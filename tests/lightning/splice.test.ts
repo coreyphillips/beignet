@@ -2139,8 +2139,18 @@ describe('Splice', function () {
 				crypto.randomBytes(20)
 			]);
 			const withdraw = 50_000n;
+			// Fold the on-chain fee into relative_satoshis exactly as
+			// node.spliceOut does (the tx_complete audit enforces the feerate,
+			// and an audit failure now aborts the splice).
+			const spliceOutFee = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 0,
+					destinationScriptLen: destScript.length
+				}),
+				253
+			);
 			opener.setSpliceOutDestination(destScript, withdraw);
-			opener.initiateSplice(-withdraw, 253);
+			opener.initiateSplice(-(withdraw + spliceOutFee), 253);
 
 			// splice_ack carries the FRESH funding pubkey (CLN behavior).
 			opener.handleSpliceAck({
@@ -2202,8 +2212,17 @@ describe('Splice', function () {
 				crypto.randomBytes(20)
 			]);
 			const withdraw = 50_000n;
+			// Fee folded into relative_satoshis: the tx_complete audit enforces
+			// the feerate, and an audit failure now aborts the splice.
+			const spliceOutFee = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 0,
+					destinationScriptLen: destScript.length
+				}),
+				253
+			);
 			opener.setSpliceOutDestination(destScript, withdraw);
-			opener.initiateSplice(-withdraw, 253);
+			opener.initiateSplice(-(withdraw + spliceOutFee), 253);
 			opener.handleSpliceAck({
 				channelId,
 				fundingPubkey: makeBasepoints(acceptorSeed).fundingPubkey,
@@ -3105,6 +3124,12 @@ describe('Splice', function () {
 				acceptor: Channel;
 				broadcasts: Buffer[];
 				errors: string[];
+				/** WATCH_FUNDING actions, tagged with the emitting channel. */
+				watches: Array<{
+					from: Channel;
+					txid: Buffer;
+					outputIndex: number;
+				}>;
 				enqueue: (to: Channel, from: Channel, actions: any[]) => void;
 				pump: () => void;
 				/** After skipping `skip` matches, drop the next `count` messages of this type. */
@@ -3116,6 +3141,8 @@ describe('Splice', function () {
 					msgType: MessageType,
 					fn: (payload: Buffer) => Buffer
 				) => void;
+				/** Stop tampering (an honest retry follows). */
+				clearIntercepts: () => void;
 			}
 
 			function makeWirePair(pushMsat = 0n): IWirePair {
@@ -3187,11 +3214,18 @@ describe('Splice', function () {
 					(payload: Buffer) => Buffer
 				>();
 
+				const watches: IWirePair['watches'] = [];
 				const enqueue = (to: Channel, from: Channel, actions: any[]): void => {
 					for (const a of actions) {
 						if (a.type === ChannelActionType.ERROR) errors.push(a.message);
 						if (a.type === ChannelActionType.BROADCAST_TX)
 							broadcasts.push(a.tx);
+						if (a.type === ChannelActionType.WATCH_FUNDING)
+							watches.push({
+								from,
+								txid: a.fundingTxid,
+								outputIndex: a.fundingOutputIndex
+							});
 						if (a.type === ChannelActionType.SEND_MESSAGE) {
 							const rule = dropRules.get(a.messageType);
 							if (rule) {
@@ -3234,17 +3268,22 @@ describe('Splice', function () {
 				): void => {
 					interceptRules.set(msgType, fn);
 				};
+				const clearIntercepts = (): void => {
+					interceptRules.clear();
+				};
 
 				return {
 					opener,
 					acceptor,
 					broadcasts,
 					errors,
+					watches,
 					enqueue,
 					pump,
 					drop,
 					clearDrops,
-					intercept
+					intercept,
+					clearIntercepts
 				};
 			}
 
@@ -3528,20 +3567,30 @@ describe('Splice', function () {
 					});
 
 					// The ACCEPTOR refuses the opener's P2WSH input at its
-					// negotiated-tx audit, before its commitment signs anything (in
-					// production the ERROR fails the splice; this harness only
-					// collects it and keeps pumping).
+					// negotiated-tx audit, before its commitment signs anything,
+					// and fails the NEGOTIATION with tx_abort: both sides unwind
+					// to NORMAL and the channel keeps operating.
 					expect(pair.errors.some((e) => e.includes('unsupported output type')))
 						.to.be.true;
-					// Defense in depth: the exchange the harness let continue is
-					// still refused at tx_signatures (P2WSH witnesses fail closed),
-					// so the acceptor never adopts the splice.
+					// The opener's mid-splice commitment_signed was already in
+					// flight when the abort left; the ignore window absorbs it
+					// instead of failing the channel on it.
 					expect(
-						pair.errors.some((e) => e.includes('invalid splice tx_signatures'))
-					).to.be.true;
-					const record = pair.acceptor.getFullState().spliceInFlight;
-					expect(record?.receivedTxSignatures ?? false).to.be.false;
-					expect(record?.fullySigned ?? false).to.be.false;
+						pair.errors.filter((e) => e.includes('commitment'))
+					).to.deep.equal([]);
+					expect(pair.broadcasts.length).to.equal(0);
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.opener.getFullState().spliceInFlight).to.be.null;
+					expect(pair.acceptor.getFullState().spliceInFlight).to.be.null;
+
+					// The channel is still usable: a fresh valid splice completes.
+					const preCapacity = pair.opener.getFundingSatoshis();
+					startSpliceOut(pair, 25_000n);
+					completeSpliceLocked(pair);
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.opener.getFundingSatoshis() < preCapacity).to.be.true;
 				});
 
 				it('persists the splice prevout set and tolerates a legacy record without it', function () {
@@ -3714,6 +3763,99 @@ describe('Splice', function () {
 					).to.be.true;
 					expect(restoredB.getFullState().spliceInFlight!.receivedTxSignatures)
 						.to.be.false;
+				});
+
+				it('keeps watching the splice outpoint on refusal and locks when it confirms', function () {
+					const pair = makeWirePair();
+					tamperTxSigs(pair, (witnesses) => {
+						const junkPriv = crypto
+							.createHash('sha256')
+							.update('not-the-wallet-key')
+							.digest();
+						const sig64 = Buffer.from(
+							ecc.sign(crypto.randomBytes(32), junkPriv)
+						);
+						const der = bitcoin.script.signature.encode(
+							sig64,
+							bitcoin.Transaction.SIGHASH_ALL
+						);
+						return [[der, witnesses[0][1]]];
+					});
+					startSpliceIn(pair);
+
+					// Refused, but the acceptor's shared-input signature had already
+					// left (it signs first), and witness data does not change the
+					// txid (BIP 141): the opener's locally valid broadcast can
+					// confirm. The refusal must keep the outpoint watched.
+					expect(
+						pair.errors.some((e) => e.includes('invalid splice tx_signatures'))
+					).to.be.true;
+					const record = pair.acceptor.getFullState().spliceInFlight!;
+					expect(record.sentTxSignatures).to.be.true;
+					expect(record.receivedTxSignatures).to.be.false;
+					expect(
+						pair.watches.some(
+							(w) =>
+								w.from === pair.acceptor && w.txid.equals(record.spliceTxid)
+						),
+						'acceptor still watches the negotiated splice outpoint'
+					).to.be.true;
+
+					// The watch pays off: the tx confirms; the peer retransmits its
+					// (honest) tx_signatures on reconnect and the splice locks.
+					pair.acceptor.markSpliceConfirmed();
+					pair.opener.markSpliceConfirmed();
+					pair.clearIntercepts();
+					disconnect(pair);
+					reconnect(pair);
+
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+					expect(
+						pair.acceptor.getFullState().fundingTxid!.equals(record.spliceTxid)
+					).to.be.true;
+				});
+
+				it('refusal before our signatures leave does not mark them sent', function () {
+					const pair = makeWirePair();
+					// Tamper the ACCEPTOR's (witness-free) tx_signatures by adding a
+					// surplus stack: the OPENER refuses BEFORE its signatures leave.
+					pair.intercept(MessageType.TX_SIGNATURES, (payload) => {
+						const msg = decodeTxSignaturesMessage(payload);
+						if (msg.witnesses.length > 0) return payload;
+						msg.witnesses = [[Buffer.alloc(71, 1), Buffer.alloc(33, 2)]];
+						return encodeTxSignaturesMessage(msg);
+					});
+					startSpliceIn(pair);
+
+					expect(
+						pair.errors.some((e) =>
+							e.includes('expected 0 witness stacks, got 1')
+						)
+					).to.be.true;
+					// The refusal ran before the send helper: state must not claim
+					// our signatures left when they did not.
+					const record = pair.opener.getFullState().spliceInFlight!;
+					expect(record.sentTxSignatures, 'opener signatures not marked sent')
+						.to.be.false;
+					expect(record.receivedTxSignatures).to.be.false;
+					// Our shared-input signature never left, so the splice cannot
+					// confirm: no watch, no broadcast.
+					expect(
+						pair.watches.filter((w) => w.from === pair.opener)
+					).to.deep.equal([]);
+					expect(pair.broadcasts.length).to.equal(0);
+
+					// An honest retransmission completes the splice with the flags
+					// telling the truth end to end.
+					pair.clearIntercepts();
+					disconnect(pair);
+					reconnect(pair);
+					expect(pair.broadcasts.length).to.equal(2);
+					expect(pair.opener.getFullState().spliceInFlight!.fullySigned).to.be
+						.true;
+					expect(pair.acceptor.getFullState().spliceInFlight!.fullySigned).to.be
+						.true;
 				});
 			});
 
@@ -4388,7 +4530,13 @@ describe('Splice', function () {
 			expect(openerChannel.isQuiescent()).to.be.true;
 			expect(acceptorChannel.isQuiescent()).to.be.true;
 
-			// Initiate splice on opener
+			// Initiate a splice-in on the opener, backed by a real wallet input
+			// (the tx_complete audit aborts an unbacked contribution).
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
 			const result = openerManager.initiateSplice(channelId, 100_000n, 253);
 			expect(result.ok).to.be.true;
 
@@ -4401,26 +4549,18 @@ describe('Splice', function () {
 			const { openerManager, channelId, openerChannel } =
 				createNormalChannelPair();
 
-			// Setup quiescence and splice
+			// Setup quiescence and a backed splice-in; the auto-routing runs the
+			// negotiation and signature exchange to AWAITING_SPLICE_LOCKED.
 			openerManager.initiateQuiescence(channelId);
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
 			openerManager.initiateSplice(channelId, 100_000n, 253);
-
-			// Get session and progress through interactive TX
-			const session = openerChannel.getSpliceSession()!;
-			session.addInput({
-				serialId: 0n,
-				prevTxid: crypto.randomBytes(32),
-				prevOutputIndex: 0,
-				sequence: 0xfffffffd
-			});
-			session.addOutput({
-				serialId: 2n,
-				amountSats: 100_000n,
-				scriptPubkey: Buffer.alloc(22, 0x01)
-			});
-			session.markTxComplete();
-			session.handlePeerTxComplete();
-			session.handleTxSignatures(crypto.randomBytes(32), 0);
+			expect(openerChannel.getSpliceSession()!.getState()).to.equal(
+				SpliceState.AWAITING_SPLICE_LOCKED
+			);
 
 			const result = openerManager.sendSpliceLocked(channelId);
 			expect(result.ok).to.be.true;

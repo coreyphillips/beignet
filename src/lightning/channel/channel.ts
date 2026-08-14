@@ -542,6 +542,16 @@ export class Channel {
 	 * Cleared on disconnect and when a fresh interactive negotiation starts.
 	 */
 	private _txAbortSent = false;
+	// We refused a COMPLETED splice negotiation with tx_abort. The peer sends
+	// its mid-splice commitment_signed right after its final tx_complete, so
+	// that message can already be in flight when our abort leaves; judged
+	// against the post-abort channel it would fail the channel on a signature
+	// that was never meant for it. While set, commitment_signed is ignored.
+	// Quiescence bars legitimate commitment traffic until the peer processes
+	// our abort, so nothing real is swallowed. Cleared when any tx_abort
+	// arrives (message ordering puts the peer's echo after the stray) and on
+	// disconnect.
+	private _spliceAbortIgnoreCommitment = false;
 	// One-shot: we answered a post-reestablish channel_reestablish (a peer whose
 	// channel process restarted on the same connection, e.g. CLN after a
 	// tx_abort) by retransmitting ours. Without the latch two nodes that both
@@ -3124,6 +3134,11 @@ export class Channel {
 	 * Returns revoke_and_ack.
 	 */
 	handleCommitmentSigned(msg: ICommitmentSignedMessage): ChannelAction[] {
+		// A mid-splice commitment_signed that raced our tx_abort belongs to
+		// the aborted splice: ignore it (see _spliceAbortIgnoreCommitment).
+		if (this._spliceAbortIgnoreCommitment) {
+			return [];
+		}
 		// Fresh signed traffic ends the reestablish exchange (status machine).
 		this._lastReestablishOutcome = null;
 		// start_batch collection: buffer the announced batch, then process all
@@ -5788,6 +5803,7 @@ export class Channel {
 		// to unwind).
 		this._spliceAbortPending = false;
 		this._txAbortSent = false;
+		this._spliceAbortIgnoreCommitment = false;
 		this._reestablishRetransmitted = false;
 		this._pendingRbfInit = null;
 		// An un-echoed abort of a recorded attempt dies with the connection
@@ -11054,10 +11070,23 @@ export class Channel {
 				this._spliceSession!.getState() === SpliceState.AWAITING_TX_SIGNATURES
 			) {
 				// Both sides complete: audit the negotiated tx before signing
-				// anything for it (S-2.M4).
+				// anything for it (S-2.M4). An unacceptable tx fails the
+				// NEGOTIATION, not the channel: tx_abort + unwind (nothing is
+				// signed yet), mirroring the tx_add_input refusal arm. A bare
+				// ERROR would leave both sides parked in a dead splice. The
+				// peer's mid-splice commitment_signed may already be in flight
+				// behind its tx_complete; the ignore window absorbs it.
 				const invalid = this._validateNegotiatedInteractiveTx('splice');
 				if (invalid) {
-					return [{ type: ChannelActionType.ERROR, message: invalid }];
+					this._spliceAbortIgnoreCommitment = true;
+					return [
+						this._txAbort(this._state.channelId!, invalid),
+						...this.abortSplice(invalid),
+						{
+							type: ChannelActionType.ERROR,
+							message: `splice aborted: ${invalid}`
+						}
+					];
 				}
 			}
 			return [...driveActions, ...this._maybeSendSpliceCommitment()];
@@ -12363,10 +12392,6 @@ export class Channel {
 				return [];
 			}
 
-			const actions: ChannelAction[] = [];
-			// We must have sent ours first (some peers send tx_signatures before us).
-			actions.push(...this._maybeSendSpliceTxSigs());
-
 			// The peer's 2-of-2 funding signature arrives in the
 			// shared_input_signature TLV (BOLT 2 splicing); its witnesses cover
 			// only its OWN wallet inputs. Legacy beignet (pre-TLV) sent the sig as
@@ -12396,17 +12421,43 @@ export class Channel {
 			// every signature verified against its negotiated prevout (the same
 			// rules as the v2 open path). Refusing here fails the exchange with
 			// a named error instead of persisting a splice tx that can never
-			// confirm.
+			// confirm. Validation runs BEFORE _maybeSendSpliceTxSigs: that
+			// helper marks our signatures sent (memory and record) as a side
+			// effect, and a refusal here must not leave state claiming a send
+			// that never happened. The build alone has no such side effects.
+			if (!this._spliceTx) {
+				this.buildAndSignSpliceTx();
+			}
 			const witnessProblem =
 				this._validateSplicePeerWitnesses(peerWalletWitnesses);
 			if (witnessProblem) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: `invalid splice tx_signatures: ${witnessProblem}`
-					}
-				];
+				const refusal: ChannelAction[] = [];
+				// Refusing the message does not make the splice unconfirmable
+				// once OUR shared-input signature has left: witness data does
+				// not change the txid (BIP 141), so the peer can broadcast its
+				// locally valid copy of the same transaction. Keep watching the
+				// negotiated outpoint so a confirmation still locks the splice
+				// (the confirmed flag flushes splice_locked once valid
+				// signatures finally arrive, e.g. retransmitted on reconnect).
+				const record = this._state.spliceInFlight;
+				if (record && (this._spliceSentTxSigs || record.sentTxSignatures)) {
+					refusal.push({
+						type: ChannelActionType.WATCH_FUNDING,
+						fundingTxid: record.spliceTxid,
+						fundingOutputIndex: record.newFundingOutputIndex,
+						minimumDepth: this._state.minimumDepth
+					});
+				}
+				refusal.push({
+					type: ChannelActionType.ERROR,
+					message: `invalid splice tx_signatures: ${witnessProblem}`
+				});
+				return refusal;
 			}
+
+			const actions: ChannelAction[] = [];
+			// We must have sent ours first (some peers send tx_signatures before us).
+			actions.push(...this._maybeSendSpliceTxSigs());
 			const tx = this.applyPeerSpliceSignature(peerSig, peerWalletWitnesses);
 			if (!tx) {
 				return [
@@ -13372,6 +13423,10 @@ export class Channel {
 	 * Handle tx_abort from peer.
 	 */
 	handleTxAbort(): ChannelAction[] {
+		// Any tx_abort from the peer proves it has processed our abort (the
+		// echo travels behind whatever the peer sent before seeing ours), so
+		// the stray-commitment window of a refused splice negotiation is over.
+		this._spliceAbortIgnoreCommitment = false;
 		// The echo/ack of a tx_abort we sent (e.g. telling the peer to forget a
 		// splice we lost across a restart). Both sides have now forgotten it.
 		if (this._spliceAbortPending) {
