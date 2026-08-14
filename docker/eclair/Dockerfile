@@ -25,8 +25,9 @@ RUN curl -fSL "https://github.com/ACINQ/eclair/releases/download/v${ECLAIR_VERSI
   && mv eclair-node-* eclair-node \
   && chmod +x eclair-node/bin/eclair-node.sh
 
-# eclair-cli so `docker exec eclair eclair-cli ...` keeps working
-RUN curl -fSL "https://raw.githubusercontent.com/ACINQ/eclair/v${ECLAIR_VERSION}/eclair-core/eclair-cli" -o /sbin/eclair-cli \
+# eclair-cli ships inside the verified zip; install it from there so
+# `docker exec eclair eclair-cli ...` works without touching a mutable tag
+RUN cp eclair-node/bin/eclair-cli /sbin/eclair-cli \
   && chmod +x /sbin/eclair-cli
 
 ENV ECLAIR_DATADIR=/home/eclair

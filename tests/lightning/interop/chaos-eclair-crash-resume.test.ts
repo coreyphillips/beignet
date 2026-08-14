@@ -10,11 +10,9 @@
  * reestablish, settle the interrupted payment, stay off chain on both sides,
  * and route a probe payment.
  *
- * Requires the compose `eclair` container (HTTP 8082, P2P 9737). On ARM Macs
- * the amd64 Eclair image SIGSEGVs on channel operations; run an arm64-native
- * image (e.g. polarlightning/eclair) and set ECLAIR_ARM64_NATIVE=1.
- * Run solo:
- *   ECLAIR_ARM64_NATIVE=1 npx mocha --exit --timeout 240000 -r ts-node/register tests/lightning/interop/chaos-eclair-crash-resume.test.ts
+ * Requires the compose `eclair` container (HTTP 8082, P2P 9737), which is
+ * built locally and runs natively on arm64. Run solo:
+ *   npx mocha --exit --timeout 240000 -r ts-node/register tests/lightning/interop/chaos-eclair-crash-resume.test.ts
  * Auto-skips when the containers are down.
  */
 
@@ -57,9 +55,6 @@ import { KillSwitch, sealableStorage } from '../helpers/chaos-harness';
 
 const SEED_PASSPHRASE = 'interop-seed-303';
 
-const isArmMac = os.platform() === 'darwin' && os.arch() === 'arm64';
-const skipChannelTests = isArmMac && process.env.ECLAIR_ARM64_NATIVE !== '1';
-
 async function waitFor(
 	probe: () => boolean,
 	what: string,
@@ -85,14 +80,6 @@ describe('Interop chaos: Eclair crash-resume (regtest)', function () {
 
 	before(async function () {
 		this.timeout(60_000);
-		if (skipChannelTests) {
-			skipAll = true;
-			console.log(
-				'    [skip] ARM Mac without ECLAIR_ARM64_NATIVE=1 (amd64 Eclair SIGSEGVs on channel ops)'
-			);
-			this.skip();
-			return;
-		}
 		if (!(await isEclairAvailable())) {
 			skipAll = true;
 			console.log('    [skip] Eclair container not reachable');
@@ -274,7 +261,6 @@ describe('Interop chaos: Eclair crash-resume (regtest)', function () {
 			const channel = recovered[0];
 			expect(channel.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
 
-			setupRoutingForChannel(node, eclairPubkey);
 			node.handleNewBlock(tip);
 			await node.connectPeer(eclairPubkey, ECLAIR_P2P_HOST, ECLAIR_P2P_PORT);
 			await waitFor(
@@ -282,6 +268,12 @@ describe('Interop chaos: Eclair crash-resume (regtest)', function () {
 				'channel to reestablish to NORMAL',
 				60_000
 			);
+			// Inject synthetic routing only AFTER the reconnect settled: if the
+			// zero-signature graph entry exists when Eclair runs its on-connect
+			// gossip sync, beignet serves it and Eclair 0.14+ closes the
+			// connection on the malformed announcement, killing the reestablish
+			// this test is about (see #340).
+			setupRoutingForChannel(node, eclairPubkey);
 
 			// The payment that was in flight across the crash must complete on
 			// both sides after reestablish.

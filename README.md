@@ -636,10 +636,10 @@ Services in `docker/docker-compose.yml`:
 
 | Service | Image | Ports |
 |---------|-------|-------|
-| bitcoind | Bitcoin Core 29.1 (regtest) | RPC 43782, ZMQ 28334/28335/28336 |
+| bitcoind | Bitcoin Core 31.0 (regtest) | RPC 43782, ZMQ 28334/28335/28336 |
 | lnd | `lightninglabs/lnd:v0.20.0-beta` | P2P 9735, REST 8081 |
 | cln | `elementsproject/lightningd:v26.06.1` | CLNRest 3010 |
-| eclair | `polarlightning/eclair:0.13.1` | HTTP API 8082 |
+| eclair | 0.14.1, built locally from the release zip (`docker/eclair/Dockerfile`) | HTTP API 8082 |
 | electrs | `getumbrel/electrs:v0.10.10` | Electrum 60001 |
 
 Covered per implementation: BOLT 8 handshake and BOLT 1 init/feature negotiation, disconnect/reconnect and ping/pong survival, channel open in both directions, bidirectional payments and payment_secret validation, MPP, SCID aliases, cooperative close, reestablish, gossip sync, inbound connections, anchor channels, anchor force-close with wallet-funded CPFP and HTLC-timeout fee-attach, and crash recovery. Beyond the shared matrix: taproot channel lifecycle vs LND (open, pay both directions, reestablish, coop and force close, penalty, SCB recovery), splice matrix and lease/liquidity-ads flows vs CLN, `simple_close` vs Eclair, blinded-path payments, and the watchtower client vs an LND tower.

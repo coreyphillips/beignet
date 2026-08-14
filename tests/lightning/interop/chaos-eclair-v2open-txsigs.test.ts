@@ -32,9 +32,9 @@
  *    fail-stop contract is untouched (no send, no persist after the kill).
  *
  * Requires the compose `eclair` container (0.14+, option_dual_fund enabled;
- * HTTP 8082, P2P 9737). On ARM Macs run an arm64-native image and set
- * ECLAIR_ARM64_NATIVE=1. Run solo:
- *   ECLAIR_ARM64_NATIVE=1 npx mocha --exit --timeout 300000 -r ts-node/register tests/lightning/interop/chaos-eclair-v2open-txsigs.test.ts
+ * HTTP 8082, P2P 9737), which is built locally and runs natively on arm64.
+ * Run solo:
+ *   npx mocha --exit --timeout 300000 -r ts-node/register tests/lightning/interop/chaos-eclair-v2open-txsigs.test.ts
  * Auto-skips when the containers are down.
  */
 
@@ -80,9 +80,6 @@ import { KillSwitch, sealableStorage } from '../helpers/chaos-harness';
 
 bitcoin.initEccLib(ecc);
 
-const isArmMac = os.platform() === 'darwin' && os.arch() === 'arm64';
-const skipChannelTests = isArmMac && process.env.ECLAIR_ARM64_NATIVE !== '1';
-
 async function waitFor(
 	probe: () => boolean,
 	what: string,
@@ -108,14 +105,6 @@ describe('Interop chaos: Eclair v2 open crash-resume (regtest)', function () {
 
 	before(async function () {
 		this.timeout(120_000);
-		if (skipChannelTests) {
-			skipAll = true;
-			console.log(
-				'    [skip] ARM Mac without ECLAIR_ARM64_NATIVE=1 (amd64 Eclair SIGSEGVs on channel ops)'
-			);
-			this.skip();
-			return;
-		}
 		if (!(await isEclairAvailable())) {
 			skipAll = true;
 			console.log('    [skip] Eclair container not reachable');
@@ -558,41 +547,24 @@ describe('Interop chaos: Eclair v2 open crash-resume (regtest)', function () {
 		);
 	}
 
+	// No mid-run skip translation: the before hook already gates on container
+	// availability, so an ECONNREFUSED once the scenario started (an Eclair
+	// crash, a failed restart) is a real regression and must FAIL.
 	it('resumes a v2 open whose tx_signatures died with the process', async function () {
-		try {
-			await crashResumeRun(
-				'interop-seed-v2open-eclair-1',
-				MessageType.TX_SIGNATURES,
-				'pre-send:tx_signatures',
-				0
-			);
-		} catch (err) {
-			const msg = (err as Error).message || '';
-			if (msg.includes('not available') || msg.includes('ECONNREFUSED')) {
-				console.log(`    chaos-eclair-v2open skipped: ${msg}`);
-				this.skip();
-				return;
-			}
-			throw err;
-		}
+		await crashResumeRun(
+			'interop-seed-v2open-eclair-1',
+			MessageType.TX_SIGNATURES,
+			'pre-send:tx_signatures',
+			0
+		);
 	});
 
 	it('resumes a v2 open whose commitment_signed died with the process, the state owing it durable', async function () {
-		try {
-			await crashResumeRun(
-				'interop-seed-v2open-eclair-2',
-				MessageType.COMMITMENT_SIGNED,
-				'pre-send:commitment_signed',
-				2500
-			);
-		} catch (err) {
-			const msg = (err as Error).message || '';
-			if (msg.includes('not available') || msg.includes('ECONNREFUSED')) {
-				console.log(`    chaos-eclair-v2open skipped: ${msg}`);
-				this.skip();
-				return;
-			}
-			throw err;
-		}
+		await crashResumeRun(
+			'interop-seed-v2open-eclair-2',
+			MessageType.COMMITMENT_SIGNED,
+			'pre-send:commitment_signed',
+			2500
+		);
 	});
 });
