@@ -3,6 +3,8 @@ name: tests
 on:
   workflow_dispatch:
   pull_request:
+  push:
+    branches: [master]
 
 jobs:
   tests:
@@ -39,14 +41,14 @@ jobs:
         run: node scripts/wait-for-electrum.js 127.0.0.1 60001 180
 
       - name: Install Node.js dependencies
-        run: npm install || npm install
+        run: npm ci
 
       # Run each suite in its own process so the on-chain wallet tests get a
       # fresh Electrum connection (they previously failed when run after the
       # lightning/CLI suites in one long process). Interop tests are excluded
       # here — they need LND/CLN/Eclair and run via `npm run test:interop`.
       - name: Run on-chain wallet tests
-        run: yarn build && npx mocha --exit -r ts-node/register --ignore 'tests/watch-only.test.ts' --ignore 'tests/psbt-flow.test.ts' --ignore 'tests/utxo-freeze.test.ts' --ignore 'tests/wallet-metadata.test.ts' --ignore 'tests/multi-account.test.ts' --ignore 'tests/descriptors.test.ts' --ignore 'tests/multisig.test.ts' --ignore 'tests/getutxos-address-type-scan.test.ts' --ignore 'tests/electrum-connect-failure.test.ts' --ignore 'tests/electrum-switch-network.test.ts' 'tests/*.test.ts'
+        run: npm run build && npx mocha --exit -r ts-node/register --ignore 'tests/watch-only.test.ts' --ignore 'tests/psbt-flow.test.ts' --ignore 'tests/utxo-freeze.test.ts' --ignore 'tests/wallet-metadata.test.ts' --ignore 'tests/multi-account.test.ts' --ignore 'tests/descriptors.test.ts' --ignore 'tests/multisig.test.ts' --ignore 'tests/getutxos-address-type-scan.test.ts' --ignore 'tests/electrum-connect-failure.test.ts' --ignore 'tests/electrum-switch-network.test.ts' 'tests/*.test.ts'
 
       # Offline suites that intentionally point wallets at an unreachable
       # Electrum port. rn-electrum-client keeps module-global client state, so
@@ -62,6 +64,11 @@ jobs:
 
       - name: Run lightning unit tests
         run: npm run test:lightning
+
+      # Also covered by the test:lightning glob above; a named step makes the
+      # conformance gate visible in CI output instead of incidental.
+      - name: Run BOLT conformance vectors
+        run: npm run test:conformance
 
       # The process-level chaos matrix SIGKILLs a real LightningNode child
       # (built against dist) at every recorded boundary; its cost and any
