@@ -438,8 +438,9 @@ describe('Issue #214: manual close rebroadcast', function () {
 		expect(closeHex, 'loopback negotiation recorded a mutual close').to.be.a(
 			'string'
 		);
-		// Mempool sighting only: issue #338 marks the monitor fully resolved
-		// here, which must NOT surface as a terminal guarantee.
+		// Mempool sighting only: the monitor waits in RESOLVING for depth
+		// (issue #338), and an unconfirmed close must NOT surface as a
+		// terminal guarantee, nor as 'sweeping' when nothing is being swept.
 		observeSpend(
 			fx.alice,
 			fx.channelId,
@@ -466,7 +467,7 @@ describe('Issue #214: manual close rebroadcast', function () {
 		fx.destroy();
 	});
 
-	it('a confirmed cooperative close is resolved and rebroadcast is a no-op', async () => {
+	it('a confirmed cooperative close resolves at depth and rebroadcast is a no-op', async () => {
 		const fx = setup(391);
 		fx.alice.closeChannel(fx.channelId, destScript(fx.alice));
 		const channel = (fx.alice as any).channelManager.getChannel(fx.channelId);
@@ -478,9 +479,17 @@ describe('Issue #214: manual close rebroadcast', function () {
 			105
 		);
 
+		// Confirmed but not yet buried IRREVOCABLE_DEPTH deep (issue #338):
+		// resolution is still in progress, not a terminal guarantee.
 		const cs = closeStatusOf(fx.alice, fx.channelId);
-		expect(cs.resolution).to.equal('resolved');
+		expect(cs.resolution).to.equal('sweeping');
 		expect(cs.confirmationHeight).to.equal(105);
+
+		// At depth the close becomes irreversible and reads resolved.
+		(fx.alice as any).channelManager.handleNewBlock(205);
+		const buried = closeStatusOf(fx.alice, fx.channelId);
+		expect(buried.resolution).to.equal('resolved');
+		expect(buried.confirmationHeight).to.equal(105);
 
 		const sent: string[] = [];
 		(fx.alice as any)._chainBackend = {

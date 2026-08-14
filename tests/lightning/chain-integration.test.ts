@@ -825,16 +825,26 @@ describe('Chain Integration (Phase 4D)', function () {
 				network
 			);
 
-			// Should be fully resolved immediately
-			expect(resolvedEmitted).to.be.true;
-
-			const resolvedAction = chainActions.find(
-				(a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED
-			);
-			expect(resolvedAction).to.exist;
+			// Not resolved at detection: the close must reach irrevocable depth
+			// first (issue 338), keeping the funding watch alive for the reorg
+			// window.
+			expect(resolvedEmitted).to.be.false;
+			expect(
+				chainActions.find(
+					(a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED
+				)
+			).to.be.undefined;
 
 			const monitor = manager.getMonitor(channelId);
 			expect(monitor).to.exist;
+			expect(monitor!.isFullyResolved()).to.be.false;
+
+			// At depth the manager resolves the channel and emits the event.
+			const atDepth = manager.handleNewBlock(200);
+			expect(
+				atDepth.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(resolvedEmitted).to.be.true;
 			expect(monitor!.isFullyResolved()).to.be.true;
 		});
 	});
@@ -1277,10 +1287,16 @@ describe('Chain Integration (Phase 4D)', function () {
 				network
 			);
 
-			// handleNewBlock should work even with multiple monitors
-			const actions = manager.handleNewBlock(200);
-			// Cooperative close is fully resolved, so no new actions
-			expect(actions).to.have.length(0);
+			// handleNewBlock should work even with multiple monitors. One short
+			// of irrevocable depth the coop close is still waiting: no actions.
+			const early = manager.handleNewBlock(199);
+			expect(early).to.have.length(0);
+
+			// At depth the coop close resolves through the block feed.
+			const atDepth = manager.handleNewBlock(200);
+			expect(
+				atDepth.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
 		});
 	});
 

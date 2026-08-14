@@ -352,6 +352,30 @@ export class ChainMonitor {
 		) {
 			monitor._state = MonitorState.RESOLVING;
 		}
+		// Pre-issue-338 state marked a cooperative close fully resolved at zero
+		// confirmations. Unless the saved state itself proves the close reached
+		// IRREVOCABLE_DEPTH, reopen resolution so the funding watch is re-armed
+		// and handleNewBlock re-promotes at real depth. Legacy monitors stopped
+		// receiving blocks at instant resolution, so their saved height sits at
+		// the close height and they all demote once; the first deep block feed
+		// re-resolves them. Only IRREVOCABLY_RESOLVED outputs are demoted:
+		// a SPEND_CONFIRMED output keeps its resolutionTxid so the restart
+		// re-arm can seed the recorded spend for reorg detection.
+		if (
+			monitor._state === MonitorState.FULLY_RESOLVED &&
+			monitor._commitmentBroadcast?.commitmentType ===
+				CommitmentType.COOPERATIVE_CLOSE &&
+			(monitor._commitmentBroadcast.blockHeight <= 0 ||
+				monitor._currentBlockHeight - monitor._commitmentBroadcast.blockHeight <
+					IRREVOCABLE_DEPTH)
+		) {
+			monitor._state = MonitorState.RESOLVING;
+			for (const output of monitor._trackedOutputs) {
+				if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) {
+					output.status = OutputStatus.CONFIRMED;
+				}
+			}
+		}
 		// Restore known preimages if present
 		if (saved.knownPreimages) {
 			for (const [hash, preimage] of Object.entries(saved.knownPreimages)) {
@@ -577,6 +601,45 @@ export class ChainMonitor {
 
 		this._currentBlockHeight = blockHeight;
 		const actions: ChainAction[] = [];
+
+		// A cooperative close has no sweeps: its outputs pay each side's script
+		// directly, so the only question is whether the close tx itself is buried
+		// deep enough that a reorg can no longer evict it (issue 338: resolving at
+		// zero confirmations tore down the funding watch, so a 1-block reorg
+		// followed by a revoked commitment went unpunished). Depth is measured
+		// from the close tx's own confirmation, never per-output heights: a
+		// wallet spend of our close output must not restart the clock, and an
+		// SCB-recovered state tracks zero outputs yet still needs to resolve.
+		// A mempool-only sighting (blockHeight 0) never counts depth;
+		// _adoptLateConfirmation starts the clock when the spend confirms.
+		if (
+			this._commitmentBroadcast?.commitmentType ===
+			CommitmentType.COOPERATIVE_CLOSE
+		) {
+			const closeHeight = this._commitmentBroadcast.blockHeight;
+			if (closeHeight > 0 && blockHeight - closeHeight >= IRREVOCABLE_DEPTH) {
+				for (const output of this._trackedOutputs) {
+					if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) continue;
+					output.status = OutputStatus.IRREVOCABLY_RESOLVED;
+					actions.push({
+						type: ChainActionType.OUTPUT_RESOLVED,
+						txid: output.txid,
+						outputIndex: output.outputIndex,
+						channelId: this._channelState.channelId ?? undefined,
+						outputType: output.outputType,
+						paymentHash: output.paymentHash
+					});
+				}
+				this._state = MonitorState.FULLY_RESOLVED;
+				if (this._channelState.channelId) {
+					actions.push({
+						type: ChainActionType.CHANNEL_FULLY_RESOLVED,
+						channelId: this._channelState.channelId
+					});
+				}
+			}
+			return actions;
+		}
 
 		// Check each tracked output for maturation
 		for (const output of this._trackedOutputs) {
@@ -1512,21 +1575,16 @@ export class ChainMonitor {
 	}
 
 	private _handleCooperativeClose(actions: ChainAction[]): ChainAction[] {
-		// Cooperative close is immediately fully resolved (no pending outputs to sweep)
-		// Mark all outputs as irrevocably resolved
-		for (const output of this._trackedOutputs) {
-			output.status = OutputStatus.IRREVOCABLY_RESOLVED;
-		}
-
-		this._state = MonitorState.FULLY_RESOLVED;
-
-		if (this._channelState.channelId) {
-			actions.push({
-				type: ChainActionType.CHANNEL_FULLY_RESOLVED,
-				channelId: this._channelState.channelId
-			});
-		}
-
+		// A cooperative close has nothing to sweep, but it is NOT resolved until
+		// the close tx is buried IRREVOCABLE_DEPTH deep (issue 338). Resolving
+		// here, at as little as a mempool sighting, emitted CHANNEL_FULLY_RESOLVED
+		// which tore down the funding watch and made restart skip re-arming it, so
+		// a reorg that evicted the close followed by a revoked commitment on the
+		// still-live funding output went undetected and unpunished. Stay in
+		// RESOLVING so the funding watch and the commitment-swap reclassify path
+		// in handleFundingSpent survive the window; handleNewBlock promotes the
+		// outputs and the monitor once the close reaches depth.
+		this._state = MonitorState.RESOLVING;
 		return actions;
 	}
 

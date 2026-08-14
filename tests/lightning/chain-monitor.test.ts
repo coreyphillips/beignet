@@ -264,7 +264,7 @@ describe('Chain Monitor (Phase 4C)', function () {
 	});
 
 	describe('Cooperative Close', function () {
-		it('should detect and immediately mark as FULLY_RESOLVED', function () {
+		it('should resolve only once the close reaches irrevocable depth', function () {
 			const { opener, openerPrivkeys } = setupNormalChannels();
 			const state = opener.getFullState();
 			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
@@ -292,13 +292,323 @@ describe('Chain Monitor (Phase 4C)', function () {
 
 			const actions = monitor.handleFundingSpent(closingResult.tx, 100);
 
+			// Issue 338: resolving at detection tore down the funding watch inside
+			// the reorg window. The close must wait out IRREVOCABLE_DEPTH.
+			expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+			expect(monitor.isFullyResolved()).to.be.false;
+			expect(
+				actions.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.be.undefined;
+
+			// One block short of depth: still unresolved, no actions.
+			const early = monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH - 1);
+			expect(early).to.have.length(0);
+			expect(monitor.isFullyResolved()).to.be.false;
+
+			// At depth: both close outputs resolve and the channel is resolved.
+			const atDepth = monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH);
 			expect(monitor.getState()).to.equal(MonitorState.FULLY_RESOLVED);
 			expect(monitor.isFullyResolved()).to.be.true;
+			expect(
+				atDepth.filter((a) => a.type === ChainActionType.OUTPUT_RESOLVED)
+			).to.have.length(2);
+			expect(
+				atDepth.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
 
-			const resolvedAction = actions.find(
-				(a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED
+			// Resolved is terminal: later blocks are no-ops.
+			expect(
+				monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH + 1)
+			).to.have.length(0);
+		});
+
+		function coopCloseFixture(): {
+			monitor: ChainMonitor;
+			closingTx: bitcoin.Transaction;
+			state: ReturnType<Channel['getFullState']>;
+			destScript: Buffer;
+			openerPrivkeys: Buffer[];
+		} {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
 			);
-			expect(resolvedAction).to.exist;
+			const closingResult = buildClosingTx({
+				fundingTxid: state.fundingTxid!.toString('hex'),
+				fundingOutputIndex: state.fundingOutputIndex,
+				fundingAmount: state.fundingSatoshis,
+				localScriptPubkey: destScript,
+				remoteScriptPubkey: Buffer.alloc(22, 0x02),
+				localAmount: 800_000n,
+				remoteAmount: 199_000n,
+				feeAmount: 1_000n
+			});
+			return {
+				monitor,
+				closingTx: closingResult.tx,
+				state,
+				destScript,
+				openerPrivkeys
+			};
+		}
+
+		it('never counts depth for a mempool-only sighting and adopts the confirmed height', function () {
+			const { monitor, closingTx } = coopCloseFixture();
+
+			monitor.handleFundingSpent(closingTx, 0);
+			expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+
+			// Hundreds of blocks with the close unconfirmed must not resolve: the
+			// depth clock starts at confirmation, not at absolute tip height.
+			expect(monitor.handleNewBlock(500)).to.have.length(0);
+			expect(monitor.isFullyResolved()).to.be.false;
+
+			// The funding watch re-fires when the close confirms at 460: the
+			// monitor adopts the height and counts depth from there.
+			monitor.handleFundingSpent(closingTx, 460);
+			expect(monitor.isFullyResolved()).to.be.false;
+			expect(
+				monitor.handleNewBlock(460 + IRREVOCABLE_DEPTH - 1)
+			).to.have.length(0);
+			const atDepth = monitor.handleNewBlock(460 + IRREVOCABLE_DEPTH);
+			expect(
+				atDepth.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(monitor.isFullyResolved()).to.be.true;
+		});
+
+		it('resolves within the adopting call when the confirmation is already at depth', function () {
+			const { monitor, closingTx } = coopCloseFixture();
+
+			monitor.handleFundingSpent(closingTx, 0);
+			monitor.handleNewBlock(600);
+
+			// Restart-style catch-up: the confirmed height arrives when the tip is
+			// already past depth; the adoption itself completes resolution.
+			const actions = monitor.handleFundingSpent(closingTx, 400);
+			expect(
+				actions.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(monitor.isFullyResolved()).to.be.true;
+		});
+
+		it('does not restart the depth clock when a close output is spent', function () {
+			const { monitor, closingTx, destScript } = coopCloseFixture();
+
+			monitor.handleFundingSpent(closingTx, 100);
+
+			// Our wallet re-spends close output 0 before depth is reached. The
+			// spend's own height must not push resolution out to spend + depth.
+			const spend = new bitcoin.Transaction();
+			spend.version = 2;
+			spend.addInput(
+				Buffer.from(closingTx.getId(), 'hex').reverse(),
+				0,
+				0xffffffff
+			);
+			spend.addOutput(destScript, 700_000);
+			monitor.handleOutputSpent(closingTx.getId(), 0, spend, 150);
+
+			const atDepth = monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+			expect(
+				atDepth.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(monitor.isFullyResolved()).to.be.true;
+		});
+
+		it('resolves an SCB-recovered coop close that tracks zero outputs', function () {
+			const { monitor, closingTx, state } = coopCloseFixture();
+			// SCB recovery restores no remote basepoints, so classifyOutputs
+			// tracks nothing. Resolution must still complete at depth.
+			state.remoteBasepoints = null;
+
+			monitor.handleFundingSpent(closingTx, 100);
+			expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+			expect(monitor.getTrackedOutputs()).to.have.length(0);
+
+			expect(
+				monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH - 1)
+			).to.have.length(0);
+			const atDepth = monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+			expect(
+				atDepth.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(monitor.isFullyResolved()).to.be.true;
+		});
+
+		it('punishes a revoked commitment that reorg-replaces the recorded coop close', function () {
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			// 1) The mutual close confirms at height 100 and waits out depth.
+			const closingResult = buildClosingTx({
+				fundingTxid: state.fundingTxid!.toString('hex'),
+				fundingOutputIndex: state.fundingOutputIndex,
+				fundingAmount: state.fundingSatoshis,
+				localScriptPubkey: destScript,
+				remoteScriptPubkey: Buffer.alloc(22, 0x02),
+				localAmount: 800_000n,
+				remoteAmount: 199_000n,
+				feeAmount: 1_000n
+			});
+			monitor.handleFundingSpent(closingResult.tx, 100);
+			monitor.handleNewBlock(150);
+			expect(monitor.isFullyResolved()).to.be.false;
+
+			// 2) A reorg evicts the close and the peer's revoked commitment #0
+			// confirms as the real funding spender. The still-alive monitor must
+			// swap, reclassify, and punish (issue 338: the pre-fix instant
+			// resolution had already torn everything down here).
+			const secret = state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
+			const revokedPoint = perCommitmentPointFromSecret(secret);
+			const revocationPubkey = deriveRevocationPubkey(
+				state.localBasepoints.revocationBasepoint,
+				revokedPoint
+			);
+			const theirDelayedPubkey = derivePublicKey(
+				state.remoteBasepoints!.delayedPaymentBasepoint,
+				revokedPoint
+			);
+			const isOpener = state.role === ChannelRole.OPENER;
+			const openPBP = isOpener
+				? state.localBasepoints.paymentBasepoint
+				: state.remoteBasepoints!.paymentBasepoint;
+			const acceptPBP = isOpener
+				? state.remoteBasepoints!.paymentBasepoint
+				: state.localBasepoints.paymentBasepoint;
+			const obscured = calculateObscuredCommitmentNumber(
+				openPBP,
+				acceptPBP,
+				0n
+			);
+			const revokedTx = new bitcoin.Transaction();
+			revokedTx.version = 2;
+			revokedTx.locktime = 0x20000000 | Number(obscured & 0xffffffn);
+			const seq = (0x80000000 | Number((obscured >> 24n) & 0xffffffn)) >>> 0;
+			revokedTx.addInput(
+				Buffer.from(state.fundingTxid!.toString('hex'), 'hex').reverse(),
+				state.fundingOutputIndex,
+				seq
+			);
+			const toLocalScript = buildToLocalScript(
+				revocationPubkey,
+				theirDelayedPubkey,
+				state.localConfig.toSelfDelay
+			);
+			revokedTx.addOutput(
+				bitcoin.payments.p2wsh({ redeem: { output: toLocalScript } }).output!,
+				800_000
+			);
+
+			const actions = monitor.handleFundingSpent(revokedTx, 150);
+
+			const penalty = actions.filter(
+				(a: any) =>
+					a.type === ChainActionType.BROADCAST_TX &&
+					a.description &&
+					a.description.includes('penalty')
+			);
+			expect(penalty.length).to.be.greaterThan(0);
+			expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+		});
+
+		it('restore demotes a legacy instantly-resolved coop monitor to RESOLVING', function () {
+			const { monitor, closingTx, state, destScript, openerPrivkeys } =
+				coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100);
+
+			// Pre-issue-338-fix persisted shape: fully resolved at the close
+			// height, every output irrevocable, tip still at the close height.
+			const saved = monitor.getFullState();
+			saved.monitorState = MonitorState.FULLY_RESOLVED;
+			for (const output of saved.trackedOutputs) {
+				output.status = OutputStatus.IRREVOCABLY_RESOLVED;
+			}
+
+			const restored = ChainMonitor.restore(
+				saved,
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			expect(restored.getState()).to.equal(MonitorState.RESOLVING);
+			for (const output of restored.getTrackedOutputs()) {
+				expect(output.status).to.equal(OutputStatus.CONFIRMED);
+			}
+
+			// The first deep block feed re-resolves it.
+			const atDepth = restored.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+			expect(
+				atDepth.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(restored.isFullyResolved()).to.be.true;
+		});
+
+		it('restore demotes a legacy coop monitor resolved from a mempool sighting', function () {
+			const { monitor, closingTx, state, destScript, openerPrivkeys } =
+				coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 0);
+
+			const saved = monitor.getFullState();
+			saved.monitorState = MonitorState.FULLY_RESOLVED;
+			for (const output of saved.trackedOutputs) {
+				output.status = OutputStatus.IRREVOCABLY_RESOLVED;
+			}
+			// Even a deep saved tip proves nothing without a confirmation height.
+			saved.currentBlockHeight = 5000;
+
+			const restored = ChainMonitor.restore(
+				saved,
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			expect(restored.getState()).to.equal(MonitorState.RESOLVING);
+			expect(restored.isFullyResolved()).to.be.false;
+		});
+
+		it('restore keeps a coop monitor resolved when the saved state proves depth', function () {
+			const { monitor, closingTx, state, destScript, openerPrivkeys } =
+				coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100);
+			monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+			expect(monitor.isFullyResolved()).to.be.true;
+
+			const restored = ChainMonitor.restore(
+				monitor.getFullState(),
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			expect(restored.getState()).to.equal(MonitorState.FULLY_RESOLVED);
+			expect(restored.isFullyResolved()).to.be.true;
 		});
 	});
 
@@ -1192,11 +1502,13 @@ describe('Chain Monitor (Phase 4C)', function () {
 			});
 
 			monitor.handleFundingSpent(closingResult.tx, 100);
-			expect(monitor.isFullyResolved()).to.be.true;
+			// The coop close waits out IRREVOCABLE_DEPTH before resolving (338).
+			expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
 
-			// New blocks on already-resolved should be no-op
+			// A block far short of depth changes nothing.
 			const actions = monitor.handleNewBlock(101);
 			expect(actions).to.have.length(0);
+			expect(monitor.isFullyResolved()).to.be.false;
 		});
 
 		it('should resolve outputs after IRREVOCABLE_DEPTH', function () {

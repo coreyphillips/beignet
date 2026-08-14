@@ -8227,11 +8227,10 @@ export class LightningNode extends EventEmitter {
 		const state = channel.getState();
 		const monitor = this.channelManager.getMonitor(channelId);
 		// A CONFIRMED close needs no rebroadcast: no-op success. The gate is
-		// isCommitmentConfirmed alone, deliberately not isFullyResolved: a
-		// cooperative close is marked fully resolved the moment it is
-		// classified, possibly from a mempool sighting (issue #338), and an
-		// unconfirmed mutual close is exactly what this route exists to
-		// re-send. A genuinely resolved force-close is always also confirmed.
+		// isCommitmentConfirmed alone, deliberately not isFullyResolved: every
+		// close now waits out IRREVOCABLE_DEPTH before resolving (issue #338),
+		// and an unconfirmed mutual close is exactly what this route exists to
+		// re-send.
 		const closeSettled =
 			monitor !== undefined && monitor.isCommitmentConfirmed();
 		if (
@@ -9375,16 +9374,20 @@ export class LightningNode extends EventEmitter {
 				monitor === undefined
 					? 'pending'
 					: monitor.getState() === MonitorState.FULLY_RESOLVED
-					? // A cooperative close is marked fully resolved at
-					  // classification, possibly from a mempool sighting (issue
-					  // #338). An unconfirmed close is never 'resolved'; report it
-					  // as still pending so consumers do not read a terminal
-					  // guarantee that a reorg can void.
+					? // Belt for pre-#338-fix persisted state that reached
+					  // FULLY_RESOLVED unconfirmed: never report a terminal
+					  // guarantee for a close a reorg can void.
 					  monitor.isCommitmentConfirmed()
 						? 'resolved'
 						: 'pending'
 					: monitor.getState() === MonitorState.RESOLVING
-					? 'sweeping'
+					? // A cooperative close waits out IRREVOCABLE_DEPTH in
+					  // RESOLVING (issue #338). While the close tx is unconfirmed
+					  // nothing is being swept, so that window reads 'pending'.
+					  cb?.commitmentType === CommitmentType.COOPERATIVE_CLOSE &&
+					  !monitor.isCommitmentConfirmed()
+						? 'pending'
+						: 'sweeping'
 					: 'pending'
 		};
 		// Our stamped reason describes OUR close. When the spend that actually
