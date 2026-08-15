@@ -645,6 +645,10 @@ export class LightningNode extends EventEmitter {
 	// failure leaves disk on the pre-close state (and without closeReason)
 	// forever.
 	private _failedTerminalPersists: Set<string> = new Set();
+	// FORCE_CLOSED channels whose confirmed-splice close re-drive could not
+	// broadcast (issue #357): retried each block until the adopted-funding
+	// commitment reaches the network.
+	private _pendingSpliceCloseRedrives: Set<string> = new Set();
 	private reestablishTimeoutBlocks: number;
 	private readonly autoReconnect: boolean;
 	private walCheckpointTimer: ReturnType<typeof setInterval> | null = null;
@@ -6410,38 +6414,76 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
-		this.chainWatcher.on('funding:confirmed', (channelId: Buffer) => {
-			const channel = this.channelManager.getChannel(channelId);
-			if (!channel) return;
-			const state = channel.getFullState();
-			// The funding is mined: the BOLT 2 broadcast obligation is met, so
-			// the retained signed tx (kept for eviction rebroadcasts) retires
-			// and the forget clock stops. Both are channel state and both are
-			// persisted here rather than left for some later transition to
-			// carry: a clock left on disk after its funding CONFIRMED keeps
-			// counting across the next restart, toward voiding a channel that
-			// is on the chain.
-			let retired = channel.clearFundingMissingClock();
-			if (state.fundingTxid) {
-				retired = channel.clearRetainedFundingPayload() || retired;
-				this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
+		this.chainWatcher.on(
+			'funding:confirmed',
+			(channelId: Buffer, txid?: string) => {
+				this.onFundingWatchConfirmed(channelId, txid);
 			}
-			if (!state.spliceFundingTxid || !channel.getSpliceSession()) {
-				if (retired) this.persistChannel(channelId);
-				return;
-			}
-			// sendSpliceLocked self-validates the splice state; ignore if not ready.
+		);
+	}
+
+	/**
+	 * A watched funding output reached confirmation depth. `confirmedTxid` is
+	 * the watched txid in display byte order; the splice branch matches it
+	 * against the in-flight record rather than trusting channel state alone:
+	 * spliceFundingTxid is only stamped on the tx_signatures success path,
+	 * while the refusal/wire-failure retention arms and the restart re-arm
+	 * watch the record's txid without it, and markErrored kills the session
+	 * a live-session gate would demand (issue #357).
+	 */
+	private onFundingWatchConfirmed(
+		channelId: Buffer,
+		confirmedTxid?: string
+	): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const state = channel.getFullState();
+		// The funding is mined: the BOLT 2 broadcast obligation is met, so
+		// the retained signed tx (kept for eviction rebroadcasts) retires
+		// and the forget clock stops. Both are channel state and both are
+		// persisted here rather than left for some later transition to
+		// carry: a clock left on disk after its funding CONFIRMED keeps
+		// counting across the next restart, toward voiding a channel that
+		// is on the chain.
+		let retired = channel.clearFundingMissingClock();
+		if (state.fundingTxid) {
+			retired = channel.clearRetainedFundingPayload() || retired;
+			this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
+		}
+		const inflight = state.spliceInFlight;
+		const spliceConfirmed =
+			inflight != null &&
+			(confirmedTxid !== undefined
+				? Buffer.from(inflight.spliceTxid).reverse().toString('hex') ===
+				  confirmedTxid
+				: state.spliceFundingTxid != null);
+		if (!spliceConfirmed) {
+			if (retired) this.persistChannel(channelId);
+			return;
+		}
+		// sendSpliceLocked self-validates the splice state; ignore if not ready.
+		if (channel.getSpliceSession()) {
 			const result = this.channelManager.sendSpliceLocked(channelId);
-			if (!result.ok) {
-				// The channel could not announce the lock (typically disconnected /
-				// AWAITING_REESTABLISH). Record the confirmation so the splice_locked
-				// is flushed by the next channel_reestablish.
-				channel.markSpliceConfirmed();
+			if (result.ok) {
 				this.persistChannel(channelId);
 				return;
 			}
-			this.persistChannel(channelId);
-		});
+		}
+		// The channel could not announce the lock: disconnected
+		// (AWAITING_REESTABLISH), force-closed, or the session died with a
+		// mid-splice channel failure. Record the confirmation durably: a live
+		// channel flushes splice_locked on the next channel_reestablish, and
+		// the force-close planner's splice adoption keys off the confirmed
+		// record.
+		channel.markSpliceConfirmed();
+		this.persistChannel(channelId);
+		// Issue #357: the confirmed splice spends the old funding outpoint,
+		// voiding any old-funding commitment this FORCE_CLOSED channel
+		// broadcast. Re-drive the close on the adopted new funding instead
+		// of waiting for an operator rebroadcast.
+		if (channel.getState() === ChannelState.FORCE_CLOSED) {
+			void this.redriveSpliceAdoptedClose(channelId);
+		}
 	}
 
 	async startChainWatcher(): Promise<void> {
@@ -8314,6 +8356,73 @@ export class LightningNode extends EventEmitter {
 		}
 		this._lastCloseBroadcast.set(idHex, { txid, ok });
 		return ok;
+	}
+
+	/**
+	 * Issue #357: a splice that confirms on a FORCE_CLOSED channel voids the
+	 * old-funding commitment we broadcast (both spend the old funding
+	 * outpoint), and until now only an operator rebroadcastClose re-planned
+	 * the close. Rebuild through the force-close planner (whose splice
+	 * adoption moves the channel onto the confirmed new funding), persist the
+	 * adoption, and broadcast once, exactly as the manual path does. A
+	 * failed broadcast is retried each block; a rebuild refusal is final
+	 * (the rebuild is deterministic: a confirmed close or a peer commitment
+	 * having won will refuse identically every time).
+	 */
+	private async redriveSpliceAdoptedClose(channelId: Buffer): Promise<void> {
+		const idHex = channelId.toString('hex');
+		this._pendingSpliceCloseRedrives.delete(idHex);
+		try {
+			const rebuilt = this.channelManager.rebuildForceCloseCommitment(
+				channelId,
+				this.resolveForceCloseFeeRatePerVbyte()
+			);
+			if (!rebuilt.ok || !rebuilt.tx) {
+				this.emitStructuredLog('chain', 'splice_close_redrive_refused', {
+					channelId: idHex,
+					error: rebuilt.error
+				});
+				return;
+			}
+			// The rebuild's splice adoption mutated durable state (the new
+			// funding outpoint, capacity and balances): persist BEFORE the tx
+			// reaches the network, as every funding-critical broadcast does.
+			this.persistChannel(channelId);
+			const txid = bitcoin.Transaction.fromBuffer(rebuilt.tx).getId();
+			const broadcastOk = await this._broadcastCloseTx(idHex, txid, rebuilt.tx);
+			if (!broadcastOk) {
+				this._pendingSpliceCloseRedrives.add(idHex);
+			}
+			this.emitStructuredLog('chain', 'splice_close_redriven', {
+				channelId: idHex,
+				txid,
+				broadcastOk
+			});
+		} catch (err) {
+			this._pendingSpliceCloseRedrives.add(idHex);
+			this.emitStructuredLog('chain', 'splice_close_redrive_failed', {
+				channelId: idHex,
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	/**
+	 * Per-block retry of splice-adopted close re-drives whose broadcast
+	 * failed (issue #357): the channel is terminal, so no later transition
+	 * exists for the broadcast to ride.
+	 */
+	private retrySpliceCloseRedrives(): void {
+		if (this._pendingSpliceCloseRedrives.size === 0) return;
+		for (const idHex of [...this._pendingSpliceCloseRedrives]) {
+			const channelId = Buffer.from(idHex, 'hex');
+			const channel = this.channelManager.getChannel(channelId);
+			if (!channel || channel.getState() !== ChannelState.FORCE_CLOSED) {
+				this._pendingSpliceCloseRedrives.delete(idHex);
+				continue;
+			}
+			void this.redriveSpliceAdoptedClose(channelId);
+		}
 	}
 
 	// ─────────────── Splicing ───────────────
@@ -14358,6 +14467,7 @@ export class LightningNode extends EventEmitter {
 		this.retryPendingFundingBroadcasts();
 		this.retryPendingSpliceBroadcasts();
 		this.retryFailedTerminalPersists();
+		this.retrySpliceCloseRedrives();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(
