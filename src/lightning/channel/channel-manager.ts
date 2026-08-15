@@ -7186,28 +7186,46 @@ export class ChannelManager extends EventEmitter {
 	rebuildForceCloseCommitment(
 		channelId: Buffer,
 		feeRatePerVbyte: number
-	): { ok: boolean; tx?: Buffer; error?: string } {
+	): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean } {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
-		const monitor = this.monitors.get(idHex);
-		if (!channel || !monitor) {
+		if (!channel) {
 			return { ok: false, error: `Channel not found: ${idHex}` };
 		}
 		if (channel.getState() !== ChannelState.FORCE_CLOSED) {
 			return { ok: false, error: 'Channel is not force-closed' };
 		}
-		// Same reasoning as rearmCommitmentCpfp: once the monitor classified a
-		// spend that is NOT our commitment (the peer's close, possibly a
-		// revoked breach), rebroadcasting ours would compete with it.
-		const broadcast = monitor.getFullState().commitmentBroadcast;
-		if (
-			broadcast &&
-			broadcast.commitmentType !== CommitmentType.OUR_COMMITMENT
-		) {
-			return { ok: false, error: 'Close was not our commitment' };
-		}
-		if (monitor.isFullyResolved() || monitor.isCommitmentConfirmed()) {
-			return { ok: false, error: 'Close already confirmed' };
+		// A restored FORCE_CLOSED channel may have NO monitor: the crash
+		// window between the terminal persist and the first spend
+		// observation, which restoreChainWatches deliberately leaves for lazy
+		// creation on spend detection. With no recorded spend evidence there
+		// is nothing to refuse on; the rebuild derives from current persisted
+		// state exactly as the original close did.
+		const monitor = this.monitors.get(idHex);
+		if (monitor) {
+			// Same reasoning as rearmCommitmentCpfp: once the monitor classified
+			// a spend that is NOT our commitment (the peer's close, possibly a
+			// revoked breach), rebroadcasting ours would compete with it.
+			const broadcast = monitor.getFullState().commitmentBroadcast;
+			if (
+				broadcast &&
+				broadcast.commitmentType !== CommitmentType.OUR_COMMITMENT
+			) {
+				return { ok: false, error: 'Close was not our commitment' };
+			}
+			if (monitor.isFullyResolved() || monitor.isCommitmentConfirmed()) {
+				// A bare confirmation can be STALE: a reorg can replace the
+				// confirmed commitment (e.g. with a splice spending the same
+				// funding outpoint), and the funding-spend reconcile demotes the
+				// recorded height only afterwards. Resolution is depth-gated
+				// (issue #338), so fully-resolved is conclusive; a bare
+				// confirmation is worth the caller retrying.
+				return {
+					ok: false,
+					error: 'Close already confirmed',
+					retryable: !monitor.isFullyResolved()
+				};
+			}
 		}
 		const signer = this.signerFor(channel, true);
 		const actions = channel.forceClose(signer);
@@ -7222,6 +7240,15 @@ export class ChannelManager extends EventEmitter {
 		);
 		if (!txAction) {
 			return { ok: false, error: 'Force close rebuilt no transaction' };
+		}
+		// The rebuild can move the close onto a DIFFERENT commitment (splice
+		// adoption, issue #357): a CPFP entry retained for the old parent
+		// would keep re-broadcasting and fee-bumping the voided commitment
+		// while the adopted one rides with no CPFP child at all. Replace it.
+		const rebuiltTxid = bitcoin.Transaction.fromBuffer(txAction.tx).getId();
+		const existingCpfp = this._pendingCommitmentCpfp.get(idHex);
+		if (existingCpfp && existingCpfp.action.commitmentTxid !== rebuiltTxid) {
+			this._pendingCommitmentCpfp.delete(idHex);
 		}
 		if (!this._pendingCommitmentCpfp.has(idHex)) {
 			this._maybeCpfpAnchorCommitment(

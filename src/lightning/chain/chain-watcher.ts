@@ -60,7 +60,7 @@ export interface IChainBackend {
 /** A funding output being watched for confirmation */
 interface IWatchedFunding {
 	channelId: Buffer;
-	txid: string; // hex, internal (reversed) byte order
+	txid: string; // hex, display byte order (as Electrum history reports it)
 	outputIndex: number;
 	minimumDepth: number;
 	scriptHash: string;
@@ -188,7 +188,9 @@ export async function classifyRemoteFundingInput(
  * and new blocks, bridging these events to the ChannelManager.
  *
  * Events:
- * - 'funding:confirmed' (channelId: Buffer)
+ * - 'funding:confirmed' (channelId: Buffer, txid: string): the watched txid
+ *   (display byte order) that reached depth, so listeners can tell a splice
+ *   confirmation from the original funding without trusting channel state
  * - 'funding:spent' (channelId: Buffer, spendingTx: Transaction)
  * - 'funding:missing' (channelId: Buffer, txid: string): the watched funding
  *   tx disappeared from mempool AND chain before confirming (evicted/replaced)
@@ -1016,7 +1018,7 @@ export class ChainWatcher extends EventEmitter {
 			watched.confirmationHeight = entry.height;
 
 			this.channelManager.handleFundingConfirmed(watched.channelId);
-			this.emit('funding:confirmed', watched.channelId);
+			this.emit('funding:confirmed', watched.channelId, watched.txid);
 
 			// Now watch for the funding output being spent (force close detection)
 			this.watchFundingSpend(watched, generation).catch((err) => {
