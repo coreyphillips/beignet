@@ -28,6 +28,37 @@
  *     waiting out the pledge TTL. Post-signature deaths keep the TTL as the
  *     backstop: the peer may broadcast, so an early release could double
  *     spend a funding tx that still confirms.
+ *
+ * tx_abort and RBF refusal semantics (issue #309): tx_abort IS the refusal
+ * signal for tx_init_rbf. BOLT 2 makes it explicit: the recipient "MUST
+ * respond either with tx_abort or with tx_ack_rbf" and "MAY send tx_abort
+ * for any reason". The refusal is ATTEMPT-scoped, never open-scoped: only
+ * the replacement attempt dies, both sides retain the current attempt, and
+ * with a fully signed attempt the channel keeps waiting for confirmation
+ * (tx_abort receiver rule: having sent tx_signatures, a node "MUST NOT
+ * forget the channel until any inputs to the negotiated tx have been
+ * spent"). Verified against both major implementations:
+ *   - Eclair 0.14.1 (ChannelOpenDualFunded.scala) rejects tx_init_rbf with
+ *     stay() + TxAbort (status RbfAborted, channel alive), and treats an
+ *     answering tx_abort to its own request as "our peer rejected our rbf
+ *     attempt": it rolls back to WaitingForConfirmations and stays in
+ *     WAIT_FOR_DUAL_FUNDING_CONFIRMED on the original funding tx.
+ *   - CLN (openingd/dualopend.c) refuses in rbf_remote_start via
+ *     open_abort() (sends tx_abort) and frees only the RBF-scoped tx_state,
+ *     keeping the previously committed attempt; its handle_tx_abort echoes
+ *     and aborts the negotiation without disconnecting.
+ * Channel.handleTxInitRbf / handleTxAbort implement the same convergence
+ * (the pending-RBF branch consumes an incoming tx_abort as the refusal and
+ * resumes the frozen tx_signatures release of the retained attempt).
+ * Known divergence: beignet conducts RBF between the commitment exchange
+ * and the tx_signatures exchange, while Eclair/CLN RBF a COMPLETED (fully
+ * signed, broadcast, unconfirmed) attempt; the windows do not overlap, and
+ * the tx_init_rbf/tx_ack_rbf codecs carry no funding_output_contribution
+ * TLV, so the replacement path is beignet-to-beignet only and a
+ * cross-implementation tx_init_rbf resolves as a clean attempt-scoped
+ * refusal in either direction rather than a completed replacement. Tracked
+ * as a feature gap in issue #360; the live refusal path is pinned by
+ * tests/lightning/interop/eclair-v2open-rbf-refusal.test.ts.
  */
 
 import { InteractiveTxBuilder } from '../interactive-tx/builder';
@@ -51,14 +82,15 @@ import { IChannelBasepoints } from '../keys/derivation';
 import { ILeaseRates } from '../gossip/types';
 
 /**
- * BOLT 2: the minimum feerate for an RBF attempt is 25/24 of the previous
- * funding feerate. At tiny feerates the 25/24 ratio rounds down to the
- * previous value, so the floor is never below a strict +1 increase.
+ * BOLT 2: the minimum feerate for an RBF attempt is the greater of 25/24 of
+ * the previous funding feerate (rounded down) and 25 sat/kw above it. At
+ * tiny feerates the ratio arm rounds down near the previous value, so the
+ * additive +25 arm is the floor there.
  */
 export function rbfFeerateFloor(previousFeeratePerkw: number): number {
 	return Math.max(
 		Math.floor((previousFeeratePerkw * 25) / 24),
-		previousFeeratePerkw + 1
+		previousFeeratePerkw + 25
 	);
 }
 
