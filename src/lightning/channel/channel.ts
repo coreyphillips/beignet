@@ -4041,10 +4041,18 @@ export class Channel {
 	 *   already in a closed state (idempotent).
 	 */
 	markClosedOnChain(force: boolean): boolean {
-		if (
-			this._state.state === ChannelState.CLOSED ||
-			this._state.state === ChannelState.FORCE_CLOSED
-		) {
+		// A commitment spend can REPLACE a recorded cooperative close (reorg
+		// swap while the mutual close waits out its anti-reorg depth, issue
+		// 353). The channel sits in CLOSED from the coop classification, but the
+		// close that is actually confirmed is now unilateral: escalate so the
+		// force-close lifecycle (pending-close balance, events, restore repair)
+		// applies in this session instead of only after a restart.
+		if (this._state.state === ChannelState.CLOSED) {
+			if (!force) return false;
+			this._state.state = ChannelState.FORCE_CLOSED;
+			return true;
+		}
+		if (this._state.state === ChannelState.FORCE_CLOSED) {
 			return false;
 		}
 		this._state.state = force ? ChannelState.FORCE_CLOSED : ChannelState.CLOSED;

@@ -459,7 +459,8 @@ describe('Pending-close resolution', function () {
 			const channelIdHex = channelId.toString('hex');
 			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
 
-			// A cooperative-close spend resolves the monitor immediately.
+			// A cooperative-close spend resolves the monitor once it is buried
+			// IRREVOCABLE_DEPTH deep (issue 338).
 			const closingResult = buildClosingTx({
 				fundingTxid: state.fundingTxid!.toString('hex'),
 				fundingOutputIndex: state.fundingOutputIndex,
@@ -479,6 +480,7 @@ describe('Pending-close resolution', function () {
 				network
 			);
 			monitor.handleFundingSpent(closingResult.tx, 100);
+			monitor.handleNewBlock(200);
 			expect(monitor.isFullyResolved()).to.be.true;
 
 			// Persist the stale shape: channel FORCE_CLOSED, monitor FULLY_RESOLVED.

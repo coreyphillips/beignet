@@ -2930,7 +2930,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						resolution: {
 							type: 'string',
 							enum: ['pending', 'sweeping', 'resolved'],
-							description: "Sweep progress across the close's tracked outputs"
+							description:
+								'On-chain resolution progress: pending until the close tx confirms, sweeping while outputs are swept and/or the close waits out its anti-reorg depth, resolved once irrevocable'
 						},
 						fundsAvailableHeight: {
 							type: 'integer',

@@ -1099,6 +1099,16 @@ export class ChainWatcher extends EventEmitter {
 			this.emit('funding:spent', watched.channelId, spendingTx);
 			return;
 		}
+
+		// History fetched successfully and NO spender found. If the channel's
+		// monitor has a confirmed spend recorded, that spend was reorged out
+		// without even re-entering the mempool, and its irrevocable-depth clock
+		// must stop counting against the vanished height (issue 352). No-op for
+		// channels with no recorded spend. The splice watch is excluded: it
+		// ignores the expected splice spend, so an empty result there is normal.
+		if (!watched.ignoreSpendTxid) {
+			this.channelManager.handleFundingSpendAbsent?.(watched.channelId);
+		}
 	}
 
 	private findChannelByFunding(

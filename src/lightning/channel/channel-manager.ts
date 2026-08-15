@@ -1990,6 +1990,21 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * The funding watch fetched the funding script's history successfully and
+	 * found NO spender: whatever spend this channel's monitor has recorded as
+	 * confirmed is no longer in the chain or the mempool (issue 352). Let the
+	 * monitor stop its irrevocable-depth clock until positive evidence returns.
+	 */
+	handleFundingSpendAbsent(channelId: Buffer): void {
+		const channelIdHex = channelId.toString('hex');
+		const monitor = this.monitors.get(channelIdHex);
+		if (!monitor) return;
+		if (monitor.handleFundingSpendAbsent()) {
+			this.emit('monitor:updated', channelIdHex, monitor);
+		}
+	}
+
+	/**
 	 * Forward new block to all active chain monitors.
 	 */
 	handleNewBlock(blockHeight: number): ChainAction[] {

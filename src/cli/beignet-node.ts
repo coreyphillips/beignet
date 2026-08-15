@@ -1049,11 +1049,10 @@ export class BeignetNode extends EventEmitter {
 		this.node.on('channel:resolved', (data: { channelId: Buffer }) => {
 			this.refreshStaticChannelBackup();
 			const channelId = data.channelId.toString('hex');
-			// Issue #338: the engine currently marks a cooperative close fully
-			// resolved the moment it is classified, possibly from a mempool
-			// sighting. An unconfirmed close is not a terminal guarantee (a
-			// reorg can void it), so do not relay it as one; once #338 gates
-			// the engine event on burial this guard never triggers.
+			// The engine gates resolution on IRREVOCABLE_DEPTH (issue #338), so
+			// a live monitor only reaches here confirmed. Kept as a belt for
+			// pre-fix persisted state: an unconfirmed close is not a terminal
+			// guarantee (a reorg can void it), so never relay it as one.
 			const monitor = this.node.getChannelManager().getMonitor(data.channelId);
 			if (monitor && !monitor.isCommitmentConfirmed()) {
 				this.log(
