@@ -26,7 +26,9 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 	/** Threshold of consecutive failures before emitting failover request */
 	readonly failoverThreshold: number;
 	/** Callback invoked when failover threshold is reached */
-	onFailoverNeeded: ((consecutiveFailures: number) => void) | null = null;
+	onFailoverNeeded:
+		| ((consecutiveFailures: number) => void | Promise<void>)
+		| null = null;
 	/** Callback invoked after subscriptions are (re)established on reconnect. */
 	onResubscribed: (() => void) | null = null;
 
@@ -167,7 +169,7 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 	 */
 	startReconnectMonitor(intervalMs = 30_000): void {
 		this.stopReconnectMonitor();
-		this._reconnectTimer = setInterval(async () => {
+		const tick = async (): Promise<void> => {
 			try {
 				// Lightweight ping: attempt to subscribe to header (no-op if already
 				// subscribed). Wrapped in the call timeout — a hanging server (e.g.
@@ -182,7 +184,7 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 						this._consecutiveFailures >= this.failoverThreshold &&
 						this.onFailoverNeeded
 					) {
-						this.onFailoverNeeded(this._consecutiveFailures);
+						void this.onFailoverNeeded(this._consecutiveFailures);
 					}
 					await this.resubscribeAll();
 				} else {
@@ -194,7 +196,7 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 					this._consecutiveFailures >= this.failoverThreshold &&
 					this.onFailoverNeeded
 				) {
-					this.onFailoverNeeded(this._consecutiveFailures);
+					void this.onFailoverNeeded(this._consecutiveFailures);
 				}
 				try {
 					await this.resubscribeAll();
@@ -202,6 +204,9 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 					// Resubscribe also failed — will retry next interval
 				}
 			}
+		};
+		this._reconnectTimer = setInterval((): void => {
+			void tick();
 		}, intervalMs);
 		if (this._reconnectTimer.unref) {
 			this._reconnectTimer.unref();

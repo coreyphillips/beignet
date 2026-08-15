@@ -7,7 +7,9 @@ import {
 	IOutput,
 	ISendTransaction,
 	TDecodeRawTx,
+	TGetByteCountInput,
 	TGetByteCountInputs,
+	TGetByteCountOutput,
 	TGetByteCountOutputs
 } from '../types';
 import { availableNetworks, reduceValue } from './wallet';
@@ -37,7 +39,7 @@ export const setReplaceByFee = ({
 		// @ts-ignore type for Psbt is wrong
 		const ins = psbt.data.globalMap.unsignedTx.tx.ins;
 		if (ins.length !== 0) {
-			ins.forEach((x) => {
+			ins.forEach((x: bitcoin.TxInput) => {
 				if (setRbf) {
 					if (x.sequence >= defaultSequence - 1) {
 						x.sequence = 0;
@@ -146,11 +148,7 @@ export const parseOnChainPaymentRequest = (
 					data = `bitcoin:${data}`;
 				}
 
-				// types are wrong for package 'bip21'
-				const result = bip21.decode(data) as {
-					address: string;
-					options: { [key: string]: string };
-				};
+				const result = bip21.decode(data);
 				const address = result.address;
 				validateAddressResult = validateAddress({ address, network });
 				//Ensure address is valid
@@ -195,7 +193,9 @@ export const constructByteCountParam = (
 		const param: TGetByteCountOutputs = {};
 		addresses.forEach((address) => {
 			if (validate(address)) {
-				const addressType = getAddressInfo(address).type.toUpperCase();
+				const addressType = getAddressInfo(
+					address
+				).type.toUpperCase() as TGetByteCountOutput;
 				param[addressType] = (param[addressType] ?? 0) + 1;
 			}
 		});
@@ -210,7 +210,7 @@ export const constructByteCountParam = (
 		// of the same type, which it then counted twice.
 		increaseAddressCount.forEach(({ addrType, count }) => {
 			if (count <= 0) return;
-			const key = String(addrType).toUpperCase();
+			const key = String(addrType).toUpperCase() as TGetByteCountOutput;
 			param[key] = (param[key] ?? 0) + count;
 		});
 		return Object.keys(param).length ? param : { P2WPKH: 0 };
@@ -267,7 +267,10 @@ export const getByteCount = (
 		let inputCount = 0;
 		let outputCount = 0;
 		// assumes compressed pubkeys in all cases.
-		const types = {
+		const types: {
+			inputs: { [key: string]: number | undefined };
+			outputs: { [key: string]: number | undefined };
+		} = {
 			// MULTISIG-* do not include pubkeys or signatures yet (this is calculated at runtime)
 			// sigs = 73 and pubkeys = 34 (these include pushdata byte)
 			inputs: {
@@ -314,12 +317,17 @@ export const getByteCount = (
 			}
 		};
 
-		const checkUInt53 = (n): void => {
-			if (n < 0 || n > Number.MAX_SAFE_INTEGER || n % 1 !== 0)
+		const checkUInt53: (n: number | undefined) => asserts n is number = (n) => {
+			if (
+				n === undefined ||
+				n < 0 ||
+				n > Number.MAX_SAFE_INTEGER ||
+				n % 1 !== 0
+			)
 				throw new RangeError('value out of range');
 		};
 
-		const varIntLength = (number): number => {
+		const varIntLength = (number: number): number => {
 			checkUInt53(number);
 
 			return number < 0xfd
@@ -337,51 +345,55 @@ export const getByteCount = (
 		// value of its upper-case twin ("P2WPKH") and count it a second time, so a
 		// param carrying both forms was double-counted. constructByteCountParam
 		// emits exactly that pair, which inflated every fee getTotalFeeObj quoted.
-		Object.keys(inputs).forEach(function (originalKey) {
-			const count = inputs[originalKey];
-			const key = originalKey.toUpperCase();
-			checkUInt53(count);
-			if (key.slice(0, 8) === 'MULTISIG') {
-				// ex. "MULTISIG-P2SH:2-3" would mean 2 of 3 P2SH MULTISIG
-				const keyParts = key.split(':');
-				if (keyParts.length !== 2) throw new Error('invalid input: ' + key);
-				const newKey = keyParts[0];
-				const mAndN = keyParts[1].split('-').map(function (item) {
-					return parseInt(item);
-				});
+		(Object.keys(inputs) as TGetByteCountInput[]).forEach(
+			function (originalKey) {
+				const count = inputs[originalKey];
+				const key = originalKey.toUpperCase();
+				checkUInt53(count);
+				if (key.slice(0, 8) === 'MULTISIG') {
+					// ex. "MULTISIG-P2SH:2-3" would mean 2 of 3 P2SH MULTISIG
+					const keyParts = key.split(':');
+					if (keyParts.length !== 2) throw new Error('invalid input: ' + key);
+					const newKey = keyParts[0];
+					const mAndN = keyParts[1].split('-').map(function (item) {
+						return parseInt(item);
+					});
 
-				const multisigWeight = types.inputs[newKey];
-				if (multisigWeight === undefined)
-					throw new Error('invalid input: ' + key);
-				totalWeight += multisigWeight * count;
-				const multiplyer = newKey === 'MULTISIG-P2SH' ? 4 : 1;
-				totalWeight += (73 * mAndN[0] + 34 * mAndN[1]) * multiplyer * count;
-			} else {
-				// An unknown key used to make totalWeight NaN, and NaN fails the
-				// minByteCount comparison below, so the function returned NaN
-				// instead of the fallback its catch provides. types.inputs has no
-				// plain P2WSH entry, which is the reachable case.
-				const weight = types.inputs[key];
-				if (weight === undefined) throw new Error('invalid input: ' + key);
-				totalWeight += weight * count;
+					const multisigWeight = types.inputs[newKey];
+					if (multisigWeight === undefined)
+						throw new Error('invalid input: ' + key);
+					totalWeight += multisigWeight * count;
+					const multiplyer = newKey === 'MULTISIG-P2SH' ? 4 : 1;
+					totalWeight += (73 * mAndN[0] + 34 * mAndN[1]) * multiplyer * count;
+				} else {
+					// An unknown key used to make totalWeight NaN, and NaN fails the
+					// minByteCount comparison below, so the function returned NaN
+					// instead of the fallback its catch provides. types.inputs has no
+					// plain P2WSH entry, which is the reachable case.
+					const weight = types.inputs[key];
+					if (weight === undefined) throw new Error('invalid input: ' + key);
+					totalWeight += weight * count;
+				}
+				inputCount += count;
+				// Any segwit input needs the 2-WU marker+flag. P2TR is segwit (v1) but
+				// has no 'W' in its name, so it was missed here and every taproot-only
+				// tx under-counted the witness overhead by 2 WU.
+				if (count > 0 && (key.indexOf('W') >= 0 || key === 'P2TR'))
+					hasWitness = true;
 			}
-			inputCount += count;
-			// Any segwit input needs the 2-WU marker+flag. P2TR is segwit (v1) but
-			// has no 'W' in its name, so it was missed here and every taproot-only
-			// tx under-counted the witness overhead by 2 WU.
-			if (count > 0 && (key.indexOf('W') >= 0 || key === 'P2TR'))
-				hasWitness = true;
-		});
+		);
 
-		Object.keys(outputs).forEach(function (originalKey) {
-			const count = outputs[originalKey];
-			const key = originalKey.toUpperCase();
-			checkUInt53(count);
-			const weight = types.outputs[key];
-			if (weight === undefined) throw new Error('invalid output: ' + key);
-			totalWeight += weight * count;
-			outputCount += count;
-		});
+		(Object.keys(outputs) as TGetByteCountOutput[]).forEach(
+			function (originalKey) {
+				const count = outputs[originalKey];
+				const key = originalKey.toUpperCase();
+				checkUInt53(count);
+				const weight = types.outputs[key];
+				if (weight === undefined) throw new Error('invalid output: ' + key);
+				totalWeight += weight * count;
+				outputCount += count;
+			}
+		);
 
 		if (hasWitness) totalWeight += 2;
 		// Price the exact script the PSBT builder will embed, rather than a second

@@ -51,6 +51,16 @@
         "@typescript-eslint/no-empty-function": "off",
         "@typescript-eslint/ban-types": "off"
       }
+    },
+    {
+      "files": ["**/*.ts"],
+      "parserOptions": {
+        "project": ["./tsconfig.test.json"]
+      },
+      "rules": {
+        "@typescript-eslint/no-floating-promises": "error",
+        "@typescript-eslint/no-misused-promises": "error"
+      }
     }
   ]
 }

@@ -246,7 +246,7 @@ describe('Channel Announcement Wiring (Phase 4)', () => {
 			);
 
 			// Watch the funding output with minimumDepth=1
-			watcher
+			void watcher
 				.watchFundingOutput(channelId, txid, 0, 1, scriptPubkey)
 				.then(() => {
 					return watcher.start();
@@ -290,7 +290,7 @@ describe('Channel Announcement Wiring (Phase 4)', () => {
 				announcementEmitted = true;
 			});
 
-			watcher
+			void watcher
 				.watchFundingOutput(channelId, txid, 0, 1, scriptPubkey)
 				.then(() => {
 					return watcher.start();

@@ -28,3 +28,11 @@ jobs:
 
       - name: Type check
         run: npm run tsc:check
+
+      # Several tests import the package root, whose types entry resolves to
+      # dist/types/index.d.ts, so dist must exist before tests are checked.
+      - name: Build
+        run: npm run build
+
+      - name: Type check tests and scripts
+        run: npm run tsc:check:tests

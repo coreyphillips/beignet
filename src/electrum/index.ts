@@ -119,10 +119,9 @@ export class Electrum {
 		this.tls = tls;
 		this.batchLimit = batchLimit;
 		this.batchDelay = batchDelay;
-		this.connectionPollingInterval = setInterval(
-			(): Promise<void> => this.checkConnection(),
-			POLLING_INTERVAL
-		);
+		this.connectionPollingInterval = setInterval((): void => {
+			void this.checkConnection();
+		}, POLLING_INTERVAL);
 	}
 
 	public get wallet(): Wallet {
@@ -594,7 +593,7 @@ export class Electrum {
 			return history;
 		}
 		await Promise.all(
-			response.data.map(({ result }): void => {
+			response.data.map(({ result }: { result: TTxResult[] }): void => {
 				if (result && result?.length > 0) {
 					result.map((item) => {
 						history.push({
@@ -1071,7 +1070,7 @@ export class Electrum {
 				network: this.electrumNetwork,
 				onReceive: async (data: TSubscribedReceive): Promise<void> => {
 					onReceive?.(data);
-					this._wallet.refreshWallet({});
+					void this._wallet.refreshWallet({});
 				}
 			});
 			if (response.error) {
@@ -1090,7 +1089,7 @@ export class Electrum {
 						addressIndex: utxo.index,
 						changeAddressIndex: utxo.index
 					});
-					this._wallet.refreshWallet({});
+					void this._wallet.refreshWallet({});
 				}
 			});
 			if (response.error) {
@@ -1169,7 +1168,7 @@ export class Electrum {
 
 				if (response.isOk()) {
 					// Re-Subscribe to Addresses & Headers
-					this.subscribeToAddresses({});
+					void this.subscribeToAddresses({});
 					this.subscribeToHeader().catch(() => {
 						/* best-effort re-subscribe on reconnect */
 					});
@@ -1207,10 +1206,9 @@ export class Electrum {
 
 	public startConnectionPolling(): void {
 		if (this.connectionPollingInterval) return;
-		this.connectionPollingInterval = setInterval(
-			(): Promise<void> => this.checkConnection(),
-			POLLING_INTERVAL
-		);
+		this.connectionPollingInterval = setInterval((): void => {
+			void this.checkConnection();
+		}, POLLING_INTERVAL);
 	}
 
 	public stopConnectionPolling(): void {

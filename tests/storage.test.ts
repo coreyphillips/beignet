@@ -25,7 +25,7 @@ const storage = { getData, setData };
 const storageSpy = sinon.spy(storage, 'setData');
 const messageSpy = sinon.spy();
 
-describe('Storage Test', async function (): Promise<void> {
+describe('Storage Test', function () {
 	this.timeout(testTimeout);
 
 	before(async function () {
@@ -151,7 +151,7 @@ describe('Storage Test', async function (): Promise<void> {
 	});
 
 	it('Should successfully stop the wallet', async () => {
-		wallet.refreshWallet(); // start wallet refresh in the background
+		void wallet.refreshWallet(); // start wallet refresh in the background
 		const r = await wallet.stop();
 		if (r.isErr()) throw r.error;
 		storageSpy.resetHistory();

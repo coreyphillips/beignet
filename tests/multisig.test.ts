@@ -121,7 +121,7 @@ const makeMultisigUtxo = async (
 	};
 };
 
-describe('Multisig P2WSH Wallets', async function () {
+describe('Multisig P2WSH Wallets', function () {
 	this.timeout(testTimeout);
 
 	before(function () {

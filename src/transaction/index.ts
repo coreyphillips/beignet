@@ -146,9 +146,9 @@ export class Transaction {
 			if (!lightningInvoice) {
 				//Remove any potential change address that may have been included from a previous tx attempt.
 				outputs = outputs.filter((output) => {
-					if (output.address && !changeAddressesArr.includes(output.address)) {
-						return output;
-					}
+					return !!(
+						output.address && !changeAddressesArr.includes(output.address)
+					);
 				});
 			}
 
@@ -374,7 +374,7 @@ export class Transaction {
 	} = {}): Result<TGetTotalFeeObj> => {
 		try {
 			if (!transaction.inputs?.length) {
-				this.setupTransaction({});
+				void this.setupTransaction({});
 				transaction = this.data;
 			}
 			const changeAddress = transaction.changeAddress;
@@ -1250,7 +1250,7 @@ export class Transaction {
 				...transaction
 			};
 
-			this._wallet.saveWalletData('transaction', this.data).then();
+			void this._wallet.saveWalletData('transaction', this.data);
 
 			return ok('Transaction updated');
 		} catch (e) {
@@ -1438,7 +1438,10 @@ export class Transaction {
 			}
 			const fees = this._wallet.feeEstimates;
 			const selectedFeeId = this._wallet.selectedFeeId;
-			const satsPerByte = customFeeRate ?? fees[selectedFeeId] ?? 1;
+			const satsPerByte =
+				customFeeRate ??
+				(fees as Partial<Record<EFeeId, number>>)[selectedFeeId] ??
+				1;
 			const fee = this.getTotalFee({
 				satsPerByte,
 				message: transaction.message,
@@ -1810,7 +1813,7 @@ export class Transaction {
 				if (!validateResponse) {
 					return;
 				}
-				const type = validateResponse.type.toUpperCase();
+				const type = validateResponse.type.toUpperCase() as EAddressType;
 				if (type in outputTypes) {
 					outputTypes[type] = outputTypes[type] + 1;
 				} else {
@@ -1827,7 +1830,7 @@ export class Transaction {
 					if (!validateResponse) {
 						return;
 					}
-					const type = validateResponse.type.toUpperCase();
+					const type = validateResponse.type.toUpperCase() as EAddressType;
 					if (type in inputTypes) {
 						inputTypes[type] = inputTypes[type] + 1;
 					} else {

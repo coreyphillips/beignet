@@ -11,7 +11,6 @@
     "allowSyntheticDefaultImports": true,
     "isolatedModules": false,
     "resolveJsonModule": true,
-    "noImplicitAny": false,
     "declaration": true,
     "strict": true,
     "allowJs": true,
@@ -21,6 +20,9 @@
     "noImplicitThis": true,
     "alwaysStrict": true,
     "noUnusedLocals": true,
+    "typeRoots": ["./node_modules/@types", "./types"],
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
     "skipLibCheck": true,
     "useUnknownInCatchVariables": false
   },

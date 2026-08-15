@@ -428,7 +428,10 @@ describe('HTTP Route Fixes', () => {
 
 describe('Daemon: sendPaymentAsync route', () => {
 	it('daemon POST /invoice/pay-async delegates to BeignetNode.sendPaymentAsync', async function () {
-		if (skipAll) return this.skip();
+		if (skipAll) {
+			this.skip();
+			return;
+		}
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-payasync-'));
 		const origHome = process.env.HOME;
 		process.env.HOME = tmpDir;
@@ -473,7 +476,10 @@ describe('Daemon: sendPaymentAsync route', () => {
 
 describe('Daemon: cancelPayment route', () => {
 	it('daemon POST /payment/cancel route exists and validates input', async function () {
-		if (skipAll) return this.skip();
+		if (skipAll) {
+			this.skip();
+			return;
+		}
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-cancel-'));
 		const origHome = process.env.HOME;
 		process.env.HOME = tmpDir;
@@ -516,7 +522,10 @@ describe('Daemon: cancelPayment route', () => {
 
 describe('Daemon: getBalance unsettledSats', () => {
 	it('GET /balance returns unsettledSats in response', async function () {
-		if (skipAll) return this.skip();
+		if (skipAll) {
+			this.skip();
+			return;
+		}
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-balance-'));
 		const origHome = process.env.HOME;
 		process.env.HOME = tmpDir;
@@ -559,7 +568,10 @@ describe('Daemon: getBalance unsettledSats', () => {
 describe('Daemon: updateChannelFee route', () => {
 	it('daemon POST /channel/update-fee delegates to BeignetNode', async function () {
 		this.timeout(30_000);
-		if (skipAll) return this.skip();
+		if (skipAll) {
+			this.skip();
+			return;
+		}
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-test-dx3-'));
 		const origHome = process.env.HOME;
 		process.env.HOME = tmpDir;

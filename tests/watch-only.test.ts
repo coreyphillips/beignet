@@ -92,7 +92,7 @@ const createWatchOnly = async (
 	return res.value;
 };
 
-describe('Watch-Only Wallets', async function () {
+describe('Watch-Only Wallets', function () {
 	this.timeout(testTimeout);
 
 	before(async function () {

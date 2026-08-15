@@ -25,7 +25,7 @@ let waitForElectrum: TWaitForElectrum;
 const rpc = new BitcoinJsonRpc(bitcoinURL);
 const failure = { canBoost: false, rbf: false, cpfp: false };
 
-describe('Boost', async function () {
+describe('Boost', function () {
 	this.timeout(testTimeout);
 
 	beforeEach(async function () {
@@ -163,7 +163,7 @@ describe('Boost', async function () {
 		const createRes = await wallet.transaction.createTransaction();
 		if (createRes.isErr()) throw createRes.error;
 		const newTxId = createRes.value.id;
-		wallet.electrum.broadcastTransaction({ rawTx: createRes.value.hex });
+		void wallet.electrum.broadcastTransaction({ rawTx: createRes.value.hex });
 
 		const addBoost = await wallet.addBoostedTransaction({
 			oldTxId,

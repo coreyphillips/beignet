@@ -35,7 +35,7 @@ const testTimeout = 60000;
  * states regressed from confirmed back to received, and one arrival
  * notified twice.
  */
-describe('Transaction message lifecycle', async function () {
+describe('Transaction message lifecycle', function () {
 	this.timeout(testTimeout);
 
 	let wallet: Wallet | undefined;

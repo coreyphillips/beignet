@@ -305,7 +305,7 @@ export class Peer extends EventEmitter {
 				this.socket.once('error', onError);
 				this.socket.once('timeout', onTimeout);
 
-				this.socket.once('connect', async () => {
+				const onConnect = async (): Promise<void> => {
 					this.socket!.removeListener('error', onError);
 					this.socket!.removeListener('timeout', onTimeout);
 					this.socket!.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
@@ -326,6 +326,9 @@ export class Peer extends EventEmitter {
 						this.destroySocket();
 						reject(err);
 					}
+				};
+				this.socket.once('connect', (): void => {
+					void onConnect();
 				});
 			}).finally(() => {
 				this.establishmentAbort = null;

@@ -1342,7 +1342,7 @@ export class PeerManager extends EventEmitter {
 		const nextBaseDelay = Math.min(baseDelay * 2, this.maxReconnectDelay);
 		this.reconnectDelays.set(pubkey, nextBaseDelay);
 
-		const timer = setTimeout(async () => {
+		const attemptReconnect = async (): Promise<void> => {
 			this.reconnectTimers.delete(pubkey);
 			// The peer may have re-dialed us while we waited (common over Tor).
 			if (this.peers.has(pubkey)) return;
@@ -1368,6 +1368,9 @@ export class PeerManager extends EventEmitter {
 			if (cancelled()) return;
 			// Every candidate failed: next round with a larger backoff.
 			this.scheduleReconnect(pubkey);
+		};
+		const timer = setTimeout((): void => {
+			void attemptReconnect();
 		}, actualDelay);
 
 		this.reconnectTimers.set(pubkey, timer);

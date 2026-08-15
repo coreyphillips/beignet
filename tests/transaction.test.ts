@@ -21,7 +21,7 @@ const testTimeout = 60000;
 
 let wallet: Wallet;
 
-describe('Transaction Test', async function (): Promise<void> {
+describe('Transaction Test', function () {
 	this.timeout(testTimeout);
 
 	before(async function () {
