@@ -103,6 +103,22 @@ function makePeerPrevTx(valueSats = 100_000): Buffer {
 	return tx.toBuffer();
 }
 
+/**
+ * Like makePeerPrevTx but paying a P2TR output at vout 0: the fee audit
+ * must charge key-spend inputs their actual 230 WU minimum, not the
+ * P2WPKH figure (issue #359).
+ */
+function makePeerPrevTxP2tr(valueSats = 100_000): Buffer {
+	const tx = new bitcoin.Transaction();
+	tx.version = 2;
+	tx.addInput(crypto.randomBytes(32), 0);
+	tx.addOutput(
+		Buffer.concat([Buffer.from([0x51, 0x20]), crypto.randomBytes(32)]),
+		valueSats
+	);
+	return tx.toBuffer();
+}
+
 function makeBasepoints(): IChannelBasepoints {
 	const privkey = crypto.randomBytes(32);
 	const pub = getPublicKey(privkey);
@@ -1504,6 +1520,106 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 				)
 			).to.be.true;
 			expect(channel.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		});
+
+		/**
+		 * Issue #359: the completed-tx fee audit must charge each input its
+		 * MINIMUM signed weight (271 WU for P2WPKH with a low-R 71 byte
+		 * signature, 230 WU for a P2TR key-spend), never the funding-side
+		 * 272 WU estimate. bitcoind-backed peers (eclair, CLN) grind low-R
+		 * signatures and pay the exact negotiated feerate against those
+		 * minimums; the old floor refused every such solo-funded open by
+		 * 1 WU per input. Shape below: our P2WPKH input + the peer's input
+		 * + one 22 byte script output at 1000 sat/kw.
+		 */
+		function driveCompletionWithFee(opts: {
+			peerPrevTx: Buffer;
+			peerInputValueSats: bigint;
+			feeSats: bigint;
+		}): { actions: ChannelAction[]; channel: Channel } {
+			const { channel, params } = makeV2Channel();
+			channel.initiateOpenV2(params);
+			const channelId = channel.getTemporaryChannelId();
+			channel.handleAcceptChannel2(makeAcceptChannel2Msg({ channelId }));
+
+			const ourValue = 200_000n;
+			const prevTx = makePeerPrevTx(Number(ourValue));
+			channel.addTxInput({
+				serialId: 0n,
+				prevTxid: Buffer.from(bitcoin.Transaction.fromBuffer(prevTx).getHash()),
+				prevOutputIndex: 0,
+				sequence: 0xfffffffd,
+				prevTx,
+				prevTxVout: 0
+			});
+			channel.handleTxAddInput({
+				channelId,
+				serialId: 1n,
+				prevTx: opts.peerPrevTx,
+				prevTxVout: 0,
+				sequence: 0xfffffffd
+			});
+			channel.addTxOutput({
+				serialId: 2n,
+				amountSats: ourValue + opts.peerInputValueSats - opts.feeSats,
+				scriptPubkey: Buffer.alloc(22, 0x00)
+			});
+			channel.handleTxComplete();
+			const actions = channel.sendTxComplete();
+			return { actions, channel };
+		}
+
+		const sends = (
+			actions: ChannelAction[],
+			messageType: MessageType
+		): boolean =>
+			actions.some(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					(a as { messageType: MessageType }).messageType === messageType
+			);
+
+		it('accepts a completed tx paying the exact feerate with low-R sized witnesses (issue 359)', () => {
+			// 42 + 271 + 271 + 124 = 708 WU at 1000 sat/kw: 708 sats is the
+			// exact low-R floor and sits BELOW the old 710 sat floor.
+			const { actions, channel } = driveCompletionWithFee({
+				peerPrevTx: makePeerPrevTx(60_000),
+				peerInputValueSats: 60_000n,
+				feeSats: 708n
+			});
+			expect(sends(actions, MessageType.TX_COMPLETE), 'negotiation completes')
+				.to.be.true;
+			expect(sends(actions, MessageType.TX_ABORT), 'no refusal').to.be.false;
+			expect(channel.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		});
+
+		it('audits P2TR key-spend inputs at their actual witness weight (issue 359)', () => {
+			// 42 + 271 + 230 + 124 = 667 WU: well below any P2WPKH-based
+			// figure for the same shape, so this only passes when the audit
+			// prices the peer's taproot input by its prevout type.
+			const { actions, channel } = driveCompletionWithFee({
+				peerPrevTx: makePeerPrevTxP2tr(60_000),
+				peerInputValueSats: 60_000n,
+				feeSats: 667n
+			});
+			expect(sends(actions, MessageType.TX_COMPLETE), 'negotiation completes')
+				.to.be.true;
+			expect(sends(actions, MessageType.TX_ABORT), 'no refusal').to.be.false;
+			expect(channel.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		});
+
+		it('still refuses a completed tx paying below the low-R fee floor', () => {
+			// 707 sats is 1 below the 708 WU minimum: the audit floor moved
+			// down to the honest minimum, it did not disappear.
+			const { actions } = driveCompletionWithFee({
+				peerPrevTx: makePeerPrevTx(60_000),
+				peerInputValueSats: 60_000n,
+				feeSats: 707n
+			});
+			expect(sends(actions, MessageType.TX_ABORT), 'refused with tx_abort').to
+				.be.true;
+			expect(sends(actions, MessageType.TX_COMPLETE), 'does not complete').to.be
+				.false;
 		});
 
 		it('should handle abort during v2 opening', () => {

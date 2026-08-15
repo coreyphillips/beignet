@@ -327,6 +327,17 @@ const channel = node.openChannelV2(peerPubkey, {
 // -> tx_signatures -> channel_ready
 ```
 
+**RBF of a v2 open.** The initiator can replace a negotiated funding attempt at a
+higher feerate via `channel.initiateTxRbf(feeratePerkw, locktime)` in the window
+between the commitment exchange and the `tx_signatures` exchange. Refusal is
+signalled with `tx_abort` per BOLT 2 (the receiver of `tx_init_rbf` MUST answer
+with `tx_ack_rbf` or `tx_abort`, and MAY refuse for any reason) and is
+attempt-scoped: only the replacement attempt dies, both sides keep the current
+attempt and the channel lives on. Inbound `tx_init_rbf` on a fully signed
+(broadcastable) attempt is refused the same way; Eclair and CLN both keep the
+open and wait out confirmation of the original funding tx after such a refusal
+(see the `dual-funding.ts` module header for the verified semantics).
+
 ### Liquidity Ads (bLIP-51)
 
 Set `leaseRates` to advertise as a lessor: peers can then request funds in an

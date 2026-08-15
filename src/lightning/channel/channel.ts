@@ -160,7 +160,6 @@ import {
 	P2WPKH_DUST_LIMIT,
 	SPLICE_TX_BASE_WEIGHT,
 	SHARED_FUNDING_INPUT_WEIGHT,
-	P2WPKH_INPUT_WEIGHT,
 	outputWeight
 } from './splice-weight';
 import {
@@ -331,6 +330,41 @@ function interactiveInputValueSats(input: IInteractiveTxInput): bigint | null {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Lower-bound signed weight (WU) of a non-shared interactive-tx input, for
+ * the fee-sufficiency audit. The audit's minimum fee must never exceed what
+ * an honest signer actually pays: bitcoind-backed peers (eclair, CLN) grind
+ * low-R signatures, so a P2WPKH witness is 107 WU (71 byte sig), not the
+ * 108 our own funding-side estimate reserves, and a P2TR key-spend witness
+ * is 66 WU (64 byte Schnorr sig, default sighash). Charging the funding
+ * estimate here refused every solo-funded eclair v2 open paying the exact
+ * negotiated feerate (issue #359). Unknown or unparseable prevouts fall
+ * back to the P2WPKH floor.
+ */
+function auditMinInputWeightWu(input: IInteractiveTxInput): number {
+	// outpoint(36) + scriptSig len(1) + sequence(4) = 41 bytes x4
+	const base = 164;
+	try {
+		if (input.prevTx && input.prevTx.length >= 32) {
+			const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
+			const out = prev.outs[input.prevTxVout ?? input.prevOutputIndex];
+			if (
+				out &&
+				out.script.length === 34 &&
+				out.script[0] === 0x51 &&
+				out.script[1] === 0x20
+			) {
+				// P2TR key-spend: count(1) + Schnorr sig(1+64)
+				return base + 66;
+			}
+		}
+	} catch {
+		/* fall through to the P2WPKH floor */
+	}
+	// P2WPKH: count(1) + low-R DER sig(1+71) + pubkey(1+33)
+	return base + 107;
 }
 
 /** A force close this channel cannot perform, and why. */
@@ -11326,7 +11360,9 @@ export class Channel {
 				const unsupported = this._v2CheckInputSpendable(input);
 				if (unsupported) return unsupported;
 			}
-			weight += isShared ? SHARED_FUNDING_INPUT_WEIGHT : P2WPKH_INPUT_WEIGHT;
+			weight += isShared
+				? SHARED_FUNDING_INPUT_WEIGHT
+				: auditMinInputWeightWu(input);
 			if (isShared) {
 				// Pre-splice capacity rolls over; it is nobody's new contribution.
 				totalInSats += this._state.fundingSatoshis;
@@ -13292,12 +13328,16 @@ export class Channel {
 				{ type: ChannelActionType.ERROR, message: 'No dual-funding session' }
 			];
 		}
-		// BOLT 2: a node MUST NOT send tx_init_rbf once it has received our
-		// tx_signatures; only one attempt is tracked here, and a
-		// broadcastable attempt (released witnesses, or the zero-local-input
-		// case where the peer never needed ours) may confirm regardless of
-		// any replacement we accept. Refusing keeps the single tracked
-		// attempt the one that can appear on chain.
+		// POLICY refusal, exercised under BOLT 2's "MAY send tx_abort for
+		// any reason". The spec's RBF window is a COMPLETED attempt (fully
+		// signed, broadcast, unconfirmed) and Eclair/CLN only RBF there,
+		// but only one attempt is tracked here, and a broadcastable attempt
+		// (released witnesses, or the zero-local-input case where the peer
+		// never needed ours) may confirm regardless of any replacement we
+		// accept. Refusing keeps the single tracked attempt the one that
+		// can appear on chain; the refusal is attempt-scoped, so the peer
+		// keeps the open and waits out confirmation (see the dual-funding
+		// module header on issue #309).
 		if (this.isV2AttemptBroadcastable()) {
 			return [
 				this._txAbort(

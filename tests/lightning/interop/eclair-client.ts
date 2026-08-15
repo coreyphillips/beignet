@@ -193,7 +193,8 @@ export class EclairRestClient {
 		fundingSatoshis: number,
 		pushMsat?: number,
 		channelType = 'anchor_outputs_zero_fee_htlc_tx',
-		fundingFeeBudgetSatoshis = 100_000
+		fundingFeeBudgetSatoshis = 100_000,
+		fundingFeerateSatByte?: number
 	): Promise<string> {
 		const params: Record<string, string> = {
 			nodeId,
@@ -204,7 +205,34 @@ export class EclairRestClient {
 		if (pushMsat !== undefined) {
 			params.pushMsat = String(pushMsat);
 		}
+		if (fundingFeerateSatByte !== undefined) {
+			params.fundingFeerateSatByte = String(fundingFeerateSatByte);
+		}
 		return this.request('/open', params);
+	}
+
+	/**
+	 * Ask eclair to RBF a dual-funded channel open it initiated (sends
+	 * tx_init_rbf). Eclair answers the command only once the attempt
+	 * resolves, so a refusal (the peer's tx_abort) surfaces as a rejected
+	 * promise or an error string, depending on the eclair version. Callers
+	 * should treat the response as diagnostic and assert on channel state.
+	 */
+	async rbfOpen(
+		channelId: string,
+		targetFeerateSatByte: number,
+		lockTime?: number,
+		fundingFeeBudgetSatoshis = 100_000
+	): Promise<string> {
+		const params: Record<string, string> = {
+			channelId,
+			targetFeerateSatByte: String(targetFeerateSatByte),
+			fundingFeeBudgetSatoshis: String(fundingFeeBudgetSatoshis)
+		};
+		if (lockTime !== undefined) {
+			params.lockTime = String(lockTime);
+		}
+		return this.request('/rbfopen', params);
 	}
 
 	async channels(nodeId?: string): Promise<IEclairChannel[]> {
