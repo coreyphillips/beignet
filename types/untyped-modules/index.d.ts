@@ -27,15 +27,31 @@ declare module 'bitcoin-units' {
 }
 
 declare module 'bip21' {
+	// encode validates amount via isFinite, so the package's documented
+	// numeric amount and a fixed-notation numeric string both work.
+	interface Bip21EncodeOptions {
+		amount?: number | string;
+		label?: string;
+		message?: string;
+		[key: string]: string | number | undefined;
+	}
+	// decode runs options.amount through Number(); the other query
+	// parameters come out of qs.parse as strings.
+	interface Bip21DecodeOptions {
+		amount?: number;
+		label?: string;
+		message?: string;
+		[key: string]: string | number | undefined;
+	}
 	export function encode(
 		address: string,
-		options?: { [key: string]: string },
+		options?: Bip21EncodeOptions,
 		urnScheme?: string
 	): string;
 	export function decode(
 		uri: string,
 		urnScheme?: string
-	): { address: string; options: { [key: string]: string } };
+	): { address: string; options: Bip21DecodeOptions };
 }
 
 declare module 'rn-electrum-client/helpers';

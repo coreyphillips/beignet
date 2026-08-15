@@ -148,11 +148,7 @@ export const parseOnChainPaymentRequest = (
 					data = `bitcoin:${data}`;
 				}
 
-				// types are wrong for package 'bip21'
-				const result = bip21.decode(data) as {
-					address: string;
-					options: { [key: string]: string };
-				};
+				const result = bip21.decode(data);
 				const address = result.address;
 				validateAddressResult = validateAddress({ address, network });
 				//Ensure address is valid
