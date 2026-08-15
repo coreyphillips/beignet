@@ -357,10 +357,9 @@ export class ChainMonitor {
 		// IRREVOCABLE_DEPTH, reopen resolution so the funding watch is re-armed
 		// and handleNewBlock re-promotes at real depth. Legacy monitors stopped
 		// receiving blocks at instant resolution, so their saved height sits at
-		// the close height and they all demote once; the first deep block feed
-		// re-resolves them. Only IRREVOCABLY_RESOLVED outputs are demoted:
-		// a SPEND_CONFIRMED output keeps its resolutionTxid so the restart
-		// re-arm can seed the recorded spend for reorg detection.
+		// the close height and they all demote once. Only IRREVOCABLY_RESOLVED
+		// outputs are demoted: a SPEND_CONFIRMED output keeps its resolutionTxid
+		// so the restart re-arm can seed the recorded spend for reorg detection.
 		if (
 			monitor._state === MonitorState.FULLY_RESOLVED &&
 			monitor._commitmentBroadcast?.commitmentType ===
@@ -375,6 +374,24 @@ export class ChainMonitor {
 					output.status = OutputStatus.CONFIRMED;
 				}
 			}
+		}
+		// Fresh-evidence rule (issue 352): never trust a persisted cooperative
+		// close confirmation height across a restart. The close may have been
+		// reorged out while the node was offline, and the session's first header
+		// reaches the monitors BEFORE restoreChainWatches re-arms the funding
+		// watch, so a stale height could reach depth and resolve with no chance
+		// for the watch to correct it. Reset the clock to unconfirmed; the
+		// re-armed watch's immediate check re-reports the spend with its LIVE
+		// height (or its eviction), and depth counts from that positive evidence.
+		// Costs one Electrum round-trip after restart; depth is height math, so
+		// a re-report of the same height loses no progress.
+		if (
+			monitor._state !== MonitorState.FULLY_RESOLVED &&
+			monitor._commitmentBroadcast?.commitmentType ===
+				CommitmentType.COOPERATIVE_CLOSE &&
+			monitor._commitmentBroadcast.blockHeight > 0
+		) {
+			monitor._rebindCommitmentConfirmation(0);
 		}
 		// Restore known preimages if present
 		if (saved.knownPreimages) {
@@ -406,7 +423,7 @@ export class ChainMonitor {
 	 * While it is only mempool-detected the commitment is still unconfirmed and its
 	 * CPFP package can be pinned by a fee spike — so re-CPFP must keep running. Note
 	 * COMMITMENT_DETECTED alone does NOT imply confirmation (a mempool-first sighting
-	 * leaves blockHeight 0 until _adoptLateConfirmation records the real height).
+	 * leaves blockHeight 0 until _reconcileRecordedSpend records the real height).
 	 */
 	isCommitmentConfirmed(): boolean {
 		return (
@@ -502,12 +519,26 @@ export class ChainMonitor {
 				this._state = MonitorState.WATCHING;
 				// fall through to normal classification below (preimages learned
 				// so far are retained in _knownPreimages)
+			} else if (
+				this._commitmentBroadcast &&
+				this._commitmentBroadcast.txid !== spendingTx.getId()
+			) {
+				// A DIFFERENT tx seen in the MEMPOOL as the funding spender. Tracking
+				// must not swap (a mempool sighting can lose the race back), but a
+				// mempool cannot hold a spend of an already-spent outpoint, so a
+				// valid competing spend means the recorded confirmed spend is no
+				// longer in the chain (issue 352). Stop the depth clock; the swap
+				// fires if the competitor confirms, and re-adoption restarts the
+				// clock if the recorded spend confirms again instead.
+				return this._demoteRecordedConfirmation();
 			} else {
-				// The spend was already processed (restored monitor, mempool-first
-				// sighting, or a duplicate scripthash notification). A spend first
-				// seen unconfirmed recorded confirmationHeight 0 — adopt the real
-				// height now so held BIP68 sweeps become schedulable.
-				return this._adoptLateConfirmation(spendingTx, blockHeight);
+				// Same tx re-reported (restored monitor, duplicate scripthash
+				// notification, or the watcher relaying the spend's CURRENT height
+				// after a status change). Reconcile the recorded confirmation with
+				// what the chain says now (issue 352): adopt a first confirmation,
+				// re-adopt a post-reorg confirmation at a new height, or demote a
+				// confirmed spend that fell back to the mempool.
+				return this._reconcileRecordedSpend(spendingTx, blockHeight);
 			}
 		}
 
@@ -611,7 +642,7 @@ export class ChainMonitor {
 		// wallet spend of our close output must not restart the clock, and an
 		// SCB-recovered state tracks zero outputs yet still needs to resolve.
 		// A mempool-only sighting (blockHeight 0) never counts depth;
-		// _adoptLateConfirmation starts the clock when the spend confirms.
+		// _reconcileRecordedSpend starts the clock when the spend confirms.
 		if (
 			this._commitmentBroadcast?.commitmentType ===
 			CommitmentType.COOPERATIVE_CLOSE
@@ -1589,28 +1620,120 @@ export class ChainMonitor {
 	}
 
 	/**
-	 * Adopt the confirmation height of a commitment spend that was first seen
-	 * in the mempool (recorded with height 0). Re-derives the maturity of every
-	 * held sweep — a BIP68 (CSV) sweep is unschedulable until its parent's
-	 * confirmation height is known — then releases anything already mature.
+	 * Reconcile the recorded funding spend with a fresh report of the SAME tx
+	 * from the funding watch: adopt a first confirmation, re-adopt a post-reorg
+	 * confirmation at a new height, or demote a spend that fell back to the
+	 * mempool (issue 352). Duplicate reports of the recorded height are no-ops.
 	 */
-	private _adoptLateConfirmation(
+	private _reconcileRecordedSpend(
 		spendingTx: bitcoin.Transaction,
 		blockHeight: number
 	): ChainAction[] {
 		if (
-			blockHeight <= 0 ||
 			!this._commitmentBroadcast ||
-			this._commitmentBroadcast.txid !== spendingTx.getId() ||
-			this._commitmentBroadcast.blockHeight > 0
+			this._commitmentBroadcast.txid !== spendingTx.getId()
 		) {
 			return [];
 		}
+		const recorded = this._commitmentBroadcast.blockHeight;
+		if (blockHeight <= 0) {
+			// The recorded spend is now reported UNCONFIRMED: a reorg pushed it
+			// back to the mempool. A no-op here left the depth clock counting
+			// against a height no longer in the chain (issue 352).
+			return recorded > 0 ? this._demoteRecordedConfirmation() : [];
+		}
+		if (recorded === blockHeight) {
+			// Duplicate notification of the recorded confirmation.
+			return [];
+		}
+		// First confirmation of a mempool-seen spend (recorded 0), or a post-reorg
+		// re-confirmation at a different height. Either way the reported height is
+		// the chain's current truth; bind everything to it.
+		return this._rebindCommitmentConfirmation(blockHeight);
+	}
 
+	/**
+	 * The recorded funding spend is no longer confirmed (reorged back to the
+	 * mempool, displaced by a valid competing mempool spend, or absent from a
+	 * successfully fetched history). Reset the confirmation so nothing counts
+	 * irrevocable depth against a height that is no longer in the chain. The
+	 * tracked classification is kept: the spend may confirm again (re-adopted at
+	 * its new height) or a competitor may confirm (the swap path reclassifies).
+	 * Purely fail-safe: it only ever delays finality, and depth is height math,
+	 * so a spurious demotion costs nothing once the same height is re-reported.
+	 */
+	private _demoteRecordedConfirmation(): ChainAction[] {
+		if (
+			!this._commitmentBroadcast ||
+			this._commitmentBroadcast.blockHeight <= 0
+		) {
+			return [];
+		}
+		// A cooperative close resolved at depth can hit this only in the narrow
+		// window before the node tears the funding watch down. Reopen resolution
+		// so the depth gate re-runs against the demoted (then re-adopted) height.
+		if (
+			this._state === MonitorState.FULLY_RESOLVED &&
+			this._commitmentBroadcast.commitmentType ===
+				CommitmentType.COOPERATIVE_CLOSE
+		) {
+			this._state = MonitorState.RESOLVING;
+			for (const output of this._trackedOutputs) {
+				if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) {
+					output.status = OutputStatus.CONFIRMED;
+				}
+			}
+		}
+		return this._rebindCommitmentConfirmation(0);
+	}
+
+	/**
+	 * The recorded funding spend is now reported absent from the funding
+	 * script's history (fetched successfully, no spender found): the recorded
+	 * confirmation was reorged out and the spend has not even re-entered the
+	 * mempool. Stop the depth clock until positive evidence returns.
+	 * Returns true when monitor state changed (so the caller persists it).
+	 */
+	handleFundingSpendAbsent(): boolean {
+		if (this._state === MonitorState.WATCHING) return false;
+		if (
+			!this._commitmentBroadcast ||
+			this._commitmentBroadcast.blockHeight <= 0
+		) {
+			return false;
+		}
+		this._demoteRecordedConfirmation();
+		return true;
+	}
+
+	/**
+	 * Bind the commitment spend and its outputs to a new confirmation height:
+	 * a first confirmation (old height 0), a post-reorg re-confirmation (new
+	 * height differs), or a demotion back to unconfirmed (new height 0).
+	 * Re-derives the maturity of every held sweep — a BIP68 (CSV) sweep counts
+	 * from the parent's confirmation, so it is unschedulable at height 0 and
+	 * shifts with a re-confirmed parent — then releases anything already mature.
+	 */
+	private _rebindCommitmentConfirmation(blockHeight: number): ChainAction[] {
+		if (!this._commitmentBroadcast) return [];
+		const oldHeight = this._commitmentBroadcast.blockHeight;
 		this._commitmentBroadcast.blockHeight = blockHeight;
 		const tip = Math.max(this._currentBlockHeight, blockHeight);
 		for (const output of this._trackedOutputs) {
-			if (output.confirmationHeight <= 0) {
+			// Outputs whose height came from the commitment's confirmation follow
+			// it. A SPEND_CONFIRMED output's height is its own spend's (its reorg
+			// handling is per-output, via handleSpendUnconfirmed), and a resolved
+			// output's finality is not re-litigated here.
+			if (
+				output.status === OutputStatus.SPEND_CONFIRMED ||
+				output.status === OutputStatus.IRREVOCABLY_RESOLVED
+			) {
+				continue;
+			}
+			if (
+				output.confirmationHeight <= 0 ||
+				output.confirmationHeight === oldHeight
+			) {
 				output.confirmationHeight = blockHeight;
 			}
 			if (output.sweepTxHex === undefined) continue;
@@ -1637,6 +1760,7 @@ export class ChainMonitor {
 			}
 		}
 
+		if (blockHeight <= 0) return [];
 		// Release any sweep whose timelock already matured while we waited.
 		return this.handleNewBlock(tip);
 	}
@@ -2542,7 +2666,7 @@ export class ChainMonitor {
 				// A relative delay needs the height it counts from. A mempool-first
 				// sighting has none yet, and treating that as 0 would name a height
 				// already behind the tip and report a race that has not started.
-				// _adoptLateConfirmation fills the height in once the commitment
+				// _reconcileRecordedSpend fills the height in once the commitment
 				// confirms, and the real transition is reported from there.
 				if (output.confirmationHeight <= 0) return undefined;
 				const scriptCsv = output.witnessScript
@@ -2595,7 +2719,7 @@ export class ChainMonitor {
 			this._state = MonitorState.RESOLVING;
 		}
 		if (candidate.confirmationHeight <= 0) {
-			// A mempool-first breach has no height yet; _adoptLateConfirmation fills
+			// A mempool-first breach has no height yet; _reconcileRecordedSpend fills
 			// it in for every tracked output once the commitment confirms.
 			candidate.confirmationHeight =
 				this._commitmentBroadcast?.blockHeight ?? 0;

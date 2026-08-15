@@ -557,12 +557,196 @@ describe('Chain Monitor (Phase 4C)', function () {
 				expect(output.status).to.equal(OutputStatus.CONFIRMED);
 			}
 
-			// The first deep block feed re-resolves it.
-			const atDepth = restored.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+			// The persisted confirmation height is not trusted across restart
+			// (issue 352): a deep header alone must not resolve the close.
+			expect(restored.handleNewBlock(100 + IRREVOCABLE_DEPTH)).to.have.length(
+				0
+			);
+			expect(restored.isFullyResolved()).to.be.false;
+
+			// The re-armed funding watch re-reports the live confirmation; the
+			// clock counts from that positive evidence and, with the tip already
+			// past depth, resolution completes inside the report.
+			const actions = restored.handleFundingSpent(closingTx, 100);
+			expect(
+				actions.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(restored.isFullyResolved()).to.be.true;
+		});
+
+		it('a restored mid-window coop monitor waits for the funding watch to re-verify', function () {
+			const { monitor, closingTx, state, destScript, openerPrivkeys } =
+				coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100);
+			expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+
+			const restored = ChainMonitor.restore(
+				monitor.getFullState(),
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			// The session's first header arrives before restoreChainWatches can
+			// re-arm the funding watch. Even far past the persisted depth it must
+			// not resolve: the close may have been reorged out while offline.
+			expect(restored.handleNewBlock(500)).to.have.length(0);
+			expect(restored.isFullyResolved()).to.be.false;
+
+			// The re-armed watch's immediate check re-reports the confirmation.
+			const actions = restored.handleFundingSpent(closingTx, 100);
+			expect(
+				actions.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(restored.isFullyResolved()).to.be.true;
+		});
+
+		it('stops the depth clock when the close is reorged back to the mempool', function () {
+			const { monitor, closingTx } = coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100);
+
+			// A reorg evicts the close; the funding watch re-reports it at
+			// height 0. The clock must stop: nothing may count depth against a
+			// height no longer in the chain.
+			monitor.handleFundingSpent(closingTx, 0);
+			expect(monitor.handleNewBlock(300)).to.have.length(0);
+			expect(monitor.isFullyResolved()).to.be.false;
+
+			// The close re-confirms at 250; depth counts from the new height.
+			monitor.handleFundingSpent(closingTx, 250);
+			expect(
+				monitor.handleNewBlock(250 + IRREVOCABLE_DEPTH - 1)
+			).to.have.length(0);
+			const atDepth = monitor.handleNewBlock(250 + IRREVOCABLE_DEPTH);
 			expect(
 				atDepth.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
 			).to.exist;
-			expect(restored.isFullyResolved()).to.be.true;
+			expect(monitor.isFullyResolved()).to.be.true;
+		});
+
+		it('a mempool conflict stops the clock without swapping, and its confirmation is punished', function () {
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			const closingResult = buildClosingTx({
+				fundingTxid: state.fundingTxid!.toString('hex'),
+				fundingOutputIndex: state.fundingOutputIndex,
+				fundingAmount: state.fundingSatoshis,
+				localScriptPubkey: destScript,
+				remoteScriptPubkey: Buffer.alloc(22, 0x02),
+				localAmount: 800_000n,
+				remoteAmount: 199_000n,
+				feeAmount: 1_000n
+			});
+			monitor.handleFundingSpent(closingResult.tx, 100);
+
+			const secret = state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
+			const revokedPoint = perCommitmentPointFromSecret(secret);
+			const revocationPubkey = deriveRevocationPubkey(
+				state.localBasepoints.revocationBasepoint,
+				revokedPoint
+			);
+			const theirDelayedPubkey = derivePublicKey(
+				state.remoteBasepoints!.delayedPaymentBasepoint,
+				revokedPoint
+			);
+			const isOpener = state.role === ChannelRole.OPENER;
+			const openPBP = isOpener
+				? state.localBasepoints.paymentBasepoint
+				: state.remoteBasepoints!.paymentBasepoint;
+			const acceptPBP = isOpener
+				? state.remoteBasepoints!.paymentBasepoint
+				: state.localBasepoints.paymentBasepoint;
+			const obscured = calculateObscuredCommitmentNumber(
+				openPBP,
+				acceptPBP,
+				0n
+			);
+			const revokedTx = new bitcoin.Transaction();
+			revokedTx.version = 2;
+			revokedTx.locktime = 0x20000000 | Number(obscured & 0xffffffn);
+			const seq = (0x80000000 | Number((obscured >> 24n) & 0xffffffn)) >>> 0;
+			revokedTx.addInput(
+				Buffer.from(state.fundingTxid!.toString('hex'), 'hex').reverse(),
+				state.fundingOutputIndex,
+				seq
+			);
+			const toLocalScript = buildToLocalScript(
+				revocationPubkey,
+				theirDelayedPubkey,
+				state.localConfig.toSelfDelay
+			);
+			revokedTx.addOutput(
+				bitcoin.payments.p2wsh({ redeem: { output: toLocalScript } }).output!,
+				800_000
+			);
+
+			// The attacker's revoked commitment displaces the evicted close in the
+			// mempool but stays unconfirmed. Tracking must NOT swap on a mempool
+			// sighting, but the clock must stop: the recorded confirmed close
+			// cannot still be in the chain if a competing spend is mempool-valid.
+			monitor.handleFundingSpent(revokedTx, 0);
+			const full = monitor.getFullState();
+			expect(full.commitmentBroadcast!.commitmentType).to.equal(
+				CommitmentType.COOPERATIVE_CLOSE
+			);
+			expect(full.commitmentBroadcast!.blockHeight).to.equal(0);
+
+			// Waiting out the ORIGINAL depth window must not resolve anything
+			// (pre-fix the stale height resolved here and the breach went
+			// unwatched).
+			expect(monitor.handleNewBlock(300)).to.have.length(0);
+			expect(monitor.isFullyResolved()).to.be.false;
+
+			// The revoked commitment finally confirms: swap, reclassify, punish.
+			const actions = monitor.handleFundingSpent(revokedTx, 300);
+			const penalty = actions.filter(
+				(a: any) =>
+					a.type === ChainActionType.BROADCAST_TX &&
+					a.description &&
+					a.description.includes('penalty')
+			);
+			expect(penalty.length).to.be.greaterThan(0);
+			expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+		});
+
+		it('handleFundingSpendAbsent stops the clock until positive evidence returns', function () {
+			const { monitor, closingTx } = coopCloseFixture();
+
+			// No spend recorded yet: absence is a no-op.
+			expect(monitor.handleFundingSpendAbsent()).to.be.false;
+
+			monitor.handleFundingSpent(closingTx, 100);
+			expect(monitor.handleFundingSpendAbsent()).to.be.true;
+			// Already demoted: idempotent.
+			expect(monitor.handleFundingSpendAbsent()).to.be.false;
+
+			// The stale height must not resolve.
+			expect(monitor.handleNewBlock(300)).to.have.length(0);
+			expect(monitor.isFullyResolved()).to.be.false;
+
+			// A flaky-backend absence costs nothing: the same height re-reported
+			// restores the clock, and with the tip already past depth resolution
+			// completes inside the report.
+			const actions = monitor.handleFundingSpent(closingTx, 100);
+			expect(
+				actions.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(monitor.isFullyResolved()).to.be.true;
 		});
 
 		it('restore demotes a legacy coop monitor resolved from a mempool sighting', function () {

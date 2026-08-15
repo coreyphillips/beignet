@@ -723,7 +723,11 @@ export interface ICloseStatus {
 	broadcast: boolean;
 	/** Block height the close confirmed at; 0 while unconfirmed. */
 	confirmationHeight: number;
-	/** Sweep progress across the close's tracked outputs. */
+	/**
+	 * On-chain resolution progress: 'pending' until the close tx confirms,
+	 * 'sweeping' while outputs are being swept and/or the close waits out its
+	 * anti-reorg depth, 'resolved' once every output is irrevocably settled.
+	 */
 	resolution: 'pending' | 'sweeping' | 'resolved';
 	/**
 	 * Height at which the to_local CSV matures and our main balance becomes

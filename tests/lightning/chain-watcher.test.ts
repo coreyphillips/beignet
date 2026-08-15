@@ -389,6 +389,91 @@ describe('Phase 4: Chain Watcher', () => {
 		});
 	});
 
+	describe('Funding spend absence notification (issue 352)', () => {
+		let backend: MockChainBackend;
+		let channelManager: ChannelManager;
+		let watcher: ChainWatcher;
+		let absentCalls: Buffer[];
+
+		beforeEach(async () => {
+			const seed = crypto.randomBytes(32);
+			backend = new MockChainBackend();
+			channelManager = new ChannelManager({
+				localBasepoints: makeBasepoints(seed),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				localFundingPrivkey: crypto.randomBytes(32)
+			});
+			channelManager.on('error', () => {});
+			absentCalls = [];
+			const original =
+				channelManager.handleFundingSpendAbsent.bind(channelManager);
+			(channelManager as any).handleFundingSpendAbsent = (
+				channelId: Buffer
+			): void => {
+				absentCalls.push(channelId);
+				original(channelId);
+			};
+
+			watcher = new ChainWatcher({
+				backend,
+				channelManager
+			});
+			await watcher.start();
+		});
+
+		afterEach(() => {
+			watcher.stop();
+		});
+
+		async function armConfirmedFundingWatch(): Promise<{
+			channelId: Buffer;
+			txid: string;
+			scriptHash: string;
+		}> {
+			const channelId = crypto.randomBytes(32);
+			const txid = crypto.randomBytes(32).toString('hex');
+			const scriptPubkey = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			const scriptHash = computeScriptHash(scriptPubkey);
+			await watcher.watchFundingOutput(channelId, txid, 0, 1, scriptPubkey);
+			backend.simulateNewBlock(100);
+			backend.setHistory(scriptHash, [{ txid, height: 98 }]);
+			// Confirms the funding, which arms spend detection and runs its
+			// immediate spend check against the spender-less history.
+			backend.simulateScriptHashChange(scriptHash);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			return { channelId, txid, scriptHash };
+		}
+
+		it('notifies when a fetched history contains no funding spender', async () => {
+			const { channelId } = await armConfirmedFundingWatch();
+			expect(absentCalls.some((cid) => cid.equals(channelId))).to.be.true;
+		});
+
+		it('does not notify while a spender is present in the history', async () => {
+			const { channelId, txid, scriptHash } = await armConfirmedFundingWatch();
+			absentCalls = [];
+
+			// A tx spending the funding outpoint appears: the spend path reports
+			// it and the absence path must stay silent.
+			const spendTx = new bitcoin.Transaction();
+			spendTx.version = 2;
+			spendTx.addInput(Buffer.from(txid, 'hex').reverse(), 0, 0xffffffff);
+			spendTx.addOutput(Buffer.from('0014' + '11'.repeat(20), 'hex'), 50_000);
+			backend.setTransaction(spendTx.getId(), spendTx.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid, height: 98 },
+				{ txid: spendTx.getId(), height: 99 }
+			]);
+			backend.simulateScriptHashChange(scriptHash);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(absentCalls.some((cid) => cid.equals(channelId))).to.be.false;
+		});
+	});
+
 	describe('Transaction broadcast', () => {
 		let backend: MockChainBackend;
 		let channelManager: ChannelManager;

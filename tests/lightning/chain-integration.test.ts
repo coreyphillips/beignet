@@ -1235,6 +1235,121 @@ describe('Chain Integration (Phase 4D)', function () {
 			);
 			expect(penaltyActions.length).to.be.greaterThan(0);
 		});
+
+		it('escalates a CLOSED channel to FORCE_CLOSED when a revoked commitment replaces its coop close', function () {
+			const {
+				opener,
+				acceptor,
+				openerPrivkeys,
+				openerBasepoints,
+				openerCommitmentSeed
+			} = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const channelId = opener.getChannelId()!;
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+
+			const config: IChannelManagerConfig = {
+				localBasepoints: openerBasepoints,
+				localPerCommitmentSeed: openerCommitmentSeed,
+				localFundingPrivkey: openerPrivkeys[0]
+			};
+			const manager = new ChannelManager(config);
+			(manager as any).channels.set(channelId.toString('hex'), opener);
+
+			// A cooperative close confirms: the channel reconciles to CLOSED and
+			// waits out irrevocable depth.
+			const closingResult = buildClosingTx({
+				fundingTxid: state.fundingTxid!.toString('hex'),
+				fundingOutputIndex: state.fundingOutputIndex,
+				fundingAmount: state.fundingSatoshis,
+				localScriptPubkey: destScript,
+				remoteScriptPubkey: Buffer.alloc(22, 0x02),
+				localAmount: 800_000n,
+				remoteAmount: 199_000n,
+				feeAmount: 1_000n
+			});
+			manager.handleFundingSpent(
+				channelId,
+				closingResult.tx,
+				100,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			expect(opener.getState()).to.equal(ChannelState.CLOSED);
+
+			// Build the revoked commitment (number 0).
+			const secret = state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
+			const revokedPoint = perCommitmentPointFromSecret(secret);
+			const revocationPubkey = deriveRevocationPubkey(
+				state.localBasepoints.revocationBasepoint,
+				revokedPoint
+			);
+			const theirDelayedPubkey = derivePublicKey(
+				state.remoteBasepoints!.delayedPaymentBasepoint,
+				revokedPoint
+			);
+			const isOpener = state.role === ChannelRole.OPENER;
+			const openPBP = isOpener
+				? state.localBasepoints.paymentBasepoint
+				: state.remoteBasepoints!.paymentBasepoint;
+			const acceptPBP = isOpener
+				? state.remoteBasepoints!.paymentBasepoint
+				: state.localBasepoints.paymentBasepoint;
+			const obscured = calculateObscuredCommitmentNumber(
+				openPBP,
+				acceptPBP,
+				0n
+			);
+			const revokedTx = new bitcoin.Transaction();
+			revokedTx.version = 2;
+			revokedTx.locktime = 0x20000000 | Number(obscured & 0xffffffn);
+			const seq = (0x80000000 | Number((obscured >> 24n) & 0xffffffn)) >>> 0;
+			revokedTx.addInput(
+				Buffer.from(state.fundingTxid!.toString('hex'), 'hex').reverse(),
+				state.fundingOutputIndex,
+				seq
+			);
+			const toLocalScript = buildToLocalScript(
+				revocationPubkey,
+				theirDelayedPubkey,
+				state.localConfig.toSelfDelay
+			);
+			revokedTx.addOutput(
+				bitcoin.payments.p2wsh({ redeem: { output: toLocalScript } }).output!,
+				800_000
+			);
+
+			let forceClosingEmitted = false;
+			manager.on('channel:force-closing', () => {
+				forceClosingEmitted = true;
+			});
+
+			// A reorg evicts the close and the revoked commitment confirms as the
+			// funding spender. The channel must leave CLOSED in THIS session
+			// (issue 353), not only after a restart repair.
+			const actions = manager.handleFundingSpent(
+				channelId,
+				revokedTx,
+				150,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			expect(opener.getState()).to.equal(ChannelState.FORCE_CLOSED);
+			expect(forceClosingEmitted).to.be.true;
+			const penalty = actions.filter(
+				(a) => a.type === ChainActionType.BROADCAST_TX
+			);
+			expect(penalty.length).to.be.greaterThan(0);
+		});
 	});
 
 	describe('Multiple Channels', function () {
