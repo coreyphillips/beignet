@@ -3859,6 +3859,187 @@ describe('Splice', function () {
 				});
 			});
 
+			describe('tx_signatures validation and abort ordering (issue #350)', function () {
+				function wrongKeySig(): Buffer {
+					const junkPriv = crypto
+						.createHash('sha256')
+						.update('not-the-funding-key')
+						.digest();
+					return Buffer.from(ecc.sign(crypto.randomBytes(32), junkPriv));
+				}
+
+				it('an invalid shared-input signature after our signatures left keeps the outpoint watched', function () {
+					const pair = makeWirePair();
+					// Tamper the OPENER's tx_signatures (the one carrying wallet
+					// witnesses); the acceptor, which signed first, refuses.
+					pair.intercept(MessageType.TX_SIGNATURES, (payload) => {
+						const msg = decodeTxSignaturesMessage(payload);
+						if (msg.witnesses.length === 0) return payload;
+						msg.sharedInputSignature = wrongKeySig();
+						return encodeTxSignaturesMessage(msg);
+					});
+					startSpliceIn(pair);
+
+					expect(
+						pair.errors.some((e) => e.includes('invalid peer splice signature'))
+					).to.be.true;
+					const record = pair.acceptor.getFullState().spliceInFlight!;
+					expect(record.sentTxSignatures).to.be.true;
+					expect(record.receivedTxSignatures).to.be.false;
+					// Our shared-input signature left, so the peer can broadcast its
+					// locally valid copy: the refusal must keep the outpoint watched.
+					expect(
+						pair.watches.some(
+							(w) =>
+								w.from === pair.acceptor && w.txid.equals(record.spliceTxid)
+						),
+						'acceptor still watches the negotiated splice outpoint'
+					).to.be.true;
+
+					// Confirmation plus an honest retransmission locks the splice.
+					pair.acceptor.markSpliceConfirmed();
+					pair.opener.markSpliceConfirmed();
+					pair.clearIntercepts();
+					disconnect(pair);
+					reconnect(pair);
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+					expect(
+						pair.acceptor.getFullState().fundingTxid!.equals(record.spliceTxid)
+					).to.be.true;
+				});
+
+				it('an invalid shared-input signature before our signatures leave does not mark them sent', function () {
+					const pair = makeWirePair();
+					// Tamper the ACCEPTOR's (witness-free, first) tx_signatures; the
+					// opener must refuse BEFORE its send helper runs.
+					pair.intercept(MessageType.TX_SIGNATURES, (payload) => {
+						const msg = decodeTxSignaturesMessage(payload);
+						if (msg.witnesses.length > 0) return payload;
+						msg.sharedInputSignature = wrongKeySig();
+						return encodeTxSignaturesMessage(msg);
+					});
+					startSpliceIn(pair);
+
+					expect(
+						pair.errors.some((e) => e.includes('invalid peer splice signature'))
+					).to.be.true;
+					const record = pair.opener.getFullState().spliceInFlight!;
+					expect(record.sentTxSignatures, 'opener signatures not marked sent')
+						.to.be.false;
+					expect(record.receivedTxSignatures).to.be.false;
+					expect(
+						pair.watches.filter((w) => w.from === pair.opener)
+					).to.deep.equal([]);
+					expect(pair.broadcasts.length).to.equal(0);
+
+					// An honest retransmission completes the splice.
+					pair.clearIntercepts();
+					disconnect(pair);
+					reconnect(pair);
+					expect(pair.broadcasts.length).to.equal(2);
+					expect(pair.opener.getFullState().spliceInFlight!.fullySigned).to.be
+						.true;
+				});
+
+				it('rejects a splice tx_signatures whose txid does not match the negotiated tx', function () {
+					const pair = makeWirePair();
+					pair.intercept(MessageType.TX_SIGNATURES, (payload) => {
+						const msg = decodeTxSignaturesMessage(payload);
+						msg.txid = Buffer.alloc(32, 0x7f);
+						return encodeTxSignaturesMessage(msg);
+					});
+					startSpliceIn(pair);
+
+					// The acceptor sends first, so the opener refuses before its own
+					// signatures or any state mutation.
+					expect(
+						pair.errors.some((e) =>
+							e.includes('splice tx_signatures txid mismatch')
+						)
+					).to.be.true;
+					const record = pair.opener.getFullState().spliceInFlight!;
+					expect(record.sentTxSignatures).to.be.false;
+					expect(record.receivedTxSignatures).to.be.false;
+					expect(pair.broadcasts.length).to.equal(0);
+
+					// Honest retransmission recovers.
+					pair.clearIntercepts();
+					disconnect(pair);
+					reconnect(pair);
+					expect(pair.broadcasts.length).to.equal(2);
+					expect(pair.opener.getFullState().spliceInFlight!.fullySigned).to.be
+						.true;
+				});
+
+				it('classifies stray splice commitments after the abort echo (reentrant order)', function () {
+					const pair = makeWirePair();
+					// Withhold the opener's real stray commitment so the orderings
+					// can be hand-driven below.
+					pair.drop(MessageType.COMMITMENT_SIGNED, 1);
+					const p2wshScript = Buffer.concat([
+						Buffer.from([0x00, 0x20]),
+						crypto.randomBytes(32)
+					]);
+					const value = 400_000n;
+					const prevTx = new bitcoin.Transaction();
+					prevTx.version = 2;
+					prevTx.addInput(crypto.randomBytes(32), 0);
+					prevTx.addOutput(p2wshScript, Number(value));
+					startSpliceIn(pair, 300_000n, {
+						walletInput: {
+							prevTx: prevTx.toBuffer(),
+							prevOutputIndex: 0,
+							value,
+							sequence: 0xfffffffd,
+							signWitness: (): Buffer[] => [Buffer.alloc(0)]
+						},
+						changeScript: Buffer.concat([
+							Buffer.from([0x00, 0x14]),
+							crypto.randomBytes(20)
+						])
+					});
+
+					expect(pair.errors.some((e) => e.includes('unsupported output type')))
+						.to.be.true;
+					// The whole abort dance ran (echo delivered), yet the window must
+					// survive it: with reentrant routing the echo can precede the
+					// stray, and a symmetric refusal has no stray behind it at all.
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					expect((pair.acceptor as any)._spliceAbortIgnoreCommitment).to.be
+						.true;
+
+					// A funding_txid-tagged commitment with no live splice session is
+					// the aborted splice's stray: swallowed, window stays armed (a
+					// stray batch can have several members).
+					const stray = {
+						channelId: pair.acceptor.getChannelId()!,
+						signature: Buffer.alloc(64, 1),
+						htlcSignatures: [],
+						fundingTxid: Buffer.alloc(32, 0x77)
+					};
+					expect(pair.acceptor.handleCommitmentSigned(stray)).to.deep.equal([]);
+					expect(pair.acceptor.handleCommitmentSigned(stray)).to.deep.equal([]);
+					expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					expect((pair.acceptor as any)._spliceAbortIgnoreCommitment).to.be
+						.true;
+
+					// An untagged commitment is legitimate traffic: the window closes
+					// and the message is judged on its merits (here, refused as an
+					// invalid signature rather than silently swallowed).
+					const actions = pair.acceptor.handleCommitmentSigned({
+						channelId: pair.acceptor.getChannelId()!,
+						signature: Buffer.alloc(64, 1),
+						htlcSignatures: []
+					});
+					expect(actions.length).to.be.greaterThan(0);
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					expect((pair.acceptor as any)._spliceAbortIgnoreCommitment).to.be
+						.false;
+				});
+			});
+
 			it('carries the shared-input signature in the tx_signatures TLV, not the witnesses (CLN interop)', function () {
 				const pair = makeWirePair();
 				startSpliceOut(pair);
@@ -4543,6 +4724,64 @@ describe('Splice', function () {
 			// Acceptor should now be in SPLICING state (auto-handled via message routing)
 			expect(openerChannel.getState()).to.equal(ChannelState.SPLICING);
 			expect(acceptorChannel.getState()).to.equal(ChannelState.SPLICING);
+		});
+
+		it('an unsupported-input refusal under synchronous routing leaves both channels NORMAL (issue 350)', function () {
+			const { openerManager, channelId, openerChannel, acceptorChannel } =
+				createNormalChannelPair();
+
+			openerManager.initiateQuiescence(channelId);
+			// Unverifiable P2WSH prevout: the acceptor's negotiated-tx audit
+			// refuses with tx_abort. connectManagers routes SYNCHRONOUSLY, so
+			// the abort echo returns BEFORE the opener's outer action loop has
+			// sent its already-built mid-splice commitment_signed; the stray
+			// arrives after the echo and must be classified, not trusted to
+			// arrive first.
+			const p2wshScript = Buffer.concat([
+				Buffer.from([0x00, 0x20]),
+				crypto.randomBytes(32)
+			]);
+			const value = 400_000n;
+			const prevTx = new bitcoin.Transaction();
+			prevTx.version = 2;
+			prevTx.addInput(crypto.randomBytes(32), 0);
+			prevTx.addOutput(p2wshScript, Number(value));
+			openerChannel.setSpliceInInputs(
+				[
+					{
+						prevTx: prevTx.toBuffer(),
+						prevOutputIndex: 0,
+						value,
+						sequence: 0xfffffffd,
+						signWitness: (): Buffer[] => [Buffer.alloc(0)]
+					}
+				],
+				Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)])
+			);
+			openerManager.initiateSplice(channelId, 300_000n, 253);
+
+			// The refusal fails only the NEGOTIATION: no ERRORED channel, no
+			// in-flight record, both sides back to NORMAL.
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(openerChannel.getFullState().spliceInFlight).to.be.null;
+			expect(acceptorChannel.getFullState().spliceInFlight).to.be.null;
+
+			// The channel is still usable: a fresh backed splice completes.
+			openerManager.initiateQuiescence(channelId);
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
+			expect(openerManager.initiateSplice(channelId, 100_000n, 253).ok).to.be
+				.true;
+			expect(openerChannel.getSpliceSession()!.getState()).to.equal(
+				SpliceState.AWAITING_SPLICE_LOCKED
+			);
+			expect(acceptorChannel.getSpliceSession()!.getState()).to.equal(
+				SpliceState.AWAITING_SPLICE_LOCKED
+			);
 		});
 
 		it('should support sendSpliceLocked via manager', function () {
