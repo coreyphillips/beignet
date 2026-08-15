@@ -6261,12 +6261,22 @@ export class Channel {
 			// still unsigned (no tx_signatures in either direction — an in-flight
 			// record may already exist from the commitment round): the peer has
 			// forgotten the splice — forget ours too.
+			const hadRecord = !!this._state.spliceInFlight;
 			const abortActions = this.abortSplice(
 				'peer reestablished without next_funding_txid'
 			);
 			actions.push(
 				...abortActions.filter((a) => a.type !== ChannelActionType.ERROR)
 			);
+			// A record meant the splice was persisted at the commitment round:
+			// persist the unwind, or a crash would resurrect the forgotten
+			// splice via restoreSpliceInFlight (issue #356). handleReestablish
+			// only prepends a persist when the batch carries a send, and this
+			// arm can produce none. Redundant with that prepend when sends
+			// exist; the manager commits once per batch.
+			if (hadRecord && !this._state.spliceInFlight) {
+				actions.push({ type: ChannelActionType.PERSIST_STATE });
+			}
 		}
 
 		// ── splice_locked retransmission (analogous to channel_ready) ──
@@ -13760,10 +13770,21 @@ export class Channel {
 		// echo tx_abort back — the peer treats the echo as the ack that both
 		// sides have forgotten the transaction.
 		if (this._spliceSession && !this._spliceSession.isComplete()) {
+			const hadRecord = !!this._state.spliceInFlight;
 			const echo = this._state.channelId
 				? [this._txAbort(this._state.channelId)]
 				: [];
-			return [...echo, ...this.abortSplice('peer sent tx_abort')];
+			const unwind = this.abortSplice('peer sent tx_abort');
+			// A record meant the splice was persisted at the commitment round:
+			// persist the unwind too (leading, so the echo is bound to the
+			// committed state), or a crash would resurrect the aborted splice
+			// via restoreSpliceInFlight and the reestablish resume path
+			// (issue #356). Skipped when the abort refused and kept the record.
+			const persist: ChannelAction[] =
+				hadRecord && !this._state.spliceInFlight
+					? [{ type: ChannelActionType.PERSIST_STATE }]
+					: [];
+			return [...persist, ...echo, ...unwind];
 		}
 
 		const session = this._state.dualFundingSession;
