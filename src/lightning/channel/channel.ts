@@ -546,11 +546,19 @@ export class Channel {
 	// its mid-splice commitment_signed right after its final tx_complete, so
 	// that message can already be in flight when our abort leaves; judged
 	// against the post-abort channel it would fail the channel on a signature
-	// that was never meant for it. While set, commitment_signed is ignored.
-	// Quiescence bars legitimate commitment traffic until the peer processes
-	// our abort, so nothing real is swallowed. Cleared when any tx_abort
-	// arrives (message ordering puts the peer's echo after the stray) and on
-	// disconnect.
+	// that was never meant for it. While set, an arriving commitment_signed
+	// is CLASSIFIED, not blanket-ignored: a funding_txid-tagged commitment is
+	// the aborted splice's stray (swallowed, guard kept armed since a stray
+	// batch can have several members), an untagged one is legitimate normal
+	// traffic (guard cleared, processed). The guard deliberately survives
+	// tx_abort: with reentrant synchronous routing the peer's abort echo can
+	// arrive BEFORE the stray it queued behind its tx_complete (issue 350),
+	// and with a symmetric audit failure the peer's tx_abort is its OWN
+	// refusal with no stray in flight at all, so no arrival order of aborts
+	// proves the window over. A live NEW splice session also clears it: the
+	// peer only starts one after processing our abort, which is after any
+	// stray was emitted, so the stray has been classified by then in every
+	// ordering. Cleared on disconnect.
 	private _spliceAbortIgnoreCommitment = false;
 	// One-shot: we answered a post-reestablish channel_reestablish (a peer whose
 	// channel process restarted on the same connection, e.g. CLN after a
@@ -3135,9 +3143,30 @@ export class Channel {
 	 */
 	handleCommitmentSigned(msg: ICommitmentSignedMessage): ChannelAction[] {
 		// A mid-splice commitment_signed that raced our tx_abort belongs to
-		// the aborted splice: ignore it (see _spliceAbortIgnoreCommitment).
+		// the aborted splice. Classify rather than blanket-ignore: arrival
+		// order of the peer's abort echo vs its stray is transport-dependent
+		// (see _spliceAbortIgnoreCommitment), so only the message itself can
+		// say which it is.
 		if (this._spliceAbortIgnoreCommitment) {
-			return [];
+			if (this._state.state === ChannelState.SPLICING && this._spliceSession) {
+				// A new splice negotiation is live: the peer starts one only
+				// after processing our abort, so the old stray (if any) has
+				// already been classified. The window is over.
+				this._spliceAbortIgnoreCommitment = false;
+			} else if (msg.fundingTxid) {
+				// funding_txid appears only on splice-context commitments, and
+				// no splice context is live: this is the aborted splice's
+				// stray. Swallow it, and void any start_batch collection it
+				// arrived under (a swallowed member would leave the batch
+				// permanently short). Keep the guard armed: a stray batch can
+				// carry more than one member.
+				this._pendingBatch = null;
+				return [];
+			} else {
+				// An untagged commitment is legitimate normal-channel traffic:
+				// the stream is past the stray. Process it.
+				this._spliceAbortIgnoreCommitment = false;
+			}
 		}
 		// Fresh signed traffic ends the reestablish exchange (status machine).
 		this._lastReestablishOutcome = null;
@@ -7881,6 +7910,38 @@ export class Channel {
 	}
 
 	/**
+	 * Pure pre-verification of the peer's shared-input signature, mirroring
+	 * exactly what applyPeerSpliceSignature checks before it mutates anything.
+	 * Exists so handleTxSignatures can refuse BEFORE _maybeSendSpliceTxSigs
+	 * runs (that helper marks our signatures sent as a side effect, and apply
+	 * cannot simply move ahead of it: apply advances the splice session out of
+	 * AWAITING_TX_SIGNATURES, which is the state the send helper gates on).
+	 * Witness data is not part of the BIP 143 sighash, so this verdict is
+	 * identical to the re-verification apply performs later.
+	 *
+	 * Returns null when the signature verifies, else a refusal reason.
+	 */
+	private _verifySpliceSharedInputSig(remoteSig: Buffer): string | null {
+		if (
+			!this._spliceSession ||
+			!this._spliceTx ||
+			!this._state.remoteBasepoints
+		) {
+			return 'no negotiated splice transaction';
+		}
+		const { tx, sharedInputIndex, oldWitnessScript } = this._spliceTx;
+		const ok = verifySpliceSharedInput(
+			tx,
+			sharedInputIndex,
+			oldWitnessScript,
+			this._state.fundingSatoshis,
+			this._state.remoteBasepoints.fundingPubkey,
+			remoteSig
+		);
+		return ok ? null : 'invalid peer splice signature';
+	}
+
+	/**
 	 * Apply the peer's signature on the shared funding input: verify it, assemble
 	 * the 2-of-2 witness onto the splice transaction, record the splice outpoint,
 	 * and advance the session to AWAITING_SPLICE_LOCKED.
@@ -11668,6 +11729,30 @@ export class Channel {
 	}
 
 	/**
+	 * Build the refusal batch for an unacceptable splice tx_signatures.
+	 * Refusing the message does not make the splice unconfirmable once OUR
+	 * shared-input signature has left: witness data does not change the txid
+	 * (BIP 141), so the peer can broadcast its locally valid copy of the same
+	 * transaction. Keep watching the negotiated outpoint so a confirmation
+	 * still locks the splice (the confirmed flag flushes splice_locked once
+	 * valid signatures finally arrive, e.g. retransmitted on reconnect).
+	 */
+	private _spliceTxSigsRefusal(message: string): ChannelAction[] {
+		const refusal: ChannelAction[] = [];
+		const record = this._state.spliceInFlight;
+		if (record && (this._spliceSentTxSigs || record.sentTxSignatures)) {
+			refusal.push({
+				type: ChannelActionType.WATCH_FUNDING,
+				fundingTxid: record.spliceTxid,
+				fundingOutputIndex: record.newFundingOutputIndex,
+				minimumDepth: this._state.minimumDepth
+			});
+		}
+		refusal.push({ type: ChannelActionType.ERROR, message });
+		return refusal;
+	}
+
+	/**
 	 * Validate the peer's splice tx_signatures wallet witnesses BEFORE they
 	 * are applied and the splice tx broadcast: exactly one stack per peer
 	 * wallet input, each bound to its negotiated prevout and
@@ -12424,43 +12509,53 @@ export class Channel {
 				];
 			}
 
+			// All validation runs BEFORE _maybeSendSpliceTxSigs: that helper
+			// marks our signatures sent (memory and record) as a side effect,
+			// and a refusal must not leave state claiming a send that never
+			// happened. The build alone has no such side effects.
+			if (!this._spliceTx) {
+				this.buildAndSignSpliceTx();
+			}
+
+			// BOLT 2: the txid MUST match the negotiated transaction; a
+			// mismatch means the peer is signing a different tx. Checked first
+			// so the diagnosis names the divergence instead of a downstream
+			// witness error. A broken restore leaves _spliceTx null; fall
+			// through and let the witness validator refuse with its own error.
+			if (this._spliceTx) {
+				const expectedTxid = Buffer.from(this._spliceTx.tx.getHash());
+				if (!msg.txid.equals(expectedTxid)) {
+					return this._spliceTxSigsRefusal(
+						`splice tx_signatures txid mismatch: peer=${Buffer.from(msg.txid)
+							.reverse()
+							.toString('hex')} ours=${Buffer.from(expectedTxid)
+							.reverse()
+							.toString('hex')}`
+					);
+				}
+			}
+
 			// Validate the peer's wallet witnesses BEFORE they are applied and
 			// the batch below persists + broadcasts: one stack per peer input,
 			// every signature verified against its negotiated prevout (the same
 			// rules as the v2 open path). Refusing here fails the exchange with
 			// a named error instead of persisting a splice tx that can never
-			// confirm. Validation runs BEFORE _maybeSendSpliceTxSigs: that
-			// helper marks our signatures sent (memory and record) as a side
-			// effect, and a refusal here must not leave state claiming a send
-			// that never happened. The build alone has no such side effects.
-			if (!this._spliceTx) {
-				this.buildAndSignSpliceTx();
-			}
+			// confirm.
 			const witnessProblem =
 				this._validateSplicePeerWitnesses(peerWalletWitnesses);
 			if (witnessProblem) {
-				const refusal: ChannelAction[] = [];
-				// Refusing the message does not make the splice unconfirmable
-				// once OUR shared-input signature has left: witness data does
-				// not change the txid (BIP 141), so the peer can broadcast its
-				// locally valid copy of the same transaction. Keep watching the
-				// negotiated outpoint so a confirmation still locks the splice
-				// (the confirmed flag flushes splice_locked once valid
-				// signatures finally arrive, e.g. retransmitted on reconnect).
-				const record = this._state.spliceInFlight;
-				if (record && (this._spliceSentTxSigs || record.sentTxSignatures)) {
-					refusal.push({
-						type: ChannelActionType.WATCH_FUNDING,
-						fundingTxid: record.spliceTxid,
-						fundingOutputIndex: record.newFundingOutputIndex,
-						minimumDepth: this._state.minimumDepth
-					});
-				}
-				refusal.push({
-					type: ChannelActionType.ERROR,
-					message: `invalid splice tx_signatures: ${witnessProblem}`
-				});
-				return refusal;
+				return this._spliceTxSigsRefusal(
+					`invalid splice tx_signatures: ${witnessProblem}`
+				);
+			}
+
+			// Verify the peer's 2-of-2 shared-input signature BEFORE the send
+			// helper runs, for the same reason as the checks above (issue 350:
+			// the later applyPeerSpliceSignature refusal discarded the send
+			// helper's actions while its sent-flags mutations survived).
+			const sigProblem = this._verifySpliceSharedInputSig(peerSig);
+			if (sigProblem) {
+				return this._spliceTxSigsRefusal(sigProblem);
 			}
 
 			const actions: ChannelAction[] = [];
@@ -12468,11 +12563,13 @@ export class Channel {
 			actions.push(...this._maybeSendSpliceTxSigs());
 			const tx = this.applyPeerSpliceSignature(peerSig, peerWalletWitnesses);
 			if (!tx) {
+				// Defensive only: every apply failure mode is pre-checked
+				// above. Keep the send helper's actions in the batch so
+				// dispatched actions always match its mutations, and keep the
+				// outpoint watched (our signatures really left in this batch).
 				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'invalid peer splice signature'
-					}
+					...actions,
+					...this._spliceTxSigsRefusal('invalid peer splice signature')
 				];
 			}
 
@@ -13431,10 +13528,11 @@ export class Channel {
 	 * Handle tx_abort from peer.
 	 */
 	handleTxAbort(): ChannelAction[] {
-		// Any tx_abort from the peer proves it has processed our abort (the
-		// echo travels behind whatever the peer sent before seeing ours), so
-		// the stray-commitment window of a refused splice negotiation is over.
-		this._spliceAbortIgnoreCommitment = false;
+		// Deliberately does NOT clear _spliceAbortIgnoreCommitment: with
+		// reentrant synchronous routing the peer's echo can overtake the stray
+		// commitment it queued first, and a symmetric refusal delivers the
+		// peer's OWN tx_abort with no stray behind it at all (issue 350). The
+		// window is resolved by classifying the next commitment_signed itself.
 		// The echo/ack of a tx_abort we sent (e.g. telling the peer to forget a
 		// splice we lost across a restart). Both sides have now forgotten it.
 		if (this._spliceAbortPending) {

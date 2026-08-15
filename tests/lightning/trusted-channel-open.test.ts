@@ -663,8 +663,11 @@ describe('Zero-conf splice semantics (BOLT 2)', function () {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function stubSplice(ch: any, overrides: Record<string, unknown> = {}): void {
 		ch._state.state = ChannelState.SPLICING;
+		// handleTxSignatures compares msg.txid against this hash; tests pass
+		// ch._spliceTx.tx.getHash() as the message txid to match.
+		const stubSpliceTxid = crypto.randomBytes(32);
 		ch._spliceTx = {
-			tx: { ins: [] },
+			tx: { ins: [], getHash: () => stubSpliceTxid },
 			sharedInputIndex: 0,
 			newFundingOutputIndex: 0,
 			ourWalletWitnesses: [],
@@ -727,10 +730,11 @@ describe('Zero-conf splice semantics (BOLT 2)', function () {
 			toBuffer: () => Buffer.alloc(1)
 		};
 		ch.applyPeerSpliceSignature = (): unknown => fakeTx;
+		ch._verifySpliceSharedInputSig = (): null => null;
 
 		const actions = ch.handleTxSignatures({
 			channelId: ch._state.channelId,
-			txid: crypto.randomBytes(32),
+			txid: ch._spliceTx.tx.getHash(),
 			witnesses: [],
 			sharedInputSignature: Buffer.alloc(64)
 		});
@@ -752,10 +756,11 @@ describe('Zero-conf splice semantics (BOLT 2)', function () {
 			toBuffer: () => Buffer.alloc(1)
 		};
 		ch.applyPeerSpliceSignature = (): unknown => fakeTx;
+		ch._verifySpliceSharedInputSig = (): null => null;
 
 		const actions = ch.handleTxSignatures({
 			channelId: ch._state.channelId,
-			txid: crypto.randomBytes(32),
+			txid: ch._spliceTx.tx.getHash(),
 			witnesses: [],
 			sharedInputSignature: Buffer.alloc(64)
 		});
