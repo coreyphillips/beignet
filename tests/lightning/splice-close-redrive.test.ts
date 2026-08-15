@@ -75,7 +75,13 @@ function makeNodeConfig(seedId: number): INodeConfig {
 class ControlledBackend implements IChainBackend {
 	broadcasts: string[] = [];
 	failBroadcasts = false;
-	async subscribeToHeaders(): Promise<void> {}
+	// The watcher's header callback, captured so tests can deliver a REAL
+	// production block (headers run through ChainWatcher.handleNewBlock, not
+	// LightningNode.handleNewBlock).
+	headerCallback: ((height: number) => void) | null = null;
+	async subscribeToHeaders(cb: (height: number) => void): Promise<void> {
+		this.headerCallback = cb;
+	}
 	async subscribeToScriptHash(): Promise<void> {}
 	async getScriptHashHistory(): Promise<
 		Array<{ txid: string; height: number }>
@@ -372,6 +378,164 @@ describe('Issue #357: splice confirmation re-drives a FORCE_CLOSED close', funct
 		await tick();
 
 		expect(fx.backend.broadcasts.length).to.equal(broadcastsAfterFirst);
+		fx.destroy();
+	});
+
+	it('retries via a real backend header (the ChainWatcher block path)', async () => {
+		const fx = await setup(3631);
+		fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice));
+		const { spliceTxid, displayHex } = graftSpliceRecord(
+			fx.alice,
+			fx.channelId
+		);
+
+		fx.backend.failBroadcasts = true;
+		fx.alice
+			.getChainWatcher()!
+			.emit('funding:confirmed', fx.channelId, displayHex);
+		await tick();
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		expect((fx.alice as any)._pendingSpliceCloseRedrives.size).to.equal(1);
+
+		// Production headers run through ChainWatcher.handleNewBlock, never
+		// LightningNode.handleNewBlock: the retry must ride the watcher's
+		// block event too.
+		fx.backend.failBroadcasts = false;
+		const broadcastsBefore = fx.backend.broadcasts.length;
+		expect(
+			fx.backend.headerCallback,
+			'watcher subscribed to headers'
+		).to.not.equal(null);
+		fx.backend.headerCallback!(800_000);
+		await tick();
+
+		expect(fx.backend.broadcasts.length).to.equal(broadcastsBefore + 1);
+		const redriven = bitcoin.Transaction.fromHex(
+			fx.backend.broadcasts[fx.backend.broadcasts.length - 1]
+		);
+		expect(Buffer.from(redriven.ins[0].hash).equals(spliceTxid)).to.equal(true);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		expect((fx.alice as any)._pendingSpliceCloseRedrives.size).to.equal(0);
+		fx.destroy();
+	});
+
+	it('redrives a restored channel whose monitor was never persisted', async () => {
+		const fx = await setup(3641);
+		fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice));
+		const { spliceTxid, displayHex } = graftSpliceRecord(
+			fx.alice,
+			fx.channelId
+		);
+		// Crash-window equivalence: the terminal channel state persisted but
+		// the monitor did not, and restoreChainWatches deliberately leaves it
+		// absent for lazy creation on spend detection.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(fx.alice as any).channelManager.monitors.delete(
+			fx.channelId.toString('hex')
+		);
+		const broadcastsBefore = fx.backend.broadcasts.length;
+
+		fx.alice
+			.getChainWatcher()!
+			.emit('funding:confirmed', fx.channelId, displayHex);
+		await tick();
+
+		const state = fx.alice
+			.getChannelManager()
+			.getChannel(fx.channelId)!
+			.getFullState();
+		expect(state.fundingTxid!.equals(spliceTxid), 'adoption applied').to.equal(
+			true
+		);
+		expect(fx.backend.broadcasts.length).to.equal(broadcastsBefore + 1);
+		const redriven = bitcoin.Transaction.fromHex(
+			fx.backend.broadcasts[fx.backend.broadcasts.length - 1]
+		);
+		expect(Buffer.from(redriven.ins[0].hash).equals(spliceTxid)).to.equal(true);
+		fx.destroy();
+	});
+
+	it('replaces a stale CPFP entry when the rebuild adopts the splice', async () => {
+		const fx = await setup(3651);
+		const forced = fx.alice.forceCloseChannel(
+			fx.channelId,
+			destScript(fx.alice)
+		);
+		const { displayHex } = graftSpliceRecord(fx.alice, fx.channelId);
+		// An anchor force-close retains a CPFP entry keyed by channel id for
+		// the OLD parent; left in place it would keep re-broadcasting and
+		// fee-bumping the voided commitment while the adopted one has no
+		// CPFP child at all.
+		const idHex = fx.channelId.toString('hex');
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const cm = fx.alice.getChannelManager() as any;
+		cm._pendingCommitmentCpfp.set(idHex, {
+			action: { commitmentTxid: forced.commitmentTxid, tx: Buffer.alloc(0) },
+			broadcastHeight: 0,
+			lastFeeRate: 1
+		});
+
+		fx.alice
+			.getChainWatcher()!
+			.emit('funding:confirmed', fx.channelId, displayHex);
+		await tick();
+
+		const entry = cm._pendingCommitmentCpfp.get(idHex);
+		expect(
+			entry === undefined ||
+				entry.action.commitmentTxid !== forced.commitmentTxid,
+			'stale old-parent CPFP entry replaced'
+		).to.equal(true);
+		fx.destroy();
+	});
+
+	it('a stale confirmed-close refusal queues a retry and recovers once demoted', async () => {
+		const fx = await setup(3661);
+		fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice));
+		// The old-funding commitment confirms first; a reorg then replaces it
+		// with the splice (both spend the old funding outpoint).
+		const closeTxHex = fx.backend.broadcasts[fx.backend.broadcasts.length - 1];
+		fx.alice
+			.getChannelManager()
+			.handleFundingSpent(
+				fx.channelId,
+				bitcoin.Transaction.fromHex(closeTxHex),
+				100,
+				destScript(fx.alice)
+			);
+		const monitor = fx.alice.getChannelManager().getMonitor(fx.channelId)!;
+		expect(monitor.isCommitmentConfirmed()).to.equal(true);
+
+		const { spliceTxid, displayHex } = graftSpliceRecord(
+			fx.alice,
+			fx.channelId
+		);
+		fx.alice
+			.getChainWatcher()!
+			.emit('funding:confirmed', fx.channelId, displayHex);
+		await tick();
+
+		// Refused against the stale confirmation, but queued: the reconcile
+		// has not demoted the pre-reorg record yet.
+		expect(record(fx.alice, fx.channelId)!.confirmed).to.equal(true);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		expect((fx.alice as any)._pendingSpliceCloseRedrives.size).to.equal(1);
+
+		// The funding-spend reconcile reports the recorded spend absent and
+		// demotes the stale confirmation; the next block's retry adopts.
+		fx.alice.getChannelManager().handleFundingSpendAbsent(fx.channelId);
+		expect(monitor.isCommitmentConfirmed()).to.equal(false);
+		const broadcastsBefore = fx.backend.broadcasts.length;
+		fx.alice.handleNewBlock(101);
+		await tick();
+
+		expect(fx.backend.broadcasts.length).to.equal(broadcastsBefore + 1);
+		const redriven = bitcoin.Transaction.fromHex(
+			fx.backend.broadcasts[fx.backend.broadcasts.length - 1]
+		);
+		expect(Buffer.from(redriven.ins[0].hash).equals(spliceTxid)).to.equal(true);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		expect((fx.alice as any)._pendingSpliceCloseRedrives.size).to.equal(0);
 		fx.destroy();
 	});
 });

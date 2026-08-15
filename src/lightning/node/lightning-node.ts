@@ -6227,6 +6227,11 @@ export class LightningNode extends EventEmitter {
 			// keep the fee advisor warm here too — force-closes and v2 opens
 			// both price themselves synchronously off its latest sample.
 			this.warmFeeAdvisor();
+			// Same reason for the splice close re-drive retry (issue #357):
+			// production headers run through the watcher, so a re-drive queued
+			// after a transient failure must get its per-block retry here, not
+			// only in handleNewBlock.
+			this.retrySpliceCloseRedrives();
 		});
 		this.chainWatcher.on('error', (err: Error) => {
 			this.emit('node:error', {
@@ -8365,9 +8370,11 @@ export class LightningNode extends EventEmitter {
 	 * the close. Rebuild through the force-close planner (whose splice
 	 * adoption moves the channel onto the confirmed new funding), persist the
 	 * adoption, and broadcast once, exactly as the manual path does. A
-	 * failed broadcast is retried each block; a rebuild refusal is final
-	 * (the rebuild is deterministic: a confirmed close or a peer commitment
-	 * having won will refuse identically every time).
+	 * failed broadcast is retried each block. Rebuild refusals are final
+	 * (deterministic: a peer commitment having won refuses identically every
+	 * time), except a bare confirmed-close refusal while a confirmed record
+	 * still awaits adoption: that monitor state can be a stale pre-reorg
+	 * record the funding-spend reconcile has yet to demote, so it retries.
 	 */
 	private async redriveSpliceAdoptedClose(channelId: Buffer): Promise<void> {
 		const idHex = channelId.toString('hex');
@@ -8378,6 +8385,19 @@ export class LightningNode extends EventEmitter {
 				this.resolveForceCloseFeeRatePerVbyte()
 			);
 			if (!rebuilt.ok || !rebuilt.tx) {
+				// A monitor-state refusal can be STALE: the splice that just
+				// confirmed spends the same funding outpoint as the "confirmed"
+				// old commitment, and the funding-spend reconcile demotes the
+				// stale record only after this callback. While a confirmed
+				// record still awaits adoption, retry each block instead of
+				// dropping the re-drive.
+				const ch = this.channelManager.getChannel(channelId);
+				if (
+					rebuilt.retryable === true &&
+					ch?.getFullState().spliceInFlight?.confirmed === true
+				) {
+					this._pendingSpliceCloseRedrives.add(idHex);
+				}
 				this.emitStructuredLog('chain', 'splice_close_redrive_refused', {
 					channelId: idHex,
 					error: rebuilt.error
