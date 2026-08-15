@@ -348,13 +348,16 @@ describe('BOLT 2 LOW hardening batch', function () {
 		});
 	});
 
-	describe('RBF feerate floor (25/24)', function () {
-		it('computes the spec floor with a strict-increase backstop', function () {
+	describe('RBF feerate floor (25/24, +25)', function () {
+		it('computes the spec floor as max of the ratio and the additive arm', function () {
+			// BOLT 2: max(floor(old * 25 / 24), old + 25).
 			expect(rbfFeerateFloor(2400)).to.equal(2500);
-			expect(rbfFeerateFloor(253)).to.equal(263);
-			// Tiny rates round down to the previous value; the floor is then +1.
-			expect(rbfFeerateFloor(10)).to.equal(11);
-			expect(rbfFeerateFloor(0)).to.equal(1);
+			// At small rates the ratio arm loses to the additive +25.
+			expect(rbfFeerateFloor(253)).to.equal(278);
+			expect(rbfFeerateFloor(10)).to.equal(35);
+			expect(rbfFeerateFloor(0)).to.equal(25);
+			// The crossover: from 600 the ratio arm meets the additive arm.
+			expect(rbfFeerateFloor(600)).to.equal(625);
 		});
 	});
 

@@ -52,7 +52,9 @@
  * resumes the frozen tx_signatures release of the retained attempt).
  * Known divergence: beignet conducts RBF between the commitment exchange
  * and the tx_signatures exchange, while Eclair/CLN RBF a COMPLETED (fully
- * signed, broadcast, unconfirmed) attempt; the windows do not overlap, so a
+ * signed, broadcast, unconfirmed) attempt; the windows do not overlap, and
+ * the tx_init_rbf/tx_ack_rbf codecs carry no funding_output_contribution
+ * TLV, so the replacement path is beignet-to-beignet only and a
  * cross-implementation tx_init_rbf resolves as a clean attempt-scoped
  * refusal in either direction rather than a completed replacement. Tracked
  * as a feature gap in issue #360; the live refusal path is pinned by
@@ -80,14 +82,15 @@ import { IChannelBasepoints } from '../keys/derivation';
 import { ILeaseRates } from '../gossip/types';
 
 /**
- * BOLT 2: the minimum feerate for an RBF attempt is 25/24 of the previous
- * funding feerate. At tiny feerates the 25/24 ratio rounds down to the
- * previous value, so the floor is never below a strict +1 increase.
+ * BOLT 2: the minimum feerate for an RBF attempt is the greater of 25/24 of
+ * the previous funding feerate (rounded down) and 25 sat/kw above it. At
+ * tiny feerates the ratio arm rounds down near the previous value, so the
+ * additive +25 arm is the floor there.
  */
 export function rbfFeerateFloor(previousFeeratePerkw: number): number {
 	return Math.max(
 		Math.floor((previousFeeratePerkw * 25) / 24),
-		previousFeeratePerkw + 1
+		previousFeeratePerkw + 25
 	);
 }
 

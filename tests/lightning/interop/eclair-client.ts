@@ -26,6 +26,13 @@ export interface IEclairPeer {
 	address?: string;
 }
 
+/** Eclair's RES_BUMP_FUNDING_FEE, the successful rbfopen response. */
+export interface IEclairRbfResult {
+	rbfIndex: number;
+	fundingTxId: string;
+	fee: number;
+}
+
 export interface IEclairChannel {
 	nodeId: string;
 	channelId: string;
@@ -214,16 +221,17 @@ export class EclairRestClient {
 	/**
 	 * Ask eclair to RBF a dual-funded channel open it initiated (sends
 	 * tx_init_rbf). Eclair answers the command only once the attempt
-	 * resolves, so a refusal (the peer's tx_abort) surfaces as a rejected
-	 * promise or an error string, depending on the eclair version. Callers
-	 * should treat the response as diagnostic and assert on channel state.
+	 * resolves: success returns RES_BUMP_FUNDING_FEE's fields, while a
+	 * refusal (the peer's tx_abort) surfaces as a rejected promise carrying
+	 * eclair's failure text. Callers should treat the response as
+	 * diagnostic and assert on channel state.
 	 */
 	async rbfOpen(
 		channelId: string,
 		targetFeerateSatByte: number,
 		lockTime?: number,
 		fundingFeeBudgetSatoshis = 100_000
-	): Promise<string> {
+	): Promise<IEclairRbfResult> {
 		const params: Record<string, string> = {
 			channelId,
 			targetFeerateSatByte: String(targetFeerateSatByte),

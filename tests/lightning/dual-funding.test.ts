@@ -1608,6 +1608,20 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			expect(channel.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
 		});
 
+		it('still refuses a P2TR-input tx one sat below its exact floor', () => {
+			// 666 sats is 1 below the 667 WU minimum: pins the P2TR key-spend
+			// input weight at exactly 230 WU rather than 230-or-less.
+			const { actions } = driveCompletionWithFee({
+				peerPrevTx: makePeerPrevTxP2tr(60_000),
+				peerInputValueSats: 60_000n,
+				feeSats: 666n
+			});
+			expect(sends(actions, MessageType.TX_ABORT), 'refused with tx_abort').to
+				.be.true;
+			expect(sends(actions, MessageType.TX_COMPLETE), 'does not complete').to.be
+				.false;
+		});
+
 		it('still refuses a completed tx paying below the low-R fee floor', () => {
 			// 707 sats is 1 below the 708 WU minimum: the audit floor moved
 			// down to the honest minimum, it did not disappear.

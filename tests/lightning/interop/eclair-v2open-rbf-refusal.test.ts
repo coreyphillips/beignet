@@ -284,7 +284,7 @@ describe('Interop: v2 open RBF refusal via tx_abort vs Eclair (regtest)', functi
 		// below run on the wire capture and on channel state.
 		let rbfOutcome: string;
 		try {
-			rbfOutcome = await eclair.rbfOpen(eclairChannelId, 50);
+			rbfOutcome = JSON.stringify(await eclair.rbfOpen(eclairChannelId, 50));
 		} catch (err: unknown) {
 			rbfOutcome = (err as Error).message;
 		}
