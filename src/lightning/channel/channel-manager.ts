@@ -6040,7 +6040,14 @@ export class ChannelManager extends EventEmitter {
 					);
 					// A splice re-watches a NEW funding outpoint on an existing
 					// channel; only a first-time funding watch means "opening".
-					if (channel.getState() !== ChannelState.SPLICING) {
+					// ERRORED is excluded too: a splice tx_signatures wire
+					// failure retains the splice-outpoint watch in the same
+					// batch that moved the channel to ERRORED, and no first-time
+					// funding watch is ever emitted by an ERRORED channel.
+					if (
+						channel.getState() !== ChannelState.SPLICING &&
+						channel.getState() !== ChannelState.ERRORED
+					) {
 						this.emit(
 							'channel:opening',
 							channel.getChannelId() || channel.getTemporaryChannelId(),
