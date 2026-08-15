@@ -28,3 +28,6 @@ jobs:
 
       - name: Type check
         run: npm run tsc:check
+
+      - name: Type check tests and scripts
+        run: npm run tsc:check:tests

@@ -549,10 +549,9 @@ const runBeignetExample = async (
 `);
 	};
 
-	r.on('exit', async () => {
+	r.on('exit', () => {
 		console.log('\nShutting down...');
-		await node.destroy();
-		process.exit(0);
+		void node.destroy().then(() => process.exit(0));
 	});
 };
 

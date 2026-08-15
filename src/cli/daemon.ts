@@ -2069,9 +2069,13 @@ export async function startDaemon(
 			cert: fs.readFileSync(opts.tlsCert),
 			key: fs.readFileSync(opts.tlsKey)
 		};
-		server = https.createServer(tlsOptions, requestHandler);
+		server = https.createServer(tlsOptions, (req, res) => {
+			void requestHandler(req, res);
+		});
 	} else {
-		server = http.createServer(requestHandler);
+		server = http.createServer((req, res) => {
+			void requestHandler(req, res);
+		});
 	}
 
 	// Wire up SSE events from BeignetNode (already JSON-safe types)

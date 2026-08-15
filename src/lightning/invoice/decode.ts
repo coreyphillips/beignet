@@ -95,7 +95,7 @@ export function decode(invoiceString: string): IInvoice {
 		// data_lengths of 52, 52, 52 or 53 respectively. Truncating an over-length
 		// field instead would yield a wrong payment hash / secret / payee that we
 		// would then try to pay.
-		const expectedWords = FIXED_LENGTH_TAG_WORDS[field.type];
+		const expectedWords = FIXED_LENGTH_TAG_WORDS[field.type as TagType];
 		if (
 			expectedWords !== undefined &&
 			field.dataWords.length !== expectedWords

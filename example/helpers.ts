@@ -17,10 +17,10 @@ export const getData: TGetData = async <K extends keyof IWalletData>(
 		const walletData: IWalletData[K] = JSON.parse(data);
 		if (walletData) return ok(walletData);
 		const defaultWalletData = getDefaultWalletData();
-		return ok(defaultWalletData[key]);
+		return ok(defaultWalletData[key as K]);
 	} catch (e) {
 		const defaultWalletData = getDefaultWalletData();
-		return ok(defaultWalletData[key]);
+		return ok(defaultWalletData[key as K]);
 	}
 };
 
@@ -50,7 +50,7 @@ export const deleteDirectory = async (
 	}
 };
 
-export const onMessage = (id, data): void => {
+export const onMessage = (id: unknown, data: unknown): void => {
 	console.log(id);
 	console.dir(data, { depth: null });
 };

@@ -226,17 +226,17 @@ export const validateMnemonic = (mnemonic = ''): boolean => {
  * @param obj2
  * @returns boolean
  */
-export const objectsMatch = (obj1, obj2): boolean => {
+export const objectsMatch = (obj1: unknown, obj2: unknown): boolean => {
 	if (!obj1 || !obj2) {
 		return false;
 	}
-	const obj1Length = Object.keys(obj1).length;
-	const obj2Length = Object.keys(obj2).length;
+	const a = obj1 as Record<string, unknown>;
+	const b = obj2 as Record<string, unknown>;
+	const obj1Length = Object.keys(a).length;
+	const obj2Length = Object.keys(b).length;
 
 	if (obj1Length === obj2Length) {
-		return Object.keys(obj1).every(
-			(key) => key in obj2 && obj2[key] === obj1[key]
-		);
+		return Object.keys(a).every((key) => key in b && b[key] === a[key]);
 	} else {
 		return false;
 	}
@@ -373,7 +373,7 @@ export const getAddressesFromPrivateKey = ({
 	}
 };
 
-export const sleep = (ms): Promise<void> => {
+export const sleep = (ms: number): Promise<void> => {
 	return new Promise((resolve) => {
 		setTimeout(resolve, ms);
 	});

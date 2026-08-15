@@ -26,7 +26,7 @@ let waitForElectrum: TWaitForElectrum;
 const rpc = new BitcoinJsonRpc(bitcoinURL);
 const ml = new MessageListener();
 
-describe('Receive', async function () {
+describe('Receive', function () {
 	this.timeout(testTimeout);
 
 	beforeEach(async function () {

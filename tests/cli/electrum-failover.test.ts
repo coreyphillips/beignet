@@ -98,7 +98,7 @@ describe('Electrum Failover — Multi-Server Support', () => {
 				called = true;
 			};
 			expect(backend.onFailoverNeeded).to.be.a('function');
-			backend.onFailoverNeeded(3);
+			void backend.onFailoverNeeded(3);
 			expect(called).to.be.true;
 		});
 

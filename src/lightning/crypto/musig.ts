@@ -53,14 +53,19 @@ function sha256(...messages: Uint8Array[]): Uint8Array {
  */
 const cryptoBackend = {
 	...baseCrypto,
-	pointMultiplyUnsafe(p, a, compress) {
+	pointMultiplyUnsafe(p: Uint8Array, a: Uint8Array, compress: boolean) {
 		try {
 			return ecc.pointMultiply(p, a, compress) ?? null;
 		} catch {
 			return null;
 		}
 	},
-	pointMultiplyAndAddUnsafe(p1, a, p2, compress) {
+	pointMultiplyAndAddUnsafe(
+		p1: Uint8Array,
+		a: Uint8Array,
+		p2: Uint8Array,
+		compress: boolean
+	) {
 		try {
 			const ap1 = ecc.pointMultiply(p1, a, false);
 			if (!ap1) return null;
@@ -69,24 +74,24 @@ const cryptoBackend = {
 			return null;
 		}
 	},
-	pointAdd(a, b, compress) {
+	pointAdd(a: Uint8Array, b: Uint8Array, compress: boolean) {
 		try {
 			return ecc.pointAdd(a, b, compress) ?? null;
 		} catch {
 			return null;
 		}
 	},
-	pointAddTweak(p, tweak, compress) {
+	pointAddTweak(p: Uint8Array, tweak: Uint8Array, compress: boolean) {
 		try {
 			return ecc.pointAddScalar(p, tweak, compress) ?? null;
 		} catch {
 			return null;
 		}
 	},
-	pointCompress(p, compress = true) {
+	pointCompress(p: Uint8Array, compress = true) {
 		return ecc.pointCompress(p, compress);
 	},
-	liftX(p) {
+	liftX(p: Uint8Array) {
 		// Lift a 32-byte x-only coordinate to a full (even-Y) point, returned
 		// uncompressed. An invalid x (not on curve) yields null.
 		try {
@@ -96,7 +101,7 @@ const cryptoBackend = {
 			return null;
 		}
 	},
-	getPublicKey(s, compress) {
+	getPublicKey(s: Uint8Array, compress: boolean) {
 		try {
 			return ecc.pointFromScalar(s, compress) ?? null;
 		} catch {

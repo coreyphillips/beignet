@@ -288,7 +288,7 @@ export const getDataFallback: TGetData = async <K extends keyof IWalletData>(
 		if (!Object.prototype.hasOwnProperty.call(defaultWalletData, dataKey)) {
 			return err(`Unable to get data for unknown key: ${key}`);
 		}
-		return ok(cloneDeep(defaultWalletData[dataKey]));
+		return ok(cloneDeep(defaultWalletData[dataKey as K]));
 	} catch (e) {
 		return err(e);
 	}
@@ -328,7 +328,7 @@ export const decodeOpReturnMessage = (opReturn = ''): string[] => {
  * @param {string} bip39Passphrase
  * @returns {Buffer}
  */
-export const getSeed = (mnemonic, bip39Passphrase): Buffer => {
+export const getSeed = (mnemonic: string, bip39Passphrase?: string): Buffer => {
 	return bip39.mnemonicToSeedSync(mnemonic, bip39Passphrase);
 };
 

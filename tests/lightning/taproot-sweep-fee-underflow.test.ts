@@ -211,7 +211,9 @@ describe('taproot sweep fee underflow', function () {
 			[paymentHash.toString('hex'), preimage]
 		]);
 
-		let resolved;
+		let resolved:
+			| ReturnType<typeof resolveTheirCurrentCommitmentOutputs>
+			| undefined;
 		expect(() => {
 			resolved = resolveTheirCurrentCommitmentOutputs(
 				state,

@@ -129,7 +129,8 @@ export const parseExtendedPublicKey = (
 				`Extended public key prefix ${prefix} does not match the ${network} network.`
 			);
 		}
-		const targetNetwork = bitcoin.networks[network];
+		const targetNetwork =
+			bitcoin.networks[network as keyof typeof bitcoin.networks];
 		// bip32.fromBase58 rejects any version bytes that differ from the
 		// network passed in, so parse with the SLIP-132 version substituted.
 		// The private version is set to a value no key can carry: fromBase58

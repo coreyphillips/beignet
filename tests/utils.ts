@@ -40,14 +40,17 @@ export const initWaitForElectrumToSync = async (
 		EProtocol.tcp
 	);
 
-	electrum.subscribe.on('blockchain.headers.subscribe', (params) => {
-		// get max height
-		const h = params
-			.map(({ height: hh }) => hh)
-			.sort()
-			.reverse()[0];
-		height = h;
-	});
+	electrum.subscribe.on(
+		'blockchain.headers.subscribe',
+		(params: { height: number }[]) => {
+			// get max height
+			const h = params
+				.map(({ height: hh }) => hh)
+				.sort()
+				.reverse()[0];
+			height = h;
+		}
+	);
 
 	await electrum.initElectrum({ client: 'wait-for-block', version: '1.4' });
 
@@ -55,11 +58,10 @@ export const initWaitForElectrumToSync = async (
 	height = tip.height;
 
 	const waitForElectrum = (): Promise<void> => {
-		return new Promise(async (resolve, reject) => {
-			let count: number;
+		return new Promise((resolve, reject) => {
 			let running = true;
 
-			const timer = setTimeout(async () => {
+			const onTimeout = async (): Promise<void> => {
 				running = false;
 				// before timeout check block count once again
 				const b = await bitcoin.getBlockCount();
@@ -69,24 +71,31 @@ export const initWaitForElectrumToSync = async (
 				} else {
 					reject(new Error('Electrum sync Timeout error'));
 				}
+			};
+			const timer = setTimeout((): void => {
+				void onTimeout();
 			}, timeout);
 
-			try {
-				count = await bitcoin.getBlockCount();
-			} catch (e) {
-				clearTimeout(timer);
-				reject(e);
-				return;
-			}
+			const poll = async (): Promise<void> => {
+				let count: number;
+				try {
+					count = await bitcoin.getBlockCount();
+				} catch (e) {
+					clearTimeout(timer);
+					reject(e);
+					return;
+				}
 
-			while (running && count !== height) {
-				await sleep(10);
-			}
+				while (running && count !== height) {
+					await sleep(10);
+				}
 
-			if (running) {
-				clearTimeout(timer);
-				resolve();
-			}
+				if (running) {
+					clearTimeout(timer);
+					resolve();
+				}
+			};
+			void poll();
 		});
 	};
 

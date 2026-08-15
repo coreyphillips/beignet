@@ -82,7 +82,11 @@ const makeUtxo = async (
 		addressType,
 		changeAddress
 	});
-	const purpose = { p2pkh: 44, p2sh: 49, p2wpkh: 84, p2tr: 86 }[addressType];
+	const purpose = (
+		{ p2pkh: 44, p2sh: 49, p2wpkh: 84, p2tr: 86 } as Partial<
+			Record<EAddressType, number>
+		>
+	)[addressType];
 	const derivationPath = `m/${purpose}'/1'/0'/${
 		changeAddress ? 1 : 0
 	}/${index}`;
@@ -158,7 +162,7 @@ const createWatchOnlyWallet = async (): Promise<Wallet> => {
 	return res.value;
 };
 
-describe('External-Signer PSBT Flow', async function () {
+describe('External-Signer PSBT Flow', function () {
 	this.timeout(testTimeout);
 
 	before(function () {

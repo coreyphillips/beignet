@@ -116,12 +116,14 @@ export const getPeers = async ({
 			// Return an array of peers provided by the currently connected electrum server.
 			const peers: IFormattedPeerData[] = [];
 			await Promise.all(
-				response.data.map(async (peer) => {
-					const formattedPeer = await formatPeerData(peer);
-					if (formattedPeer.isOk()) {
-						peers.push(formattedPeer.value);
+				response.data.map(
+					async (peer: [string, string, [string, string, string]]) => {
+						const formattedPeer = await formatPeerData(peer);
+						if (formattedPeer.isOk()) {
+							peers.push(formattedPeer.value);
+						}
 					}
-				})
+				)
 			);
 			if (peers?.length > 0) {
 				return ok(peers);
@@ -149,7 +151,7 @@ export const electrumConnection = ((
 	const subscribers: Set<(isConnected: boolean) => void> = new Set();
 	let latestState: boolean | null = null;
 
-	setInterval(async () => {
+	const checkConnection = async (): Promise<void> => {
 		try {
 			const { error } = await electrum.pingServer();
 
@@ -168,6 +170,9 @@ export const electrumConnection = ((
 		} catch (e) {
 			logger.error('Electrum connection check failed.', e);
 		}
+	};
+	setInterval((): void => {
+		void checkConnection();
 	}, POLLING_INTERVAL);
 
 	const publish = (isConnected: boolean): void => {

@@ -32,7 +32,7 @@ const testTimeout = 60000;
 
 let wallet: Wallet;
 
-describe('Wallet Library', async function () {
+describe('Wallet Library', function () {
 	this.timeout(testTimeout);
 
 	before(async function () {
@@ -375,10 +375,10 @@ describe('Wallet Library', async function () {
 	});
 
 	describe('Wallet refresh', () => {
-		let spy;
+		let spy: any;
 		before(async () => {
 			spy = sinon.spy(wallet, 'formatTransactions');
-			wallet.refreshWallet({});
+			void wallet.refreshWallet({});
 		});
 
 		it('Format transactions should not be called', () => {

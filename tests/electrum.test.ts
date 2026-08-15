@@ -17,7 +17,7 @@ const testTimeout = 60000;
 
 let wallet: Wallet;
 
-describe('Electrum Methods', async function (): Promise<void> {
+describe('Electrum Methods', function () {
 	this.timeout(testTimeout);
 
 	before(async function () {

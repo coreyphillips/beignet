@@ -443,8 +443,8 @@ export class Wallet {
 			if (wallet._disableMessagesOnCreate) wallet.disableMessages = true;
 			const res = await wallet.setWalletData();
 			if (res.isErr()) return err(res.error.message);
-			wallet.updateFeeEstimates(true);
-			wallet.refreshWallet({});
+			void wallet.updateFeeEstimates(true);
+			void wallet.refreshWallet({});
 			return ok(wallet);
 		} catch (e) {
 			return err(e);
@@ -805,7 +805,7 @@ export class Wallet {
 			});
 		}
 		this.isRefreshing = true;
-		this.updateFeeEstimates();
+		void this.updateFeeEstimates();
 		try {
 			await this.setZeroIndexAddresses();
 			const r1 = await this.updateAddressIndexes();
@@ -955,9 +955,7 @@ export class Wallet {
 						const getDataRes = await this._getData(walletDataKey);
 						if (getDataRes.isErr()) {
 							//dataResult = getDataRes?.value ?? walletData[key];
-							return err(
-								dataResult?.error?.message ?? 'Error getting wallet data'
-							);
+							return err('Error getting wallet data');
 						}
 						dataResult = getDataRes?.value;
 					} catch (e) {
@@ -1021,6 +1019,7 @@ export class Wallet {
 							this.logger.warn(`Unhandled key in getWalletData: ${key}`);
 							break;
 					}
+					return;
 				})
 			);
 			return ok(walletData);
@@ -1045,7 +1044,7 @@ export class Wallet {
 	 * @param mnemonic
 	 * @returns {boolean}
 	 */
-	isValid(mnemonic): boolean {
+	isValid(mnemonic: string): boolean {
 		return (
 			!!this._mnemonic &&
 			mnemonic === this._mnemonic &&
@@ -2156,6 +2155,7 @@ export class Wallet {
 					lastUsedChangeAddressIndex;
 				updated = true;
 			}
+			return;
 		});
 		try {
 			await Promise.all(promises);
@@ -2768,6 +2768,7 @@ export class Wallet {
 		addressType?: EAddressType
 	): Promise<void> {
 		if (addressType) {
+			// @ts-ignore
 			this.data[key][addressType] = data;
 			await this.saveWalletData(key, this._data[key]);
 		} else {
@@ -2829,7 +2830,7 @@ export class Wallet {
 
 		// Add unconfirmed transactions.
 		// No need to wait for this to finish.
-		this.addUnconfirmedTransactions({
+		void this.addUnconfirmedTransactions({
 			transactions
 		});
 
@@ -2922,11 +2923,12 @@ export class Wallet {
 			// No need to scan an address with a saved UTXO.
 			if (utxoScriptHashes.has(tx.transaction.scriptHash)) continue;
 			for (const addressType in addresses) {
-				const addressData: IAddresses = addresses[addressType];
+				const addressData: IAddresses = addresses[addressType as EAddressType];
 				if (tx.transaction.scriptHash in addressData) {
 					const address = addressData[tx.transaction.scriptHash];
 					const index = address.index;
-					const currentIndex = this.data.addressIndex[addressType].index;
+					const currentIndex =
+						this.data.addressIndex[addressType as EAddressType].index;
 					const diff = getAddressIndexDiff(index, currentIndex);
 					if (diff > this.gapLimitOptions.lookBehind) {
 						outsideGapLimitAddresses[addressType] = [
@@ -4941,9 +4943,7 @@ export class Wallet {
 			const txData = this.transaction.data;
 			const txInputs = txData?.inputs ?? [];
 			const newInputs = txInputs.filter((txInput) => {
-				if (!objectsMatch(input, txInput)) {
-					return txInput;
-				}
+				return !objectsMatch(input, txInput);
 			});
 			const updateRes = this.transaction.updateSendTransaction({
 				transaction: {
@@ -5027,7 +5027,9 @@ export class Wallet {
 				satsPerByte =
 					this.selectedFeeId === EFeeId.none
 						? satsPerByte
-						: this.feeEstimates[this.selectedFeeId];
+						: (this.feeEstimates as Partial<Record<EFeeId, number>>)[
+								this.selectedFeeId
+						  ];
 			}
 			const res = this.transaction.updateFee({
 				satsPerByte: satsPerByte ?? 1,
@@ -5052,7 +5054,7 @@ export class Wallet {
 	public updateWalletBalance({ balance }: { balance: number }): Result<string> {
 		try {
 			this._data.balance = balance;
-			this.saveWalletData('balance', balance);
+			void this.saveWalletData('balance', balance);
 			return ok('Successfully updated balance.');
 		} catch (e) {
 			return err(e);
@@ -5225,9 +5227,9 @@ export class Wallet {
 		const addresses = this.data.addresses;
 		let address: { address: IAddress; addressType: EAddressType } | undefined;
 		for (const addressType in addresses) {
-			if (scriptHash in addresses[addressType]) {
+			if (scriptHash in addresses[addressType as EAddressType]) {
 				address = {
-					address: addresses[addressType][scriptHash],
+					address: addresses[addressType as EAddressType][scriptHash],
 					addressType: addressType as EAddressType
 				};
 				break; // Exit the loop once the address is found

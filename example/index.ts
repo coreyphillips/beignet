@@ -87,12 +87,11 @@ const runExample = async (mnemonic = generateMnemonic()): Promise<void> => {
 `);
 	};
 
-	r.on('exit', async () => {
+	r.on('exit', () => {
 		console.log('\nShutting down...');
-		await wallet.stop();
-		process.exit(0);
+		void wallet.stop().then(() => process.exit(0));
 	});
 };
 
 const mnemonic = process.argv[2];
-runExample(mnemonic).then();
+void runExample(mnemonic);
