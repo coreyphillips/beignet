@@ -54,7 +54,8 @@ import {
 import { decodeStfuMessage } from '../../src/lightning/message/stfu';
 import {
 	decodeCommitmentSignedMessage,
-	encodeCommitmentSignedMessage
+	encodeCommitmentSignedMessage,
+	decodeRevokeAndAckMessage
 } from '../../src/lightning/message/channel-commitment';
 import { decodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
 import {
@@ -77,7 +78,8 @@ import {
 } from '../../src/lightning/message/channel-funding';
 import {
 	signerFromSeed,
-	realInitialCommitmentSig
+	realInitialCommitmentSig,
+	realCommitmentSigs
 } from './helpers/real-signing';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
@@ -4178,6 +4180,160 @@ describe('Splice', function () {
 					// eslint-disable-next-line @typescript-eslint/no-explicit-any
 					expect((pair.acceptor as any)._spliceAbortIgnoreCommitment).to.be
 						.false;
+				});
+			});
+
+			describe('durable splice abort unwind (issue #356)', function () {
+				/** Drive the opener into the exposure window: the in-flight record
+				 *  was persisted at the commitment round, but no tx_signatures have
+				 *  crossed in either direction (the acceptor's were lost on the
+				 *  wire, so ours never left). */
+				function makeAbortWindowPair(): IWirePair {
+					const pair = makeWirePair();
+					pair.drop(MessageType.TX_SIGNATURES);
+					startSpliceOut(pair);
+					const record = pair.opener.getFullState().spliceInFlight;
+					expect(record, 'in-flight record exists').to.not.be.null;
+					expect(record!.sentTxSignatures).to.be.false;
+					expect(record!.receivedTxSignatures).to.be.false;
+					return pair;
+				}
+
+				it('a peer tx_abort with a recorded splice persists the unwind ahead of the echo', function () {
+					const pair = makeAbortWindowPair();
+					const actions = pair.opener.handleTxAbort();
+
+					const persistIndex = actions.findIndex(
+						(a) => a.type === ChannelActionType.PERSIST_STATE
+					);
+					const echoIndex = actions.findIndex(
+						(a) =>
+							a.type === ChannelActionType.SEND_MESSAGE &&
+							(a as { messageType: MessageType }).messageType ===
+								MessageType.TX_ABORT
+					);
+					expect(persistIndex, 'unwind persisted').to.not.equal(-1);
+					expect(echoIndex, 'tx_abort echoed').to.not.equal(-1);
+					expect(persistIndex, 'persist leads the echo').to.be.lessThan(
+						echoIndex
+					);
+					expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.opener.getFullState().spliceInFlight).to.be.null;
+					expect(pair.opener.getSpliceSession()).to.be.null;
+				});
+
+				it('the persisted unwind does not resurrect the splice across a restart', function () {
+					const pair = makeAbortWindowPair();
+
+					// What disk holds going into the abort: the commitment round's
+					// persist, record included.
+					let disk = JSON.parse(
+						JSON.stringify(serializeChannelState(pair.opener.getFullState()))
+					);
+					const actions = pair.opener.handleTxAbort();
+					// Manager contract: only a PERSIST_STATE action commits the
+					// state as of its dispatch. Without one, disk keeps the record.
+					if (actions.some((a) => a.type === ChannelActionType.PERSIST_STATE)) {
+						disk = JSON.parse(
+							JSON.stringify(serializeChannelState(pair.opener.getFullState()))
+						);
+					}
+
+					// "Crash" and restart from disk.
+					const restoredState = deserializeChannelState(disk);
+					expect(restoredState.spliceInFlight, 'no record on disk').to.be.null;
+
+					const restored = new Channel(restoredState);
+					restored.restoreSpliceInFlight();
+					restored.markForReestablish();
+					expect(restored.getSpliceSession(), 'nothing resurrected').to.be.null;
+					const re = findSendAction(
+						restored.createReestablish(),
+						MessageType.CHANNEL_REESTABLISH
+					);
+					expect(
+						decodeChannelReestablishMessage(re.payload).nextFundingTxid,
+						'no forgotten splice advertised'
+					).to.be.undefined;
+				});
+
+				it('a reestablish without next_funding_txid persists the recorded splice unwind', function () {
+					const pair = makeWirePair();
+
+					// Advance past commitment number 1 with an empty commitment
+					// round first: a fresh channel would replay channel_ready on
+					// reestablish, and the send-conditioned persist that replay
+					// drags in would mask the gap this test pins.
+					const sigs = realCommitmentSigs(pair.opener);
+					pair.opener.signCommitment(sigs.signature, sigs.htlcSignatures);
+					const ackActions = pair.acceptor.handleCommitmentSigned({
+						channelId: pair.acceptor.getChannelId()!,
+						signature: sigs.signature,
+						htlcSignatures: sigs.htlcSignatures
+					});
+					const rev = findSendAction(ackActions, MessageType.REVOKE_AND_ACK);
+					pair.opener.handleRevokeAndAck(
+						decodeRevokeAndAckMessage(rev.payload)
+					);
+
+					pair.drop(MessageType.TX_SIGNATURES);
+					startSpliceOut(pair);
+					const record = pair.opener.getFullState().spliceInFlight;
+					expect(record, 'in-flight record exists').to.not.be.null;
+					expect(record!.sentTxSignatures).to.be.false;
+					expect(record!.receivedTxSignatures).to.be.false;
+					disconnect(pair);
+
+					// Model a peer that silently dropped the splice: its reestablish
+					// carries no next_funding_txid and no proactive tx_abort (our own
+					// implementation always sends one of the two, so craft the
+					// message instead of pumping the pair).
+					const aRe = decodeChannelReestablishMessage(
+						findSendAction(
+							pair.acceptor.createReestablish(),
+							MessageType.CHANNEL_REESTABLISH
+						).payload
+					);
+					expect(aRe.nextCommitmentNumber, 'channel advanced past 1').to.equal(
+						2n
+					);
+					delete aRe.nextFundingTxid;
+					delete aRe.nextFundingRetransmitFlags;
+
+					const actions = pair.opener.handleReestablish(aRe);
+					expect(
+						findSendAction(actions, MessageType.CHANNEL_READY),
+						'no channel_ready replay masking the arm'
+					).to.not.exist;
+					expect(
+						findAction(actions, ChannelActionType.PERSIST_STATE),
+						'unwind persisted'
+					).to.exist;
+					expect(pair.opener.getFullState().spliceInFlight).to.be.null;
+					expect(pair.opener.getSpliceSession()).to.be.null;
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+				});
+
+				it('a peer tx_abort before the commitment round stays persist-free', function () {
+					const { acceptor } = makeNormalChannel();
+					quiesce(acceptor);
+					acceptor.handleSplice({
+						channelId: acceptor.getChannelId()!,
+						fundingPubkey: Buffer.alloc(33, 0x02),
+						relativeSatoshis: 0n,
+						fundingFeeratePerkw: 253,
+						locktime: 0
+					});
+					expect(acceptor.getState()).to.equal(ChannelState.SPLICING);
+					expect(acceptor.getFullState().spliceInFlight).to.be.null;
+
+					const actions = acceptor.handleTxAbort();
+					expect(
+						findAction(actions, ChannelActionType.PERSIST_STATE),
+						'nothing durable to unwind'
+					).to.not.exist;
+					expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
 				});
 			});
 
