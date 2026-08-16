@@ -465,7 +465,11 @@ export class Channel {
 	// (issue #370). That unwind is owed only for a handshake the splice
 	// machinery opened (ownsQuiescence): a quiescence the operator started
 	// with initiateQuiescence() outlives a cancelled splice that merely
-	// joined it. Memory-only: quiescence never survives a disconnect.
+	// joined it. When the funder peer initiates quiescence concurrently and
+	// wins the BOLT 2 tie-break (issue #372), the request is dropped instead
+	// (with a surfaced error unless cancelled): the session belongs to the
+	// peer and a non-initiator must not send splice_init. Memory-only:
+	// quiescence never survives a disconnect.
 	private _pendingSplice: {
 		relativeSatoshis: bigint;
 		fundingFeeratePerkw: number;
@@ -7163,7 +7167,7 @@ export class Channel {
 	/**
 	 * Handle STFU message from peer.
 	 */
-	handleStfuMessage(_msg: IStfuMessage): ChannelAction[] {
+	handleStfuMessage(msg: IStfuMessage): ChannelAction[] {
 		if (this._state.state !== ChannelState.NORMAL) {
 			return [
 				{
@@ -7183,7 +7187,13 @@ export class Channel {
 			];
 		}
 
-		const result = this._quiescence.handlePeerStfu();
+		// Concurrent stfu (the peer's message also claims the initiator role
+		// while ours is out) is tie-broken in favor of the channel funder
+		// (BOLT 2), so both sides agree on who may drive a dependent protocol.
+		const result = this._quiescence.handlePeerStfu(
+			msg.initiator,
+			this._state.role === ChannelRole.OPENER
+		);
 		if (result.error) {
 			return [{ type: ChannelActionType.ERROR, message: result.error }];
 		}
@@ -7249,6 +7259,33 @@ export class Channel {
 			// A cancelled splice that merely joined a caller-owned handshake is
 			// discarded outright: the operator's quiescence completes and
 			// stands, exactly as if the splice had never been requested.
+		} else if (
+			this._pendingSplice &&
+			this._quiescence.isQuiescent() &&
+			!this._quiescence.isInitiator()
+		) {
+			// We drove quiescence for a splice but the funder peer initiated
+			// concurrently and won the BOLT 2 tie-break: the session is theirs
+			// and only the initiator may send splice_init. Drop the request
+			// and surface the error so the operator can retry after the
+			// peer's session ends (mirrors the failed-quiescence drop in
+			// initiateSplice). A cancelled request is dropped silently: the
+			// cancel already succeeded, and the peer's session ends the
+			// quiescence, so no unwind is owed.
+			const lost = this._pendingSplice;
+			this._pendingSplice = null;
+			// The dead request's wallet configuration dies with it: stale
+			// splice-in inputs would otherwise leak into the contributions of
+			// a later splice (e.g. a splice-out), and clearing them lets the
+			// wallet's pledge TTL free the coins.
+			this._resetSpliceDriver();
+			if (!lost.cancelled) {
+				actions.push({
+					type: ChannelActionType.ERROR,
+					message:
+						'Splice request dropped: concurrent stfu lost the funder tie-break, peer is the quiescence initiator'
+				});
+			}
 		}
 
 		return actions;
@@ -7371,8 +7408,24 @@ export class Channel {
 			}
 		}
 
-		// Already quiescent — start the splice immediately.
+		// Already quiescent — start the splice immediately. Only the
+		// quiescence initiator may send splice_init (BOLT 2): a side that
+		// merely answered the peer's stfu (or lost the concurrent-stfu funder
+		// tie-break) must not drive a dependent protocol into the peer's
+		// session.
 		if (this._quiescence.isQuiescent()) {
+			if (!this._quiescence.isInitiator()) {
+				// The refused request's wallet configuration dies with it
+				// (see the tie-break drop in handleStfuMessage).
+				this._resetSpliceDriver();
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Cannot splice: peer initiated the quiescence session; retry after it ends'
+					}
+				];
+			}
 			return this._startSplice(relativeSatoshis, fundingFeeratePerkw, locktime);
 		}
 
@@ -7402,8 +7455,11 @@ export class Channel {
 		const stfuActions = this.initiateQuiescence();
 		// If quiescence couldn't be started (e.g. pending HTLCs), surface the
 		// error and drop the pending splice rather than leaving it dangling.
+		// Its wallet configuration dies with it (see the tie-break drop in
+		// handleStfuMessage).
 		if (stfuActions.some((a) => a.type === ChannelActionType.ERROR)) {
 			this._pendingSplice = null;
+			this._resetSpliceDriver();
 		}
 		return stfuActions;
 	}
@@ -7555,6 +7611,18 @@ export class Channel {
 		// peer's attempt when it lands, and its echo settles the exchange.
 		if (this._spliceAbortPending) {
 			return [];
+		}
+
+		// BOLT 2: only the quiescence initiator may initiate a dependent
+		// protocol. A splice_init from the side that merely answered our stfu
+		// (or lost the concurrent-stfu funder tie-break) violates the session;
+		// refuse on the wire rather than adopt a session the sender was not
+		// entitled to open.
+		if (this._quiescence.isInitiator()) {
+			return this.refuseSpliceInit(
+				'splice_init from quiescence non-initiator',
+				'Cannot accept splice: peer is not the quiescence initiator'
+			);
 		}
 
 		// Fresh negotiation, fresh tx_abort conversation (see _startSplice).

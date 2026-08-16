@@ -315,7 +315,7 @@ describe('Quiescence (STFU)', function () {
 
 		it('should handle peer STFU from NORMAL -> RECEIVED_STFU with shouldRespond', function () {
 			const qm = new QuiescenceManager();
-			const result = qm.handlePeerStfu();
+			const result = qm.handlePeerStfu(true, false);
 			expect(result.shouldRespond).to.be.true;
 			expect(result.error).to.be.undefined;
 			expect(qm.getState()).to.equal(QuiescenceState.RECEIVED_STFU);
@@ -323,7 +323,7 @@ describe('Quiescence (STFU)', function () {
 
 		it('should complete handshake from RECEIVED_STFU -> QUIESCENT', function () {
 			const qm = new QuiescenceManager();
-			qm.handlePeerStfu();
+			qm.handlePeerStfu(true, false);
 			expect(qm.getState()).to.equal(QuiescenceState.RECEIVED_STFU);
 			qm.completeHandshake();
 			expect(qm.getState()).to.equal(QuiescenceState.QUIESCENT);
@@ -332,16 +332,44 @@ describe('Quiescence (STFU)', function () {
 		it('should handle peer STFU from SENT_STFU -> QUIESCENT', function () {
 			const qm = new QuiescenceManager();
 			qm.initiate();
-			const result = qm.handlePeerStfu();
+			const result = qm.handlePeerStfu(false, false);
 			expect(result.shouldRespond).to.be.false;
 			expect(result.error).to.be.undefined;
 			expect(qm.getState()).to.equal(QuiescenceState.QUIESCENT);
 		});
 
+		it('should keep the initiator role on a peer reply regardless of funder role', function () {
+			// The peer's stfu answers ours (initiator flag clear): no tie to
+			// break, we stay initiator even as the non-funder.
+			const qm = new QuiescenceManager();
+			qm.initiate();
+			qm.handlePeerStfu(false, false);
+			expect(qm.getState()).to.equal(QuiescenceState.QUIESCENT);
+			expect(qm.isInitiator()).to.be.true;
+		});
+
+		it('should keep the initiator role on concurrent STFU as the funder', function () {
+			// Both sides sent stfu with the initiator flag: BOLT 2 breaks the
+			// tie in favor of the channel funder.
+			const qm = new QuiescenceManager();
+			qm.initiate();
+			qm.handlePeerStfu(true, true);
+			expect(qm.getState()).to.equal(QuiescenceState.QUIESCENT);
+			expect(qm.isInitiator()).to.be.true;
+		});
+
+		it('should yield the initiator role on concurrent STFU as the non-funder', function () {
+			const qm = new QuiescenceManager();
+			qm.initiate();
+			qm.handlePeerStfu(true, false);
+			expect(qm.getState()).to.equal(QuiescenceState.QUIESCENT);
+			expect(qm.isInitiator()).to.be.false;
+		});
+
 		it('should return error on peer STFU from RECEIVED_STFU', function () {
 			const qm = new QuiescenceManager();
-			qm.handlePeerStfu();
-			const result = qm.handlePeerStfu();
+			qm.handlePeerStfu(true, false);
+			const result = qm.handlePeerStfu(true, false);
 			expect(result.error).to.equal('Unexpected STFU in current state');
 			expect(result.shouldRespond).to.be.false;
 		});
@@ -349,16 +377,16 @@ describe('Quiescence (STFU)', function () {
 		it('should return error on peer STFU from QUIESCENT', function () {
 			const qm = new QuiescenceManager();
 			qm.initiate();
-			qm.handlePeerStfu();
+			qm.handlePeerStfu(false, false);
 			expect(qm.getState()).to.equal(QuiescenceState.QUIESCENT);
-			const result = qm.handlePeerStfu();
+			const result = qm.handlePeerStfu(true, false);
 			expect(result.error).to.equal('Unexpected STFU in current state');
 		});
 
 		it('should exit quiescence from QUIESCENT -> NORMAL', function () {
 			const qm = new QuiescenceManager();
 			qm.initiate();
-			qm.handlePeerStfu();
+			qm.handlePeerStfu(false, false);
 			expect(qm.getState()).to.equal(QuiescenceState.QUIESCENT);
 			const ok = qm.exitQuiescence();
 			expect(ok).to.be.true;
@@ -377,7 +405,7 @@ describe('Quiescence (STFU)', function () {
 			expect(qm.isQuiescent()).to.be.false;
 			qm.initiate();
 			expect(qm.isQuiescent()).to.be.false;
-			qm.handlePeerStfu();
+			qm.handlePeerStfu(false, false);
 			expect(qm.isQuiescent()).to.be.true;
 		});
 
@@ -388,7 +416,7 @@ describe('Quiescence (STFU)', function () {
 			qm.initiate();
 			expect(qm.isQuiescing()).to.be.true;
 
-			qm.handlePeerStfu();
+			qm.handlePeerStfu(false, false);
 			expect(qm.isQuiescing()).to.be.true;
 
 			qm.exitQuiescence();
@@ -396,7 +424,7 @@ describe('Quiescence (STFU)', function () {
 
 			// Also check RECEIVED_STFU path
 			const qm2 = new QuiescenceManager();
-			qm2.handlePeerStfu();
+			qm2.handlePeerStfu(true, false);
 			expect(qm2.isQuiescing()).to.be.true;
 		});
 
@@ -409,14 +437,14 @@ describe('Quiescence (STFU)', function () {
 
 		it('should report isInitiator() false when peer initiates', function () {
 			const qm = new QuiescenceManager();
-			qm.handlePeerStfu();
+			qm.handlePeerStfu(true, false);
 			expect(qm.isInitiator()).to.be.false;
 		});
 
 		it('should reset to NORMAL', function () {
 			const qm = new QuiescenceManager();
 			qm.initiate();
-			qm.handlePeerStfu();
+			qm.handlePeerStfu(false, false);
 			expect(qm.getState()).to.equal(QuiescenceState.QUIESCENT);
 			qm.reset();
 			expect(qm.getState()).to.equal(QuiescenceState.NORMAL);
@@ -434,7 +462,7 @@ describe('Quiescence (STFU)', function () {
 			expect(qmA.getState()).to.equal(QuiescenceState.SENT_STFU);
 
 			// B receives STFU from A
-			const resultB = qmB.handlePeerStfu();
+			const resultB = qmB.handlePeerStfu(true, false);
 			expect(resultB.shouldRespond).to.be.true;
 			expect(qmB.getState()).to.equal(QuiescenceState.RECEIVED_STFU);
 
@@ -443,7 +471,7 @@ describe('Quiescence (STFU)', function () {
 			expect(qmB.getState()).to.equal(QuiescenceState.QUIESCENT);
 
 			// A receives STFU from B
-			const resultA = qmA.handlePeerStfu();
+			const resultA = qmA.handlePeerStfu(false, true);
 			expect(resultA.shouldRespond).to.be.false;
 			expect(qmA.getState()).to.equal(QuiescenceState.QUIESCENT);
 
@@ -708,6 +736,38 @@ describe('Quiescence (STFU)', function () {
 				crypto.randomBytes(1366)
 			);
 			expect(findAction(openerHtlcActions, ChannelActionType.ERROR)).to.exist;
+		});
+
+		it('should tie-break concurrent stfu in favor of the channel funder', function () {
+			const { opener, acceptor } = getToNormal();
+
+			// Both sides initiate before either message is delivered.
+			const openerStfu = findSendAction(
+				opener.initiateQuiescence(),
+				MessageType.STFU
+			);
+			const acceptorStfu = findSendAction(
+				acceptor.initiateQuiescence(),
+				MessageType.STFU
+			);
+			expect(decodeStfuMessage(openerStfu.payload).initiator).to.be.true;
+			expect(decodeStfuMessage(acceptorStfu.payload).initiator).to.be.true;
+
+			// Cross-deliver: both go quiescent, neither answers with another stfu.
+			const openerActions = opener.handleStfuMessage(
+				decodeStfuMessage(acceptorStfu.payload)
+			);
+			const acceptorActions = acceptor.handleStfuMessage(
+				decodeStfuMessage(openerStfu.payload)
+			);
+			expect(findSendAction(openerActions, MessageType.STFU)).to.not.exist;
+			expect(findSendAction(acceptorActions, MessageType.STFU)).to.not.exist;
+			expect(opener.isQuiescent()).to.be.true;
+			expect(acceptor.isQuiescent()).to.be.true;
+
+			// BOLT 2: the channel funder is arbitrarily the session initiator.
+			expect(opener.getFullState().quiescenceInitiator).to.be.true;
+			expect(acceptor.getFullState().quiescenceInitiator).to.be.false;
 		});
 	});
 
