@@ -7465,6 +7465,30 @@ export class Channel {
 	}
 
 	/**
+	 * Refuse an incoming splice_init with a real protocol answer (issue #371).
+	 * A bare ERROR action never reaches the wire, which left the initiator
+	 * SPLICING awaiting a splice_ack that never comes and this side silently
+	 * QUIESCENT: both HTLC-frozen until a disconnect. Instead, exit the
+	 * quiescence the stfu handshake established and answer tx_abort so the
+	 * initiator's splice unwind resumes normal operation on both sides. The
+	 * local ERROR surface is kept for the operator.
+	 */
+	private _refuseSpliceInit(
+		wireReason: string,
+		errorMessage: string
+	): ChannelAction[] {
+		this._quiescence.exitQuiescence();
+		this._state.quiescenceState = QuiescenceState.NORMAL;
+		this._state.quiescenceInitiator = false;
+		const actions: ChannelAction[] = [];
+		if (this._state.channelId) {
+			actions.push(this._txAbort(this._state.channelId, wireReason));
+		}
+		actions.push({ type: ChannelActionType.ERROR, message: errorMessage });
+		return actions;
+	}
+
+	/**
 	 * Handle an incoming splice message from remote (acceptor side).
 	 * @param msg - The decoded splice message
 	 * @param localRelativeSatoshis - Our contribution (positive = splice-in, negative = splice-out)
@@ -7497,30 +7521,19 @@ export class Channel {
 		// handshake already established so this side resumes normal operation
 		// instead of sitting silently quiescent on a splice it rejected.
 		if (isTaprootChannel(this._state.channelType)) {
-			this._quiescence.exitQuiescence();
-			this._state.quiescenceState = QuiescenceState.NORMAL;
-			this._state.quiescenceInitiator = false;
-			const abort: ChannelAction[] = [];
-			if (this._state.channelId) {
-				abort.push(
-					this._txAbort(this._state.channelId, 'taproot splicing unsupported')
-				);
-			}
-			abort.push({
-				type: ChannelActionType.ERROR,
-				message:
-					'Cannot accept splice: taproot (MuSig2) channels do not support splicing yet'
-			});
-			return abort;
+			return this._refuseSpliceInit(
+				'taproot splicing unsupported',
+				'Cannot accept splice: taproot (MuSig2) channels do not support splicing yet'
+			);
 		}
 
 		if (!this._state.channelId) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Cannot accept splice: no channel ID'
-				}
-			];
+			// No tx_abort can be composed without a channel ID, but the local
+			// quiescence unwind must still run.
+			return this._refuseSpliceInit(
+				'no channel ID',
+				'Cannot accept splice: no channel ID'
+			);
 		}
 
 		const params: ISpliceSessionParams = {
@@ -7549,7 +7562,7 @@ export class Channel {
 
 		if (!result.ok) {
 			this._spliceSession = null;
-			return [{ type: ChannelActionType.ERROR, message: result.error! }];
+			return this._refuseSpliceInit(result.error!, result.error!);
 		}
 
 		// The combined contributions must not grow the channel past the funding
@@ -7558,12 +7571,10 @@ export class Channel {
 			this._state.fundingSatoshis + this._spliceSession.getNetCapacityChange();
 		if (postSpliceCapacity > this._maxFundingSatoshis) {
 			this._spliceSession = null;
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `Cannot accept splice: post-splice capacity ${postSpliceCapacity} exceeds maximum ${this._maxFundingSatoshis}`
-				}
-			];
+			return this._refuseSpliceInit(
+				'post-splice capacity exceeds maximum',
+				`Cannot accept splice: post-splice capacity ${postSpliceCapacity} exceeds maximum ${this._maxFundingSatoshis}`
+			);
 		}
 
 		this._state.preSpliceState = this._state.state;
