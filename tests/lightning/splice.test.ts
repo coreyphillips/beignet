@@ -4966,6 +4966,50 @@ describe('Splice', function () {
 					expect(pair.opener.getSpliceSession()).to.be.null;
 					expect(pair.errors).to.be.empty;
 				});
+
+				it('a cancelled splice does not tear down caller-owned quiescence', function () {
+					const { opener } = makeNormalChannel();
+					// The operator quiesces independently; the splice merely joins
+					// the handshake already in flight.
+					const stfuActions = opener.initiateQuiescence();
+					expect(findSendAction(stfuActions, MessageType.STFU)).to.exist;
+					expect(opener.initiateSplice(100_000n, 253)).to.be.empty;
+					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+
+					const actions = opener.handleStfuMessage({
+						channelId: opener.getChannelId()!,
+						initiator: false
+					});
+					// The splice is discarded as if never requested: no unwind
+					// dance, and the operator's quiescence completes and stands.
+					expect(findSendAction(actions, MessageType.SPLICE)).to.not.exist;
+					expect(findSendAction(actions, MessageType.TX_ABORT)).to.not.exist;
+					expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+					expect(opener.isQuiescent(), 'caller quiescence stands').to.be.true;
+					expect(opener.getSpliceSession()).to.be.null;
+					expect(opener.getState()).to.equal(ChannelState.NORMAL);
+				});
+
+				it('a replacement splice keeps splice-owned quiescence unwindable', function () {
+					const { opener } = makeNormalChannel();
+					// The first splice request opened the handshake; a replacement
+					// inherits that ownership, so cancelling the replacement must
+					// still unwind or the channel would wedge (issue #370).
+					opener.initiateSplice(100_000n, 253); // stfu out, splice-owned
+					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+					expect(opener.initiateSplice(200_000n, 253)).to.be.empty;
+					expect(opener.initiateSpliceAbort('changed my mind')).to.be.empty;
+
+					const actions = opener.handleStfuMessage({
+						channelId: opener.getChannelId()!,
+						initiator: false
+					});
+					expect(findSendAction(actions, MessageType.SPLICE)).to.exist;
+					expect(findSendAction(actions, MessageType.TX_ABORT)).to.exist;
+					expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+					expect(opener.isQuiescent(), 'quiescence unwound').to.be.false;
+					expect(opener.getState()).to.equal(ChannelState.NORMAL);
+				});
 			});
 
 			it('carries the shared-input signature in the tx_signatures TLV, not the witnesses (CLN interop)', function () {

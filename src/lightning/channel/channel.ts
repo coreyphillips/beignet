@@ -462,12 +462,16 @@ export class Channel {
 	// cancelled=true: quiescence has no un-stfu, so once the handshake completes
 	// the deferred hook must still open the splice conversation and immediately
 	// tx_abort it, or both sides would sit HTLC-frozen until a disconnect
-	// (issue #370). Memory-only: quiescence never survives a disconnect.
+	// (issue #370). That unwind is owed only for a handshake the splice
+	// machinery opened (ownsQuiescence): a quiescence the operator started
+	// with initiateQuiescence() outlives a cancelled splice that merely
+	// joined it. Memory-only: quiescence never survives a disconnect.
 	private _pendingSplice: {
 		relativeSatoshis: bigint;
 		fundingFeeratePerkw: number;
 		locktime: number;
 		cancelled: boolean;
+		ownsQuiescence: boolean;
 	} | null = null;
 	// Splice interactive-tx driving (initiator side). The ordered contributions
 	// we still need to send (shared input, new funding output, splice-out
@@ -7210,31 +7214,41 @@ export class Channel {
 		) {
 			const pending = this._pendingSplice;
 			this._pendingSplice = null;
-			actions.push(
-				...this._startSplice(
-					pending.relativeSatoshis,
-					pending.fundingFeeratePerkw,
-					pending.locktime
-				)
-			);
-			// The operator cancelled the request while our stfu was unanswered
-			// (issue #370). Quiescence has no un-stfu and a tx_abort without a
-			// splice conversation would only draw a bare echo, so the one
-			// spec-clean unwind is to open the conversation we just announced
-			// and abort it at once: the peer's session abort exits its
-			// quiescence, the echo settles ours. Skipped if the splice_init
-			// could not be built (unreachable today); the disconnect fallback
-			// still applies there.
-			if (
-				pending.cancelled &&
-				!actions.some((a) => a.type === ChannelActionType.ERROR)
-			) {
+			if (!pending.cancelled) {
 				actions.push(
-					...this.initiateSpliceAbort(
-						'splice cancelled while awaiting quiescence'
+					...this._startSplice(
+						pending.relativeSatoshis,
+						pending.fundingFeeratePerkw,
+						pending.locktime
 					)
 				);
+			} else if (pending.ownsQuiescence) {
+				// The operator cancelled the request while our stfu was
+				// unanswered (issue #370). Quiescence has no un-stfu and a
+				// tx_abort without a splice conversation would only draw a bare
+				// echo, so the one spec-clean unwind is to open the conversation
+				// we just announced and abort it at once: the peer's session
+				// abort exits its quiescence, the echo settles ours. Skipped if
+				// the splice_init could not be built (unreachable today); the
+				// disconnect fallback still applies there.
+				actions.push(
+					...this._startSplice(
+						pending.relativeSatoshis,
+						pending.fundingFeeratePerkw,
+						pending.locktime
+					)
+				);
+				if (!actions.some((a) => a.type === ChannelActionType.ERROR)) {
+					actions.push(
+						...this.initiateSpliceAbort(
+							'splice cancelled while awaiting quiescence'
+						)
+					);
+				}
 			}
+			// A cancelled splice that merely joined a caller-owned handshake is
+			// discarded outright: the operator's quiescence completes and
+			// stands, exactly as if the splice had never been requested.
 		}
 
 		return actions;
@@ -7365,12 +7379,19 @@ export class Channel {
 		// Not quiescent yet: remember the request and drive quiescence ourselves
 		// so we become the quiescence initiator (the side allowed to send
 		// splice_init). The deferred splice fires from handleStfuMessage once we
-		// reach QUIESCENT.
+		// reach QUIESCENT. Ownership decides whether a later cancel owes the
+		// handshake an unwind: a handshake already in flight stays splice-owned
+		// only if an earlier (possibly since-cancelled) splice request opened
+		// it; one the operator opened with initiateQuiescence() is theirs.
+		const ownsQuiescence = this._quiescence.isQuiescing()
+			? this._pendingSplice?.ownsQuiescence ?? false
+			: true;
 		this._pendingSplice = {
 			relativeSatoshis,
 			fundingFeeratePerkw,
 			locktime,
-			cancelled: false
+			cancelled: false,
+			ownsQuiescence
 		};
 
 		if (this._quiescence.isQuiescing()) {
