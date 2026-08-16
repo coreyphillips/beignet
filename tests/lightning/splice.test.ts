@@ -5041,6 +5041,122 @@ describe('Splice', function () {
 				});
 			});
 
+			describe('concurrent stfu funder tie-break (issue #372)', function () {
+				it('the funder keeps the initiator role and fires its deferred splice', function () {
+					const { opener } = makeNormalChannel();
+					opener.initiateSplice(100_000n, 253); // stfu out, pending parked
+					// The peer initiated concurrently: its stfu carries the
+					// initiator flag instead of answering ours. BOLT 2 breaks the
+					// tie in favor of the channel funder.
+					const actions = opener.handleStfuMessage({
+						channelId: opener.getChannelId()!,
+						initiator: true
+					});
+					expect(findSendAction(actions, MessageType.SPLICE), 'splice fired').to
+						.exist;
+					expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+					expect(opener.getState()).to.equal(ChannelState.SPLICING);
+					expect(opener.getFullState().quiescenceInitiator).to.be.true;
+				});
+
+				it('the non-funder yields the session and drops its parked splice with a surfaced error', function () {
+					const { acceptor } = makeNormalChannel();
+					acceptor.initiateSplice(100_000n, 253); // stfu out, pending parked
+					const actions = acceptor.handleStfuMessage({
+						channelId: acceptor.getChannelId()!,
+						initiator: true
+					});
+					// No crossing splice_init and no extra stfu: the session is the
+					// funder's now.
+					expect(findSendAction(actions, MessageType.SPLICE)).to.not.exist;
+					expect(findSendAction(actions, MessageType.STFU)).to.not.exist;
+					const error = findAction(actions, ChannelActionType.ERROR);
+					expect(error, 'drop surfaced to the operator').to.exist;
+					expect(error.message).to.contain('tie-break');
+					expect(acceptor.isQuiescent()).to.be.true;
+					expect(acceptor.getFullState().quiescenceInitiator).to.be.false;
+					expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
+					expect(acceptor.getSpliceSession()).to.be.null;
+				});
+
+				it('a cancelled parked splice on the losing side drops silently', function () {
+					const { acceptor } = makeNormalChannel();
+					acceptor.initiateSplice(100_000n, 253);
+					expect(acceptor.initiateSpliceAbort('operator requested')).to.be
+						.empty;
+					const actions = acceptor.handleStfuMessage({
+						channelId: acceptor.getChannelId()!,
+						initiator: true
+					});
+					// No unwind dance: a non-initiator must not open a splice
+					// conversation, and the session now belongs to the funder peer,
+					// whose dependent protocol ends it.
+					expect(findSendAction(actions, MessageType.SPLICE)).to.not.exist;
+					expect(findSendAction(actions, MessageType.TX_ABORT)).to.not.exist;
+					expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+					expect(acceptor.isQuiescent(), "the peer's session stands").to.be
+						.true;
+					expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
+				});
+
+				it('a quiescent non-initiator cannot fire splice_init directly', function () {
+					const { acceptor } = makeNormalChannel();
+					// The funder initiated quiescence; we merely answered.
+					const stfuActions = acceptor.handleStfuMessage({
+						channelId: acceptor.getChannelId()!,
+						initiator: true
+					});
+					expect(findSendAction(stfuActions, MessageType.STFU)).to.exist;
+					expect(acceptor.isQuiescent()).to.be.true;
+
+					const actions = acceptor.initiateSplice(100_000n, 253);
+					const error = findAction(actions, ChannelActionType.ERROR);
+					expect(error).to.exist;
+					expect(error.message).to.contain(
+						'peer initiated the quiescence session'
+					);
+					expect(findSendAction(actions, MessageType.SPLICE)).to.not.exist;
+					expect(acceptor.isQuiescent(), 'session untouched').to.be.true;
+				});
+
+				it('crossing splice requests converge on the funder over the wire', function () {
+					const pair = makeWirePair();
+					let spliceInits = 0;
+					pair.intercept(MessageType.SPLICE, (p) => {
+						spliceInits++;
+						return p;
+					});
+					const destScript = Buffer.concat([
+						Buffer.from([0x00, 0x14]),
+						crypto.randomBytes(20)
+					]);
+					pair.opener.setSpliceOutDestination(destScript, 50_000n);
+
+					// Both sides request a splice before either stfu is delivered.
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.initiateSplice(-(50_000n + SPLICE_OUT_TEST_FEE), 253)
+					);
+					pair.enqueue(
+						pair.opener,
+						pair.acceptor,
+						pair.acceptor.initiateSplice(80_000n, 253)
+					);
+					pair.pump();
+
+					// Exactly one splice_init went on the wire (the funder's); the
+					// acceptor's request was dropped with a surfaced error instead
+					// of a crossing splice_init that would wedge both sides.
+					expect(spliceInits).to.equal(1);
+					expect(pair.errors.length).to.equal(1);
+					expect(pair.errors[0]).to.contain('tie-break');
+					// The funder's splice negotiated to completion on both sides.
+					expect(pair.opener.getFullState().spliceInFlight).to.not.be.null;
+					expect(pair.acceptor.getFullState().spliceInFlight).to.not.be.null;
+				});
+			});
+
 			it('carries the shared-input signature in the tx_signatures TLV, not the witnesses (CLN interop)', function () {
 				const pair = makeWirePair();
 				startSpliceOut(pair);
@@ -6297,6 +6413,78 @@ describe('Splice', function () {
 					crypto.randomBytes(1366)
 				).ok
 			).to.be.true;
+		});
+
+		it('concurrent operator splices converge on the funder (issue #372)', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				openerPubkey,
+				acceptorPubkey,
+				channelId,
+				openerChannel,
+				acceptorChannel
+			} = createNormalChannelPair();
+
+			// Re-route through a queue so both stfus are in flight before either
+			// side answers (the default routing delivers synchronously).
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			const wire: Array<() => void> = [];
+			let spliceInits = 0;
+			const route = (
+				from: ChannelManager,
+				fromPk: string,
+				to: ChannelManager,
+				toPk: string
+			): void => {
+				from.on(
+					'message:outbound',
+					(peerPubkey: string, type: number, payload: Buffer) => {
+						if (peerPubkey === toPk) {
+							if (type === MessageType.SPLICE) spliceInits++;
+							wire.push(() => to.handleMessage(fromPk, type, payload));
+						}
+					}
+				);
+			};
+			route(openerManager, openerPubkey, acceptorManager, acceptorPubkey);
+			route(acceptorManager, acceptorPubkey, openerManager, openerPubkey);
+
+			const openerErrors: string[] = [];
+			const acceptorErrors: string[] = [];
+			openerManager.on('error', (_id: Buffer, message: string) => {
+				openerErrors.push(message);
+			});
+			acceptorManager.on('error', (_id: Buffer, message: string) => {
+				acceptorErrors.push(message);
+			});
+
+			// Both operators request a splice concurrently.
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
+			expect(openerManager.initiateSplice(channelId, 100_000n, 253).ok).to.be
+				.true;
+			expect(acceptorManager.initiateSplice(channelId, 80_000n, 253).ok).to.be
+				.true;
+
+			while (wire.length > 0) {
+				wire.shift()!();
+			}
+
+			// One splice_init on the wire, driven by the funder; the acceptor's
+			// request was dropped and surfaced instead of crossing it.
+			expect(spliceInits).to.equal(1);
+			expect(openerErrors).to.be.empty;
+			expect(acceptorErrors.length).to.equal(1);
+			expect(acceptorErrors[0]).to.contain('tie-break');
+			expect(openerChannel.getState()).to.equal(ChannelState.SPLICING);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.SPLICING);
+			expect(openerChannel.getFullState().spliceInFlight).to.not.be.null;
+			expect(acceptorChannel.getFullState().spliceInFlight).to.not.be.null;
 		});
 
 		it('should refuse initiateSplice when the peer lacks option_splice/option_quiesce', function () {

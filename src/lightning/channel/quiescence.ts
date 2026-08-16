@@ -10,6 +10,9 @@
  *   - Cannot initiate quiescence with pending HTLCs
  *   - Reject new update_add_htlc during quiescence
  *   - Both sides must send STFU to enter QUIESCENT state
+ *   - Concurrent stfu (both sides set the initiator flag): BOLT 2 breaks the
+ *     tie arbitrarily in favor of the channel funder (the sender of
+ *     open_channel / open_channel2), who becomes the session initiator
  */
 
 export enum QuiescenceState {
@@ -55,8 +58,13 @@ export class QuiescenceManager {
 	/**
 	 * Handle receiving STFU from peer.
 	 * Returns true if we should respond with our own STFU.
+	 * @param peerInitiator - the initiator flag carried by the peer's stfu
+	 * @param localIsOpener - whether we are the channel funder (opener)
 	 */
-	handlePeerStfu(): { shouldRespond: boolean; error?: string } {
+	handlePeerStfu(
+		peerInitiator: boolean,
+		localIsOpener: boolean
+	): { shouldRespond: boolean; error?: string } {
 		switch (this.state) {
 			case QuiescenceState.NORMAL:
 				// Peer initiated -- we need to respond
@@ -64,8 +72,14 @@ export class QuiescenceManager {
 				this._initiator = false;
 				return { shouldRespond: true };
 			case QuiescenceState.SENT_STFU:
-				// Both sides sent STFU -- enter quiescent
+				// Both sides sent STFU -- enter quiescent. If the peer also
+				// claims the initiator role (concurrent stfu, not a reply to
+				// ours), BOLT 2 breaks the tie: the channel funder is the
+				// session initiator.
 				this.state = QuiescenceState.QUIESCENT;
+				if (peerInitiator) {
+					this._initiator = localIsOpener;
+				}
 				return { shouldRespond: false };
 			case QuiescenceState.RECEIVED_STFU:
 			case QuiescenceState.QUIESCENT:
