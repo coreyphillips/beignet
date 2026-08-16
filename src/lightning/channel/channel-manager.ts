@@ -5134,6 +5134,7 @@ export class ChannelManager extends EventEmitter {
 		const renegotiating =
 			!!st.v2InFlight &&
 			!!st.dualFundingSession &&
+			typeof st.v2InFlight.rbfAttempt === 'number' &&
 			st.v2InFlight.rbfAttempt !== st.dualFundingSession.getRbfCount();
 		if (
 			!renegotiating &&

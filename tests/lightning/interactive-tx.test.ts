@@ -441,6 +441,49 @@ describe('Interactive TX Construction', function () {
 				'too short'
 			);
 		});
+
+		it('round-trips the funding_output_contribution TLV (s64)', function () {
+			for (const sats of [1n, 500_000n, -25_000n, 2n ** 62n]) {
+				const encoded = encodeTxInitRbfMessage({
+					...sampleMsg,
+					fundingOutputContribution: sats
+				});
+				expect(encoded.length).to.equal(50); // 40 + type(1) + len(1) + s64(8)
+				const decoded = decodeTxInitRbfMessage(encoded);
+				expect(decoded.fundingOutputContribution).to.equal(sats);
+				expect(decoded.requireConfirmedInputs).to.equal(undefined);
+				expect(encodeTxInitRbfMessage(decoded).equals(encoded)).to.be.true;
+			}
+		});
+
+		it('round-trips require_confirmed_inputs beside the contribution', function () {
+			const encoded = encodeTxInitRbfMessage({
+				...sampleMsg,
+				fundingOutputContribution: 42_000n,
+				requireConfirmedInputs: true
+			});
+			const decoded = decodeTxInitRbfMessage(encoded);
+			expect(decoded.fundingOutputContribution).to.equal(42_000n);
+			expect(decoded.requireConfirmedInputs).to.equal(true);
+			expect(encodeTxInitRbfMessage(decoded).equals(encoded)).to.be.true;
+		});
+
+		it('an absent TLV stream decodes to absent fields', function () {
+			const decoded = decodeTxInitRbfMessage(
+				encodeTxInitRbfMessage(sampleMsg)
+			);
+			expect(decoded.fundingOutputContribution).to.equal(undefined);
+			expect(decoded.requireConfirmedInputs).to.equal(undefined);
+		});
+
+		it('rejects a malformed funding_output_contribution length', function () {
+			// type 0, length 4 (not the s64's 8), 4 value bytes.
+			const bad = Buffer.concat([
+				encodeTxInitRbfMessage(sampleMsg),
+				Buffer.from([0x00, 0x04, 0x01, 0x02, 0x03, 0x04])
+			]);
+			expect(() => decodeTxInitRbfMessage(bad)).to.throw('must be 8 bytes');
+		});
 	});
 
 	describe('Message: tx_ack_rbf (73)', function () {
@@ -470,6 +513,23 @@ describe('Interactive TX Construction', function () {
 			expect(() => decodeTxAckRbfMessage(Buffer.alloc(5))).to.throw(
 				'too short'
 			);
+		});
+
+		it('round-trips the RBF TLVs', function () {
+			const encoded = encodeTxAckRbfMessage({
+				channelId,
+				fundingOutputContribution: -1_000n,
+				requireConfirmedInputs: true
+			});
+			const decoded = decodeTxAckRbfMessage(encoded);
+			expect(decoded.channelId.equals(channelId)).to.be.true;
+			expect(decoded.fundingOutputContribution).to.equal(-1_000n);
+			expect(decoded.requireConfirmedInputs).to.equal(true);
+			expect(encodeTxAckRbfMessage(decoded).equals(encoded)).to.be.true;
+			// Absent TLVs stay absent.
+			const bare = decodeTxAckRbfMessage(encodeTxAckRbfMessage({ channelId }));
+			expect(bare.fundingOutputContribution).to.equal(undefined);
+			expect(bare.requireConfirmedInputs).to.equal(undefined);
 		});
 	});
 
