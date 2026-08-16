@@ -1703,15 +1703,21 @@ export class ChannelManager extends EventEmitter {
 
 	/**
 	 * Notify that a funding transaction has been confirmed.
+	 * `confirmedTxidHex` (display byte order) names WHICH candidate reached
+	 * depth when the watcher tracks several (post-signatures RBF); omitted
+	 * means the channel's current funding tx.
 	 */
-	handleFundingConfirmed(channelId: Buffer): void {
+	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: string): void {
 		const channel = this.channels.get(channelId.toString('hex'));
 		if (!channel) return;
 
 		const peerPubkey = this.channelPeers.get(channelId.toString('hex'));
 		if (!peerPubkey) return;
 
-		const actions = channel.fundingConfirmed();
+		const confirmedTxid = confirmedTxidHex
+			? Buffer.from(confirmedTxidHex, 'hex').reverse()
+			: undefined;
+		const actions = channel.fundingConfirmed(confirmedTxid);
 		this.processActions(peerPubkey, channel, actions);
 	}
 
@@ -4240,6 +4246,53 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Initiate an RBF of a v2 (dual-funded) open's funding transaction
+	 * (BOLT 2 tx_init_rbf; issue #360). Opener-only; permitted from the
+	 * initial commitment exchange until channel_ready crosses or an attempt
+	 * confirms. The channel's own guards produce the refusal reasons.
+	 */
+	initiateFundingRbf(
+		channelId: Buffer,
+		feeratePerKw: number,
+		locktime?: number
+	): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel =
+			this.channels.get(idHex) || this.findChannelByChannelIdInTemp(channelId);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+
+		const actions = channel.initiateTxRbf(feeratePerKw, locktime);
+		// A refusal is a bare local ERROR with no wire message: report it to
+		// the caller directly instead of dispatching it (processActions
+		// treats ERROR as a channel failure, which a refused request is not).
+		if (!actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)) {
+			const firstError = actions.find(
+				(a) => a.type === ChannelActionType.ERROR
+			);
+			return {
+				ok: false,
+				actions,
+				error:
+					firstError && 'message' in firstError
+						? firstError.message
+						: 'RBF request refused'
+			};
+		}
+		this.processActions(peerPubkey, channel, actions);
+		return { ok: true, actions };
+	}
+
+	/**
 	 * Abort a splice operation.
 	 */
 	abortSplice(channelId: Buffer, reason?: string): ChannelResult {
@@ -5073,9 +5126,20 @@ export class ChannelManager extends EventEmitter {
 		// Too late to abort (BOLT 2: no tx_abort after tx_signatures; a staged
 		// fully signed tx owes the network a broadcast). Report and leave the
 		// outcome to the watchdog; dispatching the refusal ERROR instead would
-		// wrongly tear down the temp channel.
+		// wrongly tear down the temp channel. A post-signatures RBF
+		// renegotiation is the exception: the verdict concerns the
+		// REPLACEMENT negotiation (nothing signed yet), which abortDualFunding
+		// unwinds attempt-scoped back to the retained attempt.
 		const st = channel.getFullState();
-		if (st.v2InFlight?.sentTxSignatures || st.pendingFundingTxHex) {
+		const renegotiating =
+			!!st.v2InFlight &&
+			!!st.dualFundingSession &&
+			typeof st.v2InFlight.rbfAttempt === 'number' &&
+			st.v2InFlight.rbfAttempt !== st.dualFundingSession.getRbfCount();
+		if (
+			!renegotiating &&
+			(st.v2InFlight?.sentTxSignatures || st.pendingFundingTxHex)
+		) {
 			this.emitContained(
 				'error',
 				channel.getChannelId() ?? channel.getTemporaryChannelId(),
@@ -5216,7 +5280,7 @@ export class ChannelManager extends EventEmitter {
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
-		const actions = channel.handleTxAckRbf();
+		const actions = channel.handleTxAckRbf(msg);
 		this.processActions(peerPubkey, channel, actions);
 	}
 

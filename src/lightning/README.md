@@ -256,8 +256,12 @@ const channel = node.openChannel(peerPubkey, 1_000_000n); // 1M sats
 //    it builds, signs and broadcasts the funding tx for you)
 const channelId = node.createFunding(channel, fundingTxid, outputIndex, signature);
 
-// 3. Confirm funding (after tx is mined)
+// 3. Confirm funding (after tx is mined). When the open was RBF'd
+//    (multiple funding attempts exist), the confirmed txid is REQUIRED:
+//    pass it in display byte order so the right attempt is adopted; an
+//    ambiguous call is refused.
 node.handleFundingConfirmed(channelId);
+node.handleFundingConfirmed(channelId, confirmedTxidHex); // after an RBF
 // Emits 'channel:ready' when both sides confirm
 
 // 4. Normal operation: send/receive HTLCs
@@ -327,20 +331,30 @@ const channel = node.openChannelV2(peerPubkey, {
 // -> tx_signatures -> channel_ready
 ```
 
-**RBF of a v2 open.** There is no public API for initiating a funding
-replacement yet. The internal replacement path is beignet-to-beignet only: it
-runs in a window current BOLT 2 does not use (between the commitment exchange
-and the `tx_signatures` exchange, opener-initiated), and its wire messages do
-not carry the `funding_output_contribution` TLV the spec requires from a
-contributing participant, while Eclair and CLN replace a fully signed,
-broadcast, unconfirmed funding tx. Supporting the spec window is tracked in
-issue #360. What beignet does handle today, per BOLT 2: an inbound
-`tx_init_rbf` is always answered with `tx_ack_rbf` or `tx_abort`, and a
-refusal is attempt-scoped: only the replacement attempt dies, both sides keep
-the current attempt and the channel lives on. Inbound requests on a fully
-signed (broadcastable) attempt are refused this way, and Eclair and CLN both
-keep the open and wait out confirmation of the original funding tx (see the
-`dual-funding.ts` module header for the verified semantics).
+**RBF of a v2 open.** A stuck unconfirmed v2 funding tx can be fee-bumped in
+the BOLT 2 window, in both directions and against Eclair/CLN peers (issue
+#360): from the initial commitment exchange until `channel_ready` crosses in
+either direction or an attempt confirms. As the opener:
+
+```typescript
+// Feerate must clear the BOLT 2 floor:
+// max(floor(previous * 25 / 24), previous + 25) sat/kw.
+const result = node.rbfOpenChannelV2(channelId, newFeeratePerkw);
+if (!result.ok) console.log(result.error); // refusal reason, nothing sent
+```
+
+The renegotiation reuses the wallet inputs registered for the open, repriced
+at the new feerate; superseded broadcastable attempts are retained durably and
+chain-watched beside the current one (each replacement double-spends all of
+its predecessors, so at most one can confirm), and whichever attempt confirms
+is adopted. Per BOLT 2, an inbound `tx_init_rbf` is always answered with
+`tx_ack_rbf` or `tx_abort`, and a refusal is attempt-scoped: only the
+replacement attempt dies, both sides keep the current attempt and the channel
+lives on. Deliberate refusals (all spec-legal): replacements of an open
+restored from a restart (the wallet signing closures die with the process;
+confirmation adoption still works), a `funding_output_contribution` different
+from the recorded attempt's, and non-opener initiation (see the
+`dual-funding.ts` module header for the full semantics).
 
 ### Liquidity Ads (bLIP-51)
 

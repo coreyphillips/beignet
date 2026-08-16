@@ -1105,6 +1105,40 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 				expect(result.ok).to.be.true;
 				expect(result.locktime).to.equal(800000);
 			});
+
+			it('allows RBF from AWAITING_CHANNEL_READY (issue 360 spec window)', () => {
+				const { opener } = makeRbfReadySession();
+				(opener as unknown as { _state: DualFundingState })._state =
+					DualFundingState.AWAITING_CHANNEL_READY;
+				const result = opener.initiateRbf(2000);
+				expect(result.ok).to.be.true;
+				expect(opener.getState()).to.equal(DualFundingState.TX_NEGOTIATION);
+				expect(opener.getRbfCount()).to.equal(1);
+			});
+
+			it('acceptor handles RBF from AWAITING_CHANNEL_READY', () => {
+				const channelId = crypto.randomBytes(32);
+				const acceptor = new DualFundingSession(false, channelId);
+				acceptor.handleOpenChannel2(
+					makeOpenChannel2Msg({ channelId, fundingFeeratePerkw: 1000 }),
+					makeDualFundingParams()
+				);
+				(acceptor as unknown as { _state: DualFundingState })._state =
+					DualFundingState.AWAITING_CHANNEL_READY;
+				const result = acceptor.handleRbf(2000, 0);
+				expect(result.ok).to.be.true;
+				expect(acceptor.getState()).to.equal(DualFundingState.TX_NEGOTIATION);
+				expect(acceptor.getRbfCount()).to.equal(1);
+			});
+
+			it('still refuses RBF once the session is COMPLETE', () => {
+				const { opener } = makeRbfReadySession();
+				(opener as unknown as { _state: DualFundingState })._state =
+					DualFundingState.COMPLETE;
+				const result = opener.initiateRbf(2000);
+				expect(result.ok).to.be.false;
+				expect(result.error).to.contain('wrong state');
+			});
 		});
 
 		describe('Abort', () => {

@@ -79,6 +79,7 @@ import {
 	decodeTxAddOutputMessage,
 	decodeTxSignaturesMessage,
 	decodeTxAbortMessage,
+	decodeTxAckRbfMessage,
 	encodeTxInitRbfMessage
 } from '../../src/lightning/message/interactive-tx';
 import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
@@ -1389,7 +1390,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		).to.equal(ChannelState.ERRORED);
 	});
 
-	it('refuses RBF after tx_signatures were released and on restored sessions; accepted RBF retains the rollback record until post-ack traffic', () => {
+	it('accepts RBF after tx_signatures were released (issue 360 spec window), refuses it on restored sessions; accepted RBF retains the rollback record until post-ack traffic', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
 
@@ -1436,7 +1437,10 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			'the rollback record survives replacement-round traffic'
 		).to.equal(preRecord);
 
-		// After a release, RBF is refused in both directions.
+		// After a release, the spec window is OPEN (issue #360): an inbound
+		// tx_init_rbf on the broadcastable attempt is acked, and the
+		// broadcastable record is retained as the rollback attempt. Only the
+		// non-initiator restriction still refuses the acceptor's own request.
 		const g = driveToCommitmentExchange();
 		deliverCommitments(g);
 		const accSig = g.acceptor.sendTxSignatures(
@@ -1446,14 +1450,25 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		);
 		expect(findPayload(accSig, MessageType.TX_SIGNATURES)).to.not.equal(null);
 		expect(findError(g.acceptor.initiateTxRbf(2000))).to.contain(
-			'already broadcast'
+			'Only initiator'
 		);
-		const refused = g.acceptor.handleTxInitRbf({
+		const postReleaseRecord = g.acceptor.getFullState().v2InFlight;
+		expect(postReleaseRecord!.sentTxSignatures).to.equal(true);
+		const acked = g.acceptor.handleTxInitRbf({
 			channelId: g.acceptor.getChannelId()!,
 			locktime: 0,
 			feerate: 2000
 		});
-		expect(findPayload(refused, MessageType.TX_ABORT)).to.not.equal(null);
+		expect(findError(acked)).to.equal(null);
+		expect(
+			findPayload(acked, MessageType.TX_ACK_RBF),
+			'post-release RBF is acked in the spec window'
+		).to.not.equal(null);
+		expect(
+			g.acceptor.getFullState().v2InFlight,
+			'the broadcastable record is retained as rollback state'
+		).to.equal(postReleaseRecord);
+		expect(g.acceptor.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
 
 		// A restored (builder-less) session cannot renegotiate. The revived
 		// OPENER has not released tx_signatures, so the refusal it hits is the
@@ -2002,13 +2017,15 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
 
-		// The ack revalidates the binding: a record whose witnesses left (or
-		// that tracks another tx) refuses the renegotiation on the wire and
-		// keeps the attempt.
+		// The ack revalidates the binding: if the window closed while the
+		// request was in flight (an attempt confirmed here; channel_ready
+		// crossing works the same way), the renegotiation refuses on the
+		// wire and keeps the attempt. A record whose witnesses merely left
+		// no longer invalidates the ack: that IS the spec window (issue 360).
 		const g = driveToCommitmentExchange();
 		deliverCommitments(g);
 		expect(findError(g.opener.initiateTxRbf(2000))).to.equal(null);
-		g.opener.getFullState().v2InFlight!.sentTxSignatures = true;
+		g.opener.getFullState().v2InFlight!.confirmed = true;
 		const stale = g.opener.handleTxAckRbf();
 		expect(
 			findPayload(stale, MessageType.TX_ABORT),
@@ -2019,6 +2036,433 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			null,
 			undefined
 		]);
+	});
+
+	// ─────── Issue 360: RBF in the BOLT 2 spec window (post-signatures) ───────
+
+	it('closes the spec window at channel_ready and at a confirmed attempt (issue 360)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		const ready = h.opener.fundingConfirmed();
+		expect(findPayload(ready, MessageType.CHANNEL_READY)).to.not.equal(null);
+		expect(findError(h.opener.initiateTxRbf(2000))).to.contain('channel_ready');
+		const refusal = h.opener.handleTxInitRbf({
+			channelId: h.opener.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		const abort = findPayload(refusal, MessageType.TX_ABORT);
+		expect(abort).to.not.equal(null);
+		expect(decodeTxAbortMessage(abort!).data.toString('utf8')).to.contain(
+			'channel_ready'
+		);
+
+		// A parked confirmation closes the window the same way.
+		const g = driveToCommitmentExchange();
+		deliverCommitments(g);
+		completeExchange(g);
+		g.opener.getFullState().v2InFlight!.confirmed = true;
+		expect(findError(g.opener.initiateTxRbf(2000))).to.contain('confirmed');
+		const confRefusal = g.opener.handleTxInitRbf({
+			channelId: g.opener.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		const confAbort = findPayload(confRefusal, MessageType.TX_ABORT);
+		expect(confAbort).to.not.equal(null);
+		expect(decodeTxAbortMessage(confAbort!).data.toString('utf8')).to.contain(
+			'confirmed'
+		);
+	});
+
+	it('a post-signatures acceptance rolls back to AWAITING_FUNDING_CONFIRMED on disconnect (issue 360)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		expect(h.acceptor.getFullState().v2InFlight!.sentTxSignatures).to.equal(
+			true
+		);
+		const acked = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(findPayload(acked, MessageType.TX_ACK_RBF)).to.not.equal(null);
+		expect(h.acceptor.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+
+		h.acceptor.markForReestablish();
+		const st = h.acceptor.getFullState();
+		expect(st.state).to.equal(ChannelState.AWAITING_REESTABLISH);
+		expect(
+			st.preReestablishState,
+			'a broadcastable rollback attempt waits on the chain, not the peer'
+		).to.equal(ChannelState.AWAITING_FUNDING_CONFIRMED);
+		expect(st.v2InFlight!.rbfAttempt).to.equal(0);
+		expect(st.dualFundingSession!.getRbfCount()).to.equal(0);
+	});
+
+	it('an operator abort of a post-signatures renegotiation returns both sides to the completed attempt (issue 360)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		const attempt0 = Buffer.from(
+			h.opener.getFullState().v2InFlight!.fundingTxid
+		);
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const acked = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(findPayload(acked, MessageType.TX_ACK_RBF)).to.not.equal(null);
+		expect(
+			findError(
+				h.opener.handleTxAckRbf(
+					decodeTxAckRbfMessage(findPayload(acked, MessageType.TX_ACK_RBF)!)
+				)
+			)
+		).to.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+
+		const abortActions = h.opener.abortDualFunding(
+			'operator cancelled the bump'
+		);
+		expect(
+			findPayload(abortActions, MessageType.TX_ABORT),
+			'the renegotiation abort reaches the wire despite the released signatures'
+		).to.not.equal(null);
+		const answer = h.acceptor.handleTxAbort();
+		expect(findPayload(answer, MessageType.TX_ABORT), 'echoed').to.not.equal(
+			null
+		);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.acceptor.getFullState().v2InFlight!.fundingTxid.equals(attempt0))
+			.to.be.true;
+		expect(h.opener.handleTxAbort()).to.deep.equal([
+			{ type: ChannelActionType.PERSIST_STATE }
+		]);
+		expect(h.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.opener.getFullState().v2InFlight!.fundingTxid.equals(attempt0)).to
+			.be.true;
+	});
+
+	it('a confirmation landing mid-renegotiation abandons the RBF attempt and readies the channel (issue 360)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const acked = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(
+			findError(
+				h.opener.handleTxAckRbf(
+					decodeTxAckRbfMessage(findPayload(acked, MessageType.TX_ACK_RBF)!)
+				)
+			)
+		).to.equal(null);
+
+		// BOLT 2: "If the previous transaction confirms in the middle of an
+		// RBF attempt, the attempt MUST be abandoned."
+		const confirmed = h.opener.fundingConfirmed();
+		expect(
+			findPayload(confirmed, MessageType.TX_ABORT),
+			'the renegotiation is abandoned on the wire'
+		).to.not.equal(null);
+		const openerReady = findPayload(confirmed, MessageType.CHANNEL_READY);
+		expect(openerReady, 'channel_ready flows in the same batch').to.not.equal(
+			null
+		);
+		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_CHANNEL_READY);
+		expect(h.opener.getFullState().v2InFlight!.rbfAttempt).to.equal(0);
+
+		// The acceptor rolls back on the abandon signal (wire order: the
+		// abort precedes the channel_ready), readies at its own depth
+		// callback, and both reach NORMAL.
+		const answer = h.acceptor.handleTxAbort();
+		expect(findPayload(answer, MessageType.TX_ABORT)).to.not.equal(null);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(
+			findError(
+				h.acceptor.handleChannelReady(decodeChannelReadyMessage(openerReady!))
+			)
+		).to.equal(null);
+		expect(h.opener.handleTxAbort(), 'the echo is swallowed').to.deep.equal([]);
+		const accReady = h.acceptor.fundingConfirmed();
+		const accReadyMsg = findPayload(accReady, MessageType.CHANNEL_READY);
+		expect(accReadyMsg).to.not.equal(null);
+		expect(h.acceptor.getState()).to.equal(ChannelState.NORMAL);
+		expect(
+			findError(
+				h.opener.handleChannelReady(decodeChannelReadyMessage(accReadyMsg!))
+			)
+		).to.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
+	});
+
+	it('a channel_ready received mid-renegotiation abandons the RBF attempt and is processed (issue 360 review)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const acked = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(
+			findError(
+				h.opener.handleTxAckRbf(
+					decodeTxAckRbfMessage(findPayload(acked, MessageType.TX_ACK_RBF)!)
+				)
+			)
+		).to.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+
+		// Peer-first confirmation race: the acceptor confirmed and readied;
+		// its channel_ready reaches the still-renegotiating opener. BOLT 2:
+		// a valid channel_ready mid-RBF abandons the attempt.
+		const accActions = h.acceptor.fundingConfirmed();
+		const readyMsg = findPayload(accActions, MessageType.CHANNEL_READY);
+		expect(readyMsg).to.not.equal(null);
+		const processed = h.opener.handleChannelReady(
+			decodeChannelReadyMessage(readyMsg!)
+		);
+		expect(findError(processed), 'not "Unexpected channel_ready"').to.equal(
+			null
+		);
+		expect(
+			findPayload(processed, MessageType.TX_ABORT),
+			'the RBF attempt is abandoned on the wire'
+		).to.not.equal(null);
+		const st = h.opener.getFullState();
+		expect(st.remoteChannelReady).to.equal(true);
+		expect(st.v2InFlight!.rbfAttempt).to.equal(0);
+		expect(st.dualFundingSession!.getRbfCount()).to.equal(0);
+		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_CHANNEL_READY);
+	});
+
+	it('an unencodable RBF request never installs the pending latch (issue 360 review)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		// locktime -1 fails the u32 encode; the request must die BEFORE the
+		// pending latch is installed, or every later request is refused as
+		// "already pending" until disconnect.
+		const bad = h.opener.initiateTxRbf(2000, -1);
+		expect(findError(bad)).to.contain('cannot RBF');
+		expect(findPayload(bad, MessageType.TX_INIT_RBF)).to.equal(null);
+		const good = h.opener.initiateTxRbf(2000);
+		expect(findError(good), 'the latch stayed clean').to.equal(null);
+		expect(findPayload(good, MessageType.TX_INIT_RBF)).to.not.equal(null);
+	});
+
+	it('refuses a changed funding_output_contribution attempt-scoped, in both directions (issue 360)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		const record = h.acceptor.getFullState().v2InFlight!;
+		const refusal = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000,
+			fundingOutputContribution: record.remoteContributionSats + 1n
+		});
+		const abort = findPayload(refusal, MessageType.TX_ABORT);
+		expect(abort).to.not.equal(null);
+		expect(decodeTxAbortMessage(abort!).data.toString('utf8')).to.contain(
+			'contribution'
+		);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+
+		// The exact recorded contribution is accepted, and the ack restates
+		// OUR side's contribution verbatim.
+		const acked = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000,
+			fundingOutputContribution: record.remoteContributionSats
+		});
+		const ackPayload = findPayload(acked, MessageType.TX_ACK_RBF);
+		expect(ackPayload).to.not.equal(null);
+		expect(
+			decodeTxAckRbfMessage(ackPayload!).fundingOutputContribution
+		).to.equal(record.localContributionSats);
+
+		// Outbound: an ack naming a different remote contribution unwinds on
+		// the wire and keeps the recorded attempt.
+		const g = driveToCommitmentExchange();
+		deliverCommitments(g);
+		completeExchange(g);
+		const gRecord = g.opener.getFullState().v2InFlight!;
+		expect(findError(g.opener.initiateTxRbf(2000))).to.equal(null);
+		const unwound = g.opener.handleTxAckRbf({
+			channelId: g.opener.getChannelId()!,
+			fundingOutputContribution: gRecord.remoteContributionSats + 1n
+		});
+		const gAbort = findPayload(unwound, MessageType.TX_ABORT);
+		expect(gAbort).to.not.equal(null);
+		expect(decodeTxAbortMessage(gAbort!).data.toString('utf8')).to.contain(
+			'contribution'
+		);
+		expect(g.opener.getFullState().v2InFlight!.rbfAttempt).to.equal(0);
+	});
+
+	it('refuses a replacement that does not double-spend the completed attempt (issue 360)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		const record = h.acceptor.getFullState().v2InFlight!;
+		const attempt0Tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
+		const fundingOut = attempt0Tx.outs[record.fundingOutputIndex];
+
+		const acked = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(findPayload(acked, MessageType.TX_ACK_RBF)).to.not.equal(null);
+
+		// The opener's replacement arrives spending only FRESH prevouts: no
+		// input of attempt 0 is double-spent, so both txs could confirm.
+		// BOLT 2: the receiver MUST fail the negotiation.
+		const fresh = makeRealPrevOut(250_000);
+		expect(
+			findError(
+				h.acceptor.handleTxAddInput({
+					channelId: h.acceptor.getChannelId()!,
+					serialId: 0n,
+					prevTx: fresh.prevTx,
+					prevTxVout: 0,
+					sequence: 0xfffffffd
+				})
+			)
+		).to.equal(null);
+		expect(
+			findError(
+				h.acceptor.handleTxAddOutput({
+					channelId: h.acceptor.getChannelId()!,
+					serialId: 2n,
+					amountSats: BigInt(fundingOut.value),
+					scriptPubkey: Buffer.from(fundingOut.script)
+				})
+			)
+		).to.equal(null);
+		expect(findError(h.acceptor.sendTxComplete())).to.equal(null);
+		const result = h.acceptor.handleTxComplete();
+		const abort = findPayload(result, MessageType.TX_ABORT);
+		expect(abort, 'the non-conflicting replacement is refused').to.not.equal(
+			null
+		);
+		expect(decodeTxAbortMessage(abort!).data.toString('utf8')).to.contain(
+			'double-spend'
+		);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.acceptor.getFullState().v2InFlight!.rbfAttempt).to.equal(0);
+	});
+
+	it('refuses a replacement paying less than the previous attempt (issue 360)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		const record = h.acceptor.getFullState().v2InFlight!;
+		const attempt0Tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
+		const fundingOut = attempt0Tx.outs[record.fundingOutputIndex];
+		// Inflate the RECORDED prevout values: the previous attempt now
+		// appears to have paid an enormous fee, so any honest replacement
+		// pays less and must be refused (BOLT 2's total-fee floor).
+		record.inputPrevouts[0].valueSats += 10_000_000n;
+
+		const acked = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(findPayload(acked, MessageType.TX_ACK_RBF)).to.not.equal(null);
+		// An honest replacement: the opener re-spends its attempt-0 input
+		// (satisfying the double-spend rule) plus a fresh one for the fee.
+		expect(
+			findError(
+				h.acceptor.handleTxAddInput({
+					channelId: h.acceptor.getChannelId()!,
+					serialId: 0n,
+					prevTx: h.openerPrev.prevTx,
+					prevTxVout: 0,
+					sequence: 0xfffffffd
+				})
+			)
+		).to.equal(null);
+		const topUp = makeRealPrevOut(200_000);
+		expect(
+			findError(
+				h.acceptor.handleTxAddInput({
+					channelId: h.acceptor.getChannelId()!,
+					serialId: 4n,
+					prevTx: topUp.prevTx,
+					prevTxVout: 0,
+					sequence: 0xfffffffd
+				})
+			)
+		).to.equal(null);
+		expect(
+			findError(
+				h.acceptor.handleTxAddOutput({
+					channelId: h.acceptor.getChannelId()!,
+					serialId: 2n,
+					amountSats: BigInt(fundingOut.value),
+					scriptPubkey: Buffer.from(fundingOut.script)
+				})
+			)
+		).to.equal(null);
+		expect(findError(h.acceptor.sendTxComplete())).to.equal(null);
+		const result = h.acceptor.handleTxComplete();
+		const abort = findPayload(result, MessageType.TX_ABORT);
+		expect(abort).to.not.equal(null);
+		expect(decodeTxAbortMessage(abort!).data.toString('utf8')).to.contain(
+			"below the previous attempt's fee"
+		);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
+	it('v2PreviousAttempts round-trips serialization; absent stays absent (issue 360)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		const st = h.opener.getFullState();
+		const prev = { ...st.v2InFlight! };
+		st.v2PreviousAttempts = [prev];
+		const json = JSON.parse(JSON.stringify(serializeChannelState(st)));
+		const restored = deserializeChannelState(json);
+		expect(restored.v2PreviousAttempts).to.have.length(1);
+		const r = restored.v2PreviousAttempts![0];
+		expect(r.fundingTxid.equals(prev.fundingTxid)).to.be.true;
+		expect(r.fundingOutputIndex).to.equal(prev.fundingOutputIndex);
+		expect(r.fundingTxHex).to.equal(prev.fundingTxHex);
+		expect(r.sentTxSignatures).to.equal(prev.sentTxSignatures);
+		expect(r.fullySigned).to.equal(prev.fullySigned);
+		expect(r.rbfAttempt).to.equal(prev.rbfAttempt);
+		expect(r.localContributionSats).to.equal(prev.localContributionSats);
+		expect(r.inputPrevouts.length).to.equal(prev.inputPrevouts.length);
+
+		delete json.v2PreviousAttempts;
+		expect(deserializeChannelState(json).v2PreviousAttempts).to.equal(
+			undefined
+		);
 	});
 
 	it('survives consecutive refusals and a refusal followed by an operator abort', () => {
@@ -2302,14 +2746,15 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			'the release stays frozen behind the pending request'
 		).to.equal(null);
 
-		// The acceptor refuses the crossed request (its attempt is already
-		// broadcastable). The refusal completes the exchange at the opener:
-		// echo out, and the thawed release sends the staged witnesses in
-		// the same batch.
+		// The acceptor refuses the crossed request (delivered below the 25/24
+		// floor; a broadcastable attempt itself no longer refuses in the
+		// issue-360 spec window). The refusal completes the exchange at the
+		// opener: echo out, and the thawed release sends the staged
+		// witnesses in the same batch.
 		const refusal = h.acceptor.handleTxInitRbf({
 			channelId: h.acceptor.getChannelId()!,
 			locktime: 0,
-			feerate: 2000
+			feerate: 1001
 		});
 		expect(findPayload(refusal, MessageType.TX_ABORT)).to.not.equal(null);
 		const answer = h.opener.handleTxAbort();
@@ -3702,6 +4147,345 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		acceptor.destroy();
 	});
 
+	// Drive a completed v2 open, RBF it post-signatures through the public
+	// API, and return everything the adoption tests need (issue 360).
+	async function driveSpecWindowRbf(
+		seedA: number,
+		seedB: number
+	): Promise<{
+		opener: LightningNode;
+		acceptor: LightningNode;
+		channel: Channel;
+		acceptorChannel: Channel;
+		channelId: Buffer;
+		attempt0Txid: Buffer;
+		attempt1Txid: Buffer;
+	}> {
+		const opener = new LightningNode(
+			makeNodeConfig(seedA, {
+				storage: (() => {
+					const s = new SqliteStorage(':memory:');
+					s.open();
+					return s;
+				})(),
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(seedB, {
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		wireNodes(opener, acceptor);
+
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
+		await settle(
+			() =>
+				channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED &&
+				!!channel.getFullState().v2InFlight?.fullySigned
+		);
+		const channelId = channel.getChannelId()!;
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
+		await settle(
+			() =>
+				acceptorChannel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		const attempt0Txid = Buffer.from(
+			channel.getFullState().v2InFlight!.fundingTxid
+		);
+
+		// The public API drives the whole replacement (issue 360).
+		const result = opener.rbfOpenChannelV2(channelId, 2000);
+		expect(result.ok, result.error).to.equal(true);
+		await settle(
+			() =>
+				channel.getFullState().v2InFlight?.rbfAttempt === 1 &&
+				!!channel.getFullState().v2InFlight?.fullySigned &&
+				acceptorChannel.getFullState().v2InFlight?.rbfAttempt === 1 &&
+				!!acceptorChannel.getFullState().v2InFlight?.fullySigned
+		);
+		const attempt1Txid = Buffer.from(
+			channel.getFullState().v2InFlight!.fundingTxid
+		);
+		return {
+			opener,
+			acceptor,
+			channel,
+			acceptorChannel,
+			channelId,
+			attempt0Txid,
+			attempt1Txid
+		};
+	}
+
+	it('a post-signatures RBF renegotiates to completion through the public API (issue 360)', async function () {
+		const t = await driveSpecWindowRbf(101, 102);
+		try {
+			expect(t.attempt1Txid.equals(t.attempt0Txid)).to.be.false;
+			for (const side of [t.channel, t.acceptorChannel]) {
+				const st = side.getFullState();
+				expect(st.state).to.equal(ChannelState.AWAITING_FUNDING_CONFIRMED);
+				expect(st.v2InFlight!.fundingFeeratePerkw).to.equal(2000);
+				expect(st.v2InFlight!.fundingTxid.equals(t.attempt1Txid)).to.be.true;
+				// The superseded broadcastable attempt is retained durably and
+				// stays a live candidate.
+				expect(st.v2PreviousAttempts).to.have.length(1);
+				const prev = st.v2PreviousAttempts![0];
+				expect(prev.fundingTxid.equals(t.attempt0Txid)).to.be.true;
+				expect(prev.rbfAttempt).to.equal(0);
+				expect(prev.fullySigned).to.equal(true);
+				expect(side.isV2AttemptBroadcastable()).to.equal(true);
+				// The replacement double-spends attempt 0 (reused inputs).
+				const prevTx = bitcoin.Transaction.fromHex(prev.fundingTxHex);
+				const newTx = bitcoin.Transaction.fromHex(st.v2InFlight!.fundingTxHex);
+				const newIns = new Set(
+					newTx.ins.map((i) => `${i.hash.toString('hex')}:${i.index}`)
+				);
+				expect(
+					prevTx.ins.some((i) =>
+						newIns.has(`${i.hash.toString('hex')}:${i.index}`)
+					),
+					'the replacement double-spends attempt 0'
+				).to.be.true;
+				// The staged rebroadcast follows the newest attempt.
+				expect(st.pendingFundingTxHex).to.equal(st.v2InFlight!.fundingTxHex);
+			}
+			// A second bump stacks another candidate behind the first.
+			const again = t.opener.rbfOpenChannelV2(t.channelId, 4000);
+			expect(again.ok, again.error).to.equal(true);
+			await settle(
+				() =>
+					t.channel.getFullState().v2InFlight?.rbfAttempt === 2 &&
+					!!t.channel.getFullState().v2InFlight?.fullySigned &&
+					t.acceptorChannel.getFullState().v2InFlight?.rbfAttempt === 2
+			);
+			expect(t.channel.getFullState().v2PreviousAttempts).to.have.length(2);
+			expect(
+				t.channel
+					.getFullState()
+					.v2PreviousAttempts![1].fundingTxid.equals(t.attempt1Txid)
+			).to.be.true;
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('adopts the replacement when it confirms; every candidate clears (issue 360)', async function () {
+		const t = await driveSpecWindowRbf(103, 104);
+		try {
+			const newTxidHex = Buffer.from(t.attempt1Txid).reverse().toString('hex');
+			managerOf(t.opener).handleFundingConfirmed(t.channelId, newTxidHex);
+			managerOf(t.acceptor).handleFundingConfirmed(t.channelId, newTxidHex);
+			await settle(
+				() =>
+					t.channel.getState() === ChannelState.NORMAL &&
+					t.acceptorChannel.getState() === ChannelState.NORMAL
+			);
+			for (const side of [t.channel, t.acceptorChannel]) {
+				const st = side.getFullState();
+				expect(st.state).to.equal(ChannelState.NORMAL);
+				expect(st.fundingTxid!.equals(t.attempt1Txid)).to.be.true;
+				expect(st.v2PreviousAttempts ?? []).to.have.length(0);
+				expect(st.v2InFlight).to.equal(null);
+			}
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('adopts the SUPERSEDED attempt when it wins the race to depth (issue 360)', async function () {
+		const t = await driveSpecWindowRbf(105, 106);
+		try {
+			// Each attempt's commitment signs a different funding outpoint:
+			// the adoption must also activate the ADOPTED attempt's commitment
+			// signature, or forceClose would broadcast a commitment spending
+			// an output that can never exist (review finding).
+			const sides = [t.channel, t.acceptorChannel];
+			const adoptedSigs = sides.map((side) =>
+				Buffer.from(
+					side.getFullState().v2PreviousAttempts![0].remoteCommitmentSig!
+				)
+			);
+			const replacementSigs = sides.map((side) =>
+				Buffer.from(side.getFullState().remoteCommitmentSignature!)
+			);
+			const oldTxidHex = Buffer.from(t.attempt0Txid).reverse().toString('hex');
+			managerOf(t.opener).handleFundingConfirmed(t.channelId, oldTxidHex);
+			managerOf(t.acceptor).handleFundingConfirmed(t.channelId, oldTxidHex);
+			await settle(
+				() =>
+					t.channel.getState() === ChannelState.NORMAL &&
+					t.acceptorChannel.getState() === ChannelState.NORMAL
+			);
+			for (const [i, side] of sides.entries()) {
+				const st = side.getFullState();
+				expect(st.state).to.equal(ChannelState.NORMAL);
+				expect(
+					st.fundingTxid!.equals(t.attempt0Txid),
+					'the confirmed superseded attempt is adopted'
+				).to.be.true;
+				expect(st.fundingOutputIndex).to.be.a('number');
+				expect(st.v2PreviousAttempts ?? []).to.have.length(0);
+				expect(st.v2InFlight).to.equal(null);
+				expect(
+					st.remoteCommitmentSignature!.equals(adoptedSigs[i]),
+					"the ADOPTED attempt's commitment signature is active"
+				).to.be.true;
+				expect(
+					st.remoteCommitmentSignature!.equals(replacementSigs[i]),
+					"the replacement's signature was replaced"
+				).to.be.false;
+			}
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('a restart preserves the candidate set and still adopts the superseded attempt (issue 360)', async function () {
+		const t = await driveSpecWindowRbf(107, 108);
+		try {
+			// Restart-equivalent at the channel layer: the row round-trips and
+			// the rebuilt channel still tracks both candidates.
+			const json = JSON.parse(
+				JSON.stringify(serializeChannelState(t.channel.getFullState()))
+			);
+			const revived = new Channel(deserializeChannelState(json));
+			revived.restoreV2InFlight();
+			expect(revived.getFullState().v2PreviousAttempts).to.have.length(1);
+			const adoptedSig = Buffer.from(
+				revived.getFullState().v2PreviousAttempts![0].remoteCommitmentSig!
+			);
+			// A confirmation that does not say WHICH attempt is ambiguous with
+			// candidates tracked: refused, nothing guessed, nothing mutated
+			// (review finding).
+			const ambiguous = revived.fundingConfirmed();
+			expect(findError(ambiguous)).to.contain('ambiguous');
+			expect(revived.getFullState().v2PreviousAttempts).to.have.length(1);
+			const adoption = revived.fundingConfirmed(t.attempt0Txid);
+			expect(findError(adoption)).to.equal(null);
+			expect(
+				findPayload(adoption, MessageType.CHANNEL_READY),
+				'the revived channel readies on the adopted attempt'
+			).to.not.equal(null);
+			const st = revived.getFullState();
+			expect(st.fundingTxid!.equals(t.attempt0Txid)).to.be.true;
+			expect(st.v2InFlight!.fundingTxid.equals(t.attempt0Txid)).to.be.true;
+			expect(st.v2PreviousAttempts ?? []).to.have.length(0);
+			expect(st.state).to.equal(ChannelState.AWAITING_CHANNEL_READY);
+			expect(
+				st.remoteCommitmentSignature!.equals(adoptedSig),
+				"the adopted attempt's commitment signature is active"
+			).to.be.true;
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('a force-closed open adopts a confirmed superseded attempt and re-drives the close (issue 360 review)', async function () {
+		const t = await driveSpecWindowRbf(109, 110);
+		try {
+			const adoptedSig = Buffer.from(
+				t.channel.getFullState().v2PreviousAttempts![0].remoteCommitmentSig!
+			);
+			// Force-close while every attempt is unconfirmed: the broadcast
+			// commitment spends attempt 1's funding output.
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const closed = t.opener.forceCloseChannel(t.channelId, dest);
+			expect(closed.ok, closed.error).to.equal(true);
+			expect(t.channel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+
+			// Attempt 0 wins the race to depth: the close just broadcast can
+			// never confirm. The channel must adopt the confirmed attempt and
+			// the node must re-drive the close against it.
+			const oldTxidHex = Buffer.from(t.attempt0Txid).reverse().toString('hex');
+			managerOf(t.opener).handleFundingConfirmed(t.channelId, oldTxidHex);
+			// The watcher's confirmation callback (manager first, then the
+			// node handler) drives the re-drive in production; invoke the
+			// handler the same way here (no chain watcher in this fixture).
+			(
+				t.opener as unknown as {
+					onFundingWatchConfirmed(id: Buffer, txid?: string): void;
+				}
+			).onFundingWatchConfirmed(t.channelId, oldTxidHex);
+			const idHex = t.channelId.toString('hex');
+			await settle(
+				() =>
+					(
+						t.opener as unknown as {
+							_lastCloseBroadcast: Map<string, { txid: string }>;
+						}
+					)._lastCloseBroadcast.get(idHex) !== undefined
+			);
+
+			const st = t.channel.getFullState();
+			expect(st.state, 'the terminal state is kept').to.equal(
+				ChannelState.FORCE_CLOSED
+			);
+			expect(st.fundingTxid!.equals(t.attempt0Txid)).to.be.true;
+			expect(st.v2InFlight!.confirmed).to.equal(true);
+			expect(st.v2PreviousAttempts ?? []).to.have.length(0);
+			expect(
+				st.remoteCommitmentSignature!.equals(adoptedSig),
+				"the adopted attempt's commitment signature is active"
+			).to.be.true;
+
+			// The re-driven close spends the ADOPTED funding outpoint.
+			const rebuilt = managerOf(t.opener).rebuildForceCloseCommitment(
+				t.channelId,
+				5
+			);
+			expect(rebuilt.ok, rebuilt.error).to.equal(true);
+			const closeTx = bitcoin.Transaction.fromBuffer(rebuilt.tx!);
+			expect(closeTx.ins).to.have.length(1);
+			expect(
+				Buffer.from(closeTx.ins[0].hash).equals(t.attempt0Txid),
+				'the close spends the funding that is actually on chain'
+			).to.be.true;
+			expect(closeTx.ins[0].index).to.equal(st.fundingOutputIndex);
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('rbfOpenChannelV2 validates u32 inputs before touching the channel (issue 360 review)', async function () {
+		const t = await driveSpecWindowRbf(111, 112);
+		try {
+			expect(() => t.opener.rbfOpenChannelV2(t.channelId, 4000, -1)).to.throw(
+				'u32'
+			);
+			expect(() => t.opener.rbfOpenChannelV2(t.channelId, 2 ** 32)).to.throw(
+				'u32'
+			);
+			// Nothing was poisoned: the next valid bump goes through.
+			const ok = t.opener.rbfOpenChannelV2(t.channelId, 4000);
+			expect(ok.ok, ok.error).to.equal(true);
+			await settle(
+				() =>
+					t.channel.getFullState().v2InFlight?.rbfAttempt === 2 &&
+					!!t.channel.getFullState().v2InFlight?.fullySigned
+			);
+			expect(t.channel.getFullState().v2PreviousAttempts).to.have.length(2);
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
 	it('a signer failure at the replacement commitment converges both sides', async function () {
 		const openerStorage = new SqliteStorage(':memory:');
 		openerStorage.open();
@@ -3969,7 +4753,7 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		revived.destroy();
 	});
 
-	it('a zero-input acceptor refuses RBF; both sides keep the broadcastable attempt', async function () {
+	it('a zero-input acceptor refuses RBF while its commitment exchange is incomplete; both sides keep the broadcastable attempt', async function () {
 		const opener = new LightningNode(
 			makeNodeConfig(83, {
 				storage: (() => {
@@ -3998,9 +4782,12 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		);
 		wire.clearDrops();
 
-		// The acceptor contributed no inputs: the opener can broadcast
-		// attempt 0 without it, so accepting a replacement would let a
-		// tx it cannot stop confirm while it tracks a different one.
+		// The acceptor contributed no inputs, so attempt 0 is broadcastable
+		// by the opener alone, and the dropped commitment_signed left the
+		// acceptor without the opener's commitment signature: a superseded
+		// attempt it cannot force-close must never enter the candidate set,
+		// so the replacement is refused until the exchange completes (in the
+		// issue-360 spec window a COMPLETED broadcastable attempt accepts).
 		const rbfActions = channel.initiateTxRbf(2000);
 		expect(findError(rbfActions)).to.equal(null);
 		(

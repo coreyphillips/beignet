@@ -1708,8 +1708,13 @@ export class LightningNode extends EventEmitter {
 			// the peer knows. Roll the row back to it and restore normally
 			// (restoreChannel marks it for reestablish); the rewrite is
 			// idempotent across crashes, so the row itself needs no update.
+			// Attempt-aware: a previous attempt whose witnesses left resumes
+			// waiting on the chain, not on the peer.
 			if (state.state === ChannelState.DUAL_FUNDING_V2 && state.v2InFlight) {
-				state.state = ChannelState.AWAITING_TX_SIGNATURES;
+				state.state =
+					state.v2InFlight.sentTxSignatures || state.v2InFlight.fullySigned
+						? ChannelState.AWAITING_FUNDING_CONFIRMED
+						: ChannelState.AWAITING_TX_SIGNATURES;
 				this.emitStructuredLog('channel', 'v2_rbf_provisional_rolled_back', {
 					channelId
 				});
@@ -6455,6 +6460,25 @@ export class LightningNode extends EventEmitter {
 			retired = channel.clearRetainedFundingPayload() || retired;
 			this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
 		}
+		// A v2 open force-closed before confirmation whose SUPERSEDED RBF
+		// attempt then won the race: the channel adopted that attempt (and
+		// stamped its record confirmed in the same persist), so the broadcast
+		// commitment spends a funding output that can never exist. Rebuild
+		// and rebroadcast the close against the adopted funding, on the same
+		// machinery as the confirmed-splice re-drive (issue #360).
+		if (
+			channel.getState() === ChannelState.FORCE_CLOSED &&
+			state.fundingVersion === 2 &&
+			!state.spliceInFlight &&
+			state.v2InFlight?.confirmed === true &&
+			confirmedTxid !== undefined &&
+			Buffer.from(state.v2InFlight.fundingTxid).reverse().toString('hex') ===
+				confirmedTxid
+		) {
+			if (retired) this.persistChannel(channelId);
+			void this.redriveSpliceAdoptedClose(channelId);
+			return;
+		}
 		const inflight = state.spliceInFlight;
 		const spliceConfirmed =
 			inflight != null &&
@@ -6763,12 +6787,28 @@ export class LightningNode extends EventEmitter {
 
 			const txidHex = Buffer.from(state.fundingTxid).reverse().toString('hex');
 
+			// Post-signatures RBF: superseded broadcastable attempts can still
+			// confirm and pay the same funding script, so the restored watch
+			// carries every candidate outpoint (mirrors the live watch:funding
+			// arming).
+			const previousAttempts = state.v2PreviousAttempts ?? [];
+			const candidates = previousAttempts.length
+				? [
+						{ txid: txidHex, outputIndex: state.fundingOutputIndex },
+						...previousAttempts.map((rec) => ({
+							txid: Buffer.from(rec.fundingTxid).reverse().toString('hex'),
+							outputIndex: rec.fundingOutputIndex
+						}))
+				  ]
+				: undefined;
 			await this.chainWatcher.watchFundingOutput(
 				state.channelId || state.temporaryChannelId,
 				txidHex,
 				state.fundingOutputIndex,
 				state.minimumDepth ?? 3,
-				fundingScript
+				fundingScript,
+				undefined,
+				candidates
 			);
 		}
 	}
@@ -6852,12 +6892,26 @@ export class LightningNode extends EventEmitter {
 						state.remoteBasepoints.fundingPubkey,
 						btcNetwork
 				  ).p2wshOutput;
+			// Post-signatures RBF: carry every candidate outpoint (mirrors
+			// the watch:funding arming in the chain watcher).
+			const previousAttempts = state.v2PreviousAttempts ?? [];
+			const candidates = previousAttempts.length
+				? [
+						{ txid: txidHex, outputIndex: state.fundingOutputIndex },
+						...previousAttempts.map((rec) => ({
+							txid: Buffer.from(rec.fundingTxid).reverse().toString('hex'),
+							outputIndex: rec.fundingOutputIndex
+						}))
+				  ]
+				: undefined;
 			await this.chainWatcher.watchFundingOutput(
 				channelId,
 				txidHex,
 				state.fundingOutputIndex,
 				state.minimumDepth ?? 3,
-				fundingScript
+				fundingScript,
+				undefined,
+				candidates
 			);
 			return;
 		}
@@ -7677,8 +7731,8 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
-	handleFundingConfirmed(channelId: Buffer): void {
-		this.channelManager.handleFundingConfirmed(channelId);
+	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: string): void {
+		this.channelManager.handleFundingConfirmed(channelId, confirmedTxidHex);
 	}
 
 	closeChannel(
@@ -8392,10 +8446,14 @@ export class LightningNode extends EventEmitter {
 				// record still awaits adoption, retry each block instead of
 				// dropping the re-drive.
 				const ch = this.channelManager.getChannel(channelId);
-				if (
-					rebuilt.retryable === true &&
-					ch?.getFullState().spliceInFlight?.confirmed === true
-				) {
+				const chState = ch?.getFullState();
+				const confirmedAdoption =
+					chState?.spliceInFlight?.confirmed === true ||
+					// A v2 RBF candidate adoption (issue #360) re-drives on the
+					// same machinery and retries the same way.
+					(chState?.fundingVersion === 2 &&
+						chState.v2InFlight?.confirmed === true);
+				if (rebuilt.retryable === true && confirmedAdoption) {
 					this._pendingSpliceCloseRedrives.add(idHex);
 				}
 				this.emitStructuredLog('chain', 'splice_close_redrive_refused', {
@@ -8529,6 +8587,51 @@ export class LightningNode extends EventEmitter {
 			});
 
 		return { ok: true };
+	}
+
+	/**
+	 * Bump the fee of an unconfirmed v2 (dual-funded) open by replacing its
+	 * funding transaction (BOLT 2 tx_init_rbf / tx_ack_rbf; issue #360).
+	 * Opener-only. The renegotiation reuses the wallet inputs registered for
+	 * the open, repriced at the new feerate (the contribution split never
+	 * changes), so it needs no fresh coin selection but also cannot run
+	 * after a restart (the signing closures die with the process). Permitted
+	 * until channel_ready crosses or an attempt confirms. Superseded
+	 * attempts stay chain-watched, and whichever attempt confirms is
+	 * adopted. The new feerate must clear the BOLT 2 floor:
+	 * max(floor(previous * 25 / 24), previous + 25) sat/kw.
+	 */
+	rbfOpenChannelV2(
+		channelId: Buffer,
+		fundingFeeratePerkw: number,
+		locktime?: number
+	): { ok: boolean; error?: string } {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		// Both integers ride u32 wire fields: validate BEFORE anything on the
+		// channel can mutate, so an out-of-range value cannot poison the
+		// pending-request latch.
+		if (
+			!Number.isInteger(fundingFeeratePerkw) ||
+			fundingFeeratePerkw <= 0 ||
+			fundingFeeratePerkw > 0xffffffff
+		) {
+			throw new Error(
+				`fundingFeeratePerkw must be a u32 greater than zero, got ${fundingFeeratePerkw}`
+			);
+		}
+		if (
+			locktime !== undefined &&
+			(!Number.isInteger(locktime) || locktime < 0 || locktime > 0xffffffff)
+		) {
+			throw new Error(`locktime must be a u32, got ${locktime}`);
+		}
+		const result = this.channelManager.initiateFundingRbf(
+			channelId,
+			fundingFeeratePerkw,
+			locktime
+		);
+		return result.ok ? { ok: true } : { ok: false, error: result.error };
 	}
 
 	/**

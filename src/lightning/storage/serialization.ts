@@ -403,6 +403,9 @@ export interface ISerializedChannelState {
 	commitmentFeeratePerkw?: number;
 	fundingLocktime?: number;
 	v2InFlight?: ISerializedV2InFlight | null;
+	// Broadcastable attempts superseded by an accepted RBF, newest last;
+	// absent on rows written before the spec-window RBF support (issue #360).
+	v2PreviousAttempts?: ISerializedV2InFlight[];
 	// Liquidity ads (bLIP-0051): if we are the lessor, our to_local (and its
 	// exact on-chain script) is CLTV-locked until leaseExpiry. These MUST persist —
 	// otherwise a restart rebuilds the commitment without the lock, the peer's cached
@@ -758,6 +761,9 @@ export function serializeChannelState(
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw,
 		fundingLocktime: s.fundingLocktime,
 		v2InFlight: s.v2InFlight ? serializeV2InFlight(s.v2InFlight) : null,
+		v2PreviousAttempts: s.v2PreviousAttempts?.length
+			? s.v2PreviousAttempts.map(serializeV2InFlight)
+			: undefined,
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
 		leaseCommitBlockheight: s.leaseCommitBlockheight,
@@ -942,6 +948,9 @@ export function deserializeChannelState(
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw ?? 0,
 		fundingLocktime: s.fundingLocktime ?? 0,
 		v2InFlight: s.v2InFlight ? deserializeV2InFlight(s.v2InFlight) : null,
+		v2PreviousAttempts: s.v2PreviousAttempts?.length
+			? s.v2PreviousAttempts.map(deserializeV2InFlight)
+			: undefined,
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
 		leaseCommitBlockheight: s.leaseCommitBlockheight,

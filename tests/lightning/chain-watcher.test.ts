@@ -275,6 +275,109 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(confirmed).to.be.true;
 		});
 
+		it('adopts whichever RBF candidate confirms (issue 360)', async () => {
+			const channelId = crypto.randomBytes(32);
+			const newTxid = crypto.randomBytes(32).toString('hex');
+			const oldTxid = crypto.randomBytes(32).toString('hex');
+			const scriptPubkey = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			const scriptHash = computeScriptHash(scriptPubkey);
+
+			await watcher.watchFundingOutput(
+				channelId,
+				newTxid,
+				0,
+				3,
+				scriptPubkey,
+				undefined,
+				[
+					{ txid: newTxid, outputIndex: 0 },
+					{ txid: oldTxid, outputIndex: 1 }
+				]
+			);
+			backend.simulateNewBlock(100);
+			// The SUPERSEDED attempt mined; the current one vanished (its
+			// replacement double-spent it out of the mempool).
+			backend.setHistory(scriptHash, [{ txid: oldTxid, height: 98 }]);
+
+			const confirmedTxids: string[] = [];
+			let missing = false;
+			watcher.on('funding:confirmed', (_cid: Buffer, txid: string) => {
+				confirmedTxids.push(txid);
+			});
+			watcher.on('funding:missing', () => {
+				missing = true;
+			});
+			backend.simulateScriptHashChange(scriptHash);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(confirmedTxids, 'the mined candidate is adopted').to.deep.equal([
+				oldTxid
+			]);
+			expect(missing, 'a live candidate is never "missing"').to.equal(false);
+		});
+
+		it('a transient subscription failure keeps the candidate set across the retry (issue 360 review)', async () => {
+			const channelId = crypto.randomBytes(32);
+			const newTxid = crypto.randomBytes(32).toString('hex');
+			const oldTxid = crypto.randomBytes(32).toString('hex');
+			const scriptPubkey = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			const scriptHash = computeScriptHash(scriptPubkey);
+
+			// The first subscription attempt fails; the per-block retry
+			// succeeds and MUST re-arm the full candidate set.
+			const realSubscribe = backend.subscribeToScriptHash.bind(backend);
+			let failures = 1;
+			backend.subscribeToScriptHash = async (
+				sh: string,
+				cb: () => void
+			): Promise<void> => {
+				if (failures > 0) {
+					failures--;
+					throw new Error('transient subscription failure');
+				}
+				return realSubscribe(sh, cb);
+			};
+
+			await watcher.watchFundingOutput(
+				channelId,
+				newTxid,
+				0,
+				3,
+				scriptPubkey,
+				undefined,
+				[
+					{ txid: newTxid, outputIndex: 0 },
+					{ txid: oldTxid, outputIndex: 1 }
+				]
+			);
+
+			const confirmedTxids: string[] = [];
+			let missing = false;
+			watcher.on('funding:confirmed', (_cid: Buffer, txid: string) => {
+				confirmedTxids.push(txid);
+			});
+			watcher.on('funding:missing', () => {
+				missing = true;
+			});
+			// Only the OLD candidate is on chain; the retried watch must still
+			// know about it.
+			backend.setHistory(scriptHash, [{ txid: oldTxid, height: 98 }]);
+			backend.simulateNewBlock(100);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(
+				confirmedTxids,
+				'the retried watch still tracks the superseded candidate'
+			).to.deep.equal([oldTxid]);
+			expect(missing).to.equal(false);
+		});
+
 		it('should not confirm before minimum depth', async () => {
 			const channelId = crypto.randomBytes(32);
 			const txid = crypto.randomBytes(32).toString('hex');
