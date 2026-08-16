@@ -457,11 +457,17 @@ export class Channel {
 	private _spliceSession: SpliceSession | null = null;
 	// A splice the caller requested while the channel was not yet quiescent.
 	// Fired automatically once we reach QUIESCENT (we drive quiescence ourselves
-	// so we become the quiescence initiator, as splice requires).
+	// so we become the quiescence initiator, as splice requires). A request the
+	// operator cancelled while our stfu was still unanswered stays parked with
+	// cancelled=true: quiescence has no un-stfu, so once the handshake completes
+	// the deferred hook must still open the splice conversation and immediately
+	// tx_abort it, or both sides would sit HTLC-frozen until a disconnect
+	// (issue #370). Memory-only: quiescence never survives a disconnect.
 	private _pendingSplice: {
 		relativeSatoshis: bigint;
 		fundingFeeratePerkw: number;
 		locktime: number;
+		cancelled: boolean;
 	} | null = null;
 	// Splice interactive-tx driving (initiator side). The ordered contributions
 	// we still need to send (shared input, new funding output, splice-out
@@ -7211,6 +7217,24 @@ export class Channel {
 					pending.locktime
 				)
 			);
+			// The operator cancelled the request while our stfu was unanswered
+			// (issue #370). Quiescence has no un-stfu and a tx_abort without a
+			// splice conversation would only draw a bare echo, so the one
+			// spec-clean unwind is to open the conversation we just announced
+			// and abort it at once: the peer's session abort exits its
+			// quiescence, the echo settles ours. Skipped if the splice_init
+			// could not be built (unreachable today); the disconnect fallback
+			// still applies there.
+			if (
+				pending.cancelled &&
+				!actions.some((a) => a.type === ChannelActionType.ERROR)
+			) {
+				actions.push(
+					...this.initiateSpliceAbort(
+						'splice cancelled while awaiting quiescence'
+					)
+				);
+			}
 		}
 
 		return actions;
@@ -7342,7 +7366,12 @@ export class Channel {
 		// so we become the quiescence initiator (the side allowed to send
 		// splice_init). The deferred splice fires from handleStfuMessage once we
 		// reach QUIESCENT.
-		this._pendingSplice = { relativeSatoshis, fundingFeeratePerkw, locktime };
+		this._pendingSplice = {
+			relativeSatoshis,
+			fundingFeeratePerkw,
+			locktime,
+			cancelled: false
+		};
 
 		if (this._quiescence.isQuiescing()) {
 			// STFU already in flight; just wait for QUIESCENT.
@@ -7532,6 +7561,16 @@ export class Channel {
 	 * Handle splice_ack from remote (initiator side).
 	 */
 	handleSpliceAck(msg: ISpliceAckMessage): ChannelAction[] {
+		// A splice abort of ours is still awaiting its echo: any splice_ack the
+		// peer sent before processing our tx_abort answers a dead splice_init
+		// (the cancelled-while-quiescing unwind aborts in the same batch as the
+		// splice_init, so the ack always crosses it). BOLT 2 forbids a second
+		// tx_abort while ours is outstanding; stay silent. Must precede the
+		// state guard: the unwind has already restored NORMAL by the time the
+		// crossing ack arrives.
+		if (this._spliceAbortPending) {
+			return [];
+		}
 		if (this._state.state !== ChannelState.SPLICING) {
 			return [
 				{
@@ -8282,9 +8321,13 @@ export class Channel {
 	abortSplice(reason?: string): ChannelAction[] {
 		if (!this._spliceSession) {
 			// A splice may have been requested but is still waiting for quiescence
-			// (no session created yet). Cancelling that is a no-op success.
+			// (no session created yet). Nothing left our side beyond the stfu, but
+			// stfu cannot be recalled: the request stays parked as cancelled so
+			// the deferred hook in handleStfuMessage can unwind the quiescence it
+			// completes (splice_init + immediate tx_abort, issue #370). Repeat
+			// cancels re-hit this arm and stay a no-op success.
 			if (this._pendingSplice) {
-				this._pendingSplice = null;
+				this._pendingSplice.cancelled = true;
 				return [];
 			}
 			// An unsigned in-flight record without a live session (restored from
@@ -8380,7 +8423,10 @@ export class Channel {
 			return unwind;
 		}
 		// A pending-splice cancel: quiescence was never reached, so splice_init
-		// never left and nothing is on disk. The peer has no splice to forget.
+		// never left and nothing is on disk. The peer has no splice to forget
+		// yet. If our stfu is already out, the request stays parked as
+		// cancelled and the deferred hook in handleStfuMessage unwinds the
+		// quiescence once the peer's stfu completes it (issue #370).
 		if (!hadSession && !hadRecord) {
 			return unwind;
 		}

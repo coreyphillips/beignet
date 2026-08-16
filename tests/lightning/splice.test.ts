@@ -52,6 +52,7 @@ import {
 	encodeTxSignaturesMessage
 } from '../../src/lightning/message/interactive-tx';
 import { decodeStfuMessage } from '../../src/lightning/message/stfu';
+import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import {
 	decodeCommitmentSignedMessage,
 	encodeCommitmentSignedMessage,
@@ -4793,6 +4794,180 @@ describe('Splice', function () {
 				});
 			});
 
+			describe('pending-splice cancel quiescence unwind (issue #370)', function () {
+				it('unwinds the completed handshake with splice_init + tx_abort', function () {
+					const { opener } = makeNormalChannel();
+					opener.initiateSplice(100_000n, 253); // stfu out, quiescence pending
+					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+
+					// The peer's stfu completes a handshake we cannot recall: the
+					// unwind must open the announced conversation and abort it at
+					// once, or both sides would sit HTLC-frozen until a disconnect.
+					const actions = opener.handleStfuMessage({
+						channelId: opener.getChannelId()!,
+						initiator: false
+					});
+					const spliceIndex = actions.findIndex(
+						(a) =>
+							a.type === ChannelActionType.SEND_MESSAGE &&
+							(a as { messageType: MessageType }).messageType ===
+								MessageType.SPLICE
+					);
+					const abortIndex = actions.findIndex(
+						(a) =>
+							a.type === ChannelActionType.SEND_MESSAGE &&
+							(a as { messageType: MessageType }).messageType ===
+								MessageType.TX_ABORT
+					);
+					expect(spliceIndex, 'conversation opened').to.not.equal(-1);
+					expect(abortIndex, 'and aborted at once').to.not.equal(-1);
+					expect(spliceIndex).to.be.lessThan(abortIndex);
+					expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+					expect(opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(opener.isQuiescent(), 'quiescence unwound').to.be.false;
+					expect(opener.getSpliceSession()).to.be.null;
+					expect(opener.getFullState().spliceInFlight).to.be.null;
+					expect(opener.isSpliceAbortPending(), 'echo pending').to.be.true;
+					expect(opener.getFullState().spliceAbortOwed).to.be.true;
+
+					// The echo settles the exchange.
+					const echo = opener.handleTxAbort();
+					expect(findAction(echo, ChannelActionType.ERROR)).to.not.exist;
+					expect(opener.isSpliceAbortPending()).to.be.false;
+					expect(opener.getFullState().spliceAbortOwed).to.be.false;
+				});
+
+				it('both sides resume NORMAL and HTLCs flow again', function () {
+					const pair = makeWirePair();
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.initiateSplice(100_000n, 253)
+					);
+					// Cancelled while our stfu is still in flight.
+					expect(pair.opener.initiateSpliceAbort('operator requested')).to.be
+						.empty;
+					pair.pump();
+
+					for (const ch of [pair.opener, pair.acceptor]) {
+						expect(ch.getState()).to.equal(ChannelState.NORMAL);
+						expect(ch.isQuiescent(), 'quiescence unwound').to.be.false;
+						expect(ch.getSpliceSession()).to.be.null;
+						expect(ch.getFullState().spliceInFlight).to.be.null;
+					}
+					expect(pair.errors).to.be.empty;
+					expect(pair.opener.isSpliceAbortPending(), 'echo consumed').to.be
+						.false;
+					expect(pair.opener.getFullState().spliceAbortOwed).to.be.false;
+
+					// The freeze is gone on both gates: ours to send, theirs to
+					// receive. The peer's splice_ack crossed our tx_abort on the
+					// way and was ignored, not surfaced as an error.
+					const paymentHash = crypto
+						.createHash('sha256')
+						.update(crypto.randomBytes(32))
+						.digest();
+					const addActions = pair.opener.addHtlc(
+						50_000_000n,
+						paymentHash,
+						500000,
+						crypto.randomBytes(1366)
+					);
+					const addMsg = findSendAction(
+						addActions,
+						MessageType.UPDATE_ADD_HTLC
+					);
+					expect(addMsg, 'sender gate open').to.exist;
+					const recvActions = pair.acceptor.handleUpdateAddHtlc(
+						decodeUpdateAddHtlcMessage(addMsg.payload)
+					);
+					expect(findAction(recvActions, ChannelActionType.ERROR)).to.not.exist;
+				});
+
+				it('a fresh splice before the handshake completes supersedes the unwind', function () {
+					const { opener } = makeNormalChannel();
+					opener.initiateSplice(100_000n, 253);
+					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+					// Re-requested before the peer answered our stfu: nothing beyond
+					// that stfu has left, so the new request simply replaces the
+					// cancelled one.
+					expect(opener.initiateSplice(200_000n, 253)).to.be.empty;
+
+					const actions = opener.handleStfuMessage({
+						channelId: opener.getChannelId()!,
+						initiator: false
+					});
+					const spliceMsg = findSendAction(actions, MessageType.SPLICE);
+					expect(spliceMsg, 'new splice fired').to.exist;
+					expect(
+						Number(decodeSpliceMessage(spliceMsg.payload).relativeSatoshis)
+					).to.equal(200_000);
+					expect(findSendAction(actions, MessageType.TX_ABORT), 'no unwind').to
+						.not.exist;
+					expect(opener.getState()).to.equal(ChannelState.SPLICING);
+				});
+
+				it('repeat cancels stay silent no-op successes', function () {
+					const { opener } = makeNormalChannel();
+					opener.initiateSplice(100_000n, 253);
+					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+
+					// Still exactly one unwind when the handshake completes.
+					const actions = opener.handleStfuMessage({
+						channelId: opener.getChannelId()!,
+						initiator: false
+					});
+					expect(
+						actions.filter(
+							(a) =>
+								a.type === ChannelActionType.SEND_MESSAGE &&
+								(a as { messageType: MessageType }).messageType ===
+									MessageType.TX_ABORT
+						).length
+					).to.equal(1);
+				});
+
+				it('a disconnect before the peer answers still clears the cancelled request', function () {
+					const pair = makeWirePair();
+					pair.drop(MessageType.STFU); // the peer never sees our stfu
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.initiateSplice(100_000n, 253)
+					);
+					pair.pump();
+					expect(pair.opener.initiateSpliceAbort('operator requested')).to.be
+						.empty;
+
+					disconnect(pair);
+					reconnect(pair);
+
+					for (const ch of [pair.opener, pair.acceptor]) {
+						expect(ch.getState()).to.equal(ChannelState.NORMAL);
+						expect(ch.isQuiescent()).to.be.false;
+					}
+					// Nothing owed, nothing pending: the request died with the wire.
+					// (The owed flag is optional state, absent means not owed.)
+					expect(pair.opener.getFullState().spliceAbortOwed).to.not.be.true;
+					expect(pair.opener.isSpliceAbortPending()).to.be.false;
+					expect(pair.errors).to.be.empty;
+
+					// A later operator quiescence is not torn down by a stale
+					// cancelled request.
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.initiateQuiescence()
+					);
+					pair.pump();
+					expect(pair.opener.isQuiescent()).to.be.true;
+					expect(pair.acceptor.isQuiescent()).to.be.true;
+					expect(pair.opener.getSpliceSession()).to.be.null;
+					expect(pair.errors).to.be.empty;
+				});
+			});
+
 			it('carries the shared-input signature in the tx_signatures TLV, not the witnesses (CLN interop)', function () {
 				const pair = makeWirePair();
 				startSpliceOut(pair);
@@ -5980,6 +6155,75 @@ describe('Splice', function () {
 				deserializeChannelState(openerDisk).spliceInFlight,
 				'unwind reached disk'
 			).to.be.null;
+		});
+
+		it('operator abortSplice while awaiting quiescence unwinds after the peer stfu (issue #370)', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				openerPubkey,
+				acceptorPubkey,
+				channelId,
+				openerChannel,
+				acceptorChannel
+			} = createNormalChannelPair();
+
+			// Re-route through a queue so the cancel can land while our stfu is
+			// still in flight (the default routing delivers synchronously).
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			const wire: Array<() => void> = [];
+			const route = (
+				from: ChannelManager,
+				fromPk: string,
+				to: ChannelManager,
+				toPk: string
+			): void => {
+				from.on(
+					'message:outbound',
+					(peerPubkey: string, type: number, payload: Buffer) => {
+						if (peerPubkey === toPk) {
+							wire.push(() => to.handleMessage(fromPk, type, payload));
+						}
+					}
+				);
+			};
+			route(openerManager, openerPubkey, acceptorManager, acceptorPubkey);
+			route(acceptorManager, acceptorPubkey, openerManager, openerPubkey);
+
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
+			expect(openerManager.initiateSplice(channelId, 100_000n, 253).ok).to.be
+				.true;
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL); // stfu in flight
+			expect(openerManager.abortSplice(channelId, 'operator requested').ok).to
+				.be.true;
+
+			// Deliver the queued traffic: stfu, stfu reply, then the unwind.
+			while (wire.length > 0) {
+				wire.shift()!();
+			}
+
+			for (const ch of [openerChannel, acceptorChannel]) {
+				expect(ch.getState()).to.equal(ChannelState.NORMAL);
+				expect(ch.isQuiescent(), 'quiescence unwound').to.be.false;
+			}
+			expect(openerChannel.isSpliceAbortPending(), 'echo consumed').to.be.false;
+			expect(openerChannel.getFullState().spliceAbortOwed).to.be.false;
+
+			// The channel is usable again.
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					20_000_000n,
+					crypto.createHash('sha256').update(crypto.randomBytes(32)).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
 		});
 
 		it('should refuse initiateSplice when the peer lacks option_splice/option_quiesce', function () {
