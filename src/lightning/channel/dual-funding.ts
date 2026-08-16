@@ -50,15 +50,26 @@
  * Channel.handleTxInitRbf / handleTxAbort implement the same convergence
  * (the pending-RBF branch consumes an incoming tx_abort as the refusal and
  * resumes the frozen tx_signatures release of the retained attempt).
- * Known divergence: beignet conducts RBF between the commitment exchange
- * and the tx_signatures exchange, while Eclair/CLN RBF a COMPLETED (fully
- * signed, broadcast, unconfirmed) attempt; the windows do not overlap, and
- * the tx_init_rbf/tx_ack_rbf codecs carry no funding_output_contribution
- * TLV, so the replacement path is beignet-to-beignet only and a
- * cross-implementation tx_init_rbf resolves as a clean attempt-scoped
- * refusal in either direction rather than a completed replacement. Tracked
- * as a feature gap in issue #360; the live refusal path is pinned by
- * tests/lightning/interop/eclair-v2open-rbf-refusal.test.ts.
+ *
+ * RBF window (issue #360): the spec window is supported in both directions.
+ * A funding tx may be replaced from the initial commitment exchange until
+ * channel_ready crosses in either direction or an attempt confirms —
+ * covering both beignet's legacy pre-signatures window and the BOLT 2
+ * window Eclair/CLN use (a completed, broadcast, unconfirmed attempt). The
+ * codecs carry the funding_output_contribution and require_confirmed_inputs
+ * TLVs. Superseded broadcastable attempts are retained durably
+ * (IChannelState.v2PreviousAttempts) and chain-watched beside the current
+ * one: each replacement double-spends all of its predecessors (enforced at
+ * tx_complete beside the fee-not-lower rule), at most one attempt can
+ * confirm, and whichever does is adopted. Deliberate policy residuals, all
+ * spec-legal under MAY-abort-for-any-reason:
+ *   - post-restart replacements are refused (the wallet signing closures
+ *     die with the process; adoption of persisted candidates still works);
+ *   - changing funding_output_contribution is refused (contributions stay
+ *     fixed across attempts; an absent TLV means "unchanged", for
+ *     compatibility with beignet peers predating the TLV);
+ *   - initiation stays opener-only (the spec allows either side; Eclair
+ *     and CLN only expose opener-side commands).
  */
 
 import { InteractiveTxBuilder } from '../interactive-tx/builder';
@@ -881,10 +892,14 @@ export class DualFundingSession {
 			return { ok: false, error: 'Only initiator can initiate RBF' };
 		}
 
-		// RBF can be initiated in TX_NEGOTIATION or AWAITING_TX_SIGNATURES
+		// RBF can be initiated in TX_NEGOTIATION, AWAITING_TX_SIGNATURES, or
+		// AWAITING_CHANNEL_READY (the BOLT 2 window: witnesses exchanged, the
+		// broadcast attempt unconfirmed; the channel layer gates channel_ready
+		// and confirmation).
 		if (
 			this._state !== DualFundingState.TX_NEGOTIATION &&
-			this._state !== DualFundingState.AWAITING_TX_SIGNATURES
+			this._state !== DualFundingState.AWAITING_TX_SIGNATURES &&
+			this._state !== DualFundingState.AWAITING_CHANNEL_READY
 		) {
 			return { ok: false, error: 'Cannot initiate RBF: wrong state' };
 		}
@@ -930,7 +945,8 @@ export class DualFundingSession {
 
 		if (
 			this._state !== DualFundingState.TX_NEGOTIATION &&
-			this._state !== DualFundingState.AWAITING_TX_SIGNATURES
+			this._state !== DualFundingState.AWAITING_TX_SIGNATURES &&
+			this._state !== DualFundingState.AWAITING_CHANNEL_READY
 		) {
 			return { ok: false, error: 'Cannot handle RBF: wrong state' };
 		}

@@ -84,6 +84,17 @@ interface IWatchedFunding {
 	 */
 	missingChecks?: number;
 	missingReported?: boolean;
+	/**
+	 * Every funding tx this open may still confirm as (post-signatures RBF,
+	 * issue #360): the current attempt plus every superseded broadcastable
+	 * attempt. All attempts pay the same funding script (the funding pubkeys
+	 * never rotate across RBF), so ONE scripthash subscription covers the
+	 * whole set; only the txid and output index differ per attempt. Absent =
+	 * the single txid/outputIndex pair above. Whichever candidate confirms
+	 * is adopted into txid/outputIndex, and 'funding:missing' means ALL
+	 * candidates vanished.
+	 */
+	candidates?: Array<{ txid: string; outputIndex: number }>;
 }
 
 /** A generic output being watched for spends */
@@ -475,7 +486,10 @@ export class ChainWatcher extends EventEmitter {
 		scriptPubkey: Buffer,
 		// Captured by whatever operation is registering this watch, so a stop()
 		// during either await retires the whole registration.
-		generation: number = this.lifecycleGeneration
+		generation: number = this.lifecycleGeneration,
+		// Post-signatures RBF: every candidate funding tx of this open
+		// (display-order txids). All candidates pay scriptPubkey.
+		candidates?: Array<{ txid: string; outputIndex: number }>
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		const scriptHash = computeScriptHash(scriptPubkey);
@@ -489,7 +503,8 @@ export class ChainWatcher extends EventEmitter {
 			scriptHash,
 			confirmed: false,
 			confirmationHeight: 0,
-			announcementTriggered: false
+			announcementTriggered: false,
+			candidates: candidates?.length ? candidates : undefined
 		};
 
 		this.watchedFundings.set(key, watched);
@@ -745,12 +760,27 @@ export class ChainWatcher extends EventEmitter {
 			  ).p2wshOutput;
 
 		const channelId = state.channelId || state.temporaryChannelId;
+		// Post-signatures RBF: superseded broadcastable attempts can still
+		// confirm (they pay the same funding script), so the watch carries
+		// every candidate outpoint alongside the armed attempt's.
+		const previous = state.v2PreviousAttempts ?? [];
+		const candidates = previous.length
+			? [
+					{ txid: displayTxid, outputIndex: fundingOutputIndex },
+					...previous.map((rec) => ({
+						txid: Buffer.from(rec.fundingTxid).reverse().toString('hex'),
+						outputIndex: rec.fundingOutputIndex
+					}))
+			  ]
+			: undefined;
 		this.watchFundingOutput(
 			channelId,
 			displayTxid,
 			fundingOutputIndex,
 			minimumDepth,
-			fundingScript
+			fundingScript,
+			undefined,
+			candidates
 		).catch((err) => {
 			this.emitError(err);
 		});
@@ -991,11 +1021,20 @@ export class ChainWatcher extends EventEmitter {
 			return;
 		}
 
-		// Find our funding tx in the history
-		const entry = history.find((h) => h.txid === watched.txid);
-		if (!entry) {
-			// The funding tx is in neither the mempool nor a block: it was
-			// evicted or replaced (e.g. one of its inputs double-spent). For a
+		// Find our funding tx in the history. With RBF candidates the set is
+		// "any attempt of this open": the attempts double-spend one another,
+		// so at most one can confirm, and the replaced ones legitimately
+		// vanish from the mempool — absence only matters when EVERY candidate
+		// is gone.
+		const candidates = watched.candidates?.length
+			? watched.candidates
+			: [{ txid: watched.txid, outputIndex: watched.outputIndex }];
+		const entries = history.filter((h) =>
+			candidates.some((c) => c.txid === h.txid)
+		);
+		if (entries.length === 0) {
+			// No funding candidate is in the mempool or a block: evicted or
+			// replaced (e.g. an input double-spent by a foreign tx). For a
 			// zero-conf channel that is already NORMAL this means the channel
 			// no longer exists on the network. Alarm after a debounce so a
 			// transient Electrum hiccup does not cry wolf.
@@ -1009,15 +1048,26 @@ export class ChainWatcher extends EventEmitter {
 		// Present again (mempool or chain): a reorg can bounce a tx back.
 		watched.missingChecks = 0;
 		watched.missingReported = false;
-		if (entry.height <= 0) return; // in the mempool, not yet confirmed
+		const entry = entries.find((h) => h.height > 0);
+		if (!entry) return; // in the mempool, not yet confirmed
 
 		// Calculate confirmations
 		const confirmations = this.currentBlockHeight - entry.height + 1;
 		if (confirmations >= watched.minimumDepth) {
+			// Adopt the winning candidate into the watch itself, so spend
+			// detection and the announcement proof key off the tx that is
+			// actually on chain.
+			const winner = candidates.find((c) => c.txid === entry.txid)!;
+			watched.txid = winner.txid;
+			watched.outputIndex = winner.outputIndex;
+			watched.candidates = undefined;
 			watched.confirmed = true;
 			watched.confirmationHeight = entry.height;
 
-			this.channelManager.handleFundingConfirmed(watched.channelId);
+			this.channelManager.handleFundingConfirmed(
+				watched.channelId,
+				watched.txid
+			);
 			this.emit('funding:confirmed', watched.channelId, watched.txid);
 
 			// Now watch for the funding output being spent (force close detection)
@@ -1141,6 +1191,16 @@ export class ChainWatcher extends EventEmitter {
 					spliceTxidHex === txidHex &&
 					state.spliceFundingOutputIndex === outputIndex
 				) {
+					return channel;
+				}
+			}
+			// Match a superseded RBF attempt's outpoint (post-signatures RBF:
+			// any candidate may still confirm).
+			for (const rec of state.v2PreviousAttempts ?? []) {
+				const recTxidHex = Buffer.from(rec.fundingTxid)
+					.reverse()
+					.toString('hex');
+				if (recTxidHex === txidHex && rec.fundingOutputIndex === outputIndex) {
 					return channel;
 				}
 			}

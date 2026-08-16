@@ -504,6 +504,17 @@ export interface IChannelState {
 	 * with states created before this field existed (treated as null).
 	 */
 	v2InFlight?: IV2InFlight | null;
+	/**
+	 * Dual-funding: broadcastable attempts superseded by an accepted RBF in
+	 * the BOLT 2 window (after tx_signatures, before confirmation), newest
+	 * last. Every entry has sentTxSignatures or fullySigned; any of them can
+	 * still confirm (the replacement double-spends them, but a miner may pick
+	 * an earlier attempt), so all are chain-watched until one attempt
+	 * confirms, at which point the confirmed attempt is adopted and this list
+	 * clears. Must survive disconnect AND restart. Optional for backward
+	 * compatibility (treated as empty).
+	 */
+	v2PreviousAttempts?: IV2InFlight[];
 	/** Dual-funding: commitment feerate in sat/kw (v2 only) */
 	commitmentFeeratePerkw: number;
 	/** Dual-funding: funding tx locktime (v2 only) */

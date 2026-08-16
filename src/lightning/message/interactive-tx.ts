@@ -9,8 +9,10 @@
  * tx_remove_output (69):[32:channel_id][8:serial_id]
  * tx_complete (70):    [32:channel_id]
  * tx_signatures (71):  [32:channel_id][32:txid][2:num_witnesses][witness...]
- * tx_init_rbf (72):    [32:channel_id][4:locktime][4:feerate]
- * tx_ack_rbf (73):     [32:channel_id]
+ * tx_init_rbf (72):    [32:channel_id][4:locktime][4:feerate][tlvs]
+ * tx_ack_rbf (73):     [32:channel_id][tlvs]
+ *   RBF tlvs: 0 = funding_output_contribution (s64 satoshis),
+ *             2 = require_confirmed_inputs (empty)
  * tx_abort (74):       [32:channel_id][2:len][data]
  */
 
@@ -71,10 +73,22 @@ export interface ITxInitRbfMessage {
 	channelId: Buffer;
 	locktime: number;
 	feerate: number;
+	/**
+	 * BOLT 2 `tx_init_rbf_tlvs.funding_output_contribution` (type 0, s64):
+	 * the satoshis this peer will contribute to the replacement's funding
+	 * output. Omitted = the sender is not contributing.
+	 */
+	fundingOutputContribution?: bigint;
+	/** BOLT 2 `tx_init_rbf_tlvs.require_confirmed_inputs` (type 2, empty). */
+	requireConfirmedInputs?: boolean;
 }
 
 export interface ITxAckRbfMessage {
 	channelId: Buffer;
+	/** BOLT 2 `tx_ack_rbf_tlvs.funding_output_contribution` (type 0, s64). */
+	fundingOutputContribution?: bigint;
+	/** BOLT 2 `tx_ack_rbf_tlvs.require_confirmed_inputs` (type 2, empty). */
+	requireConfirmedInputs?: boolean;
 }
 
 export interface ITxAbortMessage {
@@ -495,6 +509,51 @@ function encodeCompactSize(n: number): Buffer {
 
 // ---- tx_init_rbf (72) ----
 
+/** Encode the shared RBF TLV stream (types 0 and 2). */
+function encodeRbfTlvs(msg: {
+	fundingOutputContribution?: bigint;
+	requireConfirmedInputs?: boolean;
+}): Buffer {
+	const records = [];
+	if (msg.fundingOutputContribution !== undefined) {
+		const value = Buffer.alloc(8);
+		value.writeBigInt64BE(msg.fundingOutputContribution);
+		records.push({ type: 0n, value });
+	}
+	if (msg.requireConfirmedInputs) {
+		records.push({ type: 2n, value: Buffer.alloc(0) });
+	}
+	return records.length ? encodeTlvStream(records) : Buffer.alloc(0);
+}
+
+/** Decode the shared RBF TLV stream into the message's optional fields. */
+function decodeRbfTlvs(
+	payload: Buffer,
+	offset: number,
+	name: string
+): { fundingOutputContribution?: bigint; requireConfirmedInputs?: boolean } {
+	const result: {
+		fundingOutputContribution?: bigint;
+		requireConfirmedInputs?: boolean;
+	} = {};
+	if (offset >= payload.length) return result;
+	const { records } = decodeTlvStream(payload, offset);
+	for (const record of records) {
+		if (record.type === 0n) {
+			if (record.value.length !== 8) {
+				throw new Error(
+					`${name}: funding_output_contribution must be 8 bytes, ` +
+						`got ${record.value.length}`
+				);
+			}
+			result.fundingOutputContribution = record.value.readBigInt64BE();
+		} else if (record.type === 2n) {
+			result.requireConfirmedInputs = true;
+		}
+	}
+	return result;
+}
+
 /**
  * Encode a tx_init_rbf message payload (without 2-byte type prefix).
  */
@@ -508,7 +567,7 @@ export function encodeTxInitRbfMessage(msg: ITxInitRbfMessage): Buffer {
 	buf.writeUInt32BE(msg.locktime, 32);
 	buf.writeUInt32BE(msg.feerate, 36);
 
-	return buf;
+	return Buffer.concat([buf, encodeRbfTlvs(msg)]);
 }
 
 /**
@@ -525,7 +584,7 @@ export function decodeTxInitRbfMessage(payload: Buffer): ITxInitRbfMessage {
 	const locktime = payload.readUInt32BE(32);
 	const feerate = payload.readUInt32BE(36);
 
-	return { channelId, locktime, feerate };
+	return { channelId, locktime, feerate, ...decodeRbfTlvs(payload, 40, 'tx_init_rbf') };
 }
 
 // ---- tx_ack_rbf (73) ----
@@ -538,7 +597,7 @@ export function encodeTxAckRbfMessage(msg: ITxAckRbfMessage): Buffer {
 		throw new Error(`Channel ID must be 32 bytes, got ${msg.channelId.length}`);
 	}
 
-	return Buffer.from(msg.channelId);
+	return Buffer.concat([msg.channelId, encodeRbfTlvs(msg)]);
 }
 
 /**
@@ -553,7 +612,7 @@ export function decodeTxAckRbfMessage(payload: Buffer): ITxAckRbfMessage {
 
 	const channelId = Buffer.from(payload.subarray(0, 32));
 
-	return { channelId };
+	return { channelId, ...decodeRbfTlvs(payload, 32, 'tx_ack_rbf') };
 }
 
 // ---- tx_abort (74) ----
