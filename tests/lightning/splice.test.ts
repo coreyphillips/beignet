@@ -1750,6 +1750,15 @@ describe('Splice', function () {
 			expect(channel.isQuiescent()).to.be.true;
 		}
 
+		function quiesceAsResponder(channel: Channel): void {
+			// The peer initiates; we answer and become the non-initiator side,
+			// the side that legitimately RECEIVES splice_init (issue #372).
+			const channelId = channel.getChannelId()!;
+			const actions = channel.handleStfuMessage({ channelId, initiator: true });
+			expect(findSendAction(actions, MessageType.STFU)).to.exist;
+			expect(channel.isQuiescent()).to.be.true;
+		}
+
 		it('should reject splice when channel is not NORMAL', function () {
 			const openerBp = makeBasepoints(openerSeed);
 			const state = createOpenerState({
@@ -1829,7 +1838,7 @@ describe('Splice', function () {
 
 		it('should handle splice from remote (acceptor side)', function () {
 			const { acceptor } = makeNormalChannel();
-			quiesce(acceptor);
+			quiesceAsResponder(acceptor);
 
 			const channelId = acceptor.getChannelId()!;
 			const actions = acceptor.handleSplice({
@@ -1851,7 +1860,7 @@ describe('Splice', function () {
 			// both HTLC-frozen until a disconnect. The refusal must answer on
 			// the wire. Channel ID mismatch drives the session-validation arm.
 			const { acceptor } = makeNormalChannel();
-			quiesce(acceptor);
+			quiesceAsResponder(acceptor);
 
 			const actions = acceptor.handleSplice({
 				channelId: Buffer.alloc(32, 0xee),
@@ -1894,7 +1903,7 @@ describe('Splice', function () {
 		it('should route interactive-tx messages into the splice session (not reject them)', function () {
 			// Acceptor receives a splice and enters TX_NEGOTIATION.
 			const { acceptor } = makeNormalChannel();
-			quiesce(acceptor);
+			quiesceAsResponder(acceptor);
 			const channelId = acceptor.getChannelId()!;
 			acceptor.handleSplice({
 				channelId,
@@ -1969,7 +1978,7 @@ describe('Splice', function () {
 			// contribution while directing 400k of the shared capacity to its own
 			// output: the completion audit must reject the books.
 			const { acceptor } = makeNormalChannel();
-			quiesce(acceptor);
+			quiesceAsResponder(acceptor);
 			const channelId = acceptor.getChannelId()!;
 			acceptor.handleSplice({
 				channelId,
@@ -2002,7 +2011,7 @@ describe('Splice', function () {
 			// against a different splice txid. The negotiation must fail with
 			// tx_abort and the channel must keep operating on the existing funding.
 			const { acceptor } = makeNormalChannel();
-			quiesce(acceptor);
+			quiesceAsResponder(acceptor);
 			const channelId = acceptor.getChannelId()!;
 			acceptor.handleSplice({
 				channelId,
@@ -2027,7 +2036,7 @@ describe('Splice', function () {
 
 		it('tx_aborts a splice input spending a legacy output; the channel survives (S-2.H3)', function () {
 			const { acceptor } = makeNormalChannel();
-			quiesce(acceptor);
+			quiesceAsResponder(acceptor);
 			const channelId = acceptor.getChannelId()!;
 			acceptor.handleSplice({
 				channelId,
@@ -2286,7 +2295,7 @@ describe('Splice', function () {
 
 		it('should unwind the splice on peer tx_abort (channel returns to NORMAL)', function () {
 			const { acceptor } = makeNormalChannel();
-			quiesce(acceptor);
+			quiesceAsResponder(acceptor);
 			const channelId = acceptor.getChannelId()!;
 			acceptor.handleSplice({
 				channelId,
@@ -3037,7 +3046,7 @@ describe('Splice', function () {
 				.update(Buffer.from([0]))
 				.digest();
 			acceptor.setSigner(new ChannelSigner(acceptorFundingPriv));
-			quiesce(acceptor);
+			quiesceAsResponder(acceptor);
 			const channelId = acceptor.getChannelId()!;
 			const fundingTxid = acceptor.getFullState().fundingTxid!;
 			const openerBp = makeBasepoints(openerSeed);
@@ -4347,7 +4356,7 @@ describe('Splice', function () {
 
 				it('a peer tx_abort before the commitment round stays persist-free', function () {
 					const { acceptor } = makeNormalChannel();
-					quiesce(acceptor);
+					quiesceAsResponder(acceptor);
 					acceptor.handleSplice({
 						channelId: acceptor.getChannelId()!,
 						fundingPubkey: Buffer.alloc(33, 0x02),
@@ -4634,7 +4643,7 @@ describe('Splice', function () {
 
 				it('an inbound splice_init crossing our unacked abort is ignored', function () {
 					const { acceptor } = makeNormalChannel();
-					quiesce(acceptor);
+					quiesceAsResponder(acceptor);
 					(acceptor as any)._spliceAbortPending = true;
 					const actions = acceptor.handleSplice({
 						channelId: acceptor.getChannelId()!,
@@ -5109,6 +5118,8 @@ describe('Splice', function () {
 					expect(findSendAction(stfuActions, MessageType.STFU)).to.exist;
 					expect(acceptor.isQuiescent()).to.be.true;
 
+					const wallet = makeSpliceInWallet(100_000n);
+					acceptor.setSpliceInInputs([wallet.walletInput], wallet.changeScript);
 					const actions = acceptor.initiateSplice(100_000n, 253);
 					const error = findAction(actions, ChannelActionType.ERROR);
 					expect(error).to.exist;
@@ -5117,6 +5128,9 @@ describe('Splice', function () {
 					);
 					expect(findSendAction(actions, MessageType.SPLICE)).to.not.exist;
 					expect(acceptor.isQuiescent(), 'session untouched').to.be.true;
+					// The refused request's wallet configuration dies with it.
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					expect((acceptor as any)._spliceInInputs).to.be.null;
 				});
 
 				it('crossing splice requests converge on the funder over the wire', function () {
@@ -5154,6 +5168,57 @@ describe('Splice', function () {
 					// The funder's splice negotiated to completion on both sides.
 					expect(pair.opener.getFullState().spliceInFlight).to.not.be.null;
 					expect(pair.acceptor.getFullState().spliceInFlight).to.not.be.null;
+				});
+
+				it('the losing side clears its splice wallet configuration', function () {
+					// A real splice-in pledges wallet inputs before quiescence.
+					// The dropped request must not leave them attached: stale
+					// splice-in inputs would leak into the contributions of a
+					// later splice, and clearing them lets the wallet's pledge
+					// TTL free the coins.
+					const { acceptor } = makeNormalChannel();
+					const wallet = makeSpliceInWallet(100_000n);
+					acceptor.setSpliceInInputs([wallet.walletInput], wallet.changeScript);
+					acceptor.initiateSplice(100_000n, 253); // stfu out, pending parked
+					const actions = acceptor.handleStfuMessage({
+						channelId: acceptor.getChannelId()!,
+						initiator: true
+					});
+					expect(findAction(actions, ChannelActionType.ERROR)).to.exist;
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					expect((acceptor as any)._spliceInInputs).to.be.null;
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					expect((acceptor as any)._spliceOutDestination).to.be.null;
+				});
+
+				it('refuses splice_init from a peer that is not the quiescence initiator', function () {
+					// We initiated the quiescence session (the peer answered our
+					// stfu), so the peer must not drive a dependent protocol into
+					// it. BOLT 2 requires the receiver to fail such a splice_init;
+					// answer on the wire with tx_abort and unwind, matching the
+					// issue #371 refusal arms.
+					const { opener } = makeNormalChannel();
+					quiesce(opener);
+
+					const actions = opener.handleSplice({
+						channelId: opener.getChannelId()!,
+						fundingPubkey: Buffer.alloc(33, 0x02),
+						relativeSatoshis: 100_000n,
+						fundingFeeratePerkw: 253,
+						locktime: 0
+					});
+
+					const abortAction = findSendAction(actions, MessageType.TX_ABORT);
+					expect(abortAction, 'tx_abort answered the refusal').to.exist;
+					expect(findSendAction(actions, MessageType.SPLICE_ACK)).to.not.exist;
+					const err = findAction(actions, ChannelActionType.ERROR);
+					expect(err).to.exist;
+					expect(String(err.message)).to.contain(
+						'not the quiescence initiator'
+					);
+					expect(opener.isQuiescent(), 'quiescence unwound').to.be.false;
+					expect(opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(opener.getSpliceSession()).to.be.null;
 				});
 			});
 

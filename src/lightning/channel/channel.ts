@@ -7274,6 +7274,11 @@ export class Channel {
 			// quiescence, so no unwind is owed.
 			const lost = this._pendingSplice;
 			this._pendingSplice = null;
+			// The dead request's wallet configuration dies with it: stale
+			// splice-in inputs would otherwise leak into the contributions of
+			// a later splice (e.g. a splice-out), and clearing them lets the
+			// wallet's pledge TTL free the coins.
+			this._resetSpliceDriver();
 			if (!lost.cancelled) {
 				actions.push({
 					type: ChannelActionType.ERROR,
@@ -7410,6 +7415,9 @@ export class Channel {
 		// session.
 		if (this._quiescence.isQuiescent()) {
 			if (!this._quiescence.isInitiator()) {
+				// The refused request's wallet configuration dies with it
+				// (see the tie-break drop in handleStfuMessage).
+				this._resetSpliceDriver();
 				return [
 					{
 						type: ChannelActionType.ERROR,
@@ -7447,8 +7455,11 @@ export class Channel {
 		const stfuActions = this.initiateQuiescence();
 		// If quiescence couldn't be started (e.g. pending HTLCs), surface the
 		// error and drop the pending splice rather than leaving it dangling.
+		// Its wallet configuration dies with it (see the tie-break drop in
+		// handleStfuMessage).
 		if (stfuActions.some((a) => a.type === ChannelActionType.ERROR)) {
 			this._pendingSplice = null;
+			this._resetSpliceDriver();
 		}
 		return stfuActions;
 	}
@@ -7600,6 +7611,18 @@ export class Channel {
 		// peer's attempt when it lands, and its echo settles the exchange.
 		if (this._spliceAbortPending) {
 			return [];
+		}
+
+		// BOLT 2: only the quiescence initiator may initiate a dependent
+		// protocol. A splice_init from the side that merely answered our stfu
+		// (or lost the concurrent-stfu funder tie-break) violates the session;
+		// refuse on the wire rather than adopt a session the sender was not
+		// entitled to open.
+		if (this._quiescence.isInitiator()) {
+			return this.refuseSpliceInit(
+				'splice_init from quiescence non-initiator',
+				'Cannot accept splice: peer is not the quiescence initiator'
+			);
 		}
 
 		// Fresh negotiation, fresh tx_abort conversation (see _startSplice).

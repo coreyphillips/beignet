@@ -58,6 +58,13 @@ export class QuiescenceManager {
 	/**
 	 * Handle receiving STFU from peer.
 	 * Returns true if we should respond with our own STFU.
+	 *
+	 * Breaking change (issue #372): both arguments are new and required.
+	 * Without them the concurrent-stfu case left BOTH peers believing they
+	 * were the session initiator, so there is no safe default; direct
+	 * callers must supply the peer message's initiator flag and their own
+	 * funder role.
+	 *
 	 * @param peerInitiator - the initiator flag carried by the peer's stfu
 	 * @param localIsOpener - whether we are the channel funder (opener)
 	 */
