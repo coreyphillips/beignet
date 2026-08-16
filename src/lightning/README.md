@@ -256,8 +256,12 @@ const channel = node.openChannel(peerPubkey, 1_000_000n); // 1M sats
 //    it builds, signs and broadcasts the funding tx for you)
 const channelId = node.createFunding(channel, fundingTxid, outputIndex, signature);
 
-// 3. Confirm funding (after tx is mined)
+// 3. Confirm funding (after tx is mined). When the open was RBF'd
+//    (multiple funding attempts exist), the confirmed txid is REQUIRED:
+//    pass it in display byte order so the right attempt is adopted; an
+//    ambiguous call is refused.
 node.handleFundingConfirmed(channelId);
+node.handleFundingConfirmed(channelId, confirmedTxidHex); // after an RBF
 // Emits 'channel:ready' when both sides confirm
 
 // 4. Normal operation: send/receive HTLCs

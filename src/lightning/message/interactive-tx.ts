@@ -526,6 +526,10 @@ function encodeRbfTlvs(msg: {
 	return records.length ? encodeTlvStream(records) : Buffer.alloc(0);
 }
 
+/** The RBF TLV types both messages understand (BOLT 1: an unknown EVEN
+ *  type must fail the parse; odd types are ignorable). */
+const RBF_KNOWN_TLV_TYPES = new Set([0n, 2n]);
+
 /** Decode the shared RBF TLV stream into the message's optional fields. */
 function decodeRbfTlvs(
 	payload: Buffer,
@@ -537,7 +541,7 @@ function decodeRbfTlvs(
 		requireConfirmedInputs?: boolean;
 	} = {};
 	if (offset >= payload.length) return result;
-	const { records } = decodeTlvStream(payload, offset);
+	const { records } = decodeTlvStream(payload, offset, RBF_KNOWN_TLV_TYPES);
 	for (const record of records) {
 		if (record.type === 0n) {
 			if (record.value.length !== 8) {
@@ -548,6 +552,12 @@ function decodeRbfTlvs(
 			}
 			result.fundingOutputContribution = record.value.readBigInt64BE();
 		} else if (record.type === 2n) {
+			if (record.value.length !== 0) {
+				throw new Error(
+					`${name}: require_confirmed_inputs must be empty, ` +
+						`got ${record.value.length} bytes`
+				);
+			}
 			result.requireConfirmedInputs = true;
 		}
 	}

@@ -482,6 +482,31 @@ describe('Interactive TX Construction', function () {
 			]);
 			expect(() => decodeTxInitRbfMessage(bad)).to.throw('must be 8 bytes');
 		});
+
+		it('fails on an unknown EVEN TLV and a non-empty require_confirmed_inputs (BOLT 1)', function () {
+			// Unknown even type 4, empty value: even = mandatory = must fail.
+			const unknownEven = Buffer.concat([
+				encodeTxInitRbfMessage(sampleMsg),
+				Buffer.from([0x04, 0x00])
+			]);
+			expect(() => decodeTxInitRbfMessage(unknownEven)).to.throw(
+				'Unknown required TLV type'
+			);
+			// require_confirmed_inputs (type 2) carries no value.
+			const fatType2 = Buffer.concat([
+				encodeTxInitRbfMessage(sampleMsg),
+				Buffer.from([0x02, 0x01, 0xff])
+			]);
+			expect(() => decodeTxInitRbfMessage(fatType2)).to.throw('must be empty');
+			// Unknown ODD types stay ignorable ("it's ok to be odd").
+			const unknownOdd = Buffer.concat([
+				encodeTxInitRbfMessage(sampleMsg),
+				Buffer.from([0x05, 0x01, 0xaa])
+			]);
+			const decoded = decodeTxInitRbfMessage(unknownOdd);
+			expect(decoded.feerate).to.equal(sampleMsg.feerate);
+			expect(decoded.fundingOutputContribution).to.equal(undefined);
+		});
 	});
 
 	describe('Message: tx_ack_rbf (73)', function () {
@@ -528,6 +553,28 @@ describe('Interactive TX Construction', function () {
 			const bare = decodeTxAckRbfMessage(encodeTxAckRbfMessage({ channelId }));
 			expect(bare.fundingOutputContribution).to.equal(undefined);
 			expect(bare.requireConfirmedInputs).to.equal(undefined);
+		});
+
+		it('fails on an unknown EVEN TLV and a non-empty require_confirmed_inputs (BOLT 1)', function () {
+			const unknownEven = Buffer.concat([
+				encodeTxAckRbfMessage({ channelId }),
+				Buffer.from([0x04, 0x00])
+			]);
+			expect(() => decodeTxAckRbfMessage(unknownEven)).to.throw(
+				'Unknown required TLV type'
+			);
+			const fatType2 = Buffer.concat([
+				encodeTxAckRbfMessage({ channelId }),
+				Buffer.from([0x02, 0x01, 0xff])
+			]);
+			expect(() => decodeTxAckRbfMessage(fatType2)).to.throw('must be empty');
+			const unknownOdd = Buffer.concat([
+				encodeTxAckRbfMessage({ channelId }),
+				Buffer.from([0x05, 0x01, 0xaa])
+			]);
+			expect(
+				decodeTxAckRbfMessage(unknownOdd).channelId.equals(channelId)
+			).to.equal(true);
 		});
 	});
 

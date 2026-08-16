@@ -224,6 +224,14 @@ interface IFailedFundingWatch {
 	outputIndex: number;
 	minimumDepth: number;
 	scriptPubkey: Buffer;
+	/**
+	 * The full candidate set of the failed watch (post-signatures RBF): the
+	 * retry must re-arm ALL of it, or one transient subscription failure
+	 * would silently narrow the watch to the current attempt and a mined
+	 * older candidate would go unseen (and feed the funding-missing
+	 * watchdog instead).
+	 */
+	candidates?: Array<{ txid: string; outputIndex: number }>;
 }
 
 /** A failed output watch queued for retry */
@@ -399,7 +407,9 @@ export class ChainWatcher extends EventEmitter {
 					w.txid,
 					w.outputIndex,
 					w.minimumDepth,
-					w.scriptPubkey
+					w.scriptPubkey,
+					undefined,
+					w.candidates
 				).catch(() => {
 					/* re-queued inside watchFundingOutput */
 				});
@@ -533,7 +543,12 @@ export class ChainWatcher extends EventEmitter {
 					txid,
 					outputIndex,
 					minimumDepth,
-					scriptPubkey
+					scriptPubkey,
+					// Defensive copy: the retry must re-arm the full candidate
+					// set, and the caller's array must not mutate under it.
+					candidates: candidates?.length
+						? candidates.map((c) => ({ ...c }))
+						: undefined
 				});
 			}
 			return;
@@ -863,7 +878,9 @@ export class ChainWatcher extends EventEmitter {
 					watch.txid,
 					watch.outputIndex,
 					watch.minimumDepth,
-					watch.scriptPubkey
+					watch.scriptPubkey,
+					undefined,
+					watch.candidates
 				).catch(() => {
 					// Still failing — already re-queued inside watchFundingOutput
 				});

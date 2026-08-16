@@ -2209,6 +2209,63 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
 	});
 
+	it('a channel_ready received mid-renegotiation abandons the RBF attempt and is processed (issue 360 review)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const acked = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(
+			findError(
+				h.opener.handleTxAckRbf(
+					decodeTxAckRbfMessage(findPayload(acked, MessageType.TX_ACK_RBF)!)
+				)
+			)
+		).to.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+
+		// Peer-first confirmation race: the acceptor confirmed and readied;
+		// its channel_ready reaches the still-renegotiating opener. BOLT 2:
+		// a valid channel_ready mid-RBF abandons the attempt.
+		const accActions = h.acceptor.fundingConfirmed();
+		const readyMsg = findPayload(accActions, MessageType.CHANNEL_READY);
+		expect(readyMsg).to.not.equal(null);
+		const processed = h.opener.handleChannelReady(
+			decodeChannelReadyMessage(readyMsg!)
+		);
+		expect(findError(processed), 'not "Unexpected channel_ready"').to.equal(
+			null
+		);
+		expect(
+			findPayload(processed, MessageType.TX_ABORT),
+			'the RBF attempt is abandoned on the wire'
+		).to.not.equal(null);
+		const st = h.opener.getFullState();
+		expect(st.remoteChannelReady).to.equal(true);
+		expect(st.v2InFlight!.rbfAttempt).to.equal(0);
+		expect(st.dualFundingSession!.getRbfCount()).to.equal(0);
+		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_CHANNEL_READY);
+	});
+
+	it('an unencodable RBF request never installs the pending latch (issue 360 review)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		// locktime -1 fails the u32 encode; the request must die BEFORE the
+		// pending latch is installed, or every later request is refused as
+		// "already pending" until disconnect.
+		const bad = h.opener.initiateTxRbf(2000, -1);
+		expect(findError(bad)).to.contain('cannot RBF');
+		expect(findPayload(bad, MessageType.TX_INIT_RBF)).to.equal(null);
+		const good = h.opener.initiateTxRbf(2000);
+		expect(findError(good), 'the latch stayed clean').to.equal(null);
+		expect(findPayload(good, MessageType.TX_INIT_RBF)).to.not.equal(null);
+	});
+
 	it('refuses a changed funding_output_contribution attempt-scoped, in both directions (issue 360)', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
@@ -4248,6 +4305,19 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 	it('adopts the SUPERSEDED attempt when it wins the race to depth (issue 360)', async function () {
 		const t = await driveSpecWindowRbf(105, 106);
 		try {
+			// Each attempt's commitment signs a different funding outpoint:
+			// the adoption must also activate the ADOPTED attempt's commitment
+			// signature, or forceClose would broadcast a commitment spending
+			// an output that can never exist (review finding).
+			const sides = [t.channel, t.acceptorChannel];
+			const adoptedSigs = sides.map((side) =>
+				Buffer.from(
+					side.getFullState().v2PreviousAttempts![0].remoteCommitmentSig!
+				)
+			);
+			const replacementSigs = sides.map((side) =>
+				Buffer.from(side.getFullState().remoteCommitmentSignature!)
+			);
 			const oldTxidHex = Buffer.from(t.attempt0Txid).reverse().toString('hex');
 			managerOf(t.opener).handleFundingConfirmed(t.channelId, oldTxidHex);
 			managerOf(t.acceptor).handleFundingConfirmed(t.channelId, oldTxidHex);
@@ -4256,7 +4326,7 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 					t.channel.getState() === ChannelState.NORMAL &&
 					t.acceptorChannel.getState() === ChannelState.NORMAL
 			);
-			for (const side of [t.channel, t.acceptorChannel]) {
+			for (const [i, side] of sides.entries()) {
 				const st = side.getFullState();
 				expect(st.state).to.equal(ChannelState.NORMAL);
 				expect(
@@ -4266,6 +4336,14 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 				expect(st.fundingOutputIndex).to.be.a('number');
 				expect(st.v2PreviousAttempts ?? []).to.have.length(0);
 				expect(st.v2InFlight).to.equal(null);
+				expect(
+					st.remoteCommitmentSignature!.equals(adoptedSigs[i]),
+					"the ADOPTED attempt's commitment signature is active"
+				).to.be.true;
+				expect(
+					st.remoteCommitmentSignature!.equals(replacementSigs[i]),
+					"the replacement's signature was replaced"
+				).to.be.false;
 			}
 		} finally {
 			t.opener.destroy();
@@ -4284,6 +4362,15 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			const revived = new Channel(deserializeChannelState(json));
 			revived.restoreV2InFlight();
 			expect(revived.getFullState().v2PreviousAttempts).to.have.length(1);
+			const adoptedSig = Buffer.from(
+				revived.getFullState().v2PreviousAttempts![0].remoteCommitmentSig!
+			);
+			// A confirmation that does not say WHICH attempt is ambiguous with
+			// candidates tracked: refused, nothing guessed, nothing mutated
+			// (review finding).
+			const ambiguous = revived.fundingConfirmed();
+			expect(findError(ambiguous)).to.contain('ambiguous');
+			expect(revived.getFullState().v2PreviousAttempts).to.have.length(1);
 			const adoption = revived.fundingConfirmed(t.attempt0Txid);
 			expect(findError(adoption)).to.equal(null);
 			expect(
@@ -4295,6 +4382,104 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			expect(st.v2InFlight!.fundingTxid.equals(t.attempt0Txid)).to.be.true;
 			expect(st.v2PreviousAttempts ?? []).to.have.length(0);
 			expect(st.state).to.equal(ChannelState.AWAITING_CHANNEL_READY);
+			expect(
+				st.remoteCommitmentSignature!.equals(adoptedSig),
+				"the adopted attempt's commitment signature is active"
+			).to.be.true;
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('a force-closed open adopts a confirmed superseded attempt and re-drives the close (issue 360 review)', async function () {
+		const t = await driveSpecWindowRbf(109, 110);
+		try {
+			const adoptedSig = Buffer.from(
+				t.channel.getFullState().v2PreviousAttempts![0].remoteCommitmentSig!
+			);
+			// Force-close while every attempt is unconfirmed: the broadcast
+			// commitment spends attempt 1's funding output.
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const closed = t.opener.forceCloseChannel(t.channelId, dest);
+			expect(closed.ok, closed.error).to.equal(true);
+			expect(t.channel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+
+			// Attempt 0 wins the race to depth: the close just broadcast can
+			// never confirm. The channel must adopt the confirmed attempt and
+			// the node must re-drive the close against it.
+			const oldTxidHex = Buffer.from(t.attempt0Txid).reverse().toString('hex');
+			managerOf(t.opener).handleFundingConfirmed(t.channelId, oldTxidHex);
+			// The watcher's confirmation callback (manager first, then the
+			// node handler) drives the re-drive in production; invoke the
+			// handler the same way here (no chain watcher in this fixture).
+			(
+				t.opener as unknown as {
+					onFundingWatchConfirmed(id: Buffer, txid?: string): void;
+				}
+			).onFundingWatchConfirmed(t.channelId, oldTxidHex);
+			const idHex = t.channelId.toString('hex');
+			await settle(
+				() =>
+					(
+						t.opener as unknown as {
+							_lastCloseBroadcast: Map<string, { txid: string }>;
+						}
+					)._lastCloseBroadcast.get(idHex) !== undefined
+			);
+
+			const st = t.channel.getFullState();
+			expect(st.state, 'the terminal state is kept').to.equal(
+				ChannelState.FORCE_CLOSED
+			);
+			expect(st.fundingTxid!.equals(t.attempt0Txid)).to.be.true;
+			expect(st.v2InFlight!.confirmed).to.equal(true);
+			expect(st.v2PreviousAttempts ?? []).to.have.length(0);
+			expect(
+				st.remoteCommitmentSignature!.equals(adoptedSig),
+				"the adopted attempt's commitment signature is active"
+			).to.be.true;
+
+			// The re-driven close spends the ADOPTED funding outpoint.
+			const rebuilt = managerOf(t.opener).rebuildForceCloseCommitment(
+				t.channelId,
+				5
+			);
+			expect(rebuilt.ok, rebuilt.error).to.equal(true);
+			const closeTx = bitcoin.Transaction.fromBuffer(rebuilt.tx!);
+			expect(closeTx.ins).to.have.length(1);
+			expect(
+				Buffer.from(closeTx.ins[0].hash).equals(t.attempt0Txid),
+				'the close spends the funding that is actually on chain'
+			).to.be.true;
+			expect(closeTx.ins[0].index).to.equal(st.fundingOutputIndex);
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('rbfOpenChannelV2 validates u32 inputs before touching the channel (issue 360 review)', async function () {
+		const t = await driveSpecWindowRbf(111, 112);
+		try {
+			expect(() => t.opener.rbfOpenChannelV2(t.channelId, 4000, -1)).to.throw(
+				'u32'
+			);
+			expect(() => t.opener.rbfOpenChannelV2(t.channelId, 2 ** 32)).to.throw(
+				'u32'
+			);
+			// Nothing was poisoned: the next valid bump goes through.
+			const ok = t.opener.rbfOpenChannelV2(t.channelId, 4000);
+			expect(ok.ok, ok.error).to.equal(true);
+			await settle(
+				() =>
+					t.channel.getFullState().v2InFlight?.rbfAttempt === 2 &&
+					!!t.channel.getFullState().v2InFlight?.fullySigned
+			);
+			expect(t.channel.getFullState().v2PreviousAttempts).to.have.length(2);
 		} finally {
 			t.opener.destroy();
 			t.acceptor.destroy();

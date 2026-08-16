@@ -6460,6 +6460,25 @@ export class LightningNode extends EventEmitter {
 			retired = channel.clearRetainedFundingPayload() || retired;
 			this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
 		}
+		// A v2 open force-closed before confirmation whose SUPERSEDED RBF
+		// attempt then won the race: the channel adopted that attempt (and
+		// stamped its record confirmed in the same persist), so the broadcast
+		// commitment spends a funding output that can never exist. Rebuild
+		// and rebroadcast the close against the adopted funding, on the same
+		// machinery as the confirmed-splice re-drive (issue #360).
+		if (
+			channel.getState() === ChannelState.FORCE_CLOSED &&
+			state.fundingVersion === 2 &&
+			!state.spliceInFlight &&
+			state.v2InFlight?.confirmed === true &&
+			confirmedTxid !== undefined &&
+			Buffer.from(state.v2InFlight.fundingTxid).reverse().toString('hex') ===
+				confirmedTxid
+		) {
+			if (retired) this.persistChannel(channelId);
+			void this.redriveSpliceAdoptedClose(channelId);
+			return;
+		}
 		const inflight = state.spliceInFlight;
 		const spliceConfirmed =
 			inflight != null &&
@@ -8427,10 +8446,14 @@ export class LightningNode extends EventEmitter {
 				// record still awaits adoption, retry each block instead of
 				// dropping the re-drive.
 				const ch = this.channelManager.getChannel(channelId);
-				if (
-					rebuilt.retryable === true &&
-					ch?.getFullState().spliceInFlight?.confirmed === true
-				) {
+				const chState = ch?.getFullState();
+				const confirmedAdoption =
+					chState?.spliceInFlight?.confirmed === true ||
+					// A v2 RBF candidate adoption (issue #360) re-drives on the
+					// same machinery and retries the same way.
+					(chState?.fundingVersion === 2 &&
+						chState.v2InFlight?.confirmed === true);
+				if (rebuilt.retryable === true && confirmedAdoption) {
 					this._pendingSpliceCloseRedrives.add(idHex);
 				}
 				this.emitStructuredLog('chain', 'splice_close_redrive_refused', {
@@ -8585,10 +8608,23 @@ export class LightningNode extends EventEmitter {
 	): { ok: boolean; error?: string } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
-		if (!Number.isInteger(fundingFeeratePerkw) || fundingFeeratePerkw <= 0) {
+		// Both integers ride u32 wire fields: validate BEFORE anything on the
+		// channel can mutate, so an out-of-range value cannot poison the
+		// pending-request latch.
+		if (
+			!Number.isInteger(fundingFeeratePerkw) ||
+			fundingFeeratePerkw <= 0 ||
+			fundingFeeratePerkw > 0xffffffff
+		) {
 			throw new Error(
-				`fundingFeeratePerkw must be a positive integer, got ${fundingFeeratePerkw}`
+				`fundingFeeratePerkw must be a u32 greater than zero, got ${fundingFeeratePerkw}`
 			);
+		}
+		if (
+			locktime !== undefined &&
+			(!Number.isInteger(locktime) || locktime < 0 || locktime > 0xffffffff)
+		) {
+			throw new Error(`locktime must be a u32, got ${locktime}`);
 		}
 		const result = this.channelManager.initiateFundingRbf(
 			channelId,
