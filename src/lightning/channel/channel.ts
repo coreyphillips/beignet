@@ -7471,12 +7471,14 @@ export class Channel {
 	 * QUIESCENT: both HTLC-frozen until a disconnect. Instead, exit the
 	 * quiescence the stfu handshake established and answer tx_abort so the
 	 * initiator's splice unwind resumes normal operation on both sides. The
-	 * local ERROR surface is kept for the operator.
+	 * local ERROR surface is kept for the operator. Public because the
+	 * manager's feature-negotiation refusal (peer never advertised
+	 * option_splice) must route through the same unwind: quiescence and the
+	 * tx_abort latch are channel state the manager cannot compose itself.
+	 * Safe in any channel state: exitQuiescence is a no-op when not
+	 * quiescent, and the tx_abort latch matches what just went on the wire.
 	 */
-	private _refuseSpliceInit(
-		wireReason: string,
-		errorMessage: string
-	): ChannelAction[] {
+	refuseSpliceInit(wireReason: string, errorMessage: string): ChannelAction[] {
 		this._quiescence.exitQuiescence();
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
@@ -7521,7 +7523,7 @@ export class Channel {
 		// handshake already established so this side resumes normal operation
 		// instead of sitting silently quiescent on a splice it rejected.
 		if (isTaprootChannel(this._state.channelType)) {
-			return this._refuseSpliceInit(
+			return this.refuseSpliceInit(
 				'taproot splicing unsupported',
 				'Cannot accept splice: taproot (MuSig2) channels do not support splicing yet'
 			);
@@ -7530,7 +7532,7 @@ export class Channel {
 		if (!this._state.channelId) {
 			// No tx_abort can be composed without a channel ID, but the local
 			// quiescence unwind must still run.
-			return this._refuseSpliceInit(
+			return this.refuseSpliceInit(
 				'no channel ID',
 				'Cannot accept splice: no channel ID'
 			);
@@ -7562,7 +7564,7 @@ export class Channel {
 
 		if (!result.ok) {
 			this._spliceSession = null;
-			return this._refuseSpliceInit(result.error!, result.error!);
+			return this.refuseSpliceInit(result.error!, result.error!);
 		}
 
 		// The combined contributions must not grow the channel past the funding
@@ -7571,7 +7573,7 @@ export class Channel {
 			this._state.fundingSatoshis + this._spliceSession.getNetCapacityChange();
 		if (postSpliceCapacity > this._maxFundingSatoshis) {
 			this._spliceSession = null;
-			return this._refuseSpliceInit(
+			return this.refuseSpliceInit(
 				'post-splice capacity exceeds maximum',
 				`Cannot accept splice: post-splice capacity ${postSpliceCapacity} exceeds maximum ${this._maxFundingSatoshis}`
 			);
