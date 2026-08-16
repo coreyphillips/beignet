@@ -7358,8 +7358,10 @@ export class Channel {
 
 		// A fresh negotiation opens a fresh tx_abort conversation: an abort of
 		// THIS session deserves its echo even if an earlier one on this
-		// connection was already answered.
+		// connection was already answered, and a swallow-latch left by a prior
+		// session's unanswered abort must not eat this session's abort.
 		this._txAbortSent = false;
+		this._spliceAbortPending = false;
 		this._spliceSession = new SpliceSession(params);
 		const result = this._spliceSession.initiate();
 
@@ -7448,7 +7450,9 @@ export class Channel {
 			locktime: msg.locktime
 		};
 
+		// Fresh negotiation, fresh tx_abort conversation (see _startSplice).
 		this._txAbortSent = false;
+		this._spliceAbortPending = false;
 		this._spliceSession = new SpliceSession(params);
 		const result = this._spliceSession.handleSplice(msg);
 
@@ -8308,6 +8312,75 @@ export class Channel {
 		this._state.spliceInFlight = null;
 
 		return [];
+	}
+
+	/**
+	 * Operator-initiated splice abort (the ChannelManager.abortSplice path).
+	 * Wraps abortSplice() with the durable unwind the peer-driven arms compose
+	 * (issue #366): a leading PERSIST_STATE when an in-flight record was
+	 * cleared (the record was persisted at the commitment round, so a crash
+	 * would otherwise resurrect the aborted splice via restoreSpliceInFlight),
+	 * plus a tx_abort so the peer forgets the splice too. The send stays out
+	 * of abortSplice() itself: its message-handler callers emit their own
+	 * tx_abort and must not double-send.
+	 */
+	initiateSpliceAbort(reason?: string): ChannelAction[] {
+		const hadRecord = !!this._state.spliceInFlight;
+		const hadSession = !!this._spliceSession;
+		const wasAwaitingReestablish =
+			this._state.state === ChannelState.AWAITING_REESTABLISH;
+
+		const unwind = this.abortSplice(reason);
+		// Refusal arms (nothing to abort, or past the point of no return)
+		// mutate nothing and keep the record: nothing to persist or send.
+		if (unwind.some((a) => a.type === ChannelActionType.ERROR)) {
+			return unwind;
+		}
+		// A pending-splice cancel: quiescence was never reached, so splice_init
+		// never left and nothing is on disk. The peer has no splice to forget.
+		if (!hadSession && !hadRecord) {
+			return unwind;
+		}
+
+		const actions: ChannelAction[] = [];
+		if (hadRecord && !this._state.spliceInFlight) {
+			// Leads any send so the manager's persist-before-send gate binds
+			// the tx_abort's wire bytes into the same persist transaction.
+			actions.push({ type: ChannelActionType.PERSIST_STATE });
+		}
+
+		if (wasAwaitingReestablish) {
+			// Disconnected. The unwind arms route the restored state through
+			// _state.state, but while marked for reestablish the live slot is
+			// preReestablishState: _state.state must stay AWAITING_REESTABLISH
+			// (the manager only initiates reestablish for channels in it), and
+			// a stale SPLICING left in preReestablishState would restore a
+			// spliceless SPLICING when reestablish completes.
+			const target =
+				this._state.state !== ChannelState.AWAITING_REESTABLISH
+					? this._state.state
+					: this._state.preSpliceState ?? ChannelState.NORMAL;
+			this._state.preSpliceState = null;
+			this._state.preReestablishState =
+				target === ChannelState.SPLICING ? ChannelState.NORMAL : target;
+			this._state.state = ChannelState.AWAITING_REESTABLISH;
+			// No peer to send to: queue the forget instead. The reestablish
+			// builder turns it into a tx_abort ordered BEFORE our
+			// channel_reestablish, the ordering CLN requires.
+			this._forgottenSplice = true;
+		} else if (this._state.channelId) {
+			// The peer holds the splice live (splice_init at least crossed, or
+			// a commitment-round record exists): tell it to forget. Its echo
+			// is swallowed one-shot by the _spliceAbortPending arm of
+			// handleTxAbort; while the latch is set the manager also treats a
+			// remote error as part of the abort exchange (isSpliceAbortPending).
+			// A peer whose tx_signatures already left (unknowable here) will
+			// echo but spec-correctly refuse the unwind and retain the splice.
+			this._spliceAbortPending = true;
+			actions.push(this._txAbort(this._state.channelId, reason));
+		}
+
+		return actions;
 	}
 
 	/**

@@ -4337,6 +4337,266 @@ describe('Splice', function () {
 				});
 			});
 
+			describe('operator splice abort durable unwind (issue #366)', function () {
+				/** Both sides parked in the exposure window: dropping every
+				 *  commitment_signed leaves each side with the record it created
+				 *  when its OWN splice commitment left, and neither ever reaches
+				 *  the tx_signatures stage. */
+				function makeBilateralWindowPair(): IWirePair {
+					const pair = makeWirePair();
+					pair.drop(MessageType.COMMITMENT_SIGNED);
+					startSpliceOut(pair);
+					for (const ch of [pair.opener, pair.acceptor]) {
+						const record = ch.getFullState().spliceInFlight;
+						expect(record, 'in-flight record exists').to.not.be.null;
+						expect(record!.sentTxSignatures).to.be.false;
+						expect(record!.receivedTxSignatures).to.be.false;
+					}
+					return pair;
+				}
+
+				it('persists the unwind ahead of the tx_abort send', function () {
+					const pair = makeBilateralWindowPair();
+					const actions = pair.opener.initiateSpliceAbort('operator requested');
+
+					const persistIndex = actions.findIndex(
+						(a) => a.type === ChannelActionType.PERSIST_STATE
+					);
+					const abortIndex = actions.findIndex(
+						(a) =>
+							a.type === ChannelActionType.SEND_MESSAGE &&
+							(a as { messageType: MessageType }).messageType ===
+								MessageType.TX_ABORT
+					);
+					expect(persistIndex, 'unwind persisted').to.not.equal(-1);
+					expect(abortIndex, 'peer told to forget').to.not.equal(-1);
+					expect(persistIndex, 'persist leads the send').to.be.lessThan(
+						abortIndex
+					);
+					expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.opener.getFullState().spliceInFlight).to.be.null;
+					expect(pair.opener.getSpliceSession()).to.be.null;
+				});
+
+				it('both sides forget when neither has sent tx_signatures', function () {
+					const pair = makeBilateralWindowPair();
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.initiateSpliceAbort('operator requested')
+					);
+					pair.pump();
+
+					for (const ch of [pair.opener, pair.acceptor]) {
+						expect(ch.getState()).to.equal(ChannelState.NORMAL);
+						expect(ch.getFullState().spliceInFlight).to.be.null;
+						expect(ch.getSpliceSession()).to.be.null;
+					}
+					expect(pair.errors).to.be.empty;
+					expect(pair.opener.isSpliceAbortPending(), 'echo consumed').to.be
+						.false;
+				});
+
+				it('a peer whose tx_signatures already left refuses the unwind and keeps the splice', function () {
+					// Same window as the #356 fixture: the acceptor's tx_signatures
+					// were lost on the wire, so it is past its own point of no
+					// return while we never sent ours.
+					const pair = makeWirePair();
+					pair.drop(MessageType.TX_SIGNATURES);
+					startSpliceOut(pair);
+					const record = pair.opener.getFullState().spliceInFlight;
+					expect(record!.sentTxSignatures).to.be.false;
+					expect(record!.receivedTxSignatures).to.be.false;
+					expect(
+						pair.acceptor.getFullState().spliceInFlight!.sentTxSignatures,
+						'acceptor already sent'
+					).to.be.true;
+
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.initiateSpliceAbort('operator requested')
+					);
+					pair.pump();
+
+					// We unwound durably; the peer spec-correctly echoed but kept
+					// the splice (it cannot verify our signature never left).
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.opener.getFullState().spliceInFlight).to.be.null;
+					expect(pair.opener.isSpliceAbortPending(), 'echo consumed').to.be
+						.false;
+					expect(pair.acceptor.getState()).to.equal(ChannelState.SPLICING);
+					expect(pair.acceptor.getFullState().spliceInFlight).to.not.be.null;
+					expect(pair.errors.length).to.equal(1);
+					expect(pair.errors[0]).to.include('Cannot abort splice');
+				});
+
+				it('the persisted unwind does not resurrect the splice across a restart', function () {
+					const pair = makeBilateralWindowPair();
+
+					let disk = JSON.parse(
+						JSON.stringify(serializeChannelState(pair.opener.getFullState()))
+					);
+					const actions = pair.opener.initiateSpliceAbort('operator requested');
+					// Manager contract: only a PERSIST_STATE action commits the
+					// state as of its dispatch. Without one, disk keeps the record.
+					if (actions.some((a) => a.type === ChannelActionType.PERSIST_STATE)) {
+						disk = JSON.parse(
+							JSON.stringify(serializeChannelState(pair.opener.getFullState()))
+						);
+					}
+
+					const restoredState = deserializeChannelState(disk);
+					expect(restoredState.spliceInFlight, 'no record on disk').to.be.null;
+
+					const restored = new Channel(restoredState);
+					restored.restoreSpliceInFlight();
+					restored.markForReestablish();
+					expect(restored.getSpliceSession(), 'nothing resurrected').to.be.null;
+					const re = findSendAction(
+						restored.createReestablish(),
+						MessageType.CHANNEL_REESTABLISH
+					);
+					expect(
+						decodeChannelReestablishMessage(re.payload).nextFundingTxid,
+						'no forgotten splice advertised'
+					).to.be.undefined;
+				});
+
+				it('a pre-commitment abort sends tx_abort but stays persist-free', function () {
+					const { opener } = makeNormalChannel();
+					quiesce(opener);
+					opener.initiateSplice(100_000n, 253);
+					expect(opener.getState()).to.equal(ChannelState.SPLICING);
+					expect(opener.getFullState().spliceInFlight).to.be.null;
+
+					const actions = opener.initiateSpliceAbort('operator requested');
+					expect(
+						findSendAction(actions, MessageType.TX_ABORT),
+						'peer told to forget'
+					).to.exist;
+					expect(
+						findAction(actions, ChannelActionType.PERSIST_STATE),
+						'nothing durable to unwind'
+					).to.not.exist;
+					expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+					expect(opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(opener.getSpliceSession()).to.be.null;
+				});
+
+				it('cancelling a splice still awaiting quiescence stays silent', function () {
+					const { opener } = makeNormalChannel();
+					opener.initiateSplice(100_000n, 253); // stfu out, quiescence pending
+					expect(opener.getState()).to.equal(ChannelState.NORMAL);
+
+					const actions = opener.initiateSpliceAbort('operator requested');
+					// splice_init never left: the peer has no splice to forget and
+					// nothing is on disk.
+					expect(actions).to.be.empty;
+					expect(opener.getState()).to.equal(ChannelState.NORMAL);
+				});
+
+				it('an abort while disconnected keeps the reestablish machinery intact', function () {
+					const pair = makeBilateralWindowPair();
+					disconnect(pair);
+
+					const actions = pair.opener.initiateSpliceAbort('operator requested');
+					expect(
+						findAction(actions, ChannelActionType.PERSIST_STATE),
+						'unwind persisted'
+					).to.exist;
+					expect(
+						actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE),
+						'no send into the void'
+					).to.be.false;
+					// The live state slot while marked for reestablish is
+					// preReestablishState: state must stay AWAITING_REESTABLISH (the
+					// manager only initiates reestablish for channels in it) and the
+					// unwound target replaces the stale SPLICING.
+					expect(pair.opener.getState()).to.equal(
+						ChannelState.AWAITING_REESTABLISH
+					);
+					expect(pair.opener.getFullState().preReestablishState).to.equal(
+						ChannelState.NORMAL
+					);
+					expect(pair.opener.getFullState().spliceInFlight).to.be.null;
+					expect(pair.opener.getSpliceSession()).to.be.null;
+
+					// The queued forget goes out BEFORE our channel_reestablish,
+					// which no longer advertises the splice.
+					const openerRe = pair.opener.createReestablish();
+					const abortIndex = openerRe.findIndex(
+						(a) =>
+							a.type === ChannelActionType.SEND_MESSAGE &&
+							(a as { messageType: MessageType }).messageType ===
+								MessageType.TX_ABORT
+					);
+					const reIndex = openerRe.findIndex(
+						(a) =>
+							a.type === ChannelActionType.SEND_MESSAGE &&
+							(a as { messageType: MessageType }).messageType ===
+								MessageType.CHANNEL_REESTABLISH
+					);
+					expect(abortIndex, 'forget queued for the reconnect').to.not.equal(
+						-1
+					);
+					expect(abortIndex, 'tx_abort precedes reestablish').to.be.lessThan(
+						reIndex
+					);
+					expect(
+						decodeChannelReestablishMessage(
+							(openerRe[reIndex] as { payload: Buffer }).payload
+						).nextFundingTxid,
+						'no forgotten splice advertised'
+					).to.be.undefined;
+
+					// A full reconnect settles both sides on NORMAL with no splice.
+					const acceptorRe = pair.acceptor.createReestablish();
+					pair.enqueue(pair.acceptor, pair.opener, openerRe);
+					pair.enqueue(pair.opener, pair.acceptor, acceptorRe);
+					pair.pump();
+					for (const ch of [pair.opener, pair.acceptor]) {
+						expect(ch.getState()).to.equal(ChannelState.NORMAL);
+						expect(ch.getFullState().spliceInFlight).to.be.null;
+						expect(ch.getSpliceSession()).to.be.null;
+					}
+					expect(pair.errors).to.be.empty;
+				});
+
+				it('a second operator abort is a plain refusal', function () {
+					const pair = makeBilateralWindowPair();
+					pair.opener.initiateSpliceAbort('operator requested');
+
+					const again = pair.opener.initiateSpliceAbort('operator requested');
+					expect(again.length).to.equal(1);
+					expect(again[0].type).to.equal(ChannelActionType.ERROR);
+				});
+
+				it('a fresh negotiation clears a stale tx_abort swallow-latch', function () {
+					const { opener, acceptor } = makeNormalChannel();
+					quiesce(opener);
+					(opener as any)._spliceAbortPending = true;
+					opener.initiateSplice(100_000n, 253);
+					expect((opener as any)._spliceAbortPending, 'initiator latch cleared')
+						.to.be.false;
+
+					quiesce(acceptor);
+					(acceptor as any)._spliceAbortPending = true;
+					acceptor.handleSplice({
+						channelId: acceptor.getChannelId()!,
+						fundingPubkey: Buffer.alloc(33, 0x02),
+						relativeSatoshis: 0n,
+						fundingFeeratePerkw: 253,
+						locktime: 0
+					});
+					expect(
+						(acceptor as any)._spliceAbortPending,
+						'acceptor latch cleared'
+					).to.be.false;
+				});
+			});
+
 			it('carries the shared-input signature in the tx_signatures TLV, not the witnesses (CLN interop)', function () {
 				const pair = makeWirePair();
 				startSpliceOut(pair);
@@ -5435,6 +5695,77 @@ describe('Splice', function () {
 			const result = openerManager.abortSplice(channelId, 'test');
 			expect(result.ok).to.be.true;
 			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('operator abortSplice persists the unwind and the peer forgets (issue #366)', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				openerPubkey,
+				acceptorPubkey,
+				channelId,
+				openerChannel,
+				acceptorChannel
+			} = createNormalChannelPair();
+
+			openerManager.initiateQuiescence(channelId);
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
+
+			// Re-route with commitment_signed dropped both ways: the splice parks
+			// in the exposure window (records on both sides, no tx_signatures).
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			const route = (
+				from: ChannelManager,
+				fromPk: string,
+				to: ChannelManager,
+				toPk: string
+			): void => {
+				from.on(
+					'message:outbound',
+					(peerPubkey: string, type: number, payload: Buffer) => {
+						if (peerPubkey === toPk && type !== MessageType.COMMITMENT_SIGNED) {
+							to.handleMessage(fromPk, type, payload);
+						}
+					}
+				);
+			};
+			route(openerManager, openerPubkey, acceptorManager, acceptorPubkey);
+			route(acceptorManager, acceptorPubkey, openerManager, openerPubkey);
+
+			openerManager.initiateSplice(channelId, 100_000n, 253);
+			expect(openerChannel.getFullState().spliceInFlight).to.not.be.null;
+			expect(acceptorChannel.getFullState().spliceInFlight).to.not.be.null;
+
+			// Disk := the state as of the last dispatched PERSIST_STATE.
+			let openerDisk = JSON.parse(
+				JSON.stringify(serializeChannelState(openerChannel.getFullState()))
+			);
+			openerManager.on('channel:persist', (ev: { channel: Channel }) => {
+				if (ev.channel === openerChannel) {
+					openerDisk = JSON.parse(
+						JSON.stringify(serializeChannelState(openerChannel.getFullState()))
+					);
+				}
+			});
+
+			const result = openerManager.abortSplice(channelId, 'operator requested');
+			expect(result.ok).to.be.true;
+			// The tx_abort routed synchronously and the echo came back: both
+			// sides forgot the splice, durably on ours.
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(openerChannel.getFullState().spliceInFlight).to.be.null;
+			expect(acceptorChannel.getFullState().spliceInFlight).to.be.null;
+			expect(openerChannel.isSpliceAbortPending(), 'echo consumed').to.be.false;
+			expect(
+				deserializeChannelState(openerDisk).spliceInFlight,
+				'unwind reached disk'
+			).to.be.null;
 		});
 
 		it('should refuse initiateSplice when the peer lacks option_splice/option_quiesce', function () {
