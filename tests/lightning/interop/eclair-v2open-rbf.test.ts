@@ -286,10 +286,13 @@ describe('Interop: v2 open RBF completes vs Eclair (regtest, issue 360)', functi
 			fundingTxId?: string;
 		};
 		console.log(`    rbfopen outcome: ${JSON.stringify(rbfResult)}`);
+		// A refusal rejects the promise; success resolves with the replacement
+		// attempt (eclair numbers the first RBF 0) and its funding txid.
 		expect(
 			rbfResult.rbfIndex,
 			'eclair reports the replacement attempt index'
-		).to.be.greaterThanOrEqual(1);
+		).to.be.greaterThanOrEqual(0);
+		expect(rbfResult.fundingTxId).to.be.a('string');
 
 		await waitFor(
 			() => capturedAck !== null,
