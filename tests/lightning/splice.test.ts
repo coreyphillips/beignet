@@ -45,6 +45,7 @@ import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { calculateCommitmentFee } from '../../src/lightning/channel/commitment-builder';
 import { MessageType } from '../../src/lightning/message/types';
 import {
+	decodeTxAbortMessage,
 	decodeTxAddInputMessage,
 	decodeTxAddOutputMessage,
 	decodeTxSignaturesMessage,
@@ -1842,6 +1843,34 @@ describe('Splice', function () {
 			const ackAction = findSendAction(actions, MessageType.SPLICE_ACK);
 			expect(ackAction).to.exist;
 			expect(acceptor.getState()).to.equal(ChannelState.SPLICING);
+		});
+
+		it('refuses a splice that fails session validation with tx_abort and exits quiescence (#371)', function () {
+			// A bare local ERROR leaves the initiator SPLICING (awaiting a
+			// splice_ack that never comes) and this side silently QUIESCENT:
+			// both HTLC-frozen until a disconnect. The refusal must answer on
+			// the wire. Channel ID mismatch drives the session-validation arm.
+			const { acceptor } = makeNormalChannel();
+			quiesce(acceptor);
+
+			const actions = acceptor.handleSplice({
+				channelId: Buffer.alloc(32, 0xee),
+				fundingPubkey: Buffer.alloc(33, 0x02),
+				relativeSatoshis: 100_000n,
+				fundingFeeratePerkw: 253,
+				locktime: 0
+			});
+
+			const abortAction = findSendAction(actions, MessageType.TX_ABORT);
+			expect(abortAction, 'tx_abort answered the refusal').to.exist;
+			const decoded = decodeTxAbortMessage(abortAction.payload);
+			expect(decoded.channelId.equals(acceptor.getChannelId()!)).to.equal(true);
+			const err = findAction(actions, ChannelActionType.ERROR);
+			expect(err).to.exist;
+			expect(String(err.message)).to.include('mismatch');
+			expect(acceptor.isQuiescent(), 'quiescence unwound').to.equal(false);
+			expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
+			expect(acceptor.getSpliceSession()).to.equal(null);
 		});
 
 		it('should handle splice_ack from remote (initiator side)', function () {
@@ -7660,6 +7689,181 @@ describe('Splice', function () {
 			expect(initErr, 'initiator refused').to.not.equal(undefined);
 			expect(String(initErr.message)).to.include('taproot');
 			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('refuses a capacity-exceeding splice ON THE WIRE: tx_abort, quiescence unwound, channel stays usable (#371)', function () {
+			// The acceptor-side capacity refusal used to return a bare local
+			// ERROR: nothing reached the wire, so the initiator sat SPLICING
+			// awaiting splice_ack and the acceptor stayed QUIESCENT, both sides
+			// HTLC-frozen until a disconnect. Like the taproot refusal above,
+			// the answer must be tx_abort plus a quiescence exit.
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel,
+				openerPubkey
+			} = createNormalChannelPair();
+			// Only the opener's cap is lifted (largeChannels on, peer init
+			// advertising wumbo): its own up-front check passes, but the 16M
+			// splice-in grows the 1M channel past the acceptor's default
+			// 2^24 - 1 cap. The manager re-derives the cap per operation, so
+			// the lift must come from config + peer init, not the channel.
+			const openerPeerFeatures = FeatureFlags.empty();
+			openerPeerFeatures.setOptional(Feature.LARGE_CHANNELS);
+			openerPeerFeatures.setOptional(Feature.QUIESCE);
+			openerPeerFeatures.setOptional(Feature.SPLICE);
+			(
+				openerManager as unknown as { config: { largeChannels?: boolean } }
+			).config.largeChannels = true;
+			(openerManager as unknown as { peerManager: unknown }).peerManager = {
+				getPeer: (): {
+					getRemoteInit: () => { features: FeatureFlags };
+				} => ({
+					getRemoteInit: (): { features: FeatureFlags } => ({
+						features: openerPeerFeatures
+					})
+				})
+			};
+
+			const sent: number[] = [];
+			acceptorManager.on('message:outbound', (pk, type) => {
+				if (pk === openerPubkey) sent.push(type);
+			});
+
+			const wallet = makeSpliceInWallet(16_100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
+			openerManager.initiateQuiescence(channelId);
+			openerManager.initiateSplice(channelId, 16_000_000n, 253);
+
+			expect(
+				sent.includes(MessageType.TX_ABORT),
+				'tx_abort went out on the wire'
+			).to.equal(true);
+			expect(sent.includes(MessageType.SPLICE_ACK), 'no splice_ack').to.equal(
+				false
+			);
+			expect(
+				acceptorChannel.isQuiescent(),
+				'acceptor quiescence unwound'
+			).to.equal(false);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(
+				openerChannel.getState(),
+				'opener recovered via tx_abort'
+			).to.equal(ChannelState.NORMAL);
+
+			// Both sides stay fully usable after the refusal.
+			const preimage = crypto.randomBytes(32);
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					10_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.equal(true);
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
+		});
+
+		it('manager feature-negotiation refusal of splice_init unwinds quiescence and latches the tx_abort (#371)', function () {
+			// When the acceptor's view says the peer never negotiated
+			// option_splice, ChannelManager.handleSpliceMsg refuses before the
+			// channel sees the message. That refusal used to send tx_abort
+			// directly: the quiescence a completed stfu handshake established
+			// stayed up (acceptor HTLCs frozen until disconnect) and the
+			// unlatched tx_abort drew an extra echo round. It must route
+			// through the same channel-owned unwind as the in-channel arms.
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel,
+				openerPubkey
+			} = createNormalChannelPair();
+			// Mismatched feature views: the acceptor knows a peer init WITHOUT
+			// option_splice/option_quiesce (the opener, with no peer init at
+			// all, defaults permissive and splices anyway).
+			const emptyFeatures = FeatureFlags.empty();
+			(acceptorManager as unknown as { peerManager: unknown }).peerManager = {
+				getPeer: (): {
+					getRemoteInit: () => { features: FeatureFlags };
+				} => ({
+					getRemoteInit: (): { features: FeatureFlags } => ({
+						features: emptyFeatures
+					})
+				})
+			};
+
+			const sent: number[] = [];
+			acceptorManager.on('message:outbound', (pk, type) => {
+				if (pk === openerPubkey) sent.push(type);
+			});
+			const errors: string[] = [];
+			acceptorManager.on('error', (_id: Buffer | null, m: string) =>
+				errors.push(m)
+			);
+
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
+			openerManager.initiateQuiescence(channelId);
+			openerManager.initiateSplice(channelId, 100_000n, 253);
+
+			// Exactly ONE tx_abort from the acceptor: the latch swallows the
+			// initiator's echo instead of answering it with a third abort.
+			expect(
+				sent.filter((t) => t === MessageType.TX_ABORT).length,
+				'one tx_abort, echo swallowed'
+			).to.equal(1);
+			expect(errors.some((e) => e.includes('option_splice'))).to.equal(true);
+			expect(
+				acceptorChannel.isQuiescent(),
+				'acceptor quiescence unwound'
+			).to.equal(false);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(
+				openerChannel.getState(),
+				'opener recovered via tx_abort'
+			).to.equal(ChannelState.NORMAL);
+			expect(openerChannel.isQuiescent()).to.equal(false);
+
+			// Both directions stay usable: opener pays acceptor, then the
+			// acceptor spends what it received back to the opener.
+			const preimage = crypto.randomBytes(32);
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					30_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.equal(true);
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
+
+			const preimage2 = crypto.randomBytes(32);
+			expect(
+				acceptorManager.addHtlc(
+					channelId,
+					5_000_000n,
+					crypto.createHash('sha256').update(preimage2).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.equal(true);
+			openerManager.fulfillHtlc(channelId, 0n, preimage2);
+			expect(acceptorChannel.getFullState().htlcs.size).to.equal(0);
 		});
 
 		it('force-close adopts the splice signature at the rate it was MADE at, not a later staged fee', function () {

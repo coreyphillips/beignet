@@ -149,7 +149,6 @@ import {
 	decodeTxInitRbfMessage,
 	decodeTxAckRbfMessage,
 	decodeTxAbortMessage,
-	encodeTxAbortMessage,
 	ITxAddInputMessage
 } from '../message/interactive-tx';
 import {
@@ -4095,20 +4094,18 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		// Reject splice_init from a peer that never negotiated option_splice.
+		// Routed through the channel-owned refusal (issue #371): a direct
+		// tx_abort send would leave the quiescence a completed stfu handshake
+		// established (feature views can disagree), freezing this side's HTLCs
+		// until a disconnect, and would skip the tx_abort latch, drawing an
+		// extra echo round. processActions surfaces the ERROR action as the
+		// same 'error' event this branch used to emit.
 		if (!this.peerSupportsSplicing(peerPubkey)) {
-			this.sendMessage(
-				peerPubkey,
-				MessageType.TX_ABORT,
-				encodeTxAbortMessage({
-					channelId: msg.channelId,
-					data: Buffer.from('option_splice not negotiated', 'utf8')
-				})
-			);
-			this.emit(
-				'error',
-				msg.channelId,
+			const actions = channel.refuseSpliceInit(
+				'option_splice not negotiated',
 				'splice_init from peer without option_splice/option_quiesce'
 			);
+			this.processActions(peerPubkey, channel, actions);
 			return;
 		}
 
