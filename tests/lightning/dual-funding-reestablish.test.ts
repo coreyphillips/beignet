@@ -2125,7 +2125,9 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		).to.equal(null);
 		expect(h.opener.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
 
-		const abortActions = h.opener.abortDualFunding('operator cancelled the bump');
+		const abortActions = h.opener.abortDualFunding(
+			'operator cancelled the bump'
+		);
 		expect(
 			findPayload(abortActions, MessageType.TX_ABORT),
 			'the renegotiation abort reaches the wire despite the released signatures'
@@ -2137,18 +2139,16 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(h.acceptor.getState()).to.equal(
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
-		expect(
-			h.acceptor.getFullState().v2InFlight!.fundingTxid.equals(attempt0)
-		).to.be.true;
+		expect(h.acceptor.getFullState().v2InFlight!.fundingTxid.equals(attempt0))
+			.to.be.true;
 		expect(h.opener.handleTxAbort()).to.deep.equal([
 			{ type: ChannelActionType.PERSIST_STATE }
 		]);
 		expect(h.opener.getState()).to.equal(
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
-		expect(
-			h.opener.getFullState().v2InFlight!.fundingTxid.equals(attempt0)
-		).to.be.true;
+		expect(h.opener.getFullState().v2InFlight!.fundingTxid.equals(attempt0)).to
+			.be.true;
 	});
 
 	it('a confirmation landing mid-renegotiation abandons the RBF attempt and readies the channel (issue 360)', () => {
@@ -2196,9 +2196,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 				h.acceptor.handleChannelReady(decodeChannelReadyMessage(openerReady!))
 			)
 		).to.equal(null);
-		expect(h.opener.handleTxAbort(), 'the echo is swallowed').to.deep.equal(
-			[]
-		);
+		expect(h.opener.handleTxAbort(), 'the echo is swallowed').to.deep.equal([]);
 		const accReady = h.acceptor.fundingConfirmed();
 		const accReadyMsg = findPayload(accReady, MessageType.CHANNEL_READY);
 		expect(accReadyMsg).to.not.equal(null);
@@ -4094,7 +4092,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 
 	// Drive a completed v2 open, RBF it post-signatures through the public
 	// API, and return everything the adoption tests need (issue 360).
-	async function driveSpecWindowRbf(seedA: number, seedB: number): Promise<{
+	async function driveSpecWindowRbf(
+		seedA: number,
+		seedB: number
+	): Promise<{
 		opener: LightningNode;
 		acceptor: LightningNode;
 		channel: Channel;
@@ -4124,7 +4125,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		acceptor.on('node:error', () => {});
 		wireNodes(opener, acceptor);
 
-		const channel = opener.openChannelV2(acceptor.getNodeId(), leaseOpenParams());
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
 		await settle(
 			() =>
 				channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED &&
@@ -4220,9 +4224,7 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 	it('adopts the replacement when it confirms; every candidate clears (issue 360)', async function () {
 		const t = await driveSpecWindowRbf(103, 104);
 		try {
-			const newTxidHex = Buffer.from(t.attempt1Txid)
-				.reverse()
-				.toString('hex');
+			const newTxidHex = Buffer.from(t.attempt1Txid).reverse().toString('hex');
 			managerOf(t.opener).handleFundingConfirmed(t.channelId, newTxidHex);
 			managerOf(t.acceptor).handleFundingConfirmed(t.channelId, newTxidHex);
 			await settle(
@@ -4246,9 +4248,7 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 	it('adopts the SUPERSEDED attempt when it wins the race to depth (issue 360)', async function () {
 		const t = await driveSpecWindowRbf(105, 106);
 		try {
-			const oldTxidHex = Buffer.from(t.attempt0Txid)
-				.reverse()
-				.toString('hex');
+			const oldTxidHex = Buffer.from(t.attempt0Txid).reverse().toString('hex');
 			managerOf(t.opener).handleFundingConfirmed(t.channelId, oldTxidHex);
 			managerOf(t.acceptor).handleFundingConfirmed(t.channelId, oldTxidHex);
 			await settle(

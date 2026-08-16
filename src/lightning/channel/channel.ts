@@ -6569,9 +6569,7 @@ export class Channel {
 			);
 			if (confirmedPrevious) {
 				actions.push(
-					...this.fundingConfirmed(
-						Buffer.from(confirmedPrevious.fundingTxid)
-					)
+					...this.fundingConfirmed(Buffer.from(confirmedPrevious.fundingTxid))
 				);
 			}
 		}

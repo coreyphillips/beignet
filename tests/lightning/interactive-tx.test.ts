@@ -469,9 +469,7 @@ describe('Interactive TX Construction', function () {
 		});
 
 		it('an absent TLV stream decodes to absent fields', function () {
-			const decoded = decodeTxInitRbfMessage(
-				encodeTxInitRbfMessage(sampleMsg)
-			);
+			const decoded = decodeTxInitRbfMessage(encodeTxInitRbfMessage(sampleMsg));
 			expect(decoded.fundingOutputContribution).to.equal(undefined);
 			expect(decoded.requireConfirmedInputs).to.equal(undefined);
 		});

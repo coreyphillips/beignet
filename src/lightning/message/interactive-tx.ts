@@ -584,7 +584,12 @@ export function decodeTxInitRbfMessage(payload: Buffer): ITxInitRbfMessage {
 	const locktime = payload.readUInt32BE(32);
 	const feerate = payload.readUInt32BE(36);
 
-	return { channelId, locktime, feerate, ...decodeRbfTlvs(payload, 40, 'tx_init_rbf') };
+	return {
+		channelId,
+		locktime,
+		feerate,
+		...decodeRbfTlvs(payload, 40, 'tx_init_rbf')
+	};
 }
 
 // ---- tx_ack_rbf (73) ----
