@@ -4260,7 +4260,7 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
-		const actions = channel.abortSplice(reason);
+		const actions = channel.initiateSpliceAbort(reason);
 		this.processActions(peerPubkey, channel, actions);
 		return {
 			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),

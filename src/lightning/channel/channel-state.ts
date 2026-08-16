@@ -484,6 +484,13 @@ export interface IChannelState {
 	 * (treated as null).
 	 */
 	spliceInFlight?: ISpliceInFlight | null;
+	/**
+	 * Splice: we durably forgot a splice the peer may still hold, and owe it a
+	 * tx_abort (sent BEFORE our channel_reestablish, the ordering CLN needs)
+	 * until the peer's echo acknowledges the forget. Must survive disconnect
+	 * AND restart. Optional for backward compatibility (treated as false).
+	 */
+	spliceAbortOwed?: boolean;
 
 	/** Dual-funding: v1 or v2 funding protocol */
 	fundingVersion: 1 | 2;
