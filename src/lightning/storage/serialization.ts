@@ -390,6 +390,7 @@ export interface ISerializedChannelState {
 	spliceFundingOutputIndex?: number;
 	preSpliceState?: string | null;
 	spliceInFlight?: ISerializedSpliceInFlight | null;
+	spliceAbortOwed?: boolean;
 	remoteForwardingPolicy?: {
 		feeBaseMsat: number;
 		feeProportionalMillionths: number;
@@ -738,6 +739,7 @@ export function serializeChannelState(
 		spliceInFlight: s.spliceInFlight
 			? serializeSpliceInFlight(s.spliceInFlight)
 			: null,
+		spliceAbortOwed: s.spliceAbortOwed === true ? true : undefined,
 		remoteForwardingPolicy: s.remoteForwardingPolicy
 			? {
 					feeBaseMsat: s.remoteForwardingPolicy.feeBaseMsat,
@@ -920,6 +922,7 @@ export function deserializeChannelState(
 		spliceInFlight: s.spliceInFlight
 			? deserializeSpliceInFlight(s.spliceInFlight)
 			: null,
+		spliceAbortOwed: s.spliceAbortOwed ?? false,
 		remoteForwardingPolicy: s.remoteForwardingPolicy
 			? {
 					feeBaseMsat: s.remoteForwardingPolicy.feeBaseMsat,

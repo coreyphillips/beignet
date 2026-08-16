@@ -6102,7 +6102,14 @@ export class Channel {
 		// Sent once — on receipt CLN deletes the inflight, acks with its own
 		// tx_abort and restarts channeld on the SAME connection, which then sends
 		// a fresh channel_reestablish (handled as a re-reestablish upstream).
-		if (this._forgottenSplice && this._state.channelId) {
+		// spliceAbortOwed is the durable form (an operator abort whose tx_abort
+		// never got its echo, or never got sent at all): unlike the one-shot
+		// _forgottenSplice it stays set, re-sent on every reconnect, until the
+		// peer's echo settles it in handleTxAbort.
+		if (
+			(this._forgottenSplice || this._state.spliceAbortOwed) &&
+			this._state.channelId
+		) {
 			this._forgottenSplice = false;
 			this._spliceAbortPending = true;
 			actions.push(
@@ -7256,6 +7263,19 @@ export class Channel {
 			];
 		}
 
+		// Refused up front, before the stfu leaves (the _startSplice guard is
+		// the backstop): a delayed echo of the outstanding abort would be
+		// indistinguishable from an abort of the new session.
+		if (this._spliceAbortPending) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot splice: a previous splice abort is not yet acknowledged'
+				}
+			];
+		}
+
 		// The splice commitment machinery is ECDSA-only: the mid-splice round
 		// signs with signRemoteCommitment, which would produce garbage for a
 		// MuSig2 funding and wedge the negotiation against a real peer. Refuse
@@ -7356,12 +7376,24 @@ export class Channel {
 			locktime
 		};
 
+		// A prior splice abort is still awaiting its echo. tx_abort carries no
+		// attempt identifier, so a delayed echo would be indistinguishable from
+		// an abort of THIS fresh session and would cancel it: refuse until the
+		// exchange settles (the echo, or a disconnect, clears the latch).
+		if (this._spliceAbortPending) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot splice: a previous splice abort is not yet acknowledged'
+				}
+			];
+		}
+
 		// A fresh negotiation opens a fresh tx_abort conversation: an abort of
 		// THIS session deserves its echo even if an earlier one on this
-		// connection was already answered, and a swallow-latch left by a prior
-		// session's unanswered abort must not eat this session's abort.
+		// connection was already answered.
 		this._txAbortSent = false;
-		this._spliceAbortPending = false;
 		this._spliceSession = new SpliceSession(params);
 		const result = this._spliceSession.initiate();
 
@@ -7450,9 +7482,18 @@ export class Channel {
 			locktime: msg.locktime
 		};
 
+		// A prior splice abort of ours is still awaiting its echo, so this
+		// splice_init crossed our tx_abort on the wire. Adopting a session now
+		// would let the delayed echo cancel it (tx_abort carries no attempt
+		// identifier), and BOLT 2 forbids answering with another tx_abort while
+		// ours is outstanding. Stay silent: the crossing tx_abort aborts the
+		// peer's attempt when it lands, and its echo settles the exchange.
+		if (this._spliceAbortPending) {
+			return [];
+		}
+
 		// Fresh negotiation, fresh tx_abort conversation (see _startSplice).
 		this._txAbortSent = false;
-		this._spliceAbortPending = false;
 		this._spliceSession = new SpliceSession(params);
 		const result = this._spliceSession.handleSplice(msg);
 
@@ -8320,9 +8361,11 @@ export class Channel {
 	 * (issue #366): a leading PERSIST_STATE when an in-flight record was
 	 * cleared (the record was persisted at the commitment round, so a crash
 	 * would otherwise resurrect the aborted splice via restoreSpliceInFlight),
-	 * plus a tx_abort so the peer forgets the splice too. The send stays out
-	 * of abortSplice() itself: its message-handler callers emit their own
-	 * tx_abort and must not double-send.
+	 * plus a tx_abort so the peer forgets the splice too. The owed tx_abort is
+	 * itself durable (state.spliceAbortOwed): re-sent ahead of every
+	 * channel_reestablish across disconnects and restarts until the peer's
+	 * echo acknowledges it. The send stays out of abortSplice() itself: its
+	 * message-handler callers emit their own tx_abort and must not double-send.
 	 */
 	initiateSpliceAbort(reason?: string): ChannelAction[] {
 		const hadRecord = !!this._state.spliceInFlight;
@@ -8349,6 +8392,13 @@ export class Channel {
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
 		}
 
+		// The peer may still hold the splice: we owe it a tx_abort until its
+		// echo acknowledges the forget. The disposition is part of the state
+		// (captured by the leading persist above) because the in-memory latches
+		// do not survive a disconnect or restart, while the reestablish builder
+		// re-sends from this flag on every reconnect until the echo settles it.
+		this._state.spliceAbortOwed = true;
+
 		if (wasAwaitingReestablish) {
 			// Disconnected. The unwind arms route the restored state through
 			// _state.state, but while marked for reestablish the live slot is
@@ -8364,18 +8414,18 @@ export class Channel {
 			this._state.preReestablishState =
 				target === ChannelState.SPLICING ? ChannelState.NORMAL : target;
 			this._state.state = ChannelState.AWAITING_REESTABLISH;
-			// No peer to send to: queue the forget instead. The reestablish
-			// builder turns it into a tx_abort ordered BEFORE our
-			// channel_reestablish, the ordering CLN requires.
-			this._forgottenSplice = true;
+			// No peer to send to: the owed flag makes the reestablish builder
+			// emit the tx_abort BEFORE our channel_reestablish, the ordering
+			// CLN requires.
 		} else if (this._state.channelId) {
 			// The peer holds the splice live (splice_init at least crossed, or
 			// a commitment-round record exists): tell it to forget. Its echo
 			// is swallowed one-shot by the _spliceAbortPending arm of
-			// handleTxAbort; while the latch is set the manager also treats a
-			// remote error as part of the abort exchange (isSpliceAbortPending).
-			// A peer whose tx_signatures already left (unknowable here) will
-			// echo but spec-correctly refuse the unwind and retain the splice.
+			// handleTxAbort (which also settles the owed flag); while the latch
+			// is set the manager treats a remote error as part of the abort
+			// exchange (isSpliceAbortPending). A peer whose tx_signatures
+			// already left (unknowable here) will echo but spec-correctly
+			// refuse the unwind and retain the splice.
 			this._spliceAbortPending = true;
 			actions.push(this._txAbort(this._state.channelId, reason));
 		}
@@ -13635,12 +13685,15 @@ export class Channel {
 	 */
 	private _txAbort(channelId: Buffer, reason?: string): ChannelAction {
 		this._txAbortSent = true;
+		// The wire format carries the reason in a u16-length field: truncate
+		// rather than let the encoder throw after callers already mutated state
+		// (the unwind would then be lost along with the send).
+		const data = reason
+			? Buffer.from(reason, 'utf8').subarray(0, 65535)
+			: Buffer.alloc(0);
 		return sendMsg(
 			MessageType.TX_ABORT,
-			encodeTxAbortMessage({
-				channelId,
-				data: reason ? Buffer.from(reason, 'utf8') : Buffer.alloc(0)
-			})
+			encodeTxAbortMessage({ channelId, data })
 		);
 	}
 
@@ -13725,6 +13778,12 @@ export class Channel {
 		// splice we lost across a restart). Both sides have now forgotten it.
 		if (this._spliceAbortPending) {
 			this._spliceAbortPending = false;
+			// The echo settles a durably-owed forget: persist the clear, or a
+			// restart would keep re-sending tx_abort at every reestablish.
+			if (this._state.spliceAbortOwed) {
+				this._state.spliceAbortOwed = false;
+				return [{ type: ChannelActionType.PERSIST_STATE }];
+			}
 			return [];
 		}
 
