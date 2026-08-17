@@ -1636,6 +1636,13 @@ export class ChannelManager extends EventEmitter {
 			// builder-less session from the durable record so the signature
 			// exchange resumes over channel_reestablish.next_funding.
 			channel.restoreV2InFlight();
+			// Rows written before the open sites derived the enforced reserve
+			// carry the configured static value forever (issue #381). Lower it
+			// to what their capacity prices, once.
+			channel.repairStaticChannelReserve(
+				(this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
+					.channelReserveSatoshis
+			);
 
 			// Mark channels for reestablishment — after a restart the peer
 			// connection is lost, so we must complete channel_reestablish

@@ -2511,6 +2511,65 @@ describe('Splice', function () {
 			);
 		});
 
+		/** Drive a splice of `relativeSatoshis` to adoption and return the opener. */
+		function spliceToAdoption(relativeSatoshis: bigint): Channel {
+			const { opener } = makeNormalChannel();
+			quiesce(opener);
+			const channelId = opener.getChannelId()!;
+			opener.initiateSplice(relativeSatoshis, 253);
+			opener.handleSpliceAck({
+				channelId,
+				fundingPubkey: Buffer.alloc(33, 0x03),
+				relativeSatoshis: 0n
+			});
+			const session = opener.getSpliceSession()!;
+			session.addInput({
+				serialId: 0n,
+				prevTxid: crypto.randomBytes(32),
+				prevOutputIndex: 0,
+				sequence: 0xfffffffd
+			});
+			session.addOutput({
+				serialId: 2n,
+				amountSats: 200_000n,
+				scriptPubkey: Buffer.alloc(22, 0x01)
+			});
+			session.markTxComplete();
+			session.handlePeerTxComplete();
+			const spliceTxid = crypto.randomBytes(32);
+			session.handleTxSignatures(spliceTxid, 0);
+			opener.sendSpliceLocked();
+			opener.handleSpliceLocked({ channelId, fundingTxid: spliceTxid });
+			expect(opener.getState()).to.equal(ChannelState.NORMAL);
+			return opener;
+		}
+
+		it('a splice-out lowers the reserve it enforces on the peer (issue 381)', function () {
+			// The enforced reserve is priced at capacity, and nothing re-derived
+			// it across a splice. Frozen at the open-time value, a splice-out
+			// leaves us demanding a reserve the channel no longer justifies while
+			// the peer honours what the new capacity prices, and every HTLC in
+			// that band is refused with a bare ERROR the peer never sees, so its
+			// next commitment_signed covers an HTLC we do not hold.
+			const opener = spliceToAdoption(-800_000n);
+			expect(opener.getFundingSatoshis()).to.equal(200_000n);
+			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				2_000n
+			);
+		});
+
+		it('a splice-in never raises the reserve it enforces (issue 381)', function () {
+			// The other direction stays put: raising would start refusing HTLCs
+			// the peer believes are legal, which is the failure the lowering
+			// exists to avoid. Re-deriving both reserves at the new capacity is
+			// issue 382.
+			const opener = spliceToAdoption(500_000n);
+			expect(opener.getFundingSatoshis()).to.equal(1_500_000n);
+			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				10_000n
+			);
+		});
+
 		it('beignet<->beignet: complete splice-out, fully automated over the wire', function () {
 			const { opener, acceptor } = makeNormalChannel();
 

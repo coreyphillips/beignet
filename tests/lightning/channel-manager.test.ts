@@ -169,6 +169,38 @@ describe('Channel Manager', function () {
 			expect(errors[0]).to.include('unknown chain');
 		});
 
+		it('discards a channel whose open_channel names a hostile dust limit (issue 381)', function () {
+			// The acceptor state is seeded from the peer's message before
+			// Channel.handleOpenChannel ever runs, so what makes the refusal safe
+			// is that the ERROR action drops the temporary channel outright. If
+			// it survived, buildRemoteCommitment would trim our to_remote output
+			// at the peer's dust limit in every commitment we sign (FS-1).
+			//
+			// Alice's own dust limit is what she advertises, and it is deliberately
+			// NOT bounded on the send path: the bound belongs to values we did not
+			// choose.
+			const alice = new ChannelManager({
+				...makeConfig(1),
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG, dustLimitSatoshis: 3_000n }
+			});
+			const bob = new ChannelManager(makeConfig(2));
+			connectManagers(alice, alicePubkey, bob, bobPubkey);
+
+			const errors: string[] = [];
+			bob.on('error', (_id: Buffer | null, message: string) =>
+				errors.push(message)
+			);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+
+			expect(channel.getState()).to.equal(ChannelState.SENT_OPEN);
+			expect(errors.length).to.equal(1);
+			expect(errors[0]).to.include(
+				'dust_limit_satoshis 3000 exceeds maximum 1062'
+			);
+			expect(bob.listChannels()).to.have.length(0);
+		});
+
 		it('should reach AWAITING_FUNDING_CONFIRMED after funding', function () {
 			const { alice } = createConnectedManagers();
 

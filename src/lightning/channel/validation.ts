@@ -246,6 +246,40 @@ export function validateOpenChannelParams(
 }
 
 /**
+ * Validate a PEER's open_channel: everything validateOpenChannelParams checks,
+ * plus the bounds that apply only to a value we did not choose.
+ *
+ * Split from validateOpenChannelParams because that function also validates the
+ * open_channel WE send, where a locally configured dust limit is policy rather
+ * than an attack, and rejecting it would refuse the operator's own open. Same
+ * split as the v2 path (DualFundingSession.validateLocalParams checks the
+ * minimum only, validateOpenMsg both) and as the accept side, where the maximum
+ * lives in validateAcceptChannelParams alone.
+ * @returns Error string if invalid, null if valid.
+ */
+export function validatePeerOpenChannelParams(
+	msg: IOpenChannelMessage,
+	maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS
+): string | null {
+	const error = validateOpenChannelParams(msg, maxFundingSatoshis);
+	if (error) {
+		return error;
+	}
+
+	// The same FS-1 fund loss validateAcceptChannelParams bounds on the accept
+	// side, from the other role: buildRemoteCommitment trims at the peer's
+	// dust_limit_satoshis, so an opener that sets it near the whole capacity
+	// takes our to_remote output out of every commitment we sign for it. The
+	// channel_reserve >= dust_limit rule above does not stop it, since the
+	// opener raises its own reserve to match.
+	if (msg.dustLimitSatoshis > MAX_DUST_LIMIT_SATOSHIS) {
+		return `dust_limit_satoshis ${msg.dustLimitSatoshis} exceeds maximum ${MAX_DUST_LIMIT_SATOSHIS}`;
+	}
+
+	return null;
+}
+
+/**
  * Validate accept_channel parameters against the corresponding open_channel.
  * @returns Error string if invalid, null if valid.
  */

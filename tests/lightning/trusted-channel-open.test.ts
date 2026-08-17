@@ -194,6 +194,9 @@ describe('Trusted channel opens (zero-conf, v1 path)', function () {
 		const acceptorState = bobChannel!.getFullState();
 		expect(acceptorState.zeroConfEnabled).to.be.true;
 		expect(acceptorState.minimumDepth).to.equal(0);
+		// 1% of this 1,000,000-sat channel, which is also what the static config
+		// default happened to be before the reserve was derived (issue 381): at
+		// this one capacity the two coincide.
 		expect(acceptorState.localConfig.channelReserveSatoshis).to.equal(10_000n);
 		// The acceptor recorded the private announce_channel bit from the wire.
 		expect(acceptorState.announceChannel).to.be.false;

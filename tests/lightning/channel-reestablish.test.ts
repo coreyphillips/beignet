@@ -772,6 +772,137 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		});
 	});
 
+	describe('static channel reserve repair (issue 381)', function () {
+		/**
+		 * A row as it exists on disk, with the fields the repair reads set by the
+		 * caller. Built by round-tripping a real NORMAL channel so every other
+		 * field is genuine.
+		 */
+		function restoredRow(overrides: {
+			fundingSatoshis: string;
+			channelReserveSatoshis: string;
+			dustLimitSatoshis?: string;
+			remoteDustLimitSatoshis?: string;
+		}): Channel {
+			const { opener } = setupNormalChannels();
+			const json = JSON.parse(
+				JSON.stringify(serializeChannelState(opener.getFullState()))
+			);
+			json.fundingSatoshis = overrides.fundingSatoshis;
+			json.localConfig.channelReserveSatoshis =
+				overrides.channelReserveSatoshis;
+			if (overrides.dustLimitSatoshis !== undefined) {
+				json.localConfig.dustLimitSatoshis = overrides.dustLimitSatoshis;
+			}
+			if (overrides.remoteDustLimitSatoshis !== undefined) {
+				json.remoteConfig.dustLimitSatoshis = overrides.remoteDustLimitSatoshis;
+			}
+			return new Channel(deserializeChannelState(json));
+		}
+
+		const reserveOf = (c: Channel): bigint =>
+			c.getFullState().localConfig.channelReserveSatoshis;
+
+		it('repairs a v1 row that predates the derivation (issue 381)', function () {
+			// The open sites now record what they advertise, but they cannot
+			// reach a channel that is already open: without this the change
+			// repairs nothing that exists, and a 150,000-sat channel keeps
+			// refusing every peer HTLC that leaves it under 10,000.
+			const channel = restoredRow({
+				fundingSatoshis: '150000',
+				channelReserveSatoshis: '10000'
+			});
+			channel.repairStaticChannelReserve(10_000n);
+			expect(reserveOf(channel)).to.equal(1_500n);
+		});
+
+		it('never raises the reserve of a row that predates the derivation (issue 381)', function () {
+			// Above 1,000,000 sat the derived value is the larger one. Adopting
+			// it would start refusing HTLCs the peer believes are legal, which is
+			// the failure this repair exists to end, so the repair only lowers.
+			const channel = restoredRow({
+				fundingSatoshis: '5000000',
+				channelReserveSatoshis: '10000'
+			});
+			channel.repairStaticChannelReserve(10_000n);
+			expect(reserveOf(channel)).to.equal(10_000n);
+		});
+
+		it('leaves an already-derived row alone, and is idempotent (issue 381)', function () {
+			// The gate is "the value is still the untouched configured one".
+			// Without it a splice-out/splice-in cycle would ratchet the reserve
+			// down permanently across restarts.
+			const channel = restoredRow({
+				fundingSatoshis: '150000',
+				channelReserveSatoshis: '1500'
+			});
+			channel.repairStaticChannelReserve(10_000n);
+			expect(reserveOf(channel)).to.equal(1_500n);
+			channel.repairStaticChannelReserve(10_000n);
+			expect(reserveOf(channel)).to.equal(1_500n);
+		});
+
+		it('does not clobber a v2 row derived reserve (issue 379, issue 381)', function () {
+			// v2InFlight is nulled on adoption, so a confirmed v2 row cannot be
+			// told apart from a v1 one and the repair necessarily runs over it.
+			// v2ReserveWeEnforce is max(capacity/100, min(dusts)); the v1 value
+			// is never the smaller of the two, so the min never fires.
+			const channel = restoredRow({
+				fundingSatoshis: '20000',
+				channelReserveSatoshis: '354'
+			});
+			channel.repairStaticChannelReserve(10_000n);
+			expect(reserveOf(channel)).to.equal(354n);
+		});
+
+		it('keys the repair off the configured reserve, not a hardcoded 10,000 (issue 381)', function () {
+			// A node configured with its own static reserve carries that value on
+			// every pre-fix row, so the gate has to read the configuration.
+			const channel = restoredRow({
+				fundingSatoshis: '150000',
+				channelReserveSatoshis: '25000'
+			});
+			channel.repairStaticChannelReserve(25_000n);
+			expect(reserveOf(channel)).to.equal(1_500n);
+		});
+
+		it('errs low rather than high on an acceptor row (issue 381)', function () {
+			// The acceptor advertised max(1% of capacity, peer dust), so the
+			// re-derivation without the peer-dust term lands at 546 where the
+			// channel actually promised 1,000. Deliberate: no mainstream peer
+			// advertises a dust limit above 546, and where the term would bind,
+			// omitting it under-enforces, which cannot wedge a channel.
+			const channel = restoredRow({
+				fundingSatoshis: '50000',
+				channelReserveSatoshis: '10000',
+				remoteDustLimitSatoshis: '1000'
+			});
+			channel.repairStaticChannelReserve(10_000n);
+			expect(reserveOf(channel)).to.equal(546n);
+		});
+
+		it('runs on the ordinary restore path (issue 381)', function () {
+			// The repair is only worth anything if it is wired into the load the
+			// node actually performs, not just callable.
+			const channel = restoredRow({
+				fundingSatoshis: '150000',
+				channelReserveSatoshis: '10000'
+			});
+			const manager = new ChannelManager({
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				localFundingPrivkey: crypto.randomBytes(32),
+				htlcBasepointSecret: crypto.randomBytes(32)
+			});
+			manager.on('error', () => {
+				/* restore emits nothing here; absorb regardless */
+			});
+			manager.restoreChannel(channel, 'ab'.repeat(33));
+			expect(reserveOf(channel)).to.equal(1_500n);
+		});
+	});
+
 	describe('Full two-party reestablish simulation', function () {
 		it('should recover from disconnect after commitment exchange', function () {
 			const { opener, acceptor, acceptorSeed } = setupNormalChannels();

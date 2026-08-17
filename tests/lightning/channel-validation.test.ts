@@ -4,6 +4,7 @@ import {
 	deriveChannelId,
 	generateTemporaryChannelId,
 	validateOpenChannelParams,
+	validatePeerOpenChannelParams,
 	validateAcceptChannelParams,
 	isValidShutdownScript
 } from '../../src/lightning/channel/validation';
@@ -15,6 +16,7 @@ import {
 	MAX_ACCEPTED_HTLCS,
 	MAX_FUNDING_SATOSHIS,
 	MIN_DUST_LIMIT_SATOSHIS,
+	MAX_DUST_LIMIT_SATOSHIS,
 	DEFAULT_CHANNEL_CONFIG,
 	BITCOIN_CHAIN_HASH
 } from '../../src/lightning/channel/types';
@@ -280,6 +282,26 @@ describe('Channel Types and Validation', function () {
 			const msg = makeValidOpenMsg();
 			msg.maxAcceptedHtlcs = 484;
 			expect(validateOpenChannelParams(msg)).to.contain('exceeds maximum');
+		});
+
+		it('rejects a peer dust_limit above the maximum (issue 381)', function () {
+			// Sibling of the accept-side bound below. Without it a v1 acceptor
+			// takes an opener dust limit near the whole capacity, and every
+			// remote commitment we sign trims our to_remote output away (FS-1).
+			const msg = makeValidOpenMsg();
+			msg.dustLimitSatoshis = MAX_DUST_LIMIT_SATOSHIS + 1n;
+			expect(validatePeerOpenChannelParams(msg)).to.contain('exceeds maximum');
+			msg.dustLimitSatoshis = MAX_DUST_LIMIT_SATOSHIS;
+			expect(validatePeerOpenChannelParams(msg)).to.be.null;
+		});
+
+		it('does not bound our own open_channel dust_limit (issue 381)', function () {
+			// The bound belongs to the receive path only: validateOpenChannelParams
+			// also validates the open_channel WE send, where the dust limit is the
+			// operator's configuration and refusing it would refuse their own open.
+			const msg = makeValidOpenMsg();
+			msg.dustLimitSatoshis = MAX_DUST_LIMIT_SATOSHIS + 1n;
+			expect(validateOpenChannelParams(msg)).to.be.null;
 		});
 
 		it('should reject channel_reserve below dust_limit', function () {
