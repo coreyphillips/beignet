@@ -648,6 +648,35 @@ export class WalletFundingProvider implements IFundingProvider {
 	}
 
 	/**
+	 * Source wallet inputs + a change script for a fixed-amount dual-funded
+	 * (v2 open) contribution: the opener's auto-funding, a lease seller's
+	 * acceptor contribution, or an RBF contribution raise.
+	 *
+	 * Priced with dualFundingContributionWeight, the SAME formula the channel's
+	 * contribution computation applies to derive change (inputs - contribution -
+	 * fee), so the selection covers exactly what the channel will charge at
+	 * every input count. Sizing this with the splice weight instead
+	 * under-reserves on a fragmented wallet, because that estimator includes a
+	 * shared 2-of-2 funding input a v2 open funding transaction does not have
+	 * (issue #380).
+	 */
+	async selectDualFundingInputs(
+		amountSats: bigint,
+		feeratePerKw: number,
+		initiator: boolean
+	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
+		return this.gatherWalletInputs(
+			'v2 open contribution',
+			(selectedCount) =>
+				amountSats +
+				spliceFeeSats(
+					dualFundingContributionWeight(selectedCount, initiator),
+					feeratePerKw
+				)
+		);
+	}
+
+	/**
 	 * Shared wallet UTXO selection used by splice-in, v2 funding and fee
 	 * bumping.
 	 *

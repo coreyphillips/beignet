@@ -4398,26 +4398,43 @@ function recordingFundingProvider(
 	inputs: ISpliceWalletInput[]
 ): IFundingProvider & {
 	selectCalls: bigint[];
+	dualCalls: Array<{ amountSats: bigint; initiator: boolean }>;
 	released: Array<{ txid: string; vout: number }>;
 } {
 	const changeScript = bitcoin.payments.p2wpkh({
 		hash: crypto.randomBytes(20)
 	}).output!;
+	// selectCalls records every amount asked of the wallet whichever selector
+	// served it; dualCalls additionally records the dual-funding-aware calls
+	// with the role they were priced for (issue #380).
 	const selectCalls: bigint[] = [];
+	const dualCalls: Array<{ amountSats: bigint; initiator: boolean }> = [];
 	const released: Array<{ txid: string; vout: number }> = [];
 	let next = 0;
+	const take = (
+		amountSats: bigint
+	): { inputs: ISpliceWalletInput[]; changeScript: Buffer } => {
+		selectCalls.push(amountSats);
+		const input = inputs[Math.min(next, inputs.length - 1)];
+		next++;
+		return { inputs: [input], changeScript };
+	};
 	return {
 		selectCalls,
+		dualCalls,
 		released,
 		buildFundingTransaction: async () => {
 			throw new Error('v1 funding must not run for a v2 open');
 		},
 		broadcastTransaction: async () => 'unused',
-		selectSpliceInputs: async (amountSats: bigint) => {
-			selectCalls.push(amountSats);
-			const input = inputs[Math.min(next, inputs.length - 1)];
-			next++;
-			return { inputs: [input], changeScript };
+		selectSpliceInputs: async (amountSats: bigint) => take(amountSats),
+		selectDualFundingInputs: async (
+			amountSats: bigint,
+			_feeratePerKw: number,
+			initiator: boolean
+		) => {
+			dualCalls.push({ amountSats, initiator });
+			return take(amountSats);
 		},
 		selectMaxDualFundingInputs: async () => ({
 			inputs: [inputs[0]],
@@ -4838,6 +4855,46 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			attempt0Txid: Buffer.from(channel.getFullState().v2InFlight!.fundingTxid)
 		};
 	}
+
+	it('sizes the open and its raise with the dual-funding selector (issue 380)', async function () {
+		const topUp = makeWalletInput(120_000);
+		const t = await driveNonLeaseOpen(193, 194, [
+			makeWalletInput(120_000),
+			topUp
+		]);
+		try {
+			// The open itself, priced as the initiator.
+			expect(t.provider.dualCalls).to.deep.equal([
+				{ amountSats: 100_000n, initiator: true }
+			]);
+			const res = t.opener.rbfOpenChannelV2(
+				t.channelId,
+				2000,
+				undefined,
+				150_000n
+			);
+			expect(res.ok, res.error).to.equal(true);
+			await settle(
+				() =>
+					t.channel.getFullState().v2InFlight?.rbfAttempt === 1 &&
+					!!t.channel.getFullState().v2InFlight?.fullySigned
+			);
+			// The shortfall too: RBF initiation is opener-only, so the top-up is
+			// priced with the initiator's fee share and never with the splice
+			// weight, which reserves for a shared funding input a v2 open funding
+			// transaction does not have.
+			expect(t.provider.dualCalls).to.have.length(2);
+			expect(t.provider.dualCalls[1].initiator).to.equal(true);
+			expect(t.provider.dualCalls[1].amountSats > 0n).to.equal(true);
+			expect(
+				t.provider.selectCalls,
+				'every wallet request went through the dual-funding selector'
+			).to.deep.equal(t.provider.dualCalls.map((c) => c.amountSats));
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
 
 	it('lowers our own contribution without touching the wallet (issue 376)', async function () {
 		const t = await driveNonLeaseOpen(131, 132, [makeWalletInput(200_000)]);

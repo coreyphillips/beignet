@@ -88,6 +88,16 @@ export function spliceFeeSats(weight: number, feeratePerKw: number): bigint {
  * committed funding amount as inputs - fee(this weight) — both MUST use this
  * function, never a re-derived constant, or a max open either fails as
  * underfunded or strands sats in an unintended change output.
+ *
+ * The wallet's selection side of that contract is
+ * IFundingProvider.selectDualFundingInputs, which must size its target with
+ * this function too. estimateSpliceTxWeight is NOT a substitute: it includes
+ * the shared 2-of-2 funding input a splice spends, which a v2 open funding
+ * transaction has no equivalent of. That phantom 386 WU makes the splice
+ * estimate the larger of the two at low input counts and the SMALLER one past
+ * the crossover (48n vs the constant gap: n >= 8 as initiator, n >= 13 as
+ * acceptor), where it silently under-reserves and the open dies as underfunded
+ * after accept_channel2 (issue #380).
  */
 export function dualFundingContributionWeight(
 	inputCount: number,

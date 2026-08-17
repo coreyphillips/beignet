@@ -87,6 +87,16 @@
  * nor one whose every output trims at either dust limit is admitted, since the
  * resulting commitment has no outputs and cannot be broadcast at all.
  *
+ * Our on-chain contribution is sourced through
+ * IFundingProvider.selectDualFundingInputs, never selectSpliceInputs (issue
+ * #380): a splice-sized selection reserves for a shared 2-of-2 funding input
+ * this transaction does not have, which flips from over- to under-reserving
+ * past ~8 wallet inputs and aborts the open as underfunded after
+ * accept_channel2. Selection and Channel._computeDualFundingContributions both
+ * price with dualFundingContributionWeight, so the derived change is exact at
+ * every input count. Providers predating the method fall back to
+ * selectSpliceInputs unchanged.
+ *
  * Deliberate policy residuals, all spec-legal under
  * MAY-abort-for-any-reason:
  *   - post-restart replacements are refused (the wallet signing closures

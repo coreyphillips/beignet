@@ -11718,14 +11718,15 @@ export class Channel {
 	 * the answer BEFORE it decides whether the request can be served
 	 * synchronously or has to go through the wallet first.
 	 *
-	 * The shortfall is priced with the DUAL-FUNDING weight, while the wallet's
-	 * selectSpliceInputs reserves the SPLICE weight for the coins it picks.
-	 * Those diverge as the input count grows, so a very fragmented raise can
-	 * come back a little short and be refused as unaffordable (cleanly, with
-	 * its pledges handed back). Padding it here would mean re-deriving a
-	 * weight constant the splice-weight module explicitly forbids duplicating;
-	 * the real fix is a dual-funding-aware selector on IFundingProvider, which
-	 * the ordinary open path needs too.
+	 * The shortfall is priced over the inputs registered NOW, so it cannot
+	 * account for the weight of the top-up coins the wallet has yet to pick.
+	 * It does not need to: selectDualFundingInputs targets
+	 * topUpSats + fee(dualFundingContributionWeight(k, initiator)) for its own
+	 * k coins, and fee() is a ceiling, so
+	 * fee(w(n)) + fee(w(k)) >= fee(w(n + k)) — the top-up covers its own
+	 * marginal weight with the change-output and initiator cushions to spare
+	 * (issue #380). Padding here instead would mean re-deriving a weight
+	 * constant the splice-weight module explicitly forbids duplicating.
 	 */
 	quoteV2RbfContributionChange(
 		newFundingSatoshis: bigint,

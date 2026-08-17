@@ -80,6 +80,11 @@ import {
 	buildAnchorScript
 } from '../script/anchor';
 import type { IFundingProvider } from '../node/types';
+import {
+	canSelectDualFundingInputs,
+	selectDualFundingContribution
+} from '../node/funding-selection';
+import type { IDualFundingSelection } from '../node/funding-selection';
 import { ChannelSigner, ISigner, SignerFactory } from '../keys/signer';
 import {
 	signRemoteCommitment,
@@ -4757,15 +4762,22 @@ export class ChannelManager extends EventEmitter {
 			// than negotiating a funding tx we cannot fund.
 			const requested = msg.requestFunds.requestedSats;
 			const fp = this.fundingProvider;
-			if (fp?.selectSpliceInputs) {
+			if (canSelectDualFundingInputs(fp)) {
 				const isCurrentOpen = (): boolean =>
 					this.tempChannels.get(tempId) === channel &&
 					this.channelPeers.get(tempId) === peerPubkey;
-				let selection: ReturnType<
-					NonNullable<IFundingProvider['selectSpliceInputs']>
-				>;
+				let selection: Promise<IDualFundingSelection>;
 				try {
-					selection = fp.selectSpliceInputs(requested, msg.fundingFeeratePerkw);
+					// We are the ACCEPTOR here (answering open_channel2), so our fee
+					// share excludes the common fields and the shared funding output.
+					// The session does not exist until handleOpenChannel2 runs below,
+					// hence the literal rather than session.isInitiator().
+					selection = selectDualFundingContribution(
+						fp,
+						requested,
+						msg.fundingFeeratePerkw,
+						false
+					);
 				} catch (err) {
 					selection = Promise.reject(err);
 				}
@@ -4958,7 +4970,11 @@ export class ChannelManager extends EventEmitter {
 		// Without the matching provider method the legacy behavior holds: the
 		// embedder drives the contribution itself via addTxInput.
 		const fundMax = local.fundMax === true;
-		if (fundMax ? !fp?.selectMaxDualFundingInputs : !fp?.selectSpliceInputs) {
+		if (
+			fundMax
+				? !fp?.selectMaxDualFundingInputs
+				: !canSelectDualFundingInputs(fp)
+		) {
 			return;
 		}
 
@@ -4969,13 +4985,16 @@ export class ChannelManager extends EventEmitter {
 		const isCurrentOpen = (): boolean =>
 			this.tempChannels.get(tempId) === channel &&
 			this.channelPeers.get(tempId) === peerPubkey;
-		let selection: ReturnType<
-			NonNullable<IFundingProvider['selectSpliceInputs']>
-		>;
+		let selection: Promise<IDualFundingSelection>;
 		try {
 			selection = fundMax
 				? fp!.selectMaxDualFundingInputs!()
-				: fp!.selectSpliceInputs!(contributionSats, feeratePerKw);
+				: selectDualFundingContribution(
+						fp!,
+						contributionSats,
+						feeratePerKw,
+						true
+				  );
 		} catch (err) {
 			selection = Promise.reject(err);
 		}

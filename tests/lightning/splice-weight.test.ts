@@ -6,7 +6,8 @@ import {
 	P2WPKH_DUST_LIMIT,
 	outputWeight,
 	estimateSpliceTxWeight,
-	spliceFeeSats
+	spliceFeeSats,
+	dualFundingContributionWeight
 } from '../../src/lightning/channel/splice-weight';
 
 describe('Splice weight estimation', function () {
@@ -64,5 +65,45 @@ describe('Splice weight estimation', function () {
 		expect(
 			estimateSpliceTxWeight({ walletInputCount: 0, destinationScriptLen: 22 })
 		).to.be.lessThan(800);
+	});
+
+	describe('dual-funding contribution weight', function () {
+		it('prices our v2 open share, with the initiator surcharge', function () {
+			// Cushioned inputs (320) + change output (140), plus the common
+			// fields and the shared funding output (240) for the initiator.
+			expect(dualFundingContributionWeight(0, false)).to.equal(140);
+			expect(dualFundingContributionWeight(1, false)).to.equal(460);
+			expect(dualFundingContributionWeight(0, true)).to.equal(380);
+			expect(dualFundingContributionWeight(1, true)).to.equal(700);
+			expect(
+				dualFundingContributionWeight(3, true) -
+					dualFundingContributionWeight(1, true)
+			).to.equal(640);
+		});
+
+		// Issue #380: the splice estimator cannot size a v2 open contribution.
+		// It carries a shared 2-of-2 funding input this transaction has no
+		// equivalent of, so it over-reserves at low input counts and UNDER-
+		// reserves past the crossover, which is where the open aborted as
+		// underfunded.
+		it('crosses the splice estimate at 8 inputs as initiator', function () {
+			const splice = (n: number): number =>
+				estimateSpliceTxWeight({ walletInputCount: n, changeScriptLen: 22 });
+			expect(dualFundingContributionWeight(7, true)).to.be.lessThan(splice(7));
+			expect(dualFundingContributionWeight(8, true)).to.be.greaterThan(
+				splice(8)
+			);
+		});
+
+		it('crosses the splice estimate at 13 inputs as acceptor', function () {
+			const splice = (n: number): number =>
+				estimateSpliceTxWeight({ walletInputCount: n, changeScriptLen: 22 });
+			expect(dualFundingContributionWeight(12, false)).to.be.lessThan(
+				splice(12)
+			);
+			expect(dualFundingContributionWeight(13, false)).to.be.greaterThan(
+				splice(13)
+			);
+		});
 	});
 });
