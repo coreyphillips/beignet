@@ -7,7 +7,9 @@ import {
 	outputWeight,
 	estimateSpliceTxWeight,
 	spliceFeeSats,
-	dualFundingContributionWeight
+	dualFundingContributionWeight,
+	dualFundingTopUpWeight,
+	DUAL_FUNDING_INPUT_WEIGHT
 } from '../../src/lightning/channel/splice-weight';
 
 describe('Splice weight estimation', function () {
@@ -93,6 +95,26 @@ describe('Splice weight estimation', function () {
 			expect(dualFundingContributionWeight(8, true)).to.be.greaterThan(
 				splice(8)
 			);
+		});
+
+		it('charges a top-up only the marginal per-input weight', function () {
+			// The fixed terms cancel in the difference, so the top-up weight is
+			// role-independent and equals the per-input weight times the count.
+			for (const initiator of [true, false]) {
+				for (const [n, k] of [
+					[1, 1],
+					[3, 2],
+					[7, 5]
+				]) {
+					expect(
+						dualFundingContributionWeight(n + k, initiator) -
+							dualFundingContributionWeight(n, initiator)
+					).to.equal(dualFundingTopUpWeight(k));
+				}
+			}
+			expect(dualFundingTopUpWeight(0)).to.equal(0);
+			expect(dualFundingTopUpWeight(1)).to.equal(DUAL_FUNDING_INPUT_WEIGHT);
+			expect(dualFundingTopUpWeight(4)).to.equal(1280);
 		});
 
 		it('crosses the splice estimate at 13 inputs as acceptor', function () {

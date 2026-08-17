@@ -850,6 +850,58 @@ describe('WalletFundingProvider', () => {
 				});
 			});
 
+			it('charges an RBF top-up only the marginal weight of its own coins', async () => {
+				// A raise on a contribution that already holds one 120_000 input:
+				// quoteV2RbfContributionChange prices the shortfall over THAT input,
+				// so the fixed overhead is already inside topUpSats and the top-up
+				// owes only its own per-input weight. At 2000 sat/kw a raise to
+				// 150_000 needs exactly 32_040 from the wallet; charging a second
+				// full initiator contribution would demand 32_800 and refuse a
+				// wallet that can afford the raise.
+				const feeratePerKw = 2000;
+				const registered = 120_000n;
+				const registeredCount = 1;
+				const newFundingSatoshis = 150_000n;
+				const topUpSats =
+					newFundingSatoshis +
+					spliceFeeSats(
+						dualFundingContributionWeight(registeredCount, true),
+						feeratePerKw
+					) -
+					registered;
+				expect(topUpSats).to.equal(31_400n);
+
+				// What the channel actually charges once the coin joins the set.
+				const needed =
+					newFundingSatoshis +
+					spliceFeeSats(
+						dualFundingContributionWeight(registeredCount + 1, true),
+						feeratePerKw
+					) -
+					registered;
+				expect(needed).to.equal(32_040n);
+
+				const { wallet } = createSpliceMockWallet({
+					utxos: [{ valueSats: Number(needed) }]
+				});
+				const { inputs } = await new WalletFundingProvider(
+					wallet
+				).selectDualFundingInputs(topUpSats, feeratePerKw, true, true);
+				expect(inputs.length).to.equal(1);
+				expect(inputs[0].value).to.equal(needed);
+				// The combined set is exactly affordable, which is what
+				// initiateTxRbf re-checks before the request reaches the wire.
+				expect(
+					registered +
+						inputs[0].value -
+						newFundingSatoshis -
+						spliceFeeSats(
+							dualFundingContributionWeight(registeredCount + 1, true),
+							feeratePerKw
+						)
+				).to.equal(0n);
+			});
+
 			it('throws a clear error when the wallet cannot cover the contribution', async () => {
 				const { wallet } = createSpliceMockWallet({
 					utxos: [{ valueSats: 1_000 }]

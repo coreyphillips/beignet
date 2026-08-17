@@ -94,8 +94,18 @@
  * past ~8 wallet inputs and aborts the open as underfunded after
  * accept_channel2. Selection and Channel._computeDualFundingContributions both
  * price with dualFundingContributionWeight, so the derived change is exact at
- * every input count. Providers predating the method fall back to
+ * every input count. An RBF top-up passes topUp = true and is charged only
+ * dualFundingTopUpWeight, since the shortfall the quote returned already covers
+ * the fixed terms. Providers predating the method fall back to
  * selectSpliceInputs unchanged.
+ *
+ * Because selection is exact rather than padded, the derived change routinely
+ * lands just above zero, so a change output is emitted only at or above the
+ * negotiated interactive-tx dust floor (546 sats or the larger commitment dust
+ * limit, whichever is greater) and becomes extra fee below it. The 294-sat
+ * P2WPKH figure is NOT the governing limit here: the builder rejects any output
+ * under the interactive-tx floor on the way out, and the peer rejects it on the
+ * way in, so emitting one kills an otherwise fundable open.
  *
  * Deliberate policy residuals, all spec-legal under
  * MAY-abort-for-any-reason:

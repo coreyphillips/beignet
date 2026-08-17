@@ -14,6 +14,7 @@ import {
 	estimateSpliceTxWeight,
 	spliceFeeSats,
 	dualFundingContributionWeight,
+	dualFundingTopUpWeight,
 	outputWeight,
 	P2WPKH_INPUT_WEIGHT,
 	P2WPKH_DUST_LIMIT
@@ -659,18 +660,28 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * under-reserves on a fragmented wallet, because that estimator includes a
 	 * shared 2-of-2 funding input a v2 open funding transaction does not have
 	 * (issue #380).
+	 *
+	 * `topUp` marks an amount that ALREADY covers the contribution's fixed fee
+	 * terms because the contribution already holds registered inputs (an RBF
+	 * raise, whose shortfall quoteV2RbfContributionChange priced over exactly
+	 * those inputs). Such a selection owes only the marginal per-input weight of
+	 * the coins it adds; charging a second full contribution would double-count
+	 * the fixed terms and refuse a raise the wallet can afford.
 	 */
 	async selectDualFundingInputs(
 		amountSats: bigint,
 		feeratePerKw: number,
-		initiator: boolean
+		initiator: boolean,
+		topUp = false
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		return this.gatherWalletInputs(
-			'v2 open contribution',
+			topUp ? 'v2 open contribution top-up' : 'v2 open contribution',
 			(selectedCount) =>
 				amountSats +
 				spliceFeeSats(
-					dualFundingContributionWeight(selectedCount, initiator),
+					topUp
+						? dualFundingTopUpWeight(selectedCount)
+						: dualFundingContributionWeight(selectedCount, initiator),
 					feeratePerKw
 				)
 		);

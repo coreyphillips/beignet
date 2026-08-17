@@ -199,11 +199,18 @@ export interface IFundingProvider {
 	 *
 	 * `initiator` selects our fee share: the initiator additionally pays the
 	 * common transaction fields and the shared funding output.
+	 *
+	 * `topUp` marks an `amountSats` that already covers those fixed terms
+	 * because the contribution already holds registered inputs (an RBF raise).
+	 * Such a selection MUST charge only dualFundingTopUpWeight(count), the
+	 * marginal per-input weight; charging a second full contribution
+	 * double-counts the fixed terms and refuses a raise the wallet can afford.
 	 */
 	selectDualFundingInputs?(
 		amountSats: bigint,
 		feeratePerKw: number,
-		initiator: boolean
+		initiator: boolean,
+		topUp?: boolean
 	): Promise<{
 		inputs: import('../channel/channel').ISpliceWalletInput[];
 		changeScript: Buffer;

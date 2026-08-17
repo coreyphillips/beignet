@@ -8715,12 +8715,16 @@ export class LightningNode extends EventEmitter {
 		// Optimistic, like spliceIn: the selection is asynchronous, so the
 		// request itself is reported through node:error if it fails.
 		// RBF initiation is opener-only, so this is always the initiator's fee
-		// share; read it from the session rather than assume it.
+		// share; read it from the session rather than assume it. topUp = true:
+		// quote.topUpSats already covers the contribution's fixed fee terms over
+		// the registered inputs, so the selection owes only the marginal weight
+		// of the coins it adds.
 		selectDualFundingContribution(
 			provider,
 			quote.topUpSats,
 			fundingFeeratePerkw,
-			channel.getDualFundingSession()?.isInitiator() ?? true
+			channel.getDualFundingSession()?.isInitiator() ?? true,
+			true
 		)
 			.then(({ inputs }) => {
 				const result = this.channelManager.initiateFundingRbf(

@@ -44,15 +44,27 @@ export function canSelectDualFundingInputs(
  * here can correct a third-party provider's arithmetic; the fallback keeps such
  * embedders working exactly as they did rather than breaking them outright, and
  * WalletFundingProvider implements the correct method.
+ *
+ * `topUp` marks an amount that already covers the contribution's fixed fee
+ * terms because the contribution already holds registered inputs (an RBF
+ * raise), so the selection owes only the marginal per-input weight of the coins
+ * it adds. The splice fallback cannot express that distinction and simply
+ * over-reserves, as it always has.
  */
 export function selectDualFundingContribution(
 	fp: IFundingProvider,
 	amountSats: bigint,
 	feeratePerKw: number,
-	initiator: boolean
+	initiator: boolean,
+	topUp = false
 ): Promise<IDualFundingSelection> {
 	if (fp.selectDualFundingInputs) {
-		return fp.selectDualFundingInputs(amountSats, feeratePerKw, initiator);
+		return fp.selectDualFundingInputs(
+			amountSats,
+			feeratePerKw,
+			initiator,
+			topUp
+		);
 	}
 	if (fp.selectSpliceInputs) {
 		return fp.selectSpliceInputs(amountSats, feeratePerKw);
