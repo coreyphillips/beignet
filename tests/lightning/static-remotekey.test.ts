@@ -20,6 +20,7 @@ import {
 	Channel
 } from '../../src/lightning/channel/channel';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { expectWireRefusal } from './helpers/open-refusal';
 import { ChannelState } from '../../src/lightning/channel/types';
 import {
 	decodeOpenChannelMessage,
@@ -353,12 +354,14 @@ describe('Phase 3: option_static_remotekey', () => {
 			});
 
 			const acceptActions = acceptor.handleOpenChannel(openMsg);
-			expect(acceptActions).to.have.lengthOf(1);
-			expect(acceptActions[0].type).to.equal(ChannelActionType.ERROR);
-			expect(
-				(acceptActions[0] as { type: ChannelActionType.ERROR; message: string })
-					.message
-			).to.include('static_remotekey');
+			// A wire error for the opener and a local one for us (issue 381): a
+			// refusal it never sees leaves it parked in SENT_OPEN.
+			expect(acceptActions).to.have.lengthOf(2);
+			expectWireRefusal(
+				acceptActions,
+				openMsg.temporaryChannelId,
+				/static_remotekey/
+			);
 		});
 	});
 

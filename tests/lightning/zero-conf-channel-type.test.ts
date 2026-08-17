@@ -10,6 +10,7 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { Channel } from '../../src/lightning/channel/channel';
+import { expectWireRefusal } from './helpers/open-refusal';
 import {
 	createOpenerState,
 	createAcceptorState
@@ -23,7 +24,6 @@ import {
 } from '../../src/lightning/message/channel-open';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -104,10 +104,9 @@ describe('Zero-conf channel_type gating', function () {
 		const actions = makeAcceptor(open.temporaryChannelId).handleOpenChannel(
 			open
 		);
-		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-		expect((actions[0] as { message: string }).message).to.include(
-			'trusted peer'
-		);
+		// Wire-visible, like its open_channel2 twin: an untrusted opener that is
+		// never answered retries the identical open forever (issue 381).
+		expectWireRefusal(actions, open.temporaryChannelId, /trusted peer/);
 	});
 
 	it('accepts a zero_conf channel type from a trusted peer with minimum_depth 0', function () {

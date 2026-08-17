@@ -2512,8 +2512,20 @@ describe('Splice', function () {
 		});
 
 		/** Drive a splice of `relativeSatoshis` to adoption and return the opener. */
-		function spliceToAdoption(relativeSatoshis: bigint): Channel {
+		function spliceToAdoption(
+			relativeSatoshis: bigint,
+			shape?: { fundingVersion?: 1 | 2; peerDustLimitSatoshis?: bigint }
+		): Channel {
 			const { opener } = makeNormalChannel();
+			if (shape?.fundingVersion !== undefined) {
+				opener.getFullState().fundingVersion = shape.fundingVersion;
+			}
+			if (shape?.peerDustLimitSatoshis !== undefined) {
+				opener.getFullState().remoteConfig = {
+					...opener.getFullState().remoteConfig,
+					dustLimitSatoshis: shape.peerDustLimitSatoshis
+				};
+			}
 			quiesce(opener);
 			const channelId = opener.getChannelId()!;
 			opener.initiateSplice(relativeSatoshis, 253);
@@ -2567,6 +2579,42 @@ describe('Splice', function () {
 			expect(opener.getFundingSatoshis()).to.equal(1_500_000n);
 			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
 				10_000n
+			);
+		});
+
+		it('prices a spliced v2 channel by the v2 rule (issue 381)', function () {
+			// fundingVersion is durable and survives adoption, so the tail can tell
+			// the two apart. The v1 helper's 546-sat policy floor is above what a
+			// v2 peer keeps at this capacity (max(1% of 20,000, min(dusts)) = 354),
+			// and the 192-sat gap between them is a band of HTLCs we would refuse
+			// with a bare ERROR the peer never sees.
+			const opener = spliceToAdoption(-980_000n, {
+				fundingVersion: 2,
+				peerDustLimitSatoshis: 546n
+			});
+			expect(opener.getFundingSatoshis()).to.equal(20_000n);
+			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				354n
+			);
+		});
+
+		it('never enforces a spliced reserve above what the peer keeps (issue 381)', function () {
+			// Same band on a v1 channel, because eclair switches to the derived
+			// rule for any channel with fundingTxIndex > 0, i.e. any spliced one
+			// (Commitments.scala localChannelReserve). The negotiated rule would
+			// leave 546 here, and computeChannelReserve applies its 20% cap last,
+			// so on a small enough capacity it lands under its own starting floor
+			// (1,500/5 is 300) where the peer keeps its whole dust limit.
+			const twenty = spliceToAdoption(-980_000n);
+			expect(twenty.getFundingSatoshis()).to.equal(20_000n);
+			expect(twenty.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				354n
+			);
+
+			const tiny = spliceToAdoption(-998_500n);
+			expect(tiny.getFundingSatoshis()).to.equal(1_500n);
+			expect(tiny.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				354n
 			);
 		});
 

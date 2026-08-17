@@ -1637,12 +1637,12 @@ export class ChannelManager extends EventEmitter {
 			// exchange resumes over channel_reestablish.next_funding.
 			channel.restoreV2InFlight();
 			// Rows written before the open sites derived the enforced reserve
-			// carry the configured static value forever (issue #381). Lower it
-			// to what their capacity prices, once.
-			channel.repairStaticChannelReserve(
-				(this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
-					.channelReserveSatoshis
-			);
+			// carry the configured static value forever (issues #381, #387).
+			// Lower it to what their capacity prices. Derived from the row alone,
+			// never from this node's current configuration: that configuration is
+			// mutable between runs, and a row is not less broken because the
+			// operator has since changed it.
+			channel.repairEnforcedChannelReserve();
 
 			// Mark channels for reestablishment — after a restart the peer
 			// connection is lost, so we must complete channel_reestablish
@@ -2507,6 +2507,20 @@ export class ChannelManager extends EventEmitter {
 				peerPubkey,
 				msg.temporaryChannelId,
 				'open_channel refused: temporary_channel_id is already in use'
+			);
+			return;
+		}
+		// BOLT 1 reserves the all-zero channel_id for "all channels with this
+		// peer", so an open under it is unanswerable: every refusal below this
+		// point is scoped to the id the opener chose, and one scoped to that id
+		// would read as "fail every channel you have with me" rather than "this
+		// open is refused". Dropped locally, before any key is derived or any
+		// state retained, which is the only refusal that cannot be misread.
+		if (msg.temporaryChannelId.every((b) => b === 0)) {
+			this.emitContained(
+				'error',
+				msg.temporaryChannelId,
+				'open_channel refused: temporary_channel_id is the reserved all-zero id'
 			);
 			return;
 		}

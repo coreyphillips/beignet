@@ -1329,6 +1329,41 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(events, 'the reconnect re-armed the reminder').to.equal(1);
 	});
 
+	it('leaves the reserves of a still-negotiating v2 open to the record (issue 381)', () => {
+		// restoreChannel runs restoreV2InFlight immediately before the enforced-
+		// reserve repair, and _restoreV2RecordSnapshot owns BOTH reserves for the
+		// active attempt: capacity, balances and reserves are re-paired together,
+		// and an RBF rollback re-pairs them again. A repair that re-derived from
+		// the top-level capacity would fight that, and can skew against it in the
+		// crash window where the top-level capacity belongs to a later attempt
+		// than the record. Nothing is lost by waiting, since the row is not NORMAL
+		// and admits no HTLC; the repair lands once channel_ready nulls the record.
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.opener.getFullState()))
+		);
+		expect(json.v2InFlight, 'the fixture has a live record').to.not.be.oneOf([
+			null,
+			undefined
+		]);
+		// A value the derivation would happily lower, so what keeps it is the
+		// guard rather than the arithmetic agreeing by accident.
+		json.localConfig.channelReserveSatoshis = '10000';
+		const revived = new Channel(deserializeChannelState(json), h.openerSigner);
+		revived.repairEnforcedChannelReserve();
+		expect(
+			revived.getFullState().localConfig.channelReserveSatoshis,
+			'the repair deferred to the record'
+		).to.equal(10_000n);
+
+		// And the record is what supplies the right value, on the same load.
+		revived.restoreV2InFlight();
+		expect(revived.getFullState().localConfig.channelReserveSatoshis).to.equal(
+			1_500n
+		);
+	});
+
 	it('deserializes a legacy state without a record to null and drops it deterministically', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);

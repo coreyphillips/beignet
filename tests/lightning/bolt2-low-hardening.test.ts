@@ -21,6 +21,7 @@ import {
 	createOpenerChannel
 } from '../../src/lightning/channel/channel';
 import { createAcceptorState } from '../../src/lightning/channel/channel-state';
+import { expectWireRefusal, wireRefusalOf } from './helpers/open-refusal';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
@@ -557,6 +558,80 @@ describe('BOLT 2 LOW hardening batch', function () {
 				open.channelReserveSatoshis = 10_000n;
 			});
 			expect(errorOf(atBound.acceptActions)).to.equal(null);
+		});
+	});
+
+	describe('a refused v1 open reaches the opener (issue 381)', function () {
+		// A bare ERROR action is never put on the wire, so a refusal the opener
+		// cannot see deletes our half of the negotiation while it stays in
+		// SENT_OPEN retrying an open that can never be accepted. Every arm that
+		// refuses a FRESH open is wire-visible, exactly as handleOpenChannel2 has
+		// been since #383.
+
+		it('a peer dust_limit above the maximum', function () {
+			const { acceptActions, openMsg } = openerAndAccept(
+				(open) => {
+					open.dustLimitSatoshis = 3_000_000n;
+					open.channelReserveSatoshis = 3_000_000n;
+				},
+				undefined,
+				16_777_215n
+			);
+			expectWireRefusal(
+				acceptActions,
+				openMsg.temporaryChannelId,
+				/dust_limit_satoshis 3000000 exceeds maximum 1062/
+			);
+		});
+
+		it('an opener channel_reserve under our dust_limit', function () {
+			const { acceptActions, openMsg } = openerAndAccept((open) => {
+				open.dustLimitSatoshis = 354n;
+				open.channelReserveSatoshis = 400n;
+			}, 600n);
+			expectWireRefusal(
+				acceptActions,
+				openMsg.temporaryChannelId,
+				/exceeds opener channel_reserve/
+			);
+		});
+
+		it('our own out-of-range max_htlc_value_in_flight_msat', function () {
+			// The one arm that is OUR fault rather than the peer's, and told
+			// anyway: blame does not change the opener's problem, and its twin on
+			// the v2 path is wire-visible for the same reason.
+			const openMsg = makeValidOpenMsg();
+			const acceptor = new Channel(
+				createAcceptorState({
+					temporaryChannelId: openMsg.temporaryChannelId,
+					fundingSatoshis: openMsg.fundingSatoshis,
+					pushMsat: openMsg.pushMsat,
+					localConfig: {
+						...DEFAULT_CHANNEL_CONFIG,
+						maxHtlcValueInFlightMsat: 2n ** 64n
+					},
+					localBasepoints: realBasepoints(),
+					localPerCommitmentSeed: crypto.randomBytes(32),
+					remoteBasepoints: realBasepoints(),
+					remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
+				})
+			);
+			expectWireRefusal(
+				acceptor.handleOpenChannel(openMsg),
+				openMsg.temporaryChannelId,
+				/max_htlc_value_in_flight_msat/
+			);
+		});
+
+		it('but an open against a channel that already has a life stays local', function () {
+			// The one deliberate carve-out, shared with handleOpenChannel2: this
+			// arm can only fire on a replayed or misrouted open, and a wire error
+			// scoped to that id would cancel whatever the peer still considers
+			// live.
+			const { acceptor, openMsg } = openerAndAccept();
+			const replayed = acceptor.handleOpenChannel(openMsg);
+			expect(errorOf(replayed)).to.match(/Unexpected open_channel/);
+			expect(wireRefusalOf(replayed)).to.equal(null);
 		});
 	});
 
