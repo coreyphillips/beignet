@@ -156,11 +156,11 @@ function setupNegotiatingChannels(opts?: { withPendingHtlc?: boolean }): {
 	acceptor.fundingConfirmed();
 	opener.handleChannelReady({
 		channelId,
-		secondPerCommitmentPoint: crypto.randomBytes(33)
+		secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
 	});
 	acceptor.handleChannelReady({
 		channelId: acceptor.getChannelId()!,
-		secondPerCommitmentPoint: crypto.randomBytes(33)
+		secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
 	});
 
 	if (opts?.withPendingHtlc) {

@@ -266,6 +266,7 @@ import {
 	createOpenerState,
 	createAcceptorState,
 	IChannelState,
+	IV2InFlight,
 	mustNotBroadcastCommitment,
 	ChannelCloseReason
 } from '../channel/channel-state';
@@ -1711,10 +1712,7 @@ export class LightningNode extends EventEmitter {
 			// Attempt-aware: a previous attempt whose witnesses left resumes
 			// waiting on the chain, not on the peer.
 			if (state.state === ChannelState.DUAL_FUNDING_V2 && state.v2InFlight) {
-				state.state =
-					state.v2InFlight.sentTxSignatures || state.v2InFlight.fullySigned
-						? ChannelState.AWAITING_FUNDING_CONFIRMED
-						: ChannelState.AWAITING_TX_SIGNATURES;
+				state.state = this.v2RetainedAttemptState(state.v2InFlight);
 				this.emitStructuredLog('channel', 'v2_rbf_provisional_rolled_back', {
 					channelId
 				});
@@ -3012,8 +3010,15 @@ export class LightningNode extends EventEmitter {
 						// receiver's provisionally accepted RBF whose
 						// commit-point persist failed: the retained record
 						// is the previous attempt. Roll it back exactly as a
-						// restart would.
-						row.state.state = ChannelState.AWAITING_TX_SIGNATURES;
+						// restart would, into the state that attempt is
+						// actually waiting in. A row already durable in
+						// AWAITING_TX_SIGNATURES is not a rollback and keeps
+						// the state it was persisted with.
+						if (row.state.state === ChannelState.DUAL_FUNDING_V2) {
+							row.state.state = this.v2RetainedAttemptState(
+								row.state.v2InFlight
+							);
+						}
 						const channel = new Channel(row.state);
 						const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
 						this.channelManager.restoreChannel(
@@ -4797,6 +4802,24 @@ export class LightningNode extends EventEmitter {
 	 * shapes; established channels re-converge through the ordinary
 	 * reestablish and outbox replay.
 	 */
+	/**
+	 * The state a retained v2 opening attempt resumes in when a provisionally
+	 * accepted RBF is rolled back to it.
+	 *
+	 * An attempt whose witnesses already left waits on the CHAIN, not on the
+	 * peer: resuming it as AWAITING_TX_SIGNATURES would park it waiting for
+	 * signatures that were exchanged before the renegotiation started, and it
+	 * would sit there until some later reconnect shook it loose. Mirrors
+	 * Channel's own `_v2StateForRecord`, and is shared by all three rollback
+	 * sites (startup restore, the open-abandon revert, and the live resync)
+	 * so a row cannot resume differently depending on which one ran.
+	 */
+	private v2RetainedAttemptState(inflight: IV2InFlight): ChannelState {
+		return inflight.sentTxSignatures || inflight.fullySigned
+			? ChannelState.AWAITING_FUNDING_CONFIRMED
+			: ChannelState.AWAITING_TX_SIGNATURES;
+	}
+
 	private resyncV2OpenFromDisk(channelId: Buffer | null): void {
 		if (!channelId || !this.storage) return;
 		const idHex = channelId.toString('hex');
@@ -4815,7 +4838,7 @@ export class LightningNode extends EventEmitter {
 		}
 		try {
 			if (row.state.state === ChannelState.DUAL_FUNDING_V2) {
-				row.state.state = ChannelState.AWAITING_TX_SIGNATURES;
+				row.state.state = this.v2RetainedAttemptState(row.state.v2InFlight);
 			}
 			const channel = new Channel(row.state);
 			const keyIndex = this.storage.loadChannelKeyIndex(idHex);
@@ -8592,19 +8615,26 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Bump the fee of an unconfirmed v2 (dual-funded) open by replacing its
 	 * funding transaction (BOLT 2 tx_init_rbf / tx_ack_rbf; issue #360).
-	 * Opener-only. The renegotiation reuses the wallet inputs registered for
-	 * the open, repriced at the new feerate (the contribution split never
-	 * changes), so it needs no fresh coin selection but also cannot run
-	 * after a restart (the signing closures die with the process). Permitted
-	 * until channel_ready crosses or an attempt confirms. Superseded
-	 * attempts stay chain-watched, and whichever attempt confirms is
-	 * adopted. The new feerate must clear the BOLT 2 floor:
+	 * Opener-only. Cannot run after a restart (the wallet signing closures die
+	 * with the process). Permitted until channel_ready crosses or an attempt
+	 * confirms. Superseded attempts stay chain-watched, and whichever attempt
+	 * confirms is adopted. The new feerate must clear the BOLT 2 floor:
 	 * max(floor(previous * 25 / 24), previous + 25) sat/kw.
+	 *
+	 * `fundingSatoshis` changes OUR contribution to the funding output for the
+	 * replacement (BOLT 2 allows a different one per attempt; issue #376);
+	 * omitted keeps the current share. Lowering it, or raising it within what
+	 * the registered inputs already cover, is answered synchronously. Raising
+	 * it beyond that needs fresh coins, so the wallet selection runs in the
+	 * background: this returns `{ ok: true }` optimistically and a failure
+	 * arrives as a `node:error` with code `RBF_OPEN_FAILED`, mirroring
+	 * spliceIn. Leased opens (bLIP-51) cannot change their split at all.
 	 */
 	rbfOpenChannelV2(
 		channelId: Buffer,
 		fundingFeeratePerkw: number,
-		locktime?: number
+		locktime?: number,
+		fundingSatoshis?: bigint
 	): { ok: boolean; error?: string } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
@@ -8626,12 +8656,89 @@ export class LightningNode extends EventEmitter {
 		) {
 			throw new Error(`locktime must be a u32, got ${locktime}`);
 		}
-		const result = this.channelManager.initiateFundingRbf(
-			channelId,
-			fundingFeeratePerkw,
-			locktime
+		if (fundingSatoshis === undefined) {
+			const result = this.channelManager.initiateFundingRbf(
+				channelId,
+				fundingFeeratePerkw,
+				locktime
+			);
+			return result.ok ? { ok: true } : { ok: false, error: result.error };
+		}
+		if (typeof fundingSatoshis !== 'bigint' || fundingSatoshis <= 0n) {
+			throw new Error(
+				`fundingSatoshis must be a positive bigint, got ${fundingSatoshis}`
+			);
+		}
+		// Rides a signed 64-bit TLV; the channel's encode would throw, but a
+		// throw there is a caller error either way, so name it here.
+		if (fundingSatoshis > 0x7fffffffffffffffn) {
+			throw new Error(
+				`fundingSatoshis exceeds the funding_output_contribution range, got ${fundingSatoshis}`
+			);
+		}
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) {
+			return {
+				ok: false,
+				error: `Channel not found: ${channelId.toString('hex')}`
+			};
+		}
+		// How much (if anything) the wallet must add before this raise is
+		// affordable. Decreases and covered raises quote 0 and stay on the
+		// synchronous path.
+		const quote = channel.quoteV2RbfContributionChange(
+			fundingSatoshis,
+			fundingFeeratePerkw
 		);
-		return result.ok ? { ok: true } : { ok: false, error: result.error };
+		if (!quote.ok) return { ok: false, error: quote.error };
+		if (quote.topUpSats === 0n) {
+			const result = this.channelManager.initiateFundingRbf(
+				channelId,
+				fundingFeeratePerkw,
+				locktime,
+				{ fundingSatoshis }
+			);
+			return result.ok ? { ok: true } : { ok: false, error: result.error };
+		}
+		const provider = this.fundingProvider;
+		if (!provider?.selectSpliceInputs) {
+			return {
+				ok: false,
+				error:
+					'raising the funding contribution requires a funding provider that can select wallet inputs'
+			};
+		}
+		// Optimistic, like spliceIn: the selection is asynchronous, so the
+		// request itself is reported through node:error if it fails.
+		provider
+			.selectSpliceInputs(quote.topUpSats, fundingFeeratePerkw)
+			.then(({ inputs }) => {
+				const result = this.channelManager.initiateFundingRbf(
+					channelId,
+					fundingFeeratePerkw,
+					locktime,
+					{ fundingSatoshis, topUpInputs: inputs }
+				);
+				if (!result.ok) {
+					// The refusal path already handed the pledges back (the
+					// manager drains the channel's stash), so only report.
+					this.emit('node:error', {
+						code: 'RBF_OPEN_FAILED',
+						channelId,
+						message: result.error!,
+						timestamp: Date.now()
+					} as ILightningError);
+				}
+			})
+			.catch((err) => {
+				this.emit('node:error', {
+					code: 'RBF_OPEN_FAILED',
+					channelId,
+					message: (err as Error).message,
+					timestamp: Date.now()
+				} as ILightningError);
+			});
+		return { ok: true };
 	}
 
 	/**

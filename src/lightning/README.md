@@ -341,20 +341,43 @@ either direction or an attempt confirms. As the opener:
 // max(floor(previous * 25 / 24), previous + 25) sat/kw.
 const result = node.rbfOpenChannelV2(channelId, newFeeratePerkw);
 if (!result.ok) console.log(result.error); // refusal reason, nothing sent
+
+// Optionally change OUR contribution to the funding output for the
+// replacement (BOLT 2 allows a different one per attempt; issue #376).
+node.rbfOpenChannelV2(channelId, newFeeratePerkw, undefined, 150_000n);
 ```
 
-The renegotiation reuses the wallet inputs registered for the open, repriced
-at the new feerate; superseded broadcastable attempts are retained durably and
-chain-watched beside the current one (each replacement double-spends all of
-its predecessors, so at most one can confirm), and whichever attempt confirms
-is adopted. Per BOLT 2, an inbound `tx_init_rbf` is always answered with
-`tx_ack_rbf` or `tx_abort`, and a refusal is attempt-scoped: only the
-replacement attempt dies, both sides keep the current attempt and the channel
-lives on. Deliberate refusals (all spec-legal): replacements of an open
-restored from a restart (the wallet signing closures die with the process;
-confirmation adoption still works), a `funding_output_contribution` different
-from the recorded attempt's, and non-opener initiation (see the
-`dual-funding.ts` module header for the full semantics).
+By default the renegotiation reuses the wallet inputs registered for the open,
+repriced at the new feerate; superseded broadcastable attempts are retained
+durably and chain-watched beside the current one (each replacement
+double-spends all of its predecessors, so at most one can confirm), and
+whichever attempt confirms is adopted. Per BOLT 2, an inbound `tx_init_rbf` is
+always answered with `tx_ack_rbf` or `tx_abort`, and a refusal is
+attempt-scoped: only the replacement attempt dies, both sides keep the current
+attempt and the channel lives on.
+
+Either side may also change its `funding_output_contribution` from one attempt
+to the next. Capacity, both balances and the capacity-derived remote reserve
+are then per-attempt: every record snapshots the amounts its commitment #0 was
+built at, and each rollback, adoption and restart restores them along with the
+funding outpoint. Lowering our own contribution, or raising it within what the
+registered inputs already cover, is answered synchronously; a larger raise
+selects the shortfall from the wallet in the background, so the call returns
+optimistically and a failure arrives as a `node:error` with code
+`RBF_OPEN_FAILED`. An **absent** TLV means "unchanged" rather than the spec's
+"not contributing", for compatibility with beignet peers predating the field (a
+peer that stops contributing entirely fails the funding-output audit
+attempt-scoped). A change is refused, attempt-scoped, when the new capacity
+would exceed the channel maximum or fall below the funding-output dust floor,
+when the opener could no longer pay commitment #0's fee, or when it would leave
+both sides under the channel reserve.
+
+Deliberate refusals (all spec-legal): replacements of an open restored from a
+restart (the wallet signing closures die with the process; confirmation
+adoption still works), contribution changes on a leased open (bLIP-51: the
+`will_fund` signature and the lease fee were made over the original amounts),
+and non-opener initiation (see the `dual-funding.ts` module header for the full
+semantics).
 
 ### Liquidity Ads (bLIP-51)
 

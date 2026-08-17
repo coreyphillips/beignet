@@ -138,6 +138,24 @@ export interface IV2InFlight {
 	confirmed: boolean;
 	/** RBF attempt ordinal this record belongs to (0 = original negotiation). */
 	rbfAttempt: number;
+	/**
+	 * The channel-state values THIS attempt's commitment #0 was built at,
+	 * restored whenever the record becomes the active attempt again (rollback,
+	 * adoption, restart). BOLT 2 lets a peer change its
+	 * funding_output_contribution per RBF attempt, so capacity, both balances
+	 * and the capacity-derived remote reserve are per-attempt: reactivating an
+	 * attempt without them would rebuild its commitment at another attempt's
+	 * amounts, and the stored peer signature would not cover it.
+	 *
+	 * Written together or not at all (`fundingSatoshis !== undefined` marks the
+	 * set as present). Optional because rows persisted before contribution
+	 * changes existed have none, and those attempts all shared one set of
+	 * values by construction, so live state is already theirs.
+	 */
+	fundingSatoshis?: bigint;
+	localBalanceMsat?: bigint;
+	remoteBalanceMsat?: bigint;
+	remoteChannelReserveSatoshis?: bigint;
 }
 
 /**

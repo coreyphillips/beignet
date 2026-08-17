@@ -12,7 +12,7 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { IInteractiveTxInput, IInteractiveTxOutput } from './types';
 
-const DUST_LIMIT_SATS = 546n;
+export const DUST_LIMIT_SATS = 546n;
 
 /** BOLT 2 interactive-tx: each peer may add at most 252 inputs / 252 outputs. */
 export const MAX_INTERACTIVE_TX_INPUTS = 252;

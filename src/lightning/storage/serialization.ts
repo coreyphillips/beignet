@@ -545,6 +545,14 @@ export interface ISerializedV2InFlight {
 	receivedTxSignatures: boolean;
 	confirmed?: boolean;
 	rbfAttempt: number;
+	/**
+	 * Per-attempt channel values (see IV2InFlight). Absent on rows written
+	 * before contribution-changing RBF existed.
+	 */
+	fundingSatoshis?: string;
+	localBalanceMsat?: string;
+	remoteBalanceMsat?: string;
+	remoteChannelReserveSatoshis?: string;
 }
 
 export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
@@ -568,7 +576,23 @@ export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
 		sentTxSignatures: f.sentTxSignatures,
 		receivedTxSignatures: f.receivedTxSignatures,
 		confirmed: f.confirmed,
-		rbfAttempt: f.rbfAttempt
+		rbfAttempt: f.rbfAttempt,
+		fundingSatoshis:
+			f.fundingSatoshis !== undefined
+				? bigintToStr(f.fundingSatoshis)
+				: undefined,
+		localBalanceMsat:
+			f.localBalanceMsat !== undefined
+				? bigintToStr(f.localBalanceMsat)
+				: undefined,
+		remoteBalanceMsat:
+			f.remoteBalanceMsat !== undefined
+				? bigintToStr(f.remoteBalanceMsat)
+				: undefined,
+		remoteChannelReserveSatoshis:
+			f.remoteChannelReserveSatoshis !== undefined
+				? bigintToStr(f.remoteChannelReserveSatoshis)
+				: undefined
 	};
 }
 
@@ -595,7 +619,23 @@ export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 		sentTxSignatures: s.sentTxSignatures,
 		receivedTxSignatures: s.receivedTxSignatures,
 		confirmed: s.confirmed ?? false,
-		rbfAttempt: s.rbfAttempt
+		rbfAttempt: s.rbfAttempt,
+		fundingSatoshis:
+			s.fundingSatoshis !== undefined
+				? strToBigint(s.fundingSatoshis)
+				: undefined,
+		localBalanceMsat:
+			s.localBalanceMsat !== undefined
+				? strToBigint(s.localBalanceMsat)
+				: undefined,
+		remoteBalanceMsat:
+			s.remoteBalanceMsat !== undefined
+				? strToBigint(s.remoteBalanceMsat)
+				: undefined,
+		remoteChannelReserveSatoshis:
+			s.remoteChannelReserveSatoshis !== undefined
+				? strToBigint(s.remoteChannelReserveSatoshis)
+				: undefined
 	};
 }
 

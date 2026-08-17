@@ -7,6 +7,7 @@
  */
 
 import { expect } from 'chai';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import crypto from 'crypto';
 import * as secp from '@noble/secp256k1';
 import {
@@ -120,7 +121,7 @@ describe('Liquidity ads signalling (M3.1)', function () {
 			delayedPaymentBasepoint: crypto.randomBytes(33),
 			htlcBasepoint: crypto.randomBytes(33),
 			firstPerCommitmentPoint: crypto.randomBytes(33),
-			secondPerCommitmentPoint: crypto.randomBytes(33),
+			secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
 			channelFlags: 1,
 			channelType: Buffer.from([0x10]),
 			requestFunds: { requestedSats: 500_000n, blockheight: 800000 }
@@ -151,7 +152,7 @@ describe('Liquidity ads signalling (M3.1)', function () {
 			delayedPaymentBasepoint: crypto.randomBytes(33),
 			htlcBasepoint: crypto.randomBytes(33),
 			firstPerCommitmentPoint: crypto.randomBytes(33),
-			secondPerCommitmentPoint: crypto.randomBytes(33),
+			secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
 			willFund: { signature: sig, leaseRates: RATES }
 		};
 		const decoded = decodeAcceptChannel2Message(

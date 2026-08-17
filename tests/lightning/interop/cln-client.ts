@@ -312,6 +312,133 @@ export class ClnRestClient {
 		return this.request('POST', '/v1/splice_signed', body);
 	}
 
+	// ── v2 (dual-funded) opens and their RBF ──
+
+	/**
+	 * Reserve wallet UTXOs and return a PSBT funding `amount`. The starting
+	 * point for both openchannel_init and openchannel_bump.
+	 */
+	async fundPsbt(
+		satoshi: number | string,
+		feerate: string,
+		startweight = 250
+	): Promise<{ psbt: string; feerate_per_kw?: number }> {
+		return this.request('POST', '/v1/fundpsbt', {
+			satoshi: String(satoshi),
+			feerate,
+			startweight,
+			// Without this the reserved UTXO's remainder is left as fee, which
+			// for a wallet-sized UTXO trips bitcoind's maxtxfee at broadcast.
+			excess_as_change: true
+		});
+	}
+
+	/**
+	 * Build a PSBT from SPECIFIC utxos ("txid:vout"). The RBF recipe: a
+	 * replacement must double-spend the previous attempt, so it is funded from
+	 * that attempt's own inputs, which are still reserved for it
+	 * (`reservedok`).
+	 */
+	async utxoPsbt(
+		satoshi: number | string,
+		feerate: string,
+		utxos: string[],
+		startweight = 250
+	): Promise<{ psbt: string }> {
+		return this.request('POST', '/v1/utxopsbt', {
+			satoshi: String(satoshi),
+			feerate,
+			startweight,
+			utxos,
+			reservedok: true,
+			excess_as_change: true
+		});
+	}
+
+	/** Begin a v2 (dual-funded) open toward `id` with `amount` from initialpsbt. */
+	async openChannelInit(
+		id: string,
+		amount: number | string,
+		initialpsbt: string,
+		opts?: { feeratePerKw?: number }
+	): Promise<{
+		channel_id: string;
+		psbt: string;
+		commitments_secured: boolean;
+	}> {
+		const body: Record<string, unknown> = {
+			id,
+			amount: String(amount),
+			initialpsbt
+		};
+		if (opts?.feeratePerKw !== undefined) {
+			body.funding_feerate = `${opts.feeratePerKw}perkw`;
+		}
+		return this.request('POST', '/v1/openchannel_init', body);
+	}
+
+	/**
+	 * Start an RBF of an unconfirmed v2 open. `amount` may differ from the
+	 * original attempt (BOLT 2 allows a different funding_output_contribution
+	 * per attempt). Only valid before the channel locks in, and the feerate
+	 * must clear the peer's 25/24 floor, so pass it explicitly rather than
+	 * relying on CLN's 65/64 default.
+	 */
+	async openChannelBump(
+		channelId: string,
+		amount: number | string,
+		initialpsbt: string,
+		opts?: { feeratePerKw?: number }
+	): Promise<{
+		channel_id: string;
+		psbt: string;
+		commitments_secured: boolean;
+	}> {
+		const body: Record<string, unknown> = {
+			channel_id: channelId,
+			amount: String(amount),
+			initialpsbt
+		};
+		if (opts?.feeratePerKw !== undefined) {
+			body.funding_feerate = `${opts.feeratePerKw}perkw`;
+		}
+		return this.request('POST', '/v1/openchannel_bump', body);
+	}
+
+	/**
+	 * Advance the open's interactive-tx negotiation. Call repeatedly, feeding
+	 * the returned PSBT back in, until `commitments_secured` is true.
+	 */
+	async openChannelUpdate(
+		channelId: string,
+		psbt: string
+	): Promise<{
+		channel_id: string;
+		psbt: string;
+		commitments_secured: boolean;
+	}> {
+		return this.request('POST', '/v1/openchannel_update', {
+			channel_id: channelId,
+			psbt
+		});
+	}
+
+	/** Sign our inputs of a PSBT the wallet reserved. */
+	async signPsbt(psbt: string): Promise<{ signed_psbt: string }> {
+		return this.request('POST', '/v1/signpsbt', { psbt });
+	}
+
+	/** Send our tx_signatures for the (bumped) open. */
+	async openChannelSigned(
+		channelId: string,
+		signedPsbt: string
+	): Promise<{ channel_id: string; tx: string; txid: string }> {
+		return this.request('POST', '/v1/openchannel_signed', {
+			channel_id: channelId,
+			signed_psbt: signedPsbt
+		});
+	}
+
 	// ── Invoices ──
 
 	async createInvoice(

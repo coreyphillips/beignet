@@ -232,6 +232,16 @@ interface IFailedFundingWatch {
 	 * watchdog instead).
 	 */
 	candidates?: Array<{ txid: string; outputIndex: number }>;
+	/**
+	 * The registration this failure belongs to. A retry re-registers by map
+	 * overwrite, so a queued failure must not be replayed once a NEWER
+	 * registration for the same channel has taken its place: an RBF that
+	 * re-armed the watch with the replacement's candidate set would be
+	 * clobbered back to the stale set, and the attempt that actually
+	 * confirmed would go unseen. Identity, not equality: the entry is
+	 * replayable only while it is still the watch the map holds.
+	 */
+	watched: IWatchedFunding;
 }
 
 /** A failed output watch queued for retry */
@@ -391,6 +401,26 @@ export class ChainWatcher extends EventEmitter {
 	}
 
 	/**
+	 * Whether a queued failed funding watch has been overtaken by a newer
+	 * registration for the same channel, and must therefore be dropped rather
+	 * than retried.
+	 *
+	 * watchFundingOutput registers by map overwrite, so replaying a stale
+	 * entry would reinstate the candidate set (and current txid) of a watch
+	 * that has since been replaced — the shape a post-signatures RBF produces
+	 * whenever the first registration's subscription failed and the
+	 * replacement's succeeded. The confirmed attempt would then be absent from
+	 * the watched set and go unnoticed. Compared by identity: the entry stays
+	 * replayable only while the map still holds the very object it failed for.
+	 */
+	private isSupersededFundingWatch(entry: IFailedFundingWatch): boolean {
+		return (
+			this.watchedFundings.get(entry.channelId.toString('hex')) !==
+			entry.watched
+		);
+	}
+
+	/**
 	 * Re-check every watched funding output for confirmation and retry any failed
 	 * subscriptions, independently of new-block / subscription callbacks. Safe to
 	 * call at any time (idempotent). Call it after the Electrum connection is
@@ -402,6 +432,7 @@ export class ChainWatcher extends EventEmitter {
 			const pending = [...this.failedFundingWatches];
 			this.failedFundingWatches = [];
 			for (const w of pending) {
+				if (this.isSupersededFundingWatch(w)) continue;
 				this.watchFundingOutput(
 					w.channelId,
 					w.txid,
@@ -548,7 +579,8 @@ export class ChainWatcher extends EventEmitter {
 					// set, and the caller's array must not mutate under it.
 					candidates: candidates?.length
 						? candidates.map((c) => ({ ...c }))
-						: undefined
+						: undefined,
+					watched
 				});
 			}
 			return;
@@ -873,6 +905,7 @@ export class ChainWatcher extends EventEmitter {
 			const pending = [...this.failedFundingWatches];
 			this.failedFundingWatches = [];
 			for (const watch of pending) {
+				if (this.isSupersededFundingWatch(watch)) continue;
 				this.watchFundingOutput(
 					watch.channelId,
 					watch.txid,
