@@ -4279,7 +4279,9 @@ export class ChannelManager extends EventEmitter {
 		const peerPubkey = this.channelPeers.get(idHex);
 		if (!peerPubkey) {
 			const error = `Peer not found for channel: ${idHex}`;
-			this.releaseStaleSelectionPledges(newContribution?.topUpInputs ?? []);
+			this.releaseStaleSelectionPledges(
+				channel.unregisteredV2TopUpInputs(newContribution?.topUpInputs ?? [])
+			);
 			this.emit('error', channelId, error);
 			return { ok: false, actions: [], error };
 		}
@@ -4296,12 +4298,16 @@ export class ChannelManager extends EventEmitter {
 			const firstError = actions.find(
 				(a) => a.type === ChannelActionType.ERROR
 			);
-			// A refused request never reached the wire. Its top-up inputs were
-			// selected and frozen but never registered on the channel, so they
-			// are released directly (the stale-selection case); anything the
-			// channel itself unregistered rides the dangling stash.
+			// A refused request never reached the wire, so the coins selected
+			// for it are free again — but ONLY the ones this open does not
+			// already spend. The wallet can hand back a coin whose pledge
+			// lapsed and re-offer it as a top-up, and releasing that would
+			// unfreeze an input of the live funding tx. The channel filters;
+			// anything it unregistered itself rides the dangling stash.
 			if (newContribution?.topUpInputs?.length) {
-				this.releaseStaleSelectionPledges(newContribution.topUpInputs);
+				this.releaseStaleSelectionPledges(
+					channel.unregisteredV2TopUpInputs(newContribution.topUpInputs)
+				);
 			}
 			this.releaseDanglingV2Pledges(channel);
 			return {
@@ -5809,9 +5815,6 @@ export class ChannelManager extends EventEmitter {
 		progress?: IActionDispatchProgress
 	): void {
 		if (actions.length === 0) return;
-		// Cheap when there is nothing staged, and this is the one path every
-		// dispatch-driven rollback funnels through.
-		this.releaseDanglingV2Pledges(channel);
 		const dispatchProgress = progress ?? {
 			index: -1,
 			completedIndex: -1,
@@ -6023,6 +6026,17 @@ export class ChannelManager extends EventEmitter {
 		if (sendsBlocked) {
 			progress.sendsWithheld = true;
 			this.emit('transition:blocked', peerPubkey, batchChannelId);
+		}
+		// Hand back the coins a rollback in this batch unregistered — but only
+		// once the batch committed. A rollback whose persist failed is undone
+		// by the live resync, which restores the durable replacement from
+		// disk; releasing its inputs first would unfreeze coins that restored
+		// record still spends, and nothing re-pledges an unsigned attempt. The
+		// stash is left intact so the batch that does commit releases them.
+		// Cheap when nothing is staged, and this is the one path every
+		// dispatch-driven rollback funnels through.
+		if (!sendsBlocked && heldFrom < 0) {
+			this.releaseDanglingV2Pledges(channel);
 		}
 	}
 

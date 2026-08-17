@@ -2318,6 +2318,80 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(st.v2InFlight!.rbfAttempt).to.equal(0);
 	});
 
+	it('a peer error mid-open resumes the attempt that has its own signature (issue 376 review)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		const attempt0 = Buffer.from(
+			h.opener.getFullState().v2InFlight!.fundingTxid
+		);
+		const sig0 = Buffer.from(
+			h.opener.getFullState().remoteCommitmentSignature!
+		);
+
+		// Drive a replacement all the way to its record install, but never let
+		// the peer's commitment_signed for it arrive: the record swap
+		// re-points the funding outpoint at attempt 1 while the top-level
+		// signature still belongs to attempt 0.
+		const preRecord = h.opener.getFullState().v2InFlight!;
+		// A distinct locktime so the replacement is a DIFFERENT transaction
+		// (same inputs and outputs otherwise, so the txids would collide).
+		expect(findError(h.opener.initiateTxRbf(2000, 500))).to.equal(null);
+		const acked = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 500,
+			feerate: 2000
+		});
+		h.opener.handleTxAckRbf(
+			decodeTxAckRbfMessage(findPayload(acked, MessageType.TX_ACK_RBF)!)
+		);
+		const fundingScript = bitcoin.Transaction.fromHex(preRecord.fundingTxHex)
+			.outs[preRecord.fundingOutputIndex].script;
+		const oIn = h.opener.addTxInput(makeInput(0n, h.openerPrev.prevTx));
+		h.acceptor.handleTxAddInput(
+			decodeTxAddInputMessage(findPayload(oIn, MessageType.TX_ADD_INPUT)!)
+		);
+		const aIn = h.acceptor.addTxInput(makeInput(1n, h.acceptorPrev.prevTx));
+		h.opener.handleTxAddInput(
+			decodeTxAddInputMessage(findPayload(aIn, MessageType.TX_ADD_INPUT)!)
+		);
+		const oOut = h.opener.addTxOutput({
+			serialId: 2n,
+			amountSats: TOTAL_FUNDING,
+			scriptPubkey: fundingScript
+		});
+		h.acceptor.handleTxAddOutput(
+			decodeTxAddOutputMessage(findPayload(oOut, MessageType.TX_ADD_OUTPUT)!)
+		);
+		h.acceptor.sendTxComplete();
+		h.opener.handleTxComplete();
+		expect(findError(h.opener.sendTxComplete())).to.equal(null);
+		const recorded = h.opener.getFullState().v2InFlight!;
+		expect(recorded.rbfAttempt, 'the replacement recorded itself').to.equal(1);
+		expect(
+			recorded.remoteCommitmentSig,
+			'but is unsigned by the peer'
+		).to.equal(null);
+		expect(
+			recorded.fundingTxid.equals(attempt0),
+			'and is a different transaction'
+		).to.equal(false);
+
+		expect(h.opener.markErrored()).to.equal(true);
+		const st = h.opener.getFullState();
+		// The replacement had no signature of its own, so leaving it current
+		// would let a close report success while broadcasting a commitment
+		// whose witness does not verify over the outpoint it spends.
+		expect(st.state).to.equal(ChannelState.ERRORED);
+		expect(st.fundingTxid!.equals(attempt0), 'attempt 0 is current').to.equal(
+			true
+		);
+		expect(
+			st.remoteCommitmentSignature!.equals(sig0),
+			"and carries attempt 0's own signature"
+		).to.equal(true);
+	});
+
 	it('an unencodable RBF request never installs the pending latch (issue 360 review)', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
@@ -4667,21 +4741,15 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			);
 			expect(res.ok).to.equal(true);
 			await settle(
-				() =>
-					t.channel.getFullState().v2InFlight?.rbfAttempt === 1 ||
-					t.provider.released.length > 0,
+				() => t.channel.getFullState().v2InFlight?.rbfAttempt === 1,
 				5_000
 			);
 			const st = t.channel.getFullState();
 			// Dropping the duplicate leaves only the 120k already registered,
 			// which cannot fund a 150k contribution, so the raise is refused
-			// locally and attempt 0 stands. Keeping it would have looked
-			// affordable (the coin counted twice) and produced a replacement
-			// spending the same outpoint twice: consensus-invalid.
-			expect(
-				t.provider.released.length,
-				'the raise was refused locally and its coins handed back, never put on the wire'
-			).to.be.greaterThan(0);
+			// and attempt 0 stands. Keeping it would have looked affordable
+			// (the coin counted twice) and produced a replacement spending the
+			// same outpoint twice: consensus-invalid.
 			expect(
 				st.v2InFlight!.rbfAttempt,
 				'the unaffordable raise was refused, not negotiated'
@@ -4696,6 +4764,26 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 					'no duplicate prevout in any funding tx'
 				).to.equal(outpoints.length);
 			}
+			// And the coin attempt 0 actually spends was NEVER handed back:
+			// unfreezing it would let the next wallet spend orphan the channel.
+			const sharedTxid = bitcoin.Transaction.fromBuffer(shared.prevTx).getId();
+			expect(
+				t.provider.released.some(
+					(o) => o.txid === sharedTxid && o.vout === shared.prevOutputIndex
+				),
+				'the registered funding coin was never released'
+			).to.equal(false);
+			const attempt0Tx = bitcoin.Transaction.fromHex(
+				st.v2InFlight!.fundingTxHex
+			);
+			expect(
+				attempt0Tx.ins.some(
+					(i) =>
+						Buffer.from(i.hash).reverse().toString('hex') === sharedTxid &&
+						i.index === shared.prevOutputIndex
+				),
+				'attempt 0 does spend that coin, so releasing it would have been unsafe'
+			).to.equal(true);
 		} finally {
 			t.opener.destroy();
 			t.acceptor.destroy();
@@ -4801,6 +4889,106 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 					.getFullState()
 					.v2PreviousAttempts![1].fundingTxid.equals(t.attempt1Txid)
 			).to.be.true;
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('an ERRORED channel adopts a superseded attempt that confirms (issue 376 review)', async function () {
+		const t = await driveSpecWindowRbf(149, 150);
+		try {
+			// A peer error fails the channel while the signed replacement is
+			// current and attempt 0 is retained as a live candidate.
+			expect(t.channel.markErrored()).to.equal(true);
+			expect(t.channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(t.channel.getFullState().v2PreviousAttempts).to.have.length(1);
+
+			// Attempt 0 wins the race. ERRORED is force-closeable, so this
+			// confirmation still decides which funding any exit must spend; it
+			// used to fall through the state gate and be dropped silently,
+			// leaving no stamp for the force-close adoption to find either.
+			const oldTxidHex = Buffer.from(t.attempt0Txid).reverse().toString('hex');
+			managerOf(t.opener).handleFundingConfirmed(t.channelId, oldTxidHex);
+			const st = t.channel.getFullState();
+			expect(st.state, 'the channel stays failed').to.equal(
+				ChannelState.ERRORED
+			);
+			expect(
+				st.fundingTxid!.equals(t.attempt0Txid),
+				'the confirmed attempt is adopted'
+			).to.equal(true);
+			expect(st.v2InFlight!.confirmed).to.equal(true);
+			expect(st.v2PreviousAttempts ?? []).to.have.length(0);
+
+			// And the close it now plans spends the funding that is on chain.
+			const script = bitcoin.payments.p2wpkh({
+				hash: crypto.randomBytes(20)
+			}).output!;
+			const res = managerOf(t.opener).forceClose(t.channelId, script);
+			expect(res.ok, res.error).to.equal(true);
+			const broadcast = res.actions.find(
+				(a) => a.type === ChannelActionType.BROADCAST_TX
+			) as { tx: Buffer } | undefined;
+			const commitment = bitcoin.Transaction.fromBuffer(broadcast!.tx);
+			expect(
+				Buffer.from(commitment.ins[0].hash).equals(t.attempt0Txid)
+			).to.equal(true);
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('a late wallet selection cannot revive a closed channel (issue 376 review)', async function () {
+		const t = await driveNonLeaseOpen(151, 152, [
+			makeWalletInput(120_000),
+			makeWalletInput(120_000)
+		]);
+		try {
+			// The raise needs a top-up, so the request waits on the wallet.
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const provider = t.provider as unknown as {
+				selectSpliceInputs: (a: bigint, f: number) => Promise<unknown>;
+			};
+			const realSelect = provider.selectSpliceInputs.bind(provider);
+			provider.selectSpliceInputs = async (a: bigint, f: number) => {
+				await gate;
+				return realSelect(a, f);
+			};
+			const res = t.opener.rbfOpenChannelV2(
+				t.channelId,
+				2000,
+				undefined,
+				150_000n
+			);
+			expect(res.ok).to.equal(true);
+
+			// The channel force-closes while the selection is still in flight.
+			const script = bitcoin.payments.p2wpkh({
+				hash: crypto.randomBytes(20)
+			}).output!;
+			expect(managerOf(t.opener).forceClose(t.channelId, script).ok).to.equal(
+				true
+			);
+			expect(t.channel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+
+			// Now the wallet answers. The request must be refused outright: it
+			// would otherwise drag the closed channel back into a funding
+			// renegotiation whose commitment is already on the network.
+			release();
+			await settle(() => t.provider.released.length > 0, 5_000);
+			expect(t.channel.getState(), 'the close stands').to.equal(
+				ChannelState.FORCE_CLOSED
+			);
+			expect(t.channel.getFullState().v2InFlight?.rbfAttempt ?? 0).to.equal(0);
+			expect(
+				t.provider.released.length,
+				'the coins selected for the dead request are handed back'
+			).to.be.greaterThan(0);
 		} finally {
 			t.opener.destroy();
 			t.acceptor.destroy();

@@ -277,7 +277,10 @@ function declMsg(
 /**
  * Compute channel reserve: 1% of funding (matching LND/CLN/Eclair),
  * floored at the greater of dust limit and 546 sats (LND's minimum),
- * capped at BOLT 2 max of funding / 5 (20%).
+ * capped at funding / 5 (20%). The cap is local policy for the reserve we
+ * PROPOSE on a v1 open, not a spec rule: BOLT 2 states no maximum. It must
+ * not be applied to a v2 channel, whose reserve is not negotiated at all
+ * (see computeV2ChannelReserve).
  */
 const MIN_CHANNEL_RESERVE_SATOSHIS = 546n; // LND enforces P2PKH dust limit as minimum reserve
 
@@ -309,6 +312,29 @@ function computeChannelReserve(
 	if (reserve < minReserve) reserve = minReserve;
 	if (reserve > maxReserve) reserve = maxReserve;
 	return reserve;
+}
+
+/**
+ * The channel reserve of a v2 (dual-funded) channel.
+ *
+ * BOLT 2 leaves it out of open_channel2/accept_channel2 entirely: "the channel
+ * reserve is fixed at 1% of the total channel balance ... rounded down to the
+ * nearest whole satoshi or the `dust_limit_satoshis`, whichever is greater."
+ * Both peers DERIVE it, so there is nothing to negotiate and, crucially, no
+ * maximum: the v1 helper's 20% cap can pull the result BELOW the dust limit on
+ * a small channel, which is exactly the case the spec's dust floor exists to
+ * prevent (a reserve under dust admits a commitment whose outputs all trim
+ * away, leaving no spendable exit). beignet's stricter 546-sat policy floor is
+ * kept, since it only ever raises the reserve.
+ */
+function computeV2ChannelReserve(
+	fundingSatoshis: bigint,
+	dustLimitSatoshis: bigint
+): bigint {
+	return bigIntMax(
+		bigIntMax(fundingSatoshis / 100n, dustLimitSatoshis),
+		MIN_CHANNEL_RESERVE_SATOSHIS
+	);
 }
 
 /**
@@ -1875,16 +1901,25 @@ export class Channel {
 				}
 				return [];
 			}
-			// Force-closed before any attempt confirmed, and a SUPERSEDED
-			// attempt won the race: the broadcast commitment spends the
-			// replacement's funding output, which can now never exist. Adopt
-			// the confirmed attempt (outpoint + its commitment signature) so
-			// the close can be rebuilt against the funding that is actually
-			// on chain, keep the terminal state, and stamp the confirmation
-			// durably: the node's close re-drive (and any restart) keys off
-			// the confirmed adopted record. No ready flow and no abort: the
-			// channel already failed.
-			if (this._state.state === ChannelState.FORCE_CLOSED) {
+			// The channel already failed and a SUPERSEDED attempt won the
+			// race, so the exit it would broadcast spends a funding output
+			// that can now never exist. Adopt the confirmed attempt (outpoint
+			// + its commitment signature) so the close can be built against
+			// the funding that is actually on chain, keep the terminal state,
+			// and stamp the confirmation durably: the node's close re-drive
+			// (and any restart) keys off the confirmed adopted record. No
+			// ready flow and no abort.
+			//
+			// ERRORED belongs here as much as FORCE_CLOSED: prepareForceClose
+			// accepts both, so a channel failed by a BOLT 1 error still owes
+			// a unilateral exit. Falling through to the state gate below
+			// dropped the confirmation silently and left no stamp, so the
+			// adoption in prepareForceClose (which looks for a confirmed
+			// previous attempt) could never rescue it either.
+			if (
+				this._state.state === ChannelState.FORCE_CLOSED ||
+				this._state.state === ChannelState.ERRORED
+			) {
 				const adopted = previous[index];
 				this._state.v2InFlight = adopted;
 				this._state.v2PreviousAttempts = undefined;
@@ -6037,6 +6072,20 @@ export class Channel {
 			this._v2RecordIsStaleRollback()
 		) {
 			this._rollbackToRetainedV2Attempt();
+		} else if (this._v2ReplacementAbandonable()) {
+			// The replacement already RECORDED itself but the peer never
+			// signed it, so the record swap re-pointed the funding outpoint at
+			// an attempt whose commitment signature never arrived while the
+			// top-level remoteCommitmentSignature still holds the previous
+			// attempt's. prepareForceClose only checks that a signature
+			// EXISTS, so the failed channel would report a successful close
+			// while broadcasting a commitment that spends the replacement and
+			// carries a witness which does not verify over it: a silent
+			// no-exit. Nothing of the replacement can reach the chain (our
+			// witnesses never left and the peer cannot complete it alone), so
+			// resume the attempt that does have its own signature, exactly as
+			// the reestablish and tx_abort arms do.
+			this._popToPreviousV2Attempt();
 		}
 		this._state.state = ChannelState.ERRORED;
 		return true;
@@ -11603,6 +11652,15 @@ export class Channel {
 	 * Read-only, and deliberately outside initiateTxRbf: the node layer needs
 	 * the answer BEFORE it decides whether the request can be served
 	 * synchronously or has to go through the wallet first.
+	 *
+	 * The shortfall is priced with the DUAL-FUNDING weight, while the wallet's
+	 * selectSpliceInputs reserves the SPLICE weight for the coins it picks.
+	 * Those diverge as the input count grows, so a very fragmented raise can
+	 * come back a little short and be refused as unaffordable (cleanly, with
+	 * its pledges handed back). Padding it here would mean re-deriving a
+	 * weight constant the splice-weight module explicitly forbids duplicating;
+	 * the real fix is a dual-funding-aware selector on IFundingProvider, which
+	 * the ordinary open path needs too.
 	 */
 	quoteV2RbfContributionChange(
 		newFundingSatoshis: bigint,
@@ -13744,11 +13802,35 @@ export class Channel {
 	): ChannelAction[] {
 		// BOLT 2: a node MUST NOT send tx_init_rbf on an option_zeroconf
 		// channel. Local misuse, so a plain ERROR action (no wire error).
+		// Ahead of the lifecycle guard because it is the more specific reason
+		// and reads only the negotiated channel type.
 		if (this._isZeroConfChannelType()) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
 					message: 'tx_init_rbf is forbidden on an option_zeroconf channel'
+				}
+			];
+		}
+		// The channel must still be OPENING. Every other guard below reads the
+		// dual-funding SESSION, which a force close, a peer error or a
+		// disconnect does not reset, so none of them notice that the channel
+		// itself has left the opening flow. A raise whose wallet selection
+		// resolves asynchronously can land arbitrarily late, and without this
+		// the request would drag a FORCE_CLOSED, ERRORED or AWAITING_REESTABLISH
+		// channel back into DUAL_FUNDING_V2 and start renegotiating a funding
+		// tx whose commitment is already on the network.
+		const lifecycle = this._state.state;
+		if (
+			lifecycle !== ChannelState.DUAL_FUNDING_V2 &&
+			lifecycle !== ChannelState.AWAITING_TX_SIGNATURES &&
+			lifecycle !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
+			lifecycle !== ChannelState.AWAITING_CHANNEL_READY
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `cannot RBF a v2 open in state ${lifecycle}`
 				}
 			];
 		}
@@ -13944,15 +14026,10 @@ export class Channel {
 			// if what remains cannot fund the raise, the affordability check
 			// below refuses it.
 			if (newContribution.topUpInputs?.length) {
-				const registered = new Set(
-					this._dualFundingContribution.inputs.map((i) =>
-						this._walletInputOutpointKey(i)
-					)
-				);
 				newContribution = {
 					...newContribution,
-					topUpInputs: newContribution.topUpInputs.filter(
-						(i) => !registered.has(this._walletInputOutpointKey(i))
+					topUpInputs: this.unregisteredV2TopUpInputs(
+						newContribution.topUpInputs
 					)
 				};
 			}
@@ -14150,6 +14227,33 @@ export class Channel {
 		}`;
 	}
 
+	/**
+	 * Of `inputs`, those this channel does NOT already contribute to its v2
+	 * open: the only ones a caller may hand back to the wallet.
+	 *
+	 * A refused raise must release exactly the coins nothing spends. Its
+	 * selection can legitimately include an outpoint this open ALREADY
+	 * registered (the wallet frees a pledge whose TTL lapsed while the attempt
+	 * sat unsigned, so its next selection is free to offer that coin again),
+	 * and releasing THAT unfreezes a coin the live funding transaction
+	 * depends on: whatever spends it next orphans the channel, which is the
+	 * outcome pledges exist to prevent. The channel answers this because only
+	 * it knows the registered set.
+	 */
+	unregisteredV2TopUpInputs(
+		inputs: ISpliceWalletInput[]
+	): ISpliceWalletInput[] {
+		if (!inputs.length) return [];
+		const registered = new Set(
+			(this._dualFundingContribution?.inputs ?? []).map((i) =>
+				this._walletInputOutpointKey(i)
+			)
+		);
+		return inputs.filter(
+			(i) => !registered.has(this._walletInputOutpointKey(i))
+		);
+	}
+
 	private _restoreDualFundingContributionFor(record: IV2InFlight): void {
 		const c = this._dualFundingContribution;
 		if (!c || this._state.leaseFeeSats !== undefined) return;
@@ -14197,7 +14301,9 @@ export class Channel {
 	 * to unfreeze them; the provider's pledge TTL is the backstop for windows
 	 * no drain reaches (a crash between selection and registration).
 	 */
-	takeDanglingV2TopUpPledgeOutpoints(): Array<{ txid: string; vout: number }> {
+	takeDanglingV2TopUpPledgeOutpoints(
+		clear = true
+	): Array<{ txid: string; vout: number }> {
 		if (!this._danglingV2TopUpInputs.length) return [];
 		const outpoints: Array<{ txid: string; vout: number }> = [];
 		for (const input of this._danglingV2TopUpInputs) {
@@ -14210,7 +14316,9 @@ export class Channel {
 				// Unreadable prevTx: nothing to name, TTL handles it.
 			}
 		}
-		this._danglingV2TopUpInputs = [];
+		// A caller that cannot commit the rollback these inputs belong to
+		// peeks instead, so the stash survives for the batch that does.
+		if (clear) this._danglingV2TopUpInputs = [];
 		return outpoints;
 	}
 
@@ -14288,15 +14396,19 @@ export class Channel {
 			return `post-RBF opener contribution ${openerSats} cannot afford the initial commitment fee ${commitFeeSats}`;
 		}
 		// Neither side may be born unable to meet the reserve the new capacity
-		// implies.
-		const reserve = computeChannelReserve(
+		// implies. BOLT 2 makes this a MUST-fail on "less than or equal to",
+		// and its rationale is precisely to eliminate the case where every
+		// output would be trimmed as dust: since the v2 reserve is floored at
+		// the dust limit, both sides at or under it means the commitment has
+		// no spendable output at all.
+		const reserve = computeV2ChannelReserve(
 			newCapacity,
 			this._state.remoteConfig.dustLimitSatoshis
 		);
 		const openerAfterFee = openerSats - commitFeeSats;
 		const nonOpenerSats = isInitiator ? remoteSats : localSats;
-		if (openerAfterFee < reserve && nonOpenerSats < reserve) {
-			return `post-RBF capacity ${newCapacity} leaves both sides below the channel reserve ${reserve}`;
+		if (openerAfterFee <= reserve && nonOpenerSats <= reserve) {
+			return `post-RBF capacity ${newCapacity} leaves both sides at or below the channel reserve ${reserve}`;
 		}
 		return null;
 	}
@@ -14337,7 +14449,7 @@ export class Channel {
 		this._state.remoteBalanceMsat = newRemoteSats * 1000n;
 		this._state.remoteConfig = {
 			...this._state.remoteConfig,
-			channelReserveSatoshis: computeChannelReserve(
+			channelReserveSatoshis: computeV2ChannelReserve(
 				this._state.fundingSatoshis,
 				this._state.remoteConfig.dustLimitSatoshis
 			)
