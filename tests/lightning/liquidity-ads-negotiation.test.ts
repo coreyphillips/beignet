@@ -185,6 +185,19 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 		// Both sides agree on the lease expiry.
 		expect(bState.leaseExpiry).to.equal(800000 + 4032);
 		expect(buyerId).to.be.a('string');
+
+		// Issue 379: the lease fee grows the capacity AFTER both sides derived
+		// their v2 reserves, so both re-derive. Left stale they priced 700,000
+		// (7,000) instead of the negotiated 706,500.
+		for (const state of [bState, sState]) {
+			expect(state.remoteConfig.channelReserveSatoshis).to.equal(
+				state.fundingSatoshis / 100n
+			);
+			expect(state.localConfig.channelReserveSatoshis).to.equal(
+				state.fundingSatoshis / 100n
+			);
+			expect(state.remoteConfig.channelReserveSatoshis).to.equal(7_065n);
+		}
 	});
 
 	it('treats a request_funds of 0 sats as no lease', function () {

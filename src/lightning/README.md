@@ -357,7 +357,7 @@ attempt-scoped: only the replacement attempt dies, both sides keep the current
 attempt and the channel lives on.
 
 Either side may also change its `funding_output_contribution` from one attempt
-to the next. Capacity, both balances and the capacity-derived remote reserve
+to the next. Capacity, both balances and both capacity-derived channel reserves
 are then per-attempt: every record snapshots the amounts its commitment #0 was
 built at, and each rollback, adoption and restart restores them along with the
 funding outpoint. Lowering our own contribution, or raising it within what the
@@ -370,7 +370,24 @@ peer that stops contributing entirely fails the funding-output audit
 attempt-scoped). A change is refused, attempt-scoped, when the new capacity
 would exceed the channel maximum or fall below the funding-output dust floor,
 when the opener could no longer pay commitment #0's fee, or when it would leave
-both sides under the channel reserve.
+each side at or under its own channel reserve.
+
+A v2 open (and every RBF replacement) is admitted against BOLT 2's two receiver
+MUST-fails on the initial commitment, which `open_channel2` and `accept_channel2`
+inherit from their v1 counterparts: the funder must be able to pay commitment
+#0's fee, and both outputs must not be at or below the channel reserve. A split
+failing either would produce a commitment with every output trimmed away, and a
+transaction with no outputs cannot be broadcast, so the side holding it would
+have no unilateral exit from the funding output at all.
+
+A v2 channel exchanges no `channel_reserve_satoshis` at all: BOLT 2 fixes it at
+1% of the total capacity or the `dust_limit_satoshis`, whichever is greater, with
+no maximum, and both peers derive it. The spec does not say whose dust limit
+floors it (eclair and CLN disagree), so beignet derives the two sides by safety
+direction: the reserve it keeps takes the greater of the two dust limits, so its
+reserve output is never dust in either commitment, and the reserve it enforces on
+the peer takes the lesser and skips beignet's own 546-sat policy floor, so it can
+never exceed what a conforming peer computes for itself and reject a legal HTLC.
 
 Deliberate refusals (all spec-legal): replacements of an open restored from a
 restart (the wallet signing closures die with the process; confirmation

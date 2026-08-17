@@ -64,13 +64,28 @@
  * confirm, and whichever does is adopted.
  *
  * Either side may change its funding_output_contribution per attempt, so
- * capacity, both balances and the capacity-derived remote reserve are
+ * capacity, both balances and both capacity-derived channel reserves are
  * per-attempt too: every record snapshots the amounts its commitment #0 was
  * built at, and every rollback, adoption and restart restores them together
  * with the funding outpoint (an attempt rebuilt at another attempt's amounts
  * would not be covered by the peer's stored signature). An absent TLV means
  * "unchanged" rather than the spec's "not contributing", for compatibility
  * with beignet peers predating the TLV.
+ *
+ * Neither reserve is negotiated on a v2 channel (issue #379): BOLT 2 fixes it
+ * at 1% of the total capacity or the dust_limit_satoshis, whichever is greater,
+ * with no maximum, and both peers derive it. See Channel.v2ReserveWeKeep /
+ * v2ReserveWeEnforce for which dust limit floors which side and why. A peer's
+ * dust_limit_satoshis is bounded here at both receive sites, as v1 has bounded
+ * it since the FS-1 audit: unbounded, it both trims our commitment output away
+ * and drives the derived reserve past the whole capacity.
+ *
+ * open_channel2 and accept_channel2 also INHERIT their v1 counterparts'
+ * requirements, so both receive sites run BOLT 2's initial-commitment MUST-fails
+ * (Channel._v2InitialCommitmentRefusal, shared with the RBF path): the funder
+ * must afford commitment #0's fee, and neither a both-sides-below-reserve split
+ * nor one whose every output trims at either dust limit is admitted, since the
+ * resulting commitment has no outputs and cannot be broadcast at all.
  *
  * Deliberate policy residuals, all spec-legal under
  * MAY-abort-for-any-reason:
@@ -97,6 +112,7 @@ import {
 } from '../message/dual-funding';
 import {
 	MIN_DUST_LIMIT_SATOSHIS,
+	MAX_DUST_LIMIT_SATOSHIS,
 	MAX_ACCEPTED_HTLCS,
 	MAX_FUNDING_SATOSHIS
 } from './types';
@@ -1119,6 +1135,15 @@ export class DualFundingSession {
 			return `dust_limit_satoshis ${msg.dustLimitSatoshis} below minimum ${MIN_DUST_LIMIT_SATOSHIS}`;
 		}
 
+		// An unbounded peer dust_limit is the FS-1 fund loss (v1 bounds it in
+		// validateAcceptChannelParams): the peer sets it near the whole channel,
+		// so every commitment built at the peer's dust limit trims our output as
+		// "dust" and we sign it. It also drives the derived v2 channel reserve,
+		// which BOLT 2 floors at the dust limit with no maximum.
+		if (msg.dustLimitSatoshis > MAX_DUST_LIMIT_SATOSHIS) {
+			return `dust_limit_satoshis ${msg.dustLimitSatoshis} exceeds maximum ${MAX_DUST_LIMIT_SATOSHIS}`;
+		}
+
 		if (msg.maxAcceptedHtlcs > MAX_ACCEPTED_HTLCS) {
 			return `max_accepted_htlcs ${msg.maxAcceptedHtlcs} exceeds maximum ${MAX_ACCEPTED_HTLCS}`;
 		}
@@ -1145,6 +1170,11 @@ export class DualFundingSession {
 	private validateAcceptParams(msg: IAcceptChannel2Message): string | null {
 		if (msg.dustLimitSatoshis < MIN_DUST_LIMIT_SATOSHIS) {
 			return `dust_limit_satoshis ${msg.dustLimitSatoshis} below minimum ${MIN_DUST_LIMIT_SATOSHIS}`;
+		}
+
+		// Same FS-1 bound as validateOpenMsg, for the acceptor's dust limit.
+		if (msg.dustLimitSatoshis > MAX_DUST_LIMIT_SATOSHIS) {
+			return `dust_limit_satoshis ${msg.dustLimitSatoshis} exceeds maximum ${MAX_DUST_LIMIT_SATOSHIS}`;
 		}
 
 		if (msg.maxAcceptedHtlcs > MAX_ACCEPTED_HTLCS) {

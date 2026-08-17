@@ -53,7 +53,8 @@ import {
 } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	MAX_DUST_LIMIT_SATOSHIS
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
@@ -84,6 +85,7 @@ import {
 } from '../../src/lightning/message/interactive-tx';
 import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 import { decodeChannelReadyMessage } from '../../src/lightning/message/channel-funding';
+import { IUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import {
 	IChannelReestablishMessage,
 	decodeChannelReestablishMessage
@@ -274,9 +276,20 @@ const TOTAL_FUNDING = OPENER_FUNDING + ACCEPTOR_FUNDING;
  * acceptorNoInput the acceptor contributes nothing (no sats, no inputs), so
  * its side of the attempt is broadcastable the moment its commitment_signed
  * leaves.
+ *
+ * openerDust / acceptorDust raise one side's dust_limit_satoshis, both on the
+ * wire and in its own config (production keeps the two in step: the advertised
+ * value and localConfig both come from the node's channelConfig). Commitment #0
+ * carries no HTLCs and both outputs sit far above any value used here, so
+ * nothing trims and the real signature exchange still completes.
  */
 function driveToCommitmentExchange(
-	opts: { acceptorPrev?: IRealPrevOut; acceptorNoInput?: boolean } = {}
+	opts: {
+		acceptorPrev?: IRealPrevOut;
+		acceptorNoInput?: boolean;
+		openerDust?: bigint;
+		acceptorDust?: bigint;
+	} = {}
 ): IHarness {
 	const sharedTempId = crypto.randomBytes(32);
 
@@ -317,6 +330,13 @@ function driveToCommitmentExchange(
 	});
 	const acceptor = new Channel(acceptorState, acceptorSigner);
 
+	if (opts.openerDust !== undefined) {
+		openerState.localConfig.dustLimitSatoshis = opts.openerDust;
+	}
+	if (opts.acceptorDust !== undefined) {
+		acceptorState.localConfig.dustLimitSatoshis = opts.acceptorDust;
+	}
+
 	const mkParams = (
 		fundingSatoshis: bigint,
 		state: typeof openerState,
@@ -325,7 +345,7 @@ function driveToCommitmentExchange(
 		fundingSatoshis,
 		fundingFeeratePerkw: 1000,
 		commitmentFeeratePerkw: DEFAULT_CHANNEL_CONFIG.feeratePerKw,
-		dustLimitSatoshis: DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis,
+		dustLimitSatoshis: state.localConfig.dustLimitSatoshis,
 		maxHtlcValueInFlightMsat: DEFAULT_CHANNEL_CONFIG.maxHtlcValueInFlightMsat,
 		htlcMinimumMsat: DEFAULT_CHANNEL_CONFIG.htlcMinimumMsat,
 		toSelfDelay: DEFAULT_CHANNEL_CONFIG.toSelfDelay,
@@ -2407,6 +2427,111 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(findPayload(good, MessageType.TX_INIT_RBF)).to.not.equal(null);
 	});
 
+	/** Drive the open all the way to NORMAL on both sides. */
+	const driveToNormal = (h: IHarness): void => {
+		deliverCommitments(h);
+		completeExchange(h);
+		const opReady = findPayload(
+			h.opener.fundingConfirmed(),
+			MessageType.CHANNEL_READY
+		)!;
+		const acReady = findPayload(
+			h.acceptor.fundingConfirmed(),
+			MessageType.CHANNEL_READY
+		)!;
+		expect(
+			findError(h.opener.handleChannelReady(decodeChannelReadyMessage(acReady)))
+		).to.equal(null);
+		expect(
+			findError(
+				h.acceptor.handleChannelReady(decodeChannelReadyMessage(opReady))
+			)
+		).to.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
+		expect(h.acceptor.getState()).to.equal(ChannelState.NORMAL);
+	};
+
+	const inboundHtlc = (
+		side: Channel,
+		amountMsat: bigint,
+		id = 0n
+	): IUpdateAddHtlcMessage => ({
+		channelId: side.getChannelId()!,
+		id,
+		amountMsat,
+		paymentHash: crypto.randomBytes(32),
+		cltvExpiry: 800_000,
+		onionRoutingPacket: Buffer.alloc(1366)
+	});
+
+	it('derives both channel reserves from capacity on a v2 open (issue 379)', () => {
+		// A v2 open exchanges no channel_reserve_satoshis: both peers derive it
+		// from the total capacity. remoteConfig's (what THEY require of US) was
+		// already derived; localConfig's (what WE require of THEM) never was, so
+		// it sat at the static DEFAULT_CHANNEL_CONFIG value for the channel's
+		// whole life while a conforming peer computed 1% of capacity.
+		const h = driveToCommitmentExchange();
+		for (const side of [h.opener, h.acceptor]) {
+			const state = side.getFullState();
+			expect(Number(state.fundingSatoshis)).to.equal(Number(TOTAL_FUNDING));
+			expect(Number(state.remoteConfig.channelReserveSatoshis)).to.equal(1_500);
+			expect(Number(state.localConfig.channelReserveSatoshis)).to.equal(1_500);
+		}
+	});
+
+	it('accepts an inbound HTLC down to the derived reserve, not the static one (issue 379)', () => {
+		// handleUpdateAddHtlc gates the peer on localConfig.channelReserveSatoshis.
+		// Undervived, that rejected every HTLC leaving the peer under 10,000 sat on
+		// a 150,000-sat channel, where BOLT 2 gives the peer 1,500: an honest peer's
+		// spec-legal HTLC failed the channel.
+		const h = driveToCommitmentExchange();
+		driveToNormal(h);
+		// The opener funded 100,000 and holds 50,000 of the acceptor's on its
+		// remote side; as OPENER it adds no commitment fee to the peer's floor.
+		expect(Number(h.opener.getFullState().remoteBalanceMsat)).to.equal(
+			Number(ACCEPTOR_FUNDING * 1000n)
+		);
+
+		// One msat below the reserve is still refused, at the derived value.
+		expect(
+			findError(
+				h.opener.handleUpdateAddHtlc(inboundHtlc(h.opener, 48_500_001n))
+			)
+		).to.match(/cannot afford HTLC above channel reserve/);
+
+		// Exactly at the reserve is legal, and was refused before the derivation.
+		expect(
+			findError(
+				h.opener.handleUpdateAddHtlc(inboundHtlc(h.opener, 48_500_000n))
+			)
+		).to.equal(null);
+		expect(Number(h.opener.getFullState().remoteBalanceMsat)).to.equal(
+			1_500_000
+		);
+	});
+
+	it('pairs each side of the derived reserve with the right dust limit (issue 379)', () => {
+		// At equal dust limits both reserves are the same number, so nothing above
+		// would notice them swapped. BOLT 2 does not say whose dust_limit floors
+		// the reserve; beignet takes the maximum for what we keep (so our reserve
+		// output is never dust in either commitment) and the minimum for what we
+		// enforce (so it is never above what a conforming peer computes for
+		// itself). A zero-contribution acceptor puts capacity at 100,000, whose 1%
+		// sits below the raised dust limit, so the two values separate.
+		const h = driveToCommitmentExchange({
+			acceptorNoInput: true,
+			acceptorDust: MAX_DUST_LIMIT_SATOSHIS
+		});
+		// Both peers derive the same pair, whichever side they are on: the
+		// opener from accept_channel2, the acceptor from open_channel2.
+		for (const side of [h.opener, h.acceptor]) {
+			const state = side.getFullState();
+			expect(Number(state.fundingSatoshis)).to.equal(Number(OPENER_FUNDING));
+			expect(Number(state.remoteConfig.channelReserveSatoshis)).to.equal(1_062);
+			expect(Number(state.localConfig.channelReserveSatoshis)).to.equal(1_000);
+		}
+	});
+
 	it('accepts a changed funding_output_contribution and re-derives capacity, balances and reserve (issue 376)', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
@@ -2417,6 +2542,8 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const beforeCapacity = h.acceptor.getFullState().fundingSatoshis;
 		const beforeReserve =
 			h.acceptor.getFullState().remoteConfig.channelReserveSatoshis;
+		const beforeLocalReserve =
+			h.acceptor.getFullState().localConfig.channelReserveSatoshis;
 		const raised = record.remoteContributionSats + 20_000n;
 
 		// BOLT 2 allows a different contribution per attempt: accepted, and
@@ -2442,10 +2569,12 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(Number(after.localBalanceMsat)).to.equal(
 			Number(record.localContributionSats * 1000n)
 		);
-		// The remote reserve is capacity-derived, so it moves with it.
+		// Both reserves are capacity-derived, so both move with it (issue 379).
 		expect(Number(after.remoteConfig.channelReserveSatoshis)).to.be.greaterThan(
 			Number(beforeReserve)
 		);
+		expect(Number(beforeLocalReserve)).to.equal(1_500);
+		expect(Number(after.localConfig.channelReserveSatoshis)).to.equal(1_700);
 		// The retained attempt keeps the amounts IT was negotiated at, so the
 		// rollback below has somewhere to return to.
 		expect(Number(after.v2InFlight!.fundingSatoshis!)).to.equal(
@@ -2461,6 +2590,8 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const beforeCapacity = h.acceptor.getFullState().fundingSatoshis;
 		const beforeReserve =
 			h.acceptor.getFullState().remoteConfig.channelReserveSatoshis;
+		const beforeLocalReserve =
+			h.acceptor.getFullState().localConfig.channelReserveSatoshis;
 		const beforeRemoteMsat = h.acceptor.getFullState().remoteBalanceMsat;
 
 		h.acceptor.handleTxInitRbf({
@@ -2484,7 +2615,48 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(Number(rolled.remoteConfig.channelReserveSatoshis)).to.equal(
 			Number(beforeReserve)
 		);
+		// The reserve we enforce on the peer is per-attempt too (issue 379): the
+		// replacement raised it to 1,700 and the retained attempt owns 1,500.
+		expect(Number(beforeLocalReserve)).to.equal(1_500);
+		expect(Number(rolled.localConfig.channelReserveSatoshis)).to.equal(1_500);
 		expect(rolled.v2InFlight!.rbfAttempt).to.equal(0);
+	});
+
+	it('refuses a replacement that trims our own commitment to nothing (issue 379)', () => {
+		// The both-sides-below-reserve rule alone does not cover asymmetric dust
+		// limits. With ours at 1,062 and the peer's at 354, a 751/500 split at
+		// 253 sat/kw leaves us 568 after the 183-sat fee and the peer 500: the
+		// peer clears the 354 reserve we enforce, so the reserve rule passes,
+		// but OUR commitment trims both outputs at 1,062 and is built with none.
+		// The peer's commitment is fine, so we would be the only side without a
+		// unilateral exit.
+		const h = driveToCommitmentExchange({
+			openerDust: MAX_DUST_LIMIT_SATOSHIS
+		});
+		deliverCommitments(h);
+		completeExchange(h);
+		const openerState = h.opener.getFullState();
+		expect(Number(openerState.localConfig.dustLimitSatoshis)).to.equal(1_062);
+		expect(Number(openerState.remoteConfig.dustLimitSatoshis)).to.equal(354);
+
+		const refusal = (
+			h.opener as unknown as {
+				_v2RbfContributionRefusal: (l: bigint, r: bigint) => string | null;
+			}
+		)._v2RbfContributionRefusal(751n, 500n);
+		expect(refusal).to.match(/trims every commitment #0 output at the 1062/);
+
+		// The same split with matching low dust limits is viable and accepted.
+		const symmetric = driveToCommitmentExchange();
+		deliverCommitments(symmetric);
+		completeExchange(symmetric);
+		expect(
+			(
+				symmetric.opener as unknown as {
+					_v2RbfContributionRefusal: (l: bigint, r: bigint) => string | null;
+				}
+			)._v2RbfContributionRefusal(751n, 500n)
+		).to.equal(null);
 	});
 
 	it('refuses out-of-bounds contribution changes attempt-scoped, in both directions (issue 376)', () => {
@@ -2733,6 +2905,9 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(Number(restored.remoteChannelReserveSatoshis!)).to.equal(
 			Number(record.remoteChannelReserveSatoshis!)
 		);
+		expect(Number(restored.localChannelReserveSatoshis!)).to.equal(
+			Number(record.localChannelReserveSatoshis!)
+		);
 
 		// Rows persisted before contribution changes existed carry none, and
 		// must deserialize as absent rather than as zero: those attempts share
@@ -2742,11 +2917,73 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		delete json.v2InFlight.localBalanceMsat;
 		delete json.v2InFlight.remoteBalanceMsat;
 		delete json.v2InFlight.remoteChannelReserveSatoshis;
+		delete json.v2InFlight.localChannelReserveSatoshis;
 		const legacy = deserializeChannelState(json).v2InFlight!;
 		expect(legacy.fundingSatoshis).to.equal(undefined);
 		expect(legacy.localBalanceMsat).to.equal(undefined);
 		expect(legacy.remoteBalanceMsat).to.equal(undefined);
 		expect(legacy.remoteChannelReserveSatoshis).to.equal(undefined);
+		expect(legacy.localChannelReserveSatoshis).to.equal(undefined);
+	});
+
+	it('re-derives the enforced reserve for a row that predates it (issue 379)', () => {
+		// localChannelReserveSatoshis is optional INDEPENDENTLY of the amounts
+		// group: rows written by the version that introduced per-attempt amounts
+		// carry the other four and not this one, because the v2 open did not
+		// derive it yet. Restoring such a row must re-derive from the attempt's
+		// own capacity, never write undefined into a required bigint (which
+		// throws on the next persist, and again in the inbound-HTLC gate).
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.opener.getFullState()))
+		);
+		delete json.v2InFlight.localChannelReserveSatoshis;
+		json.localConfig.channelReserveSatoshis = '10000';
+		// Such a row's REMOTE reserve was also written by that version, i.e. by
+		// the capped helper, from the peer's dust limit alone and, on a leased
+		// open, from the pre-lease-fee capacity. Restoring it verbatim would
+		// reinstate the very defect this derivation fixes, so both sides are
+		// re-derived. 1,000 stands in for any such stale value.
+		json.v2InFlight.remoteChannelReserveSatoshis = '1000';
+
+		const restored = deserializeChannelState(json);
+		restored.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+		// A rebuilt channel, not the live one: restoreV2InFlight returns early
+		// when a dual-funding session is already present.
+		const revived = new Channel(restored, h.openerSigner);
+		revived.restoreV2InFlight();
+		const revivedState = revived.getFullState();
+		expect(Number(revivedState.localConfig.channelReserveSatoshis)).to.equal(
+			1_500
+		);
+		expect(Number(revivedState.remoteConfig.channelReserveSatoshis)).to.equal(
+			1_500
+		);
+
+		// A row with no snapshot at all still leaves live state untouched: those
+		// attempts all shared the live amounts by construction.
+		const bare = JSON.parse(
+			JSON.stringify(serializeChannelState(h.opener.getFullState()))
+		);
+		for (const field of [
+			'fundingSatoshis',
+			'localBalanceMsat',
+			'remoteBalanceMsat',
+			'remoteChannelReserveSatoshis',
+			'localChannelReserveSatoshis'
+		]) {
+			delete bare.v2InFlight[field];
+		}
+		bare.localConfig.channelReserveSatoshis = '10000';
+		const bareState = deserializeChannelState(bare);
+		bareState.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+		const bareChannel = new Channel(bareState, h.openerSigner);
+		bareChannel.restoreV2InFlight();
+		expect(
+			Number(bareChannel.getFullState().localConfig.channelReserveSatoshis)
+		).to.equal(10_000);
 	});
 
 	it('survives consecutive refusals and a refusal followed by an operator abort', () => {
@@ -5041,6 +5278,52 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		}
 	});
 
+	it('a force close adopts the confirmed attempt with BOTH its reserves (issue 379)', async function () {
+		// The adoption carries the amounts the confirmed attempt's commitment was
+		// signed at. With a contribution change the two attempts have different
+		// capacities, so the reserves differ too: attempt 0 at 100,000 enforces
+		// 1,000 on the peer, the replacement at 150,000 enforces 1,500.
+		const t = await driveNonLeaseOpen(191, 192, [
+			makeWalletInput(120_000),
+			makeWalletInput(120_000)
+		]);
+		try {
+			expect(
+				t.opener.rbfOpenChannelV2(t.channelId, 2000, undefined, 150_000n).ok
+			).to.equal(true);
+			await settle(
+				() =>
+					t.channel.getFullState().v2InFlight?.rbfAttempt === 1 &&
+					!!t.channel.getFullState().v2InFlight?.fullySigned
+			);
+			expect(
+				Number(t.channel.getFullState().localConfig.channelReserveSatoshis)
+			).to.equal(1_500);
+
+			// The depth callback lands while the channel cannot act on it, so the
+			// superseded winner is only stamped.
+			t.channel.markForReestablish();
+			managerOf(t.opener).handleFundingConfirmed(
+				t.channelId,
+				Buffer.from(t.attempt0Txid).reverse().toString('hex')
+			);
+			const script = bitcoin.payments.p2wpkh({
+				hash: crypto.randomBytes(20)
+			}).output!;
+			const res = managerOf(t.opener).forceClose(t.channelId, script);
+			expect(res.ok, res.error).to.equal(true);
+
+			const st = t.channel.getFullState();
+			expect(st.fundingTxid!.equals(t.attempt0Txid)).to.equal(true);
+			expect(Number(st.fundingSatoshis)).to.equal(100_000);
+			expect(Number(st.remoteConfig.channelReserveSatoshis)).to.equal(1_000);
+			expect(Number(st.localConfig.channelReserveSatoshis)).to.equal(1_000);
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
 	it('adopts the replacement when it confirms; every candidate clears (issue 360)', async function () {
 		const t = await driveSpecWindowRbf(103, 104);
 		try {
@@ -5194,6 +5477,12 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			);
 			expect(Number(st.remoteConfig.channelReserveSatoshis)).to.equal(
 				Number(st.v2InFlight!.remoteChannelReserveSatoshis!)
+			);
+			// Both reserves follow the resumed attempt (issue 379): the raise put
+			// 1,300 in live state and attempt 0 owns 1,000.
+			expect(Number(st.localConfig.channelReserveSatoshis)).to.equal(1_000);
+			expect(Number(st.localConfig.channelReserveSatoshis)).to.equal(
+				Number(st.v2InFlight!.localChannelReserveSatoshis!)
 			);
 			// And a fully signed retained attempt resumes waiting on the chain,
 			// not on the peer (the live-resync mapping).

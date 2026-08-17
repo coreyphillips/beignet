@@ -1300,6 +1300,247 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			expect(channel.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
 		});
 
+		/**
+		 * Issue #379. A v2 reserve is not negotiated: BOLT 2 fixes it at 1% of the
+		 * total channel balance "or the dust_limit_satoshis, whichever is greater",
+		 * with no maximum, and both peers derive it. Two things were wrong.
+		 */
+		const openAcceptorChannel = (
+			openOverrides: Partial<IOpenChannel2Message>,
+			ourDustLimitSatoshis = DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis,
+			ourFundingSatoshis = 0n
+		): {
+			channel: Channel;
+			actions: ReturnType<Channel['handleOpenChannel2']>;
+		} => {
+			const state = createAcceptorState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 0n,
+				pushMsat: 0n,
+				localConfig: {
+					...DEFAULT_CHANNEL_CONFIG,
+					dustLimitSatoshis: ourDustLimitSatoshis
+				},
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				remoteBasepoints: makeBasepoints(),
+				remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
+			});
+			const channel = new Channel(state);
+			const openMsg = makeOpenChannel2Msg({
+				channelId: state.temporaryChannelId,
+				...openOverrides
+			});
+			const localParams = makeDualFundingParams({
+				fundingSatoshis: ourFundingSatoshis,
+				dustLimitSatoshis: ourDustLimitSatoshis,
+				localBasepoints: state.localBasepoints,
+				localPerCommitmentSeed: state.localPerCommitmentSeed
+			});
+			return {
+				channel,
+				actions: channel.handleOpenChannel2(openMsg, localParams)
+			};
+		};
+
+		/** The opener side: initiateOpenV2, then a crafted accept_channel2. */
+		const openOpenerChannel = (
+			ourFundingSatoshis: bigint,
+			acceptOverrides: Partial<IAcceptChannel2Message>
+		): {
+			channel: Channel;
+			actions: ReturnType<Channel['handleAcceptChannel2']>;
+		} => {
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: ourFundingSatoshis,
+				pushMsat: 0n,
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const basepoints = state.localBasepoints;
+			const seed = state.localPerCommitmentSeed;
+			const channel = new Channel(state);
+			const openActions = channel.initiateOpenV2(
+				makeDualFundingParams({
+					fundingSatoshis: ourFundingSatoshis,
+					localBasepoints: basepoints,
+					localPerCommitmentSeed: seed
+				})
+			);
+			expect(
+				openActions.some((a) => a.type === ChannelActionType.ERROR),
+				'the open itself was emitted'
+			).to.be.false;
+			const acceptMsg = makeAcceptChannel2Msg({
+				channelId: channel.getFullState().temporaryChannelId,
+				...acceptOverrides
+			});
+			return { channel, actions: channel.handleAcceptChannel2(acceptMsg) };
+		};
+
+		const refusalOf = (
+			actions: ReturnType<Channel['handleOpenChannel2']>
+		): string | null => {
+			const error = actions.find((a) => a.type === ChannelActionType.ERROR);
+			return error && error.type === ChannelActionType.ERROR
+				? error.message
+				: null;
+		};
+
+		it('derives the v2 reserve without the v1 20% cap (issue 379)', () => {
+			// The v1 helper applies its funding/5 cap LAST, so on a small channel
+			// it lands the reserve BELOW the dust floor the spec's max() exists to
+			// enforce: at capacity 5,000 with a peer dust limit of 1,062 it yields
+			// 1,000, and a 1,000-sat reserve output is dust in the peer's own
+			// commitment. The spec value is 1,062.
+			const { channel, actions } = openAcceptorChannel({
+				fundingSatoshis: 5_000n,
+				dustLimitSatoshis: 1062n
+			});
+			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.be
+				.false;
+			const state = channel.getFullState();
+			expect(state.fundingSatoshis).to.equal(5_000n);
+			// What WE keep: never below either side's dust limit.
+			expect(state.remoteConfig.channelReserveSatoshis).to.equal(1062n);
+			// What we ENFORCE on the peer: 1% floored at the lower dust limit.
+			expect(state.localConfig.channelReserveSatoshis).to.equal(354n);
+		});
+
+		it('enforces the spec reserve on the peer, without our policy floor (issue 379)', () => {
+			// localConfig.channelReserveSatoshis is what we require of THEM, and it
+			// was never derived on a v2 open: it stayed at the static 10,000 for
+			// the channel's life, so under 1,000,000 sat of capacity we rejected an
+			// honest peer's spec-legal HTLC. beignet's stricter 546-sat policy floor
+			// must not reach it either, or a 20,000-sat channel over-enforces 546
+			// against a peer that correctly derives 354.
+			const { channel, actions } = openAcceptorChannel({
+				fundingSatoshis: 20_000n,
+				dustLimitSatoshis: 546n
+			});
+			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.be
+				.false;
+			const state = channel.getFullState();
+			expect(state.localConfig.channelReserveSatoshis).to.equal(354n);
+			// Our own reserve keeps the policy floor, which only ever costs us
+			// spendable balance.
+			expect(state.remoteConfig.channelReserveSatoshis).to.equal(546n);
+
+			// And it takes the LOWER of the two dust limits, so it stays at or
+			// below what the peer derives for itself whichever side is stricter.
+			// Ours raised to 1,062 against a peer at 354 still enforces 354.
+			const strict = openAcceptorChannel(
+				{ fundingSatoshis: 5_000n, dustLimitSatoshis: 354n },
+				1062n
+			);
+			expect(strict.actions.some((a) => a.type === ChannelActionType.ERROR)).to
+				.be.false;
+			const strictState = strict.channel.getFullState();
+			expect(strictState.localConfig.channelReserveSatoshis).to.equal(354n);
+			expect(strictState.remoteConfig.channelReserveSatoshis).to.equal(1062n);
+		});
+
+		it('bounds a v2 peer dust_limit_satoshis at the maximum (issue 379)', () => {
+			// v2 only checked the minimum, while v1 has bounded the maximum since
+			// the FS-1 audit. It matters more now that the reserve is uncapped: a
+			// peer dust limit near the whole capacity would make the reserve WE
+			// keep larger than the channel, on top of trimming our commitment
+			// output as "dust".
+			const refused = openAcceptorChannel({
+				fundingSatoshis: 200_000n,
+				dustLimitSatoshis: 1063n
+			});
+			expect(
+				refused.actions.some(
+					(a) =>
+						a.type === ChannelActionType.ERROR &&
+						/dust_limit_satoshis 1063 exceeds maximum 1062/.test(a.message)
+				)
+			).to.be.true;
+
+			const accepted = openAcceptorChannel({
+				fundingSatoshis: 200_000n,
+				dustLimitSatoshis: 1062n
+			});
+			expect(accepted.actions.some((a) => a.type === ChannelActionType.ERROR))
+				.to.be.false;
+			expect(
+				accepted.channel.getFullState().remoteConfig.channelReserveSatoshis
+			).to.equal(2_000n);
+
+			// The acceptor's dust limit is bounded independently, on the opener's
+			// receive side.
+			expect(
+				refusalOf(
+					openOpenerChannel(200_000n, { dustLimitSatoshis: 1063n }).actions
+				)
+			).to.match(/dust_limit_satoshis 1063 exceeds maximum 1062/);
+			expect(
+				refusalOf(
+					openOpenerChannel(200_000n, { dustLimitSatoshis: 1062n }).actions
+				)
+			).to.equal(null);
+		});
+
+		it('refuses a v2 open whose commitment #0 would have no outputs (issue 379)', () => {
+			// open_channel2 and accept_channel2 inherit accept_channel's
+			// requirements, so BOLT 2's two receiver MUST-fails on the initial
+			// commitment apply: the funder must afford the commitment fee, and
+			// both outputs must not be at or below the channel reserve. Neither
+			// v2 path ran them, and the reserve values alone do not stop this:
+			// a 483/300 split at 253 sat/kw leaves 300 and 300 after the 183-sat
+			// fee, both below the 354-sat dust limit, so BOTH commitments are
+			// built with zero outputs. A transaction with no outputs is invalid,
+			// so neither side would ever have a unilateral exit from the funding.
+			expect(
+				refusalOf(
+					openAcceptorChannel(
+						{ fundingSatoshis: 483n, dustLimitSatoshis: 354n },
+						354n,
+						300n
+					).actions
+				),
+				'acceptor side'
+			).to.match(/both sides at or below their channel reserve/);
+
+			// Mirrored on the opener's receive side.
+			expect(
+				refusalOf(
+					openOpenerChannel(483n, {
+						fundingSatoshis: 300n,
+						dustLimitSatoshis: 354n
+					}).actions
+				),
+				'opener side'
+			).to.match(/both sides at or below their channel reserve/);
+
+			// And an opener that cannot even pay commitment #0's fee.
+			expect(
+				refusalOf(
+					openAcceptorChannel(
+						{ fundingSatoshis: 100n, dustLimitSatoshis: 354n },
+						354n,
+						50_000n
+					).actions
+				),
+				'funder cannot afford the fee'
+			).to.match(/cannot afford the initial commitment fee/);
+
+			// An ordinary open is untouched: a single-funded 20,000-sat channel
+			// leaves the acceptor at 0, which is only ONE side below its reserve.
+			expect(
+				refusalOf(
+					openAcceptorChannel({
+						fundingSatoshis: 20_000n,
+						dustLimitSatoshis: 354n
+					}).actions
+				),
+				'a plain single-funded open still opens'
+			).to.equal(null);
+		});
+
 		it('rejects a will_fund lease on a taproot channel (mutually-exclusive types)', () => {
 			// Round 17 moved the taproot-v2 refusal to ADMISSION: the raw
 			// Channel refuses the proposed type before the lease branch (or
