@@ -372,6 +372,14 @@ would exceed the channel maximum or fall below the funding-output dust floor,
 when the opener could no longer pay commitment #0's fee, or when it would leave
 each side at or under its own channel reserve.
 
+A v2 open (and every RBF replacement) is admitted against BOLT 2's two receiver
+MUST-fails on the initial commitment, which `open_channel2` and `accept_channel2`
+inherit from their v1 counterparts: the funder must be able to pay commitment
+#0's fee, and both outputs must not be at or below the channel reserve. A split
+failing either would produce a commitment with every output trimmed away, and a
+transaction with no outputs cannot be broadcast, so the side holding it would
+have no unilateral exit from the funding output at all.
+
 A v2 channel exchanges no `channel_reserve_satoshis` at all: BOLT 2 fixes it at
 1% of the total capacity or the `dust_limit_satoshis`, whichever is greater, with
 no maximum, and both peers derive it. The spec does not say whose dust limit

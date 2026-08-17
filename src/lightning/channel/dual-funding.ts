@@ -80,6 +80,13 @@
  * it since the FS-1 audit: unbounded, it both trims our commitment output away
  * and drives the derived reserve past the whole capacity.
  *
+ * open_channel2 and accept_channel2 also INHERIT their v1 counterparts'
+ * requirements, so both receive sites run BOLT 2's initial-commitment MUST-fails
+ * (Channel._v2InitialCommitmentRefusal, shared with the RBF path): the funder
+ * must afford commitment #0's fee, and neither a both-sides-below-reserve split
+ * nor one whose every output trims at either dust limit is admitted, since the
+ * resulting commitment has no outputs and cannot be broadcast at all.
+ *
  * Deliberate policy residuals, all spec-legal under
  * MAY-abort-for-any-reason:
  *   - post-restart replacements are refused (the wallet signing closures

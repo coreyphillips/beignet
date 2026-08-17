@@ -1307,7 +1307,8 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 		 */
 		const openAcceptorChannel = (
 			openOverrides: Partial<IOpenChannel2Message>,
-			ourDustLimitSatoshis = DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis
+			ourDustLimitSatoshis = DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis,
+			ourFundingSatoshis = 0n
 		): {
 			channel: Channel;
 			actions: ReturnType<Channel['handleOpenChannel2']>;
@@ -1331,7 +1332,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 				...openOverrides
 			});
 			const localParams = makeDualFundingParams({
-				fundingSatoshis: 0n,
+				fundingSatoshis: ourFundingSatoshis,
 				dustLimitSatoshis: ourDustLimitSatoshis,
 				localBasepoints: state.localBasepoints,
 				localPerCommitmentSeed: state.localPerCommitmentSeed
@@ -1340,6 +1341,52 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 				channel,
 				actions: channel.handleOpenChannel2(openMsg, localParams)
 			};
+		};
+
+		/** The opener side: initiateOpenV2, then a crafted accept_channel2. */
+		const openOpenerChannel = (
+			ourFundingSatoshis: bigint,
+			acceptOverrides: Partial<IAcceptChannel2Message>
+		): {
+			channel: Channel;
+			actions: ReturnType<Channel['handleAcceptChannel2']>;
+		} => {
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: ourFundingSatoshis,
+				pushMsat: 0n,
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const basepoints = state.localBasepoints;
+			const seed = state.localPerCommitmentSeed;
+			const channel = new Channel(state);
+			const openActions = channel.initiateOpenV2(
+				makeDualFundingParams({
+					fundingSatoshis: ourFundingSatoshis,
+					localBasepoints: basepoints,
+					localPerCommitmentSeed: seed
+				})
+			);
+			expect(
+				openActions.some((a) => a.type === ChannelActionType.ERROR),
+				'the open itself was emitted'
+			).to.be.false;
+			const acceptMsg = makeAcceptChannel2Msg({
+				channelId: channel.getFullState().temporaryChannelId,
+				...acceptOverrides
+			});
+			return { channel, actions: channel.handleAcceptChannel2(acceptMsg) };
+		};
+
+		const refusalOf = (
+			actions: ReturnType<Channel['handleOpenChannel2']>
+		): string | null => {
+			const error = actions.find((a) => a.type === ChannelActionType.ERROR);
+			return error && error.type === ChannelActionType.ERROR
+				? error.message
+				: null;
 		};
 
 		it('derives the v2 reserve without the v1 20% cap (issue 379)', () => {
@@ -1422,6 +1469,76 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			expect(
 				accepted.channel.getFullState().remoteConfig.channelReserveSatoshis
 			).to.equal(2_000n);
+
+			// The acceptor's dust limit is bounded independently, on the opener's
+			// receive side.
+			expect(
+				refusalOf(
+					openOpenerChannel(200_000n, { dustLimitSatoshis: 1063n }).actions
+				)
+			).to.match(/dust_limit_satoshis 1063 exceeds maximum 1062/);
+			expect(
+				refusalOf(
+					openOpenerChannel(200_000n, { dustLimitSatoshis: 1062n }).actions
+				)
+			).to.equal(null);
+		});
+
+		it('refuses a v2 open whose commitment #0 would have no outputs (issue 379)', () => {
+			// open_channel2 and accept_channel2 inherit accept_channel's
+			// requirements, so BOLT 2's two receiver MUST-fails on the initial
+			// commitment apply: the funder must afford the commitment fee, and
+			// both outputs must not be at or below the channel reserve. Neither
+			// v2 path ran them, and the reserve values alone do not stop this:
+			// a 483/300 split at 253 sat/kw leaves 300 and 300 after the 183-sat
+			// fee, both below the 354-sat dust limit, so BOTH commitments are
+			// built with zero outputs. A transaction with no outputs is invalid,
+			// so neither side would ever have a unilateral exit from the funding.
+			expect(
+				refusalOf(
+					openAcceptorChannel(
+						{ fundingSatoshis: 483n, dustLimitSatoshis: 354n },
+						354n,
+						300n
+					).actions
+				),
+				'acceptor side'
+			).to.match(/both sides at or below their channel reserve/);
+
+			// Mirrored on the opener's receive side.
+			expect(
+				refusalOf(
+					openOpenerChannel(483n, {
+						fundingSatoshis: 300n,
+						dustLimitSatoshis: 354n
+					}).actions
+				),
+				'opener side'
+			).to.match(/both sides at or below their channel reserve/);
+
+			// And an opener that cannot even pay commitment #0's fee.
+			expect(
+				refusalOf(
+					openAcceptorChannel(
+						{ fundingSatoshis: 100n, dustLimitSatoshis: 354n },
+						354n,
+						50_000n
+					).actions
+				),
+				'funder cannot afford the fee'
+			).to.match(/cannot afford the initial commitment fee/);
+
+			// An ordinary open is untouched: a single-funded 20,000-sat channel
+			// leaves the acceptor at 0, which is only ONE side below its reserve.
+			expect(
+				refusalOf(
+					openAcceptorChannel({
+						fundingSatoshis: 20_000n,
+						dustLimitSatoshis: 354n
+					}).actions
+				),
+				'a plain single-funded open still opens'
+			).to.equal(null);
 		});
 
 		it('rejects a will_fund lease on a taproot channel (mutually-exclusive types)', () => {

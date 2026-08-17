@@ -157,7 +157,7 @@ export interface IV2InFlight {
 	 * optional INDEPENDENTLY of that marker: rows written by the version that
 	 * introduced the group carry the first four and not this one, since the v2
 	 * open path did not derive it yet. It must therefore be read through
-	 * Channel._v2RecordLocalReserve, which re-derives it from the attempt's own
+	 * Channel._v2RecordReserves, which re-derives it from the attempt's own
 	 * capacity, never off the presence marker.
 	 */
 	fundingSatoshis?: bigint;

@@ -2622,6 +2622,43 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(rolled.v2InFlight!.rbfAttempt).to.equal(0);
 	});
 
+	it('refuses a replacement that trims our own commitment to nothing (issue 379)', () => {
+		// The both-sides-below-reserve rule alone does not cover asymmetric dust
+		// limits. With ours at 1,062 and the peer's at 354, a 751/500 split at
+		// 253 sat/kw leaves us 568 after the 183-sat fee and the peer 500: the
+		// peer clears the 354 reserve we enforce, so the reserve rule passes,
+		// but OUR commitment trims both outputs at 1,062 and is built with none.
+		// The peer's commitment is fine, so we would be the only side without a
+		// unilateral exit.
+		const h = driveToCommitmentExchange({
+			openerDust: MAX_DUST_LIMIT_SATOSHIS
+		});
+		deliverCommitments(h);
+		completeExchange(h);
+		const openerState = h.opener.getFullState();
+		expect(Number(openerState.localConfig.dustLimitSatoshis)).to.equal(1_062);
+		expect(Number(openerState.remoteConfig.dustLimitSatoshis)).to.equal(354);
+
+		const refusal = (
+			h.opener as unknown as {
+				_v2RbfContributionRefusal: (l: bigint, r: bigint) => string | null;
+			}
+		)._v2RbfContributionRefusal(751n, 500n);
+		expect(refusal).to.match(/trims every commitment #0 output at the 1062/);
+
+		// The same split with matching low dust limits is viable and accepted.
+		const symmetric = driveToCommitmentExchange();
+		deliverCommitments(symmetric);
+		completeExchange(symmetric);
+		expect(
+			(
+				symmetric.opener as unknown as {
+					_v2RbfContributionRefusal: (l: bigint, r: bigint) => string | null;
+				}
+			)._v2RbfContributionRefusal(751n, 500n)
+		).to.equal(null);
+	});
+
 	it('refuses out-of-bounds contribution changes attempt-scoped, in both directions (issue 376)', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
@@ -2904,6 +2941,12 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		);
 		delete json.v2InFlight.localChannelReserveSatoshis;
 		json.localConfig.channelReserveSatoshis = '10000';
+		// Such a row's REMOTE reserve was also written by that version, i.e. by
+		// the capped helper, from the peer's dust limit alone and, on a leased
+		// open, from the pre-lease-fee capacity. Restoring it verbatim would
+		// reinstate the very defect this derivation fixes, so both sides are
+		// re-derived. 1,000 stands in for any such stale value.
+		json.v2InFlight.remoteChannelReserveSatoshis = '1000';
 
 		const restored = deserializeChannelState(json);
 		restored.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
@@ -2911,9 +2954,13 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		// when a dual-funding session is already present.
 		const revived = new Channel(restored, h.openerSigner);
 		revived.restoreV2InFlight();
-		expect(
-			Number(revived.getFullState().localConfig.channelReserveSatoshis)
-		).to.equal(1_500);
+		const revivedState = revived.getFullState();
+		expect(Number(revivedState.localConfig.channelReserveSatoshis)).to.equal(
+			1_500
+		);
+		expect(Number(revivedState.remoteConfig.channelReserveSatoshis)).to.equal(
+			1_500
+		);
 
 		// A row with no snapshot at all still leaves live state untouched: those
 		// attempts all shared the live amounts by construction.
