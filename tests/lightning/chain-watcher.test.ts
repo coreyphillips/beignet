@@ -378,6 +378,75 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(missing).to.equal(false);
 		});
 
+		it('a stale failed-watch retry never overwrites a newer RBF watch (issue 376)', async () => {
+			const channelId = crypto.randomBytes(32);
+			const firstTxid = crypto.randomBytes(32).toString('hex');
+			const replacementTxid = crypto.randomBytes(32).toString('hex');
+			const scriptPubkey = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			const scriptHash = computeScriptHash(scriptPubkey);
+
+			// The FIRST registration's subscription fails and is queued for
+			// retry. An RBF then re-registers the same channel with the
+			// replacement as the current attempt, and that one succeeds.
+			const realSubscribe = backend.subscribeToScriptHash.bind(backend);
+			let failures = 1;
+			backend.subscribeToScriptHash = async (
+				sh: string,
+				cb: () => void
+			): Promise<void> => {
+				if (failures > 0) {
+					failures--;
+					throw new Error('transient subscription failure');
+				}
+				return realSubscribe(sh, cb);
+			};
+
+			await watcher.watchFundingOutput(
+				channelId,
+				firstTxid,
+				0,
+				3,
+				scriptPubkey,
+				undefined,
+				[{ txid: firstTxid, outputIndex: 0 }]
+			);
+			await watcher.watchFundingOutput(
+				channelId,
+				replacementTxid,
+				0,
+				3,
+				scriptPubkey,
+				undefined,
+				[
+					{ txid: replacementTxid, outputIndex: 0 },
+					{ txid: firstTxid, outputIndex: 0 }
+				]
+			);
+
+			const confirmedTxids: string[] = [];
+			watcher.on('funding:confirmed', (_cid: Buffer, txid: string) => {
+				confirmedTxids.push(txid);
+			});
+
+			// Both drain paths run: the per-block retry and the safety-net
+			// re-check. Replaying the queued failure would put the first
+			// registration (which does not know the replacement) back in the
+			// map, and the attempt that actually confirms would be lost.
+			backend.simulateNewBlock(100);
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			backend.setHistory(scriptHash, [{ txid: replacementTxid, height: 98 }]);
+			watcher.recheckAllWatches();
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(
+				confirmedTxids,
+				'the newer watch survived the stale retry'
+			).to.deep.equal([replacementTxid]);
+		});
+
 		it('should not confirm before minimum depth', async () => {
 			const channelId = crypto.randomBytes(32);
 			const txid = crypto.randomBytes(32).toString('hex');

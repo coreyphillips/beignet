@@ -140,6 +140,7 @@ import {
 	validateV2ChannelType
 } from './types';
 import { generateNonce } from '../crypto/musig';
+import { isValidPublicKey } from '../crypto/ecdh';
 import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
 import {
@@ -208,7 +209,10 @@ import {
 	IInteractiveTxOutput,
 	InteractiveTxState
 } from '../interactive-tx/types';
-import { validateCompletedInteractiveTx } from '../interactive-tx/validation';
+import {
+	DUST_LIMIT_SATS,
+	validateCompletedInteractiveTx
+} from '../interactive-tx/validation';
 
 function getPerCommitmentPoint(seed: Buffer, commitmentNumber: bigint): Buffer {
 	const index = MAX_INDEX - commitmentNumber;
@@ -388,6 +392,12 @@ export interface IForceClosePlanReady {
 	 * either has the whole spliced view or none of it.
 	 */
 	spliceAdoption: Partial<IChannelState> | null;
+	/**
+	 * The state a CONFIRMED superseded v2 RBF attempt contributes to that
+	 * view, or null when there is none to adopt. Applied as one assignment,
+	 * like the splice adoption above.
+	 */
+	v2Adoption: Partial<IChannelState> | null;
 	/**
 	 * The taproot verification nonce the commitment was aggregated under.
 	 *
@@ -661,7 +671,25 @@ export class Channel {
 		feerate: number;
 		locktime: number;
 		fundingTxid: Buffer;
+		/**
+		 * The changed funding_output_contribution this request proposed, and
+		 * the wallet inputs selected to fund a raise. Carried here so the ack
+		 * applies EXACTLY the split that went out, and so a request that dies
+		 * unapplied (refusal, disconnect, failed binding) can hand its
+		 * now-orphaned pledges back to the wallet.
+		 */
+		contribution?: {
+			fundingSatoshis: bigint;
+			topUpInputs?: ISpliceWalletInput[];
+		};
 	} | null = null;
+	/**
+	 * Wallet inputs selected to raise our funding contribution that no attempt
+	 * ended up spending (the request was refused, lost to a disconnect, or
+	 * rolled back). Drained by the manager, which asks the wallet to release
+	 * their pledges.
+	 */
+	private _danglingV2TopUpInputs: ISpliceWalletInput[] = [];
 	// Our un-echoed tx_abort of a RECORDED v2 open. Connection scoped: the
 	// teardown happens only when the peer's echo confirms it heard the
 	// abort; until then the attempt (and its durable record) stays fully
@@ -1988,6 +2016,21 @@ export class Channel {
 		// "Unexpected channel_ready" on every reconnect of a live channel.
 		if (this._state.localChannelReady && this._state.remoteChannelReady) {
 			return [];
+		}
+		// BOLT 2 abandons an RBF attempt only for a VALID channel_ready, and
+		// the point below is stored as commitment material, so validate it
+		// before anything is abandoned or written. Checked here rather than
+		// beside the assignment: the abandon arms roll a live replacement back
+		// (and can put tx_abort on the wire), so a malformed message would
+		// otherwise destroy a perfectly good attempt on its way to being
+		// rejected.
+		if (!isValidPublicKey(msg.secondPerCommitmentPoint)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'channel_ready has an invalid second_per_commitment_point'
+				}
+			];
 		}
 		// BOLT 2: "If a valid channel_ready message is received in the middle
 		// of an RBF attempt, the attempt MUST be abandoned." The peer's ready
@@ -4677,12 +4720,30 @@ export class Channel {
 			}
 		}
 
+		// A superseded RBF attempt that won the confirmation race while we
+		// could not act on it (see _computeV2ConfirmedAdoption): close against
+		// the funding that is actually on chain, not against the replacement
+		// it beat.
+		const v2Adoption = this._computeV2ConfirmedAdoption();
+		if (v2Adoption && !v2Adoption.remoteCommitmentSignature) {
+			// Same reasoning as the splice arm above: adopting an attempt whose
+			// commitment exchange never completed would leave the REPLACEMENT's
+			// signature in place, which signs an outpoint that will never
+			// exist. There is no unilateral exit for such an attempt.
+			return {
+				ok: false,
+				error:
+					'Cannot force close: confirmed funding attempt has no remote commitment signature to adopt'
+			};
+		}
+
 		// The view this close is planned against: the live state, plus the
-		// splice adoption if there is one. A copy either way, so that nothing
-		// below can reach the live channel by accident.
+		// splice or confirmed-attempt adoption if there is one. A copy either
+		// way, so that nothing below can reach the live channel by accident.
 		const closing = {
 			...this._state,
-			...(spliceAdoption ?? {})
+			...(spliceAdoption ?? {}),
+			...(v2Adoption ?? {})
 		} as IChannelState;
 
 		if (!closing.fundingTxid || !closing.remoteBasepoints) {
@@ -4769,6 +4830,7 @@ export class Channel {
 			ok: true,
 			commitmentTx: built.result.tx.toBuffer(),
 			spliceAdoption,
+			v2Adoption,
 			localNonce,
 			channelId: closing.channelId!
 		};
@@ -4791,6 +4853,13 @@ export class Channel {
 		if (plan.spliceAdoption) {
 			Object.assign(this._state, plan.spliceAdoption);
 			this._finishSpliceRuntime();
+		}
+		if (plan.v2Adoption) {
+			Object.assign(this._state, plan.v2Adoption);
+			// Durable proof of which attempt this close was planned against:
+			// the node's close re-drive and any restart key off the confirmed
+			// adopted record.
+			this._state.v2InFlight!.confirmed = true;
 		}
 		if (plan.localNonce) {
 			this._state.localNonce = plan.localNonce;
@@ -5954,6 +6023,21 @@ export class Channel {
 		this._quiescence.reset();
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
+		// A BOLT 1 error landing mid-RBF-renegotiation: roll back to the
+		// retained attempt before failing, exactly as a disconnect would.
+		// ERRORED is force-closeable, and the renegotiation has already
+		// applied its own amounts to live state while the outpoint and the
+		// peer's signature still belong to the retained attempt, so a close
+		// planned from here would sign a commitment the stored signature does
+		// not cover. The rollback resumes an attempt-aware state, which the
+		// assignment below deliberately overrides: the channel stays failed.
+		if (
+			this._state.state === ChannelState.DUAL_FUNDING_V2 &&
+			this._state.v2InFlight &&
+			this._v2RecordIsStaleRollback()
+		) {
+			this._rollbackToRetainedV2Attempt();
+		}
 		this._state.state = ChannelState.ERRORED;
 		return true;
 	}
@@ -6054,6 +6138,9 @@ export class Channel {
 		this._txAbortSent = false;
 		this._spliceAbortIgnoreCommitment = false;
 		this._reestablishRetransmitted = false;
+		// Any coins selected for a raise the peer never acked go back to the
+		// wallet: the request dies here, so nothing will ever spend them.
+		this._releasePendingRbfTopUp();
 		this._pendingRbfInit = null;
 		// An un-echoed abort of a recorded attempt dies with the connection
 		// too: nothing was torn down, so the attempt resumes over
@@ -6797,6 +6884,17 @@ export class Channel {
 			this._state.fundingTxid = Buffer.from(inflight.fundingTxid);
 			this._state.fundingOutputIndex = inflight.fundingOutputIndex;
 		}
+		// Unconditional, unlike the outpoint above: whenever this runs the
+		// record IS the active attempt, and the row's top-level amounts can be
+		// a LATER attempt's. A contribution change is applied to live state
+		// when the renegotiation is accepted, one persist before the
+		// replacement records itself, so a crash in that window leaves the
+		// replacement's capacity and balances on a row that rolls back to this
+		// record. Restoring here re-pairs the amounts with the attempt for
+		// every caller: startup restore, the open-abandon revert, the live
+		// resync, and the in-memory rollbacks that call this right after
+		// _activateV2Record targeted the same record (idempotent).
+		this._restoreV2RecordSnapshot(inflight);
 	}
 
 	/**
@@ -11462,27 +11560,89 @@ export class Channel {
 	 * share), evaluated without touching the session or the derived list.
 	 * Null when affordable, when no contribution is registered (legacy
 	 * caller-driven flow), or for a plain zero accept, which owes no fee.
+	 *
+	 * `proposed` prices a contribution the channel has not adopted yet (an RBF
+	 * that changes our share, funded by the registered inputs plus whatever
+	 * top-up the caller selected), so the request can be refused before it
+	 * reaches the wire. Nothing is mutated either way.
 	 */
-	private _dualFundingAffordabilityError(feeratePerKw: number): string | null {
+	private _dualFundingAffordabilityError(
+		feeratePerKw: number,
+		proposed?: { contributionSats: bigint; inputs: ISpliceWalletInput[] }
+	): string | null {
 		const session = this._state.dualFundingSession;
 		const c = this._dualFundingContribution;
 		if (!session || !c) return null;
+		const inputs = proposed?.inputs ?? c.inputs;
+		const contributionSats = proposed?.contributionSats ?? c.contributionSats;
 		const initiator = session.isInitiator();
-		if (!initiator && c.inputs.length === 0 && c.contributionSats === 0n) {
+		if (!initiator && inputs.length === 0 && contributionSats === 0n) {
 			return null;
 		}
 		const feeSats = spliceFeeSats(
-			dualFundingContributionWeight(c.inputs.length, initiator),
+			dualFundingContributionWeight(inputs.length, initiator),
 			feeratePerKw
 		);
+		let walletTotal = 0n;
+		for (const w of inputs) {
+			walletTotal += w.value;
+		}
+		if (walletTotal - contributionSats - feeSats < 0n) {
+			return `wallet contribution cannot cover feerate ${feeratePerKw}: inputs ${walletTotal} < contribution ${contributionSats} + fee ${feeSats}`;
+		}
+		return null;
+	}
+
+	/**
+	 * What an RBF that changes our funding contribution to `newFundingSatoshis`
+	 * would need from the wallet: `topUpSats` is 0 when the registered inputs
+	 * already cover it (any decrease, and increases with enough headroom),
+	 * otherwise the shortfall the caller must select and pledge before
+	 * requesting the RBF.
+	 *
+	 * Read-only, and deliberately outside initiateTxRbf: the node layer needs
+	 * the answer BEFORE it decides whether the request can be served
+	 * synchronously or has to go through the wallet first.
+	 */
+	quoteV2RbfContributionChange(
+		newFundingSatoshis: bigint,
+		feeratePerKw: number
+	): { ok: true; topUpSats: bigint } | { ok: false; error: string } {
+		const c = this._dualFundingContribution;
+		if (!c) {
+			return {
+				ok: false,
+				error:
+					'cannot change the funding contribution: no wallet contribution is registered for this open'
+			};
+		}
+		if (this._state.leaseFeeSats !== undefined) {
+			return {
+				ok: false,
+				error:
+					'changing the funding contribution of a leased v2 open is not supported'
+			};
+		}
+		if (newFundingSatoshis <= 0n) {
+			return {
+				ok: false,
+				error: 'RBF funding contribution must be greater than 0'
+			};
+		}
 		let walletTotal = 0n;
 		for (const w of c.inputs) {
 			walletTotal += w.value;
 		}
-		if (walletTotal - c.contributionSats - feeSats < 0n) {
-			return `wallet contribution cannot cover feerate ${feeratePerKw}: inputs ${walletTotal} < contribution ${c.contributionSats} + fee ${feeSats}`;
-		}
-		return null;
+		const required =
+			newFundingSatoshis +
+			spliceFeeSats(
+				dualFundingContributionWeight(c.inputs.length, true),
+				feeratePerKw
+			);
+		return {
+			ok: true,
+			topUpSats: required > walletTotal ? required - walletTotal : 0n
+		};
 	}
 
 	/**
@@ -12078,7 +12238,15 @@ export class Channel {
 			sentTxSignatures: false,
 			receivedTxSignatures: false,
 			confirmed: false,
-			rbfAttempt: session.getRbfCount()
+			rbfAttempt: session.getRbfCount(),
+			// The values this attempt's commitment #0 is about to be built at.
+			// Any contribution change was already applied to live state when
+			// the renegotiation was accepted, so these are this attempt's own.
+			fundingSatoshis: this._state.fundingSatoshis,
+			localBalanceMsat: this._state.localBalanceMsat,
+			remoteBalanceMsat: this._state.remoteBalanceMsat,
+			remoteChannelReserveSatoshis:
+				this._state.remoteConfig.channelReserveSatoshis
 		};
 	}
 
@@ -13554,10 +13722,25 @@ export class Channel {
 
 	/**
 	 * Initiate RBF on the funding transaction (opener only).
+	 *
+	 * `newContribution` changes OUR funding_output_contribution for the
+	 * replacement (BOLT 2 allows a different one per attempt); omitted keeps
+	 * the recorded amount. A raised contribution arrives with the extra wallet
+	 * inputs that fund it, selected and pledged by the caller: the registered
+	 * set is only ever extended, never replaced, so the replacement still
+	 * double-spends every previous attempt.
+	 *
+	 * Every refusal here is a bare ERROR action decided BEFORE anything
+	 * reaches the wire, so a rejected request leaves the current attempt
+	 * untouched on both sides.
 	 */
 	initiateTxRbf(
 		newFeeratePerkw: number,
-		newLocktime?: number
+		newLocktime?: number,
+		newContribution?: {
+			fundingSatoshis: bigint;
+			topUpInputs?: ISpliceWalletInput[];
+		}
 	): ChannelAction[] {
 		// BOLT 2: a node MUST NOT send tx_init_rbf on an option_zeroconf
 		// channel. Local misuse, so a plain ERROR action (no wire error).
@@ -13721,11 +13904,56 @@ export class Channel {
 				}
 			];
 		}
-		// The registered wallet inputs must still cover our share at the new
-		// feerate. Pure arithmetic over already-known values, so it belongs
-		// here: a request the renegotiation could never afford is refused
-		// locally instead of aborting the attempt after the peer acks.
-		const unaffordable = this._dualFundingAffordabilityError(newFeeratePerkw);
+		// Our own changed share is validated against the same bounds the
+		// receive sites apply, before the request can reach the peer.
+		const proposedContribution =
+			newContribution?.fundingSatoshis ??
+			this._state.v2InFlight.localContributionSats;
+		if (newContribution) {
+			if (!this._dualFundingContribution) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'cannot change the funding contribution: no wallet contribution is registered for this open'
+					}
+				];
+			}
+			if (proposedContribution <= 0n) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'RBF funding contribution must be greater than 0'
+					}
+				];
+			}
+			const refusal = this._v2RbfContributionRefusal(
+				proposedContribution,
+				this._state.v2InFlight.remoteContributionSats
+			);
+			if (refusal) {
+				return [{ type: ChannelActionType.ERROR, message: refusal }];
+			}
+		}
+		// The wallet inputs must still cover our share at the new feerate.
+		// Pure arithmetic over already-known values, so it belongs here: a
+		// request the renegotiation could never afford is refused locally
+		// instead of aborting the attempt after the peer acks. A raised
+		// contribution is priced against the COMBINED set (registered plus
+		// the top-up the caller selected for it), which is what acceptance
+		// will install.
+		const unaffordable = this._dualFundingAffordabilityError(
+			newFeeratePerkw,
+			newContribution
+				? {
+						contributionSats: proposedContribution,
+						inputs: [
+							...this._dualFundingContribution!.inputs,
+							...(newContribution.topUpInputs ?? [])
+						]
+				  }
+				: undefined
+		);
 		if (unaffordable) {
 			return [{ type: ChannelActionType.ERROR, message: unaffordable }];
 		}
@@ -13743,11 +13971,15 @@ export class Channel {
 			feerate: newFeeratePerkw
 		};
 		// BOLT 2: a contributor MUST state its funding_output_contribution.
-		// Contribution changes are not supported (the replacement reuses the
-		// registered inputs at the recorded split), so the recorded amount is
-		// restated verbatim; a zero-contribution side omits the TLV.
-		const ourContribution = this._state.v2InFlight!.localContributionSats;
-		if (ourContribution > 0n) {
+		// A CHANGED amount is always stated, explicit zero included: an absent
+		// TLV means "unchanged" between beignet peers, so omitting it is how
+		// the unchanged case is expressed, never a withdrawal. Unchanged keeps
+		// the legacy shape (restate when positive, omit when zero).
+		const ourContribution = proposedContribution;
+		if (
+			ourContribution !== this._state.v2InFlight.localContributionSats ||
+			ourContribution > 0n
+		) {
 			msg.fundingOutputContribution = ourContribution;
 		}
 		// Encode BEFORE any mutation: an out-of-range feerate/locktime throws
@@ -13768,7 +14000,8 @@ export class Channel {
 		this._pendingRbfInit = {
 			feerate: newFeeratePerkw,
 			locktime,
-			fundingTxid: Buffer.from(this._state.v2InFlight!.fundingTxid)
+			fundingTxid: Buffer.from(this._state.v2InFlight!.fundingTxid),
+			contribution: newContribution
 		};
 		// A fresh abort exchange may follow this request (the peer is free
 		// to refuse it); a latch left over from a previous completed
@@ -13819,6 +14052,10 @@ export class Channel {
 	 * commitment exchange never completed activates with a null signature:
 	 * no unilateral exit exists for it, and forceClose refuses rather than
 	 * signs garbage. Every rollback/adoption path MUST route through here.
+	 *
+	 * Also restores the amounts the attempt was negotiated at (see
+	 * _restoreV2RecordSnapshot): with per-attempt contributions the outpoint
+	 * and the signature are only half of what identifies an attempt.
 	 */
 	private _activateV2Record(record: IV2InFlight): void {
 		this._state.fundingTxid = Buffer.from(record.fundingTxid);
@@ -13828,16 +14065,319 @@ export class Channel {
 			: null;
 		// A v2 opening commitment (#0) carries no HTLCs.
 		this._state.remoteHtlcSignatures = [];
+		this._restoreV2RecordSnapshot(record);
+	}
+
+	/**
+	 * Restore the capacity, balances and capacity-derived remote reserve that
+	 * a v2 attempt was negotiated at.
+	 *
+	 * BOLT 2 lets each RBF attempt carry a different
+	 * funding_output_contribution, so these values are per-attempt: an attempt
+	 * reactivated at another attempt's amounts would rebuild its commitment #0
+	 * with a different funding value and different outputs, and the peer's
+	 * stored signature covers none of it.
+	 *
+	 * Records written before contribution changes existed carry no snapshot.
+	 * Those attempts all shared one set of amounts, so live state already
+	 * holds theirs and there is nothing to restore.
+	 */
+	private _restoreV2RecordSnapshot(record: IV2InFlight): void {
+		if (record.fundingSatoshis === undefined) return;
+		this._state.fundingSatoshis = record.fundingSatoshis;
+		this._state.localBalanceMsat = record.localBalanceMsat!;
+		this._state.remoteBalanceMsat = record.remoteBalanceMsat!;
+		this._state.remoteConfig = {
+			...this._state.remoteConfig,
+			channelReserveSatoshis: record.remoteChannelReserveSatoshis!
+		};
+		// Our wallet contribution funds the funding output, so it tracks the
+		// attempt too: the change output and the underfunded check are both
+		// derived from it.
+		if (
+			this._dualFundingContribution &&
+			this._state.leaseFeeSats === undefined
+		) {
+			this._dualFundingContribution.contributionSats =
+				record.localContributionSats;
+		}
+	}
+
+	/**
+	 * Return the registered wallet contribution to the shape the given attempt
+	 * was negotiated at, handing back any inputs that attempt does not spend.
+	 *
+	 * Only a raised contribution ever extends the registered set, and the
+	 * extension belongs to the attempt that raised it: resuming an earlier
+	 * attempt with those inputs still registered would misprice the next
+	 * affordability check and keep coins frozen for a replacement that no
+	 * longer exists. Every attempt spends ALL of the inputs registered for it,
+	 * so the attempt's own transaction identifies its set exactly and no extra
+	 * durable field is needed.
+	 *
+	 * Skipped for leased opens, whose contributionSats carries the lease fee
+	 * the record does not, and whose split cannot change anyway.
+	 */
+	private _restoreDualFundingContributionFor(record: IV2InFlight): void {
+		const c = this._dualFundingContribution;
+		if (!c || this._state.leaseFeeSats !== undefined) return;
+		let spent: Set<string>;
+		try {
+			const tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
+			spent = new Set(
+				tx.ins.map((i) => `${Buffer.from(i.hash).toString('hex')}:${i.index}`)
+			);
+		} catch {
+			// Unreadable record: keep the registered set as it is rather than
+			// drop inputs the resumed attempt may still need. The wallet's
+			// pledge TTL releases anything genuinely orphaned.
+			return;
+		}
+		const kept: ISpliceWalletInput[] = [];
+		for (const input of c.inputs) {
+			const outpoint = `${extractTxidFromPrevTx(input.prevTx).toString(
+				'hex'
+			)}:${input.prevOutputIndex}`;
+			if (spent.has(outpoint)) kept.push(input);
+			else this._danglingV2TopUpInputs.push(input);
+		}
+		c.inputs = kept;
+		c.contributionSats = record.localContributionSats;
+		c.feeratePerKw = record.fundingFeeratePerkw;
+		this._dualFundingContribs = null;
+		this._dualFundingContribIndex = 0;
+	}
+
+	/**
+	 * Hand back the pledges of a contribution raise that never took effect.
+	 * Called wherever a pending RBF request is dropped without being applied.
+	 */
+	private _releasePendingRbfTopUp(): void {
+		this._stashTopUpInputs(this._pendingRbfInit?.contribution?.topUpInputs);
+	}
+
+	/** As above, for arms that captured the request before clearing the latch. */
+	private _stashTopUpInputs(inputs?: ISpliceWalletInput[]): void {
+		if (inputs?.length) this._danglingV2TopUpInputs.push(...inputs);
+	}
+
+	/**
+	 * Wallet inputs this channel selected for a contribution raise that never
+	 * became part of an attempt. The manager drains this and asks the wallet
+	 * to unfreeze them; the provider's pledge TTL is the backstop for windows
+	 * no drain reaches (a crash between selection and registration).
+	 */
+	takeDanglingV2TopUpPledgeOutpoints(): Array<{ txid: string; vout: number }> {
+		if (!this._danglingV2TopUpInputs.length) return [];
+		const outpoints: Array<{ txid: string; vout: number }> = [];
+		for (const input of this._danglingV2TopUpInputs) {
+			try {
+				outpoints.push({
+					txid: bitcoin.Transaction.fromBuffer(input.prevTx).getId(),
+					vout: input.prevOutputIndex
+				});
+			} catch {
+				// Unreadable prevTx: nothing to name, TTL handles it.
+			}
+		}
+		this._danglingV2TopUpInputs = [];
+		return outpoints;
+	}
+
+	/**
+	 * Why a proposed RBF contribution split must be refused, or null when it
+	 * is acceptable.
+	 *
+	 * BOLT 2 allows each attempt its own funding_output_contribution, so the
+	 * split is renegotiable, but the resulting channel still has to be one we
+	 * would have opened: every bound here is the v2 equivalent of a check the
+	 * v1 open path makes at accept time (validateOpenChannelParams is v1-only,
+	 * and a v2 open has no configured minimum).
+	 *
+	 * Refusals are attempt-scoped at both receive sites: the replacement dies,
+	 * both sides keep the recorded attempt, and the channel lives on.
+	 */
+	private _v2RbfContributionRefusal(
+		localSats: bigint,
+		remoteSats: bigint
+	): string | null {
+		const record = this._state.v2InFlight;
+		if (
+			record &&
+			localSats === record.localContributionSats &&
+			remoteSats === record.remoteContributionSats
+		) {
+			// Unchanged: the pre-existing path, nothing to validate.
+			return null;
+		}
+		if (localSats < 0n || remoteSats < 0n) {
+			// funding_output_contribution rides a signed 64-bit TLV, so a
+			// negative amount decodes cleanly and must be rejected here.
+			return 'RBF funding_output_contribution must not be negative';
+		}
+		if (this._state.leaseFeeSats !== undefined) {
+			// The lease fee and the will_fund signature were made over the
+			// ORIGINAL amounts, and the lessor's balance carries that fee.
+			// Renegotiating the split would invalidate the purchase both sides
+			// already agreed on.
+			return 'changing the funding contribution of a leased v2 open is not supported';
+		}
+		const newCapacity = localSats + remoteSats;
+		if (newCapacity > this._maxFundingSatoshis) {
+			return `post-RBF capacity ${newCapacity} exceeds maximum ${this._maxFundingSatoshis}`;
+		}
+		const dustFloor = bigIntMax(
+			bigIntMax(
+				this._state.localConfig.dustLimitSatoshis,
+				this._state.remoteConfig.dustLimitSatoshis
+			),
+			DUST_LIMIT_SATS
+		);
+		if (newCapacity < dustFloor) {
+			// Caught at tx_complete anyway, but refusing at the RBF message
+			// keeps it attempt-scoped instead of failing mid-exchange.
+			return `post-RBF capacity ${newCapacity} is below the funding-output dust floor ${dustFloor}`;
+		}
+		// The opener alone funds commitment #0's fee (and both anchors); a v2
+		// open has no push_msat to soften it. This is also what refuses an
+		// opener that tries to drop its contribution to nothing.
+		const isInitiator =
+			record?.isInitiator ??
+			this._state.dualFundingSession?.isInitiator() ??
+			false;
+		const openerSats = isInitiator ? localSats : remoteSats;
+		const anchor = isAnchorChannel(this._state.channelType);
+		const commitFeeSats =
+			calculateCommitmentFee(
+				this._state.commitmentFeeratePerkw,
+				0,
+				anchor,
+				isTaprootChannel(this._state.channelType)
+			) + (anchor ? ANCHOR_TOTAL_COST : 0n);
+		if (openerSats < commitFeeSats) {
+			return `post-RBF opener contribution ${openerSats} cannot afford the initial commitment fee ${commitFeeSats}`;
+		}
+		// Neither side may be born unable to meet the reserve the new capacity
+		// implies.
+		const reserve = computeChannelReserve(
+			newCapacity,
+			this._state.remoteConfig.dustLimitSatoshis
+		);
+		const openerAfterFee = openerSats - commitFeeSats;
+		const nonOpenerSats = isInitiator ? remoteSats : localSats;
+		if (openerAfterFee < reserve && nonOpenerSats < reserve) {
+			return `post-RBF capacity ${newCapacity} leaves both sides below the channel reserve ${reserve}`;
+		}
+		return null;
+	}
+
+	/**
+	 * Apply an accepted RBF contribution change to live state.
+	 *
+	 * Called at renegotiation ACCEPTANCE (tx_ack_rbf received, or tx_init_rbf
+	 * accepted), once every refusal has been decided, and before anything
+	 * sizes the replacement: the funding output, commitment #0 and the
+	 * completed-tx audits all read these live values.
+	 *
+	 * Non-lease v2 opens have no push and no HTLCs at commitment #0, so each
+	 * side's balance is exactly its contribution; leased opens keep the
+	 * refusal, because their balances also carry the lease fee the will_fund
+	 * signature was made over.
+	 */
+	private _applyV2ContributionChange(
+		newLocalSats: bigint,
+		newRemoteSats: bigint
+	): void {
+		const retained = this._state.v2InFlight;
+		// A record written before snapshots existed is about to become the
+		// rollback target for an attempt with DIFFERENT amounts, so capture
+		// the values it was negotiated at (still live, since nothing else
+		// changes them) before they are overwritten. Without this the
+		// rollback would restore nothing and resume the previous attempt at
+		// the replacement's amounts.
+		if (retained && retained.fundingSatoshis === undefined) {
+			retained.fundingSatoshis = this._state.fundingSatoshis;
+			retained.localBalanceMsat = this._state.localBalanceMsat;
+			retained.remoteBalanceMsat = this._state.remoteBalanceMsat;
+			retained.remoteChannelReserveSatoshis =
+				this._state.remoteConfig.channelReserveSatoshis;
+		}
+		this._state.fundingSatoshis = newLocalSats + newRemoteSats;
+		this._state.localBalanceMsat = newLocalSats * 1000n;
+		this._state.remoteBalanceMsat = newRemoteSats * 1000n;
+		this._state.remoteConfig = {
+			...this._state.remoteConfig,
+			channelReserveSatoshis: computeChannelReserve(
+				this._state.fundingSatoshis,
+				this._state.remoteConfig.dustLimitSatoshis
+			)
+		};
+		if (this._dualFundingContribution) {
+			this._dualFundingContribution.contributionSats = newLocalSats;
+		}
+	}
+
+	/**
+	 * The state a CONFIRMED superseded v2 RBF attempt contributes to a force
+	 * close, or null when no such attempt is waiting to be adopted.
+	 *
+	 * The chain watcher's depth callback is one-shot. When it fires while the
+	 * channel cannot consume it (disconnected, so AWAITING_REESTABLISH), the
+	 * winning attempt is only STAMPED confirmed on its record, and the live
+	 * outpoint still names the replacement it beat. A force close from there
+	 * would spend a funding output that lost the race and can never exist,
+	 * producing an exit the network rejects while the close reports success.
+	 *
+	 * Pure: like _computeSpliceAdoption it only builds the view, so
+	 * prepareForceClose can still refuse without having moved the channel.
+	 */
+	private _computeV2ConfirmedAdoption(): Partial<IChannelState> | null {
+		const previous = this._state.v2PreviousAttempts;
+		if (!previous?.length) return null;
+		// The current attempt confirming is the ordinary case and needs no
+		// adoption: it is already the active one.
+		if (this._state.v2InFlight?.confirmed) return null;
+		const index = previous.findIndex((rec) => rec.confirmed);
+		if (index < 0) return null;
+		const adopted = previous[index];
+		const fields: Partial<IChannelState> = {
+			v2InFlight: adopted,
+			v2PreviousAttempts: undefined,
+			fundingTxid: Buffer.from(adopted.fundingTxid),
+			fundingOutputIndex: adopted.fundingOutputIndex,
+			remoteCommitmentSignature: adopted.remoteCommitmentSig
+				? Buffer.from(adopted.remoteCommitmentSig)
+				: null,
+			// A v2 opening commitment (#0) carries no HTLCs.
+			remoteHtlcSignatures: [],
+			pendingFundingTxHex: undefined
+		};
+		// The amounts this attempt's commitment was signed at; absent on
+		// records predating per-attempt contributions, whose amounts are the
+		// live ones already.
+		if (adopted.fundingSatoshis !== undefined) {
+			fields.fundingSatoshis = adopted.fundingSatoshis;
+			fields.localBalanceMsat = adopted.localBalanceMsat;
+			fields.remoteBalanceMsat = adopted.remoteBalanceMsat;
+			fields.remoteConfig = {
+				...this._state.remoteConfig,
+				channelReserveSatoshis: adopted.remoteChannelReserveSatoshis!
+			};
+		}
+		return fields;
 	}
 
 	private _rollbackToRetainedV2Attempt(): void {
 		this._state.dualFundingSession?.abort();
 		this._state.dualFundingSession = null;
 		this._resetV2Driver();
+		this._releasePendingRbfTopUp();
+		this._pendingRbfInit = null;
 		this.restoreV2InFlight();
 		const record = this._state.v2InFlight;
 		if (record) {
 			this._activateV2Record(record);
+			this._restoreDualFundingContributionFor(record);
 			this._state.state = this._v2StateForRecord(record);
 		} else {
 			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
@@ -13864,6 +14404,7 @@ export class Channel {
 		this._resetV2Driver();
 		this._state.v2InFlight = record;
 		this._activateV2Record(record);
+		this._restoreDualFundingContributionFor(record);
 		this._state.pendingFundingTxHex = record.fullySigned
 			? record.fundingTxHex
 			: undefined;
@@ -13906,9 +14447,12 @@ export class Channel {
 		this._state.dualFundingSession?.abort();
 		this._state.dualFundingSession = null;
 		this._resetV2Driver();
+		this._releasePendingRbfTopUp();
+		this._pendingRbfInit = null;
 		this._state.v2InFlight = adopted;
 		this._state.v2PreviousAttempts = undefined;
 		this._activateV2Record(adopted);
+		this._restoreDualFundingContributionFor(adopted);
 		// The staged rebroadcast hex tracked the replaced attempt; the
 		// adopted tx is on chain, so it only matters when fully signed (the
 		// depth watcher retires it against the adopted txid).
@@ -13948,6 +14492,7 @@ export class Channel {
 			// longer remembers (the pending marker dies with the connection):
 			// it acknowledges nothing. The peer's view converges over
 			// reestablish.
+			this._stashTopUpInputs(pending?.contribution?.topUpInputs);
 			return [];
 		}
 		// Revalidate the binding: the renegotiation must replace exactly the
@@ -13970,6 +14515,7 @@ export class Channel {
 			// new RBF or operator abort cannot overlap it (the delayed echo
 			// would be taken for the newer abort's answer).
 			this._v2RollbackAbortPending = true;
+			this._stashTopUpInputs(pending.contribution?.topUpInputs);
 			return [
 				this._txAbort(
 					this._v2ChannelId(),
@@ -13977,21 +14523,27 @@ export class Channel {
 				)
 			];
 		}
-		// Contribution changes are not supported (see handleTxInitRbf): an
-		// ack that names a different remote contribution than the recorded
-		// attempt's unwinds the same way. Absent = unchanged.
-		if (
-			msg?.fundingOutputContribution !== undefined &&
-			msg.fundingOutputContribution !== bound.remoteContributionSats
-		) {
+		// The peer's contribution for this attempt (see handleTxInitRbf for the
+		// absent-means-unchanged rule), and ours as the request proposed it.
+		// An out-of-bounds ack unwinds on the wire and keeps the recorded
+		// attempt; our own side was already validated before the request left,
+		// so only a misbehaving peer reaches a refusal here.
+		const newRemoteContribution =
+			msg?.fundingOutputContribution ?? bound.remoteContributionSats;
+		const newLocalContribution =
+			pending.contribution?.fundingSatoshis ?? bound.localContributionSats;
+		const contributionRefusal = this._v2RbfContributionRefusal(
+			newLocalContribution,
+			newRemoteContribution
+		);
+		if (contributionRefusal) {
 			this._v2RollbackAbortPending = true;
-			return [
-				this._txAbort(
-					this._v2ChannelId(),
-					'changing the funding contribution in an RBF is not supported'
-				)
-			];
+			this._stashTopUpInputs(pending.contribution?.topUpInputs);
+			return [this._txAbort(this._v2ChannelId(), contributionRefusal)];
 		}
+		const contributionChanged =
+			newLocalContribution !== bound.localContributionSats ||
+			newRemoteContribution !== bound.remoteContributionSats;
 		// The acceptor may require confirmed inputs for the replacement; our
 		// registered inputs are reused verbatim, so a known-unconfirmed one
 		// can never satisfy it. Unwind now instead of failing mid-exchange.
@@ -14000,6 +14552,7 @@ export class Channel {
 			this._dualFundingContribution?.inputs.some((i) => i.confirmed === false)
 		) {
 			this._v2RollbackAbortPending = true;
+			this._stashTopUpInputs(pending.contribution?.topUpInputs);
 			return [
 				this._txAbort(
 					this._v2ChannelId(),
@@ -14007,7 +14560,16 @@ export class Channel {
 				)
 			];
 		}
-		const result = session.initiateRbf(pending.feerate, pending.locktime);
+		const result = session.initiateRbf(
+			pending.feerate,
+			pending.locktime,
+			contributionChanged
+				? {
+						localSats: newLocalContribution,
+						remoteSats: newRemoteContribution
+				  }
+				: undefined
+		);
 		if (!result.ok) {
 			// The peer accepted and is waiting for the renegotiation's first
 			// tx_add_*; a bare local error would strand it. Unwind on the
@@ -14021,6 +14583,7 @@ export class Channel {
 			// operator abort may overlap this abort before its echo. The
 			// stale-record guard in initiateTxRbf keeps this arm a belt.
 			this._v2RollbackAbortPending = true;
+			this._stashTopUpInputs(pending.contribution?.topUpInputs);
 			const reason = result.error || 'Failed to begin the RBF renegotiation';
 			return [
 				this._txAbort(this._v2ChannelId(), reason),
@@ -14035,6 +14598,18 @@ export class Channel {
 		// persistence failure anywhere leaves BOTH sides rolling back to the
 		// shared previous attempt. Only the driver resets.
 		this._resetV2Driver();
+		// Apply the accepted split before anything sizes the replacement:
+		// _computeDualFundingContributions below builds the shared funding
+		// output from the live capacity and our change from the live
+		// contribution. A failure after this point unwinds through
+		// _unwindV2NegotiationOrRollback, which restores the retained
+		// attempt's amounts along with its outpoint.
+		if (contributionChanged) {
+			this._applyV2ContributionChange(
+				newLocalContribution,
+				newRemoteContribution
+			);
+		}
 		// The renegotiation restarts the interactive-tx exchange from
 		// nothing: reprice the registered contribution at the accepted
 		// feerate and drop the derived list so it re-derives against the
@@ -14042,6 +14617,15 @@ export class Channel {
 		// tx_add_* rides behind the persist below, so a failed commit
 		// withholds it and the ack boundary stays the durable one.
 		if (this._dualFundingContribution) {
+			// A raised contribution is funded by the inputs the request
+			// selected on top of the registered set; they were pledged when
+			// the request was made and are adopted here, at acceptance.
+			if (pending.contribution?.topUpInputs?.length) {
+				this._dualFundingContribution.inputs = [
+					...this._dualFundingContribution.inputs,
+					...pending.contribution.topUpInputs
+				];
+			}
 			this._dualFundingContribution.feeratePerKw = pending.feerate;
 			this._dualFundingContribs = null;
 			this._dualFundingContribIndex = 0;
@@ -14171,22 +14755,27 @@ export class Channel {
 			];
 		}
 
-		// Contribution changes are not supported: capacity, balances and
-		// reserves stay identical across attempts, so rollback and adoption
-		// swap only the funding outpoint. An ABSENT TLV means "unchanged"
-		// here (beignet peers predating the TLV send none while keeping their
-		// contribution; a spec peer that stops contributing entirely fails
-		// the funding-output audit attempt-scoped instead). Refusal is
-		// attempt-scoped: both sides keep the recorded attempt.
-		if (
-			msg.fundingOutputContribution !== undefined &&
-			msg.fundingOutputContribution !==
-				this._state.v2InFlight.remoteContributionSats
-		) {
-			const reason =
-				'changing the funding contribution in an RBF is not supported';
-			return [this._txAbort(this._v2ChannelId(), reason)];
+		// BOLT 2: "it may be different from the contribution made in the
+		// previously completed transaction". An ABSENT TLV means "unchanged"
+		// here rather than the spec's "not contributing" (beignet peers
+		// predating the TLV send none while keeping their contribution; a spec
+		// peer that stops contributing entirely fails the funding-output audit
+		// attempt-scoped instead). A changed contribution is accepted within
+		// the bounds below, and refusals stay attempt-scoped: both sides keep
+		// the recorded attempt.
+		const newRemoteContribution =
+			msg.fundingOutputContribution ??
+			this._state.v2InFlight.remoteContributionSats;
+		const localContribution = this._state.v2InFlight.localContributionSats;
+		const contributionRefusal = this._v2RbfContributionRefusal(
+			localContribution,
+			newRemoteContribution
+		);
+		if (contributionRefusal) {
+			return [this._txAbort(this._v2ChannelId(), contributionRefusal)];
 		}
+		const contributionChanged =
+			newRemoteContribution !== this._state.v2InFlight.remoteContributionSats;
 		// Honor require_confirmed_inputs: our registered inputs are reused
 		// verbatim for the replacement, so a known-unconfirmed one can never
 		// satisfy the peer. Mirrors the splice-side check.
@@ -14214,7 +14803,11 @@ export class Channel {
 			];
 		}
 
-		const result = session.handleRbf(msg.feerate, msg.locktime);
+		const result = session.handleRbf(
+			msg.feerate,
+			msg.locktime,
+			contributionChanged ? newRemoteContribution : undefined
+		);
 		if (!result.ok) {
 			// Spec-conformant refusal: tx_abort with the reason, plus the
 			// app-level error for observability.
@@ -14244,6 +14837,14 @@ export class Channel {
 		// cannot produce it (records are created after the state moved to
 		// AWAITING_TX_SIGNATURES). Only the driver resets.
 		this._resetV2Driver();
+		// A changed peer contribution changes the capacity, both balances and
+		// the capacity-derived reserve. Applied here, before anything sizes
+		// the replacement: our contributions re-derive lazily on the opener's
+		// first post-ack tx_add_*, and the funding output, commitment #0 and
+		// the completed-tx audits all read these live values.
+		if (contributionChanged) {
+			this._applyV2ContributionChange(localContribution, newRemoteContribution);
+		}
 		// Restart our side of the interactive-tx exchange: reprice the
 		// registered contribution at the accepted feerate and drop the
 		// derived list (stale serial ids from the discarded builder). It
@@ -14255,8 +14856,8 @@ export class Channel {
 		}
 
 		// Send tx_ack_rbf. BOLT 2: a contributor MUST state its
-		// funding_output_contribution; contributions never change across
-		// attempts here, so the recorded amount is restated verbatim and a
+		// funding_output_contribution. Our own share is unchanged by an
+		// inbound RBF, so the recorded amount is restated verbatim and a
 		// zero-contribution side omits the TLV.
 		const ack: ITxAckRbfMessage = { channelId: this._v2ChannelId() };
 		const ourContribution = this._state.v2InFlight!.localContributionSats;
@@ -14422,9 +15023,11 @@ export class Channel {
 	 * The wallet outpoints this side contributed to the v2 open, reported only
 	 * when the open is conclusively dead with nothing anyone could broadcast
 	 * (isAbandonedV2Open), so callers can release their funding pledges at
-	 * once instead of waiting out the pledge TTL (issue #311). RBF
-	 * renegotiations reuse the same contribution inputs, so this set covers
-	 * every attempt. Empty for a zero-contribution accept and for channels
+	 * once instead of waiting out the pledge TTL (issue #311). The registered
+	 * set is the union of every attempt's inputs (an RBF only ever extends it,
+	 * to fund a raised contribution), so this covers them all; inputs an
+	 * abandoned raise left behind are reported separately by
+	 * takeDanglingV2TopUpPledgeOutpoints. Empty for a zero-contribution accept and for channels
 	 * restored after a restart (the contribution is process-local; the
 	 * provider TTL covers those). txid is display-order hex, matching the
 	 * provider's pledge keys.
@@ -14535,6 +15138,9 @@ export class Channel {
 		// resumes. Echo as the ack the abort expects unless an abort of
 		// ours is already on the wire (BOLT 2: never answer with a second).
 		if (this._pendingRbfInit) {
+			// Refused: the raise it proposed never happens, so release the
+			// coins selected for it.
+			this._releasePendingRbfTopUp();
 			this._pendingRbfInit = null;
 			if (this._txAbortSent) {
 				return this._maybeSendV2TxSigs();

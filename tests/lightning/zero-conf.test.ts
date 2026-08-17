@@ -600,7 +600,7 @@ describe('Zero-Conf Channels', function () {
 			// Simulate receiving a channel_ready while still in SENT_FUNDING_CREATED
 			const fakeChannelReady = {
 				channelId: opener.getChannelId() || crypto.randomBytes(32),
-				secondPerCommitmentPoint: crypto.randomBytes(33),
+				secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
 				shortChannelId: crypto.randomBytes(8)
 			};
 
@@ -621,7 +621,7 @@ describe('Zero-Conf Channels', function () {
 
 			const fakeChannelReady = {
 				channelId: opener.getChannelId()!,
-				secondPerCommitmentPoint: crypto.randomBytes(33),
+				secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
 				shortChannelId: crypto.randomBytes(8)
 			};
 

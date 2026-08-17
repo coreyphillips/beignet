@@ -61,13 +61,24 @@
  * (IChannelState.v2PreviousAttempts) and chain-watched beside the current
  * one: each replacement double-spends all of its predecessors (enforced at
  * tx_complete beside the fee-not-lower rule), at most one attempt can
- * confirm, and whichever does is adopted. Deliberate policy residuals, all
- * spec-legal under MAY-abort-for-any-reason:
+ * confirm, and whichever does is adopted.
+ *
+ * Either side may change its funding_output_contribution per attempt, so
+ * capacity, both balances and the capacity-derived remote reserve are
+ * per-attempt too: every record snapshots the amounts its commitment #0 was
+ * built at, and every rollback, adoption and restart restores them together
+ * with the funding outpoint (an attempt rebuilt at another attempt's amounts
+ * would not be covered by the peer's stored signature). An absent TLV means
+ * "unchanged" rather than the spec's "not contributing", for compatibility
+ * with beignet peers predating the TLV.
+ *
+ * Deliberate policy residuals, all spec-legal under
+ * MAY-abort-for-any-reason:
  *   - post-restart replacements are refused (the wallet signing closures
  *     die with the process; adoption of persisted candidates still works);
- *   - changing funding_output_contribution is refused (contributions stay
- *     fixed across attempts; an absent TLV means "unchanged", for
- *     compatibility with beignet peers predating the TLV);
+ *   - contribution changes are refused on a leased open (bLIP-51: the
+ *     will_fund signature and the lease fee were made over the original
+ *     amounts);
  *   - initiation stays opener-only (the spec allows either side; Eclair
  *     and CLN only expose opener-side commands).
  */
@@ -883,10 +894,18 @@ export class DualFundingSession {
 	/**
 	 * Initiate RBF on the funding transaction (opener only).
 	 * Returns new fee rate and locktime for tx_init_rbf.
+	 *
+	 * `newContributions` carries the split the accepted replacement is
+	 * negotiated at when either side changed its funding_output_contribution
+	 * (BOLT 2 allows a different one per attempt). Omitted means unchanged.
+	 * The channel layer validates the amounts before calling; this only
+	 * records them, atomically with the builder reset, so nothing can observe
+	 * a half-applied attempt.
 	 */
 	initiateRbf(
 		newFeeratePerkw: number,
-		newLocktime?: number
+		newLocktime?: number,
+		newContributions?: { localSats: bigint; remoteSats: bigint }
 	): IDualFundingResult & { feerate?: number; locktime?: number } {
 		if (!this._isInitiator) {
 			return { ok: false, error: 'Only initiator can initiate RBF' };
@@ -928,6 +947,15 @@ export class DualFundingSession {
 		if (this._localParams) {
 			this._localParams.fundingFeeratePerkw = newFeeratePerkw;
 			this._localParams.locktime = locktime;
+			if (newContributions) {
+				this._localParams.fundingSatoshis = newContributions.localSats;
+			}
+		}
+		if (newContributions) {
+			this._remoteFundingSatoshis = newContributions.remoteSats;
+			if (this._remoteParams) {
+				this._remoteParams.fundingSatoshis = newContributions.remoteSats;
+			}
 		}
 
 		this._state = DualFundingState.TX_NEGOTIATION;
@@ -937,8 +965,17 @@ export class DualFundingSession {
 
 	/**
 	 * Handle tx_init_rbf from peer (acceptor side).
+	 *
+	 * `newRemoteContributionSats` is the opener's changed
+	 * funding_output_contribution for this attempt (BOLT 2 permits a different
+	 * one per attempt); omitted means unchanged. Validated by the channel
+	 * layer before this is called.
 	 */
-	handleRbf(feerate: number, locktime: number): IDualFundingResult {
+	handleRbf(
+		feerate: number,
+		locktime: number,
+		newRemoteContributionSats?: bigint
+	): IDualFundingResult {
 		if (this._isInitiator) {
 			return { ok: false, error: 'Initiator cannot receive tx_init_rbf' };
 		}
@@ -971,6 +1008,16 @@ export class DualFundingSession {
 		if (this._remoteParams) {
 			this._remoteParams.fundingFeeratePerkw = feerate;
 			this._remoteParams.locktime = locktime;
+			if (newRemoteContributionSats !== undefined) {
+				this._remoteParams.fundingSatoshis = newRemoteContributionSats;
+			}
+		}
+		// The peer's contribution to the funding output for THIS attempt. The
+		// completed-tx solvency audit reads it back through
+		// getRemoteFundingSatoshis, so a changed amount has to land here or the
+		// replacement would be audited against the previous attempt's share.
+		if (newRemoteContributionSats !== undefined) {
+			this._remoteFundingSatoshis = newRemoteContributionSats;
 		}
 		// The funding feerate is the opener's and applies to the whole
 		// replacement. Our local params were seeded from open_channel2, so

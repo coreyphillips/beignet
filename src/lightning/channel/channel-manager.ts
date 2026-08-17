@@ -1461,6 +1461,9 @@ export class ChannelManager extends EventEmitter {
 			const channelIdHex = channel.getChannelId()?.toString('hex');
 			if (channelIdHex) this.purgeBarrierQueue(channelIdHex);
 			channel.markForReestablish();
+			// The disconnect dropped any un-acked RBF request; coins selected
+			// to raise its contribution are free again.
+			this.releaseDanglingV2Pledges(channel);
 			// A dead unfunded v2 open: either the drop branch just abandoned
 			// a committed RBF renegotiation nothing was signed for, or the
 			// channel was already ERRORED by an abort whose echo never
@@ -1524,6 +1527,7 @@ export class ChannelManager extends EventEmitter {
 				if (idHex && this.channels.has(idHex)) {
 					this.purgeBarrierQueue(idHex);
 					channel.markForReestablish();
+					this.releaseDanglingV2Pledges(channel);
 					continue;
 				}
 			}
@@ -4254,7 +4258,11 @@ export class ChannelManager extends EventEmitter {
 	initiateFundingRbf(
 		channelId: Buffer,
 		feeratePerKw: number,
-		locktime?: number
+		locktime?: number,
+		newContribution?: {
+			fundingSatoshis: bigint;
+			topUpInputs?: ISpliceWalletInput[];
+		}
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel =
@@ -4271,7 +4279,11 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
-		const actions = channel.initiateTxRbf(feeratePerKw, locktime);
+		const actions = channel.initiateTxRbf(
+			feeratePerKw,
+			locktime,
+			newContribution
+		);
 		// A refusal is a bare local ERROR with no wire message: report it to
 		// the caller directly instead of dispatching it (processActions
 		// treats ERROR as a channel failure, which a refused request is not).
@@ -4279,6 +4291,14 @@ export class ChannelManager extends EventEmitter {
 			const firstError = actions.find(
 				(a) => a.type === ChannelActionType.ERROR
 			);
+			// A refused request never reached the wire. Its top-up inputs were
+			// selected and frozen but never registered on the channel, so they
+			// are released directly (the stale-selection case); anything the
+			// channel itself unregistered rides the dangling stash.
+			if (newContribution?.topUpInputs?.length) {
+				this.releaseStaleSelectionPledges(newContribution.topUpInputs);
+			}
+			this.releaseDanglingV2Pledges(channel);
 			return {
 				ok: false,
 				actions,
@@ -5760,6 +5780,23 @@ export class ChannelManager extends EventEmitter {
 			.catch(() => undefined);
 	}
 
+	/**
+	 * Release the pledges of wallet inputs a channel selected to raise its v2
+	 * funding contribution, where the RBF that would have spent them never
+	 * took effect (refused, disconnected, or rolled back). The channel only
+	 * reports inputs no attempt of its own spends, so unlike the abandoned-open
+	 * release this is safe while the channel is very much alive. Best effort:
+	 * the wallet's pledge TTL is the backstop for windows no drain reaches.
+	 */
+	private releaseDanglingV2Pledges(channel: Channel): void {
+		if (!this.fundingProvider?.releaseInputPledges) return;
+		const outpoints = channel.takeDanglingV2TopUpPledgeOutpoints();
+		if (outpoints.length === 0) return;
+		void this.fundingProvider
+			.releaseInputPledges(outpoints)
+			.catch(() => undefined);
+	}
+
 	private processActions(
 		peerPubkey: string,
 		channel: Channel,
@@ -5767,6 +5804,9 @@ export class ChannelManager extends EventEmitter {
 		progress?: IActionDispatchProgress
 	): void {
 		if (actions.length === 0) return;
+		// Cheap when there is nothing staged, and this is the one path every
+		// dispatch-driven rollback funnels through.
+		this.releaseDanglingV2Pledges(channel);
 		const dispatchProgress = progress ?? {
 			index: -1,
 			completedIndex: -1,

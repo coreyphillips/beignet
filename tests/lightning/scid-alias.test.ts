@@ -3,6 +3,7 @@
  */
 
 import { expect } from 'chai';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import crypto from 'crypto';
 import { Channel } from '../../src/lightning/channel/channel';
 import {
@@ -147,7 +148,7 @@ describe('SCID Aliases (Phase 8)', function () {
 			const remoteAlias = crypto.randomBytes(8);
 			channel.handleChannelReady({
 				channelId: state.channelId!,
-				secondPerCommitmentPoint: crypto.randomBytes(33),
+				secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
 				shortChannelId: remoteAlias
 			});
 
@@ -164,7 +165,7 @@ describe('SCID Aliases (Phase 8)', function () {
 
 			channel.handleChannelReady({
 				channelId: state.channelId!,
-				secondPerCommitmentPoint: crypto.randomBytes(33)
+				secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
 			});
 
 			expect(state.remoteScidAlias).to.be.null;
