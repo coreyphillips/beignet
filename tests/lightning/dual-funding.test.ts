@@ -2902,7 +2902,10 @@ describe('Round 17: v2 channel_type admission', () => {
 		}
 
 		function makeLeaseManager(
-			selectSpliceInputs: NonNullable<IFundingProvider['selectSpliceInputs']>
+			selectSpliceInputs: NonNullable<IFundingProvider['selectSpliceInputs']>,
+			selectDualFundingInputs?: NonNullable<
+				IFundingProvider['selectDualFundingInputs']
+			>
 		): ChannelManager {
 			const mgr = new ChannelManager({
 				...makeChannelManagerConfig(),
@@ -2916,7 +2919,8 @@ describe('Round 17: v2 channel_type admission', () => {
 				broadcastTransaction: async () => {
 					throw new Error('not used by this test');
 				},
-				selectSpliceInputs
+				selectSpliceInputs,
+				...(selectDualFundingInputs ? { selectDualFundingInputs } : {})
 			});
 			return mgr;
 		}
@@ -2940,7 +2944,10 @@ describe('Round 17: v2 channel_type admission', () => {
 		}
 
 		function makeAutofundManager(
-			selectSpliceInputs: NonNullable<IFundingProvider['selectSpliceInputs']>
+			selectSpliceInputs: NonNullable<IFundingProvider['selectSpliceInputs']>,
+			selectDualFundingInputs?: NonNullable<
+				IFundingProvider['selectDualFundingInputs']
+			>
 		): ChannelManager {
 			const mgr = new ChannelManager(makeChannelManagerConfig());
 			mgr.setFundingProvider({
@@ -2950,10 +2957,165 @@ describe('Round 17: v2 channel_type admission', () => {
 				broadcastTransaction: async () => {
 					throw new Error('not used by this test');
 				},
-				selectSpliceInputs
+				selectSpliceInputs,
+				...(selectDualFundingInputs ? { selectDualFundingInputs } : {})
 			});
 			return mgr;
 		}
+
+		/**
+		 * Issue #380: a v2 open contribution must be sized with the DUAL-FUNDING
+		 * weight, not the splice weight. Both open paths prefer the
+		 * dual-funding-aware selector and hand it the role whose fee share the
+		 * channel will actually charge; selectSpliceInputs is only the fallback
+		 * for providers that predate the method.
+		 */
+		interface IDualCall {
+			amountSats: bigint;
+			feeratePerKw: number;
+			initiator: boolean;
+		}
+
+		it('funds a lease contribution through the dual-funding selector, as acceptor', async () => {
+			const changeScript = bitcoin.payments.p2wpkh({
+				hash: crypto.randomBytes(20)
+			}).output!;
+			const spliceCalls: bigint[] = [];
+			const dualCalls: IDualCall[] = [];
+			const mgr = makeLeaseManager(
+				async (amountSats) => {
+					spliceCalls.push(amountSats);
+					return { inputs: [makeAutofundInput(900_000)], changeScript };
+				},
+				async (amountSats, feeratePerKw, initiator) => {
+					dualCalls.push({ amountSats, feeratePerKw, initiator });
+					return { inputs: [makeAutofundInput(900_000)], changeScript };
+				}
+			);
+			const sent: number[] = [];
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			const openMsg = makeOpenChannel2Msg({
+				channelType: typeOf(
+					Feature.STATIC_REMOTE_KEY,
+					Feature.ANCHOR_ZERO_FEE_HTLC
+				),
+				channelFlags: 0x00,
+				requestFunds: { requestedSats: 500_000n, blockheight: 800_000 }
+			});
+
+			mgr.handleMessage(
+				peerPubkey,
+				MessageType.OPEN_CHANNEL2,
+				encodeOpenChannel2Message(openMsg)
+			);
+			await settlePromises();
+
+			expect(spliceCalls, 'the splice selector must not be used').to.deep.equal(
+				[]
+			);
+			expect(dualCalls).to.deep.equal([
+				{
+					amountSats: 500_000n,
+					feeratePerKw: openMsg.fundingFeeratePerkw,
+					// We are answering open_channel2, so our fee share excludes the
+					// common fields and the shared funding output.
+					initiator: false
+				}
+			]);
+			expect(
+				sent.filter((type) => type === MessageType.ACCEPT_CHANNEL2)
+			).to.have.length(1);
+		});
+
+		it('funds the opener contribution through the dual-funding selector, as initiator', async () => {
+			const owner = '02' + 'cd'.repeat(32);
+			const changeScript = bitcoin.payments.p2wpkh({
+				hash: crypto.randomBytes(20)
+			}).output!;
+			const spliceCalls: bigint[] = [];
+			const dualCalls: IDualCall[] = [];
+			const mgr = makeAutofundManager(
+				async (amountSats) => {
+					spliceCalls.push(amountSats);
+					return { inputs: [makeAutofundInput(200_000)], changeScript };
+				},
+				async (amountSats, feeratePerKw, initiator) => {
+					dualCalls.push({ amountSats, feeratePerKw, initiator });
+					return { inputs: [makeAutofundInput(200_000)], changeScript };
+				}
+			);
+			const sent: number[] = [];
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			const params = makeDualFundingParams();
+			const channel = mgr.createDualFundedChannel(owner, params);
+			const tempId = channel.getTemporaryChannelId();
+			sent.length = 0;
+
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({ channelId: tempId })
+				)
+			);
+			await settlePromises();
+
+			expect(spliceCalls, 'the splice selector must not be used').to.deep.equal(
+				[]
+			);
+			expect(dualCalls).to.deep.equal([
+				{
+					amountSats: params.fundingSatoshis,
+					feeratePerKw: params.fundingFeeratePerkw,
+					// The initiator additionally pays the common fields and the
+					// shared funding output.
+					initiator: true
+				}
+			]);
+			expect(
+				sent.filter((type) => type === MessageType.TX_ADD_INPUT)
+			).to.have.length(1);
+			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+		});
+
+		it('falls back to the splice selector for a provider without the dual method', async () => {
+			const owner = '02' + 'cd'.repeat(32);
+			const changeScript = bitcoin.payments.p2wpkh({
+				hash: crypto.randomBytes(20)
+			}).output!;
+			const spliceCalls: bigint[] = [];
+			const mgr = makeAutofundManager(async (amountSats) => {
+				spliceCalls.push(amountSats);
+				return { inputs: [makeAutofundInput(200_000)], changeScript };
+			});
+			const sent: number[] = [];
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			const params = makeDualFundingParams();
+			const channel = mgr.createDualFundedChannel(owner, params);
+			const tempId = channel.getTemporaryChannelId();
+			sent.length = 0;
+
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({ channelId: tempId })
+				)
+			);
+			await settlePromises();
+
+			expect(spliceCalls).to.deep.equal([params.fundingSatoshis]);
+			expect(
+				sent.filter((type) => type === MessageType.TX_ADD_INPUT)
+			).to.have.length(1);
+			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+		});
 
 		it('cleans a synchronous refusal when transport throws after delivery', () => {
 			// The reviewer's reproduction: the zero-conf trust gate fired

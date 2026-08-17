@@ -11653,8 +11653,13 @@ export class Channel {
 		if (changeSats < 0n) {
 			return `Dual-funding contribution underfunded: inputs ${walletTotal} < contribution ${c.contributionSats} + fee ${feeSats}`;
 		}
-		// A sub-dust change simply becomes extra fee (mirrors splice-in).
-		if (changeSats > P2WPKH_DUST_LIMIT) {
+		// A change output below the interactive-tx dust floor cannot be added at
+		// all: our own builder rejects it on the way out and the peer rejects it
+		// on the way in, killing an otherwise fundable open. It becomes extra fee
+		// instead. The floor is the NEGOTIATED one, never the 294-sat P2WPKH
+		// figure: selection covers exactly contribution + fee, so change lands in
+		// the 295..545 band routinely rather than exceptionally (issue #380).
+		if (changeSats >= this._v2InteractiveTxDustFloor(session)) {
 			this._dualFundingContribs.push({
 				kind: 'output',
 				output: {
@@ -11665,6 +11670,27 @@ export class Channel {
 			});
 		}
 		return null;
+	}
+
+	/**
+	 * The dust floor an output WE add to a v2 open funding transaction must
+	 * clear.
+	 *
+	 * Mirrors what InteractiveTxBuilder enforces on every tx_add_output, ours
+	 * included: the 546-sat interactive-tx floor, raised to whichever side
+	 * negotiated the larger commitment dust limit (the same pair
+	 * handleTxAddOutput feeds to setDustLimit). Using anything lower means
+	 * emitting an output the peer must reject.
+	 */
+	private _v2InteractiveTxDustFloor(session: DualFundingSession): bigint {
+		const localDust = session.getLocalParams()?.dustLimitSatoshis ?? 0n;
+		const remoteDust = session.isInitiator()
+			? session.getAcceptMsg()?.dustLimitSatoshis ?? 0n
+			: session.getOpenMsg()?.dustLimitSatoshis ?? 0n;
+		let floor = DUST_LIMIT_SATS;
+		if (localDust > floor) floor = localDust;
+		if (remoteDust > floor) floor = remoteDust;
+		return floor;
 	}
 
 	/**
@@ -11718,14 +11744,15 @@ export class Channel {
 	 * the answer BEFORE it decides whether the request can be served
 	 * synchronously or has to go through the wallet first.
 	 *
-	 * The shortfall is priced with the DUAL-FUNDING weight, while the wallet's
-	 * selectSpliceInputs reserves the SPLICE weight for the coins it picks.
-	 * Those diverge as the input count grows, so a very fragmented raise can
-	 * come back a little short and be refused as unaffordable (cleanly, with
-	 * its pledges handed back). Padding it here would mean re-deriving a
-	 * weight constant the splice-weight module explicitly forbids duplicating;
-	 * the real fix is a dual-funding-aware selector on IFundingProvider, which
-	 * the ordinary open path needs too.
+	 * The shortfall is priced over the inputs registered NOW, so it covers the
+	 * contribution's fixed fee terms but not the weight of the top-up coins the
+	 * wallet has yet to pick. Those are the selector's half of the split:
+	 * selectDualFundingInputs is called with topUp = true and charges only
+	 * dualFundingTopUpWeight(k), the marginal per-input weight. The two halves
+	 * add up to exactly what initiateTxRbf then re-checks over the combined set,
+	 * to within the one sat that separates fee(a) + fee(b) from fee(a + b).
+	 * Pricing the top-up as a whole contribution instead double-counts the fixed
+	 * terms and refuses a raise the wallet can afford (issue #380).
 	 */
 	quoteV2RbfContributionChange(
 		newFundingSatoshis: bigint,

@@ -706,6 +706,218 @@ describe('WalletFundingProvider', () => {
 				}
 			});
 		});
+
+		describe('selectDualFundingInputs (issue #380)', () => {
+			const {
+				spliceFeeSats,
+				estimateSpliceTxWeight,
+				dualFundingContributionWeight
+			} = require('../../../src/lightning/channel/splice-weight');
+
+			/**
+			 * The channel's own arithmetic, Channel._computeDualFundingContributions:
+			 * change = inputs - contribution - fee(dualFundingContributionWeight).
+			 * Negative is the `Dual-funding contribution underfunded` abort.
+			 */
+			function derivedChange(
+				inputs: Array<{ value: bigint }>,
+				contributionSats: bigint,
+				feeratePerKw: number,
+				initiator: boolean
+			): bigint {
+				return (
+					inputs.reduce((s, i) => s + i.value, 0n) -
+					contributionSats -
+					spliceFeeSats(
+						dualFundingContributionWeight(inputs.length, initiator),
+						feeratePerKw
+					)
+				);
+			}
+
+			/**
+			 * An amount a SPLICE-sized selection covers with exactly `count`
+			 * equal UTXOs and zero overshoot, so nothing masks the weight
+			 * difference. Derived from the formulas rather than hard-coded, so a
+			 * change to either weight reshapes the fixture instead of silently
+			 * unbuilding the reproduction.
+			 */
+			function amountSplicePaysWith(
+				count: number,
+				utxoValue: number,
+				feeratePerKw: number
+			): bigint {
+				return (
+					BigInt(count * utxoValue) -
+					spliceFeeSats(
+						estimateSpliceTxWeight({
+							walletInputCount: count,
+							changeScriptLen: 22
+						}),
+						feeratePerKw
+					)
+				);
+			}
+
+			// Past the crossover the splice estimate is the SMALLER of the two, so
+			// a splice-sized selection no longer covers what the channel charges:
+			// n >= 8 as initiator, n >= 13 as acceptor.
+			[
+				{ role: 'opener', initiator: true, shortCount: 12 },
+				{ role: 'lease acceptor', initiator: false, shortCount: 14 }
+			].forEach(({ role, initiator, shortCount }) => {
+				it(`covers the channel fee where a splice-sized selection comes up short (${role})`, async () => {
+					const utxoValue = 30_000;
+					const feeratePerKw = 10_000;
+					const amountSats = amountSplicePaysWith(
+						shortCount,
+						utxoValue,
+						feeratePerKw
+					);
+					const utxos = Array.from({ length: 24 }, () => ({
+						valueSats: utxoValue
+					}));
+
+					// Separate providers so the first selection's pledges cannot
+					// influence the second.
+					const spliceSized = await new WalletFundingProvider(
+						createSpliceMockWallet({ utxos }).wallet
+					).selectSpliceInputs(amountSats, feeratePerKw);
+					expect(spliceSized.inputs.length).to.equal(shortCount);
+					// The bug: the channel charges more than was reserved, so the
+					// open aborts as underfunded after accept_channel2.
+					expect(
+						derivedChange(
+							spliceSized.inputs,
+							amountSats,
+							feeratePerKw,
+							initiator
+						) < 0n
+					).to.equal(true);
+
+					const dualSized = await new WalletFundingProvider(
+						createSpliceMockWallet({ utxos }).wallet
+					).selectDualFundingInputs(amountSats, feeratePerKw, initiator);
+					expect(dualSized.inputs.length).to.be.greaterThan(shortCount);
+					expect(
+						derivedChange(
+							dualSized.inputs,
+							amountSats,
+							feeratePerKw,
+							initiator
+						) >= 0n
+					).to.equal(true);
+				});
+
+				it(`selects to the channel's exact fee boundary (${role})`, async () => {
+					const feeratePerKw = 253;
+					const utxoValue = 500_000n;
+					const exact =
+						utxoValue -
+						spliceFeeSats(
+							dualFundingContributionWeight(1, initiator),
+							feeratePerKw
+						);
+					const utxos = [
+						{ valueSats: Number(utxoValue) },
+						{ valueSats: Number(utxoValue) }
+					];
+
+					// Exactly affordable with one coin: the channel derives zero
+					// change, which is the parity the contract requires.
+					const tight = await new WalletFundingProvider(
+						createSpliceMockWallet({ utxos }).wallet
+					).selectDualFundingInputs(exact, feeratePerKw, initiator);
+					expect(tight.inputs.length).to.equal(1);
+					expect(
+						derivedChange(tight.inputs, exact, feeratePerKw, initiator)
+					).to.equal(0n);
+
+					// One sat past it takes a second coin, so the boundary is the
+					// channel's own and not a cushion hiding a mismatch.
+					const overflowed = await new WalletFundingProvider(
+						createSpliceMockWallet({ utxos }).wallet
+					).selectDualFundingInputs(exact + 1n, feeratePerKw, initiator);
+					expect(overflowed.inputs.length).to.equal(2);
+					expect(
+						derivedChange(
+							overflowed.inputs,
+							exact + 1n,
+							feeratePerKw,
+							initiator
+						) >= 0n
+					).to.equal(true);
+				});
+			});
+
+			it('charges an RBF top-up only the marginal weight of its own coins', async () => {
+				// A raise on a contribution that already holds one 120_000 input:
+				// quoteV2RbfContributionChange prices the shortfall over THAT input,
+				// so the fixed overhead is already inside topUpSats and the top-up
+				// owes only its own per-input weight. At 2000 sat/kw a raise to
+				// 150_000 needs exactly 32_040 from the wallet; charging a second
+				// full initiator contribution would demand 32_800 and refuse a
+				// wallet that can afford the raise.
+				const feeratePerKw = 2000;
+				const registered = 120_000n;
+				const registeredCount = 1;
+				const newFundingSatoshis = 150_000n;
+				const topUpSats =
+					newFundingSatoshis +
+					spliceFeeSats(
+						dualFundingContributionWeight(registeredCount, true),
+						feeratePerKw
+					) -
+					registered;
+				expect(topUpSats).to.equal(31_400n);
+
+				// What the channel actually charges once the coin joins the set.
+				const needed =
+					newFundingSatoshis +
+					spliceFeeSats(
+						dualFundingContributionWeight(registeredCount + 1, true),
+						feeratePerKw
+					) -
+					registered;
+				expect(needed).to.equal(32_040n);
+
+				const { wallet } = createSpliceMockWallet({
+					utxos: [{ valueSats: Number(needed) }]
+				});
+				const { inputs } = await new WalletFundingProvider(
+					wallet
+				).selectDualFundingInputs(topUpSats, feeratePerKw, true, true);
+				expect(inputs.length).to.equal(1);
+				expect(inputs[0].value).to.equal(needed);
+				// The combined set is exactly affordable, which is what
+				// initiateTxRbf re-checks before the request reaches the wire.
+				expect(
+					registered +
+						inputs[0].value -
+						newFundingSatoshis -
+						spliceFeeSats(
+							dualFundingContributionWeight(registeredCount + 1, true),
+							feeratePerKw
+						)
+				).to.equal(0n);
+			});
+
+			it('throws a clear error when the wallet cannot cover the contribution', async () => {
+				const { wallet } = createSpliceMockWallet({
+					utxos: [{ valueSats: 1_000 }]
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				try {
+					await provider.selectDualFundingInputs(500_000n, 253, true);
+					expect.fail('Should have thrown');
+				} catch (err) {
+					expect((err as Error).message).to.include(
+						'insufficient wallet funds for v2 open contribution'
+					);
+				}
+			});
+		});
 	});
 
 	describe('network detection', () => {

@@ -119,10 +119,17 @@ export interface IFundingProvider {
 	): Promise<void>;
 
 	/**
-	 * Splice-in only (optional): select wallet UTXOs covering `amountSats` plus
-	 * fees and return them as splice inputs (each with its prevTx, value and a
+	 * Splice-in (optional): select wallet UTXOs covering `amountSats` plus fees
+	 * and return them as splice inputs (each with its prevTx, value and a
 	 * witness-signing closure) along with a change script. Required for
 	 * `node.spliceIn` to fund the channel increase from the on-chain wallet.
+	 *
+	 * Sized with the SPLICE weight (estimateSpliceTxWeight), which includes the
+	 * shared 2-of-2 funding input a splice always spends. A v2 open funding
+	 * transaction has no such input, so this is NOT the right selector for a
+	 * dual-funding contribution: use selectDualFundingInputs, which the v2 open
+	 * paths prefer and fall back from to this method only for providers that
+	 * predate it (issue #380).
 	 */
 	selectSpliceInputs?(
 		amountSats: bigint,
@@ -172,6 +179,39 @@ export interface IFundingProvider {
 	 * in between aborts the open as underfunded rather than guessing.
 	 */
 	selectMaxDualFundingInputs?(): Promise<{
+		inputs: import('../channel/channel').ISpliceWalletInput[];
+		changeScript: Buffer;
+	}>;
+
+	/**
+	 * Select wallet UTXOs to fund a dual-funded (v2 open) contribution of
+	 * `amountSats` (optional; used by the opener's auto-funding, a lease
+	 * seller's acceptor contribution and an RBF contribution raise).
+	 *
+	 * The target MUST be priced with dualFundingContributionWeight(count,
+	 * initiator) from channel/splice-weight, the SAME formula the channel's
+	 * contribution computation applies to derive change as
+	 * inputs - contribution - fee. Sizing with the splice weight instead
+	 * under-reserves once the input count grows past the point where the
+	 * splice estimator's shared-funding-input term stops covering the
+	 * difference, and the open then dies as underfunded after accept_channel2
+	 * (issue #380).
+	 *
+	 * `initiator` selects our fee share: the initiator additionally pays the
+	 * common transaction fields and the shared funding output.
+	 *
+	 * `topUp` marks an `amountSats` that already covers those fixed terms
+	 * because the contribution already holds registered inputs (an RBF raise).
+	 * Such a selection MUST charge only dualFundingTopUpWeight(count), the
+	 * marginal per-input weight; charging a second full contribution
+	 * double-counts the fixed terms and refuses a raise the wallet can afford.
+	 */
+	selectDualFundingInputs?(
+		amountSats: bigint,
+		feeratePerKw: number,
+		initiator: boolean,
+		topUp?: boolean
+	): Promise<{
 		inputs: import('../channel/channel').ISpliceWalletInput[];
 		changeScript: Buffer;
 	}>;

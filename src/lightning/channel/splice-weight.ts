@@ -88,12 +88,46 @@ export function spliceFeeSats(weight: number, feeratePerKw: number): bigint {
  * committed funding amount as inputs - fee(this weight) — both MUST use this
  * function, never a re-derived constant, or a max open either fails as
  * underfunded or strands sats in an unintended change output.
+ *
+ * The wallet's selection side of that contract is
+ * IFundingProvider.selectDualFundingInputs, which must size its target with
+ * this function too. estimateSpliceTxWeight is NOT a substitute: it includes
+ * the shared 2-of-2 funding input a splice spends, which a v2 open funding
+ * transaction has no equivalent of. That phantom 386 WU makes the splice
+ * estimate the larger of the two at low input counts and the SMALLER one past
+ * the crossover (48n vs the constant gap: n >= 8 as initiator, n >= 13 as
+ * acceptor), where it silently under-reserves and the open dies as underfunded
+ * after accept_channel2 (issue #380).
  */
 export function dualFundingContributionWeight(
 	inputCount: number,
 	initiator: boolean
 ): number {
-	let weight = 320 * inputCount + 140;
+	let weight = DUAL_FUNDING_INPUT_WEIGHT * inputCount + 140;
 	if (initiator) weight += 240;
 	return weight;
+}
+
+/**
+ * Cushioned weight of one wallet input in an interactive-tx contribution.
+ * See dualFundingContributionWeight for why it is above the real 272 WU.
+ */
+export const DUAL_FUNDING_INPUT_WEIGHT = 320;
+
+/**
+ * Weight of ADDING inputs to a contribution that already has some: an RBF
+ * top-up.
+ *
+ * The change output and (for the initiator) the common fields and shared
+ * funding output were already priced against the original inputs, so the
+ * top-up owes only the per-input weight of the coins it brings. Role-independent
+ * for exactly that reason: dualFundingContributionWeight's fixed terms cancel
+ * in the difference, leaving DUAL_FUNDING_INPUT_WEIGHT per input either way.
+ *
+ * Charging a full dualFundingContributionWeight instead double-counts the fixed
+ * terms, which the caller's shortfall already covers, and refuses a raise the
+ * wallet can afford (issue #380).
+ */
+export function dualFundingTopUpWeight(inputCount: number): number {
+	return DUAL_FUNDING_INPUT_WEIGHT * inputCount;
 }
