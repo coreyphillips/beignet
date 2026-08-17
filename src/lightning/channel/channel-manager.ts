@@ -4269,12 +4269,17 @@ export class ChannelManager extends EventEmitter {
 			this.channels.get(idHex) || this.findChannelByChannelIdInTemp(channelId);
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
+			// The wallet selection for a raise runs asynchronously, so the
+			// channel can be gone by the time the request lands. Its coins were
+			// frozen for a request that will never be made.
+			this.releaseStaleSelectionPledges(newContribution?.topUpInputs ?? []);
 			this.emit('error', channelId, error);
 			return { ok: false, actions: [], error };
 		}
 		const peerPubkey = this.channelPeers.get(idHex);
 		if (!peerPubkey) {
 			const error = `Peer not found for channel: ${idHex}`;
+			this.releaseStaleSelectionPledges(newContribution?.topUpInputs ?? []);
 			this.emit('error', channelId, error);
 			return { ok: false, actions: [], error };
 		}

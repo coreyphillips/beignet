@@ -13934,6 +13934,28 @@ export class Channel {
 			if (refusal) {
 				return [{ type: ChannelActionType.ERROR, message: refusal }];
 			}
+			// A pledge that expired while this attempt sat unsigned is handed
+			// back to the wallet, so its own selection can re-offer a coin this
+			// open ALREADY contributes. Spending it twice would build a funding
+			// tx with a duplicate prevout: consensus-invalid, and nothing
+			// downstream rejects it (the interactive-tx builder dedups on
+			// serial id, and both audits would simply count the value twice).
+			// Drop the duplicates here, where the request is still refusable;
+			// if what remains cannot fund the raise, the affordability check
+			// below refuses it.
+			if (newContribution.topUpInputs?.length) {
+				const registered = new Set(
+					this._dualFundingContribution.inputs.map((i) =>
+						this._walletInputOutpointKey(i)
+					)
+				);
+				newContribution = {
+					...newContribution,
+					topUpInputs: newContribution.topUpInputs.filter(
+						(i) => !registered.has(this._walletInputOutpointKey(i))
+					)
+				};
+			}
 		}
 		// The wallet inputs must still cover our share at the new feerate.
 		// Pure arithmetic over already-known values, so it belongs here: a
@@ -14118,6 +14140,16 @@ export class Channel {
 	 * Skipped for leased opens, whose contributionSats carries the lease fee
 	 * the record does not, and whose split cannot change anyway.
 	 */
+	/**
+	 * A wallet input's outpoint in INTERNAL byte order, matching the `hash`
+	 * field of a parsed transaction input so the two can be compared directly.
+	 */
+	private _walletInputOutpointKey(input: ISpliceWalletInput): string {
+		return `${extractTxidFromPrevTx(input.prevTx).toString('hex')}:${
+			input.prevOutputIndex
+		}`;
+	}
+
 	private _restoreDualFundingContributionFor(record: IV2InFlight): void {
 		const c = this._dualFundingContribution;
 		if (!c || this._state.leaseFeeSats !== undefined) return;
@@ -14135,9 +14167,7 @@ export class Channel {
 		}
 		const kept: ISpliceWalletInput[] = [];
 		for (const input of c.inputs) {
-			const outpoint = `${extractTxidFromPrevTx(input.prevTx).toString(
-				'hex'
-			)}:${input.prevOutputIndex}`;
+			const outpoint = this._walletInputOutpointKey(input);
 			if (spent.has(outpoint)) kept.push(input);
 			else this._danglingV2TopUpInputs.push(input);
 		}
@@ -14544,12 +14574,17 @@ export class Channel {
 		const contributionChanged =
 			newLocalContribution !== bound.localContributionSats ||
 			newRemoteContribution !== bound.remoteContributionSats;
-		// The acceptor may require confirmed inputs for the replacement; our
-		// registered inputs are reused verbatim, so a known-unconfirmed one
-		// can never satisfy it. Unwind now instead of failing mid-exchange.
+		// The acceptor may require confirmed inputs for the replacement. Our
+		// registered inputs are reused verbatim, and a raise contributes the
+		// top-up the request selected as well, so BOTH sets have to satisfy it
+		// (the wallet may return unconfirmed coins). Unwind now instead of
+		// failing mid-exchange on a tx_add_input the peer must reject.
 		if (
 			msg?.requireConfirmedInputs &&
-			this._dualFundingContribution?.inputs.some((i) => i.confirmed === false)
+			[
+				...(this._dualFundingContribution?.inputs ?? []),
+				...(pending.contribution?.topUpInputs ?? [])
+			].some((i) => i.confirmed === false)
 		) {
 			this._v2RollbackAbortPending = true;
 			this._stashTopUpInputs(pending.contribution?.topUpInputs);

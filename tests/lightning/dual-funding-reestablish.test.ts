@@ -4652,6 +4652,56 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		}
 	});
 
+	it('a raise never contributes a coin the open already spends (issue 376)', async function () {
+		const shared = makeWalletInput(120_000);
+		// The wallet hands back the SAME coin the open already registered: its
+		// pledge lapsed while the attempt sat unsigned. Contributing it twice
+		// would build a funding tx with a duplicate prevout.
+		const t = await driveNonLeaseOpen(147, 148, [shared, shared]);
+		try {
+			const res = t.opener.rbfOpenChannelV2(
+				t.channelId,
+				2000,
+				undefined,
+				150_000n
+			);
+			expect(res.ok).to.equal(true);
+			await settle(
+				() =>
+					t.channel.getFullState().v2InFlight?.rbfAttempt === 1 ||
+					t.provider.released.length > 0,
+				5_000
+			);
+			const st = t.channel.getFullState();
+			// Dropping the duplicate leaves only the 120k already registered,
+			// which cannot fund a 150k contribution, so the raise is refused
+			// locally and attempt 0 stands. Keeping it would have looked
+			// affordable (the coin counted twice) and produced a replacement
+			// spending the same outpoint twice: consensus-invalid.
+			expect(
+				t.provider.released.length,
+				'the raise was refused locally and its coins handed back, never put on the wire'
+			).to.be.greaterThan(0);
+			expect(
+				st.v2InFlight!.rbfAttempt,
+				'the unaffordable raise was refused, not negotiated'
+			).to.equal(0);
+			for (const rec of [st.v2InFlight!, ...(st.v2PreviousAttempts ?? [])]) {
+				const tx = bitcoin.Transaction.fromHex(rec.fundingTxHex);
+				const outpoints = tx.ins.map(
+					(i) => `${i.hash.toString('hex')}:${i.index}`
+				);
+				expect(
+					new Set(outpoints).size,
+					'no duplicate prevout in any funding tx'
+				).to.equal(outpoints.length);
+			}
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
 	it('a raise refused before the wire still hands its top-up pledges back (issue 376)', async function () {
 		const t = await driveNonLeaseOpen(145, 146, [
 			makeWalletInput(120_000),
