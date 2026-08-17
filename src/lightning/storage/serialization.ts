@@ -547,12 +547,14 @@ export interface ISerializedV2InFlight {
 	rbfAttempt: number;
 	/**
 	 * Per-attempt channel values (see IV2InFlight). Absent on rows written
-	 * before contribution-changing RBF existed.
+	 * before contribution-changing RBF existed; localChannelReserveSatoshis is
+	 * additionally absent on rows written before the v2 open derived it.
 	 */
 	fundingSatoshis?: string;
 	localBalanceMsat?: string;
 	remoteBalanceMsat?: string;
 	remoteChannelReserveSatoshis?: string;
+	localChannelReserveSatoshis?: string;
 }
 
 export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
@@ -592,6 +594,10 @@ export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
 		remoteChannelReserveSatoshis:
 			f.remoteChannelReserveSatoshis !== undefined
 				? bigintToStr(f.remoteChannelReserveSatoshis)
+				: undefined,
+		localChannelReserveSatoshis:
+			f.localChannelReserveSatoshis !== undefined
+				? bigintToStr(f.localChannelReserveSatoshis)
 				: undefined
 	};
 }
@@ -635,6 +641,10 @@ export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 		remoteChannelReserveSatoshis:
 			s.remoteChannelReserveSatoshis !== undefined
 				? strToBigint(s.remoteChannelReserveSatoshis)
+				: undefined,
+		localChannelReserveSatoshis:
+			s.localChannelReserveSatoshis !== undefined
+				? strToBigint(s.localChannelReserveSatoshis)
 				: undefined
 	};
 }

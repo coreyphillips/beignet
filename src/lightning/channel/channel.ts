@@ -280,7 +280,7 @@ function declMsg(
  * capped at funding / 5 (20%). The cap is local policy for the reserve we
  * PROPOSE on a v1 open, not a spec rule: BOLT 2 states no maximum. It must
  * not be applied to a v2 channel, whose reserve is not negotiated at all
- * (see computeV2ChannelReserve).
+ * (see v2ReserveWeKeep).
  */
 const MIN_CHANNEL_RESERVE_SATOSHIS = 546n; // LND enforces P2PKH dust limit as minimum reserve
 
@@ -296,6 +296,10 @@ const LEASE_BLOCKHEIGHT_PAST_TOLERANCE = 6;
 const LEASE_BLOCKHEIGHT_FUTURE_TOLERANCE = 144;
 function bigIntMax(a: bigint, b: bigint): bigint {
 	return a > b ? a : b;
+}
+
+function bigIntMin(a: bigint, b: bigint): bigint {
+	return a < b ? a : b;
 }
 
 function computeChannelReserve(
@@ -315,25 +319,55 @@ function computeChannelReserve(
 }
 
 /**
- * The channel reserve of a v2 (dual-funded) channel.
+ * The channel reserve of a v2 (dual-funded) channel, which BOLT 2 leaves out of
+ * open_channel2/accept_channel2 entirely: "the channel reserve is fixed at 1% of
+ * the total channel balance ... rounded down to the nearest whole satoshi or the
+ * `dust_limit_satoshis`, whichever is greater." Both peers DERIVE it, so there is
+ * nothing to negotiate and, crucially, no maximum: the v1 helper's 20% cap can
+ * pull the result BELOW the dust limit on a small channel, which is exactly the
+ * case the spec's dust floor exists to prevent (a reserve under dust admits a
+ * commitment whose outputs all trim away, leaving no spendable exit).
  *
- * BOLT 2 leaves it out of open_channel2/accept_channel2 entirely: "the channel
- * reserve is fixed at 1% of the total channel balance ... rounded down to the
- * nearest whole satoshi or the `dust_limit_satoshis`, whichever is greater."
- * Both peers DERIVE it, so there is nothing to negotiate and, crucially, no
- * maximum: the v1 helper's 20% cap can pull the result BELOW the dust limit on
- * a small channel, which is exactly the case the spec's dust floor exists to
- * prevent (a reserve under dust admits a commitment whose outputs all trim
- * away, leaving no spendable exit). beignet's stricter 546-sat policy floor is
- * kept, since it only ever raises the reserve.
+ * The spec does not say WHOSE dust_limit_satoshis floors it, and the two
+ * reference implementations disagree: eclair (Commitments.scala localChannelReserve
+ * / remoteChannelReserve) floors each side at the OTHER peer's dust limit, while
+ * CLN (openingd/dualopend.c set_reserve) gives both sides one value floored at the
+ * OPENER's. So the two sides are derived directionally instead of mirroring either,
+ * which is safe against both peers at any dust pairing (and identical to both
+ * whenever the two dust limits agree, which is every real pairing):
+ *
+ *   - the reserve WE keep takes the maximum, so it is never below either peer's
+ *     dust limit and never below what a conforming peer requires of us. Being
+ *     generous here only costs us spendable balance; the reserve is not on the
+ *     wire and the commitment builder never reads it, so it cannot change
+ *     commitment bytes. This is also the only variant that keeps our reserve
+ *     output non-dust in BOTH commitments (BOLT 2's rationale for the v1 dust
+ *     couplings is that each reserve sits above both dust limits).
+ *   - the reserve we ENFORCE on the peer takes the minimum dust limit and skips
+ *     beignet's stricter 546-sat policy floor, so it can never exceed what eclair
+ *     (max(1%, our dust)) or CLN (max(1%, opener dust)) computes for itself in
+ *     either role. A local policy applied here would reject an honest peer's
+ *     spec-legal HTLC; under-enforcing is inert, since the peer's own gate binds.
  */
-function computeV2ChannelReserve(
+function v2ReserveWeKeep(
 	fundingSatoshis: bigint,
-	dustLimitSatoshis: bigint
+	ourDustLimitSatoshis: bigint,
+	peerDustLimitSatoshis: bigint
 ): bigint {
 	return bigIntMax(
-		bigIntMax(fundingSatoshis / 100n, dustLimitSatoshis),
-		MIN_CHANNEL_RESERVE_SATOSHIS
+		bigIntMax(fundingSatoshis / 100n, MIN_CHANNEL_RESERVE_SATOSHIS),
+		bigIntMax(ourDustLimitSatoshis, peerDustLimitSatoshis)
+	);
+}
+
+function v2ReserveWeEnforce(
+	fundingSatoshis: bigint,
+	ourDustLimitSatoshis: bigint,
+	peerDustLimitSatoshis: bigint
+): bigint {
+	return bigIntMax(
+		fundingSatoshis / 100n,
+		bigIntMin(ourDustLimitSatoshis, peerDustLimitSatoshis)
 	);
 }
 
@@ -10797,19 +10831,18 @@ export class Channel {
 		// acceptor's fee rate is the opener's commitment_feerate. Without this the
 		// acceptor built at the default 253 sat/kw and the commitment_signed round
 		// failed for any negotiated feerate. channel_reserve is not carried in v2
-		// (computed, and it does not affect commitment bytes).
+		// (both peers derive it, and it does not affect commitment bytes), so it is
+		// derived for BOTH sides once the dust limits are in place.
 		this._state.remoteConfig = {
+			...this._state.remoteConfig,
 			dustLimitSatoshis: msg.dustLimitSatoshis,
 			maxHtlcValueInFlightMsat: msg.maxHtlcValueInFlightMsat,
-			channelReserveSatoshis: computeChannelReserve(
-				this._state.fundingSatoshis,
-				msg.dustLimitSatoshis
-			),
 			htlcMinimumMsat: msg.htlcMinimumMsat,
 			toSelfDelay: msg.toSelfDelay,
 			maxAcceptedHtlcs: msg.maxAcceptedHtlcs,
 			feeratePerKw: msg.commitmentFeeratePerkw
 		};
+		this._deriveV2ChannelReserves();
 
 		// Script-enforced lease and simple taproot channels are MUTUALLY-EXCLUSIVE
 		// commitment types: LND has no taproot lease script (its taproot to_local and
@@ -10884,6 +10917,10 @@ export class Channel {
 			this._state.fundingSatoshis += feeMsat / 1000n;
 			this._state.localBalanceMsat += feeMsat;
 			this._state.leaseFeeSats = feeMsat / 1000n;
+			// The lease fee grew the capacity the reserves above were derived from,
+			// so re-derive. Nothing between the two points reads a reserve, and no
+			// commitment is built from one, so the order is free.
+			this._deriveV2ChannelReserves();
 			// We are the lessor: our to_local is CSV-locked until the lease expires.
 			this._state.leaseExpiry = computeLeaseExpiry(
 				msg.requestFunds.blockheight
@@ -10978,19 +11015,19 @@ export class Channel {
 		// Populate remoteConfig from accept_channel2 so we build the acceptor's
 		// commitment #0 with the acceptor's negotiated dust/delay. accept_channel2
 		// carries no feerate (the opener sets it), so the acceptor's fee rate is our
-		// own commitment feerate (which we build both commitments at).
+		// own commitment feerate (which we build both commitments at). Neither side's
+		// channel_reserve is carried in v2; both are derived once the dust limits are
+		// in place.
 		this._state.remoteConfig = {
+			...this._state.remoteConfig,
 			dustLimitSatoshis: msg.dustLimitSatoshis,
 			maxHtlcValueInFlightMsat: msg.maxHtlcValueInFlightMsat,
-			channelReserveSatoshis: computeChannelReserve(
-				this._state.fundingSatoshis,
-				msg.dustLimitSatoshis
-			),
 			htlcMinimumMsat: msg.htlcMinimumMsat,
 			toSelfDelay: msg.toSelfDelay,
 			maxAcceptedHtlcs: msg.maxAcceptedHtlcs,
 			feeratePerKw: this._state.commitmentFeeratePerkw
 		};
+		this._deriveV2ChannelReserves();
 
 		// Liquidity ads (bLIP-0051): if the seller committed will_fund, we (the
 		// buyer) pay the lease fee — shift it from us (local) to the seller
@@ -11082,6 +11119,9 @@ export class Channel {
 			this._state.fundingSatoshis += leaseFeeSat;
 			this._state.remoteBalanceMsat += feeMsat;
 			this._state.leaseFeeSats = leaseFeeSat;
+			// Same as the seller side in handleOpenChannel2: the fee grew the
+			// capacity the reserves were derived from.
+			this._deriveV2ChannelReserves();
 			this._state.leaseExpiry = computeLeaseExpiry(requestFunds.blockheight);
 			this._state.leaseCommitBlockheight = requestFunds.blockheight;
 		}
@@ -12304,7 +12344,9 @@ export class Channel {
 			localBalanceMsat: this._state.localBalanceMsat,
 			remoteBalanceMsat: this._state.remoteBalanceMsat,
 			remoteChannelReserveSatoshis:
-				this._state.remoteConfig.channelReserveSatoshis
+				this._state.remoteConfig.channelReserveSatoshis,
+			localChannelReserveSatoshis:
+				this._state.localConfig.channelReserveSatoshis
 		};
 	}
 
@@ -14168,8 +14210,52 @@ export class Channel {
 	}
 
 	/**
-	 * Restore the capacity, balances and capacity-derived remote reserve that
-	 * a v2 attempt was negotiated at.
+	 * Derive BOTH v2 channel reserves from the current capacity.
+	 *
+	 * Called at the two open sites, again whenever a liquidity-ads lease fee
+	 * grows the capacity those sites derived from, and on every accepted RBF
+	 * contribution change. localConfig.dustLimitSatoshis is the dust limit the
+	 * v2 handshake advertises (both the opener's params and the acceptor's
+	 * accept_channel2 are built from config.localConfig), so enforcement matches
+	 * the advertisement.
+	 */
+	private _deriveV2ChannelReserves(): void {
+		const capacity = this._state.fundingSatoshis;
+		const ourDust = this._state.localConfig.dustLimitSatoshis;
+		const peerDust = this._state.remoteConfig.dustLimitSatoshis;
+		this._state.remoteConfig = {
+			...this._state.remoteConfig,
+			channelReserveSatoshis: v2ReserveWeKeep(capacity, ourDust, peerDust)
+		};
+		this._state.localConfig = {
+			...this._state.localConfig,
+			channelReserveSatoshis: v2ReserveWeEnforce(capacity, ourDust, peerDust)
+		};
+	}
+
+	/**
+	 * The reserve we enforce on the peer for a given v2 attempt.
+	 *
+	 * localChannelReserveSatoshis is optional independently of the amounts group
+	 * it sits in: rows written by the version that introduced per-attempt
+	 * amounts carry the other four fields and not this one. Its value is a pure
+	 * function of the attempt's capacity, so those rows re-derive rather than
+	 * restoring undefined into a required field.
+	 */
+	private _v2RecordLocalReserve(record: IV2InFlight): bigint {
+		return (
+			record.localChannelReserveSatoshis ??
+			v2ReserveWeEnforce(
+				record.fundingSatoshis!,
+				this._state.localConfig.dustLimitSatoshis,
+				this._state.remoteConfig.dustLimitSatoshis
+			)
+		);
+	}
+
+	/**
+	 * Restore the capacity, balances and capacity-derived reserves that a v2
+	 * attempt was negotiated at.
 	 *
 	 * BOLT 2 lets each RBF attempt carry a different
 	 * funding_output_contribution, so these values are per-attempt: an attempt
@@ -14189,6 +14275,10 @@ export class Channel {
 		this._state.remoteConfig = {
 			...this._state.remoteConfig,
 			channelReserveSatoshis: record.remoteChannelReserveSatoshis!
+		};
+		this._state.localConfig = {
+			...this._state.localConfig,
+			channelReserveSatoshis: this._v2RecordLocalReserve(record)
 		};
 		// Our wallet contribution funds the funding output, so it tracks the
 		// attempt too: the change output and the underfunded check are both
@@ -14400,15 +14490,18 @@ export class Channel {
 		// and its rationale is precisely to eliminate the case where every
 		// output would be trimmed as dust: since the v2 reserve is floored at
 		// the dust limit, both sides at or under it means the commitment has
-		// no spendable output at all.
-		const reserve = computeV2ChannelReserve(
-			newCapacity,
-			this._state.remoteConfig.dustLimitSatoshis
-		);
-		const openerAfterFee = openerSats - commitFeeSats;
-		const nonOpenerSats = isInitiator ? remoteSats : localSats;
-		if (openerAfterFee <= reserve && nonOpenerSats <= reserve) {
-			return `post-RBF capacity ${newCapacity} leaves both sides at or below the channel reserve ${reserve}`;
+		// no spendable output at all. Each side is measured against ITS own
+		// reserve, which is what the two peers would derive for themselves.
+		const ourDust = this._state.localConfig.dustLimitSatoshis;
+		const peerDust = this._state.remoteConfig.dustLimitSatoshis;
+		const ourReserve = v2ReserveWeKeep(newCapacity, ourDust, peerDust);
+		const theirReserve = v2ReserveWeEnforce(newCapacity, ourDust, peerDust);
+		const ourSatsAfterFee = isInitiator ? localSats - commitFeeSats : localSats;
+		const theirSatsAfterFee = isInitiator
+			? remoteSats
+			: remoteSats - commitFeeSats;
+		if (ourSatsAfterFee <= ourReserve && theirSatsAfterFee <= theirReserve) {
+			return `post-RBF capacity ${newCapacity} leaves both sides at or below their channel reserve (ours ${ourReserve}, theirs ${theirReserve})`;
 		}
 		return null;
 	}
@@ -14443,17 +14536,16 @@ export class Channel {
 			retained.remoteBalanceMsat = this._state.remoteBalanceMsat;
 			retained.remoteChannelReserveSatoshis =
 				this._state.remoteConfig.channelReserveSatoshis;
+			// localChannelReserveSatoshis is deliberately NOT captured: on a
+			// channel opened before the reserve we enforce was derived at all,
+			// live localConfig holds the static config value, and snapshotting
+			// that would restore it durably on the next rollback. Left absent,
+			// _v2RecordLocalReserve re-derives it from the attempt's capacity.
 		}
 		this._state.fundingSatoshis = newLocalSats + newRemoteSats;
 		this._state.localBalanceMsat = newLocalSats * 1000n;
 		this._state.remoteBalanceMsat = newRemoteSats * 1000n;
-		this._state.remoteConfig = {
-			...this._state.remoteConfig,
-			channelReserveSatoshis: computeV2ChannelReserve(
-				this._state.fundingSatoshis,
-				this._state.remoteConfig.dustLimitSatoshis
-			)
-		};
+		this._deriveV2ChannelReserves();
 		if (this._dualFundingContribution) {
 			this._dualFundingContribution.contributionSats = newLocalSats;
 		}
@@ -14504,6 +14596,10 @@ export class Channel {
 			fields.remoteConfig = {
 				...this._state.remoteConfig,
 				channelReserveSatoshis: adopted.remoteChannelReserveSatoshis!
+			};
+			fields.localConfig = {
+				...this._state.localConfig,
+				channelReserveSatoshis: this._v2RecordLocalReserve(adopted)
 			};
 		}
 		return fields;

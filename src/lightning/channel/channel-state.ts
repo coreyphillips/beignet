@@ -147,15 +147,24 @@ export interface IV2InFlight {
 	 * attempt without them would rebuild its commitment at another attempt's
 	 * amounts, and the stored peer signature would not cover it.
 	 *
-	 * Written together or not at all (`fundingSatoshis !== undefined` marks the
-	 * set as present). Optional because rows persisted before contribution
-	 * changes existed have none, and those attempts all shared one set of
-	 * values by construction, so live state is already theirs.
+	 * The first four are written together or not at all
+	 * (`fundingSatoshis !== undefined` marks that set as present). Optional
+	 * because rows persisted before contribution changes existed have none, and
+	 * those attempts all shared one set of values by construction, so live state
+	 * is already theirs.
+	 *
+	 * localChannelReserveSatoshis (the reserve we ENFORCE on the peer) is
+	 * optional INDEPENDENTLY of that marker: rows written by the version that
+	 * introduced the group carry the first four and not this one, since the v2
+	 * open path did not derive it yet. It must therefore be read through
+	 * Channel._v2RecordLocalReserve, which re-derives it from the attempt's own
+	 * capacity, never off the presence marker.
 	 */
 	fundingSatoshis?: bigint;
 	localBalanceMsat?: bigint;
 	remoteBalanceMsat?: bigint;
 	remoteChannelReserveSatoshis?: bigint;
+	localChannelReserveSatoshis?: bigint;
 }
 
 /**
