@@ -146,9 +146,15 @@ const COMMITMENT_TX_HTLC_WEIGHT = 172;
  * Calculate the commitment transaction fee per BOLT 3.
  * fee = floor((base_weight + 172 * num_untrimmed_htlcs) * feerate_per_kw / 1000)
  *
+ * The fee ALONE. Affordability guards want funderCommitmentCostSats below: it
+ * derives both weight flags from the channel_type and adds the anchor outputs
+ * the builder deducts on top of the fee (issue #403).
+ *
  * @param feeratePerKw - Fee rate in sat/kW (from opener's config)
  * @param numUntrimmedHtlcs - Number of non-dust HTLC outputs
  * @param isAnchor - Whether this is an anchor channel (uses higher base weight)
+ * @param isTaproot - Whether this is a simple taproot channel (968 base weight).
+ *   Must be passed alongside isAnchor, which is also true for taproot channels.
  */
 export function calculateCommitmentFee(
 	feeratePerKw: number,
@@ -163,6 +169,49 @@ export function calculateCommitmentFee(
 		: COMMITMENT_TX_BASE_WEIGHT;
 	const weight = baseWeight + COMMITMENT_TX_HTLC_WEIGHT * numUntrimmedHtlcs;
 	return BigInt(Math.floor((weight * feeratePerKw) / 1000));
+}
+
+/**
+ * The total the commitment builder takes off the FUNDER's output: the BOLT 3
+ * commitment fee plus, on anchor channels, the two 330-sat anchor outputs it
+ * deducts separately from the fee (buildLocalCommitment / buildRemoteCommitment
+ * below). Every affordability guard, whether the funder can still afford this
+ * HTLC, this update_fee, this initial commitment, this outbound ceiling, must
+ * measure against THIS and never against the fee alone, or it admits a balance
+ * the builder cannot cover.
+ *
+ * Both weight flags are derived from the channel_type here, in one place,
+ * because they are not independent. isAnchorChannel() is deliberately TRUE for
+ * simple taproot channels (every internal anchor branch must still fire), so a
+ * caller that passes isAnchor and omits isTaproot prices a taproot commitment at
+ * the witness-v0 anchor weight 1124 instead of 968: 156 weight units the peer
+ * never charges. The two receive-side guards then refuse an update_add_htlc or
+ * update_fee that is legal by the peer's own arithmetic, and because the refusal
+ * is a bare ERROR the peer never sees, its next commitment_signed covers state
+ * we do not hold and the channel force closes (issue #403).
+ *
+ * Taproot keeps the 660-sat add: a taproot commitment carries the two anchor
+ * outputs too, and useAnchors in the builders is isAnchorChannel(), so the
+ * builder does deduct them.
+ *
+ * @param feeratePerKw - Fee rate in sat/kW (the opener's, live)
+ * @param numUntrimmedHtlcs - Number of non-dust HTLC outputs
+ * @param channelType - Negotiated channel_type, or null when none was negotiated
+ */
+export function funderCommitmentCostSats(
+	feeratePerKw: number,
+	numUntrimmedHtlcs: number,
+	channelType: Buffer | null
+): bigint {
+	const anchor = isAnchorChannel(channelType);
+	return (
+		calculateCommitmentFee(
+			feeratePerKw,
+			numUntrimmedHtlcs,
+			anchor,
+			isTaprootChannel(channelType)
+		) + (anchor ? ANCHOR_TOTAL_COST : 0n)
+	);
 }
 
 /**
@@ -557,6 +606,8 @@ export function buildLocalCommitment(
 	let localAmount = localMsat / 1000n;
 	let remoteAmount = remoteMsat / 1000n;
 
+	// funderCommitmentCostSats mirrors this deduction (fee + anchors) for the
+	// affordability guards; keep the two in step.
 	if (state.role === ChannelRole.OPENER) {
 		localAmount -= fee;
 		// Anchor channels: deduct 660 sats (2×330) for anchor outputs from opener

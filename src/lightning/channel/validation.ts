@@ -13,12 +13,9 @@ import {
 	MAX_FUNDING_SATOSHIS,
 	MIN_DUST_LIMIT_SATOSHIS,
 	MAX_DUST_LIMIT_SATOSHIS,
-	U64_MAX,
-	isAnchorChannel,
-	isTaprootChannel
+	U64_MAX
 } from './types';
-import { calculateCommitmentFee } from './commitment-builder';
-import { ANCHOR_TOTAL_COST } from '../script/anchor';
+import { funderCommitmentCostSats } from './commitment-builder';
 
 /**
  * Local policy values are written to the wire with writeBigUInt64BE, which
@@ -220,15 +217,8 @@ export function validateOpenChannelParams(
 	// commitment fee (plus both 330-sat anchors on anchor channels), so its
 	// balance after push_msat must cover that in full, and at least one side
 	// must start above channel_reserve or neither commitment output exists.
-	const anchor = isAnchorChannel(msg.channelType ?? null);
 	const commitCostMsat =
-		(calculateCommitmentFee(
-			msg.feeratePerKw,
-			0,
-			anchor,
-			isTaprootChannel(msg.channelType ?? null)
-		) +
-			(anchor ? ANCHOR_TOTAL_COST : 0n)) *
+		funderCommitmentCostSats(msg.feeratePerKw, 0, msg.channelType ?? null) *
 		1000n;
 	const funderMsat = msg.fundingSatoshis * 1000n - msg.pushMsat;
 	if (funderMsat < commitCostMsat) {
