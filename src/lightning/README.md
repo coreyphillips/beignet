@@ -368,17 +368,27 @@ optimistically and a failure arrives as a `node:error` with code
 "not contributing", for compatibility with beignet peers predating the field (a
 peer that stops contributing entirely fails the funding-output audit
 attempt-scoped). A change is refused, attempt-scoped, when the new capacity
-would exceed the channel maximum or fall below the funding-output dust floor,
-when the opener could no longer pay commitment #0's fee, or when it would leave
-each side at or under its own channel reserve.
+would exceed the channel maximum or fall below the funding-output dust floor, or
+when it fails any of the three initial-commitment rules below.
 
-A v2 open (and every RBF replacement) is admitted against BOLT 2's two receiver
-MUST-fails on the initial commitment, which `open_channel2` and `accept_channel2`
-inherit from their v1 counterparts: the funder must be able to pay commitment
-#0's fee, and both outputs must not be at or below the channel reserve. A split
-failing either would produce a commitment with every output trimmed away, and a
-transaction with no outputs cannot be broadcast, so the side holding it would
-have no unilateral exit from the funding output at all.
+A v2 open, and every RBF replacement, is admitted against three separate rules on
+the commitment it is about to build. The first two are BOLT 2's receiver
+MUST-fails, which `open_channel2` and `accept_channel2` inherit from their v1
+counterparts: the funder must be able to pay commitment #0's fee, and both
+outputs must not be at or below the channel reserve. The third is beignet's own,
+and covers what the reserves cannot: each commitment trims at ITS OWN holder's
+`dust_limit_satoshis`, while the reserve enforced on the peer deliberately floors
+at the LOWER of the two, so on an asymmetric-dust channel a balance above that
+reserve can still be dust in the commitment we hold. A split is therefore also
+refused when the larger of the two post-fee balances falls below the larger of
+the two dust limits, which is exactly the condition for one of the commitments to
+have no outputs at all. Commitment #0 carries no HTLCs and an anchor output only
+exists alongside a surviving main output, so nothing else can keep it non-empty.
+The comparison is strict: the builder trims a value below the dust limit and
+keeps one that lands exactly on it, so a split whose larger balance equals the
+larger dust limit is admitted, with the smaller side's balance dust in both
+commitments. A transaction with no outputs cannot be broadcast, so a side holding
+one would have no unilateral exit from the funding output at all.
 
 A v2 channel exchanges no `channel_reserve_satoshis` at all: BOLT 2 fixes it at
 1% of the total capacity or the `dust_limit_satoshis`, whichever is greater, with
@@ -388,6 +398,28 @@ direction: the reserve it keeps takes the greater of the two dust limits, so its
 reserve output is never dust in either commitment, and the reserve it enforces on
 the peer takes the lesser and skips beignet's own 546-sat policy floor, so it can
 never exceed what a conforming peer computes for itself and reject a legal HTLC.
+
+Enforcing the lesser value is inert against the peer's own gate but not against
+our own trim threshold, so the admission rule above has a counterpart on every
+peer-driven update. An inbound `update_add_htlc` or `update_fee` that would leave
+the commitment WE hold with no outputs at all is refused, asked of a candidate
+commitment built by the real builder rather than of a second copy of its
+arithmetic, and skipped entirely whenever the reserve we enforce already sits at
+or above our own dust limit (which is every symmetric-dust channel, so ordinary
+traffic never pays for the check). `getSpendableOutboundMsat` is floored at the
+same dust limit so our own sends cannot reach the state either, and
+`prepareForceClose` refuses to return a plan whose commitment has no outputs
+instead of handing back a transaction the network will reject.
+
+Two repairs run when a channel is restored from disk, one per reserve, each
+moving only in its own safe direction. The reserve we ENFORCE is lowered to what
+the row's capacity prices, since over-enforcing refuses an HTLC the peer believes
+is legal and force closes; the reserve we KEEP is raised to what a v2 capacity
+derives, since under-keeping means the peer refuses our next HTLC instead, and it
+costs only spendable balance. A v2 open still in flight from before either
+reserve was derived has both derived when its record is restored, and is refused
+outright, rather than resumed, when its commitment #0 has no outputs and our
+witnesses can still keep the funding transaction off chain.
 
 Deliberate refusals (all spec-legal): replacements of an open restored from a
 restart (the wallet signing closures die with the process; confirmation

@@ -1636,6 +1636,16 @@ export class ChannelManager extends EventEmitter {
 			// builder-less session from the durable record so the signature
 			// exchange resumes over channel_reestablish.next_funding.
 			channel.restoreV2InFlight();
+			// And refuse to resume one whose commitment #0 has no outputs to
+			// broadcast, while our witnesses can still keep the funding off
+			// chain (issue #387).
+			if (channel.refuseUnviableV2InFlight()) {
+				this.emit(
+					'error',
+					channel.getChannelId(),
+					'v2 open refused on restore: commitment #0 has no broadcastable output'
+				);
+			}
 			// Rows written before the open sites derived the enforced reserve
 			// carry the configured static value forever (issues #381, #387).
 			// Lower it to what their capacity prices. Derived from the row alone,
@@ -1643,6 +1653,11 @@ export class ChannelManager extends EventEmitter {
 			// mutable between runs, and a row is not less broken because the
 			// operator has since changed it.
 			channel.repairEnforcedChannelReserve();
+			// And the mirror: the reserve a v2 row KEEPS was never negotiated,
+			// so a row that predates the derivation carries the configured
+			// constant, which above 1,000,000 sat is LESS than the peer
+			// requires of us. Raise it (issue #387).
+			channel.repairKeptChannelReserve();
 
 			// Mark channels for reestablishment — after a restart the peer
 			// connection is lost, so we must complete channel_reestablish

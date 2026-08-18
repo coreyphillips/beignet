@@ -256,6 +256,33 @@ describe('Commitment Builder', function () {
 			expect(built.result.outputMap.toRemote).to.be.undefined;
 		});
 
+		it('retains an output whose value is exactly the dust limit (issue 388)', function () {
+			// BOLT 3 trims a value BELOW dust_limit_satoshis, so a value that
+			// lands exactly ON the limit is a real output. Every admission rule
+			// that predicts whether a commitment will have outputs has to use
+			// the same strict comparison; nothing pinned the boundary before,
+			// and _v2InitialCommitmentRefusal's asymmetric-dust rule rests on it.
+			const dust = DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis;
+
+			const atLimit = createReadyState();
+			atLimit.openerState.remoteBalanceMsat = dust * 1000n;
+			const kept = buildLocalCommitment(
+				atLimit.openerState,
+				getPerCommitmentPoint(atLimit.openerCommitSeed, 0n)
+			);
+			expect(kept.result.outputMap.toRemote, 'at the limit').to.not.be
+				.undefined;
+
+			const belowLimit = createReadyState();
+			belowLimit.openerState.remoteBalanceMsat = dust * 1000n - 1000n;
+			const trimmed = buildLocalCommitment(
+				belowLimit.openerState,
+				getPerCommitmentPoint(belowLimit.openerCommitSeed, 0n)
+			);
+			expect(trimmed.result.outputMap.toRemote, 'one sat below').to.be
+				.undefined;
+		});
+
 		it('should include HTLC outputs', function () {
 			const { openerState, openerCommitSeed } = createReadyState();
 			openerState.localBalanceMsat = 900_000_000n;

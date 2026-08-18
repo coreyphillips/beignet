@@ -83,9 +83,13 @@
  * open_channel2 and accept_channel2 also INHERIT their v1 counterparts'
  * requirements, so both receive sites run BOLT 2's initial-commitment MUST-fails
  * (Channel._v2InitialCommitmentRefusal, shared with the RBF path): the funder
- * must afford commitment #0's fee, and neither a both-sides-below-reserve split
- * nor one whose every output trims at either dust limit is admitted, since the
- * resulting commitment has no outputs and cannot be broadcast at all.
+ * must afford commitment #0's fee, and a both-sides-below-reserve split is
+ * refused. A third rule, beignet's own, covers what those two cannot on an
+ * asymmetric-dust channel: a split is refused when the LARGER post-fee balance
+ * falls BELOW the LARGER of the two dust limits, which is exactly when one of
+ * the two commitments is built with no outputs and cannot be broadcast at all.
+ * Strictly below, because the builder keeps an output whose value lands exactly
+ * on the dust limit (issue #388).
  *
  * Our on-chain contribution is sourced through
  * IFundingProvider.selectDualFundingInputs, never selectSpliceInputs (issue
