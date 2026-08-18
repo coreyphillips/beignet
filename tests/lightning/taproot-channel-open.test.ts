@@ -10,6 +10,7 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { Channel } from '../../src/lightning/channel/channel';
+import { expectWireRefusal } from './helpers/open-refusal';
 import {
 	createOpenerState,
 	createAcceptorState
@@ -144,7 +145,9 @@ describe('option_taproot open/accept nonce exchange', function () {
 		const actions = makeAcceptor(open.temporaryChannelId).handleOpenChannel(
 			open
 		);
-		expect(actions[0].type).to.equal('ERROR');
+		// And the opener is told, rather than left in SENT_OPEN awaiting an
+		// accept_channel that will never come (issue 381).
+		expectWireRefusal(actions, open.temporaryChannelId, /next_local_nonce/);
 	});
 
 	it('round-trips the nonce TLV through encode/decode', function () {

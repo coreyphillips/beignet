@@ -107,6 +107,7 @@ import {
 	deriveV2ChannelId,
 	deriveV2TemporaryChannelId,
 	validateOpenChannelParams,
+	validatePeerOpenChannelParams,
 	validateAcceptChannelParams,
 	validateU64,
 	isValidShutdownScript
@@ -369,6 +370,67 @@ function v2ReserveWeEnforce(
 		fundingSatoshis / 100n,
 		bigIntMin(ourDustLimitSatoshis, peerDustLimitSatoshis)
 	);
+}
+
+/**
+ * The reserve we may enforce on the peer at a given capacity, re-derived from a
+ * row alone.
+ *
+ * The two callers (splice adoption and the load-time repair) both revisit the
+ * enforced reserve of a channel that is already open, where the value we
+ * advertised is either gone (a row written before issue #381 recorded it) or no
+ * longer priced at the current capacity (a splice). Neither may land ABOVE what
+ * the peer keeps for itself: over-enforcement refuses an HTLC the peer believes
+ * is legal, the refusal is a bare ERROR action the peer never sees, and its next
+ * commitment_signed then covers an HTLC we do not hold. Erring low is inert,
+ * since the peer's own gate binds and no commitment builder reads this value.
+ *
+ * Which of the two rules the peer is applying is decided by the row, not by a
+ * guess:
+ *
+ * - DERIVED, for a v2 row or any row that has ever been spliced. A v2 reserve
+ *   was never negotiated, so both sides derive it. And eclair switches a channel
+ *   to the derived rule for `DualFunding || fundingTxIndex > 0`
+ *   (Commitments.scala localChannelReserve), i.e. once it has been spliced, v1
+ *   included, keeping max(1% of capacity, a dust limit).
+ *   v2ReserveWeEnforce is at or below that in either role and at either peer's
+ *   dust pairing, which is exactly why it omits beignet's 546-sat policy floor:
+ *   that floor sits above what a spliced peer keeps on a small capacity.
+ *   spliceFundingTxid is the marker because it is persisted, starts null and is
+ *   only ever assigned; fundingTxIndex is NOT a splice counter (adoption resets
+ *   it to 0).
+ * - NEGOTIATED, for an unspliced v1 row: the peer keeps the constant we
+ *   advertised at open, which is computeChannelReserve at this capacity.
+ *
+ * The unspliced v1 branch deliberately omits the acceptor's peer-dust floor,
+ * which is why it reproduces the OPENER's advertisement exactly and an
+ * ACCEPTOR's only from below. That floor arrived in PR #115 and our own dust
+ * floor in #381, while computeChannelReserve itself has not changed since the
+ * first commit, so a row written before either advertised the unfloored value
+ * and nothing on disk tells the two apart. Re-deriving today's floors would put
+ * those rows above what their peer keeps, which is the failure this exists to
+ * prevent; omitting them can only under-enforce. The unfloored result is still a
+ * sound lower bound in both roles, since an acceptor's advertisement is a max
+ * over it and an opener's open is refused outright when it lands under our own
+ * dust limit (validateOpenChannelParams).
+ *
+ * A backup-recovered row hardcodes fundingVersion 1 even for a v2 channel, so it
+ * takes the negotiated branch; that errs low, and such a row is ERRORED with
+ * dataLossDetected and never admits an HTLC anyway.
+ */
+function reserveWeEnforceAt(
+	state: IChannelState,
+	capacitySatoshis: bigint
+): bigint {
+	const ourDust = state.localConfig.dustLimitSatoshis;
+	if (state.fundingVersion === 2 || state.spliceFundingTxid) {
+		return v2ReserveWeEnforce(
+			capacitySatoshis,
+			ourDust,
+			state.remoteConfig.dustLimitSatoshis
+		);
+	}
+	return computeChannelReserve(capacitySatoshis, ourDust);
 }
 
 /**
@@ -1106,6 +1168,20 @@ export class Channel {
 			return [{ type: ChannelActionType.ERROR, message: error }];
 		}
 
+		// The reserve we just advertised IS the reserve we enforce on the peer:
+		// localConfig.channelReserveSatoshis is what handleUpdateAddHtlc and
+		// handleUpdateFee require the remote to keep, and what handleAcceptChannel
+		// passes to validateAcceptChannelParams as the value we proposed. Left at
+		// the config default it is a flat 10,000 that only coincides with the wire
+		// value at exactly 1,000,000 sat: below that we refuse the peer's
+		// spec-legal HTLCs, above it we let the peer sit under the reserve it
+		// promised us. Recorded after the last refusal arm, so an open we never
+		// send leaves enforcement untouched.
+		this._state.localConfig = {
+			...this._state.localConfig,
+			channelReserveSatoshis: channelReserve
+		};
+
 		this._state.state = ChannelState.SENT_OPEN;
 		return [sendMsg(MessageType.OPEN_CHANNEL, encodeOpenChannelMessage(msg))];
 	}
@@ -1592,14 +1668,52 @@ export class Channel {
 	 */
 	handleOpenChannel(msg: IOpenChannelMessage): ChannelAction[] {
 		if (this._state.state !== ChannelState.NONE) {
+			// Deliberately LOCAL-only, the same carve-out handleOpenChannel2 makes:
+			// this guard can only fire on a channel that already has a life (a
+			// replayed or misrouted open), and a wire error scoped to that id would
+			// cancel whatever the peer still considers live. Every refusal of a
+			// FRESH open below is wire-visible instead.
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected open_channel' }
 			];
 		}
 
-		const error = validateOpenChannelParams(msg, this._maxFundingSatoshis);
+		// Every rejected inbound open_channel must reach the OPENER too (BOLT 2
+		// negotiation cancellation, BOLT 1 error): a local ERROR action is never
+		// put on the wire, so it deletes our half while the opener sits in
+		// SENT_OPEN awaiting an accept_channel that never comes, retrying the
+		// identical open because nothing told it to stop. Same closure, same
+		// ordering and same reasoning as handleOpenChannel2.
+		//
+		// Scoped to the id the OPENER used, which is the id its side keys the
+		// pending open by and the one ChannelManager keys tempChannels by, so the
+		// wire scope and the local cleanup can never name different entries. It is
+		// also the only one guaranteed to be the 32 bytes encodeErrorMessage
+		// demands, having been sliced from the wire by decodeOpenChannelMessage.
+		//
+		// The wire action LEADS the local ERROR: that action's
+		// removeCurrentTempChannel must not forget the channel before its
+		// cancellation has been handed to the transport.
+		const refuse = (reason: string): ChannelAction[] => [
+			sendMsg(
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: msg.temporaryChannelId,
+					data: Buffer.from(reason, 'ascii')
+				})
+			),
+			{ type: ChannelActionType.ERROR, message: reason }
+		];
+
+		// Peer-supplied, so the bounds that only apply to a value we did not
+		// choose run too. ChannelManager.handleOpenChannel has already seeded
+		// remoteConfig from this message; what makes a refusal here safe is that
+		// the ERROR action drops the temporary channel entirely
+		// (removeCurrentTempChannel), so nothing it seeded ever reaches a live
+		// channel.
+		const error = validatePeerOpenChannelParams(msg, this._maxFundingSatoshis);
 		if (error) {
-			return [{ type: ChannelActionType.ERROR, message: error }];
+			return refuse(error);
 		}
 
 		// Store remote config
@@ -1650,12 +1764,7 @@ export class Channel {
 				!proposedFlags.hasFeature(Feature.STATIC_REMOTE_KEY) &&
 				!proposedFlags.hasFeature(Feature.OPTION_TAPROOT)
 			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Proposed channel type must include static_remotekey'
-					}
-				];
+				return refuse('Proposed channel type must include static_remotekey');
 			}
 			// A zero_conf channel type commits us to minimum_depth 0 (BOLT 2), so
 			// only accept it from peers in the trusted set (unconfirmed funding can
@@ -1664,12 +1773,9 @@ export class Channel {
 			// entry must not change how ordinary opens from that peer validate.
 			if (proposedFlags.hasFeature(Feature.ZERO_CONF)) {
 				if (!this._state.trustedPeer) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: 'Proposed zero_conf channel type requires a trusted peer'
-						}
-					];
+					return refuse(
+						'Proposed zero_conf channel type requires a trusted peer'
+					);
 				}
 				this._state.zeroConfEnabled = true;
 				this._state.minimumDepth = 0;
@@ -1688,22 +1794,30 @@ export class Channel {
 		// lower. And our dust_limit MUST be <= the opener's channel_reserve; we
 		// will not lower our own dust floor, so reject the open instead of
 		// emitting a non-compliant accept_channel the opener must then fail.
+		//
+		// Our OWN dust limit floors it too, because computeChannelReserve applies
+		// its 20% cap last and can land under the very dust floor it starts from:
+		// a 2,500-sat open against a 600-sat local dust limit yields 500. That
+		// pairing breaks the rule this reserve exists to keep (each reserve above
+		// both dust limits, see MAX_DUST_LIMIT_SATOSHIS in types.ts), leaving the
+		// opener a reserve output that trims away in our own commitment, and LND
+		// rejects such an accept_channel outright.
 		const channelReserve = bigIntMax(
 			computeChannelReserve(
 				this._state.fundingSatoshis,
 				this._state.localConfig.dustLimitSatoshis
 			),
-			msg.dustLimitSatoshis
+			bigIntMax(
+				msg.dustLimitSatoshis,
+				this._state.localConfig.dustLimitSatoshis
+			)
 		);
 		if (
 			this._state.localConfig.dustLimitSatoshis > msg.channelReserveSatoshis
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `our dust_limit ${this._state.localConfig.dustLimitSatoshis} exceeds opener channel_reserve ${msg.channelReserveSatoshis}`
-				}
-			];
+			return refuse(
+				`our dust_limit ${this._state.localConfig.dustLimitSatoshis} exceeds opener channel_reserve ${msg.channelReserveSatoshis}`
+			);
 		}
 
 		// max_htlc_value_in_flight_msat is advertised as configured, not
@@ -1714,7 +1828,13 @@ export class Channel {
 			'max_htlc_value_in_flight_msat'
 		);
 		if (acceptMaxHtlcErr) {
-			return [{ type: ChannelActionType.ERROR, message: acceptMaxHtlcErr }];
+			// Our own misconfiguration rather than the peer's fault, and told
+			// anyway, exactly as handleOpenChannel2 tells it: blame does not change
+			// the opener's problem, and a refusal it cannot see leaves it retrying
+			// an open that can never be accepted. The text is a field name and a
+			// protocol constant, and our configured value would have gone out in
+			// accept_channel on the success path regardless.
+			return refuse(acceptMaxHtlcErr);
 		}
 
 		const acceptMsg: IAcceptChannelMessage = {
@@ -1740,16 +1860,19 @@ export class Channel {
 		// option_taproot: record the opener's funding nonce and return ours.
 		if (isTaprootChannel(this._state.channelType)) {
 			if (!msg.nextLocalNonce || msg.nextLocalNonce.length !== 66) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Taproot open_channel missing a valid next_local_nonce'
-					}
-				];
+				return refuse('Taproot open_channel missing a valid next_local_nonce');
 			}
 			this._state.remoteNonce = msg.nextLocalNonce;
 			acceptMsg.nextLocalNonce = this._ensureLocalFundingNonce();
 		}
+
+		// Enforce what we just advertised (see initiateOpen). Recorded after the
+		// last refusal arm, so an open we never accept leaves enforcement
+		// untouched.
+		this._state.localConfig = {
+			...this._state.localConfig,
+			channelReserveSatoshis: channelReserve
+		};
 
 		this._state.state = ChannelState.SENT_ACCEPT;
 		return [
@@ -6981,6 +7104,62 @@ export class Channel {
 	}
 
 	/**
+	 * Lower the enforced channel reserve of a row that is carrying more than its
+	 * capacity prices (issue #381), on load.
+	 *
+	 * A row written before the open sites recorded what they advertised carries
+	 * the configured static reserve, a flat 10,000 by default, for the life of the
+	 * channel: localConfig is persisted per channel and nothing re-derives it.
+	 * Under 1,000,000 sat that refuses HTLCs the peer is entitled to send, and the
+	 * refusal is a bare ERROR the peer never sees, so its next commitment_signed
+	 * covers an HTLC we do not hold and the channel force closes. The fix at the
+	 * open sites cannot reach a channel that is already open, so without this the
+	 * change repairs nothing that exists. A v2 row written before #383 derived
+	 * either reserve is the same shape (issue #387).
+	 *
+	 * Two properties make it safe rather than a second guess at what the channel
+	 * negotiated:
+	 *
+	 * - It only ever LOWERS. The enforced reserve is read at three places
+	 *   (handleUpdateAddHtlc, handleUpdateFee, and IChannelInfo reporting) and a
+	 *   smaller value is strictly more permissive at all of them, so this can stop
+	 *   us refusing traffic the peer believes is legal and can never start
+	 *   refusing anything. That asymmetry is also why a legacy row above
+	 *   1,000,000 sat, which under-enforces, is left alone rather than raised: if
+	 *   the re-derivation were wrong for even one row, raising it opens a refusal
+	 *   band and force closes that channel.
+	 * - reserveWeEnforceAt reads only fields this method never writes, so
+	 *   `stored := min(stored, derived)` is a fixed point after one application
+	 *   and needs no marker to run once. That matters, because a channel row has
+	 *   no schema version to hang a marker on, and the previous gate, "the value
+	 *   is still the node's configured one", silently skipped every row whose
+	 *   operator had changed that configuration since the channel opened.
+	 *   Composing with a splice is safe for the same reason: the adoption tail
+	 *   takes the same min against the same function of the same capacity.
+	 *
+	 * A v2 open still negotiating is left to _restoreV2RecordSnapshot, which
+	 * restoreChannel runs immediately before this and which owns both reserves
+	 * for the active attempt. Nothing is lost by waiting: such a row is not yet
+	 * NORMAL, so it admits no HTLC to over-enforce against, and the repair lands
+	 * at the next load once channel_ready nulls the record.
+	 */
+	repairEnforcedChannelReserve(): void {
+		if (this._state.fundingSatoshis <= 0n) return;
+		if (this._state.v2InFlight || this._state.v2PreviousAttempts?.length) {
+			return;
+		}
+		const derived = reserveWeEnforceAt(
+			this._state,
+			this._state.fundingSatoshis
+		);
+		if (derived >= this._state.localConfig.channelReserveSatoshis) return;
+		this._state.localConfig = {
+			...this._state.localConfig,
+			channelReserveSatoshis: derived
+		};
+	}
+
+	/**
 	 * Record that the splice tx reached confirmation depth while splice_locked
 	 * could not be sent (e.g. the channel was AWAITING_REESTABLISH). The lock is
 	 * flushed by handleReestablish on the next reconnect.
@@ -9978,6 +10157,37 @@ export class Channel {
 		// reserve rules already bound what can actually be in flight, and the
 		// gossip htlc_maximum_msat is clamped against current capacity at
 		// channel_update build time.
+		//
+		// localConfig.channelReserveSatoshis, its neighbour, IS revisited, in one
+		// direction. It is priced at capacity, so a splice-out leaves us enforcing
+		// a reserve the post-splice channel no longer justifies while the peer
+		// honours what the new capacity prices: a channel opened at 5,000,000 and
+		// spliced down to 400,000 would refuse every peer HTLC in a 46,000-sat
+		// band, and that refusal is a bare ERROR the peer never sees, so its next
+		// commitment_signed covers an HTLC we do not hold and the channel force
+		// closes. Lowering can only stop us refusing traffic the peer believes is
+		// legal, so it can never open such a band; raising could, which is why a
+		// splice-in leaves the value alone. Re-deriving BOTH reserves at the new
+		// capacity, the reserve we keep included, is issue #382.
+		//
+		// reserveWeEnforceAt rather than the v1 helper: the v1 helper prices a v2
+		// channel by a rule neither peer applies to it, and its 546-sat policy
+		// floor sits above what a SPLICED channel is priced at on either version
+		// (eclair takes the derived branch once fundingTxIndex > 0, v1 included).
+		// Both mistakes point the same way, at a reserve above what the peer
+		// keeps, which is the band this whole adjustment exists to close. Reads
+		// `adopted`, so it sees both the capacity and the spliceFundingTxid this
+		// same adoption sets.
+		const splicedReserve = bigIntMin(
+			this._state.localConfig.channelReserveSatoshis,
+			reserveWeEnforceAt(adopted, adopted.fundingSatoshis)
+		);
+		if (splicedReserve !== this._state.localConfig.channelReserveSatoshis) {
+			fields.localConfig = {
+				...this._state.localConfig,
+				channelReserveSatoshis: splicedReserve
+			};
+		}
 		// Adopt the peer's signature on our NEW commitment (exchanged during the
 		// mid-splice commitment_signed round) so we can unilaterally close the
 		// spliced channel. After a restart the in-memory copy is gone but the

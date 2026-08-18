@@ -10,6 +10,11 @@ import {
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { MessageType } from '../../src/lightning/message/types';
+import {
+	decodeOpenChannelMessage,
+	encodeOpenChannelMessage
+} from '../../src/lightning/message/channel-open';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -167,6 +172,113 @@ describe('Channel Manager', function () {
 			expect(channel.getState()).to.equal(ChannelState.SENT_OPEN);
 			expect(errors.length).to.equal(1);
 			expect(errors[0]).to.include('unknown chain');
+		});
+
+		it('discards a channel whose open_channel names a hostile dust limit (issue 381)', function () {
+			// The acceptor state is seeded from the peer's message before
+			// Channel.handleOpenChannel ever runs, so what makes the refusal safe
+			// is that the ERROR action drops the temporary channel outright. If
+			// it survived, buildRemoteCommitment would trim our to_remote output
+			// at the peer's dust limit in every commitment we sign (FS-1).
+			//
+			// Alice's own dust limit is what she advertises, and it is deliberately
+			// NOT bounded on the send path: the bound belongs to values we did not
+			// choose.
+			const alice = new ChannelManager({
+				...makeConfig(1),
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG, dustLimitSatoshis: 3_000n }
+			});
+			const bob = new ChannelManager(makeConfig(2));
+			connectManagers(alice, alicePubkey, bob, bobPubkey);
+
+			const errors: string[] = [];
+			bob.on('error', (_id: Buffer | null, message: string) =>
+				errors.push(message)
+			);
+			// Bob's refusal now reaches Alice, and a ChannelManager with no 'error'
+			// listener throws ERR_UNHANDLED_ERROR out of handleErrorMsg, which would
+			// surface back on Bob's side as a second error.
+			const aliceErrors: string[] = [];
+			alice.on('error', (_id: Buffer | null, message: string) =>
+				aliceErrors.push(message)
+			);
+			const wire: number[] = [];
+			bob.on('message:outbound', (_peer: string, type: number) =>
+				wire.push(type)
+			);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			const tempId = channel.getTemporaryChannelId();
+
+			expect(errors.length).to.equal(1);
+			expect(errors[0]).to.include(
+				'dust_limit_satoshis 3000 exceeds maximum 1062'
+			);
+			expect(bob.listChannels()).to.have.length(0);
+			expect(bob.getTempChannel(tempId), 'acceptor dropped it').to.equal(
+				undefined
+			);
+
+			// The refusal reached the OPENER (issue 381): without it Alice keeps a
+			// live negotiation Bob has already forgotten, retrying an open that can
+			// never be accepted.
+			expect(wire, 'exactly one wire error, and nothing else').to.deep.equal([
+				MessageType.ERROR
+			]);
+			expect(
+				aliceErrors.some((m) => m.includes('exceeds maximum 1062')),
+				'the opener learned why'
+			).to.equal(true);
+			expect(alice.getTempChannel(tempId), 'opener forgot it too').to.equal(
+				undefined
+			);
+			// The Channel object keeps its historical state: a v1 open dropped this
+			// way is deliberately not marked ERRORED. What changed is that the
+			// manager no longer tracks it.
+			expect(channel.getState()).to.equal(ChannelState.SENT_OPEN);
+		});
+
+		it('drops an open_channel under the reserved all-zero id, silently (issue 381)', function () {
+			// Every other refusal is now scoped to the id the opener chose, and
+			// BOLT 1 reserves the all-zero one for every channel with the peer, so
+			// answering this one would read as "fail all of them". Refused before
+			// any key is derived or any state retained, and without a wire error.
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+
+			// Alice is not wired to Bob: her open_channel is captured and replayed
+			// under the reserved id, which no honest opener would send.
+			let openPayload: Buffer | null = null;
+			alice.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					if (type === MessageType.OPEN_CHANNEL) openPayload = payload;
+				}
+			);
+			const errors: string[] = [];
+			bob.on('error', (_id: Buffer | null, message: string) =>
+				errors.push(message)
+			);
+			const wire: number[] = [];
+			bob.on('message:outbound', (_peer: string, type: number) =>
+				wire.push(type)
+			);
+
+			alice.openChannel(bobPubkey, 1_000_000n);
+			expect(openPayload, 'captured the open_channel').to.not.equal(null);
+			const open = decodeOpenChannelMessage(openPayload!);
+			open.temporaryChannelId = Buffer.alloc(32, 0x00);
+			bob.handleMessage(
+				alicePubkey,
+				MessageType.OPEN_CHANNEL,
+				encodeOpenChannelMessage(open)
+			);
+
+			expect(errors.length).to.equal(1);
+			expect(errors[0]).to.include('all-zero id');
+			expect(wire, 'no connection-wide error goes out').to.deep.equal([]);
+			expect(bob.getTempChannel(open.temporaryChannelId)).to.equal(undefined);
+			expect(bob.listChannels()).to.have.length(0);
 		});
 
 		it('should reach AWAITING_FUNDING_CONFIRMED after funding', function () {

@@ -2511,6 +2511,113 @@ describe('Splice', function () {
 			);
 		});
 
+		/** Drive a splice of `relativeSatoshis` to adoption and return the opener. */
+		function spliceToAdoption(
+			relativeSatoshis: bigint,
+			shape?: { fundingVersion?: 1 | 2; peerDustLimitSatoshis?: bigint }
+		): Channel {
+			const { opener } = makeNormalChannel();
+			if (shape?.fundingVersion !== undefined) {
+				opener.getFullState().fundingVersion = shape.fundingVersion;
+			}
+			if (shape?.peerDustLimitSatoshis !== undefined) {
+				opener.getFullState().remoteConfig = {
+					...opener.getFullState().remoteConfig,
+					dustLimitSatoshis: shape.peerDustLimitSatoshis
+				};
+			}
+			quiesce(opener);
+			const channelId = opener.getChannelId()!;
+			opener.initiateSplice(relativeSatoshis, 253);
+			opener.handleSpliceAck({
+				channelId,
+				fundingPubkey: Buffer.alloc(33, 0x03),
+				relativeSatoshis: 0n
+			});
+			const session = opener.getSpliceSession()!;
+			session.addInput({
+				serialId: 0n,
+				prevTxid: crypto.randomBytes(32),
+				prevOutputIndex: 0,
+				sequence: 0xfffffffd
+			});
+			session.addOutput({
+				serialId: 2n,
+				amountSats: 200_000n,
+				scriptPubkey: Buffer.alloc(22, 0x01)
+			});
+			session.markTxComplete();
+			session.handlePeerTxComplete();
+			const spliceTxid = crypto.randomBytes(32);
+			session.handleTxSignatures(spliceTxid, 0);
+			opener.sendSpliceLocked();
+			opener.handleSpliceLocked({ channelId, fundingTxid: spliceTxid });
+			expect(opener.getState()).to.equal(ChannelState.NORMAL);
+			return opener;
+		}
+
+		it('a splice-out lowers the reserve it enforces on the peer (issue 381)', function () {
+			// The enforced reserve is priced at capacity, and nothing re-derived
+			// it across a splice. Frozen at the open-time value, a splice-out
+			// leaves us demanding a reserve the channel no longer justifies while
+			// the peer honours what the new capacity prices, and every HTLC in
+			// that band is refused with a bare ERROR the peer never sees, so its
+			// next commitment_signed covers an HTLC we do not hold.
+			const opener = spliceToAdoption(-800_000n);
+			expect(opener.getFundingSatoshis()).to.equal(200_000n);
+			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				2_000n
+			);
+		});
+
+		it('a splice-in never raises the reserve it enforces (issue 381)', function () {
+			// The other direction stays put: raising would start refusing HTLCs
+			// the peer believes are legal, which is the failure the lowering
+			// exists to avoid. Re-deriving both reserves at the new capacity is
+			// issue 382.
+			const opener = spliceToAdoption(500_000n);
+			expect(opener.getFundingSatoshis()).to.equal(1_500_000n);
+			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				10_000n
+			);
+		});
+
+		it('prices a spliced v2 channel by the v2 rule (issue 381)', function () {
+			// fundingVersion is durable and survives adoption, so the tail can tell
+			// the two apart. The v1 helper's 546-sat policy floor is above what a
+			// v2 peer keeps at this capacity (max(1% of 20,000, min(dusts)) = 354),
+			// and the 192-sat gap between them is a band of HTLCs we would refuse
+			// with a bare ERROR the peer never sees.
+			const opener = spliceToAdoption(-980_000n, {
+				fundingVersion: 2,
+				peerDustLimitSatoshis: 546n
+			});
+			expect(opener.getFundingSatoshis()).to.equal(20_000n);
+			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				354n
+			);
+		});
+
+		it('never enforces a spliced reserve above what the peer keeps (issue 381)', function () {
+			// Same band on a v1 channel, because eclair switches to the derived
+			// rule for any channel with fundingTxIndex > 0, i.e. any spliced one
+			// (Commitments.scala localChannelReserve). The negotiated rule would
+			// leave 546 here, and computeChannelReserve applies its 20% cap last,
+			// so on a small enough capacity it lands under its own starting floor
+			// (1,500/5 is 300) where the peer keeps its whole dust limit.
+			const twenty = spliceToAdoption(-980_000n);
+			expect(twenty.getFundingSatoshis()).to.equal(20_000n);
+			expect(twenty.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				354n
+			);
+
+			const tiny = spliceToAdoption(-998_500n);
+			expect(tiny.getFundingSatoshis()).to.equal(1_500n);
+			expect(tiny.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				354n
+			);
+		});
+
 		it('beignet<->beignet: complete splice-out, fully automated over the wire', function () {
 			const { opener, acceptor } = makeNormalChannel();
 
