@@ -426,6 +426,35 @@ reserve was derived has both derived when its record is restored, and is refused
 outright, rather than resumed, when its commitment #0 has no outputs and our
 witnesses can still keep the funding transaction off chain.
 
+### Refusals the peer can see
+
+A `ChannelActionType.ERROR` is a LOCAL event. It drops a temporary channel and
+tells the embedder; it never becomes bytes. Only a `SEND_MESSAGE` carrying
+BOLT 1's `error` reaches the peer, so a refusal built out of the former deletes
+our half of a negotiation while the peer stays parked on a message it will never
+get an answer to, or keeps an update in its book that our commitment will never
+hold. The channel still dies in that second case, but a round later on a
+signature mismatch rather than on the refusal that actually happened.
+
+A refusal is therefore put on the wire when both hold: it is unconditional and
+permanent, so the peer's view provably diverges the moment we return; and no
+legal in-flight crossing can produce it, so the predicate turns only on facts
+the peer already held when it sent. Handshake refusals use the lighter shape
+(wire error, then the local `ERROR`, in that order so the temporary channel is
+still tracked when the cancellation reaches the transport), and update-path
+refusals use `_failChannelWithWireError`, which marks the channel `ERRORED` and
+persists first. Both suppress the wire half under BOLT 1's reserved all-zero
+`channel_id`, which would read as "fail every channel you have with me".
+
+The second clause is what keeps three carve-outs local, each argued at its
+guard: the lifecycle guards, since we move to `SHUTTING_DOWN`, `CLOSING` or
+`SPLICING` unilaterally and the peer's update may have left before it saw the
+transition; the id-mismatch guards, since the id in the message is one we do not
+own; and the half of the quiescence guard where only WE have sent `stfu`, since
+the peer is bound only from its own. The remaining gap is that last window: the
+right answer there is to accept the crossing add, which needs a quiescence timer
+this implementation does not have yet.
+
 Deliberate refusals (all spec-legal): replacements of an open restored from a
 restart (the wallet signing closures die with the process; confirmation
 adoption still works), contribution changes on a leased open (bLIP-51: the

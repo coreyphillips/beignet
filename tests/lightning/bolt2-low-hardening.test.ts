@@ -484,17 +484,21 @@ describe('BOLT 2 LOW hardening batch', function () {
 			// Opener role, so no commitment-fee term rides on the peer's side:
 			// the boundary is the bare 1,500-sat reserve. 147,000,000 msat pushed
 			// leaves the acceptor holding everything but 3,000 sat.
-			const { opener } = normalPair(150_000n, 147_000_000n);
-			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
-				1_500n
-			);
+			// One pristine channel per side of the boundary: since issue 404 the
+			// refusal FAILS the channel, so the admitted case has to be measured on a
+			// channel the refused case never touched.
+			const { opener: refuses } = normalPair(150_000n, 147_000_000n);
+			const { opener: admits } = normalPair(150_000n, 147_000_000n);
 			expect(
-				errorOf(opener.handleUpdateAddHtlc(inboundHtlc(opener, 145_500_001n)))
+				refuses.getFullState().localConfig.channelReserveSatoshis
+			).to.equal(1_500n);
+			expect(
+				errorOf(refuses.handleUpdateAddHtlc(inboundHtlc(refuses, 145_500_001n)))
 			).to.match(/cannot afford HTLC above channel reserve/);
 			expect(
-				errorOf(opener.handleUpdateAddHtlc(inboundHtlc(opener, 145_500_000n)))
+				errorOf(admits.handleUpdateAddHtlc(inboundHtlc(admits, 145_500_000n)))
 			).to.equal(null);
-			expect(opener.getFullState().remoteBalanceMsat).to.equal(1_500_000n);
+			expect(admits.getFullState().remoteBalanceMsat).to.equal(1_500_000n);
 		});
 
 		it('admits an inbound HTLC above the reserve as acceptor, fee included (issue 381)', function () {
@@ -503,17 +507,19 @@ describe('BOLT 2 LOW hardening batch', function () {
 			// on top of 1,500, against the opener's 3,000,000 msat. With the
 			// static 10,000 the requirement exceeds the whole balance, so every
 			// inbound HTLC on this channel is refused today.
-			const { acceptor } = normalPair(150_000n, 147_000_000n);
+			// One pristine channel per side of the boundary (see above).
+			const { acceptor: refuses } = normalPair(150_000n, 147_000_000n);
+			const { acceptor: admits } = normalPair(150_000n, 147_000_000n);
 			expect(
-				acceptor.getFullState().localConfig.channelReserveSatoshis
+				refuses.getFullState().localConfig.channelReserveSatoshis
 			).to.equal(1_500n);
 			expect(
-				errorOf(acceptor.handleUpdateAddHtlc(inboundHtlc(acceptor, 1_274_001n)))
+				errorOf(refuses.handleUpdateAddHtlc(inboundHtlc(refuses, 1_274_001n)))
 			).to.match(/cannot afford HTLC above channel reserve/);
 			expect(
-				errorOf(acceptor.handleUpdateAddHtlc(inboundHtlc(acceptor, 1_274_000n)))
+				errorOf(admits.handleUpdateAddHtlc(inboundHtlc(admits, 1_274_000n)))
 			).to.equal(null);
-			expect(acceptor.getFullState().remoteBalanceMsat).to.equal(1_726_000n);
+			expect(admits.getFullState().remoteBalanceMsat).to.equal(1_726_000n);
 		});
 
 		it('admits an update_fee down to the reserve we advertised (issue 381)', function () {
@@ -604,6 +610,20 @@ describe('BOLT 2 LOW hardening batch', function () {
 		expect(acceptor.getFullState().localConfig.channelReserveSatoshis).to.equal(
 			1_000n
 		);
+		// Captured BEFORE any probe: since issue 404 a refusal fails the channel,
+		// and a row serialized after one carries ERRORED to the restore.
+		const row = JSON.parse(
+			JSON.stringify(serializeChannelState(acceptor.getFullState()))
+		);
+		// A fresh restore per probe, for the same reason.
+		const restore = (): Channel => {
+			const restored = new Channel(
+				deserializeChannelState(JSON.parse(JSON.stringify(row)))
+			);
+			restored.repairEnforcedChannelReserve();
+			return restored;
+		};
+
 		// 49,100,000 msat sits in the band the two values disagree about: the
 		// funder must keep 1,000,000 msat of reserve plus its commitment fee out
 		// of 50,000,000, and at 546 it would only have to keep 546,000.
@@ -612,25 +632,19 @@ describe('BOLT 2 LOW hardening batch', function () {
 		).to.match(/cannot afford HTLC above channel reserve/);
 
 		// Round-trip the row through disk and run the load-time repair over it.
-		const restored = new Channel(
-			deserializeChannelState(
-				JSON.parse(
-					JSON.stringify(serializeChannelState(acceptor.getFullState()))
-				)
-			)
-		);
-		restored.repairEnforcedChannelReserve();
 		expect(
-			restored.getFullState().localConfig.channelReserveSatoshis,
+			restore().getFullState().localConfig.channelReserveSatoshis,
 			'the negotiated reserve survived the restart'
 		).to.equal(1_000n);
+		const refuses = restore();
 		expect(
-			errorOf(restored.handleUpdateAddHtlc(inboundHtlc(restored, 49_100_000n)))
+			errorOf(refuses.handleUpdateAddHtlc(inboundHtlc(refuses, 49_100_000n)))
 		).to.match(/cannot afford HTLC above channel reserve/);
 		// And the refusal is the reserve boundary, not a channel that rejects
 		// everything: comfortably under it still goes through.
+		const admits = restore();
 		expect(
-			errorOf(restored.handleUpdateAddHtlc(inboundHtlc(restored, 48_000_000n)))
+			errorOf(admits.handleUpdateAddHtlc(inboundHtlc(admits, 48_000_000n)))
 		).to.equal(null);
 	});
 

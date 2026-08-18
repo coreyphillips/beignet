@@ -13,8 +13,11 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
 import {
 	decodeOpenChannelMessage,
-	encodeOpenChannelMessage
+	encodeOpenChannelMessage,
+	decodeAcceptChannelMessage,
+	encodeAcceptChannelMessage
 } from '../../src/lightning/message/channel-open';
+import { decodeErrorMessage } from '../../src/lightning/message/error';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -908,6 +911,196 @@ describe('Channel Manager', function () {
 			expect(alice.getChannel(channelId)!.getState()).to.equal(
 				ChannelState.NORMAL
 			);
+		});
+	});
+
+	describe('the rest of the v1 handshake reaches the peer (issue 393)', function () {
+		// A bare ERROR action never becomes bytes, so before this each of these
+		// refusals deleted our half of the negotiation while the peer stayed parked
+		// on a message it would never get an answer to.
+
+		/** Loopback that lets a test rewrite one message type in flight. */
+		function connectWithTamper(
+			a: ChannelManager,
+			pubA: string,
+			b: ChannelManager,
+			pubB: string,
+			tamper: (type: number, payload: Buffer) => Buffer
+		): void {
+			a.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer === pubB) b.handleMessage(pubA, type, tamper(type, payload));
+				}
+			);
+			b.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer === pubA) a.handleMessage(pubB, type, tamper(type, payload));
+				}
+			);
+		}
+
+		function flipByte(payload: Buffer, offset: number): Buffer {
+			const copy = Buffer.from(payload);
+			copy[offset] ^= 0xff;
+			return copy;
+		}
+
+		it('an accept_channel we cannot license is refused ON THE WIRE', function () {
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			const errors: Record<string, string[]> = { alice: [], bob: [] };
+			alice.on('error', (_id: Buffer | null, m: string) =>
+				errors.alice.push(m)
+			);
+			bob.on('error', (_id: Buffer | null, m: string) => errors.bob.push(m));
+			const wire: Array<{ type: number; payload: Buffer }> = [];
+			alice.on(
+				'message:outbound',
+				(_p: string, type: number, payload: Buffer) =>
+					wire.push({ type, payload })
+			);
+			const accepted: Buffer[] = [];
+			alice.on('channel:accepted', (ch: { getChannelId(): Buffer | null }) =>
+				accepted.push(ch.getChannelId() ?? Buffer.alloc(0))
+			);
+
+			connectWithTamper(alice, alicePubkey, bob, bobPubkey, (type, payload) => {
+				if (type !== MessageType.ACCEPT_CHANNEL) return payload;
+				// BOLT 2: accept_channel MUST echo the type open_channel set.
+				const msg = decodeAcceptChannelMessage(payload);
+				msg.channelType = undefined;
+				return encodeAcceptChannelMessage(msg);
+			});
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			const tempId = channel.getTemporaryChannelId();
+
+			const sentErrors = wire.filter((w) => w.type === MessageType.ERROR);
+			expect(
+				sentErrors,
+				'exactly one wire error to the acceptor'
+			).to.have.length(1);
+			const decoded = decodeErrorMessage(sentErrors[0].payload);
+			expect(
+				decoded.channelId.equals(tempId),
+				'scoped to the temporary id, not connection-wide'
+			).to.equal(true);
+			expect(decoded.data.toString('ascii')).to.include('omitted channel_type');
+
+			// Both sides forget the negotiation, and no funding is ever built.
+			expect(alice.getTempChannel(tempId), 'opener dropped it').to.equal(
+				undefined
+			);
+			expect(bob.getTempChannel(tempId), 'acceptor dropped it').to.equal(
+				undefined
+			);
+			expect(
+				accepted,
+				'no channel:accepted for a refused accept'
+			).to.have.length(0);
+			expect(
+				errors.bob.some((m) => m.includes('omitted channel_type')),
+				'the acceptor learned why'
+			).to.equal(true);
+		});
+
+		it('a funding_created we cannot verify is refused ON THE WIRE', function () {
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			const errors: string[] = [];
+			alice.on('error', (_id: Buffer | null, m: string) => errors.push(m));
+			bob.on('error', () => undefined);
+			const wire: Array<{ type: number; payload: Buffer }> = [];
+			bob.on('message:outbound', (_p: string, type: number, payload: Buffer) =>
+				wire.push({ type, payload })
+			);
+
+			connectWithTamper(alice, alicePubkey, bob, bobPubkey, (type, payload) =>
+				// [32 temporary_channel_id][32 txid][2 output_index][64 signature]
+				type === MessageType.FUNDING_CREATED ? flipByte(payload, 70) : payload
+			);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			const tempId = channel.getTemporaryChannelId();
+			alice.createFunding(channel, crypto.randomBytes(32), 0, Buffer.alloc(64));
+
+			const sentErrors = wire.filter((w) => w.type === MessageType.ERROR);
+			expect(sentErrors, 'exactly one wire error to the opener').to.have.length(
+				1
+			);
+			const decoded = decodeErrorMessage(sentErrors[0].payload);
+			expect(
+				decoded.channelId.equals(tempId),
+				'scoped to the id the opener used'
+			).to.equal(true);
+			expect(decoded.data.toString('ascii')).to.include(
+				'Invalid commitment signature in funding_created'
+			);
+			expect(
+				wire.some((w) => w.type === MessageType.FUNDING_SIGNED),
+				'never answered funding_signed'
+			).to.equal(false);
+			expect(bob.listChannels(), 'never promoted').to.have.length(0);
+			expect(bob.getTempChannel(tempId), 'acceptor dropped it').to.equal(
+				undefined
+			);
+			expect(
+				errors.some((m) => m.includes('Invalid commitment signature')),
+				'the opener learned why'
+			).to.equal(true);
+		});
+
+		it('a funding_signed we cannot verify is refused ON THE WIRE', function () {
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			const errors: string[] = [];
+			alice.on('error', () => undefined);
+			bob.on('error', (_id: Buffer | null, m: string) => errors.push(m));
+			const wire: Array<{ type: number; payload: Buffer }> = [];
+			alice.on(
+				'message:outbound',
+				(_p: string, type: number, payload: Buffer) =>
+					wire.push({ type, payload })
+			);
+			const authorized: Buffer[] = [];
+			alice.on('funding:authorized', (txid: Buffer) => authorized.push(txid));
+
+			connectWithTamper(alice, alicePubkey, bob, bobPubkey, (type, payload) =>
+				// [32 channel_id][64 signature]
+				type === MessageType.FUNDING_SIGNED ? flipByte(payload, 40) : payload
+			);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			alice.createFunding(channel, crypto.randomBytes(32), 0, Buffer.alloc(64));
+			const permanentId = channel.getChannelId()!;
+
+			const sentErrors = wire.filter((w) => w.type === MessageType.ERROR);
+			expect(
+				sentErrors,
+				'exactly one wire error to the acceptor'
+			).to.have.length(1);
+			const decoded = decodeErrorMessage(sentErrors[0].payload);
+			expect(
+				decoded.channelId.equals(permanentId),
+				'scoped to the PERMANENT id the acceptor now keys the channel by'
+			).to.equal(true);
+			expect(decoded.data.toString('ascii')).to.include(
+				'Invalid commitment signature in funding_signed'
+			);
+
+			// And the refusal does NOT fail the channel: nothing is on chain, so a
+			// force close would be a fiction and a persisted ERRORED row immortal.
+			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+			expect(
+				authorized,
+				'the funding broadcast was never authorized'
+			).to.have.length(0);
+			expect(
+				errors.some((m) => m.includes('Invalid commitment signature')),
+				'the acceptor learned why'
+			).to.equal(true);
 		});
 	});
 });

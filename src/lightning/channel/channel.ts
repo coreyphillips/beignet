@@ -275,6 +275,58 @@ function declMsg(
 }
 
 /**
+ * A refusal that reaches BOTH the peer and the local caller.
+ *
+ * The pairing, and the order, are the point. A bare ChannelActionType.ERROR is
+ * never put on the wire: ChannelManager._dispatchActions only drops the
+ * temporary channel and emits a local event, so a refusal made of one deletes
+ * our half of a negotiation while the peer stays parked on a message it will
+ * never get an answer to (issues 381, 393). The wire action LEADS, because that
+ * local action's removeCurrentTempChannel must not forget the channel before
+ * its cancellation has been handed to the transport.
+ *
+ * `channelId` is the SCOPE, and it is the caller's to choose: the id the PEER's
+ * side keys this negotiation by, so the wire scope and the local cleanup can
+ * never name different entries.
+ *
+ * Two ids are refused locally instead of answered, for the reason
+ * ChannelManager.refuseInboundOpen refuses them. BOLT 1 reserves the all-zero
+ * channel_id for "all channels with this peer", so echoing one turns the
+ * refusal of a single negotiation into an instruction to fail every channel we
+ * have with the sender. And a length encodeErrorMessage will not accept would
+ * throw out of a refusal arm, losing the local unwind along with the send.
+ * Suppressed HERE rather than at each caller because every refusal of this
+ * class routes through it, and a caller-side check protects only the caller
+ * that remembers to make it. The refusal still stands, just silently: there is
+ * no id we could answer under that means what we mean.
+ *
+ * For a channel that already has a life of its own, _failChannelWithWireError
+ * is the heavier shape: it marks ERRORED and persists first.
+ */
+function refuseWithWireError(
+	channelId: Buffer,
+	reason: string
+): ChannelAction[] {
+	const local: ChannelAction = {
+		type: ChannelActionType.ERROR,
+		message: reason
+	};
+	if (channelId.length !== 32 || channelId.every((b) => b === 0)) {
+		return [local];
+	}
+	return [
+		sendMsg(
+			MessageType.ERROR,
+			encodeErrorMessage({
+				channelId,
+				data: Buffer.from(reason, 'ascii')
+			})
+		),
+		local
+	];
+}
+
+/**
  * Compute channel reserve: 1% of funding (matching LND/CLN/Eclair),
  * floored at the greater of dust limit and 546 sats (LND's minimum),
  * capped at funding / 5 (20%). The cap is local policy for the reserve we
@@ -1372,12 +1424,29 @@ export class Channel {
 	 */
 	handleAcceptChannel(msg: IAcceptChannelMessage): ChannelAction[] {
 		if (this._state.state !== ChannelState.SENT_OPEN) {
+			// Deliberately LOCAL-only, the carve-out handleOpenChannel and
+			// handleOpenChannel2 make for the same reason: this guard can only fire
+			// on a channel that already has a life. A v1 opener stays keyed by this
+			// temporary id through SENT_FUNDING_CREATED and until createFunding
+			// promotes it, so the realistic producer is a duplicated or late
+			// accept_channel for an open that has already advanced, which is exactly
+			// what a retransmitting peer sends. A wire error scoped to that id would
+			// cancel an open the peer believes is healthy. Every refusal of a LIVE
+			// accept_channel below is wire-visible instead (issue 393).
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected accept_channel' }
 			];
 		}
 
 		if (!msg.temporaryChannelId.equals(this._state.temporaryChannelId)) {
+			// Also LOCAL-only, and for a different reason. ChannelManager routes
+			// accept_channel by msg.temporaryChannelId into tempChannels, so reaching
+			// this arm means the map key and the channel's own id disagree: an
+			// internal routing inconsistency, or a caller handing this Channel a
+			// message belonging to another open. Either way the id in the message is
+			// one we do not own, and answering under it would cancel a stranger's
+			// negotiation. This arm is also what makes msg.temporaryChannelId equal
+			// to ours for every arm below.
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1385,6 +1454,20 @@ export class Channel {
 				}
 			];
 		}
+
+		// Every refusal below must reach the ACCEPTOR too (BOLT 2 negotiation
+		// cancellation, BOLT 1 error): a local ERROR action is never put on the
+		// wire, so it deletes our half while the acceptor sits in SENT_ACCEPT
+		// holding a burnt key index and a retained temporary channel, waiting for a
+		// funding_created that is never coming (issue 393).
+		//
+		// Scoped to OUR temporary id, not the message's. generateTemporaryChannelId
+		// produced it, so it is 32 bytes and non-zero by construction and nothing a
+		// peer can steer, and the guard above has just proved the two are equal. It
+		// is the id the acceptor's side keys this open by and the one
+		// ChannelManager keys tempChannels by.
+		const refuse = (reason: string): ChannelAction[] =>
+			refuseWithWireError(this._state.temporaryChannelId, reason);
 
 		// Validate the acceptor's parameters against what WE proposed in
 		// open_channel BEFORE adopting them. Without this an adversarial acceptor
@@ -1401,15 +1484,15 @@ export class Channel {
 			msg
 		);
 		if (acceptError) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `Invalid accept_channel: ${acceptError}`
-				}
-			];
+			return refuse(`Invalid accept_channel: ${acceptError}`);
 		}
 
-		// Store remote config
+		// Adopted before the channel-type, zero_conf and nonce arms below, so a
+		// refusal there leaves a mutated state object. What makes that safe is what
+		// makes it safe in handleOpenChannel: the ERROR action drops the temporary
+		// channel entirely (removeCurrentTempChannel), and a v1 opener is not
+		// promoted out of tempChannels until createFunding, so nothing seeded here
+		// ever reaches a live channel.
 		this._state.remoteConfig = {
 			dustLimitSatoshis: msg.dustLimitSatoshis,
 			maxHtlcValueInFlightMsat: msg.maxHtlcValueInFlightMsat,
@@ -1441,12 +1524,9 @@ export class Channel {
 			)
 		) {
 			if (msg.minimumDepth !== 0) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: `zero_conf accept_channel must use minimum_depth 0, got ${msg.minimumDepth}`
-					}
-				];
+				return refuse(
+					`zero_conf accept_channel must use minimum_depth 0, got ${msg.minimumDepth}`
+				);
 			}
 		} else {
 			this._state.minimumDepth = msg.minimumDepth;
@@ -1464,25 +1544,16 @@ export class Channel {
 				localBits.length !== remoteBits.length ||
 				!localBits.every((b, i) => b === remoteBits[i])
 			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Channel type mismatch in accept_channel'
-					}
-				];
+				return refuse('Channel type mismatch in accept_channel');
 			}
 		} else if (this._state.channelType && !msg.channelType) {
 			// BOLT 2: if open_channel set channel_type, accept_channel MUST set it
 			// to the exact same type. An omission is a violation, not an implicit
 			// agreement — silently keeping our own type risks the two sides
 			// building different commitment formats.
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'accept_channel omitted channel_type after open_channel set it'
-				}
-			];
+			return refuse(
+				'accept_channel omitted channel_type after open_channel set it'
+			);
 		}
 		if (msg.channelType) {
 			this._state.channelType = msg.channelType;
@@ -1492,12 +1563,9 @@ export class Channel {
 		// generated and stored when we sent open_channel.
 		if (isTaprootChannel(this._state.channelType)) {
 			if (!msg.nextLocalNonce || msg.nextLocalNonce.length !== 66) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Taproot accept_channel missing a valid next_local_nonce'
-					}
-				];
+				return refuse(
+					'Taproot accept_channel missing a valid next_local_nonce'
+				);
 			}
 			this._state.remoteNonce = msg.nextLocalNonce;
 		}
@@ -1567,12 +1635,23 @@ export class Channel {
 	 */
 	handleFundingSigned(msg: IFundingSignedMessage): ChannelAction[] {
 		if (this._state.state !== ChannelState.SENT_FUNDING_CREATED) {
+			// Deliberately LOCAL-only, the same carve-out the three handlers above
+			// make. A replayed funding_signed is an ordinary retransmission shape,
+			// and by the time one arrives this side may already be
+			// AWAITING_FUNDING_CONFIRMED with the funding transaction broadcast: a
+			// wire error there would kill a channel that is genuinely opening. Every
+			// refusal of a LIVE funding_signed below is wire-visible instead
+			// (issue 393).
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected funding_signed' }
 			];
 		}
 
 		if (this._state.channelId && !msg.channelId.equals(this._state.channelId)) {
+			// Also LOCAL-only. ChannelManager resolves funding_signed BY
+			// msg.channelId (findChannelByChannelId, then the temp scan), so reaching
+			// this arm means the id it resolved through and the channel's own id
+			// disagree. The id in the message is one we do not own.
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1580,6 +1659,39 @@ export class Channel {
 				}
 			];
 		}
+
+		// Every refusal below must reach the ACCEPTOR too: a local ERROR action is
+		// never put on the wire, so it leaves the acceptor in
+		// AWAITING_FUNDING_CONFIRMED waiting for a funding transaction that will
+		// never be broadcast (issue 393). Worse here than anywhere else in the
+		// handshake, because createFunding has already promoted this channel out of
+		// tempChannels, so the local ERROR's removeCurrentTempChannel is a no-op and
+		// nothing at all happens today.
+		//
+		// Scoped to our OWN derived id, not msg.channelId. deriveChannelId built it
+		// from our own funding txid, so it is 32 bytes by construction and nothing a
+		// peer can steer, whereas the mismatch guard above only compares
+		// msg.channelId when ours is set. It is also the id the ACCEPTOR now keys
+		// this channel by: a successful funding_created promoted its side to the
+		// permanent id. The temporaryChannelId fallback is unreachable in
+		// SENT_FUNDING_CREATED (createFundingCreated is the only way in and always
+		// derives the id) and exists only for the type.
+		//
+		// Deliberately the plain refusal shape and NOT _failChannelWithWireError,
+		// even though a permanent id exists by now. Nothing is on chain:
+		// AUTHORIZE_FUNDING_BROADCAST is the only signal that permits the broadcast
+		// and no arm here reaches it, so a force close would be a fiction that
+		// prepareForceClose refuses anyway for want of a remote signature, leaving
+		// only a misleading CHANNEL_FAILED_FORCE_CLOSE_FAILED. The persisted ERRORED
+		// row would be worse: this channel has never been persisted, no funding
+		// watch was ever armed, and nothing reaps such a row. And that helper
+		// persists FIRST, so a failed persist would withhold the very error this
+		// arm exists to send.
+		const refuse = (reason: string): ChannelAction[] =>
+			refuseWithWireError(
+				this._state.channelId ?? this._state.temporaryChannelId,
+				reason
+			);
 
 		// Verify the acceptor's signature on our INITIAL commitment (#0) BEFORE
 		// broadcasting the funding transaction. Every other commitment path
@@ -1593,20 +1705,19 @@ export class Channel {
 			// commitment #0 and store it (with their signing nonce) for aggregation.
 			const err = this._acceptFundingPartial(msg.partialSignatureWithNonce);
 			if (err) {
-				return [{ type: ChannelActionType.ERROR, message: err }];
+				return refuse(err);
 			}
 		} else {
 			// Cannot verify -> must not adopt: an unverified funding_signed
 			// gives the channel no unilateral exit, and the funding broadcast
 			// that follows would lock funds behind it.
 			if (!this._signer || !this._state.remoteBasepoints) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'Cannot verify commitment signature in funding_signed: no signer or remote basepoints'
-					}
-				];
+				// Our own defect, told anyway: blame does not change the acceptor's
+				// problem, and it is otherwise left awaiting a funding transaction
+				// that will never be broadcast.
+				return refuse(
+					'Cannot verify commitment signature in funding_signed: no signer or remote basepoints'
+				);
 			}
 			const firstPerCommitmentPoint = getPerCommitmentPoint(
 				this._state.localPerCommitmentSeed,
@@ -1620,12 +1731,7 @@ export class Channel {
 				0n
 			);
 			if (!valid) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid commitment signature in funding_signed'
-					}
-				];
+				return refuse('Invalid commitment signature in funding_signed');
 			}
 
 			// Store remote's commitment signature
@@ -1698,7 +1804,10 @@ export class Channel {
 		// locally instead, which is what makes the closure's "scoped to the id
 		// the opener used" true for every caller: ChannelManager drops such an
 		// open before it ever builds a Channel, and this covers anyone driving
-		// the Channel directly.
+		// the Channel directly. refuseWithWireError suppresses it a second time,
+		// the way refuseInboundOpen does for the manager's callers; this arm
+		// stays because it refuses AHEAD of every mutation below and says which
+		// id was the problem.
 		if (msg.temporaryChannelId.every((b) => b === 0)) {
 			return [
 				{
@@ -1713,28 +1822,15 @@ export class Channel {
 		// negotiation cancellation, BOLT 1 error): a local ERROR action is never
 		// put on the wire, so it deletes our half while the opener sits in
 		// SENT_OPEN awaiting an accept_channel that never comes, retrying the
-		// identical open because nothing told it to stop. Same closure, same
-		// ordering and same reasoning as handleOpenChannel2.
+		// identical open because nothing told it to stop.
 		//
 		// Scoped to the id the OPENER used, which is the id its side keys the
 		// pending open by and the one ChannelManager keys tempChannels by, so the
 		// wire scope and the local cleanup can never name different entries. It is
 		// also the only one guaranteed to be the 32 bytes encodeErrorMessage
 		// demands, having been sliced from the wire by decodeOpenChannelMessage.
-		//
-		// The wire action LEADS the local ERROR: that action's
-		// removeCurrentTempChannel must not forget the channel before its
-		// cancellation has been handed to the transport.
-		const refuse = (reason: string): ChannelAction[] => [
-			sendMsg(
-				MessageType.ERROR,
-				encodeErrorMessage({
-					channelId: msg.temporaryChannelId,
-					data: Buffer.from(reason, 'ascii')
-				})
-			),
-			{ type: ChannelActionType.ERROR, message: reason }
-		];
+		const refuse = (reason: string): ChannelAction[] =>
+			refuseWithWireError(msg.temporaryChannelId, reason);
 
 		// Peer-supplied, so the bounds that only apply to a value we did not
 		// choose run too. ChannelManager.handleOpenChannel has already seeded
@@ -1922,12 +2018,24 @@ export class Channel {
 		partialSignatureWithNonce?: Buffer
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.SENT_ACCEPT) {
+			// Deliberately LOCAL-only, the same carve-out handleOpenChannel and
+			// handleAcceptChannel make: this guard can only fire on a channel that
+			// already has a life, so its realistic producer is a duplicated or late
+			// funding_created for an open that has already advanced. A wire error
+			// scoped to that id would cancel a negotiation the opener believes is
+			// healthy. Every refusal of a LIVE funding_created below is wire-visible
+			// instead (issue 393).
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected funding_created' }
 			];
 		}
 
 		if (!msg.temporaryChannelId.equals(this._state.temporaryChannelId)) {
+			// Also LOCAL-only. ChannelManager routes funding_created by
+			// msg.temporaryChannelId into tempChannels, so reaching this arm means
+			// the map key and the channel's own id disagree: an internal routing
+			// inconsistency, or a caller handing this Channel a message belonging to
+			// another open. The id in the message is one we do not own.
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1935,6 +2043,23 @@ export class Channel {
 				}
 			];
 		}
+
+		// Every refusal below must reach the OPENER too (BOLT 2 negotiation
+		// cancellation, BOLT 1 error): a local ERROR action is never put on the
+		// wire, so it deletes our half while the opener sits in
+		// SENT_FUNDING_CREATED holding a built and signed funding transaction it
+		// will never be told to abandon (issue 393).
+		//
+		// Scoped to the id the OPENER used, matching ChannelManager's own two
+		// refusals at this exact stage (the channel-id-in-use arms) and the id
+		// BOLT 2 still carries on funding_created. Deliberately NOT the permanent
+		// channelId derived just below: that one is built from PEER-SUPPLIED
+		// fundingTxid and fundingOutputIndex, so an opener quoting an all-zero txid
+		// at output 0 derives an all-zero channel_id and would turn this refusal
+		// into "fail every channel with me". msg.temporaryChannelId equals our own
+		// self-generated id by the guard above and cannot be steered.
+		const refuse = (reason: string): ChannelAction[] =>
+			refuseWithWireError(msg.temporaryChannelId, reason);
 
 		this._state.fundingTxid = msg.fundingTxid;
 		this._state.fundingOutputIndex = msg.fundingOutputIndex;
@@ -1954,32 +2079,31 @@ export class Channel {
 			// commitment #0 and store it (with their signing nonce) for aggregation.
 			const err = this._acceptFundingPartial(msg.partialSignatureWithNonce);
 			if (err) {
-				return [{ type: ChannelActionType.ERROR, message: err }];
+				return refuse(err);
 			}
 			if (
 				!partialSignatureWithNonce ||
 				partialSignatureWithNonce.length !== 98
 			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'Taproot funding_signed requires a partial_signature_with_nonce'
-					}
-				];
+				// Our own defect rather than the opener's fault, and told anyway,
+				// exactly as handleOpenChannel tells its max_htlc_value_in_flight
+				// misconfiguration: blame does not change the opener's problem, and a
+				// refusal it cannot see leaves it holding a built, signed, unbroadcast
+				// funding transaction forever.
+				return refuse(
+					'Taproot funding_signed requires a partial_signature_with_nonce'
+				);
 			}
 		} else {
 			// Cannot verify -> must not adopt: the funding_signed we return
 			// commits us to the opener's funding tx, so an unverified opener
 			// signature would leave this side with no unilateral exit.
 			if (!this._signer || !this._state.remoteBasepoints) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'Cannot verify commitment signature in funding_created: no signer or remote basepoints'
-					}
-				];
+				// Our own defect, told anyway, for the reason given at the taproot arm
+				// above.
+				return refuse(
+					'Cannot verify commitment signature in funding_created: no signer or remote basepoints'
+				);
 			}
 			const firstPerCommitmentPoint = getPerCommitmentPoint(
 				this._state.localPerCommitmentSeed,
@@ -1993,12 +2117,7 @@ export class Channel {
 				0n
 			);
 			if (!valid) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid commitment signature in funding_created'
-					}
-				];
+				return refuse('Invalid commitment signature in funding_created');
 			}
 
 			// Store remote's commitment signature
@@ -2536,6 +2655,17 @@ export class Channel {
 			this._state.state !== ChannelState.NORMAL &&
 			!this.canUpdateHtlcsDuringSplice()
 		) {
+			// Deliberately LOCAL-only, the carve-out handleOpenChannel makes for the
+			// same reason. Every OTHER refusal below is wire-visible (issue 404),
+			// because the peer's book provably diverges the moment we return. This one
+			// is different: a legal message can produce it. We move to SHUTTING_DOWN,
+			// CLOSING or SPLICING unilaterally, and the peer's add may already have
+			// been in flight when the transition left. BOLT 2 forbids an add only AFTER
+			// the peer has received our shutdown, so the crossing is conformant and
+			// unavoidable; failing the channel here would force close a well-behaved
+			// peer over a race, and on a CLOSING or SPLICING channel it would destroy
+			// something legitimately in progress. A NORMAL channel never reaches this
+			// arm, so nothing issue 404 is about is hidden behind it.
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected update_add_htlc' }
 			];
@@ -2557,15 +2687,31 @@ export class Channel {
 			) {
 				return [];
 			}
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `update_add_htlc reuses id ${msg.id} with different contents`
-				}
-			];
+			return this._failChannelWithWireError(
+				`update_add_htlc reuses id ${msg.id} with different contents`
+			);
 		}
 
-		// Reject during quiescence.
+		// Reject during quiescence, and tell the peer only once IT has sent stfu.
+		// From its own stfu the peer is bound by BOLT 2's "MUST NOT send an update
+		// message after stfu", and that stfu preceded this add on the same ordered
+		// stream, so no race can produce it: the refusal is provable divergence and
+		// the peer must hear it (issue 404).
+		//
+		// While only WE have sent stfu the peer owes nothing yet. Its obligation
+		// starts at ITS receipt of ours, which we cannot observe, and BOLT 2 requires
+		// that window to exist: a peer holding pending updates has to drain them
+		// before it can "reply with stfu once it can do so". Refusing there stays
+		// LOCAL, which is survivable as it stands (the add is dropped, and a
+		// disconnect reverses uncommitted adds via markForReestablish), where killing
+		// the channel over a legal crossing would not be. That leaves issue 404 open
+		// in this one window; the real answer is to ACCEPT the crossing add, which
+		// needs handleStfuMessage to stop refusing the peer's stfu reply when HTLCs
+		// are pending, plus BOLT 2's 60-second quiescence disconnect, neither of
+		// which exists yet.
+		if (this._quiescence.peerHasSentStfu()) {
+			return this._failChannelWithWireError('update_add_htlc after your stfu');
+		}
 		if (this._quiescence.isQuiescing()) {
 			return [
 				{
@@ -2577,31 +2723,23 @@ export class Channel {
 
 		// Validate inbound HTLC per BOLT 2
 		if (msg.amountMsat <= 0n) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'HTLC amount must be greater than 0'
-				}
-			];
+			// BOLT 2 MUST fail: a zero-amount add can never enter our commitment.
+			return this._failChannelWithWireError(
+				'HTLC amount must be greater than 0'
+			);
 		}
 
 		if (msg.amountMsat < this._state.localConfig.htlcMinimumMsat) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'HTLC amount below our minimum'
-				}
-			];
+			// BOLT 2 MUST fail: below the htlc_minimum_msat we advertised.
+			return this._failChannelWithWireError('HTLC amount below our minimum');
 		}
 
 		const pendingReceived = this.countPendingHtlcs(HtlcDirection.RECEIVED);
 		if (pendingReceived >= this._state.localConfig.maxAcceptedHtlcs) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Max inbound pending HTLCs exceeded'
-				}
-			];
+			// BOLT 2 MUST fail: over the max_accepted_htlcs we advertised.
+			return this._failChannelWithWireError(
+				'Max inbound pending HTLCs exceeded'
+			);
 		}
 
 		const totalReceivedInFlight =
@@ -2609,12 +2747,10 @@ export class Channel {
 		if (
 			totalReceivedInFlight > this._state.localConfig.maxHtlcValueInFlightMsat
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Max inbound HTLC value in flight exceeded'
-				}
-			];
+			// BOLT 2 MUST fail: over the max_htlc_value_in_flight_msat we advertised.
+			return this._failChannelWithWireError(
+				'Max inbound HTLC value in flight exceeded'
+			);
 		}
 
 		// Enforce the channel reserve (and, if the remote is the funder, the
@@ -2650,12 +2786,14 @@ export class Channel {
 				) * 1000n;
 		}
 		if (this._state.remoteBalanceMsat - msg.amountMsat < remoteRequiredMsat) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Remote cannot afford HTLC above channel reserve'
-				}
-			];
+			// BOLT 2 MUST fail: an add the sender cannot afford above its reserve can
+			// never enter our commitment, so its log now holds an entry ours never
+			// will. Wire error (issue 404): the silent refusal this replaced let the
+			// peer's next commitment_signed cover state we do not hold, and the
+			// channel force closed a round later blamed on an invalid signature.
+			return this._failChannelWithWireError(
+				'Remote cannot afford HTLC above channel reserve'
+			);
 		}
 
 		// Cap total dust-HTLC exposure (see addHtlc): protects against a peer
@@ -2665,43 +2803,38 @@ export class Channel {
 			this._dustExposureMsat() + msg.amountMsat >
 				Channel.MAX_DUST_HTLC_EXPOSURE_MSAT
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Dust HTLC exposure limit exceeded'
-				}
-			];
+			// OUR ceiling rather than a BOLT 2 MUST, and told anyway: the peer could
+			// not have predicted the policy, but the divergence is identical. LND and
+			// CLN instead admit the add and fail it back with an onion failure, which
+			// is the better answer and needs the check moved to the forwarding
+			// decision rather than left here.
+			return this._failChannelWithWireError(
+				'Dust HTLC exposure limit exceeded'
+			);
 		}
 
 		// BOLT 2: cltv_expiry >= 500000000 is a unix timestamp, not a block
 		// height — always invalid, independent of whether we know the current
 		// block height.
 		if (msg.cltvExpiry >= 500_000_000) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `HTLC cltv_expiry ${msg.cltvExpiry} is not a block height (>= 500000000)`
-				}
-			];
+			return this._failChannelWithWireError(
+				`HTLC cltv_expiry ${msg.cltvExpiry} is not a block height (>= 500000000)`
+			);
 		}
 
 		// CLTV validation
 		if (this._currentBlockHeight > 0) {
 			if (msg.cltvExpiry <= this._currentBlockHeight) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'HTLC CLTV already expired'
-					}
-				];
+				// The one arm that turns on state the peer cannot see, our own
+				// _currentBlockHeight. A skew large enough to reach here past the
+				// sender's cltv_expiry_delta means our chain view is broken rather than
+				// that the peer raced us, and the add cannot enter our commitment
+				// either way.
+				return this._failChannelWithWireError('HTLC CLTV already expired');
 			}
 			if (msg.cltvExpiry > this._currentBlockHeight + 5040) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'HTLC CLTV too far in future'
-					}
-				];
+				// OUR horizon, told anyway, for the reason given at the dust arm above.
+				return this._failChannelWithWireError('HTLC CLTV too far in future');
 			}
 		}
 
@@ -2727,7 +2860,7 @@ export class Channel {
 			addedHtlc: { key: `received-${msg.id}`, entry }
 		});
 		if (wouldEmpty) {
-			return [{ type: ChannelActionType.ERROR, message: wouldEmpty }];
+			return this._failChannelWithWireError(wouldEmpty);
 		}
 
 		this._state.htlcs.set(`received-${msg.id}`, entry);
@@ -4317,59 +4450,69 @@ export class Channel {
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
 			!this.isSplicePendingLock()
 		) {
+			// Deliberately LOCAL-only, the same carve-out handleUpdateAddHtlc's state
+			// guard makes. Every OTHER refusal below is wire-visible (issue 404), but
+			// a legal message can produce this one: we move to CLOSING, ERRORED or an
+			// unlocked splice unilaterally, and the opener's update_fee may already
+			// have been in flight. Failing the channel here would force close a
+			// conformant peer over a race, and on a closing channel it would destroy a
+			// close that is going fine.
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected update_fee' }
 			];
 		}
 
 		if (this._state.role !== ChannelRole.ACCEPTOR) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Only opener can send update_fee'
-				}
-			];
+			// BOLT 2 MUST fail: only the node responsible for paying the commitment
+			// fee may send update_fee.
+			return this._failChannelWithWireError('Only opener can send update_fee');
 		}
 
 		// Bounds checking: reject unreasonable fee rates
 		if (msg.feeratePerKw < 253) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Fee rate below minimum relay fee (253 sat/kw)'
-				}
-			];
+			// BOLT 2: a rate too low for the commitment to relay is a fail-the-channel
+			// condition for the receiver.
+			return this._failChannelWithWireError(
+				'Fee rate below minimum relay fee (253 sat/kw)'
+			);
 		}
 
 		// Absolute ceiling (matches the open_channel validation): even within the
 		// 10x relative bound, never accept an absurd feerate that would burn the
 		// channel balance as commitment fees.
 		if (msg.feeratePerKw > 100_000) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Fee rate above absolute maximum (100000 sat/kw)'
-				}
-			];
+			// BOLT 2: an unreasonably large rate is a fail-the-channel condition.
+			return this._failChannelWithWireError(
+				'Fee rate above absolute maximum (100000 sat/kw)'
+			);
 		}
 
-		const currentRate = this._state.remoteConfig.feeratePerKw || 253;
+		// Measured against the highest rate already in play, not only the COMMITTED
+		// one. BOLT 2 lets the opener send several update_fee inside one round and
+		// counts the last, but pendingFeeratePerKw is promoted into remoteConfig
+		// only when a staged rate reaches the signable phase or the round
+		// completes, so measuring the second update of a round against the stale
+		// committed rate refused a legal escalation (253 -> 2530 -> 25300). It only
+		// ever loosens, and the absolute ceiling above still bounds a runaway.
+		// Getting this right is a precondition for the wire error below: a guard
+		// that fails the channel must not carry known false positives.
+		const currentRate = Math.max(
+			this._state.pendingFeeratePerKw ?? 0,
+			this._state.remoteConfig.feeratePerKw || 253
+		);
 		if (msg.feeratePerKw > currentRate * 10) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Fee rate unreasonably high (>10x current rate)'
-				}
-			];
+			return this._failChannelWithWireError(
+				'Fee rate unreasonably high (>10x current rate)'
+			);
 		}
 
 		// Check whether the new fee rate would drain the opener below channel
 		// reserve, against what the builder actually takes off the funder: the fee
 		// at this channel type's base weight plus the anchor outputs it deducts on
 		// top (#193). Over-pricing it here refuses an update_fee that is legal by
-		// the opener's own arithmetic, and the bare ERROR that refusal returns is
-		// never put on the wire, so the peer keeps going and the channel force
-		// closes (#403).
+		// the opener's own arithmetic, and since issue 404 that refusal fails the
+		// channel outright rather than desyncing it silently, so this arithmetic has
+		// to match the opener's exactly (#403).
 		const activeHtlcCount = this._countActiveHtlcs();
 		const newCost = funderCommitmentCostSats(
 			msg.feeratePerKw,
@@ -4379,32 +4522,31 @@ export class Channel {
 		const reserveMsat = this._state.localConfig.channelReserveSatoshis * 1000n;
 		// Remote is the opener (we are acceptor), so check their balance
 		if (newCost * 1000n > this._state.remoteBalanceMsat - reserveMsat) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Fee rate would drain opener below channel reserve'
-				}
-			];
+			// BOLT 2: a rate the opener cannot afford above its reserve can never be
+			// applied to the commitment we hold.
+			return this._failChannelWithWireError(
+				'Fee rate would drain opener below channel reserve'
+			);
 		}
 
 		// Dust re-trim guard: on non-anchor channels the trim threshold rises
 		// with the feerate, so a fee hike can push previously-untrimmed in-flight
 		// HTLCs below dust — silently burning their value into the commitment
 		// fee. Reject a feerate that would raise total dust exposure above the
-		// same ceiling enforced at HTLC-add time. Rejecting is safe: the ERROR
-		// path force-closes at the old committed rate, where the HTLCs are still
-		// untrimmed and claimable.
+		// same ceiling enforced at HTLC-add time. Rejecting is safe because the
+		// wire error below force-closes at the old COMMITTED rate, where the HTLCs
+		// are still untrimmed and claimable. That was not true while this returned a
+		// bare ERROR: the peer never heard, kept the rate in its book, and the
+		// channel died a round later on a signature mismatch instead (issue 404).
 		if (
 			this._dustExposureAtRateMsat(msg.feeratePerKw) >
 			Channel.MAX_DUST_HTLC_EXPOSURE_MSAT
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'update_fee would raise dust HTLC exposure above limit (in-flight HTLCs would be trimmed)'
-				}
-			];
+			// OUR ceiling rather than a BOLT 2 MUST, and told anyway: the divergence
+			// is identical to a spec violation.
+			return this._failChannelWithWireError(
+				'update_fee would raise dust HTLC exposure above limit (in-flight HTLCs would be trimmed)'
+			);
 		}
 
 		// The reserve check above measures the opener against the reserve WE
@@ -4419,7 +4561,7 @@ export class Channel {
 			pendingFeeratePerKw: msg.feeratePerKw
 		});
 		if (wouldEmpty) {
-			return [{ type: ChannelActionType.ERROR, message: wouldEmpty }];
+			return this._failChannelWithWireError(wouldEmpty);
 		}
 
 		// Stage the opener's proposed feerate as pending rather than applying it to
@@ -6524,9 +6666,27 @@ export class Channel {
 	 * over provably-desynced state, persist FIRST, and surface the app-level
 	 * error. Generalizes the DLP fell-behind pattern in handleReestablish.
 	 *
-	 * ONLY for violations by the PEER (invalid signatures, bad revocation
-	 * secrets, ...): a wire error kills the channel at the peer, so local API
-	 * misuse must keep returning plain ERROR actions.
+	 * The test is DIVERGENCE, not blame. Use it for any message the peer has
+	 * already put on the wire that we refuse unconditionally and permanently:
+	 * from the moment we return, the peer's update log holds an entry ours
+	 * never will, its next commitment_signed covers state we cannot reproduce,
+	 * and the channel is dead whether or not we say so. The only choice is
+	 * whether the peer learns now with the real reason, or a round later as
+	 * "Invalid commitment signature" (issue 404). That covers our OWN policy
+	 * refusals (dust exposure ceilings, CLTV horizons, fee bounds) as squarely
+	 * as a bad signature: the peer could not have predicted the policy, but the
+	 * divergence is identical.
+	 *
+	 * Two carve-outs, both refusals that are NOT provable divergence, and both
+	 * of which keep returning plain ERROR actions:
+	 *  - local API misuse by our own caller (addHtlc with a bad amount,
+	 *    updateFee from the acceptor). Nothing was ever on the wire, so nothing
+	 *    diverged.
+	 *  - a refusal a legal in-flight crossing can produce: the lifecycle guards
+	 *    (the message arrived for a channel that has since moved to
+	 *    SHUTTING_DOWN, CLOSING, SPLICING or ERRORED) and the SENT_STFU half of
+	 *    the quiescence guard. There the peer may be entirely conformant and
+	 *    simply not yet have seen the transition we made.
 	 */
 	private _failChannelWithWireError(message: string): ChannelAction[] {
 		// A hostile or malformed message can fail a channel whose safety
@@ -11231,16 +11391,8 @@ export class Channel {
 		// (BOLT 2 negotiation cancellation): a local error alone deletes our
 		// half while the opener sits awaiting accept_channel2 forever. The
 		// error is scoped to the id the opener used.
-		const refuse = (reason: string): ChannelAction[] => [
-			sendMsg(
-				MessageType.ERROR,
-				encodeErrorMessage({
-					channelId: msg.channelId,
-					data: Buffer.from(reason, 'ascii')
-				})
-			),
-			{ type: ChannelActionType.ERROR, message: reason }
-		];
+		const refuse = (reason: string): ChannelAction[] =>
+			refuseWithWireError(msg.channelId, reason);
 
 		const acceptV2MaxHtlcErr = validateU64(
 			localParams.maxHtlcValueInFlightMsat,
@@ -11494,17 +11646,23 @@ export class Channel {
 	 * Handle accept_channel2 from remote (opener side).
 	 */
 	handleAcceptChannel2(msg: IAcceptChannel2Message): ChannelAction[] {
-		const refuse = (reason: string): ChannelAction[] => [
-			sendMsg(
-				MessageType.ERROR,
-				encodeErrorMessage({
-					channelId: msg.channelId,
-					data: Buffer.from(reason, 'utf8')
-				})
-			),
-			{ type: ChannelActionType.ERROR, message: reason }
-		];
+		const refuse = (reason: string): ChannelAction[] =>
+			refuseWithWireError(msg.channelId, reason);
 		if (this._state.state !== ChannelState.DUAL_FUNDING_V2) {
+			// Wire-visible, unlike the state guards of handleOpenChannel,
+			// handleOpenChannel2, handleAcceptChannel, handleFundingCreated and
+			// handleFundingSigned, and the asymmetry is deliberate (issue 393). Those
+			// guards fire on a duplicated or late message for a negotiation that is
+			// still live under the same id, so answering would cancel something
+			// healthy. This one cannot: a v2 open stays DUAL_FUNDING_V2 for the whole
+			// interactive-tx negotiation, so a duplicated accept_channel2 never
+			// reaches here (session.handleAcceptChannel2 refuses it below, itself
+			// wire-visibly), and once the record promotes the channel out of
+			// tempChannels the manager answers "Unknown channel_id" without calling
+			// us. What is left is a channel that is not a v2 open at all, most
+			// plausibly a v1 SENT_OPEN answered with accept_channel2, and cancelling
+			// that IS the right answer because the v1 open can never complete against
+			// it.
 			return refuse('Unexpected accept_channel2');
 		}
 

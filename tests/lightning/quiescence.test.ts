@@ -24,6 +24,7 @@ import {
 	HtlcState
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { expectWireFailure, wireRefusalOf } from './helpers/open-refusal';
 import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -663,9 +664,42 @@ describe('Quiescence (STFU)', function () {
 				onionRoutingPacket: crypto.randomBytes(1366)
 			};
 			const actions = opener.handleUpdateAddHtlc(fakeHtlcMsg);
+			// The PEER has sent stfu here, so it is bound by BOLT 2's "MUST NOT send
+			// an update message after stfu" and no crossing can explain the add.
+			// That makes it provable divergence, and the refusal is wire-visible
+			// (issue 404) rather than a bare ERROR the peer never sees.
+			expectWireFailure(
+				actions,
+				opener.getChannelId()!,
+				/update_add_htlc after your stfu/
+			);
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		it('keeps an add that merely CROSSED our own stfu local (issue 404)', function () {
+			// We have sent stfu and the peer has not answered. Its obligation starts
+			// at ITS receipt of ours, which we cannot observe, and BOLT 2 requires
+			// that window to exist ("MUST reply with stfu once it can do so", which a
+			// peer holding pending updates cannot do until it has drained them). So
+			// an add here may be entirely conformant: refuse it, but do not condemn
+			// the channel over a race.
+			const { opener } = getToNormal();
+			opener.initiateQuiescence();
+			expect(opener.getQuiescenceState()).to.equal(QuiescenceState.SENT_STFU);
+
+			const actions = opener.handleUpdateAddHtlc({
+				channelId: opener.getChannelId()!,
+				id: 0n,
+				amountMsat: 50_000_000n,
+				paymentHash: crypto.randomBytes(32),
+				cltvExpiry: 500000,
+				onionRoutingPacket: crypto.randomBytes(1366)
+			});
+			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
 			const error = findAction(actions, ChannelActionType.ERROR);
 			expect(error).to.exist;
 			expect(error.message).to.contain('quiescing');
+			expect(opener.getState()).to.equal(ChannelState.NORMAL);
 		});
 
 		it('should return correct quiescence state via getQuiescenceState', function () {

@@ -26,6 +26,7 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { expectWireFailure } from './helpers/open-refusal';
 import {
 	createOpenerState,
 	createAcceptorState
@@ -232,9 +233,10 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 				cltvExpiry: 100,
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
-			expect(actions).to.have.lengthOf(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect((actions[0] as any).message).to.include('greater than 0');
+			// Wire-visible: the peer must learn its update was refused, or its
+			// next commitment_signed covers state we do not hold (issue 404).
+			expectWireFailure(actions, state.channelId!, /greater than 0/);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 
 		it('rejects HTLC below our htlcMinimumMsat', () => {
@@ -249,9 +251,10 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 				cltvExpiry: 100,
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
-			expect(actions).to.have.lengthOf(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect((actions[0] as any).message).to.include('below our minimum');
+			// Wire-visible: the peer must learn its update was refused, or its
+			// next commitment_signed covers state we do not hold (issue 404).
+			expectWireFailure(actions, state.channelId!, /below our minimum/);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 
 		it('rejects HTLC when max inbound pending exceeded', () => {
@@ -282,9 +285,10 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 				cltvExpiry: 100,
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
-			expect(actions).to.have.lengthOf(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect((actions[0] as any).message).to.include('Max inbound pending');
+			// Wire-visible: the peer must learn its update was refused, or its
+			// next commitment_signed covers state we do not hold (issue 404).
+			expectWireFailure(actions, state.channelId!, /Max inbound pending/);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 
 		it('rejects HTLC when max inbound value in flight exceeded', () => {
@@ -299,9 +303,10 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 				cltvExpiry: 100,
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
-			expect(actions).to.have.lengthOf(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect((actions[0] as any).message).to.include('Max inbound HTLC value');
+			// Wire-visible: the peer must learn its update was refused, or its
+			// next commitment_signed covers state we do not hold (issue 404).
+			expectWireFailure(actions, state.channelId!, /Max inbound HTLC value/);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 	});
 
@@ -341,11 +346,14 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 				channelId: state.channelId!,
 				feeratePerKw: 5000
 			});
-			expect(actions).to.have.lengthOf(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect((actions[0] as any).message).to.include(
-				'drain opener below channel reserve'
+			// Wire-visible: the peer must learn its update was refused, or its
+			// next commitment_signed covers state we do not hold (issue 404).
+			expectWireFailure(
+				actions,
+				state.channelId!,
+				/drain opener below channel reserve/
 			);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 	});
 
@@ -367,6 +375,8 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 			);
 			expect(actions).to.have.lengthOf(1);
 			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+			// Control: our OWN addHtlc is local API misuse, never on the wire, so it
+			// stays a bare ERROR while every inbound arm above fails the channel.
 			expect((actions[0] as any).message).to.include('Insufficient balance');
 		});
 	});
@@ -386,9 +396,10 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 				cltvExpiry: 499, // Already expired
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
-			expect(actions).to.have.lengthOf(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect((actions[0] as any).message).to.include('CLTV already expired');
+			// Wire-visible: the peer must learn its update was refused, or its
+			// next commitment_signed covers state we do not hold (issue 404).
+			expectWireFailure(actions, state.channelId!, /CLTV already expired/);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 
 		it('rejects HTLC with CLTV too far in future', () => {
@@ -403,9 +414,10 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 				cltvExpiry: 500 + 5041, // > 5040 blocks in future
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
-			expect(actions).to.have.lengthOf(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect((actions[0] as any).message).to.include('CLTV too far in future');
+			// Wire-visible: the peer must learn its update was refused, or its
+			// next commitment_signed covers state we do not hold (issue 404).
+			expectWireFailure(actions, state.channelId!, /CLTV too far in future/);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 	});
 });

@@ -2542,12 +2542,18 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		).to.match(/cannot afford HTLC above channel reserve/);
 
 		// Exactly at the reserve is legal, and was refused before the derivation.
+		// On a PRISTINE channel: since issue 404 the refusal above fails the one it
+		// was measured on.
+		const admits = driveToCommitmentExchange();
+		driveToNormal(admits);
 		expect(
 			findError(
-				h.opener.handleUpdateAddHtlc(inboundHtlc(h.opener, 48_500_000n))
+				admits.opener.handleUpdateAddHtlc(
+					inboundHtlc(admits.opener, 48_500_000n)
+				)
 			)
 		).to.equal(null);
-		expect(Number(h.opener.getFullState().remoteBalanceMsat)).to.equal(
+		expect(Number(admits.opener.getFullState().remoteBalanceMsat)).to.equal(
 			1_500_000
 		);
 	});

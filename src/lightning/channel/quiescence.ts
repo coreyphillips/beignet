@@ -38,6 +38,27 @@ export class QuiescenceManager {
 		return this.state !== QuiescenceState.NORMAL;
 	}
 
+	/**
+	 * Has the PEER put an `stfu` on the wire?
+	 *
+	 * Only from its own `stfu` is the peer bound by BOLT 2's "MUST NOT send an
+	 * update message after `stfu`". While we have merely SENT one, the peer owes
+	 * nothing yet: its obligation starts at ITS receipt of ours, a moment we
+	 * cannot observe, and an update it had already dispatched crosses ours
+	 * legitimately. BOLT 2 requires that window to exist, since a peer holding
+	 * pending updates must drain them before it can "reply with `stfu` once it
+	 * can do so".
+	 *
+	 * So isQuiescing() (which is true in SENT_STFU too) can never be the
+	 * predicate for FAILING a channel, only for refusing an update. This is.
+	 */
+	peerHasSentStfu(): boolean {
+		return (
+			this.state === QuiescenceState.RECEIVED_STFU ||
+			this.state === QuiescenceState.QUIESCENT
+		);
+	}
+
 	isInitiator(): boolean {
 		return this._initiator;
 	}
