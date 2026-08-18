@@ -21,6 +21,10 @@ import {
 	createOpenerChannel
 } from '../../src/lightning/channel/channel';
 import { createAcceptorState } from '../../src/lightning/channel/channel-state';
+import {
+	serializeChannelState,
+	deserializeChannelState
+} from '../../src/lightning/storage/serialization';
 import { expectWireRefusal, wireRefusalOf } from './helpers/open-refusal';
 import {
 	ChannelState,
@@ -208,10 +212,11 @@ function inboundHtlc(
 /** Drive a pair all the way to NORMAL (real sigs; no commitment exchange). */
 function normalPair(
 	fundingSatoshis = 1_000_000n,
-	pushMsat = 0n
+	pushMsat = 0n,
+	mutateOpen?: (msg: IOpenChannelMessage) => void
 ): { opener: Channel; acceptor: Channel } {
 	const { opener, acceptor, accept } = openerAndAccept(
-		undefined,
+		mutateOpen,
 		undefined,
 		fundingSatoshis,
 		pushMsat
@@ -450,6 +455,29 @@ describe('BOLT 2 LOW hardening batch', function () {
 			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
 				DEFAULT_CHANNEL_CONFIG.channelReserveSatoshis
 			);
+			// And no provenance stamp either: the field still holds the node's
+			// static configuration, which is exactly the row the load-time repair
+			// is allowed to re-derive.
+			expect(opener.getFullState().channelReserveVersion).to.equal(undefined);
+		});
+
+		it('both roles stamp the reserve they recorded (issue 381)', function () {
+			// The stamp is what tells a negotiated reserve apart from an inherited
+			// static one on the next load, so an open site that records the value
+			// without it would hand the repair a row it must not touch.
+			const { opener, acceptor } = openerAndAccept(
+				undefined,
+				undefined,
+				150_000n
+			);
+			expect(
+				opener.getFullState().channelReserveVersion,
+				'opener stamped'
+			).to.be.a('number');
+			expect(
+				acceptor.getFullState().channelReserveVersion,
+				'acceptor stamped'
+			).to.be.a('number');
 		});
 
 		it('admits an inbound HTLC down to the reserve we advertised (issue 381)', function () {
@@ -561,6 +589,51 @@ describe('BOLT 2 LOW hardening batch', function () {
 		});
 	});
 
+	it('a restart does not widen what an acceptor admits (issue 381)', function () {
+		// End to end for the reserve provenance stamp. The acceptor negotiated
+		// max(1% of 50,000, both dust limits) = 1,000 against a 1,000-sat opener
+		// dust limit, and that is the number BOLT 2 makes it responsible for
+		// refusing below. Re-deriving on load would land at 546, and the 454-sat
+		// difference is HTLCs this channel promised to reject and would start
+		// accepting on the first restart, against a peer that is under no
+		// obligation to be honest about its own reserve.
+		const { acceptor } = normalPair(50_000n, 0n, (open) => {
+			open.dustLimitSatoshis = 1_000n;
+			open.channelReserveSatoshis = 1_000n;
+		});
+		expect(acceptor.getFullState().localConfig.channelReserveSatoshis).to.equal(
+			1_000n
+		);
+		// 49,100,000 msat sits in the band the two values disagree about: the
+		// funder must keep 1,000,000 msat of reserve plus its commitment fee out
+		// of 50,000,000, and at 546 it would only have to keep 546,000.
+		expect(
+			errorOf(acceptor.handleUpdateAddHtlc(inboundHtlc(acceptor, 49_100_000n)))
+		).to.match(/cannot afford HTLC above channel reserve/);
+
+		// Round-trip the row through disk and run the load-time repair over it.
+		const restored = new Channel(
+			deserializeChannelState(
+				JSON.parse(
+					JSON.stringify(serializeChannelState(acceptor.getFullState()))
+				)
+			)
+		);
+		restored.repairEnforcedChannelReserve();
+		expect(
+			restored.getFullState().localConfig.channelReserveSatoshis,
+			'the negotiated reserve survived the restart'
+		).to.equal(1_000n);
+		expect(
+			errorOf(restored.handleUpdateAddHtlc(inboundHtlc(restored, 49_100_000n)))
+		).to.match(/cannot afford HTLC above channel reserve/);
+		// And the refusal is the reserve boundary, not a channel that rejects
+		// everything: comfortably under it still goes through.
+		expect(
+			errorOf(restored.handleUpdateAddHtlc(inboundHtlc(restored, 48_000_000n)))
+		).to.equal(null);
+	});
+
 	describe('a refused v1 open reaches the opener (issue 381)', function () {
 		// A bare ERROR action is never put on the wire, so a refusal the opener
 		// cannot see deletes our half of the negotiation while it stays in
@@ -621,6 +694,32 @@ describe('BOLT 2 LOW hardening batch', function () {
 				openMsg.temporaryChannelId,
 				/max_htlc_value_in_flight_msat/
 			);
+		});
+
+		it('but an open under the all-zero id stays local, at the Channel layer', function () {
+			// ChannelManager drops such an open before it builds a Channel, so this
+			// covers anyone driving the Channel directly. It is what makes the
+			// closure's "scoped to the id the opener used" unconditionally true:
+			// BOLT 1 reserves the all-zero id for every channel with the peer, so
+			// a wire error under it would cancel far more than this open.
+			const { acceptor, openMsg } = openerAndAccept();
+			const zeroed = { ...openMsg, temporaryChannelId: Buffer.alloc(32, 0) };
+			const fresh = new Channel(
+				createAcceptorState({
+					temporaryChannelId: zeroed.temporaryChannelId,
+					fundingSatoshis: zeroed.fundingSatoshis,
+					pushMsat: zeroed.pushMsat,
+					localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+					localBasepoints: realBasepoints(),
+					localPerCommitmentSeed: crypto.randomBytes(32),
+					remoteBasepoints: realBasepoints(),
+					remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
+				})
+			);
+			const actions = fresh.handleOpenChannel(zeroed);
+			expect(errorOf(actions)).to.match(/reserved all-zero id/);
+			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
+			expect(acceptor.getState()).to.equal(ChannelState.SENT_ACCEPT);
 		});
 
 		it('but an open against a channel that already has a life stays local', function () {

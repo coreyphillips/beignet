@@ -281,6 +281,86 @@ describe('Channel Manager', function () {
 			expect(bob.listChannels()).to.have.length(0);
 		});
 
+		it('never widens an all-zero id refusal, whichever arm fires (issue 381)', function () {
+			// The guard has to precede the chain, namespace and duplicate-id
+			// refusals, not just the ones inside Channel: those three are
+			// wire-visible too, and an all-zero id combined with any of them would
+			// put a connection-wide error on the wire, telling the peer to fail
+			// every channel it has with us. refuseInboundOpen suppresses it a
+			// second time, so the v2 arms that route through it are covered as
+			// well as anything added later.
+			const alice = new ChannelManager(makeConfig(1));
+			let openPayload: Buffer | null = null;
+			alice.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					if (type === MessageType.OPEN_CHANNEL) openPayload = payload;
+				}
+			);
+			alice.openChannel(bobPubkey, 1_000_000n);
+			const open = decodeOpenChannelMessage(openPayload!);
+			open.temporaryChannelId = Buffer.alloc(32, 0x00);
+			let derived = 0;
+
+			// Each of these makes a DIFFERENT refusal arm fire ahead of the one
+			// inside Channel.handleOpenChannel.
+			const countingKeys = (): Partial<IChannelManagerConfig> => ({
+				channelKeyDeriver: (index: number) => {
+					derived++;
+					const seed = makeSeed(200 + index);
+					return {
+						basepoints: makeBasepoints(seed),
+						perCommitmentSeed: seed,
+						fundingPrivkey: seed,
+						htlcBasepointSecret: seed
+					};
+				}
+			});
+			const arms: Array<[string, () => ChannelManager]> = [
+				[
+					'unknown chain',
+					(): ChannelManager =>
+						new ChannelManager({
+							...makeConfig(2),
+							...countingKeys(),
+							chainHash: crypto
+								.createHash('sha256')
+								.update('other-chain')
+								.digest()
+						})
+				],
+				[
+					'ordinary acceptor',
+					(): ChannelManager =>
+						new ChannelManager({ ...makeConfig(2), ...countingKeys() })
+				]
+			];
+
+			for (const [label, build] of arms) {
+				const bob = build();
+				derived = 0;
+				const wire: number[] = [];
+				const errors: string[] = [];
+				bob.on('message:outbound', (_peer: string, type: number) =>
+					wire.push(type)
+				);
+				bob.on('error', (_id: Buffer | null, message: string) =>
+					errors.push(message)
+				);
+				bob.handleMessage(
+					alicePubkey,
+					MessageType.OPEN_CHANNEL,
+					encodeOpenChannelMessage(open)
+				);
+				expect(wire, `${label}: nothing on the wire`).to.deep.equal([]);
+				expect(errors.length, `${label}: refused locally`).to.equal(1);
+				expect(bob.listChannels(), `${label}: no channel`).to.have.length(0);
+				// And the drop precedes the work: an id we can never answer under
+				// must not burn a channel key index on its way to being refused.
+				expect(derived, `${label}: no channel keys derived`).to.equal(0);
+			}
+		});
+
 		it('should reach AWAITING_FUNDING_CONFIRMED after funding', function () {
 			const { alice } = createConnectedManagers();
 

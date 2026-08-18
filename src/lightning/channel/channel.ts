@@ -286,6 +286,14 @@ function declMsg(
 const MIN_CHANNEL_RESERVE_SATOSHIS = 546n; // LND enforces P2PKH dust limit as minimum reserve
 
 /**
+ * Stamped on IChannelState.channelReserveVersion by every site that writes the
+ * reserve we enforce, so a later load can tell a row that negotiated its value
+ * from one that never had a value written at all. See the field's own comment
+ * for why this is a version and not a flag, and what bumping it obliges.
+ */
+const ENFORCED_RESERVE_VERSION = 1;
+
+/**
  * Liquidity ads: how far a buyer-supplied lease blockheight may sit from our
  * current tip before we reject it (S-L/S-W MEDIUM). The buyer sets it to its
  * own tip; a small past tolerance absorbs propagation skew, and the future
@@ -1181,6 +1189,7 @@ export class Channel {
 			...this._state.localConfig,
 			channelReserveSatoshis: channelReserve
 		};
+		this._state.channelReserveVersion = ENFORCED_RESERVE_VERSION;
 
 		this._state.state = ChannelState.SENT_OPEN;
 		return [sendMsg(MessageType.OPEN_CHANNEL, encodeOpenChannelMessage(msg))];
@@ -1678,6 +1687,23 @@ export class Channel {
 			];
 		}
 
+		// The one id we cannot answer under. BOLT 1 reserves the all-zero
+		// channel_id for "all channels with this peer", so the wire error every
+		// arm below returns would tell the opener to fail all of them. Refused
+		// locally instead, which is what makes the closure's "scoped to the id
+		// the opener used" true for every caller: ChannelManager drops such an
+		// open before it ever builds a Channel, and this covers anyone driving
+		// the Channel directly.
+		if (msg.temporaryChannelId.every((b) => b === 0)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'open_channel refused: temporary_channel_id is the reserved all-zero id'
+				}
+			];
+		}
+
 		// Every rejected inbound open_channel must reach the OPENER too (BOLT 2
 		// negotiation cancellation, BOLT 1 error): a local ERROR action is never
 		// put on the wire, so it deletes our half while the opener sits in
@@ -1873,6 +1899,7 @@ export class Channel {
 			...this._state.localConfig,
 			channelReserveSatoshis: channelReserve
 		};
+		this._state.channelReserveVersion = ENFORCED_RESERVE_VERSION;
 
 		this._state.state = ChannelState.SENT_ACCEPT;
 		return [
@@ -7117,8 +7144,16 @@ export class Channel {
 	 * change repairs nothing that exists. A v2 row written before #383 derived
 	 * either reserve is the same shape (issue #387).
 	 *
-	 * Two properties make it safe rather than a second guess at what the channel
-	 * negotiated:
+	 * It runs ONLY on a row with no channelReserveVersion, i.e. one whose reserve
+	 * no site ever wrote. Every site that establishes the value stamps the
+	 * version, so a channel that negotiated its reserve keeps that exact number
+	 * across restarts and this never sees it. The re-derivation is deliberately
+	 * the weakest reserve any build could have advertised at the row's capacity,
+	 * which is the right answer for an unmarked row and the wrong one for a
+	 * marked row, so the marker is what separates them rather than arithmetic.
+	 *
+	 * Two further properties make it safe rather than a second guess at what the
+	 * channel negotiated:
 	 *
 	 * - It only ever LOWERS. The enforced reserve is read at three places
 	 *   (handleUpdateAddHtlc, handleUpdateFee, and IChannelInfo reporting) and a
@@ -7144,6 +7179,14 @@ export class Channel {
 	 * at the next load once channel_ready nulls the record.
 	 */
 	repairEnforcedChannelReserve(): void {
+		// A row whose reserve was WRITTEN by a site that knew what the channel
+		// negotiated keeps it, exactly. The re-derivation below cannot reproduce
+		// such a value and is not meant to: it is the weakest reserve any build
+		// could have advertised at this capacity, which is the right answer only
+		// while the row's provenance is unknown. Applied to a modern v1 acceptor
+		// row it would drop a negotiated 1,000 to 546 and hand a faulty or
+		// hostile peer 454 sats of room BOLT 2 makes us responsible for refusing.
+		if (this._state.channelReserveVersion) return;
 		if (this._state.fundingSatoshis <= 0n) return;
 		if (this._state.v2InFlight || this._state.v2PreviousAttempts?.length) {
 			return;
@@ -10187,6 +10230,7 @@ export class Channel {
 				...this._state.localConfig,
 				channelReserveSatoshis: splicedReserve
 			};
+			fields.channelReserveVersion = ENFORCED_RESERVE_VERSION;
 		}
 		// Adopt the peer's signature on our NEW commitment (exchanged during the
 		// mid-splice commitment_signed round) so we can unilaterally close the
@@ -14493,6 +14537,7 @@ export class Channel {
 			...this._state.localConfig,
 			channelReserveSatoshis: v2ReserveWeEnforce(capacity, ourDust, peerDust)
 		};
+		this._state.channelReserveVersion = ENFORCED_RESERVE_VERSION;
 	}
 
 	/**
@@ -14555,6 +14600,7 @@ export class Channel {
 			...this._state.localConfig,
 			channelReserveSatoshis: reserves.theirs
 		};
+		this._state.channelReserveVersion = ENFORCED_RESERVE_VERSION;
 		// Our wallet contribution funds the funding output, so it tracks the
 		// attempt too: the change output and the underfunded check are both
 		// derived from it.
@@ -14914,6 +14960,7 @@ export class Channel {
 				...this._state.localConfig,
 				channelReserveSatoshis: reserves.theirs
 			};
+			fields.channelReserveVersion = ENFORCED_RESERVE_VERSION;
 		}
 		return fields;
 	}

@@ -777,6 +777,13 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		 * A row as it exists on disk, with the fields the repair reads set by the
 		 * caller. Built by round-tripping a real NORMAL channel so every other
 		 * field is genuine.
+		 *
+		 * LEGACY by default: the version stamp the open sites write is stripped,
+		 * which is the whole population the repair exists for. Pass `recorded` for
+		 * a row written by a build that had the stamp, and note that the fixture
+		 * has to opt IN to that rather than out, so a test cannot accidentally
+		 * assert the repair's conservative value against a row that negotiated
+		 * something better.
 		 */
 		function restoredRow(overrides: {
 			fundingSatoshis: string;
@@ -786,12 +793,16 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			fundingVersion?: 1 | 2;
 			acceptorRole?: boolean;
 			spliced?: boolean;
+			recorded?: boolean;
 		}): Channel {
 			const { opener, acceptor } = setupNormalChannels();
 			const source = overrides.acceptorRole ? acceptor : opener;
 			const json = JSON.parse(
 				JSON.stringify(serializeChannelState(source.getFullState()))
 			);
+			if (!overrides.recorded) {
+				delete json.channelReserveVersion;
+			}
 			json.fundingSatoshis = overrides.fundingSatoshis;
 			json.localConfig.channelReserveSatoshis =
 				overrides.channelReserveSatoshis;
@@ -904,6 +915,30 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			});
 			channel.repairEnforcedChannelReserve();
 			expect(reserveOf(channel)).to.equal(1_500n);
+		});
+
+		it('keeps a negotiated reserve that a site actually recorded (issue 381)', function () {
+			// The conservative re-derivation is right for an UNMARKED row and
+			// wrong for a marked one. A modern v1 acceptor advertises and stores
+			// max(1% of capacity, both dust limits), so on 50,000 sat against a
+			// 1,000-sat peer dust limit it promised 1,000; re-deriving 546 would
+			// hand a faulty or hostile peer 454 sats of room BOLT 2 makes the
+			// RECEIVER responsible for refusing, and would make
+			// IChannelInfo.remoteReserveMsat disagree with the negotiation. The
+			// version stamp is what tells the two rows apart.
+			const recorded = restoredRow({
+				fundingSatoshis: '50000',
+				channelReserveSatoshis: '1000',
+				remoteDustLimitSatoshis: '1000',
+				acceptorRole: true,
+				recorded: true
+			});
+			recorded.repairEnforcedChannelReserve();
+			expect(reserveOf(recorded)).to.equal(1_000n);
+			// Idempotent from the other side too: a marked row is never touched,
+			// however many times the node restarts.
+			recorded.repairEnforcedChannelReserve();
+			expect(reserveOf(recorded)).to.equal(1_000n);
 		});
 
 		it('errs low rather than high on an acceptor row (issue 381)', function () {

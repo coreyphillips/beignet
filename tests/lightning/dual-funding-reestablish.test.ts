@@ -1350,6 +1350,10 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		// A value the derivation would happily lower, so what keeps it is the
 		// guard rather than the arithmetic agreeing by accident.
 		json.localConfig.channelReserveSatoshis = '10000';
+		// And no provenance stamp, i.e. a row from a build that never wrote one.
+		// Without stripping it the repair would skip on the stamp rather than on
+		// the live record, and this would stop testing the guard it names.
+		delete json.channelReserveVersion;
 		const revived = new Channel(deserializeChannelState(json), h.openerSigner);
 		revived.repairEnforcedChannelReserve();
 		expect(
@@ -1362,6 +1366,9 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(revived.getFullState().localConfig.channelReserveSatoshis).to.equal(
 			1_500n
 		);
+		// And it stamps provenance, so a later load does not re-derive what the
+		// record just established (issue 381).
+		expect(revived.getFullState().channelReserveVersion).to.be.a('number');
 	});
 
 	it('deserializes a legacy state without a record to null and drops it deterministically', () => {
