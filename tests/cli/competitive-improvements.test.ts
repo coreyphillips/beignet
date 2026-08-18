@@ -362,6 +362,12 @@ describe('TLS Daemon', () => {
 		} catch (err: any) {
 			expect(err.message).to.include('tlsKey is required');
 		}
+		// Config-only refusals run before BeignetNode.create, so nothing was
+		// booted for the caller to be left without a handle to.
+		expect(
+			fs.existsSync(path.join(tmpDir, 'regtest.db')),
+			'no node was booted for a config error'
+		).to.equal(false);
 	});
 
 	it('rejects tlsKey without tlsCert', async () => {
@@ -379,6 +385,56 @@ describe('TLS Daemon', () => {
 		} catch (err: any) {
 			expect(err.message).to.include('tlsCert is required');
 		}
+		expect(
+			fs.existsSync(path.join(tmpDir, 'regtest.db')),
+			'no node was booted for a config error'
+		).to.equal(false);
+	});
+
+	it('destroys the node when the start fails after booting it', async function () {
+		this.timeout(30_000);
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-leak-'));
+		// Occupy the port so the failure lands on server.listen, i.e. after the
+		// node is up. Before the fix the rejection reached the caller with no
+		// handle to the node, leaving its database, single-instance lock,
+		// Electrum poll and backup timer running for the life of the process.
+		const squatter = http.createServer();
+		await new Promise<void>((resolve) =>
+			squatter.listen(0, '127.0.0.1', () => resolve())
+		);
+		const busyPort = (squatter.address() as any).port;
+
+		let thrown: unknown;
+		try {
+			const started = await startDaemon({
+				network: 'regtest',
+				dataDir: tmpDir,
+				daemonPort: busyPort,
+				logLevel: 'silent',
+				...OFFLINE_ELECTRUM
+			});
+			await started.node.destroy();
+			started.server.close();
+		} catch (err: unknown) {
+			thrown = err;
+		} finally {
+			squatter.close();
+		}
+
+		expect(
+			(thrown as NodeJS.ErrnoException)?.code,
+			'the busy port refused the listen'
+		).to.equal('EADDRINUSE');
+		// The database proves a node really booted, so the lock being gone is
+		// destroy() having run rather than a start that never got that far.
+		expect(
+			fs.existsSync(path.join(tmpDir, 'regtest.db')),
+			'the node booted before the failure'
+		).to.equal(true);
+		expect(
+			fs.existsSync(path.join(tmpDir, 'regtest.lock')),
+			'the booted node was destroyed'
+		).to.equal(false);
 	});
 
 	it('starts HTTPS server with valid self-signed certs', async function () {
