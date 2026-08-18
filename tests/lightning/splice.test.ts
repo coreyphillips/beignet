@@ -2514,9 +2514,16 @@ describe('Splice', function () {
 		/** Drive a splice of `relativeSatoshis` to adoption and return the opener. */
 		function spliceToAdoption(
 			relativeSatoshis: bigint,
-			shape?: { fundingVersion?: 1 | 2; peerDustLimitSatoshis?: bigint }
+			shape?: {
+				fundingVersion?: 1 | 2;
+				peerDustLimitSatoshis?: bigint;
+				unstamped?: boolean;
+			}
 		): Channel {
 			const { opener } = makeNormalChannel();
+			if (shape?.unstamped) {
+				delete opener.getFullState().channelReserveVersion;
+			}
 			if (shape?.fundingVersion !== undefined) {
 				opener.getFullState().fundingVersion = shape.fundingVersion;
 			}
@@ -2568,6 +2575,18 @@ describe('Splice', function () {
 			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
 				2_000n
 			);
+		});
+
+		it('splice adoption stamps the reserve it establishes (issue 381)', function () {
+			// Starting from a row with no provenance stamp, i.e. one opened before
+			// the open sites recorded anything. Adoption is now the site that
+			// established the value, so it owes the stamp: without it the row stays
+			// eligible for the load-time repair forever.
+			const opener = spliceToAdoption(-800_000n, { unstamped: true });
+			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
+				2_000n
+			);
+			expect(opener.getFullState().channelReserveVersion).to.be.a('number');
 		});
 
 		it('a splice-in never raises the reserve it enforces (issue 381)', function () {

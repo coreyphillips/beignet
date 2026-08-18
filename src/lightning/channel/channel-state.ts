@@ -521,6 +521,27 @@ export interface IChannelState {
 
 	/** Dual-funding: v1 or v2 funding protocol */
 	fundingVersion: 1 | 2;
+	/**
+	 * Provenance of localConfig.channelReserveSatoshis, the reserve we enforce on
+	 * the peer: which generation of the code wrote it, or absent when it was
+	 * never written at all and the field still holds the node's static
+	 * configuration (issue #381).
+	 *
+	 * Absent is the only value that authorizes
+	 * Channel.repairEnforcedChannelReserve to touch the row, and it has to be a
+	 * VERSION rather than a boolean because that is the exact distinction whose
+	 * absence forced the repair to be conservative in the first place: the v1
+	 * acceptor site gained a peer-dust floor in PR #115 and an own-dust floor in
+	 * #381, and rows from either side of those changes are indistinguishable on
+	 * disk, so all of them have to be re-derived to the weakest value any of them
+	 * could have advertised. Marked rows never need that, because the generation
+	 * that wrote them is on the row.
+	 *
+	 * Bumping this is therefore a deliberate act: it means the derivation
+	 * changed, and whoever bumps it owes an explicit decision about what to do
+	 * with rows carrying the older number. Today every marked row is left alone.
+	 */
+	channelReserveVersion?: number;
 	/** Dual-funding: session state (only set for v2 channels) */
 	dualFundingSession: import('./dual-funding').DualFundingSession | null;
 	/**

@@ -400,6 +400,12 @@ export interface ISerializedChannelState {
 		timestamp: number;
 	} | null;
 	fundingVersion?: number;
+	/**
+	 * Which generation of the code wrote localConfig.channelReserveSatoshis.
+	 * Absent on every row written before it existed, which is exactly what
+	 * authorizes the load-time repair to re-derive those (issue #381).
+	 */
+	channelReserveVersion?: number;
 	commitmentFeeratePerkw?: number;
 	fundingLocktime?: number;
 	v2InFlight?: ISerializedV2InFlight | null;
@@ -808,6 +814,7 @@ export function serializeChannelState(
 			  }
 			: null,
 		fundingVersion: s.fundingVersion,
+		channelReserveVersion: s.channelReserveVersion,
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw,
 		fundingLocktime: s.fundingLocktime,
 		v2InFlight: s.v2InFlight ? serializeV2InFlight(s.v2InFlight) : null,
@@ -994,6 +1001,7 @@ export function deserializeChannelState(
 			  }
 			: null,
 		fundingVersion: (s.fundingVersion ?? 1) as 1 | 2,
+		channelReserveVersion: s.channelReserveVersion,
 		dualFundingSession: null,
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw ?? 0,
 		fundingLocktime: s.fundingLocktime ?? 0,

@@ -2211,6 +2211,69 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		node.destroy();
 	});
 
+	it('refuses an open_channel2 under the all-zero id without widening it', async function () {
+		const storage = openStorage();
+		// Same masked-node refusal as above, but the opener named the id BOLT 1
+		// reserves for "all channels with this peer". The refusal is wire-visible
+		// precisely so the opener is not left parked, and scoped to that id it
+		// would instead tell the opener to fail every channel it has with us. The
+		// suppression lives in refuseInboundOpen, which is what every v2 arm here
+		// routes through; the v1 path drops such an open even earlier.
+		const node = new LightningNode({
+			...makeNodeConfig(31, {
+				storage,
+				recovery: quorumRecovery(),
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			}),
+			preferTaproot: true
+		});
+		node.on('node:error', () => {});
+		node.on('error', () => {});
+		const manager = managerOf(node);
+		const errors: string[] = [];
+		manager.on('error', (_id: Buffer | null, message: string) => {
+			errors.push(message);
+		});
+		const sent: number[] = [];
+		node.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
+
+		const peerSide = makeBasepoints(28);
+		const openMsg = encodeOpenChannel2Message({
+			chainHash: REGTEST_CHAIN_HASH,
+			channelId: Buffer.alloc(32, 0x00),
+			fundingFeeratePerkw: 1000,
+			commitmentFeeratePerkw: 253,
+			fundingSatoshis: 150_000n,
+			dustLimitSatoshis: 546n,
+			maxHtlcValueInFlightMsat: 500_000_000n,
+			htlcMinimumMsat: 1n,
+			toSelfDelay: 144,
+			maxAcceptedHtlcs: 483,
+			locktime: 0,
+			fundingPubkey: peerSide.basepoints.fundingPubkey,
+			revocationBasepoint: peerSide.basepoints.revocationBasepoint,
+			paymentBasepoint: peerSide.basepoints.paymentBasepoint,
+			delayedPaymentBasepoint: peerSide.basepoints.delayedPaymentBasepoint,
+			htlcBasepoint: peerSide.basepoints.htlcBasepoint,
+			firstPerCommitmentPoint: peerSide.basepoints.firstPerCommitmentPoint,
+			secondPerCommitmentPoint: peerSide.basepoints.firstPerCommitmentPoint,
+			channelFlags: 1
+		});
+		manager.handleMessage('02'.repeat(33), MessageType.OPEN_CHANNEL2, openMsg);
+		await settle(() => errors.length > 0, 1500);
+
+		expect(errors.join(' ')).to.contain('does not advertise option_dual_fund');
+		expect(sent, 'no connection-wide error went out').to.not.include(
+			MessageType.ERROR
+		);
+		expect(manager.listChannels()).to.have.length(0);
+		expect(storage.loadAllChannels()).to.have.length(0);
+
+		node.destroy();
+	});
+
 	it('refuses an inbound open_channel2 from a peer whose init lacked the bit', async function () {
 		const storage = openStorage();
 		// We advertise option_dual_fund, the PEER did not: v2 establishment

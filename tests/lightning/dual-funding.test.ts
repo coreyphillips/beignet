@@ -1407,6 +1407,9 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			expect(state.remoteConfig.channelReserveSatoshis).to.equal(1062n);
 			// What we ENFORCE on the peer: 1% floored at the lower dust limit.
 			expect(state.localConfig.channelReserveSatoshis).to.equal(354n);
+			// Derived, not inherited from static configuration, and stamped as
+			// such so the load-time repair never re-derives it (issue 381).
+			expect(state.channelReserveVersion).to.be.a('number');
 		});
 
 		it('enforces the spec reserve on the peer, without our policy floor (issue 379)', () => {

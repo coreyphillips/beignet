@@ -2479,6 +2479,24 @@ export class ChannelManager extends EventEmitter {
 	private handleOpenChannel(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeOpenChannelMessage(payload);
 
+		// BOLT 1 reserves the all-zero channel_id for "all channels with this
+		// peer", so an open under it is unanswerable: every refusal below is
+		// scoped to the id the opener chose, and one scoped to THIS id would read
+		// as "fail every channel you have with me" rather than "this open is
+		// refused". Dropped first, ahead of the chain, namespace and duplicate-id
+		// refusals as well as any key derivation, because those refusals are
+		// wire-visible too and would each carry the same instruction.
+		// refuseInboundOpen suppresses it a second time, for the v2 callers and
+		// for anything added later that reaches it another way.
+		if (msg.temporaryChannelId.every((b) => b === 0)) {
+			this.emitContained(
+				'error',
+				msg.temporaryChannelId,
+				'open_channel refused: temporary_channel_id is the reserved all-zero id'
+			);
+			return;
+		}
+
 		// Reject opens for a chain we do not operate on (same guard as the v2
 		// open_channel2 path below).
 		if (
@@ -2510,21 +2528,6 @@ export class ChannelManager extends EventEmitter {
 			);
 			return;
 		}
-		// BOLT 1 reserves the all-zero channel_id for "all channels with this
-		// peer", so an open under it is unanswerable: every refusal below this
-		// point is scoped to the id the opener chose, and one scoped to that id
-		// would read as "fail every channel you have with me" rather than "this
-		// open is refused". Dropped locally, before any key is derived or any
-		// state retained, which is the only refusal that cannot be misread.
-		if (msg.temporaryChannelId.every((b) => b === 0)) {
-			this.emitContained(
-				'error',
-				msg.temporaryChannelId,
-				'open_channel refused: temporary_channel_id is the reserved all-zero id'
-			);
-			return;
-		}
-
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createAcceptorState({
 			temporaryChannelId: msg.temporaryChannelId,
@@ -4553,6 +4556,18 @@ export class ChannelManager extends EventEmitter {
 		channelId: Buffer,
 		reason: string
 	): void {
+		// BOLT 1 reserves the all-zero channel_id for "all channels with this
+		// peer", so echoing one back turns a refusal of a single open into an
+		// instruction to fail every channel we have with the sender. Suppressed
+		// HERE rather than at each caller because every inbound-open refusal in
+		// this class routes through it, v1 and v2 alike, and each one takes the
+		// id straight off the wire; a caller-side check protects only the caller
+		// that remembers to make it. The open is still refused, just silently:
+		// there is no id we could answer under that means what we mean.
+		if (channelId.every((b) => b === 0)) {
+			this.emitContained('error', channelId, reason);
+			return;
+		}
 		try {
 			this.sendMessage(
 				peerPubkey,
