@@ -404,6 +404,24 @@ describe('TLS Daemon', () => {
 		);
 		const busyPort = (squatter.address() as any).port;
 
+		// Recording the handles covers the node's timers and the daemon's own
+		// sweeps in one assertion, without reaching into timer internals.
+		const createdIntervals = new Map<unknown, number>();
+		const clearedIntervals = new Set<unknown>();
+		const realSetInterval = global.setInterval;
+		const realClearInterval = global.clearInterval;
+		global.setInterval = ((...args: unknown[]): NodeJS.Timeout => {
+			const timer = (realSetInterval as (...a: unknown[]) => NodeJS.Timeout)(
+				...args
+			);
+			createdIntervals.set(timer, args[1] as number);
+			return timer;
+		}) as unknown as typeof global.setInterval;
+		global.clearInterval = ((timer: unknown): void => {
+			clearedIntervals.add(timer);
+			(realClearInterval as (t: unknown) => void)(timer);
+		}) as unknown as typeof global.clearInterval;
+
 		let thrown: unknown;
 		try {
 			const started = await startDaemon({
@@ -411,6 +429,9 @@ describe('TLS Daemon', () => {
 				dataDir: tmpDir,
 				daemonPort: busyPort,
 				logLevel: 'silent',
+				// Opts in to the rate limiter, whose prune timer is the daemon's
+				// other repeating one.
+				rateLimit: { windowMs: 60_000, maxRequests: 100 },
 				...OFFLINE_ELECTRUM
 			});
 			await started.node.destroy();
@@ -418,6 +439,8 @@ describe('TLS Daemon', () => {
 		} catch (err: unknown) {
 			thrown = err;
 		} finally {
+			global.setInterval = realSetInterval;
+			global.clearInterval = realClearInterval;
 			squatter.close();
 		}
 
@@ -435,6 +458,15 @@ describe('TLS Daemon', () => {
 			fs.existsSync(path.join(tmpDir, 'regtest.lock')),
 			'the booted node was destroyed'
 		).to.equal(false);
+		// Reported in ms, so a regression names the timer it left behind: 300000
+		// is the rate limiter's prune, 600000 the idempotency cache sweep.
+		const leakedIntervals = [...createdIntervals.entries()]
+			.filter(([timer]) => !clearedIntervals.has(timer))
+			.map(([, ms]) => ms);
+		expect(
+			leakedIntervals,
+			'every interval the failed start scheduled was cleared'
+		).to.deep.equal([]);
 	});
 
 	it('starts HTTPS server with valid self-signed certs', async function () {

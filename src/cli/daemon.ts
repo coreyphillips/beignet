@@ -272,22 +272,36 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 	return events;
 }
 
+/** What a boot has taken so far, so a failed start can hand it all back. */
+interface IStartedResources {
+	node?: BeignetNode;
+	release: Array<() => void>;
+}
+
 export async function startDaemon(
 	opts: DaemonOptions
 ): Promise<{ server: http.Server; node: BeignetNode }> {
-	// Anything that throws after the node boots has to tear it down. The error
-	// leaves the caller with no handle, so the SQLite database, the
-	// single-instance lock, the Electrum poll and the backup timer would all
-	// outlive the failed start with nothing able to reach them. `await` here
-	// rather than a bare return, so a late rejection (server.listen answering
-	// EADDRINUSE) lands in this catch too.
-	const booted: { node?: BeignetNode } = {};
+	// Anything taken after the node boots has to be handed back if the start
+	// then fails. The error leaves the caller with no handle at all, so the
+	// SQLite database, the single-instance lock, the Electrum poll, the backup
+	// timer and the daemon's own sweep timers would outlive the failed start
+	// with nothing able to reach them. `await` here rather than a bare return,
+	// so a late rejection (server.listen answering EADDRINUSE) lands in this
+	// catch too.
+	const started: IStartedResources = { release: [] };
 	try {
-		return await bootDaemon(opts, booted);
+		return await bootDaemon(opts, started);
 	} catch (e) {
-		if (booted.node) {
-			await booted.node.destroy().catch(() => {
+		for (const release of started.release) {
+			try {
+				release();
+			} catch {
 				// Best effort: the start failure is the one worth reporting.
+			}
+		}
+		if (started.node) {
+			await started.node.destroy().catch(() => {
+				// Best effort, as above.
 			});
 		}
 		throw e;
@@ -296,7 +310,7 @@ export async function startDaemon(
 
 async function bootDaemon(
 	opts: DaemonOptions,
-	booted: { node?: BeignetNode }
+	started: IStartedResources
 ): Promise<{ server: http.Server; node: BeignetNode }> {
 	const port =
 		opts.daemonPort !== undefined && opts.daemonPort !== null
@@ -366,7 +380,7 @@ async function bootDaemon(
 		logger = createConsoleLogger(opts.logLevel, stderrConsole);
 	}
 	const node = await BeignetNode.create(logger ? { ...opts, logger } : opts);
-	booted.node = node;
+	started.node = node;
 	const storage = node.getStorage();
 	// Durable auth-key state: persisted rotate/revoke overrides live in the
 	// encrypted wallet_data table and are re-applied over the config-declared
@@ -405,6 +419,7 @@ async function bootDaemon(
 	const rateLimiter = opts.rateLimit
 		? new HttpRateLimiter(opts.rateLimit)
 		: null;
+	if (rateLimiter) started.release.push(() => rateLimiter.destroy());
 
 	// Idempotency cache
 	const idempotencyCache = new Map<string, CachedResponse>();
@@ -415,6 +430,7 @@ async function bootDaemon(
 		}
 	}, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
 	if (idempotencyCleanupTimer.unref) idempotencyCleanupTimer.unref();
+	started.release.push(() => clearInterval(idempotencyCleanupTimer));
 
 	type RouteHandler = (
 		body: Record<string, unknown>,
