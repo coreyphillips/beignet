@@ -2711,6 +2711,27 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on('channel:restore-ready', (channelId: Buffer) => {
 			this.redispatchUnresolvedReceivedHtlcs(channelId);
 		});
+		// A restored v2 open that could never be broadcast is disposed of in
+		// memory by ChannelManager.restoreChannel; this is what makes that
+		// durable (issue #387). Without it the unsafe row stays on disk in
+		// AWAITING_TX_SIGNATURES and comes back on every restart, and since an
+		// ERRORED channel is never reconnected nothing else would clear it. A
+		// condemned open persists as ERRORED rather than being deleted: the row
+		// is inert either way, and keeping it leaves the force-close material
+		// and the operator's view of what happened. A failed write is not fatal
+		// here, unlike the RBF-residue removal above, because the disposal is
+		// recomputed from the same row on the next boot; persistChannelState
+		// also arms its own per-block retry for a failed terminal state.
+		this.channelManager.on(
+			'channel:v2-open-disposed',
+			(channelId: Buffer, disposition: 'rolled-back' | 'refused') => {
+				this.persistChannel(channelId);
+				this.emitStructuredLog('channel', 'v2_open_disposed_on_restore', {
+					channelId: channelId.toString('hex'),
+					disposition
+				});
+			}
+		);
 		// A forward whose downstream leg settled while this inbound channel
 		// could not carry the fulfill (killed process, or a live disconnect
 		// at the moment the fulfill arrived) is owed its settle the moment

@@ -386,9 +386,12 @@ have no outputs at all. Commitment #0 carries no HTLCs and an anchor output only
 exists alongside a surviving main output, so nothing else can keep it non-empty.
 The comparison is strict: the builder trims a value below the dust limit and
 keeps one that lands exactly on it, so a split whose larger balance equals the
-larger dust limit is admitted, with the smaller side's balance dust in both
-commitments. A transaction with no outputs cannot be broadcast, so a side holding
-one would have no unilateral exit from the funding output at all.
+larger dust limit is admitted. At that boundary the larger balance clears both
+dust limits and is an output in both commitments, while the smaller one is
+trimmed from at least the commitment held by whichever peer has the larger dust
+limit, and may still survive in the other. A transaction with no outputs cannot
+be broadcast, so a side holding one would have no unilateral exit from the
+funding output at all.
 
 A v2 channel exchanges no `channel_reserve_satoshis` at all: BOLT 2 fixes it at
 1% of the total capacity or the `dust_limit_satoshis`, whichever is greater, with
@@ -400,8 +403,9 @@ the peer takes the lesser and skips beignet's own 546-sat policy floor, so it ca
 never exceed what a conforming peer computes for itself and reject a legal HTLC.
 
 Enforcing the lesser value is inert against the peer's own gate but not against
-our own trim threshold, so the admission rule above has a counterpart on every
-peer-driven update. An inbound `update_add_htlc` or `update_fee` that would leave
+our own trim threshold, so the admission rule above has a counterpart on the two
+peer-driven updates that can move a balance under it. An inbound
+`update_add_htlc` or `update_fee` that would leave
 the commitment WE hold with no outputs at all is refused, asked of a candidate
 commitment built by the real builder rather than of a second copy of its
 arithmetic, and skipped entirely whenever the reserve we enforce already sits at
@@ -409,7 +413,8 @@ or above our own dust limit (which is every symmetric-dust channel, so ordinary
 traffic never pays for the check). `getSpendableOutboundMsat` is floored at the
 same dust limit so our own sends cannot reach the state either, and
 `prepareForceClose` refuses to return a plan whose commitment has no outputs
-instead of handing back a transaction the network will reject.
+instead of handing back a transaction the network will reject. The candidate is
+the live commitment only; the pending-splice mirror of it is not covered yet.
 
 Two repairs run when a channel is restored from disk, one per reserve, each
 moving only in its own safe direction. The reserve we ENFORCE is lowered to what

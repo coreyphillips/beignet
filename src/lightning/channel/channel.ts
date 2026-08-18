@@ -7324,45 +7324,70 @@ export class Channel {
 	 * already reached confirmation depth. Erroring a channel from either would
 	 * be a far worse failure than the one this prevents.
 	 *
-	 * And it only tears down an attempt NOBODY can still publish, the same test
+	 * And it only disposes of an attempt NOBODY can still publish, the same test
 	 * handleReestablish applies before unwinding on a missing next_funding: no
 	 * tx_signatures crossed in either direction, and the transaction still needs
-	 * witness bytes from us. A broadcastable attempt (the zero-local-input
-	 * acceptor, the commonest shape of all) is left alone, because dropping the
-	 * record would not stop the peer publishing, it would only discard what
-	 * _computeV2ConfirmedAdoption needs to adopt the channel afterwards and
-	 * retire our own rebroadcast obligation.
+	 * witness bytes from us. That question is asked of the CURRENT record
+	 * (_v2RecordBroadcastable), never of the channel: isV2AttemptBroadcastable
+	 * answers true while ANY retained attempt is publishable, so asking it here
+	 * would let a broadcastable previous attempt wave an unsigned, outputless
+	 * replacement through to resume and release its tx_signatures. A
+	 * broadcastable CURRENT record (the zero-local-input acceptor, the commonest
+	 * shape of all) is left alone, because dropping it would not stop the peer
+	 * publishing, it would only discard what _computeV2ConfirmedAdoption needs
+	 * to adopt the channel afterwards and retire our own rebroadcast obligation.
 	 *
-	 * The teardown itself is markForReestablish's, so an unviable open ends in
-	 * exactly the state a non-resumable one does. ERRORED is also what stops the
-	 * funding rebroadcast: retryPendingFundingBroadcasts retires any pending
-	 * transaction whose channel is in a dead state.
+	 * Disposal is a ROLLBACK wherever there is something to roll back to. An
+	 * unviable replacement with retained attempts behind it is exactly
+	 * _v2ReplacementAbandonable, the shape a peer may legally tell us to forget,
+	 * so it is abandoned in favour of the newest superseded attempt rather than
+	 * condemning a channel whose previous candidate may still confirm. The loop
+	 * repeats because the resumed attempt gets the same question, and terminates
+	 * because every pass shortens v2PreviousAttempts. No tx_abort is owed for
+	 * the same reason the reestablish arm owes none: the peer holds nothing of
+	 * an unsigned replacement to forget.
+	 *
+	 * Only when nothing is left to fall back to is the open condemned, and the
+	 * teardown is then markForReestablish's, so it ends in exactly the state a
+	 * non-resumable open does. ERRORED is also what stops the funding
+	 * rebroadcast: retryPendingFundingBroadcasts retires any pending transaction
+	 * whose channel is in a dead state. The caller is expected to persist the
+	 * result; ChannelManager.restoreChannel reports it so the node can, since an
+	 * in-memory-only disposal would be undone by the next restart.
 	 */
-	refuseUnviableV2InFlight(): boolean {
-		const record = this._state.v2InFlight;
-		if (!record) return false;
-		if (
-			record.sentTxSignatures ||
-			record.receivedTxSignatures ||
-			this.isV2AttemptBroadcastable()
-		) {
-			return false;
+	refuseUnviableV2InFlight(): 'none' | 'rolled-back' | 'refused' {
+		let rolledBack = false;
+		for (;;) {
+			const record = this._state.v2InFlight;
+			if (!record) return rolledBack ? 'rolled-back' : 'none';
+			if (
+				record.sentTxSignatures ||
+				record.receivedTxSignatures ||
+				this._v2RecordBroadcastable(record)
+			) {
+				return rolledBack ? 'rolled-back' : 'none';
+			}
+			// Post-snapshot: restoreChannel calls this after restoreV2InFlight,
+			// and _popToPreviousV2Attempt re-runs it, so live state always
+			// carries THIS attempt's amounts whichever record shape it is.
+			const viability = this._v2InitialCommitmentRefusal(
+				this._state.localBalanceMsat / 1000n,
+				this._state.remoteBalanceMsat / 1000n,
+				record.isInitiator
+			);
+			if (!viability) return rolledBack ? 'rolled-back' : 'none';
+			if (this._v2ReplacementAbandonable()) {
+				this._popToPreviousV2Attempt();
+				rolledBack = true;
+				continue;
+			}
+			this._state.dualFundingSession?.abort();
+			this._state.dualFundingSession = null;
+			this._resetV2Driver();
+			this._state.v2InFlight = null;
+			this._state.state = ChannelState.ERRORED;
+			return 'refused';
 		}
-		// Post-snapshot: restoreChannel calls this after restoreV2InFlight, so
-		// live state already carries THIS attempt's amounts whichever record
-		// shape it is.
-		const viability = this._v2InitialCommitmentRefusal(
-			this._state.localBalanceMsat / 1000n,
-			this._state.remoteBalanceMsat / 1000n,
-			record.isInitiator
-		);
-		if (!viability) return false;
-		this._state.dualFundingSession?.abort();
-		this._state.dualFundingSession = null;
-		this._resetV2Driver();
-		this._state.v2InFlight = null;
-		this._state.state = ChannelState.ERRORED;
-		return true;
 	}
 
 	/**
@@ -15128,11 +15153,13 @@ export class Channel {
 		// "either commitment is empty" is exactly
 		// max(ourSatsAfterFee, theirSatsAfterFee) < max(ourDust, peerDust):
 		// the builder trims on `amount < dust_limit` and keeps an output whose
-		// value lands exactly ON the limit (script/commitment.ts). At equality
-		// only the LARGER side keeps an output and the smaller side's balance is
-		// dust in both commitments, which BOLT 2 allows for the same reason the
-		// reserve rule above is an AND: one exit is enough to unilaterally close
-		// (issue #388).
+		// value lands exactly ON the limit (script/commitment.ts). At equality the
+		// LARGER balance clears both dust limits, so it is an output in both
+		// commitments and neither is empty; the smaller one is trimmed from at
+		// least the commitment of whichever peer has the larger dust limit, and
+		// may still survive in the other. BOLT 2 allows that for the same reason
+		// the reserve rule above is an AND: one exit is enough to unilaterally
+		// close (issue #388).
 		const dustFloor = bigIntMax(ourDust, peerDust);
 		if (bigIntMax(ourSatsAfterFee, theirSatsAfterFee) < dustFloor) {
 			return `capacity ${capacity} trims every commitment #0 output at the ${dustFloor} dust limit`;
