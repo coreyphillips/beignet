@@ -21,7 +21,6 @@ import {
 	encodeChannelUpdateMessage
 } from '../gossip/messages';
 import { MessageType } from '../message/types';
-import { ANCHOR_TOTAL_COST } from '../script/anchor';
 import {
 	encodeOpenChannelMessage,
 	IOpenChannelMessage,
@@ -126,7 +125,7 @@ import {
 	verifyRemoteCommitmentPartial,
 	verifyRemoteHtlcSignatures,
 	verifyRemoteHtlcSignaturesTaproot,
-	calculateCommitmentFee,
+	funderCommitmentCostSats,
 	getCommitmentFeeRate,
 	getLocalCommitmentFeeRate,
 	getRemoteCommitmentFeeRate,
@@ -2636,25 +2635,19 @@ export class Channel {
 			// with the sender's own live-rate arithmetic whenever the two rates
 			// drifted apart, and a boundary HTLC then failed the channel over a
 			// sats-scale formula difference between two honest nodes (#193).
-			const anchor = isAnchorChannel(this._state.channelType);
-			const feeMsat =
-				BigInt(
-					calculateCommitmentFee(
-						Math.max(
-							getLocalCommitmentFeeRate(this._state),
-							getRemoteCommitmentFeeRate(this._state)
-						),
-						this._countActiveHtlcs() + 1,
-						anchor
-					)
+			// The fee plus, on anchor channels, the two 330-sat anchor outputs
+			// the builder deducts from the funder separately: one expression, so
+			// the base weight this channel type prices at and the anchor add can
+			// never be applied apart (#403).
+			remoteRequiredMsat +=
+				funderCommitmentCostSats(
+					Math.max(
+						getLocalCommitmentFeeRate(this._state),
+						getRemoteCommitmentFeeRate(this._state)
+					),
+					this._countActiveHtlcs() + 1,
+					this._state.channelType
 				) * 1000n;
-			remoteRequiredMsat += feeMsat;
-			// The commitment builder deducts the two 330-sat anchor outputs
-			// from the funder's output separately from the fee; the funder must
-			// afford those above its reserve too.
-			if (anchor) {
-				remoteRequiredMsat += ANCHOR_TOTAL_COST * 1000n;
-			}
 		}
 		if (this._state.remoteBalanceMsat - msg.amountMsat < remoteRequiredMsat) {
 			return [
@@ -4225,18 +4218,20 @@ export class Channel {
 			];
 		}
 
-		// Reject a feerate that would drain our (the opener's) balance below reserve,
-		// matching the acceptor's reserve guard. On anchor channels the builder
-		// deducts the two anchor outputs from the funder separately from the fee
-		// (#193), so the guard must count them or the promoted rate produces a
-		// commitment the reserve check would have refused.
+		// Reject a feerate that would drain our (the opener's) balance below
+		// reserve, matching the acceptor's reserve guard. Priced at what the
+		// builder actually takes off the funder: the fee at this channel type's
+		// base weight plus the anchor outputs it deducts separately (#193, #403),
+		// or the promoted rate produces a commitment the reserve check would have
+		// refused.
 		const activeHtlcCount = this._countActiveHtlcs();
-		const anchor = isAnchorChannel(this._state.channelType);
-		const newFee =
-			calculateCommitmentFee(feeratePerKw, activeHtlcCount, anchor) +
-			(anchor ? ANCHOR_TOTAL_COST : 0n);
+		const newCost = funderCommitmentCostSats(
+			feeratePerKw,
+			activeHtlcCount,
+			this._state.channelType
+		);
 		const reserveMsat = this._state.remoteConfig.channelReserveSatoshis * 1000n;
-		if (newFee * 1000n > this._state.localBalanceMsat - reserveMsat) {
+		if (newCost * 1000n > this._state.localBalanceMsat - reserveMsat) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -4368,17 +4363,22 @@ export class Channel {
 			];
 		}
 
-		// Check if new fee rate would drain opener below channel reserve. Anchor
-		// channels: the builder takes the two anchor outputs from the funder on
-		// top of the fee, so require those too (#193).
+		// Check whether the new fee rate would drain the opener below channel
+		// reserve, against what the builder actually takes off the funder: the fee
+		// at this channel type's base weight plus the anchor outputs it deducts on
+		// top (#193). Over-pricing it here refuses an update_fee that is legal by
+		// the opener's own arithmetic, and the bare ERROR that refusal returns is
+		// never put on the wire, so the peer keeps going and the channel force
+		// closes (#403).
 		const activeHtlcCount = this._countActiveHtlcs();
-		const anchor = isAnchorChannel(this._state.channelType);
-		const newFee =
-			calculateCommitmentFee(msg.feeratePerKw, activeHtlcCount, anchor) +
-			(anchor ? ANCHOR_TOTAL_COST : 0n);
+		const newCost = funderCommitmentCostSats(
+			msg.feeratePerKw,
+			activeHtlcCount,
+			this._state.channelType
+		);
 		const reserveMsat = this._state.localConfig.channelReserveSatoshis * 1000n;
 		// Remote is the opener (we are acceptor), so check their balance
-		if (newFee * 1000n > this._state.remoteBalanceMsat - reserveMsat) {
+		if (newCost * 1000n > this._state.remoteBalanceMsat - reserveMsat) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -9518,7 +9518,6 @@ export class Channel {
 					getLocalCommitmentFeeRate(this._state),
 					getRemoteCommitmentFeeRate(this._state)
 				);
-				const anchor = isAnchorChannel(this._state.channelType);
 				// Fee-spike buffer (LND-style, #193): as funder, retain the
 				// commitment fee at TWICE the live rate with room for one more
 				// HTLC beyond the one being added. An HTLC offered at the exact
@@ -9531,22 +9530,20 @@ export class Channel {
 				// at the exact ceiling force-closed an otherwise healthy
 				// channel). The buffer also absorbs genuine feerate spikes
 				// between now and the commitment that matters.
+				//
+				// Retained against the funder's FULL cost: the fee at this
+				// channel type's base weight plus the two 330-sat anchor
+				// outputs the builder deducts separately from it. Without the
+				// anchors an exact-ceiling add leaves the funder's commitment
+				// output below its negotiated reserve once the builder takes
+				// its 660 sats; without the right base weight the ceiling is
+				// understated on every taproot channel (#403).
 				requiredMsat +=
-					BigInt(
-						calculateCommitmentFee(
-							feeratePerKw * 2,
-							this._countActiveHtlcs() + 2,
-							anchor
-						)
+					funderCommitmentCostSats(
+						feeratePerKw * 2,
+						this._countActiveHtlcs() + 2,
+						this._state.channelType
 					) * 1000n;
-				// On anchor channels the commitment builder deducts the two
-				// 330-sat anchor outputs from the FUNDER's output, separately
-				// from the fee. The ceiling must retain them too, or an
-				// exact-ceiling add leaves the funder's commitment output below
-				// its negotiated reserve once the builder takes its 660 sats.
-				if (anchor) {
-					requiredMsat += ANCHOR_TOTAL_COST * 1000n;
-				}
 			}
 			const spendable = localMsat - requiredMsat;
 			return spendable > 0n ? spendable : 0n;
@@ -15115,26 +15112,25 @@ export class Channel {
 		weAreOpener: boolean
 	): string | null {
 		const capacity = localSats + remoteSats;
-		const anchor = isAnchorChannel(this._state.channelType);
-		const commitFeeSats =
-			calculateCommitmentFee(
-				this._state.commitmentFeeratePerkw,
-				0,
-				anchor,
-				isTaprootChannel(this._state.channelType)
-			) + (anchor ? ANCHOR_TOTAL_COST : 0n);
+		const commitCostSats = funderCommitmentCostSats(
+			this._state.commitmentFeeratePerkw,
+			0,
+			this._state.channelType
+		);
 		const openerSats = weAreOpener ? localSats : remoteSats;
-		if (openerSats < commitFeeSats) {
-			return `opener contribution ${openerSats} cannot afford the initial commitment fee ${commitFeeSats}`;
+		if (openerSats < commitCostSats) {
+			return `opener contribution ${openerSats} cannot afford the initial commitment fee ${commitCostSats}`;
 		}
 		const ourDust = this._state.localConfig.dustLimitSatoshis;
 		const peerDust = this._state.remoteConfig.dustLimitSatoshis;
 		const ourReserve = v2ReserveWeKeep(capacity, ourDust, peerDust);
 		const theirReserve = v2ReserveWeEnforce(capacity, ourDust, peerDust);
-		const ourSatsAfterFee = weAreOpener ? localSats - commitFeeSats : localSats;
+		const ourSatsAfterFee = weAreOpener
+			? localSats - commitCostSats
+			: localSats;
 		const theirSatsAfterFee = weAreOpener
 			? remoteSats
-			: remoteSats - commitFeeSats;
+			: remoteSats - commitCostSats;
 		// BOLT 2 MUST-fail on "less than or equal to", each side against ITS own
 		// reserve (what the two peers derive for themselves).
 		if (ourSatsAfterFee <= ourReserve && theirSatsAfterFee <= theirReserve) {
