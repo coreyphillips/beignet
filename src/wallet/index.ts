@@ -788,6 +788,7 @@ export class Wallet {
 	 * Refreshes/Syncs the wallet data.
 	 * @param {boolean} [scanAllAddresses]
 	 * @param {string[]} [additionalAddresses]
+	 * @param {boolean} [force] Runs even while another refresh is in flight.
 	 * @returns {Promise<Result<IWalletData>>}
 	 */
 	public async refreshWallet({
@@ -804,41 +805,69 @@ export class Wallet {
 				this._pendingRefreshPromises.push(resolve);
 			});
 		}
+		// Only the call that raised the flag may lower it again. A forced
+		// refresh can be nested inside one already in flight (refreshWallet ->
+		// updateTransactions -> checkUnconfirmedTransactions ->
+		// updateGhostTransactions -> rescanAddresses -> refreshWallet), and
+		// releasing the flag there would hand a second caller a concurrent
+		// refresh. Skipping the release entirely for forced refreshes was the
+		// other half of the bug: a standalone rescanAddresses left isRefreshing
+		// set for the life of the wallet, so every later refresh queued a
+		// promise nothing would resolve and stop() waited on one forever.
+		const ownsRefresh = !this.isRefreshing;
 		this.isRefreshing = true;
 		void this.updateFeeEstimates();
+		let result: Result<IWalletData>;
 		try {
-			await this.setZeroIndexAddresses();
-			const r1 = await this.updateAddressIndexes();
-			if (r1.isErr()) {
-				return this._handleRefreshError(r1.error.message);
-			}
-			const r2 = await this.getUtxos({
-				scanningStrategy: scanAllAddresses ? EScanningStrategy.all : undefined,
+			result = await this._runRefresh({
+				scanAllAddresses,
 				additionalAddresses
 			});
-			if (r2.isErr()) {
-				return this._handleRefreshError(r2.error.message);
-			}
-			const r3 = await this.updateTransactions({ scanAllAddresses });
-			if (r3.isErr()) {
-				return this._handleRefreshError(r3.error.message);
-			}
-			await this.electrum.subscribeToAddresses();
-			if (!force) {
-				this._resolveAllPendingRefreshPromises(ok(this.data));
-			}
-			return ok(this.data);
 		} catch (e) {
-			if (force) {
-				return err(e);
-			} else {
-				return this._handleRefreshError(e);
-			}
+			result = err(e);
 		} finally {
 			if (this._disableMessagesOnCreate) this.disableMessages = false;
 		}
+		if (ownsRefresh) {
+			this._resolveAllPendingRefreshPromises(result);
+		}
+		return result;
 	}
 
+	/**
+	 * The refresh itself. The isRefreshing flag is owned by refreshWallet.
+	 * @param {boolean} scanAllAddresses
+	 * @param {string[]} additionalAddresses
+	 * @returns {Promise<Result<IWalletData>>}
+	 */
+	private async _runRefresh({
+		scanAllAddresses,
+		additionalAddresses
+	}: {
+		scanAllAddresses: boolean;
+		additionalAddresses: string[];
+	}): Promise<Result<IWalletData>> {
+		await this.setZeroIndexAddresses();
+		const r1 = await this.updateAddressIndexes();
+		if (r1.isErr()) {
+			return err(r1.error.message);
+		}
+		const r2 = await this.getUtxos({
+			scanningStrategy: scanAllAddresses ? EScanningStrategy.all : undefined,
+			additionalAddresses
+		});
+		if (r2.isErr()) {
+			return err(r2.error.message);
+		}
+		const r3 = await this.updateTransactions({ scanAllAddresses });
+		if (r3.isErr()) {
+			return err(r3.error.message);
+		}
+		await this.electrum.subscribeToAddresses();
+		return ok(this.data);
+	}
+
+	/** Releases the refresh flag and hands `result` to every queued caller. */
 	private _resolveAllPendingRefreshPromises(result: Result<IWalletData>): void {
 		this.isRefreshing = false;
 		while (this._pendingRefreshPromises.length > 0) {
@@ -847,12 +876,6 @@ export class Wallet {
 				resolve(result);
 			}
 		}
-	}
-
-	private _handleRefreshError(errorMessage: string): Result<IWalletData> {
-		this.isRefreshing = false;
-		this._resolveAllPendingRefreshPromises(err(errorMessage));
-		return err(errorMessage);
 	}
 
 	/**
