@@ -356,7 +356,13 @@ function computeChannelReserve(
  *     beignet's stricter 546-sat policy floor, so it can never exceed what eclair
  *     (max(1%, our dust)) or CLN (max(1%, opener dust)) computes for itself in
  *     either role. A local policy applied here would reject an honest peer's
- *     spec-legal HTLC; under-enforcing is inert, since the peer's own gate binds.
+ *     spec-legal HTLC.
+ *
+ * Under-enforcing is inert as far as the peer's own gate is concerned, but NOT
+ * as far as our own commitment is concerned: once the two dust limits differ,
+ * this value sits below the limit OUR commitment trims at, so a peer balance
+ * that clears it can still be dust to us. Channel._localCommitmentEmptyRefusal
+ * is what keeps that from emptying the commitment we hold (issue #386).
  */
 function v2ReserveWeKeep(
 	fundingSatoshis: bigint,
@@ -2717,6 +2723,20 @@ export class Channel {
 			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {})
 		};
 
+		// The reserve check above is measured against the reserve WE enforce,
+		// which on an asymmetric-dust channel can sit below our own dust limit.
+		// An add that trims on our side then takes the peer's balance under it
+		// too, and the commitment we hold ends up with nothing to broadcast
+		// (issue #386). Asked of a candidate rather than of live state, so a
+		// refusal leaves nothing behind.
+		const wouldEmpty = this._localCommitmentEmptyRefusal({
+			remoteBalanceMsat: this._state.remoteBalanceMsat - msg.amountMsat,
+			addedHtlc: { key: `received-${msg.id}`, entry }
+		});
+		if (wouldEmpty) {
+			return [{ type: ChannelActionType.ERROR, message: wouldEmpty }];
+		}
+
 		this._state.htlcs.set(`received-${msg.id}`, entry);
 		// Two-phase: the peer's add enters commitments WE sign only after we
 		// revoke for the peer's covering commitment_signed (the peer builds its
@@ -4387,6 +4407,21 @@ export class Channel {
 			];
 		}
 
+		// The reserve check above measures the opener against the reserve WE
+		// enforce, which on an asymmetric-dust channel can sit below our own
+		// dust limit: a fee hike can then take the opener's balance under it
+		// while ours is already there, leaving the commitment we hold with no
+		// outputs at all (issue #386). Staging the rate is what makes it bite,
+		// since our local commitment builds at the staged rate from the moment
+		// it is accepted, so this must run BEFORE anything below is written or a
+		// refusal would promote a rate for a round that never happens.
+		const wouldEmpty = this._localCommitmentEmptyRefusal({
+			pendingFeeratePerKw: msg.feeratePerKw
+		});
+		if (wouldEmpty) {
+			return [{ type: ChannelActionType.ERROR, message: wouldEmpty }];
+		}
+
 		// Stage the opener's proposed feerate as pending rather than applying it to
 		// remoteConfig immediately. It is promoted to the committed config once the
 		// round finalizes, and rolled back on reestablish if interrupted — keeping
@@ -4988,6 +5023,19 @@ export class Channel {
 			undefined,
 			true
 		);
+
+		// A transaction with no outputs is consensus-invalid, so a plan built
+		// around one is not a close, it is a broadcast that will be rejected.
+		// The admission rules keep a channel out of that state (issues #386,
+		// #388); refusing here is the backstop that turns a silent failure at
+		// the network into an answer the caller can act on.
+		if (built.result.tx.outs.length === 0) {
+			return {
+				ok: false,
+				error:
+					'Cannot force close: every commitment output is below the dust limit'
+			};
+		}
 
 		let localNonce: Uint8Array | null = null;
 		if (taproot) {
@@ -7203,6 +7251,146 @@ export class Channel {
 	}
 
 	/**
+	 * Raise the reserve a v2 row KEEPS for itself to what its capacity prices,
+	 * on load (issue #387).
+	 *
+	 * The mirror of repairEnforcedChannelReserve, in the opposite direction and
+	 * for the opposite reason. remoteConfig.channelReserveSatoshis is what the
+	 * PEER requires of US, and a v2 channel never puts it on the wire: both
+	 * sides derive it, so a row written before #383 derived anything carries the
+	 * node's configured constant instead. Above 1,000,000 sat that constant is
+	 * BELOW what the peer derives, and the first HTLC that crosses into the gap
+	 * is one the peer MUST refuse, which fails the channel.
+	 *
+	 * So this only ever RAISES, exactly as its neighbour only ever lowers. Both
+	 * move in their own safe direction: over-enforcing on the peer force closes,
+	 * and so does under-keeping for ourselves. Keeping more than we must costs
+	 * getSpendableOutboundMsat and nothing else, and it is also why a stored
+	 * value ABOVE the derivation is left alone rather than normalized down; the
+	 * one visible cost is that as the opener of a small legacy row our own
+	 * updateFee can now self-refuse against the larger reserve.
+	 *
+	 * v2 only. A v1 reserve was negotiated on the wire and stored verbatim, so
+	 * there is nothing to re-derive and no ambiguity to resolve; re-pricing a
+	 * SPLICED row's kept reserve at its new capacity is issue #382, which the
+	 * splice adoption tail defers for the same reason. And v2ReserveWeKeep is at
+	 * or above what eclair (max(1%, a dust limit)) and CLN (max(1%, the opener's
+	 * dust limit)) each require of us at any dust pairing, so raising to it can
+	 * never overshoot a conforming peer.
+	 *
+	 * Not gated on channelReserveVersion: that stamp records the provenance of
+	 * the reserve we ENFORCE, negotiated versus never written, which says
+	 * nothing about a value both peers derive. It needs no marker anyway, since
+	 * v2ReserveWeKeep reads only fields this never writes, so
+	 * `stored := max(stored, derived)` is a fixed point after one application. A
+	 * still-negotiating row is left to _restoreV2RecordSnapshot, which owns both
+	 * reserves for the active attempt.
+	 */
+	repairKeptChannelReserve(): void {
+		if (this._state.fundingVersion !== 2) return;
+		if (this._state.fundingSatoshis <= 0n) return;
+		if (this._state.v2InFlight || this._state.v2PreviousAttempts?.length) {
+			return;
+		}
+		const derived = v2ReserveWeKeep(
+			this._state.fundingSatoshis,
+			this._state.localConfig.dustLimitSatoshis,
+			this._state.remoteConfig.dustLimitSatoshis
+		);
+		if (derived <= this._state.remoteConfig.channelReserveSatoshis) return;
+		this._state.remoteConfig = {
+			...this._state.remoteConfig,
+			channelReserveSatoshis: derived
+		};
+	}
+
+	/**
+	 * Refuse to resume a restored v2 open whose commitment #0 could never be
+	 * broadcast, on load. Returns whether it tore one down (issue #387).
+	 *
+	 * restoreV2InFlight rebuilds the session for any record past our initial
+	 * commitment_signed and asks nothing about the split it is resuming. Every
+	 * attempt negotiated since #383 was admitted by _v2InitialCommitmentRefusal,
+	 * so the only records this can fire on are older ones: a signed-but-unfunded
+	 * open whose commitment has no outputs would, if resumed, put a funding
+	 * output on chain that neither side can ever spend.
+	 *
+	 * Narrow on purpose, in two directions.
+	 *
+	 * It runs only from ChannelManager.restoreChannel, never inside
+	 * restoreV2InFlight, because that method is also the rollback and adoption
+	 * path: _rollbackToRetainedV2Attempt runs from markForReestablish on EVERY
+	 * disconnect, and _v2AdoptPreviousAttempt runs on an attempt that has
+	 * already reached confirmation depth. Erroring a channel from either would
+	 * be a far worse failure than the one this prevents.
+	 *
+	 * And it only disposes of an attempt NOBODY can still publish, the same test
+	 * handleReestablish applies before unwinding on a missing next_funding: no
+	 * tx_signatures crossed in either direction, and the transaction still needs
+	 * witness bytes from us. That question is asked of the CURRENT record
+	 * (_v2RecordBroadcastable), never of the channel: isV2AttemptBroadcastable
+	 * answers true while ANY retained attempt is publishable, so asking it here
+	 * would let a broadcastable previous attempt wave an unsigned, outputless
+	 * replacement through to resume and release its tx_signatures. A
+	 * broadcastable CURRENT record (the zero-local-input acceptor, the commonest
+	 * shape of all) is left alone, because dropping it would not stop the peer
+	 * publishing, it would only discard what _computeV2ConfirmedAdoption needs
+	 * to adopt the channel afterwards and retire our own rebroadcast obligation.
+	 *
+	 * Disposal is a ROLLBACK wherever there is something to roll back to. An
+	 * unviable replacement with retained attempts behind it is exactly
+	 * _v2ReplacementAbandonable, the shape a peer may legally tell us to forget,
+	 * so it is abandoned in favour of the newest superseded attempt rather than
+	 * condemning a channel whose previous candidate may still confirm. The loop
+	 * repeats because the resumed attempt gets the same question, and terminates
+	 * because every pass shortens v2PreviousAttempts. No tx_abort is owed for
+	 * the same reason the reestablish arm owes none: the peer holds nothing of
+	 * an unsigned replacement to forget.
+	 *
+	 * Only when nothing is left to fall back to is the open condemned, and the
+	 * teardown is then markForReestablish's, so it ends in exactly the state a
+	 * non-resumable open does. ERRORED is also what stops the funding
+	 * rebroadcast: retryPendingFundingBroadcasts retires any pending transaction
+	 * whose channel is in a dead state. The caller is expected to persist the
+	 * result; ChannelManager.restoreChannel reports it so the node can, since an
+	 * in-memory-only disposal would be undone by the next restart.
+	 */
+	refuseUnviableV2InFlight(): 'none' | 'rolled-back' | 'refused' {
+		let rolledBack = false;
+		for (;;) {
+			const record = this._state.v2InFlight;
+			if (!record) return rolledBack ? 'rolled-back' : 'none';
+			if (
+				record.sentTxSignatures ||
+				record.receivedTxSignatures ||
+				this._v2RecordBroadcastable(record)
+			) {
+				return rolledBack ? 'rolled-back' : 'none';
+			}
+			// Post-snapshot: restoreChannel calls this after restoreV2InFlight,
+			// and _popToPreviousV2Attempt re-runs it, so live state always
+			// carries THIS attempt's amounts whichever record shape it is.
+			const viability = this._v2InitialCommitmentRefusal(
+				this._state.localBalanceMsat / 1000n,
+				this._state.remoteBalanceMsat / 1000n,
+				record.isInitiator
+			);
+			if (!viability) return rolledBack ? 'rolled-back' : 'none';
+			if (this._v2ReplacementAbandonable()) {
+				this._popToPreviousV2Attempt();
+				rolledBack = true;
+				continue;
+			}
+			this._state.dualFundingSession?.abort();
+			this._state.dualFundingSession = null;
+			this._resetV2Driver();
+			this._state.v2InFlight = null;
+			this._state.state = ChannelState.ERRORED;
+			return 'refused';
+		}
+	}
+
+	/**
 	 * Record that the splice tx reached confirmation depth while splice_locked
 	 * could not be sent (e.g. the channel was AWAITING_REESTABLISH). The lock is
 	 * flushed by handleReestablish on the next reconnect.
@@ -9307,8 +9495,23 @@ export class Channel {
 	 */
 	getSpendableOutboundMsat(): bigint {
 		const spendableFor = (localMsat: bigint): bigint => {
+			// Floored at our OWN dust limit, not just the reserve the peer
+			// requires. Every conforming pairing already satisfies that (a v1
+			// reserve is validated against both dust limits at open, and
+			// v2ReserveWeKeep takes the greater of the two), so this changes
+			// nothing for them. It binds on a row whose reserve was never
+			// derived: sending down to a reserve below our dust limit trims our
+			// own to_local out of the commitment WE hold, and if the peer's
+			// balance is dust there too that commitment has no outputs at all
+			// and cannot be broadcast. The load-time repair fixes the stored
+			// value, but it skips a still-negotiating row and only runs on
+			// restore, so the invariant is asserted here as well rather than
+			// left to depend on which ran first (issues #386, #387).
 			const reserveMsat =
-				this._state.remoteConfig.channelReserveSatoshis * 1000n;
+				bigIntMax(
+					this._state.remoteConfig.channelReserveSatoshis,
+					this._state.localConfig.dustLimitSatoshis
+				) * 1000n;
 			let requiredMsat = reserveMsat;
 			if (this._state.role === ChannelRole.OPENER) {
 				const feeratePerKw = Math.max(
@@ -10428,6 +10631,84 @@ export class Channel {
 	/** Total in-flight dust-HTLC value (both directions), in msat. */
 	private _dustExposureMsat(): bigint {
 		return this._dustExposureAtRateMsat(getCommitmentFeeRate(this._state));
+	}
+
+	/**
+	 * Would the commitment WE hold be built with NO outputs once a peer-driven
+	 * update is applied? A refusal reason, or null (issue #386).
+	 *
+	 * The reserve we enforce on the peer floors at the LOWER of the two dust
+	 * limits (v2ReserveWeEnforce, and computeChannelReserve's capacity/5 cap can
+	 * land under our own dust limit too), so on an asymmetric-dust channel a
+	 * peer balance that clears its reserve can still be dust in OUR commitment.
+	 * Pair that with our own balance already under our dust limit, which a v2
+	 * open legitimately starts at whenever we contribute little or nothing, and
+	 * an ordinary update_add_htlc or update_fee produces a commitment with every
+	 * output trimmed. Nothing downstream catches it: the peer builds the same
+	 * bytes, so its signature verifies, and prepareForceClose would hand back a
+	 * transaction with no outputs, which cannot be broadcast. We would hold no
+	 * unilateral exit at all while the peer keeps one. This is the same rule
+	 * _v2InitialCommitmentRefusal applies at open, moved to where balances
+	 * actually change.
+	 *
+	 * The cheap gate first: when the reserve we enforce is at or above our own
+	 * dust limit, the peer's balance can never fall below it, so their to_remote
+	 * output in our commitment always survives and there is nothing to check.
+	 * Both handlers admit only when the peer keeps reserve + the commitment fee,
+	 * the builder's remote balance is never lower than the live one (it only
+	 * takes credits), and with no untrimmed HTLC the builder's fee is at or
+	 * below the estimate the handlers use. Every default-configured node sits on
+	 * that side of the gate, so the hot path is untouched.
+	 *
+	 * Past the gate it asks the REAL builder rather than repeating its
+	 * arithmetic. buildLocalCommitment also applies the deferred balance credits
+	 * of an in-flight settlement round, the second-level fee in the HTLC trim
+	 * threshold, the funder's anchor cost and the saturate-at-zero rule; a guard
+	 * that re-derived any of those would understate to_local mid-round and
+	 * refuse a commitment the builder builds with outputs, which is a force
+	 * close of a healthy channel.
+	 *
+	 * NOT mirrored onto the pending-splice commitment. _splicedState() derives
+	 * the peer's balance as the remainder of the new capacity after in-flight
+	 * HTLC value, so a naive replay of these overrides onto it would double
+	 * count; getSpendableOutboundMsat covers our own sends across both views,
+	 * and the receive side during the splice window is tracked separately.
+	 */
+	private _localCommitmentEmptyRefusal(overrides: {
+		remoteBalanceMsat?: bigint;
+		pendingFeeratePerKw?: number;
+		addedHtlc?: { key: string; entry: IHtlcEntry };
+	}): string | null {
+		const ourDust = this._state.localConfig.dustLimitSatoshis;
+		if (this._state.localConfig.channelReserveSatoshis >= ourDust) return null;
+		const candidate: IChannelState = { ...this._state };
+		if (overrides.remoteBalanceMsat !== undefined) {
+			candidate.remoteBalanceMsat = overrides.remoteBalanceMsat;
+		}
+		if (overrides.pendingFeeratePerKw !== undefined) {
+			candidate.pendingFeeratePerKw = overrides.pendingFeeratePerKw;
+		}
+		if (overrides.addedHtlc) {
+			candidate.htlcs = new Map(this._state.htlcs);
+			candidate.htlcs.set(overrides.addedHtlc.key, overrides.addedHtlc.entry);
+		}
+		const next = this._state.localCommitmentNumber + 1n;
+		let outputCount: number;
+		try {
+			outputCount = buildLocalCommitment(
+				candidate,
+				getPerCommitmentPoint(this._state.localPerCommitmentSeed, next),
+				next
+			).result.tx.outs.length;
+		} catch {
+			// A commitment we cannot build is strictly worse than one we can, so
+			// this refuses rather than admitting on the builder's behalf. It
+			// needs remoteBasepoints and fundingTxid, which any channel taking
+			// peer updates already has.
+			return 'Cannot build the commitment this update would leave us holding';
+		}
+		if (outputCount > 0) return null;
+		return `Update would trim every output of the commitment we hold at the ${ourDust}-sat dust limit`;
 	}
 
 	private _countActiveHtlcs(): number {
@@ -14584,10 +14865,20 @@ export class Channel {
 	 *
 	 * Records written before contribution changes existed carry no snapshot.
 	 * Those attempts all shared one set of amounts, so live state already
-	 * holds theirs and there is nothing to restore.
+	 * holds theirs and there is nothing to restore. Their RESERVES still are
+	 * not derived, though: such a row predates the v2 open deriving either one,
+	 * so it carries the node's configured constant on both sides for the life
+	 * of the channel and neither this method's snapshot branch nor the load-time
+	 * repairs (which defer to it for any row with a live record) ever reach it.
+	 * Derive them from live capacity, which IS this attempt's capacity by the
+	 * same argument. Safe against the stored signature: a reserve is a policy
+	 * value that no commitment builder reads (issue #387).
 	 */
 	private _restoreV2RecordSnapshot(record: IV2InFlight): void {
-		if (record.fundingSatoshis === undefined) return;
+		if (record.fundingSatoshis === undefined) {
+			this._deriveV2ChannelReserves();
+			return;
+		}
 		this._state.fundingSatoshis = record.fundingSatoshis;
 		this._state.localBalanceMsat = record.localBalanceMsat!;
 		this._state.remoteBalanceMsat = record.remoteBalanceMsat!;
@@ -14856,8 +15147,21 @@ export class Channel {
 		// reserve can still be dust in the commitment we hold. A transaction
 		// with no outputs is invalid, so the side holding it has no unilateral
 		// exit at all while the peer keeps a broadcastable one.
+		//
+		// STRICTLY below, because commitment #0 carries no HTLCs and an anchor
+		// output only exists alongside a surviving main output (BOLT 3), so
+		// "either commitment is empty" is exactly
+		// max(ourSatsAfterFee, theirSatsAfterFee) < max(ourDust, peerDust):
+		// the builder trims on `amount < dust_limit` and keeps an output whose
+		// value lands exactly ON the limit (script/commitment.ts). At equality the
+		// LARGER balance clears both dust limits, so it is an output in both
+		// commitments and neither is empty; the smaller one is trimmed from at
+		// least the commitment of whichever peer has the larger dust limit, and
+		// may still survive in the other. BOLT 2 allows that for the same reason
+		// the reserve rule above is an AND: one exit is enough to unilaterally
+		// close (issue #388).
 		const dustFloor = bigIntMax(ourDust, peerDust);
-		if (bigIntMax(ourSatsAfterFee, theirSatsAfterFee) <= dustFloor) {
+		if (bigIntMax(ourSatsAfterFee, theirSatsAfterFee) < dustFloor) {
 			return `capacity ${capacity} trims every commitment #0 output at the ${dustFloor} dust limit`;
 		}
 		return null;

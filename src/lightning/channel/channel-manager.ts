@@ -1636,6 +1636,14 @@ export class ChannelManager extends EventEmitter {
 			// builder-less session from the durable record so the signature
 			// exchange resumes over channel_reestablish.next_funding.
 			channel.restoreV2InFlight();
+			// And refuse to resume one whose commitment #0 has no outputs to
+			// broadcast, while our witnesses can still keep the funding off
+			// chain (issue #387). The disposal is in memory only, so it is
+			// reported for the node to persist: without that the unsafe row
+			// stays on disk as AWAITING_TX_SIGNATURES and is resurrected on
+			// every restart, and an ERRORED channel is never reconnected, so
+			// nothing else would ever clean it up.
+			const disposition = channel.refuseUnviableV2InFlight();
 			// Rows written before the open sites derived the enforced reserve
 			// carry the configured static value forever (issues #381, #387).
 			// Lower it to what their capacity prices. Derived from the row alone,
@@ -1643,6 +1651,11 @@ export class ChannelManager extends EventEmitter {
 			// mutable between runs, and a row is not less broken because the
 			// operator has since changed it.
 			channel.repairEnforcedChannelReserve();
+			// And the mirror: the reserve a v2 row KEEPS was never negotiated,
+			// so a row that predates the derivation carries the configured
+			// constant, which above 1,000,000 sat is LESS than the peer
+			// requires of us. Raise it (issue #387).
+			channel.repairKeptChannelReserve();
 
 			// Mark channels for reestablishment — after a restart the peer
 			// connection is lost, so we must complete channel_reestablish
@@ -1667,6 +1680,18 @@ export class ChannelManager extends EventEmitter {
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
+			// Reported only now: a listener persists the disposal, and both the
+			// channel and its peer mapping have to be registered before it can.
+			if (disposition !== 'none') {
+				this.emit('channel:v2-open-disposed', channelId, disposition);
+				this.emit(
+					'error',
+					channelId,
+					disposition === 'refused'
+						? 'v2 open refused on restore: commitment #0 has no broadcastable output'
+						: 'v2 open replacement abandoned on restore: commitment #0 has no broadcastable output'
+				);
+			}
 			// This channel came from persistence, so the node-level state that
 			// would resolve its committed inbound HTLCs (MPP part sets, held
 			// forwards, the forwarding machinery's view) died with the previous

@@ -2701,6 +2701,30 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		).to.equal(null);
 	});
 
+	it('admits a replacement whose larger output lands exactly on the dust limit (issue 388)', () => {
+		// Same asymmetric pairing as above, at the boundary. We are the opener,
+		// so the 183-sat fee is ours: 1,245 leaves us on exactly 1,062, which the
+		// builder keeps as an output because it trims strictly BELOW the limit.
+		// Neither commitment is empty, so the replacement is viable.
+		const h = driveToCommitmentExchange({
+			openerDust: MAX_DUST_LIMIT_SATOSHIS
+		});
+		deliverCommitments(h);
+		completeExchange(h);
+		const refusalOfSplit = (l: bigint, r: bigint): string | null =>
+			(
+				h.opener as unknown as {
+					_v2RbfContributionRefusal: (a: bigint, b: bigint) => string | null;
+				}
+			)._v2RbfContributionRefusal(l, r);
+
+		expect(refusalOfSplit(1_245n, 355n), 'exactly on the limit').to.equal(null);
+		// One satoshi lower really does trim both of our outputs away.
+		expect(refusalOfSplit(1_244n, 355n), 'one satoshi below').to.match(
+			/trims every commitment #0 output at the 1062/
+		);
+	});
+
 	it('refuses out-of-bounds contribution changes attempt-scoped, in both directions (issue 376)', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
@@ -3004,8 +3028,11 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			1_500
 		);
 
-		// A row with no snapshot at all still leaves live state untouched: those
-		// attempts all shared the live amounts by construction.
+		// A row with no snapshot at all leaves the AMOUNTS untouched (those
+		// attempts all shared the live amounts by construction) but still owes
+		// both reserves a derivation: such a row predates the v2 open deriving
+		// either one, and the load-time repairs defer to this method for any row
+		// carrying a record, so nothing else would ever reach it (issue 387).
 		const bare = JSON.parse(
 			JSON.stringify(serializeChannelState(h.opener.getFullState()))
 		);
@@ -3019,13 +3046,293 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			delete bare.v2InFlight[field];
 		}
 		bare.localConfig.channelReserveSatoshis = '10000';
+		bare.remoteConfig.channelReserveSatoshis = '10000';
+		delete bare.channelReserveVersion;
 		const bareState = deserializeChannelState(bare);
 		bareState.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+		const liveCapacity = bareState.fundingSatoshis;
+		const liveLocalMsat = bareState.localBalanceMsat;
 		const bareChannel = new Channel(bareState, h.openerSigner);
 		bareChannel.restoreV2InFlight();
-		expect(
-			Number(bareChannel.getFullState().localConfig.channelReserveSatoshis)
-		).to.equal(10_000);
+		const bareAfter = bareChannel.getFullState();
+		expect(Number(bareAfter.localConfig.channelReserveSatoshis)).to.equal(
+			1_500
+		);
+		expect(Number(bareAfter.remoteConfig.channelReserveSatoshis)).to.equal(
+			1_500
+		);
+		expect(bareAfter.channelReserveVersion).to.be.a('number');
+		// The amounts really are left alone.
+		expect(Number(bareAfter.fundingSatoshis)).to.equal(Number(liveCapacity));
+		expect(Number(bareAfter.localBalanceMsat)).to.equal(Number(liveLocalMsat));
+	});
+
+	/**
+	 * Issue 387: a v2 open recorded before #383 derived either reserve was never
+	 * admitted against BOLT 2's initial-commitment rules either, so a restart can
+	 * resume signature exchange on a split whose commitment #0 has no outputs at
+	 * all. Refusing on load keeps our witnesses off the wire, which is the last
+	 * point at which the funding can still be kept off chain.
+	 */
+	function legacyUnviableRow(opts: { broadcastable: boolean }): Channel {
+		const h = driveToCommitmentExchange();
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.opener.getFullState()))
+		);
+		for (const field of [
+			'fundingSatoshis',
+			'localBalanceMsat',
+			'remoteBalanceMsat',
+			'remoteChannelReserveSatoshis',
+			'localChannelReserveSatoshis'
+		]) {
+			delete json.v2InFlight[field];
+		}
+		delete json.channelReserveVersion;
+		// A split whose every commitment output trims: our 1,062-sat dust limit
+		// against the peer's 354, and a 1,244/355 split where the 183-sat fee we
+		// owe as opener leaves 1,061.
+		json.localConfig.dustLimitSatoshis = '1062';
+		json.remoteConfig.dustLimitSatoshis = '354';
+		json.fundingSatoshis = '1599';
+		json.localBalanceMsat = '1244000';
+		json.remoteBalanceMsat = '355000';
+		json.v2InFlight.sentTxSignatures = false;
+		json.v2InFlight.receivedTxSignatures = false;
+		json.v2InFlight.fullySigned = false;
+		// Broadcastable means the peer needs no witness bytes from us, so
+		// dropping the record could not keep the funding off chain.
+		json.v2InFlight.ourWalletInputIndices = opts.broadcastable ? [] : [0];
+		json.v2InFlight.ourWitnesses = opts.broadcastable ? [] : [['00']];
+		const state = deserializeChannelState(json);
+		state.state = ChannelState.AWAITING_TX_SIGNATURES;
+		return new Channel(state, h.openerSigner);
+	}
+
+	it('refuses to resume a legacy v2 open whose commitment #0 has no outputs (issue 387)', () => {
+		const revived = legacyUnviableRow({ broadcastable: false });
+		revived.restoreV2InFlight();
+		expect(revived.refuseUnviableV2InFlight(), 'refused').to.equal('refused');
+		const after = revived.getFullState();
+		expect(after.state).to.equal(ChannelState.ERRORED);
+		expect(after.v2InFlight).to.equal(null);
+		expect(after.dualFundingSession).to.equal(null);
+	});
+
+	it('still resumes a legacy v2 open the peer can publish without us (issue 387)', () => {
+		// Dropping the record would not stop the transaction, it would only
+		// discard what the confirmation adoption needs and retire our own
+		// rebroadcast obligation. Same unviable split as above.
+		const revived = legacyUnviableRow({ broadcastable: true });
+		revived.restoreV2InFlight();
+		expect(revived.isV2AttemptBroadcastable(), 'broadcastable').to.equal(true);
+		expect(revived.refuseUnviableV2InFlight(), 'left alone').to.equal('none');
+		const after = revived.getFullState();
+		expect(after.state).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(after.v2InFlight).to.not.equal(null);
+	});
+
+	it('an outputless replacement rolls back to the retained candidate, it does not resume (issue 387)', () => {
+		// isV2AttemptBroadcastable is CHANNEL-wide: it answers true while any
+		// retained attempt is publishable. Asking it about the current record
+		// let a broadcastable previous attempt wave an unsigned, outputless
+		// REPLACEMENT through, which then resumed and released tx_signatures.
+		// The current record has to be asked about itself.
+		const h = driveToCommitmentExchange();
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.opener.getFullState()))
+		);
+		const viableCapacity =
+			json.v2InFlight.fundingSatoshis ?? json.fundingSatoshis;
+		// The retained candidate: signed, so publishable, and viable.
+		json.v2PreviousAttempts = [
+			{
+				...JSON.parse(JSON.stringify(json.v2InFlight)),
+				sentTxSignatures: true,
+				fundingSatoshis: viableCapacity,
+				localBalanceMsat: json.localBalanceMsat,
+				remoteBalanceMsat: json.remoteBalanceMsat
+			}
+		];
+		// The current replacement: unsigned, needs witness bytes from us, and
+		// its commitment #0 has no outputs at 1,062 against 354.
+		json.localConfig.dustLimitSatoshis = '1062';
+		json.remoteConfig.dustLimitSatoshis = '354';
+		json.v2InFlight.sentTxSignatures = false;
+		json.v2InFlight.receivedTxSignatures = false;
+		json.v2InFlight.fullySigned = false;
+		json.v2InFlight.ourWalletInputIndices = [0];
+		json.v2InFlight.ourWitnesses = [['00']];
+		json.v2InFlight.fundingSatoshis = '1599';
+		json.v2InFlight.localBalanceMsat = '1244000';
+		json.v2InFlight.remoteBalanceMsat = '355000';
+		const state = deserializeChannelState(json);
+		state.state = ChannelState.AWAITING_TX_SIGNATURES;
+		const revived = new Channel(state, h.openerSigner);
+		revived.restoreV2InFlight();
+		// Precondition: the channel-wide answer is true here, which is exactly
+		// what used to skip the check.
+		expect(revived.isV2AttemptBroadcastable(), 'channel-wide').to.equal(true);
+
+		expect(revived.refuseUnviableV2InFlight()).to.equal('rolled-back');
+		const after = revived.getFullState();
+		// The candidate is RETAINED and resumed, not condemned: the peer may
+		// still publish it.
+		expect(after.state).to.not.equal(ChannelState.ERRORED);
+		expect(after.v2InFlight).to.not.equal(null);
+		expect(after.v2InFlight!.sentTxSignatures).to.equal(true);
+		expect(Number(after.fundingSatoshis)).to.equal(Number(viableCapacity));
+		expect(after.v2PreviousAttempts ?? []).to.have.length(0);
+	});
+
+	it('the restore path is what refuses it, and reports why (issue 387)', () => {
+		// Callable is not enough: the refusal is only worth anything if the load
+		// the node actually performs runs it.
+		const revived = legacyUnviableRow({ broadcastable: false });
+		const mgr = new ChannelManager({
+			localBasepoints: makeBasepoints(
+				getPublicKey(crypto.randomBytes(32)),
+				crypto.randomBytes(32)
+			),
+			localPerCommitmentSeed: crypto.randomBytes(32),
+			localFundingPrivkey: crypto.randomBytes(32)
+		});
+		const errors: string[] = [];
+		mgr.on('error', (_id: Buffer | null, message: string) => {
+			errors.push(message);
+		});
+		mgr.restoreChannel(
+			revived,
+			getPublicKey(crypto.randomBytes(32)).toString('hex')
+		);
+		expect(revived.getState()).to.equal(ChannelState.ERRORED);
+		expect(revived.getFullState().v2InFlight).to.equal(null);
+		expect(errors.join('|')).to.match(/no broadcastable output/);
+	});
+
+	it('the refusal is durable, so the unsafe row does not come back (issue 387)', () => {
+		// Disposing of the open in memory only leaves the original
+		// AWAITING_TX_SIGNATURES row on disk, where every restart restores and
+		// re-refuses it. An ERRORED channel is never reconnected, so nothing
+		// else would ever clear it.
+		const h = driveToCommitmentExchange();
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.opener.getFullState()))
+		);
+		for (const field of [
+			'fundingSatoshis',
+			'localBalanceMsat',
+			'remoteBalanceMsat',
+			'remoteChannelReserveSatoshis',
+			'localChannelReserveSatoshis'
+		]) {
+			delete json.v2InFlight[field];
+		}
+		delete json.channelReserveVersion;
+		json.localConfig.dustLimitSatoshis = '1062';
+		json.remoteConfig.dustLimitSatoshis = '354';
+		json.fundingSatoshis = '1599';
+		json.localBalanceMsat = '1244000';
+		json.remoteBalanceMsat = '355000';
+		json.v2InFlight.sentTxSignatures = false;
+		json.v2InFlight.receivedTxSignatures = false;
+		json.v2InFlight.fullySigned = false;
+		json.v2InFlight.ourWalletInputIndices = [0];
+		json.v2InFlight.ourWitnesses = [['00']];
+		json.state = ChannelState.AWAITING_TX_SIGNATURES;
+
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const idHex = h.opener.getChannelId()!.toString('hex');
+		storage.saveChannel(idHex, deserializeChannelState(json), '02'.repeat(33));
+		storage.saveChannelKeyIndex(idHex, 3);
+
+		const node = new LightningNode(
+			makeNodeConfig(31, { storage, recovery: { enabled: true } })
+		);
+		node.on('node:error', () => {});
+		const restored = node.getChannelManager().listChannels();
+		expect(restored).to.have.length(1);
+		expect(restored[0].getState()).to.equal(ChannelState.ERRORED);
+		// The row on DISK is what the next boot reads, so that is what has to
+		// have changed.
+		const rows = storage.loadAllChannels();
+		expect(rows, 'the row is kept, not deleted').to.have.length(1);
+		expect(rows[0].state.state, 'condemned on disk').to.equal(
+			ChannelState.ERRORED
+		);
+		expect(rows[0].state.v2InFlight ?? null).to.equal(null);
+		const persisted = rows[0].state;
+		node.destroy();
+
+		// And the next boot, which sees exactly those persisted bytes, finds it
+		// already disposed of rather than resurrecting the open.
+		const restart = new SqliteStorage(':memory:');
+		restart.open();
+		restart.saveChannel(idHex, persisted, '02'.repeat(33));
+		restart.saveChannelKeyIndex(idHex, 3);
+		const second = new LightningNode(
+			makeNodeConfig(31, { storage: restart, recovery: { enabled: true } })
+		);
+		second.on('node:error', () => {});
+		const again = second.getChannelManager().listChannels();
+		expect(again).to.have.length(1);
+		expect(again[0].getState()).to.equal(ChannelState.ERRORED);
+		expect(again[0].getFullState().v2InFlight ?? null).to.equal(null);
+		second.destroy();
+	});
+
+	it('leaves a viable legacy v2 open alone (issue 387)', () => {
+		// The guard has to be observable in BOTH directions: an ordinary
+		// 100,000/50,000 legacy row still resumes.
+		const h = driveToCommitmentExchange();
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.opener.getFullState()))
+		);
+		for (const field of [
+			'fundingSatoshis',
+			'localBalanceMsat',
+			'remoteBalanceMsat',
+			'remoteChannelReserveSatoshis',
+			'localChannelReserveSatoshis'
+		]) {
+			delete json.v2InFlight[field];
+		}
+		json.v2InFlight.sentTxSignatures = false;
+		json.v2InFlight.receivedTxSignatures = false;
+		json.v2InFlight.ourWalletInputIndices = [0];
+		const state = deserializeChannelState(json);
+		state.state = ChannelState.AWAITING_TX_SIGNATURES;
+		const revived = new Channel(state, h.openerSigner);
+		revived.restoreV2InFlight();
+		expect(revived.refuseUnviableV2InFlight()).to.equal('none');
+		expect(revived.getFullState().v2InFlight).to.not.equal(null);
+		expect(revived.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+	});
+
+	it('never errors a rollback or an adoption of a signed attempt (issue 387)', () => {
+		// restoreV2InFlight is also the rollback and adoption path: the check
+		// lives outside it because _rollbackToRetainedV2Attempt runs from
+		// markForReestablish on every disconnect, and adoption runs on an
+		// attempt that has already confirmed.
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		const record = h.acceptor.getFullState().v2InFlight!;
+		h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000,
+			fundingOutputContribution: record.remoteContributionSats + 20_000n
+		});
+		// The peer walks away: the retained attempt resumes through
+		// restoreV2InFlight, and nothing about that is allowed to error.
+		h.acceptor.handleTxAbort();
+		expect(h.acceptor.getState()).to.not.equal(ChannelState.ERRORED);
+		expect(h.acceptor.getFullState().v2InFlight).to.not.equal(null);
+		h.acceptor.markForReestablish();
+		expect(h.acceptor.getState()).to.not.equal(ChannelState.ERRORED);
+		expect(h.acceptor.getFullState().v2InFlight).to.not.equal(null);
 	});
 
 	it('survives consecutive refusals and a refusal followed by an operator abort', () => {

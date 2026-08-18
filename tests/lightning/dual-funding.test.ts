@@ -1544,6 +1544,43 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			).to.equal(null);
 		});
 
+		it('admits a v2 open whose larger output lands exactly on the dust limit (issue 388)', () => {
+			// The asymmetric-dust rule predicts "one of the two commitments is
+			// built with no outputs", and the builder trims a value BELOW the
+			// holder's dust limit while keeping one that lands exactly ON it. So
+			// the rule has to compare strictly; at equality the larger side keeps
+			// its output in BOTH commitments and neither is empty.
+			//
+			// Our dust 1,062, the opener's 354, capacity 1,600 at 253 sat/kw: the
+			// 183-sat fee leaves the opener on exactly 1,062 and us on 355. The
+			// reserve rule cannot fire (it needs BOTH sides at or under their own
+			// reserve, and 1,062 is well over the 354 we enforce), so this split
+			// reaches the dust rule and nothing else.
+			expect(
+				refusalOf(
+					openAcceptorChannel(
+						{ fundingSatoshis: 1_245n, dustLimitSatoshis: 354n },
+						1_062n,
+						355n
+					).actions
+				),
+				'exactly on the dust limit'
+			).to.equal(null);
+
+			// One satoshi lower and the opener's output really does trim away,
+			// leaving our commitment with nothing: still refused.
+			expect(
+				refusalOf(
+					openAcceptorChannel(
+						{ fundingSatoshis: 1_244n, dustLimitSatoshis: 354n },
+						1_062n,
+						355n
+					).actions
+				),
+				'one satoshi below the dust limit'
+			).to.match(/trims every commitment #0 output at the 1062/);
+		});
+
 		it('rejects a will_fund lease on a taproot channel (mutually-exclusive types)', () => {
 			// Round 17 moved the taproot-v2 refusal to ADMISSION: the raw
 			// Channel refuses the proposed type before the lease branch (or

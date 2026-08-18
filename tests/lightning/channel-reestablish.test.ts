@@ -8,6 +8,7 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import {
+	ChannelRole,
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG
 } from '../../src/lightning/channel/types';
@@ -788,6 +789,7 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		function restoredRow(overrides: {
 			fundingSatoshis: string;
 			channelReserveSatoshis: string;
+			keptReserveSatoshis?: string;
 			dustLimitSatoshis?: string;
 			remoteDustLimitSatoshis?: string;
 			fundingVersion?: 1 | 2;
@@ -806,6 +808,10 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			json.fundingSatoshis = overrides.fundingSatoshis;
 			json.localConfig.channelReserveSatoshis =
 				overrides.channelReserveSatoshis;
+			if (overrides.keptReserveSatoshis !== undefined) {
+				json.remoteConfig.channelReserveSatoshis =
+					overrides.keptReserveSatoshis;
+			}
 			if (overrides.dustLimitSatoshis !== undefined) {
 				json.localConfig.dustLimitSatoshis = overrides.dustLimitSatoshis;
 			}
@@ -823,6 +829,9 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 
 		const reserveOf = (c: Channel): bigint =>
 			c.getFullState().localConfig.channelReserveSatoshis;
+
+		const keptReserveOf = (c: Channel): bigint =>
+			c.getFullState().remoteConfig.channelReserveSatoshis;
 
 		it('repairs a v1 row that predates the derivation (issue 381)', function () {
 			// The open sites now record what they advertise, but they cannot
@@ -1036,6 +1045,118 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			});
 			manager.restoreChannel(channel, 'ab'.repeat(33));
 			expect(reserveOf(channel)).to.equal(1_500n);
+		});
+
+		it('raises the reserve a v2 row KEEPS to what its capacity prices (issue 387)', function () {
+			// remoteConfig.channelReserveSatoshis is what the PEER requires of
+			// US, and a v2 channel puts no reserve on the wire at all: both sides
+			// derive it. A row written before the v2 open derived anything
+			// carries the configured constant, and above 1,000,000 sat that
+			// constant is BELOW what the peer derives, so the first HTLC into the
+			// gap is one the peer MUST refuse and the channel fails.
+			const stale = restoredRow({
+				fundingSatoshis: '5000000',
+				channelReserveSatoshis: '50000',
+				keptReserveSatoshis: '10000',
+				fundingVersion: 2
+			});
+			stale.repairKeptChannelReserve();
+			expect(keptReserveOf(stale)).to.equal(50_000n);
+
+			// A fixed point: reading only fields it never writes, so a second
+			// load changes nothing.
+			stale.repairKeptChannelReserve();
+			expect(keptReserveOf(stale)).to.equal(50_000n);
+
+			// The dust terms count too: at 20,000 sat the 1% share is 200, so the
+			// larger of the two dust limits is what the peer keeps us above.
+			const dusty = restoredRow({
+				fundingSatoshis: '20000',
+				channelReserveSatoshis: '546',
+				keptReserveSatoshis: '546',
+				dustLimitSatoshis: '1062',
+				remoteDustLimitSatoshis: '354',
+				fundingVersion: 2
+			});
+			dusty.repairKeptChannelReserve();
+			expect(keptReserveOf(dusty)).to.equal(1_062n);
+		});
+
+		it('never lowers the reserve we keep, and never touches a v1 row (issue 387)', function () {
+			// Over-keeping only costs spendable balance; under-keeping force
+			// closes. So a stored value above the derivation is left where it is
+			// rather than normalized down.
+			const generous = restoredRow({
+				fundingSatoshis: '150000',
+				channelReserveSatoshis: '1500',
+				keptReserveSatoshis: '25000',
+				fundingVersion: 2
+			});
+			generous.repairKeptChannelReserve();
+			expect(keptReserveOf(generous)).to.equal(25_000n);
+
+			// A v1 reserve was negotiated on the wire and stored verbatim, so
+			// there is nothing to derive and no ambiguity to resolve.
+			const v1 = restoredRow({
+				fundingSatoshis: '5000000',
+				channelReserveSatoshis: '50000',
+				keptReserveSatoshis: '10000',
+				fundingVersion: 1
+			});
+			v1.repairKeptChannelReserve();
+			expect(keptReserveOf(v1)).to.equal(10_000n);
+		});
+
+		it('shrinks spendable outbound by exactly what the repair added (issue 387)', function () {
+			const channel = restoredRow({
+				fundingSatoshis: '5000000',
+				channelReserveSatoshis: '50000',
+				keptReserveSatoshis: '10000',
+				fundingVersion: 2
+			});
+			const before = channel.getSpendableOutboundMsat();
+			channel.repairKeptChannelReserve();
+			expect(before - channel.getSpendableOutboundMsat()).to.equal(
+				40_000n * 1000n
+			);
+		});
+
+		it('floors spendable outbound at our own dust limit (issues 386, 387)', function () {
+			// Independent of the repair, which skips a still-negotiating row and
+			// only runs on restore: sending down to a reserve below our own dust
+			// limit trims our to_local out of the commitment WE hold.
+			const channel = restoredRow({
+				fundingSatoshis: '150000',
+				channelReserveSatoshis: '1500',
+				keptReserveSatoshis: '400',
+				dustLimitSatoshis: '1062',
+				fundingVersion: 2
+			});
+			const state = channel.getFullState();
+			state.localBalanceMsat = 1_200_000n;
+			state.role = ChannelRole.ACCEPTOR;
+			expect(channel.getSpendableOutboundMsat()).to.equal(138_000n);
+		});
+
+		it('the kept-reserve repair runs on the ordinary restore path (issue 387)', function () {
+			const channel = restoredRow({
+				fundingSatoshis: '5000000',
+				channelReserveSatoshis: '50000',
+				keptReserveSatoshis: '10000',
+				fundingVersion: 2
+			});
+			const manager = new ChannelManager({
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				localFundingPrivkey: crypto.randomBytes(32),
+				htlcBasepointSecret: crypto.randomBytes(32)
+			});
+			manager.on('error', () => {
+				/* restore emits nothing here; absorb regardless */
+			});
+			manager.restoreChannel(channel, 'ab'.repeat(33));
+			expect(keptReserveOf(channel)).to.equal(50_000n);
 		});
 	});
 
