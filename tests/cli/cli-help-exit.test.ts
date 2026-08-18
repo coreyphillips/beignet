@@ -33,8 +33,11 @@ describe('beignet --help', function () {
 			stderr += chunk.toString();
 		});
 
-		// Comfortably under the mocha timeout, so a regression reports what
-		// actually happened instead of an opaque suite timeout.
+		// `close` rather than `exit`: exit can fire while stdout and stderr are
+		// still draining, which would let the assertions below read a partial
+		// help text. The kill deadline sits comfortably under the mocha timeout,
+		// so a regression reports what actually happened instead of an opaque
+		// suite timeout.
 		const result = await new Promise<{
 			code: number | null;
 			hung: boolean;
@@ -43,7 +46,7 @@ describe('beignet --help', function () {
 				child.kill('SIGKILL');
 				resolve({ code: null, hung: true });
 			}, 90_000);
-			child.once('exit', (code) => {
+			child.once('close', (code) => {
 				clearTimeout(killer);
 				resolve({ code, hung: false });
 			});
