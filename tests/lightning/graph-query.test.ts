@@ -45,6 +45,18 @@ import {
 } from '../../src/cli/beignet-node';
 import { BeignetError } from '../../src/cli/errors';
 
+// Electrum intentionally unreachable: nothing below needs a live chain, and a
+// refused loopback connect returns ECONNREFUSED instantly. Without this the
+// regtest default in src/cli/beignet-node.ts is a remote public host, so these
+// nominally offline tests dial a third party over the internet and fail
+// whenever it is unreachable. BeignetNode.init tolerates a failed connect:
+// resolveWalletSweepScript falls back to a locally derived index-0 address.
+const OFFLINE_ELECTRUM = {
+	electrumHost: '127.0.0.1',
+	electrumPort: 65529,
+	electrumTls: false
+};
+
 // ─────────────── Helpers ───────────────
 
 function makeSeed(id: number): Buffer {
@@ -397,7 +409,8 @@ describe('Graph query: BeignetNode surface', function () {
 		bn = await BeignetNode.create({
 			network: 'regtest',
 			dataDir: tmpDir,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 		graph = bn.getNode().getGraph();
 		ourPub = Buffer.from(bn.getNode().getNodeId(), 'hex');

@@ -37,6 +37,18 @@ import {
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { BeignetNode } from '../../src/cli/beignet-node';
 
+// Electrum intentionally unreachable: nothing below needs a live chain, and a
+// refused loopback connect returns ECONNREFUSED instantly. Without this the
+// regtest default in src/cli/beignet-node.ts is a remote public host, so these
+// nominally offline tests dial a third party over the internet and fail
+// whenever it is unreachable. BeignetNode.init tolerates a failed connect:
+// resolveWalletSweepScript falls back to a locally derived index-0 address.
+const OFFLINE_ELECTRUM = {
+	electrumHost: '127.0.0.1',
+	electrumPort: 65529,
+	electrumTls: false
+};
+
 // ─────────────── Helpers (mirrors tests/lightning/node.test.ts) ───────────────
 
 function makeSeed(id: number): Buffer {
@@ -935,7 +947,8 @@ describe('Channel Routing Policy (M3)', function () {
 				dataDir: tmpDir,
 				logLevel: 'silent',
 				rapidGossipSync: false,
-				autoGossipSync: false
+				autoGossipSync: false,
+				...OFFLINE_ELECTRUM
 			});
 			try {
 				// No channels yet: 'all' is a no-op but must still validate fields

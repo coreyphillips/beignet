@@ -56,6 +56,18 @@ import {
 } from '../../src/cli/restore';
 import { InstanceLockError } from '../../src/cli/instance-lock';
 
+// Electrum intentionally unreachable: nothing below needs a live chain, and a
+// refused loopback connect returns ECONNREFUSED instantly. Without this the
+// regtest default in src/cli/beignet-node.ts is a remote public host, so these
+// nominally offline tests dial a third party over the internet and fail
+// whenever it is unreachable. BeignetNode.init tolerates a failed connect:
+// resolveWalletSweepScript falls back to a locally derived index-0 address.
+const OFFLINE_ELECTRUM = {
+	electrumHost: '127.0.0.1',
+	electrumPort: 65529,
+	electrumTls: false
+};
+
 bitcoin.initEccLib(ecc);
 
 // ─────────────── Harness (mirrors tests/lightning/scb.test.ts) ───────────────
@@ -993,7 +1005,8 @@ describe('SCB restore', function () {
 				dataDir: tmpDir,
 				logLevel: 'silent',
 				rapidGossipSync: false,
-				autoGossipSync: false
+				autoGossipSync: false,
+				...OFFLINE_ELECTRUM
 			});
 			try {
 				const seed = bip39.mnemonicToSeedSync(MNEMONIC);

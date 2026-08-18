@@ -26,6 +26,14 @@
     "skipLibCheck": true,
     "useUnknownInCatchVariables": false
   },
+  // ts-node compiles per file through its LanguageService, which cost ~11 s of
+  // every mocha run and would be paid again by each parallel worker. Types are
+  // not lost: type-check.yml runs tsc:check and tsc:check:tests on the same
+  // events, and lint-check.yml runs type-aware eslint rules. Restore checking
+  // for a single run with TS_NODE_TYPE_CHECK=1.
+  "ts-node": {
+    "transpileOnly": true
+  },
   "lib": ["es2020"],
   "include": [
     "src/**/*.ts"

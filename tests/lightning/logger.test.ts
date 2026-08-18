@@ -300,6 +300,22 @@ const electrumOptions = {
 describe('Wallet logger injection', function () {
 	this.timeout(30000);
 
+	// Every wallet below points at an unreachable Electrum. Without an explicit
+	// disconnect the connection poll installed in the Electrum constructor keeps
+	// reconnecting for the rest of the mocha process, printing
+	// `OnError:Error: connect ECONNREFUSED 127.0.0.1:65529` from
+	// rn-electrum-client onto stdout long after this file is done, which also
+	// corrupts `--reporter json` output for every suite that follows.
+	// Tracked in an array rather than disconnected inline so a failed assertion
+	// still cleans up: a leaked wallet is exactly what pollutes the other files.
+	const wallets: Wallet[] = [];
+
+	afterEach(async () => {
+		while (wallets.length > 0) {
+			await wallets.pop()?.electrum.disconnect();
+		}
+	});
+
 	it('uses the injected logger instance', async () => {
 		const { logger } = makeLogger();
 		const res = await Wallet.create({
@@ -311,6 +327,7 @@ describe('Wallet logger injection', function () {
 		});
 		if (res.isErr()) throw res.error;
 		const wallet = res.value;
+		wallets.push(wallet);
 		expect(wallet.logger).to.equal(logger);
 	});
 
@@ -323,6 +340,7 @@ describe('Wallet logger injection', function () {
 		});
 		if (res.isErr()) throw res.error;
 		const wallet = res.value;
+		wallets.push(wallet);
 		expect(wallet.logger).to.be.an('object');
 		expect(wallet.logger.debug).to.be.a('function');
 		expect(wallet.logger.info).to.be.a('function');

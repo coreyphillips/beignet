@@ -15,7 +15,7 @@
     "test:electrum": "npm run build && env mocha --exit -r ts-node/register 'tests/electrum.test.ts'",
     "test:derivation": "npm run build && env mocha --exit -r ts-node/register 'tests/derivation.test.ts'",
     "test:transaction": "npm run build && env mocha --exit -r ts-node/register 'tests/transaction.test.ts'",
-    "test:lightning": "npx mocha --exit -r ts-node/register --ignore 'tests/lightning/interop/**' --ignore 'tests/lightning/recovery-phase7-sigkill.test.ts' 'tests/lightning/**/*.test.ts'",
+    "test:lightning": "npx mocha --exit --parallel --timeout 20000 -r ts-node/register --ignore 'tests/lightning/interop/**' --ignore 'tests/lightning/recovery-phase7-*.test.ts' 'tests/lightning/**/*.test.ts'",
     "test:chaos": "npx mocha --exit -r ts-node/register --timeout 300000 --ignore 'tests/lightning/recovery-phase7-sigkill.test.ts' 'tests/lightning/recovery-phase7-*.test.ts'",
     "test:sigkill": "npm run build && npx mocha --exit -r ts-node/register --timeout 600000 tests/lightning/recovery-phase7-sigkill.test.ts",
     "test:conformance": "npx mocha --exit -r ts-node/register 'tests/lightning/conformance/**/*.test.ts'",

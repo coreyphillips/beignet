@@ -18,6 +18,18 @@ import {
 import { startDaemon, DaemonOptions } from '../../src/cli/daemon';
 import { resolveConfig } from '../../src/cli/config';
 
+// Electrum intentionally unreachable: nothing below needs a live chain, and a
+// refused loopback connect returns ECONNREFUSED instantly. Without this the
+// regtest default in src/cli/beignet-node.ts is a remote public host, so these
+// nominally offline tests dial a third party over the internet and fail
+// whenever it is unreachable. BeignetNode.init tolerates a failed connect:
+// resolveWalletSweepScript falls back to a locally derived index-0 address.
+const OFFLINE_ELECTRUM = {
+	electrumHost: '127.0.0.1',
+	electrumPort: 65529,
+	electrumTls: false
+};
+
 // ─────────────── Spending Limits ───────────────
 
 describe('Spending Limits', () => {
@@ -47,7 +59,8 @@ describe('Spending Limits', () => {
 		const node = await BeignetNode.create({
 			network: 'regtest',
 			dataDir: tmpDir,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			const info = node.getDailySpendInfo();
@@ -68,7 +81,8 @@ describe('Spending Limits', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			logLevel: 'silent',
-			dailySpendLimitSats: 100_000
+			dailySpendLimitSats: 100_000,
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			const info = node.getDailySpendInfo();
@@ -90,7 +104,8 @@ describe('Spending Limits', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			logLevel: 'silent',
-			dailySpendLimitSats: 1000
+			dailySpendLimitSats: 1000,
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			// Access private method via prototype for testing
@@ -112,7 +127,8 @@ describe('Spending Limits', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			logLevel: 'silent',
-			dailySpendLimitSats: 1000
+			dailySpendLimitSats: 1000,
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			const recordFn = (node as any)._recordSpend.bind(node);
@@ -142,7 +158,8 @@ describe('Spending Limits', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			logLevel: 'silent',
-			dailySpendLimitSats: 1000
+			dailySpendLimitSats: 1000,
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			const recordFn = (node as any)._recordSpend.bind(node);
@@ -209,7 +226,8 @@ describe('Idempotency Keys', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			daemonPort: 0, // random port
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 
 		const port = (server.address() as any).port;
@@ -241,7 +259,8 @@ describe('Idempotency Keys', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			daemonPort: 0,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 
 		const port = (server.address() as any).port;
@@ -280,7 +299,8 @@ describe('Idempotency Keys', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			daemonPort: 0,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 
 		const port = (server.address() as any).port;
@@ -305,7 +325,8 @@ describe('Idempotency Keys', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			daemonPort: 0,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 
 		const port = (server.address() as any).port;
@@ -334,7 +355,8 @@ describe('TLS Daemon', () => {
 				dataDir: tmpDir,
 				daemonPort: 0,
 				logLevel: 'silent',
-				tlsCert: '/tmp/nonexistent-cert.pem'
+				tlsCert: '/tmp/nonexistent-cert.pem',
+				...OFFLINE_ELECTRUM
 			});
 			expect.fail('should have thrown');
 		} catch (err: any) {
@@ -350,7 +372,8 @@ describe('TLS Daemon', () => {
 				dataDir: tmpDir,
 				daemonPort: 0,
 				logLevel: 'silent',
-				tlsKey: '/tmp/nonexistent-key.pem'
+				tlsKey: '/tmp/nonexistent-key.pem',
+				...OFFLINE_ELECTRUM
 			});
 			expect.fail('should have thrown');
 		} catch (err: any) {
@@ -369,7 +392,8 @@ describe('TLS Daemon', () => {
 			daemonPort: 0,
 			logLevel: 'silent',
 			tlsCert: certPath,
-			tlsKey: keyPath
+			tlsKey: keyPath,
+			...OFFLINE_ELECTRUM
 		});
 
 		const port = (server.address() as any).port;
@@ -423,7 +447,8 @@ describe('Drain Mode', () => {
 		const node = await BeignetNode.create({
 			network: 'regtest',
 			dataDir: tmpDir,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			expect(node.isDraining()).to.be.false;
@@ -443,7 +468,8 @@ describe('Drain Mode', () => {
 		const node = await BeignetNode.create({
 			network: 'regtest',
 			dataDir: tmpDir,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			expect(node.hasPendingPayments()).to.be.false;
@@ -459,7 +485,8 @@ describe('Drain Mode', () => {
 		const node = await BeignetNode.create({
 			network: 'regtest',
 			dataDir: tmpDir,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			node.setDraining(true);
@@ -481,7 +508,8 @@ describe('Drain Mode', () => {
 		const node = await BeignetNode.create({
 			network: 'regtest',
 			dataDir: tmpDir,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			node.setDraining(true);
@@ -504,7 +532,8 @@ describe('Drain Mode', () => {
 			dataDir: tmpDir,
 			daemonPort: 0,
 			logLevel: 'silent',
-			dailySpendLimitSats: 50000
+			dailySpendLimitSats: 50000,
+			...OFFLINE_ELECTRUM
 		});
 		const port = (server.address() as any).port;
 		try {
