@@ -14,6 +14,18 @@ import * as os from 'os';
 import { BeignetError } from '../../src/cli/errors';
 import { PaymentFilter } from '../../src/cli/types';
 
+// Electrum intentionally unreachable: nothing below needs a live chain, and a
+// refused loopback connect returns ECONNREFUSED instantly. Without this the
+// regtest default in src/cli/beignet-node.ts is a remote public host, so these
+// nominally offline tests dial a third party over the internet and fail
+// whenever it is unreachable. BeignetNode.init tolerates a failed connect:
+// resolveWalletSweepScript falls back to a locally derived index-0 address.
+const OFFLINE_ELECTRUM = {
+	electrumHost: '127.0.0.1',
+	electrumPort: 65529,
+	electrumTls: false
+};
+
 // ─────────────── Phase 1: Spend Limit Safety ───────────────
 
 describe('Phase 1: Spend Limit Safety', () => {
@@ -25,7 +37,8 @@ describe('Phase 1: Spend Limit Safety', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			logLevel: 'silent',
-			dailySpendLimitSats: 100_000
+			dailySpendLimitSats: 100_000,
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			// Before any payment attempt
@@ -57,7 +70,8 @@ describe('Phase 1: Spend Limit Safety', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			logLevel: 'silent',
-			dailySpendLimitSats: 1000
+			dailySpendLimitSats: 1000,
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			const n = node as any;
@@ -92,7 +106,8 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 		const node = await BeignetNode.create({
 			network: 'regtest',
 			dataDir: tmpDir,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			const n = node as any;
@@ -127,7 +142,8 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 			dataDir: tmpDir,
 			logLevel: 'silent',
 			backupPath,
-			backupIntervalMs: 60_000 // won't fire during test
+			backupIntervalMs: 60_000, // won't fire during test
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			const n = node as any;
@@ -163,7 +179,8 @@ describe('Phase 3: Timeout Safety', () => {
 			network: 'regtest',
 			dataDir: tmpDir,
 			logLevel: 'silent',
-			connectTimeoutMs: 500
+			connectTimeoutMs: 500,
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			const fakePubkey = '02' + '00'.repeat(32);
@@ -194,7 +211,8 @@ describe('Phase 3: Timeout Safety', () => {
 		const node = await BeignetNode.create({
 			network: 'regtest',
 			dataDir: tmpDir,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			// Set draining — the first attempt will fail from _checkDraining,
@@ -239,7 +257,8 @@ describe('Phase 4: Payment Filtering', () => {
 		const node = await BeignetNode.create({
 			network: 'regtest',
 			dataDir: tmpDir,
-			logLevel: 'silent'
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
 		});
 		try {
 			// Inject mock payments via the underlying node's payment map

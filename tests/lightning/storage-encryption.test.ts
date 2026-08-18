@@ -29,6 +29,18 @@ import {
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { BeignetNode } from '../../src/cli/beignet-node';
 
+// Electrum intentionally unreachable: nothing below needs a live chain, and a
+// refused loopback connect returns ECONNREFUSED instantly. Without this the
+// regtest default in src/cli/beignet-node.ts is a remote public host, so these
+// nominally offline tests dial a third party over the internet and fail
+// whenever it is unreachable. BeignetNode.init tolerates a failed connect:
+// resolveWalletSweepScript falls back to a locally derived index-0 address.
+const OFFLINE_ELECTRUM = {
+	electrumHost: '127.0.0.1',
+	electrumPort: 65529,
+	electrumTls: false
+};
+
 function makeSeed(id: number): Buffer {
 	return crypto
 		.createHash('sha256')
@@ -384,7 +396,8 @@ describe('Storage Encryption', function () {
 				dataDir: tmpDir,
 				logLevel: 'silent',
 				rapidGossipSync: false,
-				autoGossipSync: false
+				autoGossipSync: false,
+				...OFFLINE_ELECTRUM
 			});
 			let paymentHash: string;
 			try {
@@ -424,7 +437,8 @@ describe('Storage Encryption', function () {
 				logLevel: 'silent',
 				rapidGossipSync: false,
 				autoGossipSync: false,
-				storageEncryption: false
+				storageEncryption: false,
+				...OFFLINE_ELECTRUM
 			});
 			try {
 				node.createInvoice(1000, marker);

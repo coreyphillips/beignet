@@ -590,10 +590,10 @@ LightningNode              High-level API (EventEmitter)
 ## Tests
 
 ```bash
-npm run test:lightning     # 4000+ Lightning unit tests, no infrastructure needed
+npm run test:lightning     # 5400+ Lightning unit tests (parallel), no infrastructure needed
 npm run test:cli           # 900+ CLI + daemon unit tests, no infrastructure needed
 npm run test:conformance   # 250+ official BOLT vector cases (subset of test:lightning)
-npm run test:chaos         # recovery chaos matrix developer loop (subset of test:lightning)
+npm run test:chaos         # recovery kill matrices, split out of test:lightning
 npm run test:sigkill       # process-level SIGKILL chaos matrix (builds dist first)
 npm run test:integration   # daemon/Electrum integration (needs an Electrum server)
 npm run test:interop       # 190+ cases vs LND/CLN/Eclair (needs Docker)

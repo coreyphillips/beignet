@@ -69,6 +69,13 @@ jobs:
       - name: Run BOLT conformance vectors
         run: npm run test:conformance
 
+      # Parallel workers, one test file each, with ts-node in transpile-only mode
+      # (the "ts-node" key in tsconfig.json). Types are still gated: type-check.yml
+      # runs tsc over src AND tests on the same events, so the per-file
+      # LanguageService pass this step used to make was duplicated work.
+      # The eight in-process recovery kill matrices used to be covered here by
+      # falling inside the glob; they now run in the `chaos` job below, and the
+      # two file sets together are exactly the set this step used to cover.
       - name: Run lightning unit tests
         run: npm run test:lightning
 
@@ -90,3 +97,33 @@ jobs:
       - name: Dump docker logs on failure
         if: failure()
         uses: jwalton/gh-docker-logs@v2
+
+  # Its own job rather than another step in `tests`: these eight in-process kill
+  # matrices are the most expensive thing in the repo (~9 minutes for 30 tests,
+  # because runKillMatrix replays a whole scenario from scratch once per recorded
+  # boundary). As a step they would simply stay on the critical path they were
+  # already on. Nothing here needs docker or dist, so the job skips both: only
+  # recovery-phase7-sigkill.test.ts spawns a child built against dist, and that
+  # stays in the `tests` job's test:sigkill step. They stay serial too, because
+  # helpers/chaos-quorum.ts holds one current-run trio per process.
+  chaos:
+    name: Run recovery chaos matrix
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Run recovery chaos matrix
+        run: npm run test:chaos

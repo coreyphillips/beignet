@@ -851,11 +851,12 @@ npx mocha --exit -r ts-node/register 'tests/lightning/dual-funding.test.ts'
 |-------|-------|-------|
 | `test:lightning` | 4000+ | No infrastructure required |
 | `test:conformance` | 250+ | Official BOLT vectors, included in the count above |
+| `test:chaos` | 30 | Recovery kill matrices, split out of `test:lightning` |
 | `test:interop` | 190+ | Live LND/CLN/Eclair on regtest, Docker required |
 
 Counts are floors, not snapshots. Run the suites for exact numbers.
 
-Interop tests are excluded from `npm run test:lightning`. Use `npm run test:interop` to run them with Docker.
+Interop tests and the `recovery-phase7-*` kill matrices are excluded from `npm run test:lightning`. Use `npm run test:interop` (Docker required) and `npm run test:chaos` to run them.
 
 ### Test Patterns
 

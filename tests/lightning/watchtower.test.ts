@@ -720,6 +720,9 @@ class FakeTower extends EventEmitter implements ITowerTransport {
 	connected = false;
 	created = false;
 	receivedUpdates: Array<{ seqNum: number; hint: Buffer }> = [];
+	/** Every STATE_UPDATE that reached the tower, silentUpdates included, so a
+	 *  test can wait for a ship that is never going to be answered. */
+	stateUpdatesSeen = 0;
 	lastApplied = 0;
 	behaviour: {
 		createCode?: number;
@@ -771,6 +774,7 @@ class FakeTower extends EventEmitter implements ITowerTransport {
 					})
 				);
 			} else if (type === WtMessageType.STATE_UPDATE) {
+				this.stateUpdatesSeen++;
 				if (this.behaviour.silentUpdates) return;
 				const upd = decodeStateUpdate(payload);
 				const code = this.behaviour.updateCode
@@ -799,8 +803,21 @@ class FakeTower extends EventEmitter implements ITowerTransport {
 	}
 }
 
-function tick(ms = 5): Promise<void> {
-	return new Promise((r) => setTimeout(r, ms));
+/**
+ * Wait until pred() holds, or give up after `ms` and let the assertion that
+ * follows report the real failure.
+ *
+ * This file used to sleep a fixed 5 to 20 ms instead. Those budgets were sized
+ * on an idle machine, but session negotiation and update shipping are real
+ * async work, so under mocha --parallel a loaded box missed them and these
+ * cases failed intermittently while passing in isolation.
+ */
+async function waitFor(pred: () => boolean, ms = 5000): Promise<void> {
+	const deadline = Date.now() + ms;
+	while (Date.now() < deadline) {
+		if (pred()) return;
+		await new Promise((r) => setTimeout(r, 1));
+	}
 }
 
 /** In-memory IWatchtowerStore for deterministic backlog-drain tests. */
@@ -863,6 +880,13 @@ function contextForClient(): IJusticeContext {
 }
 
 describe('watchtower client session state machine (fake tower)', function () {
+	// Explicit rather than inherited: waitFor() below allows up to 5 s for a
+	// condition, which only elapses when something is genuinely broken, and
+	// mocha's 2000 ms default would cut that short and report an opaque
+	// timeout instead of the assertion that actually failed. 20_000 matches
+	// what test:lightning passes and what most files here already set.
+	this.timeout(20_000);
+
 	function makeClient(
 		fake: FakeTower,
 		store?: IWatchtowerStore
@@ -881,11 +905,15 @@ describe('watchtower client session state machine (fake tower)', function () {
 		const fake = new FakeTower(parseTowerUri(TOWER_URI));
 		const client = makeClient(fake);
 		await client.start();
-		await tick();
+		await waitFor(() => fake.created);
 		expect(fake.created).to.be.true;
 
 		client.backupRevokedState(contextForClient());
-		await tick(20);
+		await waitFor(
+			() =>
+				fake.receivedUpdates.length > 0 &&
+				client.getHealth()[0].pendingBacklog === 0
+		);
 
 		expect(fake.receivedUpdates.length).to.equal(1);
 		expect(fake.receivedUpdates[0].seqNum).to.equal(1);
@@ -901,9 +929,15 @@ describe('watchtower client session state machine (fake tower)', function () {
 			StateUpdateCode.MAX_UPDATES_EXCEEDED;
 		const client = makeClient(fake);
 		await client.start();
-		await tick();
+		await waitFor(() => fake.created);
 		client.backupRevokedState(contextForClient());
-		await tick(20);
+		// stateUpdatesSeen, not just the backlog: the backlog is 1 the moment the
+		// update is queued, so waiting on that alone would let the "never shipped"
+		// assertion below pass before the tower had even answered.
+		await waitFor(
+			() =>
+				fake.stateUpdatesSeen > 0 && client.getHealth()[0].pendingBacklog === 1
+		);
 		// Update stays queued (never dropped) and the exhausted session is cleared.
 		expect(fake.receivedUpdates.length).to.equal(0);
 		expect(client.getHealth()[0].pendingBacklog).to.equal(1);
@@ -943,7 +977,12 @@ describe('watchtower client session state machine (fake tower)', function () {
 		const fake = new FakeTower(parseTowerUri(TOWER_URI));
 		const client = makeClient(fake, store);
 		await client.start();
-		await tick(20);
+		await waitFor(
+			() =>
+				fake.receivedUpdates.length > 0 &&
+				store.updates[0].acked &&
+				client.getHealth()[0].pendingBacklog === 0
+		);
 
 		expect(fake.created, 'no new session negotiated').to.be.false;
 		expect(fake.receivedUpdates.length).to.equal(1);
@@ -988,9 +1027,13 @@ describe('watchtower client session state machine (fake tower)', function () {
 
 		const rejections = await captureUnhandledRejections(async () => {
 			await client.start();
-			await tick();
+			await waitFor(() => fake.created);
 			client.backupRevokedState(contextForClient());
-			await tick(20);
+			await waitFor(
+				() =>
+					logs.some((l) => l.event === 'backup_failed') &&
+					client.getHealth()[0].pendingBacklog === 1
+			);
 		});
 
 		expect(rejections).to.deep.equal([]);
@@ -1009,14 +1052,16 @@ describe('watchtower client session state machine (fake tower)', function () {
 
 		const rejections = await captureUnhandledRejections(async () => {
 			await client.start();
-			await tick();
-			// The ship stalls awaiting a reply the tower never sends.
+			await waitFor(() => fake.created);
+			// The ship stalls awaiting a reply the tower never sends. Wait for the
+			// update to actually reach the tower, not for a fixed delay: stopping
+			// before it lands would test nothing.
 			client.backupRevokedState(contextForClient());
-			await tick();
+			await waitFor(() => fake.stateUpdatesSeen > 0);
 			// Without waiter tracking this wait would sit on its 30s timer and
 			// reject long after shutdown; stop() must settle it now.
 			client.stop();
-			await tick();
+			await waitFor(() => logs.some((l) => l.event === 'backup_failed'));
 		});
 
 		expect(rejections).to.deep.equal([]);
@@ -1067,11 +1112,13 @@ describe('watchtower client session state machine (fake tower)', function () {
 			logs.push(e)
 		);
 		await client.start();
-		await tick(20);
+		// The persisted update drains and is refused first; only once that has
+		// happened is it safe to clear the log and drive the real case.
+		await waitFor(() => logs.some((l) => l.event === 'backup_failed'));
 
 		logs.length = 0;
 		client.backupRevokedState(contextForClient());
-		await tick(20);
+		await waitFor(() => logs.some((l) => l.event === 'backup_failed'));
 
 		const failure = logs.find((l) => l.event === 'backup_failed');
 		expect(failure).to.not.equal(undefined);
