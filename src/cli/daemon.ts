@@ -272,8 +272,45 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 	return events;
 }
 
+/** What a boot has taken so far, so a failed start can hand it all back. */
+interface IStartedResources {
+	node?: BeignetNode;
+	release: Array<() => void>;
+}
+
 export async function startDaemon(
 	opts: DaemonOptions
+): Promise<{ server: http.Server; node: BeignetNode }> {
+	// Anything taken after the node boots has to be handed back if the start
+	// then fails. The error leaves the caller with no handle at all, so the
+	// SQLite database, the single-instance lock, the Electrum poll, the backup
+	// timer and the daemon's own sweep timers would outlive the failed start
+	// with nothing able to reach them. `await` here rather than a bare return,
+	// so a late rejection (server.listen answering EADDRINUSE) lands in this
+	// catch too.
+	const started: IStartedResources = { release: [] };
+	try {
+		return await bootDaemon(opts, started);
+	} catch (e) {
+		for (const release of started.release) {
+			try {
+				release();
+			} catch {
+				// Best effort: the start failure is the one worth reporting.
+			}
+		}
+		if (started.node) {
+			await started.node.destroy().catch(() => {
+				// Best effort, as above.
+			});
+		}
+		throw e;
+	}
+}
+
+async function bootDaemon(
+	opts: DaemonOptions,
+	started: IStartedResources
 ): Promise<{ server: http.Server; node: BeignetNode }> {
 	const port =
 		opts.daemonPort !== undefined && opts.daemonPort !== null
@@ -306,6 +343,21 @@ export async function startDaemon(
 			'Refusing wildcard CORS without authentication. Configure apiToken or apiKeys, set an explicit cors origin, or set insecure: true to accept the risk.'
 		);
 	}
+	// Config-only checks belong here, ahead of BeignetNode.create: a typo is
+	// not worth booting a node for, and one that throws further down leaves the
+	// caller no handle to destroy.
+	if (opts.tlsCert && !opts.tlsKey) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'tlsKey is required when tlsCert is provided'
+		);
+	}
+	if (opts.tlsKey && !opts.tlsCert) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'tlsCert is required when tlsKey is provided'
+		);
+	}
 	// A typo here would silently fall back to socket-address keying, so a
 	// non-IP entry is a config error, not something to skip over.
 	for (const proxy of opts.rateLimit?.trustedProxies ?? []) {
@@ -328,6 +380,7 @@ export async function startDaemon(
 		logger = createConsoleLogger(opts.logLevel, stderrConsole);
 	}
 	const node = await BeignetNode.create(logger ? { ...opts, logger } : opts);
+	started.node = node;
 	const storage = node.getStorage();
 	// Durable auth-key state: persisted rotate/revoke overrides live in the
 	// encrypted wallet_data table and are re-applied over the config-declared
@@ -366,6 +419,7 @@ export async function startDaemon(
 	const rateLimiter = opts.rateLimit
 		? new HttpRateLimiter(opts.rateLimit)
 		: null;
+	if (rateLimiter) started.release.push(() => rateLimiter.destroy());
 
 	// Idempotency cache
 	const idempotencyCache = new Map<string, CachedResponse>();
@@ -376,6 +430,7 @@ export async function startDaemon(
 		}
 	}, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
 	if (idempotencyCleanupTimer.unref) idempotencyCleanupTimer.unref();
+	started.release.push(() => clearInterval(idempotencyCleanupTimer));
 
 	type RouteHandler = (
 		body: Record<string, unknown>,
@@ -1788,20 +1843,6 @@ export async function startDaemon(
 
 	const corsOrigin =
 		opts.cors === true ? '*' : typeof opts.cors === 'string' ? opts.cors : null;
-
-	// TLS validation
-	if (opts.tlsCert && !opts.tlsKey) {
-		throw new BeignetError(
-			'INVALID_PARAMS',
-			'tlsKey is required when tlsCert is provided'
-		);
-	}
-	if (opts.tlsKey && !opts.tlsCert) {
-		throw new BeignetError(
-			'INVALID_PARAMS',
-			'tlsCert is required when tlsKey is provided'
-		);
-	}
 
 	const requestHandler = async (
 		req: http.IncomingMessage,

@@ -171,9 +171,25 @@ export const electrumConnection = ((
 			logger.error('Electrum connection check failed.', e);
 		}
 	};
-	setInterval((): void => {
-		void checkConnection();
-	}, POLLING_INTERVAL);
+	// The poll exists only to feed subscribers, so it runs only while there is
+	// one. Started at module load it kept the event loop alive in every process
+	// that so much as imported the library: `beignet --help` printed its text
+	// and then hung forever. It is unref'd as well, so a process that does
+	// subscribe can still exit on its own. React Native's timer handle has no
+	// unref, hence the guard.
+	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const startPolling = (): void => {
+		if (pollTimer) return;
+		pollTimer = setInterval((): void => {
+			void checkConnection();
+		}, POLLING_INTERVAL);
+		if (pollTimer.unref) pollTimer.unref();
+	};
+	const stopPolling = (): void => {
+		if (!pollTimer) return;
+		clearInterval(pollTimer);
+		pollTimer = null;
+	};
 
 	const publish = (isConnected: boolean): void => {
 		// Skip if no subscribers
@@ -194,10 +210,12 @@ export const electrumConnection = ((
 		callback: (isConnected: boolean) => void
 	): ElectrumConnectionSubscription => {
 		subscribers.add(callback);
+		startPolling();
 
 		return {
 			remove: (): void => {
 				subscribers.delete(callback);
+				if (subscribers.size === 0) stopPolling();
 			}
 		};
 	};
