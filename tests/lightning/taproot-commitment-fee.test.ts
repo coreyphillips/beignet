@@ -78,7 +78,13 @@ function taprootType(): Buffer {
 	return flags.toBuffer();
 }
 
-/** The 3-bit spelling some fixtures use: static_remotekey + anchors + taproot. */
+/**
+ * A synthetic combined-bit type: static_remotekey + anchors + taproot. LND
+ * REJECTS this combination, validating the taproot channel_type as an exact
+ * match on the taproot bit alone (channel.ts initiateOpen), so it is not a real
+ * wire spelling. It is here as a defensive case for the helper's precedence: a
+ * channel_type carrying the anchor bit outright must still price at 968.
+ */
 function taprootWithAnchorBitType(): Buffer {
 	const flags = FeatureFlags.empty();
 	flags.setCompulsory(Feature.STATIC_REMOTE_KEY);
@@ -255,10 +261,11 @@ describe('Taproot commitment weight in the affordability guards (issue 403)', fu
 			}
 		});
 
-		it('reads the taproot bit ahead of the anchor bit, in either spelling', function () {
-			// isAnchorChannel() is true for a taproot-only type, and LND's other
-			// spelling sets the anchor bit outright, so the taproot base weight
-			// must win in both.
+		it('reads the taproot bit ahead of the anchor bit, even with both set', function () {
+			// isAnchorChannel() is true for a taproot-only type, so the taproot
+			// base weight has to win the precedence chain rather than depend on
+			// the anchor bit being absent. The combined-bit case is synthetic, not
+			// a wire spelling (see taprootWithAnchorBitType).
 			expect(funderCommitmentCostSats(10_000, 0, taprootType())).to.equal(
 				10_340n
 			);
