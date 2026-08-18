@@ -173,6 +173,10 @@ export class Wallet {
 	private _pendingRefreshPromises: Array<
 		(result: Result<IWalletData>) => void
 	> = [];
+	// Refresh bodies currently running. Forced refreshes bypass the isRefreshing
+	// guard, so more than one can be in flight and the flag belongs to all of
+	// them until the last one finishes.
+	private _activeRefreshes = 0;
 	private _disableMessagesOnCreate: boolean;
 	// BIP32 account index as a path segment string ('0' by default).
 	private readonly _account: string;
@@ -805,16 +809,18 @@ export class Wallet {
 				this._pendingRefreshPromises.push(resolve);
 			});
 		}
-		// Only the call that raised the flag may lower it again. A forced
-		// refresh can be nested inside one already in flight (refreshWallet ->
-		// updateTransactions -> checkUnconfirmedTransactions ->
-		// updateGhostTransactions -> rescanAddresses -> refreshWallet), and
-		// releasing the flag there would hand a second caller a concurrent
-		// refresh. Skipping the release entirely for forced refreshes was the
-		// other half of the bug: a standalone rescanAddresses left isRefreshing
-		// set for the life of the wallet, so every later refresh queued a
-		// promise nothing would resolve and stop() waited on one forever.
-		const ownsRefresh = !this.isRefreshing;
+		// The flag stays up until the LAST refresh body finishes, not the first.
+		// A forced refresh bypasses the guard above, so it can run nested inside
+		// one already in flight (refreshWallet -> updateTransactions ->
+		// checkUnconfirmedTransactions -> updateGhostTransactions ->
+		// rescanAddresses -> refreshWallet) or alongside one as a sibling, and
+		// lowering the flag while either is still working hands a third caller a
+		// concurrent refresh and lets stop() disconnect underneath it. Never
+		// lowering it for forced refreshes was the other half of the bug: a
+		// standalone rescanAddresses left isRefreshing set for the life of the
+		// wallet, so every later refresh queued a promise nothing would resolve
+		// and stop() waited on one forever.
+		this._activeRefreshes += 1;
 		this.isRefreshing = true;
 		void this.updateFeeEstimates();
 		let result: Result<IWalletData>;
@@ -826,9 +832,10 @@ export class Wallet {
 		} catch (e) {
 			result = err(e);
 		} finally {
+			this._activeRefreshes -= 1;
 			if (this._disableMessagesOnCreate) this.disableMessages = false;
 		}
-		if (ownsRefresh) {
+		if (this._activeRefreshes === 0) {
 			this._resolveAllPendingRefreshPromises(result);
 		}
 		return result;

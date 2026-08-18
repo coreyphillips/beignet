@@ -73,6 +73,21 @@ const withDeadline = async <T>(
 	}
 };
 
+/** Polls a condition and throws rather than returning quietly on timeout. */
+const waitFor = async (
+	predicate: () => boolean,
+	ms: number,
+	what: string
+): Promise<void> => {
+	const deadline = Date.now() + ms;
+	while (!predicate()) {
+		if (Date.now() > deadline) {
+			throw new Error(`timed out after ${ms}ms waiting for ${what}`);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+};
+
 describe('refreshWallet flag lifecycle', function () {
 	this.timeout(60000);
 
@@ -201,6 +216,61 @@ describe('refreshWallet flag lifecycle', function () {
 			true
 		);
 		expect(wallet.isRefreshing).to.equal(false);
+	});
+
+	it('keeps the flag up until a sibling forced refresh finishes too', async function () {
+		// One gate per getUtxos call, so the two refreshes can be finished in a
+		// chosen order rather than whichever one the runtime happens to pick.
+		const gates: Array<() => void> = [];
+		getUtxosStub.callsFake(async () => {
+			await new Promise<void>((resolve) => gates.push(resolve));
+			return ok<IGetUtxosResponse>({ utxos: [], balance: 0 });
+		});
+
+		const first = wallet.refreshWallet({});
+		await waitFor(
+			() => gates.length === 1,
+			5000,
+			'the first refresh to reach getUtxos'
+		);
+		// rescanAddresses forces its way past the guard, so this one runs
+		// alongside the first rather than queueing behind it.
+		const sibling = wallet.refreshWallet({ force: true });
+		await waitFor(
+			() => gates.length === 2,
+			5000,
+			'the forced refresh to reach getUtxos'
+		);
+
+		let queuedSettled = false;
+		const queued = wallet.refreshWallet({});
+		void queued.then(() => {
+			queuedSettled = true;
+		});
+
+		gates[0]();
+		const firstRes = await withDeadline(first, 5000, 'the first refresh');
+		expect(firstRes.isOk()).to.equal(true);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+
+		expect(
+			wallet.isRefreshing,
+			'the sibling forced refresh is still running'
+		).to.equal(true);
+		expect(
+			queuedSettled,
+			'the queued caller waits for the last refresh, not the first'
+		).to.equal(false);
+
+		gates[1]();
+		const siblingRes = await withDeadline(sibling, 5000, 'the forced refresh');
+		expect(siblingRes.isOk()).to.equal(true);
+		const queuedRes = await withDeadline(queued, 5000, 'the queued refresh');
+		expect(queuedRes.isOk()).to.equal(true);
+		expect(
+			wallet.isRefreshing,
+			'the last refresh to finish released the flag'
+		).to.equal(false);
 	});
 
 	it('keeps the flag while a nested forced refresh runs inside another', async function () {
