@@ -420,6 +420,37 @@ describe('Channel Types and Validation', function () {
 			);
 		});
 
+		it('rejects an acceptor reserve above 20% of funding (issue 391)', function () {
+			// The combined bound alone still admits a reserve near the whole
+			// capacity, which locks the funder's balance unspendable for the
+			// channel's life. Same cap as the open_channel side.
+			const open = makeValidOpenMsg();
+			const accept = makeValidAcceptMsg(open);
+			accept.channelReserveSatoshis = open.fundingSatoshis / 5n;
+			expect(validateAcceptChannelParams(open, accept)).to.be.null;
+			accept.channelReserveSatoshis = open.fundingSatoshis / 5n + 1n;
+			expect(validateAcceptChannelParams(open, accept)).to.contain(
+				'exceeds maximum'
+			);
+		});
+
+		it('floors the acceptor reserve cap at the opener dust limit', function () {
+			// The rules above REQUIRE the acceptor reserve to clear OUR dust
+			// limit, which is operator configuration the peer does not choose,
+			// so the cap can never sit below it.
+			const open = makeValidOpenMsg();
+			open.fundingSatoshis = 10_000n;
+			open.dustLimitSatoshis = 3_000n;
+			open.channelReserveSatoshis = 3_000n;
+			const accept = makeValidAcceptMsg(open);
+			accept.channelReserveSatoshis = 3_000n;
+			expect(validateAcceptChannelParams(open, accept)).to.be.null;
+			accept.channelReserveSatoshis = 3_001n;
+			expect(validateAcceptChannelParams(open, accept)).to.contain(
+				'exceeds maximum'
+			);
+		});
+
 		it('should reject combined reserves exceeding funding', function () {
 			const open = makeValidOpenMsg();
 			open.fundingSatoshis = 20_000n;

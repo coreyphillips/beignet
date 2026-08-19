@@ -1484,6 +1484,28 @@ export class ChannelManager extends EventEmitter {
 			// rules; what is not was a negotiation that restarts.
 			const channelIdHex = channel.getChannelId()?.toString('hex');
 			if (channelIdHex) this.purgeBarrierQueue(channelIdHex);
+			// A promoted v1 opener still awaiting funding_signed has no
+			// commitment to resume: BOLT 2 has no reestablish before
+			// funding_signed, and the peers (eclair, LND) forget the attempt
+			// on disconnect. markForReestablish does nothing for this state,
+			// so without this arm the channel sat in the permanent map
+			// forever and its funding pledges renewed for the life of the
+			// process (issue #412). Drop the whole lifecycle and free the
+			// inputs; the channel object keeps its historical state, exactly
+			// as a refused funding_signed leaves it.
+			if (
+				channel.getState() === ChannelState.SENT_FUNDING_CREATED &&
+				channel.getFullState().fundingVersion !== 2
+			) {
+				this.removeCurrentChannelLifecycle(peerPubkey, channel);
+				this.emit(
+					'error',
+					channel.getChannelId() ?? channel.getTemporaryChannelId(),
+					'Peer disconnected during channel open (state: SENT_FUNDING_CREATED)'
+				);
+				this.releaseRefusedV1FundingPledges(channel);
+				continue;
+			}
 			channel.markForReestablish();
 			// The disconnect dropped any un-acked RBF request; coins selected
 			// to raise its contribution are free again.

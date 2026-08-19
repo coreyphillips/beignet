@@ -740,12 +740,21 @@ describe('Zero-Conf Channels', function () {
 
 			expect(opener.getState()).to.equal(ChannelState.NORMAL);
 
-			// Now funding confirms for real
+			// Now funding confirms for real. The ready flow already ran with no
+			// chain evidence, so the one-shot observation is recorded durably
+			// (issue #413) rather than discarded: without the stamp a later
+			// error would leave this actually-funded channel ERRORED forever.
 			const confirmActions = opener.fundingConfirmed();
-			// Should be empty (no error) — channel already in NORMAL
 			const err = findAction(confirmActions, ChannelActionType.ERROR);
 			expect(err).to.be.undefined;
-			expect(confirmActions).to.have.length(0);
+			expect(confirmActions).to.deep.equal([
+				{ type: ChannelActionType.PERSIST_STATE }
+			]);
+			expect(opener.getFullState().fundingConfirmedLate).to.equal(true);
+			expect(opener.getState()).to.equal(ChannelState.NORMAL);
+
+			// And it stays one-shot: a repeat observation changes nothing.
+			expect(opener.fundingConfirmed()).to.have.length(0);
 			expect(opener.getState()).to.equal(ChannelState.NORMAL);
 		});
 

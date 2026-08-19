@@ -670,13 +670,14 @@ export interface IChannelState {
 	 */
 	dataLossDetected?: boolean;
 	/**
-	 * The funding tx reached minimumDepth while the channel was already
-	 * ERRORED (the chain watcher's depth callback is one-shot and the ready
-	 * flow cannot consume it there). Read by the node's failure-resolution
-	 * paths (issue #413): once set, the commitment broadcast spends an
-	 * outpoint that provably exists.
+	 * The funding tx reached minimumDepth in a state whose ready flow could
+	 * not consume it: the zero-conf fast-track had already run it, or the
+	 * channel had already failed. The chain watcher's depth callback is
+	 * one-shot, so the observation is recorded durably here. Read by the
+	 * node's failure-resolution paths (issue #413): once set, a commitment
+	 * broadcast spends an outpoint OUR OWN watcher has proven exists.
 	 */
-	fundingConfirmedWhileErrored?: boolean;
+	fundingConfirmedLate?: boolean;
 	/**
 	 * Recovery 5.6 StateUncertain: this state was restored from replicas that
 	 * cannot be proven current (guardian replication is best effort until the

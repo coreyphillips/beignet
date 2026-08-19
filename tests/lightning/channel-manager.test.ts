@@ -1301,6 +1301,86 @@ describe('Channel Manager', function () {
 			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
 		});
 
+		it('a disconnect retires a promoted SENT_FUNDING_CREATED opener and frees its pledges (issue 412)', async function () {
+			// The promoted opener has left tempChannels, so the early-state
+			// disconnect sweep never saw it, and markForReestablish does
+			// nothing for SENT_FUNDING_CREATED (BOLT 2 has no reestablish
+			// before funding_signed). Without the explicit arm it sat in the
+			// permanent map forever with its pledges renewing every block.
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			alice.on('error', () => undefined);
+			bob.on('error', () => undefined);
+
+			const released: Array<Array<{ txid: string; vout: number }>> = [];
+			alice.setFundingProvider({
+				buildFundingTransaction: async () => {
+					throw new Error('unused');
+				},
+				broadcastTransaction: async () => {
+					throw new Error('unused');
+				},
+				releaseInputPledges: async (outpoints) => {
+					released.push(outpoints);
+				}
+			});
+
+			const queue: Array<() => void> = [];
+			const drain = async (): Promise<void> => {
+				while (queue.length) queue.shift()!();
+				await new Promise((r) => setImmediate(r));
+			};
+			alice.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== bobPubkey) return;
+					queue.push(() => bob.handleMessage(alicePubkey, type, payload));
+				}
+			);
+			bob.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== alicePubkey) return;
+					queue.push(() => alice.handleMessage(bobPubkey, type, payload));
+				}
+			);
+
+			const fundingTx = new bitcoin.Transaction();
+			fundingTx.addInput(crypto.randomBytes(32), 0);
+			fundingTx.addOutput(
+				bitcoin.script.compile([bitcoin.opcodes.OP_0, crypto.randomBytes(20)]),
+				1_000_000
+			);
+			const expected = fundingTx.ins.map((input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			}));
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			await drain();
+			const channelId = alice.createFunding(
+				channel,
+				fundingTx.getHash(),
+				0,
+				Buffer.alloc(64)
+			);
+			expect(channelId, 'promoted').to.not.equal(null);
+			channel.getFullState().pendingFundingTxHex = fundingTx.toHex();
+
+			// The peer disconnects while withholding funding_signed.
+			alice.handlePeerDisconnected(bobPubkey);
+			await drain();
+
+			expect(alice.listChannels()).to.have.length(0);
+			expect(alice.getTempChannel(channel.getTemporaryChannelId())).to.equal(
+				undefined
+			);
+			expect(released).to.deep.equal([expected]);
+			// Historical state kept, exactly as a refused funding_signed
+			// leaves it: nothing is on chain to be ERRORED about.
+			expect(channel.getState()).to.equal(ChannelState.SENT_FUNDING_CREATED);
+		});
+
 		it('a funding_signed we cannot verify is refused ON THE WIRE', function () {
 			const alice = new ChannelManager(makeConfig(1));
 			const bob = new ChannelManager(makeConfig(2));
