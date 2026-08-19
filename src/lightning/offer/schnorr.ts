@@ -51,7 +51,13 @@ export function schnorrVerify(
 		throw new Error(`Signature must be 64 bytes, got ${signature.length}`);
 	}
 
-	return ecc.verifySchnorr(message, publicKey, signature);
+	// Length-valid but malformed content (out-of-range scalar) makes the
+	// backend throw rather than return false; peer bytes never get to throw.
+	try {
+		return ecc.verifySchnorr(message, publicKey, signature);
+	} catch {
+		return false;
+	}
 }
 
 /**

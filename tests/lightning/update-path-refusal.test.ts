@@ -37,6 +37,7 @@ import {
 	IUpdateFeeMessage
 } from '../../src/lightning/message/channel-update';
 import { QuiescenceState } from '../../src/lightning/channel/quiescence';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { expectWireFailure, wireRefusalOf } from './helpers/open-refusal';
 
 function makeBasepoints(seed: string): IChannelBasepoints {
@@ -541,6 +542,121 @@ describe('Update-path refusals reach the peer (issue 404)', function () {
 			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
 				true
 			);
+		});
+	});
+});
+
+/** An OFFERED htlc with a known preimage, for the resolution handlers. */
+function seedOfferedHtlc(channel: Channel, id: bigint, preimage: Buffer): void {
+	channel.getFullState().htlcs.set(`offered-${id}`, {
+		id,
+		direction: HtlcDirection.OFFERED,
+		amountMsat: 1_000_000n,
+		paymentHash: crypto.createHash('sha256').update(preimage).digest(),
+		cltvExpiry: 500,
+		onionRoutingPacket: Buffer.alloc(1366),
+		state: HtlcState.COMMITTED
+	});
+}
+
+function makeTaprootChannelType(): Buffer {
+	const flags = FeatureFlags.empty();
+	flags.setCompulsory(Feature.OPTION_TAPROOT);
+	return flags.toBuffer();
+}
+
+describe('Resolution and closing refusals reach the peer (issue 409)', function () {
+	describe('handleUpdateFulfillHtlc', function () {
+		it('fails the channel on the wire on an invalid preimage (attempted theft)', function () {
+			const channel = makeChannel();
+			seedOfferedHtlc(channel, 0n, Buffer.alloc(32, 1));
+			const actions = channel.handleUpdateFulfillHtlc({
+				channelId: channel.getChannelId()!,
+				id: 0n,
+				paymentPreimage: Buffer.alloc(32, 2)
+			});
+			expectWireFailure(
+				actions,
+				channel.getChannelId()!,
+				/Invalid preimage for offered HTLC/
+			);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		it('control: an unknown id refuses LOCALLY (crash-replay carve-out)', function () {
+			// A peer restored from a legally lagging snapshot replays its whole
+			// pending-update queue, and the replayed fulfill can land on an entry
+			// the completed round already deleted. Never wire-fail it.
+			const channel = makeChannel();
+			const actions = channel.handleUpdateFulfillHtlc({
+				channelId: channel.getChannelId()!,
+				id: 99n,
+				paymentPreimage: Buffer.alloc(32, 2)
+			});
+			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
+			expect(actions).to.have.length(1);
+			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		});
+	});
+
+	describe('handleUpdateFailHtlc / handleUpdateFailMalformedHtlc', function () {
+		it('control: an unknown id on update_fail_htlc refuses LOCALLY', function () {
+			const channel = makeChannel();
+			const actions = channel.handleUpdateFailHtlc({
+				channelId: channel.getChannelId()!,
+				id: 99n,
+				reason: Buffer.alloc(32)
+			});
+			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
+			expect(actions).to.have.length(1);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('fails the channel on the wire when failure_code lacks BADONION', function () {
+			// The bit check precedes the entry lookup, so no seeding needed: a
+			// missing BADONION bit is nonconformant whatever the id refers to.
+			const channel = makeChannel();
+			const actions = channel.handleUpdateFailMalformedHtlc({
+				channelId: channel.getChannelId()!,
+				id: 0n,
+				sha256OfOnion: Buffer.alloc(32),
+				failureCode: 0x4001 // BADONION (0x8000) not set
+			});
+			expectWireFailure(actions, channel.getChannelId()!, /BADONION/);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		it('control: an unknown id with a proper BADONION code refuses LOCALLY', function () {
+			const channel = makeChannel();
+			const actions = channel.handleUpdateFailMalformedHtlc({
+				channelId: channel.getChannelId()!,
+				id: 99n,
+				sha256OfOnion: Buffer.alloc(32),
+				failureCode: 0x8000 | 1
+			});
+			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
+			expect(actions).to.have.length(1);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		});
+	});
+
+	describe('handleRevokeAndAck, taproot nonce arm', function () {
+		it('fails the channel on the wire when next_local_nonce is missing', function () {
+			const secret = crypto.createHash('sha256').update('raa-s').digest();
+			const channel = makeChannel({
+				channelType: makeTaprootChannelType(),
+				remoteCommitmentNumber: 1n,
+				remoteCurrentPerCommitmentPoint: getPublicKey(secret)
+			});
+			const actions = channel.handleRevokeAndAck({
+				channelId: channel.getChannelId()!,
+				perCommitmentSecret: secret,
+				nextPerCommitmentPoint: getPublicKey(Buffer.alloc(32, 7))
+				// no nextLocalNonce
+			});
+			expectWireFailure(actions, channel.getChannelId()!, /next_local_nonce/);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 	});
 });

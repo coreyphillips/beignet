@@ -183,5 +183,13 @@ export function verifyTaprootHtlcLeaf(
 	sig: Buffer
 ): boolean {
 	const x = xOnlyPubkey.length === 33 ? xOnlyPubkey.subarray(1) : xOnlyPubkey;
-	return ecc.verifySchnorr(sighash, x, sig);
+	// A correctly-counted but malformed peer signature (out-of-range scalar)
+	// makes verifySchnorr THROW rather than return false; the throw would
+	// escape handleCommitmentSigned's refusal arms entirely. Malformed means
+	// invalid.
+	try {
+		return ecc.verifySchnorr(sighash, x, sig);
+	} catch {
+		return false;
+	}
 }

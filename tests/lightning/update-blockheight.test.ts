@@ -61,6 +61,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { expectWireFailure } from './helpers/open-refusal';
 
 bitcoin.initEccLib(ecc);
 
@@ -267,41 +268,68 @@ describe('update_blockheight (bLIP-0051, lessor side)', function () {
 		).to.throw('too short');
 	});
 
-	it('validates sender role, lease presence, monotonicity and staleness', function () {
-		const { buyer, seller } = setupLeasedPair();
-
-		// Only the opener may send: the buyer (opener) must reject one.
-		const buyerActions = buyer.handleUpdateBlockheight(
-			updateMsg(buyer, NEW_BH)
+	// Each refusal is a wire-visible channel failure (issue 409, CLN parity),
+	// so every arm gets its own pristine pair: a refused channel is ERRORED
+	// and can never be reused.
+	it('fails the channel on the wire when the non-opener sends one', function () {
+		const { buyer } = setupLeasedPair();
+		const actions = buyer.handleUpdateBlockheight(updateMsg(buyer, NEW_BH));
+		expectWireFailure(
+			actions,
+			buyer.getChannelId()!,
+			/Only the opener can send update_blockheight/
 		);
-		expect(buyerActions[0]?.type).to.equal(ChannelActionType.ERROR);
+		expect(buyer.getState()).to.equal(ChannelState.ERRORED);
+	});
 
-		// Not leased / not lessor: strip the lease from the seller.
-		const ss = seller.getFullState();
-		const savedExpiry = ss.leaseExpiry;
-		ss.leaseExpiry = undefined;
-		expect(
-			seller.handleUpdateBlockheight(updateMsg(seller, NEW_BH))[0]?.type
-		).to.equal(ChannelActionType.ERROR);
-		ss.leaseExpiry = savedExpiry;
+	it('fails the channel on the wire on a non-leased channel', function () {
+		const { seller } = setupLeasedPair();
+		seller.getFullState().leaseExpiry = undefined;
+		const actions = seller.handleUpdateBlockheight(updateMsg(seller, NEW_BH));
+		expectWireFailure(
+			actions,
+			seller.getChannelId()!,
+			/update_blockheight on a non-leased channel/
+		);
+		expect(seller.getState()).to.equal(ChannelState.ERRORED);
+	});
 
-		// Decrease is rejected; equal is a no-op.
+	it('fails the channel on the wire when the height decreases; equal is a no-op', function () {
+		const { seller: noopSeller } = setupLeasedPair();
 		expect(
-			seller.handleUpdateBlockheight(updateMsg(seller, OPEN_BH - 1))[0]?.type
-		).to.equal(ChannelActionType.ERROR);
-		expect(
-			seller.handleUpdateBlockheight(updateMsg(seller, OPEN_BH))
+			noopSeller.handleUpdateBlockheight(updateMsg(noopSeller, OPEN_BH))
 		).to.have.length(0);
-		expect(ss.pendingLeaseBlockheight).to.be.undefined;
+		expect(noopSeller.getFullState().pendingLeaseBlockheight).to.be.undefined;
+		expect(noopSeller.getState()).to.equal(ChannelState.NORMAL);
 
-		// Staleness: more than 1008 blocks behind our tip.
+		const { seller } = setupLeasedPair();
+		const actions = seller.handleUpdateBlockheight(
+			updateMsg(seller, OPEN_BH - 1)
+		);
+		expectWireFailure(
+			actions,
+			seller.getChannelId()!,
+			/update_blockheight decreased/
+		);
+		expect(seller.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('fails the channel on the wire on a stale height (1008 behind our tip)', function () {
+		const { seller } = setupLeasedPair();
 		seller.setBlockHeight(NEW_BH + 2000);
-		expect(
-			seller.handleUpdateBlockheight(updateMsg(seller, NEW_BH))[0]?.type
-		).to.equal(ChannelActionType.ERROR);
-		seller.setBlockHeight(NEW_BH);
+		const actions = seller.handleUpdateBlockheight(updateMsg(seller, NEW_BH));
+		expectWireFailure(
+			actions,
+			seller.getChannelId()!,
+			/update_blockheight too old/
+		);
+		expect(seller.getState()).to.equal(ChannelState.ERRORED);
+	});
 
-		// Happy path: staged, no error.
+	it('stages a valid height with no error', function () {
+		const { seller } = setupLeasedPair();
+		const ss = seller.getFullState();
+		seller.setBlockHeight(NEW_BH);
 		expect(
 			seller.handleUpdateBlockheight(updateMsg(seller, NEW_BH))
 		).to.have.length(0);

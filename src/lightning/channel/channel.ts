@@ -1407,14 +1407,27 @@ export class Channel {
 			this._state.localPerCommitmentSeed,
 			commitmentNumber
 		);
-		const valid = verifyRemoteCommitmentPartial(
-			this._state,
-			theirPartial,
-			ourPublicNonce,
-			theirSigningNonce,
-			localPerCommitmentPoint,
-			commitmentNumber
-		);
+		let valid: boolean;
+		try {
+			valid = verifyRemoteCommitmentPartial(
+				this._state,
+				theirPartial,
+				ourPublicNonce,
+				theirSigningNonce,
+				localPerCommitmentPoint,
+				commitmentNumber
+			);
+		} catch (err) {
+			// A 98-byte partial whose 66-byte nonce halves are not decodable
+			// curve points, or whose 32-byte scalar is out of range, makes the
+			// musig library THROW ('Unexpected public nonce at infinity',
+			// 'Invalid sig') rather than return false. Uncaught, that throw
+			// escaped every refusal arm above this helper all the way to
+			// ChannelManager.handleMessage's catch: no wire error, no unwind,
+			// a dead open nobody was told about (issue 415).
+			const detail = err instanceof Error ? err.message : String(err);
+			return `Invalid taproot partial signature (${detail})`;
+		}
 		if (!valid) {
 			return 'Invalid taproot partial signature';
 		}
@@ -3143,6 +3156,16 @@ export class Channel {
 		const key = `offered-${msg.id}`;
 		const entry = this._state.htlcs.get(key);
 		if (!entry) {
+			// A bare local ERROR, deliberately (issue 409 carve-out). BOLT 2
+			// reads this as a MUST-fail, but a legal crossing reaches it: a peer
+			// that crashed after completing the removal round and restored a
+			// lagging snapshot (the issue 295/297 window this codebase embraces)
+			// replays its WHOLE pending-update queue on reestablish, and our own
+			// handleReestablish does exactly that, unconditionally. The replayed
+			// fulfill/fail then lands on an entry handleRevokeAndAck already
+			// deleted. A replay that finds the entry takes the repeat branch
+			// below; this arm is the same family one persist further along, and
+			// a guard that kills a channel must carry no known false positives.
 			return [
 				{ type: ChannelActionType.ERROR, message: `HTLC ${msg.id} not found` }
 			];
@@ -3160,12 +3183,12 @@ export class Channel {
 			.update(msg.paymentPreimage)
 			.digest();
 		if (!fulfillHash.equals(entry.paymentHash)) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid preimage for offered HTLC'
-				}
-			];
+			// An attempted theft answered with silence was the worst of the bare
+			// arms (issue 409): the peer kept the bogus fulfill in its book and
+			// the channel died a round later on a signature mismatch.
+			return this._failChannelWithWireError(
+				'Invalid preimage for offered HTLC'
+			);
 		}
 
 		// A reestablish replay of a fulfill we already processed (BOLT 2 update
@@ -3386,6 +3409,8 @@ export class Channel {
 		const key = `offered-${msg.id}`;
 		const entry = this._state.htlcs.get(key);
 		if (!entry) {
+			// Deliberately bare: see the crash-replay carve-out argued at
+			// handleUpdateFulfillHtlc's not-found arm.
 			return [
 				{ type: ChannelActionType.ERROR, message: `HTLC ${msg.id} not found` }
 			];
@@ -3449,20 +3474,19 @@ export class Channel {
 			];
 		}
 
-		// BOLT 2: failure_code MUST have BADONION (0x8000) bit set
+		// BOLT 2: failure_code MUST have BADONION (0x8000) bit set. A pure check
+		// of the message bytes, so nothing in flight can excuse it.
 		if ((msg.failureCode & 0x8000) === 0) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'update_fail_malformed_htlc: failure_code missing BADONION bit'
-				}
-			];
+			return this._failChannelWithWireError(
+				'update_fail_malformed_htlc: failure_code missing BADONION bit'
+			);
 		}
 
 		const key = `offered-${msg.id}`;
 		const entry = this._state.htlcs.get(key);
 		if (!entry) {
+			// Deliberately bare: see the crash-replay carve-out argued at
+			// handleUpdateFulfillHtlc's not-found arm.
 			return [
 				{ type: ChannelActionType.ERROR, message: `HTLC ${msg.id} not found` }
 			];
@@ -3944,6 +3968,20 @@ export class Channel {
 		}
 
 		if (isTaprootChannel(this._state.channelType)) {
+			// Cannot verify -> must not adopt, the taproot twin of the ECDSA arm
+			// below. A plain ERROR, not a wire error: the missing pieces are a
+			// LOCAL invariant failure, not a peer violation, so the channel must
+			// not be condemned at the peer. Checked here so the wire-visible arms
+			// below can only ever carry a peer-fault reason.
+			if (!this._state.localNextNonce || !this._state.remoteBasepoints) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Cannot verify taproot commitment partial: no verification nonce or remote basepoints'
+					}
+				];
+			}
 			// Verify the peer's Schnorr sigs over our second-level HTLC txs FIRST
 			// (a pure check, no state writes) — _verifyAndStoreRemotePartial
 			// overwrites remoteCommitmentSignature/remoteSigningNonce on success,
@@ -3952,25 +3990,20 @@ export class Channel {
 			// the next commitment's partial against the current commitment's tx —
 			// an invalid, unminable witness. No state may change unless the whole
 			// message verifies.
-			if (this._state.remoteBasepoints) {
-				const htlcPoint = getPerCommitmentPoint(
-					this._state.localPerCommitmentSeed,
-					this._state.localCommitmentNumber + 1n
-				);
-				if (
-					!verifyRemoteHtlcSignaturesTaproot(
-						this._state,
-						htlcPoint,
-						msg.htlcSignatures
-					)
-				) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: 'Invalid taproot HTLC signature'
-						}
-					];
-				}
+			const htlcPoint = getPerCommitmentPoint(
+				this._state.localPerCommitmentSeed,
+				this._state.localCommitmentNumber + 1n
+			);
+			if (
+				!verifyRemoteHtlcSignaturesTaproot(
+					this._state,
+					htlcPoint,
+					msg.htlcSignatures
+				)
+			) {
+				// Twin of the wire-visible ECDSA HTLC-sig arm below (BOLT 2 MUST
+				// fail the channel).
+				return this._failChannelWithWireError('Invalid taproot HTLC signature');
 			}
 			// option_taproot: verify the peer's MuSig2 partial over OUR next
 			// commitment using the verification nonce we advertised one step ahead
@@ -3982,7 +4015,11 @@ export class Channel {
 				this._state.localCommitmentNumber + 1n
 			);
 			if (err) {
-				return [{ type: ChannelActionType.ERROR, message: err }];
+				// Twin of the wire-visible ECDSA commitment-sig arm below. The
+				// local-invariant reason inside _verifyAndStoreRemotePartial is
+				// unreachable past the pre-check above, so err is always a
+				// peer-fault reason here.
+				return this._failChannelWithWireError(err);
 			}
 			this._state.remoteHtlcSignatures = msg.htlcSignatures;
 		} else {
@@ -4258,12 +4295,13 @@ export class Channel {
 		// peer's NEXT commitment (matching remoteNextPerCommitmentPoint).
 		if (isTaprootChannel(this._state.channelType)) {
 			if (!msg.nextLocalNonce || msg.nextLocalNonce.length !== 66) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Taproot revoke_and_ack missing a valid next_local_nonce'
-					}
-				];
+				// Pure message-content MUST of the taproot extension: every
+				// conformant revoke_and_ack, retransmits included, re-attaches
+				// the nonce (ours does, deterministically), and without it no
+				// further commitment can ever be co-signed.
+				return this._failChannelWithWireError(
+					'Taproot revoke_and_ack missing a valid next_local_nonce'
+				);
 			}
 			this._state.remoteNonce = msg.nextLocalNonce;
 		}
@@ -4722,57 +4760,51 @@ export class Channel {
 		}
 
 		// Only the opener sends update_blockheight (CLN channeld enforces the
-		// same on both sides).
+		// same on both sides, and fails the channel; now we tell the peer too).
+		// Roles were fixed at open, so nothing in flight can excuse it.
 		if (this._state.role !== ChannelRole.ACCEPTOR) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Only the opener can send update_blockheight'
-				}
-			];
+			return this._failChannelWithWireError(
+				'Only the opener can send update_blockheight'
+			);
 		}
 
 		// Only meaningful on a leased channel where WE are the lessor: the
-		// height feeds our lease CSV. CLN fails the channel for it too.
+		// height feeds our lease CSV. CLN fails the channel for it too, and the
+		// lease's existence is a fact both sides fixed at open.
 		if (this._state.leaseExpiry === undefined || !this._state.isLessor) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'update_blockheight on a non-leased channel'
-				}
-			];
+			return this._failChannelWithWireError(
+				'update_blockheight on a non-leased channel'
+			);
 		}
 
 		// Monotonic: the agreed blockheight never decreases (CLN warns and
-		// fails). An equal height is a harmless no-op.
+		// fails). An equal height is a harmless no-op. The comparison only ever
+		// sees heights the opener itself put on the wire: markForReestablish
+		// discards an uncommitted staged height on disconnect, so no legal
+		// replay compares against state the peer never learned of.
 		const current =
 			this._state.pendingLeaseBlockheight ??
 			this._state.leaseCommitBlockheight ??
 			0;
 		if (msg.blockheight < current) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `update_blockheight decreased (${msg.blockheight} < ${current})`
-				}
-			];
+			return this._failChannelWithWireError(
+				`update_blockheight decreased (${msg.blockheight} < ${current})`
+			);
 		}
 		if (msg.blockheight === current) {
 			return [];
 		}
 
-		// Staleness (CLN parity): a height more than 1008 blocks behind our own
-		// tip means the opener's view is unusably old.
+		// Staleness (CLN parity, which fails the channel): a height more than
+		// 1008 blocks behind our own tip means the opener's view is unusably
+		// old. Our-tip policy, told anyway, like the CLTV horizon (issue 404).
 		if (
 			this._currentBlockHeight > 0 &&
 			msg.blockheight + 1008 < this._currentBlockHeight
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `update_blockheight too old (${msg.blockheight} vs tip ${this._currentBlockHeight})`
-				}
-			];
+			return this._failChannelWithWireError(
+				`update_blockheight too old (${msg.blockheight} vs tip ${this._currentBlockHeight})`
+			);
 		}
 
 		// A NEW update while a previous staged height already reached the
@@ -5476,17 +5508,31 @@ export class Channel {
 	 *   a real script derived from the funding pubkey.
 	 */
 	handleShutdown(msg: IShutdownMessage, localScript?: Buffer): ChannelAction[] {
+		// Lifecycle first, so the wire-visible content arms below can only ever
+		// fire on a live channel: outside these states the peer may simply not
+		// have seen our terminal transition yet, and a wire error here would
+		// condemn a channel over a legal crossing (the standard carve-out).
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			this._state.state !== ChannelState.NEGOTIATING_CLOSING
+		) {
+			return [
+				{ type: ChannelActionType.ERROR, message: 'Unexpected shutdown' }
+			];
+		}
+
 		// Simple-taproot close: the peer's shutdown MUST carry its MuSig2
 		// closing nonce (TLV 8) — without it no closing session can exist and
-		// we must never fall back to ECDSA negotiation on a P2TR funding.
+		// we must never fall back to ECDSA negotiation on a P2TR funding. Every
+		// conformant taproot shutdown, retransmits included, carries a fresh
+		// nonce (buildShutdownRetransmit always attaches one), so this is a
+		// pure content check and wire-visible.
 		if (isTaprootChannel(this._state.channelType)) {
 			if (!msg.shutdownNonce || msg.shutdownNonce.length !== 66) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Taproot shutdown missing the MuSig2 closing nonce (TLV 8)'
-					}
-				];
+				return this._failChannelWithWireError(
+					'Taproot shutdown missing the MuSig2 closing nonce (TLV 8)'
+				);
 			}
 		}
 
@@ -5495,6 +5541,10 @@ export class Channel {
 		// close output in an unspendable script. We accept any valid witness
 		// program (incl. P2TR) so taproot peers can coop-close cleanly. OP_RETURN
 		// forms are additionally allowed under option_simple_close (dust burn).
+		// Wire-visible per BOLT 2's own "send an error and fail the channel"
+		// option: the script forms and the simple_close negotiation are facts
+		// the peer held when it sent, and a retransmit carries the persisted,
+		// previously-validated script.
 		if (
 			!isValidShutdownScript(
 				msg.scriptPubkey,
@@ -5502,12 +5552,7 @@ export class Channel {
 				this._state.simpleClose === true
 			)
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid shutdown scriptPubkey'
-				}
-			];
+			return this._failChannelWithWireError('Invalid shutdown scriptPubkey');
 		}
 
 		// Accept shutdown in NEGOTIATING_CLOSING — peer retransmits after
@@ -5531,15 +5576,6 @@ export class Channel {
 				this.resetSimpleCloseNegotiation();
 			}
 			return [];
-		}
-
-		if (
-			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
-		) {
-			return [
-				{ type: ChannelActionType.ERROR, message: 'Unexpected shutdown' }
-			];
 		}
 
 		this._state.remoteShutdownScript = msg.scriptPubkey;
@@ -5700,7 +5736,13 @@ export class Channel {
 		// Fund-safety: a peer MUST NOT send closing_signed while HTLCs are still
 		// pending (BOLT 2). The closing tx is built from the settled balances only,
 		// so signing here would burn any in-flight HTLC's value to miner fees.
-		// Stay in the current state (channel + funding watch intact) and error.
+		// Deliberately a bare local ERROR (issue 409 carve-out): a legal crossing
+		// reaches it. If WE crashed and restored a snapshot lagging one removal
+		// round, markForReestablish resurrects a COMMITTED entry while the peer's
+		// ledger is legitimately HTLC-free, and its re-proposed closing_signed
+		// lands here mid-replay. The stall also self-heals: we stay in the
+		// current state (channel + funding watch intact), the replayed round
+		// drains the count, and the shutdown exchange re-kicks negotiation.
 		if (
 			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
 			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
@@ -5735,25 +5777,31 @@ export class Channel {
 		// watch upstream) on fee agreement ALONE. A peer can echo our proposed fee with
 		// a garbage signature; if we closed + stopped watching we could not punish a
 		// later revoked/latest commitment broadcast on the still-live funding output.
-		// Verify the peer's closing signature over the agreed tx FIRST; on failure stay
-		// in NEGOTIATING_CLOSING (channel + funding watch intact). The callback is
-		// optional so existing unit callers that only exercise fee logic are unaffected.
+		// Verify the peer's closing signature over the agreed tx FIRST. On failure the
+		// channel is failed ON THE WIRE (BOLT 2 sanctions "send an error and fail the
+		// channel" here): with zero pending HTLCs both ledgers' balances agree, so a
+		// conformant retransmit always verifies and a mismatch is a real divergence.
+		// ERRORED keeps the funding watch alive; only CLOSED tears it down. The
+		// callback is optional so existing unit callers that only exercise fee logic
+		// are unaffected.
 		const peerSigValid = (feeSatoshis: bigint): boolean =>
 			!verifyClosingFn || verifyClosingFn(feeSatoshis, msg.signature);
+
+		// The signature must be valid whatever we think of the fee: BOLT 2 makes
+		// an invalid closing signature a MUST-fail regardless of which branch
+		// the fee lands in, and checking it only at agreement let a garbage-
+		// signed proposal drive the counter rounds until the final one.
+		if (!peerSigValid(msg.feeSatoshis)) {
+			return this._failChannelWithWireError(
+				'Coop-close: peer closing signature failed to verify'
+			);
+		}
 
 		// If their fee matches our last proposal → agreement reached
 		if (
 			this._state.lastProposedClosingFeeSat !== null &&
 			msg.feeSatoshis === this._state.lastProposedClosingFeeSat
 		) {
-			if (!peerSigValid(msg.feeSatoshis)) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Coop-close: peer closing signature failed to verify'
-					}
-				];
-			}
 			this._state.state = ChannelState.CLOSED;
 			return [
 				{
@@ -5768,14 +5816,6 @@ export class Channel {
 			msg.feeSatoshis >= this._state.closingFeeMin! &&
 			msg.feeSatoshis <= this._state.closingFeeMax!
 		) {
-			if (!peerSigValid(msg.feeSatoshis)) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Coop-close: peer closing signature failed to verify'
-					}
-				];
-			}
 			const sig = signClosingFn(msg.feeSatoshis);
 			const response: IClosingSignedMessage = {
 				channelId: this._state.channelId!,
@@ -5842,15 +5882,19 @@ export class Channel {
 		if (!msg.partialSignature) {
 			// Never fall back to interpreting the (zeroed) ECDSA field: the
 			// funding output is P2TR key-spend and only a MuSig2 partial works.
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Taproot closing_signed missing the MuSig2 partial signature (TLV 6)'
-				}
-			];
+			// Wire-visible: a pure content check no crossing can produce.
+			return this._failChannelWithWireError(
+				'Taproot closing_signed missing the MuSig2 partial signature (TLV 6)'
+			);
 		}
 		if (!this._remoteClosingNonce || !this._ourClosingNonce) {
+			// Deliberately bare (issue 409 carve-out), a mixed-fault arm: the
+			// nonces are unpersisted privates, so a missing OUR nonce is our own
+			// restart artifact, and buildShutdownRetransmit deliberately nulls
+			// the remote one on reestablish. A conformant peer's mandatory
+			// shutdown retransmit repopulates it (ordered transport puts that
+			// shutdown before any closing_signed), so only ordering artifacts
+			// and our own state land here, never provable peer divergence.
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -5866,23 +5910,18 @@ export class Channel {
 		// Initiator: we already made our (only) offer.
 		if (this._state.lastProposedClosingFeeSat !== null) {
 			if (msg.feeSatoshis !== this._state.lastProposedClosingFeeSat) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							`Taproot closing fee must echo our offer: sent ${this._state.lastProposedClosingFeeSat}, ` +
-							`got ${msg.feeSatoshis}`
-					}
-				];
+				// Countering would need a second use of a single-use nonce, so a
+				// non-echo provably cannot complete this session or any other:
+				// permanent divergence, told on the wire.
+				return this._failChannelWithWireError(
+					`Taproot closing fee must echo our offer: sent ${this._state.lastProposedClosingFeeSat}, ` +
+						`got ${msg.feeSatoshis}`
+				);
 			}
 			if (!peerSigValid(msg.feeSatoshis)) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'Coop-close: peer closing partial signature failed to verify'
-					}
-				];
+				return this._failChannelWithWireError(
+					'Coop-close: peer closing partial signature failed to verify'
+				);
 			}
 			this._state.state = ChannelState.CLOSED;
 			return [
@@ -5932,6 +5971,15 @@ export class Channel {
 			msg.feeSatoshis > maxAcceptableFee ||
 			msg.feeSatoshis < minAcceptableFee
 		) {
+			// Deliberately a BARE local refusal (issue 409 carve-out): the band
+			// is derived from OUR private feerate estimate, a fact the peer
+			// never held, so a conformant initiator with a fresher fee view can
+			// land here on a fee the opener can perfectly well pay. A guard
+			// that kills a channel must carry no known false positives; the
+			// stall is recoverable (a reconnect starts a fresh closing session
+			// with fresh nonces and a fresh offer). The dust and opener-balance
+			// arms below stay wire-visible: those turn on the dust limit we
+			// advertised at open and on the shared ledger, facts the peer held.
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -5944,28 +5992,19 @@ export class Channel {
 			// nor consume it down to a dust remnant.
 			const dust = this._state.localConfig.dustLimitSatoshis;
 			if (openerBalanceSat < msg.feeSatoshis + dust) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: `Taproot closing fee ${msg.feeSatoshis} leaves our output below dust (balance ${openerBalanceSat}, dust ${dust})`
-					}
-				];
+				return this._failChannelWithWireError(
+					`Taproot closing fee ${msg.feeSatoshis} leaves our output below dust (balance ${openerBalanceSat}, dust ${dust})`
+				);
 			}
 		} else if (msg.feeSatoshis > openerBalanceSat) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `Taproot closing fee ${msg.feeSatoshis} exceeds opener balance ${openerBalanceSat}`
-				}
-			];
+			return this._failChannelWithWireError(
+				`Taproot closing fee ${msg.feeSatoshis} exceeds opener balance ${openerBalanceSat}`
+			);
 		}
 		if (!peerSigValid(msg.feeSatoshis)) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Coop-close: peer closing partial signature failed to verify'
-				}
-			];
+			return this._failChannelWithWireError(
+				'Coop-close: peer closing partial signature failed to verify'
+			);
 		}
 		if (this._hasSignedClosing) {
 			// Duplicate closing_signed in the same session — our reply is out.
@@ -6785,7 +6824,35 @@ export class Channel {
 	 *    SHUTTING_DOWN, CLOSING, SPLICING or ERRORED) and the SENT_STFU half of
 	 *    the quiescence guard. There the peer may be entirely conformant and
 	 *    simply not yet have seen the transition we made.
+	 *
+	 * The crossing clause also covers the crash-replay family (issue 409): a
+	 * peer restored from a legally lagging snapshot replays its whole pending
+	 * update queue on reestablish (handleReestablish does the same), so the
+	 * "HTLC not found" arms and the pending-HTLC closing_signed arm can fire
+	 * against a conformant peer and stay bare, each argued at its guard. So
+	 * does the taproot closing_signed nonce-exchange arm, whose predicate
+	 * mixes our own unpersisted restart state with reestablish ordering.
 	 */
+	/**
+	 * Fail the channel for a peer message whose payload did not even DECODE
+	 * (a wrong-length TLV, a truncated field). The per-handler content checks
+	 * can never see such a message, because the codec throws first and the
+	 * throw used to die in ChannelManager.handleMessage's catch: no wire
+	 * error, no unwind (issue 409 review). Same lifecycle carve-out as the
+	 * handlers themselves: outside a live state the peer may not have seen
+	 * our terminal transition, so the refusal stays local.
+	 */
+	failFromMalformedPeerMessage(reason: string): ChannelAction[] {
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			this._state.state !== ChannelState.NEGOTIATING_CLOSING
+		) {
+			return [{ type: ChannelActionType.ERROR, message: reason }];
+		}
+		return this._failChannelWithWireError(reason);
+	}
+
 	private _failChannelWithWireError(
 		message: string,
 		cleanup?: IErrorAction['cleanup']
