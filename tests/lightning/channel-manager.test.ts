@@ -241,6 +241,49 @@ describe('Channel Manager', function () {
 			expect(channel.getState()).to.equal(ChannelState.SENT_OPEN);
 		});
 
+		it('discards a channel whose open_channel names a hostile reserve (issue 391)', function () {
+			// An opener demanding a reserve near the whole capacity leaves the
+			// acceptor a channel it can receive into and never spend from. A real
+			// beignet opener always computes its reserve (capped at 20%), so the
+			// hostile value is injected by capturing and tampering the message.
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+
+			let openPayload: Buffer | null = null;
+			alice.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					if (type === MessageType.OPEN_CHANNEL) openPayload = payload;
+				}
+			);
+			const errors: string[] = [];
+			bob.on('error', (_id: Buffer | null, message: string) =>
+				errors.push(message)
+			);
+			const wire: number[] = [];
+			bob.on('message:outbound', (_peer: string, type: number) =>
+				wire.push(type)
+			);
+
+			alice.openChannel(bobPubkey, 1_000_000n);
+			const open = decodeOpenChannelMessage(openPayload!);
+			open.channelReserveSatoshis = 800_000n;
+			bob.handleMessage(
+				alicePubkey,
+				MessageType.OPEN_CHANNEL,
+				encodeOpenChannelMessage(open)
+			);
+
+			expect(errors.length).to.equal(1);
+			expect(errors[0]).to.include(
+				'channel_reserve_satoshis 800000 exceeds maximum 200000'
+			);
+			// The refusal is wire-visible, scoped to the id the opener chose.
+			expect(wire).to.deep.equal([MessageType.ERROR]);
+			expect(bob.getTempChannel(open.temporaryChannelId)).to.equal(undefined);
+			expect(bob.listChannels()).to.have.length(0);
+		});
+
 		it('drops an open_channel under the reserved all-zero id, silently (issue 381)', function () {
 			// Every other refusal is now scoped to the id the opener chose, and
 			// BOLT 1 reserves the all-zero one for every channel with the peer, so

@@ -304,6 +304,42 @@ describe('Channel Types and Validation', function () {
 			expect(validateOpenChannelParams(msg)).to.be.null;
 		});
 
+		it('rejects a peer channel_reserve above 20% of funding (issue 391)', function () {
+			// Without it an opener demanding a reserve near the whole capacity
+			// leaves us a channel we can receive into and never spend from, for
+			// its whole life. LND and CLN cap a peer-proposed reserve at 20% of
+			// capacity, and computeChannelReserve caps our own proposals the
+			// same way.
+			const msg = makeValidOpenMsg();
+			msg.channelReserveSatoshis = msg.fundingSatoshis / 5n + 1n;
+			expect(validatePeerOpenChannelParams(msg)).to.contain('exceeds maximum');
+			msg.channelReserveSatoshis = msg.fundingSatoshis / 5n;
+			expect(validatePeerOpenChannelParams(msg)).to.be.null;
+		});
+
+		it('floors the reserve cap at the dust bound on tiny opens (issue 391)', function () {
+			// On a small channel 20% of funding lands below the dust ceiling,
+			// and the reserve must be >= the opener's dust limit, so a bare 20%
+			// cap would refuse a spec-forced minimum. The cap floors at
+			// MAX_DUST_LIMIT_SATOSHIS, which the dust arm already bounds.
+			const msg = makeValidOpenMsg();
+			msg.fundingSatoshis = 5_000n;
+			msg.maxHtlcValueInFlightMsat = 1_000_000n;
+			msg.channelReserveSatoshis = MAX_DUST_LIMIT_SATOSHIS;
+			expect(validatePeerOpenChannelParams(msg)).to.be.null;
+			msg.channelReserveSatoshis = MAX_DUST_LIMIT_SATOSHIS + 1n;
+			expect(validatePeerOpenChannelParams(msg)).to.contain('exceeds maximum');
+		});
+
+		it('does not bound our own open_channel reserve (issue 391)', function () {
+			// Same split as the dust bound above: the reserve we propose is
+			// already capped by computeChannelReserve, and refusing an operator
+			// override here would refuse their own open rather than an attack.
+			const msg = makeValidOpenMsg();
+			msg.channelReserveSatoshis = msg.fundingSatoshis / 2n;
+			expect(validateOpenChannelParams(msg)).to.be.null;
+		});
+
 		it('should reject channel_reserve below dust_limit', function () {
 			const msg = makeValidOpenMsg();
 			msg.channelReserveSatoshis = 400n;

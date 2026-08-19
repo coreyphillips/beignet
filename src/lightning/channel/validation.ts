@@ -266,6 +266,21 @@ export function validatePeerOpenChannelParams(
 		return `dust_limit_satoshis ${msg.dustLimitSatoshis} exceeds maximum ${MAX_DUST_LIMIT_SATOSHIS}`;
 	}
 
+	// A reserve near the whole capacity leaves the acceptor a channel it can
+	// receive into and never spend from, for the channel's life: a free burn
+	// of our inbound liquidity and a channel slot. BOLT 2 states no maximum,
+	// but LND and CLN both cap a peer-proposed reserve at 20% of capacity,
+	// and computeChannelReserve applies the same cap to the reserve we
+	// propose. The MAX_DUST_LIMIT_SATOSHIS floor keeps tiny spec-legal opens
+	// admissible: the reserve must be >= the opener's dust limit, which the
+	// arm above already bounds, so the forced minimum can never exceed it.
+	const reserveCap = msg.fundingSatoshis / 5n;
+	const maxReserve =
+		reserveCap > MAX_DUST_LIMIT_SATOSHIS ? reserveCap : MAX_DUST_LIMIT_SATOSHIS;
+	if (msg.channelReserveSatoshis > maxReserve) {
+		return `channel_reserve_satoshis ${msg.channelReserveSatoshis} exceeds maximum ${maxReserve}`;
+	}
+
 	return null;
 }
 
