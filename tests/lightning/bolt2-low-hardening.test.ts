@@ -53,8 +53,12 @@ import { BITCOIN_CHAIN_HASH } from '../../src/lightning/channel/types';
 import {
 	seedKey,
 	signerFromSeed,
-	realInitialCommitmentSig
+	realInitialCommitmentSig,
+	realCommitmentSigs
 } from './helpers/real-signing';
+import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
+import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 
 function realBasepoints(seed?: Buffer): IChannelBasepoints {
 	// With a seed, derive with the seedKey convention so signerFromSeed(seed)
@@ -484,17 +488,21 @@ describe('BOLT 2 LOW hardening batch', function () {
 			// Opener role, so no commitment-fee term rides on the peer's side:
 			// the boundary is the bare 1,500-sat reserve. 147,000,000 msat pushed
 			// leaves the acceptor holding everything but 3,000 sat.
-			const { opener } = normalPair(150_000n, 147_000_000n);
-			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
-				1_500n
-			);
+			// One pristine channel per side of the boundary: since issue 404 the
+			// refusal FAILS the channel, so the admitted case has to be measured on a
+			// channel the refused case never touched.
+			const { opener: refuses } = normalPair(150_000n, 147_000_000n);
+			const { opener: admits } = normalPair(150_000n, 147_000_000n);
 			expect(
-				errorOf(opener.handleUpdateAddHtlc(inboundHtlc(opener, 145_500_001n)))
+				refuses.getFullState().localConfig.channelReserveSatoshis
+			).to.equal(1_500n);
+			expect(
+				errorOf(refuses.handleUpdateAddHtlc(inboundHtlc(refuses, 145_500_001n)))
 			).to.match(/cannot afford HTLC above channel reserve/);
 			expect(
-				errorOf(opener.handleUpdateAddHtlc(inboundHtlc(opener, 145_500_000n)))
+				errorOf(admits.handleUpdateAddHtlc(inboundHtlc(admits, 145_500_000n)))
 			).to.equal(null);
-			expect(opener.getFullState().remoteBalanceMsat).to.equal(1_500_000n);
+			expect(admits.getFullState().remoteBalanceMsat).to.equal(1_500_000n);
 		});
 
 		it('admits an inbound HTLC above the reserve as acceptor, fee included (issue 381)', function () {
@@ -503,17 +511,19 @@ describe('BOLT 2 LOW hardening batch', function () {
 			// on top of 1,500, against the opener's 3,000,000 msat. With the
 			// static 10,000 the requirement exceeds the whole balance, so every
 			// inbound HTLC on this channel is refused today.
-			const { acceptor } = normalPair(150_000n, 147_000_000n);
+			// One pristine channel per side of the boundary (see above).
+			const { acceptor: refuses } = normalPair(150_000n, 147_000_000n);
+			const { acceptor: admits } = normalPair(150_000n, 147_000_000n);
 			expect(
-				acceptor.getFullState().localConfig.channelReserveSatoshis
+				refuses.getFullState().localConfig.channelReserveSatoshis
 			).to.equal(1_500n);
 			expect(
-				errorOf(acceptor.handleUpdateAddHtlc(inboundHtlc(acceptor, 1_274_001n)))
+				errorOf(refuses.handleUpdateAddHtlc(inboundHtlc(refuses, 1_274_001n)))
 			).to.match(/cannot afford HTLC above channel reserve/);
 			expect(
-				errorOf(acceptor.handleUpdateAddHtlc(inboundHtlc(acceptor, 1_274_000n)))
+				errorOf(admits.handleUpdateAddHtlc(inboundHtlc(admits, 1_274_000n)))
 			).to.equal(null);
-			expect(acceptor.getFullState().remoteBalanceMsat).to.equal(1_726_000n);
+			expect(admits.getFullState().remoteBalanceMsat).to.equal(1_726_000n);
 		});
 
 		it('admits an update_fee down to the reserve we advertised (issue 381)', function () {
@@ -604,6 +614,20 @@ describe('BOLT 2 LOW hardening batch', function () {
 		expect(acceptor.getFullState().localConfig.channelReserveSatoshis).to.equal(
 			1_000n
 		);
+		// Captured BEFORE any probe: since issue 404 a refusal fails the channel,
+		// and a row serialized after one carries ERRORED to the restore.
+		const row = JSON.parse(
+			JSON.stringify(serializeChannelState(acceptor.getFullState()))
+		);
+		// A fresh restore per probe, for the same reason.
+		const restore = (): Channel => {
+			const restored = new Channel(
+				deserializeChannelState(JSON.parse(JSON.stringify(row)))
+			);
+			restored.repairEnforcedChannelReserve();
+			return restored;
+		};
+
 		// 49,100,000 msat sits in the band the two values disagree about: the
 		// funder must keep 1,000,000 msat of reserve plus its commitment fee out
 		// of 50,000,000, and at 546 it would only have to keep 546,000.
@@ -612,25 +636,19 @@ describe('BOLT 2 LOW hardening batch', function () {
 		).to.match(/cannot afford HTLC above channel reserve/);
 
 		// Round-trip the row through disk and run the load-time repair over it.
-		const restored = new Channel(
-			deserializeChannelState(
-				JSON.parse(
-					JSON.stringify(serializeChannelState(acceptor.getFullState()))
-				)
-			)
-		);
-		restored.repairEnforcedChannelReserve();
 		expect(
-			restored.getFullState().localConfig.channelReserveSatoshis,
+			restore().getFullState().localConfig.channelReserveSatoshis,
 			'the negotiated reserve survived the restart'
 		).to.equal(1_000n);
+		const refuses = restore();
 		expect(
-			errorOf(restored.handleUpdateAddHtlc(inboundHtlc(restored, 49_100_000n)))
+			errorOf(refuses.handleUpdateAddHtlc(inboundHtlc(refuses, 49_100_000n)))
 		).to.match(/cannot afford HTLC above channel reserve/);
 		// And the refusal is the reserve boundary, not a channel that rejects
 		// everything: comfortably under it still goes through.
+		const admits = restore();
 		expect(
-			errorOf(restored.handleUpdateAddHtlc(inboundHtlc(restored, 48_000_000n)))
+			errorOf(admits.handleUpdateAddHtlc(inboundHtlc(admits, 48_000_000n)))
 		).to.equal(null);
 	});
 
@@ -840,6 +858,113 @@ describe('BOLT 2 LOW hardening batch', function () {
 			expect(res.ok).to.equal(false);
 			expect(res.error).to.match(/Channel not found/);
 			node.destroy();
+		});
+	});
+
+	describe('an add that crossed our own shutdown (issue 404)', function () {
+		// BOLT 2 forbids update_add_htlc only AFTER the peer has received our
+		// shutdown. Until it sends its own we have no evidence it has, so an add
+		// that left before ours arrived is conformant and MUST be recorded.
+		// Dropping it does not spare the channel; it only mislabels its death.
+
+		/**
+		 * normalPair hands each side a RANDOM secondPerCommitmentPoint for the
+		 * peer, which is fine for tests that never run a commitment round but makes
+		 * one impossible: the two sides then build different scripts and every
+		 * signature mismatches. Replace both with the point the peer's own seed
+		 * derives so a real round can be exchanged.
+		 */
+		function pairNextPoints(opener: Channel, acceptor: Channel): void {
+			const pointAt = (side: Channel, n: bigint): Buffer =>
+				perCommitmentPointFromSecret(
+					generateFromSeed(
+						side.getFullState().localPerCommitmentSeed,
+						MAX_INDEX - n
+					)
+				);
+			opener.getFullState().remoteNextPerCommitmentPoint = pointAt(
+				acceptor,
+				1n
+			);
+			acceptor.getFullState().remoteNextPerCommitmentPoint = pointAt(
+				opener,
+				1n
+			);
+		}
+
+		function shutDownLocally(side: Channel): void {
+			const actions = side.initiateShutdown(
+				Buffer.from('0014' + '00'.repeat(20), 'hex')
+			);
+			expect(errorOf(actions), 'shutdown accepted').to.equal(null);
+			expect(side.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+			expect(
+				side.getFullState().remoteShutdownScript,
+				'the peer has not shut down'
+			).to.equal(null);
+		}
+
+		it('admits the add, and the covering commitment_signed then verifies', function () {
+			const { opener, acceptor } = normalPair(1_000_000n, 400_000_000n);
+			pairNextPoints(opener, acceptor);
+			shutDownLocally(acceptor);
+
+			// The opener, which has not seen our shutdown, adds an HTLC.
+			const add = opener.addHtlc(
+				1_000_000n,
+				crypto.randomBytes(32),
+				800_000,
+				Buffer.alloc(1366)
+			);
+			expect(errorOf(add), 'the opener may still add').to.equal(null);
+			const addMsg = decodeUpdateAddHtlcMessage(
+				findSend(add, MessageType.UPDATE_ADD_HTLC)!
+			);
+
+			expect(
+				acceptor.handleUpdateAddHtlc(addMsg),
+				'admitted, not refused'
+			).to.have.length(0);
+			expect(
+				acceptor.getFullState().htlcs.get(`received-${addMsg.id}`),
+				'and recorded'
+			).to.not.equal(undefined);
+
+			// The whole point: the peer's covering commitment_signed is built over
+			// the same commitment we now hold, so it verifies. While the add was
+			// dropped this failed, and handleCommitmentSigned killed the channel
+			// with an "invalid signature" that was never invalid.
+			const sigs = realCommitmentSigs(opener);
+			const actions = acceptor.handleCommitmentSigned({
+				channelId: acceptor.getChannelId()!,
+				signature: sigs.signature,
+				htlcSignatures: sigs.htlcSignatures
+			});
+			expect(errorOf(actions), 'the covering commitment verifies').to.equal(
+				null
+			);
+			expect(acceptor.getState()).to.not.equal(ChannelState.ERRORED);
+		});
+
+		it('and once the PEER has shut down the add is refused, but LOCALLY', function () {
+			const { opener, acceptor } = normalPair(1_000_000n, 400_000_000n);
+			shutDownLocally(acceptor);
+			acceptor.handleShutdown({
+				channelId: acceptor.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '11'.repeat(20), 'hex')
+			});
+			expect(acceptor.getFullState().remoteShutdownScript).to.not.equal(null);
+
+			// The peer is bound now, and is still not condemned: handleReestablish
+			// replays every queued update_add_htlc after a reconnect, so an add
+			// arriving here can be a peer doing exactly what BOLT 2 requires.
+			const actions = acceptor.handleUpdateAddHtlc(
+				inboundHtlc(acceptor, 1_000_000n)
+			);
+			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
+			expect(errorOf(actions)).to.match(/Unexpected update_add_htlc/);
+			expect(acceptor.getState()).to.not.equal(ChannelState.ERRORED);
+			void opener;
 		});
 	});
 });

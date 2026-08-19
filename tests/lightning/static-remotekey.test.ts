@@ -283,12 +283,14 @@ describe('Phase 3: option_static_remotekey', () => {
 			};
 
 			const actions = opener.handleAcceptChannel(fakeAcceptMsg);
-			expect(actions).to.have.lengthOf(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect(
-				(actions[0] as { type: ChannelActionType.ERROR; message: string })
-					.message
-			).to.include('Channel type mismatch');
+			// And the acceptor is told, rather than left in SENT_ACCEPT holding a
+			// burnt key index and waiting for a funding_created that will never come
+			// (issue 393).
+			expectWireRefusal(
+				actions,
+				opener.getTemporaryChannelId(),
+				/Channel type mismatch/
+			);
 		});
 
 		it('should accept matching channel type in accept_channel', () => {

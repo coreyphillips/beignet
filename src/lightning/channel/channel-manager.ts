@@ -5750,6 +5750,24 @@ export class ChannelManager extends EventEmitter {
 		return true;
 	}
 
+	/**
+	 * Apply an ERROR action's cleanup disposition. See IErrorAction.cleanup.
+	 *
+	 * Returns whether anything was removed, which is what gates the v2 pledge
+	 * release and the contained re-emit at the end of processActions.
+	 */
+	private cleanupForError(
+		peerPubkey: string,
+		channel: Channel,
+		cleanup: IErrorAction['cleanup']
+	): boolean {
+		if (cleanup === 'none') return false;
+		if (cleanup === 'lifecycle') {
+			return this.removeCurrentChannelLifecycle(peerPubkey, channel);
+		}
+		return this.removeCurrentTempChannel(peerPubkey, channel);
+	}
+
 	/** Remove a temporary channel only when this exact lifecycle still owns it. */
 	private removeCurrentTempChannel(
 		peerPubkey: string,
@@ -5920,7 +5938,10 @@ export class ChannelManager extends EventEmitter {
 				(dispatchProgress.completedIndex >= errorIndex ||
 					dispatchProgress.attemptedMessageTypes.has(MessageType.ERROR) ||
 					dispatchProgress.attemptedMessageTypes.has(MessageType.TX_ABORT)) &&
-				this.removeCurrentTempChannel(peerPubkey, channel)
+				// Honours the same disposition as the dispatch arm: a guard that
+				// refuses in order to PRESERVE a live negotiation must not have it
+				// deleted here instead when a listener throws mid-batch.
+				this.cleanupForError(peerPubkey, channel, errorAction.cleanup)
 			) {
 				this.emitContained(
 					'error',
@@ -6193,7 +6214,7 @@ export class ChannelManager extends EventEmitter {
 					// A channel that failed before funding has no permanent id yet, so
 					// fall back to the temporary one: without it the error carries a
 					// null channelId and cannot be tied back to the open it belongs to.
-					if (this.removeCurrentTempChannel(peerPubkey, channel)) {
+					if (this.cleanupForError(peerPubkey, channel, action.cleanup)) {
 						// A validation error just ended a tracked v2 open (an
 						// invalid peer contribution, a failed audit): its
 						// funding pledges release with it (issue #311).

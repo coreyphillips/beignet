@@ -24,31 +24,81 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import {
+	IChannelBasepoints,
+	perCommitmentPointFromSecret
+} from '../../src/lightning/keys/derivation';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
 import { decodeErrorMessage } from '../../src/lightning/message/error';
 import { IFundingProvider } from '../../src/lightning/node/types';
 
-function makeBasepoints(): IChannelBasepoints {
+/**
+ * Basepoints that MATCH the signing keys the node is configured with, and a
+ * first_per_commitment_point that matches its per-commitment seed.
+ *
+ * Both matter: the acceptor verifies our signature over its commitment #0
+ * against the funding_pubkey we advertised, and it builds that commitment from
+ * the point its own seed derives rather than the one it advertised. A fixture
+ * with unrelated random keys therefore produces a funding_created the acceptor
+ * MUST refuse. That used to be invisible (the refusal was a bare ERROR the
+ * peer never saw, issue 393), so this file passed while exercising a refused
+ * open rather than the successful one it describes.
+ */
+function makeKeys(seedId: number): {
+	basepoints: IChannelBasepoints;
+	fundingPrivkey: Buffer;
+	htlcSecret: Buffer;
+	perCommitmentSeed: Buffer;
+} {
+	const seed = crypto
+		.createHash('sha256')
+		.update(`abort-open-${seedId}`)
+		.digest();
+	const perCommitmentSeed = crypto
+		.createHash('sha256')
+		.update(seed)
+		.update(Buffer.from('pcs'))
+		.digest();
 	const keys: Buffer[] = [];
-	for (let i = 0; i < 5; i++) keys.push(crypto.randomBytes(32));
+	for (let i = 0; i < 5; i++) {
+		keys.push(
+			crypto
+				.createHash('sha256')
+				.update(seed)
+				.update(Buffer.from([i]))
+				.digest()
+		);
+	}
 	return {
-		fundingPubkey: getPublicKey(keys[0]),
-		revocationBasepoint: getPublicKey(keys[1]),
-		paymentBasepoint: getPublicKey(keys[2]),
-		delayedPaymentBasepoint: getPublicKey(keys[3]),
-		htlcBasepoint: getPublicKey(keys[4]),
-		firstPerCommitmentPoint: Buffer.alloc(33)
+		basepoints: {
+			fundingPubkey: getPublicKey(keys[0]),
+			revocationBasepoint: getPublicKey(keys[1]),
+			paymentBasepoint: getPublicKey(keys[2]),
+			delayedPaymentBasepoint: getPublicKey(keys[3]),
+			htlcBasepoint: getPublicKey(keys[4]),
+			firstPerCommitmentPoint: perCommitmentPointFromSecret(
+				generateFromSeed(perCommitmentSeed, MAX_INDEX)
+			)
+		},
+		fundingPrivkey: keys[0],
+		htlcSecret: keys[4],
+		perCommitmentSeed
 	};
 }
 
+let seedCounter = 0;
+
 function makeNode(fundingProvider?: IFundingProvider): LightningNode {
+	const { basepoints, fundingPrivkey, htlcSecret, perCommitmentSeed } =
+		makeKeys(seedCounter++);
 	const node = new LightningNode({
 		nodePrivateKey: crypto.randomBytes(32),
-		perCommitmentSeed: crypto.randomBytes(32),
-		channelBasepoints: makeBasepoints(),
-		fundingPrivkey: crypto.randomBytes(32),
+		perCommitmentSeed,
+		channelBasepoints: basepoints,
+		fundingPrivkey,
+		htlcBasepointSecret: htlcSecret,
 		fundingProvider
 	});
 	node.on('error', () => {});

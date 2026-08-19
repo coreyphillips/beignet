@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { expectWireFailure } from './helpers/open-refusal';
 import {
 	ChannelState,
 	ChannelRole,
@@ -130,9 +131,14 @@ describe('update_fee Balance Drain Protection', () => {
 		};
 
 		const actions = channel.handleUpdateFee(msg);
-		expect(actions.length).to.equal(1);
-		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-		expect((actions[0] as any).message).to.include('drain');
+		// Wire-visible: the opener must learn the rate was refused, or its next
+		// commitment_signed is built at a rate we never staged (issue 404).
+		expectWireFailure(
+			actions,
+			channel.getChannelId() ?? channel.getTemporaryChannelId(),
+			/drain/
+		);
+		expect(channel.getState()).to.equal(ChannelState.ERRORED);
 	});
 
 	it('accepts fee within opener balance', () => {
@@ -199,8 +205,14 @@ describe('update_fee Balance Drain Protection', () => {
 			feeratePerKw: 19000
 		};
 		const actions2 = channel.handleUpdateFee(msg2);
-		expect(actions2.length).to.equal(1);
-		expect(actions2[0].type).to.equal(ChannelActionType.ERROR);
+		// Wire-visible: the opener must learn the rate was refused, or its next
+		// commitment_signed is built at a rate we never staged (issue 404).
+		expectWireFailure(
+			actions2,
+			channel.getChannelId() ?? channel.getTemporaryChannelId(),
+			/drain/
+		);
+		expect(channel.getState()).to.equal(ChannelState.ERRORED);
 	});
 
 	it('accounts for anchor channel higher base weight', () => {
@@ -228,9 +240,14 @@ describe('update_fee Balance Drain Protection', () => {
 		};
 
 		const actions = channel.handleUpdateFee(msg);
-		expect(actions.length).to.equal(1);
-		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-		expect((actions[0] as any).message).to.include('drain');
+		// Wire-visible: the opener must learn the rate was refused, or its next
+		// commitment_signed is built at a rate we never staged (issue 404).
+		expectWireFailure(
+			actions,
+			channel.getChannelId() ?? channel.getTemporaryChannelId(),
+			/drain/
+		);
+		expect(channel.getState()).to.equal(ChannelState.ERRORED);
 	});
 });
 
@@ -261,8 +278,13 @@ describe('update_fee during shutdown (S-2.M6)', () => {
 			channelId: crypto.randomBytes(32),
 			feeratePerKw: 1000
 		});
+		// Control: the lifecycle guard is deliberately LOCAL-only, unlike every
+		// other arm of this handler. A closing channel's opener may simply not
+		// have seen our transition yet, and failing it would destroy a close
+		// that is going fine (issue 404).
 		expect(actions.length).to.equal(1);
 		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+		expect(channel.getState()).to.equal(ChannelState.CLOSED);
 	});
 });
 
@@ -293,9 +315,14 @@ describe('update_fee dust re-trim protection', () => {
 			channelId: crypto.randomBytes(32),
 			feeratePerKw: 20_000
 		});
-		expect(actions.length).to.equal(1);
-		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-		expect((actions[0] as any).message).to.include('dust HTLC exposure');
+		// Wire-visible: the opener must learn the rate was refused, or its next
+		// commitment_signed is built at a rate we never staged (issue 404).
+		expectWireFailure(
+			actions,
+			channel.getChannelId() ?? channel.getTemporaryChannelId(),
+			/dust HTLC exposure/
+		);
+		expect(channel.getState()).to.equal(ChannelState.ERRORED);
 	});
 
 	it('accepts the same update_fee when no in-flight HTLC would be trimmed', () => {
@@ -341,6 +368,8 @@ describe('update_fee dust re-trim protection', () => {
 		addCommittedHtlc(channel, 10_000_000n);
 
 		const actions = channel.updateFee(20_000);
+		// Control: our OWN updateFee is local API misuse, never on the wire, so
+		// it stays a bare ERROR and the channel stays healthy.
 		expect(actions.length).to.equal(1);
 		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
 		expect((actions[0] as any).message).to.include('dust HTLC exposure');

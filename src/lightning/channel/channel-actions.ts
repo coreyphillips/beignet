@@ -117,6 +117,26 @@ export interface IChannelClosedAction {
 export interface IErrorAction {
 	type: ChannelActionType.ERROR;
 	message: string;
+	/**
+	 * What the dispatcher should do with this channel's registration.
+	 *
+	 * Omitted keeps the historical behaviour: drop the TEMPORARY mapping, which
+	 * is right for a refusal that ends a pre-funding negotiation the manager
+	 * still keys by its temporary id.
+	 *
+	 * `'none'` drops nothing. For the handshake guards that fire on a REPLAYED or
+	 * MISROUTED message, dropping is the bug: those refusals exist to leave a
+	 * healthy negotiation alone, and the default would delete the very lifecycle
+	 * the guard is protecting.
+	 *
+	 * `'lifecycle'` drops the permanent registration too. A v1 opener is promoted
+	 * to its permanent id by createFunding, BEFORE a queued funding_signed
+	 * arrives, so a refusal there finds nothing under the temporary id and would
+	 * otherwise strand the channel in the permanent map in SENT_FUNDING_CREATED
+	 * forever. Only for a channel whose funding was never authorized for
+	 * broadcast.
+	 */
+	cleanup?: 'none' | 'lifecycle';
 }
 
 export interface IHtlcForwardedAction {

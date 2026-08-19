@@ -17,7 +17,12 @@ import { Channel } from '../../src/lightning/channel/channel';
 import { createAcceptorState } from '../../src/lightning/channel/channel-state';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
-import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import {
+	IChannelBasepoints,
+	perCommitmentPointFromSecret
+} from '../../src/lightning/keys/derivation';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
+import { realInitialCommitmentSig } from './helpers/real-signing';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IDualFundingParams } from '../../src/lightning/channel/dual-funding';
 import { ILeaseRates } from '../../src/lightning/gossip/types';
@@ -217,11 +222,33 @@ describe('Liquidity ads lessor safety', function () {
 });
 
 describe('Liquidity ads lessor channel_update fee cap', function () {
+	/**
+	 * Basepoints that MATCH the node's signing keys, with a
+	 * first_per_commitment_point derived from its per-commitment seed.
+	 *
+	 * Both matter: the acceptor verifies the opener's signature over its
+	 * commitment #0 against the advertised funding_pubkey, and it builds that
+	 * commitment from the point its own seed derives rather than the one it
+	 * advertised. Unrelated random keys make funding_created unverifiable, which
+	 * used to be invisible because the refusal never reached the wire (issue
+	 * 393) and let this fixture reach NORMAL on a refused open.
+	 */
 	function nodeConfig(seedId: number): INodeConfig {
 		const seed = crypto
 			.createHash('sha256')
 			.update(`lessor-fee-cap-${seedId}`)
 			.digest();
+		const perCommitmentSeed = crypto
+			.createHash('sha256')
+			.update(seed)
+			.update(Buffer.from('pcs'))
+			.digest();
+		const key = (i: number): Buffer =>
+			crypto
+				.createHash('sha256')
+				.update(seed)
+				.update(Buffer.from([i]))
+				.digest();
 		return {
 			nodePrivateKey: crypto
 				.createHash('sha256')
@@ -230,17 +257,19 @@ describe('Liquidity ads lessor channel_update fee cap', function () {
 				.digest(),
 			network: Network.REGTEST,
 			channelConfig: { ...DEFAULT_CHANNEL_CONFIG },
-			channelBasepoints: makeBasepoints(),
-			perCommitmentSeed: crypto
-				.createHash('sha256')
-				.update(seed)
-				.update(Buffer.from('pcs'))
-				.digest(),
-			fundingPrivkey: crypto
-				.createHash('sha256')
-				.update(seed)
-				.update(Buffer.from([0]))
-				.digest()
+			channelBasepoints: {
+				fundingPubkey: getPublicKey(key(0)),
+				revocationBasepoint: getPublicKey(key(1)),
+				paymentBasepoint: getPublicKey(key(2)),
+				delayedPaymentBasepoint: getPublicKey(key(3)),
+				htlcBasepoint: getPublicKey(key(4)),
+				firstPerCommitmentPoint: perCommitmentPointFromSecret(
+					generateFromSeed(perCommitmentSeed, MAX_INDEX)
+				)
+			},
+			perCommitmentSeed,
+			fundingPrivkey: key(0),
+			htlcBasepointSecret: key(4)
 		};
 	}
 
@@ -255,7 +284,15 @@ describe('Liquidity ads lessor channel_update fee cap', function () {
 		});
 		const ch = a.openChannel(b.getNodeId(), 1_000_000n);
 		const txid = crypto.randomBytes(32);
-		const channelId = a.createFunding(ch, txid, 0, crypto.randomBytes(64))!;
+		// A REAL signature over the acceptor's commitment #0: it verifies this
+		// before answering funding_signed, and since issue 393 it says so on the
+		// wire, which ends the open instead of silently half-opening it.
+		const channelId = a.createFunding(
+			ch,
+			txid,
+			0,
+			realInitialCommitmentSig(ch, txid, 0)
+		)!;
 		a.handleFundingConfirmed(channelId);
 		b.handleFundingConfirmed(channelId);
 		return channelId;

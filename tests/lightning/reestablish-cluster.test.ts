@@ -33,6 +33,7 @@ import {
 	HtlcState
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { expectWireFailure } from './helpers/open-refusal';
 import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -315,21 +316,9 @@ describe('S-2.H5: uncommitted remote updates reversed on disconnect', function (
 		t.A().addHtlc(t.channelId, 1_000_000n, hash, 900, Buffer.alloc(1366));
 		expect(t.errors, t.errors.join('; ')).to.have.length(0);
 
-		const actions = t.bChannel().handleUpdateAddHtlc({
-			channelId: t.channelId,
-			id: 0n,
-			amountMsat: 3_000_000n,
-			paymentHash: sha256(Buffer.from('other')),
-			cltvExpiry: 950,
-			onionRoutingPacket: Buffer.alloc(1366)
-		});
-		const err = actions.find((a) => a.type === ChannelActionType.ERROR) as
-			| { message: string }
-			| undefined;
-		expect(err, 'channel failed on the collision').to.not.equal(undefined);
-		expect(err!.message).to.match(/reuses id/);
-
-		// A byte-identical replay stays a no-op.
+		// The byte-identical replay FIRST: it is the tolerated case, and the
+		// collision below now fails the channel, so a replay run after it would
+		// only reach the lifecycle guard.
 		const committed = t.bChannel().getFullState().htlcs.get('received-0')!;
 		const replay = t.bChannel().handleUpdateAddHtlc({
 			channelId: t.channelId,
@@ -340,6 +329,20 @@ describe('S-2.H5: uncommitted remote updates reversed on disconnect', function (
 			onionRoutingPacket: committed.onionRoutingPacket
 		});
 		expect(replay).to.have.length(0);
+
+		const actions = t.bChannel().handleUpdateAddHtlc({
+			channelId: t.channelId,
+			id: 0n,
+			amountMsat: 3_000_000n,
+			paymentHash: sha256(Buffer.from('other')),
+			cltvExpiry: 950,
+			onionRoutingPacket: Buffer.alloc(1366)
+		});
+		// "Fails the channel" is now literally true, and A hears about it: a bare
+		// ERROR proved only that WE stopped, while the peer kept the add in its
+		// book and the desync surfaced a round later (issue 404).
+		expectWireFailure(actions, t.channelId, /reuses id/);
+		expect(t.bChannel().getState()).to.equal(ChannelState.ERRORED);
 	});
 
 	it('reverses an uncommitted remote fulfill: HTLC restored, replay settles once', function () {
