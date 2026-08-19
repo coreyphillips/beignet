@@ -6580,7 +6580,10 @@ export class LightningNode extends EventEmitter {
 			!state.spliceInFlight
 		) {
 			if (retired) this.persistChannel(channelId);
-			this.handleChannelErrored(channelId, 'funding confirmed for failed channel');
+			this.handleChannelErrored(
+				channelId,
+				'funding confirmed for failed channel'
+			);
 			return;
 		}
 		const inflight = state.spliceInFlight;
@@ -16631,7 +16634,9 @@ export class LightningNode extends EventEmitter {
 								this.emit('node:error', {
 									code: 'ERRORED_TIMEOUT_FORCE_CLOSED',
 									channelId,
-									message: `Channel ${channelId.toString('hex')} ERRORED for > ${
+									message: `Channel ${channelId.toString(
+										'hex'
+									)} ERRORED for > ${
 										this.reestablishTimeoutBlocks
 									} blocks with no close from the peer; force-closing to recover funds`,
 									timestamp: Date.now()

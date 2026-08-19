@@ -450,7 +450,10 @@ describe('Issue #175: a BOLT 1 error fails the channel on chain', function () {
 
 // ─── Issue #413: no close against an outpoint not known to exist ───
 
-function openUnconfirmedChannel(alice: LightningNode, bob: LightningNode): Buffer {
+function openUnconfirmedChannel(
+	alice: LightningNode,
+	bob: LightningNode
+): Buffer {
 	// openReadyChannel minus the handleFundingConfirmed calls: funded (both
 	// commitment signatures exchanged), fundingTxid set, nothing on chain.
 	const channel = alice.openChannel(bob.getNodeId(), 1_000_000n);
