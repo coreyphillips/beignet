@@ -670,6 +670,14 @@ export interface IChannelState {
 	 */
 	dataLossDetected?: boolean;
 	/**
+	 * The funding tx reached minimumDepth while the channel was already
+	 * ERRORED (the chain watcher's depth callback is one-shot and the ready
+	 * flow cannot consume it there). Read by the node's failure-resolution
+	 * paths (issue #413): once set, the commitment broadcast spends an
+	 * outpoint that provably exists.
+	 */
+	fundingConfirmedWhileErrored?: boolean;
+	/**
 	 * Recovery 5.6 StateUncertain: this state was restored from replicas that
 	 * cannot be proven current (guardian replication is best effort until the
 	 * Phase 6 barriers), so the stored local commitment may be revoked in the

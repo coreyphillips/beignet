@@ -6568,6 +6568,21 @@ export class LightningNode extends EventEmitter {
 			void this.redriveSpliceAdoptedClose(channelId);
 			return;
 		}
+		// Issue #413: a v1 channel failed by a BOLT 1 error before its funding
+		// confirmed skipped its commitment broadcast. The outpoint exists now
+		// (fundingConfirmed just stamped it durably, via the watcher's
+		// channelManager.handleFundingConfirmed call): drive the close it
+		// owes. handleChannelErrored re-checks every guard, so this is
+		// idempotent.
+		if (
+			channel.getState() === ChannelState.ERRORED &&
+			state.fundingVersion === 1 &&
+			!state.spliceInFlight
+		) {
+			if (retired) this.persistChannel(channelId);
+			this.handleChannelErrored(channelId, 'funding confirmed for failed channel');
+			return;
+		}
 		const inflight = state.spliceInFlight;
 		const spliceConfirmed =
 			inflight != null &&
@@ -7822,6 +7837,19 @@ export class LightningNode extends EventEmitter {
 
 	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: string): void {
 		this.channelManager.handleFundingConfirmed(channelId, confirmedTxidHex);
+		// Issue #413: manually driven chains have no watcher event to
+		// re-drive the close an ERRORED v1 channel skipped while its funding
+		// was unconfirmed. fundingConfirmed just stamped the proof; drive it.
+		const channel = this.channelManager.getChannel(channelId);
+		if (
+			channel?.getState() === ChannelState.ERRORED &&
+			channel.getFullState().fundingVersion === 1
+		) {
+			this.handleChannelErrored(
+				channelId,
+				'funding confirmed for failed channel'
+			);
+		}
 	}
 
 	closeChannel(
@@ -14911,6 +14939,25 @@ export class LightningNode extends EventEmitter {
 			});
 			return;
 		}
+		if (
+			state.fundingVersion === 1 &&
+			!this.erroredFundingKnownOnChain(channel, state)
+		) {
+			// A v1 open failed before its funding is known on chain (acceptor:
+			// the opener may never publish; manual opener: we cannot see the
+			// mempool). A commitment spending an outpoint that may not exist
+			// cannot "close on chain": the broadcast fails or hangs while the
+			// node reports a close that did not happen. Leave the channel
+			// ERRORED: fundingConfirmed stamps the confirmation durably and
+			// re-drives this close, and the funding-missing clock
+			// (FUNDING_FORGET_BLOCKS) retires the channel if the funding
+			// never appears. Skip, do NOT void (issue #413).
+			this.emitStructuredLog('channel', 'errored_funding_not_on_chain', {
+				channelId: channelId.toString('hex'),
+				reason
+			});
+			return;
+		}
 		const result = this._forceCloseWithReason(
 			channelId,
 			this.getSweepDestinationScript(),
@@ -14944,6 +14991,26 @@ export class LightningNode extends EventEmitter {
 			channelId: channelId.toString('hex'),
 			reason
 		});
+	}
+
+	/**
+	 * The issue-#413 gate for closing an ERRORED v1 channel on chain: the
+	 * channel's own persisted evidence, OR the opener carve-out - WE staged
+	 * this funding tx and its broadcast is authorized
+	 * (retryPendingFundingBroadcasts pushes it every block), so the outpoint
+	 * is ours to create and a commitment on top of the mempool parent is a
+	 * legitimate exit. Covers the zero-conf opener, whose ready flags carry
+	 * no chain evidence. Process-local by design: channel state must never
+	 * BE the broadcast authorization. 'candidate' and 'restored' entries
+	 * answer false - the tx may never have left this process.
+	 */
+	private erroredFundingKnownOnChain(
+		channel: Channel,
+		state: IChannelState
+	): boolean {
+		if (channel.isFundingKnownOnChain()) return true;
+		const txidHex = state.fundingTxid!.toString('hex');
+		return this.pendingFundingTxs.get(txidHex)?.phase === 'authorized';
 	}
 
 	/**
@@ -16534,24 +16601,44 @@ export class LightningNode extends EventEmitter {
 				} else {
 					const startHeight = this._stuckChannelTracker.get(erroredKey)!;
 					if (blockHeight - startHeight > this.reestablishTimeoutBlocks) {
-						try {
-							this._forceCloseWithReason(
-								channelId,
-								this.getSweepDestinationScript(),
-								this.resolveForceCloseFeeRatePerVbyte(),
-								'ERRORED_TIMEOUT_FORCE_CLOSED'
+						if (
+							state.fundingVersion === 1 &&
+							!this.erroredFundingKnownOnChain(channel, state)
+						) {
+							// Issue #413: the outpoint is not known to exist, so
+							// the timeout has served but the close cannot happen
+							// yet. KEEP the tracker: the close fires on the first
+							// block after the funding is known on chain; if it
+							// never appears, the funding-missing clock
+							// (FUNDING_FORGET_BLOCKS) retires the channel instead.
+							this.emitStructuredLog(
+								'channel',
+								'errored_funding_not_on_chain',
+								{
+									channelId: channelId.toString('hex'),
+									waitedBlocks: blockHeight - startHeight
+								}
 							);
-							this._stuckChannelTracker.delete(erroredKey);
-							this.emit('node:error', {
-								code: 'ERRORED_TIMEOUT_FORCE_CLOSED',
-								channelId,
-								message: `Channel ${channelId.toString('hex')} ERRORED for > ${
-									this.reestablishTimeoutBlocks
-								} blocks with no close from the peer; force-closing to recover funds`,
-								timestamp: Date.now()
-							} as ILightningError);
-						} catch {
-							// Ignore force-close errors
+						} else {
+							try {
+								this._forceCloseWithReason(
+									channelId,
+									this.getSweepDestinationScript(),
+									this.resolveForceCloseFeeRatePerVbyte(),
+									'ERRORED_TIMEOUT_FORCE_CLOSED'
+								);
+								this._stuckChannelTracker.delete(erroredKey);
+								this.emit('node:error', {
+									code: 'ERRORED_TIMEOUT_FORCE_CLOSED',
+									channelId,
+									message: `Channel ${channelId.toString('hex')} ERRORED for > ${
+										this.reestablishTimeoutBlocks
+									} blocks with no close from the peer; force-closing to recover funds`,
+									timestamp: Date.now()
+								} as ILightningError);
+							} catch {
+								// Ignore force-close errors
+							}
 						}
 					}
 				}

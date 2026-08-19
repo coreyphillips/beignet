@@ -426,6 +426,10 @@ export interface ISerializedChannelState {
 	// behind would otherwise forget the flag and let a force-close broadcast
 	// our stale (revoked) commitment.
 	dataLossDetected?: boolean;
+	// Issue #413: the funding confirmed while the channel was ERRORED. MUST
+	// persist - it is the durable proof the outpoint exists that lets a
+	// restart's failure-resolution paths broadcast the owed close.
+	fundingConfirmedWhileErrored?: boolean;
 	// Recovery 5.6 StateUncertain: MUST persist for the same reason - a
 	// restart of a possibly-stale restore must not forget that broadcasting
 	// is forbidden until reestablish proves the state current.
@@ -826,6 +830,7 @@ export function serializeChannelState(
 		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
 		dataLossDetected: s.dataLossDetected,
+		fundingConfirmedWhileErrored: s.fundingConfirmedWhileErrored,
 		stateUncertain: s.stateUncertain,
 		recoveryCloseReason: s.recoveryCloseReason,
 		closeReason: s.closeReason,
@@ -1014,6 +1019,7 @@ export function deserializeChannelState(
 		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
 		dataLossDetected: s.dataLossDetected,
+		fundingConfirmedWhileErrored: s.fundingConfirmedWhileErrored,
 		stateUncertain: s.stateUncertain,
 		recoveryCloseReason: s.recoveryCloseReason,
 		closeReason: s.closeReason,

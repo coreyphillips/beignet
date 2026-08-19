@@ -447,3 +447,94 @@ describe('Issue #175: a BOLT 1 error fails the channel on chain', function () {
 		fx.bob.destroy();
 	});
 });
+
+// ─── Issue #413: no close against an outpoint not known to exist ───
+
+function openUnconfirmedChannel(alice: LightningNode, bob: LightningNode): Buffer {
+	// openReadyChannel minus the handleFundingConfirmed calls: funded (both
+	// commitment signatures exchanged), fundingTxid set, nothing on chain.
+	const channel = alice.openChannel(bob.getNodeId(), 1_000_000n);
+	return alice.createFunding(
+		channel,
+		crypto.randomBytes(32),
+		0,
+		crypto.randomBytes(64)
+	)!;
+}
+
+function setupUnconfirmed(seedBase: number): IFixture {
+	const alice = createNode(seedBase);
+	const bob = createNode(seedBase + 1);
+	connectNodes(alice, bob);
+	const channelId = openUnconfirmedChannel(alice, bob);
+	const events: string[] = [];
+	alice.on('node:error', (err: any) => events.push(err.code));
+	return {
+		alice,
+		bob,
+		channelId,
+		events,
+		aliceState: () =>
+			(alice as any).channelManager.getChannel(channelId).getFullState().state
+	};
+}
+
+describe('Issue #413: a v1 channel with unconfirmed funding is not closed on chain', function () {
+	this.timeout(10_000);
+
+	it('skips the broadcast and leaves the channel ERRORED', () => {
+		// The commitment spends an outpoint that may not exist (the acceptor's
+		// opener may never publish). Broadcasting it fails or hangs while the
+		// node reports a close that did not happen.
+		const fx = setupUnconfirmed(91);
+
+		sendErrorToAlice(fx, fx.channelId);
+
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSE_FAILED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('drives the skipped close the moment the funding confirms', () => {
+		const fx = setupUnconfirmed(93);
+
+		sendErrorToAlice(fx, fx.channelId);
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+
+		// The embedder reports the confirmation: fundingConfirmed stamps the
+		// proof durably and the node re-drives the close it owed.
+		fx.alice.handleFundingConfirmed(fx.channelId);
+
+		expect(fx.aliceState()).to.equal(ChannelState.FORCE_CLOSED);
+		expect(fx.events).to.include('CHANNEL_FAILED_FORCE_CLOSED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('the ERRORED block backstop waits for the stamp, then fires', () => {
+		// Covers the restart/watcher-less shape: the confirmation is stamped
+		// through the manager alone (no node-level re-drive), and the per-block
+		// backstop picks it up because the skip kept the tracker armed.
+		const fx = setupUnconfirmed(95);
+		const HEIGHT = 800_000;
+		const timeout = (fx.alice as any).reestablishTimeoutBlocks;
+
+		sendErrorToAlice(fx, fx.channelId);
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+
+		(fx.alice as any).scanStuckChannels(HEIGHT);
+		(fx.alice as any).scanStuckChannels(HEIGHT + timeout + 1);
+		expect(fx.events).to.not.include('ERRORED_TIMEOUT_FORCE_CLOSED');
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+
+		(fx.alice as any).channelManager.handleFundingConfirmed(fx.channelId);
+		(fx.alice as any).scanStuckChannels(HEIGHT + timeout + 2);
+
+		expect(fx.events).to.include('ERRORED_TIMEOUT_FORCE_CLOSED');
+		expect(fx.aliceState()).to.equal(ChannelState.FORCE_CLOSED);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+});

@@ -2368,6 +2368,20 @@ export class Channel {
 				this._state.v2InFlight.confirmed = true;
 				return [...prefix, { type: ChannelActionType.PERSIST_STATE }];
 			}
+			// A v1 channel already failed by a BOLT 1 error: the ready flow
+			// cannot run, but the depth callback is one-shot, so record
+			// durably that the outpoint now exists. The node's failure
+			// resolution (handleChannelErrored and the ERRORED block
+			// backstop) keys off this to broadcast the exit it skipped while
+			// the funding was not on chain (issue #413).
+			if (
+				this._state.state === ChannelState.ERRORED &&
+				!this._state.v2InFlight &&
+				!this._state.fundingConfirmedWhileErrored
+			) {
+				this._state.fundingConfirmedWhileErrored = true;
+				return [...prefix, { type: ChannelActionType.PERSIST_STATE }];
+			}
 			return prefix;
 		}
 		// One attempt reached depth, so every other attempt of this open is
@@ -16315,6 +16329,35 @@ export class Channel {
 			rec.fullySigned ||
 			(rec.ourWalletInputIndices.length === 0 && rec.ourWitnesses.length === 0)
 		);
+	}
+
+	/**
+	 * Whether this channel holds affirmative, persisted evidence that its
+	 * funding transaction reached the chain (issue #413). Answers from
+	 * channel state only; the node composes its process-local knowledge (a
+	 * funding broadcast we ourselves authorized) at the call site. Like
+	 * isV2AttemptBroadcastable, every consumer must fail toward KEEPING
+	 * state: "unknown" answers false, and false means skip the commitment
+	 * broadcast, never fabricate a close.
+	 */
+	isFundingKnownOnChain(): boolean {
+		const s = this._state;
+		// Announcement depth (6 confs, stamped while NORMAL): definitive.
+		if (s.shortChannelId != null || s.fundingConfirmationHeight > 0) {
+			return true;
+		}
+		// Depth reached after the channel had already failed (issue #413).
+		if (s.fundingConfirmedWhileErrored === true) return true;
+		// v2: confirmation is stamped durably on the attempt records.
+		if (this._v2AnyAttemptConfirmed()) return true;
+		// The zero-conf fast-track sets BOTH ready flags with no chain
+		// evidence (the fundingConfirmed short-circuit at funding_signed),
+		// so the flags only count when the ready flow required real depth.
+		if (s.zeroConfEnabled && s.trustedPeer) return false;
+		// localChannelReady: our own watcher saw minimumDepth.
+		// remoteChannelReady: the peer's channel_ready, which BOLT 2 permits
+		// only at depth - the same claim the NORMAL transition trusts.
+		return s.localChannelReady || s.remoteChannelReady;
 	}
 
 	/**
