@@ -75,7 +75,8 @@ import { encodeErrorMessage } from '../message/error';
 import {
 	ChannelAction,
 	ChannelActionType,
-	ISendMessageAction
+	ISendMessageAction,
+	IErrorAction
 } from './channel-actions';
 import {
 	ChannelState,
@@ -289,41 +290,59 @@ function declMsg(
  * side keys this negotiation by, so the wire scope and the local cleanup can
  * never name different entries.
  *
- * Two ids are refused locally instead of answered, for the reason
- * ChannelManager.refuseInboundOpen refuses them. BOLT 1 reserves the all-zero
- * channel_id for "all channels with this peer", so echoing one turns the
- * refusal of a single negotiation into an instruction to fail every channel we
- * have with the sender. And a length encodeErrorMessage will not accept would
- * throw out of a refusal arm, losing the local unwind along with the send.
- * Suppressed HERE rather than at each caller because every refusal of this
- * class routes through it, and a caller-side check protects only the caller
- * that remembers to make it. The refusal still stands, just silently: there is
- * no id we could answer under that means what we mean.
+ * `cleanup` says what the dispatcher should do with this channel's
+ * registration; see IErrorAction.
  *
  * For a channel that already has a life of its own, _failChannelWithWireError
- * is the heavier shape: it marks ERRORED and persists first.
+ * is the heavier shape: it marks ERRORED and persists first. Both route their
+ * wire half through wireErrorFor, so the scope rule below is the same one.
  */
 function refuseWithWireError(
 	channelId: Buffer,
-	reason: string
+	reason: string,
+	cleanup?: IErrorAction['cleanup']
 ): ChannelAction[] {
-	const local: ChannelAction = {
+	const local: IErrorAction = {
 		type: ChannelActionType.ERROR,
-		message: reason
+		message: reason,
+		...(cleanup ? { cleanup } : {})
 	};
+	const wire = wireErrorFor(channelId, reason);
+	return wire ? [wire, local] : [local];
+}
+
+/**
+ * The wire half of a refusal, or null when this id cannot carry one.
+ *
+ * Two ids are refused locally instead of answered, for the reason
+ * ChannelManager.refuseInboundOpen refuses them. BOLT 1 reserves the all-zero
+ * channel_id for "all channels with this peer", so echoing one turns the
+ * refusal of a single channel into an instruction to fail every channel we have
+ * with the sender. And a length encodeErrorMessage will not accept would THROW,
+ * which is worse than silence at either call site: out of a refusal arm it
+ * loses the local unwind along with the send, and out of _failChannelWithWireError
+ * it escapes after the channel has already been marked ERRORED, so the caller
+ * gets no actions at all for a channel that is now failed.
+ *
+ * Suppressed HERE rather than at each caller because every wire refusal in this
+ * file routes through it, and a caller-side check protects only the caller that
+ * remembers to make it. The refusal or the failure still stands, just silently:
+ * there is no id we could answer under that means what we mean.
+ */
+function wireErrorFor(
+	channelId: Buffer,
+	reason: string
+): ISendMessageAction | null {
 	if (channelId.length !== 32 || channelId.every((b) => b === 0)) {
-		return [local];
+		return null;
 	}
-	return [
-		sendMsg(
-			MessageType.ERROR,
-			encodeErrorMessage({
-				channelId,
-				data: Buffer.from(reason, 'ascii')
-			})
-		),
-		local
-	];
+	return sendMsg(
+		MessageType.ERROR,
+		encodeErrorMessage({
+			channelId,
+			data: Buffer.from(reason, 'ascii')
+		})
+	);
 }
 
 /**
@@ -1433,8 +1452,15 @@ export class Channel {
 			// what a retransmitting peer sends. A wire error scoped to that id would
 			// cancel an open the peer believes is healthy. Every refusal of a LIVE
 			// accept_channel below is wire-visible instead (issue 393).
+			// cleanup 'none': the manager drops the temporary channel for EVERY
+			// local ERROR, so the default would delete the very negotiation this
+			// guard exists to leave alone.
 			return [
-				{ type: ChannelActionType.ERROR, message: 'Unexpected accept_channel' }
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected accept_channel',
+					cleanup: 'none'
+				}
 			];
 		}
 
@@ -1447,10 +1473,14 @@ export class Channel {
 			// one we do not own, and answering under it would cancel a stranger's
 			// negotiation. This arm is also what makes msg.temporaryChannelId equal
 			// to ours for every arm below.
+			// cleanup 'none': the manager drops the temporary channel for EVERY
+			// local ERROR, so the default would delete the very negotiation this
+			// guard exists to leave alone.
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'temporary_channel_id mismatch'
+					message: 'temporary_channel_id mismatch',
+					cleanup: 'none'
 				}
 			];
 		}
@@ -1642,8 +1672,15 @@ export class Channel {
 			// wire error there would kill a channel that is genuinely opening. Every
 			// refusal of a LIVE funding_signed below is wire-visible instead
 			// (issue 393).
+			// cleanup 'none': the manager drops the temporary channel for EVERY
+			// local ERROR, so the default would delete the very negotiation this
+			// guard exists to leave alone.
 			return [
-				{ type: ChannelActionType.ERROR, message: 'Unexpected funding_signed' }
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected funding_signed',
+					cleanup: 'none'
+				}
 			];
 		}
 
@@ -1652,10 +1689,14 @@ export class Channel {
 			// msg.channelId (findChannelByChannelId, then the temp scan), so reaching
 			// this arm means the id it resolved through and the channel's own id
 			// disagree. The id in the message is one we do not own.
+			// cleanup 'none': the manager drops the temporary channel for EVERY
+			// local ERROR, so the default would delete the very negotiation this
+			// guard exists to leave alone.
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'channel_id mismatch in funding_signed'
+					message: 'channel_id mismatch in funding_signed',
+					cleanup: 'none'
 				}
 			];
 		}
@@ -1687,10 +1728,19 @@ export class Channel {
 		// watch was ever armed, and nothing reaps such a row. And that helper
 		// persists FIRST, so a failed persist would withhold the very error this
 		// arm exists to send.
+		//
+		// cleanup 'lifecycle', which is what makes the local half work at all here.
+		// createFunding promoted this channel to its PERMANENT id before a queued
+		// funding_signed could arrive, so the default temporary-id drop finds
+		// nothing and the opener would sit in this.channels in
+		// SENT_FUNDING_CREATED forever: refused at the peer, immortal locally. The
+		// funding transaction was never authorized for broadcast, so dropping the
+		// whole registration is the correct unwind.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(
 				this._state.channelId ?? this._state.temporaryChannelId,
-				reason
+				reason,
+				'lifecycle'
 			);
 
 		// Verify the acceptor's signature on our INITIAL commitment (#0) BEFORE
@@ -2025,8 +2075,15 @@ export class Channel {
 			// scoped to that id would cancel a negotiation the opener believes is
 			// healthy. Every refusal of a LIVE funding_created below is wire-visible
 			// instead (issue 393).
+			// cleanup 'none': the manager drops the temporary channel for EVERY
+			// local ERROR, so the default would delete the very negotiation this
+			// guard exists to leave alone.
 			return [
-				{ type: ChannelActionType.ERROR, message: 'Unexpected funding_created' }
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected funding_created',
+					cleanup: 'none'
+				}
 			];
 		}
 
@@ -2036,10 +2093,14 @@ export class Channel {
 			// the map key and the channel's own id disagree: an internal routing
 			// inconsistency, or a caller handing this Channel a message belonging to
 			// another open. The id in the message is one we do not own.
+			// cleanup 'none': the manager drops the temporary channel for EVERY
+			// local ERROR, so the default would delete the very negotiation this
+			// guard exists to leave alone.
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'temporary_channel_id mismatch'
+					message: 'temporary_channel_id mismatch',
+					cleanup: 'none'
 				}
 			];
 		}
@@ -2651,23 +2712,52 @@ export class Channel {
 	 * Handle update_add_htlc from remote (received HTLC).
 	 */
 	handleUpdateAddHtlc(msg: IUpdateAddHtlcMessage): ChannelAction[] {
+		// An add that crossed OUR OWN shutdown on the wire. BOLT 2 forbids an add
+		// only AFTER the peer has received our shutdown, and until it sends its own
+		// we have no evidence it has: its add may have left before ours arrived.
+		// Such an add MUST be recorded. Dropping it does not spare the channel, it
+		// only mislabels its death: the peer's covering commitment_signed is then
+		// verified against a commitment that lacks the HTLC, fails, and
+		// handleCommitmentSigned fails the channel over an "invalid signature"
+		// that was never invalid. handleCommitmentSigned accepts SHUTTING_DOWN for
+		// exactly this reason, and BOLT 2 requires the shutdown to wait for
+		// in-flight HTLCs to resolve before closing_signed.
+		const crossedOurShutdown =
+			this._state.state === ChannelState.SHUTTING_DOWN &&
+			this._state.remoteShutdownScript === null;
+
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			!this.canUpdateHtlcsDuringSplice()
+			!this.canUpdateHtlcsDuringSplice() &&
+			!crossedOurShutdown
 		) {
-			// Deliberately LOCAL-only, the carve-out handleOpenChannel makes for the
-			// same reason. Every OTHER refusal below is wire-visible (issue 404),
-			// because the peer's book provably diverges the moment we return. This one
-			// is different: a legal message can produce it. We move to SHUTTING_DOWN,
-			// CLOSING or SPLICING unilaterally, and the peer's add may already have
-			// been in flight when the transition left. BOLT 2 forbids an add only AFTER
-			// the peer has received our shutdown, so the crossing is conformant and
-			// unavoidable; failing the channel here would force close a well-behaved
-			// peer over a race, and on a CLOSING or SPLICING channel it would destroy
-			// something legitimately in progress. A NORMAL channel never reaches this
-			// arm, so nothing issue 404 is about is hidden behind it.
+			// Every OTHER refusal in this handler is wire-visible (issue 404). This
+			// one stays LOCAL even once the peer has provably bound itself, and that
+			// is a decision rather than the carve-out it looks like:
+			//
+			//  - Nothing cascades from it. In NEGOTIATING_CLOSING, CLOSED or
+			//    SPLICING the covering commitment_signed is refused by
+			//    handleCommitmentSigned's own state gate, or routed to the splice
+			//    batch path, so the add stalls and nothing is force closed. That is
+			//    the opposite of the SHUTTING_DOWN case carved out above, where the
+			//    commitment IS verified and the channel dies on a signature that was
+			//    never wrong. Only that case needed fixing.
+			//  - Wire-failing here would force close CONFORMANT peers.
+			//    handleReestablish replays every queued update_add_htlc after a
+			//    reconnect (BOLT 2: "Retransmit un-acked update messages"), and
+			//    remoteShutdownScript is persisted, so a peer retransmitting an
+			//    unrevoked add into a shutting-down channel is doing exactly what
+			//    the spec tells it to. Mid-splice the same: this implementation
+			//    parks TAPROOT channels in quiescence for the whole pending-lock
+			//    window (canUpdateHtlcsDuringSplice), longer than the splicing spec
+			//    requires, so a conformant taproot peer resuming updates there would
+			//    be condemned for our own conservatism.
 			return [
-				{ type: ChannelActionType.ERROR, message: 'Unexpected update_add_htlc' }
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected update_add_htlc',
+					cleanup: 'none'
+				}
 			];
 		}
 
@@ -2709,6 +2799,9 @@ export class Channel {
 		// needs handleStfuMessage to stop refusing the peer's stfu reply when HTLCs
 		// are pending, plus BOLT 2's 60-second quiescence disconnect, neither of
 		// which exists yet.
+		// Reached from NORMAL (a quiescence handshake that has not moved the
+		// channel state yet); the lifecycle guard above already answered the same
+		// question for a channel that has moved.
 		if (this._quiescence.peerHasSentStfu()) {
 			return this._failChannelWithWireError('update_add_htlc after your stfu');
 		}
@@ -4450,15 +4543,20 @@ export class Channel {
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
 			!this.isSplicePendingLock()
 		) {
-			// Deliberately LOCAL-only, the same carve-out handleUpdateAddHtlc's state
-			// guard makes. Every OTHER refusal below is wire-visible (issue 404), but
-			// a legal message can produce this one: we move to CLOSING, ERRORED or an
-			// unlocked splice unilaterally, and the opener's update_fee may already
-			// have been in flight. Failing the channel here would force close a
-			// conformant peer over a race, and on a closing channel it would destroy a
-			// close that is going fine.
+			// Same split as handleUpdateAddHtlc's lifecycle guard. There is no
+			// crossing case to carve out here, because update_fee is legal during
+			// shutdown and SHUTTING_DOWN never reaches this arm; what is left is a
+			// channel that has moved to CLOSING, ERRORED or an unlocked splice.
+			// LOCAL for the reasons handleUpdateAddHtlc's guard sets out: nothing
+			// cascades from a refused update_fee in these states, and update_fee is
+			// itself replayed by handleReestablish, so wire-failing it would condemn
+			// a peer doing what BOLT 2 requires.
 			return [
-				{ type: ChannelActionType.ERROR, message: 'Unexpected update_fee' }
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected update_fee',
+					cleanup: 'none'
+				}
 			];
 		}
 
@@ -6688,7 +6786,10 @@ export class Channel {
 	 *    the quiescence guard. There the peer may be entirely conformant and
 	 *    simply not yet have seen the transition we made.
 	 */
-	private _failChannelWithWireError(message: string): ChannelAction[] {
+	private _failChannelWithWireError(
+		message: string,
+		cleanup?: IErrorAction['cleanup']
+	): ChannelAction[] {
 		// A hostile or malformed message can fail a channel whose safety
 		// flags already forbid broadcasting (a restored uncertain channel
 		// sent garbage counters, say). The peer-close disposition must ride
@@ -6697,16 +6798,21 @@ export class Channel {
 		this._ensureRecoveryCloseDisposition();
 		this._state.state = ChannelState.ERRORED;
 		const channelId = this._state.channelId ?? this._state.temporaryChannelId;
+		// Same scope rule as every other wire refusal. When the id cannot carry
+		// one, the channel is still failed and persisted locally; what is lost is
+		// only the peer's notification, and with it the channel:errored emit that
+		// rides the send, so no close is driven until the next restart reads the
+		// ERRORED row. That is the correct trade against telling a peer to fail
+		// every channel it has with us.
+		const wire = wireErrorFor(channelId, message);
 		return [
 			{ type: ChannelActionType.PERSIST_STATE },
-			sendMsg(
-				MessageType.ERROR,
-				encodeErrorMessage({
-					channelId,
-					data: Buffer.from(message, 'ascii')
-				})
-			),
-			{ type: ChannelActionType.ERROR, message }
+			...(wire ? [wire] : []),
+			{
+				type: ChannelActionType.ERROR,
+				message,
+				...(cleanup ? { cleanup } : {})
+			} as IErrorAction
 		];
 	}
 

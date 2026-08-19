@@ -53,8 +53,12 @@ import { BITCOIN_CHAIN_HASH } from '../../src/lightning/channel/types';
 import {
 	seedKey,
 	signerFromSeed,
-	realInitialCommitmentSig
+	realInitialCommitmentSig,
+	realCommitmentSigs
 } from './helpers/real-signing';
+import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
+import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 
 function realBasepoints(seed?: Buffer): IChannelBasepoints {
 	// With a seed, derive with the seedKey convention so signerFromSeed(seed)
@@ -854,6 +858,113 @@ describe('BOLT 2 LOW hardening batch', function () {
 			expect(res.ok).to.equal(false);
 			expect(res.error).to.match(/Channel not found/);
 			node.destroy();
+		});
+	});
+
+	describe('an add that crossed our own shutdown (issue 404)', function () {
+		// BOLT 2 forbids update_add_htlc only AFTER the peer has received our
+		// shutdown. Until it sends its own we have no evidence it has, so an add
+		// that left before ours arrived is conformant and MUST be recorded.
+		// Dropping it does not spare the channel; it only mislabels its death.
+
+		/**
+		 * normalPair hands each side a RANDOM secondPerCommitmentPoint for the
+		 * peer, which is fine for tests that never run a commitment round but makes
+		 * one impossible: the two sides then build different scripts and every
+		 * signature mismatches. Replace both with the point the peer's own seed
+		 * derives so a real round can be exchanged.
+		 */
+		function pairNextPoints(opener: Channel, acceptor: Channel): void {
+			const pointAt = (side: Channel, n: bigint): Buffer =>
+				perCommitmentPointFromSecret(
+					generateFromSeed(
+						side.getFullState().localPerCommitmentSeed,
+						MAX_INDEX - n
+					)
+				);
+			opener.getFullState().remoteNextPerCommitmentPoint = pointAt(
+				acceptor,
+				1n
+			);
+			acceptor.getFullState().remoteNextPerCommitmentPoint = pointAt(
+				opener,
+				1n
+			);
+		}
+
+		function shutDownLocally(side: Channel): void {
+			const actions = side.initiateShutdown(
+				Buffer.from('0014' + '00'.repeat(20), 'hex')
+			);
+			expect(errorOf(actions), 'shutdown accepted').to.equal(null);
+			expect(side.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+			expect(
+				side.getFullState().remoteShutdownScript,
+				'the peer has not shut down'
+			).to.equal(null);
+		}
+
+		it('admits the add, and the covering commitment_signed then verifies', function () {
+			const { opener, acceptor } = normalPair(1_000_000n, 400_000_000n);
+			pairNextPoints(opener, acceptor);
+			shutDownLocally(acceptor);
+
+			// The opener, which has not seen our shutdown, adds an HTLC.
+			const add = opener.addHtlc(
+				1_000_000n,
+				crypto.randomBytes(32),
+				800_000,
+				Buffer.alloc(1366)
+			);
+			expect(errorOf(add), 'the opener may still add').to.equal(null);
+			const addMsg = decodeUpdateAddHtlcMessage(
+				findSend(add, MessageType.UPDATE_ADD_HTLC)!
+			);
+
+			expect(
+				acceptor.handleUpdateAddHtlc(addMsg),
+				'admitted, not refused'
+			).to.have.length(0);
+			expect(
+				acceptor.getFullState().htlcs.get(`received-${addMsg.id}`),
+				'and recorded'
+			).to.not.equal(undefined);
+
+			// The whole point: the peer's covering commitment_signed is built over
+			// the same commitment we now hold, so it verifies. While the add was
+			// dropped this failed, and handleCommitmentSigned killed the channel
+			// with an "invalid signature" that was never invalid.
+			const sigs = realCommitmentSigs(opener);
+			const actions = acceptor.handleCommitmentSigned({
+				channelId: acceptor.getChannelId()!,
+				signature: sigs.signature,
+				htlcSignatures: sigs.htlcSignatures
+			});
+			expect(errorOf(actions), 'the covering commitment verifies').to.equal(
+				null
+			);
+			expect(acceptor.getState()).to.not.equal(ChannelState.ERRORED);
+		});
+
+		it('and once the PEER has shut down the add is refused, but LOCALLY', function () {
+			const { opener, acceptor } = normalPair(1_000_000n, 400_000_000n);
+			shutDownLocally(acceptor);
+			acceptor.handleShutdown({
+				channelId: acceptor.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '11'.repeat(20), 'hex')
+			});
+			expect(acceptor.getFullState().remoteShutdownScript).to.not.equal(null);
+
+			// The peer is bound now, and is still not condemned: handleReestablish
+			// replays every queued update_add_htlc after a reconnect, so an add
+			// arriving here can be a peer doing exactly what BOLT 2 requires.
+			const actions = acceptor.handleUpdateAddHtlc(
+				inboundHtlc(acceptor, 1_000_000n)
+			);
+			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
+			expect(errorOf(actions)).to.match(/Unexpected update_add_htlc/);
+			expect(acceptor.getState()).to.not.equal(ChannelState.ERRORED);
+			void opener;
 		});
 	});
 });

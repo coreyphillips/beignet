@@ -446,13 +446,30 @@ refusals use `_failChannelWithWireError`, which marks the channel `ERRORED` and
 persists first. Both suppress the wire half under BOLT 1's reserved all-zero
 `channel_id`, which would read as "fail every channel you have with me".
 
-The second clause is what keeps three carve-outs local, each argued at its
-guard: the lifecycle guards, since we move to `SHUTTING_DOWN`, `CLOSING` or
-`SPLICING` unilaterally and the peer's update may have left before it saw the
-transition; the id-mismatch guards, since the id in the message is one we do not
-own; and the half of the quiescence guard where only WE have sent `stfu`, since
-the peer is bound only from its own. The remaining gap is that last window: the
-right answer there is to accept the crossing add, which needs a quiescence timer
+The second clause is what keeps the carve-outs local, each argued at its guard:
+the id-mismatch guards, since the id in the message is one we do not own; the
+half of the quiescence guard where only WE have sent `stfu`, since the peer is
+bound only from its own; and the lifecycle guards.
+
+Those lifecycle guards are the subtle ones, and refusing was the wrong answer in
+one case. An `update_add_htlc` that crossed our own `shutdown` is conformant
+(BOLT 2 forbids one only after the peer has RECEIVED our shutdown) and is now
+ACCEPTED rather than refused: dropping it did not spare the channel, it deferred
+the death by one round and mislabelled it, because the peer's covering
+`commitment_signed` was then verified against a commitment missing the HTLC and
+failed. `handleCommitmentSigned` already accepts `SHUTTING_DOWN` for exactly
+this reason.
+
+The remaining lifecycle refusals stay local even where the peer has provably
+bound itself, which is a decision and not an oversight. Nothing cascades from
+them: outside `NORMAL` and `SHUTTING_DOWN` the covering `commitment_signed` is
+refused by its own state gate, so the update stalls rather than force-closing.
+And condemning there would force close conformant peers, because
+`handleReestablish` replays every queued `update_add_htlc` and `update_fee`
+after a reconnect while `remoteShutdownScript` is persisted, and because this
+implementation parks taproot channels in quiescence for longer than the splicing
+spec requires. The one genuinely open gap is the `SENT_STFU` window, where the
+right answer is to accept the crossing add and that needs a quiescence timer
 this implementation does not have yet.
 
 Deliberate refusals (all spec-legal): replacements of an open restored from a

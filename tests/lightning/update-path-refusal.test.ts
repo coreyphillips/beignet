@@ -308,15 +308,62 @@ describe('Update-path refusals reach the peer (issue 404)', function () {
 			expect(channel.getState()).to.equal(ChannelState.NORMAL);
 		});
 
-		it('control: the lifecycle guard stays LOCAL on a closing channel', function () {
-			// We move to SHUTTING_DOWN unilaterally and BOLT 2 forbids an add only
-			// AFTER the peer has received our shutdown, so this crossing is legal.
-			const channel = makeChannel({ state: ChannelState.SHUTTING_DOWN });
+		it('ACCEPTS an add that crossed our own shutdown', function () {
+			// BOLT 2 forbids an add only AFTER the peer has received our shutdown,
+			// and until it sends its own we have no evidence it has. Dropping such an
+			// add does not spare the channel: the peer's covering commitment_signed
+			// is then verified against a commitment that lacks the HTLC and the
+			// channel dies on an "invalid signature" that was never invalid.
+			const channel = makeChannel({
+				state: ChannelState.SHUTTING_DOWN,
+				localShutdownScript: Buffer.alloc(22),
+				remoteShutdownScript: null
+			});
+			const actions = channel.handleUpdateAddHtlc(add(channel));
+			expect(actions, 'admitted, not refused').to.have.length(0);
+			expect(
+				channel.getFullState().htlcs.get('received-0'),
+				'recorded'
+			).to.not.equal(undefined);
+			expect(channel.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+		});
+
+		// The end-to-end half of this, where the peer's covering commitment_signed
+		// is verified against the commitment the admitted add produced, needs a real
+		// signing pair and lives in bolt2-low-hardening.test.ts beside normalPair.
+
+		it('control: an add after the PEER shut down still refuses LOCALLY', function () {
+			// The peer IS bound here, and it is still not condemned. Two reasons,
+			// both at the guard: nothing cascades (handleCommitmentSigned refuses a
+			// covering commitment outside NORMAL/SHUTTING_DOWN, so the add stalls
+			// rather than force-closing), and handleReestablish REPLAYS every queued
+			// update_add_htlc after a reconnect, so a peer retransmitting an
+			// unrevoked add into a shutting-down channel is doing exactly what BOLT 2
+			// requires. Wire-failing here would force close a conformant peer.
+			const channel = makeChannel({
+				state: ChannelState.NEGOTIATING_CLOSING,
+				localShutdownScript: Buffer.alloc(22),
+				remoteShutdownScript: Buffer.alloc(22)
+			});
 			const actions = channel.handleUpdateAddHtlc(add(channel));
 			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
 			expect(actions).to.have.length(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect(channel.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+			expect(channel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+		});
+
+		it('control: a CLOSED channel refuses LOCALLY and is preserved', function () {
+			// The peer may simply not have seen our transition, and destroying a
+			// close that is going fine would be worse than refusing.
+			const channel = makeChannel({ state: ChannelState.CLOSED });
+			const actions = channel.handleUpdateAddHtlc(add(channel));
+			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
+			expect(actions).to.have.length(1);
+			const local = actions[0] as { type: ChannelActionType; cleanup?: string };
+			expect(local.type).to.equal(ChannelActionType.ERROR);
+			expect(local.cleanup, 'the manager must not drop the lifecycle').to.equal(
+				'none'
+			);
+			expect(channel.getState()).to.equal(ChannelState.CLOSED);
 		});
 	});
 
@@ -422,6 +469,10 @@ describe('Update-path refusals reach the peer (issue 404)', function () {
 			const actions = channel.handleUpdateFee(fee(channel, 1_000));
 			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
 			expect(actions).to.have.length(1);
+			const local = actions[0] as { type: ChannelActionType; cleanup?: string };
+			expect(local.cleanup, 'the manager must not drop the lifecycle').to.equal(
+				'none'
+			);
 			expect(channel.getState()).to.equal(ChannelState.CLOSED);
 		});
 	});
@@ -452,6 +503,43 @@ describe('Update-path refusals reach the peer (issue 404)', function () {
 			);
 			expect(channel.getFullState().remoteConfig.feeratePerKw).to.equal(
 				before.committed
+			);
+		});
+	});
+
+	describe('a failure the id cannot carry stays off the wire', function () {
+		// _failChannelWithWireError shares refuseWithWireError's scope rule. Without
+		// that, an all-zero channel_id would tell the peer to fail EVERY channel it
+		// has with us, and a malformed-length one would throw out of the helper
+		// AFTER the channel had already been marked ERRORED, so the caller got no
+		// actions at all for a channel that was now failed.
+
+		it('suppresses the wire half under the reserved all-zero id', function () {
+			const channel = makeChannel({ channelId: Buffer.alloc(32) });
+			const actions = channel.handleUpdateAddHtlc(
+				add(channel, { amountMsat: 0n })
+			);
+			expect(wireRefusalOf(actions), 'never connection-wide').to.equal(null);
+			// The channel is still failed and still persisted; only the peer's
+			// notification is lost.
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(actions[0].type).to.equal(ChannelActionType.PERSIST_STATE);
+			expect(
+				actions.some((a) => a.type === ChannelActionType.ERROR),
+				'the local failure still stands'
+			).to.equal(true);
+		});
+
+		it('and does not throw on a malformed-length id', function () {
+			const channel = makeChannel({ channelId: Buffer.alloc(16) });
+			let actions: ReturnType<Channel['handleUpdateAddHtlc']> = [];
+			expect(() => {
+				actions = channel.handleUpdateAddHtlc(add(channel, { amountMsat: 0n }));
+			}, 'a throw would strand an ERRORED channel with no actions').to.not.throw();
+			expect(wireRefusalOf(actions)).to.equal(null);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
+				true
 			);
 		});
 	});

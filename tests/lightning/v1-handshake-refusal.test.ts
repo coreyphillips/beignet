@@ -33,6 +33,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
+import { isTaprootChannel } from '../../src/lightning/channel/types';
 import {
 	decodeOpenChannelMessage,
 	decodeAcceptChannelMessage,
@@ -79,8 +80,16 @@ interface IPair {
 	accept: IAcceptChannelMessage;
 }
 
-/** A real opener and acceptor driven to accept_channel, with real signers. */
-function pair(channelType?: Buffer): IPair {
+/**
+ * A real opener and acceptor driven to accept_channel, with real signers.
+ *
+ * `preferTaproot` drives initiateOpen's own taproot branch rather than patching
+ * channelType afterwards, so the nonce state both sides hold is the one a real
+ * negotiation produces. Patching it after a non-taproot handshake left
+ * localNonce/remoteNonce unset and let the nonce arms pass for the wrong
+ * reason.
+ */
+function pair(preferTaproot = false): IPair {
 	const openerSeed = crypto.randomBytes(32);
 	const acceptorSeed = crypto.randomBytes(32);
 	const openerState = createOpenerState({
@@ -94,7 +103,10 @@ function pair(channelType?: Buffer): IPair {
 	const opener = new Channel(openerState);
 	opener.setSigner(signerFromSeed(openerSeed));
 	const openMsg = decodeOpenChannelMessage(
-		findSend(opener.initiateOpen(), MessageType.OPEN_CHANNEL)!
+		findSend(
+			opener.initiateOpen(undefined, false, preferTaproot),
+			MessageType.OPEN_CHANNEL
+		)!
 	);
 
 	const acceptor = new Channel(
@@ -129,13 +141,6 @@ function pair(channelType?: Buffer): IPair {
 	const accept = decodeAcceptChannelMessage(
 		findSend(acceptActions, MessageType.ACCEPT_CHANNEL)!
 	);
-	// Applied to the OPENER only, and after the acceptor has answered: the
-	// acceptor refuses an exotic type outright (an untrusted zero_conf open), and
-	// what these arms turn on is the type the OPENER believes it proposed.
-	if (channelType) {
-		opener.getFullState().channelType = channelType;
-		acceptor.getFullState().channelType = channelType;
-	}
 	return { opener, acceptor, accept };
 }
 
@@ -169,9 +174,15 @@ function fundingSigned(p: IPair): IFundingSignedMessage {
 	};
 }
 
-function taprootType(): Buffer {
+/**
+ * A zero_conf opener, for the minimum_depth arm. Applied to the OPENER only and
+ * after the acceptor has answered, because an acceptor refuses an untrusted
+ * zero_conf open outright and never produces the accept_channel this needs.
+ */
+function zeroConfType(): Buffer {
 	const f = FeatureFlags.empty();
-	f.setCompulsory(Feature.OPTION_TAPROOT);
+	f.setCompulsory(Feature.STATIC_REMOTE_KEY);
+	f.setCompulsory(Feature.ZERO_CONF);
 	return f.toBuffer();
 }
 
@@ -192,13 +203,11 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 		});
 
 		it('a zero_conf accept_channel with a non-zero minimum_depth', function () {
-			const f = FeatureFlags.empty();
-			f.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			f.setCompulsory(Feature.ZERO_CONF);
-			const p = pair(f.toBuffer());
+			const p = pair();
+			p.opener.getFullState().channelType = zeroConfType();
 			const actions = p.opener.handleAcceptChannel({
 				...p.accept,
-				channelType: f.toBuffer(),
+				channelType: zeroConfType(),
 				minimumDepth: 3
 			});
 			expectWireRefusal(
@@ -235,10 +244,16 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 		});
 
 		it('a taproot accept_channel without a usable next_local_nonce', function () {
-			const p = pair(taprootType());
+			const p = pair(true);
+			// A real taproot negotiation: both sides carry live nonce state, so the
+			// arm under test is the one a stripped next_local_nonce actually reaches.
+			expect(isTaprootChannel(p.accept.channelType!)).to.equal(true);
+			expect(p.accept.nextLocalNonce).to.have.length(66);
+			expect(p.opener.getFullState().localNonce, 'opener nonce').to.not.equal(
+				undefined
+			);
 			const actions = p.opener.handleAcceptChannel({
 				...p.accept,
-				channelType: taprootType(),
 				nextLocalNonce: undefined
 			});
 			expectWireRefusal(
@@ -246,6 +261,10 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 				p.opener.getTemporaryChannelId(),
 				/next_local_nonce/
 			);
+			expect(
+				p.opener.getFullState().remoteNonce,
+				'a refused nonce is never adopted'
+			).to.equal(undefined);
 		});
 
 		it('but a replayed accept_channel for a LIVE open stays local', function () {
@@ -450,35 +469,26 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 		});
 	});
 
-	describe('taproot arms', function () {
-		it('a funding_created with an unusable peer MuSig2 partial', function () {
-			const p = pair(taprootType());
+	describe('taproot arms, on a REAL taproot negotiation', function () {
+		it('a funding_created whose MuSig2 partial we cannot accept', function () {
+			const p = pair(true);
+			// Both sides hold live nonce state, so _acceptFundingPartial is reached
+			// with everything it needs and fails on the partial itself.
+			expect(p.acceptor.getFullState().remoteNonce).to.have.length(66);
+			expect(
+				p.acceptor.getFullState().localNonce,
+				'acceptor nonce'
+			).to.not.equal(undefined);
 			const actions = p.acceptor.handleFundingCreated(
 				{ ...fundingCreated(p), partialSignatureWithNonce: Buffer.alloc(10) },
 				crypto.randomBytes(64),
 				Buffer.alloc(98)
 			);
-			expect(
-				wireRefusalOf(actions, p.acceptor.getTemporaryChannelId())
-			).to.be.a('string');
-		});
-
-		it('a funding_created we cannot answer with our own partial', function () {
-			const p = pair(taprootType());
-			p.acceptor.getFullState().remoteNonce = Buffer.alloc(66, 2);
-			const actions = p.acceptor.handleFundingCreated(
-				{
-					...fundingCreated(p),
-					partialSignatureWithNonce: Buffer.alloc(98, 1)
-				},
-				crypto.randomBytes(64),
-				undefined
+			expectWireRefusal(
+				actions,
+				p.acceptor.getTemporaryChannelId(),
+				/partial|nonce|signature/i
 			);
-			// Whichever taproot arm fires, the opener hears about it.
-			expect(
-				wireRefusalOf(actions, p.acceptor.getTemporaryChannelId()),
-				'wire refusal'
-			).to.be.a('string');
 		});
 	});
 });

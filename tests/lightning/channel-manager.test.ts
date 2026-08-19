@@ -1052,6 +1052,117 @@ describe('Channel Manager', function () {
 			).to.equal(true);
 		});
 
+		it('a REPLAYED accept_channel leaves the healthy negotiation alone', function () {
+			// The state guard is local-only so a wire error cannot cancel an open the
+			// peer believes is healthy. But the manager drops the temporary channel
+			// for EVERY local ERROR, so without cleanup 'none' the local half deleted
+			// the very negotiation the guard exists to protect.
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			alice.on('error', () => undefined);
+			bob.on('error', () => undefined);
+			let acceptPayload: Buffer | null = null;
+			connectManagers(alice, alicePubkey, bob, bobPubkey);
+			bob.on(
+				'message:outbound',
+				(_p: string, type: number, payload: Buffer) => {
+					if (type === MessageType.ACCEPT_CHANNEL) acceptPayload = payload;
+				}
+			);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			const tempId = channel.getTemporaryChannelId();
+			expect(acceptPayload, 'captured the accept').to.not.equal(null);
+			expect(alice.getTempChannel(tempId), 'tracked after the accept').to.equal(
+				channel
+			);
+
+			const wire: number[] = [];
+			alice.on('message:outbound', (_p: string, type: number) =>
+				wire.push(type)
+			);
+			alice.handleMessage(
+				bobPubkey,
+				MessageType.ACCEPT_CHANNEL,
+				acceptPayload as unknown as Buffer
+			);
+
+			expect(wire, 'nothing on the wire').to.have.length(0);
+			expect(
+				alice.getTempChannel(tempId),
+				'the negotiation survives the replay'
+			).to.equal(channel);
+		});
+
+		it('a refused funding_signed drops the PROMOTED registration too', async function () {
+			// createFunding promotes the opener to its permanent id, so with QUEUED
+			// delivery (a real socket) funding_signed arrives after the promotion and
+			// the temporary-id drop finds nothing. Without cleanup 'lifecycle' the
+			// opener stayed in this.channels in SENT_FUNDING_CREATED forever:
+			// refused at the peer, immortal locally.
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			alice.on('error', () => undefined);
+			bob.on('error', () => undefined);
+
+			const queue: Array<() => void> = [];
+			const drain = async (): Promise<void> => {
+				while (queue.length) queue.shift()!();
+				await new Promise((r) => setImmediate(r));
+			};
+			alice.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== bobPubkey) return;
+					queue.push(() => bob.handleMessage(alicePubkey, type, payload));
+				}
+			);
+			bob.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== alicePubkey) return;
+					const tampered =
+						type === MessageType.FUNDING_SIGNED
+							? (() => {
+									// [32 channel_id][64 signature]
+									const copy = Buffer.from(payload);
+									copy[40] ^= 0xff;
+									return copy;
+							  })()
+							: payload;
+					queue.push(() => alice.handleMessage(bobPubkey, type, tampered));
+				}
+			);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			await drain();
+			const channelId = alice.createFunding(
+				channel,
+				crypto.randomBytes(32),
+				0,
+				Buffer.alloc(64)
+			);
+			expect(channelId, 'promoted before funding_signed arrived').to.not.equal(
+				null
+			);
+			expect(
+				alice.listChannels().length,
+				'promoted while the reply is still queued'
+			).to.equal(1);
+
+			await drain();
+			await drain();
+
+			expect(
+				alice.listChannels(),
+				'no permanent SENT_FUNDING_CREATED zombie'
+			).to.have.length(0);
+			expect(
+				alice.getTempChannel(channel.getTemporaryChannelId()),
+				'and nothing under the temporary id either'
+			).to.equal(undefined);
+		});
+
 		it('a funding_signed we cannot verify is refused ON THE WIRE', function () {
 			const alice = new ChannelManager(makeConfig(1));
 			const bob = new ChannelManager(makeConfig(2));
