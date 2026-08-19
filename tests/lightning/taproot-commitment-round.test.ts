@@ -25,6 +25,7 @@ import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
 import { decodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
 import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
+import { expectWireFailure } from './helpers/open-refusal';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -186,6 +187,38 @@ describe('option_taproot commitment round + nonce rotation (Stage B)', function 
 			expect(s.remoteNonce, "peer's #1 verification nonce").to.exist;
 			expect(s.remoteNonce!.length).to.equal(66);
 		}
+	});
+
+	it('fails the channel on the wire on a garbage 98-byte partial (issues 409/415)', function () {
+		// Before issue 415 a length-valid partial with undecodable nonce points
+		// THREW out of the handler; before 409 the refusal was a bare local
+		// ERROR. Now it must come back as a wire failure, like the ECDSA twin.
+		const { bobChannel, channelId } = setupReadyTaprootChannel();
+		let actions: ReturnType<Channel['handleCommitmentSigned']> = [];
+		expect(() => {
+			actions = bobChannel.handleCommitmentSigned({
+				channelId,
+				signature: Buffer.alloc(64),
+				htlcSignatures: [],
+				partialSignatureWithNonce: Buffer.alloc(98, 1)
+			});
+		}).to.not.throw();
+		expectWireFailure(actions, channelId, /Invalid taproot partial signature/);
+		expect(bobChannel.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('fails the channel on the wire on an invalid taproot HTLC signature (issue 409)', function () {
+		// An HTLC signature count mismatch fails verification outright; the
+		// refusal is the taproot twin of the wire-visible ECDSA HTLC-sig arm.
+		const { bobChannel, channelId } = setupReadyTaprootChannel();
+		const actions = bobChannel.handleCommitmentSigned({
+			channelId,
+			signature: Buffer.alloc(64),
+			htlcSignatures: [Buffer.alloc(64)],
+			partialSignatureWithNonce: Buffer.alloc(98, 1)
+		});
+		expectWireFailure(actions, channelId, /Invalid taproot HTLC signature/);
+		expect(bobChannel.getState()).to.equal(ChannelState.ERRORED);
 	});
 
 	it('completes a full no-HTLC commitment round, rotates nonces, and both #1 partials aggregate', function () {

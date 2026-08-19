@@ -42,6 +42,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { expectWireFailure, wireRefusalOf } from './helpers/open-refusal';
 
 /** Sign the peer's next commitment for real and send commitment_signed. */
 function signRealCommitment(channel: ChannelClass): any[] {
@@ -1119,14 +1120,34 @@ describe('Channel State Machine', function () {
 		});
 
 		it('should reject a peer shutdown with a non-standard scriptPubkey', function () {
+			// On a live channel the refusal is a wire-visible channel failure
+			// (issue 409): the script forms are facts the peer held when it sent.
+			const { opener } = getToNormal();
+			const actions = opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: crypto.randomBytes(22) // junk, not a valid P2WPKH
+			});
+			expectWireFailure(
+				actions,
+				opener.getChannelId()!,
+				/Invalid shutdown scriptPubkey/
+			);
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		it('a shutdown for a not-yet-open channel refuses locally (lifecycle gate)', function () {
+			// Before the channel is live the peer may act on state we have not
+			// reached; the hoisted lifecycle gate answers, off the wire, even
+			// when the script would also be invalid.
 			const { opener } = createTestChannels();
 			const actions = opener.handleShutdown({
 				channelId: Buffer.alloc(32, 0xcc),
-				scriptPubkey: crypto.randomBytes(22) // junk, not a valid P2WPKH
+				scriptPubkey: crypto.randomBytes(22)
 			});
 			const error = findAction(actions, ChannelActionType.ERROR);
 			expect(error).to.exist;
-			expect((error as any).message).to.contain('Invalid shutdown');
+			expect((error as any).message).to.contain('Unexpected shutdown');
+			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
 		});
 	});
 

@@ -23,6 +23,7 @@ import {
 	signerFromSeed,
 	realInitialCommitmentSig
 } from './helpers/real-signing';
+import { expectWireFailure, wireRefusalOf } from './helpers/open-refusal';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	return {
@@ -352,6 +353,9 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			// A peer echoes our proposed fee but sends a garbage closing signature.
 			// Without a signature gate the channel would go CLOSED and the funding
 			// watch would be torn down, leaving a later revoked broadcast unpunished.
+			// The channel is failed ON THE WIRE (issue 409): with no pending HTLCs
+			// both ledgers agree, so a conformant sig always verifies and a
+			// mismatch is real divergence. ERRORED keeps the funding watch alive.
 			const { opener } = setupNegotiatingChannels();
 			opener.handleShutdown({
 				channelId: opener.getChannelId()!,
@@ -378,9 +382,48 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			);
 
 			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.false;
-			expect(findErrorAction(actions)).to.include('signature');
-			// Channel stays in negotiation (funding watch intact upstream).
-			expect(opener.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+			expectWireFailure(
+				actions,
+				opener.getChannelId()!,
+				/closing signature failed to verify/
+			);
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		it('fails the channel on the wire on an in-range fee with an invalid signature', function () {
+			// The accept-their-fee branch has the same signature gate as the
+			// fee-echo branch; a garbage sig there must also be told to the peer.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			// Propose first so the fee range is initialized, then answer with a
+			// DIFFERENT fee inside [ideal/2, ideal*2] to land in the accept
+			// branch rather than the echo or counter branches.
+			const proposeActions = opener.proposeClosingFee(crypto.randomBytes(64));
+			const proposedFee = decodeClosingSignedMessage(
+				findSendAction(proposeActions, MessageType.CLOSING_SIGNED)!
+			).feeSatoshis;
+
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: proposedFee + 1n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn,
+				() => false
+			);
+
+			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.false;
+			expectWireFailure(
+				actions,
+				opener.getChannelId()!,
+				/closing signature failed to verify/
+			);
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
 		});
 
 		it('still closes on a fee-echo with a valid peer signature (C1 control)', function () {
@@ -593,9 +636,12 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 		it('rejects closing_signed while HTLCs are pending (fund-safety)', function () {
 			// The closing tx pays out the settled balances only, so signing a
 			// mutual close with an HTLC in flight burns that HTLC's value to
-			// fees. A peer that sends shutdown followed by closing_signed while
-			// we still have a pending HTLC must be rejected, and the channel
-			// (plus its funding watch) must stay intact.
+			// fees. Deliberately a BARE local refusal (issue 409 carve-out): a
+			// crash-restored lagging snapshot on OUR side can resurrect a
+			// COMMITTED entry while the peer's ledger is legitimately HTLC-free,
+			// so this arm can fire against a conformant peer; the stall
+			// self-heals as the replayed round drains. The channel (plus its
+			// funding watch) must stay intact.
 			const { opener } = setupNegotiatingChannels({ withPendingHtlc: true });
 
 			expect(opener.getState()).to.equal(ChannelState.SHUTTING_DOWN);
@@ -611,6 +657,7 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			);
 
 			expect(findErrorAction(actions)).to.include('pending HTLCs');
+			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
 			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.false;
 			expect(findSendAction(actions, MessageType.CLOSING_SIGNED)).to.be.null;
 			expect(opener.getState()).to.equal(ChannelState.SHUTTING_DOWN);

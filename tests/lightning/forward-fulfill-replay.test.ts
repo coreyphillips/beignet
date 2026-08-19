@@ -653,6 +653,12 @@ describe('Replayed update_fulfill_htlc re-drives settlement (issue 295)', () => 
 			'corrupted replay rejected'
 		).to.equal(true);
 		expect(fulfillEvents, 'corrupted replay emitted nothing').to.equal(2);
+		// The refusal is now a wire-visible channel failure (issue 409); the
+		// node's errored pipeline then force-closes it.
+		expect(channel.getState()).to.be.oneOf([
+			ChannelState.ERRORED,
+			ChannelState.FORCE_CLOSED
+		]);
 
 		alice.destroy();
 		bob.destroy();

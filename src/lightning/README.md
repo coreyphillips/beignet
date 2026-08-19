@@ -472,6 +472,25 @@ spec requires. The one genuinely open gap is the `SENT_STFU` window, where the
 right answer is to accept the crossing add and that needs a quiescence timer
 this implementation does not have yet.
 
+The same replay machinery derives the crash-replay carve-outs (issue 409): a
+peer restored from a legally lagging snapshot replays its whole pending update
+queue on reestablish, so a fulfill or fail can land on an HTLC entry the
+completed round already deleted ("HTLC not found" stays bare), and our own
+lagging restore can resurrect a COMMITTED entry while the peer's ledger is
+legitimately HTLC-free (the pending-HTLC `closing_signed` arm stays bare and
+self-heals as the replayed round drains). The taproot `closing_signed`
+nonce-exchange arm also stays bare: its predicate mixes our own unpersisted
+restart state with reestablish ordering, never provable peer divergence.
+
+Closing-negotiation refusals are otherwise wire-visible by the same two
+clauses read against the negotiation itself rather than the update logs: an
+invalid closing signature, a malformed TLV, a non-echoed taproot fee, or a fee
+outside the responder band turns only on bytes and policy the peer held when
+it sent, and the single-round taproot session can never recover in-session,
+so a bare refusal is an unbounded stall nobody is told about. `handleShutdown`
+now runs its lifecycle gate FIRST so its wire-visible content checks (missing
+MuSig2 nonce, invalid scriptPubkey) can only fire on a live channel.
+
 Deliberate refusals (all spec-legal): replacements of an open restored from a
 restart (the wallet signing closures die with the process; confirmation
 adoption still works), contribution changes on a leased open (bLIP-51: the

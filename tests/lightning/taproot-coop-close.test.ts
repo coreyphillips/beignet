@@ -38,6 +38,7 @@ import {
 	encodeClosingSignedMessage,
 	encodeShutdownMessage
 } from '../../src/lightning/message/channel-close';
+import { expectWireFailure, wireRefusalOf } from './helpers/open-refusal';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -279,20 +280,15 @@ describe('Taproot cooperative close (MuSig2)', function () {
 		expect(aliceChannel.isSimpleClose()).to.equal(false);
 	});
 
-	it('errors when a taproot peer sends shutdown without the nonce TLV', function () {
+	it('fails the channel on the wire when a taproot peer sends shutdown without the nonce TLV', function () {
 		const { bobChannel, channelId } = readyTaprootChannel(7, 8);
-		const stateBefore = bobChannel.getState();
 
 		const actions = bobChannel.handleShutdown({
 			channelId,
 			scriptPubkey: P2WPKH_A
 		});
-		const err = actions.find((a) => a.type === ChannelActionType.ERROR) as {
-			message: string;
-		};
-		expect(err, 'expected an ERROR action').to.exist;
-		expect(err.message).to.match(/nonce/i);
-		expect(bobChannel.getState()).to.equal(stateBefore);
+		expectWireFailure(actions, channelId, /nonce/i);
+		expect(bobChannel.getState()).to.equal(ChannelState.ERRORED);
 		expect(bobChannel.getFullState().remoteShutdownScript).to.not.exist;
 	});
 
@@ -320,12 +316,8 @@ describe('Taproot cooperative close (MuSig2)', function () {
 			},
 			() => crypto.randomBytes(32)
 		);
-		const err = actions.find((a) => a.type === ChannelActionType.ERROR) as {
-			message: string;
-		};
-		expect(err, 'expected an ERROR action').to.exist;
-		expect(err.message).to.match(/partial/i);
-		expect(bobChannel.getState()).to.not.equal(ChannelState.CLOSED);
+		expectWireFailure(actions, channelId, /partial/i);
+		expect(bobChannel.getState()).to.equal(ChannelState.ERRORED);
 	});
 
 	it('initiator errors when the echoed fee differs from its offer', function () {
@@ -360,18 +352,16 @@ describe('Taproot cooperative close (MuSig2)', function () {
 			},
 			() => crypto.randomBytes(32)
 		);
-		const err = actions.find((a) => a.type === ChannelActionType.ERROR) as {
-			message: string;
-		};
-		expect(err, 'expected an ERROR action').to.exist;
-		expect(err.message).to.match(/echo/i);
-		expect(aliceChannel.getState()).to.not.equal(ChannelState.CLOSED);
+		expectWireFailure(actions, channelId, /echo/i);
+		expect(aliceChannel.getState()).to.equal(ChannelState.ERRORED);
 	});
 
-	it('responder rejects an unreasonable initiator fee (fund-safety)', function () {
-		// bob is the RESPONDER here (alice, the opener, never proposes): a fee
-		// far outside the reasonable band must be refused rather than accepted
-		// verbatim, since single-round negotiation cannot counter it.
+	// bob is the RESPONDER in the next two (alice, the opener, never proposes):
+	// a fee far outside the reasonable band must be refused rather than
+	// accepted verbatim, since single-round negotiation cannot counter it. A
+	// refusal now fails the channel, so each direction gets a pristine fixture.
+	it('responder rejects an unreasonably HIGH initiator fee (fund-safety)', function () {
+		// An absurdly high fee (would burn the balance to miners).
 		const { bobChannel, channelId } = readyTaprootChannel(21, 22);
 		bobChannel.handleShutdown(
 			{
@@ -383,7 +373,6 @@ describe('Taproot cooperative close (MuSig2)', function () {
 		);
 		expect(bobChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
 
-		// An absurdly high fee (would burn the balance to miners).
 		const high = bobChannel.handleClosingSigned(
 			{
 				channelId,
@@ -393,13 +382,23 @@ describe('Taproot cooperative close (MuSig2)', function () {
 			},
 			() => crypto.randomBytes(32)
 		);
-		expect(
-			high.find((a) => a.type === ChannelActionType.ERROR),
-			'high fee rejected'
-		).to.exist;
-		expect(bobChannel.getState()).to.not.equal(ChannelState.CLOSED);
+		expectWireFailure(high, channelId, /outside acceptable range/);
+		expect(bobChannel.getState()).to.equal(ChannelState.ERRORED);
+	});
 
+	it('responder rejects an unreasonably LOW initiator fee (fund-safety)', function () {
 		// An absurdly low fee (would produce an unrelayable, un-RBF-able tx).
+		const { bobChannel, channelId } = readyTaprootChannel(43, 44);
+		bobChannel.handleShutdown(
+			{
+				channelId,
+				scriptPubkey: P2WPKH_A,
+				shutdownNonce: crypto.randomBytes(66)
+			},
+			P2WPKH_A
+		);
+		expect(bobChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+
 		const low = bobChannel.handleClosingSigned(
 			{
 				channelId,
@@ -409,11 +408,97 @@ describe('Taproot cooperative close (MuSig2)', function () {
 			},
 			() => crypto.randomBytes(32)
 		);
-		expect(
-			low.find((a) => a.type === ChannelActionType.ERROR),
-			'low fee rejected'
-		).to.exist;
-		expect(bobChannel.getState()).to.not.equal(ChannelState.CLOSED);
+		expectWireFailure(low, channelId, /outside acceptable range/);
+		expect(bobChannel.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('responder rejects a fee exceeding the opener balance', function () {
+		// bob (non-opener responder): the fee comes out of ALICE's output, and a
+		// fee above her whole balance can never produce a valid closing tx. The
+		// band is [ideal/5, ideal*5], so shrink alice's mirrored balance below
+		// the band floor to reach the exceeds-balance arm with an in-band fee.
+		const { bobChannel, channelId } = readyTaprootChannel(45, 46);
+		bobChannel.handleShutdown(
+			{
+				channelId,
+				scriptPubkey: P2WPKH_A,
+				shutdownNonce: crypto.randomBytes(66)
+			},
+			P2WPKH_A
+		);
+		expect(bobChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+
+		bobChannel.getFullState().remoteBalanceMsat = 100_000n; // 100 sat
+		const actions = bobChannel.handleClosingSigned(
+			{
+				channelId,
+				feeSatoshis: 200n,
+				signature: Buffer.alloc(64),
+				partialSignature: crypto.randomBytes(32)
+			},
+			() => crypto.randomBytes(32)
+		);
+		expectWireFailure(actions, channelId, /exceeds opener balance/);
+		expect(bobChannel.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('responder fails the channel on a partial that does not verify', function () {
+		const { bobChannel, channelId } = readyTaprootChannel(47, 48);
+		bobChannel.handleShutdown(
+			{
+				channelId,
+				scriptPubkey: P2WPKH_A,
+				shutdownNonce: crypto.randomBytes(66)
+			},
+			P2WPKH_A
+		);
+		expect(bobChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+
+		const actions = bobChannel.handleClosingSigned(
+			{
+				channelId,
+				feeSatoshis: 200n,
+				signature: Buffer.alloc(64),
+				partialSignature: crypto.randomBytes(32)
+			},
+			() => crypto.randomBytes(32),
+			() => false
+		);
+		expectWireFailure(actions, channelId, /partial signature failed to verify/);
+		expect(bobChannel.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('control: closing_signed before the nonce exchange stays a LOCAL error', function () {
+		// The nonce-exchange-incomplete arm is an argued carve-out: the nonces
+		// are unpersisted privates and buildShutdownRetransmit deliberately
+		// nulls the remote one on reestablish, so this can fire on ordering
+		// artifacts, never provable peer divergence. It must stay off the wire.
+		const { aliceChannel, channelId } = readyTaprootChannel(49, 50);
+		aliceChannel.initiateShutdown(P2WPKH_A);
+		aliceChannel.handleShutdown({
+			channelId,
+			scriptPubkey: P2WPKH_A,
+			shutdownNonce: crypto.randomBytes(66)
+		});
+		// Reestablish path: the retransmit drops the stale remote nonce.
+		aliceChannel.buildShutdownRetransmit();
+
+		const actions = aliceChannel.handleClosingSigned(
+			{
+				channelId,
+				feeSatoshis: 200n,
+				signature: Buffer.alloc(64),
+				partialSignature: crypto.randomBytes(32)
+			},
+			() => crypto.randomBytes(32)
+		);
+		const err = actions.find((a) => a.type === ChannelActionType.ERROR) as {
+			message: string;
+		};
+		expect(err, 'expected a local ERROR').to.exist;
+		expect(err.message).to.match(/nonce exchange/);
+		expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
+		expect(aliceChannel.getState()).to.not.equal(ChannelState.ERRORED);
 	});
 
 	// FS-5: when WE are the opener the closing fee is paid from OUR output. The
@@ -478,12 +563,8 @@ describe('Taproot cooperative close (MuSig2)', function () {
 			},
 			() => crypto.randomBytes(32)
 		);
-		const err = actions.find((a) => a.type === ChannelActionType.ERROR) as {
-			message: string;
-		};
-		expect(err, 'sub-dust-reserve fee is rejected').to.exist;
-		expect(err.message).to.match(/dust/i);
-		expect(aliceChannel.getState()).to.not.equal(ChannelState.CLOSED);
+		expectWireFailure(actions, channelId, /dust/i);
+		expect(aliceChannel.getState()).to.equal(ChannelState.ERRORED);
 	});
 
 	it('responder-as-opener accepts a fee that leaves exactly the dust reserve', function () {

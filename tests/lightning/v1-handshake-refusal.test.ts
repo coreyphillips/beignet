@@ -536,9 +536,10 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 			);
 			// The lifecycle unwind must survive: createFunding promoted the opener
 			// to its permanent id, so only cleanup 'lifecycle' reaps it.
-			const local = actions.find(
-				(a) => a.type === ChannelActionType.ERROR
-			) as { type: ChannelActionType; cleanup?: string };
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR) as {
+				type: ChannelActionType;
+				cleanup?: string;
+			};
 			expect(local.cleanup).to.equal('lifecycle');
 		});
 	});
