@@ -3279,48 +3279,56 @@ export class ChannelManager extends EventEmitter {
 		feeSatoshis: bigint,
 		theirSig: Buffer
 	): Buffer | null {
-		if (isTaprootChannel(channel.getFullState().channelType)) {
-			return this.buildSignedTaprootMutualCloseTx(
-				channel,
-				feeSatoshis,
-				theirSig
-			);
-		}
-		const {
-			tx,
-			witnessScript,
-			fundingSatoshis,
-			localFundingPubkey,
-			remoteFundingPubkey
-		} = this.buildClosingTxAndScript(channel, feeSatoshis);
-		const signer = this.signerFor(channel, false);
-		const ourSig = signer.signClosingTx(
-			tx,
-			witnessScript,
-			Number(fundingSatoshis)
-		);
-		if (
-			!signer.verifyCommitmentSig(
+		// Whole-body guard like buildSignedSimpleMutualCloseTx: the taproot
+		// path verifies a peer-supplied MuSig2 partial, and garbage bytes make
+		// the musig library throw rather than return false (issue 415). A null
+		// keeps the channel + funding watch alive at the caller.
+		try {
+			if (isTaprootChannel(channel.getFullState().channelType)) {
+				return this.buildSignedTaprootMutualCloseTx(
+					channel,
+					feeSatoshis,
+					theirSig
+				);
+			}
+			const {
 				tx,
-				theirSig,
-				remoteFundingPubkey,
+				witnessScript,
+				fundingSatoshis,
+				localFundingPubkey,
+				remoteFundingPubkey
+			} = this.buildClosingTxAndScript(channel, feeSatoshis);
+			const signer = this.signerFor(channel, false);
+			const ourSig = signer.signClosingTx(
+				tx,
 				witnessScript,
 				Number(fundingSatoshis)
-			)
-		) {
+			);
+			if (
+				!signer.verifyCommitmentSig(
+					tx,
+					theirSig,
+					remoteFundingPubkey,
+					witnessScript,
+					Number(fundingSatoshis)
+				)
+			) {
+				return null;
+			}
+			tx.setWitness(
+				0,
+				ChannelSigner.buildFundingWitness(
+					ourSig,
+					theirSig,
+					localFundingPubkey,
+					remoteFundingPubkey,
+					witnessScript
+				)
+			);
+			return tx.toBuffer();
+		} catch {
 			return null;
 		}
-		tx.setWitness(
-			0,
-			ChannelSigner.buildFundingWitness(
-				ourSig,
-				theirSig,
-				localFundingPubkey,
-				remoteFundingPubkey,
-				witnessScript
-			)
-		);
-		return tx.toBuffer();
 	}
 
 	/**

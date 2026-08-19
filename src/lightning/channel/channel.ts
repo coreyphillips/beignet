@@ -1407,14 +1407,27 @@ export class Channel {
 			this._state.localPerCommitmentSeed,
 			commitmentNumber
 		);
-		const valid = verifyRemoteCommitmentPartial(
-			this._state,
-			theirPartial,
-			ourPublicNonce,
-			theirSigningNonce,
-			localPerCommitmentPoint,
-			commitmentNumber
-		);
+		let valid: boolean;
+		try {
+			valid = verifyRemoteCommitmentPartial(
+				this._state,
+				theirPartial,
+				ourPublicNonce,
+				theirSigningNonce,
+				localPerCommitmentPoint,
+				commitmentNumber
+			);
+		} catch (err) {
+			// A 98-byte partial whose 66-byte nonce halves are not decodable
+			// curve points, or whose 32-byte scalar is out of range, makes the
+			// musig library THROW ('Unexpected public nonce at infinity',
+			// 'Invalid sig') rather than return false. Uncaught, that throw
+			// escaped every refusal arm above this helper all the way to
+			// ChannelManager.handleMessage's catch: no wire error, no unwind,
+			// a dead open nobody was told about (issue 415).
+			const detail = err instanceof Error ? err.message : String(err);
+			return `Invalid taproot partial signature (${detail})`;
+		}
 		if (!valid) {
 			return 'Invalid taproot partial signature';
 		}

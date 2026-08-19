@@ -490,5 +490,56 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 				/partial|nonce|signature/i
 			);
 		});
+
+		it('a funding_created partial of the RIGHT length but garbage content (issue 415)', function () {
+			// A 98-byte partial whose nonce halves are not curve points made the
+			// musig library THROW instead of return false, and the throw escaped
+			// the refusal arms entirely. The tighter regex pins the verify path:
+			// the missing-nonce arm's reason would not match it.
+			const p = pair(true);
+			expect(p.acceptor.getFullState().remoteNonce).to.have.length(66);
+			const actions = p.acceptor.handleFundingCreated(
+				{
+					...fundingCreated(p),
+					partialSignatureWithNonce: Buffer.alloc(98, 1)
+				},
+				crypto.randomBytes(64),
+				Buffer.alloc(98)
+			);
+			expectWireRefusal(
+				actions,
+				p.acceptor.getTemporaryChannelId(),
+				/Invalid taproot partial signature/
+			);
+		});
+
+		it('a funding_signed partial of the RIGHT length but garbage content (issue 415)', function () {
+			const p = pair(true);
+			// driveToFundingCreated passes no partial, which a taproot opener
+			// refuses; drive the same path with a length-valid one.
+			p.opener.handleAcceptChannel(p.accept);
+			p.opener.createFundingCreated(
+				crypto.randomBytes(32),
+				0,
+				crypto.randomBytes(64),
+				Buffer.alloc(98)
+			);
+			expect(p.opener.getState()).to.equal(ChannelState.SENT_FUNDING_CREATED);
+			const actions = p.opener.handleFundingSigned({
+				...fundingSigned(p),
+				partialSignatureWithNonce: Buffer.alloc(98, 1)
+			});
+			expectWireRefusal(
+				actions,
+				p.opener.getChannelId()!,
+				/Invalid taproot partial signature/
+			);
+			// The lifecycle unwind must survive: createFunding promoted the opener
+			// to its permanent id, so only cleanup 'lifecycle' reaps it.
+			const local = actions.find(
+				(a) => a.type === ChannelActionType.ERROR
+			) as { type: ChannelActionType; cleanup?: string };
+			expect(local.cleanup).to.equal('lifecycle');
+		});
 	});
 });
