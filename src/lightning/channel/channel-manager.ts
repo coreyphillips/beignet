@@ -2950,8 +2950,48 @@ export class ChannelManager extends EventEmitter {
 		this.processActions(peerPubkey, channel, actions);
 	}
 
+	/**
+	 * A close-family payload that failed to DECODE (wrong-length nonce TLV,
+	 * truncated partial) never reaches the handler whose content checks would
+	 * wire-fail it; without this, the codec throw died in handleMessage's
+	 * catch as a null-id local error. Both shutdown and closing_signed lead
+	 * with the 32-byte channel_id at a fixed offset, so the channel can still
+	 * be identified and failed with a properly scoped wire error.
+	 */
+	private failChannelForUndecodablePayload(
+		peerPubkey: string,
+		payload: Buffer,
+		name: string,
+		err: unknown
+	): void {
+		const detail = err instanceof Error ? err.message : String(err);
+		const channelId =
+			payload.length >= 32 ? Buffer.from(payload.subarray(0, 32)) : null;
+		const channel = channelId ? this.findChannelByChannelId(channelId) : null;
+		if (!channel) {
+			this.emit('error', channelId, `Undecodable ${name}: ${detail}`);
+			return;
+		}
+		this.processActions(
+			peerPubkey,
+			channel,
+			channel.failFromMalformedPeerMessage(`Undecodable ${name}: ${detail}`)
+		);
+	}
+
 	private handleShutdownMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeShutdownMessage(payload);
+		let msg: ReturnType<typeof decodeShutdownMessage>;
+		try {
+			msg = decodeShutdownMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'shutdown',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -3013,7 +3053,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleClosingSignedMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeClosingSignedMessage(payload);
+		let msg: ReturnType<typeof decodeClosingSignedMessage>;
+		try {
+			msg = decodeClosingSignedMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'closing_signed',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -3058,16 +3109,22 @@ export class ChannelManager extends EventEmitter {
 				// Defense in depth: handleClosingSigned already gated CLOSED on a valid
 				// sig, so we should not reach here — but if the close tx can't be built,
 				// do NOT process CHANNEL_CLOSED (keep the channel + funding watch alive).
+				// The channel committed CLOSED internally before the build ran, so a
+				// bare filter would strand it falsely CLOSED with nothing broadcast:
+				// no rebroadcast, no force-close route, and a restart would persist
+				// the lie. Roll it back to NEGOTIATING_CLOSING and persist THAT, so
+				// every recovery path (retry, reconnect with fresh session, operator
+				// force close) stays open.
+				channel.getFullState().state = ChannelState.NEGOTIATING_CLOSING;
 				this.emit(
 					'error',
 					msg.channelId,
 					'Coop-close: peer closing signature failed to verify'
 				);
-				this.processActions(
-					peerPubkey,
-					channel,
-					actions.filter((a) => a.type !== ChannelActionType.CHANNEL_CLOSED)
-				);
+				this.processActions(peerPubkey, channel, [
+					{ type: ChannelActionType.PERSIST_STATE },
+					...actions.filter((a) => a.type !== ChannelActionType.CHANNEL_CLOSED)
+				]);
 			}
 		} else {
 			this.processActions(peerPubkey, channel, actions);
@@ -3100,24 +3157,58 @@ export class ChannelManager extends EventEmitter {
 					remoteNonce
 				);
 			}
-			const { tx, witnessScript, fundingSatoshis, remoteFundingPubkey } =
-				this.buildClosingTxAndScript(channel, feeSatoshis);
-			const signer = this.signerFor(channel, false);
-			return signer.verifyCommitmentSig(
-				tx,
-				theirSig,
-				remoteFundingPubkey,
-				witnessScript,
-				Number(fundingSatoshis)
+			return (
+				this.buildVerifiedLegacyCloseTx(channel, feeSatoshis, theirSig) !== null
 			);
 		} catch {
 			return false;
 		}
 	}
 
+	/**
+	 * Build the legacy (non-taproot) closing tx VARIANT the peer's signature
+	 * actually covers, or null if it covers neither. BOLT 2 permits the signer
+	 * to eliminate its OWN output from the closing transaction, so a valid
+	 * signature may be over the canonical two-output tx or over the tx with
+	 * the peer's output removed (its value donated to fees); a verifier pinned
+	 * to the canonical variant falsely rejects the second, and this PR made
+	 * that rejection fatal. Our own output is present in both variants.
+	 */
+	private buildVerifiedLegacyCloseTx(
+		channel: Channel,
+		feeSatoshis: bigint,
+		theirSig: Buffer
+	): {
+		tx: import('bitcoinjs-lib').Transaction;
+		witnessScript: Buffer;
+		fundingSatoshis: bigint;
+		localFundingPubkey: Buffer;
+		remoteFundingPubkey: Buffer;
+	} | null {
+		const signer = this.signerFor(channel, false);
+		const covers = (
+			built: ReturnType<ChannelManager['buildClosingTxAndScript']>
+		): boolean =>
+			signer.verifyCommitmentSig(
+				built.tx,
+				theirSig,
+				built.remoteFundingPubkey,
+				built.witnessScript,
+				Number(built.fundingSatoshis)
+			);
+		const canonical = this.buildClosingTxAndScript(channel, feeSatoshis);
+		if (covers(canonical)) return canonical;
+		// The eliminated variant only differs when the remote output survived
+		// the dust filter in the canonical build.
+		if (canonical.tx.outs.length < 2) return null;
+		const eliminated = this.buildClosingTxAndScript(channel, feeSatoshis, true);
+		return covers(eliminated) ? eliminated : null;
+	}
+
 	private buildClosingTxAndScript(
 		channel: Channel,
-		feeSatoshis: bigint
+		feeSatoshis: bigint,
+		omitRemoteOutput = false
 	): {
 		tx: import('bitcoinjs-lib').Transaction;
 		witnessScript: Buffer;
@@ -3137,7 +3228,11 @@ export class ChannelManager extends EventEmitter {
 		const localAmount = localIsOpener
 			? localBalanceSat - feeSatoshis
 			: localBalanceSat;
-		const remoteAmount = localIsOpener
+		// BOLT 2 lets the signer eliminate its OWN output (value to fees);
+		// forcing the amount to zero drops it through the dust filter below.
+		const remoteAmount = omitRemoteOutput
+			? 0n
+			: localIsOpener
 			? remoteBalanceSat
 			: remoteBalanceSat - feeSatoshis;
 
@@ -3291,41 +3386,35 @@ export class ChannelManager extends EventEmitter {
 					theirSig
 				);
 			}
-			const {
-				tx,
-				witnessScript,
-				fundingSatoshis,
-				localFundingPubkey,
-				remoteFundingPubkey
-			} = this.buildClosingTxAndScript(channel, feeSatoshis);
-			const signer = this.signerFor(channel, false);
-			const ourSig = signer.signClosingTx(
-				tx,
-				witnessScript,
-				Number(fundingSatoshis)
+			// Sign and broadcast the VARIANT the peer's signature covers (the
+			// canonical tx or the one with the peer's own output eliminated);
+			// signing the canonical tx against an eliminated-variant signature
+			// would assemble an unbroadcastable witness.
+			const built = this.buildVerifiedLegacyCloseTx(
+				channel,
+				feeSatoshis,
+				theirSig
 			);
-			if (
-				!signer.verifyCommitmentSig(
-					tx,
-					theirSig,
-					remoteFundingPubkey,
-					witnessScript,
-					Number(fundingSatoshis)
-				)
-			) {
+			if (!built) {
 				return null;
 			}
-			tx.setWitness(
+			const signer = this.signerFor(channel, false);
+			const ourSig = signer.signClosingTx(
+				built.tx,
+				built.witnessScript,
+				Number(built.fundingSatoshis)
+			);
+			built.tx.setWitness(
 				0,
 				ChannelSigner.buildFundingWitness(
 					ourSig,
 					theirSig,
-					localFundingPubkey,
-					remoteFundingPubkey,
-					witnessScript
+					built.localFundingPubkey,
+					built.remoteFundingPubkey,
+					built.witnessScript
 				)
 			);
-			return tx.toBuffer();
+			return built.tx.toBuffer();
 		} catch {
 			return null;
 		}

@@ -187,5 +187,14 @@ export function verify(
 	signature: Buffer,
 	strict = false
 ): boolean {
-	return ecc.verify(messageHash, publicKey, signature, strict);
+	// Malformed input (an out-of-range scalar in the signature, a non-point
+	// pubkey) makes the backend THROW rather than return false. Every caller
+	// treats this as a boolean judgment over untrusted bytes, and an escaping
+	// throw from a peer-message handler bypasses the refusal path entirely
+	// (issue 415's shape), so malformed means invalid here.
+	try {
+		return ecc.verify(messageHash, publicKey, signature, strict);
+	} catch {
+		return false;
+	}
 }

@@ -8,6 +8,8 @@ import {
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
+	HtlcDirection,
+	HtlcState,
 	isTaprootChannel
 } from '../../src/lightning/channel/types';
 import {
@@ -217,6 +219,34 @@ describe('option_taproot commitment round + nonce rotation (Stage B)', function 
 			htlcSignatures: [Buffer.alloc(64)],
 			partialSignatureWithNonce: Buffer.alloc(98, 1)
 		});
+		expectWireFailure(actions, channelId, /Invalid taproot HTLC signature/);
+		expect(bobChannel.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('a correctly-counted but MALFORMED taproot HTLC signature fails on the wire, not by throwing', function () {
+		// With one real HTLC and one 64-byte all-0xff signature, verifySchnorr
+		// used to THROW ('Expected Signature') before the refusal arm could
+		// run, leaving the channel NORMAL with no wire error (issue 409
+		// review, finding 1).
+		const { bobChannel, channelId } = setupReadyTaprootChannel();
+		bobChannel.getFullState().htlcs.set('received-0', {
+			id: 0n,
+			direction: HtlcDirection.RECEIVED,
+			amountMsat: 50_000_000n,
+			paymentHash: crypto.randomBytes(32),
+			cltvExpiry: 500,
+			onionRoutingPacket: Buffer.alloc(1366),
+			state: HtlcState.COMMITTED
+		});
+		let actions: ReturnType<Channel['handleCommitmentSigned']> = [];
+		expect(() => {
+			actions = bobChannel.handleCommitmentSigned({
+				channelId,
+				signature: Buffer.alloc(64),
+				htlcSignatures: [Buffer.alloc(64, 0xff)],
+				partialSignatureWithNonce: Buffer.alloc(98, 1)
+			});
+		}).to.not.throw();
 		expectWireFailure(actions, channelId, /Invalid taproot HTLC signature/);
 		expect(bobChannel.getState()).to.equal(ChannelState.ERRORED);
 	});

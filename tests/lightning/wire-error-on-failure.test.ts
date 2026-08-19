@@ -16,6 +16,7 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
 import {
 	ChannelManager,
 	IChannelManagerConfig
@@ -272,5 +273,121 @@ describe('wire error + channel failure on peer protocol violations', function ()
 		);
 		expect(t.bChannel.getState()).to.equal(ChannelState.NORMAL);
 		expect(t.aChannel.getState()).to.equal(ChannelState.NORMAL);
+	});
+
+	it('a MALFORMED commitment signature (out-of-range scalar) fails on the wire, not by throwing', function () {
+		// A 64-byte all-0xff signature made ecc.verify THROW ('Expected
+		// Signature') instead of returning false; the throw escaped every
+		// refusal arm to handleMessage's catch, leaving the channel NORMAL
+		// with no wire error (issue 409 review, finding 1's ECDSA twin).
+		const t = makePair('malformed-commit-sig');
+		t.corruptNext(MessageType.COMMITMENT_SIGNED, (p) => {
+			p.fill(0xff, 32, 96);
+			return p;
+		});
+		t.A.addHtlc(
+			t.channelId,
+			1_000_000n,
+			sha256(crypto.randomBytes(32)),
+			900,
+			Buffer.alloc(1366)
+		);
+		const wireErrors = wireErrorsIn(t.toA);
+		expect(wireErrors.length, 'wire error sent').to.be.greaterThan(0);
+		expect(wireErrors.join('; ')).to.contain('Invalid commitment signature');
+		expect(t.bChannel.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	describe('legacy coop-close signature verification (issue 409 review)', function () {
+		/** Shutdown-scripted NEGOTIATING pair with real balances on both sides. */
+		function closingPair(tag: string): IPair {
+			const t = makePair(tag);
+			for (const [ch, local, remote] of [
+				[t.aChannel, 700_000_000n, 300_000_000n],
+				[t.bChannel, 300_000_000n, 700_000_000n]
+			] as const) {
+				ch.getFullState().localBalanceMsat = local;
+				ch.getFullState().remoteBalanceMsat = remote;
+			}
+			// Freeze the negotiation right after the shutdown exchange: A's first
+			// closing_signed is dropped, so both sides hold scripts + state and
+			// the test can drive signatures by hand.
+			t.cutBefore(MessageType.CLOSING_SIGNED);
+			const res = t.A.initiateShutdown(
+				t.channelId,
+				Buffer.from('0014' + 'aa'.repeat(20), 'hex')
+			);
+			expect(res.ok, res.error).to.equal(true);
+			expect(t.aChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+			return t;
+		}
+
+		it('accepts a valid signature over the signer-eliminated-own-output variant (BOLT 2)', function () {
+			const t = closingPair('close-variant');
+			const fee = 500n;
+			// B signs the variant WITHOUT its own output (value donated to fees).
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const variant = (t.A as any).buildClosingTxAndScript(
+				t.aChannel,
+				fee,
+				true
+			);
+			expect(variant.tx.outs.length, 'one-output variant').to.equal(1);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const bSig = (t.B as any)
+				.signerFor(t.bChannel, false)
+				.signClosingTx(
+					variant.tx,
+					variant.witnessScript,
+					Number(variant.fundingSatoshis)
+				);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect((t.A as any).verifyPeerClosingSig(t.aChannel, fee, bSig)).to.equal(
+				true,
+				'eliminated-variant signature accepted'
+			);
+			// And the broadcastable build signs the SAME variant, not the
+			// canonical tx the signature does not cover.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const closeTx = (t.A as any).buildSignedMutualCloseTx(
+				t.aChannel,
+				fee,
+				bSig
+			);
+			expect(closeTx, 'close tx built').to.not.equal(null);
+			const parsed = bitcoin.Transaction.fromBuffer(closeTx!);
+			expect(parsed.outs.length, 'broadcasts the one-output variant').to.equal(
+				1
+			);
+		});
+
+		it('still rejects a signature that covers neither variant', function () {
+			const t = closingPair('close-variant-reject');
+			const fee = 500n;
+			// A structurally valid but wrong signature (signed over garbage).
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const canonical = (t.A as any).buildClosingTxAndScript(t.aChannel, 999n);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const wrongSig = (t.B as any)
+				.signerFor(t.bChannel, false)
+				.signClosingTx(
+					canonical.tx,
+					canonical.witnessScript,
+					Number(canonical.fundingSatoshis)
+				);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect(
+				(t.A as any).verifyPeerClosingSig(t.aChannel, fee, wrongSig)
+			).to.equal(false);
+			// A MALFORMED signature is invalid too, never a throw (finding 1).
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect(
+				(t.A as any).verifyPeerClosingSig(
+					t.aChannel,
+					fee,
+					Buffer.alloc(64, 0xff)
+				)
+			).to.equal(false);
+		});
 	});
 });

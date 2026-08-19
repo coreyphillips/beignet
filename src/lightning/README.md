@@ -484,12 +484,21 @@ restart state with reestablish ordering, never provable peer divergence.
 
 Closing-negotiation refusals are otherwise wire-visible by the same two
 clauses read against the negotiation itself rather than the update logs: an
-invalid closing signature, a malformed TLV, a non-echoed taproot fee, or a fee
-outside the responder band turns only on bytes and policy the peer held when
-it sent, and the single-round taproot session can never recover in-session,
-so a bare refusal is an unbounded stall nobody is told about. `handleShutdown`
-now runs its lifecycle gate FIRST so its wire-visible content checks (missing
-MuSig2 nonce, invalid scriptPubkey) can only fire on a live channel.
+invalid closing signature (checked on EVERY fee branch, and against both BOLT
+3 closing variants, including the one where the signer eliminated its own
+output), a malformed TLV, a non-echoed taproot fee, or a fee violating the
+dust limit we advertised at open or the shared ledger balance turns only on
+bytes and facts the peer held when it sent, and the single-round taproot
+session can never recover in-session, so a bare refusal is an unbounded stall
+nobody is told about. The taproot responder FEE BAND is the argued exception
+and stays local: it is derived from our private feerate estimate, a fact the
+peer never held, so a conformant initiator with a fresher fee view can land
+there on a perfectly payable fee. `handleShutdown` now runs its lifecycle
+gate FIRST so its wire-visible content checks (missing MuSig2 nonce, invalid
+scriptPubkey) can only fire on a live channel, and a close-family payload
+that fails to DECODE (a wrong-length TLV the handler checks can never see)
+is failed on the wire by the manager, scoped to the channel id at the
+payload's fixed offset.
 
 Deliberate refusals (all spec-legal): replacements of an open restored from a
 restart (the wallet signing closures die with the process; confirmation

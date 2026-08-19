@@ -5787,16 +5787,21 @@ export class Channel {
 		const peerSigValid = (feeSatoshis: bigint): boolean =>
 			!verifyClosingFn || verifyClosingFn(feeSatoshis, msg.signature);
 
+		// The signature must be valid whatever we think of the fee: BOLT 2 makes
+		// an invalid closing signature a MUST-fail regardless of which branch
+		// the fee lands in, and checking it only at agreement let a garbage-
+		// signed proposal drive the counter rounds until the final one.
+		if (!peerSigValid(msg.feeSatoshis)) {
+			return this._failChannelWithWireError(
+				'Coop-close: peer closing signature failed to verify'
+			);
+		}
+
 		// If their fee matches our last proposal → agreement reached
 		if (
 			this._state.lastProposedClosingFeeSat !== null &&
 			msg.feeSatoshis === this._state.lastProposedClosingFeeSat
 		) {
-			if (!peerSigValid(msg.feeSatoshis)) {
-				return this._failChannelWithWireError(
-					'Coop-close: peer closing signature failed to verify'
-				);
-			}
 			this._state.state = ChannelState.CLOSED;
 			return [
 				{
@@ -5811,11 +5816,6 @@ export class Channel {
 			msg.feeSatoshis >= this._state.closingFeeMin! &&
 			msg.feeSatoshis <= this._state.closingFeeMax!
 		) {
-			if (!peerSigValid(msg.feeSatoshis)) {
-				return this._failChannelWithWireError(
-					'Coop-close: peer closing signature failed to verify'
-				);
-			}
 			const sig = signClosingFn(msg.feeSatoshis);
 			const response: IClosingSignedMessage = {
 				channelId: this._state.channelId!,
@@ -5971,13 +5971,21 @@ export class Channel {
 			msg.feeSatoshis > maxAcceptableFee ||
 			msg.feeSatoshis < minAcceptableFee
 		) {
-			// OUR policy, told anyway (the issue 404 fee-bounds rule): the band
-			// is wide at the effective feerate, single-round means we cannot
-			// counter, and a bare refusal would leave the initiator re-offering
-			// the same fee forever with nobody told the close is dead.
-			return this._failChannelWithWireError(
-				`Taproot closing fee ${msg.feeSatoshis} outside acceptable range [${minAcceptableFee}, ${maxAcceptableFee}]`
-			);
+			// Deliberately a BARE local refusal (issue 409 carve-out): the band
+			// is derived from OUR private feerate estimate, a fact the peer
+			// never held, so a conformant initiator with a fresher fee view can
+			// land here on a fee the opener can perfectly well pay. A guard
+			// that kills a channel must carry no known false positives; the
+			// stall is recoverable (a reconnect starts a fresh closing session
+			// with fresh nonces and a fresh offer). The dust and opener-balance
+			// arms below stay wire-visible: those turn on the dust limit we
+			// advertised at open and on the shared ledger, facts the peer held.
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Taproot closing fee ${msg.feeSatoshis} outside acceptable range [${minAcceptableFee}, ${maxAcceptableFee}]`
+				}
+			];
 		}
 		if (isOpener) {
 			// Reserve our dust limit so an accepted fee can neither drop our output
@@ -6825,6 +6833,26 @@ export class Channel {
 	 * does the taproot closing_signed nonce-exchange arm, whose predicate
 	 * mixes our own unpersisted restart state with reestablish ordering.
 	 */
+	/**
+	 * Fail the channel for a peer message whose payload did not even DECODE
+	 * (a wrong-length TLV, a truncated field). The per-handler content checks
+	 * can never see such a message, because the codec throws first and the
+	 * throw used to die in ChannelManager.handleMessage's catch: no wire
+	 * error, no unwind (issue 409 review). Same lifecycle carve-out as the
+	 * handlers themselves: outside a live state the peer may not have seen
+	 * our terminal transition, so the refusal stays local.
+	 */
+	failFromMalformedPeerMessage(reason: string): ChannelAction[] {
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			this._state.state !== ChannelState.NEGOTIATING_CLOSING
+		) {
+			return [{ type: ChannelActionType.ERROR, message: reason }];
+		}
+		return this._failChannelWithWireError(reason);
+	}
+
 	private _failChannelWithWireError(
 		message: string,
 		cleanup?: IErrorAction['cleanup']

@@ -390,6 +390,59 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			expect(opener.getState()).to.equal(ChannelState.ERRORED);
 		});
 
+		it('fails the channel on the wire on a counter-path fee with an invalid signature', function () {
+			// BOLT 2 makes an invalid closing signature a MUST-fail whatever the
+			// fee; the counter-propose branch used to skip verification
+			// entirely, letting a garbage-signed proposal drive the negotiation
+			// until the final round (issue 409 review, finding 2).
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 10_000_000n, // far out of range: counter path
+					signature: crypto.randomBytes(64)
+				},
+				signFn,
+				() => false
+			);
+
+			expect(findSendAction(actions, MessageType.CLOSING_SIGNED)).to.be.null;
+			expectWireFailure(
+				actions,
+				opener.getChannelId()!,
+				/closing signature failed to verify/
+			);
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		it('control: a VALID signature on an out-of-range fee still counter-proposes', function () {
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 10_000_000n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn,
+				() => true
+			);
+
+			expect(findErrorAction(actions)).to.be.null;
+			expect(findSendAction(actions, MessageType.CLOSING_SIGNED)).to.not.be
+				.null;
+			expect(opener.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+		});
+
 		it('fails the channel on the wire on an in-range fee with an invalid signature', function () {
 			// The accept-their-fee branch has the same signature gate as the
 			// fee-echo branch; a garbage sig there must also be told to the peer.
