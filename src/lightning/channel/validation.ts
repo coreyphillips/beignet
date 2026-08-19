@@ -266,7 +266,37 @@ export function validatePeerOpenChannelParams(
 		return `dust_limit_satoshis ${msg.dustLimitSatoshis} exceeds maximum ${MAX_DUST_LIMIT_SATOSHIS}`;
 	}
 
+	// A reserve near the whole capacity leaves the acceptor a channel it can
+	// receive into and never spend from, for the channel's life: a free burn
+	// of our inbound liquidity and a channel slot. BOLT 2 states no maximum,
+	// but LND and CLN both cap a peer-proposed reserve at 20% of capacity,
+	// and computeChannelReserve applies the same cap to the reserve we
+	// propose. The MAX_DUST_LIMIT_SATOSHIS floor keeps tiny spec-legal opens
+	// admissible: the reserve must be >= the opener's dust limit, which the
+	// arm above already bounds, so the forced minimum can never exceed it.
+	const maxReserve = peerReserveCap(
+		msg.fundingSatoshis,
+		MAX_DUST_LIMIT_SATOSHIS
+	);
+	if (msg.channelReserveSatoshis > maxReserve) {
+		return `channel_reserve_satoshis ${msg.channelReserveSatoshis} exceeds maximum ${maxReserve}`;
+	}
+
 	return null;
+}
+
+/**
+ * The ceiling on a PEER-proposed channel_reserve_satoshis: 20% of capacity
+ * (LND/CLN precedent; computeChannelReserve caps our own proposals the same
+ * way), floored so a reserve the protocol itself forces up to a dust limit
+ * stays admissible on tiny channels. `dustFloor` is the largest dust limit
+ * the peer's reserve is REQUIRED to clear.
+ */
+function peerReserveCap(fundingSatoshis: bigint, dustFloor: bigint): bigint {
+	const cap = fundingSatoshis / 5n;
+	const floor =
+		dustFloor > MAX_DUST_LIMIT_SATOSHIS ? dustFloor : MAX_DUST_LIMIT_SATOSHIS;
+	return cap > floor ? cap : floor;
 }
 
 /**
@@ -315,6 +345,21 @@ export function validateAcceptChannelParams(
 		open.fundingSatoshis
 	) {
 		return 'combined channel reserves exceed funding_satoshis';
+	}
+
+	// The same 20% cap validatePeerOpenChannelParams holds an opener to
+	// (issue #391), from the other role: the combined bound above still
+	// admits an acceptor reserve near the whole capacity, which locks the
+	// funder's balance unspendable for the channel's life. Floored at the
+	// opener's dust limit because the arm above REQUIRES the acceptor's
+	// reserve to clear it, and ours is operator configuration the peer does
+	// not choose.
+	const maxAcceptReserve = peerReserveCap(
+		open.fundingSatoshis,
+		open.dustLimitSatoshis
+	);
+	if (accept.channelReserveSatoshis > maxAcceptReserve) {
+		return `channel_reserve_satoshis ${accept.channelReserveSatoshis} exceeds maximum ${maxAcceptReserve}`;
 	}
 
 	// to_self_delay must be > 0

@@ -21,7 +21,11 @@ import {
 	IBlindedHopData,
 	IBlindedPaymentPath
 } from '../onion/blinded-path';
-import { ChannelManager, IPerChannelKeys } from '../channel/channel-manager';
+import {
+	ChannelManager,
+	IPerChannelKeys,
+	txInputOutpoints
+} from '../channel/channel-manager';
 import { ChannelResult } from '../channel/types';
 import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
@@ -426,6 +430,14 @@ const FUNDING_FORGET_BLOCKS = 2016;
 interface IPendingFundingTx {
 	txHex: string;
 	phase: 'candidate' | 'authorized' | 'restored';
+	/**
+	 * The backend accepted (or already knew) this transaction at least once
+	 * in this process. 'authorized' alone only means we DECIDED to broadcast;
+	 * the handoff can still have failed, so authorization is never evidence
+	 * the transaction exists anywhere (issue #413). Process-local, like
+	 * phase: a restart answers unknown and self-heals on the next retry.
+	 */
+	broadcastSucceeded?: boolean;
 }
 
 export class LightningNode extends EventEmitter {
@@ -4675,6 +4687,8 @@ export class LightningNode extends EventEmitter {
 						.then((f) => (f > 0 ? this.clampEstimatedFeeRate(f) : undefined))
 				: Promise.resolve(undefined);
 
+		let builtTxHex: string | null = null;
+		let builtTxidHex: string | null = null;
 		feePromise
 			.then((satsPerByte) =>
 				this.fundingProvider!.buildFundingTransaction(
@@ -4685,6 +4699,11 @@ export class LightningNode extends EventEmitter {
 				)
 			)
 			.then(({ txHex, txid, outputIndex }) => {
+				// Captured for the catch below: a throw between here and
+				// setPendingFundingTx leaves pledged inputs with no entry the
+				// retirement sweep could ever release (issue #412).
+				builtTxHex = txHex;
+				builtTxidHex = txid.toString('hex');
 				// Set funding outpoint on state before signing (required for commitment building)
 				state.fundingTxid = txid;
 				state.fundingOutputIndex = outputIndex;
@@ -4730,6 +4749,14 @@ export class LightningNode extends EventEmitter {
 					message: (err as Error).message,
 					timestamp: Date.now()
 				} as ILightningError);
+				// The build succeeded but the open died before funding_created
+				// went out (the same boundary abortPendingOpen no-ops past):
+				// the peer never had anything to sign and nothing was
+				// broadcast, so the pledged inputs free here (issue #412).
+				if (builtTxHex && !channel.getChannelId()) {
+					if (builtTxidHex) this.deletePendingFundingTx(builtTxidHex);
+					this.releaseFundingTxPledges(builtTxHex);
+				}
 				// A funding failure after accept_channel must not strand the
 				// negotiated channel in SENT_OPEN/SENT_ACCEPT: tear it down and
 				// tell the peer, so neither side keeps a half-open channel that
@@ -4768,9 +4795,16 @@ export class LightningNode extends EventEmitter {
 		}
 		if (!this.channelManager.voidChannel(channelId)) return true;
 		this.chainWatcher?.removeWatchedFunding(channelId);
-		this.deletePendingFundingTx(
-			Buffer.from(txid, 'hex').reverse().toString('hex')
-		);
+		const pendingKey = Buffer.from(txid, 'hex').reverse().toString('hex');
+		const retainedTxHex = this.pendingFundingTxs.get(pendingKey)?.txHex;
+		this.deletePendingFundingTx(pendingKey);
+		// The void IS the durable decision that this funding is not on chain
+		// and will not be rebroadcast, so whatever pledges still reserve its
+		// inputs protect a transaction that will never exist (issue #412).
+		// This is also the terminal for a dead channel's preserved broadcast
+		// obligation, which retryPendingFundingBroadcasts deliberately never
+		// retires on channel state alone.
+		if (retainedTxHex) this.releaseFundingTxPledges(retainedTxHex);
 		if (!deleted) {
 			// The row survived but is durably condemned: the removal
 			// proceeds and the terminal event fires when the deletion lands
@@ -5148,23 +5182,36 @@ export class LightningNode extends EventEmitter {
 		// Covers all three routes that reach here: the watch:funding emit, the
 		// per-block sweep and the startup sweep.
 		if (!this.owesFundingBroadcast(txidHex)) return;
-		this.fundingProvider.broadcastTransaction(txHex).catch((err) => {
-			const message = (err as Error)?.message ?? String(err);
-			// A tx that is already mined cannot be re-sent; that is success,
-			// and funding:confirmed will retire the entry.
-			if (/already in block ?chain|already known|txn-already/i.test(message)) {
-				return;
-			}
-			this.emitStructuredLog('chain', 'funding_broadcast_failed', {
-				txid: txidHex,
-				error: message
+		this.fundingProvider
+			.broadcastTransaction(txHex)
+			.then(() => {
+				// The parent exists on the network now: closes built on top of
+				// it stop being fiction (issue #413). Entry mutation is safe
+				// even if the entry was retired meanwhile.
+				entry.broadcastSucceeded = true;
+				this.resumeSkippedCloseAfterBroadcast(txidHex);
+			})
+			.catch((err) => {
+				const message = (err as Error)?.message ?? String(err);
+				// A tx that is already mined cannot be re-sent; that is success,
+				// and funding:confirmed will retire the entry.
+				if (
+					/already in block ?chain|already known|txn-already/i.test(message)
+				) {
+					entry.broadcastSucceeded = true;
+					this.resumeSkippedCloseAfterBroadcast(txidHex);
+					return;
+				}
+				this.emitStructuredLog('chain', 'funding_broadcast_failed', {
+					txid: txidHex,
+					error: message
+				});
+				this.emit('node:error', {
+					code: 'FUNDING_BROADCAST_FAILED',
+					message: `${message} (funding tx ${txidHex} retained; will retry)`,
+					timestamp: Date.now()
+				} as ILightningError);
 			});
-			this.emit('node:error', {
-				code: 'FUNDING_BROADCAST_FAILED',
-				message: `${message} (funding tx ${txidHex} retained; will retry)`,
-				timestamp: Date.now()
-			} as ILightningError);
-		});
 	}
 
 	/**
@@ -5194,6 +5241,41 @@ export class LightningNode extends EventEmitter {
 				error: (err as Error)?.message ?? String(err)
 			});
 		});
+	}
+
+	/**
+	 * A close skipped because its funding parent was nowhere (issue #413)
+	 * resumes the moment the backend accepts the parent: a commitment on top
+	 * of the mempool parent is a legitimate exit, and waiting for depth would
+	 * leave an errored channel unresolved for no reason. handleChannelErrored
+	 * re-checks every guard, so this is idempotent and a no-op for channels
+	 * that are not ERRORED.
+	 */
+	private resumeSkippedCloseAfterBroadcast(txidHex: string): void {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
+			if (state.state === ChannelState.ERRORED && state.fundingVersion !== 2) {
+				this.handleChannelErrored(
+					state.channelId ?? state.temporaryChannelId,
+					'funding broadcast accepted for failed channel'
+				);
+			}
+			return;
+		}
+	}
+
+	/**
+	 * Best-effort release of the wallet pledges behind a retained funding
+	 * tx (issue #412). Never awaited: the provider ignores outpoints it no
+	 * longer holds, and the pledge TTL remains the backstop.
+	 */
+	private releaseFundingTxPledges(txHex: string): void {
+		const provider = this.fundingProvider;
+		if (!provider?.releaseInputPledges) return;
+		const outpoints = txInputOutpoints(txHex);
+		if (outpoints.length === 0) return;
+		void provider.releaseInputPledges(outpoints).catch(() => undefined);
 	}
 
 	/**
@@ -5240,11 +5322,42 @@ export class LightningNode extends EventEmitter {
 		}
 		for (const [txidHex, entry] of [...this.pendingFundingTxs]) {
 			const channelState = liveByTxid.get(txidHex);
-			if (channelState === undefined || deadStates.has(channelState)) {
+			// A dead channel STATE does not end the broadcast obligation:
+			// BOLT 2 starts it at funding_signed, and only a confirmation
+			// (funding:confirmed retires the entry) or a void
+			// (voidMissingFundingChannel deletes it) ends it. The close that
+			// resolved the channel may itself be a child of this very
+			// transaction, so an 'authorized' parent keeps rebroadcasting
+			// through ERRORED/FORCE_CLOSED/CLOSED (issue #413), and a parked
+			// candidate or restored entry whose funding_signed has landed
+			// keeps waiting for its authorization (issue #412). Only an entry
+			// whose channel is GONE, or whose obligation provably never began
+			// (awaitingFundingAuthorization answers from the row: without the
+			// remote commitment signature no authorization could ever have
+			// cleared its persist gate, in this process or a previous one),
+			// retires here.
+			const owed =
+				entry.phase === 'authorized' ||
+				this.awaitingFundingAuthorization(txidHex);
+			if (
+				channelState === undefined ||
+				(deadStates.has(channelState) && !owed)
+			) {
 				this.emitStructuredLog('chain', 'pending_funding_retired', {
 					txid: txidHex,
 					reason: channelState === undefined ? 'no channel' : channelState
 				});
+				// A never-owed entry retired against its LIVE row proves the
+				// broadcast was never authorized in any process (the persist
+				// carrying the remote signature gates the authorization), so
+				// its wallet input pledges free with it (issue #412). With
+				// the channel gone only a 'candidate' carries that proof
+				// (signed in this process, never authorized); a channel-less
+				// 'restored' or 'authorized' entry keeps its pledges, with
+				// the provider TTL as the backstop.
+				if (channelState !== undefined || entry.phase === 'candidate') {
+					this.releaseFundingTxPledges(entry.txHex);
+				}
 				this.deletePendingFundingTx(txidHex);
 				continue;
 			}
@@ -6285,6 +6398,12 @@ export class LightningNode extends EventEmitter {
 			// after a transient failure must get its per-block retry here, not
 			// only in handleNewBlock.
 			this.retrySpliceCloseRedrives();
+			// And for the funding broadcast obligation (issue #412): the
+			// per-block rebroadcast, the pledge renewals that ride it, and
+			// the dead-entry retirement (which releases v1 pledges) must all
+			// run on live headers, not only when an embedder drives
+			// handleNewBlock itself.
+			this.retryPendingFundingBroadcasts();
 		});
 		this.chainWatcher.on('error', (err: Error) => {
 			this.emit('node:error', {
@@ -6525,6 +6644,24 @@ export class LightningNode extends EventEmitter {
 		) {
 			if (retired) this.persistChannel(channelId);
 			void this.redriveSpliceAdoptedClose(channelId);
+			return;
+		}
+		// Issue #413: a v1 channel failed by a BOLT 1 error before its funding
+		// confirmed skipped its commitment broadcast. The outpoint exists now
+		// (fundingConfirmed just stamped it durably, via the watcher's
+		// channelManager.handleFundingConfirmed call): drive the close it
+		// owes. handleChannelErrored re-checks every guard, so this is
+		// idempotent.
+		if (
+			channel.getState() === ChannelState.ERRORED &&
+			state.fundingVersion === 1 &&
+			!state.spliceInFlight
+		) {
+			if (retired) this.persistChannel(channelId);
+			this.handleChannelErrored(
+				channelId,
+				'funding confirmed for failed channel'
+			);
 			return;
 		}
 		const inflight = state.spliceInFlight;
@@ -7781,6 +7918,31 @@ export class LightningNode extends EventEmitter {
 
 	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: string): void {
 		this.channelManager.handleFundingConfirmed(channelId, confirmedTxidHex);
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const state = channel.getFullState();
+		// The confirmation ends the broadcast obligation on manually driven
+		// chains too, exactly as onFundingWatchConfirmed retires it on
+		// watcher-driven ones: without this the retained parent rebroadcast
+		// and renewed its pledges forever (review of issue #412).
+		let retired = channel.clearFundingMissingClock();
+		if (state.fundingTxid) {
+			retired = channel.clearRetainedFundingPayload() || retired;
+			this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
+		}
+		if (retired) this.persistChannel(channelId);
+		// Issue #413: manually driven chains have no watcher event to
+		// re-drive the close an ERRORED v1 channel skipped while its funding
+		// was unconfirmed. fundingConfirmed just stamped the proof; drive it.
+		if (
+			channel.getState() === ChannelState.ERRORED &&
+			state.fundingVersion === 1
+		) {
+			this.handleChannelErrored(
+				channelId,
+				'funding confirmed for failed channel'
+			);
+		}
 	}
 
 	closeChannel(
@@ -14870,6 +15032,18 @@ export class LightningNode extends EventEmitter {
 			});
 			return;
 		}
+		if (
+			this.skipAutoCloseFundingNotOnChain(channel, state, `errored: ${reason}`)
+		) {
+			// A v1 open failed before its funding is known on chain (acceptor:
+			// the opener may never publish; manual opener: we cannot see the
+			// mempool). Leave the channel ERRORED: fundingConfirmed stamps the
+			// confirmation durably and re-drives this close, and the
+			// funding-missing clock (FUNDING_FORGET_BLOCKS) retires the
+			// channel if the funding never appears. Skip, do NOT void
+			// (issue #413).
+			return;
+		}
 		const result = this._forceCloseWithReason(
 			channelId,
 			this.getSweepDestinationScript(),
@@ -14903,6 +15077,53 @@ export class LightningNode extends EventEmitter {
 			channelId: channelId.toString('hex'),
 			reason
 		});
+	}
+
+	/**
+	 * The issue-#413 gate for automatically closing a v1 channel on chain:
+	 * the channel's own persisted local evidence, OR the opener carve-out -
+	 * WE staged this funding tx and the backend ACCEPTED it at least once
+	 * (retryPendingFundingBroadcasts keeps pushing it every block), so the
+	 * outpoint is ours to create and a commitment on top of the mempool
+	 * parent is a legitimate exit. Covers the zero-conf opener, whose ready
+	 * flags carry no chain evidence. Authorization alone is NOT enough: it
+	 * only means we decided to broadcast, and the handoff may have failed.
+	 * Process-local by design: channel state must never BE the broadcast
+	 * evidence. 'candidate' and 'restored' entries answer false - the tx may
+	 * never have left this process.
+	 */
+	private fundingKnownOnChain(channel: Channel, state: IChannelState): boolean {
+		if (channel.isFundingKnownOnChain()) return true;
+		const txidHex = state.fundingTxid!.toString('hex');
+		const entry = this.pendingFundingTxs.get(txidHex);
+		return entry?.phase === 'authorized' && entry.broadcastSucceeded === true;
+	}
+
+	/**
+	 * The shared guard every AUTOMATIC v1 force-close path runs before
+	 * broadcasting a commitment (issue #413): a commitment spending an
+	 * outpoint not known to exist cannot "close on chain" - the broadcast
+	 * fails or hangs while the node reports a close that did not happen, and
+	 * whatever the close was meant to claim cannot confirm without the
+	 * parent either. Returns true when the close must be skipped; the caller
+	 * leaves the channel as it is. fundingConfirmed stamps the confirmation
+	 * durably when it arrives and the failure-resolution paths re-drive the
+	 * close then. The operator API (forceCloseChannel) stays ungated: an
+	 * explicit command may know better than we do.
+	 */
+	private skipAutoCloseFundingNotOnChain(
+		channel: Channel,
+		state: IChannelState,
+		context: string
+	): boolean {
+		if (state.fundingVersion === 2) return false;
+		if (!state.fundingTxid) return false;
+		if (this.fundingKnownOnChain(channel, state)) return false;
+		this.emitStructuredLog('channel', 'close_skipped_funding_not_on_chain', {
+			channelId: (state.channelId ?? state.temporaryChannelId).toString('hex'),
+			context
+		});
+		return true;
 	}
 
 	/**
@@ -14982,6 +15203,18 @@ export class LightningNode extends EventEmitter {
 							this.preimages.has(paymentHashHex)));
 				if (haveClaim && htlc.cltvExpiry - blockHeight <= claimBuffer) {
 					const channelId = state.channelId || state.temporaryChannelId;
+					// Without the funding parent on chain the HTLC-success claim
+					// cannot confirm either, so this close protects nothing
+					// (issue #413).
+					if (
+						this.skipAutoCloseFundingNotOnChain(
+							channel,
+							state,
+							'HTLC_CLAIM_FORCE_CLOSE'
+						)
+					) {
+						continue;
+					}
 					this.emit('node:error', {
 						code: 'HTLC_CLAIM_FORCE_CLOSE',
 						channelId,
@@ -15125,6 +15358,17 @@ export class LightningNode extends EventEmitter {
 				// Outbound unresolved: never fail upstream on time alone. Force-close
 				// the inbound channel so resolution moves on-chain, and keep the forward
 				// mapping so a late downstream settlement can still be honored.
+				// Unless the funding parent is not known on chain, in which case
+				// nothing built on it can resolve anything (issue #413).
+				if (
+					this.skipAutoCloseFundingNotOnChain(
+						channel,
+						state,
+						'FORWARD_TIMEOUT_FORCE_CLOSE'
+					)
+				) {
+					continue;
+				}
 				this.emit('node:error', {
 					code: 'FORWARD_TIMEOUT_FORCE_CLOSE',
 					channelId,
@@ -15936,6 +16180,18 @@ export class LightningNode extends EventEmitter {
 					? 0
 					: LightningNode.OFFERED_HTLC_FORCE_CLOSE_GRACE_BLOCKS;
 				if (blockHeight >= htlc.cltvExpiry + graceBlocks) {
+					// Without the funding parent on chain the timeout claim
+					// cannot confirm and neither can the downstream's preimage
+					// claim: the close protects nothing (issue #413).
+					if (
+						this.skipAutoCloseFundingNotOnChain(
+							channel,
+							state,
+							'HTLC_EXPIRY_FORCE_CLOSE'
+						)
+					) {
+						continue;
+					}
 					this.emit('node:error', {
 						code: 'HTLC_EXPIRY_FORCE_CLOSE',
 						channelId,
@@ -16446,7 +16702,18 @@ export class LightningNode extends EventEmitter {
 					this._stuckChannelTracker.set(reestablishKey, blockHeight);
 				} else {
 					const startHeight = this._stuckChannelTracker.get(reestablishKey)!;
-					if (blockHeight - startHeight > this.reestablishTimeoutBlocks) {
+					if (
+						blockHeight - startHeight > this.reestablishTimeoutBlocks &&
+						// Issue #413: a vanished peer whose funding never reached
+						// the chain has nothing to close on. The tracker stays
+						// armed; the close fires once the funding is known, and
+						// the funding-missing clock retires the channel if not.
+						!this.skipAutoCloseFundingNotOnChain(
+							channel,
+							state,
+							'REESTABLISH_TIMEOUT_FORCE_CLOSED'
+						)
+					) {
 						try {
 							const destScript = bitcoin.payments.p2wpkh({
 								pubkey: this.fundingPubkey
@@ -16493,24 +16760,41 @@ export class LightningNode extends EventEmitter {
 				} else {
 					const startHeight = this._stuckChannelTracker.get(erroredKey)!;
 					if (blockHeight - startHeight > this.reestablishTimeoutBlocks) {
-						try {
-							this._forceCloseWithReason(
-								channelId,
-								this.getSweepDestinationScript(),
-								this.resolveForceCloseFeeRatePerVbyte(),
-								'ERRORED_TIMEOUT_FORCE_CLOSED'
-							);
-							this._stuckChannelTracker.delete(erroredKey);
-							this.emit('node:error', {
-								code: 'ERRORED_TIMEOUT_FORCE_CLOSED',
-								channelId,
-								message: `Channel ${channelId.toString('hex')} ERRORED for > ${
-									this.reestablishTimeoutBlocks
-								} blocks with no close from the peer; force-closing to recover funds`,
-								timestamp: Date.now()
-							} as ILightningError);
-						} catch {
-							// Ignore force-close errors
+						if (
+							this.skipAutoCloseFundingNotOnChain(
+								channel,
+								state,
+								'errored timeout backstop'
+							)
+						) {
+							// Issue #413: the timeout has served but the close
+							// cannot happen yet. KEEP the tracker: the close
+							// fires on the first block after the funding is
+							// known on chain; if it never appears, the
+							// funding-missing clock (FUNDING_FORGET_BLOCKS)
+							// retires the channel instead.
+						} else {
+							try {
+								this._forceCloseWithReason(
+									channelId,
+									this.getSweepDestinationScript(),
+									this.resolveForceCloseFeeRatePerVbyte(),
+									'ERRORED_TIMEOUT_FORCE_CLOSED'
+								);
+								this._stuckChannelTracker.delete(erroredKey);
+								this.emit('node:error', {
+									code: 'ERRORED_TIMEOUT_FORCE_CLOSED',
+									channelId,
+									message: `Channel ${channelId.toString(
+										'hex'
+									)} ERRORED for > ${
+										this.reestablishTimeoutBlocks
+									} blocks with no close from the peer; force-closing to recover funds`,
+									timestamp: Date.now()
+								} as ILightningError);
+							} catch {
+								// Ignore force-close errors
+							}
 						}
 					}
 				}
@@ -16531,7 +16815,15 @@ export class LightningNode extends EventEmitter {
 					this._stuckChannelTracker.set(shutdownKey, blockHeight);
 				} else {
 					const startHeight = this._stuckChannelTracker.get(shutdownKey)!;
-					if (blockHeight - startHeight > 10) {
+					if (
+						blockHeight - startHeight > 10 &&
+						// Issue #413: no close without the funding on chain.
+						!this.skipAutoCloseFundingNotOnChain(
+							channel,
+							state,
+							'STUCK_CHANNEL_FORCE_CLOSED'
+						)
+					) {
 						// Force close the stuck channel
 						try {
 							const destScript = bitcoin.payments.p2wpkh({

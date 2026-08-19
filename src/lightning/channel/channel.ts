@@ -2368,6 +2368,18 @@ export class Channel {
 				this._state.v2InFlight.confirmed = true;
 				return [...prefix, { type: ChannelActionType.PERSIST_STATE }];
 			}
+			// A v1 depth observation the ready flow cannot consume: the
+			// zero-conf fast-track already ran it (NORMAL long before real
+			// depth), or the channel has already failed. The callback is
+			// one-shot, so record durably that the outpoint now exists. The
+			// node's failure resolution (handleChannelErrored and the ERRORED
+			// block backstop) keys off this to broadcast the exit it skipped
+			// or would otherwise skip while the funding was not known on
+			// chain (issue #413).
+			if (!this._state.v2InFlight && !this._state.fundingConfirmedLate) {
+				this._state.fundingConfirmedLate = true;
+				return [...prefix, { type: ChannelActionType.PERSIST_STATE }];
+			}
 			return prefix;
 		}
 		// One attempt reached depth, so every other attempt of this open is
@@ -16315,6 +16327,37 @@ export class Channel {
 			rec.fullySigned ||
 			(rec.ourWalletInputIndices.length === 0 && rec.ourWitnesses.length === 0)
 		);
+	}
+
+	/**
+	 * Whether this channel holds affirmative, persisted, LOCAL evidence that
+	 * its funding transaction reached the chain (issue #413). Only our own
+	 * watcher's observations count: remoteChannelReady is the peer's claim
+	 * (a hostile peer sends channel_ready early, then an error, to make us
+	 * broadcast against an outpoint we never saw), and shortChannelId-shaped
+	 * values can be peer-supplied on zero-conf paths, so neither is admitted.
+	 * The node composes its process-local knowledge (a funding broadcast we
+	 * ourselves handed to the backend) at the call site. Like
+	 * isV2AttemptBroadcastable, every consumer must fail toward KEEPING
+	 * state: "unknown" answers false, and false means skip the commitment
+	 * broadcast, never fabricate a close.
+	 */
+	isFundingKnownOnChain(): boolean {
+		const s = this._state;
+		// Announcement depth: 6 confs seen by our own watcher while NORMAL.
+		if (s.fundingConfirmationHeight > 0) return true;
+		// Depth observed by our watcher outside the ready flow (issue #413):
+		// after the channel failed, or after the zero-conf fast-track.
+		if (s.fundingConfirmedLate === true) return true;
+		// v2: confirmation is stamped durably on the attempt records by our
+		// own depth callback.
+		if (this._v2AnyAttemptConfirmed()) return true;
+		// The zero-conf fast-track sets localChannelReady with no chain
+		// evidence (the fundingConfirmed short-circuit at funding_signed),
+		// so the flag only counts when the ready flow required real depth.
+		if (s.zeroConfEnabled && s.trustedPeer) return false;
+		// localChannelReady: our own watcher saw minimumDepth.
+		return s.localChannelReady;
 	}
 
 	/**

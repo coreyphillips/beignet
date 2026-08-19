@@ -34,6 +34,7 @@ import {
 	deserializeChannelState,
 	serializeChannelState
 } from '../../src/lightning/storage/serialization';
+import { encodeErrorMessage } from '../../src/lightning/message/error';
 import {
 	CRASH_V1_PROFILE,
 	GuardianClient,
@@ -730,14 +731,459 @@ describe('Funding broadcast authorization (BOLT 2 ordering)', function () {
 		bob.destroy();
 	});
 
+	it('an owed funding survives the channel dying, and its failed broadcast is never chain evidence', async function () {
+		// Review of issue 413: 'authorized' only means we DECIDED to
+		// broadcast. With the backend down the handoff failed, so an error
+		// must not force-close on top of a parent that reached nobody, and
+		// the obligation (BOLT 2: MUST broadcast after funding_signed) must
+		// survive the channel dying rather than retire with it.
+		const broadcasts: string[] = [];
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		let fundingTxidHex = '';
+		let fail = true;
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				return built;
+			},
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				if (fail) throw new Error('backend down');
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			},
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(51, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(52));
+		const events: string[] = [];
+		alice.on('node:error', (e: ILightningError) => events.push(e.code));
+		bob.on('node:error', () => {});
+		connectNodes(alice, bob);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		// funding_signed landed, authorization fired, the broadcast FAILED.
+		expect(broadcasts).to.have.length(1);
+		expect(pendingMap(alice).size).to.equal(1);
+
+		const channelId = alice
+			.getChannelManager()
+			.listChannels()[0]
+			.getChannelId()!;
+		alice.handlePeerMessage(
+			bob.getNodeId(),
+			17, // ERROR
+			encodeErrorMessage({ channelId, data: Buffer.from('nope') })
+		);
+		await tick();
+		// No fictional close: the parent reached nobody.
+		expect(events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+
+		// The dead channel state does not retire the obligation: the entry
+		// survives, rebroadcasts, and its pledges stay frozen.
+		alice.handleNewBlock(500);
+		await tick();
+		expect(pendingMap(alice).has(fundingTxidHex)).to.equal(true);
+		expect(broadcasts).to.have.length(2);
+		expect(released).to.have.length(0);
+
+		// Backend heals: the parent finally reaches the network, and the
+		// accepted broadcast resumes the skipped close at once. Waiting for
+		// depth would leave the channel ERRORED for no reason: a commitment
+		// on top of the mempool parent is a legitimate exit.
+		fail = false;
+		alice.handleNewBlock(501);
+		await tick();
+		expect(broadcasts.length).to.be.greaterThanOrEqual(3);
+		expect(events).to.include('CHANNEL_FAILED_FORCE_CLOSED');
+
+		// The parent keeps rebroadcasting through the terminal state...
+		const preRetire = broadcasts.length;
+		alice.handleNewBlock(502);
+		await tick();
+		expect(pendingMap(alice).has(fundingTxidHex)).to.equal(true);
+		expect(broadcasts.length).to.equal(preRetire + 1);
+
+		// ...until the confirmation retires the obligation, on manually
+		// driven chains too (no watcher event fires here).
+		alice.handleFundingConfirmed(channelId);
+		await tick();
+		expect(pendingMap(alice).size).to.equal(0);
+		const postRetire = broadcasts.length;
+		alice.handleNewBlock(503);
+		await tick();
+		expect(broadcasts.length).to.equal(postRetire);
+		expect(released).to.have.length(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a parked candidate whose funding_signed landed keeps its entry and pledges (issue 412)', async function () {
+		// The durability barrier can hold the authorization while
+		// funding_signed has already landed: the obligation exists durably
+		// (a restart re-adopts and re-asks), so an error racing the barrier
+		// must not release the inputs a crash-recovered broadcast would
+		// spend. awaitingFundingAuthorization is the guard.
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		let fundingTxidHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				return built;
+			},
+			broadcastTransaction: async (txHex) =>
+				bitcoin.Transaction.fromHex(txHex).getId(),
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(53, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(54));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectNodes(alice, bob);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		// Model the parked barrier: funding_signed landed but the
+		// authorization never fired in this process.
+		const entry = pendingMap(alice).get(fundingTxidHex) as unknown as {
+			phase: string;
+			broadcastSucceeded?: boolean;
+		};
+		entry.phase = 'candidate';
+		entry.broadcastSucceeded = undefined;
+
+		const channelId = alice
+			.getChannelManager()
+			.listChannels()[0]
+			.getChannelId()!;
+		alice.handlePeerMessage(
+			bob.getNodeId(),
+			17, // ERROR
+			encodeErrorMessage({ channelId, data: Buffer.from('nope') })
+		);
+		await tick();
+		alice.handleNewBlock(500);
+		await tick();
+
+		expect(
+			pendingMap(alice).has(fundingTxidHex),
+			'the owed entry survives the dead channel'
+		).to.equal(true);
+		expect(released).to.have.length(0);
+
+		// The restart shape of the same obligation: a 'restored' entry whose
+		// row carries the remote signature is equally owed.
+		entry.phase = 'restored';
+		alice.handleNewBlock(501);
+		await tick();
+		expect(
+			pendingMap(alice).has(fundingTxidHex),
+			'a restored owed entry survives too'
+		).to.equal(true);
+		expect(released).to.have.length(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a restored entry whose row proves no obligation retires and frees its pledges (issue 412)', async function () {
+		// Restart re-freeze: every restored entry used to be treated as owed,
+		// so an errored open with no remote signature renewed its pledges
+		// forever after a restart. The row is the proof: without the remote
+		// commitment signature no authorization could ever have cleared its
+		// persist gate, in this process or a previous one.
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		let fundingTxidHex = '';
+		let builtTxHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				builtTxHex = built.txHex;
+				return built;
+			},
+			broadcastTransaction: async (txHex) =>
+				bitcoin.Transaction.fromHex(txHex).getId(),
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(57, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(58));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectWithheld(alice, bob, FUNDING_SIGNED);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		const channelId = alice
+			.getChannelManager()
+			.listChannels()[0]
+			.getChannelId()!;
+		alice.handlePeerMessage(
+			bob.getNodeId(),
+			17, // ERROR
+			encodeErrorMessage({ channelId, data: Buffer.from('nope') })
+		);
+		await tick();
+
+		// Model the post-restart entry: same row (ERRORED, no remote
+		// signature), authorization unknown.
+		const entry = pendingMap(alice).get(fundingTxidHex) as unknown as {
+			phase: string;
+		};
+		entry.phase = 'restored';
+
+		alice.handleNewBlock(500);
+		await tick();
+		const expected = bitcoin.Transaction.fromHex(builtTxHex).ins.map(
+			(input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			})
+		);
+		expect(pendingMap(alice).size).to.equal(0);
+		expect(released).to.deep.equal([expected]);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('the retirement sweep runs on production headers too (issue 412)', async function () {
+		// The live ChainWatcher block listener, not only the embedder-driven
+		// handleNewBlock, must run the retry sweep: rebroadcasts, pledge
+		// renewals and the dead-entry retirement all ride it.
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		let builtTxHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				builtTxHex = built.txHex;
+				return built;
+			},
+			broadcastTransaction: async (txHex) =>
+				bitcoin.Transaction.fromHex(txHex).getId(),
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(55, {
+				fundingProvider: provider,
+				chainBackend: new ControlledBackend()
+			})
+		);
+		const bob = new LightningNode(makeNodeConfig(56));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectWithheld(alice, bob, FUNDING_SIGNED);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		expect(pendingMap(alice).size).to.equal(1);
+
+		const channelId = alice
+			.getChannelManager()
+			.listChannels()[0]
+			.getChannelId()!;
+		alice.handlePeerMessage(
+			bob.getNodeId(),
+			17, // ERROR
+			encodeErrorMessage({ channelId, data: Buffer.from('nope') })
+		);
+		await tick();
+
+		// A production header, not handleNewBlock.
+		alice.getChainWatcher()!.emit('block', 500);
+		await tick();
+
+		const expected = bitcoin.Transaction.fromHex(builtTxHex).ins.map(
+			(input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			})
+		);
+		expect(released).to.deep.equal([expected]);
+		expect(pendingMap(alice).size).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a refused funding_signed frees the pledged inputs at once (issue 412)', async function () {
+		const broadcasts: string[] = [];
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		let builtTxHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				builtTxHex = built.txHex;
+				return built;
+			},
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			},
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(47, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(48));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+
+		// connectWithheld, except the held funding_signed is delivered with a
+		// flipped signature byte, so the refusal lands after the promotion the
+		// way a real socket orders it.
+		const held: Array<{ type: number; payload: Buffer }> = [];
+		alice.on(
+			'message:outbound',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (pubkey === bob.getNodeId()) {
+					bob.handlePeerMessage(alice.getNodeId(), type, payload);
+				}
+			}
+		);
+		bob.on(
+			'message:outbound',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (pubkey !== alice.getNodeId()) return;
+				if (type === FUNDING_SIGNED) {
+					held.push({ type, payload });
+					return;
+				}
+				alice.handlePeerMessage(bob.getNodeId(), type, payload);
+			}
+		);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		expect(pendingMap(alice).size).to.equal(1);
+		expect(released).to.have.length(0);
+
+		// [32 channel_id][64 signature]: flip a signature byte and deliver.
+		const copy = Buffer.from(held[0].payload);
+		copy[40] ^= 0xff;
+		alice.handlePeerMessage(bob.getNodeId(), held[0].type, copy);
+		await tick();
+
+		const expected = bitcoin.Transaction.fromHex(builtTxHex).ins.map(
+			(input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			})
+		);
+		expect(released, 'released immediately, before any block').to.have.length(
+			1
+		);
+		expect(released[0]).to.deep.equal(expected);
+		expect(alice.getChannelManager().listChannels()).to.have.length(0);
+
+		// The next block retires the candidate entry without broadcasting.
+		// The sweep's own release is a benign no-op at the provider.
+		alice.handleNewBlock(500);
+		await tick();
+		expect(pendingMap(alice).size).to.equal(0);
+		expect(broadcasts).to.have.length(0);
+		for (const r of released) expect(r).to.deep.equal(expected);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a candidate entry retired for a dead channel frees the pledges at the next block (issue 412)', async function () {
+		// A peer ERROR after funding_created runs failChannelByError: the
+		// channel is ERRORED but stays registered, so the immediate release
+		// above never fires. The entry-retirement sweep is the seam that
+		// catches this shape, and every other path that drops a pre-broadcast
+		// v1 channel.
+		const broadcasts: string[] = [];
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		let builtTxHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				builtTxHex = built.txHex;
+				return built;
+			},
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			},
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(49, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(50));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectWithheld(alice, bob, FUNDING_SIGNED);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		expect(pendingMap(alice).size).to.equal(1);
+
+		const channelId = alice
+			.getChannelManager()
+			.listChannels()[0]
+			.getChannelId()!;
+		alice.handlePeerMessage(
+			bob.getNodeId(),
+			17, // ERROR
+			encodeErrorMessage({ channelId, data: Buffer.from('nope') })
+		);
+		await tick();
+		expect(released, 'still registered: no immediate release').to.have.length(
+			0
+		);
+
+		alice.handleNewBlock(500);
+		await tick();
+		const expected = bitcoin.Transaction.fromHex(builtTxHex).ins.map(
+			(input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			})
+		);
+		expect(released, 'freed with the retired entry').to.deep.equal([expected]);
+		expect(pendingMap(alice).size).to.equal(0);
+		expect(broadcasts).to.have.length(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	it('the obligation begins the moment funding_signed lands', async function () {
 		const broadcasts: string[] = [];
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
 		const provider: IFundingProvider = {
 			buildFundingTransaction: async (address, amountSats) =>
 				buildMockFundingTx(address, Number(amountSats)),
 			broadcastTransaction: async (txHex) => {
 				broadcasts.push(txHex);
 				return bitcoin.Transaction.fromHex(txHex).getId();
+			},
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
 			}
 		};
 		const alice = new LightningNode(
@@ -765,6 +1211,9 @@ describe('Funding broadcast authorization (BOLT 2 ordering)', function () {
 		await tick();
 		expect(broadcasts).to.have.length(2);
 		expect(broadcasts[1]).to.equal(broadcasts[0]);
+		// An authorized, broadcast funding never releases its pledges, on
+		// either issue-412 seam: the coins are committed until it confirms.
+		expect(released).to.have.length(0);
 
 		alice.destroy();
 		bob.destroy();

@@ -18,7 +18,9 @@ import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	ChannelState,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	HtlcDirection,
+	HtlcState
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -28,6 +30,7 @@ import {
 	encodeErrorMessage
 } from '../../src/lightning/message/error';
 import { encodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
+import { encodeChannelReadyMessage } from '../../src/lightning/message/channel-funding';
 import { encodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 import {
 	encodeTxAbortMessage,
@@ -443,6 +446,232 @@ describe('Issue #175: a BOLT 1 error fails the channel on chain', function () {
 
 		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
 		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+});
+
+// ─── Issue #413: no close against an outpoint not known to exist ───
+
+function openUnconfirmedChannel(
+	alice: LightningNode,
+	bob: LightningNode
+): Buffer {
+	// openReadyChannel minus the handleFundingConfirmed calls: funded (both
+	// commitment signatures exchanged), fundingTxid set, nothing on chain.
+	const channel = alice.openChannel(bob.getNodeId(), 1_000_000n);
+	return alice.createFunding(
+		channel,
+		crypto.randomBytes(32),
+		0,
+		crypto.randomBytes(64)
+	)!;
+}
+
+function setupUnconfirmed(seedBase: number): IFixture {
+	const alice = createNode(seedBase);
+	const bob = createNode(seedBase + 1);
+	connectNodes(alice, bob);
+	const channelId = openUnconfirmedChannel(alice, bob);
+	const events: string[] = [];
+	alice.on('node:error', (err: any) => events.push(err.code));
+	return {
+		alice,
+		bob,
+		channelId,
+		events,
+		aliceState: () =>
+			(alice as any).channelManager.getChannel(channelId).getFullState().state
+	};
+}
+
+describe('Issue #413: a v1 channel with unconfirmed funding is not closed on chain', function () {
+	this.timeout(10_000);
+
+	it('skips the broadcast and leaves the channel ERRORED', () => {
+		// The commitment spends an outpoint that may not exist (the acceptor's
+		// opener may never publish). Broadcasting it fails or hangs while the
+		// node reports a close that did not happen.
+		const fx = setupUnconfirmed(91);
+
+		sendErrorToAlice(fx, fx.channelId);
+
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSE_FAILED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('drives the skipped close the moment the funding confirms', () => {
+		const fx = setupUnconfirmed(93);
+
+		sendErrorToAlice(fx, fx.channelId);
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+
+		// The embedder reports the confirmation: fundingConfirmed stamps the
+		// proof durably and the node re-drives the close it owed.
+		fx.alice.handleFundingConfirmed(fx.channelId);
+
+		expect(fx.aliceState()).to.equal(ChannelState.FORCE_CLOSED);
+		expect(fx.events).to.include('CHANNEL_FAILED_FORCE_CLOSED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('the ERRORED block backstop waits for the stamp, then fires', () => {
+		// Covers the restart/watcher-less shape: the confirmation is stamped
+		// through the manager alone (no node-level re-drive), and the per-block
+		// backstop picks it up because the skip kept the tracker armed.
+		const fx = setupUnconfirmed(95);
+		const HEIGHT = 800_000;
+		const timeout = (fx.alice as any).reestablishTimeoutBlocks;
+
+		sendErrorToAlice(fx, fx.channelId);
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+
+		(fx.alice as any).scanStuckChannels(HEIGHT);
+		(fx.alice as any).scanStuckChannels(HEIGHT + timeout + 1);
+		expect(fx.events).to.not.include('ERRORED_TIMEOUT_FORCE_CLOSED');
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+
+		(fx.alice as any).channelManager.handleFundingConfirmed(fx.channelId);
+		(fx.alice as any).scanStuckChannels(HEIGHT + timeout + 2);
+
+		expect(fx.events).to.include('ERRORED_TIMEOUT_FORCE_CLOSED');
+		expect(fx.aliceState()).to.equal(ChannelState.FORCE_CLOSED);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it("a peer's early channel_ready is not funding evidence", () => {
+		// channel_ready is the PEER'S claim: a hostile peer sends it before the
+		// funding confirms, then errors the channel, trying to make us
+		// broadcast against an outpoint we never observed.
+		const fx = setupUnconfirmed(97);
+
+		fx.alice.handlePeerMessage(
+			fx.bob.getNodeId(),
+			MessageType.CHANNEL_READY,
+			encodeChannelReadyMessage({
+				channelId: fx.channelId,
+				secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
+			})
+		);
+		sendErrorToAlice(fx, fx.channelId);
+
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+});
+
+// ─── Issue #413 review: zero-conf ready flags carry no chain evidence ───
+
+function setupZeroConf(seedBase: number): IFixture {
+	const alice = createNode(seedBase);
+	const bob = createNode(seedBase + 1);
+	connectNodes(alice, bob);
+	alice.addTrustedPeer(bob.getNodeId());
+	bob.addTrustedPeer(alice.getNodeId());
+	const channel = alice.openChannel(
+		bob.getNodeId(),
+		1_000_000n,
+		undefined,
+		undefined,
+		false,
+		true
+	);
+	const channelId = alice.createFunding(
+		channel,
+		crypto.randomBytes(32),
+		0,
+		crypto.randomBytes(64)
+	)!;
+	const events: string[] = [];
+	alice.on('node:error', (err: any) => events.push(err.code));
+	return {
+		alice,
+		bob,
+		channelId,
+		events,
+		aliceState: () =>
+			(alice as any).channelManager.getChannel(channelId).getFullState().state
+	};
+}
+
+describe('Issue #413: zero-conf fast-track flags are not chain evidence', function () {
+	this.timeout(10_000);
+
+	it('an errored zero-conf channel with unconfirmed funding is not closed', () => {
+		const fx = setupZeroConf(101);
+		// The fast-track ran the ready flow with no chain evidence.
+		expect(fx.aliceState()).to.equal(ChannelState.NORMAL);
+
+		sendErrorToAlice(fx, fx.channelId);
+
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('a real confirmation while NORMAL is stamped and unlocks the close', () => {
+		// The depth callback is one-shot and the zero-conf ready flow already
+		// ran, so without the durable stamp this observation would be thrown
+		// away and a later error would leave a funded channel ERRORED forever.
+		const fx = setupZeroConf(103);
+		expect(fx.aliceState()).to.equal(ChannelState.NORMAL);
+
+		fx.alice.handleFundingConfirmed(fx.channelId);
+		expect(
+			(fx.alice as any).channelManager.getChannel(fx.channelId).getFullState()
+				.fundingConfirmedLate
+		).to.equal(true);
+
+		sendErrorToAlice(fx, fx.channelId);
+
+		expect(fx.aliceState()).to.equal(ChannelState.FORCE_CLOSED);
+		expect(fx.events).to.include('CHANNEL_FAILED_FORCE_CLOSED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('the HTLC expiry backstop honors the funding gate too', () => {
+		// The expiry scanners admit ERRORED channels, so without the gate an
+		// unconfirmed zero-conf channel with an offered HTLC skipped the
+		// error-driven close only to be force-closed at expiry anyway. The
+		// claim the close protects cannot confirm without the parent either.
+		const fx = setupZeroConf(105);
+		const state = (fx.alice as any).channelManager
+			.getChannel(fx.channelId)
+			.getFullState();
+		state.htlcs.set('offered-0', {
+			id: 0n,
+			amountMsat: 50_000_000n,
+			paymentHash: crypto.randomBytes(32),
+			cltvExpiry: 500,
+			onionRoutingPacket: Buffer.alloc(1366),
+			direction: HtlcDirection.OFFERED,
+			state: HtlcState.COMMITTED
+		});
+		state.localBalanceMsat -= 50_000_000n;
+
+		sendErrorToAlice(fx, fx.channelId);
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+
+		// Past expiry, zero grace on an errored channel: without the gate
+		// this closed on an outpoint never observed.
+		(fx.alice as any).scanExpiringOfferedHtlcs(600);
+		expect(fx.events).to.not.include('HTLC_EXPIRY_FORCE_CLOSE');
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
+
+		// Once the funding is known on chain the same backstop does its job.
+		(fx.alice as any).channelManager.handleFundingConfirmed(fx.channelId);
+		(fx.alice as any).scanExpiringOfferedHtlcs(600);
+		expect(fx.events).to.include('HTLC_EXPIRY_FORCE_CLOSE');
+		expect(fx.aliceState()).to.equal(ChannelState.FORCE_CLOSED);
 		fx.alice.destroy();
 		fx.bob.destroy();
 	});
