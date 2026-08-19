@@ -17,7 +17,10 @@ import {
 	decodeAcceptChannelMessage,
 	encodeAcceptChannelMessage
 } from '../../src/lightning/message/channel-open';
-import { decodeErrorMessage } from '../../src/lightning/message/error';
+import {
+	decodeErrorMessage,
+	encodeErrorMessage
+} from '../../src/lightning/message/error';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { IFundingProvider } from '../../src/lightning/node/types';
 
@@ -920,9 +923,6 @@ describe('Channel Manager', function () {
 			alice.on('error', () => {
 				/* surfacing tested separately */
 			});
-			const {
-				encodeErrorMessage
-			} = require('../../src/lightning/message/error');
 			const payload = encodeErrorMessage({
 				channelId,
 				data: Buffer.from('it broke', 'utf8')
@@ -935,9 +935,6 @@ describe('Channel Manager', function () {
 
 		it('surfaces a remote warning without failing the channel', function () {
 			const { alice, channelId } = openAndReadyChannel();
-			const {
-				encodeErrorMessage
-			} = require('../../src/lightning/message/error');
 			const warnings: string[] = [];
 			alice.on('error', (_cid: Buffer | null, message: string) =>
 				warnings.push(message)
@@ -1299,6 +1296,70 @@ describe('Channel Manager', function () {
 			// The release must not have failed the channel: nothing is on chain,
 			// and a v1 open dropped this way keeps its historical state.
 			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+		});
+
+		it('an error quoting the TEMPORARY id fails the promoted channel, owner only (issue 412)', async function () {
+			// A refusal of funding_created quotes the temporary id (the only id
+			// that message carries), but with queued transport it lands after
+			// the promotion. The resolver used to drop it silently, leaving the
+			// channel in SENT_FUNDING_CREATED forever with its pledges renewing
+			// every block.
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			const carolPubkey =
+				makeConfig(3).localBasepoints.fundingPubkey.toString('hex');
+			alice.on('error', () => undefined);
+			bob.on('error', () => undefined);
+
+			const queue: Array<() => void> = [];
+			const drain = async (): Promise<void> => {
+				while (queue.length) queue.shift()!();
+				await new Promise((r) => setImmediate(r));
+			};
+			alice.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== bobPubkey) return;
+					queue.push(() => bob.handleMessage(alicePubkey, type, payload));
+				}
+			);
+			bob.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== alicePubkey) return;
+					// Withhold funding_signed: bob "refuses" with the error below.
+					if (type === MessageType.FUNDING_SIGNED) return;
+					queue.push(() => alice.handleMessage(bobPubkey, type, payload));
+				}
+			);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			await drain();
+			const channelId = alice.createFunding(
+				channel,
+				crypto.randomBytes(32),
+				0,
+				Buffer.alloc(64)
+			);
+			await drain();
+			expect(channelId, 'promoted').to.not.equal(null);
+			const tempId = channel.getTemporaryChannelId();
+
+			// A third party quoting the temporary id must not fail it.
+			alice.handleMessage(
+				carolPubkey,
+				17, // ERROR
+				encodeErrorMessage({ channelId: tempId, data: Buffer.from('nope') })
+			);
+			expect(channel.getState()).to.equal(ChannelState.SENT_FUNDING_CREATED);
+
+			// The owner's refusal must, even under the pre-promotion id.
+			alice.handleMessage(
+				bobPubkey,
+				17, // ERROR
+				encodeErrorMessage({ channelId: tempId, data: Buffer.from('nope') })
+			);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 
 		it('a disconnect retires a promoted SENT_FUNDING_CREATED opener and frees its pledges (issue 412)', async function () {

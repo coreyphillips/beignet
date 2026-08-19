@@ -5189,6 +5189,7 @@ export class LightningNode extends EventEmitter {
 				// it stop being fiction (issue #413). Entry mutation is safe
 				// even if the entry was retired meanwhile.
 				entry.broadcastSucceeded = true;
+				this.resumeSkippedCloseAfterBroadcast(txidHex);
 			})
 			.catch((err) => {
 				const message = (err as Error)?.message ?? String(err);
@@ -5198,6 +5199,7 @@ export class LightningNode extends EventEmitter {
 					/already in block ?chain|already known|txn-already/i.test(message)
 				) {
 					entry.broadcastSucceeded = true;
+					this.resumeSkippedCloseAfterBroadcast(txidHex);
 					return;
 				}
 				this.emitStructuredLog('chain', 'funding_broadcast_failed', {
@@ -5239,6 +5241,28 @@ export class LightningNode extends EventEmitter {
 				error: (err as Error)?.message ?? String(err)
 			});
 		});
+	}
+
+	/**
+	 * A close skipped because its funding parent was nowhere (issue #413)
+	 * resumes the moment the backend accepts the parent: a commitment on top
+	 * of the mempool parent is a legitimate exit, and waiting for depth would
+	 * leave an errored channel unresolved for no reason. handleChannelErrored
+	 * re-checks every guard, so this is idempotent and a no-op for channels
+	 * that are not ERRORED.
+	 */
+	private resumeSkippedCloseAfterBroadcast(txidHex: string): void {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
+			if (state.state === ChannelState.ERRORED && state.fundingVersion !== 2) {
+				this.handleChannelErrored(
+					state.channelId ?? state.temporaryChannelId,
+					'funding broadcast accepted for failed channel'
+				);
+			}
+			return;
+		}
 	}
 
 	/**
@@ -5305,11 +5329,15 @@ export class LightningNode extends EventEmitter {
 			// resolved the channel may itself be a child of this very
 			// transaction, so an 'authorized' parent keeps rebroadcasting
 			// through ERRORED/FORCE_CLOSED/CLOSED (issue #413), and a parked
-			// candidate whose funding_signed has landed keeps waiting for its
-			// authorization (issue #412). Only an entry whose channel is
-			// GONE, or whose obligation provably never began, retires here.
+			// candidate or restored entry whose funding_signed has landed
+			// keeps waiting for its authorization (issue #412). Only an entry
+			// whose channel is GONE, or whose obligation provably never began
+			// (awaitingFundingAuthorization answers from the row: without the
+			// remote commitment signature no authorization could ever have
+			// cleared its persist gate, in this process or a previous one),
+			// retires here.
 			const owed =
-				entry.phase !== 'candidate' ||
+				entry.phase === 'authorized' ||
 				this.awaitingFundingAuthorization(txidHex);
 			if (
 				channelState === undefined ||
@@ -5319,13 +5347,15 @@ export class LightningNode extends EventEmitter {
 					txid: txidHex,
 					reason: channelState === undefined ? 'no channel' : channelState
 				});
-				// A retired CANDIDATE was signed in this process and never
-				// authorized, so nothing was ever broadcast: its wallet input
-				// pledges free with the entry (issue #412). 'authorized' may
-				// be on the network and 'restored' cannot prove it is not
-				// (the pre-crash authorization is unknown), so both keep
-				// their pledges; the provider TTL remains their backstop.
-				if (entry.phase === 'candidate') {
+				// A never-owed entry retired against its LIVE row proves the
+				// broadcast was never authorized in any process (the persist
+				// carrying the remote signature gates the authorization), so
+				// its wallet input pledges free with it (issue #412). With
+				// the channel gone only a 'candidate' carries that proof
+				// (signed in this process, never authorized); a channel-less
+				// 'restored' or 'authorized' entry keeps its pledges, with
+				// the provider TTL as the backstop.
+				if (channelState !== undefined || entry.phase === 'candidate') {
 					this.releaseFundingTxPledges(entry.txHex);
 				}
 				this.deletePendingFundingTx(txidHex);
@@ -7888,13 +7918,25 @@ export class LightningNode extends EventEmitter {
 
 	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: string): void {
 		this.channelManager.handleFundingConfirmed(channelId, confirmedTxidHex);
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const state = channel.getFullState();
+		// The confirmation ends the broadcast obligation on manually driven
+		// chains too, exactly as onFundingWatchConfirmed retires it on
+		// watcher-driven ones: without this the retained parent rebroadcast
+		// and renewed its pledges forever (review of issue #412).
+		let retired = channel.clearFundingMissingClock();
+		if (state.fundingTxid) {
+			retired = channel.clearRetainedFundingPayload() || retired;
+			this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
+		}
+		if (retired) this.persistChannel(channelId);
 		// Issue #413: manually driven chains have no watcher event to
 		// re-drive the close an ERRORED v1 channel skipped while its funding
 		// was unconfirmed. fundingConfirmed just stamped the proof; drive it.
-		const channel = this.channelManager.getChannel(channelId);
 		if (
-			channel?.getState() === ChannelState.ERRORED &&
-			channel.getFullState().fundingVersion === 1
+			channel.getState() === ChannelState.ERRORED &&
+			state.fundingVersion === 1
 		) {
 			this.handleChannelErrored(
 				channelId,
@@ -15171,7 +15213,7 @@ export class LightningNode extends EventEmitter {
 							'HTLC_CLAIM_FORCE_CLOSE'
 						)
 					) {
-						break;
+						continue;
 					}
 					this.emit('node:error', {
 						code: 'HTLC_CLAIM_FORCE_CLOSE',
@@ -15325,7 +15367,7 @@ export class LightningNode extends EventEmitter {
 						'FORWARD_TIMEOUT_FORCE_CLOSE'
 					)
 				) {
-					break;
+					continue;
 				}
 				this.emit('node:error', {
 					code: 'FORWARD_TIMEOUT_FORCE_CLOSE',
@@ -16148,7 +16190,7 @@ export class LightningNode extends EventEmitter {
 							'HTLC_EXPIRY_FORCE_CLOSE'
 						)
 					) {
-						break;
+						continue;
 					}
 					this.emit('node:error', {
 						code: 'HTLC_EXPIRY_FORCE_CLOSE',

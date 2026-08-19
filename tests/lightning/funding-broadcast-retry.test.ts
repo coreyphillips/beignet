@@ -792,23 +792,32 @@ describe('Funding broadcast authorization (BOLT 2 ordering)', function () {
 		expect(broadcasts).to.have.length(2);
 		expect(released).to.have.length(0);
 
-		// Backend heals: the parent finally reaches the network.
+		// Backend heals: the parent finally reaches the network, and the
+		// accepted broadcast resumes the skipped close at once. Waiting for
+		// depth would leave the channel ERRORED for no reason: a commitment
+		// on top of the mempool parent is a legitimate exit.
 		fail = false;
 		alice.handleNewBlock(501);
 		await tick();
-		expect(broadcasts).to.have.length(3);
-
-		// The confirmation stamps the proof and re-drives the owed close.
-		alice.handleFundingConfirmed(channelId);
-		await tick();
+		expect(broadcasts.length).to.be.greaterThanOrEqual(3);
 		expect(events).to.include('CHANNEL_FAILED_FORCE_CLOSED');
 
-		// And the parent keeps rebroadcasting through the terminal state
-		// until funding:confirmed retires the entry.
+		// The parent keeps rebroadcasting through the terminal state...
+		const preRetire = broadcasts.length;
 		alice.handleNewBlock(502);
 		await tick();
 		expect(pendingMap(alice).has(fundingTxidHex)).to.equal(true);
-		expect(broadcasts).to.have.length(4);
+		expect(broadcasts.length).to.equal(preRetire + 1);
+
+		// ...until the confirmation retires the obligation, on manually
+		// driven chains too (no watcher event fires here).
+		alice.handleFundingConfirmed(channelId);
+		await tick();
+		expect(pendingMap(alice).size).to.equal(0);
+		const postRetire = broadcasts.length;
+		alice.handleNewBlock(503);
+		await tick();
+		expect(broadcasts.length).to.equal(postRetire);
 		expect(released).to.have.length(0);
 
 		alice.destroy();
@@ -872,6 +881,82 @@ describe('Funding broadcast authorization (BOLT 2 ordering)', function () {
 			'the owed entry survives the dead channel'
 		).to.equal(true);
 		expect(released).to.have.length(0);
+
+		// The restart shape of the same obligation: a 'restored' entry whose
+		// row carries the remote signature is equally owed.
+		entry.phase = 'restored';
+		alice.handleNewBlock(501);
+		await tick();
+		expect(
+			pendingMap(alice).has(fundingTxidHex),
+			'a restored owed entry survives too'
+		).to.equal(true);
+		expect(released).to.have.length(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a restored entry whose row proves no obligation retires and frees its pledges (issue 412)', async function () {
+		// Restart re-freeze: every restored entry used to be treated as owed,
+		// so an errored open with no remote signature renewed its pledges
+		// forever after a restart. The row is the proof: without the remote
+		// commitment signature no authorization could ever have cleared its
+		// persist gate, in this process or a previous one.
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		let fundingTxidHex = '';
+		let builtTxHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				builtTxHex = built.txHex;
+				return built;
+			},
+			broadcastTransaction: async (txHex) =>
+				bitcoin.Transaction.fromHex(txHex).getId(),
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(57, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(58));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectWithheld(alice, bob, FUNDING_SIGNED);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		const channelId = alice
+			.getChannelManager()
+			.listChannels()[0]
+			.getChannelId()!;
+		alice.handlePeerMessage(
+			bob.getNodeId(),
+			17, // ERROR
+			encodeErrorMessage({ channelId, data: Buffer.from('nope') })
+		);
+		await tick();
+
+		// Model the post-restart entry: same row (ERRORED, no remote
+		// signature), authorization unknown.
+		const entry = pendingMap(alice).get(fundingTxidHex) as unknown as {
+			phase: string;
+		};
+		entry.phase = 'restored';
+
+		alice.handleNewBlock(500);
+		await tick();
+		const expected = bitcoin.Transaction.fromHex(builtTxHex).ins.map(
+			(input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			})
+		);
+		expect(pendingMap(alice).size).to.equal(0);
+		expect(released).to.deep.equal([expected]);
 
 		alice.destroy();
 		bob.destroy();

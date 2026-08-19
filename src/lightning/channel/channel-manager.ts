@@ -5739,8 +5739,26 @@ export class ChannelManager extends EventEmitter {
 		// exchange for a forgotten splice is pending, the peer's error is part
 		// of that dance (CLN's channeld errors/restarts around it) — failing the
 		// channel here would kill it right before it recovers.
-		const channel = this.channels.get(channelIdHex);
-		const senderOwnsIt = this.channelPeers.get(channelIdHex) === peerPubkey;
+		let channel = this.channels.get(channelIdHex);
+		let ownerKeyHex = channelIdHex;
+		if (!channel) {
+			// A refusal of funding_created quotes the TEMPORARY id (the only id
+			// that message carries), but with real queued transport it lands
+			// after createFunding promoted the opener to its permanent id, so
+			// the direct lookup misses and the error was silently dropped: the
+			// channel sat in SENT_FUNDING_CREATED forever, renewing its funding
+			// pledges every block (issue #412). Resolve the temporary id
+			// against the promoted registrations too; ownership is still
+			// checked under the key the channel is actually registered by.
+			for (const [idHex, candidate] of this.channels) {
+				if (candidate.getTemporaryChannelId().equals(msg.channelId)) {
+					channel = candidate;
+					ownerKeyHex = idHex;
+					break;
+				}
+			}
+		}
+		const senderOwnsIt = this.channelPeers.get(ownerKeyHex) === peerPubkey;
 		const inAbortDance = channel?.isSpliceAbortPending() ?? false;
 		if (channel && senderOwnsIt && !inAbortDance) {
 			this.failChannelByError(channel, `Remote error: ${errorText}`);
