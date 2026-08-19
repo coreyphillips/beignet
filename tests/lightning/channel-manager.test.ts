@@ -18,6 +18,8 @@ import {
 	encodeAcceptChannelMessage
 } from '../../src/lightning/message/channel-open';
 import { decodeErrorMessage } from '../../src/lightning/message/error';
+import * as bitcoin from 'bitcoinjs-lib';
+import type { IFundingProvider } from '../../src/lightning/node/types';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -1204,6 +1206,99 @@ describe('Channel Manager', function () {
 				alice.getTempChannel(channel.getTemporaryChannelId()),
 				'and nothing under the temporary id either'
 			).to.equal(undefined);
+		});
+
+		it('a refused funding_signed releases the v1 funding input pledges (issue 412)', async function () {
+			// Same queued-delivery ordering as above: the refusal lands after the
+			// promotion. The registration drop is covered there; this pins the
+			// other half of issue 412, that the wallet pledges behind the signed
+			// funding tx free immediately rather than staying frozen until some
+			// future funding selection prunes them.
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			alice.on('error', () => undefined);
+			bob.on('error', () => undefined);
+
+			const released: Array<Array<{ txid: string; vout: number }>> = [];
+			const provider: IFundingProvider = {
+				buildFundingTransaction: async () => {
+					throw new Error('unused');
+				},
+				broadcastTransaction: async () => {
+					throw new Error('unused');
+				},
+				releaseInputPledges: async (outpoints) => {
+					released.push(outpoints);
+				}
+			};
+			alice.setFundingProvider(provider);
+
+			const queue: Array<() => void> = [];
+			const drain = async (): Promise<void> => {
+				while (queue.length) queue.shift()!();
+				await new Promise((r) => setImmediate(r));
+			};
+			alice.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== bobPubkey) return;
+					queue.push(() => bob.handleMessage(alicePubkey, type, payload));
+				}
+			);
+			bob.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== alicePubkey) return;
+					const tampered =
+						type === MessageType.FUNDING_SIGNED
+							? (() => {
+									// [32 channel_id][64 signature]
+									const copy = Buffer.from(payload);
+									copy[40] ^= 0xff;
+									return copy;
+							  })()
+							: payload;
+					queue.push(() => alice.handleMessage(bobPubkey, type, tampered));
+				}
+			);
+
+			// The funding tx whose inputs the wallet froze at build time.
+			const fundingTx = new bitcoin.Transaction();
+			fundingTx.addInput(crypto.randomBytes(32), 0);
+			fundingTx.addInput(crypto.randomBytes(32), 1);
+			fundingTx.addOutput(
+				bitcoin.script.compile([bitcoin.opcodes.OP_0, crypto.randomBytes(20)]),
+				1_000_000
+			);
+			const expected = fundingTx.ins.map((input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			}));
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			await drain();
+			const channelId = alice.createFunding(
+				channel,
+				fundingTx.getHash(),
+				0,
+				Buffer.alloc(64)
+			);
+			expect(channelId, 'promoted before funding_signed arrived').to.not.equal(
+				null
+			);
+			// The node retains the signed tx on channel state right before
+			// createFunding (lightning-node handleAutoFunding); mirror it.
+			channel.getFullState().pendingFundingTxHex = fundingTx.toHex();
+
+			await drain();
+			await drain();
+
+			expect(released, 'released exactly once').to.have.length(1);
+			expect(released[0], 'both funding inputs freed').to.deep.equal(expected);
+			expect(alice.listChannels()).to.have.length(0);
+			// The release must not have failed the channel: nothing is on chain,
+			// and a v1 open dropped this way keeps its historical state.
+			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
 		});
 
 		it('a funding_signed we cannot verify is refused ON THE WIRE', function () {

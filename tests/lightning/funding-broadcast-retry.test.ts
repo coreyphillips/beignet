@@ -34,6 +34,7 @@ import {
 	deserializeChannelState,
 	serializeChannelState
 } from '../../src/lightning/storage/serialization';
+import { encodeErrorMessage } from '../../src/lightning/message/error';
 import {
 	CRASH_V1_PROFILE,
 	GuardianClient,
@@ -730,14 +731,167 @@ describe('Funding broadcast authorization (BOLT 2 ordering)', function () {
 		bob.destroy();
 	});
 
+	it('a refused funding_signed frees the pledged inputs at once (issue 412)', async function () {
+		const broadcasts: string[] = [];
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		let builtTxHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				builtTxHex = built.txHex;
+				return built;
+			},
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			},
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(47, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(48));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+
+		// connectWithheld, except the held funding_signed is delivered with a
+		// flipped signature byte, so the refusal lands after the promotion the
+		// way a real socket orders it.
+		const held: Array<{ type: number; payload: Buffer }> = [];
+		alice.on(
+			'message:outbound',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (pubkey === bob.getNodeId()) {
+					bob.handlePeerMessage(alice.getNodeId(), type, payload);
+				}
+			}
+		);
+		bob.on(
+			'message:outbound',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (pubkey !== alice.getNodeId()) return;
+				if (type === FUNDING_SIGNED) {
+					held.push({ type, payload });
+					return;
+				}
+				alice.handlePeerMessage(bob.getNodeId(), type, payload);
+			}
+		);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		expect(pendingMap(alice).size).to.equal(1);
+		expect(released).to.have.length(0);
+
+		// [32 channel_id][64 signature]: flip a signature byte and deliver.
+		const copy = Buffer.from(held[0].payload);
+		copy[40] ^= 0xff;
+		alice.handlePeerMessage(bob.getNodeId(), held[0].type, copy);
+		await tick();
+
+		const expected = bitcoin.Transaction.fromHex(builtTxHex).ins.map(
+			(input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			})
+		);
+		expect(released, 'released immediately, before any block').to.have.length(
+			1
+		);
+		expect(released[0]).to.deep.equal(expected);
+		expect(alice.getChannelManager().listChannels()).to.have.length(0);
+
+		// The next block retires the candidate entry without broadcasting.
+		// The sweep's own release is a benign no-op at the provider.
+		alice.handleNewBlock(500);
+		await tick();
+		expect(pendingMap(alice).size).to.equal(0);
+		expect(broadcasts).to.have.length(0);
+		for (const r of released) expect(r).to.deep.equal(expected);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a candidate entry retired for a dead channel frees the pledges at the next block (issue 412)', async function () {
+		// A peer ERROR after funding_created runs failChannelByError: the
+		// channel is ERRORED but stays registered, so the immediate release
+		// above never fires. The entry-retirement sweep is the seam that
+		// catches this shape, and every other path that drops a pre-broadcast
+		// v1 channel.
+		const broadcasts: string[] = [];
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		let builtTxHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				builtTxHex = built.txHex;
+				return built;
+			},
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			},
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(49, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(50));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectWithheld(alice, bob, FUNDING_SIGNED);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		expect(pendingMap(alice).size).to.equal(1);
+
+		const channelId = alice
+			.getChannelManager()
+			.listChannels()[0]
+			.getChannelId()!;
+		alice.handlePeerMessage(
+			bob.getNodeId(),
+			17, // ERROR
+			encodeErrorMessage({ channelId, data: Buffer.from('nope') })
+		);
+		await tick();
+		expect(released, 'still registered: no immediate release').to.have.length(
+			0
+		);
+
+		alice.handleNewBlock(500);
+		await tick();
+		const expected = bitcoin.Transaction.fromHex(builtTxHex).ins.map(
+			(input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			})
+		);
+		expect(released, 'freed with the retired entry').to.deep.equal([expected]);
+		expect(pendingMap(alice).size).to.equal(0);
+		expect(broadcasts).to.have.length(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	it('the obligation begins the moment funding_signed lands', async function () {
 		const broadcasts: string[] = [];
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
 		const provider: IFundingProvider = {
 			buildFundingTransaction: async (address, amountSats) =>
 				buildMockFundingTx(address, Number(amountSats)),
 			broadcastTransaction: async (txHex) => {
 				broadcasts.push(txHex);
 				return bitcoin.Transaction.fromHex(txHex).getId();
+			},
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
 			}
 		};
 		const alice = new LightningNode(
@@ -765,6 +919,9 @@ describe('Funding broadcast authorization (BOLT 2 ordering)', function () {
 		await tick();
 		expect(broadcasts).to.have.length(2);
 		expect(broadcasts[1]).to.equal(broadcasts[0]);
+		// An authorized, broadcast funding never releases its pledges, on
+		// either issue-412 seam: the coins are committed until it confirms.
+		expect(released).to.have.length(0);
 
 		alice.destroy();
 		bob.destroy();

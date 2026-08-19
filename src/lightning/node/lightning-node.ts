@@ -21,7 +21,11 @@ import {
 	IBlindedHopData,
 	IBlindedPaymentPath
 } from '../onion/blinded-path';
-import { ChannelManager, IPerChannelKeys } from '../channel/channel-manager';
+import {
+	ChannelManager,
+	IPerChannelKeys,
+	txInputOutpoints
+} from '../channel/channel-manager';
 import { ChannelResult } from '../channel/types';
 import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
@@ -4675,6 +4679,8 @@ export class LightningNode extends EventEmitter {
 						.then((f) => (f > 0 ? this.clampEstimatedFeeRate(f) : undefined))
 				: Promise.resolve(undefined);
 
+		let builtTxHex: string | null = null;
+		let builtTxidHex: string | null = null;
 		feePromise
 			.then((satsPerByte) =>
 				this.fundingProvider!.buildFundingTransaction(
@@ -4685,6 +4691,11 @@ export class LightningNode extends EventEmitter {
 				)
 			)
 			.then(({ txHex, txid, outputIndex }) => {
+				// Captured for the catch below: a throw between here and
+				// setPendingFundingTx leaves pledged inputs with no entry the
+				// retirement sweep could ever release (issue #412).
+				builtTxHex = txHex;
+				builtTxidHex = txid.toString('hex');
 				// Set funding outpoint on state before signing (required for commitment building)
 				state.fundingTxid = txid;
 				state.fundingOutputIndex = outputIndex;
@@ -4730,6 +4741,14 @@ export class LightningNode extends EventEmitter {
 					message: (err as Error).message,
 					timestamp: Date.now()
 				} as ILightningError);
+				// The build succeeded but the open died before funding_created
+				// went out (the same boundary abortPendingOpen no-ops past):
+				// the peer never had anything to sign and nothing was
+				// broadcast, so the pledged inputs free here (issue #412).
+				if (builtTxHex && !channel.getChannelId()) {
+					if (builtTxidHex) this.deletePendingFundingTx(builtTxidHex);
+					this.releaseFundingTxPledges(builtTxHex);
+				}
 				// A funding failure after accept_channel must not strand the
 				// negotiated channel in SENT_OPEN/SENT_ACCEPT: tear it down and
 				// tell the peer, so neither side keeps a half-open channel that
@@ -5197,6 +5216,19 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Best-effort release of the wallet pledges behind a retained funding
+	 * tx (issue #412). Never awaited: the provider ignores outpoints it no
+	 * longer holds, and the pledge TTL remains the backstop.
+	 */
+	private releaseFundingTxPledges(txHex: string): void {
+		const provider = this.fundingProvider;
+		if (!provider?.releaseInputPledges) return;
+		const outpoints = txInputOutpoints(txHex);
+		if (outpoints.length === 0) return;
+		void provider.releaseInputPledges(outpoints).catch(() => undefined);
+	}
+
+	/**
 	 * Retry every pending funding broadcast whose channel is still alive and
 	 * unconfirmed, and retire entries whose channel is gone (aborted, closed
 	 * or voided before confirmation): broadcasting a funding tx for a dead
@@ -5245,6 +5277,15 @@ export class LightningNode extends EventEmitter {
 					txid: txidHex,
 					reason: channelState === undefined ? 'no channel' : channelState
 				});
+				// A retired CANDIDATE was signed in this process and never
+				// authorized, so nothing was ever broadcast: its wallet input
+				// pledges free with the entry (issue #412). 'authorized' may
+				// be on the network and 'restored' cannot prove it is not
+				// (the pre-crash authorization is unknown), so both keep
+				// their pledges; the provider TTL remains their backstop.
+				if (entry.phase === 'candidate') {
+					this.releaseFundingTxPledges(entry.txHex);
+				}
 				this.deletePendingFundingTx(txidHex);
 				continue;
 			}

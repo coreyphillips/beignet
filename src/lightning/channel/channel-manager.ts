@@ -166,6 +166,24 @@ import { signWillFund, verifyWillFund } from './liquidity-ads';
 import { decodeAnnouncementSignaturesMessage } from '../gossip/messages';
 import { Feature, FeatureFlags } from '../features/flags';
 
+/**
+ * The outpoints a raw transaction spends, txid in display-order hex (the
+ * form the funding provider keys its pledges by). Unreadable hex cannot
+ * name a pledge, so it maps to no outpoints; the pledge TTL covers it.
+ */
+export function txInputOutpoints(
+	txHex: string
+): Array<{ txid: string; vout: number }> {
+	try {
+		return bitcoin.Transaction.fromHex(txHex).ins.map((input) => ({
+			txid: Buffer.from(input.hash).reverse().toString('hex'),
+			vout: input.index
+		}));
+	} catch {
+		return [];
+	}
+}
+
 /** Per-channel key set returned by the channel key deriver callback. */
 export interface IPerChannelKeys {
 	fundingPrivkey: Buffer;
@@ -409,13 +427,14 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private _verifiedPeerInputs = new WeakMap<Channel, Set<string>>();
 	/**
-	 * Channels whose v2 funding pledges were already released (issue #311).
-	 * Several terminal sites can fire for one death (an ERROR action in the
-	 * teardown batch plus the tx_abort finally, an error sweep plus a later
-	 * disconnect); the provider release is idempotent, but releasing once
-	 * keeps the call sites honest and observable.
+	 * Channels whose funding pledges were already released (issue #311 for
+	 * v2 opens, issue #412 for v1). Several terminal sites can fire for one
+	 * death (an ERROR action in the teardown batch plus the tx_abort
+	 * finally, an error sweep plus a later disconnect); the provider release
+	 * is idempotent, but releasing once keeps the call sites honest and
+	 * observable.
 	 */
-	private _v2PledgesReleased = new WeakSet<Channel>();
+	private _fundingPledgesReleased = new WeakSet<Channel>();
 	/** Cached local node id (pubkey) for the tx_signatures ordering tie-break. */
 	private localNodeIdCache: Buffer | null = null;
 	/**
@@ -5928,7 +5947,7 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private releaseAbandonedV2Pledges(channel: Channel): void {
 		if (!this.fundingProvider?.releaseInputPledges) return;
-		if (this._v2PledgesReleased.has(channel)) return;
+		if (this._fundingPledgesReleased.has(channel)) return;
 		const outpoints = channel.getReleasableV2PledgeOutpoints();
 		if (outpoints.length === 0) return;
 		const id = channel.getChannelId() ?? channel.getTemporaryChannelId();
@@ -5940,7 +5959,7 @@ export class ChannelManager extends EventEmitter {
 		// here would let the wallet double-spend the input of an open that
 		// resumes after a restart. The TTL remains the backstop.
 		if (id && this.config.hasResumableChannelRow?.(id) === true) return;
-		this._v2PledgesReleased.add(channel);
+		this._fundingPledgesReleased.add(channel);
 		void this.fundingProvider
 			.releaseInputPledges(outpoints)
 			.catch(() => undefined);
@@ -5950,13 +5969,44 @@ export class ChannelManager extends EventEmitter {
 	 * A v2 temp open just deleted because of a fatal BOLT 1 error: mark it
 	 * ERRORED (consistent with failChannelByError; also what lets the
 	 * abandoned-v2 getter answer) and release its funding pledges
-	 * (issue #311). v1 opens are left untouched: they have no v2 pledges,
-	 * and their removed channel objects keep their historical state.
+	 * (issue #311). v1 opens are handled by the sibling below.
 	 */
 	private releaseErroredTempV2Pledges(channel: Channel): void {
 		if (channel.getFullState().fundingVersion !== 2) return;
 		channel.markErrored();
 		this.releaseAbandonedV2Pledges(channel);
+	}
+
+	/**
+	 * Release the wallet pledges behind a v1 funding tx that was signed but
+	 * whose broadcast was provably never authorized (issue #412).
+	 * SENT_FUNDING_CREATED is the proof: handleFundingSigned moves to
+	 * AWAITING_FUNDING_CONFIRMED before it can emit
+	 * AUTHORIZE_FUNDING_BROADCAST, and the node never reauthorizes a
+	 * SENT_FUNDING_CREATED channel. Any later state may have been broadcast
+	 * and keeps its pledges; the node's entry-retirement sweep backstops
+	 * those. Deliberately does NOT markErrored: nothing is on chain, and a
+	 * v1 open dropped this way keeps its historical state.
+	 */
+	private releaseRefusedV1FundingPledges(channel: Channel): void {
+		if (!this.fundingProvider?.releaseInputPledges) return;
+		if (this._fundingPledgesReleased.has(channel)) return;
+		const state = channel.getFullState();
+		if (state.fundingVersion === 2) return;
+		if (state.state !== ChannelState.SENT_FUNDING_CREATED) return;
+		if (!state.pendingFundingTxHex) return;
+		const id = channel.getChannelId() ?? channel.getTemporaryChannelId();
+		const idHex = id?.toString('hex');
+		if (idHex && (this.channels.has(idHex) || this.tempChannels.has(idHex))) {
+			return;
+		}
+		if (id && this.config.hasResumableChannelRow?.(id) === true) return;
+		const outpoints = txInputOutpoints(state.pendingFundingTxHex);
+		if (outpoints.length === 0) return;
+		this._fundingPledgesReleased.add(channel);
+		void this.fundingProvider
+			.releaseInputPledges(outpoints)
+			.catch(() => undefined);
 	}
 
 	/**
@@ -6314,8 +6364,11 @@ export class ChannelManager extends EventEmitter {
 					if (this.cleanupForError(peerPubkey, channel, action.cleanup)) {
 						// A validation error just ended a tracked v2 open (an
 						// invalid peer contribution, a failed audit): its
-						// funding pledges release with it (issue #311).
+						// funding pledges release with it (issue #311). Same
+						// for a v1 open refused before its broadcast was ever
+						// authorized (issue #412).
 						this.releaseErroredTempV2Pledges(channel);
+						this.releaseRefusedV1FundingPledges(channel);
 					}
 					this.emit(
 						'error',
