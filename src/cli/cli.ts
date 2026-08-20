@@ -435,7 +435,7 @@ async function handleStart(): Promise<void> {
 	const isDaemon = hasFlag('--daemon');
 
 	try {
-		const { server } = await startDaemon({
+		const { stop } = await startDaemon({
 			mnemonic: config.mnemonic,
 			network: config.network,
 			alias: config.alias,
@@ -475,11 +475,34 @@ async function handleStart(): Promise<void> {
 			result: { message: 'Node started', port: daemonPort, pid: process.pid }
 		});
 
-		// Clean shutdown on signals
+		// Clean shutdown on signals: the same teardown POST /stop runs, so an
+		// in-flight backup completes and SQLite closes before the process ends.
+		// The inner bound caps the node's HTLC drain; the outer one covers a
+		// hang the node's own timeout does not reach (SQLite close, wallet
+		// stop) so Ctrl-C always terminates.
+		const SHUTDOWN_NODE_TIMEOUT_MS = 10_000;
+		const SHUTDOWN_FORCE_EXIT_MS = 15_000;
+		let shuttingDown = false;
 		const shutdown = (): void => {
+			if (shuttingDown) {
+				// Second signal: the operator insists, skip the graceful path.
+				process.exit(1);
+			}
+			shuttingDown = true;
 			removePidFile();
-			server.close();
-			process.exit(0);
+			const forceExit = setTimeout(() => {
+				process.stderr.write('beignet: shutdown timed out, forcing exit\n');
+				process.exit(1);
+			}, SHUTDOWN_FORCE_EXIT_MS);
+			forceExit.unref();
+			void stop(SHUTDOWN_NODE_TIMEOUT_MS)
+				.catch(() => {
+					// Best effort; the exit below is the point.
+				})
+				.then(() => {
+					clearTimeout(forceExit);
+					process.exit(0);
+				});
 		};
 		process.on('SIGINT', shutdown);
 		process.on('SIGTERM', shutdown);

@@ -1885,6 +1885,14 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Distinct pubkeys of every peer we track a channel with, pending opens
+	 * included.
+	 */
+	listChannelPeers(): string[] {
+		return [...new Set(this.channelPeers.values())];
+	}
+
+	/**
 	 * Notify that a funding transaction has been confirmed.
 	 * `confirmedTxidHex` (display byte order) names WHICH candidate reached
 	 * depth when the watcher tracks several (post-signatures RBF); omitted

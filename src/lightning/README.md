@@ -244,6 +244,14 @@ nodeB.on('message:outbound', (pubkey, type, payload) => {
     nodeA.handlePeerMessage(nodeB.getNodeId(), type, payload);
   }
 });
+
+// The node cannot drop a transport it does not own. When it needs a peer
+// disconnected (durability barriers, the BOLT 2 quiescence watchdog), it
+// asks the host: stop relaying for that peer, then resume later as a
+// reconnect (the node has already marked the channels for reestablish).
+nodeA.on('peer:disconnect-requested', (pubkey) => {
+  // e.g. close the websocket/queue backing this peer's relay
+});
 ```
 
 ### Channel Lifecycle
@@ -847,6 +855,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `sweep:uneconomic` | `(channelId: Buffer, action: ISweepUneconomicChainAction)` | An on-chain claim was declined because it cannot pay its own fee (`reason: 'skipped'`), or a competing spend path opened while it stayed unclaimed (`reason: 'contested'`). Retries continue in both cases, until the outpoint is spent |
 | `peer:connect` | `(pubkey: string)` | Peer connected (networking mode) |
 | `peer:disconnect` | `(pubkey: string)` | Peer disconnected (networking mode) |
+| `peer:disconnect-requested` | `(pubkey: string)` | The node needs this peer's connection severed but holds no socket for it (event-transport mode, or an unconnected peer): the HOST must close its transport. The protocol side (channels marked for reestablish) is already applied; reconnect and reestablish as usual |
 | `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode) |
 | `broadcast:tx` | `(tx: Buffer)` | Transaction to broadcast on-chain |
 | `onion:received` | `(payload: IOnionMessagePayload)` | Onion message received (type 513) |

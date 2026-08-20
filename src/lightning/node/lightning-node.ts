@@ -337,6 +337,7 @@ bitcoin.initEccLib(ecc);
  * - 'htlc:forward-failed' ({ inChannelId: Buffer, outChannelId: Buffer }) — a forwarded HTLC failed downstream
  * - 'peer:connect' (pubkey: string)
  * - 'peer:disconnect' (pubkey: string)
+ * - 'peer:disconnect-requested' (pubkey: string): external-transport (message:outbound) mode only; the host must sever its connection to this peer, the protocol side (channels marked for reestablish) is already applied
  * - 'peer:error' (pubkey: string, error: Error)
  * - 'peer_storage:retrieved' (peerPubkey: string, blob: Buffer)
  * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction): an on-chain claim was declined because it cannot pay its own fee
@@ -740,6 +741,12 @@ export class LightningNode extends EventEmitter {
 	 * of guardian replication, in every durability mode.
 	 */
 	private recoveryBarrier: DurabilityBarrier | undefined;
+	/**
+	 * Mirrors the barrier's fenced latch so every transport chokepoint sees a
+	 * runtime supersession (recovery 5.8), not only the PeerManager: the
+	 * event transport consults recoveryPermitsPeerTraffic too.
+	 */
+	private _barrierFenced = false;
 	/** The constructor's dial pass was withheld pending gate confirmation. */
 	private _autoReconnectDeferred = false;
 	private capsuleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -3198,16 +3205,14 @@ export class LightningNode extends EventEmitter {
 				// nested dispatches; tearing the peer down mid-turn would pull
 				// state out from under them.
 				setImmediate(() => {
-					try {
-						this.peerManager?.disconnectPeer(peerPubkey);
-					} catch {
-						// Already disconnected, or transport-level teardown raced.
-					}
+					this.requestPeerDisconnect(peerPubkey);
 					// A v2 opening whose blocked persist left memory ahead of
 					// disk (e.g. the replacement's commitment failed to
 					// commit) resyncs to the durable truth: the attempt on
 					// disk is the only one a restart would resume, so it is
-					// the only one this side may keep tracking.
+					// the only one this side may keep tracking. Runs after the
+					// disconnect so the reestablish rollback cannot mutate the
+					// attempt this just re-installed.
 					this.resyncV2OpenFromDisk(channelId);
 				});
 			}
@@ -3234,22 +3239,7 @@ export class LightningNode extends EventEmitter {
 					channelId: channelIdHex
 				});
 				setImmediate(() => {
-					if (this.peerManager) {
-						try {
-							this.peerManager.disconnectPeer(peerPubkey);
-						} catch {
-							// Already disconnected, or transport-level teardown raced.
-						}
-						return;
-					}
-					// External transport (message:outbound mode): there is no
-					// socket here to drop. Ask the host to sever the connection
-					// and apply the protocol side ourselves - BOLT 2: the channel
-					// is no longer quiescent upon disconnection, and reestablish
-					// resynchronizes on reconnect. Without this the channel would
-					// stay quiescing forever with its parked HTLCs stranded.
-					this.emit('peer:disconnect-requested', peerPubkey);
-					this.channelManager.handlePeerDisconnected(peerPubkey);
+					this.requestPeerDisconnect(peerPubkey);
 				});
 			}
 		);
@@ -3273,8 +3263,9 @@ export class LightningNode extends EventEmitter {
 		// the reason is durability rather than storage. What they share is the
 		// remedy, because a peer waiting on a revoke or commitment we will
 		// never send on this connection rides every in-flight HTLC to its
-		// CLTV. A fenced writer is the exception: its transport is already
-		// being torn down node wide by the gate's hard freeze.
+		// CLTV. A fenced writer is the exception: hardFreezeTransports has
+		// already torn its transports down node wide, on the socket side and
+		// the event side both, the moment the fence latched.
 		this.channelManager.on(
 			'transition:frozen',
 			(
@@ -3297,13 +3288,9 @@ export class LightningNode extends EventEmitter {
 						'the channel resumes through reestablish once the quorum is reachable',
 					timestamp: Date.now()
 				} as ILightningError);
-				if (reason === 'fenced' || !this.peerManager) return;
+				if (reason === 'fenced') return;
 				setImmediate(() => {
-					try {
-						this.peerManager?.disconnectPeer(peerPubkey);
-					} catch {
-						// Already disconnected, or transport-level teardown raced.
-					}
+					this.requestPeerDisconnect(peerPubkey);
 				});
 			}
 		);
@@ -3336,13 +3323,8 @@ export class LightningNode extends EventEmitter {
 						'the connection is dropped so reestablish can replay from durable state',
 					timestamp: Date.now()
 				} as ILightningError);
-				if (!this.peerManager) return;
 				setImmediate(() => {
-					try {
-						this.peerManager?.disconnectPeer(peerPubkey);
-					} catch {
-						// Already disconnected, or transport-level teardown raced.
-					}
+					this.requestPeerDisconnect(peerPubkey);
 				});
 			}
 		);
@@ -3670,6 +3652,74 @@ export class LightningNode extends EventEmitter {
 				this.emit('sweep:uneconomic', channelId, action);
 			}
 		);
+	}
+
+	/**
+	 * Sever a peer at this node's own initiative (durability barriers, the
+	 * quiescence watchdog). Chosen PER PEER, not per node: with networking
+	 * enabled a peer the PeerManager holds gets its socket dropped, and the
+	 * peer:disconnect event applies the protocol side
+	 * (handlePeerDisconnected) through wirePeerManagerEvents. A peer the
+	 * PeerManager does not hold talks over the event transport
+	 * (message:outbound mode, or the unconnected-peer fallback in
+	 * emitOutbound), so there is no socket to drop: apply the protocol side
+	 * directly, then notify 'peer:disconnect-requested' so the HOST severs
+	 * its connection. Without both halves nothing marks the channels
+	 * AWAITING_REESTABLISH, the reestablish backstop never sees them, and
+	 * recovery degrades to CLTV-expiry scans.
+	 */
+	private requestPeerDisconnect(peerPubkey: string): void {
+		if (this.peerManager?.getPeer(peerPubkey)) {
+			try {
+				this.peerManager.disconnectPeer(peerPubkey);
+			} catch {
+				// Already disconnected, or transport-level teardown raced.
+			}
+			return;
+		}
+		this.channelManager.handlePeerDisconnected(peerPubkey);
+		this.notifyPeerDisconnectRequestObservers(peerPubkey);
+	}
+
+	/**
+	 * Notify peer:disconnect-requested with each observer FULLY contained,
+	 * the external-transport sibling of notifyPeerDisconnectObservers: the
+	 * HOST listener that severs the transport may share the event with
+	 * application observers, and emit() stops at the first throw, so a
+	 * throwing observer ahead of the transport listener would leave the
+	 * poisoned connection up.
+	 */
+	private notifyPeerDisconnectRequestObservers(pubkey: string): void {
+		for (const listener of this.rawListeners('peer:disconnect-requested')) {
+			try {
+				(listener as (pubkey: string) => void)(pubkey);
+			} catch (err) {
+				try {
+					this.emitStructuredLog('peer', 'disconnect_request_observer_failed', {
+						pubkey,
+						error: err instanceof Error ? err.message : String(err)
+					});
+				} catch {
+					// Reporting is best effort; the remaining observers still run.
+				}
+			}
+		}
+	}
+
+	/**
+	 * The fence remedy, node wide (recovery 5.6/5.8): freezeConnections is
+	 * the PeerManager's own irreversible teardown (listeners, ALL reconnect
+	 * timers, connections still mid-handshake, every registered peer), and
+	 * every channel peer that is NOT in the PeerManager's hands by then rides
+	 * the event transport, so the host is asked to sever it and the channels
+	 * are marked for reestablish. Traffic itself is already gated by
+	 * recoveryPermitsPeerTraffic in both modes.
+	 */
+	private hardFreezeTransports(): void {
+		this.peerManager?.freezeConnections();
+		for (const pubkey of this.channelManager.listChannelPeers()) {
+			this.requestPeerDisconnect(pubkey);
+		}
 	}
 
 	/**
@@ -4238,12 +4288,8 @@ export class LightningNode extends EventEmitter {
 		});
 		gate.onFenced(() => {
 			// Hard-freeze (spec 5.6): a superseded writer must not exchange
-			// another wire message with anyone. freezeConnections is the
-			// PeerManager's own irreversible teardown: listeners, ALL
-			// reconnect timers (including ones for currently-disconnected
-			// peers), connections still mid-handshake (invisible to
-			// listPeers), and every registered peer.
-			this.peerManager?.freezeConnections();
+			// another wire message with anyone, on either transport.
+			this.hardFreezeTransports();
 		});
 	}
 
@@ -4262,11 +4308,15 @@ export class LightningNode extends EventEmitter {
 		journal: RecoveryJournal | undefined
 	): void {
 		barrier.onFenced((superseding) => {
+			// The latch and the freeze first: they silence both transport
+			// chokepoints before any public observer below gets a chance to
+			// throw past them.
+			this._barrierFenced = true;
+			this.hardFreezeTransports();
 			this.emitStructuredLog('channel', 'recovery_fenced', {
 				epoch: superseding ? String(superseding.lease.epoch) : null
 			});
 			this.emit('recovery:fenced', superseding);
-			this.peerManager?.freezeConnections();
 		});
 		// Ownership settles asynchronously after construction, and a pump that
 		// finds no lease with nobody waiting gives up rather than spinning a
@@ -4394,6 +4444,10 @@ export class LightningNode extends EventEmitter {
 		// quorum-receipted before this node talks to anyone (connections,
 		// outbound messages and inbound dispatch all consult this).
 		if (this.startupRepairPending) return false;
+		// A runtime supersession is the same hard freeze as a fenced gate
+		// (spec 5.6): a superseded writer must not exchange another wire
+		// message with anyone, on either transport.
+		if (this._barrierFenced) return false;
 		return this.recoveryGate ? this.recoveryGate.permitsPeerTraffic() : true;
 	}
 
