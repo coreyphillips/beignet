@@ -278,9 +278,22 @@ interface IStartedResources {
 	release: Array<() => void>;
 }
 
+/** A running daemon: the HTTP server, the node, and the one way to stop both. */
+export interface IStartedDaemon {
+	server: http.Server;
+	node: BeignetNode;
+	/**
+	 * Graceful teardown of everything the boot created: webhooks, the payment
+	 * queue, the node (falling back to destroy), the rate limiter, the
+	 * idempotency sweep and the HTTP server. Idempotent; the POST /stop route
+	 * and the CLI signal handler share it.
+	 */
+	stop: (timeoutMs?: number) => Promise<void>;
+}
+
 export async function startDaemon(
 	opts: DaemonOptions
-): Promise<{ server: http.Server; node: BeignetNode }> {
+): Promise<IStartedDaemon> {
 	// Anything taken after the node boots has to be handed back if the start
 	// then fails. The error leaves the caller with no handle at all, so the
 	// SQLite database, the single-instance lock, the Electrum poll, the backup
@@ -311,7 +324,7 @@ export async function startDaemon(
 async function bootDaemon(
 	opts: DaemonOptions,
 	started: IStartedResources
-): Promise<{ server: http.Server; node: BeignetNode }> {
+): Promise<IStartedDaemon> {
 	const port =
 		opts.daemonPort !== undefined && opts.daemonPort !== null
 			? opts.daemonPort
@@ -2020,12 +2033,7 @@ async function bootDaemon(
 			res.end(
 				JSON.stringify(success({ stopped: true, drained: drainRequested }))
 			);
-			webhookManager.clear();
-			paymentQueue.removeAllListeners();
-			await node.gracefulShutdown().catch(() => node.destroy());
-			if (rateLimiter) rateLimiter.destroy();
-			clearInterval(idempotencyCleanupTimer);
-			server.close();
+			await stop();
 			return;
 		}
 
@@ -2119,6 +2127,21 @@ async function bootDaemon(
 		});
 	}
 
+	// The one teardown path for a successful boot, shared by the POST /stop
+	// route and whatever handle the caller keeps (the CLI's signal handler).
+	// Everything here is idempotent, so the guard only spares repeat work.
+	let stopped = false;
+	const stop = async (timeoutMs = 30_000): Promise<void> => {
+		if (stopped) return;
+		stopped = true;
+		webhookManager.clear();
+		paymentQueue.removeAllListeners();
+		await node.gracefulShutdown(timeoutMs).catch(() => node.destroy());
+		if (rateLimiter) rateLimiter.destroy();
+		clearInterval(idempotencyCleanupTimer);
+		server.close();
+	};
+
 	// Wire up SSE events from BeignetNode (already JSON-safe types)
 	const sseEvents = getRelayedEvents(opts.htlcEvents);
 	for (const eventName of sseEvents) {
@@ -2142,7 +2165,7 @@ async function bootDaemon(
 		server.on('error', reject);
 		server.listen(port, host, () => {
 			logger?.info(`Daemon listening on ${host}:${port}`);
-			resolve({ server, node });
+			resolve({ server, node, stop });
 		});
 	});
 }
