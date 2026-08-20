@@ -159,7 +159,6 @@ import {
 	estimateSpliceTxWeight,
 	spliceFeeSats,
 	dualFundingContributionWeight,
-	P2WPKH_DUST_LIMIT,
 	SPLICE_TX_BASE_WEIGHT,
 	SHARED_FUNDING_INPUT_WEIGHT,
 	outputWeight
@@ -8185,6 +8184,33 @@ export class Channel {
 			);
 		}
 
+		// ── Flush a v1 funding confirmation parked while disconnected ──
+		// The chain watcher's depth callback is one-shot: a confirmation
+		// observed while this channel was wrapped in AWAITING_REESTABLISH hit
+		// fundingConfirmed's late gate, which stamped fundingConfirmedLate
+		// durably and did nothing else. Nothing re-detects it (a restart only
+		// races reestablish for the re-armed watch), so consume the stamp here
+		// and run the ready flow the observation was owed (issue #420). The v2
+		// path has its own flush in _handleReestablishV2. !localChannelReady
+		// makes this mutually exclusive with the retransmit block above, so
+		// exactly one channel_ready ever leaves; the AWAITING_CHANNEL_READY arm
+		// covers the remote-ready-first shape, where the peer's channel_ready
+		// landed before (or during) the disconnect but ours never left. The
+		// stamp itself stays set: it is durable on-chain evidence for
+		// isFundingKnownOnChain, and the state leaving
+		// AWAITING_FUNDING_CONFIRMED makes the flush one-shot anyway.
+		if (
+			!this._state.v2InFlight &&
+			this._state.fundingConfirmedLate === true &&
+			!this._state.localChannelReady &&
+			(this._state.state === ChannelState.AWAITING_FUNDING_CONFIRMED ||
+				this._state.state === ChannelState.AWAITING_CHANNEL_READY)
+		) {
+			actions.push(
+				...this.fundingConfirmed(this._state.fundingTxid ?? undefined)
+			);
+		}
+
 		this._lastReestablishOutcome = actions.some(
 			(a) => a.type === ChannelActionType.SEND_MESSAGE && a.replay === true
 		)
@@ -8895,6 +8921,25 @@ export class Channel {
 	}
 
 	/**
+	 * The dust floor an output WE add to a splice transaction must clear.
+	 *
+	 * Mirrors what InteractiveTxBuilder enforces on every tx_add_output, ours
+	 * included: the 546-sat interactive-tx floor, raised to whichever side
+	 * negotiated the larger commitment dust limit (the same pair
+	 * handleTxAddOutput feeds to setDustLimit on the splice arm). Using
+	 * anything lower means emitting an output the peer must reject.
+	 */
+	spliceInteractiveTxDustFloor(): bigint {
+		return bigIntMax(
+			bigIntMax(
+				this._state.localConfig.dustLimitSatoshis,
+				this._state.remoteConfig.dustLimitSatoshis
+			),
+			DUST_LIMIT_SATS
+		);
+	}
+
+	/**
 	 * Compute the ordered list of interactive-tx contributions we (the initiator)
 	 * send for this splice. Currently supports the single-sided cases:
 	 *   - splice-out: shared input -> new funding output + destination output
@@ -8975,10 +9020,15 @@ export class Channel {
 				}
 			});
 
-			// Drop a dust change output (the dust implicitly becomes extra fee) —
-			// a sub-dust output would make the splice tx nonstandard.
+			// A change output below the interactive-tx dust floor cannot be
+			// added at all: our own builder rejects it on the way out and the
+			// peer rejects it on the way in, aborting an otherwise fundable
+			// splice. It becomes extra fee instead. The floor is the NEGOTIATED
+			// one, never the 294-sat P2WPKH figure: selection covers exactly
+			// amount + fee, so change lands in the 295..545 band routinely
+			// rather than exceptionally (issue #389).
 			const changeSats = walletTotal - netChange - feeSats;
-			if (changeSats > P2WPKH_DUST_LIMIT) {
+			if (changeSats >= this.spliceInteractiveTxDustFloor()) {
 				this._spliceContributions.push({
 					kind: 'output',
 					output: {
@@ -9900,7 +9950,17 @@ export class Channel {
 		return spliced < live ? spliced : live;
 	}
 
-	private _splicedState(): IChannelState | null {
+	/**
+	 * The channel state re-anchored on the pending splice funding. `base`
+	 * defaults to the live state; _localCommitmentEmptyRefusal passes a
+	 * live-shaped CANDIDATE instead. A candidate's remoteBalanceMsat override
+	 * is intentionally discarded by the remainder derivation below, so a
+	 * caller that has both deducted an inbound add from the remote balance
+	 * and inserted it into the htlcs map counts it exactly once.
+	 */
+	private _splicedState(
+		base: IChannelState = this._state
+	): IChannelState | null {
 		if (!this._spliceTx || !this._spliceSession) return null;
 		const session = this._spliceSession;
 		const tx = this._spliceTx.tx;
@@ -9914,12 +9974,10 @@ export class Channel {
 		// its own balance and the peer's is the remainder of the new capacity. Both
 		// sides therefore agree on the split and build identical commitments.
 		const feeFromChannelSats =
-			this._state.fundingSatoshis +
-			session.getNetCapacityChange() -
-			newCapacity;
+			base.fundingSatoshis + session.getNetCapacityChange() - newCapacity;
 		const myFeeMsat = session.isInitiator() ? feeFromChannelSats * 1000n : 0n;
 		const myNewLocalMsat =
-			this._state.localBalanceMsat +
+			base.localBalanceMsat +
 			session.getLocalRelativeSatoshis() * 1000n -
 			myFeeMsat;
 		// HTLCs riding through the splice (S-2.M8) hold value in NEITHER
@@ -9942,7 +10000,7 @@ export class Channel {
 		// HTLC gates lifted, pay-during-splice) mirror updates onto both
 		// fundings without divergence.
 		let htlcInFlightMsat = 0n;
-		for (const e of this._state.htlcs.values()) {
+		for (const e of base.htlcs.values()) {
 			htlcInFlightMsat += e.amountMsat;
 		}
 		const theirNewMsat =
@@ -9955,21 +10013,21 @@ export class Channel {
 		// so the commitment's funding witness script and anchor outputs match what
 		// the peer signed. All other basepoints (revocation/payment/delayed/htlc)
 		// are unchanged by a splice.
-		const splicedRemoteBasepoints = this._state.remoteBasepoints
+		const splicedRemoteBasepoints = base.remoteBasepoints
 			? {
-					...this._state.remoteBasepoints,
+					...base.remoteBasepoints,
 					fundingPubkey:
 						session.getRemoteFundingPubkey() ??
-						this._state.remoteBasepoints.fundingPubkey
+						base.remoteBasepoints.fundingPubkey
 			  }
-			: this._state.remoteBasepoints;
+			: base.remoteBasepoints;
 		const splicedLocalBasepoints = {
-			...this._state.localBasepoints,
+			...base.localBasepoints,
 			fundingPubkey: session.getLocalFundingPubkey()
 		};
 
 		return {
-			...this._state,
+			...base,
 			fundingTxid: Buffer.from(tx.getHash()),
 			fundingOutputIndex: idx,
 			fundingSatoshis: newCapacity,
@@ -11010,11 +11068,18 @@ export class Channel {
 	 * refuse a commitment the builder builds with outputs, which is a force
 	 * close of a healthy channel.
 	 *
-	 * NOT mirrored onto the pending-splice commitment. _splicedState() derives
-	 * the peer's balance as the remainder of the new capacity after in-flight
-	 * HTLC value, so a naive replay of these overrides onto it would double
-	 * count; getSpendableOutboundMsat covers our own sends across both views,
-	 * and the receive side during the splice window is tracked separately.
+	 * While a fully signed splice awaits its lock, the same question is asked
+	 * of the SPLICED view: _splicedState(candidate) re-anchors the candidate
+	 * on the new funding, deriving the peer's balance as the remainder of the
+	 * new capacity after in-flight HTLC value, so the add's amount counts once
+	 * rather than twice. The spliced half runs regardless of the cheap gate:
+	 * the reserve we enforce bounds only the peer's LIVE balance, and a peer
+	 * splice-out leaves a spliced remainder below it because reserves are not
+	 * re-derived until the lock (issue #382). It is skipped when the in-memory
+	 * session is not rebuilt (no spliced view exists to check);
+	 * _handleCommitmentSignedBatch independently fails closed there before any
+	 * revocation. getSpendableOutboundMsat still covers our own sends across
+	 * both views (issue #405).
 	 */
 	private _localCommitmentEmptyRefusal(overrides: {
 		remoteBalanceMsat?: bigint;
@@ -11022,7 +11087,9 @@ export class Channel {
 		addedHtlc?: { key: string; entry: IHtlcEntry };
 	}): string | null {
 		const ourDust = this._state.localConfig.dustLimitSatoshis;
-		if (this._state.localConfig.channelReserveSatoshis >= ourDust) return null;
+		const liveHalf = this._state.localConfig.channelReserveSatoshis < ourDust;
+		const spliceHalf = this.isSplicePendingLock();
+		if (!liveHalf && !spliceHalf) return null;
 		const candidate: IChannelState = { ...this._state };
 		if (overrides.remoteBalanceMsat !== undefined) {
 			candidate.remoteBalanceMsat = overrides.remoteBalanceMsat;
@@ -11035,22 +11102,36 @@ export class Channel {
 			candidate.htlcs.set(overrides.addedHtlc.key, overrides.addedHtlc.entry);
 		}
 		const next = this._state.localCommitmentNumber + 1n;
-		let outputCount: number;
-		try {
-			outputCount = buildLocalCommitment(
-				candidate,
-				getPerCommitmentPoint(this._state.localPerCommitmentSeed, next),
-				next
-			).result.tx.outs.length;
-		} catch {
-			// A commitment we cannot build is strictly worse than one we can, so
-			// this refuses rather than admitting on the builder's behalf. It
-			// needs remoteBasepoints and fundingTxid, which any channel taking
-			// peer updates already has.
-			return 'Cannot build the commitment this update would leave us holding';
+		const point = getPerCommitmentPoint(
+			this._state.localPerCommitmentSeed,
+			next
+		);
+		const emptyRefusal = (view: IChannelState, what: string): string | null => {
+			let outputCount: number;
+			try {
+				outputCount = buildLocalCommitment(view, point, next).result.tx.outs
+					.length;
+			} catch {
+				// A commitment we cannot build is strictly worse than one we can,
+				// so this refuses rather than admitting on the builder's behalf.
+				// It needs remoteBasepoints and fundingTxid, which any channel
+				// taking peer updates already has.
+				return `Cannot build the ${what} this update would leave us holding`;
+			}
+			if (outputCount > 0) return null;
+			return `Update would trim every output of the ${what} we hold at the ${ourDust}-sat dust limit`;
+		};
+		if (liveHalf) {
+			const refusal = emptyRefusal(candidate, 'commitment');
+			if (refusal) return refusal;
 		}
-		if (outputCount > 0) return null;
-		return `Update would trim every output of the commitment we hold at the ${ourDust}-sat dust limit`;
+		if (spliceHalf) {
+			const spliced = this._splicedState(candidate);
+			if (spliced) {
+				return emptyRefusal(spliced, 'pending-splice commitment');
+			}
+		}
+		return null;
 	}
 
 	private _countActiveHtlcs(): number {

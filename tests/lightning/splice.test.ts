@@ -3283,6 +3283,214 @@ describe('Splice', function () {
 			expect(opener.getState()).to.equal(ChannelState.NORMAL);
 		});
 
+		describe('splice-in change dust floor (issue #389)', function () {
+			// The channel's own fee arithmetic (_computeSpliceContributions):
+			// fundingScriptLen = newFunding.p2wshOutput.length = 34, P2WPKH
+			// change = 22, and the estimate counts the change output even when
+			// it is later folded — 996 WU, 252 sats at 253 sat/kw. Sizing the
+			// wallet UTXO as amount + fee + desiredChange therefore pins the
+			// change the splice-in arm computes to EXACTLY desiredChange.
+			const spliceInAmount = 300_000n;
+			const spliceInFee = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 1,
+					fundingScriptLen: 34,
+					changeScriptLen: 22
+				}),
+				253
+			);
+
+			/**
+			 * Run a full splice-in over the wire with the wallet UTXO sized to
+			 * leave EXACTLY desiredChangeSats (makeSpliceInWallet always leaves
+			 * ~100k, far above any floor). openerDustSats raises the opener's
+			 * commitment dust limit CONSISTENTLY on both sides' views of the
+			 * open channel, which is what lifts the negotiated interactive-tx
+			 * floor above the 546-sat default.
+			 */
+			function runSpliceIn(
+				desiredChangeSats: bigint,
+				openerDustSats?: bigint
+			): {
+				opener: Channel;
+				outputs: Array<{ amountSats: bigint; scriptPubkey: Buffer }>;
+				changeScript: Buffer;
+				feePaid: bigint;
+				broadcasts: Buffer[];
+			} {
+				bitcoin.initEccLib(ecc);
+				const { opener, acceptor } = makeNormalChannel();
+				if (openerDustSats !== undefined) {
+					opener.getFullState().localConfig.dustLimitSatoshis = openerDustSats;
+					acceptor.getFullState().remoteConfig.dustLimitSatoshis =
+						openerDustSats;
+				}
+
+				const walletPriv = crypto
+					.createHash('sha256')
+					.update(`dust-floor-${desiredChangeSats}-${openerDustSats ?? 0n}`)
+					.digest();
+				const walletPub = Buffer.from(ecc.pointFromScalar(walletPriv, true)!);
+				const walletScript = bitcoin.payments.p2wpkh({ pubkey: walletPub })
+					.output!;
+				const scriptCode = bitcoin.payments.p2pkh({ pubkey: walletPub })
+					.output!;
+				const walletValue = spliceInAmount + spliceInFee + desiredChangeSats;
+				const prevTx = new bitcoin.Transaction();
+				prevTx.version = 2;
+				prevTx.addInput(crypto.randomBytes(32), 0);
+				prevTx.addOutput(walletScript, Number(walletValue));
+				const walletInput = {
+					prevTx: prevTx.toBuffer(),
+					prevOutputIndex: 0,
+					value: walletValue,
+					sequence: 0xfffffffd,
+					signWitness: (
+						tx: bitcoin.Transaction,
+						inputIndex: number,
+						v: bigint
+					): Buffer[] => {
+						const sighash = tx.hashForWitnessV0(
+							inputIndex,
+							scriptCode,
+							Number(v),
+							bitcoin.Transaction.SIGHASH_ALL
+						);
+						const sig64 = Buffer.from(ecc.sign(sighash, walletPriv));
+						const der = bitcoin.script.signature.encode(
+							sig64,
+							bitcoin.Transaction.SIGHASH_ALL
+						);
+						return [der, walletPub];
+					}
+				};
+
+				const deliver = (
+					ch: Channel,
+					msgType: MessageType,
+					payload: Buffer
+				): any[] => {
+					switch (msgType) {
+						case MessageType.STFU:
+							return ch.handleStfuMessage(decodeStfuMessage(payload));
+						case MessageType.SPLICE:
+							return ch.handleSplice(decodeSpliceMessage(payload));
+						case MessageType.SPLICE_ACK:
+							return ch.handleSpliceAck(decodeSpliceAckMessage(payload));
+						case MessageType.TX_ADD_INPUT:
+							return ch.handleTxAddInput(decodeTxAddInputMessage(payload));
+						case MessageType.TX_ADD_OUTPUT:
+							return ch.handleTxAddOutput(decodeTxAddOutputMessage(payload));
+						case MessageType.TX_COMPLETE:
+							return ch.handleTxComplete();
+						case MessageType.TX_SIGNATURES:
+							return ch.handleTxSignatures(decodeTxSignaturesMessage(payload));
+						case MessageType.COMMITMENT_SIGNED:
+							return ch.handleCommitmentSigned(
+								decodeCommitmentSignedMessage(payload)
+							);
+						default:
+							return [];
+					}
+				};
+				const queue: Array<{
+					to: Channel;
+					from: Channel;
+					msgType: MessageType;
+					payload: Buffer;
+				}> = [];
+				const broadcasts: Buffer[] = [];
+				const enqueue = (to: Channel, from: Channel, actions: any[]): void => {
+					for (const a of actions) {
+						if (a.type === ChannelActionType.ERROR)
+							throw new Error(`channel error: ${a.message}`);
+						if (a.type === ChannelActionType.SEND_MESSAGE)
+							queue.push({
+								to,
+								from,
+								msgType: a.messageType,
+								payload: a.payload
+							});
+						if (a.type === ChannelActionType.BROADCAST_TX)
+							broadcasts.push(a.tx);
+					}
+				};
+
+				opener.setSpliceInInputs([walletInput], walletScript);
+				enqueue(acceptor, opener, opener.initiateSplice(spliceInAmount, 253));
+				let steps = 0;
+				while (queue.length > 0) {
+					if (steps++ > 300) throw new Error('splice-in did not settle');
+					const { to, from, msgType, payload } = queue.shift()!;
+					enqueue(from, to, deliver(to, msgType, payload));
+				}
+
+				const os = opener.getSpliceSession()!;
+				expect(os.getState()).to.equal(SpliceState.AWAITING_SPLICE_LOCKED);
+				const otx = os.buildTransaction()!;
+				// Shared funding input + the one wallet input, in every case.
+				expect(otx.inputs.length).to.equal(2);
+				const outputTotal = otx.outputs.reduce((s, o) => s + o.amountSats, 0n);
+				return {
+					opener,
+					outputs: otx.outputs,
+					changeScript: walletScript,
+					feePaid: FUNDING_SATOSHIS + walletValue - outputTotal,
+					broadcasts
+				};
+			}
+
+			it('folds change in the 295..545 band into fee instead of emitting it', function () {
+				// Default configs negotiate the 546-sat interactive-tx floor
+				// (max(354, 354, 546)); the old `> 294` rule would have emitted
+				// this 400-sat change and the peer would have refused it.
+				const run = runSpliceIn(400n);
+				expect(run.opener.spliceInteractiveTxDustFloor()).to.equal(546n);
+				// The ONLY output is the new funding — no change was added, and
+				// the splice still ran to fully signed on both sides.
+				expect(run.outputs.length).to.equal(1);
+				expect(run.outputs[0].amountSats).to.equal(
+					FUNDING_SATOSHIS + spliceInAmount
+				);
+				expect(run.broadcasts.length, 'both sides signed + broadcast').to.equal(
+					2
+				);
+				// Conservation pins where the sats went: the folded 400 rides on
+				// top of the estimated fee.
+				expect(run.feePaid).to.equal(spliceInFee + 400n);
+			});
+
+			it('emits the change output at exactly the 546-sat floor (>= comparison)', function () {
+				const run = runSpliceIn(546n);
+				expect(run.outputs.length).to.equal(2);
+				const change = run.outputs.find((o) =>
+					o.scriptPubkey.equals(run.changeScript)
+				);
+				expect(change, 'change output present').to.exist;
+				expect(change!.amountSats).to.equal(546n);
+				expect(run.feePaid).to.equal(spliceInFee);
+			});
+
+			it('applies the NEGOTIATED floor when a commitment dust limit exceeds 546', function () {
+				// A 1000-sat commitment dust limit raises the floor both sides
+				// enforce on every tx_add_output, ours included: a 999-sat
+				// change output would abort the splice at the peer.
+				const folded = runSpliceIn(999n, 1_000n);
+				expect(folded.opener.spliceInteractiveTxDustFloor()).to.equal(1_000n);
+				expect(folded.outputs.length).to.equal(1);
+				expect(folded.feePaid).to.equal(spliceInFee + 999n);
+
+				const emitted = runSpliceIn(1_000n, 1_000n);
+				expect(emitted.outputs.length).to.equal(2);
+				const change = emitted.outputs.find((o) =>
+					o.scriptPubkey.equals(emitted.changeScript)
+				);
+				expect(change, 'change output present at the raised floor').to.exist;
+				expect(change!.amountSats).to.equal(1_000n);
+				expect(emitted.feePaid).to.equal(spliceInFee);
+			});
+		});
+
 		// ─────────────── Disconnect & reestablish safety ───────────────
 
 		describe('disconnect & reestablish safety', function () {
@@ -8604,6 +8812,164 @@ describe('Splice', function () {
 			expect(
 				resent.filter((t) => t === MessageType.COMMITMENT_SIGNED).length
 			).to.be.gte(2);
+		});
+
+		describe('empty-commitment guard during the pending-lock window (issue #405)', function () {
+			// A splice-out down to a tiny 900-sat capacity, driven to the
+			// pending-lock window. The LIVE balances stay pre-splice until the
+			// lock (reserves are not re-derived either), so every update below
+			// passes the live checks — only the SPLICED view can refuse it.
+			// Non-anchor arithmetic: commitment fee floor(724 * rate / 1000),
+			// HTLC-success trim threshold 354 + floor(703 * rate / 1000).
+			function pendingLockSpliceOutPair(
+				newCapacitySats: bigint
+			): ReturnType<typeof createNormalChannelPair> {
+				const pair = createNormalChannelPair();
+				pair.openerManager.initiateQuiescence(pair.channelId);
+				const destScript = Buffer.concat([
+					Buffer.from([0x00, 0x14]),
+					crypto.randomBytes(20)
+				]);
+				// node.spliceOut's exact arithmetic: the destination receives
+				// the full withdrawal and the on-chain fee rides in the declared
+				// relative (the tx_complete audit enforces the feerate).
+				const spliceOutFee = spliceFeeSats(
+					estimateSpliceTxWeight({
+						walletInputCount: 0,
+						destinationScriptLen: destScript.length
+					}),
+					253
+				);
+				const withdraw = FUNDING_SATOSHIS - newCapacitySats - spliceOutFee;
+				pair.openerChannel.setSpliceOutDestination(destScript, withdraw);
+				expect(
+					pair.openerManager.initiateSplice(
+						pair.channelId,
+						-(withdraw + spliceOutFee),
+						253
+					).ok
+				).to.equal(true);
+				// Auto-routing drove the negotiation and tx_signatures; without
+				// splice_locked both sides sit in the pending-lock window.
+				expect(pair.openerChannel.isSplicePendingLock()).to.equal(true);
+				expect(pair.acceptorChannel.isSplicePendingLock()).to.equal(true);
+				return pair;
+			}
+
+			// A raw peer update_add_htlc delivered straight to the acceptor's
+			// handler: the opener's own send path would refuse these amounts,
+			// and the guard under test sits on the RECEIVE side.
+			function inboundAdd(
+				channel: Channel,
+				amountMsat: bigint
+			): Parameters<Channel['handleUpdateAddHtlc']>[0] {
+				return {
+					channelId: channel.getChannelId()!,
+					id: 0n,
+					amountMsat,
+					paymentHash: crypto.randomBytes(32),
+					cltvExpiry: 500_000,
+					onionRoutingPacket: Buffer.alloc(1366)
+				};
+			}
+
+			const errorOf = (actions: any[]): string | null =>
+				findAction(actions, ChannelActionType.ERROR)?.message ?? null;
+
+			it('refuses an inbound add that would trim every output of the pending-splice commitment', function () {
+				const { acceptorChannel } = pendingLockSpliceOutPair(900n);
+				// The cheap gate skips the LIVE half outright (the reserve we
+				// enforce, 10k, is far above our 354-sat dust limit), so the
+				// refusal below can only come from the spliced half.
+				const state = acceptorChannel.getFullState();
+				expect(
+					state.localConfig.channelReserveSatoshis >=
+						state.localConfig.dustLimitSatoshis
+				).to.equal(true);
+				const remoteBefore = state.remoteBalanceMsat;
+				const spliceSigBefore = Buffer.from(
+					state.spliceInFlight!.remoteCommitmentSig!
+				);
+
+				// On the 900-sat spliced capacity a 500-sat inbound add trims
+				// everything we would hold: to_remote 900 - 500 - 183 = 217 <
+				// 354, the HTLC 500 < 531 (354 + 177 success fee), to_local 0.
+				const actions = acceptorChannel.handleUpdateAddHtlc(
+					inboundAdd(acceptorChannel, 500_000n)
+				);
+				expect(errorOf(actions)).to.match(/pending-splice commitment/);
+				// Wire-visible: the peer's log holds an add ours never will.
+				expect(findSendAction(actions, MessageType.ERROR)).to.exist;
+				// And the refusal wrote nothing.
+				expect(acceptorChannel.getFullState().htlcs.size).to.equal(0);
+				expect(acceptorChannel.getFullState().remoteBalanceMsat).to.equal(
+					remoteBefore
+				);
+				expect(
+					acceptorChannel
+						.getFullState()
+						.spliceInFlight!.remoteCommitmentSig!.equals(spliceSigBefore)
+				).to.equal(true);
+			});
+
+			it('refuses an update_fee that would trim every output of the pending-splice commitment', function () {
+				const { acceptorChannel } = pendingLockSpliceOutPair(900n);
+				// 1000 sat/kw charges 724 sats: spliced to_remote 900 - 724 =
+				// 176 < 354 and to_local is 0 — nothing survives. The live view
+				// (to_remote ~989k sats) admits the same rate easily.
+				const actions = acceptorChannel.handleUpdateFee({
+					channelId: acceptorChannel.getChannelId()!,
+					feeratePerKw: 1000
+				});
+				expect(errorOf(actions)).to.match(/pending-splice commitment/);
+				// No fee round was staged by the refusal.
+				expect(acceptorChannel.getFullState().pendingFeeratePerKw).to.equal(
+					undefined
+				);
+			});
+
+			it('admits an add whose HTLC output survives the pending-splice commitment', function () {
+				const { acceptorChannel } = pendingLockSpliceOutPair(900n);
+				// 600 sats clears the 531-sat trim threshold, so the spliced
+				// commitment keeps the HTLC output even though both main
+				// balances trim (to_remote 900 - 600 - 183 = 117, to_local 0).
+				const actions = acceptorChannel.handleUpdateAddHtlc(
+					inboundAdd(acceptorChannel, 600_000n)
+				);
+				expect(errorOf(actions)).to.equal(null);
+				expect(acceptorChannel.getFullState().htlcs.size).to.equal(1);
+				expect(acceptorChannel.getState()).to.equal(ChannelState.SPLICING);
+			});
+
+			it('admits an update_fee the pending-splice commitment survives', function () {
+				const { acceptorChannel } = pendingLockSpliceOutPair(900n);
+				// 400 sat/kw charges 289 sats: spliced to_remote 900 - 289 =
+				// 611 >= 354 keeps its output.
+				const actions = acceptorChannel.handleUpdateFee({
+					channelId: acceptorChannel.getChannelId()!,
+					feeratePerKw: 400
+				});
+				expect(errorOf(actions)).to.equal(null);
+				expect(acceptorChannel.getFullState().pendingFeeratePerKw).to.equal(
+					400
+				);
+			});
+
+			it('skips the spliced half when the in-memory splice session is absent', function () {
+				const { acceptorChannel } = pendingLockSpliceOutPair(900n);
+				// A process that persisted the pending-lock window but has not
+				// rebuilt the in-memory session has no spliced view to ask; the
+				// update is admitted exactly as before the guard (and
+				// _handleCommitmentSignedBatch independently fails closed there
+				// before any revocation). Private poke mirrors the reload tests.
+				(acceptorChannel as any)._spliceSession = null;
+				expect(acceptorChannel.isSplicePendingLock()).to.equal(true);
+				const actions = acceptorChannel.handleUpdateAddHtlc(
+					inboundAdd(acceptorChannel, 500_000n)
+				);
+				expect(errorOf(actions)).to.equal(null);
+				expect(acceptorChannel.getFullState().htlcs.size).to.equal(1);
+			});
 		});
 	});
 

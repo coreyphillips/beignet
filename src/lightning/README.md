@@ -413,8 +413,12 @@ or above our own dust limit (which is every symmetric-dust channel, so ordinary
 traffic never pays for the check). `getSpendableOutboundMsat` is floored at the
 same dust limit so our own sends cannot reach the state either, and
 `prepareForceClose` refuses to return a plan whose commitment has no outputs
-instead of handing back a transaction the network will reject. The candidate is
-the live commitment only; the pending-splice mirror of it is not covered yet.
+instead of handing back a transaction the network will reject. While a fully
+signed splice awaits its lock, the same candidate is also re-anchored on the
+pending splice funding (`_splicedState`) and refused if THAT commitment would be
+empty. The spliced half is evaluated even on symmetric-dust channels: the
+enforced reserve bounds only the live balance, not the spliced remainder a peer
+splice-out leaves behind, since reserves are not re-derived until the lock.
 
 Two repairs run when a channel is restored from disk, one per reserve, each
 moving only in its own safe direction. The reserve we ENFORCE is lowered to what
