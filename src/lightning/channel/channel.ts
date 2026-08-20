@@ -8607,6 +8607,27 @@ export class Channel {
 					}
 				];
 			}
+			// BOLT 2 tx_complete (issue #423): a splice-out adds a destination
+			// output, and a side that adds a non-funding output must end at or
+			// above the reserve the NEW capacity prices, or the peer MUST abort
+			// the negotiation. Refuse up-front rather than burn a quiescence
+			// round on a splice our own tx_complete audit would abort.
+			const postCapacity = this._state.fundingSatoshis + relativeSatoshis;
+			const reserveSats = v2ReserveWeKeep(
+				postCapacity,
+				this._state.localConfig.dustLimitSatoshis,
+				this._state.remoteConfig.dustLimitSatoshis
+			);
+			if (localBalanceSats - withdrawSats < reserveSats) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `Cannot splice-out: post-splice balance ${
+							localBalanceSats - withdrawSats
+						} sats would be below the channel reserve ${reserveSats} sats at the new capacity`
+					}
+				];
+			}
 		}
 
 		// Already quiescent — start the splice immediately. Only the
@@ -9001,6 +9022,21 @@ export class Channel {
 				this._state.remoteConfig.dustLimitSatoshis
 			),
 			DUST_LIMIT_SATS
+		);
+	}
+
+	/**
+	 * The reserve a conforming peer may require us to keep at a given capacity
+	 * (v2ReserveWeKeep), derived from the capacity and the two dust limits
+	 * alone. The node's splice preflights price post-splice compositions with
+	 * it: a splice that parks our balance below this while adding a non-funding
+	 * output is one the peer MUST tx_abort (BOLT 2, issue #423).
+	 */
+	spliceReserveWeKeepSats(capacitySats: bigint): bigint {
+		return v2ReserveWeKeep(
+			capacitySats,
+			this._state.localConfig.dustLimitSatoshis,
+			this._state.remoteConfig.dustLimitSatoshis
 		);
 	}
 
@@ -13264,21 +13300,102 @@ export class Channel {
 			if (remoteOwned && !isShared) remoteOutputSats += output.amountSats;
 		}
 
+		let audit: string | null;
 		if (!valuesKnown) {
 			// Cannot audit funds/fees without input values; still enforce weight.
-			return weight > 400_000
-				? `Transaction weight ${weight} exceeds 400000 WU`
-				: null;
+			audit =
+				weight > 400_000
+					? `Transaction weight ${weight} exceeds 400000 WU`
+					: null;
+		} else {
+			audit = validateCompletedInteractiveTx({
+				remoteInputSats,
+				remoteOutputSats,
+				remoteContributionSats,
+				feeSats: totalInSats - totalOutSats,
+				weight,
+				feeratePerKw
+			});
 		}
+		if (audit) return audit;
+		// The BOLT 2 splice reserve rule (issue #423) needs no input values, so
+		// it runs whether or not every prev_tx parsed, and after the existing
+		// refusals so their reason strings win when a tx trips more than one
+		// check.
+		return kind === 'splice'
+			? this._spliceBelowReserveRefusal(outputs, fundingScript, weAreInitiator)
+			: null;
+	}
 
-		return validateCompletedInteractiveTx({
-			remoteInputSats,
-			remoteOutputSats,
-			remoteContributionSats,
-			feeSats: totalInSats - totalOutSats,
-			weight,
-			feeratePerKw
-		});
+	/**
+	 * BOLT 2 tx_complete (splice): the negotiation MUST fail when either side
+	 * has added an output other than the new channel funding output and that
+	 * side's post-splice balance is below the channel reserve priced at the NEW
+	 * capacity (issue #423). Being below reserve on its own is fine; a side
+	 * taking funds OUT of the channel must end up meeting it. Runs at the
+	 * tx_complete audit, BEFORE the splice tx is built (_spliceTx is set later
+	 * by _maybeSendSpliceCommitment), so the split is derived with
+	 * _splicedState's arithmetic from the session and the negotiated outputs.
+	 * The peer's side is judged against v2ReserveWeEnforce (never above what a
+	 * conforming peer computes for itself, so an honest spec-legal splice is
+	 * never aborted) and our own against v2ReserveWeKeep (the most a conforming
+	 * peer may enforce on us), both derived from the new capacity alone: the
+	 * stored reserve is a preflight concern, not a wire-audit one.
+	 */
+	private _spliceBelowReserveRefusal(
+		outputs: IInteractiveTxOutput[],
+		fundingScript: Buffer | null,
+		weAreInitiator: boolean
+	): string | null {
+		const session = this._spliceSession;
+		if (!session || !fundingScript) return null;
+		let newCapacity: bigint | null = null;
+		let weAdded = false;
+		let theyAdded = false;
+		for (const output of outputs) {
+			if (output.scriptPubkey.equals(fundingScript)) {
+				if (newCapacity === null) newCapacity = output.amountSats;
+				continue;
+			}
+			if ((output.serialId % 2n === 0n) !== weAreInitiator) theyAdded = true;
+			else weAdded = true;
+		}
+		// No funding output (the commitment step errors on that) or no
+		// non-funding output on either side: the rule does not arm.
+		if (newCapacity === null || (!weAdded && !theyAdded)) return null;
+		const feeFromChannelSats =
+			this._state.fundingSatoshis +
+			session.getNetCapacityChange() -
+			newCapacity;
+		const myFeeMsat = session.isInitiator() ? feeFromChannelSats * 1000n : 0n;
+		const myNewLocalMsat =
+			this._state.localBalanceMsat +
+			session.getLocalRelativeSatoshis() * 1000n -
+			myFeeMsat;
+		let htlcInFlightMsat = 0n;
+		for (const e of this._state.htlcs.values()) {
+			htlcInFlightMsat += e.amountMsat;
+		}
+		const theirNewMsat = newCapacity * 1000n - myNewLocalMsat - htlcInFlightMsat;
+		const ourDust = this._state.localConfig.dustLimitSatoshis;
+		const peerDust = this._state.remoteConfig.dustLimitSatoshis;
+		if (theyAdded) {
+			const theirReserve = v2ReserveWeEnforce(newCapacity, ourDust, peerDust);
+			if (theirNewMsat < theirReserve * 1000n) {
+				return `splice leaves the peer balance ${
+					theirNewMsat / 1000n
+				} sats below the channel reserve ${theirReserve} sats at the new capacity ${newCapacity} sats`;
+			}
+		}
+		if (weAdded) {
+			const ourReserve = v2ReserveWeKeep(newCapacity, ourDust, peerDust);
+			if (myNewLocalMsat < ourReserve * 1000n) {
+				return `splice leaves our balance ${
+					myNewLocalMsat / 1000n
+				} sats below the channel reserve ${ourReserve} sats at the new capacity ${newCapacity} sats`;
+			}
+		}
+		return null;
 	}
 
 	private _v2NegotiatedTx(): {

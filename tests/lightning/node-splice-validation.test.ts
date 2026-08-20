@@ -217,6 +217,69 @@ describe('LightningNode splice validation', function () {
 		node.destroy();
 	});
 
+	it('prices the splice-out reserve at the post-splice capacity (issue #423)', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const channel = (node as any).channelManager.channels.get(
+			channelId.toString('hex')
+		);
+		// Zero the stored reserve so only the derived post-capacity bound can
+		// refuse: with 100k local of 1M capacity, withdrawing 92k leaves
+		// ~7_816 sats, below 1% of the ~908k post-splice capacity.
+		channel.getFullState().remoteConfig.channelReserveSatoshis = 0n;
+		channel.getFullState().localBalanceMsat = 100_000_000n;
+		channel.getFullState().remoteBalanceMsat = 900_000_000n;
+
+		const refused = node.spliceOut(channelId, 92_000n, 253);
+		expect(refused.ok).to.be.false;
+		expect(refused.error).to.include('insufficient channel balance');
+
+		// 80k leaves ~19_816 sats, above the ~9_198-sat derived bound: this
+		// arm admits it (whatever can still fail later is never this arm).
+		const admitted = node.spliceOut(channelId, 80_000n, 253);
+		expect(admitted.error ?? '').to.not.include(
+			'insufficient channel balance'
+		);
+		node.destroy();
+	});
+
+	it('refuses a splice-in that leaves us below the reserve at the new capacity (issue #423)', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const channel = (node as any).channelManager.channels.get(
+			channelId.toString('hex')
+		);
+		channel.getFullState().localBalanceMsat = 2_000_000n;
+		channel.getFullState().remoteBalanceMsat = 998_000_000n;
+
+		// 2k + 3k = 5k post balance, below v2ReserveWeKeep(1_003_000) =
+		// 10_030. Refused synchronously, BEFORE the funding-provider check
+		// (no provider is configured on this node).
+		const refused = node.spliceIn(channelId, 3_000n);
+		expect(refused.ok).to.be.false;
+		expect(refused.error).to.include('below the channel reserve');
+
+		// 2k + 20k = 22k clears the 10_200-sat bound and falls through to
+		// the provider requirement, proving the arm's order.
+		const admitted = node.spliceIn(channelId, 20_000n);
+		expect(admitted.ok).to.be.false;
+		expect(admitted.error).to.include('selectSpliceInputs');
+		node.destroy();
+	});
+
+	it('spliceQuote reports the derived reserve when the stored one is lower (issue #423)', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const channel = (node as any).channelManager.channels.get(
+			channelId.toString('hex')
+		);
+		channel.getFullState().remoteConfig.channelReserveSatoshis = 0n;
+		const quote = node.spliceQuote(channelId, 'out', 253);
+		// v2ReserveWeKeep(1_000_000, 354, 354) = 10_000, not the stored 0.
+		expect(quote.reserveSats).to.equal(10_000);
+		node.destroy();
+	});
+
 	it('admits a splice-out exactly at the default 546-sat floor (issue #389)', function () {
 		const node = createTestNode();
 		const channelId = injectNormalChannel(node);

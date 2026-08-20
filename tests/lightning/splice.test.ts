@@ -3300,6 +3300,203 @@ describe('Splice', function () {
 			).to.not.exist;
 		});
 
+		it('tx_aborts a peer splice-out that leaves the peer below the reserve at the new capacity (issue #423)', function () {
+			// BOLT 2 tx_complete: the receiver MUST fail the negotiation when a
+			// side that added a non-funding output lands below the channel
+			// reserve priced at the NEW capacity. The peer withdraws almost its
+			// whole balance: 400k - 394k leaves it 6_000 sats, below
+			// v2ReserveWeEnforce(606_000) = 6_060.
+			const { acceptor } = makeNormalChannel(600_000_000n);
+			const acceptorFundingPriv = crypto
+				.createHash('sha256')
+				.update(acceptorSeed)
+				.update(Buffer.from([0]))
+				.digest();
+			acceptor.setSigner(new ChannelSigner(acceptorFundingPriv));
+			quiesceAsResponder(acceptor);
+			const channelId = acceptor.getChannelId()!;
+			const fundingTxid = acceptor.getFullState().fundingTxid!;
+			const openerBp = makeBasepoints(openerSeed);
+
+			acceptor.handleSplice({
+				channelId,
+				fundingPubkey: openerBp.fundingPubkey,
+				relativeSatoshis: -394_000n,
+				fundingFeeratePerkw: 253,
+				locktime: 0
+			});
+			acceptor.handleTxAddInput({
+				channelId,
+				serialId: 0n,
+				prevTx: Buffer.alloc(0),
+				prevTxVout: 0,
+				sequence: 0xfffffffd,
+				sharedInputTxid: fundingTxid
+			});
+			const {
+				createFundingScript
+			} = require('../../src/lightning/script/funding');
+			const newFunding = createFundingScript(
+				acceptor.getFullState().localBasepoints.fundingPubkey,
+				openerBp.fundingPubkey
+			);
+			acceptor.handleTxAddOutput({
+				channelId,
+				serialId: 2n,
+				amountSats: 606_000n,
+				scriptPubkey: newFunding.p2wshOutput
+			});
+			acceptor.handleTxAddOutput({
+				channelId,
+				serialId: 4n,
+				amountSats: 393_000n,
+				scriptPubkey: Buffer.concat([
+					Buffer.from([0x00, 0x14]),
+					crypto.randomBytes(20)
+				])
+			});
+
+			const actions = acceptor.handleTxComplete();
+			expect(
+				findSendAction(actions, MessageType.TX_ABORT),
+				'tx_abort sent to peer'
+			).to.exist;
+			const err = findAction(actions, ChannelActionType.ERROR);
+			expect(err, 'surfaced as error').to.exist;
+			expect(err.message).to.match(/below the channel reserve/);
+			expect(
+				findSendAction(actions, MessageType.TX_SIGNATURES),
+				'no tx_signatures sent'
+			).to.not.exist;
+			expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
+			expect((acceptor as any)._spliceSession, 'session unwound').to.be.null;
+		});
+
+		it('admits a peer splice-out that lands exactly on the reserve at the new capacity (issue #423)', function () {
+			// Boundary: 400k - 393_940 leaves the peer 6_060 sats, exactly
+			// v2ReserveWeEnforce(606_060) = 6_060. The spec bound is "less
+			// than", so this negotiation must complete.
+			const { acceptor } = makeNormalChannel(600_000_000n);
+			const acceptorFundingPriv = crypto
+				.createHash('sha256')
+				.update(acceptorSeed)
+				.update(Buffer.from([0]))
+				.digest();
+			acceptor.setSigner(new ChannelSigner(acceptorFundingPriv));
+			quiesceAsResponder(acceptor);
+			const channelId = acceptor.getChannelId()!;
+			const fundingTxid = acceptor.getFullState().fundingTxid!;
+			const openerBp = makeBasepoints(openerSeed);
+
+			acceptor.handleSplice({
+				channelId,
+				fundingPubkey: openerBp.fundingPubkey,
+				relativeSatoshis: -393_940n,
+				fundingFeeratePerkw: 253,
+				locktime: 0
+			});
+			acceptor.handleTxAddInput({
+				channelId,
+				serialId: 0n,
+				prevTx: Buffer.alloc(0),
+				prevTxVout: 0,
+				sequence: 0xfffffffd,
+				sharedInputTxid: fundingTxid
+			});
+			const {
+				createFundingScript
+			} = require('../../src/lightning/script/funding');
+			const newFunding = createFundingScript(
+				acceptor.getFullState().localBasepoints.fundingPubkey,
+				openerBp.fundingPubkey
+			);
+			acceptor.handleTxAddOutput({
+				channelId,
+				serialId: 2n,
+				amountSats: 606_060n,
+				scriptPubkey: newFunding.p2wshOutput
+			});
+			acceptor.handleTxAddOutput({
+				channelId,
+				serialId: 4n,
+				amountSats: 392_940n,
+				scriptPubkey: Buffer.concat([
+					Buffer.from([0x00, 0x14]),
+					crypto.randomBytes(20)
+				])
+			});
+
+			const actions = acceptor.handleTxComplete();
+			expect(
+				findSendAction(actions, MessageType.TX_ABORT),
+				'no tx_abort at the boundary'
+			).to.not.exist;
+			const err = findAction(actions, ChannelActionType.ERROR);
+			expect(
+				err?.message ?? '',
+				'no reserve refusal at the boundary'
+			).to.not.match(/below the channel reserve/);
+		});
+
+		it('initiateSplice refuses a splice-out into the derived reserve band (issue #423)', function () {
+			// 1M balance, withdraw 999_600: the 400 sats left sit below
+			// v2ReserveWeKeep(400) = 546, a composition a conforming peer MUST
+			// tx_abort. Refused before any quiescence round starts.
+			const { opener } = makeNormalChannel();
+			const actions = opener.initiateSplice(-999_600n, 253);
+			const err = findAction(actions, ChannelActionType.ERROR);
+			expect(err, 'refused up-front').to.exist;
+			expect(err.message).to.match(/below the channel reserve/);
+			expect(
+				findSendAction(actions, MessageType.STFU),
+				'no quiescence started'
+			).to.not.exist;
+		});
+
+		it('refuses our own composition when our change output sits below the reserve (issue #423)', function () {
+			// Direct unit of the our-side arm: the acceptor holds 0 sats and
+			// the outputs carry an odd-serial (our) non-funding output, so the
+			// composition is one the peer MUST abort.
+			const { acceptor } = makeNormalChannel();
+			quiesceAsResponder(acceptor);
+			const channelId = acceptor.getChannelId()!;
+			const openerBp = makeBasepoints(openerSeed);
+			acceptor.handleSplice({
+				channelId,
+				fundingPubkey: openerBp.fundingPubkey,
+				relativeSatoshis: 0n,
+				fundingFeeratePerkw: 253,
+				locktime: 0
+			});
+			const {
+				createFundingScript
+			} = require('../../src/lightning/script/funding');
+			const newFunding = createFundingScript(
+				acceptor.getFullState().localBasepoints.fundingPubkey,
+				openerBp.fundingPubkey
+			);
+			const refusal = (acceptor as any)._spliceBelowReserveRefusal(
+				[
+					{
+						serialId: 2n,
+						amountSats: 999_000n,
+						scriptPubkey: newFunding.p2wshOutput
+					},
+					{
+						serialId: 1n,
+						amountSats: 1_000n,
+						scriptPubkey: Buffer.concat([
+							Buffer.from([0x00, 0x14]),
+							crypto.randomBytes(20)
+						])
+					}
+				],
+				newFunding.p2wshOutput,
+				false
+			);
+			expect(refusal).to.match(/our balance .* below the channel reserve/);
+		});
+
 		it('aborts a splice-in when the peer requires confirmed inputs and selection has unconfirmed UTXOs', function () {
 			const { opener } = makeNormalChannel();
 			const channelId = opener.getChannelId()!;
