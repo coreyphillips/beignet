@@ -9080,9 +9080,7 @@ describe('Splice', function () {
 			// 13,000,000 (v2ReserveWeKeep at 1.3M, both dusts 354). The pending
 			// view binds; with the stored reserve applied to both views the
 			// ceiling read 390,000,000 and over-admitted by 3,000 sats.
-			expect(acceptorChannel.getSpendableOutboundMsat()).to.equal(
-				387_000_000n
-			);
+			expect(acceptorChannel.getSpendableOutboundMsat()).to.equal(387_000_000n);
 		});
 
 		it('prices the pending view from the record alone after a restart', function () {

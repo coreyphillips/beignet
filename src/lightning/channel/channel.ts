@@ -9971,10 +9971,8 @@ export class Channel {
 			// restore, so the invariant is asserted here as well rather than
 			// left to depend on which ran first (issues #386, #387).
 			const reserveMsat =
-				bigIntMax(
-					keptReserveSats,
-					this._state.localConfig.dustLimitSatoshis
-				) * 1000n;
+				bigIntMax(keptReserveSats, this._state.localConfig.dustLimitSatoshis) *
+				1000n;
 			let requiredMsat = reserveMsat;
 			if (this._state.role === ChannelRole.OPENER) {
 				const feeratePerKw = Math.max(
