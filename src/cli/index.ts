@@ -11,7 +11,7 @@ export {
 	isRetryableError,
 	isPermanentFailure
 } from './errors';
-export { startDaemon, DaemonOptions } from './daemon';
+export { startDaemon, DaemonOptions, IStartedDaemon } from './daemon';
 export {
 	ApiKeyAuthenticator,
 	ApiKeyDefinition,

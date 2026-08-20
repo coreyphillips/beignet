@@ -867,7 +867,7 @@ describe('Recovery phase 6: barrier disconnects reach the host on external trans
 		storage.close();
 	});
 
-	it('with networking the socket drop stays the remedy and no host request fires', async function (): Promise<void> {
+	it('with networking a HELD peer gets the socket drop and no host request', async function (): Promise<void> {
 		const storage = openStorage();
 		const config = makeNodeConfig(storage, undefined);
 		config.enableNetworking = true;
@@ -877,11 +877,16 @@ describe('Recovery phase 6: barrier disconnects reach the host on external trans
 		const resets = spyOnResets(node);
 		const requests = collectRequests(node);
 		const dropped: string[] = [];
-		(
+		const pm = (
 			node as unknown as {
-				peerManager: { disconnectPeer: (pubkey: string) => void };
+				peerManager: {
+					disconnectPeer: (pubkey: string) => void;
+					getPeer: (pubkey: string) => unknown;
+				};
 			}
-		).peerManager.disconnectPeer = (pubkey: string): void => {
+		).peerManager;
+		pm.getPeer = (): unknown => ({});
+		pm.disconnectPeer = (pubkey: string): void => {
 			dropped.push(pubkey);
 		};
 
@@ -909,6 +914,87 @@ describe('Recovery phase 6: barrier disconnects reach the host on external trans
 		expect(resets).to.have.length(0);
 
 		node.destroy();
+		storage.close();
+	});
+
+	it('with networking an UNHELD peer still gets the reset and the host request', async function (): Promise<void> {
+		// The remedy is chosen per peer, not per node: a peer the PeerManager
+		// does not hold talks over the event transport, and disconnectPeer
+		// would find nothing to drop.
+		const storage = openStorage();
+		const config = makeNodeConfig(storage, undefined);
+		config.enableNetworking = true;
+		const node = new LightningNode(config);
+		node.on('error', () => {});
+		node.on('node:error', () => {});
+		const resets = spyOnResets(node);
+		const requests = collectRequests(node);
+
+		emitOnManager(
+			node,
+			'transition:dispatch-failed',
+			PEER,
+			'bb'.repeat(32),
+			'observer exploded',
+			2
+		);
+		await flush();
+
+		expect(requests).to.deep.equal([PEER]);
+		expect(resets).to.deep.equal([PEER]);
+
+		node.destroy();
+		storage.close();
+	});
+
+	it('a barrier fence silences the event transport and asks the host to disconnect', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const replicator = replicatorFor(storage, bind(served));
+		const barrier = barrierFor(replicator, () => null, 'quorum');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'quorum',
+			barrier
+		});
+		const resets = spyOnResets(node);
+		const requests = collectRequests(node);
+		const cm = (
+			node as unknown as {
+				channelManager: { listChannelPeers: () => string[] };
+			}
+		).channelManager;
+		cm.listChannelPeers = (): string[] => [PEER];
+		const outbound: number[] = [];
+		node.on('message:outbound', (_pubkey: string, type: number) => {
+			outbound.push(type);
+		});
+		const send = (
+			node as unknown as {
+				emitOutbound: (pubkey: string, type: number, payload: Buffer) => void;
+			}
+		).emitOutbound.bind(node);
+
+		// Before the fence the event transport carries traffic.
+		send(PEER, 18, Buffer.alloc(0));
+		expect(outbound).to.have.length(1);
+
+		(barrier as unknown as { fence: () => void }).fence();
+
+		// The fence asks the host to sever every channel peer's transport and
+		// applies the protocol side, the same remedy the socket side gets
+		// from freezeConnections.
+		expect(requests).to.deep.equal([PEER]);
+		expect(resets).to.deep.equal([PEER]);
+		// And the chokepoint goes silent: a superseded writer must not put
+		// another wire message on ANY transport.
+		send(PEER, 18, Buffer.alloc(0));
+		expect(outbound).to.have.length(1);
+		expect(node.getRecoveryStatus().fenced).to.equal(true);
+
+		node.destroy();
+		await shutdown(served);
 		storage.close();
 	});
 });

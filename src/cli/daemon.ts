@@ -283,10 +283,12 @@ export interface IStartedDaemon {
 	server: http.Server;
 	node: BeignetNode;
 	/**
-	 * Graceful teardown of everything the boot created: webhooks, the payment
-	 * queue, the node (falling back to destroy), the rate limiter, the
-	 * idempotency sweep and the HTTP server. Idempotent; the POST /stop route
-	 * and the CLI signal handler share it.
+	 * Graceful teardown of everything the boot created: the payment queue's
+	 * listeners, the node (falling back to destroy), the rate limiter, the
+	 * idempotency sweep, open SSE connections and the HTTP server. Webhook
+	 * registrations persist by contract and are NOT deleted. Repeat callers
+	 * share the first call's in-flight promise; the POST /stop route and the
+	 * CLI signal handler both use it.
 	 */
 	stop: (timeoutMs?: number) => Promise<void>;
 }
@@ -2129,17 +2131,28 @@ async function bootDaemon(
 
 	// The one teardown path for a successful boot, shared by the POST /stop
 	// route and whatever handle the caller keeps (the CLI's signal handler).
-	// Everything here is idempotent, so the guard only spares repeat work.
-	let stopped = false;
-	const stop = async (timeoutMs = 30_000): Promise<void> => {
-		if (stopped) return;
-		stopped = true;
-		webhookManager.clear();
-		paymentQueue.removeAllListeners();
-		await node.gracefulShutdown(timeoutMs).catch(() => node.destroy());
-		if (rateLimiter) rateLimiter.destroy();
-		clearInterval(idempotencyCleanupTimer);
-		server.close();
+	// The in-flight promise is memoized so a second caller (a signal during
+	// /stop) waits for the SAME teardown instead of resolving early and
+	// letting the process exit before it finishes. Webhook registrations are
+	// deliberately left alone: they persist across restarts by contract, and
+	// dispatch stops with the node's listeners.
+	let stopping: Promise<void> | null = null;
+	const stop = (timeoutMs = 30_000): Promise<void> => {
+		stopping ??= (async (): Promise<void> => {
+			paymentQueue.removeAllListeners();
+			await node.gracefulShutdown(timeoutMs).catch(() => node.destroy());
+			if (rateLimiter) rateLimiter.destroy();
+			clearInterval(idempotencyCleanupTimer);
+			// SSE responses hold their sockets open indefinitely; destroy them
+			// so the server can actually finish closing. destroy() fires each
+			// request's close handler, which clears its keepalive interval.
+			for (const client of sseClients) {
+				client.destroy();
+			}
+			sseClients.clear();
+			server.close();
+		})();
+		return stopping;
 	};
 
 	// Wire up SSE events from BeignetNode (already JSON-safe types)
