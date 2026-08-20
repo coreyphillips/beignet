@@ -8757,26 +8757,11 @@ export class LightningNode extends EventEmitter {
 			} as ILightningError);
 			return { ok: false, error: spliceInErr };
 		}
-		// BOLT 2 tx_complete (issue #423): our splice-in change output is a
-		// non-funding output, so a conforming peer MUST abort the negotiation
-		// if our post-splice balance is still below the reserve priced at the
-		// new capacity. Derived-only bound (no stored max): a splice-in moves
-		// toward the stored reserve, never away from it. Conservative in one
-		// rare case: a selection whose change dies to the dust floor adds no
-		// output and could not be aborted, but is refused here all the same.
-		const postCapacity = channel.getFullState().fundingSatoshis + amountSats;
-		const reserveSats = channel.spliceReserveWeKeepSats(postCapacity);
-		const postLocalSats = channel.getBalances().localMsat / 1000n + amountSats;
-		if (postLocalSats < reserveSats) {
-			const error = `splice-in of ${amountSats} sats leaves our balance ${postLocalSats} sats below the channel reserve ${reserveSats} sats at the new capacity; splice in at least enough to clear the reserve`;
-			this.emit('node:error', {
-				code: 'SPLICE_IN_FAILED',
-				channelId,
-				message: error,
-				timestamp: Date.now()
-			} as ILightningError);
-			return { ok: false, error };
-		}
+		// The issue #423 splice-in reserve rule lives in channel.initiateSplice
+		// (after input selection, below): it arms only when the selection's
+		// change output will actually be emitted, which a pre-selection check
+		// here cannot know, and it must read the balance current at initiation,
+		// not the one from before the asynchronous selection.
 		if (!this.fundingProvider?.selectSpliceInputs) {
 			const error =
 				'splice-in requires a funding provider with selectSpliceInputs (wallet UTXO sourcing)';
@@ -9009,15 +8994,36 @@ export class LightningNode extends EventEmitter {
 				fundingFeeratePerkw
 			);
 			const state = channel.getFullState();
-			// Same raise-only bound as the spliceOut preflight (issue #423),
-			// priced at the CURRENT capacity: for any withdrawal the post-splice
-			// derived reserve is at most this, so the quote never over-offers.
 			const stored = state.remoteConfig?.channelReserveSatoshis ?? 0n;
-			const derived = channel.spliceReserveWeKeepSats(state.fundingSatoshis);
-			const reserve = derived > stored ? derived : stored;
 			const local = channel.getBalances().localMsat / 1000n;
+			// spliceOut prices the kept reserve at the POST-splice capacity, so
+			// the advertised maximum must be solved against that same predicate:
+			// pricing at the current capacity understates it whenever the stored
+			// reserve sits below the derived one (issue #423 review). The
+			// predicate is monotone in the amount (the derived reserve only
+			// shrinks as more is withdrawn, and never faster than the
+			// withdrawal grows), so binary search finds the boundary.
+			const admits = (amountSats: bigint): boolean => {
+				const derived = channel.spliceReserveWeKeepSats(
+					state.fundingSatoshis - amountSats - feeSats
+				);
+				const reserve = derived > stored ? derived : stored;
+				return amountSats + feeSats <= local - reserve;
+			};
+			let lo = 0n;
+			let hi = local > feeSats ? local - feeSats : 0n;
+			if (!admits(0n)) hi = 0n;
+			while (lo < hi) {
+				const mid = (lo + hi + 1n) / 2n;
+				if (admits(mid)) lo = mid;
+				else hi = mid - 1n;
+			}
+			const max = lo;
+			const derivedAtMax = channel.spliceReserveWeKeepSats(
+				state.fundingSatoshis - max - feeSats
+			);
+			const reserve = derivedAtMax > stored ? derivedAtMax : stored;
 			const spendable = local > reserve ? local - reserve : 0n;
-			const max = spendable > feeSats ? spendable - feeSats : 0n;
 			return {
 				direction,
 				feeSats: Number(feeSats),

@@ -602,11 +602,16 @@ describe('v2 open decode/signature-stage faults (issue 426)', function () {
 		expect(sent[0].data.toString('ascii')).to.contain(
 			'Invalid commitment signature in v2 open'
 		);
-		// Nothing broadcastable existed, so the teardown is total: session and
-		// record gone, row condemned, registration removed, pledge freed.
+		// Nothing broadcastable existed: session gone, row condemned,
+		// registration removed, pledge freed. The record itself is retained
+		// so a node's errored handler can recognize the non-broadcastable
+		// attempt and void rather than force-close.
 		expect(chA.getState()).to.equal(ChannelState.ERRORED);
 		expect(chA.getFullState().condemned).to.equal(true);
-		expect(chA.getFullState().v2InFlight).to.equal(null);
+		expect(
+			chA.getFullState().v2InFlight,
+			'record retained for the errored-handler void guard'
+		).to.not.equal(null);
 		expect(h.mgrA.listChannels()).to.have.length(0);
 		await settle(() => h.released.length > 0);
 		expect(h.released.length, 'opener pledge released').to.be.greaterThan(0);

@@ -241,7 +241,11 @@ describe('LightningNode splice validation', function () {
 		node.destroy();
 	});
 
-	it('refuses a splice-in that leaves us below the reserve at the new capacity (issue #423)', function () {
+	it('does not pre-judge a splice-in reserve before input selection (issue #423 review)', function () {
+		// The reserve rule arms only when the SELECTION emits a change
+		// output, which is unknowable before selectSpliceInputs runs: a
+		// below-reserve splice-in must reach the provider stage, not be
+		// refused up-front.
 		const node = createTestNode();
 		const channelId = injectNormalChannel(node);
 		const channel = (node as any).channelManager.channels.get(
@@ -249,32 +253,121 @@ describe('LightningNode splice validation', function () {
 		);
 		channel.getFullState().localBalanceMsat = 2_000_000n;
 		channel.getFullState().remoteBalanceMsat = 998_000_000n;
-
-		// 2k + 3k = 5k post balance, below v2ReserveWeKeep(1_003_000) =
-		// 10_030. Refused synchronously, BEFORE the funding-provider check
-		// (no provider is configured on this node).
-		const refused = node.spliceIn(channelId, 3_000n);
-		expect(refused.ok).to.be.false;
-		expect(refused.error).to.include('below the channel reserve');
-
-		// 2k + 20k = 22k clears the 10_200-sat bound and falls through to
-		// the provider requirement, proving the arm's order.
-		const admitted = node.spliceIn(channelId, 20_000n);
-		expect(admitted.ok).to.be.false;
-		expect(admitted.error).to.include('selectSpliceInputs');
+		const result = node.spliceIn(channelId, 3_000n);
+		expect(result.ok).to.be.false;
+		expect(result.error).to.include('selectSpliceInputs');
+		expect(result.error).to.not.include('reserve');
 		node.destroy();
 	});
 
-	it('spliceQuote reports the derived reserve when the stored one is lower (issue #423)', function () {
+	it('the splice-in reserve refusal is output-aware and runs after selection (issue #423)', async function () {
+		const changeScript = Buffer.concat([
+			Buffer.from([0x00, 0x14]),
+			crypto.randomBytes(20)
+		]);
+		const fee = spliceFeeSats(
+			estimateSpliceTxWeight({
+				walletInputCount: 1,
+				fundingScriptLen: 34,
+				changeScriptLen: changeScript.length
+			}),
+			253
+		);
+		const makeInput = (value: bigint) => ({
+			prevTx: Buffer.alloc(60),
+			prevOutputIndex: 0,
+			value,
+			sequence: 0xfffffffd,
+			signWitness: (): Buffer[] => [],
+			confirmed: true
+		});
+		const lowBalance = (node: LightningNode): Buffer => {
+			const channelId = injectNormalChannel(node);
+			const channel = (node as any).channelManager.channels.get(
+				channelId.toString('hex')
+			);
+			channel.getFullState().localBalanceMsat = 2_000_000n;
+			channel.getFullState().remoteBalanceMsat = 998_000_000n;
+			// The synthetic channel skips the handshake; a real NORMAL
+			// channel always carries the peer basepoints the guard's funding
+			// script derives from.
+			channel.getFullState().remoteBasepoints = makeBasepoints(
+				crypto.createHash('sha256').update('splice-validation-peer').digest()
+			);
+			return channelId;
+		};
+
+		// A change-emitting selection with 2k + 3k = 5k post balance, below
+		// v2ReserveWeKeep(1_003_000) = 10_030: refused after selection, via
+		// the async error surface.
+		const refusingNode = createTestNode();
+		const refusingErrors: string[] = [];
+		refusingNode.on('node:error', (e: { message: string }) =>
+			refusingErrors.push(e.message)
+		);
+		(refusingNode as any).fundingProvider = {
+			selectSpliceInputs: async () => ({
+				inputs: [makeInput(3_000n + fee + 2_000n)],
+				changeScript
+			})
+		};
+		const refusingId = lowBalance(refusingNode);
+		expect(refusingNode.spliceIn(refusingId, 3_000n).ok).to.be.true;
+		await new Promise((r) => setTimeout(r, 20));
+		expect(
+			refusingErrors.join('; '),
+			'reserve refusal surfaced asynchronously'
+		).to.match(/below the channel reserve/);
+		refusingNode.destroy();
+
+		// An exact-input selection emits no change output: same balances,
+		// no refusal, the splice proceeds to quiescence.
+		const admittingNode = createTestNode();
+		const admittingErrors: string[] = [];
+		admittingNode.on('node:error', (e: { message: string }) =>
+			admittingErrors.push(e.message)
+		);
+		(admittingNode as any).fundingProvider = {
+			selectSpliceInputs: async () => ({
+				inputs: [makeInput(3_000n + fee)],
+				changeScript
+			})
+		};
+		const admittingId = lowBalance(admittingNode);
+		expect(admittingNode.spliceIn(admittingId, 3_000n).ok).to.be.true;
+		await new Promise((r) => setTimeout(r, 20));
+		expect(
+			admittingErrors.join('; '),
+			'no reserve refusal for a no-change selection'
+		).to.not.match(/below the channel reserve/);
+		admittingNode.destroy();
+	});
+
+	it('spliceQuote maxAmountSats is exactly the largest amount spliceOut admits (issue #423)', function () {
 		const node = createTestNode();
 		const channelId = injectNormalChannel(node);
 		const channel = (node as any).channelManager.channels.get(
 			channelId.toString('hex')
 		);
+		// A stored reserve below the derived band, where the old
+		// current-capacity pricing understated the maximum: spliceOut prices
+		// the reserve at the POST-splice capacity, so the quote must solve
+		// against that same predicate.
 		channel.getFullState().remoteConfig.channelReserveSatoshis = 0n;
 		const quote = node.spliceQuote(channelId, 'out', 253);
-		// v2ReserveWeKeep(1_000_000, 354, 354) = 10_000, not the stored 0.
-		expect(quote.reserveSats).to.equal(10_000);
+		const max = BigInt(quote.maxAmountSats);
+		// One above the advertised maximum is refused by the balance arm.
+		const above = node.spliceOut(channelId, max + 1n, 253);
+		expect(above.ok).to.be.false;
+		expect(above.error).to.include('insufficient channel balance');
+		// The advertised maximum itself passes it.
+		const at = node.spliceOut(channelId, max, 253);
+		expect(at.error ?? '').to.not.include('insufficient channel balance');
+		// And it sits above the old current-capacity offer of
+		// local - K(1M) - fee = 1M - 10_000 - fee.
+		expect(Number(max)).to.be.greaterThan(
+			Number(1_000_000n - 10_000n - BigInt(quote.feeSats))
+		);
 		node.destroy();
 	});
 

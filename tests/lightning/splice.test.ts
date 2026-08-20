@@ -3438,6 +3438,83 @@ describe('Splice', function () {
 			).to.not.match(/below the channel reserve/);
 		});
 
+		it('refuses a splice-in whose change output parks us below the reserve at the new capacity (issue #423)', function () {
+			// The BOLT 2 reserve rule arms only when a side ADDS a non-funding
+			// output; for a splice-in that is the change output. 5k local + 3k
+			// in = 8k, below v2ReserveWeKeep(1_003_000) = 10_030, and the
+			// selection leaves change well above the dust floor.
+			const { acceptor } = makeNormalChannel(5_000_000n);
+			const changeScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const fee = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 1,
+					fundingScriptLen: 34,
+					changeScriptLen: changeScript.length
+				}),
+				253
+			);
+			acceptor.setSpliceInInputs(
+				[
+					{
+						prevTx: Buffer.alloc(60),
+						prevOutputIndex: 0,
+						value: 3_000n + fee + 2_000n,
+						sequence: 0xfffffffd,
+						signWitness: () => [],
+						confirmed: true
+					}
+				],
+				changeScript
+			);
+			const actions = acceptor.initiateSplice(3_000n, 253);
+			const err = findAction(actions, ChannelActionType.ERROR);
+			expect(err, 'refused up-front').to.exist;
+			expect(err.message).to.match(/below the channel reserve/);
+			expect(findSendAction(actions, MessageType.STFU), 'no quiescence started')
+				.to.not.exist;
+		});
+
+		it('admits an exact-input splice-in below the reserve: no change output to abort (issue #423)', function () {
+			// Same balances, but the selection covers exactly amount + fee: no
+			// change output is emitted, the reserve rule does not arm, and the
+			// splice is legal under BOLT 2 even though we stay below reserve.
+			const { acceptor } = makeNormalChannel(5_000_000n);
+			const changeScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const fee = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 1,
+					fundingScriptLen: 34,
+					changeScriptLen: changeScript.length
+				}),
+				253
+			);
+			acceptor.setSpliceInInputs(
+				[
+					{
+						prevTx: Buffer.alloc(60),
+						prevOutputIndex: 0,
+						value: 3_000n + fee,
+						sequence: 0xfffffffd,
+						signWitness: () => [],
+						confirmed: true
+					}
+				],
+				changeScript
+			);
+			const actions = acceptor.initiateSplice(3_000n, 253);
+			expect(
+				findAction(actions, ChannelActionType.ERROR)?.message ?? ''
+			).to.not.match(/below the channel reserve/);
+			expect(findSendAction(actions, MessageType.STFU), 'quiescence started').to
+				.exist;
+		});
+
 		it('initiateSplice refuses a splice-out into the derived reserve band (issue #423)', function () {
 			// 1M balance, withdraw 999_600: the 400 sats left sit below
 			// v2ReserveWeKeep(400) = 546, a composition a conforming peer MUST

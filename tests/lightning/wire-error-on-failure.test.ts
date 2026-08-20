@@ -639,9 +639,12 @@ describe('undecodable-payload decode guards (issue 426)', function () {
 	});
 
 	it('a non-broadcastable v2 signature-stage fault tears the open down condemned', function () {
-		// Nothing anyone can broadcast: the decided teardown of the recorded
-		// tx_abort arm, wire-visible, condemned in the same persist so the
-		// pledge release passes the durable-row probe.
+		// Nothing anyone can broadcast: the decided teardown, wire-visible,
+		// condemned in the same persist so the pledge release passes the
+		// durable-row probe. The record is RETAINED: the node's synchronous
+		// channel:errored handler reads v2InFlight to recognize the
+		// non-broadcastable attempt and void the channel instead of
+		// force-closing into a funding tx that can never exist.
 		const channel = makeV2SigStageChannel();
 		channel.getFullState().v2InFlight = makeV2Record();
 		expect(channel.isV2AttemptBroadcastable()).to.equal(false);
@@ -661,7 +664,47 @@ describe('undecodable-payload decode guards (issue 426)', function () {
 		expect(local!.cleanup).to.equal('lifecycle');
 		expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		expect(channel.getFullState().condemned).to.equal(true);
-		expect(channel.getFullState().v2InFlight).to.equal(null);
+		expect(
+			channel.getFullState().v2InFlight,
+			'record retained for the errored-handler void guard'
+		).to.not.equal(null);
+	});
+
+	it('a recorded-but-unsigned replacement pops to the signed attempt before failing', function () {
+		// The normalization markErrored runs must run here too: without it
+		// the failure pairs the replacement's outpoint with the previous
+		// attempt's signature and prepareForceClose signs a commitment the
+		// stored signature does not cover.
+		const channel = makeV2SigStageChannel();
+		const previous = makeV2Record();
+		previous.sentTxSignatures = true;
+		previous.fundingTxid = Buffer.alloc(32, 0x0b);
+		const replacement = makeV2Record();
+		replacement.fundingTxid = Buffer.alloc(32, 0x0a);
+		replacement.rbfAttempt = 1;
+		channel.getFullState().v2InFlight = replacement;
+		channel.getFullState().v2PreviousAttempts = [previous];
+
+		const actions = channel.failFromMalformedPeerMessage(
+			'Undecodable commitment_signed: boom'
+		);
+		// The signed previous attempt resumed and is broadcastable on its
+		// own: the row survives on it, nothing is condemned.
+		const local = actions.find((a) => a.type === ChannelActionType.ERROR) as
+			| IErrorAction
+			| undefined;
+		expect(local!.cleanup, 'row survives on the resumed attempt').to.equal(
+			'none'
+		);
+		expect(
+			channel
+				.getFullState()
+				.v2InFlight!.fundingTxid.equals(previous.fundingTxid),
+			'the signed attempt is current again'
+		).to.equal(true);
+		expect(channel.getFullState().v2PreviousAttempts).to.equal(undefined);
+		expect(channel.getFullState().condemned).to.not.equal(true);
+		expect(channel.getState()).to.equal(ChannelState.ERRORED);
 	});
 
 	it('a SPLICING channel keeps the bare local refusal (argued carve-out)', function () {
