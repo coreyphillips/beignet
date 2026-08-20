@@ -337,6 +337,7 @@ bitcoin.initEccLib(ecc);
  * - 'htlc:forward-failed' ({ inChannelId: Buffer, outChannelId: Buffer }) — a forwarded HTLC failed downstream
  * - 'peer:connect' (pubkey: string)
  * - 'peer:disconnect' (pubkey: string)
+ * - 'peer:disconnect-requested' (pubkey: string): external-transport (message:outbound) mode only; the host must sever its connection to this peer, the protocol side (channels marked for reestablish) is already applied
  * - 'peer:error' (pubkey: string, error: Error)
  * - 'peer_storage:retrieved' (peerPubkey: string, blob: Buffer)
  * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction): an on-chain claim was declined because it cannot pay its own fee
@@ -3198,16 +3199,14 @@ export class LightningNode extends EventEmitter {
 				// nested dispatches; tearing the peer down mid-turn would pull
 				// state out from under them.
 				setImmediate(() => {
-					try {
-						this.peerManager?.disconnectPeer(peerPubkey);
-					} catch {
-						// Already disconnected, or transport-level teardown raced.
-					}
+					this.requestPeerDisconnect(peerPubkey);
 					// A v2 opening whose blocked persist left memory ahead of
 					// disk (e.g. the replacement's commitment failed to
 					// commit) resyncs to the durable truth: the attempt on
 					// disk is the only one a restart would resume, so it is
-					// the only one this side may keep tracking.
+					// the only one this side may keep tracking. Runs after the
+					// disconnect so the reestablish rollback cannot mutate the
+					// attempt this just re-installed.
 					this.resyncV2OpenFromDisk(channelId);
 				});
 			}
@@ -3234,22 +3233,7 @@ export class LightningNode extends EventEmitter {
 					channelId: channelIdHex
 				});
 				setImmediate(() => {
-					if (this.peerManager) {
-						try {
-							this.peerManager.disconnectPeer(peerPubkey);
-						} catch {
-							// Already disconnected, or transport-level teardown raced.
-						}
-						return;
-					}
-					// External transport (message:outbound mode): there is no
-					// socket here to drop. Ask the host to sever the connection
-					// and apply the protocol side ourselves - BOLT 2: the channel
-					// is no longer quiescent upon disconnection, and reestablish
-					// resynchronizes on reconnect. Without this the channel would
-					// stay quiescing forever with its parked HTLCs stranded.
-					this.emit('peer:disconnect-requested', peerPubkey);
-					this.channelManager.handlePeerDisconnected(peerPubkey);
+					this.requestPeerDisconnect(peerPubkey);
 				});
 			}
 		);
@@ -3297,13 +3281,9 @@ export class LightningNode extends EventEmitter {
 						'the channel resumes through reestablish once the quorum is reachable',
 					timestamp: Date.now()
 				} as ILightningError);
-				if (reason === 'fenced' || !this.peerManager) return;
+				if (reason === 'fenced') return;
 				setImmediate(() => {
-					try {
-						this.peerManager?.disconnectPeer(peerPubkey);
-					} catch {
-						// Already disconnected, or transport-level teardown raced.
-					}
+					this.requestPeerDisconnect(peerPubkey);
 				});
 			}
 		);
@@ -3336,13 +3316,8 @@ export class LightningNode extends EventEmitter {
 						'the connection is dropped so reestablish can replay from durable state',
 					timestamp: Date.now()
 				} as ILightningError);
-				if (!this.peerManager) return;
 				setImmediate(() => {
-					try {
-						this.peerManager?.disconnectPeer(peerPubkey);
-					} catch {
-						// Already disconnected, or transport-level teardown raced.
-					}
+					this.requestPeerDisconnect(peerPubkey);
 				});
 			}
 		);
@@ -3670,6 +3645,30 @@ export class LightningNode extends EventEmitter {
 				this.emit('sweep:uneconomic', channelId, action);
 			}
 		);
+	}
+
+	/**
+	 * Sever a peer at this node's own initiative (durability barriers, the
+	 * quiescence watchdog). With networking enabled the PeerManager drops the
+	 * socket, and its peer:disconnect event applies the protocol side
+	 * (handlePeerDisconnected) through wirePeerManagerEvents. On an external
+	 * transport (message:outbound mode) there is no socket to drop: apply the
+	 * protocol side directly, then emit 'peer:disconnect-requested' so the
+	 * HOST severs its connection. Without both halves nothing marks the
+	 * channels AWAITING_REESTABLISH, the reestablish backstop never sees
+	 * them, and recovery degrades to CLTV-expiry scans.
+	 */
+	private requestPeerDisconnect(peerPubkey: string): void {
+		if (this.peerManager) {
+			try {
+				this.peerManager.disconnectPeer(peerPubkey);
+			} catch {
+				// Already disconnected, or transport-level teardown raced.
+			}
+			return;
+		}
+		this.channelManager.handlePeerDisconnected(peerPubkey);
+		this.emit('peer:disconnect-requested', peerPubkey);
 	}
 
 	/**

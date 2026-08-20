@@ -733,3 +733,182 @@ describe('Recovery phase 6: a truncated wire stream drops the connection', () =>
 		storage.close();
 	});
 });
+
+// Issue 432: the barrier handlers' remedy is a disconnect, but in
+// message:outbound mode there is no PeerManager to drop a socket. The node
+// must then apply the protocol side itself (handlePeerDisconnected, marking
+// the channels for reestablish) and ask the HOST to sever the connection via
+// 'peer:disconnect-requested', the pattern the quiescence watchdog already
+// uses. Without both halves the peer waits forever on a withheld batch and
+// the reestablish backstop never sees the channel.
+describe('Recovery phase 6: barrier disconnects reach the host on external transports', () => {
+	const PEER = '02'.repeat(33);
+
+	function spyOnResets(node: LightningNode): string[] {
+		const resets: string[] = [];
+		const cm = (node as unknown as { channelManager: ChannelManager })
+			.channelManager;
+		const original = cm.handlePeerDisconnected.bind(cm);
+		cm.handlePeerDisconnected = (pubkey: string): void => {
+			resets.push(pubkey);
+			original(pubkey);
+		};
+		return resets;
+	}
+
+	function collectRequests(node: LightningNode): string[] {
+		const requests: string[] = [];
+		node.on('peer:disconnect-requested', (pubkey: string) => {
+			requests.push(pubkey);
+		});
+		return requests;
+	}
+
+	function emitOnManager(node: LightningNode, ...args: unknown[]): void {
+		(
+			node as unknown as { channelManager: { emit: (...a: unknown[]) => void } }
+		).channelManager.emit(...args);
+	}
+
+	// The handlers defer their remedy with setImmediate; two rounds cover a
+	// deferral scheduled from inside the first.
+	async function flush(): Promise<void> {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+
+	it('transition:blocked resets the channels and asks the host to disconnect', async function (): Promise<void> {
+		const storage = openStorage();
+		const node = createNode(storage, undefined);
+		const resets = spyOnResets(node);
+		const requests = collectRequests(node);
+
+		emitOnManager(node, 'transition:blocked', PEER, null);
+		await flush();
+
+		expect(requests).to.deep.equal([PEER]);
+		expect(resets).to.deep.equal([PEER]);
+
+		node.destroy();
+		storage.close();
+	});
+
+	it('transition:frozen does the same and still reports the barrier timeout', async function (): Promise<void> {
+		const storage = openStorage();
+		const node = createNode(storage, undefined);
+		const resets = spyOnResets(node);
+		const requests = collectRequests(node);
+		const codes: string[] = [];
+		node.on('node:error', (error: { code: string }) => {
+			codes.push(error.code);
+		});
+
+		emitOnManager(
+			node,
+			'transition:frozen',
+			PEER,
+			'aa'.repeat(32),
+			'timeout',
+			1
+		);
+		await flush();
+
+		expect(requests).to.deep.equal([PEER]);
+		expect(resets).to.deep.equal([PEER]);
+		expect(codes).to.include('DURABILITY_BARRIER_TIMEOUT');
+
+		node.destroy();
+		storage.close();
+	});
+
+	it('a fenced freeze stays exempt from the disconnect', async function (): Promise<void> {
+		const storage = openStorage();
+		const node = createNode(storage, undefined);
+		const resets = spyOnResets(node);
+		const requests = collectRequests(node);
+
+		emitOnManager(
+			node,
+			'transition:frozen',
+			PEER,
+			'aa'.repeat(32),
+			'fenced',
+			1
+		);
+		await flush();
+
+		expect(requests).to.have.length(0);
+		expect(resets).to.have.length(0);
+
+		node.destroy();
+		storage.close();
+	});
+
+	it('transition:dispatch-failed resets the channels and asks the host to disconnect', async function (): Promise<void> {
+		const storage = openStorage();
+		const node = createNode(storage, undefined);
+		const resets = spyOnResets(node);
+		const requests = collectRequests(node);
+
+		emitOnManager(
+			node,
+			'transition:dispatch-failed',
+			PEER,
+			'bb'.repeat(32),
+			'observer exploded',
+			2
+		);
+		await flush();
+
+		expect(requests).to.deep.equal([PEER]);
+		expect(resets).to.deep.equal([PEER]);
+
+		node.destroy();
+		storage.close();
+	});
+
+	it('with networking the socket drop stays the remedy and no host request fires', async function (): Promise<void> {
+		const storage = openStorage();
+		const config = makeNodeConfig(storage, undefined);
+		config.enableNetworking = true;
+		const node = new LightningNode(config);
+		node.on('error', () => {});
+		node.on('node:error', () => {});
+		const resets = spyOnResets(node);
+		const requests = collectRequests(node);
+		const dropped: string[] = [];
+		(
+			node as unknown as {
+				peerManager: { disconnectPeer: (pubkey: string) => void };
+			}
+		).peerManager.disconnectPeer = (pubkey: string): void => {
+			dropped.push(pubkey);
+		};
+
+		emitOnManager(node, 'transition:blocked', PEER, null);
+		emitOnManager(
+			node,
+			'transition:frozen',
+			PEER,
+			'aa'.repeat(32),
+			'timeout',
+			1
+		);
+		emitOnManager(
+			node,
+			'transition:dispatch-failed',
+			PEER,
+			'bb'.repeat(32),
+			'observer exploded',
+			2
+		);
+		await flush();
+
+		expect(dropped).to.deep.equal([PEER, PEER, PEER]);
+		expect(requests).to.have.length(0);
+		expect(resets).to.have.length(0);
+
+		node.destroy();
+		storage.close();
+	});
+});
