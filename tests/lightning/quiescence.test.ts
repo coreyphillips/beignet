@@ -676,19 +676,20 @@ describe('Quiescence (STFU)', function () {
 			expect(opener.getState()).to.equal(ChannelState.ERRORED);
 		});
 
-		it('keeps an add that merely CROSSED our own stfu local (issue 404)', function () {
+		it('ACCEPTS an add that merely CROSSED our own stfu (issue 411)', function () {
 			// We have sent stfu and the peer has not answered. Its obligation starts
 			// at ITS receipt of ours, which we cannot observe, and BOLT 2 requires
 			// that window to exist ("MUST reply with stfu once it can do so", which a
 			// peer holding pending updates cannot do until it has drained them). So
-			// an add here may be entirely conformant: refuse it, but do not condemn
-			// the channel over a race.
-			const { opener } = getToNormal();
-			opener.initiateQuiescence();
-			expect(opener.getQuiescenceState()).to.equal(QuiescenceState.SENT_STFU);
+			// the crossing add is conformant and is admitted; the node parks its
+			// disposition until quiescence ends. The acceptor side receives, so the
+			// funder's balance affords the add.
+			const { acceptor } = getToNormal();
+			acceptor.initiateQuiescence();
+			expect(acceptor.getQuiescenceState()).to.equal(QuiescenceState.SENT_STFU);
 
-			const actions = opener.handleUpdateAddHtlc({
-				channelId: opener.getChannelId()!,
+			const actions = acceptor.handleUpdateAddHtlc({
+				channelId: acceptor.getChannelId()!,
 				id: 0n,
 				amountMsat: 50_000_000n,
 				paymentHash: crypto.randomBytes(32),
@@ -696,10 +697,16 @@ describe('Quiescence (STFU)', function () {
 				onionRoutingPacket: crypto.randomBytes(1366)
 			});
 			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
-			const error = findAction(actions, ChannelActionType.ERROR);
-			expect(error).to.exist;
-			expect(error.message).to.contain('quiescing');
-			expect(opener.getState()).to.equal(ChannelState.NORMAL);
+			expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+			expect(
+				acceptor.getFullState().htlcs.get('received-0'),
+				'recorded'
+			).to.not.equal(undefined);
+			expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
+			expect(
+				acceptor.getQuiescenceState(),
+				'the handshake stays where it was'
+			).to.equal(QuiescenceState.SENT_STFU);
 		});
 
 		it('should return correct quiescence state via getQuiescenceState', function () {
@@ -1046,6 +1053,243 @@ describe('Quiescence (STFU)', function () {
 			const error = findAction(exitActions, ChannelActionType.ERROR);
 			expect(error).to.exist;
 			expect(error.message).to.contain('not quiescent');
+		});
+	});
+
+	// ─────────────── Crossing adds and the quiescence watchdog ───────────────
+
+	describe('crossing adds and the quiescence watchdog (issues 410/411)', function () {
+		const QUIESCENCE_TIMEOUT_MS = 60;
+		const aliceConfig = makeConfig(30);
+		const bobConfig = makeConfig(40);
+		const alicePubkey =
+			aliceConfig.localBasepoints.fundingPubkey.toString('hex');
+		const bobPubkey = bobConfig.localBasepoints.fundingPubkey.toString('hex');
+
+		function sleep(ms: number): Promise<void> {
+			return new Promise((resolve) => setTimeout(resolve, ms));
+		}
+
+		/**
+		 * Loopback pump with per-direction stfu control: 'hold' queues stfu for
+		 * later release, 'drop' discards it, everything else flows immediately.
+		 */
+		function connectWithStfuControl(
+			alice: ChannelManager,
+			bob: ChannelManager,
+			mode: 'hold' | 'drop'
+		): { releaseHeldStfu: () => void } {
+			const held: Array<{ from: string; to: ChannelManager; payload: Buffer }> =
+				[];
+			const route = (
+				from: string,
+				to: ChannelManager,
+				type: number,
+				payload: Buffer
+			): void => {
+				if (type === MessageType.STFU) {
+					if (mode === 'drop') return;
+					held.push({ from, to, payload });
+					return;
+				}
+				to.handleMessage(from, type, payload);
+			};
+			alice.on('message:outbound', (peer: string, t: number, p: Buffer) => {
+				if (peer === bobPubkey) route(alicePubkey, bob, t, p);
+			});
+			bob.on('message:outbound', (peer: string, t: number, p: Buffer) => {
+				if (peer === alicePubkey) route(bobPubkey, alice, t, p);
+			});
+			return {
+				// Drain until empty: delivering a held stfu can produce the
+				// peer's reply stfu, which the pump captures too.
+				releaseHeldStfu: () => {
+					while (held.length > 0) {
+						const h = held.shift()!;
+						h.to.handleMessage(h.from, MessageType.STFU, h.payload);
+					}
+				}
+			};
+		}
+
+		function readyPair(mode: 'hold' | 'drop'): {
+			alice: ChannelManager;
+			bob: ChannelManager;
+			channelId: Buffer;
+			releaseHeldStfu: () => void;
+		} {
+			const alice = new ChannelManager({
+				...aliceConfig,
+				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+			});
+			const bob = new ChannelManager({
+				...bobConfig,
+				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+			});
+			const { releaseHeldStfu } = connectWithStfuControl(alice, bob, mode);
+			alice.on('error', () => {});
+			bob.on('error', () => {});
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			const fundingTxid = crypto.randomBytes(32);
+			const channelId = alice.createFunding(
+				channel,
+				fundingTxid,
+				0,
+				crypto.randomBytes(64)
+			)!;
+			alice.handleFundingConfirmed(channelId);
+			bob.handleFundingConfirmed(channelId);
+			return { alice, bob, channelId, releaseHeldStfu };
+		}
+
+		it('a crossing add drains in SENT_STFU and the late stfu reply completes the handshake', function () {
+			const { alice, bob, channelId, releaseHeldStfu } = readyPair('hold');
+			const bobChannel = bob.getChannel(channelId)!;
+			const aliceChannel = alice.getChannel(channelId)!;
+
+			// Bob initiates quiescence; his stfu is held, so Alice does not know.
+			const q = bob.initiateQuiescence(channelId);
+			expect(q.ok, q.error).to.be.true;
+			expect(bobChannel.getQuiescenceState()).to.equal(
+				QuiescenceState.SENT_STFU
+			);
+
+			// Alice's add crosses Bob's stfu. Bob accepts it (issue 411) and the
+			// commitment dance drains it fully while Bob stays in SENT_STFU:
+			// commitment_signed/revoke_and_ack are not update messages.
+			const res = alice.addHtlc(
+				channelId,
+				20_000_000n,
+				crypto.randomBytes(32),
+				500_000,
+				crypto.randomBytes(1366)
+			);
+			expect(res.ok).to.be.true;
+			const entry = bobChannel.getFullState().htlcs.get('received-0');
+			expect(entry, 'crossing add admitted').to.not.equal(undefined);
+			expect(entry!.state, 'fully committed').to.equal(HtlcState.COMMITTED);
+			expect(bobChannel.getQuiescenceState()).to.equal(
+				QuiescenceState.SENT_STFU
+			);
+
+			// The drain is complete, so Alice can answer the released stfu at
+			// once, and Bob's pending gate accepts the reply: a COMMITTED live
+			// HTLC is not a pending update.
+			releaseHeldStfu();
+			expect(aliceChannel.isQuiescent()).to.be.true;
+			expect(bobChannel.isQuiescent()).to.be.true;
+		});
+
+		it('disconnects after the timeout while quiescing with an HTLC pending', async function () {
+			const { alice, bob, channelId } = readyPair('drop');
+
+			// A fully committed live HTLC, then a quiescence handshake that never
+			// completes (the stfu is dropped).
+			expect(
+				alice.addHtlc(
+					channelId,
+					20_000_000n,
+					crypto.randomBytes(32),
+					500_000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
+			const timeouts: Array<{ channelIdHex: string; peer: string }> = [];
+			alice.on('quiescence:timeout', (channelIdHex: string, peer: string) => {
+				timeouts.push({ channelIdHex, peer });
+			});
+			expect(alice.initiateQuiescence(channelId).ok).to.be.true;
+
+			await sleep(QUIESCENCE_TIMEOUT_MS * 3);
+			expect(timeouts.length, 'BOLT 2 60s disconnect demanded').to.be.above(0);
+			expect(timeouts[0].channelIdHex).to.equal(channelId.toString('hex'));
+			expect(timeouts[0].peer).to.equal(bobPubkey);
+			void bob;
+		});
+
+		it('an idle quiescence with no HTLCs is left standing', async function () {
+			const { alice, channelId } = readyPair('drop');
+			const timeouts: string[] = [];
+			alice.on('quiescence:timeout', (channelIdHex: string) => {
+				timeouts.push(channelIdHex);
+			});
+			expect(alice.initiateQuiescence(channelId).ok).to.be.true;
+
+			await sleep(QUIESCENCE_TIMEOUT_MS * 3);
+			// BOLT 2 disconnects "if the HTLCs are pending"; nothing is.
+			expect(timeouts).to.have.length(0);
+		});
+
+		it('a disconnect retires the watchdog and reports the session over', async function () {
+			const { alice, channelId } = readyPair('drop');
+			expect(
+				alice.addHtlc(
+					channelId,
+					20_000_000n,
+					crypto.randomBytes(32),
+					500_000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
+			const ended: string[] = [];
+			const timeouts: string[] = [];
+			alice.on('quiescence:ended', (channelIdHex: string) => {
+				ended.push(channelIdHex);
+			});
+			alice.on('quiescence:timeout', (channelIdHex: string) => {
+				timeouts.push(channelIdHex);
+			});
+			expect(alice.initiateQuiescence(channelId).ok).to.be.true;
+
+			alice.handlePeerDisconnected(bobPubkey);
+			expect(ended, 'quiescence never survives a disconnect').to.deep.equal([
+				channelId.toString('hex')
+			]);
+			await sleep(QUIESCENCE_TIMEOUT_MS * 3);
+			expect(timeouts, 'the timer was cleared').to.have.length(0);
+		});
+
+		it('a QUIESCENT session with a live HTLC also times out', async function () {
+			// The MUST covers the whole session, not just the handshake: a
+			// stalled dependent protocol with an HTLC pending must disconnect.
+			const alice = new ChannelManager({
+				...aliceConfig,
+				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+			});
+			const bob = new ChannelManager({
+				...bobConfig,
+				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+			});
+			connectManagers(alice, alicePubkey, bob, bobPubkey);
+			alice.on('error', () => {});
+			bob.on('error', () => {});
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			const channelId = alice.createFunding(
+				channel,
+				crypto.randomBytes(32),
+				0,
+				crypto.randomBytes(64)
+			)!;
+			alice.handleFundingConfirmed(channelId);
+			bob.handleFundingConfirmed(channelId);
+			expect(
+				alice.addHtlc(
+					channelId,
+					20_000_000n,
+					crypto.randomBytes(32),
+					500_000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
+			const timeouts: string[] = [];
+			alice.on('quiescence:timeout', (channelIdHex: string) => {
+				timeouts.push(channelIdHex);
+			});
+			expect(alice.initiateQuiescence(channelId).ok).to.be.true;
+			expect(alice.getChannel(channelId)!.isQuiescent()).to.be.true;
+
+			await sleep(QUIESCENCE_TIMEOUT_MS * 3);
+			expect(timeouts.length).to.be.above(0);
 		});
 	});
 });

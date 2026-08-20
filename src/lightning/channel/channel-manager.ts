@@ -344,6 +344,12 @@ export interface IChannelManagerConfig {
 	 * exist (no storage).
 	 */
 	hasResumableChannelRow?: (channelId: Buffer) => boolean;
+	/**
+	 * BOLT 2 quiescence watchdog window in ms (default 60_000): "MUST
+	 * disconnect after 60 seconds of quiescence if the HTLCs are pending".
+	 * Injectable so tests can shrink it.
+	 */
+	quiescenceTimeoutMs?: number;
 }
 
 /**
@@ -367,6 +373,11 @@ export interface IChannelManagerConfig {
  * - 'htlc:forwarded' (channelId: Buffer, htlcId: bigint, amountMsat: bigint, paymentHash: Buffer)
  * - 'htlc:fulfilled' (channelId: Buffer, htlcId: bigint, preimage: Buffer)
  * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer)
+ * - 'quiescence:ended' (channelIdHex: string) — the channel left quiescence;
+ *   parked HTLC dispositions may resume
+ * - 'quiescence:timeout' (channelIdHex: string, peerPubkey: string) — BOLT 2's
+ *   60-second quiescence window elapsed with HTLCs pending; the peer must be
+ *   disconnected
  * - 'error' (channelId: Buffer | null, message: string)
  */
 
@@ -375,6 +386,9 @@ export interface IChannelManagerConfig {
  * package (matches the ChainMonitor sweep rebroadcast cadence).
  */
 const COMMITMENT_CPFP_REBUMP_INTERVAL = 6;
+
+/** BOLT 2: "MUST disconnect after 60 seconds of quiescence if the HTLCs are pending". */
+const DEFAULT_QUIESCENCE_TIMEOUT_MS = 60_000;
 
 export class ChannelManager extends EventEmitter {
 	private config: IChannelManagerConfig;
@@ -390,6 +404,13 @@ export class ChannelManager extends EventEmitter {
 	 * never run for a channel that has been live all along.
 	 */
 	private channelsAwaitingRestoreRepair: Set<string> = new Set();
+	/**
+	 * BOLT 2 quiescence watchdog: one timer per quiescing channel. Timer
+	 * presence doubles as the "was quiescing" latch, so clearing one emits
+	 * 'quiescence:ended'. Timers are unref'd and cleared on detach.
+	 */
+	private quiescenceTimers: Map<string, ReturnType<typeof setTimeout>> =
+		new Map();
 	private peerManager: PeerManager | null = null;
 	private monitors: Map<string, ChainMonitor> = new Map();
 	// Latest block height seen (for stamping when a force-close CPFP was broadcast).
@@ -617,6 +638,10 @@ export class ChannelManager extends EventEmitter {
 	 */
 	detachFromPeerManager(): void {
 		this.peerManager = null;
+		for (const timer of this.quiescenceTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.quiescenceTimers.clear();
 	}
 
 	// ─────────────── Zero-Conf Trusted Peers ───────────────
@@ -1507,6 +1532,9 @@ export class ChannelManager extends EventEmitter {
 				continue;
 			}
 			channel.markForReestablish();
+			// Quiescence never survives a disconnect (BOLT 2); retire the
+			// watchdog and release anything parked behind the session.
+			this._syncQuiescenceWatchdog(channel);
 			// The disconnect dropped any un-acked RBF request; coins selected
 			// to raise its contribution are free again.
 			this.releaseDanglingV2Pledges(channel);
@@ -6483,12 +6511,66 @@ export class ChannelManager extends EventEmitter {
 			.catch(() => undefined);
 	}
 
+	/**
+	 * Keep the per-channel quiescence watchdog in step with the channel's
+	 * quiescence state (BOLT 2 60-second disconnect). Runs on every action
+	 * batch, INCLUDING empty ones: quiescence-exiting channel methods
+	 * (abortSplice, exitQuiescence) can return no actions. Terminal exits that
+	 * bypass processActions entirely (markErrored, force close) are covered by
+	 * the fire-time re-check, which emits 'quiescence:ended' instead of
+	 * timing out when the session is already over.
+	 */
+	private _syncQuiescenceWatchdog(channel: Channel): void {
+		// Tolerate partial channel doubles in tests and recovery shims.
+		if (typeof channel.isQuiescing !== 'function') return;
+		const channelIdHex = channel.getChannelId()?.toString('hex');
+		if (!channelIdHex) return;
+		const timer = this.quiescenceTimers.get(channelIdHex);
+		if (channel.isQuiescing()) {
+			if (timer) return;
+			const t = setTimeout(() => {
+				this.quiescenceTimers.delete(channelIdHex);
+				this._onQuiescenceTimeout(channelIdHex);
+			}, this.config.quiescenceTimeoutMs ?? DEFAULT_QUIESCENCE_TIMEOUT_MS);
+			if (typeof t.unref === 'function') t.unref();
+			this.quiescenceTimers.set(channelIdHex, t);
+			return;
+		}
+		if (timer) {
+			clearTimeout(timer);
+			this.quiescenceTimers.delete(channelIdHex);
+			this.emit('quiescence:ended', channelIdHex);
+		}
+	}
+
+	private _onQuiescenceTimeout(channelIdHex: string): void {
+		const channel = this.channels.get(channelIdHex);
+		if (!channel) return;
+		if (!channel.isQuiescing()) {
+			// The session ended through a path with no watchdog sync point;
+			// release anything parked on it.
+			this.emit('quiescence:ended', channelIdHex);
+			return;
+		}
+		// BOLT 2 disconnects "if the HTLCs are pending": an idle operator
+		// quiescence with no HTLC entries at all may stand. Re-arm, since a
+		// crossing add could still land while the session continues.
+		if (channel.getFullState().htlcs.size === 0) {
+			this._syncQuiescenceWatchdog(channel);
+			return;
+		}
+		const peerPubkey = this.channelPeers.get(channelIdHex);
+		if (peerPubkey === undefined) return;
+		this.emit('quiescence:timeout', channelIdHex, peerPubkey);
+	}
+
 	private processActions(
 		peerPubkey: string,
 		channel: Channel,
 		actions: ChannelAction[],
 		progress?: IActionDispatchProgress
 	): void {
+		this._syncQuiescenceWatchdog(channel);
 		if (actions.length === 0) return;
 		const dispatchProgress = progress ?? {
 			index: -1,

@@ -2816,36 +2816,25 @@ export class Channel {
 			);
 		}
 
-		// Reject during quiescence, and tell the peer only once IT has sent stfu.
-		// From its own stfu the peer is bound by BOLT 2's "MUST NOT send an update
-		// message after stfu", and that stfu preceded this add on the same ordered
-		// stream, so no race can produce it: the refusal is provable divergence and
-		// the peer must hear it (issue 404).
+		// Reject during quiescence only once the PEER has sent stfu. From its own
+		// stfu the peer is bound by BOLT 2's "MUST NOT send an update message
+		// after stfu", and that stfu preceded this add on the same ordered
+		// stream, so no race can produce it: the refusal is provable divergence
+		// and the peer must hear it (issue 404).
 		//
 		// While only WE have sent stfu the peer owes nothing yet. Its obligation
-		// starts at ITS receipt of ours, which we cannot observe, and BOLT 2 requires
-		// that window to exist: a peer holding pending updates has to drain them
-		// before it can "reply with stfu once it can do so". Refusing there stays
-		// LOCAL, which is survivable as it stands (the add is dropped, and a
-		// disconnect reverses uncommitted adds via markForReestablish), where killing
-		// the channel over a legal crossing would not be. That leaves issue 404 open
-		// in this one window; the real answer is to ACCEPT the crossing add, which
-		// needs handleStfuMessage to stop refusing the peer's stfu reply when HTLCs
-		// are pending, plus BOLT 2's 60-second quiescence disconnect, neither of
-		// which exists yet.
+		// starts at ITS receipt of ours, which we cannot observe, and BOLT 2
+		// requires that window to exist: a peer holding pending updates has to
+		// drain them before it can "reply with stfu once it can do so". So a
+		// crossing add is conformant and is ACCEPTED here (issue 411); the node
+		// parks its disposition until quiescence ends, and the manager's
+		// quiescence watchdog enforces BOLT 2's 60-second disconnect if the
+		// session stalls with HTLCs pending.
 		// Reached from NORMAL (a quiescence handshake that has not moved the
 		// channel state yet); the lifecycle guard above already answered the same
 		// question for a channel that has moved.
 		if (this._quiescence.peerHasSentStfu()) {
 			return this._failChannelWithWireError('update_add_htlc after your stfu');
-		}
-		if (this._quiescence.isQuiescing()) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Unexpected update_add_htlc: channel is quiescing'
-				}
-			];
 		}
 
 		// Validate inbound HTLC per BOLT 2
@@ -2923,22 +2912,11 @@ export class Channel {
 			);
 		}
 
-		// Cap total dust-HTLC exposure (see addHtlc): protects against a peer
-		// loading the channel with unenforceable dust that burns to fees on close.
-		if (
-			this._isDustHtlc(msg.amountMsat) &&
-			this._dustExposureMsat() + msg.amountMsat >
-				Channel.MAX_DUST_HTLC_EXPOSURE_MSAT
-		) {
-			// OUR ceiling rather than a BOLT 2 MUST, and told anyway: the peer could
-			// not have predicted the policy, but the divergence is identical. LND and
-			// CLN instead admit the add and fail it back with an onion failure, which
-			// is the better answer and needs the check moved to the forwarding
-			// decision rather than left here.
-			return this._failChannelWithWireError(
-				'Dust HTLC exposure limit exceeded'
-			);
-		}
+		// The dust-exposure ceiling is deliberately NOT enforced here. BOLT 2
+		// ("Bounding exposure to trimmed in-flight HTLCs"): the receiver SHOULD
+		// fail such an HTLC once it's committed, not refuse the add. The node
+		// admits it and fails it back with temporary_channel_failure via
+		// receivedHtlcExceedsDustExposure() (issue 410).
 
 		// BOLT 2: cltv_expiry >= 500000000 is a unix timestamp, not a block
 		// height — always invalid, independent of whether we know the current
@@ -2959,10 +2937,9 @@ export class Channel {
 				// either way.
 				return this._failChannelWithWireError('HTLC CLTV already expired');
 			}
-			if (msg.cltvExpiry > this._currentBlockHeight + 5040) {
-				// OUR horizon, told anyway, for the reason given at the dust arm above.
-				return this._failChannelWithWireError('HTLC CLTV too far in future');
-			}
+			// The far-future horizon (MAX_HTLC_CLTV_EXPIRY_DELTA) is OUR policy,
+			// not a BOLT 2 MUST: the node admits the add and fails it back with
+			// expiry_too_far once committed (issue 410).
 		}
 
 		const entry: IHtlcEntry = {
@@ -4714,8 +4691,11 @@ export class Channel {
 			this._dustExposureAtRateMsat(msg.feeratePerKw) >
 			Channel.MAX_DUST_HTLC_EXPOSURE_MSAT
 		) {
-			// OUR ceiling rather than a BOLT 2 MUST, and told anyway: the divergence
-			// is identical to a spec violation.
+			// Unlike the HTLC-add arms (issue 410), this one stays a channel
+			// failure: BOLT 2's dust-exposure section says the receiver of such an
+			// update_fee "MAY fail the channel" (eclair and CLN do), and there is
+			// no per-HTLC answer to a fee update that re-trims the whole in-flight
+			// set.
 			return this._failChannelWithWireError(
 				'update_fee would raise dust HTLC exposure above limit (in-flight HTLCs would be trimmed)'
 			);
@@ -11290,6 +11270,13 @@ export class Channel {
 	static readonly MAX_DUST_HTLC_EXPOSURE_MSAT = 5_000_000n; // 5000 sats
 
 	/**
+	 * How far past the current block height an incoming HTLC's cltv_expiry may
+	 * reach (~5 weeks). Our policy, not a BOLT 2 MUST: the node admits an add
+	 * beyond it and fails it back with expiry_too_far once committed.
+	 */
+	static readonly MAX_HTLC_CLTV_EXPIRY_DELTA = 5040;
+
+	/**
 	 * Whether an HTLC of this amount would be trimmed (dust) on at least one of
 	 * the two commitments at the given feerate. Mirrors the commitment builder's
 	 * trim rule (dust_limit + second-level tx fee): for non-anchor channels the
@@ -11339,6 +11326,43 @@ export class Channel {
 	/** Total in-flight dust-HTLC value (both directions), in msat. */
 	private _dustExposureMsat(): bigint {
 		return this._dustExposureAtRateMsat(getCommitmentFeeRate(this._state));
+	}
+
+	/**
+	 * Whether this in-flight received dust HTLC breached
+	 * MAX_DUST_HTLC_EXPOSURE_MSAT when it was admitted. BOLT 2 ("Bounding
+	 * exposure to trimmed in-flight HTLCs"): such an HTLC SHOULD be failed
+	 * once committed rather than refused at add time (issue 410).
+	 *
+	 * Sequential-admission semantics: exposure counts every in-flight offered
+	 * dust HTLC plus received dust HTLCs up to and including this id. A whole
+	 * batch can commit at once, and against the full map's total every dust
+	 * HTLC in it would read as over the ceiling; ordering by id fails back
+	 * only the ones that actually pushed past it, and answers the same on a
+	 * restart replay.
+	 */
+	receivedHtlcExceedsDustExposure(htlcId: bigint): boolean {
+		const entry = this._state.htlcs.get('received-' + htlcId);
+		if (!entry) return false;
+		if (
+			entry.state !== HtlcState.PENDING &&
+			entry.state !== HtlcState.COMMITTED
+		) {
+			return false;
+		}
+		const rate = getCommitmentFeeRate(this._state);
+		if (!this._isDustHtlcAtRate(entry.amountMsat, rate)) return false;
+		let exposureMsat = 0n;
+		for (const e of this._state.htlcs.values()) {
+			if (e.state !== HtlcState.PENDING && e.state !== HtlcState.COMMITTED) {
+				continue;
+			}
+			if (e.direction === HtlcDirection.RECEIVED && e.id > htlcId) continue;
+			if (this._isDustHtlcAtRate(e.amountMsat, rate)) {
+				exposureMsat += e.amountMsat;
+			}
+		}
+		return exposureMsat > Channel.MAX_DUST_HTLC_EXPOSURE_MSAT;
 	}
 
 	/**

@@ -402,7 +402,7 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 
-		it('rejects HTLC with CLTV too far in future', () => {
+		it('admits HTLC with CLTV too far in future (failed back once committed)', () => {
 			const { channel, state } = makeNormalChannel(14);
 			channel.setBlockHeight(500);
 
@@ -411,13 +411,14 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 				id: 0n,
 				amountMsat: 10_000n,
 				paymentHash: crypto.randomBytes(32),
-				cltvExpiry: 500 + 5041, // > 5040 blocks in future
+				cltvExpiry: 500 + 5041, // > MAX_HTLC_CLTV_EXPIRY_DELTA blocks ahead
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
-			// Wire-visible: the peer must learn its update was refused, or its
-			// next commitment_signed covers state we do not hold (issue 404).
-			expectWireFailure(actions, state.channelId!, /CLTV too far in future/);
-			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			// Our policy, not a BOLT 2 MUST: the node admits it and fails it
+			// back with expiry_too_far after commitment (issue 410).
+			expect(actions).to.have.length(0);
+			expect(state.htlcs.get('received-0')).to.not.equal(undefined);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
 		});
 	});
 });
