@@ -3956,6 +3956,18 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			findPayload(opHandle, MessageType.CHANNEL_READY),
 			'the parked confirmation flushes as channel_ready'
 		).to.not.equal(null);
+		// EXACTLY one: the flush runs before the channel_ready retransmit arm
+		// and sets localChannelReady, so without the queued-send dedup the
+		// retransmit fired too and one reestablish put two channel_ready
+		// messages on the wire (issue 421).
+		expect(
+			opHandle.filter(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					a.messageType === MessageType.CHANNEL_READY
+			).length,
+			'exactly one channel_ready leaves (issue 421)'
+		).to.equal(1);
 	});
 
 	it('flushes a confirmation that arrived mid-exchange when the exchange completes', () => {

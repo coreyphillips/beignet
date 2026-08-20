@@ -2590,15 +2590,43 @@ describe('Splice', function () {
 		});
 
 		it('a splice-in never raises the reserve it enforces (issue 381)', function () {
-			// The other direction stays put: raising would start refusing HTLCs
-			// the peer believes are legal, which is the failure the lowering
-			// exists to avoid. Re-deriving both reserves at the new capacity is
-			// issue 382.
+			// The other direction stays put, by policy rather than omission
+			// (issue 382): CLN never re-prices a reserve across a splice, so its
+			// own gate still lets it spend down to the value priced at the
+			// ORIGINAL capacity, and raising ours would start refusing HTLCs it
+			// believes are legal. Erring low is inert; the peer's own gate binds.
 			const opener = spliceToAdoption(500_000n);
 			expect(opener.getFundingSatoshis()).to.equal(1_500_000n);
 			expect(opener.getFullState().localConfig.channelReserveSatoshis).to.equal(
 				10_000n
 			);
+		});
+
+		it('a splice-in raises the reserve it keeps to the new capacity price (issue 382)', function () {
+			// eclair re-derives BOTH reserves from the new capacity once
+			// fundingTxIndex > 0 (v1 channels included), so after a splice-in the
+			// peer enforces more against us than the open-time value. A kept
+			// reserve still priced at the old capacity lets
+			// getSpendableOutboundMsat overdraw into an HTLC the peer MUST
+			// refuse, which force closes the channel.
+			const opener = spliceToAdoption(500_000n);
+			expect(opener.getFundingSatoshis()).to.equal(1_500_000n);
+			expect(
+				opener.getFullState().remoteConfig.channelReserveSatoshis
+			).to.equal(15_000n);
+		});
+
+		it('a splice-out never lowers the reserve it keeps (issue 382)', function () {
+			// CLN never re-prices a reserve across a splice (channeld has no
+			// reserve handling at all), so the peer may keep enforcing the value
+			// priced at the ORIGINAL capacity forever; lowering what we keep to
+			// the new 2,000-sat derivation would open the same overdraw gap the
+			// raise above closes. Over-keeping only costs our own spendable.
+			const opener = spliceToAdoption(-800_000n);
+			expect(opener.getFundingSatoshis()).to.equal(200_000n);
+			expect(
+				opener.getFullState().remoteConfig.channelReserveSatoshis
+			).to.equal(10_000n);
 		});
 
 		it('prices a spliced v2 channel by the v2 rule (issue 381)', function () {

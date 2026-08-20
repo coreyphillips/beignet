@@ -7595,8 +7595,8 @@ export class Channel {
 	}
 
 	/**
-	 * Raise the reserve a v2 row KEEPS for itself to what its capacity prices,
-	 * on load (issue #387).
+	 * Raise the reserve a v2 or spliced row KEEPS for itself to what its
+	 * capacity prices, on load (issues #387, #382).
 	 *
 	 * The mirror of repairEnforcedChannelReserve, in the opposite direction and
 	 * for the opposite reason. remoteConfig.channelReserveSatoshis is what the
@@ -7614,13 +7614,19 @@ export class Channel {
 	 * one visible cost is that as the opener of a small legacy row our own
 	 * updateFee can now self-refuse against the larger reserve.
 	 *
-	 * v2 only. A v1 reserve was negotiated on the wire and stored verbatim, so
-	 * there is nothing to re-derive and no ambiguity to resolve; re-pricing a
-	 * SPLICED row's kept reserve at its new capacity is issue #382, which the
-	 * splice adoption tail defers for the same reason. And v2ReserveWeKeep is at
-	 * or above what eclair (max(1%, a dust limit)) and CLN (max(1%, the opener's
-	 * dust limit)) each require of us at any dust pairing, so raising to it can
-	 * never overshoot a conforming peer.
+	 * v2 rows and SPLICED rows, the same branch rule as reserveWeEnforceAt. An
+	 * unspliced v1 reserve was negotiated on the wire and stored verbatim, so
+	 * there is nothing to re-derive and no ambiguity to resolve. A spliced row
+	 * of either version is different (issue #382): eclair re-derives both
+	 * reserves from the new capacity once fundingTxIndex > 0, v1 included, so
+	 * after a splice-in the peer may be enforcing more against us than the row
+	 * kept. The splice adoption tail now raises the kept reserve at every
+	 * adoption; this covers rows whose splice adopted BEFORE that existed. And
+	 * v2ReserveWeKeep is at or above what eclair (max(1%, a dust limit)) and
+	 * CLN (max(1%, the opener's dust limit)) each require of us at any dust
+	 * pairing and any splice history (CLN never re-prices across a splice, so
+	 * what it enforces is bounded by the max() this composes with), so raising
+	 * to it can never overshoot a conforming peer.
 	 *
 	 * Not gated on channelReserveVersion: that stamp records the provenance of
 	 * the reserve we ENFORCE, negotiated versus never written, which says
@@ -7631,7 +7637,9 @@ export class Channel {
 	 * reserves for the active attempt.
 	 */
 	repairKeptChannelReserve(): void {
-		if (this._state.fundingVersion !== 2) return;
+		if (this._state.fundingVersion !== 2 && !this._state.spliceFundingTxid) {
+			return;
+		}
 		if (this._state.fundingSatoshis <= 0n) return;
 		if (this._state.v2InFlight || this._state.v2PreviousAttempts?.length) {
 			return;
@@ -8154,12 +8162,21 @@ export class Channel {
 		// missed our channel_ready — retransmit REGARDLESS of our local state
 		// (we may already have advanced to NORMAL). The local-state condition
 		// is kept as a belt-and-braces fallback for peers that omit the field
-		// semantics (pre-ready states always retransmit).
+		// semantics (pre-ready states always retransmit). Skipped when a
+		// channel_ready is already queued: the v2 parked-confirmation flush
+		// above runs fundingConfirmed, whose fresh send is byte-identical to
+		// this replay, and without the skip one reestablish put both on the
+		// wire (issue #421).
 		if (
 			this._state.localChannelReady &&
 			(msg.nextCommitmentNumber === 1n ||
 				this._state.state === ChannelState.AWAITING_CHANNEL_READY ||
-				this._state.state === ChannelState.AWAITING_FUNDING_CONFIRMED)
+				this._state.state === ChannelState.AWAITING_FUNDING_CONFIRMED) &&
+			!actions.some(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					a.messageType === MessageType.CHANNEL_READY
+			)
 		) {
 			const secondPoint = getPerCommitmentPoint(
 				this._state.localPerCommitmentSeed,
@@ -10804,17 +10821,25 @@ export class Channel {
 		// gossip htlc_maximum_msat is clamped against current capacity at
 		// channel_update build time.
 		//
-		// localConfig.channelReserveSatoshis, its neighbour, IS revisited, in one
-		// direction. It is priced at capacity, so a splice-out leaves us enforcing
-		// a reserve the post-splice channel no longer justifies while the peer
-		// honours what the new capacity prices: a channel opened at 5,000,000 and
-		// spliced down to 400,000 would refuse every peer HTLC in a 46,000-sat
-		// band, and that refusal is a bare ERROR the peer never sees, so its next
-		// commitment_signed covers an HTLC we do not hold and the channel force
-		// closes. Lowering can only stop us refusing traffic the peer believes is
-		// legal, so it can never open such a band; raising could, which is why a
-		// splice-in leaves the value alone. Re-deriving BOTH reserves at the new
-		// capacity, the reserve we keep included, is issue #382.
+		// Both channelReserveSatoshis, by contrast, ARE revisited (issue #382:
+		// BOLT 2 prices the reserve at current capacity), each in ONE direction
+		// only, because the two reference peers disagree about what a splice does
+		// to the reserve: eclair re-derives BOTH sides from the new capacity the
+		// moment fundingTxIndex > 0 (Commitments.scala, v1 channels included),
+		// while CLN never re-prices either side across a splice (channeld has no
+		// reserve handling at all; an explicit DTODO). Each direction below is
+		// the one that is safe against BOTH behaviours; the opposite direction
+		// would open a refusal band against one of them, and a reserve refusal is
+		// an HTLC the two sides disagree about, which force closes the channel.
+		//
+		// The reserve we ENFORCE only ever falls. A splice-out leaves us
+		// enforcing a reserve the post-splice channel no longer justifies (a
+		// channel opened at 5,000,000 and spliced down to 400,000 would refuse
+		// every peer HTLC in a 46,000-sat band the peer believes is legal), so
+		// lowering to what the new capacity prices closes that band. Raising
+		// after a splice-in would open the mirror band against CLN, whose own
+		// gate still lets it spend down to the reserve priced at the ORIGINAL
+		// capacity; erring low is inert, the peer's own gate binds.
 		//
 		// reserveWeEnforceAt rather than the v1 helper: the v1 helper prices a v2
 		// channel by a rule neither peer applies to it, and its 546-sat policy
@@ -10834,6 +10859,37 @@ export class Channel {
 				channelReserveSatoshis: splicedReserve
 			};
 			fields.channelReserveVersion = ENFORCED_RESERVE_VERSION;
+		}
+		// The reserve we KEEP only ever rises. After a splice-in eclair enforces
+		// the reserve the NEW capacity prices, so a kept value still priced at
+		// the old capacity lets getSpendableOutboundMsat overdraw into an HTLC
+		// the peer MUST refuse; raising to v2ReserveWeKeep closes that, and can
+		// never overshoot a conforming peer (it is at or above what eclair and
+		// CLN each require of us at any dust pairing). Lowering after a
+		// splice-out would open the same gap against CLN, which keeps enforcing
+		// the value priced at the ORIGINAL capacity; keeping more than a peer
+		// demands only costs our own spendable balance. No provenance stamp:
+		// channelReserveVersion records the ENFORCED reserve only, and max()
+		// against a pure derivation is a fixed point, exactly as in
+		// repairKeptChannelReserve. Gated by the same branch rule as
+		// reserveWeEnforceAt so the degenerate empty-fields adoption cannot
+		// re-price a never-spliced v1 row's wire-negotiated value (every real
+		// adoption arm sets fields.spliceFundingTxid before this runs).
+		if (adopted.fundingVersion === 2 || adopted.spliceFundingTxid) {
+			const keptReserve = bigIntMax(
+				this._state.remoteConfig.channelReserveSatoshis,
+				v2ReserveWeKeep(
+					adopted.fundingSatoshis,
+					this._state.localConfig.dustLimitSatoshis,
+					this._state.remoteConfig.dustLimitSatoshis
+				)
+			);
+			if (keptReserve !== this._state.remoteConfig.channelReserveSatoshis) {
+				fields.remoteConfig = {
+					...this._state.remoteConfig,
+					channelReserveSatoshis: keptReserve
+				};
+			}
 		}
 		// Adopt the peer's signature on our NEW commitment (exchanged during the
 		// mid-splice commitment_signed round) so we can unilaterally close the
