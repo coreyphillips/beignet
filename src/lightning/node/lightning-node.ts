@@ -1025,6 +1025,8 @@ export class LightningNode extends EventEmitter {
 			// unchanged.
 			durabilityBarrier: this.recoveryBarrier,
 			largeChannels: this.largeChannels,
+			// BOLT 2 quiescence watchdog window (default 60s in the manager).
+			quiescenceTimeoutMs: config.quiescenceTimeoutMs,
 			// Liquidity ads seller policy (bLIP-0051): sign will_fund for inbound
 			// request_funds and fund the contribution via the fundingProvider.
 			leaseRates: config.leaseRates,
@@ -3232,11 +3234,22 @@ export class LightningNode extends EventEmitter {
 					channelId: channelIdHex
 				});
 				setImmediate(() => {
-					try {
-						this.peerManager?.disconnectPeer(peerPubkey);
-					} catch {
-						// Already disconnected, or transport-level teardown raced.
+					if (this.peerManager) {
+						try {
+							this.peerManager.disconnectPeer(peerPubkey);
+						} catch {
+							// Already disconnected, or transport-level teardown raced.
+						}
+						return;
 					}
+					// External transport (message:outbound mode): there is no
+					// socket here to drop. Ask the host to sever the connection
+					// and apply the protocol side ourselves - BOLT 2: the channel
+					// is no longer quiescent upon disconnection, and reestablish
+					// resynchronizes on reconnect. Without this the channel would
+					// stay quiescing forever with its parked HTLCs stranded.
+					this.emit('peer:disconnect-requested', peerPubkey);
+					this.channelManager.handlePeerDisconnected(peerPubkey);
 				});
 			}
 		);
@@ -12259,20 +12272,28 @@ export class LightningNode extends EventEmitter {
 
 		// Policy fail-backs (issue 410): BOLT 2's dust-exposure section says an
 		// HTLC over the ceiling SHOULD be failed once committed and its preimage
-		// never revealed, so this runs before the final/forward split. The CLTV
-		// horizon is our policy with the same shape. Inside a blinded route the
-		// reason must not leak (BOLT 4), so those surface as
-		// invalid_onion_blinding instead. Replayed idempotently on restart via
-		// redispatchUnresolvedReceivedHtlcs.
+		// never revealed, so this runs before any dispatch. The CLTV horizon is
+		// our policy with the same shape. BOLT 4 splits the code by hop role: a
+		// forwarding node answers temporary_channel_failure / expiry_too_far,
+		// but a final node must not return forwarding-only errors and answers
+		// the non-leaking incorrect_or_unknown_payment_details instead. Inside
+		// a blinded route the reason must not leak either way (BOLT 4), so
+		// those surface as invalid_onion_blinding. Replayed idempotently on
+		// restart via redispatchUnresolvedReceivedHtlcs.
+		const finalHop = isFinalHop(processed.nextPacket);
 		let policyCode: number | null = null;
 		if (channel.receivedHtlcExceedsDustExposure(htlcId)) {
-			policyCode = TEMPORARY_CHANNEL_FAILURE;
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_CHANNEL_FAILURE;
 		} else if (
 			this.currentBlockHeight > 0 &&
 			htlcEntry.cltvExpiry >
 				this.currentBlockHeight + Channel.MAX_HTLC_CLTV_EXPIRY_DELTA
 		) {
-			policyCode = EXPIRY_TOO_FAR;
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: EXPIRY_TOO_FAR;
 		}
 		if (policyCode !== null) {
 			// TLV 12 (current_blinding_point) marks the introduction node; a
@@ -12299,13 +12320,15 @@ export class LightningNode extends EventEmitter {
 				createFailureMessage(
 					processed.sharedSecret,
 					policyCode,
-					this.updateFlaggedFailureData(policyCode)
+					policyCode === INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+						? this.incorrectPaymentDetailsData(amountMsat)
+						: this.updateFlaggedFailureData(policyCode)
 				)
 			);
 			return;
 		}
 
-		if (isFinalHop(processed.nextPacket)) {
+		if (finalHop) {
 			// We are the final destination. htlcEntry.blindingPoint is the
 			// update_add_htlc path key a downstream blinded final hop received
 			// (absent when we are the path's introduction node, which gets the

@@ -33,9 +33,19 @@ import {
 } from '../../src/lightning/gossip/types';
 import {
 	TEMPORARY_CHANNEL_FAILURE,
-	EXPIRY_TOO_FAR
+	EXPIRY_TOO_FAR,
+	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 } from '../../src/lightning/onion/types';
+import {
+	constructOnionPacket,
+	encodeOnionPacket
+} from '../../src/lightning/onion/construct';
+import { computeSharedSecrets } from '../../src/lightning/onion/sphinx-crypto';
+import { decryptFailureMessage } from '../../src/lightning/onion/failures';
 import { MessageType } from '../../src/lightning/message/types';
+import { Channel } from '../../src/lightning/channel/channel';
+import { createOpenerState } from '../../src/lightning/channel/channel-state';
+import { HtlcDirection, HtlcState } from '../../src/lightning/channel/types';
 
 // ─────────────── Harness (mirrors hold-invoices.test.ts) ───────────────
 
@@ -92,8 +102,11 @@ function makeNodeConfig(seedId: number): INodeConfig {
 	};
 }
 
-function createNode(seedId: number): LightningNode {
-	const node = new LightningNode(makeNodeConfig(seedId));
+function createNode(
+	seedId: number,
+	extra: Partial<INodeConfig> = {}
+): LightningNode {
+	const node = new LightningNode({ ...makeNodeConfig(seedId), ...extra });
 	node.on('error', () => {});
 	return node;
 }
@@ -195,7 +208,7 @@ function settleTicks(rounds = 6): Promise<void> {
 describe('Policy fail-backs and quiescence parking (issues 410/411)', function () {
 	this.timeout(20_000);
 
-	it('fails a dust-exposure breach back with temporary_channel_failure, not the channel', function () {
+	it('fails a final-hop dust-exposure breach back, not the channel', function () {
 		const alice = createNode(1);
 		const bob = createNode(2);
 		connectNodes(alice, bob);
@@ -231,7 +244,10 @@ describe('Policy fail-backs and quiescence parking (issues 410/411)', function (
 		expect(bob.listHeldHtlcs()).to.have.length(14);
 
 		// The 15th dust HTLC pushes exposure to 5_250_000 msat. BOLT 2: fail
-		// it once committed, reveal no preimage, keep the channel.
+		// it once committed, reveal no preimage, keep the channel. BOLT 4: a
+		// FINAL node must not return the forwarding-only
+		// temporary_channel_failure; the non-leaking final-node answer is
+		// incorrect_or_unknown_payment_details.
 		const inv15 = bob.createInvoice({
 			amountMsat: dustAmount,
 			description: 'dust-over'
@@ -240,7 +256,7 @@ describe('Policy fail-backs and quiescence parking (issues 410/411)', function (
 
 		const failed = alice.getPayment(inv15.paymentHash)!;
 		expect(failed.status).to.equal(PaymentStatus.FAILED);
-		expect(failed.failureCode).to.equal(TEMPORARY_CHANNEL_FAILURE);
+		expect(failed.failureCode).to.equal(INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
 		expect(bob.getPayment(inv15.paymentHash)?.status).to.not.equal(
 			PaymentStatus.COMPLETED
 		);
@@ -262,7 +278,7 @@ describe('Policy fail-backs and quiescence parking (issues 410/411)', function (
 		);
 	});
 
-	it('fails a far-future CLTV back with expiry_too_far, not the channel', function () {
+	it('fails a final-hop far-future CLTV back, not the channel', function () {
 		const alice = createNode(3);
 		const bob = createNode(4);
 		connectNodes(alice, bob);
@@ -284,9 +300,11 @@ describe('Policy fail-backs and quiescence parking (issues 410/411)', function (
 		});
 		alice.sendPayment(invFar.bolt11);
 
+		// BOLT 4: expiry_too_far is a forwarding-only error; the final node
+		// answers incorrect_or_unknown_payment_details instead.
 		const failed = alice.getPayment(invFar.paymentHash)!;
 		expect(failed.status).to.equal(PaymentStatus.FAILED);
-		expect(failed.failureCode).to.equal(EXPIRY_TOO_FAR);
+		expect(failed.failureCode).to.equal(INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
 
 		const bobChannel = bob.getChannelManager().getChannel(channelId)!;
 		expect(bobChannel.getState(), 'the channel survives').to.equal(
@@ -371,5 +389,395 @@ describe('Policy fail-backs and quiescence parking (issues 410/411)', function (
 			alice.getPayment(inv.paymentHash)!.status,
 			'the parked settle drained after reestablish'
 		).to.equal(PaymentStatus.COMPLETED);
+	});
+
+	it('a batched non-hold dust breach fails only the HTLC that crossed the ceiling', function () {
+		// 15 dust adds land in one burst BEFORE any settles: earlier siblings
+		// resolve (FULFILLED) while later ones are dispatched, so a live
+		// exposure recomputation would let the breaching HTLC slip under the
+		// ceiling. The admission-time stamp must not.
+		const alice = createNode(7);
+		const bob = createNode(8);
+		let holdAliceToBob = false;
+		const queued: Array<() => void> = [];
+		alice.on(
+			'message:outbound',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (pubkey !== bob.getNodeId()) return;
+				if (holdAliceToBob) {
+					queued.push(() =>
+						bob.handlePeerMessage(alice.getNodeId(), type, payload)
+					);
+					return;
+				}
+				bob.handlePeerMessage(alice.getNodeId(), type, payload);
+			}
+		);
+		bob.on(
+			'message:outbound',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (pubkey !== alice.getNodeId()) return;
+				alice.handlePeerMessage(bob.getNodeId(), type, payload);
+			}
+		);
+		const channelId = openReadyChannel(alice, bob);
+		buildGraph(alice, bob, [channelId]);
+		const aliceChannel = alice.getChannelManager().getChannel(channelId)!;
+		(aliceChannel as unknown as { _isDustHtlc: () => boolean })._isDustHtlc =
+			() => false;
+
+		// All 15 adds leave Alice before Bob's replies can settle any of them:
+		// Alice's own revokes queue BEHIND her later sends, so Bob admits the
+		// whole burst first.
+		const dustAmount = 350_000n;
+		holdAliceToBob = true;
+		const hashes: Buffer[] = [];
+		for (let i = 0; i < 15; i++) {
+			const inv = bob.createInvoice({
+				amountMsat: dustAmount,
+				description: `burst-${i}`
+			});
+			hashes.push(inv.paymentHash);
+			alice.sendPayment(inv.bolt11);
+		}
+		// Drain with the hold still up: Alice's REACTIVE messages (her next
+		// commitment_signed after Bob's revoke) must join the queue behind her
+		// already-sent adds, exactly as the ordered transport would deliver
+		// them. Releasing them directly would overtake the queued adds and
+		// hand Bob a signature covering HTLCs he has not seen.
+		while (queued.length > 0) {
+			queued.shift()!();
+		}
+		holdAliceToBob = false;
+
+		for (let i = 0; i < 14; i++) {
+			expect(
+				alice.getPayment(hashes[i])!.status,
+				`payment ${i} under the ceiling settles`
+			).to.equal(PaymentStatus.COMPLETED);
+		}
+		const failed = alice.getPayment(hashes[14])!;
+		expect(failed.status, 'the breaching HTLC fails').to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(failed.failureCode).to.equal(INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
+		expect(
+			bob.getChannelManager().getChannel(channelId)!.getState(),
+			'the channel survives'
+		).to.equal(ChannelState.NORMAL);
+	});
+
+	it('a FORWARDING node answers temporary_channel_failure for a dust breach', function () {
+		// Style-1 fixture: one node, a hand-installed channel, a real two-hop
+		// onion so isFinalHop is false, and the entry stamped the way
+		// handleUpdateAddHtlc stamps an over-the-ceiling admission.
+		const node = createNode(9);
+		const nodePrivkey = makeNodeConfig(9).nodePrivateKey;
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(makeSeed(9)),
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		const channelId = crypto.randomBytes(32);
+		state.channelId = channelId;
+		state.state = ChannelState.NORMAL;
+		const channel = new Channel(state);
+		const cm = node.getChannelManager();
+		cm.restoreChannel(channel, crypto.randomBytes(33).toString('hex'));
+
+		const failHtlcCalls: Array<{ reason: Buffer }> = [];
+		(cm as unknown as { failHtlc: unknown }).failHtlc = (
+			_c: Buffer,
+			_id: bigint,
+			reason: Buffer
+		): void => {
+			failHtlcCalls.push({ reason });
+		};
+
+		const paymentHash = crypto.randomBytes(32);
+		const sessionKey = crypto.randomBytes(32);
+		const nextHopKey = crypto.randomBytes(32);
+		const hops = [
+			{
+				pubkey: getPublicKey(nodePrivkey),
+				payload: {
+					amountToForwardMsat: 300_000n,
+					outgoingCltvValue: 600,
+					shortChannelId: Buffer.alloc(8, 7)
+				}
+			},
+			{
+				pubkey: getPublicKey(nextHopKey),
+				payload: {
+					amountToForwardMsat: 300_000n,
+					outgoingCltvValue: 600
+				}
+			}
+		];
+		const packet = constructOnionPacket(sessionKey, hops, paymentHash);
+		const { sharedSecrets } = computeSharedSecrets(
+			sessionKey,
+			hops.map((h) => h.pubkey)
+		);
+
+		state.htlcs.set('received-0', {
+			id: 0n,
+			amountMsat: 350_000n,
+			paymentHash,
+			cltvExpiry: 700,
+			onionRoutingPacket: encodeOnionPacket(packet),
+			direction: HtlcDirection.RECEIVED,
+			state: HtlcState.COMMITTED,
+			dustExposureFailback: true
+		});
+
+		(
+			node as unknown as {
+				handleIncomingHtlc: (
+					c: Buffer,
+					i: bigint,
+					a: bigint,
+					h: Buffer
+				) => void;
+			}
+		).handleIncomingHtlc(channelId, 0n, 350_000n, paymentHash);
+
+		expect(failHtlcCalls, 'failed back').to.have.length(1);
+		const decrypted = decryptFailureMessage(
+			[sharedSecrets[0]],
+			failHtlcCalls[0].reason
+		);
+		expect(decrypted, 'failure decrypts').to.not.be.null;
+		expect(decrypted!.failure.failureCode).to.equal(TEMPORARY_CHANNEL_FAILURE);
+		// restoreChannel parks the fixture in AWAITING_REESTABLISH; the point
+		// here is that the policy answer is a fail-back, never a channel kill.
+		expect(channel.getState(), 'the channel survives').to.not.equal(
+			ChannelState.ERRORED
+		);
+	});
+
+	it('a FORWARDING node answers expiry_too_far past the CLTV horizon', function () {
+		const node = createNode(10);
+		const nodePrivkey = makeNodeConfig(10).nodePrivateKey;
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(makeSeed(10)),
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		const channelId = crypto.randomBytes(32);
+		state.channelId = channelId;
+		state.state = ChannelState.NORMAL;
+		const channel = new Channel(state);
+		const cm = node.getChannelManager();
+		cm.restoreChannel(channel, crypto.randomBytes(33).toString('hex'));
+		(
+			node as unknown as { currentBlockHeight: number }
+		).currentBlockHeight = 500;
+
+		const failHtlcCalls: Array<{ reason: Buffer }> = [];
+		(cm as unknown as { failHtlc: unknown }).failHtlc = (
+			_c: Buffer,
+			_id: bigint,
+			reason: Buffer
+		): void => {
+			failHtlcCalls.push({ reason });
+		};
+
+		const paymentHash = crypto.randomBytes(32);
+		const sessionKey = crypto.randomBytes(32);
+		const hops = [
+			{
+				pubkey: getPublicKey(nodePrivkey),
+				payload: {
+					amountToForwardMsat: 1_000_000n,
+					outgoingCltvValue: 5_900,
+					shortChannelId: Buffer.alloc(8, 7)
+				}
+			},
+			{
+				pubkey: getPublicKey(crypto.randomBytes(32)),
+				payload: {
+					amountToForwardMsat: 1_000_000n,
+					outgoingCltvValue: 5_900
+				}
+			}
+		];
+		const packet = constructOnionPacket(sessionKey, hops, paymentHash);
+		const { sharedSecrets } = computeSharedSecrets(
+			sessionKey,
+			hops.map((h) => h.pubkey)
+		);
+
+		// 6_000 > 500 + MAX_HTLC_CLTV_EXPIRY_DELTA (5040): past the horizon.
+		state.htlcs.set('received-0', {
+			id: 0n,
+			amountMsat: 1_000_000n,
+			paymentHash,
+			cltvExpiry: 6_000,
+			onionRoutingPacket: encodeOnionPacket(packet),
+			direction: HtlcDirection.RECEIVED,
+			state: HtlcState.COMMITTED
+		});
+
+		(
+			node as unknown as {
+				handleIncomingHtlc: (
+					c: Buffer,
+					i: bigint,
+					a: bigint,
+					h: Buffer
+				) => void;
+			}
+		).handleIncomingHtlc(channelId, 0n, 1_000_000n, paymentHash);
+
+		expect(failHtlcCalls, 'failed back').to.have.length(1);
+		const decrypted = decryptFailureMessage(
+			[sharedSecrets[0]],
+			failHtlcCalls[0].reason
+		);
+		expect(decrypted, 'failure decrypts').to.not.be.null;
+		expect(decrypted!.failure.failureCode).to.equal(EXPIRY_TOO_FAR);
+		expect(channel.getState(), 'the channel survives').to.not.equal(
+			ChannelState.ERRORED
+		);
+	});
+
+	it('defers a hold-invoice settle while quiescing and delivers it after reestablish', async function () {
+		// Issue 430 (the review's repro): a live HTLC that PREDATES the stfu
+		// still reaches fulfillHtlc from settleHeldHtlc. The manager must
+		// defer the wire half, or update_fulfill_htlc goes out mid-session.
+		const alice = createNode(11);
+		const bob = createNode(12);
+		const cut = { val: false };
+		const gate = { hold: false, queue: [] as Array<() => void> };
+		let fulfillsOnWire = 0;
+		const route = (from: LightningNode, to: LightningNode): void => {
+			from.on('message:outbound', (pk: string, t: number, p: Buffer) => {
+				if (cut.val) return;
+				if (pk !== to.getNodeId()) return;
+				if (t === MessageType.STFU) return;
+				if (from === bob && t === MessageType.UPDATE_FULFILL_HTLC) {
+					fulfillsOnWire++;
+				}
+				if (gate.hold) {
+					gate.queue.push(() => to.handlePeerMessage(from.getNodeId(), t, p));
+					return;
+				}
+				to.handlePeerMessage(from.getNodeId(), t, p);
+			});
+		};
+		route(alice, bob);
+		route(bob, alice);
+		const channelId = openReadyChannel(alice, bob);
+		buildGraph(alice, bob, [channelId]);
+		const bobChannel = bob.getChannelManager().getChannel(channelId)!;
+
+		// Park a hold-invoice HTLC, then quiesce with it committed (legal:
+		// a committed HTLC is not a pending update).
+		const preimage = crypto.randomBytes(32);
+		const hash = crypto.createHash('sha256').update(preimage).digest();
+		const inv = bob.createInvoice({
+			amountMsat: 1_000_000n,
+			description: 'held-then-quiesced',
+			hold: true,
+			paymentHash: hash
+		});
+		alice.sendPayment(inv.bolt11);
+		expect(bob.listHeldHtlcs()).to.have.length(1);
+		expect(bob.getChannelManager().initiateQuiescence(channelId).ok).to.be.true;
+		expect(bobChannel.isQuiescing()).to.be.true;
+
+		// The settle is requested mid-session: nothing may reach the wire.
+		expect(bob.settleHeldHtlc(hash, preimage)).to.be.true;
+		expect(fulfillsOnWire, 'no update message after stfu').to.equal(0);
+		expect(alice.getPayment(hash)!.status).to.equal(PaymentStatus.PENDING);
+
+		// Quiescence dies with the connection; reestablish releases the
+		// deferred settle.
+		cut.val = true;
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settleTicks();
+		cut.val = false;
+		gate.hold = true;
+		alice.getChannelManager().handlePeerReconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerReconnected(alice.getNodeId());
+		while (gate.queue.length > 0) {
+			gate.queue.shift()!();
+		}
+		gate.hold = false;
+		await settleTicks();
+
+		expect(fulfillsOnWire, 'the deferred fulfill went out').to.equal(1);
+		expect(alice.getPayment(hash)!.status).to.equal(PaymentStatus.COMPLETED);
+		expect(bobChannel.getState()).to.equal(ChannelState.NORMAL);
+	});
+
+	it('the watchdog resets the channel and asks the host to disconnect on external transports', async function () {
+		// message:outbound mode has no PeerManager: the node must emit
+		// 'peer:disconnect-requested' and apply the protocol side itself, or
+		// the channel would stay quiescing forever with its HTLCs stranded.
+		const QUIESCENCE_TIMEOUT_MS = 60;
+		const alice = createNode(13, {
+			quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+		});
+		const bob = createNode(14, { quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS });
+		alice.on(
+			'message:outbound',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (pubkey !== bob.getNodeId() || type === MessageType.STFU) return;
+				bob.handlePeerMessage(alice.getNodeId(), type, payload);
+			}
+		);
+		bob.on(
+			'message:outbound',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (pubkey !== alice.getNodeId() || type === MessageType.STFU) return;
+				alice.handlePeerMessage(bob.getNodeId(), type, payload);
+			}
+		);
+		const channelId = openReadyChannel(alice, bob);
+		buildGraph(alice, bob, [channelId]);
+		const bobChannel = bob.getChannelManager().getChannel(channelId)!;
+
+		// A committed live HTLC so BOLT 2's "if the HTLCs are pending" holds.
+		const preimage = crypto.randomBytes(32);
+		const hash = crypto.createHash('sha256').update(preimage).digest();
+		const inv = bob.createInvoice({
+			amountMsat: 1_000_000n,
+			description: 'held-through-timeout',
+			hold: true,
+			paymentHash: hash
+		});
+		alice.sendPayment(inv.bolt11);
+		expect(bob.listHeldHtlcs()).to.have.length(1);
+
+		const disconnectRequests: string[] = [];
+		bob.on('peer:disconnect-requested', (pubkey: string) => {
+			disconnectRequests.push(pubkey);
+		});
+
+		// The stfu is dropped, so the handshake never completes.
+		expect(bob.getChannelManager().initiateQuiescence(channelId).ok).to.be.true;
+		expect(bobChannel.isQuiescing()).to.be.true;
+
+		await new Promise<void>((resolve) =>
+			setTimeout(resolve, QUIESCENCE_TIMEOUT_MS * 3)
+		);
+		await settleTicks();
+
+		expect(disconnectRequests, 'the host was asked to disconnect').to.include(
+			alice.getNodeId()
+		);
+		expect(bobChannel.getState(), 'the protocol side was applied').to.equal(
+			ChannelState.AWAITING_REESTABLISH
+		);
+		expect(bobChannel.getQuiescenceState()).to.equal(QuiescenceState.NORMAL);
 	});
 });

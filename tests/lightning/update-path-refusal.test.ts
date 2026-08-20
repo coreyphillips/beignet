@@ -298,12 +298,12 @@ describe('Update-path refusals reach the peer (issue 404)', function () {
 			expect(channel.getState()).to.equal(ChannelState.NORMAL);
 			expect(
 				channel.receivedHtlcExceedsDustExposure(1n),
-				'flagged for the node-level fail-back'
+				'stamped at admission for the node-level fail-back'
 			).to.equal(true);
 			expect(
 				channel.receivedHtlcExceedsDustExposure(5n),
-				'every in-flight dust HTLC is flagged while exposure is over'
-			).to.equal(true);
+				'the pre-existing HTLC was not over the ceiling when IT was admitted'
+			).to.equal(false);
 		});
 
 		it('control: a byte-identical replay is still a no-op', function () {

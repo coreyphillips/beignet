@@ -411,6 +411,32 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private quiescenceTimers: Map<string, ReturnType<typeof setTimeout>> =
 		new Map();
+	/**
+	 * HTLC settle operations deferred because their channel was quiescing
+	 * when they were requested (BOLT 2: no update messages after stfu, issue
+	 * 430). Drained when quiescence ends, after reestablish, and retried per
+	 * block; purged on terminal states (they resolve on-chain). In-memory
+	 * only: a restart re-derives settles from durable state via the node's
+	 * recovery passes.
+	 */
+	private pendingQuiescentSettles: Map<
+		string,
+		Array<
+			| { kind: 'fulfill'; htlcId: bigint; preimage: Buffer }
+			| {
+					kind: 'fail';
+					htlcId: bigint;
+					reason: Buffer;
+					direction: HtlcDirection;
+			  }
+			| {
+					kind: 'failMalformed';
+					htlcId: bigint;
+					sha256OfOnion: Buffer;
+					failureCode: number;
+			  }
+		>
+	> = new Map();
 	private peerManager: PeerManager | null = null;
 	private monitors: Map<string, ChainMonitor> = new Map();
 	// Latest block height seen (for stamping when a force-close CPFP was broadcast).
@@ -1133,6 +1159,18 @@ export class ChannelManager extends EventEmitter {
 		const preimageHash = crypto.createHash('sha256').update(preimage).digest();
 		this.recordPreimage(preimageHash, preimage);
 
+		// BOLT 2 quiescence: no update messages after stfu (issue 430). The
+		// preimage is already with the monitors (above); the wire half waits.
+		if (
+			this._deferSettleIfQuiescing(idHex, channel, {
+				kind: 'fulfill',
+				htlcId,
+				preimage
+			})
+		) {
+			return { ok: true, actions: [] };
+		}
+
 		const actions = channel.fulfillHtlc(htlcId, preimage);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -1171,6 +1209,18 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
+		// BOLT 2 quiescence: no update messages after stfu (issue 430).
+		if (
+			this._deferSettleIfQuiescing(idHex, channel, {
+				kind: 'fail',
+				htlcId,
+				reason,
+				direction
+			})
+		) {
+			return { ok: true, actions: [] };
+		}
+
 		const actions = channel.failHtlc(htlcId, reason, direction);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -1206,6 +1256,18 @@ export class ChannelManager extends EventEmitter {
 			const error = `Peer not found for channel: ${idHex}`;
 			this.emit('error', channelId, error);
 			return { ok: false, actions: [], error };
+		}
+
+		// BOLT 2 quiescence: no update messages after stfu (issue 430).
+		if (
+			this._deferSettleIfQuiescing(idHex, channel, {
+				kind: 'failMalformed',
+				htlcId,
+				sha256OfOnion,
+				failureCode
+			})
+		) {
+			return { ok: true, actions: [] };
 		}
 
 		const actions = channel.failMalformedHtlc(
@@ -1415,6 +1477,17 @@ export class ChannelManager extends EventEmitter {
 			const error = `Peer not found for channel: ${idHex}`;
 			this.emit('error', channelId, error);
 			return { ok: false, actions: [], error };
+		}
+
+		// BOLT 2 quiescence: update_fee is an update message too. Dropped, not
+		// deferred: fee refresh is periodic and idempotent, the next cycle
+		// re-proposes once the session ends.
+		if (typeof channel.isQuiescing === 'function' && channel.isQuiescing()) {
+			return {
+				ok: false,
+				actions: [],
+				error: 'Cannot update fee: channel is quiescing'
+			};
 		}
 
 		const actions = channel.updateFee(feeratePerKw);
@@ -2127,6 +2200,13 @@ export class ChannelManager extends EventEmitter {
 		// Update block height on all channels for CLTV validation
 		for (const channel of this.channels.values()) {
 			channel.setBlockHeight(blockHeight);
+		}
+
+		// Invariant keeper for settles deferred during quiescence (issue 430):
+		// terminal quiescence exits and reestablish gaps have no event to drain
+		// on, so retry every parked channel each block.
+		for (const channelIdHex of [...this.pendingQuiescentSettles.keys()]) {
+			this._drainDeferredSettles(channelIdHex);
 		}
 
 		const allActions: ChainAction[] = [];
@@ -4399,6 +4479,14 @@ export class ChannelManager extends EventEmitter {
 				'channel:reestablished',
 				channel.getChannelId() ?? channel.getTemporaryChannelId()
 			);
+			// Settles deferred during a pre-disconnect quiescence session can
+			// flow again (issue 430). Deferred out of this dispatch turn.
+			const deferredSettleHex = channel.getChannelId()?.toString('hex');
+			if (deferredSettleHex) {
+				setImmediate(() => {
+					this._drainDeferredSettles(deferredSettleHex);
+				});
+			}
 			// Release a durably owed commitment_signed (see the note above the
 			// NORMAL check). Runs after the repair emissions so a fulfill/fail
 			// they staged rides the same release. Re-check the state: a
@@ -6540,6 +6628,83 @@ export class ChannelManager extends EventEmitter {
 			clearTimeout(timer);
 			this.quiescenceTimers.delete(channelIdHex);
 			this.emit('quiescence:ended', channelIdHex);
+			// Deferred (issue 430): this sync point runs inside processActions,
+			// and the drained settles start dispatches of their own.
+			setImmediate(() => {
+				this._drainDeferredSettles(channelIdHex);
+			});
+		}
+	}
+
+	/** Queue an HTLC settle for after quiescence; true when it was deferred. */
+	private _deferSettleIfQuiescing(
+		channelIdHex: string,
+		channel: Channel,
+		op:
+			| { kind: 'fulfill'; htlcId: bigint; preimage: Buffer }
+			| {
+					kind: 'fail';
+					htlcId: bigint;
+					reason: Buffer;
+					direction: HtlcDirection;
+			  }
+			| {
+					kind: 'failMalformed';
+					htlcId: bigint;
+					sha256OfOnion: Buffer;
+					failureCode: number;
+			  }
+	): boolean {
+		if (typeof channel.isQuiescing !== 'function' || !channel.isQuiescing()) {
+			return false;
+		}
+		const list = this.pendingQuiescentSettles.get(channelIdHex) ?? [];
+		list.push(op);
+		this.pendingQuiescentSettles.set(channelIdHex, list);
+		return true;
+	}
+
+	/**
+	 * Apply HTLC settles deferred while their channel was quiescing. Entries
+	 * are removed from the map BEFORE replay: the replayed call re-defers if
+	 * quiescence somehow resumed, and the per-block retry must never race the
+	 * quiescence-ended drain into a double apply. Held (not consumed) while
+	 * the channel cannot carry updates (AWAITING_REESTABLISH); purged on
+	 * terminal states, where the HTLCs resolve on-chain instead.
+	 */
+	private _drainDeferredSettles(channelIdHex: string): void {
+		const list = this.pendingQuiescentSettles.get(channelIdHex);
+		if (!list?.length) return;
+		const channel = this.channels.get(channelIdHex);
+		if (!channel) {
+			this.pendingQuiescentSettles.delete(channelIdHex);
+			return;
+		}
+		const state = channel.getState();
+		if (
+			state === ChannelState.ERRORED ||
+			state === ChannelState.CLOSED ||
+			state === ChannelState.FORCE_CLOSED
+		) {
+			this.pendingQuiescentSettles.delete(channelIdHex);
+			return;
+		}
+		if (channel.isQuiescing() || !channel.isHtlcUsable()) return;
+		this.pendingQuiescentSettles.delete(channelIdHex);
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		for (const op of list) {
+			if (op.kind === 'fulfill') {
+				this.fulfillHtlc(channelId, op.htlcId, op.preimage);
+			} else if (op.kind === 'fail') {
+				this.failHtlc(channelId, op.htlcId, op.reason, op.direction);
+			} else {
+				this.failMalformedHtlc(
+					channelId,
+					op.htlcId,
+					op.sha256OfOnion,
+					op.failureCode
+				);
+			}
 		}
 	}
 

@@ -573,10 +573,11 @@ describe('Quiescence (STFU)', function () {
 			expect(opener.isQuiescent()).to.be.true;
 		});
 
-		it('should reject STFU with pending HTLCs', function () {
+		it('latches an initiating STFU that arrives with pending updates (issue 431)', function () {
 			const { opener, acceptor } = getToNormal();
 
-			// Add an HTLC to acceptor (incoming)
+			// Add an HTLC to acceptor (incoming), no commitment round: the
+			// update stays genuinely pending.
 			const paymentHash = crypto
 				.createHash('sha256')
 				.update(crypto.randomBytes(32))
@@ -590,14 +591,57 @@ describe('Quiescence (STFU)', function () {
 			const addMsg = findSendAction(addActions, MessageType.UPDATE_ADD_HTLC);
 			acceptor.handleUpdateAddHtlc(decodeUpdateAddHtlcMessage(addMsg.payload));
 
+			// BOLT 2: an initiating stfu legitimately crosses in-flight updates
+			// and the receiver "MUST reply with stfu once it can do so". The
+			// transition happens now; the reply is owed until the drain
+			// completes.
 			const stfuMsg: IStfuMessage = {
 				channelId: acceptor.getChannelId()!,
 				initiator: true
 			};
 			const actions = acceptor.handleStfuMessage(stfuMsg);
-			const error = findAction(actions, ChannelActionType.ERROR);
-			expect(error).to.exist;
-			expect(error.message).to.contain('pending HTLCs exist');
+			expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+			expect(findSendAction(actions, MessageType.STFU), 'no reply yet').to.not
+				.exist;
+			expect(acceptor.getQuiescenceState()).to.equal(
+				QuiescenceState.RECEIVED_STFU
+			);
+		});
+
+		it('a peer update AFTER its latched stfu still fails the channel', function () {
+			// From its own stfu the peer is bound by "MUST NOT send an update
+			// message after stfu"; the latch must not weaken that arm.
+			const { opener, acceptor } = getToNormal();
+			const paymentHash = crypto
+				.createHash('sha256')
+				.update(crypto.randomBytes(32))
+				.digest();
+			const addActions = opener.addHtlc(
+				50_000_000n,
+				paymentHash,
+				500000,
+				crypto.randomBytes(1366)
+			);
+			const addMsg = findSendAction(addActions, MessageType.UPDATE_ADD_HTLC);
+			acceptor.handleUpdateAddHtlc(decodeUpdateAddHtlcMessage(addMsg.payload));
+			acceptor.handleStfuMessage({
+				channelId: acceptor.getChannelId()!,
+				initiator: true
+			});
+			expect(acceptor.getQuiescenceState()).to.equal(
+				QuiescenceState.RECEIVED_STFU
+			);
+
+			const late = acceptor.handleUpdateAddHtlc({
+				channelId: acceptor.getChannelId()!,
+				id: 1n,
+				amountMsat: 40_000_000n,
+				paymentHash: crypto.randomBytes(32),
+				cltvExpiry: 500000,
+				onionRoutingPacket: crypto.randomBytes(1366)
+			});
+			expect(wireRefusalOf(late), 'told on the wire').to.not.equal(null);
+			expect(acceptor.getState()).to.equal(ChannelState.ERRORED);
 		});
 
 		it('should exit quiescence and return to normal', function () {
@@ -1071,52 +1115,27 @@ describe('Quiescence (STFU)', function () {
 		}
 
 		/**
-		 * Loopback pump with per-direction stfu control: 'hold' queues stfu for
-		 * later release, 'drop' discards it, everything else flows immediately.
+		 * Loopback that discards stfu in both directions, so a handshake can
+		 * never complete; everything else flows immediately.
 		 */
-		function connectWithStfuControl(
+		function connectDroppingStfu(
 			alice: ChannelManager,
-			bob: ChannelManager,
-			mode: 'hold' | 'drop'
-		): { releaseHeldStfu: () => void } {
-			const held: Array<{ from: string; to: ChannelManager; payload: Buffer }> =
-				[];
-			const route = (
-				from: string,
-				to: ChannelManager,
-				type: number,
-				payload: Buffer
-			): void => {
-				if (type === MessageType.STFU) {
-					if (mode === 'drop') return;
-					held.push({ from, to, payload });
-					return;
-				}
-				to.handleMessage(from, type, payload);
-			};
+			bob: ChannelManager
+		): void {
 			alice.on('message:outbound', (peer: string, t: number, p: Buffer) => {
-				if (peer === bobPubkey) route(alicePubkey, bob, t, p);
+				if (peer !== bobPubkey || t === MessageType.STFU) return;
+				bob.handleMessage(alicePubkey, t, p);
 			});
 			bob.on('message:outbound', (peer: string, t: number, p: Buffer) => {
-				if (peer === alicePubkey) route(bobPubkey, alice, t, p);
+				if (peer !== alicePubkey || t === MessageType.STFU) return;
+				alice.handleMessage(bobPubkey, t, p);
 			});
-			return {
-				// Drain until empty: delivering a held stfu can produce the
-				// peer's reply stfu, which the pump captures too.
-				releaseHeldStfu: () => {
-					while (held.length > 0) {
-						const h = held.shift()!;
-						h.to.handleMessage(h.from, MessageType.STFU, h.payload);
-					}
-				}
-			};
 		}
 
-		function readyPair(mode: 'hold' | 'drop'): {
+		function readyPair(): {
 			alice: ChannelManager;
 			bob: ChannelManager;
 			channelId: Buffer;
-			releaseHeldStfu: () => void;
 		} {
 			const alice = new ChannelManager({
 				...aliceConfig,
@@ -1126,7 +1145,7 @@ describe('Quiescence (STFU)', function () {
 				...bobConfig,
 				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
 			});
-			const { releaseHeldStfu } = connectWithStfuControl(alice, bob, mode);
+			connectDroppingStfu(alice, bob);
 			alice.on('error', () => {});
 			bob.on('error', () => {});
 			const channel = alice.openChannel(bobPubkey, 1_000_000n);
@@ -1139,49 +1158,85 @@ describe('Quiescence (STFU)', function () {
 			)!;
 			alice.handleFundingConfirmed(channelId);
 			bob.handleFundingConfirmed(channelId);
-			return { alice, bob, channelId, releaseHeldStfu };
+			return { alice, bob, channelId };
 		}
 
-		it('a crossing add drains in SENT_STFU and the late stfu reply completes the handshake', function () {
-			const { alice, bob, channelId, releaseHeldStfu } = readyPair('hold');
+		it('a crossing add drains in SENT_STFU and the deferred stfu reply completes the handshake', function () {
+			// Order-preserving wire: once deferred, every message queues and is
+			// delivered strictly FIFO, exactly as the ordered transport would.
+			const alice = new ChannelManager({
+				...aliceConfig,
+				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+			});
+			const bob = new ChannelManager({
+				...bobConfig,
+				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+			});
+			let deferDelivery = false;
+			const wire: Array<() => void> = [];
+			const route = (
+				from: ChannelManager,
+				fromPk: string,
+				to: ChannelManager,
+				toPk: string
+			): void => {
+				from.on('message:outbound', (peer: string, t: number, p: Buffer) => {
+					if (peer !== toPk) return;
+					if (deferDelivery) {
+						wire.push(() => to.handleMessage(fromPk, t, p));
+						return;
+					}
+					to.handleMessage(fromPk, t, p);
+				});
+			};
+			route(alice, alicePubkey, bob, bobPubkey);
+			route(bob, bobPubkey, alice, alicePubkey);
+			alice.on('error', () => {});
+			bob.on('error', () => {});
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			const channelId = alice.createFunding(
+				channel,
+				crypto.randomBytes(32),
+				0,
+				crypto.randomBytes(64)
+			)!;
+			alice.handleFundingConfirmed(channelId);
+			bob.handleFundingConfirmed(channelId);
 			const bobChannel = bob.getChannel(channelId)!;
 			const aliceChannel = alice.getChannel(channelId)!;
 
-			// Bob initiates quiescence; his stfu is held, so Alice does not know.
-			const q = bob.initiateQuiescence(channelId);
-			expect(q.ok, q.error).to.be.true;
-			expect(bobChannel.getQuiescenceState()).to.equal(
-				QuiescenceState.SENT_STFU
-			);
+			// Bob's stfu and Alice's add leave their nodes before either sees
+			// the other's message: a genuine crossing.
+			deferDelivery = true;
+			expect(bob.initiateQuiescence(channelId).ok).to.be.true;
+			expect(
+				alice.addHtlc(
+					channelId,
+					20_000_000n,
+					crypto.randomBytes(32),
+					500_000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
 
-			// Alice's add crosses Bob's stfu. Bob accepts it (issue 411) and the
-			// commitment dance drains it fully while Bob stays in SENT_STFU:
-			// commitment_signed/revoke_and_ack are not update messages.
-			const res = alice.addHtlc(
-				channelId,
-				20_000_000n,
-				crypto.randomBytes(32),
-				500_000,
-				crypto.randomBytes(1366)
-			);
-			expect(res.ok).to.be.true;
+			// Deliver strictly in order until the wire is dry. Alice receives
+			// Bob's stfu while her add is pending: she latches it (issue 431),
+			// drains the add through the commitment dance, and replies only
+			// then. Bob accepts the crossing add in SENT_STFU (issue 411) and
+			// his pending gate accepts the conformant late reply.
+			while (wire.length > 0) {
+				wire.shift()!();
+			}
+
 			const entry = bobChannel.getFullState().htlcs.get('received-0');
 			expect(entry, 'crossing add admitted').to.not.equal(undefined);
 			expect(entry!.state, 'fully committed').to.equal(HtlcState.COMMITTED);
-			expect(bobChannel.getQuiescenceState()).to.equal(
-				QuiescenceState.SENT_STFU
-			);
-
-			// The drain is complete, so Alice can answer the released stfu at
-			// once, and Bob's pending gate accepts the reply: a COMMITTED live
-			// HTLC is not a pending update.
-			releaseHeldStfu();
 			expect(aliceChannel.isQuiescent()).to.be.true;
 			expect(bobChannel.isQuiescent()).to.be.true;
 		});
 
 		it('disconnects after the timeout while quiescing with an HTLC pending', async function () {
-			const { alice, bob, channelId } = readyPair('drop');
+			const { alice, bob, channelId } = readyPair();
 
 			// A fully committed live HTLC, then a quiescence handshake that never
 			// completes (the stfu is dropped).
@@ -1208,7 +1263,7 @@ describe('Quiescence (STFU)', function () {
 		});
 
 		it('an idle quiescence with no HTLCs is left standing', async function () {
-			const { alice, channelId } = readyPair('drop');
+			const { alice, channelId } = readyPair();
 			const timeouts: string[] = [];
 			alice.on('quiescence:timeout', (channelIdHex: string) => {
 				timeouts.push(channelIdHex);
@@ -1221,7 +1276,7 @@ describe('Quiescence (STFU)', function () {
 		});
 
 		it('a disconnect retires the watchdog and reports the session over', async function () {
-			const { alice, channelId } = readyPair('drop');
+			const { alice, channelId } = readyPair();
 			expect(
 				alice.addHtlc(
 					channelId,

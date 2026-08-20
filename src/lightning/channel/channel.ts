@@ -670,6 +670,13 @@ export class Channel {
 	private _state: IChannelState;
 	private _signer: ISigner | null = null;
 	private _quiescence: QuiescenceManager = new QuiescenceManager();
+	/**
+	 * A peer-initiated stfu arrived while updates were pending (issue 431).
+	 * The RECEIVED_STFU transition already happened; the reply is owed and
+	 * goes out from _maybeAnswerOwedStfu once the drain completes. In-memory
+	 * only: quiescence never survives a disconnect.
+	 */
+	private _stfuReplyOwed = false;
 	private _spliceSession: SpliceSession | null = null;
 	// A splice the caller requested while the channel was not yet quiescent.
 	// Fired automatically once we reach QUIESCENT (we drive quiescence ourselves
@@ -2914,9 +2921,15 @@ export class Channel {
 
 		// The dust-exposure ceiling is deliberately NOT enforced here. BOLT 2
 		// ("Bounding exposure to trimmed in-flight HTLCs"): the receiver SHOULD
-		// fail such an HTLC once it's committed, not refuse the add. The node
-		// admits it and fails it back with temporary_channel_failure via
-		// receivedHtlcExceedsDustExposure() (issue 410).
+		// fail such an HTLC once it's committed, not refuse the add. The
+		// classification is made NOW and stamped on the entry (see
+		// dustExposureFailback below): dispatch-time recomputation is
+		// order-dependent once batched siblings start settling, and a restart
+		// replay must answer identically.
+		const dustExposureFailback =
+			this._isDustHtlc(msg.amountMsat) &&
+			this._dustExposureMsat() + msg.amountMsat >
+				Channel.MAX_DUST_HTLC_EXPOSURE_MSAT;
 
 		// BOLT 2: cltv_expiry >= 500000000 is a unix timestamp, not a block
 		// height — always invalid, independent of whether we know the current
@@ -2950,7 +2963,8 @@ export class Channel {
 			onionRoutingPacket: msg.onionRoutingPacket,
 			direction: HtlcDirection.RECEIVED,
 			state: HtlcState.PENDING,
-			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {})
+			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {}),
+			...(dustExposureFailback ? { dustExposureFailback: true } : {})
 		};
 
 		// The reserve check above is measured against the reserve WE enforce,
@@ -3072,6 +3086,17 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Cannot fulfill HTLC: wrong state'
+				}
+			];
+		}
+		// BOLT 2 quiescence: "MUST NOT send an update message after stfu". The
+		// manager defers settles on a quiescing channel before reaching here;
+		// this guard covers callers driving the Channel directly.
+		if (this._quiescence.isQuiescing()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot fulfill HTLC: channel is quiescing'
 				}
 			];
 		}
@@ -3260,6 +3285,18 @@ export class Channel {
 			];
 		}
 
+		// BOLT 2 quiescence: "MUST NOT send an update message after stfu". The
+		// manager defers settles on a quiescing channel before reaching here;
+		// this guard covers callers driving the Channel directly.
+		if (this._quiescence.isQuiescing()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot fail HTLC: channel is quiescing'
+				}
+			];
+		}
+
 		// BOLT 2: update_fail_htlc removes an HTLC the PEER offered us. Refuse to
 		// fail one we offered rather than fall through to the received-keyed lookup
 		// and corrupt the same-id inbound HTLC.
@@ -3335,6 +3372,18 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Cannot fail HTLC: wrong state'
+				}
+			];
+		}
+
+		// BOLT 2 quiescence: "MUST NOT send an update message after stfu". The
+		// manager defers settles on a quiescing channel before reaching here;
+		// this guard covers callers driving the Channel directly.
+		if (this._quiescence.isQuiescing()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot fail HTLC: channel is quiescing'
 				}
 			];
 		}
@@ -4204,7 +4253,10 @@ export class Channel {
 		// is emitted from handleRevokeAndAck when LND acknowledges.
 		return [
 			{ type: ChannelActionType.PERSIST_STATE },
-			sendMsg(MessageType.REVOKE_AND_ACK, encodeRevokeAndAckMessage(revokeMsg))
+			sendMsg(MessageType.REVOKE_AND_ACK, encodeRevokeAndAckMessage(revokeMsg)),
+			// An owed stfu reply (issue 431) goes out only after the revoke that
+			// completed the drain.
+			...this._maybeAnswerOwedStfu()
 		];
 	}
 
@@ -4432,7 +4484,13 @@ export class Channel {
 		}
 
 		// Persist state after processing revoke_and_ack (Fix 2.2)
-		return [{ type: ChannelActionType.PERSIST_STATE }, ...htlcActions];
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			...htlcActions,
+			// An owed stfu reply (issue 431) goes out once this revoke completed
+			// the drain.
+			...this._maybeAnswerOwedStfu()
+		];
 	}
 
 	/**
@@ -4454,6 +4512,18 @@ export class Channel {
 		if (this._state.role !== ChannelRole.OPENER) {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Only opener can update fee' }
+			];
+		}
+
+		// BOLT 2 quiescence: "MUST NOT send an update message after stfu". The
+		// manager defers settles on a quiescing channel before reaching here;
+		// this guard covers callers driving the Channel directly.
+		if (this._quiescence.isQuiescing()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot update fee: channel is quiescing'
+				}
 			];
 		}
 
@@ -6583,6 +6653,7 @@ export class Channel {
 		this._resetSpliceDriver();
 		this._pendingSplice = null;
 		this._quiescence.reset();
+		this._stfuReplyOwed = false;
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
 		// A BOLT 1 error landing mid-RBF-renegotiation: roll back to the
@@ -6742,6 +6813,7 @@ export class Channel {
 
 		// Quiescence never survives a disconnect (BOLT 2 quiescence).
 		this._quiescence.reset();
+		this._stfuReplyOwed = false;
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
 
@@ -8430,6 +8502,30 @@ export class Channel {
 	/**
 	 * Handle STFU message from peer.
 	 */
+	/**
+	 * Send the stfu reply owed from a latched peer stfu (issue 431) once no
+	 * updates are pending. Hooked at the tails of handleCommitmentSigned and
+	 * handleRevokeAndAck, the only places the last in-flight update can
+	 * settle; self-gates until the drain is genuinely complete.
+	 */
+	private _maybeAnswerOwedStfu(): ChannelAction[] {
+		if (!this._stfuReplyOwed) return [];
+		if (this._state.state !== ChannelState.NORMAL) return [];
+		if (this.hasPendingHtlcs()) return [];
+		this._stfuReplyOwed = false;
+		const responseMsg: IStfuMessage = {
+			channelId: this._state.channelId!,
+			initiator: false
+		};
+		this._quiescence.completeHandshake();
+		this._state.quiescenceState = this._quiescence.getState();
+		this._state.quiescenceInitiator = this._quiescence.isInitiator();
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.STFU, encodeStfuMessage(responseMsg))
+		];
+	}
+
 	handleStfuMessage(msg: IStfuMessage): ChannelAction[] {
 		if (this._state.state !== ChannelState.NORMAL) {
 			return [
@@ -8440,14 +8536,37 @@ export class Channel {
 			];
 		}
 
-		// Check for pending HTLCs
+		// Pending updates split by direction (BOLT 2). The peer's REPLY to our
+		// own stfu may not arrive while updates are pending: the replier "MUST
+		// NOT send stfu if any of the sender's htlc additions, htlc removals or
+		// fee updates are pending for either peer", and on the ordered stream
+		// everything that would drain them precedes a conformant reply. An
+		// INITIATING stfu, by contrast, legitimately crosses our own in-flight
+		// updates, and the receiver "MUST reply with stfu once it can do so":
+		// the transition to RECEIVED_STFU happens NOW (so a later peer update
+		// is provable divergence, and our own new updates stop), while the
+		// reply is owed until the drain completes (issue 431; answered from
+		// _maybeAnswerOwedStfu as the last in-flight update settles).
 		if (this.hasPendingHtlcs()) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Cannot accept STFU: pending HTLCs exist'
-				}
-			];
+			if (this._quiescence.getState() !== QuiescenceState.NORMAL) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Cannot accept STFU: pending HTLCs exist'
+					}
+				];
+			}
+			const latch = this._quiescence.handlePeerStfu(
+				msg.initiator,
+				this._state.role === ChannelRole.OPENER
+			);
+			if (latch.error) {
+				return [{ type: ChannelActionType.ERROR, message: latch.error }];
+			}
+			this._stfuReplyOwed = true;
+			this._state.quiescenceState = this._quiescence.getState();
+			this._state.quiescenceInitiator = this._quiescence.isInitiator();
+			return [{ type: ChannelActionType.PERSIST_STATE }];
 		}
 
 		// Concurrent stfu (the peer's message also claims the initiator role
@@ -11329,17 +11448,16 @@ export class Channel {
 	}
 
 	/**
-	 * Whether this in-flight received dust HTLC breached
-	 * MAX_DUST_HTLC_EXPOSURE_MSAT when it was admitted. BOLT 2 ("Bounding
-	 * exposure to trimmed in-flight HTLCs"): such an HTLC SHOULD be failed
-	 * once committed rather than refused at add time (issue 410).
-	 *
-	 * Sequential-admission semantics: exposure counts every in-flight offered
-	 * dust HTLC plus received dust HTLCs up to and including this id. A whole
-	 * batch can commit at once, and against the full map's total every dust
-	 * HTLC in it would read as over the ceiling; ordering by id fails back
-	 * only the ones that actually pushed past it, and answers the same on a
-	 * restart replay.
+	 * Whether this in-flight received HTLC breached MAX_DUST_HTLC_EXPOSURE_MSAT
+	 * when it was ADMITTED (the dustExposureFailback stamp set by
+	 * handleUpdateAddHtlc). BOLT 2 ("Bounding exposure to trimmed in-flight
+	 * HTLCs"): such an HTLC SHOULD be failed once committed rather than
+	 * refused at add time (issue 410). The stamp rather than a live
+	 * recomputation: within a synchronously dispatched batch, earlier
+	 * final-hop siblings settle (FULFILLED/FAILED) before later entries are
+	 * checked and would vanish from a live exposure total, letting the HTLC
+	 * that crossed the ceiling slip under it; the stamp is also persisted, so
+	 * a restart replay answers identically.
 	 */
 	receivedHtlcExceedsDustExposure(htlcId: bigint): boolean {
 		const entry = this._state.htlcs.get('received-' + htlcId);
@@ -11350,19 +11468,7 @@ export class Channel {
 		) {
 			return false;
 		}
-		const rate = getCommitmentFeeRate(this._state);
-		if (!this._isDustHtlcAtRate(entry.amountMsat, rate)) return false;
-		let exposureMsat = 0n;
-		for (const e of this._state.htlcs.values()) {
-			if (e.state !== HtlcState.PENDING && e.state !== HtlcState.COMMITTED) {
-				continue;
-			}
-			if (e.direction === HtlcDirection.RECEIVED && e.id > htlcId) continue;
-			if (this._isDustHtlcAtRate(e.amountMsat, rate)) {
-				exposureMsat += e.amountMsat;
-			}
-		}
-		return exposureMsat > Channel.MAX_DUST_HTLC_EXPOSURE_MSAT;
+		return entry.dustExposureFailback === true;
 	}
 
 	/**

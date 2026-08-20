@@ -306,6 +306,18 @@ export interface IHtlcEntry {
 	 * dispatched by the next revoke_and_ack rather than being skipped forever.
 	 */
 	forwardEmitted?: boolean;
+	/**
+	 * Admission-time classification (issue 410): this received HTLC was dust
+	 * and pushed total dust exposure past MAX_DUST_HTLC_EXPOSURE_MSAT when it
+	 * was admitted, so the node fails it back once committed (BOLT 2: SHOULD
+	 * fail such an HTLC once it's committed, SHOULD NOT reveal a preimage).
+	 * Stamped at admission because the exposure total is order-dependent:
+	 * within a synchronously dispatched batch, earlier entries settle before
+	 * later ones are checked, so a dispatch-time recomputation would let the
+	 * HTLC that crossed the ceiling slip under it. Persisted so a restart
+	 * replay answers identically.
+	 */
+	dustExposureFailback?: boolean;
 }
 
 /**
