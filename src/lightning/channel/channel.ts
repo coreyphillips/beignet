@@ -4506,7 +4506,22 @@ export class Channel {
 			this._state.channelType
 		);
 		const reserveMsat = this._state.remoteConfig.channelReserveSatoshis * 1000n;
-		if (newCost * 1000n > this._state.localBalanceMsat - reserveMsat) {
+		let headroomMsat = this._state.localBalanceMsat - reserveMsat;
+		// While a splice awaits its lock the fee round mirrors onto the pending
+		// funding too, whose balance AND reserve both differ (a splice-out's
+		// candidate has less to spend; the pending capacity prices its own
+		// reserve). Bind on whichever view affords less, exactly as
+		// getSpendableOutboundMsat does for adds.
+		const pendingBalanceMsat = this.getPendingSpliceLocalBalanceMsat();
+		const pendingReserveSats = this._pendingSpliceKeptReserveSats();
+		if (pendingBalanceMsat !== null && pendingReserveSats !== null) {
+			const pendingHeadroomMsat =
+				pendingBalanceMsat - pendingReserveSats * 1000n;
+			if (pendingHeadroomMsat < headroomMsat) {
+				headroomMsat = pendingHeadroomMsat;
+			}
+		}
+		if (newCost * 1000n > headroomMsat) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -9884,6 +9899,36 @@ export class Channel {
 	}
 
 	/**
+	 * The reserve WE must keep on the pending splice funding, or null when no
+	 * splice is past its point of no return. BOLT 2 prices the reserve at
+	 * current capacity and eclair derives it per funding candidate, validating
+	 * every update against ALL active commitments, so during the pending-lock
+	 * window (updates resume after tx_signatures, before splice_locked) the
+	 * pending view binds at the reserve the PENDING capacity prices — on a
+	 * peer-funded splice-in the stored value is priced at the smaller old
+	 * capacity and admits sends eclair rejects against the new commitment.
+	 * Floored at the stored value, never below it: CLN never re-prices across
+	 * a splice, so on a splice-out it keeps enforcing the reserve priced at
+	 * the ORIGINAL capacity against both views. Same record-first sourcing as
+	 * getPendingSpliceLocalBalanceMsat so a restored session (no in-memory
+	 * splice state) prices from the persisted point-of-no-return record.
+	 */
+	private _pendingSpliceKeptReserveSats(): bigint | null {
+		if (!this._state.spliceInFlight) return null;
+		const pendingCapacity =
+			this._splicedState()?.fundingSatoshis ??
+			this._state.spliceInFlight.newFundingSatoshis;
+		return bigIntMax(
+			this._state.remoteConfig.channelReserveSatoshis,
+			v2ReserveWeKeep(
+				pendingCapacity,
+				this._state.localConfig.dustLimitSatoshis,
+				this._state.remoteConfig.dustLimitSatoshis
+			)
+		);
+	}
+
+	/**
 	 * A conservative ceiling on the outbound HTLC value this channel can add
 	 * right now, in msat: local balance minus the reserve the peer requires,
 	 * minus (for the opener) the commitment fee with one more HTLC. This is
@@ -9900,13 +9945,19 @@ export class Channel {
 	 *
 	 * While a splice awaits its lock, every update is mirrored onto BOTH
 	 * commitments (current funding + pending splice funding), so the
-	 * constraint is the minimum across the live and pending-splice local
-	 * balances: a splice-out's candidate commitment has less to spend, and an
-	 * HTLC the live commitment could afford would make the spliced one
-	 * unbuildable.
+	 * constraint is the minimum across the live and pending-splice VIEWS,
+	 * each priced with its own reserve: a splice-out's candidate commitment
+	 * has less to spend, and a splice-in's candidate commitment keeps a
+	 * larger reserve (the pending capacity prices it, and eclair validates
+	 * every update against all active commitments), so an HTLC the live
+	 * commitment could afford would make the spliced one unbuildable or
+	 * spec-refusable.
 	 */
 	getSpendableOutboundMsat(): bigint {
-		const spendableFor = (localMsat: bigint): bigint => {
+		const spendableFor = (
+			localMsat: bigint,
+			keptReserveSats: bigint
+		): bigint => {
 			// Floored at our OWN dust limit, not just the reserve the peer
 			// requires. Every conforming pairing already satisfies that (a v1
 			// reserve is validated against both dust limits at open, and
@@ -9921,7 +9972,7 @@ export class Channel {
 			// left to depend on which ran first (issues #386, #387).
 			const reserveMsat =
 				bigIntMax(
-					this._state.remoteConfig.channelReserveSatoshis,
+					keptReserveSats,
 					this._state.localConfig.dustLimitSatoshis
 				) * 1000n;
 			let requiredMsat = reserveMsat;
@@ -9960,10 +10011,14 @@ export class Channel {
 			const spendable = localMsat - requiredMsat;
 			return spendable > 0n ? spendable : 0n;
 		};
-		const live = spendableFor(this._state.localBalanceMsat);
+		const live = spendableFor(
+			this._state.localBalanceMsat,
+			this._state.remoteConfig.channelReserveSatoshis
+		);
 		const pendingSplice = this.getPendingSpliceLocalBalanceMsat();
-		if (pendingSplice === null) return live;
-		const spliced = spendableFor(pendingSplice);
+		const pendingReserve = this._pendingSpliceKeptReserveSats();
+		if (pendingSplice === null || pendingReserve === null) return live;
+		const spliced = spendableFor(pendingSplice, pendingReserve);
 		return spliced < live ? spliced : live;
 	}
 

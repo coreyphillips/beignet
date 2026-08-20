@@ -252,6 +252,47 @@ function makeSpliceInWallet(amountSats: bigint): {
 }
 
 /**
+ * A manager pair driven through a splice-out (to newCapacitySats) up to the
+ * pending-lock window: negotiation and tx_signatures complete, splice_locked
+ * never sent, so update traffic has resumed while every update still mirrors
+ * onto both fundings.
+ */
+function pendingLockSpliceOutPair(
+	newCapacitySats: bigint
+): ReturnType<typeof createNormalChannelPair> {
+	const pair = createNormalChannelPair();
+	pair.openerManager.initiateQuiescence(pair.channelId);
+	const destScript = Buffer.concat([
+		Buffer.from([0x00, 0x14]),
+		crypto.randomBytes(20)
+	]);
+	// node.spliceOut's exact arithmetic: the destination receives
+	// the full withdrawal and the on-chain fee rides in the declared
+	// relative (the tx_complete audit enforces the feerate).
+	const spliceOutFee = spliceFeeSats(
+		estimateSpliceTxWeight({
+			walletInputCount: 0,
+			destinationScriptLen: destScript.length
+		}),
+		253
+	);
+	const withdraw = FUNDING_SATOSHIS - newCapacitySats - spliceOutFee;
+	pair.openerChannel.setSpliceOutDestination(destScript, withdraw);
+	expect(
+		pair.openerManager.initiateSplice(
+			pair.channelId,
+			-(withdraw + spliceOutFee),
+			253
+		).ok
+	).to.equal(true);
+	// Auto-routing drove the negotiation and tx_signatures; without
+	// splice_locked both sides sit in the pending-lock window.
+	expect(pair.openerChannel.isSplicePendingLock()).to.equal(true);
+	expect(pair.acceptorChannel.isSplicePendingLock()).to.equal(true);
+	return pair;
+}
+
+/**
  * Helper to create a pair of channels (opener + acceptor) in NORMAL state,
  * connected through ChannelManagers with message routing.
  */
@@ -8844,45 +8885,12 @@ describe('Splice', function () {
 
 		describe('empty-commitment guard during the pending-lock window (issue #405)', function () {
 			// A splice-out down to a tiny 900-sat capacity, driven to the
-			// pending-lock window. The LIVE balances stay pre-splice until the
-			// lock (reserves are not re-derived either), so every update below
-			// passes the live checks — only the SPLICED view can refuse it.
+			// pending-lock window (fixture at file scope, shared with the
+			// pending-lock reserve tests). The LIVE balances stay pre-splice
+			// until the lock, so every update below passes the live checks —
+			// only the SPLICED view can refuse it.
 			// Non-anchor arithmetic: commitment fee floor(724 * rate / 1000),
 			// HTLC-success trim threshold 354 + floor(703 * rate / 1000).
-			function pendingLockSpliceOutPair(
-				newCapacitySats: bigint
-			): ReturnType<typeof createNormalChannelPair> {
-				const pair = createNormalChannelPair();
-				pair.openerManager.initiateQuiescence(pair.channelId);
-				const destScript = Buffer.concat([
-					Buffer.from([0x00, 0x14]),
-					crypto.randomBytes(20)
-				]);
-				// node.spliceOut's exact arithmetic: the destination receives
-				// the full withdrawal and the on-chain fee rides in the declared
-				// relative (the tx_complete audit enforces the feerate).
-				const spliceOutFee = spliceFeeSats(
-					estimateSpliceTxWeight({
-						walletInputCount: 0,
-						destinationScriptLen: destScript.length
-					}),
-					253
-				);
-				const withdraw = FUNDING_SATOSHIS - newCapacitySats - spliceOutFee;
-				pair.openerChannel.setSpliceOutDestination(destScript, withdraw);
-				expect(
-					pair.openerManager.initiateSplice(
-						pair.channelId,
-						-(withdraw + spliceOutFee),
-						253
-					).ok
-				).to.equal(true);
-				// Auto-routing drove the negotiation and tx_signatures; without
-				// splice_locked both sides sit in the pending-lock window.
-				expect(pair.openerChannel.isSplicePendingLock()).to.equal(true);
-				expect(pair.acceptorChannel.isSplicePendingLock()).to.equal(true);
-				return pair;
-			}
 
 			// A raw peer update_add_htlc delivered straight to the acceptor's
 			// handler: the opener's own send path would refuse these amounts,
@@ -9015,6 +9023,93 @@ describe('Splice', function () {
 				expect(errorOf(actions)).to.equal(null);
 				expect(acceptorChannel.getFullState().htlcs.size).to.equal(1);
 			});
+		});
+	});
+
+	describe('pending-lock reserve view (issue #382)', function () {
+		// During the pending-lock window every update mirrors onto the pending
+		// funding, whose reserve BOLT 2 prices at the PENDING capacity: eclair
+		// derives the reserve per funding candidate and validates each update
+		// against every active commitment, so a ceiling still priced at the old
+		// capacity over-admits by the reserve delta and eclair rejects the
+		// update against the new commitment.
+
+		/**
+		 * Opener routes 400k sats to the acceptor, then splices IN 300k from a
+		 * wallet input; both sides stop at the pending-lock window. The
+		 * acceptor contributes nothing, so its live and pending balances agree
+		 * and ONLY the reserve separates its two funding views: stored 10,000
+		 * (1% of the 1M open) vs 13,000 (1% of the 1.3M pending capacity).
+		 */
+		function pendingLockSpliceInPair(): ReturnType<
+			typeof createNormalChannelPair
+		> {
+			const pair = createNormalChannelPair();
+			const preimage = crypto.randomBytes(32);
+			expect(
+				pair.openerManager.addHtlc(
+					pair.channelId,
+					400_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.equal(true);
+			pair.acceptorManager.fulfillHtlc(pair.channelId, 0n, preimage);
+			expect(pair.acceptorChannel.getBalances().localMsat).to.equal(
+				400_000_000n
+			);
+
+			const { walletInput, changeScript } = makeSpliceInWallet(300_000n);
+			pair.openerChannel.setSpliceInInputs([walletInput], changeScript);
+			pair.openerManager.initiateQuiescence(pair.channelId);
+			expect(
+				pair.openerManager.initiateSplice(pair.channelId, 300_000n, 253).ok
+			).to.equal(true);
+			expect(pair.openerChannel.isSplicePendingLock()).to.equal(true);
+			expect(pair.acceptorChannel.isSplicePendingLock()).to.equal(true);
+			return pair;
+		}
+
+		const errorOf = (actions: any[]): string | null =>
+			findAction(actions, ChannelActionType.ERROR)?.message ?? null;
+
+		it('prices the pending funding view at its own reserve for outbound sends', function () {
+			const { acceptorChannel } = pendingLockSpliceInPair();
+			// Live view: 400,000,000 - 10,000,000. Pending view: 400,000,000 -
+			// 13,000,000 (v2ReserveWeKeep at 1.3M, both dusts 354). The pending
+			// view binds; with the stored reserve applied to both views the
+			// ceiling read 390,000,000 and over-admitted by 3,000 sats.
+			expect(acceptorChannel.getSpendableOutboundMsat()).to.equal(
+				387_000_000n
+			);
+		});
+
+		it('prices the pending view from the record alone after a restart', function () {
+			// A restart inside the window rebuilds the channel without its
+			// in-memory splice session; the persisted point-of-no-return record
+			// carries the pending capacity, and the ceiling must not widen back
+			// to the live-only figure.
+			const { acceptorChannel } = pendingLockSpliceInPair();
+			const json = JSON.parse(
+				JSON.stringify(serializeChannelState(acceptorChannel.getFullState()))
+			);
+			const restored = new Channel(deserializeChannelState(json));
+			expect(restored.getSpendableOutboundMsat()).to.equal(387_000_000n);
+		});
+
+		it('binds our own update_fee on the pending funding view', function () {
+			// Splice-out down to 60,000 sats: the live view holds 990,000 sats
+			// of fee headroom while the pending view holds 50,000. A rate only
+			// the live view affords must be refused (the fee round mirrors onto
+			// the pending funding): 80,000 sat/kw costs 57,920 > 50,000; 50,000
+			// sat/kw costs 36,200 and passes.
+			const { openerChannel } = pendingLockSpliceOutPair(60_000n);
+			const refused = openerChannel.updateFee(80_000);
+			expect(errorOf(refused)).to.include('below channel reserve');
+			const allowed = openerChannel.updateFee(50_000);
+			expect(errorOf(allowed)).to.equal(null);
+			expect(findSendAction(allowed, MessageType.UPDATE_FEE)).to.exist;
 		});
 	});
 
