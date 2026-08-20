@@ -6173,6 +6173,13 @@ export class ChannelManager extends EventEmitter {
 				// deleted here instead when a listener throws mid-batch.
 				this.cleanupForError(peerPubkey, channel, errorAction.cleanup)
 			) {
+				// Same pledge-release hooks as the dispatch arm. A listener that
+				// throws mid-batch (a failed wire send, say) lands here instead,
+				// and this cleanup deregisters the channel, so no disconnect sweep
+				// will ever find it again: skipping the release here would strand
+				// the wallet inputs until their TTL (issues #311/#412).
+				this.releaseErroredTempV2Pledges(channel);
+				this.releaseRefusedV1FundingPledges(channel);
 				this.emitContained(
 					'error',
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),

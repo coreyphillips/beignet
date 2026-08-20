@@ -1405,6 +1405,90 @@ describe('Channel Manager', function () {
 			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
 		});
 
+		it('a wire-send failure during the funding_signed refusal still releases the pledges', async function () {
+			// If the outbound ERROR listener throws (a failed transport write),
+			// the dispatch never reaches the local ERROR action: processActions'
+			// finalizer deregisters the channel instead. That cleanup used to
+			// skip the pledge-release hooks of the dispatch arm, stranding the
+			// wallet inputs until their TTL with no registered channel left for
+			// the disconnect sweep to find.
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			alice.on('error', () => undefined);
+			bob.on('error', () => undefined);
+
+			const released: Array<Array<{ txid: string; vout: number }>> = [];
+			const provider: IFundingProvider = {
+				buildFundingTransaction: async () => {
+					throw new Error('unused');
+				},
+				broadcastTransaction: async () => {
+					throw new Error('must never broadcast');
+				},
+				releaseInputPledges: async (outpoints) => {
+					released.push(outpoints);
+				}
+			};
+			alice.setFundingProvider(provider);
+
+			const queue: Array<() => void> = [];
+			const drain = async (): Promise<void> => {
+				while (queue.length) queue.shift()!();
+				await new Promise((r) => setImmediate(r));
+			};
+			alice.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== bobPubkey) return;
+					if (type === MessageType.ERROR) {
+						throw new Error('transport write failed');
+					}
+					queue.push(() => bob.handleMessage(alicePubkey, type, payload));
+				}
+			);
+			bob.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== alicePubkey) return;
+					const tampered =
+						type === MessageType.FUNDING_SIGNED
+							? // Same undecodable TLV suffix as the test above.
+							  Buffer.concat([payload, Buffer.from([0x02, 0x62, 0x01])])
+							: payload;
+					queue.push(() => alice.handleMessage(bobPubkey, type, tampered));
+				}
+			);
+
+			const fundingTx = new bitcoin.Transaction();
+			fundingTx.addInput(crypto.randomBytes(32), 0);
+			fundingTx.addInput(crypto.randomBytes(32), 1);
+			fundingTx.addOutput(
+				bitcoin.script.compile([bitcoin.opcodes.OP_0, crypto.randomBytes(20)]),
+				1_000_000
+			);
+			const expected = fundingTx.ins.map((input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			}));
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			await drain();
+			alice.createFunding(channel, fundingTx.getHash(), 0, Buffer.alloc(64));
+			channel.getFullState().pendingFundingTxHex = fundingTx.toHex();
+
+			await drain();
+			await drain();
+
+			// The finalizer deregistered the channel AND freed the pledges.
+			expect(released, 'released exactly once').to.have.length(1);
+			expect(released[0], 'both funding inputs freed').to.deep.equal(expected);
+			expect(alice.listChannels()).to.have.length(0);
+			expect(alice.getTempChannel(channel.getTemporaryChannelId())).to.equal(
+				undefined
+			);
+			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+		});
+
 		it('an error quoting the TEMPORARY id fails the promoted channel, owner only (issue 412)', async function () {
 			// A refusal of funding_created quotes the temporary id (the only id
 			// that message carries), but with queued transport it lands after
