@@ -1416,16 +1416,19 @@ export class Channel {
 				localPerCommitmentPoint,
 				commitmentNumber
 			);
-		} catch (err) {
+		} catch {
 			// A 98-byte partial whose 66-byte nonce halves are not decodable
 			// curve points, or whose 32-byte scalar is out of range, makes the
 			// musig library THROW ('Unexpected public nonce at infinity',
 			// 'Invalid sig') rather than return false. Uncaught, that throw
 			// escaped every refusal arm above this helper all the way to
 			// ChannelManager.handleMessage's catch: no wire error, no unwind,
-			// a dead open nobody was told about (issue 415).
-			const detail = err instanceof Error ? err.message : String(err);
-			return `Invalid taproot partial signature (${detail})`;
+			// a dead open nobody was told about (issue 415). Defense in depth
+			// behind verifyRemoteCommitmentPartial's own catch. The exception
+			// text is deliberately NOT included: this reason travels verbatim
+			// in BOLT 1 error data, and library internals are neither a stable
+			// wire contract nor the peer's business.
+			return 'Invalid taproot partial signature';
 		}
 		if (!valid) {
 			return 'Invalid taproot partial signature';
@@ -2126,20 +2129,17 @@ export class Channel {
 		// Scoped to the id the OPENER used, matching ChannelManager's own two
 		// refusals at this exact stage (the channel-id-in-use arms) and the id
 		// BOLT 2 still carries on funding_created. Deliberately NOT the permanent
-		// channelId derived just below: that one is built from PEER-SUPPLIED
-		// fundingTxid and fundingOutputIndex, so an opener quoting an all-zero txid
-		// at output 0 derives an all-zero channel_id and would turn this refusal
-		// into "fail every channel with me". msg.temporaryChannelId equals our own
-		// self-generated id by the guard above and cannot be steered.
+		// channelId derived after verification below: that one is built from
+		// PEER-SUPPLIED fundingTxid and fundingOutputIndex, so an opener quoting
+		// an all-zero txid at output 0 derives an all-zero channel_id and would
+		// turn this refusal into "fail every channel with me".
+		// msg.temporaryChannelId equals our own self-generated id by the guard
+		// above and cannot be steered.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.temporaryChannelId, reason);
 
 		this._state.fundingTxid = msg.fundingTxid;
 		this._state.fundingOutputIndex = msg.fundingOutputIndex;
-		this._state.channelId = deriveChannelId(
-			msg.fundingTxid,
-			msg.fundingOutputIndex
-		);
 
 		// Verify the opener's signature on our initial commitment (#0) before
 		// sending funding_signed (BOLT 2 MUST: the acceptor validates the
@@ -2201,6 +2201,16 @@ export class Channel {
 		);
 		this._state.lastSignedCommitLeaseBlockheight =
 			getLocalCommitmentLeaseBlockheight(this._state);
+
+		// Adopt the peer-derived permanent id only after every refusal arm above
+		// has passed: it is built from PEER-SUPPLIED fields (an all-zero txid at
+		// output 0 derives an all-zero channel_id), so a refused funding_created
+		// must leave getChannelId() null and let the manager's local-error emits
+		// fall back to the temporary id, matching the wire refusal's scope.
+		this._state.channelId = deriveChannelId(
+			msg.fundingTxid,
+			msg.fundingOutputIndex
+		);
 
 		const signedMsg: IFundingSignedMessage = {
 			channelId: this._state.channelId,
@@ -6867,8 +6877,31 @@ export class Channel {
 	 * error, no unwind (issue 409 review). Same lifecycle carve-out as the
 	 * handlers themselves: outside a live state the peer may not have seen
 	 * our terminal transition, so the refusal stays local.
+	 *
+	 * The two pre-funding arms take the exact shapes the decoded refusals at
+	 * those states use (the refuse closures in handleFundingCreated and
+	 * handleFundingSigned): scoped to an id the peer can act on, with the
+	 * cleanup that unwinds this stage, and deliberately WITHOUT a persisted
+	 * ERRORED row, since nothing has ever been persisted in either state.
+	 * They apply to ANY undecodable message resolved to a channel in these
+	 * states, close messages included: no conformant peer has a shutdown or
+	 * closing_signed in flight before funding_signed (there is no permanent
+	 * channel_id to quote yet), and the bare-ERROR fallthrough they replace
+	 * silently dropped the temp channel at SENT_ACCEPT (issue 393's shape)
+	 * and left an immortal promoted registration with frozen pledges at
+	 * SENT_FUNDING_CREATED (issue 412's shape).
 	 */
 	failFromMalformedPeerMessage(reason: string): ChannelAction[] {
+		if (this._state.state === ChannelState.SENT_ACCEPT) {
+			return refuseWithWireError(this._state.temporaryChannelId, reason);
+		}
+		if (this._state.state === ChannelState.SENT_FUNDING_CREATED) {
+			return refuseWithWireError(
+				this._state.channelId ?? this._state.temporaryChannelId,
+				reason,
+				'lifecycle'
+			);
+		}
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&

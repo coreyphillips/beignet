@@ -743,6 +743,65 @@ describe('Commitment Builder', function () {
 				.true;
 		});
 
+		it('verifyRemoteCommitmentPartial returns false on a garbage partial with an undecodable nonce (issue 415)', function () {
+			// Nonce halves that are not decodable curve points make the musig
+			// backend throw ('Unexpected public nonce at infinity') rather than
+			// return false. Malformed peer bytes must mean invalid, not a throw
+			// escaping every refusal arm.
+			const { acceptorState, acceptorCommitSeed } = createReadyState();
+			acceptorState.channelType = taprootType();
+
+			const acceptorNonce = generateNonce({
+				publicKey: acceptorState.localBasepoints.fundingPubkey,
+				sessionId: crypto.randomBytes(32)
+			});
+			const acceptorPoint = getPerCommitmentPoint(acceptorCommitSeed, 0n);
+
+			let result = true;
+			expect(() => {
+				result = verifyRemoteCommitmentPartial(
+					acceptorState,
+					Buffer.alloc(32, 1),
+					acceptorNonce,
+					Buffer.alloc(66, 1),
+					acceptorPoint
+				);
+			}).to.not.throw();
+			expect(result).to.equal(false);
+		});
+
+		it('verifyRemoteCommitmentPartial returns false on an out-of-range scalar with a VALID nonce (issue 415)', function () {
+			// With both nonces valid the session aggregates fine and the throw
+			// comes later, from partialVerify on the out-of-range scalar
+			// ('Invalid sig'). Same rule: malformed means invalid.
+			const { openerState, acceptorState, acceptorCommitSeed } =
+				createReadyState();
+			openerState.channelType = taprootType();
+			acceptorState.channelType = taprootType();
+
+			const openerNonce = generateNonce({
+				publicKey: openerState.localBasepoints.fundingPubkey,
+				sessionId: crypto.randomBytes(32)
+			});
+			const acceptorNonce = generateNonce({
+				publicKey: acceptorState.localBasepoints.fundingPubkey,
+				sessionId: crypto.randomBytes(32)
+			});
+			const acceptorPoint = getPerCommitmentPoint(acceptorCommitSeed, 0n);
+
+			let result = true;
+			expect(() => {
+				result = verifyRemoteCommitmentPartial(
+					acceptorState,
+					Buffer.alloc(32, 0xff),
+					acceptorNonce,
+					Buffer.from(openerNonce),
+					acceptorPoint
+				);
+			}).to.not.throw();
+			expect(result).to.equal(false);
+		});
+
 		it('signs + verifies taproot HTLC second-level Schnorr signatures', function () {
 			const { openerState, acceptorState, openerSeed, acceptorCommitSeed } =
 				createReadyState();

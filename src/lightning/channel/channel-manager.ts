@@ -2672,7 +2672,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleFundingCreated(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeFundingCreatedMessage(payload);
+		let msg: ReturnType<typeof decodeFundingCreatedMessage>;
+		try {
+			msg = decodeFundingCreatedMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'funding_created',
+				err
+			);
+			return;
+		}
 		const channel = this.tempChannels.get(
 			msg.temporaryChannelId.toString('hex')
 		);
@@ -2767,7 +2778,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleFundingSigned(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeFundingSignedMessage(payload);
+		let msg: ReturnType<typeof decodeFundingSignedMessage>;
+		try {
+			msg = decodeFundingSignedMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'funding_signed',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) {
 			// Try by scanning temp channels that have a channel ID set
@@ -2883,7 +2905,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleCommitmentSigned(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeCommitmentSignedMessage(payload);
+		let msg: ReturnType<typeof decodeCommitmentSignedMessage>;
+		try {
+			msg = decodeCommitmentSignedMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'commitment_signed',
+				err
+			);
+			return;
+		}
 		// A v2 open exchanges commitment_signed while the channel still lives in
 		// tempChannels (keyed by its now-derived channelId), so fall back to the
 		// temp lookup.
@@ -2992,12 +3025,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
-	 * A close-family payload that failed to DECODE (wrong-length nonce TLV,
-	 * truncated partial) never reaches the handler whose content checks would
+	 * A payload that failed to DECODE (wrong-length TLV, truncated record, a
+	 * lying count) never reaches the handler whose content checks would
 	 * wire-fail it; without this, the codec throw died in handleMessage's
-	 * catch as a null-id local error. Both shutdown and closing_signed lead
-	 * with the 32-byte channel_id at a fixed offset, so the channel can still
-	 * be identified and failed with a properly scoped wire error.
+	 * catch as a null-id local error. Every guarded message leads with a
+	 * 32-byte id at offset 0: funding_created the temporary_channel_id;
+	 * shutdown, closing_signed, funding_signed and commitment_signed the
+	 * channel_id, which for a v2 open may still be temp-resident. So the
+	 * channel can be identified and failed with a properly scoped wire
+	 * error. The lookup chain mirrors isForeignChannelMessage, which already
+	 * ownership-screened these types on the same leading bytes even for
+	 * undecodable payloads, so a third party cannot steer this onto someone
+	 * else's channel.
 	 */
 	private failChannelForUndecodablePayload(
 		peerPubkey: string,
@@ -3008,7 +3047,11 @@ export class ChannelManager extends EventEmitter {
 		const detail = err instanceof Error ? err.message : String(err);
 		const channelId =
 			payload.length >= 32 ? Buffer.from(payload.subarray(0, 32)) : null;
-		const channel = channelId ? this.findChannelByChannelId(channelId) : null;
+		const channel = channelId
+			? this.findChannelByChannelId(channelId) ||
+			  this.findChannelByChannelIdInTemp(channelId) ||
+			  this.findTempChannel(channelId)
+			: null;
 		if (!channel) {
 			this.emit('error', channelId, `Undecodable ${name}: ${detail}`);
 			return;
@@ -6130,6 +6173,13 @@ export class ChannelManager extends EventEmitter {
 				// deleted here instead when a listener throws mid-batch.
 				this.cleanupForError(peerPubkey, channel, errorAction.cleanup)
 			) {
+				// Same pledge-release hooks as the dispatch arm. A listener that
+				// throws mid-batch (a failed wire send, say) lands here instead,
+				// and this cleanup deregisters the channel, so no disconnect sweep
+				// will ever find it again: skipping the release here would strand
+				// the wallet inputs until their TTL (issues #311/#412).
+				this.releaseErroredTempV2Pledges(channel);
+				this.releaseRefusedV1FundingPledges(channel);
 				this.emitContained(
 					'error',
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
