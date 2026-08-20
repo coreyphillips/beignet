@@ -580,6 +580,30 @@ describe('undecodable-payload decode guards (issue 426)', function () {
 		};
 	}
 
+	it('a pre-record v2 fault refuses on the wire without persisting a row', function () {
+		// Before the record exists nothing was ever persisted, so nothing may
+		// start being: wire refusal scoped to the negotiation id, default temp
+		// cleanup, NO PERSIST_STATE and no condemned stamp (the same rule as
+		// the other pre-funding arms).
+		const channel = makeV2SigStageChannel();
+		channel.getFullState().state = ChannelState.DUAL_FUNDING_V2;
+		channel.getFullState().v2InFlight = null;
+
+		const actions = channel.failFromMalformedPeerMessage(
+			'Undecodable tx_add_output: boom'
+		);
+		expect(
+			actions.some((a) => a.type === ChannelActionType.PERSIST_STATE),
+			'no persisted row'
+		).to.equal(false);
+		const send = actions.find(
+			(a) => a.type === ChannelActionType.SEND_MESSAGE
+		) as ISendMessageAction | undefined;
+		expect(send, 'wire refusal sent').to.exist;
+		expect(send!.messageType).to.equal(MessageType.ERROR);
+		expect(channel.getFullState().condemned).to.not.equal(true);
+	});
+
 	it('a broadcastable v2 signature-stage fault keeps the ERRORED row and the record', function () {
 		// The peer may broadcast without another byte from us: the row, the
 		// registration and the record must all survive (cleanup 'none'), and
