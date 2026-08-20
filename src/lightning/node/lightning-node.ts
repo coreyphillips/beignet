@@ -9072,6 +9072,14 @@ export class LightningNode extends EventEmitter {
 		// oldCap + relative_satoshis, and we declare relative = -(amount + fee)).
 		// So the channel must be able to spare amount + fee.
 		let error = this._validateSpliceRequest(channelId, amountSats);
+		// The destination is an interactive-tx output, so it must clear the
+		// NEGOTIATED floor, not just the generic 546-sat one: a peer whose
+		// commitment dust limit is larger rejects the tx_add_output and the
+		// splice aborts after the fact (issue #389).
+		const destinationFloor = channel.spliceInteractiveTxDustFloor();
+		if (!error && amountSats < destinationFloor) {
+			error = `splice-out amount ${amountSats} sats is below this channel's negotiated dust floor (${destinationFloor} sats)`;
+		}
 		// Footgun guard: a fee at or above the withdrawal means you'd burn more
 		// on-chain than you take out — almost always a mistake (wrong feerate).
 		if (!error && fee >= amountSats) {
@@ -9166,8 +9174,12 @@ export class LightningNode extends EventEmitter {
 		channelId: Buffer,
 		amountSats: bigint
 	): string | null {
-		if (amountSats <= LightningNode.SPLICE_MIN_AMOUNT_SATS) {
-			return `splice amount ${amountSats} sats is at or below the dust floor (${LightningNode.SPLICE_MIN_AMOUNT_SATS} sats)`;
+		// Strict: the interactive-tx builder (and the negotiated-floor check
+		// on splice-out destinations) accepts an output AT the floor, so the
+		// preflight must too — refusing equality here would reject a
+		// splice the negotiation itself is happy to complete.
+		if (amountSats < LightningNode.SPLICE_MIN_AMOUNT_SATS) {
+			return `splice amount ${amountSats} sats is below the dust floor (${LightningNode.SPLICE_MIN_AMOUNT_SATS} sats)`;
 		}
 		const peerPubkey = this.channelManager.getPeerForChannel(channelId);
 		// Unknown support (no init to read) passes, as it always has: the

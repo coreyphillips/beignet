@@ -190,6 +190,48 @@ describe('LightningNode splice validation', function () {
 			.true;
 		node.destroy();
 	});
+
+	it('enforces the negotiated dust floor on splice-out, not just the generic 546 (issue #389)', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const channel = (node as any).channelManager.channels.get(
+			channelId.toString('hex')
+		);
+		// The peer negotiated a 1000-sat commitment dust limit, so every
+		// output we add to the splice tx must clear 1000, not 546 — the
+		// withdrawal destination included.
+		channel.getFullState().remoteConfig.dustLimitSatoshis = 1_000n;
+		expect(channel.spliceInteractiveTxDustFloor()).to.equal(1_000n);
+
+		// 800 sats clears the generic 546-sat preflight but not this
+		// channel's floor: the peer would refuse the tx_add_output and the
+		// splice would abort only after the stfu round.
+		const refused = node.spliceOut(channelId, 800n, 253);
+		expect(refused.ok).to.be.false;
+		expect(refused.error).to.match(/negotiated dust floor \(1000 sats\)/);
+
+		// At the floor the new preflight admits it; whatever can still fail
+		// later, it is never this arm.
+		const atFloor = node.spliceOut(channelId, 1_000n, 253);
+		expect(atFloor.error ?? '').to.not.include('negotiated dust floor');
+		node.destroy();
+	});
+
+	it('admits a splice-out exactly at the default 546-sat floor (issue #389)', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		// The interactive-tx builder accepts an output AT the floor, so both
+		// preflights must too: the generic arm is strict (< 546) and, on a
+		// default-dust channel, the negotiated floor IS 546. Anything that
+		// still fails later is never a dust arm.
+		const atFloor = node.spliceOut(channelId, 546n, 253);
+		expect(atFloor.error ?? '').to.not.include('dust floor');
+		// One below stays refused.
+		const below = node.spliceOut(channelId, 545n, 253);
+		expect(below.ok).to.be.false;
+		expect(below.error).to.include('below the dust floor');
+		node.destroy();
+	});
 });
 
 describe('LightningNode peerSupportsSplicing', function () {
