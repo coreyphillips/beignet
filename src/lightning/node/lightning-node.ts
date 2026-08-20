@@ -610,6 +610,19 @@ export class LightningNode extends EventEmitter {
 	 * forward interrupted by a restart falls back to an ordinary error.
 	 */
 	private blindedIncomingHtlcs: Map<string, 'intro' | 'mid'> = new Map();
+
+	/**
+	 * Incoming-HTLC dispatches parked because the channel was quiescing when
+	 * they committed (BOLT 2: no update messages after stfu, issue 411).
+	 * Drained on the manager's 'quiescence:ended' event; the per-block retry is
+	 * the invariant keeper, since terminal quiescence exits (disconnect,
+	 * errored, force close) emit no event. In-memory only: a restart replays
+	 * these via redispatchUnresolvedReceivedHtlcs.
+	 */
+	private parkedQuiescentHtlcs: Map<
+		string,
+		Array<{ htlcId: bigint; amountMsat: bigint; paymentHash: Buffer }>
+	> = new Map();
 	private feeEstimator: IFeeEstimator | null = null;
 	private missionControl: MissionControl;
 	/** Leveled diagnostic logger (injectable via INodeConfig.logger; no-op by default). */
@@ -1012,6 +1025,8 @@ export class LightningNode extends EventEmitter {
 			// unchanged.
 			durabilityBarrier: this.recoveryBarrier,
 			largeChannels: this.largeChannels,
+			// BOLT 2 quiescence watchdog window (default 60s in the manager).
+			quiescenceTimeoutMs: config.quiescenceTimeoutMs,
 			// Liquidity ads seller policy (bLIP-0051): sign will_fund for inbound
 			// request_funds and fund the contribution via the fundingProvider.
 			leaseRates: config.leaseRates,
@@ -2752,6 +2767,9 @@ export class LightningNode extends EventEmitter {
 		// event where the restore repair above is not.
 		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
 			this.settleForwardsOwedUpstream(channelId);
+			// A disconnect-during-quiescence left parked dispatches waiting for
+			// the channel to carry updates again; it can now.
+			this.drainParkedQuiescentHtlcs(channelId.toString('hex'));
 		});
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
 			this.registerChannelScids(channelId);
@@ -3191,6 +3209,47 @@ export class LightningNode extends EventEmitter {
 					// disk is the only one a restart would resume, so it is
 					// the only one this side may keep tracking.
 					this.resyncV2OpenFromDisk(channelId);
+				});
+			}
+		);
+
+		// Quiescence over on a channel: re-drive any incoming-HTLC dispatches
+		// parked while it was quiescing (issue 411). Deferred: the event fires
+		// from inside a processActions dispatch, and the re-driven dispositions
+		// start a dispatch of their own.
+		this.channelManager.on('quiescence:ended', (channelIdHex: string) => {
+			setImmediate(() => {
+				this.drainParkedQuiescentHtlcs(channelIdHex);
+			});
+		});
+
+		// BOLT 2: "MUST disconnect after 60 seconds of quiescence if the HTLCs
+		// are pending". The disconnect resets quiescence via markForReestablish,
+		// which also reverses uncommitted adds - the spec's own escape hatch.
+		this.channelManager.on(
+			'quiescence:timeout',
+			(channelIdHex: string, peerPubkey: string) => {
+				this.emitStructuredLog('channel', 'quiescence_timeout', {
+					peerPubkey,
+					channelId: channelIdHex
+				});
+				setImmediate(() => {
+					if (this.peerManager) {
+						try {
+							this.peerManager.disconnectPeer(peerPubkey);
+						} catch {
+							// Already disconnected, or transport-level teardown raced.
+						}
+						return;
+					}
+					// External transport (message:outbound mode): there is no
+					// socket here to drop. Ask the host to sever the connection
+					// and apply the protocol side ourselves - BOLT 2: the channel
+					// is no longer quiescent upon disconnection, and reestablish
+					// resynchronizes on reconnect. Without this the channel would
+					// stay quiescing forever with its parked HTLCs stranded.
+					this.emit('peer:disconnect-requested', peerPubkey);
+					this.channelManager.handlePeerDisconnected(peerPubkey);
 				});
 			}
 		);
@@ -12108,6 +12167,18 @@ export class LightningNode extends EventEmitter {
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return;
 
+		// BOLT 2 quiescence: "MUST NOT send an update message after stfu". An
+		// add that crossed our own stfu can reach COMMITTED while the channel is
+		// still quiescing (issue 411), and every disposition below can send
+		// update_fail_htlc/update_fulfill_htlc. Park the dispatch before ANY arm
+		// runs (the cap/rate-limit fails below included); it is re-driven when
+		// the manager reports quiescence over, with a per-block retry covering
+		// the exits that emit no event (disconnect, errored, force close).
+		if (channel.isQuiescing()) {
+			this.parkQuiescentHtlc(channelId, htlcId, amountMsat, paymentHash);
+			return;
+		}
+
 		// Global HTLC limit check
 		if (this.getTotalInFlightHtlcCount() > this.maxTotalInFlightHtlcs) {
 			this.channelManager.failHtlc(
@@ -12199,7 +12270,65 @@ export class LightningNode extends EventEmitter {
 			RecoveryCriticality.SafetyCritical
 		);
 
-		if (isFinalHop(processed.nextPacket)) {
+		// Policy fail-backs (issue 410): BOLT 2's dust-exposure section says an
+		// HTLC over the ceiling SHOULD be failed once committed and its preimage
+		// never revealed, so this runs before any dispatch. The CLTV horizon is
+		// our policy with the same shape. BOLT 4 splits the code by hop role: a
+		// forwarding node answers temporary_channel_failure / expiry_too_far,
+		// but a final node must not return forwarding-only errors and answers
+		// the non-leaking incorrect_or_unknown_payment_details instead. Inside
+		// a blinded route the reason must not leak either way (BOLT 4), so
+		// those surface as invalid_onion_blinding. Replayed idempotently on
+		// restart via redispatchUnresolvedReceivedHtlcs.
+		const finalHop = isFinalHop(processed.nextPacket);
+		let policyCode: number | null = null;
+		if (channel.receivedHtlcExceedsDustExposure(htlcId)) {
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_CHANNEL_FAILURE;
+		} else if (
+			this.currentBlockHeight > 0 &&
+			htlcEntry.cltvExpiry >
+				this.currentBlockHeight + Channel.MAX_HTLC_CLTV_EXPIRY_DELTA
+		) {
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: EXPIRY_TOO_FAR;
+		}
+		if (policyCode !== null) {
+			// TLV 12 (current_blinding_point) marks the introduction node; a
+			// message-level blinding point means we are a downstream blinded hop.
+			const blindedRole: 'intro' | 'mid' | undefined = processed.hopPayload
+				.blindingPoint
+				? 'intro'
+				: htlcEntry.blindingPoint
+				? 'mid'
+				: undefined;
+			if (blindedRole) {
+				this.failBlindedIncomingHtlc(
+					channelId,
+					htlcId,
+					blindedRole,
+					processed.sharedSecret
+				);
+				return;
+			}
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(
+				channelId,
+				htlcId,
+				createFailureMessage(
+					processed.sharedSecret,
+					policyCode,
+					policyCode === INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+						? this.incorrectPaymentDetailsData(amountMsat)
+						: this.updateFlaggedFailureData(policyCode)
+				)
+			);
+			return;
+		}
+
+		if (finalHop) {
 			// We are the final destination. htlcEntry.blindingPoint is the
 			// update_add_htlc path key a downstream blinded final hop received
 			// (absent when we are the path's introduction node, which gets the
@@ -12227,6 +12356,62 @@ export class LightningNode extends EventEmitter {
 				amountMsat,
 				htlcEntry.cltvExpiry,
 				htlcEntry.blindingPoint
+			);
+		}
+	}
+
+	private parkQuiescentHtlc(
+		channelId: Buffer,
+		htlcId: bigint,
+		amountMsat: bigint,
+		paymentHash: Buffer
+	): void {
+		const key = channelId.toString('hex');
+		const list = this.parkedQuiescentHtlcs.get(key) ?? [];
+		if (!list.some((e) => e.htlcId === htlcId)) {
+			list.push({ htlcId, amountMsat, paymentHash });
+		}
+		this.parkedQuiescentHtlcs.set(key, list);
+	}
+
+	/**
+	 * Re-drive incoming-HTLC dispatches parked while their channel was
+	 * quiescing. Each entry is deleted BEFORE the re-invoke: handleIncomingHtlc
+	 * re-parks it if quiescence resumed, and a still-parked entry must never be
+	 * dispatched twice by the event drain and the per-block retry racing.
+	 */
+	private drainParkedQuiescentHtlcs(channelIdHex: string): void {
+		const list = this.parkedQuiescentHtlcs.get(channelIdHex);
+		if (!list?.length) return;
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) {
+			// Channel removed from the manager: nothing left to fail against.
+			this.parkedQuiescentHtlcs.delete(channelIdHex);
+			return;
+		}
+		const state = channel.getState();
+		if (
+			state === ChannelState.ERRORED ||
+			state === ChannelState.CLOSED ||
+			state === ChannelState.FORCE_CLOSED
+		) {
+			// Terminal: the HTLCs resolve on-chain, not by update messages.
+			this.parkedQuiescentHtlcs.delete(channelIdHex);
+			return;
+		}
+		// Not merely "no longer quiescing": after a disconnect-during-quiescence
+		// the channel sits in AWAITING_REESTABLISH, where failHtlc/fulfillHtlc
+		// refuse and a drained entry would be consumed and stranded. Hold until
+		// the channel can carry updates again; the per-block retry gets it there.
+		if (channel.isQuiescing() || !channel.isHtlcUsable()) return;
+		this.parkedQuiescentHtlcs.delete(channelIdHex);
+		for (const entry of list) {
+			this.handleIncomingHtlc(
+				channelId,
+				entry.htlcId,
+				entry.amountMsat,
+				entry.paymentHash
 			);
 		}
 	}
@@ -14953,6 +15138,12 @@ export class LightningNode extends EventEmitter {
 			this.resolveForceCloseFeeRatePerVbyte()
 		);
 		this.scanExpiringHtlcs(blockHeight);
+		// Invariant keeper for HTLC dispatches parked during quiescence: the
+		// terminal quiescence exits (disconnect, errored, force close) emit no
+		// 'quiescence:ended', so retry every parked channel each block.
+		for (const channelIdHex of [...this.parkedQuiescentHtlcs.keys()]) {
+			this.drainParkedQuiescentHtlcs(channelIdHex);
+		}
 		this.scanExpiringOfferedHtlcs(blockHeight);
 		this.scanExpiringHeldHtlcs(blockHeight);
 		this.scanExpiringHeldForwards(blockHeight);
@@ -15292,6 +15483,12 @@ export class LightningNode extends EventEmitter {
 				// HTLC we cannot claim costs us nothing to leave: the upstream
 				// refunds itself via its HTLC-timeout once the commitment confirms.
 				if (errored) continue;
+
+				// BOLT 2 quiescence: no update messages after stfu. The ChannelState
+				// stays NORMAL through a quiescence handshake, so it must be asked
+				// directly; the quiescence watchdog's disconnect is the spec's
+				// remedy for an HTLC nearing its deadline during quiescence.
+				if (channel.isQuiescing()) continue;
 
 				if (htlc.cltvExpiry - blockHeight <= this.htlcSafetyMargin) {
 					const channelId = state.channelId || state.temporaryChannelId;

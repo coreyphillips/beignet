@@ -472,9 +472,10 @@ And condemning there would force close conformant peers, because
 `handleReestablish` replays every queued `update_add_htlc` and `update_fee`
 after a reconnect while `remoteShutdownScript` is persisted, and because this
 implementation parks taproot channels in quiescence for longer than the splicing
-spec requires. The one genuinely open gap is the `SENT_STFU` window, where the
-right answer is to accept the crossing add and that needs a quiescence timer
-this implementation does not have yet.
+spec requires. The `SENT_STFU` window is closed (issue 411): a crossing add is
+accepted, its disposition is parked at the node until quiescence ends, and the
+manager's quiescence watchdog enforces BOLT 2's 60-second disconnect when a
+session stalls with HTLCs pending.
 
 The same replay machinery derives the crash-replay carve-outs (issue 409): a
 peer restored from a legally lagging snapshot replays its whole pending update

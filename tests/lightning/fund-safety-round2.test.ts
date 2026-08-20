@@ -134,10 +134,14 @@ describe('Fund safety round 2', function () {
 			expect(ok.find((a) => a.type === ChannelActionType.ERROR)).to.not.exist;
 		});
 
-		it('rejects an inbound dust HTLC over the cap', function () {
+		it('admits an inbound dust HTLC over the cap and flags it for fail-back', function () {
+			// BOLT 2 ("Bounding exposure to trimmed in-flight HTLCs"): the
+			// receiver SHOULD fail such an HTLC once committed, not refuse the
+			// add (issue 410). The channel admits it and exposes the predicate
+			// the node's fail-back runs on.
 			const channel = makeNormalAcceptorChannel();
 			const dustAmount = 350_000n;
-			for (let i = 0; i < 14; i++) {
+			for (let i = 0; i < 15; i++) {
 				const actions = channel.handleUpdateAddHtlc({
 					channelId: channel.getChannelId()!,
 					id: BigInt(i),
@@ -151,17 +155,11 @@ describe('Fund safety round 2', function () {
 					`inbound dust HTLC ${i} accepted`
 				).to.not.exist;
 			}
-			const rejected = channel.handleUpdateAddHtlc({
-				channelId: channel.getChannelId()!,
-				id: 14n,
-				amountMsat: dustAmount,
-				paymentHash: crypto.randomBytes(32),
-				cltvExpiry: 1000,
-				onionRoutingPacket: Buffer.alloc(1366)
-			});
-			const err: any = rejected.find((a) => a.type === ChannelActionType.ERROR);
-			expect(err).to.exist;
-			expect(err.message).to.include('Dust HTLC exposure');
+			// 14 x 350_000 msat = 4_900_000 stayed under the 5_000_000 cap; the
+			// 15th pushed exposure over, so it must be failed back once
+			// committed.
+			expect(channel.receivedHtlcExceedsDustExposure(13n)).to.equal(false);
+			expect(channel.receivedHtlcExceedsDustExposure(14n)).to.equal(true);
 		});
 	});
 

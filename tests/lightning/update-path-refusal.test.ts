@@ -10,9 +10,11 @@
  *
  * The rule these tests pin: an arm is wire-visible iff the refusal is
  * unconditional and permanent AND no legal in-flight crossing can produce it.
- * The second clause is what keeps the lifecycle guards and the SENT_STFU half
- * of the quiescence guard local, and the control tests below are the ones that
- * fail if a later change "unifies" them with the rest.
+ * The second clause is what keeps the lifecycle guards local, and the control
+ * tests below are the ones that fail if a later change "unifies" them with
+ * the rest. Two former refusals are no longer refusals at all (issues 410 and
+ * 411): OUR-policy dust/CLTV-horizon adds are admitted and failed back by the
+ * node once committed, and an add that crossed our own stfu is accepted.
  */
 
 import { expect } from 'chai';
@@ -252,20 +254,6 @@ describe('Update-path refusals reach the peer (issue 404)', function () {
 						)
 					};
 				}
-			},
-			{
-				name: 'a cltv_expiry past our horizon',
-				reason: /CLTV too far in future/,
-				run: () => {
-					const channel = makeChannel();
-					channel.setBlockHeight(1_000);
-					return {
-						channel,
-						actions: channel.handleUpdateAddHtlc(
-							add(channel, { cltvExpiry: 1_000 + 5_041 })
-						)
-					};
-				}
 			}
 		];
 
@@ -277,20 +265,45 @@ describe('Update-path refusals reach the peer (issue 404)', function () {
 			});
 		}
 
-		it('fails the channel on the wire for dust exposure over our ceiling', function () {
-			// Our own ceiling, not a BOLT 2 MUST, and told anyway: the peer could not
-			// have predicted the policy but the divergence is identical.
+		it('ADMITS a cltv_expiry past our horizon (failed back once committed)', function () {
+			// Our policy, not a BOLT 2 MUST: the add is admitted and the node
+			// fails it back with expiry_too_far after commitment (issue 410).
+			const channel = makeChannel();
+			channel.setBlockHeight(1_000);
+			const actions = channel.handleUpdateAddHtlc(
+				add(channel, { cltvExpiry: 1_000 + 5_041 })
+			);
+			expect(actions, 'admitted, not refused').to.have.length(0);
+			expect(
+				channel.getFullState().htlcs.get('received-0'),
+				'recorded'
+			).to.not.equal(undefined);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('ADMITS dust exposure over our ceiling (failed back once committed)', function () {
+			// BOLT 2 ("Bounding exposure to trimmed in-flight HTLCs"): such an
+			// HTLC SHOULD be failed once committed, not refused at add time.
+			// The channel exposes the predicate the node fails it back with.
 			const channel = makeChannel({}, { dustLimitSatoshis: 100_000n });
 			seedHtlc(channel, 50_000_000n, 5n);
 			const actions = channel.handleUpdateAddHtlc(
 				add(channel, { id: 1n, amountMsat: 50_000_000n })
 			);
-			expectWireFailure(
-				actions,
-				channel.getChannelId()!,
-				/Dust HTLC exposure limit exceeded/
-			);
-			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(actions, 'admitted, not refused').to.have.length(0);
+			expect(
+				channel.getFullState().htlcs.get('received-1'),
+				'recorded'
+			).to.not.equal(undefined);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+			expect(
+				channel.receivedHtlcExceedsDustExposure(1n),
+				'stamped at admission for the node-level fail-back'
+			).to.equal(true);
+			expect(
+				channel.receivedHtlcExceedsDustExposure(5n),
+				'the pre-existing HTLC was not over the ceiling when IT was admitted'
+			).to.equal(false);
 		});
 
 		it('control: a byte-identical replay is still a no-op', function () {
@@ -387,16 +400,25 @@ describe('Update-path refusals reach the peer (issue 404)', function () {
 			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		});
 
-		it('control: an add that merely crossed OUR stfu stays local', function () {
+		it('ACCEPTS an add that merely crossed OUR stfu', function () {
 			// The peer owes nothing until it has received our stfu, a moment we
-			// cannot observe, and BOLT 2 requires that window to exist.
+			// cannot observe, and BOLT 2 requires that window to exist: a peer
+			// holding pending updates drains them before it can "reply with stfu
+			// once it can do so" (issue 411).
 			const channel = makeChannel();
 			channel.initiateQuiescence();
 			expect(channel.getQuiescenceState()).to.equal(QuiescenceState.SENT_STFU);
 			const actions = channel.handleUpdateAddHtlc(add(channel));
-			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
-			expect(actions).to.have.length(1);
+			expect(actions, 'admitted, not refused').to.have.length(0);
+			expect(
+				channel.getFullState().htlcs.get('received-0'),
+				'recorded'
+			).to.not.equal(undefined);
 			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+			expect(
+				channel.getQuiescenceState(),
+				'the handshake stays where it was'
+			).to.equal(QuiescenceState.SENT_STFU);
 		});
 	});
 

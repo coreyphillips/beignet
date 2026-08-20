@@ -144,6 +144,8 @@ export interface ISerializedHtlcEntry {
 	removalLocallyRevoked?: boolean;
 	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
 	forwardEmitted?: boolean;
+	/** Admission-time dust-exposure classification (see IHtlcEntry). */
+	dustExposureFailback?: boolean;
 }
 
 export interface ISerializedHtlcSnapshot {
@@ -189,6 +191,9 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.forwardEmitted !== undefined
 			? { forwardEmitted: e.forwardEmitted }
+			: {}),
+		...(e.dustExposureFailback !== undefined
+			? { dustExposureFailback: e.dustExposureFailback }
 			: {})
 	};
 }
@@ -227,6 +232,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.forwardEmitted !== undefined
 				? { forwardEmitted: s.forwardEmitted }
+				: {}),
+			...(s.dustExposureFailback !== undefined
+				? { dustExposureFailback: s.dustExposureFailback }
 				: {})
 		}
 	};

@@ -450,6 +450,12 @@ export interface INodeConfig {
 	maxPaymentRetries?: number;
 	/** Global HTLC limit across all channels (default 1000) */
 	maxTotalInFlightHtlcs?: number;
+	/**
+	 * BOLT 2 quiescence watchdog window in ms (default 60_000): "MUST
+	 * disconnect after 60 seconds of quiescence if the HTLCs are pending".
+	 * Injectable so tests can shrink it.
+	 */
+	quiescenceTimeoutMs?: number;
 	/** Starting channel key index (for per-channel HD derivation) */
 	nextChannelIndex?: number;
 	/**
