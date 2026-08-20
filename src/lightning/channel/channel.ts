@@ -6613,6 +6613,28 @@ export class Channel {
 		// planned from here would sign a commitment the stored signature does
 		// not cover. The rollback resumes an attempt-aware state, which the
 		// assignment below deliberately overrides: the channel stays failed.
+		this._normalizeV2AttemptForFailure();
+		this._state.state = ChannelState.ERRORED;
+		return true;
+	}
+
+	/**
+	 * The v2 attempt repairs EVERY failure path must run before it makes the
+	 * channel force-closeable. A mid-RBF stale rollback record resumes the
+	 * retained attempt. A recorded-but-unsigned replacement pops back to the
+	 * newest attempt that carries its own signature: the record swap
+	 * re-pointed the funding outpoint at an attempt whose commitment
+	 * signature never arrived while the top-level remoteCommitmentSignature
+	 * still holds the previous attempt's, and prepareForceClose only checks
+	 * that a signature EXISTS, so an un-normalized failure would report a
+	 * successful close while broadcasting a commitment whose witness does
+	 * not verify: a silent no-exit. Nothing of the abandoned replacement can
+	 * reach the chain (our witnesses never left and the peer cannot complete
+	 * it alone; _v2ReplacementAbandonable checks both), exactly as the
+	 * reestablish and tx_abort arms argue. Shared by markErrored and
+	 * _failV2SignatureStage; both override the resumed state afterwards.
+	 */
+	private _normalizeV2AttemptForFailure(): void {
 		if (
 			this._state.state === ChannelState.DUAL_FUNDING_V2 &&
 			this._state.v2InFlight &&
@@ -6620,22 +6642,8 @@ export class Channel {
 		) {
 			this._rollbackToRetainedV2Attempt();
 		} else if (this._v2ReplacementAbandonable()) {
-			// The replacement already RECORDED itself but the peer never
-			// signed it, so the record swap re-pointed the funding outpoint at
-			// an attempt whose commitment signature never arrived while the
-			// top-level remoteCommitmentSignature still holds the previous
-			// attempt's. prepareForceClose only checks that a signature
-			// EXISTS, so the failed channel would report a successful close
-			// while broadcasting a commitment that spends the replacement and
-			// carries a witness which does not verify over it: a silent
-			// no-exit. Nothing of the replacement can reach the chain (our
-			// witnesses never left and the peer cannot complete it alone), so
-			// resume the attempt that does have its own signature, exactly as
-			// the reestablish and tx_abort arms do.
 			this._popToPreviousV2Attempt();
 		}
-		this._state.state = ChannelState.ERRORED;
-		return true;
 	}
 
 	markForReestablish(): void {
@@ -6890,9 +6898,27 @@ export class Channel {
 	 * silently dropped the temp channel at SENT_ACCEPT (issue 393's shape)
 	 * and left an immortal promoted registration with frozen pledges at
 	 * SENT_FUNDING_CREATED (issue 412's shape).
+	 *
+	 * Issue 426 extends the same doctrine to the remaining negotiation
+	 * states. SENT_OPEN mirrors SENT_ACCEPT exactly (the opener parked on an
+	 * accept_channel it can never decode; nothing persisted, no pledges). A
+	 * pre-record DUAL_FUNDING_V2 refusal is wire-visible and scoped to the id
+	 * the peer keys the negotiation by; the default temp cleanup and the
+	 * ERROR-arm pledge hooks unwind it. At or past the v2 signature stage
+	 * (AWAITING_TX_SIGNATURES, or a recorded DUAL_FUNDING_V2 mid-RBF whose
+	 * retained attempt is broadcastable) _failV2SignatureStage picks the
+	 * disposition by broadcastability. Deliberately still bare: the funded
+	 * pre-ready states and AWAITING_REESTABLISH (the peer's own retransmit or
+	 * reconnect heals a garbled message, so the refusal is not permanent and
+	 * a wire failure would kill a recoverable funded channel), SPLICING (the
+	 * disconnect unwind and reestablish splice recovery resolve a wedged
+	 * negotiation; the channel itself is healthy), and the dead states.
 	 */
 	failFromMalformedPeerMessage(reason: string): ChannelAction[] {
-		if (this._state.state === ChannelState.SENT_ACCEPT) {
+		if (
+			this._state.state === ChannelState.SENT_ACCEPT ||
+			this._state.state === ChannelState.SENT_OPEN
+		) {
 			return refuseWithWireError(this._state.temporaryChannelId, reason);
 		}
 		if (this._state.state === ChannelState.SENT_FUNDING_CREATED) {
@@ -6903,6 +6929,21 @@ export class Channel {
 			);
 		}
 		if (
+			this._state.state === ChannelState.DUAL_FUNDING_V2 &&
+			this._state.v2InFlight == null
+		) {
+			return refuseWithWireError(
+				this._state.channelId ?? this._state.temporaryChannelId,
+				reason
+			);
+		}
+		if (
+			this._state.state === ChannelState.AWAITING_TX_SIGNATURES ||
+			this._state.state === ChannelState.DUAL_FUNDING_V2
+		) {
+			return this._failV2SignatureStage(reason);
+		}
+		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING
@@ -6910,6 +6951,47 @@ export class Channel {
 			return [{ type: ChannelActionType.ERROR, message: reason }];
 		}
 		return this._failChannelWithWireError(reason);
+	}
+
+	/**
+	 * Fail a v2 open at or past the signature stage for a peer-held fault (an
+	 * undecodable message, an invalid commitment signature). Wire-visible in
+	 * both dispositions; broadcastability picks the cleanup.
+	 *
+	 * Broadcastable (witnesses left, tx fully signed, or a zero-local-input
+	 * attempt): the peer may broadcast the funding tx without another byte
+	 * from us, so the ERRORED row, the registration and the funding watch all
+	 * survive and the pledges stay frozen. 'none' rather than the default so
+	 * a not-yet-promoted attempt is never deregistered either.
+	 *
+	 * Not broadcastable: the decided teardown, with a BOLT 1 error in place
+	 * of a tx_abort echo, since garbage is not a negotiation message we can
+	 * answer in-protocol. Condemned rides the terminal persist, so the row is
+	 * deletion-owed (startup deletes it instead of restoring), and the
+	 * 'lifecycle' cleanup's pledge release passes hasResumableChannelRow. The
+	 * record is deliberately RETAINED, unlike the recorded tx_abort teardown:
+	 * the wire error's channel:errored ride runs the node's errored handler
+	 * synchronously, and its non-broadcastable guard reads v2InFlight to void
+	 * the channel instead of force-closing into a funding tx that can never
+	 * exist. Clearing the record first blinded that guard and produced a
+	 * fictional FORCE_CLOSED.
+	 */
+	private _failV2SignatureStage(reason: string): ChannelAction[] {
+		// A failure mid-RBF must not persist or close against mixed attempt
+		// state (one attempt's balances with another's outpoint and
+		// signature): resume the internally consistent attempt first, the
+		// same repairs markErrored runs. The broadcastability branch below
+		// then reads the resumed attempt, so an abandonable replacement
+		// backed by a signed previous attempt keeps its row.
+		this._normalizeV2AttemptForFailure();
+		if (this.isV2AttemptBroadcastable()) {
+			return this._failChannelWithWireError(reason, 'none');
+		}
+		this._state.dualFundingSession?.abort();
+		this._state.dualFundingSession = null;
+		this._resetV2Driver();
+		this._state.condemned = true;
+		return this._failChannelWithWireError(reason, 'lifecycle');
 	}
 
 	private _failChannelWithWireError(
@@ -8594,6 +8676,54 @@ export class Channel {
 			];
 		}
 
+		// BOLT 2 tx_complete (issue #423): the reserve rule arms only when a
+		// side ADDS a non-funding output. For a splice-in that is the change
+		// output, whose emission is decided by the same arithmetic
+		// _computeSpliceContributions later uses; the wallet inputs are set
+		// before initiation, so the decision is available up-front, on the
+		// current balance. An exact-input or dust-folded selection adds no
+		// output and stays legal below the reserve.
+		if (relativeSatoshis > 0n && this._spliceInInputs) {
+			const remoteFundingPubkey = this._state.remoteBasepoints?.fundingPubkey;
+			if (remoteFundingPubkey) {
+				let walletTotal = 0n;
+				for (const w of this._spliceInInputs.inputs) {
+					walletTotal += w.value;
+				}
+				const feeSats = spliceFeeSats(
+					estimateSpliceTxWeight({
+						walletInputCount: this._spliceInInputs.inputs.length,
+						fundingScriptLen: createFundingScript(
+							this._state.localBasepoints.fundingPubkey,
+							remoteFundingPubkey
+						).p2wshOutput.length,
+						changeScriptLen: this._spliceInInputs.changeScript.length
+					}),
+					fundingFeeratePerkw || 253
+				);
+				const changeSats = walletTotal - relativeSatoshis - feeSats;
+				const postCapacity = this._state.fundingSatoshis + relativeSatoshis;
+				const reserveSats = v2ReserveWeKeep(
+					postCapacity,
+					this._state.localConfig.dustLimitSatoshis,
+					this._state.remoteConfig.dustLimitSatoshis
+				);
+				const postLocalSats =
+					this._state.localBalanceMsat / 1000n + relativeSatoshis;
+				if (
+					changeSats >= this.spliceInteractiveTxDustFloor() &&
+					postLocalSats < reserveSats
+				) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: `Cannot splice-in: the change output makes this a composition the peer must abort, post-splice balance ${postLocalSats} sats below the channel reserve ${reserveSats} sats at the new capacity; splice in at least enough to clear the reserve`
+						}
+					];
+				}
+			}
+		}
+
 		// Validate splice-out doesn't exceed our balance (cheap to check up-front,
 		// before we quiesce, so we don't STFU only to then fail).
 		if (relativeSatoshis < 0n) {
@@ -8604,6 +8734,27 @@ export class Channel {
 					{
 						type: ChannelActionType.ERROR,
 						message: 'Cannot splice-out: insufficient local balance'
+					}
+				];
+			}
+			// BOLT 2 tx_complete (issue #423): a splice-out adds a destination
+			// output, and a side that adds a non-funding output must end at or
+			// above the reserve the NEW capacity prices, or the peer MUST abort
+			// the negotiation. Refuse up-front rather than burn a quiescence
+			// round on a splice our own tx_complete audit would abort.
+			const postCapacity = this._state.fundingSatoshis + relativeSatoshis;
+			const reserveSats = v2ReserveWeKeep(
+				postCapacity,
+				this._state.localConfig.dustLimitSatoshis,
+				this._state.remoteConfig.dustLimitSatoshis
+			);
+			if (localBalanceSats - withdrawSats < reserveSats) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `Cannot splice-out: post-splice balance ${
+							localBalanceSats - withdrawSats
+						} sats would be below the channel reserve ${reserveSats} sats at the new capacity`
 					}
 				];
 			}
@@ -9001,6 +9152,21 @@ export class Channel {
 				this._state.remoteConfig.dustLimitSatoshis
 			),
 			DUST_LIMIT_SATS
+		);
+	}
+
+	/**
+	 * The reserve a conforming peer may require us to keep at a given capacity
+	 * (v2ReserveWeKeep), derived from the capacity and the two dust limits
+	 * alone. The node's splice preflights price post-splice compositions with
+	 * it: a splice that parks our balance below this while adding a non-funding
+	 * output is one the peer MUST tx_abort (BOLT 2, issue #423).
+	 */
+	spliceReserveWeKeepSats(capacitySats: bigint): bigint {
+		return v2ReserveWeKeep(
+			capacitySats,
+			this._state.localConfig.dustLimitSatoshis,
+			this._state.remoteConfig.dustLimitSatoshis
 		);
 	}
 
@@ -13264,21 +13430,103 @@ export class Channel {
 			if (remoteOwned && !isShared) remoteOutputSats += output.amountSats;
 		}
 
+		let audit: string | null;
 		if (!valuesKnown) {
 			// Cannot audit funds/fees without input values; still enforce weight.
-			return weight > 400_000
-				? `Transaction weight ${weight} exceeds 400000 WU`
-				: null;
+			audit =
+				weight > 400_000
+					? `Transaction weight ${weight} exceeds 400000 WU`
+					: null;
+		} else {
+			audit = validateCompletedInteractiveTx({
+				remoteInputSats,
+				remoteOutputSats,
+				remoteContributionSats,
+				feeSats: totalInSats - totalOutSats,
+				weight,
+				feeratePerKw
+			});
 		}
+		if (audit) return audit;
+		// The BOLT 2 splice reserve rule (issue #423) needs no input values, so
+		// it runs whether or not every prev_tx parsed, and after the existing
+		// refusals so their reason strings win when a tx trips more than one
+		// check.
+		return kind === 'splice'
+			? this._spliceBelowReserveRefusal(outputs, fundingScript, weAreInitiator)
+			: null;
+	}
 
-		return validateCompletedInteractiveTx({
-			remoteInputSats,
-			remoteOutputSats,
-			remoteContributionSats,
-			feeSats: totalInSats - totalOutSats,
-			weight,
-			feeratePerKw
-		});
+	/**
+	 * BOLT 2 tx_complete (splice): the negotiation MUST fail when either side
+	 * has added an output other than the new channel funding output and that
+	 * side's post-splice balance is below the channel reserve priced at the NEW
+	 * capacity (issue #423). Being below reserve on its own is fine; a side
+	 * taking funds OUT of the channel must end up meeting it. Runs at the
+	 * tx_complete audit, BEFORE the splice tx is built (_spliceTx is set later
+	 * by _maybeSendSpliceCommitment), so the split is derived with
+	 * _splicedState's arithmetic from the session and the negotiated outputs.
+	 * The peer's side is judged against v2ReserveWeEnforce (never above what a
+	 * conforming peer computes for itself, so an honest spec-legal splice is
+	 * never aborted) and our own against v2ReserveWeKeep (the most a conforming
+	 * peer may enforce on us), both derived from the new capacity alone: the
+	 * stored reserve is a preflight concern, not a wire-audit one.
+	 */
+	private _spliceBelowReserveRefusal(
+		outputs: IInteractiveTxOutput[],
+		fundingScript: Buffer | null,
+		weAreInitiator: boolean
+	): string | null {
+		const session = this._spliceSession;
+		if (!session || !fundingScript) return null;
+		let newCapacity: bigint | null = null;
+		let weAdded = false;
+		let theyAdded = false;
+		for (const output of outputs) {
+			if (output.scriptPubkey.equals(fundingScript)) {
+				if (newCapacity === null) newCapacity = output.amountSats;
+				continue;
+			}
+			if ((output.serialId % 2n === 0n) !== weAreInitiator) theyAdded = true;
+			else weAdded = true;
+		}
+		// No funding output (the commitment step errors on that) or no
+		// non-funding output on either side: the rule does not arm.
+		if (newCapacity === null || (!weAdded && !theyAdded)) return null;
+		const feeFromChannelSats =
+			this._state.fundingSatoshis +
+			session.getNetCapacityChange() -
+			newCapacity;
+		const myFeeMsat = session.isInitiator() ? feeFromChannelSats * 1000n : 0n;
+		const myNewLocalMsat =
+			this._state.localBalanceMsat +
+			session.getLocalRelativeSatoshis() * 1000n -
+			myFeeMsat;
+		let htlcInFlightMsat = 0n;
+		for (const e of this._state.htlcs.values()) {
+			htlcInFlightMsat += e.amountMsat;
+		}
+		const theirNewMsat =
+			newCapacity * 1000n - myNewLocalMsat - htlcInFlightMsat;
+		const ourDust = this._state.localConfig.dustLimitSatoshis;
+		const peerDust = this._state.remoteConfig.dustLimitSatoshis;
+		if (theyAdded) {
+			const theirReserve = v2ReserveWeEnforce(newCapacity, ourDust, peerDust);
+			if (theirNewMsat < theirReserve * 1000n) {
+				return `splice leaves the peer balance ${
+					theirNewMsat / 1000n
+				} sats below the channel reserve ${theirReserve} sats at the new capacity ${newCapacity} sats`;
+			}
+		}
+		if (weAdded) {
+			const ourReserve = v2ReserveWeKeep(newCapacity, ourDust, peerDust);
+			if (myNewLocalMsat < ourReserve * 1000n) {
+				return `splice leaves our balance ${
+					myNewLocalMsat / 1000n
+				} sats below the channel reserve ${ourReserve} sats at the new capacity ${newCapacity} sats`;
+			}
+		}
+		return null;
 	}
 
 	private _v2NegotiatedTx(): {
@@ -14206,12 +14454,13 @@ export class Channel {
 			0n
 		);
 		if (!valid) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid commitment signature in v2 open'
-				}
-			];
+			// Peer-held fault at the signature stage: wire-visible, with the
+			// disposition picked by broadcastability (issue 426). The bare
+			// ERROR this replaces left a promoted registration behind as a
+			// non-ERRORED zombie the peer was never told about.
+			return this._failV2SignatureStage(
+				'Invalid commitment signature in v2 open'
+			);
 		}
 		this._state.remoteCommitmentSignature = Buffer.from(msg.signature);
 		this._state.remoteHtlcSignatures = [];

@@ -2543,7 +2543,27 @@ export class ChannelManager extends EventEmitter {
 	// ─────────────── Message Handlers ───────────────
 
 	private handleOpenChannel(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeOpenChannelMessage(payload);
+		let msg: ReturnType<typeof decodeOpenChannelMessage>;
+		try {
+			msg = decodeOpenChannelMessage(payload);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			const reason = `Undecodable open_channel: ${detail}`;
+			// No channel exists to fail; refuse the open the way the decoded
+			// refusals below do. The temporary_channel_id sits at 32..64,
+			// after the chain_hash; below 64 bytes there is no id that means
+			// what we would mean by it, so the refusal stays local.
+			if (payload.length >= 64) {
+				this.refuseInboundOpen(
+					peerPubkey,
+					Buffer.from(payload.subarray(32, 64)),
+					reason
+				);
+			} else {
+				this.emitContained('error', null, reason);
+			}
+			return;
+		}
 
 		// BOLT 1 reserves the all-zero channel_id for "all channels with this
 		// peer", so an open under it is unanswerable: every refusal below is
@@ -2648,7 +2668,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleAcceptChannel(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeAcceptChannelMessage(payload);
+		let msg: ReturnType<typeof decodeAcceptChannelMessage>;
+		try {
+			msg = decodeAcceptChannelMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'accept_channel',
+				err
+			);
+			return;
+		}
 		const channel = this.tempChannels.get(
 			msg.temporaryChannelId.toString('hex')
 		);
@@ -2848,7 +2879,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleChannelReady(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeChannelReadyMessage(payload);
+		let msg: ReturnType<typeof decodeChannelReadyMessage>;
+		try {
+			msg = decodeChannelReadyMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'channel_ready',
+				err
+			);
+			return;
+		}
 		// A zero-conf v2 peer sends channel_ready right behind tx_signatures,
 		// while the channel still lives in tempChannels (keyed by its derived
 		// channelId) — fall back to the temp lookup and promote it.
@@ -2866,7 +2908,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleUpdateAddHtlc(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeUpdateAddHtlcMessage(payload);
+		let msg: ReturnType<typeof decodeUpdateAddHtlcMessage>;
+		try {
+			msg = decodeUpdateAddHtlcMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'update_add_htlc',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -2875,7 +2928,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleUpdateFulfillHtlc(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeUpdateFulfillHtlcMessage(payload);
+		let msg: ReturnType<typeof decodeUpdateFulfillHtlcMessage>;
+		try {
+			msg = decodeUpdateFulfillHtlcMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'update_fulfill_htlc',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -2884,7 +2948,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleUpdateFailHtlc(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeUpdateFailHtlcMessage(payload);
+		let msg: ReturnType<typeof decodeUpdateFailHtlcMessage>;
+		try {
+			msg = decodeUpdateFailHtlcMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'update_fail_htlc',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -2896,7 +2971,18 @@ export class ChannelManager extends EventEmitter {
 		peerPubkey: string,
 		payload: Buffer
 	): void {
-		const msg = decodeUpdateFailMalformedHtlcMessage(payload);
+		let msg: ReturnType<typeof decodeUpdateFailMalformedHtlcMessage>;
+		try {
+			msg = decodeUpdateFailMalformedHtlcMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'update_fail_malformed_htlc',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -2942,7 +3028,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleRevokeAndAck(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeRevokeAndAckMessage(payload);
+		let msg: ReturnType<typeof decodeRevokeAndAckMessage>;
+		try {
+			msg = decodeRevokeAndAckMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'revoke_and_ack',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -3004,7 +3101,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleUpdateFeeMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeUpdateFeeMessage(payload);
+		let msg: ReturnType<typeof decodeUpdateFeeMessage>;
+		try {
+			msg = decodeUpdateFeeMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'update_fee',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -3016,7 +3124,18 @@ export class ChannelManager extends EventEmitter {
 		peerPubkey: string,
 		payload: Buffer
 	): void {
-		const msg = decodeUpdateBlockheightMessage(payload);
+		let msg: ReturnType<typeof decodeUpdateBlockheightMessage>;
+		try {
+			msg = decodeUpdateBlockheightMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'update_blockheight',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -3033,10 +3152,12 @@ export class ChannelManager extends EventEmitter {
 	 * shutdown, closing_signed, funding_signed and commitment_signed the
 	 * channel_id, which for a v2 open may still be temp-resident. So the
 	 * channel can be identified and failed with a properly scoped wire
-	 * error. The lookup chain mirrors isForeignChannelMessage, which already
-	 * ownership-screened these types on the same leading bytes even for
-	 * undecodable payloads, so a third party cannot steer this onto someone
-	 * else's channel.
+	 * error. The lookup chain mirrors isForeignChannelMessage, and the owner
+	 * check is repeated here rather than relied on from the pre-screen:
+	 * accept_channel2 is not in OWNED_CHANNEL_MESSAGES (its handler does its
+	 * own owner check, which an undecodable payload never reaches), so a
+	 * third party quoting someone else's id in garbage must be refused HERE
+	 * or it could fail the victim's channel (issue 426).
 	 */
 	private failChannelForUndecodablePayload(
 		peerPubkey: string,
@@ -3054,6 +3175,15 @@ export class ChannelManager extends EventEmitter {
 			: null;
 		if (!channel) {
 			this.emit('error', channelId, `Undecodable ${name}: ${detail}`);
+			return;
+		}
+		const owner = this.findPeerForChannel(channel);
+		if (owner !== undefined && owner !== peerPubkey) {
+			this.emit(
+				'error',
+				channelId,
+				`Ignoring undecodable ${name} for a channel owned by another peer`
+			);
 			return;
 		}
 		this.processActions(
@@ -3836,7 +3966,18 @@ export class ChannelManager extends EventEmitter {
 	 * defense-in-depth CHANNEL_CLOSED strip as the legacy path.
 	 */
 	private handleClosingCompleteMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeClosingCompleteMessage(payload);
+		let msg: ReturnType<typeof decodeClosingCompleteMessage>;
+		try {
+			msg = decodeClosingCompleteMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'closing_complete',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -3928,7 +4069,18 @@ export class ChannelManager extends EventEmitter {
 	 * closing_sig from the peer: we are the CLOSER; broadcast our close tx.
 	 */
 	private handleClosingSigMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeClosingSigMessage(payload);
+		let msg: ReturnType<typeof decodeClosingSigMessage>;
+		try {
+			msg = decodeClosingSigMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'closing_sig',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -4056,7 +4208,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleChannelReestablish(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeChannelReestablishMessage(payload);
+		let msg: ReturnType<typeof decodeChannelReestablishMessage>;
+		try {
+			msg = decodeChannelReestablishMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'channel_reestablish',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 
 		// BOLT 2: reestablish for a channel we consider closed (or never knew)
@@ -4251,7 +4414,13 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleStfu(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeStfuMessage(payload);
+		let msg: ReturnType<typeof decodeStfuMessage>;
+		try {
+			msg = decodeStfuMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(peerPubkey, payload, 'stfu', err);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -4334,7 +4503,13 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleSpliceMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeSpliceMessage(payload);
+		let msg: ReturnType<typeof decodeSpliceMessage>;
+		try {
+			msg = decodeSpliceMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(peerPubkey, payload, 'splice', err);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -4362,7 +4537,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleSpliceAckMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeSpliceAckMessage(payload);
+		let msg: ReturnType<typeof decodeSpliceAckMessage>;
+		try {
+			msg = decodeSpliceAckMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'splice_ack',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -4372,7 +4558,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleSpliceLockedMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeSpliceLockedMessage(payload);
+		let msg: ReturnType<typeof decodeSpliceLockedMessage>;
+		try {
+			msg = decodeSpliceLockedMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'splice_locked',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -4382,7 +4579,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleStartBatchMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeStartBatchMessage(payload);
+		let msg: ReturnType<typeof decodeStartBatchMessage>;
+		try {
+			msg = decodeStartBatchMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'start_batch',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
@@ -4792,7 +5000,25 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleOpenChannel2(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeOpenChannel2Message(payload);
+		let msg: ReturnType<typeof decodeOpenChannel2Message>;
+		try {
+			msg = decodeOpenChannel2Message(payload);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			const reason = `Undecodable open_channel2: ${detail}`;
+			// Same shape as the open_channel guard: the negotiation id sits
+			// at 32..64, after the chain_hash.
+			if (payload.length >= 64) {
+				this.refuseInboundOpen(
+					peerPubkey,
+					Buffer.from(payload.subarray(32, 64)),
+					reason
+				);
+			} else {
+				this.emitContained('error', null, reason);
+			}
+			return;
+		}
 
 		// V2 establishment is conditioned on NEGOTIATED option_dual_fund:
 		// BOTH our advertised vector and the peer's init must carry it, so
@@ -5105,7 +5331,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleAcceptChannel2Msg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeAcceptChannel2Message(payload);
+		let msg: ReturnType<typeof decodeAcceptChannel2Message>;
+		try {
+			msg = decodeAcceptChannel2Message(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'accept_channel2',
+				err
+			);
+			return;
+		}
 		const tempId = msg.channelId.toString('hex');
 		const channel = this.tempChannels.get(tempId);
 		if (!channel) {
@@ -5290,7 +5527,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleTxAddInput(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeTxAddInputMessage(payload);
+		let msg: ReturnType<typeof decodeTxAddInputMessage>;
+		try {
+			msg = decodeTxAddInputMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'tx_add_input',
+				err
+			);
+			return;
+		}
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
 			this.findChannelByChannelIdInTemp(msg.channelId) ||
@@ -5454,7 +5702,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleTxAddOutput(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeTxAddOutputMessage(payload);
+		let msg: ReturnType<typeof decodeTxAddOutputMessage>;
+		try {
+			msg = decodeTxAddOutputMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'tx_add_output',
+				err
+			);
+			return;
+		}
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
 			this.findChannelByChannelIdInTemp(msg.channelId) ||
@@ -5466,7 +5725,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleTxRemoveInput(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeTxRemoveInputMessage(payload);
+		let msg: ReturnType<typeof decodeTxRemoveInputMessage>;
+		try {
+			msg = decodeTxRemoveInputMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'tx_remove_input',
+				err
+			);
+			return;
+		}
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
 			this.findChannelByChannelIdInTemp(msg.channelId) ||
@@ -5478,7 +5748,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleTxRemoveOutput(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeTxRemoveOutputMessage(payload);
+		let msg: ReturnType<typeof decodeTxRemoveOutputMessage>;
+		try {
+			msg = decodeTxRemoveOutputMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'tx_remove_output',
+				err
+			);
+			return;
+		}
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
 			this.findChannelByChannelIdInTemp(msg.channelId) ||
@@ -5490,7 +5771,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleTxCompleteMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeTxCompleteMessage(payload);
+		let msg: ReturnType<typeof decodeTxCompleteMessage>;
+		try {
+			msg = decodeTxCompleteMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'tx_complete',
+				err
+			);
+			return;
+		}
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
 			this.findChannelByChannelIdInTemp(msg.channelId) ||
@@ -5506,7 +5798,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleTxSignaturesMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeTxSignaturesMessage(payload);
+		let msg: ReturnType<typeof decodeTxSignaturesMessage>;
+		try {
+			msg = decodeTxSignaturesMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'tx_signatures',
+				err
+			);
+			return;
+		}
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
 			this.findChannelByChannelIdInTemp(msg.channelId) ||
@@ -5553,7 +5856,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleTxInitRbfMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeTxInitRbfMessage(payload);
+		let msg: ReturnType<typeof decodeTxInitRbfMessage>;
+		try {
+			msg = decodeTxInitRbfMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'tx_init_rbf',
+				err
+			);
+			return;
+		}
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
 			this.findChannelByChannelIdInTemp(msg.channelId) ||
@@ -5565,7 +5879,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleTxAckRbfMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeTxAckRbfMessage(payload);
+		let msg: ReturnType<typeof decodeTxAckRbfMessage>;
+		try {
+			msg = decodeTxAckRbfMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'tx_ack_rbf',
+				err
+			);
+			return;
+		}
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
 			this.findChannelByChannelIdInTemp(msg.channelId) ||
@@ -5577,7 +5902,18 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private handleTxAbortMsg(peerPubkey: string, payload: Buffer): void {
-		const msg = decodeTxAbortMessage(payload);
+		let msg: ReturnType<typeof decodeTxAbortMessage>;
+		try {
+			msg = decodeTxAbortMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'tx_abort',
+				err
+			);
+			return;
+		}
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
 			this.findChannelByChannelIdInTemp(msg.channelId) ||
@@ -5625,7 +5961,18 @@ export class ChannelManager extends EventEmitter {
 		peerPubkey: string,
 		payload: Buffer
 	): void {
-		const msg = decodeAnnouncementSignaturesMessage(payload);
+		let msg: ReturnType<typeof decodeAnnouncementSignaturesMessage>;
+		try {
+			msg = decodeAnnouncementSignaturesMessage(payload);
+		} catch (err) {
+			this.failChannelForUndecodablePayload(
+				peerPubkey,
+				payload,
+				'announcement_signatures',
+				err
+			);
+			return;
+		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) {
 			this.emit('error', null, 'Unknown channel_id in announcement_signatures');

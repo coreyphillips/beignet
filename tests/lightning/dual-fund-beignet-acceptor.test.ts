@@ -45,6 +45,7 @@ import {
 } from '../../src/lightning/channel/splice-weight';
 import { IFundingProvider } from '../../src/lightning/node/types';
 import { MessageType } from '../../src/lightning/message/types';
+import { decodeErrorMessage } from '../../src/lightning/message/error';
 
 // ─────────────── Helpers ───────────────
 
@@ -451,5 +452,169 @@ describe('trusted zero-conf v2 open (dual-funded)', function () {
 		expect(acceptorChannel(h)!.getState()).to.equal(
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
+	});
+});
+
+describe('v2 open decode/signature-stage faults (issue 426)', function () {
+	this.timeout(10_000);
+
+	interface ITamperHarness {
+		mgrA: ChannelManager;
+		mgrB: ChannelManager;
+		sideA: ISide;
+		sideB: ISide;
+		errors: string[];
+		broadcasts: Buffer[];
+		aWire: Array<{ type: number; payload: Buffer }>;
+		bWire: Array<{ type: number; payload: Buffer }>;
+		released: Array<Array<{ txid: string; vout: number }>>;
+		walletInput: ISpliceWalletInput;
+	}
+
+	function makeTamperHarness(
+		tamper: (from: 'A' | 'B', type: number, payload: Buffer) => Buffer
+	): ITamperHarness {
+		const sideA = makeSide();
+		const sideB = makeSide();
+		const mgrA = new ChannelManager(sideA.config);
+		const mgrB = new ChannelManager(sideB.config);
+		const errors: string[] = [];
+		mgrA.on('error', (_id: Buffer | null, msg: string) =>
+			errors.push(`A: ${msg}`)
+		);
+		mgrB.on('error', (_id: Buffer | null, msg: string) =>
+			errors.push(`B: ${msg}`)
+		);
+		const broadcasts: Buffer[] = [];
+		mgrA.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
+		mgrB.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
+		const aWire: Array<{ type: number; payload: Buffer }> = [];
+		const bWire: Array<{ type: number; payload: Buffer }> = [];
+		mgrA.on(
+			'message:outbound',
+			(_peer: string, type: number, payload: Buffer) => {
+				const out = tamper('A', type, payload);
+				aWire.push({ type, payload: out });
+				mgrB.handleMessage(sideA.pubkey, type, out);
+			}
+		);
+		mgrB.on(
+			'message:outbound',
+			(_peer: string, type: number, payload: Buffer) => {
+				const out = tamper('B', type, payload);
+				bWire.push({ type, payload: out });
+				mgrA.handleMessage(sideB.pubkey, type, out);
+			}
+		);
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		const changeScript = bitcoin.payments.p2wpkh({
+			hash: crypto.randomBytes(20)
+		}).output!;
+		const walletInput = makeWalletInput(WALLET_UTXO_SATS);
+		const fundingProvider: IFundingProvider = {
+			buildFundingTransaction: async () => {
+				throw new Error('v1 funding must not run for a v2 open');
+			},
+			broadcastTransaction: async () => 'unused',
+			selectSpliceInputs: async () => ({ inputs: [walletInput], changeScript }),
+			selectMaxDualFundingInputs: async () => ({
+				inputs: [walletInput],
+				changeScript
+			}),
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		mgrA.setFundingProvider(fundingProvider);
+		return {
+			mgrA,
+			mgrB,
+			sideA,
+			sideB,
+			errors,
+			broadcasts,
+			aWire,
+			bWire,
+			released,
+			walletInput
+		};
+	}
+
+	const wireErrorsOf = (
+		wire: Array<{ type: number; payload: Buffer }>
+	): Array<{ channelId: Buffer; data: Buffer }> =>
+		wire
+			.filter((m) => m.type === MessageType.ERROR)
+			.map((m) => decodeErrorMessage(m.payload));
+
+	it('an undecodable tx_add_output refuses the negotiation on the wire and unwinds both sides', async function () {
+		// Pre-record DUAL_FUNDING_V2: the acceptor wire-refuses instead of the
+		// old null-id local error, and the opener's remote-error unwind frees
+		// its pledged wallet input.
+		let cut = false;
+		const h = makeTamperHarness((from, type, payload) => {
+			if (from === 'A' && type === MessageType.TX_ADD_OUTPUT && !cut) {
+				cut = true;
+				return payload.subarray(0, 40);
+			}
+			return payload;
+		});
+		h.mgrA.createDualFundedChannel(h.sideB.pubkey, openerParams(h.sideA));
+
+		await settle(() => wireErrorsOf(h.bWire).length > 0);
+		const refusals = wireErrorsOf(h.bWire);
+		expect(refusals, 'acceptor refused on the wire').to.have.length(1);
+		expect(refusals[0].data.toString('ascii')).to.contain(
+			'Undecodable tx_add_output'
+		);
+		expect(
+			refusals[0].channelId.some((b) => b !== 0),
+			'refusal carries a real id'
+		).to.equal(true);
+		expect(acceptorChannel(h), 'acceptor deregistered').to.equal(undefined);
+
+		// The opener received the error and released its pledge.
+		await settle(() => h.released.length > 0);
+		expect(h.released.length, 'opener pledge released').to.be.greaterThan(0);
+		expect(h.broadcasts, 'nothing broadcast').to.have.length(0);
+	});
+
+	it('an invalid v2 commitment_signed tears the open down on the wire with a condemned row', async function () {
+		// The signature-stage arm: before the fix the invalid-sig refusal was
+		// a bare local ERROR that left a promoted registration behind as a
+		// non-ERRORED zombie the peer was never told about.
+		const h = makeTamperHarness((from, type, payload) => {
+			if (from === 'B' && type === MessageType.COMMITMENT_SIGNED) {
+				const p = Buffer.from(payload);
+				p[40] ^= 0xff;
+				return p;
+			}
+			return payload;
+		});
+		const chA = h.mgrA.createDualFundedChannel(
+			h.sideB.pubkey,
+			openerParams(h.sideA)
+		);
+
+		await settle(() => wireErrorsOf(h.aWire).length > 0);
+		const sent = wireErrorsOf(h.aWire);
+		expect(sent.length, 'opener failed the open on the wire').to.equal(1);
+		expect(sent[0].data.toString('ascii')).to.contain(
+			'Invalid commitment signature in v2 open'
+		);
+		// Nothing broadcastable existed: session gone, row condemned,
+		// registration removed, pledge freed. The record itself is retained
+		// so a node's errored handler can recognize the non-broadcastable
+		// attempt and void rather than force-close.
+		expect(chA.getState()).to.equal(ChannelState.ERRORED);
+		expect(chA.getFullState().condemned).to.equal(true);
+		expect(
+			chA.getFullState().v2InFlight,
+			'record retained for the errored-handler void guard'
+		).to.not.equal(null);
+		expect(h.mgrA.listChannels()).to.have.length(0);
+		await settle(() => h.released.length > 0);
+		expect(h.released.length, 'opener pledge released').to.be.greaterThan(0);
+		expect(h.broadcasts, 'nothing broadcast').to.have.length(0);
 	});
 });
