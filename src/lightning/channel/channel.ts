@@ -6890,9 +6890,27 @@ export class Channel {
 	 * silently dropped the temp channel at SENT_ACCEPT (issue 393's shape)
 	 * and left an immortal promoted registration with frozen pledges at
 	 * SENT_FUNDING_CREATED (issue 412's shape).
+	 *
+	 * Issue 426 extends the same doctrine to the remaining negotiation
+	 * states. SENT_OPEN mirrors SENT_ACCEPT exactly (the opener parked on an
+	 * accept_channel it can never decode; nothing persisted, no pledges). A
+	 * pre-record DUAL_FUNDING_V2 refusal is wire-visible and scoped to the id
+	 * the peer keys the negotiation by; the default temp cleanup and the
+	 * ERROR-arm pledge hooks unwind it. At or past the v2 signature stage
+	 * (AWAITING_TX_SIGNATURES, or a recorded DUAL_FUNDING_V2 mid-RBF whose
+	 * retained attempt is broadcastable) _failV2SignatureStage picks the
+	 * disposition by broadcastability. Deliberately still bare: the funded
+	 * pre-ready states and AWAITING_REESTABLISH (the peer's own retransmit or
+	 * reconnect heals a garbled message, so the refusal is not permanent and
+	 * a wire failure would kill a recoverable funded channel), SPLICING (the
+	 * disconnect unwind and reestablish splice recovery resolve a wedged
+	 * negotiation; the channel itself is healthy), and the dead states.
 	 */
 	failFromMalformedPeerMessage(reason: string): ChannelAction[] {
-		if (this._state.state === ChannelState.SENT_ACCEPT) {
+		if (
+			this._state.state === ChannelState.SENT_ACCEPT ||
+			this._state.state === ChannelState.SENT_OPEN
+		) {
 			return refuseWithWireError(this._state.temporaryChannelId, reason);
 		}
 		if (this._state.state === ChannelState.SENT_FUNDING_CREATED) {
@@ -6903,6 +6921,21 @@ export class Channel {
 			);
 		}
 		if (
+			this._state.state === ChannelState.DUAL_FUNDING_V2 &&
+			this._state.v2InFlight == null
+		) {
+			return refuseWithWireError(
+				this._state.channelId ?? this._state.temporaryChannelId,
+				reason
+			);
+		}
+		if (
+			this._state.state === ChannelState.AWAITING_TX_SIGNATURES ||
+			this._state.state === ChannelState.DUAL_FUNDING_V2
+		) {
+			return this._failV2SignatureStage(reason);
+		}
+		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING
@@ -6910,6 +6943,36 @@ export class Channel {
 			return [{ type: ChannelActionType.ERROR, message: reason }];
 		}
 		return this._failChannelWithWireError(reason);
+	}
+
+	/**
+	 * Fail a v2 open at or past the signature stage for a peer-held fault (an
+	 * undecodable message, an invalid commitment signature). Wire-visible in
+	 * both dispositions; broadcastability picks the cleanup.
+	 *
+	 * Broadcastable (witnesses left, tx fully signed, or a zero-local-input
+	 * attempt): the peer may broadcast the funding tx without another byte
+	 * from us, so the ERRORED row, the registration and the funding watch all
+	 * survive and the pledges stay frozen. 'none' rather than the default so
+	 * a not-yet-promoted attempt is never deregistered either.
+	 *
+	 * Not broadcastable: the same decided teardown as the recorded tx_abort
+	 * arm (handleTxAbort's terminal branch), with a BOLT 1 error in place of
+	 * the tx_abort echo, since garbage is not a negotiation message we can
+	 * answer in-protocol. Condemned rides the terminal persist, so the row is
+	 * deletion-owed (startup deletes it instead of restoring), and the
+	 * 'lifecycle' cleanup's pledge release passes hasResumableChannelRow.
+	 */
+	private _failV2SignatureStage(reason: string): ChannelAction[] {
+		if (this.isV2AttemptBroadcastable()) {
+			return this._failChannelWithWireError(reason, 'none');
+		}
+		this._state.v2InFlight = null;
+		this._state.dualFundingSession?.abort();
+		this._state.dualFundingSession = null;
+		this._resetV2Driver();
+		this._state.condemned = true;
+		return this._failChannelWithWireError(reason, 'lifecycle');
 	}
 
 	private _failChannelWithWireError(
@@ -13376,7 +13439,8 @@ export class Channel {
 		for (const e of this._state.htlcs.values()) {
 			htlcInFlightMsat += e.amountMsat;
 		}
-		const theirNewMsat = newCapacity * 1000n - myNewLocalMsat - htlcInFlightMsat;
+		const theirNewMsat =
+			newCapacity * 1000n - myNewLocalMsat - htlcInFlightMsat;
 		const ourDust = this._state.localConfig.dustLimitSatoshis;
 		const peerDust = this._state.remoteConfig.dustLimitSatoshis;
 		if (theyAdded) {
@@ -14323,12 +14387,13 @@ export class Channel {
 			0n
 		);
 		if (!valid) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid commitment signature in v2 open'
-				}
-			];
+			// Peer-held fault at the signature stage: wire-visible, with the
+			// disposition picked by broadcastability (issue 426). The bare
+			// ERROR this replaces left a promoted registration behind as a
+			// non-ERRORED zombie the peer was never told about.
+			return this._failV2SignatureStage(
+				'Invalid commitment signature in v2 open'
+			);
 		}
 		this._state.remoteCommitmentSignature = Buffer.from(msg.signature);
 		this._state.remoteHtlcSignatures = [];

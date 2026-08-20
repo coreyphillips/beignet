@@ -237,9 +237,7 @@ describe('LightningNode splice validation', function () {
 		// 80k leaves ~19_816 sats, above the ~9_198-sat derived bound: this
 		// arm admits it (whatever can still fail later is never this arm).
 		const admitted = node.spliceOut(channelId, 80_000n, 253);
-		expect(admitted.error ?? '').to.not.include(
-			'insufficient channel balance'
-		);
+		expect(admitted.error ?? '').to.not.include('insufficient channel balance');
 		node.destroy();
 	});
 

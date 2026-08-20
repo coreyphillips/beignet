@@ -3447,10 +3447,8 @@ describe('Splice', function () {
 			const err = findAction(actions, ChannelActionType.ERROR);
 			expect(err, 'refused up-front').to.exist;
 			expect(err.message).to.match(/below the channel reserve/);
-			expect(
-				findSendAction(actions, MessageType.STFU),
-				'no quiescence started'
-			).to.not.exist;
+			expect(findSendAction(actions, MessageType.STFU), 'no quiescence started')
+				.to.not.exist;
 		});
 
 		it('refuses our own composition when our change output sits below the reserve (issue #423)', function () {

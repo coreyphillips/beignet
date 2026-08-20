@@ -26,11 +26,19 @@ import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG
 } from '../../src/lightning/channel/types';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import {
+	ChannelActionType,
+	IErrorAction,
+	ISendMessageAction
+} from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { decodeErrorMessage } from '../../src/lightning/message/error';
+import {
+	createOpenerState,
+	IV2InFlight
+} from '../../src/lightning/channel/channel-state';
 
 const sha256 = (b: Buffer): Buffer =>
 	crypto.createHash('sha256').update(b).digest();
@@ -437,5 +445,215 @@ describe('wire error + channel failure on peer protocol violations', function ()
 				)
 			).to.equal(false);
 		});
+	});
+});
+
+describe('undecodable-payload decode guards (issue 426)', function () {
+	it('an undecodable update_add_htlc fails the channel on the wire', function () {
+		// The truncated payload throws in the decoder; the guard must route it
+		// through failFromMalformedPeerMessage instead of the dispatcher catch.
+		const t = makePair('undecodable-add');
+		t.corruptNext(MessageType.UPDATE_ADD_HTLC, (p) => p.subarray(0, 40));
+		t.A.addHtlc(
+			t.channelId,
+			1_000_000n,
+			sha256(crypto.randomBytes(32)),
+			900,
+			Buffer.alloc(1366)
+		);
+
+		const wireErrors = wireErrorsIn(t.toA);
+		expect(wireErrors.length, 'wire error sent').to.be.greaterThan(0);
+		expect(wireErrors.join('; ')).to.contain('Undecodable update_add_htlc');
+		expect(t.bChannel.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('an undecodable revoke_and_ack (truncated TLV) fails the channel on the wire', function () {
+		// The TLV-stream decoder class: a suffix declaring 98 bytes with 1
+		// present throws after the fixed fields parsed.
+		const t = makePair('undecodable-revoke');
+		t.corruptNext(MessageType.REVOKE_AND_ACK, (p) =>
+			Buffer.concat([p, Buffer.from([0x02, 0x62, 0x01])])
+		);
+		t.A.addHtlc(
+			t.channelId,
+			1_000_000n,
+			sha256(crypto.randomBytes(32)),
+			900,
+			Buffer.alloc(1366)
+		);
+
+		const wireErrors = wireErrorsIn(t.toA);
+		expect(wireErrors.length, 'wire error sent').to.be.greaterThan(0);
+		expect(wireErrors.join('; ')).to.contain('Undecodable revoke_and_ack');
+		expect(t.bChannel.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('an undecodable channel_reestablish leaves the channel recoverable', function () {
+		// The argued carve-out: a garbled reestablish is healed by the peer's
+		// own retry (every reconnect mints a fresh one), so the refusal is not
+		// permanent and must NOT wire-fail a funded recoverable channel.
+		const t = makePair('undecodable-reestablish');
+		const aPub = getPublicKey(
+			makeConfig('undecodable-reestablish-A').nodePrivateKey!
+		).toString('hex');
+		const bPub = getPublicKey(
+			makeConfig('undecodable-reestablish-B').nodePrivateKey!
+		).toString('hex');
+		t.A.handlePeerDisconnected(bPub);
+		t.B.handlePeerDisconnected(aPub);
+		expect(t.bChannel.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+
+		const wireBefore = wireErrorsIn(t.toA).length;
+		t.B.handleMessage(
+			aPub,
+			MessageType.CHANNEL_REESTABLISH,
+			Buffer.concat([t.channelId, Buffer.alloc(8)])
+		);
+		expect(wireErrorsIn(t.toA).length, 'no wire error').to.equal(wireBefore);
+		expect(t.bChannel.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+		expect(t.B.getChannelsByPeer(aPub), 'still registered').to.have.length(1);
+
+		// A decoded retry heals the side that received the garbage.
+		t.A.handlePeerReconnected(bPub);
+		expect(t.bChannel.getState()).to.equal(ChannelState.NORMAL);
+	});
+
+	it("a third party's undecodable accept_channel2 cannot fail the victim's channel", function () {
+		// accept_channel2 is not pre-screened by isForeignChannelMessage, so
+		// the ownership check must live inside failChannelForUndecodablePayload
+		// or garbage quoting a victim's id would fail that channel.
+		const t = makePair('third-party-accept2');
+		const charlie = getPublicKey(sha256(Buffer.from('charlie-node'))).toString(
+			'hex'
+		);
+		const before = t.errors.length;
+		t.B.handleMessage(
+			charlie,
+			MessageType.ACCEPT_CHANNEL2,
+			Buffer.concat([t.channelId, Buffer.alloc(4)])
+		);
+		expect(t.bChannel.getState(), 'victim channel intact').to.equal(
+			ChannelState.NORMAL
+		);
+		expect(wireErrorsIn(t.toA), 'nothing sent to the owner').to.have.length(0);
+		expect(t.errors.slice(before).join('; ')).to.contain(
+			'Ignoring undecodable accept_channel2'
+		);
+	});
+
+	function makeV2SigStageChannel(): Channel {
+		const cfg = makeConfig('v2-sig-stage');
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: cfg.localBasepoints,
+			localPerCommitmentSeed: cfg.localPerCommitmentSeed
+		});
+		state.state = ChannelState.AWAITING_TX_SIGNATURES;
+		state.channelId = crypto.randomBytes(32);
+		state.fundingVersion = 2;
+		return new Channel(state);
+	}
+
+	function makeV2Record(): IV2InFlight {
+		return {
+			fundingTxid: crypto.randomBytes(32),
+			fundingOutputIndex: 0,
+			fundingTxHex: 'aa',
+			fullySigned: false,
+			isInitiator: true,
+			localContributionSats: 150_000n,
+			remoteContributionSats: 0n,
+			fundingFeeratePerkw: 1000,
+			weSignFirst: false,
+			ourWitnesses: [[Buffer.alloc(64)]],
+			ourWalletInputIndices: [0],
+			inputPrevouts: [],
+			remoteCommitmentSig: null,
+			sentTxSignatures: false,
+			receivedTxSignatures: false,
+			confirmed: false,
+			rbfAttempt: 0
+		};
+	}
+
+	it('a broadcastable v2 signature-stage fault keeps the ERRORED row and the record', function () {
+		// The peer may broadcast without another byte from us: the row, the
+		// registration and the record must all survive (cleanup 'none'), and
+		// the row is NOT condemned.
+		const channel = makeV2SigStageChannel();
+		channel.getFullState().v2InFlight = makeV2Record();
+		channel.getFullState().pendingFundingTxHex = 'aa';
+		expect(channel.isV2AttemptBroadcastable()).to.equal(true);
+
+		const actions = channel.failFromMalformedPeerMessage(
+			'Undecodable tx_signatures: boom'
+		);
+		expect(actions[0].type).to.equal(ChannelActionType.PERSIST_STATE);
+		const send = actions.find(
+			(a) => a.type === ChannelActionType.SEND_MESSAGE
+		) as ISendMessageAction | undefined;
+		expect(send, 'wire error sent').to.exist;
+		expect(send!.messageType).to.equal(MessageType.ERROR);
+		expect(
+			decodeErrorMessage(send!.payload).channelId.equals(
+				channel.getChannelId()!
+			)
+		).to.equal(true);
+		const local = actions.find((a) => a.type === ChannelActionType.ERROR) as
+			| IErrorAction
+			| undefined;
+		expect(local!.cleanup, 'registration survives').to.equal('none');
+		expect(channel.getState()).to.equal(ChannelState.ERRORED);
+		expect(channel.getFullState().condemned).to.not.equal(true);
+		expect(channel.getFullState().v2InFlight, 'record retained').to.not.equal(
+			null
+		);
+	});
+
+	it('a non-broadcastable v2 signature-stage fault tears the open down condemned', function () {
+		// Nothing anyone can broadcast: the decided teardown of the recorded
+		// tx_abort arm, wire-visible, condemned in the same persist so the
+		// pledge release passes the durable-row probe.
+		const channel = makeV2SigStageChannel();
+		channel.getFullState().v2InFlight = makeV2Record();
+		expect(channel.isV2AttemptBroadcastable()).to.equal(false);
+
+		const actions = channel.failFromMalformedPeerMessage(
+			'Undecodable commitment_signed: boom'
+		);
+		expect(actions[0].type).to.equal(ChannelActionType.PERSIST_STATE);
+		const send = actions.find(
+			(a) => a.type === ChannelActionType.SEND_MESSAGE
+		) as ISendMessageAction | undefined;
+		expect(send, 'wire error sent').to.exist;
+		expect(send!.messageType).to.equal(MessageType.ERROR);
+		const local = actions.find((a) => a.type === ChannelActionType.ERROR) as
+			| IErrorAction
+			| undefined;
+		expect(local!.cleanup).to.equal('lifecycle');
+		expect(channel.getState()).to.equal(ChannelState.ERRORED);
+		expect(channel.getFullState().condemned).to.equal(true);
+		expect(channel.getFullState().v2InFlight).to.equal(null);
+	});
+
+	it('a SPLICING channel keeps the bare local refusal (argued carve-out)', function () {
+		// A wedged splice negotiation resolves through the disconnect unwind
+		// and reestablish recovery; the channel itself is healthy and funded,
+		// so garbage mid-splice must not wire-fail it.
+		const channel = makeV2SigStageChannel();
+		channel.getFullState().fundingVersion = 1;
+		channel.getFullState().v2InFlight = null;
+		channel.getFullState().state = ChannelState.SPLICING;
+
+		const actions = channel.failFromMalformedPeerMessage(
+			'Undecodable tx_add_input: boom'
+		);
+		expect(actions).to.have.length(1);
+		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+		expect(channel.getState()).to.equal(ChannelState.SPLICING);
 	});
 });

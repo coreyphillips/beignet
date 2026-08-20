@@ -1489,6 +1489,105 @@ describe('Channel Manager', function () {
 			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
 		});
 
+		it('an undecodable accept_channel refuses the open on the wire and drops the temp channel (issue 426)', async function () {
+			// The opener parked at SENT_OPEN used to hit the bare default arm:
+			// the codec throw died as a null-id local error, the temp channel
+			// was silently dropped and the peer kept waiting on a funding that
+			// would never come (the issue 393 shape one message earlier).
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			alice.on('error', () => undefined);
+			bob.on('error', () => undefined);
+
+			const queue: Array<() => void> = [];
+			const drain = async (): Promise<void> => {
+				while (queue.length) queue.shift()!();
+				await new Promise((r) => setImmediate(r));
+			};
+			const aliceWire: Array<{ type: number; payload: Buffer }> = [];
+			alice.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== bobPubkey) return;
+					aliceWire.push({ type, payload });
+					queue.push(() => bob.handleMessage(alicePubkey, type, payload));
+				}
+			);
+			bob.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== alicePubkey) return;
+					const tampered =
+						type === MessageType.ACCEPT_CHANNEL
+							? // TLV type 2 declaring 98 bytes with only 1 present.
+							  Buffer.concat([payload, Buffer.from([0x02, 0x62, 0x01])])
+							: payload;
+					queue.push(() => alice.handleMessage(bobPubkey, type, tampered));
+				}
+			);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			const tempId = channel.getTemporaryChannelId();
+			await drain();
+
+			// The peer was told, scoped to the temporary id.
+			const wireErrors = aliceWire
+				.filter((m) => m.type === MessageType.ERROR)
+				.map((m) => decodeErrorMessage(m.payload));
+			expect(wireErrors, 'exactly one wire error').to.have.length(1);
+			expect(wireErrors[0].channelId.equals(tempId)).to.equal(true);
+			expect(wireErrors[0].data.toString('ascii')).to.contain(
+				'Undecodable accept_channel'
+			);
+			expect(alice.getTempChannel(tempId)).to.equal(undefined);
+			expect(alice.listChannels()).to.have.length(0);
+			// Nothing was ever persisted at SENT_OPEN, so nothing may start
+			// being: same no-ERRORED-row rule as the other pre-funding arms.
+			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+		});
+
+		it('an undecodable open_channel is refused scoped to the id at bytes 32..64 (issue 426)', function () {
+			const bob = new ChannelManager(makeConfig(2));
+			bob.on('error', () => undefined);
+			const wire: Array<{ type: number; payload: Buffer }> = [];
+			bob.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== alicePubkey) return;
+					wire.push({ type, payload });
+				}
+			);
+
+			// 64 bytes of garbage: chain_hash at 0..32, the id the opener keys
+			// the negotiation by at 32..64. The decoder throws on the length.
+			const tempId = crypto.randomBytes(32);
+			bob.handleMessage(
+				alicePubkey,
+				MessageType.OPEN_CHANNEL,
+				Buffer.concat([crypto.randomBytes(32), tempId])
+			);
+			const wireErrors = wire
+				.filter((m) => m.type === MessageType.ERROR)
+				.map((m) => decodeErrorMessage(m.payload));
+			expect(wireErrors, 'exactly one wire error').to.have.length(1);
+			expect(wireErrors[0].channelId.equals(tempId)).to.equal(true);
+			expect(wireErrors[0].data.toString('ascii')).to.contain(
+				'Undecodable open_channel'
+			);
+
+			// Below 64 bytes there is no id that means what we would mean by
+			// it: the refusal stays local.
+			const before = wire.length;
+			bob.handleMessage(
+				alicePubkey,
+				MessageType.OPEN_CHANNEL,
+				Buffer.alloc(40)
+			);
+			expect(wire.length, 'nothing sent for a sub-64-byte payload').to.equal(
+				before
+			);
+		});
+
 		it('an error quoting the TEMPORARY id fails the promoted channel, owner only (issue 412)', async function () {
 			// A refusal of funding_created quotes the temporary id (the only id
 			// that message carries), but with queued transport it lands after
