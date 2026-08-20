@@ -11128,6 +11128,18 @@ export class Channel {
 		if (spliceHalf) {
 			const spliced = this._splicedState(candidate);
 			if (spliced) {
+				// An update the NEW capacity cannot fund derives a negative
+				// balance: the remainder invariant (local + remote + htlcs =
+				// capacity) then puts more value in outputs than the spliced
+				// funding holds, and the builder happily emits e.g. an
+				// untrimmed HTLC output larger than the funding — a
+				// consensus-invalid commitment an output-count check alone
+				// accepts. With both derived balances non-negative the same
+				// invariant bounds every output combination by the capacity,
+				// so this is the complete underfunding check.
+				if (spliced.localBalanceMsat < 0n || spliced.remoteBalanceMsat < 0n) {
+					return `Update would overdraw the ${spliced.fundingSatoshis}-sat pending-splice capacity`;
+				}
 				return emptyRefusal(spliced, 'pending-splice commitment');
 			}
 		}

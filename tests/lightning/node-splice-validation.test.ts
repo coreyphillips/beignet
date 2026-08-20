@@ -216,6 +216,22 @@ describe('LightningNode splice validation', function () {
 		expect(atFloor.error ?? '').to.not.include('negotiated dust floor');
 		node.destroy();
 	});
+
+	it('admits a splice-out exactly at the default 546-sat floor (issue #389)', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		// The interactive-tx builder accepts an output AT the floor, so both
+		// preflights must too: the generic arm is strict (< 546) and, on a
+		// default-dust channel, the negotiated floor IS 546. Anything that
+		// still fails later is never a dust arm.
+		const atFloor = node.spliceOut(channelId, 546n, 253);
+		expect(atFloor.error ?? '').to.not.include('dust floor');
+		// One below stays refused.
+		const below = node.spliceOut(channelId, 545n, 253);
+		expect(below.ok).to.be.false;
+		expect(below.error).to.include('below the dust floor');
+		node.destroy();
+	});
 });
 
 describe('LightningNode peerSupportsSplicing', function () {

@@ -8928,6 +8928,23 @@ describe('Splice', function () {
 				);
 			});
 
+			it('refuses an inbound add the pending-splice capacity cannot fund', function () {
+				const { acceptorChannel } = pendingLockSpliceOutPair(900n);
+				// A 1000-sat add exceeds the 900-sat spliced capacity outright:
+				// the remainder derivation leaves a NEGATIVE to_remote, and the
+				// untrimmed 1000-sat HTLC output would spend more than the new
+				// funding holds — a consensus-invalid commitment. The live view
+				// (to_remote ~989k sats) admits it easily, and an output-count
+				// check alone would too, since the HTLC output survives.
+				const actions = acceptorChannel.handleUpdateAddHtlc(
+					inboundAdd(acceptorChannel, 1_000_000n)
+				);
+				expect(errorOf(actions)).to.match(/pending-splice capacity/);
+				expect(findSendAction(actions, MessageType.ERROR)).to.exist;
+				// And the refusal wrote nothing.
+				expect(acceptorChannel.getFullState().htlcs.size).to.equal(0);
+			});
+
 			it('admits an add whose HTLC output survives the pending-splice commitment', function () {
 				const { acceptorChannel } = pendingLockSpliceOutPair(900n);
 				// 600 sats clears the 531-sat trim threshold, so the spliced
