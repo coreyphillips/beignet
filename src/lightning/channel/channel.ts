@@ -4506,7 +4506,22 @@ export class Channel {
 			this._state.channelType
 		);
 		const reserveMsat = this._state.remoteConfig.channelReserveSatoshis * 1000n;
-		if (newCost * 1000n > this._state.localBalanceMsat - reserveMsat) {
+		let headroomMsat = this._state.localBalanceMsat - reserveMsat;
+		// While a splice awaits its lock the fee round mirrors onto the pending
+		// funding too, whose balance AND reserve both differ (a splice-out's
+		// candidate has less to spend; the pending capacity prices its own
+		// reserve). Bind on whichever view affords less, exactly as
+		// getSpendableOutboundMsat does for adds.
+		const pendingBalanceMsat = this.getPendingSpliceLocalBalanceMsat();
+		const pendingReserveSats = this._pendingSpliceKeptReserveSats();
+		if (pendingBalanceMsat !== null && pendingReserveSats !== null) {
+			const pendingHeadroomMsat =
+				pendingBalanceMsat - pendingReserveSats * 1000n;
+			if (pendingHeadroomMsat < headroomMsat) {
+				headroomMsat = pendingHeadroomMsat;
+			}
+		}
+		if (newCost * 1000n > headroomMsat) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -7595,8 +7610,8 @@ export class Channel {
 	}
 
 	/**
-	 * Raise the reserve a v2 row KEEPS for itself to what its capacity prices,
-	 * on load (issue #387).
+	 * Raise the reserve a v2 or spliced row KEEPS for itself to what its
+	 * capacity prices, on load (issues #387, #382).
 	 *
 	 * The mirror of repairEnforcedChannelReserve, in the opposite direction and
 	 * for the opposite reason. remoteConfig.channelReserveSatoshis is what the
@@ -7614,13 +7629,19 @@ export class Channel {
 	 * one visible cost is that as the opener of a small legacy row our own
 	 * updateFee can now self-refuse against the larger reserve.
 	 *
-	 * v2 only. A v1 reserve was negotiated on the wire and stored verbatim, so
-	 * there is nothing to re-derive and no ambiguity to resolve; re-pricing a
-	 * SPLICED row's kept reserve at its new capacity is issue #382, which the
-	 * splice adoption tail defers for the same reason. And v2ReserveWeKeep is at
-	 * or above what eclair (max(1%, a dust limit)) and CLN (max(1%, the opener's
-	 * dust limit)) each require of us at any dust pairing, so raising to it can
-	 * never overshoot a conforming peer.
+	 * v2 rows and SPLICED rows, the same branch rule as reserveWeEnforceAt. An
+	 * unspliced v1 reserve was negotiated on the wire and stored verbatim, so
+	 * there is nothing to re-derive and no ambiguity to resolve. A spliced row
+	 * of either version is different (issue #382): eclair re-derives both
+	 * reserves from the new capacity once fundingTxIndex > 0, v1 included, so
+	 * after a splice-in the peer may be enforcing more against us than the row
+	 * kept. The splice adoption tail now raises the kept reserve at every
+	 * adoption; this covers rows whose splice adopted BEFORE that existed. And
+	 * v2ReserveWeKeep is at or above what eclair (max(1%, a dust limit)) and
+	 * CLN (max(1%, the opener's dust limit)) each require of us at any dust
+	 * pairing and any splice history (CLN never re-prices across a splice, so
+	 * what it enforces is bounded by the max() this composes with), so raising
+	 * to it can never overshoot a conforming peer.
 	 *
 	 * Not gated on channelReserveVersion: that stamp records the provenance of
 	 * the reserve we ENFORCE, negotiated versus never written, which says
@@ -7631,7 +7652,9 @@ export class Channel {
 	 * reserves for the active attempt.
 	 */
 	repairKeptChannelReserve(): void {
-		if (this._state.fundingVersion !== 2) return;
+		if (this._state.fundingVersion !== 2 && !this._state.spliceFundingTxid) {
+			return;
+		}
 		if (this._state.fundingSatoshis <= 0n) return;
 		if (this._state.v2InFlight || this._state.v2PreviousAttempts?.length) {
 			return;
@@ -8154,12 +8177,21 @@ export class Channel {
 		// missed our channel_ready — retransmit REGARDLESS of our local state
 		// (we may already have advanced to NORMAL). The local-state condition
 		// is kept as a belt-and-braces fallback for peers that omit the field
-		// semantics (pre-ready states always retransmit).
+		// semantics (pre-ready states always retransmit). Skipped when a
+		// channel_ready is already queued: the v2 parked-confirmation flush
+		// above runs fundingConfirmed, whose fresh send is byte-identical to
+		// this replay, and without the skip one reestablish put both on the
+		// wire (issue #421).
 		if (
 			this._state.localChannelReady &&
 			(msg.nextCommitmentNumber === 1n ||
 				this._state.state === ChannelState.AWAITING_CHANNEL_READY ||
-				this._state.state === ChannelState.AWAITING_FUNDING_CONFIRMED)
+				this._state.state === ChannelState.AWAITING_FUNDING_CONFIRMED) &&
+			!actions.some(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					a.messageType === MessageType.CHANNEL_READY
+			)
 		) {
 			const secondPoint = getPerCommitmentPoint(
 				this._state.localPerCommitmentSeed,
@@ -9867,6 +9899,36 @@ export class Channel {
 	}
 
 	/**
+	 * The reserve WE must keep on the pending splice funding, or null when no
+	 * splice is past its point of no return. BOLT 2 prices the reserve at
+	 * current capacity and eclair derives it per funding candidate, validating
+	 * every update against ALL active commitments, so during the pending-lock
+	 * window (updates resume after tx_signatures, before splice_locked) the
+	 * pending view binds at the reserve the PENDING capacity prices — on a
+	 * peer-funded splice-in the stored value is priced at the smaller old
+	 * capacity and admits sends eclair rejects against the new commitment.
+	 * Floored at the stored value, never below it: CLN never re-prices across
+	 * a splice, so on a splice-out it keeps enforcing the reserve priced at
+	 * the ORIGINAL capacity against both views. Same record-first sourcing as
+	 * getPendingSpliceLocalBalanceMsat so a restored session (no in-memory
+	 * splice state) prices from the persisted point-of-no-return record.
+	 */
+	private _pendingSpliceKeptReserveSats(): bigint | null {
+		if (!this._state.spliceInFlight) return null;
+		const pendingCapacity =
+			this._splicedState()?.fundingSatoshis ??
+			this._state.spliceInFlight.newFundingSatoshis;
+		return bigIntMax(
+			this._state.remoteConfig.channelReserveSatoshis,
+			v2ReserveWeKeep(
+				pendingCapacity,
+				this._state.localConfig.dustLimitSatoshis,
+				this._state.remoteConfig.dustLimitSatoshis
+			)
+		);
+	}
+
+	/**
 	 * A conservative ceiling on the outbound HTLC value this channel can add
 	 * right now, in msat: local balance minus the reserve the peer requires,
 	 * minus (for the opener) the commitment fee with one more HTLC. This is
@@ -9883,13 +9945,19 @@ export class Channel {
 	 *
 	 * While a splice awaits its lock, every update is mirrored onto BOTH
 	 * commitments (current funding + pending splice funding), so the
-	 * constraint is the minimum across the live and pending-splice local
-	 * balances: a splice-out's candidate commitment has less to spend, and an
-	 * HTLC the live commitment could afford would make the spliced one
-	 * unbuildable.
+	 * constraint is the minimum across the live and pending-splice VIEWS,
+	 * each priced with its own reserve: a splice-out's candidate commitment
+	 * has less to spend, and a splice-in's candidate commitment keeps a
+	 * larger reserve (the pending capacity prices it, and eclair validates
+	 * every update against all active commitments), so an HTLC the live
+	 * commitment could afford would make the spliced one unbuildable or
+	 * spec-refusable.
 	 */
 	getSpendableOutboundMsat(): bigint {
-		const spendableFor = (localMsat: bigint): bigint => {
+		const spendableFor = (
+			localMsat: bigint,
+			keptReserveSats: bigint
+		): bigint => {
 			// Floored at our OWN dust limit, not just the reserve the peer
 			// requires. Every conforming pairing already satisfies that (a v1
 			// reserve is validated against both dust limits at open, and
@@ -9903,10 +9971,8 @@ export class Channel {
 			// restore, so the invariant is asserted here as well rather than
 			// left to depend on which ran first (issues #386, #387).
 			const reserveMsat =
-				bigIntMax(
-					this._state.remoteConfig.channelReserveSatoshis,
-					this._state.localConfig.dustLimitSatoshis
-				) * 1000n;
+				bigIntMax(keptReserveSats, this._state.localConfig.dustLimitSatoshis) *
+				1000n;
 			let requiredMsat = reserveMsat;
 			if (this._state.role === ChannelRole.OPENER) {
 				const feeratePerKw = Math.max(
@@ -9943,10 +10009,14 @@ export class Channel {
 			const spendable = localMsat - requiredMsat;
 			return spendable > 0n ? spendable : 0n;
 		};
-		const live = spendableFor(this._state.localBalanceMsat);
+		const live = spendableFor(
+			this._state.localBalanceMsat,
+			this._state.remoteConfig.channelReserveSatoshis
+		);
 		const pendingSplice = this.getPendingSpliceLocalBalanceMsat();
-		if (pendingSplice === null) return live;
-		const spliced = spendableFor(pendingSplice);
+		const pendingReserve = this._pendingSpliceKeptReserveSats();
+		if (pendingSplice === null || pendingReserve === null) return live;
+		const spliced = spendableFor(pendingSplice, pendingReserve);
 		return spliced < live ? spliced : live;
 	}
 
@@ -10804,17 +10874,25 @@ export class Channel {
 		// gossip htlc_maximum_msat is clamped against current capacity at
 		// channel_update build time.
 		//
-		// localConfig.channelReserveSatoshis, its neighbour, IS revisited, in one
-		// direction. It is priced at capacity, so a splice-out leaves us enforcing
-		// a reserve the post-splice channel no longer justifies while the peer
-		// honours what the new capacity prices: a channel opened at 5,000,000 and
-		// spliced down to 400,000 would refuse every peer HTLC in a 46,000-sat
-		// band, and that refusal is a bare ERROR the peer never sees, so its next
-		// commitment_signed covers an HTLC we do not hold and the channel force
-		// closes. Lowering can only stop us refusing traffic the peer believes is
-		// legal, so it can never open such a band; raising could, which is why a
-		// splice-in leaves the value alone. Re-deriving BOTH reserves at the new
-		// capacity, the reserve we keep included, is issue #382.
+		// Both channelReserveSatoshis, by contrast, ARE revisited (issue #382:
+		// BOLT 2 prices the reserve at current capacity), each in ONE direction
+		// only, because the two reference peers disagree about what a splice does
+		// to the reserve: eclair re-derives BOTH sides from the new capacity the
+		// moment fundingTxIndex > 0 (Commitments.scala, v1 channels included),
+		// while CLN never re-prices either side across a splice (channeld has no
+		// reserve handling at all; an explicit DTODO). Each direction below is
+		// the one that is safe against BOTH behaviours; the opposite direction
+		// would open a refusal band against one of them, and a reserve refusal is
+		// an HTLC the two sides disagree about, which force closes the channel.
+		//
+		// The reserve we ENFORCE only ever falls. A splice-out leaves us
+		// enforcing a reserve the post-splice channel no longer justifies (a
+		// channel opened at 5,000,000 and spliced down to 400,000 would refuse
+		// every peer HTLC in a 46,000-sat band the peer believes is legal), so
+		// lowering to what the new capacity prices closes that band. Raising
+		// after a splice-in would open the mirror band against CLN, whose own
+		// gate still lets it spend down to the reserve priced at the ORIGINAL
+		// capacity; erring low is inert, the peer's own gate binds.
 		//
 		// reserveWeEnforceAt rather than the v1 helper: the v1 helper prices a v2
 		// channel by a rule neither peer applies to it, and its 546-sat policy
@@ -10834,6 +10912,37 @@ export class Channel {
 				channelReserveSatoshis: splicedReserve
 			};
 			fields.channelReserveVersion = ENFORCED_RESERVE_VERSION;
+		}
+		// The reserve we KEEP only ever rises. After a splice-in eclair enforces
+		// the reserve the NEW capacity prices, so a kept value still priced at
+		// the old capacity lets getSpendableOutboundMsat overdraw into an HTLC
+		// the peer MUST refuse; raising to v2ReserveWeKeep closes that, and can
+		// never overshoot a conforming peer (it is at or above what eclair and
+		// CLN each require of us at any dust pairing). Lowering after a
+		// splice-out would open the same gap against CLN, which keeps enforcing
+		// the value priced at the ORIGINAL capacity; keeping more than a peer
+		// demands only costs our own spendable balance. No provenance stamp:
+		// channelReserveVersion records the ENFORCED reserve only, and max()
+		// against a pure derivation is a fixed point, exactly as in
+		// repairKeptChannelReserve. Gated by the same branch rule as
+		// reserveWeEnforceAt so the degenerate empty-fields adoption cannot
+		// re-price a never-spliced v1 row's wire-negotiated value (every real
+		// adoption arm sets fields.spliceFundingTxid before this runs).
+		if (adopted.fundingVersion === 2 || adopted.spliceFundingTxid) {
+			const keptReserve = bigIntMax(
+				this._state.remoteConfig.channelReserveSatoshis,
+				v2ReserveWeKeep(
+					adopted.fundingSatoshis,
+					this._state.localConfig.dustLimitSatoshis,
+					this._state.remoteConfig.dustLimitSatoshis
+				)
+			);
+			if (keptReserve !== this._state.remoteConfig.channelReserveSatoshis) {
+				fields.remoteConfig = {
+					...this._state.remoteConfig,
+					channelReserveSatoshis: keptReserve
+				};
+			}
 		}
 		// Adopt the peer's signature on our NEW commitment (exchanged during the
 		// mid-splice commitment_signed round) so we can unilaterally close the

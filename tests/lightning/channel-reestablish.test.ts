@@ -1082,7 +1082,7 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			expect(keptReserveOf(dusty)).to.equal(1_062n);
 		});
 
-		it('never lowers the reserve we keep, and never touches a v1 row (issue 387)', function () {
+		it('never lowers the reserve we keep, and never touches an unspliced v1 row (issue 387)', function () {
 			// Over-keeping only costs spendable balance; under-keeping force
 			// closes. So a stored value above the derivation is left where it is
 			// rather than normalized down.
@@ -1095,8 +1095,9 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			generous.repairKeptChannelReserve();
 			expect(keptReserveOf(generous)).to.equal(25_000n);
 
-			// A v1 reserve was negotiated on the wire and stored verbatim, so
-			// there is nothing to derive and no ambiguity to resolve.
+			// An unspliced v1 reserve was negotiated on the wire and stored
+			// verbatim, so there is nothing to derive and no ambiguity to
+			// resolve.
 			const v1 = restoredRow({
 				fundingSatoshis: '5000000',
 				channelReserveSatoshis: '50000',
@@ -1105,6 +1106,24 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			});
 			v1.repairKeptChannelReserve();
 			expect(keptReserveOf(v1)).to.equal(10_000n);
+		});
+
+		it('repairs the kept reserve of a spliced v1 row (issue 382)', function () {
+			// A spliced channel is priced by the derived rule on both sides:
+			// eclair re-derives once fundingTxIndex > 0, v1 included. The splice
+			// adoption tail now raises the kept reserve at every adoption; a row
+			// whose splice adopted BEFORE that existed still carries the
+			// open-time value, so the load-time repair covers it, exactly as the
+			// enforce-side repair covers spliced rows via reserveWeEnforceAt.
+			const spliced = restoredRow({
+				fundingSatoshis: '5000000',
+				channelReserveSatoshis: '50000',
+				keptReserveSatoshis: '10000',
+				fundingVersion: 1,
+				spliced: true
+			});
+			spliced.repairKeptChannelReserve();
+			expect(keptReserveOf(spliced)).to.equal(50_000n);
 		});
 
 		it('shrinks spendable outbound by exactly what the repair added (issue 387)', function () {
