@@ -1298,6 +1298,113 @@ describe('Channel Manager', function () {
 			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
 		});
 
+		it('an UNDECODABLE funding_signed unwinds the promoted open on the wire and releases the pledges', async function () {
+			// A funding_signed whose TLV suffix does not decode used to throw in
+			// the codec and die in handleMessage's catch: no wire error, no
+			// unwind, the promoted registration and its pledges frozen forever
+			// (the issue 415 shape at this boundary). The decode guard must take
+			// the exact refusal the content arms use at SENT_FUNDING_CREATED:
+			// wire error scoped to the promoted id, lifecycle cleanup, pledge
+			// release, and deliberately NO persisted ERRORED row.
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+			alice.on('error', () => undefined);
+			bob.on('error', () => undefined);
+
+			const released: Array<Array<{ txid: string; vout: number }>> = [];
+			let broadcastRequested = false;
+			const provider: IFundingProvider = {
+				buildFundingTransaction: async () => {
+					throw new Error('unused');
+				},
+				broadcastTransaction: async () => {
+					broadcastRequested = true;
+					throw new Error('must never broadcast');
+				},
+				releaseInputPledges: async (outpoints) => {
+					released.push(outpoints);
+				}
+			};
+			alice.setFundingProvider(provider);
+
+			const queue: Array<() => void> = [];
+			const drain = async (): Promise<void> => {
+				while (queue.length) queue.shift()!();
+				await new Promise((r) => setImmediate(r));
+			};
+			const aliceWire: Array<{ type: number; payload: Buffer }> = [];
+			alice.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== bobPubkey) return;
+					aliceWire.push({ type, payload });
+					queue.push(() => bob.handleMessage(alicePubkey, type, payload));
+				}
+			);
+			bob.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer !== alicePubkey) return;
+					const tampered =
+						type === MessageType.FUNDING_SIGNED
+							? // TLV type 2 declaring 98 bytes with only 1 present: the
+							  // decoder throws before any handler content check runs.
+							  Buffer.concat([payload, Buffer.from([0x02, 0x62, 0x01])])
+							: payload;
+					queue.push(() => alice.handleMessage(bobPubkey, type, tampered));
+				}
+			);
+
+			const fundingTx = new bitcoin.Transaction();
+			fundingTx.addInput(crypto.randomBytes(32), 0);
+			fundingTx.addInput(crypto.randomBytes(32), 1);
+			fundingTx.addOutput(
+				bitcoin.script.compile([bitcoin.opcodes.OP_0, crypto.randomBytes(20)]),
+				1_000_000
+			);
+			const expected = fundingTx.ins.map((input) => ({
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index
+			}));
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			await drain();
+			const channelId = alice.createFunding(
+				channel,
+				fundingTx.getHash(),
+				0,
+				Buffer.alloc(64)
+			);
+			expect(channelId, 'promoted before funding_signed arrived').to.not.equal(
+				null
+			);
+			channel.getFullState().pendingFundingTxHex = fundingTx.toHex();
+
+			await drain();
+			await drain();
+
+			// The peer was told, scoped to the promoted channel id.
+			const wireErrors = aliceWire
+				.filter((m) => m.type === MessageType.ERROR)
+				.map((m) => decodeErrorMessage(m.payload));
+			expect(wireErrors, 'exactly one wire error').to.have.length(1);
+			expect(wireErrors[0].channelId.equals(channelId!)).to.equal(true);
+			expect(wireErrors[0].data.toString('ascii')).to.contain(
+				'Undecodable funding_signed'
+			);
+			// Full lifecycle unwind, pledges freed, nothing ever broadcast.
+			expect(released, 'released exactly once').to.have.length(1);
+			expect(released[0], 'both funding inputs freed').to.deep.equal(expected);
+			expect(alice.listChannels()).to.have.length(0);
+			expect(alice.getTempChannel(channel.getTemporaryChannelId())).to.equal(
+				undefined
+			);
+			expect(broadcastRequested, 'no broadcast authorization').to.equal(false);
+			// Same no-ERRORED-row rule as the decoded refusal: nothing was ever
+			// persisted in SENT_FUNDING_CREATED, so nothing may start being.
+			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+		});
+
 		it('an error quoting the TEMPORARY id fails the promoted channel, owner only (issue 412)', async function () {
 			// A refusal of funding_created quotes the temporary id (the only id
 			// that message carries), but with queued transport it lands after

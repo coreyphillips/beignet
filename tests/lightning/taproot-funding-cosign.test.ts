@@ -19,6 +19,8 @@ import { createTaprootFundingScript } from '../../src/lightning/script/funding-t
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Channel } from '../../src/lightning/channel/channel';
+import { MessageType } from '../../src/lightning/message/types';
+import { decodeErrorMessage } from '../../src/lightning/message/error';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -235,5 +237,151 @@ describe('option_taproot funding co-sign (Stage A)', function () {
 			);
 		}
 		expect(bobError).to.equal(true);
+	});
+
+	it('an UNDECODABLE funding_created (truncated TLV) is refused on the wire, scoped to the temp id', function () {
+		// A funding_created whose TLV suffix does not decode used to throw in
+		// the codec and die in handleMessage's catch: a null-id local error,
+		// nothing on the wire, the temp channel still tracked (the issue 415
+		// shape at the decode boundary). The guard must take the exact refusal
+		// the content arms use at SENT_ACCEPT: wire error scoped to the
+		// temporary id, temp registration dropped, no funding_signed.
+		const alice = new ChannelManager(makeConfig(5, true));
+		const bob = new ChannelManager(makeConfig(6, false));
+		const aPub = alice['config'].localBasepoints.fundingPubkey.toString('hex');
+		const bPub = bob['config'].localBasepoints.fundingPubkey.toString('hex');
+
+		let sentTempId: Buffer | null = null;
+		const bobWire: Array<{ type: number; payload: Buffer }> = [];
+		alice.on(
+			'message:outbound',
+			(peer: string, type: number, payload: Buffer) => {
+				if (peer !== bPub) return;
+				let p = payload;
+				if (type === MessageType.FUNDING_CREATED) {
+					sentTempId = Buffer.from(payload.subarray(0, 32));
+					// Keep the 130-byte fixed body, replace the partial TLV with
+					// type 2 declaring 98 bytes and carrying 1: the decoder throws
+					// before any handler content check runs.
+					p = Buffer.concat([
+						payload.subarray(0, 130),
+						Buffer.from([0x02, 0x62, 0x01])
+					]);
+				}
+				bob.handleMessage(aPub, type, p);
+			}
+		);
+		bob.on(
+			'message:outbound',
+			(peer: string, type: number, payload: Buffer) => {
+				bobWire.push({ type, payload });
+				if (peer === aPub) alice.handleMessage(bPub, type, payload);
+			}
+		);
+		const bobErrors: Array<{ id: Buffer | null; message: string }> = [];
+		bob.on('error', (id: Buffer | null, message: string) =>
+			bobErrors.push({ id, message })
+		);
+		alice.on('error', () => undefined);
+
+		const aliceChannel = alice.openChannel(bPub, 1_000_000n);
+		alice.createFunding(
+			aliceChannel,
+			crypto.randomBytes(32),
+			0,
+			crypto.randomBytes(64)
+		);
+
+		expect(sentTempId, 'funding_created intercepted').to.not.equal(null);
+		// The opener was told, scoped to the id it keys this negotiation by.
+		const wireErrors = bobWire
+			.filter((m) => m.type === MessageType.ERROR)
+			.map((m) => decodeErrorMessage(m.payload));
+		expect(wireErrors, 'exactly one wire error').to.have.length(1);
+		expect(wireErrors[0].channelId.equals(sentTempId!)).to.equal(true);
+		expect(wireErrors[0].data.toString('ascii')).to.contain(
+			'Undecodable funding_created'
+		);
+		// No funding_signed for a message that never decoded.
+		expect(bobWire.some((m) => m.type === MessageType.FUNDING_SIGNED)).to.equal(
+			false
+		);
+		// The dead negotiation is unwound, and the local error names it by the
+		// same id the wire refusal used.
+		expect(bob.getTempChannel(sentTempId!)).to.equal(undefined);
+		const refusal = bobErrors.find((e) =>
+			e.message.includes('Undecodable funding_created')
+		);
+		expect(refusal, 'local refusal fired').to.not.equal(undefined);
+		expect(refusal!.id, 'local error id present').to.not.equal(null);
+		expect(refusal!.id!.equals(sentTempId!)).to.equal(true);
+	});
+
+	it('a refused funding_created reports the TEMPORARY id locally, never the peer-steered derived id', function () {
+		// The permanent channel_id is derived from PEER-SUPPLIED fundingTxid
+		// and fundingOutputIndex. Adopting it before verification meant an
+		// opener quoting an all-zero txid at output 0 steered the LOCAL error
+		// event to the all-zero id while the wire refusal correctly used the
+		// temporary id. The derived id must not be adopted until every refusal
+		// arm has passed.
+		const alice = new ChannelManager(makeConfig(7, true));
+		const bob = new ChannelManager(makeConfig(8, false));
+		const aPub = alice['config'].localBasepoints.fundingPubkey.toString('hex');
+		const bPub = bob['config'].localBasepoints.fundingPubkey.toString('hex');
+
+		const bobWire: Array<{ type: number; payload: Buffer }> = [];
+		alice.on(
+			'message:outbound',
+			(peer: string, type: number, payload: Buffer) => {
+				if (peer !== bPub) return;
+				let p = payload;
+				if (type === MessageType.FUNDING_CREATED) {
+					// Zero the fundingTxid (bytes 32..64); the output index stays 0,
+					// so the derived channel_id is ALL-ZERO. The partial no longer
+					// verifies over the zeroed outpoint, so bob refuses naturally.
+					p = Buffer.from(payload);
+					p.fill(0, 32, 64);
+				}
+				bob.handleMessage(aPub, type, p);
+			}
+		);
+		bob.on(
+			'message:outbound',
+			(peer: string, type: number, payload: Buffer) => {
+				bobWire.push({ type, payload });
+				if (peer === aPub) alice.handleMessage(bPub, type, payload);
+			}
+		);
+		const bobErrors: Array<{ id: Buffer | null; message: string }> = [];
+		bob.on('error', (id: Buffer | null, message: string) =>
+			bobErrors.push({ id, message })
+		);
+		alice.on('error', () => undefined);
+
+		const aliceChannel = alice.openChannel(bPub, 1_000_000n);
+		const tempId = aliceChannel.getTemporaryChannelId();
+		alice.createFunding(
+			aliceChannel,
+			crypto.randomBytes(32),
+			0,
+			crypto.randomBytes(64)
+		);
+
+		const refusal = bobErrors.find((e) =>
+			e.message.includes('Invalid taproot partial signature')
+		);
+		expect(refusal, 'local refusal fired').to.not.equal(undefined);
+		// The local scope matches the wire scope: the temporary id, never the
+		// all-zero derivation.
+		expect(refusal!.id, 'local error id present').to.not.equal(null);
+		expect(refusal!.id!.equals(tempId)).to.equal(true);
+		const wireErrors = bobWire
+			.filter((m) => m.type === MessageType.ERROR)
+			.map((m) => decodeErrorMessage(m.payload));
+		expect(wireErrors, 'exactly one wire error').to.have.length(1);
+		expect(wireErrors[0].channelId.equals(tempId)).to.equal(true);
+		expect(bobWire.some((m) => m.type === MessageType.FUNDING_SIGNED)).to.equal(
+			false
+		);
 	});
 });

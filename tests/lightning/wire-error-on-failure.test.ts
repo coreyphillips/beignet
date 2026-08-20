@@ -181,6 +181,54 @@ describe('wire error + channel failure on peer protocol violations', function ()
 		expect(t.errors.join('; ')).to.contain('Invalid commitment signature');
 	});
 
+	it('an UNDECODABLE commitment_signed (truncated TLV) fails the channel on the wire', function () {
+		// The codec throw used to die in handleMessage's catch as a null-id
+		// local error: no wire error, channel left NORMAL on desynced state
+		// (the issue 415 shape at the decode boundary).
+		const t = makePair('undecodable-commit');
+		t.corruptNext(MessageType.COMMITMENT_SIGNED, (p) =>
+			// TLV type 2 declaring 98 bytes with only 1 present.
+			Buffer.concat([p, Buffer.from([0x02, 0x62, 0x01])])
+		);
+		t.A.addHtlc(
+			t.channelId,
+			1_000_000n,
+			sha256(crypto.randomBytes(32)),
+			900,
+			Buffer.alloc(1366)
+		);
+
+		const wireErrors = wireErrorsIn(t.toA);
+		expect(wireErrors.length, 'wire error sent').to.be.greaterThan(0);
+		expect(wireErrors.join('; ')).to.contain('Undecodable commitment_signed');
+		expect(t.bChannel.getState()).to.equal(ChannelState.ERRORED);
+		expect(t.errors.join('; ')).to.contain('Undecodable commitment_signed');
+	});
+
+	it('a commitment_signed lying about its HTLC count fails the channel on the wire', function () {
+		// num_htlcs is peer-controlled and checked in the DECODER ("too short
+		// for N HTLCs"), so this malformed shape throws before the TLV parse
+		// and before any handler content check.
+		const t = makePair('lying-htlc-count');
+		t.corruptNext(MessageType.COMMITMENT_SIGNED, (p) => {
+			p.writeUInt16BE(200, 96);
+			return p;
+		});
+		t.A.addHtlc(
+			t.channelId,
+			1_000_000n,
+			sha256(crypto.randomBytes(32)),
+			900,
+			Buffer.alloc(1366)
+		);
+
+		const wireErrors = wireErrorsIn(t.toA);
+		expect(wireErrors.length, 'wire error sent').to.be.greaterThan(0);
+		expect(wireErrors.join('; ')).to.contain('Undecodable commitment_signed');
+		expect(t.bChannel.getState()).to.equal(ChannelState.ERRORED);
+		expect(t.errors.join('; ')).to.contain('Undecodable commitment_signed');
+	});
+
 	it('a bad revocation secret triggers a WIRE error and fails the channel', function () {
 		const t = makePair('bad-revoke');
 		// Round 1 completes fully so A holds B's genuine secret #0 (the FIRST

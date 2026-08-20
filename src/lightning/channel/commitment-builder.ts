@@ -1089,29 +1089,37 @@ export function verifyRemoteCommitmentPartial(
 	localPerCommitmentPoint: Buffer,
 	commitmentNumber?: bigint
 ): boolean {
-	const built = buildLocalCommitment(
-		state,
-		localPerCommitmentPoint,
-		commitmentNumber
-	);
-	const sighash = taprootCommitmentSighash(
-		built.result.tx,
-		taprootFundingSpk(state),
-		Number(state.fundingSatoshis)
-	);
-	const session = startCommitmentSigningSession(
-		sighash,
-		state.localBasepoints.fundingPubkey,
-		state.remoteBasepoints!.fundingPubkey,
-		ourPublicNonce,
-		theirPublicNonce
-	);
-	return verifyPartialCommitmentSig(
-		session,
-		theirPartialSig,
-		state.remoteBasepoints!.fundingPubkey,
-		theirPublicNonce
-	);
+	// Peer-supplied nonce halves that are not decodable curve points, or a
+	// partial scalar out of range, make the musig backend THROW ('Unexpected
+	// public nonce at infinity', 'Invalid sig') rather than return false, so
+	// malformed means invalid here (issue 415).
+	try {
+		const built = buildLocalCommitment(
+			state,
+			localPerCommitmentPoint,
+			commitmentNumber
+		);
+		const sighash = taprootCommitmentSighash(
+			built.result.tx,
+			taprootFundingSpk(state),
+			Number(state.fundingSatoshis)
+		);
+		const session = startCommitmentSigningSession(
+			sighash,
+			state.localBasepoints.fundingPubkey,
+			state.remoteBasepoints!.fundingPubkey,
+			ourPublicNonce,
+			theirPublicNonce
+		);
+		return verifyPartialCommitmentSig(
+			session,
+			theirPartialSig,
+			state.remoteBasepoints!.fundingPubkey,
+			theirPublicNonce
+		);
+	} catch {
+		return false;
+	}
 }
 
 /**
