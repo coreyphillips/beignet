@@ -1,5 +1,6 @@
 import * as ecc from '@bitcoinerlab/secp256k1';
 import crypto from 'crypto';
+import type { KeyObject } from 'crypto';
 
 /**
  * Perform ECDH key agreement and return SHA256 of the shared point.
@@ -197,4 +198,181 @@ export function verify(
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * ASN.1 SubjectPublicKeyInfo prefix for a secp256k1 EC public key.
+ * Concatenated with a 33-byte compressed point it forms the DER document
+ * node:crypto's createPublicKey accepts; OpenSSL handles the compressed
+ * encoding itself, so no decompression is needed.
+ */
+const SECP256K1_SPKI_PREFIX = Buffer.from(
+	'3036301006072a8648ce3d020106052b8104000a032200',
+	'hex'
+);
+
+/**
+ * Bound on the imported-key cache. Sized to hold the announced Lightning node
+ * population (~13-16k) so every recurring gossip signer stays cached through
+ * a full sync; per-channel bitcoin keys are ~unique and churn the cold end.
+ */
+const SHA256D_KEY_CACHE_MAX = 16384;
+
+let sha256dBackend: 'node' | 'js' | null = null;
+const sha256dKeyCache = new Map<string, KeyObject>();
+
+/**
+ * Select the verification backend for verifySha256d, once. The platform must
+ * PROVE the fast path before it is trusted: react-native crypto shims
+ * commonly provide hashing but omit or stub asymmetric verify, and a backend
+ * that lies rather than throws would corrupt every gossip verdict. Sign a
+ * fixed digest with the always-present JS lib and require node:crypto to
+ * accept it and reject a tampered copy; anything else selects the JS
+ * fallback permanently.
+ */
+function resolveSha256dBackend(): 'node' | 'js' {
+	if (sha256dBackend !== null) {
+		return sha256dBackend;
+	}
+	sha256dBackend = 'js';
+	try {
+		if (
+			typeof crypto.verify !== 'function' ||
+			typeof crypto.createPublicKey !== 'function' ||
+			typeof crypto.createHash !== 'function'
+		) {
+			return sha256dBackend;
+		}
+		const priv = Buffer.alloc(32, 7);
+		const firstHash = crypto
+			.createHash('sha256')
+			.update('beignet sha256d backend self-test')
+			.digest();
+		const digest = crypto.createHash('sha256').update(firstHash).digest();
+		const sig = sign(digest, priv);
+		const key = crypto.createPublicKey({
+			key: Buffer.concat([SECP256K1_SPKI_PREFIX, getPublicKey(priv)]),
+			format: 'der',
+			type: 'spki'
+		});
+		const good = crypto.verify(
+			'sha256',
+			firstHash,
+			{ key, dsaEncoding: 'ieee-p1363' },
+			sig
+		);
+		const tampered = Buffer.from(sig);
+		tampered[tampered.length - 1] ^= 0x01;
+		const bad = crypto.verify(
+			'sha256',
+			firstHash,
+			{ key, dsaEncoding: 'ieee-p1363' },
+			tampered
+		);
+		if (good === true && bad === false) {
+			sha256dBackend = 'node';
+		}
+	} catch {
+		// Leave the JS fallback selected.
+	}
+	return sha256dBackend;
+}
+
+/**
+ * Import a compressed public key as a node:crypto KeyObject, cached. Cache
+ * hits refresh recency so recurring gossip signers (node ids) outlive the
+ * stream of ~unique per-channel bitcoin keys passing through; import
+ * failures stay uncached so a flood of unique malformed keys cannot poison
+ * the working set.
+ */
+function getCachedVerifyKey(publicKey: Buffer): KeyObject | null {
+	const hex = publicKey.toString('hex');
+	const cached = sha256dKeyCache.get(hex);
+	if (cached !== undefined) {
+		sha256dKeyCache.delete(hex);
+		sha256dKeyCache.set(hex, cached);
+		return cached;
+	}
+	if (publicKey.length !== 33) {
+		return null;
+	}
+	let key: KeyObject;
+	try {
+		key = crypto.createPublicKey({
+			key: Buffer.concat([SECP256K1_SPKI_PREFIX, publicKey]),
+			format: 'der',
+			type: 'spki'
+		});
+	} catch {
+		return null;
+	}
+	if (sha256dKeyCache.size >= SHA256D_KEY_CACHE_MAX) {
+		const oldest = sha256dKeyCache.keys().next().value;
+		if (oldest !== undefined) {
+			sha256dKeyCache.delete(oldest);
+		}
+	}
+	sha256dKeyCache.set(hex, key);
+	return key;
+}
+
+/**
+ * Verify a signature that covers the double-SHA256 of some data, given the
+ * FIRST SHA256 (the BOLT 7 gossip signature scheme). Taking the single hash
+ * rather than the final digest is what unlocks the fast path: node:crypto
+ * will not verify a bare pre-hashed digest for EC keys, but letting it hash
+ * the first SHA256 with 'sha256' lands on exactly the SHA256d digest the
+ * signature covers. Non-strict (high-S accepted) and malformed-means-invalid,
+ * matching verify() above; verdicts agree with the JS lib on both paths.
+ * @param firstHash - sha256(data); the signature covers sha256(firstHash)
+ * @param publicKey - 33-byte compressed public key
+ * @param signature - 64-byte compact signature (r || s)
+ * @returns True if signature is valid
+ */
+export function verifySha256d(
+	firstHash: Buffer,
+	publicKey: Buffer,
+	signature: Buffer
+): boolean {
+	if (resolveSha256dBackend() === 'node') {
+		const key = getCachedVerifyKey(publicKey);
+		if (key === null) {
+			return false;
+		}
+		try {
+			return crypto.verify(
+				'sha256',
+				firstHash,
+				{ key, dsaEncoding: 'ieee-p1363' },
+				signature
+			);
+		} catch {
+			return false;
+		}
+	}
+	return verifySha256dJs(firstHash, publicKey, signature);
+}
+
+/**
+ * Pure-JS fallback for verifySha256d, used where node:crypto is unavailable
+ * or fails its self-test (react-native embeddings). Exported so tests can
+ * pin verdict agreement between the two backends.
+ */
+export function verifySha256dJs(
+	firstHash: Buffer,
+	publicKey: Buffer,
+	signature: Buffer
+): boolean {
+	const digest = crypto.createHash('sha256').update(firstHash).digest();
+	return verify(digest, publicKey, signature);
+}
+
+/**
+ * Test hook: reset the memoized backend selection and key cache. Passing
+ * force pins subsequent verifications to that backend without re-running the
+ * self-test; omitting it restores automatic resolution.
+ */
+export function _resetSha256dBackendForTests(force?: 'node' | 'js'): void {
+	sha256dBackend = force ?? null;
+	sha256dKeyCache.clear();
 }

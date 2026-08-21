@@ -5,7 +5,7 @@
  */
 
 import crypto from 'crypto';
-import { sign, verify } from '../crypto/ecdh';
+import { sign, verifySha256d } from '../crypto/ecdh';
 import { CHANNEL_FLAG_DIRECTION } from './types';
 import {
 	IChannelAnnouncementMessage,
@@ -19,10 +19,19 @@ import {
 } from './messages';
 
 /**
+ * Compute the first SHA256 of the signed data. Signatures cover the double
+ * SHA256, but verification hands the single hash to verifySha256d so the
+ * fast backend can apply the second round itself (issue #441).
+ */
+function computeGossipFirstHash(data: Buffer): Buffer {
+	return crypto.createHash('sha256').update(data).digest();
+}
+
+/**
  * Compute the double-SHA256 hash used for gossip signatures.
  */
 export function computeGossipSignatureHash(data: Buffer): Buffer {
-	const first = crypto.createHash('sha256').update(data).digest();
+	const first = computeGossipFirstHash(data);
 	return crypto.createHash('sha256').update(first).digest();
 }
 
@@ -58,13 +67,13 @@ export function verifyChannelAnnouncement(
 	payload: Buffer
 ): boolean {
 	const signedData = getChannelAnnouncementSignedData(payload);
-	const hash = computeGossipSignatureHash(signedData);
+	const firstHash = computeGossipFirstHash(signedData);
 
 	return (
-		verify(hash, msg.nodeId1, msg.nodeSignature1) &&
-		verify(hash, msg.nodeId2, msg.nodeSignature2) &&
-		verify(hash, msg.bitcoinKey1, msg.bitcoinSignature1) &&
-		verify(hash, msg.bitcoinKey2, msg.bitcoinSignature2)
+		verifySha256d(firstHash, msg.nodeId1, msg.nodeSignature1) &&
+		verifySha256d(firstHash, msg.nodeId2, msg.nodeSignature2) &&
+		verifySha256d(firstHash, msg.bitcoinKey1, msg.bitcoinSignature1) &&
+		verifySha256d(firstHash, msg.bitcoinKey2, msg.bitcoinSignature2)
 	);
 }
 
@@ -76,8 +85,8 @@ export function verifyNodeAnnouncement(
 	payload: Buffer
 ): boolean {
 	const signedData = getNodeAnnouncementSignedData(payload);
-	const hash = computeGossipSignatureHash(signedData);
-	return verify(hash, msg.nodeId, msg.signature);
+	const firstHash = computeGossipFirstHash(signedData);
+	return verifySha256d(firstHash, msg.nodeId, msg.signature);
 }
 
 /**
@@ -91,10 +100,10 @@ export function verifyChannelUpdate(
 	nodeId2: Buffer
 ): boolean {
 	const signedData = getChannelUpdateSignedData(payload);
-	const hash = computeGossipSignatureHash(signedData);
+	const firstHash = computeGossipFirstHash(signedData);
 	const direction = msg.channelFlags & CHANNEL_FLAG_DIRECTION;
 	const signerKey = direction === 0 ? nodeId1 : nodeId2;
-	return verify(hash, signerKey, msg.signature);
+	return verifySha256d(firstHash, signerKey, msg.signature);
 }
 
 /**
