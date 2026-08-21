@@ -1141,7 +1141,17 @@ export class LightningNode extends EventEmitter {
 		this.warmFeeAdvisor();
 
 		this.graph = new NetworkGraph(this.chainHash(), {
-			eagerVerify: this.eagerGossipVerify
+			eagerVerify: this.eagerGossipVerify,
+			// Ceiling evictions (issue #446) must reach disk, or the evicted
+			// rows re-inflate the graph on the next restore.
+			onChannelEvicted: (scidHex) => {
+				if (typeof this.storage?.deleteGossipChannel === 'function') {
+					this.safeStorage(
+						() => this.storage!.deleteGossipChannel!(scidHex),
+						'deleteGossipChannel'
+					);
+				}
+			}
 		});
 
 		this.onionMessageManager = new OnionMessageManager(config.nodePrivateKey);

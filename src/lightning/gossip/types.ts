@@ -274,6 +274,15 @@ export const ANNOUNCEMENT_SIGNATURES_LENGTH = 168;
 /** BOLT 7: Maximum age for channel updates before pruning (2 weeks). */
 export const DEFAULT_PRUNE_MAX_AGE = 1_209_600;
 
+/**
+ * BOLT 7: ignore gossip timestamped unreasonably far in the future. One hour
+ * of forward skew is generous (gossip propagates in seconds; RGS snapshots
+ * are stamped in the past) while capping how long a garbage timestamp can
+ * camp a slot against the strictly-newer freshness rule: without a bound, a
+ * max-u32 timestamp holds its slot until 2106 (issue #446).
+ */
+export const MAX_GOSSIP_TIMESTAMP_SKEW = 3_600;
+
 // ── Short Channel ID ────────────────────────────────────────────────
 
 /**
