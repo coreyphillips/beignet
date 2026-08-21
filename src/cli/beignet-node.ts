@@ -758,12 +758,18 @@ export class BeignetNode extends EventEmitter {
 		if (!opts.allowMultipleInstances) {
 			const lockPath = path.join(this.dataDir, `${networkName}.lock`);
 			try {
-				acquireInstanceLock(lockPath, Date.now(), (holder, reason) => {
-					this.log(
-						'warn',
-						`[beignet] Reclaimed stale instance lock (pid ${holder.pid} on ` +
-							`${holder.hostname}, ${reason}) at ${lockPath}`
-					);
+				// reclaimForeignHost: after a container recreate the recorded
+				// pid is meaningless here, and this daemon is the wallet's only
+				// legitimate starter — take the leftover lock over.
+				acquireInstanceLock(lockPath, {
+					reclaimForeignHost: true,
+					onReclaim: (holder, reason) => {
+						this.log(
+							'warn',
+							`[beignet] Reclaimed stale instance lock (pid ${holder.pid} on ` +
+								`${holder.hostname}, ${reason}) at ${lockPath}`
+						);
+					}
 				});
 			} catch (e) {
 				if (e instanceof InstanceLockError) {

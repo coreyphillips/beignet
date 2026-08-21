@@ -1151,5 +1151,29 @@ describe('SCB restore', function () {
 			expect(result.preRestorePath).to.equal(`${dbPath}.pre-restore-7`);
 			expect(fs.existsSync(lockPath)).to.equal(false);
 		});
+
+		it('performDbRestore fails closed on a lock recorded under another hostname', function () {
+			const backup = path.join(tmpDir, 'backup.db');
+			const dbPath = path.join(tmpDir, 'mainnet.db');
+			const lockPath = path.join(tmpDir, 'mainnet.lock');
+			writeSqliteLike(backup, 'NEW');
+			writeSqliteLike(dbPath, 'OLD');
+
+			// A daemon in another container may still have this data dir open;
+			// its pid cannot be probed from here, so restore must refuse whether
+			// that pid happens to look alive or dead in our namespace.
+			for (const pid of [process.ppid, 2_147_483_646]) {
+				fs.writeFileSync(
+					lockPath,
+					JSON.stringify({ pid, hostname: 'other-container', createdAt: 1 })
+				);
+				expect(() => performDbRestore(backup, dbPath, lockPath)).to.throw(
+					InstanceLockError
+				);
+				expect(fs.readFileSync(dbPath).includes('OLD')).to.equal(true);
+				// The live daemon's lock must be left intact, not reclaimed.
+				expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid).to.equal(pid);
+			}
+		});
 	});
 });
