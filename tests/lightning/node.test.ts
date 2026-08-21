@@ -353,7 +353,7 @@ describe('Lightning Node', function () {
 			outputIndex: 0
 		});
 
-		it('should add channel announcement to graph', function () {
+		it('should add channel announcement to graph', async function () {
 			const node = createNode(1);
 			const { payload } = createSignedChannelAnnouncement(
 				gossipKey1,
@@ -367,10 +367,12 @@ describe('Lightning Node', function () {
 				MessageType.CHANNEL_ANNOUNCEMENT,
 				payload
 			);
+			// Broadcast gossip is queued off the message path (issue #437).
+			await node.flushGossip();
 			expect(node.getGraph().getChannelCount()).to.equal(1);
 		});
 
-		it('should reject invalid channel announcement', function () {
+		it('should reject invalid channel announcement', async function () {
 			const node = createNode(1);
 			const { payload } = createSignedChannelAnnouncement(
 				gossipKey1,
@@ -387,10 +389,11 @@ describe('Lightning Node', function () {
 				MessageType.CHANNEL_ANNOUNCEMENT,
 				corrupted
 			);
+			await node.flushGossip();
 			expect(node.getGraph().getChannelCount()).to.equal(0);
 		});
 
-		it('should apply channel update after announcement', function () {
+		it('should apply channel update after announcement', async function () {
 			const node = createNode(1);
 			const { payload: annPayload } = createSignedChannelAnnouncement(
 				gossipKey1,
@@ -416,13 +419,14 @@ describe('Lightning Node', function () {
 				MessageType.CHANNEL_UPDATE,
 				updatePayload
 			);
+			await node.flushGossip();
 
 			const channel = node.getGraph().getChannel(testScid);
 			expect(channel).to.exist;
 			expect(channel!.update1).to.exist;
 		});
 
-		it('should ignore channel update without prior announcement', function () {
+		it('should ignore channel update without prior announcement', async function () {
 			const node = createNode(1);
 			const updatePayload = createSignedChannelUpdate(gossipKey1, testScid, 0);
 			node.handlePeerMessage(
@@ -430,10 +434,11 @@ describe('Lightning Node', function () {
 				MessageType.CHANNEL_UPDATE,
 				updatePayload
 			);
+			await node.flushGossip();
 			expect(node.getGraph().getChannelCount()).to.equal(0);
 		});
 
-		it('should apply node announcement after channel exists', function () {
+		it('should apply node announcement after channel exists', async function () {
 			const node = createNode(1);
 			const { payload: annPayload } = createSignedChannelAnnouncement(
 				gossipKey1,
@@ -454,13 +459,14 @@ describe('Lightning Node', function () {
 				MessageType.NODE_ANNOUNCEMENT,
 				nodeAnnPayload
 			);
+			await node.flushGossip();
 
 			const graphNode = node.getGraph().getNode(getPublicKey(gossipKey1));
 			expect(graphNode).to.exist;
 			expect(graphNode!.announcement).to.exist;
 		});
 
-		it('should report correct graph counts', function () {
+		it('should report correct graph counts', async function () {
 			const node = createNode(1);
 			const { payload: annPayload } = createSignedChannelAnnouncement(
 				gossipKey1,
@@ -474,12 +480,13 @@ describe('Lightning Node', function () {
 				MessageType.CHANNEL_ANNOUNCEMENT,
 				annPayload
 			);
+			await node.flushGossip();
 
 			expect(node.getGraph().getChannelCount()).to.equal(1);
 			expect(node.getGraph().getNodeCount()).to.equal(2);
 		});
 
-		it('should build multi-channel graph', function () {
+		it('should build multi-channel graph', async function () {
 			const node = createNode(1);
 			const scid1 = encodeShortChannelId({
 				block: 100,
@@ -525,6 +532,7 @@ describe('Lightning Node', function () {
 				MessageType.CHANNEL_ANNOUNCEMENT,
 				ann2
 			);
+			await node.flushGossip();
 
 			expect(node.getGraph().getChannelCount()).to.equal(2);
 			expect(node.getGraph().getNodeCount()).to.equal(3);
@@ -2295,7 +2303,7 @@ describe('Lightning Node', function () {
 			expect(node2.getPeerManager()).to.be.null;
 		});
 
-		it('should route gossip messages from PeerManager to NetworkGraph', function () {
+		it('should route gossip messages from PeerManager to NetworkGraph', async function () {
 			const config = makeNodeConfig(1);
 			config.enableNetworking = true;
 			const node = new LightningNode(config);
@@ -2346,6 +2354,7 @@ describe('Lightning Node', function () {
 				MessageType.CHANNEL_ANNOUNCEMENT,
 				payload
 			);
+			await node.flushGossip();
 
 			expect(node.getGraph().getChannelCount()).to.equal(1);
 			node.destroy();
@@ -2444,7 +2453,7 @@ describe('Lightning Node', function () {
 			expect(payment.status).to.equal(PaymentStatus.COMPLETED);
 		});
 
-		it('should allow handlePeerMessage even when networking IS enabled', function () {
+		it('should allow handlePeerMessage even when networking IS enabled', async function () {
 			const config = makeNodeConfig(1);
 			config.enableNetworking = true;
 			const node = new LightningNode(config);
@@ -2485,6 +2494,7 @@ describe('Lightning Node', function () {
 				MessageType.CHANNEL_ANNOUNCEMENT,
 				payload
 			);
+			await node.flushGossip();
 			expect(node.getGraph().getChannelCount()).to.equal(1);
 			node.destroy();
 		});
