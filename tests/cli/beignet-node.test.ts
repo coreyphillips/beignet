@@ -15,7 +15,8 @@ import {
 import {
 	BeignetNode,
 	BeignetNodeOptions,
-	defaultDataDirForMnemonic
+	defaultDataDirForMnemonic,
+	gossipPrimeLatch
 } from '../../src/cli/beignet-node';
 import type {
 	ApiResponse,
@@ -441,6 +442,126 @@ describe('BeignetNode', () => {
 			expect(err).to.be.instanceOf(Error);
 		}
 	}).timeout(30000);
+});
+
+// ─────────────── Gossip Sync Deferral (issue #441) ───────────────
+
+describe('Gossip sync deferral during initial RGS (issue #441)', () => {
+	type PatchedNode = {
+		initiateGossipSync: (pk: string) => void;
+		listPeers: () => Array<{ pubkey: string }>;
+	};
+	type LatchAccess = { _initialGossipPrime: Promise<void> | null };
+
+	const makeNode = async (): Promise<{
+		bn: BeignetNode;
+		synced: string[];
+		release: () => void;
+	}> => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-defer-'));
+		const bn = await BeignetNode.create({
+			network: 'regtest',
+			dataDir: dir,
+			logLevel: 'silent',
+			autoGossipSync: true,
+			...OFFLINE_ELECTRUM
+		});
+		const ln = bn.getNode();
+		const synced: string[] = [];
+		(ln as unknown as PatchedNode).initiateGossipSync = (pk): void => {
+			synced.push(pk);
+		};
+		(ln as unknown as PatchedNode).listPeers = (): Array<{
+			pubkey: string;
+		}> => [{ pubkey: 'deadbeefpeer' }];
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		(bn as unknown as LatchAccess)._initialGossipPrime = gate;
+		return { bn, synced, release };
+	};
+
+	const drainDeferred = async (): Promise<void> => {
+		await new Promise((resolve) => setImmediate(resolve));
+	};
+
+	it('gossipPrimeLatch resolves on resolve, reject, and timeout, never rejecting', async () => {
+		await gossipPrimeLatch(Promise.resolve('ok'), 10_000);
+		// A failed RGS download must release deferred syncs, not block them.
+		await gossipPrimeLatch(Promise.reject(new Error('rgs down')), 10_000);
+		// A hung download is bounded by the cap.
+		await gossipPrimeLatch(new Promise(() => undefined), 20);
+	});
+
+	it('defers connect-time sync while the latch is pending, then fires', async function () {
+		this.timeout(20_000);
+		const { bn, synced, release } = await makeNode();
+		try {
+			bn.getNode().emit('peer:connect', 'deadbeefpeer');
+			expect(synced).to.deep.equal([]);
+			release();
+			await drainDeferred();
+			expect(synced).to.deep.equal(['deadbeefpeer']);
+		} finally {
+			await bn.destroy();
+		}
+	});
+
+	it('does not fire a deferred sync for a peer that disconnected during the wait', async function () {
+		this.timeout(20_000);
+		const { bn, synced, release } = await makeNode();
+		try {
+			(bn.getNode() as unknown as PatchedNode).listPeers = (): Array<{
+				pubkey: string;
+			}> => [];
+			bn.getNode().emit('peer:connect', 'deadbeefpeer');
+			release();
+			await drainDeferred();
+			expect(synced).to.deep.equal([]);
+		} finally {
+			await bn.destroy();
+		}
+	});
+
+	it('does not fire a deferred sync after destroy', async function () {
+		this.timeout(20_000);
+		const { bn, synced, release } = await makeNode();
+		bn.getNode().emit('peer:connect', 'deadbeefpeer');
+		await bn.destroy();
+		release();
+		await drainDeferred();
+		expect(synced).to.deep.equal([]);
+	});
+
+	it('installs no latch on regtest boot; with the latch clear sync is synchronous', async function () {
+		this.timeout(20_000);
+		const { bn, synced } = await makeNode();
+		try {
+			(bn as unknown as LatchAccess)._initialGossipPrime = null;
+			bn.getNode().emit('peer:connect', 'deadbeefpeer');
+			expect(synced).to.deep.equal(['deadbeefpeer']);
+
+			const freshDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), 'beignet-nolatch-')
+			);
+			const fresh = await BeignetNode.create({
+				network: 'regtest',
+				dataDir: freshDir,
+				logLevel: 'silent',
+				...OFFLINE_ELECTRUM
+			});
+			try {
+				expect((fresh as unknown as LatchAccess)._initialGossipPrime).to.equal(
+					null
+				);
+			} finally {
+				await fresh.destroy();
+			}
+		} finally {
+			await bn.destroy();
+		}
+	});
 });
 
 // ─────────────── Daemon Route Tests ───────────────

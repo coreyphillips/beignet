@@ -75,9 +75,7 @@ describe('Gossip verify backend parity (issue #441)', function () {
 		_resetSha256dBackendForTests();
 	});
 
-	const bothBackends = (
-		fn: (verify: typeof verifySha256d) => void
-	): void => {
+	const bothBackends = (fn: (verify: typeof verifySha256d) => void): void => {
 		_resetSha256dBackendForTests('node');
 		fn(verifySha256d);
 		_resetSha256dBackendForTests('js');
@@ -89,25 +87,14 @@ describe('Gossip verify backend parity (issue #441)', function () {
 		const vectors = Array.from({ length: 32 }, makeVector);
 		bothBackends((verify) => {
 			for (const v of vectors) {
-				expect(verify(v.firstHash, v.publicKey, v.signature)).to.equal(
-					true
-				);
+				expect(verify(v.firstHash, v.publicKey, v.signature)).to.equal(true);
 				const tampered = Buffer.from(v.signature);
 				tampered[40] ^= 0x01;
-				expect(verify(v.firstHash, v.publicKey, tampered)).to.equal(
-					false
-				);
+				expect(verify(v.firstHash, v.publicKey, tampered)).to.equal(false);
 				const wrongKey = getPublicKey(crypto.randomBytes(32));
-				expect(verify(v.firstHash, wrongKey, v.signature)).to.equal(
-					false
-				);
-				const wrongHash = crypto
-					.createHash('sha256')
-					.update('other')
-					.digest();
-				expect(verify(wrongHash, v.publicKey, v.signature)).to.equal(
-					false
-				);
+				expect(verify(v.firstHash, wrongKey, v.signature)).to.equal(false);
+				const wrongHash = crypto.createHash('sha256').update('other').digest();
+				expect(verify(wrongHash, v.publicKey, v.signature)).to.equal(false);
 			}
 		});
 	});
@@ -130,10 +117,7 @@ describe('Gossip verify backend parity (issue #441)', function () {
 		while (isValidPublicKey(offCurve)) {
 			offCurve[32] = (offCurve[32] + 1) & 0xff;
 		}
-		const sGeqN = Buffer.concat([
-			v.signature.subarray(0, 32),
-			SECP256K1_N
-		]);
+		const sGeqN = Buffer.concat([v.signature.subarray(0, 32), SECP256K1_N]);
 		const zeroS = Buffer.concat([
 			v.signature.subarray(0, 32),
 			Buffer.alloc(32)
@@ -172,17 +156,11 @@ describe('Gossip verify backend parity (issue #441)', function () {
 		_resetSha256dBackendForTests('node');
 		const v = makeVector();
 		// Miss, then hit, then a tampered check against the cached key.
-		expect(verifySha256d(v.firstHash, v.publicKey, v.signature)).to.equal(
-			true
-		);
-		expect(verifySha256d(v.firstHash, v.publicKey, v.signature)).to.equal(
-			true
-		);
+		expect(verifySha256d(v.firstHash, v.publicKey, v.signature)).to.equal(true);
+		expect(verifySha256d(v.firstHash, v.publicKey, v.signature)).to.equal(true);
 		const tampered = Buffer.from(v.signature);
 		tampered[5] ^= 0x01;
-		expect(verifySha256d(v.firstHash, v.publicKey, tampered)).to.equal(
-			false
-		);
+		expect(verifySha256d(v.firstHash, v.publicKey, tampered)).to.equal(false);
 		for (let i = 0; i < 50; i++) {
 			const d = makeVector();
 			expect(verifySha256d(d.firstHash, d.publicKey, d.signature)).to.equal(
@@ -202,14 +180,9 @@ describe('Gossip verify backend parity (issue #441)', function () {
 		const upd = makeSignedChannelUpdate(scid, keys.nodeKey1, 0, 1_700_000_000);
 		const nodeAnn = makeSignedNodeAnnouncement(keys.nodeKey2, 1_700_000_000);
 
-		const tamperedAnn = {
-			...ann.msg,
-			nodeSignature1: (() => {
-				const s = Buffer.from(ann.msg.nodeSignature1);
-				s[10] ^= 0x01;
-				return s;
-			})()
-		};
+		const tamperedSig = Buffer.from(ann.msg.nodeSignature1);
+		tamperedSig[10] ^= 0x01;
+		const tamperedAnn = { ...ann.msg, nodeSignature1: tamperedSig };
 
 		for (const backend of ['node', 'js'] as const) {
 			_resetSha256dBackendForTests(backend);
