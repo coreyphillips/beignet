@@ -96,8 +96,11 @@ export function restoreDbFile(
 
 /**
  * Perform the offline DB restore while holding the wallet's single-instance
- * lock. Throws InstanceLockError when a live daemon holds the lock (the same
- * check BeignetNode.create performs), so a running node is never overwritten.
+ * lock. Throws InstanceLockError when a live daemon holds the lock, so a
+ * running node is never overwritten. Unlike daemon startup this stays
+ * fail-closed on a lock recorded under another hostname (e.g. restore run
+ * from the host against a container's data dir): liveness cannot be verified
+ * from here, so the lock is refused rather than reclaimed.
  */
 export function performDbRestore(
 	backupFile: string,

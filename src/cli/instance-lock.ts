@@ -13,6 +13,16 @@
  * stale lock from a crashed run, which we reclaim. Hard kills (SIGKILL) leave a
  * stale lock, but the next start detects it via the liveness check — so no
  * manual cleanup is ever required.
+ *
+ * The PID probe is only meaningful in our own PID namespace, so it applies
+ * only when the recorded hostname matches ours. A lock recorded under a
+ * different hostname (e.g. a recreated container on the same data dir, where
+ * the old PID may now belong to an unrelated process) cannot be probed at all.
+ * What happens then is the caller's choice via `reclaimForeignHost`: daemon
+ * startup opts in and reclaims it as stale, while callers that must never
+ * disturb a possibly-live instance elsewhere (offline DB restore) keep the
+ * fail-closed default and refuse. Cross-host sharing of one data dir is not a
+ * supported scenario — a PID probe could not arbitrate it either way.
  */
 
 import * as fs from 'fs';
@@ -46,31 +56,82 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
-function readLock(lockPath: string): ILockInfo | null {
+interface ILockFile {
+	/** Exact bytes on disk, kept so a removal can target the file we inspected. */
+	raw: string;
+	info: ILockInfo | null;
+}
+
+/** Null when the file is missing/unreadable; `info` null when it is corrupt. */
+function readLockFile(lockPath: string): ILockFile | null {
+	let raw: string;
 	try {
-		const parsed = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-		if (typeof parsed?.pid === 'number') return parsed as ILockInfo;
+		raw = fs.readFileSync(lockPath, 'utf8');
 	} catch {
-		// Missing/corrupt lock file — treat as no valid holder.
+		return null;
 	}
-	return null;
+	try {
+		const parsed = JSON.parse(raw);
+		if (typeof parsed?.pid === 'number') return { raw, info: parsed };
+	} catch {
+		// Corrupt lock file — no valid holder, but keep the bytes.
+	}
+	return { raw, info: null };
+}
+
+/**
+ * A hostname is comparable only when it is a non-empty string. Anything else
+ * (missing, mangled, empty) counts as "same host", so the conservative PID
+ * probe stays in charge and a possibly-live local holder is never clobbered.
+ */
+function isComparableHostname(h: unknown): h is string {
+	return typeof h === 'string' && h.trim() !== '';
+}
+
+function isForeignHost(recorded: unknown, ours: string): boolean {
+	return (
+		isComparableHostname(recorded) &&
+		isComparableHostname(ours) &&
+		recorded !== ours
+	);
+}
+
+/** Why a stale lock was reclaimed, reported via `onReclaim`. */
+export type LockReclaimReason = 'dead-pid' | 'foreign-host';
+
+export interface IAcquireLockOptions {
+	/** Timestamp recorded in the lock; pass a fixed value for deterministic tests. */
+	now?: number;
+	/**
+	 * Treat a lock recorded under a different hostname as stale and reclaim it
+	 * (the PID probe proves nothing across a container recreate). Default
+	 * false: without the opt-in a foreign-host lock is refused outright, since
+	 * its liveness cannot be verified from here.
+	 */
+	reclaimForeignHost?: boolean;
+	/** Invoked after acquisition for each stale holder whose lock was taken over. */
+	onReclaim?: (holder: ILockInfo, reason: LockReclaimReason) => void;
 }
 
 /**
  * Acquire the lock at `lockPath`, creating parent state as needed. Throws
- * {@link InstanceLockError} if a live instance already holds it. Reclaims a
- * stale lock left by a crashed process. Pass `now` for deterministic tests.
+ * {@link InstanceLockError} if a live instance already holds it — or, unless
+ * `reclaimForeignHost` is set, if the lock was recorded under another hostname
+ * (unverifiable, so fail closed). Reclaims a stale lock left by a crashed
+ * process, or a foreign-host lock when opted in.
  */
 export function acquireInstanceLock(
 	lockPath: string,
-	now: number = Date.now()
+	opts: IAcquireLockOptions = {}
 ): ILockInfo {
+	const { now = Date.now(), reclaimForeignHost = false, onReclaim } = opts;
 	const info: ILockInfo = {
 		pid: process.pid,
 		hostname: os.hostname(),
 		createdAt: now
 	};
 	const payload = JSON.stringify(info);
+	const reclaimed: Array<{ holder: ILockInfo; reason: LockReclaimReason }> = [];
 
 	// At most two attempts: the second runs only after we clear a stale lock,
 	// so a live competitor can never be silently overwritten.
@@ -82,23 +143,61 @@ export function acquireInstanceLock(
 			} finally {
 				fs.closeSync(fd);
 			}
+			// Notify only once the lock is ours: reporting earlier would sit
+			// inside the inspect→remove window and widen that race.
+			for (const r of reclaimed) onReclaim?.(r.holder, r.reason);
 			return info;
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
 
-			const holder = readLock(lockPath);
-			if (holder && holder.pid !== process.pid && isProcessAlive(holder.pid)) {
-				throw new InstanceLockError(
-					`Another beignet instance (pid ${holder.pid} on ${holder.hostname}) is already ` +
-						`using this wallet. Stop it first, or start with a different dataDir. Lock: ${lockPath}`,
-					holder
-				);
+			const existing = readLockFile(lockPath);
+			// Vanished between the create and the read — retry the create.
+			if (existing === null) continue;
+
+			const holder = existing.info;
+			const foreign =
+				holder !== null && isForeignHost(holder.hostname, info.hostname);
+			if (holder) {
+				if (foreign && !reclaimForeignHost) {
+					throw new InstanceLockError(
+						`The instance lock for this wallet was recorded on another host ` +
+							`(pid ${holder.pid} on ${holder.hostname}), so its liveness cannot be ` +
+							`verified from here. Stop that instance, or remove the lock file if you ` +
+							`are certain it is stale. Lock: ${lockPath}`,
+						holder
+					);
+				}
+				if (
+					!foreign &&
+					holder.pid !== process.pid &&
+					isProcessAlive(holder.pid)
+				) {
+					throw new InstanceLockError(
+						`Another beignet instance (pid ${holder.pid} on ${holder.hostname}) is already ` +
+							`using this wallet. Stop it first, or start with a different dataDir. Lock: ${lockPath}`,
+						holder
+					);
+				}
 			}
-			// Stale (crashed) or our own leftover lock — remove and retry once.
+
+			// Stale (dead/foreign/own-leftover holder, or corrupt) — remove and
+			// retry once, but only the exact bytes we inspected: if the file
+			// changed underneath us another starter owns it now, so leave it in
+			// place and let the retry re-evaluate the new holder.
 			try {
+				if (fs.readFileSync(lockPath, 'utf8') !== existing.raw) continue;
 				fs.unlinkSync(lockPath);
 			} catch {
-				// Someone else won the race to clear it; the retry will re-evaluate.
+				// Someone else won the race to clear it; the retry re-evaluates.
+				continue;
+			}
+			// A takeover of another holder is reported (post-acquisition); our
+			// own same-host leftover is not.
+			if (holder && (foreign || holder.pid !== process.pid)) {
+				reclaimed.push({
+					holder,
+					reason: foreign ? 'foreign-host' : 'dead-pid'
+				});
 			}
 		}
 	}
@@ -107,7 +206,7 @@ export function acquireInstanceLock(
 	// retry — treat as contended rather than forcing it.
 	throw new InstanceLockError(
 		`Could not acquire the instance lock at ${lockPath} (contended by another starting instance).`,
-		readLock(lockPath)
+		readLockFile(lockPath)?.info ?? null
 	);
 }
 
@@ -117,8 +216,14 @@ export function acquireInstanceLock(
  */
 export function releaseInstanceLock(lockPath: string): void {
 	try {
-		const holder = readLock(lockPath);
-		if (holder && holder.pid === process.pid) {
+		const holder = readLockFile(lockPath)?.info;
+		// PID alone is ambiguous across hosts — require the hostname to match
+		// too (an unverifiable hostname counts as ours, as on acquire).
+		const ours =
+			holder &&
+			holder.pid === process.pid &&
+			!isForeignHost(holder.hostname, os.hostname());
+		if (ours) {
 			fs.unlinkSync(lockPath);
 		}
 	} catch {
