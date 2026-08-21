@@ -35,7 +35,8 @@ import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
 import {
 	makeSignedChannelKeys,
 	makeSignedChannelAnnouncement,
-	makeSignedChannelUpdate
+	makeSignedChannelUpdate,
+	makeSignedNodeAnnouncement
 } from './helpers/signed-gossip';
 import {
 	GossipSyncManager,
@@ -987,6 +988,251 @@ describe('Gossip Sync (Phase 5)', function () {
 		});
 	});
 
+	describe('Deferred gossip provenance (issue #443)', function () {
+		// Lazy verification: foreign gossip is admitted as 'deferred' and only
+		// verified when a gossip query asks for the entry. The #340 contract
+		// (nothing unverified is ever served) must hold throughout.
+
+		/** Two random pubkeys; makeChannelAnnouncement orders them itself. */
+		function randomNodePair(): [Buffer, Buffer] {
+			return [
+				getPublicKey(crypto.randomBytes(32)),
+				getPublicKey(crypto.randomBytes(32))
+			];
+		}
+
+		/** RGS-style entry: all-zero signatures, zero bitcoin keys. */
+		function zeroSigAnnouncement(
+			msg: IChannelAnnouncementMessage
+		): IChannelAnnouncementMessage {
+			return {
+				...msg,
+				nodeSignature1: Buffer.alloc(64),
+				nodeSignature2: Buffer.alloc(64),
+				bitcoinSignature1: Buffer.alloc(64),
+				bitcoinSignature2: Buffer.alloc(64),
+				bitcoinKey1: Buffer.alloc(33),
+				bitcoinKey2: Buffer.alloc(33)
+			};
+		}
+
+		it('advertises deferred channels in reply_channel_range without verifying them, never false ones', function () {
+			const graph = new NetworkGraph();
+			const deferredScid = makeScid(100, 1, 0);
+			const falseScid = makeScid(100, 2, 0);
+			const signed = makeSignedChannelAnnouncement(
+				deferredScid,
+				makeSignedChannelKeys()
+			);
+			graph.addChannelAnnouncement(signed.msg, { verified: 'deferred' });
+			// No opts: explicit false (RGS/API injection), never advertised.
+			graph.addChannelAnnouncement(
+				makeChannelAnnouncement(falseScid, ...randomNodePair())
+			);
+
+			const scids = graph.getChannelsByBlockRange(100, 10);
+			expect(scids.length).to.equal(1);
+			expect(scids[0].equals(deferredScid)).to.be.true;
+			// The range scan is the cheap heuristic: it must not verify.
+			expect(graph.getChannel(deferredScid)!.announcementVerified).to.equal(
+				'deferred'
+			);
+		});
+
+		it('resolves deferred entries at serve time and serves the genuine ones (sticky)', function () {
+			const graph = new NetworkGraph();
+			const scid = makeScid(101, 1, 0);
+			const keys = makeSignedChannelKeys();
+			const ann = makeSignedChannelAnnouncement(scid, keys);
+			const upd = makeSignedChannelUpdate(scid, keys.nodeKey1, 0, 1000);
+			const nodeAnn = makeSignedNodeAnnouncement(keys.nodeKey1, 1000);
+			graph.addChannelAnnouncement(ann.msg, { verified: 'deferred' });
+			graph.applyChannelUpdate(upd.msg, { verified: 'deferred' });
+			graph.applyNodeAnnouncement(nodeAnn.msg, { verified: 'deferred' });
+
+			const result = graph.getGossipMessagesForChannels([scid]);
+			expect(result.announcements.length).to.equal(1);
+			expect(result.updates.length).to.equal(1);
+			expect(result.nodeAnnouncements.length).to.equal(1);
+			// Resolution is sticky: no signature is ever checked twice.
+			const ch = graph.getChannel(scid)!;
+			expect(ch.announcementVerified).to.be.true;
+			expect(ch.update1Verified).to.be.true;
+			expect(graph.getNode(nodeAnn.msg.nodeId)!.announcementVerified).to.be
+				.true;
+		});
+
+		it('resolves garbage-signature deferred entries to false and never serves them', function () {
+			const graph = new NetworkGraph();
+			const scid = makeScid(102, 1, 0);
+			// Random signatures: verification must fail at serve time.
+			const garbage = makeChannelAnnouncement(scid, ...randomNodePair());
+			graph.addChannelAnnouncement(garbage, { verified: 'deferred' });
+			// A genuinely signed update under a failed announcement must stay
+			// deferred: its endpoint keys are unauthenticated, so the serve loop
+			// never verifies past a non-servable announcement.
+			const keys = makeSignedChannelKeys();
+			const upd = makeSignedChannelUpdate(scid, keys.nodeKey1, 0, 1000);
+			graph.applyChannelUpdate(upd.msg, { verified: 'deferred' });
+
+			expect(graph.getChannelsByBlockRange(102, 5).length).to.equal(1);
+			const first = graph.getGossipMessagesForChannels([scid]);
+			expect(first.announcements.length).to.equal(0);
+			expect(first.updates.length).to.equal(0);
+			expect(graph.getChannel(scid)!.announcementVerified).to.be.false;
+			expect(graph.getChannel(scid)!.update1Verified).to.equal('deferred');
+			// Resolved false drops out of the range advertisement too.
+			expect(graph.getChannelsByBlockRange(102, 5).length).to.equal(0);
+			// And a second query stays empty without re-verification.
+			const second = graph.getGossipMessagesForChannels([scid]);
+			expect(second.announcements.length).to.equal(0);
+		});
+
+		it('stops resolving when the serve budget is exhausted and resumes on a later query', function () {
+			const graph = new NetworkGraph();
+			const scid = makeScid(103, 1, 0);
+			const keys = makeSignedChannelKeys();
+			const ann = makeSignedChannelAnnouncement(scid, keys);
+			graph.addChannelAnnouncement(ann.msg, { verified: 'deferred' });
+
+			const budget = NetworkGraph.SERVE_VERIFY_BUDGET_MS;
+			try {
+				NetworkGraph.SERVE_VERIFY_BUDGET_MS = 0;
+				const starved = graph.getGossipMessagesForChannels([scid]);
+				expect(starved.announcements.length).to.equal(0);
+				// Unresolved, not failed: the entry stays deferred for later.
+				expect(graph.getChannel(scid)!.announcementVerified).to.equal(
+					'deferred'
+				);
+			} finally {
+				NetworkGraph.SERVE_VERIFY_BUDGET_MS = budget;
+			}
+			const served = graph.getGossipMessagesForChannels([scid]);
+			expect(served.announcements.length).to.equal(1);
+			expect(graph.getChannel(scid)!.announcementVerified).to.be.true;
+		});
+
+		it('lets a deferred announcement take over only a signatureless slot with matching endpoints', function () {
+			const graph = new NetworkGraph();
+			const scid = makeScid(104, 1, 0);
+			const keys = makeSignedChannelKeys();
+			const signed = makeSignedChannelAnnouncement(scid, keys);
+			// RGS-primed slot: zero signatures, same endpoints.
+			graph.addChannelAnnouncement(zeroSigAnnouncement(signed.msg));
+
+			// Mismatched endpoints never take over.
+			const otherScidAnn = makeSignedChannelAnnouncement(
+				scid,
+				makeSignedChannelKeys()
+			);
+			expect(
+				graph.addChannelAnnouncement(otherScidAnn.msg, {
+					verified: 'deferred'
+				})
+			).to.be.false;
+
+			// Matching endpoints: the signed copy takes the slot as deferred.
+			expect(graph.addChannelAnnouncement(signed.msg, { verified: 'deferred' }))
+				.to.be.true;
+			expect(graph.getChannel(scid)!.announcementVerified).to.equal('deferred');
+
+			// A re-served identical announcement refuses: the slot now carries
+			// real signatures, so accepting would only re-trigger persistence.
+			expect(graph.addChannelAnnouncement(signed.msg, { verified: 'deferred' }))
+				.to.be.false;
+
+			// And deferred never displaces a verified slot.
+			const verifiedScid = makeScid(104, 2, 0);
+			const verified = makeSignedChannelAnnouncement(
+				verifiedScid,
+				makeSignedChannelKeys()
+			);
+			graph.addChannelAnnouncement(verified.msg, { verified: true });
+			expect(
+				graph.addChannelAnnouncement(verified.msg, { verified: 'deferred' })
+			).to.be.false;
+			expect(graph.getChannel(verifiedScid)!.announcementVerified).to.be.true;
+		});
+
+		it('lets a deferred update bypass freshness only over a signatureless slot', function () {
+			const graph = new NetworkGraph();
+			const scid = makeScid(105, 1, 0);
+			const keys = makeSignedChannelKeys();
+			const ann = makeSignedChannelAnnouncement(scid, keys);
+			graph.addChannelAnnouncement(ann.msg, { verified: 'deferred' });
+
+			// RGS-style zero-sig update stamped with a synthetic newer timestamp.
+			const rgsUpdate = {
+				...makeSignedChannelUpdate(scid, keys.nodeKey1, 0, 2000).msg,
+				signature: Buffer.alloc(64)
+			};
+			graph.applyChannelUpdate(rgsUpdate);
+			// The older real broadcast update still takes the slot.
+			const older = makeSignedChannelUpdate(scid, keys.nodeKey1, 0, 1000);
+			expect(graph.applyChannelUpdate(older.msg, { verified: 'deferred' })).to
+				.be.true;
+			expect(graph.getChannel(scid)!.update1Verified).to.equal('deferred');
+
+			// Over a REAL-signature slot, normal freshness rules: a re-served or
+			// older deferred update refuses, a strictly newer one lands.
+			expect(graph.applyChannelUpdate(older.msg, { verified: 'deferred' })).to
+				.be.false;
+			const newer = makeSignedChannelUpdate(scid, keys.nodeKey1, 0, 3000);
+			expect(graph.applyChannelUpdate(newer.msg, { verified: 'deferred' })).to
+				.be.true;
+		});
+
+		it('re-requests signatureless entries via getMissingSCIDs in eager mode only', function () {
+			const rgsScid = makeScid(106, 1, 0);
+			const rgsUpdScid = makeScid(106, 2, 0);
+			const failedScid = makeScid(106, 3, 0);
+			const absentScid = makeScid(106, 4, 0);
+
+			function populate(graph: NetworkGraph): void {
+				const rgsKeys = makeSignedChannelKeys();
+				// RGS-primed announcement: zero signatures, worth re-fetching.
+				graph.addChannelAnnouncement(
+					zeroSigAnnouncement(
+						makeSignedChannelAnnouncement(rgsScid, rgsKeys).msg
+					)
+				);
+				// Verified announcement with an RGS-primed (zero-sig) update.
+				const updKeys = makeSignedChannelKeys();
+				graph.addChannelAnnouncement(
+					makeSignedChannelAnnouncement(rgsUpdScid, updKeys).msg,
+					{ verified: true }
+				);
+				graph.applyChannelUpdate({
+					...makeSignedChannelUpdate(rgsUpdScid, updKeys.nodeKey1, 0, 1000).msg,
+					signature: Buffer.alloc(64)
+				});
+				// Real signatures that failed verification: re-fetching would
+				// re-serve the same bytes forever, so never re-request.
+				graph.addChannelAnnouncement(
+					makeChannelAnnouncement(failedScid, ...randomNodePair())
+				);
+			}
+			const remote = [rgsScid, rgsUpdScid, failedScid, absentScid];
+
+			const eager = new NetworkGraph(BITCOIN_CHAIN_HASH, {
+				eagerVerify: true
+			});
+			populate(eager);
+			const eagerMissing = eager.getMissingSCIDs(remote);
+			expect(eagerMissing.map((s) => s.toString('hex')).sort()).to.deep.equal(
+				[rgsScid, rgsUpdScid, absentScid].map((s) => s.toString('hex')).sort()
+			);
+
+			// Lazy wallets keep the presence-only behavior (issue #441: RGS
+			// priming shrinks the p2p request).
+			const lazy = new NetworkGraph();
+			populate(lazy);
+			const lazyMissing = lazy.getMissingSCIDs(remote);
+			expect(lazyMissing.length).to.equal(1);
+			expect(lazyMissing[0].equals(absentScid)).to.be.true;
+		});
+	});
+
 	describe('Full Sync Protocol Simulation', function () {
 		it('should complete full sync between two graphs', function () {
 			// Graph A has channels at blocks 100-102
@@ -1061,14 +1307,16 @@ describe('Gossip Sync (Phase 5)', function () {
 	describe('LightningNode Integration', function () {
 		function makeNode(
 			enableNetworking = false,
-			nodePrivateKey = crypto.randomBytes(32)
+			nodePrivateKey = crypto.randomBytes(32),
+			eagerGossipVerify = false
 		): LightningNode {
 			return new LightningNode({
 				nodePrivateKey,
 				perCommitmentSeed: crypto.randomBytes(32),
 				channelBasepoints: makeBasepoints(),
 				fundingPrivkey: crypto.randomBytes(32),
-				enableNetworking
+				enableNetworking,
+				eagerGossipVerify
 			});
 		}
 
@@ -1289,8 +1537,8 @@ describe('Gossip Sync (Phase 5)', function () {
 			node.destroy();
 		});
 
-		it('serves received announcements byte-identically and withholds ones with unreproducible signed bytes (issue #340)', async function () {
-			const node = makeNode();
+		it('serves received announcements byte-identically and withholds ones with unreproducible signed bytes (issue #340, eager mode)', async function () {
+			const node = makeNode(false, crypto.randomBytes(32), true);
 			const peer = 'aa'.repeat(33);
 			const cleanScid = makeScid(150, 1, 0);
 			const extraScid = makeScid(150, 2, 0);
@@ -1350,8 +1598,8 @@ describe('Gossip Sync (Phase 5)', function () {
 			node.destroy();
 		});
 
-		it('withholds a signed channel_update whose extra signed bytes cannot be reproduced (issue #340)', async function () {
-			const node = makeNode();
+		it('withholds a signed channel_update whose extra signed bytes cannot be reproduced (issue #340, eager mode)', async function () {
+			const node = makeNode(false, crypto.randomBytes(32), true);
 			const peer = 'aa'.repeat(33);
 			const scid = makeScid(151, 1, 0);
 			const keys = makeSignedChannelKeys();
@@ -1397,6 +1645,95 @@ describe('Gossip Sync (Phase 5)', function () {
 			const served = node.getGraph().getGossipMessagesForChannels([scid]);
 			expect(served.updates.length).to.equal(1);
 			expect(served.updates[0].channelFlags & 0x01).to.equal(0);
+			node.destroy();
+		});
+
+		it('defers intake verification and resolves it at serve time (issue #443, lazy default)', async function () {
+			const node = makeNode();
+			const peer = 'aa'.repeat(33);
+			const cleanScid = makeScid(150, 3, 0);
+			const extraScid = makeScid(150, 4, 0);
+			const cleanKeys = makeSignedChannelKeys();
+			const clean = makeSignedChannelAnnouncement(
+				cleanScid,
+				cleanKeys,
+				REGTEST_CHAIN_HASH
+			);
+			// Signed future fields the codec cannot round-trip: serve-time
+			// resolution verifies the canonical re-encoding, so this one must
+			// resolve unservable exactly like eager intake would classify it.
+			const extra = makeSignedChannelAnnouncement(
+				extraScid,
+				makeSignedChannelKeys(),
+				REGTEST_CHAIN_HASH,
+				Buffer.from([1, 2, 3])
+			);
+			const cleanUpd = makeSignedChannelUpdate(
+				cleanScid,
+				cleanKeys.nodeKey1,
+				0,
+				1000,
+				REGTEST_CHAIN_HASH
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_ANNOUNCEMENT,
+				clean.payload
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_ANNOUNCEMENT,
+				extra.payload
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_UPDATE,
+				cleanUpd.payload
+			);
+			await node.flushGossip();
+
+			// Intake paid for no signatures: everything sits deferred.
+			const graph = node.getGraph();
+			expect(graph.getChannel(cleanScid)!.announcementVerified).to.equal(
+				'deferred'
+			);
+			expect(graph.getChannel(cleanScid)!.update1Verified).to.equal('deferred');
+			expect(graph.getChannel(extraScid)!.announcementVerified).to.equal(
+				'deferred'
+			);
+
+			// A gossip query triggers resolution: the clean entry is served
+			// byte-identically, the unreproducible one is withheld.
+			const outbound: Array<{ type: number; payload: Buffer }> = [];
+			node.on(
+				'message:outbound',
+				(_pubkey: string, type: number, payload: Buffer) => {
+					outbound.push({ type, payload });
+				}
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.QUERY_SHORT_CHANNEL_IDS,
+				encodeQueryShortChannelIdsMessage({
+					chainHash: REGTEST_CHAIN_HASH,
+					encodedShortIds: encodeShortChannelIds([cleanScid, extraScid])
+				})
+			);
+			const servedAnns = outbound.filter(
+				(m) => m.type === MessageType.CHANNEL_ANNOUNCEMENT
+			);
+			expect(servedAnns.length).to.equal(1);
+			expect(servedAnns[0].payload.equals(clean.payload)).to.be.true;
+			const servedUpds = outbound.filter(
+				(m) => m.type === MessageType.CHANNEL_UPDATE
+			);
+			expect(servedUpds.length).to.equal(1);
+			expect(servedUpds[0].payload.equals(cleanUpd.payload)).to.be.true;
+
+			// Resolution is sticky: the flags are booleans now.
+			expect(graph.getChannel(cleanScid)!.announcementVerified).to.be.true;
+			expect(graph.getChannel(cleanScid)!.update1Verified).to.be.true;
+			expect(graph.getChannel(extraScid)!.announcementVerified).to.be.false;
 			node.destroy();
 		});
 

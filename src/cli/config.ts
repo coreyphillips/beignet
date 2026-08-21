@@ -196,6 +196,18 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_FORWARDING_ENABLED === 'true'
 				: undefined) ??
 			file.forwardingEnabled,
+		// Exact 'true'/'false' only (the autoReconnect rule): a typo falls back
+		// to the default, lazy verification, which is the safe direction — the
+		// node still never serves anything unverified, it just verifies later
+		// and cheaper.
+		eagerGossipVerify:
+			cliFlags.eagerGossipVerify ??
+			(process.env.BEIGNET_EAGER_GOSSIP_VERIFY === 'true'
+				? true
+				: process.env.BEIGNET_EAGER_GOSSIP_VERIFY === 'false'
+				? false
+				: undefined) ??
+			file.eagerGossipVerify,
 		// Exact 'true'/'false' only; anything else is ignored rather than
 		// guessed at, per the standing rule that a typo never crashes the
 		// daemon. Ignored falls back to the node default (reconnect ON), which

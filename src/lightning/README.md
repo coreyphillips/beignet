@@ -770,11 +770,26 @@ work for local routing but are never served in `reply_channel_range` or
 `query_short_channel_ids` responses (BOLT 7 forbids relaying unvalidated
 announcements; strict peers such as eclair 0.14+ disconnect on invalid gossip
 signatures). Pass `{ verified: true }` only for signature-checked messages that
-re-encode byte-identically to the signed wire payload; the `handlePeerMessage`
-gossip handlers do this automatically. Rapid Gossip Sync entries are always
-unverified because RGS strips signatures. Stored rows that predate these flags
-are resolved at restore by verifying the canonical re-encoding, failing safe to
-unverified.
+re-encode byte-identically to the signed wire payload, or
+`{ verified: 'deferred' }` for signed-but-unchecked ones. Rapid Gossip Sync
+entries are always unverified because RGS strips signatures.
+
+Gossip provenance has three states: `true` (verified and servable), `false`
+(failed verification or signatureless, never served and never re-checked) and
+`'deferred'` (carries signatures, not yet checked). By default the node runs
+lazy verification: foreign broadcast gossip is admitted as `'deferred'` without
+any signature work, `reply_channel_range` advertises those SCIDs, and the first
+`query_short_channel_ids` that asks for an entry resolves it within a bounded
+per-query budget (`NetworkGraph.SERVE_VERIFY_BUDGET_MS`), serving only what
+verifies. This skips nearly the entire first-dump verification cost for wallet
+nodes while preserving the never-serve-unverified rule. Updates naming our own
+channels and node announcements that feed peer address capture are still
+verified at intake. Set `eagerGossipVerify: true` on relay-class nodes to
+verify everything at intake as before; eager mode also re-requests
+signatureless RGS-primed entries from peers so their signed copies become
+servable. Stored rows that predate the provenance flags are resolved at
+restore: eager mode verifies the canonical re-encoding (failing safe to
+unverified), lazy mode marks them `'deferred'` and lets the serve path decide.
 
 ### HTLC Forwarding
 

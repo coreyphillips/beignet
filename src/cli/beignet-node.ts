@@ -236,6 +236,15 @@ export interface BeignetNodeOptions {
 	rapidGossipSync?: boolean;
 	/** Rapid Gossip Sync snapshot URL (defaults to the public LDK endpoint). */
 	rapidGossipSyncUrl?: string;
+	/**
+	 * Signature-verify foreign broadcast gossip at intake (default false).
+	 * By default verification is deferred until a gossip query asks for an
+	 * entry, which skips nearly the whole first-dump verification cost;
+	 * nothing unverified is ever served either way. Set true on relay-class
+	 * nodes that serve the graph: intake and restore verify eagerly and
+	 * signatureless RGS-primed entries are re-fetched signed from peers.
+	 */
+	eagerGossipVerify?: boolean;
 	/** Optional error callback — receives all node:error events instead of silently absorbing them */
 	onError?: (error: {
 		code: string;
@@ -1119,6 +1128,7 @@ export class BeignetNode extends EventEmitter {
 			autoReconnect: opts.autoReconnect ?? true,
 			autoUpdateChannelFees: opts.autoUpdateChannelFees ?? false,
 			forwardingEnabled: opts.forwardingEnabled ?? true,
+			eagerGossipVerify: opts.eagerGossipVerify ?? false,
 			localFeatures: LightningNode.defaultFeatures(),
 			chainHashes: [chainHash],
 			alias: opts.alias,

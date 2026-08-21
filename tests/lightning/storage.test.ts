@@ -332,7 +332,7 @@ describe('Storage Layer', function () {
 			};
 		}
 
-		it('resolves legacy rows without provenance flags by signature verification at restore', function () {
+		it('resolves legacy rows without provenance flags by signature verification at restore (eager mode)', function () {
 			// Pre-#340 rows carry no flags and may hold zero-signature RGS
 			// messages (a verified update persisted the whole channel), so
 			// absence is resolved by verifying the canonical re-encoding at the
@@ -344,7 +344,9 @@ describe('Storage Layer', function () {
 			// Deserialize invents nothing.
 			expect(restoredInvalid.announcementVerified).to.be.undefined;
 			expect(restoredInvalid.update1Verified).to.be.undefined;
-			const graphInvalid = new NetworkGraph();
+			const graphInvalid = new NetworkGraph(BITCOIN_CHAIN_HASH, {
+				eagerVerify: true
+			});
 			graphInvalid.restoreChannel(restoredInvalid);
 			const chInvalid = graphInvalid.getChannel(
 				restoredInvalid.shortChannelId
@@ -373,7 +375,9 @@ describe('Storage Layer', function () {
 			const restoredValid = deserializeGraphChannel(
 				serializeGraphChannel(legacy)
 			);
-			const graphValid = new NetworkGraph();
+			const graphValid = new NetworkGraph(BITCOIN_CHAIN_HASH, {
+				eagerVerify: true
+			});
 			graphValid.restoreChannel(restoredValid);
 			const chValid = graphValid.getChannel(scid)!;
 			expect(chValid.announcementVerified).to.be.true;
@@ -415,6 +419,34 @@ describe('Storage Layer', function () {
 				.false;
 		});
 
+		it('marks unresolved legacy rows deferred at restore in lazy mode (issue #443)', function () {
+			// The lazy default moves the signature work off the boot path: an
+			// unresolved flag becomes 'deferred' and is verified only when a
+			// gossip query asks for the entry, with the same outcome eager
+			// restore would have produced. Explicit booleans are untouched and
+			// no flag is invented for a message that is not in the row.
+			const legacy = makeGraphChannelFixture();
+			legacy.update1Verified = true;
+			const restored = deserializeGraphChannel(serializeGraphChannel(legacy));
+			const graph = new NetworkGraph();
+			graph.restoreChannel(restored);
+			const ch = graph.getChannel(restored.shortChannelId)!;
+			expect(ch.announcementVerified).to.equal('deferred');
+			expect(ch.update1Verified).to.be.true;
+			expect(ch.update2Verified).to.be.undefined;
+
+			// An eager graph resolves a 'deferred' row left by a lazy run, so a
+			// lazy-to-eager migration never holds deferred entries post-boot.
+			const eager = new NetworkGraph(BITCOIN_CHAIN_HASH, {
+				eagerVerify: true
+			});
+			const again = deserializeGraphChannel(serializeGraphChannel(ch));
+			eager.restoreChannel(again);
+			const resolved = eager.getChannel(again.shortChannelId)!;
+			// The fixture's announcement carries garbage signatures: unservable.
+			expect(resolved.announcementVerified).to.be.false;
+		});
+
 		it('round-trips explicit provenance flags', function () {
 			// Mixed provenance happens in production: a verified update applied
 			// to an RGS-primed (unverified) channel is persisted whole.
@@ -424,6 +456,17 @@ describe('Storage Layer', function () {
 			const restored = deserializeGraphChannel(serializeGraphChannel(channel));
 			expect(restored.announcementVerified).to.be.false;
 			expect(restored.update1Verified).to.be.true;
+
+			// Lazy intake persists 'deferred' provenance; it must survive a
+			// restart as-is so boot never re-verifies it (issue #443).
+			const deferred = makeGraphChannelFixture();
+			deferred.announcementVerified = 'deferred';
+			deferred.update1Verified = 'deferred';
+			const restoredDeferred = deserializeGraphChannel(
+				serializeGraphChannel(deferred)
+			);
+			expect(restoredDeferred.announcementVerified).to.equal('deferred');
+			expect(restoredDeferred.update1Verified).to.equal('deferred');
 
 			const nodeAnn: INodeAnnouncementMessage = {
 				signature: crypto.randomBytes(64),
@@ -642,7 +685,9 @@ describe('Storage Layer', function () {
 			const loaded = storage.loadAllGossipChannels();
 			expect(loaded).to.have.length(1);
 
-			const graph = new NetworkGraph();
+			const graph = new NetworkGraph(BITCOIN_CHAIN_HASH, {
+				eagerVerify: true
+			});
 			graph.restoreChannel(loaded[0]);
 			const ch = graph.getChannel(scid)!;
 			expect(ch.announcementVerified).to.be.false;
@@ -652,6 +697,23 @@ describe('Storage Layer', function () {
 			const served = graph.getGossipMessagesForChannels([scid]);
 			expect(served.announcements).to.have.length(0);
 			expect(served.updates).to.have.length(0);
+
+			// Lazy restore reaches the same end state through the serve path:
+			// the row restores deferred, gets advertised once, then the first
+			// query resolves the zero-signature announcement unservable, and
+			// the whole channel (signed update included, its endpoints being
+			// unauthenticated) is withheld and drops out of later ranges.
+			const lazy = new NetworkGraph();
+			lazy.restoreChannel(storage.loadAllGossipChannels()[0]);
+			const lazyCh = lazy.getChannel(scid)!;
+			expect(lazyCh.announcementVerified).to.equal('deferred');
+			expect(lazy.getChannelsByBlockRange(100, 5)).to.have.length(1);
+			const lazyServed = lazy.getGossipMessagesForChannels([scid]);
+			expect(lazyServed.announcements).to.have.length(0);
+			expect(lazyServed.updates).to.have.length(0);
+			expect(lazyCh.announcementVerified).to.be.false;
+			expect(lazyCh.update1Verified).to.equal('deferred');
+			expect(lazy.getChannelsByBlockRange(100, 5)).to.have.length(0);
 		});
 
 		it('should save and load gossip nodes', function () {

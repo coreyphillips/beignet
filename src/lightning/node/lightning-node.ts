@@ -70,6 +70,7 @@ import {
 	INodeAddress,
 	IRoute,
 	IRouteHop,
+	TGossipVerified,
 	ADDRESS_TYPE_TORV2,
 	ADDRESS_TYPE_TORV3
 } from '../gossip/types';
@@ -503,6 +504,7 @@ export class LightningNode extends EventEmitter {
 	private currentBlockHeight = 0;
 	private htlcSafetyMargin: number;
 	private forwardingEnabled: boolean;
+	private eagerGossipVerify: boolean;
 	private forwardingCltvDelta: number;
 	private forwardingFeeBaseMsat: number;
 	private forwardingFeePropMillionths: number;
@@ -933,6 +935,7 @@ export class LightningNode extends EventEmitter {
 
 		this.htlcSafetyMargin = config.htlcSafetyMargin ?? 6;
 		this.forwardingEnabled = config.forwardingEnabled ?? true;
+		this.eagerGossipVerify = config.eagerGossipVerify ?? false;
 		this.forwardingCltvDelta = config.forwardingCltvDelta ?? 40;
 		this.forwardingFeeBaseMsat = config.forwardingFeeBaseMsat ?? 1000;
 		this.forwardingFeePropMillionths = config.forwardingFeePropMillionths ?? 1;
@@ -1137,7 +1140,9 @@ export class LightningNode extends EventEmitter {
 		// interval before its first v2 open can price itself.
 		this.warmFeeAdvisor();
 
-		this.graph = new NetworkGraph(this.chainHash());
+		this.graph = new NetworkGraph(this.chainHash(), {
+			eagerVerify: this.eagerGossipVerify
+		});
 
 		this.onionMessageManager = new OnionMessageManager(config.nodePrivateKey);
 		this.wireOnionMessageEvents();
@@ -10952,15 +10957,21 @@ export class LightningNode extends EventEmitter {
 		if (!this.graph.wouldAcceptChannelAnnouncement(msg)) {
 			return;
 		}
-		if (!verifyChannelAnnouncement(msg, payload)) {
-			return;
+		// Lazy mode (default): admit with deferred provenance and skip the
+		// signature work entirely; verification pays for itself only at serve
+		// time, when a gossip query asks for the entry (issue #443).
+		let verified: TGossipVerified = 'deferred';
+		if (this.eagerGossipVerify) {
+			if (!verifyChannelAnnouncement(msg, payload)) {
+				return;
+			}
+			// The signature covers the full payload, signed future fields
+			// included. If the codec cannot reproduce it byte for byte, a
+			// served re-encoding would carry invalid signatures, so keep the
+			// entry routable but never serve it (#340).
+			verified = encodeChannelAnnouncementMessage(msg).equals(payload);
 		}
-		// The signature covers the full payload, signed future fields included.
-		// If the codec cannot reproduce it byte for byte, a served re-encoding
-		// would carry invalid signatures, so keep the entry routable but never
-		// serve it (#340).
-		const servable = encodeChannelAnnouncementMessage(msg).equals(payload);
-		if (this.graph.addChannelAnnouncement(msg, { verified: servable })) {
+		if (this.graph.addChannelAnnouncement(msg, { verified })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
 			if (ch)
 				this.safeStorage(
@@ -10985,25 +10996,31 @@ export class LightningNode extends EventEmitter {
 		// the result: the graph (freshness/verified gate) or the channel-peer
 		// address capture below (its own freshness map). Otherwise this is a
 		// re-served known announcement and its signature proves nothing new.
-		if (
-			!this.graph.wouldAcceptNodeAnnouncement(msg) &&
-			!this.nodeAnnouncementCaptureWorthwhile(msg)
-		) {
+		const captureWorthwhile = this.nodeAnnouncementCaptureWorthwhile(msg);
+		if (!this.graph.wouldAcceptNodeAnnouncement(msg) && !captureWorthwhile) {
 			return;
 		}
-		if (!verifyNodeAnnouncement(msg, payload)) {
-			return;
+		// Address capture must only ever consume VERIFIED announcements (an
+		// unproven claim could redirect a channel peer's reconnects), so a
+		// capture-worthy announcement is verified eagerly even in lazy mode.
+		// Everything else defers to serve time (issue #443).
+		let verified: TGossipVerified = 'deferred';
+		if (this.eagerGossipVerify || captureWorthwhile) {
+			if (!verifyNodeAnnouncement(msg, payload)) {
+				return;
+			}
+			// A signature-verified announcement from a channel peer is the only
+			// dialable address we ever learn for peers that connected inbound
+			// (their TCP source port is ephemeral, so it is never stored).
+			// Capture it even when the graph rejects the announcement below — a
+			// node with only private channels never enters the graph, yet its
+			// channels still need a reconnect path or they sit in
+			// AWAITING_REESTABLISH forever.
+			this.captureChannelPeerAddresses(msg);
+			// Serve only what re-encodes byte-identically (see handleChannelAnnouncement).
+			verified = encodeNodeAnnouncementMessage(msg).equals(payload);
 		}
-		// A signature-verified announcement from a channel peer is the only
-		// dialable address we ever learn for peers that connected inbound (their
-		// TCP source port is ephemeral, so it is never stored). Capture it even
-		// when the graph rejects the announcement below — a node with only
-		// private channels never enters the graph, yet its channels still need
-		// a reconnect path or they sit in AWAITING_REESTABLISH forever.
-		this.captureChannelPeerAddresses(msg);
-		// Serve only what re-encodes byte-identically (see handleChannelAnnouncement).
-		const servable = encodeNodeAnnouncementMessage(msg).equals(payload);
-		if (this.graph.applyNodeAnnouncement(msg, { verified: servable })) {
+		if (this.graph.applyNodeAnnouncement(msg, { verified })) {
 			const node = this.graph.getNode(msg.nodeId);
 			if (node)
 				this.safeStorage(
@@ -11100,12 +11117,20 @@ export class LightningNode extends EventEmitter {
 		if (!this.graph.wouldAcceptChannelUpdate(msg)) {
 			return;
 		}
-		if (!verifyChannelUpdate(msg, payload, channel.nodeId1, channel.nodeId2)) {
-			return;
+		// Updates naming one of OUR channels keep eager verification even in
+		// lazy mode: their graph slots back invoice route hints and must never
+		// sit deferred. Everything else defers to serve time (issue #443).
+		let verified: TGossipVerified = 'deferred';
+		if (this.eagerGossipVerify || this.channelUpdateTargetsOurChannel(msg)) {
+			if (
+				!verifyChannelUpdate(msg, payload, channel.nodeId1, channel.nodeId2)
+			) {
+				return;
+			}
+			// Serve only what re-encodes byte-identically (see handleChannelAnnouncement).
+			verified = encodeChannelUpdateMessage(msg).equals(payload);
 		}
-		// Serve only what re-encodes byte-identically (see handleChannelAnnouncement).
-		const servable = encodeChannelUpdateMessage(msg).equals(payload);
-		if (this.graph.applyChannelUpdate(msg, { verified: servable })) {
+		if (this.graph.applyChannelUpdate(msg, { verified })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
 			if (ch)
 				this.safeStorage(
@@ -15947,6 +15972,7 @@ export class LightningNode extends EventEmitter {
 			autoReconnect?: boolean;
 			autoUpdateChannelFees?: boolean;
 			forwardingEnabled?: boolean;
+			eagerGossipVerify?: boolean;
 			sweepDestinationScript?: Buffer;
 			peerStorageEnabled?: boolean;
 			autoRebalance?: IAutoRebalanceConfig;
@@ -16002,6 +16028,7 @@ export class LightningNode extends EventEmitter {
 			autoReconnect: options?.autoReconnect,
 			autoUpdateChannelFees: options?.autoUpdateChannelFees,
 			forwardingEnabled: options?.forwardingEnabled,
+			eagerGossipVerify: options?.eagerGossipVerify,
 			localFeatures: options?.localFeatures,
 			chainHashes: options?.chainHashes,
 			alias: options?.alias,

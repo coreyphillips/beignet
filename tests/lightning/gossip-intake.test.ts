@@ -21,11 +21,13 @@ import {
 	NetworkGraph,
 	encodeChannelAnnouncementMessage,
 	encodeChannelUpdateMessage,
+	encodeNodeAnnouncementMessage,
 	encodeShortChannelId,
 	signChannelAnnouncement,
 	signChannelUpdate,
 	CHANNEL_FLAG_DIRECTION
 } from '../../src/lightning/gossip';
+import { makeSignedNodeAnnouncement } from './helpers/signed-gossip';
 import { IChannelUpdateMessage } from '../../src/lightning/gossip/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
@@ -214,7 +216,7 @@ describe('Gossip intake queue (LightningNode)', () => {
 	let dbPath: string;
 	let node: LightningNode;
 
-	function makeConfig(): INodeConfig {
+	function makeConfig(eagerGossipVerify = false): INodeConfig {
 		const seed = crypto.randomBytes(32);
 		const keys: Buffer[] = [];
 		for (let i = 0; i < 5; i++) {
@@ -245,7 +247,8 @@ describe('Gossip intake queue (LightningNode)', () => {
 			perCommitmentSeed: crypto.randomBytes(32),
 			fundingPrivkey: keys[0],
 			storage,
-			enableNetworking: false
+			enableNetworking: false,
+			eagerGossipVerify
 		};
 	}
 
@@ -334,6 +337,13 @@ describe('Gossip intake queue (LightningNode)', () => {
 	});
 
 	it('the event loop keeps ticking while a dump drains', async () => {
+		// The tick floor below only exists when intake verifies (issue #437's
+		// contract); the lazy default admits a 40-message dump in one slice.
+		// destroy() closes the storage handle, so build a fresh one.
+		node.destroy();
+		storage = new SqliteStorage(dbPath);
+		storage.open();
+		node = new LightningNode(makeConfig(true));
 		for (let i = 0; i < 40; i++) {
 			const ann = buildAnnouncement(400 + i, REGTEST_CHAIN_HASH);
 			feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
@@ -352,5 +362,131 @@ describe('Gossip intake queue (LightningNode)', () => {
 		// 160 pure-JS signature verifications cannot have run in one slice;
 		// the loop must have turned between slices.
 		expect(ticks).to.be.at.least(5);
+	});
+
+	it('lazy intake (default) admits a dump as deferred without paying for signatures', async () => {
+		const ann = buildAnnouncement(500, REGTEST_CHAIN_HASH);
+		const update = buildUpdate(ann, 1000, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		feed(MessageType.CHANNEL_UPDATE, update.payload);
+		await node.flushGossip();
+		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
+		expect(ch.announcementVerified).to.equal('deferred');
+		expect(ch.update1Verified).to.equal('deferred');
+	});
+
+	it('lazy intake admits a garbage-signature announcement as deferred; eager drops it', async () => {
+		const ann = buildAnnouncement(501, REGTEST_CHAIN_HASH);
+		const garbage = {
+			...ann.msg,
+			nodeSignature1: crypto.randomBytes(64)
+		};
+		const garbagePayload = encodeChannelAnnouncementMessage(garbage);
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, garbagePayload);
+		await node.flushGossip();
+		expect(
+			graphOf(node).getChannel(ann.msg.shortChannelId)!.announcementVerified
+		).to.equal('deferred');
+
+		node.destroy();
+		storage = new SqliteStorage(dbPath);
+		storage.open();
+		node = new LightningNode(makeConfig(true));
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, garbagePayload);
+		await node.flushGossip();
+		expect(graphOf(node).getChannel(ann.msg.shortChannelId)).to.equal(
+			undefined
+		);
+	});
+
+	it('a re-served dump in lazy mode causes no graph change and no storage writes', async () => {
+		const ann = buildAnnouncement(502, REGTEST_CHAIN_HASH);
+		const update = buildUpdate(ann, 1000, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		feed(MessageType.CHANNEL_UPDATE, update.payload);
+		await node.flushGossip();
+
+		// A deferred slot holding real signatures must refuse its own re-serve
+		// at apply, or every re-served dump would rewrite the whole gossip
+		// table (the #437 failure class relocated to disk).
+		let writes = 0;
+		const original = storage.saveGossipChannel.bind(storage);
+		storage.saveGossipChannel = (scidHex, channel): void => {
+			writes++;
+			original(scidHex, channel);
+		};
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		feed(MessageType.CHANNEL_UPDATE, update.payload);
+		await node.flushGossip();
+		expect(writes).to.equal(0);
+		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
+		expect(ch.announcementVerified).to.equal('deferred');
+		expect(ch.update1?.timestamp).to.equal(1000);
+	});
+
+	it('our-channel updates keep eager verification in lazy mode', async () => {
+		const ann = buildAnnouncement(600, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		await node.flushGossip();
+		// Pretend the SCID names one of our channels: this is the synchronous
+		// intake fork whose graph slot backs invoice route hints.
+		(
+			node as unknown as {
+				channelUpdateTargetsOurChannel(m: unknown): boolean;
+			}
+		).channelUpdateTargetsOurChannel = () => true;
+
+		const update = buildUpdate(ann, 1000, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_UPDATE, update.payload);
+		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
+		// Verified at intake: a boolean, never 'deferred'.
+		expect(ch.update1Verified).to.be.true;
+
+		// A garbage signature is dropped outright, not admitted deferred.
+		const garbage = {
+			...buildUpdate(ann, 2000, 0, REGTEST_CHAIN_HASH).msg,
+			signature: crypto.randomBytes(64)
+		};
+		feed(MessageType.CHANNEL_UPDATE, encodeChannelUpdateMessage(garbage));
+		expect(ch.update1?.timestamp).to.equal(1000);
+		expect(ch.update1Verified).to.be.true;
+	});
+
+	it('capture-worthy node announcements keep eager verification in lazy mode', async () => {
+		const ann = buildAnnouncement(601, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		await node.flushGossip();
+
+		// Baseline: a crowd node announcement is admitted deferred.
+		const first = makeSignedNodeAnnouncement(ann.key1.privateKey, 1000);
+		feed(MessageType.NODE_ANNOUNCEMENT, first.payload);
+		await node.flushGossip();
+		expect(
+			graphOf(node).getNode(first.msg.nodeId)!.announcementVerified
+		).to.equal('deferred');
+
+		// A capture-worthy one (reconnect-address source for a channel peer)
+		// verifies at intake even in lazy mode: addresses must never be
+		// captured from an unproven claim.
+		(
+			node as unknown as {
+				nodeAnnouncementCaptureWorthwhile(m: unknown): boolean;
+			}
+		).nodeAnnouncementCaptureWorthwhile = () => true;
+		const second = makeSignedNodeAnnouncement(ann.key1.privateKey, 2000);
+		feed(MessageType.NODE_ANNOUNCEMENT, second.payload);
+		await node.flushGossip();
+		const stored = graphOf(node).getNode(second.msg.nodeId)!;
+		expect(stored.announcementVerified).to.be.true;
+
+		// And a garbage signature is dropped outright, never admitted.
+		const garbage = {
+			...makeSignedNodeAnnouncement(ann.key1.privateKey, 3000).msg,
+			signature: crypto.randomBytes(64)
+		};
+		feed(MessageType.NODE_ANNOUNCEMENT, encodeNodeAnnouncementMessage(garbage));
+		await node.flushGossip();
+		expect(stored.announcement!.timestamp).to.equal(2000);
+		expect(stored.announcementVerified).to.be.true;
 	});
 });
