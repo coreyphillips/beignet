@@ -509,6 +509,26 @@ export class LightningNode extends EventEmitter {
 	/** Per-channel routing-policy overrides (channelId hex -> partial policy). */
 	private channelPolicies: Map<string, IChannelPolicyUpdate> = new Map();
 	private gossipSyncManagers: Map<string, GossipSyncManager> = new Map();
+	/**
+	 * Broadcast gossip intake (beignet issue #437). Announcements and updates
+	 * are queued here and verified in time-budgeted slices off the event loop,
+	 * because a peer serving a full graph dump carries hundreds of thousands
+	 * of pure-JS signature verifications; handled inline they pin the process
+	 * for the whole dump, starving every route, ping, and signal handler,
+	 * and the resulting pong timeouts make peers reconnect and restart the
+	 * dump: a livelock. Head index instead of shift() so draining a deep
+	 * queue is linear, not quadratic.
+	 */
+	private gossipIntake: Array<{
+		pubkey: string;
+		type: number;
+		payload: Buffer;
+	}> = [];
+	private gossipIntakeHead = 0;
+	private gossipIntakeDraining = false;
+	private gossipIntakeDropped = 0;
+	private static readonly GOSSIP_INTAKE_MAX = 30_000;
+	private static readonly GOSSIP_INTAKE_SLICE_MS = 10;
 	/** Our own node_announcement (cached so we can re-broadcast it for propagation). */
 	private _ownNodeAnnouncement?: Buffer;
 	/** Our own channel_announcement + channel_update per channel, cached for re-broadcast. */
@@ -7339,6 +7359,10 @@ export class LightningNode extends EventEmitter {
 		this._destroyed = true;
 		// Retires any chain startup sequence still working through its awaits.
 		++this.chainStartupGeneration;
+		// Queued broadcast gossip dies with the node; the drain loop also
+		// checks _destroyed so an in-flight slice stops rescheduling.
+		this.gossipIntake = [];
+		this.gossipIntakeHead = 0;
 		// Anything held behind the barrier is refused rather than left parked.
 		// A shutdown is not permission either, and the barrier's retry timer
 		// must not keep the process alive.
@@ -10716,15 +10740,35 @@ export class LightningNode extends EventEmitter {
 		payload: Buffer
 	): void {
 		switch (type) {
+			// Broadcast gossip is queued, not handled inline: see gossipIntake.
+			// Query/reply traffic stays synchronous below; it is low-volume,
+			// request-scoped, and a sync manager mid-conversation should not
+			// wait behind a queued dump.
 			case MessageType.CHANNEL_ANNOUNCEMENT:
-				this.handleChannelAnnouncement(payload);
-				break;
 			case MessageType.NODE_ANNOUNCEMENT:
-				this.handleNodeAnnouncement(payload);
+				this.enqueueBroadcastGossip(pubkey, type, payload);
 				break;
-			case MessageType.CHANNEL_UPDATE:
-				this.handleChannelUpdate(payload);
+			case MessageType.CHANNEL_UPDATE: {
+				// A peer's update for one of OUR channels is not crowd gossip:
+				// it feeds invoice route hints and blinded-path payment_relay
+				// right now, and its volume is bounded by our channel count,
+				// so it keeps the synchronous path. Decode here is cheap; the
+				// expensive signature check stays behind the graph's gates.
+				let ours = false;
+				try {
+					ours = this.channelUpdateTargetsOurChannel(
+						decodeChannelUpdateMessage(payload)
+					);
+				} catch {
+					return; // malformed gossip — same silent drop as the handler's
+				}
+				if (ours) {
+					this.handleChannelUpdate(payload);
+					break;
+				}
+				this.enqueueBroadcastGossip(pubkey, type, payload);
 				break;
+			}
 			case MessageType.REPLY_CHANNEL_RANGE: {
 				const syncMgr = this.gossipSyncManagers.get(pubkey);
 				if (syncMgr) {
@@ -10776,6 +10820,98 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Queue one broadcast gossip message. Bounded: a flood beyond the cap is
+	 * dropped newest-first (dropping oldest would orphan queued updates from
+	 * their announcements) and counted, with one structured log per overflow
+	 * episode rather than per message.
+	 */
+	private enqueueBroadcastGossip(
+		pubkey: string,
+		type: number,
+		payload: Buffer
+	): void {
+		const queued = this.gossipIntake.length - this.gossipIntakeHead;
+		if (queued >= LightningNode.GOSSIP_INTAKE_MAX) {
+			if (this.gossipIntakeDropped === 0) {
+				this.emitStructuredLog('peer', 'gossip_intake_overflow', {
+					pubkey,
+					queued
+				});
+			}
+			this.gossipIntakeDropped++;
+			return;
+		}
+		this.gossipIntake.push({ pubkey, type, payload });
+		if (!this.gossipIntakeDraining) {
+			this.gossipIntakeDraining = true;
+			setImmediate(() => this.drainGossipIntake());
+		}
+	}
+
+	/**
+	 * Verify and apply queued broadcast gossip in time-budgeted slices,
+	 * yielding to the event loop between slices so a graph-sized dump costs
+	 * throughput, never liveness. Runs until the queue is empty, then reports
+	 * how much an overflow episode dropped (if any) and closes it.
+	 */
+	private drainGossipIntake(): void {
+		const sliceStart = Date.now();
+		while (
+			this.gossipIntakeHead < this.gossipIntake.length &&
+			!this._destroyed &&
+			Date.now() - sliceStart < LightningNode.GOSSIP_INTAKE_SLICE_MS
+		) {
+			const item = this.gossipIntake[this.gossipIntakeHead++];
+			try {
+				switch (item.type) {
+					case MessageType.CHANNEL_ANNOUNCEMENT:
+						this.handleChannelAnnouncement(item.payload);
+						break;
+					case MessageType.NODE_ANNOUNCEMENT:
+						this.handleNodeAnnouncement(item.payload);
+						break;
+					case MessageType.CHANNEL_UPDATE:
+						this.handleChannelUpdate(item.payload);
+						break;
+				}
+			} catch (err) {
+				this.emitStructuredLog('peer', 'gossip_intake_failed', {
+					pubkey: item.pubkey,
+					type: item.type,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+		}
+		if (this.gossipIntakeHead < this.gossipIntake.length && !this._destroyed) {
+			setImmediate(() => this.drainGossipIntake());
+			return;
+		}
+		this.gossipIntake = [];
+		this.gossipIntakeHead = 0;
+		this.gossipIntakeDraining = false;
+		if (this.gossipIntakeDropped > 0) {
+			this.emitStructuredLog('peer', 'gossip_intake_overflow_ended', {
+				dropped: this.gossipIntakeDropped
+			});
+			this.gossipIntakeDropped = 0;
+		}
+	}
+
+	/**
+	 * Resolves when every currently queued broadcast gossip message has been
+	 * processed. Tests and callers that feed gossip and then read the graph
+	 * need this barrier; the intake is otherwise deliberately asynchronous.
+	 */
+	async flushGossip(): Promise<void> {
+		while (
+			this.gossipIntakeHead < this.gossipIntake.length ||
+			this.gossipIntakeDraining
+		) {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+	}
+
 	private getOrCreateSyncManager(pubkey: string): GossipSyncManager {
 		let mgr = this.gossipSyncManagers.get(pubkey);
 		if (!mgr) {
@@ -10811,6 +10947,11 @@ export class LightningNode extends EventEmitter {
 		} catch {
 			return; // malformed gossip — drop silently
 		}
+		// Ask the graph before paying for four signature verifications: a
+		// re-served known announcement cannot change anything (issue #437).
+		if (!this.graph.wouldAcceptChannelAnnouncement(msg)) {
+			return;
+		}
 		if (!verifyChannelAnnouncement(msg, payload)) {
 			return;
 		}
@@ -10839,6 +10980,16 @@ export class LightningNode extends EventEmitter {
 			msg = decodeNodeAnnouncementMessage(payload);
 		} catch {
 			return; // malformed gossip (e.g. zero timestamp) — drop silently
+		}
+		// Verification is worth paying for only if SOME consumer would take
+		// the result: the graph (freshness/verified gate) or the channel-peer
+		// address capture below (its own freshness map). Otherwise this is a
+		// re-served known announcement and its signature proves nothing new.
+		if (
+			!this.graph.wouldAcceptNodeAnnouncement(msg) &&
+			!this.nodeAnnouncementCaptureWorthwhile(msg)
+		) {
+			return;
 		}
 		if (!verifyNodeAnnouncement(msg, payload)) {
 			return;
@@ -10884,6 +11035,21 @@ export class LightningNode extends EventEmitter {
 	 * promotes a fallback once a dial to it succeeds). The newest announcement
 	 * always supersedes, including down to an empty address list.
 	 */
+	/**
+	 * The pre-verification mirror of captureChannelPeerAddresses' own gates:
+	 * true only for a channel peer's announcement strictly newer than the one
+	 * whose addresses we already hold. Must not drift from that method.
+	 */
+	private nodeAnnouncementCaptureWorthwhile(
+		msg: INodeAnnouncementMessage
+	): boolean {
+		if (!this.peerManager) return false;
+		const pubkey = msg.nodeId.toString('hex');
+		if (!this.channelPeerPubkeys().has(pubkey)) return false;
+		const previous = this.announcedPeerAddresses.get(pubkey);
+		return !previous || msg.timestamp > previous.timestamp;
+	}
+
 	private captureChannelPeerAddresses(msg: INodeAnnouncementMessage): void {
 		if (!this.peerManager) return;
 		const pubkey = msg.nodeId.toString('hex');
@@ -10929,6 +11095,11 @@ export class LightningNode extends EventEmitter {
 		if (!channel) {
 			return; // no prior announcement
 		}
+		// A stale re-send against a verified slot cannot change the graph;
+		// refuse it by timestamp before paying for the signature (issue #437).
+		if (!this.graph.wouldAcceptChannelUpdate(msg)) {
+			return;
+		}
 		if (!verifyChannelUpdate(msg, payload, channel.nodeId1, channel.nodeId2)) {
 			return;
 		}
@@ -10955,6 +11126,25 @@ export class LightningNode extends EventEmitter {
 	 * policy for PRIVATE channels reaches invoice route hints and blinded-path
 	 * payment_relay; the graph only stores updates for announced channels.
 	 */
+	/**
+	 * Whether a channel_update's SCID (real or either side's alias) names one
+	 * of our own channels: the intake fork between the synchronous own-channel
+	 * path and the queued crowd-gossip path. Mirrors the candidate matching in
+	 * maybeAdoptPeerChannelPolicy below; they must not drift.
+	 */
+	private channelUpdateTargetsOurChannel(msg: IChannelUpdateMessage): boolean {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			const scids = [
+				state.shortChannelId,
+				state.scidAlias,
+				state.remoteScidAlias
+			].filter((s): s is Buffer => s !== null);
+			if (scids.some((s) => s.equals(msg.shortChannelId))) return true;
+		}
+		return false;
+	}
+
 	private maybeAdoptPeerChannelPolicy(
 		msg: IChannelUpdateMessage,
 		payload: Buffer

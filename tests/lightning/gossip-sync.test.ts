@@ -1289,7 +1289,7 @@ describe('Gossip Sync (Phase 5)', function () {
 			node.destroy();
 		});
 
-		it('serves received announcements byte-identically and withholds ones with unreproducible signed bytes (issue #340)', function () {
+		it('serves received announcements byte-identically and withholds ones with unreproducible signed bytes (issue #340)', async function () {
 			const node = makeNode();
 			const peer = 'aa'.repeat(33);
 			const cleanScid = makeScid(150, 1, 0);
@@ -1317,6 +1317,8 @@ describe('Gossip Sync (Phase 5)', function () {
 				MessageType.CHANNEL_ANNOUNCEMENT,
 				extra.payload
 			);
+			// Broadcast gossip is queued off the message path (issue #437).
+			await node.flushGossip();
 
 			const graph = node.getGraph();
 			// Both entries are routable...
@@ -1348,7 +1350,7 @@ describe('Gossip Sync (Phase 5)', function () {
 			node.destroy();
 		});
 
-		it('withholds a signed channel_update whose extra signed bytes cannot be reproduced (issue #340)', function () {
+		it('withholds a signed channel_update whose extra signed bytes cannot be reproduced (issue #340)', async function () {
 			const node = makeNode();
 			const peer = 'aa'.repeat(33);
 			const scid = makeScid(151, 1, 0);
@@ -1384,6 +1386,8 @@ describe('Gossip Sync (Phase 5)', function () {
 				MessageType.CHANNEL_UPDATE,
 				extraUpd.payload
 			);
+			// Broadcast gossip is queued off the message path (issue #437).
+			await node.flushGossip();
 
 			const ch = node.getGraph().getChannel(scid)!;
 			expect(ch.update1Verified).to.be.true;

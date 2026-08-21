@@ -191,6 +191,69 @@ export class NetworkGraph {
 		return true;
 	}
 
+	// ── Pre-verification gates ─────────────────────────────────────────────
+	// Signature verification runs in pure JS and a full-graph gossip dump from
+	// one peer carries hundreds of thousands of signatures, so the intake path
+	// asks these BEFORE verifying: each mirrors its apply method's acceptance
+	// rule under the most permissive provenance (verified), so a false here
+	// means the message cannot change the graph no matter what verification
+	// finds, and its signatures need never be checked. Keep each gate next to
+	// the rule it mirrors; they must not drift (beignet issue #437: a peer
+	// re-serving a known graph pinned the event loop for the whole dump).
+
+	/**
+	 * Whether a channel_announcement could change the graph at all. False for
+	 * a wrong chain, disordered node ids, or an SCID already held with a
+	 * verified announcement (announcements are immutable per SCID; only the
+	 * unverified-to-verified upgrade in addChannelAnnouncement remains, and it
+	 * requires matching endpoints).
+	 */
+	wouldAcceptChannelAnnouncement(msg: IChannelAnnouncementMessage): boolean {
+		if (!msg.chainHash.equals(this._chainHash)) return false;
+		if (Buffer.compare(msg.nodeId1, msg.nodeId2) >= 0) return false;
+		const existing = this._channels.get(msg.shortChannelId.toString('hex'));
+		if (!existing) return true;
+		return (
+			existing.announcementVerified !== true &&
+			existing.nodeId1.equals(msg.nodeId1) &&
+			existing.nodeId2.equals(msg.nodeId2)
+		);
+	}
+
+	/**
+	 * Whether a channel_update could change the graph at all. False when the
+	 * channel is unknown, or when the held update for that direction is
+	 * verified and not older (the verified-over-unverified takeover is then
+	 * out of reach, so a stale re-send can be refused by its timestamp alone,
+	 * never needing its signature).
+	 */
+	wouldAcceptChannelUpdate(msg: IChannelUpdateMessage): boolean {
+		const channel = this._channels.get(msg.shortChannelId.toString('hex'));
+		if (!channel) return false;
+		const direction = msg.channelFlags & CHANNEL_FLAG_DIRECTION;
+		const existing = direction === 0 ? channel.update1 : channel.update2;
+		const existingVerified =
+			direction === 0 ? channel.update1Verified : channel.update2Verified;
+		if (existing && msg.timestamp <= existing.timestamp) {
+			return existingVerified !== true;
+		}
+		return true;
+	}
+
+	/**
+	 * Whether a node_announcement could change the graph at all. False for a
+	 * channel-less node, or when the held announcement is verified and not
+	 * older (same shape as wouldAcceptChannelUpdate).
+	 */
+	wouldAcceptNodeAnnouncement(msg: INodeAnnouncementMessage): boolean {
+		const node = this._nodes.get(msg.nodeId.toString('hex'));
+		if (!node || node.channels.size === 0) return false;
+		if (node.announcement && msg.timestamp <= node.announcement.timestamp) {
+			return node.announcementVerified !== true;
+		}
+		return true;
+	}
+
 	getChannel(shortChannelId: Buffer): IGraphChannel | undefined {
 		return this._channels.get(shortChannelId.toString('hex'));
 	}
