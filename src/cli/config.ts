@@ -213,7 +213,29 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 		logLevel:
 			parseLogLevel(cliFlags.logLevel) ||
 			parseLogLevel(process.env.BEIGNET_LOG_LEVEL) ||
-			parseLogLevel(file.logLevel)
+			parseLogLevel(file.logLevel),
+		// Passed through raw: the daemon validates before booting a node, so a
+		// malformed guardian set or profile refuses startup with a precise
+		// message instead of silently changing the quorum arithmetic. Only the
+		// MODE follows the ignore-typos rule, because its fallback (off) is the
+		// safe direction and an existing quorum-marked database still refuses
+		// to start unbarriered at the library level.
+		recoveryMode:
+			cliFlags.recoveryMode ||
+			process.env.BEIGNET_RECOVERY_MODE ||
+			file.recoveryMode,
+		recoveryGuardians:
+			cliFlags.recoveryGuardians ||
+			(process.env.BEIGNET_RECOVERY_GUARDIANS
+				? process.env.BEIGNET_RECOVERY_GUARDIANS.split(',')
+						.map((g) => g.trim())
+						.filter((g) => g.length > 0)
+				: undefined) ||
+			file.recoveryGuardians,
+		recoveryProfile:
+			cliFlags.recoveryProfile ||
+			process.env.BEIGNET_RECOVERY_PROFILE ||
+			file.recoveryProfile
 	};
 }
 

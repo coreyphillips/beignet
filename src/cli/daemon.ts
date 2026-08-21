@@ -9,7 +9,12 @@ import * as net from 'net';
 import * as https from 'https';
 import * as fs from 'fs';
 import { Console } from 'console';
-import { BeignetNode, BeignetNodeOptions } from './beignet-node';
+import {
+	BeignetNode,
+	BeignetNodeOptions,
+	parseRecoveryMode
+} from './beignet-node';
+import { parseGuardianUri } from '../lightning/recovery';
 import { ILogger, createConsoleLogger } from '../logger';
 import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
@@ -156,6 +161,17 @@ export const AUTH_EXEMPT_ROUTES = new Set([
 	'GET /openapi.json'
 ]);
 
+/**
+ * Routes a restore-pending daemon still serves (GET /events bypasses this
+ * set through its own dispatcher arm, so SSE restore progress flows too).
+ */
+const RESTORE_PENDING_ROUTES = new Set([
+	'GET /recovery/status',
+	'POST /recovery/restore',
+	'GET /openapi.json',
+	'POST /stop'
+]);
+
 /** HTTP status for a failure envelope; unmapped codes are server faults. */
 const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	INVALID_PARAMS: 400,
@@ -188,7 +204,20 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	L402_FETCH_FAILED: 502,
 	// Unknown channel / wrong state / nothing recorded to rebroadcast are all
 	// problems with the caller's request, not node faults: never a 5xx.
-	REBROADCAST_FAILED: 400
+	REBROADCAST_FAILED: 400,
+	// Recovery Protocol surface (docs/RECOVERY-PROTOCOL.md section 8).
+	// 503s are genuinely retryable (a quorum that answers later changes the
+	// answer); 409s are state conflicts the caller must react to; the rest
+	// are caller or configuration problems, never node faults.
+	NODE_RESTORE_PENDING: 503,
+	RESTORE_IN_PROGRESS: 409,
+	RESTORE_NOT_PENDING: 409,
+	RESTORE_NO_QUORUM: 503,
+	RESTORE_CAS_EXHAUSTED: 503,
+	RESTORE_UNKNOWN_NAMESPACE: 404,
+	RESTORE_CONFLICT: 409,
+	RESTORE_HEAD_UNVERIFIABLE: 502,
+	RESTORE_TARGET_UNSUPPORTED: 400
 };
 
 export function statusForErrorCode(code: string): number {
@@ -264,7 +293,17 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		// this list a failed open is invisible to clients: the pending channel
 		// just disappears and nothing ever says why.
 		'node:error',
-		'node:ready'
+		'node:ready',
+		// Recovery Protocol (docs/RECOVERY-PROTOCOL.md section 8). Always on:
+		// low volume by construction (durability watermark advances, fences,
+		// restore progress), and the umbrel dashboard's degraded-state badge
+		// rides them.
+		'recovery:durable',
+		'recovery:fenced',
+		'recovery:backfill-lost',
+		'recovery:guardian_unreachable',
+		'recovery:restore-progress',
+		'recovery:restored'
 	];
 	if (htlcEvents === true) {
 		events.push('htlc:forwarded', 'htlc:fulfilled', 'htlc:failed');
@@ -382,6 +421,49 @@ async function bootDaemon(
 				`rateLimit.trustedProxies entry is not an IP address: ${proxy}`
 			);
 		}
+	}
+	// Recovery Protocol configuration (docs/RECOVERY-PROTOCOL.md section 8).
+	// The MODE follows the ignore-typos rule (unknown values fall back to
+	// off, the safe direction), but everything that changes the quorum
+	// arithmetic is validated hard: a silently dropped guardian or profile
+	// would leave the operator believing in protection that is not there.
+	const recoveryMode = parseRecoveryMode(opts.recoveryMode);
+	if (
+		opts.recoveryProfile !== undefined &&
+		opts.recoveryProfile !== 'crash-v1'
+	) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Unknown recovery profile "${opts.recoveryProfile}"; crash-v1 is ` +
+				'the only accepted value (and the default)'
+		);
+	}
+	const guardianEntries = opts.recoveryGuardians ?? [];
+	if (recoveryMode === 'async-remote' || recoveryMode === 'quorum') {
+		if (guardianEntries.length !== 3) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`Recovery mode ${recoveryMode} needs exactly 3 guardians ` +
+					`(crash-v1 is 2-of-3); got ${guardianEntries.length}`
+			);
+		}
+		for (const entry of guardianEntries) {
+			try {
+				parseGuardianUri(entry);
+			} catch (e) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					e instanceof Error ? e.message : String(e)
+				);
+			}
+		}
+	} else if (guardianEntries.length > 0) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Recovery guardians are configured but the recovery mode is ` +
+				`"${opts.recoveryMode ?? 'off'}" (resolved: ${recoveryMode}); ` +
+				'guardians need async-remote or quorum'
+		);
 	}
 	// Diagnostic logger: an injected opts.logger wins; otherwise a configured
 	// logLevel creates a console logger on stderr (stdout stays reserved for
@@ -1767,6 +1849,24 @@ async function bootDaemon(
 			return success(await node.payOffer(offer, amountSats, timeoutMs));
 		},
 
+		// ── Guardian Recovery (docs/RECOVERY-PROTOCOL.md section 8) ──
+		// Distinct from the SCB flows above: an SCB restore force-closes every
+		// channel; a guardian restore RESUMES them from replicated state.
+		'GET /recovery/status': () => success(node.getRecoverySurfaceStatus()),
+		'POST /recovery/restore': async (body) => {
+			// The epoch takeover permanently fences any still-running old
+			// writer, so a bare POST must not trigger it by accident.
+			const { confirm } = body as { confirm?: boolean };
+			if (confirm !== true) {
+				return failure(
+					'INVALID_PARAMS',
+					'Guardian restore permanently fences the previous writer; ' +
+						'pass {"confirm": true} to proceed'
+				);
+			}
+			return success(await node.restoreFromGuardians());
+		},
+
 		// ── Webhooks ──
 		'POST /webhooks/register': (body) => {
 			const { url, events, secret } = body as {
@@ -1999,6 +2099,27 @@ async function bootDaemon(
 				);
 				return;
 			}
+		}
+
+		// ── Restore-pending hold (docs/RECOVERY-PROTOCOL.md section 8) ──
+		// A daemon booted against a fresh database whose recovery namespace
+		// the guardian set holds has no node underneath it yet: only the
+		// recovery surface (plus SSE above, stop and the spec) can answer.
+		// Everything else, /health included, refuses with a code that says
+		// exactly what to do; health checks reading 503 as not-ready is the
+		// truthful answer for a node awaiting its state.
+		if (node.restorePending && !RESTORE_PENDING_ROUTES.has(routeKey)) {
+			endWithResult(
+				res,
+				failure(
+					'NODE_RESTORE_PENDING',
+					'This daemon is holding for a guardian restore: the database ' +
+						'is fresh and the guardian set holds its namespace. Run the ' +
+						'admin-scoped restore under /recovery, or check its status ' +
+						'route.'
+				)
+			);
+			return;
 		}
 
 		// ── Prometheus metrics endpoint (text/plain) ──

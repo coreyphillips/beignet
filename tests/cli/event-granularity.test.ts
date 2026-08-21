@@ -21,6 +21,22 @@ const NEW_EVENTS = [
 	'channel:resolved'
 ];
 const HTLC_EVENTS = ['htlc:forwarded', 'htlc:fulfilled', 'htlc:failed'];
+/** Recovery events LightningNode emits and BeignetNode relays JSON-safe. */
+const RECOVERY_NODE_EVENTS = [
+	'recovery:durable',
+	'recovery:fenced',
+	'recovery:backfill-lost'
+];
+/**
+ * Recovery events that ORIGINATE in BeignetNode (like node:ready): the
+ * daemon owns the barrier and the restore driver, so it bridges their
+ * callbacks instead of relaying a LightningNode emission.
+ */
+const RECOVERY_DAEMON_EVENTS = [
+	'recovery:guardian_unreachable',
+	'recovery:restore-progress',
+	'recovery:restored'
+];
 const BASE_EVENTS = [
 	'payment:received',
 	'payment:sent',
@@ -70,6 +86,15 @@ describe('Event granularity (M4 batch 2b)', () => {
 		it('relays node:error, with and without htlc events', () => {
 			expect(getRelayedEvents()).to.include('node:error');
 			expect(getRelayedEvents(true)).to.include('node:error');
+		});
+
+		// Low volume by construction, and the operator surface (degraded-state
+		// badges, restore progress) rides them, so they are never gated.
+		it('relays the recovery events, with and without htlc events', () => {
+			for (const e of [...RECOVERY_NODE_EVENTS, ...RECOVERY_DAEMON_EVENTS]) {
+				expect(getRelayedEvents(), e).to.include(e);
+				expect(getRelayedEvents(true), e).to.include(e);
+			}
 		});
 	});
 
@@ -220,6 +245,22 @@ describe('Event granularity (M4 batch 2b)', () => {
 				expect(beignetNodeSrc, `relay for ${e}`).to.match(
 					new RegExp(`this\\.node\\.on\\(\\s*'${e}'`)
 				);
+				expect(beignetNodeSrc, `emit for ${e}`).to.include(`this.emit('${e}'`);
+			}
+		});
+
+		it('LightningNode emits, and BeignetNode relays, the node-origin recovery events', () => {
+			for (const e of RECOVERY_NODE_EVENTS) {
+				expect(lightningNodeSrc, e).to.include(`'${e}'`);
+				expect(beignetNodeSrc, `relay for ${e}`).to.match(
+					new RegExp(`this\\.node\\.on\\(\\s*'${e}'`)
+				);
+				expect(beignetNodeSrc, `emit for ${e}`).to.include(`this.emit('${e}'`);
+			}
+		});
+
+		it('BeignetNode originates the daemon-side recovery events', () => {
+			for (const e of RECOVERY_DAEMON_EVENTS) {
 				expect(beignetNodeSrc, `emit for ${e}`).to.include(`this.emit('${e}'`);
 			}
 		});

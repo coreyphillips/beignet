@@ -1519,6 +1519,51 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/recovery/status': {
+				get: {
+					summary:
+						'Recovery Protocol status: the configured mode and guardian set, the daemon state (disabled/running/restore-required/restoring/fenced), and the node view (startup gate, durability, last durable sequence, per-channel recovery status). A 404 means the daemon predates the feature; a 200 with state "disabled" means supported but off',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description:
+								'Mode, profile, guardians, daemon state, node recovery status (null when off or restore-pending), and restore progress when one is pending or running'
+						}
+					}
+				}
+			},
+			'/recovery/restore': {
+				post: {
+					summary:
+						'Restore this node from its guardian replicas and start it on the restored state (channels RESUME instead of force-closing). Only valid while the daemon is restore-pending: a fresh database whose recovery namespace the guardian set holds. The epoch takeover permanently fences any still-running previous writer, so confirm must be true. Progress streams over SSE as recovery:restore-progress; crash-safe and re-runnable',
+					tags: ['Node'],
+					requestBody: bodyContent({ confirm: 'boolean' }),
+					responses: {
+						'200': {
+							description:
+								'Restore report: exact (wire-safety proven), frames applied, guardians repaired, and the acquired writer epoch'
+						},
+						'400': {
+							description:
+								'Missing confirm, or the target storage is unsupported'
+						},
+						'404': {
+							description: 'The guardian set does not know this namespace'
+						},
+						'409': {
+							description:
+								'Not restore-pending, a restore is already running, or conflicting guardian artifacts (outside the crash-fault model)'
+						},
+						'502': {
+							description: 'No verifiable head among the guardian answers'
+						},
+						'503': {
+							description:
+								'No guardian quorum reachable, or the epoch CAS retries were exhausted; retry when the set is reachable'
+						}
+					}
+				}
+			},
 			'/send': {
 				post: {
 					summary: 'Send on-chain Bitcoin',
