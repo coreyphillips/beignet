@@ -2,12 +2,13 @@
 
 Replicated, cryptographically versioned state continuity for Lightning channels, with channel-preserving restore and split-brain fencing.
 
-Status: Phases 1 to 6 implemented (safety transition layer + durable outbox, PR #273; hash-chained journal with snapshots, compaction and deterministic reconstruction, PR #278; Recovery Capsule over peer_storage with validated multi-candidate restore, PR #279; guardian protocol with the reference guardian, transports and quorum client, PRs #282 and #283; writer epochs, split-brain fencing, startup quarantine and the per-channel recovery status machine, PR #284; quorum durability barriers, pipelined appends, and the wire-safety proof that lets a quorum restore resume, PR #287); Phase 7 (chaos test matrix) in PR #290: in-process kill sweeps + the dedicated SIGKILL child; interop chaos follows as its own PR
+Status: Phases 1 to 6 implemented (safety transition layer + durable outbox, PR #273; hash-chained journal with snapshots, compaction and deterministic reconstruction, PR #278; Recovery Capsule over peer_storage with validated multi-candidate restore, PR #279; guardian protocol with the reference guardian, transports and quorum client, PRs #282 and #283; writer epochs, split-brain fencing, startup quarantine and the per-channel recovery status machine, PR #284; quorum durability barriers, pipelined appends, and the wire-safety proof that lets a quorum restore resume, PR #287); Phase 7 (chaos test matrix) complete (PRs #290 and #303: in-process kill sweeps, the dedicated SIGKILL child, and the interop chaos matrix); the section 8 daemon surface is implemented (issue #435), with the representative daemon SIGKILL smoke test following as its own PR
 Revision 2 (2026-07-23): epoch acquisition is now a compare-and-swap takeover and restoration fences before reconstructing; reestablish is described as a consistency gate, not a proof of exact recovery; uncertain recovery states may never broadcast the stored local commitment
 Revision 3 (2026-07-27): applied an external design review of revision 2. Guardians gain explicit durability obligations and the backfill verbs SYNC_RECORD and SYNC_EPOCH; restoration gains a head reconciliation algorithm over a read quorum with stale-guardian repair (5.7); the node-wide journal ordering question is decided with pipelined appends and cumulative receipts (5.3); ephemeral signing sessions get a nonce-reuse invariant and a four-way disposition classification (5.10); Phase 4 gains an exact wire specification deliverable and a written comparison against LDK's Versioned Storage Service; a prior art and standardization path section was added (12)
 Revision 4 (2026-08-01): the Phase 4 gating deliverables. The guardian transport is decided and recorded (12.1): HTTP/protobuf over v3 onion services and HTTPS/protobuf over clearnet are both first-class normative transports, and BOLT 8 custom messages are not the v1 transport; the exact wire specification exists as docs/RECOVERY-GUARDIAN-WIRE.md; the written VSS comparison is completed (12.2) and concludes the guardian protocol ships as a VSS-compatible sibling with four semantic extensions VSS cannot express today; open questions 11.1, 11.2 and 11.7 are closed. Applied four external design review rounds of the wire draft: an explicit REGISTER_NODE genesis operation under a dedicated seed-derived recovery root (which is also the guardian namespace, keeping the Lightning node id out of the protocol, including out of the IV derivation), the writer lease separated from the log head so the post-takeover state is fully defined, an IMMUTABLE root-committed ChainOrigin inside the registration so an existing node enables guardians mid-journal without renumbering while a truncated store can never pass a surviving record off as its origin, a deterministic AES-GCM nonce construction keyed by recovery_id, an exact SYNC_EPOCH validation algorithm, per-verb protobuf responses with 32-byte x-only keys throughout, mandatory transport authentication for non-local deployments with credentials recoverable from the encrypted capsule, guardian-set replacement made a LITERAL v1 non-feature (one set per namespace ever; loss degrades to SCB/DLP; ROTATE_SET reserved), uncertain-store repair defined as rollback-then-replay anchored at the origin proof with re-entry to writability ONLY on quorum evidence (writer possession never proves recency), receipts certifying origin-through-head across epochs, and the obsolete 5.5 sketches replaced rather than annotated
 Revision 5 (2026-08-02): Phase 6 as built. Durability becomes a property a FRAME DECLARES rather than a runtime setting, which is what turns exact restore from an assertion into evidence: 5.8 gains the sticky-quorum rule (a chain containing a quorum frame can never be followed by an unbarriered one, so a certified head reading 'quorum' also rules out the unbarriered frames a restore cannot see), and 5.6's StateUncertain marking gains its one and only exit, the wire-safety proof, derived from the restore and re-verified rather than configured. Compaction gains a retain floor: guardians hold an immutable chain from a root-committed origin and accept only logHead.sequence + 1, so a frame pruned before it replicated wedges that guardian permanently and, under a barrier, blocks every channel on the node. Replication gains what a barrier needs to stand on: receipts bound to the namespace, epoch and frame hash before they can release anything, a single-flight monotone watermark, a fence that requires a signed higher epoch rather than one endpoint's unsigned rejection, and genuinely pipelined appends per 5.3.
 Revision 6 (2026-08-04): Phase 7 acceptance corrected before the chaos work starts. The process-level SIGKILL target is a production LightningNode assembly running in a dedicated child process, not the CLI daemon, whose recovery surface (section 8) remains unimplemented; naming the daemon as the kill target would have tested configuration plumbing that does not exist yet. The dedicated child carries the complete kill-point matrix. Once the section 8 daemon surface ships, a representative daemon SIGKILL smoke test must prove the daemon constructs and restarts the same recovery-enabled assembly; validating that configuration surface is that test's job, and the child harness makes no claim about it.
+Revision 7 (2026-08-21): the section 8 daemon surface is implemented (issue #435) and section 8 is corrected to the API as built: no monolithic RecoveryConfig (the barrier and startup gate are constructed outside the node through the shared assembly helper buildGuardianRecovery, which also makes the boot decision); restore is the pre-node RestoreDriver against an empty database rather than the never-built node.restoreFromRecoveryReplicas, surfaced on the daemon as a restore-pending boot state plus POST /recovery/restore; the event set is recovery:durable / recovery:fenced / recovery:backfill-lost from the node plus embedder-origin recovery:guardian_unreachable / recovery:restore-progress / recovery:restored. The representative daemon SIGKILL smoke test from revision 6 is now unblocked and follows as its own PR.
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
 Audience: an implementing agent or engineer. Every code reference below was verified against the codebase as of beignet 0.7.0 (2026-07-22). Re-verify line numbers before editing; file and symbol names are the stable anchors.
 
@@ -724,40 +725,94 @@ These distinctions must appear in user-facing documentation and in the API docs 
 
 ## 8. Public API and configuration surface
 
+This section describes the surface AS BUILT (revision 7); the original sketch
+predates phases 5 and 6 and differed in three ways worth recording. First,
+there is no monolithic `RecoveryConfig` with a `guardians` list: the barrier
+and the startup gate are constructed OUTSIDE the node (the gate must exist at
+node construction or it races the constructor's auto-reconnect dials), and
+`buildGuardianRecovery` in `src/lightning/recovery/assembly.ts` is the one
+call embedders share to do that wiring. Second, restore is not a method on a
+running node: the fence-before-restore invariant (5.7) means restoration runs
+against an EMPTY database BEFORE any node exists, as the standalone
+`RestoreDriver`; the sketched `node.restoreFromRecoveryReplicas()` was never
+built and never will be in that shape. Third, the event set changed:
+`recovery:backfill-lost` exists (the namespace-is-finished signal, 5.3), and
+`recovery:guardian_unreachable` / `recovery:restored` are embedder-origin
+events (the embedder owns the barrier callbacks and the restore driver), not
+LightningNode emissions.
+
 Library (all additive, default off):
 
 ```ts
-interface RecoveryConfig {
-  enabled: boolean;                    // default false
-  durability: RecoveryDurability;      // default 'async-remote' when enabled
-  barrier?: DurabilityBarrier;         // required when durability is 'quorum'
-  startupGate?: GuardianStartupGate;   // required for a guardian-backed node
-  guardians?: GuardianDescriptor[];    // absent = peer_storage checkpoints only
-  profile?: 'crash-v1';                // the only accepted value in v1 (12.1)
+// INodeConfig.recovery (src/lightning/node/types.ts)
+recovery?: {
+  enabled?: boolean;                   // default false
+  durability?: RecoveryDurability;     // 'local' | 'async-remote' | 'quorum'
+  barrier?: DurabilityBarrier;         // built outside; required for quorum,
+                                       // and it drives replication in every mode
+  startupGate?: GuardianStartupGate;   // built outside; required for a
+                                       // guardian-backed node, AT construction
+  maxRetainedFrameGap?: number;
   snapshotIntervalFrames?: number;
-}
+  snapshotIntervalBytes?: number;
+};
 
-// LightningNode additions
-node.getRecoveryStatus(): RecoveryStatus;    // durability, lastDurableSequence, per-channel ChannelRecoveryStatus + awaitingDurability
+// The shared integrator wiring (src/lightning/recovery/assembly.ts)
+parseGuardianUri('<64-hex-x-only-pubkey>@<http(s) url>'): IParsedGuardian;
+buildGuardianRecovery({storage, nodeSecret, durability, guardians, ...}):
+  Promise<GuardianBootDecision>;
+// GuardianBootDecision:
+//   run              -> the recovery config fragment + confirm() to drive the
+//                       gate after node construction
+//   restore-required -> the namespace lives on the guardians and this
+//                       database is fresh; buildRestoreDriver() -> RestoreDriver
+//   unavailable      -> no quorum to decide ownership with; retry, never guess
+
+// LightningNode
+node.getRecoveryStatus();  // { gate, durability, startupRepairPending,
+                           //   lastDurableSequence, awaitingDurabilityCount,
+                           //   fenced, backfillLost, channels: [{ channelId,
+                           //   status: ChannelRecoveryStatus,
+                           //   awaitingDurability }] }
 // awaitingDurability sits BESIDE the status rather than becoming an eighth
 // ChannelRecoveryStatus member: the seven values are the 5.7 machine and
 // describe what is known about a channel's STATE, while waiting on a receipt
 // says nothing about the state, only that a message it authorized has not been
 // let out yet.
-node.restoreFromRecoveryReplicas(opts): Promise<RestoreReport>;
-events: 'recovery:durable', 'recovery:guardian_unreachable', 'recovery:fenced', 'recovery:restored'
+
+// Restore (pre-node, empty target database; 5.7):
+new RestoreDriver({target, guardians, context, required, recoveryRoot,
+  nodeSecret, nodeId, onEvent}).restore(): Promise<IRestoreResult>;
+
+// LightningNode events: 'recovery:durable' (through: bigint),
+// 'recovery:fenced' (superseding?: GuardianState),
+// 'recovery:backfill-lost' (detail: string)
+// Embedder-origin events (bridged from the barrier's onEvent and the restore
+// driver): 'recovery:guardian_unreachable', 'recovery:restore-progress',
+// 'recovery:restored'
 ```
 
-CLI daemon (`src/cli/`), for embedders such as beignet-umbrel, following the existing `BEIGNET_*` env convention:
+CLI daemon (`src/cli/`), for embedders such as beignet-umbrel, following the existing `BEIGNET_*` env convention (implemented, issue #435):
 
 ```text
 BEIGNET_RECOVERY_MODE = off | peer-storage | async-remote | quorum
-BEIGNET_RECOVERY_GUARDIANS = comma-separated guardian URIs
+BEIGNET_RECOVERY_GUARDIANS = comma-separated <64-hex-x-only-pubkey>@<url>
+(exactly three in the guardian modes; a malformed entry refuses startup, and
+an unknown MODE falls back to off per the daemon's typo rule, which is safe
+because a quorum-marked database still refuses to start unbarriered)
 BEIGNET_RECOVERY_PROFILE = crash-v1 (the only accepted value in v1; no
 free-form quorum tuples, per 12.1)
 ```
 
-Plus REST endpoints on the daemon: `GET /recovery/status`, `POST /recovery/restore`.
+Plus REST endpoints on the daemon: `GET /recovery/status` (readonly scope; the
+capability probe: 404 = predates the feature, 200 with state 'disabled' =
+supported but off) and `POST /recovery/restore` (admin scope, requires
+`{"confirm": true}` because the takeover permanently fences the previous
+writer; only answers on a daemon booted restore-pending, i.e. a fresh database
+whose namespace the guardian set holds, and every other route answers 503
+NODE_RESTORE_PENDING in that state). The daemon relays all six recovery
+events over SSE and webhooks, and `beignet recovery status|restore` are the
+CLI commands.
 
 ## 9. Implementation phases and acceptance criteria
 

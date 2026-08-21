@@ -147,6 +147,8 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'GET /backup/scb': ['readonly'],
 	'GET /backup/peer-retrieved': ['readonly'],
 	'GET /queue': ['readonly'],
+	// Recovery Protocol status: diagnostics, like /channel/diagnostics.
+	'GET /recovery/status': ['readonly'],
 
 	// ── Read-only POSTs (pure queries, no state change, no funds) ──
 	'POST /route/estimate': ['readonly'],
@@ -258,6 +260,8 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /backup': [],
 	'POST /backup/trigger': [],
 	'POST /restore/scb': [],
+	// The guardian-restore takeover permanently fences the previous writer.
+	'POST /recovery/restore': [],
 	'POST /watchtower/add': [],
 	'DELETE /watchtower/remove': [],
 	'POST /webhooks/register': [],

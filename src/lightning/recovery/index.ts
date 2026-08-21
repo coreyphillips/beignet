@@ -28,3 +28,4 @@ export * from './startup-gate';
 export * from './channel-status';
 export * from './durability-barrier';
 export * from './wire-safety';
+export * from './assembly';

@@ -518,6 +518,20 @@ export interface BeignetConfig {
 	 *  'silent'). When set, the daemon prints leveled diagnostics to stderr;
 	 *  unset keeps the daemon silent (status quo). */
 	logLevel?: TLogLevel;
+	/** Recovery Protocol mode (docs/RECOVERY-PROTOCOL.md section 8):
+	 *  'off' | 'peer-storage' | 'async-remote' | 'quorum'. Exact values only;
+	 *  anything else is ignored and the default (off) rules. Env:
+	 *  BEIGNET_RECOVERY_MODE. */
+	recoveryMode?: string;
+	/** Guardian set for async-remote/quorum modes, as
+	 *  "<64-hex-x-only-pubkey>@<http(s) url>" URIs (crash-v1: exactly three).
+	 *  Malformed entries refuse daemon startup rather than silently changing
+	 *  the quorum arithmetic. Env: BEIGNET_RECOVERY_GUARDIANS (comma list). */
+	recoveryGuardians?: string[];
+	/** Recovery fault-model profile. 'crash-v1' is the only accepted value
+	 *  and the default when a guardian mode is configured. Env:
+	 *  BEIGNET_RECOVERY_PROFILE. */
+	recoveryProfile?: string;
 }
 
 export interface HealthInfo {
@@ -930,5 +944,29 @@ export interface BeignetNodeEvents {
 		from: { host: string; port: number };
 		to: { host: string; port: number };
 		timestamp: number;
+	}) => void;
+	/** Recovery Protocol (docs/RECOVERY-PROTOCOL.md section 8). The first
+	 *  three originate in LightningNode and are relayed JSON-safe; the last
+	 *  three originate here (the daemon owns the barrier and the restore). */
+	'recovery:durable': (data: { through: string }) => void;
+	'recovery:fenced': (data: {
+		supersededBy: {
+			epoch: string;
+			writerPublicKey: string;
+			sequence: string;
+			frameHash: string;
+		} | null;
+	}) => void;
+	'recovery:backfill-lost': (data: { detail: string }) => void;
+	'recovery:guardian_unreachable': (data: {
+		detail: string;
+		sequence?: string;
+	}) => void;
+	'recovery:restore-progress': (data: { type: string; detail: string }) => void;
+	'recovery:restored': (data: {
+		exact: boolean;
+		framesApplied: number;
+		guardiansRepaired: number;
+		epoch: string;
 	}) => void;
 }

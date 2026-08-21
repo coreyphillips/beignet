@@ -66,6 +66,8 @@ describe('OpenAPI Spec Completeness', () => {
 		'/backup/scb',
 		'/backup/peer-retrieved',
 		'/restore/scb',
+		'/recovery/status',
+		'/recovery/restore',
 		'/send',
 		'/stats',
 		'/events',

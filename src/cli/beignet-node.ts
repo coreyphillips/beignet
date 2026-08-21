@@ -72,7 +72,20 @@ import {
 	Network,
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY
 } from '../lightning/invoice/types';
-import { LnCoinType } from '../lightning/keys/wallet-keys';
+import {
+	LnCoinType,
+	deriveLightningKeysFromMnemonic
+} from '../lightning/keys/wallet-keys';
+import {
+	GuardianBootDecision,
+	GuardianState,
+	IParsedGuardian,
+	IRestoreResult,
+	RestoreRefusedError,
+	buildGuardianRecovery,
+	parseGuardianUri
+} from '../lightning/recovery';
+import { INodeConfig } from '../lightning/node/types';
 import {
 	BITCOIN_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
@@ -278,6 +291,23 @@ export interface BeignetNodeOptions {
 	 */
 	watchtowers?: string[];
 	/**
+	 * Recovery Protocol mode (docs/RECOVERY-PROTOCOL.md section 8). Exact
+	 * values 'off' | 'peer-storage' | 'async-remote' | 'quorum'; anything
+	 * else is treated as off, the safe fallback (an existing quorum-marked
+	 * database still refuses to start unbarriered at the library level).
+	 */
+	recoveryMode?: string;
+	/**
+	 * Guardian set for the guardian-backed modes, as
+	 * "<64-hex-x-only-pubkey>@<http(s) url>" URIs (crash-v1: exactly three).
+	 * A malformed entry throws rather than silently changing the quorum
+	 * arithmetic; the daemon validates these before create so a typo never
+	 * boots a node.
+	 */
+	recoveryGuardians?: string[];
+	/** Fault-model profile; 'crash-v1' is the only value and the default. */
+	recoveryProfile?: string;
+	/**
 	 * Encrypt the SQLite database at rest with a key derived from the wallet
 	 * seed (default true). An existing plaintext database is migrated in place
 	 * on first open; restoring a backup requires the same mnemonic. Set false
@@ -322,6 +352,33 @@ const DEFAULT_DATA_DIR = path.join(
 	'.beignet',
 	'data'
 );
+
+export type RecoveryMode = 'off' | 'peer-storage' | 'async-remote' | 'quorum';
+
+/**
+ * Exact values only; anything else is off. The typo-tolerant fallback is
+ * safe here because guardians configured alongside an unrecognized mode
+ * still refuse daemon startup (guardians require a guardian mode), and an
+ * existing quorum-marked database refuses to start unbarriered at the
+ * library level, so a typo can never silently downgrade a protected node.
+ */
+export function parseRecoveryMode(value: string | undefined): RecoveryMode {
+	return value === 'peer-storage' ||
+		value === 'async-remote' ||
+		value === 'quorum'
+		? value
+		: 'off';
+}
+
+/** RestoreRefusedError reasons as daemon error codes (HTTP mapping lives in daemon.ts). */
+const RESTORE_ERROR_CODES: Record<RestoreRefusedError['reason'], string> = {
+	'no-quorum': 'RESTORE_NO_QUORUM',
+	'unknown-namespace': 'RESTORE_UNKNOWN_NAMESPACE',
+	conflict: 'RESTORE_CONFLICT',
+	'cas-exhausted': 'RESTORE_CAS_EXHAUSTED',
+	'head-unverifiable': 'RESTORE_HEAD_UNVERIFIABLE',
+	'target-unsupported': 'RESTORE_TARGET_UNSUPPORTED'
+};
 
 /**
  * Compute the default per-wallet data directory for a mnemonic.
@@ -573,6 +630,28 @@ export class BeignetNode extends EventEmitter {
 	private _sweepRefreshTimer?: ReturnType<typeof setInterval>;
 	/** Background timer waiting for Electrum before fallback-fund recovery (see runFallbackRecoveryWhenConnected). */
 	private _fallbackRecoveryTimer?: ReturnType<typeof setInterval>;
+	// ─── Recovery Protocol surface (docs/RECOVERY-PROTOCOL.md section 8) ───
+	/** Parsed mode; 'off' unless a recognized mode was configured. */
+	private recoveryMode: RecoveryMode = 'off';
+	/** Parsed guardian set, kept for the status surface. */
+	private recoveryGuardianSet: IParsedGuardian[] = [];
+	/** The node-level recovery config fragment initNode passes at construction. */
+	private recoveryNodeConfig?: INodeConfig['recovery'];
+	/** The assembled run decision (guardian modes only). */
+	private _recoveryRun?: Extract<GuardianBootDecision, { kind: 'run' }>;
+	/** Present while this device must restore before it can run. */
+	private _restoreDecision?: Extract<
+		GuardianBootDecision,
+		{ kind: 'restore-required' }
+	>;
+	/** True from the restore-required decision until initNode completes. */
+	private _restorePending = false;
+	private _restoreInFlight = false;
+	private _lastRestoreEvent?: { type: string; detail: string };
+	/** init opts, kept so a restore can run the deferred node construction. */
+	private _deferredOpts?: BeignetNodeOptions;
+	/** Backoff timer for the startup gate confirmation loop. */
+	private _confirmTimer?: ReturnType<typeof setTimeout>;
 	private mnemonic: string;
 	private networkName: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	private dataDir: string;
@@ -670,31 +749,6 @@ export class BeignetNode extends EventEmitter {
 		this.rapidGossipSync = opts.rapidGossipSync ?? true;
 		this.rapidGossipSyncUrl = opts.rapidGossipSyncUrl;
 		const networkName = this.networkName;
-		const defaults = DEFAULT_ELECTRUM[networkName];
-		const rawElectrumHost = opts.electrumHost || defaults.host;
-		const electrumPort = opts.electrumPort || defaults.port;
-		const electrumTls = opts.electrumTls ?? defaults.useTls;
-
-		// Resolve the Electrum host to IPv4 up front. A `.local` (mDNS) or
-		// dual-stack name often resolves to an IPv6 link-local address (fe80::…)
-		// first, which the Electrum client's bare socket.connect(port, host)
-		// stalls on (link-local needs a %zone id), producing intermittent
-		// "Unable to connect" / blockHeight 0. Pin to the routable IPv4 address.
-		const electrumHost = await resolveHostToIPv4(rawElectrumHost);
-		if (electrumHost !== rawElectrumHost) {
-			this.log('info', 'Resolved Electrum host to IPv4', {
-				host: rawElectrumHost,
-				ipv4: electrumHost
-			});
-		}
-
-		// 1. Map network name to beignet types
-		const beignetNetwork = this.toBeignetNetwork(networkName);
-		const lnNetwork = this.toLnNetwork(networkName);
-		const coinType = this.toCoinType(networkName);
-		let chainHash = BITCOIN_CHAIN_HASH;
-		if (networkName === 'regtest') chainHash = REGTEST_CHAIN_HASH;
-		if (networkName === 'signet') chainHash = SIGNET_CHAIN_HASH;
 
 		// 2. Acquire the single-instance lock before touching storage. Two
 		// instances on one data dir share a node identity (peer churns the
@@ -765,6 +819,60 @@ export class BeignetNode extends EventEmitter {
 			encryptionKey ? { encryptionKey } : undefined
 		);
 		this.storage.open();
+
+		// Recovery Protocol boot decision (docs/RECOVERY-PROTOCOL.md section
+		// 8). Guardian modes ask the guardian set who owns this namespace
+		// BEFORE any node exists: a fresh database whose namespace the
+		// guardians hold must restore, never run, and the daemon holds it in
+		// the restore-pending state until restoreFromGuardians completes.
+		await this.prepareRecovery(opts);
+		if (this._restorePending) {
+			this._deferredOpts = opts;
+			this.log(
+				'warn',
+				'Recovery restore required: this database is fresh and the ' +
+					'guardian set holds its namespace. The daemon serves only the ' +
+					'recovery surface until POST /recovery/restore runs.'
+			);
+			return;
+		}
+
+		await this.initNode(opts);
+	}
+
+	/**
+	 * Everything past the boot decision: on-chain wallet, Electrum, the
+	 * LightningNode itself and its listeners. Runs from init for a runnable
+	 * node, and from restoreFromGuardians for a node that booted
+	 * restore-pending.
+	 */
+	private async initNode(opts: BeignetNodeOptions): Promise<void> {
+		const networkName = this.networkName;
+		const defaults = DEFAULT_ELECTRUM[networkName];
+		const rawElectrumHost = opts.electrumHost || defaults.host;
+		const electrumPort = opts.electrumPort || defaults.port;
+		const electrumTls = opts.electrumTls ?? defaults.useTls;
+
+		// Resolve the Electrum host to IPv4 up front. A `.local` (mDNS) or
+		// dual-stack name often resolves to an IPv6 link-local address (fe80::…)
+		// first, which the Electrum client's bare socket.connect(port, host)
+		// stalls on (link-local needs a %zone id), producing intermittent
+		// "Unable to connect" / blockHeight 0. Pin to the routable IPv4 address.
+		const electrumHost = await resolveHostToIPv4(rawElectrumHost);
+		if (electrumHost !== rawElectrumHost) {
+			this.log('info', 'Resolved Electrum host to IPv4', {
+				host: rawElectrumHost,
+				ipv4: electrumHost
+			});
+		}
+
+		// 1. Map network name to beignet types
+		const beignetNetwork = this.toBeignetNetwork(networkName);
+		const lnNetwork = this.toLnNetwork(networkName);
+		const coinType = this.toCoinType(networkName);
+		let chainHash = BITCOIN_CHAIN_HASH;
+		if (networkName === 'regtest') chainHash = REGTEST_CHAIN_HASH;
+		if (networkName === 'signet') chainHash = SIGNET_CHAIN_HASH;
 
 		// 3. Create on-chain wallet
 		const electrumServer = {
@@ -939,7 +1047,8 @@ export class BeignetNode extends EventEmitter {
 			peerStorageEnabled: this.peerStorageEnabled,
 			autoRebalance: opts.autoRebalance,
 			autoTuneFees: opts.autoTuneFees,
-			watchtowers: opts.watchtowers
+			watchtowers: opts.watchtowers,
+			recovery: this.recoveryNodeConfig
 		});
 
 		// If the wallet sweep address couldn't be resolved yet (e.g. Electrum was
@@ -1238,6 +1347,37 @@ export class BeignetNode extends EventEmitter {
 			this.emit('node:ready');
 		});
 
+		// Recovery Protocol events (docs/RECOVERY-PROTOCOL.md section 8),
+		// relayed with JSON-safe payloads. recovery:guardian_unreachable and
+		// the restore events originate HERE rather than in LightningNode: the
+		// daemon owns the barrier and the restore driver, so it bridges their
+		// callbacks (see prepareRecovery and restoreFromGuardians).
+		this.node.on('recovery:durable', (through: bigint) => {
+			this.emit('recovery:durable', { through: through.toString() });
+		});
+		this.node.on('recovery:fenced', (superseding?: GuardianState) => {
+			this.log(
+				'error',
+				'Recovery fenced: a newer writer epoch owns this namespace; ' +
+					'this device must not send another channel message'
+			);
+			this.emit('recovery:fenced', {
+				supersededBy: superseding
+					? {
+							epoch: superseding.lease.epoch.toString(),
+							writerPublicKey:
+								superseding.lease.writerPublicKey.toString('hex'),
+							sequence: superseding.logHead.sequence.toString(),
+							frameHash: superseding.logHead.frameHash.toString('hex')
+					  }
+					: null
+			});
+		});
+		this.node.on('recovery:backfill-lost', (detail: string) => {
+			this.log('error', 'Recovery backfill lost', { detail });
+			this.emit('recovery:backfill-lost', { detail });
+		});
+
 		// Peer storage: peers that hold our SCB return it on every reconnect.
 		// Keep only blobs that decrypt as OUR backup (a peer may return stale
 		// data or garbage) and only the newest of those. Never auto-restored.
@@ -1332,6 +1472,297 @@ export class BeignetNode extends EventEmitter {
 		// socket otherwise surfaces a noisy "Connection to server lost" trace.
 		if (this.sweepDestinationScript) {
 			this.runFallbackRecoveryWhenConnected();
+		}
+
+		// 14. Guardian modes: confirm the writer lease with the quorum. The
+		// gate holds ALL peer traffic until this succeeds, so it retries on a
+		// backoff for as long as the guardians are unreachable (spec 5.6:
+		// silence is not evidence of ownership, and a quarantined node safely
+		// does nothing).
+		if (this._recoveryRun) {
+			this.startRecoveryConfirmLoop();
+		}
+	}
+
+	/**
+	 * Parse the recovery configuration and, in a guardian mode, make the boot
+	 * decision against the guardian set. Sets recoveryNodeConfig for initNode
+	 * (run), or _restorePending (restore-required), or throws (unavailable:
+	 * no quorum to decide ownership with, which a fresh boot cannot proceed
+	 * past; a restarting daemon self-heals when the guardians return).
+	 */
+	private async prepareRecovery(opts: BeignetNodeOptions): Promise<void> {
+		const mode = parseRecoveryMode(opts.recoveryMode);
+		this.recoveryMode = mode;
+		if (mode === 'off') return;
+		if (mode === 'peer-storage') {
+			// Journal + Recovery Capsule over peer_storage, no guardians.
+			// 'local' is the honest durability label for a node with no
+			// replicator; capsule distribution rides peerStorageEnabled.
+			this.recoveryNodeConfig = { enabled: true, durability: 'local' };
+			return;
+		}
+		// Guardian-backed modes. The daemon validates the guardian set before
+		// create; parsing again here gives library callers the same refusals.
+		const guardians = (opts.recoveryGuardians ?? []).map(parseGuardianUri);
+		this.recoveryGuardianSet = guardians;
+		const coinType = this.toCoinType(this.networkName);
+		const keys = deriveLightningKeysFromMnemonic(
+			this.mnemonic,
+			undefined,
+			coinType
+		);
+		const decision = await buildGuardianRecovery({
+			storage: this.storage,
+			nodeSecret: keys.nodePrivateKey,
+			durability: mode,
+			guardians,
+			onBarrierEvent: (event) => {
+				if (event.type === 'barrier:unreachable') {
+					this.log('warn', 'Recovery guardian unreachable', {
+						detail: event.detail
+					});
+					this.emit('recovery:guardian_unreachable', {
+						detail: event.detail,
+						...(event.sequence !== undefined
+							? { sequence: event.sequence.toString() }
+							: {})
+					});
+				}
+			},
+			onGateEvent: (event) => {
+				this.log(
+					event.type === 'gate:fenced' ? 'error' : 'info',
+					`Recovery gate: ${event.type}`,
+					{ detail: event.detail }
+				);
+			},
+			onReplicationEvent: (event) => {
+				this.log('debug', `Recovery replication: ${event.type}`, {
+					detail: event.detail
+				});
+			}
+		});
+		if (decision.kind === 'run') {
+			this._recoveryRun = decision;
+			this.recoveryNodeConfig = decision.recovery;
+			return;
+		}
+		if (decision.kind === 'restore-required') {
+			this._restoreDecision = decision;
+			this._restorePending = true;
+			return;
+		}
+		throw new BeignetError(
+			'RECOVERY_UNAVAILABLE',
+			`Recovery ${decision.outcome}: ${decision.detail}. Ownership of ` +
+				'this namespace cannot be decided without a guardian quorum; ' +
+				'retry when the guardian set is reachable.'
+		);
+	}
+
+	/**
+	 * Confirm the writer lease with the guardian quorum, retrying on a
+	 * 5s-doubling-to-60s backoff until confirmed or fenced. The gate opening
+	 * releases the node's held dials; a fence is relayed so operators see it.
+	 */
+	private startRecoveryConfirmLoop(): void {
+		const run = this._recoveryRun;
+		if (!run) return;
+		let delayMs = 5_000;
+		const attempt = async (): Promise<void> => {
+			if (this.destroyed) return;
+			try {
+				const outcome = await run.confirm();
+				if (outcome.state === 'confirmed') {
+					this.log('info', 'Recovery gate confirmed; peer traffic released', {
+						confirming: outcome.confirming
+					});
+					return;
+				}
+				if (outcome.state === 'fenced') {
+					// The gate found a newer epoch at startup: same event the
+					// barrier relays for a running node, same payload shape.
+					this.emit('recovery:fenced', {
+						supersededBy: outcome.supersededBy
+							? {
+									epoch: outcome.supersededBy.lease.epoch.toString(),
+									writerPublicKey:
+										outcome.supersededBy.lease.writerPublicKey.toString('hex'),
+									sequence: outcome.supersededBy.logHead.sequence.toString(),
+									frameHash:
+										outcome.supersededBy.logHead.frameHash.toString('hex')
+							  }
+							: null
+					});
+					return;
+				}
+				this.log('warn', 'Recovery gate still quarantined; retrying', {
+					confirming: outcome.confirming,
+					nextRetryMs: delayMs
+				});
+			} catch (err) {
+				this.log('warn', 'Recovery gate confirmation attempt failed', {
+					error: err instanceof Error ? err.message : String(err),
+					nextRetryMs: delayMs
+				});
+			}
+			this._confirmTimer = setTimeout(() => {
+				void attempt();
+			}, delayMs);
+			this._confirmTimer.unref?.();
+			delayMs = Math.min(delayMs * 2, 60_000);
+		};
+		void attempt();
+	}
+
+	/** True while the daemon must hold every route except the recovery surface. */
+	get restorePending(): boolean {
+		return this._restorePending;
+	}
+
+	/**
+	 * The recovery picture for GET /recovery/status. Always answers (a 404
+	 * from an older daemon is the "predates the feature" probe; a 200 with
+	 * state 'disabled' means supported but off).
+	 */
+	getRecoverySurfaceStatus(): {
+		mode: RecoveryMode;
+		profile: 'crash-v1' | null;
+		guardians: Array<{ guardianId: string; url: string }>;
+		state: 'disabled' | 'running' | 'restore-required' | 'restoring' | 'fenced';
+		node: ReturnType<LightningNode['getRecoveryStatus']> | null;
+		restore?: {
+			inProgress: boolean;
+			lastEvent?: { type: string; detail: string };
+		};
+	} {
+		const guardians = this.recoveryGuardianSet.map((g) => ({
+			guardianId: g.guardianId.toString('hex'),
+			url: g.url
+		}));
+		const profile =
+			this.recoveryMode === 'async-remote' || this.recoveryMode === 'quorum'
+				? ('crash-v1' as const)
+				: null;
+		if (this.recoveryMode === 'off') {
+			return {
+				mode: 'off',
+				profile: null,
+				guardians: [],
+				state: 'disabled',
+				node: null
+			};
+		}
+		if (this._restorePending) {
+			return {
+				mode: this.recoveryMode,
+				profile,
+				guardians,
+				state: this._restoreInFlight ? 'restoring' : 'restore-required',
+				node: null,
+				restore: {
+					inProgress: this._restoreInFlight,
+					...(this._lastRestoreEvent
+						? { lastEvent: this._lastRestoreEvent }
+						: {})
+				}
+			};
+		}
+		const node = this.node.getRecoveryStatus();
+		return {
+			mode: this.recoveryMode,
+			profile,
+			guardians,
+			state: node.fenced || node.gate === 'fenced' ? 'fenced' : 'running',
+			node
+		};
+	}
+
+	/**
+	 * Take this namespace over from the guardian replicas and start the node
+	 * on the restored state (POST /recovery/restore). Only meaningful in the
+	 * restore-pending boot state. The epoch takeover permanently fences any
+	 * still-running old writer, which is why the daemon route demands an
+	 * explicit confirm. Crash-safe and re-runnable: the driver persists its
+	 * pending acquisition before any request and installs everything in one
+	 * transaction, so a crash lands the next boot back in restore-pending and
+	 * a second call resumes idempotently.
+	 */
+	async restoreFromGuardians(): Promise<{
+		exact: boolean;
+		framesApplied: number;
+		guardiansRepaired: number;
+		epoch: string;
+	}> {
+		// In-flight first: mid-restore the pending markers are already being
+		// consumed (the decision clears before the deferred node build), and
+		// the truthful answer for a second caller is "one is running".
+		if (this._restoreInFlight) {
+			throw new BeignetError(
+				'RESTORE_IN_PROGRESS',
+				'A guardian restore is already running; watch ' +
+					'recovery:restore-progress over SSE or poll the status route.'
+			);
+		}
+		if (!this._restorePending || !this._restoreDecision) {
+			throw new BeignetError(
+				'RESTORE_NOT_PENDING',
+				'Guardian restore only applies while the daemon is in the ' +
+					'restore-required state (a fresh database whose namespace the ' +
+					'guardian set holds). This node is ' +
+					(this.recoveryMode === 'off' || this.recoveryMode === 'peer-storage'
+						? 'not running a guardian recovery mode.'
+						: 'already running on its own state.')
+			);
+		}
+		this._restoreInFlight = true;
+		try {
+			const driver = this._restoreDecision.buildRestoreDriver((event) => {
+				this._lastRestoreEvent = { type: event.type, detail: event.detail };
+				this.log('info', `Recovery restore: ${event.type}`, {
+					detail: event.detail
+				});
+				this.emit('recovery:restore-progress', {
+					type: event.type,
+					detail: event.detail
+				});
+			});
+			let result: IRestoreResult;
+			try {
+				result = await driver.restore();
+			} catch (err) {
+				if (err instanceof RestoreRefusedError) {
+					throw new BeignetError(RESTORE_ERROR_CODES[err.reason], err.message);
+				}
+				throw err;
+			}
+			// The lease is durably installed, so re-running the boot decision
+			// short-circuits on it (already-held, no network) and yields the
+			// runnable assembly for the deferred node construction.
+			const opts = this._deferredOpts!;
+			this._restoreDecision = undefined;
+			await this.prepareRecovery(opts);
+			if (!this._recoveryRun) {
+				throw new BeignetError(
+					'INTERNAL_ERROR',
+					'Restore installed a lease but the reassembly did not yield a ' +
+						'runnable recovery state'
+				);
+			}
+			await this.initNode(opts);
+			this._restorePending = false;
+			const info = {
+				exact: result.wireSafetyProof !== undefined,
+				framesApplied: result.framesApplied,
+				guardiansRepaired: result.guardiansRepaired,
+				epoch: result.lease.epoch.toString()
+			};
+			this.emit('recovery:restored', info);
+			this.log('info', 'Recovery restore complete', info);
+			return info;
+		} finally {
+			this._restoreInFlight = false;
 		}
 	}
 
@@ -3294,6 +3725,9 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	hasPendingPayments(): boolean {
+		// A restore-pending daemon has no node and therefore no payments; the
+		// stop route's drain poll must not crash on it.
+		if (this._restorePending) return false;
 		const payments = this.node.listPayments();
 		return payments.some((p) => p.status === 'PENDING');
 	}
@@ -5951,17 +6385,22 @@ export class BeignetNode extends EventEmitter {
 			this._fallbackRecoveryTimer = undefined;
 		}
 		this.paymentQueue?.removeAllListeners();
+		if (this._confirmTimer) {
+			clearTimeout(this._confirmTimer);
+			this._confirmTimer = undefined;
+		}
 		// Await any in-flight backup before closing storage
 		if (this._backupPromise) {
 			await this._backupPromise.catch(() => {
 				/* best-effort: backup errors already surface via backup:failed */
 			});
 		}
-		await this.node.gracefulShutdown(timeoutMs);
+		// A restore-pending daemon never built the node or the wallet.
+		await (this.node as LightningNode | undefined)?.gracefulShutdown(timeoutMs);
 		this.storage.close();
 		this.removeAllListeners();
 		try {
-			await this.wallet.stop();
+			await (this.wallet as Wallet | undefined)?.stop();
 		} catch {
 			// Ignore shutdown errors
 		}
@@ -5983,12 +6422,18 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		if (this._confirmTimer) {
+			clearTimeout(this._confirmTimer);
+			this._confirmTimer = undefined;
+		}
 		this.paymentQueue?.removeAllListeners();
-		this.node.destroy();
+		// A restore-pending daemon never built the node or the wallet; the
+		// definite-assignment assertions on the fields do not change that.
+		(this.node as LightningNode | undefined)?.destroy();
 		this.storage.close();
 		this.removeAllListeners();
 		try {
-			await this.wallet.stop();
+			await (this.wallet as Wallet | undefined)?.stop();
 		} catch {
 			// Ignore shutdown errors
 		}

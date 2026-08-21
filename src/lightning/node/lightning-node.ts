@@ -15762,6 +15762,7 @@ export class LightningNode extends EventEmitter {
 			autoRebalance?: IAutoRebalanceConfig;
 			autoTuneFees?: IAutoTuneFeesConfig;
 			watchtowers?: string[];
+			recovery?: INodeConfig['recovery'];
 			channelKeyDeriver?: (
 				channelIndex: number
 			) => import('../channel/channel-manager').IPerChannelKeys;
@@ -15828,6 +15829,7 @@ export class LightningNode extends EventEmitter {
 			autoRebalance: options?.autoRebalance,
 			autoTuneFees: options?.autoTuneFees,
 			watchtowers: options?.watchtowers,
+			recovery: options?.recovery,
 			channelKeyDeriver
 		});
 	}

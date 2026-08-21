@@ -311,6 +311,8 @@ async function main(): Promise<void> {
 			return handleBackup();
 		case 'restore':
 			return handleRestore();
+		case 'recovery':
+			return handleRecovery();
 		default:
 			output({
 				ok: false,
@@ -415,6 +417,13 @@ async function handleStart(): Promise<void> {
 	const logLevelFlag = parseFlag('--log-level');
 	if (logLevelFlag)
 		cliFlags.logLevel = logLevelFlag as BeignetConfig['logLevel'];
+	const recoveryModeFlag = parseFlag('--recovery-mode');
+	if (recoveryModeFlag) cliFlags.recoveryMode = recoveryModeFlag;
+	const recoveryGuardianFlags = parseRepeatedFlag('--recovery-guardian');
+	if (recoveryGuardianFlags.length > 0)
+		cliFlags.recoveryGuardians = recoveryGuardianFlags;
+	const recoveryProfileFlag = parseFlag('--recovery-profile');
+	if (recoveryProfileFlag) cliFlags.recoveryProfile = recoveryProfileFlag;
 
 	const config = resolveConfig(cliFlags);
 
@@ -466,7 +475,10 @@ async function handleStart(): Promise<void> {
 			insecure: config.insecure,
 			forwardingEnabled: config.forwardingEnabled,
 			autoReconnect: config.autoReconnect,
-			logLevel: config.logLevel
+			logLevel: config.logLevel,
+			recoveryMode: config.recoveryMode,
+			recoveryGuardians: config.recoveryGuardians,
+			recoveryProfile: config.recoveryProfile
 		});
 
 		writePidFile(process.pid, daemonPort);
@@ -2069,6 +2081,34 @@ async function handleBackup(): Promise<void> {
 	return outputResult(await httpRequest('POST', '/backup', { destPath: sub }));
 }
 
+async function handleRecovery(): Promise<void> {
+	const sub = filteredArgs[1];
+	if (sub === 'status') {
+		// Recovery Protocol surface (docs/RECOVERY-PROTOCOL.md section 8): the
+		// mode, the guardian set, the startup gate, and how far replication
+		// provably got.
+		return outputResult(await httpRequest('GET', '/recovery/status'));
+	}
+	if (sub === 'restore') {
+		// Guardian restore, only meaningful while the daemon reports
+		// restore-required (fresh database whose namespace the guardians hold).
+		// The takeover permanently fences any still-running old writer; typing
+		// this command is the operator's confirmation, so the daemon's explicit
+		// confirm gate is satisfied here.
+		return outputResult(
+			await httpRequest('POST', '/recovery/restore', { confirm: true })
+		);
+	}
+	output({
+		ok: false,
+		error: {
+			code: 'INVALID_PARAMS',
+			message: 'Usage: beignet recovery status | beignet recovery restore'
+		}
+	});
+	process.exitCode = 1;
+}
+
 async function handleRestore(): Promise<void> {
 	const sub = filteredArgs[1];
 	const file = filteredArgs[2];
@@ -2301,6 +2341,13 @@ On-chain:
   restore db <backupFile>                Restore a database backup (full state;
                                          OFFLINE - stop the daemon first; needs
                                          the same mnemonic, DB is seed-encrypted)
+  recovery status                        Recovery Protocol status: mode, guardian
+                                         set, startup gate, durable sequence
+  recovery restore                       Restore this node from its guardian
+                                         replicas (daemon must be in the
+                                         restore-required state: fresh database,
+                                         namespace held by the guardians; channels
+                                         RESUME instead of force-closing)
 
 Peers:
   peer connect <pubkey> <host> <port>    Connect to peer
@@ -2492,6 +2539,17 @@ Start flags:
                                          included, on start or disconnect. With no
                                          listen/websocket port either, the node is
                                          genuinely quiet (reconnect is on by default)
+  --recovery-mode <mode>                 Recovery Protocol mode: off | peer-storage |
+                                         async-remote | quorum (default: off; env
+                                         BEIGNET_RECOVERY_MODE; unknown values are
+                                         ignored and off rules)
+  --recovery-guardian <pubkey@url>       One guardian of the crash-v1 set, as a
+                                         64-hex x-only pubkey @ http(s) URL. Repeat
+                                         exactly three times for async-remote/quorum
+                                         (env BEIGNET_RECOVERY_GUARDIANS, comma list)
+  --recovery-profile <name>              Recovery fault-model profile; crash-v1 is
+                                         the only accepted value and the default
+                                         (env BEIGNET_RECOVERY_PROFILE)
 
 Pay-retry flags:
   --max-retries <N>                      Max retry attempts (default: 3)

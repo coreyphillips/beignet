@@ -347,8 +347,9 @@ With `peerStorageEnabled` (default true) the node advertises
 |--------|---------|-------------|
 | `restoreFromScb(encoded)` | `Promise<{ recovering, skipped, channelCount }>` | Recover channels from an SCB blob (daemon: `POST /restore/scb` with `{ encoded }` or `{ path }`; CLI: `beignet restore scb <file>`) |
 | `beignet restore db <backupFile>` | JSON result | Copy a database backup into place (OFFLINE, local CLI operation - no daemon call) |
+| `restoreFromGuardians()` | `Promise<{ exact, framesApplied, guardiansRepaired, epoch }>` | Restore from guardian replicas and start the node on the restored state (daemon: `POST /recovery/restore` with `{ confirm: true }`; CLI: `beignet recovery restore`) |
 
-Two very different restore modes:
+Three very different restore modes:
 
 - **SCB restore = on-chain recovery only.** The backup holds no commitment
   state, so the channels themselves cannot be resumed. Each entry is
@@ -374,6 +375,68 @@ Two very different restore modes:
   stale database and going online can be unsafe (peers may prove the state
   stale); prefer the most recent backup, and rely on SCB recovery when in
   doubt.
+
+- **Guardian restore = resume the channels.** With the Recovery Protocol in a
+  guardian mode (below), the node's safety-critical state is replicated as an
+  encrypted journal to a 2-of-3 guardian set, and a restore reconstructs the
+  exact channel state and RESUMES the channels via `channel_reestablish`
+  instead of force-closing. See "Guardian recovery" next.
+
+#### Guardian recovery (Recovery Protocol)
+
+The Recovery Protocol (docs/RECOVERY-PROTOCOL.md) is configured entirely
+through env/config, following the other `BEIGNET_*` settings:
+
+```bash
+BEIGNET_RECOVERY_MODE=quorum   # off | peer-storage | async-remote | quorum
+BEIGNET_RECOVERY_GUARDIANS=<64-hex-pubkey>@https://g1.example,<64-hex-pubkey>@https://g2.example,<64-hex-pubkey>@http://<v3>.onion
+BEIGNET_RECOVERY_PROFILE=crash-v1   # optional; crash-v1 is the only value
+```
+
+- `off` (default): nothing changes.
+- `peer-storage`: the encrypted recovery journal is kept locally and a
+  Recovery Capsule (SCB + journal) is distributed over BOLT 1 peer storage.
+  No guardians involved.
+- `async-remote`: the journal also replicates in the background to the
+  guardian set (exactly three `pubkey@url` entries; the pubkey is the
+  guardian's x-only identity key). Wire traffic never waits on guardians.
+- `quorum`: safety-critical wire messages (`revoke_and_ack`,
+  `update_fulfill_htlc`, ...) are additionally HELD until the journal frame
+  behind them is acknowledged by 2 of 3 guardians. This is the strongest
+  tier: a device destroyed at any moment restores on new hardware and
+  resumes its channels, and the epoch takeover fences the old device if it
+  ever comes back.
+
+Operational notes:
+
+- A malformed guardian entry, a wrong guardian count, or guardians configured
+  without a guardian mode REFUSE daemon startup: silently dropping a guardian
+  would change the quorum arithmetic. An unknown `BEIGNET_RECOVERY_MODE`
+  value falls back to `off` (the usual typo rule), but never silently: a
+  database already marked quorum then refuses to start unbarriered at the
+  library level, and configured guardians beside a typo'd mode refuse too.
+- In the guardian modes the node boots QUARANTINED: it makes no peer
+  connections until a guardian quorum confirms this device still owns the
+  writer lease (split-brain protection). If the guardians are unreachable at
+  boot, the daemon and its API come up, peer traffic waits, and confirmation
+  retries on a backoff; `GET /recovery/status` shows `gate: "quarantined"`.
+  A normal restart does NOT need the guardians reachable: the persisted
+  lease short-circuits the boot decision, only the confirmation waits.
+- Restore-from-nothing: start the daemon with the same mnemonic, the same
+  guardian set, and a FRESH data dir. The boot detects the namespace on the
+  guardians and holds in a restore-pending state where only
+  `GET /recovery/status`, `POST /recovery/restore`, `GET /events`,
+  `GET /openapi.json` and `POST /stop` answer (everything else returns 503
+  `NODE_RESTORE_PENDING`; `/health` reads as not-ready, which is true).
+  `POST /recovery/restore` with `{ "confirm": true }` performs the guardian
+  takeover, streams `recovery:restore-progress` events over SSE/webhooks,
+  builds the node on the restored state, and returns the restore report.
+  The confirm flag is required because the takeover permanently fences any
+  still-running previous device. The restore is crash-safe and re-runnable.
+- Recovery events relayed over SSE and webhooks (always on):
+  `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`,
+  `recovery:guardian_unreachable`, `recovery:restore-progress`,
+  `recovery:restored`.
 
 #### Health & Monitoring
 
@@ -1299,6 +1362,17 @@ beignet recover-fallback-funds --fee-rate 5
 beignet backup trigger
 ```
 
+### Guardian Recovery
+
+```bash
+beignet recovery status     # Recovery Protocol status: mode, guardian set,
+                            # startup gate, last durable sequence
+beignet recovery restore    # take this namespace over from the guardian
+                            # replicas and start the node on the restored
+                            # state (restore-pending daemons only; channels
+                            # RESUME instead of force-closing)
+```
+
 ### BOLT 12 Offers
 
 ```bash
@@ -1417,6 +1491,9 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_TLS_KEY` | Path to TLS private key for HTTPS daemon |
 | `BEIGNET_HTLC_EVENTS` | `true` to relay per-HTLC events over SSE + webhooks |
 | `BEIGNET_LOG_LEVEL` | Daemon stderr log level: `debug`, `info`, `warn`, `error`, `silent` (default: silent) |
+| `BEIGNET_RECOVERY_MODE` | Recovery Protocol mode: `off`, `peer-storage`, `async-remote`, `quorum` (default: off; unknown values fall back to off) |
+| `BEIGNET_RECOVERY_GUARDIANS` | Guardian set for async-remote/quorum, comma-separated `<64-hex-x-only-pubkey>@<http(s) url>` (crash-v1: exactly three; malformed entries refuse startup) |
+| `BEIGNET_RECOVERY_PROFILE` | Recovery fault-model profile; `crash-v1` is the only accepted value and the default |
 
 ### Priority Order
 
@@ -1596,6 +1673,8 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |
 | POST | `/auth/keys/revoke` | `{ name }` | Disable a named API key immediately (admin scope; persisted, survives restarts) |
 | POST | `/auth/keys/rotate` | `{ name }` | Mint a new random secret for a named key; returned once, old secret dies immediately (admin scope; persisted) |
+| GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`fenced`), and the node view (startup gate, durability, last durable sequence, per-channel recovery status). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
+| POST | `/recovery/restore` | `{ confirm: true }` | Restore from guardian replicas and start the node on the restored state (restore-pending daemons only; channels RESUME instead of force-closing; the takeover permanently fences the previous writer). Progress streams over SSE as `recovery:restore-progress` |
 | POST | `/stop` | `{ drain?, drainTimeoutMs? }` | Stop daemon. `drain: true` waits for in-flight payments before shutting down. |
 
 ### Server-Sent Events (SSE)
@@ -1610,7 +1689,7 @@ event: channel:ready
 data: {"channelId":"cd34..."}
 ```
 
-Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`.
+Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`, and the Recovery Protocol events `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`, `recovery:guardian_unreachable`, `recovery:restore-progress`, `recovery:restored` (always on; low volume, and operator dashboards ride them).
 
 - `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
 - `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).
