@@ -704,6 +704,22 @@ export class BeignetNode extends EventEmitter {
 	 * Cleared to null on settle so later reconnects sync immediately.
 	 */
 	private _initialGossipPrime: Promise<void> | null = null;
+	/**
+	 * Resolves the boot RGS settlement the latch above waits on. The latch is
+	 * installed BEFORE the LightningNode exists (its constructor already
+	 * schedules persisted-peer reconnects, so any later install leaves a
+	 * window where an early connect sees no latch); the RGS attempt itself
+	 * starts further down the boot sequence and releases through this.
+	 */
+	private _releaseBootRgs: (() => void) | null = null;
+	/**
+	 * Pubkeys with a deferred gossip sync already queued on the latch. A
+	 * connect/disconnect/reconnect churn during the RGS window must produce
+	 * one sync per peer, not one per connect: a duplicate initiateGossipSync
+	 * resets the same sync state machine mid-handshake and re-sends the
+	 * range queries.
+	 */
+	private readonly _deferredGossipSyncs = new Set<string>();
 	private paymentQueue?: PaymentQueue;
 	private backupTimer?: ReturnType<typeof setInterval>;
 	private backupPath?: string;
@@ -1075,6 +1091,26 @@ export class BeignetNode extends EventEmitter {
 			});
 		}
 
+		// Install the gossip-prime latch before the LightningNode exists: its
+		// constructor schedules persisted-peer reconnects, and the awaits
+		// between construction and the RGS kick-off below (fee estimation,
+		// listen) would otherwise let an early peer connect observe no latch
+		// and start the full p2p sync this latch exists to defer (issue #441).
+		// The RGS attempt itself starts later in boot and releases the latch
+		// through _releaseBootRgs; the timeout therefore caps total deferral
+		// from here, which also bounds it if boot fails before RGS starts.
+		if (this.rapidGossipSync && this.networkName === 'mainnet') {
+			const settled = new Promise<void>((resolve) => {
+				this._releaseBootRgs = resolve;
+			});
+			this._initialGossipPrime = gossipPrimeLatch(
+				settled,
+				BeignetNode.INITIAL_GOSSIP_PRIME_TIMEOUT_MS
+			).then(() => {
+				this._initialGossipPrime = null;
+			});
+		}
+
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
 			network: lnNetwork,
@@ -1373,16 +1409,22 @@ export class BeignetNode extends EventEmitter {
 				if (prime) {
 					// Boot RGS is still in flight: a sync now would request the
 					// entire graph this node is about to receive from the
-					// snapshot and verify all of it (issue #441). Each peer
-					// connecting during the window gets its own continuation.
-					void prime.then(() => {
-						if (this.destroyed) return;
-						const stillConnected = this.node
-							.listPeers()
-							.some((p) => p.pubkey === pubkey);
-						if (!stillConnected) return;
-						this.startGossipSync(pubkey);
-					});
+					// snapshot and verify all of it (issue #441). One deferred
+					// sync per pubkey: a reconnect during the window must not
+					// queue a second continuation, or both would fire on
+					// release and reset the same sync state machine.
+					if (!this._deferredGossipSyncs.has(pubkey)) {
+						this._deferredGossipSyncs.add(pubkey);
+						void prime.then(() => {
+							this._deferredGossipSyncs.delete(pubkey);
+							if (this.destroyed) return;
+							const stillConnected = this.node
+								.listPeers()
+								.some((p) => p.pubkey === pubkey);
+							if (!stillConnected) return;
+							this.startGossipSync(pubkey);
+						});
+					}
 				} else {
 					this.startGossipSync(pubkey);
 				}
@@ -1517,20 +1559,19 @@ export class BeignetNode extends EventEmitter {
 		// Default graph source: download the full network graph via Rapid Gossip
 		// Sync (mainnet). Runs in the background so it never blocks startup; the
 		// graph fills in within a few seconds, enabling multi-hop routing.
-		// Connect-time p2p gossip sync defers behind the latch until this first
-		// attempt settles, success or not (issue #441).
+		// Connect-time p2p gossip sync defers behind the latch (installed
+		// earlier, before the node existed) until this first attempt settles,
+		// success or not (issue #441).
 		if (this.rapidGossipSync && this.networkName === 'mainnet') {
 			const rgs = this.syncRapidGossip().catch((err) => {
 				this.log('warn', 'Rapid gossip sync failed', {
 					error: err instanceof Error ? err.message : String(err)
 				});
 			});
-			this._initialGossipPrime = gossipPrimeLatch(
-				rgs,
-				BeignetNode.INITIAL_GOSSIP_PRIME_TIMEOUT_MS
-			).then(() => {
-				this._initialGossipPrime = null;
-			});
+			const release = this._releaseBootRgs;
+			if (release) {
+				void rgs.then(release);
+			}
 		}
 
 		// 13. Recover any funds stranded at the funding-key fallback address from

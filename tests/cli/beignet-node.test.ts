@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as http from 'http';
+import * as net from 'net';
 import { BeignetError, describeFailureCode } from '../../src/cli/errors';
 import {
 	loadConfig,
@@ -532,6 +533,81 @@ describe('Gossip sync deferral during initial RGS (issue #441)', () => {
 		release();
 		await drainDeferred();
 		expect(synced).to.deep.equal([]);
+	});
+
+	it('coalesces deferred syncs for a peer that reconnects during the window', async function () {
+		this.timeout(20_000);
+		const { bn, synced, release } = await makeNode();
+		try {
+			// connect -> disconnect -> reconnect while RGS is pending: two
+			// connect events, but only one deferred sync may fire on release.
+			bn.getNode().emit('peer:connect', 'deadbeefpeer');
+			bn.getNode().emit('peer:connect', 'deadbeefpeer');
+			expect(synced).to.deep.equal([]);
+			release();
+			await drainDeferred();
+			expect(synced).to.deep.equal(['deadbeefpeer']);
+		} finally {
+			await bn.destroy();
+		}
+	});
+
+	it('installs the latch before peers can connect on a mainnet boot', async function () {
+		this.timeout(30_000);
+		// A silent TCP server keeps the RGS https fetch pending (the TLS
+		// handshake never completes), so the latch stays installed for the
+		// whole test instead of settling on a fast connection error.
+		const sockets: net.Socket[] = [];
+		const server = net.createServer((socket) => {
+			sockets.push(socket);
+		});
+		await new Promise<void>((resolve) => {
+			server.listen(0, '127.0.0.1', resolve);
+		});
+		const port = (server.address() as net.AddressInfo).port;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-mainnet-'));
+		const bn = await BeignetNode.create({
+			network: 'mainnet',
+			dataDir: dir,
+			logLevel: 'silent',
+			autoGossipSync: true,
+			rapidGossipSyncUrl: `https://127.0.0.1:${port}/snapshot`,
+			...OFFLINE_ELECTRUM
+		});
+		try {
+			type BootSeams = {
+				_initialGossipPrime: Promise<void> | null;
+				_releaseBootRgs: (() => void) | null;
+			};
+			const seams = bn as unknown as BootSeams;
+			// The latch is installed before the LightningNode exists, so by
+			// the time create() resolves it must be present while RGS pends.
+			const prime = seams._initialGossipPrime;
+			expect(prime).to.not.equal(null);
+
+			const ln = bn.getNode();
+			const synced: string[] = [];
+			(ln as unknown as PatchedNode).initiateGossipSync = (pk): void => {
+				synced.push(pk);
+			};
+			(ln as unknown as PatchedNode).listPeers = (): Array<{
+				pubkey: string;
+			}> => [{ pubkey: 'deadbeefpeer' }];
+			ln.emit('peer:connect', 'deadbeefpeer');
+			expect(synced).to.deep.equal([]);
+
+			// Settle the boot RGS attempt through its release seam: the latch
+			// resolves, the deferred sync fires, and the latch clears.
+			seams._releaseBootRgs!();
+			await prime;
+			await drainDeferred();
+			expect(synced).to.deep.equal(['deadbeefpeer']);
+			expect(seams._initialGossipPrime).to.equal(null);
+		} finally {
+			await bn.destroy();
+			for (const socket of sockets) socket.destroy();
+			server.close();
+		}
 	});
 
 	it('installs no latch on regtest boot; with the latch clear sync is synchronous', async function () {
