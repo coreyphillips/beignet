@@ -3299,11 +3299,12 @@ export class BeignetNode extends EventEmitter {
 			openedCount++;
 			const promise = (async (): Promise<void> => {
 				try {
-					// Look up address from gossip graph
-					const graphNode = graph.getNode(
+					// Look up address from gossip graph. Dialing requires a
+					// signature-verified announcement; a deferred one is
+					// resolved by this read (issue #443).
+					const addrs = graph.getVerifiedNodeAnnouncement(
 						Buffer.from(suggestion.nodeId, 'hex')
-					);
-					const addrs = graphNode?.announcement?.addresses;
+					)?.addresses;
 					if (addrs && addrs.length > 0) {
 						const addr =
 							addrs.find((a) => a.type === 1 || a.type === 2) || addrs[0];

@@ -421,21 +421,25 @@ describe('Storage Layer', function () {
 
 		it('marks unresolved legacy rows deferred at restore in lazy mode (issue #443)', function () {
 			// The lazy default moves the signature work off the boot path: an
-			// unresolved flag becomes 'deferred' and is verified only when a
-			// gossip query asks for the entry, with the same outcome eager
+			// unresolved flag gains the deferred marker (its boolean stays
+			// unset, so truthiness checks read unverified) and is verified only
+			// when a consumer asks for the entry, with the same outcome eager
 			// restore would have produced. Explicit booleans are untouched and
-			// no flag is invented for a message that is not in the row.
+			// no marker is invented for a message that is not in the row.
 			const legacy = makeGraphChannelFixture();
 			legacy.update1Verified = true;
 			const restored = deserializeGraphChannel(serializeGraphChannel(legacy));
 			const graph = new NetworkGraph();
 			graph.restoreChannel(restored);
 			const ch = graph.getChannel(restored.shortChannelId)!;
-			expect(ch.announcementVerified).to.equal('deferred');
+			expect(ch.announcementVerified).to.equal(undefined);
+			expect(ch.announcementVerifyDeferred).to.equal(true);
 			expect(ch.update1Verified).to.be.true;
+			expect(ch.update1VerifyDeferred).to.equal(undefined);
 			expect(ch.update2Verified).to.be.undefined;
+			expect(ch.update2VerifyDeferred).to.be.undefined;
 
-			// An eager graph resolves a 'deferred' row left by a lazy run, so a
+			// An eager graph resolves a deferred row left by a lazy run, so a
 			// lazy-to-eager migration never holds deferred entries post-boot.
 			const eager = new NetworkGraph(BITCOIN_CHAIN_HASH, {
 				eagerVerify: true
@@ -445,6 +449,20 @@ describe('Storage Layer', function () {
 			const resolved = eager.getChannel(again.shortChannelId)!;
 			// The fixture's announcement carries garbage signatures: unservable.
 			expect(resolved.announcementVerified).to.be.false;
+			expect(resolved.announcementVerifyDeferred).to.equal(undefined);
+
+			// A row carrying garbage in a verified field (a custom storage
+			// adapter, or the string encoding of a pre-release build) resolves
+			// at the boundary like a legacy row instead of being trusted.
+			const tainted = deserializeGraphChannel(serializeGraphChannel(legacy));
+			(
+				tainted as unknown as { announcementVerified: string }
+			).announcementVerified = 'deferred';
+			const lazyGraph = new NetworkGraph();
+			lazyGraph.restoreChannel(tainted);
+			const sanitized = lazyGraph.getChannel(tainted.shortChannelId)!;
+			expect(sanitized.announcementVerified).to.equal(undefined);
+			expect(sanitized.announcementVerifyDeferred).to.equal(true);
 		});
 
 		it('round-trips explicit provenance flags', function () {
@@ -457,16 +475,18 @@ describe('Storage Layer', function () {
 			expect(restored.announcementVerified).to.be.false;
 			expect(restored.update1Verified).to.be.true;
 
-			// Lazy intake persists 'deferred' provenance; it must survive a
-			// restart as-is so boot never re-verifies it (issue #443).
+			// Lazy intake persists deferred markers (with the boolean flags
+			// unset); they must survive a restart as-is so boot never
+			// re-verifies them (issue #443).
 			const deferred = makeGraphChannelFixture();
-			deferred.announcementVerified = 'deferred';
-			deferred.update1Verified = 'deferred';
+			deferred.announcementVerifyDeferred = true;
+			deferred.update1VerifyDeferred = true;
 			const restoredDeferred = deserializeGraphChannel(
 				serializeGraphChannel(deferred)
 			);
-			expect(restoredDeferred.announcementVerified).to.equal('deferred');
-			expect(restoredDeferred.update1Verified).to.equal('deferred');
+			expect(restoredDeferred.announcementVerified).to.equal(undefined);
+			expect(restoredDeferred.announcementVerifyDeferred).to.equal(true);
+			expect(restoredDeferred.update1VerifyDeferred).to.equal(true);
 
 			const nodeAnn: INodeAnnouncementMessage = {
 				signature: crypto.randomBytes(64),
@@ -706,13 +726,13 @@ describe('Storage Layer', function () {
 			const lazy = new NetworkGraph();
 			lazy.restoreChannel(storage.loadAllGossipChannels()[0]);
 			const lazyCh = lazy.getChannel(scid)!;
-			expect(lazyCh.announcementVerified).to.equal('deferred');
+			expect(lazyCh.announcementVerifyDeferred).to.equal(true);
 			expect(lazy.getChannelsByBlockRange(100, 5)).to.have.length(1);
 			const lazyServed = lazy.getGossipMessagesForChannels([scid]);
 			expect(lazyServed.announcements).to.have.length(0);
 			expect(lazyServed.updates).to.have.length(0);
 			expect(lazyCh.announcementVerified).to.be.false;
-			expect(lazyCh.update1Verified).to.equal('deferred');
+			expect(lazyCh.update1VerifyDeferred).to.equal(true);
 			expect(lazy.getChannelsByBlockRange(100, 5)).to.have.length(0);
 		});
 

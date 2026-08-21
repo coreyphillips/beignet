@@ -31,26 +31,76 @@ function isSignatureless(sig: Buffer): boolean {
 	return sig.equals(ZERO_SIG);
 }
 
-/** Anything other than the two positive states normalizes to explicit false. */
+/**
+ * Normalize a caller's provenance claim: anything other than the two positive
+ * states is explicit false, and a 'deferred' claim on a signatureless message
+ * is also false, since it can never verify. Without that downgrade an
+ * identical zero-signature replay would stay takeover-eligible against its
+ * own zero-signature slot forever, each acceptance re-triggering persistence.
+ */
 function normalizeVerified(
-	verified: TGossipVerified | undefined
+	verified: TGossipVerified | undefined,
+	signature: Buffer
 ): TGossipVerified {
-	return verified === true || verified === 'deferred' ? verified : false;
+	if (verified === true) return true;
+	if (verified === 'deferred')
+		return isSignatureless(signature) ? false : 'deferred';
+	return false;
+}
+
+/**
+ * The stored form of a provenance claim: a settled boolean, or an undefined
+ * boolean plus the deferred marker. The *Verified fields stay strictly
+ * boolean so downstream truthiness checks never see a truthy unverified
+ * value (issue #443 review).
+ */
+function provenancePair(verified: TGossipVerified): {
+	verified: boolean | undefined;
+	deferred: true | undefined;
+} {
+	if (verified === true) return { verified: true, deferred: undefined };
+	if (verified === 'deferred') return { verified: undefined, deferred: true };
+	return { verified: false, deferred: undefined };
+}
+
+/**
+ * Storage rows come from arbitrary backends: only exact booleans are trusted
+ * in a *Verified field, and a settled boolean always clears the deferred
+ * marker. Anything else resolves at the restore boundary like a legacy row.
+ */
+function sanitizeSlot(
+	verified: boolean | undefined,
+	deferred: boolean | undefined
+): { verified: boolean | undefined; deferred: true | undefined } {
+	const v = typeof verified === 'boolean' ? verified : undefined;
+	return {
+		verified: v,
+		deferred: v === undefined && deferred === true ? true : undefined
+	};
 }
 
 export class NetworkGraph {
 	/**
-	 * Per-query wall-clock budget for resolving 'deferred' provenance inside
-	 * getGossipMessagesForChannels. The serve path is synchronous on the
-	 * message path, so lazy verification must be bounded or a large
-	 * query_short_channel_ids would starve the event loop the way unsliced
-	 * intake once did (issue #437). Entries left unresolved are simply omitted
-	 * from this reply and stay resolvable by a later query. Static and mutable
-	 * so tests can pin it (the INITIAL_GOSSIP_PRIME_TIMEOUT_MS pattern).
+	 * Wall-clock budget for resolving deferred provenance inside
+	 * getGossipMessagesForChannels, shared by every query in the current
+	 * window. The serve path is synchronous on the message path, so lazy
+	 * verification must be bounded or repeated query_short_channel_ids
+	 * bursts would starve the event loop the way unsliced intake once did
+	 * (issue #437); a shared rolling window, rather than a per-query timer,
+	 * keeps the bound from multiplying with the query rate. Channels left
+	 * unresolved are omitted whole from the reply, reported through the end
+	 * marker's full_information bit, and stay resolvable in a later window.
+	 * Static and mutable so tests can pin them (the
+	 * INITIAL_GOSSIP_PRIME_TIMEOUT_MS pattern).
 	 */
 	static SERVE_VERIFY_BUDGET_MS = 50;
+	static SERVE_VERIFY_WINDOW_MS = 1000;
 
 	private _channels: Map<string, IGraphChannel> = new Map();
+	/** Start of the current serve-verification budget window (epoch ms). */
+	private _serveVerifyWindowStart = 0;
+	/** Verification time spent in the current window across all queries. */
+	private _serveVerifySpentMs = 0;
 	private _nodes: Map<string, IGraphNode> = new Map();
 	// BOLT 7: announcements are chain-scoped. The graph accepts only its own
 	// chain — previously hardcoded to mainnet, which silently discarded every
@@ -100,6 +150,7 @@ export class NetworkGraph {
 			return false;
 		}
 
+		const verified = normalizeVerified(opts.verified, msg.nodeSignature1);
 		const scidHex = msg.shortChannelId.toString('hex');
 
 		const existing = this._channels.get(scidHex);
@@ -108,14 +159,16 @@ export class NetworkGraph {
 			// unverified (e.g. Rapid Gossip Sync primed it) replaces the entry
 			// in place, so the channel becomes servable. Endpoints must match;
 			// existing updates and their provenance flags are preserved. A
-			// deferred candidate may only displace a SIGNATURELESS slot: over a
-			// signed slot it could change nothing servability-wise, and a peer
-			// re-serving a known dump against an all-deferred graph would
-			// otherwise "accept" every duplicate and re-trigger a storage write
-			// per entry (the issue #437 failure class, relocated to disk).
+			// deferred candidate (always real-signature, normalizeVerified
+			// downgrades the rest) may only displace a SIGNATURELESS slot:
+			// over a signed slot it could change nothing servability-wise,
+			// and a peer re-serving a known dump against an all-deferred
+			// graph would otherwise "accept" every duplicate and re-trigger a
+			// storage write per entry (the issue #437 failure class,
+			// relocated to disk).
 			const upgrade =
-				opts.verified === true ||
-				(opts.verified === 'deferred' &&
+				verified === true ||
+				(verified === 'deferred' &&
 					isSignatureless(existing.announcement.nodeSignature1));
 			if (
 				upgrade &&
@@ -123,9 +176,11 @@ export class NetworkGraph {
 				existing.nodeId1.equals(msg.nodeId1) &&
 				existing.nodeId2.equals(msg.nodeId2)
 			) {
+				const pair = provenancePair(verified);
 				existing.announcement = msg;
 				existing.features = Buffer.from(msg.features);
-				existing.announcementVerified = normalizeVerified(opts.verified);
+				existing.announcementVerified = pair.verified;
+				existing.announcementVerifyDeferred = pair.deferred;
 				return true;
 			}
 			// Reject duplicate
@@ -133,13 +188,15 @@ export class NetworkGraph {
 		}
 
 		// Create the channel entry
+		const pair = provenancePair(verified);
 		const channel: IGraphChannel = {
 			shortChannelId: Buffer.from(msg.shortChannelId),
 			nodeId1: Buffer.from(msg.nodeId1),
 			nodeId2: Buffer.from(msg.nodeId2),
 			features: Buffer.from(msg.features),
 			announcement: msg,
-			announcementVerified: normalizeVerified(opts.verified)
+			announcementVerified: pair.verified,
+			announcementVerifyDeferred: pair.deferred
 		};
 		this._channels.set(scidHex, channel);
 
@@ -188,31 +245,35 @@ export class NetworkGraph {
 		const existing = direction === 0 ? channel.update1 : channel.update2;
 		const existingVerified =
 			direction === 0 ? channel.update1Verified : channel.update2Verified;
+		const verified = normalizeVerified(opts.verified, msg.signature);
 
 		// Reject if not strictly newer, unless a verified update is taking over
 		// an unverified slot: RGS stamps synthetic updates with the snapshot's
 		// global latest-seen timestamp, which would otherwise block the real
-		// signed update forever. A deferred candidate gets the same bypass but
+		// signed update forever. A deferred candidate (always real-signature,
+		// normalizeVerified downgrades the rest) gets the same bypass but
 		// ONLY over a signatureless slot (whose timestamp is synthetic by
 		// construction); over signed slots normal freshness applies, so a
 		// re-served known update refuses here without a storage write.
 		if (existing && msg.timestamp <= existing.timestamp) {
 			const takeover =
 				existingVerified !== true &&
-				(opts.verified === true ||
-					(opts.verified === 'deferred' &&
-						isSignatureless(existing.signature)));
+				(verified === true ||
+					(verified === 'deferred' && isSignatureless(existing.signature)));
 			if (!takeover) {
 				return false;
 			}
 		}
 
+		const pair = provenancePair(verified);
 		if (direction === 0) {
 			channel.update1 = msg;
-			channel.update1Verified = normalizeVerified(opts.verified);
+			channel.update1Verified = pair.verified;
+			channel.update1VerifyDeferred = pair.deferred;
 		} else {
 			channel.update2 = msg;
-			channel.update2Verified = normalizeVerified(opts.verified);
+			channel.update2Verified = pair.verified;
+			channel.update2VerifyDeferred = pair.deferred;
 		}
 
 		return true;
@@ -237,18 +298,22 @@ export class NetworkGraph {
 			return false;
 		}
 
+		const verified = normalizeVerified(opts.verified, msg.signature);
+
 		// Reject if not strictly newer, unless a verified announcement is taking
 		// over an unverified slot (see applyChannelUpdate). No deferred bypass
 		// here: RGS carries no node_announcements, so signatureless node slots
 		// with synthetic timestamps never exist.
 		if (node.announcement && msg.timestamp <= node.announcement.timestamp) {
-			if (!(opts.verified === true && node.announcementVerified !== true)) {
+			if (!(verified === true && node.announcementVerified !== true)) {
 				return false;
 			}
 		}
 
+		const pair = provenancePair(verified);
 		node.announcement = msg;
-		node.announcementVerified = normalizeVerified(opts.verified);
+		node.announcementVerified = pair.verified;
+		node.announcementVerifyDeferred = pair.deferred;
 		return true;
 	}
 
@@ -325,6 +390,29 @@ export class NetworkGraph {
 
 	getNode(nodeId: Buffer): IGraphNode | undefined {
 		return this._nodes.get(nodeId.toString('hex'));
+	}
+
+	/**
+	 * The node's announcement resolved to signature-verified provenance, or
+	 * undefined. This is the trust boundary for every consumer that acts on
+	 * announcement contents beyond routing (reconnect fallbacks, pubkey-only
+	 * dials, channel-open suggestions): a deferred announcement is verified
+	 * here on first read, so an unproven address claim is never dialed. Cost
+	 * is one bounded verification per unresolved node, caller-driven, and the
+	 * settled flag makes it one-time.
+	 */
+	getVerifiedNodeAnnouncement(
+		nodeId: Buffer
+	): INodeAnnouncementMessage | undefined {
+		const node = this._nodes.get(nodeId.toString('hex'));
+		if (!node?.announcement) return undefined;
+		if (node.announcementVerifyDeferred === true) {
+			node.announcementVerified = verifyNodeAnnouncementMessage(
+				node.announcement
+			);
+			node.announcementVerifyDeferred = undefined;
+		}
+		return node.announcementVerified === true ? node.announcement : undefined;
 	}
 
 	/**
@@ -422,46 +510,61 @@ export class NetworkGraph {
 	 * Restore a channel directly into the graph (bypasses graph validation).
 	 * Rows persisted before provenance tracking carry no verified flags;
 	 * absence cannot be trusted (pre-#340 rows could hold zero-signature RGS
-	 * messages persisted alongside a verified update), so such flags are
-	 * resolved here. Eager mode verifies the canonical re-encoding at once,
-	 * and also resolves 'deferred' rows left by an earlier lazy run so an
-	 * eager node never holds deferred entries post-boot. Lazy mode (default)
-	 * marks unresolved flags 'deferred' instead, moving the signature work to
-	 * serve time (issue #443); either way nothing unresolved is ever served.
-	 * Rows with explicit boolean flags skip the signature checks. This is
-	 * the common boundary for every storage backend, custom ones included.
+	 * messages persisted alongside a verified update), so unresolved flags
+	 * (absent, non-boolean, or marked deferred) are resolved here. Eager mode
+	 * verifies the canonical re-encoding at once, so an eager node never
+	 * holds deferred entries post-boot, a lazy-to-eager migration included.
+	 * Lazy mode (default) marks them deferred instead, moving the signature
+	 * work to the point of consumption (issue #443); either way nothing
+	 * unresolved is ever served. Rows with explicit boolean flags skip the
+	 * signature checks. This is the common boundary for every storage
+	 * backend, custom ones included.
 	 */
 	restoreChannel(channel: IGraphChannel): void {
+		const ann = sanitizeSlot(
+			channel.announcementVerified,
+			channel.announcementVerifyDeferred
+		);
+		const upd1 = sanitizeSlot(
+			channel.update1Verified,
+			channel.update1VerifyDeferred
+		);
+		const upd2 = sanitizeSlot(
+			channel.update2Verified,
+			channel.update2VerifyDeferred
+		);
 		if (this._eagerVerify) {
-			if (typeof channel.announcementVerified !== 'boolean') {
-				channel.announcementVerified = verifyChannelAnnouncementMessage(
-					channel.announcement
-				);
-			}
-			if (channel.update1 && typeof channel.update1Verified !== 'boolean') {
-				channel.update1Verified = verifyChannelUpdateMessage(
-					channel.update1,
-					channel.nodeId1,
-					channel.nodeId2
-				);
-			}
-			if (channel.update2 && typeof channel.update2Verified !== 'boolean') {
-				channel.update2Verified = verifyChannelUpdateMessage(
-					channel.update2,
-					channel.nodeId1,
-					channel.nodeId2
-				);
-			}
+			channel.announcementVerified =
+				ann.verified ?? verifyChannelAnnouncementMessage(channel.announcement);
+			channel.announcementVerifyDeferred = undefined;
+			channel.update1Verified = channel.update1
+				? upd1.verified ??
+				  verifyChannelUpdateMessage(
+						channel.update1,
+						channel.nodeId1,
+						channel.nodeId2
+				  )
+				: undefined;
+			channel.update1VerifyDeferred = undefined;
+			channel.update2Verified = channel.update2
+				? upd2.verified ??
+				  verifyChannelUpdateMessage(
+						channel.update2,
+						channel.nodeId1,
+						channel.nodeId2
+				  )
+				: undefined;
+			channel.update2VerifyDeferred = undefined;
 		} else {
-			if (channel.announcementVerified === undefined) {
-				channel.announcementVerified = 'deferred';
-			}
-			if (channel.update1 && channel.update1Verified === undefined) {
-				channel.update1Verified = 'deferred';
-			}
-			if (channel.update2 && channel.update2Verified === undefined) {
-				channel.update2Verified = 'deferred';
-			}
+			channel.announcementVerified = ann.verified;
+			channel.announcementVerifyDeferred =
+				ann.verified === undefined ? true : undefined;
+			channel.update1Verified = channel.update1 ? upd1.verified : undefined;
+			channel.update1VerifyDeferred =
+				channel.update1 && upd1.verified === undefined ? true : undefined;
+			channel.update2Verified = channel.update2 ? upd2.verified : undefined;
+			channel.update2VerifyDeferred =
+				channel.update2 && upd2.verified === undefined ? true : undefined;
 		}
 
 		const scidHex = channel.shortChannelId.toString('hex');
@@ -490,26 +593,34 @@ export class NetworkGraph {
 
 	/**
 	 * Restore a node directly into the graph (bypasses graph validation).
-	 * Legacy rows without a provenance flag are resolved per the policy in
-	 * restoreChannel: eager verifies (and resolves 'deferred'), lazy defers.
+	 * Unresolved provenance is settled per the policy in restoreChannel:
+	 * eager verifies at once, lazy marks it deferred.
 	 */
 	restoreNode(node: IGraphNode): void {
+		const slot = sanitizeSlot(
+			node.announcementVerified,
+			node.announcementVerifyDeferred
+		);
 		if (node.announcement) {
 			if (this._eagerVerify) {
-				if (typeof node.announcementVerified !== 'boolean') {
-					node.announcementVerified = verifyNodeAnnouncementMessage(
-						node.announcement
-					);
-				}
-			} else if (node.announcementVerified === undefined) {
-				node.announcementVerified = 'deferred';
+				node.announcementVerified =
+					slot.verified ?? verifyNodeAnnouncementMessage(node.announcement);
+				node.announcementVerifyDeferred = undefined;
+			} else {
+				node.announcementVerified = slot.verified;
+				node.announcementVerifyDeferred =
+					slot.verified === undefined ? true : undefined;
 			}
+		} else {
+			node.announcementVerified = undefined;
+			node.announcementVerifyDeferred = undefined;
 		}
 		const nodeHex = node.nodeId.toString('hex');
 		const existing = this._nodes.get(nodeHex);
 		if (existing) {
 			existing.announcement = node.announcement;
 			existing.announcementVerified = node.announcementVerified;
+			existing.announcementVerifyDeferred = node.announcementVerifyDeferred;
 		} else {
 			this._nodes.set(nodeHex, node);
 		}
@@ -551,7 +662,7 @@ export class NetworkGraph {
 			// then fails simply gets omitted from that reply.
 			if (
 				channel.announcementVerified !== true &&
-				channel.announcementVerified !== 'deferred'
+				channel.announcementVerifyDeferred !== true
 			) {
 				continue;
 			}
@@ -590,12 +701,16 @@ export class NetworkGraph {
 
 	/**
 	 * Get all gossip messages (announcement + updates + node announcements) for a set of SCIDs.
-	 * Used to respond to query_short_channel_ids.
+	 * Used to respond to query_short_channel_ids. `complete` is false when a
+	 * channel was omitted only because the shared verification budget ran
+	 * out; the caller reports it through the end marker's full_information
+	 * bit so the requester knows the reply omitted known data.
 	 */
 	getGossipMessagesForChannels(scids: Buffer[]): {
 		announcements: IChannelAnnouncementMessage[];
 		updates: IChannelUpdateMessage[];
 		nodeAnnouncements: INodeAnnouncementMessage[];
+		complete: boolean;
 	} {
 		const announcements: IChannelAnnouncementMessage[] = [];
 		const updates: IChannelUpdateMessage[] = [];
@@ -605,25 +720,101 @@ export class NetworkGraph {
 		// Deferred provenance (issue #443) is resolved here, on demand: this is
 		// the only place verification of foreign gossip pays for itself (the
 		// right to serve the entry). The loop runs synchronously on the message
-		// path, so resolution is capped by a wall-clock budget; entries left
-		// unresolved are omitted from this reply and stay 'deferred' for a
-		// later query. Resolved flags are sticky booleans, so no entry is ever
-		// verified twice in one process lifetime.
-		const sliceStart = Date.now();
-		const withinBudget = (): boolean =>
-			Date.now() - sliceStart < NetworkGraph.SERVE_VERIFY_BUDGET_MS;
+		// path, so resolution draws on a budget SHARED by every query in the
+		// current window; a per-query timer would multiply with the query rate
+		// and rebuild the very starvation this design avoids. Resolved flags
+		// are sticky booleans, so no entry is ever verified twice in one
+		// process lifetime.
+		const now = Date.now();
+		if (
+			now - this._serveVerifyWindowStart >=
+			NetworkGraph.SERVE_VERIFY_WINDOW_MS
+		) {
+			this._serveVerifyWindowStart = now;
+			this._serveVerifySpentMs = 0;
+		}
+		let complete = true;
 
 		for (const scid of scids) {
 			const channel = this._channels.get(scid.toString('hex'));
 			if (!channel) continue;
-			// Resolve the announcement first and gate the whole channel on it:
-			// the updates of a non-servable channel are never verified (their
-			// endpoint keys are unauthenticated) and never served.
-			if (channel.announcementVerified === 'deferred' && withinBudget()) {
-				channel.announcementVerified = verifyChannelAnnouncementMessage(
-					channel.announcement
-				);
+
+			// A channel is served atomically or not at all: partial output
+			// (an announcement without its updates) would make the requester
+			// record the SCID as synced and never ask for the omitted pieces
+			// again.
+			const nodesNeedingResolution = [channel.nodeId1, channel.nodeId2]
+				.map((id) => id.toString('hex'))
+				.filter((hex) => {
+					if (seenNodes.has(hex)) return false;
+					const n = this._nodes.get(hex);
+					return (
+						n?.announcement !== undefined &&
+						n.announcementVerifyDeferred === true
+					);
+				});
+			const needsResolution =
+				channel.announcementVerifyDeferred === true ||
+				(channel.update1 !== undefined &&
+					channel.update1VerifyDeferred === true) ||
+				(channel.update2 !== undefined &&
+					channel.update2VerifyDeferred === true) ||
+				nodesNeedingResolution.length > 0;
+
+			if (needsResolution) {
+				if (this._serveVerifySpentMs >= NetworkGraph.SERVE_VERIFY_BUDGET_MS) {
+					// Budget exhausted: omit the whole channel from this reply.
+					// It stays deferred, resolvable in a later window, and the
+					// end marker reports the omission.
+					complete = false;
+					continue;
+				}
+				// Once started, a channel's slots settle as a group; the budget
+				// overrun is bounded by one channel (at most 8 signature
+				// checks: 4 announcement, 2 updates, 2 node announcements).
+				const t0 = Date.now();
+				if (channel.announcementVerifyDeferred === true) {
+					channel.announcementVerified = verifyChannelAnnouncementMessage(
+						channel.announcement
+					);
+					channel.announcementVerifyDeferred = undefined;
+				}
+				// The updates and node announcements of a non-servable channel
+				// are never verified: its endpoint keys are unauthenticated.
+				if (channel.announcementVerified === true) {
+					if (
+						channel.update1 !== undefined &&
+						channel.update1VerifyDeferred === true
+					) {
+						channel.update1Verified = verifyChannelUpdateMessage(
+							channel.update1,
+							channel.nodeId1,
+							channel.nodeId2
+						);
+						channel.update1VerifyDeferred = undefined;
+					}
+					if (
+						channel.update2 !== undefined &&
+						channel.update2VerifyDeferred === true
+					) {
+						channel.update2Verified = verifyChannelUpdateMessage(
+							channel.update2,
+							channel.nodeId1,
+							channel.nodeId2
+						);
+						channel.update2VerifyDeferred = undefined;
+					}
+					for (const hex of nodesNeedingResolution) {
+						const n = this._nodes.get(hex)!;
+						n.announcementVerified = verifyNodeAnnouncementMessage(
+							n.announcement!
+						);
+						n.announcementVerifyDeferred = undefined;
+					}
+				}
+				this._serveVerifySpentMs += Date.now() - t0;
 			}
+
 			// BOLT 7: never relay announcements we have not validated (#340).
 			// Skipping the whole channel also covers a verified update sitting
 			// on an unverified announcement: an update MUST NOT be sent without
@@ -631,29 +822,11 @@ export class NetworkGraph {
 			if (channel.announcementVerified !== true) continue;
 
 			announcements.push(channel.announcement);
-			if (channel.update1) {
-				if (channel.update1Verified === 'deferred' && withinBudget()) {
-					channel.update1Verified = verifyChannelUpdateMessage(
-						channel.update1,
-						channel.nodeId1,
-						channel.nodeId2
-					);
-				}
-				if (channel.update1Verified === true) {
-					updates.push(channel.update1);
-				}
+			if (channel.update1 && channel.update1Verified === true) {
+				updates.push(channel.update1);
 			}
-			if (channel.update2) {
-				if (channel.update2Verified === 'deferred' && withinBudget()) {
-					channel.update2Verified = verifyChannelUpdateMessage(
-						channel.update2,
-						channel.nodeId1,
-						channel.nodeId2
-					);
-				}
-				if (channel.update2Verified === true) {
-					updates.push(channel.update2);
-				}
+			if (channel.update2 && channel.update2Verified === true) {
+				updates.push(channel.update2);
 			}
 
 			// Collect node announcements for endpoint nodes (deduplicated)
@@ -662,18 +835,12 @@ export class NetworkGraph {
 				if (seenNodes.has(nodeHex)) continue;
 				seenNodes.add(nodeHex);
 				const node = this._nodes.get(nodeHex);
-				if (!node?.announcement) continue;
-				if (node.announcementVerified === 'deferred' && withinBudget()) {
-					node.announcementVerified = verifyNodeAnnouncementMessage(
-						node.announcement
-					);
-				}
-				if (node.announcementVerified === true) {
+				if (node?.announcement && node.announcementVerified === true) {
 					nodeAnnouncements.push(node.announcement);
 				}
 			}
 		}
 
-		return { announcements, updates, nodeAnnouncements };
+		return { announcements, updates, nodeAnnouncements, complete };
 	}
 }

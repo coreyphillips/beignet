@@ -371,8 +371,9 @@ describe('Gossip intake queue (LightningNode)', () => {
 		feed(MessageType.CHANNEL_UPDATE, update.payload);
 		await node.flushGossip();
 		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
-		expect(ch.announcementVerified).to.equal('deferred');
-		expect(ch.update1Verified).to.equal('deferred');
+		expect(ch.announcementVerified).to.equal(undefined);
+		expect(ch.announcementVerifyDeferred).to.equal(true);
+		expect(ch.update1VerifyDeferred).to.equal(true);
 	});
 
 	it('lazy intake admits a garbage-signature announcement as deferred; eager drops it', async () => {
@@ -385,8 +386,9 @@ describe('Gossip intake queue (LightningNode)', () => {
 		feed(MessageType.CHANNEL_ANNOUNCEMENT, garbagePayload);
 		await node.flushGossip();
 		expect(
-			graphOf(node).getChannel(ann.msg.shortChannelId)!.announcementVerified
-		).to.equal('deferred');
+			graphOf(node).getChannel(ann.msg.shortChannelId)!
+				.announcementVerifyDeferred
+		).to.equal(true);
 
 		node.destroy();
 		storage = new SqliteStorage(dbPath);
@@ -420,7 +422,7 @@ describe('Gossip intake queue (LightningNode)', () => {
 		await node.flushGossip();
 		expect(writes).to.equal(0);
 		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
-		expect(ch.announcementVerified).to.equal('deferred');
+		expect(ch.announcementVerifyDeferred).to.equal(true);
 		expect(ch.update1?.timestamp).to.equal(1000);
 	});
 
@@ -462,8 +464,8 @@ describe('Gossip intake queue (LightningNode)', () => {
 		feed(MessageType.NODE_ANNOUNCEMENT, first.payload);
 		await node.flushGossip();
 		expect(
-			graphOf(node).getNode(first.msg.nodeId)!.announcementVerified
-		).to.equal('deferred');
+			graphOf(node).getNode(first.msg.nodeId)!.announcementVerifyDeferred
+		).to.equal(true);
 
 		// A capture-worthy one (reconnect-address source for a channel peer)
 		// verifies at intake even in lazy mode: addresses must never be

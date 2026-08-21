@@ -125,7 +125,8 @@ export function makeSignedChannelUpdate(
 /** A node_announcement genuinely signed by the node's key. */
 export function makeSignedNodeAnnouncement(
 	nodeKey: Buffer,
-	timestamp: number
+	timestamp: number,
+	addresses: INodeAnnouncementMessage['addresses'] = []
 ): { msg: INodeAnnouncementMessage; payload: Buffer } {
 	const unsigned: INodeAnnouncementMessage = {
 		signature: Buffer.alloc(64),
@@ -134,7 +135,7 @@ export function makeSignedNodeAnnouncement(
 		nodeId: getPublicKey(nodeKey),
 		rgbColor: Buffer.from([255, 0, 0]),
 		alias: Buffer.alloc(32),
-		addresses: []
+		addresses
 	};
 	const payload = encodeNodeAnnouncementMessage(unsigned);
 	signNodeAnnouncement(payload, nodeKey).copy(payload, 0);

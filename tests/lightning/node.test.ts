@@ -407,8 +407,8 @@ describe('Lightning Node', function () {
 			await lazy.flushGossip();
 			expect(lazy.getGraph().getChannelCount()).to.equal(1);
 			expect(
-				lazy.getGraph().getChannel(testScid)!.announcementVerified
-			).to.equal('deferred');
+				lazy.getGraph().getChannel(testScid)!.announcementVerifyDeferred
+			).to.equal(true);
 			expect(
 				lazy.getGraph().getGossipMessagesForChannels([testScid]).announcements
 			).to.have.length(0);

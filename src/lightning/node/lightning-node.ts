@@ -4697,15 +4697,20 @@ export class LightningNode extends EventEmitter {
 		);
 		for (const pubkey of channelPeers) {
 			let newest = persistedAnnounced.get(pubkey);
-			const node = this.graph.getNode(Buffer.from(pubkey, 'hex'));
+			// Addresses are dialed, so only a signature-verified announcement
+			// may supply them; a deferred one is resolved by this read
+			// (issue #443).
+			const announcement = this.graph.getVerifiedNodeAnnouncement(
+				Buffer.from(pubkey, 'hex')
+			);
 			if (
-				node?.announcement &&
-				(!newest || node.announcement.timestamp > newest.timestamp)
+				announcement &&
+				(!newest || announcement.timestamp > newest.timestamp)
 			) {
 				newest = {
 					pubkey,
-					timestamp: node.announcement.timestamp,
-					addresses: announcedDialableAddresses(node.announcement.addresses)
+					timestamp: announcement.timestamp,
+					addresses: announcedDialableAddresses(announcement.addresses)
 				};
 			}
 			if (!newest) continue;
@@ -6372,10 +6377,12 @@ export class LightningNode extends EventEmitter {
 		const isTor = (a: INodeAddress): boolean =>
 			a.type === ADDRESS_TYPE_TORV2 || a.type === ADDRESS_TYPE_TORV3;
 
-		// 1. Gossip graph: node_announcement addresses in announced order.
+		// 1. Gossip graph: node_announcement addresses in announced order. Only
+		// a signature-verified announcement may supply dial targets; a
+		// deferred one is resolved by this read (issue #443).
 		const announced =
-			this.graph.getNode(Buffer.from(pubkey, 'hex'))?.announcement?.addresses ??
-			[];
+			this.graph.getVerifiedNodeAnnouncement(Buffer.from(pubkey, 'hex'))
+				?.addresses ?? [];
 		let skippedTor = 0;
 		const candidates: Array<{ host: string; port: number }> = [];
 		for (const addr of announced) {
