@@ -506,6 +506,12 @@ export interface BeignetConfig {
 	/** Relay third-party HTLCs, i.e. act as a routing hop (default true). Set
 	 *  false so a wallet declines all forwards. Env: BEIGNET_FORWARDING_ENABLED. */
 	forwardingEnabled?: boolean;
+	/** Signature-verify foreign broadcast gossip at intake (default false:
+	 *  verification is deferred until a gossip query asks for the entry;
+	 *  nothing unverified is ever served either way). Set true on relay-class
+	 *  nodes that serve the graph. Env: BEIGNET_EAGER_GOSSIP_VERIFY, exact
+	 *  'true' or 'false'; anything else is ignored. */
+	eagerGossipVerify?: boolean;
 	/** Dial known peers (channel partners included) on start and on disconnect
 	 *  (default true). Set false and, with neither listenPort nor
 	 *  websocketPort configured, the node is genuinely quiet: channels stay

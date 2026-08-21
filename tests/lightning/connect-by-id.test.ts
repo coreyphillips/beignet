@@ -110,9 +110,12 @@ function injectAnnouncement(
 	const graph = node.getGraph() as unknown as {
 		_nodes: Map<string, unknown>;
 	};
+	// Model an announcement the intake path verified: only announcementVerified
+	// entries may supply dial addresses (issue #443).
 	graph._nodes.set(TARGET_PUBKEY, {
 		nodeId: Buffer.from(TARGET_PUBKEY, 'hex'),
 		announcement: { addresses },
+		announcementVerified: true,
 		channels: new Set()
 	});
 }

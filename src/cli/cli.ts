@@ -385,6 +385,7 @@ async function handleStart(): Promise<void> {
 	if (hasFlag('--metrics-public')) cliFlags.metricsPublic = true;
 	if (hasFlag('--insecure')) cliFlags.insecure = true;
 	if (hasFlag('--no-forwarding')) cliFlags.forwardingEnabled = false;
+	if (hasFlag('--eager-gossip-verify')) cliFlags.eagerGossipVerify = true;
 	if (hasFlag('--no-auto-reconnect')) cliFlags.autoReconnect = false;
 	const apiTokenFlag = parseFlag('--api-token');
 	if (apiTokenFlag) cliFlags.apiToken = apiTokenFlag;
@@ -474,6 +475,7 @@ async function handleStart(): Promise<void> {
 			metricsPublic: config.metricsPublic,
 			insecure: config.insecure,
 			forwardingEnabled: config.forwardingEnabled,
+			eagerGossipVerify: config.eagerGossipVerify,
 			autoReconnect: config.autoReconnect,
 			logLevel: config.logLevel,
 			recoveryMode: config.recoveryMode,
@@ -2535,6 +2537,9 @@ Start flags:
   --no-forwarding                        Decline to relay third-party HTLCs, i.e.
                                          do not act as a routing hop (forwarding
                                          is on by default)
+  --eager-gossip-verify                  Verify foreign gossip signatures at intake
+                                         instead of lazily at serve time (off by
+                                         default; for relay-class nodes)
   --no-auto-reconnect                    Do not dial known peers, channel partners
                                          included, on start or disconnect. With no
                                          listen/websocket port either, the node is

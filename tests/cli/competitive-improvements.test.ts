@@ -857,6 +857,14 @@ describe('Documentation Accuracy', () => {
 		expect(cliReadme).to.include('BEIGNET_TLS_KEY');
 		expect(cliReadme).to.include('BEIGNET_DAILY_SPEND_LIMIT_SATS');
 	});
+
+	it('CLI README documents the gossip verification policy env var', () => {
+		const cliReadme = fs.readFileSync(
+			path.join(__dirname, '../../src/cli/README.md'),
+			'utf-8'
+		);
+		expect(cliReadme).to.include('BEIGNET_EAGER_GOSSIP_VERIFY');
+	});
 });
 
 // ─────────────── HTTP Helpers ───────────────

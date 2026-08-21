@@ -373,6 +373,17 @@ export interface INodeConfig {
 	 * stop selecting us. Does not affect our own sends or receives.
 	 */
 	forwardingEnabled?: boolean;
+	/**
+	 * Whether to signature-verify foreign broadcast gossip at intake. Default
+	 * false: entries are admitted with deferred provenance and verified only
+	 * when a gossip query asks for them, which skips nearly the entire
+	 * first-dump verification cost for wallet nodes (issue #443). Nothing
+	 * unverified is ever served to gossip queries in either mode. Set true on
+	 * relay-class nodes that want to serve the graph: intake and restore then
+	 * verify eagerly, and signatureless RGS-primed entries are re-requested
+	 * from peers so their signed copies become servable.
+	 */
+	eagerGossipVerify?: boolean;
 	/** CLTV delta for forwarding (default 40) */
 	forwardingCltvDelta?: number;
 	/** Base fee in msat for forwarding (default 1000) */

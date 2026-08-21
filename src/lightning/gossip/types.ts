@@ -177,6 +177,18 @@ export interface IGossipTimestampFilterMessage {
 	timestampRange: number; // uint32
 }
 
+/**
+ * Provenance a caller can claim for a gossip message applied to the graph.
+ * `true` = signature-verified AND the codec reproduces the signed bytes, so
+ * the entry may be served to gossip queries. `'deferred'` = carries
+ * signatures that have not been checked yet; verification is postponed until
+ * a consumer needs the trust (a gossip query, a dial-address read), per
+ * issue #443. Anything else stores as explicit false: never served, never
+ * re-checked. This is an input type; stored entries keep boolean flags plus
+ * separate *VerifyDeferred markers (see IGraphChannel).
+ */
+export type TGossipVerified = boolean | 'deferred';
+
 export interface IGraphChannel {
 	shortChannelId: Buffer;
 	nodeId1: Buffer;
@@ -186,13 +198,25 @@ export interface IGraphChannel {
 	update1?: IChannelUpdateMessage;
 	update2?: IChannelUpdateMessage;
 	// BOLT 7: a node MUST NOT relay announcements it has not validated. These
-	// flags record signature-verified (or self-signed) provenance per stored
-	// message; unverified entries (Rapid Gossip Sync strips signatures, direct
-	// API injection carries none) stay routable locally but are excluded from
-	// reply_channel_range / query_short_channel_ids responses.
+	// booleans record signature-verified (servable) provenance per stored
+	// message; only entries whose flag is exactly true are included in
+	// reply_channel_range data / query_short_channel_ids responses. All
+	// states stay routable locally. Absent (undefined) means a legacy row
+	// from before provenance tracking (resolved at the restore boundary), or
+	// a deferred entry when the matching marker below is set.
 	announcementVerified?: boolean;
 	update1Verified?: boolean;
 	update2Verified?: boolean;
+	// Deferred-verification markers (issue #443): the message carries
+	// signatures that have not been checked yet. While a marker is true the
+	// matching *Verified flag stays undefined, so both truthiness checks and
+	// the === true serve filters treat the entry as unverified; resolution
+	// settles the boolean and clears the marker. Kept separate from the
+	// booleans so downstream `if (x.announcementVerified)` code never sees a
+	// truthy unverified value.
+	announcementVerifyDeferred?: boolean;
+	update1VerifyDeferred?: boolean;
+	update2VerifyDeferred?: boolean;
 }
 
 export interface IGraphNode {
@@ -202,6 +226,7 @@ export interface IGraphNode {
 	// Same provenance rule as IGraphChannel: unverified node_announcements are
 	// never served to gossip queries.
 	announcementVerified?: boolean;
+	announcementVerifyDeferred?: boolean;
 }
 
 export interface IRouteHop {

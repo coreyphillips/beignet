@@ -1220,6 +1220,9 @@ export function serializeGraphNode(node: IGraphNode): string {
 	if (node.announcementVerified !== undefined) {
 		obj.announcementVerified = node.announcementVerified;
 	}
+	if (node.announcementVerifyDeferred !== undefined) {
+		obj.announcementVerifyDeferred = node.announcementVerifyDeferred;
+	}
 	return JSON.stringify(obj);
 }
 

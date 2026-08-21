@@ -579,25 +579,21 @@ describe('Peer held post-handshake delivery', function () {
 			(
 				a as unknown as {
 					graph: {
-						getNode(id: Buffer): {
-							announcement: {
-								addresses: Array<{
-									type: number;
-									host: string;
-									port: number;
-								}>;
-							};
+						getVerifiedNodeAnnouncement(id: Buffer): {
+							addresses: Array<{
+								type: number;
+								host: string;
+								port: number;
+							}>;
 						};
 					};
 				}
 			).graph = {
-				getNode: () => ({
-					announcement: {
-						addresses: [
-							{ type: 1, host: '127.0.0.1', port: 1 },
-							{ type: 1, host: '127.0.0.1', port: 2 }
-						]
-					}
+				getVerifiedNodeAnnouncement: () => ({
+					addresses: [
+						{ type: 1, host: '127.0.0.1', port: 1 },
+						{ type: 1, host: '127.0.0.1', port: 2 }
+					]
 				})
 			};
 			const pmA = (
@@ -682,9 +678,9 @@ describe('Peer held post-handshake delivery', function () {
 			const pubkey = getPublicKey(makeSeed(995)).toString('hex');
 			(
 				a as unknown as {
-					graph: { getNode(id: Buffer): undefined };
+					graph: { getVerifiedNodeAnnouncement(id: Buffer): undefined };
 				}
-			).graph = { getNode: () => undefined };
+			).graph = { getVerifiedNodeAnnouncement: () => undefined };
 			(
 				a as unknown as {
 					bootstrapPeers(): Promise<

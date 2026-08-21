@@ -770,11 +770,36 @@ work for local routing but are never served in `reply_channel_range` or
 `query_short_channel_ids` responses (BOLT 7 forbids relaying unvalidated
 announcements; strict peers such as eclair 0.14+ disconnect on invalid gossip
 signatures). Pass `{ verified: true }` only for signature-checked messages that
-re-encode byte-identically to the signed wire payload; the `handlePeerMessage`
-gossip handlers do this automatically. Rapid Gossip Sync entries are always
-unverified because RGS strips signatures. Stored rows that predate these flags
-are resolved at restore by verifying the canonical re-encoding, failing safe to
-unverified.
+re-encode byte-identically to the signed wire payload, or
+`{ verified: 'deferred' }` for signed-but-unchecked ones. Rapid Gossip Sync
+entries are always unverified because RGS strips signatures.
+
+Gossip provenance has three states: verified (`*Verified: true`, servable),
+unverified (`*Verified: false`, failed verification or signatureless, never
+served and never re-checked) and deferred (`*VerifyDeferred: true` with the
+boolean unset: carries signatures, not yet checked). The booleans never go
+truthy for unchecked data, so existing `if (announcementVerified)` consumers
+stay safe. By default the node runs lazy verification: foreign broadcast
+gossip is admitted deferred without any signature work, `reply_channel_range`
+advertises those SCIDs, and the first `query_short_channel_ids` that asks for
+an entry resolves it, serving only what verifies. Resolution draws on a
+verification budget shared by all queries in a rolling window
+(`NetworkGraph.SERVE_VERIFY_BUDGET_MS` per `SERVE_VERIFY_WINDOW_MS`); each
+channel is served atomically (announcement plus updates plus endpoint node
+announcements) or omitted whole, and an omission forced by the budget is
+reported through the `reply_short_channel_ids_end` `full_information` bit.
+This skips nearly the entire first-dump verification cost for wallet nodes
+while preserving the never-serve-unverified rule. Trust-consuming reads stay
+verified everywhere: updates naming our own channels and node announcements
+that feed peer address capture are verified at intake, and every dial-address
+consumer goes through `NetworkGraph.getVerifiedNodeAnnouncement`, which
+resolves a deferred announcement before handing out addresses. Set
+`eagerGossipVerify: true` on relay-class nodes to verify everything at intake
+as before; eager mode also re-requests signatureless RGS-primed entries from
+peers so their signed copies become servable. Stored rows that predate the
+provenance flags are resolved at restore: eager mode verifies the canonical
+re-encoding (failing safe to unverified), lazy mode marks them deferred and
+lets the point of consumption decide.
 
 ### HTLC Forwarding
 

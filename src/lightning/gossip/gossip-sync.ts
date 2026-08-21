@@ -253,13 +253,16 @@ export class GossipSyncManager extends EventEmitter {
 			});
 		}
 
-		// End marker
+		// End marker. full_information drops to 0 when the shared deferred
+		// verification budget forced channels out of this reply (issue #443):
+		// the requester must not treat an omission we know about as "the
+		// responder has nothing more".
 		messages.push({
 			type: MessageType.REPLY_SHORT_CHANNEL_IDS_END,
 			payload: encodeReplyShortChannelIdsEndMessage({
 				// BOLT 7: reply MUST echo the query's chain_hash.
 				chainHash: msg.chainHash,
-				complete: true
+				complete: gossipData.complete
 			})
 		});
 
