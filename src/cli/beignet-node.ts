@@ -758,7 +758,13 @@ export class BeignetNode extends EventEmitter {
 		if (!opts.allowMultipleInstances) {
 			const lockPath = path.join(this.dataDir, `${networkName}.lock`);
 			try {
-				acquireInstanceLock(lockPath);
+				acquireInstanceLock(lockPath, Date.now(), (holder, reason) => {
+					this.log(
+						'warn',
+						`[beignet] Reclaimed stale instance lock (pid ${holder.pid} on ` +
+							`${holder.hostname}, ${reason}) at ${lockPath}`
+					);
+				});
 			} catch (e) {
 				if (e instanceof InstanceLockError) {
 					throw new BeignetError(
@@ -771,7 +777,8 @@ export class BeignetNode extends EventEmitter {
 			this._lockPath = lockPath;
 			// Safety net: release the lock if the process exits without destroy()
 			// (Ctrl-C, uncaught error). A hard kill leaves it, but the next start
-			// reclaims a stale lock via PID liveness, so no manual cleanup is needed.
+			// reclaims a stale lock via PID liveness (same host) or a hostname
+			// change (recreated container), so no manual cleanup is needed.
 			this._lockExitHandler = (): void => releaseInstanceLock(lockPath);
 			process.once('exit', this._lockExitHandler);
 		}
