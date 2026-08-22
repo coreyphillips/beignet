@@ -1681,6 +1681,194 @@ describe('BOLT 7: Gossip & Routing', () => {
 			expect(graph.removeChannel(makeScid(1, 1, 1))).to.be.false;
 		});
 
+		it('should report nodes garbage-collected by removeChannel via onNodeEvicted', () => {
+			const evictedNodes: string[] = [];
+			const localGraph = new NetworkGraph(BITCOIN_CHAIN_HASH, {
+				onNodeEvicted: (nodeIdHex): void => {
+					evictedNodes.push(nodeIdHex);
+				}
+			});
+
+			const { key1, key2 } = makeOrderedKeypairs();
+			const key3 = makeKeypair();
+			let channelKey1: typeof key1, channelKey2: typeof key3;
+			if (Buffer.compare(key1.publicKey, key3.publicKey) < 0) {
+				channelKey1 = key1;
+				channelKey2 = key3;
+			} else {
+				channelKey1 = key3;
+				channelKey2 = key1;
+			}
+
+			const scid1 = makeScid(700000, 1, 0);
+			const scid2 = makeScid(700000, 2, 0);
+			const { msg: msg1 } = buildChannelAnnouncement(
+				key1,
+				key2,
+				makeKeypair(),
+				makeKeypair(),
+				scid1
+			);
+			const { msg: msg2 } = buildChannelAnnouncement(
+				channelKey1,
+				channelKey2,
+				makeKeypair(),
+				makeKeypair(),
+				scid2
+			);
+			localGraph.addChannelAnnouncement(msg1);
+			localGraph.addChannelAnnouncement(msg2);
+
+			// key2 loses its only channel; key1 still holds scid2
+			localGraph.removeChannel(scid1);
+			expect(evictedNodes).to.deep.equal([key2.publicKey.toString('hex')]);
+
+			// Now key1 and key3 lose their last channel too
+			localGraph.removeChannel(scid2);
+			expect(evictedNodes).to.have.members([
+				key1.publicKey.toString('hex'),
+				key2.publicKey.toString('hex'),
+				key3.publicKey.toString('hex')
+			]);
+			expect(evictedNodes).to.have.length(3);
+		});
+
+		it('ceiling replacement never reports an endpoint the incoming channel keeps', () => {
+			const savedCap = NetworkGraph.MAX_CHANNELS;
+			try {
+				NetworkGraph.MAX_CHANNELS = 1;
+				const evictedNodes: string[] = [];
+				const localGraph = new NetworkGraph(BITCOIN_CHAIN_HASH, {
+					onNodeEvicted: (nodeIdHex): void => {
+						evictedNodes.push(nodeIdHex);
+					}
+				});
+
+				const shared = makeKeypair();
+				const other1 = makeKeypair();
+				const other2 = makeKeypair();
+				const order = (
+					a: typeof shared,
+					b: typeof shared
+				): [typeof shared, typeof shared] =>
+					Buffer.compare(a.publicKey, b.publicKey) < 0 ? [a, b] : [b, a];
+				const [pair1a, pair1b] = order(shared, other1);
+				const [pair2a, pair2b] = order(shared, other2);
+
+				const scid1 = makeScid(700100, 1, 0);
+				const scid2 = makeScid(700100, 2, 0);
+				const { msg: msg1 } = buildChannelAnnouncement(
+					pair1a,
+					pair1b,
+					makeKeypair(),
+					makeKeypair(),
+					scid1
+				);
+				const { msg: msg2 } = buildChannelAnnouncement(
+					pair2a,
+					pair2b,
+					makeKeypair(),
+					makeKeypair(),
+					scid2
+				);
+
+				expect(
+					localGraph.addChannelAnnouncement(msg1, { verified: 'deferred' })
+				).to.be.true;
+				// The verified admission evicts shared-other1 to make room for
+				// shared-other2: only other1 lost its last channel; the shared
+				// endpoint owns the admitted channel and must not be reported.
+				expect(localGraph.addChannelAnnouncement(msg2, { verified: true })).to
+					.be.true;
+				expect(evictedNodes).to.deep.equal([other1.publicKey.toString('hex')]);
+				expect(localGraph.getNode(shared.publicKey)).to.not.be.undefined;
+			} finally {
+				NetworkGraph.MAX_CHANNELS = savedCap;
+			}
+		});
+
+		it('restore ceiling replacement never reports a shared endpoint either', () => {
+			const savedCap = NetworkGraph.MAX_CHANNELS;
+			try {
+				NetworkGraph.MAX_CHANNELS = 1;
+				const evictedNodes: string[] = [];
+				const localGraph = new NetworkGraph(BITCOIN_CHAIN_HASH, {
+					onNodeEvicted: (nodeIdHex): void => {
+						evictedNodes.push(nodeIdHex);
+					}
+				});
+
+				const shared = makeKeypair();
+				const other1 = makeKeypair();
+				const other2 = makeKeypair();
+				const order = (
+					a: typeof shared,
+					b: typeof shared
+				): [typeof shared, typeof shared] =>
+					Buffer.compare(a.publicKey, b.publicKey) < 0 ? [a, b] : [b, a];
+				const [pair1a, pair1b] = order(shared, other1);
+				const [pair2a, pair2b] = order(shared, other2);
+
+				const scid1 = makeScid(700101, 1, 0);
+				const scid2 = makeScid(700101, 2, 0);
+				const { msg: msg1 } = buildChannelAnnouncement(
+					pair1a,
+					pair1b,
+					makeKeypair(),
+					makeKeypair(),
+					scid1
+				);
+				const { msg: msg2 } = buildChannelAnnouncement(
+					pair2a,
+					pair2b,
+					makeKeypair(),
+					makeKeypair(),
+					scid2
+				);
+
+				expect(
+					localGraph.addChannelAnnouncement(msg1, { verified: 'deferred' })
+				).to.be.true;
+				localGraph.restoreChannel({
+					shortChannelId: scid2,
+					nodeId1: pair2a.publicKey,
+					nodeId2: pair2b.publicKey,
+					features: Buffer.alloc(0),
+					announcement: msg2,
+					announcementVerified: true
+				});
+				expect(localGraph.getChannel(scid2)).to.not.be.undefined;
+				expect(evictedNodes).to.deep.equal([other1.publicKey.toString('hex')]);
+				expect(localGraph.getNode(shared.publicKey)).to.not.be.undefined;
+			} finally {
+				NetworkGraph.MAX_CHANNELS = savedCap;
+			}
+		});
+
+		it('a throwing onNodeEvicted callback cannot leave the graph partially cleaned', () => {
+			const localGraph = new NetworkGraph(BITCOIN_CHAIN_HASH, {
+				onNodeEvicted: (): void => {
+					throw new Error('callback boom');
+				}
+			});
+			const { key1, key2 } = makeOrderedKeypairs();
+			const scid = makeScid(700102, 1, 0);
+			const { msg } = buildChannelAnnouncement(
+				key1,
+				key2,
+				makeKeypair(),
+				makeKeypair(),
+				scid
+			);
+			localGraph.addChannelAnnouncement(msg);
+
+			// The callback fires only after the channel and BOTH endpoint
+			// nodes are removed, so the throw escapes with the graph clean.
+			expect(() => localGraph.removeChannel(scid)).to.throw('callback boom');
+			expect(localGraph.getChannelCount()).to.equal(0);
+			expect(localGraph.getNodeCount()).to.equal(0);
+		});
+
 		it('should prune stale channels', () => {
 			const { key1, key2 } = makeOrderedKeypairs();
 			const btcKey1 = makeKeypair();

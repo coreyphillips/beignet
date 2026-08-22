@@ -894,6 +894,12 @@ export class SqliteStorage implements IStorageBackend {
 			.run(nodeIdHex, json);
 	}
 
+	deleteGossipNode(nodeIdHex: string): void {
+		this.db
+			.prepare('DELETE FROM gossip_nodes WHERE node_id_hex = ?')
+			.run(nodeIdHex);
+	}
+
 	loadAllGossipNodes(): IGraphNode[] {
 		const rows = this.db
 			.prepare('SELECT node_json FROM gossip_nodes')

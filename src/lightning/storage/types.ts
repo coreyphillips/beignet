@@ -190,6 +190,8 @@ export interface IStorageBackend {
 	// ─── Gossip Cleanup (optional) ───
 	/** Delete a gossip channel by SCID hex. Used during graph pruning. */
 	deleteGossipChannel?(scidHex: string): void;
+	/** Delete a gossip node by node id hex once its last channel goes (issue #447). */
+	deleteGossipNode?(nodeIdHex: string): void;
 
 	// ─── Channel Routing Policies (optional) ───
 	/** Save a per-channel routing-policy override (msat fields as strings). */

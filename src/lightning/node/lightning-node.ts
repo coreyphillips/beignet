@@ -1153,6 +1153,25 @@ export class LightningNode extends EventEmitter {
 						'deleteGossipChannel'
 					);
 				}
+			},
+			// A node whose last graph channel went away is deleted from memory
+			// by removeChannel; without this its gossip_nodes row would outlive
+			// it forever and resurrect it on every boot (issue #447). Node rows
+			// are deleted only when channel rows can be too: with
+			// deleteGossipChannel absent, evicted channel rows survive on disk
+			// and would restore placeholder nodes whose announcements this
+			// deleted. The boot orphan gate, keyed to disk channel rows, cleans
+			// such backends up instead.
+			onNodeEvicted: (nodeIdHex) => {
+				if (
+					typeof this.storage?.deleteGossipNode === 'function' &&
+					typeof this.storage.deleteGossipChannel === 'function'
+				) {
+					this.safeStorage(
+						() => this.storage!.deleteGossipNode!(nodeIdHex),
+						'deleteGossipNode'
+					);
+				}
 			}
 		});
 
@@ -2125,6 +2144,14 @@ export class LightningNode extends EventEmitter {
 		// drops those slots, leaving such a row equally short-lived.
 		const gossipRestoreCutoff =
 			Math.floor(Date.now() / 1000) - DEFAULT_PRUNE_MAX_AGE;
+		// Endpoints of every channel row that stays on disk past the stale
+		// filter. Node-row orphanhood below is decided against DISK, not the
+		// capped in-memory graph: restoreChannel keeps verified overflow rows
+		// on disk without admitting them, and their node rows must survive
+		// alongside them. Rows restoreChannel itself trims from disk leave
+		// their endpoints in this set; those node rows are cleaned one boot
+		// later, once their channel rows are gone.
+		const diskChannelEndpoints = new Set<string>();
 		for (const channel of this.storage.loadAllGossipChannels()) {
 			const ts1 =
 				channel.update1 &&
@@ -2146,9 +2173,34 @@ export class LightningNode extends EventEmitter {
 				}
 				continue;
 			}
+			diskChannelEndpoints.add(channel.nodeId1.toString('hex'));
+			diskChannelEndpoints.add(channel.nodeId2.toString('hex'));
 			this.graph.restoreChannel(channel);
 		}
+		// The channel loop above created a graph node entry for every restored
+		// channel endpoint. A node row absent from the graph AND from the
+		// surviving disk channel rows' endpoints has no channel behind it: an
+		// orphan leaked before node rows were deleted alongside their last
+		// channel (issue #447). Restoring it would resurrect the leak in
+		// memory, so delete the row and skip it. A node row referenced only by
+		// a retained overflow channel row is kept on disk but not restored;
+		// it returns with its channel on a later boot. Channel peer reconnects
+		// are unaffected: their addresses live in the announced peer address
+		// capture, not in gossip_nodes.
 		for (const node of this.storage.loadAllGossipNodes()) {
+			if (!this.graph.getNode(node.nodeId)) {
+				const nodeIdHex = node.nodeId.toString('hex');
+				if (
+					!diskChannelEndpoints.has(nodeIdHex) &&
+					typeof this.storage.deleteGossipNode === 'function'
+				) {
+					this.safeStorage(
+						() => this.storage!.deleteGossipNode!(nodeIdHex),
+						'deleteGossipNode'
+					);
+				}
+				continue;
+			}
 			this.graph.restoreNode(node);
 		}
 
