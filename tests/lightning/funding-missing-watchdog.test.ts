@@ -267,6 +267,83 @@ describe('Channel voiding on funding:missing', function () {
 		bob.destroy();
 	});
 
+	it('no chain tip: the absence starts no clock and the channel is retained', async function () {
+		// Issue #463. currentBlockHeight is 0 until a header the backend
+		// actually delivered replaces it, and a header subscription that
+		// answers with the stored default never does. Stamping that as
+		// "missing since" records the genesis block, and the next absence at a
+		// real tip then measures a wait of the whole chain.
+		const { alice, bob, channelId } = setupPair(904, 905);
+		await tick(60);
+
+		const voided: Buffer[] = [];
+		alice.on('channel:voided', (d: { channelId: Buffer }) =>
+			voided.push(d.channelId)
+		);
+		expect(alice.getCurrentBlockHeight(), 'no tip yet').to.equal(0);
+
+		alice
+			.getChainWatcher()!
+			.emit('funding:missing', channelId, '55'.repeat(32));
+		expect(voided, 'nothing is voided without a tip').to.have.length(0);
+		expect(alice.listChannels().length).to.equal(1);
+		const channel = alice.getChannelManager().getChannel(channelId)!;
+		expect(channel.fundingMissingSince(), 'no clock was started').to.equal(
+			undefined
+		);
+
+		// The tip arrives: the clock starts HERE, and the full BOLT 2 wait
+		// still has to pass.
+		alice.handleNewBlock(700_000);
+		alice
+			.getChainWatcher()!
+			.emit('funding:missing', channelId, '55'.repeat(32));
+		expect(channel.fundingMissingSince()).to.equal(700_000);
+		expect(voided).to.have.length(0);
+		expect(alice.listChannels().length).to.equal(1);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a start height stamped with no tip is not a countdown from genesis', async function () {
+		// The same defect read back off disk: a row written by a build without
+		// the guard carries a 0, which must not read as "missing since block
+		// zero" and forget the channel on the first absence at a real tip.
+		const { alice, bob, channelId } = setupPair(906, 907);
+		await tick(60);
+
+		const voided: Buffer[] = [];
+		alice.on('channel:voided', (d: { channelId: Buffer }) =>
+			voided.push(d.channelId)
+		);
+		const channel = alice.getChannelManager().getChannel(channelId)!;
+		// White-box: exactly what such a row deserializes to.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(channel.getFullState() as any).fundingMissingSinceHeight = 0;
+
+		alice.handleNewBlock(700_000);
+		alice
+			.getChainWatcher()!
+			.emit('funding:missing', channelId, '66'.repeat(32));
+		expect(voided, 'the stale zero is repaired, not acted on').to.have.length(
+			0
+		);
+		expect(channel.fundingMissingSince()).to.equal(700_000);
+		expect(alice.listChannels().length).to.equal(1);
+
+		// And the real wait still ends the way it always did.
+		alice.handleNewBlock(700_000 + 2016);
+		alice
+			.getChainWatcher()!
+			.emit('funding:missing', channelId, '66'.repeat(32));
+		expect(voided).to.have.length(1);
+		expect(alice.listChannels().length).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	it('a vanished splice tx is alarm-only: the live channel survives', async function () {
 		const { alice, bob, channelId } = setupPair(902, 903);
 		await tick(60);

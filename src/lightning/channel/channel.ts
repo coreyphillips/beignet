@@ -813,6 +813,17 @@ export class Channel {
 	 * Cleared on disconnect and when a fresh interactive negotiation starts.
 	 */
 	private _txAbortSent = false;
+	/**
+	 * This channel's record was read off disk at startup, so it says what some
+	 * EARLIER process durably wrote and not what that process went on to do. A
+	 * Recovery Capsule is best-effort recency by construction (BOLT 1 peer
+	 * storage is rate limited and providers need not return the latest blob,
+	 * docs/RECOVERY-PROTOCOL.md 5.4), so `sentTxSignatures: false` here can
+	 * describe an open whose signatures did leave and whose funding is on
+	 * chain. Set by ChannelManager.restoreChannel's startup caller; in memory
+	 * because every start re-reads the row and re-sets it (issue #463).
+	 */
+	private _recordRestoredFromDisk = false;
 	// We refused a COMPLETED splice negotiation with tx_abort. The peer sends
 	// its mid-splice commitment_signed right after its final tx_complete, so
 	// that message can already be in flight when our abort leaves; judged
@@ -2375,11 +2386,21 @@ export class Channel {
 			// exchange completion or the next reestablish flush channel_ready
 			// (mirrors markSpliceConfirmed for a splice that confirmed while
 			// the channel could not send splice_locked).
+			//
+			// ERRORED is admitted for the same reason the v1 arm below records
+			// fundingConfirmedLate (issue #413): a failed open never flushes
+			// channel_ready, but the outpoint now provably exists, and every
+			// decision that turns on that fact reads it back through
+			// isFundingKnownOnChain. Without the stamp a failed v2 open can
+			// watch its own funding reach depth and record nothing, so it
+			// stays 'not on chain' forever and no exit is ever driven for it
+			// (issue #463).
 			if (
 				this._state.v2InFlight &&
 				!this._state.v2InFlight.confirmed &&
 				(this._state.state === ChannelState.AWAITING_REESTABLISH ||
-					this._state.state === ChannelState.AWAITING_TX_SIGNATURES)
+					this._state.state === ChannelState.AWAITING_TX_SIGNATURES ||
+					this._state.state === ChannelState.ERRORED)
 			) {
 				this._state.v2InFlight.confirmed = true;
 				return [...prefix, { type: ChannelActionType.PERSIST_STATE }];
@@ -5136,20 +5157,41 @@ export class Channel {
 	 * Idempotent afterwards, so every later absence keeps the original height.
 	 */
 	beginFundingMissingClock(height: number): boolean {
-		if (this._state.fundingMissingSinceHeight !== undefined) return false;
+		// A non-positive height is not a height: it is the node saying it has
+		// no chain tip yet (currentBlockHeight starts at 0 and only a header
+		// the backend actually delivered replaces it). Stamping it would
+		// record "missing since the genesis block", and the next absence at a
+		// real tip would then measure a wait of the whole chain and forget a
+		// funding that was never given its 2016 blocks. Absence that cannot be
+		// timed does not start a clock; the caller retains the channel and
+		// asks again (issue #463).
+		if (!Number.isFinite(height) || height <= 0) return false;
+		if (this.fundingMissingSince() !== undefined) return false;
 		this._state.fundingMissingSinceHeight = height;
 		return true;
 	}
 
-	/** The height absence was first observed at, or undefined if never. */
+	/**
+	 * The height absence was first observed at, or undefined if never. A
+	 * non-positive stored value reads as unset: rows written before the guard
+	 * above existed can carry a 0 stamped with no tip, and that is not a
+	 * countdown anyone may act on. Reporting it as unset lets the next real
+	 * absence restamp it at a height that means something.
+	 */
 	fundingMissingSince(): number | undefined {
-		return this._state.fundingMissingSinceHeight;
+		const since = this._state.fundingMissingSinceHeight;
+		if (since === undefined || !Number.isFinite(since) || since <= 0) {
+			return undefined;
+		}
+		return since;
 	}
 
 	/**
 	 * Stop the clock: the funding was found, so nothing is counting down any
 	 * more. Returns true when this call cleared a running clock, so the caller
 	 * knows the removal is a state change that owes a persist of its own.
+	 * Keyed on the raw field rather than fundingMissingSince(), so an unusable
+	 * stamp still gets removed from disk instead of lingering forever.
 	 */
 	clearFundingMissingClock(): boolean {
 		if (this._state.fundingMissingSinceHeight === undefined) return false;
@@ -7036,7 +7078,10 @@ export class Channel {
 		// then reads the resumed attempt, so an abandonable replacement
 		// backed by a signed previous attempt keeps its row.
 		this._normalizeV2AttemptForFailure();
-		if (this.isV2AttemptBroadcastable()) {
+		if (this.isV2AttemptBroadcastable() || this.v2TeardownMustRetain()) {
+			// A restored record cannot authorize the condemned teardown below
+			// either: condemning deletes the row at the next start, which is
+			// the same removal by a slower route (issue #463).
 			return this._failChannelWithWireError(reason, 'none');
 		}
 		this._state.dualFundingSession?.abort();
@@ -16867,9 +16912,23 @@ export class Channel {
 	 * and row); everything it checks is durable, so the answer survives a
 	 * restore. Never true once our tx_signatures left (the peer may hold a
 	 * broadcastable funding tx), once the fully signed tx was staged for
-	 * (re)broadcast, or once either channel_ready was exchanged.
+	 * (re)broadcast, once either channel_ready was exchanged, or once our own
+	 * watcher has seen the funding on chain.
+	 *
+	 * Durable facts only, deliberately. What the record cannot answer is
+	 * whether it is CURRENT: a database installed by a recovery restore can
+	 * be behind what the node actually did, so callers that would remove a
+	 * channel on a purely local inference screen for that separately
+	 * (ChannelManager.isChannelRestoredFromDisk).
 	 */
 	isAbandonedV2Open(): boolean {
+		// Chain evidence outranks the record. isV2AttemptBroadcastable answers
+		// from what this node remembers doing, and a funding tx our own watcher
+		// has seen at depth exists whatever the record says about our
+		// witnesses. Removing such a channel would delete the only state that
+		// can sweep that funding's outputs, so a confirmed open is never
+		// abandoned (issue #463).
+		if (this.isFundingKnownOnChain()) return false;
 		return (
 			this._state.state === ChannelState.ERRORED &&
 			this._state.fundingVersion === 2 &&
@@ -16921,6 +16980,36 @@ export class Channel {
 	 * broadcastable by construction, so the channel-wide answer stays true
 	 * while any of them is still live.
 	 */
+	/** Register this channel's record as one loaded from disk at startup. */
+	markRecordRestoredFromDisk(): void {
+		this._recordRestoredFromDisk = true;
+	}
+
+	/** Whether this channel's record was loaded from disk at startup. */
+	isRecordRestoredFromDisk(): boolean {
+		return this._recordRestoredFromDisk;
+	}
+
+	/**
+	 * Whether a v2 teardown must RETAIN this open even though the record says
+	 * nobody can broadcast its funding tx.
+	 *
+	 * isV2AttemptBroadcastable answers from what this node remembers doing,
+	 * and a restored record cannot prove that: the process that wrote it may
+	 * have released tx_signatures afterwards, in which case the peer holds a
+	 * complete funding tx and BOLT 2 forbids forgetting the channel until its
+	 * inputs are provably unspendable. A peer's tx_abort is honest evidence
+	 * that IT wants the open dead, and an honest peer may send one before its
+	 * own signatures while already holding ours; neither says the funding is
+	 * not on chain. Discarding the open here drops the funding watch, the
+	 * monitor spend detection would build from it and the SCB entry, which is
+	 * how a peer's force-close went unswept in issue #463. Chain evidence
+	 * retires such a channel instead, through the funding-missing watchdog.
+	 */
+	private v2TeardownMustRetain(): boolean {
+		return this._recordRestoredFromDisk;
+	}
+
 	isV2AttemptBroadcastable(): boolean {
 		if (this._state.pendingFundingTxHex) return true;
 		if (this._state.v2PreviousAttempts?.length) return true;
@@ -17087,7 +17176,7 @@ export class Channel {
 				this._txAbortSent = false;
 				return [{ type: ChannelActionType.PERSIST_STATE }];
 			}
-			if (this.isV2AttemptBroadcastable()) {
+			if (this.isV2AttemptBroadcastable() || this.v2TeardownMustRetain()) {
 				// The latch stays SET for the retained attempt: tx_abort has
 				// no exchange identifier, so a cleared latch could not tell
 				// the peer's next independent abort from a duplicate or an
@@ -17223,7 +17312,7 @@ export class Channel {
 		// channel until the funding's inputs are provably unspendable. Echo
 		// the abort as the ack, but keep the record, the state and the
 		// watch.
-		if (this.isV2AttemptBroadcastable()) {
+		if (this.isV2AttemptBroadcastable() || this.v2TeardownMustRetain()) {
 			// The compose latches _txAbortSent, and for the RETAINED attempt
 			// it stays latched: tx_abort has no exchange identifier, so a
 			// second inbound abort is indistinguishable from a duplicate or

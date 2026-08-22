@@ -81,6 +81,7 @@ import {
 	decodeTxSignaturesMessage,
 	decodeTxAbortMessage,
 	decodeTxAckRbfMessage,
+	encodeTxAbortMessage,
 	encodeTxInitRbfMessage
 } from '../../src/lightning/message/interactive-tx';
 import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
@@ -102,6 +103,13 @@ import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { ILeaseRates } from '../../src/lightning/gossip/types';
 import { reconstructFromFrames } from '../../src/lightning/recovery';
+import { encodeErrorMessage } from '../../src/lightning/message/error';
+import { buildRemoteCommitment } from '../../src/lightning/channel/commitment-builder';
+import { ChainActionType, OutputType } from '../../src/lightning/chain/types';
+import {
+	IChainBackend,
+	computeScriptHash
+} from '../../src/lightning/chain/chain-watcher';
 
 // ─────────────── Channel-level helpers ───────────────
 
@@ -4688,6 +4696,7 @@ function makeNodeConfig(
 		recovery?: INodeConfig['recovery'];
 		fundingProvider?: IFundingProvider;
 		leaseRates?: ILeaseRates;
+		chainBackend?: IChainBackend;
 	} = {}
 ): INodeConfig {
 	const seed = makeSeed(seedId);
@@ -4706,6 +4715,43 @@ function makeNodeConfig(
 		htlcBasepointSecret: htlcSecret,
 		...opts
 	};
+}
+
+/**
+ * A scripted Electrum-style backend: the tests set the script-hash history and
+ * the raw transactions the chain is supposed to hold, and the headers
+ * subscription delivers a tip so the watcher can reason about depth.
+ */
+class ScriptedChainBackend implements IChainBackend {
+	history = new Map<string, Array<{ txid: string; height: number }>>();
+	transactions = new Map<string, Buffer>();
+	tipHeight = 200;
+	private onBlock: ((height: number) => void) | null = null;
+
+	async subscribeToHeaders(cb: (height: number) => void): Promise<void> {
+		this.onBlock = cb;
+		cb(this.tipHeight);
+	}
+	async subscribeToScriptHash(): Promise<void> {
+		/* the tests drive checks through recheckAllWatches instead */
+	}
+	async getScriptHashHistory(
+		scriptHash: string
+	): Promise<Array<{ txid: string; height: number }>> {
+		return this.history.get(scriptHash) ?? [];
+	}
+	async getTransaction(txid: string): Promise<Buffer> {
+		const raw = this.transactions.get(txid);
+		if (!raw) throw new Error(`Transaction ${txid} not found`);
+		return raw;
+	}
+	async broadcastTransaction(): Promise<string> {
+		return '';
+	}
+	advanceTo(height: number): void {
+		this.tipHeight = height;
+		this.onBlock?.(height);
+	}
 }
 
 /** A real spendable P2WPKH UTXO with a working witness-signing closure. */
@@ -7015,6 +7061,543 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		expect(openerStorage.loadAllChannels()).to.have.length(0);
 
 		opener.destroy();
+		acceptor.destroy();
+	});
+
+	it('a RESTORED errored v2 open is retained, not voided, and still sweeps the peer close (463)', async function () {
+		// Issue #463. The same diverged terminal as the test above, except the
+		// record was READ OFF DISK at startup instead of negotiated by this
+		// process. A Tier 2 Recovery Capsule is best-effort recency (BOLT 1
+		// peer storage is rate limited and providers need not return the
+		// latest blob), so a restored record saying "our witnesses never left"
+		// can describe an open whose funding confirmed long ago. Deleting the
+		// channel on it takes the funding watch, the monitor that would be
+		// built from it and the SCB entry with it, which is how a peer's
+		// force-close output went unswept.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-void-463-'));
+		const dbPath = path.join(dir, 'opener.db');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const opener1 = new LightningNode(
+			makeNodeConfig(163, {
+				storage: storage1,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(164));
+		opener1.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire1 = wireNodes(opener1, acceptor);
+		wire1.dropFrom(opener1, MessageType.COMMITMENT_SIGNED);
+
+		const channel1 = opener1.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire1.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel1.getChannelId()!;
+		expect(channel1.getFullState().v2InFlight!.sentTxSignatures).to.be.false;
+
+		// What the chain will actually hold: the peer's commitment, at an index
+		// beyond anything the stale record knows, spending the funding outpoint
+		// and paying our balance to to_remote. Built from the live state, which
+		// the restored process no longer has the material to reproduce.
+		const peerCommitment = buildRemoteCommitment(
+			channel1.getFullState(),
+			perCommitmentPointFromSecret(
+				crypto
+					.createHash('sha256')
+					.update(Buffer.from('peer-close-463'))
+					.digest()
+			),
+			4n
+		).result.tx;
+
+		opener1.destroy();
+		managerOf(acceptor).handlePeerDisconnected(opener1.getNodeId());
+
+		// ── A new process restores the row from disk. ──
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const opener2 = new LightningNode(
+			makeNodeConfig(163, { storage: storage2, recovery: { enabled: true } })
+		);
+		opener2.on('node:error', () => {});
+		const voided: Buffer[] = [];
+		opener2.on('channel:voided', (e: { channelId: Buffer }) => {
+			voided.push(e.channelId);
+		});
+		expect(managerOf(opener2).getChannel(channelId)).to.not.equal(undefined);
+
+		// The peer forgot the channel and says so, exactly as it did after its
+		// own force-close in the report.
+		opener2.handlePeerMessage(
+			acceptor.getNodeId(),
+			MessageType.ERROR,
+			encodeErrorMessage({
+				channelId,
+				data: Buffer.from('unknown or closed channel', 'ascii')
+			})
+		);
+
+		const retained = managerOf(opener2).getChannel(channelId);
+		expect(retained, 'the restored channel is kept').to.not.equal(undefined);
+		expect(retained!.getState()).to.equal(ChannelState.ERRORED);
+		expect(voided, 'nothing is voided on a restored record').to.have.length(0);
+		expect(storage2.loadAllChannels(), 'the row survives').to.have.length(1);
+		// The Tier 1 guarantee the void also destroyed: the channel is still in
+		// the node's own static channel backup, and so in the next capsule.
+		expect(
+			opener2
+				.buildStaticChannelBackupData()
+				.channels.some((c) => c.channelId === channelId.toString('hex')),
+			'the channel is still named by the SCB'
+		).to.equal(true);
+		// A disconnect must not finish what the error started.
+		managerOf(opener2).handlePeerDisconnected(acceptor.getNodeId());
+		expect(managerOf(opener2).getChannel(channelId)).to.not.equal(undefined);
+		expect(voided).to.have.length(0);
+
+		// The money: the peer's commitment confirms and the retained channel
+		// builds its monitor and sweeps our to_remote. With the channel deleted
+		// this returns an empty action list and the output is never claimed.
+		const destScript = bitcoin.payments.p2wpkh({
+			pubkey: getPublicKey(crypto.randomBytes(32)),
+			network: bitcoin.networks.regtest
+		}).output!;
+		const actions = managerOf(opener2).handleFundingSpent(
+			channelId,
+			peerCommitment,
+			150,
+			destScript,
+			10
+		);
+		const monitor = managerOf(opener2).getMonitor(channelId);
+		expect(
+			monitor,
+			'a monitor was built from the retained channel'
+		).to.not.equal(undefined);
+		expect(monitor!.getTrackedOutputs().map((o) => o.outputType)).to.deep.equal(
+			[OutputType.TO_REMOTE]
+		);
+		// Anchor to_remote carries a 1-block CSV, so the sweep is scheduled at
+		// the spend and released by the next block.
+		const matured = managerOf(opener2).handleNewBlock(151);
+		const sweeps = [...actions, ...matured].filter(
+			(a) => a.type === ChainActionType.BROADCAST_TX
+		);
+		expect(sweeps, 'exactly one to_remote sweep').to.have.length(1);
+		const sweep = bitcoin.Transaction.fromBuffer(
+			(sweeps[0] as { tx: Buffer }).tx
+		);
+		expect(
+			Buffer.from(sweep.ins[0].hash).reverse().toString('hex'),
+			'the sweep spends the peer commitment'
+		).to.equal(peerCommitment.getId());
+		expect(sweep.outs[0].script.equals(destScript)).to.equal(true);
+
+		opener2.destroy();
+		acceptor.destroy();
+	});
+
+	it('a retained errored v2 open records its funding reaching depth (463)', async function () {
+		// The retention above must not be a trapdoor. A failed v2 open never
+		// flushes channel_ready, so the confirmation has to be recorded on the
+		// record itself; without it isFundingKnownOnChain answers false
+		// forever, every automatic exit stays disarmed and the channel is
+		// stuck with no way out but the funding-missing watchdog.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-conf-463-'));
+		const dbPath = path.join(dir, 'opener.db');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const opener1 = new LightningNode(
+			makeNodeConfig(165, {
+				storage: storage1,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(166));
+		opener1.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire1 = wireNodes(opener1, acceptor);
+		wire1.dropFrom(opener1, MessageType.COMMITMENT_SIGNED);
+		const channel1 = opener1.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire1.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel1.getChannelId()!;
+		opener1.destroy();
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const opener2 = new LightningNode(
+			makeNodeConfig(165, { storage: storage2, recovery: { enabled: true } })
+		);
+		opener2.on('node:error', () => {});
+		opener2.handlePeerMessage(
+			acceptor.getNodeId(),
+			MessageType.ERROR,
+			encodeErrorMessage({
+				channelId,
+				data: Buffer.from('unknown or closed channel', 'ascii')
+			})
+		);
+		const retained = managerOf(opener2).getChannel(channelId)!;
+		expect(retained.getState()).to.equal(ChannelState.ERRORED);
+		expect(retained.isFundingKnownOnChain()).to.equal(false);
+		expect(retained.isAbandonedV2Open()).to.equal(true);
+
+		// The watcher reports the depth it was always going to report.
+		managerOf(opener2).handleFundingConfirmed(channelId);
+		expect(retained.isFundingKnownOnChain()).to.equal(true);
+		expect(retained.getFullState().v2InFlight!.confirmed).to.equal(true);
+		// And a funded open is no longer an abandoned one, whatever the record
+		// says about our witnesses.
+		expect(retained.isAbandonedV2Open()).to.equal(false);
+		expect(
+			storage2.loadChannel(channelId.toString('hex'))!.state.v2InFlight!
+				.confirmed,
+			'the stamp is durable'
+		).to.equal(true);
+
+		opener2.destroy();
+		acceptor.destroy();
+	});
+
+	it('the v2 funding-on-chain gate covers only unbroadcastable pre-ready opens (463)', function () {
+		// The automatic force-close paths were exempt from the
+		// funding-known-on-chain guard for every v2 channel, because
+		// handleChannelErrored used to remove the one shape that needed it.
+		// Now that the shape is retained instead, the guard has to cover it -
+		// and nothing else. A live channel must keep its exits, zero-conf
+		// especially: isFundingKnownOnChain answers false for a trusted
+		// zero-conf peer by design (issue #413), so a broader gate here would
+		// silently disarm every automatic close it has.
+		const node = new LightningNode(makeNodeConfig(167));
+		node.on('node:error', () => {});
+		const gate = (
+			node as unknown as {
+				v2CloseNeedsFundingOnChain: (c: Channel, s: IChannelState) => boolean;
+			}
+		).v2CloseNeedsFundingOnChain.bind(node);
+		const chan = (broadcastable: boolean): Channel =>
+			({
+				isV2AttemptBroadcastable: (): boolean => broadcastable
+			}) as unknown as Channel;
+		const state = (over: Partial<IChannelState>): IChannelState =>
+			({
+				v2InFlight: null,
+				localChannelReady: false,
+				remoteChannelReady: false,
+				...over
+			}) as IChannelState;
+		const record = {} as NonNullable<IChannelState['v2InFlight']>;
+
+		expect(
+			gate(chan(false), state({ v2InFlight: record })),
+			'the retained shape is gated'
+		).to.equal(true);
+		expect(
+			gate(chan(false), state({})),
+			'no in-flight record (a live channel, zero-conf included)'
+		).to.equal(false);
+		expect(
+			gate(chan(true), state({ v2InFlight: record })),
+			'a broadcastable attempt'
+		).to.equal(false);
+		expect(
+			gate(chan(false), state({ v2InFlight: record, localChannelReady: true })),
+			'our channel_ready crossed'
+		).to.equal(false);
+		expect(
+			gate(
+				chan(false),
+				state({ v2InFlight: record, remoteChannelReady: true })
+			),
+			'the peer channel_ready crossed'
+		).to.equal(false);
+
+		node.destroy();
+	});
+
+	it('a restored open is retained through a tx_abort, echo and all (463)', async function () {
+		// A peer's tx_abort says the PEER wants the open dead. It does not say
+		// our own witnesses never left: an honest peer may abort before
+		// sending its own tx_signatures while already holding ours, and a
+		// restored record cannot tell that apart. BOLT 2 forbids forgetting a
+		// channel whose signatures we released until its funding inputs are
+		// provably unspendable, so the abort is echoed as the ack and the
+		// record, the state and the watch are all kept.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-abort-463-'));
+		const dbPath = path.join(dir, 'opener.db');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const opener1 = new LightningNode(
+			makeNodeConfig(168, {
+				storage: storage1,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(169));
+		opener1.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire1 = wireNodes(opener1, acceptor);
+		wire1.dropFrom(opener1, MessageType.COMMITMENT_SIGNED);
+		const channel1 = opener1.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire1.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel1.getChannelId()!;
+		opener1.destroy();
+		managerOf(acceptor).handlePeerDisconnected(opener1.getNodeId());
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const opener2 = new LightningNode(
+			makeNodeConfig(168, { storage: storage2, recovery: { enabled: true } })
+		);
+		opener2.on('node:error', () => {});
+		expect(
+			managerOf(opener2).isChannelRestoredFromDisk(channelId),
+			'the row is registered as restored'
+		).to.equal(true);
+
+		const sent: number[] = [];
+		opener2.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
+		const voided: Buffer[] = [];
+		opener2.on('channel:voided', (e: { channelId: Buffer }) => {
+			voided.push(e.channelId);
+		});
+
+		// The peer aborts the open.
+		opener2.handlePeerMessage(
+			acceptor.getNodeId(),
+			MessageType.TX_ABORT,
+			encodeTxAbortMessage({
+				channelId,
+				data: Buffer.from('peer abandoned the open', 'ascii')
+			})
+		);
+		await settle(() => sent.includes(MessageType.TX_ABORT));
+
+		const kept = managerOf(opener2).getChannel(channelId);
+		expect(kept, 'the restored open survives the abort').to.not.equal(
+			undefined
+		);
+		expect(
+			kept!.getFullState().v2InFlight,
+			'the record is kept, so the funding watch keeps its outpoint'
+		).to.not.be.oneOf([null, undefined]);
+		expect(kept!.getFullState().condemned).to.not.equal(true);
+		expect(voided, 'nothing terminal is reported').to.have.length(0);
+		expect(
+			storage2.loadAllChannels(),
+			'and the row is still on disk'
+		).to.have.length(1);
+		// The peer still gets its ack, so neither side is left waiting.
+		expect(sent.filter((t) => t === MessageType.TX_ABORT)).to.have.length(1);
+
+		expect(kept!.isRecordRestoredFromDisk()).to.equal(true);
+
+		opener2.destroy();
+		acceptor.destroy();
+	});
+
+	it('a restored watch finds a funding the record never named, end to end (463)', async function () {
+		// The capsule holds attempt A; the lost process replaced it by RBF and
+		// B is what confirmed. A watch armed from the record alone filters the
+		// funding script's history down to A, reports the funding ABSENT while
+		// B sits confirmed in that very history, and never arms spend
+		// detection, so the peer's close on B is never swept. Driven through
+		// the real ChainWatcher rather than by calling handleFundingSpent.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-rbf-463-'));
+		const dbPath = path.join(dir, 'opener.db');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const opener1 = new LightningNode(
+			makeNodeConfig(170, {
+				storage: storage1,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(400_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(171));
+		opener1.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire1 = wireNodes(opener1, acceptor);
+		wire1.dropFrom(opener1, MessageType.COMMITMENT_SIGNED);
+		const channel1 = opener1.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire1.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel1.getChannelId()!;
+		const recorded = channel1.getFullState();
+		const fundingScript = createFundingScript(
+			recorded.localBasepoints.fundingPubkey,
+			recorded.remoteBasepoints!.fundingPubkey,
+			bitcoin.networks.regtest
+		).p2wshOutput;
+
+		// The RBF replacement the record never saw: same script, same value.
+		const replacement = new bitcoin.Transaction();
+		replacement.version = 2;
+		replacement.addInput(crypto.randomBytes(32), 0);
+		replacement.addOutput(fundingScript, Number(recorded.fundingSatoshis));
+		// And the peer's commitment spending it.
+		const spentState = deserializeChannelState(serializeChannelState(recorded));
+		spentState.fundingTxid = replacement.getHash();
+		spentState.fundingOutputIndex = 0;
+		const peerCommitment = buildRemoteCommitment(
+			spentState,
+			perCommitmentPointFromSecret(
+				crypto
+					.createHash('sha256')
+					.update(Buffer.from('rbf-close-463'))
+					.digest()
+			),
+			3n
+		).result.tx;
+
+		opener1.destroy();
+		managerOf(acceptor).handlePeerDisconnected(opener1.getNodeId());
+
+		const backend = new ScriptedChainBackend();
+		backend.transactions.set(replacement.getId(), replacement.toBuffer());
+		backend.transactions.set(peerCommitment.getId(), peerCommitment.toBuffer());
+		backend.history.set(computeScriptHash(fundingScript), [
+			{ txid: replacement.getId(), height: 100 },
+			{ txid: peerCommitment.getId(), height: 150 }
+		]);
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const opener2 = new LightningNode(
+			makeNodeConfig(170, {
+				storage: storage2,
+				recovery: { enabled: true },
+				chainBackend: backend
+			})
+		);
+		opener2.on('node:error', () => {});
+		const broadcasts: Buffer[] = [];
+		opener2.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
+
+		// The watcher arms itself from the restored row, then answers from the
+		// chain on its ordinary recheck: the recorded attempt is absent, the
+		// replacement is found in the funding script's own history, and the
+		// peer's close on it is detected.
+		for (
+			let i = 0;
+			i < 40 && !opener2.getChannelManager().getMonitor(channelId);
+			i++
+		) {
+			await opener2.getChainWatcher()!.recheckAllWatches();
+			await new Promise((r) => setTimeout(r, 25));
+		}
+		const monitor = opener2.getChannelManager().getMonitor(channelId)!;
+		expect(
+			monitor.getTrackedOutputs().map((o) => o.outputType),
+			'the peer close was classified and our output tracked'
+		).to.deep.equal([OutputType.TO_REMOTE]);
+
+		// Anchor to_remote matures one block after the spend.
+		opener2.handleNewBlock(201);
+		expect(broadcasts, 'the to_remote sweep went out').to.have.length(1);
+		const sweep = bitcoin.Transaction.fromBuffer(broadcasts[0]);
+		expect(Buffer.from(sweep.ins[0].hash).reverse().toString('hex')).to.equal(
+			peerCommitment.getId()
+		);
+
+		opener2.destroy();
+		acceptor.destroy();
+	});
+
+	it('the forget clock reaches its disposition without a second alarm (463)', async function () {
+		// 'funding:missing' is one-shot for as long as the absence continues,
+		// so a disposition driven by that event alone gets exactly one chance:
+		// the clock starts and is never looked at again. The per-block review
+		// is what carries it to the end.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-clock-463-'));
+		const dbPath = path.join(dir, 'opener.db');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const opener1 = new LightningNode(
+			makeNodeConfig(172, {
+				storage: storage1,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(400_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(173));
+		opener1.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire1 = wireNodes(opener1, acceptor);
+		wire1.dropFrom(opener1, MessageType.COMMITMENT_SIGNED);
+		const channel1 = opener1.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire1.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel1.getChannelId()!;
+		opener1.destroy();
+
+		// A chain that has never heard of this funding, at a real tip.
+		const backend = new ScriptedChainBackend();
+		backend.tipHeight = 700_000;
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const opener2 = new LightningNode(
+			makeNodeConfig(172, {
+				storage: storage2,
+				recovery: { enabled: true },
+				chainBackend: backend
+			})
+		);
+		opener2.on('node:error', () => {});
+		let alarms = 0;
+		opener2.on('node:error', (e: { code: string }) => {
+			if (e.code === 'FUNDING_MISSING') alarms++;
+		});
+		const voided: Buffer[] = [];
+		opener2.on('channel:voided', (e: { channelId: Buffer }) => {
+			voided.push(e.channelId);
+		});
+
+		// Three absent answers arm the watcher's one and only alarm.
+		const watcher = opener2.getChainWatcher()!;
+		await settle(() => opener2.listChannels().length === 1, 4000);
+		for (let i = 0; i < 4; i++) await watcher.recheckAllWatches();
+		await settle(() => alarms > 0, 4000);
+		expect(alarms, 'the alarm is one-shot').to.equal(1);
+		const channel = opener2.getChannelManager().getChannel(channelId)!;
+		expect(channel.fundingMissingSince()).to.equal(700_000);
+		expect(
+			voided,
+			'nothing is forgotten before its 2016 blocks'
+		).to.have.length(0);
+
+		// Blocks pass. No further alarm is ever emitted, and the disposition
+		// still lands.
+		backend.advanceTo(700_000 + 2015);
+		opener2.handleNewBlock(700_000 + 2015);
+		expect(voided).to.have.length(0);
+		backend.advanceTo(700_000 + 2017);
+		opener2.handleNewBlock(700_000 + 2017);
+		expect(alarms, 'still just the one alarm').to.equal(1);
+		expect(voided, 'the clock reached its disposition').to.have.length(1);
+		expect(opener2.getChannelManager().getChannel(channelId)).to.equal(
+			undefined
+		);
+
+		opener2.destroy();
 		acceptor.destroy();
 	});
 

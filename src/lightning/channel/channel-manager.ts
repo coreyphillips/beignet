@@ -1706,7 +1706,18 @@ export class ChannelManager extends EventEmitter {
 			// channel that no reestablish, disposition or cleanup ever
 			// touches; a peer that still asks after removal gets the
 			// unknown-channel error and ends the attempt on its side.
-			if (channel.isAbandonedV2Open() && channelIdHex) {
+			//
+			// Not for a record this process only read off disk: nothing has
+			// checked it against the peer or the chain, and a restore can hand
+			// back an older view of an open that has since funded. Such a
+			// channel is retained here and removed, if it really is dead, by
+			// the funding-missing watchdog, which asks the chain and then waits
+			// out BOLT 2's 2016 blocks (issue #463).
+			if (
+				channel.isAbandonedV2Open() &&
+				channelIdHex &&
+				!channel.isRecordRestoredFromDisk()
+			) {
 				this.channels.delete(channelIdHex);
 				this.channelPeers.delete(channelIdHex);
 				this.emit(
@@ -1927,6 +1938,33 @@ export class ChannelManager extends EventEmitter {
 			// process. Arm the one-shot repair; reestablish fires it.
 			this.channelsAwaitingRestoreRepair.add(channelId.toString('hex'));
 		}
+	}
+
+	/**
+	 * Register a channel as one whose record came off disk at startup.
+	 *
+	 * Called by the node's storage restore ONLY. Deliberately not inside
+	 * restoreChannel, which is also the live re-restore path for a blocked
+	 * persist resync and for both abandonment reverts: those re-read a row
+	 * this process itself negotiated, and marking them would disable the
+	 * removals that keep dead opens from accumulating.
+	 */
+	markChannelRestoredFromDisk(channelId: Buffer): void {
+		this.channels.get(channelId.toString('hex'))?.markRecordRestoredFromDisk();
+	}
+
+	/**
+	 * Whether this channel's record was loaded from disk at startup and has
+	 * therefore never been checked against anything but itself. Callers that
+	 * would DELETE a channel on a local inference must refuse while this is
+	 * true and let the chain answer instead (issue #463).
+	 */
+	isChannelRestoredFromDisk(channelId: Buffer): boolean {
+		return (
+			this.channels
+				.get(channelId.toString('hex'))
+				?.isRecordRestoredFromDisk() ?? false
+		);
 	}
 
 	/**
