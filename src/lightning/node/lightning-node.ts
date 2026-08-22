@@ -72,7 +72,9 @@ import {
 	IRouteHop,
 	TGossipVerified,
 	ADDRESS_TYPE_TORV2,
-	ADDRESS_TYPE_TORV3
+	ADDRESS_TYPE_TORV3,
+	DEFAULT_PRUNE_MAX_AGE,
+	gossipTimestampTooFarFuture
 } from '../gossip/types';
 import {
 	decodeChannelAnnouncementMessage,
@@ -2115,8 +2117,35 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		// Restore gossip graph
+		// Restore gossip graph. Stale rows are filtered out BEFORE the graph's
+		// restore ceiling sees them: startup pruning removes them right after
+		// anyway, so letting one occupy a ceiling slot first could evict (and
+		// delete) a fresh row it will not outlive. Far-future timestamps do
+		// not count toward freshness here for the same reason: restoreChannel
+		// drops those slots, leaving such a row equally short-lived.
+		const gossipRestoreCutoff =
+			Math.floor(Date.now() / 1000) - DEFAULT_PRUNE_MAX_AGE;
 		for (const channel of this.storage.loadAllGossipChannels()) {
+			const ts1 =
+				channel.update1 &&
+				!gossipTimestampTooFarFuture(channel.update1.timestamp)
+					? channel.update1.timestamp
+					: 0;
+			const ts2 =
+				channel.update2 &&
+				!gossipTimestampTooFarFuture(channel.update2.timestamp)
+					? channel.update2.timestamp
+					: 0;
+			if (Math.max(ts1, ts2) < gossipRestoreCutoff) {
+				if (typeof this.storage.deleteGossipChannel === 'function') {
+					const scidHex = channel.shortChannelId.toString('hex');
+					this.safeStorage(
+						() => this.storage!.deleteGossipChannel!(scidHex),
+						'deleteGossipChannel'
+					);
+				}
+				continue;
+			}
 			this.graph.restoreChannel(channel);
 		}
 		for (const node of this.storage.loadAllGossipNodes()) {
@@ -4699,11 +4728,14 @@ export class LightningNode extends EventEmitter {
 		// record for private-only peers, whose announcements the graph
 		// rejects) and the restored graph. Seeding the timestamps also keeps
 		// replayed old announcements from regressing addresses post-restart.
+		// A capture persisted before the far-future bound existed can carry a
+		// poisoned timestamp that no later real announcement could supersede
+		// (the same repair restoreChannel applies to graph rows); drop it so
+		// the graph announcement or the next live capture reseeds the slot.
 		const persistedAnnounced = new Map(
-			(this.storage.loadAllAnnouncedPeerAddresses?.() ?? []).map((entry) => [
-				entry.pubkey,
-				entry
-			])
+			(this.storage.loadAllAnnouncedPeerAddresses?.() ?? [])
+				.filter((entry) => !gossipTimestampTooFarFuture(entry.timestamp))
+				.map((entry) => [entry.pubkey, entry])
 		);
 		for (const pubkey of channelPeers) {
 			let newest = persistedAnnounced.get(pubkey);
@@ -11009,6 +11041,13 @@ export class LightningNode extends EventEmitter {
 		} catch {
 			return; // malformed gossip (e.g. zero timestamp) — drop silently
 		}
+		// BOLT 7: far-future refusal before the capture path; its private
+		// freshness map would otherwise let a validly signed max-u32
+		// announcement pin the peer's reconnect fallback address against
+		// every later real announcement (issue #446).
+		if (gossipTimestampTooFarFuture(msg.timestamp)) {
+			return;
+		}
 		// Verification is worth paying for only if SOME consumer would take
 		// the result: the graph (freshness/verified gate) or the channel-peer
 		// address capture below (its own freshness map). Otherwise this is a
@@ -11118,6 +11157,14 @@ export class LightningNode extends EventEmitter {
 			msg = decodeChannelUpdateMessage(payload);
 		} catch {
 			return; // malformed gossip (e.g. zero timestamp) — drop silently
+		}
+		// BOLT 7: a far-future timestamp is refused before ANY side effect.
+		// The graph gate below refuses it too, but the policy-adoption path
+		// runs first and keys its own freshness off the same timestamp:
+		// adopted once, a max-u32 update would pin our route hints and
+		// blinded-path policy against every later real update (issue #446).
+		if (gossipTimestampTooFarFuture(msg.timestamp)) {
+			return;
 		}
 		// Peer policy for OUR channels: private channels never get an
 		// announcement, so their updates can never live in the graph. Retain a
@@ -17442,8 +17489,7 @@ export class LightningNode extends EventEmitter {
 			typeof this.storage.deleteGossipChannel === 'function'
 		) {
 			const channels = this.graph.getAllChannels();
-			const TWO_WEEKS = 1_209_600; // DEFAULT_PRUNE_MAX_AGE
-			const cutoff = now - TWO_WEEKS;
+			const cutoff = now - DEFAULT_PRUNE_MAX_AGE;
 			for (const channel of channels) {
 				const ts1 = channel.update1?.timestamp ?? 0;
 				const ts2 = channel.update2?.timestamp ?? 0;

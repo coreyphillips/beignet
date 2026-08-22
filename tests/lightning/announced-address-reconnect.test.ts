@@ -338,6 +338,21 @@ describe('LightningNode: channel peer address capture', function () {
 		h.node.destroy();
 	});
 
+	it('ignores a far-future announcement so it cannot pin the fallback address', function () {
+		const h = makeCaptureHarness();
+		// BOLT 7 far-future bound (issue #446): validly signed, but captured
+		// once its max-u32 timestamp would outrank every later real
+		// announcement in this map's freshness rule, pinning the address
+		// forever. It must be refused before the capture path runs.
+		h.announce([ADDR_1], 4294967295);
+		expect(h.announced()).to.deep.equal([]);
+		expect(h.recorded.announcedSaves.length).to.equal(0);
+		// The slot stays open for the genuine announcement.
+		h.announce([ADDR_2], 1000);
+		expect(h.announced()).to.deep.equal([{ host: '203.0.113.8', port: 9735 }]);
+		h.node.destroy();
+	});
+
 	it('a newer announcement with no usable addresses clears the fallbacks', function () {
 		const h = makeCaptureHarness();
 		h.announce([ADDR_1], 1000);

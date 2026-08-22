@@ -39,6 +39,7 @@ import { makeSignedNodeAnnouncement } from './helpers/signed-gossip';
 import {
 	IChannelUpdateMessage,
 	IGraphChannel,
+	DEFAULT_PRUNE_MAX_AGE,
 	MAX_GOSSIP_TIMESTAMP_SKEW
 } from '../../src/lightning/gossip/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -298,6 +299,55 @@ describe('Gossip far-future timestamps (NetworkGraph, issue #446)', () => {
 		expect(graph.applyChannelUpdate(beyond.msg, { verified: true })).to.equal(
 			false
 		);
+	});
+
+	it('a poisoned pre-bound row is repaired at the restore boundary', () => {
+		// A max-u32 update persisted BEFORE the bound existed restores with
+		// verified flags, so no takeover can displace it and pruning (keyed
+		// off the same timestamp) never reclaims it. The restore boundary
+		// must drop the slot or upgrading cannot repair a poisoned database.
+		const graph = new NetworkGraph(REGTEST_CHAIN_HASH);
+		const ann = buildAnnouncement(703, REGTEST_CHAIN_HASH);
+		const poison = buildUpdate(ann, FAR_FUTURE, 0, REGTEST_CHAIN_HASH);
+		graph.restoreChannel({
+			shortChannelId: ann.msg.shortChannelId,
+			nodeId1: ann.msg.nodeId1,
+			nodeId2: ann.msg.nodeId2,
+			features: Buffer.alloc(0),
+			announcement: ann.msg,
+			announcementVerified: true,
+			update1: poison.msg,
+			update1Verified: true
+		});
+		const ch = graph.getChannel(ann.msg.shortChannelId)!;
+		expect(ch.update1).to.equal(undefined);
+		expect(ch.update1Verified).to.equal(undefined);
+
+		// The freed slot takes the next real update instead of refusing it.
+		const real = buildUpdate(ann, 1000, 0, REGTEST_CHAIN_HASH);
+		expect(graph.applyChannelUpdate(real.msg, { verified: true })).to.equal(
+			true
+		);
+		expect(ch.update1?.timestamp).to.equal(1000);
+
+		// Same repair for a poisoned node announcement row.
+		const poisonAnn = makeSignedNodeAnnouncement(
+			ann.key1.privateKey,
+			FAR_FUTURE
+		);
+		graph.restoreNode({
+			nodeId: poisonAnn.msg.nodeId,
+			announcement: poisonAnn.msg,
+			announcementVerified: true,
+			channels: new Set([ann.msg.shortChannelId.toString('hex')])
+		});
+		expect(graph.getNode(poisonAnn.msg.nodeId)!.announcement).to.equal(
+			undefined
+		);
+		const realAnn = makeSignedNodeAnnouncement(ann.key1.privateKey, 1000);
+		expect(
+			graph.applyNodeAnnouncement(realAnn.msg, { verified: true })
+		).to.equal(true);
 	});
 });
 
@@ -853,5 +903,123 @@ describe('Gossip intake queue (LightningNode)', () => {
 			undefined
 		);
 		expect(storage.loadAllGossipChannels()).to.have.length(1);
+	});
+
+	it('a stale verified row cannot displace a fresh deferred row at the restore ceiling', async () => {
+		// Startup pruning would remove the stale row moments after restore, so
+		// letting it win a ceiling slot first (evicting and DELETING the fresh
+		// row it will not outlive) would leave the graph empty. The restore
+		// filter must keep stale rows out of ceiling contention entirely.
+		node.destroy();
+		storage = new SqliteStorage(dbPath);
+		storage.open();
+
+		const now = Math.floor(Date.now() / 1000);
+		const annStale = buildAnnouncement(810, REGTEST_CHAIN_HASH);
+		const staleUpd = buildUpdate(
+			annStale,
+			now - DEFAULT_PRUNE_MAX_AGE - 3600,
+			0,
+			REGTEST_CHAIN_HASH
+		);
+		storage.saveGossipChannel(annStale.msg.shortChannelId.toString('hex'), {
+			shortChannelId: annStale.msg.shortChannelId,
+			nodeId1: annStale.msg.nodeId1,
+			nodeId2: annStale.msg.nodeId2,
+			features: Buffer.alloc(0),
+			announcement: annStale.msg,
+			announcementVerified: true,
+			update1: staleUpd.msg,
+			update1Verified: true
+		});
+		const annFresh = buildAnnouncement(811, REGTEST_CHAIN_HASH);
+		const freshUpd = buildUpdate(annFresh, now - 60, 0, REGTEST_CHAIN_HASH);
+		storage.saveGossipChannel(annFresh.msg.shortChannelId.toString('hex'), {
+			shortChannelId: annFresh.msg.shortChannelId,
+			nodeId1: annFresh.msg.nodeId1,
+			nodeId2: annFresh.msg.nodeId2,
+			features: Buffer.alloc(0),
+			announcement: annFresh.msg,
+			update1: freshUpd.msg
+		});
+
+		const savedCap = NetworkGraph.MAX_CHANNELS;
+		NetworkGraph.MAX_CHANNELS = 1;
+		try {
+			node = new LightningNode(makeConfig());
+		} finally {
+			NetworkGraph.MAX_CHANNELS = savedCap;
+		}
+
+		expect(graphOf(node).getChannelCount()).to.equal(1);
+		expect(graphOf(node).getChannel(annFresh.msg.shortChannelId)).to.not.equal(
+			undefined
+		);
+		expect(storage.loadAllGossipChannels()).to.have.length(1);
+	});
+
+	it('a far-future update never reaches peer policy adoption', async () => {
+		// The adoption path runs before the graph gate and keys its own
+		// freshness off the update timestamp: adopted once, a max-u32 update
+		// would pin our route-hint policy against every later real update.
+		let adoptions = 0;
+		(
+			node as unknown as {
+				maybeAdoptPeerChannelPolicy(m: unknown, p: unknown): void;
+			}
+		).maybeAdoptPeerChannelPolicy = (): void => {
+			adoptions++;
+		};
+		const ann = buildAnnouncement(812, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		await node.flushGossip();
+
+		const camped = buildUpdate(ann, 4294967295, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_UPDATE, camped.payload);
+		await node.flushGossip();
+		expect(adoptions).to.equal(0);
+
+		// Sanity: an in-range update does reach the adoption path.
+		const real = buildUpdate(ann, 1000, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_UPDATE, real.payload);
+		await node.flushGossip();
+		expect(adoptions).to.equal(1);
+	});
+
+	it('a far-future node announcement never reaches address capture', async () => {
+		// The capture path's private freshness map would otherwise let a
+		// validly signed max-u32 announcement pin the peer's reconnect
+		// fallback address against every later real announcement.
+		const ann = buildAnnouncement(813, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		await node.flushGossip();
+
+		(
+			node as unknown as {
+				nodeAnnouncementCaptureWorthwhile(m: unknown): boolean;
+			}
+		).nodeAnnouncementCaptureWorthwhile = (): boolean => true;
+		let captures = 0;
+		(
+			node as unknown as {
+				captureChannelPeerAddresses(m: unknown): void;
+			}
+		).captureChannelPeerAddresses = (): void => {
+			captures++;
+		};
+
+		const camped = makeSignedNodeAnnouncement(ann.key1.privateKey, 4294967295);
+		feed(MessageType.NODE_ANNOUNCEMENT, camped.payload);
+		await node.flushGossip();
+		expect(captures).to.equal(0);
+		expect(graphOf(node).getNode(camped.msg.nodeId)!.announcement).to.equal(
+			undefined
+		);
+
+		// Sanity: an in-range verified announcement does reach capture.
+		const real = makeSignedNodeAnnouncement(ann.key1.privateKey, 2000);
+		feed(MessageType.NODE_ANNOUNCEMENT, real.payload);
+		await node.flushGossip();
+		expect(captures).to.equal(1);
 	});
 });

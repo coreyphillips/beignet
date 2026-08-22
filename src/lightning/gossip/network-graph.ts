@@ -12,7 +12,7 @@ import {
 	TGossipVerified,
 	CHANNEL_FLAG_DIRECTION,
 	DEFAULT_PRUNE_MAX_AGE,
-	MAX_GOSSIP_TIMESTAMP_SKEW,
+	gossipTimestampTooFarFuture,
 	decodeShortChannelId
 } from './types';
 import {
@@ -30,17 +30,6 @@ const ZERO_SIG = Buffer.alloc(64);
  */
 function isSignatureless(sig: Buffer): boolean {
 	return sig.equals(ZERO_SIG);
-}
-
-/**
- * BOLT 7: gossip timestamped unreasonably far in the future is ignored.
- * Without this bound a well-formed garbage message carrying a max-u32
- * timestamp would camp its slot via the strictly-newer freshness rule, and
- * pruning (which keys off the same timestamp) would never reclaim it
- * (issue #446).
- */
-function timestampTooFarFuture(timestamp: number): boolean {
-	return timestamp > Math.floor(Date.now() / 1000) + MAX_GOSSIP_TIMESTAMP_SKEW;
 }
 
 /**
@@ -326,7 +315,7 @@ export class NetworkGraph {
 		// BOLT 7: ignore timestamps unreasonably far in the future, whatever
 		// the provenance; admitted, one would camp its slot against the
 		// strictly-newer rule below and never go stale (issue #446).
-		if (timestampTooFarFuture(msg.timestamp)) {
+		if (gossipTimestampTooFarFuture(msg.timestamp)) {
 			return false;
 		}
 		const scidHex = msg.shortChannelId.toString('hex');
@@ -385,7 +374,7 @@ export class NetworkGraph {
 		opts: { verified?: TGossipVerified } = {}
 	): boolean {
 		// BOLT 7: ignore far-future timestamps (see applyChannelUpdate).
-		if (timestampTooFarFuture(msg.timestamp)) {
+		if (gossipTimestampTooFarFuture(msg.timestamp)) {
 			return false;
 		}
 		const nodeHex = msg.nodeId.toString('hex');
@@ -464,7 +453,7 @@ export class NetworkGraph {
 	 * never needing its signature).
 	 */
 	wouldAcceptChannelUpdate(msg: IChannelUpdateMessage): boolean {
-		if (timestampTooFarFuture(msg.timestamp)) return false;
+		if (gossipTimestampTooFarFuture(msg.timestamp)) return false;
 		const channel = this._channels.get(msg.shortChannelId.toString('hex'));
 		if (!channel) return false;
 		const direction = msg.channelFlags & CHANNEL_FLAG_DIRECTION;
@@ -483,7 +472,7 @@ export class NetworkGraph {
 	 * older (same shape as wouldAcceptChannelUpdate).
 	 */
 	wouldAcceptNodeAnnouncement(msg: INodeAnnouncementMessage): boolean {
-		if (timestampTooFarFuture(msg.timestamp)) return false;
+		if (gossipTimestampTooFarFuture(msg.timestamp)) return false;
 		const node = this._nodes.get(msg.nodeId.toString('hex'));
 		if (!node || node.channels.size === 0) return false;
 		if (node.announcement && msg.timestamp <= node.announcement.timestamp) {
@@ -630,6 +619,31 @@ export class NetworkGraph {
 	 * backend, custom ones included.
 	 */
 	restoreChannel(channel: IGraphChannel): void {
+		// A row persisted before the far-future bound existed can carry a
+		// timestamp the intake gates now refuse; restored raw it would re-camp
+		// its slot (verified flags block every takeover) and, keying pruning
+		// off the same timestamp, never go stale. Drop the poisoned slot: the
+		// freed slot takes the next real update, a row left with no updates is
+		// pruned right after restore, and per the issue #443 precedent the
+		// repair is not written back (the row self-heals on the next accepted
+		// update).
+		if (
+			channel.update1 &&
+			gossipTimestampTooFarFuture(channel.update1.timestamp)
+		) {
+			channel.update1 = undefined;
+			channel.update1Verified = undefined;
+			channel.update1VerifyDeferred = undefined;
+		}
+		if (
+			channel.update2 &&
+			gossipTimestampTooFarFuture(channel.update2.timestamp)
+		) {
+			channel.update2 = undefined;
+			channel.update2Verified = undefined;
+			channel.update2VerifyDeferred = undefined;
+		}
+
 		const ann = sanitizeSlot(
 			channel.announcementVerified,
 			channel.announcementVerifyDeferred
@@ -727,6 +741,15 @@ export class NetworkGraph {
 	 * eager verifies at once, lazy marks it deferred.
 	 */
 	restoreNode(node: IGraphNode): void {
+		// Same repair as restoreChannel: a pre-bound far-future announcement
+		// would camp the node's slot forever, so it is dropped and the next
+		// real announcement takes the slot.
+		if (
+			node.announcement &&
+			gossipTimestampTooFarFuture(node.announcement.timestamp)
+		) {
+			node.announcement = undefined;
+		}
 		const slot = sanitizeSlot(
 			node.announcementVerified,
 			node.announcementVerifyDeferred

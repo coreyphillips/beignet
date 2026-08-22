@@ -283,6 +283,16 @@ export const DEFAULT_PRUNE_MAX_AGE = 1_209_600;
  */
 export const MAX_GOSSIP_TIMESTAMP_SKEW = 3_600;
 
+/**
+ * The shared far-future test for every gossip timestamp consumer: the graph
+ * gates AND the node-side paths with their own freshness state (peer policy
+ * adoption, reconnect-address capture). One definition, or a path that
+ * forgets the bound re-opens the camping window it closes.
+ */
+export function gossipTimestampTooFarFuture(timestamp: number): boolean {
+	return timestamp > Math.floor(Date.now() / 1000) + MAX_GOSSIP_TIMESTAMP_SKEW;
+}
+
 // ── Short Channel ID ────────────────────────────────────────────────
 
 /**
