@@ -824,7 +824,10 @@ export class BeignetNode extends EventEmitter {
 		this.rapidGossipSync = opts.rapidGossipSync ?? true;
 		this.rapidGossipSyncUrl = opts.rapidGossipSyncUrl;
 		if (opts.recoveryLeaseCheckIntervalMs !== undefined) {
-			this._leaseCheckIntervalMs = Math.max(0, opts.recoveryLeaseCheckIntervalMs);
+			this._leaseCheckIntervalMs = Math.max(
+				0,
+				opts.recoveryLeaseCheckIntervalMs
+			);
 		}
 		const networkName = this.networkName;
 
@@ -5640,6 +5643,14 @@ export class BeignetNode extends EventEmitter {
 					: `All ${readyChannels.length} channel(s) are >90% depleted in one direction`
 		});
 
+		// 12. CHANNEL_BACKUP: the recovery tier, which decides what a lost
+		// device costs (issue #454). The severity follows the outcome because
+		// the scoring below is severity specific: a fenced or namespace-lost
+		// node is a CRITICAL failure (it must not operate, or can never open
+		// another channel), everything short of a confirmed guardian quorum
+		// is a WARNING.
+		checks.push(this.channelBackupReadiness());
+
 		// Calculate weighted score
 		// CRITICAL failures = -30, WARNINGs = -10, INFOs = -5
 		let score = 100;
@@ -5660,6 +5671,72 @@ export class BeignetNode extends EventEmitter {
 			score,
 			ready: !hasCriticalFailure,
 			checks
+		};
+	}
+
+	private channelBackupReadiness(): ReadinessCheck {
+		const name = 'CHANNEL_BACKUP';
+		const mode = this.recoveryMode;
+		if (mode === 'off') {
+			return {
+				name,
+				status: 'WARN',
+				severity: 'WARNING',
+				message:
+					'No recovery mode: a lost device can only force-close its ' +
+					'channels from the SCB (set BEIGNET_RECOVERY_MODE)'
+			};
+		}
+		const status = this.node.getRecoveryStatus();
+		if (status.fenced || status.gate === 'fenced') {
+			return {
+				name,
+				status: 'FAIL',
+				severity: 'CRITICAL',
+				message:
+					'Another device owns this recovery namespace; this node is ' +
+					'fenced and must not operate'
+			};
+		}
+		if (status.backfillLost) {
+			return {
+				name,
+				status: 'FAIL',
+				severity: 'CRITICAL',
+				message:
+					'This recovery namespace lost its guardian backfill; no ' +
+					'further channel state can be proven durable'
+			};
+		}
+		if (mode === 'peer-storage') {
+			return {
+				name,
+				status: 'WARN',
+				severity: 'WARNING',
+				message:
+					'Recovery capsules go to storage peers only (Tier 2 restore ' +
+					'via /recovery/restore-capsule); no guardian quorum, so no ' +
+					'fencing between devices'
+			};
+		}
+		if (status.gate !== 'confirmed') {
+			return {
+				name,
+				status: 'WARN',
+				severity: 'WARNING',
+				message:
+					`Guardian mode ${mode}: the quorum has not confirmed this ` +
+					'lease yet; channels stay quarantined'
+			};
+		}
+		return {
+			name,
+			status: 'PASS',
+			severity: 'WARNING',
+			message:
+				`Channel state replicated to a guardian quorum (${mode}, durable ` +
+				`through ${status.lastDurableSequence}); a lost device resumes ` +
+				'its channels'
 		};
 	}
 

@@ -132,6 +132,25 @@ async function waitFor(
 	}
 }
 
+function readinessCheck(
+	body: Record<string, unknown>,
+	name: string
+): { status: string; severity: string; message: string } {
+	const checks = (
+		body.result as {
+			checks: Array<{
+				name: string;
+				status: string;
+				severity: string;
+				message: string;
+			}>;
+		}
+	).checks;
+	const check = checks.find((c) => c.name === name);
+	expect(check, `readiness check ${name} present`).to.not.equal(undefined);
+	return check!;
+}
+
 async function expectStartRefused(
 	opts: Record<string, unknown>,
 	message: RegExp
@@ -242,6 +261,15 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 		expect(result.node).to.equal(null);
 	});
 
+	it('GET /readiness warns on CHANNEL_BACKUP when recovery is off', async () => {
+		const res = await request(portOf(daemon), 'GET', '/readiness');
+		expect(res.status).to.equal(200);
+		const check = readinessCheck(res.body, 'CHANNEL_BACKUP');
+		expect(check.status).to.equal('WARN');
+		expect(check.severity).to.equal('WARNING');
+		expect(check.message).to.match(/force-close/);
+	});
+
 	it('POST /recovery/restore without confirm is refused', async () => {
 		const res = await request(portOf(daemon), 'POST', '/recovery/restore', {});
 		expect(res.status).to.equal(400);
@@ -282,6 +310,10 @@ describe('Recovery surface: peer-storage mode', () => {
 			expect(result.state).to.equal('running');
 			expect(result.node?.durability).to.equal('local');
 			expect(result.node?.gate).to.equal('disabled');
+			const readiness = await request(portOf(daemon), 'GET', '/readiness');
+			const check = readinessCheck(readiness.body, 'CHANNEL_BACKUP');
+			expect(check.status).to.equal('WARN');
+			expect(check.message).to.match(/storage peers/);
 		} finally {
 			await daemon.stop();
 			fs.rmSync(dir, { recursive: true, force: true });
@@ -341,6 +373,10 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 			expect(
 				(confirmedA.body.result as { node: { gate: string } }).node.gate
 			).to.equal('confirmed');
+			const readyA = await request(portA, 'GET', '/readiness');
+			const backupA = readinessCheck(readyA.body, 'CHANNEL_BACKUP');
+			expect(backupA.status).to.equal('PASS');
+			expect(backupA.message).to.match(/guardian quorum \(quorum/);
 
 			// Device B: same seed, fresh database. The boot decision must
 			// refuse to register a second genesis and hold for restore.
@@ -428,9 +464,17 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 					(fencedA.body.result as { node: { gate: string } }).node.gate
 				).to.equal('fenced');
 				expect(fencedOnA).to.have.length(1);
-				expect(
-					(fencedOnA[0].supersededBy as { epoch: string }).epoch
-				).to.equal('2');
+				expect((fencedOnA[0].supersededBy as { epoch: string }).epoch).to.equal(
+					'2'
+				);
+				// A fenced node is not mainnet ready, whatever else passes.
+				const fencedReady = await request(portA, 'GET', '/readiness');
+				const fencedCheck = readinessCheck(fencedReady.body, 'CHANNEL_BACKUP');
+				expect(fencedCheck.status).to.equal('FAIL');
+				expect(fencedCheck.severity).to.equal('CRITICAL');
+				expect((fencedReady.body.result as { ready: boolean }).ready).to.equal(
+					false
+				);
 			} finally {
 				await deviceB.stop();
 				await deviceA.stop();

@@ -1660,7 +1660,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/channel/suggestions` | `?count=<n>` | Graph-based channel open suggestions |
 | GET | `/fees` | -- | On-chain fee trend analysis |
 | GET | `/logs` | `?category=&since=&limit=` | Query persistent action log |
-| GET | `/readiness` | -- | Mainnet readiness checklist (11 checks) |
+| GET | `/readiness` | -- | Mainnet readiness checklist (12 checks) |
 | GET | `/metrics` | readonly | Prometheus text exposition format metrics (auth-gated: reports balances; `metricsPublic: true` serves it without auth) |
 | POST | `/webhooks/register` | `{ url, events, secret? }` | Register webhook callback |
 | DELETE | `/webhooks/unregister` | `{ id }` | Remove webhook |

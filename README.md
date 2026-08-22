@@ -376,7 +376,7 @@ for (const rec of liquidity.recommendations) {
 node.getChannelSuggestions(3);  // graph-based peer suggestions for opens
 node.getFeeSnapshot();          // on-chain fee trend: OPEN_NOW / WAIT / NEUTRAL
 node.estimatePayment(bolt11);   // success probability + estimated fee, pre-send
-node.getMainnetReadiness();     // 11-check weighted readiness report
+node.getMainnetReadiness();     // 12-check weighted readiness report
 ```
 
 <details>
