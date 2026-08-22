@@ -142,9 +142,7 @@ export class GuardianStartupGate {
 		states: GuardianState[],
 		confirming: number
 	): IConfirmationOutcome {
-		this.supersededBy = states.find(
-			(state) => state.lease.epoch > lease.epoch
-		);
+		this.supersededBy = states.find((state) => state.lease.epoch > lease.epoch);
 		this.state = 'fenced';
 		this.emit({
 			type: 'gate:fenced',
