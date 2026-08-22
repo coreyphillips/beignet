@@ -985,23 +985,32 @@ describe('Production Hardening 11', function () {
 				const storage = new SqliteStorage(dbPath);
 				storage.open();
 
+				const config = makeNodeConfig(505);
+				config.storage = storage;
+				const node = new LightningNode(config);
+				node.on('error', () => {});
+
 				const now = Math.floor(Date.now() / 1000);
 				const staleTs = now - DEFAULT_PRUNE_MAX_AGE - 100;
 
 				const scidHex = 'aabbccdd22222222';
+				const scid = Buffer.from(scidHex, 'hex');
 				const nodeKey1 = Buffer.alloc(33, 1);
 				const nodeKey2 = Buffer.alloc(33, 2);
 
+				// The row lands after boot so the restore-time stale filter
+				// cannot delete it; only the prune path is under test here
+				// (issue #450).
 				storage.saveGossipChannel(scidHex, {
-					shortChannelId: Buffer.from(scidHex, 'hex'),
+					shortChannelId: scid,
 					nodeId1: nodeKey1,
 					nodeId2: nodeKey2,
 					features: Buffer.alloc(0),
 					announcement: {} as any,
 					update1: {
 						signature: Buffer.alloc(64),
-						chainHash: BITCOIN_CHAIN_HASH,
-						shortChannelId: Buffer.from(scidHex, 'hex'),
+						chainHash: REGTEST_CHAIN_HASH,
+						shortChannelId: scid,
 						timestamp: staleTs,
 						messageFlags: 0,
 						channelFlags: 0,
@@ -1013,20 +1022,14 @@ describe('Production Hardening 11', function () {
 					update2: null as any
 				});
 
-				const config = makeNodeConfig(505);
-				config.storage = storage;
-				const node = new LightningNode(config);
-				node.on('error', () => {});
-
-				// Add to graph
 				(node as any).graph.addChannelAnnouncement({
 					nodeSignature1: Buffer.alloc(64),
 					nodeSignature2: Buffer.alloc(64),
 					bitcoinSignature1: Buffer.alloc(64),
 					bitcoinSignature2: Buffer.alloc(64),
 					features: Buffer.alloc(0),
-					chainHash: BITCOIN_CHAIN_HASH,
-					shortChannelId: Buffer.from(scidHex, 'hex'),
+					chainHash: REGTEST_CHAIN_HASH,
+					shortChannelId: scid,
 					nodeId1: nodeKey1,
 					nodeId2: nodeKey2,
 					bitcoinKey1: nodeKey1,
@@ -1034,8 +1037,8 @@ describe('Production Hardening 11', function () {
 				});
 				(node as any).graph.applyChannelUpdate({
 					signature: Buffer.alloc(64),
-					chainHash: BITCOIN_CHAIN_HASH,
-					shortChannelId: Buffer.from(scidHex, 'hex'),
+					chainHash: REGTEST_CHAIN_HASH,
+					shortChannelId: scid,
 					timestamp: staleTs,
 					messageFlags: 0,
 					channelFlags: 0,
@@ -1045,8 +1048,15 @@ describe('Production Hardening 11', function () {
 					feeProportionalMillionths: 1
 				});
 
+				// Guard against the test going vacuous again: the row must have
+				// survived boot and the channel must be in the graph for the
+				// prune path to have anything to collect.
+				expect(storage.loadAllGossipChannels().length).to.equal(1);
+				expect((node as any).graph.getChannel(scid)).to.not.be.undefined;
+
 				(node as any).pruneStaleGossipWithStorage();
 
+				expect((node as any).graph.getChannel(scid)).to.be.undefined;
 				expect(storage.loadAllGossipChannels().length).to.equal(0);
 
 				node.destroy();
