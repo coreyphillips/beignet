@@ -79,15 +79,17 @@ import {
 import {
 	GuardianBootDecision,
 	GuardianState,
+	IGuardianConfigEntry,
 	IParsedGuardian,
 	IRestoreResult,
 	RestoreRefusedError,
 	buildGuardianRecovery,
-	parseGuardianUri,
+	parseGuardianEntry,
 	decodeRecoveryCapsuleBlob,
 	restoreBestRecoveryCapsule,
 	assertEmptyTarget,
-	CapsuleCandidateError
+	CapsuleCandidateError,
+	GuardianDescriptor
 } from '../lightning/recovery';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
 import { INodeConfig } from '../lightning/node/types';
@@ -313,12 +315,14 @@ export interface BeignetNodeOptions {
 	recoveryMode?: string;
 	/**
 	 * Guardian set for the guardian-backed modes, as
-	 * "<64-hex-x-only-pubkey>@<http(s) url>" URIs (crash-v1: exactly three).
-	 * A malformed entry throws rather than silently changing the quorum
-	 * arithmetic; the daemon validates these before create so a typo never
-	 * boots a node.
+	 * "<64-hex-x-only-pubkey>@<http(s) url>" URIs or structured
+	 * { guardianId, url, auth? } entries (crash-v1: exactly three). The
+	 * structured form carries the transport credential a retrieved capsule
+	 * hands back through revealCapsuleGuardians. A malformed entry throws
+	 * rather than silently changing the quorum arithmetic; the daemon
+	 * validates these before create so a typo never boots a node.
 	 */
-	recoveryGuardians?: string[];
+	recoveryGuardians?: Array<string | IGuardianConfigEntry>;
 	/** Fault-model profile; 'crash-v1' is the only value and the default. */
 	recoveryProfile?: string;
 	/**
@@ -402,6 +406,60 @@ interface ICapsuleRestoreMarker {
 	keep: string;
 	head: { writerEpoch: string; latestSequence: string };
 	tier: 2;
+}
+
+/**
+ * A capsule guardian descriptor as the daemon reports it: identity and
+ * transports only. The capsule may carry a transport credential (wire 2.4);
+ * it is encrypted under the node secret for exactly that reason and never
+ * leaves the capsule through a readonly route or a log line.
+ */
+export interface IReportedGuardian {
+	guardianId: string;
+	transports: Array<{
+		type: 'onion-http' | 'https' | 'local-http';
+		url: string;
+	}>;
+}
+
+/**
+ * Strip userinfo from a URL before it is reported or logged. The parser
+ * refuses credentials in guardian URLs, but a descriptor is data from a
+ * capsule, and a readonly route must not be the place that leaks one.
+ */
+function redactUrl(url: string): string {
+	try {
+		const parsed = new URL(url);
+		if (parsed.username === '' && parsed.password === '') return url;
+		parsed.username = '';
+		parsed.password = '';
+		return parsed.toString();
+	} catch {
+		return '<invalid url>';
+	}
+}
+
+function redactGuardians(
+	descriptors: GuardianDescriptor[]
+): IReportedGuardian[] {
+	// The decoder shape-checks descriptors (assertGuardianDescriptors), so
+	// every entry has an id and at least one transport; the credential stays
+	// behind here, both the structured `auth` and anything inside a URL.
+	return descriptors.map((g) => ({
+		guardianId: g.guardianId,
+		transports: g.transports.map((t) => ({
+			type: t.type,
+			url: redactUrl(t.url)
+		}))
+	}));
+}
+
+/** Same guardian identities, in any order. */
+function sameGuardianIds(a: string[], b: string[]): boolean {
+	if (a.length !== b.length) return false;
+	const sortedA = a.map((id) => id.toLowerCase()).sort();
+	const sortedB = b.map((id) => id.toLowerCase()).sort();
+	return sortedA.every((id, i) => id === sortedB[i]);
 }
 
 /** Write through a temp file and rename, so a crash never leaves a torn file. */
@@ -816,6 +874,8 @@ export class BeignetNode extends EventEmitter {
 			latestSequence: bigint;
 			inline: boolean;
 			channelCount: number;
+			/** The guardian locators the capsule names (spec 5.4, issue #457). */
+			guardians: GuardianDescriptor[];
 			receivedAt: number;
 		}
 	>();
@@ -1697,7 +1757,7 @@ export class BeignetNode extends EventEmitter {
 		}
 		// Guardian-backed modes. The daemon validates the guardian set before
 		// create; parsing again here gives library callers the same refusals.
-		const guardians = (opts.recoveryGuardians ?? []).map(parseGuardianUri);
+		const guardians = (opts.recoveryGuardians ?? []).map(parseGuardianEntry);
 		this.recoveryGuardianSet = guardians;
 		const decision = await buildGuardianRecovery({
 			storage: this.storage,
@@ -1895,6 +1955,13 @@ export class BeignetNode extends EventEmitter {
 				latestSequence: string;
 				inline: boolean;
 				channelCount: number;
+				/**
+				 * Guardian locators the capsule names, credentials redacted:
+				 * what a seed restore with no configuration needs to rebuild
+				 * BEIGNET_RECOVERY_GUARDIANS (issue #457). Reported, never
+				 * adopted over the configured set.
+				 */
+				guardians: IReportedGuardian[];
 				fromPeer: string;
 				receivedAt: number;
 			} | null;
@@ -1996,6 +2063,7 @@ export class BeignetNode extends EventEmitter {
 					latestSequence: c.latestSequence.toString(),
 					inline: c.inline,
 					channelCount: c.channelCount,
+					guardians: redactGuardians(c.guardians),
 					fromPeer,
 					receivedAt: c.receivedAt
 				};
@@ -2004,6 +2072,45 @@ export class BeignetNode extends EventEmitter {
 		if (!best) return { candidates: 0, best: null };
 		const { epoch: _e, sequence: _s, ...rest } = best;
 		return { candidates: this._peerRetrievedCapsules.size, best: rest };
+	}
+
+	/**
+	 * The admin handoff of the best retrieved capsule's guardian set WITH
+	 * its transport credentials (POST /recovery/capsule-guardians). The
+	 * status route redacts credentials because it is readonly; an operator
+	 * restarting in a guardian mode whose guardians require authentication
+	 * needs them back, and the config file accepts exactly the entries
+	 * returned here. Nothing is adopted or persisted by this call.
+	 */
+	revealCapsuleGuardians(): {
+		fromPeer: string;
+		head: { writerEpoch: string; latestSequence: string };
+		guardians: GuardianDescriptor[];
+		/** Config-file ready entries for recoveryGuardians. */
+		entries: IGuardianConfigEntry[];
+	} {
+		const best = this.describeRetrievedCapsules().best;
+		if (!best) {
+			throw new BeignetError(
+				'CAPSULE_RESTORE_NO_CANDIDATES',
+				'No storage peer has returned a Recovery Capsule this session. ' +
+					'Connect to the peers this node had channels with and retry.'
+			);
+		}
+		const held = this._peerRetrievedCapsules.get(best.fromPeer)!;
+		return {
+			fromPeer: best.fromPeer,
+			head: {
+				writerEpoch: best.writerEpoch,
+				latestSequence: best.latestSequence
+			},
+			guardians: held.guardians,
+			entries: held.guardians.map((g) => ({
+				guardianId: g.guardianId,
+				url: g.transports[0].url,
+				...(g.auth ? { auth: g.auth } : {})
+			}))
+		};
 	}
 
 	/**
@@ -2165,6 +2272,40 @@ export class BeignetNode extends EventEmitter {
 				writerEpoch: result.newestSeenHead.writerEpoch.toString(),
 				latestSequence: result.newestSeenHead.latestSequence.toString()
 			};
+			// A capsule that names guardians describes a guardian-backed
+			// namespace, and neither tier below is the right restore for one.
+			// Tier 2 here would install the state without the 5.7 takeover
+			// that fences a still-running old writer (and a quorum-marked
+			// journal then refuses to boot unbarriered anyway); Tier 1 would
+			// persist DLP recovery and ask the peers to force-close channels
+			// the guardians could have resumed exactly. Stop before either
+			// acts: the locators are on the status route and the admin
+			// handoff, and the restore is the guardian path after a restart.
+			// The SCB emergency path stays what it always was, the peer
+			// retrieved backup through the SCB restore route.
+			if (result.capsule.guardians.length > 0) {
+				staged.close();
+				dropStaged();
+				const locators = redactGuardians(result.capsule.guardians);
+				this.log(
+					'warn',
+					'Capsule restore refused: capsule names a guardian set',
+					{
+						guardians: locators
+					}
+				);
+				throw new BeignetError(
+					'CAPSULE_RESTORE_GUARDIAN_BACKED',
+					`The best capsule names ${locators.length} guardian(s): its state ` +
+						'belongs to a guardian-backed namespace, which restores through ' +
+						'the guardian set with fencing, not from peer storage. Restart ' +
+						'in that recovery mode with the guardians the capsule names ' +
+						'(capsules.best.guardians on the status route, or the ' +
+						'capsule-guardians handoff when they need credentials); for an ' +
+						'emergency SCB-only recovery use the peer-retrieved backup with ' +
+						'the SCB restore route.'
+				);
+			}
 			const common = {
 				channelCount: result.scb.channels.length,
 				framesApplied: result.framesApplied,
@@ -7245,6 +7386,7 @@ export class BeignetNode extends EventEmitter {
 					latestSequence: capsule.latestSequence,
 					inline,
 					channelCount: embedded.channels.length,
+					guardians: capsule.guardians,
 					receivedAt: Date.now()
 				});
 				this.log('info', 'Recovered capsule from peer storage', {
@@ -7252,8 +7394,41 @@ export class BeignetNode extends EventEmitter {
 					writerEpoch: capsule.writerEpoch.toString(),
 					latestSequence: capsule.latestSequence.toString(),
 					inline,
-					channelCount: embedded.channels.length
+					channelCount: embedded.channels.length,
+					guardians: capsule.guardians.length
 				});
+				// The capsule's locators are reported, never adopted: a set
+				// that disagrees with the configured one is a stale
+				// pre-enablement capsule or an operator error (set replacement
+				// does not exist in v1, wire 5.9), and either way the operator
+				// decides. Warn once per change of set from this peer, not on
+				// every equal-head re-send after a reconnect.
+				if (
+					this.recoveryGuardianSet.length > 0 &&
+					!sameGuardianIds(
+						capsule.guardians.map((g) => g.guardianId),
+						this.recoveryGuardianSet.map((g) => g.guardianId.toString('hex'))
+					) &&
+					(!held ||
+						!sameGuardianIds(
+							capsule.guardians.map((g) => g.guardianId),
+							held.guardians.map((g) => g.guardianId)
+						))
+				) {
+					this.log(
+						'warn',
+						'Retrieved capsule names a guardian set that differs from ' +
+							'the configured one; the configured set stays in force',
+						{
+							fromPeer: peerPubkey,
+							capsule: redactGuardians(capsule.guardians),
+							configured: this.recoveryGuardianSet.map((g) => ({
+								guardianId: g.guardianId.toString('hex'),
+								url: g.url
+							}))
+						}
+					);
+				}
 			}
 			// Surface the Tier 1 material under the wallet seed, the key
 			// restoreFromScb (POST /restore/scb) decodes with.

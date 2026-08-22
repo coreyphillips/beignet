@@ -22,6 +22,7 @@ import {
 	GuardianHttpServer,
 	ReferenceGuardian,
 	composeRecoveryCapsule,
+	decodeRecoveryCapsuleBlob,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { decodeScb, encodeScb } from '../../src/lightning/backup/scb';
@@ -38,6 +39,11 @@ const MNEMONIC =
 const sha = (s: string): Buffer =>
 	crypto.createHash('sha256').update(s).digest();
 
+const NODE_SECRET = deriveLightningKeysFromMnemonic(
+	MNEMONIC,
+	undefined,
+	LnCoinType.REGTEST
+).nodePrivateKey;
 const GUARDIAN_SECRETS = [1, 2, 3].map((i) => sha(`surface-guardian-${i}`));
 const GUARDIAN_IDS = GUARDIAN_SECRETS.map((s) => xOnlyFromSecret(s));
 
@@ -216,6 +222,36 @@ describe('Recovery surface: configuration validation (pre-boot)', () => {
 		);
 	});
 
+	it('refuses a credential inside a guardian URL and a malformed structured entry', async () => {
+		const ids = GUARDIAN_IDS.map((id) => id.toString('hex'));
+		await expectStartRefused(
+			{
+				recoveryMode: 'quorum',
+				recoveryGuardians: [
+					`${ids[0]}@https://alice:secret@g1.example`,
+					`${ids[1]}@https://g2.example`,
+					`${ids[2]}@https://g3.example`
+				]
+			},
+			/credentials in the URL/
+		);
+		await expectStartRefused(
+			{
+				recoveryMode: 'quorum',
+				recoveryGuardians: [
+					{
+						guardianId: ids[0],
+						url: 'https://g1.example',
+						auth: { type: 'nope' }
+					},
+					{ guardianId: ids[1], url: 'https://g2.example' },
+					{ guardianId: ids[2], url: 'https://g3.example' }
+				]
+			},
+			/not a known credential shape/
+		);
+	});
+
 	it('refuses guardians configured without a guardian mode, typos included', async () => {
 		const guardians = GUARDIAN_IDS.map(
 			(id, i) => `${id.toString('hex')}@http://127.0.0.1:${i + 1}`
@@ -373,11 +409,6 @@ describe('Recovery surface: peer-storage mode', () => {
 });
 
 describe('Recovery surface: capsule restore in peer-storage mode', () => {
-	const NODE_SECRET = deriveLightningKeysFromMnemonic(
-		MNEMONIC,
-		undefined,
-		LnCoinType.REGTEST
-	).nodePrivateKey;
 	const PEER_A = '02' + 'a1'.repeat(32);
 	const PEER_B = '02' + 'b2'.repeat(32);
 	const ADMIN_KEY = 'a'.repeat(64);
@@ -810,6 +841,173 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 			fs.rmSync(dirDirty, { recursive: true, force: true });
 		}
 	});
+	it('refuses a capsule that names guardians before either tier acts, and hands the set back on the admin route', async function (): Promise<void> {
+		this.timeout(60_000);
+		const dir = tmpDir('capsule-guardian-backed');
+		const dirSrc = tmpDir('capsule-guardian-src');
+		const GUARDIAN_ID = '44'.repeat(32);
+		const guardians = [
+			{
+				guardianId: GUARDIAN_ID,
+				transports: [
+					{ type: 'https' as const, url: 'https://alice:secret@g1.example' }
+				],
+				auth: { type: 'bearer' as const, token: 'bearer-secret' }
+			}
+		];
+		try {
+			// An inline (Tier 2) candidate naming guardians, composed from a
+			// node that holds state.
+			const source = await startDaemon({
+				...OFFLINE,
+				dataDir: dirSrc,
+				recoveryMode: 'peer-storage'
+			});
+			let inlineBlob: Buffer;
+			let scbOnlyBlob: Buffer;
+			try {
+				const own = await request(portOf(source), 'POST', '/invoice/create', {
+					amountSats: 1,
+					description: 'guardian-backed state'
+				});
+				expect(own.body.ok).to.equal(true);
+				const storageSrc = (
+					source.node as unknown as { storage: SqliteStorage }
+				).storage;
+				inlineBlob = composeRecoveryCapsule({
+					storage: storageSrc,
+					encryptedScb: emptyScb('bcrt'),
+					nodeSecret: NODE_SECRET,
+					guardians
+				}).blob;
+				scbOnlyBlob = composeRecoveryCapsule({
+					storage: storageSrc,
+					encryptedScb: emptyScb('bcrt'),
+					nodeSecret: NODE_SECRET,
+					guardians,
+					allowInline: false
+				}).blob;
+			} finally {
+				await source.stop();
+			}
+
+			const daemon = await startDaemon({
+				...OFFLINE,
+				dataDir: dir,
+				recoveryMode: 'peer-storage',
+				apiToken: ADMIN_KEY,
+				apiKeys: [{ name: 'monitor', key: MONITOR_KEY, scopes: ['readonly'] }]
+			});
+			const port = portOf(daemon);
+			try {
+				const expectUntouched = async (): Promise<void> => {
+					expect((await statusOf(port, ADMIN_KEY)).state).to.equal('running');
+					expect(
+						(await request(port, 'GET', '/info', undefined, ADMIN_KEY)).status
+					).to.equal(200);
+					expect(
+						fs.existsSync(path.join(dir, 'regtest.db.capsule-restore'))
+					).to.equal(false);
+					expect(
+						fs.existsSync(path.join(dir, 'regtest.capsule-restore.json'))
+					).to.equal(false);
+				};
+				const restore = (): Promise<{
+					status: number;
+					body: Record<string, unknown>;
+				}> =>
+					request(
+						port,
+						'POST',
+						'/recovery/restore-capsule',
+						{ confirm: true },
+						ADMIN_KEY
+					);
+
+				// Tier 1 shape first: the refusal lands before the SCB path
+				// persists DLP recovery or asks a peer to force-close.
+				retrieved(daemon, PEER_A, scbOnlyBlob);
+				const tier1 = await restore();
+				expect(tier1.status).to.equal(409);
+				expect((tier1.body.error as { code: string }).code).to.equal(
+					'CAPSULE_RESTORE_GUARDIAN_BACKED'
+				);
+				await expectUntouched();
+
+				// Tier 2 shape: the inline replica displaces the SCB-only twin
+				// at the same head, and the refusal lands before the swap.
+				retrieved(daemon, PEER_A, inlineBlob);
+				const status = await statusOf(port, ADMIN_KEY);
+				expect(status.capsules.best?.inline).to.equal(true);
+				const tier2 = await restore();
+				expect(tier2.status).to.equal(409);
+				expect((tier2.body.error as { code: string }).code).to.equal(
+					'CAPSULE_RESTORE_GUARDIAN_BACKED'
+				);
+				await expectUntouched();
+
+				// The readonly status route reports the locators with every
+				// credential gone: the structured auth AND the URL userinfo.
+				const reported = (
+					await request(port, 'GET', '/recovery/status', undefined, MONITOR_KEY)
+				).body.result as {
+					capsules: { best: { guardians: Array<Record<string, unknown>> } };
+				};
+				expect(reported.capsules.best.guardians).to.deep.equal([
+					{
+						guardianId: GUARDIAN_ID,
+						transports: [{ type: 'https', url: 'https://g1.example/' }]
+					}
+				]);
+
+				// The admin handoff is the one place they come back, behind
+				// admin scope and an explicit confirm.
+				const noConfirm = await request(
+					port,
+					'POST',
+					'/recovery/capsule-guardians',
+					{},
+					ADMIN_KEY
+				);
+				expect(noConfirm.status).to.equal(400);
+				const readonly = await request(
+					port,
+					'POST',
+					'/recovery/capsule-guardians',
+					{ confirm: true },
+					MONITOR_KEY
+				);
+				expect(readonly.status).to.equal(403);
+				const handoff = await request(
+					port,
+					'POST',
+					'/recovery/capsule-guardians',
+					{ confirm: true },
+					ADMIN_KEY
+				);
+				expect(handoff.status, JSON.stringify(handoff.body)).to.equal(200);
+				const revealed = handoff.body.result as {
+					fromPeer: string;
+					guardians: unknown[];
+					entries: unknown[];
+				};
+				expect(revealed.fromPeer).to.equal(PEER_A);
+				expect(revealed.guardians).to.deep.equal(guardians);
+				expect(revealed.entries).to.deep.equal([
+					{
+						guardianId: GUARDIAN_ID,
+						url: 'https://alice:secret@g1.example',
+						auth: { type: 'bearer', token: 'bearer-secret' }
+					}
+				]);
+			} finally {
+				await daemon.stop();
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+			fs.rmSync(dirSrc, { recursive: true, force: true });
+		}
+	});
 });
 
 describe('Recovery surface: guardian quorum lifecycle over REST', () => {
@@ -869,13 +1067,146 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 			expect(backupA.status).to.equal('PASS');
 			expect(backupA.message).to.match(/guardian quorum \(quorum/);
 
-			// Device B: same seed, fresh database. The boot decision must
-			// refuse to register a second genesis and hold for restore.
+			// The capsule A pushes to storage peers names its guardian set
+			// (issue #457): one local-http descriptor per configured entry,
+			// and no credential key because the URI format carries none.
+			const capsuleBlob = (
+				deviceA.node.getNode() as unknown as {
+					ourPeerStorageBlob: Buffer | null;
+				}
+			).ourPeerStorageBlob;
+			expect(
+				capsuleBlob,
+				'a guardian-mode node composes a capsule'
+			).to.not.equal(null);
+			const capsuleA = decodeRecoveryCapsuleBlob(capsuleBlob!, NODE_SECRET);
+			expect(capsuleA).to.not.equal(null);
+			expect(capsuleA!.guardians).to.deep.equal(
+				served.map((entry) => ({
+					guardianId: entry.guardian.guardianId.toString('hex'),
+					transports: [
+						{
+							type: 'local-http',
+							url: entry.uri.slice(entry.uri.indexOf('@') + 1)
+						}
+					]
+				}))
+			);
+
+			// A capsule naming a DIFFERENT set is reported under capsules.best
+			// and never adopted: the configured set stays at the top level.
+			const foreignIds = [4, 5, 6].map((i) =>
+				xOnlyFromSecret(sha(`foreign-guardian-${i}`)).toString('hex')
+			);
+			const foreignBlob = composeRecoveryCapsule({
+				storage: (deviceA.node as unknown as { storage: SqliteStorage })
+					.storage,
+				encryptedScb: capsuleA!.encryptedScb,
+				nodeSecret: NODE_SECRET,
+				guardians: foreignIds.map((guardianId, i) => ({
+					guardianId,
+					transports: [{ type: 'https', url: `https://g${i}.example` }],
+					auth: { type: 'bearer', token: `foreign-${i}` }
+				}))
+			}).blob;
+			deviceA.node
+				.getNode()
+				.emit('peer_storage:retrieved', '02' + 'c3'.repeat(32), foreignBlob);
+			const foreignStatus = await request(portA, 'GET', '/recovery/status');
+			const foreignResult = foreignStatus.body.result as {
+				guardians: Array<{ guardianId: string }>;
+				capsules: {
+					best: {
+						guardians: Array<Record<string, unknown>>;
+					} | null;
+				};
+			};
+			expect(foreignResult.guardians.map((g) => g.guardianId)).to.deep.equal(
+				GUARDIAN_IDS.map((id) => id.toString('hex'))
+			);
+			expect(
+				foreignResult.capsules.best?.guardians.map((g) => g.guardianId)
+			).to.deep.equal(foreignIds);
+			for (const reported of foreignResult.capsules.best!.guardians) {
+				expect(
+					reported,
+					'credentials never leave the capsule'
+				).to.not.have.property('auth');
+			}
+
+			// Device B: same seed, fresh data dir, and NO guardian configuration
+			// at all. Booted in peer-storage mode it pushes nothing while empty,
+			// and the capsule a storage peer returns names the set to restore
+			// with; a restart in quorum mode with that set is then the ordinary
+			// restore-from-nothing flow.
+			const deviceBProbe = await startDaemon({
+				...OFFLINE,
+				dataDir: dirB,
+				recoveryMode: 'peer-storage'
+			});
+			let recoveredEntries: Array<{ guardianId: string; url: string }>;
+			try {
+				const portProbe = portOf(deviceBProbe);
+				deviceBProbe.node
+					.getNode()
+					.emit('peer_storage:retrieved', '02' + 'a1'.repeat(32), capsuleBlob!);
+				const probe = await request(portProbe, 'GET', '/recovery/status');
+				expect(probe.status).to.equal(200);
+				const probeResult = probe.body.result as {
+					mode: string;
+					guardians: unknown[];
+					capsules: {
+						candidates: number;
+						best: {
+							guardians: Array<{
+								guardianId: string;
+								transports: Array<{ type: string; url: string }>;
+							}>;
+						} | null;
+					};
+				};
+				expect(probeResult.mode).to.equal('peer-storage');
+				expect(probeResult.guardians).to.deep.equal([]);
+				expect(probeResult.capsules.candidates).to.equal(1);
+				const locators = probeResult.capsules.best!.guardians;
+				expect(locators).to.have.length(3);
+				const recoveredUris = locators.map(
+					(g) => `${g.guardianId}@${g.transports[0].url}`
+				);
+				expect([...recoveredUris].sort()).to.deep.equal(
+					[...guardianUris].sort()
+				);
+				// The admin handoff returns the same set as structured config
+				// entries (no auth key: the daemon URI form carries none).
+				const handoff = await request(
+					portProbe,
+					'POST',
+					'/recovery/capsule-guardians',
+					{ confirm: true }
+				);
+				expect(handoff.status, JSON.stringify(handoff.body)).to.equal(200);
+				recoveredEntries = (
+					handoff.body.result as {
+						entries: Array<{ guardianId: string; url: string }>;
+					}
+				).entries;
+				expect(recoveredEntries).to.have.length(3);
+				for (const entry of recoveredEntries) {
+					expect(entry).to.not.have.property('auth');
+				}
+			} finally {
+				await deviceBProbe.stop();
+			}
+
+			// Device B again, now in quorum mode with the set the capsule
+			// named, in the structured form the handoff returned. The boot
+			// decision must refuse to register a second genesis and hold for
+			// restore.
 			const deviceB = await startDaemon({
 				...OFFLINE,
 				dataDir: dirB,
 				recoveryMode: 'quorum',
-				recoveryGuardians: guardianUris
+				recoveryGuardians: recoveredEntries
 			});
 			const portB = portOf(deviceB);
 			try {

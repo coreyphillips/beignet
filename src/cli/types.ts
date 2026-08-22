@@ -4,6 +4,7 @@
  */
 
 import { TLogLevel } from '../logger';
+import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
 
 export interface NodeInfo {
 	nodeId: string;
@@ -531,9 +532,12 @@ export interface BeignetConfig {
 	recoveryMode?: string;
 	/** Guardian set for async-remote/quorum modes, as
 	 *  "<64-hex-x-only-pubkey>@<http(s) url>" URIs (crash-v1: exactly three).
+	 *  The config file may instead hold objects { guardianId, url, auth? },
+	 *  the shape POST /recovery/capsule-guardians hands back, so a transport
+	 *  credential recovered from peer storage can re-enter a guardian mode.
 	 *  Malformed entries refuse daemon startup rather than silently changing
 	 *  the quorum arithmetic. Env: BEIGNET_RECOVERY_GUARDIANS (comma list). */
-	recoveryGuardians?: string[];
+	recoveryGuardians?: Array<string | IGuardianConfigEntry>;
 	/** Recovery fault-model profile. 'crash-v1' is the only accepted value
 	 *  and the default when a guardian mode is configured. Env:
 	 *  BEIGNET_RECOVERY_PROFILE. */

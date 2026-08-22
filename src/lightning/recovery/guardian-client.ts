@@ -157,6 +157,16 @@ export interface IGuardianEndpointSelection {
 /** A Tor v3 onion service hostname: 56 base32 characters plus .onion. */
 const ONION_V3_HOSTNAME = /^[a-z2-7]{56}\.onion$/;
 
+/**
+ * Whether a hostname is a Tor v3 onion service. The one rule endpoint
+ * selection, the plaintext-credential guard and transport classification
+ * (assembly.ts guardianDescriptorFor) all share: a bare .onion suffix is not
+ * evidence of a Tor-encrypted destination.
+ */
+export function isOnionV3Hostname(hostname: string): boolean {
+	return ONION_V3_HOSTNAME.test(hostname);
+}
+
 /** Strictly loopback; container hostnames need explicit approval. */
 export function isLoopbackHostname(hostname: string): boolean {
 	return hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';

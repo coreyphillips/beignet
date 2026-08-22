@@ -10,6 +10,7 @@ Revision 5 (2026-08-02): Phase 6 as built. Durability becomes a property a FRAME
 Revision 6 (2026-08-04): Phase 7 acceptance corrected before the chaos work starts. The process-level SIGKILL target is a production LightningNode assembly running in a dedicated child process, not the CLI daemon, whose recovery surface (section 8) remains unimplemented; naming the daemon as the kill target would have tested configuration plumbing that does not exist yet. The dedicated child carries the complete kill-point matrix. Once the section 8 daemon surface ships, a representative daemon SIGKILL smoke test must prove the daemon constructs and restarts the same recovery-enabled assembly; validating that configuration surface is that test's job, and the child harness makes no claim about it.
 Revision 7 (2026-08-21): the section 8 daemon surface is implemented (issue #435) and section 8 is corrected to the API as built: no monolithic RecoveryConfig (the barrier and startup gate are constructed outside the node through the shared assembly helper buildGuardianRecovery, which also makes the boot decision); restore is the pre-node RestoreDriver against an empty database rather than the never-built node.restoreFromRecoveryReplicas, surfaced on the daemon as a restore-pending boot state plus POST /recovery/restore; the event set is recovery:durable / recovery:fenced / recovery:backfill-lost from the node plus embedder-origin recovery:guardian_unreachable / recovery:restore-progress / recovery:restored. The representative daemon SIGKILL smoke test from revision 6 is now unblocked and follows as its own PR.
 Revision 8 (2026-08-22): follow-ups from the beignet-umbrel recovery UI (issues #453, #454, #455). The capsule restore side is implemented on the daemon: retrieved blobs are recognized as capsules (keyed by the node secret, unlike the seed-keyed plain SCB), the embedded SCB is surfaced so Tier 1 never regresses under a recovery mode, and POST /recovery/restore-capsule performs the 5.4 restore rule for peer-storage mode (Tier 2 into a fresh database followed by a restart-required hold, Tier 1 on the live node). An empty node no longer pushes a backup that would destroy a provider's last good copy, and under a recovery mode only the capsule goes to storage peers. An idle confirmed writer re-checks its lease on a cadence and fences on a proven newer epoch (5.6). GET /readiness gains the CHANNEL_BACKUP check.
+Revision 9 (2026-08-22): the capsule carries its guardian locators (issue #457). Every capsule a guardian-backed node pushes now embeds the configured set as GuardianDescriptors (built by the assembly from the parsed set, with the recoverable transport credential when an embedder supplied one), so the 5.7 hop "capsule -> guardian locators" has something to read: a seed restore with no configuration boots a fresh database in peer-storage mode, reads the locators under capsules.best on GET /recovery/status, and restarts in the guardian mode with them. Locators are reported and never adopted over the configured set; a disagreement is logged. Credentials leave the capsule only through the admin handoff POST /recovery/capsule-guardians, never through the readonly status route or a log line, and the capsule restore route refuses a capsule that names guardians: a guardian-backed namespace restores through its guardians with fencing, not unfenced from peer storage or by force-closing what the guardians could resume.
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
 Audience: an implementing agent or engineer. Every code reference below was verified against the codebase as of beignet 0.7.0 (2026-07-22). Re-verify line numbers before editing; file and symbol names are the stable anchors.
 
@@ -313,6 +314,8 @@ export interface RecoveryCapsule {
   inlineRecoveryState?: Buffer;    // full snapshot + deltas, only when it fits
 }
 ```
+
+`guardians` is the configured set as built by `buildGuardianRecovery` (section 8): one descriptor per parsed guardian, the transport type classified from its URL (https, an http v3 onion host, otherwise local-http), and the transport credential when the embedder supplied one (wire 2.4). A peer-storage-only node has no set and composes an empty list. This is the hop the 5.7 flow starts with: a seed restore with no configuration reads the set back from peer storage instead of needing it from the operator (issue #457).
 
 Encryption: HKDF info `'beignet-recovery-capsule-v1'`, then the existing `padOwnPeerStorageBlob` framing (no size leak). Push via the existing `distributePeerStorage`; refresh on every snapshot, on initial guardian enablement or descriptor and credential changes (set replacement does not exist in v1, see 12.1), and at most once per minute to respect provider rate limits.
 
@@ -760,6 +763,9 @@ recovery?: {
                                        // and it drives replication in every mode
   startupGate?: GuardianStartupGate;   // built outside; required for a
                                        // guardian-backed node, AT construction
+  guardians?: GuardianDescriptor[];    // locators (and credentials) every
+                                       // capsule carries; filled by the
+                                       // assembly, pure data, never dialed
   maxRetainedFrameGap?: number;
   snapshotIntervalFrames?: number;
   snapshotIntervalBytes?: number;
@@ -767,6 +773,9 @@ recovery?: {
 
 // The shared integrator wiring (src/lightning/recovery/assembly.ts)
 parseGuardianUri('<64-hex-x-only-pubkey>@<http(s) url>'): IParsedGuardian;
+// IParsedGuardian.auth is optional (the URI format carries none); it rides
+// into the client and the capsule descriptor. guardianDescriptorFor() is the
+// IParsedGuardian -> GuardianDescriptor rule the assembly applies.
 buildGuardianRecovery({storage, nodeSecret, durability, guardians, ...}):
   Promise<GuardianBootDecision>;
 // GuardianBootDecision:
@@ -856,6 +865,34 @@ swapped in: an operational fault, not a candidate defect). `GET /backup/peer-ret
 answers in every mode: the SCB embedded in a retrieved capsule is re-encoded
 under the wallet seed and reported with `source: 'capsule'`. CLI:
 `beignet recovery restore-capsule`.
+
+Guardian locators (issue #457). `capsules.best.guardians` on `GET /recovery/status`
+lists the descriptors the best retrieved capsule names, credentials redacted
+(structured `auth` and any URL userinfo, which the guardian parser refuses on
+input anyway): the status route is readonly, so it is not the place a
+credential leaves the capsule. `POST /recovery/capsule-guardians` (admin
+scope, `{"confirm": true}`) is: it hands the same set back WITH credentials as
+config-file entries `{guardianId, url, auth?}`, which `recoveryGuardians`
+accepts beside the `pubkey@url` string form, so a wallet whose guardians
+require authentication (wire 2.4) can re-enter its guardian mode after a seed
+restore. Locators are REPORTED, never adopted: a running guardian-mode node
+whose retrieved capsule names a different set logs a warning and keeps the
+configured set, because set replacement does not exist in v1 (wire 5.9) and the
+difference is either a stale pre-enablement capsule or an operator error. The
+flow for a seed restore with no configuration: boot the fresh database in
+peer-storage mode (it pushes nothing while empty), connect to the old peers,
+read the locators from the status route (or the handoff), then restart in the
+guardian mode with them; that boot finds the namespace on the guardians and
+`POST /recovery/restore` performs the fenced takeover.
+
+`POST /recovery/restore-capsule` refuses a capsule that names guardians (409
+`CAPSULE_RESTORE_GUARDIAN_BACKED`) before either tier acts. Tier 2 from peer
+storage would install a guardian-backed namespace without the 5.7 takeover
+that fences a still-running old writer (and a quorum-marked journal then
+refuses to boot unbarriered anyway); Tier 1 would persist DLP recovery and
+ask the peers to force-close channels the guardians could have resumed
+exactly. The emergency SCB-only path is unchanged and explicitly labelled:
+the peer-retrieved backup through the SCB restore route.
 
 `GET /readiness` carries a `CHANNEL_BACKUP` check derived from this surface:
 PASS for a guardian mode with a confirmed gate, WARN for peer-storage and

@@ -36,9 +36,16 @@ import {
 } from './guardian-wire';
 import {
 	GuardianClient,
+	GuardianHttpTransport,
 	IBoundGuardianClient,
-	IGuardianSetContext
+	IGuardianSetContext,
+	isOnionV3Hostname
 } from './guardian-client';
+import {
+	GuardianAuth,
+	GuardianDescriptor,
+	assertGuardianAuth
+} from './capsule';
 import {
 	GuardianReplicator,
 	IGuardianReplicationEvent
@@ -60,6 +67,88 @@ export interface IParsedGuardian {
 	guardianId: Buffer;
 	/** Base URL, e.g. https://host, http://<v3>.onion, http://127.0.0.1:8080. */
 	url: string;
+	/**
+	 * Transport credential (wire 2.4 and 9). The `pubkey@url` URI format
+	 * carries none, so embedders set it programmatically; it rides into the
+	 * guardian client AND into the capsule's GuardianDescriptor, because a
+	 * credential that does not survive a seed restore leaves the records
+	 * behind it unreachable exactly when they matter. A bearer or macaroon
+	 * credential over plaintext http to a non-loopback, non-onion host is
+	 * refused unless `allowUnencryptedAuth` is set on the assembly; a
+	 * `tor-v3-client-auth` credential lives at the Tor layer and needs the
+	 * assembly's `transportFor` hook, without which it is refused rather
+	 * than silently ignored.
+	 */
+	auth?: GuardianAuth;
+}
+
+/**
+ * A guardian as structured configuration: what `parseGuardianUri` yields
+ * from `<pubkey>@<url>` plus the optional credential the URI form cannot
+ * carry. This is the shape a daemon hands back from a retrieved capsule and
+ * the shape its config file accepts, so a credential recovered from peer
+ * storage can re-enter the guardian modes.
+ */
+export interface IGuardianConfigEntry {
+	guardianId: string;
+	url: string;
+	auth?: GuardianAuth;
+}
+
+/**
+ * Parse one guardian from either form, a `<pubkey>@<url>` string or an
+ * IGuardianConfigEntry object, with the same refusals for both.
+ */
+export function parseGuardianEntry(
+	entry: string | IGuardianConfigEntry
+): IParsedGuardian {
+	if (typeof entry === 'string') return parseGuardianUri(entry);
+	if (
+		typeof entry !== 'object' ||
+		entry === null ||
+		typeof entry.guardianId !== 'string' ||
+		typeof entry.url !== 'string'
+	) {
+		throw new Error(
+			'guardian entry must be a <64-hex-x-only-pubkey>@<url> string or an ' +
+				'object with guardianId and url'
+		);
+	}
+	const parsed = parseGuardianParts(entry.guardianId, entry.url);
+	if (entry.auth !== undefined) {
+		parsed.auth = assertGuardianAuth(
+			entry.auth,
+			`guardian ${entry.guardianId}`
+		);
+	}
+	return parsed;
+}
+
+/**
+ * The capsule descriptor for one configured guardian (spec 5.4). The
+ * transport type follows from the URL, which parseGuardianUri already
+ * restricted to http(s): https is `https`, an http v3 onion host is
+ * `onion-http`, any other http host is `local-http`. That last class is
+ * wider than what endpoint selection will dial: a non-loopback local-http
+ * descriptor reaches a client only through `allowLocalHttpHost`
+ * (guardian-client.ts selectGuardianEndpoint), never by default.
+ */
+export function guardianDescriptorFor(
+	parsed: IParsedGuardian
+): GuardianDescriptor {
+	const url = new URL(parsed.url);
+	const type: GuardianDescriptor['transports'][number]['type'] =
+		url.protocol === 'https:'
+			? 'https'
+			: isOnionV3Hostname(url.hostname)
+			? 'onion-http'
+			: 'local-http';
+	const descriptor: GuardianDescriptor = {
+		guardianId: parsed.guardianId.toString('hex'),
+		transports: [{ type, url: parsed.url }]
+	};
+	if (parsed.auth) descriptor.auth = parsed.auth;
+	return descriptor;
 }
 
 /**
@@ -87,6 +176,13 @@ export function parseGuardianUri(entry: string): IParsedGuardian {
 				'x-only pubkey'
 		);
 	}
+	return parseGuardianParts(idHex, url);
+}
+
+function parseGuardianParts(idHex: string, url: string): IParsedGuardian {
+	if (!/^[0-9a-fA-F]{64}$/.test(idHex)) {
+		throw new Error(`guardian pubkey "${idHex}" is not a 64-hex x-only key`);
+	}
 	const guardianId = Buffer.from(idHex, 'hex');
 	if (!ecc.isXOnlyPoint(guardianId)) {
 		throw new Error(
@@ -102,6 +198,15 @@ export function parseGuardianUri(entry: string): IParsedGuardian {
 	if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
 		throw new Error(
 			`guardian URL "${url}" must use http or https, not ${parsed.protocol}`
+		);
+	}
+	// A credential belongs in `auth`, which the capsule encrypts and the
+	// daemon redacts; userinfo in the URL would ride into every status
+	// report and log line that names the endpoint.
+	if (parsed.username !== '' || parsed.password !== '') {
+		throw new Error(
+			`guardian URL for ${idHex} must not carry credentials in the URL; ` +
+				'use the auth field'
 		);
 	}
 	return { guardianId, url };
@@ -123,6 +228,22 @@ export interface IGuardianAssemblyConfig {
 	onReplicationEvent?: (event: IGuardianReplicationEvent) => void;
 	barrierTimeoutMs?: number;
 	allowUnencryptedSecrets?: boolean;
+	/**
+	 * Permit a bearer or macaroon credential over plain http to a
+	 * non-loopback, non-onion host (GuardianClient's flag of the same name).
+	 * Only for an isolated container network; unrelated to
+	 * `allowUnencryptedSecrets`, which is about the storage backend.
+	 */
+	allowUnencryptedAuth?: boolean;
+	/**
+	 * Transport factory per guardian, for embedders that own a Tor layer: a
+	 * `tor-v3-client-auth` credential is consumed HERE (the HTTP client only
+	 * applies bearer and macaroon headers), so a guardian carrying one is
+	 * refused when this hook is absent or returns nothing for it.
+	 */
+	transportFor?: (
+		guardian: IParsedGuardian
+	) => GuardianHttpTransport | undefined;
 }
 
 /**
@@ -193,10 +314,26 @@ export async function buildGuardianRecovery(
 		guardianSetId: setId,
 		members: guardianIds
 	};
-	const bound: IBoundGuardianClient[] = config.guardians.map((g) => ({
-		expectedGuardianId: g.guardianId,
-		client: new GuardianClient({ url: g.url, guardianSetId: setId })
-	}));
+	const bound: IBoundGuardianClient[] = config.guardians.map((g) => {
+		const transport = config.transportFor?.(g);
+		if (g.auth?.type === 'tor-v3-client-auth' && !transport) {
+			throw new Error(
+				`guardian ${g.guardianId.toString('hex')} carries a ` +
+					'tor-v3-client-auth credential, which only an injected Tor ' +
+					'transport can apply; provide transportFor or drop the credential'
+			);
+		}
+		return {
+			expectedGuardianId: g.guardianId,
+			client: new GuardianClient({
+				url: g.url,
+				guardianSetId: setId,
+				auth: g.auth,
+				transport,
+				allowUnencryptedAuth: config.allowUnencryptedAuth
+			})
+		};
+	});
 	const root = deriveRecoveryRoot(config.nodeSecret);
 	const replicator = new GuardianReplicator({
 		storage: config.storage,
@@ -237,7 +374,11 @@ export async function buildGuardianRecovery(
 					enabled: true,
 					durability: config.durability,
 					barrier,
-					startupGate: gate
+					startupGate: gate,
+					// The locators every capsule this node pushes will carry
+					// (spec 5.4): a seed restore reads them back from peer
+					// storage instead of needing the set from configuration.
+					guardians: config.guardians.map(guardianDescriptorFor)
 				},
 				confirm: (): Promise<IConfirmationOutcome> => gate.confirm(lease),
 				recheck: (): Promise<IConfirmationOutcome> => gate.recheck(lease),

@@ -32,6 +32,9 @@ import {
 	RecoveryManager,
 	ReferenceGuardian,
 	buildGuardianRecovery,
+	guardianDescriptorFor,
+	nodeGuardianTransport,
+	parseGuardianEntry,
 	parseGuardianUri,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
@@ -193,11 +196,103 @@ describe('Recovery assembly: parseGuardianUri', () => {
 			[`${'00'.repeat(32)}@https://g.example`, /not a valid x-only/],
 			[`${VALID_ID}@not a url`, /not a valid URL/],
 			[`${VALID_ID}@ftp://g.example`, /must use http or https/],
-			[`${VALID_ID}@ws://g.example`, /must use http or https/]
+			[`${VALID_ID}@ws://g.example`, /must use http or https/],
+			// A credential in the URL would ride into every status report
+			// and log line naming the endpoint; auth is the only place for it.
+			[`${VALID_ID}@https://alice:secret@g.example`, /credentials in the URL/],
+			[`${VALID_ID}@https://alice@g.example`, /credentials in the URL/]
 		];
 		for (const [entry, message] of cases) {
 			expect(() => parseGuardianUri(entry), entry).to.throw(message);
 		}
+	});
+});
+
+describe('Recovery assembly: parseGuardianEntry (issue #457)', () => {
+	it('accepts the string form and the structured form with a credential', () => {
+		const fromUri = parseGuardianEntry(`${VALID_ID}@https://g.example`);
+		expect(fromUri.guardianId.toString('hex')).to.equal(VALID_ID);
+		expect(fromUri.url).to.equal('https://g.example');
+		expect(fromUri).to.not.have.property('auth');
+
+		const structured = parseGuardianEntry({
+			guardianId: VALID_ID,
+			url: 'https://g.example',
+			auth: { type: 'macaroon', macaroon: 'AgEDbG5k' }
+		});
+		expect(structured.guardianId.toString('hex')).to.equal(VALID_ID);
+		expect(structured.auth).to.deep.equal({
+			type: 'macaroon',
+			macaroon: 'AgEDbG5k'
+		});
+	});
+
+	it('refuses malformed structured entries with the same rules as the URI', () => {
+		const cases: Array<[unknown, RegExp]> = [
+			[{ url: 'https://g.example' }, /object with guardianId and url/],
+			[{ guardianId: VALID_ID }, /object with guardianId and url/],
+			[{ guardianId: 'zz'.repeat(32), url: 'https://g.example' }, /64-hex/],
+			[{ guardianId: VALID_ID, url: 'ftp://g.example' }, /http or https/],
+			[
+				{ guardianId: VALID_ID, url: 'https://u:p@g.example' },
+				/credentials in the URL/
+			],
+			[
+				{ guardianId: VALID_ID, url: 'https://g.example', auth: { type: 'x' } },
+				/not a known credential shape/
+			],
+			[
+				{ guardianId: VALID_ID, url: 'https://g.example', auth: 'token' },
+				/auth is not an object/
+			]
+		];
+		for (const [entry, message] of cases) {
+			expect(
+				() =>
+					parseGuardianEntry(entry as Parameters<typeof parseGuardianEntry>[0]),
+				JSON.stringify(entry)
+			).to.throw(message);
+		}
+	});
+});
+
+describe('Recovery assembly: guardianDescriptorFor (issue #457)', () => {
+	const ONION =
+		'http://vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion';
+
+	it('classifies the transport from the URL the same way endpoint selection does', () => {
+		const cases: Array<[string, 'https' | 'onion-http' | 'local-http']> = [
+			['https://guardian.example.com:8443/base', 'https'],
+			[ONION, 'onion-http'],
+			['http://127.0.0.1:8080', 'local-http'],
+			// Any other http host is local-http in the descriptor; whether a
+			// client will dial it is allowLocalHttpHost's decision.
+			['http://guardian-1:8080', 'local-http'],
+			// A bare .onion suffix is not a v3 onion service.
+			['http://short.onion', 'local-http']
+		];
+		for (const [url, type] of cases) {
+			const descriptor = guardianDescriptorFor(
+				parseGuardianUri(`${VALID_ID}@${url}`)
+			);
+			expect(descriptor, url).to.deep.equal({
+				guardianId: VALID_ID,
+				transports: [{ type, url }]
+			});
+		}
+	});
+
+	it('carries a supplied credential and omits the key otherwise', () => {
+		const parsed = parseGuardianUri(`${VALID_ID}@https://g.example`);
+		expect(guardianDescriptorFor(parsed)).to.not.have.property('auth');
+		const withAuth = guardianDescriptorFor({
+			...parsed,
+			auth: { type: 'bearer', token: 'secret-token' }
+		});
+		expect(withAuth.auth).to.deep.equal({
+			type: 'bearer',
+			token: 'secret-token'
+		});
 	});
 });
 
@@ -218,6 +313,14 @@ describe('Recovery assembly: buildGuardianRecovery', () => {
 		if (decision.kind !== 'run') throw new Error('unreachable');
 		expect(decision.recovery.enabled).to.equal(true);
 		expect(decision.recovery.durability).to.equal('quorum');
+		// The capsule locators (issue #457): the configured set, one
+		// local-http transport each, no credential key when none was given.
+		expect(decision.recovery.guardians).to.deep.equal(
+			served.map((entry) => ({
+				guardianId: entry.id.toString('hex'),
+				transports: [{ type: 'local-http', url: entry.url }]
+			}))
+		);
 		expect(decision.barrier.enforcing).to.equal(true);
 		expect(decision.gate.getState()).to.equal('quarantined');
 		expect(decision.gate.permitsPeerTraffic()).to.equal(false);
@@ -362,6 +465,68 @@ describe('Recovery assembly: buildGuardianRecovery', () => {
 		expect(decision.outcome).to.equal('no-quorum');
 		expect(decision.detail).to.match(/only 0 of 3/);
 		storage.close();
+	});
+
+	it('refuses a tor-v3-client-auth credential it has no transport for, and uses an injected one', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const guardians = parsedGuardians(served).map((g, i) =>
+			i === 0
+				? {
+						...g,
+						auth: { type: 'tor-v3-client-auth' as const, privateKey: 'x25519' }
+				  }
+				: g
+		);
+		try {
+			// The HTTP client cannot apply a Tor credential; accepting the
+			// key and dialing without it would be a silent downgrade.
+			let refused: unknown = null;
+			try {
+				await buildGuardianRecovery({
+					storage,
+					nodeSecret: NODE_SECRET,
+					durability: 'quorum',
+					guardians,
+					clock
+				});
+			} catch (err) {
+				refused = err;
+			}
+			expect(refused).to.be.instanceOf(Error);
+			expect((refused as Error).message).to.match(/tor-v3-client-auth/);
+
+			// With a transport factory the credential has a consumer; the
+			// factory sees the guardian it is for.
+			const seen: string[] = [];
+			const decision = await buildGuardianRecovery({
+				storage,
+				nodeSecret: NODE_SECRET,
+				durability: 'quorum',
+				guardians,
+				clock,
+				transportFor: (g) => {
+					seen.push(g.guardianId.toString('hex'));
+					return g.auth?.type === 'tor-v3-client-auth'
+						? nodeGuardianTransport()
+						: undefined;
+				}
+			});
+			expect(decision.kind).to.equal('run');
+			expect(seen).to.deep.equal(
+				guardians.map((g) => g.guardianId.toString('hex'))
+			);
+			if (decision.kind === 'run') {
+				expect(decision.recovery.guardians?.[0].auth).to.deep.equal({
+					type: 'tor-v3-client-auth',
+					privateKey: 'x25519'
+				});
+			}
+		} finally {
+			await shutdown(served);
+			storage.close();
+		}
 	});
 
 	it('refuses a guardian set the crash-v1 profile cannot commit to', async () => {

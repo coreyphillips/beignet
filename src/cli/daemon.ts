@@ -14,7 +14,7 @@ import {
 	BeignetNodeOptions,
 	parseRecoveryMode
 } from './beignet-node';
-import { parseGuardianUri } from '../lightning/recovery';
+import { parseGuardianEntry } from '../lightning/recovery';
 import { ILogger, createConsoleLogger } from '../logger';
 import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
@@ -234,6 +234,7 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	CAPSULE_RESTORE_NO_CANDIDATES: 404,
 	CAPSULE_RESTORE_TARGET_DIRTY: 409,
 	CAPSULE_RESTORE_FAILED: 409,
+	CAPSULE_RESTORE_GUARDIAN_BACKED: 409,
 	CAPSULE_RESTORE_INSTALL_FAILED: 500
 };
 
@@ -482,7 +483,7 @@ async function bootDaemon(
 		}
 		for (const entry of guardianEntries) {
 			try {
-				parseGuardianUri(entry);
+				parseGuardianEntry(entry);
 			} catch (e) {
 				throw new BeignetError(
 					'INVALID_PARAMS',
@@ -1914,6 +1915,21 @@ async function bootDaemon(
 				);
 			}
 			return success(await node.restoreFromCapsules());
+		},
+		'POST /recovery/capsule-guardians': (body) => {
+			// The one place a retrieved capsule's guardian credentials leave
+			// the daemon (the status route redacts them): admin scope, and an
+			// explicit confirm so a scripted status sweep cannot collect them.
+			const { confirm } = body as { confirm?: boolean };
+			if (confirm !== true) {
+				return failure(
+					'INVALID_PARAMS',
+					'This returns the guardian set of the best retrieved capsule ' +
+						'INCLUDING transport credentials; pass {"confirm": true} ' +
+						'to proceed'
+				);
+			}
+			return success(node.revealCapsuleGuardians());
 		},
 
 		// ── Webhooks ──

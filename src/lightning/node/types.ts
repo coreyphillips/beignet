@@ -21,6 +21,7 @@ import { WebSocketConstructor } from '../transport/websocket';
 import { GuardianStartupGate } from '../recovery/startup-gate';
 import { DurabilityBarrier } from '../recovery/durability-barrier';
 import { RecoveryDurability } from '../recovery/types';
+import type { GuardianDescriptor } from '../recovery/capsule';
 
 export type { IInvoiceInfo };
 
@@ -359,6 +360,16 @@ export interface INodeConfig {
 		 * for a node genuinely running without guardians.
 		 */
 		startupGate?: GuardianStartupGate;
+		/**
+		 * Guardian locators embedded in every Recovery Capsule the node
+		 * pushes to storage peers (5.4; wire 2.4 for the recoverable
+		 * credential), so a seed restore finds the guardian set from peer
+		 * storage alone instead of needing it from configuration. Pure data:
+		 * the node never dials a descriptor, the barrier and gate above
+		 * already hold the clients. `buildGuardianRecovery` fills this from
+		 * the parsed set; a peer-storage-only node has none.
+		 */
+		guardians?: GuardianDescriptor[];
 	};
 	/** Chain backend for blockchain monitoring (Electrum, Esplora, etc.) */
 	chainBackend?: IChainBackend;
