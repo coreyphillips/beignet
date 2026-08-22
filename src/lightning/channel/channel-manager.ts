@@ -460,6 +460,26 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private channelsAwaitingRestoreRepair: Set<string> = new Set();
 	/**
+	 * Channels whose record was loaded from disk at startup, keyed by channel
+	 * id hex. Registered by the node's storage restore, never by the live
+	 * re-restore paths (a blocked persist resync, an abandonment revert),
+	 * which re-read a row this process itself negotiated.
+	 *
+	 * The distinction is what stops a rewound record from deleting a funded
+	 * channel. A Tier 2 Recovery Capsule is best-effort recency by
+	 * construction (BOLT 1 peer storage is rate limited and providers need not
+	 * return the latest blob, docs/RECOVERY-PROTOCOL.md 5.4), so a restored v2
+	 * record can say "our witnesses never left" about an open whose funding
+	 * confirmed long ago. Nothing local can tell that apart, so the removals
+	 * that rest on a local inference alone screen for this and leave the
+	 * verdict to the chain (issue #463).
+	 *
+	 * In memory on purpose: every start re-reads the rows and re-registers
+	 * them, so it is as durable as the row itself, and it can only ever make
+	 * the node keep more state.
+	 */
+	private channelsRestoredFromDisk: Set<string> = new Set();
+	/**
 	 * BOLT 2 quiescence watchdog: one timer per quiescing channel. Timer
 	 * presence doubles as the "was quiescing" latch, so clearing one emits
 	 * 'quiescence:ended'. Timers are unref'd and cleared on detach.
@@ -1706,7 +1726,18 @@ export class ChannelManager extends EventEmitter {
 			// channel that no reestablish, disposition or cleanup ever
 			// touches; a peer that still asks after removal gets the
 			// unknown-channel error and ends the attempt on its side.
-			if (channel.isAbandonedV2Open() && channelIdHex) {
+			//
+			// Not for a record this process only read off disk: nothing has
+			// checked it against the peer or the chain, and a restore can hand
+			// back an older view of an open that has since funded. Such a
+			// channel is retained here and removed, if it really is dead, by
+			// the funding-missing watchdog, which asks the chain and then waits
+			// out BOLT 2's 2016 blocks (issue #463).
+			if (
+				channel.isAbandonedV2Open() &&
+				channelIdHex &&
+				!this.channelsRestoredFromDisk.has(channelIdHex)
+			) {
 				this.channels.delete(channelIdHex);
 				this.channelPeers.delete(channelIdHex);
 				this.emit(
@@ -1927,6 +1958,25 @@ export class ChannelManager extends EventEmitter {
 			// process. Arm the one-shot repair; reestablish fires it.
 			this.channelsAwaitingRestoreRepair.add(channelId.toString('hex'));
 		}
+	}
+
+	/**
+	 * Register a channel as one whose record came off disk at startup.
+	 * Called by the node's storage restore only; see
+	 * channelsRestoredFromDisk for why the live re-restore paths must not.
+	 */
+	markChannelRestoredFromDisk(channelId: Buffer): void {
+		this.channelsRestoredFromDisk.add(channelId.toString('hex'));
+	}
+
+	/**
+	 * Whether this channel's record was loaded from disk at startup and has
+	 * therefore never been checked against anything but itself. Callers that
+	 * would DELETE a channel on a local inference must refuse while this is
+	 * true and let the chain answer instead (issue #463).
+	 */
+	isChannelRestoredFromDisk(channelId: Buffer): boolean {
+		return this.channelsRestoredFromDisk.has(channelId.toString('hex'));
 	}
 
 	/**
@@ -6483,6 +6533,7 @@ export class ChannelManager extends EventEmitter {
 		this.channels.delete(idHex);
 		this.channelPeers.delete(idHex);
 		this.channelsAwaitingRestoreRepair.delete(idHex);
+		this.channelsRestoredFromDisk.delete(idHex);
 		return true;
 	}
 

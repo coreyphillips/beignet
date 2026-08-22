@@ -1860,6 +1860,14 @@ export class LightningNode extends EventEmitter {
 			const channel = new Channel(state);
 			const keyIndex = this.storage!.loadChannelKeyIndex(channelId);
 			this.channelManager.restoreChannel(channel, peerPubkey, keyIndex);
+			// This row was read off disk and nothing has checked it against
+			// the peer or the chain yet. Only the STARTUP restore registers
+			// that: the live re-restore paths (a blocked persist resync, an
+			// abandonment revert) re-read a row this process negotiated
+			// itself (issue #463).
+			this.channelManager.markChannelRestoredFromDisk(
+				Buffer.from(channelId, 'hex')
+			);
 			// AFTER restoreChannel: markForReestablish resets the splice driver
 			// for non-splicing channels, and that reset clears _lastSentBatch,
 			// so bytes restored before it would be silently wiped.
@@ -6898,7 +6906,23 @@ export class LightningNode extends EventEmitter {
 						return;
 					}
 				}
-				const waited = this.currentBlockHeight - channel.fundingMissingSince()!;
+				// No usable start height: this node has no chain tip yet, or the
+				// row carries a stamp written before there was one. A wait
+				// cannot be measured against either, and measuring it anyway
+				// compares against NaN, which is never less than
+				// FUNDING_FORGET_BLOCKS and drops straight into the void. Same
+				// answer as an unwritable clock start: retain, and ask again on
+				// the next absence (issue #463).
+				const missingSince = channel.fundingMissingSince();
+				if (missingSince === undefined) {
+					this.emitStructuredLog('chain', 'funding_missing_untimed', {
+						channelId: channelId.toString('hex'),
+						txid,
+						blockHeight: this.currentBlockHeight
+					});
+					return;
+				}
+				const waited = this.currentBlockHeight - missingSince;
 
 				if (waited < FUNDING_FORGET_BLOCKS) {
 					this.emitStructuredLog('chain', 'funding_missing_waiting', {
@@ -15699,6 +15723,22 @@ export class LightningNode extends EventEmitter {
 		const state = channel.getFullState();
 		if (state.state !== ChannelState.ERRORED) return;
 		if (!state.fundingTxid) return;
+		if (mustNotBroadcastCommitment(state)) {
+			// Proven stale or unprovable (recovery 5.6): broadcasting our
+			// commitment is forbidden; the peer's close resolves the channel.
+			// FIRST, ahead of the v2 disposition below: 5.6's only safe exit
+			// is the peer closing, and that needs the channel, its monitor and
+			// its funding watch to still be here when the peer's commitment
+			// lands. A restore marks these rows precisely because their record
+			// cannot be trusted to describe the chain, so a removal decided
+			// from that record is the one thing this state must not do
+			// (issue #463).
+			this.emitStructuredLog('channel', 'errored_awaiting_peer_close', {
+				channelId: channelId.toString('hex'),
+				reason
+			});
+			return;
+		}
 		if (state.v2InFlight && !channel.isV2AttemptBroadcastable()) {
 			// A v2 open the peer provably cannot broadcast: our witnesses
 			// never left AND the funding tx still needs them, so a
@@ -15710,6 +15750,26 @@ export class LightningNode extends EventEmitter {
 			// the zero-local-input case where the peer needs no witness
 			// bytes from us at all, keeps the watch and the force-close
 			// path below instead.
+			//
+			// The VOID needs more than the record does. "Nothing to broadcast"
+			// is a claim about what this node did; "nothing on chain" is a
+			// claim about the chain, and a row read off disk at startup can be
+			// an older view of an open that has since funded (a Recovery
+			// Capsule is best-effort recency, docs/RECOVERY-PROTOCOL.md 5.4).
+			// Deleting the channel there takes the funding watch, the lazily
+			// built monitor and the SCB entry with it, which is exactly how a
+			// peer's force-close went unswept in issue #463. So the removal is
+			// declined for such a row and the channel is retained: the
+			// funding-missing watchdog still removes it if the chain says the
+			// funding is not there, after three absent history answers and
+			// BOLT 2's 2016 blocks.
+			if (this.channelManager.isChannelRestoredFromDisk(channelId)) {
+				this.emitStructuredLog('channel', 'errored_unsigned_v2_retained', {
+					channelId: channelId.toString('hex'),
+					reason
+				});
+				return;
+			}
 			this.emitStructuredLog('channel', 'errored_unsigned_v2_voided', {
 				channelId: channelId.toString('hex'),
 				reason
@@ -15730,15 +15790,6 @@ export class LightningNode extends EventEmitter {
 					?.releaseInputPledges?.(pledges)
 					.catch(() => undefined);
 			}
-			return;
-		}
-		if (mustNotBroadcastCommitment(state)) {
-			// Proven stale or unprovable (recovery 5.6): broadcasting our
-			// commitment is forbidden; the peer's close resolves the channel.
-			this.emitStructuredLog('channel', 'errored_awaiting_peer_close', {
-				channelId: channelId.toString('hex'),
-				reason
-			});
 			return;
 		}
 		if (
@@ -15825,14 +15876,46 @@ export class LightningNode extends EventEmitter {
 		state: IChannelState,
 		context: string
 	): boolean {
-		if (state.fundingVersion === 2) return false;
 		if (!state.fundingTxid) return false;
+		if (
+			state.fundingVersion === 2 &&
+			!this.v2CloseNeedsFundingOnChain(channel, state)
+		) {
+			return false;
+		}
 		if (this.fundingKnownOnChain(channel, state)) return false;
 		this.emitStructuredLog('channel', 'close_skipped_funding_not_on_chain', {
 			channelId: (state.channelId ?? state.temporaryChannelId).toString('hex'),
 			context
 		});
 		return true;
+	}
+
+	/**
+	 * Whether a v2 open answers to the funding-on-chain guard above, which the
+	 * v2 family was exempt from while handleChannelErrored removed these
+	 * channels outright instead (issue #463).
+	 *
+	 * Only an open still short of channel_ready whose recorded attempt nobody
+	 * can broadcast: that is the one shape whose commitment provably spends an
+	 * outpoint that may never exist, and it is the shape now retained rather
+	 * than voided, so the automatic closes need the same guard the removal
+	 * used to make unnecessary. Everything else keeps the ungated v2
+	 * behaviour, zero-conf channels in particular: isFundingKnownOnChain
+	 * answers false for a trusted zero-conf peer by design (issue #413), so a
+	 * broader test here would disarm every automatic exit a live zero-conf
+	 * channel has.
+	 */
+	private v2CloseNeedsFundingOnChain(
+		channel: Channel,
+		state: IChannelState
+	): boolean {
+		return (
+			state.v2InFlight != null &&
+			!channel.isV2AttemptBroadcastable() &&
+			!state.localChannelReady &&
+			!state.remoteChannelReady
+		);
 	}
 
 	/**

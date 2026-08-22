@@ -2375,11 +2375,21 @@ export class Channel {
 			// exchange completion or the next reestablish flush channel_ready
 			// (mirrors markSpliceConfirmed for a splice that confirmed while
 			// the channel could not send splice_locked).
+			//
+			// ERRORED is admitted for the same reason the v1 arm below records
+			// fundingConfirmedLate (issue #413): a failed open never flushes
+			// channel_ready, but the outpoint now provably exists, and every
+			// decision that turns on that fact reads it back through
+			// isFundingKnownOnChain. Without the stamp a failed v2 open can
+			// watch its own funding reach depth and record nothing, so it
+			// stays 'not on chain' forever and no exit is ever driven for it
+			// (issue #463).
 			if (
 				this._state.v2InFlight &&
 				!this._state.v2InFlight.confirmed &&
 				(this._state.state === ChannelState.AWAITING_REESTABLISH ||
-					this._state.state === ChannelState.AWAITING_TX_SIGNATURES)
+					this._state.state === ChannelState.AWAITING_TX_SIGNATURES ||
+					this._state.state === ChannelState.ERRORED)
 			) {
 				this._state.v2InFlight.confirmed = true;
 				return [...prefix, { type: ChannelActionType.PERSIST_STATE }];
@@ -5136,20 +5146,41 @@ export class Channel {
 	 * Idempotent afterwards, so every later absence keeps the original height.
 	 */
 	beginFundingMissingClock(height: number): boolean {
-		if (this._state.fundingMissingSinceHeight !== undefined) return false;
+		// A non-positive height is not a height: it is the node saying it has
+		// no chain tip yet (currentBlockHeight starts at 0 and only a header
+		// the backend actually delivered replaces it). Stamping it would
+		// record "missing since the genesis block", and the next absence at a
+		// real tip would then measure a wait of the whole chain and forget a
+		// funding that was never given its 2016 blocks. Absence that cannot be
+		// timed does not start a clock; the caller retains the channel and
+		// asks again (issue #463).
+		if (!Number.isFinite(height) || height <= 0) return false;
+		if (this.fundingMissingSince() !== undefined) return false;
 		this._state.fundingMissingSinceHeight = height;
 		return true;
 	}
 
-	/** The height absence was first observed at, or undefined if never. */
+	/**
+	 * The height absence was first observed at, or undefined if never. A
+	 * non-positive stored value reads as unset: rows written before the guard
+	 * above existed can carry a 0 stamped with no tip, and that is not a
+	 * countdown anyone may act on. Reporting it as unset lets the next real
+	 * absence restamp it at a height that means something.
+	 */
 	fundingMissingSince(): number | undefined {
-		return this._state.fundingMissingSinceHeight;
+		const since = this._state.fundingMissingSinceHeight;
+		if (since === undefined || !Number.isFinite(since) || since <= 0) {
+			return undefined;
+		}
+		return since;
 	}
 
 	/**
 	 * Stop the clock: the funding was found, so nothing is counting down any
 	 * more. Returns true when this call cleared a running clock, so the caller
 	 * knows the removal is a state change that owes a persist of its own.
+	 * Keyed on the raw field rather than fundingMissingSince(), so an unusable
+	 * stamp still gets removed from disk instead of lingering forever.
 	 */
 	clearFundingMissingClock(): boolean {
 		if (this._state.fundingMissingSinceHeight === undefined) return false;
@@ -16867,9 +16898,23 @@ export class Channel {
 	 * and row); everything it checks is durable, so the answer survives a
 	 * restore. Never true once our tx_signatures left (the peer may hold a
 	 * broadcastable funding tx), once the fully signed tx was staged for
-	 * (re)broadcast, or once either channel_ready was exchanged.
+	 * (re)broadcast, once either channel_ready was exchanged, or once our own
+	 * watcher has seen the funding on chain.
+	 *
+	 * Durable facts only, deliberately. What the record cannot answer is
+	 * whether it is CURRENT: a database installed by a recovery restore can
+	 * be behind what the node actually did, so callers that would remove a
+	 * channel on a purely local inference screen for that separately
+	 * (ChannelManager.isChannelRestoredFromDisk).
 	 */
 	isAbandonedV2Open(): boolean {
+		// Chain evidence outranks the record. isV2AttemptBroadcastable answers
+		// from what this node remembers doing, and a funding tx our own watcher
+		// has seen at depth exists whatever the record says about our
+		// witnesses. Removing such a channel would delete the only state that
+		// can sweep that funding's outputs, so a confirmed open is never
+		// abandoned (issue #463).
+		if (this.isFundingKnownOnChain()) return false;
 		return (
 			this._state.state === ChannelState.ERRORED &&
 			this._state.fundingVersion === 2 &&
