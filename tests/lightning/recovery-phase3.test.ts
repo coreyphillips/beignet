@@ -396,7 +396,7 @@ describe('Recovery phase 3: capsule crypto', () => {
 			snapshotHash: Buffer.alloc(32, 9),
 			guardians: [
 				{
-					guardianId: 'ab'.repeat(33),
+					guardianId: 'ab'.repeat(32),
 					transports: [
 						{ type: 'onion-http', url: 'http://guardianexample.onion' },
 						{ type: 'https', url: 'https://guardian.example.com' }
@@ -459,6 +459,58 @@ describe('Recovery phase 3: capsule crypto', () => {
 			token: 'restore-me-with-the-seed'
 		});
 		expect(decoded!.guardians[2].auth).to.equal(undefined);
+	});
+
+	it('refuses a capsule whose guardian list is malformed (issue #457 review)', () => {
+		// The capsule authenticates, so these are "our" bytes; the decoder is
+		// still the one place to find out that a descriptor is null or has no
+		// transport, never a status route that only reports it.
+		const malformed: unknown[] = [
+			[null],
+			[{ guardianId: 'ab'.repeat(32) }],
+			[{ guardianId: 'ab'.repeat(32), transports: [] }],
+			[
+				{
+					guardianId: 'ab'.repeat(33),
+					transports: [{ type: 'https', url: 'https://g' }]
+				}
+			],
+			[
+				{
+					guardianId: 'ab'.repeat(32),
+					transports: [{ type: 'ftp', url: 'ftp://g' }]
+				}
+			],
+			[
+				{
+					guardianId: 'ab'.repeat(32),
+					transports: [{ type: 'https', url: 'https://g' }],
+					auth: { type: 'bearer' }
+				}
+			],
+			'not-a-list'
+		];
+		for (const guardians of malformed) {
+			const capsule = {
+				...sampleCapsule(),
+				guardians
+			} as unknown as RecoveryCapsule;
+			const blob = encryptRecoveryCapsule(capsule, NODE_SECRET);
+			expect(
+				decodeRecoveryCapsuleBlob(blob, NODE_SECRET),
+				JSON.stringify(guardians)
+			).to.equal(null);
+		}
+		// An absent list (a pre-#457 capsule) still decodes as empty.
+		const legacy = { ...sampleCapsule() } as Partial<RecoveryCapsule>;
+		delete legacy.guardians;
+		const legacyBlob = encryptRecoveryCapsule(
+			legacy as RecoveryCapsule,
+			NODE_SECRET
+		);
+		expect(
+			decodeRecoveryCapsuleBlob(legacyBlob, NODE_SECRET)!.guardians
+		).to.deep.equal([]);
 	});
 
 	it('returns null for foreign, tampered and wrong-key blobs', () => {

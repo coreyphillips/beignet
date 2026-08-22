@@ -455,11 +455,23 @@ Operational notes:
   its guardians. Boot the fresh data dir in `peer-storage` mode (it pushes
   nothing while empty), connect to the peers the node had channels with,
   read `capsules.best.guardians` on `GET /recovery/status` (`guardianId` plus
-  transports; credentials are never reported), rebuild
+  transports; credentials are never reported there), rebuild
   `BEIGNET_RECOVERY_GUARDIANS` as `<guardianId>@<url>` entries and restart in
-  the guardian mode: that boot holds restore-pending as above. A running
-  guardian-mode node only reports a capsule's set, it never adopts one; a set
-  that differs from the configured one is logged as a warning.
+  the guardian mode: that boot holds restore-pending as above. When the
+  guardians require a transport credential, `beignet recovery
+  capsule-guardians` (`POST /recovery/capsule-guardians`, admin scope,
+  `{ "confirm": true }`) hands back the set WITH credentials as config-file
+  entries: put them under `recoveryGuardians` in the config file as objects
+  `{ "guardianId", "url", "auth" }` (the env form stays `pubkey@url`; a URL
+  must not carry userinfo, credentials go in `auth`). A running guardian-mode
+  node only reports a capsule's set, it never adopts one; a set that differs
+  from the configured one is logged as a warning.
+- `POST /recovery/restore-capsule` refuses a capsule that names guardians
+  (409 `CAPSULE_RESTORE_GUARDIAN_BACKED`): that state belongs to a
+  guardian-backed namespace and restores through the guardian set with
+  fencing, never unfenced from peer storage, and never by force-closing
+  channels the guardians could resume exactly. The emergency SCB-only path
+  is unchanged: `GET /backup/peer-retrieved` plus `POST /restore/scb`.
 - Recovery events relayed over SSE and webhooks (always on):
   `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`,
   `recovery:guardian_unreachable`, `recovery:restore-progress`,
@@ -1402,6 +1414,8 @@ beignet recovery restore-capsule  # peer-storage mode: restore from the
                             # Recovery Capsules storage peers returned
                             # (connect to the old channel peers first;
                             # Tier 2 asks for a daemon restart)
+beignet recovery capsule-guardians  # the best retrieved capsule's guardian set
+                            # with credentials, as config entries
 ```
 
 ### BOLT 12 Offers
@@ -1709,6 +1723,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`restart-required`/`fenced`), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session (`capsules`, whose `best` names the guardian locators the capsule carries, credentials redacted). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
 | POST | `/recovery/restore` | `{ confirm: true }` | Restore from guardian replicas and start the node on the restored state (restore-pending daemons only; channels RESUME instead of force-closing; the takeover permanently fences the previous writer). Progress streams over SSE as `recovery:restore-progress` |
 | POST | `/recovery/restore-capsule` | `{ confirm: true }` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session. Tier 2 installs the exact state into a fresh database and holds the daemon until a restart (503 `NODE_RESTART_REQUIRED` elsewhere); Tier 1 recovers the embedded SCB on the live node. Progress streams over SSE as `recovery:restore-progress` |
+| POST | `/recovery/capsule-guardians` | `{ confirm: true }` | The guardian set the best retrieved capsule names, INCLUDING transport credentials, as config-file entries for `recoveryGuardians`. The status route redacts credentials; this admin handoff is how a seed restore whose guardians need authentication gets them back. Nothing is adopted or persisted |
 | POST | `/stop` | `{ drain?, drainTimeoutMs? }` | Stop daemon. `drain: true` waits for in-flight payments before shutting down. |
 
 ### Server-Sent Events (SSE)

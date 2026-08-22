@@ -655,6 +655,85 @@ function encodeCapsule(capsule: RecoveryCapsule): Buffer {
 	return Buffer.from(JSON.stringify(encoded), 'utf8');
 }
 
+const GUARDIAN_TRANSPORT_TYPES = new Set(['onion-http', 'https', 'local-http']);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Strict decode of the capsule's guardian list (the issue #317 rule applied
+ * to the one field the decoder used to pass through untyped). The capsule
+ * authenticates under the node secret, so these are our own bytes, but a
+ * consumer that reports or dials a descriptor must never be the first thing
+ * to find out that one is `null` or has no transports.
+ */
+export function assertGuardianDescriptors(
+	value: unknown
+): GuardianDescriptor[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) {
+		throw new Error('capsule guardians is not an array');
+	}
+	return value.map((entry, index) => {
+		const where = `capsule guardian ${index}`;
+		if (!isRecord(entry)) throw new Error(`${where} is not an object`);
+		const guardianId = entry.guardianId;
+		if (
+			typeof guardianId !== 'string' ||
+			!/^[0-9a-fA-F]{64}$/.test(guardianId)
+		) {
+			throw new Error(`${where} guardianId is not a 64-hex x-only key`);
+		}
+		const transports = entry.transports;
+		if (!Array.isArray(transports) || transports.length === 0) {
+			throw new Error(`${where} has no transports`);
+		}
+		const descriptor: GuardianDescriptor = {
+			guardianId,
+			transports: transports.map((transport, i) => {
+				if (
+					!isRecord(transport) ||
+					typeof transport.type !== 'string' ||
+					!GUARDIAN_TRANSPORT_TYPES.has(transport.type) ||
+					typeof transport.url !== 'string'
+				) {
+					throw new Error(`${where} transport ${i} is malformed`);
+				}
+				return {
+					type: transport.type as GuardianDescriptor['transports'][number]['type'],
+					url: transport.url
+				};
+			})
+		};
+		if (entry.auth !== undefined) {
+			descriptor.auth = assertGuardianAuth(entry.auth, where);
+		}
+		return descriptor;
+	});
+}
+
+/** Strict decode of one transport credential (wire 2.4 shapes only). */
+export function assertGuardianAuth(
+	value: unknown,
+	where: string
+): GuardianAuth {
+	if (!isRecord(value)) throw new Error(`${where} auth is not an object`);
+	if (value.type === 'bearer' && typeof value.token === 'string') {
+		return { type: 'bearer', token: value.token };
+	}
+	if (value.type === 'macaroon' && typeof value.macaroon === 'string') {
+		return { type: 'macaroon', macaroon: value.macaroon };
+	}
+	if (
+		value.type === 'tor-v3-client-auth' &&
+		typeof value.privateKey === 'string'
+	) {
+		return { type: 'tor-v3-client-auth', privateKey: value.privateKey };
+	}
+	throw new Error(`${where} auth is not a known credential shape`);
+}
+
 function decodeCapsule(plaintext: Buffer): RecoveryCapsule {
 	const encoded = JSON.parse(plaintext.toString('utf8')) as IEncodedCapsule;
 	if (encoded.version !== 1) {
@@ -667,7 +746,7 @@ function decodeCapsule(plaintext: Buffer): RecoveryCapsule {
 		latestSequence: BigInt(encoded.latestSequence),
 		frameHash: Buffer.from(encoded.frameHash, 'hex'),
 		snapshotHash: Buffer.from(encoded.snapshotHash, 'hex'),
-		guardians: encoded.guardians ?? []
+		guardians: assertGuardianDescriptors(encoded.guardians)
 	};
 	if (encoded.inlineRecoveryState != null) {
 		capsule.inlineRecoveryState = Buffer.from(

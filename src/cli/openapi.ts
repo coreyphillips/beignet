@@ -1581,11 +1581,29 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'Not in peer-storage mode, a restore is already running, this database already holds state a restore would discard, or no candidate validates'
+								'Not in peer-storage mode, a restore is already running, this database already holds state a restore would discard, no candidate validates, or the best capsule names a guardian set (CAPSULE_RESTORE_GUARDIAN_BACKED: that state restores through the guardians with fencing; restart in the guardian mode with the locators under capsules.best.guardians, or the capsule-guardians handoff when they need credentials)'
 						},
 						'500': {
 							description:
 								'The restored database could not be written or swapped in (an operational fault, not a candidate defect)'
+						}
+					}
+				}
+			},
+			'/recovery/capsule-guardians': {
+				post: {
+					summary:
+						'The guardian set the best retrieved Recovery Capsule names, INCLUDING transport credentials, as config entries for recoveryGuardians. The status route redacts credentials because it is readonly; this admin handoff is how a seed restore whose guardians require authentication gets them back. Nothing is adopted or persisted; confirm must be true',
+					tags: ['Node'],
+					requestBody: bodyContent({ confirm: 'boolean' }),
+					responses: {
+						'200': {
+							description:
+								'The peer the capsule came from, its head, the full descriptors, and config-file ready entries (guardianId, url, auth when present)'
+						},
+						'400': { description: 'Missing confirm' },
+						'404': {
+							description: 'No storage peer has returned a capsule this session'
 						}
 					}
 				}

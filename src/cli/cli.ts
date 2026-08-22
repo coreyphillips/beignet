@@ -2110,13 +2110,23 @@ async function handleRecovery(): Promise<void> {
 			await httpRequest('POST', '/recovery/restore-capsule', { confirm: true })
 		);
 	}
+	if (sub === 'capsule-guardians') {
+		// The best retrieved capsule's guardian set WITH its transport
+		// credentials, as config-file entries for recoveryGuardians. Typing
+		// the command is the confirmation.
+		return outputResult(
+			await httpRequest('POST', '/recovery/capsule-guardians', {
+				confirm: true
+			})
+		);
+	}
 	output({
 		ok: false,
 		error: {
 			code: 'INVALID_PARAMS',
 			message:
 				'Usage: beignet recovery status | beignet recovery restore | ' +
-				'beignet recovery restore-capsule'
+				'beignet recovery restore-capsule | beignet recovery capsule-guardians'
 		}
 	});
 	process.exitCode = 1;
@@ -2365,6 +2375,9 @@ On-chain:
                                          Recovery Capsules storage peers returned
                                          (connect to the old channel peers first;
                                          Tier 2 asks for a daemon restart)
+  recovery capsule-guardians             The guardian set the best retrieved
+                                         capsule names, credentials included, as
+                                         config entries for recoveryGuardians
 
 Peers:
   peer connect <pubkey> <host> <port>    Connect to peer

@@ -263,6 +263,8 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	// The guardian-restore takeover permanently fences the previous writer.
 	'POST /recovery/restore': [],
 	'POST /recovery/restore-capsule': [],
+	// Hands back a retrieved capsule's guardian credentials.
+	'POST /recovery/capsule-guardians': [],
 	'POST /watchtower/add': [],
 	'DELETE /watchtower/remove': [],
 	'POST /webhooks/register': [],
