@@ -538,6 +538,9 @@ export interface BeignetConfig {
 	 *  and the default when a guardian mode is configured. Env:
 	 *  BEIGNET_RECOVERY_PROFILE. */
 	recoveryProfile?: string;
+	/** Guardian modes: idle writer lease re-check cadence in ms (default
+	 *  300000, 0 disables). Env: BEIGNET_RECOVERY_LEASE_CHECK_MS. */
+	recoveryLeaseCheckIntervalMs?: number;
 }
 
 export interface HealthInfo {

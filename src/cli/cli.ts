@@ -480,7 +480,8 @@ async function handleStart(): Promise<void> {
 			logLevel: config.logLevel,
 			recoveryMode: config.recoveryMode,
 			recoveryGuardians: config.recoveryGuardians,
-			recoveryProfile: config.recoveryProfile
+			recoveryProfile: config.recoveryProfile,
+			recoveryLeaseCheckIntervalMs: config.recoveryLeaseCheckIntervalMs
 		});
 
 		writePidFile(process.pid, daemonPort);

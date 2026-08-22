@@ -317,6 +317,13 @@ export interface BeignetNodeOptions {
 	/** Fault-model profile; 'crash-v1' is the only value and the default. */
 	recoveryProfile?: string;
 	/**
+	 * Guardian modes: how often an idle confirmed writer re-asks the guardian
+	 * set whether its lease is still current (issue #455). Default 5 minutes;
+	 * 0 disables. A proven newer epoch fences exactly as a refused append
+	 * would; an outage never changes the gate.
+	 */
+	recoveryLeaseCheckIntervalMs?: number;
+	/**
 	 * Encrypt the SQLite database at rest with a key derived from the wallet
 	 * seed (default true). An existing plaintext database is migrated in place
 	 * on first open; restoring a backup requires the same mnemonic. Set false
@@ -683,6 +690,9 @@ export class BeignetNode extends EventEmitter {
 	private _deferredOpts?: BeignetNodeOptions;
 	/** Backoff timer for the startup gate confirmation loop. */
 	private _confirmTimer?: ReturnType<typeof setTimeout>;
+	private _leaseCheckTimer?: ReturnType<typeof setInterval>;
+	private _leaseCheckInFlight = false;
+	private _leaseCheckIntervalMs = BeignetNode.DEFAULT_LEASE_CHECK_INTERVAL_MS;
 	private mnemonic: string;
 	private networkName: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	private dataDir: string;
@@ -704,6 +714,8 @@ export class BeignetNode extends EventEmitter {
 	 * tests can shrink it (the GOSSIP_INTAKE_MAX pattern).
 	 */
 	static INITIAL_GOSSIP_PRIME_TIMEOUT_MS = 90_000;
+	/** Idle writer lease re-check cadence (issue #455). */
+	private static readonly DEFAULT_LEASE_CHECK_INTERVAL_MS = 5 * 60_000;
 	/**
 	 * Non-null only while the boot-time RGS attempt is in flight (mainnet with
 	 * rapidGossipSync on). Connect-time gossip sync waits on it so a fresh
@@ -811,6 +823,9 @@ export class BeignetNode extends EventEmitter {
 		this.peerStorageEnabled = opts.peerStorageEnabled ?? true;
 		this.rapidGossipSync = opts.rapidGossipSync ?? true;
 		this.rapidGossipSyncUrl = opts.rapidGossipSyncUrl;
+		if (opts.recoveryLeaseCheckIntervalMs !== undefined) {
+			this._leaseCheckIntervalMs = Math.max(0, opts.recoveryLeaseCheckIntervalMs);
+		}
 		const networkName = this.networkName;
 
 		// 2. Acquire the single-instance lock before touching storage. Two
@@ -1697,23 +1712,13 @@ export class BeignetNode extends EventEmitter {
 					this.log('info', 'Recovery gate confirmed; peer traffic released', {
 						confirming: outcome.confirming
 					});
+					this.startRecoveryLeaseCheck();
 					return;
 				}
 				if (outcome.state === 'fenced') {
 					// The gate found a newer epoch at startup: same event the
 					// barrier relays for a running node, same payload shape.
-					this.emit('recovery:fenced', {
-						supersededBy: outcome.supersededBy
-							? {
-									epoch: outcome.supersededBy.lease.epoch.toString(),
-									writerPublicKey:
-										outcome.supersededBy.lease.writerPublicKey.toString('hex'),
-									sequence: outcome.supersededBy.logHead.sequence.toString(),
-									frameHash:
-										outcome.supersededBy.logHead.frameHash.toString('hex')
-							  }
-							: null
-					});
+					this.emitGateFenced(outcome.supersededBy);
 					return;
 				}
 				this.log('warn', 'Recovery gate still quarantined; retrying', {
@@ -1733,6 +1738,74 @@ export class BeignetNode extends EventEmitter {
 			delayMs = Math.min(delayMs * 2, 60_000);
 		};
 		void attempt();
+	}
+
+	/**
+	 * Relay a gate fence with the payload shape the barrier path uses, so a
+	 * consumer sees one event whichever side noticed the takeover.
+	 */
+	private emitGateFenced(supersededBy: GuardianState | undefined): void {
+		this.emit('recovery:fenced', {
+			supersededBy: supersededBy
+				? {
+						epoch: supersededBy.lease.epoch.toString(),
+						writerPublicKey: supersededBy.lease.writerPublicKey.toString('hex'),
+						sequence: supersededBy.logHead.sequence.toString(),
+						frameHash: supersededBy.logHead.frameHash.toString('hex')
+				  }
+				: null
+		});
+	}
+
+	/**
+	 * Periodic lease re-check for an idle confirmed writer (issue #455).
+	 *
+	 * Fencing is enforced on commits and the startup gate covers restarts,
+	 * so a superseded device that stays idle keeps reporting itself as the
+	 * owner until one of those happens. This asks the guardian set on a
+	 * cadence and, on a proven newer epoch, fences through the same gate
+	 * path the startup check uses (the node hard-freezes its transports and
+	 * the status route flips to fenced). It needs no quorum: one verified
+	 * higher-epoch state is the same evidence a refused append yields. An
+	 * outage or a partial answer changes nothing, by the gate's contract.
+	 */
+	private startRecoveryLeaseCheck(): void {
+		const run = this._recoveryRun;
+		if (!run || this._leaseCheckTimer || this._leaseCheckIntervalMs <= 0) {
+			return;
+		}
+		this._leaseCheckTimer = setInterval(() => {
+			if (this.destroyed || this._leaseCheckInFlight) return;
+			this._leaseCheckInFlight = true;
+			run
+				.recheck()
+				.then((outcome) => {
+					if (outcome.state !== 'fenced') return;
+					this.log(
+						'error',
+						'Recovery lease check: a newer writer epoch owns this ' +
+							'namespace; this device is fenced'
+					);
+					this.stopRecoveryLeaseCheck();
+					this.emitGateFenced(outcome.supersededBy);
+				})
+				.catch((err) => {
+					this.log('debug', 'Recovery lease check failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				})
+				.finally(() => {
+					this._leaseCheckInFlight = false;
+				});
+		}, this._leaseCheckIntervalMs);
+		this._leaseCheckTimer.unref?.();
+	}
+
+	private stopRecoveryLeaseCheck(): void {
+		if (this._leaseCheckTimer) {
+			clearInterval(this._leaseCheckTimer);
+			this._leaseCheckTimer = undefined;
+		}
 	}
 
 	/** True while the daemon must hold every route except the recovery surface. */
@@ -6526,6 +6599,7 @@ export class BeignetNode extends EventEmitter {
 			clearTimeout(this._confirmTimer);
 			this._confirmTimer = undefined;
 		}
+		this.stopRecoveryLeaseCheck();
 		// Await any in-flight backup before closing storage
 		if (this._backupPromise) {
 			await this._backupPromise.catch(() => {
@@ -6563,6 +6637,7 @@ export class BeignetNode extends EventEmitter {
 			clearTimeout(this._confirmTimer);
 			this._confirmTimer = undefined;
 		}
+		this.stopRecoveryLeaseCheck();
 		this.paymentQueue?.removeAllListeners();
 		// A restore-pending daemon never built the node or the wallet; the
 		// definite-assignment assertions on the fields do not change that.

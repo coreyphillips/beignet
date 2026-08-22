@@ -247,7 +247,13 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 		recoveryProfile:
 			cliFlags.recoveryProfile ||
 			process.env.BEIGNET_RECOVERY_PROFILE ||
-			file.recoveryProfile
+			file.recoveryProfile,
+		recoveryLeaseCheckIntervalMs:
+			cliFlags.recoveryLeaseCheckIntervalMs ??
+			(process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS
+				? parseInt(process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS, 10)
+				: undefined) ??
+			file.recoveryLeaseCheckIntervalMs
 	};
 }
 

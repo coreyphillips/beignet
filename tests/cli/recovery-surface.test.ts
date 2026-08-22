@@ -300,13 +300,20 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 			// Device A: register the namespace and make one journaled commit
 			// durable on the quorum (an invoice persists its payment secret
 			// through the safety-transition layer).
+			// Device A stays RUNNING and idle through the takeover below: the
+			// periodic lease check (issue #455) is what must notice it.
 			const deviceA = await startDaemon({
 				...OFFLINE,
 				dataDir: dirA,
 				recoveryMode: 'quorum',
-				recoveryGuardians: guardianUris
+				recoveryGuardians: guardianUris,
+				recoveryLeaseCheckIntervalMs: 200
 			});
 			const portA = portOf(deviceA);
+			const fencedOnA: Array<Record<string, unknown>> = [];
+			deviceA.node.on('recovery:fenced', (data) =>
+				fencedOnA.push(data as Record<string, unknown>)
+			);
 			const statusA = await request(portA, 'GET', '/recovery/status');
 			expect(statusA.status).to.equal(200);
 			const resultA = statusA.body.result as {
@@ -330,7 +337,10 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 				).node;
 				return node !== null && BigInt(node.lastDurableSequence) >= 1n;
 			});
-			await deviceA.stop();
+			const confirmedA = await request(portA, 'GET', '/recovery/status');
+			expect(
+				(confirmedA.body.result as { node: { gate: string } }).node.gate
+			).to.equal('confirmed');
 
 			// Device B: same seed, fresh database. The boot decision must
 			// refuse to register a second genesis and hold for restore.
@@ -405,8 +415,25 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 				};
 				expect(afterResult.state).to.equal('running');
 				expect(afterResult.node?.durability).to.equal('quorum');
+
+				// The idle old writer learns it was superseded from the lease
+				// check alone: no commit, no restart. Same event and payload
+				// as the barrier and startup-gate fences.
+				await waitFor(async () => {
+					const res = await request(portA, 'GET', '/recovery/status');
+					return (res.body.result as { state: string }).state === 'fenced';
+				});
+				const fencedA = await request(portA, 'GET', '/recovery/status');
+				expect(
+					(fencedA.body.result as { node: { gate: string } }).node.gate
+				).to.equal('fenced');
+				expect(fencedOnA).to.have.length(1);
+				expect(
+					(fencedOnA[0].supersededBy as { epoch: string }).epoch
+				).to.equal('2');
 			} finally {
 				await deviceB.stop();
+				await deviceA.stop();
 			}
 		} finally {
 			await shutdown(served);

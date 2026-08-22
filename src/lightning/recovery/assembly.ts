@@ -151,6 +151,12 @@ export type GuardianBootDecision =
 			kind: 'run';
 			recovery: NonNullable<INodeConfig['recovery']>;
 			confirm: () => Promise<IConfirmationOutcome>;
+			/**
+			 * Periodic ownership re-check for an idle confirmed writer (issue
+			 * #455): fences on a proven newer epoch, never downgrades
+			 * otherwise. Run it on a cadence after confirm() succeeds.
+			 */
+			recheck: () => Promise<IConfirmationOutcome>;
 			replicator: GuardianReplicator;
 			barrier: DurabilityBarrier;
 			gate: GuardianStartupGate;
@@ -234,6 +240,7 @@ export async function buildGuardianRecovery(
 					startupGate: gate
 				},
 				confirm: (): Promise<IConfirmationOutcome> => gate.confirm(lease),
+				recheck: (): Promise<IConfirmationOutcome> => gate.recheck(lease),
 				replicator,
 				barrier,
 				gate
