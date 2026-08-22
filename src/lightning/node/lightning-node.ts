@@ -226,7 +226,8 @@ import {
 	deriveRecoveryRoot,
 	journalSupported,
 	loadWriterLease,
-	composeRecoveryCapsule
+	composeRecoveryCapsule,
+	assertEmptyTarget
 } from '../recovery';
 import {
 	IChannelPersistEvent,
@@ -775,6 +776,11 @@ export class LightningNode extends EventEmitter {
 	private _autoReconnectDeferred = false;
 	private capsuleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private capsuleLastRefreshAt = 0;
+	/**
+	 * A capsule carrying real state went out this run. Until then an empty
+	 * node composes nothing: see composeRecoveryCapsuleBlob.
+	 */
+	private capsuleCarriedState = false;
 	/** A journaled commit landed after the last compose (see connect path). */
 	private capsuleDirty = false;
 
@@ -4303,6 +4309,19 @@ export class LightningNode extends EventEmitter {
 		) {
 			return null;
 		}
+		// An empty node has nothing to back up, and pushing an empty capsule
+		// can only destroy a provider's last good copy. The device that
+		// matters here is a seed restore on a fresh database: it connects to
+		// its old peers precisely to RETRIEVE the capsule they hold, and the
+		// BOLT 1 provider keeps one blob per peer, so our empty push would
+		// replace the backup before the operator can act on it (issue #453).
+		// Emptiness is the restore side's own definition (assertEmptyTarget):
+		// no channels, payments, invoices or secrets. Once a capsule with
+		// state has gone out this run, later empties are truthful updates
+		// (the last channel closed) and go out as before.
+		if (!this.capsuleCarriedState && !this.storageHoldsRecoverableState()) {
+			return null;
+		}
 		let allowInline = true;
 		try {
 			this.recoveryJournal?.prepareForReplication();
@@ -4334,6 +4353,7 @@ export class LightningNode extends EventEmitter {
 					error: inlineError
 				});
 			}
+			this.capsuleCarriedState = true;
 			if (allowInline) {
 				this.capsuleDirty = false;
 			} else {
@@ -4351,6 +4371,17 @@ export class LightningNode extends EventEmitter {
 				error: err instanceof Error ? err.message : String(err)
 			});
 			return null;
+		}
+	}
+
+	/** Whether this node's tables hold anything a restore would want back. */
+	private storageHoldsRecoverableState(): boolean {
+		if (!this.storage) return false;
+		try {
+			assertEmptyTarget(this.storage);
+			return false;
+		} catch {
+			return true;
 		}
 	}
 

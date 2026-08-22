@@ -83,7 +83,10 @@ import {
 	IRestoreResult,
 	RestoreRefusedError,
 	buildGuardianRecovery,
-	parseGuardianUri
+	parseGuardianUri,
+	decodeRecoveryCapsuleBlob,
+	restoreBestRecoveryCapsule,
+	assertEmptyTarget
 } from '../lightning/recovery';
 import { INodeConfig } from '../lightning/node/types';
 import {
@@ -774,7 +777,34 @@ export class BeignetNode extends EventEmitter {
 		encoded: string;
 		createdAt: number;
 		fromPeer: string;
+		channelCount: number;
+		source: 'scb' | 'capsule';
 	} | null = null;
+	/**
+	 * Best Recovery Capsule each peer has returned (spec 5.4): the raw blob
+	 * for restoreBestRecoveryCapsule plus its decoded head for the status
+	 * route. Never auto-restored.
+	 */
+	private readonly _peerRetrievedCapsules = new Map<
+		string,
+		{
+			blob: Buffer;
+			writerEpoch: bigint;
+			latestSequence: bigint;
+			inline: boolean;
+			channelCount: number;
+			receivedAt: number;
+		}
+	>();
+	/** A non-empty SCB went out to storage peers this run. */
+	private _pushedChannelBackup = false;
+	private _nodeSecret?: Buffer;
+	private _storageEncryptionKey?: Buffer;
+	/**
+	 * A Tier 2 capsule restore replaced the database underneath this daemon;
+	 * only a restart builds a node on it (see restoreFromCapsules).
+	 */
+	private _restartRequired = false;
 
 	private constructor(
 		mnemonic: string,
@@ -903,6 +933,7 @@ export class BeignetNode extends EventEmitter {
 			encryptionKey = deriveStorageKey(bip39.mnemonicToSeedSync(this.mnemonic));
 		}
 
+		this._storageEncryptionKey = encryptionKey;
 		this.storage = new SqliteStorage(
 			dbPath,
 			(err) => {
@@ -1643,15 +1674,9 @@ export class BeignetNode extends EventEmitter {
 		// create; parsing again here gives library callers the same refusals.
 		const guardians = (opts.recoveryGuardians ?? []).map(parseGuardianUri);
 		this.recoveryGuardianSet = guardians;
-		const coinType = this.toCoinType(this.networkName);
-		const keys = deriveLightningKeysFromMnemonic(
-			this.mnemonic,
-			undefined,
-			coinType
-		);
 		const decision = await buildGuardianRecovery({
 			storage: this.storage,
-			nodeSecret: keys.nodePrivateKey,
+			nodeSecret: this.nodeSecret(),
 			durability: mode,
 			guardians,
 			onBarrierEvent: (event) => {
@@ -1825,8 +1850,26 @@ export class BeignetNode extends EventEmitter {
 		mode: RecoveryMode;
 		profile: 'crash-v1' | null;
 		guardians: Array<{ guardianId: string; url: string }>;
-		state: 'disabled' | 'running' | 'restore-required' | 'restoring' | 'fenced';
+		state:
+			| 'disabled'
+			| 'running'
+			| 'restore-required'
+			| 'restoring'
+			| 'restart-required'
+			| 'fenced';
 		node: ReturnType<LightningNode['getRecoveryStatus']> | null;
+		/** Recovery Capsules storage peers returned this session (spec 5.4). */
+		capsules: {
+			candidates: number;
+			best: {
+				writerEpoch: string;
+				latestSequence: string;
+				inline: boolean;
+				channelCount: number;
+				fromPeer: string;
+				receivedAt: number;
+			} | null;
+		};
 		restore?: {
 			inProgress: boolean;
 			lastEvent?: { type: string; detail: string };
@@ -1840,13 +1883,30 @@ export class BeignetNode extends EventEmitter {
 			this.recoveryMode === 'async-remote' || this.recoveryMode === 'quorum'
 				? ('crash-v1' as const)
 				: null;
+		const capsules = this.describeRetrievedCapsules();
+		const restore = {
+			inProgress: this._restoreInFlight,
+			...(this._lastRestoreEvent ? { lastEvent: this._lastRestoreEvent } : {})
+		};
+		if (this._restartRequired) {
+			return {
+				mode: this.recoveryMode,
+				profile,
+				guardians,
+				state: 'restart-required',
+				node: null,
+				capsules,
+				restore
+			};
+		}
 		if (this.recoveryMode === 'off') {
 			return {
 				mode: 'off',
 				profile: null,
 				guardians: [],
 				state: 'disabled',
-				node: null
+				node: null,
+				capsules
 			};
 		}
 		if (this._restorePending) {
@@ -1856,12 +1916,8 @@ export class BeignetNode extends EventEmitter {
 				guardians,
 				state: this._restoreInFlight ? 'restoring' : 'restore-required',
 				node: null,
-				restore: {
-					inProgress: this._restoreInFlight,
-					...(this._lastRestoreEvent
-						? { lastEvent: this._lastRestoreEvent }
-						: {})
-				}
+				capsules,
+				restore
 			};
 		}
 		const node = this.node.getRecoveryStatus();
@@ -1870,8 +1926,333 @@ export class BeignetNode extends EventEmitter {
 			profile,
 			guardians,
 			state: node.fenced || node.gate === 'fenced' ? 'fenced' : 'running',
-			node
+			node,
+			capsules
 		};
+	}
+
+	/** True after a Tier 2 capsule restore: only a restart serves a node again. */
+	get restartRequired(): boolean {
+		return this._restartRequired;
+	}
+
+	/** Best retrieved capsule by (writerEpoch, latestSequence), for status. */
+	private describeRetrievedCapsules(): ReturnType<
+		BeignetNode['getRecoverySurfaceStatus']
+	>['capsules'] {
+		let best:
+			| (ReturnType<
+					BeignetNode['getRecoverySurfaceStatus']
+			  >['capsules']['best'] & {
+					epoch: bigint;
+					sequence: bigint;
+			  })
+			| null = null;
+		for (const [fromPeer, c] of this._peerRetrievedCapsules) {
+			// Highest head wins; at an equal head an inline replica beats an
+			// SCB-only twin, which is also the order the restore tries them.
+			if (
+				!best ||
+				c.writerEpoch > best.epoch ||
+				(c.writerEpoch === best.epoch && c.latestSequence > best.sequence) ||
+				(c.writerEpoch === best.epoch &&
+					c.latestSequence === best.sequence &&
+					c.inline &&
+					!best.inline)
+			) {
+				best = {
+					epoch: c.writerEpoch,
+					sequence: c.latestSequence,
+					writerEpoch: c.writerEpoch.toString(),
+					latestSequence: c.latestSequence.toString(),
+					inline: c.inline,
+					channelCount: c.channelCount,
+					fromPeer,
+					receivedAt: c.receivedAt
+				};
+			}
+		}
+		if (!best) return { candidates: 0, best: null };
+		const { epoch: _e, sequence: _s, ...rest } = best;
+		return { candidates: this._peerRetrievedCapsules.size, best: rest };
+	}
+
+	/**
+	 * Restore this node from the Recovery Capsules storage peers returned
+	 * (POST /recovery/restore-capsule, spec 5.4): peer-storage mode's
+	 * counterpart to restoreFromGuardians.
+	 *
+	 * The capsules only arrive once a node is running and connected, but a
+	 * Tier 2 install needs an EMPTY database, and even a fresh peer-storage
+	 * node has journaled its genesis snapshot by then. So the install goes
+	 * into a new database file, the running node (which must itself hold no
+	 * channel state) is torn down, the files are swapped, and the daemon
+	 * holds in the restart-required state: a restart boots on the restored
+	 * state and the channels resume through reestablish. The previous
+	 * database is kept beside it, never deleted. A Tier 1 outcome (no inline
+	 * journal validated) needs none of that: the embedded SCB goes through
+	 * recoverFromStaticChannelBackup on the live node, exactly like
+	 * POST /restore/scb.
+	 *
+	 * Local durability has no fencing (spec 5.6): if the old device is still
+	 * running, nothing stops it from acting on the same channels, which is
+	 * why the daemon route demands an explicit confirm.
+	 */
+	async restoreFromCapsules(): Promise<{
+		tier: 1 | 2;
+		channelCount: number;
+		framesApplied: number;
+		head: { writerEpoch: string; latestSequence: string };
+		newestSeenHead: { writerEpoch: string; latestSequence: string };
+		rejectedCandidates: number;
+		restartRequired: boolean;
+		recovering?: string[];
+		skipped?: Array<{ channelId: string; reason: string }>;
+	}> {
+		if (this._restoreInFlight) {
+			throw new BeignetError(
+				'RESTORE_IN_PROGRESS',
+				'A restore is already running; poll the status route.'
+			);
+		}
+		if (this.recoveryMode !== 'peer-storage' || this._restorePending) {
+			throw new BeignetError(
+				'CAPSULE_RESTORE_UNSUPPORTED',
+				'Capsule restore applies to peer-storage mode only. Guardian ' +
+					'modes restore through the guardian set (the /recovery/restore ' +
+					'route); with recovery off there is no journal to restore, so ' +
+					'use the SCB a peer returned (/backup/peer-retrieved) with the ' +
+					'SCB restore route instead.'
+			);
+		}
+		if (this._peerRetrievedCapsules.size === 0) {
+			throw new BeignetError(
+				'CAPSULE_RESTORE_NO_CANDIDATES',
+				'No storage peer has returned a Recovery Capsule this session. ' +
+					'Connect to the peers this node had channels with and retry.'
+			);
+		}
+		try {
+			assertEmptyTarget(this.storage);
+		} catch (err) {
+			throw new BeignetError(
+				'CAPSULE_RESTORE_TARGET_DIRTY',
+				'This database already holds channel, payment or invoice state ' +
+					'that a restore would discard; run the restore from a fresh ' +
+					'data directory (' +
+					(err instanceof Error ? err.message : String(err)) +
+					')'
+			);
+		}
+		this._restoreInFlight = true;
+		const progress = (type: string, detail: string): void => {
+			this._lastRestoreEvent = { type, detail };
+			this.log('info', `Capsule restore: ${type}`, { detail });
+			this.emit('recovery:restore-progress', { type, detail });
+		};
+		const stagedPath = path.join(
+			this.dataDir,
+			`${this.networkName}.db.capsule-restore`
+		);
+		const dropStaged = (): void => {
+			for (const suffix of ['', '-wal', '-shm']) {
+				try {
+					fs.unlinkSync(`${stagedPath}${suffix}`);
+				} catch {
+					// Not there.
+				}
+			}
+		};
+		try {
+			const blobs = [...this._peerRetrievedCapsules.values()].map(
+				(c) => c.blob
+			);
+			progress(
+				'capsule:selecting',
+				`${blobs.length} candidate capsule(s) from storage peers`
+			);
+			dropStaged();
+			const staged = new SqliteStorage(
+				stagedPath,
+				() => {
+					/* a fresh file has no rows to skip */
+				},
+				this._storageEncryptionKey
+					? { encryptionKey: this._storageEncryptionKey }
+					: undefined
+			);
+			staged.open();
+			let result: ReturnType<typeof restoreBestRecoveryCapsule>;
+			try {
+				result = restoreBestRecoveryCapsule(blobs, staged, this.nodeSecret(), {
+					scratchStorage: (): SqliteStorage => {
+						const scratch = new SqliteStorage(':memory:');
+						scratch.open();
+						return scratch;
+					}
+				});
+				const expectedNetwork = this.toLnNetwork(this.networkName);
+				if (result.scb.network !== expectedNetwork) {
+					throw new Error(
+						`capsule SCB network "${result.scb.network}" does not match ` +
+							`this node's network "${expectedNetwork}"`
+					);
+				}
+			} catch (err) {
+				staged.close();
+				dropStaged();
+				throw new BeignetError(
+					'CAPSULE_RESTORE_FAILED',
+					`No retrieved capsule could be restored: ${
+						err instanceof Error ? err.message : String(err)
+					}`
+				);
+			}
+			const head = {
+				writerEpoch: result.capsule.writerEpoch.toString(),
+				latestSequence: result.capsule.latestSequence.toString()
+			};
+			const newestSeenHead = {
+				writerEpoch: result.newestSeenHead.writerEpoch.toString(),
+				latestSequence: result.newestSeenHead.latestSequence.toString()
+			};
+			const common = {
+				channelCount: result.scb.channels.length,
+				framesApplied: result.framesApplied,
+				head,
+				newestSeenHead,
+				rejectedCandidates: result.rejectedCandidates
+			};
+
+			if (result.tier === 1) {
+				// Nothing was written to the staged file; the SCB is the whole
+				// answer and the live node takes it like any SCB restore.
+				staged.close();
+				dropStaged();
+				progress(
+					'capsule:tier1',
+					`no inline journal validated; recovering ${common.channelCount} channel(s) from the embedded SCB`
+				);
+				const { recovering, skipped } =
+					await this.node.recoverFromStaticChannelBackup(result.scb.channels);
+				const info = {
+					tier: 1 as const,
+					...common,
+					restartRequired: false,
+					recovering,
+					skipped
+				};
+				progress(
+					'restore:complete',
+					`Tier 1: ${recovering.length} channel(s) recovering, ${skipped.length} skipped`
+				);
+				this.emit('recovery:restored', {
+					exact: false,
+					framesApplied: 0,
+					guardiansRepaired: 0,
+					epoch: head.writerEpoch,
+					tier: 1,
+					restartRequired: false
+				});
+				return info;
+			}
+
+			// Tier 2: the staged database is the node's exact state. Carry the
+			// peer addresses the operator just used across, so the restored
+			// node dials its channel peers on its own after the restart.
+			try {
+				for (const peer of this.storage.loadAllPeerAddresses()) {
+					staged.savePeerAddress(peer.pubkey, peer.host, peer.port);
+				}
+			} catch (err) {
+				this.log('warn', 'Could not carry peer addresses into the restore', {
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+			staged.close();
+			progress(
+				'capsule:installed',
+				`Tier 2: ${result.framesApplied} frame(s) replayed at epoch ${head.writerEpoch} sequence ${head.latestSequence}`
+			);
+
+			// Tear the running node down (its destroy closes the database), then
+			// swap the files. From here only a restart serves a node again.
+			this.teardownNodeForRestart();
+			const dbPath = path.join(this.dataDir, `${this.networkName}.db`);
+			const keptPath = `${dbPath}.pre-capsule-restore-${new Date()
+				.toISOString()
+				.replace(/[:.]/g, '-')}`;
+			fs.renameSync(dbPath, keptPath);
+			for (const suffix of ['-wal', '-shm']) {
+				try {
+					fs.renameSync(`${dbPath}${suffix}`, `${keptPath}${suffix}`);
+				} catch {
+					// A clean close leaves none behind.
+				}
+			}
+			fs.renameSync(stagedPath, dbPath);
+			this._restartRequired = true;
+			const info = {
+				tier: 2 as const,
+				...common,
+				restartRequired: true
+			};
+			progress(
+				'restore:complete',
+				`restored database installed (previous kept at ${path.basename(
+					keptPath
+				)}); restart the daemon to resume ${common.channelCount} channel(s)`
+			);
+			this.emit('recovery:restored', {
+				exact: true,
+				framesApplied: result.framesApplied,
+				guardiansRepaired: 0,
+				epoch: head.writerEpoch,
+				tier: 2,
+				restartRequired: true
+			});
+			return info;
+		} finally {
+			this._restoreInFlight = false;
+		}
+	}
+
+	/**
+	 * Stop everything that touches the node or its database ahead of the
+	 * restore swap. Deliberately NOT destroy(): the daemon, its emitter (SSE
+	 * subscribers watching the restore) and the instance lock stay up so the
+	 * operator can read the status route and stop the daemon cleanly.
+	 */
+	private teardownNodeForRestart(): void {
+		if (this.backupTimer) {
+			clearInterval(this.backupTimer);
+			this.backupTimer = undefined;
+		}
+		if (this._sweepRefreshTimer) {
+			clearInterval(this._sweepRefreshTimer);
+			this._sweepRefreshTimer = undefined;
+		}
+		if (this._fallbackRecoveryTimer) {
+			clearInterval(this._fallbackRecoveryTimer);
+			this._fallbackRecoveryTimer = undefined;
+		}
+		this.paymentQueue?.removeAllListeners();
+		this.node.destroy();
+		void (this.wallet as Wallet | undefined)?.stop().catch(() => {
+			/* best effort */
+		});
+	}
+
+	/** Node identity secret; the capsule key and its embedded SCB derive from it. */
+	private nodeSecret(): Buffer {
+		if (!this._nodeSecret) {
+			this._nodeSecret = deriveLightningKeysFromMnemonic(
+				this.mnemonic,
+				undefined,
+				this.toCoinType(this.networkName)
+			).nodePrivateKey;
+		}
+		return this._nodeSecret;
 	}
 
 	/**
@@ -6568,16 +6949,26 @@ export class BeignetNode extends EventEmitter {
 	 * advertises option_provide_storage (and to capable peers on connect).
 	 */
 	private refreshStaticChannelBackup(): void {
-		if (this.destroyed) return;
+		if (this.destroyed || this._restartRequired) return;
 		try {
-			const { encoded } = this.exportStaticChannelBackup();
-			if (this.peerStorageEnabled) {
-				const sent = this.node.distributePeerStorage(
-					Buffer.from(encoded, 'utf8')
-				);
-				if (sent > 0) {
-					this.log('debug', 'Pushed SCB to peer storage', { peers: sent });
-				}
+			const { encoded, channelCount } = this.exportStaticChannelBackup();
+			if (!this.peerStorageEnabled) return;
+			// With a recovery mode on, the library's Recovery Capsule (which
+			// embeds this same SCB) is the blob storage peers hold, on its own
+			// rate-limited schedule; pushing the plain SCB beside it would just
+			// race it for the one slot a provider keeps (issue #453).
+			if (this.recoveryNodeConfig?.enabled) return;
+			// An empty backup can only destroy a provider's last good copy, and
+			// a seed-restored node connects to its old peers precisely to get
+			// that copy back. Push empties only after a real backup went out
+			// this run (the last channel closed: a truthful update).
+			if (channelCount === 0 && !this._pushedChannelBackup) return;
+			const sent = this.node.distributePeerStorage(
+				Buffer.from(encoded, 'utf8')
+			);
+			if (channelCount > 0) this._pushedChannelBackup = true;
+			if (sent > 0) {
+				this.log('debug', 'Pushed SCB to peer storage', { peers: sent });
 			}
 		} catch (err) {
 			this.log('warn', 'Static channel backup refresh failed', {
@@ -6592,6 +6983,60 @@ export class BeignetNode extends EventEmitter {
 	 * and may return anything.
 	 */
 	private handleRetrievedPeerStorage(peerPubkey: string, blob: Buffer): void {
+		// A Recovery Capsule (spec 5.4) is what a node in any recovery mode
+		// pushes; it embeds an SCB, so Tier 1 never regresses when the blob
+		// a peer returns happens to be the capsule (issue #453). Both the
+		// capsule and its SCB are keyed by the node secret, not the wallet
+		// seed the plain SCB uses.
+		const capsule = decodeRecoveryCapsuleBlob(blob, this.nodeSecret());
+		if (capsule) {
+			let embedded: IStaticChannelBackup;
+			try {
+				embedded = decodeScb(capsule.encryptedScb, this.nodeSecret());
+			} catch {
+				this.log(
+					'debug',
+					'Ignoring capsule whose embedded SCB does not decode',
+					{
+						fromPeer: peerPubkey
+					}
+				);
+				return;
+			}
+			const held = this._peerRetrievedCapsules.get(peerPubkey);
+			if (
+				!held ||
+				capsule.writerEpoch > held.writerEpoch ||
+				(capsule.writerEpoch === held.writerEpoch &&
+					capsule.latestSequence >= held.latestSequence)
+			) {
+				this._peerRetrievedCapsules.set(peerPubkey, {
+					blob: Buffer.from(blob),
+					writerEpoch: capsule.writerEpoch,
+					latestSequence: capsule.latestSequence,
+					inline: capsule.inlineRecoveryState !== undefined,
+					channelCount: embedded.channels.length,
+					receivedAt: Date.now()
+				});
+				this.log('info', 'Recovered capsule from peer storage', {
+					fromPeer: peerPubkey,
+					writerEpoch: capsule.writerEpoch.toString(),
+					latestSequence: capsule.latestSequence.toString(),
+					inline: capsule.inlineRecoveryState !== undefined,
+					channelCount: embedded.channels.length
+				});
+			}
+			// Surface the Tier 1 material under the wallet seed, the key
+			// restoreFromScb (POST /restore/scb) decodes with.
+			const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+			this.offerRetrievedScb(
+				encodeScb(embedded, seed),
+				embedded,
+				peerPubkey,
+				'capsule'
+			);
+			return;
+		}
 		let backup: IStaticChannelBackup;
 		const encoded = blob.toString('utf8');
 		try {
@@ -6603,19 +7048,43 @@ export class BeignetNode extends EventEmitter {
 			});
 			return;
 		}
-		if (
-			this._peerRetrievedScb &&
-			this._peerRetrievedScb.createdAt >= backup.createdAt
-		) {
-			return;
+		this.offerRetrievedScb(encoded, backup, peerPubkey, 'scb');
+	}
+
+	/**
+	 * Keep the most useful retrieved SCB: newest by createdAt, except that an
+	 * empty backup never displaces one with channels. A seed-restored node
+	 * pushes nothing while empty (refreshStaticChannelBackup), but a peer
+	 * may still hold an empty blob from a session that closed its last
+	 * channel, and for a restore the copy that names channels is the one
+	 * worth keeping (recovering an already-closed channel is harmless).
+	 */
+	private offerRetrievedScb(
+		encoded: string,
+		backup: IStaticChannelBackup,
+		fromPeer: string,
+		source: 'scb' | 'capsule'
+	): void {
+		const held = this._peerRetrievedScb;
+		if (held) {
+			if (backup.channels.length === 0 && held.channelCount > 0) return;
+			if (
+				held.createdAt >= backup.createdAt &&
+				!(held.channelCount === 0 && backup.channels.length > 0)
+			) {
+				return;
+			}
 		}
 		this._peerRetrievedScb = {
 			encoded,
 			createdAt: backup.createdAt,
-			fromPeer: peerPubkey
+			fromPeer,
+			channelCount: backup.channels.length,
+			source
 		};
 		this.log('info', 'Recovered SCB from peer storage', {
-			fromPeer: peerPubkey,
+			fromPeer,
+			source,
 			createdAt: backup.createdAt,
 			channelCount: backup.channels.length
 		});
@@ -6623,13 +7092,16 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * Newest valid SCB a peer has returned via BOLT 1 peer storage this
-	 * session, or null. Recovery stays explicit: feed `encoded` to
-	 * restoreFromScb (daemon: POST /restore/scb) when recovering.
+	 * session (directly, or embedded in a Recovery Capsule), or null.
+	 * Recovery stays explicit: feed `encoded` to restoreFromScb (daemon:
+	 * POST /restore/scb) when recovering.
 	 */
 	getPeerRetrievedBackup(): {
 		encoded: string;
 		createdAt: number;
 		fromPeer: string;
+		channelCount: number;
+		source: 'scb' | 'capsule';
 	} | null {
 		return this._peerRetrievedScb;
 	}

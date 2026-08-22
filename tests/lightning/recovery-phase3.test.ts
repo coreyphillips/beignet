@@ -1227,8 +1227,10 @@ describe('Recovery phase 3: review regressions', () => {
 		const storage = openStorage();
 		const node = createNode(5, storage, true);
 		const nodeKey = makeNodeConfig(5).nodePrivateKey;
-		// Startup composed and consumed the throttle window; this commit
-		// lands inside it, so the cached blob stays at the startup head.
+		// An empty node composes nothing at startup (issue #453), so the first
+		// commit composes and consumes the throttle window; the second lands
+		// inside it, and the cached blob stays at the first commit's head.
+		node.createInvoice({ amountMsat: 2_000n, description: 'opens-window' });
 		node.createInvoice({ amountMsat: 3_000n, description: 'inside-window' });
 		const cached = decodeRecoveryCapsuleBlob(
 			(node as unknown as { ourPeerStorageBlob: Buffer | null })

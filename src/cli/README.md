@@ -317,7 +317,7 @@ off-machine (e.g. via `beignet backup scb <destPath>` or `GET /backup/scb`).
 
 | Method / Command | Returns | Description |
 |--------|---------|-------------|
-| `getPeerRetrievedBackup()` | `{ encoded, createdAt, fromPeer } \| null` | Newest valid SCB a peer returned this session (daemon: `GET /backup/peer-retrieved`; CLI: `beignet backup peer-retrieved`) |
+| `getPeerRetrievedBackup()` | `{ encoded, createdAt, fromPeer, channelCount, source } \| null` | Most useful valid SCB a peer returned this session, directly (`source: 'scb'`) or embedded in a Recovery Capsule (`source: 'capsule'`, re-encoded under the wallet seed); an empty backup never displaces one naming channels (daemon: `GET /backup/peer-retrieved`; CLI: `beignet backup peer-retrieved`) |
 
 With `peerStorageEnabled` (default true) the node advertises
 `option_provide_storage` and uses it in both directions:
@@ -348,6 +348,7 @@ With `peerStorageEnabled` (default true) the node advertises
 | `restoreFromScb(encoded)` | `Promise<{ recovering, skipped, channelCount }>` | Recover channels from an SCB blob (daemon: `POST /restore/scb` with `{ encoded }` or `{ path }`; CLI: `beignet restore scb <file>`) |
 | `beignet restore db <backupFile>` | JSON result | Copy a database backup into place (OFFLINE, local CLI operation - no daemon call) |
 | `restoreFromGuardians()` | `Promise<{ exact, framesApplied, guardiansRepaired, epoch }>` | Restore from guardian replicas and start the node on the restored state (daemon: `POST /recovery/restore` with `{ confirm: true }`; CLI: `beignet recovery restore`) |
+| `restoreFromCapsules()` | `Promise<{ tier, channelCount, framesApplied, head, newestSeenHead, rejectedCandidates, restartRequired, recovering?, skipped? }>` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session (daemon: `POST /recovery/restore-capsule` with `{ confirm: true }`; CLI: `beignet recovery restore-capsule`). Tier 2 installs the exact state into a fresh database and holds the daemon until a restart; Tier 1 recovers the embedded SCB on the live node |
 
 Three very different restore modes:
 
@@ -396,7 +397,17 @@ BEIGNET_RECOVERY_PROFILE=crash-v1   # optional; crash-v1 is the only value
 - `off` (default): nothing changes.
 - `peer-storage`: the encrypted recovery journal is kept locally and a
   Recovery Capsule (SCB + journal) is distributed over BOLT 1 peer storage.
-  No guardians involved.
+  No guardians involved, so no fencing between devices either. Restore:
+  boot the same mnemonic on a FRESH data dir in this mode (an empty node
+  pushes nothing, so the peers keep the capsule), connect to the peers the
+  node had channels with, check `capsules` on `GET /recovery/status`, then
+  `POST /recovery/restore-capsule` with `{ "confirm": true }`. When an
+  inline journal validates (Tier 2) the exact state is installed into a
+  fresh database, the daemon holds in the `restart-required` state (every
+  route but the recovery surface answers 503 `NODE_RESTART_REQUIRED`) and a
+  restart resumes the channels; the previous database is kept beside it as
+  `<network>.db.pre-capsule-restore-<timestamp>`. Otherwise (Tier 1) the
+  embedded SCB is recovered on the live node like `POST /restore/scb`.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.
@@ -422,6 +433,10 @@ Operational notes:
   retries on a backoff; `GET /recovery/status` shows `gate: "quarantined"`.
   A normal restart does NOT need the guardians reachable: the persisted
   lease short-circuits the boot decision, only the confirmation waits.
+- Once confirmed, an idle node re-checks its lease with the guardians every
+  `BEIGNET_RECOVERY_LEASE_CHECK_MS` (default 300000; 0 disables) so a device
+  superseded while parked reports `fenced` within that window instead of at
+  its next commit or restart. An outage never changes the gate.
 - Restore-from-nothing: start the daemon with the same mnemonic, the same
   guardian set, and a FRESH data dir. The boot detects the namespace on the
   guardians and holds in a restore-pending state where only
@@ -1371,6 +1386,10 @@ beignet recovery restore    # take this namespace over from the guardian
                             # replicas and start the node on the restored
                             # state (restore-pending daemons only; channels
                             # RESUME instead of force-closing)
+beignet recovery restore-capsule  # peer-storage mode: restore from the
+                            # Recovery Capsules storage peers returned
+                            # (connect to the old channel peers first;
+                            # Tier 2 asks for a daemon restart)
 ```
 
 ### BOLT 12 Offers
@@ -1495,6 +1514,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_RECOVERY_MODE` | Recovery Protocol mode: `off`, `peer-storage`, `async-remote`, `quorum` (default: off; unknown values fall back to off) |
 | `BEIGNET_RECOVERY_GUARDIANS` | Guardian set for async-remote/quorum, comma-separated `<64-hex-x-only-pubkey>@<http(s) url>` (crash-v1: exactly three; malformed entries refuse startup) |
 | `BEIGNET_RECOVERY_PROFILE` | Recovery fault-model profile; `crash-v1` is the only accepted value and the default |
+| `BEIGNET_RECOVERY_LEASE_CHECK_MS` | Guardian modes: idle writer lease re-check cadence in ms (default: 300000; 0 disables) |
 
 ### Priority Order
 
@@ -1674,8 +1694,9 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |
 | POST | `/auth/keys/revoke` | `{ name }` | Disable a named API key immediately (admin scope; persisted, survives restarts) |
 | POST | `/auth/keys/rotate` | `{ name }` | Mint a new random secret for a named key; returned once, old secret dies immediately (admin scope; persisted) |
-| GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`fenced`), and the node view (startup gate, durability, last durable sequence, per-channel recovery status). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
+| GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`restart-required`/`fenced`), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session (`capsules`). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
 | POST | `/recovery/restore` | `{ confirm: true }` | Restore from guardian replicas and start the node on the restored state (restore-pending daemons only; channels RESUME instead of force-closing; the takeover permanently fences the previous writer). Progress streams over SSE as `recovery:restore-progress` |
+| POST | `/recovery/restore-capsule` | `{ confirm: true }` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session. Tier 2 installs the exact state into a fresh database and holds the daemon until a restart (503 `NODE_RESTART_REQUIRED` elsewhere); Tier 1 recovers the embedded SCB on the live node. Progress streams over SSE as `recovery:restore-progress` |
 | POST | `/stop` | `{ drain?, drainTimeoutMs? }` | Stop daemon. `drain: true` waits for in-flight payments before shutting down. |
 
 ### Server-Sent Events (SSE)

@@ -1488,12 +1488,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/backup/peer-retrieved': {
 				get: {
 					summary:
-						'Get the newest valid SCB a peer returned via BOLT 1 peer storage (recovery flow: reinstall with the mnemonic, connect to peers, fetch this, then POST /restore/scb with its encoded blob)',
+						'Get the newest valid SCB a peer returned via BOLT 1 peer storage, directly or embedded in a Recovery Capsule (recovery flow: reinstall with the mnemonic, connect to peers, fetch this, then POST /restore/scb with its encoded blob; in peer-storage mode prefer POST /recovery/restore-capsule, which can resume the channels)',
 					tags: ['Node'],
 					responses: {
 						'200': {
 							description:
-								'Encoded SCB blob, its creation timestamp, and the peer that returned it'
+								'Encoded SCB blob, its creation timestamp, channel count, source (scb or capsule), and the peer that returned it'
 						},
 						'404': {
 							description: 'No peer has returned a valid backup this session'
@@ -1522,12 +1522,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/recovery/status': {
 				get: {
 					summary:
-						'Recovery Protocol status: the configured mode and guardian set, the daemon state (disabled/running/restore-required/restoring/fenced), and the node view (startup gate, durability, last durable sequence, per-channel recovery status). A 404 means the daemon predates the feature; a 200 with state "disabled" means supported but off',
+						'Recovery Protocol status: the configured mode and guardian set, the daemon state (disabled/running/restore-required/restoring/restart-required/fenced), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session. A 404 means the daemon predates the feature; a 200 with state "disabled" means supported but off',
 					tags: ['Node'],
 					responses: {
 						'200': {
 							description:
-								'Mode, profile, guardians, daemon state, node recovery status (null when off or restore-pending), and restore progress when one is pending or running'
+								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head, and restore progress when one is pending or running'
 						}
 					}
 				}
@@ -1560,6 +1560,28 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'503': {
 							description:
 								'No guardian quorum reachable, or the epoch CAS retries were exhausted; retry when the set is reachable'
+						}
+					}
+				}
+			},
+			'/recovery/restore-capsule': {
+				post: {
+					summary:
+						'Peer-storage mode: restore this node from the Recovery Capsules storage peers returned this session (connect to the peers the node had channels with first; GET /recovery/status lists the candidates). Tier 2 (inline journal validates) installs the exact state into a fresh database, tears the node down and holds the daemon in the restart-required state: restart it to resume the channels; the previous database is kept beside it. Tier 1 (SCB only) recovers the channels on the live node like POST /restore/scb. Local durability has no fencing, so confirm must be true',
+					tags: ['Node'],
+					requestBody: bodyContent({ confirm: 'boolean' }),
+					responses: {
+						'200': {
+							description:
+								'Restore report: tier, channel count, frames applied, the restored head and the newest head seen, rejected candidates, and whether a restart is required (Tier 1 adds the recovering and skipped channel lists)'
+						},
+						'400': { description: 'Missing confirm' },
+						'404': {
+							description: 'No storage peer has returned a capsule this session'
+						},
+						'409': {
+							description:
+								'Not in peer-storage mode, a restore is already running, this database already holds state a restore would discard, or no candidate validates'
 						}
 					}
 				}
