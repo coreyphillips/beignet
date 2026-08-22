@@ -1567,13 +1567,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/recovery/restore-capsule': {
 				post: {
 					summary:
-						'Peer-storage mode: restore this node from the Recovery Capsules storage peers returned this session (connect to the peers the node had channels with first; GET /recovery/status lists the candidates). Tier 2 (inline journal validates) installs the exact state into a fresh database, tears the node down and holds the daemon in the restart-required state: restart it to resume the channels; the previous database is kept beside it. Tier 1 (SCB only) recovers the channels on the live node like POST /restore/scb. Local durability has no fencing, so confirm must be true',
+						'Peer-storage mode: restore this node from the Recovery Capsules storage peers returned this session (connect to the peers the node had channels with first; GET /recovery/status lists the candidates). Tier 2 (inline journal validates) installs the exact state into a fresh database, tears the node down and holds the daemon in the restart-required state: restart it to resume the channels; the previous database is kept beside it. Tier 1 (SCB only) recovers the channels on the live node like POST /restore/scb. Local durability has no fencing, so confirm must be true. A capsule that names guardians is refused unless unfenced is true: the labelled escape hatch for a guardian set that is gone, which cannot fence the previous writer (it keeps acting on the channels if it still runs) and never applies to a quorum-durability journal',
 					tags: ['Node'],
-					requestBody: bodyContent({ confirm: 'boolean' }),
+					requestBody: bodyContent({ confirm: 'boolean', unfenced: 'boolean' }),
 					responses: {
 						'200': {
 							description:
-								'Restore report: tier, channel count, frames applied, the restored head and the newest head seen, rejected candidates, the guardian locators the capsule names (credentials redacted; non-empty means restart in that guardian mode with this set), and whether a restart is required (Tier 1 adds the recovering and skipped channel lists)'
+								'Restore report: tier, channel count, frames applied, the restored head and the newest head seen, rejected candidates, whether a restart is required, and, after an unfenced restore, the guardians the capsule named under unfenced (Tier 1 adds the recovering and skipped channel lists)'
 						},
 						'400': { description: 'Missing confirm' },
 						'404': {
@@ -1581,7 +1581,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'Not in peer-storage mode, a restore is already running, this database already holds state a restore would discard, no candidate validates, or the best capsule names a guardian set (CAPSULE_RESTORE_GUARDIAN_BACKED: that state restores through the guardians with fencing; restart in the guardian mode with the locators under capsules.best.guardians, or the capsule-guardians handoff when they need credentials)'
+								'Not in peer-storage mode, a restore is already running, this database already holds state a restore would discard, no candidate validates, the best capsule names a guardian set and unfenced is not set (CAPSULE_RESTORE_GUARDIAN_BACKED: that state restores through the guardians with fencing; restart in the guardian mode with the locators under capsules.best.guardians, or the capsule-guardians handoff when they need credentials), or it carries a quorum-durability journal, which no unfenced restore can boot (CAPSULE_RESTORE_QUORUM_NAMESPACE)'
 						},
 						'500': {
 							description:

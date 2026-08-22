@@ -348,7 +348,7 @@ With `peerStorageEnabled` (default true) the node advertises
 | `restoreFromScb(encoded)` | `Promise<{ recovering, skipped, channelCount }>` | Recover channels from an SCB blob (daemon: `POST /restore/scb` with `{ encoded }` or `{ path }`; CLI: `beignet restore scb <file>`) |
 | `beignet restore db <backupFile>` | JSON result | Copy a database backup into place (OFFLINE, local CLI operation - no daemon call) |
 | `restoreFromGuardians()` | `Promise<{ exact, framesApplied, guardiansRepaired, epoch }>` | Restore from guardian replicas and start the node on the restored state (daemon: `POST /recovery/restore` with `{ confirm: true }`; CLI: `beignet recovery restore`) |
-| `restoreFromCapsules()` | `Promise<{ tier, channelCount, framesApplied, head, newestSeenHead, rejectedCandidates, guardians, restartRequired, recovering?, skipped? }>` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session (daemon: `POST /recovery/restore-capsule` with `{ confirm: true }`; CLI: `beignet recovery restore-capsule`). Tier 2 installs the exact state into a fresh database and holds the daemon until a restart; Tier 1 recovers the embedded SCB on the live node |
+| `restoreFromCapsules({ unfenced? })` | `Promise<{ tier, channelCount, framesApplied, head, newestSeenHead, rejectedCandidates, restartRequired, unfenced?, recovering?, skipped? }>` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session (daemon: `POST /recovery/restore-capsule` with `{ confirm: true }`; CLI: `beignet recovery restore-capsule`). Tier 2 installs the exact state into a fresh database and holds the daemon until a restart; Tier 1 recovers the embedded SCB on the live node |
 
 Three very different restore modes:
 
@@ -472,6 +472,15 @@ Operational notes:
   fencing, never unfenced from peer storage, and never by force-closing
   channels the guardians could resume exactly. The emergency SCB-only path
   is unchanged: `GET /backup/peer-retrieved` plus `POST /restore/scb`.
+- Guardian set gone for good: `{ "confirm": true, "unfenced": true }`
+  (`beignet recovery restore-capsule --unfenced`) is the labelled escape
+  hatch from spec 5.7. It restores the capsule anyway and CANNOT fence the
+  previous writer: if that device still runs, it keeps acting on the same
+  channels. The report carries the named guardians under `unfenced`, and
+  the restore progress stream says so. It never applies to a
+  quorum-durability journal (409 `CAPSULE_RESTORE_QUORUM_NAMESPACE`): such
+  a chain refuses to boot without its quorum, so its only paths are the
+  guardians or the SCB route.
 - Recovery events relayed over SSE and webhooks (always on):
   `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`,
   `recovery:guardian_unreachable`, `recovery:restore-progress`,
@@ -1414,6 +1423,9 @@ beignet recovery restore-capsule  # peer-storage mode: restore from the
                             # Recovery Capsules storage peers returned
                             # (connect to the old channel peers first;
                             # Tier 2 asks for a daemon restart)
+                            # --unfenced: guardian set gone; restores a
+                            # guardian-backed capsule WITHOUT fencing the
+                            # old writer (never for quorum journals)
 beignet recovery capsule-guardians  # the best retrieved capsule's guardian set
                             # with credentials, as config entries
 ```
@@ -1722,7 +1734,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/auth/keys/rotate` | `{ name }` | Mint a new random secret for a named key; returned once, old secret dies immediately (admin scope; persisted) |
 | GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`restart-required`/`fenced`), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session (`capsules`, whose `best` names the guardian locators the capsule carries, credentials redacted). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
 | POST | `/recovery/restore` | `{ confirm: true }` | Restore from guardian replicas and start the node on the restored state (restore-pending daemons only; channels RESUME instead of force-closing; the takeover permanently fences the previous writer). Progress streams over SSE as `recovery:restore-progress` |
-| POST | `/recovery/restore-capsule` | `{ confirm: true }` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session. Tier 2 installs the exact state into a fresh database and holds the daemon until a restart (503 `NODE_RESTART_REQUIRED` elsewhere); Tier 1 recovers the embedded SCB on the live node. Progress streams over SSE as `recovery:restore-progress` |
+| POST | `/recovery/restore-capsule` | `{ confirm: true, unfenced?: boolean }` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session. Tier 2 installs the exact state into a fresh database and holds the daemon until a restart (503 `NODE_RESTART_REQUIRED` elsewhere); Tier 1 recovers the embedded SCB on the live node. Progress streams over SSE as `recovery:restore-progress` |
 | POST | `/recovery/capsule-guardians` | `{ confirm: true }` | The guardian set the best retrieved capsule names, INCLUDING transport credentials, as config-file entries for `recoveryGuardians`. The status route redacts credentials; this admin handoff is how a seed restore whose guardians need authentication gets them back. Nothing is adopted or persisted |
 | POST | `/stop` | `{ drain?, drainTimeoutMs? }` | Stop daemon. `drain: true` waits for in-flight payments before shutting down. |
 

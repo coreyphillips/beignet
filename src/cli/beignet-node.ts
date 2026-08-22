@@ -89,8 +89,11 @@ import {
 	restoreBestRecoveryCapsule,
 	assertEmptyTarget,
 	CapsuleCandidateError,
-	GuardianDescriptor
+	GuardianDescriptor,
+	chainPromisedQuorum,
+	deriveRecoveryMasterKey
 } from '../lightning/recovery';
+import { getPublicKey } from '../lightning/crypto/ecdh';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
 import { INodeConfig } from '../lightning/node/types';
 import {
@@ -2133,8 +2136,17 @@ export class BeignetNode extends EventEmitter {
 	 * Local durability has no fencing (spec 5.6): if the old device is still
 	 * running, nothing stops it from acting on the same channels, which is
 	 * why the daemon route demands an explicit confirm.
+	 *
+	 * A capsule that names guardians belongs to a guardian-backed namespace
+	 * and is refused: that state restores through the guardian set with
+	 * fencing. `unfenced` is the explicitly labelled escape hatch spec 5.7
+	 * reserves for an operator whose guardian set is gone (issue #459): it
+	 * proceeds anyway, cannot fence the old writer and says so, and is
+	 * limited to a chain that never promised quorum, because a quorum-marked
+	 * journal refuses to boot unbarriered and so could only ever be restored
+	 * through its guardians or the SCB route.
 	 */
-	async restoreFromCapsules(): Promise<{
+	async restoreFromCapsules(options: { unfenced?: boolean } = {}): Promise<{
 		tier: 1 | 2;
 		channelCount: number;
 		framesApplied: number;
@@ -2142,6 +2154,11 @@ export class BeignetNode extends EventEmitter {
 		newestSeenHead: { writerEpoch: string; latestSequence: string };
 		rejectedCandidates: number;
 		restartRequired: boolean;
+		/**
+		 * Set when the escape hatch restored a guardian-backed capsule: the
+		 * old writer is NOT fenced, and these are the guardians it named.
+		 */
+		unfenced?: { guardians: IReportedGuardian[] };
 		recovering?: string[];
 		skipped?: Array<{ channelId: string; reason: string }>;
 	}> {
@@ -2283,27 +2300,66 @@ export class BeignetNode extends EventEmitter {
 			// handoff, and the restore is the guardian path after a restart.
 			// The SCB emergency path stays what it always was, the peer
 			// retrieved backup through the SCB restore route.
+			let unfenced: { guardians: IReportedGuardian[] } | undefined;
 			if (result.capsule.guardians.length > 0) {
-				staged.close();
-				dropStaged();
 				const locators = redactGuardians(result.capsule.guardians);
+				if (!options.unfenced) {
+					staged.close();
+					dropStaged();
+					this.log(
+						'warn',
+						'Capsule restore refused: capsule names a guardian set',
+						{
+							guardians: locators
+						}
+					);
+					throw new BeignetError(
+						'CAPSULE_RESTORE_GUARDIAN_BACKED',
+						`The best capsule names ${locators.length} guardian(s): its state ` +
+							'belongs to a guardian-backed namespace, which restores through ' +
+							'the guardian set with fencing, not from peer storage. Restart ' +
+							'in that recovery mode with the guardians the capsule names ' +
+							'(capsules.best.guardians on the status route, or the ' +
+							'capsule-guardians handoff when they need credentials); for an ' +
+							'emergency SCB-only recovery use the peer-retrieved backup with ' +
+							'the SCB restore route. An operator whose guardian set is gone ' +
+							'can pass unfenced: true, which cannot fence the old writer.'
+					);
+				}
+				// The escape hatch. A quorum-marked chain is still refused: the
+				// node refuses to run it unbarriered (lightning-node
+				// construction), so the install could never boot in this mode,
+				// and every exactness that chain certified rests on the
+				// guardians that are being bypassed.
+				if (
+					result.tier === 2 &&
+					chainPromisedQuorum(
+						staged,
+						deriveRecoveryMasterKey(this.nodeSecret()),
+						getPublicKey(this.nodeSecret())
+					)
+				) {
+					staged.close();
+					dropStaged();
+					throw new BeignetError(
+						'CAPSULE_RESTORE_QUORUM_NAMESPACE',
+						'The best capsule carries a quorum-durability journal, which ' +
+							'cannot boot without its guardian quorum even unfenced; ' +
+							'restore through the guardian set, or recover the channels ' +
+							'from the peer-retrieved backup with the SCB restore route.'
+					);
+				}
+				unfenced = { guardians: locators };
 				this.log(
 					'warn',
-					'Capsule restore refused: capsule names a guardian set',
-					{
-						guardians: locators
-					}
+					'UNFENCED capsule restore: the capsule names a guardian set and ' +
+						'the previous writer is not fenced; if it still runs, it keeps ' +
+						'acting on these channels',
+					{ guardians: locators }
 				);
-				throw new BeignetError(
-					'CAPSULE_RESTORE_GUARDIAN_BACKED',
-					`The best capsule names ${locators.length} guardian(s): its state ` +
-						'belongs to a guardian-backed namespace, which restores through ' +
-						'the guardian set with fencing, not from peer storage. Restart ' +
-						'in that recovery mode with the guardians the capsule names ' +
-						'(capsules.best.guardians on the status route, or the ' +
-						'capsule-guardians handoff when they need credentials); for an ' +
-						'emergency SCB-only recovery use the peer-retrieved backup with ' +
-						'the SCB restore route.'
+				progress(
+					'capsule:unfenced',
+					`restoring a guardian-backed capsule without fencing: the previous writer is NOT fenced (${locators.length} guardian(s) named)`
 				);
 			}
 			const common = {
@@ -2311,7 +2367,8 @@ export class BeignetNode extends EventEmitter {
 				framesApplied: result.framesApplied,
 				head,
 				newestSeenHead,
-				rejectedCandidates: result.rejectedCandidates
+				rejectedCandidates: result.rejectedCandidates,
+				...(unfenced ? { unfenced } : {})
 			};
 
 			if (result.tier === 1) {

@@ -1000,8 +1000,84 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 						auth: { type: 'bearer', token: 'bearer-secret' }
 					}
 				]);
+
+				// The escape hatch (issue #459): unfenced restores the
+				// guardian-backed capsule anyway. The source chain is local
+				// durability, so Tier 2 installs, and the report says what
+				// was not fenced. A non-boolean flag is a parameter error.
+				const badFlag = await request(
+					port,
+					'POST',
+					'/recovery/restore-capsule',
+					{ confirm: true, unfenced: 'yes' },
+					ADMIN_KEY
+				);
+				expect(badFlag.status).to.equal(400);
+				const progress: string[] = [];
+				daemon.node.on('recovery:restore-progress', (data) =>
+					progress.push((data as { type: string }).type)
+				);
+				const hatch = await request(
+					port,
+					'POST',
+					'/recovery/restore-capsule',
+					{ confirm: true, unfenced: true },
+					ADMIN_KEY
+				);
+				expect(hatch.status, JSON.stringify(hatch.body)).to.equal(200);
+				const report = hatch.body.result as {
+					tier: number;
+					restartRequired: boolean;
+					unfenced?: { guardians: Array<Record<string, unknown>> };
+				};
+				expect(report.tier).to.equal(2);
+				expect(report.restartRequired).to.equal(true);
+				expect(report.unfenced?.guardians).to.deep.equal([
+					{
+						guardianId: GUARDIAN_ID,
+						transports: [{ type: 'https', url: 'https://g1.example/' }]
+					}
+				]);
+				expect(progress).to.include('capsule:unfenced');
+				expect((await statusOf(port, ADMIN_KEY)).state).to.equal(
+					'restart-required'
+				);
 			} finally {
 				await daemon.stop();
+			}
+
+			// The Tier 1 shape under the hatch recovers on the live node like
+			// any SCB restore, and reports the unfenced guardians too.
+			const tier1Dir = tmpDir('capsule-guardian-tier1');
+			const tier1Daemon = await startDaemon({
+				...OFFLINE,
+				dataDir: tier1Dir,
+				recoveryMode: 'peer-storage'
+			});
+			try {
+				const tier1Port = portOf(tier1Daemon);
+				retrieved(tier1Daemon, PEER_A, scbOnlyBlob);
+				const hatch = await request(
+					tier1Port,
+					'POST',
+					'/recovery/restore-capsule',
+					{ confirm: true, unfenced: true }
+				);
+				expect(hatch.status, JSON.stringify(hatch.body)).to.equal(200);
+				const report = hatch.body.result as {
+					tier: number;
+					restartRequired: boolean;
+					recovering: string[];
+					unfenced?: { guardians: unknown[] };
+				};
+				expect(report.tier).to.equal(1);
+				expect(report.restartRequired).to.equal(false);
+				expect(report.recovering).to.deep.equal([]);
+				expect(report.unfenced?.guardians).to.have.length(1);
+				expect((await statusOf(tier1Port)).state).to.equal('running');
+			} finally {
+				await tier1Daemon.stop();
+				fs.rmSync(tier1Dir, { recursive: true, force: true });
 			}
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
@@ -1170,6 +1246,21 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 				expect(probeResult.capsules.candidates).to.equal(1);
 				const locators = probeResult.capsules.best!.guardians;
 				expect(locators).to.have.length(3);
+				// A quorum chain has no escape hatch: the install could never
+				// boot unbarriered, so even unfenced is refused (issue #459).
+				const hatch = await request(
+					portProbe,
+					'POST',
+					'/recovery/restore-capsule',
+					{ confirm: true, unfenced: true }
+				);
+				expect(hatch.status).to.equal(409);
+				expect((hatch.body.error as { code: string }).code).to.equal(
+					'CAPSULE_RESTORE_QUORUM_NAMESPACE'
+				);
+				expect(
+					fs.existsSync(path.join(dirB, 'regtest.db.capsule-restore'))
+				).to.equal(false);
 				const recoveredUris = locators.map(
 					(g) => `${g.guardianId}@${g.transports[0].url}`
 				);
