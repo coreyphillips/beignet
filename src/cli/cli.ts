@@ -2105,9 +2105,14 @@ async function handleRecovery(): Promise<void> {
 	if (sub === 'restore-capsule') {
 		// Peer-storage mode: restore from the Recovery Capsules storage peers
 		// returned this session. Typing the command is the confirmation; a
-		// Tier 2 result asks for a daemon restart.
+		// Tier 2 result asks for a daemon restart. --unfenced is the labelled
+		// escape hatch for a capsule that names a guardian set whose
+		// guardians are gone: it cannot fence the previous writer.
 		return outputResult(
-			await httpRequest('POST', '/recovery/restore-capsule', { confirm: true })
+			await httpRequest('POST', '/recovery/restore-capsule', {
+				confirm: true,
+				...(hasFlag('--unfenced') ? { unfenced: true } : {})
+			})
 		);
 	}
 	if (sub === 'capsule-guardians') {
@@ -2371,10 +2376,13 @@ On-chain:
                                          restore-required state: fresh database,
                                          namespace held by the guardians; channels
                                          RESUME instead of force-closing)
-  recovery restore-capsule               Peer-storage mode: restore from the
+  recovery restore-capsule [--unfenced]  Peer-storage mode: restore from the
                                          Recovery Capsules storage peers returned
                                          (connect to the old channel peers first;
-                                         Tier 2 asks for a daemon restart)
+                                         Tier 2 asks for a daemon restart).
+                                         --unfenced restores a capsule that names
+                                         guardians WITHOUT fencing the old writer
+                                         (guardian set gone; never for quorum)
   recovery capsule-guardians             The guardian set the best retrieved
                                          capsule names, credentials included, as
                                          config entries for recoveryGuardians

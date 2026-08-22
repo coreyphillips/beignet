@@ -235,6 +235,7 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	CAPSULE_RESTORE_TARGET_DIRTY: 409,
 	CAPSULE_RESTORE_FAILED: 409,
 	CAPSULE_RESTORE_GUARDIAN_BACKED: 409,
+	CAPSULE_RESTORE_QUORUM_NAMESPACE: 409,
 	CAPSULE_RESTORE_INSTALL_FAILED: 500
 };
 
@@ -1905,7 +1906,10 @@ async function bootDaemon(
 			// peers returned (spec 5.4). Local durability has no fencing, so
 			// an old device still running would keep acting on the same
 			// channels; a bare POST must not start that by accident.
-			const { confirm } = body as { confirm?: boolean };
+			const { confirm, unfenced } = body as {
+				confirm?: boolean;
+				unfenced?: boolean;
+			};
 			if (confirm !== true) {
 				return failure(
 					'INVALID_PARAMS',
@@ -1914,7 +1918,10 @@ async function bootDaemon(
 						'{"confirm": true} to proceed'
 				);
 			}
-			return success(await node.restoreFromCapsules());
+			if (unfenced !== undefined && typeof unfenced !== 'boolean') {
+				return failure('INVALID_PARAMS', 'unfenced must be a boolean');
+			}
+			return success(await node.restoreFromCapsules({ unfenced }));
 		},
 		'POST /recovery/capsule-guardians': (body) => {
 			// The one place a retrieved capsule's guardian credentials leave
