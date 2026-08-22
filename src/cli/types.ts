@@ -538,6 +538,9 @@ export interface BeignetConfig {
 	 *  and the default when a guardian mode is configured. Env:
 	 *  BEIGNET_RECOVERY_PROFILE. */
 	recoveryProfile?: string;
+	/** Guardian modes: idle writer lease re-check cadence in ms (default
+	 *  300000, 0 disables). Env: BEIGNET_RECOVERY_LEASE_CHECK_MS. */
+	recoveryLeaseCheckIntervalMs?: number;
 }
 
 export interface HealthInfo {
@@ -974,5 +977,9 @@ export interface BeignetNodeEvents {
 		framesApplied: number;
 		guardiansRepaired: number;
 		epoch: string;
+		/** Capsule restores only: 2 = exact state installed, 1 = SCB only. */
+		tier?: 1 | 2;
+		/** Capsule restores only: true after a Tier 2 install replaced the database. */
+		restartRequired?: boolean;
 	}) => void;
 }

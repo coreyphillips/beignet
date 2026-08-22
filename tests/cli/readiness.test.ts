@@ -75,7 +75,7 @@ describe('Mainnet Readiness Checklist', () => {
 		expect(hasCriticalFailure).to.be.false;
 	});
 
-	it('all 11 check names are defined', () => {
+	it('all 12 check names are defined', () => {
 		const expectedNames = [
 			'STORAGE_CONFIGURED',
 			'CHAIN_BACKEND_CONNECTED',
@@ -87,12 +87,13 @@ describe('Mainnet Readiness Checklist', () => {
 			'ELECTRUM_REDUNDANCY',
 			'BACKUP_CONFIGURED',
 			'SUFFICIENT_CHANNELS',
-			'CHANNEL_BALANCE_HEALTH'
+			'CHANNEL_BALANCE_HEALTH',
+			'CHANNEL_BACKUP'
 		];
 		for (const name of expectedNames) {
 			expect(name).to.be.a('string');
 		}
-		expect(expectedNames).to.have.length(11);
+		expect(expectedNames).to.have.length(12);
 	});
 
 	it('ELECTRUM_REDUNDANCY warns when only 1 server', () => {

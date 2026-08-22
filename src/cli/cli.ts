@@ -480,7 +480,8 @@ async function handleStart(): Promise<void> {
 			logLevel: config.logLevel,
 			recoveryMode: config.recoveryMode,
 			recoveryGuardians: config.recoveryGuardians,
-			recoveryProfile: config.recoveryProfile
+			recoveryProfile: config.recoveryProfile,
+			recoveryLeaseCheckIntervalMs: config.recoveryLeaseCheckIntervalMs
 		});
 
 		writePidFile(process.pid, daemonPort);
@@ -2101,11 +2102,21 @@ async function handleRecovery(): Promise<void> {
 			await httpRequest('POST', '/recovery/restore', { confirm: true })
 		);
 	}
+	if (sub === 'restore-capsule') {
+		// Peer-storage mode: restore from the Recovery Capsules storage peers
+		// returned this session. Typing the command is the confirmation; a
+		// Tier 2 result asks for a daemon restart.
+		return outputResult(
+			await httpRequest('POST', '/recovery/restore-capsule', { confirm: true })
+		);
+	}
 	output({
 		ok: false,
 		error: {
 			code: 'INVALID_PARAMS',
-			message: 'Usage: beignet recovery status | beignet recovery restore'
+			message:
+				'Usage: beignet recovery status | beignet recovery restore | ' +
+				'beignet recovery restore-capsule'
 		}
 	});
 	process.exitCode = 1;
@@ -2350,6 +2361,10 @@ On-chain:
                                          restore-required state: fresh database,
                                          namespace held by the guardians; channels
                                          RESUME instead of force-closing)
+  recovery restore-capsule               Peer-storage mode: restore from the
+                                         Recovery Capsules storage peers returned
+                                         (connect to the old channel peers first;
+                                         Tier 2 asks for a daemon restart)
 
 Peers:
   peer connect <pubkey> <host> <port>    Connect to peer

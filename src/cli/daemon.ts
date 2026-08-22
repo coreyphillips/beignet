@@ -172,6 +172,17 @@ const RESTORE_PENDING_ROUTES = new Set([
 	'POST /stop'
 ]);
 
+/**
+ * Routes a daemon still serves after a Tier 2 capsule restore replaced its
+ * database: the node underneath is gone until a restart builds one on the
+ * restored state.
+ */
+const RESTART_REQUIRED_ROUTES = new Set([
+	'GET /recovery/status',
+	'GET /openapi.json',
+	'POST /stop'
+]);
+
 /** HTTP status for a failure envelope; unmapped codes are server faults. */
 const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	INVALID_PARAMS: 400,
@@ -217,7 +228,13 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	RESTORE_UNKNOWN_NAMESPACE: 404,
 	RESTORE_CONFLICT: 409,
 	RESTORE_HEAD_UNVERIFIABLE: 502,
-	RESTORE_TARGET_UNSUPPORTED: 400
+	RESTORE_TARGET_UNSUPPORTED: 400,
+	NODE_RESTART_REQUIRED: 503,
+	CAPSULE_RESTORE_UNSUPPORTED: 409,
+	CAPSULE_RESTORE_NO_CANDIDATES: 404,
+	CAPSULE_RESTORE_TARGET_DIRTY: 409,
+	CAPSULE_RESTORE_FAILED: 409,
+	CAPSULE_RESTORE_INSTALL_FAILED: 500
 };
 
 export function statusForErrorCode(code: string): number {
@@ -436,6 +453,22 @@ async function bootDaemon(
 			'INVALID_PARAMS',
 			`Unknown recovery profile "${opts.recoveryProfile}"; crash-v1 is ` +
 				'the only accepted value (and the default)'
+		);
+	}
+	if (
+		opts.recoveryLeaseCheckIntervalMs !== undefined &&
+		(!Number.isInteger(opts.recoveryLeaseCheckIntervalMs) ||
+			opts.recoveryLeaseCheckIntervalMs < 0 ||
+			opts.recoveryLeaseCheckIntervalMs > 2_147_483_647)
+	) {
+		// Node's timers turn NaN and anything past 2^31-1 ms into a 1 ms
+		// delay, which would poll the guardian set continuously.
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Invalid recovery lease check interval "${String(
+				opts.recoveryLeaseCheckIntervalMs
+			)}"; BEIGNET_RECOVERY_LEASE_CHECK_MS must be an integer between 0 ` +
+				'and 2147483647 (0 disables the check)'
 		);
 	}
 	const guardianEntries = opts.recoveryGuardians ?? [];
@@ -1866,6 +1899,22 @@ async function bootDaemon(
 			}
 			return success(await node.restoreFromGuardians());
 		},
+		'POST /recovery/restore-capsule': async (body) => {
+			// Peer-storage mode: restore from the Recovery Capsules storage
+			// peers returned (spec 5.4). Local durability has no fencing, so
+			// an old device still running would keep acting on the same
+			// channels; a bare POST must not start that by accident.
+			const { confirm } = body as { confirm?: boolean };
+			if (confirm !== true) {
+				return failure(
+					'INVALID_PARAMS',
+					'Capsule restore replaces this database with the retrieved ' +
+						'state and, at Tier 2, requires a daemon restart; pass ' +
+						'{"confirm": true} to proceed'
+				);
+			}
+			return success(await node.restoreFromCapsules());
+		},
 
 		// ── Webhooks ──
 		'POST /webhooks/register': (body) => {
@@ -2117,6 +2166,18 @@ async function bootDaemon(
 						'is fresh and the guardian set holds its namespace. Run the ' +
 						'admin-scoped restore under /recovery, or check its status ' +
 						'route.'
+				)
+			);
+			return;
+		}
+		if (node.restartRequired && !RESTART_REQUIRED_ROUTES.has(routeKey)) {
+			endWithResult(
+				res,
+				failure(
+					'NODE_RESTART_REQUIRED',
+					'A capsule restore replaced this database; restart the daemon ' +
+						'to run on the restored state (the status route under ' +
+						'/recovery reports the restore).'
 				)
 			);
 			return;

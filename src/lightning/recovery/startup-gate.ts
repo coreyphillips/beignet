@@ -132,6 +132,76 @@ export class GuardianStartupGate {
 	}
 
 	/**
+	 * Fencing is permanent: this writer lost the namespace, and no later
+	 * answer can give it back. Only a restore can. Callers have already
+	 * returned on every fenced-before path, so this is always a transition
+	 * and the fenced listeners (the node's hard freeze) run exactly once.
+	 */
+	private fenceOn(
+		lease: IWriterLeaseKeys,
+		states: GuardianState[],
+		confirming: number
+	): IConfirmationOutcome {
+		this.supersededBy = states.find((state) => state.lease.epoch > lease.epoch);
+		this.state = 'fenced';
+		this.emit({
+			type: 'gate:fenced',
+			detail:
+				`epoch ${lease.epoch} was superseded` +
+				(this.supersededBy
+					? ` by epoch ${this.supersededBy.lease.epoch}`
+					: '') +
+				'; channels are frozen and no peer traffic is permitted',
+			currentState: this.supersededBy
+		});
+		for (const listener of this.fencedListeners) listener();
+		return {
+			state: 'fenced',
+			confirming,
+			supersededBy: this.supersededBy
+		};
+	}
+
+	/**
+	 * Re-ask the guardian set whether THIS lease is still current, for a
+	 * gate that is already open (issue #455).
+	 *
+	 * An idle writer otherwise learns of a takeover only on its next commit
+	 * (the barrier) or its next restart (confirm), which on a parked node
+	 * can be days. This is the cheap periodic check in between, and it is
+	 * deliberately asymmetric: a proven newer epoch fences exactly as
+	 * confirm would (one bound guardian's receipt-covered state naming a
+	 * higher epoch is the same evidence the barrier fences on), but nothing
+	 * else touches the gate. Silence, a partial answer or a transport error
+	 * is not evidence of anything, and unlike confirm this must never
+	 * downgrade a confirmed gate to quarantined: that would freeze a
+	 * healthy running node on every guardian outage. Errors propagate so
+	 * the caller can log them; the gate state is unchanged on any throw.
+	 */
+	async recheck(lease: IWriterLeaseKeys): Promise<IConfirmationOutcome> {
+		if (this.state !== 'confirmed') {
+			return {
+				state: this.state,
+				confirming: 0,
+				supersededBy: this.supersededBy
+			};
+		}
+		const answer = await this.config.replicator.confirmOwnership(lease);
+		if ((this.state as StartupGateState) === 'fenced') {
+			// Fenced concurrently (a barrier pass, or a racing confirm).
+			return {
+				state: 'fenced',
+				confirming: 0,
+				supersededBy: this.supersededBy
+			};
+		}
+		if (answer.superseded) {
+			return this.fenceOn(lease, answer.states, answer.confirming);
+		}
+		return { state: 'confirmed', confirming: answer.confirming };
+	}
+
+	/**
 	 * Ask the guardian set whether THIS lease is still the current writer.
 	 *
 	 * Confirmation requires `required` distinct guardians whose signed state
@@ -188,29 +258,7 @@ export class GuardianStartupGate {
 		}
 
 		if (superseded) {
-			// Fencing is permanent: this writer lost the namespace, and no
-			// later answer can give it back. Only a restore can.
-			this.supersededBy = states.find(
-				(state) => state.lease.epoch > lease.epoch
-			);
-			this.state = 'fenced';
-			this.emit({
-				type: 'gate:fenced',
-				detail:
-					`epoch ${lease.epoch} was superseded` +
-					(this.supersededBy
-						? ` by epoch ${this.supersededBy.lease.epoch}`
-						: '') +
-					'; channels are frozen and no peer traffic is permitted',
-				currentState: this.supersededBy
-			});
-			// Always a transition: every fenced-before path returned above.
-			for (const listener of this.fencedListeners) listener();
-			return {
-				state: 'fenced',
-				confirming,
-				supersededBy: this.supersededBy
-			};
+			return this.fenceOn(lease, states, confirming);
 		}
 
 		if (confirming < this.config.required) {

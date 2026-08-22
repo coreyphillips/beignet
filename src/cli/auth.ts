@@ -262,6 +262,7 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /restore/scb': [],
 	// The guardian-restore takeover permanently fences the previous writer.
 	'POST /recovery/restore': [],
+	'POST /recovery/restore-capsule': [],
 	'POST /watchtower/add': [],
 	'DELETE /watchtower/remove': [],
 	'POST /webhooks/register': [],

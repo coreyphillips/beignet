@@ -75,6 +75,19 @@ import { PaymentDirection, PaymentStatus } from '../node/types';
  * defect proven on the scratch, every error the real install raises is a
  * TARGET problem and propagates.
  */
+/**
+ * restoreBestRecoveryCapsule found no candidate it could restore: nothing
+ * decrypted, conflicting heads, or no candidate validated. Distinct from
+ * every other throw, which means the TARGET (or scratch) failed and the
+ * candidates are not to blame.
+ */
+export class CapsuleCandidateError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'CapsuleCandidateError';
+	}
+}
+
 export class CapsuleReplayError extends Error {
 	readonly cause: unknown;
 	constructor(cause: unknown) {
@@ -1273,7 +1286,7 @@ export function restoreBestRecoveryCapsule(
 		.map((blob) => decodeRecoveryCapsuleBlob(blob, nodeSecret))
 		.filter((c): c is RecoveryCapsule => c !== null);
 	if (candidates.length === 0) {
-		throw new Error(
+		throw new CapsuleCandidateError(
 			`no recovery capsule among ${blobs.length} candidate blobs`
 		);
 	}
@@ -1328,7 +1341,7 @@ export function restoreBestRecoveryCapsule(
 		const group = sorted.slice(i, j);
 		for (const other of group) {
 			if (!other.frameHash.equals(group[0].frameHash)) {
-				throw new Error(
+				throw new CapsuleCandidateError(
 					`conflicting recovery capsule heads at epoch ${group[0].writerEpoch} sequence ${group[0].latestSequence}: two histories share the same height, refusing to choose`
 				);
 			}
@@ -1407,7 +1420,7 @@ export function restoreBestRecoveryCapsule(
 			rejectedCandidates: candidates.length - 1
 		};
 	}
-	throw new Error(
+	throw new CapsuleCandidateError(
 		'no recovery capsule candidate validates: every inline journal failed verification and no SCB decodes'
 	);
 }

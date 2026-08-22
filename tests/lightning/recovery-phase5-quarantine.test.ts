@@ -72,6 +72,7 @@ interface IServed {
 	server: GuardianHttpServer;
 	client: GuardianClient;
 	id: Buffer;
+	port: number;
 }
 
 async function serve(index: number): Promise<IServed> {
@@ -86,6 +87,7 @@ async function serve(index: number): Promise<IServed> {
 	return {
 		guardian,
 		server,
+		port,
 		id: GUARDIAN_IDS[index],
 		client: new GuardianClient({
 			url: `http://127.0.0.1:${port}`,
@@ -378,6 +380,97 @@ describe('Recovery phase 5: startup quarantine', () => {
 			(stored as { state: 'present'; lease: IWriterLeaseKeys }).lease
 				.confirmedAt
 		).to.equal(lease.confirmedAt);
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('recheck keeps a confirmed gate open through an outage and fences on a proven takeover', async function (): Promise<void> {
+		// Issue #455: the idle re-check must be asymmetric. Guardians going
+		// dark is not evidence of anything (confirm would re-quarantine; the
+		// re-check must not), while one signed higher-epoch state is the
+		// same proof the barrier fences on.
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const secret = nodeSecretOf(12);
+		const rep = replicatorFor(storage, served, secret);
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		const root = deriveRecoveryRoot(secret);
+
+		const events: IStartupGateEvent[] = [];
+		const gate = gateFor(storage, rep, events);
+		let fencedListenerRuns = 0;
+		gate.onFenced(() => {
+			fencedListenerRuns++;
+		});
+		expect((await gate.confirm(lease)).state).to.equal('confirmed');
+
+		// Still current: the re-check confirms and changes nothing.
+		const still = await gate.recheck(lease);
+		expect(still.state).to.equal('confirmed');
+		expect(still.confirming).to.equal(3);
+		expect(gate.permitsPeerTraffic()).to.equal(true);
+
+		// Every guardian dark: whether the fan-out surfaces as an error or
+		// as zero confirmations, the gate stays OPEN (confirm would have
+		// re-quarantined here).
+		const ports = served.map((entry) => entry.port);
+		for (const entry of served) await entry.server.close();
+		try {
+			const dark = await gate.recheck(lease);
+			expect(dark.state).to.equal('confirmed');
+			expect(dark.confirming).to.equal(0);
+		} catch {
+			// An error is the other acceptable answer; the assertions below
+			// prove it changed nothing.
+		}
+		expect(gate.getState()).to.equal('confirmed');
+		expect(gate.permitsPeerTraffic()).to.equal(true);
+		expect(events.some((e) => e.type === 'gate:quarantined')).to.equal(false);
+		expect(fencedListenerRuns).to.equal(0);
+
+		// Guardians return on the SAME ports (the replicator's clients are
+		// bound to them) and another device takes the epoch.
+		for (const [i, entry] of served.entries()) {
+			entry.server = new GuardianHttpServer({ guardian: entry.guardian });
+			await entry.server.listen(ports[i]);
+		}
+		const head = (await served[0].client.getHead(root.recoveryId))
+			.state as GuardianState;
+		const newWriter = generateWriterKey();
+		for (const entry of served) {
+			expect(
+				(
+					await entry.client.acquireEpoch({
+						protocolVersion: 1,
+						guardianSetId: SET_ID,
+						expectedState: head,
+						newEpoch: head.lease.epoch + 1n,
+						newWriterPublicKey: newWriter.publicKey,
+						...signAcquisition(
+							SET_ID,
+							head,
+							head.lease.epoch + 1n,
+							newWriter,
+							root.rootSecret
+						)
+					})
+				).status
+			).to.equal(GuardianStatus.OK);
+		}
+
+		const fenced = await gate.recheck(lease);
+		expect(fenced.state).to.equal('fenced');
+		expect(fenced.supersededBy?.lease.epoch).to.equal(lease.epoch + 1n);
+		expect(gate.permitsPeerTraffic()).to.equal(false);
+		expect(events.some((e) => e.type === 'gate:fenced')).to.equal(true);
+		expect(fencedListenerRuns, 'hard-freeze hook ran once').to.equal(1);
+		// Permanent, and idempotent: a later re-check reports fenced without
+		// re-running the freeze.
+		const again = await gate.recheck(lease);
+		expect(again.state).to.equal('fenced');
+		expect(fencedListenerRuns).to.equal(1);
 		await shutdown(served);
 		storage.close();
 	});

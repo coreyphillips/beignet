@@ -16,12 +16,21 @@ import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
+import { resolveConfig } from '../../src/cli/config';
 import { BeignetError } from '../../src/cli/errors';
 import {
 	GuardianHttpServer,
 	ReferenceGuardian,
+	composeRecoveryCapsule,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
+import { decodeScb, encodeScb } from '../../src/lightning/backup/scb';
+import {
+	LnCoinType,
+	deriveLightningKeysFromMnemonic
+} from '../../src/lightning/keys/wallet-keys';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import * as bip39 from 'bip39';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -88,11 +97,13 @@ function request(
 	port: number,
 	method: string,
 	urlPath: string,
-	body?: Record<string, unknown>
+	body?: Record<string, unknown>,
+	token?: string
 ): Promise<{ status: number; body: Record<string, unknown> }> {
 	return new Promise((resolve, reject) => {
 		const payload = body ? JSON.stringify(body) : undefined;
 		const headers: Record<string, string | number> = {};
+		if (token) headers['Authorization'] = `Bearer ${token}`;
 		if (payload) {
 			headers['Content-Type'] = 'application/json';
 			headers['Content-Length'] = Buffer.byteLength(payload);
@@ -130,6 +141,25 @@ async function waitFor(
 		if (Date.now() > deadline) throw new Error('waitFor timed out');
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
+}
+
+function readinessCheck(
+	body: Record<string, unknown>,
+	name: string
+): { status: string; severity: string; message: string } {
+	const checks = (
+		body.result as {
+			checks: Array<{
+				name: string;
+				status: string;
+				severity: string;
+				message: string;
+			}>;
+		}
+	).checks;
+	const check = checks.find((c) => c.name === name);
+	expect(check, `readiness check ${name} present`).to.not.equal(undefined);
+	return check!;
 }
 
 async function expectStartRefused(
@@ -206,6 +236,31 @@ describe('Recovery surface: configuration validation (pre-boot)', () => {
 		);
 	});
 
+	it('refuses a lease check interval Node would turn into a 1 ms poll', async () => {
+		// NaN (an unparseable env value) and anything past 2^31-1 ms both
+		// become a 1 ms timer in Node, which would hammer the guardian set.
+		process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS = 'soon';
+		try {
+			expect(
+				Number.isNaN(resolveConfig({}).recoveryLeaseCheckIntervalMs)
+			).to.equal(true);
+		} finally {
+			delete process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS;
+		}
+		await expectStartRefused(
+			{ dataDir: dir, recoveryLeaseCheckIntervalMs: Number.NaN },
+			/BEIGNET_RECOVERY_LEASE_CHECK_MS must be an integer/
+		);
+		await expectStartRefused(
+			{ dataDir: dir, recoveryLeaseCheckIntervalMs: 2 ** 31 },
+			/BEIGNET_RECOVERY_LEASE_CHECK_MS must be an integer/
+		);
+		await expectStartRefused(
+			{ dataDir: dir, recoveryLeaseCheckIntervalMs: 1.5 },
+			/BEIGNET_RECOVERY_LEASE_CHECK_MS must be an integer/
+		);
+	});
+
 	it('refuses an unknown recovery profile', async () => {
 		await expectStartRefused(
 			{ dataDir: dir, recoveryProfile: 'byzantine-v9' },
@@ -242,11 +297,35 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 		expect(result.node).to.equal(null);
 	});
 
+	it('GET /readiness warns on CHANNEL_BACKUP when recovery is off', async () => {
+		const res = await request(portOf(daemon), 'GET', '/readiness');
+		expect(res.status).to.equal(200);
+		const check = readinessCheck(res.body, 'CHANNEL_BACKUP');
+		expect(check.status).to.equal('WARN');
+		expect(check.severity).to.equal('WARNING');
+		expect(check.message).to.match(/force-close/);
+	});
+
 	it('POST /recovery/restore without confirm is refused', async () => {
 		const res = await request(portOf(daemon), 'POST', '/recovery/restore', {});
 		expect(res.status).to.equal(400);
 		expect((res.body.error as { code: string }).code).to.equal(
 			'INVALID_PARAMS'
+		);
+	});
+
+	it('POST /recovery/restore-capsule with recovery off is unsupported', async () => {
+		const res = await request(
+			portOf(daemon),
+			'POST',
+			'/recovery/restore-capsule',
+			{
+				confirm: true
+			}
+		);
+		expect(res.status).to.equal(409);
+		expect((res.body.error as { code: string }).code).to.equal(
+			'CAPSULE_RESTORE_UNSUPPORTED'
 		);
 	});
 
@@ -282,9 +361,453 @@ describe('Recovery surface: peer-storage mode', () => {
 			expect(result.state).to.equal('running');
 			expect(result.node?.durability).to.equal('local');
 			expect(result.node?.gate).to.equal('disabled');
+			const readiness = await request(portOf(daemon), 'GET', '/readiness');
+			const check = readinessCheck(readiness.body, 'CHANNEL_BACKUP');
+			expect(check.status).to.equal('WARN');
+			expect(check.message).to.match(/storage peers/);
 		} finally {
 			await daemon.stop();
 			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe('Recovery surface: capsule restore in peer-storage mode', () => {
+	const NODE_SECRET = deriveLightningKeysFromMnemonic(
+		MNEMONIC,
+		undefined,
+		LnCoinType.REGTEST
+	).nodePrivateKey;
+	const PEER_A = '02' + 'a1'.repeat(32);
+	const PEER_B = '02' + 'b2'.repeat(32);
+	const ADMIN_KEY = 'a'.repeat(64);
+	const MONITOR_KEY = 'b'.repeat(64);
+	const emptyScb = (network: string): string =>
+		encodeScb(
+			{ version: 1, network, createdAt: Date.now(), channels: [] },
+			NODE_SECRET
+		);
+
+	/** Feed a blob in as if a storage peer had returned it on reconnect. */
+	function retrieved(daemon: IStartedDaemon, peer: string, blob: Buffer): void {
+		daemon.node.getNode().emit('peer_storage:retrieved', peer, blob);
+	}
+
+	async function statusOf(
+		port: number,
+		token?: string
+	): Promise<{
+		state: string;
+		capsules: {
+			candidates: number;
+			best: { inline: boolean; latestSequence: string } | null;
+		};
+	}> {
+		const res = await request(
+			port,
+			'GET',
+			'/recovery/status',
+			undefined,
+			token
+		);
+		expect(res.status).to.equal(200);
+		return res.body.result as {
+			state: string;
+			capsules: {
+				candidates: number;
+				best: { inline: boolean; latestSequence: string } | null;
+			};
+		};
+	}
+
+	it('recognizes capsules, surfaces the embedded SCB, and restores Tier 2 across a restart', async function (): Promise<void> {
+		this.timeout(180_000);
+		const dirA = tmpDir('capsule-a');
+		const dirB = tmpDir('capsule-b');
+		try {
+			// Device A: one journaled commit (an invoice), which composes the
+			// capsule the library would push to storage peers. A second
+			// candidate is the SCB-only twin of the same head (the degraded
+			// compose), to prove the restore picks the replica that validates
+			// inline rather than the first one that arrived.
+			const deviceA = await startDaemon({
+				...OFFLINE,
+				dataDir: dirA,
+				recoveryMode: 'peer-storage'
+			});
+			const portA = portOf(deviceA);
+			const invoice = await request(portA, 'POST', '/invoice/create', {
+				amountSats: 2100,
+				description: 'capsule restore probe'
+			});
+			expect(invoice.body.ok, JSON.stringify(invoice.body)).to.equal(true);
+			const paymentHash = (invoice.body.result as { paymentHash: string })
+				.paymentHash;
+			const inlineBlob = (
+				deviceA.node.getNode() as unknown as {
+					ourPeerStorageBlob: Buffer | null;
+				}
+			).ourPeerStorageBlob;
+			expect(
+				inlineBlob,
+				'a node holding state composes a capsule'
+			).to.not.equal(null);
+			const storageA = (deviceA.node as unknown as { storage: SqliteStorage })
+				.storage;
+			const scbOnlyBlob = composeRecoveryCapsule({
+				storage: storageA,
+				encryptedScb: emptyScb('bcrt'),
+				nodeSecret: NODE_SECRET,
+				allowInline: false
+			}).blob;
+			// A capsule this seed's node composed on ANOTHER network: testnet,
+			// regtest and signet share a coin type, so it authenticates here.
+			const foreignNetworkBlob = composeRecoveryCapsule({
+				storage: storageA,
+				encryptedScb: emptyScb('tb'),
+				nodeSecret: NODE_SECRET
+			}).blob;
+			await deviceA.stop();
+
+			// Device B: same seed, fresh database, peer-storage mode. It boots
+			// normally (there is no guardian set to ask), and pushes nothing
+			// while empty, so the peers keep the capsule for it. It carries
+			// API keys so the restore can prove a revocation survives.
+			const bootB = (): Promise<IStartedDaemon> =>
+				startDaemon({
+					...OFFLINE,
+					dataDir: dirB,
+					recoveryMode: 'peer-storage',
+					apiToken: ADMIN_KEY,
+					apiKeys: [{ name: 'monitor', key: MONITOR_KEY, scopes: ['readonly'] }]
+				});
+			const get = (
+				port: number,
+				urlPath: string,
+				token = ADMIN_KEY
+			): Promise<{ status: number; body: Record<string, unknown> }> =>
+				request(port, 'GET', urlPath, undefined, token);
+			const post = (
+				port: number,
+				urlPath: string,
+				body: Record<string, unknown>
+			): Promise<{ status: number; body: Record<string, unknown> }> =>
+				request(port, 'POST', urlPath, body, ADMIN_KEY);
+			let deviceB = await bootB();
+			let portB = portOf(deviceB);
+			let report: { head: { writerEpoch: string; latestSequence: string } };
+			try {
+				// A revoked key must stay dead across the restore: the override
+				// lives in the database the swap replaces. So must a webhook.
+				expect((await get(portB, '/info', MONITOR_KEY)).status).to.equal(200);
+				const revoke = await post(portB, '/auth/keys/revoke', {
+					name: 'monitor'
+				});
+				expect(revoke.status).to.equal(200);
+				expect((await get(portB, '/info', MONITOR_KEY)).status).to.equal(401);
+				const hook = await post(portB, '/webhooks/register', {
+					url: 'http://127.0.0.1:9/hook',
+					events: ['payment:received']
+				});
+				expect(hook.status, JSON.stringify(hook.body)).to.equal(200);
+
+				expect(
+					(
+						deviceB.node.getNode() as unknown as {
+							ourPeerStorageBlob: Buffer | null;
+						}
+					).ourPeerStorageBlob,
+					'an empty node pushes no capsule'
+				).to.equal(null);
+				expect((await statusOf(portB, ADMIN_KEY)).capsules).to.deep.equal({
+					candidates: 0,
+					best: null
+				});
+				expect((await get(portB, '/backup/peer-retrieved')).status).to.equal(
+					404
+				);
+				const early = await post(portB, '/recovery/restore-capsule', {
+					confirm: true
+				});
+				expect(early.status).to.equal(404);
+				expect((early.body.error as { code: string }).code).to.equal(
+					'CAPSULE_RESTORE_NO_CANDIDATES'
+				);
+				const unconfirmed = await post(portB, '/recovery/restore-capsule', {});
+				expect(unconfirmed.status).to.equal(400);
+
+				// Garbage is still ignored, so is the other-network capsule
+				// (left in, its newer head would win the selection and fail the
+				// whole restore); the capsules are recognized.
+				retrieved(deviceB, PEER_A, crypto.randomBytes(200));
+				retrieved(deviceB, PEER_A, foreignNetworkBlob);
+				expect((await statusOf(portB, ADMIN_KEY)).capsules.candidates).to.equal(
+					0
+				);
+				expect((await get(portB, '/backup/peer-retrieved')).status).to.equal(
+					404
+				);
+				retrieved(deviceB, PEER_A, scbOnlyBlob);
+				let status = await statusOf(portB, ADMIN_KEY);
+				expect(status.capsules.candidates).to.equal(1);
+				expect(status.capsules.best?.inline).to.equal(false);
+				retrieved(deviceB, PEER_B, inlineBlob!);
+				status = await statusOf(portB, ADMIN_KEY);
+				expect(status.capsules.candidates).to.equal(2);
+				expect(status.capsules.best?.inline).to.equal(true);
+				// The same peer returning the SCB-only twin of the SAME head on
+				// a later reconnect must not displace the inline replica.
+				retrieved(deviceB, PEER_B, scbOnlyBlob);
+				status = await statusOf(portB, ADMIN_KEY);
+				expect(status.capsules.candidates).to.equal(2);
+				expect(status.capsules.best?.inline).to.equal(true);
+
+				// Tier 1 never regresses: the embedded SCB is surfaced under the
+				// wallet seed, the key POST /restore/scb decodes with.
+				const surfaced = await get(portB, '/backup/peer-retrieved');
+				expect(surfaced.status).to.equal(200);
+				const scb = surfaced.body.result as {
+					encoded: string;
+					source: string;
+					channelCount: number;
+				};
+				expect(scb.source).to.equal('capsule');
+				expect(scb.channelCount).to.equal(0);
+				const decoded = decodeScb(
+					scb.encoded,
+					bip39.mnemonicToSeedSync(MNEMONIC)
+				);
+				expect(decoded.network).to.equal('bcrt');
+
+				const progress: string[] = [];
+				const restored: Array<Record<string, unknown>> = [];
+				deviceB.node.on('recovery:restore-progress', (data) =>
+					progress.push((data as { type: string }).type)
+				);
+				deviceB.node.on('recovery:restored', (data) =>
+					restored.push(data as Record<string, unknown>)
+				);
+				const res = await post(portB, '/recovery/restore-capsule', {
+					confirm: true
+				});
+				expect(res.body.ok, JSON.stringify(res.body)).to.equal(true);
+				const result = res.body.result as {
+					tier: number;
+					framesApplied: number;
+					rejectedCandidates: number;
+					restartRequired: boolean;
+					head: { writerEpoch: string; latestSequence: string };
+				};
+				report = result;
+				expect(result.tier).to.equal(2);
+				expect(result.framesApplied).to.be.at.least(1);
+				expect(result.rejectedCandidates).to.equal(1);
+				expect(result.restartRequired).to.equal(true);
+				expect(progress).to.include('capsule:installed');
+				expect(progress).to.include('restore:complete');
+				expect(restored).to.have.length(1);
+				expect(restored[0].tier).to.equal(2);
+
+				// The daemon holds for a restart: nothing but the recovery
+				// surface answers, and the status says why.
+				const held = await get(portB, '/info');
+				expect(held.status).to.equal(503);
+				expect((held.body.error as { code: string }).code).to.equal(
+					'NODE_RESTART_REQUIRED'
+				);
+				const heldStatus = await statusOf(portB, ADMIN_KEY);
+				expect(heldStatus.state).to.equal('restart-required');
+				expect(heldStatus.capsules.candidates).to.equal(2);
+			} finally {
+				await deviceB.stop();
+			}
+
+			// The previous database is kept beside the restored one; the swap
+			// marker cleared.
+			const files = fs.readdirSync(dirB);
+			expect(files).to.include('regtest.db');
+			const kept = files.find((f) =>
+				f.startsWith('regtest.db.pre-capsule-restore-')
+			);
+			expect(kept).to.not.equal(undefined);
+			expect(files.some((f) => f.endsWith('.capsule-restore'))).to.equal(false);
+			expect(files).to.not.include('regtest.capsule-restore.json');
+
+			const expectRestoredState = async (port: number): Promise<void> => {
+				const after = await statusOf(port, ADMIN_KEY);
+				expect(after.state).to.equal('running');
+				expect(after.capsules.candidates).to.equal(0);
+				const found = await get(port, `/invoice?paymentHash=${paymentHash}`);
+				expect(found.status, JSON.stringify(found.body)).to.equal(200);
+				expect(
+					(found.body.result as { description: string }).description
+				).to.equal('capsule restore probe');
+				// Daemon state followed the operator: the revoked key is still
+				// dead and the webhook is still registered.
+				expect((await get(port, '/info', MONITOR_KEY)).status).to.equal(401);
+				const hooks = await get(port, '/webhooks');
+				expect(hooks.status).to.equal(200);
+				expect(
+					(hooks.body.result as Array<{ url: string }>).map((h) => h.url)
+				).to.deep.equal(['http://127.0.0.1:9/hook']);
+			};
+
+			// Restart: the node runs on A's exact state.
+			deviceB = await bootB();
+			portB = portOf(deviceB);
+			try {
+				await expectRestoredState(portB);
+			} finally {
+				await deviceB.stop();
+			}
+
+			// Kill points inside the swap. The marker makes the two renames
+			// durable: a boot that finds it finishes whatever a crash left,
+			// from either side of the window, and never opens an empty
+			// database instead.
+			const dbPath = path.join(dirB, 'regtest.db');
+			const stagedPath = path.join(dirB, 'regtest.db.capsule-restore');
+			const markerPath = path.join(dirB, 'regtest.capsule-restore.json');
+			const marker = JSON.stringify({
+				version: 1,
+				stagedAt: Date.now(),
+				staged: 'regtest.db.capsule-restore',
+				keep: 'regtest.db.pre-capsule-restore-replay',
+				head: report.head,
+				tier: 2
+			});
+			// (1) Crash between the renames: the canonical database was moved
+			// aside and the staged one not yet installed.
+			fs.renameSync(dbPath, stagedPath);
+			fs.writeFileSync(markerPath, marker);
+			deviceB = await bootB();
+			portB = portOf(deviceB);
+			try {
+				await expectRestoredState(portB);
+			} finally {
+				await deviceB.stop();
+			}
+			expect(fs.existsSync(markerPath)).to.equal(false);
+			expect(fs.existsSync(stagedPath)).to.equal(false);
+			// (2) Crash before the first rename: the empty pre-restore database
+			// is still canonical beside the fully staged one.
+			fs.renameSync(dbPath, stagedPath);
+			fs.copyFileSync(path.join(dirB, kept!), dbPath);
+			fs.writeFileSync(markerPath, marker);
+			deviceB = await bootB();
+			portB = portOf(deviceB);
+			try {
+				await expectRestoredState(portB);
+			} finally {
+				await deviceB.stop();
+			}
+			expect(fs.existsSync(markerPath)).to.equal(false);
+			expect(
+				fs.existsSync(path.join(dirB, 'regtest.db.pre-capsule-restore-replay'))
+			).to.equal(true);
+		} finally {
+			fs.rmSync(dirA, { recursive: true, force: true });
+			fs.rmSync(dirB, { recursive: true, force: true });
+		}
+	});
+
+	it('falls back to Tier 1 on the live node, and refuses a database holding state', async function (): Promise<void> {
+		this.timeout(60_000);
+		const dir = tmpDir('capsule-tier1');
+		const dirDirty = tmpDir('capsule-dirty');
+		try {
+			const daemon = await startDaemon({
+				...OFFLINE,
+				dataDir: dir,
+				recoveryMode: 'peer-storage'
+			});
+			const port = portOf(daemon);
+			try {
+				// An SCB-only capsule (no inline journal): Tier 1 is the whole
+				// answer and needs no restart.
+				const scratch = new SqliteStorage(':memory:');
+				scratch.open();
+				const blob = composeRecoveryCapsule({
+					storage: scratch,
+					encryptedScb: emptyScb('bcrt'),
+					nodeSecret: NODE_SECRET
+				}).blob;
+				scratch.close();
+				retrieved(daemon, PEER_A, blob);
+				const res = await request(port, 'POST', '/recovery/restore-capsule', {
+					confirm: true
+				});
+				expect(res.body.ok, JSON.stringify(res.body)).to.equal(true);
+				const report = res.body.result as {
+					tier: number;
+					restartRequired: boolean;
+					recovering: string[];
+				};
+				expect(report.tier).to.equal(1);
+				expect(report.restartRequired).to.equal(false);
+				expect(report.recovering).to.deep.equal([]);
+				const info = await request(port, 'GET', '/info');
+				expect(info.status).to.equal(200);
+				expect((await statusOf(port)).state).to.equal('running');
+
+				// A staged file that cannot be written is an operational
+				// failure, not a candidate defect: 500, and the daemon keeps
+				// serving. (A directory squatting on the staged path makes the
+				// open fail.)
+				fs.mkdirSync(path.join(dir, 'regtest.db.capsule-restore'));
+				const broken = await request(
+					port,
+					'POST',
+					'/recovery/restore-capsule',
+					{ confirm: true }
+				);
+				expect(broken.status).to.equal(500);
+				expect((broken.body.error as { code: string }).code).to.equal(
+					'CAPSULE_RESTORE_INSTALL_FAILED'
+				);
+				fs.rmdirSync(path.join(dir, 'regtest.db.capsule-restore'));
+				expect((await statusOf(port)).state).to.equal('running');
+				expect((await request(port, 'GET', '/info')).status).to.equal(200);
+			} finally {
+				await daemon.stop();
+			}
+
+			// A database that already holds state is refused, not discarded.
+			const dirty = await startDaemon({
+				...OFFLINE,
+				dataDir: dirDirty,
+				recoveryMode: 'peer-storage'
+			});
+			try {
+				const portDirty = portOf(dirty);
+				const own = await request(portDirty, 'POST', '/invoice/create', {
+					amountSats: 1,
+					description: 'local state'
+				});
+				expect(own.body.ok).to.equal(true);
+				const ownBlob = (
+					dirty.node.getNode() as unknown as {
+						ourPeerStorageBlob: Buffer | null;
+					}
+				).ourPeerStorageBlob;
+				retrieved(dirty, PEER_B, ownBlob!);
+				const res = await request(
+					portDirty,
+					'POST',
+					'/recovery/restore-capsule',
+					{ confirm: true }
+				);
+				expect(res.status).to.equal(409);
+				expect((res.body.error as { code: string }).code).to.equal(
+					'CAPSULE_RESTORE_TARGET_DIRTY'
+				);
+				expect((await statusOf(portDirty)).state).to.equal('running');
+			} finally {
+				await dirty.stop();
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+			fs.rmSync(dirDirty, { recursive: true, force: true });
 		}
 	});
 });
@@ -300,13 +823,20 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 			// Device A: register the namespace and make one journaled commit
 			// durable on the quorum (an invoice persists its payment secret
 			// through the safety-transition layer).
+			// Device A stays RUNNING and idle through the takeover below: the
+			// periodic lease check (issue #455) is what must notice it.
 			const deviceA = await startDaemon({
 				...OFFLINE,
 				dataDir: dirA,
 				recoveryMode: 'quorum',
-				recoveryGuardians: guardianUris
+				recoveryGuardians: guardianUris,
+				recoveryLeaseCheckIntervalMs: 200
 			});
 			const portA = portOf(deviceA);
+			const fencedOnA: Array<Record<string, unknown>> = [];
+			deviceA.node.on('recovery:fenced', (data) =>
+				fencedOnA.push(data as Record<string, unknown>)
+			);
 			const statusA = await request(portA, 'GET', '/recovery/status');
 			expect(statusA.status).to.equal(200);
 			const resultA = statusA.body.result as {
@@ -330,7 +860,14 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 				).node;
 				return node !== null && BigInt(node.lastDurableSequence) >= 1n;
 			});
-			await deviceA.stop();
+			const confirmedA = await request(portA, 'GET', '/recovery/status');
+			expect(
+				(confirmedA.body.result as { node: { gate: string } }).node.gate
+			).to.equal('confirmed');
+			const readyA = await request(portA, 'GET', '/readiness');
+			const backupA = readinessCheck(readyA.body, 'CHANNEL_BACKUP');
+			expect(backupA.status).to.equal('PASS');
+			expect(backupA.message).to.match(/guardian quorum \(quorum/);
 
 			// Device B: same seed, fresh database. The boot decision must
 			// refuse to register a second genesis and hold for restore.
@@ -405,8 +942,46 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 				};
 				expect(afterResult.state).to.equal('running');
 				expect(afterResult.node?.durability).to.equal('quorum');
+
+				// The idle old writer learns it was superseded from the lease
+				// check alone: no commit, no restart. Same event and payload
+				// as the barrier and startup-gate fences.
+				await waitFor(async () => {
+					const res = await request(portA, 'GET', '/recovery/status');
+					return (res.body.result as { state: string }).state === 'fenced';
+				});
+				const fencedA = await request(portA, 'GET', '/recovery/status');
+				expect(
+					(fencedA.body.result as { node: { gate: string } }).node.gate
+				).to.equal('fenced');
+				expect(fencedOnA).to.have.length(1);
+				expect((fencedOnA[0].supersededBy as { epoch: string }).epoch).to.equal(
+					'2'
+				);
+				// The barrier noticing the same takeover on A's next commit must
+				// not relay a second recovery:fenced: one fence, one event.
+				const late = await request(portA, 'POST', '/invoice/create', {
+					amountSats: 5,
+					description: 'after the takeover'
+				});
+				expect(late.status, JSON.stringify(late.body)).to.equal(200);
+				await waitFor(async () => {
+					const res = await request(portA, 'GET', '/recovery/status');
+					return (res.body.result as { node: { fenced: boolean } }).node.fenced;
+				});
+				expect(fencedOnA).to.have.length(1);
+
+				// A fenced node is not mainnet ready, whatever else passes.
+				const fencedReady = await request(portA, 'GET', '/readiness');
+				const fencedCheck = readinessCheck(fencedReady.body, 'CHANNEL_BACKUP');
+				expect(fencedCheck.status).to.equal('FAIL');
+				expect(fencedCheck.severity).to.equal('CRITICAL');
+				expect((fencedReady.body.result as { ready: boolean }).ready).to.equal(
+					false
+				);
 			} finally {
 				await deviceB.stop();
+				await deviceA.stop();
 			}
 		} finally {
 			await shutdown(served);

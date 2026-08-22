@@ -330,16 +330,31 @@ async function main() {
 	// start; the parent replays the identical command sequence every life,
 	// which is what makes the ordinals deterministic.
 	let commitCount = 0;
+	// Sends made from INSIDE a commit (the Recovery Capsule refresh rides
+	// the commit's onCommitted hook, so a peer_storage push can leave the
+	// socket before realCommit returns) happen after the transaction is
+	// durable. Their schedule lines are held until the commit line is out,
+	// or the rehearsal would file a durable-after boundary before
+	// post-commit:N and classify its kill as an abandonment.
+	let commitDepth = 0;
+	const deferredSends = [];
 	const rec = node.recovery;
 	const realCommit = rec.commit.bind(rec);
 	rec.commit = (transition) => {
 		commitCount++;
 		if (ARM === `pre-commit:${commitCount}`) freeze(ARM);
-		const result = realCommit(transition);
+		commitDepth++;
+		let result;
+		try {
+			result = realCommit(transition);
+		} finally {
+			commitDepth--;
+		}
 		if (result && result.committed !== false) {
 			out(`evt:commit:${commitCount}`);
 			if (ARM === `post-commit:${commitCount}`) freeze(ARM);
 		}
+		for (const line of deferredSends.splice(0)) out(line);
 		return result;
 	};
 
@@ -355,7 +370,11 @@ async function main() {
 		const name = MESSAGE_NAMES.MessageType[type] || String(type);
 		const k = (sendCounts.get(name) || 0) + 1;
 		sendCounts.set(name, k);
-		out(`evt:send:${name}:${k}`);
+		if (commitDepth > 0) {
+			deferredSends.push(`evt:send:${name}:${k}`);
+		} else {
+			out(`evt:send:${name}:${k}`);
+		}
 		if (env.CHAOS_DEBUG === '1' && name === 'ERROR') {
 			out(
 				`dbg:error-payload:${payload

@@ -9,6 +9,7 @@ Revision 4 (2026-08-01): the Phase 4 gating deliverables. The guardian transport
 Revision 5 (2026-08-02): Phase 6 as built. Durability becomes a property a FRAME DECLARES rather than a runtime setting, which is what turns exact restore from an assertion into evidence: 5.8 gains the sticky-quorum rule (a chain containing a quorum frame can never be followed by an unbarriered one, so a certified head reading 'quorum' also rules out the unbarriered frames a restore cannot see), and 5.6's StateUncertain marking gains its one and only exit, the wire-safety proof, derived from the restore and re-verified rather than configured. Compaction gains a retain floor: guardians hold an immutable chain from a root-committed origin and accept only logHead.sequence + 1, so a frame pruned before it replicated wedges that guardian permanently and, under a barrier, blocks every channel on the node. Replication gains what a barrier needs to stand on: receipts bound to the namespace, epoch and frame hash before they can release anything, a single-flight monotone watermark, a fence that requires a signed higher epoch rather than one endpoint's unsigned rejection, and genuinely pipelined appends per 5.3.
 Revision 6 (2026-08-04): Phase 7 acceptance corrected before the chaos work starts. The process-level SIGKILL target is a production LightningNode assembly running in a dedicated child process, not the CLI daemon, whose recovery surface (section 8) remains unimplemented; naming the daemon as the kill target would have tested configuration plumbing that does not exist yet. The dedicated child carries the complete kill-point matrix. Once the section 8 daemon surface ships, a representative daemon SIGKILL smoke test must prove the daemon constructs and restarts the same recovery-enabled assembly; validating that configuration surface is that test's job, and the child harness makes no claim about it.
 Revision 7 (2026-08-21): the section 8 daemon surface is implemented (issue #435) and section 8 is corrected to the API as built: no monolithic RecoveryConfig (the barrier and startup gate are constructed outside the node through the shared assembly helper buildGuardianRecovery, which also makes the boot decision); restore is the pre-node RestoreDriver against an empty database rather than the never-built node.restoreFromRecoveryReplicas, surfaced on the daemon as a restore-pending boot state plus POST /recovery/restore; the event set is recovery:durable / recovery:fenced / recovery:backfill-lost from the node plus embedder-origin recovery:guardian_unreachable / recovery:restore-progress / recovery:restored. The representative daemon SIGKILL smoke test from revision 6 is now unblocked and follows as its own PR.
+Revision 8 (2026-08-22): follow-ups from the beignet-umbrel recovery UI (issues #453, #454, #455). The capsule restore side is implemented on the daemon: retrieved blobs are recognized as capsules (keyed by the node secret, unlike the seed-keyed plain SCB), the embedded SCB is surfaced so Tier 1 never regresses under a recovery mode, and POST /recovery/restore-capsule performs the 5.4 restore rule for peer-storage mode (Tier 2 into a fresh database followed by a restart-required hold, Tier 1 on the live node). An empty node no longer pushes a backup that would destroy a provider's last good copy, and under a recovery mode only the capsule goes to storage peers. An idle confirmed writer re-checks its lease on a cadence and fences on a proven newer epoch (5.6). GET /readiness gains the CHANNEL_BACKUP check.
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
 Audience: an implementing agent or engineer. Every code reference below was verified against the codebase as of beignet 0.7.0 (2026-07-22). Re-verify line numbers before editing; file and symbol names are the stable anchors.
 
@@ -317,7 +318,7 @@ Encryption: HKDF info `'beignet-recovery-capsule-v1'`, then the existing `padOwn
 
 For small wallets (one or two channels), the complete recovery state will often fit inline, making Tier 2 restore possible from peer_storage alone with zero new infrastructure. That alone justifies Phase 3 shipping before guardians exist.
 
-Restore side: on reconnect after seed restore, collect `'peer_storage:retrieved'` blobs from all storage peers, decrypt all candidate capsules, and select the highest `(writerEpoch, sequence)` whose hash chain validates. BOLT 1 requires providers to return the blob early after reconnection, before normal channel recovery, which is exactly the window this needs.
+Restore side: on reconnect after seed restore, collect `'peer_storage:retrieved'` blobs from all storage peers, decrypt all candidate capsules, and select the highest `(writerEpoch, sequence)` whose hash chain validates. Implemented in the library as `restoreBestRecoveryCapsule` (one validated operation over the raw candidate blobs, against an EMPTY target) and on the daemon as `POST /recovery/restore-capsule` (section 8). Two push-side rules make the retrieval reachable in practice (issue #453): a node whose tables hold no recoverable state composes no capsule, because an empty push would replace the provider's last good copy before a seed-restored device could act on it; and with a recovery mode on, the capsule is the ONLY blob the node pushes (it embeds the SCB), so the plain SCB never races it for the one slot a provider keeps. BOLT 1 requires providers to return the blob early after reconnection, before normal channel recovery, which is exactly the window this needs.
 
 ### 5.5 Guardian protocol (Phase 4)
 
@@ -517,6 +518,13 @@ Phone A comes back online:
                         definitive epoch rejection as a hard freeze signal,
                         but there is a window before it learns this
   in local mode: no fencing at all
+
+An idle writer (no commits, no restart) would otherwise never run either
+check. Implemented (issue #455): a confirmed writer re-asks the guardian set
+on a cadence (daemon default five minutes) and fences on the same evidence a
+refused append yields, one bound guardian's receipt-covered state naming a
+higher epoch; the re-check never downgrades a confirmed gate on an outage,
+because silence is not evidence either way.
 ```
 
 Additional startup rule (closes the pre-reestablish window): channels may not leave quarantine, and the node may not even connect to channel peers, until current writer ownership is confirmed with the quorum (or the operator explicitly runs in a mode without guardians). A stale device therefore discovers it was superseded before it can touch the Lightning protocol.
@@ -802,6 +810,9 @@ an unknown MODE falls back to off per the daemon's typo rule, which is safe
 because a quorum-marked database still refuses to start unbarriered)
 BEIGNET_RECOVERY_PROFILE = crash-v1 (the only accepted value in v1; no
 free-form quorum tuples, per 12.1)
+BEIGNET_RECOVERY_LEASE_CHECK_MS = idle writer lease re-check cadence in the
+guardian modes (default 300000; 0 disables; see 5.6; an integer in
+0..2147483647, anything else refuses startup)
 ```
 
 Plus REST endpoints on the daemon: `GET /recovery/status` (readonly scope; the
@@ -813,6 +824,43 @@ whose namespace the guardian set holds, and every other route answers 503
 NODE_RESTORE_PENDING in that state). The daemon relays all six recovery
 events over SSE and webhooks, and `beignet recovery status|restore` are the
 CLI commands.
+
+Peer-storage mode restores through `POST /recovery/restore-capsule` (admin
+scope, requires `{"confirm": true}` because local durability has no fencing:
+an old device still running keeps acting on the same channels). The flow:
+boot the fresh database in peer-storage mode (it pushes nothing while empty),
+connect to the peers the node had channels with, read the candidates under
+`capsules` on `GET /recovery/status`, then restore. Tier 2 (an inline journal
+validates) installs the exact state into a fresh database file, carries the
+daemon-local state that lives beside the channel state across (persisted
+API-key rotations and revocations, webhooks, peer addresses), tears the node
+down, swaps the files (the previous database is kept beside it as
+`<network>.db.pre-capsule-restore-<timestamp>`) and holds the daemon in the
+`restart-required` state, where every route but the recovery surface answers
+503 NODE_RESTART_REQUIRED; a restart resumes the channels through
+reestablish. The swap is made durable by a marker
+(`<network>.capsule-restore.json`, written before the renames, cleared after):
+a boot that finds it finishes the swap from whichever side of the crash
+window it was interrupted on, so no restart lands on an empty database.
+Tier 1 (SCB only) recovers the channels on the live node exactly like
+`POST /restore/scb`. Retrieval keeps only capsules whose embedded SCB names
+this network (testnet, regtest and signet share a coin type, so a capsule
+from the same seed on another of them authenticates) and, at an equal head,
+never lets an SCB-only twin displace an inline replica. Refusals: 409
+CAPSULE_RESTORE_UNSUPPORTED (not peer-storage mode), 404
+CAPSULE_RESTORE_NO_CANDIDATES, 409 CAPSULE_RESTORE_TARGET_DIRTY (the database
+already holds state a restore would discard; use a fresh data directory), 409
+CAPSULE_RESTORE_FAILED (no candidate validates, or conflicting heads), 500
+CAPSULE_RESTORE_INSTALL_FAILED (the restored database could not be written or
+swapped in: an operational fault, not a candidate defect). `GET /backup/peer-retrieved`
+answers in every mode: the SCB embedded in a retrieved capsule is re-encoded
+under the wallet seed and reported with `source: 'capsule'`. CLI:
+`beignet recovery restore-capsule`.
+
+`GET /readiness` carries a `CHANNEL_BACKUP` check derived from this surface:
+PASS for a guardian mode with a confirmed gate, WARN for peer-storage and
+off, FAIL (CRITICAL, so `ready` is false) when the node is fenced or the
+namespace lost its backfill.
 
 ## 9. Implementation phases and acceptance criteria
 

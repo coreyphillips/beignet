@@ -68,6 +68,7 @@ describe('OpenAPI Spec Completeness', () => {
 		'/restore/scb',
 		'/recovery/status',
 		'/recovery/restore',
+		'/recovery/restore-capsule',
 		'/send',
 		'/stats',
 		'/events',

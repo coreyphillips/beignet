@@ -29,10 +29,16 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { ChannelState } from '../../src/lightning/channel/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
+	decodeScb,
 	encodeScb,
 	IStaticChannelBackup
 } from '../../src/lightning/backup/scb';
 import { BeignetNode } from '../../src/cli/beignet-node';
+import { composeRecoveryCapsule } from '../../src/lightning/recovery';
+import {
+	LnCoinType,
+	deriveLightningKeysFromMnemonic
+} from '../../src/lightning/keys/wallet-keys';
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -522,14 +528,63 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 			'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 		const seed = bip39.mnemonicToSeedSync(mnemonic);
 
-		function makeScbBlob(createdAt: number, withSeed: Buffer = seed): Buffer {
+		const nodeSecret = deriveLightningKeysFromMnemonic(
+			mnemonic,
+			undefined,
+			LnCoinType.REGTEST
+		).nodePrivateKey;
+
+		const peerNodeId = getPublicKey(Buffer.alloc(32, 7)).toString('hex');
+		function channelEntry(index: number): IStaticChannelBackup['channels'][0] {
+			return {
+				channelId: Buffer.alloc(32, index + 1).toString('hex'),
+				peerNodeId,
+				peerAddresses: [],
+				fundingTxid: Buffer.alloc(32, index + 2).toString('hex'),
+				fundingOutputIndex: 0,
+				fundingSatoshis: '100000',
+				channelKeyIndex: index,
+				channelType: '',
+				role: 'OPENER',
+				isTaproot: false,
+				isAnchor: false
+			};
+		}
+
+		function makeScbBlob(
+			createdAt: number,
+			withSeed: Buffer = seed,
+			channelCount = 0
+		): Buffer {
 			const backup: IStaticChannelBackup = {
 				version: 1,
-				network: 'REGTEST',
+				network: 'bcrt',
 				createdAt,
-				channels: []
+				channels: Array.from({ length: channelCount }, (_, i) =>
+					channelEntry(i)
+				)
 			};
 			return Buffer.from(encodeScb(backup, withSeed), 'utf8');
+		}
+
+		/** A Recovery Capsule as the library pushes it: keyed by the node secret. */
+		function makeCapsuleBlob(
+			createdAt: number,
+			channelCount: number,
+			secret: Buffer = nodeSecret
+		): Buffer {
+			const backup: IStaticChannelBackup = {
+				version: 1,
+				network: 'bcrt',
+				createdAt,
+				channels: Array.from({ length: channelCount }, (_, i) =>
+					channelEntry(i)
+				)
+			};
+			return composeRecoveryCapsule({
+				encryptedScb: encodeScb(backup, secret),
+				nodeSecret: secret
+			}).blob;
 		}
 
 		function makeFakeBeignet(): {
@@ -538,14 +593,32 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 				encoded: string;
 				createdAt: number;
 				fromPeer: string;
+				channelCount: number;
+				source: 'scb' | 'capsule';
 			} | null;
+			capsules: Map<string, { channelCount: number; inline: boolean }>;
 		} {
-			// The handler only touches mnemonic/log/_peerRetrievedScb, so it can be
-			// exercised without an Electrum-connected BeignetNode instance.
+			// The handler only touches the mnemonic-derived keys, log and the
+			// two retrieval slots, so it can be exercised without an
+			// Electrum-connected BeignetNode instance.
+			const proto = BeignetNode.prototype as unknown as {
+				nodeSecret: () => Buffer;
+				toCoinType: (network: string) => number;
+				toLnNetwork: (network: string) => string;
+				offerRetrievedScb: () => void;
+				retrievedBackupMatchesNetwork: () => boolean;
+			};
 			const fake = {
 				mnemonic,
+				networkName: 'regtest',
 				log: (): void => {},
-				_peerRetrievedScb: null
+				_peerRetrievedScb: null,
+				_peerRetrievedCapsules: new Map(),
+				nodeSecret: proto.nodeSecret,
+				toCoinType: proto.toCoinType,
+				toLnNetwork: proto.toLnNetwork,
+				offerRetrievedScb: proto.offerRetrievedScb,
+				retrievedBackupMatchesNetwork: proto.retrievedBackupMatchesNetwork
 			};
 			return {
 				handle: (pubkey: string, blob: Buffer): void =>
@@ -555,7 +628,8 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 						blob
 					),
 				get: () =>
-					(BeignetNode.prototype as any).getPeerRetrievedBackup.call(fake)
+					(BeignetNode.prototype as any).getPeerRetrievedBackup.call(fake),
+				capsules: fake._peerRetrievedCapsules
 			};
 		}
 
@@ -578,6 +652,59 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 			fake.handle('peer3', makeScbBlob(1500));
 			expect(fake.get()!.createdAt).to.equal(2000);
 			expect(fake.get()!.fromPeer).to.equal('peer2');
+		});
+
+		it('an empty backup never displaces one that names channels', function () {
+			// A peer may hold the empty blob a session pushed after closing its
+			// last channel, or the backup the node had before it; for a restore
+			// the copy naming channels is the useful one (issue #453).
+			const fake = makeFakeBeignet();
+			fake.handle('peer1', makeScbBlob(1000, seed, 1));
+			fake.handle('peer2', makeScbBlob(2000, seed, 0));
+			expect(fake.get()!.createdAt).to.equal(1000);
+			expect(fake.get()!.channelCount).to.equal(1);
+			// A newer blob WITH channels still wins, and one with channels
+			// replaces a held empty one even when older.
+			fake.handle('peer3', makeScbBlob(3000, seed, 2));
+			expect(fake.get()!.createdAt).to.equal(3000);
+			const empty = makeFakeBeignet();
+			empty.handle('peer1', makeScbBlob(5000, seed, 0));
+			empty.handle('peer2', makeScbBlob(4000, seed, 1));
+			expect(empty.get()!.createdAt).to.equal(4000);
+		});
+
+		it('recognizes a Recovery Capsule and surfaces its SCB under the wallet seed', function () {
+			// With a recovery mode on, the blob a storage peer holds is the
+			// capsule (keyed by the node secret), which embeds the SCB; Tier 1
+			// must not regress to "no backup" (issue #453).
+			const fake = makeFakeBeignet();
+			fake.handle('peer1', makeCapsuleBlob(7000, 1));
+			const got = fake.get();
+			expect(got).to.not.equal(null);
+			expect(got!.source).to.equal('capsule');
+			expect(got!.channelCount).to.equal(1);
+			expect(got!.createdAt).to.equal(7000);
+			// Re-encoded under the SEED: exactly what restoreFromScb decodes.
+			expect(decodeScb(got!.encoded, seed).channels).to.have.length(1);
+			expect(fake.capsules.size).to.equal(1);
+			expect(fake.capsules.get('peer1')!.inline).to.equal(false);
+			// A capsule under another node's key is not ours.
+			fake.handle('peer2', makeCapsuleBlob(9000, 3, crypto.randomBytes(32)));
+			expect(fake.capsules.size).to.equal(1);
+			expect(fake.get()!.createdAt).to.equal(7000);
+			// One this seed's node composed on another network authenticates
+			// (testnet, regtest and signet share a coin type) but is not ours
+			// to restore either.
+			const foreign = composeRecoveryCapsule({
+				encryptedScb: encodeScb(
+					{ version: 1, network: 'tb', createdAt: 9500, channels: [] },
+					nodeSecret
+				),
+				nodeSecret
+			}).blob;
+			fake.handle('peer3', foreign);
+			expect(fake.capsules.size).to.equal(1);
+			expect(fake.get()!.createdAt).to.equal(7000);
 		});
 
 		it('BeignetNodeOptions accepts peerStorageEnabled', function () {
