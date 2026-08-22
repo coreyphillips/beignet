@@ -22,6 +22,7 @@ import {
 	GuardianHttpServer,
 	ReferenceGuardian,
 	composeRecoveryCapsule,
+	decodeRecoveryCapsuleBlob,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { decodeScb, encodeScb } from '../../src/lightning/backup/scb';
@@ -38,6 +39,11 @@ const MNEMONIC =
 const sha = (s: string): Buffer =>
 	crypto.createHash('sha256').update(s).digest();
 
+const NODE_SECRET = deriveLightningKeysFromMnemonic(
+	MNEMONIC,
+	undefined,
+	LnCoinType.REGTEST
+).nodePrivateKey;
 const GUARDIAN_SECRETS = [1, 2, 3].map((i) => sha(`surface-guardian-${i}`));
 const GUARDIAN_IDS = GUARDIAN_SECRETS.map((s) => xOnlyFromSecret(s));
 
@@ -373,11 +379,6 @@ describe('Recovery surface: peer-storage mode', () => {
 });
 
 describe('Recovery surface: capsule restore in peer-storage mode', () => {
-	const NODE_SECRET = deriveLightningKeysFromMnemonic(
-		MNEMONIC,
-		undefined,
-		LnCoinType.REGTEST
-	).nodePrivateKey;
 	const PEER_A = '02' + 'a1'.repeat(32);
 	const PEER_B = '02' + 'b2'.repeat(32);
 	const ADMIN_KEY = 'a'.repeat(64);
@@ -869,13 +870,127 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 			expect(backupA.status).to.equal('PASS');
 			expect(backupA.message).to.match(/guardian quorum \(quorum/);
 
-			// Device B: same seed, fresh database. The boot decision must
-			// refuse to register a second genesis and hold for restore.
+			// The capsule A pushes to storage peers names its guardian set
+			// (issue #457): one local-http descriptor per configured entry,
+			// and no credential key because the URI format carries none.
+			const capsuleBlob = (
+				deviceA.node.getNode() as unknown as {
+					ourPeerStorageBlob: Buffer | null;
+				}
+			).ourPeerStorageBlob;
+			expect(
+				capsuleBlob,
+				'a guardian-mode node composes a capsule'
+			).to.not.equal(null);
+			const capsuleA = decodeRecoveryCapsuleBlob(capsuleBlob!, NODE_SECRET);
+			expect(capsuleA).to.not.equal(null);
+			expect(capsuleA!.guardians).to.deep.equal(
+				served.map((entry) => ({
+					guardianId: entry.guardian.guardianId.toString('hex'),
+					transports: [
+						{
+							type: 'local-http',
+							url: entry.uri.slice(entry.uri.indexOf('@') + 1)
+						}
+					]
+				}))
+			);
+
+			// A capsule naming a DIFFERENT set is reported under capsules.best
+			// and never adopted: the configured set stays at the top level.
+			const foreignIds = [4, 5, 6].map((i) =>
+				xOnlyFromSecret(sha(`foreign-guardian-${i}`)).toString('hex')
+			);
+			const foreignBlob = composeRecoveryCapsule({
+				storage: (deviceA.node as unknown as { storage: SqliteStorage })
+					.storage,
+				encryptedScb: capsuleA!.encryptedScb,
+				nodeSecret: NODE_SECRET,
+				guardians: foreignIds.map((guardianId, i) => ({
+					guardianId,
+					transports: [{ type: 'https', url: `https://g${i}.example` }],
+					auth: { type: 'bearer', token: `foreign-${i}` }
+				}))
+			}).blob;
+			deviceA.node
+				.getNode()
+				.emit('peer_storage:retrieved', '02' + 'c3'.repeat(32), foreignBlob);
+			const foreignStatus = await request(portA, 'GET', '/recovery/status');
+			const foreignResult = foreignStatus.body.result as {
+				guardians: Array<{ guardianId: string }>;
+				capsules: {
+					best: {
+						guardians: Array<Record<string, unknown>>;
+					} | null;
+				};
+			};
+			expect(foreignResult.guardians.map((g) => g.guardianId)).to.deep.equal(
+				GUARDIAN_IDS.map((id) => id.toString('hex'))
+			);
+			expect(
+				foreignResult.capsules.best?.guardians.map((g) => g.guardianId)
+			).to.deep.equal(foreignIds);
+			for (const reported of foreignResult.capsules.best!.guardians) {
+				expect(
+					reported,
+					'credentials never leave the capsule'
+				).to.not.have.property('auth');
+			}
+
+			// Device B: same seed, fresh data dir, and NO guardian configuration
+			// at all. Booted in peer-storage mode it pushes nothing while empty,
+			// and the capsule a storage peer returns names the set to restore
+			// with; a restart in quorum mode with that set is then the ordinary
+			// restore-from-nothing flow.
+			const deviceBProbe = await startDaemon({
+				...OFFLINE,
+				dataDir: dirB,
+				recoveryMode: 'peer-storage'
+			});
+			let recoveredUris: string[];
+			try {
+				const portProbe = portOf(deviceBProbe);
+				deviceBProbe.node
+					.getNode()
+					.emit('peer_storage:retrieved', '02' + 'a1'.repeat(32), capsuleBlob!);
+				const probe = await request(portProbe, 'GET', '/recovery/status');
+				expect(probe.status).to.equal(200);
+				const probeResult = probe.body.result as {
+					mode: string;
+					guardians: unknown[];
+					capsules: {
+						candidates: number;
+						best: {
+							guardians: Array<{
+								guardianId: string;
+								transports: Array<{ type: string; url: string }>;
+							}>;
+						} | null;
+					};
+				};
+				expect(probeResult.mode).to.equal('peer-storage');
+				expect(probeResult.guardians).to.deep.equal([]);
+				expect(probeResult.capsules.candidates).to.equal(1);
+				const locators = probeResult.capsules.best!.guardians;
+				expect(locators).to.have.length(3);
+				recoveredUris = locators.map(
+					(g) => `${g.guardianId}@${g.transports[0].url}`
+				);
+				expect([...recoveredUris].sort()).to.deep.equal(
+					[...guardianUris].sort()
+				);
+			} finally {
+				await deviceBProbe.stop();
+			}
+
+			// Device B again, now in quorum mode with the set the capsule
+			// named. The boot decision must refuse to register a second genesis
+			// and hold for restore.
 			const deviceB = await startDaemon({
 				...OFFLINE,
 				dataDir: dirB,
 				recoveryMode: 'quorum',
-				recoveryGuardians: guardianUris
+				recoveryGuardians: recoveredUris
 			});
 			const portB = portOf(deviceB);
 			try {

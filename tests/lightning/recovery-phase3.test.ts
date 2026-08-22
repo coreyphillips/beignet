@@ -31,6 +31,7 @@ import {
 	RecoveryManager,
 	RecoveryJournal,
 	RecoveryCapsule,
+	GuardianDescriptor,
 	RecoveryMutation,
 	RecoveryOutboundMessage,
 	CAPSULE_MAX_BYTES,
@@ -979,6 +980,66 @@ describe('Recovery phase 3: end to end restore from the capsule alone', () => {
 
 // ─────────────── Review regressions: stale startup, validated selection,
 // new-provider freshness ───────────────
+
+describe('Recovery phase 3: capsule guardian locators (issue #457)', () => {
+	const GUARDIANS: GuardianDescriptor[] = [
+		{
+			guardianId: '11'.repeat(32),
+			transports: [{ type: 'https', url: 'https://g1.example' }],
+			auth: { type: 'bearer', token: 'g1-token' }
+		},
+		{
+			guardianId: '22'.repeat(32),
+			transports: [
+				{
+					type: 'onion-http',
+					url: 'http://vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion'
+				}
+			]
+		},
+		{
+			guardianId: '33'.repeat(32),
+			transports: [{ type: 'local-http', url: 'http://127.0.0.1:8080' }]
+		}
+	];
+
+	function composedCapsule(guardians?: GuardianDescriptor[]): RecoveryCapsule {
+		const config = makeNodeConfig(7, openStorage(), true);
+		config.recovery = guardians
+			? { enabled: true, guardians }
+			: { enabled: true };
+		const node = new LightningNode(config);
+		node.on('error', () => {});
+		node.on('node:error', () => {});
+		try {
+			node.createInvoice({ amountMsat: 1_000n, description: 'locators' });
+			expect(node.refreshRecoveryCapsule()).to.be.at.least(0);
+			const blob = (node as unknown as { ourPeerStorageBlob: Buffer | null })
+				.ourPeerStorageBlob;
+			expect(blob, 'capsule composed').to.not.equal(null);
+			const decoded = decodeRecoveryCapsuleBlob(blob!, config.nodePrivateKey);
+			expect(decoded, 'capsule decodes under the node secret').to.not.equal(
+				null
+			);
+			return decoded!;
+		} finally {
+			node.destroy();
+		}
+	}
+
+	it('embeds the configured descriptors, credentials included, in every capsule', () => {
+		const capsule = composedCapsule(GUARDIANS);
+		expect(capsule.guardians).to.deep.equal(GUARDIANS);
+		expect(
+			capsule.inlineRecoveryState,
+			'locators do not displace the inline journal'
+		).to.not.equal(undefined);
+	});
+
+	it('composes an empty locator list when no set is configured', () => {
+		expect(composedCapsule().guardians).to.deep.equal([]);
+	});
+});
 
 describe('Recovery phase 3: review regressions', () => {
 	it('startup capsule re-bases a journal left stale by a disabled period', () => {

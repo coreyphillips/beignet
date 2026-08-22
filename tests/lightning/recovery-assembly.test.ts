@@ -32,6 +32,7 @@ import {
 	RecoveryManager,
 	ReferenceGuardian,
 	buildGuardianRecovery,
+	guardianDescriptorFor,
 	parseGuardianUri,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
@@ -201,6 +202,46 @@ describe('Recovery assembly: parseGuardianUri', () => {
 	});
 });
 
+describe('Recovery assembly: guardianDescriptorFor (issue #457)', () => {
+	const ONION =
+		'http://vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion';
+
+	it('classifies the transport from the URL the same way endpoint selection does', () => {
+		const cases: Array<[string, 'https' | 'onion-http' | 'local-http']> = [
+			['https://guardian.example.com:8443/base', 'https'],
+			[ONION, 'onion-http'],
+			['http://127.0.0.1:8080', 'local-http'],
+			// Any other http host is local-http in the descriptor; whether a
+			// client will dial it is allowLocalHttpHost's decision.
+			['http://guardian-1:8080', 'local-http'],
+			// A bare .onion suffix is not a v3 onion service.
+			['http://short.onion', 'local-http']
+		];
+		for (const [url, type] of cases) {
+			const descriptor = guardianDescriptorFor(
+				parseGuardianUri(`${VALID_ID}@${url}`)
+			);
+			expect(descriptor, url).to.deep.equal({
+				guardianId: VALID_ID,
+				transports: [{ type, url }]
+			});
+		}
+	});
+
+	it('carries a supplied credential and omits the key otherwise', () => {
+		const parsed = parseGuardianUri(`${VALID_ID}@https://g.example`);
+		expect(guardianDescriptorFor(parsed)).to.not.have.property('auth');
+		const withAuth = guardianDescriptorFor({
+			...parsed,
+			auth: { type: 'bearer', token: 'secret-token' }
+		});
+		expect(withAuth.auth).to.deep.equal({
+			type: 'bearer',
+			token: 'secret-token'
+		});
+	});
+});
+
 describe('Recovery assembly: buildGuardianRecovery', () => {
 	it('registers a fresh namespace, runs, and confirms against the quorum', async function (): Promise<void> {
 		this.timeout(20_000);
@@ -218,6 +259,14 @@ describe('Recovery assembly: buildGuardianRecovery', () => {
 		if (decision.kind !== 'run') throw new Error('unreachable');
 		expect(decision.recovery.enabled).to.equal(true);
 		expect(decision.recovery.durability).to.equal('quorum');
+		// The capsule locators (issue #457): the configured set, one
+		// local-http transport each, no credential key when none was given.
+		expect(decision.recovery.guardians).to.deep.equal(
+			served.map((entry) => ({
+				guardianId: entry.id.toString('hex'),
+				transports: [{ type: 'local-http', url: entry.url }]
+			}))
+		);
 		expect(decision.barrier.enforcing).to.equal(true);
 		expect(decision.gate.getState()).to.equal('quarantined');
 		expect(decision.gate.permitsPeerTraffic()).to.equal(false);

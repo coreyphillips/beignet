@@ -87,7 +87,8 @@ import {
 	decodeRecoveryCapsuleBlob,
 	restoreBestRecoveryCapsule,
 	assertEmptyTarget,
-	CapsuleCandidateError
+	CapsuleCandidateError,
+	GuardianDescriptor
 } from '../lightning/recovery';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
 import { INodeConfig } from '../lightning/node/types';
@@ -402,6 +403,40 @@ interface ICapsuleRestoreMarker {
 	keep: string;
 	head: { writerEpoch: string; latestSequence: string };
 	tier: 2;
+}
+
+/**
+ * A capsule guardian descriptor as the daemon reports it: identity and
+ * transports only. The capsule may carry a transport credential (wire 2.4);
+ * it is encrypted under the node secret for exactly that reason and never
+ * leaves the capsule through a readonly route or a log line.
+ */
+export interface IReportedGuardian {
+	guardianId: string;
+	transports: Array<{
+		type: 'onion-http' | 'https' | 'local-http';
+		url: string;
+	}>;
+}
+
+function redactGuardians(
+	descriptors: GuardianDescriptor[]
+): IReportedGuardian[] {
+	// The capsule authenticates under the node secret, so these are our own
+	// descriptors; the decoder still does not shape-check them, and a status
+	// route must not throw over a field it only reports.
+	return descriptors.map((g) => ({
+		guardianId: String(g.guardianId),
+		transports: (g.transports ?? []).map((t) => ({ type: t.type, url: t.url }))
+	}));
+}
+
+/** Same guardian identities, in any order. */
+function sameGuardianIds(a: string[], b: string[]): boolean {
+	if (a.length !== b.length) return false;
+	const sortedA = a.map((id) => String(id).toLowerCase()).sort();
+	const sortedB = b.map((id) => String(id).toLowerCase()).sort();
+	return sortedA.every((id, i) => id === sortedB[i]);
 }
 
 /** Write through a temp file and rename, so a crash never leaves a torn file. */
@@ -816,6 +851,8 @@ export class BeignetNode extends EventEmitter {
 			latestSequence: bigint;
 			inline: boolean;
 			channelCount: number;
+			/** The guardian locators the capsule names (spec 5.4, issue #457). */
+			guardians: GuardianDescriptor[];
 			receivedAt: number;
 		}
 	>();
@@ -1895,6 +1932,13 @@ export class BeignetNode extends EventEmitter {
 				latestSequence: string;
 				inline: boolean;
 				channelCount: number;
+				/**
+				 * Guardian locators the capsule names, credentials redacted:
+				 * what a seed restore with no configuration needs to rebuild
+				 * BEIGNET_RECOVERY_GUARDIANS (issue #457). Reported, never
+				 * adopted over the configured set.
+				 */
+				guardians: IReportedGuardian[];
 				fromPeer: string;
 				receivedAt: number;
 			} | null;
@@ -1996,6 +2040,7 @@ export class BeignetNode extends EventEmitter {
 					latestSequence: c.latestSequence.toString(),
 					inline: c.inline,
 					channelCount: c.channelCount,
+					guardians: redactGuardians(c.guardians),
 					fromPeer,
 					receivedAt: c.receivedAt
 				};
@@ -2034,6 +2079,13 @@ export class BeignetNode extends EventEmitter {
 		head: { writerEpoch: string; latestSequence: string };
 		newestSeenHead: { writerEpoch: string; latestSequence: string };
 		rejectedCandidates: number;
+		/**
+		 * Guardian locators the restored capsule names (credentials
+		 * redacted). Non-empty means the state belongs to a guardian-backed
+		 * namespace: restart in that mode with this set, or a quorum-marked
+		 * database refuses to start unbarriered.
+		 */
+		guardians: IReportedGuardian[];
 		restartRequired: boolean;
 		recovering?: string[];
 		skipped?: Array<{ channelId: string; reason: string }>;
@@ -2165,13 +2217,20 @@ export class BeignetNode extends EventEmitter {
 				writerEpoch: result.newestSeenHead.writerEpoch.toString(),
 				latestSequence: result.newestSeenHead.latestSequence.toString()
 			};
+			const guardians = redactGuardians(result.capsule.guardians);
 			const common = {
 				channelCount: result.scb.channels.length,
 				framesApplied: result.framesApplied,
 				head,
 				newestSeenHead,
-				rejectedCandidates: result.rejectedCandidates
+				rejectedCandidates: result.rejectedCandidates,
+				guardians
 			};
+			if (guardians.length > 0) {
+				this.log('info', 'Restored capsule names a guardian set', {
+					guardians
+				});
+			}
 
 			if (result.tier === 1) {
 				// Nothing was written to the staged file; the SCB is the whole
@@ -7245,6 +7304,7 @@ export class BeignetNode extends EventEmitter {
 					latestSequence: capsule.latestSequence,
 					inline,
 					channelCount: embedded.channels.length,
+					guardians: capsule.guardians,
 					receivedAt: Date.now()
 				});
 				this.log('info', 'Recovered capsule from peer storage', {
@@ -7252,8 +7312,41 @@ export class BeignetNode extends EventEmitter {
 					writerEpoch: capsule.writerEpoch.toString(),
 					latestSequence: capsule.latestSequence.toString(),
 					inline,
-					channelCount: embedded.channels.length
+					channelCount: embedded.channels.length,
+					guardians: capsule.guardians.length
 				});
+				// The capsule's locators are reported, never adopted: a set
+				// that disagrees with the configured one is a stale
+				// pre-enablement capsule or an operator error (set replacement
+				// does not exist in v1, wire 5.9), and either way the operator
+				// decides. Warn once per change of set from this peer, not on
+				// every equal-head re-send after a reconnect.
+				if (
+					this.recoveryGuardianSet.length > 0 &&
+					!sameGuardianIds(
+						capsule.guardians.map((g) => g.guardianId),
+						this.recoveryGuardianSet.map((g) => g.guardianId.toString('hex'))
+					) &&
+					(!held ||
+						!sameGuardianIds(
+							capsule.guardians.map((g) => g.guardianId),
+							held.guardians.map((g) => g.guardianId)
+						))
+				) {
+					this.log(
+						'warn',
+						'Retrieved capsule names a guardian set that differs from ' +
+							'the configured one; the configured set stays in force',
+						{
+							fromPeer: peerPubkey,
+							capsule: redactGuardians(capsule.guardians),
+							configured: this.recoveryGuardianSet.map((g) => ({
+								guardianId: g.guardianId.toString('hex'),
+								url: g.url
+							}))
+						}
+					);
+				}
 			}
 			// Surface the Tier 1 material under the wallet seed, the key
 			// restoreFromScb (POST /restore/scb) decodes with.

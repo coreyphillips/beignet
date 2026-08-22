@@ -1527,7 +1527,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head, and restore progress when one is pending or running'
+								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head and the guardian locators that capsule names (credentials redacted; reported, never adopted over the configured set), and restore progress when one is pending or running'
 						}
 					}
 				}
@@ -1573,7 +1573,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Restore report: tier, channel count, frames applied, the restored head and the newest head seen, rejected candidates, and whether a restart is required (Tier 1 adds the recovering and skipped channel lists)'
+								'Restore report: tier, channel count, frames applied, the restored head and the newest head seen, rejected candidates, the guardian locators the capsule names (credentials redacted; non-empty means restart in that guardian mode with this set), and whether a restart is required (Tier 1 adds the recovering and skipped channel lists)'
 						},
 						'400': { description: 'Missing confirm' },
 						'404': {

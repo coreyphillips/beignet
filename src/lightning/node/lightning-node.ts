@@ -227,7 +227,8 @@ import {
 	journalSupported,
 	loadWriterLease,
 	composeRecoveryCapsule,
-	assertEmptyTarget
+	assertEmptyTarget,
+	GuardianDescriptor
 } from '../recovery';
 import {
 	IChannelPersistEvent,
@@ -754,6 +755,11 @@ export class LightningNode extends EventEmitter {
 	private recoveryCapsuleActive = false;
 	private recoveryJournal: RecoveryJournal | undefined;
 	/**
+	 * Guardian locators every composed capsule carries (5.4): the configured
+	 * set in the guardian modes, empty for a peer-storage-only node.
+	 */
+	private readonly recoveryGuardians: GuardianDescriptor[];
+	/**
 	 * Startup quarantine (recovery 5.6). Installed at CONSTRUCTION from
 	 * config.recovery.startupGate. While present and unconfirmed, the node
 	 * makes NO peer contact at all, inbound or outbound, connection
@@ -905,6 +911,7 @@ export class LightningNode extends EventEmitter {
 		// the peer_storage Recovery Capsule.
 		this.recoveryCapsuleActive = journal !== undefined;
 		this.recoveryJournal = journal;
+		this.recoveryGuardians = config.recovery?.guardians ?? [];
 		this.recovery = this.storage
 			? new RecoveryManager(this.storage, {
 					journal,
@@ -4345,6 +4352,7 @@ export class LightningNode extends EventEmitter {
 			const { blob, inlineError } = composeRecoveryCapsule({
 				storage: this.storage,
 				encryptedScb,
+				guardians: this.recoveryGuardians,
 				nodeSecret: this.nodePrivkey,
 				allowInline
 			});

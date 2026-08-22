@@ -587,7 +587,10 @@ export interface RecoveryCapsule {
 	 * as a real hash.
 	 */
 	snapshotHash: Buffer;
-	/** How to find the real replicated state (empty until Phase 4). */
+	/**
+	 * How to find the real replicated state: the configured guardian set in
+	 * the guardian modes (issue #457), empty for a peer-storage-only node.
+	 */
 	guardians: GuardianDescriptor[];
 	/** Full stored journal (frames + meta), present only when it fits. */
 	inlineRecoveryState?: Buffer;

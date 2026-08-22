@@ -598,9 +598,9 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 			} | null;
 			capsules: Map<string, { channelCount: number; inline: boolean }>;
 		} {
-			// The handler only touches the mnemonic-derived keys, log and the
-			// two retrieval slots, so it can be exercised without an
-			// Electrum-connected BeignetNode instance.
+			// The handler only touches the mnemonic-derived keys, log, the
+			// configured guardian set and the two retrieval slots, so it can
+			// be exercised without an Electrum-connected BeignetNode instance.
 			const proto = BeignetNode.prototype as unknown as {
 				nodeSecret: () => Buffer;
 				toCoinType: (network: string) => number;
@@ -614,6 +614,7 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 				log: (): void => {},
 				_peerRetrievedScb: null,
 				_peerRetrievedCapsules: new Map(),
+				recoveryGuardianSet: [],
 				nodeSecret: proto.nodeSecret,
 				toCoinType: proto.toCoinType,
 				toLnNetwork: proto.toLnNetwork,

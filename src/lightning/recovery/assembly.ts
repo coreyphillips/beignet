@@ -37,8 +37,10 @@ import {
 import {
 	GuardianClient,
 	IBoundGuardianClient,
-	IGuardianSetContext
+	IGuardianSetContext,
+	isOnionV3Hostname
 } from './guardian-client';
+import { GuardianAuth, GuardianDescriptor } from './capsule';
 import {
 	GuardianReplicator,
 	IGuardianReplicationEvent
@@ -60,6 +62,43 @@ export interface IParsedGuardian {
 	guardianId: Buffer;
 	/** Base URL, e.g. https://host, http://<v3>.onion, http://127.0.0.1:8080. */
 	url: string;
+	/**
+	 * Transport credential (wire 2.4 and 9). The `pubkey@url` URI format
+	 * carries none, so embedders set it programmatically; it rides into the
+	 * guardian client AND into the capsule's GuardianDescriptor, because a
+	 * credential that does not survive a seed restore leaves the records
+	 * behind it unreachable exactly when they matter. A bearer or macaroon
+	 * credential over plaintext http to a non-loopback, non-onion host is
+	 * refused unless `allowUnencryptedAuth` is set on the assembly.
+	 */
+	auth?: GuardianAuth;
+}
+
+/**
+ * The capsule descriptor for one configured guardian (spec 5.4). The
+ * transport type follows from the URL, which parseGuardianUri already
+ * restricted to http(s): https is `https`, an http v3 onion host is
+ * `onion-http`, any other http host is `local-http`. That last class is
+ * wider than what endpoint selection will dial: a non-loopback local-http
+ * descriptor reaches a client only through `allowLocalHttpHost`
+ * (guardian-client.ts selectGuardianEndpoint), never by default.
+ */
+export function guardianDescriptorFor(
+	parsed: IParsedGuardian
+): GuardianDescriptor {
+	const url = new URL(parsed.url);
+	const type: GuardianDescriptor['transports'][number]['type'] =
+		url.protocol === 'https:'
+			? 'https'
+			: isOnionV3Hostname(url.hostname)
+			? 'onion-http'
+			: 'local-http';
+	const descriptor: GuardianDescriptor = {
+		guardianId: parsed.guardianId.toString('hex'),
+		transports: [{ type, url: parsed.url }]
+	};
+	if (parsed.auth) descriptor.auth = parsed.auth;
+	return descriptor;
 }
 
 /**
@@ -123,6 +162,13 @@ export interface IGuardianAssemblyConfig {
 	onReplicationEvent?: (event: IGuardianReplicationEvent) => void;
 	barrierTimeoutMs?: number;
 	allowUnencryptedSecrets?: boolean;
+	/**
+	 * Permit a bearer or macaroon credential over plain http to a
+	 * non-loopback, non-onion host (GuardianClient's flag of the same name).
+	 * Only for an isolated container network; unrelated to
+	 * `allowUnencryptedSecrets`, which is about the storage backend.
+	 */
+	allowUnencryptedAuth?: boolean;
 }
 
 /**
@@ -195,7 +241,12 @@ export async function buildGuardianRecovery(
 	};
 	const bound: IBoundGuardianClient[] = config.guardians.map((g) => ({
 		expectedGuardianId: g.guardianId,
-		client: new GuardianClient({ url: g.url, guardianSetId: setId })
+		client: new GuardianClient({
+			url: g.url,
+			guardianSetId: setId,
+			auth: g.auth,
+			allowUnencryptedAuth: config.allowUnencryptedAuth
+		})
 	}));
 	const root = deriveRecoveryRoot(config.nodeSecret);
 	const replicator = new GuardianReplicator({
@@ -237,7 +288,11 @@ export async function buildGuardianRecovery(
 					enabled: true,
 					durability: config.durability,
 					barrier,
-					startupGate: gate
+					startupGate: gate,
+					// The locators every capsule this node pushes will carry
+					// (spec 5.4): a seed restore reads them back from peer
+					// storage instead of needing the set from configuration.
+					guardians: config.guardians.map(guardianDescriptorFor)
 				},
 				confirm: (): Promise<IConfirmationOutcome> => gate.confirm(lease),
 				recheck: (): Promise<IConfirmationOutcome> => gate.recheck(lease),
