@@ -773,6 +773,10 @@ recovery?: {
   maxRetainedFrameGap?: number;
   snapshotIntervalFrames?: number;
   snapshotIntervalBytes?: number;
+  unknownChannelReestablishHoldMs?: number;  // 5.4: hold an unknown channel's
+                                       // channel_reestablish this long instead
+                                       // of failing it. Peer-storage only;
+                                       // absent or 0 answers immediately
 };
 
 // The shared integrator wiring (src/lightning/recovery/assembly.ts)
@@ -794,7 +798,11 @@ node.getRecoveryStatus();  // { gate, durability, startupRepairPending,
                            //   lastDurableSequence, awaitingDurabilityCount,
                            //   fenced, backfillLost, channels: [{ channelId,
                            //   status: ChannelRecoveryStatus,
-                           //   awaitingDurability }] }
+                           //   awaitingDurability }],
+                           //   heldReestablish: [{ peer, channelId,
+                           //   expiresAt }] }
+// heldReestablish is the 5.4 hold, and sits outside `channels` because it
+// describes peers waiting on channels this node does NOT have.
 // awaitingDurability sits BESIDE the status rather than becoming an eighth
 // ChannelRecoveryStatus member: the seven values are the 5.7 machine and
 // describe what is known about a channel's STATE, while waiting on a receipt
@@ -838,9 +846,12 @@ supported but off) and `POST /recovery/restore` (admin scope, requires
 `{"confirm": true}` because the takeover permanently fences the previous
 writer; only answers on a daemon booted restore-pending, i.e. a fresh database
 whose namespace the guardian set holds, and every other route answers 503
-NODE_RESTORE_PENDING in that state). The daemon relays all six recovery
-events over SSE and webhooks, and `beignet recovery status|restore` are the
-CLI commands.
+NODE_RESTORE_PENDING in that state). The daemon relays every recovery event
+over SSE and webhooks (recovery:durable, recovery:fenced,
+recovery:backfill-lost and recovery:reestablish-held from the node, plus the
+embedder-origin recovery:guardian_unreachable, recovery:restore-progress and
+recovery:restored), and `beignet recovery status|restore` are the CLI
+commands.
 
 Peer-storage mode restores through `POST /recovery/restore-capsule` (admin
 scope, requires `{"confirm": true}` because local durability has no fencing:

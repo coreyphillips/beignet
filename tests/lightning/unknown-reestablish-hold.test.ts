@@ -320,15 +320,16 @@ describe('Unknown-channel reestablish hold (issue #462)', function () {
 			expect(unknownChannelErrors()).to.have.length(1);
 		});
 
-		it('answers immediately once the ceiling on parked messages is reached', function () {
+		it('spends the quota per peer, so one peer cannot expose another', function () {
 			const { manager, sent, unknownChannelErrors } = makeRestoreTarget(5_000);
+			const flooder = crypto.randomBytes(33).toString('hex');
 
-			// 64 is MAX_HELD_UNKNOWN_REESTABLISH: far past any real restore
-			// target, and the point at which a peer fabricating channel ids stops
-			// buying timers.
+			// 64 is MAX_HELD_UNKNOWN_REESTABLISH_PER_PEER: far past any real
+			// topology, and the point at which a peer fabricating channel ids
+			// stops buying timers.
 			for (let i = 0; i < 64; i++) {
 				manager.handleMessage(
-					bobPubkey,
+					flooder,
 					MessageType.CHANNEL_REESTABLISH,
 					reestablishPayload(crypto.randomBytes(32))
 				);
@@ -336,14 +337,33 @@ describe('Unknown-channel reestablish hold (issue #462)', function () {
 			expect(sent, 'all parked').to.have.length(0);
 			expect(manager.heldUnknownChannelReestablish()).to.have.length(64);
 
+			// Spending it is self-inflicted: only the flooder falls through.
 			manager.handleMessage(
-				bobPubkey,
+				flooder,
 				MessageType.CHANNEL_REESTABLISH,
 				reestablishPayload(crypto.randomBytes(32))
 			);
+			const errors = unknownChannelErrors();
+			expect(errors, 'the flooder fails closed').to.have.length(1);
+			expect(errors[0].peer).to.equal(flooder);
+
+			// An honest peer arriving after the flood still gets its window: a
+			// global budget would have handed this one the permanent error and
+			// force-closed a channel a restore was about to resume.
+			const channelId = crypto.randomBytes(32);
+			manager.handleMessage(
+				bobPubkey,
+				MessageType.CHANNEL_REESTABLISH,
+				reestablishPayload(channelId)
+			);
 			expect(
 				unknownChannelErrors(),
-				'fails closed past the cap'
+				'the honest peer is untouched by the flood'
+			).to.have.length(1);
+			expect(
+				manager
+					.heldUnknownChannelReestablish()
+					.filter((h) => h.peer === bobPubkey)
 			).to.have.length(1);
 
 			manager.detachFromPeerManager();
@@ -470,7 +490,57 @@ describe('Unknown-channel reestablish hold (issue #462)', function () {
 				),
 				'the restored channel is never failed as unknown'
 			).to.have.length(0);
+			// BOLT 2: both sides transmit channel_reestablish, and wait, before
+			// any other message for the channel. Bring-up ran while the database
+			// was still empty, so this replay is the only chance to send ours.
+			expect(sent.length, 'the peer is answered').to.be.greaterThan(0);
+			expect(
+				sent[0].type,
+				'our channel_reestablish precedes any other channel traffic'
+			).to.equal(MessageType.CHANNEL_REESTABLISH);
+			expect(sent[0].payload.subarray(0, 32).toString('hex')).to.equal(
+				channelId.toString('hex')
+			);
 			expect(restored.heldUnknownChannelReestablish()).to.have.length(0);
+		});
+
+		it('never replays a parked message against another peer channel', async function () {
+			// The window is exactly when a channel id can change hands: a peer
+			// parks an id while the database is empty, and the restore installs
+			// it as SOMEONE ELSE'S channel. Replaying through the private handler
+			// would run the sender's counters against that channel and could
+			// mark it ERRORED.
+			const { alice, channelId } = openAndReadyChannel(0);
+			const restored = new ChannelManager({
+				...aliceConfig,
+				unknownChannelReestablishHoldMs: 80
+			});
+			const impostor = crypto.randomBytes(33).toString('hex');
+			const sent: Array<{ peer: string; type: number }> = [];
+			restored.on('message:outbound', (peer: string, type: number) => {
+				sent.push({ peer, type });
+			});
+			restored.on('error', () => {
+				/* absorbed */
+			});
+
+			restored.handleMessage(
+				impostor,
+				MessageType.CHANNEL_REESTABLISH,
+				reestablishPayload(channelId)
+			);
+			// The restore hands the id to bob, not to the peer that parked it.
+			const channel = alice.getChannel(channelId)!;
+			restored.restoreChannel(channel, bobPubkey);
+			await sleep(400);
+
+			expect(
+				sent.filter((m) => m.peer === impostor),
+				'nothing is sent to a peer that does not own the channel'
+			).to.have.length(0);
+			expect(channel.getState(), "the owner's channel is untouched").to.equal(
+				ChannelState.AWAITING_REESTABLISH
+			);
 		});
 	});
 });

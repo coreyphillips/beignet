@@ -333,6 +333,39 @@ describe('Recovery surface: configuration validation (pre-boot)', () => {
 		}
 	});
 
+	it('refuses a partially numeric interval instead of truncating it', () => {
+		// parseInt stops at the first character it cannot use, so '0.5' read as
+		// 0 would silently DISABLE a protection whose 0 means off, and '10m'
+		// read as 10 would turn ten minutes into ten milliseconds. Both must
+		// reach the daemon as NaN, which refuses startup and names the variable.
+		const cases = ['0.5', '10m', '600_000', '1e3', ' 12x '];
+		for (const raw of cases) {
+			for (const key of [
+				'BEIGNET_RECOVERY_REESTABLISH_HOLD_MS',
+				'BEIGNET_RECOVERY_LEASE_CHECK_MS'
+			] as const) {
+				process.env[key] = raw;
+				try {
+					const resolved = resolveConfig({});
+					const value =
+						key === 'BEIGNET_RECOVERY_REESTABLISH_HOLD_MS'
+							? resolved.recoveryReestablishHoldMs
+							: resolved.recoveryLeaseCheckIntervalMs;
+					expect(Number.isNaN(value), `${key}=${raw}`).to.equal(true);
+				} finally {
+					delete process.env[key];
+				}
+			}
+		}
+		// Whitespace around a whole integer is still a whole integer.
+		process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS = ' 600000 ';
+		try {
+			expect(resolveConfig({}).recoveryReestablishHoldMs).to.equal(600_000);
+		} finally {
+			delete process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS;
+		}
+	});
+
 	it('refuses an unknown recovery profile', async () => {
 		await expectStartRefused(
 			{ dataDir: dir, recoveryProfile: 'byzantine-v9' },
