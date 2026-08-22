@@ -233,7 +233,8 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	CAPSULE_RESTORE_UNSUPPORTED: 409,
 	CAPSULE_RESTORE_NO_CANDIDATES: 404,
 	CAPSULE_RESTORE_TARGET_DIRTY: 409,
-	CAPSULE_RESTORE_FAILED: 409
+	CAPSULE_RESTORE_FAILED: 409,
+	CAPSULE_RESTORE_INSTALL_FAILED: 500
 };
 
 export function statusForErrorCode(code: string): number {
@@ -452,6 +453,22 @@ async function bootDaemon(
 			'INVALID_PARAMS',
 			`Unknown recovery profile "${opts.recoveryProfile}"; crash-v1 is ` +
 				'the only accepted value (and the default)'
+		);
+	}
+	if (
+		opts.recoveryLeaseCheckIntervalMs !== undefined &&
+		(!Number.isInteger(opts.recoveryLeaseCheckIntervalMs) ||
+			opts.recoveryLeaseCheckIntervalMs < 0 ||
+			opts.recoveryLeaseCheckIntervalMs > 2_147_483_647)
+	) {
+		// Node's timers turn NaN and anything past 2^31-1 ms into a 1 ms
+		// delay, which would poll the guardian set continuously.
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Invalid recovery lease check interval "${String(
+				opts.recoveryLeaseCheckIntervalMs
+			)}"; BEIGNET_RECOVERY_LEASE_CHECK_MS must be an integer between 0 ` +
+				'and 2147483647 (0 disables the check)'
 		);
 	}
 	const guardianEntries = opts.recoveryGuardians ?? [];

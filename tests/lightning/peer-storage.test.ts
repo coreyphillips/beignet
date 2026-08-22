@@ -558,7 +558,7 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 		): Buffer {
 			const backup: IStaticChannelBackup = {
 				version: 1,
-				network: 'REGTEST',
+				network: 'bcrt',
 				createdAt,
 				channels: Array.from({ length: channelCount }, (_, i) =>
 					channelEntry(i)
@@ -575,7 +575,7 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 		): Buffer {
 			const backup: IStaticChannelBackup = {
 				version: 1,
-				network: 'REGTEST',
+				network: 'bcrt',
 				createdAt,
 				channels: Array.from({ length: channelCount }, (_, i) =>
 					channelEntry(i)
@@ -604,7 +604,9 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 			const proto = BeignetNode.prototype as unknown as {
 				nodeSecret: () => Buffer;
 				toCoinType: (network: string) => number;
+				toLnNetwork: (network: string) => string;
 				offerRetrievedScb: () => void;
+				retrievedBackupMatchesNetwork: () => boolean;
 			};
 			const fake = {
 				mnemonic,
@@ -614,7 +616,9 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 				_peerRetrievedCapsules: new Map(),
 				nodeSecret: proto.nodeSecret,
 				toCoinType: proto.toCoinType,
-				offerRetrievedScb: proto.offerRetrievedScb
+				toLnNetwork: proto.toLnNetwork,
+				offerRetrievedScb: proto.offerRetrievedScb,
+				retrievedBackupMatchesNetwork: proto.retrievedBackupMatchesNetwork
 			};
 			return {
 				handle: (pubkey: string, blob: Buffer): void =>
@@ -686,6 +690,19 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 			expect(fake.capsules.get('peer1')!.inline).to.equal(false);
 			// A capsule under another node's key is not ours.
 			fake.handle('peer2', makeCapsuleBlob(9000, 3, crypto.randomBytes(32)));
+			expect(fake.capsules.size).to.equal(1);
+			expect(fake.get()!.createdAt).to.equal(7000);
+			// One this seed's node composed on another network authenticates
+			// (testnet, regtest and signet share a coin type) but is not ours
+			// to restore either.
+			const foreign = composeRecoveryCapsule({
+				encryptedScb: encodeScb(
+					{ version: 1, network: 'tb', createdAt: 9500, channels: [] },
+					nodeSecret
+				),
+				nodeSecret
+			}).blob;
+			fake.handle('peer3', foreign);
 			expect(fake.capsules.size).to.equal(1);
 			expect(fake.get()!.createdAt).to.equal(7000);
 		});

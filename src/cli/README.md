@@ -406,8 +406,11 @@ BEIGNET_RECOVERY_PROFILE=crash-v1   # optional; crash-v1 is the only value
   fresh database, the daemon holds in the `restart-required` state (every
   route but the recovery surface answers 503 `NODE_RESTART_REQUIRED`) and a
   restart resumes the channels; the previous database is kept beside it as
-  `<network>.db.pre-capsule-restore-<timestamp>`. Otherwise (Tier 1) the
-  embedded SCB is recovered on the live node like `POST /restore/scb`.
+  `<network>.db.pre-capsule-restore-<timestamp>`, and API-key revocations,
+  webhooks and peer addresses follow into the restored one. The swap is
+  crash-safe: a marker (`<network>.capsule-restore.json`) lets the next boot
+  finish an interrupted swap. Otherwise (Tier 1) the embedded SCB is
+  recovered on the live node like `POST /restore/scb`.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.
@@ -1514,7 +1517,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_RECOVERY_MODE` | Recovery Protocol mode: `off`, `peer-storage`, `async-remote`, `quorum` (default: off; unknown values fall back to off) |
 | `BEIGNET_RECOVERY_GUARDIANS` | Guardian set for async-remote/quorum, comma-separated `<64-hex-x-only-pubkey>@<http(s) url>` (crash-v1: exactly three; malformed entries refuse startup) |
 | `BEIGNET_RECOVERY_PROFILE` | Recovery fault-model profile; `crash-v1` is the only accepted value and the default |
-| `BEIGNET_RECOVERY_LEASE_CHECK_MS` | Guardian modes: idle writer lease re-check cadence in ms (default: 300000; 0 disables) |
+| `BEIGNET_RECOVERY_LEASE_CHECK_MS` | Guardian modes: idle writer lease re-check cadence in ms, an integer in 0..2147483647 (default: 300000; 0 disables; anything else refuses startup) |
 
 ### Priority Order
 

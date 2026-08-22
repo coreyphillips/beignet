@@ -86,8 +86,10 @@ import {
 	parseGuardianUri,
 	decodeRecoveryCapsuleBlob,
 	restoreBestRecoveryCapsule,
-	assertEmptyTarget
+	assertEmptyTarget,
+	CapsuleCandidateError
 } from '../lightning/recovery';
+import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
 import { INodeConfig } from '../lightning/node/types';
 import {
 	BITCOIN_CHAIN_HASH,
@@ -390,6 +392,25 @@ export function parseRecoveryMode(value: string | undefined): RecoveryMode {
 }
 
 /** RestoreRefusedError reasons as daemon error codes (HTTP mapping lives in daemon.ts). */
+/** Durable record of a Tier 2 capsule restore's pending database swap. */
+interface ICapsuleRestoreMarker {
+	version: 1;
+	stagedAt: number;
+	/** Basename of the fully installed restored database. */
+	staged: string;
+	/** Basename the previous database is moved aside under. */
+	keep: string;
+	head: { writerEpoch: string; latestSequence: string };
+	tier: 2;
+}
+
+/** Write through a temp file and rename, so a crash never leaves a torn file. */
+function writeFileAtomic(filePath: string, content: string): void {
+	const tmp = `${filePath}.tmp`;
+	fs.writeFileSync(tmp, content);
+	fs.renameSync(tmp, filePath);
+}
+
 const RESTORE_ERROR_CODES: Record<RestoreRefusedError['reason'], string> = {
 	'no-quorum': 'RESTORE_NO_QUORUM',
 	'unknown-namespace': 'RESTORE_UNKNOWN_NAMESPACE',
@@ -719,6 +740,8 @@ export class BeignetNode extends EventEmitter {
 	static INITIAL_GOSSIP_PRIME_TIMEOUT_MS = 90_000;
 	/** Idle writer lease re-check cadence (issue #455). */
 	private static readonly DEFAULT_LEASE_CHECK_INTERVAL_MS = 5 * 60_000;
+	/** Largest delay Node's timers honor; beyond it they fire after 1 ms. */
+	private static readonly MAX_TIMER_MS = 2_147_483_647;
 	/**
 	 * Non-null only while the boot-time RGS attempt is in flight (mainnet with
 	 * rapidGossipSync on). Connect-time gossip sync waits on it so a fresh
@@ -805,6 +828,8 @@ export class BeignetNode extends EventEmitter {
 	 * only a restart builds a node on it (see restoreFromCapsules).
 	 */
 	private _restartRequired = false;
+	/** recovery:fenced is relayed once per process, whichever path noticed. */
+	private _recoveryFenceRelayed = false;
 
 	private constructor(
 		mnemonic: string,
@@ -854,10 +879,17 @@ export class BeignetNode extends EventEmitter {
 		this.rapidGossipSync = opts.rapidGossipSync ?? true;
 		this.rapidGossipSyncUrl = opts.rapidGossipSyncUrl;
 		if (opts.recoveryLeaseCheckIntervalMs !== undefined) {
-			this._leaseCheckIntervalMs = Math.max(
-				0,
-				opts.recoveryLeaseCheckIntervalMs
-			);
+			// setInterval silently turns NaN and anything past 2^31-1 ms into a
+			// 1 ms timer, which would poll the guardian set continuously.
+			const ms = opts.recoveryLeaseCheckIntervalMs;
+			if (!Number.isInteger(ms) || ms < 0 || ms > BeignetNode.MAX_TIMER_MS) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					`recoveryLeaseCheckIntervalMs must be an integer between 0 and ` +
+						`${BeignetNode.MAX_TIMER_MS} (got ${String(ms)})`
+				);
+			}
+			this._leaseCheckIntervalMs = ms;
 		}
 		const networkName = this.networkName;
 
@@ -934,6 +966,9 @@ export class BeignetNode extends EventEmitter {
 		}
 
 		this._storageEncryptionKey = encryptionKey;
+		// A Tier 2 capsule restore that crashed mid-swap left its durable
+		// marker; finish the install before anything opens the database.
+		this.finishStagedCapsuleRestore(dbPath);
 		this.storage = new SqliteStorage(
 			dbPath,
 			(err) => {
@@ -1522,17 +1557,7 @@ export class BeignetNode extends EventEmitter {
 				'Recovery fenced: a newer writer epoch owns this namespace; ' +
 					'this device must not send another channel message'
 			);
-			this.emit('recovery:fenced', {
-				supersededBy: superseding
-					? {
-							epoch: superseding.lease.epoch.toString(),
-							writerPublicKey:
-								superseding.lease.writerPublicKey.toString('hex'),
-							sequence: superseding.logHead.sequence.toString(),
-							frameHash: superseding.logHead.frameHash.toString('hex')
-					  }
-					: null
-			});
+			this.relayRecoveryFenced(superseding);
 		});
 		this.node.on('recovery:backfill-lost', (detail: string) => {
 			this.log('error', 'Recovery backfill lost', { detail });
@@ -1746,7 +1771,7 @@ export class BeignetNode extends EventEmitter {
 				if (outcome.state === 'fenced') {
 					// The gate found a newer epoch at startup: same event the
 					// barrier relays for a running node, same payload shape.
-					this.emitGateFenced(outcome.supersededBy);
+					this.relayRecoveryFenced(outcome.supersededBy);
 					return;
 				}
 				this.log('warn', 'Recovery gate still quarantined; retrying', {
@@ -1769,10 +1794,15 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Relay a gate fence with the payload shape the barrier path uses, so a
-	 * consumer sees one event whichever side noticed the takeover.
+	 * Relay a fence ONCE, whichever side noticed the takeover first (the
+	 * barrier on a refused append, the startup gate, or the idle lease
+	 * check), with one payload shape. The lease check has nothing left to
+	 * learn once the device is fenced, so it stops here too.
 	 */
-	private emitGateFenced(supersededBy: GuardianState | undefined): void {
+	private relayRecoveryFenced(supersededBy: GuardianState | undefined): void {
+		this.stopRecoveryLeaseCheck();
+		if (this._recoveryFenceRelayed) return;
+		this._recoveryFenceRelayed = true;
 		this.emit('recovery:fenced', {
 			supersededBy: supersededBy
 				? {
@@ -1814,8 +1844,7 @@ export class BeignetNode extends EventEmitter {
 						'Recovery lease check: a newer writer epoch owns this ' +
 							'namespace; this device is fenced'
 					);
-					this.stopRecoveryLeaseCheck();
-					this.emitGateFenced(outcome.supersededBy);
+					this.relayRecoveryFenced(outcome.supersededBy);
 				})
 				.catch((err) => {
 					this.log('debug', 'Recovery lease check failed', {
@@ -2072,16 +2101,39 @@ export class BeignetNode extends EventEmitter {
 				`${blobs.length} candidate capsule(s) from storage peers`
 			);
 			dropStaged();
-			const staged = new SqliteStorage(
-				stagedPath,
-				() => {
-					/* a fresh file has no rows to skip */
-				},
-				this._storageEncryptionKey
-					? { encryptionKey: this._storageEncryptionKey }
-					: undefined
-			);
-			staged.open();
+			// Everything up to the marker write is a TARGET failure unless the
+			// library says otherwise: the candidates are only to blame for a
+			// CapsuleCandidateError (nothing decrypted, conflicting heads, no
+			// candidate validated); a staged file that cannot be opened or
+			// written is an operational fault and is reported as one.
+			const installFailure = (err: unknown): BeignetError =>
+				err instanceof CapsuleCandidateError
+					? new BeignetError(
+							'CAPSULE_RESTORE_FAILED',
+							`No retrieved capsule could be restored: ${err.message}`
+					  )
+					: new BeignetError(
+							'CAPSULE_RESTORE_INSTALL_FAILED',
+							`Could not write the restored database: ${
+								err instanceof Error ? err.message : String(err)
+							}`
+					  );
+			let staged: SqliteStorage;
+			try {
+				staged = new SqliteStorage(
+					stagedPath,
+					() => {
+						/* a fresh file has no rows to skip */
+					},
+					this._storageEncryptionKey
+						? { encryptionKey: this._storageEncryptionKey }
+						: undefined
+				);
+				staged.open();
+			} catch (err) {
+				dropStaged();
+				throw installFailure(err);
+			}
 			let result: ReturnType<typeof restoreBestRecoveryCapsule>;
 			try {
 				result = restoreBestRecoveryCapsule(blobs, staged, this.nodeSecret(), {
@@ -2091,9 +2143,11 @@ export class BeignetNode extends EventEmitter {
 						return scratch;
 					}
 				});
+				// Retrieval already refuses wrong-network capsules; this is the
+				// belt on those braces, and a candidate defect if it ever fires.
 				const expectedNetwork = this.toLnNetwork(this.networkName);
 				if (result.scb.network !== expectedNetwork) {
-					throw new Error(
+					throw new CapsuleCandidateError(
 						`capsule SCB network "${result.scb.network}" does not match ` +
 							`this node's network "${expectedNetwork}"`
 					);
@@ -2101,12 +2155,7 @@ export class BeignetNode extends EventEmitter {
 			} catch (err) {
 				staged.close();
 				dropStaged();
-				throw new BeignetError(
-					'CAPSULE_RESTORE_FAILED',
-					`No retrieved capsule could be restored: ${
-						err instanceof Error ? err.message : String(err)
-					}`
-				);
+				throw installFailure(err);
 			}
 			const head = {
 				writerEpoch: result.capsule.writerEpoch.toString(),
@@ -2157,17 +2206,17 @@ export class BeignetNode extends EventEmitter {
 				return info;
 			}
 
-			// Tier 2: the staged database is the node's exact state. Carry the
-			// peer addresses the operator just used across, so the restored
-			// node dials its channel peers on its own after the restart.
+			// Tier 2: the staged database is the node's exact state. The daemon
+			// state that lives beside the channel state in this database (the
+			// persisted API-key rotations and revocations above all, then the
+			// webhooks and the peer addresses the operator just used) is
+			// carried across, or a restart would resurrect a revoked key.
 			try {
-				for (const peer of this.storage.loadAllPeerAddresses()) {
-					staged.savePeerAddress(peer.pubkey, peer.host, peer.port);
-				}
+				this.carryDaemonState(this.storage, staged);
 			} catch (err) {
-				this.log('warn', 'Could not carry peer addresses into the restore', {
-					error: err instanceof Error ? err.message : String(err)
-				});
+				staged.close();
+				dropStaged();
+				throw installFailure(err);
 			}
 			staged.close();
 			progress(
@@ -2175,23 +2224,51 @@ export class BeignetNode extends EventEmitter {
 				`Tier 2: ${result.framesApplied} frame(s) replayed at epoch ${head.writerEpoch} sequence ${head.latestSequence}`
 			);
 
-			// Tear the running node down (its destroy closes the database), then
-			// swap the files. From here only a restart serves a node again.
-			this.teardownNodeForRestart();
+			// The swap is two renames with a crash window between them. The
+			// marker written first makes it durable: init() finishes whatever
+			// a crash left behind before the next boot opens a database, so
+			// no restart can land on an empty one. From the marker on, only a
+			// restart serves a node again, whatever happens below.
 			const dbPath = path.join(this.dataDir, `${this.networkName}.db`);
 			const keptPath = `${dbPath}.pre-capsule-restore-${new Date()
 				.toISOString()
 				.replace(/[:.]/g, '-')}`;
-			fs.renameSync(dbPath, keptPath);
-			for (const suffix of ['-wal', '-shm']) {
-				try {
-					fs.renameSync(`${dbPath}${suffix}`, `${keptPath}${suffix}`);
-				} catch {
-					// A clean close leaves none behind.
-				}
+			const marker: ICapsuleRestoreMarker = {
+				version: 1,
+				stagedAt: Date.now(),
+				staged: path.basename(stagedPath),
+				keep: path.basename(keptPath),
+				head,
+				tier: 2
+			};
+			try {
+				writeFileAtomic(
+					this.capsuleRestoreMarkerPath(),
+					JSON.stringify(marker)
+				);
+			} catch (err) {
+				dropStaged();
+				throw installFailure(err);
 			}
-			fs.renameSync(stagedPath, dbPath);
 			this._restartRequired = true;
+			// Tear the running node down (its destroy closes the database), then
+			// swap the files through the same path a crashed swap resumes on.
+			this.teardownNodeForRestart();
+			try {
+				this.finishStagedCapsuleRestore(dbPath);
+			} catch (err) {
+				// The marker is still there: the next boot completes the swap.
+				this.log('error', 'Capsule restore swap did not complete', {
+					error: err instanceof Error ? err.message : String(err)
+				});
+				throw new BeignetError(
+					'CAPSULE_RESTORE_INSTALL_FAILED',
+					'The restored database was written but the file swap did not ' +
+						'complete; restart the daemon, which finishes the install (' +
+						(err instanceof Error ? err.message : String(err)) +
+						')'
+				);
+			}
 			const info = {
 				tier: 2 as const,
 				...common,
@@ -2241,6 +2318,142 @@ export class BeignetNode extends EventEmitter {
 		void (this.wallet as Wallet | undefined)?.stop().catch(() => {
 			/* best effort */
 		});
+	}
+
+	private capsuleRestoreMarkerPath(): string {
+		return path.join(this.dataDir, `${this.networkName}.capsule-restore.json`);
+	}
+
+	/**
+	 * Daemon-local state that lives in the database beside the channel
+	 * state, and must follow the operator into the restored one: persisted
+	 * API-key rotations and revocations (a dropped override resurrects a
+	 * revoked secret), registered webhooks, and the peer addresses just
+	 * used to retrieve the capsules (so the restored node dials its channel
+	 * peers on its own). The auth override is mandatory; the rest is best
+	 * effort and logged.
+	 */
+	private carryDaemonState(from: SqliteStorage, to: SqliteStorage): void {
+		const overrides = from.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
+		if (overrides !== null) {
+			to.saveWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY, overrides);
+		}
+		try {
+			for (const hook of from.loadAllWebhooks()) {
+				to.saveWebhook(
+					hook.id,
+					hook.url,
+					hook.events,
+					hook.secretHash,
+					hook.createdAt
+				);
+			}
+		} catch (err) {
+			this.log('warn', 'Could not carry webhooks into the restore', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+		try {
+			for (const peer of from.loadAllPeerAddresses()) {
+				to.savePeerAddress(peer.pubkey, peer.host, peer.port);
+			}
+		} catch (err) {
+			this.log('warn', 'Could not carry peer addresses into the restore', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	/**
+	 * Complete a marker-backed database swap, at restore time and on the
+	 * boot after a crash. Idempotent over every state the two renames can
+	 * be interrupted in: both files present (nothing moved yet), only the
+	 * staged file present (the canonical database was moved aside), or
+	 * only the canonical one (the swap finished, the marker did not clear).
+	 * The previous database is only ever renamed, never deleted, and only
+	 * after it is verified to hold no channel state.
+	 */
+	private finishStagedCapsuleRestore(dbPath: string): void {
+		const markerPath = this.capsuleRestoreMarkerPath();
+		if (!fs.existsSync(markerPath)) return;
+		let marker: ICapsuleRestoreMarker;
+		try {
+			marker = JSON.parse(
+				fs.readFileSync(markerPath, 'utf8')
+			) as ICapsuleRestoreMarker;
+			if (
+				marker.version !== 1 ||
+				typeof marker.staged !== 'string' ||
+				typeof marker.keep !== 'string'
+			) {
+				throw new Error('unrecognized marker shape');
+			}
+		} catch (err) {
+			throw new BeignetError(
+				'CAPSULE_RESTORE_INSTALL_FAILED',
+				`Unreadable capsule restore marker at ${markerPath} (${
+					err instanceof Error ? err.message : String(err)
+				}); inspect the data directory before starting`
+			);
+		}
+		const stagedPath = path.join(this.dataDir, marker.staged);
+		const keptPath = path.join(this.dataDir, marker.keep);
+		const sidecars = ['-wal', '-shm'];
+		const moveAside = (): void => {
+			// The restore verified emptiness before writing the marker; verify
+			// again here so a database that somehow gained channel state in
+			// between is never moved out from under its channels.
+			const current = new SqliteStorage(
+				dbPath,
+				() => {
+					/* residue check only */
+				},
+				this._storageEncryptionKey
+					? { encryptionKey: this._storageEncryptionKey }
+					: undefined
+			);
+			current.open();
+			try {
+				assertEmptyTarget(current);
+			} finally {
+				current.close();
+			}
+			fs.renameSync(dbPath, keptPath);
+			for (const suffix of sidecars) {
+				try {
+					fs.renameSync(`${dbPath}${suffix}`, `${keptPath}${suffix}`);
+				} catch {
+					// A clean close leaves none behind.
+				}
+			}
+		};
+		const stagedExists = fs.existsSync(stagedPath);
+		const dbExists = fs.existsSync(dbPath);
+		if (stagedExists) {
+			if (dbExists) moveAside();
+			for (const suffix of sidecars) {
+				try {
+					fs.unlinkSync(`${stagedPath}${suffix}`);
+				} catch {
+					// None expected: the staged database was closed cleanly.
+				}
+			}
+			fs.renameSync(stagedPath, dbPath);
+			this.log('info', 'Capsule restore installed', {
+				head: marker.head,
+				previous: marker.keep
+			});
+		} else if (!dbExists) {
+			// Neither file: nothing this marker refers to exists any more.
+			fs.unlinkSync(markerPath);
+			throw new BeignetError(
+				'CAPSULE_RESTORE_INSTALL_FAILED',
+				`Capsule restore marker found but neither ${marker.staged} nor ` +
+					`the database exists; the previous database may be at ` +
+					`${marker.keep}. Inspect the data directory before starting`
+			);
+		}
+		fs.unlinkSync(markerPath);
 	}
 
 	/** Node identity secret; the capsule key and its embedded SCB derive from it. */
@@ -7003,18 +7216,34 @@ export class BeignetNode extends EventEmitter {
 				);
 				return;
 			}
+			// Testnet, regtest and signet share a coin type, so a capsule from
+			// this seed's node on another of those networks authenticates
+			// here. It is not a candidate: left in, its head could win the
+			// selection and fail the whole restore on the network check.
+			if (
+				!this.retrievedBackupMatchesNetwork(embedded, peerPubkey, 'capsule')
+			) {
+				return;
+			}
 			const held = this._peerRetrievedCapsules.get(peerPubkey);
+			const inline = capsule.inlineRecoveryState !== undefined;
+			// Higher head wins. At an equal head a replica carrying the inline
+			// Tier 2 journal is never displaced by an SCB-only twin (the same
+			// node composes both shapes of one head when a re-base fails).
 			if (
 				!held ||
 				capsule.writerEpoch > held.writerEpoch ||
 				(capsule.writerEpoch === held.writerEpoch &&
-					capsule.latestSequence >= held.latestSequence)
+					capsule.latestSequence > held.latestSequence) ||
+				(capsule.writerEpoch === held.writerEpoch &&
+					capsule.latestSequence === held.latestSequence &&
+					(inline || !held.inline))
 			) {
 				this._peerRetrievedCapsules.set(peerPubkey, {
 					blob: Buffer.from(blob),
 					writerEpoch: capsule.writerEpoch,
 					latestSequence: capsule.latestSequence,
-					inline: capsule.inlineRecoveryState !== undefined,
+					inline,
 					channelCount: embedded.channels.length,
 					receivedAt: Date.now()
 				});
@@ -7022,7 +7251,7 @@ export class BeignetNode extends EventEmitter {
 					fromPeer: peerPubkey,
 					writerEpoch: capsule.writerEpoch.toString(),
 					latestSequence: capsule.latestSequence.toString(),
-					inline: capsule.inlineRecoveryState !== undefined,
+					inline,
 					channelCount: embedded.channels.length
 				});
 			}
@@ -7048,7 +7277,25 @@ export class BeignetNode extends EventEmitter {
 			});
 			return;
 		}
+		if (!this.retrievedBackupMatchesNetwork(backup, peerPubkey, 'scb')) return;
 		this.offerRetrievedScb(encoded, backup, peerPubkey, 'scb');
+	}
+
+	/** A retrieved backup from another network is ignored, not kept. */
+	private retrievedBackupMatchesNetwork(
+		backup: IStaticChannelBackup,
+		fromPeer: string,
+		source: 'scb' | 'capsule'
+	): boolean {
+		const expected = this.toLnNetwork(this.networkName);
+		if (backup.network === expected) return true;
+		this.log('debug', 'Ignoring peer storage backup from another network', {
+			fromPeer,
+			source,
+			network: backup.network,
+			expected
+		});
+		return false;
 	}
 
 	/**

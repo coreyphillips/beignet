@@ -1582,6 +1582,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'409': {
 							description:
 								'Not in peer-storage mode, a restore is already running, this database already holds state a restore would discard, or no candidate validates'
+						},
+						'500': {
+							description:
+								'The restored database could not be written or swapped in (an operational fault, not a candidate defect)'
 						}
 					}
 				}

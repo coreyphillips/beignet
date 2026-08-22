@@ -811,7 +811,8 @@ because a quorum-marked database still refuses to start unbarriered)
 BEIGNET_RECOVERY_PROFILE = crash-v1 (the only accepted value in v1; no
 free-form quorum tuples, per 12.1)
 BEIGNET_RECOVERY_LEASE_CHECK_MS = idle writer lease re-check cadence in the
-guardian modes (default 300000; 0 disables; see 5.6)
+guardian modes (default 300000; 0 disables; see 5.6; an integer in
+0..2147483647, anything else refuses startup)
 ```
 
 Plus REST endpoints on the daemon: `GET /recovery/status` (readonly scope; the
@@ -830,17 +831,28 @@ an old device still running keeps acting on the same channels). The flow:
 boot the fresh database in peer-storage mode (it pushes nothing while empty),
 connect to the peers the node had channels with, read the candidates under
 `capsules` on `GET /recovery/status`, then restore. Tier 2 (an inline journal
-validates) installs the exact state into a fresh database file, tears the
-node down, swaps the files (the previous database is kept beside it as
+validates) installs the exact state into a fresh database file, carries the
+daemon-local state that lives beside the channel state across (persisted
+API-key rotations and revocations, webhooks, peer addresses), tears the node
+down, swaps the files (the previous database is kept beside it as
 `<network>.db.pre-capsule-restore-<timestamp>`) and holds the daemon in the
 `restart-required` state, where every route but the recovery surface answers
 503 NODE_RESTART_REQUIRED; a restart resumes the channels through
-reestablish. Tier 1 (SCB only) recovers the channels on the live node exactly
-like `POST /restore/scb`. Refusals: 409 CAPSULE_RESTORE_UNSUPPORTED (not
-peer-storage mode), 404 CAPSULE_RESTORE_NO_CANDIDATES, 409
-CAPSULE_RESTORE_TARGET_DIRTY (the database already holds state a restore
-would discard; use a fresh data directory), 409 CAPSULE_RESTORE_FAILED (no
-candidate validates, or conflicting heads). `GET /backup/peer-retrieved`
+reestablish. The swap is made durable by a marker
+(`<network>.capsule-restore.json`, written before the renames, cleared after):
+a boot that finds it finishes the swap from whichever side of the crash
+window it was interrupted on, so no restart lands on an empty database.
+Tier 1 (SCB only) recovers the channels on the live node exactly like
+`POST /restore/scb`. Retrieval keeps only capsules whose embedded SCB names
+this network (testnet, regtest and signet share a coin type, so a capsule
+from the same seed on another of them authenticates) and, at an equal head,
+never lets an SCB-only twin displace an inline replica. Refusals: 409
+CAPSULE_RESTORE_UNSUPPORTED (not peer-storage mode), 404
+CAPSULE_RESTORE_NO_CANDIDATES, 409 CAPSULE_RESTORE_TARGET_DIRTY (the database
+already holds state a restore would discard; use a fresh data directory), 409
+CAPSULE_RESTORE_FAILED (no candidate validates, or conflicting heads), 500
+CAPSULE_RESTORE_INSTALL_FAILED (the restored database could not be written or
+swapped in: an operational fault, not a candidate defect). `GET /backup/peer-retrieved`
 answers in every mode: the SCB embedded in a retrieved capsule is re-encoded
 under the wallet seed and reported with `source: 'capsule'`. CLI:
 `beignet recovery restore-capsule`.

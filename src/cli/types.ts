@@ -977,5 +977,9 @@ export interface BeignetNodeEvents {
 		framesApplied: number;
 		guardiansRepaired: number;
 		epoch: string;
+		/** Capsule restores only: 2 = exact state installed, 1 = SCB only. */
+		tier?: 1 | 2;
+		/** Capsule restores only: true after a Tier 2 install replaced the database. */
+		restartRequired?: boolean;
 	}) => void;
 }

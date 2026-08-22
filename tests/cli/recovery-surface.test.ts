@@ -16,6 +16,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
+import { resolveConfig } from '../../src/cli/config';
 import { BeignetError } from '../../src/cli/errors';
 import {
 	GuardianHttpServer,
@@ -96,11 +97,13 @@ function request(
 	port: number,
 	method: string,
 	urlPath: string,
-	body?: Record<string, unknown>
+	body?: Record<string, unknown>,
+	token?: string
 ): Promise<{ status: number; body: Record<string, unknown> }> {
 	return new Promise((resolve, reject) => {
 		const payload = body ? JSON.stringify(body) : undefined;
 		const headers: Record<string, string | number> = {};
+		if (token) headers['Authorization'] = `Bearer ${token}`;
 		if (payload) {
 			headers['Content-Type'] = 'application/json';
 			headers['Content-Length'] = Buffer.byteLength(payload);
@@ -233,6 +236,31 @@ describe('Recovery surface: configuration validation (pre-boot)', () => {
 		);
 	});
 
+	it('refuses a lease check interval Node would turn into a 1 ms poll', async () => {
+		// NaN (an unparseable env value) and anything past 2^31-1 ms both
+		// become a 1 ms timer in Node, which would hammer the guardian set.
+		process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS = 'soon';
+		try {
+			expect(
+				Number.isNaN(resolveConfig({}).recoveryLeaseCheckIntervalMs)
+			).to.equal(true);
+		} finally {
+			delete process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS;
+		}
+		await expectStartRefused(
+			{ dataDir: dir, recoveryLeaseCheckIntervalMs: Number.NaN },
+			/BEIGNET_RECOVERY_LEASE_CHECK_MS must be an integer/
+		);
+		await expectStartRefused(
+			{ dataDir: dir, recoveryLeaseCheckIntervalMs: 2 ** 31 },
+			/BEIGNET_RECOVERY_LEASE_CHECK_MS must be an integer/
+		);
+		await expectStartRefused(
+			{ dataDir: dir, recoveryLeaseCheckIntervalMs: 1.5 },
+			/BEIGNET_RECOVERY_LEASE_CHECK_MS must be an integer/
+		);
+	});
+
 	it('refuses an unknown recovery profile', async () => {
 		await expectStartRefused(
 			{ dataDir: dir, recoveryProfile: 'byzantine-v9' },
@@ -352,20 +380,36 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 	).nodePrivateKey;
 	const PEER_A = '02' + 'a1'.repeat(32);
 	const PEER_B = '02' + 'b2'.repeat(32);
+	const ADMIN_KEY = 'a'.repeat(64);
+	const MONITOR_KEY = 'b'.repeat(64);
+	const emptyScb = (network: string): string =>
+		encodeScb(
+			{ version: 1, network, createdAt: Date.now(), channels: [] },
+			NODE_SECRET
+		);
 
 	/** Feed a blob in as if a storage peer had returned it on reconnect. */
 	function retrieved(daemon: IStartedDaemon, peer: string, blob: Buffer): void {
 		daemon.node.getNode().emit('peer_storage:retrieved', peer, blob);
 	}
 
-	async function statusOf(port: number): Promise<{
+	async function statusOf(
+		port: number,
+		token?: string
+	): Promise<{
 		state: string;
 		capsules: {
 			candidates: number;
 			best: { inline: boolean; latestSequence: string } | null;
 		};
 	}> {
-		const res = await request(port, 'GET', '/recovery/status');
+		const res = await request(
+			port,
+			'GET',
+			'/recovery/status',
+			undefined,
+			token
+		);
 		expect(res.status).to.equal(200);
 		return res.body.result as {
 			state: string;
@@ -377,7 +421,7 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 	}
 
 	it('recognizes capsules, surfaces the embedded SCB, and restores Tier 2 across a restart', async function (): Promise<void> {
-		this.timeout(120_000);
+		this.timeout(180_000);
 		const dirA = tmpDir('capsule-a');
 		const dirB = tmpDir('capsule-b');
 		try {
@@ -412,25 +456,61 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 				.storage;
 			const scbOnlyBlob = composeRecoveryCapsule({
 				storage: storageA,
-				encryptedScb: encodeScb(
-					{ version: 1, network: 'bcrt', createdAt: Date.now(), channels: [] },
-					NODE_SECRET
-				),
+				encryptedScb: emptyScb('bcrt'),
 				nodeSecret: NODE_SECRET,
 				allowInline: false
+			}).blob;
+			// A capsule this seed's node composed on ANOTHER network: testnet,
+			// regtest and signet share a coin type, so it authenticates here.
+			const foreignNetworkBlob = composeRecoveryCapsule({
+				storage: storageA,
+				encryptedScb: emptyScb('tb'),
+				nodeSecret: NODE_SECRET
 			}).blob;
 			await deviceA.stop();
 
 			// Device B: same seed, fresh database, peer-storage mode. It boots
 			// normally (there is no guardian set to ask), and pushes nothing
-			// while empty, so the peers keep the capsule for it.
-			let deviceB = await startDaemon({
-				...OFFLINE,
-				dataDir: dirB,
-				recoveryMode: 'peer-storage'
-			});
+			// while empty, so the peers keep the capsule for it. It carries
+			// API keys so the restore can prove a revocation survives.
+			const bootB = (): Promise<IStartedDaemon> =>
+				startDaemon({
+					...OFFLINE,
+					dataDir: dirB,
+					recoveryMode: 'peer-storage',
+					apiToken: ADMIN_KEY,
+					apiKeys: [{ name: 'monitor', key: MONITOR_KEY, scopes: ['readonly'] }]
+				});
+			const get = (
+				port: number,
+				urlPath: string,
+				token = ADMIN_KEY
+			): Promise<{ status: number; body: Record<string, unknown> }> =>
+				request(port, 'GET', urlPath, undefined, token);
+			const post = (
+				port: number,
+				urlPath: string,
+				body: Record<string, unknown>
+			): Promise<{ status: number; body: Record<string, unknown> }> =>
+				request(port, 'POST', urlPath, body, ADMIN_KEY);
+			let deviceB = await bootB();
 			let portB = portOf(deviceB);
+			let report: { head: { writerEpoch: string; latestSequence: string } };
 			try {
+				// A revoked key must stay dead across the restore: the override
+				// lives in the database the swap replaces. So must a webhook.
+				expect((await get(portB, '/info', MONITOR_KEY)).status).to.equal(200);
+				const revoke = await post(portB, '/auth/keys/revoke', {
+					name: 'monitor'
+				});
+				expect(revoke.status).to.equal(200);
+				expect((await get(portB, '/info', MONITOR_KEY)).status).to.equal(401);
+				const hook = await post(portB, '/webhooks/register', {
+					url: 'http://127.0.0.1:9/hook',
+					events: ['payment:received']
+				});
+				expect(hook.status, JSON.stringify(hook.body)).to.equal(200);
+
 				expect(
 					(
 						deviceB.node.getNode() as unknown as {
@@ -439,47 +519,52 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 					).ourPeerStorageBlob,
 					'an empty node pushes no capsule'
 				).to.equal(null);
-				expect((await statusOf(portB)).capsules).to.deep.equal({
+				expect((await statusOf(portB, ADMIN_KEY)).capsules).to.deep.equal({
 					candidates: 0,
 					best: null
 				});
-				const none = await request(portB, 'GET', '/backup/peer-retrieved');
-				expect(none.status).to.equal(404);
-				const early = await request(
-					portB,
-					'POST',
-					'/recovery/restore-capsule',
-					{
-						confirm: true
-					}
+				expect((await get(portB, '/backup/peer-retrieved')).status).to.equal(
+					404
 				);
+				const early = await post(portB, '/recovery/restore-capsule', {
+					confirm: true
+				});
 				expect(early.status).to.equal(404);
 				expect((early.body.error as { code: string }).code).to.equal(
 					'CAPSULE_RESTORE_NO_CANDIDATES'
 				);
-				const unconfirmed = await request(
-					portB,
-					'POST',
-					'/recovery/restore-capsule',
-					{}
-				);
+				const unconfirmed = await post(portB, '/recovery/restore-capsule', {});
 				expect(unconfirmed.status).to.equal(400);
 
-				// Garbage is still ignored; the capsules are recognized.
+				// Garbage is still ignored, so is the other-network capsule
+				// (left in, its newer head would win the selection and fail the
+				// whole restore); the capsules are recognized.
 				retrieved(deviceB, PEER_A, crypto.randomBytes(200));
-				expect((await statusOf(portB)).capsules.candidates).to.equal(0);
+				retrieved(deviceB, PEER_A, foreignNetworkBlob);
+				expect((await statusOf(portB, ADMIN_KEY)).capsules.candidates).to.equal(
+					0
+				);
+				expect((await get(portB, '/backup/peer-retrieved')).status).to.equal(
+					404
+				);
 				retrieved(deviceB, PEER_A, scbOnlyBlob);
-				let status = await statusOf(portB);
+				let status = await statusOf(portB, ADMIN_KEY);
 				expect(status.capsules.candidates).to.equal(1);
 				expect(status.capsules.best?.inline).to.equal(false);
 				retrieved(deviceB, PEER_B, inlineBlob!);
-				status = await statusOf(portB);
+				status = await statusOf(portB, ADMIN_KEY);
+				expect(status.capsules.candidates).to.equal(2);
+				expect(status.capsules.best?.inline).to.equal(true);
+				// The same peer returning the SCB-only twin of the SAME head on
+				// a later reconnect must not displace the inline replica.
+				retrieved(deviceB, PEER_B, scbOnlyBlob);
+				status = await statusOf(portB, ADMIN_KEY);
 				expect(status.capsules.candidates).to.equal(2);
 				expect(status.capsules.best?.inline).to.equal(true);
 
 				// Tier 1 never regresses: the embedded SCB is surfaced under the
 				// wallet seed, the key POST /restore/scb decodes with.
-				const surfaced = await request(portB, 'GET', '/backup/peer-retrieved');
+				const surfaced = await get(portB, '/backup/peer-retrieved');
 				expect(surfaced.status).to.equal(200);
 				const scb = surfaced.body.result as {
 					encoded: string;
@@ -502,21 +587,22 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 				deviceB.node.on('recovery:restored', (data) =>
 					restored.push(data as Record<string, unknown>)
 				);
-				const res = await request(portB, 'POST', '/recovery/restore-capsule', {
+				const res = await post(portB, '/recovery/restore-capsule', {
 					confirm: true
 				});
 				expect(res.body.ok, JSON.stringify(res.body)).to.equal(true);
-				const report = res.body.result as {
+				const result = res.body.result as {
 					tier: number;
 					framesApplied: number;
 					rejectedCandidates: number;
 					restartRequired: boolean;
-					head: { latestSequence: string };
+					head: { writerEpoch: string; latestSequence: string };
 				};
-				expect(report.tier).to.equal(2);
-				expect(report.framesApplied).to.be.at.least(1);
-				expect(report.rejectedCandidates).to.equal(1);
-				expect(report.restartRequired).to.equal(true);
+				report = result;
+				expect(result.tier).to.equal(2);
+				expect(result.framesApplied).to.be.at.least(1);
+				expect(result.rejectedCandidates).to.equal(1);
+				expect(result.restartRequired).to.equal(true);
 				expect(progress).to.include('capsule:installed');
 				expect(progress).to.include('restore:complete');
 				expect(restored).to.have.length(1);
@@ -524,49 +610,101 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 
 				// The daemon holds for a restart: nothing but the recovery
 				// surface answers, and the status says why.
-				const held = await request(portB, 'GET', '/info');
+				const held = await get(portB, '/info');
 				expect(held.status).to.equal(503);
 				expect((held.body.error as { code: string }).code).to.equal(
 					'NODE_RESTART_REQUIRED'
 				);
-				const heldStatus = await statusOf(portB);
+				const heldStatus = await statusOf(portB, ADMIN_KEY);
 				expect(heldStatus.state).to.equal('restart-required');
 				expect(heldStatus.capsules.candidates).to.equal(2);
 			} finally {
 				await deviceB.stop();
 			}
 
-			// The previous database is kept beside the restored one.
+			// The previous database is kept beside the restored one; the swap
+			// marker cleared.
 			const files = fs.readdirSync(dirB);
 			expect(files).to.include('regtest.db');
-			expect(
-				files.some((f) => f.startsWith('regtest.db.pre-capsule-restore-'))
-			).to.equal(true);
+			const kept = files.find((f) =>
+				f.startsWith('regtest.db.pre-capsule-restore-')
+			);
+			expect(kept).to.not.equal(undefined);
 			expect(files.some((f) => f.endsWith('.capsule-restore'))).to.equal(false);
+			expect(files).to.not.include('regtest.capsule-restore.json');
 
-			// Restart: the node runs on A's exact state.
-			deviceB = await startDaemon({
-				...OFFLINE,
-				dataDir: dirB,
-				recoveryMode: 'peer-storage'
-			});
-			portB = portOf(deviceB);
-			try {
-				const after = await statusOf(portB);
+			const expectRestoredState = async (port: number): Promise<void> => {
+				const after = await statusOf(port, ADMIN_KEY);
 				expect(after.state).to.equal('running');
 				expect(after.capsules.candidates).to.equal(0);
-				const found = await request(
-					portB,
-					'GET',
-					`/invoice?paymentHash=${paymentHash}`
-				);
+				const found = await get(port, `/invoice?paymentHash=${paymentHash}`);
 				expect(found.status, JSON.stringify(found.body)).to.equal(200);
 				expect(
 					(found.body.result as { description: string }).description
 				).to.equal('capsule restore probe');
+				// Daemon state followed the operator: the revoked key is still
+				// dead and the webhook is still registered.
+				expect((await get(port, '/info', MONITOR_KEY)).status).to.equal(401);
+				const hooks = await get(port, '/webhooks');
+				expect(hooks.status).to.equal(200);
+				expect(
+					(hooks.body.result as Array<{ url: string }>).map((h) => h.url)
+				).to.deep.equal(['http://127.0.0.1:9/hook']);
+			};
+
+			// Restart: the node runs on A's exact state.
+			deviceB = await bootB();
+			portB = portOf(deviceB);
+			try {
+				await expectRestoredState(portB);
 			} finally {
 				await deviceB.stop();
 			}
+
+			// Kill points inside the swap. The marker makes the two renames
+			// durable: a boot that finds it finishes whatever a crash left,
+			// from either side of the window, and never opens an empty
+			// database instead.
+			const dbPath = path.join(dirB, 'regtest.db');
+			const stagedPath = path.join(dirB, 'regtest.db.capsule-restore');
+			const markerPath = path.join(dirB, 'regtest.capsule-restore.json');
+			const marker = JSON.stringify({
+				version: 1,
+				stagedAt: Date.now(),
+				staged: 'regtest.db.capsule-restore',
+				keep: 'regtest.db.pre-capsule-restore-replay',
+				head: report.head,
+				tier: 2
+			});
+			// (1) Crash between the renames: the canonical database was moved
+			// aside and the staged one not yet installed.
+			fs.renameSync(dbPath, stagedPath);
+			fs.writeFileSync(markerPath, marker);
+			deviceB = await bootB();
+			portB = portOf(deviceB);
+			try {
+				await expectRestoredState(portB);
+			} finally {
+				await deviceB.stop();
+			}
+			expect(fs.existsSync(markerPath)).to.equal(false);
+			expect(fs.existsSync(stagedPath)).to.equal(false);
+			// (2) Crash before the first rename: the empty pre-restore database
+			// is still canonical beside the fully staged one.
+			fs.renameSync(dbPath, stagedPath);
+			fs.copyFileSync(path.join(dirB, kept!), dbPath);
+			fs.writeFileSync(markerPath, marker);
+			deviceB = await bootB();
+			portB = portOf(deviceB);
+			try {
+				await expectRestoredState(portB);
+			} finally {
+				await deviceB.stop();
+			}
+			expect(fs.existsSync(markerPath)).to.equal(false);
+			expect(
+				fs.existsSync(path.join(dirB, 'regtest.db.pre-capsule-restore-replay'))
+			).to.equal(true);
 		} finally {
 			fs.rmSync(dirA, { recursive: true, force: true });
 			fs.rmSync(dirB, { recursive: true, force: true });
@@ -591,15 +729,7 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 				scratch.open();
 				const blob = composeRecoveryCapsule({
 					storage: scratch,
-					encryptedScb: encodeScb(
-						{
-							version: 1,
-							network: 'bcrt',
-							createdAt: Date.now(),
-							channels: []
-						},
-						NODE_SECRET
-					),
+					encryptedScb: emptyScb('bcrt'),
 					nodeSecret: NODE_SECRET
 				}).blob;
 				scratch.close();
@@ -619,6 +749,25 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 				const info = await request(port, 'GET', '/info');
 				expect(info.status).to.equal(200);
 				expect((await statusOf(port)).state).to.equal('running');
+
+				// A staged file that cannot be written is an operational
+				// failure, not a candidate defect: 500, and the daemon keeps
+				// serving. (A directory squatting on the staged path makes the
+				// open fail.)
+				fs.mkdirSync(path.join(dir, 'regtest.db.capsule-restore'));
+				const broken = await request(
+					port,
+					'POST',
+					'/recovery/restore-capsule',
+					{ confirm: true }
+				);
+				expect(broken.status).to.equal(500);
+				expect((broken.body.error as { code: string }).code).to.equal(
+					'CAPSULE_RESTORE_INSTALL_FAILED'
+				);
+				fs.rmdirSync(path.join(dir, 'regtest.db.capsule-restore'));
+				expect((await statusOf(port)).state).to.equal('running');
+				expect((await request(port, 'GET', '/info')).status).to.equal(200);
 			} finally {
 				await daemon.stop();
 			}
@@ -646,9 +795,7 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 					portDirty,
 					'POST',
 					'/recovery/restore-capsule',
-					{
-						confirm: true
-					}
+					{ confirm: true }
 				);
 				expect(res.status).to.equal(409);
 				expect((res.body.error as { code: string }).code).to.equal(
@@ -811,6 +958,19 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 				expect((fencedOnA[0].supersededBy as { epoch: string }).epoch).to.equal(
 					'2'
 				);
+				// The barrier noticing the same takeover on A's next commit must
+				// not relay a second recovery:fenced: one fence, one event.
+				const late = await request(portA, 'POST', '/invoice/create', {
+					amountSats: 5,
+					description: 'after the takeover'
+				});
+				expect(late.status, JSON.stringify(late.body)).to.equal(200);
+				await waitFor(async () => {
+					const res = await request(portA, 'GET', '/recovery/status');
+					return (res.body.result as { node: { fenced: boolean } }).node.fenced;
+				});
+				expect(fencedOnA).to.have.length(1);
+
 				// A fenced node is not mainnet ready, whatever else passes.
 				const fencedReady = await request(portA, 'GET', '/readiness');
 				const fencedCheck = readinessCheck(fencedReady.body, 'CHANNEL_BACKUP');
