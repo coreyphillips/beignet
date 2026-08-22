@@ -1028,6 +1028,53 @@ describe('Gossip intake queue (LightningNode)', () => {
 		expect(remaining[0].nodeId.equals(ann.msg.nodeId1)).to.equal(true);
 	});
 
+	it('boot keeps node rows referenced by channel rows retained past the ceiling', async () => {
+		// restoreChannel deliberately leaves excess verified channel rows on
+		// disk when the ceiling was lowered between runs. Their endpoints are
+		// absent from the capped graph, but their node rows must survive with
+		// them or a later boot with a normal ceiling restores placeholder
+		// nodes without announcements.
+		node.destroy();
+		storage = new SqliteStorage(dbPath);
+		storage.open();
+
+		const now = Math.floor(Date.now() / 1000);
+		for (const block of [830, 831]) {
+			const ann = buildAnnouncement(block, REGTEST_CHAIN_HASH);
+			const upd = buildUpdate(ann, now - 60, 0, REGTEST_CHAIN_HASH);
+			storage.saveGossipChannel(ann.msg.shortChannelId.toString('hex'), {
+				shortChannelId: ann.msg.shortChannelId,
+				nodeId1: ann.msg.nodeId1,
+				nodeId2: ann.msg.nodeId2,
+				features: Buffer.alloc(0),
+				announcement: ann.msg,
+				announcementVerified: true,
+				update1: upd.msg,
+				update1Verified: true
+			});
+			for (const nodeId of [ann.msg.nodeId1, ann.msg.nodeId2]) {
+				storage.saveGossipNode(nodeId.toString('hex'), {
+					nodeId,
+					channels: new Set([ann.msg.shortChannelId.toString('hex')])
+				});
+			}
+		}
+
+		const savedCap = NetworkGraph.MAX_CHANNELS;
+		NetworkGraph.MAX_CHANNELS = 1;
+		try {
+			node = new LightningNode(makeConfig());
+		} finally {
+			NetworkGraph.MAX_CHANNELS = savedCap;
+		}
+
+		// One verified row holds the single slot; the other stays on disk,
+		// and every node row a disk channel row references stays with it.
+		expect(graphOf(node).getChannelCount()).to.equal(1);
+		expect(storage.loadAllGossipChannels()).to.have.length(2);
+		expect(storage.loadAllGossipNodes()).to.have.length(4);
+	});
+
 	it('a far-future update never reaches peer policy adoption', async () => {
 		// The adoption path runs before the graph gate and keys its own
 		// freshness off the update timestamp: adopted once, a max-u32 update

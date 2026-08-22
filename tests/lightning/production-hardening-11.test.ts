@@ -1195,6 +1195,76 @@ describe('Production Hardening 11', function () {
 				node.destroy();
 				fs.rmSync(tmpDir, { recursive: true, force: true });
 			});
+
+			it('should not delete node rows when storage lacks deleteGossipChannel', () => {
+				const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ph11-gdb6-'));
+				const dbPath = path.join(tmpDir, 'test.db');
+				const storage = new SqliteStorage(dbPath);
+				storage.open();
+
+				const config = makeNodeConfig(508);
+				config.storage = storage;
+				const node = new LightningNode(config);
+				node.on('error', () => {});
+
+				const now = Math.floor(Date.now() / 1000);
+				const staleTs = now - DEFAULT_PRUNE_MAX_AGE - 100;
+				const scidHex = 'aabbccdd55555555';
+				const nodeKey1 = Buffer.alloc(33, 1);
+				const nodeKey2 = Buffer.alloc(33, 2);
+
+				storage.saveGossipChannel(scidHex, {
+					shortChannelId: Buffer.from(scidHex, 'hex'),
+					nodeId1: nodeKey1,
+					nodeId2: nodeKey2,
+					features: Buffer.alloc(0),
+					announcement: {} as any,
+					update1: null as any,
+					update2: null as any
+				});
+				storage.saveGossipNode(nodeKey1.toString('hex'), {
+					nodeId: nodeKey1,
+					channels: new Set([scidHex])
+				});
+
+				(node as any).graph.addChannelAnnouncement({
+					nodeSignature1: Buffer.alloc(64),
+					nodeSignature2: Buffer.alloc(64),
+					bitcoinSignature1: Buffer.alloc(64),
+					bitcoinSignature2: Buffer.alloc(64),
+					features: Buffer.alloc(0),
+					chainHash: REGTEST_CHAIN_HASH,
+					shortChannelId: Buffer.from(scidHex, 'hex'),
+					nodeId1: nodeKey1,
+					nodeId2: nodeKey2,
+					bitcoinKey1: nodeKey1,
+					bitcoinKey2: nodeKey2
+				});
+				(node as any).graph.applyChannelUpdate({
+					signature: Buffer.alloc(64),
+					chainHash: REGTEST_CHAIN_HASH,
+					shortChannelId: Buffer.from(scidHex, 'hex'),
+					timestamp: staleTs,
+					messageFlags: 0,
+					channelFlags: 0,
+					cltvExpiryDelta: 40,
+					htlcMinimumMsat: 0n,
+					feeBaseMsat: 1000,
+					feeProportionalMillionths: 1
+				});
+
+				// Without deleteGossipChannel the evicted channel row survives
+				// on disk, so deleting its node row would strand a placeholder
+				// node on the next boot: node deletion must be skipped too.
+				(storage as any).deleteGossipChannel = undefined;
+				(node as any).pruneStaleGossipWithStorage();
+
+				expect(storage.loadAllGossipChannels().length).to.equal(1);
+				expect(storage.loadAllGossipNodes().length).to.equal(1);
+
+				node.destroy();
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			});
 		});
 
 		describe('2c. Reconnect timer cleanup', () => {

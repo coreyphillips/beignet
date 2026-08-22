@@ -141,6 +141,13 @@ export class NetworkGraph {
 	// can delete the persisted gossip_nodes row; the graph itself never
 	// touches storage (issue #447).
 	private readonly _onNodeEvicted?: (nodeIdHex: string) => void;
+	// Non-null while a ceiling replacement is in flight: removeChannel
+	// deposits GC'd node hexes here instead of reporting them, and the
+	// admission flushes only the ones still absent once the incoming
+	// channel is in place. Reporting mid-replacement would delete the
+	// persisted row of an endpoint the victim shares with the admitted
+	// channel.
+	private _deferredNodeEvictions: string[] | null = null;
 
 	constructor(
 		chainHash: Buffer = BITCOIN_CHAIN_HASH,
@@ -178,6 +185,23 @@ export class NetworkGraph {
 	 * their fabricated announcements makes them unevictable. The ceiling
 	 * still holds absolutely.
 	 */
+	/**
+	 * Report deferred node evictions once an admission has completed. Only
+	 * nodes still absent are reported: an endpoint the ceiling victim
+	 * shared with the admitted channel was re-created by the insert and
+	 * its persisted row must survive.
+	 */
+	private _flushDeferredNodeEvictions(): void {
+		const deferred = this._deferredNodeEvictions;
+		this._deferredNodeEvictions = null;
+		if (!deferred) return;
+		for (const nodeIdHex of deferred) {
+			if (!this._nodes.has(nodeIdHex)) {
+				this._onNodeEvicted?.(nodeIdHex);
+			}
+		}
+	}
+
 	private _evictOneUnverified(): boolean {
 		const victim = this._unverifiedChannels.values().next();
 		if (victim.done) return false;
@@ -263,9 +287,13 @@ export class NetworkGraph {
 		// Ceiling (issue #446): only new entries are growth (the upgrade path
 		// above settles in place), and only a verified admission may make room
 		// by evicting an unverified entry; unverified ones are refused, so
-		// garbage displaces nothing.
+		// garbage displaces nothing. Node-eviction reports wait until the
+		// incoming channel is inserted (the victim may share an endpoint).
 		if (this._channels.size >= NetworkGraph.MAX_CHANNELS) {
-			if (verified !== true || !this._evictOneUnverified()) {
+			if (verified !== true) return false;
+			this._deferredNodeEvictions = [];
+			if (!this._evictOneUnverified()) {
+				this._deferredNodeEvictions = null;
 				return false;
 			}
 		}
@@ -304,6 +332,7 @@ export class NetworkGraph {
 		}
 		this._nodes.get(node2Hex)!.channels.add(scidHex);
 
+		this._flushDeferredNodeEvictions();
 		return true;
 	}
 
@@ -548,12 +577,14 @@ export class NetworkGraph {
 		const node1Hex = channel.nodeId1.toString('hex');
 		const node2Hex = channel.nodeId2.toString('hex');
 
+		const evictedNodes: string[] = [];
+
 		const node1 = this._nodes.get(node1Hex);
 		if (node1) {
 			node1.channels.delete(scidHex);
 			if (node1.channels.size === 0) {
 				this._nodes.delete(node1Hex);
-				this._onNodeEvicted?.(node1Hex);
+				evictedNodes.push(node1Hex);
 			}
 		}
 
@@ -562,7 +593,19 @@ export class NetworkGraph {
 			node2.channels.delete(scidHex);
 			if (node2.channels.size === 0) {
 				this._nodes.delete(node2Hex);
-				this._onNodeEvicted?.(node2Hex);
+				evictedNodes.push(node2Hex);
+			}
+		}
+
+		// Report only after both endpoints are cleaned: a throwing callback
+		// must not leave node2 pointing at a channel that no longer exists.
+		// Inside a ceiling replacement the reports are deferred until the
+		// incoming channel is in place.
+		for (const nodeIdHex of evictedNodes) {
+			if (this._deferredNodeEvictions) {
+				this._deferredNodeEvictions.push(nodeIdHex);
+			} else {
+				this._onNodeEvicted?.(nodeIdHex);
 			}
 		}
 
@@ -713,7 +756,11 @@ export class NetworkGraph {
 		const isNew = !this._channels.has(scidHex);
 		if (isNew && this._channels.size >= NetworkGraph.MAX_CHANNELS) {
 			if (channel.announcementVerified === true) {
-				if (!this._evictOneUnverified()) return;
+				this._deferredNodeEvictions = [];
+				if (!this._evictOneUnverified()) {
+					this._deferredNodeEvictions = null;
+					return;
+				}
 			} else {
 				this._onChannelEvicted?.(scidHex);
 				return;
@@ -742,6 +789,8 @@ export class NetworkGraph {
 			});
 		}
 		this._nodes.get(node2Hex)!.channels.add(scidHex);
+
+		this._flushDeferredNodeEvictions();
 	}
 
 	/**
