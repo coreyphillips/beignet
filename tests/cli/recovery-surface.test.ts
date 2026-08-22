@@ -27,6 +27,7 @@ import {
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { decodeScb, encodeScb } from '../../src/lightning/backup/scb';
+import { encodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
 import {
 	LnCoinType,
 	deriveLightningKeysFromMnemonic
@@ -298,6 +299,40 @@ describe('Recovery surface: configuration validation (pre-boot)', () => {
 		);
 	});
 
+	it('refuses a reestablish hold Node would turn into a 1 ms delay', async () => {
+		// Same timer trap as the lease check: past 2^31-1 ms the hold would fire
+		// after 1 ms and look like a configured window that never holds.
+		process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS = 'later';
+		try {
+			expect(
+				Number.isNaN(resolveConfig({}).recoveryReestablishHoldMs)
+			).to.equal(true);
+		} finally {
+			delete process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS;
+		}
+		await expectStartRefused(
+			{ dataDir: dir, recoveryReestablishHoldMs: Number.NaN },
+			/BEIGNET_RECOVERY_REESTABLISH_HOLD_MS must be an integer/
+		);
+		await expectStartRefused(
+			{ dataDir: dir, recoveryReestablishHoldMs: 2 ** 31 },
+			/BEIGNET_RECOVERY_REESTABLISH_HOLD_MS must be an integer/
+		);
+		await expectStartRefused(
+			{ dataDir: dir, recoveryReestablishHoldMs: -1 },
+			/BEIGNET_RECOVERY_REESTABLISH_HOLD_MS must be an integer/
+		);
+	});
+
+	it('reads the reestablish hold from the environment', () => {
+		process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS = '900000';
+		try {
+			expect(resolveConfig({}).recoveryReestablishHoldMs).to.equal(900_000);
+		} finally {
+			delete process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS;
+		}
+	});
+
 	it('refuses an unknown recovery profile', async () => {
 		await expectStartRefused(
 			{ dataDir: dir, recoveryProfile: 'byzantine-v9' },
@@ -402,6 +437,110 @@ describe('Recovery surface: peer-storage mode', () => {
 			const check = readinessCheck(readiness.body, 'CHANNEL_BACKUP');
 			expect(check.status).to.equal('WARN');
 			expect(check.message).to.match(/storage peers/);
+		} finally {
+			await daemon.stop();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('holds a peer channel_reestablish for an unknown channel and reports it (issue #462)', async function (): Promise<void> {
+		this.timeout(30_000);
+		const dir = tmpDir('peer-storage-hold');
+		const daemon = await startDaemon({
+			...OFFLINE,
+			dataDir: dir,
+			recoveryMode: 'peer-storage'
+		});
+		try {
+			const node = daemon.node.getNode();
+			const sent: Array<{ type: number }> = [];
+			node.on('message:outbound', (_peer: string, type: number) => {
+				sent.push({ type });
+			});
+			const channelId = crypto.randomBytes(32);
+			const peer = crypto.randomBytes(33).toString('hex');
+			// channel_reestablish (136) for a channel this fresh database has no
+			// record of, which is what a peer sends the instant a restore target
+			// connects. Pre-#462 this drew the BOLT 1 error (17) and the peer
+			// force-closed the channel the capsule was about to restore.
+			node.handlePeerMessage(
+				peer,
+				136,
+				encodeChannelReestablishMessage({
+					channelId,
+					nextCommitmentNumber: 1n,
+					nextRevocationNumber: 0n,
+					yourLastPerCommitmentSecret: Buffer.alloc(32),
+					myCurrentPerCommitmentPoint: Buffer.concat([
+						Buffer.from([0x02]),
+						crypto.randomBytes(32)
+					])
+				})
+			);
+
+			expect(sent, 'nothing answered the peer').to.have.length(0);
+
+			const res = await request(portOf(daemon), 'GET', '/recovery/status');
+			const result = res.body.result as {
+				node: {
+					heldReestablish: Array<{
+						peer: string;
+						channelId: string;
+						expiresAt: number;
+					}>;
+				} | null;
+			};
+			const held = result.node?.heldReestablish ?? [];
+			expect(held, 'the waiting peer is on the status route').to.have.length(1);
+			expect(held[0].peer).to.equal(peer);
+			expect(held[0].channelId).to.equal(channelId.toString('hex'));
+			// The operator's deadline: the default window is 10 minutes.
+			expect(held[0].expiresAt).to.be.greaterThan(Date.now());
+		} finally {
+			await daemon.stop();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('answers immediately when the hold is switched off', async function (): Promise<void> {
+		this.timeout(30_000);
+		const dir = tmpDir('peer-storage-nohold');
+		const daemon = await startDaemon({
+			...OFFLINE,
+			dataDir: dir,
+			recoveryMode: 'peer-storage',
+			recoveryReestablishHoldMs: 0
+		});
+		try {
+			const node = daemon.node.getNode();
+			const sent: Array<{ type: number }> = [];
+			node.on('message:outbound', (_peer: string, type: number) => {
+				sent.push({ type });
+			});
+			node.handlePeerMessage(
+				crypto.randomBytes(33).toString('hex'),
+				136,
+				encodeChannelReestablishMessage({
+					channelId: crypto.randomBytes(32),
+					nextCommitmentNumber: 1n,
+					nextRevocationNumber: 0n,
+					yourLastPerCommitmentSecret: Buffer.alloc(32),
+					myCurrentPerCommitmentPoint: Buffer.concat([
+						Buffer.from([0x02]),
+						crypto.randomBytes(32)
+					])
+				})
+			);
+
+			expect(
+				sent.some((m) => m.type === 17),
+				'pre-#462 conduct'
+			).to.be.true;
+			const res = await request(portOf(daemon), 'GET', '/recovery/status');
+			const result = res.body.result as {
+				node: { heldReestablish: unknown[] } | null;
+			};
+			expect(result.node?.heldReestablish).to.have.length(0);
 		} finally {
 			await daemon.stop();
 			fs.rmSync(dir, { recursive: true, force: true });

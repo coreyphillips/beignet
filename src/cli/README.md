@@ -392,6 +392,7 @@ through env/config, following the other `BEIGNET_*` settings:
 BEIGNET_RECOVERY_MODE=quorum   # off | peer-storage | async-remote | quorum
 BEIGNET_RECOVERY_GUARDIANS=<64-hex-pubkey>@https://g1.example,<64-hex-pubkey>@https://g2.example,<64-hex-pubkey>@http://<v3>.onion
 BEIGNET_RECOVERY_PROFILE=crash-v1   # optional; crash-v1 is the only value
+BEIGNET_RECOVERY_REESTABLISH_HOLD_MS=600000   # peer-storage only; 0 disables
 ```
 
 - `off` (default): nothing changes.
@@ -401,7 +402,16 @@ BEIGNET_RECOVERY_PROFILE=crash-v1   # optional; crash-v1 is the only value
   boot the same mnemonic on a FRESH data dir in this mode (an empty node
   pushes nothing, so the peers keep the capsule), connect to the peers the
   node had channels with, check `capsules` on `GET /recovery/status`, then
-  `POST /recovery/restore-capsule` with `{ "confirm": true }`. When an
+  `POST /recovery/restore-capsule` with `{ "confirm": true }`. Connecting
+  before you restore is safe: in this mode the node HOLDS a peer's
+  `channel_reestablish` for a channel the empty database has no record of
+  instead of answering it with the BOLT 1 unknown-channel error, which would
+  make the peer force-close the channel the restore is about to resume
+  (issue #462). `GET /recovery/status` lists each held peer under
+  `node.heldReestablish` with the `expiresAt` you have to beat; past that the
+  error goes out as before. The window is
+  `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS` (default 600000; 0 answers
+  immediately) and it is granted once per peer and channel. When an
   inline journal validates (Tier 2) the exact state is installed into a
   fresh database, the daemon holds in the `restart-required` state (every
   route but the recovery surface answers 503 `NODE_RESTART_REQUIRED`) and a
@@ -486,8 +496,8 @@ Operational notes:
   the guardians or the SCB route.
 - Recovery events relayed over SSE and webhooks (always on):
   `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`,
-  `recovery:guardian_unreachable`, `recovery:restore-progress`,
-  `recovery:restored`.
+  `recovery:reestablish-held`, `recovery:guardian_unreachable`,
+  `recovery:restore-progress`, `recovery:restored`.
 
 #### Health & Monitoring
 
@@ -1556,6 +1566,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_RECOVERY_GUARDIANS` | Guardian set for async-remote/quorum, comma-separated `<64-hex-x-only-pubkey>@<http(s) url>` (crash-v1: exactly three; malformed entries refuse startup) |
 | `BEIGNET_RECOVERY_PROFILE` | Recovery fault-model profile; `crash-v1` is the only accepted value and the default |
 | `BEIGNET_RECOVERY_LEASE_CHECK_MS` | Guardian modes: idle writer lease re-check cadence in ms, an integer in 0..2147483647 (default: 300000; 0 disables; anything else refuses startup) |
+| `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS` | peer-storage mode: how long an unknown channel's `channel_reestablish` is held before the BOLT 1 error goes out, an integer in 0..2147483647 (default: 600000; 0 answers immediately; anything else refuses startup) |
 
 ### Priority Order
 
@@ -1753,7 +1764,7 @@ event: channel:ready
 data: {"channelId":"cd34..."}
 ```
 
-Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`, and the Recovery Protocol events `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`, `recovery:guardian_unreachable`, `recovery:restore-progress`, `recovery:restored` (always on; low volume, and operator dashboards ride them).
+Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`, and the Recovery Protocol events `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`, `recovery:reestablish-held`, `recovery:guardian_unreachable`, `recovery:restore-progress`, `recovery:restored` (always on; low volume, and operator dashboards ride them).
 
 - `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
 - `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).

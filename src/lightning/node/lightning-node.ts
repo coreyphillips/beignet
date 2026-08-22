@@ -345,6 +345,7 @@ bitcoin.initEccLib(ecc);
  * - 'peer:disconnect-requested' (pubkey: string): external-transport (message:outbound) mode only; the host must sever its connection to this peer, the protocol side (channels marked for reestablish) is already applied
  * - 'peer:error' (pubkey: string, error: Error)
  * - 'peer_storage:retrieved' (peerPubkey: string, blob: Buffer)
+ * - 'recovery:reestablish-held' (peerPubkey: string, channelIdHex: string, expiresAt: number): a peer's channel_reestablish for a channel this node has no record of was parked instead of failed, because the node may still be an incomplete restore target (issue #462)
  * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction): an on-chain claim was declined because it cannot pay its own fee
  */
 
@@ -1072,6 +1073,12 @@ export class LightningNode extends EventEmitter {
 			largeChannels: this.largeChannels,
 			// BOLT 2 quiescence watchdog window (default 60s in the manager).
 			quiescenceTimeoutMs: config.quiescenceTimeoutMs,
+			// Recovery 5.7 (issue #462): on a node that may still be an
+			// incomplete restore target, park an unknown channel's reestablish
+			// for this long instead of failing it. Unset everywhere else, where
+			// the manager answers immediately exactly as before.
+			unknownChannelReestablishHoldMs:
+				config.recovery?.unknownChannelReestablishHoldMs,
 			// Liquidity ads seller policy (bLIP-0051): sign will_fund for inbound
 			// request_funds and fund the contribution via the fundingProvider.
 			leaseRates: config.leaseRates,
@@ -3373,6 +3380,28 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// Recovery 5.7 (issue #462): a peer is waiting on a channel this node
+		// has no record of, and the reply is parked rather than sent. This is
+		// the operator's cue that a Recovery Capsule has to be applied before
+		// the window ends, so it is surfaced rather than logged at debug.
+		this.channelManager.on(
+			'reestablish:held',
+			(peerPubkey: string, channelId: Buffer, expiresAt: number) => {
+				const channelIdHex = channelId.toString('hex');
+				this.emitStructuredLog('channel', 'reestablish_held', {
+					peerPubkey,
+					channelId: channelIdHex,
+					expiresAt
+				});
+				this.emit(
+					'recovery:reestablish-held',
+					peerPubkey,
+					channelIdHex,
+					expiresAt
+				);
+			}
+		);
+
 		// A quorum barrier is holding a batch's messages (Recovery 5.8). Purely
 		// informational: the channel is waiting, not broken, and the release
 		// happens on its own once the guardians answer.
@@ -4546,6 +4575,19 @@ export class LightningNode extends EventEmitter {
 			status: ChannelRecoveryStatus;
 			awaitingDurability: boolean;
 		}>;
+		/**
+		 * Peers whose channel_reestablish is parked because it names a channel
+		 * this node has no record of (5.7, issue #462). Non-empty only on a
+		 * node configured as a possible restore target, and it is the operator's
+		 * deadline: each entry's expiresAt is when the peer stops waiting and
+		 * gets told the channel is unknown, which force-closes it. Deliberately
+		 * NOT in `channels`, which describes channels this node HAS.
+		 */
+		heldReestablish: Array<{
+			peer: string;
+			channelId: string;
+			expiresAt: number;
+		}>;
 	} {
 		const gated = !this.recoveryPermitsPeerTraffic();
 		const barrier = this.recoveryBarrier?.snapshot();
@@ -4585,7 +4627,8 @@ export class LightningNode extends EventEmitter {
 			backfillLost:
 				barrier?.backfillLost ??
 				(this.storage ? chainLostBackfill(this.storage) !== null : false),
-			channels
+			channels,
+			heldReestablish: this.channelManager.heldUnknownChannelReestablish()
 		};
 	}
 

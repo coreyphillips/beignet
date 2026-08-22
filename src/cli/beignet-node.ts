@@ -336,6 +336,17 @@ export interface BeignetNodeOptions {
 	 */
 	recoveryLeaseCheckIntervalMs?: number;
 	/**
+	 * peer-storage mode: how long a peer's channel_reestablish for a channel
+	 * this node has no record of is held before the BOLT 1 error goes out
+	 * (issue #462). Default 10 minutes; 0 answers immediately, which is the
+	 * pre-#462 conduct. A node restoring over peer_storage boots empty on
+	 * purpose and gets the peer's reestablish in the same instant as the
+	 * Recovery Capsule that answers it, so failing the channel there
+	 * force-closes exactly what the restore is about to resume. Ignored in
+	 * every other mode.
+	 */
+	recoveryReestablishHoldMs?: number;
+	/**
 	 * Encrypt the SQLite database at rest with a key derived from the wallet
 	 * seed (default true). An existing plaintext database is migrated in place
 	 * on first open; restoring a backup requires the same mnemonic. Set false
@@ -778,6 +789,8 @@ export class BeignetNode extends EventEmitter {
 	private _leaseCheckTimer?: ReturnType<typeof setInterval>;
 	private _leaseCheckInFlight = false;
 	private _leaseCheckIntervalMs = BeignetNode.DEFAULT_LEASE_CHECK_INTERVAL_MS;
+	/** peer-storage unknown-reestablish hold window (issue #462). */
+	private _reestablishHoldMs = BeignetNode.DEFAULT_REESTABLISH_HOLD_MS;
 	private mnemonic: string;
 	private networkName: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	private dataDir: string;
@@ -801,6 +814,15 @@ export class BeignetNode extends EventEmitter {
 	static INITIAL_GOSSIP_PRIME_TIMEOUT_MS = 90_000;
 	/** Idle writer lease re-check cadence (issue #455). */
 	private static readonly DEFAULT_LEASE_CHECK_INTERVAL_MS = 5 * 60_000;
+	/**
+	 * peer-storage mode: how long an unknown channel's reestablish is held
+	 * before the peer is told the channel is unknown (issue #462). Long
+	 * enough for an operator to read `capsules` off GET /recovery/status and
+	 * run POST /recovery/restore-capsule, short enough that a peer waiting on
+	 * a channel this node genuinely never had resolves within one reconnect
+	 * cycle.
+	 */
+	private static readonly DEFAULT_REESTABLISH_HOLD_MS = 10 * 60_000;
 	/** Largest delay Node's timers honor; beyond it they fire after 1 ms. */
 	private static readonly MAX_TIMER_MS = 2_147_483_647;
 	/**
@@ -953,6 +975,19 @@ export class BeignetNode extends EventEmitter {
 				);
 			}
 			this._leaseCheckIntervalMs = ms;
+		}
+		if (opts.recoveryReestablishHoldMs !== undefined) {
+			// setTimeout turns anything past 2^31-1 ms into a 1 ms delay, which
+			// would look like a configured hold that never actually holds.
+			const ms = opts.recoveryReestablishHoldMs;
+			if (!Number.isInteger(ms) || ms < 0 || ms > BeignetNode.MAX_TIMER_MS) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					`recoveryReestablishHoldMs must be an integer between 0 and ` +
+						`${BeignetNode.MAX_TIMER_MS} (got ${String(ms)})`
+				);
+			}
+			this._reestablishHoldMs = ms;
 		}
 		const networkName = this.networkName;
 
@@ -1626,6 +1661,23 @@ export class BeignetNode extends EventEmitter {
 			this.log('error', 'Recovery backfill lost', { detail });
 			this.emit('recovery:backfill-lost', { detail });
 		});
+		this.node.on(
+			'recovery:reestablish-held',
+			(peerPubkey: string, channelId: string, expiresAt: number) => {
+				this.log(
+					'warn',
+					'Holding a peer channel_reestablish for an unknown channel: ' +
+						'apply a Recovery Capsule (/recovery/restore-capsule) before ' +
+						'the hold expires, or the peer will force-close',
+					{ peerPubkey, channelId, expiresAt }
+				);
+				this.emit('recovery:reestablish-held', {
+					peerPubkey,
+					channelId,
+					expiresAt
+				});
+			}
+		);
 
 		// Peer storage: peers that hold our SCB return it on every reconnect.
 		// Keep only blobs that decrypt as OUR backup (a peer may return stale
@@ -1755,7 +1807,17 @@ export class BeignetNode extends EventEmitter {
 			// Journal + Recovery Capsule over peer_storage, no guardians.
 			// 'local' is the honest durability label for a node with no
 			// replicator; capsule distribution rides peerStorageEnabled.
-			this.recoveryNodeConfig = { enabled: true, durability: 'local' };
+			//
+			// This is the only mode that can be an INCOMPLETE restore target:
+			// it boots empty on purpose and waits for the operator to apply a
+			// capsule. Hold an unknown channel's reestablish for that window
+			// rather than failing the channel the restore is about to resume
+			// (spec 5.7, issue #462).
+			this.recoveryNodeConfig = {
+				enabled: true,
+				durability: 'local',
+				unknownChannelReestablishHoldMs: this._reestablishHoldMs
+			};
 			return;
 		}
 		// Guardian-backed modes. The daemon validates the guardian set before

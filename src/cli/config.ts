@@ -253,7 +253,13 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			(process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS
 				? parseInt(process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS, 10)
 				: undefined) ??
-			file.recoveryLeaseCheckIntervalMs
+			file.recoveryLeaseCheckIntervalMs,
+		recoveryReestablishHoldMs:
+			cliFlags.recoveryReestablishHoldMs ??
+			(process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS
+				? parseInt(process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS, 10)
+				: undefined) ??
+			file.recoveryReestablishHoldMs
 	};
 }
 

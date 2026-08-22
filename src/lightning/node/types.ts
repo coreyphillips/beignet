@@ -370,6 +370,26 @@ export interface INodeConfig {
 		 * the parsed set; a peer-storage-only node has none.
 		 */
 		guardians?: GuardianDescriptor[];
+		/**
+		 * How long an inbound channel_reestablish naming a channel this node
+		 * has NO record of is held before the BOLT 1 error goes out (5.7,
+		 * issue #462). Absent or 0 answers immediately, which is what every
+		 * mode but peer-storage wants.
+		 *
+		 * Set it on a node that may be an INCOMPLETE restore target. A node
+		 * restoring over peer_storage boots on a deliberately empty database
+		 * and receives the peer's reestablish in the same instant as the
+		 * Recovery Capsule that would answer it, so failing the channel there
+		 * force-closes exactly the channel the restore is about to resume.
+		 * The peer waits indefinitely for silence and permanently for an
+		 * error, so the deferral costs nothing and buys the restore window.
+		 * The error is deferred, never dropped.
+		 *
+		 * Guardian modes have no use for it: their startup gate already
+		 * refuses all peer contact until ownership is confirmed, and a
+		 * guardian restore rebuilds the database before the node runs.
+		 */
+		unknownChannelReestablishHoldMs?: number;
 	};
 	/** Chain backend for blockchain monitoring (Electrum, Esplora, etc.) */
 	chainBackend?: IChainBackend;
