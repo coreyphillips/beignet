@@ -57,6 +57,23 @@ function parseApiKeysEnv(): BeignetConfig['apiKeys'] {
 }
 
 /**
+ * An env value that must be a COMPLETE base-10 integer, in milliseconds.
+ *
+ * parseInt stops at the first character it cannot use, so it reads '0.5' as 0
+ * and '10m' as 10: for these settings that silently disables a protection
+ * whose 0 means off, or turns ten minutes into ten milliseconds. Anything that
+ * is not wholly an integer becomes NaN here instead, which the daemon's range
+ * check refuses at startup with a message naming the variable, matching what
+ * the docs promise. Absent or empty stays undefined so the config file still
+ * gets its turn.
+ */
+function integerEnv(raw: string | undefined): number | undefined {
+	const trimmed = raw?.trim();
+	if (!trimmed) return undefined;
+	return /^[+-]?\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
+}
+
+/**
  * Merge CLI flags > env vars > config file, returning final config.
  */
 export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
@@ -250,10 +267,12 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			file.recoveryProfile,
 		recoveryLeaseCheckIntervalMs:
 			cliFlags.recoveryLeaseCheckIntervalMs ??
-			(process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS
-				? parseInt(process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS, 10)
-				: undefined) ??
-			file.recoveryLeaseCheckIntervalMs
+			integerEnv(process.env.BEIGNET_RECOVERY_LEASE_CHECK_MS) ??
+			file.recoveryLeaseCheckIntervalMs,
+		recoveryReestablishHoldMs:
+			cliFlags.recoveryReestablishHoldMs ??
+			integerEnv(process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS) ??
+			file.recoveryReestablishHoldMs
 	};
 }
 

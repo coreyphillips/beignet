@@ -545,6 +545,11 @@ export interface BeignetConfig {
 	/** Guardian modes: idle writer lease re-check cadence in ms (default
 	 *  300000, 0 disables). Env: BEIGNET_RECOVERY_LEASE_CHECK_MS. */
 	recoveryLeaseCheckIntervalMs?: number;
+	/** peer-storage mode: how long a peer's channel_reestablish for a channel
+	 *  this node has no record of is held before the BOLT 1 error goes out
+	 *  (default 600000, 0 answers immediately). Env:
+	 *  BEIGNET_RECOVERY_REESTABLISH_HOLD_MS. */
+	recoveryReestablishHoldMs?: number;
 }
 
 export interface HealthInfo {
@@ -971,6 +976,14 @@ export interface BeignetNodeEvents {
 		} | null;
 	}) => void;
 	'recovery:backfill-lost': (data: { detail: string }) => void;
+	/** peer-storage mode: a peer's channel_reestablish for a channel this node
+	 *  has no record of was held instead of failed (issue #462). Apply a
+	 *  Recovery Capsule before expiresAt or the peer force-closes. */
+	'recovery:reestablish-held': (data: {
+		peerPubkey: string;
+		channelId: string;
+		expiresAt: number;
+	}) => void;
 	'recovery:guardian_unreachable': (data: {
 		detail: string;
 		sequence?: string;

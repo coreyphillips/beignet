@@ -320,6 +320,7 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'recovery:durable',
 		'recovery:fenced',
 		'recovery:backfill-lost',
+		'recovery:reestablish-held',
 		'recovery:guardian_unreachable',
 		'recovery:restore-progress',
 		'recovery:restored'
@@ -471,6 +472,22 @@ async function bootDaemon(
 				opts.recoveryLeaseCheckIntervalMs
 			)}"; BEIGNET_RECOVERY_LEASE_CHECK_MS must be an integer between 0 ` +
 				'and 2147483647 (0 disables the check)'
+		);
+	}
+	if (
+		opts.recoveryReestablishHoldMs !== undefined &&
+		(!Number.isInteger(opts.recoveryReestablishHoldMs) ||
+			opts.recoveryReestablishHoldMs < 0 ||
+			opts.recoveryReestablishHoldMs > 2_147_483_647)
+	) {
+		// Same trap as the lease check: past 2^31-1 ms a timer fires after 1 ms,
+		// so an over-large hold would silently behave like no hold at all.
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Invalid recovery reestablish hold "${String(
+				opts.recoveryReestablishHoldMs
+			)}"; BEIGNET_RECOVERY_REESTABLISH_HOLD_MS must be an integer ` +
+				'between 0 and 2147483647 (0 answers immediately)'
 		);
 	}
 	const guardianEntries = opts.recoveryGuardians ?? [];

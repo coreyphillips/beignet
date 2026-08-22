@@ -12,6 +12,7 @@ Revision 7 (2026-08-21): the section 8 daemon surface is implemented (issue #435
 Revision 8 (2026-08-22): follow-ups from the beignet-umbrel recovery UI (issues #453, #454, #455). The capsule restore side is implemented on the daemon: retrieved blobs are recognized as capsules (keyed by the node secret, unlike the seed-keyed plain SCB), the embedded SCB is surfaced so Tier 1 never regresses under a recovery mode, and POST /recovery/restore-capsule performs the 5.4 restore rule for peer-storage mode (Tier 2 into a fresh database followed by a restart-required hold, Tier 1 on the live node). An empty node no longer pushes a backup that would destroy a provider's last good copy, and under a recovery mode only the capsule goes to storage peers. An idle confirmed writer re-checks its lease on a cadence and fences on a proven newer epoch (5.6). GET /readiness gains the CHANNEL_BACKUP check.
 Revision 9 (2026-08-22): the capsule carries its guardian locators (issue #457). Every capsule a guardian-backed node pushes now embeds the configured set as GuardianDescriptors (built by the assembly from the parsed set, with the recoverable transport credential when an embedder supplied one), so the 5.7 hop "capsule -> guardian locators" has something to read: a seed restore with no configuration boots a fresh database in peer-storage mode, reads the locators under capsules.best on GET /recovery/status, and restarts in the guardian mode with them. Locators are reported and never adopted over the configured set; a disagreement is logged. Credentials leave the capsule only through the admin handoff POST /recovery/capsule-guardians, never through the readonly status route or a log line, and the capsule restore route refuses a capsule that names guardians: a guardian-backed namespace restores through its guardians with fencing, not unfenced from peer storage or by force-closing what the guardians could resume.
 Revision 10 (2026-08-22): the unfenced capsule restore escape hatch (issue #459). POST /recovery/restore-capsule accepts unfenced: true for a capsule that names guardians whose set is gone; it cannot fence the previous writer and says so in the response, the progress stream and the log, and it never applies to a quorum-durability journal, which cannot boot unbarriered.
+Revision 11 (2026-08-22): a peer-storage node holds an unknown channel's channel_reestablish instead of failing it (issue #462). A node restoring over peer_storage boots on a deliberately empty database and receives the peer's channel_reestablish in the same instant as the Recovery Capsule that would answer it, so the pre-#462 conduct (the BOLT 1 unknown-channel error) force-closed exactly the channel the Tier 2 restore was about to resume, and the exact resume the route promises could not happen against a live peer at all. In peer-storage mode the reply is now parked for a window (BEIGNET_RECOVERY_REESTABLISH_HOLD_MS, default 10 minutes; 0 restores the old conduct), one window per peer and channel, after which the same error goes out unchanged. Held peers are reported under heldReestablish on GET /recovery/status. This is 5.7's quarantine rule applied to the peer-storage mode, which has no startup gate to enforce it.
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
 Audience: an implementing agent or engineer. Every code reference below was verified against the codebase as of beignet 0.7.0 (2026-07-22). Re-verify line numbers before editing; file and symbol names are the stable anchors.
 
@@ -323,6 +324,8 @@ Encryption: HKDF info `'beignet-recovery-capsule-v1'`, then the existing `padOwn
 For small wallets (one or two channels), the complete recovery state will often fit inline, making Tier 2 restore possible from peer_storage alone with zero new infrastructure. That alone justifies Phase 3 shipping before guardians exist.
 
 Restore side: on reconnect after seed restore, collect `'peer_storage:retrieved'` blobs from all storage peers, decrypt all candidate capsules, and select the highest `(writerEpoch, sequence)` whose hash chain validates. Implemented in the library as `restoreBestRecoveryCapsule` (one validated operation over the raw candidate blobs, against an EMPTY target) and on the daemon as `POST /recovery/restore-capsule` (section 8). Two push-side rules make the retrieval reachable in practice (issue #453): a node whose tables hold no recoverable state composes no capsule, because an empty push would replace the provider's last good copy before a seed-restored device could act on it; and with a recovery mode on, the capsule is the ONLY blob the node pushes (it embeds the SCB), so the plain SCB never races it for the one slot a provider keeps. BOLT 1 requires providers to return the blob early after reconnection, before normal channel recovery, which is exactly the window this needs.
+
+That window has to survive the peer, not just the provider (issue #462). The capsule and the peer's `channel_reestablish` arrive in the same instant, and the empty database has no record of the channel the peer is reestablishing, so the BOLT 1 unknown-channel error the node would normally send fails the exact channel the restore is about to resume: by the time an operator can act on `capsules.best` the funding output is already being spent. A node in peer-storage mode therefore HOLDS an unknown channel's reestablish for a window rather than answering it, which is 5.7's `send ONLY channel_reestablish` rule applied to the mode that has no startup gate to enforce it. Holding is the recoverable direction: a peer waits indefinitely for silence (its own backstop is a stuck-channel timeout measured in blocks) and permanently for an error. The error is deferred, never dropped, and the window is granted once per peer and channel per process, so a node that genuinely never had the channel converges on today's answer instead of leaving the peer a zombie it reestablishes forever. The rule is scoped to peer-storage: `off` is the SCB/DLP path, where the peer's force-close IS the recovery mechanism, and the guardian modes already refuse all peer contact until ownership is confirmed (5.6).
 
 ### 5.5 Guardian protocol (Phase 4)
 
@@ -770,6 +773,10 @@ recovery?: {
   maxRetainedFrameGap?: number;
   snapshotIntervalFrames?: number;
   snapshotIntervalBytes?: number;
+  unknownChannelReestablishHoldMs?: number;  // 5.4: hold an unknown channel's
+                                       // channel_reestablish this long instead
+                                       // of failing it. Peer-storage only;
+                                       // absent or 0 answers immediately
 };
 
 // The shared integrator wiring (src/lightning/recovery/assembly.ts)
@@ -791,7 +798,11 @@ node.getRecoveryStatus();  // { gate, durability, startupRepairPending,
                            //   lastDurableSequence, awaitingDurabilityCount,
                            //   fenced, backfillLost, channels: [{ channelId,
                            //   status: ChannelRecoveryStatus,
-                           //   awaitingDurability }] }
+                           //   awaitingDurability }],
+                           //   heldReestablish: [{ peer, channelId,
+                           //   expiresAt }] }
+// heldReestablish is the 5.4 hold, and sits outside `channels` because it
+// describes peers waiting on channels this node does NOT have.
 // awaitingDurability sits BESIDE the status rather than becoming an eighth
 // ChannelRecoveryStatus member: the seven values are the 5.7 machine and
 // describe what is known about a channel's STATE, while waiting on a receipt
@@ -823,6 +834,10 @@ free-form quorum tuples, per 12.1)
 BEIGNET_RECOVERY_LEASE_CHECK_MS = idle writer lease re-check cadence in the
 guardian modes (default 300000; 0 disables; see 5.6; an integer in
 0..2147483647, anything else refuses startup)
+BEIGNET_RECOVERY_REESTABLISH_HOLD_MS = peer-storage mode: how long an unknown
+channel's channel_reestablish is held before the BOLT 1 error goes out
+(default 600000; 0 answers immediately, the pre-#462 conduct; see 5.4; an
+integer in 0..2147483647, anything else refuses startup)
 ```
 
 Plus REST endpoints on the daemon: `GET /recovery/status` (readonly scope; the
@@ -831,16 +846,24 @@ supported but off) and `POST /recovery/restore` (admin scope, requires
 `{"confirm": true}` because the takeover permanently fences the previous
 writer; only answers on a daemon booted restore-pending, i.e. a fresh database
 whose namespace the guardian set holds, and every other route answers 503
-NODE_RESTORE_PENDING in that state). The daemon relays all six recovery
-events over SSE and webhooks, and `beignet recovery status|restore` are the
-CLI commands.
+NODE_RESTORE_PENDING in that state). The daemon relays every recovery event
+over SSE and webhooks (recovery:durable, recovery:fenced,
+recovery:backfill-lost and recovery:reestablish-held from the node, plus the
+embedder-origin recovery:guardian_unreachable, recovery:restore-progress and
+recovery:restored), and `beignet recovery status|restore` are the CLI
+commands.
 
 Peer-storage mode restores through `POST /recovery/restore-capsule` (admin
 scope, requires `{"confirm": true}` because local durability has no fencing:
 an old device still running keeps acting on the same channels). The flow:
 boot the fresh database in peer-storage mode (it pushes nothing while empty),
 connect to the peers the node had channels with, read the candidates under
-`capsules` on `GET /recovery/status`, then restore. Tier 2 (an inline journal
+`capsules` on `GET /recovery/status`, then restore. Connecting is safe to do
+before restoring: while the mode is peer-storage the node holds an unknown
+channel's `channel_reestablish` rather than failing it (5.4, issue #462), and
+`GET /recovery/status` lists each held peer under `heldReestablish` with the
+`expiresAt` by which the capsule has to be applied. Past that the peer is told
+the channel is unknown and force-closes, which is the pre-#462 outcome. Tier 2 (an inline journal
 validates) installs the exact state into a fresh database file, carries the
 daemon-local state that lives beside the channel state across (persisted
 API-key rotations and revocations, webhooks, peer addresses), tears the node

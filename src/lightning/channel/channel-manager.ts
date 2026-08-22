@@ -350,6 +350,27 @@ export interface IChannelManagerConfig {
 	 * Injectable so tests can shrink it.
 	 */
 	quiescenceTimeoutMs?: number;
+	/**
+	 * How long an inbound channel_reestablish naming a channel this node has
+	 * NO record of is held before it is answered with the BOLT 1 error
+	 * (docs/RECOVERY-PROTOCOL.md 5.7, issue #462). Absent or 0 keeps the
+	 * historical conduct: the error goes out immediately.
+	 *
+	 * Set only by a node that may be an INCOMPLETE restore target, which
+	 * today means peer-storage recovery mode: its database is deliberately
+	 * empty until the operator applies a Recovery Capsule, and the capsule
+	 * arrives in the same instant as the peer's reestablish, so erroring
+	 * makes the peer force-close a channel the restore is about to resume.
+	 * A peer waits indefinitely for an unanswered reestablish, but reads an
+	 * error as a permanent failure, so holding is the recoverable direction.
+	 *
+	 * The hold covers the unknown-channel case ONLY. FORCE_CLOSED, CLOSED
+	 * and ERRORED are channels this node does know about, and their answer
+	 * is never deferred. The error is deferred, never dropped: one window
+	 * per (peer, channel) per process, after which the peer gets exactly the
+	 * reply it gets today.
+	 */
+	unknownChannelReestablishHoldMs?: number;
 }
 
 /**
@@ -378,6 +399,11 @@ export interface IChannelManagerConfig {
  * - 'quiescence:timeout' (channelIdHex: string, peerPubkey: string) — BOLT 2's
  *   60-second quiescence window elapsed with HTLCs pending; the peer must be
  *   disconnected
+ * - 'reestablish:held' (peerPubkey: string, channelId: Buffer, expiresAt: number):
+ *   a peer's channel_reestablish for a channel we have no record of was parked
+ *   rather than failed, because this node may still be an incomplete restore
+ *   target (issue #462); the operator has until expiresAt to install the state
+ *   that answers it
  * - 'error' (channelId: Buffer | null, message: string)
  */
 
@@ -389,6 +415,35 @@ const COMMITMENT_CPFP_REBUMP_INTERVAL = 6;
 
 /** BOLT 2: "MUST disconnect after 60 seconds of quiescence if the HTLCs are pending". */
 const DEFAULT_QUIESCENCE_TIMEOUT_MS = 60_000;
+
+/**
+ * Ceiling on held unknown-channel reestablishes PER PEER (issue #462). A peer
+ * streaming fabricated channel ids would otherwise buy a timer and a payload
+ * buffer per id. Per peer rather than global so that spending it is always
+ * self-inflicted: a peer that exhausts its own quota gets the immediate error
+ * for its next id, and every other peer keeps a full quota of its own. Far
+ * above any real topology (nodes rarely hold more than a handful of channels
+ * with one peer), so a genuine restore never reaches it.
+ *
+ * Spent windows stay in the map and count toward this, so the ceiling bounds
+ * windows granted per peer per process, not just windows open at once.
+ */
+const MAX_HELD_UNKNOWN_REESTABLISH_PER_PEER = 64;
+
+/**
+ * Ceiling across all peers, a memory backstop rather than a policy: the
+ * per-peer quota is what protects honest peers, and this only bounds what a
+ * flood of distinct peer identities can cost. Reaching it declines the hold,
+ * which is the safe direction (it is what an unconfigured node does).
+ */
+const MAX_HELD_UNKNOWN_REESTABLISH = 1024;
+
+/**
+ * setTimeout turns anything past 2^31-1 ms into a 1 ms delay, which would
+ * make an over-large hold window fire instantly and look like no hold at all.
+ * Out-of-range windows decline the hold outright instead (issue #462).
+ */
+const MAX_UNKNOWN_REESTABLISH_HOLD_MS = 2_147_483_647;
 
 export class ChannelManager extends EventEmitter {
 	private config: IChannelManagerConfig;
@@ -411,6 +466,28 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private quiescenceTimers: Map<string, ReturnType<typeof setTimeout>> =
 		new Map();
+	/**
+	 * Inbound channel_reestablish messages parked because they name a channel
+	 * this node has no record of and the node is an incomplete restore target
+	 * (issue #462; see unknownChannelReestablishHoldMs). Keyed
+	 * `${peerPubkey}:${channelIdHex}`.
+	 *
+	 * `deadline` is absolute and outlives its timer, so a disconnect can drop
+	 * the timer while the entry keeps the clock: a peer that reconnects gets
+	 * the REMAINDER of its original window, never a fresh one. An entry whose
+	 * deadline has passed stays in the map as a tombstone, which is what makes
+	 * the window one-per-(peer, channel) for the life of the process.
+	 */
+	private heldUnknownReestablish: Map<
+		string,
+		{
+			peerPubkey: string;
+			channelId: Buffer;
+			payload: Buffer;
+			deadline: number;
+			timer: ReturnType<typeof setTimeout> | null;
+		}
+	> = new Map();
 	/**
 	 * HTLC settle operations deferred because their channel was quiescing
 	 * when they were requested (BOLT 2: no update messages after stfu, issue
@@ -668,6 +745,7 @@ export class ChannelManager extends EventEmitter {
 			clearTimeout(timer);
 		}
 		this.quiescenceTimers.clear();
+		this._clearHeldUnknownReestablish();
 	}
 
 	// ─────────────── Zero-Conf Trusted Peers ───────────────
@@ -1568,6 +1646,15 @@ export class ChannelManager extends EventEmitter {
 	 * Handle peer disconnection: mark all channels with this peer as AWAITING_REESTABLISH.
 	 */
 	handlePeerDisconnected(peerPubkey: string): void {
+		// A parked reestablish (issue #462) describes a connection that is now
+		// gone, so its timer is retired. The entry stays with its ORIGINAL
+		// deadline: the peer that reconnects and re-sends gets what is left of
+		// the one window it was granted, not another one.
+		for (const entry of this.heldUnknownReestablish.values()) {
+			if (entry.peerPubkey !== peerPubkey || !entry.timer) continue;
+			clearTimeout(entry.timer);
+			entry.timer = null;
+		}
 		// Established channels → mark for reestablish
 		for (const channel of this.getChannelsByPeer(peerPubkey)) {
 			// Anything held behind the quorum barrier goes FIRST, and is
@@ -4323,6 +4410,190 @@ export class ChannelManager extends EventEmitter {
 		return { ok: true, actions };
 	}
 
+	/**
+	 * Park a peer's channel_reestablish for a channel we have no record of,
+	 * rather than answering it with the BOLT 1 error (issue #462). True when
+	 * the message was parked and the caller must not reply.
+	 *
+	 * Declines, so the error goes out immediately, when: no hold window is
+	 * configured; this peer has spent its quota (or the global backstop is
+	 * reached); or this (peer, channel) already had its window and it elapsed.
+	 * Parking is therefore bounded twice over, by the per-peer quota and by one
+	 * window per key per process.
+	 */
+	private _holdUnknownChannelReestablish(
+		peerPubkey: string,
+		channelId: Buffer,
+		payload: Buffer
+	): boolean {
+		const holdMs = this.config.unknownChannelReestablishHoldMs;
+		if (
+			holdMs === undefined ||
+			!Number.isFinite(holdMs) ||
+			holdMs <= 0 ||
+			holdMs > MAX_UNKNOWN_REESTABLISH_HOLD_MS
+		) {
+			return false;
+		}
+		const key = `${peerPubkey}:${channelId.toString('hex')}`;
+		const now = Date.now();
+		const existing = this.heldUnknownReestablish.get(key);
+		if (existing) {
+			// The window is over: this key already had its one grace period, so
+			// the peer gets the answer it would have got without the hold.
+			if (now >= existing.deadline) return false;
+			// Re-arm after a disconnect cleared the timer, for what is LEFT of
+			// the original window. A flapping peer cannot renew it.
+			if (!existing.timer) {
+				existing.timer = this._armUnknownReestablishTimer(
+					key,
+					existing.deadline - now
+				);
+			}
+			// A retransmit inside the window replaces the payload: the newest
+			// message is the one worth replaying when the window ends.
+			existing.payload = payload;
+			return true;
+		}
+		if (
+			this.heldUnknownReestablish.size >= MAX_HELD_UNKNOWN_REESTABLISH ||
+			this._heldUnknownReestablishForPeer(peerPubkey) >=
+				MAX_HELD_UNKNOWN_REESTABLISH_PER_PEER
+		) {
+			return false;
+		}
+		const deadline = now + holdMs;
+		this.heldUnknownReestablish.set(key, {
+			peerPubkey,
+			channelId: Buffer.from(channelId),
+			payload,
+			deadline,
+			timer: this._armUnknownReestablishTimer(key, holdMs)
+		});
+		this.emit('reestablish:held', peerPubkey, Buffer.from(channelId), deadline);
+		return true;
+	}
+
+	/**
+	 * Windows this peer has been granted, spent ones included. A linear scan
+	 * over a map the global ceiling keeps small, run only when a reestablish
+	 * names a channel we have no record of, which is rare outside a restore.
+	 */
+	private _heldUnknownReestablishForPeer(peerPubkey: string): number {
+		let count = 0;
+		for (const entry of this.heldUnknownReestablish.values()) {
+			if (entry.peerPubkey === peerPubkey) count++;
+		}
+		return count;
+	}
+
+	/** One unref'd timer that replays a held reestablish when its window ends. */
+	private _armUnknownReestablishTimer(
+		key: string,
+		delayMs: number
+	): ReturnType<typeof setTimeout> {
+		const timer = setTimeout(() => {
+			const entry = this.heldUnknownReestablish.get(key);
+			if (!entry) return;
+			// Keep the entry as a tombstone: its elapsed deadline is what makes
+			// the replay fall through to the error instead of re-parking.
+			entry.timer = null;
+			this._replayHeldReestablish(
+				entry.peerPubkey,
+				entry.channelId,
+				entry.payload
+			);
+		}, delayMs);
+		if (typeof timer.unref === 'function') timer.unref();
+		return timer;
+	}
+
+	/**
+	 * Deliver a parked reestablish now that its window has closed. Replayed
+	 * rather than answered from scratch: if a restore installed the channel
+	 * meanwhile the peer gets the real reestablish handling it has been waiting
+	 * for, and if not the unknown-channel error goes out as it would have.
+	 */
+	private _replayHeldReestablish(
+		peerPubkey: string,
+		channelId: Buffer,
+		payload: Buffer
+	): void {
+		// A channel that appeared DURING the window never went through peer
+		// bring-up, so nobody has sent our channel_reestablish for it, and
+		// shouldRetransmitReestablish() is false in AWAITING_REESTABLISH.
+		// Without this the peer would be answered by a node that never
+		// introduced itself, and BOLT 2 has both sides transmit (and wait)
+		// before any other message for the channel. Ours goes first, exactly as
+		// handlePeerReconnected would have sent it at bring-up.
+		//
+		// A double send cannot arise: parking means the channel was unknown at
+		// that moment, and a disconnect retires the timer, so a reconnect
+		// re-drives bring-up rather than reaching here.
+		const channel = this.findChannelByChannelId(channelId);
+		if (
+			channel &&
+			channel.getState() === ChannelState.AWAITING_REESTABLISH &&
+			this.getPeerForChannel(channel.getChannelId() ?? channelId) === peerPubkey
+		) {
+			// Contained: this runs from a timer, where a throw would be an
+			// uncaught exception rather than a failed message. The dispatch
+			// below still runs, because the peer is owed an answer either way
+			// (handleMessage has the same containment for the same reason).
+			try {
+				this.processActions(peerPubkey, channel, channel.createReestablish());
+			} catch (err) {
+				this.emit(
+					'error',
+					channel.getChannelId() ?? channelId,
+					`Error reestablishing a channel restored under a hold: ${
+						err instanceof Error ? err.message : String(err)
+					}`
+				);
+			}
+		}
+		// Through handleMessage, never the handler directly: the parked id may
+		// have been restored as ANOTHER peer's channel while the window ran, and
+		// only the foreign-channel screen there keeps this sender's counters
+		// away from a channel it does not own.
+		this.handleMessage(peerPubkey, MessageType.CHANNEL_REESTABLISH, payload);
+	}
+
+	/**
+	 * Reestablishes parked right now (issue #462), for the recovery status
+	 * surface: which peer is waiting on which channel, and how long the
+	 * operator has left to apply a capsule before the peer is told the
+	 * channel is unknown. Reports only what is genuinely still waiting, so it
+	 * excludes both spent windows and entries whose peer has disconnected (no
+	 * armed timer): those describe a connection nobody is holding open.
+	 */
+	heldUnknownChannelReestablish(): Array<{
+		peer: string;
+		channelId: string;
+		expiresAt: number;
+	}> {
+		const now = Date.now();
+		const held: Array<{ peer: string; channelId: string; expiresAt: number }> =
+			[];
+		for (const entry of this.heldUnknownReestablish.values()) {
+			if (!entry.timer || entry.deadline <= now) continue;
+			held.push({
+				peer: entry.peerPubkey,
+				channelId: entry.channelId.toString('hex'),
+				expiresAt: entry.deadline
+			});
+		}
+		return held;
+	}
+
+	/** Drop every parked reestablish and its timer. */
+	private _clearHeldUnknownReestablish(): void {
+		for (const entry of this.heldUnknownReestablish.values()) {
+			if (entry.timer) clearTimeout(entry.timer);
+		}
+		this.heldUnknownReestablish.clear();
+	}
+
 	private handleChannelReestablish(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeChannelReestablishMessage>;
 		try {
@@ -4338,10 +4609,24 @@ export class ChannelManager extends EventEmitter {
 		}
 		const channel = this.findChannelByChannelId(msg.channelId);
 
+		// Recovery 5.7 (issue #462): a node that may still be an incomplete
+		// restore target holds an unknown channel's reestablish instead of
+		// failing it, because the state that would answer it may be minutes
+		// away in a Recovery Capsule. Only the UNKNOWN case: the arm below
+		// answers for channels this node has a record of.
+		if (
+			!channel &&
+			this._holdUnknownChannelReestablish(peerPubkey, msg.channelId, payload)
+		) {
+			return;
+		}
+
 		// BOLT 2: reestablish for a channel we consider closed (or never knew)
 		// must be answered with an error so the peer force-closes and stops
 		// retrying it on every reconnect. Silently ignoring it leaves the peer
-		// with a zombie channel it reestablishes forever.
+		// with a zombie channel it reestablishes forever, which is why the hold
+		// above defers this reply rather than dropping it: an expired window
+		// arrives back here.
 		const deadState = channel?.getState();
 		if (
 			!channel ||

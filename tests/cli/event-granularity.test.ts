@@ -25,7 +25,8 @@ const HTLC_EVENTS = ['htlc:forwarded', 'htlc:fulfilled', 'htlc:failed'];
 const RECOVERY_NODE_EVENTS = [
 	'recovery:durable',
 	'recovery:fenced',
-	'recovery:backfill-lost'
+	'recovery:backfill-lost',
+	'recovery:reestablish-held'
 ];
 /**
  * Recovery events that ORIGINATE in BeignetNode (like node:ready): the
