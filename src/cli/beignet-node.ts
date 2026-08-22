@@ -2168,6 +2168,15 @@ export class BeignetNode extends EventEmitter {
 				'A restore is already running; poll the status route.'
 			);
 		}
+		// The escape hatch is authorization, so only the exact boolean counts:
+		// a truthy string from a library caller must not open it.
+		if (
+			options.unfenced !== undefined &&
+			typeof options.unfenced !== 'boolean'
+		) {
+			throw new BeignetError('INVALID_PARAMS', 'unfenced must be a boolean');
+		}
+		const unfencedRequested = options.unfenced === true;
 		if (this.recoveryMode !== 'peer-storage' || this._restorePending) {
 			throw new BeignetError(
 				'CAPSULE_RESTORE_UNSUPPORTED',
@@ -2300,10 +2309,33 @@ export class BeignetNode extends EventEmitter {
 			// handoff, and the restore is the guardian path after a restart.
 			// The SCB emergency path stays what it always was, the peer
 			// retrieved backup through the SCB restore route.
+			// A quorum-marked chain never installs from peer storage, locators
+			// or not (a capsule from before #458 carries none): the node
+			// refuses to run it unbarriered at construction, so the install
+			// could never boot in this mode, and every exactness that chain
+			// certified rests on the guardian quorum this route bypasses.
+			if (
+				result.tier === 2 &&
+				chainPromisedQuorum(
+					staged,
+					deriveRecoveryMasterKey(this.nodeSecret()),
+					getPublicKey(this.nodeSecret())
+				)
+			) {
+				staged.close();
+				dropStaged();
+				throw new BeignetError(
+					'CAPSULE_RESTORE_QUORUM_NAMESPACE',
+					'The best capsule carries a quorum-durability journal, which ' +
+						'cannot boot without its guardian quorum even unfenced; ' +
+						'restore through the guardian set, or recover the channels ' +
+						'from the peer-retrieved backup with the SCB restore route.'
+				);
+			}
 			let unfenced: { guardians: IReportedGuardian[] } | undefined;
 			if (result.capsule.guardians.length > 0) {
 				const locators = redactGuardians(result.capsule.guardians);
-				if (!options.unfenced) {
+				if (!unfencedRequested) {
 					staged.close();
 					dropStaged();
 					this.log(
@@ -2326,29 +2358,7 @@ export class BeignetNode extends EventEmitter {
 							'can pass unfenced: true, which cannot fence the old writer.'
 					);
 				}
-				// The escape hatch. A quorum-marked chain is still refused: the
-				// node refuses to run it unbarriered (lightning-node
-				// construction), so the install could never boot in this mode,
-				// and every exactness that chain certified rests on the
-				// guardians that are being bypassed.
-				if (
-					result.tier === 2 &&
-					chainPromisedQuorum(
-						staged,
-						deriveRecoveryMasterKey(this.nodeSecret()),
-						getPublicKey(this.nodeSecret())
-					)
-				) {
-					staged.close();
-					dropStaged();
-					throw new BeignetError(
-						'CAPSULE_RESTORE_QUORUM_NAMESPACE',
-						'The best capsule carries a quorum-durability journal, which ' +
-							'cannot boot without its guardian quorum even unfenced; ' +
-							'restore through the guardian set, or recover the channels ' +
-							'from the peer-retrieved backup with the SCB restore route.'
-					);
-				}
+				// The escape hatch: the quorum guard above already ran.
 				unfenced = { guardians: locators };
 				this.log(
 					'warn',

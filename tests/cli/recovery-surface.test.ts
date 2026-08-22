@@ -23,6 +23,7 @@ import {
 	ReferenceGuardian,
 	composeRecoveryCapsule,
 	decodeRecoveryCapsuleBlob,
+	encryptRecoveryCapsule,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { decodeScb, encodeScb } from '../../src/lightning/backup/scb';
@@ -1013,6 +1014,20 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 					ADMIN_KEY
 				);
 				expect(badFlag.status).to.equal(400);
+				// The library API is as strict as the route: a truthy string
+				// is not authorization.
+				let libraryError: unknown = null;
+				try {
+					await daemon.node.restoreFromCapsules({
+						unfenced: 'false' as unknown as boolean
+					});
+				} catch (err) {
+					libraryError = err;
+				}
+				expect((libraryError as { code?: string } | null)?.code).to.equal(
+					'INVALID_PARAMS'
+				);
+				await expectUntouched();
 				const progress: string[] = [];
 				daemon.node.on('recovery:restore-progress', (data) =>
 					progress.push((data as { type: string }).type)
@@ -1285,6 +1300,48 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 				for (const entry of recoveredEntries) {
 					expect(entry).to.not.have.property('auth');
 				}
+
+				// A capsule from before locators existed names no guardians
+				// but can still carry a quorum journal; the quorum refusal
+				// does not depend on the locators, hatch or no hatch.
+				const legacyBlob = encryptRecoveryCapsule(
+					{ ...capsuleA!, guardians: [] },
+					NODE_SECRET
+				);
+				deviceBProbe.node
+					.getNode()
+					.emit('peer_storage:retrieved', '02' + 'a1'.repeat(32), legacyBlob);
+				const legacyStatus = await request(
+					portProbe,
+					'GET',
+					'/recovery/status'
+				);
+				expect(
+					(
+						legacyStatus.body.result as {
+							capsules: { best: { guardians: unknown[] } };
+						}
+					).capsules.best.guardians
+				).to.deep.equal([]);
+				for (const body of [
+					{ confirm: true },
+					{ confirm: true, unfenced: true }
+				]) {
+					const legacy = await request(
+						portProbe,
+						'POST',
+						'/recovery/restore-capsule',
+						body
+					);
+					expect(legacy.status, JSON.stringify(body)).to.equal(409);
+					expect((legacy.body.error as { code: string }).code).to.equal(
+						'CAPSULE_RESTORE_QUORUM_NAMESPACE'
+					);
+				}
+				expect(
+					fs.existsSync(path.join(dirB, 'regtest.db.capsule-restore'))
+				).to.equal(false);
+				expect((await request(portProbe, 'GET', '/info')).status).to.equal(200);
 			} finally {
 				await deviceBProbe.stop();
 			}

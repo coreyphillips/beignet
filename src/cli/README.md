@@ -467,20 +467,23 @@ Operational notes:
   node only reports a capsule's set, it never adopts one; a set that differs
   from the configured one is logged as a warning.
 - `POST /recovery/restore-capsule` refuses a capsule that names guardians
-  (409 `CAPSULE_RESTORE_GUARDIAN_BACKED`): that state belongs to a
-  guardian-backed namespace and restores through the guardian set with
-  fencing, never unfenced from peer storage, and never by force-closing
-  channels the guardians could resume exactly. The emergency SCB-only path
-  is unchanged: `GET /backup/peer-retrieved` plus `POST /restore/scb`.
+  by default (409 `CAPSULE_RESTORE_GUARDIAN_BACKED`): that state belongs to
+  a guardian-backed namespace and restores through the guardian set with
+  fencing, not from peer storage, and not by force-closing channels the
+  guardians could resume exactly. The emergency SCB-only path is
+  unchanged: `GET /backup/peer-retrieved` plus `POST /restore/scb`. A
+  quorum-durability journal is refused whether or not the capsule names
+  guardians (409 `CAPSULE_RESTORE_QUORUM_NAMESPACE`; capsules from before
+  locators existed carry none): it cannot boot without its quorum.
 - Guardian set gone for good: `{ "confirm": true, "unfenced": true }`
   (`beignet recovery restore-capsule --unfenced`) is the labelled escape
   hatch from spec 5.7. It restores the capsule anyway and CANNOT fence the
   previous writer: if that device still runs, it keeps acting on the same
   channels. The report carries the named guardians under `unfenced`, and
-  the restore progress stream says so. It never applies to a
-  quorum-durability journal (409 `CAPSULE_RESTORE_QUORUM_NAMESPACE`): such
-  a chain refuses to boot without its quorum, so its only paths are the
-  guardians or the SCB route.
+  the restore progress stream says so. It is the only exception to the
+  default refusal, and it never applies to a quorum-durability journal:
+  such a chain refuses to boot without its quorum, so its only paths are
+  the guardians or the SCB route.
 - Recovery events relayed over SSE and webhooks (always on):
   `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`,
   `recovery:guardian_unreachable`, `recovery:restore-progress`,

@@ -887,24 +887,28 @@ guardian mode with them; that boot finds the namespace on the guardians and
 `POST /recovery/restore` performs the fenced takeover.
 
 `POST /recovery/restore-capsule` refuses a capsule that names guardians (409
-`CAPSULE_RESTORE_GUARDIAN_BACKED`) before either tier acts. Tier 2 from peer
-storage would install a guardian-backed namespace without the 5.7 takeover
-that fences a still-running old writer (and a quorum-marked journal then
-refuses to boot unbarriered anyway); Tier 1 would persist DLP recovery and
-ask the peers to force-close channels the guardians could have resumed
-exactly. The emergency SCB-only path is unchanged and explicitly labelled:
-the peer-retrieved backup through the SCB restore route.
+`CAPSULE_RESTORE_GUARDIAN_BACKED`) before either tier acts, by default. Tier 2
+from peer storage would install a guardian-backed namespace without the 5.7
+takeover that fences a still-running old writer; Tier 1 would persist DLP
+recovery and ask the peers to force-close channels the guardians could have
+resumed exactly. The emergency SCB-only path is unchanged and explicitly
+labelled: the peer-retrieved backup through the SCB restore route. Separately
+and unconditionally, a Tier 2 candidate whose chain ever promised quorum is
+refused (409 `CAPSULE_RESTORE_QUORUM_NAMESPACE`) whether or not it names
+guardians (a capsule from before locators existed names none): the node
+refuses to run such a chain unbarriered, so the install could never boot in
+this mode.
 
 The escape hatch 5.7 step 5 reserves for a guardian set that is gone (issue
 #459) is `{"confirm": true, "unfenced": true}` on the same route (CLI
 `--unfenced`). It restores the capsule anyway and states, in the response
 (`unfenced.guardians`), the progress stream (`capsule:unfenced`) and the log,
 that it cannot fence the previous writer: a still-running old device keeps
-acting on the channels. It is limited to a chain that never promised quorum
-(409 `CAPSULE_RESTORE_QUORUM_NAMESPACE` otherwise): a quorum-marked journal
-refuses to boot unbarriered, so an unfenced install of one could never run,
-and every exactness that chain certified rests on the guardians being
-bypassed. Its only paths stay the guardian restore or the SCB route.
+acting on the channels. It is the one exception to the default refusal and
+does not lift the quorum refusal above: a quorum-marked journal refuses to
+boot unbarriered, so an unfenced install of one could never run, and every
+exactness that chain certified rests on the guardians being bypassed. Its
+only paths stay the guardian restore or the SCB route.
 
 `GET /readiness` carries a `CHANNEL_BACKUP` check derived from this surface:
 PASS for a guardian mode with a confirmed gate, WARN for peer-storage and
