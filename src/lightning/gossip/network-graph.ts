@@ -136,17 +136,24 @@ export class NetworkGraph {
 	// (including restore-time trims), so the owner can delete the persisted
 	// row; the graph itself never touches storage.
 	private readonly _onChannelEvicted?: (scidHex: string) => void;
+	// Fired with the nodeIdHex of every node garbage-collected because its
+	// last graph channel went away (prune or ceiling eviction), so the owner
+	// can delete the persisted gossip_nodes row; the graph itself never
+	// touches storage (issue #447).
+	private readonly _onNodeEvicted?: (nodeIdHex: string) => void;
 
 	constructor(
 		chainHash: Buffer = BITCOIN_CHAIN_HASH,
 		opts: {
 			eagerVerify?: boolean;
 			onChannelEvicted?: (scidHex: string) => void;
+			onNodeEvicted?: (nodeIdHex: string) => void;
 		} = {}
 	) {
 		this._chainHash = chainHash;
 		this._eagerVerify = opts.eagerVerify === true;
 		this._onChannelEvicted = opts.onChannelEvicted;
+		this._onNodeEvicted = opts.onNodeEvicted;
 	}
 
 	/**
@@ -546,6 +553,7 @@ export class NetworkGraph {
 			node1.channels.delete(scidHex);
 			if (node1.channels.size === 0) {
 				this._nodes.delete(node1Hex);
+				this._onNodeEvicted?.(node1Hex);
 			}
 		}
 
@@ -554,6 +562,7 @@ export class NetworkGraph {
 			node2.channels.delete(scidHex);
 			if (node2.channels.size === 0) {
 				this._nodes.delete(node2Hex);
+				this._onNodeEvicted?.(node2Hex);
 			}
 		}
 

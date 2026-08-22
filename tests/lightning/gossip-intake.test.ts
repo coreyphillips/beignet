@@ -419,6 +419,36 @@ describe('Gossip channel ceiling (NetworkGraph, issue #446)', () => {
 		expect(evicted).to.deep.equal([ann1.msg.shortChannelId.toString('hex')]);
 	});
 
+	it('ceiling eviction reports the evicted channel orphaned nodes (issue #447)', () => {
+		NetworkGraph.MAX_CHANNELS = 1;
+		const evictedChannels: string[] = [];
+		const evictedNodes: string[] = [];
+		const graph = new NetworkGraph(REGTEST_CHAIN_HASH, {
+			onChannelEvicted: (scidHex): void => {
+				evictedChannels.push(scidHex);
+			},
+			onNodeEvicted: (nodeIdHex): void => {
+				evictedNodes.push(nodeIdHex);
+			}
+		});
+		const ann1 = buildAnnouncement(730, REGTEST_CHAIN_HASH);
+		const ann2 = buildAnnouncement(731, REGTEST_CHAIN_HASH);
+		graph.addChannelAnnouncement(ann1.msg, { verified: 'deferred' });
+		expect(graph.addChannelAnnouncement(ann2.msg, { verified: true })).to.equal(
+			true
+		);
+		expect(evictedChannels).to.deep.equal([
+			ann1.msg.shortChannelId.toString('hex')
+		]);
+		// Both endpoints lost their only channel with the eviction, so their
+		// persisted gossip_nodes rows must be reported for deletion too.
+		expect(evictedNodes).to.have.members([
+			ann1.msg.nodeId1.toString('hex'),
+			ann1.msg.nodeId2.toString('hex')
+		]);
+		expect(evictedNodes).to.have.length(2);
+	});
+
 	it('a full graph of verified entries refuses even verified admissions', () => {
 		NetworkGraph.MAX_CHANNELS = 2;
 		const evicted: string[] = [];
@@ -956,6 +986,46 @@ describe('Gossip intake queue (LightningNode)', () => {
 			undefined
 		);
 		expect(storage.loadAllGossipChannels()).to.have.length(1);
+	});
+
+	it('boot deletes orphaned gossip_nodes rows instead of restoring them (issue #447)', async () => {
+		node.destroy();
+		storage = new SqliteStorage(dbPath);
+		storage.open();
+
+		const now = Math.floor(Date.now() / 1000);
+		const ann = buildAnnouncement(820, REGTEST_CHAIN_HASH);
+		const upd = buildUpdate(ann, now - 60, 0, REGTEST_CHAIN_HASH);
+		storage.saveGossipChannel(ann.msg.shortChannelId.toString('hex'), {
+			shortChannelId: ann.msg.shortChannelId,
+			nodeId1: ann.msg.nodeId1,
+			nodeId2: ann.msg.nodeId2,
+			features: Buffer.alloc(0),
+			announcement: ann.msg,
+			update1: upd.msg
+		});
+		// One node row backed by the live channel, one orphan row whose
+		// channels all left storage long ago (the pre-fix leak).
+		storage.saveGossipNode(ann.msg.nodeId1.toString('hex'), {
+			nodeId: ann.msg.nodeId1,
+			channels: new Set([ann.msg.shortChannelId.toString('hex')])
+		});
+		const orphanId = buildAnnouncement(821, REGTEST_CHAIN_HASH).msg.nodeId1;
+		storage.saveGossipNode(orphanId.toString('hex'), {
+			nodeId: orphanId,
+			channels: new Set(['aa'.repeat(8)])
+		});
+		expect(storage.loadAllGossipNodes()).to.have.length(2);
+
+		node = new LightningNode(makeConfig());
+
+		// The linked node restored; the orphan is neither in the graph nor
+		// left behind on disk.
+		expect(graphOf(node).getNode(ann.msg.nodeId1)).to.not.equal(undefined);
+		expect(graphOf(node).getNode(orphanId)).to.equal(undefined);
+		const remaining = storage.loadAllGossipNodes();
+		expect(remaining).to.have.length(1);
+		expect(remaining[0].nodeId.equals(ann.msg.nodeId1)).to.equal(true);
 	});
 
 	it('a far-future update never reaches peer policy adoption', async () => {

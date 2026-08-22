@@ -1681,6 +1681,58 @@ describe('BOLT 7: Gossip & Routing', () => {
 			expect(graph.removeChannel(makeScid(1, 1, 1))).to.be.false;
 		});
 
+		it('should report nodes garbage-collected by removeChannel via onNodeEvicted', () => {
+			const evictedNodes: string[] = [];
+			const localGraph = new NetworkGraph(BITCOIN_CHAIN_HASH, {
+				onNodeEvicted: (nodeIdHex): void => {
+					evictedNodes.push(nodeIdHex);
+				}
+			});
+
+			const { key1, key2 } = makeOrderedKeypairs();
+			const key3 = makeKeypair();
+			let channelKey1: typeof key1, channelKey2: typeof key3;
+			if (Buffer.compare(key1.publicKey, key3.publicKey) < 0) {
+				channelKey1 = key1;
+				channelKey2 = key3;
+			} else {
+				channelKey1 = key3;
+				channelKey2 = key1;
+			}
+
+			const scid1 = makeScid(700000, 1, 0);
+			const scid2 = makeScid(700000, 2, 0);
+			const { msg: msg1 } = buildChannelAnnouncement(
+				key1,
+				key2,
+				makeKeypair(),
+				makeKeypair(),
+				scid1
+			);
+			const { msg: msg2 } = buildChannelAnnouncement(
+				channelKey1,
+				channelKey2,
+				makeKeypair(),
+				makeKeypair(),
+				scid2
+			);
+			localGraph.addChannelAnnouncement(msg1);
+			localGraph.addChannelAnnouncement(msg2);
+
+			// key2 loses its only channel; key1 still holds scid2
+			localGraph.removeChannel(scid1);
+			expect(evictedNodes).to.deep.equal([key2.publicKey.toString('hex')]);
+
+			// Now key1 and key3 lose their last channel too
+			localGraph.removeChannel(scid2);
+			expect(evictedNodes).to.have.members([
+				key1.publicKey.toString('hex'),
+				key2.publicKey.toString('hex'),
+				key3.publicKey.toString('hex')
+			]);
+			expect(evictedNodes).to.have.length(3);
+		});
+
 		it('should prune stale channels', () => {
 			const { key1, key2 } = makeOrderedKeypairs();
 			const btcKey1 = makeKeypair();

@@ -750,6 +750,29 @@ describe('Storage Layer', function () {
 			expect(all[0].channels.has('scid1')).to.be.true;
 		});
 
+		it('should delete gossip nodes', function () {
+			const nodeId1 = getPublicKey(makeSeed(2));
+			const nodeId2 = getPublicKey(makeSeed(3));
+			storage.saveGossipNode(nodeId1.toString('hex'), {
+				nodeId: nodeId1,
+				channels: new Set(['scid1'])
+			});
+			storage.saveGossipNode(nodeId2.toString('hex'), {
+				nodeId: nodeId2,
+				channels: new Set(['scid2'])
+			});
+			expect(storage.loadAllGossipNodes()).to.have.length(2);
+
+			storage.deleteGossipNode(nodeId1.toString('hex'));
+			const all = storage.loadAllGossipNodes();
+			expect(all).to.have.length(1);
+			expect(all[0].nodeId.equals(nodeId2)).to.be.true;
+
+			// Deleting an unknown id is a no-op
+			storage.deleteGossipNode('00'.repeat(33));
+			expect(storage.loadAllGossipNodes()).to.have.length(1);
+		});
+
 		it('should support transactions', function () {
 			storage.transaction(() => {
 				storage.savePreimage('hash1', crypto.randomBytes(32));

@@ -1153,6 +1153,17 @@ export class LightningNode extends EventEmitter {
 						'deleteGossipChannel'
 					);
 				}
+			},
+			// A node whose last graph channel went away is deleted from memory
+			// by removeChannel; without this its gossip_nodes row would outlive
+			// it forever and resurrect it on every boot (issue #447).
+			onNodeEvicted: (nodeIdHex) => {
+				if (typeof this.storage?.deleteGossipNode === 'function') {
+					this.safeStorage(
+						() => this.storage!.deleteGossipNode!(nodeIdHex),
+						'deleteGossipNode'
+					);
+				}
 			}
 		});
 
@@ -2148,7 +2159,28 @@ export class LightningNode extends EventEmitter {
 			}
 			this.graph.restoreChannel(channel);
 		}
+		// The channel loop above created a graph node entry for every restored
+		// channel endpoint, so a node row whose id is absent here has no live
+		// channel behind it: an orphan leaked before node rows were deleted
+		// alongside their last channel (issue #447). Restoring it would
+		// resurrect the leak in memory, so delete the row and skip it. Channel
+		// peer reconnects are unaffected: their addresses live in the announced
+		// peer address capture, not in gossip_nodes. The one row this trims
+		// besides true orphans is the endpoint of a verified channel row
+		// skipped at a lowered restore ceiling; that node entry returns with
+		// its channel on a later boot and the next node_announcement refills
+		// the announcement slot.
 		for (const node of this.storage.loadAllGossipNodes()) {
+			if (!this.graph.getNode(node.nodeId)) {
+				if (typeof this.storage.deleteGossipNode === 'function') {
+					const nodeIdHex = node.nodeId.toString('hex');
+					this.safeStorage(
+						() => this.storage!.deleteGossipNode!(nodeIdHex),
+						'deleteGossipNode'
+					);
+				}
+				continue;
+			}
 			this.graph.restoreNode(node);
 		}
 
