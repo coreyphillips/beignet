@@ -95,6 +95,26 @@ interface IWatchedFunding {
 	 * candidates vanished.
 	 */
 	candidates?: Array<{ txid: string; outputIndex: number }>;
+	/** The funding output's scriptPubkey, kept for candidate discovery. */
+	script: Buffer;
+	/**
+	 * This watch was armed from a record that may be behind what the node
+	 * actually did (a row restored from disk, issue #463), so its candidate
+	 * txids are not the whole answer: a funding attempt the lost process
+	 * replaced by RBF confirms under a txid the record never names, and
+	 * filtering the script's history down to the recorded txids would report
+	 * the funding ABSENT while it sits confirmed in that very history.
+	 *
+	 * When set, an otherwise-empty filter falls back to reading the history
+	 * for a transaction that CREATES an output paying this exact script for
+	 * this exact value. Both halves matter: the script alone is public for an
+	 * announced channel (channel_announcement carries both funding pubkeys),
+	 * so a third party could pay it and steer the watch onto an outpoint
+	 * nobody will ever spend. Requiring the full funding value makes that cost
+	 * more than the balance it could deny, and the deepest confirmation wins,
+	 * which the real funding always is.
+	 */
+	discoverValueSats?: number;
 }
 
 /** A generic output being watched for spends */
@@ -205,6 +225,9 @@ export async function classifyRemoteFundingInput(
  * - 'funding:spent' (channelId: Buffer, spendingTx: Transaction)
  * - 'funding:missing' (channelId: Buffer, txid: string): the watched funding
  *   tx disappeared from mempool AND chain before confirming (evicted/replaced)
+ * - 'funding:discovered' (channelId: Buffer, txid: string): a restored watch
+ *   found its funding in the script's history under a txid the restored record
+ *   never named, and adopted it (issue #463)
  * - 'broadcast:success' (txid: string)
  * - 'broadcast:failure' (error: Error)
  * - 'error' (error: Error)
@@ -530,7 +553,10 @@ export class ChainWatcher extends EventEmitter {
 		generation: number = this.lifecycleGeneration,
 		// Post-signatures RBF: every candidate funding tx of this open
 		// (display-order txids). All candidates pay scriptPubkey.
-		candidates?: Array<{ txid: string; outputIndex: number }>
+		candidates?: Array<{ txid: string; outputIndex: number }>,
+		// Restored records only: the funding value to recognize an attempt the
+		// record does not name by (see discoverValueSats).
+		discoverValueSats?: number
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		const scriptHash = computeScriptHash(scriptPubkey);
@@ -545,7 +571,9 @@ export class ChainWatcher extends EventEmitter {
 			confirmed: false,
 			confirmationHeight: 0,
 			announcementTriggered: false,
-			candidates: candidates?.length ? candidates : undefined
+			candidates: candidates?.length ? candidates : undefined,
+			script: scriptPubkey,
+			discoverValueSats
 		};
 
 		this.watchedFundings.set(key, watched);
@@ -633,6 +661,7 @@ export class ChainWatcher extends EventEmitter {
 			outputIndex,
 			minimumDepth: 0,
 			scriptHash: computeScriptHash(scriptPubkey),
+			script: scriptPubkey,
 			confirmed: true,
 			confirmationHeight: 0,
 			announcementTriggered: true,
@@ -1079,9 +1108,32 @@ export class ChainWatcher extends EventEmitter {
 		const candidates = watched.candidates?.length
 			? watched.candidates
 			: [{ txid: watched.txid, outputIndex: watched.outputIndex }];
-		const entries = history.filter((h) =>
+		let entries = history.filter((h) =>
 			candidates.some((c) => c.txid === h.txid)
 		);
+		if (entries.length === 0 && watched.discoverValueSats !== undefined) {
+			// A restored record whose attempt the chain does not know: read the
+			// funding out of the history instead of insisting on the txid the
+			// record happens to name (issue #463).
+			const found = await this.discoverFundingInHistory(
+				watched,
+				history,
+				generation
+			);
+			if (
+				!this.isCurrentGeneration(generation) ||
+				this.watchedFundings.get(key) !== watched
+			) {
+				return;
+			}
+			if (found) {
+				watched.txid = found.txid;
+				watched.outputIndex = found.outputIndex;
+				watched.candidates = undefined;
+				this.emit('funding:discovered', watched.channelId, found.txid);
+				entries = history.filter((h) => h.txid === found.txid);
+			}
+		}
 		if (entries.length === 0) {
 			// No funding candidate is in the mempool or a block: evicted or
 			// replaced (e.g. an input double-spent by a foreign tx). For a
@@ -1125,6 +1177,61 @@ export class ChainWatcher extends EventEmitter {
 				this.emitError(err);
 			});
 		}
+	}
+
+	/**
+	 * Read the funding transaction out of the funding script's own history,
+	 * for a watch whose recorded candidates are all absent. Returns the
+	 * deepest confirmed transaction that CREATES an output paying the watched
+	 * script for the watched value, which is the only thing the funding of
+	 * this channel can be; see discoverValueSats for why both halves of that
+	 * test are required. Mempool-only transactions are ignored: an
+	 * unconfirmed stranger is not evidence, and the real funding of a restored
+	 * channel has long since confirmed.
+	 */
+	private async discoverFundingInHistory(
+		watched: IWatchedFunding,
+		history: Array<{ txid: string; height: number }>,
+		generation: number
+	): Promise<{ txid: string; outputIndex: number } | null> {
+		let best: { txid: string; outputIndex: number; height: number } | null =
+			null;
+		for (const entry of history) {
+			if (entry.height <= 0) continue;
+			if (best && entry.height >= best.height) continue;
+			let tx: import('bitcoinjs-lib').Transaction;
+			try {
+				const raw = await this.backend.getTransaction(entry.txid);
+				if (!this.isCurrentGeneration(generation)) return null;
+				tx = bitcoin.Transaction.fromBuffer(raw);
+			} catch {
+				// One unreadable entry must not hide the rest of the history.
+				continue;
+			}
+			const index = tx.outs.findIndex(
+				(out) =>
+					out.value === watched.discoverValueSats &&
+					out.script.equals(watched.script)
+			);
+			if (index < 0) continue;
+			best = { txid: entry.txid, outputIndex: index, height: entry.height };
+		}
+		return best ? { txid: best.txid, outputIndex: best.outputIndex } : null;
+	}
+
+	/**
+	 * Presence of a watched funding as the chain last answered it, for the
+	 * node's per-block review of the BOLT 2 forget clock (issue #463).
+	 * 'unknown' until a check has actually succeeded, and until the absence
+	 * debounce has run its course, so a restart never reads a fresh watch as
+	 * evidence of anything.
+	 */
+	getFundingPresence(channelId: Buffer): 'present' | 'absent' | 'unknown' {
+		const watched = this.watchedFundings.get(channelId.toString('hex'));
+		if (!watched) return 'unknown';
+		if (watched.confirmed || watched.missingChecks === 0) return 'present';
+		if (watched.missingReported) return 'absent';
+		return 'unknown';
 	}
 
 	private async watchFundingSpend(

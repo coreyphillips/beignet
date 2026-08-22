@@ -6733,6 +6733,9 @@ export class LightningNode extends EventEmitter {
 			// run on live headers, not only when an embedder drives
 			// handleNewBlock itself.
 			this.retryPendingFundingBroadcasts();
+			// And the BOLT 2 forget clock, for the same reason: its only other
+			// driver is a one-shot alarm (issue #463).
+			this.reviewFundingMissingClocks(height);
 		});
 		this.chainWatcher.on('error', (err: Error) => {
 			this.emit('node:error', {
@@ -6816,123 +6819,7 @@ export class LightningNode extends EventEmitter {
 					message: `funding tx ${txid} disappeared from mempool and chain before confirming`,
 					timestamp: Date.now()
 				} as ILightningError);
-
-				const channel = this.channelManager.getChannel(channelId);
-				if (!channel) return;
-				const state = channel.getFullState();
-				// A vanished SPLICE tx is different: the pre-splice channel is
-				// real and confirmed, and voiding it would destroy a live
-				// channel. Alarm only; splice rollback is a separate path.
-				if (state.spliceInFlight) return;
-
-				const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
-				const pending = this.pendingFundingTxs.get(internalHex);
-				const pendingHex = pending?.txHex;
-
-				// The funder's own obligation comes first: if we hold the
-				// transaction and are allowed to send it, absence is answered
-				// by sending it rather than by waiting out a clock.
-				if (
-					pendingHex &&
-					this.fundingProvider &&
-					this.owesFundingBroadcast(internalHex)
-				) {
-					this.fundingProvider
-						.broadcastTransaction(pendingHex)
-						.then(() => {
-							this.emitStructuredLog('chain', 'funding_rebroadcast', {
-								channelId: channelId.toString('hex'),
-								txid
-							});
-						})
-						.catch((err) => {
-							// A rejection is NOT evidence that the channel is
-							// fiction. bad-txns-inputs-missingorspent covers an
-							// unconfirmed parent this backend has not seen, a
-							// mempool conflict need not be confirmed, and a
-							// timeout says nothing at all. Retain, retry, and
-							// leave forgetting to the block clock below, which
-							// this side never even starts: a funder that owes
-							// the broadcast answers by sending.
-							this.emitStructuredLog('chain', 'funding_rebroadcast_rejected', {
-								channelId: channelId.toString('hex'),
-								txid,
-								error: (err as Error)?.message ?? String(err)
-							});
-						});
-					return;
-				}
-
-				// We hold the transaction but may not send it yet: ask again.
-				if (pendingHex && this.awaitingFundingAuthorization(internalHex)) {
-					this.emitStructuredLog('chain', 'funding_missing_unauthorized', {
-						channelId: channelId.toString('hex'),
-						txid
-					});
-					this.requestFundingReauthorization(internalHex);
-					return;
-				}
-
-				// Otherwise this is the fundee, or a funder whose payload is
-				// gone. Nothing to send, so the only question is the clock.
-				//
-				// ABSENCE IS A CLOCK, NOT A VERDICT. This alarm fires after
-				// three checks find nothing and does not require that the
-				// transaction was ever seen, so it cannot on its own tell an
-				// evicted funding from one we are deliberately withholding, one
-				// whose funder has not broadcast yet, or a backend with an
-				// incomplete view. BOLT 2 gives the answer: a node forgets an
-				// unconfirmed funding only after 2016 blocks. Until then the
-				// channel is retained, whichever side we are, because
-				// forgetting early forces a funder to close and reopen a
-				// channel that was never in trouble.
-				//
-				// The START of that countdown has to reach disk before it
-				// counts for anything. Held only in memory it is lost on the
-				// next restart, the following absence starts it again at
-				// whatever height the node is at by then, and a node that
-				// restarts often enough never reaches the disposition at all.
-				// A start that cannot be recorded therefore does not begin:
-				// failing closed here means RETAINING the channel and asking
-				// again on the next absence, never counting down from a height
-				// no restart can read back.
-				if (channel.beginFundingMissingClock(this.currentBlockHeight)) {
-					if (!this.persistChannelCommitted(channelId)) {
-						channel.clearFundingMissingClock();
-						this.emitStructuredLog('chain', 'funding_missing_clock_unwritten', {
-							channelId: channelId.toString('hex'),
-							txid
-						});
-						return;
-					}
-				}
-				// No usable start height: this node has no chain tip yet, or the
-				// row carries a stamp written before there was one. A wait
-				// cannot be measured against either, and measuring it anyway
-				// compares against NaN, which is never less than
-				// FUNDING_FORGET_BLOCKS and drops straight into the void. Same
-				// answer as an unwritable clock start: retain, and ask again on
-				// the next absence (issue #463).
-				const missingSince = channel.fundingMissingSince();
-				if (missingSince === undefined) {
-					this.emitStructuredLog('chain', 'funding_missing_untimed', {
-						channelId: channelId.toString('hex'),
-						txid,
-						blockHeight: this.currentBlockHeight
-					});
-					return;
-				}
-				const waited = this.currentBlockHeight - missingSince;
-
-				if (waited < FUNDING_FORGET_BLOCKS) {
-					this.emitStructuredLog('chain', 'funding_missing_waiting', {
-						channelId: channelId.toString('hex'),
-						txid,
-						waitedBlocks: waited
-					});
-					return;
-				}
-				this.voidMissingFundingChannel(channelId, txid);
+				this.disposeMissingFunding(channelId, txid);
 			}
 		);
 
@@ -6942,6 +6829,172 @@ export class LightningNode extends EventEmitter {
 				this.onFundingWatchConfirmed(channelId, txid);
 			}
 		);
+	}
+
+	/**
+	 * Act on a funding the chain says is absent: rebroadcast it if we owe the
+	 * broadcast, otherwise run BOLT 2's forget clock and, at its end, void the
+	 * channel.
+	 *
+	 * Reached from the watcher's one-shot 'funding:missing' alarm AND from the
+	 * per-block review below, because that alarm fires ONCE per continuous
+	 * absence: latched on the first report and re-armed only when the
+	 * transaction reappears. A disposition driven by the alarm alone therefore
+	 * gets exactly one chance, so a clock that could not start (no chain tip
+	 * yet) never started, and a clock that did start was never looked at again
+	 * and never reached its 2016 blocks (issue #463).
+	 */
+	private disposeMissingFunding(channelId: Buffer, txid: string): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const state = channel.getFullState();
+		// A vanished SPLICE tx is different: the pre-splice channel is
+		// real and confirmed, and voiding it would destroy a live
+		// channel. Alarm only; splice rollback is a separate path.
+		if (state.spliceInFlight) return;
+
+		const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
+		const pending = this.pendingFundingTxs.get(internalHex);
+		const pendingHex = pending?.txHex;
+
+		// The funder's own obligation comes first: if we hold the
+		// transaction and are allowed to send it, absence is answered
+		// by sending it rather than by waiting out a clock.
+		if (
+			pendingHex &&
+			this.fundingProvider &&
+			this.owesFundingBroadcast(internalHex)
+		) {
+			this.fundingProvider
+				.broadcastTransaction(pendingHex)
+				.then(() => {
+					this.emitStructuredLog('chain', 'funding_rebroadcast', {
+						channelId: channelId.toString('hex'),
+						txid
+					});
+				})
+				.catch((err) => {
+					// A rejection is NOT evidence that the channel is
+					// fiction. bad-txns-inputs-missingorspent covers an
+					// unconfirmed parent this backend has not seen, a
+					// mempool conflict need not be confirmed, and a
+					// timeout says nothing at all. Retain, retry, and
+					// leave forgetting to the block clock below, which
+					// this side never even starts: a funder that owes
+					// the broadcast answers by sending.
+					this.emitStructuredLog('chain', 'funding_rebroadcast_rejected', {
+						channelId: channelId.toString('hex'),
+						txid,
+						error: (err as Error)?.message ?? String(err)
+					});
+				});
+			return;
+		}
+
+		// We hold the transaction but may not send it yet: ask again.
+		if (pendingHex && this.awaitingFundingAuthorization(internalHex)) {
+			this.emitStructuredLog('chain', 'funding_missing_unauthorized', {
+				channelId: channelId.toString('hex'),
+				txid
+			});
+			this.requestFundingReauthorization(internalHex);
+			return;
+		}
+
+		// Otherwise this is the fundee, or a funder whose payload is
+		// gone. Nothing to send, so the only question is the clock.
+		//
+		// ABSENCE IS A CLOCK, NOT A VERDICT. This alarm fires after
+		// three checks find nothing and does not require that the
+		// transaction was ever seen, so it cannot on its own tell an
+		// evicted funding from one we are deliberately withholding, one
+		// whose funder has not broadcast yet, or a backend with an
+		// incomplete view. BOLT 2 gives the answer: a node forgets an
+		// unconfirmed funding only after 2016 blocks. Until then the
+		// channel is retained, whichever side we are, because
+		// forgetting early forces a funder to close and reopen a
+		// channel that was never in trouble.
+		//
+		// The START of that countdown has to reach disk before it
+		// counts for anything. Held only in memory it is lost on the
+		// next restart, the following absence starts it again at
+		// whatever height the node is at by then, and a node that
+		// restarts often enough never reaches the disposition at all.
+		// A start that cannot be recorded therefore does not begin:
+		// failing closed here means RETAINING the channel and asking
+		// again on the next absence, never counting down from a height
+		// no restart can read back.
+		if (channel.beginFundingMissingClock(this.currentBlockHeight)) {
+			if (!this.persistChannelCommitted(channelId)) {
+				channel.clearFundingMissingClock();
+				this.emitStructuredLog('chain', 'funding_missing_clock_unwritten', {
+					channelId: channelId.toString('hex'),
+					txid
+				});
+				return;
+			}
+		}
+		// No usable start height: this node has no chain tip yet, or the
+		// row carries a stamp written before there was one. A wait
+		// cannot be measured against either, and measuring it anyway
+		// compares against NaN, which is never less than
+		// FUNDING_FORGET_BLOCKS and drops straight into the void. Same
+		// answer as an unwritable clock start: retain, and ask again on
+		// the next absence (issue #463).
+		const missingSince = channel.fundingMissingSince();
+		if (missingSince === undefined) {
+			this.emitStructuredLog('chain', 'funding_missing_untimed', {
+				channelId: channelId.toString('hex'),
+				txid,
+				blockHeight: this.currentBlockHeight
+			});
+			return;
+		}
+		const waited = this.currentBlockHeight - missingSince;
+
+		if (waited < FUNDING_FORGET_BLOCKS) {
+			this.emitStructuredLog('chain', 'funding_missing_waiting', {
+				channelId: channelId.toString('hex'),
+				txid,
+				waitedBlocks: waited
+			});
+			return;
+		}
+		this.voidMissingFundingChannel(channelId, txid);
+	}
+
+	/**
+	 * Per-block review of every funding-missing clock, on the chain's answer
+	 * rather than on an event that fires once (see disposeMissingFunding).
+	 *
+	 * A funding the watcher has seen since stops any clock it started: "missing
+	 * since" must not survive an observation of presence, or a countdown begun
+	 * during one outage is still ticking during the next. A funding the watcher
+	 * still reports absent runs the ordinary disposition, which is where the
+	 * clock starts and where 2016 blocks later it ends.
+	 */
+	private reviewFundingMissingClocks(blockHeight: number): void {
+		if (!this.chainWatcher || blockHeight <= 0) return;
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.fundingTxid) continue;
+			const channelId = state.channelId ?? state.temporaryChannelId;
+			const presence = this.chainWatcher.getFundingPresence(channelId);
+			if (presence === 'present') {
+				if (channel.clearFundingMissingClock()) {
+					this.persistChannel(channelId);
+					this.emitStructuredLog('chain', 'funding_missing_clock_cleared', {
+						channelId: channelId.toString('hex')
+					});
+				}
+				continue;
+			}
+			if (presence !== 'absent') continue;
+			this.disposeMissingFunding(
+				channelId,
+				Buffer.from(state.fundingTxid).reverse().toString('hex')
+			);
+		}
 	}
 
 	/**
@@ -7331,6 +7384,15 @@ export class LightningNode extends EventEmitter {
 						}))
 				  ]
 				: undefined;
+			// A row restored from disk can name an attempt the lost process
+			// later replaced by RBF: the replacement pays this same funding
+			// script, so let the watch recognize it in the script's own
+			// history rather than filtering it out as absent (issue #463).
+			const discoverValueSats = this.channelManager.isChannelRestoredFromDisk(
+				state.channelId || state.temporaryChannelId
+			)
+				? Number(state.fundingSatoshis)
+				: undefined;
 			await this.chainWatcher.watchFundingOutput(
 				state.channelId || state.temporaryChannelId,
 				txidHex,
@@ -7338,7 +7400,8 @@ export class LightningNode extends EventEmitter {
 				state.minimumDepth ?? 3,
 				fundingScript,
 				undefined,
-				candidates
+				candidates,
+				discoverValueSats
 			);
 		}
 	}
@@ -15640,6 +15703,7 @@ export class LightningNode extends EventEmitter {
 		this.scanExpiringHeldForwards(blockHeight);
 		this.scanForwardTimeouts(blockHeight);
 		this.scanStuckChannels(blockHeight);
+		this.reviewFundingMissingClocks(blockHeight);
 		this.scanStuckPayments();
 		this.sweepExpiredIssuedInvoices();
 		if (blockHeight % 10 === 0) {

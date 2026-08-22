@@ -813,6 +813,17 @@ export class Channel {
 	 * Cleared on disconnect and when a fresh interactive negotiation starts.
 	 */
 	private _txAbortSent = false;
+	/**
+	 * This channel's record was read off disk at startup, so it says what some
+	 * EARLIER process durably wrote and not what that process went on to do. A
+	 * Recovery Capsule is best-effort recency by construction (BOLT 1 peer
+	 * storage is rate limited and providers need not return the latest blob,
+	 * docs/RECOVERY-PROTOCOL.md 5.4), so `sentTxSignatures: false` here can
+	 * describe an open whose signatures did leave and whose funding is on
+	 * chain. Set by ChannelManager.restoreChannel's startup caller; in memory
+	 * because every start re-reads the row and re-sets it (issue #463).
+	 */
+	private _recordRestoredFromDisk = false;
 	// We refused a COMPLETED splice negotiation with tx_abort. The peer sends
 	// its mid-splice commitment_signed right after its final tx_complete, so
 	// that message can already be in flight when our abort leaves; judged
@@ -7067,7 +7078,10 @@ export class Channel {
 		// then reads the resumed attempt, so an abandonable replacement
 		// backed by a signed previous attempt keeps its row.
 		this._normalizeV2AttemptForFailure();
-		if (this.isV2AttemptBroadcastable()) {
+		if (this.isV2AttemptBroadcastable() || this.v2TeardownMustRetain()) {
+			// A restored record cannot authorize the condemned teardown below
+			// either: condemning deletes the row at the next start, which is
+			// the same removal by a slower route (issue #463).
 			return this._failChannelWithWireError(reason, 'none');
 		}
 		this._state.dualFundingSession?.abort();
@@ -16966,6 +16980,36 @@ export class Channel {
 	 * broadcastable by construction, so the channel-wide answer stays true
 	 * while any of them is still live.
 	 */
+	/** Register this channel's record as one loaded from disk at startup. */
+	markRecordRestoredFromDisk(): void {
+		this._recordRestoredFromDisk = true;
+	}
+
+	/** Whether this channel's record was loaded from disk at startup. */
+	isRecordRestoredFromDisk(): boolean {
+		return this._recordRestoredFromDisk;
+	}
+
+	/**
+	 * Whether a v2 teardown must RETAIN this open even though the record says
+	 * nobody can broadcast its funding tx.
+	 *
+	 * isV2AttemptBroadcastable answers from what this node remembers doing,
+	 * and a restored record cannot prove that: the process that wrote it may
+	 * have released tx_signatures afterwards, in which case the peer holds a
+	 * complete funding tx and BOLT 2 forbids forgetting the channel until its
+	 * inputs are provably unspendable. A peer's tx_abort is honest evidence
+	 * that IT wants the open dead, and an honest peer may send one before its
+	 * own signatures while already holding ours; neither says the funding is
+	 * not on chain. Discarding the open here drops the funding watch, the
+	 * monitor spend detection would build from it and the SCB entry, which is
+	 * how a peer's force-close went unswept in issue #463. Chain evidence
+	 * retires such a channel instead, through the funding-missing watchdog.
+	 */
+	private v2TeardownMustRetain(): boolean {
+		return this._recordRestoredFromDisk;
+	}
+
 	isV2AttemptBroadcastable(): boolean {
 		if (this._state.pendingFundingTxHex) return true;
 		if (this._state.v2PreviousAttempts?.length) return true;
@@ -17132,7 +17176,7 @@ export class Channel {
 				this._txAbortSent = false;
 				return [{ type: ChannelActionType.PERSIST_STATE }];
 			}
-			if (this.isV2AttemptBroadcastable()) {
+			if (this.isV2AttemptBroadcastable() || this.v2TeardownMustRetain()) {
 				// The latch stays SET for the retained attempt: tx_abort has
 				// no exchange identifier, so a cleared latch could not tell
 				// the peer's next independent abort from a duplicate or an
@@ -17268,7 +17312,7 @@ export class Channel {
 		// channel until the funding's inputs are provably unspendable. Echo
 		// the abort as the ack, but keep the record, the state and the
 		// watch.
-		if (this.isV2AttemptBroadcastable()) {
+		if (this.isV2AttemptBroadcastable() || this.v2TeardownMustRetain()) {
 			// The compose latches _txAbortSent, and for the RETAINED attempt
 			// it stays latched: tx_abort has no exchange identifier, so a
 			// second inbound abort is indistinguishable from a duplicate or
