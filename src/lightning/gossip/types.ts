@@ -274,6 +274,25 @@ export const ANNOUNCEMENT_SIGNATURES_LENGTH = 168;
 /** BOLT 7: Maximum age for channel updates before pruning (2 weeks). */
 export const DEFAULT_PRUNE_MAX_AGE = 1_209_600;
 
+/**
+ * BOLT 7: ignore gossip timestamped unreasonably far in the future. One hour
+ * of forward skew is generous (gossip propagates in seconds; RGS snapshots
+ * are stamped in the past) while capping how long a garbage timestamp can
+ * camp a slot against the strictly-newer freshness rule: without a bound, a
+ * max-u32 timestamp holds its slot until 2106 (issue #446).
+ */
+export const MAX_GOSSIP_TIMESTAMP_SKEW = 3_600;
+
+/**
+ * The shared far-future test for every gossip timestamp consumer: the graph
+ * gates AND the node-side paths with their own freshness state (peer policy
+ * adoption, reconnect-address capture). One definition, or a path that
+ * forgets the bound re-opens the camping window it closes.
+ */
+export function gossipTimestampTooFarFuture(timestamp: number): boolean {
+	return timestamp > Math.floor(Date.now() / 1000) + MAX_GOSSIP_TIMESTAMP_SKEW;
+}
+
 // ── Short Channel ID ────────────────────────────────────────────────
 
 /**

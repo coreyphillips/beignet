@@ -12,6 +12,7 @@ import {
 	TGossipVerified,
 	CHANNEL_FLAG_DIRECTION,
 	DEFAULT_PRUNE_MAX_AGE,
+	gossipTimestampTooFarFuture,
 	decodeShortChannelId
 } from './types';
 import {
@@ -96,7 +97,27 @@ export class NetworkGraph {
 	static SERVE_VERIFY_BUDGET_MS = 50;
 	static SERVE_VERIFY_WINDOW_MS = 1000;
 
+	/**
+	 * Hard ceiling on graph channels. Lazy intake (issue #443) admits gossip
+	 * for the price of a decode, so without a ceiling a hostile peer can
+	 * inflate graph memory and the gossip tables without ever paying for a
+	 * signature (issue #446). The public graph is well under this; the bound
+	 * only bites on garbage. At the ceiling, verified admissions evict an
+	 * unverified entry (garbage never starves out real data) while
+	 * unverified ones are refused. Static and mutable so tests can pin it
+	 * (the SERVE_VERIFY_BUDGET_MS pattern).
+	 */
+	static MAX_CHANNELS = 100_000;
+
 	private _channels: Map<string, IGraphChannel> = new Map();
+	/**
+	 * scidHex of every held channel whose announcement is not settled
+	 * verified: the eviction candidates, indexed so admission at the ceiling
+	 * stays O(1). Invariant: member iff present in _channels with
+	 * announcementVerified !== true; every site that settles a channel's
+	 * announcement provenance or changes _channels membership maintains it.
+	 */
+	private _unverifiedChannels: Set<string> = new Set();
 	/** Start of the current serve-verification budget window (epoch ms). */
 	private _serveVerifyWindowStart = 0;
 	/** Verification time spent in the current window across all queries. */
@@ -111,13 +132,57 @@ export class NetworkGraph {
 	// peers. Lazy mode (default, wallets): verification is deferred until a
 	// gossip query asks for the entry (issue #443).
 	private readonly _eagerVerify: boolean;
+	// Fired with the scidHex of every channel dropped by ceiling eviction
+	// (including restore-time trims), so the owner can delete the persisted
+	// row; the graph itself never touches storage.
+	private readonly _onChannelEvicted?: (scidHex: string) => void;
 
 	constructor(
 		chainHash: Buffer = BITCOIN_CHAIN_HASH,
-		opts: { eagerVerify?: boolean } = {}
+		opts: {
+			eagerVerify?: boolean;
+			onChannelEvicted?: (scidHex: string) => void;
+		} = {}
 	) {
 		this._chainHash = chainHash;
 		this._eagerVerify = opts.eagerVerify === true;
+		this._onChannelEvicted = opts.onChannelEvicted;
+	}
+
+	/**
+	 * Keep the eviction index in step with a channel's settled announcement
+	 * provenance. Call after any site settles announcementVerified.
+	 */
+	private _syncUnverifiedIndex(scidHex: string, channel: IGraphChannel): void {
+		if (channel.announcementVerified === true) {
+			this._unverifiedChannels.delete(scidHex);
+		} else {
+			this._unverifiedChannels.add(scidHex);
+		}
+	}
+
+	/**
+	 * Evict one unverified channel to admit a verified one at the ceiling.
+	 * Insertion order makes the victim the oldest unverified entry. Returns
+	 * false when nothing is evictable (every held channel is verified).
+	 * Note the preference, not the ceiling, is best-effort: announcement
+	 * verification proves signatures over keys the message itself carries,
+	 * not UTXO existence, so an attacker who baits serve-time resolution of
+	 * their fabricated announcements makes them unevictable. The ceiling
+	 * still holds absolutely.
+	 */
+	private _evictOneUnverified(): boolean {
+		const victim = this._unverifiedChannels.values().next();
+		if (victim.done) return false;
+		const channel = this._channels.get(victim.value);
+		if (channel) {
+			this.removeChannel(channel.shortChannelId);
+		} else {
+			// Defensive: repair a desynced index entry.
+			this._unverifiedChannels.delete(victim.value);
+		}
+		this._onChannelEvicted?.(victim.value);
+		return true;
 	}
 
 	getChannelCount(): number {
@@ -181,10 +246,21 @@ export class NetworkGraph {
 				existing.features = Buffer.from(msg.features);
 				existing.announcementVerified = pair.verified;
 				existing.announcementVerifyDeferred = pair.deferred;
+				this._syncUnverifiedIndex(scidHex, existing);
 				return true;
 			}
 			// Reject duplicate
 			return false;
+		}
+
+		// Ceiling (issue #446): only new entries are growth (the upgrade path
+		// above settles in place), and only a verified admission may make room
+		// by evicting an unverified entry; unverified ones are refused, so
+		// garbage displaces nothing.
+		if (this._channels.size >= NetworkGraph.MAX_CHANNELS) {
+			if (verified !== true || !this._evictOneUnverified()) {
+				return false;
+			}
 		}
 
 		// Create the channel entry
@@ -199,6 +275,7 @@ export class NetworkGraph {
 			announcementVerifyDeferred: pair.deferred
 		};
 		this._channels.set(scidHex, channel);
+		this._syncUnverifiedIndex(scidHex, channel);
 
 		// Ensure node entries exist and link channel
 		const node1Hex = msg.nodeId1.toString('hex');
@@ -235,6 +312,12 @@ export class NetworkGraph {
 		msg: IChannelUpdateMessage,
 		opts: { verified?: TGossipVerified } = {}
 	): boolean {
+		// BOLT 7: ignore timestamps unreasonably far in the future, whatever
+		// the provenance; admitted, one would camp its slot against the
+		// strictly-newer rule below and never go stale (issue #446).
+		if (gossipTimestampTooFarFuture(msg.timestamp)) {
+			return false;
+		}
 		const scidHex = msg.shortChannelId.toString('hex');
 		const channel = this._channels.get(scidHex);
 		if (!channel) {
@@ -290,6 +373,10 @@ export class NetworkGraph {
 		msg: INodeAnnouncementMessage,
 		opts: { verified?: TGossipVerified } = {}
 	): boolean {
+		// BOLT 7: ignore far-future timestamps (see applyChannelUpdate).
+		if (gossipTimestampTooFarFuture(msg.timestamp)) {
+			return false;
+		}
 		const nodeHex = msg.nodeId.toString('hex');
 		const node = this._nodes.get(nodeHex);
 
@@ -333,16 +420,24 @@ export class NetworkGraph {
 
 	/**
 	 * Whether a channel_announcement could change the graph at all. False for
-	 * a wrong chain, disordered node ids, or an SCID already held with a
+	 * a wrong chain, disordered node ids, an SCID already held with a
 	 * verified announcement (announcements are immutable per SCID; only the
 	 * unverified-to-verified upgrade in addChannelAnnouncement remains, and it
-	 * requires matching endpoints).
+	 * requires matching endpoints), or a full graph with nothing evictable.
 	 */
 	wouldAcceptChannelAnnouncement(msg: IChannelAnnouncementMessage): boolean {
 		if (!msg.chainHash.equals(this._chainHash)) return false;
 		if (Buffer.compare(msg.nodeId1, msg.nodeId2) >= 0) return false;
 		const existing = this._channels.get(msg.shortChannelId.toString('hex'));
-		if (!existing) return true;
+		if (!existing) {
+			// Ceiling mirror: at the ceiling a new entry is only admissible
+			// (under the most permissive provenance, verified) while an
+			// unverified entry remains evictable.
+			return (
+				this._channels.size < NetworkGraph.MAX_CHANNELS ||
+				this._unverifiedChannels.size > 0
+			);
+		}
 		return (
 			existing.announcementVerified !== true &&
 			existing.nodeId1.equals(msg.nodeId1) &&
@@ -358,6 +453,7 @@ export class NetworkGraph {
 	 * never needing its signature).
 	 */
 	wouldAcceptChannelUpdate(msg: IChannelUpdateMessage): boolean {
+		if (gossipTimestampTooFarFuture(msg.timestamp)) return false;
 		const channel = this._channels.get(msg.shortChannelId.toString('hex'));
 		if (!channel) return false;
 		const direction = msg.channelFlags & CHANNEL_FLAG_DIRECTION;
@@ -376,6 +472,7 @@ export class NetworkGraph {
 	 * older (same shape as wouldAcceptChannelUpdate).
 	 */
 	wouldAcceptNodeAnnouncement(msg: INodeAnnouncementMessage): boolean {
+		if (gossipTimestampTooFarFuture(msg.timestamp)) return false;
 		const node = this._nodes.get(msg.nodeId.toString('hex'));
 		if (!node || node.channels.size === 0) return false;
 		if (node.announcement && msg.timestamp <= node.announcement.timestamp) {
@@ -438,6 +535,7 @@ export class NetworkGraph {
 		if (!channel) return false;
 
 		this._channels.delete(scidHex);
+		this._unverifiedChannels.delete(scidHex);
 
 		// Remove from endpoint nodes' channel sets
 		const node1Hex = channel.nodeId1.toString('hex');
@@ -521,6 +619,31 @@ export class NetworkGraph {
 	 * backend, custom ones included.
 	 */
 	restoreChannel(channel: IGraphChannel): void {
+		// A row persisted before the far-future bound existed can carry a
+		// timestamp the intake gates now refuse; restored raw it would re-camp
+		// its slot (verified flags block every takeover) and, keying pruning
+		// off the same timestamp, never go stale. Drop the poisoned slot: the
+		// freed slot takes the next real update, a row left with no updates is
+		// pruned right after restore, and per the issue #443 precedent the
+		// repair is not written back (the row self-heals on the next accepted
+		// update).
+		if (
+			channel.update1 &&
+			gossipTimestampTooFarFuture(channel.update1.timestamp)
+		) {
+			channel.update1 = undefined;
+			channel.update1Verified = undefined;
+			channel.update1VerifyDeferred = undefined;
+		}
+		if (
+			channel.update2 &&
+			gossipTimestampTooFarFuture(channel.update2.timestamp)
+		) {
+			channel.update2 = undefined;
+			channel.update2Verified = undefined;
+			channel.update2VerifyDeferred = undefined;
+		}
+
 		const ann = sanitizeSlot(
 			channel.announcementVerified,
 			channel.announcementVerifyDeferred
@@ -568,7 +691,28 @@ export class NetworkGraph {
 		}
 
 		const scidHex = channel.shortChannelId.toString('hex');
+
+		// Ceiling (issue #446): the restore path admits rows with no gates, so
+		// a poisoned store would otherwise re-inflate the graph on every boot.
+		// Same preference as live admission: a verified row may evict an
+		// unverified in-graph entry; an unverified row is dropped, and
+		// reported so its storage row is deleted. A verified row that cannot
+		// be admitted (everything held is verified, reachable only if the
+		// ceiling was lowered between runs) is skipped WITHOUT the report:
+		// provably-signed data is left on disk for a future run rather than
+		// trimmed.
+		const isNew = !this._channels.has(scidHex);
+		if (isNew && this._channels.size >= NetworkGraph.MAX_CHANNELS) {
+			if (channel.announcementVerified === true) {
+				if (!this._evictOneUnverified()) return;
+			} else {
+				this._onChannelEvicted?.(scidHex);
+				return;
+			}
+		}
+
 		this._channels.set(scidHex, channel);
+		this._syncUnverifiedIndex(scidHex, channel);
 
 		// Ensure node entries exist and link channel
 		const node1Hex = channel.nodeId1.toString('hex');
@@ -597,6 +741,15 @@ export class NetworkGraph {
 	 * eager verifies at once, lazy marks it deferred.
 	 */
 	restoreNode(node: IGraphNode): void {
+		// Same repair as restoreChannel: a pre-bound far-future announcement
+		// would camp the node's slot forever, so it is dropped and the next
+		// real announcement takes the slot.
+		if (
+			node.announcement &&
+			gossipTimestampTooFarFuture(node.announcement.timestamp)
+		) {
+			node.announcement = undefined;
+		}
 		const slot = sanitizeSlot(
 			node.announcementVerified,
 			node.announcementVerifyDeferred
@@ -736,7 +889,8 @@ export class NetworkGraph {
 		let complete = true;
 
 		for (const scid of scids) {
-			const channel = this._channels.get(scid.toString('hex'));
+			const scidHex = scid.toString('hex');
+			const channel = this._channels.get(scidHex);
 			if (!channel) continue;
 
 			// A channel is served atomically or not at all: partial output
@@ -778,6 +932,7 @@ export class NetworkGraph {
 						channel.announcement
 					);
 					channel.announcementVerifyDeferred = undefined;
+					this._syncUnverifiedIndex(scidHex, channel);
 				}
 				// The updates and node announcements of a non-servable channel
 				// are never verified: its endpoint keys are unauthenticated.
