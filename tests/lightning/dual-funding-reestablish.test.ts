@@ -4726,6 +4726,8 @@ class ScriptedChainBackend implements IChainBackend {
 	history = new Map<string, Array<{ txid: string; height: number }>>();
 	transactions = new Map<string, Buffer>();
 	tipHeight = 200;
+	/** Number of script-hash subscriptions to fail before answering. */
+	failSubscriptions = 0;
 	private onBlock: ((height: number) => void) | null = null;
 
 	async subscribeToHeaders(cb: (height: number) => void): Promise<void> {
@@ -4733,6 +4735,10 @@ class ScriptedChainBackend implements IChainBackend {
 		cb(this.tipHeight);
 	}
 	async subscribeToScriptHash(): Promise<void> {
+		if (this.failSubscriptions > 0) {
+			this.failSubscriptions--;
+			throw new Error('scripthash subscription failed');
+		}
 		/* the tests drive checks through recheckAllWatches instead */
 	}
 	async getScriptHashHistory(
@@ -7446,10 +7452,18 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			bitcoin.networks.regtest
 		).p2wshOutput;
 
-		// The RBF replacement the record never saw: same script, same value.
+		// The RBF replacement the record never saw: same script, same value,
+		// and spending the recorded attempt's own input, which is what makes
+		// it a replacement rather than an unrelated transaction.
+		const recordedTx = bitcoin.Transaction.fromHex(
+			recorded.v2InFlight!.fundingTxHex
+		);
 		const replacement = new bitcoin.Transaction();
 		replacement.version = 2;
-		replacement.addInput(crypto.randomBytes(32), 0);
+		replacement.addInput(
+			Buffer.from(recordedTx.ins[0].hash),
+			recordedTx.ins[0].index
+		);
 		replacement.addOutput(fundingScript, Number(recorded.fundingSatoshis));
 		// And the peer's commitment spending it.
 		const spentState = deserializeChannelState(serializeChannelState(recorded));
@@ -7486,7 +7500,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 				chainBackend: backend
 			})
 		);
-		opener2.on('node:error', () => {});
+		const watcherErrors: string[] = [];
+		opener2.on('node:error', (e: { code: string; message: string }) => {
+			if (e.code === 'CHAIN_WATCHER_ERROR') watcherErrors.push(e.message);
+		});
 		const broadcasts: Buffer[] = [];
 		opener2.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
 
@@ -7507,6 +7524,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			monitor.getTrackedOutputs().map((o) => o.outputType),
 			'the peer close was classified and our output tracked'
 		).to.deep.equal([OutputType.TO_REMOTE]);
+		// The adoption reads the candidate set back off the watch. Indexing the
+		// set computed before discovery threw instead, so the bind only landed
+		// on a LATER recheck and every check in between reported an error.
+		expect(watcherErrors, 'the bind raises nothing').to.deep.equal([]);
 
 		// Anchor to_remote matures one block after the spend.
 		opener2.handleNewBlock(201);
@@ -7514,6 +7535,324 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const sweep = bitcoin.Transaction.fromBuffer(broadcasts[0]);
 		expect(Buffer.from(sweep.ins[0].hash).reverse().toString('hex')).to.equal(
 			peerCommitment.getId()
+		);
+
+		opener2.destroy();
+		acceptor.destroy();
+	});
+
+	it('a deeper exact-value decoy never wins over the spent replacement (463)', async function () {
+		// Script and value make a forgery expensive, not authentic, and
+		// channel_announcement publishes both funding pubkeys. A decoy
+		// confirmed EARLIER than the real replacement would win a
+		// deepest-wins rule outright, and the watch would then ignore the real
+		// funding's spend forever. Only a spend binds, and only this
+		// channel's two parties can produce one for a 2-of-2 of their own
+		// funding pubkeys.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-decoy-463-'));
+		const dbPath = path.join(dir, 'opener.db');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const opener1 = new LightningNode(
+			makeNodeConfig(174, {
+				storage: storage1,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(400_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(175));
+		opener1.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire1 = wireNodes(opener1, acceptor);
+		wire1.dropFrom(opener1, MessageType.COMMITMENT_SIGNED);
+		const channel1 = opener1.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire1.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel1.getChannelId()!;
+		const recorded = channel1.getFullState();
+		const fundingScript = createFundingScript(
+			recorded.localBasepoints.fundingPubkey,
+			recorded.remoteBasepoints!.fundingPubkey,
+			bitcoin.networks.regtest
+		).p2wshOutput;
+		const value = Number(recorded.fundingSatoshis);
+		const recordedTx = bitcoin.Transaction.fromHex(
+			recorded.v2InFlight!.fundingTxHex
+		);
+
+		// A stranger pays the exact script for the exact value, and mines it
+		// BEFORE the real replacement. Nobody can ever spend it.
+		const decoy = new bitcoin.Transaction();
+		decoy.version = 2;
+		decoy.addInput(crypto.randomBytes(32), 7);
+		decoy.addOutput(fundingScript, value);
+
+		const replacement = new bitcoin.Transaction();
+		replacement.version = 2;
+		replacement.addInput(
+			Buffer.from(recordedTx.ins[0].hash),
+			recordedTx.ins[0].index
+		);
+		replacement.addOutput(fundingScript, value);
+		const spentState = deserializeChannelState(serializeChannelState(recorded));
+		spentState.fundingTxid = replacement.getHash();
+		spentState.fundingOutputIndex = 0;
+		const peerCommitment = buildRemoteCommitment(
+			spentState,
+			perCommitmentPointFromSecret(
+				crypto.createHash('sha256').update(Buffer.from('decoy-463')).digest()
+			),
+			3n
+		).result.tx;
+
+		opener1.destroy();
+		managerOf(acceptor).handlePeerDisconnected(opener1.getNodeId());
+
+		const backend = new ScriptedChainBackend();
+		for (const tx of [decoy, replacement, peerCommitment]) {
+			backend.transactions.set(tx.getId(), tx.toBuffer());
+		}
+		backend.history.set(computeScriptHash(fundingScript), [
+			{ txid: decoy.getId(), height: 50 },
+			{ txid: replacement.getId(), height: 100 },
+			{ txid: peerCommitment.getId(), height: 150 }
+		]);
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const opener2 = new LightningNode(
+			makeNodeConfig(174, {
+				storage: storage2,
+				recovery: { enabled: true },
+				chainBackend: backend
+			})
+		);
+		opener2.on('node:error', () => {});
+		const discovered: string[] = [];
+		opener2
+			.getChainWatcher()!
+			.on('funding:discovered', (_id: Buffer, txid: string) =>
+				discovered.push(txid)
+			);
+		for (
+			let i = 0;
+			i < 40 && !opener2.getChannelManager().getMonitor(channelId);
+			i++
+		) {
+			await opener2.getChainWatcher()!.recheckAllWatches();
+			await new Promise((r) => setTimeout(r, 25));
+		}
+
+		expect(
+			discovered,
+			'bound to the spent replacement, not the decoy'
+		).to.deep.equal([replacement.getId()]);
+		const monitor = opener2.getChannelManager().getMonitor(channelId)!;
+		expect(monitor.getTrackedOutputs().map((o) => o.outputType)).to.deep.equal([
+			OutputType.TO_REMOTE
+		]);
+
+		opener2.destroy();
+		acceptor.destroy();
+	});
+
+	it('an unspent replacement stops the forget clock without binding (463)', async function () {
+		// The peer has not closed, so nothing has proved which of the outputs
+		// paying this script is ours. That is not a reason to forget the
+		// channel: something on chain pays its funding script for its funding
+		// value, so the BOLT 2 clock must not run, and equally not a reason to
+		// report a confirmation or retire the recorded funding payload.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-unspent-463-'));
+		const dbPath = path.join(dir, 'opener.db');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const opener1 = new LightningNode(
+			makeNodeConfig(176, {
+				storage: storage1,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(400_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(177));
+		opener1.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire1 = wireNodes(opener1, acceptor);
+		wire1.dropFrom(opener1, MessageType.COMMITMENT_SIGNED);
+		const channel1 = opener1.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire1.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel1.getChannelId()!;
+		const recorded = channel1.getFullState();
+		const fundingScript = createFundingScript(
+			recorded.localBasepoints.fundingPubkey,
+			recorded.remoteBasepoints!.fundingPubkey,
+			bitcoin.networks.regtest
+		).p2wshOutput;
+		const recordedTx = bitcoin.Transaction.fromHex(
+			recorded.v2InFlight!.fundingTxHex
+		);
+		const replacement = new bitcoin.Transaction();
+		replacement.version = 2;
+		replacement.addInput(
+			Buffer.from(recordedTx.ins[0].hash),
+			recordedTx.ins[0].index
+		);
+		replacement.addOutput(fundingScript, Number(recorded.fundingSatoshis));
+		opener1.destroy();
+
+		const backend = new ScriptedChainBackend();
+		backend.tipHeight = 700_000;
+		backend.transactions.set(replacement.getId(), replacement.toBuffer());
+		backend.history.set(computeScriptHash(fundingScript), [
+			{ txid: replacement.getId(), height: 690_000 }
+		]);
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const opener2 = new LightningNode(
+			makeNodeConfig(176, {
+				storage: storage2,
+				recovery: { enabled: true },
+				chainBackend: backend
+			})
+		);
+		opener2.on('node:error', () => {});
+		const voided: Buffer[] = [];
+		opener2.on('channel:voided', (e: { channelId: Buffer }) => {
+			voided.push(e.channelId);
+		});
+		const confirmed: Buffer[] = [];
+		opener2
+			.getChainWatcher()!
+			.on('funding:confirmed', (id: Buffer) => confirmed.push(id));
+
+		await settle(() => opener2.listChannels().length === 1, 4000);
+		for (let i = 0; i < 4; i++)
+			await opener2.getChainWatcher()!.recheckAllWatches();
+
+		const channel = opener2.getChannelManager().getChannel(channelId)!;
+		expect(
+			channel.fundingMissingSince(),
+			'a provisional match is presence, so no clock starts'
+		).to.equal(undefined);
+		expect(confirmed, 'and nothing is reported as confirmed').to.have.length(0);
+		expect(
+			channel.getFullState().pendingFundingTxHex ??
+				opener2.getChannelManager().getChannel(channelId)!.getFullState()
+					.v2InFlight?.fundingTxHex,
+			'the recorded funding payload is not retired'
+		).to.not.equal(undefined);
+
+		// Well past BOLT 2's window, still retained.
+		backend.advanceTo(700_000 + 2017);
+		opener2.handleNewBlock(700_000 + 2017);
+		expect(
+			voided,
+			'never forgotten while something pays its script'
+		).to.have.length(0);
+		expect(opener2.getChannelManager().getChannel(channelId)).to.not.equal(
+			undefined
+		);
+
+		opener2.destroy();
+		acceptor.destroy();
+	});
+
+	it('discovery survives a failed subscription and its retry (463)', async function () {
+		// The retry queue re-arms a watch whose subscription failed. It has to
+		// re-arm the SAME watch: dropping the discovery value there would
+		// leave a restored channel filtering the history down to a txid the
+		// chain does not have, permanently, and the funding-missing watchdog
+		// as the only outcome.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-resub-463-'));
+		const dbPath = path.join(dir, 'opener.db');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const opener1 = new LightningNode(
+			makeNodeConfig(178, {
+				storage: storage1,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(400_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(179));
+		opener1.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire1 = wireNodes(opener1, acceptor);
+		wire1.dropFrom(opener1, MessageType.COMMITMENT_SIGNED);
+		const channel1 = opener1.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire1.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel1.getChannelId()!;
+		const recorded = channel1.getFullState();
+		const fundingScript = createFundingScript(
+			recorded.localBasepoints.fundingPubkey,
+			recorded.remoteBasepoints!.fundingPubkey,
+			bitcoin.networks.regtest
+		).p2wshOutput;
+		const recordedTx = bitcoin.Transaction.fromHex(
+			recorded.v2InFlight!.fundingTxHex
+		);
+		const replacement = new bitcoin.Transaction();
+		replacement.version = 2;
+		replacement.addInput(
+			Buffer.from(recordedTx.ins[0].hash),
+			recordedTx.ins[0].index
+		);
+		replacement.addOutput(fundingScript, Number(recorded.fundingSatoshis));
+		const spentState = deserializeChannelState(serializeChannelState(recorded));
+		spentState.fundingTxid = replacement.getHash();
+		spentState.fundingOutputIndex = 0;
+		const peerCommitment = buildRemoteCommitment(
+			spentState,
+			perCommitmentPointFromSecret(
+				crypto.createHash('sha256').update(Buffer.from('resub-463')).digest()
+			),
+			3n
+		).result.tx;
+		opener1.destroy();
+
+		const backend = new ScriptedChainBackend();
+		// The first subscription of the restored watch fails.
+		backend.failSubscriptions = 1;
+		backend.transactions.set(replacement.getId(), replacement.toBuffer());
+		backend.transactions.set(peerCommitment.getId(), peerCommitment.toBuffer());
+		backend.history.set(computeScriptHash(fundingScript), [
+			{ txid: replacement.getId(), height: 100 },
+			{ txid: peerCommitment.getId(), height: 150 }
+		]);
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const opener2 = new LightningNode(
+			makeNodeConfig(178, {
+				storage: storage2,
+				recovery: { enabled: true },
+				chainBackend: backend
+			})
+		);
+		opener2.on('node:error', () => {});
+		for (
+			let i = 0;
+			i < 40 && !opener2.getChannelManager().getMonitor(channelId);
+			i++
+		) {
+			await opener2.getChainWatcher()!.recheckAllWatches();
+			await new Promise((r) => setTimeout(r, 25));
+		}
+
+		const monitor = opener2.getChannelManager().getMonitor(channelId);
+		expect(monitor, 'the retried watch still discovers').to.not.equal(
+			undefined
+		);
+		expect(monitor!.getTrackedOutputs().map((o) => o.outputType)).to.deep.equal(
+			[OutputType.TO_REMOTE]
 		);
 
 		opener2.destroy();

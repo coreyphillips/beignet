@@ -106,15 +106,37 @@ interface IWatchedFunding {
 	 * the funding ABSENT while it sits confirmed in that very history.
 	 *
 	 * When set, an otherwise-empty filter falls back to reading the history
-	 * for a transaction that CREATES an output paying this exact script for
-	 * this exact value. Both halves matter: the script alone is public for an
-	 * announced channel (channel_announcement carries both funding pubkeys),
-	 * so a third party could pay it and steer the watch onto an outpoint
-	 * nobody will ever spend. Requiring the full funding value makes that cost
-	 * more than the balance it could deny, and the deepest confirmation wins,
-	 * which the real funding always is.
+	 * for transactions that CREATE an output paying this exact script for this
+	 * exact value. Script plus value makes a forgery expensive; it does not
+	 * make it authentic, and the script alone is public for an announced
+	 * channel (channel_announcement carries both funding pubkeys). So a match
+	 * is only ever PROVISIONAL, and binding waits for the second phase below.
 	 */
 	discoverValueSats?: number;
+	/**
+	 * Confirmed script-and-value matches that are not (yet) known to be this
+	 * channel's funding: candidates, never conclusions. They keep the watch
+	 * reading as PRESENT, so a restored channel whose funding the record
+	 * cannot name is never forgotten by the BOLT 2 clock, but nothing else is
+	 * done with them. The watched outpoint is not moved, no confirmation is
+	 * reported and the recorded funding payload is not retired, because any
+	 * of those would act on a transaction that may be a decoy.
+	 *
+	 * Binding waits for a SPEND of one of them. The output pays a 2-of-2 that
+	 * only this channel's two parties can satisfy, so a transaction spending
+	 * it exists only if both of them signed one, which nobody who merely
+	 * copied the script can arrange. A decoy therefore stays provisional
+	 * forever while the search continues past it (issue #463).
+	 */
+	provisional?: Array<{ txid: string; outputIndex: number; height: number }>;
+	/**
+	 * Per-txid results of the discovery scan, so each transaction in the
+	 * history is fetched once and not again on every recheck. Transactions are
+	 * immutable, so both halves keep: `out` is the index of an output paying
+	 * the watched script for the watched value (null if none), and `ins` are
+	 * the outpoints it spends, as `txid:vout`.
+	 */
+	discoveryScan?: Map<string, { out: number | null; ins: string[] }>;
 }
 
 /** A generic output being watched for spends */
@@ -226,8 +248,8 @@ export async function classifyRemoteFundingInput(
  * - 'funding:missing' (channelId: Buffer, txid: string): the watched funding
  *   tx disappeared from mempool AND chain before confirming (evicted/replaced)
  * - 'funding:discovered' (channelId: Buffer, txid: string): a restored watch
- *   found its funding in the script's history under a txid the restored record
- *   never named, and adopted it (issue #463)
+ *   bound to a funding in the script's history that the restored record never
+ *   named, having seen it spent by the two parties that alone can (issue #463)
  * - 'broadcast:success' (txid: string)
  * - 'broadcast:failure' (error: Error)
  * - 'error' (error: Error)
@@ -255,6 +277,15 @@ interface IFailedFundingWatch {
 	 * watchdog instead).
 	 */
 	candidates?: Array<{ txid: string; outputIndex: number }>;
+	/**
+	 * Restored watches only: the funding value discovery recognizes an
+	 * unnamed attempt by. Carried through the retry for the same reason the
+	 * candidate set is: a transient subscription failure must not silently
+	 * re-arm a narrower watch than the one that failed, which here would
+	 * disable discovery outright and leave the funding-missing watchdog as
+	 * the only outcome (issue #463).
+	 */
+	discoverValueSats?: number;
 	/**
 	 * The registration this failure belongs to. A retry re-registers by map
 	 * overwrite, so a queued failure must not be replayed once a NEWER
@@ -463,7 +494,8 @@ export class ChainWatcher extends EventEmitter {
 					w.minimumDepth,
 					w.scriptPubkey,
 					undefined,
-					w.candidates
+					w.candidates,
+					w.discoverValueSats
 				).catch(() => {
 					/* re-queued inside watchFundingOutput */
 				});
@@ -608,6 +640,7 @@ export class ChainWatcher extends EventEmitter {
 					candidates: candidates?.length
 						? candidates.map((c) => ({ ...c }))
 						: undefined,
+					discoverValueSats,
 					watched
 				});
 			}
@@ -942,7 +975,8 @@ export class ChainWatcher extends EventEmitter {
 					watch.minimumDepth,
 					watch.scriptPubkey,
 					undefined,
-					watch.candidates
+					watch.candidates,
+					watch.discoverValueSats
 				).catch(() => {
 					// Still failing — already re-queued inside watchFundingOutput
 				});
@@ -1111,11 +1145,15 @@ export class ChainWatcher extends EventEmitter {
 		let entries = history.filter((h) =>
 			candidates.some((c) => c.txid === h.txid)
 		);
-		if (entries.length === 0 && watched.discoverValueSats !== undefined) {
+		if (entries.length > 0) {
+			// The recorded attempt answers for itself; nothing provisional
+			// applies any more.
+			watched.provisional = undefined;
+		} else if (watched.discoverValueSats !== undefined) {
 			// A restored record whose attempt the chain does not know: read the
 			// funding out of the history instead of insisting on the txid the
 			// record happens to name (issue #463).
-			const found = await this.discoverFundingInHistory(
+			const bound = await this.discoverRestoredFunding(
 				watched,
 				history,
 				generation
@@ -1126,12 +1164,23 @@ export class ChainWatcher extends EventEmitter {
 			) {
 				return;
 			}
-			if (found) {
-				watched.txid = found.txid;
-				watched.outputIndex = found.outputIndex;
+			if (bound) {
+				watched.txid = bound.txid;
+				watched.outputIndex = bound.outputIndex;
 				watched.candidates = undefined;
-				this.emit('funding:discovered', watched.channelId, found.txid);
-				entries = history.filter((h) => h.txid === found.txid);
+				watched.provisional = undefined;
+				watched.discoveryScan = undefined;
+				this.emit('funding:discovered', watched.channelId, bound.txid);
+				entries = history.filter((h) => h.txid === bound.txid);
+			} else if (watched.provisional?.length) {
+				// Unproven but real enough to stop the clock: something is
+				// sitting on chain that pays this channel's funding script for
+				// its funding value. It is NOT reported as a confirmation and
+				// the watched outpoint does not move, because the evidence
+				// that it is ours has not arrived yet.
+				watched.missingChecks = 0;
+				watched.missingReported = false;
+				return;
 			}
 		}
 		if (entries.length === 0) {
@@ -1158,8 +1207,15 @@ export class ChainWatcher extends EventEmitter {
 		if (confirmations >= watched.minimumDepth) {
 			// Adopt the winning candidate into the watch itself, so spend
 			// detection and the announcement proof key off the tx that is
-			// actually on chain.
-			const winner = candidates.find((c) => c.txid === entry.txid)!;
+			// actually on chain. Re-read the candidate set from the watch:
+			// discovery above can have bound an outpoint the set computed at
+			// the top of this method never held, and indexing that stale array
+			// threw rather than adopting.
+			const active = watched.candidates?.length
+				? watched.candidates
+				: [{ txid: watched.txid, outputIndex: watched.outputIndex }];
+			const winner = active.find((c) => c.txid === entry.txid);
+			if (!winner) return;
 			watched.txid = winner.txid;
 			watched.outputIndex = winner.outputIndex;
 			watched.candidates = undefined;
@@ -1180,43 +1236,87 @@ export class ChainWatcher extends EventEmitter {
 	}
 
 	/**
-	 * Read the funding transaction out of the funding script's own history,
-	 * for a watch whose recorded candidates are all absent. Returns the
-	 * deepest confirmed transaction that CREATES an output paying the watched
-	 * script for the watched value, which is the only thing the funding of
-	 * this channel can be; see discoverValueSats for why both halves of that
-	 * test are required. Mempool-only transactions are ignored: an
-	 * unconfirmed stranger is not evidence, and the real funding of a restored
-	 * channel has long since confirmed.
+	 * Two-phase discovery of a restored channel's funding, for a watch whose
+	 * recorded candidates the chain does not know.
+	 *
+	 * Phase one collects PROVISIONAL candidates: confirmed transactions in the
+	 * funding script's own history that create an output paying that script
+	 * for the funding value. That test makes a forgery expensive, not
+	 * authentic, and "deepest wins" would happily pick a decoy an attacker
+	 * confirmed first, after which the watch would ignore the real funding's
+	 * spend forever. So nothing is bound on it.
+	 *
+	 * Phase two waits for one of those outputs to be SPENT, and binds to that
+	 * one. The output pays a 2-of-2 of this channel's two funding pubkeys, so
+	 * only its two parties can produce a transaction spending it, and this
+	 * node never signs a spend of anything but its own funding. A spend is
+	 * therefore proof of a jointly authorized funding attempt, which no amount
+	 * of copying the script can manufacture. Mempool spends count: a close
+	 * that has not confirmed yet is still a real spend, and the outpoint it
+	 * names is what spend detection needs.
+	 *
+	 * A provisional candidate that is never spent simply stays provisional,
+	 * which is the honest answer: something pays this script on chain, so the
+	 * channel is not forgotten, but nothing has shown it to be ours.
+	 *
+	 * Returns the outpoint to bind, or null when the search ends provisional
+	 * (watched.provisional carries what it found).
 	 */
-	private async discoverFundingInHistory(
+	private async discoverRestoredFunding(
 		watched: IWatchedFunding,
 		history: Array<{ txid: string; height: number }>,
 		generation: number
 	): Promise<{ txid: string; outputIndex: number } | null> {
-		let best: { txid: string; outputIndex: number; height: number } | null =
-			null;
+		const scan = (watched.discoveryScan ??= new Map());
 		for (const entry of history) {
-			if (entry.height <= 0) continue;
-			if (best && entry.height >= best.height) continue;
+			if (scan.has(entry.txid)) continue;
 			let tx: import('bitcoinjs-lib').Transaction;
 			try {
 				const raw = await this.backend.getTransaction(entry.txid);
 				if (!this.isCurrentGeneration(generation)) return null;
 				tx = bitcoin.Transaction.fromBuffer(raw);
 			} catch {
-				// One unreadable entry must not hide the rest of the history.
+				// One unreadable entry must not hide the rest of the history,
+				// and must not be cached as a verdict either: leave it
+				// unscanned so the next recheck asks again.
 				continue;
 			}
-			const index = tx.outs.findIndex(
-				(out) =>
-					out.value === watched.discoverValueSats &&
-					out.script.equals(watched.script)
+			const out = tx.outs.findIndex(
+				(o) =>
+					o.value === watched.discoverValueSats &&
+					o.script.equals(watched.script)
 			);
-			if (index < 0) continue;
-			best = { txid: entry.txid, outputIndex: index, height: entry.height };
+			scan.set(entry.txid, {
+				out: out < 0 ? null : out,
+				ins: tx.ins.map(
+					(i) => `${Buffer.from(i.hash).reverse().toString('hex')}:${i.index}`
+				)
+			});
 		}
-		return best ? { txid: best.txid, outputIndex: best.outputIndex } : null;
+
+		// Phase one: every confirmed script-and-value match, deepest first so
+		// a bind has a stable order to choose in.
+		const provisional = history
+			.filter((h) => h.height > 0 && scan.get(h.txid)?.out != null)
+			.map((h) => ({
+				txid: h.txid,
+				outputIndex: scan.get(h.txid)!.out!,
+				height: h.height
+			}))
+			.sort((a, b) => a.height - b.height);
+		watched.provisional = provisional.length ? provisional : undefined;
+		if (provisional.length === 0) return null;
+
+		// Phase two: one of them spent, by anyone, at any depth.
+		const spent = new Set<string>();
+		for (const [, scanned] of scan) {
+			for (const outpoint of scanned.ins) spent.add(outpoint);
+		}
+		for (const candidate of provisional) {
+			if (!spent.has(`${candidate.txid}:${candidate.outputIndex}`)) continue;
+			return { txid: candidate.txid, outputIndex: candidate.outputIndex };
+		}
+		return null;
 	}
 
 	/**
@@ -1230,6 +1330,10 @@ export class ChainWatcher extends EventEmitter {
 		const watched = this.watchedFundings.get(channelId.toString('hex'));
 		if (!watched) return 'unknown';
 		if (watched.confirmed || watched.missingChecks === 0) return 'present';
+		// Something on chain pays this channel's funding script for its
+		// funding value. Unproven, but not absent: the BOLT 2 forget clock
+		// must not run against it (issue #463).
+		if (watched.provisional?.length) return 'present';
 		if (watched.missingReported) return 'absent';
 		return 'unknown';
 	}
