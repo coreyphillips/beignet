@@ -722,16 +722,39 @@ describe('Daemon auth middleware', () => {
 			expect(notFound.status).to.equal(404);
 
 			// Fractional sats used to throw an uncaught RangeError at BigInt()
-			// and surface as a 200 INTERNAL_ERROR.
-			const fractional = await httpPost(
-				addr.port,
+			// and surface as a 200 INTERNAL_ERROR. Issue #472: the zero-conf
+			// and v2 routes skipped the same guard, so they still answered a
+			// scrubbed 500 long after /channel/open was fixed.
+			for (const route of [
 				'/channel/open',
-				{ pubkey: '02' + 'ab'.repeat(32), amountSats: 1.5 },
+				'/channel/open-zeroconf',
+				'/channel/open-v2'
+			]) {
+				const fractional = await httpPost(
+					addr.port,
+					route,
+					{ pubkey: '02' + 'ab'.repeat(32), amountSats: 1.5 },
+					auth
+				);
+				expect(fractional.status, route).to.equal(400);
+				expect(
+					(fractional.body.error as { code: string }).code,
+					route
+				).to.equal('INVALID_PARAMS');
+			}
+
+			// Issue #471: a typed code with no entry in STATUS_BY_ERROR_CODE
+			// shipped as a 500, which reads as a node fault. A splice against
+			// an unknown channel is a state refusal, not a fault.
+			const unknownChannel = await httpPost(
+				addr.port,
+				'/channel/splice-quote',
+				{ channelId: 'cd'.repeat(32), direction: 'out', feeratePerkw: 2500 },
 				auth
 			);
-			expect(fractional.status).to.equal(400);
-			expect((fractional.body.error as { code: string }).code).to.equal(
-				'INVALID_PARAMS'
+			expect(unknownChannel.status).to.equal(404);
+			expect((unknownChannel.body.error as { code: string }).code).to.equal(
+				'CHANNEL_NOT_FOUND'
 			);
 		} finally {
 			await node.destroy();

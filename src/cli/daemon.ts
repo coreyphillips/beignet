@@ -236,7 +236,38 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	CAPSULE_RESTORE_FAILED: 409,
 	CAPSULE_RESTORE_GUARDIAN_BACKED: 409,
 	CAPSULE_RESTORE_QUORUM_NAMESPACE: 409,
-	CAPSULE_RESTORE_INSTALL_FAILED: 500
+	CAPSULE_RESTORE_INSTALL_FAILED: 500,
+	// Domain failures from BeignetErrorCode (issue #471). Every one of these
+	// used to fall through to the 500 default, so a failed peer dial read as a
+	// node fault, which is the class an agent retries. Same vocabulary as the
+	// blocks above: 502/504 when the trouble is upstream of us (the peer, the
+	// network), 409 when the node's own state conflicts with the request, 503
+	// when waiting genuinely changes the answer.
+	CONNECT_FAILED: 502,
+	CONNECT_TIMEOUT: 504,
+	PAYMENT_FAILED: 502,
+	PAYMENT_TIMEOUT: 504,
+	NO_ROUTE: 502,
+	OPEN_FAILED: 502,
+	PEER_NOT_CONNECTED: 409,
+	INSUFFICIENT_BALANCE: 409,
+	CHANNEL_NOT_READY: 409,
+	DUPLICATE_PAYMENT: 409,
+	NOT_BOOSTABLE: 409,
+	NOTHING_TO_CONSOLIDATE: 409,
+	NODE_DESTROYED: 409,
+	FUNDING_PROVIDER_REQUIRED: 409,
+	CHANNEL_NOT_FOUND: 404,
+	INVOICE_EXPIRED: 410,
+	SPENDING_LIMIT_EXCEEDED: 403,
+	SERVICE_DRAINING: 503,
+	FEE_ESTIMATE_NOT_READY: 503
+	// Left unmapped on purpose, so they keep the 500 default:
+	// WALLET_CREATE_FAILED, ADDRESS_FAILED and REFRESH_FAILED are node faults,
+	// and SEND_FAILED, CLOSE_FAILED, FORCE_CLOSE_FAILED and ZERO_CONF_FAILED
+	// are grab-bags whose producers span caller state and genuine faults; each
+	// needs splitting before it can carry one honest status.
+	// INSTANCE_ALREADY_RUNNING is a startup refusal and never reaches HTTP.
 };
 
 export function statusForErrorCode(code: string): number {

@@ -174,6 +174,9 @@ import {
 	LightningErrorCode,
 	LightningPaymentError,
 	InvalidChannelOpenError,
+	ChannelFundingUnavailableError,
+	ChannelFundingUnavailableCode,
+	InvalidSpliceError,
 	IChannelHealth,
 	IStructuredLog,
 	IPaymentProof,
@@ -8032,13 +8035,14 @@ export class LightningNode extends EventEmitter {
 		inputCount: number;
 	} {
 		if (!Number.isFinite(satsPerVbyte) || satsPerVbyte <= 0) {
-			throw new Error(
+			throw new InvalidChannelOpenError(
 				`satsPerVbyte (${satsPerVbyte}) must be a positive finite rate`
 			);
 		}
 		const fp = this.fundingProvider;
 		if (!fp?.quoteDualFundingMax) {
-			throw new Error(
+			throw new ChannelFundingUnavailableError(
+				ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED,
 				'quoting a max dual-funded (v2) open requires a funding provider with quoteDualFundingMax'
 			);
 		}
@@ -8134,7 +8138,8 @@ export class LightningNode extends EventEmitter {
 				// rate (required above), so funding nets out to zero change.
 				const fp = this.fundingProvider;
 				if (!fp?.quoteDualFundingMax || !fp.selectMaxDualFundingInputs) {
-					throw new Error(
+					throw new ChannelFundingUnavailableError(
+						ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED,
 						'max funding on a dual-funded (v2) open requires a funding provider with quoteDualFundingMax and selectMaxDualFundingInputs'
 					);
 				}
@@ -8143,7 +8148,8 @@ export class LightningNode extends EventEmitter {
 				);
 				const quote = fp.quoteDualFundingMax(feeratePerKw);
 				if (quote.fundingSatoshis <= 0n) {
-					throw new Error(
+					throw new ChannelFundingUnavailableError(
+						ChannelFundingUnavailableCode.INSUFFICIENT_BALANCE,
 						`insufficient funds for a max dual-funded open: ${quote.spendableSats} sats spendable cannot cover the ${quote.feeSats} sat funding fee`
 					);
 				}
@@ -8176,7 +8182,8 @@ export class LightningNode extends EventEmitter {
 			// honestly; the seed resolves almost immediately and a retry
 			// succeeds.
 			if (quotedSatPerVbyte <= 0 && this.feeEstimator) {
-				throw new Error(
+				throw new ChannelFundingUnavailableError(
+					ChannelFundingUnavailableCode.FEE_ESTIMATE_NOT_READY,
 					'fee estimate not ready yet for a dual-funded open (the estimator has not delivered its first sample); retry shortly or pass an explicit satsPerVbyte'
 				);
 			}
@@ -9197,9 +9204,9 @@ export class LightningNode extends EventEmitter {
 		fundingFeeratePerkw = 253
 	): { ok: boolean; error?: string } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
-		if (cidErr) throw new Error(cidErr);
+		if (cidErr) throw new InvalidSpliceError(cidErr);
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
-		if (satsErr) throw new Error(satsErr);
+		if (satsErr) throw new InvalidSpliceError(satsErr);
 
 		// Splice-in must fund the channel increase with wallet inputs. Source them
 		// from the funding provider (UTXO selection + change + per-input signing),
@@ -9444,10 +9451,13 @@ export class LightningNode extends EventEmitter {
 		inputCount?: number;
 	} {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
-		if (cidErr) throw new Error(cidErr);
+		if (cidErr) throw new InvalidSpliceError(cidErr);
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) {
-			throw new Error(`Channel not found: ${channelId.toString('hex')}`);
+			throw new ChannelFundingUnavailableError(
+				ChannelFundingUnavailableCode.CHANNEL_NOT_FOUND,
+				`Channel not found: ${channelId.toString('hex')}`
+			);
 		}
 
 		if (direction === 'out') {
@@ -9500,7 +9510,8 @@ export class LightningNode extends EventEmitter {
 		}
 
 		if (!this.fundingProvider?.quoteSpliceIn) {
-			throw new Error(
+			throw new ChannelFundingUnavailableError(
+				ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED,
 				'splice-in quote requires a funding provider with quoteSpliceIn (wallet UTXO sourcing)'
 			);
 		}
@@ -9521,14 +9532,14 @@ export class LightningNode extends EventEmitter {
 		destinationScript?: Buffer
 	): { ok: boolean; error?: string } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
-		if (cidErr) throw new Error(cidErr);
+		if (cidErr) throw new InvalidSpliceError(cidErr);
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
-		if (satsErr) throw new Error(satsErr);
+		if (satsErr) throw new InvalidSpliceError(satsErr);
 		if (
 			destinationScript !== undefined &&
 			(!Buffer.isBuffer(destinationScript) || destinationScript.length === 0)
 		) {
-			throw new Error(
+			throw new InvalidSpliceError(
 				'destinationScript must be a non-empty Buffer when provided'
 			);
 		}
@@ -9540,7 +9551,7 @@ export class LightningNode extends EventEmitter {
 			destinationScript !== undefined &&
 			!isValidShutdownScript(destinationScript, true)
 		) {
-			throw new Error(
+			throw new InvalidSpliceError(
 				'destinationScript is not a standard output script (would burn the withdrawn funds)'
 			);
 		}

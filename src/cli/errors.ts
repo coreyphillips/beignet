@@ -41,6 +41,10 @@ export enum BeignetErrorCode {
 	DUPLICATE_PAYMENT = 'DUPLICATE_PAYMENT',
 	CHANNEL_NOT_READY = 'CHANNEL_NOT_READY',
 	OPEN_FAILED = 'OPEN_FAILED',
+	/** The node has no funding provider able to serve this open or splice. */
+	FUNDING_PROVIDER_REQUIRED = 'FUNDING_PROVIDER_REQUIRED',
+	/** The fee estimator has not delivered its first sample; retry shortly. */
+	FEE_ESTIMATE_NOT_READY = 'FEE_ESTIMATE_NOT_READY',
 
 	// Budget
 	SPENDING_LIMIT_EXCEEDED = 'SPENDING_LIMIT_EXCEEDED',
@@ -100,7 +104,9 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.BODY_TOO_LARGE,
 		BeignetErrorCode.MNEMONIC_REQUIRES_AUTH,
 		BeignetErrorCode.SPENDING_LIMIT_EXCEEDED,
-		BeignetErrorCode.SERVICE_DRAINING
+		BeignetErrorCode.SERVICE_DRAINING,
+		// A node with no funding provider will not grow one on a retry.
+		BeignetErrorCode.FUNDING_PROVIDER_REQUIRED
 	]);
 	if (permanentCodes.has(err.code)) return false;
 
@@ -111,7 +117,9 @@ export function isRetryableError(err: BeignetError): boolean {
 	const retryableCodes: Set<string> = new Set([
 		BeignetErrorCode.PAYMENT_TIMEOUT,
 		BeignetErrorCode.PEER_NOT_CONNECTED,
-		BeignetErrorCode.NO_ROUTE
+		BeignetErrorCode.NO_ROUTE,
+		// The estimator's seed lands within milliseconds of construction.
+		BeignetErrorCode.FEE_ESTIMATE_NOT_READY
 	]);
 	if (retryableCodes.has(err.code)) return true;
 
