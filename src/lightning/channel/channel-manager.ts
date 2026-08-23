@@ -39,7 +39,11 @@ import {
 	ClosingSigVariant,
 	IClosingCompleteMessage
 } from '../message/channel-close';
-import { decodeErrorMessage, encodeErrorMessage } from '../message/error';
+import {
+	canScopeWireError,
+	decodeErrorMessage,
+	encodeErrorMessage
+} from '../message/error';
 import { decodeChannelReestablishMessage } from '../message/channel-reestablish';
 import { decodeStfuMessage } from '../message/stfu';
 import {
@@ -444,6 +448,59 @@ const MAX_HELD_UNKNOWN_REESTABLISH = 1024;
  * Out-of-range windows decline the hold outright instead (issue #462).
  */
 const MAX_UNKNOWN_REESTABLISH_HOLD_MS = 2_147_483_647;
+
+/** BOLT 1 length-prefixes the error `data` field with a u16. */
+const MAX_WIRE_ERROR_DATA_BYTES = 0xffff;
+
+/**
+ * `reason` as wire bytes, clamped to what the length prefix can carry.
+ *
+ * Not every reason is ours: abortPendingOpen quotes an IFundingProvider error
+ * verbatim, so an embedder that throws more than 64 KiB of text would otherwise
+ * take encodeErrorMessage down with it. Clamped rather than refused because the
+ * peer is mid-negotiation: a truncated cancellation still frees it, while no
+ * message at all leaves it parked on an open that will never answer.
+ *
+ * The cut backs off over any UTF-8 continuation bytes it orphaned, so the
+ * operator at the far end never reads a split character.
+ *
+ * @param reason - Human-readable text for the peer's operator
+ * @returns The data field, at most MAX_WIRE_ERROR_DATA_BYTES long
+ */
+function clampWireErrorData(reason: string): Buffer {
+	const data = Buffer.from(reason, 'utf8');
+	if (data.length <= MAX_WIRE_ERROR_DATA_BYTES) return data;
+	let end = MAX_WIRE_ERROR_DATA_BYTES;
+	while (end > 0 && (data[end] & 0xc0) === 0x80) end--;
+	return data.subarray(0, end);
+}
+
+/**
+ * The payload for a BOLT 1 error scoped to `channelId`, or null when this id
+ * cannot carry one (canScopeWireError says which, and why).
+ *
+ * The manager-layer twin of Channel.wireErrorFor, returning a payload rather
+ * than an action because some of the sites here hand it straight to
+ * sendMessage while others wrap it in a SEND_MESSAGE action. Every wire error
+ * this class produces routes through it, for the reason refuseInboundOpen used
+ * to give for its own inline copy: a caller-side check protects only the caller
+ * that remembers to make it, and several of these sites take an id straight off
+ * the wire whose safety currently rests on a guard in a DIFFERENT handler
+ * (funding_created quotes the temporary id open_channel screened). A null here
+ * suppresses the wire half only; the local refusal, the cleanup and the event
+ * still stand.
+ *
+ * @param channelId - The id the error would be scoped to
+ * @param reason - Human-readable text for the peer's operator
+ * @returns The encoded error payload, or null when the id cannot carry one
+ */
+function wireErrorPayloadFor(channelId: Buffer, reason: string): Buffer | null {
+	if (!canScopeWireError(channelId)) return null;
+	return encodeErrorMessage({
+		channelId,
+		data: clampWireErrorData(reason)
+	});
+}
 
 export class ChannelManager extends EventEmitter {
 	private config: IChannelManagerConfig;
@@ -972,14 +1029,14 @@ export class ChannelManager extends EventEmitter {
 			return;
 		}
 		try {
-			this.sendMessage(
-				peerPubkey,
-				MessageType.ERROR,
-				encodeErrorMessage({
-					channelId: tempIdBuf,
-					data: Buffer.from(reason, 'utf8')
-				})
-			);
+			// Inside the guard, encoding included: the channel is already
+			// ERRORED by here, so anything that throws on the way to the wire
+			// must still leave the registration cleaned up and channel:aborted
+			// emitted rather than stranding a failed channel in tempChannels.
+			const wire = wireErrorPayloadFor(tempIdBuf, reason);
+			if (wire) {
+				this.sendMessage(peerPubkey, MessageType.ERROR, wire);
+			}
 		} finally {
 			if (this.removeCurrentTempChannel(peerPubkey, channel)) {
 				this.emitContained('channel:aborted', tempIdBuf, reason);
@@ -2979,17 +3036,11 @@ export class ChannelManager extends EventEmitter {
 			)
 		) {
 			const reason = 'funding_created refused: channel_id is already in use';
-			this.processActions(peerPubkey, channel, [
-				{
-					type: ChannelActionType.SEND_MESSAGE,
-					messageType: MessageType.ERROR,
-					payload: encodeErrorMessage({
-						channelId: msg.temporaryChannelId,
-						data: Buffer.from(reason, 'utf8')
-					})
-				},
-				{ type: ChannelActionType.ERROR, message: reason }
-			]);
+			this.processActions(
+				peerPubkey,
+				channel,
+				this.refusalActions(msg.temporaryChannelId, reason)
+			);
 			return;
 		}
 
@@ -3032,17 +3083,11 @@ export class ChannelManager extends EventEmitter {
 		// Reserve that id before dispatch, but never promote a rejected open.
 		if (!hasError && !this.promoteChannelLifecycle(peerPubkey, channel)) {
 			const reason = 'funding_created refused: channel_id is already in use';
-			this.processActions(peerPubkey, channel, [
-				{
-					type: ChannelActionType.SEND_MESSAGE,
-					messageType: MessageType.ERROR,
-					payload: encodeErrorMessage({
-						channelId: msg.temporaryChannelId,
-						data: Buffer.from(reason, 'utf8')
-					})
-				},
-				{ type: ChannelActionType.ERROR, message: reason }
-			]);
+			this.processActions(
+				peerPubkey,
+				channel,
+				this.refusalActions(msg.temporaryChannelId, reason)
+			);
 			return;
 		}
 
@@ -3080,17 +3125,11 @@ export class ChannelManager extends EventEmitter {
 			);
 			if (!hasError && !this.promoteChannelLifecycle(peerPubkey, ch)) {
 				const reason = 'funding_signed refused: channel_id is already in use';
-				this.processActions(peerPubkey, ch, [
-					{
-						type: ChannelActionType.SEND_MESSAGE,
-						messageType: MessageType.ERROR,
-						payload: encodeErrorMessage({
-							channelId: msg.channelId,
-							data: Buffer.from(reason, 'utf8')
-						})
-					},
-					{ type: ChannelActionType.ERROR, message: reason }
-				]);
+				this.processActions(
+					peerPubkey,
+					ch,
+					this.refusalActions(msg.channelId, reason)
+				);
 				return;
 			}
 
@@ -4645,6 +4684,32 @@ export class ChannelManager extends EventEmitter {
 			);
 			return;
 		}
+
+		// BOLT 1 reserves the all-zero channel_id for "all channels with this
+		// peer", so a reestablish naming it identifies no channel and there is
+		// no id we could answer under that means what we mean: the arm below
+		// would send its "unknown or closed channel" error scoped to the
+		// reserved id, which the peer reads as an instruction to fail EVERY
+		// channel it has with us. Our own handleErrorMsg implements exactly
+		// that rule, so one such message between two beignet nodes force-closes
+		// every shared channel (issue #466). refuseInboundOpen and
+		// Channel.wireErrorFor already refuse the same id for the same reason.
+		//
+		// Ahead of BOTH the lookup and the recovery hold below. An id that names
+		// no channel is not a channel a Recovery Capsule can restore, so parking
+		// it would spend one of the peer's hold windows, emit reestablish:held
+		// and put an all-zero row on the recovery status surface for a message
+		// that can never be answered. The decoder fixes channelId at 32 bytes,
+		// so the reserved id is the only case canScopeWireError can refuse here.
+		if (!canScopeWireError(msg.channelId)) {
+			this.emitContained(
+				'error',
+				msg.channelId,
+				'channel_reestablish dropped: channel_id is the reserved all-zero id'
+			);
+			return;
+		}
+
 		const channel = this.findChannelByChannelId(msg.channelId);
 
 		// Recovery 5.7 (issue #462): a node that may still be an incomplete
@@ -4693,19 +4758,15 @@ export class ChannelManager extends EventEmitter {
 					'peer sent channel_reestablish for a failed channel'
 				);
 			}
-			this.sendMessage(
-				peerPubkey,
-				MessageType.ERROR,
-				encodeErrorMessage({
-					channelId: msg.channelId,
-					data: Buffer.from(
-						failedNotClosed
-							? 'channel failed; closing on chain'
-							: 'unknown or closed channel',
-						'utf8'
-					)
-				})
+			const wire = wireErrorPayloadFor(
+				msg.channelId,
+				failedNotClosed
+					? 'channel failed; closing on chain'
+					: 'unknown or closed channel'
 			);
+			if (wire) {
+				this.sendMessage(peerPubkey, MessageType.ERROR, wire);
+			}
 			return;
 		}
 
@@ -5411,33 +5472,49 @@ export class ChannelManager extends EventEmitter {
 		return channel;
 	}
 
+	/**
+	 * A refusal of a channel that already has a state machine: the wire half
+	 * (when the id can carry one) followed by the local ERROR the dispatcher
+	 * unwinds with. The manager-layer twin of Channel.refuseWithWireError, and
+	 * the wire action LEADS for the same reason it does there.
+	 *
+	 * @param channelId - The scope the peer keys this negotiation by
+	 * @param reason - Human-readable text for both halves
+	 * @returns The actions to dispatch, never empty
+	 */
+	private refusalActions(channelId: Buffer, reason: string): ChannelAction[] {
+		const payload = wireErrorPayloadFor(channelId, reason);
+		const local: ChannelAction = {
+			type: ChannelActionType.ERROR,
+			message: reason
+		};
+		if (!payload) return [local];
+		return [
+			{
+				type: ChannelActionType.SEND_MESSAGE,
+				messageType: MessageType.ERROR,
+				payload
+			},
+			local
+		];
+	}
+
 	/** Refuse an inbound open before any channel state is retained. */
 	private refuseInboundOpen(
 		peerPubkey: string,
 		channelId: Buffer,
 		reason: string
 	): void {
-		// BOLT 1 reserves the all-zero channel_id for "all channels with this
-		// peer", so echoing one back turns a refusal of a single open into an
-		// instruction to fail every channel we have with the sender. Suppressed
-		// HERE rather than at each caller because every inbound-open refusal in
-		// this class routes through it, v1 and v2 alike, and each one takes the
-		// id straight off the wire; a caller-side check protects only the caller
-		// that remembers to make it. The open is still refused, just silently:
-		// there is no id we could answer under that means what we mean.
-		if (channelId.every((b) => b === 0)) {
-			this.emitContained('error', channelId, reason);
-			return;
-		}
+		// The open is still refused when the id cannot carry the wire half
+		// (wireErrorPayloadFor says which ids those are), just silently: there
+		// is no id we could answer under that means what we mean. Encoding sits
+		// inside the guard with the send, so no failure on the way to the wire
+		// can cost the local refusal diagnostic the finally owes.
 		try {
-			this.sendMessage(
-				peerPubkey,
-				MessageType.ERROR,
-				encodeErrorMessage({
-					channelId,
-					data: Buffer.from(reason, 'utf8')
-				})
-			);
+			const payload = wireErrorPayloadFor(channelId, reason);
+			if (payload) {
+				this.sendMessage(peerPubkey, MessageType.ERROR, payload);
+			}
 		} catch {
 			// The wire attempt already happened. Keep the local refusal diagnostic
 			// singular even when a synchronous outbound observer throws.
@@ -5828,17 +5905,11 @@ export class ChannelManager extends EventEmitter {
 			);
 			if (!ok) {
 				const reason = 'Invalid will_fund signature';
-				this.processActions(peerPubkey, channel, [
-					{
-						type: ChannelActionType.SEND_MESSAGE,
-						messageType: MessageType.ERROR,
-						payload: encodeErrorMessage({
-							channelId: msg.channelId,
-							data: Buffer.from(reason, 'utf8')
-						})
-					},
-					{ type: ChannelActionType.ERROR, message: reason }
-				]);
+				this.processActions(
+					peerPubkey,
+					channel,
+					this.refusalActions(msg.channelId, reason)
+				);
 				return;
 			}
 			leaseEvent = {

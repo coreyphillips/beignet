@@ -71,7 +71,7 @@ import {
 	encodeChannelReestablishMessage,
 	IChannelReestablishMessage
 } from '../message/channel-reestablish';
-import { encodeErrorMessage } from '../message/error';
+import { canScopeWireError, encodeErrorMessage } from '../message/error';
 import {
 	ChannelAction,
 	ChannelActionType,
@@ -332,7 +332,7 @@ function wireErrorFor(
 	channelId: Buffer,
 	reason: string
 ): ISendMessageAction | null {
-	if (channelId.length !== 32 || channelId.every((b) => b === 0)) {
+	if (!canScopeWireError(channelId)) {
 		return null;
 	}
 	return sendMsg(

@@ -840,6 +840,67 @@ describe('Channel Manager', function () {
 			);
 		});
 
+		it('drops a channel_reestablish under the reserved all-zero id, silently (issue 466)', function () {
+			// The arm above answers an unknown channel with a BOLT 1 error scoped
+			// to the id the peer quoted. BOLT 1 reserves the all-zero id for every
+			// channel with the peer, so answering under it reads as "fail all of
+			// them", and handleErrorMsg (below) implements exactly that: between
+			// two beignet nodes one bogus reestablish force-closed every shared
+			// channel. No channel has to exist for the reply to fire.
+			const alice = new ChannelManager(aliceConfig);
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			alice.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+				}
+			);
+			const errors: string[] = [];
+			alice.on('error', (_id: Buffer | null, message: string) =>
+				errors.push(message)
+			);
+
+			alice.handleMessage(
+				bobPubkey,
+				136,
+				makeReestablishPayload(Buffer.alloc(32, 0x00))
+			);
+
+			expect(sent, 'no connection-wide error goes out').to.deep.equal([]);
+			expect(errors).to.have.length(1);
+			expect(errors[0]).to.include('all-zero id');
+		});
+
+		it('still answers a reestablish for any other unknown id (issue 466)', function () {
+			// The guard above must be exactly one id wide: every other unknown
+			// channel still gets the error that stops the peer retrying forever.
+			const alice = new ChannelManager(aliceConfig);
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			alice.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+				}
+			);
+			alice.on('error', () => {
+				/* observed through the messages */
+			});
+
+			// One byte set is enough to leave the reserved id.
+			const nearlyZero = Buffer.alloc(32, 0x00);
+			nearlyZero[31] = 0x01;
+			alice.handleMessage(bobPubkey, 136, makeReestablishPayload(nearlyZero));
+
+			expect(sent).to.have.length(1);
+			expect(sent[0].type).to.equal(17);
+			expect(sent[0].payload.subarray(0, 32).toString('hex')).to.equal(
+				nearlyZero.toString('hex')
+			);
+			expect(sent[0].payload.toString('utf8')).to.include(
+				'unknown or closed channel'
+			);
+		});
+
 		it('replies with error to reestablish for a force-closed channel', function () {
 			const { alice, bob, channelId } = openAndReadyChannel();
 			alice.on('error', () => {

@@ -4580,6 +4580,73 @@ describe('Round 17: v2 channel_type admission', () => {
 			expect(aborted).to.equal(1);
 		});
 
+		it('cleans abortPendingOpen when the reason is too long to encode', () => {
+			// `reason` carries an IFundingProvider error verbatim
+			// ("funding failed: ${err.message}"), and BOLT 1 length-prefixes the
+			// error data with a u16, so an embedder that throws more than 64 KiB
+			// of text used to take encodeErrorMessage down with it. The channel
+			// was already marked ERRORED by then, so a throw before the cleanup
+			// left it registered in tempChannels with no channel:aborted.
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			const channel = mgr.openChannel(owner, 100_000n);
+			const tempId = channel.getTemporaryChannelId();
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			mgr.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					if (type === MessageType.ERROR) sent.push({ type, payload });
+				}
+			);
+			let aborted = 0;
+			mgr.on('channel:aborted', () => {
+				aborted++;
+			});
+
+			const reason = `funding failed: ${'x'.repeat(70_000)}`;
+			expect(() => mgr.abortPendingOpen(channel, reason)).to.not.throw();
+
+			// The peer is still told, with the diagnostic clamped to what the
+			// u16 can carry: a stranded negotiation is worse than a short one.
+			expect(sent).to.have.length(1);
+			const decoded = decodeErrorMessage(sent[0].payload);
+			expect(decoded.channelId.equals(tempId)).to.equal(true);
+			expect(decoded.data).to.have.length(0xffff);
+			expect(decoded.data.toString('utf8')).to.match(/^funding failed: x+$/);
+
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+			expect(mapsOf(mgr).channelPeers.has(tempId.toString('hex'))).to.equal(
+				false
+			);
+			expect(aborted).to.equal(1);
+		});
+
+		it('clamps an over-long reason on a UTF-8 boundary', () => {
+			// The cut must not orphan a continuation byte: 0xffff lands mid-'e'
+			// here (two bytes each), so the clamp backs off one byte and the far
+			// end reads whole characters instead of a replacement char.
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			const channel = mgr.openChannel(owner, 100_000n);
+			const sent: Buffer[] = [];
+			mgr.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					if (type === MessageType.ERROR) sent.push(payload);
+				}
+			);
+
+			mgr.abortPendingOpen(channel, '\u00e9'.repeat(40_000));
+
+			expect(sent).to.have.length(1);
+			const { data } = decodeErrorMessage(sent[0]);
+			expect(data).to.have.length(0xfffe);
+			expect(data.toString('utf8')).to.not.include('\ufffd');
+		});
+
 		it('preserves a reentrant same-id replacement during abortPendingOpen cleanup', () => {
 			const mgr = new ChannelManager(makeChannelManagerConfig());
 			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
