@@ -94,11 +94,20 @@ class MockChainBackend implements IChainBackend {
 		this.headerCallbacks.push(onNewBlock);
 	}
 
+	/**
+	 * Keep only the FIRST callback registered per script hash, which is what
+	 * the real Electrum client does: rn-electrum-client answers a repeat
+	 * subscription for a script hash it already holds with "Already
+	 * Subscribed." and never wires the new callback (issue #468).
+	 */
+	onlyFirstScriptHashCallback = false;
+
 	async subscribeToScriptHash(
 		scriptHash: string,
 		onChange: () => void
 	): Promise<void> {
 		const existing = this.scriptHashCallbacks.get(scriptHash) || [];
+		if (this.onlyFirstScriptHashCallback && existing.length > 0) return;
 		existing.push(onChange);
 		this.scriptHashCallbacks.set(scriptHash, existing);
 	}
@@ -751,6 +760,109 @@ describe('Phase 4: Chain Watcher', () => {
 			await new Promise((resolve) => setTimeout(resolve, 50));
 
 			expect(absentCalls.some((cid) => cid.equals(channelId))).to.be.false;
+		});
+	});
+
+	describe('Funding spend detection (issue #468)', () => {
+		let backend: MockChainBackend;
+		let channelManager: ChannelManager;
+		let watcher: ChainWatcher;
+		let spends: Buffer[];
+
+		beforeEach(async () => {
+			const seed = crypto.randomBytes(32);
+			backend = new MockChainBackend();
+			channelManager = new ChannelManager({
+				localBasepoints: makeBasepoints(seed),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				localFundingPrivkey: crypto.randomBytes(32)
+			});
+			channelManager.on('error', () => {});
+			watcher = new ChainWatcher({ backend, channelManager });
+			spends = [];
+			watcher.on('funding:spent', (cid: Buffer) => spends.push(cid));
+			await watcher.start();
+		});
+
+		afterEach(() => {
+			watcher.stop();
+		});
+
+		/**
+		 * A funding watch confirmed at depth against a history that holds no
+		 * spender yet, which is the state a live channel sits in.
+		 */
+		async function armConfirmedWatch(): Promise<{
+			channelId: Buffer;
+			txid: string;
+			scriptHash: string;
+		}> {
+			const channelId = crypto.randomBytes(32);
+			const txid = crypto.randomBytes(32).toString('hex');
+			const scriptPubkey = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			const scriptHash = computeScriptHash(scriptPubkey);
+			backend.setHistory(scriptHash, [{ txid, height: 98 }]);
+			backend.simulateNewBlock(100);
+			await watcher.watchFundingOutput(channelId, txid, 0, 3, scriptPubkey);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(spends, 'nothing spends the funding yet').to.have.length(0);
+			return { channelId, txid, scriptHash };
+		}
+
+		/** A commitment spending the watched funding outpoint. */
+		function publishClose(
+			txid: string,
+			scriptHash: string,
+			height: number
+		): string {
+			const closeTx = new bitcoin.Transaction();
+			closeTx.version = 2;
+			closeTx.addInput(Buffer.from(txid, 'hex').reverse(), 0, 0xffffffff);
+			closeTx.addOutput(Buffer.from('0014' + '22'.repeat(20), 'hex'), 40_000);
+			backend.setTransaction(closeTx.getId(), closeTx.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid, height: 98 },
+				{ txid: closeTx.getId(), height }
+			]);
+			return closeTx.getId();
+		}
+
+		it('registers a close that appears after the funding confirmed, on the next block', async () => {
+			const { channelId, txid, scriptHash } = await armConfirmedWatch();
+
+			// The close lands AFTER the watch confirmed, so the immediate spend
+			// check watchFundingSpend ran against a spender-less history. A
+			// block is all the node gets: no script hash notification is
+			// simulated here, because the production Electrum client never
+			// delivers one for the spend subscription.
+			publishClose(txid, scriptHash, 101);
+			backend.simulateNewBlock(101);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(
+				spends.some((cid) => cid.equals(channelId)),
+				'the block registered the close'
+			).to.be.true;
+		});
+
+		it('registers a close through the confirmation subscription when the backend honours only the first callback', async () => {
+			backend.onlyFirstScriptHashCallback = true;
+			const { channelId, txid, scriptHash } = await armConfirmedWatch();
+
+			// The only callback the backend holds is the one watchFundingOutput
+			// registered for the confirmation. It has to cover the spend too,
+			// or the notification is spent on a check that returns immediately.
+			publishClose(txid, scriptHash, 101);
+			backend.simulateScriptHashChange(scriptHash);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(
+				spends.some((cid) => cid.equals(channelId)),
+				'the retained subscription registered the close'
+			).to.be.true;
 		});
 	});
 

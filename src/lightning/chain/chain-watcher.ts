@@ -646,9 +646,7 @@ export class ChainWatcher extends EventEmitter {
 				// callback registered before a stop() must not start a check that
 				// captures the current generation and passes every guard.
 				if (!this.isCurrentGeneration(generation)) return;
-				this.checkFundingConfirmation(key, generation).catch((err) => {
-					this.emitError(err);
-				});
+				this.onFundingScriptHashChange(key, generation);
 			});
 		} catch {
 			// Queue for retry on next block, unless the watch was retired while
@@ -1061,16 +1059,16 @@ export class ChainWatcher extends EventEmitter {
 		// Advance all chain monitors
 		this.channelManager.handleNewBlock(height);
 
-		// Check all watched fundings for confirmation and announcement depth
+		// Check all watched fundings for confirmation, announcement depth and
+		// the spend that closes the channel.
 		for (const [key, watched] of this.watchedFundings) {
 			if (!watched.confirmed) {
 				this.checkFundingConfirmation(key, generation).catch((err) => {
 					this.emitError(err);
 				});
-			} else if (
-				!watched.announcementTriggered &&
-				watched.confirmationHeight > 0
-			) {
+				continue;
+			}
+			if (!watched.announcementTriggered && watched.confirmationHeight > 0) {
 				// Check if 6 confirmations reached for channel announcement
 				const depth = height - watched.confirmationHeight + 1;
 				if (depth >= 6) {
@@ -1080,6 +1078,17 @@ export class ChainWatcher extends EventEmitter {
 					});
 				}
 			}
+			// A confirmed watch is waiting for exactly one thing: the spend that
+			// closes the channel. A block is the event that can turn "no spend"
+			// into "spend", and the header subscription is the one notification
+			// this watcher can rely on being delivered, so the close is found
+			// here rather than whenever the 60s recheck timer next happens to
+			// fire (issue #468). Nothing new is asked of the backend either:
+			// recheckAllWatches already runs this same sweep, ten times more
+			// often than a block arrives on mainnet.
+			this.checkFundingSpent(watched, generation).catch((err) => {
+				this.emitError(err);
+			});
 		}
 
 		this.emit('block', height);
@@ -1138,6 +1147,34 @@ export class ChainWatcher extends EventEmitter {
 			watched.confirmationHeight,
 			txIndex
 		);
+	}
+
+	/**
+	 * Route a funding script hash notification to whichever check the watch is
+	 * still waiting on: the confirmation before minimumDepth, and after it the
+	 * spend that closes the channel.
+	 *
+	 * One callback has to cover both phases because a funding script hash is
+	 * subscribed exactly once in practice. The Electrum client answers a repeat
+	 * subscription for a script hash it already holds with "Already
+	 * Subscribed." and never wires the new callback, so the spend subscription
+	 * watchFundingSpend adds is not delivered and the confirmation callback,
+	 * which returns on its first line once the watch is confirmed, was the only
+	 * one left. A close then had nothing pushing it and waited on the recheck
+	 * timer (issue #468).
+	 */
+	private onFundingScriptHashChange(key: string, generation: number): void {
+		const watched = this.watchedFundings.get(key);
+		if (!watched) return;
+		if (!watched.confirmed) {
+			this.checkFundingConfirmation(key, generation).catch((err) => {
+				this.emitError(err);
+			});
+			return;
+		}
+		this.checkFundingSpent(watched, generation).catch((err) => {
+			this.emitError(err);
+		});
 	}
 
 	private async checkFundingConfirmation(
