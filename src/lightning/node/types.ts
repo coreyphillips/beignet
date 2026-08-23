@@ -978,6 +978,22 @@ export class LightningPaymentError extends Error {
 	}
 }
 
+/**
+ * A channel open refused for the caller's own arguments: the request as
+ * written cannot be served, whatever the node's state. Extends Error so
+ * existing catch blocks and message assertions keep working, and gives the
+ * CLI layer something to key on: it maps this to a BeignetError
+ * INVALID_PARAMS so the daemon answers 400 carrying this message, instead of
+ * scrubbing an untyped throw to a generic 500 (issue #464). Node faults stay
+ * untyped on purpose, so they keep scrubbing.
+ */
+export class InvalidChannelOpenError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'InvalidChannelOpenError';
+	}
+}
+
 // ─── Channel Health ───
 
 export interface IChannelHealth {

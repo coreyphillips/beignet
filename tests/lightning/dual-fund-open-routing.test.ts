@@ -12,6 +12,7 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { InvalidChannelOpenError } from '../../src/lightning/node/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
@@ -226,6 +227,92 @@ describe('Issue #158: openChannel routes v1 vs v2 by peer features', function ()
 		);
 		expect(v1Calls.length).to.equal(0);
 		expect(v2Calls.length).to.equal(0);
+	});
+
+	it('the push refusal is typed, so the daemon can answer 400 (issue #464)', function () {
+		// An untyped throw is scrubbed to a generic 500 "Internal server
+		// error" by the daemon, which hid this message from the caller.
+		wirePeer(true);
+		try {
+			node.openChannel(peerPubkey, 100_000n, 10_000_000n);
+			expect.fail('expected the push to be refused');
+		} catch (err: unknown) {
+			expect(err).to.be.instanceOf(InvalidChannelOpenError);
+			expect((err as Error).message).to.include('open_channel2');
+		}
+	});
+
+	it('types every refusal that is about the caller arguments (issue #464)', function () {
+		// No wirePeer: each of these is refused on the arguments alone,
+		// before the v1/v2 routing decision needs a peer.
+		const refusals: Array<[string, () => unknown]> = [
+			['bad pubkey', (): unknown => node.openChannel('not-a-pubkey', 100_000n)],
+			['zero funding', (): unknown => node.openChannel(peerPubkey, 0n)],
+			[
+				'push over funding',
+				(): unknown => node.openChannel(peerPubkey, 100n, 1_000_000n)
+			],
+			[
+				'bad fee rate',
+				(): unknown =>
+					node.openChannel(peerPubkey, 100_000n, undefined, Number.NaN)
+			],
+			[
+				'max without a pinned rate',
+				(): unknown =>
+					node.openChannel(peerPubkey, 100_000n, undefined, undefined, true)
+			],
+			[
+				'v2 bad pubkey',
+				(): unknown =>
+					node.openChannelV2('not-a-pubkey', { fundingSatoshis: 100_000n })
+			],
+			[
+				'v2 zero funding',
+				(): unknown => node.openChannelV2(peerPubkey, { fundingSatoshis: 0n })
+			],
+			[
+				'v2 lease without a fee ceiling',
+				(): unknown =>
+					node.openChannelV2(peerPubkey, {
+						fundingSatoshis: 100_000n,
+						requestFunds: { requestedSats: 50_000n, blockheight: 1 }
+					})
+			],
+			[
+				'v2 max with a lease',
+				(): unknown =>
+					node.openChannelV2(peerPubkey, {
+						fundingSatoshis: 100_000n,
+						fundMax: true,
+						requestFunds: { requestedSats: 50_000n, blockheight: 1 },
+						maxLeaseRates: {
+							fundingWeightWitness: 500,
+							leaseFeeBasis: 100,
+							leaseFeeBaseSat: 1000,
+							channelFeeMaxBaseMsat: 1000,
+							channelFeeMaxProportionalThousandths: 10
+						}
+					})
+			]
+		];
+		for (const [label, refuse] of refusals) {
+			try {
+				refuse();
+				expect.fail(`expected ${label} to be refused`);
+			} catch (err: unknown) {
+				expect(err, label).to.be.instanceOf(InvalidChannelOpenError);
+			}
+		}
+		// The trusted-open refusal is the one that needs a peer to judge:
+		// this one never negotiated option_zeroconf.
+		wirePeer(true);
+		try {
+			node.openChannel(peerPubkey, 100_000n, undefined, 1, false, true);
+			expect.fail('expected the trusted open to be refused');
+		} catch (err: unknown) {
+			expect(err, 'trusted open').to.be.instanceOf(InvalidChannelOpenError);
+		}
 	});
 
 	it('a max open toward a dual-fund peer commits the provider v2 quote', function () {

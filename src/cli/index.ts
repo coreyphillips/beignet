@@ -29,6 +29,7 @@ export { HttpRateLimiter, RateLimitOptions } from './http-rate-limiter';
 export {
 	LightningErrorCode,
 	LightningPaymentError,
+	InvalidChannelOpenError,
 	IChannelHealth,
 	IStructuredLog,
 	IPaymentProof,
