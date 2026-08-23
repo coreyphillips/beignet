@@ -20,6 +20,26 @@ export interface IErrorMessage {
 }
 
 /**
+ * Whether a BOLT 1 error may be SCOPED to this channel_id.
+ *
+ * False for the two ids that cannot carry one. The all-zero id is reserved for
+ * "all channels with this peer", so an error sent under it instructs the peer to
+ * fail every channel it has with us rather than the single one we mean. And a
+ * length encodeErrorMessage will not accept would THROW, which at a refusal site
+ * loses the local unwind along with the send.
+ *
+ * The predicate lives here, beside the encoder it guards, because both the
+ * Channel layer (wireErrorFor) and the ChannelManager layer (wireErrorPayloadFor)
+ * apply the same rule and a second copy is a second thing to keep in step.
+ *
+ * @param channelId - The id a refusal or failure would be scoped to
+ * @returns True when an error under this id means what the sender means
+ */
+export function canScopeWireError(channelId: Buffer): boolean {
+	return channelId.length === 32 && !channelId.every((b) => b === 0);
+}
+
+/**
  * Encode an `error` or `warning` message payload.
  * @param msg - Error message data
  * @returns Encoded payload (without the 2-byte message type prefix)

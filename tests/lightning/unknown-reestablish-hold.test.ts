@@ -383,6 +383,30 @@ describe('Unknown-channel reestablish hold (issue #462)', function () {
 			await sleep(200);
 			expect(sent, 'no reply from a detached manager').to.have.length(0);
 		});
+
+		it('never parks a reestablish under the reserved all-zero id (issue 466)', function () {
+			// The reserved id names no channel, so no capsule can ever restore
+			// one: holding it would spend a window, emit reestablish:held and put
+			// an all-zero row on the recovery status surface for a message the
+			// node must never answer. The guard sits ahead of the hold for that.
+			const { manager, sent } = makeRestoreTarget(5_000);
+			const held: string[] = [];
+			manager.on('reestablish:held', (_peer: string, id: Buffer) =>
+				held.push(id.toString('hex'))
+			);
+
+			manager.handleMessage(
+				bobPubkey,
+				MessageType.CHANNEL_REESTABLISH,
+				reestablishPayload(Buffer.alloc(32, 0x00))
+			);
+
+			expect(sent, 'no connection-wide error goes out').to.have.length(0);
+			expect(held, 'no window spent').to.deep.equal([]);
+			expect(manager.heldUnknownChannelReestablish()).to.have.length(0);
+
+			manager.detachFromPeerManager();
+		});
 	});
 
 	describe('channels this node does know about are never held', function () {
