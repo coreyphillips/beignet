@@ -1049,16 +1049,18 @@ try {
 A channel open the engine refuses on the caller's own arguments (a push toward a dual-fund peer, a `pushSats` above the funding amount, a non-positive fee rate, `max` without a pinned rate, a trusted open toward a peer that never negotiated `option_zeroconf`) throws an `InvalidChannelOpenError`. Every open entry point converts it to `INVALID_PARAMS`, so the daemon answers **HTTP 400 with the engine's message** instead of scrubbing it to a generic 500. Node faults stay untyped and still answer 500.
 
 ```typescript
-import { InvalidChannelOpenError } from 'beignet/cli';
+import { BeignetError } from 'beignet/cli';
 
 try {
-  node.openChannel(peerPubkey, 100_000n, 50_000_000n);
+  node.openChannel(peerPubkey, 100_000, 50_000);
 } catch (err) {
-  if (err instanceof InvalidChannelOpenError) {
+  if (err instanceof BeignetError && err.code === 'INVALID_PARAMS') {
     // The request cannot be served as written; err.message says why.
   }
 }
 ```
+
+`InvalidChannelOpenError` is what an embedder driving a raw `LightningNode` catches (it is exported from `beignet/cli` too); on `BeignetNode` and over HTTP the refusal always arrives as `INVALID_PARAMS`.
 
 ---
 
