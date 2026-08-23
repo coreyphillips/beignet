@@ -833,4 +833,34 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		expect(restored.stateUncertain).to.equal(true);
 		expect(mustNotBroadcastCommitment(restored)).to.equal(true);
 	});
+
+	it('the capsule restore hold survives the serialization round trip, and does not become the never-broadcast flag (issue #469)', function () {
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		const state = opener.getFullState();
+		state.restoreRecencyUnproven = true;
+		const restored = deserializeChannelState(serializeChannelState(state));
+		// A restart between the restore and the first reconnect must not
+		// forget that an AUTOMATIC broadcast is forbidden.
+		expect(restored.restoreRecencyUnproven).to.equal(true);
+		// It is NOT the 5.6 never-broadcast invariant: that one also refuses
+		// the operator's explicit force close, and this one deliberately does
+		// not.
+		expect(mustNotBroadcastCommitment(restored)).to.equal(false);
+	});
+
+	it('a field-less row round trips without inventing the hold (issue #469)', function () {
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		const serialized = serializeChannelState(opener.getFullState());
+		// Absent rather than false, which is what keeps a recovery frame
+		// written before the field existed re-encoding byte-identically.
+		expect(serialized.restoreRecencyUnproven).to.equal(undefined);
+		expect(
+			JSON.parse(JSON.stringify(serialized)).restoreRecencyUnproven
+		).to.equal(undefined);
+		expect(deserializeChannelState(serialized).restoreRecencyUnproven).to.equal(
+			undefined
+		);
+	});
 });

@@ -190,6 +190,25 @@ interface IWatchedOutput {
  */
 const SPEND_FINALITY_DEPTH = 100;
 
+/**
+ * Separates a pre-splice spend watch's registry key from the plain channelId
+ * hex every other funding watch is keyed by (issue #479). The pre-splice leg
+ * shares a channel with the watch on the post-splice outpoint, so it needs a
+ * key of its own; nothing that looks a channel up by id can then reach it.
+ */
+const PRE_SPLICE_KEY_MARKER = ':presplice:';
+
+/** Registry key for the pre-splice spend watch on one outpoint. */
+function preSpliceWatchKey(
+	channelId: Buffer,
+	txid: string,
+	outputIndex: number
+): string {
+	return `${channelId.toString(
+		'hex'
+	)}${PRE_SPLICE_KEY_MARKER}${txid}:${outputIndex}`;
+}
+
 export interface IChainWatcherConfig {
 	backend: IChainBackend;
 	channelManager: ChannelManager;
@@ -566,6 +585,13 @@ export class ChainWatcher extends EventEmitter {
 	 * Returns true if the entry was found and removed.
 	 */
 	removeWatchedFunding(channelId: Buffer): boolean {
+		// Any pre-splice spend watch goes with it: the callers are the
+		// channel:resolved handler and the funding-missing void, and after
+		// either there is no channel left for a breach to be reported against
+		// (issue #479). The return still answers for the channel's own entry.
+		for (const key of this.preSpliceWatchKeysFor(channelId)) {
+			this.watchedFundings.delete(key);
+		}
 		return this.watchedFundings.delete(channelId.toString('hex'));
 	}
 
@@ -717,17 +743,39 @@ export class ChainWatcher extends EventEmitter {
 	 * otherwise have no spend subscription. A peer that evicts our low-feerate
 	 * splice from the mempool and broadcasts a revoked pre-splice commitment
 	 * spends the old outpoint with a different txid, which this detects and routes
-	 * to handleFundingSpent (the breach path). This watch is intentionally NOT
-	 * stored in watchedFundings so it does not collide with the channel's
-	 * new-outpoint funding watch; a restart re-arms it via restoreChainWatches.
+	 * to handleFundingSpent (the breach path).
+	 *
+	 * The watch is held in watchedFundings under its OWN key (issue #479). It
+	 * used to be held nowhere, so that it could not collide with the channel's
+	 * new-outpoint watch, and the price was that neither recheckAllWatches nor
+	 * handleNewBlock ever looked at it again: the outpoint got one check at arm
+	 * time plus a script hash subscription the real Electrum client drops
+	 * (issue #478), and a breach broadcast after that went undetected until a
+	 * restart re-armed the watch. Keyed per OUTPOINT rather than per channel,
+	 * because completeSplice nulls spliceInFlight as soon as splice_locked is
+	 * sent, which on a zero-conf channel is the same action batch as the
+	 * broadcast, so a second splice can legitimately need a second leg while the
+	 * first one's tx is still unconfirmed.
+	 *
+	 * A confirmed, announcement-triggered entry falls straight through both
+	 * sweep loops to checkFundingSpent, so re-polling, the map-identity guard
+	 * and the stop() teardown all come for free.
 	 */
 	async watchFundingSpendDuringSplice(
 		channelId: Buffer,
 		txid: string,
 		outputIndex: number,
 		scriptPubkey: Buffer,
-		ignoreSpendTxid: string
+		ignoreSpendTxid: string,
+		// Captured by whatever operation is registering this watch, so a stop()
+		// during the await retires the whole registration.
+		generation: number = this.lifecycleGeneration
 	): Promise<void> {
+		// Ahead of the map write, not just inside watchFundingSpend: an outer
+		// operation that began before stop() can still call in for the first
+		// time afterwards, and an entry inserted then would survive into the
+		// next start() and be swept against a channel that may be gone.
+		if (!this.isCurrentGeneration(generation)) return;
 		const watched: IWatchedFunding = {
 			channelId,
 			txid,
@@ -740,7 +788,34 @@ export class ChainWatcher extends EventEmitter {
 			announcementTriggered: true,
 			ignoreSpendTxid
 		};
-		await this.watchFundingSpend(watched);
+		const key = preSpliceWatchKey(channelId, txid, outputIndex);
+		this.watchedFundings.set(key, watched);
+
+		await this.watchFundingSpend(watched, generation, key);
+
+		// Same retirement watchFundingOutput performs after its own awaits: a
+		// registration overtaken by a stop() or by a newer one for the same
+		// outpoint must not leave this entry behind.
+		if (
+			!this.isCurrentGeneration(generation) &&
+			this.watchedFundings.get(key) === watched
+		) {
+			this.watchedFundings.delete(key);
+		}
+	}
+
+	/**
+	 * Every pre-splice spend watch armed for this channel (issue #479). Read
+	 * off the registry rather than tracked separately, so retirement has one
+	 * home.
+	 */
+	private preSpliceWatchKeysFor(channelId: Buffer): string[] {
+		const prefix = `${channelId.toString('hex')}${PRE_SPLICE_KEY_MARKER}`;
+		const keys: string[] = [];
+		for (const key of this.watchedFundings.keys()) {
+			if (key.startsWith(prefix)) keys.push(key);
+		}
+		return keys;
 	}
 
 	/**
@@ -1531,11 +1606,19 @@ export class ChainWatcher extends EventEmitter {
 		// only the first non-self entry therefore missed real closes; every
 		// candidate must be examined. Include both confirmed (height > 0) and
 		// mempool (height <= 0) spends.
+		//
+		// A pre-splice leg retires on its own evidence, so the one entry it
+		// skips by name is remembered rather than merely skipped (issue #479).
+		let ignoredSpend: { txid: string; height: number } | null = null;
+
 		for (const entry of history) {
 			if (entry.txid === watched.txid) continue;
 			// A legitimate splice spends the pre-splice funding output; only a
 			// DIFFERENT spender (a revoked/force-close commitment) is a breach.
 			if (watched.ignoreSpendTxid && entry.txid === watched.ignoreSpendTxid) {
+				if (entry.height > 0) {
+					ignoredSpend = { txid: entry.txid, height: entry.height };
+				}
 				continue;
 			}
 
@@ -1566,13 +1649,61 @@ export class ChainWatcher extends EventEmitter {
 			return;
 		}
 
+		// No breach on a pre-splice leg, and the splice tx it exists to ignore
+		// is buried: the old outpoint is spent for good, so the leg retires
+		// itself (issue #479). Depth is the right signal and splice_locked is
+		// not: on a zero-conf channel splice_locked leaves in the same action
+		// batch as the broadcast, so retiring on it would drop the watch inside
+		// the very window a mempool-eviction breach lives in. A reorg that
+		// un-confirms the splice tx simply leaves the leg armed.
+		if (
+			key !== undefined &&
+			ignoredSpend !== null &&
+			this.currentBlockHeight > 0 &&
+			this.currentBlockHeight - ignoredSpend.height + 1 >= SPEND_FINALITY_DEPTH
+		) {
+			// Confirm it really spent THIS outpoint before acting on it. The
+			// funding script is shared by every splice generation, so a txid
+			// sitting in that history proves it is on chain and nothing more,
+			// and reading the wrong one as final would retire a breach watch
+			// early. The fetch is gated on the depth test, so it happens once,
+			// at retirement, and not on every sweep.
+			const rawIgnored = await this.backend.getTransaction(ignoredSpend.txid);
+			if (superseded()) return;
+			const ignoredTx = bitcoin.Transaction.fromBuffer(rawIgnored);
+			const spendsOurs = ignoredTx.ins.some((input) => {
+				const inputTxid = Buffer.from(input.hash).reverse().toString('hex');
+				return (
+					inputTxid === watched.txid && input.index === watched.outputIndex
+				);
+			});
+			if (spendsOurs && this.watchedFundings.get(key) === watched) {
+				this.watchedFundings.delete(key);
+				return;
+			}
+		}
+
 		// History fetched successfully and NO spender found. If the channel's
 		// monitor has a confirmed spend recorded, that spend was reorged out
 		// without even re-entering the mempool, and its irrevocable-depth clock
 		// must stop counting against the vanished height (issue 352). No-op for
 		// channels with no recorded spend. The splice watch is excluded: it
 		// ignores the expected splice spend, so an empty result there is normal.
-		if (!watched.ignoreSpendTxid) {
+		//
+		// So is the channel's OWN watch while any pre-splice leg is armed, and
+		// that exclusion is load-bearing (issue #479). handleFundingSpendAbsent
+		// is scoped to the CHANNEL, not to an outpoint, so it demotes whatever
+		// spend the monitor holds. Both watches are swept every block, and if
+		// the splice tx confirms, is reorged out and the revoked pre-splice
+		// commitment wins, the leg reports that breach while this watch finds
+		// nothing spending the outpoint the splice tx was going to create: one
+		// verdict would then undo the other, every block, stopping the
+		// irrevocable-depth clock and rescheduling every CSV sweep bound to it.
+		// A channel gets one reporter.
+		if (
+			!watched.ignoreSpendTxid &&
+			this.preSpliceWatchKeysFor(watched.channelId).length === 0
+		) {
 			watched.spendScanRevision = revision + 1;
 			this.channelManager.handleFundingSpendAbsent?.(watched.channelId);
 		}

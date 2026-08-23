@@ -792,6 +792,34 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		).to.equal(null);
 	});
 
+	it('a reestablish that FAILS the channel does not lift a capsule restore hold (issue #469)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		h.opener.markForReestablish();
+		h.opener.getFullState().restoreRecencyUnproven = true;
+
+		const divergent: IChannelReestablishMessage = {
+			channelId: h.opener.getChannelId()!,
+			nextCommitmentNumber: 1n,
+			nextRevocationNumber: 0n,
+			yourLastPerCommitmentSecret: Buffer.alloc(32),
+			myCurrentPerCommitmentPoint: getPerCommitmentPoint(h.acceptorSeed, 0n),
+			nextFundingTxid: crypto.randomBytes(32),
+			nextFundingRetransmitFlags: 0
+		};
+		const actions = h.opener.handleReestablish(divergent);
+
+		// _handleReestablishV2 is spread into the action list rather than
+		// returned from handleReestablish, so its failure arms fall through to
+		// the same terminus a successful exchange reaches. "Control got there"
+		// is therefore not evidence the peer confirmed anything, and lifting
+		// the hold here would re-arm every automatic close on a row whose
+		// recency is still unproven.
+		expect(findError(actions)).to.contain('does not match');
+		expect(h.opener.getState()).to.equal(ChannelState.ERRORED);
+		expect(h.opener.getFullState().restoreRecencyUnproven).to.equal(true);
+	});
+
 	it('pins the reestablish counters of a mid-open v2 channel to 1/0/zeros', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);

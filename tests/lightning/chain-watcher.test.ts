@@ -944,6 +944,328 @@ describe('Phase 4: Chain Watcher', () => {
 		});
 	});
 
+	describe('Pre-splice spend watches (issue #479)', () => {
+		let backend: MockChainBackend;
+		let channelManager: ChannelManager;
+		let watcher: ChainWatcher;
+		let spends: Buffer[];
+		let absentCalls: Buffer[];
+
+		/** The registry the watches live in, for the retirement assertions. */
+		function registryKeys(): string[] {
+			return [
+				...(
+					watcher as unknown as {
+						watchedFundings: Map<string, unknown>;
+					}
+				).watchedFundings.keys()
+			];
+		}
+
+		function preSpliceKeys(channelId: Buffer): string[] {
+			const prefix = `${channelId.toString('hex')}:presplice:`;
+			return registryKeys().filter((k) => k.startsWith(prefix));
+		}
+
+		beforeEach(async () => {
+			const seed = crypto.randomBytes(32);
+			backend = new MockChainBackend();
+			channelManager = new ChannelManager({
+				localBasepoints: makeBasepoints(seed),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				localFundingPrivkey: crypto.randomBytes(32)
+			});
+			channelManager.on('error', () => {});
+			absentCalls = [];
+			const originalAbsent =
+				channelManager.handleFundingSpendAbsent.bind(channelManager);
+			(channelManager as any).handleFundingSpendAbsent = (
+				channelId: Buffer
+			): void => {
+				absentCalls.push(channelId);
+				originalAbsent(channelId);
+			};
+			watcher = new ChainWatcher({ backend, channelManager });
+			watcher.on('error', () => {});
+			spends = [];
+			watcher.on('funding:spent', (cid: Buffer) => spends.push(cid));
+			await watcher.start();
+		});
+
+		afterEach(() => {
+			watcher.stop();
+		});
+
+		/**
+		 * The shape restoreChainWatches and registerFundingWatch arm during an
+		 * in-flight splice: the channel's own watch moved to the splice
+		 * outpoint, and a spend watch left behind on the pre-splice one. The
+		 * funding pubkeys do not rotate across a splice, so both share a script
+		 * hash, which is exactly the case the Electrum client answers with
+		 * "Already Subscribed." (issue #478).
+		 */
+		async function armSplice(height = 100): Promise<{
+			channelId: Buffer;
+			oldTxid: string;
+			spliceTxid: string;
+			scriptHash: string;
+		}> {
+			const channelId = crypto.randomBytes(32);
+			const oldTxid = crypto.randomBytes(32).toString('hex');
+			const scriptPubkey = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			const scriptHash = computeScriptHash(scriptPubkey);
+
+			// The pre-splice funding tx itself, so a scan walking the shared
+			// history can fetch every entry it is not allowed to skip.
+			const oldTx = new bitcoin.Transaction();
+			oldTx.version = 2;
+			oldTx.addInput(crypto.randomBytes(32), 0, 0xffffffff);
+			oldTx.addOutput(scriptPubkey, 100_000);
+			backend.setTransaction(oldTxid, oldTx.toBuffer());
+
+			// The splice tx spends the pre-splice funding output.
+			const spliceTx = new bitcoin.Transaction();
+			spliceTx.version = 2;
+			spliceTx.addInput(Buffer.from(oldTxid, 'hex').reverse(), 0, 0xffffffff);
+			spliceTx.addOutput(scriptPubkey, 90_000);
+			const spliceTxid = spliceTx.getId();
+			backend.setTransaction(spliceTxid, spliceTx.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 0 }
+			]);
+			backend.simulateNewBlock(height);
+
+			await watcher.watchFundingOutput(
+				channelId,
+				spliceTxid,
+				0,
+				3,
+				scriptPubkey
+			);
+			await watcher.watchFundingSpendDuringSplice(
+				channelId,
+				oldTxid,
+				0,
+				scriptPubkey,
+				spliceTxid
+			);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			spends = [];
+			absentCalls = [];
+			return { channelId, oldTxid, spliceTxid, scriptHash };
+		}
+
+		/**
+		 * The attack: the peer evicts our low-feerate splice from the mempool
+		 * and broadcasts a revoked pre-splice commitment on the old outpoint.
+		 */
+		function publishBreach(
+			oldTxid: string,
+			scriptHash: string,
+			height: number
+		): string {
+			const breach = new bitcoin.Transaction();
+			breach.version = 2;
+			breach.addInput(Buffer.from(oldTxid, 'hex').reverse(), 0, 0xffffffff);
+			breach.addOutput(Buffer.from('0014' + '33'.repeat(20), 'hex'), 80_000);
+			backend.setTransaction(breach.getId(), breach.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: breach.getId(), height }
+			]);
+			return breach.getId();
+		}
+
+		it('detects a revoked pre-splice commitment on a later block', async () => {
+			// The only callback the backend retains for this script hash is the
+			// funding watch's, which is what the real client does, so the
+			// splice watch has no push path at all and the block is the only
+			// event left.
+			backend.onlyFirstScriptHashCallback = true;
+			const { channelId, oldTxid, scriptHash } = await armSplice();
+
+			publishBreach(oldTxid, scriptHash, 101);
+			backend.simulateNewBlock(101);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(
+				spends.some((cid) => cid.equals(channelId)),
+				'the block registered the breach on the pre-splice outpoint'
+			).to.be.true;
+		});
+
+		it('detects a revoked pre-splice commitment through recheckAllWatches', async () => {
+			backend.onlyFirstScriptHashCallback = true;
+			const { channelId, oldTxid, scriptHash } = await armSplice();
+
+			publishBreach(oldTxid, scriptHash, 101);
+			watcher.recheckAllWatches();
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(
+				spends.some((cid) => cid.equals(channelId)),
+				'the recheck sweep registered the breach'
+			).to.be.true;
+		});
+
+		it('keeps the watch while the splice tx is unconfirmed, and retires it once that spend is final', async () => {
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+			expect(preSpliceKeys(channelId), 'armed').to.have.length(1);
+
+			// splice_locked can leave in the same action batch as the
+			// broadcast on a zero-conf channel, so a message-driven retirement
+			// would drop the watch here, inside the attack window.
+			backend.simulateNewBlock(101);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(
+				preSpliceKeys(channelId),
+				'an unconfirmed splice tx retires nothing'
+			).to.have.length(1);
+
+			// Confirmed, but not yet buried.
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 102 }
+			]);
+			backend.simulateNewBlock(150);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(
+				preSpliceKeys(channelId),
+				'a shallow splice confirmation retires nothing'
+			).to.have.length(1);
+
+			// Buried past SPEND_FINALITY_DEPTH: the old outpoint is spent for
+			// good and the watch has nothing left to catch.
+			backend.simulateNewBlock(202);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(
+				preSpliceKeys(channelId),
+				'a final splice spend retires the watch'
+			).to.have.length(0);
+		});
+
+		it('does not retire on a buried transaction that spent some other outpoint', async () => {
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+
+			// The funding script is shared by every splice generation, so a
+			// txid sitting in that history proves it is on chain and nothing
+			// more. Here the ignored txid confirms and buries while spending
+			// something else entirely, which is the shape a stale record
+			// produces; reading it as "the old outpoint is spent for good"
+			// would retire the breach watch early.
+			const unrelated = new bitcoin.Transaction();
+			unrelated.version = 2;
+			unrelated.addInput(crypto.randomBytes(32), 7, 0xffffffff);
+			unrelated.addOutput(Buffer.from('0014' + '44'.repeat(20), 'hex'), 70_000);
+			backend.setTransaction(spliceTxid, unrelated.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 102 }
+			]);
+			backend.simulateNewBlock(300);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(
+				preSpliceKeys(channelId),
+				'the watch stays until its own outpoint is provably spent'
+			).to.have.length(1);
+		});
+
+		it('keeps one watch per pre-splice outpoint', async () => {
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+
+			// completeSplice nulls spliceInFlight when splice_locked is sent,
+			// which on a zero-conf channel is before the splice tx confirms, so
+			// a second splice can be negotiated while the first one's outpoint
+			// still needs watching.
+			const secondSpliceTxid = crypto.randomBytes(32).toString('hex');
+			const scriptPubkey = (
+				watcher as unknown as {
+					watchedFundings: Map<string, { script: Buffer }>;
+				}
+			).watchedFundings.get(channelId.toString('hex'))!.script;
+			await watcher.watchFundingSpendDuringSplice(
+				channelId,
+				spliceTxid,
+				0,
+				scriptPubkey,
+				secondSpliceTxid
+			);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			const keys = preSpliceKeys(channelId);
+			expect(keys, 'both pre-splice outpoints are watched').to.have.length(2);
+			expect(keys.some((k) => k.endsWith(`${oldTxid}:0`))).to.be.true;
+			expect(keys.some((k) => k.endsWith(`${spliceTxid}:0`))).to.be.true;
+			expect(scriptHash).to.be.a('string');
+		});
+
+		it('does not report a spend absence for the channel while a pre-splice watch is armed', async () => {
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+
+			// The splice confirmed, then a reorg took it out and the revoked
+			// pre-splice commitment won. The channel's own watch now finds
+			// nothing spending the outpoint the splice was going to create,
+			// while the pre-splice watch reports the breach. The absence
+			// verdict is channel-scoped, so left alone it would demote the
+			// breach the other watch just recorded, every block.
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 102 }
+			]);
+			backend.simulateNewBlock(103);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			const breachTxid = publishBreach(oldTxid, scriptHash, 104);
+			backend.simulateNewBlock(104);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(
+				spends.some((cid) => cid.equals(channelId)),
+				'the breach is reported'
+			).to.be.true;
+			expect(
+				absentCalls.some((cid) => cid.equals(channelId)),
+				'no absence verdict contradicts it'
+			).to.be.false;
+			expect(breachTxid).to.be.a('string');
+		});
+
+		it('drops pre-splice watches with the channel, and never resurrects one after stop', async () => {
+			const { channelId } = await armSplice();
+			expect(preSpliceKeys(channelId)).to.have.length(1);
+
+			expect(watcher.removeWatchedFunding(channelId), 'channel entry removed')
+				.to.be.true;
+			expect(
+				preSpliceKeys(channelId),
+				'its pre-splice watches went with it'
+			).to.have.length(0);
+
+			const late = await armSplice(200);
+			watcher.stop();
+			const scriptPubkey = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			await watcher.watchFundingSpendDuringSplice(
+				late.channelId,
+				late.oldTxid,
+				0,
+				scriptPubkey,
+				late.spliceTxid
+			);
+			expect(
+				registryKeys(),
+				'a registration landing after stop leaves nothing behind'
+			).to.have.length(0);
+		});
+	});
+
 	describe('Transaction broadcast', () => {
 		let backend: MockChainBackend;
 		let channelManager: ChannelManager;

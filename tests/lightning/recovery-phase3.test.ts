@@ -59,7 +59,10 @@ import {
 	hashFrame
 } from '../../src/lightning/recovery';
 import { withStorageTransaction } from '../../src/lightning/storage/transaction';
-import { createOpenerState } from '../../src/lightning/channel/channel-state';
+import {
+	createOpenerState,
+	IChannelState
+} from '../../src/lightning/channel/channel-state';
 import { MonitorState } from '../../src/lightning/chain/types';
 import { PaymentDirection } from '../../src/lightning/node/types';
 import { MessageType } from '../../src/lightning/message/types';
@@ -304,6 +307,15 @@ function dumpTables(storage: IStorageBackend): string {
 		rows.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 	const bigintSafe = (_key: string, value: unknown): unknown =>
 		typeof value === 'bigint' ? `${value.toString()}n` : value;
+	// The RECONSTRUCTION is byte-identical; the install then records that the
+	// source was a best-effort checkpoint (issue #469). Dropping that one field
+	// keeps this comparison answering the question it was written to answer,
+	// and the tests that care assert the marker itself separately.
+	const withoutRestoreMarker = (state: IChannelState): string => {
+		const { restoreRecencyUnproven, ...rest } = serializeChannelState(state);
+		void restoreRecencyUnproven;
+		return JSON.stringify(rest);
+	};
 	const dump = {
 		channels: sortByFirst(
 			storage
@@ -312,7 +324,7 @@ function dumpTables(storage: IStorageBackend): string {
 					(c) =>
 						[
 							c.channelId,
-							JSON.stringify(serializeChannelState(c.state)),
+							withoutRestoreMarker(c.state),
 							c.peerPubkey,
 							String(storage.loadChannelKeyIndex(c.channelId))
 						] as [string, string, string, string]
@@ -700,6 +712,105 @@ describe('Recovery phase 3: capsule restore', () => {
 		target.close();
 	});
 
+	/**
+	 * A journaled namespace holding one channel row in `state`, so the install's
+	 * marking pass has something to mark (issue #469).
+	 */
+	function capsuleWithChannel(state: ChannelState): {
+		storage: SqliteStorage;
+		capsule: RecoveryCapsule;
+		channelId: string;
+	} {
+		const { storage, manager } = journaledStorage();
+		const point = getPublicKey(Buffer.alloc(32, 41));
+		const channelState = createOpenerState({
+			temporaryChannelId: Buffer.alloc(32, 42),
+			fundingSatoshis: 500_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: {
+				fundingPubkey: point,
+				revocationBasepoint: point,
+				paymentBasepoint: point,
+				delayedPaymentBasepoint: point,
+				htlcBasepoint: point,
+				firstPerCommitmentPoint: point
+			},
+			localPerCommitmentSeed: Buffer.alloc(32, 43)
+		});
+		const channelId = 'ab'.repeat(32);
+		channelState.channelId = Buffer.from(channelId, 'hex');
+		channelState.state = state;
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'channel_state',
+						channelId,
+						state: channelState,
+						peerPubkey: point.toString('hex')
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		const { capsule } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		return { storage, capsule, channelId };
+	}
+
+	it('marks every restored channel as recency-unproven, and leaves the source alone (issue #469)', () => {
+		const { storage, capsule, channelId } = capsuleWithChannel(
+			ChannelState.NORMAL
+		);
+		const target = openStorage();
+		expect(
+			restoreFromRecoveryCapsule(capsule, target, NODE_SECRET).tier
+		).to.equal(2);
+
+		// The reconstruction is byte-identical to the capsule, and that is
+		// exactly why the marker is needed: a capsule is best-effort recency
+		// (5.4), so the row can be an older view of what this node did, and no
+		// automatic force close may broadcast its commitment until a
+		// channel_reestablish has confirmed it.
+		const restored = target.loadChannel(channelId);
+		expect(restored, 'the channel restored').to.not.equal(null);
+		expect(restored!.state.restoreRecencyUnproven).to.equal(true);
+		// NOT stateUncertain: that flag never clears and routes reestablish
+		// itself to DLP, so it would force-close every capsule restore.
+		expect(restored!.state.stateUncertain).to.equal(undefined);
+
+		// The marker belongs to the RESTORE, not to the channel: the live node
+		// this capsule came from is unaffected.
+		expect(
+			storage.loadChannel(channelId)!.state.restoreRecencyUnproven
+		).to.equal(undefined);
+
+		storage.close();
+		target.close();
+	});
+
+	it('leaves a terminal restored channel unmarked (issue #469)', () => {
+		const { storage, capsule, channelId } = capsuleWithChannel(
+			ChannelState.CLOSED
+		);
+		const target = openStorage();
+		restoreFromRecoveryCapsule(capsule, target, NODE_SECRET);
+
+		// A closed row can never reestablish, so marking it would report a wait
+		// with no end, and it has nothing left to broadcast anyway.
+		expect(
+			target.loadChannel(channelId)!.state.restoreRecencyUnproven
+		).to.equal(undefined);
+
+		storage.close();
+		target.close();
+	});
+
 	it('falls back to tier 1 when the capsule has no inline state', () => {
 		const { storage } = journaledStorage();
 		const { capsule } = composeRecoveryCapsule({
@@ -949,6 +1060,16 @@ describe('Recovery phase 3: end to end restore from the capsule alone', () => {
 		).to.not.equal(undefined);
 		expect(result.rejectedCandidates).to.equal(0);
 		expect(dumpTables(restoredStorage)).to.equal(dumpTables(liveStorage));
+		// Everything except the one thing byte-identity cannot carry: this
+		// database came from a best-effort checkpoint, so until the peer
+		// confirms it no automatic close may broadcast the commitment
+		// (issue #469).
+		expect(
+			restoredStorage
+				.loadAllChannels()
+				.every((c) => c.state.restoreRecencyUnproven === true),
+			'the restored rows are marked recency-unproven'
+		).to.equal(true);
 		// The Tier 1 material is present and lists the channel too.
 		expect(result.scb.channels).to.have.length(1);
 
@@ -1002,6 +1123,20 @@ describe('Recovery phase 3: end to end restore from the capsule alone', () => {
 		const bobChannel = bob.getChannelManager().listChannels()[0];
 		expect(restoredChannel.getState()).to.equal(ChannelState.NORMAL);
 		expect(bobChannel.getState()).to.equal(ChannelState.NORMAL);
+		// The safety net 5.4 names has now run, so the restriction lifts and
+		// the lift is on disk: a restart must not reinstate it (issue #469).
+		// This is also what separates the marker from stateUncertain, which
+		// would have routed this very exchange to DLP instead.
+		expect(
+			restoredChannel.getFullState().restoreRecencyUnproven,
+			'a completed reestablish lifts the restore hold'
+		).to.equal(undefined);
+		expect(
+			restoredStorage.loadChannel(
+				restoredChannel.getChannelId()!.toString('hex')
+			)!.state.restoreRecencyUnproven,
+			'and the lift was persisted'
+		).to.equal(undefined);
 
 		buildDirectGraph(restored);
 		const invoice = bob.createInvoice({

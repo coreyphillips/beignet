@@ -374,3 +374,119 @@ describe('Issue #174: ERRORED channels keep their HTLC backstops', function () {
 		});
 	});
 });
+
+/**
+ * Issue #469: a channel restored from a Recovery Capsule carries a checkpoint
+ * whose recency nothing has confirmed. Until a channel_reestablish does, this
+ * node must not broadcast its commitment ON ITS OWN INITIATIVE: the peer may
+ * already hold a revocation for it, and the justice path takes the whole
+ * balance. The operator's explicit force close stays available throughout,
+ * which is the exit docs/RECOVERY-PROTOCOL.md 5.6 already names.
+ */
+describe('Issue #469: a capsule-restored channel holds its automatic closes', function () {
+	this.timeout(10_000);
+
+	/** An ERRORED, funded channel whose row came from a capsule restore. */
+	function setupUnprovenChannel(seedBase: number): IErroredFixture {
+		const fx = setupErroredChannel(seedBase);
+		(fx.alice as any).channelManager
+			.getChannel(fx.channelId)
+			.getFullState().restoreRecencyUnproven = true;
+		return fx;
+	}
+
+	it('does not force-close on a peer error', () => {
+		const fx = setupUnprovenChannel(71);
+
+		(fx.alice as any).handleChannelErrored(fx.channelId, 'peer sent an error');
+
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		expect(chan.getFullState().state).to.equal(ChannelState.ERRORED);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('does not force-close at the errored timeout backstop', () => {
+		const fx = setupUnprovenChannel(73);
+		const timeout = (fx.alice as any).reestablishTimeoutBlocks;
+
+		(fx.alice as any).scanStuckChannels(HEIGHT);
+		(fx.alice as any).scanStuckChannels(HEIGHT + timeout + 1);
+
+		expect(fx.events).to.not.include('ERRORED_TIMEOUT_FORCE_CLOSED');
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		expect(chan.getFullState().state).to.equal(ChannelState.ERRORED);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('does not force-close to claim an inbound HTLC we hold the preimage for', () => {
+		const fx = setupUnprovenChannel(75);
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		(fx.alice as any).preimages.set(paymentHash.toString('hex'), preimage);
+		addHtlc(fx.alice, fx.channelId, 'received-9', {
+			id: 9n,
+			paymentHash,
+			cltvExpiry: HEIGHT + 10
+		});
+
+		(fx.alice as any).scanExpiringHtlcs(HEIGHT);
+
+		// One HTLC's value is a bounded loss; a revoked commitment is the whole
+		// balance.
+		expect(fx.events).to.not.include('HTLC_CLAIM_FORCE_CLOSE');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('asks the peer to close instead, and stops once the hold lifts', () => {
+		const fx = setupUnprovenChannel(77);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+
+		// The gate would otherwise be a trapdoor: an ERRORED row never reaches
+		// Channel.handleReestablish, because ChannelManager answers a
+		// reestablish for one with a wire error, so nothing would ever clear
+		// the hold and nothing would drive the channel anywhere either.
+		expect(chan.getRecoveryCloseReason()).to.equal('restore-unproven');
+		expect(chan.hasRecoveryCloseDisposition()).to.equal(true);
+		expect(chan.buildRecoveryCloseActions()).to.not.have.length(0);
+
+		// Derived, never stamped, so lifting the hold revokes the request too.
+		chan.getFullState().restoreRecencyUnproven = undefined;
+		expect(chan.getRecoveryCloseReason()).to.equal(undefined);
+		expect(chan.buildRecoveryCloseActions()).to.have.length(0);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('still force-closes when the operator asks explicitly', () => {
+		const fx = setupUnprovenChannel(79);
+
+		const result = fx.alice.forceCloseChannel(
+			fx.channelId,
+			Buffer.from('0014' + '11'.repeat(20), 'hex')
+		);
+
+		// The labelled escape hatch: an explicit command may know better than
+		// we do, exactly as it does for the funding-not-on-chain gate.
+		expect(result.ok, result.error).to.equal(true);
+		expect(result.commitmentTxid).to.be.a('string');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('reports the hold on the recovery status', () => {
+		const fx = setupUnprovenChannel(81);
+
+		const entry = fx.alice
+			.getRecoveryStatus()
+			.channels.find((c) => c.channelId === fx.channelId.toString('hex'));
+
+		expect(entry, 'the channel is reported').to.not.equal(undefined);
+		expect(entry!.restoreRecencyUnproven).to.equal(true);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+});

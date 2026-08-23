@@ -183,7 +183,10 @@ export interface IRemoteForwardingPolicy {
 }
 
 /** Why a channel is durably waiting for the PEER's force close (5.6). */
-export type RecoveryCloseReason = 'local-data-loss' | 'state-uncertain';
+export type RecoveryCloseReason =
+	| 'local-data-loss'
+	| 'state-uncertain'
+	| 'restore-unproven';
 
 /**
  * Why WE closed (or are closing) the channel. 'user' means an API-initiated
@@ -692,6 +695,32 @@ export interface IChannelState {
 	 * proving us stale upgrades to dataLossDetected.
 	 */
 	stateUncertain?: boolean;
+	/**
+	 * This row came from a Recovery Capsule and no `channel_reestablish` has
+	 * confirmed it against the peer yet (issue #469).
+	 *
+	 * A capsule is best-effort recency by construction: BOLT 1 peer storage is
+	 * rate limited and providers need not return the latest blob
+	 * (docs/RECOVERY-PROTOCOL.md 5.4), so a Tier 2 restore is byte-identical
+	 * to a checkpoint that may be behind what this node actually did. 5.4 names
+	 * `channel_reestablish` as the safety net for exactly that, and it is: an
+	 * honest peer's counters expose the gap and route the channel to DLP. But
+	 * the safety net only covers the paths that reach it, and the AUTOMATIC
+	 * force-close paths do not - a peer's BOLT 1 error, the reestablish and
+	 * errored timeout backstops, the HTLC deadline backstops. Each of those
+	 * would broadcast a commitment the peer may already hold a revocation for,
+	 * which forfeits the whole balance to the justice path.
+	 *
+	 * So while this is set the node refuses to broadcast our commitment ON ITS
+	 * OWN INITIATIVE. It is deliberately NOT `stateUncertain`: that flag is
+	 * permanent absent independently verified storage provenance and routes
+	 * reestablish itself to DLP, so setting it here would force-close every
+	 * capsule restore and defeat the feature. This one clears the moment a
+	 * reestablish completes, and the operator's explicit force close is never
+	 * gated by it. MUST persist: a restart between the restore and the first
+	 * reconnect must not forget the restriction.
+	 */
+	restoreRecencyUnproven?: boolean;
 	/**
 	 * Recovery 5.6 liveness: the channel was routed to the DLP path and the
 	 * peer must force-close it. The wire error asking for that close can be

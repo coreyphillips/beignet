@@ -4600,6 +4600,18 @@ export class LightningNode extends EventEmitter {
 			 * The peer's close is what resolves it, and this reports the wait.
 			 */
 			fundingUnidentified?: boolean;
+			/**
+			 * A channel restored from a Recovery Capsule that no
+			 * `channel_reestablish` has confirmed against its peer yet
+			 * (issue #469). A capsule is best-effort recency (5.4), so until
+			 * the peer answers, this node will not broadcast the channel's
+			 * commitment on its own initiative: the automatic close paths are
+			 * held and the channel asks the peer to close instead. It clears
+			 * on the first completed reestablish. If the peer never returns,
+			 * the operator's explicit force close is the remaining exit, and
+			 * it is deliberately never gated by this.
+			 */
+			restoreRecencyUnproven?: boolean;
 		}>;
 		/**
 		 * Peers whose channel_reestablish is parked because it names a channel
@@ -4623,6 +4635,7 @@ export class LightningNode extends EventEmitter {
 			status: ChannelRecoveryStatus;
 			awaitingDurability: boolean;
 			fundingUnidentified?: boolean;
+			restoreRecencyUnproven?: boolean;
 		}> = [];
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
@@ -4637,7 +4650,10 @@ export class LightningNode extends EventEmitter {
 					? ChannelRecoveryStatus.Quarantined
 					: channel.getRecoveryStatus(),
 				awaitingDurability: holding.has(idHex),
-				...(fundingUnidentified ? { fundingUnidentified: true } : {})
+				...(fundingUnidentified ? { fundingUnidentified: true } : {}),
+				...(state.restoreRecencyUnproven
+					? { restoreRecencyUnproven: true }
+					: {})
 			});
 		}
 		return {
@@ -15901,6 +15917,15 @@ export class LightningNode extends EventEmitter {
 			});
 			return;
 		}
+		// A capsule-restored row no reestablish has confirmed yet (issue #469).
+		// Here rather than only at the shared guard below, for the reason the
+		// #463 comment above gives: the v2 disposition between the two can
+		// REMOVE the channel, and a removal decided from a record whose recency
+		// is unproven is the one thing this state must not do. The channel
+		// keeps asking the peer to close on every reconnect meanwhile.
+		if (this.skipAutoCloseRestoreUnproven(state, `errored: ${reason}`)) {
+			return;
+		}
 		if (state.v2InFlight && !channel.isV2AttemptBroadcastable()) {
 			// A v2 open the peer provably cannot broadcast: our witnesses
 			// never left AND the funding tx still needs them, so a
@@ -16019,6 +16044,33 @@ export class LightningNode extends EventEmitter {
 		const txidHex = state.fundingTxid!.toString('hex');
 		const entry = this.pendingFundingTxs.get(txidHex);
 		return entry?.phase === 'authorized' && entry.broadcastSucceeded === true;
+	}
+
+	/**
+	 * The other shared guard every AUTOMATIC force-close path runs before
+	 * broadcasting a commitment (issue #469): this channel was restored from a
+	 * Recovery Capsule and no `channel_reestablish` has confirmed it against
+	 * the peer yet, so our latest local commitment may be one the peer already
+	 * holds a revocation for. Broadcasting it on our own initiative forfeits
+	 * the whole balance to the justice path.
+	 *
+	 * Kept beside skipAutoCloseFundingNotOnChain rather than folded into it,
+	 * because the two skips end differently: that one self-clears the moment
+	 * the funding confirms, this one waits for the peer or for an operator.
+	 * While it holds, the channel asks the peer to close instead
+	 * (Channel.buildRecoveryCloseActions, regenerated on every reconnect), and
+	 * forceCloseChannel stays ungated, which is 5.6's labelled escape hatch.
+	 */
+	private skipAutoCloseRestoreUnproven(
+		state: IChannelState,
+		context: string
+	): boolean {
+		if (state.restoreRecencyUnproven !== true) return false;
+		this.emitStructuredLog('channel', 'close_skipped_restore_unproven', {
+			channelId: (state.channelId ?? state.temporaryChannelId).toString('hex'),
+			context
+		});
+		return true;
 	}
 
 	/**
@@ -16160,7 +16212,14 @@ export class LightningNode extends EventEmitter {
 					// Without the funding parent on chain the HTLC-success claim
 					// cannot confirm either, so this close protects nothing
 					// (issue #413).
+					// Or the row's recency is unproven (issue #469): one HTLC's
+					// value is a bounded loss, a revoked commitment is the whole
+					// balance.
 					if (
+						this.skipAutoCloseRestoreUnproven(
+							state,
+							'HTLC_CLAIM_FORCE_CLOSE'
+						) ||
 						this.skipAutoCloseFundingNotOnChain(
 							channel,
 							state,
@@ -16320,7 +16379,12 @@ export class LightningNode extends EventEmitter {
 				// mapping so a late downstream settlement can still be honored.
 				// Unless the funding parent is not known on chain, in which case
 				// nothing built on it can resolve anything (issue #413).
+				// Or the row's recency is unproven (issue #469).
 				if (
+					this.skipAutoCloseRestoreUnproven(
+						state,
+						'FORWARD_TIMEOUT_FORCE_CLOSE'
+					) ||
 					this.skipAutoCloseFundingNotOnChain(
 						channel,
 						state,
@@ -17147,7 +17211,12 @@ export class LightningNode extends EventEmitter {
 					// Without the funding parent on chain the timeout claim
 					// cannot confirm and neither can the downstream's preimage
 					// claim: the close protects nothing (issue #413).
+					// Or the row's recency is unproven (issue #469).
 					if (
+						this.skipAutoCloseRestoreUnproven(
+							state,
+							'HTLC_EXPIRY_FORCE_CLOSE'
+						) ||
 						this.skipAutoCloseFundingNotOnChain(
 							channel,
 							state,
@@ -17623,6 +17692,13 @@ export class LightningNode extends EventEmitter {
 			// channel. Never time it out.
 			// (Channel.forceClose refuses too - this skip avoids even trying.)
 			if (mustNotBroadcastCommitment(state)) {
+				continue;
+			}
+			// Restored from a capsule and not yet confirmed against the peer
+			// (issue #469). Covers every timeout backstop below: a timeout is
+			// this node acting on its own initiative, which is exactly what a
+			// row of unproven recency may not do.
+			if (this.skipAutoCloseRestoreUnproven(state, 'stuck channel scan')) {
 				continue;
 			}
 

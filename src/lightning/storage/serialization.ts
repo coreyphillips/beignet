@@ -443,9 +443,19 @@ export interface ISerializedChannelState {
 	// restart of a possibly-stale restore must not forget that broadcasting
 	// is forbidden until reestablish proves the state current.
 	stateUncertain?: boolean;
+	// Issue #469: this row came from a Recovery Capsule and no
+	// channel_reestablish has confirmed it against the peer yet. MUST persist -
+	// a restart between the restore and the first reconnect must not forget
+	// that an AUTOMATIC commitment broadcast is forbidden.
+	restoreRecencyUnproven?: boolean;
 	// Recovery 5.6 liveness: the persisted peer-close disposition; the wire
-	// error is regenerated from this on every reconnect.
-	recoveryCloseReason?: 'local-data-loss' | 'state-uncertain';
+	// error is regenerated from this on every reconnect. 'restore-unproven' is
+	// DERIVED from the flag above rather than stamped, so it is never written
+	// here; the union carries it so the two types stay one shape.
+	recoveryCloseReason?:
+		| 'local-data-loss'
+		| 'state-uncertain'
+		| 'restore-unproven';
 	// Why WE closed the channel ('user' or an automatic close code).
 	closeReason?: ChannelCloseReason;
 	dlpRemotePerCommitmentPoint?: string | null;
@@ -841,6 +851,7 @@ export function serializeChannelState(
 		dataLossDetected: s.dataLossDetected,
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
+		restoreRecencyUnproven: s.restoreRecencyUnproven,
 		recoveryCloseReason: s.recoveryCloseReason,
 		closeReason: s.closeReason,
 		dlpRemotePerCommitmentPoint: bufToHex(s.dlpRemotePerCommitmentPoint ?? null)
@@ -1030,6 +1041,7 @@ export function deserializeChannelState(
 		dataLossDetected: s.dataLossDetected,
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
+		restoreRecencyUnproven: s.restoreRecencyUnproven,
 		recoveryCloseReason: s.recoveryCloseReason,
 		closeReason: s.closeReason,
 		dlpRemotePerCommitmentPoint:

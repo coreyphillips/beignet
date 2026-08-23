@@ -61,7 +61,7 @@ import {
 	VerifiedRecoveryChain
 } from './types';
 import { createOpenerState, IChannelState } from '../channel/channel-state';
-import { DEFAULT_CHANNEL_CONFIG } from '../channel/types';
+import { ChannelState, DEFAULT_CHANNEL_CONFIG } from '../channel/types';
 import { MonitorState } from '../chain/types';
 import { PaymentDirection, PaymentStatus } from '../node/types';
 
@@ -1306,8 +1306,39 @@ export function restoreFromRecoveryCapsule(
 			);
 		}
 		reconstructFromFrames(target, frames);
+		markCapsuleRestoredChannels(target);
 	});
 	return { tier: 2, scb, framesApplied: frames.length };
+}
+
+/**
+ * Record on every restored channel that this row came from a capsule and no
+ * `channel_reestablish` has confirmed it against the peer yet (issue #469).
+ *
+ * The reconstruction is byte-identical to the capsule, and that is exactly the
+ * problem: a capsule is best-effort recency (5.4), so byte-identical to a
+ * checkpoint is not the same as current, and every AUTOMATIC force-close path
+ * would broadcast a commitment the peer may already hold a revocation for. The
+ * restriction is lifted by the first completed reestablish, which is the safety
+ * net 5.4 already names; the operator's explicit force close is never gated by
+ * it. Structurally the same step RestoreDriver takes for `stateUncertain`, and
+ * applied inside the install transaction for the same reason: a crash must not
+ * leave a channel resumable that nothing has confirmed.
+ *
+ * Terminal rows are skipped. They can never reestablish, so marking them would
+ * report a wait that has no end, and they have nothing left to broadcast.
+ */
+function markCapsuleRestoredChannels(target: IStorageBackend): void {
+	for (const row of target.loadAllChannels()) {
+		if (
+			row.state.state === ChannelState.CLOSED ||
+			row.state.state === ChannelState.FORCE_CLOSED
+		) {
+			continue;
+		}
+		row.state.restoreRecencyUnproven = true;
+		target.saveChannel(row.channelId, row.state, row.peerPubkey);
+	}
 }
 
 export interface IBestCapsuleRestore extends ICapsuleRestoreResult {

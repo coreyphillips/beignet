@@ -5057,6 +5057,16 @@ export class Channel {
 		}
 		if (this._state.dataLossDetected) return 'local-data-loss';
 		if (this._state.stateUncertain) return 'state-uncertain';
+		// A capsule-restored row the peer has not confirmed yet (issue #469).
+		// DERIVED and never stamped by _ensureRecoveryCloseDisposition, unlike
+		// the two above: those flags are permanent, this one clears on the
+		// first completed reestablish and the disposition must clear with it.
+		// It is what stops the automatic-close gate becoming a trapdoor: an
+		// ERRORED row never reaches Channel.handleReestablish at all, because
+		// ChannelManager answers a reestablish for one with a wire error, so
+		// without a peer-close request such a channel would wait forever with
+		// nothing driving it anywhere.
+		if (this._state.restoreRecencyUnproven) return 'restore-unproven';
 		return undefined;
 	}
 
@@ -5095,6 +5105,8 @@ export class Channel {
 		const data =
 			reason === 'local-data-loss'
 				? 'peer proved our channel state is stale (data loss); awaiting your force close'
+				: reason === 'restore-unproven'
+				? 'restored channel state has not been confirmed by channel_reestablish (recovery); awaiting your force close'
 				: 'restored channel state cannot be proven current (recovery); awaiting your force close';
 		return [
 			// The persist leads, exactly as it does at the two sites that first
@@ -8461,6 +8473,25 @@ export class Channel {
 			? 'replay'
 			: 'clean';
 
+		// The capsule restore's safety net just ran (issue #469). The peer's
+		// counters were compatible with this row, which is the confirmation
+		// docs/RECOVERY-PROTOCOL.md 5.4 names for a best-effort checkpoint, so
+		// the node may broadcast this channel's commitment on its own
+		// initiative again.
+		//
+		// "Control reached here" is NOT the predicate. _handleReestablishV2 is
+		// spread into `actions`, so its failure arms (a next_funding_txid that
+		// does not match the in-flight open, a tx_abort) land in the batch and
+		// fall through to this line with the channel already ERRORED. Only an
+		// exchange that actually succeeded lifts the restriction.
+		const clearedRestoreHold =
+			this._state.restoreRecencyUnproven === true &&
+			!this._state.dataLossDetected &&
+			this._state.state !== ChannelState.ERRORED;
+		if (clearedRestoreHold) {
+			this._state.restoreRecencyUnproven = undefined;
+		}
+
 		// Persist before ANY of the above reaches the peer
 		// (docs/RECOVERY-PROTOCOL.md 5.1). Reestablish both mutates state (the
 		// restored channel state, the adopted remote nonce, splice resumption)
@@ -8470,7 +8501,15 @@ export class Channel {
 		// exactly the case the gate exists to stop, arriving one connection
 		// later. A retransmission is only safe once what justifies it is on
 		// disk.
-		if (actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)) {
+		//
+		// Lifting the restore hold is itself a durable state change with no
+		// message of its own to ride on, so it earns the persist too. Kept
+		// conditional rather than unconditional: a reconnect that produces
+		// nothing to send still produces no batch.
+		if (
+			clearedRestoreHold ||
+			actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)
+		) {
 			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
 		}
 
