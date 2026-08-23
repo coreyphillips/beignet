@@ -173,6 +173,7 @@ import {
 	IInvoiceInfo,
 	LightningErrorCode,
 	LightningPaymentError,
+	InvalidChannelOpenError,
 	IChannelHealth,
 	IStructuredLog,
 	IPaymentProof,
@@ -8067,11 +8068,11 @@ export class LightningNode extends EventEmitter {
 		trusted = false
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
-		if (pubkeyErr) throw new Error(pubkeyErr);
+		if (pubkeyErr) throw new InvalidChannelOpenError(pubkeyErr);
 		const satsErr = validatePositiveBigint(fundingSatoshis, 'fundingSatoshis');
-		if (satsErr) throw new Error(satsErr);
+		if (satsErr) throw new InvalidChannelOpenError(satsErr);
 		if (pushMsat !== undefined && pushMsat > fundingSatoshis * 1000n) {
-			throw new Error(
+			throw new InvalidChannelOpenError(
 				`pushMsat (${pushMsat}) cannot exceed fundingSatoshis * 1000 (${
 					fundingSatoshis * 1000n
 				})`
@@ -8083,7 +8084,7 @@ export class LightningNode extends EventEmitter {
 			satsPerVbyte !== undefined &&
 			(!Number.isFinite(satsPerVbyte) || satsPerVbyte <= 0)
 		) {
-			throw new Error(
+			throw new InvalidChannelOpenError(
 				`satsPerVbyte (${satsPerVbyte}) must be a positive finite rate`
 			);
 		}
@@ -8095,7 +8096,7 @@ export class LightningNode extends EventEmitter {
 		// the rate its max was quoted at, so only an on-chain balance change (which
 		// the funding provider guards) can still cause a mismatch.
 		if (fundMax && satsPerVbyte === undefined) {
-			throw new Error(
+			throw new InvalidChannelOpenError(
 				'max funding requires a pinned satsPerVbyte (the rate the max amount was quoted at)'
 			);
 		}
@@ -8105,7 +8106,7 @@ export class LightningNode extends EventEmitter {
 		// advertise them, say) instead of sending a proposal the peer must
 		// reject with an opaque channel-type error.
 		if (trusted && !this.peerNegotiatedZeroConf(peerPubkey)) {
-			throw new Error(
+			throw new InvalidChannelOpenError(
 				`Peer ${peerPubkey} did not negotiate option_zeroconf and option_scid_alias; a trusted (zero-conf) open needs both in its init features`
 			);
 		}
@@ -8120,7 +8121,7 @@ export class LightningNode extends EventEmitter {
 		// is queued for later.
 		if (this.peerNegotiatedDualFund(peerPubkey)) {
 			if (pushMsat !== undefined && pushMsat > 0n) {
-				throw new Error(
+				throw new InvalidChannelOpenError(
 					'push is not possible on a dual-funded (v2) open: open_channel2 has no push_msat. Open without a push and pay the peer once the channel is ready.'
 				);
 			}
@@ -8300,17 +8301,17 @@ export class LightningNode extends EventEmitter {
 		}
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
-		if (pubkeyErr) throw new Error(pubkeyErr);
+		if (pubkeyErr) throw new InvalidChannelOpenError(pubkeyErr);
 		const satsErr = validatePositiveBigint(
 			params.fundingSatoshis,
 			'fundingSatoshis'
 		);
-		if (satsErr) throw new Error(satsErr);
+		if (satsErr) throw new InvalidChannelOpenError(satsErr);
 		// Fail fast at the API boundary; handleAcceptChannel2 enforces the same
 		// invariant as defense-in-depth (an uncapped lease fee could otherwise
 		// drain the buyer's balance).
 		if (params.requestFunds && !params.maxLeaseRates) {
-			throw new Error(
+			throw new InvalidChannelOpenError(
 				'requestFunds requires maxLeaseRates (buyer fee ceiling)'
 			);
 		}
@@ -8318,7 +8319,7 @@ export class LightningNode extends EventEmitter {
 		// open must commit the ENTIRE balance minus fees in open_channel2 —
 		// there is nothing left to absorb the fee later.
 		if (params.fundMax && params.requestFunds) {
-			throw new Error(
+			throw new InvalidChannelOpenError(
 				'max funding cannot be combined with requestFunds (the lease fee is not known when the max is committed)'
 			);
 		}

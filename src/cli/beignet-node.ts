@@ -95,7 +95,7 @@ import {
 } from '../lightning/recovery';
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
-import { INodeConfig } from '../lightning/node/types';
+import { INodeConfig, InvalidChannelOpenError } from '../lightning/node/types';
 import {
 	BITCOIN_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
@@ -599,6 +599,25 @@ export function decodeOfferInput(
 				err instanceof Error ? err.message : 'failed to decode'
 			}`
 		);
+	}
+}
+
+/**
+ * Run a channel open, converting the engine's argument refusals into a typed
+ * INVALID_PARAMS (400) that keeps their message. The daemon only passes a
+ * BeignetError through; anything else is logged as an unhandled fault and
+ * scrubbed to a generic 500, which hid honest, actionable refusals such as a
+ * push toward a dual-fund peer (issue #464). Node faults are deliberately not
+ * converted: they still scrub.
+ */
+function openOrRefuse<T>(open: () => T): T {
+	try {
+		return open();
+	} catch (err: unknown) {
+		if (err instanceof InvalidChannelOpenError) {
+			throw new BeignetError(BeignetErrorCode.INVALID_PARAMS, err.message);
+		}
+		throw err;
 	}
 }
 
@@ -4144,13 +4163,15 @@ export class BeignetNode extends EventEmitter {
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
 			pushSats !== undefined ? BigInt(pushSats) * 1000n : undefined;
-		const channel = this.node.openChannel(
-			pubkey,
-			fundingSatoshis,
-			pushMsat,
-			satsPerVbyte,
-			max,
-			trusted
+		const channel = openOrRefuse(() =>
+			this.node.openChannel(
+				pubkey,
+				fundingSatoshis,
+				pushMsat,
+				satsPerVbyte,
+				max,
+				trusted
+			)
 		);
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
@@ -5951,10 +5972,8 @@ export class BeignetNode extends EventEmitter {
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
 			pushSats !== undefined ? BigInt(pushSats) * 1000n : undefined;
-		const channel = this.node.openZeroConfChannel(
-			peerPubkey,
-			fundingSatoshis,
-			pushMsat
+		const channel = openOrRefuse(() =>
+			this.node.openZeroConfChannel(peerPubkey, fundingSatoshis, pushMsat)
 		);
 		if (!channel) {
 			throw new BeignetError(
@@ -5988,12 +6007,14 @@ export class BeignetNode extends EventEmitter {
 			locktime?: number;
 		}
 	): ChannelInfo {
-		const channel = this.node.openChannelV2(peerPubkey, {
-			fundingSatoshis: BigInt(params.amountSats),
-			fundingFeeratePerkw: params.fundingFeeratePerkw,
-			commitmentFeeratePerkw: params.commitmentFeeratePerkw,
-			locktime: params.locktime
-		});
+		const channel = openOrRefuse(() =>
+			this.node.openChannelV2(peerPubkey, {
+				fundingSatoshis: BigInt(params.amountSats),
+				fundingFeeratePerkw: params.fundingFeeratePerkw,
+				commitmentFeeratePerkw: params.commitmentFeeratePerkw,
+				locktime: params.locktime
+			})
+		);
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
 		const channelId = state.channelId || state.temporaryChannelId;

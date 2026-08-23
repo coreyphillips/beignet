@@ -1044,6 +1044,22 @@ try {
 
 `LightningPaymentError` extends `Error`, so existing `catch` blocks continue to work. The `code` property enables programmatic error handling without string matching.
 
+#### Typed Channel-Open Refusals (Lightning Layer)
+
+A channel open the engine refuses on the caller's own arguments (a push toward a dual-fund peer, a `pushSats` above the funding amount, a non-positive fee rate, `max` without a pinned rate, a trusted open toward a peer that never negotiated `option_zeroconf`) throws an `InvalidChannelOpenError`. Every open entry point converts it to `INVALID_PARAMS`, so the daemon answers **HTTP 400 with the engine's message** instead of scrubbing it to a generic 500. Node faults stay untyped and still answer 500.
+
+```typescript
+import { InvalidChannelOpenError } from 'beignet/cli';
+
+try {
+  node.openChannel(peerPubkey, 100_000n, 50_000_000n);
+} catch (err) {
+  if (err instanceof InvalidChannelOpenError) {
+    // The request cannot be served as written; err.message says why.
+  }
+}
+```
+
 ---
 
 ## CLI Commands
