@@ -449,6 +449,32 @@ const MAX_HELD_UNKNOWN_REESTABLISH = 1024;
  */
 const MAX_UNKNOWN_REESTABLISH_HOLD_MS = 2_147_483_647;
 
+/** BOLT 1 length-prefixes the error `data` field with a u16. */
+const MAX_WIRE_ERROR_DATA_BYTES = 0xffff;
+
+/**
+ * `reason` as wire bytes, clamped to what the length prefix can carry.
+ *
+ * Not every reason is ours: abortPendingOpen quotes an IFundingProvider error
+ * verbatim, so an embedder that throws more than 64 KiB of text would otherwise
+ * take encodeErrorMessage down with it. Clamped rather than refused because the
+ * peer is mid-negotiation: a truncated cancellation still frees it, while no
+ * message at all leaves it parked on an open that will never answer.
+ *
+ * The cut backs off over any UTF-8 continuation bytes it orphaned, so the
+ * operator at the far end never reads a split character.
+ *
+ * @param reason - Human-readable text for the peer's operator
+ * @returns The data field, at most MAX_WIRE_ERROR_DATA_BYTES long
+ */
+function clampWireErrorData(reason: string): Buffer {
+	const data = Buffer.from(reason, 'utf8');
+	if (data.length <= MAX_WIRE_ERROR_DATA_BYTES) return data;
+	let end = MAX_WIRE_ERROR_DATA_BYTES;
+	while (end > 0 && (data[end] & 0xc0) === 0x80) end--;
+	return data.subarray(0, end);
+}
+
 /**
  * The payload for a BOLT 1 error scoped to `channelId`, or null when this id
  * cannot carry one (canScopeWireError says which, and why).
@@ -472,7 +498,7 @@ function wireErrorPayloadFor(channelId: Buffer, reason: string): Buffer | null {
 	if (!canScopeWireError(channelId)) return null;
 	return encodeErrorMessage({
 		channelId,
-		data: Buffer.from(reason, 'utf8')
+		data: clampWireErrorData(reason)
 	});
 }
 
@@ -1002,8 +1028,12 @@ export class ChannelManager extends EventEmitter {
 			}
 			return;
 		}
-		const wire = wireErrorPayloadFor(tempIdBuf, reason);
 		try {
+			// Inside the guard, encoding included: the channel is already
+			// ERRORED by here, so anything that throws on the way to the wire
+			// must still leave the registration cleaned up and channel:aborted
+			// emitted rather than stranding a failed channel in tempChannels.
+			const wire = wireErrorPayloadFor(tempIdBuf, reason);
 			if (wire) {
 				this.sendMessage(peerPubkey, MessageType.ERROR, wire);
 			}
@@ -5477,14 +5507,14 @@ export class ChannelManager extends EventEmitter {
 	): void {
 		// The open is still refused when the id cannot carry the wire half
 		// (wireErrorPayloadFor says which ids those are), just silently: there
-		// is no id we could answer under that means what we mean.
-		const payload = wireErrorPayloadFor(channelId, reason);
-		if (!payload) {
-			this.emitContained('error', channelId, reason);
-			return;
-		}
+		// is no id we could answer under that means what we mean. Encoding sits
+		// inside the guard with the send, so no failure on the way to the wire
+		// can cost the local refusal diagnostic the finally owes.
 		try {
-			this.sendMessage(peerPubkey, MessageType.ERROR, payload);
+			const payload = wireErrorPayloadFor(channelId, reason);
+			if (payload) {
+				this.sendMessage(peerPubkey, MessageType.ERROR, payload);
+			}
 		} catch {
 			// The wire attempt already happened. Keep the local refusal diagnostic
 			// singular even when a synchronous outbound observer throws.
