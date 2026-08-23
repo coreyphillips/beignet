@@ -619,8 +619,8 @@ export enum ChannelRecoveryStatus {
   ReplayRequired,   // peer needs retransmission; serve exact bytes from the outbox
   LocalDataLoss,    // peer proved we are stale: existing DLP path, no broadcast
   StateUncertain,   // cannot prove our state is current: never broadcast, peer closes
-  RestoreRecencyUnproven, // capsule-restored and failed: transacts while healthy,
-                          // but no AUTOMATIC close will broadcast its commitment
+  RestoreRecencyUnproven, // capsule-restored and failed: no AUTOMATIC close will
+                          // broadcast its commitment, and it takes no new HTLCs
   Active,
   ForceClosing,
 }

@@ -521,26 +521,11 @@ describe('Issue #469: a capsule-restored channel holds its automatic closes', fu
 		expect(refusal.message).to.match(/Recovery Capsule/);
 		expect(chan.getFullState().htlcs.size).to.equal(0);
 
-		// Inbound: accepted onto the commitment as BOLT 2 requires, then
-		// failed straight back rather than settled or forwarded. Settling
-		// would reveal a preimage against a peer we could never escalate
-		// against.
-		const failed: bigint[] = [];
-		const mgr = (fx.alice as any).channelManager;
-		mgr.failHtlc = (_id: Buffer, htlcId: bigint): void => {
-			failed.push(htlcId);
-		};
-		addHtlc(fx.alice, fx.channelId, 'received-11', {
-			id: 11n,
-			cltvExpiry: HEIGHT + 100
-		});
-		(fx.alice as any).handleIncomingHtlc(
-			fx.channelId,
-			11n,
-			50_000n,
-			crypto.randomBytes(32)
-		);
-		expect(failed, 'the inbound HTLC is failed back').to.deep.equal([11n]);
+		// Routing: the channel is not offered to any planner either, so an MPP
+		// payment cannot dispatch a safe part and then discover a held one.
+		expect(chan.isHtlcUsable(), 'not usable for new HTLCs').to.equal(false);
+		const edges = (fx.alice as any).getLocalChannelEdges() as unknown[];
+		expect(edges, 'and not in the local edge overlay').to.have.length(0);
 
 		fx.alice.destroy();
 		fx.bob.destroy();

@@ -4615,9 +4615,12 @@ export class LightningNode extends EventEmitter {
 			 * the peer answers, this node will not broadcast the channel's
 			 * commitment on its own initiative: the automatic close paths are
 			 * held and the channel asks the peer to close instead. It clears
-			 * on the first completed reestablish. If the peer never returns,
-			 * the operator's explicit force close is the remaining exit, and
-			 * it is deliberately never gated by this.
+			 * A compatible reestablish does not lift it, since compatibility is
+			 * not recency, so it stands for the life of the channel: such a
+			 * channel also takes no new HTLCs, though existing ones still
+			 * settle and it can still be closed cooperatively. The peer's close
+			 * and the operator's explicit force close are the exits, and the
+			 * second is deliberately never gated by this.
 			 */
 			restoreRecencyUnproven?: boolean;
 		}>;
@@ -7418,12 +7421,37 @@ export class LightningNode extends EventEmitter {
 				// broadcasts an old commitment) is detected. The splice tx itself
 				// spends the old output legitimately, so it is ignored. state.fundingTxid
 				// still holds the OLD outpoint until completeSplice swaps it.
-				// The pre-splice leg is NOT armed here. The channel records it
-				// durably, with its own script, in the batch that authorizes
-				// the splice broadcast, and the loop above re-arms every
-				// recorded leg (issue #479). Deriving one here instead would
-				// rebuild the script from the channel's CURRENT funding keys,
-				// which a splice may have rotated.
+				// The leg is normally armed by the loop above, from the record
+				// the channel wrote in the batch that authorized the splice
+				// (issue #479). This is the fallback for a row that predates
+				// that field and was mid-splice when the node upgraded, which
+				// would otherwise come back watching only an outpoint that may
+				// never confirm.
+				//
+				// Deriving the script here is sound in exactly this case and
+				// nowhere else: the splice has not been adopted (spliceInFlight
+				// is still set), so `fundingTxid` is the superseded outpoint and
+				// `remoteBasepoints.fundingPubkey` is still the PRE-splice key.
+				// A rotated key is only adopted by completeSplice, which is what
+				// makes the same derivation wrong once the splice has locked.
+				const supersededTxid = Buffer.from(state.fundingTxid)
+					.reverse()
+					.toString('hex');
+				const alreadyRecorded = (state.preSpliceSpendWatches ?? []).some(
+					(w) =>
+						w.txid === supersededTxid &&
+						w.outputIndex === state.fundingOutputIndex
+				);
+				if (!alreadyRecorded) {
+					await this.chainWatcher.watchFundingSpendDuringSplice(
+						state.channelId || state.temporaryChannelId,
+						supersededTxid,
+						state.fundingOutputIndex,
+						fundingScript,
+						spliceTxidHex,
+						generation
+					);
+				}
 				if (inflight.fullySigned && this.isCurrentChainStartup(generation)) {
 					// Through the ACTION path, never straight at the backend. A
 					// splice creates a funding output exactly as an open does, so
@@ -12044,12 +12072,7 @@ export class LightningNode extends EventEmitter {
 			const firstHopChannel = this.firstHopChannelFor(route);
 			if (
 				firstHopChannel &&
-				(firstHopChannel.getSpendableOutboundMsat() < route.totalAmountMsat ||
-					// A held capsule restore takes no new HTLCs (issue #469), so
-					// screen it here rather than letting addHtlc refuse: the
-					// MPP fallback below can then route around it instead of
-					// the payment simply failing.
-					firstHopChannel.getFullState().restoreRecencyUnproven === true)
+				firstHopChannel.getSpendableOutboundMsat() < route.totalAmountMsat
 			) {
 				route = null;
 			}
@@ -12908,26 +12931,6 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
-		// A capsule-restored channel whose recency cannot be proven takes no NEW
-		// HTLCs (issue #469). Settling this would reveal a preimage against a
-		// peer we could never escalate against: every automatic close is
-		// refused for as long as the hold stands, so the on-chain claim the
-		// deadline backstop exists to make can never happen. Forwarding is the
-		// same bet with an extra leg. Fail it back now, while it is still free
-		// to do so; the sender simply routes elsewhere.
-		if (channel.getFullState().restoreRecencyUnproven === true) {
-			this.emitStructuredLog('htlc', 'refused_restore_unproven', {
-				channelId: channelId.toString('hex'),
-				htlcId: htlcId.toString()
-			});
-			this.channelManager.failHtlc(
-				channelId,
-				htlcId,
-				createFailureMessage(Buffer.alloc(32), TEMPORARY_CHANNEL_FAILURE)
-			);
-			return;
-		}
-
 		// Global HTLC limit check
 		if (this.getTotalInFlightHtlcCount() > this.maxTotalInFlightHtlcs) {
 			this.channelManager.failHtlc(
@@ -13031,7 +13034,27 @@ export class LightningNode extends EventEmitter {
 		// restart via redispatchUnresolvedReceivedHtlcs.
 		const finalHop = isFinalHop(processed.nextPacket);
 		let policyCode: number | null = null;
-		if (channel.receivedHtlcExceedsDustExposure(htlcId)) {
+		if (channel.getFullState().restoreRecencyUnproven === true) {
+			// A capsule-restored channel whose recency cannot be proven takes
+			// no NEW HTLCs (issue #469). Settling this would reveal a preimage
+			// against a peer we could never escalate against, because every
+			// automatic close is refused while the hold stands, so the on-chain
+			// claim the deadline backstops exist to make can never happen;
+			// forwarding is the same bet with an extra leg.
+			//
+			// Decided HERE rather than before the onion is processed, so the
+			// failure is encrypted under the sender's own shared secret and can
+			// actually be read, and so it takes the same role-correct and
+			// blinded-route handling as every other policy fail-back below.
+			this.emitStructuredLog('htlc', 'refused_restore_unproven', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				finalHop
+			});
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_CHANNEL_FAILURE;
+		} else if (channel.receivedHtlcExceedsDustExposure(htlcId)) {
 			policyCode = finalHop
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				: TEMPORARY_CHANNEL_FAILURE;
@@ -16162,8 +16185,8 @@ export class LightningNode extends EventEmitter {
 	 * the whole balance to the justice path.
 	 *
 	 * Kept beside skipAutoCloseFundingNotOnChain rather than folded into it,
-	 * because the two skips end differently: that one self-clears the moment
-	 * the funding confirms, this one waits for the peer or for an operator.
+	 * because the two skips end differently: that one self-clears once the
+	 * funding confirms, this one waits for the peer or for an operator.
 	 * While it holds, the channel asks the peer to close instead
 	 * (Channel.buildRecoveryCloseActions, regenerated on every reconnect), and
 	 * forceCloseChannel stays ungated, which is 5.6's labelled escape hatch.

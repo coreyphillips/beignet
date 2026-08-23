@@ -1160,8 +1160,11 @@ describe('Recovery phase 3: end to end restore from the capsule alone', () => {
 			amountMsat: 50_000n,
 			description: 'post-restore'
 		});
-		const payment = restored.sendPayment(invoice.bolt11);
-		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		// The channel is not offered to the router at all, so nothing is
+		// dispatched and then failed: an MPP payment that sent a safe part
+		// before a held part refused locally would leave that first part locked
+		// until the mpp_timeout.
+		expect(() => restored.sendPayment(invoice.bolt11)).to.throw(/No route/);
 
 		restored.destroy();
 		bob.destroy();

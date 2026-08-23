@@ -1319,9 +1319,10 @@ export function restoreFromRecoveryCapsule(
  * problem: a capsule is best-effort recency (5.4), so byte-identical to a
  * checkpoint is not the same as current, and every AUTOMATIC force-close path
  * would broadcast a commitment the peer may already hold a revocation for. The
- * restriction is lifted by the first completed reestablish, which is the safety
- * net 5.4 already names; the operator's explicit force close is never gated by
- * it. Structurally the same step RestoreDriver takes for `stateUncertain`, and
+ * restriction is permanent, because a compatible reestablish proves
+ * compatibility and not recency; the peer's close and the operator's explicit
+ * force close are the exits, and the second is never gated by it.
+ * Structurally the same step RestoreDriver takes for `stateUncertain`, and
  * applied inside the install transaction for the same reason: a crash must not
  * leave a channel resumable that nothing has confirmed.
  *

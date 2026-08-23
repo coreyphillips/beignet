@@ -5089,9 +5089,9 @@ export class Channel {
 		if (this._state.stateUncertain) return 'state-uncertain';
 		// A capsule-restored row the peer has not confirmed yet (issue #469).
 		// DERIVED and never stamped by _ensureRecoveryCloseDisposition, unlike
-		// the two above: those flags are permanent, this one clears on the
-		// first completed reestablish and the disposition must clear with it.
-		// It is what stops the automatic-close gate becoming a trapdoor: an
+		// the two above: deriving keeps the disposition answerable to the flag
+		// rather than to a field some transition remembered to set. It is what
+		// stops the automatic-close gate becoming a trapdoor: an
 		// ERRORED row never reaches Channel.handleReestablish at all, because
 		// ChannelManager answers a reestablish for one with a wire error, so
 		// without a peer-close request such a channel would wait forever with
@@ -5120,6 +5120,41 @@ export class Channel {
 		} else if (this._state.stateUncertain) {
 			this._state.recoveryCloseReason = 'state-uncertain';
 		}
+	}
+
+	/**
+	 * An irrecoverable reestablish counter gap on a channel whose automatic
+	 * closes are held (issue #469).
+	 *
+	 * These two branches are a dead end by construction: the peer names a
+	 * commitment or revocation this node never produced, so nothing can be
+	 * retransmitted and the exchange cannot complete. On an ordinary channel
+	 * that is survivable, because the reestablish-timeout backstop force-closes
+	 * it after `reestablishTimeoutBlocks`. On a held one that backstop is
+	 * refused forever, and the bare error these used to return leaves the
+	 * channel in AWAITING_REESTABLISH with no durable disposition, so
+	 * hasRecoveryCloseDisposition stays false and not even the peer-close
+	 * request goes out: a channel with no exit at all.
+	 *
+	 * So the failure is made terminal and durable here, which is what puts it
+	 * on the 5.6 path the hold already assumes: ERRORED plus a persist, after
+	 * which the derived `restore-unproven` disposition asks the peer to close
+	 * on this and every later reconnect.
+	 */
+	private _heldReestablishGapFailure(message: string): ChannelAction[] {
+		if (this._state.restoreRecencyUnproven !== true) {
+			return [{ type: ChannelActionType.ERROR, message }];
+		}
+		this._state.state = ChannelState.ERRORED;
+		return [
+			// Persist FIRST, exactly as the DLP arms above: a crash between
+			// this and the socket must not forget that the peer has to close.
+			{ type: ChannelActionType.PERSIST_STATE },
+			...this.buildRecoveryCloseActions().filter(
+				(a) => a.type !== ChannelActionType.PERSIST_STATE
+			),
+			{ type: ChannelActionType.ERROR, message }
+		];
 	}
 
 	/**
@@ -8168,12 +8203,9 @@ export class Channel {
 		// We've created up to remoteCommitmentNumber commitments for them.
 		if (msg.nextCommitmentNumber > this._state.remoteCommitmentNumber + 1n) {
 			// Peer expects a commitment we've never created — irrecoverable gap
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Remote expects future commitment we have not created'
-				}
-			];
+			return this._heldReestablishGapFailure(
+				'Remote expects future commitment we have not created'
+			);
 		}
 
 		// ── Revocation retransmission logic ──
@@ -8187,12 +8219,9 @@ export class Channel {
 		// normally. Only a larger gap is irrecoverable.
 		if (msg.nextRevocationNumber > this._state.localCommitmentNumber + 1n) {
 			// Peer expects a revocation we've never created — irrecoverable
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Remote expects future revocation we have not sent'
-				}
-			];
+			return this._heldReestablishGapFailure(
+				'Remote expects future revocation we have not sent'
+			);
 		}
 
 		// Collected separately from `actions`: when the peer missed BOTH our
@@ -10618,6 +10647,16 @@ export class Channel {
 	 * immediately.
 	 */
 	isHtlcUsable(lookThroughReestablish = false): boolean {
+		// A capsule-restored channel whose recency cannot be proven takes no
+		// NEW HTLCs (issue #469): its on-chain HTLC deadline backstops can
+		// never fire while the hold stands, so an obligation taken on here has
+		// no enforcement behind it. Answered from the ONE predicate every
+		// planner and forwarding decision already consults, rather than at
+		// each of them: a route the router still offers is a part that can be
+		// dispatched, and an MPP payment that sends a safe part before a held
+		// part refuses locally leaves the first one locked until the
+		// mpp_timeout.
+		if (this._state.restoreRecencyUnproven === true) return false;
 		const eff =
 			lookThroughReestablish &&
 			this._state.state === ChannelState.AWAITING_REESTABLISH
@@ -11120,6 +11159,15 @@ export class Channel {
 		this._state.spliceFundingTxid = signed.spliceTxid;
 		this._state.spliceFundingOutputIndex = signed.newFundingOutputIndex;
 		this._syncSpliceInFlight({ sentTxSignatures: true });
+		// The old outpoint becomes attackable at this same point of no return:
+		// once our signature is out the peer can complete and broadcast the
+		// splice, and a peer that instead evicts it and publishes a revoked
+		// pre-splice commitment spends the OLD output. No WATCH_FUNDING is in
+		// this batch (the watch moves when the transaction is actually
+		// broadcast), so without recording the leg here a crash between now and
+		// the peer's tx_signatures would restore a channel watching only an
+		// outpoint that does not exist yet (issue #479).
+		this._recordPreSpliceSpendWatch(signed.spliceTxid);
 
 		// Our shared-input (2-of-2 funding) signature travels in the
 		// shared_input_signature TLV; witnesses carry only the stacks for the

@@ -421,6 +421,24 @@ BEIGNET_RECOVERY_REESTABLISH_HOLD_MS=600000   # peer-storage only; 0 disables
   crash-safe: a marker (`<network>.capsule-restore.json`) lets the next boot
   finish an interrupted swap. Otherwise (Tier 1) the embedded SCB is
   recovered on the live node like `POST /restore/scb`.
+
+  A Tier 2 restore brings the channels back HOLDABLE, not fully live. A
+  capsule is best-effort recency by construction and a compatible
+  `channel_reestablish` proves compatibility, not recency, so every restored
+  channel carries `restoreRecencyUnproven` on `GET /recovery/status` for the
+  rest of its life. While it is set the daemon never force-closes that
+  channel on its own initiative (a peer error and the reestablish/errored
+  timeout backstops are all held, and the channel asks its peer to close
+  instead), and the channel takes no new HTLCs, since the on-chain HTLC
+  deadline backstops that would enforce them can never fire. Existing HTLCs
+  still settle and fail, the balance is intact, and a cooperative close stays
+  available and cannot be penalized from a stale state. An ERRORED one
+  reports `status: "restore_recency_unproven"` rather than `force_closing`.
+  The exits are the peer closing, or
+  `beignet channel forceclose <id> --accept-stale-state-risk`
+  (`POST /channel/forceclose` with `acceptStaleStateRisk: true`), which is
+  refused without the flag because publishing a commitment the peer may
+  already have revoked forfeits the whole channel balance.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.

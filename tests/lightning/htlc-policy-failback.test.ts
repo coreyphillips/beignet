@@ -278,6 +278,46 @@ describe('Policy fail-backs and quiescence parking (issues 410/411)', function (
 		);
 	});
 
+	it('fails an HTLC back readably when the receiving channel is a held capsule restore (issue #469)', function () {
+		const alice = createNode(21);
+		const bob = createNode(22);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		buildGraph(alice, bob, [channelId]);
+
+		// BOB's side of the channel came from a Recovery Capsule, so it takes
+		// no new HTLCs. Alice's side is ordinary, so she still routes over it
+		// and the refusal has to travel back to her as a readable failure.
+		bob
+			.getChannelManager()
+			.getChannel(channelId)!
+			.getFullState().restoreRecencyUnproven = true;
+
+		const inv = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'held-restore'
+		});
+		alice.sendPayment(inv.bolt11);
+
+		const failed = alice.getPayment(inv.paymentHash)!;
+		expect(failed.status).to.equal(PaymentStatus.FAILED);
+		// Decrypting it at all is the point: built before the onion was
+		// processed it was encrypted under an all-zero secret, and the payer
+		// could read nothing. And BOLT 4's role split still applies, so a
+		// FINAL node answers the non-leaking code, not the forwarding-only
+		// temporary_channel_failure.
+		expect(failed.failureCode, 'the payer could decrypt the failure').to.equal(
+			INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+		);
+		expect(bob.getPayment(inv.paymentHash)?.status).to.not.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(
+			bob.getChannelManager().getChannel(channelId)!.getState(),
+			'the channel survives'
+		).to.equal(ChannelState.NORMAL);
+	});
+
 	it('fails a final-hop far-future CLTV back, not the channel', function () {
 		const alice = createNode(3);
 		const bob = createNode(4);

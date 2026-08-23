@@ -1758,6 +1758,15 @@ export class ChainWatcher extends EventEmitter {
 			if (other === watched) continue;
 			if (other.channelId.toString('hex') !== idHex) continue;
 			other.reportedSpendTxid = undefined;
+			// Clearing the flag is not enough: a sibling scan that already
+			// fetched its history is still in flight, and its own revision has
+			// not moved, so it would pass every guard and report ITS spend
+			// after this one. That is how an orphaned pre-splice spend
+			// reclaimed ownership from the canonical close and put the monitor
+			// back on a transaction no longer in the chain, taking the penalty
+			// and fee-bump tracking bound to the real one with it. Retiring
+			// those scans is part of the ownership transfer.
+			other.spendScanRevision = (other.spendScanRevision ?? 0) + 1;
 		}
 	}
 

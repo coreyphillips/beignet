@@ -607,6 +607,73 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		expect(mustNotBroadcastCommitment(restored.getFullState())).to.equal(false);
 	});
 
+	it('an irrecoverable counter gap on a held channel ends in a peer-close request, not limbo (issue #469)', function () {
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		const state = opener.getFullState();
+		state.restoreRecencyUnproven = true;
+		opener.markForReestablish();
+
+		// The peer names a commitment this node never produced. Nothing can be
+		// retransmitted, so the exchange is a dead end. On an ordinary channel
+		// the reestablish-timeout backstop eventually force-closes it; on a
+		// held one that backstop is refused forever, so a bare error would
+		// leave the channel in AWAITING_REESTABLISH with no timeout, no
+		// disposition and therefore not even a peer-close request.
+		const actions = opener.handleReestablish({
+			channelId: opener.getChannelId()!,
+			nextCommitmentNumber: state.remoteCommitmentNumber + 50n,
+			nextRevocationNumber: state.localCommitmentNumber,
+			yourLastPerCommitmentSecret: Buffer.alloc(32),
+			myCurrentPerCommitmentPoint: perCommitmentPointFromSecret(
+				crypto.createHash('sha256').update(Buffer.from('gap')).digest()
+			)
+		});
+
+		expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		expect(
+			actions.some((a) => a.type === ChannelActionType.PERSIST_STATE),
+			'the disposition is persisted before the error leaves'
+		).to.equal(true);
+		expect(
+			actions.some(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					a.messageType === MessageType.ERROR
+			),
+			'and the peer is asked to close'
+		).to.equal(true);
+		expect(opener.getRecoveryCloseReason()).to.equal('restore-unproven');
+		expect(opener.hasRecoveryCloseDisposition()).to.equal(true);
+		// Still never our own broadcast.
+		expect(
+			actions.some((a) => a.type === ChannelActionType.BROADCAST_TX)
+		).to.equal(false);
+	});
+
+	it('leaves an unheld counter gap on its existing path', function () {
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		const state = opener.getFullState();
+		opener.markForReestablish();
+
+		// No hold: the reestablish-timeout backstop is still armed for this
+		// channel, so the terminal transition is not this handler's to make.
+		const actions = opener.handleReestablish({
+			channelId: opener.getChannelId()!,
+			nextCommitmentNumber: state.remoteCommitmentNumber + 50n,
+			nextRevocationNumber: state.localCommitmentNumber,
+			yourLastPerCommitmentSecret: Buffer.alloc(32),
+			myCurrentPerCommitmentPoint: perCommitmentPointFromSecret(
+				crypto.createHash('sha256').update(Buffer.from('gap2')).digest()
+			)
+		});
+
+		expect(opener.getState()).to.not.equal(ChannelState.ERRORED);
+		expect(actions).to.have.length(1);
+		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+	});
+
 	it('ReplayRequired serves the exact PERSISTED bytes across a restart', function () {
 		// The spec's requirement for ReplayRequired: the peer gets exactly
 		// what was sent before the crash, from persistence, not a rebuild.

@@ -950,6 +950,7 @@ describe('Phase 4: Chain Watcher', () => {
 		let watcher: ChainWatcher;
 		let spends: Buffer[];
 		let absentCalls: Buffer[];
+		let reported: string[];
 
 		/** The registry the watches live in, for the retirement assertions. */
 		function registryKeys(): string[] {
@@ -985,6 +986,25 @@ describe('Phase 4: Chain Watcher', () => {
 				absentCalls.push(channelId);
 				originalAbsent(channelId);
 			};
+			reported = [];
+			const originalSpent =
+				channelManager.handleFundingSpent.bind(channelManager);
+			(channelManager as any).handleFundingSpent = (
+				cid: Buffer,
+				spendingTx: bitcoin.Transaction,
+				blockHeight: number,
+				destinationScript: Buffer,
+				feeRatePerVbyte?: number
+			): ReturnType<typeof originalSpent> => {
+				reported.push(spendingTx.getId());
+				return originalSpent(
+					cid,
+					spendingTx,
+					blockHeight,
+					destinationScript,
+					feeRatePerVbyte
+				);
+			};
 			watcher = new ChainWatcher({ backend, channelManager });
 			watcher.on('error', () => {});
 			spends = [];
@@ -995,6 +1015,8 @@ describe('Phase 4: Chain Watcher', () => {
 		afterEach(() => {
 			watcher.stop();
 		});
+
+		const reportedTxids = (): string[] => reported;
 
 		/**
 		 * The shape restoreChainWatches and registerFundingWatch arm during an
@@ -1307,6 +1329,71 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(retired, 'the retirement is announced').to.deep.equal([
 				{ txid: oldTxid, outputIndex: 0 }
 			]);
+		});
+
+		it('a stale sibling scan cannot reclaim the spend verdict from the canonical close', async () => {
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+			const registry = (
+				watcher as unknown as {
+					watchedFundings: Map<string, unknown>;
+				}
+			).watchedFundings;
+			const chanKey = channelId.toString('hex');
+			const legKey = preSpliceKeys(channelId)[0];
+			const gen = (watcher as unknown as { lifecycleGeneration: number })
+				.lifecycleGeneration;
+			const scan = (
+				watcher as unknown as {
+					checkFundingSpent: (
+						w: unknown,
+						g: number,
+						k: string
+					) => Promise<void>;
+				}
+			).checkFundingSpent.bind(watcher);
+
+			// The leg's scan snapshots a history holding an ORPHANED spend of
+			// the old outpoint, then parks mid-flight.
+			const orphan = publishBreach(oldTxid, scriptHash, 104);
+			backend.holdHistory(1);
+			const parked = scan(registry.get(legKey), gen, legKey).catch(() => {
+				/* not the subject */
+			});
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			// While it is parked the real close of the NEW outpoint is found by
+			// the channel's own watch, which takes ownership of the verdict.
+			const close = new bitcoin.Transaction();
+			close.version = 2;
+			close.addInput(Buffer.from(spliceTxid, 'hex').reverse(), 0, 0xffffffff);
+			close.addOutput(Buffer.from('0014' + '66'.repeat(20), 'hex'), 60_000);
+			backend.setTransaction(close.getId(), close.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 105 },
+				{ txid: close.getId(), height: 106 }
+			]);
+			const chanWatch = registry.get(chanKey) as { txid: string };
+			chanWatch.txid = spliceTxid;
+			await scan(chanWatch, gen, chanKey);
+			expect(reportedTxids(), 'the canonical close is recorded').to.deep.equal([
+				close.getId()
+			]);
+
+			// The parked scan now finishes. Clearing the sibling's ownership
+			// flag alone would not stop it: its own revision never moved, so it
+			// would pass every guard and put the monitor back on a transaction
+			// that is no longer in the chain, taking the penalty and fee-bump
+			// tracking bound to the real close with it.
+			backend.releaseHistory();
+			await parked;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			expect(
+				reportedTxids(),
+				'the orphan never reclaims the verdict'
+			).to.deep.equal([close.getId()]);
+			expect(orphan).to.be.a('string');
 		});
 
 		it('drops pre-splice watches with the channel, and never resurrects one after stop', async () => {
@@ -1682,6 +1769,103 @@ describe('Phase 4: Chain Watcher', () => {
 				'armed against the recorded script, not the channel current one'
 			).to.equal(computeScriptHash(legScript));
 			node.destroy();
+		});
+
+		it('restoreChainWatches never leaves a signed-splice channel without an old-outpoint watch (issue #479)', async () => {
+			const {
+				LightningNode
+			} = require('../../src/lightning/node/lightning-node');
+			const {
+				createOpenerState
+			} = require('../../src/lightning/channel/channel-state');
+			const { Channel } = require('../../src/lightning/channel/channel');
+			const {
+				ChannelState,
+				DEFAULT_CHANNEL_CONFIG
+			} = require('../../src/lightning/channel/types');
+
+			const seed = crypto.randomBytes(32);
+			const basepoints = makeBasepoints(seed);
+			const mockBackend: IChainBackend = {
+				subscribeToHeaders: async () => {},
+				subscribeToScriptHash: async () => {},
+				getScriptHashHistory: async () => [],
+				getTransaction: async () => Buffer.alloc(0),
+				broadcastTransaction: async () => ''
+			};
+			const node = new LightningNode({
+				nodePrivateKey: crypto.randomBytes(32),
+				channelBasepoints: basepoints,
+				perCommitmentSeed: crypto.randomBytes(32),
+				fundingPrivkey: crypto.randomBytes(32),
+				chainBackend: mockBackend
+			});
+
+			// The crash shape: our splice tx_signatures left, so the peer can
+			// complete and broadcast, but no leg was ever recorded (a row
+			// written before the field existed, or any path that reaches the
+			// point of no return without one). Restoration must not come back
+			// watching only an outpoint that does not exist yet.
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 1_000_000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: basepoints,
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			state.state = ChannelState.SPLICING;
+			state.channelId = crypto.randomBytes(32);
+			state.fundingTxid = crypto.randomBytes(32);
+			state.fundingOutputIndex = 0;
+			state.remoteBasepoints = makeBasepoints(crypto.randomBytes(32));
+			state.preSpliceSpendWatches = undefined;
+			const spliceTx = new bitcoin.Transaction();
+			spliceTx.version = 2;
+			spliceTx.addInput(Buffer.from(state.fundingTxid), 0, 0xffffffff);
+			spliceTx.addOutput(
+				Buffer.from('0020' + '55'.repeat(32), 'hex'),
+				1_000_000
+			);
+			state.spliceInFlight = {
+				spliceTxid: Buffer.from(spliceTx.getId(), 'hex').reverse(),
+				newFundingOutputIndex: 0,
+				newFundingSatoshis: 1_000_000n,
+				spliceTxHex: spliceTx.toHex(),
+				fullySigned: false,
+				isInitiator: true,
+				localRelativeSatoshis: 0n,
+				remoteRelativeSatoshis: 0n,
+				remoteFundingPubkey: getPublicKey(crypto.randomBytes(32)),
+				ourSharedInputSig: Buffer.alloc(64),
+				ourWalletWitnesses: [],
+				ourWalletInputIndices: [],
+				inputPrevouts: [],
+				remoteCommitmentSig: crypto.randomBytes(64),
+				sentTxSignatures: true,
+				receivedTxSignatures: false,
+				localSpliceLocked: false,
+				remoteSpliceLocked: false,
+				confirmed: false
+			};
+			node
+				.getChannelManager()
+				.restoreChannel(new Channel(state), 'cafe'.repeat(16));
+
+			await node.restoreChainWatches();
+
+			const watched = (
+				node.getChainWatcher()! as unknown as {
+					watchedFundings: Map<string, unknown>;
+				}
+			).watchedFundings;
+			const oldTxid = Buffer.from(state.fundingTxid).reverse().toString('hex');
+			expect(
+				watched.has(
+					`${state.channelId.toString('hex')}:presplice:${oldTxid}:0`
+				),
+				'the superseded outpoint is watched'
+			).to.be.true;
 		});
 
 		it('should not create ChainWatcher when no backend provided', () => {
