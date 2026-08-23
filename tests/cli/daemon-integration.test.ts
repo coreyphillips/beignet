@@ -454,13 +454,18 @@ describe('Daemon: sendPaymentAsync route', () => {
 					'INVALID_PARAMS'
 				);
 
+				// A bolt11 that will never decode is INVALID_INVOICE, not a
+				// payment that failed. The route used to flatten every throw to
+				// PAYMENT_FAILED, which now answers 502 and would tell an agent
+				// to retry the same unparseable string forever (issue #471).
 				const resp2 = await httpPost(addr.port, '/invoice/pay-async', {
 					bolt11: 'invalid'
 				});
 				expect(resp2.body.ok).to.be.false;
 				expect((resp2.body.error as { code: string }).code).to.equal(
-					'PAYMENT_FAILED'
+					'INVALID_INVOICE'
 				);
+				expect(resp2.status).to.equal(400);
 			} finally {
 				await node.destroy();
 				server.close();

@@ -983,40 +983,64 @@ try {
 }
 ```
 
-Error codes (`BeignetErrorCode` enum):
+Error codes (`BeignetErrorCode` enum). The HTTP column is the status the daemon
+answers with: **4xx** when the request cannot be served as written, **409** when
+the node's own state conflicts with it, **502/504** when the trouble is upstream
+of us (the peer, the network), **503** when waiting genuinely changes the answer,
+and **500** only when the node itself failed. An agent can retry on 5xx and must
+not repeat a 4xx unchanged.
 
-| Code | Category | Description |
-|------|----------|-------------|
-| `WALLET_CREATE_FAILED` | Wallet | On-chain wallet initialization failed |
-| `ADDRESS_FAILED` | Wallet | Could not derive new address |
-| `SEND_FAILED` | Wallet | On-chain send failed |
-| `REFRESH_FAILED` | Wallet | Wallet sync failed |
-| `NOT_BOOSTABLE` | Wallet | Transaction cannot be fee-bumped (unknown, confirmed, or not RBF/CPFP-able) |
-| `NOTHING_TO_CONSOLIDATE` | Wallet | Consolidation needs at least two spendable UTXOs |
-| `PAYMENT_FAILED` | Payments | Lightning payment failed |
-| `PAYMENT_TIMEOUT` | Payments | Payment did not settle within timeout |
-| `INVOICE_EXPIRED` | Payments | Invoice has expired |
-| `NO_ROUTE` | Payments | No route found to destination |
-| `CHANNEL_NOT_FOUND` | Channels | Channel ID does not exist |
-| `CLOSE_FAILED` | Channels | Cooperative close failed |
-| `FORCE_CLOSE_FAILED` | Channels | Force close failed |
-| `ZERO_CONF_FAILED` | Channels | Zero-conf channel open failed |
-| `NODE_DESTROYED` | Node | Operation on destroyed node |
-| `INVALID_PARAMS` | Node | Missing or invalid request parameters |
-| `NOT_FOUND` | Node | Resource not found |
-| `BODY_TOO_LARGE` | Node | Request body exceeds 1MB |
-| `MNEMONIC_REQUIRES_AUTH` | Node | apiToken or apiKeys required for mnemonic access |
-| `UNAUTHORIZED` | Node | Invalid or missing auth token / API key (HTTP 401) |
-| `FORBIDDEN` | Node | Valid API key without the scope a route requires (HTTP 403) |
-| `INSUFFICIENT_BALANCE` | Payments | Not enough balance to send |
-| `PEER_NOT_CONNECTED` | Peers | Peer is not connected |
-| `DUPLICATE_PAYMENT` | Payments | Payment with this hash already pending |
-| `CHANNEL_NOT_READY` | Channels | Channel is not in NORMAL state |
-| `OPEN_FAILED` | Channels | Channel open failed |
-| `SPENDING_LIMIT_EXCEEDED` | Payments | Daily spending limit exceeded (permanent) |
-| `SERVICE_DRAINING` | Node | Node is draining — no new payments accepted (permanent) |
-| `IDEMPOTENCY_CONFLICT` | HTTP | Same idempotency key used with different request body |
-| `RATE_LIMITED` | HTTP | Too many requests (token bucket rate limiter) |
+| Code | Category | HTTP | Description |
+|------|----------|------|-------------|
+| `WALLET_CREATE_FAILED` | Wallet | 500 | On-chain wallet initialization failed |
+| `ADDRESS_FAILED` | Wallet | 500 | Could not derive new address |
+| `SEND_FAILED` | Wallet | 500 | On-chain send failed |
+| `REFRESH_FAILED` | Wallet | 500 | Wallet sync failed |
+| `NOT_BOOSTABLE` | Wallet | 409 | Transaction cannot be fee-bumped (unknown, confirmed, or not RBF/CPFP-able) |
+| `NOTHING_TO_CONSOLIDATE` | Wallet | 409 | Consolidation needs at least two spendable UTXOs |
+| `INSTANCE_ALREADY_RUNNING` | Wallet | n/a | Another instance holds the data-dir lock (startup only, never over HTTP) |
+| `PAYMENT_FAILED` | Payments | 502 | Lightning payment failed |
+| `PAYMENT_TIMEOUT` | Payments | 504 | Payment did not settle within timeout |
+| `INVOICE_EXPIRED` | Payments | 410 | Invoice has expired |
+| `NO_ROUTE` | Payments | 502 | No route found to destination |
+| `INVALID_INVOICE` | Payments | 400 | BOLT 11 string failed to parse |
+| `INVALID_OFFER` | Payments | 400 | BOLT 12 offer string failed to parse |
+| `INSUFFICIENT_BALANCE` | Payments | 409 | Not enough balance to send, or to fund the requested open |
+| `DUPLICATE_PAYMENT` | Payments | 409 | Payment with this hash already pending |
+| `SPENDING_LIMIT_EXCEEDED` | Payments | 403 | Daily spending limit exceeded (permanent) |
+| `CHANNEL_NOT_FOUND` | Channels | 404 | Channel ID does not exist |
+| `CHANNEL_NOT_READY` | Channels | 409 | Channel is not in NORMAL state |
+| `OPEN_FAILED` | Channels | 409 | Channel open failed |
+| `CLOSE_FAILED` | Channels | 500 | Cooperative close failed |
+| `FORCE_CLOSE_FAILED` | Channels | 500 | Force close failed |
+| `ZERO_CONF_FAILED` | Channels | 500 | Zero-conf channel open failed |
+| `FUNDING_PROVIDER_REQUIRED` | Channels | 409 | The node has no funding provider able to serve this open or splice |
+| `FEE_ESTIMATE_NOT_READY` | Channels | 503 | The fee estimator has not delivered its first sample; retry shortly |
+| `PEER_NOT_CONNECTED` | Peers | 409 | Peer is not connected |
+| `CONNECT_FAILED` | Peers | 502 | Dialing the peer failed |
+| `CONNECT_TIMEOUT` | Peers | 504 | The peer did not answer the dial in time |
+| `NODE_DESTROYED` | Node | 409 | Operation on destroyed node |
+| `INVALID_PARAMS` | Node | 400 | Missing or invalid request parameters |
+| `NOT_FOUND` | Node | 404 | Resource not found |
+| `BODY_TOO_LARGE` | Node | 413 | Request body exceeds 1MB |
+| `MNEMONIC_REQUIRES_AUTH` | Node | 403 | apiToken or apiKeys required for mnemonic access |
+| `UNAUTHORIZED` | Node | 401 | Invalid or missing auth token / API key |
+| `FORBIDDEN` | Node | 403 | Valid API key without the scope a route requires |
+| `SERVICE_DRAINING` | Node | 409 | Node is draining, no new payments accepted |
+| `IDEMPOTENCY_CONFLICT` | HTTP | 409 | Same idempotency key used with different request body |
+| `RATE_LIMITED` | HTTP | 429 | Too many requests (token bucket rate limiter) |
+
+`SEND_FAILED`, `CLOSE_FAILED`, `FORCE_CLOSE_FAILED`, `ZERO_CONF_FAILED` and the
+`PSBT_*` codes keep the 500 default on purpose: each covers both caller-state
+problems and genuine node faults, so no single status is honest until they are
+split.
+
+**Retryability is one decision, not two.** Every code answered with 502, 503 or
+504 is one `isRetryableError()` returns true for, and a test walks the status map
+to keep them from drifting apart. The status also reads the BOLT 4 failure code:
+a `PAYMENT_FAILED` carrying the PERM flag answers **409**, not `PAYMENT_FAILED`'s
+usual 502, because the payee refuses it every time. Failure bodies carry
+`failureCode` so a caller can make the same judgment itself.
 
 #### Typed Payment Errors (Lightning Layer)
 
@@ -1060,7 +1084,33 @@ try {
 }
 ```
 
-`InvalidChannelOpenError` is what an embedder driving a raw `LightningNode` catches (it is exported from `beignet/cli` too); on `BeignetNode` and over HTTP the refusal always arrives as `INVALID_PARAMS`.
+`InvalidChannelOpenError` is what an embedder driving a raw `LightningNode` catches (it is exported from `beignet/cli` too); on `BeignetNode` and over HTTP the refusal always arrives as `INVALID_PARAMS`. A splice refused the same way throws the sibling `InvalidSpliceError`, which converts identically.
+
+#### Typed Channel-Funding State Refusals (Lightning Layer)
+
+A request the node cannot serve for its **own** state or configuration is a different thing: the request is well formed, this node cannot serve it as things stand. `INVALID_PARAMS` would be a lie, so these throw a `ChannelFundingUnavailableError` carrying a `code`, and each code answers with a status of its own.
+
+| `ChannelFundingUnavailableCode` | Reaches the caller as | HTTP |
+|---|---|---|
+| `FUNDING_PROVIDER_REQUIRED` | `FUNDING_PROVIDER_REQUIRED` | 409 |
+| `INSUFFICIENT_BALANCE` | `INSUFFICIENT_BALANCE` | 409 |
+| `FEE_ESTIMATE_NOT_READY` | `FEE_ESTIMATE_NOT_READY` | 503 |
+| `CHANNEL_NOT_FOUND` | `CHANNEL_NOT_FOUND` | 404 |
+
+```typescript
+import { BeignetError, isRetryableError } from 'beignet/cli';
+
+try {
+  node.openChannel(peerPubkey, 100_000, undefined, 5, true); // max open
+} catch (err) {
+  if (err instanceof BeignetError && isRetryableError(err)) {
+    // FEE_ESTIMATE_NOT_READY: the estimator's first sample lands in
+    // milliseconds, so a retry succeeds. Everything else needs a decision.
+  }
+}
+```
+
+Node faults are still deliberately untyped, so they keep scrubbing to a generic **500** with the detail in the daemon log only.
 
 ---
 

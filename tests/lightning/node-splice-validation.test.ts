@@ -15,6 +15,11 @@ import {
 	spliceFeeSats
 } from '../../src/lightning/channel/splice-weight';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
+import {
+	InvalidSpliceError,
+	ChannelFundingUnavailableError,
+	ChannelFundingUnavailableCode
+} from '../../src/lightning/node/types';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -169,6 +174,52 @@ describe('LightningNode splice validation', function () {
 		expect(() =>
 			node.spliceOut(channelId, 10_000n, 2500, Buffer.alloc(0))
 		).to.throw('destinationScript must be a non-empty Buffer');
+		node.destroy();
+	});
+
+	/**
+	 * Issue #472: a splice refused for the caller's own arguments is typed, so
+	 * the CLI layer answers 400 with this message rather than letting the
+	 * daemon scrub it to a generic 500. An unknown channel is a state refusal
+	 * and carries its own code.
+	 */
+	it('types the splice argument refusals and the unknown channel', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const argumentRefusals: Array<[string, () => unknown]> = [
+			[
+				'short channelId',
+				(): unknown => node.spliceIn(Buffer.alloc(4), 10_000n, 2500)
+			],
+			['zero amount', (): unknown => node.spliceIn(channelId, 0n, 2500)],
+			['negative amount', (): unknown => node.spliceOut(channelId, -1n, 2500)],
+			[
+				'empty destinationScript',
+				(): unknown => node.spliceOut(channelId, 10_000n, 2500, Buffer.alloc(0))
+			],
+			[
+				'non-standard destinationScript',
+				(): unknown =>
+					node.spliceOut(
+						channelId,
+						10_000n,
+						2500,
+						Buffer.from([0x6a, 0x01, 0x00])
+					)
+			]
+		];
+		for (const [label, run] of argumentRefusals) {
+			expect(run, label).to.throw(InvalidSpliceError);
+		}
+		try {
+			node.spliceQuote(Buffer.alloc(32, 0xee), 'out', 2500);
+			expect.fail('expected the quote to be refused');
+		} catch (err: unknown) {
+			expect(err).to.be.instanceOf(ChannelFundingUnavailableError);
+			expect((err as ChannelFundingUnavailableError).code).to.equal(
+				ChannelFundingUnavailableCode.CHANNEL_NOT_FOUND
+			);
+		}
 		node.destroy();
 	});
 

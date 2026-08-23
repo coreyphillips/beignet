@@ -18,6 +18,11 @@ import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import {
+	InvalidChannelOpenError,
+	ChannelFundingUnavailableError,
+	ChannelFundingUnavailableCode
+} from '../../src/lightning/node/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 
 function makeBasepoints(): IChannelBasepoints {
@@ -170,6 +175,27 @@ describe('quoteDualFundingMaxOpen', function () {
 		wireProvider();
 		expect(() => node.quoteDualFundingMaxOpen(0)).to.throw(
 			'positive finite rate'
+		);
+	});
+
+	/**
+	 * Issue #471: the quote path carries the same two refusals as the open path
+	 * and used to scrub to a generic 500 the same way. The missing provider is
+	 * this node's configuration; the bad rate is the caller's argument.
+	 */
+	it('types both quote refusals so the daemon can answer honestly', function () {
+		try {
+			node.quoteDualFundingMaxOpen(2);
+			expect.fail('expected the quote to be refused');
+		} catch (err: unknown) {
+			expect(err).to.be.instanceOf(ChannelFundingUnavailableError);
+			expect((err as ChannelFundingUnavailableError).code).to.equal(
+				ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED
+			);
+		}
+		wireProvider();
+		expect(() => node.quoteDualFundingMaxOpen(0)).to.throw(
+			InvalidChannelOpenError
 		);
 	});
 });

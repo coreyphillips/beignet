@@ -512,6 +512,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'200': {
 							description: 'Channel info',
 							content: jsonContent({ $ref: '#/components/schemas/ChannelInfo' })
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: the request cannot be served as written (fractional amount, push toward a dual-fund peer, out-of-range feerate)'
+						},
+						'409': {
+							description:
+								'FUNDING_PROVIDER_REQUIRED or INSUFFICIENT_BALANCE: the node cannot fund this open as things stand'
+						},
+						'503': {
+							description:
+								'FEE_ESTIMATE_NOT_READY: the estimator has not sampled yet, retry shortly'
 						}
 					}
 				}
@@ -763,6 +775,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'200': {
 							description: 'Peer info',
 							content: jsonContent({ $ref: '#/components/schemas/PeerInfo' })
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: malformed pubkey, host without port, or host/port contradicting the ws url'
+						},
+						'502': { description: 'CONNECT_FAILED: the dial failed' },
+						'504': {
+							description: 'CONNECT_TIMEOUT: the peer did not answer in time'
 						}
 					}
 				}
@@ -1136,7 +1156,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								$ref: '#/components/schemas/PaymentEstimate'
 							})
 						},
-						'400': { description: 'Invalid params or no route' }
+						'400': { description: 'Invalid params' },
+						'502': { description: 'NO_ROUTE, no path to the destination' }
 					}
 				}
 			},
@@ -1259,7 +1280,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								$ref: '#/components/schemas/RouteQueryResult'
 							})
 						},
-						'400': { description: 'No route or fee exceeds maximum' }
+						'409': {
+							description:
+								'FEE_EXCEEDS_MAX, the route costs more than maxFeeSats'
+						},
+						'502': { description: 'NO_ROUTE, no path to the destination' }
 					}
 				}
 			},
@@ -1657,9 +1682,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Boost result',
 							content: jsonContent({ $ref: '#/components/schemas/BoostResult' })
 						},
-						'400': {
+						'400': { description: 'Invalid params' },
+						'409': {
 							description:
-								'NOT_BOOSTABLE (unknown/confirmed/non-RBF tx; try /tx/boost for CPFP) or invalid params'
+								'NOT_BOOSTABLE (unknown/confirmed/non-RBF tx; try /tx/boost for CPFP)'
 						}
 					}
 				}
@@ -1678,9 +1704,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Boost result',
 							content: jsonContent({ $ref: '#/components/schemas/BoostResult' })
 						},
-						'400': {
-							description: 'NOT_BOOSTABLE or invalid params'
-						}
+						'400': { description: 'Invalid params' },
+						'409': { description: 'NOT_BOOSTABLE' }
 					}
 				}
 			},
@@ -1712,9 +1737,9 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								$ref: '#/components/schemas/ConsolidateResult'
 							})
 						},
-						'400': {
-							description:
-								'NOTHING_TO_CONSOLIDATE (fewer than 2 UTXOs) or invalid params'
+						'400': { description: 'Invalid params' },
+						'409': {
+							description: 'NOTHING_TO_CONSOLIDATE (fewer than 2 UTXOs)'
 						}
 					}
 				}
@@ -1877,7 +1902,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Fee snapshot',
 							content: jsonContent({ $ref: '#/components/schemas/FeeSnapshot' })
 						},
-						'400': { description: 'No fee samples recorded yet' }
+						'404': { description: 'NO_DATA, no fee samples recorded yet' }
 					}
 				}
 			},
@@ -2290,6 +2315,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'200': {
 							description: 'Channel info',
 							content: jsonContent({ $ref: '#/components/schemas/ChannelInfo' })
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: the request cannot be served as written (fractional amount, push toward a dual-fund peer, out-of-range feerate)'
+						},
+						'409': {
+							description:
+								'FUNDING_PROVIDER_REQUIRED or INSUFFICIENT_BALANCE: the node cannot fund this open as things stand'
+						},
+						'503': {
+							description:
+								'FEE_ESTIMATE_NOT_READY: the estimator has not sampled yet, retry shortly'
 						}
 					}
 				}
@@ -2309,6 +2346,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'200': {
 							description: 'Channel info',
 							content: jsonContent({ $ref: '#/components/schemas/ChannelInfo' })
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: the request cannot be served as written (fractional amount, push toward a dual-fund peer, out-of-range feerate)'
+						},
+						'409': {
+							description:
+								'FUNDING_PROVIDER_REQUIRED or INSUFFICIENT_BALANCE: the node cannot fund this open as things stand'
+						},
+						'503': {
+							description:
+								'FEE_ESTIMATE_NOT_READY: the estimator has not sampled yet, retry shortly'
 						}
 					}
 				}
@@ -2387,7 +2436,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									}
 								}
 							})
-						}
+						},
+						'409': {
+							description:
+								'FUNDING_PROVIDER_REQUIRED: no funding provider able to quote a splice-in'
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: malformed channelId, non-integer amount, or a feeratePerkw outside 1..4294967295'
+						},
+						'404': { description: 'CHANNEL_NOT_FOUND' }
 					}
 				}
 			},
@@ -2406,7 +2464,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/SpliceResult'
 							})
-						}
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: malformed channelId, non-integer amount, or a feeratePerkw outside 1..4294967295'
+						},
+						'404': { description: 'CHANNEL_NOT_FOUND' }
 					}
 				}
 			},
@@ -2425,7 +2488,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/SpliceResult'
 							})
-						}
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: malformed channelId, non-integer amount, or a feeratePerkw outside 1..4294967295'
+						},
+						'404': { description: 'CHANNEL_NOT_FOUND' }
 					}
 				}
 			},

@@ -95,7 +95,12 @@ import {
 } from '../lightning/recovery';
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
-import { INodeConfig, InvalidChannelOpenError } from '../lightning/node/types';
+import {
+	INodeConfig,
+	InvalidRequestError,
+	ChannelFundingUnavailableError,
+	ChannelFundingUnavailableCode
+} from '../lightning/node/types';
 import {
 	BITCOIN_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
@@ -603,19 +608,43 @@ export function decodeOfferInput(
 }
 
 /**
- * Run a channel open, converting the engine's argument refusals into a typed
- * INVALID_PARAMS (400) that keeps their message. The daemon only passes a
- * BeignetError through; anything else is logged as an unhandled fault and
- * scrubbed to a generic 500, which hid honest, actionable refusals such as a
- * push toward a dual-fund peer (issue #464). Node faults are deliberately not
- * converted: they still scrub.
+ * The code a refusal the node cannot currently serve reaches the caller as.
+ * INVALID_PARAMS would be a lie for every one of these: the request is well
+ * formed, this node cannot serve it as things stand (issue #471).
  */
-function openOrRefuse<T>(open: () => T): T {
+const FUNDING_UNAVAILABLE_CODES: Record<
+	ChannelFundingUnavailableCode,
+	BeignetErrorCode
+> = {
+	[ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED]:
+		BeignetErrorCode.FUNDING_PROVIDER_REQUIRED,
+	[ChannelFundingUnavailableCode.INSUFFICIENT_BALANCE]:
+		BeignetErrorCode.INSUFFICIENT_BALANCE,
+	[ChannelFundingUnavailableCode.FEE_ESTIMATE_NOT_READY]:
+		BeignetErrorCode.FEE_ESTIMATE_NOT_READY,
+	[ChannelFundingUnavailableCode.CHANNEL_NOT_FOUND]:
+		BeignetErrorCode.CHANNEL_NOT_FOUND
+};
+
+/**
+ * Run a channel-funding request (open, quote or splice), converting the engine's
+ * typed refusals into BeignetErrors that keep their message. The daemon only
+ * passes a BeignetError through; anything else is logged as an unhandled fault
+ * and scrubbed to a generic 500, which hid honest, actionable refusals such as a
+ * push toward a dual-fund peer (issue #464) or a max open on an empty wallet
+ * (issue #471). Refusals about the caller's arguments answer INVALID_PARAMS
+ * (400); refusals about this node's state or configuration answer a code of
+ * their own. Node faults are deliberately not converted: they still scrub.
+ */
+function fundingOrRefuse<T>(run: () => T): T {
 	try {
-		return open();
+		return run();
 	} catch (err: unknown) {
-		if (err instanceof InvalidChannelOpenError) {
+		if (err instanceof InvalidRequestError) {
 			throw new BeignetError(BeignetErrorCode.INVALID_PARAMS, err.message);
+		}
+		if (err instanceof ChannelFundingUnavailableError) {
+			throw new BeignetError(FUNDING_UNAVAILABLE_CODES[err.code], err.message);
 		}
 		throw err;
 	}
@@ -743,6 +772,74 @@ function requirePositiveFiniteNumber(value: unknown, field: string): number {
 		);
 	}
 	return value;
+}
+
+/**
+ * The funding amounts every channel-open entry point takes. Guard before
+ * BigInt(): a fractional amount throws an uncaught RangeError, and a string
+ * amount reaches the spend-limit math where + concatenates instead of adding.
+ * Shared so no open path can be added without them (issue #472); zero is left
+ * to the engine, which refuses it as a caller-argument refusal.
+ */
+function requireOpenAmounts(amountSats: unknown, pushSats?: unknown): void {
+	if (typeof amountSats !== 'number' || !Number.isSafeInteger(amountSats)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'amountSats must be an integer number of satoshis'
+		);
+	}
+	if (amountSats < 0) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'amountSats must be >= 0'
+		);
+	}
+	if (
+		pushSats !== undefined &&
+		(typeof pushSats !== 'number' ||
+			!Number.isSafeInteger(pushSats) ||
+			pushSats < 0)
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'pushSats must be a non-negative integer number of satoshis'
+		);
+	}
+}
+
+/**
+ * A value the wire carries as a u32 (feerate_perkw, locktime). Buffer's
+ * writeUInt32BE truncates 1.5 to 1 and throws on 2^32, and both happen after
+ * the channel's state machine has moved, so the bound is enforced here.
+ */
+function requireU32(value: unknown, field: string, min = 1): number {
+	if (
+		typeof value !== 'number' ||
+		!Number.isInteger(value) ||
+		value < min ||
+		value > 0xffffffff
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be an integer between ${min} and 4294967295`
+		);
+	}
+	return value;
+}
+
+/**
+ * A 32-byte channel id as hex. Buffer.from(x, 'hex') silently truncates at the
+ * first non-hex character, so an unchecked id reaches the engine as a short
+ * buffer and reads as a malformed-argument fault rather than a bad request.
+ */
+function requireChannelIdHex(value: unknown, field = 'channelId'): Buffer {
+	if (typeof value !== 'string' || !/^[0-9a-fA-F]{64}$/.test(value)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be a 64-character hex channel id`
+		);
+	}
+	return Buffer.from(value, 'hex');
 }
 
 export class BeignetNode extends EventEmitter {
@@ -3513,7 +3610,9 @@ export class BeignetNode extends EventEmitter {
 
 		const { peerKnown, dualFund } = this.node.peerFundingInfo(peerPubkey);
 		if (dualFund) {
-			const quote = this.node.quoteDualFundingMaxOpen(satsPerByte);
+			const quote = fundingOrRefuse(() =>
+				this.node.quoteDualFundingMaxOpen(satsPerByte)
+			);
 			return {
 				method: 'v2',
 				peerKnown,
@@ -4016,6 +4115,12 @@ export class BeignetNode extends EventEmitter {
 			await Promise.race([connectPromise, timeoutPromise]);
 		} catch (err) {
 			if (err instanceof BeignetError) throw err;
+			// A malformed pubkey or an unpaired host/port is the caller's own
+			// request, not a dial that failed: CONNECT_FAILED answers 502 and
+			// tells an agent to retry something that can never succeed.
+			if (err instanceof InvalidRequestError) {
+				throw new BeignetError(BeignetErrorCode.INVALID_PARAMS, err.message);
+			}
 			// Wrap raw transport/handshake failures so callers get a clean error
 			// instead of an uncaught socket exception. A mid-handshake close almost
 			// always means a wrong node pubkey or a non-LN address/port.
@@ -4137,33 +4242,11 @@ export class BeignetNode extends EventEmitter {
 		max = false,
 		trusted = false
 	): ChannelInfo {
-		// Guard before BigInt(): a fractional amount throws an uncaught
-		// RangeError, and a string amount reaches the spend-limit math where
-		// + concatenates instead of adding.
-		if (typeof amountSats !== 'number' || !Number.isSafeInteger(amountSats)) {
-			throw new BeignetError(
-				'INVALID_PARAMS',
-				'amountSats must be an integer number of satoshis'
-			);
-		}
-		if (amountSats < 0) {
-			throw new BeignetError('INVALID_PARAMS', 'amountSats must be >= 0');
-		}
-		if (
-			pushSats !== undefined &&
-			(typeof pushSats !== 'number' ||
-				!Number.isSafeInteger(pushSats) ||
-				pushSats < 0)
-		) {
-			throw new BeignetError(
-				'INVALID_PARAMS',
-				'pushSats must be a non-negative integer number of satoshis'
-			);
-		}
+		requireOpenAmounts(amountSats, pushSats);
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
 			pushSats !== undefined ? BigInt(pushSats) * 1000n : undefined;
-		const channel = openOrRefuse(() =>
+		const channel = fundingOrRefuse(() =>
 			this.node.openChannel(
 				pubkey,
 				fundingSatoshis,
@@ -5969,10 +6052,11 @@ export class BeignetNode extends EventEmitter {
 		amountSats: number,
 		pushSats?: number
 	): ChannelInfo {
+		requireOpenAmounts(amountSats, pushSats);
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
 			pushSats !== undefined ? BigInt(pushSats) * 1000n : undefined;
-		const channel = openOrRefuse(() =>
+		const channel = fundingOrRefuse(() =>
 			this.node.openZeroConfChannel(peerPubkey, fundingSatoshis, pushMsat)
 		);
 		if (!channel) {
@@ -6007,7 +6091,14 @@ export class BeignetNode extends EventEmitter {
 			locktime?: number;
 		}
 	): ChannelInfo {
-		const channel = openOrRefuse(() =>
+		requireOpenAmounts(params.amountSats);
+		if (params.fundingFeeratePerkw !== undefined)
+			requireU32(params.fundingFeeratePerkw, 'fundingFeeratePerkw');
+		if (params.commitmentFeeratePerkw !== undefined)
+			requireU32(params.commitmentFeeratePerkw, 'commitmentFeeratePerkw');
+		if (params.locktime !== undefined)
+			requireU32(params.locktime, 'locktime', 0);
+		const channel = fundingOrRefuse(() =>
 			this.node.openChannelV2(peerPubkey, {
 				fundingSatoshis: BigInt(params.amountSats),
 				fundingFeeratePerkw: params.fundingFeeratePerkw,
@@ -6037,10 +6128,10 @@ export class BeignetNode extends EventEmitter {
 		direction: 'in' | 'out',
 		feeratePerkw: number
 	): ReturnType<LightningNode['spliceQuote']> {
-		return this.node.spliceQuote(
-			Buffer.from(channelId, 'hex'),
-			direction,
-			feeratePerkw
+		const idBuf = requireChannelIdHex(channelId);
+		requireU32(feeratePerkw, 'feeratePerkw');
+		return fundingOrRefuse(() =>
+			this.node.spliceQuote(idBuf, direction, feeratePerkw)
 		);
 	}
 
@@ -6049,8 +6140,12 @@ export class BeignetNode extends EventEmitter {
 		amountSats: number,
 		feeratePerkw: number
 	): SpliceResult {
-		const idBuf = Buffer.from(channelId, 'hex');
-		const result = this.node.spliceIn(idBuf, BigInt(amountSats), feeratePerkw);
+		const idBuf = requireChannelIdHex(channelId);
+		requirePositiveSafeInteger(amountSats, 'amountSats');
+		requireU32(feeratePerkw, 'feeratePerkw');
+		const result = fundingOrRefuse(() =>
+			this.node.spliceIn(idBuf, BigInt(amountSats), feeratePerkw)
+		);
 		// The SCB is refreshed on the splice:complete event (when fundingTxid holds
 		// the new outpoint), NOT here at initiation where it still holds the old one.
 		return result;
@@ -6062,20 +6157,35 @@ export class BeignetNode extends EventEmitter {
 		feeratePerkw: number,
 		destinationAddress?: string
 	): SpliceResult {
-		const idBuf = Buffer.from(channelId, 'hex');
+		const idBuf = requireChannelIdHex(channelId);
+		requirePositiveSafeInteger(amountSats, 'amountSats');
+		requireU32(feeratePerkw, 'feeratePerkw');
 		let destinationScript: Buffer | undefined;
 		if (destinationAddress) {
 			const bitcoin = require('bitcoinjs-lib');
-			destinationScript = bitcoin.address.toOutputScript(
-				destinationAddress,
-				this.getBitcoinNetwork()
-			);
+			try {
+				destinationScript = bitcoin.address.toOutputScript(
+					destinationAddress,
+					this.getBitcoinNetwork()
+				);
+			} catch (err: unknown) {
+				// An address this network cannot decode is the caller's typo,
+				// not a node fault: refuse it rather than scrubbing to a 500.
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					`destinationAddress is not a valid address for this network: ${
+						err instanceof Error ? err.message : 'failed to decode'
+					}`
+				);
+			}
 		}
-		const result = this.node.spliceOut(
-			idBuf,
-			BigInt(amountSats),
-			feeratePerkw,
-			destinationScript
+		const result = fundingOrRefuse(() =>
+			this.node.spliceOut(
+				idBuf,
+				BigInt(amountSats),
+				feeratePerkw,
+				destinationScript
+			)
 		);
 		// The SCB is refreshed on the splice:complete event (when fundingTxid holds
 		// the new outpoint), NOT here at initiation where it still holds the old one.

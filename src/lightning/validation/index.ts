@@ -87,6 +87,24 @@ export function validatePositiveBigint(
 }
 
 /**
+ * Validate a value carried on the wire as a u32 (feerate_perkw, locktime).
+ * Anything else is rejected HERE rather than at encode time: writeUInt32BE
+ * silently truncates 1.5 to 1, and throws on 2^32 after the caller's state
+ * machine has already moved, which wedges a channel (issue #475 review).
+ * Returns null on success, error string on failure.
+ */
+export function validateU32(
+	value: number,
+	name: string,
+	{ min = 0 }: { min?: number } = {}
+): string | null {
+	if (!Number.isInteger(value) || value < min || value > 0xffffffff) {
+		return `${name} must be an integer between ${min} and 4294967295, got ${value}`;
+	}
+	return null;
+}
+
+/**
  * Validate a TCP port number (1-65535).
  * Returns null on success, error string on failure.
  */

@@ -12,7 +12,11 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { InvalidChannelOpenError } from '../../src/lightning/node/types';
+import {
+	InvalidChannelOpenError,
+	ChannelFundingUnavailableError,
+	ChannelFundingUnavailableCode
+} from '../../src/lightning/node/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
@@ -205,6 +209,16 @@ describe('Issue #158: openChannel routes v1 vs v2 by peer features', function ()
 		expect(() => node.openChannel(peerPubkey, 100_000n)).to.throw(
 			/fee estimate not ready/i
 		);
+		// Issue #471: retryable, and typed as such, so it can answer 503
+		// instead of the 500 an unsampled estimator used to produce.
+		try {
+			node.openChannel(peerPubkey, 100_000n);
+		} catch (err: unknown) {
+			expect(err).to.be.instanceOf(ChannelFundingUnavailableError);
+			expect((err as ChannelFundingUnavailableError).code).to.equal(
+				ChannelFundingUnavailableCode.FEE_ESTIMATE_NOT_READY
+			);
+		}
 		expect(v2Calls.length).to.equal(0);
 		saved.destroy();
 	});
@@ -376,6 +390,62 @@ describe('Issue #158: openChannel routes v1 vs v2 by peer features', function ()
 		expect(() =>
 			node.openChannel(peerPubkey, 100_000n, undefined, 5, true)
 		).to.throw(/insufficient funds for a max dual-funded open/i);
+		expect(v2Calls.length).to.equal(0);
+	});
+
+	/**
+	 * Issue #471: these three are refused for the NODE's state or configuration,
+	 * not the caller's arguments, so INVALID_PARAMS would be a lie. Each carries
+	 * a code of its own; untyped, all three scrubbed to a generic 500 and the
+	 * message survived only in the daemon log.
+	 */
+	it('types the state and config refusals with a code (issue #471)', function () {
+		wirePeer(true);
+		const noProvider = (): unknown =>
+			node.openChannel(peerPubkey, 100_000n, undefined, 5, true);
+		const emptyWallet = (): unknown => {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(node as any).fundingProvider = {
+				quoteDualFundingMax: () => ({
+					fundingSatoshis: 0n,
+					spendableSats: 100n,
+					feeSats: 700n,
+					inputCount: 1
+				}),
+				selectMaxDualFundingInputs: async () => ({
+					inputs: [],
+					changeScript: Buffer.alloc(0)
+				})
+			};
+			return node.openChannel(peerPubkey, 100_000n, undefined, 5, true);
+		};
+		const cases: Array<[string, () => unknown, ChannelFundingUnavailableCode]> =
+			[
+				[
+					'no funding provider',
+					noProvider,
+					ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED
+				],
+				[
+					'empty wallet',
+					emptyWallet,
+					ChannelFundingUnavailableCode.INSUFFICIENT_BALANCE
+				]
+			];
+		for (const [label, run, code] of cases) {
+			try {
+				run();
+				expect.fail(`${label}: expected a refusal`);
+			} catch (err: unknown) {
+				expect(err, label).to.be.instanceOf(ChannelFundingUnavailableError);
+				expect((err as ChannelFundingUnavailableError).code, label).to.equal(
+					code
+				);
+				// A state refusal is not an argument refusal: keeping them apart
+				// is what stops a 400 from being answered for either one.
+				expect(err, label).to.not.be.instanceOf(InvalidChannelOpenError);
+			}
+		}
 		expect(v2Calls.length).to.equal(0);
 	});
 

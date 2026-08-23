@@ -41,6 +41,10 @@ export enum BeignetErrorCode {
 	DUPLICATE_PAYMENT = 'DUPLICATE_PAYMENT',
 	CHANNEL_NOT_READY = 'CHANNEL_NOT_READY',
 	OPEN_FAILED = 'OPEN_FAILED',
+	/** The node has no funding provider able to serve this open or splice. */
+	FUNDING_PROVIDER_REQUIRED = 'FUNDING_PROVIDER_REQUIRED',
+	/** The fee estimator has not delivered its first sample; retry shortly. */
+	FEE_ESTIMATE_NOT_READY = 'FEE_ESTIMATE_NOT_READY',
 
 	// Budget
 	SPENDING_LIMIT_EXCEEDED = 'SPENDING_LIMIT_EXCEEDED',
@@ -100,18 +104,40 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.BODY_TOO_LARGE,
 		BeignetErrorCode.MNEMONIC_REQUIRES_AUTH,
 		BeignetErrorCode.SPENDING_LIMIT_EXCEEDED,
-		BeignetErrorCode.SERVICE_DRAINING
+		BeignetErrorCode.SERVICE_DRAINING,
+		// A node with no funding provider will not grow one on a retry.
+		BeignetErrorCode.FUNDING_PROVIDER_REQUIRED
 	]);
 	if (permanentCodes.has(err.code)) return false;
 
 	// BOLT 4 PERM flag (0x4000) — permanent failure
 	if (err.failureCode !== undefined && err.failureCode & 0x4000) return false;
 
-	// Retryable error codes
+	// Retryable error codes. Every code the daemon answers with a 502/503/504
+	// must be in here: those statuses tell a caller to try again, and a
+	// permanent failure that reads as retryable is worse than no code at all.
+	// A test walks the status map and fails if the two ever disagree.
 	const retryableCodes: Set<string> = new Set([
 		BeignetErrorCode.PAYMENT_TIMEOUT,
 		BeignetErrorCode.PEER_NOT_CONNECTED,
-		BeignetErrorCode.NO_ROUTE
+		BeignetErrorCode.NO_ROUTE,
+		// The estimator's seed lands within milliseconds of construction.
+		BeignetErrorCode.FEE_ESTIMATE_NOT_READY,
+		// A peer that is down or slow now can be up on the next attempt. These
+		// only read as permanent before because they fell through the default.
+		BeignetErrorCode.CONNECT_FAILED,
+		BeignetErrorCode.CONNECT_TIMEOUT,
+		// Reaching an upstream (the fee source, an L402 target, a guardian
+		// quorum) failed; the next attempt reaches a different world.
+		'FEE_ESTIMATE_FAILED',
+		'L402_FETCH_FAILED',
+		'RESTORE_HEAD_UNVERIFIABLE',
+		'RECOVERY_UNAVAILABLE',
+		// Recovery holds that resolve on their own or on a restart.
+		'NODE_RESTORE_PENDING',
+		'NODE_RESTART_REQUIRED',
+		'RESTORE_NO_QUORUM',
+		'RESTORE_CAS_EXHAUSTED'
 	]);
 	if (retryableCodes.has(err.code)) return true;
 
