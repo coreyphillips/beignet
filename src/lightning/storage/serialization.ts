@@ -450,6 +450,7 @@ export interface ISerializedChannelState {
 	preSpliceSpendWatches?: Array<{
 		txid: string;
 		outputIndex: number;
+		script: string;
 		spliceTxid: string;
 	}>;
 	// Issue #469: this row came from a Recovery Capsule, whose recency nothing

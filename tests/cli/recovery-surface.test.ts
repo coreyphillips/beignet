@@ -493,6 +493,23 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 			/acceptStaleStateRisk/
 		);
 
+		// Buffer.from(x, 'hex') is case insensitive and truncates at the first
+		// non-hex pair, so the caller's spelling is not an identity: these all
+		// resolve to the SAME channel and must all hit the same refusal.
+		for (const spelling of [
+			channelId.toUpperCase(),
+			`${channelId}zz`,
+			channelId.slice(0, 63)
+		]) {
+			const res = await request(portOf(daemon), 'POST', '/channel/forceclose', {
+				channelId: spelling
+			});
+			expect(res.status, `spelling ${spelling.slice(0, 8)}`).to.equal(400);
+			expect((res.body.error as { code: string }).code).to.equal(
+				'INVALID_PARAMS'
+			);
+		}
+
 		// With the acknowledgement it is allowed through to the engine, which
 		// is the point: the hold is never a refusal to the operator.
 		const accepted = await request(

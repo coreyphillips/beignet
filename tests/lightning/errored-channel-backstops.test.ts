@@ -503,6 +503,49 @@ describe('Issue #469: a capsule-restored channel holds its automatic closes', fu
 		fx.bob.destroy();
 	});
 
+	it('takes no new HTLCs in either direction', () => {
+		const fx = setupUnprovenChannel(85);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+
+		// Outbound: the channel itself refuses, so nothing can put a new
+		// obligation on a channel whose on-chain backstops are disarmed.
+		const actions = chan.addHtlc(
+			50_000n,
+			crypto.randomBytes(32),
+			HEIGHT + 100,
+			Buffer.alloc(1366)
+		);
+		const refusal = actions.find((a: any) => a.type === 'ERROR');
+		expect(refusal, 'the add is refused').to.not.equal(undefined);
+		expect(refusal.message).to.match(/Recovery Capsule/);
+		expect(chan.getFullState().htlcs.size).to.equal(0);
+
+		// Inbound: accepted onto the commitment as BOLT 2 requires, then
+		// failed straight back rather than settled or forwarded. Settling
+		// would reveal a preimage against a peer we could never escalate
+		// against.
+		const failed: bigint[] = [];
+		const mgr = (fx.alice as any).channelManager;
+		mgr.failHtlc = (_id: Buffer, htlcId: bigint): void => {
+			failed.push(htlcId);
+		};
+		addHtlc(fx.alice, fx.channelId, 'received-11', {
+			id: 11n,
+			cltvExpiry: HEIGHT + 100
+		});
+		(fx.alice as any).handleIncomingHtlc(
+			fx.channelId,
+			11n,
+			50_000n,
+			crypto.randomBytes(32)
+		);
+		expect(failed, 'the inbound HTLC is failed back').to.deep.equal([11n]);
+
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
 	it('reports the hold on the recovery status', () => {
 		const fx = setupUnprovenChannel(81);
 

@@ -1024,7 +1024,7 @@ describe('Recovery phase 3: capsule restore', () => {
 // ─────────────── 5. Acceptance: restore + reestablish + pay ───────────────
 
 describe('Recovery phase 3: end to end restore from the capsule alone', () => {
-	it('restores a small node, resumes the channel via reestablish, and pays', function () {
+	it('restores a small node and resumes the channel via reestablish, holding it against new HTLCs', function () {
 		this.timeout(30_000);
 
 		// A journaled node with one live channel and an invoice.
@@ -1141,13 +1141,27 @@ describe('Recovery phase 3: end to end restore from the capsule alone', () => {
 			'and it is still on disk for the next restart'
 		).to.equal(true);
 
+		// The channel came back whole: its balance is intact and nothing was
+		// force closed, which is what a Tier 2 restore is for and what
+		// separates it from the SCB/DLP path.
+		expect(restoredChannel.getFullState().localBalanceMsat).to.equal(
+			1_000_000_000n
+		);
+
+		// It takes no NEW HTLCs though (issue #469). Every automatic close is
+		// refused while the hold stands, so the on-chain claim the HTLC
+		// deadline backstops exist to make can never happen, and settling a
+		// payment here would be accepting an obligation this node has decided
+		// it cannot enforce. The safe exits stay open: the peer closing, a
+		// cooperative close (no revocation, so a stale state cannot be
+		// penalized), or the operator's acknowledged force close.
 		buildDirectGraph(restored);
 		const invoice = bob.createInvoice({
 			amountMsat: 50_000n,
 			description: 'post-restore'
 		});
 		const payment = restored.sendPayment(invoice.bolt11);
-		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
 
 		restored.destroy();
 		bob.destroy();

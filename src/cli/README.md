@@ -1328,7 +1328,10 @@ beignet channel open-v2 <pubkey> <sats> [fundingFeeratePerkw]
 beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
 beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
 beignet channel close <channelId>
-beignet channel forceclose <channelId>
+beignet channel forceclose <channelId> [--accept-stale-state-risk]
+# A channel restored from a Recovery Capsule refuses a force close without the
+# flag: its state cannot be proven current, so if the peer holds a newer one the
+# broadcast is revoked and the whole channel balance goes to the justice path.
 beignet channel rebroadcast-close <channelId>
 beignet channel splice-in <channelId> <sats> <feeratePerkw>
 beignet channel splice-out <channelId> <sats> <feeratePerkw>

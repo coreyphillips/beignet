@@ -7374,11 +7374,15 @@ export class LightningNode extends EventEmitter {
 			// transaction confirming, so this list is the only thing that can
 			// bring the watch back (issue #479).
 			for (const leg of state.preSpliceSpendWatches ?? []) {
+				// The leg's OWN script, never the channel's current one: a
+				// splice may rotate the peer's funding pubkey, so recomputing
+				// it here would subscribe to a script hash the superseded
+				// output never paid and the breach would be invisible.
 				await this.chainWatcher.watchFundingSpendDuringSplice(
 					state.channelId || state.temporaryChannelId,
 					leg.txid,
 					leg.outputIndex,
-					fundingScript,
+					Buffer.from(leg.script, 'hex'),
 					leg.spliceTxid,
 					generation
 				);
@@ -7414,26 +7418,12 @@ export class LightningNode extends EventEmitter {
 				// broadcasts an old commitment) is detected. The splice tx itself
 				// spends the old output legitimately, so it is ignored. state.fundingTxid
 				// still holds the OLD outpoint until completeSplice swaps it.
-				const supersededTxid = Buffer.from(state.fundingTxid)
-					.reverse()
-					.toString('hex');
-				await this.chainWatcher.watchFundingSpendDuringSplice(
-					state.channelId || state.temporaryChannelId,
-					supersededTxid,
-					state.fundingOutputIndex,
-					fundingScript,
-					spliceTxidHex
-				);
-				// Also recorded durably here, so a row written before the field
-				// existed starts carrying it, and so the NEXT restart still
-				// finds the outpoint once completeSplice has cleared
-				// spliceInFlight (issue #479).
-				this.recordPreSpliceSpendWatch(
-					state.channelId || state.temporaryChannelId,
-					supersededTxid,
-					state.fundingOutputIndex,
-					spliceTxidHex
-				);
+				// The pre-splice leg is NOT armed here. The channel records it
+				// durably, with its own script, in the batch that authorizes
+				// the splice broadcast, and the loop above re-arms every
+				// recorded leg (issue #479). Deriving one here instead would
+				// rebuild the script from the channel's CURRENT funding keys,
+				// which a splice may have rotated.
 				if (inflight.fullySigned && this.isCurrentChainStartup(generation)) {
 					// Through the ACTION path, never straight at the backend. A
 					// splice creates a funding output exactly as an open does, so
@@ -7526,37 +7516,6 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Remember, durably, that this superseded funding outpoint still needs a
-	 * spend watch, and which transaction is expected to spend it (issue #479).
-	 *
-	 * Idempotent per outpoint: re-arming the same leg (a restart, a retried
-	 * watch:funding) must not grow the list. Persisted through the ordinary
-	 * channel persist, so a failure here costs the NEXT restart its watch and
-	 * nothing else.
-	 */
-	private recordPreSpliceSpendWatch(
-		channelId: Buffer,
-		txid: string,
-		outputIndex: number,
-		spliceTxid: string
-	): void {
-		const channel = this.channelManager.getChannel(channelId);
-		if (!channel) return;
-		const state = channel.getFullState();
-		const existing = state.preSpliceSpendWatches ?? [];
-		if (
-			existing.some((w) => w.txid === txid && w.outputIndex === outputIndex)
-		) {
-			return;
-		}
-		state.preSpliceSpendWatches = [
-			...existing,
-			{ txid, outputIndex, spliceTxid }
-		];
-		this.persistChannel(channelId);
-	}
-
-	/**
 	 * The watcher retired a pre-splice spend watch because the transaction it
 	 * was ignoring is irrevocably confirmed as that outpoint's spender. Drop
 	 * the durable record with it, so the list stays empty on a channel with no
@@ -7624,39 +7583,21 @@ export class LightningNode extends EventEmitter {
 					state.minimumDepth ?? 3,
 					spliceFunding.p2wshOutput
 				);
-				if (state.fundingTxid && state.remoteBasepoints) {
-					const oldFundingScript = isTaprootChannel(state.channelType)
-						? createTaprootFundingScript(
-								state.localBasepoints.fundingPubkey,
-								state.remoteBasepoints.fundingPubkey,
-								btcNetwork
-						  ).p2trOutput
-						: createFundingScript(
-								state.localBasepoints.fundingPubkey,
-								state.remoteBasepoints.fundingPubkey,
-								btcNetwork
-						  ).p2wshOutput;
-					const supersededTxid = Buffer.from(state.fundingTxid)
-						.reverse()
-						.toString('hex');
+				// Spend detection on the superseded outpoint comes from the
+				// channel's own durable record, which was written in the batch
+				// that authorized this broadcast (issue #479). Reading state
+				// here instead would be racing it: on a zero-conf channel
+				// splice_locked leaves in that same batch, so by the time this
+				// handler runs completeSplice may already have adopted the new
+				// funding, and both the outpoint and the funding keys read
+				// post-splice.
+				for (const leg of state.preSpliceSpendWatches ?? []) {
 					await this.chainWatcher.watchFundingSpendDuringSplice(
 						channelId,
-						supersededTxid,
-						state.fundingOutputIndex,
-						oldFundingScript,
-						txidHex
-					);
-					// Durably, so the next start can re-arm it. spliceInFlight
-					// cannot: completeSplice clears it when splice_locked is
-					// sent, which on a zero-conf channel is the same action
-					// batch as this broadcast, so a restart before the splice
-					// confirmed came back with no record of the outpoint at all
-					// (issue #479).
-					this.recordPreSpliceSpendWatch(
-						channelId,
-						supersededTxid,
-						state.fundingOutputIndex,
-						txidHex
+						leg.txid,
+						leg.outputIndex,
+						Buffer.from(leg.script, 'hex'),
+						leg.spliceTxid
 					);
 				}
 				return;
@@ -12103,7 +12044,12 @@ export class LightningNode extends EventEmitter {
 			const firstHopChannel = this.firstHopChannelFor(route);
 			if (
 				firstHopChannel &&
-				firstHopChannel.getSpendableOutboundMsat() < route.totalAmountMsat
+				(firstHopChannel.getSpendableOutboundMsat() < route.totalAmountMsat ||
+					// A held capsule restore takes no new HTLCs (issue #469), so
+					// screen it here rather than letting addHtlc refuse: the
+					// MPP fallback below can then route around it instead of
+					// the payment simply failing.
+					firstHopChannel.getFullState().restoreRecencyUnproven === true)
 			) {
 				route = null;
 			}
@@ -12959,6 +12905,26 @@ export class LightningNode extends EventEmitter {
 		// the exits that emit no event (disconnect, errored, force close).
 		if (channel.isQuiescing()) {
 			this.parkQuiescentHtlc(channelId, htlcId, amountMsat, paymentHash);
+			return;
+		}
+
+		// A capsule-restored channel whose recency cannot be proven takes no NEW
+		// HTLCs (issue #469). Settling this would reveal a preimage against a
+		// peer we could never escalate against: every automatic close is
+		// refused for as long as the hold stands, so the on-chain claim the
+		// deadline backstop exists to make can never happen. Forwarding is the
+		// same bet with an extra leg. Fail it back now, while it is still free
+		// to do so; the sender simply routes elsewhere.
+		if (channel.getFullState().restoreRecencyUnproven === true) {
+			this.emitStructuredLog('htlc', 'refused_restore_unproven', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString()
+			});
+			this.channelManager.failHtlc(
+				channelId,
+				htlcId,
+				createFailureMessage(Buffer.alloc(32), TEMPORARY_CHANNEL_FAILURE)
+			);
 			return;
 		}
 

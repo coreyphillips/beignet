@@ -2638,6 +2638,26 @@ export class Channel {
 			];
 		}
 
+		// A capsule-restored channel whose recency cannot be proven takes no NEW
+		// HTLCs (issue #469). Its HTLC deadline backstops can never fire, since
+		// every automatic close is refused for as long as the hold stands, and
+		// an HTLC whose only on-chain enforcement this node has disarmed is a
+		// bounded risk turning into an unbounded one: the peer can simply stall
+		// and we have nothing to escalate to. Existing HTLCs still settle and
+		// fail off chain, and the channel still closes cooperatively, which
+		// needs no revocation and is therefore safe from a stale state.
+		if (this._state.restoreRecencyUnproven === true) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot add HTLC: channel was restored from a Recovery Capsule ' +
+						'and its state cannot be proven current, so its on-chain HTLC ' +
+						'backstops are disabled'
+				}
+			];
+		}
+
 		// Reject during quiescence.
 		if (this._quiescence.isQuiescing()) {
 			return [
@@ -14212,6 +14232,62 @@ export class Channel {
 	}
 
 	/**
+	 * Record, durably and with its OWN script, the funding outpoint this splice
+	 * is about to supersede (issue #479).
+	 *
+	 * Called where the splice's WATCH_FUNDING is pushed, which is where the
+	 * channel's own funding watch MOVES to the new outpoint and the old one
+	 * stops being covered. Two things make that the right moment and this the
+	 * right layer:
+	 *
+	 * - It runs while the action array is still being BUILT, so completeSplice
+	 *   has not adopted the new funding yet and `fundingTxid`, the output
+	 *   index and `remoteBasepoints.fundingPubkey` are all still the
+	 *   pre-splice ones. On a zero-conf channel splice_locked leaves in this
+	 *   same batch, so anything reading channel state afterwards, including
+	 *   the node's own watch:funding handler, may already see the post-splice
+	 *   values.
+	 * - The batch's PERSIST_STATE therefore carries this record, which puts it
+	 *   on disk before the transaction that supersedes the outpoint is
+	 *   authorized to reach the network. A crash in between leaves the record,
+	 *   not a gap.
+	 *
+	 * The script is stored rather than recomputed because a splice may rotate
+	 * the peer's funding pubkey, so the channel's later funding script can
+	 * hash to something this output never paid.
+	 */
+	private _recordPreSpliceSpendWatch(spliceTxid: Buffer): void {
+		const fundingTxid = this._state.fundingTxid;
+		if (!fundingTxid || !this._state.remoteBasepoints) return;
+		const txid = Buffer.from(fundingTxid).reverse().toString('hex');
+		const outputIndex = this._state.fundingOutputIndex;
+		const existing = this._state.preSpliceSpendWatches ?? [];
+		if (
+			existing.some((w) => w.txid === txid && w.outputIndex === outputIndex)
+		) {
+			return;
+		}
+		const script = isTaprootChannel(this._state.channelType)
+			? createTaprootFundingScript(
+					this._state.localBasepoints.fundingPubkey,
+					this._state.remoteBasepoints.fundingPubkey
+			  ).p2trOutput
+			: createFundingScript(
+					this._state.localBasepoints.fundingPubkey,
+					this._state.remoteBasepoints.fundingPubkey
+			  ).p2wshOutput;
+		this._state.preSpliceSpendWatches = [
+			...existing,
+			{
+				txid,
+				outputIndex,
+				script: script.toString('hex'),
+				spliceTxid: Buffer.from(spliceTxid).reverse().toString('hex')
+			}
+		];
+	}
+
+	/**
 	 * Build the non-terminal refusal batch for an unacceptable splice
 	 * tx_signatures: used by the wallet-witness arm, the after-sent txid
 	 * mismatch, and the defensive apply-failure arm, where the peer may still
@@ -14226,6 +14302,7 @@ export class Channel {
 		const refusal: ChannelAction[] = [];
 		const record = this._state.spliceInFlight;
 		if (record && (this._spliceSentTxSigs || record.sentTxSignatures)) {
+			this._recordPreSpliceSpendWatch(record.spliceTxid);
 			refusal.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: record.spliceTxid,
@@ -14250,6 +14327,7 @@ export class Channel {
 		const actions: ChannelAction[] = [];
 		const record = this._state.spliceInFlight;
 		if (record && (this._spliceSentTxSigs || record.sentTxSignatures)) {
+			this._recordPreSpliceSpendWatch(record.spliceTxid);
 			actions.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: record.spliceTxid,
@@ -15142,6 +15220,7 @@ export class Channel {
 				tx: tx.toBuffer(),
 				fundingCritical: true
 			});
+			this._recordPreSpliceSpendWatch(spliceTxid);
 			actions.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: spliceTxid,

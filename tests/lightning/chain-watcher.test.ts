@@ -1650,8 +1650,20 @@ describe('Phase 4: Chain Watcher', () => {
 			state.spliceInFlight = null;
 			const supersededTxid = crypto.randomBytes(32).toString('hex');
 			const spliceTxid = crypto.randomBytes(32).toString('hex');
+			// The leg carries its OWN script: a splice can rotate the peer's
+			// funding pubkey, so the channel's current funding script may hash
+			// to something the superseded output never paid.
+			const legScript = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
 			state.preSpliceSpendWatches = [
-				{ txid: supersededTxid, outputIndex: 1, spliceTxid }
+				{
+					txid: supersededTxid,
+					outputIndex: 1,
+					script: legScript.toString('hex'),
+					spliceTxid
+				}
 			];
 			const channel = new Channel(state);
 			node.getChannelManager().restoreChannel(channel, 'cafe'.repeat(16));
@@ -1660,12 +1672,15 @@ describe('Phase 4: Chain Watcher', () => {
 
 			const watcher = node.getChainWatcher()!;
 			const watched = (watcher as any).watchedFundings as Map<string, unknown>;
+			const legKey = `${state.channelId.toString(
+				'hex'
+			)}:presplice:${supersededTxid}:1`;
+			expect(watched.has(legKey), 'the superseded outpoint is watched again').to
+				.be.true;
 			expect(
-				watched.has(
-					`${state.channelId.toString('hex')}:presplice:${supersededTxid}:1`
-				),
-				'the superseded outpoint is watched again'
-			).to.be.true;
+				(watched.get(legKey) as { scriptHash: string }).scriptHash,
+				'armed against the recorded script, not the channel current one'
+			).to.equal(computeScriptHash(legScript));
 			node.destroy();
 		});
 

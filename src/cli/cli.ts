@@ -768,7 +768,15 @@ async function handleChannel(): Promise<void> {
 		case 'forceclose':
 			return outputResult(
 				await httpRequest('POST', '/channel/forceclose', {
-					channelId: filteredArgs[2]
+					channelId: filteredArgs[2],
+					// A channel restored from a Recovery Capsule refuses an
+					// unacknowledged force close, because its commitment may be
+					// one the peer already holds a revocation for. Without a
+					// way to say so the documented escape hatch was
+					// unreachable from the CLI.
+					...(hasFlag('--accept-stale-state-risk')
+						? { acceptStaleStateRisk: true }
+						: {})
 				})
 			);
 		case 'rebroadcast-close':
@@ -2417,6 +2425,10 @@ Channels:
                                          confirmation (trusted peers only)
   channel close <id>                     Cooperative close
   channel forceclose <id>                Force close
+                                         --accept-stale-state-risk: required
+                                         for a channel restored from a
+                                         Recovery Capsule, whose commitment
+                                         the peer may have already revoked
   channel rebroadcast-close <id>         Rebroadcast recorded close tx
   channel funding-quote <pubkey> [satsPerVbyte]
                                          Peer-aware max open preview: v1 or

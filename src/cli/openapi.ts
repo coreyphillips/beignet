@@ -561,7 +561,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
-						acceptStaleStateRisk: 'boolean'
+						// Conditionally required, and only for a capsule-restored
+						// channel, so the schema cannot say "required" without
+						// misdescribing every other force close.
+						acceptStaleStateRisk: 'boolean?'
 					}),
 					responses: {
 						'200': { description: 'Force close result with commitment txid' }
@@ -1556,7 +1559,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head and the guardian locators that capsule names (credentials redacted; reported, never adopted over the configured set), and restore progress when one is pending or running. In peer-storage mode node.heldReestablish lists peers whose channel_reestablish for a channel this node has no record of is being held rather than answered: each entry carries the expiresAt by which a capsule must be applied, after which the peer is told the channel is unknown and force-closes. A channel restored from a capsule carries node.channels[].restoreRecencyUnproven for as long as it exists: a capsule is best-effort recency and a compatible channel_reestablish does not prove otherwise, so the daemon will never force-close that channel on its own initiative (a peer error and the timeout backstops are held, and the channel asks its peer to close instead). It still transacts normally. The exits are the peer closing, or /channel/forceclose with acceptStaleStateRisk: true'
+								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head and the guardian locators that capsule names (credentials redacted; reported, never adopted over the configured set), and restore progress when one is pending or running. In peer-storage mode node.heldReestablish lists peers whose channel_reestablish for a channel this node has no record of is being held rather than answered: each entry carries the expiresAt by which a capsule must be applied, after which the peer is told the channel is unknown and force-closes. A channel restored from a capsule carries node.channels[].restoreRecencyUnproven for as long as it exists: a capsule is best-effort recency and a compatible channel_reestablish does not prove otherwise, so the daemon will never force-close that channel on its own initiative (a peer error and the timeout backstops are held, and the channel asks its peer to close instead). Such a channel also takes no new HTLCs, since its on-chain HTLC deadline backstops can never fire, though existing ones still settle and it can still be closed cooperatively. The exits are the peer closing, or /channel/forceclose with acceptStaleStateRisk: true'
 						}
 					}
 				}

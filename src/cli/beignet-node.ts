@@ -4401,10 +4401,24 @@ export class BeignetNode extends EventEmitter {
 		error?: string;
 		commitmentTxid?: string;
 	} {
+		// Validate before deciding anything from it. Buffer.from(x, 'hex')
+		// truncates at the first non-hex pair and is case insensitive, so a
+		// caller's spelling is not an identity: 'AB...' and 'ab...xyz' both
+		// decode to the same channel while matching no canonical id, which
+		// walked straight past the acknowledgement below.
+		if (!/^[0-9a-fA-F]{64}$/.test(channelId)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'channelId must be 64 hex characters'
+			);
+		}
 		const idBuf = Buffer.from(channelId, 'hex');
+		// Compare on the DECODED bytes, which is what the engine resolves.
+		const canonicalId = idBuf.toString('hex');
 		const held = this.node
 			.getRecoveryStatus()
-			.channels.find((c) => c.channelId === channelId)?.restoreRecencyUnproven;
+			.channels.find((c) => c.channelId === canonicalId)
+			?.restoreRecencyUnproven;
 		if (held === true && acceptStaleStateRisk !== true) {
 			throw new BeignetError(
 				'INVALID_PARAMS',

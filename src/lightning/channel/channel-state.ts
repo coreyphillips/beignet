@@ -522,6 +522,18 @@ export interface IChannelState {
 	 * a restart before the splice confirmed came back blind to exactly the
 	 * attack the watch exists for.
 	 *
+	 * Each entry carries the outpoint's OWN scriptPubkey, which is the whole
+	 * point of recording it rather than recomputing one: a splice may rotate
+	 * the peer's funding pubkey (`ISpliceInFlight.remoteFundingPubkey`, and
+	 * CLN does this), so the channel's current funding script can hash to
+	 * something the superseded output never paid, and a watch armed from it
+	 * subscribes to the wrong script and never sees the breach.
+	 *
+	 * Written by the channel in the SAME batch that authorizes the splice
+	 * broadcast, before completeSplice adopts the new funding, so the values
+	 * are the pre-splice ones and the record is on disk before the transaction
+	 * that supersedes the outpoint can reach the network.
+	 *
 	 * Display-order hex, because these are consumed verbatim by ChainWatcher,
 	 * which speaks the byte order Electrum reports. Entries are removed when
 	 * the watcher reports the outpoint's expected spend irrevocably confirmed,
@@ -530,6 +542,7 @@ export interface IChannelState {
 	preSpliceSpendWatches?: Array<{
 		txid: string;
 		outputIndex: number;
+		script: string;
 		spliceTxid: string;
 	}>;
 	/**
@@ -748,10 +761,16 @@ export interface IChannelState {
 	 *
 	 * It is still deliberately NOT `stateUncertain`, which routes reestablish
 	 * itself to DLP and would force-close every capsule restore: this channel
-	 * RESUMES and transacts normally. Only the unilateral broadcast this node
-	 * would choose on its own is refused, and the operator's explicit force
-	 * close is the labelled exit 5.6 names, never gated by this. MUST persist:
-	 * a restart must not forget the restriction.
+	 * RESUMES, keeps its funds and can be closed cooperatively, which needs no
+	 * revocation and so cannot be penalized from a stale state. What it does
+	 * not do is take NEW HTLCs. Its on-chain HTLC deadline backstops can never
+	 * fire while the hold stands, and accepting an obligation whose only
+	 * enforcement this node has disarmed is how a bounded risk becomes an
+	 * unbounded one; existing HTLCs still settle and fail off chain.
+	 *
+	 * The operator's explicit force close is the labelled exit 5.6 names,
+	 * never gated by this. MUST persist: a restart must not forget the
+	 * restriction.
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**
