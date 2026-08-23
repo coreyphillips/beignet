@@ -542,7 +542,15 @@ export class ChainMonitor {
 			}
 		}
 
-		this._currentBlockHeight = blockHeight;
+		// The spend's height is NOT the chain tip: a scan can discover a close
+		// that confirmed long ago, and the manager has already advanced every
+		// monitor to the real tip before that scan finishes. Adopting the older
+		// height rewound the tip, so a sweep whose CSV matured hundreds of
+		// blocks back was held as CONFIRMED and waited for another block to
+		// release it (issue #468). A mempool sighting reports 0 and would have
+		// rewound it to zero. _rebindCommitmentConfirmation already takes the
+		// same view of the two.
+		this._currentBlockHeight = Math.max(this._currentBlockHeight, blockHeight);
 
 		const classified = classifyCommitmentTx(spendingTx, this._channelState);
 		const txid = spendingTx.getId();

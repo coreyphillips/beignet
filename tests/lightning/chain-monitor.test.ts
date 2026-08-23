@@ -904,6 +904,50 @@ describe('Chain Monitor (Phase 4C)', function () {
 			).to.equal(OutputStatus.SPEND_BROADCAST);
 		});
 
+		it('keeps the tip when a historical close is discovered, so a matured sweep goes out at once (issue #468)', function () {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			const perCommitmentSecret = generateFromSeed(
+				state.localPerCommitmentSeed,
+				MAX_INDEX - state.localCommitmentNumber
+			);
+			const built = buildLocalCommitment(
+				state,
+				perCommitmentPointFromSecret(perCommitmentSecret)
+			);
+
+			// The monitor knows the chain tip is 1000 before the close is found:
+			// this is a scan that discovers a close which confirmed long ago, at
+			// 100, whose to_local CSV matured hundreds of blocks back.
+			monitor.handleNewBlock(1000);
+			const actions = monitor.handleFundingSpent(built.result.tx, 100);
+
+			const toLocal = monitor
+				.getTrackedOutputs()
+				.find((o) => o.outputType === OutputType.TO_LOCAL);
+			expect(toLocal, 'to_local output tracked').to.exist;
+			expect(toLocal!.maturityHeight!).to.be.lessThan(1000);
+			// The spend's height is not the chain tip. Adopting it as the tip
+			// rewound the monitor to 100 and held a sweep that matured at 244
+			// until some later block happened to arrive.
+			expect(
+				actions.filter((a) => a.type === ChainActionType.BROADCAST_TX).length,
+				'the matured to_local sweep is broadcast immediately'
+			).to.equal(1);
+			expect(toLocal!.status).to.equal(OutputStatus.SPEND_BROADCAST);
+		});
+
 		it('holds a CSV sweep seen in the mempool (height 0) until the spend confirms', function () {
 			const { opener, openerPrivkeys } = setupNormalChannels();
 			const state = opener.getFullState();

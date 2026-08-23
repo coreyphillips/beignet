@@ -148,6 +148,17 @@ interface IWatchedFunding {
 	 */
 	scanRevision?: number;
 	/**
+	 * The same idea as scanRevision, for the spend half of the watch: bumped
+	 * whenever a spend scan reports a spend or an absence. Spend scans overlap
+	 * too (a block, a script hash notification and the recheck timer all start
+	 * them) and each one carries a history it fetched before its awaits, so an
+	 * older scan that finishes last would otherwise overwrite the newer answer.
+	 * Reporting an older height demotes a recorded confirmation, which stops
+	 * the monitor's depth clock and unschedules every CSV sweep bound to it
+	 * (issue #468).
+	 */
+	spendScanRevision?: number;
+	/**
 	 * Per-txid results of the discovery scan, so each transaction in the
 	 * history is fetched once and not again on every recheck. Transactions are
 	 * immutable, so both halves keep: `out` is the index of an output paying
@@ -541,7 +552,9 @@ export class ChainWatcher extends EventEmitter {
 			// close would sit on chain unhandled forever. Fully resolved
 			// watches are retired by the node, so anything still here is still
 			// waiting for that spend (issue #463).
-			this.checkFundingSpent(watched).catch((err) => this.emitError(err));
+			this.checkFundingSpent(watched, this.lifecycleGeneration, key).catch(
+				(err) => this.emitError(err)
+			);
 		}
 		for (const key of this.watchedOutputs.keys()) {
 			this.checkOutputSpend(key).catch((err) => this.emitError(err));
@@ -1086,7 +1099,7 @@ export class ChainWatcher extends EventEmitter {
 			// fire (issue #468). Nothing new is asked of the backend either:
 			// recheckAllWatches already runs this same sweep, ten times more
 			// often than a block arrives on mainnet.
-			this.checkFundingSpent(watched, generation).catch((err) => {
+			this.checkFundingSpent(watched, generation, key).catch((err) => {
 				this.emitError(err);
 			});
 		}
@@ -1172,7 +1185,7 @@ export class ChainWatcher extends EventEmitter {
 			});
 			return;
 		}
-		this.checkFundingSpent(watched, generation).catch((err) => {
+		this.checkFundingSpent(watched, generation, key).catch((err) => {
 			this.emitError(err);
 		});
 	}
@@ -1312,7 +1325,7 @@ export class ChainWatcher extends EventEmitter {
 			this.emit('funding:confirmed', watched.channelId, watched.txid);
 
 			// Now watch for the funding output being spent (force close detection)
-			this.watchFundingSpend(watched, generation).catch((err) => {
+			this.watchFundingSpend(watched, generation, key).catch((err) => {
 				this.emitError(err);
 			});
 		}
@@ -1447,7 +1460,10 @@ export class ChainWatcher extends EventEmitter {
 
 	private async watchFundingSpend(
 		watched: IWatchedFunding,
-		generation: number = this.lifecycleGeneration
+		generation: number = this.lifecycleGeneration,
+		// See checkFundingSpent: omitted for the splice watch, which is not
+		// held in watchedFundings.
+		key?: string
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		// Subscribe to detect when the funding output is spent. A failure here
@@ -1461,7 +1477,7 @@ export class ChainWatcher extends EventEmitter {
 		try {
 			await this.backend.subscribeToScriptHash(watched.scriptHash, () => {
 				if (!this.isCurrentGeneration(generation)) return;
-				this.checkFundingSpent(watched, generation).catch((err) => {
+				this.checkFundingSpent(watched, generation, key).catch((err) => {
 					this.emitError(err);
 				});
 			});
@@ -1475,7 +1491,7 @@ export class ChainWatcher extends EventEmitter {
 
 		// Immediately check if the output was already spent (e.g., after restart
 		// where the force-close tx was confirmed while we were offline)
-		await this.checkFundingSpent(watched, generation);
+		await this.checkFundingSpent(watched, generation, key);
 	}
 
 	private async checkFundingSpent(
@@ -1484,11 +1500,29 @@ export class ChainWatcher extends EventEmitter {
 		// generation is the only check available here, which makes it important
 		// that the caller passes the one it started in rather than letting this
 		// capture a fresh one after a stop().
-		generation: number = this.lifecycleGeneration
+		generation: number = this.lifecycleGeneration,
+		// Registry key of this watch, for the callers that took it out of
+		// watchedFundings. Omitted by watchFundingSpendDuringSplice, whose
+		// watch is deliberately not held there and therefore cannot be
+		// compared against it.
+		key?: string
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
+		// Whatever this scan concludes is only safe to apply while it is still
+		// answering for the current watch and nothing else has concluded
+		// anything since it started. A splice replaces the channel's watch with
+		// one on the new outpoint, and a scan still running against the old one
+		// would report the splice tx itself as the close; an older scan
+		// finishing after a newer one would demote a confirmation back to the
+		// mempool height it happened to fetch (issue #468).
+		const revision = watched.spendScanRevision ?? 0;
+		const superseded = (): boolean =>
+			!this.isCurrentGeneration(generation) ||
+			(key !== undefined && this.watchedFundings.get(key) !== watched) ||
+			(watched.spendScanRevision ?? 0) !== revision;
+
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
-		if (!this.isCurrentGeneration(generation)) return;
+		if (superseded()) return;
 
 		// Look for the transaction that spends our funding output. The script's
 		// history can contain MULTIPLE non-spending entries sharing the same
@@ -1506,7 +1540,7 @@ export class ChainWatcher extends EventEmitter {
 			}
 
 			const rawTx = await this.backend.getTransaction(entry.txid);
-			if (!this.isCurrentGeneration(generation)) return;
+			if (superseded()) return;
 			const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
 
 			// Verify this tx actually spends our funding output
@@ -1520,6 +1554,7 @@ export class ChainWatcher extends EventEmitter {
 
 			// Use 0 for mempool txs (Electrum returns height <= 0 for unconfirmed)
 			const height = entry.height > 0 ? entry.height : 0;
+			watched.spendScanRevision = revision + 1;
 			this.channelManager.handleFundingSpent(
 				watched.channelId,
 				spendingTx,
@@ -1538,6 +1573,7 @@ export class ChainWatcher extends EventEmitter {
 		// channels with no recorded spend. The splice watch is excluded: it
 		// ignores the expected splice spend, so an empty result there is normal.
 		if (!watched.ignoreSpendTxid) {
+			watched.spendScanRevision = revision + 1;
 			this.channelManager.handleFundingSpendAbsent?.(watched.channelId);
 		}
 	}
