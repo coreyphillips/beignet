@@ -14,6 +14,7 @@ import { ChannelManager } from '../channel/channel-manager';
 import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
 import { isTaprootChannel } from '../channel/types';
+import { IRREVOCABLE_DEPTH } from './types';
 
 bitcoin.initEccLib(ecc);
 
@@ -158,6 +159,20 @@ interface IWatchedFunding {
 	 * (issue #468).
 	 */
 	spendScanRevision?: number;
+	/**
+	 * The spend this watch last reported, i.e. the one the channel's monitor
+	 * is currently holding on this watch's behalf. At most one watch per
+	 * channel carries it (issue #479).
+	 *
+	 * A channel can have more than one watch once a splice leaves a
+	 * pre-splice leg behind, and handleFundingSpendAbsent is scoped to the
+	 * CHANNEL rather than to an outpoint, so it retracts whatever spend the
+	 * monitor holds no matter which watch found it. Ownership is what lets the
+	 * absence verdict stay accurate in both directions: the watch that
+	 * reported the spend is the only one allowed to say it is gone, and the
+	 * others stay quiet instead of undoing it.
+	 */
+	reportedSpendTxid?: string;
 	/**
 	 * Per-txid results of the discovery scan, so each transaction in the
 	 * history is fetched once and not again on every recheck. Transactions are
@@ -1638,6 +1653,9 @@ export class ChainWatcher extends EventEmitter {
 			// Use 0 for mempool txs (Electrum returns height <= 0 for unconfirmed)
 			const height = entry.height > 0 ? entry.height : 0;
 			watched.spendScanRevision = revision + 1;
+			// This watch now owns the channel's spend verdict, so no sibling
+			// can retract it and this one can (issue #479).
+			this.claimSpendReport(watched, entry.txid);
 			this.channelManager.handleFundingSpent(
 				watched.channelId,
 				spendingTx,
@@ -1660,7 +1678,12 @@ export class ChainWatcher extends EventEmitter {
 			key !== undefined &&
 			ignoredSpend !== null &&
 			this.currentBlockHeight > 0 &&
-			this.currentBlockHeight - ignoredSpend.height + 1 >= SPEND_FINALITY_DEPTH
+			// The monitor's own boundary, `blockHeight - confirmationHeight >=
+			// IRREVOCABLE_DEPTH` (chain-monitor.ts, OUTPUT_RESOLVED), and NOT
+			// the `+ 1` form the watchedOutputs teardown uses: that one retires
+			// a block EARLY, which for a breach watch means going blind for the
+			// last block before the spend is irrevocable.
+			this.currentBlockHeight - ignoredSpend.height >= IRREVOCABLE_DEPTH
 		) {
 			// Confirm it really spent THIS outpoint before acting on it. The
 			// funding script is shared by every splice generation, so a txid
@@ -1679,6 +1702,15 @@ export class ChainWatcher extends EventEmitter {
 			});
 			if (spendsOurs && this.watchedFundings.get(key) === watched) {
 				this.watchedFundings.delete(key);
+				// The node keeps a durable record of this outpoint so a restart
+				// can re-arm the watch; retiring the watch retires that too
+				// (issue #479).
+				this.emit(
+					'funding:presplice-retired',
+					watched.channelId,
+					watched.txid,
+					watched.outputIndex
+				);
 				return;
 			}
 		}
@@ -1687,26 +1719,56 @@ export class ChainWatcher extends EventEmitter {
 		// monitor has a confirmed spend recorded, that spend was reorged out
 		// without even re-entering the mempool, and its irrevocable-depth clock
 		// must stop counting against the vanished height (issue 352). No-op for
-		// channels with no recorded spend. The splice watch is excluded: it
-		// ignores the expected splice spend, so an empty result there is normal.
+		// channels with no recorded spend.
 		//
-		// So is the channel's OWN watch while any pre-splice leg is armed, and
-		// that exclusion is load-bearing (issue #479). handleFundingSpendAbsent
-		// is scoped to the CHANNEL, not to an outpoint, so it demotes whatever
-		// spend the monitor holds. Both watches are swept every block, and if
-		// the splice tx confirms, is reorged out and the revoked pre-splice
-		// commitment wins, the leg reports that breach while this watch finds
-		// nothing spending the outpoint the splice tx was going to create: one
-		// verdict would then undo the other, every block, stopping the
-		// irrevocable-depth clock and rescheduling every CSV sweep bound to it.
-		// A channel gets one reporter.
-		if (
-			!watched.ignoreSpendTxid &&
-			this.preSpliceWatchKeysFor(watched.channelId).length === 0
-		) {
+		// WHICH watch may say that is the whole question once a splice leaves a
+		// pre-splice leg behind, because handleFundingSpendAbsent is scoped to
+		// the CHANNEL and retracts whatever spend the monitor holds (issue
+		// #479). Ownership decides it:
+		//
+		//  - this watch reported the monitor's current spend and no longer sees
+		//    it: that is a genuine reorg of a spend WE found, and retracting it
+		//    is exactly issue 352's job. True for a pre-splice leg too, which
+		//    is what makes a reorged breach retractable rather than permanent.
+		//  - a SIBLING owns the verdict: stay quiet. Otherwise the leg's breach
+		//    report and this watch's empty result would undo each other every
+		//    block, stopping the depth clock and rescheduling every CSV sweep
+		//    bound to it.
+		//  - nobody owns one: the ordinary case, and only the channel's own
+		//    watch speaks. A leg stays silent because it ignores the expected
+		//    splice spend, so an empty result there is normal, not a reorg.
+		const ownsReport = watched.reportedSpendTxid !== undefined;
+		const siblingOwnsReport =
+			!ownsReport && this.hasSpendReportOwner(watched.channelId);
+		if (ownsReport || (!siblingOwnsReport && !watched.ignoreSpendTxid)) {
+			watched.reportedSpendTxid = undefined;
 			watched.spendScanRevision = revision + 1;
 			this.channelManager.handleFundingSpendAbsent?.(watched.channelId);
 		}
+	}
+
+	/**
+	 * Record that `watched` is the watch whose spend the channel's monitor now
+	 * holds, and that no sibling is (issue #479).
+	 */
+	private claimSpendReport(watched: IWatchedFunding, txid: string): void {
+		watched.reportedSpendTxid = txid;
+		const idHex = watched.channelId.toString('hex');
+		for (const other of this.watchedFundings.values()) {
+			if (other === watched) continue;
+			if (other.channelId.toString('hex') !== idHex) continue;
+			other.reportedSpendTxid = undefined;
+		}
+	}
+
+	/** Whether any watch for this channel owns the monitor's spend verdict. */
+	private hasSpendReportOwner(channelId: Buffer): boolean {
+		const idHex = channelId.toString('hex');
+		for (const watched of this.watchedFundings.values()) {
+			if (watched.channelId.toString('hex') !== idHex) continue;
+			if (watched.reportedSpendTxid !== undefined) return true;
+		}
+		return false;
 	}
 
 	private findChannelByFunding(

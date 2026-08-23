@@ -1235,6 +1235,80 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(breachTxid).to.be.a('string');
 		});
 
+		it('retracts a pre-splice breach when a reorg takes it out of the history', async () => {
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+
+			// The splice confirms, is reorged out, and the revoked pre-splice
+			// commitment wins. The leg reports the breach and now OWNS the
+			// channel's spend verdict.
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 102 }
+			]);
+			backend.simulateNewBlock(103);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			publishBreach(oldTxid, scriptHash, 104);
+			backend.simulateNewBlock(104);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(
+				spends.some((cid) => cid.equals(channelId)),
+				'the breach is reported'
+			).to.be.true;
+			expect(absentCalls, 'and nothing contradicts it').to.have.length(0);
+
+			// Now the breach itself is reorged out. Whoever reported a spend
+			// has to be able to take it back, or the monitor keeps a
+			// confirmation height that is no longer in the chain and runs its
+			// finality clock against it.
+			backend.setHistory(scriptHash, [{ txid: oldTxid, height: 90 }]);
+			backend.simulateNewBlock(105);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(
+				absentCalls.some((cid) => cid.equals(channelId)),
+				'the leg retracts the spend it reported'
+			).to.be.true;
+		});
+
+		it('retires exactly at the monitor irrevocable boundary, not a block before', async () => {
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 200 }
+			]);
+
+			// IRREVOCABLE_DEPTH is 100 and the monitor resolves an output at
+			// `tip - confirmationHeight >= 100`, i.e. at 300. Retiring at 299
+			// would leave the breach undetectable for the last block before
+			// the spend is irrevocable.
+			backend.simulateNewBlock(299);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(
+				preSpliceKeys(channelId),
+				'still armed one block short of the boundary'
+			).to.have.length(1);
+
+			const retired: Array<{ txid: string; outputIndex: number }> = [];
+			watcher.on(
+				'funding:presplice-retired',
+				(_cid: Buffer, txid: string, outputIndex: number) => {
+					retired.push({ txid, outputIndex });
+				}
+			);
+			backend.simulateNewBlock(300);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(
+				preSpliceKeys(channelId),
+				'retired at the boundary the monitor uses'
+			).to.have.length(0);
+			// The node keeps a durable record so a restart can re-arm this
+			// watch; retiring it has to retire that too, or the next start
+			// re-arms a watch for an outpoint nothing can spend any more.
+			expect(retired, 'the retirement is announced').to.deep.equal([
+				{ txid: oldTxid, outputIndex: 0 }
+			]);
+		});
+
 		it('drops pre-splice watches with the channel, and never resurrects one after stop', async () => {
 			const { channelId } = await armSplice();
 			expect(preSpliceKeys(channelId)).to.have.length(1);
@@ -1520,6 +1594,78 @@ describe('Phase 4: Chain Watcher', () => {
 			const watched = (watcher as any).watchedFundings as Map<string, unknown>;
 			expect(watched.has(state.channelId.toString('hex')), 'funding watched').to
 				.be.true;
+			node.destroy();
+		});
+
+		it('restoreChainWatches re-arms a pre-splice spend watch after the splice locked (issue #479)', async () => {
+			const {
+				LightningNode
+			} = require('../../src/lightning/node/lightning-node');
+			const {
+				createOpenerState
+			} = require('../../src/lightning/channel/channel-state');
+			const { Channel } = require('../../src/lightning/channel/channel');
+			const {
+				ChannelState,
+				DEFAULT_CHANNEL_CONFIG
+			} = require('../../src/lightning/channel/types');
+
+			const seed = crypto.randomBytes(32);
+			const basepoints = makeBasepoints(seed);
+			const mockBackend: IChainBackend = {
+				subscribeToHeaders: async () => {},
+				subscribeToScriptHash: async () => {},
+				getScriptHashHistory: async () => [],
+				getTransaction: async () => Buffer.alloc(0),
+				broadcastTransaction: async () => ''
+			};
+			const node = new LightningNode({
+				nodePrivateKey: crypto.randomBytes(32),
+				channelBasepoints: basepoints,
+				perCommitmentSeed: crypto.randomBytes(32),
+				fundingPrivkey: crypto.randomBytes(32),
+				chainBackend: mockBackend
+			});
+
+			// The shape a zero-conf splice leaves behind: splice_locked went out
+			// in the same action batch as the broadcast, so completeSplice has
+			// already moved fundingTxid to the new outpoint and cleared
+			// spliceInFlight, while the splice transaction is still only in the
+			// mempool. The old outpoint remains spendable by a revoked
+			// pre-splice commitment, and spliceInFlight can no longer tell the
+			// next start that.
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100_000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: basepoints,
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			state.state = ChannelState.NORMAL;
+			state.channelId = crypto.randomBytes(32);
+			state.fundingTxid = crypto.randomBytes(32);
+			state.fundingOutputIndex = 0;
+			state.remoteBasepoints = makeBasepoints(crypto.randomBytes(32));
+			state.spliceInFlight = null;
+			const supersededTxid = crypto.randomBytes(32).toString('hex');
+			const spliceTxid = crypto.randomBytes(32).toString('hex');
+			state.preSpliceSpendWatches = [
+				{ txid: supersededTxid, outputIndex: 1, spliceTxid }
+			];
+			const channel = new Channel(state);
+			node.getChannelManager().restoreChannel(channel, 'cafe'.repeat(16));
+
+			await node.restoreChainWatches();
+
+			const watcher = node.getChainWatcher()!;
+			const watched = (watcher as any).watchedFundings as Map<string, unknown>;
+			expect(
+				watched.has(
+					`${state.channelId.toString('hex')}:presplice:${supersededTxid}:1`
+				),
+				'the superseded outpoint is watched again'
+			).to.be.true;
 			node.destroy();
 		});
 

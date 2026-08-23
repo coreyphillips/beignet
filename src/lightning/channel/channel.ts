@@ -5021,6 +5021,16 @@ export class Channel {
 			s.state === ChannelState.FORCE_CLOSED ||
 			s.state === ChannelState.ERRORED
 		) {
+			// ...unless the capsule restore hold is on, in which case no
+			// automatic close will ever run and reporting ForceClosing would
+			// tell an operator a close is under way when the channel is
+			// waiting on the peer or on them (issue #469).
+			if (
+				s.state === ChannelState.ERRORED &&
+				s.restoreRecencyUnproven === true
+			) {
+				return ChannelRecoveryStatus.RestoreRecencyUnproven;
+			}
 			// ERRORED without a stale flag is recovered by broadcasting our
 			// latest commitment (the BOLT 1 prescription for a received
 			// error), so it is on the force-close path.
@@ -8473,24 +8483,25 @@ export class Channel {
 			? 'replay'
 			: 'clean';
 
-		// The capsule restore's safety net just ran (issue #469). The peer's
-		// counters were compatible with this row, which is the confirmation
-		// docs/RECOVERY-PROTOCOL.md 5.4 names for a best-effort checkpoint, so
-		// the node may broadcast this channel's commitment on its own
-		// initiative again.
+		// NOTE (issue #469): a compatible reestablish does NOT lift
+		// restoreRecencyUnproven, and deliberately so. Compatibility is not
+		// recency. BOLT 2's stale-state proof runs one way only: a valid
+		// FUTURE secret proves we fell behind, but nothing in
+		// channel_reestablish attests the peer's HIGHEST state, and the peer
+		// holding our capsule is the same peer we would be trusting here. One
+		// that holds N+1 can under-report N-compatible counters and replay the
+		// old secret it already has, wait for an automatic close to publish
+		// revoked state N, and take the channel through the justice path. This
+		// is the same reasoning the stateUncertain arm above states at length.
 		//
-		// "Control reached here" is NOT the predicate. _handleReestablishV2 is
-		// spread into `actions`, so its failure arms (a next_funding_txid that
-		// does not match the in-flight open, a tx_abort) land in the batch and
-		// fall through to this line with the channel already ERRORED. Only an
-		// exchange that actually succeeded lifts the restriction.
-		const clearedRestoreHold =
-			this._state.restoreRecencyUnproven === true &&
-			!this._state.dataLossDetected &&
-			this._state.state !== ChannelState.ERRORED;
-		if (clearedRestoreHold) {
-			this._state.restoreRecencyUnproven = undefined;
-		}
+		// The hold is therefore permanent, and that IS the protection: the
+		// attack needs US to broadcast. A peer that never gets a revoked
+		// commitment out of us has to close with a state we can sweep from, or
+		// leave the channel open. Resuming is still safe to allow, which is
+		// what keeps this narrower than stateUncertain and keeps issue #462's
+		// fix working; only the unilateral broadcast we would choose on our
+		// own is refused, and the operator's explicit force close remains the
+		// labelled exit (5.6).
 
 		// Persist before ANY of the above reaches the peer
 		// (docs/RECOVERY-PROTOCOL.md 5.1). Reestablish both mutates state (the
@@ -8501,15 +8512,7 @@ export class Channel {
 		// exactly the case the gate exists to stop, arriving one connection
 		// later. A retransmission is only safe once what justifies it is on
 		// disk.
-		//
-		// Lifting the restore hold is itself a durable state change with no
-		// message of its own to ride on, so it earns the persist too. Kept
-		// conditional rather than unconditional: a reconnect that produces
-		// nothing to send still produces no batch.
-		if (
-			clearedRestoreHold ||
-			actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)
-		) {
+		if (actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)) {
 			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
 		}
 

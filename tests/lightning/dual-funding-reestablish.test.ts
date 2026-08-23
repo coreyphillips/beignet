@@ -792,7 +792,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		).to.equal(null);
 	});
 
-	it('a reestablish that FAILS the channel does not lift a capsule restore hold (issue #469)', () => {
+	it('no reestablish outcome lifts a capsule restore hold, including on the v2 path (issue #469)', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
 		h.opener.markForReestablish();
@@ -809,12 +809,11 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		};
 		const actions = h.opener.handleReestablish(divergent);
 
-		// _handleReestablishV2 is spread into the action list rather than
-		// returned from handleReestablish, so its failure arms fall through to
-		// the same terminus a successful exchange reaches. "Control got there"
-		// is therefore not evidence the peer confirmed anything, and lifting
-		// the hold here would re-arm every automatic close on a row whose
-		// recency is still unproven.
+		// The hold is permanent because compatibility is not recency, and the
+		// v2 path gets its own case because _handleReestablishV2 is SPREAD
+		// into the action list rather than returned: any clear reintroduced at
+		// the shared terminus would fire here too, on an exchange that did not
+		// merely fail to prove recency but failed outright.
 		expect(findError(actions)).to.contain('does not match');
 		expect(h.opener.getState()).to.equal(ChannelState.ERRORED);
 		expect(h.opener.getFullState().restoreRecencyUnproven).to.equal(true);

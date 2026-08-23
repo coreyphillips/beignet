@@ -4386,12 +4386,37 @@ export class BeignetNode extends EventEmitter {
 		return this.node.closeChannel(idBuf, scriptPubkey);
 	}
 
-	forceCloseChannel(channelId: string): {
+	forceCloseChannel(
+		channelId: string,
+		// The labelled risk acknowledgement RECOVERY-PROTOCOL 5.6 asks for
+		// (issue #469). Required only for a channel restored from a Recovery
+		// Capsule, whose recency nothing can prove: this node refuses to
+		// broadcast such a commitment on its own initiative because the peer
+		// may already hold a revocation for it, and an operator command is the
+		// documented exit. It should be a decision, not a default, so the
+		// route refuses without it and says why.
+		acceptStaleStateRisk = false
+	): {
 		ok: boolean;
 		error?: string;
 		commitmentTxid?: string;
 	} {
 		const idBuf = Buffer.from(channelId, 'hex');
+		const held = this.node
+			.getRecoveryStatus()
+			.channels.find((c) => c.channelId === channelId)?.restoreRecencyUnproven;
+		if (held === true && acceptStaleStateRisk !== true) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'This channel was restored from a Recovery Capsule and its state ' +
+					'cannot be proven current, so the node will not broadcast its ' +
+					'commitment on its own initiative. If the peer holds a newer ' +
+					'state, force closing publishes a revoked commitment and the ' +
+					'whole channel balance is lost to the justice path. Waiting for ' +
+					'the peer to close is the safe outcome. Set ' +
+					'acceptStaleStateRisk: true to force close anyway.'
+			);
+		}
 		// Sweep recovered funds into the wallet-owned address (tracked + spendable)
 		// when available; fall back to the LN funding address otherwise.
 		let destinationScript = this.sweepDestinationScript;

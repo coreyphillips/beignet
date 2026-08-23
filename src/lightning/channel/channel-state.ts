@@ -507,6 +507,32 @@ export interface IChannelState {
 	/** Splice: state before splicing (to restore on abort) */
 	preSpliceState: ChannelState | null;
 	/**
+	 * Funding outpoints a splice has superseded but whose spend must still be
+	 * watched, with the splice transaction that is expected to spend each one
+	 * (issue #479).
+	 *
+	 * The channel's own funding watch moves to the new outpoint as soon as the
+	 * splice transaction is broadcast, so from then until that transaction is
+	 * irrevocably confirmed the old outpoint has no watch of its own, and a
+	 * peer that evicts a low-feerate splice from the mempool can spend it with
+	 * a revoked pre-splice commitment. `spliceInFlight` used to be the only
+	 * record a restart could rebuild that watch from, and it is not enough:
+	 * completeSplice clears it when splice_locked is sent, which on a
+	 * zero-conf channel happens in the same action batch as the broadcast, so
+	 * a restart before the splice confirmed came back blind to exactly the
+	 * attack the watch exists for.
+	 *
+	 * Display-order hex, because these are consumed verbatim by ChainWatcher,
+	 * which speaks the byte order Electrum reports. Entries are removed when
+	 * the watcher reports the outpoint's expected spend irrevocably confirmed,
+	 * so the list is empty on a channel with no splice history in flight.
+	 */
+	preSpliceSpendWatches?: Array<{
+		txid: string;
+		outputIndex: number;
+		spliceTxid: string;
+	}>;
+	/**
 	 * Splice: in-flight splice past the point of no return (we sent
 	 * tx_signatures, or the mid-splice commitment round completed). Must survive
 	 * disconnect AND restart — the splice tx may confirm at any time. Optional
@@ -712,13 +738,20 @@ export interface IChannelState {
 	 * which forfeits the whole balance to the justice path.
 	 *
 	 * So while this is set the node refuses to broadcast our commitment ON ITS
-	 * OWN INITIATIVE. It is deliberately NOT `stateUncertain`: that flag is
-	 * permanent absent independently verified storage provenance and routes
-	 * reestablish itself to DLP, so setting it here would force-close every
-	 * capsule restore and defeat the feature. This one clears the moment a
-	 * reestablish completes, and the operator's explicit force close is never
-	 * gated by it. MUST persist: a restart between the restore and the first
-	 * reconnect must not forget the restriction.
+	 * OWN INITIATIVE, and it stays set. A COMPATIBLE reestablish does not lift
+	 * it: BOLT 2's stale-state proof runs one way only, and the peer holding
+	 * our capsule is the same peer we would be trusting, so one that holds a
+	 * newer state can under-report compatible counters, replay the old secret
+	 * it already has, and wait for an automatic close to publish a commitment
+	 * it can penalize. The hold IS the defence against that, because the
+	 * attack needs us to broadcast.
+	 *
+	 * It is still deliberately NOT `stateUncertain`, which routes reestablish
+	 * itself to DLP and would force-close every capsule restore: this channel
+	 * RESUMES and transacts normally. Only the unilateral broadcast this node
+	 * would choose on its own is refused, and the operator's explicit force
+	 * close is the labelled exit 5.6 names, never gated by this. MUST persist:
+	 * a restart must not forget the restriction.
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**

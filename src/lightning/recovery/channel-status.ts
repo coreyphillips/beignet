@@ -25,6 +25,15 @@ export enum ChannelRecoveryStatus {
 	LocalDataLoss = 'local_data_loss',
 	/** Cannot prove our state is current: never broadcast, peer closes. */
 	StateUncertain = 'state_uncertain',
+	/**
+	 * Restored from a Recovery Capsule and failed: the channel transacts
+	 * normally while it is healthy, but its recency is unprovable, so no
+	 * AUTOMATIC close will broadcast its commitment (issue #469). Distinct
+	 * from ForceClosing, which would claim a close is under way, and from
+	 * StateUncertain, which also refuses to resume. The peer's close or the
+	 * operator's explicit force close resolves it.
+	 */
+	RestoreRecencyUnproven = 'restore_recency_unproven',
 	Active = 'active',
 	ForceClosing = 'force_closing'
 }

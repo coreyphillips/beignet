@@ -537,6 +537,76 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		expect(mustNotBroadcastCommitment(restored.getFullState())).to.equal(true);
 	});
 
+	it('a down-reporting peer cannot launder a capsule restore into an automatic close (issue #469)', function () {
+		// The same laundering attempt against the CAPSULE hold, which unlike
+		// stateUncertain lets the channel resume. Resuming is fine; what must
+		// not happen is the hold lifting, because the exchange proves nothing
+		// about the peer's highest state and the peer holding our capsule is
+		// the same peer we would be trusting here.
+		const { opener, acceptor, openerCommitmentSeed } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+
+		const stale = deserializeChannelState(
+			serializeChannelState(opener.getFullState())
+		);
+		exchangeCommitments(opener, acceptor);
+		expect(
+			Number(opener.getFullState().localCommitmentNumber)
+		).to.be.greaterThan(Number(stale.localCommitmentNumber));
+
+		// A Tier 2 capsule install restores the stale snapshot and marks it.
+		stale.restoreRecencyUnproven = true;
+		const restored = new Channel(stale);
+		restored.markForReestablish();
+
+		const actions = restored.handleReestablish({
+			channelId: restored.getChannelId()!,
+			nextCommitmentNumber: stale.remoteCommitmentNumber + 1n,
+			nextRevocationNumber: stale.localCommitmentNumber,
+			yourLastPerCommitmentSecret: generateFromSeed(
+				openerCommitmentSeed,
+				MAX_INDEX - (stale.localCommitmentNumber - 1n)
+			),
+			myCurrentPerCommitmentPoint: perCommitmentPointFromSecret(
+				crypto.createHash('sha256').update(Buffer.from('down-report')).digest()
+			)
+		});
+
+		// The channel is allowed to resume, which is the whole point of the
+		// narrower marker, and it is NOT routed to DLP...
+		expect(restored.getState()).to.not.equal(ChannelState.ERRORED);
+		expect(
+			actions.some((a) => a.type === ChannelActionType.BROADCAST_TX)
+		).to.equal(false);
+		// ...but the hold survives, so no automatic close will ever publish
+		// the commitment the peer has already revoked in its true view. That
+		// refusal is the defence: the attack needs US to broadcast.
+		expect(
+			restored.getFullState().restoreRecencyUnproven,
+			'a compatible reestablish is not proof of recency'
+		).to.equal(true);
+	});
+
+	it('an ERRORED capsule-restored channel reports the hold, not a force close (issue #469)', function () {
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		const state = opener.getFullState();
+		state.restoreRecencyUnproven = true;
+		const restored = new Channel(
+			deserializeChannelState(serializeChannelState(state))
+		);
+		expect(restored.markErrored()).to.equal(true);
+
+		// ForceClosing would tell an operator a close is under way. Nothing is
+		// closing this channel: it is waiting on the peer or on them.
+		expect(restored.getRecoveryStatus()).to.equal(
+			ChannelRecoveryStatus.RestoreRecencyUnproven
+		);
+		// And it is still not the never-broadcast invariant, so the operator's
+		// explicit force close is not refused.
+		expect(mustNotBroadcastCommitment(restored.getFullState())).to.equal(false);
+	});
+
 	it('ReplayRequired serves the exact PERSISTED bytes across a restart', function () {
 		// The spec's requirement for ReplayRequired: the peer gets exactly
 		// what was sent before the crash, from persistence, not a rebuild.

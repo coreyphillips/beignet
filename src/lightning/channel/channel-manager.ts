@@ -1872,6 +1872,33 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Send the durable peer-close request NOW, rather than waiting for the
+	 * next reconnect to regenerate it (recovery 5.6 liveness).
+	 *
+	 * handlePeerReconnected repeats the request on every reconnect, which
+	 * covers a crash between the ERRORED persist and the socket. It does not
+	 * cover a channel that reaches the held ERRORED state while the peer is
+	 * ALREADY connected, which is the ordinary case for a capsule-restored
+	 * channel the peer errors: nothing automatic will close it, and without
+	 * this both sides would sit waiting on each other until something else
+	 * happens to reconnect them (issue #469).
+	 *
+	 * Returns whether a request was actually sent; empty for a channel with no
+	 * recovery-close disposition, which is every ordinary error.
+	 */
+	sendRecoveryCloseRequest(channelId: Buffer): boolean {
+		const idHex = channelId.toString('hex');
+		const channel = this.getChannel(channelId);
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!channel || !peerPubkey) return false;
+		if (channel.getState() !== ChannelState.ERRORED) return false;
+		const actions = channel.buildRecoveryCloseActions();
+		if (actions.length === 0) return false;
+		this.processActions(peerPubkey, channel, actions);
+		return true;
+	}
+
+	/**
 	 * Restore a channel from persisted state.
 	 * Channels in NORMAL state are transitioned to AWAITING_REESTABLISH
 	 * since we need to send channel_reestablish before resuming operations.

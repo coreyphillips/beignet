@@ -434,6 +434,86 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 		);
 	});
 
+	it('POST /channel/forceclose refuses a capsule-restored channel without acceptStaleStateRisk (issue #469)', async () => {
+		const node = daemon.node.getNode();
+		const {
+			createOpenerState
+		} = require('../../src/lightning/channel/channel-state');
+		const { Channel } = require('../../src/lightning/channel/channel');
+		const {
+			ChannelState,
+			DEFAULT_CHANNEL_CONFIG
+		} = require('../../src/lightning/channel/types');
+		const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+		const point = getPublicKey(crypto.randomBytes(32));
+		const bp = {
+			fundingPubkey: point,
+			revocationBasepoint: point,
+			paymentBasepoint: point,
+			delayedPaymentBasepoint: point,
+			htlcBasepoint: point,
+			firstPerCommitmentPoint: point
+		};
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 100_000n,
+			pushMsat: 0n,
+			localConfig: DEFAULT_CHANNEL_CONFIG,
+			localBasepoints: bp,
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		state.state = ChannelState.NORMAL;
+		state.channelId = crypto.randomBytes(32);
+		state.fundingTxid = crypto.randomBytes(32);
+		state.remoteBasepoints = bp;
+		state.restoreRecencyUnproven = true;
+		node
+			.getChannelManager()
+			.restoreChannel(
+				new Channel(state),
+				crypto.randomBytes(33).toString('hex')
+			);
+		const channelId = state.channelId.toString('hex');
+
+		// The exit RECOVERY-PROTOCOL 5.6 names is the operator "explicitly
+		// accepting the risk", and explicit has to mean something: this
+		// commitment may be one the peer already holds a revocation for, so
+		// publishing it can forfeit the whole channel balance.
+		const refused = await request(
+			portOf(daemon),
+			'POST',
+			'/channel/forceclose',
+			{ channelId }
+		);
+		expect(refused.status).to.equal(400);
+		expect((refused.body.error as { code: string }).code).to.equal(
+			'INVALID_PARAMS'
+		);
+		expect((refused.body.error as { message: string }).message).to.match(
+			/acceptStaleStateRisk/
+		);
+
+		// With the acknowledgement it is allowed through to the engine, which
+		// is the point: the hold is never a refusal to the operator.
+		const accepted = await request(
+			portOf(daemon),
+			'POST',
+			'/channel/forceclose',
+			{ channelId, acceptStaleStateRisk: true }
+		);
+		expect(
+			(accepted.body.error as { message?: string } | undefined)?.message ?? '',
+			'the acknowledgement is not what stops it'
+		).to.not.match(/acceptStaleStateRisk/);
+
+		// Shared daemon: take the fixture channel back out.
+		(
+			node.getChannelManager() as unknown as {
+				channels: Map<string, unknown>;
+			}
+		).channels.delete(channelId);
+	});
+
 	it('POST /recovery/restore on a running node answers RESTORE_NOT_PENDING', async () => {
 		const res = await request(portOf(daemon), 'POST', '/recovery/restore', {
 			confirm: true

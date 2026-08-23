@@ -701,6 +701,13 @@ export class LightningNode extends EventEmitter {
 	// manual rebroadcast re-establishes the truth, so `broadcast` honestly
 	// reads false in between.
 	private _pendingCloseTxids: Map<string, string> = new Map(); // txidHex -> channelIdHex
+	/**
+	 * Channels this process has already sent an immediate recovery-close
+	 * request for (issue #469). The request is a BOLT 1 error and the path
+	 * that sends it also runs on errors RECEIVED, so without this two nodes
+	 * answer each other forever. Reconnect still repeats it durably.
+	 */
+	private _recoveryCloseRequested: Set<string> = new Set();
 	private _lastCloseBroadcast: Map<string, { txid: string; ok: boolean }> =
 		new Map(); // channelIdHex -> last close-tx broadcast result
 	// Terminal-state (CLOSED/FORCE_CLOSED/ERRORED) channel persists that
@@ -3064,6 +3071,7 @@ export class LightningNode extends EventEmitter {
 			// Close-broadcast bookkeeping is only meaningful while the close can
 			// still be rebroadcast; a resolved close retires it.
 			const resolvedIdHex = channelId.toString('hex');
+			this._recoveryCloseRequested.delete(resolvedIdHex);
 			this._lastCloseBroadcast.delete(resolvedIdHex);
 			for (const [txid, idHex] of this._pendingCloseTxids) {
 				if (idHex === resolvedIdHex) this._pendingCloseTxids.delete(txid);
@@ -6867,6 +6875,12 @@ export class LightningNode extends EventEmitter {
 				this.onFundingWatchConfirmed(channelId, txid);
 			}
 		);
+		this.chainWatcher.on(
+			'funding:presplice-retired',
+			(channelId: Buffer, txid: string, outputIndex: number) => {
+				this.retirePreSpliceSpendWatch(channelId, txid, outputIndex);
+			}
+		);
 	}
 
 	/**
@@ -7353,6 +7367,23 @@ export class LightningNode extends EventEmitter {
 						btcNetwork
 				  ).p2wshOutput;
 
+			// Superseded funding outpoints whose expected splice spend is not yet
+			// irrevocable. Re-armed for EVERY channel, not just one with a live
+			// spliceInFlight: completeSplice clears that record at
+			// splice_locked, which on a zero-conf channel precedes the splice
+			// transaction confirming, so this list is the only thing that can
+			// bring the watch back (issue #479).
+			for (const leg of state.preSpliceSpendWatches ?? []) {
+				await this.chainWatcher.watchFundingSpendDuringSplice(
+					state.channelId || state.temporaryChannelId,
+					leg.txid,
+					leg.outputIndex,
+					fundingScript,
+					leg.spliceTxid,
+					generation
+				);
+			}
+
 			const inflight = state.spliceInFlight;
 			if (inflight) {
 				// In-flight splice: watch the splice tx's new funding output INSTEAD
@@ -7383,11 +7414,24 @@ export class LightningNode extends EventEmitter {
 				// broadcasts an old commitment) is detected. The splice tx itself
 				// spends the old output legitimately, so it is ignored. state.fundingTxid
 				// still holds the OLD outpoint until completeSplice swaps it.
+				const supersededTxid = Buffer.from(state.fundingTxid)
+					.reverse()
+					.toString('hex');
 				await this.chainWatcher.watchFundingSpendDuringSplice(
 					state.channelId || state.temporaryChannelId,
-					Buffer.from(state.fundingTxid).reverse().toString('hex'),
+					supersededTxid,
 					state.fundingOutputIndex,
 					fundingScript,
+					spliceTxidHex
+				);
+				// Also recorded durably here, so a row written before the field
+				// existed starts carrying it, and so the NEXT restart still
+				// finds the outpoint once completeSplice has cleared
+				// spliceInFlight (issue #479).
+				this.recordPreSpliceSpendWatch(
+					state.channelId || state.temporaryChannelId,
+					supersededTxid,
+					state.fundingOutputIndex,
 					spliceTxidHex
 				);
 				if (inflight.fullySigned && this.isCurrentChainStartup(generation)) {
@@ -7482,6 +7526,62 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Remember, durably, that this superseded funding outpoint still needs a
+	 * spend watch, and which transaction is expected to spend it (issue #479).
+	 *
+	 * Idempotent per outpoint: re-arming the same leg (a restart, a retried
+	 * watch:funding) must not grow the list. Persisted through the ordinary
+	 * channel persist, so a failure here costs the NEXT restart its watch and
+	 * nothing else.
+	 */
+	private recordPreSpliceSpendWatch(
+		channelId: Buffer,
+		txid: string,
+		outputIndex: number,
+		spliceTxid: string
+	): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const state = channel.getFullState();
+		const existing = state.preSpliceSpendWatches ?? [];
+		if (
+			existing.some((w) => w.txid === txid && w.outputIndex === outputIndex)
+		) {
+			return;
+		}
+		state.preSpliceSpendWatches = [
+			...existing,
+			{ txid, outputIndex, spliceTxid }
+		];
+		this.persistChannel(channelId);
+	}
+
+	/**
+	 * The watcher retired a pre-splice spend watch because the transaction it
+	 * was ignoring is irrevocably confirmed as that outpoint's spender. Drop
+	 * the durable record with it, so the list stays empty on a channel with no
+	 * splice in flight and a later restart does not re-arm a watch for an
+	 * outpoint nothing can spend any more (issue #479).
+	 */
+	private retirePreSpliceSpendWatch(
+		channelId: Buffer,
+		txid: string,
+		outputIndex: number
+	): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const state = channel.getFullState();
+		const remaining = (state.preSpliceSpendWatches ?? []).filter(
+			(w) => !(w.txid === txid && w.outputIndex === outputIndex)
+		);
+		if (remaining.length === (state.preSpliceSpendWatches ?? []).length) {
+			return;
+		}
+		state.preSpliceSpendWatches = remaining.length ? remaining : undefined;
+		this.persistChannel(channelId);
+	}
+
+	/**
 	 * Arm the chain watches for the channel whose funding tx this is, exactly
 	 * as restoreChainWatches would on the next restart: confirmation and
 	 * announcement depth detection, breach (spend) detection, and the
@@ -7536,11 +7636,26 @@ export class LightningNode extends EventEmitter {
 								state.remoteBasepoints.fundingPubkey,
 								btcNetwork
 						  ).p2wshOutput;
+					const supersededTxid = Buffer.from(state.fundingTxid)
+						.reverse()
+						.toString('hex');
 					await this.chainWatcher.watchFundingSpendDuringSplice(
 						channelId,
-						Buffer.from(state.fundingTxid).reverse().toString('hex'),
+						supersededTxid,
 						state.fundingOutputIndex,
 						oldFundingScript,
+						txidHex
+					);
+					// Durably, so the next start can re-arm it. spliceInFlight
+					// cannot: completeSplice clears it when splice_locked is
+					// sent, which on a zero-conf channel is the same action
+					// batch as this broadcast, so a restart before the splice
+					// confirmed came back with no record of the outpoint at all
+					// (issue #479).
+					this.recordPreSpliceSpendWatch(
+						channelId,
+						supersededTxid,
+						state.fundingOutputIndex,
 						txidHex
 					);
 				}
@@ -15924,6 +16039,32 @@ export class LightningNode extends EventEmitter {
 		// is unproven is the one thing this state must not do. The channel
 		// keeps asking the peer to close on every reconnect meanwhile.
 		if (this.skipAutoCloseRestoreUnproven(state, `errored: ${reason}`)) {
+			// Nothing automatic will ever close this channel, so the peer-close
+			// request is the only thing that moves it, and it has to leave NOW.
+			// handlePeerReconnected regenerates it on every reconnect, but a
+			// channel the peer errors while it is already connected would
+			// otherwise sit until something else happened to reconnect them,
+			// with both sides waiting on the other (issue #469).
+			//
+			// ONCE per channel per process. The request IS a BOLT 1 error, and
+			// this path runs on every error we process, including the one a
+			// peer sends back in answer to ours: sending unconditionally makes
+			// two nodes trade errors forever. The durable repeat lives on the
+			// reconnect path, which is naturally paced, so nothing is lost.
+			//
+			// Latched BEFORE the send, not after it. processActions dispatches
+			// synchronously, so the peer's answering error can re-enter this
+			// very method before the call returns, and a latch set afterwards
+			// is still empty when it does. Cleared again if nothing was
+			// actually sent, so a channel with no disposition yet can still
+			// ask later.
+			const idHex = channelId.toString('hex');
+			if (!this._recoveryCloseRequested.has(idHex)) {
+				this._recoveryCloseRequested.add(idHex);
+				if (!this.channelManager.sendRecoveryCloseRequest(channelId)) {
+					this._recoveryCloseRequested.delete(idHex);
+				}
+			}
 			return;
 		}
 		if (state.v2InFlight && !channel.isV2AttemptBroadcastable()) {

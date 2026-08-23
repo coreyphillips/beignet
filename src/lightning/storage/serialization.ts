@@ -443,10 +443,18 @@ export interface ISerializedChannelState {
 	// restart of a possibly-stale restore must not forget that broadcasting
 	// is forbidden until reestablish proves the state current.
 	stateUncertain?: boolean;
-	// Issue #469: this row came from a Recovery Capsule and no
-	// channel_reestablish has confirmed it against the peer yet. MUST persist -
-	// a restart between the restore and the first reconnect must not forget
-	// that an AUTOMATIC commitment broadcast is forbidden.
+	// Issue #479: funding outpoints a splice superseded whose spend must still
+	// be watched, with the splice tx expected to spend each. MUST persist -
+	// spliceInFlight is cleared at splice_locked, so it cannot rebuild this
+	// watch after a restart, and the old outpoint would go unwatched.
+	preSpliceSpendWatches?: Array<{
+		txid: string;
+		outputIndex: number;
+		spliceTxid: string;
+	}>;
+	// Issue #469: this row came from a Recovery Capsule, whose recency nothing
+	// can prove. MUST persist - a restart must not forget that an AUTOMATIC
+	// commitment broadcast is forbidden.
 	restoreRecencyUnproven?: boolean;
 	// Recovery 5.6 liveness: the persisted peer-close disposition; the wire
 	// error is regenerated from this on every reconnect. 'restore-unproven' is
@@ -852,6 +860,9 @@ export function serializeChannelState(
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
 		restoreRecencyUnproven: s.restoreRecencyUnproven,
+		preSpliceSpendWatches: s.preSpliceSpendWatches?.length
+			? s.preSpliceSpendWatches.map((w) => ({ ...w }))
+			: undefined,
 		recoveryCloseReason: s.recoveryCloseReason,
 		closeReason: s.closeReason,
 		dlpRemotePerCommitmentPoint: bufToHex(s.dlpRemotePerCommitmentPoint ?? null)
@@ -1042,6 +1053,9 @@ export function deserializeChannelState(
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
 		restoreRecencyUnproven: s.restoreRecencyUnproven,
+		preSpliceSpendWatches: s.preSpliceSpendWatches?.length
+			? s.preSpliceSpendWatches.map((w) => ({ ...w }))
+			: undefined,
 		recoveryCloseReason: s.recoveryCloseReason,
 		closeReason: s.closeReason,
 		dlpRemotePerCommitmentPoint:

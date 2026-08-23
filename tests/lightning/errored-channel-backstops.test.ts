@@ -477,6 +477,32 @@ describe('Issue #469: a capsule-restored channel holds its automatic closes', fu
 		fx.bob.destroy();
 	});
 
+	it('asks the peer to close immediately, and only once', () => {
+		const fx = setupUnprovenChannel(83);
+		const errorsOut: Buffer[] = [];
+		fx.alice.on(
+			'message:outbound',
+			(_pk: string, type: number, payload: Buffer) => {
+				if (type === 17) errorsOut.push(payload);
+			}
+		);
+
+		(fx.alice as any).handleChannelErrored(fx.channelId, 'peer sent an error');
+
+		// Nothing automatic will ever close this channel, so if the request
+		// waited for the next reconnect both sides could sit on each other
+		// indefinitely.
+		expect(errorsOut, 'the peer-close request went out now').to.have.length(1);
+
+		// And exactly once: the request IS a BOLT 1 error, and this path also
+		// runs on errors RECEIVED, so an unlatched send makes two nodes trade
+		// errors forever. The durable repeat lives on the reconnect path.
+		(fx.alice as any).handleChannelErrored(fx.channelId, 'and again');
+		expect(errorsOut, 'no error-for-error loop').to.have.length(1);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
 	it('reports the hold on the recovery status', () => {
 		const fx = setupUnprovenChannel(81);
 

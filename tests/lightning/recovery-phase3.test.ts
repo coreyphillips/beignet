@@ -1123,20 +1123,23 @@ describe('Recovery phase 3: end to end restore from the capsule alone', () => {
 		const bobChannel = bob.getChannelManager().listChannels()[0];
 		expect(restoredChannel.getState()).to.equal(ChannelState.NORMAL);
 		expect(bobChannel.getState()).to.equal(ChannelState.NORMAL);
-		// The safety net 5.4 names has now run, so the restriction lifts and
-		// the lift is on disk: a restart must not reinstate it (issue #469).
-		// This is also what separates the marker from stateUncertain, which
-		// would have routed this very exchange to DLP instead.
+		// The channel RESUMED and pays below, which is what separates the hold
+		// from stateUncertain: that flag would have routed this very exchange
+		// to DLP. But the hold itself stays (issue #469). A compatible
+		// reestablish is not proof of recency, and in peer-storage mode the
+		// peer holding the capsule is the same peer we would be trusting, so
+		// this node will not choose to broadcast this commitment on its own
+		// initiative no matter how well the exchange went.
 		expect(
 			restoredChannel.getFullState().restoreRecencyUnproven,
-			'a completed reestablish lifts the restore hold'
-		).to.equal(undefined);
+			'a compatible reestablish does not lift the restore hold'
+		).to.equal(true);
 		expect(
 			restoredStorage.loadChannel(
 				restoredChannel.getChannelId()!.toString('hex')
 			)!.state.restoreRecencyUnproven,
-			'and the lift was persisted'
-		).to.equal(undefined);
+			'and it is still on disk for the next restart'
+		).to.equal(true);
 
 		buildDirectGraph(restored);
 		const invoice = bob.createInvoice({
