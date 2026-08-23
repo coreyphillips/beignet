@@ -16,12 +16,19 @@
  */
 
 import { expect } from 'chai';
-import { BeignetError, BeignetErrorCode } from '../../src/cli/errors';
+import * as fs from 'fs';
+import * as path from 'path';
+import {
+	BeignetError,
+	BeignetErrorCode,
+	isRetryableError
+} from '../../src/cli/errors';
 import { BeignetNode } from '../../src/cli/beignet-node';
-import { statusForErrorCode } from '../../src/cli/daemon';
+import { statusForErrorCode, statusForFailure } from '../../src/cli/daemon';
 import {
 	ChannelFundingUnavailableCode,
 	ChannelFundingUnavailableError,
+	InvalidPeerConnectError,
 	InvalidSpliceError
 } from '../../src/lightning/node/types';
 
@@ -163,32 +170,94 @@ describe('Issue #471: state and config refusals carry a code, not a 500', () => 
 	});
 });
 
-describe('Issue #471: every BeignetErrorCode has a decided HTTP status', () => {
+/**
+ * Every code the daemon can put on the wire, read out of the source rather than
+ * from the enum: BeignetError takes an arbitrary string and production uses
+ * that, so walking BeignetErrorCode alone would leave codes like FEE_EXCEEDS_MAX
+ * unchecked (they were falling through to 500).
+ */
+function emittedErrorCodes(): string[] {
+	const root = path.join(__dirname, '..', '..', 'src');
+	const files: string[] = [];
+	const walk = (dir: string): void => {
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			const full = path.join(dir, entry.name);
+			if (entry.isDirectory()) walk(full);
+			else if (entry.name.endsWith('.ts')) files.push(full);
+		}
+	};
+	walk(root);
+	const patterns = [
+		/new BeignetError\(\s*'([A-Z0-9_]+)'/g,
+		/new BeignetError\(\s*BeignetErrorCode\.([A-Z0-9_]+)/g,
+		/\bfailure\(\s*'([A-Z0-9_]+)'/g,
+		// An assignment inside a catch, which becomes failure(code, msg). NOT a
+		// `readonly code =` class field: those live on plain Error subclasses
+		// the daemon never unwraps, so they scrub whole (issue #474).
+		/(?<!readonly )\bcode\s*=\s*'([A-Z0-9_]+)'/g
+	];
+	const codes = new Set<string>(Object.values(BeignetErrorCode));
+	for (const file of files) {
+		const src = fs.readFileSync(file, 'utf8');
+		for (const pattern of patterns) {
+			for (const match of src.matchAll(pattern)) codes.add(match[1]);
+		}
+		// Values of the string-keyed translation tables (payment failure codes,
+		// recovery refusal reasons) are emitted the same way.
+		for (const block of src.matchAll(
+			/(?:codeMap|RESTORE_ERROR_CODES)[^=]*=\s*\{([\s\S]*?)\n\t*\};/g
+		)) {
+			for (const match of block[1].matchAll(/:\s*'([A-Z0-9_]+)'/g))
+				codes.add(match[1]);
+		}
+	}
+	return [...codes].sort();
+}
+
+describe('Issue #471: every error code the daemon emits has a decided status', () => {
 	/**
 	 * Codes that keep the 500 default on purpose. WALLET_CREATE_FAILED,
-	 * ADDRESS_FAILED and REFRESH_FAILED are node faults. SEND_FAILED,
-	 * CLOSE_FAILED, FORCE_CLOSE_FAILED and ZERO_CONF_FAILED are grab-bags whose
-	 * producers span caller state and genuine faults, so no single status is
-	 * honest until they are split. INSTANCE_ALREADY_RUNNING never reaches HTTP.
+	 * ADDRESS_FAILED, REFRESH_FAILED and DESCRIPTOR_EXPORT_FAILED are node
+	 * faults. SEND_FAILED, CLOSE_FAILED, FORCE_CLOSE_FAILED, ZERO_CONF_FAILED
+	 * and the PSBT_* trio are grab-bags whose producers span caller state and
+	 * genuine faults, so no single status is honest until they are split
+	 * (issue #474). INSTANCE_ALREADY_RUNNING never reaches HTTP, and
+	 * INTERNAL_ERROR is the scrub itself.
 	 *
-	 * Adding a code to this list must be a decision, not an oversight: that is
-	 * the whole point of walking the enum here.
+	 * Adding a code here must be a decision, not an oversight: that is the
+	 * whole point of reading the list out of the source.
 	 */
-	const STAYS_500: string[] = [
-		BeignetErrorCode.WALLET_CREATE_FAILED,
-		BeignetErrorCode.ADDRESS_FAILED,
-		BeignetErrorCode.REFRESH_FAILED,
-		BeignetErrorCode.SEND_FAILED,
-		BeignetErrorCode.CLOSE_FAILED,
-		BeignetErrorCode.FORCE_CLOSE_FAILED,
-		BeignetErrorCode.ZERO_CONF_FAILED,
-		BeignetErrorCode.INSTANCE_ALREADY_RUNNING
-	];
+	const STAYS_500 = new Set<string>([
+		'WALLET_CREATE_FAILED',
+		'ADDRESS_FAILED',
+		'REFRESH_FAILED',
+		'DESCRIPTOR_EXPORT_FAILED',
+		'SEND_FAILED',
+		'CLOSE_FAILED',
+		'FORCE_CLOSE_FAILED',
+		'ZERO_CONF_FAILED',
+		'PSBT_BUILD_FAILED',
+		'PSBT_COMBINE_FAILED',
+		'PSBT_IMPORT_FAILED',
+		'INSTANCE_ALREADY_RUNNING',
+		'INTERNAL_ERROR',
+		'CAPSULE_RESTORE_INSTALL_FAILED'
+	]);
 
-	for (const code of Object.values(BeignetErrorCode)) {
+	const CODES = emittedErrorCodes();
+
+	it('finds the codes by reading the source, not just the enum', () => {
+		// A guard on the guard: if the scan stops matching, every assertion
+		// below passes vacuously.
+		expect(CODES.length).to.be.greaterThan(50);
+		expect(CODES).to.include('FEE_EXCEEDS_MAX');
+		expect(CODES).to.include(BeignetErrorCode.CONNECT_FAILED);
+	});
+
+	for (const code of CODES) {
 		it(`${code} is mapped or explicitly left as a server fault`, () => {
 			const status = statusForErrorCode(code);
-			if (STAYS_500.includes(code)) {
+			if (STAYS_500.has(code)) {
 				expect(status).to.equal(500);
 			} else {
 				expect(
@@ -198,6 +267,39 @@ describe('Issue #471: every BeignetErrorCode has a decided HTTP status', () => {
 			}
 		});
 	}
+
+	/**
+	 * The invariant behind the whole change: 502/503/504 tell a caller to try
+	 * again. A code isPermanentFailure calls permanent may never answer one, or
+	 * the status and the library predicate give opposite instructions.
+	 */
+	it('never answers a retryable 5xx for a permanent failure', () => {
+		for (const code of CODES) {
+			const status = statusForErrorCode(code);
+			if (status < 500 || status === 500) continue;
+			const err = new BeignetError(code, 'test');
+			expect(
+				isRetryableError(err),
+				`${code} answers ${status}, which says retry, but isRetryableError says permanent`
+			).to.equal(true);
+		}
+	});
+
+	it('drops a permanent BOLT 4 payment failure out of the retryable class', () => {
+		// 0x400f = PERM|incorrect_or_unknown_payment_details. The payee will
+		// refuse it every time, so PAYMENT_FAILED's own 502 would be a lie.
+		const perm = new BeignetError(
+			BeignetErrorCode.PAYMENT_FAILED,
+			'gone',
+			0x400f
+		);
+		expect(isRetryableError(perm)).to.equal(false);
+		expect(statusForFailure(perm.code, perm.failureCode)).to.equal(409);
+		// Without the flag it stays upstream trouble, which is retryable.
+		const temp = new BeignetError(BeignetErrorCode.PAYMENT_FAILED, 'busy', 7);
+		expect(isRetryableError(temp)).to.equal(true);
+		expect(statusForFailure(temp.code, temp.failureCode)).to.equal(502);
+	});
 
 	it('keeps an unknown code a server fault', () => {
 		expect(statusForErrorCode('INTERNAL_ERROR')).to.equal(500);
@@ -322,12 +424,54 @@ describe('Issue #472: the splice paths guard their arguments too', () => {
 		expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
 	});
 
-	it('refuses a non-positive splice feerate', () => {
-		const err = refusalFrom(
-			() => guardedSplice().spliceQuote(CHANNEL_ID, 'in', 0),
-			'splice feerate'
-		);
-		expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
+	/**
+	 * funding_feerate_perkw is a u32 on the wire. writeUInt32BE turns 1.5 into
+	 * 1, quietly repricing the splice, and throws on 2^32 AFTER the channel has
+	 * moved to SPLICING and persisted, which wedges it until a restart. Both
+	 * bounds have to be enforced before any of that runs.
+	 */
+	const BAD_FEERATES: Array<[string, number]> = [
+		['zero', 0],
+		['negative', -1],
+		['fractional', 1.5],
+		['above u32', 0x1_0000_0000],
+		['not finite', Number.POSITIVE_INFINITY]
+	];
+	for (const [label, feerate] of BAD_FEERATES) {
+		it(`refuses a ${label} splice feerate on all three entry points`, () => {
+			const calls: Array<() => unknown> = [
+				(): unknown => guardedSplice().spliceQuote(CHANNEL_ID, 'in', feerate),
+				(): unknown => guardedSplice().spliceIn(CHANNEL_ID, 50_000, feerate),
+				(): unknown => guardedSplice().spliceOut(CHANNEL_ID, 50_000, feerate)
+			];
+			for (const call of calls) {
+				const err = refusalFrom(call, `${label} feerate`);
+				expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
+				expect(err.message).to.include('4294967295');
+			}
+		});
+	}
+
+	it('refuses the same out-of-range values on the v2 open wire fields', () => {
+		const bn = (): BeignetNode =>
+			nodeWithEngine({
+				openChannelV2: (): never => {
+					expect.fail('the engine was reached past the guard');
+				}
+			});
+		const cases: Array<[string, Record<string, number>]> = [
+			['fundingFeeratePerkw', { fundingFeeratePerkw: 1.5 }],
+			['commitmentFeeratePerkw', { commitmentFeeratePerkw: 0x1_0000_0000 }],
+			['locktime', { locktime: 2.5 }]
+		];
+		for (const [label, extra] of cases) {
+			const err = refusalFrom(
+				() => bn().openChannelV2(PUBKEY, { amountSats: 100_000, ...extra }),
+				label
+			);
+			expect(err.code, label).to.equal(BeignetErrorCode.INVALID_PARAMS);
+			expect(err.message, label).to.include(label);
+		}
 	});
 
 	it('refuses a destination address this network cannot decode', () => {
@@ -338,5 +482,47 @@ describe('Issue #472: the splice paths guard their arguments too', () => {
 		);
 		expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
 		expect(err.message).to.include('destinationAddress');
+	});
+});
+
+describe('Issue #471: the grab-bag codes stop swallowing caller refusals', () => {
+	it('a malformed pubkey is INVALID_PARAMS, not a CONNECT_FAILED to retry', async () => {
+		const bn = nodeWithEngine({
+			// The engine method is async, so its refusals arrive as rejections.
+			connectPeer: async (): Promise<never> => {
+				throw new InvalidPeerConnectError('pubkey must be 33 bytes of hex');
+			},
+			listPeers: (): unknown[] => []
+		});
+		Object.assign(bn, { _connectTimeoutMs: 5_000 });
+		try {
+			await bn.connectPeer('nonsense');
+			expect.fail('expected the dial to be refused');
+		} catch (err: unknown) {
+			expect(err).to.be.instanceOf(BeignetError);
+			const beignetErr = err as BeignetError;
+			// CONNECT_FAILED answers 502, which tells an agent to dial again.
+			expect(beignetErr.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
+			expect(statusForErrorCode(beignetErr.code)).to.equal(400);
+		}
+	});
+
+	it('a genuine dial failure is still CONNECT_FAILED', async () => {
+		const bn = nodeWithEngine({
+			connectPeer: async (): Promise<never> => {
+				throw new Error('ECONNREFUSED');
+			},
+			listPeers: (): unknown[] => []
+		});
+		Object.assign(bn, { _connectTimeoutMs: 5_000 });
+		try {
+			await bn.connectPeer(PUBKEY, '127.0.0.1', 9735);
+			expect.fail('expected the dial to fail');
+		} catch (err: unknown) {
+			expect((err as BeignetError).code).to.equal(
+				BeignetErrorCode.CONNECT_FAILED
+			);
+			expect(statusForErrorCode((err as BeignetError).code)).to.equal(502);
+		}
 	});
 });

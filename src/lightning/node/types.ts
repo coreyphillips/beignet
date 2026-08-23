@@ -979,18 +979,41 @@ export class LightningPaymentError extends Error {
 }
 
 /**
- * A channel open refused for the caller's own arguments: the request as
- * written cannot be served, whatever the node's state. Extends Error so
- * existing catch blocks and message assertions keep working, and gives the
- * CLI layer something to key on: it maps this to a BeignetError
- * INVALID_PARAMS so the daemon answers 400 carrying this message, instead of
- * scrubbing an untyped throw to a generic 500 (issue #464). Node faults stay
- * untyped on purpose, so they keep scrubbing.
+ * A request refused for the caller's own arguments: as written it cannot be
+ * served, whatever the node's state. Extends Error so existing catch blocks and
+ * message assertions keep working, and gives the CLI layer one thing to key on:
+ * it maps any of these to a BeignetError INVALID_PARAMS so the daemon answers
+ * 400 carrying the message, instead of scrubbing an untyped throw to a generic
+ * 500 (issue #464). Node faults stay untyped on purpose, so they keep scrubbing.
+ *
+ * Subclassed per surface so a caller can still tell an open from a splice from
+ * a dial; catch the base when the distinction does not matter.
  */
-export class InvalidChannelOpenError extends Error {
+export class InvalidRequestError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'InvalidRequestError';
+	}
+}
+
+/** A channel open refused for the caller's own arguments. */
+export class InvalidChannelOpenError extends InvalidRequestError {
 	constructor(message: string) {
 		super(message);
 		this.name = 'InvalidChannelOpenError';
+	}
+}
+
+/**
+ * A peer dial refused for the caller's own arguments (a malformed pubkey, a
+ * host without a port, a host/port pair contradicting the WebSocket url).
+ * Without this the CLI's blanket wrap turns them into CONNECT_FAILED, which
+ * answers 502 and tells an agent to retry a request that can never succeed.
+ */
+export class InvalidPeerConnectError extends InvalidRequestError {
+	constructor(message: string) {
+		super(message);
+		this.name = 'InvalidPeerConnectError';
 	}
 }
 
@@ -1027,11 +1050,9 @@ export class ChannelFundingUnavailableError extends Error {
 
 /**
  * A splice refused for the caller's own arguments. Same contract as
- * InvalidChannelOpenError, under its own name because a splice is not an open:
- * the CLI layer maps it to INVALID_PARAMS so the daemon answers 400 carrying
- * this message.
+ * InvalidChannelOpenError, under its own name because a splice is not an open.
  */
-export class InvalidSpliceError extends Error {
+export class InvalidSpliceError extends InvalidRequestError {
 	constructor(message: string) {
 		super(message);
 		this.name = 'InvalidSpliceError';

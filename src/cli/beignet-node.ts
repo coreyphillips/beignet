@@ -97,8 +97,7 @@ import { getPublicKey } from '../lightning/crypto/ecdh';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
 import {
 	INodeConfig,
-	InvalidChannelOpenError,
-	InvalidSpliceError,
+	InvalidRequestError,
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode
 } from '../lightning/node/types';
@@ -641,10 +640,7 @@ function fundingOrRefuse<T>(run: () => T): T {
 	try {
 		return run();
 	} catch (err: unknown) {
-		if (
-			err instanceof InvalidChannelOpenError ||
-			err instanceof InvalidSpliceError
-		) {
+		if (err instanceof InvalidRequestError) {
 			throw new BeignetError(BeignetErrorCode.INVALID_PARAMS, err.message);
 		}
 		if (err instanceof ChannelFundingUnavailableError) {
@@ -809,6 +805,26 @@ function requireOpenAmounts(amountSats: unknown, pushSats?: unknown): void {
 			'pushSats must be a non-negative integer number of satoshis'
 		);
 	}
+}
+
+/**
+ * A value the wire carries as a u32 (feerate_perkw, locktime). Buffer's
+ * writeUInt32BE truncates 1.5 to 1 and throws on 2^32, and both happen after
+ * the channel's state machine has moved, so the bound is enforced here.
+ */
+function requireU32(value: unknown, field: string, min = 1): number {
+	if (
+		typeof value !== 'number' ||
+		!Number.isInteger(value) ||
+		value < min ||
+		value > 0xffffffff
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be an integer between ${min} and 4294967295`
+		);
+	}
+	return value;
 }
 
 /**
@@ -4099,6 +4115,12 @@ export class BeignetNode extends EventEmitter {
 			await Promise.race([connectPromise, timeoutPromise]);
 		} catch (err) {
 			if (err instanceof BeignetError) throw err;
+			// A malformed pubkey or an unpaired host/port is the caller's own
+			// request, not a dial that failed: CONNECT_FAILED answers 502 and
+			// tells an agent to retry something that can never succeed.
+			if (err instanceof InvalidRequestError) {
+				throw new BeignetError(BeignetErrorCode.INVALID_PARAMS, err.message);
+			}
 			// Wrap raw transport/handshake failures so callers get a clean error
 			// instead of an uncaught socket exception. A mid-handshake close almost
 			// always means a wrong node pubkey or a non-LN address/port.
@@ -6070,6 +6092,12 @@ export class BeignetNode extends EventEmitter {
 		}
 	): ChannelInfo {
 		requireOpenAmounts(params.amountSats);
+		if (params.fundingFeeratePerkw !== undefined)
+			requireU32(params.fundingFeeratePerkw, 'fundingFeeratePerkw');
+		if (params.commitmentFeeratePerkw !== undefined)
+			requireU32(params.commitmentFeeratePerkw, 'commitmentFeeratePerkw');
+		if (params.locktime !== undefined)
+			requireU32(params.locktime, 'locktime', 0);
 		const channel = fundingOrRefuse(() =>
 			this.node.openChannelV2(peerPubkey, {
 				fundingSatoshis: BigInt(params.amountSats),
@@ -6101,7 +6129,7 @@ export class BeignetNode extends EventEmitter {
 		feeratePerkw: number
 	): ReturnType<LightningNode['spliceQuote']> {
 		const idBuf = requireChannelIdHex(channelId);
-		requirePositiveFiniteNumber(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw');
 		return fundingOrRefuse(() =>
 			this.node.spliceQuote(idBuf, direction, feeratePerkw)
 		);
@@ -6114,7 +6142,7 @@ export class BeignetNode extends EventEmitter {
 	): SpliceResult {
 		const idBuf = requireChannelIdHex(channelId);
 		requirePositiveSafeInteger(amountSats, 'amountSats');
-		requirePositiveFiniteNumber(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw');
 		const result = fundingOrRefuse(() =>
 			this.node.spliceIn(idBuf, BigInt(amountSats), feeratePerkw)
 		);
@@ -6131,7 +6159,7 @@ export class BeignetNode extends EventEmitter {
 	): SpliceResult {
 		const idBuf = requireChannelIdHex(channelId);
 		requirePositiveSafeInteger(amountSats, 'amountSats');
-		requirePositiveFiniteNumber(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw');
 		let destinationScript: Buffer | undefined;
 		if (destinationAddress) {
 			const bitcoin = require('bitcoinjs-lib');

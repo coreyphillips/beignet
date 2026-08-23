@@ -177,6 +177,7 @@ import {
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode,
 	InvalidSpliceError,
+	InvalidPeerConnectError,
 	IChannelHealth,
 	IStructuredLog,
 	IPaymentProof,
@@ -200,6 +201,7 @@ import {
 	validateBuffer,
 	validateBufferMinMax,
 	validatePositiveBigint,
+	validateU32,
 	validatePort,
 	validateHost,
 	MAX_MESSAGE_SIZE,
@@ -6522,7 +6524,7 @@ export class LightningNode extends EventEmitter {
 		}
 		this.assertPeerContactPermitted('connectPeer');
 		const pubkeyErr = validateHexPubkey(pubkey, 'pubkey');
-		if (pubkeyErr) throw new Error(pubkeyErr);
+		if (pubkeyErr) throw new InvalidPeerConnectError(pubkeyErr);
 		if (transport?.type === 'ws' && transport.url !== undefined) {
 			// Derive the dial address from the explicit URL (and reject a
 			// mismatched host/port pair to avoid ambiguous bookkeeping).
@@ -6531,7 +6533,7 @@ export class LightningNode extends EventEmitter {
 				(host !== undefined && host !== parsed.host) ||
 				(port !== undefined && port !== parsed.port)
 			) {
-				throw new Error(
+				throw new InvalidPeerConnectError(
 					'host/port conflict with the WebSocket url (omit host/port or make them match)'
 				);
 			}
@@ -6540,7 +6542,7 @@ export class LightningNode extends EventEmitter {
 		}
 		if (host === undefined && port === undefined) {
 			if (transport?.type === 'ws') {
-				throw new Error(
+				throw new InvalidPeerConnectError(
 					'WebSocket transport requires host+port or an explicit url'
 				);
 			}
@@ -6548,14 +6550,14 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		if (host === undefined || port === undefined) {
-			throw new Error(
+			throw new InvalidPeerConnectError(
 				'host and port must be provided together (omit both to resolve from gossip/DNS)'
 			);
 		}
 		const hostErr = validateHost(host);
-		if (hostErr) throw new Error(hostErr);
+		if (hostErr) throw new InvalidPeerConnectError(hostErr);
 		const portErr = validatePort(port);
-		if (portErr) throw new Error(portErr);
+		if (portErr) throw new InvalidPeerConnectError(portErr);
 		await this.peerManager.connectPeer(pubkey, host, port, transport);
 	}
 
@@ -8330,6 +8332,19 @@ export class LightningNode extends EventEmitter {
 				'max funding cannot be combined with requestFunds (the lease fee is not known when the max is committed)'
 			);
 		}
+		// open_channel2 carries all three as u32. Same reason as splice_init:
+		// encoding runs after the channel exists and is keyed by temporary id.
+		for (const [name, value] of [
+			['fundingFeeratePerkw', params.fundingFeeratePerkw],
+			['commitmentFeeratePerkw', params.commitmentFeeratePerkw],
+			['locktime', params.locktime]
+		] as Array<[string, number | undefined]>) {
+			if (value === undefined) continue;
+			const err = validateU32(value, name, {
+				min: name === 'locktime' ? 0 : 1
+			});
+			if (err) throw new InvalidChannelOpenError(err);
+		}
 
 		const config = this.channelManager['config'] as {
 			localConfig?: import('../channel/types').IChannelConfig;
@@ -9207,6 +9222,13 @@ export class LightningNode extends EventEmitter {
 		if (cidErr) throw new InvalidSpliceError(cidErr);
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
 		if (satsErr) throw new InvalidSpliceError(satsErr);
+		// splice_init carries funding_feerate_perkw as a u32. Refuse a bad one
+		// here: encoding happens AFTER the channel has moved to SPLICING and
+		// persisted, so a throw there leaves the channel wedged until restart.
+		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
+			min: 1
+		});
+		if (feeErr) throw new InvalidSpliceError(feeErr);
 
 		// Splice-in must fund the channel increase with wallet inputs. Source them
 		// from the funding provider (UTXO selection + change + per-input signing),
@@ -9452,6 +9474,10 @@ export class LightningNode extends EventEmitter {
 	} {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new InvalidSpliceError(cidErr);
+		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
+			min: 1
+		});
+		if (feeErr) throw new InvalidSpliceError(feeErr);
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) {
 			throw new ChannelFundingUnavailableError(
@@ -9535,6 +9561,13 @@ export class LightningNode extends EventEmitter {
 		if (cidErr) throw new InvalidSpliceError(cidErr);
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
 		if (satsErr) throw new InvalidSpliceError(satsErr);
+		// splice_init carries funding_feerate_perkw as a u32. Refuse a bad one
+		// here: encoding happens AFTER the channel has moved to SPLICING and
+		// persisted, so a throw there leaves the channel wedged until restart.
+		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
+			min: 1
+		});
+		if (feeErr) throw new InvalidSpliceError(feeErr);
 		if (
 			destinationScript !== undefined &&
 			(!Buffer.isBuffer(destinationScript) || destinationScript.length === 0)

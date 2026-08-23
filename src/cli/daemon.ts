@@ -248,7 +248,10 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	PAYMENT_FAILED: 502,
 	PAYMENT_TIMEOUT: 504,
 	NO_ROUTE: 502,
-	OPEN_FAILED: 502,
+	FEE_ESTIMATE_FAILED: 502,
+	// An open that failed is not a dial that can be repeated: the caller has to
+	// decide what to change, so it must not read as a retryable 5xx.
+	OPEN_FAILED: 409,
 	PEER_NOT_CONNECTED: 409,
 	INSUFFICIENT_BALANCE: 409,
 	CHANNEL_NOT_READY: 409,
@@ -260,13 +263,21 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	CHANNEL_NOT_FOUND: 404,
 	INVOICE_EXPIRED: 410,
 	SPENDING_LIMIT_EXCEEDED: 403,
-	SERVICE_DRAINING: 503,
-	FEE_ESTIMATE_NOT_READY: 503
+	// Draining is an operator decision, not a wait: isPermanentFailure agrees,
+	// so it must not answer a retryable 5xx.
+	SERVICE_DRAINING: 409,
+	FEE_ESTIMATE_NOT_READY: 503,
+	// The caller's own fee ceiling, a recovery answer that needs a reachable
+	// quorum, and a resource with nothing recorded yet: none is a node fault.
+	FEE_EXCEEDS_MAX: 409,
+	RECOVERY_UNAVAILABLE: 503,
+	NO_DATA: 404
 	// Left unmapped on purpose, so they keep the 500 default:
-	// WALLET_CREATE_FAILED, ADDRESS_FAILED and REFRESH_FAILED are node faults,
-	// and SEND_FAILED, CLOSE_FAILED, FORCE_CLOSE_FAILED and ZERO_CONF_FAILED
-	// are grab-bags whose producers span caller state and genuine faults; each
-	// needs splitting before it can carry one honest status.
+	// WALLET_CREATE_FAILED, ADDRESS_FAILED, REFRESH_FAILED and
+	// DESCRIPTOR_EXPORT_FAILED are node faults, and SEND_FAILED, CLOSE_FAILED,
+	// FORCE_CLOSE_FAILED, ZERO_CONF_FAILED and the PSBT_* trio are grab-bags
+	// whose producers span caller state and genuine faults; each needs
+	// splitting before it can carry one honest status (issue #474).
 	// INSTANCE_ALREADY_RUNNING is a startup refusal and never reaches HTTP.
 };
 
@@ -274,11 +285,32 @@ export function statusForErrorCode(code: string): number {
 	return STATUS_BY_ERROR_CODE[code] ?? 500;
 }
 
+/**
+ * The status for a failure, which needs more than the code alone. A payment
+ * that failed with the BOLT 4 PERM flag is permanent whatever its code says,
+ * and PAYMENT_FAILED's own 502 would tell the caller to retry something the
+ * payee refuses every time. isRetryableError reads the same flag, so the
+ * status and the library predicate cannot drift apart.
+ */
+export function statusForFailure(code: string, failureCode?: number): number {
+	const status = statusForErrorCode(code);
+	if (status >= 500 && failureCode !== undefined && failureCode & 0x4000) {
+		return 409;
+	}
+	return status;
+}
+
 /** End the response, mapping a failure envelope to its HTTP status. */
 function endWithResult(res: http.ServerResponse, result: unknown): void {
-	const failureLike = result as { ok?: boolean; error?: { code?: string } };
+	const failureLike = result as {
+		ok?: boolean;
+		error?: { code?: string; failureCode?: number };
+	};
 	if (failureLike?.ok === false && failureLike.error?.code) {
-		res.statusCode = statusForErrorCode(failureLike.error.code);
+		res.statusCode = statusForFailure(
+			failureLike.error.code,
+			failureLike.error.failureCode
+		);
 	}
 	res.end(JSON.stringify(result));
 }
@@ -1267,7 +1299,12 @@ async function bootDaemon(
 				);
 			} catch (err: unknown) {
 				const msg = err instanceof Error ? err.message : String(err);
-				return failure('PAYMENT_FAILED', msg);
+				// A malformed bolt11 is INVALID_INVOICE, not a payment that
+				// failed: flattening it to PAYMENT_FAILED answers 502 and tells
+				// an agent to retry a string that will never decode. Same shape
+				// as the keysend route below.
+				const code = err instanceof BeignetError ? err.code : 'PAYMENT_FAILED';
+				return failure(code, msg);
 			}
 		},
 		'POST /invoice/pay-safe': async (body) => {
@@ -2340,8 +2377,10 @@ async function bootDaemon(
 			endWithResult(res, result);
 		} catch (err: unknown) {
 			if (err instanceof BeignetError) {
-				res.statusCode = statusForErrorCode(err.code);
-				res.end(JSON.stringify(failure(err.code, err.message)));
+				res.statusCode = statusForFailure(err.code, err.failureCode);
+				// toJSON carries failureCode, which the caller needs to tell a
+				// permanent BOLT 4 failure from one worth retrying.
+				res.end(JSON.stringify({ ok: false, error: err.toJSON() }));
 			} else {
 				// Unknown throw: log the detail server-side and answer with a
 				// generic message. Raw messages leak filesystem paths and

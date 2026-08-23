@@ -1010,7 +1010,7 @@ not repeat a 4xx unchanged.
 | `SPENDING_LIMIT_EXCEEDED` | Payments | 403 | Daily spending limit exceeded (permanent) |
 | `CHANNEL_NOT_FOUND` | Channels | 404 | Channel ID does not exist |
 | `CHANNEL_NOT_READY` | Channels | 409 | Channel is not in NORMAL state |
-| `OPEN_FAILED` | Channels | 502 | Channel open failed |
+| `OPEN_FAILED` | Channels | 409 | Channel open failed |
 | `CLOSE_FAILED` | Channels | 500 | Cooperative close failed |
 | `FORCE_CLOSE_FAILED` | Channels | 500 | Force close failed |
 | `ZERO_CONF_FAILED` | Channels | 500 | Zero-conf channel open failed |
@@ -1026,13 +1026,21 @@ not repeat a 4xx unchanged.
 | `MNEMONIC_REQUIRES_AUTH` | Node | 403 | apiToken or apiKeys required for mnemonic access |
 | `UNAUTHORIZED` | Node | 401 | Invalid or missing auth token / API key |
 | `FORBIDDEN` | Node | 403 | Valid API key without the scope a route requires |
-| `SERVICE_DRAINING` | Node | 503 | Node is draining, no new payments accepted |
+| `SERVICE_DRAINING` | Node | 409 | Node is draining, no new payments accepted |
 | `IDEMPOTENCY_CONFLICT` | HTTP | 409 | Same idempotency key used with different request body |
 | `RATE_LIMITED` | HTTP | 429 | Too many requests (token bucket rate limiter) |
 
-`SEND_FAILED`, `CLOSE_FAILED`, `FORCE_CLOSE_FAILED` and `ZERO_CONF_FAILED` keep
-the 500 default on purpose: each covers both caller-state problems and genuine
-node faults, so no single status is honest until they are split.
+`SEND_FAILED`, `CLOSE_FAILED`, `FORCE_CLOSE_FAILED`, `ZERO_CONF_FAILED` and the
+`PSBT_*` codes keep the 500 default on purpose: each covers both caller-state
+problems and genuine node faults, so no single status is honest until they are
+split.
+
+**Retryability is one decision, not two.** Every code answered with 502, 503 or
+504 is one `isRetryableError()` returns true for, and a test walks the status map
+to keep them from drifting apart. The status also reads the BOLT 4 failure code:
+a `PAYMENT_FAILED` carrying the PERM flag answers **409**, not `PAYMENT_FAILED`'s
+usual 502, because the payee refuses it every time. Failure bodies carry
+`failureCode` so a caller can make the same judgment itself.
 
 #### Typed Payment Errors (Lightning Layer)
 
