@@ -4582,6 +4582,18 @@ export class LightningNode extends EventEmitter {
 			channelId: string;
 			status: ChannelRecoveryStatus;
 			awaitingDurability: boolean;
+			/**
+			 * A restored channel whose funding this node cannot identify on
+			 * chain: something descending from its recorded attempts pays its
+			 * funding script, but nothing has spent it, so which output funded
+			 * the channel is unproven (issue #463). The channel is deliberately
+			 * held in that state indefinitely. It is not forgotten, because a
+			 * funding of its lineage is on chain; and it is not closed, because
+			 * the stored commitment signs the attempt the record names and not
+			 * whatever replaced it, so there is no unilateral exit to drive.
+			 * The peer's close is what resolves it, and this reports the wait.
+			 */
+			fundingUnidentified?: boolean;
 		}>;
 		/**
 		 * Peers whose channel_reestablish is parked because it names a channel
@@ -4604,18 +4616,22 @@ export class LightningNode extends EventEmitter {
 			channelId: string;
 			status: ChannelRecoveryStatus;
 			awaitingDurability: boolean;
+			fundingUnidentified?: boolean;
 		}> = [];
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			if (state.state === ChannelState.CLOSED) continue;
 			const id = state.channelId ?? state.temporaryChannelId;
 			const idHex = id.toString('hex');
+			const fundingUnidentified =
+				this.chainWatcher?.hasProvisionalFunding(id) ?? false;
 			channels.push({
 				channelId: idHex,
 				status: gated
 					? ChannelRecoveryStatus.Quarantined
 					: channel.getRecoveryStatus(),
-				awaitingDurability: holding.has(idHex)
+				awaitingDurability: holding.has(idHex),
+				...(fundingUnidentified ? { fundingUnidentified: true } : {})
 			});
 		}
 		return {
@@ -7388,11 +7404,15 @@ export class LightningNode extends EventEmitter {
 			// later replaced by RBF: the replacement pays this same funding
 			// script, so let the watch recognize it in the script's own
 			// history rather than filtering it out as absent (issue #463).
-			const discoverValueSats = this.channelManager.isChannelRestoredFromDisk(
-				state.channelId || state.temporaryChannelId
-			)
-				? Number(state.fundingSatoshis)
-				: undefined;
+			// What identifies it is lineage, not shape: the input outpoints of
+			// every attempt the record knows, which a replacement must all
+			// descend from and which no other channel of ours can match.
+			const discoverAttemptInputs =
+				this.channelManager.isChannelRestoredFromDisk(
+					state.channelId || state.temporaryChannelId
+				)
+					? this.recordedV2AttemptInputs(state)
+					: undefined;
 			await this.chainWatcher.watchFundingOutput(
 				state.channelId || state.temporaryChannelId,
 				txidHex,
@@ -7401,9 +7421,42 @@ export class LightningNode extends EventEmitter {
 				fundingScript,
 				undefined,
 				candidates,
-				discoverValueSats
+				discoverAttemptInputs
 			);
 		}
+	}
+
+	/**
+	 * The input outpoints of every v2 funding attempt this row records, as
+	 * `txid:vout`, for restored-watch discovery (issue #463). Empty for a
+	 * channel with no retained attempt, which disables discovery: without a
+	 * recorded attempt there is no lineage to descend from, and a funding
+	 * script alone identifies nothing (channelKeyDeriver is optional, so
+	 * channels with one peer can share their funding pubkeys).
+	 */
+	private recordedV2AttemptInputs(state: IChannelState): string[][] {
+		const records = [
+			...(state.v2InFlight ? [state.v2InFlight] : []),
+			...(state.v2PreviousAttempts ?? [])
+		];
+		const lineage: string[][] = [];
+		for (const record of records) {
+			try {
+				const tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
+				const inputs = tx.ins.map(
+					(input) =>
+						`${Buffer.from(input.hash).reverse().toString('hex')}:${
+							input.index
+						}`
+				);
+				if (inputs.length > 0) lineage.push(inputs);
+			} catch {
+				// An unparseable payload contributes no lineage. Every other
+				// attempt still constrains the search, and with none of them
+				// parsing, discovery simply stays off.
+			}
+		}
+		return lineage;
 	}
 
 	/**

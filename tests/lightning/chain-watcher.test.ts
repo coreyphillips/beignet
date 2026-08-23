@@ -103,10 +103,37 @@ class MockChainBackend implements IChainBackend {
 		this.scriptHashCallbacks.set(scriptHash, existing);
 	}
 
+	private historyHolds = 0;
+	private historyGate: Promise<void> | null = null;
+	private releaseGate: (() => void) | null = null;
+
+	/** Park the next `count` history fetches until releaseHistory(). */
+	holdHistory(count = 1): void {
+		this.historyHolds = count;
+		this.historyGate = new Promise((resolve) => {
+			this.releaseGate = resolve;
+		});
+	}
+
+	releaseHistory(): void {
+		this.historyHolds = 0;
+		this.releaseGate?.();
+		this.historyGate = null;
+		this.releaseGate = null;
+	}
+
 	async getScriptHashHistory(
 		scriptHash: string
 	): Promise<Array<{ txid: string; height: number }>> {
-		return this.scriptHashHistory.get(scriptHash) || [];
+		// The snapshot is taken BEFORE parking, so a held call answers with
+		// the history as it was when it started, which is what a stalled scan
+		// really holds.
+		const snapshot = this.scriptHashHistory.get(scriptHash) || [];
+		if (this.historyHolds > 0) {
+			this.historyHolds--;
+			await this.historyGate;
+		}
+		return snapshot;
 	}
 
 	async getTransaction(txid: string): Promise<Buffer> {
@@ -558,6 +585,87 @@ describe('Phase 4: Chain Watcher', () => {
 			backend.simulateScriptHashChange(scriptHash);
 			await new Promise((resolve) => setTimeout(resolve, 50));
 			expect(confirmed).to.be.false;
+		});
+	});
+
+	describe('Overlapping confirmation scans (issue #463)', () => {
+		/**
+		 * Checks for one watch can overlap: a subscription callback, a block
+		 * and the recheck timer all start them, and each holds a history it
+		 * fetched before its awaits. A scan that stalls while another finishes
+		 * must retire, not apply its stale answer over the newer one.
+		 */
+		it('a stalled scan never overwrites a newer confirmation', async () => {
+			const backend = new MockChainBackend();
+			const channelManager = new ChannelManager({
+				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				localFundingPrivkey: crypto.randomBytes(32)
+			});
+			channelManager.on('error', () => {});
+			const watcher = new ChainWatcher({ backend, channelManager });
+			watcher.on('error', () => {});
+
+			const channelId = crypto.randomBytes(32);
+			const script = bitcoin.payments.p2wsh({
+				redeem: { output: bitcoin.script.compile([bitcoin.opcodes.OP_TRUE]) }
+			}).output!;
+			const scriptHash = computeScriptHash(script);
+			const stale = 'aa'.repeat(32);
+			const winner = 'bb'.repeat(32);
+
+			await watcher.start();
+			backend.simulateNewBlock(200);
+			// The stalled scan's view: only the stale attempt, confirmed.
+			backend.setHistory(scriptHash, [{ txid: stale, height: 100 }]);
+			backend.holdHistory(1);
+			const arming = watcher.watchFundingOutput(
+				channelId,
+				stale,
+				0,
+				1,
+				script,
+				undefined,
+				[
+					{ txid: stale, outputIndex: 0 },
+					{ txid: winner, outputIndex: 1 }
+				]
+			);
+			await new Promise((r) => setTimeout(r, 20));
+
+			// The chain moves on and a second check completes against the newer
+			// history while the first is still parked mid-fetch.
+			backend.setHistory(scriptHash, [{ txid: winner, height: 150 }]);
+			await watcher.recheckAllWatches();
+			await new Promise((r) => setTimeout(r, 20));
+
+			// Only now does the stalled scan resume, holding its stale view.
+			backend.releaseHistory();
+			await arming;
+			await new Promise((r) => setTimeout(r, 20));
+
+			const held = (
+				watcher as unknown as {
+					watchedFundings: Map<
+						string,
+						{ txid: string; confirmed: boolean; missingChecks?: number }
+					>;
+				}
+			).watchedFundings.get(channelId.toString('hex'))!;
+			expect(held.confirmed, 'the newer scan confirmed').to.equal(true);
+			expect(held.txid, 'and the stalled one did not revert it').to.equal(
+				winner
+			);
+			// The stalled scan held a history the confirmation is not in, so
+			// on resuming it read the funding as ABSENT and counted that
+			// against a watch that had just confirmed. Three of those emit
+			// funding:missing for a funding that is on chain, which starts
+			// BOLT 2's forget clock against it.
+			expect(
+				held.missingChecks ?? 0,
+				'and did not count an absence against it either'
+			).to.equal(0);
+			watcher.stop();
 		});
 	});
 

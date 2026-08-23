@@ -105,14 +105,25 @@ interface IWatchedFunding {
 	 * filtering the script's history down to the recorded txids would report
 	 * the funding ABSENT while it sits confirmed in that very history.
 	 *
-	 * When set, an otherwise-empty filter falls back to reading the history
-	 * for transactions that CREATE an output paying this exact script for this
-	 * exact value. Script plus value makes a forgery expensive; it does not
-	 * make it authentic, and the script alone is public for an announced
-	 * channel (channel_announcement carries both funding pubkeys). So a match
-	 * is only ever PROVISIONAL, and binding waits for the second phase below.
+	 * When set, an otherwise-empty filter falls back to reading the funding
+	 * script's history for a transaction that could be a replacement of these
+	 * attempts. One entry per funding attempt the record knows, holding that
+	 * attempt's input outpoints as `txid:vout`.
+	 *
+	 * LINEAGE, not shape, is what identifies the funding. The script is not
+	 * unique: channelKeyDeriver is optional, and without it every channel with
+	 * a given peer shares one set of funding pubkeys and therefore one script,
+	 * so an older channel's own funding and close sit in this very history and
+	 * a legitimate spend of it proves nothing about WHICH channel it was. The
+	 * value is not fixed either: BOLT 2 lets a peer change its
+	 * funding_output_contribution between RBF attempts, which this
+	 * implementation supports, so a replacement can pay a different amount. A
+	 * replacement must instead share an input with every attempt it replaces,
+	 * which nothing outside this negotiation can arrange and which no other
+	 * channel of ours can satisfy: its funding spends coins this one never
+	 * pledged.
 	 */
-	discoverValueSats?: number;
+	discoverAttemptInputs?: string[][];
 	/**
 	 * Confirmed script-and-value matches that are not (yet) known to be this
 	 * channel's funding: candidates, never conclusions. They keep the watch
@@ -129,6 +140,13 @@ interface IWatchedFunding {
 	 * forever while the search continues past it (issue #463).
 	 */
 	provisional?: Array<{ txid: string; outputIndex: number; height: number }>;
+	/**
+	 * Bumped whenever a check adopts an outpoint or records a confirmation.
+	 * Every check captures it before its first await and re-reads it after,
+	 * so a scan that stalled while another finished retires instead of
+	 * overwriting the newer answer with its own stale one (issue #463).
+	 */
+	scanRevision?: number;
 	/**
 	 * Per-txid results of the discovery scan, so each transaction in the
 	 * history is fetched once and not again on every recheck. Transactions are
@@ -278,14 +296,14 @@ interface IFailedFundingWatch {
 	 */
 	candidates?: Array<{ txid: string; outputIndex: number }>;
 	/**
-	 * Restored watches only: the funding value discovery recognizes an
-	 * unnamed attempt by. Carried through the retry for the same reason the
-	 * candidate set is: a transient subscription failure must not silently
-	 * re-arm a narrower watch than the one that failed, which here would
-	 * disable discovery outright and leave the funding-missing watchdog as
-	 * the only outcome (issue #463).
+	 * Restored watches only: the attempt lineage discovery recognizes an
+	 * unnamed replacement by. Carried through the retry for the same reason
+	 * the candidate set is: a transient subscription failure must not
+	 * silently re-arm a narrower watch than the one that failed, which here
+	 * would disable discovery outright and leave the funding-missing watchdog
+	 * as the only outcome (issue #463).
 	 */
-	discoverValueSats?: number;
+	discoverAttemptInputs?: string[][];
 	/**
 	 * The registration this failure belongs to. A retry re-registers by map
 	 * overwrite, so a queued failure must not be replayed once a NEWER
@@ -495,7 +513,7 @@ export class ChainWatcher extends EventEmitter {
 					w.scriptPubkey,
 					undefined,
 					w.candidates,
-					w.discoverValueSats
+					w.discoverAttemptInputs
 				).catch(() => {
 					/* re-queued inside watchFundingOutput */
 				});
@@ -515,7 +533,15 @@ export class ChainWatcher extends EventEmitter {
 		for (const [key, watched] of this.watchedFundings) {
 			if (!watched.confirmed) {
 				this.checkFundingConfirmation(key).catch((err) => this.emitError(err));
+				continue;
 			}
+			// A CONFIRMED watch is looking for one thing: the spend that closes
+			// the channel. Its spend subscription can have failed, or been lost
+			// with a reconnect, and nothing else would ever look again, so the
+			// close would sit on chain unhandled forever. Fully resolved
+			// watches are retired by the node, so anything still here is still
+			// waiting for that spend (issue #463).
+			this.checkFundingSpent(watched).catch((err) => this.emitError(err));
 		}
 		for (const key of this.watchedOutputs.keys()) {
 			this.checkOutputSpend(key).catch((err) => this.emitError(err));
@@ -586,9 +612,10 @@ export class ChainWatcher extends EventEmitter {
 		// Post-signatures RBF: every candidate funding tx of this open
 		// (display-order txids). All candidates pay scriptPubkey.
 		candidates?: Array<{ txid: string; outputIndex: number }>,
-		// Restored records only: the funding value to recognize an attempt the
-		// record does not name by (see discoverValueSats).
-		discoverValueSats?: number
+		// Restored records only: the input lineage of every attempt the record
+		// knows, to recognize a replacement it does not name (see
+		// discoverAttemptInputs).
+		discoverAttemptInputs?: string[][]
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		const scriptHash = computeScriptHash(scriptPubkey);
@@ -605,7 +632,9 @@ export class ChainWatcher extends EventEmitter {
 			announcementTriggered: false,
 			candidates: candidates?.length ? candidates : undefined,
 			script: scriptPubkey,
-			discoverValueSats
+			discoverAttemptInputs: discoverAttemptInputs?.length
+				? discoverAttemptInputs
+				: undefined
 		};
 
 		this.watchedFundings.set(key, watched);
@@ -640,7 +669,7 @@ export class ChainWatcher extends EventEmitter {
 					candidates: candidates?.length
 						? candidates.map((c) => ({ ...c }))
 						: undefined,
-					discoverValueSats,
+					discoverAttemptInputs,
 					watched
 				});
 			}
@@ -976,7 +1005,7 @@ export class ChainWatcher extends EventEmitter {
 					watch.scriptPubkey,
 					undefined,
 					watch.candidates,
-					watch.discoverValueSats
+					watch.discoverAttemptInputs
 				).catch(() => {
 					// Still failing — already re-queued inside watchFundingOutput
 				});
@@ -1120,6 +1149,11 @@ export class ChainWatcher extends EventEmitter {
 		if (!this.isCurrentGeneration(generation)) return;
 		const watched = this.watchedFundings.get(key);
 		if (!watched || watched.confirmed) return;
+		// Checks for one watch can overlap (a subscription callback, a block
+		// and the recheck timer all start them), and each one holds a history
+		// it fetched before its awaits. Whatever this scan concludes is only
+		// safe to apply while nothing else has concluded anything since.
+		const revision = watched.scanRevision ?? 0;
 
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
 
@@ -1129,7 +1163,9 @@ export class ChainWatcher extends EventEmitter {
 		// restart rather than merely cleared.
 		if (
 			!this.isCurrentGeneration(generation) ||
-			this.watchedFundings.get(key) !== watched
+			this.watchedFundings.get(key) !== watched ||
+			watched.confirmed ||
+			(watched.scanRevision ?? 0) !== revision
 		) {
 			return;
 		}
@@ -1149,22 +1185,26 @@ export class ChainWatcher extends EventEmitter {
 			// The recorded attempt answers for itself; nothing provisional
 			// applies any more.
 			watched.provisional = undefined;
-		} else if (watched.discoverValueSats !== undefined) {
+		} else if (watched.discoverAttemptInputs?.length) {
 			// A restored record whose attempt the chain does not know: read the
 			// funding out of the history instead of insisting on the txid the
 			// record happens to name (issue #463).
-			const bound = await this.discoverRestoredFunding(
+			const discovery = await this.discoverRestoredFunding(
 				watched,
 				history,
 				generation
 			);
 			if (
 				!this.isCurrentGeneration(generation) ||
-				this.watchedFundings.get(key) !== watched
+				this.watchedFundings.get(key) !== watched ||
+				watched.confirmed ||
+				(watched.scanRevision ?? 0) !== revision
 			) {
 				return;
 			}
-			if (bound) {
+			if (discovery.bound) {
+				const bound = discovery.bound;
+				watched.scanRevision = revision + 1;
 				watched.txid = bound.txid;
 				watched.outputIndex = bound.outputIndex;
 				watched.candidates = undefined;
@@ -1172,6 +1212,11 @@ export class ChainWatcher extends EventEmitter {
 				watched.discoveryScan = undefined;
 				this.emit('funding:discovered', watched.channelId, bound.txid);
 				entries = history.filter((h) => h.txid === bound.txid);
+			} else if (!discovery.complete) {
+				// Part of the history could not be read, so this scan does not
+				// know whether the funding is there. Absence is a verdict and
+				// this is not one: leave the debounce untouched and ask again.
+				return;
 			} else if (watched.provisional?.length) {
 				// Unproven but real enough to stop the clock: something is
 				// sitting on chain that pays this channel's funding script for
@@ -1216,6 +1261,7 @@ export class ChainWatcher extends EventEmitter {
 				: [{ txid: watched.txid, outputIndex: watched.outputIndex }];
 			const winner = active.find((c) => c.txid === entry.txid);
 			if (!winner) return;
+			watched.scanRevision = (watched.scanRevision ?? 0) + 1;
 			watched.txid = winner.txid;
 			watched.outputIndex = winner.outputIndex;
 			watched.candidates = undefined;
@@ -1237,55 +1283,57 @@ export class ChainWatcher extends EventEmitter {
 
 	/**
 	 * Two-phase discovery of a restored channel's funding, for a watch whose
-	 * recorded candidates the chain does not know.
+	 * recorded attempts the chain does not know.
 	 *
 	 * Phase one collects PROVISIONAL candidates: confirmed transactions in the
-	 * funding script's own history that create an output paying that script
-	 * for the funding value. That test makes a forgery expensive, not
-	 * authentic, and "deepest wins" would happily pick a decoy an attacker
-	 * confirmed first, after which the watch would ignore the real funding's
-	 * spend forever. So nothing is bound on it.
+	 * funding script's history that pay that script and share an input with
+	 * every attempt the record knows. That lineage is what identifies the
+	 * funding, because neither the script nor the value can. See
+	 * discoverAttemptInputs. Nothing is bound on it: an attacker cannot forge
+	 * the lineage, but a candidate that merely looks like a replacement is
+	 * still not known to be the one this channel ended up with.
 	 *
 	 * Phase two waits for one of those outputs to be SPENT, and binds to that
-	 * one. The output pays a 2-of-2 of this channel's two funding pubkeys, so
-	 * only its two parties can produce a transaction spending it, and this
-	 * node never signs a spend of anything but its own funding. A spend is
-	 * therefore proof of a jointly authorized funding attempt, which no amount
-	 * of copying the script can manufacture. Mempool spends count: a close
-	 * that has not confirmed yet is still a real spend, and the outpoint it
-	 * names is what spend detection needs.
+	 * one. The output pays a 2-of-2 of this channel's funding pubkeys, so a
+	 * spend of it exists only because both parties signed one. Lineage says
+	 * the coins came from this negotiation; the spend says the negotiation
+	 * finished on this outpoint. A candidate that is never spent stays
+	 * provisional, which is the honest answer: the channel is not forgotten,
+	 * and nothing has shown which output is the one that funded it.
 	 *
-	 * A provisional candidate that is never spent simply stays provisional,
-	 * which is the honest answer: something pays this script on chain, so the
-	 * channel is not forgotten, but nothing has shown it to be ours.
-	 *
-	 * Returns the outpoint to bind, or null when the search ends provisional
-	 * (watched.provisional carries what it found).
+	 * `complete` is false when any history entry could not be read. An
+	 * incomplete scan must never be reported as absence: a backend that fails
+	 * selectively would otherwise run BOLT 2's forget clock against a funding
+	 * that is sitting on chain.
 	 */
 	private async discoverRestoredFunding(
 		watched: IWatchedFunding,
 		history: Array<{ txid: string; height: number }>,
 		generation: number
-	): Promise<{ txid: string; outputIndex: number } | null> {
+	): Promise<{
+		bound: { txid: string; outputIndex: number } | null;
+		complete: boolean;
+	}> {
+		const lineage = watched.discoverAttemptInputs ?? [];
+		if (lineage.length === 0) return { bound: null, complete: true };
 		const scan = (watched.discoveryScan ??= new Map());
+		let complete = true;
 		for (const entry of history) {
 			if (scan.has(entry.txid)) continue;
 			let tx: import('bitcoinjs-lib').Transaction;
 			try {
 				const raw = await this.backend.getTransaction(entry.txid);
-				if (!this.isCurrentGeneration(generation)) return null;
+				if (!this.isCurrentGeneration(generation)) {
+					return { bound: null, complete: false };
+				}
 				tx = bitcoin.Transaction.fromBuffer(raw);
 			} catch {
-				// One unreadable entry must not hide the rest of the history,
-				// and must not be cached as a verdict either: leave it
-				// unscanned so the next recheck asks again.
+				// Not cached as a verdict: the next check asks again, and until
+				// it can be read this scan knows less than the whole history.
+				complete = false;
 				continue;
 			}
-			const out = tx.outs.findIndex(
-				(o) =>
-					o.value === watched.discoverValueSats &&
-					o.script.equals(watched.script)
-			);
+			const out = tx.outs.findIndex((o) => o.script.equals(watched.script));
 			scan.set(entry.txid, {
 				out: out < 0 ? null : out,
 				ins: tx.ins.map(
@@ -1294,10 +1342,18 @@ export class ChainWatcher extends EventEmitter {
 			});
 		}
 
-		// Phase one: every confirmed script-and-value match, deepest first so
-		// a bind has a stable order to choose in.
+		// Phase one: confirmed, pays the script, and descends from every
+		// attempt the record knows. Ordered by depth so a bind has a stable
+		// order to choose in.
 		const provisional = history
-			.filter((h) => h.height > 0 && scan.get(h.txid)?.out != null)
+			.filter((h) => {
+				if (h.height <= 0) return false;
+				const scanned = scan.get(h.txid);
+				if (!scanned || scanned.out == null) return false;
+				return lineage.every((attemptInputs) =>
+					attemptInputs.some((outpoint) => scanned.ins.includes(outpoint))
+				);
+			})
 			.map((h) => ({
 				txid: h.txid,
 				outputIndex: scan.get(h.txid)!.out!,
@@ -1305,7 +1361,7 @@ export class ChainWatcher extends EventEmitter {
 			}))
 			.sort((a, b) => a.height - b.height);
 		watched.provisional = provisional.length ? provisional : undefined;
-		if (provisional.length === 0) return null;
+		if (provisional.length === 0) return { bound: null, complete };
 
 		// Phase two: one of them spent, by anyone, at any depth.
 		const spent = new Set<string>();
@@ -1314,9 +1370,23 @@ export class ChainWatcher extends EventEmitter {
 		}
 		for (const candidate of provisional) {
 			if (!spent.has(`${candidate.txid}:${candidate.outputIndex}`)) continue;
-			return { txid: candidate.txid, outputIndex: candidate.outputIndex };
+			return {
+				bound: { txid: candidate.txid, outputIndex: candidate.outputIndex },
+				complete
+			};
 		}
-		return null;
+		return { bound: null, complete };
+	}
+
+	/**
+	 * Whether this watch is holding an unproven funding: something on chain
+	 * descends from the recorded attempts and pays the funding script, but
+	 * nothing has spent it, so the channel cannot be resolved and must not be
+	 * forgotten either (issue #463).
+	 */
+	hasProvisionalFunding(channelId: Buffer): boolean {
+		const watched = this.watchedFundings.get(channelId.toString('hex'));
+		return !!watched?.provisional?.length;
 	}
 
 	/**
@@ -1343,13 +1413,24 @@ export class ChainWatcher extends EventEmitter {
 		generation: number = this.lifecycleGeneration
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
-		// Subscribe to detect when the funding output is spent
-		await this.backend.subscribeToScriptHash(watched.scriptHash, () => {
-			if (!this.isCurrentGeneration(generation)) return;
-			this.checkFundingSpent(watched, generation).catch((err) => {
-				this.emitError(err);
+		// Subscribe to detect when the funding output is spent. A failure here
+		// must not cost the check below: by this point the funding is
+		// confirmed, and the close it is about to look for may already be on
+		// chain. Losing it to a transient subscription error left nothing to
+		// recover it, because a confirmed watch is not re-checked for
+		// confirmation. Report the failure and go on; recheckAllWatches sweeps
+		// confirmed watches for spends, so the subscription is an
+		// optimization, not the only path (issue #463).
+		try {
+			await this.backend.subscribeToScriptHash(watched.scriptHash, () => {
+				if (!this.isCurrentGeneration(generation)) return;
+				this.checkFundingSpent(watched, generation).catch((err) => {
+					this.emitError(err);
+				});
 			});
-		});
+		} catch (err) {
+			this.emitError(err as Error);
+		}
 
 		// A stop() during the subscribe would otherwise let the check below start
 		// fresh and capture the post-stop generation, passing every guard.
