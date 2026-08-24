@@ -4883,6 +4883,21 @@ export class ChannelManager extends EventEmitter {
 			state === ChannelState.NEGOTIATING_CLOSING ||
 			state === ChannelState.SHUTTING_DOWN
 		) {
+			// A channel restored MID-close from a Recovery Capsule without the
+			// operator's acknowledgement must not resume the negotiation:
+			// every remaining stage signs the split the capsule carries, and
+			// even our retransmitted shutdown advertises a close we would then
+			// refuse (issue #469). Refuse terminally here instead, so the 5.6
+			// disposition asks the peer to close rather than the row sitting
+			// in a state nothing else drives.
+			if (channel.isMutualCloseHeld()) {
+				this.processActions(
+					peerPubkey,
+					channel,
+					channel.refuseHeldMutualClose()
+				);
+				return;
+			}
 			// Re-evaluate the negotiation path — features are per-connection —
 			// and abandon any in-flight closing_complete (its closing_sig can
 			// never arrive on the new connection; negotiation restarts per spec).

@@ -801,6 +801,18 @@ export interface IChannelState {
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**
+	 * The operator's labelled acknowledgement (RECOVERY-PROTOCOL 5.6) that a
+	 * mutual close of this capsule-restored channel may sign away balances the
+	 * row cannot prove current (issue #469). Stamped only by initiateShutdown
+	 * when acceptStaleStateRisk (exact true) accompanies the local close, and
+	 * it covers the WHOLE negotiation: the peer's mandatory shutdown reply and
+	 * every closing signature stage consult it, because each of them advances
+	 * or signs the same stale split the initiation was warned about. Persisted
+	 * so a disconnect or restart inside the negotiation does not turn an
+	 * authorized close into a refusal.
+	 */
+	staleCloseRiskAccepted?: boolean;
+	/**
 	 * Recovery 5.6 liveness: the channel was routed to the DLP path and the
 	 * peer must force-close it. The wire error asking for that close can be
 	 * lost to a crash between the ERRORED persist and the socket, so the

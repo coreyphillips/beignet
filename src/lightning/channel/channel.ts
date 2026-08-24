@@ -2646,8 +2646,8 @@ export class Channel {
 		// an HTLC whose only on-chain enforcement this node has disarmed is a
 		// bounded risk turning into an unbounded one: the peer can simply stall
 		// and we have nothing to escalate to. Existing HTLCs still settle and
-		// fail off chain, and the channel still closes cooperatively, which
-		// needs no revocation and is therefore safe from a stale state.
+		// fail off chain, and the channel can still be closed with the
+		// operator's acknowledged cooperative close or by the peer.
 		if (this._state.restoreRecencyUnproven === true) {
 			return [
 				{
@@ -5158,6 +5158,38 @@ export class Channel {
 		];
 	}
 
+	/**
+	 * Whether a mutual close is refused on this channel: restored from a
+	 * Recovery Capsule, balances unproven, and no operator acknowledgement
+	 * covering the negotiation (issue #469). One predicate so the shutdown
+	 * handler, every closing signature stage and the manager's post-reestablish
+	 * resume all answer the same question the same way: the acknowledgement is
+	 * negotiation-wide, not a property of the initiating call alone, because
+	 * the peer's mandatory shutdown reply and each signing stage advance the
+	 * same stale split the initiation was warned about.
+	 */
+	isMutualCloseHeld(): boolean {
+		return (
+			this._state.restoreRecencyUnproven === true &&
+			this._state.staleCloseRiskAccepted !== true
+		);
+	}
+
+	/**
+	 * The manager's entry to the held-close refusal, for a channel restored
+	 * MID-close surfacing at reestablish: resuming the negotiation is exactly
+	 * what must not run, but doing nothing leaves the row in SHUTTING_DOWN or
+	 * NEGOTIATING_CLOSING with nothing else driving it anywhere. Terminal and
+	 * durable instead, so the 5.6 disposition asks the peer to close.
+	 */
+	refuseHeldMutualClose(): ChannelAction[] {
+		return this._heldCooperativeCloseRefusal(
+			'Cannot resume cooperative close: this channel was restored from a ' +
+				'Recovery Capsule and its balances cannot be proven current; ' +
+				'awaiting your force close instead'
+		);
+	}
+
 	private _heldReestablishGapFailure(message: string): ChannelAction[] {
 		if (this._state.restoreRecencyUnproven !== true) {
 			return [{ type: ChannelActionType.ERROR, message }];
@@ -5664,7 +5696,11 @@ export class Channel {
 		// operator's explicit force close, and the peer's own unilateral close,
 		// which the 5.6 disposition asks for on every reconnect and which pays
 		// us our to_remote at THEIR state, never at less than we are owed.
-		if (this._state.restoreRecencyUnproven === true && !acceptStaleStateRisk) {
+		//
+		// Exact true only: the acknowledgement is authorization, and a JS
+		// caller passing a truthy non-boolean ('false', 1) must not spend it.
+		const acknowledged = acceptStaleStateRisk === true;
+		if (this.isMutualCloseHeld() && !acknowledged) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -5677,7 +5713,23 @@ export class Channel {
 				}
 			];
 		}
-		return this._initiateShutdown(scriptPubkey);
+		const actions = this._initiateShutdown(scriptPubkey);
+		if (
+			acknowledged &&
+			this._state.restoreRecencyUnproven === true &&
+			!actions.some((a) => a.type === ChannelActionType.ERROR)
+		) {
+			// The acknowledgement covers the whole negotiation, not just this
+			// call: the peer's mandatory shutdown reply and every closing
+			// signature stage consult it (isMutualCloseHeld), and a disconnect
+			// or restart mid-negotiation must not turn the authorized close
+			// into a refusal. Persist leads the send so a crash between them
+			// cannot lose the authorization the retransmitted shutdown relies
+			// on.
+			this._state.staleCloseRiskAccepted = true;
+			return [{ type: ChannelActionType.PERSIST_STATE }, ...actions];
+		}
+		return actions;
 	}
 
 	private _initiateShutdown(scriptPubkey: Buffer): ChannelAction[] {
@@ -5789,7 +5841,12 @@ export class Channel {
 		// because its own commitment pays our to_remote at ITS state, never at
 		// less than we are owed. Terminal and persisted, so the disposition is
 		// durable and the request is regenerated on every reconnect.
-		if (this._state.restoreRecencyUnproven === true) {
+		//
+		// UNLESS the operator's acknowledgement covers the negotiation: after
+		// an acknowledged initiateShutdown the peer MUST reply with its own
+		// shutdown (BOLT 2), and refusing that reply would turn every
+		// authorized close into ERRORED at its first response.
+		if (this.isMutualCloseHeld()) {
 			return this._heldCooperativeCloseRefusal(
 				'Cannot close cooperatively: this channel was restored from a ' +
 					'Recovery Capsule and its balances cannot be proven current; ' +
@@ -5915,6 +5972,16 @@ export class Channel {
 			];
 		}
 
+		// A channel restored MID-close can reach every signing stage without
+		// ever passing the initiateShutdown gate, so each stage re-asks the
+		// question itself: proposing is signing (legacy closing_signed and the
+		// taproot partial both carry our signature over the restored split),
+		// and doing it unacknowledged is the loss the hold exists to prevent
+		// (issue #469).
+		if (this.isMutualCloseHeld()) {
+			return this.refuseHeldMutualClose();
+		}
+
 		// Fund-safety: the closing tx pays out localBalanceMsat/remoteBalanceMsat
 		// only, so any in-flight HTLC's value would be silently burned to fees.
 		// BOLT 2 forbids starting fee negotiation until all HTLCs are resolved.
@@ -6006,6 +6073,14 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected closing_signed' }
 			];
+		}
+
+		// Every closing signature stage re-asks the held-close question: a
+		// channel restored MID-close reaches here without ever passing the
+		// initiateShutdown gate, and answering would counter-sign the restored
+		// split (issue #469).
+		if (this.isMutualCloseHeld()) {
+			return this.refuseHeldMutualClose();
 		}
 
 		// Fund-safety: a peer MUST NOT send closing_signed while HTLCs are still
@@ -6455,6 +6530,13 @@ export class Channel {
 		) {
 			return err('Cannot send closing_complete: wrong state');
 		}
+		// Every closing signature stage re-asks the held-close question: a
+		// channel restored MID-close reaches here without ever passing the
+		// initiateShutdown gate, and closing_complete carries our signature
+		// over the restored split (issue #469).
+		if (this.isMutualCloseHeld()) {
+			return this.refuseHeldMutualClose();
+		}
 		if (
 			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
 			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
@@ -6603,6 +6685,15 @@ export class Channel {
 		) {
 			return err('Unexpected closing_complete');
 		}
+
+		// Every closing signature stage re-asks the held-close question: a
+		// channel restored MID-close reaches here without ever passing the
+		// initiateShutdown gate, and answering would sign the closee side of
+		// the restored split (issue #469). A held row can never have reached
+		// CLOSED, so the concurrent-close carve-out above is untouched.
+		if (this.isMutualCloseHeld()) {
+			return this.refuseHeldMutualClose();
+		}
 		if (
 			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
 			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
@@ -6743,6 +6834,15 @@ export class Channel {
 			!alreadyClosed
 		) {
 			return err('Unexpected closing_sig');
+		}
+
+		// Every closing signature stage re-asks the held-close question (issue
+		// #469): completing here broadcasts a close tx paying the restored
+		// split. Unreachable in practice while held, because the gate on
+		// sendClosingComplete means no closing_complete of ours is pending,
+		// but the refusal keeps the stages uniform.
+		if (this.isMutualCloseHeld()) {
+			return this.refuseHeldMutualClose();
 		}
 		const last = this._state.lastLocalClosingComplete;
 		if (!last || !this._state.awaitingClosingSig) {

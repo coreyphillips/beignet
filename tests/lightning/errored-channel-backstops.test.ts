@@ -802,6 +802,119 @@ describe('Issue #469: a capsule-restored channel holds its automatic closes', fu
 			'the acknowledgement is not what stops it'
 		).to.equal(undefined);
 		expect(chan.getFullState().state).to.equal(ChannelState.SHUTTING_DOWN);
+		expect(
+			accepted[0].type,
+			'the acknowledgement is persisted ahead of the send'
+		).to.equal('PERSIST_STATE');
+		expect(chan.getFullState().staleCloseRiskAccepted).to.equal(true);
+	});
+
+	it('an acknowledged close survives the peer shutdown reply', () => {
+		// The acknowledgement authorizes the NEGOTIATION, not one call: the
+		// peer MUST reply to our shutdown with its own (BOLT 2), and that
+		// reply used to hit the unconditional refusal, turning every
+		// authorized close into ERRORED at its first response.
+		const fx = setupUnprovenChannel(103);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+		const script = Buffer.from('0014' + '11'.repeat(20), 'hex');
+
+		const result = fx.alice.closeChannel(fx.channelId, script, true);
+		expect(result.ok, result.error).to.equal(true);
+		expect(
+			chan.getFullState().state,
+			'the negotiation proceeds instead of erroring'
+		).to.be.oneOf([ChannelState.NEGOTIATING_CLOSING, ChannelState.CLOSED]);
+		expect(chan.hasRecoveryCloseDisposition()).to.equal(false);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('does not spend the acknowledgement on a truthy non-boolean', () => {
+		// A JS caller can pass anything; only exact true is authorization.
+		const fx = setupUnprovenChannel(105);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+		const script = Buffer.from('0014' + '11'.repeat(20), 'hex');
+
+		const refused = chan.initiateShutdown(script, 'false');
+		expect(
+			refused.find((a: any) => a.type === 'ERROR'),
+			'a truthy non-boolean does not authorize'
+		).to.not.equal(undefined);
+		expect(chan.getFullState().staleCloseRiskAccepted).to.equal(undefined);
+		expect(chan.getFullState().state).to.equal(ChannelState.NORMAL);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('a channel restored mid-close refuses every closing signature stage', () => {
+		// A row persisted DURING a close comes back in SHUTTING_DOWN or
+		// NEGOTIATING_CLOSING and reaches the signing handlers without ever
+		// passing the initiateShutdown gate, so each stage re-asks the
+		// held-close question itself and lands on the durable peer-close path.
+		const fx = setupUnprovenChannel(107);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		const st = chan.getFullState();
+		const dummySig = Buffer.alloc(64);
+		const script = Buffer.from('0014' + '11'.repeat(20), 'hex');
+
+		const stages: Array<[string, () => any[]]> = [
+			['proposeClosingFee', () => chan.proposeClosingFee(() => dummySig)],
+			[
+				'handleClosingSigned',
+				() =>
+					chan.handleClosingSigned(
+						{ channelId: fx.channelId, feeSatoshis: 500n, signature: dummySig },
+						() => dummySig
+					)
+			],
+			[
+				'sendClosingComplete',
+				() => chan.sendClosingComplete(500n, 0, () => dummySig)
+			],
+			[
+				'handleClosingComplete',
+				() =>
+					chan.handleClosingComplete(
+						{
+							channelId: fx.channelId,
+							feeSatoshis: 500n,
+							locktime: 0,
+							closerScriptPubkey: script,
+							closeeScriptPubkey: script
+						},
+						() => true,
+						() => dummySig
+					)
+			],
+			[
+				'handleClosingSig',
+				() =>
+					chan.handleClosingSig(
+						{
+							channelId: fx.channelId,
+							feeSatoshis: 500n,
+							locktime: 0,
+							closerScriptPubkey: script,
+							closeeScriptPubkey: script
+						},
+						() => true
+					)
+			]
+		];
+		for (const [name, run] of stages) {
+			st.state = ChannelState.NEGOTIATING_CLOSING;
+			const actions = run();
+			const err = actions.find((a: any) => a.type === 'ERROR');
+			expect(err, `${name} refuses`).to.not.equal(undefined);
+			expect(err.message, name).to.match(/Recovery Capsule/);
+			expect(st.state, `${name} lands on the peer-close path`).to.equal(
+				ChannelState.ERRORED
+			);
+		}
+		fx.alice.destroy();
+		fx.bob.destroy();
 	});
 
 	it('refuses a peer-initiated cooperative close onto the 5.6 peer-close path', () => {

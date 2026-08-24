@@ -550,6 +550,108 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		alice.destroy();
 	});
 
+	it('a held channel restored mid-close is refused onto the peer-close path at reconnect', async function () {
+		// A capsule can capture a row DURING a cooperative close. Resuming
+		// that negotiation after the restore would sign the split the capsule
+		// carries without the operator ever passing the initiateShutdown
+		// gate, and doing nothing would leave the row in SHUTTING_DOWN with
+		// nothing else driving it. The manager refuses terminally at the
+		// reestablish tail instead, which derives the 5.6 peer-close
+		// disposition (issue #469).
+		this.timeout(20_000);
+		const dbPath = tempDb('redispatch-held-close');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage1);
+		wire(alice, bob, { val: false });
+		openReadyChannel(alice, bob);
+		await settle();
+		bob.destroy();
+
+		const inspect = new SqliteStorage(dbPath);
+		inspect.open();
+		const row = inspect.loadAllChannels()[0];
+		row.state.state = ChannelState.SHUTTING_DOWN;
+		row.state.localShutdownScript = Buffer.from(
+			'0014' + '33'.repeat(20),
+			'hex'
+		);
+		row.state.restoreRecencyUnproven = true;
+		inspect.saveChannel(row.channelId, row.state, row.peerPubkey);
+
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		alice.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, inspect);
+		const sentShutdowns: number[] = [];
+		restarted.on('message:outbound', (_pk: string, t: number) => {
+			// 38 = BOLT 2 shutdown
+			if (t === 38) sentShutdowns.push(t);
+		});
+		await reconnect(restarted, alice);
+
+		const channel = restarted.getChannelManager().listChannels()[0];
+		expect(channel.getState()).to.equal(ChannelState.ERRORED);
+		expect(channel.getRecoveryCloseReason()).to.equal('restore-unproven');
+		expect(
+			sentShutdowns,
+			'our shutdown is not retransmitted for a close we would refuse'
+		).to.have.length(0);
+
+		restarted.destroy();
+		alice.destroy();
+	});
+
+	it('an acknowledged mid-close restore resumes the negotiation at reconnect', async function () {
+		// The same shape with the operator's persisted acknowledgement on the
+		// row: the negotiation must resume rather than refuse, which is also
+		// the round trip proving the acknowledgement survives a restart.
+		this.timeout(20_000);
+		const dbPath = tempDb('redispatch-acked-close');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage1);
+		wire(alice, bob, { val: false });
+		openReadyChannel(alice, bob);
+		await settle();
+		bob.destroy();
+
+		const inspect = new SqliteStorage(dbPath);
+		inspect.open();
+		const row = inspect.loadAllChannels()[0];
+		row.state.state = ChannelState.SHUTTING_DOWN;
+		row.state.localShutdownScript = Buffer.from(
+			'0014' + '33'.repeat(20),
+			'hex'
+		);
+		row.state.restoreRecencyUnproven = true;
+		row.state.staleCloseRiskAccepted = true;
+		inspect.saveChannel(row.channelId, row.state, row.peerPubkey);
+
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		alice.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, inspect);
+		await reconnect(restarted, alice);
+
+		const channel = restarted.getChannelManager().listChannels()[0];
+		expect(
+			channel.getFullState().staleCloseRiskAccepted,
+			'the acknowledgement survived the restart'
+		).to.equal(true);
+		expect(
+			channel.getState(),
+			'the close proceeds rather than refusing'
+		).to.be.oneOf([
+			ChannelState.SHUTTING_DOWN,
+			ChannelState.NEGOTIATING_CLOSING,
+			ChannelState.CLOSED
+		]);
+
+		restarted.destroy();
+		alice.destroy();
+	});
+
 	it('a live reconnect does NOT re-run the repair (the restart-only boundary)', async function () {
 		this.timeout(20_000);
 		const alice = createNode(ALICE_SEED);
