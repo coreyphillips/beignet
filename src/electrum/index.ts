@@ -156,6 +156,11 @@ export class Electrum {
 	private _currentServer: TServer | null = null;
 	/** Number of times the connected server changed after the first connect. */
 	private _rotationCount = 0;
+	/** Set when a connect tore the client down, cleared once its subscriptions
+	 *  have been re-issued. Survives failed attempts: a switch that resets the
+	 *  client and then reaches no server at all still owes the restore to
+	 *  whichever later connect succeeds. */
+	private _subscriptionRestoreOwed = false;
 
 	public servers?: TServer | TServer[];
 	public network: EAvailableNetworks;
@@ -252,7 +257,6 @@ export class Electrum {
 			return err('Regtest requires that you pre-specify a server.');
 		}
 		const candidates = this.getServerCandidates(customPeers, electrumNetwork);
-		const previousServer = this._currentServer;
 		let connected = false;
 		let lastError = 'No Electrum servers available.';
 		for (const candidate of this.orderCandidates(candidates)) {
@@ -260,8 +264,15 @@ export class Electrum {
 				candidate,
 				electrumNetwork
 			);
+			if (startResponse.clientReset) {
+				this._subscriptionRestoreOwed = true;
+			}
 			if (startResponse.error) {
-				this.recordServerFailure(candidate);
+				// A candidate the teardown refused was never dialled, so it must
+				// not be blamed for the failure and cooled down.
+				if (!startResponse.teardownRefused) {
+					this.recordServerFailure(candidate);
+				}
 				lastError = String(startResponse.error);
 				continue;
 			}
@@ -283,18 +294,18 @@ export class Electrum {
 			return err(lastError);
 		}
 		this.publishConnectionChange(true);
-		if (
-			previousServer &&
-			this._currentServer &&
-			this.serverKey(previousServer) !== this.serverKey(this._currentServer)
-		) {
-			// The previous server's client, and with it every subscription made
-			// through it, is gone. The wallet's own address subscriptions have no
-			// other reconnect hook here (checkConnection re-issues them only on
-			// its own reconnect path), so without this the wallet would see no
-			// incoming payment until its next full refresh.
-			this.subscribeToAddresses({}).catch(() => {
-				// Best-effort: re-issued by the next refresh or reconnect.
+		if (this._subscriptionRestoreOwed) {
+			// The torn down client took every subscription in this process with
+			// it, including the ones this instance never made, and the wallet's
+			// own addresses have no other reconnect hook here (checkConnection
+			// re-issues them only on its own reconnect path). Keyed on the reset
+			// rather than on a server change: a switch that stops the peer and
+			// then falls back to the server it started from resets exactly the
+			// same state while leaving the current server untouched.
+			this._subscriptionRestoreOwed = false;
+			this.restoreSubscriptions(electrumNetwork).catch(() => {
+				// Best-effort: re-armed so the next connect tries again.
+				this._subscriptionRestoreOwed = true;
 			});
 		}
 		this.subscribeToHeader().catch(() => {
@@ -310,9 +321,23 @@ export class Electrum {
 	private async attemptConnect(
 		server: TServer,
 		electrumNetwork: EElectrumNetworks
-	): Promise<{ error: unknown }> {
-		await this.stopPeerIfServerChanged(server, electrumNetwork);
-		return await electrum.start({
+	): Promise<{
+		error: unknown;
+		clientReset: boolean;
+		teardownRefused?: boolean;
+	}> {
+		const teardown = await this.stopPeerIfServerChanged(
+			server,
+			electrumNetwork
+		);
+		if (teardown.error) {
+			return {
+				error: teardown.error,
+				clientReset: teardown.clientReset,
+				teardownRefused: true
+			};
+		}
+		const startResponse = await electrum.start({
 			clientName: 'beignet',
 			protocolVersion: '1.4',
 			network: electrumNetwork,
@@ -320,6 +345,7 @@ export class Electrum {
 			tls: this.tls,
 			customPeers: [server]
 		});
+		return { error: startResponse.error, clientReset: teardown.clientReset };
 	}
 
 	/**
@@ -336,16 +362,67 @@ export class Electrum {
 	 * process silently stops receiving header and script hash notifications.
 	 * The same-server path is left alone: the client pings the live connection
 	 * and disconnects itself (resetting the same state) if the ping fails.
+	 *
+	 * The client only clears that bookkeeping when closing the socket succeeds
+	 * and reports the failure as { error: true }, so a teardown that did not
+	 * happen refuses the candidate instead of connecting a fresh client on top
+	 * of stale state, which is the very bug this guards against. Rotation then
+	 * moves on, and the still-connected server is accepted unchanged when it
+	 * comes back around.
 	 */
 	private async stopPeerIfServerChanged(
 		server: TServer,
 		electrumNetwork: EElectrumNetworks
-	): Promise<void> {
+	): Promise<{ error?: string; clientReset: boolean }> {
 		const peer = electrum.getConnectedPeer(electrumNetwork);
-		if (!peer?.host) return;
+		if (!peer?.host) return { clientReset: false };
 		const peerKey = `${peer.host}|${peer.protocol}|${peer.port}`;
-		if (peerKey === this.serverKey(server)) return;
-		await electrum.stop({ network: electrumNetwork });
+		if (peerKey === this.serverKey(server)) return { clientReset: false };
+		const stopResponse = await electrum.stop({ network: electrumNetwork });
+		// The cleared peer is the observable proof that the bookkeeping went
+		// with it, so it decides, and the reported error only sharpens the
+		// message.
+		const clientReset = !electrum.getConnectedPeer(electrumNetwork)?.host;
+		if (!clientReset) {
+			const reason = stopResponse?.error
+				? `: ${String(stopResponse.data ?? '')}`
+				: '.';
+			return {
+				error: `Unable to disconnect from ${peer.host} before switching Electrum servers${reason}`,
+				clientReset: false
+			};
+		}
+		return { clientReset: true };
+	}
+
+	/**
+	 * Re-issues every subscription this process holds for the network after the
+	 * client was torn down.
+	 *
+	 * rn-electrum-client keeps one client, and with it one set of
+	 * subscriptions and one notification handler, per network for the whole
+	 * process, so a reset by any instance drops what every other instance
+	 * subscribed as well. The shared script hash router is the record of that
+	 * state; re-subscribing its hashes restores the handler wiring for all of
+	 * them, and this instance's own wallet addresses are re-issued on top to
+	 * pick up anything generated since.
+	 */
+	private async restoreSubscriptions(
+		electrumNetwork: EElectrumNetworks
+	): Promise<void> {
+		const router = scriptHashRouters.get(electrumNetwork);
+		if (router) {
+			await Promise.all(
+				[...router.subscriptions.keys()].map(async (scriptHash) => {
+					await electrum.subscribeAddress({
+						scriptHash,
+						network: electrumNetwork,
+						onReceive: router.dispatch
+					});
+				})
+			);
+		}
+		await this.subscribeToAddresses({});
 	}
 
 	/**
@@ -1350,8 +1427,12 @@ export class Electrum {
 				});
 
 				if (response.isOk()) {
-					// Re-Subscribe to Addresses & Headers
-					void this.subscribeToAddresses({});
+					// Re-Subscribe to Addresses & Headers. A failed ping means the
+					// client dropped the connection, so every instance's script
+					// hashes went with it, not just this wallet's addresses.
+					void this.restoreSubscriptions(this.electrumNetwork).catch(() => {
+						/* best-effort re-subscribe on reconnect */
+					});
 					this.subscribeToHeader().catch(() => {
 						/* best-effort re-subscribe on reconnect */
 					});

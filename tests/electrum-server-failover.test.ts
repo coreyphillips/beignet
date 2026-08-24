@@ -78,6 +78,12 @@ let protocolSubscribes: string[];
 let connectionEvents: string[];
 /** Height the next header subscription reports, so the servers differ. */
 let nextHeaderHeight: number;
+/** Hosts the fake connection layer accepts; anything else refuses to connect,
+ *  including the hardcoded fallback peers the rotation falls through to. */
+let reachableHosts: Set<string>;
+/** Models a close() that throws: the client reports { error: true } and keeps
+ *  every bit of its per-network state, peer included. */
+let disconnectFails: boolean;
 
 const resetClient = (): void => {
 	client.peer = null;
@@ -101,6 +107,14 @@ const stubHelpers = (): void => {
 				const server = customPeers[0];
 				const protocol = server.protocol;
 				const port = protocol === EProtocol.ssl ? server.ssl : server.tcp;
+				if (!reachableHosts.has(server.host)) {
+					connectionEvents.push(`refused:${server.host}`);
+					return {
+						error: true,
+						data: 'Unable to connect to Electrum server.',
+						network
+					};
+				}
 				connectionEvents.push(`connect:${server.host}`);
 				const sameServer =
 					client.peer?.host === server.host &&
@@ -120,6 +134,12 @@ const stubHelpers = (): void => {
 	sinon
 		.stub(electrumHelpers, 'stop')
 		.callsFake(async ({ network }: { network?: string } = {}) => {
+			if (disconnectFails) {
+				// close() threw: the client returns before it clears any of the
+				// per-network state, so the peer and the bookkeeping both survive.
+				connectionEvents.push('disconnect-failed');
+				return { error: true, data: 'socket hang up', network };
+			}
 			connectionEvents.push('disconnect');
 			resetClient();
 			return { error: false, data: 'Disconnected...', network };
@@ -175,7 +195,8 @@ let storedHeader: IHeader;
 
 const createFakeWallet = (
 	refreshSpy: sinon.SinonStub,
-	messageSpy: sinon.SinonStub
+	messageSpy: sinon.SinonStub,
+	scriptHash: string = walletScriptHash
 ): Wallet => {
 	return {
 		sendMessage: messageSpy,
@@ -198,7 +219,7 @@ const createFakeWallet = (
 				header: storedHeader,
 				addresses: {
 					[EAddressType.p2wpkh]: {
-						'0': { index: 0, scriptHash: walletScriptHash }
+						'0': { index: 0, scriptHash }
 					}
 				},
 				addressIndex: { [EAddressType.p2wpkh]: { index: 0 } }
@@ -213,10 +234,11 @@ const createdInstances: Electrum[] = [];
 
 const createElectrum = (
 	refreshSpy: sinon.SinonStub,
-	messageSpy: sinon.SinonStub
+	messageSpy: sinon.SinonStub,
+	scriptHash: string = walletScriptHash
 ): Electrum => {
 	const electrum = new Electrum({
-		wallet: createFakeWallet(refreshSpy, messageSpy),
+		wallet: createFakeWallet(refreshSpy, messageSpy, scriptHash),
 		network: EAvailableNetworks.testnet,
 		net,
 		tls,
@@ -245,6 +267,8 @@ describe('Electrum failover to a different server (issue #482)', () => {
 		protocolSubscribes = [];
 		connectionEvents = [];
 		nextHeaderHeight = 100;
+		reachableHosts = new Set([serverA.host, serverB.host]);
+		disconnectFails = false;
 		storedHeader = { height: 0, hash: '', hex: '' };
 		stubHelpers();
 		refreshSpy = sinon.spy();
@@ -253,6 +277,7 @@ describe('Electrum failover to a different server (issue #482)', () => {
 	});
 
 	afterEach(async () => {
+		disconnectFails = false;
 		for (const instance of createdInstances) {
 			await instance.disconnect();
 		}
@@ -366,6 +391,110 @@ describe('Electrum failover to a different server (issue #482)', () => {
 			protocolSubscribes,
 			'wallet addresses must be re-subscribed on the new server'
 		).to.include(walletScriptHash);
+	});
+
+	it('restores subscriptions when a failed switch lands back on the same server', async () => {
+		const onReceive = sinon.spy();
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.subscribeToAddresses({ scriptHashes: ['aaaa'], onReceive });
+		await electrum.subscribeToAddresses({});
+		expect(protocolSubscribes).to.include(walletScriptHash);
+
+		// The switch stops A and then reaches no server at all, so the client
+		// state is gone while the connected server never changed.
+		reachableHosts = new Set();
+		const failed = await electrum.connectToElectrum({ servers: serverB });
+		expect(failed.isErr()).to.equal(true);
+		expect(client.peer, 'the old peer was torn down').to.equal(null);
+
+		protocolSubscribes = [];
+		reachableHosts = new Set([serverA.host]);
+		const recovered = await electrum.connectToElectrum({ servers: serverA });
+		expect(recovered.isOk()).to.equal(true);
+		await flush();
+
+		expect(
+			protocolSubscribes,
+			'the wallet addresses must be re-subscribed, same server or not'
+		).to.include(walletScriptHash);
+		expect(
+			protocolSubscribes,
+			'tracked script hashes must be re-subscribed too'
+		).to.include('aaaa');
+		expect(client.addressHandler).to.not.equal(null);
+		await client.addressHandler?.(['aaaa', 'status-after-recovery']);
+		expect(onReceive.calledOnce, 'the callback must still be reached').to.equal(
+			true
+		);
+	});
+
+	it("restores another instance's subscriptions after a server change", async () => {
+		const otherWalletScriptHash = 'eeee';
+		const other = createElectrum(
+			sinon.spy(),
+			sinon.spy(),
+			otherWalletScriptHash
+		);
+		const onReceive = sinon.spy();
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+		await other.subscribeToAddresses({ scriptHashes: ['bbbb'], onReceive });
+		await other.subscribeToAddresses({});
+		expect(protocolSubscribes).to.include('bbbb');
+
+		protocolSubscribes = [];
+		await electrum.connectToElectrum({ servers: serverB });
+		await flush();
+
+		// One client per network for the whole process: the instance that
+		// switched servers dropped these subscriptions, so it owes them back.
+		expect(
+			protocolSubscribes,
+			"another instance's tracked hashes must reach the new server"
+		).to.include('bbbb');
+		expect(
+			protocolSubscribes,
+			"another instance's wallet addresses must reach the new server"
+		).to.include(otherWalletScriptHash);
+		expect(client.addressHandler).to.not.equal(null);
+		await client.addressHandler?.(['bbbb', 'status-after-failover']);
+		expect(
+			onReceive.calledOnce,
+			"the other instance's callback must still be reached"
+		).to.equal(true);
+	});
+
+	it('refuses to switch servers when the disconnect fails', async () => {
+		const onReceive = sinon.spy();
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.subscribeToAddresses({ scriptHashes: ['aaaa'], onReceive });
+		const handler = client.addressHandler;
+
+		disconnectFails = true;
+		protocolSubscribes = [];
+		connectionEvents = [];
+		const swapped = await electrum.connectToElectrum({ servers: serverB });
+		await flush();
+
+		expect(
+			swapped.isErr(),
+			'a switch onto stale client state must not report success'
+		).to.equal(true);
+		expect(
+			connectionEvents.some((event) => event.startsWith('connect:')),
+			'no replacement client may be built on stale bookkeeping'
+		).to.equal(false);
+		expect(client.peer?.host, 'the live peer is kept').to.equal(serverA.host);
+		expect(
+			client.addressHandler,
+			'the surviving handler still routes notifications'
+		).to.equal(handler);
+		await client.addressHandler?.(['aaaa', 'status-after-refusal']);
+		expect(onReceive.calledOnce).to.equal(true);
 	});
 
 	it('keeps the connection when reconnecting to the same server', async () => {
