@@ -1564,7 +1564,11 @@ export class ChannelManager extends EventEmitter {
 	/**
 	 * Initiate cooperative shutdown on a channel.
 	 */
-	initiateShutdown(channelId: Buffer, scriptPubkey: Buffer): ChannelResult {
+	initiateShutdown(
+		channelId: Buffer,
+		scriptPubkey: Buffer,
+		acceptStaleStateRisk = false
+	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
 		if (!channel) {
@@ -1583,7 +1587,10 @@ export class ChannelManager extends EventEmitter {
 		// the state machine runs (its script rules depend on it).
 		channel.setSimpleClose(this.peerNegotiatedSimpleClose(peerPubkey));
 
-		const actions = channel.initiateShutdown(scriptPubkey);
+		const actions = channel.initiateShutdown(
+			scriptPubkey,
+			acceptStaleStateRisk
+		);
 		this.processActions(peerPubkey, channel, actions);
 		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
 		if (errorAction) {

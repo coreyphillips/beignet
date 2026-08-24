@@ -159,7 +159,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `openChannelAndWait(pubkey, amountSats, opts?)` | `Promise<ChannelInfo>` | Open channel + wait for NORMAL state. `opts: { pushSats?, timeoutMs? }` |
 | `openZeroConfChannel(pubkey, sats, pushSats?)` | `ChannelInfo` | Open zero-conf channel (peer must be trusted) |
 | `openChannelV2(pubkey, params)` | `ChannelInfo` | Open dual-funded v2 channel |
-| `closeChannel(channelId)` | `{ ok, error? }` | Cooperative close |
+| `closeChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error? }` | Cooperative close; a capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
 | `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; a capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
 | `spliceOut(channelId, amountSats, feerate)` | `SpliceResult` | Withdraw funds from channel |
@@ -1768,7 +1768,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/channels/ensure-minimum` | `{ count, satsPerChannel, timeoutMs? }` | Auto-open channels to meet minimum count |
 | POST | `/channel/connect-and-open` | `{ pubkey, host, port, amountSats, pushSats? }` | Connect + open in one call |
 | POST | `/channel/open-and-wait` | `{ pubkey, amountSats, pushSats?, timeoutMs? }` | Open channel + wait for NORMAL state |
-| POST | `/channel/close` | `{ channelId }` | Coop close |
+| POST | `/channel/close` | `{ channelId, acceptStaleStateRisk? }` | Coop close; the flag is required for a capsule-restored channel |
 | POST | `/channel/forceclose` | `{ channelId, acceptStaleStateRisk? }` | Force close; the flag is required for a capsule-restored channel |
 | POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
 | POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds |

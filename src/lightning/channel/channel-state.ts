@@ -776,16 +776,28 @@ export interface IChannelState {
 	 *
 	 * It is still deliberately NOT `stateUncertain`, which routes reestablish
 	 * itself to DLP and would force-close every capsule restore: this channel
-	 * RESUMES, keeps its funds and can be closed cooperatively, which needs no
-	 * revocation and so cannot be penalized from a stale state. What it does
-	 * not do is take NEW HTLCs. Its on-chain HTLC deadline backstops can never
-	 * fire while the hold stands, and accepting an obligation whose only
-	 * enforcement this node has disarmed is how a bounded risk becomes an
-	 * unbounded one; existing HTLCs still settle and fail off chain.
+	 * RESUMES and keeps its funds. What it does not do is take NEW HTLCs. Its
+	 * on-chain HTLC deadline backstops can never fire while the hold stands,
+	 * and accepting an obligation whose only enforcement this node has disarmed
+	 * is how a bounded risk becomes an unbounded one; existing HTLCs still
+	 * settle and fail off chain.
 	 *
-	 * The operator's explicit force close is the labelled exit 5.6 names,
-	 * never gated by this. MUST persist: a restart must not forget the
-	 * restriction.
+	 * Nor does it close COOPERATIVELY. That was once argued here as safe
+	 * because a mutual close involves no revocation, and that is true and
+	 * beside the point: a mutual close pays out the balances THIS row carries,
+	 * and a stale capsule's allocation can only ever be the peer-favourable
+	 * one, since any payment received after the checkpoint is missing from it.
+	 * A peer holding the newer state can under-report compatible reestablish
+	 * counters, ask to close, and validly sign the older split; signing it is a
+	 * loss with no penalty attached and no way back. Both directions are
+	 * refused, and a locally initiated close takes the same labelled
+	 * acknowledgement the operator force close does.
+	 *
+	 * What remains are the two exits that are actually safe: the operator's
+	 * explicit force close, never gated by this, and the PEER's own unilateral
+	 * close, which the 5.6 disposition asks for on every reconnect and which
+	 * pays our to_remote at the peer's state, never at less than we are owed.
+	 * MUST persist: a restart must not forget the restriction.
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**

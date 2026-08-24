@@ -4386,7 +4386,13 @@ export class BeignetNode extends EventEmitter {
 		return opened;
 	}
 
-	closeChannel(channelId: string): { ok: boolean; error?: string } {
+	closeChannel(
+		channelId: string,
+		// Required for a capsule-restored channel, whose balances nothing can
+		// prove current: a mutual close signs the allocation this row carries,
+		// and a stale one is peer-favourable by construction (issue #469).
+		acceptStaleStateRisk = false
+	): { ok: boolean; error?: string } {
 		const idBuf = Buffer.from(channelId, 'hex');
 		// Derive a P2WPKH script from the funding address for the closing output
 		const address = this.node.getFundingAddress();
@@ -4395,7 +4401,7 @@ export class BeignetNode extends EventEmitter {
 			address,
 			this.getBitcoinNetwork()
 		);
-		return this.node.closeChannel(idBuf, scriptPubkey);
+		return this.node.closeChannel(idBuf, scriptPubkey, acceptStaleStateRisk);
 	}
 
 	forceCloseChannel(

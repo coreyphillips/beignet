@@ -775,6 +775,63 @@ describe('Issue #469: a capsule-restored channel holds its automatic closes', fu
 		fx.bob.destroy();
 	});
 
+	it('refuses a cooperative close in both directions while recency is unproven', () => {
+		// A mutual close needs no revocation, which is why the hold lets the
+		// channel resume - but it pays out the balances THIS row carries, and a
+		// stale capsule's allocation can only be the peer-favourable one: any
+		// payment received after the checkpoint is missing from it. Signing it
+		// is a loss with no penalty attached and no way back.
+		const fx = setupUnprovenChannel(99);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+		const script = Buffer.from('0014' + '11'.repeat(20), 'hex');
+
+		const refused = chan.initiateShutdown(script);
+		const err = refused.find((a: any) => a.type === 'ERROR');
+		expect(err, 'a local close is refused').to.not.equal(undefined);
+		expect(err.message).to.match(/Recovery Capsule/);
+		expect(chan.getFullState().state, 'and nothing moved').to.equal(
+			ChannelState.NORMAL
+		);
+
+		// The labelled acknowledgement is the same one the operator force close
+		// takes: the hold is never a refusal to the operator.
+		const accepted = chan.initiateShutdown(script, true);
+		expect(
+			accepted.find((a: any) => a.type === 'ERROR'),
+			'the acknowledgement is not what stops it'
+		).to.equal(undefined);
+		expect(chan.getFullState().state).to.equal(ChannelState.SHUTTING_DOWN);
+	});
+
+	it('refuses a peer-initiated cooperative close onto the 5.6 peer-close path', () => {
+		const fx = setupUnprovenChannel(101);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+
+		const actions = chan.handleShutdown({
+			channelId: fx.channelId,
+			scriptPubkey: Buffer.from('0014' + '22'.repeat(20), 'hex')
+		});
+
+		const err = actions.find((a: any) => a.type === 'ERROR');
+		expect(err, 'our signature is not offered over a stale split').to.not.equal(
+			undefined
+		);
+		expect(err.message).to.match(/force close/);
+		expect(
+			chan.getFullState().state,
+			'and the channel lands on the durable peer-close path'
+		).to.equal(ChannelState.ERRORED);
+		expect(chan.getRecoveryCloseReason()).to.equal('restore-unproven');
+		expect(
+			actions[0].type,
+			'persisted before the error reaches the wire'
+		).to.equal('PERSIST_STATE');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
 	it('reports the hold on the recovery status', () => {
 		const fx = setupUnprovenChannel(81);
 

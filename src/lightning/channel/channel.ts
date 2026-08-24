@@ -5137,6 +5137,27 @@ export class Channel {
 	 * which the derived `restore-unproven` disposition asks the peer to close
 	 * on this and every later reconnect.
 	 */
+	/**
+	 * A peer-initiated cooperative close on a channel whose restored balances
+	 * cannot be proven current (issue #469).
+	 *
+	 * Shaped exactly like the reestablish-gap failure below and for the same
+	 * reason: refusing has to leave the channel somewhere, and the only place
+	 * that moves it is the 5.6 peer-close disposition. ERRORED plus a persist,
+	 * after which the derived `restore-unproven` reason asks the peer to close
+	 * on this and every later reconnect.
+	 */
+	private _heldCooperativeCloseRefusal(message: string): ChannelAction[] {
+		this._state.state = ChannelState.ERRORED;
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			...this.buildRecoveryCloseActions().filter(
+				(a) => a.type !== ChannelActionType.PERSIST_STATE
+			),
+			{ type: ChannelActionType.ERROR, message }
+		];
+	}
+
 	private _heldReestablishGapFailure(message: string): ChannelAction[] {
 		if (this._state.restoreRecencyUnproven !== true) {
 			return [{ type: ChannelActionType.ERROR, message }];
@@ -5621,7 +5642,45 @@ export class Channel {
 	/**
 	 * Initiate cooperative close by sending shutdown.
 	 */
-	initiateShutdown(scriptPubkey: Buffer): ChannelAction[] {
+	initiateShutdown(
+		scriptPubkey: Buffer,
+		/**
+		 * The labelled acknowledgement RECOVERY-PROTOCOL 5.6 asks for, the
+		 * same one the operator force close takes. Required only on a channel
+		 * restored from a Recovery Capsule, whose BALANCES nothing can prove
+		 * current (issue #469).
+		 */
+		acceptStaleStateRisk = false
+	): ChannelAction[] {
+		// A mutual close needs no revocation, which is why the hold allows the
+		// channel to resume - but it pays out the balances THIS row carries,
+		// and a stale capsule's allocation can only ever be the peer-favourable
+		// one: any payment received after the checkpoint is missing from it. A
+		// peer holding the newer state can under-report compatible reestablish
+		// counters, ask to close, and validly sign the older split. Signing it
+		// is a loss with no penalty attached and no way back.
+		//
+		// The exits that remain are both safe and both already exist: the
+		// operator's explicit force close, and the peer's own unilateral close,
+		// which the 5.6 disposition asks for on every reconnect and which pays
+		// us our to_remote at THEIR state, never at less than we are owed.
+		if (this._state.restoreRecencyUnproven === true && !acceptStaleStateRisk) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot close cooperatively: channel was restored from a ' +
+						'Recovery Capsule and its balances cannot be proven current, ' +
+						'so a mutual close may sign away funds received after the ' +
+						'capsule was written',
+					cleanup: 'none'
+				}
+			];
+		}
+		return this._initiateShutdown(scriptPubkey);
+	}
+
+	private _initiateShutdown(scriptPubkey: Buffer): ChannelAction[] {
 		// option_simple_close allows re-sending shutdown to update the local
 		// script mid-negotiation (restarting the signing flow); legacy close
 		// only permits initiating from NORMAL.
@@ -5721,6 +5780,21 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected shutdown' }
 			];
+		}
+
+		// The peer asking to close is the same trap from the other side (issue
+		// #469 review). It would be OUR signature over a stale allocation, so
+		// the answer has to be the same: refuse, and stay on the 5.6 path that
+		// asks the peer to close unilaterally instead - which is safe for us,
+		// because its own commitment pays our to_remote at ITS state, never at
+		// less than we are owed. Terminal and persisted, so the disposition is
+		// durable and the request is regenerated on every reconnect.
+		if (this._state.restoreRecencyUnproven === true) {
+			return this._heldCooperativeCloseRefusal(
+				'Cannot close cooperatively: this channel was restored from a ' +
+					'Recovery Capsule and its balances cannot be proven current; ' +
+					'please force close instead'
+			);
 		}
 
 		// Simple-taproot close: the peer's shutdown MUST carry its MuSig2

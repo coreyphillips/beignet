@@ -8639,7 +8639,14 @@ export class LightningNode extends EventEmitter {
 
 	closeChannel(
 		channelId: Buffer,
-		scriptPubkey: Buffer
+		scriptPubkey: Buffer,
+		/**
+		 * The labelled acknowledgement RECOVERY-PROTOCOL 5.6 asks for. Needed
+		 * only on a channel restored from a Recovery Capsule: a mutual close
+		 * pays out the balances that row carries, and a stale allocation can
+		 * only be the peer-favourable one (issue #469).
+		 */
+		acceptStaleStateRisk = false
 	): { ok: boolean; error?: string } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
@@ -8661,7 +8668,8 @@ export class LightningNode extends EventEmitter {
 		const stamped = channel?.recordCloseReason('user') ?? false;
 		const result = this.channelManager.initiateShutdown(
 			channelId,
-			scriptPubkey
+			scriptPubkey,
+			acceptStaleStateRisk
 		);
 		if (!result.ok) {
 			if (stamped) {

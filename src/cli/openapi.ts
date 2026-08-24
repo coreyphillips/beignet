@@ -549,9 +549,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			},
 			'/channel/close': {
 				post: {
-					summary: 'Cooperatively close a channel',
+					summary:
+						'Cooperatively close a channel. A channel restored from a Recovery Capsule needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway',
 					tags: ['Channels'],
-					requestBody: bodyContent({ channelId: 'string' }),
+					requestBody: bodyContent({
+						channelId: 'string',
+						// Conditionally required, and only for a capsule-restored
+						// channel, so the schema cannot say "required" without
+						// misdescribing every other close.
+						acceptStaleStateRisk: 'boolean?'
+					}),
 					responses: { '200': { description: 'Close result' } }
 				}
 			},
