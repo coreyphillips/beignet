@@ -10053,7 +10053,12 @@ export class LightningNode extends EventEmitter {
 				stuckBlocks,
 				// Lets the advisor keep counting a channel that pays through its
 				// splice instead of zeroing the liquidity for the splice window.
-				htlcUsable: ch.htlcUsable
+				htlcUsable: ch.htlcUsable,
+				// Keeps the advisor from recommending a force close of a channel
+				// whose local broadcast the restore hold forbids (issue #469).
+				...(ch.restoreRecencyUnproven === true
+					? { restoreRecencyUnproven: true }
+					: {})
 			};
 		});
 		return this.liquidityAdvisor.analyze(snapshots);
@@ -10077,7 +10082,10 @@ export class LightningNode extends EventEmitter {
 			// A rebalance is two new HTLCs, so a channel that refuses them
 			// cannot be either leg. The planner reads this rather than the
 			// state, for the same reason the advisor does (issue #469).
-			htlcUsable: ch.htlcUsable
+			htlcUsable: ch.htlcUsable,
+			...(ch.restoreRecencyUnproven === true
+				? { restoreRecencyUnproven: true }
+				: {})
 		}));
 		const plans = planRebalances(snapshots, {
 			minImbalancePct:

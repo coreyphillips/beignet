@@ -46,6 +46,14 @@ export interface IChannelSnapshot {
 	 * Absent means unknown, and only the state is judged.
 	 */
 	htlcUsable?: boolean;
+	/**
+	 * The channel was restored from a Recovery Capsule and its balances cannot
+	 * be proven current (issue #469): the node refuses to broadcast its own
+	 * commitment while this stands, so advice to force-close it is advice to
+	 * do the one thing the hold exists to prevent. Absent means not restored
+	 * (or a caller predating the field), and close advice stands.
+	 */
+	restoreRecencyUnproven?: boolean;
 }
 
 export interface ILiquiditySnapshot {
@@ -170,7 +178,11 @@ export class LiquidityAdvisor {
 			if (
 				ch.state === 'AWAITING_REESTABLISH' &&
 				ch.stuckBlocks !== undefined &&
-				ch.stuckBlocks > 100
+				ch.stuckBlocks > 100 &&
+				// A capsule-held channel is EXPECTED to sit here until its peer
+				// connects, and a local force close is exactly what its hold
+				// forbids; the exit is the peer's own close (issue #469).
+				ch.restoreRecencyUnproven !== true
 			) {
 				recommendations.push({
 					type: RecommendationType.CLOSE_CHANNEL,

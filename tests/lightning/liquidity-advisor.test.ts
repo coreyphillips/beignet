@@ -248,6 +248,26 @@ describe('LiquidityAdvisor', () => {
 		).to.be.true;
 	});
 
+	it('suppresses close advice for a capsule-held stuck channel', () => {
+		// A channel restored from a Recovery Capsule sits in
+		// AWAITING_REESTABLISH until its peer connects, and its hold forbids
+		// exactly the local force close this rule recommends (issue #469).
+		const result = advisor.analyze([
+			makeChannel({
+				channelId: 'held_ch',
+				state: 'AWAITING_REESTABLISH',
+				stuckBlocks: 150,
+				restoreRecencyUnproven: true
+			})
+		]);
+		expect(
+			result.recommendations.some(
+				(r) => r.type === RecommendationType.CLOSE_CHANNEL
+			),
+			'no close advice for a channel whose local broadcast is held'
+		).to.be.false;
+	});
+
 	it('with near-empty idle channel returns LOW CLOSE_CHANNEL', () => {
 		const twoDaysAgo = Date.now() - 48 * 60 * 60 * 1000;
 		const result = advisor.analyze([
