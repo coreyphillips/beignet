@@ -531,6 +531,102 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 		).channels.delete(channelId);
 	});
 
+	it('POST /channel/close refuses a capsule-restored channel without acceptStaleStateRisk (issue #469)', async () => {
+		const node = daemon.node.getNode();
+		const {
+			createOpenerState
+		} = require('../../src/lightning/channel/channel-state');
+		const { Channel } = require('../../src/lightning/channel/channel');
+		const {
+			ChannelState,
+			DEFAULT_CHANNEL_CONFIG
+		} = require('../../src/lightning/channel/types');
+		const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+		const point = getPublicKey(crypto.randomBytes(32));
+		const bp = {
+			fundingPubkey: point,
+			revocationBasepoint: point,
+			paymentBasepoint: point,
+			delayedPaymentBasepoint: point,
+			htlcBasepoint: point,
+			firstPerCommitmentPoint: point
+		};
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 100_000n,
+			pushMsat: 0n,
+			localConfig: DEFAULT_CHANNEL_CONFIG,
+			localBasepoints: bp,
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		state.state = ChannelState.NORMAL;
+		state.channelId = crypto.randomBytes(32);
+		state.fundingTxid = crypto.randomBytes(32);
+		state.remoteBasepoints = bp;
+		state.restoreRecencyUnproven = true;
+		node
+			.getChannelManager()
+			.restoreChannel(
+				new Channel(state),
+				crypto.randomBytes(33).toString('hex')
+			);
+		const channelId = state.channelId.toString('hex');
+		// A RESUMED held channel: restoreChannel wraps the row for
+		// reestablish, and a shutdown is only legal from NORMAL.
+		node.getChannelManager().getChannel(state.channelId)!.getFullState().state =
+			ChannelState.NORMAL;
+
+		try {
+			// A mutual close pays out the restored balances, which cannot be
+			// proven current, so it takes the same labelled acknowledgement
+			// the force close does.
+			const refused = await request(portOf(daemon), 'POST', '/channel/close', {
+				channelId
+			});
+			expect((refused.body.error as { code: string }).code).to.equal(
+				'CLOSE_FAILED'
+			);
+			expect((refused.body.error as { message: string }).message).to.match(
+				/Recovery Capsule/
+			);
+
+			// With the acknowledgement the close goes through to the engine
+			// and the whole negotiation is covered.
+			const accepted = await request(portOf(daemon), 'POST', '/channel/close', {
+				channelId,
+				acceptStaleStateRisk: true
+			});
+			expect(
+				accepted.body.ok,
+				'the acknowledgement is not what stops it'
+			).to.equal(true);
+		} finally {
+			(
+				node.getChannelManager() as unknown as {
+					channels: Map<string, unknown>;
+				}
+			).channels.delete(channelId);
+		}
+	});
+
+	it('the CLI forwards --accept-stale-state-risk on close exactly as on forceclose', () => {
+		// Source-derived, like the parity suite: the daemon route accepts the
+		// flag, so a CLI close that never forwards it makes the acknowledged
+		// cooperative-close route unreachable from the CLI.
+		const cliSrc = fs.readFileSync(
+			path.join(__dirname, '../../src/cli/cli.ts'),
+			'utf8'
+		);
+		const closeCase = cliSrc.slice(
+			cliSrc.indexOf("case 'close':"),
+			cliSrc.indexOf("case 'forceclose':")
+		);
+		expect(closeCase, 'close posts the flag').to.include(
+			'acceptStaleStateRisk'
+		);
+		expect(closeCase).to.include('--accept-stale-state-risk');
+	});
+
 	it('keeps a capsule-restored channel out of every readiness and capacity surface (issue #469)', async () => {
 		// A held channel stays NORMAL: it keeps its balance and closes
 		// cooperatively. But routing refuses it and addHtlc refuses it, so a

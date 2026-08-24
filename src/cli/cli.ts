@@ -762,7 +762,14 @@ async function handleChannel(): Promise<void> {
 		case 'close':
 			return outputResult(
 				await httpRequest('POST', '/channel/close', {
-					channelId: filteredArgs[2]
+					channelId: filteredArgs[2],
+					// A channel restored from a Recovery Capsule refuses an
+					// unacknowledged cooperative close too: a mutual close pays
+					// out the restored balances, which cannot be proven
+					// current. Same labelled escape hatch as the force close.
+					...(hasFlag('--accept-stale-state-risk')
+						? { acceptStaleStateRisk: true }
+						: {})
 				})
 			);
 		case 'forceclose':
@@ -2424,6 +2431,10 @@ Channels:
                                          --trusted: zero-conf, usable before
                                          confirmation (trusted peers only)
   channel close <id>                     Cooperative close
+                                         --accept-stale-state-risk: required
+                                         for a channel restored from a
+                                         Recovery Capsule, whose balances a
+                                         mutual close would pay out unproven
   channel forceclose <id>                Force close
                                          --accept-stale-state-risk: required
                                          for a channel restored from a

@@ -431,14 +431,21 @@ BEIGNET_RECOVERY_REESTABLISH_HOLD_MS=600000   # peer-storage only; 0 disables
   timeout backstops are all held, and the channel asks its peer to close
   instead), and the channel takes no new HTLCs, since the on-chain HTLC
   deadline backstops that would enforce them can never fire. Existing HTLCs
-  still settle and fail, the balance is intact, and a cooperative close stays
-  available and cannot be penalized from a stale state. An ERRORED one
-  reports `status: "restore_recency_unproven"` rather than `force_closing`.
-  The exits are the peer closing, or
+  still settle and fail, and the balance is intact. A cooperative close is
+  refused by default in BOTH directions too: a mutual close pays out the
+  balances the restored row carries, and a stale capsule's allocation can
+  only be the peer-favourable one, since any payment received after the
+  checkpoint is missing from it. An ERRORED one reports
+  `status: "restore_recency_unproven"` rather than `force_closing`. The
+  exits are the peer closing, or the operator's labelled acknowledgement on
+  either close:
+  `beignet channel close <id> --accept-stale-state-risk`
+  (`POST /channel/close` with `acceptStaleStateRisk: true`) accepts the
+  stale-split risk and covers the whole negotiation, and
   `beignet channel forceclose <id> --accept-stale-state-risk`
-  (`POST /channel/forceclose` with `acceptStaleStateRisk: true`), which is
-  refused without the flag because publishing a commitment the peer may
-  already have revoked forfeits the whole channel balance.
+  (`POST /channel/forceclose` with `acceptStaleStateRisk: true`) accepts
+  that publishing a commitment the peer may already have revoked forfeits
+  the whole channel balance. Both are refused without the flag.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.
@@ -1345,11 +1352,12 @@ beignet channel open-zeroconf <pubkey> <sats> [pushSats]
 beignet channel open-v2 <pubkey> <sats> [fundingFeeratePerkw]
 beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
 beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
-beignet channel close <channelId>
+beignet channel close <channelId> [--accept-stale-state-risk]
 beignet channel forceclose <channelId> [--accept-stale-state-risk]
-# A channel restored from a Recovery Capsule refuses a force close without the
-# flag: its state cannot be proven current, so if the peer holds a newer one the
-# broadcast is revoked and the whole channel balance goes to the justice path.
+# A channel restored from a Recovery Capsule refuses either close without the
+# flag. Cooperative: a mutual close pays out restored balances that cannot be
+# proven current. Force: if the peer holds a newer state the broadcast is
+# revoked and the whole channel balance goes to the justice path.
 beignet channel rebroadcast-close <channelId>
 beignet channel splice-in <channelId> <sats> <feeratePerkw>
 beignet channel splice-out <channelId> <sats> <feeratePerkw>

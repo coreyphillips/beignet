@@ -764,16 +764,17 @@ export interface IChannelInfo {
 	 *
 	 * This is the sending gate. It is deliberately NOT "can exchange updates":
 	 * a channel answering false here can still settle and fail the HTLCs it
-	 * already has, and still closes cooperatively.
+	 * already has, and can still negotiate a close.
 	 */
 	htlcUsable?: boolean;
 	/**
 	 * The channel was restored from a Recovery Capsule and no
 	 * channel_reestablish has proven its state current, so it takes no NEW
 	 * HTLCs and is offered to no router or planner (issue #469). Existing
-	 * HTLCs still settle, and it still closes cooperatively. Present only
-	 * while the hold stands; it is the reason a NORMAL channel can report
-	 * htlcUsable false.
+	 * HTLCs still settle; a cooperative close is refused in both directions
+	 * unless the operator's acceptStaleStateRisk acknowledgement covers the
+	 * negotiation. Present only while the hold stands; it is the reason a
+	 * NORMAL channel can report htlcUsable false.
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**

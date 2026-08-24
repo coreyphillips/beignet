@@ -4637,13 +4637,14 @@ export class LightningNode extends EventEmitter {
 			 * (issue #469). A capsule is best-effort recency (5.4), so until
 			 * the peer answers, this node will not broadcast the channel's
 			 * commitment on its own initiative: the automatic close paths are
-			 * held and the channel asks the peer to close instead. It clears
+			 * held and the channel asks the peer to close instead.
 			 * A compatible reestablish does not lift it, since compatibility is
 			 * not recency, so it stands for the life of the channel: such a
 			 * channel also takes no new HTLCs, though existing ones still
-			 * settle and it can still be closed cooperatively. The peer's close
-			 * and the operator's explicit force close are the exits, and the
-			 * second is deliberately never gated by this.
+			 * settle, and a cooperative close is refused in both directions
+			 * unless the operator's acceptStaleStateRisk acknowledgement
+			 * covers the negotiation. The peer's close and the operator's
+			 * acknowledged close (cooperative or force) are the exits.
 			 */
 			restoreRecencyUnproven?: boolean;
 		}>;

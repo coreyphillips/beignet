@@ -127,7 +127,8 @@ export interface ChannelInfo {
 	/**
 	 * The channel was restored from a Recovery Capsule and its state has not
 	 * been proven current, so it takes no new HTLCs and is offered to no
-	 * router. Existing HTLCs still settle and it still closes cooperatively.
+	 * router. Existing HTLCs still settle; a cooperative close is refused in
+	 * both directions without the acceptStaleStateRisk acknowledgement.
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**
