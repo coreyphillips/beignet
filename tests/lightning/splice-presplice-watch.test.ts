@@ -365,12 +365,27 @@ describe('Pre-splice spend watch record (issue #479)', () => {
 		const types = actions.map((a) => a.type);
 		expect(
 			types.indexOf(ChannelActionType.PERSIST_STATE),
-			'the record reaches disk first'
+			'the records reach disk first'
 		).to.equal(0);
 		expect(
 			types.indexOf(ChannelActionType.WATCH_PRESPLICE_SPEND),
-			'then the watch is armed'
+			'then the superseded outpoint is covered'
 		).to.equal(1);
+		// BOTH outputs, not just the old one. Our signature completes the
+		// shared 2-of-2 input, so from here the peer can publish the splice and
+		// its own commitment on the spliced funding while withholding its
+		// tx_signatures. Without this the new output was watched by nothing,
+		// and once the leg retired at depth the channel's own watch, still on
+		// the old outpoint, read the splice itself as a close.
+		const watchNew = actions.find(
+			(a) => a.type === ChannelActionType.WATCH_FUNDING
+		) as unknown as { fundingTxid: Buffer; fundingOutputIndex: number };
+		expect(watchNew, 'and so is the one the splice creates').to.not.equal(
+			undefined
+		);
+		expect(watchNew.fundingTxid.equals(spliceTxid)).to.equal(true);
+		expect(watchNew.fundingOutputIndex).to.equal(0);
+
 		const send = actions.find(
 			(a) =>
 				a.type === ChannelActionType.SEND_MESSAGE &&
@@ -382,16 +397,7 @@ describe('Pre-splice spend watch record (issue #479)', () => {
 		expect(
 			types.indexOf(ChannelActionType.SEND_MESSAGE),
 			'in that order'
-		).to.be.greaterThan(1);
-
-		// Emphatically NOT a WATCH_FUNDING: that would re-key the channel's
-		// only funding watch onto an outpoint whose transaction has not been
-		// broadcast and may never be, abandoning the live confirmed one and
-		// starting the forget clock against a transaction that does not exist
-		// (issue #481).
-		expect(types, 'the channel funding watch is not moved here').to.not.include(
-			ChannelActionType.WATCH_FUNDING
-		);
+		).to.equal(types.length - 1);
 		expect(channel.getFullState().preSpliceSpendWatches).to.have.length(1);
 	});
 

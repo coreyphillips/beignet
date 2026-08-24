@@ -2582,6 +2582,107 @@ describe('Phase 4: Chain Watcher', () => {
 			node.destroy();
 		});
 
+		it('keeps the old funding watched while a splice is still unsigned (issue #479)', async () => {
+			// The shared input is the 2-of-2 funding, so until OUR tx_signatures
+			// have left nobody can broadcast that splice: the outpoint it would
+			// create does not exist, and the live funding is still the old one.
+			// Moving the watch there anyway left the old output covered by
+			// nothing at all - no leg is recorded before this point either,
+			// because such a splice can still be aborted - so a commitment
+			// spending the funding that DOES exist went unseen.
+			const {
+				LightningNode
+			} = require('../../src/lightning/node/lightning-node');
+			const {
+				createOpenerState
+			} = require('../../src/lightning/channel/channel-state');
+			const { Channel } = require('../../src/lightning/channel/channel');
+			const {
+				ChannelState,
+				DEFAULT_CHANNEL_CONFIG
+			} = require('../../src/lightning/channel/types');
+
+			const basepoints = makeBasepoints(crypto.randomBytes(32));
+			const node = new LightningNode({
+				nodePrivateKey: crypto.randomBytes(32),
+				channelBasepoints: basepoints,
+				perCommitmentSeed: crypto.randomBytes(32),
+				fundingPrivkey: crypto.randomBytes(32),
+				chainBackend: {
+					subscribeToHeaders: async () => {},
+					subscribeToScriptHash: async () => {},
+					getScriptHashHistory: async () => [],
+					getTransaction: async () => Buffer.alloc(0),
+					broadcastTransaction: async () => ''
+				} as IChainBackend
+			});
+
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 1_000_000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: basepoints,
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			state.state = ChannelState.SPLICING;
+			state.channelId = crypto.randomBytes(32);
+			state.fundingTxid = crypto.randomBytes(32);
+			state.fundingOutputIndex = 1;
+			state.remoteBasepoints = makeBasepoints(crypto.randomBytes(32));
+			state.preSpliceSpendWatches = undefined;
+			const spliceTx = new bitcoin.Transaction();
+			spliceTx.version = 2;
+			spliceTx.addInput(Buffer.from(state.fundingTxid), 1, 0xfffffffd);
+			spliceTx.addOutput(
+				Buffer.from('0020' + '44'.repeat(32), 'hex'),
+				1_000_000
+			);
+			state.spliceInFlight = {
+				spliceTxid: Buffer.from(spliceTx.getId(), 'hex').reverse(),
+				newFundingOutputIndex: 0,
+				newFundingSatoshis: 1_000_000n,
+				spliceTxHex: spliceTx.toHex(),
+				fullySigned: false,
+				isInitiator: true,
+				localRelativeSatoshis: 0n,
+				remoteRelativeSatoshis: 0n,
+				remoteFundingPubkey: getPublicKey(crypto.randomBytes(32)),
+				ourSharedInputSig: Buffer.alloc(64),
+				ourWalletWitnesses: [],
+				ourWalletInputIndices: [],
+				inputPrevouts: [],
+				remoteCommitmentSig: crypto.randomBytes(64),
+				// The point of no return has NOT been reached.
+				sentTxSignatures: false,
+				receivedTxSignatures: false,
+				localSpliceLocked: false,
+				remoteSpliceLocked: false,
+				confirmed: false
+			};
+			node
+				.getChannelManager()
+				.restoreChannel(new Channel(state), 'cafe'.repeat(16));
+
+			await node.restoreChainWatches();
+
+			const watched = (
+				node.getChainWatcher()! as unknown as {
+					watchedFundings: Map<string, { txid: string }>;
+				}
+			).watchedFundings;
+			const oldTxid = Buffer.from(state.fundingTxid).reverse().toString('hex');
+			const primary = watched.get(state.channelId.toString('hex'));
+			expect(primary, 'the channel still has a funding watch').to.not.equal(
+				undefined
+			);
+			expect(
+				primary!.txid,
+				'and it is still on the funding that actually exists'
+			).to.equal(oldTxid);
+			node.destroy();
+		});
+
 		it('should not create ChainWatcher when no backend provided', () => {
 			const {
 				LightningNode

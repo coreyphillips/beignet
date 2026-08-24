@@ -11386,12 +11386,27 @@ export class Channel {
 			sharedInputSignature: signed.signature
 		};
 		const actions: ChannelAction[] = [
-			// Persist the leg, then arm the watch, then let our signature out.
-			// In that order: the record must be on disk before a crash can
-			// leave the peer able to broadcast, and the watch must be live
-			// before the peer can be told it may.
+			// Persist the records, then arm both watches, then let our
+			// signature out. In that order: what is on disk must survive a
+			// crash that leaves the peer able to broadcast, and both watches
+			// must be live before the peer can be told it may.
 			{ type: ChannelActionType.PERSIST_STATE },
 			...armPreSplice,
+			// The NEW output needs covering here too, not only at broadcast.
+			// Our signature completes the shared 2-of-2 input, so from the
+			// moment it leaves the peer can publish the splice - and its own
+			// commitment on the spliced funding, which it already holds our
+			// signature for - while withholding its tx_signatures. Arming only
+			// the old-outpoint leg left that output unwatched, so the splice
+			// could confirm unseen; and once the leg retired at depth the
+			// channel's own watch, still on the old outpoint, read the very
+			// same splice as a close.
+			{
+				type: ChannelActionType.WATCH_FUNDING,
+				fundingTxid: signed.spliceTxid,
+				fundingOutputIndex: signed.newFundingOutputIndex,
+				minimumDepth: this._state.minimumDepth
+			},
 			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg))
 		];
 		// Zero-conf: when the peer's tx_signatures arrived before ours (this

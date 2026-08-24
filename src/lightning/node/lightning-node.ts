@@ -6930,6 +6930,14 @@ export class LightningNode extends EventEmitter {
 		// real and confirmed, and voiding it would destroy a live
 		// channel. Alarm only; splice rollback is a separate path.
 		if (state.spliceInFlight) return;
+		// Nor while a superseded outpoint of this channel is still being
+		// watched. The channel's own watch moves to the splice output at the
+		// point of no return, and for a ZERO-CONF parent whose funding never
+		// confirmed the evidence test below cannot speak for it, so the leg is
+		// what says the pre-splice funding is real. It retires only when the
+		// splice spend is irrevocable, which is exactly when absence about the
+		// new outpoint starts meaning something.
+		if (state.preSpliceSpendWatches?.length) return;
 		// And a splice that ENDS without confirming is the same channel with
 		// that record already cleared (issue #481). Both the abort path and the
 		// zero-conf completeSplice null spliceInFlight while the channel's
@@ -7470,10 +7478,20 @@ export class LightningNode extends EventEmitter {
 			);
 
 			const inflight = state.spliceInFlight;
-			if (inflight) {
-				// In-flight splice: watch the splice tx's new funding output INSTEAD
-				// of the old one (watches are keyed by channelId; the old funding
-				// output is expected to be spent by the splice tx, and a stale
+			// ONLY past the point of no return. The shared input is the 2-of-2
+			// funding, so until OUR tx_signatures have left nobody can broadcast
+			// that splice: the outpoint it would create does not exist, and the
+			// live funding is still the old one. Moving the watch there anyway
+			// left the old output covered by nothing at all - the leg is
+			// deliberately not recorded before this point either, because such a
+			// splice can still be aborted - so a commitment spending the funding
+			// that DOES exist went unseen. A pre-signature splice that aborts
+			// therefore needs no re-arming: the watch never moved.
+			if (inflight && inflight.sentTxSignatures === true) {
+				// In-flight splice: watch the splice tx's new funding output IN
+				// ADDITION to the old one, which keeps its own spend coverage
+				// from the pre-splice leg armed above (the old output is
+				// expected to be spent by the splice tx, and a stale
 				// confirmation re-fire would trigger a premature splice_locked).
 				// Also rebroadcast the fully-signed splice tx — the network may never
 				// have seen it if we crashed right after persisting.
