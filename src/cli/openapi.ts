@@ -64,7 +64,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ready': {
 				get: {
 					summary:
-						'Simple readiness check — true when node has at least one NORMAL channel (auth-exempt)',
+						'Simple readiness check — true when the node has at least one channel that is NORMAL and will accept a new HTLC. A channel restored from a Recovery Capsule whose state has not been proven current is NORMAL but holds, so it does not count (auth-exempt)',
 					tags: ['Node'],
 					security: [],
 					responses: {
@@ -110,7 +110,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			},
 			'/channels/ready': {
 				get: {
-					summary: 'List channels in NORMAL state',
+					summary:
+						'List channels that are NORMAL and will accept a new HTLC (a capsule-restored channel holding for recency is excluded)',
 					tags: ['Channels'],
 					responses: {
 						'200': {

@@ -222,7 +222,7 @@ flows, just-in-time inventory checks, atomic swaps.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getReadyChannels()` | `ChannelInfo[]` | List channels in NORMAL state |
+| `getReadyChannels()` | `ChannelInfo[]` | List channels that are NORMAL and will accept a new HTLC |
 | `canSend(amountSats)` | `{ canSend, bestChannelId?, availableSats }` | Check if you can send this amount (accounts for channel reserves) |
 | `canReceive(amountSats)` | `{ canReceive, bestChannelId?, availableSats }` | Check if you can receive this amount (accounts for channel reserves) |
 
@@ -1727,7 +1727,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/stats` | `?window=<ms>` | Node statistics (optional time window in ms) |
 | GET | `/peers` | -- | List peers |
 | GET | `/channels` | -- | List channels |
-| GET | `/channels/ready` | -- | List channels in NORMAL state |
+| GET | `/channels/ready` | -- | List channels that are NORMAL and will accept a new HTLC (a capsule-restored channel holding for recency is excluded) |
 | GET | `/can-send` | `?amountSats=<n>` | Check send capacity |
 | GET | `/can-receive` | `?amountSats=<n>` | Check receive capacity |
 | GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable) |

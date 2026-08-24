@@ -726,6 +726,55 @@ describe('Issue #469: a capsule-restored channel holds its automatic closes', fu
 		fx.bob.destroy();
 	});
 
+	it('fails an abandoned forward with well-formed BOLT 4 failure data', () => {
+		// TEMPORARY_CHANNEL_FAILURE carries the UPDATE flag, so BOLT 4 still
+		// requires the two-byte channel_update length even when the update
+		// itself is omitted. Empty data is malformed and a strict peer may
+		// treat the whole failure as such.
+		const {
+			decryptFailureMessage
+		} = require('../../src/lightning/onion/failures');
+		const fx = setupUnprovenChannel(97);
+		const node = fx.alice as any;
+		const inChannelId = crypto.randomBytes(32);
+		const sharedSecret = crypto.randomBytes(32);
+		const outKey = `${fx.channelId.toString('hex')}:offered-3`;
+
+		node.forwardedHtlcs.set(outKey, { inChannelId, inHtlcId: 11n });
+		node.receivedHtlcSharedSecrets.set(
+			`${inChannelId.toString('hex')}:11`,
+			sharedSecret
+		);
+		let captured: Buffer | undefined;
+		node.failForwardUpstream = (
+			_k: string,
+			_f: unknown,
+			_c: Buffer,
+			_h: bigint,
+			reason: Buffer
+		): boolean => {
+			captured = reason;
+			return true;
+		};
+
+		node.failAbandonedLocalAdd(fx.channelId, {
+			htlcId: 3n,
+			paymentHash: crypto.randomBytes(32),
+			amountMsat: 50_000n
+		});
+
+		expect(captured, 'the inbound leg is failed').to.not.equal(undefined);
+		const decoded = decryptFailureMessage([sharedSecret], captured!);
+		expect(decoded, 'and the payer can read it').to.not.equal(null);
+		expect(decoded.failure.failureCode).to.equal(0x1007);
+		expect(
+			decoded.failure.failureData?.length,
+			'with the channel_update length BOLT 4 requires'
+		).to.equal(2);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
 	it('reports the hold on the recovery status', () => {
 		const fx = setupUnprovenChannel(81);
 

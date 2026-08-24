@@ -570,16 +570,55 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 		state.localBalanceMsat = 900_000_000n;
 		state.remoteBalanceMsat = 100_000_000n;
 		state.restoreRecencyUnproven = true;
+		const peer = crypto.randomBytes(33).toString('hex');
+		node.getChannelManager().restoreChannel(new Channel(state), peer);
+		// restoreChannel wraps the row in AWAITING_REESTABLISH. The shape this
+		// is about is the one AFTER that completes: a RESUMED held channel,
+		// NORMAL and holding a real balance, which is exactly what every
+		// state-only surface used to count.
+		state.state = ChannelState.NORMAL;
+		state.remoteScidAlias = crypto.randomBytes(8);
+		const channelId = state.channelId.toString('hex');
+
+		// A second, ordinary channel with the mirror imbalance, so a rebalance
+		// between the two is possible and the planner has something to plan.
+		const other = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: DEFAULT_CHANNEL_CONFIG,
+			localBasepoints: bp,
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		other.state = ChannelState.NORMAL;
+		other.channelId = crypto.randomBytes(32);
+		other.fundingTxid = crypto.randomBytes(32);
+		other.remoteBasepoints = bp;
+		other.localBalanceMsat = 50_000_000n;
+		other.remoteBalanceMsat = 950_000_000n;
 		node
 			.getChannelManager()
 			.restoreChannel(
-				new Channel(state),
+				new Channel(other),
 				crypto.randomBytes(33).toString('hex')
 			);
-		const channelId = state.channelId.toString('hex');
+		other.state = ChannelState.NORMAL;
+		const otherId = other.channelId.toString('hex');
 		const cli = daemon.node;
 
 		try {
+			// The planner only ever filtered on NORMAL state, so the held
+			// channel's 900k made it the obvious donor for the other channel's
+			// 50k - a plan execution would refuse the moment it tried.
+			expect(
+				cli
+					.getAdvisorRecommendations()
+					.rebalancePlan.filter(
+						(p: { fromChannelId: string; toChannelId: string }) =>
+							p.fromChannelId === channelId || p.toChannelId === channelId
+					),
+				'nothing is planned through it'
+			).to.have.length(0);
 			const listed = cli
 				.listChannels()
 				.find((c: { channelId: string }) => c.channelId === channelId);
@@ -589,31 +628,129 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 			);
 			expect(listed!.restoreRecencyUnproven, 'and it says why').to.equal(true);
 
-			expect(
-				cli
-					.getReadyChannels()
-					.some((c: { channelId: string }) => c.channelId === channelId),
-				'not counted ready'
-			).to.equal(false);
-			expect(cli.canSend(1000).canSend, 'nothing sendable through it').to.equal(
-				false
+			const ready = cli
+				.getReadyChannels()
+				.map((c: { channelId: string }) => c.channelId);
+			expect(ready, 'the held channel is not counted ready').to.not.include(
+				channelId
 			);
+			expect(ready, 'the ordinary one still is').to.include(otherId);
 			expect(
-				cli.canReceive(1000).canReceive,
-				'and nothing receivable'
+				cli.canSend(500_000).bestChannelId,
+				'its 900k of local balance is not offered for sending'
+			).to.not.equal(channelId);
+			expect(
+				cli.canSend(500_000).canSend,
+				'and nothing else can cover it either'
 			).to.equal(false);
-			expect(cli.getHealth().readyChannelCount, 'not a ready channel').to.equal(
-				0
-			);
+			expect(
+				cli.canReceive(500_000).canReceive,
+				'the mirror on the receive side'
+			).to.equal(true);
+			expect(
+				cli.getHealth().readyChannelCount,
+				'one ready channel, not two'
+			).to.equal(1);
 			const liquidity = cli.getLiquiditySnapshot();
 			expect(
-				liquidity.totalLocalBalanceSats + liquidity.totalRemoteBalanceSats,
-				'and no liquidity is claimed for it'
-			).to.equal(0);
+				liquidity.totalLocalBalanceSats,
+				'its 900k of local balance is not claimed as liquidity'
+			).to.equal(50_000);
+			expect(
+				liquidity.activeChannelCount,
+				'and it is not an active channel to the advisor'
+			).to.equal(1);
 			expect(
 				liquidity.sendableSats,
-				'and nothing is reported as sendable through it'
-			).to.equal(0);
+				'and its 900k is not reported as sendable (only the other channel)'
+			).to.be.lessThan(100_000);
+			// Not just the totals: a held channel must be out of the ANALYSIS,
+			// or the advisor recommends and the planner plans work that
+			// execution rejects.
+			// eslint-disable-next-line no-console
+			console.log(
+				'DBG active',
+				liquidity.activeChannelCount,
+				'plans',
+				cli.getAdvisorRecommendations().rebalancePlan.length,
+				'hint',
+				(cli.getChannelDiagnostics(channelId) as any).willGenerateRoutingHint
+			);
+		} finally {
+			const channels = (
+				node.getChannelManager() as unknown as {
+					channels: Map<string, unknown>;
+				}
+			).channels;
+			channels.delete(channelId);
+			channels.delete(otherId);
+		}
+	});
+
+	it('does not promise a routing hint a held channel will not generate (issue #469)', async () => {
+		// A resumed held channel is NORMAL, so a diagnostic keyed on state
+		// answered "yes, a hint will be generated" in the same response that
+		// reported HELD_RESTORE and said hints are skipped.
+		const node = daemon.node.getNode();
+		const {
+			createOpenerState
+		} = require('../../src/lightning/channel/channel-state');
+		const { Channel } = require('../../src/lightning/channel/channel');
+		const {
+			ChannelState,
+			DEFAULT_CHANNEL_CONFIG
+		} = require('../../src/lightning/channel/types');
+		const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+		const point = getPublicKey(crypto.randomBytes(32));
+		const bp = {
+			fundingPubkey: point,
+			revocationBasepoint: point,
+			paymentBasepoint: point,
+			delayedPaymentBasepoint: point,
+			htlcBasepoint: point,
+			firstPerCommitmentPoint: point
+		};
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: DEFAULT_CHANNEL_CONFIG,
+			localBasepoints: bp,
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		state.state = ChannelState.NORMAL;
+		state.channelId = crypto.randomBytes(32);
+		state.fundingTxid = crypto.randomBytes(32);
+		state.remoteBasepoints = bp;
+		state.announceChannel = false;
+		state.restoreRecencyUnproven = true;
+		node
+			.getChannelManager()
+			.restoreChannel(
+				new Channel(state),
+				crypto.randomBytes(33).toString('hex')
+			);
+		// Resumed, and with an SCID the remote recognizes, so the only thing
+		// left deciding the answer is whether the channel takes a new HTLC.
+		state.state = ChannelState.NORMAL;
+		state.remoteScidAlias = crypto.randomBytes(8);
+		const channelId = state.channelId.toString('hex');
+
+		try {
+			const diagnostic = daemon.node.getChannelDiagnostics(
+				channelId
+			) as unknown as {
+				willGenerateRoutingHint: boolean;
+				issues: string[];
+			};
+			expect(
+				diagnostic.issues.some((i: string) => i.startsWith('HELD_RESTORE')),
+				'the hold is reported'
+			).to.equal(true);
+			expect(
+				diagnostic.willGenerateRoutingHint,
+				'and no hint is promised alongside it'
+			).to.equal(false);
 		} finally {
 			(
 				node.getChannelManager() as unknown as {

@@ -4568,11 +4568,11 @@ export class BeignetNode extends EventEmitter {
 			remoteScidAlias: remoteScidAlias?.toString('hex') || null,
 			shortChannelId: shortChannelId?.toString('hex') || null,
 			effectiveScid: effectiveScid?.toString('hex') || null,
-			willGenerateRoutingHint:
-				!!effectiveScid &&
-				(state.state === 'NORMAL' ||
-					state.preReestablishState === 'NORMAL' ||
-					acceptsNewThrough),
+			// A held restore is NORMAL, so state alone said yes while the same
+			// response reported HELD_RESTORE and said hints are skipped. The
+			// hint is generated iff the channel will take a new HTLC, which is
+			// the one predicate the hint builder itself consults (issue #469).
+			willGenerateRoutingHint: !!effectiveScid && acceptsNewThrough,
 			localBalanceSats: Number(state.localBalanceMsat / 1000n),
 			remoteBalanceSats: Number(state.remoteBalanceMsat / 1000n),
 			issues
@@ -6821,7 +6821,8 @@ export class BeignetNode extends EventEmitter {
 		for (const ch of this.node.listChannels()) {
 			// A held restore is NORMAL with htlcUsable false, so this two-clause
 			// test admitted it on the first clause alone (issue #469). Its
-			// balance is real, but it can carry nothing.
+			// balance is real, but it can carry nothing. The engine excludes it
+			// from the analysis this wraps for the same reason.
 			if (isHeldRestore(ch)) continue;
 			if (ch.state !== ChannelState.NORMAL && !ch.htlcUsable) continue;
 			const chReserveMsat = ch.localReserveMsat ?? 0n;

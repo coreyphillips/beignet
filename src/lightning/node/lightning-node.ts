@@ -9990,7 +9990,14 @@ export class LightningNode extends EventEmitter {
 	}
 
 	getLiquiditySnapshot(): ILiquiditySnapshot {
-		const channels = this.listChannels();
+		// A capsule-restored channel whose recency cannot be proven is NORMAL
+		// and holds a real balance, but it refuses every new HTLC, so counting
+		// it makes the advisor recommend and the planner plan work that
+		// execution will reject (issue #469). Excluded HERE, before the
+		// analysis, rather than by adjusting a total afterwards.
+		const channels = this.listChannels().filter(
+			(ch) => ch.restoreRecencyUnproven !== true
+		);
 		const snapshots: IChannelSnapshot[] = channels.map((ch) => {
 			const channelIdHex = ch.channelId.toString('hex');
 			const reestablishKey = `reestablish:${channelIdHex}`;
@@ -10035,14 +10042,18 @@ export class LightningNode extends EventEmitter {
 	 * sized toward 50/50. Pure planning -- nothing is executed.
 	 */
 	planRebalanceRecommendations(minImbalancePct?: number): IRebalancePlan[] {
-		const snapshots: IChannelSnapshot[] = this.listChannels().map((ch) => ({
-			channelId: ch.channelId.toString('hex'),
-			state: ch.state as string,
-			localBalanceMsat: ch.localBalanceMsat,
-			remoteBalanceMsat: ch.remoteBalanceMsat,
-			capacitySats: Number(ch.fundingSatoshis),
-			peerPubkey: ch.peerPubkey
-		}));
+		const snapshots: IChannelSnapshot[] = this.listChannels()
+			// Same exclusion as the advisor above, and for the same reason: a
+			// plan that routes through a channel refusing new HTLCs cannot run.
+			.filter((ch) => ch.restoreRecencyUnproven !== true)
+			.map((ch) => ({
+				channelId: ch.channelId.toString('hex'),
+				state: ch.state as string,
+				localBalanceMsat: ch.localBalanceMsat,
+				remoteBalanceMsat: ch.remoteBalanceMsat,
+				capacitySats: Number(ch.fundingSatoshis),
+				peerPubkey: ch.peerPubkey
+			}));
 		const plans = planRebalances(snapshots, {
 			minImbalancePct:
 				minImbalancePct ?? this.autoRebalanceConfig.minImbalancePct
@@ -15069,7 +15080,16 @@ export class LightningNode extends EventEmitter {
 			}`;
 			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
 			const reason = sharedSecret
-				? createFailureMessage(sharedSecret, TEMPORARY_CHANNEL_FAILURE)
+				? createFailureMessage(
+						sharedSecret,
+						TEMPORARY_CHANNEL_FAILURE,
+						// TEMPORARY_CHANNEL_FAILURE carries the UPDATE flag, so
+						// BOLT 4 still requires the two-byte channel_update
+						// length even when the update itself is omitted. Empty
+						// data here is malformed, and a strict peer may treat
+						// the whole failure as such.
+						this.updateFlaggedFailureData(TEMPORARY_CHANNEL_FAILURE)
+				  )
 				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 			this.failForwardUpstream(
 				outKey,
@@ -15323,7 +15343,16 @@ export class LightningNode extends EventEmitter {
 			}`;
 			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
 			const reason = sharedSecret
-				? createFailureMessage(sharedSecret, TEMPORARY_CHANNEL_FAILURE)
+				? createFailureMessage(
+						sharedSecret,
+						TEMPORARY_CHANNEL_FAILURE,
+						// TEMPORARY_CHANNEL_FAILURE carries the UPDATE flag, so
+						// BOLT 4 still requires the two-byte channel_update
+						// length even when the update itself is omitted. Empty
+						// data here is malformed, and a strict peer may treat
+						// the whole failure as such.
+						this.updateFlaggedFailureData(TEMPORARY_CHANNEL_FAILURE)
+				  )
 				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 			this.failForwardUpstream(
 				outKey,
