@@ -839,6 +839,26 @@ export class ChainWatcher extends EventEmitter {
 		};
 		this.watchedFundings.set(key, watched);
 
+		// The pre-splice leg's ONLY script hash subscription: the channel's
+		// new-outpoint watch subscribes its own script in watchFundingOutput,
+		// and nothing else covers this outpoint. Subscribed here rather than
+		// in watchFundingSpend, which every confirmed channel watch also
+		// reaches while already holding watchFundingOutput's subscription: a
+		// second one there made every notification start two spend scans. The
+		// callback routes through the same phase dispatcher, which re-reads
+		// the watch from the registry, so a retired leg costs a map miss
+		// rather than a stale scan. A failure must not cost the immediate
+		// check below; the entry is registered, so the per-block sweeps
+		// re-poll it regardless (issue #463).
+		try {
+			await this.backend.subscribeToScriptHash(scriptHash, () => {
+				if (!this.isCurrentGeneration(generation)) return;
+				this.onFundingScriptHashChange(key, generation);
+			});
+		} catch (err) {
+			this.emitError(err as Error);
+		}
+
 		await this.watchFundingSpend(watched, generation, key);
 
 		// Same retirement watchFundingOutput performs after its own awaits: a
@@ -1290,14 +1310,15 @@ export class ChainWatcher extends EventEmitter {
 	 * still waiting on: the confirmation before minimumDepth, and after it the
 	 * spend that closes the channel.
 	 *
-	 * One callback has to cover both phases because a funding script hash is
-	 * subscribed exactly once in practice. The Electrum client answers a repeat
-	 * subscription for a script hash it already holds with "Already
-	 * Subscribed." and never wires the new callback, so the spend subscription
-	 * watchFundingSpend adds is not delivered and the confirmation callback,
-	 * which returns on its first line once the watch is confirmed, was the only
-	 * one left. A close then had nothing pushing it and waited on the recheck
-	 * timer (issue #468).
+	 * One callback covers both phases so each watch subscribes its script hash
+	 * exactly once. It first existed because the Electrum client answered a
+	 * repeat subscription with "Already Subscribed." and never wired the new
+	 * callback, leaving the confirmation callback (which returns on its first
+	 * line once the watch is confirmed) the only one delivered, so a close had
+	 * nothing pushing it and waited on the recheck timer (issue #468). Now that
+	 * the backend delivers a notification to EVERY callback registered for a
+	 * script hash (issue #478), the single phase-routed subscription is also
+	 * what keeps one notification to one scan.
 	 */
 	private onFundingScriptHashChange(key: string, generation: number): void {
 		const watched = this.watchedFundings.get(key);
@@ -1591,28 +1612,14 @@ export class ChainWatcher extends EventEmitter {
 		key: string
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
-		// Subscribe to detect when the funding output is spent. A failure here
-		// must not cost the check below: by this point the funding is
-		// confirmed, and the close it is about to look for may already be on
-		// chain. Losing it to a transient subscription error left nothing to
-		// recover it, because a confirmed watch is not re-checked for
-		// confirmation. Report the failure and go on; recheckAllWatches sweeps
-		// confirmed watches for spends, so the subscription is an
-		// optimization, not the only path (issue #463).
-		try {
-			await this.backend.subscribeToScriptHash(watched.scriptHash, () => {
-				if (!this.isCurrentGeneration(generation)) return;
-				this.checkFundingSpent(watched, generation, key).catch((err) => {
-					this.emitError(err);
-				});
-			});
-		} catch (err) {
-			this.emitError(err as Error);
-		}
-
-		// A stop() during the subscribe would otherwise let the check below start
-		// fresh and capture the post-stop generation, passing every guard.
-		if (!this.isCurrentGeneration(generation)) return;
+		// No subscription of its own. Every watch reaching this method already
+		// holds one whose callback dispatches by phase
+		// (onFundingScriptHashChange): the channel watches from
+		// watchFundingOutput, the pre-splice legs from
+		// watchFundingSpendDuringSplice. The backend delivers a notification
+		// to EVERY callback registered for a script hash (issue #478), so a
+		// second subscription here made each notification start two identical
+		// spend scans, arbitrated only after both history requests had begun.
 
 		// Immediately check if the output was already spent (e.g., after restart
 		// where the force-close tx was confirmed while we were offline).

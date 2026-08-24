@@ -62,6 +62,82 @@ import {
 	POLLING_INTERVAL
 } from '../shapes';
 
+type TScriptHashSubscription = {
+	callbacks: Set<(data: TSubscribedReceive) => void>;
+	/** Address index of a UTXO tracked beyond the gap limit; that index is
+	 *  rescanned before the wallet refresh on notification. */
+	utxoIndex?: number;
+};
+
+type TScriptHashRouter = {
+	/** Every instance that subscribed on this network, for the fallback refresh. */
+	instances: Set<Electrum>;
+	/** scriptHash -> per-instance subscription state. */
+	subscriptions: Map<string, Map<Electrum, TScriptHashSubscription>>;
+	/** The one handler every subscribeAddress call for this network is given. */
+	dispatch: (data: TSubscribedReceive) => Promise<void>;
+};
+
+/**
+ * Script hash routing state, shared per network across every Electrum
+ * instance in the process. rn-electrum-client keeps ONE
+ * 'blockchain.scripthash.subscribe' handler per network for the WHOLE process
+ * (the first onReceive it is handed) and answers a repeat script hash with
+ * "Already Subscribed." without wiring the new callback, so per-call closures
+ * are never delivered, and even an instance-local router would strand every
+ * instance but the first. Each network therefore gets one shared registry and
+ * one stable dispatcher that routes by the script hash in the notification
+ * payload; instances withdraw from it in disconnect().
+ */
+const scriptHashRouters: Map<EElectrumNetworks, TScriptHashRouter> = new Map();
+
+function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
+	let router = scriptHashRouters.get(network);
+	if (!router) {
+		const created: TScriptHashRouter = {
+			instances: new Set(),
+			subscriptions: new Map(),
+			dispatch: async (data: TSubscribedReceive): Promise<void> => {
+				const scriptHash = Array.isArray(data) ? data[0] : undefined;
+				const subs = scriptHash
+					? created.subscriptions.get(scriptHash)
+					: undefined;
+				if (!subs || subs.size === 0) {
+					// Nothing registered for this hash (a race with removal, or a
+					// subscription that predates the registry): fall back to the
+					// pre-registry behaviour and refresh every subscribed wallet.
+					for (const instance of [...created.instances]) {
+						void instance.wallet.refreshWallet({});
+					}
+					return;
+				}
+				for (const [instance, sub] of [...subs]) {
+					// Snapshots: a callback may unregister itself or a sibling
+					// mid-dispatch.
+					for (const callback of [...sub.callbacks]) {
+						try {
+							callback(data);
+						} catch {
+							// One subscriber must not starve the rest or the refresh.
+						}
+					}
+					if (sub.utxoIndex !== undefined) {
+						await instance.getUtxos({
+							scanningStrategy: EScanningStrategy.singleIndex,
+							addressIndex: sub.utxoIndex,
+							changeAddressIndex: sub.utxoIndex
+						});
+					}
+					void instance.wallet.refreshWallet({});
+				}
+			}
+		};
+		router = created;
+		scriptHashRouters.set(network, created);
+	}
+	return router;
+}
+
 export class Electrum {
 	private readonly _wallet: Wallet;
 	private sendMessage: TOnMessage;
@@ -1016,6 +1092,55 @@ export class Electrum {
 	}
 
 	/**
+	 * This instance's subscription record for a script hash in the shared
+	 * per-network router, created on demand. Every subscribed hash gets a
+	 * record so notifications refresh exactly the wallets that subscribed it.
+	 */
+	private _scriptHashRecord(scriptHash: string): TScriptHashSubscription {
+		const router = getScriptHashRouter(this.electrumNetwork);
+		router.instances.add(this);
+		let subs = router.subscriptions.get(scriptHash);
+		if (!subs) {
+			subs = new Map();
+			router.subscriptions.set(scriptHash, subs);
+		}
+		let sub = subs.get(this);
+		if (!sub) {
+			sub = { callbacks: new Set() };
+			subs.set(this, sub);
+		}
+		return sub;
+	}
+
+	/**
+	 * Detach a callback previously handed to subscribeToAddresses (matched by
+	 * function reference). Notifications for the hash stop reaching that
+	 * callback; the wallet refresh on notification is unaffected.
+	 */
+	removeScriptHashCallback({
+		scriptHash,
+		onReceive
+	}: {
+		scriptHash: string;
+		onReceive: (data: TSubscribedReceive) => void;
+	}): boolean {
+		const router = scriptHashRouters.get(this.electrumNetwork);
+		const subs = router?.subscriptions.get(scriptHash);
+		const sub = subs?.get(this);
+		if (!router || !subs || !sub) {
+			return false;
+		}
+		const removed = sub.callbacks.delete(onReceive);
+		if (sub.callbacks.size === 0 && sub.utxoIndex === undefined) {
+			subs.delete(this);
+			if (subs.size === 0) {
+				router.subscriptions.delete(scriptHash);
+			}
+		}
+		return removed;
+	}
+
+	/**
 	 * Subscribes to a number of address script hashes for receiving.
 	 * @param {string[]} scriptHashes
 	 * @param onReceive
@@ -1063,36 +1188,52 @@ export class Electrum {
 			});
 		}
 
-		// Subscribe to all provided script hashes.
+		// Subscribe to all provided script hashes. Callbacks are registered
+		// before the client call: the protocol subscription can deliver a
+		// notification immediately, and a repeat hash resolves as "Already
+		// Subscribed." without touching the client's own handler wiring. On
+		// failure, only what this attempt added is rolled back, so a caller
+		// retrying with a fresh closure cannot accumulate dead callbacks and a
+		// concurrent subscription for the same hash keeps its own.
+		const dispatch = getScriptHashRouter(this.electrumNetwork).dispatch;
 		const allScriptHashesPromises = scriptHashes.map(async (scriptHash) => {
+			const sub = this._scriptHashRecord(scriptHash);
+			const added = onReceive ? !sub.callbacks.has(onReceive) : false;
+			if (onReceive) {
+				sub.callbacks.add(onReceive);
+			}
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash,
 				network: this.electrumNetwork,
-				onReceive: async (data: TSubscribedReceive): Promise<void> => {
-					onReceive?.(data);
-					void this._wallet.refreshWallet({});
-				}
+				onReceive: dispatch
 			});
 			if (response.error) {
+				if (added && onReceive) {
+					this.removeScriptHashCallback({ scriptHash, onReceive });
+				}
 				throw Error('Unable to subscribe to receiving addresses.');
 			}
 		});
 
 		const allUtxosPromises = allUtxos.map(async (utxo) => {
+			const sub = this._scriptHashRecord(utxo.scriptHash);
+			const added = onReceive ? !sub.callbacks.has(onReceive) : false;
+			if (onReceive) {
+				sub.callbacks.add(onReceive);
+			}
+			sub.utxoIndex = utxo.index;
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash: utxo.scriptHash,
 				network: this.electrumNetwork,
-				onReceive: async (data: TSubscribedReceive): Promise<void> => {
-					onReceive?.(data);
-					await this.getUtxos({
-						scanningStrategy: EScanningStrategy.singleIndex,
-						addressIndex: utxo.index,
-						changeAddressIndex: utxo.index
-					});
-					void this._wallet.refreshWallet({});
-				}
+				onReceive: dispatch
 			});
 			if (response.error) {
+				if (added && onReceive) {
+					this.removeScriptHashCallback({
+						scriptHash: utxo.scriptHash,
+						onReceive
+					});
+				}
 				throw Error('Unable to subscribe to receiving addresses.');
 			}
 		});
@@ -1201,6 +1342,18 @@ export class Electrum {
 
 	public async disconnect(): Promise<void> {
 		this.stopConnectionPolling();
+		// Withdraw from the shared routers: a notification routed after this
+		// point must not refresh or call back into a wallet that is shutting
+		// down.
+		for (const router of scriptHashRouters.values()) {
+			router.instances.delete(this);
+			for (const [scriptHash, subs] of router.subscriptions) {
+				subs.delete(this);
+				if (subs.size === 0) {
+					router.subscriptions.delete(scriptHash);
+				}
+			}
+		}
 		await electrum.stop();
 	}
 

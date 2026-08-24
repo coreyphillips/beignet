@@ -19,6 +19,7 @@ function makeHangingElectrum(): Record<string, unknown> {
 		getTransactions: () => new Promise(() => {}),
 		getTransactionMerkle: () => new Promise(() => {}),
 		broadcastTransaction: () => new Promise(() => {}),
+		removeScriptHashCallback: () => true,
 		onReceive: () => {}
 	};
 }
@@ -41,6 +42,7 @@ function makeSlowElectrum(delayMs: number): Record<string, unknown> {
 		getTransactionMerkle: () => delay({ pos: 0 }),
 		broadcastTransaction: () =>
 			delay({ isErr: () => false, value: 'deadbeef' }),
+		removeScriptHashCallback: () => true,
 		onReceive: () => {}
 	};
 }
@@ -65,6 +67,7 @@ function makeInstantElectrum(): Record<string, unknown> {
 		getTransactionMerkle: () => Promise.resolve({ pos: 2 }),
 		broadcastTransaction: () =>
 			Promise.resolve({ isErr: () => false, value: 'txid123' }),
+		removeScriptHashCallback: () => true,
 		onReceive: () => {}
 	};
 }

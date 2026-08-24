@@ -16,7 +16,17 @@ import { Electrum } from '../../electrum';
 export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 	private electrum: Electrum;
 	private headerCallback: ((height: number) => void) | null = null;
-	private subscribedScriptHashes: Map<string, () => void> = new Map();
+	/**
+	 * Tracked subscriptions, keyed by script hash. Multiple watchers can share
+	 * one script (a funding output gets a confirmation watch and a spend
+	 * watch), so callbacks accumulate behind one dispatcher per hash. The
+	 * dispatcher reference is stable so the Electrum layer can dedupe the
+	 * repeat registrations resubscribeAll performs after every reconnect.
+	 */
+	private subscribedScriptHashes: Map<
+		string,
+		{ callbacks: Set<() => void>; dispatcher: () => void }
+	> = new Map();
 	private _originalOnReceive: ((data: unknown) => void) | undefined = undefined;
 	private _reconnectTimer: ReturnType<typeof setInterval> | null = null;
 	/** Timeout in ms for individual Electrum RPC calls (default 30s) */
@@ -83,14 +93,12 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 			await this.subscribeToHeaders(this.headerCallback);
 		}
 		// Re-subscribe to all tracked script hashes
-		for (const [scriptHash, onChange] of this.subscribedScriptHashes) {
+		for (const [scriptHash, entry] of this.subscribedScriptHashes) {
 			try {
 				await this.withTimeout(
 					this.electrum.subscribeToAddresses({
 						scriptHashes: [scriptHash],
-						onReceive: () => {
-							onChange();
-						}
+						onReceive: entry.dispatcher
 					}),
 					`resubscribe(${scriptHash.slice(0, 8)}...)`
 				);
@@ -236,10 +244,45 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 	/**
 	 * Remove a script hash from the tracked set (memory cleanup).
 	 * Does not unsubscribe at the Electrum protocol level (no such command),
-	 * but prevents re-subscription on reconnect and frees the callback.
+	 * but prevents re-subscription on reconnect and detaches the callbacks
+	 * from the Electrum layer so notifications stop reaching them.
 	 */
 	unsubscribeScriptHash(scriptHash: string): boolean {
-		return this.subscribedScriptHashes.delete(scriptHash);
+		const entry = this.subscribedScriptHashes.get(scriptHash);
+		if (!entry) {
+			return false;
+		}
+		this.subscribedScriptHashes.delete(scriptHash);
+		this.electrum.removeScriptHashCallback({
+			scriptHash,
+			onReceive: entry.dispatcher
+		});
+		return true;
+	}
+
+	/**
+	 * Undo what one FAILED subscribe attempt added: the attempt's own callback,
+	 * and the whole entry (wallet-layer dispatcher included) only when nothing
+	 * else holds callbacks for the hash. Callers retry with a fresh closure, so
+	 * keeping a failed attempt's callback would deliver every later
+	 * notification to it AND its successful successor.
+	 */
+	private _rollbackScriptHashCallback(
+		scriptHash: string,
+		entry: { callbacks: Set<() => void>; dispatcher: () => void },
+		onChange: () => void,
+		hadCallback: boolean
+	): void {
+		if (hadCallback) return;
+		entry.callbacks.delete(onChange);
+		if (entry.callbacks.size > 0) return;
+		if (this.subscribedScriptHashes.get(scriptHash) === entry) {
+			this.subscribedScriptHashes.delete(scriptHash);
+		}
+		this.electrum.removeScriptHashCallback({
+			scriptHash,
+			onReceive: entry.dispatcher
+		});
 	}
 
 	async subscribeToScriptHash(
@@ -247,17 +290,51 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 		onChange: () => void
 	): Promise<void> {
 		// Track for re-subscription on reconnect
-		this.subscribedScriptHashes.set(scriptHash, onChange);
-		const result = await this.withTimeout(
-			this.electrum.subscribeToAddresses({
-				scriptHashes: [scriptHash],
-				onReceive: () => {
-					onChange();
+		let entry = this.subscribedScriptHashes.get(scriptHash);
+		if (!entry) {
+			const callbacks = new Set<() => void>();
+			entry = {
+				callbacks,
+				dispatcher: (): void => {
+					// Snapshot: a callback may retire watches mid-dispatch.
+					for (const callback of [...callbacks]) {
+						try {
+							callback();
+						} catch {
+							// One watcher must not starve the rest.
+						}
+					}
 				}
-			}),
-			`subscribeToScriptHash(${scriptHash.slice(0, 8)}...)`
-		);
+			};
+			this.subscribedScriptHashes.set(scriptHash, entry);
+		}
+		const hadCallback = entry.callbacks.has(onChange);
+		entry.callbacks.add(onChange);
+		let result;
+		try {
+			result = await this.withTimeout(
+				this.electrum.subscribeToAddresses({
+					scriptHashes: [scriptHash],
+					onReceive: entry.dispatcher
+				}),
+				`subscribeToScriptHash(${scriptHash.slice(0, 8)}...)`
+			);
+		} catch (err) {
+			this._rollbackScriptHashCallback(
+				scriptHash,
+				entry,
+				onChange,
+				hadCallback
+			);
+			throw err;
+		}
 		if (result.isErr()) {
+			this._rollbackScriptHashCallback(
+				scriptHash,
+				entry,
+				onChange,
+				hadCallback
+			);
 			throw new Error(`Failed to subscribe to script hash: ${result.error}`);
 		}
 	}

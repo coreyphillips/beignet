@@ -29,6 +29,7 @@ function makeInstantElectrum(): Record<string, unknown> {
 		getTransactionMerkle: () => Promise.resolve({ pos: 0 }),
 		broadcastTransaction: () =>
 			Promise.resolve({ isErr: () => false, value: 'txid' }),
+		removeScriptHashCallback: () => true,
 		onReceive: () => {}
 	};
 }
