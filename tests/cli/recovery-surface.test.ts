@@ -664,18 +664,13 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 				liquidity.sendableSats,
 				'and its 900k is not reported as sendable (only the other channel)'
 			).to.be.lessThan(100_000);
-			// Not just the totals: a held channel must be out of the ANALYSIS,
-			// or the advisor recommends and the planner plans work that
-			// execution rejects.
-			// eslint-disable-next-line no-console
-			console.log(
-				'DBG active',
-				liquidity.activeChannelCount,
-				'plans',
-				cli.getAdvisorRecommendations().rebalancePlan.length,
-				'hint',
-				(cli.getChannelDiagnostics(channelId) as any).willGenerateRoutingHint
-			);
+			// Out of the ANALYSIS, but still counted as a channel: channelCount
+			// means the number of channels, and a node whose only channel is
+			// held must not be told that none exist.
+			expect(
+				liquidity.channelCount,
+				'both channels are still counted'
+			).to.equal(2);
 		} finally {
 			const channels = (
 				node.getChannelManager() as unknown as {

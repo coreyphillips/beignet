@@ -6827,8 +6827,8 @@ export class BeignetNode extends EventEmitter {
 		for (const ch of this.node.listChannels()) {
 			// A held restore is NORMAL with htlcUsable false, so this two-clause
 			// test admitted it on the first clause alone (issue #469). Its
-			// balance is real, but it can carry nothing. The engine excludes it
-			// from the analysis this wraps for the same reason.
+			// balance is real, but it can carry nothing, so it contributes no
+			// sendable sats and reserves nothing worth reporting.
 			if (isHeldRestore(ch)) continue;
 			if (ch.state !== ChannelState.NORMAL && !ch.htlcUsable) continue;
 			const chReserveMsat = ch.localReserveMsat ?? 0n;

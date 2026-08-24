@@ -44,6 +44,13 @@ export function planRebalances(
 	const receivers: ISide[] = [];
 
 	for (const ch of channels) {
+		// An explicit htlcUsable:false is disqualifying however NORMAL the
+		// state looks: a rebalance is two new HTLCs, and a channel that
+		// refuses them cannot be either leg of one. A capsule-restored
+		// channel holding for unproven recency is exactly that shape, and
+		// planning through it produced a plan execution would reject
+		// (issue #469).
+		if (ch.htlcUsable === false) continue;
 		if (ch.state !== 'NORMAL' || ch.capacitySats <= 0) continue;
 		const localSats = ch.localBalanceMsat / 1000n;
 		const localPct = (Number(localSats) / ch.capacitySats) * 100;

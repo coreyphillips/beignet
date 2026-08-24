@@ -10016,14 +10016,13 @@ export class LightningNode extends EventEmitter {
 	}
 
 	getLiquiditySnapshot(): ILiquiditySnapshot {
-		// A capsule-restored channel whose recency cannot be proven is NORMAL
-		// and holds a real balance, but it refuses every new HTLC, so counting
-		// it makes the advisor recommend and the planner plan work that
-		// execution will reject (issue #469). Excluded HERE, before the
-		// analysis, rather than by adjusting a total afterwards.
-		const channels = this.listChannels().filter(
-			(ch) => ch.restoreRecencyUnproven !== true
-		);
+		// Every channel, including one held for unproven recency: channelCount
+		// has to keep meaning the number of channels, and a node whose only
+		// channel is held must not be told that no channels exist. What the
+		// held one does not do is count as ACTIVE, and the advisor decides
+		// that from htlcUsable, which already answers false for it (issue
+		// #469).
+		const channels = this.listChannels();
 		const snapshots: IChannelSnapshot[] = channels.map((ch) => {
 			const channelIdHex = ch.channelId.toString('hex');
 			const reestablishKey = `reestablish:${channelIdHex}`;
@@ -10068,18 +10067,18 @@ export class LightningNode extends EventEmitter {
 	 * sized toward 50/50. Pure planning -- nothing is executed.
 	 */
 	planRebalanceRecommendations(minImbalancePct?: number): IRebalancePlan[] {
-		const snapshots: IChannelSnapshot[] = this.listChannels()
-			// Same exclusion as the advisor above, and for the same reason: a
-			// plan that routes through a channel refusing new HTLCs cannot run.
-			.filter((ch) => ch.restoreRecencyUnproven !== true)
-			.map((ch) => ({
-				channelId: ch.channelId.toString('hex'),
-				state: ch.state as string,
-				localBalanceMsat: ch.localBalanceMsat,
-				remoteBalanceMsat: ch.remoteBalanceMsat,
-				capacitySats: Number(ch.fundingSatoshis),
-				peerPubkey: ch.peerPubkey
-			}));
+		const snapshots: IChannelSnapshot[] = this.listChannels().map((ch) => ({
+			channelId: ch.channelId.toString('hex'),
+			state: ch.state as string,
+			localBalanceMsat: ch.localBalanceMsat,
+			remoteBalanceMsat: ch.remoteBalanceMsat,
+			capacitySats: Number(ch.fundingSatoshis),
+			peerPubkey: ch.peerPubkey,
+			// A rebalance is two new HTLCs, so a channel that refuses them
+			// cannot be either leg. The planner reads this rather than the
+			// state, for the same reason the advisor does (issue #469).
+			htlcUsable: ch.htlcUsable
+		}));
 		const plans = planRebalances(snapshots, {
 			minImbalancePct:
 				minImbalancePct ?? this.autoRebalanceConfig.minImbalancePct

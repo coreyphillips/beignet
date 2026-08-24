@@ -75,8 +75,16 @@ export class LiquidityAdvisor {
 		// balances it reports, so it must keep counting. Filtering on NORMAL
 		// alone zeroed the liquidity figures for the whole time a splice ran,
 		// which read as having no funds mid-splice.
-		const activeChannels = channels.filter(
-			(ch) => ch.state === 'NORMAL' || ch.htlcUsable === true
+		// An EXPLICIT false overrides the state fallback. htlcUsable is the
+		// answer to "will this channel take a new HTLC", and a channel that
+		// says no is not active however normal its state looks: a
+		// capsule-restored channel holding for unproven recency is NORMAL,
+		// holds a real balance, and refuses everything (issue #469). Absent
+		// (legacy callers that do not set it) still falls back to the state.
+		const activeChannels = channels.filter((ch) =>
+			ch.htlcUsable === false
+				? false
+				: ch.state === 'NORMAL' || ch.htlcUsable === true
 		);
 		activeCount = activeChannels.length;
 
