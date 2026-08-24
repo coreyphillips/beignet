@@ -1868,6 +1868,345 @@ describe('Phase 4: Chain Watcher', () => {
 			).to.be.true;
 		});
 
+		it('arms a pre-splice leg when the node has restarted its chain watcher (issue #479 review)', async () => {
+			// The node and the watcher keep SEPARATE generation counters, and
+			// both are plain numbers. restoreChainWatches used to hand the
+			// watcher its own, and ChainWatcher.start() early-returns when it is
+			// already started, so the ordinary "auto-start, then start
+			// explicitly" sequence left the node on 2 and the watcher on 1. The
+			// arm then returned before it registered anything: no entry, no
+			// error, and nothing for the recheck timer to recover.
+			const {
+				LightningNode
+			} = require('../../src/lightning/node/lightning-node');
+			const {
+				createOpenerState
+			} = require('../../src/lightning/channel/channel-state');
+			const { Channel } = require('../../src/lightning/channel/channel');
+			const {
+				ChannelState,
+				DEFAULT_CHANNEL_CONFIG
+			} = require('../../src/lightning/channel/types');
+
+			const basepoints = makeBasepoints(crypto.randomBytes(32));
+			const mockBackend: IChainBackend = {
+				subscribeToHeaders: async () => {},
+				subscribeToScriptHash: async () => {},
+				getScriptHashHistory: async () => [],
+				getTransaction: async () => Buffer.alloc(0),
+				broadcastTransaction: async () => ''
+			};
+			const node = new LightningNode({
+				nodePrivateKey: crypto.randomBytes(32),
+				channelBasepoints: basepoints,
+				perCommitmentSeed: crypto.randomBytes(32),
+				fundingPrivkey: crypto.randomBytes(32),
+				chainBackend: mockBackend
+			});
+			// Let the constructor's auto-start finish before adding the channel,
+			// so the explicit start below is the one that sees it.
+			await new Promise((resolve) => setTimeout(resolve, 30));
+
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100_000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: basepoints,
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			state.state = ChannelState.NORMAL;
+			state.channelId = crypto.randomBytes(32);
+			state.fundingTxid = crypto.randomBytes(32);
+			state.fundingOutputIndex = 0;
+			state.remoteBasepoints = makeBasepoints(crypto.randomBytes(32));
+			state.spliceInFlight = null;
+			const supersededTxid = crypto.randomBytes(32).toString('hex');
+			const legScript = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			state.preSpliceSpendWatches = [
+				{
+					txid: supersededTxid,
+					outputIndex: 3,
+					script: legScript.toString('hex'),
+					spliceTxid: crypto.randomBytes(32).toString('hex')
+				}
+			];
+			node
+				.getChannelManager()
+				.restoreChannel(new Channel(state), 'cafe'.repeat(16));
+
+			// The second start: node generation 2, watcher generation still 1.
+			await node.startChainWatcher();
+
+			const nodeGeneration = (
+				node as unknown as {
+					chainStartupGeneration: number;
+				}
+			).chainStartupGeneration;
+			const watcher = node.getChainWatcher()!;
+			const watcherGeneration = (
+				watcher as unknown as {
+					lifecycleGeneration: number;
+				}
+			).lifecycleGeneration;
+			expect(
+				nodeGeneration,
+				'the two counters have diverged, which is the whole point'
+			).to.not.equal(watcherGeneration);
+
+			const watched = (
+				watcher as unknown as { watchedFundings: Map<string, unknown> }
+			).watchedFundings;
+			expect(
+				watched.has(
+					`${state.channelId.toString('hex')}:presplice:${supersededTxid}:3`
+				),
+				'the leg is armed regardless of the node counter'
+			).to.be.true;
+			node.destroy();
+		});
+
+		it('records a derived pre-splice leg durably, so the next restart is not blind (issue #479)', async () => {
+			// A row that was mid-splice when the node upgraded carries the leg
+			// nowhere but spliceInFlight. Arming from it without WRITING it back
+			// only lasts until completeSplice clears that record, which on a
+			// zero-conf channel happens before the splice confirms.
+			const {
+				LightningNode
+			} = require('../../src/lightning/node/lightning-node');
+			const {
+				createOpenerState
+			} = require('../../src/lightning/channel/channel-state');
+			const { Channel } = require('../../src/lightning/channel/channel');
+			const {
+				ChannelState,
+				DEFAULT_CHANNEL_CONFIG
+			} = require('../../src/lightning/channel/types');
+			const {
+				serializeChannelState,
+				deserializeChannelState
+			} = require('../../src/lightning/storage/serialization');
+			const {
+				createFundingScript
+			} = require('../../src/lightning/script/funding');
+
+			const basepoints = makeBasepoints(crypto.randomBytes(32));
+			const makeNode = (): any =>
+				new LightningNode({
+					nodePrivateKey: crypto.randomBytes(32),
+					channelBasepoints: basepoints,
+					perCommitmentSeed: crypto.randomBytes(32),
+					fundingPrivkey: crypto.randomBytes(32),
+					chainBackend: {
+						subscribeToHeaders: async () => {},
+						subscribeToScriptHash: async () => {},
+						getScriptHashHistory: async () => [],
+						getTransaction: async () => Buffer.alloc(0),
+						broadcastTransaction: async () => ''
+					} as IChainBackend
+				});
+
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 1_000_000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: basepoints,
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			state.state = ChannelState.SPLICING;
+			state.channelId = crypto.randomBytes(32);
+			state.fundingTxid = crypto.randomBytes(32);
+			state.fundingOutputIndex = 2;
+			state.remoteBasepoints = makeBasepoints(crypto.randomBytes(32));
+			state.preSpliceSpendWatches = undefined;
+			const spliceTx = new bitcoin.Transaction();
+			spliceTx.version = 2;
+			spliceTx.addInput(Buffer.from(state.fundingTxid), 2, 0xffffffff);
+			spliceTx.addOutput(
+				Buffer.from('0020' + '77'.repeat(32), 'hex'),
+				1_000_000
+			);
+			const spliceTxid = Buffer.from(spliceTx.getId(), 'hex').reverse();
+			state.spliceInFlight = {
+				spliceTxid,
+				newFundingOutputIndex: 0,
+				newFundingSatoshis: 1_000_000n,
+				spliceTxHex: spliceTx.toHex(),
+				fullySigned: false,
+				isInitiator: true,
+				localRelativeSatoshis: 0n,
+				remoteRelativeSatoshis: 0n,
+				// Rotated, so recomputing the script later would be wrong.
+				remoteFundingPubkey: getPublicKey(crypto.randomBytes(32)),
+				ourSharedInputSig: Buffer.alloc(64),
+				ourWalletWitnesses: [],
+				ourWalletInputIndices: [],
+				inputPrevouts: [],
+				remoteCommitmentSig: crypto.randomBytes(64),
+				sentTxSignatures: true,
+				receivedTxSignatures: false,
+				localSpliceLocked: false,
+				remoteSpliceLocked: false,
+				confirmed: false
+			};
+
+			const first = makeNode();
+			const channel = new Channel(state);
+			first.getChannelManager().restoreChannel(channel, 'cafe'.repeat(16));
+			await first.restoreChainWatches();
+
+			const legs = channel.getFullState().preSpliceSpendWatches ?? [];
+			expect(
+				legs,
+				'the derived leg was written back, not just armed'
+			).to.have.length(1);
+			const supersededTxid = Buffer.from(state.fundingTxid)
+				.reverse()
+				.toString('hex');
+			expect(legs[0].txid).to.equal(supersededTxid);
+			expect(legs[0].outputIndex).to.equal(2);
+			expect(legs[0].spliceTxid).to.equal(
+				Buffer.from(spliceTxid).reverse().toString('hex')
+			);
+			// The PRE-splice script, from the peer's pre-splice funding key.
+			expect(legs[0].script).to.equal(
+				(
+					createFundingScript(
+						state.localBasepoints.fundingPubkey,
+						state.remoteBasepoints.fundingPubkey
+					).p2wshOutput as Buffer
+				).toString('hex')
+			);
+			first.destroy();
+
+			// The zero-conf adoption: splice_locked went out in the same batch
+			// as the broadcast, so spliceInFlight is gone while the splice tx is
+			// still unconfirmed. Only the persisted record can re-arm the watch.
+			const revived = deserializeChannelState(
+				serializeChannelState(channel.getFullState())
+			);
+			revived.spliceInFlight = null;
+
+			const second = makeNode();
+			second
+				.getChannelManager()
+				.restoreChannel(new Channel(revived), 'cafe'.repeat(16));
+			await second.restoreChainWatches();
+			const watched = (
+				second.getChainWatcher()! as unknown as {
+					watchedFundings: Map<string, unknown>;
+				}
+			).watchedFundings;
+			expect(
+				watched.has(
+					`${state.channelId.toString('hex')}:presplice:${supersededTxid}:2`
+				),
+				'the leg survives the record that derived it'
+			).to.be.true;
+			second.destroy();
+		});
+
+		it('a leg whose history cannot be fetched does not abort the rest of the restore (issue #479)', async () => {
+			// One transient Electrum error used to propagate out of the arm,
+			// out of the channel loop and out of restoreChainWatches, taking
+			// every later channel's watch, the pending-broadcast retries and the
+			// reconnect monitor with it. None of those is retried anywhere.
+			const {
+				LightningNode
+			} = require('../../src/lightning/node/lightning-node');
+			const {
+				createOpenerState
+			} = require('../../src/lightning/channel/channel-state');
+			const { Channel } = require('../../src/lightning/channel/channel');
+			const {
+				ChannelState,
+				DEFAULT_CHANNEL_CONFIG
+			} = require('../../src/lightning/channel/types');
+
+			const basepoints = makeBasepoints(crypto.randomBytes(32));
+			const legScript = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			const poisoned = computeScriptHash(legScript);
+			const mockBackend: IChainBackend = {
+				subscribeToHeaders: async () => {},
+				subscribeToScriptHash: async () => {},
+				getScriptHashHistory: async (scriptHash: string) => {
+					if (scriptHash === poisoned) throw new Error('electrum down');
+					return [];
+				},
+				getTransaction: async () => Buffer.alloc(0),
+				broadcastTransaction: async () => ''
+			};
+			const node = new LightningNode({
+				nodePrivateKey: crypto.randomBytes(32),
+				channelBasepoints: basepoints,
+				perCommitmentSeed: crypto.randomBytes(32),
+				fundingPrivkey: crypto.randomBytes(32),
+				chainBackend: mockBackend
+			});
+			node.on('node:error', () => {});
+
+			const makeChannel = (withLeg: boolean): any => {
+				const state = createOpenerState({
+					temporaryChannelId: crypto.randomBytes(32),
+					fundingSatoshis: 100_000n,
+					pushMsat: 0n,
+					localConfig: DEFAULT_CHANNEL_CONFIG,
+					localBasepoints: basepoints,
+					localPerCommitmentSeed: crypto.randomBytes(32)
+				});
+				state.state = ChannelState.NORMAL;
+				state.channelId = crypto.randomBytes(32);
+				state.fundingTxid = crypto.randomBytes(32);
+				state.fundingOutputIndex = 0;
+				state.remoteBasepoints = makeBasepoints(crypto.randomBytes(32));
+				state.spliceInFlight = null;
+				if (withLeg) {
+					state.preSpliceSpendWatches = [
+						{
+							txid: crypto.randomBytes(32).toString('hex'),
+							outputIndex: 0,
+							script: legScript.toString('hex'),
+							spliceTxid: crypto.randomBytes(32).toString('hex')
+						}
+					];
+				}
+				return new Channel(state);
+			};
+
+			// listChannels() preserves insertion order, so the poisoned channel
+			// is restored first and the healthy one after it.
+			const poisonedChannel = makeChannel(true);
+			const laterChannel = makeChannel(false);
+			node
+				.getChannelManager()
+				.restoreChannel(poisonedChannel, 'cafe'.repeat(16));
+			node.getChannelManager().restoreChannel(laterChannel, 'beef'.repeat(16));
+
+			await node.restoreChainWatches();
+
+			const watched = (
+				node.getChainWatcher()! as unknown as {
+					watchedFundings: Map<string, unknown>;
+				}
+			).watchedFundings;
+			expect(
+				watched.has(poisonedChannel.getFullState().channelId.toString('hex')),
+				'the poisoned channel still gets its own funding watch'
+			).to.be.true;
+			expect(
+				watched.has(laterChannel.getFullState().channelId.toString('hex')),
+				'and every later channel is still restored'
+			).to.be.true;
+			node.destroy();
+		});
+
 		it('should not create ChainWatcher when no backend provided', () => {
 			const {
 				LightningNode

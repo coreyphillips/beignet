@@ -7169,8 +7169,24 @@ export class LightningNode extends EventEmitter {
 			this.wireChainWatcherEvents();
 			await this.chainWatcher.start();
 			if (!this.isCurrentChainStartup(generation)) return;
-			// Re-watch funding outputs for all restored channels
-			await this.restoreChainWatches(generation);
+			// Re-watch funding outputs for all restored channels.
+			//
+			// Guarded, because everything after it is startup work that is
+			// retried nowhere: the pending funding and splice rebroadcast
+			// sweeps, and the Electrum reconnect monitor whose onResubscribed
+			// hook is what re-scans every watch after a drop. The only caller of
+			// startChainWatcher is the constructor's auto-start, which reports
+			// and gives up. Individual watches already isolate their own
+			// failures; this catches whatever a future one forgets to.
+			try {
+				await this.restoreChainWatches(generation);
+			} catch (err) {
+				this.emit('node:error', {
+					code: 'CHAIN_RESTORE_WATCH_FAILED',
+					message: `Failed to restore chain watches: ${(err as Error).message}`,
+					timestamp: Date.now()
+				} as ILightningError);
+			}
 			// destroy() during the restore must not let the rest of startup run:
 			// it would retry funding broadcasts and restart the reconnect monitor
 			// that destroy() just stopped.
@@ -7370,26 +7386,44 @@ export class LightningNode extends EventEmitter {
 						btcNetwork
 				  ).p2wshOutput;
 
+			// A row written before preSpliceSpendWatches existed that was
+			// mid-splice when the node upgraded carries the leg nowhere but
+			// spliceInFlight, and completeSplice clears THAT at splice_locked,
+			// which on a zero-conf channel precedes the splice confirming. So
+			// derive the record now, from the channel's own derivation, and put
+			// it on disk BEFORE the watch is armed: the next restart must find
+			// a record rather than a gap, however this one ends (issue #479).
+			if (state.spliceInFlight && channel.recordInFlightPreSpliceSpendWatch()) {
+				try {
+					this.persistChannel(state.channelId || state.temporaryChannelId);
+				} catch (err) {
+					// The record is in memory either way, so the watch below is
+					// still armed for this session and the derivation re-runs
+					// idempotently next restart. Nothing in this loop may throw:
+					// what follows it in startChainWatcher is the pending
+					// broadcast retries and the reconnect monitor, and neither
+					// is retried anywhere.
+					this.emit('node:error', {
+						code: 'PRESPLICE_WATCH_FAILED',
+						channelId: state.channelId || state.temporaryChannelId,
+						message: `Failed to persist the derived pre-splice spend watch: ${
+							(err as Error).message
+						}`,
+						timestamp: Date.now()
+					} as ILightningError);
+				}
+			}
+
 			// Superseded funding outpoints whose expected splice spend is not yet
 			// irrevocable. Re-armed for EVERY channel, not just one with a live
 			// spliceInFlight: completeSplice clears that record at
 			// splice_locked, which on a zero-conf channel precedes the splice
 			// transaction confirming, so this list is the only thing that can
 			// bring the watch back (issue #479).
-			for (const leg of state.preSpliceSpendWatches ?? []) {
-				// The leg's OWN script, never the channel's current one: a
-				// splice may rotate the peer's funding pubkey, so recomputing
-				// it here would subscribe to a script hash the superseded
-				// output never paid and the breach would be invisible.
-				await this.chainWatcher.watchFundingSpendDuringSplice(
-					state.channelId || state.temporaryChannelId,
-					leg.txid,
-					leg.outputIndex,
-					Buffer.from(leg.script, 'hex'),
-					leg.spliceTxid,
-					generation
-				);
-			}
+			await this.armPreSpliceSpendWatches(
+				state.channelId || state.temporaryChannelId,
+				state
+			);
 
 			const inflight = state.spliceInFlight;
 			if (inflight) {
@@ -7415,43 +7449,13 @@ export class LightningNode extends EventEmitter {
 					spliceFunding.p2wshOutput
 				);
 				// The new-outpoint watch above only arms spend detection once the
-				// splice tx confirms, so the OLD (still-confirmed) funding output has
-				// no spend subscription. Watch it directly for a hostile spend, so a
-				// revoked pre-splice commitment (peer evicts our low-feerate splice and
-				// broadcasts an old commitment) is detected. The splice tx itself
-				// spends the old output legitimately, so it is ignored. state.fundingTxid
-				// still holds the OLD outpoint until completeSplice swaps it.
-				// The leg is normally armed by the loop above, from the record
-				// the channel wrote in the batch that authorized the splice
-				// (issue #479). This is the fallback for a row that predates
-				// that field and was mid-splice when the node upgraded, which
-				// would otherwise come back watching only an outpoint that may
-				// never confirm.
-				//
-				// Deriving the script here is sound in exactly this case and
-				// nowhere else: the splice has not been adopted (spliceInFlight
-				// is still set), so `fundingTxid` is the superseded outpoint and
-				// `remoteBasepoints.fundingPubkey` is still the PRE-splice key.
-				// A rotated key is only adopted by completeSplice, which is what
-				// makes the same derivation wrong once the splice has locked.
-				const supersededTxid = Buffer.from(state.fundingTxid)
-					.reverse()
-					.toString('hex');
-				const alreadyRecorded = (state.preSpliceSpendWatches ?? []).some(
-					(w) =>
-						w.txid === supersededTxid &&
-						w.outputIndex === state.fundingOutputIndex
-				);
-				if (!alreadyRecorded) {
-					await this.chainWatcher.watchFundingSpendDuringSplice(
-						state.channelId || state.temporaryChannelId,
-						supersededTxid,
-						state.fundingOutputIndex,
-						fundingScript,
-						spliceTxidHex,
-						generation
-					);
-				}
+				// splice tx confirms, so the OLD (still-confirmed) funding output
+				// has no spend subscription of its own. That watch is armed by
+				// the loop ABOVE, from the durable record, which the block ahead
+				// of it derives and persists for a row that predates the field.
+				// Arming it here as well, without recording it, is what made a
+				// second restart come back blind once completeSplice had cleared
+				// spliceInFlight (issue #479).
 				if (inflight.fullySigned && this.isCurrentChainStartup(generation)) {
 					// Through the ACTION path, never straight at the backend. A
 					// splice creates a funding output exactly as an open does, so
@@ -7578,6 +7582,52 @@ export class LightningNode extends EventEmitter {
 	 * old one (the splice tx legitimately spends it; anything else is a
 	 * breach).
 	 */
+	/**
+	 * Arm chain spend detection on every superseded funding outpoint this
+	 * channel has recorded (issue #479).
+	 *
+	 * The leg's OWN stored script, never the channel's current one: a splice
+	 * may rotate the peer's funding pubkey, so recomputing the script here
+	 * would subscribe to a hash the superseded output never paid and the breach
+	 * would be invisible. Held in the watcher under a per-outpoint key, so this
+	 * never disturbs the channel's own funding watch.
+	 *
+	 * Isolated per LEG. A transient Electrum error on one outpoint must not
+	 * cost the others, the channel's own funding watch, or - when this runs
+	 * from the startup restore - every later channel plus the pending-broadcast
+	 * retries and the reconnect monitor that follow it, none of which is
+	 * retried anywhere.
+	 */
+	private async armPreSpliceSpendWatches(
+		channelId: Buffer,
+		state: IChannelState
+	): Promise<void> {
+		if (!this.chainWatcher) return;
+		for (const leg of state.preSpliceSpendWatches ?? []) {
+			try {
+				await this.chainWatcher.watchFundingSpendDuringSplice(
+					channelId,
+					leg.txid,
+					leg.outputIndex,
+					Buffer.from(leg.script, 'hex'),
+					leg.spliceTxid
+				);
+			} catch (err) {
+				// Its own code, not the generic recovery one: the consequence
+				// is specific and worth naming, because a revoked pre-splice
+				// commitment on that outpoint can go unpunished.
+				this.emit('node:error', {
+					code: 'PRESPLICE_WATCH_FAILED',
+					channelId,
+					message: `Failed to watch pre-splice funding outpoint ${leg.txid}:${
+						leg.outputIndex
+					}: ${(err as Error).message}`,
+					timestamp: Date.now()
+				} as ILightningError);
+			}
+		}
+	}
+
 	private async registerFundingWatch(fundingTxid: Buffer): Promise<void> {
 		if (!this.chainWatcher) return;
 		const networkMap: Record<string, bitcoin.Network> = {
@@ -7619,15 +7669,7 @@ export class LightningNode extends EventEmitter {
 				// handler runs completeSplice may already have adopted the new
 				// funding, and both the outpoint and the funding keys read
 				// post-splice.
-				for (const leg of state.preSpliceSpendWatches ?? []) {
-					await this.chainWatcher.watchFundingSpendDuringSplice(
-						channelId,
-						leg.txid,
-						leg.outputIndex,
-						Buffer.from(leg.script, 'hex'),
-						leg.spliceTxid
-					);
-				}
+				await this.armPreSpliceSpendWatches(channelId, state);
 				return;
 			}
 

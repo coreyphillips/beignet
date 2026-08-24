@@ -781,11 +781,15 @@ export class ChainWatcher extends EventEmitter {
 		txid: string,
 		outputIndex: number,
 		scriptPubkey: Buffer,
-		ignoreSpendTxid: string,
-		// Captured by whatever operation is registering this watch, so a stop()
-		// during the await retires the whole registration.
-		generation: number = this.lifecycleGeneration
+		ignoreSpendTxid: string
 	): Promise<void> {
+		// Read here, never accepted from the caller. The node keeps a startup
+		// counter of its own with the same TYPE, so a caller passing "the
+		// generation my operation started in" could hand this one a number from
+		// the wrong object, and every arm would then return below without a
+		// trace: no registry entry, no error, and nothing for the recheck timer
+		// to recover. No caller outside this class has a value worth passing.
+		const generation = this.lifecycleGeneration;
 		// Ahead of the map write, not just inside watchFundingSpend: an outer
 		// operation that began before stop() can still call in for the first
 		// time afterwards, and an entry inserted then would survive into the
@@ -1551,9 +1555,11 @@ export class ChainWatcher extends EventEmitter {
 	private async watchFundingSpend(
 		watched: IWatchedFunding,
 		generation: number = this.lifecycleGeneration,
-		// See checkFundingSpent: omitted for the splice watch, which is not
-		// held in watchedFundings.
-		key?: string
+		// Registry key of this watch. Required: every watch this class arms is
+		// held in watchedFundings, the pre-splice legs included since issue
+		// #479, and the map-identity guard the key enables is what retires a
+		// scan whose watch was replaced or whose channel is gone.
+		key: string
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		// Subscribe to detect when the funding output is spent. A failure here
@@ -1580,22 +1586,32 @@ export class ChainWatcher extends EventEmitter {
 		if (!this.isCurrentGeneration(generation)) return;
 
 		// Immediately check if the output was already spent (e.g., after restart
-		// where the force-close tx was confirmed while we were offline)
-		await this.checkFundingSpent(watched, generation, key);
+		// where the force-close tx was confirmed while we were offline).
+		//
+		// Guarded for the same reason the subscribe above is, and the same
+		// reason watchFundingOutput guards its own immediate check: ARMING must
+		// not fail because the first look failed. An Electrum error here used
+		// to propagate out of watchFundingSpendDuringSplice and abort the
+		// caller's entire restore loop, taking every later channel's watch, the
+		// pending-broadcast retries and the reconnect monitor with it. The scan
+		// itself keeps throwing for its other launch sites, which catch.
+		try {
+			await this.checkFundingSpent(watched, generation, key);
+		} catch (err) {
+			this.emitError(err as Error);
+		}
 	}
 
 	private async checkFundingSpent(
 		watched: IWatchedFunding,
-		// Splice watches are deliberately not held in watchedFundings, so the
-		// generation is the only check available here, which makes it important
-		// that the caller passes the one it started in rather than letting this
-		// capture a fresh one after a stop().
+		// The lifecycle generation the CALLER started in, not a fresh read: a
+		// stop() during this scan's awaits must retire it, and capturing here
+		// would pick up the post-stop value and pass every guard.
 		generation: number = this.lifecycleGeneration,
-		// Registry key of this watch, for the callers that took it out of
-		// watchedFundings. Omitted by watchFundingSpendDuringSplice, whose
-		// watch is deliberately not held there and therefore cannot be
-		// compared against it.
-		key?: string
+		// Registry key of this watch. Required: a pre-splice leg is held in
+		// watchedFundings under its own per-outpoint key since issue #479, so
+		// there is no longer a watch this cannot be compared against.
+		key: string
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		// Whatever this scan concludes is only safe to apply while it is still
@@ -1608,7 +1624,7 @@ export class ChainWatcher extends EventEmitter {
 		const revision = watched.spendScanRevision ?? 0;
 		const superseded = (): boolean =>
 			!this.isCurrentGeneration(generation) ||
-			(key !== undefined && this.watchedFundings.get(key) !== watched) ||
+			this.watchedFundings.get(key) !== watched ||
 			(watched.spendScanRevision ?? 0) !== revision;
 
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
@@ -1675,7 +1691,6 @@ export class ChainWatcher extends EventEmitter {
 		// the very window a mempool-eviction breach lives in. A reorg that
 		// un-confirms the splice tx simply leaves the leg armed.
 		if (
-			key !== undefined &&
 			ignoredSpend !== null &&
 			this.currentBlockHeight > 0 &&
 			// The monitor's own boundary, `blockHeight - confirmationHeight >=

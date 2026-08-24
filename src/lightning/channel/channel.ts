@@ -14336,6 +14336,31 @@ export class Channel {
 	}
 
 	/**
+	 * Record the still-current funding outpoint as the pre-splice spend watch
+	 * for the splice in flight, for a row written before `preSpliceSpendWatches`
+	 * existed that was mid-splice when the node upgraded (issue #479). Returns
+	 * whether the list changed, so the caller knows to persist.
+	 *
+	 * Legal ONLY while `spliceInFlight` is set, and that is exactly what makes
+	 * the derivation sound rather than a guess: completeSplice has not adopted
+	 * the new funding, so `fundingTxid` is still the outpoint the splice will
+	 * supersede and `remoteBasepoints.fundingPubkey` is still the PRE-splice
+	 * key. The same derivation is wrong the moment the splice locks, because a
+	 * splice may rotate that key and completeSplice adopts the rotation.
+	 *
+	 * The channel derives it rather than the node, so the taproot branch, the
+	 * display-order conversion and the per-outpoint dedupe all live in one
+	 * place: the private writer this delegates to.
+	 */
+	recordInFlightPreSpliceSpendWatch(): boolean {
+		const record = this._state.spliceInFlight;
+		if (!record) return false;
+		const before = this._state.preSpliceSpendWatches?.length ?? 0;
+		this._recordPreSpliceSpendWatch(record.spliceTxid);
+		return (this._state.preSpliceSpendWatches?.length ?? 0) !== before;
+	}
+
+	/**
 	 * Build the non-terminal refusal batch for an unacceptable splice
 	 * tx_signatures: used by the wallet-witness arm, the after-sent txid
 	 * mismatch, and the defensive apply-failure arm, where the peer may still
