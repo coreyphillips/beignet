@@ -1711,10 +1711,14 @@ export class ChainWatcher extends EventEmitter {
 				height,
 				this.destinationScript,
 				this.getSweepFeeRatePerVbyte?.() ?? 10,
+				undefined,
+				undefined,
+				undefined,
 				// WHICH outpoint this spends is what the monitor records as its
 				// own durable ownership of the channel's spend verdict, and the
 				// only thing that lets a retraction be scoped correctly after a
-				// restart (issue #479).
+				// restart (issue #479). Last in the list because the arguments
+				// before it are a published API this must not renumber.
 				{ txid: watched.txid, outputIndex: watched.outputIndex }
 			);
 			this.emit('funding:spent', watched.channelId, spendingTx);

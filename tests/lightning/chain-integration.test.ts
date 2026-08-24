@@ -820,7 +820,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				100,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network
@@ -896,7 +895,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				100,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network
@@ -946,7 +944,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				100,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network
@@ -993,7 +990,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				100,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network
@@ -1005,7 +1001,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				101,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network
@@ -1056,7 +1051,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				100,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network
@@ -1120,7 +1114,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				100,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network
@@ -1225,7 +1218,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				100,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network
@@ -1284,7 +1276,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				100,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network
@@ -1347,7 +1338,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				150,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network
@@ -1407,7 +1397,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				100,
 				destScript1,
 				10,
-				undefined,
 				pk1[1],
 				pk1[2],
 				network
@@ -1465,7 +1454,6 @@ describe('Chain Integration (Phase 4D)', function () {
 				100,
 				destScript,
 				10,
-				undefined,
 				openerPrivkeys[1],
 				openerPrivkeys[2],
 				network

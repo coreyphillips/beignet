@@ -2345,16 +2345,17 @@ export class ChannelManager extends EventEmitter {
 		blockHeight: number,
 		destinationScript: Buffer,
 		feeRatePerVbyte = 10,
-		// Which funding outpoint the reporting watch saw this transaction
-		// spend (issue #479). Ahead of the key material below rather than
-		// appended after it: nothing in this repository passes those three, and
-		// appending would make the one production call site write three bare
-		// undefined arguments before the meaningful one, which is the exact
-		// positional slip this round is fixing elsewhere.
-		spentOutpoint?: { txid: string; outputIndex: number },
 		revocationBasepointSecret?: Buffer,
 		paymentPrivkey?: Buffer,
-		network?: import('bitcoinjs-lib').Network
+		network?: import('bitcoinjs-lib').Network,
+		// Which funding outpoint the reporting watch saw this transaction
+		// spend (issue #479). APPENDED, never inserted: ChannelManager is
+		// exported, and moving an existing optional argument breaks a
+		// TypeScript consumer's build and silently shifts a JavaScript
+		// consumer's key material and network into the wrong slots. The one
+		// production caller passing it writes the intervening arguments out,
+		// which is the cost of not breaking everyone else's.
+		spentOutpoint?: { txid: string; outputIndex: number }
 	): ChainAction[] {
 		const channelIdHex = channelId.toString('hex');
 		let monitor = this.monitors.get(channelIdHex);
