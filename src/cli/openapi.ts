@@ -3040,7 +3040,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						htlcUsable: {
 							type: 'boolean',
 							description:
-								'Whether the channel can carry HTLC traffic right now (NORMAL, or paying through its splice)'
+								'Whether the channel will accept a NEW HTLC: usable right now (NORMAL, or paying through its splice) and its state provably current. A channel answering false can still settle the HTLCs it already has'
+						},
+						restoreRecencyUnproven: {
+							type: 'boolean',
+							description:
+								'The channel was restored from a Recovery Capsule and no channel_reestablish has proven its state current, so it takes no new HTLCs and is offered to no router. Existing HTLCs still settle and it still closes cooperatively. Present only while the hold stands'
 						},
 						peerSupportsSplicing: {
 							type: 'boolean',

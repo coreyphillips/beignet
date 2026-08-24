@@ -523,10 +523,149 @@ describe('Issue #469: a capsule-restored channel holds its automatic closes', fu
 
 		// Routing: the channel is not offered to any planner either, so an MPP
 		// payment cannot dispatch a safe part and then discover a held one.
-		expect(chan.isHtlcUsable(), 'not usable for new HTLCs').to.equal(false);
+		expect(chan.acceptsNewHtlcs(), 'not usable for new HTLCs').to.equal(false);
+		// And the split is real: it can still exchange updates for the HTLCs it
+		// already has, which is what lets a queued fulfill release its preimage
+		// (issue #469 review, finding 7).
+		expect(
+			chan.canSettleHtlcs(),
+			'but it still settles existing ones'
+		).to.equal(true);
 		const edges = (fx.alice as any).getLocalChannelEdges() as unknown[];
 		expect(edges, 'and not in the local edge overlay').to.have.length(0);
 
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('still drains a queued fulfill, so a held channel releases its preimage', () => {
+		// The review's own repro. Folding the hold into isHtlcUsable stopped the
+		// deferred-settle drain, which gates queued fulfills, fails and
+		// malformed-fails on the same predicate the router uses. A held channel
+		// never drained, so a queued fulfill never released its preimage - and
+		// the on-chain claim that would otherwise have made up for it is
+		// exactly what the hold disables.
+		const fx = setupUnprovenChannel(87);
+		const manager = (fx.alice as any).channelManager;
+		const chan = manager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		addHtlc(fx.alice, fx.channelId, 'received-4', {
+			id: 4n,
+			paymentHash,
+			cltvExpiry: HEIGHT + 40
+		});
+
+		const idHex = fx.channelId.toString('hex');
+		manager.pendingQuiescentSettles.set(idHex, [
+			{ kind: 'fulfill', htlcId: 4n, preimage }
+		]);
+		manager._drainDeferredSettles(idHex);
+
+		expect(
+			manager.pendingQuiescentSettles.has(idHex),
+			'the queue was consumed, not held forever'
+		).to.equal(false);
+		expect(
+			chan.getFullState().htlcs.get('received-4').state,
+			'and the fulfill actually ran'
+		).to.equal(HtlcState.FULFILLED);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('still drains parked incoming HTLCs rather than holding them forever', () => {
+		const fx = setupUnprovenChannel(89);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+
+		const idHex = fx.channelId.toString('hex');
+		(fx.alice as any).parkedQuiescentHtlcs.set(idHex, [
+			{
+				htlcId: 7n,
+				amountMsat: 50_000n,
+				paymentHash: crypto.randomBytes(32)
+			}
+		]);
+		(fx.alice as any).drainParkedQuiescentHtlcs(idHex);
+
+		expect(
+			(fx.alice as any).parkedQuiescentHtlcs.has(idHex),
+			'the park is drained; the hold then refuses the HTLC on a path that answers the payer'
+		).to.equal(false);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('drains a deferred settle on a SHUTTING_DOWN channel too', () => {
+		// The same class of error, pre-existing: BOLT 2 forbids new adds after
+		// shutdown, not removals, and canFulfillHtlc has always accepted
+		// SHUTTING_DOWN. The drain asked isHtlcUsable, which does not, so a
+		// settle deferred by quiescence and drained after shutdown began was
+		// held instead of applied.
+		const fx = setupErroredChannel(91);
+		const manager = (fx.alice as any).channelManager;
+		const chan = manager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.SHUTTING_DOWN;
+
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		addHtlc(fx.alice, fx.channelId, 'received-5', {
+			id: 5n,
+			paymentHash,
+			cltvExpiry: HEIGHT + 40
+		});
+
+		const idHex = fx.channelId.toString('hex');
+		manager.pendingQuiescentSettles.set(idHex, [
+			{ kind: 'fulfill', htlcId: 5n, preimage }
+		]);
+		manager._drainDeferredSettles(idHex);
+
+		expect(chan.getFullState().htlcs.get('received-5').state).to.equal(
+			HtlcState.FULFILLED
+		);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('separates accepting a new HTLC from settling an existing one', () => {
+		const fx = setupUnprovenChannel(93);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		const state = chan.getFullState();
+
+		for (const s of [ChannelState.NORMAL, ChannelState.SHUTTING_DOWN]) {
+			state.state = s;
+			state.restoreRecencyUnproven = true;
+			expect(chan.acceptsNewHtlcs(), `held ${s} takes no new HTLC`).to.equal(
+				false
+			);
+			expect(chan.canSettleHtlcs(), `held ${s} still settles`).to.equal(true);
+			state.restoreRecencyUnproven = undefined;
+			expect(
+				chan.acceptsNewHtlcs(),
+				`unheld ${s} takes a new HTLC iff it is NORMAL`
+			).to.equal(s === ChannelState.NORMAL);
+			expect(chan.canSettleHtlcs(), `unheld ${s} settles`).to.equal(true);
+		}
+
+		state.state = ChannelState.AWAITING_REESTABLISH;
+		state.preReestablishState = ChannelState.NORMAL;
+		expect(
+			chan.canSettleHtlcs(),
+			'a disconnected channel exchanges nothing until it is back'
+		).to.equal(false);
+		expect(
+			chan.acceptsNewHtlcs(true),
+			'but it can be described by the state it will return to'
+		).to.equal(true);
+		state.restoreRecencyUnproven = true;
+		expect(
+			chan.acceptsNewHtlcs(true),
+			'unless the hold stands, which looking through does not lift'
+		).to.equal(false);
 		fx.alice.destroy();
 		fx.bob.destroy();
 	});

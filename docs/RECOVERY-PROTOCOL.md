@@ -806,13 +806,14 @@ node.getRecoveryStatus();  // { gate, durability, startupRepairPending,
                            //   lastDurableSequence, awaitingDurabilityCount,
                            //   fenced, backfillLost, channels: [{ channelId,
                            //   status: ChannelRecoveryStatus,
-                           //   awaitingDurability }],
+                           //   awaitingDurability, fundingUnidentified?,
+                           //   restoreRecencyUnproven? }],
                            //   heldReestablish: [{ peer, channelId,
                            //   expiresAt }] }
 // heldReestablish is the 5.4 hold, and sits outside `channels` because it
 // describes peers waiting on channels this node does NOT have.
-// awaitingDurability sits BESIDE the status rather than becoming an eighth
-// ChannelRecoveryStatus member: the seven values are the 5.7 machine and
+// awaitingDurability sits BESIDE the status rather than becoming a ninth
+// ChannelRecoveryStatus member: the eight values are the 5.7 machine and
 // describe what is known about a channel's STATE, while waiting on a receipt
 // says nothing about the state, only that a message it authorized has not been
 // let out yet.

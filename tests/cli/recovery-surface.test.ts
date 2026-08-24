@@ -531,6 +531,98 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 		).channels.delete(channelId);
 	});
 
+	it('keeps a capsule-restored channel out of every readiness and capacity surface (issue #469)', async () => {
+		// A held channel stays NORMAL: it keeps its balance and closes
+		// cooperatively. But routing refuses it and addHtlc refuses it, so a
+		// surface that answers "ready" or "you can send this much" from state
+		// alone tells a caller something the daemon will not honour.
+		const node = daemon.node.getNode();
+		const {
+			createOpenerState
+		} = require('../../src/lightning/channel/channel-state');
+		const { Channel } = require('../../src/lightning/channel/channel');
+		const {
+			ChannelState,
+			DEFAULT_CHANNEL_CONFIG
+		} = require('../../src/lightning/channel/types');
+		const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+		const point = getPublicKey(crypto.randomBytes(32));
+		const bp = {
+			fundingPubkey: point,
+			revocationBasepoint: point,
+			paymentBasepoint: point,
+			delayedPaymentBasepoint: point,
+			htlcBasepoint: point,
+			firstPerCommitmentPoint: point
+		};
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: DEFAULT_CHANNEL_CONFIG,
+			localBasepoints: bp,
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		state.state = ChannelState.NORMAL;
+		state.channelId = crypto.randomBytes(32);
+		state.fundingTxid = crypto.randomBytes(32);
+		state.remoteBasepoints = bp;
+		state.localBalanceMsat = 900_000_000n;
+		state.remoteBalanceMsat = 100_000_000n;
+		state.restoreRecencyUnproven = true;
+		node
+			.getChannelManager()
+			.restoreChannel(
+				new Channel(state),
+				crypto.randomBytes(33).toString('hex')
+			);
+		const channelId = state.channelId.toString('hex');
+		const cli = daemon.node;
+
+		try {
+			const listed = cli
+				.listChannels()
+				.find((c: { channelId: string }) => c.channelId === channelId);
+			expect(listed, 'the channel is still listed').to.not.equal(undefined);
+			expect(listed!.htlcUsable, 'but not usable for a new HTLC').to.equal(
+				false
+			);
+			expect(listed!.restoreRecencyUnproven, 'and it says why').to.equal(true);
+
+			expect(
+				cli
+					.getReadyChannels()
+					.some((c: { channelId: string }) => c.channelId === channelId),
+				'not counted ready'
+			).to.equal(false);
+			expect(cli.canSend(1000).canSend, 'nothing sendable through it').to.equal(
+				false
+			);
+			expect(
+				cli.canReceive(1000).canReceive,
+				'and nothing receivable'
+			).to.equal(false);
+			expect(cli.getHealth().readyChannelCount, 'not a ready channel').to.equal(
+				0
+			);
+			const liquidity = cli.getLiquiditySnapshot();
+			expect(
+				liquidity.totalLocalBalanceSats + liquidity.totalRemoteBalanceSats,
+				'and no liquidity is claimed for it'
+			).to.equal(0);
+			expect(
+				liquidity.sendableSats,
+				'and nothing is reported as sendable through it'
+			).to.equal(0);
+		} finally {
+			(
+				node.getChannelManager() as unknown as {
+					channels: Map<string, unknown>;
+				}
+			).channels.delete(channelId);
+		}
+	});
+
 	it('POST /recovery/restore on a running node answers RESTORE_NOT_PENDING', async () => {
 		const res = await request(portOf(daemon), 'POST', '/recovery/restore', {
 			confirm: true

@@ -10072,13 +10072,13 @@ export class LightningNode extends EventEmitter {
 		if (maxFeeSats < 0n) throw new Error('maxFeeSats must be non-negative');
 
 		const fromChannel = this.channelManager.getChannel(fromChannelId);
-		if (!fromChannel || !fromChannel.isHtlcUsable()) {
+		if (!fromChannel || !fromChannel.acceptsNewHtlcs()) {
 			throw new Error(
 				`from channel not found or not usable: ${fromChannelId.toString('hex')}`
 			);
 		}
 		const toChannel = this.channelManager.getChannel(toChannelId);
-		if (!toChannel || !toChannel.isHtlcUsable()) {
+		if (!toChannel || !toChannel.acceptsNewHtlcs()) {
 			throw new Error(
 				`to channel not found or not usable: ${toChannelId.toString('hex')}`
 			);
@@ -10512,7 +10512,12 @@ export class LightningNode extends EventEmitter {
 		const pendingSplice = channel.getPendingSpliceLocalBalanceMsat();
 		if (pendingSplice !== null)
 			info.pendingSpliceLocalBalanceMsat = pendingSplice;
-		info.htlcUsable = channel.isHtlcUsable();
+		info.htlcUsable = channel.acceptsNewHtlcs();
+		// The reason a NORMAL channel can still answer false, so a consumer can
+		// tell "mid-splice and parked" from "restored and held" (issue #469).
+		if (state.restoreRecencyUnproven === true) {
+			info.restoreRecencyUnproven = true;
+		}
 		// Present exactly when the channel is mid-splice by EFFECTIVE state
 		// (looking through a reconnect): true = pay-through accounting (counted
 		// in the canonical balance at min(live, settle-to)), false = parked
@@ -11000,7 +11005,7 @@ export class LightningNode extends EventEmitter {
 		// Look through a reconnect (SCID and peer info stay valid for hints),
 		// and admit a usable mid-splice channel: it receives fine, still under
 		// its pre-splice scid until the lock.
-		if (!channel.isHtlcUsable(true)) return null;
+		if (!channel.acceptsNewHtlcs(true)) return null;
 
 		const channelId = channel.getChannelId();
 		if (!channelId) return null;
@@ -11120,7 +11125,7 @@ export class LightningNode extends EventEmitter {
 
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
-			if (!channel.isHtlcUsable(true)) continue;
+			if (!channel.acceptsNewHtlcs(true)) continue;
 
 			const channelId = channel.getChannelId();
 			if (!channelId) continue;
@@ -11809,7 +11814,9 @@ export class LightningNode extends EventEmitter {
 		// (e.g. missing SCID/alias, or relying on gossip that hasn't propagated).
 		const allChannels = this.channelManager.listChannels();
 		if (routingHints.length === 0) {
-			const receivableNormal = allChannels.some((ch) => ch.isHtlcUsable(true));
+			const receivableNormal = allChannels.some((ch) =>
+				ch.acceptsNewHtlcs(true)
+			);
 			if (receivableNormal) {
 				this.emit('node:error', {
 					code: 'NO_ROUTING_HINTS',
@@ -11931,7 +11938,7 @@ export class LightningNode extends EventEmitter {
 	private getLocalChannelEdges(): ILocalChannelEdge[] {
 		const edges: ILocalChannelEdge[] = [];
 		for (const channel of this.channelManager.listChannels()) {
-			if (!channel.isHtlcUsable()) continue;
+			if (!channel.acceptsNewHtlcs()) continue;
 			const channelId = channel.getChannelId();
 			if (!channelId) continue;
 			const peerHex = this.channelManager.getPeerForChannel(channelId);
@@ -13229,7 +13236,7 @@ export class LightningNode extends EventEmitter {
 		// the channel sits in AWAITING_REESTABLISH, where failHtlc/fulfillHtlc
 		// refuse and a drained entry would be consumed and stranded. Hold until
 		// the channel can carry updates again; the per-block retry gets it there.
-		if (channel.isQuiescing() || !channel.isHtlcUsable()) return;
+		if (channel.isQuiescing() || !channel.canSettleHtlcs()) return;
 		this.parkedQuiescentHtlcs.delete(channelIdHex);
 		for (const entry of list) {
 			this.handleIncomingHtlc(
@@ -17815,7 +17822,7 @@ export class LightningNode extends EventEmitter {
 			// phase survives a disconnect (AWAITING_REESTABLISH wrapping
 			// SPLICING), or a splice-out would bounce back to its full
 			// pre-splice balance the moment the peer drops and double-count
-			// against the on-chain side. Routing keeps strict isHtlcUsable().
+			// against the on-chain side. Routing keeps strict acceptsNewHtlcs().
 			const effState =
 				state.state === ChannelState.AWAITING_REESTABLISH
 					? state.preReestablishState ?? state.state
@@ -18232,7 +18239,7 @@ export class LightningNode extends EventEmitter {
 		for (const channel of this.channelManager.getChannelsByPeer(
 			peerPubkeyHex
 		)) {
-			if (!channel.isHtlcUsable()) continue;
+			if (!channel.acceptsNewHtlcs()) continue;
 			const st = channel.getFullState();
 			if (
 				(st.shortChannelId && st.shortChannelId.equals(scid)) ||
@@ -18250,7 +18257,7 @@ export class LightningNode extends EventEmitter {
 		amountMsat?: bigint
 	): Channel | undefined {
 		const channels = this.channelManager.getChannelsByPeer(peerPubkeyHex);
-		const normalChannels = channels.filter((ch) => ch.isHtlcUsable());
+		const normalChannels = channels.filter((ch) => ch.acceptsNewHtlcs());
 
 		if (normalChannels.length === 0) return undefined;
 		if (normalChannels.length === 1) return normalChannels[0];

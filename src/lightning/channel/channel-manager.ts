@@ -7139,7 +7139,7 @@ export class ChannelManager extends EventEmitter {
 			this.pendingQuiescentSettles.delete(channelIdHex);
 			return;
 		}
-		if (channel.isQuiescing() || !channel.isHtlcUsable()) return;
+		if (channel.isQuiescing() || !channel.canSettleHtlcs()) return;
 		this.pendingQuiescentSettles.delete(channelIdHex);
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		for (const op of list) {

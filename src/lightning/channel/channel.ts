@@ -3093,13 +3093,7 @@ export class Channel {
 	 * guards of fulfillHtlc below; keep the two in step.
 	 */
 	canFulfillHtlc(htlcId: bigint): boolean {
-		if (
-			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN &&
-			!this.canUpdateHtlcsDuringSplice()
-		) {
-			return false;
-		}
+		if (!this.canSettleHtlcs()) return false;
 		const entry = this._state.htlcs.get(`received-${htlcId}`);
 		if (!entry) return false;
 		return (
@@ -10647,16 +10641,6 @@ export class Channel {
 	 * immediately.
 	 */
 	isHtlcUsable(lookThroughReestablish = false): boolean {
-		// A capsule-restored channel whose recency cannot be proven takes no
-		// NEW HTLCs (issue #469): its on-chain HTLC deadline backstops can
-		// never fire while the hold stands, so an obligation taken on here has
-		// no enforcement behind it. Answered from the ONE predicate every
-		// planner and forwarding decision already consults, rather than at
-		// each of them: a route the router still offers is a part that can be
-		// dispatched, and an MPP payment that sends a safe part before a held
-		// part refuses locally leaves the first one locked until the
-		// mpp_timeout.
-		if (this._state.restoreRecencyUnproven === true) return false;
 		const eff =
 			lookThroughReestablish &&
 			this._state.state === ChannelState.AWAITING_REESTABLISH
@@ -10668,6 +10652,51 @@ export class Channel {
 			this._state.spliceInFlight?.sentTxSignatures === true &&
 			this._state.spliceInFlight?.receivedTxSignatures === true &&
 			!isTaprootChannel(this._state.channelType)
+		);
+	}
+
+	/**
+	 * Whether this channel may take a NEW HTLC: it can carry traffic right now
+	 * AND its state is provably current.
+	 *
+	 * A capsule-restored channel whose recency cannot be proven answers false
+	 * (issue #469). Every automatic close is refused while the hold stands, so
+	 * its on-chain HTLC deadline backstops can never fire, and an obligation
+	 * taken on here has no enforcement behind it: the peer can simply stall.
+	 *
+	 * A SEPARATE predicate from isHtlcUsable rather than a clause inside it,
+	 * because existing HTLCs must still settle and fail off chain. Folding the
+	 * hold into isHtlcUsable stopped the deferred-settle drains, and a held
+	 * channel with a queued fulfill then never released its preimage - while
+	 * the on-chain claim that would otherwise have made up for it is exactly
+	 * what the hold disables.
+	 *
+	 * Answered in ONE place so "the router will offer it" and "the channel will
+	 * accept it" cannot disagree: a route the router still publishes is a part
+	 * that gets dispatched, and an MPP payment that sends a safe part before a
+	 * held part refuses locally leaves the first one locked to its mpp_timeout.
+	 */
+	acceptsNewHtlcs(lookThroughReestablish = false): boolean {
+		if (this._state.restoreRecencyUnproven === true) return false;
+		return this.isHtlcUsable(lookThroughReestablish);
+	}
+
+	/**
+	 * Whether update messages for an EXISTING HTLC may be exchanged right now:
+	 * the state test fulfillHtlc, failHtlc and failMalformedHtlc all run,
+	 * hoisted so the deferred drains ask the same question the settle itself
+	 * will.
+	 *
+	 * Deliberately wider than isHtlcUsable. SHUTTING_DOWN still settles (BOLT 2
+	 * forbids new adds after shutdown, not removals), and the recency hold does
+	 * not apply here at all: refusing to release a preimage on a held channel
+	 * is how a paid HTLC becomes unclaimable.
+	 */
+	canSettleHtlcs(): boolean {
+		return (
+			this._state.state === ChannelState.NORMAL ||
+			this._state.state === ChannelState.SHUTTING_DOWN ||
+			this.canUpdateHtlcsDuringSplice()
 		);
 	}
 

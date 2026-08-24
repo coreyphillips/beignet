@@ -122,8 +122,14 @@ export interface ChannelInfo {
 	 * localBalanceSats stays pre-splice until splice_locked.
 	 */
 	pendingSpliceLocalBalanceSats?: number;
-	/** Whether the channel can carry HTLC traffic right now (0.6.0+). */
+	/** Whether the channel will accept a NEW HTLC (0.6.0+). */
 	htlcUsable?: boolean;
+	/**
+	 * The channel was restored from a Recovery Capsule and its state has not
+	 * been proven current, so it takes no new HTLCs and is offered to no
+	 * router. Existing HTLCs still settle and it still closes cooperatively.
+	 */
+	restoreRecencyUnproven?: boolean;
 	/**
 	 * Present exactly when mid-splice by effective state: true = paying
 	 * through the splice (counted in the canonical balance), false = parked.
