@@ -418,6 +418,37 @@ describe('Pre-splice spend watch record (issue #479)', () => {
 		expect(types).to.include(ChannelActionType.WATCH_FUNDING);
 	});
 
+	it('records no leg for a splice that has not reached the point of no return (issue #479)', () => {
+		// Before our tx_signatures leave, nobody can broadcast that splice, so
+		// the outpoint needs no leg - and recording one anyway makes it OUTLIVE
+		// the negotiation, because such a splice can still be safely aborted.
+		// Legs are keyed per outpoint, so the stale entry would then block a
+		// later splice of the SAME outpoint from recording its real expected
+		// spender, and the watcher would report that splice's own valid
+		// transaction as a close.
+		const { channel } = makeSplicingChannel();
+		const state = channel.getFullState();
+		state.preSpliceSpendWatches = undefined;
+		state.spliceInFlight!.sentTxSignatures = false;
+
+		expect(
+			channel.recordInFlightPreSpliceSpendWatch(),
+			'nothing is recorded before our signature leaves'
+		).to.equal(false);
+		expect(state.preSpliceSpendWatches).to.equal(undefined);
+
+		// The splice is safely aborted and a NEW one takes its place on the
+		// same outpoint. Its expected spender is the one that must be recorded.
+		const secondSpliceTxid = crypto.randomBytes(32);
+		state.spliceInFlight!.spliceTxid = secondSpliceTxid;
+		state.spliceInFlight!.sentTxSignatures = true;
+
+		expect(channel.recordInFlightPreSpliceSpendWatch()).to.equal(true);
+		expect(state.preSpliceSpendWatches![0].spliceTxid).to.equal(
+			Buffer.from(secondSpliceTxid).reverse().toString('hex')
+		);
+	});
+
 	it('records one leg per superseded outpoint, never a duplicate', () => {
 		const { channel, spliceTxid } = makeSplicingChannel();
 		const priv = channel as unknown as {

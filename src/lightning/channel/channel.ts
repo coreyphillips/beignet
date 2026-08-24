@@ -14564,6 +14564,15 @@ export class Channel {
 	 * key. The same derivation is wrong the moment the splice locks, because a
 	 * splice may rotate that key and completeSplice adopts the rotation.
 	 *
+	 * And ONLY past the point of no return. Before our tx_signatures leave,
+	 * nobody can broadcast that splice, so the outpoint needs no leg - while
+	 * recording one anyway makes it OUTLIVE the negotiation: such a splice can
+	 * still be safely aborted, and the record would then name a transaction
+	 * that will never exist. Legs are keyed per outpoint, so that stale entry
+	 * also blocks a later splice of the SAME outpoint from recording its real
+	 * expected spender, and the watcher would report that splice's own valid
+	 * transaction as a close.
+	 *
 	 * The channel derives it rather than the node, so the taproot branch, the
 	 * display-order conversion and the per-outpoint dedupe all live in one
 	 * place: the private writer this delegates to.
@@ -14571,6 +14580,7 @@ export class Channel {
 	recordInFlightPreSpliceSpendWatch(): boolean {
 		const record = this._state.spliceInFlight;
 		if (!record) return false;
+		if (record.sentTxSignatures !== true) return false;
 		const before = this._state.preSpliceSpendWatches?.length ?? 0;
 		this._recordPreSpliceSpendWatch(record.spliceTxid);
 		return (this._state.preSpliceSpendWatches?.length ?? 0) !== before;
