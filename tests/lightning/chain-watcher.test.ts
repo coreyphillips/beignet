@@ -1632,12 +1632,13 @@ describe('Phase 4: Chain Watcher', () => {
 			).to.deep.equal([breach]);
 		});
 
-		it('a re-reported spend does not retire a sibling scan', async () => {
-			// The starvation guard. checkFundingSpent has no dedupe and
-			// re-reports the spend it still sees on every sweep, so counting
-			// each of those as a fresh verdict would let one armed leg with a
-			// standing breach retire the channel's own concurrent scan every
-			// block, which is a worse failure than the race being fixed.
+		it('a repeat observation still retires an older stalled scan', async () => {
+			// Freshness is about when the evidence was gathered, not about
+			// whether the monitor changed as a result. Scan 1 reports the
+			// breach; scan 2 stalls holding a history from before it; scan 3
+			// re-observes the same breach and the monitor deduplicates it.
+			// Scan 2 must still be retired when it wakes, or it contradicts a
+			// spend that has since been confirmed by later evidence.
 			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
 			const registry = (
 				watcher as unknown as {
@@ -1660,34 +1661,32 @@ describe('Phase 4: Chain Watcher', () => {
 			const chanWatch = registry.get(chanKey) as { txid: string };
 			chanWatch.txid = spliceTxid;
 
+			// 1: the leg finds the breach.
 			const breach = publishBreach(oldTxid, scriptHash, 104);
-			const close = new bitcoin.Transaction();
-			close.version = 2;
-			close.addInput(Buffer.from(spliceTxid, 'hex').reverse(), 0, 0xffffffff);
-			close.addOutput(Buffer.from('0014' + '88'.repeat(20), 'hex'), 40_000);
-			backend.setTransaction(close.getId(), close.toBuffer());
+			await scan(registry.get(legKey), gen, legKey);
+			expect(reportedTxids()).to.deep.equal([breach]);
+
+			// 2: the channel's own scan starts against a history in which its
+			// outpoint also looks spent, and parks.
+			const stale = new bitcoin.Transaction();
+			stale.version = 2;
+			stale.addInput(Buffer.from(spliceTxid, 'hex').reverse(), 0, 0xffffffff);
+			stale.addOutput(Buffer.from('0014' + '99'.repeat(20), 'hex'), 30_000);
+			backend.setTransaction(stale.getId(), stale.toBuffer());
 			backend.setHistory(scriptHash, [
 				{ txid: oldTxid, height: 90 },
 				{ txid: breach, height: 104 },
 				{ txid: spliceTxid, height: 105 },
-				{ txid: close.getId(), height: 106 }
+				{ txid: stale.getId(), height: 106 }
 			]);
-
-			await scan(registry.get(legKey), gen, legKey);
-			expect(reportedTxids(), 'the leg reports its breach').to.deep.equal([
-				breach
-			]);
-
-			// The channel's own scan starts and parks.
 			backend.holdHistory(1);
 			const parked = scan(chanWatch, gen, chanKey).catch(() => {
 				/* not the subject */
 			});
 			await new Promise((resolve) => setTimeout(resolve, 20));
 
-			// The leg sweeps twice more against an unchanged history, reporting
-			// the same spend each time.
-			await scan(registry.get(legKey), gen, legKey);
+			// 3: the leg sweeps again and re-observes the SAME breach, which
+			// the monitor deduplicates.
 			await scan(registry.get(legKey), gen, legKey);
 
 			backend.releaseHistory();
@@ -1696,8 +1695,8 @@ describe('Phase 4: Chain Watcher', () => {
 
 			expect(
 				reportedTxids(),
-				'the parked scan was not starved by the repeats'
-			).to.include(close.getId());
+				'the stalled scan does not report over evidence younger than it'
+			).to.deep.equal([breach, breach]);
 		});
 
 		it("a leg vouches for the splice on behalf of the channel's own watch", async () => {

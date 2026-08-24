@@ -1738,6 +1738,14 @@ export class ChainMonitor {
 			// depth clock stops for good and every CSV sweep bound to it
 			// becomes unschedulable.
 			if (scan.expectedSpendTxid === broadcast.txid) return false;
+			// A transaction never spends an output it creates. So a scan of an
+			// outpoint BELONGING to the recorded spend is not evidence against
+			// it, whatever it found: after a splice is adopted the channel's
+			// own watch sits on exactly such an outpoint, and a record written
+			// before spentOutpoint existed would otherwise be demoted by it
+			// with nothing left able to re-report the transaction - the leg
+			// skips it by name, and this watch is downstream of it.
+			if (scan.txid === broadcast.txid) return false;
 			if (broadcast.spentOutpoint) {
 				// Evidence about one outpoint says nothing about another. This
 				// is what lets a leg retract a breach it found while staying

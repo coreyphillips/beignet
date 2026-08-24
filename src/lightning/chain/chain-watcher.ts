@@ -375,8 +375,6 @@ interface IChannelSpendScan {
 	nextTicket: number;
 	/** Ticket of the scan whose verdict the channel's monitor now holds. */
 	appliedTicket: number;
-	/** That verdict, so a repeat report is not mistaken for a new one. */
-	appliedVerdict?: string;
 }
 
 export class ChainWatcher extends EventEmitter {
@@ -1706,7 +1704,7 @@ export class ChainWatcher extends EventEmitter {
 
 			// Use 0 for mempool txs (Electrum returns height <= 0 for unconfirmed)
 			const height = entry.height > 0 ? entry.height : 0;
-			this.recordSpendVerdict(idHex, ticket, `spend:${entry.txid}:${height}`);
+			this.recordSpendVerdict(idHex, ticket);
 			this.channelManager.handleFundingSpent(
 				watched.channelId,
 				spendingTx,
@@ -1803,7 +1801,7 @@ export class ChainWatcher extends EventEmitter {
 				// - a demotion nothing could ever undo.
 				expectedSpendTxid: expectedSpender
 			}) ?? false;
-		if (retracted) this.recordSpendVerdict(idHex, ticket, 'absent');
+		if (retracted) this.recordSpendVerdict(idHex, ticket);
 	}
 
 	/**
@@ -1860,23 +1858,28 @@ export class ChainWatcher extends EventEmitter {
 	}
 
 	/**
-	 * Record the verdict this scan applied, so scans that started before it
-	 * retire instead of overwriting it.
+	 * Record that this scan reached the monitor, so scans that started before
+	 * it retire instead of overwriting what it saw.
 	 *
-	 * A verdict IDENTICAL to the one already standing is not an application.
-	 * checkFundingSpent has no dedupe and re-reports the spend it still sees on
-	 * every sweep, so counting those would let one armed leg with a standing
-	 * breach retire the channel's own concurrent scan every single block. That
-	 * starvation is a worse failure than the race this exists to fix.
+	 * Freshness is about WHEN THE EVIDENCE WAS GATHERED, not about whether the
+	 * monitor's state changed as a result. A scan that re-observes the spend
+	 * already recorded has confirmed it at ITS OWN, later moment, so an older
+	 * scan still holding a history from before that must not be allowed to
+	 * contradict it afterwards with an absence or a different spender. Skipping
+	 * the advance because the monitor deduplicated the report left exactly that
+	 * hole.
+	 *
+	 * This does NOT starve a sibling. The only verdict a pre-splice leg
+	 * repeats is a breach on the superseded outpoint, which means the splice
+	 * was evicted, which means the outpoint it would have created does not
+	 * exist and the channel's own watch has nothing to report; and while both
+	 * watches still cover the SAME outpoint they agree. A verdict the monitor
+	 * refuses (an absence about an outpoint its record does not name) never
+	 * reaches here at all.
 	 */
-	private recordSpendVerdict(
-		idHex: string,
-		ticket: number,
-		verdict: string
-	): void {
+	private recordSpendVerdict(idHex: string, ticket: number): void {
 		const state = this.channelSpendScans.get(idHex);
-		if (!state || state.appliedVerdict === verdict) return;
-		state.appliedVerdict = verdict;
+		if (!state) return;
 		state.appliedTicket = Math.max(state.appliedTicket, ticket);
 	}
 

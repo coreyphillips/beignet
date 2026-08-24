@@ -830,6 +830,26 @@ describe('Chain Monitor (Phase 4C)', function () {
 			expect(monitor.isCommitmentConfirmed()).to.be.false;
 		});
 
+		it('never retracts a record from a scan of an outpoint it created', function () {
+			// A transaction cannot spend an output it creates. After a splice
+			// is adopted the channel's own funding watch sits on exactly such
+			// an outpoint, and for a record written before spentOutpoint
+			// existed nothing else would refuse it: the leg skips that
+			// transaction by name and this watch is downstream of it, so the
+			// demotion would be permanent.
+			const { monitor, closingTx } = coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100);
+
+			expect(
+				monitor.handleFundingSpendAbsent({
+					txid: closingTx.getId(),
+					outputIndex: 0
+				}),
+				'the scanned outpoint belongs to the recorded spend'
+			).to.be.false;
+			expect(monitor.isCommitmentConfirmed()).to.be.true;
+		});
+
 		it('keeps the pre-outpoint rule for a record written before the field existed', function () {
 			const { monitor, closingTx } = coopCloseFixture();
 			// No outpoint supplied: the shape a row persisted before issue #479
