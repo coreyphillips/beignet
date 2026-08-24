@@ -1911,7 +1911,17 @@ export class ChannelManager extends EventEmitter {
 	 * persisted marker of its own.
 	 */
 	private _rollbackForReestablish(channel: Channel): void {
-		const abandoned = channel.markForReestablish();
+		// A row already wrapped in AWAITING_REESTABLISH gets the unsigned-add
+		// rollback WITHOUT being re-wrapped: markForReestablish refuses that
+		// state on purpose, because wrapping it again would overwrite
+		// preReestablishState with AWAITING_REESTABLISH and lose the state the
+		// channel is meant to return to. A capsule can hold exactly such a row,
+		// and without this the add it carries survives to be replayed (issue
+		// #469).
+		const abandoned =
+			channel.getState() === ChannelState.AWAITING_REESTABLISH
+				? channel.dropUnsignedHeldAdds()
+				: channel.markForReestablish();
 		if (abandoned.length === 0) return;
 		const channelId = channel.getChannelId() ?? channel.getTemporaryChannelId();
 		setImmediate(() => {
@@ -2011,6 +2021,15 @@ export class ChannelManager extends EventEmitter {
 				st === ChannelState.AWAITING_FUNDING_CONFIRMED ||
 				st === ChannelState.AWAITING_CHANNEL_READY ||
 				st === ChannelState.SHUTTING_DOWN ||
+				// A close under negotiation must complete channel_reestablish
+				// before it resumes, exactly like any other operational state,
+				// and markForReestablish has always handled it; only this list
+				// left it out. A held channel makes the omission matter: it
+				// sends no reestablish, so it never reaches its timeout either.
+				st === ChannelState.NEGOTIATING_CLOSING ||
+				// Already wrapped by the session that persisted it. It is not
+				// re-wrapped, but it still owes the unsigned-add rollback.
+				st === ChannelState.AWAITING_REESTABLISH ||
 				st === ChannelState.SPLICING ||
 				// A v2 open is only reestablishable when the durable record made
 				// it resumable; a row persisted before the record existed keeps

@@ -206,6 +206,33 @@ describe('Issue #469: a held restore forgets its unsigned adds', function () {
 		expect(state.needsCommitment).to.equal(true);
 	});
 
+	it('drops the add on a row the capsule already wrapped in AWAITING_REESTABLISH', () => {
+		// A capsule can hold a channel persisted mid-reestablish.
+		// markForReestablish refuses that state on purpose - re-wrapping would
+		// overwrite preReestablishState and lose the state the channel returns
+		// to - so the rollback has to reach it another way, or the add is
+		// replayed the moment the peer reconnects.
+		const { channel, htlcId } = channelWithUnsignedAdd();
+		const state = channel.getFullState();
+		state.preReestablishState = ChannelState.NORMAL;
+		state.state = ChannelState.AWAITING_REESTABLISH;
+		state.restoreRecencyUnproven = true;
+
+		expect(
+			channel.markForReestablish(),
+			'the wrapping path correctly declines this state'
+		).to.have.length(0);
+
+		const abandoned = channel.dropUnsignedHeldAdds();
+		expect(abandoned, 'but the rollback still runs').to.have.length(1);
+		expect(abandoned[0].htlcId).to.equal(htlcId);
+		expect(state.pendingLocalUpdates).to.have.length(0);
+		expect(
+			state.preReestablishState,
+			'and the state it returns to is untouched'
+		).to.equal(ChannelState.NORMAL);
+	});
+
 	it('the reestablish replay carries no dropped add', () => {
 		const { channel, htlcId } = channelWithUnsignedAdd();
 		const state = channel.getFullState();

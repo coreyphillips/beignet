@@ -6964,6 +6964,21 @@ export class Channel {
 		return false;
 	}
 
+	/**
+	 * The unsigned-add rollback ALONE, for a row that is already wrapped in
+	 * AWAITING_REESTABLISH (issue #469).
+	 *
+	 * A capsule can hold a channel persisted mid-reestablish, and
+	 * markForReestablish deliberately refuses that state: re-wrapping it would
+	 * overwrite `preReestablishState` with AWAITING_REESTABLISH and lose the
+	 * state the channel is supposed to return to. But the drop still has to
+	 * run, or handleReestablish replays an add the hold forbids the moment the
+	 * peer reconnects.
+	 */
+	dropUnsignedHeldAdds(): IAbandonedLocalAdd[] {
+		return this._dropUnsignedLocalAddsIfHeld();
+	}
+
 	markForReestablish(): IAbandonedLocalAdd[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
