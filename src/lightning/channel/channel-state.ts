@@ -182,6 +182,21 @@ export interface IRemoteForwardingPolicy {
 	timestamp: number;
 }
 
+/**
+ * A local update_add_htlc abandoned by the reestablish rollback on a channel
+ * whose restore could not prove its recency (issue #469).
+ *
+ * Never covered by a signature of ours, so it is in neither commitment and can
+ * be forgotten locally without desyncing anything. But whatever put it there -
+ * a forward's incoming leg, an outgoing payment attempt - still believes it is
+ * in flight, and has to be told.
+ */
+export interface IAbandonedLocalAdd {
+	htlcId: bigint;
+	paymentHash: Buffer;
+	amountMsat: bigint;
+}
+
 /** Why a channel is durably waiting for the PEER's force close (5.6). */
 export type RecoveryCloseReason =
 	| 'local-data-loss'

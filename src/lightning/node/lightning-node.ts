@@ -284,6 +284,7 @@ import {
 import {
 	createOpenerState,
 	createAcceptorState,
+	IAbandonedLocalAdd,
 	IChannelState,
 	IV2InFlight,
 	mustNotBroadcastCommitment,
@@ -3542,6 +3543,17 @@ export class LightningNode extends EventEmitter {
 			(channelId: Buffer, htlcId: bigint, reason: Buffer) => {
 				this.handleHtlcFailed(channelId, htlcId, reason);
 				this.emit('htlc:failed', { channelId, htlcId });
+			}
+		);
+
+		// An offered HTLC the channel dropped on a held restore rather than
+		// replay (issue #469). Nothing on chain resolves it, so whatever is
+		// waiting on it has to be told here.
+		this.channelManager.on(
+			'htlc:local-add-abandoned',
+			(channelId: Buffer, adds: IAbandonedLocalAdd[]) => {
+				for (const add of adds) this.failAbandonedLocalAdd(channelId, add);
+				this.persistChannel(channelId);
 			}
 		);
 
@@ -15251,16 +15263,89 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * An offered HTLC the channel abandoned before any signature covered it:
+	 * the reestablish rollback on a capsule-restored channel whose recency
+	 * cannot be proven (issue #469).
+	 *
+	 * It never reached a commitment, so nothing on chain will ever resolve it -
+	 * but its incoming leg, or the payment attempt that dispatched it, is still
+	 * waiting. Route both to exactly the paths a peer-sent update_fail_htlc
+	 * would have taken.
+	 *
+	 * Idempotent and safe to run late: both branches no-op when their record is
+	 * already gone, and both have durable backstops behind them (the
+	 * owed-upstream pass treats an entry gone from a live NORMAL outbound
+	 * channel as a failed leg, and the stuck-payment sweep fails a pending
+	 * outbound payment with no HTLC).
+	 */
+	private failAbandonedLocalAdd(
+		channelId: Buffer,
+		add: IAbandonedLocalAdd
+	): void {
+		const outKey = `${channelId.toString('hex')}:offered-${add.htlcId}`;
+		this.emitStructuredLog('htlc', 'local_add_abandoned', {
+			channelId: channelId.toString('hex'),
+			htlcId: Number(add.htlcId),
+			paymentHash: add.paymentHash.toString('hex'),
+			amountMsat: Number(add.amountMsat)
+		});
+		const forward = this.forwardedHtlcs.get(outKey);
+		if (forward) {
+			// Synthesized locally under the INBOUND shared secret, the same
+			// shape the owed-upstream pass uses for a downstream failure whose
+			// reason bytes are gone: there are no downstream bytes here either,
+			// and it refunds the payer identically. A refusal leaves the
+			// linkage for that pass to retry.
+			const secretKey = `${forward.inChannelId.toString('hex')}:${
+				forward.inHtlcId
+			}`;
+			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
+			const reason = sharedSecret
+				? createFailureMessage(sharedSecret, TEMPORARY_CHANNEL_FAILURE)
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.failForwardUpstream(
+				outKey,
+				forward,
+				channelId,
+				add.htlcId,
+				reason,
+				true
+			);
+			return;
+		}
+		this.handleHtlcFailed(
+			channelId,
+			add.htlcId,
+			Buffer.alloc(0),
+			'Outgoing HTLC abandoned: the channel was restored from a Recovery ' +
+				'Capsule and its state cannot be proven current'
+		);
+	}
+
 	private handleHtlcFailed(
 		channelId: Buffer,
 		htlcId: bigint,
-		reason: Buffer
+		reason: Buffer,
+		/**
+		 * Set when the failure was generated HERE rather than returned by the
+		 * peer: `reason` is then already a complete failure message (or empty)
+		 * and this string is the human-readable cause.
+		 */
+		localFailureReason?: string
 	): void {
 		// Check if this is a forwarded HTLC — wrap and propagate failure upstream
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		const forward = this.forwardedHtlcs.get(outKey);
 		if (forward) {
-			this.failForwardUpstream(outKey, forward, channelId, htlcId, reason);
+			this.failForwardUpstream(
+				outKey,
+				forward,
+				channelId,
+				htlcId,
+				reason,
+				localFailureReason !== undefined
+			);
 			return;
 		}
 
@@ -15300,7 +15385,8 @@ export class LightningNode extends EventEmitter {
 					'Remote failure could not be decrypted (no hop HMAC matched)';
 			}
 		} else if (reason.length === 0) {
-			payment.failureReason = 'Peer failed the HTLC with an empty reason';
+			payment.failureReason =
+				localFailureReason ?? 'Peer failed the HTLC with an empty reason';
 		}
 
 		// PERM|15 is overloaded, so the PERM bit alone does not mean "give up":

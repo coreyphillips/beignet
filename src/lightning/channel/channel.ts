@@ -36,6 +36,7 @@ import {
 	IChannelReadyMessage
 } from '../message/channel-funding';
 import {
+	decodeUpdateAddHtlcMessage,
 	encodeUpdateAddHtlcMessage,
 	IUpdateAddHtlcMessage,
 	encodeUpdateFulfillHtlcMessage,
@@ -91,6 +92,7 @@ import {
 	DEFAULT_CHANNEL_CONFIG
 } from './types';
 import {
+	IAbandonedLocalAdd,
 	IChannelState,
 	IRemoteForwardingPolicy,
 	ISpliceInFlight,
@@ -6810,7 +6812,159 @@ export class Channel {
 		}
 	}
 
-	markForReestablish(): void {
+	/**
+	 * Drop the queued update_add_htlc messages no commitment_signed of ours
+	 * covers, on a channel whose restore could not prove its recency (issue
+	 * #469). Returns what was abandoned, so the caller can tell whoever is
+	 * still waiting on it.
+	 *
+	 * handleReestablish replays pendingLocalUpdates as raw bytes with no
+	 * inspection, which BOLT 2 requires: the peer forgets what it never
+	 * committed. On a HELD channel that replay re-offers an HTLC the channel is
+	 * forbidden to offer, because addHtlc refuses one outright - the on-chain
+	 * deadline backstops that would enforce it are disarmed for as long as the
+	 * hold stands, and the hold is permanent. Worse, the entry still carries
+	 * needsCommitment, so the reestablish tail's auto-sign would COMMIT it.
+	 *
+	 * Only indices at or above pendingLocalUpdatesSignedCount are eligible.
+	 * Everything below it is covered by our outstanding commitment_signed and
+	 * MUST be replayed, and removing one would shift the boundary that count
+	 * names. The entry vetoes independently: signCommitment stamps
+	 * commitCoverPending and flips PENDING to COMMITTED in the same pass that
+	 * sets the count, so only a PENDING entry with addRemoteCommitted false and
+	 * no commitCoverPending stamp may go.
+	 *
+	 * Such an add is in NEITHER commitment: buildLocalCommitment excludes our
+	 * offered adds while addRemoteCommitted is false, and the remote commitment
+	 * only ever gets one when we sign. So dropping it desyncs no signature, and
+	 * the peer's own reconnect rollback discards the uncommitted add it
+	 * received - the mirror of the loop above - so both sides converge on "it
+	 * never happened".
+	 *
+	 * localHtlcCounter is deliberately NOT rewound. Rewinding is the dangerous
+	 * option: it lets a later add reuse an id a peer that kept the original
+	 * still holds, which this implementation itself treats as channel-fatal.
+	 * The gap it would close can never be observed, because addHtlc refuses
+	 * every subsequent add on a held channel. That is why HELD-ONLY scoping is
+	 * load-bearing for correctness here and not merely conservative: dropping
+	 * unsigned local adds in general is a BOLT 2 deviation with nothing to
+	 * justify it, since an ordinary channel replays them and the HTLC completes.
+	 */
+	private _dropUnsignedLocalAddsIfHeld(): IAbandonedLocalAdd[] {
+		if (this._state.restoreRecencyUnproven !== true) return [];
+		const queue = this._state.pendingLocalUpdates ?? [];
+		const signed = this._state.pendingLocalUpdatesSignedCount;
+		if (queue.length <= signed) return [];
+
+		const kept = queue.slice(0, signed);
+		const dropped: IAbandonedLocalAdd[] = [];
+		for (let i = signed; i < queue.length; i++) {
+			const update = queue[i];
+			if (update.type !== MessageType.UPDATE_ADD_HTLC) {
+				kept.push(update);
+				continue;
+			}
+			let msg: IUpdateAddHtlcMessage;
+			try {
+				msg = decodeUpdateAddHtlcMessage(update.payload);
+			} catch {
+				// Undecodable: leave it exactly as it was rather than guess.
+				kept.push(update);
+				continue;
+			}
+			const key = `offered-${msg.id}`;
+			const entry = this._state.htlcs.get(key);
+			if (
+				entry &&
+				!(
+					entry.state === HtlcState.PENDING &&
+					entry.addRemoteCommitted === false &&
+					entry.commitCoverPending !== true
+				)
+			) {
+				// A signature of ours covers it: not ours to forget.
+				kept.push(update);
+				continue;
+			}
+			if (entry) {
+				this._state.htlcs.delete(key);
+				// The provisional debit addHtlc took comes back, the same
+				// arithmetic handleRevokeAndAck applies to a terminally failed
+				// offered HTLC.
+				this._state.localBalanceMsat += entry.amountMsat;
+			}
+			dropped.push({
+				htlcId: msg.id,
+				paymentHash: Buffer.from(entry?.paymentHash ?? msg.paymentHash),
+				amountMsat: entry?.amountMsat ?? msg.amountMsat
+			});
+		}
+		if (dropped.length === 0) return [];
+		this._state.pendingLocalUpdates = kept;
+		// signedCount is untouched: nothing at or below the boundary moved.
+		if (!this._owesCommitmentSignature()) {
+			this._state.needsCommitment = false;
+		}
+		return dropped;
+	}
+
+	/**
+	 * Whether anything still owes the peer a commitment_signed, mirroring every
+	 * site that sets needsCommitment.
+	 *
+	 * Needed because autoSignAndSendCommitment gates on that flag alone, with
+	 * no "would this commitment differ" test. If a dropped add was the only
+	 * reason it was set, the reestablish tail would send a commitment_signed
+	 * covering no updates, which BOLT 2 forbids and which CLN answers with an
+	 * error - force-closing the one channel that must not be force-closed.
+	 *
+	 * Conservative by construction: it answers true whenever it is not certain,
+	 * because a wrongly kept flag costs one redundant round while a wrongly
+	 * cleared one stalls the channel until an unrelated update revives it.
+	 */
+	private _owesCommitmentSignature(): boolean {
+		if (
+			this._state.pendingLocalUpdates.length >
+			this._state.pendingLocalUpdatesSignedCount
+		) {
+			return true;
+		}
+		if (
+			this._state.pendingFeeratePerKw !== undefined &&
+			this._state.pendingFeerateCommitted !== true
+		) {
+			return true;
+		}
+		if (
+			this._state.pendingLeaseBlockheight !== undefined &&
+			this._state.pendingLeaseBlockheightCommitted !== true
+		) {
+			return true;
+		}
+		// A peer update we have revoked for but not yet covered by a signature
+		// of ours: handleCommitmentSigned sets the flag for exactly these, and
+		// signCommitment stamps commitCoverPending when it covers them.
+		for (const entry of this._state.htlcs.values()) {
+			if (entry.commitCoverPending === true) continue;
+			if (
+				entry.addLocallyRevoked === true &&
+				entry.state === HtlcState.PENDING
+			) {
+				return true;
+			}
+			if (
+				entry.removalLocallyRevoked === true &&
+				entry.removalRemoteCommitted !== true &&
+				(entry.state === HtlcState.FULFILLED ||
+					entry.state === HtlcState.FAILED)
+			) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	markForReestablish(): IAbandonedLocalAdd[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
@@ -6821,7 +6975,7 @@ export class Channel {
 			this._state.state !== ChannelState.AWAITING_TX_SIGNATURES &&
 			this._state.state !== ChannelState.DUAL_FUNDING_V2
 		) {
-			return; // Only mark operational, funded or resumable-open channels
+			return []; // Only mark operational, funded or resumable-open channels
 		}
 
 		// A disconnect aborts any quiescence handshake, so a splice we were waiting
@@ -6869,7 +7023,7 @@ export class Channel {
 				this._resetV2Driver();
 				this._state.v2InFlight = null;
 				this._state.state = ChannelState.ERRORED;
-				return;
+				return [];
 			}
 		}
 
@@ -6940,7 +7094,9 @@ export class Channel {
 		// debits remoteBalanceMsat and leaks an HTLC slot, and (b) make the
 		// id-only add dedup swallow a reused id carrying a DIFFERENT HTLC,
 		// desyncing the commitment. (Our own uncommitted updates are the
-		// opposite case: they stay and replay via pendingLocalUpdates.)
+		// opposite case: they stay and replay via pendingLocalUpdates - except
+		// an ADD on a held restore, which the block at the end of this method
+		// drops, for the reason argued there.)
 		for (const [key, entry] of this._state.htlcs) {
 			// A peer add never covered by the peer's commitment_signed
 			// (addLocallyRevoked flips in handleCommitmentSigned).
@@ -7003,6 +7159,13 @@ export class Channel {
 		) {
 			this._state.pendingLeaseBlockheight = undefined;
 		}
+
+		// Last, after every other rollback, so the commitment-owed test sees
+		// the final fee and blockheight state. Here rather than in
+		// handleReestablish so it also beats the reestablish tail's auto-sign,
+		// which would otherwise commit a restored unsigned add on the one
+		// channel whose commitment must never move (issue #469).
+		return this._dropUnsignedLocalAddsIfHeld();
 	}
 
 	/**

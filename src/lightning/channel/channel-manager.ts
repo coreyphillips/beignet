@@ -1749,7 +1749,7 @@ export class ChannelManager extends EventEmitter {
 				this.releaseRefusedV1FundingPledges(channel);
 				continue;
 			}
-			channel.markForReestablish();
+			this._rollbackForReestablish(channel);
 			// Quiescence never survives a disconnect (BOLT 2); retire the
 			// watchdog and release anything parked behind the session.
 			this._syncQuiescenceWatchdog(channel);
@@ -1829,7 +1829,7 @@ export class ChannelManager extends EventEmitter {
 				const idHex = channel.getChannelId()?.toString('hex');
 				if (idHex && this.channels.has(idHex)) {
 					this.purgeBarrierQueue(idHex);
-					channel.markForReestablish();
+					this._rollbackForReestablish(channel);
 					this.releaseDanglingV2Pledges(channel);
 					continue;
 				}
@@ -1897,6 +1897,26 @@ export class ChannelManager extends EventEmitter {
 		if (actions.length === 0) return false;
 		this.processActions(peerPubkey, channel, actions);
 		return true;
+	}
+
+	/**
+	 * markForReestablish plus the report its rollback owes the node.
+	 *
+	 * Deferred out of this turn, exactly as the deferred-settle drain is: at
+	 * startup this runs from restoreChannel, and the node's forwarding
+	 * linkages, payment records and htlc-to-payment map are all loaded AFTER
+	 * the channels are, so a synchronous emit would look them up before they
+	 * exist. The durable backstops behind it (the owed-upstream pass, and the
+	 * stuck-payment sweep) cover a crash in between, so nothing here needs a
+	 * persisted marker of its own.
+	 */
+	private _rollbackForReestablish(channel: Channel): void {
+		const abandoned = channel.markForReestablish();
+		if (abandoned.length === 0) return;
+		const channelId = channel.getChannelId() ?? channel.getTemporaryChannelId();
+		setImmediate(() => {
+			this.emit('htlc:local-add-abandoned', channelId, abandoned);
+		});
 	}
 
 	/**
@@ -2001,7 +2021,7 @@ export class ChannelManager extends EventEmitter {
 				(st === ChannelState.AWAITING_TX_SIGNATURES &&
 					channel.getFullState().v2InFlight != null)
 			) {
-				channel.markForReestablish();
+				this._rollbackForReestablish(channel);
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);

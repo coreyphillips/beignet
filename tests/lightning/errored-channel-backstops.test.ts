@@ -670,6 +670,62 @@ describe('Issue #469: a capsule-restored channel holds its automatic closes', fu
 		fx.bob.destroy();
 	});
 
+	it('fails the payment behind an add it abandons', async () => {
+		// The drop is local, so nothing on chain will ever resolve the HTLC -
+		// but the attempt that dispatched it is still in flight, and the
+		// reason it is told has to be true rather than "the peer failed it
+		// with an empty reason".
+		const fx = setupUnprovenChannel(95);
+		const manager = (fx.alice as any).channelManager;
+		const chan = manager.getChannel(fx.channelId);
+		const state = chan.getFullState();
+		state.state = ChannelState.NORMAL;
+		state.restoreRecencyUnproven = undefined;
+
+		const paymentHash = crypto.randomBytes(32);
+		const actions = chan.addHtlc(
+			50_000_000n,
+			paymentHash,
+			HEIGHT + 100,
+			Buffer.alloc(1366)
+		);
+		expect(
+			actions.find((a: any) => a.type === 'ERROR'),
+			'the add is accepted before the hold'
+		).to.equal(undefined);
+		const htlcId = state.localHtlcCounter - 1n;
+
+		const hashHex = paymentHash.toString('hex');
+		(fx.alice as any).payments.set(hashHex, {
+			paymentHash,
+			direction: 'OUTGOING',
+			status: 'PENDING',
+			amountMsat: 50_000_000n,
+			createdAt: Date.now()
+		});
+		(fx.alice as any).htlcPaymentMap.set(
+			`${fx.channelId.toString('hex')}:offered-${htlcId}`,
+			hashHex
+		);
+
+		state.restoreRecencyUnproven = true;
+		manager._rollbackForReestablish(chan);
+		// The report is deferred: at startup this runs before the node's
+		// payment records are even loaded.
+		await new Promise((resolve) => setImmediate(resolve));
+
+		const payment = (fx.alice as any).payments.get(hashHex);
+		expect(
+			payment.status,
+			'the attempt is failed, not left in flight'
+		).to.equal('FAILED');
+		expect(payment.failureReason, 'and told the truth about why').to.match(
+			/Recovery Capsule/
+		);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
 	it('reports the hold on the recovery status', () => {
 		const fx = setupUnprovenChannel(81);
 
