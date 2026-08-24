@@ -1700,6 +1700,78 @@ describe('Phase 4: Chain Watcher', () => {
 			).to.include(close.getId());
 		});
 
+		it("a leg vouches for the splice on behalf of the channel's own watch", async () => {
+			// The point-of-no-return shape: our tx_signatures have left, so the
+			// peer can assemble and broadcast the splice, but no WATCH_FUNDING
+			// has been emitted yet - the channel's own funding watch is still
+			// on the OLD outpoint and carries no expected spender of its own.
+			// Arming a second watch does not stop the first one reporting the
+			// legitimate splice as a spend of the funding, and classification
+			// has no branch for "this is a splice", so the channel would be
+			// marked closed on chain while it is very much alive. What stops it
+			// is that the expected spender belongs to the OUTPOINT.
+			const channelId = crypto.randomBytes(32);
+			const scriptPubkey = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			const scriptHash = computeScriptHash(scriptPubkey);
+			const oldTxid = crypto.randomBytes(32).toString('hex');
+
+			const oldTx = new bitcoin.Transaction();
+			oldTx.version = 2;
+			oldTx.addInput(crypto.randomBytes(32), 0, 0xffffffff);
+			oldTx.addOutput(scriptPubkey, 100_000);
+			backend.setTransaction(oldTxid, oldTx.toBuffer());
+
+			const spliceTx = new bitcoin.Transaction();
+			spliceTx.version = 2;
+			spliceTx.addInput(Buffer.from(oldTxid, 'hex').reverse(), 0, 0xfffffffd);
+			spliceTx.addOutput(scriptPubkey, 90_000);
+			const spliceTxid = spliceTx.getId();
+			backend.setTransaction(spliceTxid, spliceTx.toBuffer());
+
+			backend.setHistory(scriptHash, [{ txid: oldTxid, height: 90 }]);
+			backend.simulateNewBlock(100);
+			// The channel's own funding watch, still on the outpoint the splice
+			// will supersede, exactly as it stands before the broadcast.
+			await watcher.watchFundingOutput(channelId, oldTxid, 0, 3, scriptPubkey);
+			await watcher.watchFundingSpendDuringSplice(
+				channelId,
+				oldTxid,
+				0,
+				scriptPubkey,
+				spliceTxid
+			);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			spends = [];
+			reported = [];
+
+			// The peer publishes the splice while withholding its own
+			// tx_signatures. Both watches sweep the same shared script.
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 101 }
+			]);
+			backend.simulateNewBlock(101);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(
+				reportedTxids(),
+				'the legitimate splice is not read as a close by either watch'
+			).to.deep.equal([]);
+
+			// A revoked pre-splice commitment on the same outpoint still is.
+			const breachTxid = publishBreach(oldTxid, scriptHash, 102);
+			backend.simulateNewBlock(102);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			// Both watches cover this outpoint, so both legitimately see it; the
+			// monitor reconciles a repeat of the same transaction.
+			expect(
+				[...new Set(reportedTxids())],
+				'but a different spender of the same outpoint is'
+			).to.deep.equal([breachTxid]);
+		});
+
 		it('drops pre-splice watches with the channel, and never resurrects one after stop', async () => {
 			const { channelId } = await armSplice();
 			expect(preSpliceKeys(channelId)).to.have.length(1);

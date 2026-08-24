@@ -7560,6 +7560,16 @@ export class ChannelManager extends EventEmitter {
 						);
 					}
 					break;
+				case ChannelActionType.WATCH_PRESPLICE_SPEND:
+					// Ungated, for the same reasons WATCH_FUNDING is: it puts no
+					// bytes on the wire, changes nothing on chain, and is
+					// idempotent per outpoint. On a refused persist the right
+					// disposition is still the outpoint watched and the
+					// transaction not created. No 'channel:opening' companion
+					// either - this action moves nothing and describes no new
+					// funding.
+					this.emit('watch:presplice-spend', action.channelId);
+					break;
 				case ChannelActionType.AUTHORIZE_FUNDING_BROADCAST:
 					// Same guard and the same reason as BROADCAST_TX below: a
 					// funding transaction whose channel state never reached

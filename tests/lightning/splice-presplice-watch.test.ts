@@ -322,6 +322,102 @@ describe('Pre-splice spend watch record (issue #479)', () => {
 		);
 	});
 
+	it('arms the leg in the same batch that reaches the point of no return', () => {
+		// Once our tx_signatures leave, the peer can assemble and broadcast the
+		// splice without us. No WATCH_FUNDING is in that batch, because the
+		// transaction has not been broadcast and cannot be by us, so before
+		// this the superseded outpoint had no live subscription at all between
+		// our signature leaving and the peer's arriving: a node that did not
+		// restart was blind to a revoked pre-splice commitment for the whole
+		// window, and the channel's own watch would have read the legitimate
+		// splice as a close.
+		const { channel, spliceTxid } = makeSplicingChannel();
+		const {
+			ChannelActionType
+		} = require('../../src/lightning/channel/channel-actions');
+		const { SpliceState } = require('../../src/lightning/channel/splice');
+		const { MessageType } = require('../../src/lightning/message/types');
+		const priv = channel as unknown as Record<string, unknown>;
+
+		// The state _maybeSendSpliceTxSigs runs in: the interactive tx is
+		// complete, the commitment round is done, and we sign first.
+		priv._spliceSession = {
+			getState: () => SpliceState.AWAITING_TX_SIGNATURES
+		};
+		priv._spliceSentCommitment = true;
+		priv._spliceReceivedCommitment = true;
+		priv._spliceSentTxSigs = false;
+		priv._signer = {};
+		priv._spliceTx = { ourWalletWitnesses: [], newFundingOutputIndex: 0 };
+		priv.buildAndSignSpliceTx = (): unknown => ({
+			spliceTxid,
+			newFundingOutputIndex: 0,
+			signature: Buffer.alloc(64)
+		});
+
+		const actions = (
+			priv._maybeSendSpliceTxSigs as () => Array<{
+				type: string;
+				messageType?: number;
+			}>
+		).call(channel);
+
+		const types = actions.map((a) => a.type);
+		expect(
+			types.indexOf(ChannelActionType.PERSIST_STATE),
+			'the record reaches disk first'
+		).to.equal(0);
+		expect(
+			types.indexOf(ChannelActionType.WATCH_PRESPLICE_SPEND),
+			'then the watch is armed'
+		).to.equal(1);
+		const send = actions.find(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				a.messageType === MessageType.TX_SIGNATURES
+		);
+		expect(send, 'and only then does our signature leave').to.not.equal(
+			undefined
+		);
+		expect(
+			types.indexOf(ChannelActionType.SEND_MESSAGE),
+			'in that order'
+		).to.be.greaterThan(1);
+
+		// Emphatically NOT a WATCH_FUNDING: that would re-key the channel's
+		// only funding watch onto an outpoint whose transaction has not been
+		// broadcast and may never be, abandoning the live confirmed one and
+		// starting the forget clock against a transaction that does not exist
+		// (issue #481).
+		expect(types, 'the channel funding watch is not moved here').to.not.include(
+			ChannelActionType.WATCH_FUNDING
+		);
+		expect(channel.getFullState().preSpliceSpendWatches).to.have.length(1);
+	});
+
+	it('persists the leg a refused tx_signatures records', () => {
+		// The refusal batch is the only thing that knows about the leg it just
+		// recorded, and nothing downstream of a refusal is guaranteed to
+		// persist the channel.
+		const { channel, spliceTxid } = makeSplicingChannel();
+		const {
+			ChannelActionType
+		} = require('../../src/lightning/channel/channel-actions');
+		const priv = channel as unknown as Record<string, unknown>;
+		priv._spliceSentTxSigs = true;
+		channel.getFullState().spliceInFlight!.spliceTxid = spliceTxid;
+
+		const actions = (
+			priv._spliceTxSigsRefusal as (m: string) => Array<{ type: string }>
+		).call(channel, 'nope');
+		const types = actions.map((a) => a.type);
+		expect(types[0], 'the persist leads the batch').to.equal(
+			ChannelActionType.PERSIST_STATE
+		);
+		expect(types).to.include(ChannelActionType.WATCH_PRESPLICE_SPEND);
+		expect(types).to.include(ChannelActionType.WATCH_FUNDING);
+	});
+
 	it('records one leg per superseded outpoint, never a duplicate', () => {
 		const { channel, spliceTxid } = makeSplicingChannel();
 		const priv = channel as unknown as {

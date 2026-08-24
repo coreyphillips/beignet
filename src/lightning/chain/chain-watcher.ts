@@ -802,19 +802,33 @@ export class ChainWatcher extends EventEmitter {
 		// time afterwards, and an entry inserted then would survive into the
 		// next start() and be swept against a channel that may be gone.
 		if (!this.isCurrentGeneration(generation)) return;
+		const key = preSpliceWatchKey(channelId, txid, outputIndex);
+		const scriptHash = computeScriptHash(scriptPubkey);
+		// Idempotent per outpoint. Re-arming is routine now that the channel
+		// emits it in the batch reaching the point of no return as well as on
+		// every watch:funding and at startup, and replacing a live entry with
+		// an equivalent one would retire whatever scan is in flight against it
+		// through the map-identity guard, for nothing.
+		const existing = this.watchedFundings.get(key);
+		if (
+			existing &&
+			existing.scriptHash === scriptHash &&
+			existing.ignoreSpendTxid === ignoreSpendTxid
+		) {
+			return;
+		}
 		const watched: IWatchedFunding = {
 			channelId,
 			txid,
 			outputIndex,
 			minimumDepth: 0,
-			scriptHash: computeScriptHash(scriptPubkey),
+			scriptHash,
 			script: scriptPubkey,
 			confirmed: true,
 			confirmationHeight: 0,
 			announcementTriggered: true,
 			ignoreSpendTxid
 		};
-		const key = preSpliceWatchKey(channelId, txid, outputIndex);
 		this.watchedFundings.set(key, watched);
 
 		await this.watchFundingSpend(watched, generation, key);
@@ -1653,13 +1667,25 @@ export class ChainWatcher extends EventEmitter {
 		// A pre-splice leg retires on its own evidence, so the one entry it
 		// skips by name is remembered rather than merely skipped (issue #479).
 		let ignoredSpend: { txid: string; height: number } | null = null;
+		// An expected spender is a property of the OUTPOINT, not of one watch.
+		// Between our splice tx_signatures leaving and the broadcast, the
+		// channel's own funding watch is still on the old outpoint and carries
+		// no ignore of its own, so a peer that assembles and publishes the
+		// splice while withholding its signatures would be reported by that
+		// watch as a spend of the funding - and classification has no branch
+		// for "this is a splice", so the channel gets marked closed on chain
+		// while it is very much alive. The leg vouches for the splice on behalf
+		// of every watch of the same outpoint.
+		const expectedSpender = this.expectedSpenderFor(watched);
 
 		for (const entry of history) {
 			if (entry.txid === watched.txid) continue;
 			// A legitimate splice spends the pre-splice funding output; only a
 			// DIFFERENT spender (a revoked/force-close commitment) is a breach.
-			if (watched.ignoreSpendTxid && entry.txid === watched.ignoreSpendTxid) {
-				if (entry.height > 0) {
+			if (expectedSpender !== undefined && entry.txid === expectedSpender) {
+				// Only the leg itself retires on this evidence, so only the leg
+				// remembers it: see the retirement branch below.
+				if (entry.height > 0 && entry.txid === watched.ignoreSpendTxid) {
 					ignoredSpend = { txid: entry.txid, height: entry.height };
 				}
 				continue;
@@ -1705,6 +1731,10 @@ export class ChainWatcher extends EventEmitter {
 		// the very window a mempool-eviction breach lives in. A reorg that
 		// un-confirms the splice tx simply leaves the leg armed.
 		if (
+			// The leg's own evidence about its own expected spender. The
+			// channel's own watch may share the skip above, but it must not
+			// retire a leg it does not own.
+			watched.ignoreSpendTxid !== undefined &&
 			ignoredSpend !== null &&
 			this.currentBlockHeight > 0 &&
 			// The monitor's own boundary, `blockHeight - confirmationHeight >=
@@ -1766,9 +1796,40 @@ export class ChainWatcher extends EventEmitter {
 			this.channelManager.handleFundingSpendAbsent?.(watched.channelId, {
 				txid: watched.txid,
 				outputIndex: watched.outputIndex,
-				expectedSpendTxid: watched.ignoreSpendTxid
+				// The channel-scoped answer, not this watch's own field: during
+				// the splice window the channel's own watch shares the leg's
+				// expected spender, and without it here that watch would offer
+				// to retract a monitor record of the splice transaction itself
+				// - a demotion nothing could ever undo.
+				expectedSpendTxid: expectedSpender
 			}) ?? false;
 		if (retracted) this.recordSpendVerdict(idHex, ticket, 'absent');
+	}
+
+	/**
+	 * The transaction some watch of this channel expects to spend `watched`'s
+	 * outpoint, and which is therefore not a breach (issue #479).
+	 *
+	 * Read across the channel's watches rather than off the one scanning,
+	 * because during a splice two of them cover the same outpoint: the leg,
+	 * which knows the splice transaction by name, and the channel's own
+	 * funding watch, which does not and would otherwise report that
+	 * transaction as the close. Self-correcting: once WATCH_FUNDING moves the
+	 * channel's watch to the new outpoint the two no longer match, and it is
+	 * restart-safe because the leg is re-armed from disk.
+	 */
+	private expectedSpenderFor(watched: IWatchedFunding): string | undefined {
+		const idHex = watched.channelId.toString('hex');
+		for (const other of this.watchedFundings.values()) {
+			if (other.ignoreSpendTxid === undefined) continue;
+			if (other.channelId.toString('hex') !== idHex) continue;
+			if (other.txid !== watched.txid) continue;
+			if (other.outputIndex !== watched.outputIndex) continue;
+			// At most one: legs are keyed per outpoint, and the channel's own
+			// funding watch never carries an ignore of its own.
+			return other.ignoreSpendTxid;
+		}
+		return undefined;
 	}
 
 	/**

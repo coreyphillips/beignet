@@ -11167,7 +11167,7 @@ export class Channel {
 		// broadcast), so without recording the leg here a crash between now and
 		// the peer's tx_signatures would restore a channel watching only an
 		// outpoint that does not exist yet (issue #479).
-		this._recordPreSpliceSpendWatch(signed.spliceTxid);
+		const armPreSplice = this._recordPreSpliceSpendWatch(signed.spliceTxid);
 
 		// Our shared-input (2-of-2 funding) signature travels in the
 		// shared_input_signature TLV; witnesses carry only the stacks for the
@@ -11179,7 +11179,12 @@ export class Channel {
 			sharedInputSignature: signed.signature
 		};
 		const actions: ChannelAction[] = [
+			// Persist the leg, then arm the watch, then let our signature out.
+			// In that order: the record must be on disk before a crash can
+			// leave the peer able to broadcast, and the watch must be live
+			// before the peer can be told it may.
 			{ type: ChannelActionType.PERSIST_STATE },
+			...armPreSplice,
 			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg))
 		];
 		// Zero-conf: when the peer's tx_signatures arrived before ours (this
@@ -14303,17 +14308,28 @@ export class Channel {
 	 * The script is stored rather than recomputed because a splice may rotate
 	 * the peer's funding pubkey, so the channel's later funding script can
 	 * hash to something this output never paid.
+	 *
+	 * RETURNS the action that arms the watch, rather than leaving arming to
+	 * whatever the caller remembers to push next to it. Three of the four call
+	 * sites got arming for free from a WATCH_FUNDING they happened to emit
+	 * anyway; the fourth is the EARLIEST point of no return, it emits no
+	 * WATCH_FUNDING because the splice transaction has not been broadcast, and
+	 * it therefore left the superseded outpoint with no live subscription at
+	 * all between our signature leaving and the peer's arriving.
 	 */
-	private _recordPreSpliceSpendWatch(spliceTxid: Buffer): void {
+	private _recordPreSpliceSpendWatch(spliceTxid: Buffer): ChannelAction[] {
 		const fundingTxid = this._state.fundingTxid;
-		if (!fundingTxid || !this._state.remoteBasepoints) return;
+		if (!fundingTxid || !this._state.remoteBasepoints) return [];
 		const txid = Buffer.from(fundingTxid).reverse().toString('hex');
 		const outputIndex = this._state.fundingOutputIndex;
 		const existing = this._state.preSpliceSpendWatches ?? [];
 		if (
 			existing.some((w) => w.txid === txid && w.outputIndex === outputIndex)
 		) {
-			return;
+			// Already recorded, but still arm: arming is idempotent per
+			// outpoint, and a refusal path re-entered after a reconnect has to
+			// be able to put the watch back.
+			return this._armPreSpliceSpendWatches();
 		}
 		const script = isTaprootChannel(this._state.channelType)
 			? createTaprootFundingScript(
@@ -14333,6 +14349,14 @@ export class Channel {
 				spliceTxid: Buffer.from(spliceTxid).reverse().toString('hex')
 			}
 		];
+		return this._armPreSpliceSpendWatches();
+	}
+
+	/** The action that arms every pre-splice leg this channel has recorded. */
+	private _armPreSpliceSpendWatches(): ChannelAction[] {
+		const channelId = this._state.channelId;
+		if (!channelId) return [];
+		return [{ type: ChannelActionType.WATCH_PRESPLICE_SPEND, channelId }];
 	}
 
 	/**
@@ -14375,7 +14399,11 @@ export class Channel {
 		const refusal: ChannelAction[] = [];
 		const record = this._state.spliceInFlight;
 		if (record && (this._spliceSentTxSigs || record.sentTxSignatures)) {
-			this._recordPreSpliceSpendWatch(record.spliceTxid);
+			// The leg it records has to reach disk: this batch is the only
+			// thing that knows about it, and nothing downstream of a refusal is
+			// guaranteed to persist.
+			refusal.push({ type: ChannelActionType.PERSIST_STATE });
+			refusal.push(...this._recordPreSpliceSpendWatch(record.spliceTxid));
 			refusal.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: record.spliceTxid,
@@ -14400,7 +14428,7 @@ export class Channel {
 		const actions: ChannelAction[] = [];
 		const record = this._state.spliceInFlight;
 		if (record && (this._spliceSentTxSigs || record.sentTxSignatures)) {
-			this._recordPreSpliceSpendWatch(record.spliceTxid);
+			actions.push(...this._recordPreSpliceSpendWatch(record.spliceTxid));
 			actions.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: record.spliceTxid,
@@ -15293,7 +15321,7 @@ export class Channel {
 				tx: tx.toBuffer(),
 				fundingCritical: true
 			});
-			this._recordPreSpliceSpendWatch(spliceTxid);
+			actions.push(...this._recordPreSpliceSpendWatch(spliceTxid));
 			actions.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: spliceTxid,

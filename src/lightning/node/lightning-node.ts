@@ -3617,6 +3617,17 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// Arm spend detection on the outpoints a splice has superseded, without
+		// touching the channel's own funding watch (issue #479). Reading state
+		// here is safe where reading it in registerFundingWatch's splice arm is
+		// not: this needs only preSpliceSpendWatches, which completeSplice never
+		// touches, so a zero-conf splice_locked in the same batch cannot race it.
+		this.channelManager.on('watch:presplice-spend', (channelId: Buffer) => {
+			const channel = this.channelManager.getChannel(channelId);
+			if (!channel) return;
+			void this.armPreSpliceSpendWatches(channelId, channel.getFullState());
+		});
+
 		this.channelManager.on('watch:funding', (fundingTxid: Buffer) => {
 			const txidHex = fundingTxid.toString('hex');
 			// Arming the watch is deliberately NOT gated. It emits no bytes,
