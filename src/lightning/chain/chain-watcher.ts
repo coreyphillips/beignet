@@ -146,19 +146,14 @@ interface IWatchedFunding {
 	 * Every check captures it before its first await and re-reads it after,
 	 * so a scan that stalled while another finished retires instead of
 	 * overwriting the newer answer with its own stale one (issue #463).
+	 *
+	 * CONFIRMATION half only. The spend half is arbitrated per CHANNEL
+	 * instead, by `channelSpendScans`, because a channel has more than one
+	 * watch once a splice leaves a pre-splice leg behind and those watches
+	 * answer for one shared monitor; a per-watch counter cannot express that.
+	 * Do not merge the two.
 	 */
 	scanRevision?: number;
-	/**
-	 * The same idea as scanRevision, for the spend half of the watch: bumped
-	 * whenever a spend scan reports a spend or an absence. Spend scans overlap
-	 * too (a block, a script hash notification and the recheck timer all start
-	 * them) and each one carries a history it fetched before its awaits, so an
-	 * older scan that finishes last would otherwise overwrite the newer answer.
-	 * Reporting an older height demotes a recorded confirmation, which stops
-	 * the monitor's depth clock and unschedules every CSV sweep bound to it
-	 * (issue #468).
-	 */
-	spendScanRevision?: number;
 	/**
 	 * The spend this watch last reported, i.e. the one the channel's monitor
 	 * is currently holding on this watch's behalf. At most one watch per
@@ -388,10 +383,31 @@ const MAX_BROADCAST_RETRIES = 12;
  */
 const RECHECK_INTERVAL_MS = 60_000;
 
+/** Spend-scan arbitration state for one channel. */
+interface IChannelSpendScan {
+	/** Monotonic dispenser: every scan takes the next value when it starts. */
+	nextTicket: number;
+	/** Ticket of the scan whose verdict the channel's monitor now holds. */
+	appliedTicket: number;
+	/** That verdict, so a repeat report is not mistaken for a new one. */
+	appliedVerdict?: string;
+}
+
 export class ChainWatcher extends EventEmitter {
 	private backend: IChainBackend;
 	private channelManager: ChannelManager;
 	private watchedFundings: Map<string, IWatchedFunding> = new Map(); // channelIdHex → funding
+	/**
+	 * Spend-scan arbitration, per CHANNEL (issues #468, #479).
+	 *
+	 * A channel has more than one watch once a splice leaves a pre-splice leg
+	 * behind, and every one of them reports into the same monitor, so "is my
+	 * answer still the freshest" is a question about the channel and not about
+	 * one watch. Overlapping scans are routine: a block, a script hash
+	 * notification and the recheck timer each start one, and each carries a
+	 * history it fetched before its awaits.
+	 */
+	private channelSpendScans: Map<string, IChannelSpendScan> = new Map();
 	private watchedOutputs: Map<string, IWatchedOutput> = new Map(); // "txid:vout" → output
 	private failedFundingWatches: IFailedFundingWatch[] = [];
 	private failedOutputWatches: IFailedOutputWatch[] = [];
@@ -607,6 +623,10 @@ export class ChainWatcher extends EventEmitter {
 		for (const key of this.preSpliceWatchKeysFor(channelId)) {
 			this.watchedFundings.delete(key);
 		}
+		// Safe to drop the channel's spend-scan arbitration with its watches: a
+		// scan still in flight is retired by the map-identity guard, which no
+		// longer finds its watch, whatever the ticket state says.
+		this.channelSpendScans.delete(channelId.toString('hex'));
 		return this.watchedFundings.delete(channelId.toString('hex'));
 	}
 
@@ -627,6 +647,7 @@ export class ChainWatcher extends EventEmitter {
 			this._recheckTimer = null;
 		}
 		this.watchedFundings.clear();
+		this.channelSpendScans.clear();
 		this.watchedOutputs.clear();
 		this.failedFundingWatches.length = 0;
 		this.failedOutputWatches.length = 0;
@@ -1615,17 +1636,22 @@ export class ChainWatcher extends EventEmitter {
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		// Whatever this scan concludes is only safe to apply while it is still
-		// answering for the current watch and nothing else has concluded
-		// anything since it started. A splice replaces the channel's watch with
-		// one on the new outpoint, and a scan still running against the old one
-		// would report the splice tx itself as the close; an older scan
-		// finishing after a newer one would demote a confirmation back to the
-		// mempool height it happened to fetch (issue #468).
-		const revision = watched.spendScanRevision ?? 0;
+		// answering for the current watch and no FRESHER scan of this channel
+		// has concluded anything since it started. A splice replaces the
+		// channel's watch with one on the new outpoint, and a scan still
+		// running against the old one would report the splice tx itself as the
+		// close; a scan that started earlier and finished later would demote a
+		// confirmation back to the mempool height it happened to fetch (issue
+		// #468).
+		//
+		// The ticket is taken here, before the first await, because it records
+		// when this scan's evidence was gathered.
+		const idHex = watched.channelId.toString('hex');
+		const ticket = this.beginSpendScan(idHex);
 		const superseded = (): boolean =>
 			!this.isCurrentGeneration(generation) ||
 			this.watchedFundings.get(key) !== watched ||
-			(watched.spendScanRevision ?? 0) !== revision;
+			this.spendScanOvertaken(idHex, ticket);
 
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
 		if (superseded()) return;
@@ -1668,10 +1694,10 @@ export class ChainWatcher extends EventEmitter {
 
 			// Use 0 for mempool txs (Electrum returns height <= 0 for unconfirmed)
 			const height = entry.height > 0 ? entry.height : 0;
-			watched.spendScanRevision = revision + 1;
 			// This watch now owns the channel's spend verdict, so no sibling
 			// can retract it and this one can (issue #479).
 			this.claimSpendReport(watched, entry.txid);
+			this.recordSpendVerdict(idHex, ticket, `spend:${entry.txid}:${height}`);
 			this.channelManager.handleFundingSpent(
 				watched.channelId,
 				spendingTx,
@@ -1757,9 +1783,57 @@ export class ChainWatcher extends EventEmitter {
 			!ownsReport && this.hasSpendReportOwner(watched.channelId);
 		if (ownsReport || (!siblingOwnsReport && !watched.ignoreSpendTxid)) {
 			watched.reportedSpendTxid = undefined;
-			watched.spendScanRevision = revision + 1;
+			this.recordSpendVerdict(idHex, ticket, 'absent');
 			this.channelManager.handleFundingSpendAbsent?.(watched.channelId);
 		}
+	}
+
+	/**
+	 * A ticket for a spend scan starting now. Taken BEFORE the scan's first
+	 * await, so it records when the scan's evidence was gathered.
+	 */
+	private beginSpendScan(idHex: string): number {
+		const state = this.channelSpendScans.get(idHex) ?? {
+			nextTicket: 0,
+			appliedTicket: 0
+		};
+		this.channelSpendScans.set(idHex, state);
+		return ++state.nextTicket;
+	}
+
+	/**
+	 * Whether a scan that STARTED LATER than this one has already applied a
+	 * verdict for the channel.
+	 *
+	 * Start order, not completion order. The later scan holds the fresher
+	 * history whichever of the two happens to finish first, so arbitrating on
+	 * completion gets one of the two interleavings wrong: it discards a
+	 * canonical scan that began after an older one and merely finished behind
+	 * it.
+	 */
+	private spendScanOvertaken(idHex: string, ticket: number): boolean {
+		return (this.channelSpendScans.get(idHex)?.appliedTicket ?? 0) > ticket;
+	}
+
+	/**
+	 * Record the verdict this scan applied, so scans that started before it
+	 * retire instead of overwriting it.
+	 *
+	 * A verdict IDENTICAL to the one already standing is not an application.
+	 * checkFundingSpent has no dedupe and re-reports the spend it still sees on
+	 * every sweep, so counting those would let one armed leg with a standing
+	 * breach retire the channel's own concurrent scan every single block. That
+	 * starvation is a worse failure than the race this exists to fix.
+	 */
+	private recordSpendVerdict(
+		idHex: string,
+		ticket: number,
+		verdict: string
+	): void {
+		const state = this.channelSpendScans.get(idHex);
+		if (!state || state.appliedVerdict === verdict) return;
+		state.appliedVerdict = verdict;
+		state.appliedTicket = Math.max(state.appliedTicket, ticket);
 	}
 
 	/**
@@ -1773,15 +1847,6 @@ export class ChainWatcher extends EventEmitter {
 			if (other === watched) continue;
 			if (other.channelId.toString('hex') !== idHex) continue;
 			other.reportedSpendTxid = undefined;
-			// Clearing the flag is not enough: a sibling scan that already
-			// fetched its history is still in flight, and its own revision has
-			// not moved, so it would pass every guard and report ITS spend
-			// after this one. That is how an orphaned pre-splice spend
-			// reclaimed ownership from the canonical close and put the monitor
-			// back on a transaction no longer in the chain, taking the penalty
-			// and fee-bump tracking bound to the real one with it. Retiring
-			// those scans is part of the ownership transfer.
-			other.spendScanRevision = (other.spendScanRevision ?? 0) + 1;
 		}
 	}
 

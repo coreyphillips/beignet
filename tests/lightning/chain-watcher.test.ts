@@ -113,22 +113,29 @@ class MockChainBackend implements IChainBackend {
 	}
 
 	private historyHolds = 0;
-	private historyGate: Promise<void> | null = null;
-	private releaseGate: (() => void) | null = null;
+	/** One gate per parked fetch, oldest first, so they can be released
+	 * individually. Arbitration between two overlapping scans turns on which
+	 * one STARTED first and which one FINISHES first, and only staged release
+	 * can express both independently. */
+	private historyGates: Array<() => void> = [];
 
-	/** Park the next `count` history fetches until releaseHistory(). */
+	/** Park the next `count` history fetches until they are released. */
 	holdHistory(count = 1): void {
 		this.historyHolds = count;
-		this.historyGate = new Promise((resolve) => {
-			this.releaseGate = resolve;
-		});
 	}
 
+	/** Release every parked fetch. */
 	releaseHistory(): void {
 		this.historyHolds = 0;
-		this.releaseGate?.();
-		this.historyGate = null;
-		this.releaseGate = null;
+		const gates = this.historyGates;
+		this.historyGates = [];
+		for (const release of gates) release();
+	}
+
+	/** Release the oldest parked fetch only, leaving the rest held. */
+	releaseNextHistory(): void {
+		const release = this.historyGates.shift();
+		release?.();
 	}
 
 	async getScriptHashHistory(
@@ -140,7 +147,9 @@ class MockChainBackend implements IChainBackend {
 		const snapshot = this.scriptHashHistory.get(scriptHash) || [];
 		if (this.historyHolds > 0) {
 			this.historyHolds--;
-			await this.historyGate;
+			await new Promise<void>((resolve) => {
+				this.historyGates.push(resolve);
+			});
 		}
 		return snapshot;
 	}
@@ -1381,10 +1390,11 @@ describe('Phase 4: Chain Watcher', () => {
 			]);
 
 			// The parked scan now finishes. Clearing the sibling's ownership
-			// flag alone would not stop it: its own revision never moved, so it
-			// would pass every guard and put the monitor back on a transaction
-			// that is no longer in the chain, taking the penalty and fee-bump
-			// tracking bound to the real close with it.
+			// flag alone would not stop it: it would pass every remaining guard
+			// and put the monitor back on a transaction that is no longer in
+			// the chain, taking the penalty and fee-bump tracking bound to the
+			// real close with it. What stops it is the channel's scan ticket:
+			// the canonical close applied a verdict AFTER this scan started.
 			backend.releaseHistory();
 			await parked;
 			await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1394,6 +1404,221 @@ describe('Phase 4: Chain Watcher', () => {
 				'the orphan never reclaims the verdict'
 			).to.deep.equal([close.getId()]);
 			expect(orphan).to.be.a('string');
+		});
+
+		it('a scan that started later wins even when the earlier one finishes first', async () => {
+			// The mirror of the case above, and the one arbitration on
+			// COMPLETION order gets wrong. The leg's scan starts first and
+			// finishes first, holding an orphaned pre-splice spend; the
+			// channel's own scan starts after it, holding the canonical close.
+			// Retiring every sibling at claim time would throw the fresher
+			// answer away and leave the monitor bound to the orphan.
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+			const registry = (
+				watcher as unknown as {
+					watchedFundings: Map<string, unknown>;
+				}
+			).watchedFundings;
+			const chanKey = channelId.toString('hex');
+			const legKey = preSpliceKeys(channelId)[0];
+			const gen = (watcher as unknown as { lifecycleGeneration: number })
+				.lifecycleGeneration;
+			const scan = (
+				watcher as unknown as {
+					checkFundingSpent: (
+						w: unknown,
+						g: number,
+						k: string
+					) => Promise<void>;
+				}
+			).checkFundingSpent.bind(watcher);
+
+			const orphan = publishBreach(oldTxid, scriptHash, 104);
+			backend.holdHistory(2);
+
+			// Started FIRST, against a history holding only the orphan.
+			const legScan = scan(registry.get(legKey), gen, legKey).catch(() => {
+				/* not the subject */
+			});
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			// Started SECOND, against a history that also holds the real close
+			// of the new outpoint.
+			const close = new bitcoin.Transaction();
+			close.version = 2;
+			close.addInput(Buffer.from(spliceTxid, 'hex').reverse(), 0, 0xffffffff);
+			close.addOutput(Buffer.from('0014' + '66'.repeat(20), 'hex'), 60_000);
+			backend.setTransaction(close.getId(), close.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: orphan, height: 104 },
+				{ txid: spliceTxid, height: 105 },
+				{ txid: close.getId(), height: 106 }
+			]);
+			const chanWatch = registry.get(chanKey) as { txid: string };
+			chanWatch.txid = spliceTxid;
+			const chanScan = scan(chanWatch, gen, chanKey).catch(() => {
+				/* not the subject */
+			});
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			// The EARLIER scan finishes first, then the later one.
+			backend.releaseNextHistory();
+			await legScan;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			backend.releaseNextHistory();
+			await chanScan;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			expect(
+				reportedTxids(),
+				'the canonical close is not discarded by the older scan'
+			).to.include(close.getId());
+			expect(
+				reportedTxids()[reportedTxids().length - 1],
+				'and it is the verdict the monitor ends up holding'
+			).to.equal(close.getId());
+		});
+
+		it('a retraction retires a sibling scan that started before it', async () => {
+			// The absence half of the same race. Retracting used to move only
+			// the retracting watch's own counter, so a sibling that had already
+			// fetched its history sailed past every guard and reported a spend
+			// the retraction had just contradicted.
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+			const registry = (
+				watcher as unknown as {
+					watchedFundings: Map<string, unknown>;
+				}
+			).watchedFundings;
+			const chanKey = channelId.toString('hex');
+			const legKey = preSpliceKeys(channelId)[0];
+			const gen = (watcher as unknown as { lifecycleGeneration: number })
+				.lifecycleGeneration;
+			const scan = (
+				watcher as unknown as {
+					checkFundingSpent: (
+						w: unknown,
+						g: number,
+						k: string
+					) => Promise<void>;
+				}
+			).checkFundingSpent.bind(watcher);
+			const chanWatch = registry.get(chanKey) as { txid: string };
+			chanWatch.txid = spliceTxid;
+
+			// The leg finds a breach and owns the channel's spend verdict.
+			const breach = publishBreach(oldTxid, scriptHash, 104);
+			await scan(registry.get(legKey), gen, legKey);
+			expect(reportedTxids(), 'the breach is recorded').to.deep.equal([breach]);
+
+			// The channel's own scan starts, holding a history in which the new
+			// outpoint is also spent, and parks.
+			const stale = new bitcoin.Transaction();
+			stale.version = 2;
+			stale.addInput(Buffer.from(spliceTxid, 'hex').reverse(), 0, 0xffffffff);
+			stale.addOutput(Buffer.from('0014' + '77'.repeat(20), 'hex'), 50_000);
+			backend.setTransaction(stale.getId(), stale.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: breach, height: 104 },
+				{ txid: spliceTxid, height: 105 },
+				{ txid: stale.getId(), height: 106 }
+			]);
+			backend.holdHistory(1);
+			const parked = scan(chanWatch, gen, chanKey).catch(() => {
+				/* not the subject */
+			});
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			// A reorg takes the breach out and the leg, which owns the verdict,
+			// retracts it. That retraction is a verdict of its own.
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 105 }
+			]);
+			await scan(registry.get(legKey), gen, legKey);
+			expect(
+				absentCalls.some((cid) => cid.equals(channelId)),
+				'the leg retracted'
+			).to.be.true;
+
+			backend.releaseHistory();
+			await parked;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			expect(
+				reportedTxids(),
+				'the parked sibling does not report over the retraction'
+			).to.deep.equal([breach]);
+		});
+
+		it('a re-reported spend does not retire a sibling scan', async () => {
+			// The starvation guard. checkFundingSpent has no dedupe and
+			// re-reports the spend it still sees on every sweep, so counting
+			// each of those as a fresh verdict would let one armed leg with a
+			// standing breach retire the channel's own concurrent scan every
+			// block, which is a worse failure than the race being fixed.
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+			const registry = (
+				watcher as unknown as {
+					watchedFundings: Map<string, unknown>;
+				}
+			).watchedFundings;
+			const chanKey = channelId.toString('hex');
+			const legKey = preSpliceKeys(channelId)[0];
+			const gen = (watcher as unknown as { lifecycleGeneration: number })
+				.lifecycleGeneration;
+			const scan = (
+				watcher as unknown as {
+					checkFundingSpent: (
+						w: unknown,
+						g: number,
+						k: string
+					) => Promise<void>;
+				}
+			).checkFundingSpent.bind(watcher);
+			const chanWatch = registry.get(chanKey) as { txid: string };
+			chanWatch.txid = spliceTxid;
+
+			const breach = publishBreach(oldTxid, scriptHash, 104);
+			const close = new bitcoin.Transaction();
+			close.version = 2;
+			close.addInput(Buffer.from(spliceTxid, 'hex').reverse(), 0, 0xffffffff);
+			close.addOutput(Buffer.from('0014' + '88'.repeat(20), 'hex'), 40_000);
+			backend.setTransaction(close.getId(), close.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: breach, height: 104 },
+				{ txid: spliceTxid, height: 105 },
+				{ txid: close.getId(), height: 106 }
+			]);
+
+			await scan(registry.get(legKey), gen, legKey);
+			expect(reportedTxids(), 'the leg reports its breach').to.deep.equal([
+				breach
+			]);
+
+			// The channel's own scan starts and parks.
+			backend.holdHistory(1);
+			const parked = scan(chanWatch, gen, chanKey).catch(() => {
+				/* not the subject */
+			});
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			// The leg sweeps twice more against an unchanged history, reporting
+			// the same spend each time.
+			await scan(registry.get(legKey), gen, legKey);
+			await scan(registry.get(legKey), gen, legKey);
+
+			backend.releaseHistory();
+			await parked;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			expect(
+				reportedTxids(),
+				'the parked scan was not starved by the repeats'
+			).to.include(close.getId());
 		});
 
 		it('drops pre-splice watches with the channel, and never resurrects one after stop', async () => {
