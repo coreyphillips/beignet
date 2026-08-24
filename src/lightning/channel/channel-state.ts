@@ -182,8 +182,26 @@ export interface IRemoteForwardingPolicy {
 	timestamp: number;
 }
 
+/**
+ * A local update_add_htlc abandoned by the reestablish rollback on a channel
+ * whose restore could not prove its recency (issue #469).
+ *
+ * Never covered by a signature of ours, so it is in neither commitment and can
+ * be forgotten locally without desyncing anything. But whatever put it there -
+ * a forward's incoming leg, an outgoing payment attempt - still believes it is
+ * in flight, and has to be told.
+ */
+export interface IAbandonedLocalAdd {
+	htlcId: bigint;
+	paymentHash: Buffer;
+	amountMsat: bigint;
+}
+
 /** Why a channel is durably waiting for the PEER's force close (5.6). */
-export type RecoveryCloseReason = 'local-data-loss' | 'state-uncertain';
+export type RecoveryCloseReason =
+	| 'local-data-loss'
+	| 'state-uncertain'
+	| 'restore-unproven';
 
 /**
  * Why WE closed (or are closing) the channel. 'user' means an API-initiated
@@ -504,6 +522,45 @@ export interface IChannelState {
 	/** Splice: state before splicing (to restore on abort) */
 	preSpliceState: ChannelState | null;
 	/**
+	 * Funding outpoints a splice has superseded but whose spend must still be
+	 * watched, with the splice transaction that is expected to spend each one
+	 * (issue #479).
+	 *
+	 * The channel's own funding watch moves to the new outpoint as soon as the
+	 * splice transaction is broadcast, so from then until that transaction is
+	 * irrevocably confirmed the old outpoint has no watch of its own, and a
+	 * peer that evicts a low-feerate splice from the mempool can spend it with
+	 * a revoked pre-splice commitment. `spliceInFlight` used to be the only
+	 * record a restart could rebuild that watch from, and it is not enough:
+	 * completeSplice clears it when splice_locked is sent, which on a
+	 * zero-conf channel happens in the same action batch as the broadcast, so
+	 * a restart before the splice confirmed came back blind to exactly the
+	 * attack the watch exists for.
+	 *
+	 * Each entry carries the outpoint's OWN scriptPubkey, which is the whole
+	 * point of recording it rather than recomputing one: a splice may rotate
+	 * the peer's funding pubkey (`ISpliceInFlight.remoteFundingPubkey`, and
+	 * CLN does this), so the channel's current funding script can hash to
+	 * something the superseded output never paid, and a watch armed from it
+	 * subscribes to the wrong script and never sees the breach.
+	 *
+	 * Written by the channel in the SAME batch that authorizes the splice
+	 * broadcast, before completeSplice adopts the new funding, so the values
+	 * are the pre-splice ones and the record is on disk before the transaction
+	 * that supersedes the outpoint can reach the network.
+	 *
+	 * Display-order hex, because these are consumed verbatim by ChainWatcher,
+	 * which speaks the byte order Electrum reports. Entries are removed when
+	 * the watcher reports the outpoint's expected spend irrevocably confirmed,
+	 * so the list is empty on a channel with no splice history in flight.
+	 */
+	preSpliceSpendWatches?: Array<{
+		txid: string;
+		outputIndex: number;
+		script: string;
+		spliceTxid: string;
+	}>;
+	/**
 	 * Splice: in-flight splice past the point of no return (we sent
 	 * tx_signatures, or the mid-splice commitment round completed). Must survive
 	 * disconnect AND restart — the splice tx may confirm at any time. Optional
@@ -692,6 +749,69 @@ export interface IChannelState {
 	 * proving us stale upgrades to dataLossDetected.
 	 */
 	stateUncertain?: boolean;
+	/**
+	 * This row came from a Recovery Capsule and no `channel_reestablish` has
+	 * confirmed it against the peer yet (issue #469).
+	 *
+	 * A capsule is best-effort recency by construction: BOLT 1 peer storage is
+	 * rate limited and providers need not return the latest blob
+	 * (docs/RECOVERY-PROTOCOL.md 5.4), so a Tier 2 restore is byte-identical
+	 * to a checkpoint that may be behind what this node actually did. 5.4 names
+	 * `channel_reestablish` as the safety net for exactly that, and it is: an
+	 * honest peer's counters expose the gap and route the channel to DLP. But
+	 * the safety net only covers the paths that reach it, and the AUTOMATIC
+	 * force-close paths do not - a peer's BOLT 1 error, the reestablish and
+	 * errored timeout backstops, the HTLC deadline backstops. Each of those
+	 * would broadcast a commitment the peer may already hold a revocation for,
+	 * which forfeits the whole balance to the justice path.
+	 *
+	 * So while this is set the node refuses to broadcast our commitment ON ITS
+	 * OWN INITIATIVE, and it stays set. A COMPATIBLE reestablish does not lift
+	 * it: BOLT 2's stale-state proof runs one way only, and the peer holding
+	 * our capsule is the same peer we would be trusting, so one that holds a
+	 * newer state can under-report compatible counters, replay the old secret
+	 * it already has, and wait for an automatic close to publish a commitment
+	 * it can penalize. The hold IS the defence against that, because the
+	 * attack needs us to broadcast.
+	 *
+	 * It is still deliberately NOT `stateUncertain`, which routes reestablish
+	 * itself to DLP and would force-close every capsule restore: this channel
+	 * RESUMES and keeps its funds. What it does not do is take NEW HTLCs. Its
+	 * on-chain HTLC deadline backstops can never fire while the hold stands,
+	 * and accepting an obligation whose only enforcement this node has disarmed
+	 * is how a bounded risk becomes an unbounded one; existing HTLCs still
+	 * settle and fail off chain.
+	 *
+	 * Nor does it close COOPERATIVELY. That was once argued here as safe
+	 * because a mutual close involves no revocation, and that is true and
+	 * beside the point: a mutual close pays out the balances THIS row carries,
+	 * and a stale capsule's allocation can only ever be the peer-favourable
+	 * one, since any payment received after the checkpoint is missing from it.
+	 * A peer holding the newer state can under-report compatible reestablish
+	 * counters, ask to close, and validly sign the older split; signing it is a
+	 * loss with no penalty attached and no way back. Both directions are
+	 * refused, and a locally initiated close takes the same labelled
+	 * acknowledgement the operator force close does.
+	 *
+	 * What remains are the two exits that are actually safe: the operator's
+	 * explicit force close, never gated by this, and the PEER's own unilateral
+	 * close, which the 5.6 disposition asks for on every reconnect and which
+	 * pays our to_remote at the peer's state, never at less than we are owed.
+	 * MUST persist: a restart must not forget the restriction.
+	 */
+	restoreRecencyUnproven?: boolean;
+	/**
+	 * The operator's labelled acknowledgement (RECOVERY-PROTOCOL 5.6) that a
+	 * mutual close of this capsule-restored channel may sign away balances the
+	 * row cannot prove current (issue #469). Stamped only by initiateShutdown
+	 * when acceptStaleStateRisk (exact true) accompanies the local close, and
+	 * it covers the WHOLE negotiation: the peer's mandatory shutdown reply and
+	 * every closing signature stage consult it, because each of them advances
+	 * or signs the same stale split the initiation was warned about. Persisted
+	 * so a disconnect or restart inside the negotiation does not turn an
+	 * authorized close into a refusal.
+	 */
+	staleCloseRiskAccepted?: boolean;
 	/**
 	 * Recovery 5.6 liveness: the channel was routed to the DLP path and the
 	 * peer must force-close it. The wire error asking for that close can be

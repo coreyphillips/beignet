@@ -146,6 +146,8 @@ export interface ISerializedHtlcEntry {
 	forwardEmitted?: boolean;
 	/** Admission-time dust-exposure classification (see IHtlcEntry). */
 	dustExposureFailback?: boolean;
+	/** Admitted while the capsule-restore hold stood (see IHtlcEntry). */
+	addedWhileRestoreUnproven?: boolean;
 }
 
 export interface ISerializedHtlcSnapshot {
@@ -194,6 +196,9 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.dustExposureFailback !== undefined
 			? { dustExposureFailback: e.dustExposureFailback }
+			: {}),
+		...(e.addedWhileRestoreUnproven !== undefined
+			? { addedWhileRestoreUnproven: e.addedWhileRestoreUnproven }
 			: {})
 	};
 }
@@ -235,6 +240,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.dustExposureFailback !== undefined
 				? { dustExposureFailback: s.dustExposureFailback }
+				: {}),
+			...(s.addedWhileRestoreUnproven !== undefined
+				? { addedWhileRestoreUnproven: s.addedWhileRestoreUnproven }
 				: {})
 		}
 	};
@@ -443,9 +451,33 @@ export interface ISerializedChannelState {
 	// restart of a possibly-stale restore must not forget that broadcasting
 	// is forbidden until reestablish proves the state current.
 	stateUncertain?: boolean;
+	// Issue #479: funding outpoints a splice superseded whose spend must still
+	// be watched, with the splice tx expected to spend each. MUST persist -
+	// spliceInFlight is cleared at splice_locked, so it cannot rebuild this
+	// watch after a restart, and the old outpoint would go unwatched.
+	preSpliceSpendWatches?: Array<{
+		txid: string;
+		outputIndex: number;
+		script: string;
+		spliceTxid: string;
+	}>;
+	// Issue #469: this row came from a Recovery Capsule, whose recency nothing
+	// can prove. MUST persist - a restart must not forget that an AUTOMATIC
+	// commitment broadcast is forbidden.
+	restoreRecencyUnproven?: boolean;
+	// Issue #469: the operator acknowledged the stale-close risk when
+	// initiating a mutual close of the row above. MUST persist - a restart
+	// inside the negotiation must not turn the authorized close into a
+	// refusal.
+	staleCloseRiskAccepted?: boolean;
 	// Recovery 5.6 liveness: the persisted peer-close disposition; the wire
-	// error is regenerated from this on every reconnect.
-	recoveryCloseReason?: 'local-data-loss' | 'state-uncertain';
+	// error is regenerated from this on every reconnect. 'restore-unproven' is
+	// DERIVED from the flag above rather than stamped, so it is never written
+	// here; the union carries it so the two types stay one shape.
+	recoveryCloseReason?:
+		| 'local-data-loss'
+		| 'state-uncertain'
+		| 'restore-unproven';
 	// Why WE closed the channel ('user' or an automatic close code).
 	closeReason?: ChannelCloseReason;
 	dlpRemotePerCommitmentPoint?: string | null;
@@ -841,6 +873,11 @@ export function serializeChannelState(
 		dataLossDetected: s.dataLossDetected,
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
+		restoreRecencyUnproven: s.restoreRecencyUnproven,
+		staleCloseRiskAccepted: s.staleCloseRiskAccepted,
+		preSpliceSpendWatches: s.preSpliceSpendWatches?.length
+			? s.preSpliceSpendWatches.map((w) => ({ ...w }))
+			: undefined,
 		recoveryCloseReason: s.recoveryCloseReason,
 		closeReason: s.closeReason,
 		dlpRemotePerCommitmentPoint: bufToHex(s.dlpRemotePerCommitmentPoint ?? null)
@@ -1030,6 +1067,11 @@ export function deserializeChannelState(
 		dataLossDetected: s.dataLossDetected,
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
+		restoreRecencyUnproven: s.restoreRecencyUnproven,
+		staleCloseRiskAccepted: s.staleCloseRiskAccepted,
+		preSpliceSpendWatches: s.preSpliceSpendWatches?.length
+			? s.preSpliceSpendWatches.map((w) => ({ ...w }))
+			: undefined,
 		recoveryCloseReason: s.recoveryCloseReason,
 		closeReason: s.closeReason,
 		dlpRemotePerCommitmentPoint:

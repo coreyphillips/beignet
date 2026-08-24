@@ -15,6 +15,7 @@ export enum ChannelActionType {
 	BROADCAST_TX = 'BROADCAST_TX',
 	AUTHORIZE_FUNDING_BROADCAST = 'AUTHORIZE_FUNDING_BROADCAST',
 	WATCH_FUNDING = 'WATCH_FUNDING',
+	WATCH_PRESPLICE_SPEND = 'WATCH_PRESPLICE_SPEND',
 	CHANNEL_READY = 'CHANNEL_READY',
 	CHANNEL_CLOSED = 'CHANNEL_CLOSED',
 	ERROR = 'ERROR',
@@ -102,6 +103,29 @@ export interface IWatchFundingAction {
 	fundingTxid: Buffer;
 	fundingOutputIndex: number;
 	minimumDepth: number;
+}
+
+/**
+ * Arm chain spend detection on every superseded funding outpoint this channel
+ * has recorded, and MOVE NOTHING (issue #479).
+ *
+ * Separate from WATCH_FUNDING because the two answer different questions, and
+ * the point of no return needs only one of them. WATCH_FUNDING re-keys the
+ * channel's single funding watch onto a new outpoint; at the first
+ * tx_signatures release that outpoint's transaction has not been broadcast and
+ * cannot be by us, so moving the watch there would abandon the live, confirmed
+ * old outpoint and start the forget clock against a transaction that may never
+ * exist. This arms the legs under their own per-outpoint keys instead, so the
+ * channel's funding watch stays exactly where it is.
+ *
+ * Carries the channel id rather than the legs themselves: the record was
+ * written before this action was built, and completeSplice never touches the
+ * list, so reading it at dispatch time is not the zero-conf race that reading
+ * fundingTxid there would be.
+ */
+export interface IWatchPreSpliceSpendAction {
+	type: ChannelActionType.WATCH_PRESPLICE_SPEND;
+	channelId: Buffer;
 }
 
 export interface IChannelReadyAction {
@@ -430,6 +454,7 @@ export type ChannelAction =
 	| IBroadcastTxAction
 	| IAuthorizeFundingBroadcastAction
 	| IWatchFundingAction
+	| IWatchPreSpliceSpendAction
 	| IChannelReadyAction
 	| IChannelClosedAction
 	| IErrorAction

@@ -282,6 +282,21 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 			};
 		}
 
+		it('never plans through a channel that refuses new HTLCs', function () {
+			// A rebalance is two new HTLCs, so a channel that refuses them
+			// cannot be either leg. A capsule-restored channel holding for
+			// unproven recency is NORMAL with a real balance and refuses
+			// everything, and the planner used to nominate it as the obvious
+			// donor (issue #469).
+			const held = { ...snap('aa', 950_000), htlcUsable: false };
+			expect(planRebalances([held, snap('bb', 50_000)])).to.have.length(0);
+			// Absent still means "judge by the state", for callers that do not
+			// populate the field at all.
+			expect(
+				planRebalances([snap('aa', 950_000), snap('bb', 50_000)])
+			).to.have.length(1);
+		});
+
 		it('pairs a saturated channel with a depleted one toward 50/50', function () {
 			const plans = planRebalances([snap('aa', 950_000), snap('bb', 50_000)]);
 			expect(plans).to.have.length(1);

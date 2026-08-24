@@ -36,6 +36,7 @@ import {
 	IChannelReadyMessage
 } from '../message/channel-funding';
 import {
+	decodeUpdateAddHtlcMessage,
 	encodeUpdateAddHtlcMessage,
 	IUpdateAddHtlcMessage,
 	encodeUpdateFulfillHtlcMessage,
@@ -91,6 +92,7 @@ import {
 	DEFAULT_CHANNEL_CONFIG
 } from './types';
 import {
+	IAbandonedLocalAdd,
 	IChannelState,
 	IRemoteForwardingPolicy,
 	ISpliceInFlight,
@@ -2638,6 +2640,26 @@ export class Channel {
 			];
 		}
 
+		// A capsule-restored channel whose recency cannot be proven takes no NEW
+		// HTLCs (issue #469). Its HTLC deadline backstops can never fire, since
+		// every automatic close is refused for as long as the hold stands, and
+		// an HTLC whose only on-chain enforcement this node has disarmed is a
+		// bounded risk turning into an unbounded one: the peer can simply stall
+		// and we have nothing to escalate to. Existing HTLCs still settle and
+		// fail off chain, and the channel can still be closed with the
+		// operator's acknowledged cooperative close or by the peer.
+		if (this._state.restoreRecencyUnproven === true) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot add HTLC: channel was restored from a Recovery Capsule ' +
+						'and its state cannot be proven current, so its on-chain HTLC ' +
+						'backstops are disabled'
+				}
+			];
+		}
+
 		// Reject during quiescence.
 		if (this._quiescence.isQuiescing()) {
 			return [
@@ -2985,7 +3007,13 @@ export class Channel {
 			direction: HtlcDirection.RECEIVED,
 			state: HtlcState.PENDING,
 			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {}),
-			...(dustExposureFailback ? { dustExposureFailback: true } : {})
+			...(dustExposureFailback ? { dustExposureFailback: true } : {}),
+			// Provenance for the capsule-restore hold (issue #469): only an add
+			// admitted while the hold already stood is refused by the node; one
+			// already committed in the capsule predates it and still settles.
+			...(this._state.restoreRecencyUnproven === true
+				? { addedWhileRestoreUnproven: true }
+				: {})
 		};
 
 		// The reserve check above is measured against the reserve WE enforce,
@@ -3073,13 +3101,7 @@ export class Channel {
 	 * guards of fulfillHtlc below; keep the two in step.
 	 */
 	canFulfillHtlc(htlcId: bigint): boolean {
-		if (
-			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN &&
-			!this.canUpdateHtlcsDuringSplice()
-		) {
-			return false;
-		}
+		if (!this.canSettleHtlcs()) return false;
 		const entry = this._state.htlcs.get(`received-${htlcId}`);
 		if (!entry) return false;
 		return (
@@ -5021,6 +5043,16 @@ export class Channel {
 			s.state === ChannelState.FORCE_CLOSED ||
 			s.state === ChannelState.ERRORED
 		) {
+			// ...unless the capsule restore hold is on, in which case no
+			// automatic close will ever run and reporting ForceClosing would
+			// tell an operator a close is under way when the channel is
+			// waiting on the peer or on them (issue #469).
+			if (
+				s.state === ChannelState.ERRORED &&
+				s.restoreRecencyUnproven === true
+			) {
+				return ChannelRecoveryStatus.RestoreRecencyUnproven;
+			}
 			// ERRORED without a stale flag is recovered by broadcasting our
 			// latest commitment (the BOLT 1 prescription for a received
 			// error), so it is on the force-close path.
@@ -5057,6 +5089,16 @@ export class Channel {
 		}
 		if (this._state.dataLossDetected) return 'local-data-loss';
 		if (this._state.stateUncertain) return 'state-uncertain';
+		// A capsule-restored row the peer has not confirmed yet (issue #469).
+		// DERIVED and never stamped by _ensureRecoveryCloseDisposition, unlike
+		// the two above: deriving keeps the disposition answerable to the flag
+		// rather than to a field some transition remembered to set. It is what
+		// stops the automatic-close gate becoming a trapdoor: an
+		// ERRORED row never reaches Channel.handleReestablish at all, because
+		// ChannelManager answers a reestablish for one with a wire error, so
+		// without a peer-close request such a channel would wait forever with
+		// nothing driving it anywhere.
+		if (this._state.restoreRecencyUnproven) return 'restore-unproven';
 		return undefined;
 	}
 
@@ -5083,6 +5125,94 @@ export class Channel {
 	}
 
 	/**
+	 * An irrecoverable reestablish counter gap on a channel whose automatic
+	 * closes are held (issue #469).
+	 *
+	 * These two branches are a dead end by construction: the peer names a
+	 * commitment or revocation this node never produced, so nothing can be
+	 * retransmitted and the exchange cannot complete. On an ordinary channel
+	 * that is survivable, because the reestablish-timeout backstop force-closes
+	 * it after `reestablishTimeoutBlocks`. On a held one that backstop is
+	 * refused forever, and the bare error these used to return leaves the
+	 * channel in AWAITING_REESTABLISH with no durable disposition, so
+	 * hasRecoveryCloseDisposition stays false and not even the peer-close
+	 * request goes out: a channel with no exit at all.
+	 *
+	 * So the failure is made terminal and durable here, which is what puts it
+	 * on the 5.6 path the hold already assumes: ERRORED plus a persist, after
+	 * which the derived `restore-unproven` disposition asks the peer to close
+	 * on this and every later reconnect.
+	 */
+	/**
+	 * A peer-initiated cooperative close on a channel whose restored balances
+	 * cannot be proven current (issue #469).
+	 *
+	 * Shaped exactly like the reestablish-gap failure below and for the same
+	 * reason: refusing has to leave the channel somewhere, and the only place
+	 * that moves it is the 5.6 peer-close disposition. ERRORED plus a persist,
+	 * after which the derived `restore-unproven` reason asks the peer to close
+	 * on this and every later reconnect.
+	 */
+	private _heldCooperativeCloseRefusal(message: string): ChannelAction[] {
+		this._state.state = ChannelState.ERRORED;
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			...this.buildRecoveryCloseActions().filter(
+				(a) => a.type !== ChannelActionType.PERSIST_STATE
+			),
+			{ type: ChannelActionType.ERROR, message }
+		];
+	}
+
+	/**
+	 * Whether a mutual close is refused on this channel: restored from a
+	 * Recovery Capsule, balances unproven, and no operator acknowledgement
+	 * covering the negotiation (issue #469). One predicate so the shutdown
+	 * handler, every closing signature stage and the manager's post-reestablish
+	 * resume all answer the same question the same way: the acknowledgement is
+	 * negotiation-wide, not a property of the initiating call alone, because
+	 * the peer's mandatory shutdown reply and each signing stage advance the
+	 * same stale split the initiation was warned about.
+	 */
+	isMutualCloseHeld(): boolean {
+		return (
+			this._state.restoreRecencyUnproven === true &&
+			this._state.staleCloseRiskAccepted !== true
+		);
+	}
+
+	/**
+	 * The manager's entry to the held-close refusal, for a channel restored
+	 * MID-close surfacing at reestablish: resuming the negotiation is exactly
+	 * what must not run, but doing nothing leaves the row in SHUTTING_DOWN or
+	 * NEGOTIATING_CLOSING with nothing else driving it anywhere. Terminal and
+	 * durable instead, so the 5.6 disposition asks the peer to close.
+	 */
+	refuseHeldMutualClose(): ChannelAction[] {
+		return this._heldCooperativeCloseRefusal(
+			'Cannot resume cooperative close: this channel was restored from a ' +
+				'Recovery Capsule and its balances cannot be proven current; ' +
+				'awaiting your force close instead'
+		);
+	}
+
+	private _heldReestablishGapFailure(message: string): ChannelAction[] {
+		if (this._state.restoreRecencyUnproven !== true) {
+			return [{ type: ChannelActionType.ERROR, message }];
+		}
+		this._state.state = ChannelState.ERRORED;
+		return [
+			// Persist FIRST, exactly as the DLP arms above: a crash between
+			// this and the socket must not forget that the peer has to close.
+			{ type: ChannelActionType.PERSIST_STATE },
+			...this.buildRecoveryCloseActions().filter(
+				(a) => a.type !== ChannelActionType.PERSIST_STATE
+			),
+			{ type: ChannelActionType.ERROR, message }
+		];
+	}
+
+	/**
 	 * The durable peer-close request (recovery 5.6). The original wire error
 	 * can be lost to a crash between the ERRORED persist and the socket
 	 * (ERROR is deliberately not in the retransmission outbox), so the
@@ -5095,6 +5225,8 @@ export class Channel {
 		const data =
 			reason === 'local-data-loss'
 				? 'peer proved our channel state is stale (data loss); awaiting your force close'
+				: reason === 'restore-unproven'
+				? 'restored channel state has not been confirmed by channel_reestablish (recovery); awaiting your force close'
 				: 'restored channel state cannot be proven current (recovery); awaiting your force close';
 		return [
 			// The persist leads, exactly as it does at the two sites that first
@@ -5548,7 +5680,65 @@ export class Channel {
 	/**
 	 * Initiate cooperative close by sending shutdown.
 	 */
-	initiateShutdown(scriptPubkey: Buffer): ChannelAction[] {
+	initiateShutdown(
+		scriptPubkey: Buffer,
+		/**
+		 * The labelled acknowledgement RECOVERY-PROTOCOL 5.6 asks for, the
+		 * same one the operator force close takes. Required only on a channel
+		 * restored from a Recovery Capsule, whose BALANCES nothing can prove
+		 * current (issue #469).
+		 */
+		acceptStaleStateRisk = false
+	): ChannelAction[] {
+		// A mutual close needs no revocation, which is why the hold allows the
+		// channel to resume - but it pays out the balances THIS row carries,
+		// and a stale capsule's allocation can only ever be the peer-favourable
+		// one: any payment received after the checkpoint is missing from it. A
+		// peer holding the newer state can under-report compatible reestablish
+		// counters, ask to close, and validly sign the older split. Signing it
+		// is a loss with no penalty attached and no way back.
+		//
+		// The exits that remain are both safe and both already exist: the
+		// operator's explicit force close, and the peer's own unilateral close,
+		// which the 5.6 disposition asks for on every reconnect and which pays
+		// us our to_remote at THEIR state, never at less than we are owed.
+		//
+		// Exact true only: the acknowledgement is authorization, and a JS
+		// caller passing a truthy non-boolean ('false', 1) must not spend it.
+		const acknowledged = acceptStaleStateRisk === true;
+		if (this.isMutualCloseHeld() && !acknowledged) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot close cooperatively: channel was restored from a ' +
+						'Recovery Capsule and its balances cannot be proven current, ' +
+						'so a mutual close may sign away funds received after the ' +
+						'capsule was written',
+					cleanup: 'none'
+				}
+			];
+		}
+		const actions = this._initiateShutdown(scriptPubkey);
+		if (
+			acknowledged &&
+			this._state.restoreRecencyUnproven === true &&
+			!actions.some((a) => a.type === ChannelActionType.ERROR)
+		) {
+			// The acknowledgement covers the whole negotiation, not just this
+			// call: the peer's mandatory shutdown reply and every closing
+			// signature stage consult it (isMutualCloseHeld), and a disconnect
+			// or restart mid-negotiation must not turn the authorized close
+			// into a refusal. Persist leads the send so a crash between them
+			// cannot lose the authorization the retransmitted shutdown relies
+			// on.
+			this._state.staleCloseRiskAccepted = true;
+			return [{ type: ChannelActionType.PERSIST_STATE }, ...actions];
+		}
+		return actions;
+	}
+
+	private _initiateShutdown(scriptPubkey: Buffer): ChannelAction[] {
 		// option_simple_close allows re-sending shutdown to update the local
 		// script mid-negotiation (restarting the signing flow); legacy close
 		// only permits initiating from NORMAL.
@@ -5648,6 +5838,26 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected shutdown' }
 			];
+		}
+
+		// The peer asking to close is the same trap from the other side (issue
+		// #469 review). It would be OUR signature over a stale allocation, so
+		// the answer has to be the same: refuse, and stay on the 5.6 path that
+		// asks the peer to close unilaterally instead - which is safe for us,
+		// because its own commitment pays our to_remote at ITS state, never at
+		// less than we are owed. Terminal and persisted, so the disposition is
+		// durable and the request is regenerated on every reconnect.
+		//
+		// UNLESS the operator's acknowledgement covers the negotiation: after
+		// an acknowledged initiateShutdown the peer MUST reply with its own
+		// shutdown (BOLT 2), and refusing that reply would turn every
+		// authorized close into ERRORED at its first response.
+		if (this.isMutualCloseHeld()) {
+			return this._heldCooperativeCloseRefusal(
+				'Cannot close cooperatively: this channel was restored from a ' +
+					'Recovery Capsule and its balances cannot be proven current; ' +
+					'please force close instead'
+			);
 		}
 
 		// Simple-taproot close: the peer's shutdown MUST carry its MuSig2
@@ -5768,6 +5978,16 @@ export class Channel {
 			];
 		}
 
+		// A channel restored MID-close can reach every signing stage without
+		// ever passing the initiateShutdown gate, so each stage re-asks the
+		// question itself: proposing is signing (legacy closing_signed and the
+		// taproot partial both carry our signature over the restored split),
+		// and doing it unacknowledged is the loss the hold exists to prevent
+		// (issue #469).
+		if (this.isMutualCloseHeld()) {
+			return this.refuseHeldMutualClose();
+		}
+
 		// Fund-safety: the closing tx pays out localBalanceMsat/remoteBalanceMsat
 		// only, so any in-flight HTLC's value would be silently burned to fees.
 		// BOLT 2 forbids starting fee negotiation until all HTLCs are resolved.
@@ -5859,6 +6079,14 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected closing_signed' }
 			];
+		}
+
+		// Every closing signature stage re-asks the held-close question: a
+		// channel restored MID-close reaches here without ever passing the
+		// initiateShutdown gate, and answering would counter-sign the restored
+		// split (issue #469).
+		if (this.isMutualCloseHeld()) {
+			return this.refuseHeldMutualClose();
 		}
 
 		// Fund-safety: a peer MUST NOT send closing_signed while HTLCs are still
@@ -6308,6 +6536,13 @@ export class Channel {
 		) {
 			return err('Cannot send closing_complete: wrong state');
 		}
+		// Every closing signature stage re-asks the held-close question: a
+		// channel restored MID-close reaches here without ever passing the
+		// initiateShutdown gate, and closing_complete carries our signature
+		// over the restored split (issue #469).
+		if (this.isMutualCloseHeld()) {
+			return this.refuseHeldMutualClose();
+		}
 		if (
 			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
 			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
@@ -6456,6 +6691,15 @@ export class Channel {
 		) {
 			return err('Unexpected closing_complete');
 		}
+
+		// Every closing signature stage re-asks the held-close question: a
+		// channel restored MID-close reaches here without ever passing the
+		// initiateShutdown gate, and answering would sign the closee side of
+		// the restored split (issue #469). A held row can never have reached
+		// CLOSED, so the concurrent-close carve-out above is untouched.
+		if (this.isMutualCloseHeld()) {
+			return this.refuseHeldMutualClose();
+		}
 		if (
 			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
 			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
@@ -6596,6 +6840,15 @@ export class Channel {
 			!alreadyClosed
 		) {
 			return err('Unexpected closing_sig');
+		}
+
+		// Every closing signature stage re-asks the held-close question (issue
+		// #469): completing here broadcasts a close tx paying the restored
+		// split. Unreachable in practice while held, because the gate on
+		// sendClosingComplete means no closing_complete of ours is pending,
+		// but the refusal keeps the stages uniform.
+		if (this.isMutualCloseHeld()) {
+			return this.refuseHeldMutualClose();
 		}
 		const last = this._state.lastLocalClosingComplete;
 		if (!last || !this._state.awaitingClosingSig) {
@@ -6739,7 +6992,174 @@ export class Channel {
 		}
 	}
 
-	markForReestablish(): void {
+	/**
+	 * Drop the queued update_add_htlc messages no commitment_signed of ours
+	 * covers, on a channel whose restore could not prove its recency (issue
+	 * #469). Returns what was abandoned, so the caller can tell whoever is
+	 * still waiting on it.
+	 *
+	 * handleReestablish replays pendingLocalUpdates as raw bytes with no
+	 * inspection, which BOLT 2 requires: the peer forgets what it never
+	 * committed. On a HELD channel that replay re-offers an HTLC the channel is
+	 * forbidden to offer, because addHtlc refuses one outright - the on-chain
+	 * deadline backstops that would enforce it are disarmed for as long as the
+	 * hold stands, and the hold is permanent. Worse, the entry still carries
+	 * needsCommitment, so the reestablish tail's auto-sign would COMMIT it.
+	 *
+	 * Only indices at or above pendingLocalUpdatesSignedCount are eligible.
+	 * Everything below it is covered by our outstanding commitment_signed and
+	 * MUST be replayed, and removing one would shift the boundary that count
+	 * names. The entry vetoes independently: signCommitment stamps
+	 * commitCoverPending and flips PENDING to COMMITTED in the same pass that
+	 * sets the count, so only a PENDING entry with addRemoteCommitted false and
+	 * no commitCoverPending stamp may go.
+	 *
+	 * Such an add is in NEITHER commitment: buildLocalCommitment excludes our
+	 * offered adds while addRemoteCommitted is false, and the remote commitment
+	 * only ever gets one when we sign. So dropping it desyncs no signature, and
+	 * the peer's own reconnect rollback discards the uncommitted add it
+	 * received - the mirror of the loop above - so both sides converge on "it
+	 * never happened".
+	 *
+	 * localHtlcCounter is deliberately NOT rewound. Rewinding is the dangerous
+	 * option: it lets a later add reuse an id a peer that kept the original
+	 * still holds, which this implementation itself treats as channel-fatal.
+	 * The gap it would close can never be observed, because addHtlc refuses
+	 * every subsequent add on a held channel. That is why HELD-ONLY scoping is
+	 * load-bearing for correctness here and not merely conservative: dropping
+	 * unsigned local adds in general is a BOLT 2 deviation with nothing to
+	 * justify it, since an ordinary channel replays them and the HTLC completes.
+	 */
+	private _dropUnsignedLocalAddsIfHeld(): IAbandonedLocalAdd[] {
+		if (this._state.restoreRecencyUnproven !== true) return [];
+		const queue = this._state.pendingLocalUpdates ?? [];
+		const signed = this._state.pendingLocalUpdatesSignedCount;
+		if (queue.length <= signed) return [];
+
+		const kept = queue.slice(0, signed);
+		const dropped: IAbandonedLocalAdd[] = [];
+		for (let i = signed; i < queue.length; i++) {
+			const update = queue[i];
+			if (update.type !== MessageType.UPDATE_ADD_HTLC) {
+				kept.push(update);
+				continue;
+			}
+			let msg: IUpdateAddHtlcMessage;
+			try {
+				msg = decodeUpdateAddHtlcMessage(update.payload);
+			} catch {
+				// Undecodable: leave it exactly as it was rather than guess.
+				kept.push(update);
+				continue;
+			}
+			const key = `offered-${msg.id}`;
+			const entry = this._state.htlcs.get(key);
+			if (
+				entry &&
+				!(
+					entry.state === HtlcState.PENDING &&
+					entry.addRemoteCommitted === false &&
+					entry.commitCoverPending !== true
+				)
+			) {
+				// A signature of ours covers it: not ours to forget.
+				kept.push(update);
+				continue;
+			}
+			if (entry) {
+				this._state.htlcs.delete(key);
+				// The provisional debit addHtlc took comes back, the same
+				// arithmetic handleRevokeAndAck applies to a terminally failed
+				// offered HTLC.
+				this._state.localBalanceMsat += entry.amountMsat;
+			}
+			dropped.push({
+				htlcId: msg.id,
+				paymentHash: Buffer.from(entry?.paymentHash ?? msg.paymentHash),
+				amountMsat: entry?.amountMsat ?? msg.amountMsat
+			});
+		}
+		if (dropped.length === 0) return [];
+		this._state.pendingLocalUpdates = kept;
+		// signedCount is untouched: nothing at or below the boundary moved.
+		if (!this._owesCommitmentSignature()) {
+			this._state.needsCommitment = false;
+		}
+		return dropped;
+	}
+
+	/**
+	 * Whether anything still owes the peer a commitment_signed, mirroring every
+	 * site that sets needsCommitment.
+	 *
+	 * Needed because autoSignAndSendCommitment gates on that flag alone, with
+	 * no "would this commitment differ" test. If a dropped add was the only
+	 * reason it was set, the reestablish tail would send a commitment_signed
+	 * covering no updates, which BOLT 2 forbids and which CLN answers with an
+	 * error - force-closing the one channel that must not be force-closed.
+	 *
+	 * Conservative by construction: it answers true whenever it is not certain,
+	 * because a wrongly kept flag costs one redundant round while a wrongly
+	 * cleared one stalls the channel until an unrelated update revives it.
+	 */
+	private _owesCommitmentSignature(): boolean {
+		if (
+			this._state.pendingLocalUpdates.length >
+			this._state.pendingLocalUpdatesSignedCount
+		) {
+			return true;
+		}
+		if (
+			this._state.pendingFeeratePerKw !== undefined &&
+			this._state.pendingFeerateCommitted !== true
+		) {
+			return true;
+		}
+		if (
+			this._state.pendingLeaseBlockheight !== undefined &&
+			this._state.pendingLeaseBlockheightCommitted !== true
+		) {
+			return true;
+		}
+		// A peer update we have revoked for but not yet covered by a signature
+		// of ours: handleCommitmentSigned sets the flag for exactly these, and
+		// signCommitment stamps commitCoverPending when it covers them.
+		for (const entry of this._state.htlcs.values()) {
+			if (entry.commitCoverPending === true) continue;
+			if (
+				entry.addLocallyRevoked === true &&
+				entry.state === HtlcState.PENDING
+			) {
+				return true;
+			}
+			if (
+				entry.removalLocallyRevoked === true &&
+				entry.removalRemoteCommitted !== true &&
+				(entry.state === HtlcState.FULFILLED ||
+					entry.state === HtlcState.FAILED)
+			) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * The unsigned-add rollback ALONE, for a row that is already wrapped in
+	 * AWAITING_REESTABLISH (issue #469).
+	 *
+	 * A capsule can hold a channel persisted mid-reestablish, and
+	 * markForReestablish deliberately refuses that state: re-wrapping it would
+	 * overwrite `preReestablishState` with AWAITING_REESTABLISH and lose the
+	 * state the channel is supposed to return to. But the drop still has to
+	 * run, or handleReestablish replays an add the hold forbids the moment the
+	 * peer reconnects.
+	 */
+	dropUnsignedHeldAdds(): IAbandonedLocalAdd[] {
+		return this._dropUnsignedLocalAddsIfHeld();
+	}
+
+	markForReestablish(): IAbandonedLocalAdd[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
@@ -6750,7 +7170,7 @@ export class Channel {
 			this._state.state !== ChannelState.AWAITING_TX_SIGNATURES &&
 			this._state.state !== ChannelState.DUAL_FUNDING_V2
 		) {
-			return; // Only mark operational, funded or resumable-open channels
+			return []; // Only mark operational, funded or resumable-open channels
 		}
 
 		// A disconnect aborts any quiescence handshake, so a splice we were waiting
@@ -6798,7 +7218,7 @@ export class Channel {
 				this._resetV2Driver();
 				this._state.v2InFlight = null;
 				this._state.state = ChannelState.ERRORED;
-				return;
+				return [];
 			}
 		}
 
@@ -6869,7 +7289,9 @@ export class Channel {
 		// debits remoteBalanceMsat and leaks an HTLC slot, and (b) make the
 		// id-only add dedup swallow a reused id carrying a DIFFERENT HTLC,
 		// desyncing the commitment. (Our own uncommitted updates are the
-		// opposite case: they stay and replay via pendingLocalUpdates.)
+		// opposite case: they stay and replay via pendingLocalUpdates - except
+		// an ADD on a held restore, which the block at the end of this method
+		// drops, for the reason argued there.)
 		for (const [key, entry] of this._state.htlcs) {
 			// A peer add never covered by the peer's commitment_signed
 			// (addLocallyRevoked flips in handleCommitmentSigned).
@@ -6932,6 +7354,13 @@ export class Channel {
 		) {
 			this._state.pendingLeaseBlockheight = undefined;
 		}
+
+		// Last, after every other rollback, so the commitment-owed test sees
+		// the final fee and blockheight state. Here rather than in
+		// handleReestablish so it also beats the reestablish tail's auto-sign,
+		// which would otherwise commit a restored unsigned add on the one
+		// channel whose commitment must never move (issue #469).
+		return this._dropUnsignedLocalAddsIfHeld();
 	}
 
 	/**
@@ -8126,12 +8555,9 @@ export class Channel {
 		// We've created up to remoteCommitmentNumber commitments for them.
 		if (msg.nextCommitmentNumber > this._state.remoteCommitmentNumber + 1n) {
 			// Peer expects a commitment we've never created — irrecoverable gap
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Remote expects future commitment we have not created'
-				}
-			];
+			return this._heldReestablishGapFailure(
+				'Remote expects future commitment we have not created'
+			);
 		}
 
 		// ── Revocation retransmission logic ──
@@ -8145,12 +8571,9 @@ export class Channel {
 		// normally. Only a larger gap is irrecoverable.
 		if (msg.nextRevocationNumber > this._state.localCommitmentNumber + 1n) {
 			// Peer expects a revocation we've never created — irrecoverable
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Remote expects future revocation we have not sent'
-				}
-			];
+			return this._heldReestablishGapFailure(
+				'Remote expects future revocation we have not sent'
+			);
 		}
 
 		// Collected separately from `actions`: when the peer missed BOTH our
@@ -8460,6 +8883,26 @@ export class Channel {
 		)
 			? 'replay'
 			: 'clean';
+
+		// NOTE (issue #469): a compatible reestablish does NOT lift
+		// restoreRecencyUnproven, and deliberately so. Compatibility is not
+		// recency. BOLT 2's stale-state proof runs one way only: a valid
+		// FUTURE secret proves we fell behind, but nothing in
+		// channel_reestablish attests the peer's HIGHEST state, and the peer
+		// holding our capsule is the same peer we would be trusting here. One
+		// that holds N+1 can under-report N-compatible counters and replay the
+		// old secret it already has, wait for an automatic close to publish
+		// revoked state N, and take the channel through the justice path. This
+		// is the same reasoning the stateUncertain arm above states at length.
+		//
+		// The hold is therefore permanent, and that IS the protection: the
+		// attack needs US to broadcast. A peer that never gets a revoked
+		// commitment out of us has to close with a state we can sweep from, or
+		// leave the channel open. Resuming is still safe to allow, which is
+		// what keeps this narrower than stateUncertain and keeps issue #462's
+		// fix working; only the unilateral broadcast we would choose on our
+		// own is refused, and the operator's explicit force close remains the
+		// labelled exit (5.6).
 
 		// Persist before ANY of the above reaches the peer
 		// (docs/RECOVERY-PROTOCOL.md 5.1). Reestablish both mutates state (the
@@ -10570,6 +11013,51 @@ export class Channel {
 		);
 	}
 
+	/**
+	 * Whether this channel may take a NEW HTLC: it can carry traffic right now
+	 * AND its state is provably current.
+	 *
+	 * A capsule-restored channel whose recency cannot be proven answers false
+	 * (issue #469). Every automatic close is refused while the hold stands, so
+	 * its on-chain HTLC deadline backstops can never fire, and an obligation
+	 * taken on here has no enforcement behind it: the peer can simply stall.
+	 *
+	 * A SEPARATE predicate from isHtlcUsable rather than a clause inside it,
+	 * because existing HTLCs must still settle and fail off chain. Folding the
+	 * hold into isHtlcUsable stopped the deferred-settle drains, and a held
+	 * channel with a queued fulfill then never released its preimage - while
+	 * the on-chain claim that would otherwise have made up for it is exactly
+	 * what the hold disables.
+	 *
+	 * Answered in ONE place so "the router will offer it" and "the channel will
+	 * accept it" cannot disagree: a route the router still publishes is a part
+	 * that gets dispatched, and an MPP payment that sends a safe part before a
+	 * held part refuses locally leaves the first one locked to its mpp_timeout.
+	 */
+	acceptsNewHtlcs(lookThroughReestablish = false): boolean {
+		if (this._state.restoreRecencyUnproven === true) return false;
+		return this.isHtlcUsable(lookThroughReestablish);
+	}
+
+	/**
+	 * Whether update messages for an EXISTING HTLC may be exchanged right now:
+	 * the state test fulfillHtlc, failHtlc and failMalformedHtlc all run,
+	 * hoisted so the deferred drains ask the same question the settle itself
+	 * will.
+	 *
+	 * Deliberately wider than isHtlcUsable. SHUTTING_DOWN still settles (BOLT 2
+	 * forbids new adds after shutdown, not removals), and the recency hold does
+	 * not apply here at all: refusing to release a preimage on a held channel
+	 * is how a paid HTLC becomes unclaimable.
+	 */
+	canSettleHtlcs(): boolean {
+		return (
+			this._state.state === ChannelState.NORMAL ||
+			this._state.state === ChannelState.SHUTTING_DOWN ||
+			this.canUpdateHtlcsDuringSplice()
+		);
+	}
+
 	isSplicePendingLock(): boolean {
 		return (
 			this._state.state === ChannelState.SPLICING &&
@@ -11058,6 +11546,15 @@ export class Channel {
 		this._state.spliceFundingTxid = signed.spliceTxid;
 		this._state.spliceFundingOutputIndex = signed.newFundingOutputIndex;
 		this._syncSpliceInFlight({ sentTxSignatures: true });
+		// The old outpoint becomes attackable at this same point of no return:
+		// once our signature is out the peer can complete and broadcast the
+		// splice, and a peer that instead evicts it and publishes a revoked
+		// pre-splice commitment spends the OLD output. No WATCH_FUNDING is in
+		// this batch (the watch moves when the transaction is actually
+		// broadcast), so without recording the leg here a crash between now and
+		// the peer's tx_signatures would restore a channel watching only an
+		// outpoint that does not exist yet (issue #479).
+		const armPreSplice = this._recordPreSpliceSpendWatch(signed.spliceTxid);
 
 		// Our shared-input (2-of-2 funding) signature travels in the
 		// shared_input_signature TLV; witnesses carry only the stacks for the
@@ -11069,7 +11566,27 @@ export class Channel {
 			sharedInputSignature: signed.signature
 		};
 		const actions: ChannelAction[] = [
+			// Persist the records, then arm both watches, then let our
+			// signature out. In that order: what is on disk must survive a
+			// crash that leaves the peer able to broadcast, and both watches
+			// must be live before the peer can be told it may.
 			{ type: ChannelActionType.PERSIST_STATE },
+			...armPreSplice,
+			// The NEW output needs covering here too, not only at broadcast.
+			// Our signature completes the shared 2-of-2 input, so from the
+			// moment it leaves the peer can publish the splice - and its own
+			// commitment on the spliced funding, which it already holds our
+			// signature for - while withholding its tx_signatures. Arming only
+			// the old-outpoint leg left that output unwatched, so the splice
+			// could confirm unseen; and once the leg retired at depth the
+			// channel's own watch, still on the old outpoint, read the very
+			// same splice as a close.
+			{
+				type: ChannelActionType.WATCH_FUNDING,
+				fundingTxid: signed.spliceTxid,
+				fundingOutputIndex: signed.newFundingOutputIndex,
+				minimumDepth: this._state.minimumDepth
+			},
 			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg))
 		];
 		// Zero-conf: when the peer's tx_signatures arrived before ours (this
@@ -14170,6 +14687,116 @@ export class Channel {
 	}
 
 	/**
+	 * Record, durably and with its OWN script, the funding outpoint this splice
+	 * is about to supersede (issue #479).
+	 *
+	 * Called where the splice's WATCH_FUNDING is pushed, which is where the
+	 * channel's own funding watch MOVES to the new outpoint and the old one
+	 * stops being covered. Two things make that the right moment and this the
+	 * right layer:
+	 *
+	 * - It runs while the action array is still being BUILT, so completeSplice
+	 *   has not adopted the new funding yet and `fundingTxid`, the output
+	 *   index and `remoteBasepoints.fundingPubkey` are all still the
+	 *   pre-splice ones. On a zero-conf channel splice_locked leaves in this
+	 *   same batch, so anything reading channel state afterwards, including
+	 *   the node's own watch:funding handler, may already see the post-splice
+	 *   values.
+	 * - The batch's PERSIST_STATE therefore carries this record, which puts it
+	 *   on disk before the transaction that supersedes the outpoint is
+	 *   authorized to reach the network. A crash in between leaves the record,
+	 *   not a gap.
+	 *
+	 * The script is stored rather than recomputed because a splice may rotate
+	 * the peer's funding pubkey, so the channel's later funding script can
+	 * hash to something this output never paid.
+	 *
+	 * RETURNS the action that arms the watch, rather than leaving arming to
+	 * whatever the caller remembers to push next to it. Three of the four call
+	 * sites got arming for free from a WATCH_FUNDING they happened to emit
+	 * anyway; the fourth is the EARLIEST point of no return, it emits no
+	 * WATCH_FUNDING because the splice transaction has not been broadcast, and
+	 * it therefore left the superseded outpoint with no live subscription at
+	 * all between our signature leaving and the peer's arriving.
+	 */
+	private _recordPreSpliceSpendWatch(spliceTxid: Buffer): ChannelAction[] {
+		const fundingTxid = this._state.fundingTxid;
+		if (!fundingTxid || !this._state.remoteBasepoints) return [];
+		const txid = Buffer.from(fundingTxid).reverse().toString('hex');
+		const outputIndex = this._state.fundingOutputIndex;
+		const existing = this._state.preSpliceSpendWatches ?? [];
+		if (
+			existing.some((w) => w.txid === txid && w.outputIndex === outputIndex)
+		) {
+			// Already recorded, but still arm: arming is idempotent per
+			// outpoint, and a refusal path re-entered after a reconnect has to
+			// be able to put the watch back.
+			return this._armPreSpliceSpendWatches();
+		}
+		const script = isTaprootChannel(this._state.channelType)
+			? createTaprootFundingScript(
+					this._state.localBasepoints.fundingPubkey,
+					this._state.remoteBasepoints.fundingPubkey
+			  ).p2trOutput
+			: createFundingScript(
+					this._state.localBasepoints.fundingPubkey,
+					this._state.remoteBasepoints.fundingPubkey
+			  ).p2wshOutput;
+		this._state.preSpliceSpendWatches = [
+			...existing,
+			{
+				txid,
+				outputIndex,
+				script: script.toString('hex'),
+				spliceTxid: Buffer.from(spliceTxid).reverse().toString('hex')
+			}
+		];
+		return this._armPreSpliceSpendWatches();
+	}
+
+	/** The action that arms every pre-splice leg this channel has recorded. */
+	private _armPreSpliceSpendWatches(): ChannelAction[] {
+		const channelId = this._state.channelId;
+		if (!channelId) return [];
+		return [{ type: ChannelActionType.WATCH_PRESPLICE_SPEND, channelId }];
+	}
+
+	/**
+	 * Record the still-current funding outpoint as the pre-splice spend watch
+	 * for the splice in flight, for a row written before `preSpliceSpendWatches`
+	 * existed that was mid-splice when the node upgraded (issue #479). Returns
+	 * whether the list changed, so the caller knows to persist.
+	 *
+	 * Legal ONLY while `spliceInFlight` is set, and that is exactly what makes
+	 * the derivation sound rather than a guess: completeSplice has not adopted
+	 * the new funding, so `fundingTxid` is still the outpoint the splice will
+	 * supersede and `remoteBasepoints.fundingPubkey` is still the PRE-splice
+	 * key. The same derivation is wrong the moment the splice locks, because a
+	 * splice may rotate that key and completeSplice adopts the rotation.
+	 *
+	 * And ONLY past the point of no return. Before our tx_signatures leave,
+	 * nobody can broadcast that splice, so the outpoint needs no leg - while
+	 * recording one anyway makes it OUTLIVE the negotiation: such a splice can
+	 * still be safely aborted, and the record would then name a transaction
+	 * that will never exist. Legs are keyed per outpoint, so that stale entry
+	 * also blocks a later splice of the SAME outpoint from recording its real
+	 * expected spender, and the watcher would report that splice's own valid
+	 * transaction as a close.
+	 *
+	 * The channel derives it rather than the node, so the taproot branch, the
+	 * display-order conversion and the per-outpoint dedupe all live in one
+	 * place: the private writer this delegates to.
+	 */
+	recordInFlightPreSpliceSpendWatch(): boolean {
+		const record = this._state.spliceInFlight;
+		if (!record) return false;
+		if (record.sentTxSignatures !== true) return false;
+		const before = this._state.preSpliceSpendWatches?.length ?? 0;
+		this._recordPreSpliceSpendWatch(record.spliceTxid);
+		return (this._state.preSpliceSpendWatches?.length ?? 0) !== before;
+	}
+
+	/**
 	 * Build the non-terminal refusal batch for an unacceptable splice
 	 * tx_signatures: used by the wallet-witness arm, the after-sent txid
 	 * mismatch, and the defensive apply-failure arm, where the peer may still
@@ -14184,6 +14811,11 @@ export class Channel {
 		const refusal: ChannelAction[] = [];
 		const record = this._state.spliceInFlight;
 		if (record && (this._spliceSentTxSigs || record.sentTxSignatures)) {
+			// The leg it records has to reach disk: this batch is the only
+			// thing that knows about it, and nothing downstream of a refusal is
+			// guaranteed to persist.
+			refusal.push({ type: ChannelActionType.PERSIST_STATE });
+			refusal.push(...this._recordPreSpliceSpendWatch(record.spliceTxid));
 			refusal.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: record.spliceTxid,
@@ -14208,6 +14840,7 @@ export class Channel {
 		const actions: ChannelAction[] = [];
 		const record = this._state.spliceInFlight;
 		if (record && (this._spliceSentTxSigs || record.sentTxSignatures)) {
+			actions.push(...this._recordPreSpliceSpendWatch(record.spliceTxid));
 			actions.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: record.spliceTxid,
@@ -15100,6 +15733,7 @@ export class Channel {
 				tx: tx.toBuffer(),
 				fundingCritical: true
 			});
+			actions.push(...this._recordPreSpliceSpendWatch(spliceTxid));
 			actions.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: spliceTxid,

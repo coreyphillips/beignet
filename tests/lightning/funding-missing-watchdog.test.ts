@@ -222,6 +222,26 @@ describe('Channel voiding on funding:missing', function () {
 		)!;
 		alice.handleFundingConfirmed(channelId);
 		bob.handleFundingConfirmed(channelId);
+		// The shape this suite is about, and the only one BOLT 2's forget clock
+		// is for: NORMAL while the funding transaction has never reached the
+		// chain. A channel whose funding our OWN watcher has seen is never
+		// retired by absence (issue #481), so the zero-conf trust that let it
+		// go NORMAL early has to be on the row for the clock to run at all.
+		for (const node of [alice, bob]) {
+			const st = (
+				node as unknown as {
+					channelManager: {
+						getChannel: (id: Buffer) => {
+							getFullState: () => Record<string, unknown>;
+						};
+					};
+				}
+			).channelManager
+				.getChannel(channelId)
+				.getFullState();
+			st.zeroConfEnabled = true;
+			st.trustedPeer = true;
+		}
 		return { alice, bob, channelId };
 	}
 
@@ -262,6 +282,64 @@ describe('Channel voiding on funding:missing', function () {
 			'the channel is gone entirely (nothing to close)'
 		).to.equal(0);
 		expect(errors.some((e) => e.code === 'FUNDING_MISSING')).to.equal(true);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('never voids a channel whose funding this node has seen on chain (issue #481)', async function () {
+		// A splice that ends without its transaction confirming leaves the
+		// channel's funding watch on an outpoint that may never exist, and both
+		// the abort path and the zero-conf completeSplice null spliceInFlight
+		// while it does. Three absent answers plus BOLT 2's 2016 blocks then
+		// voided a live, funded channel, taking its monitor and its SCB entry
+		// with it. Only the chain may retire a channel (issue #463), and the
+		// chain has already spoken here.
+		const { alice, bob, channelId } = setupPair(902, 903);
+		await tick(60);
+
+		const state = (
+			alice as unknown as {
+				channelManager: {
+					getChannel: (id: Buffer) => {
+						getFullState: () => Record<string, unknown>;
+					};
+				};
+			}
+		).channelManager
+			.getChannel(channelId)
+			.getFullState();
+		// Our OWN watcher saw the funding reach depth; setupPair's zero-conf
+		// trust is what would otherwise deny that.
+		state.zeroConfEnabled = false;
+		state.trustedPeer = false;
+		// And the splice that superseded it has already been forgotten, which
+		// is exactly what used to lift the old guard.
+		state.spliceInFlight = null;
+
+		const voided: Buffer[] = [];
+		alice.removeAllListeners('node:error');
+		alice.on('node:error', () => undefined);
+		alice.on('channel:voided', (d: { channelId: Buffer }) =>
+			voided.push(d.channelId)
+		);
+
+		alice.handleNewBlock(700_000);
+		alice
+			.getChainWatcher()!
+			.emit('funding:missing', channelId, '44'.repeat(32));
+		alice.handleNewBlock(700_000 + 2016 * 2);
+		alice
+			.getChainWatcher()!
+			.emit('funding:missing', channelId, '44'.repeat(32));
+
+		expect(voided.length, 'the forget clock never reaches a verdict').to.equal(
+			0
+		);
+		expect(
+			alice.listChannels().length,
+			'and the channel is still here'
+		).to.equal(1);
 
 		alice.destroy();
 		bob.destroy();

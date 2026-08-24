@@ -72,6 +72,7 @@ import {
 	ChainActionType,
 	CommitmentType,
 	IFeeBumpAndBroadcastChainAction,
+	IFundingSpendScan,
 	satPerVbyteToSatPerKw
 } from '../chain/types';
 import {
@@ -1563,7 +1564,11 @@ export class ChannelManager extends EventEmitter {
 	/**
 	 * Initiate cooperative shutdown on a channel.
 	 */
-	initiateShutdown(channelId: Buffer, scriptPubkey: Buffer): ChannelResult {
+	initiateShutdown(
+		channelId: Buffer,
+		scriptPubkey: Buffer,
+		acceptStaleStateRisk = false
+	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
 		if (!channel) {
@@ -1582,7 +1587,10 @@ export class ChannelManager extends EventEmitter {
 		// the state machine runs (its script rules depend on it).
 		channel.setSimpleClose(this.peerNegotiatedSimpleClose(peerPubkey));
 
-		const actions = channel.initiateShutdown(scriptPubkey);
+		const actions = channel.initiateShutdown(
+			scriptPubkey,
+			acceptStaleStateRisk
+		);
 		this.processActions(peerPubkey, channel, actions);
 		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
 		if (errorAction) {
@@ -1748,7 +1756,7 @@ export class ChannelManager extends EventEmitter {
 				this.releaseRefusedV1FundingPledges(channel);
 				continue;
 			}
-			channel.markForReestablish();
+			this._rollbackForReestablish(channel);
 			// Quiescence never survives a disconnect (BOLT 2); retire the
 			// watchdog and release anything parked behind the session.
 			this._syncQuiescenceWatchdog(channel);
@@ -1828,7 +1836,7 @@ export class ChannelManager extends EventEmitter {
 				const idHex = channel.getChannelId()?.toString('hex');
 				if (idHex && this.channels.has(idHex)) {
 					this.purgeBarrierQueue(idHex);
-					channel.markForReestablish();
+					this._rollbackForReestablish(channel);
 					this.releaseDanglingV2Pledges(channel);
 					continue;
 				}
@@ -1869,6 +1877,63 @@ export class ChannelManager extends EventEmitter {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Send the durable peer-close request NOW, rather than waiting for the
+	 * next reconnect to regenerate it (recovery 5.6 liveness).
+	 *
+	 * handlePeerReconnected repeats the request on every reconnect, which
+	 * covers a crash between the ERRORED persist and the socket. It does not
+	 * cover a channel that reaches the held ERRORED state while the peer is
+	 * ALREADY connected, which is the ordinary case for a capsule-restored
+	 * channel the peer errors: nothing automatic will close it, and without
+	 * this both sides would sit waiting on each other until something else
+	 * happens to reconnect them (issue #469).
+	 *
+	 * Returns whether a request was actually sent; empty for a channel with no
+	 * recovery-close disposition, which is every ordinary error.
+	 */
+	sendRecoveryCloseRequest(channelId: Buffer): boolean {
+		const idHex = channelId.toString('hex');
+		const channel = this.getChannel(channelId);
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!channel || !peerPubkey) return false;
+		if (channel.getState() !== ChannelState.ERRORED) return false;
+		const actions = channel.buildRecoveryCloseActions();
+		if (actions.length === 0) return false;
+		this.processActions(peerPubkey, channel, actions);
+		return true;
+	}
+
+	/**
+	 * markForReestablish plus the report its rollback owes the node.
+	 *
+	 * Deferred out of this turn, exactly as the deferred-settle drain is: at
+	 * startup this runs from restoreChannel, and the node's forwarding
+	 * linkages, payment records and htlc-to-payment map are all loaded AFTER
+	 * the channels are, so a synchronous emit would look them up before they
+	 * exist. The durable backstops behind it (the owed-upstream pass, and the
+	 * stuck-payment sweep) cover a crash in between, so nothing here needs a
+	 * persisted marker of its own.
+	 */
+	private _rollbackForReestablish(channel: Channel): void {
+		// A row already wrapped in AWAITING_REESTABLISH gets the unsigned-add
+		// rollback WITHOUT being re-wrapped: markForReestablish refuses that
+		// state on purpose, because wrapping it again would overwrite
+		// preReestablishState with AWAITING_REESTABLISH and lose the state the
+		// channel is meant to return to. A capsule can hold exactly such a row,
+		// and without this the add it carries survives to be replayed (issue
+		// #469).
+		const abandoned =
+			channel.getState() === ChannelState.AWAITING_REESTABLISH
+				? channel.dropUnsignedHeldAdds()
+				: channel.markForReestablish();
+		if (abandoned.length === 0) return;
+		const channelId = channel.getChannelId() ?? channel.getTemporaryChannelId();
+		setImmediate(() => {
+			this.emit('htlc:local-add-abandoned', channelId, abandoned);
+		});
 	}
 
 	/**
@@ -1963,6 +2028,15 @@ export class ChannelManager extends EventEmitter {
 				st === ChannelState.AWAITING_FUNDING_CONFIRMED ||
 				st === ChannelState.AWAITING_CHANNEL_READY ||
 				st === ChannelState.SHUTTING_DOWN ||
+				// A close under negotiation must complete channel_reestablish
+				// before it resumes, exactly like any other operational state,
+				// and markForReestablish has always handled it; only this list
+				// left it out. A held channel makes the omission matter: it
+				// sends no reestablish, so it never reaches its timeout either.
+				st === ChannelState.NEGOTIATING_CLOSING ||
+				// Already wrapped by the session that persisted it. It is not
+				// re-wrapped, but it still owes the unsigned-add rollback.
+				st === ChannelState.AWAITING_REESTABLISH ||
 				st === ChannelState.SPLICING ||
 				// A v2 open is only reestablishable when the durable record made
 				// it resumable; a row persisted before the record existed keeps
@@ -1973,7 +2047,7 @@ export class ChannelManager extends EventEmitter {
 				(st === ChannelState.AWAITING_TX_SIGNATURES &&
 					channel.getFullState().v2InFlight != null)
 			) {
-				channel.markForReestablish();
+				this._rollbackForReestablish(channel);
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
@@ -2299,7 +2373,15 @@ export class ChannelManager extends EventEmitter {
 		feeRatePerVbyte = 10,
 		revocationBasepointSecret?: Buffer,
 		paymentPrivkey?: Buffer,
-		network?: import('bitcoinjs-lib').Network
+		network?: import('bitcoinjs-lib').Network,
+		// Which funding outpoint the reporting watch saw this transaction
+		// spend (issue #479). APPENDED, never inserted: ChannelManager is
+		// exported, and moving an existing optional argument breaks a
+		// TypeScript consumer's build and silently shifts a JavaScript
+		// consumer's key material and network into the wrong slots. The one
+		// production caller passing it writes the intervening arguments out,
+		// which is the cost of not breaking everyone else's.
+		spentOutpoint?: { txid: string; outputIndex: number }
 	): ChainAction[] {
 		const channelIdHex = channelId.toString('hex');
 		let monitor = this.monitors.get(channelIdHex);
@@ -2336,7 +2418,11 @@ export class ChannelManager extends EventEmitter {
 			this._seedMonitorPreimages(channelIdHex, monitor);
 		}
 
-		const chainActions = monitor.handleFundingSpent(spendingTx, blockHeight);
+		const chainActions = monitor.handleFundingSpent(
+			spendingTx,
+			blockHeight,
+			spentOutpoint
+		);
 		this.processChainActions(channelId, chainActions);
 
 		// Reconcile the channel state machine with the on-chain close so that
@@ -2372,14 +2458,23 @@ export class ChannelManager extends EventEmitter {
 	 * found NO spender: whatever spend this channel's monitor has recorded as
 	 * confirmed is no longer in the chain or the mempool (issue 352). Let the
 	 * monitor stop its irrevocable-depth clock until positive evidence returns.
+	 *
+	 * `scan` names the outpoint that evidence is about. The monitor decides
+	 * whether its record answers to it, because the record is the durable half
+	 * and the watcher's is not (issue #479). Returns whether anything was
+	 * actually retracted, so the caller can tell a verdict that landed from one
+	 * that was refused.
 	 */
-	handleFundingSpendAbsent(channelId: Buffer): void {
+	handleFundingSpendAbsent(
+		channelId: Buffer,
+		scan?: IFundingSpendScan
+	): boolean {
 		const channelIdHex = channelId.toString('hex');
 		const monitor = this.monitors.get(channelIdHex);
-		if (!monitor) return;
-		if (monitor.handleFundingSpendAbsent()) {
-			this.emit('monitor:updated', channelIdHex, monitor);
-		}
+		if (!monitor) return false;
+		if (!monitor.handleFundingSpendAbsent(scan)) return false;
+		this.emit('monitor:updated', channelIdHex, monitor);
+		return true;
 	}
 
 	/**
@@ -4788,6 +4883,21 @@ export class ChannelManager extends EventEmitter {
 			state === ChannelState.NEGOTIATING_CLOSING ||
 			state === ChannelState.SHUTTING_DOWN
 		) {
+			// A channel restored MID-close from a Recovery Capsule without the
+			// operator's acknowledgement must not resume the negotiation:
+			// every remaining stage signs the split the capsule carries, and
+			// even our retransmitted shutdown advertises a close we would then
+			// refuse (issue #469). Refuse terminally here instead, so the 5.6
+			// disposition asks the peer to close rather than the row sitting
+			// in a state nothing else drives.
+			if (channel.isMutualCloseHeld()) {
+				this.processActions(
+					peerPubkey,
+					channel,
+					channel.refuseHeldMutualClose()
+				);
+				return;
+			}
 			// Re-evaluate the negotiation path — features are per-connection —
 			// and abandon any in-flight closing_complete (its closing_sig can
 			// never arrive on the new connection; negotiation restarts per spec).
@@ -4857,7 +4967,14 @@ export class ChannelManager extends EventEmitter {
 		// the declared total with less money than it sent. The repair exists
 		// for exactly one situation, a process that lost its in-memory view,
 		// so it is armed at restore and fires once.
-		if (channel.getState() === ChannelState.NORMAL) {
+		// Every state that can still SETTLE existing HTLCs, not NORMAL alone. A
+		// restored SHUTTING_DOWN channel returns to SHUTTING_DOWN after
+		// reestablish, so it never got the repair, and an unresolved committed
+		// HTLC then kept the shutdown from ever reaching zero - while on a held
+		// channel the automatic close that would otherwise end it is refused
+		// (issue #469). The one-shot guard is unchanged: the repair is still
+		// armed at restore and fires once.
+		if (channel.canSettleHtlcs()) {
 			this.emitRestoreRepairOnce(
 				channel.getChannelId() ?? channel.getTemporaryChannelId()
 			);
@@ -4880,13 +4997,14 @@ export class ChannelManager extends EventEmitter {
 				});
 			}
 			// Release a durably owed commitment_signed (see the note above the
-			// NORMAL check). Runs after the repair emissions so a fulfill/fail
-			// they staged rides the same release. Re-check the state: a
-			// listener may have force-closed the channel.
+			// settle check). Runs after the repair emissions so a fulfill/fail
+			// they staged rides the same release. Re-check: a listener may have
+			// force-closed the channel, and a shutting-down one still owes the
+			// signature that lets its last HTLC resolve.
 			const reestablishedId = channel.getChannelId();
 			if (
 				reestablishedId &&
-				channel.getState() === ChannelState.NORMAL &&
+				channel.canSettleHtlcs() &&
 				!channel.isCollectingBatch()
 			) {
 				this.autoSignAndSendCommitment(reestablishedId);
@@ -7091,7 +7209,7 @@ export class ChannelManager extends EventEmitter {
 			this.pendingQuiescentSettles.delete(channelIdHex);
 			return;
 		}
-		if (channel.isQuiescing() || !channel.isHtlcUsable()) return;
+		if (channel.isQuiescing() || !channel.canSettleHtlcs()) return;
 		this.pendingQuiescentSettles.delete(channelIdHex);
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		for (const op of list) {
@@ -7511,6 +7629,16 @@ export class ChannelManager extends EventEmitter {
 							action.fundingTxid
 						);
 					}
+					break;
+				case ChannelActionType.WATCH_PRESPLICE_SPEND:
+					// Ungated, for the same reasons WATCH_FUNDING is: it puts no
+					// bytes on the wire, changes nothing on chain, and is
+					// idempotent per outpoint. On a refused persist the right
+					// disposition is still the outpoint watched and the
+					// transaction not created. No 'channel:opening' companion
+					// either - this action moves nothing and describes no new
+					// funding.
+					this.emit('watch:presplice-spend', action.channelId);
 					break;
 				case ChannelActionType.AUTHORIZE_FUNDING_BROADCAST:
 					// Same guard and the same reason as BROADCAST_TX below: a

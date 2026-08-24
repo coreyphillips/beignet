@@ -17,6 +17,7 @@ import {
 	OutputType,
 	ITrackedOutput,
 	ICommitmentBroadcast,
+	IFundingSpendScan,
 	IRREVOCABLE_DEPTH
 } from './types';
 import {
@@ -485,7 +486,12 @@ export class ChainMonitor {
 	 */
 	handleFundingSpent(
 		spendingTx: bitcoin.Transaction,
-		blockHeight: number
+		blockHeight: number,
+		// Which funding outpoint the reporting watch saw this transaction
+		// spend (issue #479). Durable ownership of the channel's spend
+		// verdict: a retraction may only ever contradict a record of the
+		// outpoint the retracting scan actually covered.
+		spentOutpoint?: { txid: string; outputIndex: number }
 	): ChainAction[] {
 		if (this._state !== MonitorState.WATCHING) {
 			// Commitment SWAP: a DIFFERENT tx now spends the funding output. The
@@ -538,7 +544,11 @@ export class ChainMonitor {
 				// what the chain says now (issue 352): adopt a first confirmation,
 				// re-adopt a post-reorg confirmation at a new height, or demote a
 				// confirmed spend that fell back to the mempool.
-				return this._reconcileRecordedSpend(spendingTx, blockHeight);
+				return this._reconcileRecordedSpend(
+					spendingTx,
+					blockHeight,
+					spentOutpoint
+				);
 			}
 		}
 
@@ -575,7 +585,10 @@ export class ChainMonitor {
 			txid,
 			blockHeight,
 			commitmentNumber: classified.commitmentNumber,
-			trackedOutputs
+			trackedOutputs,
+			// Assigned even when the caller supplies nothing, so a report that
+			// does not name an outpoint cannot inherit the previous record's.
+			spentOutpoint
 		};
 
 		this._state = MonitorState.COMMITMENT_DETECTED;
@@ -1635,13 +1648,22 @@ export class ChainMonitor {
 	 */
 	private _reconcileRecordedSpend(
 		spendingTx: bitcoin.Transaction,
-		blockHeight: number
+		blockHeight: number,
+		spentOutpoint?: { txid: string; outputIndex: number }
 	): ChainAction[] {
 		if (
 			!this._commitmentBroadcast ||
 			this._commitmentBroadcast.txid !== spendingTx.getId()
 		) {
 			return [];
+		}
+		// A record written before spentOutpoint existed learns its outpoint
+		// from the first live re-report of the SAME transaction, which the
+		// guard above has just established. That upgrades a restored monitor in
+		// place, so its pre-splice leg can retract without waiting for a new
+		// close (issue #479).
+		if (!this._commitmentBroadcast.spentOutpoint && spentOutpoint) {
+			this._commitmentBroadcast.spentOutpoint = spentOutpoint;
 		}
 		const recorded = this._commitmentBroadcast.blockHeight;
 		if (blockHeight <= 0) {
@@ -1702,13 +1724,53 @@ export class ChainMonitor {
 	 * mempool. Stop the depth clock until positive evidence returns.
 	 * Returns true when monitor state changed (so the caller persists it).
 	 */
-	handleFundingSpendAbsent(): boolean {
+	handleFundingSpendAbsent(scan?: IFundingSpendScan): boolean {
 		if (this._state === MonitorState.WATCHING) return false;
-		if (
-			!this._commitmentBroadcast ||
-			this._commitmentBroadcast.blockHeight <= 0
-		) {
-			return false;
+		const broadcast = this._commitmentBroadcast;
+		if (!broadcast || broadcast.blockHeight <= 0) return false;
+		if (scan) {
+			// NEVER against the spender this scan exists to ignore. For a
+			// pre-splice leg that is the splice transaction, and a record of it
+			// is the outpoint's real spender (the issue #357 adoption shape).
+			// Nothing would ever re-report it, because the leg skips it by name
+			// and the channel's own watch has moved to the new outpoint, so the
+			// demotion below would be PERMANENT rather than fail-safe: the
+			// depth clock stops for good and every CSV sweep bound to it
+			// becomes unschedulable.
+			if (scan.expectedSpendTxid === broadcast.txid) return false;
+			// A transaction never spends an output it creates. So a scan of an
+			// outpoint BELONGING to the recorded spend is not evidence against
+			// it, whatever it found: after a splice is adopted the channel's
+			// own watch sits on exactly such an outpoint, and a record written
+			// before spentOutpoint existed would otherwise be demoted by it
+			// with nothing left able to re-report the transaction - the leg
+			// skips it by name, and this watch is downstream of it.
+			if (scan.txid === broadcast.txid) return false;
+			if (broadcast.spentOutpoint) {
+				// Evidence about one outpoint says nothing about another. This
+				// is what lets a leg retract a breach it found while staying
+				// silent about the canonical close of the new outpoint, and it
+				// works after a restart because the outpoint is on disk.
+				if (
+					broadcast.spentOutpoint.txid !== scan.txid ||
+					broadcast.spentOutpoint.outputIndex !== scan.outputIndex
+				) {
+					return false;
+				}
+			}
+			// A record predating spentOutpoint cannot be outpoint-matched, and
+			// it used to refuse any scan naming an expected spender outright.
+			// But after an upgrade restart the pre-splice leg, which always
+			// names the splice tx, can be the ONLY watch still scanning the
+			// outpoint such a record spent: the channel's own watch has moved
+			// to the splice outpoint, so refusing the leg left a vanished
+			// spend's confirmation and finality clock running forever. The
+			// shapes that genuinely must never retract are already refused
+			// above by name: a record OF the scan's expected spender (the
+			// issue #357 adoption shape) and a record whose own outpoint the
+			// scan sits on. Anything else a name-carrying scan retracts stays
+			// fail-safe: if the recorded spend is really on chain, the watch
+			// covering the outpoint it spent re-reports it every sweep.
 		}
 		this._demoteRecordedConfirmation();
 		return true;

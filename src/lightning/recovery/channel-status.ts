@@ -25,6 +25,20 @@ export enum ChannelRecoveryStatus {
 	LocalDataLoss = 'local_data_loss',
 	/** Cannot prove our state is current: never broadcast, peer closes. */
 	StateUncertain = 'state_uncertain',
+	/**
+	 * Restored from a Recovery Capsule and failed: its recency is unprovable
+	 * and always will be, so no AUTOMATIC close will broadcast its commitment
+	 * and it takes no new HTLCs (issue #469). Existing HTLCs still settle and
+	 * fail off chain. A cooperative close is refused in both directions too,
+	 * unless the operator's acceptStaleStateRisk acknowledgement covers the
+	 * negotiation: a mutual close pays out the restored balances, and a stale
+	 * capsule's allocation can only be the peer-favourable one.
+	 *
+	 * Distinct from ForceClosing, which would claim a close is under way, and
+	 * from StateUncertain, which also refuses to resume at all. The peer's
+	 * close or the operator's acknowledged close (either kind) resolves it.
+	 */
+	RestoreRecencyUnproven = 'restore_recency_unproven',
 	Active = 'active',
 	ForceClosing = 'force_closing'
 }

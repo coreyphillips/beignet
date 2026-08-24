@@ -374,3 +374,587 @@ describe('Issue #174: ERRORED channels keep their HTLC backstops', function () {
 		});
 	});
 });
+
+/**
+ * Issue #469: a channel restored from a Recovery Capsule carries a checkpoint
+ * whose recency nothing has confirmed. Until a channel_reestablish does, this
+ * node must not broadcast its commitment ON ITS OWN INITIATIVE: the peer may
+ * already hold a revocation for it, and the justice path takes the whole
+ * balance. The operator's explicit force close stays available throughout,
+ * which is the exit docs/RECOVERY-PROTOCOL.md 5.6 already names.
+ */
+describe('Issue #469: a capsule-restored channel holds its automatic closes', function () {
+	this.timeout(10_000);
+
+	/** An ERRORED, funded channel whose row came from a capsule restore. */
+	function setupUnprovenChannel(seedBase: number): IErroredFixture {
+		const fx = setupErroredChannel(seedBase);
+		(fx.alice as any).channelManager
+			.getChannel(fx.channelId)
+			.getFullState().restoreRecencyUnproven = true;
+		return fx;
+	}
+
+	it('does not force-close on a peer error', () => {
+		const fx = setupUnprovenChannel(71);
+
+		(fx.alice as any).handleChannelErrored(fx.channelId, 'peer sent an error');
+
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		expect(chan.getFullState().state).to.equal(ChannelState.ERRORED);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('does not force-close at the errored timeout backstop', () => {
+		const fx = setupUnprovenChannel(73);
+		const timeout = (fx.alice as any).reestablishTimeoutBlocks;
+
+		(fx.alice as any).scanStuckChannels(HEIGHT);
+		(fx.alice as any).scanStuckChannels(HEIGHT + timeout + 1);
+
+		expect(fx.events).to.not.include('ERRORED_TIMEOUT_FORCE_CLOSED');
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		expect(chan.getFullState().state).to.equal(ChannelState.ERRORED);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('does not force-close to claim an inbound HTLC we hold the preimage for', () => {
+		const fx = setupUnprovenChannel(75);
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		(fx.alice as any).preimages.set(paymentHash.toString('hex'), preimage);
+		addHtlc(fx.alice, fx.channelId, 'received-9', {
+			id: 9n,
+			paymentHash,
+			cltvExpiry: HEIGHT + 10
+		});
+
+		(fx.alice as any).scanExpiringHtlcs(HEIGHT);
+
+		// One HTLC's value is a bounded loss; a revoked commitment is the whole
+		// balance.
+		expect(fx.events).to.not.include('HTLC_CLAIM_FORCE_CLOSE');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('asks the peer to close instead, and stops once the hold lifts', () => {
+		const fx = setupUnprovenChannel(77);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+
+		// The gate would otherwise be a trapdoor: an ERRORED row never reaches
+		// Channel.handleReestablish, because ChannelManager answers a
+		// reestablish for one with a wire error, so nothing would ever clear
+		// the hold and nothing would drive the channel anywhere either.
+		expect(chan.getRecoveryCloseReason()).to.equal('restore-unproven');
+		expect(chan.hasRecoveryCloseDisposition()).to.equal(true);
+		expect(chan.buildRecoveryCloseActions()).to.not.have.length(0);
+
+		// Derived, never stamped, so lifting the hold revokes the request too.
+		chan.getFullState().restoreRecencyUnproven = undefined;
+		expect(chan.getRecoveryCloseReason()).to.equal(undefined);
+		expect(chan.buildRecoveryCloseActions()).to.have.length(0);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('still force-closes when the operator asks explicitly', () => {
+		const fx = setupUnprovenChannel(79);
+
+		const result = fx.alice.forceCloseChannel(
+			fx.channelId,
+			Buffer.from('0014' + '11'.repeat(20), 'hex')
+		);
+
+		// The labelled escape hatch: an explicit command may know better than
+		// we do, exactly as it does for the funding-not-on-chain gate.
+		expect(result.ok, result.error).to.equal(true);
+		expect(result.commitmentTxid).to.be.a('string');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('asks the peer to close immediately, and only once', () => {
+		const fx = setupUnprovenChannel(83);
+		const errorsOut: Buffer[] = [];
+		fx.alice.on(
+			'message:outbound',
+			(_pk: string, type: number, payload: Buffer) => {
+				if (type === 17) errorsOut.push(payload);
+			}
+		);
+
+		(fx.alice as any).handleChannelErrored(fx.channelId, 'peer sent an error');
+
+		// Nothing automatic will ever close this channel, so if the request
+		// waited for the next reconnect both sides could sit on each other
+		// indefinitely.
+		expect(errorsOut, 'the peer-close request went out now').to.have.length(1);
+
+		// And exactly once: the request IS a BOLT 1 error, and this path also
+		// runs on errors RECEIVED, so an unlatched send makes two nodes trade
+		// errors forever. The durable repeat lives on the reconnect path.
+		(fx.alice as any).handleChannelErrored(fx.channelId, 'and again');
+		expect(errorsOut, 'no error-for-error loop').to.have.length(1);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('takes no new HTLCs in either direction', () => {
+		const fx = setupUnprovenChannel(85);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+
+		// Outbound: the channel itself refuses, so nothing can put a new
+		// obligation on a channel whose on-chain backstops are disarmed.
+		const actions = chan.addHtlc(
+			50_000n,
+			crypto.randomBytes(32),
+			HEIGHT + 100,
+			Buffer.alloc(1366)
+		);
+		const refusal = actions.find((a: any) => a.type === 'ERROR');
+		expect(refusal, 'the add is refused').to.not.equal(undefined);
+		expect(refusal.message).to.match(/Recovery Capsule/);
+		expect(chan.getFullState().htlcs.size).to.equal(0);
+
+		// Routing: the channel is not offered to any planner either, so an MPP
+		// payment cannot dispatch a safe part and then discover a held one.
+		expect(chan.acceptsNewHtlcs(), 'not usable for new HTLCs').to.equal(false);
+		// And the split is real: it can still exchange updates for the HTLCs it
+		// already has, which is what lets a queued fulfill release its preimage
+		// (issue #469 review, finding 7).
+		expect(
+			chan.canSettleHtlcs(),
+			'but it still settles existing ones'
+		).to.equal(true);
+		const edges = (fx.alice as any).getLocalChannelEdges() as unknown[];
+		expect(edges, 'and not in the local edge overlay').to.have.length(0);
+
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('still drains a queued fulfill, so a held channel releases its preimage', () => {
+		// The review's own repro. Folding the hold into isHtlcUsable stopped the
+		// deferred-settle drain, which gates queued fulfills, fails and
+		// malformed-fails on the same predicate the router uses. A held channel
+		// never drained, so a queued fulfill never released its preimage - and
+		// the on-chain claim that would otherwise have made up for it is
+		// exactly what the hold disables.
+		const fx = setupUnprovenChannel(87);
+		const manager = (fx.alice as any).channelManager;
+		const chan = manager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		addHtlc(fx.alice, fx.channelId, 'received-4', {
+			id: 4n,
+			paymentHash,
+			cltvExpiry: HEIGHT + 40
+		});
+
+		const idHex = fx.channelId.toString('hex');
+		manager.pendingQuiescentSettles.set(idHex, [
+			{ kind: 'fulfill', htlcId: 4n, preimage }
+		]);
+		manager._drainDeferredSettles(idHex);
+
+		expect(
+			manager.pendingQuiescentSettles.has(idHex),
+			'the queue was consumed, not held forever'
+		).to.equal(false);
+		expect(
+			chan.getFullState().htlcs.get('received-4').state,
+			'and the fulfill actually ran'
+		).to.equal(HtlcState.FULFILLED);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('still drains parked incoming HTLCs rather than holding them forever', () => {
+		const fx = setupUnprovenChannel(89);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+
+		const idHex = fx.channelId.toString('hex');
+		(fx.alice as any).parkedQuiescentHtlcs.set(idHex, [
+			{
+				htlcId: 7n,
+				amountMsat: 50_000n,
+				paymentHash: crypto.randomBytes(32)
+			}
+		]);
+		(fx.alice as any).drainParkedQuiescentHtlcs(idHex);
+
+		expect(
+			(fx.alice as any).parkedQuiescentHtlcs.has(idHex),
+			'the park is drained; the hold then refuses the HTLC on a path that answers the payer'
+		).to.equal(false);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('drains a deferred settle on a SHUTTING_DOWN channel too', () => {
+		// The same class of error, pre-existing: BOLT 2 forbids new adds after
+		// shutdown, not removals, and canFulfillHtlc has always accepted
+		// SHUTTING_DOWN. The drain asked isHtlcUsable, which does not, so a
+		// settle deferred by quiescence and drained after shutdown began was
+		// held instead of applied.
+		const fx = setupErroredChannel(91);
+		const manager = (fx.alice as any).channelManager;
+		const chan = manager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.SHUTTING_DOWN;
+
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		addHtlc(fx.alice, fx.channelId, 'received-5', {
+			id: 5n,
+			paymentHash,
+			cltvExpiry: HEIGHT + 40
+		});
+
+		const idHex = fx.channelId.toString('hex');
+		manager.pendingQuiescentSettles.set(idHex, [
+			{ kind: 'fulfill', htlcId: 5n, preimage }
+		]);
+		manager._drainDeferredSettles(idHex);
+
+		expect(chan.getFullState().htlcs.get('received-5').state).to.equal(
+			HtlcState.FULFILLED
+		);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('separates accepting a new HTLC from settling an existing one', () => {
+		const fx = setupUnprovenChannel(93);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		const state = chan.getFullState();
+
+		for (const s of [ChannelState.NORMAL, ChannelState.SHUTTING_DOWN]) {
+			state.state = s;
+			state.restoreRecencyUnproven = true;
+			expect(chan.acceptsNewHtlcs(), `held ${s} takes no new HTLC`).to.equal(
+				false
+			);
+			expect(chan.canSettleHtlcs(), `held ${s} still settles`).to.equal(true);
+			state.restoreRecencyUnproven = undefined;
+			expect(
+				chan.acceptsNewHtlcs(),
+				`unheld ${s} takes a new HTLC iff it is NORMAL`
+			).to.equal(s === ChannelState.NORMAL);
+			expect(chan.canSettleHtlcs(), `unheld ${s} settles`).to.equal(true);
+		}
+
+		state.state = ChannelState.AWAITING_REESTABLISH;
+		state.preReestablishState = ChannelState.NORMAL;
+		expect(
+			chan.canSettleHtlcs(),
+			'a disconnected channel exchanges nothing until it is back'
+		).to.equal(false);
+		expect(
+			chan.acceptsNewHtlcs(true),
+			'but it can be described by the state it will return to'
+		).to.equal(true);
+		state.restoreRecencyUnproven = true;
+		expect(
+			chan.acceptsNewHtlcs(true),
+			'unless the hold stands, which looking through does not lift'
+		).to.equal(false);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('fails the payment behind an add it abandons', async () => {
+		// The drop is local, so nothing on chain will ever resolve the HTLC -
+		// but the attempt that dispatched it is still in flight, and the
+		// reason it is told has to be true rather than "the peer failed it
+		// with an empty reason".
+		const fx = setupUnprovenChannel(95);
+		const manager = (fx.alice as any).channelManager;
+		const chan = manager.getChannel(fx.channelId);
+		const state = chan.getFullState();
+		state.state = ChannelState.NORMAL;
+		state.restoreRecencyUnproven = undefined;
+
+		const paymentHash = crypto.randomBytes(32);
+		const actions = chan.addHtlc(
+			50_000_000n,
+			paymentHash,
+			HEIGHT + 100,
+			Buffer.alloc(1366)
+		);
+		expect(
+			actions.find((a: any) => a.type === 'ERROR'),
+			'the add is accepted before the hold'
+		).to.equal(undefined);
+		const htlcId = state.localHtlcCounter - 1n;
+
+		const hashHex = paymentHash.toString('hex');
+		(fx.alice as any).payments.set(hashHex, {
+			paymentHash,
+			direction: 'OUTGOING',
+			status: 'PENDING',
+			amountMsat: 50_000_000n,
+			createdAt: Date.now()
+		});
+		(fx.alice as any).htlcPaymentMap.set(
+			`${fx.channelId.toString('hex')}:offered-${htlcId}`,
+			hashHex
+		);
+
+		state.restoreRecencyUnproven = true;
+		manager._rollbackForReestablish(chan);
+		// The report is deferred: at startup this runs before the node's
+		// payment records are even loaded.
+		await new Promise((resolve) => setImmediate(resolve));
+
+		const payment = (fx.alice as any).payments.get(hashHex);
+		expect(
+			payment.status,
+			'the attempt is failed, not left in flight'
+		).to.equal('FAILED');
+		expect(payment.failureReason, 'and told the truth about why').to.match(
+			/Recovery Capsule/
+		);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('fails an abandoned forward with well-formed BOLT 4 failure data', () => {
+		// TEMPORARY_CHANNEL_FAILURE carries the UPDATE flag, so BOLT 4 still
+		// requires the two-byte channel_update length even when the update
+		// itself is omitted. Empty data is malformed and a strict peer may
+		// treat the whole failure as such.
+		const {
+			decryptFailureMessage
+		} = require('../../src/lightning/onion/failures');
+		const fx = setupUnprovenChannel(97);
+		const node = fx.alice as any;
+		const inChannelId = crypto.randomBytes(32);
+		const sharedSecret = crypto.randomBytes(32);
+		const outKey = `${fx.channelId.toString('hex')}:offered-3`;
+
+		node.forwardedHtlcs.set(outKey, { inChannelId, inHtlcId: 11n });
+		node.receivedHtlcSharedSecrets.set(
+			`${inChannelId.toString('hex')}:11`,
+			sharedSecret
+		);
+		let captured: Buffer | undefined;
+		node.failForwardUpstream = (
+			_k: string,
+			_f: unknown,
+			_c: Buffer,
+			_h: bigint,
+			reason: Buffer
+		): boolean => {
+			captured = reason;
+			return true;
+		};
+
+		node.failAbandonedLocalAdd(fx.channelId, {
+			htlcId: 3n,
+			paymentHash: crypto.randomBytes(32),
+			amountMsat: 50_000n
+		});
+
+		expect(captured, 'the inbound leg is failed').to.not.equal(undefined);
+		const decoded = decryptFailureMessage([sharedSecret], captured!);
+		expect(decoded, 'and the payer can read it').to.not.equal(null);
+		expect(decoded.failure.failureCode).to.equal(0x1007);
+		expect(
+			decoded.failure.failureData?.length,
+			'with the channel_update length BOLT 4 requires'
+		).to.equal(2);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('refuses a cooperative close in both directions while recency is unproven', () => {
+		// A mutual close needs no revocation, which is why the hold lets the
+		// channel resume - but it pays out the balances THIS row carries, and a
+		// stale capsule's allocation can only be the peer-favourable one: any
+		// payment received after the checkpoint is missing from it. Signing it
+		// is a loss with no penalty attached and no way back.
+		const fx = setupUnprovenChannel(99);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+		const script = Buffer.from('0014' + '11'.repeat(20), 'hex');
+
+		const refused = chan.initiateShutdown(script);
+		const err = refused.find((a: any) => a.type === 'ERROR');
+		expect(err, 'a local close is refused').to.not.equal(undefined);
+		expect(err.message).to.match(/Recovery Capsule/);
+		expect(chan.getFullState().state, 'and nothing moved').to.equal(
+			ChannelState.NORMAL
+		);
+
+		// The labelled acknowledgement is the same one the operator force close
+		// takes: the hold is never a refusal to the operator.
+		const accepted = chan.initiateShutdown(script, true);
+		expect(
+			accepted.find((a: any) => a.type === 'ERROR'),
+			'the acknowledgement is not what stops it'
+		).to.equal(undefined);
+		expect(chan.getFullState().state).to.equal(ChannelState.SHUTTING_DOWN);
+		expect(
+			accepted[0].type,
+			'the acknowledgement is persisted ahead of the send'
+		).to.equal('PERSIST_STATE');
+		expect(chan.getFullState().staleCloseRiskAccepted).to.equal(true);
+	});
+
+	it('an acknowledged close survives the peer shutdown reply', () => {
+		// The acknowledgement authorizes the NEGOTIATION, not one call: the
+		// peer MUST reply to our shutdown with its own (BOLT 2), and that
+		// reply used to hit the unconditional refusal, turning every
+		// authorized close into ERRORED at its first response.
+		const fx = setupUnprovenChannel(103);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+		const script = Buffer.from('0014' + '11'.repeat(20), 'hex');
+
+		const result = fx.alice.closeChannel(fx.channelId, script, true);
+		expect(result.ok, result.error).to.equal(true);
+		expect(
+			chan.getFullState().state,
+			'the negotiation proceeds instead of erroring'
+		).to.be.oneOf([ChannelState.NEGOTIATING_CLOSING, ChannelState.CLOSED]);
+		expect(chan.hasRecoveryCloseDisposition()).to.equal(false);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('does not spend the acknowledgement on a truthy non-boolean', () => {
+		// A JS caller can pass anything; only exact true is authorization.
+		const fx = setupUnprovenChannel(105);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+		const script = Buffer.from('0014' + '11'.repeat(20), 'hex');
+
+		const refused = chan.initiateShutdown(script, 'false');
+		expect(
+			refused.find((a: any) => a.type === 'ERROR'),
+			'a truthy non-boolean does not authorize'
+		).to.not.equal(undefined);
+		expect(chan.getFullState().staleCloseRiskAccepted).to.equal(undefined);
+		expect(chan.getFullState().state).to.equal(ChannelState.NORMAL);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('a channel restored mid-close refuses every closing signature stage', () => {
+		// A row persisted DURING a close comes back in SHUTTING_DOWN or
+		// NEGOTIATING_CLOSING and reaches the signing handlers without ever
+		// passing the initiateShutdown gate, so each stage re-asks the
+		// held-close question itself and lands on the durable peer-close path.
+		const fx = setupUnprovenChannel(107);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		const st = chan.getFullState();
+		const dummySig = Buffer.alloc(64);
+		const script = Buffer.from('0014' + '11'.repeat(20), 'hex');
+
+		const stages: Array<[string, () => any[]]> = [
+			['proposeClosingFee', () => chan.proposeClosingFee(() => dummySig)],
+			[
+				'handleClosingSigned',
+				() =>
+					chan.handleClosingSigned(
+						{ channelId: fx.channelId, feeSatoshis: 500n, signature: dummySig },
+						() => dummySig
+					)
+			],
+			[
+				'sendClosingComplete',
+				() => chan.sendClosingComplete(500n, 0, () => dummySig)
+			],
+			[
+				'handleClosingComplete',
+				() =>
+					chan.handleClosingComplete(
+						{
+							channelId: fx.channelId,
+							feeSatoshis: 500n,
+							locktime: 0,
+							closerScriptPubkey: script,
+							closeeScriptPubkey: script
+						},
+						() => true,
+						() => dummySig
+					)
+			],
+			[
+				'handleClosingSig',
+				() =>
+					chan.handleClosingSig(
+						{
+							channelId: fx.channelId,
+							feeSatoshis: 500n,
+							locktime: 0,
+							closerScriptPubkey: script,
+							closeeScriptPubkey: script
+						},
+						() => true
+					)
+			]
+		];
+		for (const [name, run] of stages) {
+			st.state = ChannelState.NEGOTIATING_CLOSING;
+			const actions = run();
+			const err = actions.find((a: any) => a.type === 'ERROR');
+			expect(err, `${name} refuses`).to.not.equal(undefined);
+			expect(err.message, name).to.match(/Recovery Capsule/);
+			expect(st.state, `${name} lands on the peer-close path`).to.equal(
+				ChannelState.ERRORED
+			);
+		}
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('refuses a peer-initiated cooperative close onto the 5.6 peer-close path', () => {
+		const fx = setupUnprovenChannel(101);
+		const chan = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		chan.getFullState().state = ChannelState.NORMAL;
+
+		const actions = chan.handleShutdown({
+			channelId: fx.channelId,
+			scriptPubkey: Buffer.from('0014' + '22'.repeat(20), 'hex')
+		});
+
+		const err = actions.find((a: any) => a.type === 'ERROR');
+		expect(err, 'our signature is not offered over a stale split').to.not.equal(
+			undefined
+		);
+		expect(err.message).to.match(/force close/);
+		expect(
+			chan.getFullState().state,
+			'and the channel lands on the durable peer-close path'
+		).to.equal(ChannelState.ERRORED);
+		expect(chan.getRecoveryCloseReason()).to.equal('restore-unproven');
+		expect(
+			actions[0].type,
+			'persisted before the error reaches the wire'
+		).to.equal('PERSIST_STATE');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('reports the hold on the recovery status', () => {
+		const fx = setupUnprovenChannel(81);
+
+		const entry = fx.alice
+			.getRecoveryStatus()
+			.channels.find((c) => c.channelId === fx.channelId.toString('hex'));
+
+		expect(entry, 'the channel is reported').to.not.equal(undefined);
+		expect(entry!.restoreRecencyUnproven).to.equal(true);
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+});

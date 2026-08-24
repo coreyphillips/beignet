@@ -1040,17 +1040,33 @@ async function bootDaemon(
 			);
 		},
 		'POST /channel/close': (body) => {
-			const { channelId } = body as { channelId: string };
+			const { channelId, acceptStaleStateRisk } = body as {
+				channelId: string;
+				acceptStaleStateRisk?: boolean;
+			};
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
-			const result = node.closeChannel(channelId);
+			// Strict boolean, the same rule the force close uses: the
+			// acknowledgement is authorization, so only the exact value counts.
+			const result = node.closeChannel(
+				channelId,
+				acceptStaleStateRisk === true
+			);
 			if (!result.ok)
 				return failure('CLOSE_FAILED', result.error || 'Close failed');
 			return success({ closed: true });
 		},
 		'POST /channel/forceclose': (body) => {
-			const { channelId } = body as { channelId: string };
+			const { channelId, acceptStaleStateRisk } = body as {
+				channelId: string;
+				acceptStaleStateRisk?: boolean;
+			};
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
-			const result = node.forceCloseChannel(channelId);
+			// Strict boolean: the acknowledgement is authorization, so only the
+			// exact value counts (issue #469, same rule as the restore routes).
+			const result = node.forceCloseChannel(
+				channelId,
+				acceptStaleStateRisk === true
+			);
 			if (!result.ok)
 				return failure(
 					'FORCE_CLOSE_FAILED',

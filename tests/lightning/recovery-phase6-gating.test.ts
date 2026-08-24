@@ -45,7 +45,7 @@ function stubChannel(channelId: Buffer): Channel {
 		getChannelId: (): Buffer => channelId,
 		getTemporaryChannelId: (): Buffer | null => null,
 		getState: (): ChannelState => ChannelState.NORMAL,
-		markForReestablish: (): void => undefined,
+		markForReestablish: (): unknown[] => [],
 		isAbandonedV2Open: (): boolean => false
 	} as unknown as Channel;
 }
@@ -718,7 +718,7 @@ describe('Recovery phase 6: the peer-close request survives a refusal', () => {
 			getChannelId: (): Buffer => channelId,
 			getTemporaryChannelId: (): Buffer | null => null,
 			getState: (): ChannelState => ChannelState.ERRORED,
-			markForReestablish: (): void => undefined,
+			markForReestablish: (): unknown[] => [],
 			buildRecoveryCloseActions: (): ChannelAction[] => [
 				{ type: ChannelActionType.PERSIST_STATE },
 				declare(MessageType.ERROR)
@@ -982,7 +982,7 @@ describe('Recovery phase 6: a restart asks the barrier, it does not assume', () 
 			getChannelId: (): Buffer => channelId,
 			getTemporaryChannelId: (): Buffer | null => null,
 			getState: (): ChannelState => ChannelState.AWAITING_FUNDING_CONFIRMED,
-			markForReestablish: (): void => undefined,
+			markForReestablish: (): unknown[] => [],
 			buildFundingReauthorizationActions: (): ChannelAction[] => [
 				{ type: ChannelActionType.PERSIST_STATE },
 				{
@@ -1115,7 +1115,7 @@ describe('Recovery phase 6: a refused terminal close leaves the queue alone', ()
 			getChannelId: (): Buffer => channelId,
 			getTemporaryChannelId: (): Buffer | null => null,
 			getState: (): ChannelState => ChannelState.NORMAL,
-			markForReestablish: (): void => undefined,
+			markForReestablish: (): unknown[] => [],
 			getSigner: (): unknown => ({}),
 			channelKeyIndex: 0,
 			prepareForceClose: (): { ok: false; error: string } => ({

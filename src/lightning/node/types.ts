@@ -758,10 +758,25 @@ export interface IChannelInfo {
 	 */
 	pendingSpliceLocalBalanceMsat?: bigint;
 	/**
-	 * Whether the channel can carry HTLC traffic right now (NORMAL, or ECDSA
-	 * pending-lock mid-splice with pay-during-splice active).
+	 * Whether the channel will accept a NEW HTLC: it can carry traffic right
+	 * now (NORMAL, or ECDSA pending-lock mid-splice with pay-during-splice
+	 * active) AND its state is provably current.
+	 *
+	 * This is the sending gate. It is deliberately NOT "can exchange updates":
+	 * a channel answering false here can still settle and fail the HTLCs it
+	 * already has, and can still negotiate a close.
 	 */
 	htlcUsable?: boolean;
+	/**
+	 * The channel was restored from a Recovery Capsule and no
+	 * channel_reestablish has proven its state current, so it takes no NEW
+	 * HTLCs and is offered to no router or planner (issue #469). Existing
+	 * HTLCs still settle; a cooperative close is refused in both directions
+	 * unless the operator's acceptStaleStateRisk acknowledgement covers the
+	 * negotiation. Present only while the hold stands; it is the reason a
+	 * NORMAL channel can report htlcUsable false.
+	 */
+	restoreRecencyUnproven?: boolean;
 	/**
 	 * Present exactly when the channel is mid-splice by effective state
 	 * (looking through a reconnect): true = pay-through accounting (counted in

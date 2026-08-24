@@ -792,6 +792,33 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		).to.equal(null);
 	});
 
+	it('no reestablish outcome lifts a capsule restore hold, including on the v2 path (issue #469)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		h.opener.markForReestablish();
+		h.opener.getFullState().restoreRecencyUnproven = true;
+
+		const divergent: IChannelReestablishMessage = {
+			channelId: h.opener.getChannelId()!,
+			nextCommitmentNumber: 1n,
+			nextRevocationNumber: 0n,
+			yourLastPerCommitmentSecret: Buffer.alloc(32),
+			myCurrentPerCommitmentPoint: getPerCommitmentPoint(h.acceptorSeed, 0n),
+			nextFundingTxid: crypto.randomBytes(32),
+			nextFundingRetransmitFlags: 0
+		};
+		const actions = h.opener.handleReestablish(divergent);
+
+		// The hold is permanent because compatibility is not recency, and the
+		// v2 path gets its own case because _handleReestablishV2 is SPREAD
+		// into the action list rather than returned: any clear reintroduced at
+		// the shared terminus would fire here too, on an exchange that did not
+		// merely fail to prove recency but failed outright.
+		expect(findError(actions)).to.contain('does not match');
+		expect(h.opener.getState()).to.equal(ChannelState.ERRORED);
+		expect(h.opener.getFullState().restoreRecencyUnproven).to.equal(true);
+	});
+
 	it('pins the reestablish counters of a mid-open v2 channel to 1/0/zeros', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);

@@ -749,6 +749,171 @@ describe('Chain Monitor (Phase 4C)', function () {
 			expect(monitor.isFullyResolved()).to.be.true;
 		});
 
+		it('records which funding outpoint a reported spend was seen to spend', function () {
+			const { monitor, closingTx } = coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100, {
+				txid: 'aa'.repeat(32),
+				outputIndex: 3
+			});
+			expect(
+				monitor.getFullState().commitmentBroadcast!.spentOutpoint
+			).to.deep.equal({ txid: 'aa'.repeat(32), outputIndex: 3 });
+		});
+
+		it('retracts only a record of the outpoint the scan covered', function () {
+			const { monitor, closingTx } = coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100, {
+				txid: 'aa'.repeat(32),
+				outputIndex: 0
+			});
+
+			// A scan of a DIFFERENT outpoint is not evidence about this record.
+			// Once a splice leaves a pre-splice leg behind, both watches sweep
+			// the same shared funding script every block, and an unscoped
+			// verdict would let each undo the other's.
+			expect(
+				monitor.handleFundingSpendAbsent({
+					txid: 'bb'.repeat(32),
+					outputIndex: 0
+				}),
+				'a sibling outpoint says nothing'
+			).to.be.false;
+			expect(
+				monitor.handleFundingSpendAbsent({
+					txid: 'aa'.repeat(32),
+					outputIndex: 1
+				}),
+				'nor does the same txid at another index'
+			).to.be.false;
+			expect(monitor.isCommitmentConfirmed()).to.be.true;
+
+			expect(
+				monitor.handleFundingSpendAbsent({
+					txid: 'aa'.repeat(32),
+					outputIndex: 0
+				}),
+				'the outpoint it belongs to does'
+			).to.be.true;
+			expect(monitor.isCommitmentConfirmed()).to.be.false;
+		});
+
+		it('never retracts the spender a pre-splice leg exists to ignore', function () {
+			// The issue #357 adoption shape: the monitor legitimately holds the
+			// SPLICE transaction as the recorded spend of the old outpoint. A
+			// leg armed on that outpoint sees only the transaction it skips by
+			// name, so an unscoped "no spender found" would demote it - and
+			// nothing would ever re-report it, because the leg ignores it and
+			// the channel's own watch has moved on. That demotion would be
+			// permanent rather than fail-safe: the depth clock stops for good
+			// and every CSV sweep bound to it becomes unschedulable.
+			const { monitor, closingTx } = coopCloseFixture();
+			const oldOutpoint = { txid: 'aa'.repeat(32), outputIndex: 0 };
+			monitor.handleFundingSpent(closingTx, 100, oldOutpoint);
+
+			expect(
+				monitor.handleFundingSpendAbsent({
+					...oldOutpoint,
+					expectedSpendTxid: closingTx.getId()
+				}),
+				'the record IS the expected spender'
+			).to.be.false;
+			expect(monitor.isCommitmentConfirmed()).to.be.true;
+
+			// A leg whose expected spender is something else still retracts a
+			// breach it found on that same outpoint.
+			expect(
+				monitor.handleFundingSpendAbsent({
+					...oldOutpoint,
+					expectedSpendTxid: 'cc'.repeat(32)
+				})
+			).to.be.true;
+			expect(monitor.isCommitmentConfirmed()).to.be.false;
+		});
+
+		it('never retracts a record from a scan of an outpoint it created', function () {
+			// A transaction cannot spend an output it creates. After a splice
+			// is adopted the channel's own funding watch sits on exactly such
+			// an outpoint, and for a record written before spentOutpoint
+			// existed nothing else would refuse it: the leg skips that
+			// transaction by name and this watch is downstream of it, so the
+			// demotion would be permanent.
+			const { monitor, closingTx } = coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100);
+
+			expect(
+				monitor.handleFundingSpendAbsent({
+					txid: closingTx.getId(),
+					outputIndex: 0
+				}),
+				'the scanned outpoint belongs to the recorded spend'
+			).to.be.false;
+			expect(monitor.isCommitmentConfirmed()).to.be.true;
+		});
+
+		it('lets a name-carrying watch retract a legacy record', function () {
+			const { monitor, closingTx } = coopCloseFixture();
+			// No outpoint supplied: the shape a row persisted before issue #479
+			// comes back with.
+			monitor.handleFundingSpent(closingTx, 100);
+			expect(
+				monitor.getFullState().commitmentBroadcast!.spentOutpoint
+			).to.equal(undefined);
+
+			// After an upgrade restart the pre-splice leg, which always names
+			// the splice tx it ignores, can be the ONLY watch still scanning
+			// the outpoint such a record spent: the channel's own watch has
+			// moved to the splice outpoint, which the two txid guards refuse.
+			// Refusing the leg outright left the vanished spend's confirmation
+			// and finality clock running forever.
+			expect(
+				monitor.handleFundingSpendAbsent({
+					txid: 'aa'.repeat(32),
+					outputIndex: 0,
+					expectedSpendTxid: 'cc'.repeat(32)
+				}),
+				'a leg naming an unrelated spender retracts'
+			).to.be.true;
+			expect(monitor.isCommitmentConfirmed()).to.be.false;
+		});
+
+		it('still refuses a legacy record OF the expected spender', function () {
+			// The issue #357 adoption shape with a pre-outpoint row: the
+			// record is the splice transaction the leg exists to ignore, and
+			// the txid guard, not the outpoint match, is what refuses it.
+			const { monitor, closingTx } = coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100);
+			expect(
+				monitor.handleFundingSpendAbsent({
+					txid: 'aa'.repeat(32),
+					outputIndex: 0,
+					expectedSpendTxid: closingTx.getId()
+				}),
+				'the record IS the expected spender'
+			).to.be.false;
+			expect(monitor.isCommitmentConfirmed()).to.be.true;
+		});
+
+		it('teaches a legacy record its outpoint from the next live report', function () {
+			const { monitor, closingTx } = coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100);
+			// The same transaction re-reported, this time by a watcher that
+			// names the outpoint. Upgrades the row in place, so its leg can
+			// retract without waiting for a new close.
+			monitor.handleFundingSpent(closingTx, 100, {
+				txid: 'aa'.repeat(32),
+				outputIndex: 2
+			});
+			expect(
+				monitor.getFullState().commitmentBroadcast!.spentOutpoint
+			).to.deep.equal({ txid: 'aa'.repeat(32), outputIndex: 2 });
+			expect(
+				monitor.handleFundingSpendAbsent({
+					txid: 'bb'.repeat(32),
+					outputIndex: 2
+				})
+			).to.be.false;
+		});
+
 		it('restore demotes a legacy coop monitor resolved from a mempool sighting', function () {
 			const { monitor, closingTx, state, destScript, openerPrivkeys } =
 				coopCloseFixture();
@@ -1332,6 +1497,114 @@ describe('Chain Monitor (Phase 4C)', function () {
 				(a: any) => a.description && a.description.includes('penalty')
 			);
 			expect(penaltyBroadcast).to.exist;
+		});
+
+		it('a restored monitor can still retract the breach it recorded (issue #479)', function () {
+			// Ownership of the channel's spend verdict used to live only in the
+			// watcher's memory. After a restart nothing owned it: the re-armed
+			// pre-splice leg could not retract a breach it had itself reported,
+			// and with the replacement zero-conf funding still unconfirmed the
+			// channel's own watch never spend-scanned either, so the vanished
+			// breach's finality clock kept advancing against a height no longer
+			// in the chain.
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			const secret = state.shaChainStore.getSecret(MAX_INDEX - 0n);
+			const revokedPoint = perCommitmentPointFromSecret(secret!);
+			const revocationPubkey = deriveRevocationPubkey(
+				state.localBasepoints.revocationBasepoint,
+				revokedPoint
+			);
+			const theirDelayedPubkey = derivePublicKey(
+				state.remoteBasepoints!.delayedPaymentBasepoint,
+				revokedPoint
+			);
+			const isOpener = state.role === ChannelRole.OPENER;
+			const obscured = calculateObscuredCommitmentNumber(
+				isOpener
+					? state.localBasepoints.paymentBasepoint
+					: state.remoteBasepoints!.paymentBasepoint,
+				isOpener
+					? state.remoteBasepoints!.paymentBasepoint
+					: state.localBasepoints.paymentBasepoint,
+				0n
+			);
+			const revokedTx = new bitcoin.Transaction();
+			revokedTx.version = 2;
+			revokedTx.locktime = 0x20000000 | Number(obscured & 0xffffffn);
+			revokedTx.addInput(
+				Buffer.from(state.fundingTxid!.toString('hex'), 'hex').reverse(),
+				state.fundingOutputIndex,
+				(0x80000000 | Number((obscured >> 24n) & 0xffffffn)) >>> 0
+			);
+			revokedTx.addOutput(
+				bitcoin.payments.p2wsh({
+					redeem: {
+						output: buildToLocalScript(
+							revocationPubkey,
+							theirDelayedPubkey,
+							state.localConfig.toSelfDelay
+						)
+					}
+				}).output!,
+				800_000
+			);
+
+			// The pre-splice leg reports the breach on the SUPERSEDED outpoint.
+			const supersededOutpoint = {
+				txid: Buffer.from(state.fundingTxid!).reverse().toString('hex'),
+				outputIndex: state.fundingOutputIndex
+			};
+			monitor.handleFundingSpent(revokedTx, 104, supersededOutpoint);
+			expect(monitor.isCommitmentConfirmed()).to.be.true;
+
+			const {
+				serializeChainMonitorState,
+				deserializeChainMonitorState
+			} = require('../../src/lightning/storage/serialization');
+			const restored = ChainMonitor.restore(
+				deserializeChainMonitorState(
+					serializeChainMonitorState(monitor.getFullState())
+				),
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			expect(
+				restored.getFullState().commitmentBroadcast!.spentOutpoint,
+				'the outpoint survived the round trip'
+			).to.deep.equal(supersededOutpoint);
+			expect(
+				restored.isCommitmentConfirmed(),
+				'and the clock is still running, which is the danger'
+			).to.be.true;
+
+			// The reorg takes the breach out. The re-armed leg scans the shared
+			// funding script, finds only the splice transaction it ignores by
+			// name, and offers to retract.
+			expect(
+				restored.handleFundingSpendAbsent({
+					...supersededOutpoint,
+					expectedSpendTxid: 'cc'.repeat(32)
+				}),
+				'the re-armed leg can take its own report back'
+			).to.be.true;
+			expect(restored.isCommitmentConfirmed()).to.be.false;
 		});
 
 		// Audit MEDIUM-1: a reorg can evict a recorded commitment without resetting

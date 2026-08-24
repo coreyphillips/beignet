@@ -159,8 +159,8 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `openChannelAndWait(pubkey, amountSats, opts?)` | `Promise<ChannelInfo>` | Open channel + wait for NORMAL state. `opts: { pushSats?, timeoutMs? }` |
 | `openZeroConfChannel(pubkey, sats, pushSats?)` | `ChannelInfo` | Open zero-conf channel (peer must be trusted) |
 | `openChannelV2(pubkey, params)` | `ChannelInfo` | Open dual-funded v2 channel |
-| `closeChannel(channelId)` | `{ ok, error? }` | Cooperative close |
-| `forceCloseChannel(channelId)` | `{ ok, error? }` | Force close |
+| `closeChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error? }` | Cooperative close; a capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
+| `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; a capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
 | `spliceOut(channelId, amountSats, feerate)` | `SpliceResult` | Withdraw funds from channel |
 | `listChannels()` | `ChannelInfo[]` | List all channels |
@@ -222,7 +222,7 @@ flows, just-in-time inventory checks, atomic swaps.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getReadyChannels()` | `ChannelInfo[]` | List channels in NORMAL state |
+| `getReadyChannels()` | `ChannelInfo[]` | List channels that are NORMAL and will accept a new HTLC |
 | `canSend(amountSats)` | `{ canSend, bestChannelId?, availableSats }` | Check if you can send this amount (accounts for channel reserves) |
 | `canReceive(amountSats)` | `{ canReceive, bestChannelId?, availableSats }` | Check if you can receive this amount (accounts for channel reserves) |
 
@@ -421,6 +421,31 @@ BEIGNET_RECOVERY_REESTABLISH_HOLD_MS=600000   # peer-storage only; 0 disables
   crash-safe: a marker (`<network>.capsule-restore.json`) lets the next boot
   finish an interrupted swap. Otherwise (Tier 1) the embedded SCB is
   recovered on the live node like `POST /restore/scb`.
+
+  A Tier 2 restore brings the channels back HOLDABLE, not fully live. A
+  capsule is best-effort recency by construction and a compatible
+  `channel_reestablish` proves compatibility, not recency, so every restored
+  channel carries `restoreRecencyUnproven` on `GET /recovery/status` for the
+  rest of its life. While it is set the daemon never force-closes that
+  channel on its own initiative (a peer error and the reestablish/errored
+  timeout backstops are all held, and the channel asks its peer to close
+  instead), and the channel takes no new HTLCs, since the on-chain HTLC
+  deadline backstops that would enforce them can never fire. Existing HTLCs
+  still settle and fail, and the balance is intact. A cooperative close is
+  refused by default in BOTH directions too: a mutual close pays out the
+  balances the restored row carries, and a stale capsule's allocation can
+  only be the peer-favourable one, since any payment received after the
+  checkpoint is missing from it. An ERRORED one reports
+  `status: "restore_recency_unproven"` rather than `force_closing`. The
+  exits are the peer closing, or the operator's labelled acknowledgement on
+  either close:
+  `beignet channel close <id> --accept-stale-state-risk`
+  (`POST /channel/close` with `acceptStaleStateRisk: true`) accepts the
+  stale-split risk and covers the whole negotiation, and
+  `beignet channel forceclose <id> --accept-stale-state-risk`
+  (`POST /channel/forceclose` with `acceptStaleStateRisk: true`) accepts
+  that publishing a commitment the peer may already have revoked forfeits
+  the whole channel balance. Both are refused without the flag.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.
@@ -790,7 +815,7 @@ interface HealthInfo {
   electrumConnected: boolean;
   peerCount: number;
   channelCount: number;
-  readyChannelCount: number;  // channels in NORMAL state
+  readyChannelCount: number;  // NORMAL channels that will accept a new HTLC
   graphNodes: number;
   graphChannels: number;
 }
@@ -1327,8 +1352,12 @@ beignet channel open-zeroconf <pubkey> <sats> [pushSats]
 beignet channel open-v2 <pubkey> <sats> [fundingFeeratePerkw]
 beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
 beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
-beignet channel close <channelId>
-beignet channel forceclose <channelId>
+beignet channel close <channelId> [--accept-stale-state-risk]
+beignet channel forceclose <channelId> [--accept-stale-state-risk]
+# A channel restored from a Recovery Capsule refuses either close without the
+# flag. Cooperative: a mutual close pays out restored balances that cannot be
+# proven current. Force: if the peer holds a newer state the broadcast is
+# revoked and the whole channel balance goes to the justice path.
 beignet channel rebroadcast-close <channelId>
 beignet channel splice-in <channelId> <sats> <feeratePerkw>
 beignet channel splice-out <channelId> <sats> <feeratePerkw>
@@ -1706,7 +1735,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/stats` | `?window=<ms>` | Node statistics (optional time window in ms) |
 | GET | `/peers` | -- | List peers |
 | GET | `/channels` | -- | List channels |
-| GET | `/channels/ready` | -- | List channels in NORMAL state |
+| GET | `/channels/ready` | -- | List channels that are NORMAL and will accept a new HTLC (a capsule-restored channel holding for recency is excluded) |
 | GET | `/can-send` | `?amountSats=<n>` | Check send capacity |
 | GET | `/can-receive` | `?amountSats=<n>` | Check receive capacity |
 | GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable) |
@@ -1747,8 +1776,8 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/channels/ensure-minimum` | `{ count, satsPerChannel, timeoutMs? }` | Auto-open channels to meet minimum count |
 | POST | `/channel/connect-and-open` | `{ pubkey, host, port, amountSats, pushSats? }` | Connect + open in one call |
 | POST | `/channel/open-and-wait` | `{ pubkey, amountSats, pushSats?, timeoutMs? }` | Open channel + wait for NORMAL state |
-| POST | `/channel/close` | `{ channelId }` | Coop close |
-| POST | `/channel/forceclose` | `{ channelId }` | Force close |
+| POST | `/channel/close` | `{ channelId, acceptStaleStateRisk? }` | Coop close; the flag is required for a capsule-restored channel |
+| POST | `/channel/forceclose` | `{ channelId, acceptStaleStateRisk? }` | Force close; the flag is required for a capsule-restored channel |
 | POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
 | POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds |
 | POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw }` | Splice-out funds |

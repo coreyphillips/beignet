@@ -851,8 +851,13 @@ describe('Post-splice channel re-announcement', function () {
 				backend,
 				channelManager: fakeManager as any
 			});
-			await (watcher as any).checkFundingSpent({
-				channelId: crypto.randomBytes(32),
+			// Registered under its own key, exactly as every production arming
+			// path does: the scan's map-identity guard answers against the
+			// registry, so a watch that was never put there reads as one that
+			// has already been replaced.
+			const channelId = crypto.randomBytes(32);
+			const watched = {
+				channelId,
 				txid: txB.getId(), // watching the POST-splice funding
 				outputIndex: 0,
 				minimumDepth: 3,
@@ -860,7 +865,14 @@ describe('Post-splice channel re-announcement', function () {
 				confirmed: true,
 				confirmationHeight: 953266,
 				announcementTriggered: false
-			});
+			};
+			const key = channelId.toString('hex');
+			(watcher as any).watchedFundings.set(key, watched);
+			await (watcher as any).checkFundingSpent(
+				watched,
+				(watcher as any).lifecycleGeneration,
+				key
+			);
 			return includeSpender
 				? detected.map((d) => ({ ...d, expectedTxid: txC.getId() }) as any)
 				: detected;

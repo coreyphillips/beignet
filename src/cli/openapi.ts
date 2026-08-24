@@ -64,7 +64,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ready': {
 				get: {
 					summary:
-						'Simple readiness check — true when node has at least one NORMAL channel (auth-exempt)',
+						'Simple readiness check — true when the node has at least one channel that is NORMAL and will accept a new HTLC. A channel restored from a Recovery Capsule whose state has not been proven current is NORMAL but holds, so it does not count (auth-exempt)',
 					tags: ['Node'],
 					security: [],
 					responses: {
@@ -110,7 +110,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			},
 			'/channels/ready': {
 				get: {
-					summary: 'List channels in NORMAL state',
+					summary:
+						'List channels that are NORMAL and will accept a new HTLC (a capsule-restored channel holding for recency is excluded)',
 					tags: ['Channels'],
 					responses: {
 						'200': {
@@ -548,17 +549,31 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			},
 			'/channel/close': {
 				post: {
-					summary: 'Cooperatively close a channel',
+					summary:
+						'Cooperatively close a channel. A channel restored from a Recovery Capsule needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway',
 					tags: ['Channels'],
-					requestBody: bodyContent({ channelId: 'string' }),
+					requestBody: bodyContent({
+						channelId: 'string',
+						// Conditionally required, and only for a capsule-restored
+						// channel, so the schema cannot say "required" without
+						// misdescribing every other close.
+						acceptStaleStateRisk: 'boolean?'
+					}),
 					responses: { '200': { description: 'Close result' } }
 				}
 			},
 			'/channel/forceclose': {
 				post: {
-					summary: 'Force close a channel (returns commitment txid)',
+					summary:
+						'Force close a channel (returns commitment txid). A channel restored from a Recovery Capsule needs acceptStaleStateRisk: true, because its recency cannot be proven: the node refuses to broadcast such a commitment on its own initiative, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path. Waiting for the peer to close is the safe outcome; the flag is the labelled way to accept the risk anyway',
 					tags: ['Channels'],
-					requestBody: bodyContent({ channelId: 'string' }),
+					requestBody: bodyContent({
+						channelId: 'string',
+						// Conditionally required, and only for a capsule-restored
+						// channel, so the schema cannot say "required" without
+						// misdescribing every other force close.
+						acceptStaleStateRisk: 'boolean?'
+					}),
 					responses: {
 						'200': { description: 'Force close result with commitment txid' }
 					}
@@ -1552,7 +1567,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head and the guardian locators that capsule names (credentials redacted; reported, never adopted over the configured set), and restore progress when one is pending or running. In peer-storage mode node.heldReestablish lists peers whose channel_reestablish for a channel this node has no record of is being held rather than answered: each entry carries the expiresAt by which a capsule must be applied, after which the peer is told the channel is unknown and force-closes'
+								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head and the guardian locators that capsule names (credentials redacted; reported, never adopted over the configured set), and restore progress when one is pending or running. In peer-storage mode node.heldReestablish lists peers whose channel_reestablish for a channel this node has no record of is being held rather than answered: each entry carries the expiresAt by which a capsule must be applied, after which the peer is told the channel is unknown and force-closes. A channel restored from a capsule carries node.channels[].restoreRecencyUnproven for as long as it exists: a capsule is best-effort recency and a compatible channel_reestablish does not prove otherwise, so the daemon will never force-close that channel on its own initiative (a peer error and the timeout backstops are held, and the channel asks its peer to close instead). Such a channel also takes no new HTLCs, since its on-chain HTLC deadline backstops can never fire, though existing ones still settle; a cooperative close is refused in both directions too, since a mutual close pays out restored balances that cannot be proven current. The exits are the peer closing, or the operator acknowledging the risk with acceptStaleStateRisk: true on /channel/close (covers the whole negotiation) or /channel/forceclose'
 						}
 					}
 				}
@@ -3033,7 +3048,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						htlcUsable: {
 							type: 'boolean',
 							description:
-								'Whether the channel can carry HTLC traffic right now (NORMAL, or paying through its splice)'
+								'Whether the channel will accept a NEW HTLC: usable right now (NORMAL, or paying through its splice) and its state provably current. A channel answering false can still settle the HTLCs it already has'
+						},
+						restoreRecencyUnproven: {
+							type: 'boolean',
+							description:
+								'The channel was restored from a Recovery Capsule and no channel_reestablish has proven its state current, so it takes no new HTLCs and is offered to no router. Existing HTLCs still settle; a cooperative close is refused in both directions without the acceptStaleStateRisk acknowledgement on /channel/close. Present only while the hold stands'
 						},
 						peerSupportsSplicing: {
 							type: 'boolean',

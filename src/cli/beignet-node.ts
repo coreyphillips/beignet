@@ -842,6 +842,18 @@ function requireChannelIdHex(value: unknown, field = 'channelId'): Buffer {
 	return Buffer.from(value, 'hex');
 }
 
+/**
+ * A channel restored from a Recovery Capsule whose state no channel_reestablish
+ * has proven current (issue #469). It stays NORMAL, keeps its balance and
+ * closes cooperatively, and it settles the HTLCs it already has - but it takes
+ * no new ones and is offered to no router, so no readiness or capacity surface
+ * may count it. Read off the wire field rather than recomputed: these surfaces
+ * hold serialized channel info, not Channel objects.
+ */
+function isHeldRestore(ch: { restoreRecencyUnproven?: boolean }): boolean {
+	return ch.restoreRecencyUnproven === true;
+}
+
 export class BeignetNode extends EventEmitter {
 	// ─── Typed event overloads ───
 	on<K extends keyof BeignetNodeEvents>(
@@ -4374,7 +4386,13 @@ export class BeignetNode extends EventEmitter {
 		return opened;
 	}
 
-	closeChannel(channelId: string): { ok: boolean; error?: string } {
+	closeChannel(
+		channelId: string,
+		// Required for a capsule-restored channel, whose balances nothing can
+		// prove current: a mutual close signs the allocation this row carries,
+		// and a stale one is peer-favourable by construction (issue #469).
+		acceptStaleStateRisk = false
+	): { ok: boolean; error?: string } {
 		const idBuf = Buffer.from(channelId, 'hex');
 		// Derive a P2WPKH script from the funding address for the closing output
 		const address = this.node.getFundingAddress();
@@ -4383,15 +4401,54 @@ export class BeignetNode extends EventEmitter {
 			address,
 			this.getBitcoinNetwork()
 		);
-		return this.node.closeChannel(idBuf, scriptPubkey);
+		return this.node.closeChannel(idBuf, scriptPubkey, acceptStaleStateRisk);
 	}
 
-	forceCloseChannel(channelId: string): {
+	forceCloseChannel(
+		channelId: string,
+		// The labelled risk acknowledgement RECOVERY-PROTOCOL 5.6 asks for
+		// (issue #469). Required only for a channel restored from a Recovery
+		// Capsule, whose recency nothing can prove: this node refuses to
+		// broadcast such a commitment on its own initiative because the peer
+		// may already hold a revocation for it, and an operator command is the
+		// documented exit. It should be a decision, not a default, so the
+		// route refuses without it and says why.
+		acceptStaleStateRisk = false
+	): {
 		ok: boolean;
 		error?: string;
 		commitmentTxid?: string;
 	} {
+		// Validate before deciding anything from it. Buffer.from(x, 'hex')
+		// truncates at the first non-hex pair and is case insensitive, so a
+		// caller's spelling is not an identity: 'AB...' and 'ab...xyz' both
+		// decode to the same channel while matching no canonical id, which
+		// walked straight past the acknowledgement below.
+		if (!/^[0-9a-fA-F]{64}$/.test(channelId)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'channelId must be 64 hex characters'
+			);
+		}
 		const idBuf = Buffer.from(channelId, 'hex');
+		// Compare on the DECODED bytes, which is what the engine resolves.
+		const canonicalId = idBuf.toString('hex');
+		const held = this.node
+			.getRecoveryStatus()
+			.channels.find((c) => c.channelId === canonicalId)
+			?.restoreRecencyUnproven;
+		if (held === true && acceptStaleStateRisk !== true) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'This channel was restored from a Recovery Capsule and its state ' +
+					'cannot be proven current, so the node will not broadcast its ' +
+					'commitment on its own initiative. If the peer holds a newer ' +
+					'state, force closing publishes a revoked commitment and the ' +
+					'whole channel balance is lost to the justice path. Waiting for ' +
+					'the peer to close is the safe outcome. Set ' +
+					'acceptStaleStateRisk: true to force close anyway.'
+			);
+		}
 		// Sweep recovered funds into the wallet-owned address (tracked + spendable)
 		// when available; fall back to the LN funding address otherwise.
 		let destinationScript = this.sweepDestinationScript;
@@ -4471,11 +4528,15 @@ export class BeignetNode extends EventEmitter {
 			);
 		// Pay-during-splice (0.6.0): a channel paying through its splice is
 		// fully usable — hints generate, payments flow — so it is not an issue.
-		const htlcUsableThrough = channel.isHtlcUsable(true);
+		const acceptsNewThrough = channel.acceptsNewHtlcs(true);
+		if (state.restoreRecencyUnproven === true)
+			issues.push(
+				'HELD_RESTORE: Channel was restored from a Recovery Capsule and its state has not been proven current, so it takes no new HTLCs. Routing hints will be skipped.'
+			);
 		if (
 			state.state !== 'NORMAL' &&
 			state.preReestablishState !== 'NORMAL' &&
-			!htlcUsableThrough
+			!acceptsNewThrough
 		) {
 			issues.push(
 				`NOT_NORMAL: Channel state is ${state.state} (pre-reestablish: ${
@@ -4513,11 +4574,11 @@ export class BeignetNode extends EventEmitter {
 			remoteScidAlias: remoteScidAlias?.toString('hex') || null,
 			shortChannelId: shortChannelId?.toString('hex') || null,
 			effectiveScid: effectiveScid?.toString('hex') || null,
-			willGenerateRoutingHint:
-				!!effectiveScid &&
-				(state.state === 'NORMAL' ||
-					state.preReestablishState === 'NORMAL' ||
-					htlcUsableThrough),
+			// A held restore is NORMAL, so state alone said yes while the same
+			// response reported HELD_RESTORE and said hints are skipped. The
+			// hint is generated iff the channel will take a new HTLC, which is
+			// the one predicate the hint builder itself consults (issue #469).
+			willGenerateRoutingHint: !!effectiveScid && acceptsNewThrough,
 			localBalanceSats: Number(state.localBalanceMsat / 1000n),
 			remoteBalanceSats: Number(state.remoteBalanceMsat / 1000n),
 			issues
@@ -4538,6 +4599,7 @@ export class BeignetNode extends EventEmitter {
 		htlcCount?: number;
 		pendingSpliceLocalBalanceMsat?: bigint;
 		htlcUsable?: boolean;
+		restoreRecencyUnproven?: boolean;
 		payThroughSplice?: boolean;
 		localReserveMsat?: bigint;
 		remoteReserveMsat?: bigint;
@@ -4586,6 +4648,8 @@ export class BeignetNode extends EventEmitter {
 		// here re-parked every mid-splice channel in the UI while the daemon
 		// happily paid through the window.
 		if (ch.htlcUsable !== undefined) info.htlcUsable = ch.htlcUsable;
+		if (ch.restoreRecencyUnproven)
+			info.restoreRecencyUnproven = ch.restoreRecencyUnproven;
 		if (ch.payThroughSplice !== undefined)
 			info.payThroughSplice = ch.payThroughSplice;
 		if (ch.isPrivate !== undefined) info.isPrivate = ch.isPrivate;
@@ -6436,7 +6500,7 @@ export class BeignetNode extends EventEmitter {
 			this.wallet?.electrum?.connectedToElectrum ?? false;
 		const channels = this.node.listChannels();
 		const readyChannels = channels.filter(
-			(ch) => ch.state === ChannelState.NORMAL
+			(ch) => ch.state === ChannelState.NORMAL && !isHeldRestore(ch)
 		);
 		const peerCount = this.node.listPeers().length;
 		const graph = this.node.getGraph();
@@ -6449,7 +6513,9 @@ export class BeignetNode extends EventEmitter {
 		// ERRORED are the states that mean an established channel is broken.
 		const operating = channels.filter(
 			(ch) =>
-				ch.state === ChannelState.NORMAL || ch.state === ChannelState.SPLICING
+				(ch.state === ChannelState.NORMAL ||
+					ch.state === ChannelState.SPLICING) &&
+				!isHeldRestore(ch)
 		);
 		const broken = channels.filter(
 			(ch) =>
@@ -6517,7 +6583,9 @@ export class BeignetNode extends EventEmitter {
 		// 3. AUTO_RECONNECT_ENABLED (WARNING)
 		const nodeInfo = this.node.getNodeInfo();
 		const channels = this.node.listChannels();
-		const readyChannels = channels.filter((ch) => ch.state === 'NORMAL');
+		const readyChannels = channels.filter(
+			(ch) => ch.state === 'NORMAL' && !isHeldRestore(ch)
+		);
 
 		checks.push({
 			name: 'AUTO_RECONNECT_ENABLED',
@@ -6757,6 +6825,11 @@ export class BeignetNode extends EventEmitter {
 		let reserveMsat = 0n;
 		let sendableMsat = 0n;
 		for (const ch of this.node.listChannels()) {
+			// A held restore is NORMAL with htlcUsable false, so this two-clause
+			// test admitted it on the first clause alone (issue #469). Its
+			// balance is real, but it can carry nothing, so it contributes no
+			// sendable sats and reserves nothing worth reporting.
+			if (isHeldRestore(ch)) continue;
 			if (ch.state !== ChannelState.NORMAL && !ch.htlcUsable) continue;
 			const chReserveMsat = ch.localReserveMsat ?? 0n;
 			reserveMsat += chReserveMsat;
@@ -7156,7 +7229,7 @@ export class BeignetNode extends EventEmitter {
 	getReadyChannels(): ChannelInfo[] {
 		return this.node
 			.listChannels()
-			.filter((ch) => ch.state === ChannelState.NORMAL)
+			.filter((ch) => ch.state === ChannelState.NORMAL && !isHeldRestore(ch))
 			.map((ch) => this.toChannelInfo(ch));
 	}
 
@@ -7171,7 +7244,7 @@ export class BeignetNode extends EventEmitter {
 		let totalAvailableMsat = 0n;
 
 		for (const ch of this.node.listChannels()) {
-			if (ch.state !== ChannelState.NORMAL) continue;
+			if (ch.state !== ChannelState.NORMAL || isHeldRestore(ch)) continue;
 			// Subtract channel reserve — we must maintain this minimum balance
 			const reserveMsat = ch.localReserveMsat ?? 0n;
 			const available =
@@ -7203,7 +7276,7 @@ export class BeignetNode extends EventEmitter {
 		let totalAvailableMsat = 0n;
 
 		for (const ch of this.node.listChannels()) {
-			if (ch.state !== ChannelState.NORMAL) continue;
+			if (ch.state !== ChannelState.NORMAL || isHeldRestore(ch)) continue;
 			// Subtract channel reserve — remote must maintain this minimum balance
 			const reserveMsat = ch.remoteReserveMsat ?? 0n;
 			const available =

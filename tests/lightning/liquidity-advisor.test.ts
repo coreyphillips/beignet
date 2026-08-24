@@ -27,6 +27,34 @@ describe('LiquidityAdvisor', () => {
 		};
 	}
 
+	it('an explicit htlcUsable false is not active, however NORMAL the state', () => {
+		// A capsule-restored channel holding for unproven recency is NORMAL,
+		// holds a real balance and refuses every new HTLC. Counting it made the
+		// advisor recommend, and the planner plan, work that execution rejects
+		// (issue #469). It still COUNTS as a channel: channelCount means the
+		// number of channels, and a node whose only channel is held must not be
+		// told that none exist.
+		const snapshot = advisor.analyze([
+			makeChannel({ channelId: 'held', htlcUsable: false })
+		]);
+		expect(snapshot.channelCount, 'it is still a channel').to.equal(1);
+		expect(snapshot.activeChannelCount, 'but not an active one').to.equal(0);
+		expect(snapshot.totalLocalBalanceSats).to.equal(0);
+		expect(
+			snapshot.recommendations.some((r) =>
+				r.reason.includes('No channels exist')
+			),
+			'and it is not reported as having no channels'
+		).to.equal(false);
+	});
+
+	it('keeps the state fallback for a snapshot that never sets htlcUsable', () => {
+		// Legacy callers do not populate the field; absent must still mean
+		// "judge by the state", or every one of them reads as inactive.
+		const snapshot = advisor.analyze([makeChannel({ channelId: 'legacy' })]);
+		expect(snapshot.activeChannelCount).to.equal(1);
+	});
+
 	it('returns snapshot with correct balance totals', () => {
 		const result = advisor.analyze([makeChannel()]);
 		expect(result.totalLocalBalanceSats).to.equal(500_000);
@@ -218,6 +246,26 @@ describe('LiquidityAdvisor', () => {
 					r.channelId === 'stuck_ch'
 			)
 		).to.be.true;
+	});
+
+	it('suppresses close advice for a capsule-held stuck channel', () => {
+		// A channel restored from a Recovery Capsule sits in
+		// AWAITING_REESTABLISH until its peer connects, and its hold forbids
+		// exactly the local force close this rule recommends (issue #469).
+		const result = advisor.analyze([
+			makeChannel({
+				channelId: 'held_ch',
+				state: 'AWAITING_REESTABLISH',
+				stuckBlocks: 150,
+				restoreRecencyUnproven: true
+			})
+		]);
+		expect(
+			result.recommendations.some(
+				(r) => r.type === RecommendationType.CLOSE_CHANNEL
+			),
+			'no close advice for a channel whose local broadcast is held'
+		).to.be.false;
 	});
 
 	it('with near-empty idle channel returns LOW CLOSE_CHANNEL', () => {
