@@ -252,6 +252,7 @@ export class Electrum {
 			return err('Regtest requires that you pre-specify a server.');
 		}
 		const candidates = this.getServerCandidates(customPeers, electrumNetwork);
+		const previousServer = this._currentServer;
 		let connected = false;
 		let lastError = 'No Electrum servers available.';
 		for (const candidate of this.orderCandidates(candidates)) {
@@ -282,6 +283,20 @@ export class Electrum {
 			return err(lastError);
 		}
 		this.publishConnectionChange(true);
+		if (
+			previousServer &&
+			this._currentServer &&
+			this.serverKey(previousServer) !== this.serverKey(this._currentServer)
+		) {
+			// The previous server's client, and with it every subscription made
+			// through it, is gone. The wallet's own address subscriptions have no
+			// other reconnect hook here (checkConnection re-issues them only on
+			// its own reconnect path), so without this the wallet would see no
+			// incoming payment until its next full refresh.
+			this.subscribeToAddresses({}).catch(() => {
+				// Best-effort: re-issued by the next refresh or reconnect.
+			});
+		}
 		this.subscribeToHeader().catch(() => {
 			// Best-effort: the header subscription is rebuilt on reconnect.
 		});
@@ -296,6 +311,7 @@ export class Electrum {
 		server: TServer,
 		electrumNetwork: EElectrumNetworks
 	): Promise<{ error: unknown }> {
+		await this.stopPeerIfServerChanged(server, electrumNetwork);
 		return await electrum.start({
 			clientName: 'beignet',
 			protocolVersion: '1.4',
@@ -304,6 +320,32 @@ export class Electrum {
 			tls: this.tls,
 			customPeers: [server]
 		});
+	}
+
+	/**
+	 * Disconnects the connected peer when the next connect targets a different
+	 * server.
+	 *
+	 * rn-electrum-client builds a fresh client whenever the target
+	 * host/port/protocol differ from the connected peer, but only its
+	 * disconnect path clears the per-network bookkeeping (subscribedAddresses,
+	 * subscribedHeaders, onAddressReceive) while the notification handlers live
+	 * on the client object that is thrown away. Without this reset every
+	 * subscribe after a failover answers "Already Subscribed." although nothing
+	 * is subscribed on the new connection and no handler is wired to it, so the
+	 * process silently stops receiving header and script hash notifications.
+	 * The same-server path is left alone: the client pings the live connection
+	 * and disconnects itself (resetting the same state) if the ping fails.
+	 */
+	private async stopPeerIfServerChanged(
+		server: TServer,
+		electrumNetwork: EElectrumNetworks
+	): Promise<void> {
+		const peer = electrum.getConnectedPeer(electrumNetwork);
+		if (!peer?.host) return;
+		const peerKey = `${peer.host}|${peer.protocol}|${peer.port}`;
+		if (peerKey === this.serverKey(server)) return;
+		await electrum.stop({ network: electrumNetwork });
 	}
 
 	/**
