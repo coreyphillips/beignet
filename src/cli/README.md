@@ -808,7 +808,7 @@ interface HealthInfo {
   electrumConnected: boolean;
   peerCount: number;
   channelCount: number;
-  readyChannelCount: number;  // channels in NORMAL state
+  readyChannelCount: number;  // NORMAL channels that will accept a new HTLC
   graphNodes: number;
   graphChannels: number;
 }

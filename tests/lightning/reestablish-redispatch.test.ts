@@ -490,6 +490,66 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		alice.destroy();
 	});
 
+	it('a restored SHUTTING_DOWN channel still gets the restore repair', async function () {
+		// The repair gate was NORMAL-only, and a restored SHUTTING_DOWN channel
+		// returns to SHUTTING_DOWN after reestablish, so it never fired. An
+		// unresolved committed HTLC then kept the shutdown from ever reaching
+		// zero, and on a channel held for unproven capsule recency the
+		// automatic close that would otherwise end it is refused (issue #469).
+		this.timeout(20_000);
+		const dbPath = tempDb('redispatch-shutdown');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage1);
+		wire(alice, bob, { val: false });
+		openReadyChannel(alice, bob);
+		await settle();
+		bob.destroy();
+
+		// Bring the row back mid-shutdown, which is what a channel persisted
+		// during a cooperative close looks like on disk.
+		const inspect = new SqliteStorage(dbPath);
+		inspect.open();
+		const row = inspect.loadAllChannels()[0];
+		row.state.state = ChannelState.SHUTTING_DOWN;
+		row.state.localShutdownScript = Buffer.from(
+			'0014' + '33'.repeat(20),
+			'hex'
+		);
+		inspect.saveChannel(row.channelId, row.state, row.peerPubkey);
+
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		alice.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, inspect);
+		const repaired: string[] = [];
+		restarted
+			.getChannelManager()
+			.on('channel:restore-ready', (id: Buffer) =>
+				repaired.push(id.toString('hex'))
+			);
+
+		await reconnect(restarted, alice);
+
+		// The repair runs at the reestablish tail, while the channel is back in
+		// SHUTTING_DOWN; the close negotiation that follows may then carry it
+		// all the way to CLOSED in the same drain, which is the point - it can
+		// only get there once its HTLCs resolve.
+		expect(
+			repaired,
+			'the repair that resolves its last HTLC still runs'
+		).to.have.length(1);
+		const channel = restarted.getChannelManager().listChannels()[0];
+		expect(
+			channel.getState() === ChannelState.SHUTTING_DOWN ||
+				channel.getState() === ChannelState.CLOSED,
+			`the close proceeds rather than stalling (got ${channel.getState()})`
+		).to.equal(true);
+
+		restarted.destroy();
+		alice.destroy();
+	});
+
 	it('a live reconnect does NOT re-run the repair (the restart-only boundary)', async function () {
 		this.timeout(20_000);
 		const alice = createNode(ALICE_SEED);

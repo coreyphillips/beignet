@@ -4952,7 +4952,14 @@ export class ChannelManager extends EventEmitter {
 		// the declared total with less money than it sent. The repair exists
 		// for exactly one situation, a process that lost its in-memory view,
 		// so it is armed at restore and fires once.
-		if (channel.getState() === ChannelState.NORMAL) {
+		// Every state that can still SETTLE existing HTLCs, not NORMAL alone. A
+		// restored SHUTTING_DOWN channel returns to SHUTTING_DOWN after
+		// reestablish, so it never got the repair, and an unresolved committed
+		// HTLC then kept the shutdown from ever reaching zero - while on a held
+		// channel the automatic close that would otherwise end it is refused
+		// (issue #469). The one-shot guard is unchanged: the repair is still
+		// armed at restore and fires once.
+		if (channel.canSettleHtlcs()) {
 			this.emitRestoreRepairOnce(
 				channel.getChannelId() ?? channel.getTemporaryChannelId()
 			);
@@ -4975,13 +4982,14 @@ export class ChannelManager extends EventEmitter {
 				});
 			}
 			// Release a durably owed commitment_signed (see the note above the
-			// NORMAL check). Runs after the repair emissions so a fulfill/fail
-			// they staged rides the same release. Re-check the state: a
-			// listener may have force-closed the channel.
+			// settle check). Runs after the repair emissions so a fulfill/fail
+			// they staged rides the same release. Re-check: a listener may have
+			// force-closed the channel, and a shutting-down one still owes the
+			// signature that lets its last HTLC resolve.
 			const reestablishedId = channel.getChannelId();
 			if (
 				reestablishedId &&
-				channel.getState() === ChannelState.NORMAL &&
+				channel.canSettleHtlcs() &&
 				!channel.isCollectingBatch()
 			) {
 				this.autoSignAndSendCommitment(reestablishedId);
