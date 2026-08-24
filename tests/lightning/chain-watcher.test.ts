@@ -1699,6 +1699,80 @@ describe('Phase 4: Chain Watcher', () => {
 			).to.deep.equal([breach, breach]);
 		});
 
+		it('a newer completed absence retires an older scan of the same outpoint', async () => {
+			// The absence race with nothing to retract. The channel's own scan
+			// starts against a history in which its outpoint looks spent, and
+			// parks; a reorg takes that spend out; a NEWER scan of the same
+			// outpoint completes against the clean history. The monitor is
+			// still WATCHING, so no verdict was applied and the channel-wide
+			// ticket never moved. What must stop the older scan from resuming
+			// and reporting the vanished spend anyway is the outpoint's own
+			// completed-scan freshness.
+			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
+			const registry = (
+				watcher as unknown as {
+					watchedFundings: Map<string, unknown>;
+				}
+			).watchedFundings;
+			const chanKey = channelId.toString('hex');
+			const gen = (watcher as unknown as { lifecycleGeneration: number })
+				.lifecycleGeneration;
+			const scan = (
+				watcher as unknown as {
+					checkFundingSpent: (
+						w: unknown,
+						g: number,
+						k: string
+					) => Promise<void>;
+				}
+			).checkFundingSpent.bind(watcher);
+			const chanWatch = registry.get(chanKey) as { txid: string };
+			chanWatch.txid = spliceTxid;
+
+			// A spend of the channel's outpoint that a reorg is about to erase.
+			const stale = new bitcoin.Transaction();
+			stale.version = 2;
+			stale.addInput(Buffer.from(spliceTxid, 'hex').reverse(), 0, 0xffffffff);
+			stale.addOutput(Buffer.from('0014' + 'aa'.repeat(20), 'hex'), 30_000);
+			backend.setTransaction(stale.getId(), stale.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 105 },
+				{ txid: stale.getId(), height: 106 }
+			]);
+			backend.holdHistory(1);
+			const parked = scan(chanWatch, gen, chanKey).catch(() => {
+				/* not the subject */
+			});
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			// The reorg erases the spend; a newer scan of the SAME outpoint
+			// runs to completion and finds nothing.
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 105 }
+			]);
+			await scan(chanWatch, gen, chanKey);
+			expect(
+				absentScans.some(
+					(c) =>
+						c.channelId.equals(channelId) &&
+						c.scan?.txid === spliceTxid &&
+						c.scan?.outputIndex === 0
+				),
+				'the newer scan reported the absence'
+			).to.be.true;
+
+			backend.releaseHistory();
+			await parked;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			expect(
+				reportedTxids(),
+				'the older scan does not report the vanished spend over it'
+			).to.deep.equal([]);
+		});
+
 		it("a leg vouches for the splice on behalf of the channel's own watch", async () => {
 			// The point-of-no-return shape: our tx_signatures have left, so the
 			// peer can assemble and broadcast the splice, but no WATCH_FUNDING

@@ -375,6 +375,16 @@ interface IChannelSpendScan {
 	nextTicket: number;
 	/** Ticket of the scan whose verdict the channel's monitor now holds. */
 	appliedTicket: number;
+	/**
+	 * Ticket of the newest scan that ran to COMPLETION, per outpoint
+	 * ("txid:vout"). appliedTicket advances only when the monitor applies a
+	 * verdict, and a successful no-spend scan of an outpoint the monitor
+	 * holds nothing about applies none, so on its own it left an older scan
+	 * stalled in getTransaction free to resume afterwards and report a spend
+	 * the newer history no longer contained. Per outpoint, because a
+	 * completed scan is evidence about ITS outpoint and nothing else.
+	 */
+	completedByOutpoint: Map<string, number>;
 }
 
 export class ChainWatcher extends EventEmitter {
@@ -1645,11 +1655,13 @@ export class ChainWatcher extends EventEmitter {
 		// The ticket is taken here, before the first await, because it records
 		// when this scan's evidence was gathered.
 		const idHex = watched.channelId.toString('hex');
+		const outKey = `${watched.txid}:${watched.outputIndex}`;
 		const ticket = this.beginSpendScan(idHex);
 		const superseded = (): boolean =>
 			!this.isCurrentGeneration(generation) ||
 			this.watchedFundings.get(key) !== watched ||
-			this.spendScanOvertaken(idHex, ticket);
+			this.spendScanOvertaken(idHex, ticket) ||
+			this.outpointScanOvertaken(idHex, outKey, ticket);
 
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
 		if (superseded()) return;
@@ -1705,6 +1717,7 @@ export class ChainWatcher extends EventEmitter {
 			// Use 0 for mempool txs (Electrum returns height <= 0 for unconfirmed)
 			const height = entry.height > 0 ? entry.height : 0;
 			this.recordSpendVerdict(idHex, ticket);
+			this.recordScanCompleted(idHex, outKey, ticket);
 			this.channelManager.handleFundingSpent(
 				watched.channelId,
 				spendingTx,
@@ -1762,6 +1775,7 @@ export class ChainWatcher extends EventEmitter {
 				);
 			});
 			if (spendsOurs && this.watchedFundings.get(key) === watched) {
+				this.recordScanCompleted(idHex, outKey, ticket);
 				this.watchedFundings.delete(key);
 				// The node keeps a durable record of this outpoint so a restart
 				// can re-arm the watch; retiring the watch retires that too
@@ -1805,6 +1819,12 @@ export class ChainWatcher extends EventEmitter {
 				// - a demotion nothing could ever undo.
 				expectedSpendTxid: expectedSpender
 			}) ?? false;
+		// Completion advances the outpoint's freshness whether or not the
+		// monitor had anything to retract: this scan's history IS the newest
+		// evidence about the outpoint, and an older scan still stalled in an
+		// await must retire against it rather than resume and report a spend
+		// this history no longer contains.
+		this.recordScanCompleted(idHex, outKey, ticket);
 		if (retracted) this.recordSpendVerdict(idHex, ticket);
 	}
 
@@ -1841,7 +1861,8 @@ export class ChainWatcher extends EventEmitter {
 	private beginSpendScan(idHex: string): number {
 		const state = this.channelSpendScans.get(idHex) ?? {
 			nextTicket: 0,
-			appliedTicket: 0
+			appliedTicket: 0,
+			completedByOutpoint: new Map<string, number>()
 		};
 		this.channelSpendScans.set(idHex, state);
 		return ++state.nextTicket;
@@ -1859,6 +1880,39 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	private spendScanOvertaken(idHex: string, ticket: number): boolean {
 		return (this.channelSpendScans.get(idHex)?.appliedTicket ?? 0) > ticket;
+	}
+
+	/**
+	 * Whether a scan of the SAME outpoint that started later than this one has
+	 * already run to completion. Completion, not application: a successful
+	 * no-spend scan applies no verdict when the monitor is still WATCHING, so
+	 * the channel-wide appliedTicket never moved, and an older scan stalled in
+	 * getTransaction could resume afterwards and report a spend the newer
+	 * history had already dropped. Scoped per outpoint because a completed
+	 * scan is evidence about its own outpoint only; verdicts the monitor
+	 * actually applied keep arbitrating channel-wide via appliedTicket.
+	 */
+	private outpointScanOvertaken(
+		idHex: string,
+		outKey: string,
+		ticket: number
+	): boolean {
+		return (
+			(this.channelSpendScans.get(idHex)?.completedByOutpoint.get(outKey) ??
+				0) > ticket
+		);
+	}
+
+	/** Record that this scan of this outpoint ran to completion. */
+	private recordScanCompleted(
+		idHex: string,
+		outKey: string,
+		ticket: number
+	): void {
+		const state = this.channelSpendScans.get(idHex);
+		if (!state) return;
+		const prev = state.completedByOutpoint.get(outKey) ?? 0;
+		if (ticket > prev) state.completedByOutpoint.set(outKey, ticket);
 	}
 
 	/**
