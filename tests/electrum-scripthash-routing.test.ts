@@ -50,6 +50,11 @@ const server: TServer = {
  */
 let globalHandler: ((data: TNotification) => void | Promise<void>) | null;
 let subscribedHashes: string[];
+/** Fail the next N protocol subscribes (after the handler install, matching
+ *  where the real client's blockchainScripthash_subscribe request fails). */
+let failNextSubscribes: number;
+/** Hang the next N protocol subscribes, for the backend timeout path. */
+let hangNextSubscribes: number;
 
 const fireNotification = async (data: TNotification): Promise<void> => {
 	if (!globalHandler) {
@@ -68,6 +73,10 @@ const createFakeWallet = (refreshSpy: sinon.SinonStub): Wallet => {
 	} as unknown as Wallet;
 };
 
+/** Instances created this test, withdrawn from the shared per-network router
+ *  in afterEach so no test leaks subscriptions into the next. */
+const createdInstances: Electrum[] = [];
+
 const createElectrum = (refreshSpy: sinon.SinonStub): Electrum => {
 	const electrum = new Electrum({
 		wallet: createFakeWallet(refreshSpy),
@@ -78,6 +87,7 @@ const createElectrum = (refreshSpy: sinon.SinonStub): Electrum => {
 	});
 	// No background pings during tests.
 	electrum.stopConnectionPolling();
+	createdInstances.push(electrum);
 	return electrum;
 };
 
@@ -88,6 +98,8 @@ describe('Electrum script hash subscription routing (issue #478)', () => {
 	beforeEach(() => {
 		globalHandler = null;
 		subscribedHashes = [];
+		failNextSubscribes = 0;
+		hangNextSubscribes = 0;
 		sinon.stub(electrumHelpers, 'subscribeAddress').callsFake(
 			async ({
 				scriptHash = '',
@@ -98,6 +110,19 @@ describe('Electrum script hash subscription routing (issue #478)', () => {
 			} = {}) => {
 				if (onReceive && !globalHandler) {
 					globalHandler = onReceive;
+				}
+				if (hangNextSubscribes > 0) {
+					hangNextSubscribes--;
+					return new Promise(() => {});
+				}
+				if (failNextSubscribes > 0) {
+					failNextSubscribes--;
+					return {
+						error: true,
+						data: 'subscribe failed',
+						id: 1,
+						method: 'subscribeAddress'
+					};
 				}
 				if (subscribedHashes.includes(scriptHash)) {
 					return {
@@ -120,7 +145,11 @@ describe('Electrum script hash subscription routing (issue #478)', () => {
 		electrum = createElectrum(refreshSpy);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		for (const instance of createdInstances) {
+			await instance.disconnect();
+		}
+		createdInstances.length = 0;
 		sinon.restore();
 	});
 
@@ -228,6 +257,60 @@ describe('Electrum script hash subscription routing (issue #478)', () => {
 		expect(refreshSpy.calledOnce).to.be.true;
 	});
 
+	it('routes across two instances on the same network', async () => {
+		// The client keeps one handler per network for the whole PROCESS, so
+		// the registry and dispatcher must be shared per network: an
+		// instance-local router would strand every instance but the first.
+		const refreshB = sinon.spy();
+		const electrumB = createElectrum(refreshB);
+		const cbA = sinon.spy();
+		const cbB = sinon.spy();
+		await electrum.subscribeToAddresses({
+			scriptHashes: ['11aa'],
+			onReceive: cbA
+		});
+		await electrumB.subscribeToAddresses({
+			scriptHashes: ['22bb'],
+			onReceive: cbB
+		});
+
+		await fireNotification(['22bb', 's1']);
+		expect(cbB.calledOnce, "the second instance's callback fires").to.be.true;
+		expect(refreshB.calledOnce, 'the second instance refreshes').to.be.true;
+		expect(cbA.notCalled).to.be.true;
+		expect(refreshSpy.notCalled, 'the first instance does not refresh').to.be
+			.true;
+
+		await fireNotification(['11aa', 's2']);
+		expect(cbA.calledOnce).to.be.true;
+		expect(refreshSpy.calledOnce).to.be.true;
+		expect(cbB.calledOnce).to.be.true;
+		expect(refreshB.calledOnce).to.be.true;
+	});
+
+	it('rolls back a callback whose subscription failed', async () => {
+		// A caller that retries a failed subscription with a fresh closure
+		// must not leave the failed attempt's callback receiving
+		// notifications alongside its successor.
+		const cb1 = sinon.spy();
+		const cb2 = sinon.spy();
+		failNextSubscribes = 1;
+		const failed = await electrum.subscribeToAddresses({
+			scriptHashes: ['33cc'],
+			onReceive: cb1
+		});
+		expect(failed.isErr()).to.be.true;
+		const retried = await electrum.subscribeToAddresses({
+			scriptHashes: ['33cc'],
+			onReceive: cb2
+		});
+		expect(retried.isErr()).to.be.false;
+
+		await fireNotification(['33cc', 's']);
+		expect(cb1.notCalled, 'the failed attempt left no callback').to.be.true;
+		expect(cb2.calledOnce).to.be.true;
+	});
+
 	describe('ElectrumBackend fan-out over a shared funding script', () => {
 		let backend: ElectrumBackend;
 
@@ -262,6 +345,46 @@ describe('Electrum script hash subscription routing (issue #478)', () => {
 
 			await fireNotification(['beef', 's1']);
 			expect(cb.callCount).to.equal(1);
+		});
+
+		it('rolls back a backend callback whose subscribe attempt failed', async () => {
+			// ChainWatcher retries a failed subscription with a fresh closure;
+			// the failed attempt's callback must not fire alongside it.
+			const stale = sinon.spy();
+			const fresh = sinon.spy();
+			failNextSubscribes = 1;
+			let threw = false;
+			try {
+				await backend.subscribeToScriptHash('44dd', stale);
+			} catch {
+				threw = true;
+			}
+			expect(threw, 'the failed subscribe propagates').to.be.true;
+			await backend.subscribeToScriptHash('44dd', fresh);
+
+			await fireNotification(['44dd', 's']);
+			expect(stale.notCalled, 'the failed attempt left no callback').to.be.true;
+			expect(fresh.calledOnce).to.be.true;
+		});
+
+		it('rolls back a backend callback whose subscribe attempt timed out', async () => {
+			const timedOut = sinon.spy();
+			const fresh = sinon.spy();
+			const impatient = new ElectrumBackend(electrum, 50);
+			hangNextSubscribes = 1;
+			let threw = false;
+			try {
+				await impatient.subscribeToScriptHash('55ee', timedOut);
+			} catch {
+				threw = true;
+			}
+			expect(threw, 'the timeout propagates').to.be.true;
+			await impatient.subscribeToScriptHash('55ee', fresh);
+
+			await fireNotification(['55ee', 's']);
+			expect(timedOut.notCalled, 'the timed-out attempt left no callback').to.be
+				.true;
+			expect(fresh.calledOnce).to.be.true;
 		});
 
 		it('unsubscribeScriptHash stops delivery and future resubscription', async () => {

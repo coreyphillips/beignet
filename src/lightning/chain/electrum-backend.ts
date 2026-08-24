@@ -260,6 +260,31 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 		return true;
 	}
 
+	/**
+	 * Undo what one FAILED subscribe attempt added: the attempt's own callback,
+	 * and the whole entry (wallet-layer dispatcher included) only when nothing
+	 * else holds callbacks for the hash. Callers retry with a fresh closure, so
+	 * keeping a failed attempt's callback would deliver every later
+	 * notification to it AND its successful successor.
+	 */
+	private _rollbackScriptHashCallback(
+		scriptHash: string,
+		entry: { callbacks: Set<() => void>; dispatcher: () => void },
+		onChange: () => void,
+		hadCallback: boolean
+	): void {
+		if (hadCallback) return;
+		entry.callbacks.delete(onChange);
+		if (entry.callbacks.size > 0) return;
+		if (this.subscribedScriptHashes.get(scriptHash) === entry) {
+			this.subscribedScriptHashes.delete(scriptHash);
+		}
+		this.electrum.removeScriptHashCallback({
+			scriptHash,
+			onReceive: entry.dispatcher
+		});
+	}
+
 	async subscribeToScriptHash(
 		scriptHash: string,
 		onChange: () => void
@@ -283,15 +308,33 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 			};
 			this.subscribedScriptHashes.set(scriptHash, entry);
 		}
+		const hadCallback = entry.callbacks.has(onChange);
 		entry.callbacks.add(onChange);
-		const result = await this.withTimeout(
-			this.electrum.subscribeToAddresses({
-				scriptHashes: [scriptHash],
-				onReceive: entry.dispatcher
-			}),
-			`subscribeToScriptHash(${scriptHash.slice(0, 8)}...)`
-		);
+		let result;
+		try {
+			result = await this.withTimeout(
+				this.electrum.subscribeToAddresses({
+					scriptHashes: [scriptHash],
+					onReceive: entry.dispatcher
+				}),
+				`subscribeToScriptHash(${scriptHash.slice(0, 8)}...)`
+			);
+		} catch (err) {
+			this._rollbackScriptHashCallback(
+				scriptHash,
+				entry,
+				onChange,
+				hadCallback
+			);
+			throw err;
+		}
 		if (result.isErr()) {
+			this._rollbackScriptHashCallback(
+				scriptHash,
+				entry,
+				onChange,
+				hadCallback
+			);
 			throw new Error(`Failed to subscribe to script hash: ${result.error}`);
 		}
 	}

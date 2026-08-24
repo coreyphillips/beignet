@@ -896,6 +896,35 @@ describe('Phase 4: Chain Watcher', () => {
 			).to.be.true;
 		});
 
+		it('starts exactly one spend scan per notification for a confirmed watch', async () => {
+			const { channelId, txid, scriptHash } = await armConfirmedWatch();
+
+			// The backend delivers a notification to EVERY callback registered
+			// for a script hash (issue #478), so the phase-routed subscription
+			// from watchFundingOutput has to be the only one this watch holds.
+			// The second one watchFundingSpend used to add made each
+			// notification start two identical history scans.
+			publishClose(txid, scriptHash, 101);
+			const originalHistory = backend.getScriptHashHistory.bind(backend);
+			let historyCalls = 0;
+			(backend as any).getScriptHashHistory = (
+				hash: string
+			): ReturnType<typeof originalHistory> => {
+				historyCalls++;
+				return originalHistory(hash);
+			};
+			backend.simulateScriptHashChange(scriptHash);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			expect(
+				spends.some((cid) => cid.equals(channelId)),
+				'the notification registered the close'
+			).to.be.true;
+			expect(historyCalls, 'one notification starts one spend scan').to.equal(
+				1
+			);
+		});
+
 		it('drops a block scan whose watch was replaced before it finished', async () => {
 			const { channelId, txid, scriptHash } = await armConfirmedWatch();
 
