@@ -80,6 +80,24 @@ export class Electrum {
 	private _currentServer: TServer | null = null;
 	/** Number of times the connected server changed after the first connect. */
 	private _rotationCount = 0;
+	/**
+	 * Per-script-hash subscription callbacks. rn-electrum-client installs only
+	 * ONE 'blockchain.scripthash.subscribe' handler per network (the first
+	 * onReceive it is handed) and answers a repeat script hash with
+	 * "Already Subscribed." without wiring the new callback, so per-call
+	 * closures are never delivered. Every subscribeAddress call therefore
+	 * gets the same dispatcher (_onScriptHashNotification) and the real
+	 * callbacks live here, routed by the script hash in the payload.
+	 */
+	private _scriptHashSubscriptions: Map<
+		string,
+		{
+			callbacks: Set<(data: TSubscribedReceive) => void>;
+			/** Address index of a UTXO tracked beyond the gap limit; that
+			 *  index is rescanned before the wallet refresh on notification. */
+			utxoIndex?: number;
+		}
+	> = new Map();
 
 	public servers?: TServer | TServer[];
 	public network: EAvailableNetworks;
@@ -1016,6 +1034,75 @@ export class Electrum {
 	}
 
 	/**
+	 * The single handler given to every subscribeAddress call. The client
+	 * delivers each scripthash notification for the network here exactly once;
+	 * route it to the callbacks registered for that hash, then refresh the
+	 * wallet (every notification refreshed the wallet before the registry
+	 * existed, and subscribed hashes are all wallet-relevant).
+	 */
+	private _onScriptHashNotification = async (
+		data: TSubscribedReceive
+	): Promise<void> => {
+		const scriptHash = Array.isArray(data) ? data[0] : undefined;
+		const entry = scriptHash
+			? this._scriptHashSubscriptions.get(scriptHash)
+			: undefined;
+		if (entry) {
+			// Snapshot: a callback may unregister itself or a sibling mid-dispatch.
+			for (const callback of [...entry.callbacks]) {
+				try {
+					callback(data);
+				} catch {
+					// One subscriber must not starve the rest or the refresh.
+				}
+			}
+			if (entry.utxoIndex !== undefined) {
+				await this.getUtxos({
+					scanningStrategy: EScanningStrategy.singleIndex,
+					addressIndex: entry.utxoIndex,
+					changeAddressIndex: entry.utxoIndex
+				});
+			}
+		}
+		void this._wallet.refreshWallet({});
+	};
+
+	private _getOrCreateScriptHashEntry(scriptHash: string): {
+		callbacks: Set<(data: TSubscribedReceive) => void>;
+		utxoIndex?: number;
+	} {
+		let entry = this._scriptHashSubscriptions.get(scriptHash);
+		if (!entry) {
+			entry = { callbacks: new Set() };
+			this._scriptHashSubscriptions.set(scriptHash, entry);
+		}
+		return entry;
+	}
+
+	/**
+	 * Detach a callback previously handed to subscribeToAddresses (matched by
+	 * function reference). Notifications for the hash stop reaching that
+	 * callback; the wallet refresh on notification is unaffected.
+	 */
+	removeScriptHashCallback({
+		scriptHash,
+		onReceive
+	}: {
+		scriptHash: string;
+		onReceive: (data: TSubscribedReceive) => void;
+	}): boolean {
+		const entry = this._scriptHashSubscriptions.get(scriptHash);
+		if (!entry) {
+			return false;
+		}
+		const removed = entry.callbacks.delete(onReceive);
+		if (entry.callbacks.size === 0 && entry.utxoIndex === undefined) {
+			this._scriptHashSubscriptions.delete(scriptHash);
+		}
+		return removed;
+	}
+
+	/**
 	 * Subscribes to a number of address script hashes for receiving.
 	 * @param {string[]} scriptHashes
 	 * @param onReceive
@@ -1063,15 +1150,18 @@ export class Electrum {
 			});
 		}
 
-		// Subscribe to all provided script hashes.
+		// Subscribe to all provided script hashes. Callbacks are registered
+		// before the client call: the protocol subscription can deliver a
+		// notification immediately, and a repeat hash resolves as "Already
+		// Subscribed." without touching the client's own handler wiring.
 		const allScriptHashesPromises = scriptHashes.map(async (scriptHash) => {
+			if (onReceive) {
+				this._getOrCreateScriptHashEntry(scriptHash).callbacks.add(onReceive);
+			}
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash,
 				network: this.electrumNetwork,
-				onReceive: async (data: TSubscribedReceive): Promise<void> => {
-					onReceive?.(data);
-					void this._wallet.refreshWallet({});
-				}
+				onReceive: this._onScriptHashNotification
 			});
 			if (response.error) {
 				throw Error('Unable to subscribe to receiving addresses.');
@@ -1079,18 +1169,15 @@ export class Electrum {
 		});
 
 		const allUtxosPromises = allUtxos.map(async (utxo) => {
+			const entry = this._getOrCreateScriptHashEntry(utxo.scriptHash);
+			if (onReceive) {
+				entry.callbacks.add(onReceive);
+			}
+			entry.utxoIndex = utxo.index;
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash: utxo.scriptHash,
 				network: this.electrumNetwork,
-				onReceive: async (data: TSubscribedReceive): Promise<void> => {
-					onReceive?.(data);
-					await this.getUtxos({
-						scanningStrategy: EScanningStrategy.singleIndex,
-						addressIndex: utxo.index,
-						changeAddressIndex: utxo.index
-					});
-					void this._wallet.refreshWallet({});
-				}
+				onReceive: this._onScriptHashNotification
 			});
 			if (response.error) {
 				throw Error('Unable to subscribe to receiving addresses.');
