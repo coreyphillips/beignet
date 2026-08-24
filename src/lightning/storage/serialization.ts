@@ -146,6 +146,8 @@ export interface ISerializedHtlcEntry {
 	forwardEmitted?: boolean;
 	/** Admission-time dust-exposure classification (see IHtlcEntry). */
 	dustExposureFailback?: boolean;
+	/** Admitted while the capsule-restore hold stood (see IHtlcEntry). */
+	addedWhileRestoreUnproven?: boolean;
 }
 
 export interface ISerializedHtlcSnapshot {
@@ -194,6 +196,9 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.dustExposureFailback !== undefined
 			? { dustExposureFailback: e.dustExposureFailback }
+			: {}),
+		...(e.addedWhileRestoreUnproven !== undefined
+			? { addedWhileRestoreUnproven: e.addedWhileRestoreUnproven }
 			: {})
 	};
 }
@@ -235,6 +240,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.dustExposureFailback !== undefined
 				? { dustExposureFailback: s.dustExposureFailback }
+				: {}),
+			...(s.addedWhileRestoreUnproven !== undefined
+				? { addedWhileRestoreUnproven: s.addedWhileRestoreUnproven }
 				: {})
 		}
 	};

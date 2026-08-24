@@ -318,6 +318,17 @@ export interface IHtlcEntry {
 	 * replay answers identically.
 	 */
 	dustExposureFailback?: boolean;
+	/**
+	 * Admission-time provenance (issue #469): this received HTLC entered the
+	 * channel while its capsule-restore hold (restoreRecencyUnproven) was
+	 * already standing, so the node fails it back once committed rather than
+	 * settling it. Stamped at admission because that is the fact the policy
+	 * turns on: an HTLC already committed in the capsule predates the hold,
+	 * still settles off chain, and must not be mistaken for a new one when
+	 * redispatchUnresolvedReceivedHtlcs replays it after a restart. Persisted
+	 * so the refusal survives a crash between the commit and the fail-back.
+	 */
+	addedWhileRestoreUnproven?: boolean;
 }
 
 /**

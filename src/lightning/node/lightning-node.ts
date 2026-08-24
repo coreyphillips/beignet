@@ -13163,13 +13163,22 @@ export class LightningNode extends EventEmitter {
 		// restart via redispatchUnresolvedReceivedHtlcs.
 		const finalHop = isFinalHop(processed.nextPacket);
 		let policyCode: number | null = null;
-		if (channel.getFullState().restoreRecencyUnproven === true) {
+		if (
+			channel.getFullState().restoreRecencyUnproven === true &&
+			htlcEntry.addedWhileRestoreUnproven === true
+		) {
 			// A capsule-restored channel whose recency cannot be proven takes
 			// no NEW HTLCs (issue #469). Settling this would reveal a preimage
 			// against a peer we could never escalate against, because every
 			// automatic close is refused while the hold stands, so the on-chain
 			// claim the deadline backstops exist to make can never happen;
 			// forwarding is the same bet with an extra leg.
+			//
+			// NEW is decided by the entry's admission-time provenance, not by
+			// the hold alone: this same path handles the redispatch of HTLCs
+			// already committed in the capsule (redispatchUnresolvedReceivedHtlcs
+			// after a restart), and those predate the hold, still settle off
+			// chain, and are exactly what the restore promises to preserve.
 			//
 			// Decided HERE rather than before the onion is processed, so the
 			// failure is encrypted under the sender's own shared secret and can

@@ -3007,7 +3007,13 @@ export class Channel {
 			direction: HtlcDirection.RECEIVED,
 			state: HtlcState.PENDING,
 			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {}),
-			...(dustExposureFailback ? { dustExposureFailback: true } : {})
+			...(dustExposureFailback ? { dustExposureFailback: true } : {}),
+			// Provenance for the capsule-restore hold (issue #469): only an add
+			// admitted while the hold already stood is refused by the node; one
+			// already committed in the capsule predates it and still settles.
+			...(this._state.restoreRecencyUnproven === true
+				? { addedWhileRestoreUnproven: true }
+				: {})
 		};
 
 		// The reserve check above is measured against the reserve WE enforce,

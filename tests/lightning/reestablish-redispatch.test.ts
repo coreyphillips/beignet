@@ -395,6 +395,102 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		alice.destroy();
 	});
 
+	it('a capsule-restored channel still fulfills the HTLC the capsule committed', async function () {
+		// The restore hold refuses NEW HTLCs, and the refusal used to key on
+		// the hold alone, so the redispatch of an HTLC the capsule itself had
+		// committed was failed back instead of fulfilled: the payer lost a
+		// payment the restore exists to preserve (issue #469). Provenance is
+		// per HTLC now, and only an add admitted while the hold already stood
+		// is refused.
+		this.timeout(20_000);
+		const dbPath = tempDb('redispatch-held-fulfill');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const dead = { val: false };
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, sealableStorage(storage1, dead));
+		wire(alice, bob, dead);
+		openReadyChannel(alice, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'held redispatch'
+		});
+
+		// Same crash point as the test above: the add round's commit lands,
+		// the fulfill chain dies with the process.
+		const holder = bob as unknown as {
+			recovery: {
+				commit: (transition: SafetyTransition) => IRecoveryCommitResult;
+			};
+		};
+		const realCommit = holder.recovery.commit.bind(holder.recovery);
+		let commits = 0;
+		holder.recovery.commit = (
+			transition: SafetyTransition
+		): IRecoveryCommitResult => {
+			if (dead.val) {
+				return {
+					committed: false,
+					released: [],
+					frameSequence: null,
+					error: new Error('crashed')
+				};
+			}
+			const result = realCommit(transition);
+			if (++commits === 3) dead.val = true;
+			return result;
+		};
+
+		const payment = alice.sendPayment(invoice.bolt11);
+		expect(payment.status, 'payment interrupted by the crash').to.equal(
+			PaymentStatus.PENDING
+		);
+		await settle();
+		bob.destroy();
+
+		// The capsule install stamps the hold on every restored row; this is
+		// that marker over the crash shape above. The committed HTLC predates
+		// it, so it carries no admitted-while-held provenance.
+		const inspect = new SqliteStorage(dbPath);
+		inspect.open();
+		const row = inspect.loadAllChannels()[0];
+		const committedEntries = [...row.state.htlcs.entries()].filter(
+			([key, entry]) =>
+				key.startsWith('received-') && entry.state === HtlcState.COMMITTED
+		);
+		expect(committedEntries.length, 'one committed received HTLC').to.equal(1);
+		expect(
+			committedEntries[0][1].addedWhileRestoreUnproven,
+			'the capsule HTLC predates the hold'
+		).to.equal(undefined);
+		row.state.restoreRecencyUnproven = true;
+		inspect.saveChannel(row.channelId, row.state, row.peerPubkey);
+
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		alice.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, inspect);
+		await reconnect(restarted, alice);
+
+		// The redispatch must fulfill, not fail back: the HTLC was admitted
+		// before the hold began.
+		expect(payment.status, 'payer settled despite the hold').to.equal(
+			PaymentStatus.COMPLETED
+		);
+		const channel = restarted.getChannelManager().listChannels()[0];
+		expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		expect(channel.getFullState().htlcs.size, 'no HTLC left pending').to.equal(
+			0
+		);
+		expect(
+			channel.getFullState().restoreRecencyUnproven,
+			'the hold itself still stands'
+		).to.equal(true);
+
+		restarted.destroy();
+		alice.destroy();
+	});
+
 	it('a receiver crash before the hold-park persists leaves the HTLC reachable by settle', async function () {
 		this.timeout(20_000);
 		const dbPath = tempDb('redispatch-hold');
