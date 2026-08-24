@@ -6930,6 +6930,27 @@ export class LightningNode extends EventEmitter {
 		// real and confirmed, and voiding it would destroy a live
 		// channel. Alarm only; splice rollback is a separate path.
 		if (state.spliceInFlight) return;
+		// And a splice that ENDS without confirming is the same channel with
+		// that record already cleared (issue #481). Both the abort path and the
+		// zero-conf completeSplice null spliceInFlight while the channel's
+		// funding watch still points at a splice outpoint that may never exist,
+		// after which three absent answers and BOLT 2's 2016 blocks would void
+		// a live, funded channel, taking its monitor and its SCB entry with it.
+		//
+		// So the guard turns on the invariant #463 settled rather than on a
+		// local record: a channel whose funding THIS NODE'S OWN WATCHER has
+		// seen on chain is never retired by absence. isFundingKnownOnChain is
+		// already exactly that evidence, persisted, peer-independent and
+		// fail-toward-keeping. What stays voidable is what BOLT 2's forget
+		// clock is actually for: a funding that never reached the chain at all.
+		if (channel.isFundingKnownOnChain()) {
+			this.emitStructuredLog('chain', 'funding_missing_ignored', {
+				channelId: channelId.toString('hex'),
+				txid,
+				reason: 'funding known on chain'
+			});
+			return;
+		}
 
 		const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
 		const pending = this.pendingFundingTxs.get(internalHex);
