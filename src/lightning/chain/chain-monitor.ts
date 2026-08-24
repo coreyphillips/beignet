@@ -1757,12 +1757,20 @@ export class ChainMonitor {
 				) {
 					return false;
 				}
-			} else if (scan.expectedSpendTxid !== undefined) {
-				// A record predating spentOutpoint cannot be matched, so keep
-				// exactly the rule that applied when it was written: a watch
-				// that ignores a spender by name never retracts.
-				return false;
 			}
+			// A record predating spentOutpoint cannot be outpoint-matched, and
+			// it used to refuse any scan naming an expected spender outright.
+			// But after an upgrade restart the pre-splice leg, which always
+			// names the splice tx, can be the ONLY watch still scanning the
+			// outpoint such a record spent: the channel's own watch has moved
+			// to the splice outpoint, so refusing the leg left a vanished
+			// spend's confirmation and finality clock running forever. The
+			// shapes that genuinely must never retract are already refused
+			// above by name: a record OF the scan's expected spender (the
+			// issue #357 adoption shape) and a record whose own outpoint the
+			// scan sits on. Anything else a name-carrying scan retracts stays
+			// fail-safe: if the recorded spend is really on chain, the watch
+			// covering the outpoint it spent re-reports it every sweep.
 		}
 		this._demoteRecordedConfirmation();
 		return true;

@@ -850,7 +850,7 @@ describe('Chain Monitor (Phase 4C)', function () {
 			expect(monitor.isCommitmentConfirmed()).to.be.true;
 		});
 
-		it('keeps the pre-outpoint rule for a record written before the field existed', function () {
+		it('lets a name-carrying watch retract a legacy record', function () {
 			const { monitor, closingTx } = coopCloseFixture();
 			// No outpoint supplied: the shape a row persisted before issue #479
 			// comes back with.
@@ -859,23 +859,38 @@ describe('Chain Monitor (Phase 4C)', function () {
 				monitor.getFullState().commitmentBroadcast!.spentOutpoint
 			).to.equal(undefined);
 
-			// Exactly the rule that applied when it was written: a watch that
-			// ignores a spender by name never retracts.
+			// After an upgrade restart the pre-splice leg, which always names
+			// the splice tx it ignores, can be the ONLY watch still scanning
+			// the outpoint such a record spent: the channel's own watch has
+			// moved to the splice outpoint, which the two txid guards refuse.
+			// Refusing the leg outright left the vanished spend's confirmation
+			// and finality clock running forever.
 			expect(
 				monitor.handleFundingSpendAbsent({
 					txid: 'aa'.repeat(32),
 					outputIndex: 0,
 					expectedSpendTxid: 'cc'.repeat(32)
 				}),
-				'a leg cannot retract an unmatchable record'
-			).to.be.false;
+				'a leg naming an unrelated spender retracts'
+			).to.be.true;
+			expect(monitor.isCommitmentConfirmed()).to.be.false;
+		});
+
+		it('still refuses a legacy record OF the expected spender', function () {
+			// The issue #357 adoption shape with a pre-outpoint row: the
+			// record is the splice transaction the leg exists to ignore, and
+			// the txid guard, not the outpoint match, is what refuses it.
+			const { monitor, closingTx } = coopCloseFixture();
+			monitor.handleFundingSpent(closingTx, 100);
 			expect(
 				monitor.handleFundingSpendAbsent({
 					txid: 'aa'.repeat(32),
-					outputIndex: 0
+					outputIndex: 0,
+					expectedSpendTxid: closingTx.getId()
 				}),
-				"but the channel's own watch still can"
-			).to.be.true;
+				'the record IS the expected spender'
+			).to.be.false;
+			expect(monitor.isCommitmentConfirmed()).to.be.true;
 		});
 
 		it('teaches a legacy record its outpoint from the next live report', function () {
