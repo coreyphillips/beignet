@@ -113,6 +113,24 @@ export interface ICommitmentBroadcast {
 	 */
 	revokedTxHex?: string;
 	/**
+	 * The funding outpoint this transaction was reported as spending (issue
+	 * #479).
+	 *
+	 * A channel has more than one watched funding outpoint once a splice leaves
+	 * a pre-splice leg behind, and an absence verdict is evidence about the ONE
+	 * outpoint its scan covered, so a retraction has to know which outpoint
+	 * this record belongs to. Durable, and that is what makes the ownership
+	 * survive a restart: it used to live only in the watcher's in-memory
+	 * bookkeeping, so a re-armed leg owned nothing, could not retract a breach
+	 * that had since been reorged out, and the finality clock kept advancing
+	 * against a height no longer in the chain.
+	 *
+	 * Display-order txid, as the watcher speaks it. Absent on rows written
+	 * before this field existed; see ChainMonitor.handleFundingSpendAbsent for
+	 * what that means.
+	 */
+	spentOutpoint?: { txid: string; outputIndex: number };
+	/**
 	 * Output indices of this commitment that one of our broadcast claims already
 	 * spends. A penalty batch can also spend settled-HTLC outputs reconstructed
 	 * from revokedHtlcSnapshots, which never become tracked outputs, so the
@@ -121,6 +139,23 @@ export interface ICommitmentBroadcast {
 	 * transaction that conflicts with a live claim of our own.
 	 */
 	claimedOutputIndices?: number[];
+}
+
+/**
+ * A funding-spend scan that fetched its script history successfully and found
+ * no transaction spending `txid:outputIndex`.
+ */
+export interface IFundingSpendScan {
+	txid: string;
+	outputIndex: number;
+	/**
+	 * A spender this scan deliberately does not report: the splice transaction
+	 * a pre-splice leg exists to ignore. A monitor record of THAT transaction
+	 * is the outpoint's real, expected spender, so an empty result is not
+	 * evidence against it. Its presence also marks the scan as a leg's, which
+	 * is what a record predating `spentOutpoint` keys off.
+	 */
+	expectedSpendTxid?: string;
 }
 
 /** Chain action types returned by ChainMonitor */

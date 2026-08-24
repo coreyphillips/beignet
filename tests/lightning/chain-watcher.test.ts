@@ -20,6 +20,7 @@ import {
 	computeScriptHash
 } from '../../src/lightning/chain/chain-watcher';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import { IFundingSpendScan } from '../../src/lightning/chain/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 
@@ -706,10 +707,11 @@ describe('Phase 4: Chain Watcher', () => {
 			const original =
 				channelManager.handleFundingSpendAbsent.bind(channelManager);
 			(channelManager as any).handleFundingSpendAbsent = (
-				channelId: Buffer
-			): void => {
+				channelId: Buffer,
+				scan?: IFundingSpendScan
+			): boolean => {
 				absentCalls.push(channelId);
-				original(channelId);
+				return original(channelId, scan);
 			};
 
 			watcher = new ChainWatcher({
@@ -959,6 +961,11 @@ describe('Phase 4: Chain Watcher', () => {
 		let watcher: ChainWatcher;
 		let spends: Buffer[];
 		let absentCalls: Buffer[];
+		let absentScans: Array<{
+			channelId: Buffer;
+			scan?: IFundingSpendScan;
+		}>;
+		let forceRetracted: boolean;
 		let reported: string[];
 
 		/** The registry the watches live in, for the retirement assertions. */
@@ -987,13 +994,22 @@ describe('Phase 4: Chain Watcher', () => {
 			});
 			channelManager.on('error', () => {});
 			absentCalls = [];
+			absentScans = [];
+			// The monitor owns the retraction decision now, and these channels
+			// have no monitor, so it always answers "nothing retracted". Tests
+			// about the WATCHER's arbitration force the answer instead of
+			// standing up a monitor they are not about; tests about the
+			// DECISION live in chain-monitor.test.ts.
+			forceRetracted = false;
 			const originalAbsent =
 				channelManager.handleFundingSpendAbsent.bind(channelManager);
 			(channelManager as any).handleFundingSpendAbsent = (
-				channelId: Buffer
-			): void => {
+				channelId: Buffer,
+				scan?: IFundingSpendScan
+			): boolean => {
 				absentCalls.push(channelId);
-				originalAbsent(channelId);
+				absentScans.push({ channelId, scan });
+				return originalAbsent(channelId, scan) || forceRetracted;
 			};
 			reported = [];
 			const originalSpent =
@@ -1235,23 +1251,35 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(scriptHash).to.be.a('string');
 		});
 
-		it('does not report a spend absence for the channel while a pre-splice watch is armed', async () => {
+		it('scopes an absence verdict to the outpoint the scan covered', async () => {
 			const { channelId, oldTxid, spliceTxid, scriptHash } = await armSplice();
 
 			// The splice confirmed, then a reorg took it out and the revoked
 			// pre-splice commitment won. The channel's own watch now finds
 			// nothing spending the outpoint the splice was going to create,
-			// while the pre-splice watch reports the breach. The absence
-			// verdict is channel-scoped, so left alone it would demote the
-			// breach the other watch just recorded, every block.
+			// while the pre-splice watch reports the breach on the OLD one.
+			// Left unscoped these two would undo each other every block; what
+			// keeps them apart is that each says which outpoint it is evidence
+			// about, and the monitor only ever retracts a record of that same
+			// outpoint (issue #479).
+			// Deep enough for the channel's own watch to confirm and arm its
+			// spend detection, so this really is two live watches over one
+			// shared script and not just the leg talking to itself.
 			backend.setHistory(scriptHash, [
 				{ txid: oldTxid, height: 90 },
-				{ txid: spliceTxid, height: 102 }
+				{ txid: spliceTxid, height: 100 }
 			]);
 			backend.simulateNewBlock(103);
 			await new Promise((resolve) => setTimeout(resolve, 50));
 
 			const breachTxid = publishBreach(oldTxid, scriptHash, 104);
+			// publishBreach rewrites the history; keep the splice in it, or the
+			// channel's own watch has nothing to be watching.
+			backend.setHistory(scriptHash, [
+				{ txid: oldTxid, height: 90 },
+				{ txid: spliceTxid, height: 100 },
+				{ txid: breachTxid, height: 104 }
+			]);
 			backend.simulateNewBlock(104);
 			await new Promise((resolve) => setTimeout(resolve, 50));
 
@@ -1259,10 +1287,36 @@ describe('Phase 4: Chain Watcher', () => {
 				spends.some((cid) => cid.equals(channelId)),
 				'the breach is reported'
 			).to.be.true;
+			const mine = absentScans.filter((c) => c.channelId.equals(channelId));
+			expect(mine.length, 'an absence verdict was offered').to.be.greaterThan(
+				0
+			);
+			for (const call of mine) {
+				expect(
+					call.scan,
+					'every absence verdict names the outpoint it is about'
+				).to.not.equal(undefined);
+				// The dangerous shape is a verdict that claims the outpoint the
+				// breach spent WITHOUT naming the splice transaction it
+				// ignores: that is the one the monitor would act on, and it
+				// would demote the breach the sibling just recorded.
+				if (call.scan!.txid === oldTxid) {
+					expect(
+						call.scan!.expectedSpendTxid,
+						'a verdict about the old outpoint is the leg speaking'
+					).to.equal(spliceTxid);
+				} else {
+					expect(
+						call.scan!.txid,
+						'and anything else is the channel watch, on its own outpoint'
+					).to.equal(spliceTxid);
+					expect(call.scan!.expectedSpendTxid).to.equal(undefined);
+				}
+			}
 			expect(
-				absentCalls.some((cid) => cid.equals(channelId)),
-				'no absence verdict contradicts it'
-			).to.be.false;
+				mine.some((c) => c.scan!.txid === spliceTxid),
+				'the channel watch spoke for its own outpoint'
+			).to.be.true;
 			expect(breachTxid).to.be.a('string');
 		});
 
@@ -1285,20 +1339,42 @@ describe('Phase 4: Chain Watcher', () => {
 				spends.some((cid) => cid.equals(channelId)),
 				'the breach is reported'
 			).to.be.true;
-			expect(absentCalls, 'and nothing contradicts it').to.have.length(0);
+			expect(
+				absentScans.filter(
+					(c) =>
+						c.channelId.equals(channelId) &&
+						c.scan?.txid === oldTxid &&
+						c.scan?.expectedSpendTxid === undefined
+				),
+				'and nothing offers to contradict it'
+			).to.have.length(0);
 
 			// Now the breach itself is reorged out. Whoever reported a spend
 			// has to be able to take it back, or the monitor keeps a
 			// confirmation height that is no longer in the chain and runs its
-			// finality clock against it.
+			// finality clock against it. The leg says so by naming the outpoint
+			// it scanned AND the splice transaction it deliberately ignores,
+			// which is what stops the same verdict retracting a record of that
+			// splice; the monitor matches the two (issue #479).
 			backend.setHistory(scriptHash, [{ txid: oldTxid, height: 90 }]);
 			backend.simulateNewBlock(105);
 			await new Promise((resolve) => setTimeout(resolve, 50));
 
+			const legVerdicts = absentScans.filter(
+				(c) => c.channelId.equals(channelId) && c.scan?.txid === oldTxid
+			);
 			expect(
-				absentCalls.some((cid) => cid.equals(channelId)),
-				'the leg retracts the spend it reported'
-			).to.be.true;
+				legVerdicts.length,
+				'the leg offers to retract the spend it reported'
+			).to.be.greaterThan(0);
+			expect(
+				legVerdicts[0].scan!.outputIndex,
+				'against the outpoint it is armed on'
+			).to.equal(0);
+			expect(
+				legVerdicts[0].scan!.expectedSpendTxid,
+				'and it names the spender it exists to ignore'
+			).to.equal(spliceTxid);
 		});
 
 		it('retires exactly at the monitor irrevocable boundary, not a block before', async () => {
@@ -1531,8 +1607,11 @@ describe('Phase 4: Chain Watcher', () => {
 			});
 			await new Promise((resolve) => setTimeout(resolve, 20));
 
-			// A reorg takes the breach out and the leg, which owns the verdict,
-			// retracts it. That retraction is a verdict of its own.
+			// A reorg takes the breach out and the leg, whose outpoint the
+			// monitor's record names, retracts it. This channel has no monitor,
+			// so the answer is forced; the decision itself is covered in
+			// chain-monitor.test.ts.
+			forceRetracted = true;
 			backend.setHistory(scriptHash, [
 				{ txid: oldTxid, height: 90 },
 				{ txid: spliceTxid, height: 105 }

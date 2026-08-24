@@ -72,6 +72,7 @@ import {
 	ChainActionType,
 	CommitmentType,
 	IFeeBumpAndBroadcastChainAction,
+	IFundingSpendScan,
 	satPerVbyteToSatPerKw
 } from '../chain/types';
 import {
@@ -2324,6 +2325,13 @@ export class ChannelManager extends EventEmitter {
 		blockHeight: number,
 		destinationScript: Buffer,
 		feeRatePerVbyte = 10,
+		// Which funding outpoint the reporting watch saw this transaction
+		// spend (issue #479). Ahead of the key material below rather than
+		// appended after it: nothing in this repository passes those three, and
+		// appending would make the one production call site write three bare
+		// undefined arguments before the meaningful one, which is the exact
+		// positional slip this round is fixing elsewhere.
+		spentOutpoint?: { txid: string; outputIndex: number },
 		revocationBasepointSecret?: Buffer,
 		paymentPrivkey?: Buffer,
 		network?: import('bitcoinjs-lib').Network
@@ -2363,7 +2371,11 @@ export class ChannelManager extends EventEmitter {
 			this._seedMonitorPreimages(channelIdHex, monitor);
 		}
 
-		const chainActions = monitor.handleFundingSpent(spendingTx, blockHeight);
+		const chainActions = monitor.handleFundingSpent(
+			spendingTx,
+			blockHeight,
+			spentOutpoint
+		);
 		this.processChainActions(channelId, chainActions);
 
 		// Reconcile the channel state machine with the on-chain close so that
@@ -2399,14 +2411,23 @@ export class ChannelManager extends EventEmitter {
 	 * found NO spender: whatever spend this channel's monitor has recorded as
 	 * confirmed is no longer in the chain or the mempool (issue 352). Let the
 	 * monitor stop its irrevocable-depth clock until positive evidence returns.
+	 *
+	 * `scan` names the outpoint that evidence is about. The monitor decides
+	 * whether its record answers to it, because the record is the durable half
+	 * and the watcher's is not (issue #479). Returns whether anything was
+	 * actually retracted, so the caller can tell a verdict that landed from one
+	 * that was refused.
 	 */
-	handleFundingSpendAbsent(channelId: Buffer): void {
+	handleFundingSpendAbsent(
+		channelId: Buffer,
+		scan?: IFundingSpendScan
+	): boolean {
 		const channelIdHex = channelId.toString('hex');
 		const monitor = this.monitors.get(channelIdHex);
-		if (!monitor) return;
-		if (monitor.handleFundingSpendAbsent()) {
-			this.emit('monitor:updated', channelIdHex, monitor);
-		}
+		if (!monitor) return false;
+		if (!monitor.handleFundingSpendAbsent(scan)) return false;
+		this.emit('monitor:updated', channelIdHex, monitor);
+		return true;
 	}
 
 	/**
