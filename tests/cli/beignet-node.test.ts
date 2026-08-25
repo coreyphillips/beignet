@@ -428,21 +428,38 @@ describe('BeignetNode', () => {
 		}
 	});
 
-	it('create should reject with BeignetError on bad electrum config', async () => {
-		// Use a non-existent host to trigger connection error during wallet creation
+	it('create comes up over an unreachable Electrum, on a locally derived sweep address', async function () {
+		this.timeout(20_000);
+		// This asserted the opposite until #400: it wrapped `expect.fail` in a
+		// catch that accepted any Error, and expect.fail throws an
+		// AssertionError, so the test passed whether or not create rejected.
+		// It does not reject: resolveWalletSweepScript swallows the connect
+		// failure and falls back to a deterministic index-0 wallet address,
+		// which is what keeps an offline restart able to build a force-close
+		// sweep. (The dial is a refused loopback port rather than the old
+		// 192.0.2.1 blackhole, which cost a connect timeout per run.)
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-test-'));
+		let node: BeignetNode | undefined;
 		try {
-			await BeignetNode.create({
+			node = await BeignetNode.create({
 				network: 'regtest',
-				electrumHost: '192.0.2.1', // TEST-NET, guaranteed unreachable
-				electrumPort: 1,
-				dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-test-'))
+				logLevel: 'silent',
+				dataDir: dir,
+				...OFFLINE_ELECTRUM
 			});
-			expect.fail('Should have thrown');
-		} catch (err: unknown) {
-			// Either BeignetError or connection error is acceptable
-			expect(err).to.be.instanceOf(Error);
+			const sweepScript = (
+				node as unknown as { sweepDestinationScript?: Buffer }
+			).sweepDestinationScript;
+			expect(
+				sweepScript,
+				'the offline fallback still produced a wallet-owned sweep script'
+			).to.be.instanceOf(Buffer);
+			expect(sweepScript!.length).to.be.greaterThan(0);
+		} finally {
+			await node?.destroy();
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
-	}).timeout(30000);
+	});
 });
 
 // ─────────────── Gossip Sync Deferral (issue #441) ───────────────
