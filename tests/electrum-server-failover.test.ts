@@ -1994,6 +1994,29 @@ describe('Electrum reconcile debt is not a subscribe failure (issue #514)', () =
 		).to.equal(true);
 	});
 
+	it('still reports the debt to a caller asking about the server', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		walletHeader.reconcileFails = true;
+		nextHeaderHeight = 90;
+		socketIsDead = true;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// The reconnect monitor's ping asks whether the SERVER is serving this
+		// wallet, and the history batches behind the reconciliation are that
+		// server's. Without this a server that answers headers and fails
+		// history pinned the monitor at zero failures forever, and in the
+		// daemon that monitor is the only path to a second server.
+		const pinged = await electrum.pingHeaderSubscription();
+		expect(pinged.isErr()).to.equal(true);
+		expect(
+			(await electrum.subscribeToHeader()).isOk(),
+			'while the subscription itself is still live'
+		).to.equal(true);
+	});
+
 	it('keeps the restore owed all the same', async () => {
 		await electrum.connectToElectrum({ servers: serverA });
 		await flush();

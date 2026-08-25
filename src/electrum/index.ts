@@ -1570,6 +1570,26 @@ export class Electrum {
 	}
 
 	/**
+	 * The same subscribe, answered as a liveness check on the SERVER rather
+	 * than on the subscription.
+	 *
+	 * A failed reconciliation is left out of the subscription result on
+	 * purpose: the subscription is registered, wired and answering, and a
+	 * caller that only needs headers (ChainWatcher, which refuses to accept
+	 * work at all without one) must not be told otherwise. But the RPCs the
+	 * reconciliation runs are the same server's, and a server that serves
+	 * blockchain.headers.subscribe while failing the history batches behind
+	 * checkUnconfirmedTransactions is exactly what a reconnect monitor exists
+	 * to rotate away from. So the monitor asks with this instead, and gets the
+	 * debt as the failure it is for that question.
+	 */
+	public async pingHeaderSubscription(): Promise<Result<IHeader>> {
+		const { result, reconcileOwed } = await this.subscribeToHeaderInternal();
+		if (result.isErr() || !reconcileOwed) return result;
+		return err('Unable to reconcile the header this server reported.');
+	}
+
+	/**
 	 * The subscribe itself, with the reconciliation debt reported apart from
 	 * the subscription result.
 	 *
