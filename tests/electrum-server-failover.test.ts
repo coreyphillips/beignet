@@ -1734,6 +1734,34 @@ describe('Electrum concurrent header subscribes (issue #507)', () => {
 		}
 	});
 
+	it('does not issue a queued subscribe from a stopped instance', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		// The first subscribe holds the gate; the second queues behind it.
+		const held = createGate();
+		headerSubscribeControls.set(1, { gate: held, fails: false });
+		client.subscribedHeaders = false;
+		const first = electrum.subscribeToHeader();
+		const queued = electrum.subscribeToHeader();
+		await flush();
+
+		await electrum.disconnect();
+		const callsBeforeRelease = headerSubscribeCalls;
+		held.release();
+		expect((await queued).isErr()).to.equal(true);
+		await first;
+		await flush();
+
+		// The client dials a random peers.json server for any network it holds
+		// no client for, and disconnect() is what leaves it with none, so a
+		// request issued from the queue after that point connects a stopped
+		// wallet to a server nobody chose.
+		expect(
+			headerSubscribeCalls,
+			'the queued subscribe must not reach the client at all'
+		).to.equal(callsBeforeRelease);
+	});
+
 	it('still delivers two genuine blocks', async () => {
 		await electrum.connectToElectrum({ servers: serverA });
 		await flush();

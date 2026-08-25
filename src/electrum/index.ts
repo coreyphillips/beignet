@@ -1694,6 +1694,19 @@ export class Electrum {
 		// header that overtook it: see THeaderRouter.seq.
 		let seenAt = router.seq;
 		const run = async (): Promise<ISubscribeToHeader> => {
+			// Re-checked here, not only on the way in: this caller can sit
+			// queued behind another subscribe for as long as that one takes,
+			// and a disconnect can land in the meantime. Issuing the request
+			// then would dial from a stopped instance, because the client falls
+			// into connectToRandomPeer whenever the network it is asked about
+			// has no client, and disconnect() is exactly what leaves it with
+			// none.
+			if (this._disconnected) {
+				return {
+					error: true,
+					data: DISCONNECTED_ERROR
+				} as unknown as ISubscribeToHeader;
+			}
 			seenAt = router.seq;
 			return electrum.subscribeHeader({
 				network: electrumNetwork,
