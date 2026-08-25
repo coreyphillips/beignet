@@ -372,7 +372,7 @@ Retrying the same invoice while the payment is still `PENDING` will throw `DUPLI
 |--------|---------|-------------------|----------|
 | `payInvoice()` | Yes | Yes | Simple scripts |
 | `payInvoiceSafe()` | Yes | No (returns `FAILED`) | Agent loops |
-| `sendPaymentAsync()` | No | No | Fire-and-forget |
+| `sendPaymentAsync()` | No | Only at submission (drain, limits, decode, no route) | Fire-and-forget |
 | `payInvoiceWithRetry()` | Yes | No | Production agents |
 
 ### Recommended safe pattern

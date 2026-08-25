@@ -285,14 +285,14 @@ export interface BeignetNodeOptions {
 	backupIntervalMs?: number;
 	/**
 	 * COMBINED daily spending limit in satoshis, shared by Lightning payments
-	 * (payInvoice/sendKeysend) AND external on-chain sends (sendOnchain and
-	 * sendMaxOnchain, counted as amount + fee). Excluded by design:
-	 * consolidateUtxos (self-pay), channel opens/splices/funding, and
+	 * (payInvoice/sendKeysend/sendPaymentAsync) AND external on-chain sends
+	 * (sendOnchain and sendMaxOnchain, counted as amount + fee). Excluded by
+	 * design: consolidateUtxos (self-pay), channel opens/splices/funding, and
 	 * bumpFeeOnchain/boostOnchain (fee-only). Resets at midnight UTC.
 	 * NOTE: before v0.3.0 this limit covered Lightning only.
 	 */
 	dailySpendLimitSats?: number;
-	/** Maximum amount in satoshis for a single payment. Rejects any payInvoice/sendKeysend call exceeding this. Prevents accidental large payments. */
+	/** Maximum amount in satoshis for a single payment. Rejects any payInvoice/sendKeysend/sendPaymentAsync call exceeding this. Prevents accidental large payments. */
 	maxPaymentSats?: number;
 	/** Timeout for connectPeer() in milliseconds (default: 15000) */
 	connectTimeoutMs?: number;
@@ -1029,6 +1029,15 @@ export class BeignetNode extends EventEmitter {
 	private _dailySpentOnchainSats = 0;
 	private _dailySpendResetTime = 0;
 	private _pendingSpendSats = 0;
+	/**
+	 * paymentHash hex -> sats reserved in _pendingSpendSats for a payment
+	 * submitted through the fire-and-forget path, which returns before the
+	 * payment settles and so has no local listener to release the reservation.
+	 * The forwarding payment:sent / payment:failed handlers installed in
+	 * create() settle these, which keeps the listener count constant no matter
+	 * how many async payments are in flight.
+	 */
+	private readonly _asyncSpendReservations = new Map<string, number>();
 	private _maxPaymentSats?: number;
 	/**
 	 * Paid L402 credentials, so a gated API is paid for once rather than per
@@ -1541,6 +1550,9 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('payment:sent', (info: IPaymentInfo) => {
 			const pi = this.toPaymentInfo(info);
+			// Before the forward, so a subscriber reading the daily spend from
+			// this event sees the settled payment already counted.
+			this._settleAsyncReservation(pi.paymentHash, true);
 			this.log('info', 'Payment sent', {
 				paymentHash: pi.paymentHash,
 				amountSats: pi.amountSats,
@@ -1550,6 +1562,7 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('payment:failed', (info: IPaymentInfo) => {
 			const pi = this.toPaymentInfo(info);
+			this._settleAsyncReservation(pi.paymentHash, false);
 			// A bare failure code cannot be acted on: the same code means very
 			// different things depending on WHICH hop returned it. Log the erring hop
 			// and the channel it was asked to forward over, so a route failure can be
@@ -4976,6 +4989,25 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
+	 * Releases the pending reservation an async payment holds, and records the
+	 * spend when it settled. Keyed on the map, so it runs exactly once per
+	 * payment however many times a terminal event arrives, and is a no-op for
+	 * payments whose caller holds its own reservation (payInvoice, sendKeysend).
+	 */
+	private _settleAsyncReservation(
+		paymentHashHex: string,
+		completed: boolean
+	): void {
+		const reservedSats = this._asyncSpendReservations.get(paymentHashHex);
+		if (reservedSats === undefined) return;
+		this._asyncSpendReservations.delete(paymentHashHex);
+		// Released before the spend is recorded, so a concurrent
+		// _checkSpendLimit never sees the same sats counted twice.
+		this._pendingSpendSats -= reservedSats;
+		if (completed) this._recordSpend(reservedSats);
+	}
+
+	/**
 	 * Returns the on-chain amount+fee an external send will subtract from the
 	 * daily budget, computed from the transaction the wallet just built.
 	 * FAIL CLOSED: when a limit is configured and the built fee cannot be
@@ -5597,7 +5629,22 @@ export class BeignetNode extends EventEmitter {
 		amountSats?: number,
 		metadata?: Record<string, string>
 	): { paymentHash: string; status: 'PENDING' } {
+		// Returning before the payment settles is the point of this method, not
+		// a licence to skip admission: drain mode and both spending limits are
+		// applied exactly as payInvoice applies them, and the reservation is
+		// settled by the forwarding handlers in create() rather than by a
+		// listener of our own (issue #526).
+		this._checkDraining();
 		const decoded = decodeInvoiceInput(bolt11);
+		const paymentHashHex = decoded.paymentHash.toString('hex');
+		const spendAmountSats =
+			amountSats ??
+			(decoded.amountMsat !== undefined
+				? Number(decoded.amountMsat / 1000n)
+				: 0);
+		// Converted BEFORE the spend accounting below, for the reason
+		// payInvoice's copy documents: a RangeError out of BigInt() must not
+		// leave the reservation raised for the life of the process (issue #474).
 		const maxFeeMsat =
 			maxFeeSats !== undefined
 				? BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) *
@@ -5608,12 +5655,42 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
-		if (metadata) {
-			this.node.setPaymentMetadata(decoded.paymentHash, metadata);
+
+		// A resubmission of a hash already in flight must not overwrite that
+		// payment's reservation: the send below refuses the duplicate, and
+		// releasing on the way out would free capacity the first payment still
+		// holds. Its limits are still checked.
+		let reserved = false;
+		if (spendAmountSats > 0) {
+			this._checkMaxPayment(spendAmountSats);
+			this._checkSpendLimit(spendAmountSats);
+			if (!this._asyncSpendReservations.has(paymentHashHex)) {
+				// Reserved BEFORE the send, both because a later submission must
+				// not pass the daily limit on capacity this one already holds and
+				// because sendPayment can emit a terminal event synchronously (an
+				// expired invoice fails inside the call) that the handler in
+				// create() has to find a reservation for.
+				this._pendingSpendSats += spendAmountSats;
+				this._asyncSpendReservations.set(paymentHashHex, spendAmountSats);
+				reserved = true;
+			}
 		}
-		this.node.sendPayment(bolt11, undefined, maxFeeMsat, amountMsat);
+		const releaseReservation = (): void => {
+			if (reserved) this._settleAsyncReservation(paymentHashHex, false);
+		};
+
+		try {
+			if (metadata) {
+				this.node.setPaymentMetadata(decoded.paymentHash, metadata);
+			}
+			this.node.sendPayment(bolt11, undefined, maxFeeMsat, amountMsat);
+		} catch (err: unknown) {
+			// A payment that never started holds no capacity.
+			releaseReservation();
+			throw err;
+		}
 		return {
-			paymentHash: decoded.paymentHash.toString('hex'),
+			paymentHash: paymentHashHex,
 			status: 'PENDING'
 		};
 	}
