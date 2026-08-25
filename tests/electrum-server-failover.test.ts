@@ -191,6 +191,10 @@ let headerSubscribeCalls: number;
  *  "Already Subscribed." included: reaching it at all is what dials a random
  *  peers.json server for a network with no client. */
 let headerSubscribeRequests: number;
+/** Every call that reached the client's subscribeAddress, the ones it answers
+ *  "Already Subscribed." included, so a restore that re-issues everything is
+ *  visible even when nothing new is subscribed. */
+let addressSubscribeRequests: number;
 /** Held open to keep a subscription request in flight for as long as a test
  *  needs, so a disconnect can land in the middle of one. */
 let subscriptionGate: { promise: Promise<void>; release: () => void } | null;
@@ -215,6 +219,8 @@ let balanceProbes: string[];
 /** Held open to park a connection poll inside its ping, so a disconnect can
  *  land in the middle of one. */
 let pingGate: { promise: Promise<void>; release: () => void } | null;
+/** The same, for the network-scoped liveness probe the poll actually uses. */
+let probeGate: { promise: Promise<void>; release: () => void } | null;
 /** Number of pings issued, so a test can prove one never happened. */
 let pings: number;
 /** Confirmed balance the stubbed script hash lookup answers with. */
@@ -371,6 +377,7 @@ const stubHelpers = (): void => {
 			scriptHash?: string;
 			onReceive?: (data: TNotification) => void;
 		} = {}) => {
+			addressSubscribeRequests++;
 			if (subscriptionGate) await subscriptionGate.promise;
 			if (subscriptionFailures.delete(scriptHash)) {
 				return { error: true, data: 'Subscription failed.' };
@@ -392,6 +399,7 @@ const stubHelpers = (): void => {
 		.stub(electrumHelpers, 'getAddressScriptHashBalance')
 		.callsFake(async ({ network }: { network?: string } = {}) => {
 			balanceProbes.push(network ?? '');
+			if (probeGate) await probeGate.promise;
 			if (peerIsDeaf) return { error: true, data: 'timeout' };
 			return { error: false, data: stubbedBalance };
 		});
@@ -560,12 +568,14 @@ const startTest = (): void => {
 	headerSubscribeControls = new Map();
 	headerSubscribeCalls = 0;
 	headerSubscribeRequests = 0;
+	addressSubscribeRequests = 0;
 	reachableHosts = new Set([serverA.host, serverB.host]);
 	disconnectFails = false;
 	socketIsDead = false;
 	peerIsDeaf = false;
 	balanceProbes = [];
 	pingGate = null;
+	probeGate = null;
 	pings = 0;
 	walletHeader = createWalletHeader();
 	stubHelpers();
@@ -580,6 +590,8 @@ const endTest = async (): Promise<void> => {
 	peerIsDeaf = false;
 	pingGate?.release();
 	pingGate = null;
+	probeGate?.release();
+	probeGate = null;
 	subscriptionGate?.release();
 	subscriptionGate = null;
 	headerHandlerGate?.release();
@@ -598,6 +610,31 @@ const endTest = async (): Promise<void> => {
 		await instance.disconnect();
 	}
 	createdInstances.length = 0;
+	// The network's restore debt is module state in src, and it deliberately
+	// outlives the instance that recorded it, so a test that ends owing one
+	// would leave every later test in this process (the CI run is one mocha
+	// process over the whole tests tree) running a restore it never asked for.
+	// One successful connect discharges it, which is how a live process clears
+	// it too.
+	try {
+		reachableHosts = new Set([serverA.host, serverB.host]);
+		subscriptionFailures.clear();
+		peerIsDeaf = false;
+		const sweeper = createElectrum(
+			sinon.spy(),
+			sinon.spy(),
+			'0000',
+			createWalletHeader()
+		);
+		await sweeper.connectToElectrum({ servers: serverA });
+		await flush();
+		await sweeper.disconnect();
+	} catch {
+		// A test that left the stubs unusable is reported by its own
+		// assertions, not by this.
+	}
+	createdInstances.length = 0;
+	createdWalletHeaders.length = 0;
 	sinon.restore();
 };
 
@@ -2366,14 +2403,18 @@ describe('Electrum lifecycle and disconnect races', () => {
 		await flush();
 		connectionEvents.length = 0;
 
-		// The tick is already inside its ping when the wallet stops.
-		pingGate = createGate();
+		// The tick is inside its liveness probe when the wallet stops, and the
+		// probe then answers that the peer is gone, which is the branch that
+		// reconnects.
+		probeGate = createGate();
+		peerIsDeaf = true;
 		const polling = pollConnection(electrum);
 		await flush();
 		await electrum.disconnect();
-		pingGate.release();
-		pingGate = null;
+		probeGate.release();
+		probeGate = null;
 		await polling;
+		peerIsDeaf = false;
 		await flush();
 
 		expect(
@@ -2451,6 +2492,19 @@ describe('Electrum lifecycle and disconnect races', () => {
 			protocolSubscribes,
 			'a debt on the shared client is any instance on the network to discharge'
 		).to.include('cccc');
+
+		// And the debt is settled. Counted at the client rather than read off
+		// protocolSubscribes, which records nothing for a hash the client
+		// answers "Already Subscribed.": a debt that is never discharged would
+		// otherwise be invisible, with every poll on every instance running a
+		// full restore forever.
+		const requestsAfterDischarge = addressSubscribeRequests;
+		await pollConnection(other);
+		await flush();
+		expect(
+			addressSubscribeRequests,
+			'a discharged debt must not keep re-running the restore'
+		).to.equal(requestsAfterDischarge);
 	});
 
 	it('does not let a stale restore discharge a newer debt (#499)', async () => {

@@ -29,6 +29,7 @@ import {
 	Electrum,
 	EProtocol,
 	EScanningStrategy,
+	ok,
 	TServer,
 	Wallet
 } from '../src';
@@ -492,24 +493,54 @@ describe('Electrum dispatch and monitor against a stopped instance', () => {
 		);
 	});
 
+	it('does not refresh a wallet that disconnects inside its own scan (#505)', async () => {
+		// The sibling of the case above: the parked entry is this instance's
+		// OWN, so the re-read at the top of the loop has already happened and
+		// only the check after the scan can catch the withdrawal.
+		let release = (): void => {};
+		const parked = new Promise<void>((resolve) => {
+			release = (): void => resolve();
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(electrum as any).getUtxos = async (): Promise<void> => parked;
+		await electrum.subscribeToAddresses({
+			scriptHashes: ['bcbc'],
+			onReceive: sinon.spy()
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(electrum as any)._scriptHashRecord('bcbc').utxoIndex = 0;
+
+		const dispatched = fireNotification(['bcbc', 's1']);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await electrum.disconnect();
+		release();
+		await dispatched;
+
+		expect(
+			refreshSpy.called,
+			'a wallet that shut down while its own scan ran must not be refreshed'
+		).to.equal(false);
+	});
+
 	it('lets the reconnect monitor tick past a stopped instance (#502)', async () => {
 		const backend = new ElectrumBackend(electrum);
 		let failovers = 0;
 		backend.onFailoverNeeded = (): void => {
 			failovers++;
 		};
+		const pinged = sinon.spy(electrum, 'pingHeaderSubscription');
 		await electrum.disconnect();
 
-		// The monitor's tick pings with subscribeToHeader, which a stopped
-		// instance refuses by design. Three of those used to reach the default
-		// failover threshold and reconnect the wallet.
-		const tick = async (): Promise<void> => {
-			backend.startReconnectMonitor(10);
-			await new Promise((resolve) => setTimeout(resolve, 40));
-			backend.stopReconnectMonitor();
-		};
-		await tick();
+		// Driven by hand rather than by wall clock: an assertion that the
+		// monitor did nothing is also true of a monitor that never ticked.
+		backend.startReconnectMonitor(10);
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		backend.stopReconnectMonitor();
+		await new Promise((resolve) => setTimeout(resolve, 0));
 
+		expect(pinged.called, 'a stopped instance must not even be asked').to.equal(
+			false
+		);
 		expect(
 			backend.getConsecutiveFailures(),
 			'a refusal by design is not a server failure'
@@ -519,5 +550,20 @@ describe('Electrum dispatch and monitor against a stopped instance', () => {
 			electrum.isDisconnected,
 			'the stopped instance stays stopped'
 		).to.equal(true);
+	});
+
+	it('still pings a live instance on every tick (#502)', async () => {
+		const backend = new ElectrumBackend(electrum);
+		const pinged = sinon
+			.stub(electrum, 'pingHeaderSubscription')
+			.resolves(ok({ height: 1, hash: 'aa', hex: '00' }));
+
+		backend.startReconnectMonitor(10);
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		backend.stopReconnectMonitor();
+
+		// The positive control: without this, the test above passes on a
+		// monitor that simply never ran.
+		expect(pinged.called, 'the monitor must actually tick').to.equal(true);
 	});
 });
