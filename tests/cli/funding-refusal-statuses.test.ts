@@ -526,3 +526,379 @@ describe('Issue #471: the grab-bag codes stop swallowing caller refusals', () =>
 		}
 	});
 });
+
+/**
+ * Issue #474: the payment and invoice paths were left out of #472's sweep.
+ *
+ * Two separate faults, both reachable from a single mistyped field:
+ *
+ * 1. payInvoice and sendKeysend raised _pendingSpendSats BEFORE the BigInt()
+ *    conversion that throws, and every decrement lives in the Promise below
+ *    that a RangeError never reaches. The reservation was stranded, and once
+ *    the leaked total passed dailySpendLimit, _checkSpendLimit refused every
+ *    real payment until the daemon restarted. The same strand happened on a
+ *    perfectly well-formed request whose sendPayment refused synchronously
+ *    (no route, a duplicate, a peer that is gone).
+ *
+ * 2. The rest of the caller-facing API converted amounts with an unguarded
+ *    BigInt(), so a fractional value scrubbed to a 500 INTERNAL_ERROR, the
+ *    class an agent retries.
+ *
+ * And the caller-state half of the two close codes: an unknown channel came
+ * back as CLOSE_FAILED, which has no status entry and shipped as a 500 with
+ * "Channel not found" in the body.
+ */
+describe('Issue #474: the payment and invoice paths guard before BigInt()', () => {
+	/** A signed BOLT 11 vector (BOLT 11 test vectors, 2500u) that decodes. */
+	const BOLT11 =
+		'lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs' +
+		'pp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7' +
+		'enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke' +
+		'0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh';
+	/**
+	 * nodeWithEngine plus the spend-accounting fields. They are class fields
+	 * set in the constructor, so Object.create leaves them undefined and
+	 * `undefined += n` would quietly make the counter NaN instead of leaking.
+	 */
+	function payingNode(
+		engine: Record<string, unknown>,
+		/** undefined is "no limit", which is what an unconfigured node has. */
+		dailySpendLimitSats?: number
+	): BeignetNode {
+		return Object.assign(nodeWithEngine(engine), {
+			_pendingSpendSats: 0,
+			_dailySpentSats: 0,
+			_dailySpentLightningSats: 0,
+			_dailySpentOnchainSats: 0,
+			_dailySpendLimitSats: dailySpendLimitSats,
+			_draining: false
+		}) as unknown as BeignetNode;
+	}
+
+	const pendingOf = (bn: BeignetNode): number =>
+		(bn as unknown as { _pendingSpendSats: number })._pendingSpendSats;
+
+	/** Run `fn`, returning the BeignetError it rejected with. */
+	async function asyncRefusalFrom(
+		fn: () => Promise<unknown>,
+		label: string
+	): Promise<BeignetError> {
+		try {
+			await fn();
+		} catch (err: unknown) {
+			expect(err, label).to.be.instanceOf(BeignetError);
+			return err as BeignetError;
+		}
+		return expect.fail(`${label}: expected a refusal`);
+	}
+
+	/** Every entry point, its unreachable engine method, and how to call it. */
+	const ENTRY_POINTS: Array<{
+		name: string;
+		engineMethod: string;
+		/** Called with the bad value in each numeric position, in turn. */
+		call: (bn: BeignetNode, bad: unknown) => unknown;
+		field: string;
+	}> = [
+		{
+			name: 'createInvoice(amountSats)',
+			engineMethod: 'createInvoice',
+			call: (bn, bad): unknown => bn.createInvoice(bad as number),
+			field: 'amountSats'
+		},
+		{
+			name: 'createHoldInvoice(amountSats)',
+			engineMethod: 'createInvoice',
+			call: (bn, bad): unknown =>
+				bn.createHoldInvoice({
+					paymentHash: 'ab'.repeat(32),
+					amountSats: bad as number
+				}),
+			field: 'amountSats'
+		},
+		{
+			name: 'payInvoice(maxFeeSats)',
+			engineMethod: 'sendPayment',
+			call: (bn, bad): unknown => bn.payInvoice(BOLT11, 60_000, bad as number),
+			field: 'maxFeeSats'
+		},
+		{
+			name: 'payInvoice(amountSats)',
+			engineMethod: 'sendPayment',
+			call: (bn, bad): unknown =>
+				bn.payInvoice(BOLT11, 60_000, undefined, bad as number),
+			field: 'amountSats'
+		},
+		{
+			name: 'sendPaymentAsync(maxFeeSats)',
+			engineMethod: 'sendPayment',
+			call: (bn, bad): unknown => bn.sendPaymentAsync(BOLT11, bad as number),
+			field: 'maxFeeSats'
+		},
+		{
+			name: 'sendPaymentAsync(amountSats)',
+			engineMethod: 'sendPayment',
+			call: (bn, bad): unknown =>
+				bn.sendPaymentAsync(BOLT11, undefined, bad as number),
+			field: 'amountSats'
+		},
+		{
+			name: 'sendKeysend(amountSats)',
+			engineMethod: 'sendKeysend',
+			call: (bn, bad): unknown => bn.sendKeysend(PUBKEY, bad as number),
+			field: 'amountSats'
+		},
+		{
+			name: 'sendKeysend(maxFeeSats)',
+			engineMethod: 'sendKeysend',
+			call: (bn, bad): unknown =>
+				bn.sendKeysend(PUBKEY, 1_000, 60_000, bad as number),
+			field: 'maxFeeSats'
+		},
+		{
+			name: 'queryRoute(maxFeeSats)',
+			engineMethod: 'queryRoute',
+			call: (bn, bad): unknown =>
+				bn.queryRoute('02' + 'cd'.repeat(32), 1_000, bad as number),
+			field: 'maxFeeSats'
+		},
+		{
+			name: 'canSend(amountSats)',
+			engineMethod: 'listChannels',
+			call: (bn, bad): unknown => bn.canSend(bad as number),
+			field: 'amountSats'
+		},
+		{
+			name: 'canReceive(amountSats)',
+			engineMethod: 'listChannels',
+			call: (bn, bad): unknown => bn.canReceive(bad as number),
+			field: 'amountSats'
+		},
+		{
+			name: 'updateChannelPolicy(htlcMinimumMsat)',
+			engineMethod: 'setChannelPolicy',
+			call: (bn, bad): unknown =>
+				bn.updateChannelPolicy(CHANNEL_ID, {
+					htlcMinimumMsat: bad as number
+				}),
+			field: 'htlcMinimumMsat'
+		},
+		{
+			name: 'updateChannelPolicy(htlcMaximumMsat)',
+			engineMethod: 'setChannelPolicy',
+			call: (bn, bad): unknown =>
+				bn.updateChannelPolicy(CHANNEL_ID, {
+					htlcMaximumMsat: bad as number
+				}),
+			field: 'htlcMaximumMsat'
+		}
+	];
+
+	for (const entry of ENTRY_POINTS) {
+		/** An engine that must never be reached: the guard runs first. */
+		const guarded = (): BeignetNode =>
+			payingNode({
+				[entry.engineMethod]: (): never => {
+					expect.fail(`${entry.name}: the engine was reached past the guard`);
+				},
+				setPaymentMetadata: (): void => {},
+				listChannels: (): unknown[] => []
+			});
+
+		for (const [label, bad] of [
+			['fractional', 1.5],
+			['negative', -1],
+			['non-finite', Number.POSITIVE_INFINITY],
+			['unsafe', Number.MAX_SAFE_INTEGER + 2]
+		] as Array<[string, unknown]>) {
+			it(`${entry.name} refuses a ${label} value`, async () => {
+				const bn = guarded();
+				const err = await asyncRefusalFrom(
+					async () => entry.call(bn, bad),
+					entry.name
+				);
+				expect(err.code, entry.name).to.equal(BeignetErrorCode.INVALID_PARAMS);
+				expect(err.message, entry.name).to.contain(entry.field);
+				expect(statusForErrorCode(err.code), entry.name).to.equal(400);
+				// Nothing was reserved for a request that never started.
+				expect(pendingOf(bn), entry.name).to.equal(0);
+			});
+		}
+	}
+
+	it('a repeated bad maxFeeSats does not ratchet the spend reservation', async () => {
+		const bn = payingNode({
+			sendPayment: (): never => expect.fail('the engine was reached'),
+			setPaymentMetadata: (): void => {}
+		});
+		for (let i = 0; i < 3; i++) {
+			const err = await asyncRefusalFrom(
+				async () => bn.payInvoice(BOLT11, 60_000, 1.5),
+				'payInvoice'
+			);
+			expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
+		}
+		// Each refusal used to leave the invoice's own 250 000 sats reserved,
+		// so three of them put 750 000 sats permanently against the limit.
+		expect(pendingOf(bn)).to.equal(0);
+	});
+
+	it('payInvoice releases the reservation when the send is refused', async () => {
+		const bn = payingNode({
+			setPaymentMetadata: (): void => {},
+			failPayment: (): void => {},
+			on: (): void => {},
+			removeListener: (): void => {},
+			sendPayment: (): never => {
+				throw Object.assign(new Error('No route found'), { code: 'NO_ROUTE' });
+			}
+		});
+		const err = await asyncRefusalFrom(
+			async () => bn.payInvoice(BOLT11, 60_000),
+			'payInvoice'
+		);
+		expect(err.code).to.equal(BeignetErrorCode.NO_ROUTE);
+		// A payment that never started holds no capacity.
+		expect(pendingOf(bn)).to.equal(0);
+	});
+
+	it('sendKeysend releases the reservation when the send throws', async () => {
+		const bn = payingNode({
+			sendKeysend: (): never => {
+				throw new Error('boom');
+			}
+		});
+		try {
+			await bn.sendKeysend(PUBKEY, 5_000);
+			expect.fail('expected the keysend to fail');
+		} catch (err: unknown) {
+			expect((err as Error).message).to.equal('boom');
+		}
+		expect(pendingOf(bn)).to.equal(0);
+	});
+
+	it('a settled keysend records the spend exactly once', async () => {
+		const bn = payingNode(
+			{
+				sendKeysend: (): unknown => ({
+					paymentHash: Buffer.alloc(32, 1),
+					amountMsat: 5_000_000n,
+					status: 'COMPLETED',
+					direction: 'OUTGOING',
+					createdAt: 0
+				}),
+				listChannels: (): unknown[] => []
+			},
+			1_000_000
+		);
+		await bn.sendKeysend(PUBKEY, 5_000);
+		expect(pendingOf(bn)).to.equal(0);
+		expect(
+			(bn as unknown as { _dailySpentSats: number })._dailySpentSats
+		).to.equal(5_000);
+	});
+
+	it('a string amount never reaches the spend accounting', async () => {
+		const bn = payingNode({
+			sendPayment: (): never => expect.fail('the engine was reached'),
+			setPaymentMetadata: (): void => {}
+		});
+		const err = await asyncRefusalFrom(
+			async () =>
+				bn.payInvoice(BOLT11, 60_000, undefined, '1000' as unknown as number),
+			'payInvoice'
+		);
+		expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
+		// BigInt('1000') would have succeeded, so the string used to reach the
+		// limit math, where + concatenates instead of adding.
+		expect(typeof pendingOf(bn)).to.equal('number');
+		expect(pendingOf(bn)).to.equal(0);
+	});
+
+	it('a zero fee ceiling and an amountless invoice still work', () => {
+		const bn = payingNode({
+			createInvoice: (opts: { amountMsat?: bigint }): unknown => ({
+				bolt11: 'lnbcrt1',
+				paymentHash: Buffer.alloc(32),
+				paymentSecret: Buffer.alloc(32),
+				amountMsat: opts.amountMsat
+			})
+		});
+		// Zero means "amountless", the BOLT 11 shape the guard must not refuse.
+		expect(bn.createInvoice(0).amountSats).to.equal(undefined);
+		expect(bn.createInvoice(undefined).amountSats).to.equal(undefined);
+		expect(bn.createInvoice(1_000).amountSats).to.equal(1_000);
+	});
+
+	it('accepts a decimal-string msat policy field, and refuses a word', () => {
+		let seen: { htlcMinimumMsat?: bigint } | undefined;
+		const bn = payingNode({
+			setChannelPolicy: (
+				_id: unknown,
+				update: { htlcMinimumMsat?: bigint }
+			) => {
+				seen = update;
+			},
+			listChannels: (): unknown[] => [],
+			getChannelPolicy: (): undefined => undefined
+		});
+		bn.updateChannelPolicy(CHANNEL_ID, { htlcMinimumMsat: '1000' });
+		expect(seen?.htlcMinimumMsat).to.equal(1000n);
+		const err = refusalFrom(
+			() => bn.updateChannelPolicy(CHANNEL_ID, { htlcMinimumMsat: 'lots' }),
+			'updateChannelPolicy'
+		);
+		expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
+	});
+
+	it('closes: an unknown channel is CHANNEL_NOT_FOUND, not a 500 grab-bag', () => {
+		const bn = nodeWithEngine({
+			getChannel: (): undefined => undefined,
+			getFundingAddress: (): string =>
+				'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080',
+			getRecoveryStatus: (): unknown => ({ channels: [] }),
+			closeChannel: (): never => expect.fail('the engine was reached'),
+			forceCloseChannel: (): never => expect.fail('the engine was reached')
+		});
+		for (const [label, call] of [
+			['closeChannel', (): unknown => bn.closeChannel(CHANNEL_ID)],
+			['forceCloseChannel', (): unknown => bn.forceCloseChannel(CHANNEL_ID)]
+		] as Array<[string, () => unknown]>) {
+			const err = refusalFrom(call, label);
+			expect(err.code, label).to.equal(BeignetErrorCode.CHANNEL_NOT_FOUND);
+			expect(statusForErrorCode(err.code), label).to.equal(404);
+			expect(err.message, label).to.contain(CHANNEL_ID);
+		}
+	});
+
+	it('closes: a malformed channel id is refused, not truncated', () => {
+		const bn = nodeWithEngine({
+			getChannel: (): never => expect.fail('the id guard was skipped'),
+			getFundingAddress: (): never => expect.fail('the id guard was skipped'),
+			getRecoveryStatus: (): unknown => ({ channels: [] })
+		});
+		for (const [label, call] of [
+			['closeChannel', (): unknown => bn.closeChannel('cd')],
+			['forceCloseChannel', (): unknown => bn.forceCloseChannel('cd')]
+		] as Array<[string, () => unknown]>) {
+			const err = refusalFrom(call, label);
+			expect(err.code, label).to.equal(BeignetErrorCode.INVALID_PARAMS);
+			expect(statusForErrorCode(err.code), label).to.equal(400);
+		}
+	});
+
+	it('keeps CLOSE_FAILED for a channel that exists and would not close', () => {
+		const bn = nodeWithEngine({
+			getChannel: (): unknown => ({ channelId: Buffer.alloc(32) }),
+			getFundingAddress: (): string =>
+				'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080',
+			closeChannel: (): unknown => ({
+				ok: false,
+				error: 'channel is quiescing'
+			})
+		});
+		const result = bn.closeChannel(CHANNEL_ID);
+		expect(result.ok).to.equal(false);
+		expect(result.error).to.equal('channel is quiescing');
+	});
+});

@@ -277,7 +277,12 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// DESCRIPTOR_EXPORT_FAILED are node faults, and SEND_FAILED, CLOSE_FAILED,
 	// FORCE_CLOSE_FAILED, ZERO_CONF_FAILED and the PSBT_* trio are grab-bags
 	// whose producers span caller state and genuine faults; each needs
-	// splitting before it can carry one honest status (issue #474).
+	// splitting before it can carry one honest status (issue #474). The
+	// caller-state half of the two close codes is split off at the source
+	// rather than here: closeChannel/forceCloseChannel now refuse a malformed
+	// id as INVALID_PARAMS and an unknown channel as CHANNEL_NOT_FOUND, so what
+	// still reaches CLOSE_FAILED/FORCE_CLOSE_FAILED is a channel that exists
+	// and would not close.
 	// INSTANCE_ALREADY_RUNNING is a startup refusal and never reaches HTTP.
 };
 
