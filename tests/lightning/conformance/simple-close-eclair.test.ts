@@ -3,9 +3,11 @@
  *
  * No upstream lightning/bolts test vectors exist for closing_complete /
  * closing_sig, so the fixture (vectors/eclair-simple-close.json) freezes
- * payloads captured from a live eclair 0.13 node during the
- * tests/lightning/interop/eclair-simple-close.test.ts run. Skips cleanly if
- * the fixture has not been captured yet.
+ * payloads captured from a live eclair 0.13 node by a
+ * CAPTURE_VECTORS=1 run of tests/lightning/interop/eclair-simple-close.test.ts.
+ * The fixture is a frozen reference: an ordinary interop run does not rewrite
+ * it, so a decode regression against those real payloads fails here rather
+ * than being re-frozen away. Skips cleanly if the fixture is missing.
  */
 
 import { expect } from 'chai';
@@ -32,7 +34,7 @@ describe('Conformance: option_simple_close (eclair wire bytes)', function () {
 	before(function () {
 		if (!fs.existsSync(FIXTURE)) {
 			console.log(
-				'    ⚠ eclair-simple-close.json not captured yet — run the eclair interop test first'
+				'    ⚠ eclair-simple-close.json not captured yet — run the eclair interop test with CAPTURE_VECTORS=1 first'
 			);
 			this.skip();
 			return;
