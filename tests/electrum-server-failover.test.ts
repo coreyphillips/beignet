@@ -202,6 +202,19 @@ let socketIsDead: boolean;
 /** Confirmed balance the stubbed script hash lookup answers with. */
 const stubbedBalance = { confirmed: 4321, unconfirmed: 0 };
 
+/**
+ * sinon's fake timers, reached through a cast: the sinon typing this repo
+ * resolves for the default export does not declare them, and the test type
+ * check is run over the whole tests tree.
+ */
+type TFakeClock = { tick: (ms: number) => void; restore: () => void };
+const useFakeClock = (toFake: string[]): TFakeClock =>
+	(
+		sinon as unknown as {
+			useFakeTimers: (opts: { now: number; toFake: string[] }) => TFakeClock;
+		}
+	).useFakeTimers({ now: Date.now(), toFake });
+
 const createGate = (): { promise: Promise<void>; release: () => void } => {
 	let release = (): void => {};
 	const promise = new Promise<void>((resolve) => {
@@ -1696,10 +1709,7 @@ describe('Electrum concurrent header subscribes (issue #507)', () => {
 	});
 
 	it('does not let one unanswered subscribe wedge the network', async () => {
-		const clock = sinon.useFakeTimers({
-			now: Date.now(),
-			toFake: ['setTimeout', 'clearTimeout']
-		});
+		const clock = useFakeClock(['setTimeout', 'clearTimeout']);
 		try {
 			// A server that accepts the connection and then says nothing. The
 			// client's own handshake carries no timeout, so this attempt never
