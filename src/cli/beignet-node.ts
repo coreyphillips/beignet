@@ -763,6 +763,40 @@ function requirePositiveSafeInteger(value: unknown, field: string): number {
 	return value;
 }
 
+/**
+ * A satoshi amount that may legitimately be nothing: a fee ceiling of zero
+ * ("route for free or fail"), an invoice with no amount, a push of nothing.
+ * Everything else requirePositiveSafeInteger refuses is refused here too.
+ */
+function requireNonNegativeSafeInteger(value: unknown, field: string): number {
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be a whole number of satoshis, zero or greater`
+		);
+	}
+	return value;
+}
+
+/**
+ * A millisatoshi field that reaches the library as a bigint but is accepted
+ * from callers as a number or a decimal string. BigInt() is the only thing
+ * that ever validated it, by throwing, so both spellings are checked here
+ * instead: a whole non-negative number, or digits only.
+ */
+function requireMsatValue(value: number | string, field: string): bigint {
+	if (typeof value === 'number') {
+		return BigInt(requireNonNegativeSafeInteger(value, field));
+	}
+	if (typeof value === 'string' && /^[0-9]+$/.test(value)) {
+		return BigInt(value);
+	}
+	throw new BeignetError(
+		BeignetErrorCode.INVALID_PARAMS,
+		`${field} must be a whole number of millisatoshis, or a string of digits`
+	);
+}
+
 /** A fee rate may be fractional, but it must be a real, positive, finite number. */
 function requirePositiveFiniteNumber(value: unknown, field: string): number {
 	if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
@@ -4393,7 +4427,21 @@ export class BeignetNode extends EventEmitter {
 		// and a stale one is peer-favourable by construction (issue #469).
 		acceptStaleStateRisk = false
 	): { ok: boolean; error?: string } {
-		const idBuf = Buffer.from(channelId, 'hex');
+		// Validated the way forceCloseChannel already validates: Buffer.from
+		// truncates at the first non-hex pair, so a caller's spelling is not an
+		// identity and a malformed id would silently address some other channel
+		// (issue #463/#469).
+		const idBuf = requireChannelIdHex(channelId);
+		// An unknown channel is the caller's mistake, not a node fault. It used
+		// to fall through to the engine and come back as CLOSE_FAILED, which
+		// has no status entry and therefore shipped as a retryable 500 with
+		// "Channel not found" in the body (issue #474).
+		if (!this.node.getChannel(idBuf)) {
+			throw new BeignetError(
+				BeignetErrorCode.CHANNEL_NOT_FOUND,
+				`Channel not found: ${idBuf.toString('hex')}`
+			);
+		}
 		// Derive a P2WPKH script from the funding address for the closing output
 		const address = this.node.getFundingAddress();
 		const bitcoin = require('bitcoinjs-lib');
@@ -4431,6 +4479,16 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		const idBuf = Buffer.from(channelId, 'hex');
+		// Same reason closeChannel refuses one: an unknown channel is a caller
+		// mistake, and FORCE_CLOSE_FAILED carries no status, so it shipped as a
+		// 500 (issue #474). Checked before the acknowledgement so a typo is
+		// answered as a typo rather than as a restore refusal.
+		if (!this.node.getChannel(idBuf)) {
+			throw new BeignetError(
+				BeignetErrorCode.CHANNEL_NOT_FOUND,
+				`Channel not found: ${idBuf.toString('hex')}`
+			);
+		}
 		// Compare on the DECODED bytes, which is what the engine resolves.
 		const canonicalId = idBuf.toString('hex');
 		const held = this.node
@@ -4675,9 +4733,12 @@ export class BeignetNode extends EventEmitter {
 		expirySecs?: number,
 		descriptionHash?: Buffer
 	): InvoiceInfo {
+		// Zero and undefined both mean "amountless invoice"; anything else has
+		// to survive BigInt(), which a fractional amountSats does not (#474).
 		const amountMsat =
 			amountSats !== undefined && amountSats !== 0
-				? BigInt(amountSats) * 1000n
+				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
+				  1000n
 				: undefined;
 		const result = this.node.createInvoice({
 			amountMsat,
@@ -4720,7 +4781,8 @@ export class BeignetNode extends EventEmitter {
 		const amountMsat =
 			opts.amountMsat ??
 			(opts.amountSats !== undefined && opts.amountSats !== 0
-				? BigInt(opts.amountSats) * 1000n
+				? BigInt(requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')) *
+				  1000n
 				: undefined);
 		const result = this.node.createInvoice({
 			amountMsat,
@@ -5224,26 +5286,57 @@ export class BeignetNode extends EventEmitter {
 			(decoded.amountMsat !== undefined
 				? Number(decoded.amountMsat / 1000n)
 				: 0);
+		// Converted BEFORE the spend accounting below, not after it. Every
+		// decrement of _pendingSpendSats lives inside the Promise executor
+		// further down, which a RangeError out of BigInt() never reaches: the
+		// counter would stay raised for the life of the process, and once it
+		// passed dailySpendLimit _checkSpendLimit would refuse every real
+		// payment until the daemon restarted (issue #474).
+		const maxFeeMsat =
+			maxFeeSats !== undefined
+				? BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) *
+				  1000n
+				: undefined;
+		const amountMsat =
+			amountSats !== undefined
+				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
+				  1000n
+				: undefined;
+
 		if (spendAmountSats > 0) {
 			this._checkMaxPayment(spendAmountSats);
 			this._checkSpendLimit(spendAmountSats);
 			this._pendingSpendSats += spendAmountSats;
 		}
 
-		const maxFeeMsat =
-			maxFeeSats !== undefined ? BigInt(maxFeeSats) * 1000n : undefined;
-		const amountMsat =
-			amountSats !== undefined ? BigInt(amountSats) * 1000n : undefined;
+		// One release shared by every exit, and idempotent, because more than
+		// one can run for a single payment (a timeout followed by a late
+		// payment:failed). The reservation is deliberately held for the whole
+		// in-flight window: it is what stops two concurrent payments both
+		// passing the daily limit before either records a spend, so this must
+		// never become a `finally` around the synchronous body.
+		let released = false;
+		const releaseReservation = (): void => {
+			if (spendAmountSats <= 0 || released) return;
+			released = true;
+			this._pendingSpendSats -= spendAmountSats;
+		};
 
-		// Store metadata on the payment if provided
-		if (metadata) {
-			this.node.setPaymentMetadata(decoded.paymentHash, metadata);
+		// Store metadata on the payment if provided. Guarded, because nothing
+		// between the reservation above and the executor below may strand it.
+		try {
+			if (metadata) {
+				this.node.setPaymentMetadata(decoded.paymentHash, metadata);
+			}
+		} catch (err: unknown) {
+			releaseReservation();
+			throw err;
 		}
 
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				if (spendAmountSats > 0) this._pendingSpendSats -= spendAmountSats;
+				releaseReservation();
 				// Clean up the ghost payment to free channel capacity
 				this.node.failPayment(decoded.paymentHash);
 				reject(
@@ -5263,17 +5356,17 @@ export class BeignetNode extends EventEmitter {
 			const onSent = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					if (spendAmountSats > 0) {
-						this._pendingSpendSats -= spendAmountSats;
-						this._recordSpend(spendAmountSats);
-					}
+					// Released before the spend is recorded, so a concurrent
+					// _checkSpendLimit never sees the same sats counted twice.
+					releaseReservation();
+					if (spendAmountSats > 0) this._recordSpend(spendAmountSats);
 					resolve(this.toPaymentInfo(info));
 				}
 			};
 			const onFailed = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					if (spendAmountSats > 0) this._pendingSpendSats -= spendAmountSats;
+					releaseReservation();
 					const failDesc =
 						info.failureCode !== undefined
 							? describeFailureCode(info.failureCode)
@@ -5295,6 +5388,11 @@ export class BeignetNode extends EventEmitter {
 				this.node.sendPayment(bolt11, undefined, maxFeeMsat, amountMsat);
 			} catch (err: unknown) {
 				cleanup();
+				// A payment that never started holds no capacity. Without this
+				// the reservation outlived every refused send (no route, a
+				// duplicate, a peer that is gone) and ratcheted the counter up
+				// until the daily limit refused real payments (issue #474).
+				releaseReservation();
 				const msg = err instanceof Error ? err.message : String(err);
 				// Use typed error code if available, fall back to string matching
 				let code = 'PAYMENT_FAILED';
@@ -5501,9 +5599,15 @@ export class BeignetNode extends EventEmitter {
 	): { paymentHash: string; status: 'PENDING' } {
 		const decoded = decodeInvoiceInput(bolt11);
 		const maxFeeMsat =
-			maxFeeSats !== undefined ? BigInt(maxFeeSats) * 1000n : undefined;
+			maxFeeSats !== undefined
+				? BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) *
+				  1000n
+				: undefined;
 		const amountMsat =
-			amountSats !== undefined ? BigInt(amountSats) * 1000n : undefined;
+			amountSats !== undefined
+				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
+				  1000n
+				: undefined;
 		if (metadata) {
 			this.node.setPaymentMetadata(decoded.paymentHash, metadata);
 		}
@@ -5525,25 +5629,47 @@ export class BeignetNode extends EventEmitter {
 		metadata?: Record<string, string>
 	): Promise<PaymentInfo> {
 		this._checkDraining();
+		// Guarded before the accounting for the same reason payInvoice is: the
+		// decrements all live in the callbacks below, so a RangeError here used
+		// to leave _pendingSpendSats permanently raised (issue #474).
+		const amountMsat =
+			BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) * 1000n;
+		const maxFeeMsat =
+			maxFeeSats !== undefined
+				? BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) *
+				  1000n
+				: undefined;
 		this._checkMaxPayment(amountSats);
 		this._checkSpendLimit(amountSats);
 		this._pendingSpendSats += amountSats;
+		// Idempotent, and shared by every exit, for the reason payInvoice's
+		// copy documents: the reservation is held for the whole in-flight
+		// window, and a keysend that never started holds no capacity.
+		let released = false;
+		const releaseReservation = (): void => {
+			if (released) return;
+			released = true;
+			this._pendingSpendSats -= amountSats;
+		};
 		const destination = Buffer.from(pubkey, 'hex');
-		const amountMsat = BigInt(amountSats) * 1000n;
-		const maxFeeMsat =
-			maxFeeSats !== undefined ? BigInt(maxFeeSats) * 1000n : undefined;
 
-		const result = this.node.sendKeysend({
-			destination,
-			amountMsat,
-			maxFeeMsat,
-			metadata
-		});
+		let result: IPaymentInfo;
+		try {
+			result = this.node.sendKeysend({
+				destination,
+				amountMsat,
+				maxFeeMsat,
+				metadata
+			});
+		} catch (err: unknown) {
+			releaseReservation();
+			throw err;
+		}
 		const paymentHashHex = result.paymentHash.toString('hex');
 
 		// If already settled synchronously
 		if (result.status !== 'PENDING') {
-			this._pendingSpendSats -= amountSats;
+			releaseReservation();
 			if (result.status === 'COMPLETED') this._recordSpend(amountSats);
 			return this.toPaymentInfo(result);
 		}
@@ -5551,7 +5677,7 @@ export class BeignetNode extends EventEmitter {
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				this._pendingSpendSats -= amountSats;
+				releaseReservation();
 				this.node.failPayment(result.paymentHash);
 				reject(
 					new BeignetError(
@@ -5570,7 +5696,7 @@ export class BeignetNode extends EventEmitter {
 			const onSent = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					this._pendingSpendSats -= amountSats;
+					releaseReservation();
 					this._recordSpend(amountSats);
 					resolve(this.toPaymentInfo(info));
 				}
@@ -5578,7 +5704,7 @@ export class BeignetNode extends EventEmitter {
 			const onFailed = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					this._pendingSpendSats -= amountSats;
+					releaseReservation();
 					const failDesc =
 						info.failureCode !== undefined
 							? describeFailureCode(info.failureCode)
@@ -5934,10 +6060,21 @@ export class BeignetNode extends EventEmitter {
 			update.feeProportionalMillionths = policy.feeProportionalMillionths;
 		if (policy.cltvExpiryDelta !== undefined)
 			update.cltvExpiryDelta = policy.cltvExpiryDelta;
+		// The msat fields take a number or a decimal string, and BigInt()
+		// throws on anything else: a RangeError on a fractional number, a
+		// SyntaxError on a non-numeric string. Over HTTP the route's own catch
+		// scrubbed both into a 500; an SDK caller got the raw throw. Refuse
+		// them as what they are (issue #474).
 		if (policy.htlcMinimumMsat !== undefined)
-			update.htlcMinimumMsat = BigInt(policy.htlcMinimumMsat);
+			update.htlcMinimumMsat = requireMsatValue(
+				policy.htlcMinimumMsat,
+				'htlcMinimumMsat'
+			);
 		if (policy.htlcMaximumMsat !== undefined)
-			update.htlcMaximumMsat = BigInt(policy.htlcMaximumMsat);
+			update.htlcMaximumMsat = requireMsatValue(
+				policy.htlcMaximumMsat,
+				'htlcMaximumMsat'
+			);
 
 		const targets =
 			channelId === 'all'
@@ -6340,10 +6477,16 @@ export class BeignetNode extends EventEmitter {
 	): Promise<PaymentInfo> {
 		const offer = decodeOfferInput(offerStr);
 
-		// Request invoice from the offer
+		// Request invoice from the offer. Guarded before BigInt(): a fractional
+		// amount threw an uncaught RangeError that shipped as a scrubbed 500
+		// (issue #474).
 		const requestOptions =
 			amountSats !== undefined
-				? { amount: BigInt(amountSats) * 1000n }
+				? {
+						amount:
+							BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
+							1000n
+				  }
 				: undefined;
 
 		const bolt12Invoice = await this.node.requestInvoice(offer, requestOptions);
@@ -7136,6 +7279,12 @@ export class BeignetNode extends EventEmitter {
 				'amountSats must be a positive integer'
 			);
 		}
+		// Checked here rather than at the comparison below, which only runs
+		// when a route was found: a bad ceiling is the caller's mistake either
+		// way, and it used to reach BigInt() unguarded (issue #474).
+		if (maxFeeSats !== undefined) {
+			requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats');
+		}
 		const amountMsat = BigInt(amountSats) * 1000n;
 		const route = this.node.queryRoute(
 			Buffer.from(destination, 'hex'),
@@ -7238,7 +7387,10 @@ export class BeignetNode extends EventEmitter {
 		bestChannelId?: string;
 		availableSats: number;
 	} {
-		const amountMsat = BigInt(amountSats) * 1000n;
+		// The routes reach this through parseIntParam, but an SDK caller does
+		// not, and a fractional amount threw out of BigInt() (issue #474).
+		const amountMsat =
+			BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) * 1000n;
 		let bestChannel: ChannelInfo | null = null;
 		let bestAvailableMsat = 0n;
 		let totalAvailableMsat = 0n;
@@ -7270,7 +7422,10 @@ export class BeignetNode extends EventEmitter {
 		bestChannelId?: string;
 		availableSats: number;
 	} {
-		const amountMsat = BigInt(amountSats) * 1000n;
+		// Same as canSend: guarded for the SDK callers the route parsing does
+		// not cover (issue #474).
+		const amountMsat =
+			BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) * 1000n;
 		let bestChannel: ChannelInfo | null = null;
 		let bestAvailableMsat = 0n;
 		let totalAvailableMsat = 0n;

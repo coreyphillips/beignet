@@ -1058,7 +1058,11 @@ not repeat a 4xx unchanged.
 `SEND_FAILED`, `CLOSE_FAILED`, `FORCE_CLOSE_FAILED`, `ZERO_CONF_FAILED` and the
 `PSBT_*` codes keep the 500 default on purpose: each covers both caller-state
 problems and genuine node faults, so no single status is honest until they are
-split.
+split. The two close codes have had their caller-state half split off at the
+source: `POST /channel/close` and `POST /channel/forceclose` answer **400
+`INVALID_PARAMS`** for a malformed channel id and **404 `CHANNEL_NOT_FOUND`**
+for a channel the node does not hold, so a 500 from either now means a channel
+that exists and would not close.
 
 **Retryability is one decision, not two.** Every code answered with 502, 503 or
 504 is one `isRetryableError()` returns true for, and a test walks the status map
