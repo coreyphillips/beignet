@@ -91,6 +91,57 @@ type TScriptHashRouter = {
  */
 const scriptHashRouters: Map<EElectrumNetworks, TScriptHashRouter> = new Map();
 
+type THeaderRouter = {
+	/** Every instance subscribed to this network's headers. */
+	handlers: Map<Electrum, (data: INewBlock[]) => Promise<void>>;
+	/** The one handler every subscribeHeader call for this network is given. */
+	dispatch: (data: INewBlock[]) => Promise<void>;
+};
+
+/**
+ * Header routing state, shared per network for the same reason the script hash
+ * routers are: rn-electrum-client keeps ONE
+ * 'blockchain.headers.subscribe' handler per network for the WHOLE process and
+ * answers every later subscribe with "Already Subscribed.", so a per-call
+ * closure only ever reaches the instance that subscribed first, and a client
+ * reset would hand the network's headers to whichever instance re-subscribed
+ * first while silencing the rest. Instances withdraw in disconnect().
+ */
+const headerRouters: Map<EElectrumNetworks, THeaderRouter> = new Map();
+
+function getHeaderRouter(network: EElectrumNetworks): THeaderRouter {
+	let router = headerRouters.get(network);
+	if (!router) {
+		const created: THeaderRouter = {
+			handlers: new Map(),
+			dispatch: async (data: INewBlock[]): Promise<void> => {
+				// Snapshot: a handler may disconnect its instance mid-dispatch.
+				for (const handler of [...created.handlers.values()]) {
+					try {
+						await handler(data);
+					} catch {
+						// One instance must not starve the rest.
+					}
+				}
+			}
+		};
+		router = created;
+		headerRouters.set(network, created);
+	}
+	return router;
+}
+
+/**
+ * Networks whose client was torn down with its subscriptions still owed.
+ * Module state because the client is per network for the whole process: the
+ * instance that reset it and the instance that reconnects need not be the same
+ * one, so the debt belongs to the network rather than to whoever noticed it.
+ * Survives failed attempts, too: a switch that resets the client and then
+ * reaches no server at all still owes the restore to whichever later connect
+ * succeeds.
+ */
+const subscriptionRestoreOwed: Set<EElectrumNetworks> = new Set();
+
 function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 	let router = scriptHashRouters.get(network);
 	if (!router) {
@@ -156,6 +207,10 @@ export class Electrum {
 	private _currentServer: TServer | null = null;
 	/** Number of times the connected server changed after the first connect. */
 	private _rotationCount = 0;
+	/** Set by disconnect(): this instance withdrew from the shared routers, so
+	 *  work still in flight must not register it back into them. Cleared when a
+	 *  new connect is explicitly requested. */
+	private _disconnected = false;
 
 	public servers?: TServer | TServer[];
 	public network: EAvailableNetworks;
@@ -220,6 +275,10 @@ export class Electrum {
 		servers?: TServer | TServer[];
 		disableRegtestCheck?: boolean;
 	}): Promise<Result<TConnectToElectrumRes>> {
+		// An explicit connect revives an instance that had disconnected; a
+		// disconnect landing mid-connect keeps the flag set, so the attempt it
+		// interrupted still declines to re-register the instance.
+		this._disconnected = false;
 		if (this._connectInFlight) return this._connectInFlight;
 		this._connectInFlight = this._doConnect(args).finally(() => {
 			this._connectInFlight = null;
@@ -259,8 +318,15 @@ export class Electrum {
 				candidate,
 				electrumNetwork
 			);
+			if (startResponse.clientReset) {
+				subscriptionRestoreOwed.add(electrumNetwork);
+			}
 			if (startResponse.error) {
-				this.recordServerFailure(candidate);
+				// A candidate the teardown refused was never dialled, so it must
+				// not be blamed for the failure and cooled down.
+				if (!startResponse.teardownRefused) {
+					this.recordServerFailure(candidate);
+				}
 				lastError = String(startResponse.error);
 				continue;
 			}
@@ -282,6 +348,21 @@ export class Electrum {
 			return err(lastError);
 		}
 		this.publishConnectionChange(true);
+		// disconnect() may have landed while this attempt was in flight, and it
+		// withdrew the instance from the shared routers.
+		if (this._disconnected) return ok('Connected to Electrum server.');
+		if (subscriptionRestoreOwed.has(electrumNetwork)) {
+			// The torn down client took every subscription in this process with
+			// it, including the ones this instance never made, and the wallet's
+			// own addresses have no other reconnect hook here (checkConnection
+			// re-issues them only on its own reconnect path). Keyed on the reset
+			// rather than on a server change: a switch that stops the peer and
+			// then falls back to the server it started from resets exactly the
+			// same state while leaving the current server untouched.
+			this.restoreSubscriptionsBestEffort(electrumNetwork);
+		}
+		// Re-issues the shared header dispatcher, so every instance subscribed
+		// to this network's headers is wired to the new client, not just this one.
 		this.subscribeToHeader().catch(() => {
 			// Best-effort: the header subscription is rebuilt on reconnect.
 		});
@@ -295,14 +376,132 @@ export class Electrum {
 	private async attemptConnect(
 		server: TServer,
 		electrumNetwork: EElectrumNetworks
-	): Promise<{ error: unknown }> {
-		return await electrum.start({
+	): Promise<{
+		error: unknown;
+		clientReset: boolean;
+		teardownRefused?: boolean;
+	}> {
+		const teardown = await this.stopPeerIfServerChanged(
+			server,
+			electrumNetwork
+		);
+		if (teardown.error) {
+			return {
+				error: teardown.error,
+				clientReset: teardown.clientReset,
+				teardownRefused: true
+			};
+		}
+		const startResponse = await electrum.start({
 			clientName: 'beignet',
 			protocolVersion: '1.4',
 			network: electrumNetwork,
 			net: this.net,
 			tls: this.tls,
 			customPeers: [server]
+		});
+		return { error: startResponse.error, clientReset: teardown.clientReset };
+	}
+
+	/**
+	 * Disconnects the connected peer when the next connect targets a different
+	 * server.
+	 *
+	 * rn-electrum-client builds a fresh client whenever the target
+	 * host/port/protocol differ from the connected peer, but only its
+	 * disconnect path clears the per-network bookkeeping (subscribedAddresses,
+	 * subscribedHeaders, onAddressReceive) while the notification handlers live
+	 * on the client object that is thrown away. Without this reset every
+	 * subscribe after a failover answers "Already Subscribed." although nothing
+	 * is subscribed on the new connection and no handler is wired to it, so the
+	 * process silently stops receiving header and script hash notifications.
+	 * The same-server path is left alone: the client pings the live connection
+	 * and disconnects itself (resetting the same state) if the ping fails.
+	 *
+	 * The client only clears that bookkeeping when closing the socket succeeds
+	 * and reports the failure as { error: true }, so a teardown that did not
+	 * happen refuses the candidate instead of connecting a fresh client on top
+	 * of stale state, which is the very bug this guards against. Rotation then
+	 * moves on, and the still-connected server is accepted unchanged when it
+	 * comes back around.
+	 */
+	private async stopPeerIfServerChanged(
+		server: TServer,
+		electrumNetwork: EElectrumNetworks
+	): Promise<{ error?: string; clientReset: boolean }> {
+		const peer = electrum.getConnectedPeer(electrumNetwork);
+		if (!peer?.host) return { clientReset: false };
+		const peerKey = `${peer.host}|${peer.protocol}|${peer.port}`;
+		if (peerKey === this.serverKey(server)) return { clientReset: false };
+		const stopResponse = await electrum.stop({ network: electrumNetwork });
+		// The cleared peer is the observable proof that the bookkeeping went
+		// with it, so it decides, and the reported error only sharpens the
+		// message.
+		const clientReset = !electrum.getConnectedPeer(electrumNetwork)?.host;
+		if (!clientReset) {
+			const reason = stopResponse?.error
+				? `: ${String(stopResponse.data ?? '')}`
+				: '.';
+			return {
+				error: `Unable to disconnect from ${peer.host} before switching Electrum servers${reason}`,
+				clientReset: false
+			};
+		}
+		return { clientReset: true };
+	}
+
+	/**
+	 * Re-issues every subscription this process holds for the network after the
+	 * client was torn down.
+	 *
+	 * rn-electrum-client keeps one client, and with it one set of
+	 * subscriptions and one notification handler, per network for the whole
+	 * process, so a reset by any instance drops what every other instance
+	 * subscribed as well. The shared script hash router is the record of that
+	 * state; re-subscribing its hashes restores the handler wiring for all of
+	 * them, and this instance's own wallet addresses are re-issued on top to
+	 * pick up anything generated since.
+	 */
+	private async restoreSubscriptions(
+		electrumNetwork: EElectrumNetworks
+	): Promise<void> {
+		if (this._disconnected) return;
+		const router = scriptHashRouters.get(electrumNetwork);
+		if (router) {
+			await Promise.all(
+				[...router.subscriptions.keys()].map(async (scriptHash) => {
+					const response = await electrum.subscribeAddress({
+						scriptHash,
+						network: electrumNetwork,
+						onReceive: router.dispatch
+					});
+					if (response.error) {
+						throw new Error('Unable to restore address subscriptions.');
+					}
+				})
+			);
+		}
+		// Checked again: disconnect() can land while the hashes above are in
+		// flight, and subscribeToAddresses would register this instance back
+		// into the router it just withdrew from.
+		if (this._disconnected) return;
+		const walletSubscriptions = await this.subscribeToAddresses({});
+		if (walletSubscriptions.isErr()) {
+			throw walletSubscriptions.error;
+		}
+	}
+
+	/**
+	 * Discharges the network's outstanding subscription restore, re-arming it
+	 * for the next connect on this network if it does not fully succeed. Any
+	 * instance may discharge it: the client, and therefore the debt, is shared.
+	 */
+	private restoreSubscriptionsBestEffort(
+		electrumNetwork: EElectrumNetworks
+	): void {
+		subscriptionRestoreOwed.delete(electrumNetwork);
+		this.restoreSubscriptions(electrumNetwork).catch(() => {
+			subscriptionRestoreOwed.add(electrumNetwork);
 		});
 	}
 
@@ -1054,28 +1253,46 @@ export class Electrum {
 	}
 
 	/**
+	 * Applies a new block header to this instance's wallet. Handed to the
+	 * shared per-network header router rather than to the client directly, so
+	 * every subscribed instance is reached by the one handler the client keeps.
+	 */
+	private readonly _onNewBlock = async (data: INewBlock[]): Promise<void> => {
+		const hex = data[0].hex;
+		const hash = this.getBlockHashFromHex({ blockHex: hex });
+		const header: IHeader = { ...data[0], hash };
+		const reorgDetected = header.height < this.getBlockHeader().height;
+		await this._wallet.updateHeader(header);
+		if (reorgDetected) {
+			await this._wallet.checkUnconfirmedTransactions(reorgDetected);
+		}
+		await this._wallet.refreshWallet();
+		this.onReceive?.(data);
+		this.sendMessage(onMessageKeys.newBlock, data[0]);
+	};
+
+	/**
 	 * Subscribes to the current networks headers.
 	 * @return {Promise<Result<string>>}
 	 */
 	public async subscribeToHeader(): Promise<Result<IHeader>> {
+		const router = getHeaderRouter(this.electrumNetwork);
+		// Registered before the call, and left registered on "Already
+		// Subscribed.": the client wires a handler only for the first subscribe
+		// on the network, so this is what makes the later instances (and the
+		// ones a client reset silenced) receive headers at all. Only what this
+		// attempt added is rolled back on failure.
+		const hadHandler = router.handlers.has(this);
+		router.handlers.set(this, this._onNewBlock);
 		const subscribeResponse: ISubscribeToHeader =
 			await electrum.subscribeHeader({
 				network: this.electrumNetwork,
-				onReceive: async (data: INewBlock[]) => {
-					const hex = data[0].hex;
-					const hash = this.getBlockHashFromHex({ blockHex: hex });
-					const header: IHeader = { ...data[0], hash };
-					const reorgDetected = header.height < this.getBlockHeader().height;
-					await this._wallet.updateHeader(header);
-					if (reorgDetected) {
-						await this._wallet.checkUnconfirmedTransactions(reorgDetected);
-					}
-					await this._wallet.refreshWallet();
-					this.onReceive?.(data);
-					this.sendMessage(onMessageKeys.newBlock, data[0]);
-				}
+				onReceive: router.dispatch
 			});
 		if (subscribeResponse.error) {
+			if (!hadHandler) {
+				router.handlers.delete(this);
+			}
 			return err('Unable to subscribe to headers.');
 		}
 		// eslint-disable-next-line @typescript-eslint/ban-ts-comment
@@ -1308,8 +1525,10 @@ export class Electrum {
 				});
 
 				if (response.isOk()) {
-					// Re-Subscribe to Addresses & Headers
-					void this.subscribeToAddresses({});
+					// Re-Subscribe to Addresses & Headers. A failed ping means the
+					// client dropped the connection, so every instance's script
+					// hashes went with it, not just this wallet's addresses.
+					this.restoreSubscriptionsBestEffort(this.electrumNetwork);
 					this.subscribeToHeader().catch(() => {
 						/* best-effort re-subscribe on reconnect */
 					});
@@ -1344,7 +1563,12 @@ export class Electrum {
 		this.stopConnectionPolling();
 		// Withdraw from the shared routers: a notification routed after this
 		// point must not refresh or call back into a wallet that is shutting
-		// down.
+		// down. The flag keeps work still in flight (a subscription restore
+		// mid-await) from quietly registering the instance back.
+		this._disconnected = true;
+		for (const router of headerRouters.values()) {
+			router.handlers.delete(this);
+		}
 		for (const router of scriptHashRouters.values()) {
 			router.instances.delete(this);
 			for (const [scriptHash, subs] of router.subscriptions) {

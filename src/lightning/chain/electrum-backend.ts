@@ -27,7 +27,13 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 		string,
 		{ callbacks: Set<() => void>; dispatcher: () => void }
 	> = new Map();
-	private _originalOnReceive: ((data: unknown) => void) | undefined = undefined;
+	/**
+	 * The onReceive delegate this backend installed on the Electrum instance,
+	 * compared by identity so a re-subscribe never wraps its own wrapper. The
+	 * previous handler is captured in the closure rather than read back from a
+	 * field, which is what made a second install recurse into itself.
+	 */
+	private _headerDelegate: ((data: unknown) => void) | null = null;
 	private _reconnectTimer: ReturnType<typeof setInterval> | null = null;
 	/** Timeout in ms for individual Electrum RPC calls (default 30s) */
 	readonly callTimeoutMs: number;
@@ -56,7 +62,6 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 	setElectrum(electrum: Electrum): void {
 		this.electrum = electrum;
 		this._consecutiveFailures = 0;
-		this._originalOnReceive = undefined;
 	}
 
 	getConsecutiveFailures(): number {
@@ -141,13 +146,17 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 			throw new Error(`Failed to subscribe to headers: ${result.error}`);
 		}
 
-		// Install stable delegate exactly once to prevent callback stacking on resubscribe
-		if (!this._originalOnReceive) {
-			this._originalOnReceive = this.electrum.onReceive;
-			this.electrum.onReceive = (data: unknown): void => {
-				if (this._originalOnReceive) {
-					this._originalOnReceive(data);
-				}
+		// Install the delegate once per Electrum instance, keyed on what is
+		// actually installed: a resubscribe (after a reconnect, or after
+		// failover re-points this backend) must not wrap the delegate it
+		// already installed, which would report every block twice.
+		const alreadyInstalled =
+			this._headerDelegate !== null &&
+			this.electrum.onReceive === this._headerDelegate;
+		if (!alreadyInstalled) {
+			const previousOnReceive = this.electrum.onReceive;
+			const delegate = (data: unknown): void => {
+				previousOnReceive?.(data);
 				// Electrum header subscription data arrives as an array with { height, hex }
 				if (
 					Array.isArray(data) &&
@@ -157,6 +166,8 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 					this.notifyNewBlock(data[0].height);
 				}
 			};
+			this._headerDelegate = delegate;
+			this.electrum.onReceive = delegate;
 		}
 
 		// Initial height from subscription result:
