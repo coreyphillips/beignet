@@ -442,6 +442,28 @@ describe('Phase 5: Defense in Depth', function () {
 			expect(mockElectrum._headerSubscribeCount).to.equal(1);
 		});
 
+		it('should not re-wrap its own header delegate on resubscribeAll', async function () {
+			const mockElectrum = createMockElectrum();
+			const backend = new ElectrumBackend(mockElectrum as any);
+			let blocks = 0;
+			await backend.subscribeToHeaders((): void => {
+				blocks++;
+			});
+
+			// The daemon's failover handler re-points the backend at the wallet's
+			// Electrum instance and re-subscribes everything on top.
+			backend.setElectrum(mockElectrum as any);
+			await backend.resubscribeAll();
+			backend.stopReconnectMonitor();
+
+			blocks = 0;
+			mockElectrum.onReceive?.([{ height: 500, hex: '00' }]);
+
+			// A delegate that resolved its predecessor through a mutable field
+			// called itself here, overflowing the stack on the next header.
+			expect(blocks).to.equal(1);
+		});
+
 		it('should add new subscriptions to tracked set after resubscribeAll', async function () {
 			const mockElectrum = createMockElectrum();
 			const backend = new ElectrumBackend(mockElectrum as any);
