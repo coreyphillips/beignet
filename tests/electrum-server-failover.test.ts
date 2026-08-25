@@ -2496,10 +2496,7 @@ describe('Electrum lifecycle and disconnect races', () => {
 	});
 
 	it('does not let a restore that never settles disable the retry (#499)', async () => {
-		const clock = sinon.useFakeTimers({
-			now: Date.now(),
-			toFake: ['Date']
-		});
+		const clock = useFakeClock(['Date']);
 		try {
 			const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
 			await electrum.connectToElectrum({ servers: serverA });
