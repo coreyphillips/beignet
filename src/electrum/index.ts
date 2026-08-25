@@ -196,6 +196,17 @@ export class Electrum {
 	private _currentServer: TServer | null = null;
 	/** Number of times the connected server changed after the first connect. */
 	private _rotationCount = 0;
+	/** Network whose subscription restore last failed, cleared once one
+	 *  succeeds. A restore only fails on a socket that can stay healthy
+	 *  indefinitely, and nothing else reconnects while it does, so the
+	 *  connection poll owns the retry. */
+	private _restoreOwed: EElectrumNetworks | null = null;
+	/** Per-network bookkeeping for concurrent header subscribes: how many are in
+	 *  flight and whether the handler must stay registered (see subscribeToHeader). */
+	private readonly _headerSubscribes: Map<
+		EElectrumNetworks,
+		{ inFlight: number; committed: boolean }
+	> = new Map();
 	/** Set by disconnect(): this instance withdrew from the shared routers, so
 	 *  work still in flight must not register it back into them. Cleared when a
 	 *  new connect is explicitly requested. */
@@ -476,16 +487,24 @@ export class Electrum {
 	}
 
 	/**
-	 * Runs the restore without letting it fail the connect: a re-subscribe that
-	 * errors is retried by the next connect on this network, which restores
-	 * unconditionally.
+	 * Runs the restore without letting it fail the connect. A re-subscribe that
+	 * errors leaves the debt recorded, because the socket it failed on is
+	 * otherwise healthy: no reconnect is coming to restore unconditionally, so
+	 * the connection poll retries it instead of leaving the hashes unwired.
 	 */
 	private restoreSubscriptionsBestEffort(
 		electrumNetwork: EElectrumNetworks
 	): void {
-		this.restoreSubscriptions(electrumNetwork).catch(() => {
-			// Retried on the next connect.
-		});
+		this.restoreSubscriptions(electrumNetwork).then(
+			() => {
+				if (this._restoreOwed === electrumNetwork) {
+					this._restoreOwed = null;
+				}
+			},
+			() => {
+				this._restoreOwed = electrumNetwork;
+			}
+		);
 	}
 
 	/**
@@ -1259,25 +1278,41 @@ export class Electrum {
 	 * @return {Promise<Result<string>>}
 	 */
 	public async subscribeToHeader(): Promise<Result<IHeader>> {
-		const router = getHeaderRouter(this.electrumNetwork);
+		const electrumNetwork = this.electrumNetwork;
+		const router = getHeaderRouter(electrumNetwork);
 		// Registered before the call, and left registered on "Already
 		// Subscribed.": the client wires a handler only for the first subscribe
 		// on the network, so this is what makes the later instances (and the
-		// ones a client reset silenced) receive headers at all. Only what this
-		// attempt added is rolled back on failure.
-		const hadHandler = router.handlers.has(this);
+		// ones a client reset silenced) receive headers at all.
+		let state = this._headerSubscribes.get(electrumNetwork);
+		if (!state) {
+			state = { inFlight: 0, committed: false };
+			this._headerSubscribes.set(electrumNetwork, state);
+		}
+		// A handler already registered predates this attempt, so a failure here
+		// must not withdraw it.
+		if (router.handlers.has(this)) state.committed = true;
 		router.handlers.set(this, this._onNewBlock);
-		const subscribeResponse: ISubscribeToHeader =
-			await electrum.subscribeHeader({
-				network: this.electrumNetwork,
+		state.inFlight++;
+		let subscribeResponse: ISubscribeToHeader;
+		try {
+			subscribeResponse = await electrum.subscribeHeader({
+				network: electrumNetwork,
 				onReceive: router.dispatch
 			});
+		} finally {
+			state.inFlight--;
+		}
 		if (subscribeResponse.error) {
-			if (!hadHandler) {
+			// Rolled back only when this attempt is the last word: a concurrent
+			// call that already succeeded, or one still in flight, owns the
+			// handler now, and deleting it would silence a live subscription.
+			if (!state.committed && state.inFlight === 0) {
 				router.handlers.delete(this);
 			}
 			return err('Unable to subscribe to headers.');
 		}
+		state.committed = true;
 		// eslint-disable-next-line @typescript-eslint/ban-ts-comment
 		// @ts-ignore
 		if (subscribeResponse?.data === 'Already Subscribed.') {
@@ -1515,6 +1550,11 @@ export class Electrum {
 				}
 			} else {
 				this.publishConnectionChange(true);
+				// The socket is fine, so no reconnect will run the restore a
+				// previous connect left owed. This is its only other retry hook.
+				if (this._restoreOwed === this.electrumNetwork && !this._disconnected) {
+					this.restoreSubscriptionsBestEffort(this.electrumNetwork);
+				}
 			}
 		} catch (e) {
 			this.wallet.logger.error('Electrum connection check failed.', e);
@@ -1544,8 +1584,18 @@ export class Electrum {
 		// down. The flag keeps work still in flight (a subscription restore
 		// mid-await) from quietly registering the instance back.
 		this._disconnected = true;
+		// The debt goes with the instance: the next connect restores
+		// unconditionally anyway, and the poll that would retry it is stopped.
+		this._restoreOwed = null;
 		for (const router of headerRouters.values()) {
 			router.handlers.delete(this);
+		}
+		// The withdrawn handlers are no longer registered, so nothing a later
+		// subscribe installs predates them. The entries themselves are kept, so
+		// a subscribe still in flight keeps sharing state with the ones a
+		// reconnect issues rather than rolling back their handler.
+		for (const state of this._headerSubscribes.values()) {
+			state.committed = false;
 		}
 		for (const router of scriptHashRouters.values()) {
 			router.instances.delete(this);

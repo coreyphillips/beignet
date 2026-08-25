@@ -88,6 +88,14 @@ let connectionEvents: string[];
 let nextHeaderHeight: number;
 /** Script hashes whose next subscription request should fail. */
 let subscriptionFailures: Set<string>;
+/** Per-call control over blockchain.headers.subscribe, keyed by call index, so
+ *  a test can decide the order two concurrent subscribes resolve in and which
+ *  of them fails. */
+let headerSubscribeControls: Map<
+	number,
+	{ gate: { promise: Promise<void>; release: () => void }; fails: boolean }
+>;
+let headerSubscribeCalls: number;
 /** Held open to keep a subscription request in flight for as long as a test
  *  needs, so a disconnect can land in the middle of one. */
 let subscriptionGate: { promise: Promise<void>; release: () => void } | null;
@@ -192,6 +200,13 @@ const stubHelpers = (): void => {
 		}: {
 			onReceive?: (data: unknown[]) => void;
 		} = {}) => {
+			const control = headerSubscribeControls.get(headerSubscribeCalls++);
+			if (control) {
+				await control.gate.promise;
+				if (control.fails) {
+					return { error: true, data: 'Subscription failed.' };
+				}
+			}
 			if (client.subscribedHeaders) {
 				return { error: false, data: 'Already Subscribed.' };
 			}
@@ -233,6 +248,12 @@ const stubHelpers = (): void => {
 	sinon
 		.stub(electrumHelpers, 'getAddressScriptHashBalance')
 		.callsFake(async () => ({ error: false, data: stubbedBalance }));
+
+	// The poll's health check: healthy for exactly as long as a peer is connected.
+	sinon.stub(electrumHelpers, 'pingServer').callsFake(async () => ({
+		error: !client.peer,
+		data: client.peer ? 'pong' : 'Not connected.'
+	}));
 };
 
 /** The wallet's stored header, updated by the header subscription. */
@@ -295,6 +316,14 @@ const createElectrum = (
 	return electrum;
 };
 
+/** One pass of the connection poll, driven by hand so the tests keep their
+ *  timing. */
+const pollConnection = async (instance: Electrum): Promise<void> => {
+	await (
+		instance as unknown as { checkConnection: () => Promise<void> }
+	).checkConnection();
+};
+
 /** Lets the fire-and-forget post-connect subscriptions settle. */
 const flush = async (): Promise<void> => {
 	for (let i = 0; i < 5; i++) {
@@ -313,6 +342,8 @@ const startTest = (): void => {
 	nextHeaderHeight = 100;
 	subscriptionFailures = new Set();
 	subscriptionGate = null;
+	headerSubscribeControls = new Map();
+	headerSubscribeCalls = 0;
 	reachableHosts = new Set([serverA.host, serverB.host]);
 	disconnectFails = false;
 	socketIsDead = false;
@@ -328,6 +359,10 @@ const endTest = async (): Promise<void> => {
 	socketIsDead = false;
 	subscriptionGate?.release();
 	subscriptionGate = null;
+	for (const control of headerSubscribeControls.values()) {
+		control.gate.release();
+	}
+	headerSubscribeControls.clear();
 	for (const instance of createdInstances) {
 		await instance.disconnect();
 	}
@@ -818,5 +853,106 @@ describe('Electrum reconnect to the same server after a dead socket (issue #485)
 		expect(client.addressHandler).to.not.equal(null);
 		await client.addressHandler?.(['aaaa', 'status-after-guard-reconnect']);
 		expect(onReceive.calledOnce).to.equal(true);
+	});
+
+	it('retries a failed restore on a healthy connection poll', async () => {
+		const onReceive = sinon.spy();
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.subscribeToAddresses({ scriptHashes: ['aaaa'], onReceive });
+
+		// The reconnect restores everything the dead socket cost, except that
+		// one hash's re-subscribe errors. The replacement socket is healthy, so
+		// no further connect is coming to try again.
+		socketIsDead = true;
+		subscriptionFailures.add('aaaa');
+		protocolSubscribes = [];
+		const reconnected = await electrum.connectToElectrum({ servers: serverA });
+		expect(reconnected.isOk()).to.equal(true);
+		await flush();
+		expect(
+			protocolSubscribes,
+			'the restore of this hash failed'
+		).to.not.include('aaaa');
+
+		await pollConnection(electrum);
+		await flush();
+
+		expect(
+			protocolSubscribes,
+			'the poll must re-issue what the failed restore still owes'
+		).to.include('aaaa');
+		expect(client.addressHandler).to.not.equal(null);
+		await client.addressHandler?.(['aaaa', 'status-after-poll-retry']);
+		expect(onReceive.calledOnce, 'the callback must be reached again').to.equal(
+			true
+		);
+
+		// And the debt is settled: a later healthy poll re-subscribes nothing.
+		protocolSubscribes = [];
+		await pollConnection(electrum);
+		await flush();
+		expect(protocolSubscribes).to.deep.equal([]);
+	});
+
+	it('keeps the header handler a concurrent subscribe installed', async () => {
+		const otherMessageSpy = sinon.spy();
+		const other = createElectrum(sinon.spy(), otherMessageSpy, 'cccc');
+		const failing = { gate: createGate(), fails: true };
+		const succeeding = { gate: createGate(), fails: false };
+		headerSubscribeControls.set(0, failing);
+		headerSubscribeControls.set(1, succeeding);
+
+		// Two subscribes in flight at once, the second landing first.
+		const first = other.subscribeToHeader();
+		const second = other.subscribeToHeader();
+		succeeding.gate.release();
+		expect((await second).isOk()).to.equal(true);
+		failing.gate.release();
+		expect((await first).isErr()).to.equal(true);
+
+		expect(
+			client.headerHandler,
+			'the successful subscribe wired a handler'
+		).to.not.equal(null);
+		await client.headerHandler?.([{ height: 512, hex: headerHex }]);
+		await flush();
+
+		const blocks = otherMessageSpy
+			.getCalls()
+			.filter(
+				(call: { args: [string, { height: number }] }) =>
+					call.args[0] === 'newBlock'
+			);
+		expect(
+			blocks.length,
+			'the failed attempt must not withdraw the live subscription'
+		).to.equal(1);
+		expect(blocks[0].args[1].height).to.equal(512);
+	});
+
+	it('withdraws the header handler when every subscribe fails', async () => {
+		const otherMessageSpy = sinon.spy();
+		const other = createElectrum(sinon.spy(), otherMessageSpy, 'cccc');
+		const failing = { gate: createGate(), fails: true };
+		failing.gate.release();
+		headerSubscribeControls.set(0, failing);
+
+		expect((await other.subscribeToHeader()).isErr()).to.equal(true);
+
+		// Nothing is subscribed, so the handler this attempt installed has to go
+		// with it rather than linger on the shared router.
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await client.headerHandler?.([{ height: 640, hex: headerHex }]);
+		await flush();
+
+		const blocks = otherMessageSpy
+			.getCalls()
+			.filter(
+				(call: { args: [string, { height: number }] }) =>
+					call.args[0] === 'newBlock'
+			);
+		expect(blocks.length, 'the rolled back handler must stay gone').to.equal(0);
 	});
 });
