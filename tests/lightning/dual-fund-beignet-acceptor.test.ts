@@ -46,6 +46,7 @@ import {
 import { IFundingProvider } from '../../src/lightning/node/types';
 import { MessageType } from '../../src/lightning/message/types';
 import { decodeErrorMessage } from '../../src/lightning/message/error';
+import { settle } from './helpers/settle';
 
 // ─────────────── Helpers ───────────────
 
@@ -138,33 +139,6 @@ function openerParams(
 		),
 		...overrides
 	};
-}
-
-/**
- * Wait until pred() holds, or give up after `ms`.
- *
- * Two phases on purpose. The first 25 ms drain the microtask and immediate
- * queues at full speed, so a predicate that only needs the pending promise
- * callbacks (the funding provider's async input selection, a storage write's
- * continuation) resolves with no added latency. After that it parks on a real
- * sleep: the old body spun on setImmediate for the WHOLE deadline, so every
- * call whose predicate is EXPECTED to stay false held a core at 100% until it
- * expired. Under mocha --parallel that is one pegged core per worker.
- *
- * Still returns silently on timeout. Several call sites deliberately wait on a
- * predicate that must never become true.
- */
-async function settle(pred: () => boolean, ms = 2000): Promise<void> {
-	const deadline = Date.now() + ms;
-	const spinUntil = Math.min(deadline, Date.now() + 25);
-	while (Date.now() < spinUntil) {
-		if (pred()) return;
-		await new Promise((resolve) => setImmediate(resolve));
-	}
-	while (Date.now() < deadline) {
-		if (pred()) return;
-		await new Promise((resolve) => setTimeout(resolve, 5));
-	}
 }
 
 interface IHarness {

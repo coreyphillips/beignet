@@ -239,14 +239,19 @@ describe('Fix 6: sendPaymentAsync() on BeignetNode', () => {
 		// BeignetNode.sendPaymentAsync calls decodeInvoice which throws on invalid input
 		const node = createTestNode();
 
-		// Simulate what happens: decodeInvoice('') will throw
+		// Simulate what happens: decodeInvoice('') will throw. The throw is
+		// caught OUTSIDE the try: expect.fail throws an AssertionError, which
+		// instanceOf(Error) accepted, so a decode that returned would have
+		// read as a pass (issue #400).
+		const { decode } = require('../../src/lightning/invoice/decode');
+		let err: unknown;
 		try {
-			const { decode } = require('../../src/lightning/invoice/decode');
 			decode('');
-			expect.fail('Should have thrown');
-		} catch (err: unknown) {
-			expect(err).to.be.instanceOf(Error);
+		} catch (e: unknown) {
+			err = e;
 		}
+		expect(err, 'an empty invoice decoded').to.be.instanceOf(Error);
+		expect((err as Error).message).to.contain('too short');
 		node.destroy();
 	});
 });

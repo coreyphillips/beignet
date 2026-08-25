@@ -110,6 +110,7 @@ import {
 	IChainBackend,
 	computeScriptHash
 } from '../../src/lightning/chain/chain-watcher';
+import { settle, neverSettles } from './helpers/settle';
 
 // ─────────────── Channel-level helpers ───────────────
 
@@ -5103,33 +5104,6 @@ function wireNodes(a: LightningNode, b: LightningNode): IWire {
 	};
 }
 
-/**
- * Wait until pred() holds, or give up after `ms`.
- *
- * Two phases on purpose. The first 25 ms drain the microtask and immediate
- * queues at full speed, so a predicate that only needs the pending promise
- * callbacks (the funding provider's async input selection, a storage write's
- * continuation) resolves with no added latency. After that it parks on a real
- * sleep: the old body spun on setImmediate for the WHOLE deadline, so every
- * call whose predicate is EXPECTED to stay false held a core at 100% until it
- * expired. Under mocha --parallel that is one pegged core per worker.
- *
- * Still returns silently on timeout. Several call sites deliberately wait on a
- * predicate that must never become true.
- */
-async function settle(pred: () => boolean, ms = 3000): Promise<void> {
-	const deadline = Date.now() + ms;
-	const spinUntil = Math.min(deadline, Date.now() + 25);
-	while (Date.now() < spinUntil) {
-		if (pred()) return;
-		await new Promise((resolve) => setImmediate(resolve));
-	}
-	while (Date.now() < deadline) {
-		if (pred()) return;
-		await new Promise((resolve) => setTimeout(resolve, 5));
-	}
-}
-
 // ─────────────── Node-level tests ───────────────
 
 describe('Dual funding v2 reestablish, node level (issues 288/289)', function () {
@@ -5697,6 +5671,14 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		// would build a funding tx with a duplicate prevout.
 		const t = await driveNonLeaseOpen(147, 148, [shared, shared]);
 		try {
+			// The refusal itself is the event to wait for. Waiting instead for
+			// the replacement that must never appear only ever ran a deadline
+			// out, so the assertions below fired whether or not the raise had
+			// been decided yet.
+			const refusals: string[] = [];
+			t.opener.on('node:error', (err: unknown) => {
+				refusals.push(String((err as { message?: string })?.message ?? err));
+			});
 			const res = t.opener.rbfOpenChannelV2(
 				t.channelId,
 				2000,
@@ -5704,10 +5686,11 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 				150_000n
 			);
 			expect(res.ok).to.equal(true);
-			await settle(
-				() => t.channel.getFullState().v2InFlight?.rbfAttempt === 1,
-				5_000
-			);
+			await settle(() => refusals.length > 0);
+			expect(
+				refusals.join(' '),
+				'refused on affordability, once the duplicate coin was dropped'
+			).to.contain('wallet contribution cannot cover feerate');
 			const st = t.channel.getFullState();
 			// Dropping the duplicate leaves only the 120k already registered,
 			// which cannot fund a 150k contribution, so the raise is refused
@@ -6854,15 +6837,20 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 				processActions: (p: string, c: Channel, a: unknown[]) => void;
 			}
 		).processActions(acceptor.getNodeId(), channel, abortActions);
-		await settle(
-			() => managerOf(opener).getChannel(channelId) !== undefined,
-			4000
+		// The claim is that the removal never happens, and the channel is
+		// trivially still there the instant the abort returns: waiting for it
+		// to exist returned at once and gave a late void no window to fire.
+		// Wait the window out on the removal instead.
+		await neverSettles(
+			() =>
+				voided.length > 0 ||
+				managerOf(opener).getChannel(channelId) === undefined,
+			500
 		);
 		expect(
 			managerOf(opener).getChannel(channelId),
 			'the channel stays tracked without a durable removal'
 		).to.not.equal(undefined);
-		expect(voided).to.have.length(0);
 		expect(openerStorage.loadAllChannels()).to.have.length(1);
 
 		opener.destroy();
@@ -8633,10 +8621,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		).processActions(acceptor.getNodeId(), channel, abortActions);
 		await settle(() => managerOf(opener).getChannel(channelId) === undefined);
 		expect(managerOf(opener).getChannel(channelId)).to.equal(undefined);
-		expect(
-			voided,
-			'no terminal event without a durable deletion'
-		).to.have.length(0);
+		await neverSettles(
+			() => voided.length > 0,
+			300 // no terminal event without a durable deletion
+		);
 		expect(openerStorage.loadAllChannels()).to.have.length(1);
 		expect(openerStorage.loadAllChannels()[0].state.condemned).to.be.true;
 
@@ -8700,8 +8688,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			stillFailing.getChannelManager().listChannels(),
 			'a condemned row never restores as a live channel'
 		).to.have.length(0);
-		await settle(() => stillFailingVoided.length > 0, 300);
-		expect(stillFailingVoided).to.have.length(0);
+		await neverSettles(
+			() => stillFailingVoided.length > 0,
+			300 // the restart owes the deletion; it does not report it done
+		);
 		expect(openerStorageStillFailing.loadAllChannels()).to.have.length(1);
 		stillFailing.destroy();
 
