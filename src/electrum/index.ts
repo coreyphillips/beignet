@@ -316,6 +316,11 @@ export class Electrum {
 	 *  evidence of it, so a reconciliation that fails is owed here and every
 	 *  later header retries it until one succeeds. */
 	private _reorgOwed = false;
+	/** Set when a server answered with the stored tip's own parent, which says
+	 *  it does not hold that tip. Until something confirms the tip again, a
+	 *  header that arrives too far away to be compared is read as a rollback
+	 *  rather than as growth: see applyHeader. */
+	private _tipUnverified = false;
 
 	public servers?: TServer | TServer[];
 	public network: EAvailableNetworks;
@@ -1489,11 +1494,15 @@ export class Electrum {
 				// orphaned, and writing this one on top is what spends the
 				// evidence.
 				reorgDetected = header.hash !== storedHash;
+				// The same block: a server holds the stored tip after all.
+				if (!reorgDetected) this._tipUnverified = false;
 			} else if (header.height === stored.height + 1) {
 				// The ordinary block-by-block case, and the only hot one. A
 				// successor that does not build on the stored tip means the
 				// stored tip is gone, however much taller the chain now is.
 				reorgDetected = this.getPrevBlockHash(header.hex) !== storedHash;
+				// A block built on it is the same confirmation.
+				if (!reorgDetected) this._tipUnverified = false;
 			} else if (
 				reported &&
 				header.height === stored.height - 1 &&
@@ -1513,11 +1522,25 @@ export class Electrum {
 				// announces the parent of the block this wallet holds is
 				// telling it that block was undone. That one keeps the reading
 				// it always had, below.
+				//
+				// Remembered, though: a server that answers with this tip's
+				// parent is saying it does not hold the tip. If the next header
+				// this wallet applies lands close enough to be compared, that
+				// settles it either way. If it lands further out, the gap rule
+				// below would read it as growth and the rollback would be lost
+				// for good, so an unconfirmed tip makes that case a rollback.
+				this._tipUnverified = true;
 				return ok('Header below the stored tip ignored.');
+			} else if (this._tipUnverified) {
+				// Too far away to compare, on a tip a server has already
+				// declined to confirm. Reconciling a chain that was fine costs
+				// a reorg message with nothing in it; reading a rollback as
+				// growth loses it permanently.
+				reorgDetected = true;
 			}
-			// A gap of more than one block in either direction is left with the
-			// height-only reading: the wallet stores one tip, so it holds no
-			// evidence about the blocks in between.
+			// Otherwise a gap of more than one block in either direction is left
+			// with the height-only reading: the wallet stores one tip, so it
+			// holds no evidence about the blocks in between.
 		}
 		// The header this wallet already holds, with nothing owed on it: the
 		// tip is re-applied on every subscribe, and the reconnect monitor makes
@@ -1538,6 +1561,8 @@ export class Electrum {
 		// the next header rather than forgotten.
 		if (reorgDetected) this._reorgOwed = true;
 		await this._wallet.updateHeader(header);
+		// The tip this doubt was about has been replaced.
+		this._tipUnverified = false;
 		if (!reorgDetected) return ok('Header stored.');
 		const reconciled = await this._wallet.checkUnconfirmedTransactions(true);
 		if (reconciled.isErr()) return err(reconciled.error.message);

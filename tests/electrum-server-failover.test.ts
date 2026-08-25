@@ -2067,6 +2067,46 @@ describe('Electrum hash aware rollback detection (issues #511, #515)', () => {
 		).to.equal(101);
 	});
 
+	it('reconciles a rollback that surfaces two blocks above an ignored tip', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		walletHeader.reorgChecks = [];
+
+		// A failover lands on a server that answers with this tip's own parent,
+		// which is ignored: it says nothing about block 100 either way.
+		nextHeaderHeight = 99;
+		await electrum.connectToElectrum({ servers: serverB });
+		await flush();
+		expect(walletHeader.stored.height).to.equal(100);
+		expect(walletHeader.reorgChecks).to.deep.equal([]);
+
+		// The wallet then misses a block (a disconnect, an app backgrounded)
+		// and the next header it sees is two above the stored tip, too far away
+		// to compare. Read as growth, the rollback that orphaned 100 would be
+		// lost for good.
+		const forkedAt100 = siblingHeaderHexAt(100);
+		const forked101 = Buffer.alloc(80);
+		forked101.writeUInt32LE(1, 0);
+		Buffer.from(Block.fromHex(forkedAt100).getId(), 'hex')
+			.reverse()
+			.copy(forked101, 4);
+		forked101.writeUInt32LE(11, 76);
+		const forked102 = Buffer.alloc(80);
+		forked102.writeUInt32LE(1, 0);
+		Buffer.from(Block.fromHex(forked101.toString('hex')).getId(), 'hex')
+			.reverse()
+			.copy(forked102, 4);
+		forked102.writeUInt32LE(12, 76);
+		await fireHeader(102, forked102.toString('hex'));
+		await flush();
+
+		expect(walletHeader.stored.height).to.equal(102);
+		expect(
+			walletHeader.reorgChecks,
+			'a tip no server would confirm must not be overwritten as growth'
+		).to.deep.equal([true]);
+	});
+
 	it('leaves a fresh wallet with no stored hash alone', async () => {
 		const freshHeader = createWalletHeader();
 		const fresh = createElectrum(sinon.spy(), sinon.spy(), 'dddd', freshHeader);
