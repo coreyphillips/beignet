@@ -1,11 +1,11 @@
 /**
- * Production Hardening 6 — Phase 1: Fund Safety Tests (18 tests)
+ * Production Hardening 6 — Phase 1: Fund Safety Tests (21 tests)
  *
  * 1.1: Wire startReconnectMonitor in LightningNode (4 tests)
  * 1.2: Safe default fee rate for chain monitor restore (3 tests)
  * 1.3: Default autoReconnect to true when networking enabled (3 tests)
  * 1.4: Fix AWAITING_FUNDING_CONFIRMED stuck detection (4 tests)
- * 1.5: Stable delegate for ElectrumBackend onReceive (4 tests)
+ * 1.5: Stable delegate for ElectrumBackend onReceive (7 tests)
  */
 
 import { expect } from 'chai';
@@ -518,5 +518,72 @@ describe('Fix 1.5: Stable delegate for ElectrumBackend onReceive', () => {
 
 		triggerOnReceive([{ height: 500, hex: 'abc' }]);
 		expect(originalCallCount).to.equal(1);
+	});
+
+	it('failing back to a previously wrapped instance reports a block once', async () => {
+		const heights: number[] = [];
+		const serverA = createMockElectrum();
+		const serverB = createMockElectrum();
+
+		const backend = new ElectrumBackend(serverA.electrum as never);
+		await backend.subscribeToHeaders((h: number) => heights.push(h));
+
+		// Failover A -> B, then back to A, each re-subscribing on top.
+		backend.setElectrum(serverB.electrum as never);
+		await backend.resubscribeAll();
+		backend.setElectrum(serverA.electrum as never);
+		await backend.resubscribeAll();
+		backend.stopReconnectMonitor();
+
+		serverA.triggerOnReceive([{ height: 600, hex: 'abc' }]);
+
+		// A's retained delegate used to read as foreign on the way back, so one
+		// header ran the backend callback twice.
+		expect(heights.filter((h) => h === 600).length).to.equal(1);
+	});
+
+	it('failback does not stack wrappers over the instance original onReceive', async () => {
+		let originalCallCount = 0;
+		const serverA = createMockElectrum();
+		const serverB = createMockElectrum();
+		serverA.electrum.onReceive = (): void => {
+			originalCallCount++;
+		};
+
+		const backend = new ElectrumBackend(serverA.electrum as never);
+		await backend.subscribeToHeaders(() => {});
+		backend.setElectrum(serverB.electrum as never);
+		await backend.resubscribeAll();
+		backend.setElectrum(serverA.electrum as never);
+		await backend.resubscribeAll();
+		backend.stopReconnectMonitor();
+
+		serverA.triggerOnReceive([{ height: 601, hex: 'abc' }]);
+		expect(originalCallCount).to.equal(1);
+	});
+
+	it('a server the backend moved off no longer reports blocks', async () => {
+		const heights: number[] = [];
+		let originalCallCount = 0;
+		const serverA = createMockElectrum();
+		const serverB = createMockElectrum();
+		serverA.electrum.onReceive = (): void => {
+			originalCallCount++;
+		};
+
+		const backend = new ElectrumBackend(serverA.electrum as never);
+		await backend.subscribeToHeaders((h: number) => heights.push(h));
+		backend.setElectrum(serverB.electrum as never);
+		await backend.resubscribeAll();
+		backend.stopReconnectMonitor();
+
+		// A is still connected and still delivering headers.
+		serverA.triggerOnReceive([{ height: 602, hex: 'abc' }]);
+		expect(heights.filter((h) => h === 602).length).to.equal(0);
+		// A's own handler is back in place, undisturbed.
+		expect(originalCallCount).to.equal(1);
+
+		serverB.triggerOnReceive([{ height: 603, hex: 'abc' }]);
+		expect(heights.filter((h) => h === 603).length).to.equal(1);
 	});
 });

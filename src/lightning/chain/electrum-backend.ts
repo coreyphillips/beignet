@@ -28,12 +28,23 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 		{ callbacks: Set<() => void>; dispatcher: () => void }
 	> = new Map();
 	/**
-	 * The onReceive delegate this backend installed on the Electrum instance,
-	 * compared by identity so a re-subscribe never wraps its own wrapper. The
-	 * previous handler is captured in the closure rather than read back from a
-	 * field, which is what made a second install recurse into itself.
+	 * The onReceive delegate this backend installed, per Electrum instance, with
+	 * the handler it displaced. Compared by identity so a re-subscribe never
+	 * wraps its own wrapper. Keyed by instance rather than held in one field
+	 * because failing over and back (A to B to A) leaves A holding a delegate
+	 * this backend installed: a single field remembers only B's, so A's own
+	 * delegate reads as foreign and gets wrapped a second time, reporting every
+	 * header twice. The displaced handler is captured here rather than read back
+	 * from a mutable field, which is what made a second install recurse into
+	 * itself.
 	 */
-	private _headerDelegate: ((data: unknown) => void) | null = null;
+	private _headerDelegates = new WeakMap<
+		Electrum,
+		{
+			delegate: (data: unknown) => void;
+			previous: ((data: unknown) => void) | undefined;
+		}
+	>();
 	private _reconnectTimer: ReturnType<typeof setInterval> | null = null;
 	/** Timeout in ms for individual Electrum RPC calls (default 30s) */
 	readonly callTimeoutMs: number;
@@ -60,8 +71,28 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 
 	/** Replace the underlying Electrum instance (used during failover) */
 	setElectrum(electrum: Electrum): void {
+		if (electrum !== this.electrum) {
+			this._detachHeaderDelegate(this.electrum);
+		}
 		this.electrum = electrum;
 		this._consecutiveFailures = 0;
+	}
+
+	/**
+	 * Take this backend's delegate back off the instance it is leaving, so a
+	 * server that keeps delivering headers cannot report blocks to a backend
+	 * that has moved on. Only possible while our delegate is the installed one:
+	 * anything wrapped on top of it owns the chain now, so the record is kept
+	 * instead, which is what lets a later failback recognise the delegate as
+	 * ours rather than wrapping it again.
+	 */
+	private _detachHeaderDelegate(electrum: Electrum): void {
+		const installed = this._headerDelegates.get(electrum);
+		if (!installed || electrum.onReceive !== installed.delegate) {
+			return;
+		}
+		electrum.onReceive = installed.previous;
+		this._headerDelegates.delete(electrum);
 	}
 
 	getConsecutiveFailures(): number {
@@ -147,14 +178,14 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 		}
 
 		// Install the delegate once per Electrum instance, keyed on what is
-		// actually installed: a resubscribe (after a reconnect, or after
-		// failover re-points this backend) must not wrap the delegate it
-		// already installed, which would report every block twice.
-		const alreadyInstalled =
-			this._headerDelegate !== null &&
-			this.electrum.onReceive === this._headerDelegate;
-		if (!alreadyInstalled) {
-			const previousOnReceive = this.electrum.onReceive;
+		// actually installed on THAT instance: a resubscribe (after a reconnect,
+		// after failover re-points this backend, or after a failback to a server
+		// this backend wrapped before) must not wrap a delegate it already
+		// installed, which would report every block twice.
+		const electrum = this.electrum;
+		const installed = this._headerDelegates.get(electrum);
+		if (!installed || electrum.onReceive !== installed.delegate) {
+			const previousOnReceive = electrum.onReceive;
 			const delegate = (data: unknown): void => {
 				previousOnReceive?.(data);
 				// Electrum header subscription data arrives as an array with { height, hex }
@@ -166,8 +197,11 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 					this.notifyNewBlock(data[0].height);
 				}
 			};
-			this._headerDelegate = delegate;
-			this.electrum.onReceive = delegate;
+			this._headerDelegates.set(electrum, {
+				delegate,
+				previous: previousOnReceive
+			});
+			electrum.onReceive = delegate;
 		}
 
 		// Initial height from subscription result:
