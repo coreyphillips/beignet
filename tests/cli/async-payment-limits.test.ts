@@ -14,7 +14,10 @@ import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
-import { BeignetNode } from '../../src/cli/beignet-node';
+import {
+	BeignetNode,
+	MAX_LATE_ASYNC_SPEND_ENTRIES
+} from '../../src/cli/beignet-node';
 import { startDaemon } from '../../src/cli/daemon';
 
 // Same rationale as tests/cli/agent-production-hardening.ts: a refused loopback
@@ -36,7 +39,9 @@ type StubbedEngine = {
 type Internals = {
 	node: StubbedEngine;
 	_pendingSpendSats: number;
+	_dailySpendResetTime: number;
 	_asyncSpendReservations: Map<string, number>;
+	_asyncLateSpendSats: Map<string, number>;
 };
 
 const internals = (node: BeignetNode): Internals =>
@@ -192,6 +197,105 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		expect(internals(node)._asyncSpendReservations.size).to.equal(0);
 		// The budget is intact: a payment that never started holds no capacity.
 		expect(() => node.sendPaymentAsync(bolt11)).to.throw('No route found');
+	});
+
+	it('limits a fixed-amount invoice by its own amount, not by the override', () => {
+		const calls = stubSendPayment(node);
+		// The engine pays the encoded 6 000 sats whatever the override says, so
+		// admitting the payment on the override's word waves it past both limits.
+		const { bolt11 } = node.createInvoice(6_000, 'fixed');
+
+		expect(() => node.sendPaymentAsync(bolt11, undefined, 1)).to.throw(
+			'exceeds per-payment limit'
+		);
+		// Zero is the worse case: it used to skip the checks altogether.
+		expect(() => node.sendPaymentAsync(bolt11, undefined, 0)).to.throw(
+			'exceeds per-payment limit'
+		);
+		expect(calls).to.have.length(0);
+		expect(internals(node)._pendingSpendSats).to.equal(0);
+	});
+
+	it('reserves and records the encoded amount when the override understates it', () => {
+		stubSendPayment(node);
+		const { bolt11 } = node.createInvoice(3_000, 'understated');
+
+		const { paymentHash } = node.sendPaymentAsync(bolt11, undefined, 1);
+		expect(internals(node)._pendingSpendSats).to.equal(3_000);
+
+		settle(node, paymentHash, 3_000, 'COMPLETED');
+		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
+	});
+
+	it('charges a payment that settles after it was reported failed', () => {
+		stubSendPayment(node);
+		const { paymentHash } = node.sendPaymentAsync(
+			node.createInvoice(3_000, 'cancelled').bolt11
+		);
+
+		// What cancelPayment() does: the engine marks the payment failed, but
+		// its HTLC is still live and the preimage can still arrive.
+		settle(node, paymentHash, 3_000, 'FAILED');
+		expect(internals(node)._pendingSpendSats).to.equal(0);
+		expect(node.getDailySpendInfo().spentSats).to.equal(0);
+
+		settle(node, paymentHash, 3_000, 'COMPLETED');
+		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
+		// Exactly once, however many terminal events follow.
+		settle(node, paymentHash, 3_000, 'COMPLETED');
+		settle(node, paymentHash, 3_000, 'FAILED');
+		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
+		expect(internals(node)._pendingSpendSats).to.equal(0);
+	});
+
+	it('charges a retry of a failed payment once, not twice', () => {
+		stubSendPayment(node);
+		const { bolt11 } = node.createInvoice(3_000, 'retried');
+		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		settle(node, paymentHash, 3_000, 'FAILED');
+
+		// The retry's own reservation supersedes the failed attempt's claim.
+		node.sendPaymentAsync(bolt11);
+		expect(internals(node)._pendingSpendSats).to.equal(3_000);
+		settle(node, paymentHash, 3_000, 'COMPLETED');
+		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
+		expect(internals(node)._pendingSpendSats).to.equal(0);
+		expect(internals(node)._asyncLateSpendSats.size).to.equal(0);
+	});
+
+	it('bounds the failed payments held for a late settlement', () => {
+		const int = internals(node);
+		const hashAt = (i: number): string => i.toString(16).padStart(64, '0');
+		// Seeded directly: this is about the size of the map after a long run of
+		// failures, and the reservation path it comes from is covered above.
+		for (let i = 0; i < MAX_LATE_ASYNC_SPEND_ENTRIES + 10; i++) {
+			int._asyncSpendReservations.set(hashAt(i), 1);
+			int._pendingSpendSats += 1;
+			settle(node, hashAt(i), 1, 'FAILED');
+		}
+
+		expect(int._asyncLateSpendSats.size).to.equal(MAX_LATE_ASYNC_SPEND_ENTRIES);
+		expect(int._pendingSpendSats).to.equal(0);
+		// The oldest failures go first: they are the ones least able to settle.
+		expect(int._asyncLateSpendSats.has(hashAt(0))).to.equal(false);
+		expect(
+			int._asyncLateSpendSats.has(hashAt(MAX_LATE_ASYNC_SPEND_ENTRIES + 9))
+		).to.equal(true);
+	});
+
+	it('counts a settlement that arrives after midnight UTC against the new day', () => {
+		stubSendPayment(node);
+		const { paymentHash } = node.sendPaymentAsync(
+			node.createInvoice(3_000, 'past midnight').bolt11
+		);
+		// The daily window expired while the payment was in flight.
+		internals(node)._dailySpendResetTime = Date.now() - 1;
+
+		settle(node, paymentHash, 3_000, 'COMPLETED');
+		// Recording into the expired day made the next reset erase the spend, so
+		// whether it counted depended on a read-only call running first.
+		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
+		expect(node.getDailySpendInfo().resetsAt).to.be.greaterThan(Date.now());
 	});
 
 	it('leaves the accounting alone for an amountless invoice with no override', () => {
