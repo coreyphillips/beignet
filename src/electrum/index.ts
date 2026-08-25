@@ -1308,6 +1308,26 @@ export class Electrum {
 	}
 
 	/**
+	 * Stores a header and reconciles the rollback it implies, if any.
+	 *
+	 * Every header write goes through here, the one a (re)subscribe answers
+	 * with included: a header below the stored one is the only evidence of a
+	 * rollback this instance gets, and writing it straight to storage spends
+	 * that evidence. The stored height silently drops, and the next
+	 * notification, higher than what was written, then reads as ordinary
+	 * growth, so a chain that rolled back while this process was away, or
+	 * while it was talking to a server that has since been swapped out, is
+	 * never reconciled at all.
+	 */
+	private async applyHeader(header: IHeader): Promise<void> {
+		const reorgDetected = header.height < this.getBlockHeader().height;
+		await this._wallet.updateHeader(header);
+		if (reorgDetected) {
+			await this._wallet.checkUnconfirmedTransactions(reorgDetected);
+		}
+	}
+
+	/**
 	 * Applies a new block header to this instance's wallet. Handed to the
 	 * shared per-network header router rather than to the client directly, so
 	 * every subscribed instance is reached by the one handler the client keeps.
@@ -1316,11 +1336,7 @@ export class Electrum {
 		const hex = data[0].hex;
 		const hash = this.getBlockHashFromHex({ blockHex: hex });
 		const header: IHeader = { ...data[0], hash };
-		const reorgDetected = header.height < this.getBlockHeader().height;
-		await this._wallet.updateHeader(header);
-		if (reorgDetected) {
-			await this._wallet.checkUnconfirmedTransactions(reorgDetected);
-		}
+		await this.applyHeader(header);
 		await this._wallet.refreshWallet();
 		this.onReceive?.(data);
 		this.sendMessage(onMessageKeys.newBlock, data[0]);
@@ -1380,11 +1396,15 @@ export class Electrum {
 		if (subscribeResponse?.data === 'Already Subscribed.') {
 			return ok(this.getBlockHeader());
 		}
-		// Update local storage with current height and hex.
+		// Update local storage with current height and hex. Reconciled rather
+		// than written, because a subscribe is exactly where a rollback shows
+		// up: this is the first header the wallet sees after a reconnect, and
+		// after a failover it comes from a server the wallet has never spoken
+		// to.
 		const hex = subscribeResponse.data.hex;
 		const hash = this.getBlockHashFromHex({ blockHex: hex });
-		const header = { ...subscribeResponse.data, hash };
-		await this._wallet.updateHeader(header);
+		const header: IHeader = { ...subscribeResponse.data, hash };
+		await this.applyHeader(header);
 		return ok(header);
 	}
 

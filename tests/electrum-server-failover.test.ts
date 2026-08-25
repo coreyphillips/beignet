@@ -26,6 +26,12 @@
  * ElectrumBackend reconnect monitor still ticking after wallet.stop()) put the
  * stopped instance straight back into the shared routers.
  *
+ * And for issue #496: the header a (re)subscribe answers with was written
+ * straight to storage without the reorg check the notification path runs, so a
+ * rollback that happened while this process was away lowered the stored height
+ * unreconciled, and every notification after it, higher than what was written,
+ * read as ordinary growth.
+ *
  * Fully OFFLINE: the client helpers are stubbed with a faithful model of that
  * per-network state, including the upstream asymmetry (a server swap drops the
  * handlers but keeps the bookkeeping), and notifications are fired by invoking
@@ -271,6 +277,8 @@ const stubHelpers = (): void => {
 
 /** The wallet's stored header, updated by the header subscription. */
 let storedHeader: IHeader;
+/** The reorg flag of every checkUnconfirmedTransactions call, in order. */
+let reorgChecks: boolean[];
 
 const createFakeWallet = (
 	refreshSpy: sinon.SinonStub,
@@ -285,7 +293,11 @@ const createFakeWallet = (
 			if (headerHandlerGate) await headerHandlerGate.promise;
 			storedHeader = header;
 		},
-		checkUnconfirmedTransactions: async (): Promise<void> => {},
+		checkUnconfirmedTransactions: async (
+			reorgDetected = false
+		): Promise<void> => {
+			reorgChecks.push(reorgDetected);
+		},
 		addressTypesToMonitor: [EAddressType.p2wpkh],
 		gapLimitOptions: {
 			lookAhead: 2,
@@ -363,6 +375,7 @@ const startTest = (): void => {
 	disconnectFails = false;
 	socketIsDead = false;
 	storedHeader = { height: 0, hash: '', hex: '' };
+	reorgChecks = [];
 	stubHelpers();
 	refreshSpy = sinon.spy();
 	messageSpy = sinon.spy();
@@ -1237,5 +1250,96 @@ describe('Electrum subscriptions after disconnect (issue #494)', () => {
 		expect(onReceive.calledOnce, 'the revived instance is wired').to.equal(
 			true
 		);
+	});
+});
+
+describe('Electrum reconnect header reorg reconciliation (issue #496)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	it('reconciles a rollback the reconnect header reports', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(storedHeader.height).to.equal(100);
+		reorgChecks = [];
+
+		// The chain rolled back while the socket was dead, so the restore's
+		// header subscription answers below the stored tip.
+		nextHeaderHeight = 96;
+		socketIsDead = true;
+		const reconnected = await electrum.connectToElectrum({ servers: serverA });
+		expect(reconnected.isOk()).to.equal(true);
+		await flush();
+
+		expect(storedHeader.height, 'the shorter chain is stored').to.equal(96);
+		expect(
+			reorgChecks,
+			'and the rollback it implies is reconciled'
+		).to.deep.equal([true]);
+	});
+
+	it('reconciles a rollback a failover to a shorter chain reports', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		reorgChecks = [];
+
+		nextHeaderHeight = 90;
+		const swapped = await electrum.connectToElectrum({ servers: serverB });
+		expect(swapped.isOk()).to.equal(true);
+		await flush();
+
+		expect(storedHeader.height).to.equal(90);
+		expect(reorgChecks).to.deep.equal([true]);
+	});
+
+	it('leaves no rollback for a notification that could no longer see it', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		reorgChecks = [];
+
+		nextHeaderHeight = 96;
+		socketIsDead = true;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// The shorter chain grows past the reconnect header but stays below the
+		// tip that was stored before it, which is exactly the notification that
+		// used to be the only chance to notice the rollback, and could not:
+		// the unreconciled write had already lowered the stored height.
+		expect(client.headerHandler).to.not.equal(null);
+		await client.headerHandler?.([{ height: 98, hex: headerHex }]);
+		await flush();
+
+		expect(storedHeader.height).to.equal(98);
+		expect(
+			reorgChecks,
+			'the reconnect reconciled it once, and the block on top is growth'
+		).to.deep.equal([true]);
+	});
+
+	it('reconciles nothing when the reconnect header extends the stored chain', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		reorgChecks = [];
+
+		nextHeaderHeight = 140;
+		socketIsDead = true;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(storedHeader.height).to.equal(140);
+		expect(reorgChecks, 'a taller chain is not a rollback').to.deep.equal([]);
+	});
+
+	it('still reconciles a rollback a notification reports', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		reorgChecks = [];
+
+		await client.headerHandler?.([{ height: 95, hex: headerHex }]);
+		await flush();
+
+		expect(storedHeader.height).to.equal(95);
+		expect(reorgChecks).to.deep.equal([true]);
 	});
 });
