@@ -8,7 +8,8 @@
  * (note: modern CLN itself does advertise bits 60/61, so the legacy coverage
  * relies on the helper's feature set, not on CLN's).
  *
- * Also captures Eclair's real closing_complete/closing_sig wire bytes into
+ * With CAPTURE_VECTORS=1 it also re-freezes Eclair's real
+ * closing_complete/closing_sig wire bytes into
  * tests/lightning/conformance/vectors/eclair-simple-close.json (no upstream
  * test vectors exist for simple close).
  */
@@ -39,6 +40,13 @@ const VECTORS_PATH = path.join(
 	'vectors',
 	'eclair-simple-close.json'
 );
+
+// Refreshing the committed fixture is an intentional act. A default run is
+// read-only, so the vector stays the frozen eclair 0.13 reference the decode
+// conformance test checks against: re-freezing it from the current run would
+// paper over exactly the decode regression that test exists to catch, and
+// would leave every interop run with a dirty working tree.
+const CAPTURE_VECTORS = process.env.CAPTURE_VECTORS === '1';
 
 interface ICapturedMsg {
 	type: number;
@@ -150,25 +158,30 @@ describe('Interop: option_simple_close vs Eclair (regtest)', function () {
 	});
 
 	after(function () {
-		// Freeze real Eclair wire bytes as decode fixtures.
-		if (allCaptured.length > 0) {
-			fs.mkdirSync(path.dirname(VECTORS_PATH), { recursive: true });
-			fs.writeFileSync(
-				VECTORS_PATH,
-				JSON.stringify(
-					{
-						description:
-							'closing_complete (40) / closing_sig (41) payloads captured from a live eclair 0.13 node (no upstream vectors exist)',
-						messages: allCaptured
-					},
-					null,
-					'\t'
-				)
-			);
+		if (allCaptured.length === 0) return;
+		if (!CAPTURE_VECTORS) {
 			console.log(
-				`    captured ${allCaptured.length} simple-close messages → ${VECTORS_PATH}`
+				`    saw ${allCaptured.length} simple-close messages; set CAPTURE_VECTORS=1 to re-freeze ${VECTORS_PATH}`
 			);
+			return;
 		}
+		// Freeze real Eclair wire bytes as decode fixtures.
+		fs.mkdirSync(path.dirname(VECTORS_PATH), { recursive: true });
+		fs.writeFileSync(
+			VECTORS_PATH,
+			JSON.stringify(
+				{
+					description:
+						'closing_complete (40) / closing_sig (41) payloads captured from a live eclair 0.13 node (no upstream vectors exist)',
+					messages: allCaptured
+				},
+				null,
+				'\t'
+			)
+		);
+		console.log(
+			`    captured ${allCaptured.length} simple-close messages → ${VECTORS_PATH}`
+		);
 	});
 
 	it('closes as CLOSEE: eclair funds the close, beignet co-signs and broadcasts', async function () {

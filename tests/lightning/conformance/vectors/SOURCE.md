@@ -33,6 +33,15 @@ machine-loadable records (no values altered — uint64-range decimals are quoted
 as strings so JSON.parse cannot lose precision). To re-sync, refetch the files
 at a newer commit and update the hex in place.
 
+## Captured, not vendored
+
+`eclair-simple-close.json` is the exception: no upstream vectors exist for
+`option_simple_close`, so it freezes `closing_complete` / `closing_sig` payloads
+captured from a live eclair 0.13 node. Refreshing it is deliberate, via
+`CAPTURE_VECTORS=1` on `tests/lightning/interop/eclair-simple-close.test.ts`; an
+ordinary interop run leaves it alone so the decode conformance test has a fixed
+reference to regress against.
+
 ## Known upstream vectors not vendored
 
 - `bolt02/splicing-test.md` — prose message-sequence scenarios, no machine
