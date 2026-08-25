@@ -190,11 +190,33 @@ const HEADER_SUBSCRIBE_GATE_MS = 30_000;
 const subscriptionRestoreOwed: Set<EElectrumNetworks> = new Set();
 
 /**
- * Restores in flight per network, so the poll hook does not stack one restore
- * per instance onto the same client every tick. The connect path never
- * consults it: that restore is unconditional (see _doConnect).
+ * Start times of the restores in flight per network, so the poll hook does not
+ * stack one restore per instance onto the same client every tick. The connect
+ * path never consults it: that restore is unconditional (see _doConnect).
+ *
+ * Times rather than a count, because a restore is not guaranteed to settle: it
+ * awaits caller-supplied storage through applyReportedHeader, and a wallet
+ * whose write never answers would otherwise hold the gate shut and disable the
+ * only retry hook the whole network has, permanently. One that has been
+ * running longer than any real restore takes stops counting.
  */
-const restoresInFlight: Map<EElectrumNetworks, number> = new Map();
+const restoresInFlight: Map<EElectrumNetworks, number[]> = new Map();
+
+/** After this, an unsettled restore no longer holds the poll hook shut. */
+const RESTORE_STALL_MS = 60_000;
+
+/**
+ * Bumped every time a restore records a debt for a network. A restore that
+ * started BEFORE the bump cannot discharge that debt: it never re-issued the
+ * subscription that failed, so its success says nothing about it.
+ */
+const restoreDebtSeq: Map<EElectrumNetworks, number> = new Map();
+
+function restoreIsRunning(network: EElectrumNetworks, now: number): boolean {
+	const started = restoresInFlight.get(network);
+	if (!started) return false;
+	return started.some((at) => now - at < RESTORE_STALL_MS);
+}
 
 /**
  * Server keys (host|protocol|port) that an instance in this process connected
@@ -582,10 +604,19 @@ export class Electrum {
 			this.publishConnectionChange(false);
 			return err(lastError);
 		}
+		// Checked BEFORE anything is announced. disconnect() may have landed
+		// while this attempt was in flight: it withdrew the instance from the
+		// shared routers and tore the client down, and this attempt has since
+		// built a fresh one, so a live socket (and the client's own keep-alive
+		// interval) would be left behind a wallet the caller believes is
+		// stopped. Take it back down, and announce nothing: disconnect()
+		// publishes nothing itself, and a connected event for a stopped wallet
+		// is a lie its consumers act on.
+		if (this._disconnected) {
+			await electrum.stop({ network: electrumNetwork });
+			return err(DISCONNECTED_ERROR);
+		}
 		this.publishConnectionChange(true);
-		// disconnect() may have landed while this attempt was in flight, and it
-		// withdrew the instance from the shared routers.
-		if (this._disconnected) return ok('Connected to Electrum server.');
 		// Unconditional, because a connect cannot tell whether the client it now
 		// holds is the one that was subscribed. Our own teardown resets it on a
 		// server change, and rn-electrum-client resets it behind our back on the
@@ -797,13 +828,21 @@ export class Electrum {
 	private restoreSubscriptionsBestEffort(
 		electrumNetwork: EElectrumNetworks
 	): void {
-		restoresInFlight.set(
-			electrumNetwork,
-			(restoresInFlight.get(electrumNetwork) ?? 0) + 1
-		);
+		const startedAt = Date.now();
+		const started = restoresInFlight.get(electrumNetwork) ?? [];
+		started.push(startedAt);
+		restoresInFlight.set(electrumNetwork, started);
+		// Read at the start, so a debt recorded WHILE this restore was running
+		// is not discharged by it: this attempt re-issued the subscriptions the
+		// router held when it began, and a failure since then is about a
+		// different attempt on a client this one never saw.
+		const debtSeenAt = restoreDebtSeq.get(electrumNetwork) ?? 0;
 		this.restoreSubscriptions(electrumNetwork)
 			.then(
 				() => {
+					if ((restoreDebtSeq.get(electrumNetwork) ?? 0) !== debtSeenAt) {
+						return;
+					}
 					if (this._restoreOwed === electrumNetwork) {
 						this._restoreOwed = null;
 					}
@@ -817,6 +856,7 @@ export class Electrum {
 					// unwired are the shared router's, so an instance that walks
 					// away mid-restore leaves the debt behind rather than taking
 					// it with it.
+					restoreDebtSeq.set(electrumNetwork, debtSeenAt + 1);
 					subscriptionRestoreOwed.add(electrumNetwork);
 					// A restore that failed because THIS instance disconnected
 					// owes nothing of its OWN: disconnect() cleared that field,
@@ -827,9 +867,11 @@ export class Electrum {
 				}
 			)
 			.finally(() => {
-				const left = (restoresInFlight.get(electrumNetwork) ?? 1) - 1;
-				if (left > 0) restoresInFlight.set(electrumNetwork, left);
-				else restoresInFlight.delete(electrumNetwork);
+				const left = restoresInFlight.get(electrumNetwork);
+				if (!left) return;
+				const at = left.indexOf(startedAt);
+				if (at >= 0) left.splice(at, 1);
+				if (left.length === 0) restoresInFlight.delete(electrumNetwork);
 			});
 	}
 
@@ -960,10 +1002,10 @@ export class Electrum {
 	async isConnected(): Promise<boolean> {
 		// Guarded for the reason checkConnection is: a ping with no client for
 		// the network dials a random peers.json server rather than answering
-		// false, so a bare ping both lies and connects.
+		// false, so a bare ping both lies and connects. And asked of this
+		// instance's own network, which the unscoped ping does not do.
 		if (!this.isOurPeer()) return false;
-		const { error } = await electrum.pingServer();
-		return !error;
+		return this.peerResponds(this.electrumNetwork);
 	}
 
 	/**
@@ -2301,7 +2343,15 @@ export class Electrum {
 			// foreign peer down and restores every subscription the network
 			// holds.
 			const ours = this.isOurPeer();
-			const { error } = ours ? await electrum.pingServer() : { error: true };
+			// Scoped to OUR network, not asked of whichever network connected
+			// last. electrum.pingServer takes no network and resolves one from
+			// clients.network, so in a process with instances on more than one
+			// network a wallet whose own socket has died can ping a sibling's
+			// live client, get a pong, and report itself healthy for as long as
+			// the sibling stays up.
+			const error = ours
+				? !(await this.peerResponds(this.electrumNetwork))
+				: true;
 			// A disconnect that landed while the ping was in flight has already
 			// withdrawn this instance. Nothing past here may run for it:
 			// connectToElectrum clears _disconnected for an EXPLICIT revive, so
@@ -2342,7 +2392,7 @@ export class Electrum {
 				if (
 					owed &&
 					!this._disconnected &&
-					!restoresInFlight.has(this.electrumNetwork)
+					!restoreIsRunning(this.electrumNetwork, Date.now())
 				) {
 					this.restoreSubscriptionsBestEffort(this.electrumNetwork);
 				}

@@ -2387,6 +2387,40 @@ describe('Electrum lifecycle and disconnect races', () => {
 		).to.equal(true);
 	});
 
+	it('leaves no client behind a connect the disconnect outran (#504)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		messageSpy.resetHistory();
+		connectionEvents.length = 0;
+
+		// The connect is inside electrum.start() when the wallet stops.
+		reachableHosts.delete(serverB.host);
+		reachableHosts.add(serverB.host);
+		const connecting = electrum.connectToElectrum({ servers: serverB });
+		await electrum.disconnect();
+		const result = await connecting;
+		await flush();
+
+		expect(
+			result.isErr(),
+			'a connect the disconnect outran has not connected anything'
+		).to.equal(true);
+		expect(
+			messageSpy
+				.getCalls()
+				.filter(
+					(call: { args: [string, unknown] }) =>
+						call.args[0] === 'connectedToElectrum' && call.args[1] === true
+				).length,
+			'and must not announce a connection for a stopped wallet'
+		).to.equal(0);
+		expect(
+			connectionEvents.filter((event) => event.startsWith('disconnect:'))
+				.length,
+			'the socket it built is taken back down'
+		).to.be.greaterThan(0);
+	});
+
 	it('lets a sibling discharge the debt a failed restore left (#499)', async () => {
 		const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
 		await electrum.connectToElectrum({ servers: serverA });
@@ -2417,6 +2451,97 @@ describe('Electrum lifecycle and disconnect races', () => {
 			protocolSubscribes,
 			'a debt on the shared client is any instance on the network to discharge'
 		).to.include('cccc');
+	});
+
+	it('does not let a stale restore discharge a newer debt (#499)', async () => {
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// One restore still in flight, parked in the header reconcile this
+		// wallet's own storage is holding open.
+		const parked = createGate();
+		walletHeader.writeGate = parked;
+		// The header has to MOVE, or applyHeader short circuits on the tip it
+		// already holds and the restore never reaches the write.
+		nextHeaderHeight = 101;
+		socketIsDead = true;
+		void electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// A second restore, started after it, fails on the sibling's hash and
+		// records the debt.
+		socketIsDead = true;
+		subscriptionFailures.add('cccc');
+		void electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// The first one finally settles. It re-issued the subscriptions the
+		// client held when it began, so its success says nothing about the one
+		// that has failed since.
+		parked.release();
+		walletHeader.writeGate = null;
+		await flush();
+		protocolSubscribes.length = 0;
+
+		await pollConnection(electrum);
+		await flush();
+
+		expect(
+			protocolSubscribes,
+			'the debt recorded while it ran must survive its success'
+		).to.include('cccc');
+	});
+
+	it('does not let a restore that never settles disable the retry (#499)', async () => {
+		const clock = sinon.useFakeTimers({
+			now: Date.now(),
+			toFake: ['Date']
+		});
+		try {
+			const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
+			await electrum.connectToElectrum({ servers: serverA });
+			await flush();
+			await other.connectToElectrum({ servers: serverA });
+			await flush();
+
+			// A wallet whose storage never answers, which the header dispatch
+			// already has to defend against: its restore never settles.
+			const wedged = createGate();
+			walletHeader.writeGate = wedged;
+			nextHeaderHeight = 101;
+			socketIsDead = true;
+			void electrum.connectToElectrum({ servers: serverA });
+			await flush();
+
+			// A later restore fails on the sibling's hash and records the debt.
+			socketIsDead = true;
+			subscriptionFailures.add('cccc');
+			void other.connectToElectrum({ servers: serverA });
+			await flush();
+			protocolSubscribes.length = 0;
+
+			// While the wedged one is plausibly still working, the poll defers
+			// to it rather than stacking a second restore per tick.
+			await pollConnection(other);
+			await flush();
+			expect(protocolSubscribes).to.not.include('cccc');
+
+			// Long past any real restore, it stops holding the gate shut: it is
+			// the only retry hook the whole network has.
+			clock.tick(120_000);
+			await pollConnection(other);
+			await flush();
+
+			expect(
+				protocolSubscribes,
+				'a restore that never settles must not disable the retry forever'
+			).to.include('cccc');
+		} finally {
+			clock.restore();
+		}
 	});
 
 	it('runs its own teardown when the same server stops answering (#509)', async () => {
