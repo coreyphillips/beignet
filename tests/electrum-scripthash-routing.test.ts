@@ -29,6 +29,7 @@ import {
 	Electrum,
 	EProtocol,
 	EScanningStrategy,
+	ok,
 	TServer,
 	Wallet
 } from '../src';
@@ -400,5 +401,169 @@ describe('Electrum script hash subscription routing (issue #478)', () => {
 			await backend.resubscribeAll();
 			expect(subscribedHashes).to.not.include('dead');
 		});
+	});
+});
+
+/**
+ * Issue #501 (and its duplicate #505): the script hash dispatcher iterated a
+ * snapshot of the ENTRIES and never re-read the map, so an instance that
+ * disconnected while an earlier entry was parked in getUtxos still had its
+ * callbacks fired and its wallet refreshed. The header dispatcher already
+ * re-read its handler at the moment of the call; this is its sibling.
+ *
+ * Issue #502: a stopped instance answers every subscribe with the disconnected
+ * refusal by design, and ElectrumBackend's reconnect monitor could not tell
+ * that apart from a server failure. It counted the refusal toward
+ * onFailoverNeeded, whose handler calls connectToElectrum and puts the stopped
+ * wallet fully back on the network.
+ */
+describe('Electrum dispatch and monitor against a stopped instance', () => {
+	let refreshSpy: sinon.SinonStub;
+	let electrum: Electrum;
+
+	beforeEach(() => {
+		globalHandler = null;
+		subscribedHashes = [];
+		failNextSubscribes = 0;
+		hangNextSubscribes = 0;
+		sinon.stub(electrumHelpers, 'subscribeAddress').callsFake(
+			async ({
+				scriptHash = '',
+				onReceive = undefined
+			}: {
+				scriptHash?: string;
+				onReceive?: (data: TNotification) => void;
+			} = {}) => {
+				if (onReceive && !globalHandler) globalHandler = onReceive;
+				if (subscribedHashes.includes(scriptHash)) {
+					return { error: false, data: 'Already Subscribed.' };
+				}
+				subscribedHashes.push(scriptHash);
+				return { error: false, data: { id: 1, jsonrpc: '2.0', result: null } };
+			}
+		);
+		refreshSpy = sinon.spy();
+		electrum = createElectrum(refreshSpy);
+	});
+
+	afterEach(async () => {
+		for (const instance of createdInstances) {
+			await instance.disconnect();
+		}
+		createdInstances.length = 0;
+		sinon.restore();
+	});
+
+	it('does not refresh a wallet that disconnects mid-dispatch (#501)', async () => {
+		const refreshB = sinon.spy();
+		const electrumB = createElectrum(refreshB);
+		const cbB = sinon.spy();
+
+		// Both instances subscribe the SAME hash, and the first tracks a UTXO
+		// on it, so its entry parks the dispatch inside getUtxos.
+		let release = (): void => {};
+		const parked = new Promise<void>((resolve) => {
+			release = (): void => resolve();
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(electrum as any).getUtxos = async (): Promise<void> => parked;
+		await electrum.subscribeToAddresses({
+			scriptHashes: ['abab'],
+			onReceive: sinon.spy()
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(electrum as any)._scriptHashRecord('abab').utxoIndex = 0;
+		await electrumB.subscribeToAddresses({
+			scriptHashes: ['abab'],
+			onReceive: cbB
+		});
+
+		const dispatched = fireNotification(['abab', 's1']);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await electrumB.disconnect();
+		release();
+		await dispatched;
+
+		expect(
+			refreshB.called,
+			'a wallet that shut down must not be refreshed'
+		).to.equal(false);
+		expect(cbB.called, 'and its callback must not be called either').to.equal(
+			false
+		);
+	});
+
+	it('does not refresh a wallet that disconnects inside its own scan (#505)', async () => {
+		// The sibling of the case above: the parked entry is this instance's
+		// OWN, so the re-read at the top of the loop has already happened and
+		// only the check after the scan can catch the withdrawal.
+		let release = (): void => {};
+		const parked = new Promise<void>((resolve) => {
+			release = (): void => resolve();
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(electrum as any).getUtxos = async (): Promise<void> => parked;
+		await electrum.subscribeToAddresses({
+			scriptHashes: ['bcbc'],
+			onReceive: sinon.spy()
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(electrum as any)._scriptHashRecord('bcbc').utxoIndex = 0;
+
+		const dispatched = fireNotification(['bcbc', 's1']);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await electrum.disconnect();
+		release();
+		await dispatched;
+
+		expect(
+			refreshSpy.called,
+			'a wallet that shut down while its own scan ran must not be refreshed'
+		).to.equal(false);
+	});
+
+	it('lets the reconnect monitor tick past a stopped instance (#502)', async () => {
+		const backend = new ElectrumBackend(electrum);
+		let failovers = 0;
+		backend.onFailoverNeeded = (): void => {
+			failovers++;
+		};
+		const pinged = sinon.spy(electrum, 'pingHeaderSubscription');
+		await electrum.disconnect();
+
+		// Driven by hand rather than by wall clock: an assertion that the
+		// monitor did nothing is also true of a monitor that never ticked.
+		backend.startReconnectMonitor(10);
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		backend.stopReconnectMonitor();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(pinged.called, 'a stopped instance must not even be asked').to.equal(
+			false
+		);
+		expect(
+			backend.getConsecutiveFailures(),
+			'a refusal by design is not a server failure'
+		).to.equal(0);
+		expect(failovers, 'and must not drive a failover').to.equal(0);
+		expect(
+			electrum.isDisconnected,
+			'the stopped instance stays stopped'
+		).to.equal(true);
+	});
+
+	it('still pings a live instance on every tick (#502)', async () => {
+		const backend = new ElectrumBackend(electrum);
+		const pinged = sinon
+			.stub(electrum, 'pingHeaderSubscription')
+			.resolves(ok({ height: 1, hash: 'aa', hex: '00' }));
+
+		backend.startReconnectMonitor(10);
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		backend.stopReconnectMonitor();
+
+		// The positive control: without this, the test above passes on a
+		// monitor that simply never ran.
+		expect(pinged.called, 'the monitor must actually tick').to.equal(true);
 	});
 });

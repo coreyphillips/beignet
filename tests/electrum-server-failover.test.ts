@@ -191,6 +191,10 @@ let headerSubscribeCalls: number;
  *  "Already Subscribed." included: reaching it at all is what dials a random
  *  peers.json server for a network with no client. */
 let headerSubscribeRequests: number;
+/** Every call that reached the client's subscribeAddress, the ones it answers
+ *  "Already Subscribed." included, so a restore that re-issues everything is
+ *  visible even when nothing new is subscribed. */
+let addressSubscribeRequests: number;
 /** Held open to keep a subscription request in flight for as long as a test
  *  needs, so a disconnect can land in the middle of one. */
 let subscriptionGate: { promise: Promise<void>; release: () => void } | null;
@@ -207,6 +211,18 @@ let disconnectFails: boolean;
  *  peer finds the client's own ping failing. Consumed on use, because the
  *  replacement client the reset leaves behind is alive. */
 let socketIsDead: boolean;
+/** Makes every RPC to the connected peer fail, which is what a socket the
+ *  client believes in but that answers nothing looks like. */
+let peerIsDeaf: boolean;
+/** Networks the liveness probe was asked about, in order. */
+let balanceProbes: string[];
+/** Held open to park a connection poll inside its ping, so a disconnect can
+ *  land in the middle of one. */
+let pingGate: { promise: Promise<void>; release: () => void } | null;
+/** The same, for the network-scoped liveness probe the poll actually uses. */
+let probeGate: { promise: Promise<void>; release: () => void } | null;
+/** Number of pings issued, so a test can prove one never happened. */
+let pings: number;
 /** Confirmed balance the stubbed script hash lookup answers with. */
 const stubbedBalance = { confirmed: 4321, unconfirmed: 0 };
 
@@ -296,7 +312,7 @@ const stubHelpers = (): void => {
 				connectionEvents.push('disconnect-failed');
 				return { error: true, data: 'socket hang up', network };
 			}
-			connectionEvents.push('disconnect');
+			connectionEvents.push(`disconnect:${network ?? '<module-global>'}`);
 			resetClient();
 			return { error: false, data: 'Disconnected...', network };
 		});
@@ -361,6 +377,7 @@ const stubHelpers = (): void => {
 			scriptHash?: string;
 			onReceive?: (data: TNotification) => void;
 		} = {}) => {
+			addressSubscribeRequests++;
 			if (subscriptionGate) await subscriptionGate.promise;
 			if (subscriptionFailures.delete(scriptHash)) {
 				return { error: true, data: 'Subscription failed.' };
@@ -380,13 +397,28 @@ const stubHelpers = (): void => {
 
 	sinon
 		.stub(electrumHelpers, 'getAddressScriptHashBalance')
-		.callsFake(async () => ({ error: false, data: stubbedBalance }));
+		.callsFake(async ({ network }: { network?: string } = {}) => {
+			balanceProbes.push(network ?? '');
+			if (probeGate) await probeGate.promise;
+			if (peerIsDeaf) return { error: true, data: 'timeout' };
+			return { error: false, data: stubbedBalance };
+		});
 
-	// The poll's health check: healthy for exactly as long as a peer is connected.
-	sinon.stub(electrumHelpers, 'pingServer').callsFake(async () => ({
-		error: !client.peer,
-		data: client.peer ? 'pong' : 'Not connected.'
-	}));
+	// The poll's health check: healthy for exactly as long as a peer is
+	// connected, and it answers for the module-global network, not ours.
+	sinon.stub(electrumHelpers, 'pingServer').callsFake(async () => {
+		pings++;
+		if (pingGate) await pingGate.promise;
+		// The helper dials a random peers.json peer whenever the network it
+		// answers for has no client, so a ping with nothing connected reports a
+		// live connection to a server nobody asked for.
+		if (!client.peer) {
+			connectionEvents.push('random-peer');
+			client.peer = { host: 'random.peers.json', port: 50002, protocol: 'ssl' };
+			return { error: false, data: 'pong' };
+		}
+		return { error: false, data: 'pong' };
+	});
 };
 
 /** One wallet's header bookkeeping. Per wallet, because a header applies to
@@ -436,6 +468,14 @@ const createFakeWallet = (
 		sendMessage: messageSpy,
 		isSwitchingNetworks: false,
 		refreshWallet: refreshSpy,
+		// The connection poll logs on both branches; without this a test that
+		// takes the reconnect branch fails on the logger, not on the behaviour.
+		logger: {
+			info: (): void => {},
+			warn: (): void => {},
+			error: (): void => {},
+			debug: (): void => {}
+		},
 		updateHeader: async (newHeader: IHeader): Promise<void> => {
 			if (headerHandlerGate) await headerHandlerGate.promise;
 			if (header.writeGate) await header.writeGate.promise;
@@ -528,9 +568,15 @@ const startTest = (): void => {
 	headerSubscribeControls = new Map();
 	headerSubscribeCalls = 0;
 	headerSubscribeRequests = 0;
+	addressSubscribeRequests = 0;
 	reachableHosts = new Set([serverA.host, serverB.host]);
 	disconnectFails = false;
 	socketIsDead = false;
+	peerIsDeaf = false;
+	balanceProbes = [];
+	pingGate = null;
+	probeGate = null;
+	pings = 0;
 	walletHeader = createWalletHeader();
 	stubHelpers();
 	refreshSpy = sinon.spy();
@@ -541,6 +587,11 @@ const startTest = (): void => {
 const endTest = async (): Promise<void> => {
 	disconnectFails = false;
 	socketIsDead = false;
+	peerIsDeaf = false;
+	pingGate?.release();
+	pingGate = null;
+	probeGate?.release();
+	probeGate = null;
 	subscriptionGate?.release();
 	subscriptionGate = null;
 	headerHandlerGate?.release();
@@ -559,6 +610,31 @@ const endTest = async (): Promise<void> => {
 		await instance.disconnect();
 	}
 	createdInstances.length = 0;
+	// The network's restore debt is module state in src, and it deliberately
+	// outlives the instance that recorded it, so a test that ends owing one
+	// would leave every later test in this process (the CI run is one mocha
+	// process over the whole tests tree) running a restore it never asked for.
+	// One successful connect discharges it, which is how a live process clears
+	// it too.
+	try {
+		reachableHosts = new Set([serverA.host, serverB.host]);
+		subscriptionFailures.clear();
+		peerIsDeaf = false;
+		const sweeper = createElectrum(
+			sinon.spy(),
+			sinon.spy(),
+			'0000',
+			createWalletHeader()
+		);
+		await sweeper.connectToElectrum({ servers: serverA });
+		await flush();
+		await sweeper.disconnect();
+	} catch {
+		// A test that left the stubs unusable is reported by its own
+		// assertions, not by this.
+	}
+	createdInstances.length = 0;
+	createdWalletHeaders.length = 0;
 	sinon.restore();
 };
 
@@ -577,7 +653,7 @@ describe('Electrum failover to a different server (issue #482)', () => {
 
 		expect(connectionEvents).to.deep.equal([
 			`connect:${serverA.host}`,
-			'disconnect',
+			'disconnect:bitcoinTestnet',
 			`connect:${serverB.host}`
 		]);
 	});
@@ -2230,5 +2306,437 @@ describe('Electrum reconcile debt is not a subscribe failure (issue #514)', () =
 		expect(protocolSubscribes, 'the owed restore must be retried').to.include(
 			'headers'
 		);
+	});
+});
+
+/**
+ * Issue #491: disconnect() called the client's stop() with no network, which
+ * the client resolves from clients.network, the network that connected LAST by
+ * any instance in the process. In a process with instances on more than one
+ * network that tears down a sibling's socket, and every subscription that
+ * network holds, while leaving this instance's own client running.
+ *
+ * Issue #498: every helper dials a random peers.json server when the network
+ * it answers for has no client, so a bare ping can CREATE a connection nobody
+ * asked for, carrying none of this process's subscriptions, and the health
+ * check then reports a live connection forever with nothing subscribed.
+ *
+ * Issue #504: the poll tick a disconnect interrupted resumed afterwards, called
+ * connectToElectrum, cleared the disconnected flag and put the stopped
+ * instance back on the network.
+ *
+ * Issue #499: the restore debt was the instance's alone, although what a
+ * restore re-issues is the whole network's shared client, so a sibling never
+ * retried the hashes the failing instance left unwired.
+ *
+ * Issue #509: on a same-server reconnect the client pings and, on failure,
+ * runs its own disconnect, which closes the socket BEFORE it clears the
+ * per-network bookkeeping, discards the result, and builds the replacement
+ * anyway. A close() that throws leaves every restore answered
+ * "Already Subscribed." on a client that no longer exists.
+ *
+ * Issue #513: a network change adopted the new network without withdrawing the
+ * instance from the old one's routers, so the old socket could still deliver
+ * into a wallet that had moved on.
+ */
+describe('Electrum lifecycle and disconnect races', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	it('stops the client for its OWN network, not the last one connected', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		connectionEvents.length = 0;
+
+		await electrum.disconnect();
+
+		expect(
+			connectionEvents,
+			'a bare stop() would tear down whichever network connected last'
+		).to.deep.equal(['disconnect:bitcoinTestnet']);
+	});
+
+	it('never pings a peer this instance did not connect (#498)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		// Another instance's disconnect took the shared client with it.
+		client.peer = null;
+		client.subscribedHeaders = false;
+		client.subscribedHashes = [];
+		client.headerHandlers = [];
+		protocolSubscribes.length = 0;
+		connectionEvents.length = 0;
+		pings = 0;
+
+		await pollConnection(electrum);
+		await flush();
+
+		expect(pings, 'a ping with no client dials a random peer').to.equal(0);
+		expect(
+			connectionEvents,
+			'the poll must reconnect to a server we chose'
+		).to.deep.equal([`connect:${serverA.host}`]);
+		expect(
+			protocolSubscribes,
+			'and the reconnect restores what the network holds'
+		).to.include('headers');
+		expect(protocolSubscribes).to.include(walletScriptHash);
+	});
+
+	it('treats a peer that changed behind us as a lost connection (#498)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		// A helper dialled a peers.json server while we were not looking.
+		client.peer = { host: 'random.peers.json', port: 50002, protocol: 'ssl' };
+		connectionEvents.length = 0;
+		protocolSubscribes.length = 0;
+
+		await pollConnection(electrum);
+		await flush();
+
+		expect(connectionEvents).to.include(`connect:${serverA.host}`);
+		expect(protocolSubscribes).to.include('headers');
+	});
+
+	it('does not reconnect from a poll the disconnect interrupted (#504)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		connectionEvents.length = 0;
+
+		// The tick is inside its liveness probe when the wallet stops, and the
+		// probe then answers that the peer is gone, which is the branch that
+		// reconnects.
+		probeGate = createGate();
+		peerIsDeaf = true;
+		const polling = pollConnection(electrum);
+		await flush();
+		await electrum.disconnect();
+		probeGate.release();
+		probeGate = null;
+		await polling;
+		peerIsDeaf = false;
+		await flush();
+
+		expect(
+			connectionEvents.filter((event) => event.startsWith('connect:')),
+			'a stopped instance must not be put back on the network'
+		).to.deep.equal([]);
+		expect(electrum.isDisconnected).to.equal(true);
+		expect(
+			(await electrum.subscribeToHeader()).isErr(),
+			'and it must still refuse subscribes'
+		).to.equal(true);
+	});
+
+	it('leaves no client behind a connect the disconnect outran (#504)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		messageSpy.resetHistory();
+		connectionEvents.length = 0;
+
+		// The connect is inside electrum.start() when the wallet stops.
+		reachableHosts.delete(serverB.host);
+		reachableHosts.add(serverB.host);
+		const connecting = electrum.connectToElectrum({ servers: serverB });
+		await electrum.disconnect();
+		const result = await connecting;
+		await flush();
+
+		expect(
+			result.isErr(),
+			'a connect the disconnect outran has not connected anything'
+		).to.equal(true);
+		expect(
+			messageSpy
+				.getCalls()
+				.filter(
+					(call: { args: [string, unknown] }) =>
+						call.args[0] === 'connectedToElectrum' && call.args[1] === true
+				).length,
+			'and must not announce a connection for a stopped wallet'
+		).to.equal(0);
+		expect(
+			connectionEvents.filter((event) => event.startsWith('disconnect:'))
+				.length,
+			'the socket it built is taken back down'
+		).to.be.greaterThan(0);
+	});
+
+	it('lets a sibling discharge the debt a failed restore left (#499)', async () => {
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// The client resets and the restore, run by the FIRST instance, fails
+		// on a hash that belongs to the second: what a restore re-issues is the
+		// whole network's shared client, not the running instance's own work.
+		socketIsDead = true;
+		subscriptionFailures.add('cccc');
+		protocolSubscribes.length = 0;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(
+			protocolSubscribes,
+			"the sibling's hash was left unwired"
+		).to.not.include('cccc');
+		protocolSubscribes.length = 0;
+
+		// The socket is healthy, so no reconnect is coming for anybody, and the
+		// instance that noticed is not the one whose hash is missing.
+		await pollConnection(other);
+		await flush();
+
+		expect(
+			protocolSubscribes,
+			'a debt on the shared client is any instance on the network to discharge'
+		).to.include('cccc');
+
+		// And the debt is settled. Counted at the client rather than read off
+		// protocolSubscribes, which records nothing for a hash the client
+		// answers "Already Subscribed.": a debt that is never discharged would
+		// otherwise be invisible, with every poll on every instance running a
+		// full restore forever.
+		const requestsAfterDischarge = addressSubscribeRequests;
+		await pollConnection(other);
+		await flush();
+		expect(
+			addressSubscribeRequests,
+			'a discharged debt must not keep re-running the restore'
+		).to.equal(requestsAfterDischarge);
+	});
+
+	it('does not let a stale restore discharge a newer debt (#499)', async () => {
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// One restore still in flight, parked in the header reconcile this
+		// wallet's own storage is holding open.
+		const parked = createGate();
+		walletHeader.writeGate = parked;
+		// The header has to MOVE, or applyHeader short circuits on the tip it
+		// already holds and the restore never reaches the write.
+		nextHeaderHeight = 101;
+		socketIsDead = true;
+		void electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// A second restore, started after it, fails on the sibling's hash and
+		// records the debt.
+		socketIsDead = true;
+		subscriptionFailures.add('cccc');
+		void electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// The first one finally settles. It re-issued the subscriptions the
+		// client held when it began, so its success says nothing about the one
+		// that has failed since.
+		parked.release();
+		walletHeader.writeGate = null;
+		await flush();
+		protocolSubscribes.length = 0;
+
+		await pollConnection(electrum);
+		await flush();
+
+		expect(
+			protocolSubscribes,
+			'the debt recorded while it ran must survive its success'
+		).to.include('cccc');
+	});
+
+	it('does not let a restore that never settles disable the retry (#499)', async () => {
+		const clock = useFakeClock(['Date']);
+		try {
+			const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
+			await electrum.connectToElectrum({ servers: serverA });
+			await flush();
+			await other.connectToElectrum({ servers: serverA });
+			await flush();
+
+			// A wallet whose storage never answers, which the header dispatch
+			// already has to defend against: its restore never settles.
+			const wedged = createGate();
+			walletHeader.writeGate = wedged;
+			nextHeaderHeight = 101;
+			socketIsDead = true;
+			void electrum.connectToElectrum({ servers: serverA });
+			await flush();
+
+			// A later restore fails on the sibling's hash and records the debt.
+			socketIsDead = true;
+			subscriptionFailures.add('cccc');
+			void other.connectToElectrum({ servers: serverA });
+			await flush();
+			protocolSubscribes.length = 0;
+
+			// While the wedged one is plausibly still working, the poll defers
+			// to it rather than stacking a second restore per tick.
+			await pollConnection(other);
+			await flush();
+			expect(protocolSubscribes).to.not.include('cccc');
+
+			// Long past any real restore, it stops holding the gate shut: it is
+			// the only retry hook the whole network has.
+			clock.tick(120_000);
+			await pollConnection(other);
+			await flush();
+
+			expect(
+				protocolSubscribes,
+				'a restore that never settles must not disable the retry forever'
+			).to.include('cccc');
+		} finally {
+			clock.restore();
+		}
+	});
+
+	it('runs its own teardown when the same server stops answering (#509)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		connectionEvents.length = 0;
+		protocolSubscribes.length = 0;
+		balanceProbes.length = 0;
+
+		// The socket is up as far as the client is concerned, but the peer
+		// answers nothing.
+		peerIsDeaf = true;
+		const reconnected = await electrum.connectToElectrum({ servers: serverA });
+		peerIsDeaf = false;
+		await flush();
+
+		expect(reconnected.isOk()).to.equal(true);
+		expect(balanceProbes, 'the peer was probed on OUR network').to.deep.equal([
+			'bitcoinTestnet'
+		]);
+		expect(
+			connectionEvents,
+			'a deaf peer is torn down where we can see it happen'
+		).to.deep.equal(['disconnect:bitcoinTestnet', `connect:${serverA.host}`]);
+		expect(
+			protocolSubscribes,
+			'and everything the network holds is re-issued for real'
+		).to.include('headers');
+		expect(protocolSubscribes).to.include(walletScriptHash);
+	});
+
+	it('leaves a live peer alone on a same-server connect (#509)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		connectionEvents.length = 0;
+
+		const again = await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(again.isOk()).to.equal(true);
+		expect(
+			connectionEvents,
+			'a healthy socket must not be torn down and rebuilt'
+		).to.deep.equal([`connect:${serverA.host}`]);
+	});
+
+	it('refuses the candidate when that teardown fails (#509)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// The peer is deaf AND close() throws, which is the case beignet could
+		// not see at all: the client would have built a replacement on stale
+		// bookkeeping and answered every later restore "Already Subscribed.".
+		peerIsDeaf = true;
+		disconnectFails = true;
+		const refused = await electrum.connectToElectrum({ servers: serverA });
+		peerIsDeaf = false;
+		disconnectFails = false;
+		await flush();
+
+		expect(refused.isErr()).to.equal(true);
+		expect(
+			connectionEvents.filter((event) => event.startsWith('connect:')).length,
+			'no client is built on bookkeeping that was never cleared'
+		).to.equal(1);
+	});
+
+	it('withdraws from the old network routers on a network change (#513)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(walletHeader.stored.height).to.equal(100);
+		// The dispatcher the testnet router handed the client.
+		const testnetDispatch = client.headerHandlers[0];
+		expect(testnetDispatch).to.not.equal(undefined);
+
+		const switched = await electrum.connectToElectrum({
+			network: EAvailableNetworks.bitcoin,
+			servers: serverA
+		});
+		expect(switched.isOk()).to.equal(true);
+		await flush();
+		walletHeader.reorgChecks = [];
+		const heightAfterSwitch = walletHeader.stored.height;
+
+		// The old network's socket is still alive and still delivering.
+		await testnetDispatch?.([{ height: 900, hex: headerHexAt(900) }]);
+		await flush();
+
+		expect(
+			walletHeader.stored.height,
+			'a header from the network it left must not reach this wallet'
+		).to.equal(heightAfterSwitch);
+	});
+});
+
+/**
+ * The peer test is "did anyone in this process choose it", not "did I": there
+ * is one client per network for the whole process, so a sibling instance may
+ * have moved it to a server from its own list, and that client is still the
+ * one carrying the shared router's subscriptions. Only a peer nobody here
+ * chose is the stray dial #498 is about.
+ */
+describe('Electrum peer ownership across instances (issue #498)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	it('accepts a peer a sibling instance connected', async () => {
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
+		other.servers = [serverB];
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		// The sibling moves the shared client to its own server.
+		await other.connectToElectrum({ servers: serverB });
+		await flush();
+		connectionEvents.length = 0;
+
+		await pollConnection(electrum);
+		await flush();
+
+		expect(
+			connectionEvents.filter((event) => event.startsWith('connect:')),
+			'two instances on one network must not fight over the client'
+		).to.deep.equal([]);
+		expect(electrum.connectedToElectrum).to.equal(true);
+	});
+
+	it('rejects a peer once every instance that chose it has gone', async () => {
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+		// The first instance stops, but the peer it was on is still connected
+		// because the second is on it too.
+		await electrum.disconnect();
+		client.peer = { host: serverA.host, port: serverA.ssl, protocol: 'ssl' };
+		connectionEvents.length = 0;
+
+		await pollConnection(other);
+		await flush();
+
+		expect(
+			connectionEvents.filter((event) => event.startsWith('connect:')),
+			'the instance still on that server keeps it'
+		).to.deep.equal([]);
 	});
 });
