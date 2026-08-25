@@ -183,6 +183,10 @@ let headerSubscribeControls: Map<
 	}
 >;
 let headerSubscribeCalls: number;
+/** Every call that reached the client's subscribeHeader, the ones it answers
+ *  "Already Subscribed." included: reaching it at all is what dials a random
+ *  peers.json server for a network with no client. */
+let headerSubscribeRequests: number;
 /** Held open to keep a subscription request in flight for as long as a test
  *  needs, so a disconnect can land in the middle of one. */
 let subscriptionGate: { promise: Promise<void>; release: () => void } | null;
@@ -303,6 +307,7 @@ const stubHelpers = (): void => {
 		}: {
 			onReceive?: (data: unknown[]) => void;
 		} = {}) => {
+			headerSubscribeRequests++;
 			// Answered before anything else, exactly as the client does: a
 			// network it already holds a subscription for gets the bare string
 			// and no listener.
@@ -518,6 +523,7 @@ const startTest = (): void => {
 	headerHandlerGate = null;
 	headerSubscribeControls = new Map();
 	headerSubscribeCalls = 0;
+	headerSubscribeRequests = 0;
 	reachableHosts = new Set([serverA.host, serverB.host]);
 	disconnectFails = false;
 	socketIsDead = false;
@@ -1746,7 +1752,7 @@ describe('Electrum concurrent header subscribes (issue #507)', () => {
 		await flush();
 
 		await electrum.disconnect();
-		const callsBeforeRelease = headerSubscribeCalls;
+		const requestsBeforeRelease = headerSubscribeRequests;
 		held.release();
 		expect((await queued).isErr()).to.equal(true);
 		await first;
@@ -1757,9 +1763,9 @@ describe('Electrum concurrent header subscribes (issue #507)', () => {
 		// request issued from the queue after that point connects a stopped
 		// wallet to a server nobody chose.
 		expect(
-			headerSubscribeCalls,
+			headerSubscribeRequests,
 			'the queued subscribe must not reach the client at all'
-		).to.equal(callsBeforeRelease);
+		).to.equal(requestsBeforeRelease);
 	});
 
 	it('still delivers two genuine blocks', async () => {
