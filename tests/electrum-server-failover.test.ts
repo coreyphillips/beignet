@@ -104,6 +104,9 @@ let headerSubscribeCalls: number;
 /** Held open to keep a subscription request in flight for as long as a test
  *  needs, so a disconnect can land in the middle of one. */
 let subscriptionGate: { promise: Promise<void>; release: () => void } | null;
+/** Held open to park a wallet inside updateHeader, so a disconnect can land
+ *  while the shared header dispatch is part way through its queue. */
+let headerHandlerGate: { promise: Promise<void>; release: () => void } | null;
 /** Hosts the fake connection layer accepts; anything else refuses to connect,
  *  including the hardcoded fallback peers the rotation falls through to. */
 let reachableHosts: Set<string>;
@@ -274,6 +277,7 @@ const createFakeWallet = (
 		isSwitchingNetworks: false,
 		refreshWallet: refreshSpy,
 		updateHeader: async (header: IHeader): Promise<void> => {
+			if (headerHandlerGate) await headerHandlerGate.promise;
 			storedHeader = header;
 		},
 		checkUnconfirmedTransactions: async (): Promise<void> => {},
@@ -347,6 +351,7 @@ const startTest = (): void => {
 	nextHeaderHeight = 100;
 	subscriptionFailures = new Set();
 	subscriptionGate = null;
+	headerHandlerGate = null;
 	headerSubscribeControls = new Map();
 	headerSubscribeCalls = 0;
 	reachableHosts = new Set([serverA.host, serverB.host]);
@@ -364,6 +369,8 @@ const endTest = async (): Promise<void> => {
 	socketIsDead = false;
 	subscriptionGate?.release();
 	subscriptionGate = null;
+	headerHandlerGate?.release();
+	headerHandlerGate = null;
 	for (const control of headerSubscribeControls.values()) {
 		control.gate.release();
 	}
@@ -900,6 +907,55 @@ describe('Electrum reconnect to the same server after a dead socket (issue #485)
 		expect(protocolSubscribes).to.deep.equal([]);
 	});
 
+	it('retries a failed header restore on a healthy connection poll', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// The reconnect restores everything the dead socket cost, except that
+		// the header re-subscribe errors. The replacement socket is healthy, so
+		// no further connect is coming to try again.
+		socketIsDead = true;
+		const failing = { gate: createGate(), fails: true };
+		failing.gate.release();
+		headerSubscribeControls.set(1, failing);
+		protocolSubscribes = [];
+		const reconnected = await electrum.connectToElectrum({ servers: serverA });
+		expect(reconnected.isOk()).to.equal(true);
+		await flush();
+		expect(protocolSubscribes, 'the header restore failed').to.not.include(
+			'headers'
+		);
+		expect(
+			client.headerHandler,
+			'nothing is wired to the replacement client'
+		).to.equal(null);
+
+		await pollConnection(electrum);
+		await flush();
+
+		expect(
+			protocolSubscribes,
+			'the poll must re-issue the header subscription the restore owes'
+		).to.include('headers');
+		expect(client.headerHandler).to.not.equal(null);
+		await client.headerHandler?.([{ height: 800, hex: headerHex }]);
+		await flush();
+		const blocks = messageSpy
+			.getCalls()
+			.filter(
+				(call: { args: [string, { height: number }] }) =>
+					call.args[0] === 'newBlock'
+			);
+		expect(blocks.length, 'and the wallet receives blocks again').to.equal(1);
+		expect(blocks[0].args[1].height).to.equal(800);
+
+		// And the debt is settled: a later healthy poll re-subscribes nothing.
+		protocolSubscribes = [];
+		await pollConnection(electrum);
+		await flush();
+		expect(protocolSubscribes).to.deep.equal([]);
+	});
+
 	it('keeps the header handler a concurrent subscribe installed', async () => {
 		const otherMessageSpy = sinon.spy();
 		const other = createElectrum(sinon.spy(), otherMessageSpy, 'cccc');
@@ -1056,6 +1112,52 @@ describe('Electrum subscriptions after disconnect (issue #494)', () => {
 			storedHeader.height,
 			'nor write the header into a stopped wallet'
 		).to.equal(0);
+	});
+
+	it('drops a queued header dispatch for an instance that disconnects', async () => {
+		const otherRefresh = sinon.stub();
+		const otherMessageSpy = sinon.spy();
+		const other = createElectrum(otherRefresh, otherMessageSpy, 'eeee');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// The dispatch is sequential, so the second instance is still queued
+		// behind the first while the first is inside updateHeader.
+		const gate = createGate();
+		headerHandlerGate = gate;
+		const dispatched = client.headerHandler?.([
+			{ height: 700, hex: headerHex }
+		]);
+		await flush();
+		await other.disconnect();
+		gate.release();
+		headerHandlerGate = null;
+		await dispatched;
+		await flush();
+
+		const otherBlocks = otherMessageSpy
+			.getCalls()
+			.filter(
+				(call: { args: [string, { height: number }] }) =>
+					call.args[0] === 'newBlock'
+			);
+		expect(
+			otherBlocks.length,
+			'a wallet that stopped mid-dispatch must not be handed the header'
+		).to.equal(0);
+		expect(otherRefresh.called, 'nor refreshed by it').to.equal(false);
+		const ownBlocks = messageSpy
+			.getCalls()
+			.filter(
+				(call: { args: [string, { height: number }] }) =>
+					call.args[0] === 'newBlock'
+			);
+		expect(
+			ownBlocks.length,
+			'while the instance that held the dispatch up still gets it'
+		).to.equal(1);
 	});
 
 	it('subscribes again once the instance reconnects', async () => {

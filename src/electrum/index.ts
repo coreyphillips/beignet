@@ -118,8 +118,16 @@ function getHeaderRouter(network: EElectrumNetworks): THeaderRouter {
 		const created: THeaderRouter = {
 			handlers: new Map(),
 			dispatch: async (data: INewBlock[]): Promise<void> => {
-				// Snapshot: a handler may disconnect its instance mid-dispatch.
-				for (const handler of [...created.handlers.values()]) {
+				// The instances are snapshotted so a handler may withdraw itself
+				// or a sibling mid-dispatch, but each handler is read at the
+				// moment it is called rather than taken from that snapshot: the
+				// handler ahead of it in the queue can await for as long as a
+				// wallet refresh takes, and an instance that disconnects in the
+				// meantime must not be refreshed by a header it is merely still
+				// queued for.
+				for (const instance of [...created.handlers.keys()]) {
+					const handler = created.handlers.get(instance);
+					if (!handler) continue;
 					try {
 						await handler(data);
 					} catch {
@@ -364,11 +372,6 @@ export class Electrum {
 		// when nothing was lost: the client answers a known script hash with
 		// "Already Subscribed." without touching the socket.
 		this.restoreSubscriptionsBestEffort(electrumNetwork);
-		// Re-issues the shared header dispatcher, so every instance subscribed
-		// to this network's headers is wired to the new client, not just this one.
-		this.subscribeToHeader().catch(() => {
-			// Best-effort: the header subscription is rebuilt on reconnect.
-		});
 		return ok('Connected to Electrum server.');
 	}
 
@@ -458,12 +461,23 @@ export class Electrum {
 	 * subscribed as well. The shared script hash router is the record of that
 	 * state; re-subscribing its hashes restores the handler wiring for all of
 	 * them, and this instance's own wallet addresses are re-issued on top to
-	 * pick up anything generated since.
+	 * pick up anything generated since. The header subscription is part of the
+	 * same restore, so a failure to re-issue it is owed and retried like the
+	 * hashes are.
 	 */
 	private async restoreSubscriptions(
 		electrumNetwork: EElectrumNetworks
 	): Promise<void> {
 		if (this._disconnected) return;
+		// Re-issues the shared header dispatcher, so every instance subscribed
+		// to this network's headers is wired to the new client, not just this
+		// one. Started before the hashes and awaited after them, so neither
+		// failure defers the other, and settled the moment it is started, so a
+		// rejection is never left unhandled when the hashes fail first.
+		const headerFailed = this.subscribeToHeader().then(
+			(result) => result.isErr(),
+			() => true
+		);
 		const router = scriptHashRouters.get(electrumNetwork);
 		if (router) {
 			await Promise.all(
@@ -486,6 +500,14 @@ export class Electrum {
 		const walletSubscriptions = await this.subscribeToAddresses({});
 		if (walletSubscriptions.isErr()) {
 			throw walletSubscriptions.error;
+		}
+		// subscribeToHeader answers a protocol failure with an error value
+		// rather than a rejection, so nothing outside the restore would ever
+		// notice one, and the socket it failed on can stay healthy
+		// indefinitely: without the debt below the wallet would receive no
+		// header notification until the next reconnect.
+		if (await headerFailed) {
+			throw new Error('Unable to restore the header subscription.');
 		}
 	}
 
