@@ -42,6 +42,12 @@ captured from a live eclair 0.13 node. Refreshing it is deliberate, via
 ordinary interop run leaves it alone so the decode conformance test has a fixed
 reference to regress against.
 
+Because the refresh replaces the file wholesale, it also has to be complete: the
+capture only writes when both close cases in that file pass and both message
+types (40 and 41) were seen, so a `--grep`'d or failed run errors instead of
+half-replacing the fixture. The conformance test likewise fails if either type
+is missing.
+
 ## Known upstream vectors not vendored
 
 - `bolt02/splicing-test.md` — prose message-sequence scenarios, no machine

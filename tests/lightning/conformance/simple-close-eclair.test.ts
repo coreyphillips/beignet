@@ -7,7 +7,9 @@
  * CAPTURE_VECTORS=1 run of tests/lightning/interop/eclair-simple-close.test.ts.
  * The fixture is a frozen reference: an ordinary interop run does not rewrite
  * it, so a decode regression against those real payloads fails here rather
- * than being re-frozen away. Skips cleanly if the fixture is missing.
+ * than being re-frozen away. Skips cleanly if the fixture is missing, but a
+ * fixture that is present and incomplete (one of the two message types gone)
+ * is a failure, not a skip.
  */
 
 import { expect } from 'chai';
@@ -42,9 +44,29 @@ describe('Conformance: option_simple_close (eclair wire bytes)', function () {
 		fixture = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'));
 	});
 
+	// A capture run replaces the fixture wholesale, so a partial capture would
+	// quietly drop a whole message type while every remaining entry still
+	// decodes. Both types are load-bearing coverage; require them explicitly.
+	it('covers both closing_complete and closing_sig', function () {
+		for (const type of [
+			MessageType.CLOSING_COMPLETE,
+			MessageType.CLOSING_SIG
+		]) {
+			expect(
+				fixture!.messages.some((m) => m.type === type),
+				`fixture carries a type ${type} message`
+			).to.equal(true);
+		}
+	});
+
 	it('decodes every captured message and re-encodes byte-identically', function () {
 		expect(fixture!.messages.length).to.be.greaterThan(0);
 		for (const m of fixture!.messages) {
+			expect(
+				m.type === MessageType.CLOSING_COMPLETE ||
+					m.type === MessageType.CLOSING_SIG,
+				`unexpected message type ${m.type} in fixture`
+			).to.equal(true);
 			const payload = Buffer.from(m.payloadHex, 'hex');
 			const decoded =
 				m.type === MessageType.CLOSING_COMPLETE
