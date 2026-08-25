@@ -185,19 +185,26 @@ describe('Phase 3: Timeout Safety', () => {
 		try {
 			const fakePubkey = '02' + '00'.repeat(32);
 			const start = Date.now();
+			// Caught OUTSIDE the try: expect.fail throws an AssertionError,
+			// which the old catch accepted as "an Error was thrown", so a
+			// connectPeer that resolved read as a pass (issue #400).
+			let err: unknown;
 			try {
 				await node.connectPeer(fakePubkey, '192.0.2.1', 9735);
-				expect.fail('Should have timed out');
-			} catch (err: unknown) {
-				const elapsed = Date.now() - start;
-				// Should fail within reasonable range of the 500ms timeout
-				// (the underlying connect might fail faster than timeout, which is also fine)
-				expect(elapsed).to.be.lessThan(5000);
-				if (err instanceof BeignetError && err.code === 'CONNECT_TIMEOUT') {
-					expect(err.message).to.include('timed out');
-				}
-				// If it fails for another reason (e.g., DNS error) before timeout, that's also acceptable
+			} catch (e: unknown) {
+				err = e;
 			}
+			const elapsed = Date.now() - start;
+			expect(err, 'the dial to a blackhole address resolved').to.be.instanceOf(
+				Error
+			);
+			// Should fail within reasonable range of the 500ms timeout
+			// (the underlying connect might fail faster than timeout, which is also fine)
+			expect(elapsed).to.be.lessThan(5000);
+			if (err instanceof BeignetError && err.code === 'CONNECT_TIMEOUT') {
+				expect(err.message).to.include('timed out');
+			}
+			// If it fails for another reason (e.g., DNS error) before timeout, that's also acceptable
 		} finally {
 			await node.destroy();
 			fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -215,21 +222,35 @@ describe('Phase 3: Timeout Safety', () => {
 			...OFFLINE_ELECTRUM
 		});
 		try {
-			// Set draining — the first attempt will fail from _checkDraining,
-			// since payInvoice calls _checkDraining at the top
+			// A DECODABLE invoice, minted before draining starts. The old
+			// literal 'lnbcrt1pntest' never survived decodeInvoiceInput, so
+			// the refusal under test (_checkDraining, at the top of
+			// payInvoice) was never reached, and the catch asserted only
+			// instanceOf(Error), which the AssertionError from expect.fail
+			// would have satisfied anyway (issue #400).
+			const invoice = node.createInvoice(1000, 'drain test');
 			node.setDraining(true);
 			expect(node.isDraining()).to.be.true;
 
+			let err: unknown;
 			try {
-				await node.payInvoiceWithRetry('lnbcrt1pntest', {
-					maxRetries: 3,
-					backoffMs: 100
-				});
-				expect.fail('Should have thrown');
-			} catch (err: unknown) {
-				// Should get SERVICE_DRAINING or invoice decode error
-				expect(err).to.be.instanceOf(Error);
+				await node.payInvoice(invoice.bolt11);
+			} catch (e: unknown) {
+				err = e;
 			}
+			expect(err, 'a draining node paid anyway').to.be.instanceOf(BeignetError);
+			expect((err as BeignetError).code).to.equal('SERVICE_DRAINING');
+
+			// SERVICE_DRAINING is a permanent code, so the retry wrapper gives
+			// up on the first attempt instead of backing off three times.
+			const retries: unknown[] = [];
+			node.on('payment:retry', (e: unknown) => retries.push(e));
+			const result = await node.payInvoiceWithRetry(invoice.bolt11, {
+				maxRetries: 3,
+				backoffMs: 100
+			});
+			expect(result.attempts, 'it stopped after the first attempt').to.equal(1);
+			expect(retries, 'a draining node must not retry').to.have.length(0);
 		} finally {
 			await node.destroy();
 			fs.rmSync(tmpDir, { recursive: true, force: true });
