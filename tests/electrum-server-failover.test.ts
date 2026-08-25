@@ -1710,7 +1710,11 @@ describe('Electrum concurrent header subscribes (issue #507)', () => {
 				(call: { args: [string, { height: number }] }) =>
 					call.args[0] === 'newBlock'
 			);
-		expect(blocks.map((call) => call.args[1].height)).to.deep.equal([101, 102]);
+		expect(
+			blocks.map(
+				(call: { args: [string, { height: number }] }) => call.args[1].height
+			)
+		).to.deep.equal([101, 102]);
 	});
 });
 
@@ -1808,7 +1812,9 @@ describe('Electrum hash aware rollback detection (issues #511, #515)', () => {
 	beforeEach(startTest);
 	afterEach(endTest);
 
-	const reorgMessages = (spy: sinon.SinonSpy): unknown[] =>
+	const reorgMessages = (spy: {
+		getCalls: () => Array<{ args: [string, unknown] }>;
+	}): unknown[] =>
 		spy
 			.getCalls()
 			.filter((call: { args: [string, unknown] }) => call.args[0] === 'reorg');
