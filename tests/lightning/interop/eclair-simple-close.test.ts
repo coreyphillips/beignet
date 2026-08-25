@@ -11,7 +11,8 @@
  * With CAPTURE_VECTORS=1 it also re-freezes Eclair's real
  * closing_complete/closing_sig wire bytes into
  * tests/lightning/conformance/vectors/eclair-simple-close.json (no upstream
- * test vectors exist for simple close).
+ * test vectors exist for simple close). That refresh needs the whole file to
+ * run and pass; a filtered or failed run leaves the fixture untouched.
  */
 
 import { expect } from 'chai';
@@ -47,6 +48,18 @@ const VECTORS_PATH = path.join(
 // paper over exactly the decode regression that test exists to catch, and
 // would leave every interop run with a dirty working tree.
 const CAPTURE_VECTORS = process.env.CAPTURE_VECTORS === '1';
+
+// The fixture is only ever replaced wholesale, so a capture run has to produce
+// the whole thing: every contributing case must pass, and the result must carry
+// both message types. A --grep'd run (or one where a later case fails) would
+// otherwise write a fixture missing, say, every closing_sig, and the decode
+// conformance test would keep passing on the half of the coverage that is left.
+const CLOSEE_CASE =
+	'closes as CLOSEE: eclair funds the close, beignet co-signs and broadcasts';
+const CLOSER_CASE =
+	'closes as CLOSER: beignet pays the fee from its pushed balance';
+const REQUIRED_CASES = [CLOSEE_CASE, CLOSER_CASE];
+const REQUIRED_TYPES = [MessageType.CLOSING_COMPLETE, MessageType.CLOSING_SIG];
 
 interface ICapturedMsg {
 	type: number;
@@ -119,6 +132,7 @@ describe('Interop: option_simple_close vs Eclair (regtest)', function () {
 	let node: LightningNode;
 	let skipAll = false;
 	const allCaptured: ICapturedMsg[] = [];
+	const passedCases = new Set<string>();
 
 	before(async function () {
 		this.timeout(300_000);
@@ -155,6 +169,8 @@ describe('Interop: option_simple_close vs Eclair (regtest)', function () {
 
 	afterEach(function () {
 		if (node) node.destroy();
+		const test = this.currentTest;
+		if (test && test.state === 'passed') passedCases.add(test.title);
 	});
 
 	after(function () {
@@ -164,6 +180,27 @@ describe('Interop: option_simple_close vs Eclair (regtest)', function () {
 				`    saw ${allCaptured.length} simple-close messages; set CAPTURE_VECTORS=1 to re-freeze ${VECTORS_PATH}`
 			);
 			return;
+		}
+		const missingCases = REQUIRED_CASES.filter((t) => !passedCases.has(t));
+		const missingTypes = REQUIRED_TYPES.filter(
+			(t) => !allCaptured.some((m) => m.type === t)
+		);
+		if (missingCases.length > 0 || missingTypes.length > 0) {
+			// Partial capture: leave the committed fixture alone and fail loudly,
+			// so a filtered run cannot look like a successful refresh.
+			const why = [
+				missingCases.length > 0
+					? `cases that did not pass: ${missingCases.join('; ')}`
+					: null,
+				missingTypes.length > 0
+					? `message types never captured: ${missingTypes.join(', ')}`
+					: null
+			]
+				.filter(Boolean)
+				.join(' — ');
+			throw new Error(
+				`incomplete simple-close capture (${why}); ${VECTORS_PATH} left unchanged. Re-run the whole file without --grep to refresh it.`
+			);
 		}
 		// Freeze real Eclair wire bytes as decode fixtures.
 		fs.mkdirSync(path.dirname(VECTORS_PATH), { recursive: true });
@@ -184,7 +221,7 @@ describe('Interop: option_simple_close vs Eclair (regtest)', function () {
 		);
 	});
 
-	it('closes as CLOSEE: eclair funds the close, beignet co-signs and broadcasts', async function () {
+	it(CLOSEE_CASE, async function () {
 		if (skipAll) this.skip();
 
 		// Eclair-funded channel: beignet's balance is 0, so beignet never sends
@@ -234,7 +271,7 @@ describe('Interop: option_simple_close vs Eclair (regtest)', function () {
 		).to.equal(0);
 	});
 
-	it('closes as CLOSER: beignet pays the fee from its pushed balance', async function () {
+	it(CLOSER_CASE, async function () {
 		if (skipAll) this.skip();
 
 		// Push 100k sat so beignet has a balance and runs the closer path
