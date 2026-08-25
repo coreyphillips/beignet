@@ -152,6 +152,20 @@ const headerRouters: Map<EElectrumNetworks, THeaderRouter> = new Map();
  */
 const headerSubscribeGates: Map<EElectrumNetworks, Promise<void>> = new Map();
 
+/**
+ * How long a subscribe may hold the gate before the next caller stops waiting
+ * for it.
+ *
+ * The gate must be bounded, because the attempt behind it is not: the client
+ * falls into connectToRandomPeer when a network has no client, and the
+ * server_version handshake in there carries no timeout of its own, on a socket
+ * whose timeout it disables. One server that accepts the connection and then
+ * says nothing would otherwise wedge every later subscribe on that network for
+ * as long as the process lives. Well above the client's own 10s request
+ * timeouts, so an attempt that is merely slow is still waited for.
+ */
+const HEADER_SUBSCRIBE_GATE_MS = 30_000;
+
 function getHeaderRouter(network: EElectrumNetworks): THeaderRouter {
 	let router = headerRouters.get(network);
 	if (!router) {
@@ -1543,8 +1557,16 @@ export class Electrum {
 	 * that rolled back, with the notification that follows too high to reveal
 	 * it, which is the same bug the reconnect one had.
 	 */
-	private async applyReportedHeader(header: IHeader): Promise<Result<string>> {
-		const router = getHeaderRouter(this.electrumNetwork);
+	private async applyReportedHeader(
+		header: IHeader,
+		/** The network the subscribe was ISSUED on, captured before its await.
+		 *  Not re-read from this.electrumNetwork, which a network change may
+		 *  have moved in the meantime: the old network's tip would then be
+		 *  written into the new network's router and fanned out to every wallet
+		 *  on it, where the height gap reads as an enormous rollback. */
+		electrumNetwork: EElectrumNetworks
+	): Promise<Result<string>> {
+		const router = getHeaderRouter(electrumNetwork);
 		router.last = header;
 		router.seq++;
 		let failure = '';
@@ -1684,10 +1706,19 @@ export class Electrum {
 		// that re-issues the request.
 		const previous = headerSubscribeGates.get(electrumNetwork);
 		const attempt = previous ? previous.then(run, run) : run();
-		const gate = attempt.then(
-			() => undefined,
-			() => undefined
-		);
+		// Bounded on purpose: see HEADER_SUBSCRIBE_GATE_MS. The caller still
+		// awaits the attempt itself, and its own timeout is its own business;
+		// what must not hang is the next subscribe on this network.
+		const gate = Promise.race([
+			attempt.then(
+				() => undefined,
+				() => undefined
+			),
+			new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, HEADER_SUBSCRIBE_GATE_MS);
+				if (timer.unref) timer.unref();
+			})
+		]);
 		headerSubscribeGates.set(electrumNetwork, gate);
 		void gate.then(() => {
 			if (headerSubscribeGates.get(electrumNetwork) === gate) {
@@ -1737,7 +1768,10 @@ export class Electrum {
 			// restore retries with, and a reconciliation that failed the first
 			// time is owed by whichever wallets it failed for.
 			if (router.last) {
-				const applied = await this.applyReportedHeader(router.last);
+				const applied = await this.applyReportedHeader(
+					router.last,
+					electrumNetwork
+				);
 				return {
 					result: ok(this.getBlockHeader()),
 					reconcileOwed: applied.isErr()
@@ -1763,7 +1797,7 @@ export class Electrum {
 			// own reconciliation through _reorgOwed.
 			return { result: ok(this.getBlockHeader()), reconcileOwed: false };
 		}
-		const applied = await this.applyReportedHeader(header);
+		const applied = await this.applyReportedHeader(header, electrumNetwork);
 		// The restore reads this: a wallet left holding an unreconciled
 		// rollback has not been restored, whatever the subscription itself did.
 		// The header is stored either way, because applyHeader writes before it

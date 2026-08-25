@@ -1695,6 +1695,35 @@ describe('Electrum concurrent header subscribes (issue #507)', () => {
 		).to.deep.equal([]);
 	});
 
+	it('does not let one unanswered subscribe wedge the network', async () => {
+		const clock = sinon.useFakeTimers({
+			now: Date.now(),
+			toFake: ['setTimeout', 'clearTimeout']
+		});
+		try {
+			// A server that accepts the connection and then says nothing. The
+			// client's own handshake carries no timeout, so this attempt never
+			// settles.
+			const silent = createGate();
+			headerSubscribeControls.set(0, { gate: silent, fails: false });
+			const wedged = electrum.subscribeToHeader();
+			await Promise.resolve();
+
+			// A later caller must not queue behind it for the life of the
+			// process: everything from the reconnect monitor to the restore
+			// comes through here.
+			const second = electrum.subscribeToHeader();
+			clock.tick(60_000);
+			const result = await second;
+			expect(result.isOk()).to.equal(true);
+
+			silent.release();
+			await wedged;
+		} finally {
+			clock.restore();
+		}
+	});
+
 	it('still delivers two genuine blocks', async () => {
 		await electrum.connectToElectrum({ servers: serverA });
 		await flush();
