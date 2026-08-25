@@ -16,6 +16,11 @@
  * observable to the teardown above, so the restore after a successful connect
  * is unconditional.
  *
+ * And for issue #487: when that teardown refused every candidate, the connect
+ * still reported the wallet disconnected and adopted the target it never
+ * reached, so the peer it had deliberately kept went on serving calls while
+ * every guarded call retried the same doomed switch.
+ *
  * And for issue #494: the public subscribeToHeader/subscribeToAddresses did not
  * check the disconnected flag, so a caller that outlived disconnect() (an
  * ElectrumBackend reconnect monitor still ticking after wallet.stop()) put the
@@ -760,6 +765,55 @@ describe('Electrum failover to a different server (issue #482)', () => {
 		).to.equal(handler);
 		await client.addressHandler?.(['aaaa', 'status-after-refusal']);
 		expect(onReceive.calledOnce).to.equal(true);
+	});
+
+	it('stays connected when every candidate is refused (issue #487)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		messageSpy.resetHistory();
+
+		disconnectFails = true;
+		const swapped = await electrum.connectToElectrum({ servers: serverB });
+		await flush();
+
+		expect(swapped.isErr()).to.equal(true);
+		expect(
+			electrum.connectedToElectrum,
+			'the peer the teardown kept is still serving every call'
+		).to.equal(true);
+		expect(
+			messageSpy
+				.getCalls()
+				.filter(
+					(call: { args: [string, boolean] }) =>
+						call.args[0] === 'connectedToElectrum'
+				).length,
+			'no disconnect may be announced for a connection that never dropped'
+		).to.equal(0);
+		expect(
+			electrum.servers,
+			'the refused target must not become the reconnect target'
+		).to.deep.equal([serverA]);
+	});
+
+	it('does not retry a refused switch on every later call (issue #487)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		disconnectFails = true;
+		const swapped = await electrum.connectToElectrum({ servers: serverB });
+		expect(swapped.isErr()).to.equal(true);
+		await flush();
+		connectionEvents = [];
+
+		const balance = await electrum.getAddressBalance(walletScriptHash);
+
+		expect(balance.error, 'the kept peer answers the call').to.equal(false);
+		expect(balance.confirmed).to.equal(stubbedBalance.confirmed);
+		expect(
+			connectionEvents,
+			'a guarded call must not retry the switch that was refused'
+		).to.deep.equal([]);
 	});
 
 	it('keeps the connection when reconnecting to the same server', async () => {

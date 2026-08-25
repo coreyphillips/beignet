@@ -324,11 +324,17 @@ export class Electrum {
 		const candidates = this.getServerCandidates(customPeers, electrumNetwork);
 		let connected = false;
 		let lastError = 'No Electrum servers available.';
+		/** Whether any candidate got past the teardown and reached a socket. */
+		let dialledAny = false;
+		/** Whether any candidate was refused because the peer would not stop. */
+		let refusedAny = false;
 		for (const candidate of this.orderCandidates(candidates)) {
 			const startResponse = await this.attemptConnect(
 				candidate,
 				electrumNetwork
 			);
+			dialledAny = dialledAny || !startResponse.teardownRefused;
+			refusedAny = refusedAny || !!startResponse.teardownRefused;
 			if (startResponse.error) {
 				// A candidate the teardown refused was never dialled, so it must
 				// not be blamed for the failure and cooled down.
@@ -341,6 +347,23 @@ export class Electrum {
 			this.recordServerSuccess(candidate);
 			connected = true;
 			break;
+		}
+		// Every candidate was refused before it was dialled, and the peer whose
+		// teardown refused them is still connected: the switch was declined on
+		// purpose to keep a working connection rather than build a client on
+		// stale bookkeeping, so nothing about this instance's connection
+		// changed. Reporting a disconnect would contradict the peer that is
+		// still serving every call, and adopting the refused target would point
+		// the reconnect guards and the connection poll at the same doomed
+		// switch on every later call. The error still goes back to the caller,
+		// and the poll remains the authority on whether the kept peer is alive.
+		if (
+			!connected &&
+			refusedAny &&
+			!dialledAny &&
+			!!electrum.getConnectedPeer(electrumNetwork)?.host
+		) {
+			return err(lastError);
 		}
 		// A network switch needs the network fields updated even when the new
 		// network has no reachable server, but that must never be reported as
@@ -425,7 +448,8 @@ export class Electrum {
 	 * happen refuses the candidate instead of connecting a fresh client on top
 	 * of stale state, which is the very bug this guards against. Rotation then
 	 * moves on, and the still-connected server is accepted unchanged when it
-	 * comes back around.
+	 * comes back around. When it is not among the candidates at all the connect
+	 * fails without touching the connection it kept: see _doConnect.
 	 */
 	private async stopPeerIfServerChanged(
 		server: TServer,
