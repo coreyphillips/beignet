@@ -26,7 +26,10 @@ import {
 	OutputStatus,
 	ITrackedOutput
 } from '../../../src/lightning/chain/types';
-import { resolveRevokedCommitmentOutputs } from '../../../src/lightning/chain/output-resolver';
+import {
+	matchRevokedHtlcSnapshotOutputs,
+	resolveRevokedCommitmentOutputs
+} from '../../../src/lightning/chain/output-resolver';
 import {
 	buildTaprootToLocalOutput,
 	buildTaprootReceivedHtlcOutput
@@ -339,19 +342,32 @@ describe('Interop: option_taproot revoked-commitment penalty sweep (regtest, P6c
 
 		// The HTLC has SETTLED: it lives only in the snapshot, not in state.htlcs,
 		// and trackedOutputs (from live classification) does NOT contain it.
+		// matchRevokedHtlcSnapshotOutputs pairs a snapshot entry to a commitment
+		// output on BOTH amountMsat/1000 and scriptPubkey (the value is what breaks
+		// the equal-script tie between offered HTLCs, whose script omits the CLTV),
+		// so the entry must declare the amount the output actually holds.
 		aliceState.revokedHtlcSnapshots = new Map([
 			[
 				'1',
 				[
 					{
 						paymentHash,
-						amountMsat: 100_000_000n,
+						amountMsat: BigInt(htlcFund.valueSat) * 1000n,
 						cltvExpiry,
 						direction: HtlcDirection.OFFERED
 					}
 				]
 			]
 		]);
+
+		// Fail here rather than on the empty resolve below: the fixture drifting
+		// out of step with the funded output is the failure this test has had.
+		expect(
+			matchRevokedHtlcSnapshotOutputs(aliceState, 1n, revokedTx, NETWORK).get(
+				htlcFund.vout
+			),
+			'the snapshot entry must pair with the funded HTLC output'
+		).to.exist;
 
 		const destScript = bitcoin.address.toOutputScript(
 			(await bitcoinRpc('getnewaddress')) as string,
