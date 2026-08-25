@@ -9,6 +9,13 @@
  * so the process received no header and no script hash notifications. The fix
  * stops the current peer before connecting to a different one.
  *
+ * And for issue #485: reconnecting to the SAME server after its socket died
+ * loses every subscription too, because the client pings that peer inside
+ * start() and, on failure, runs its own disconnect (clearing the same
+ * bookkeeping) before building a replacement client. Nothing about that is
+ * observable to the teardown above, so the restore after a successful connect
+ * is unconditional.
+ *
  * Fully OFFLINE: the client helpers are stubbed with a faithful model of that
  * per-network state, including the upstream asymmetry (a server swap drops the
  * handlers but keeps the bookkeeping), and notifications are fired by invoking
@@ -90,6 +97,12 @@ let reachableHosts: Set<string>;
 /** Models a close() that throws: the client reports { error: true } and keeps
  *  every bit of its per-network state, peer included. */
 let disconnectFails: boolean;
+/** Models a dead socket on the connected peer: the next connect to that same
+ *  peer finds the client's own ping failing. Consumed on use, because the
+ *  replacement client the reset leaves behind is alive. */
+let socketIsDead: boolean;
+/** Confirmed balance the stubbed script hash lookup answers with. */
+const stubbedBalance = { confirmed: 4321, unconfirmed: 0 };
 
 const createGate = (): { promise: Promise<void>; release: () => void } => {
 	let release = (): void => {};
@@ -130,10 +143,20 @@ const stubHelpers = (): void => {
 					};
 				}
 				connectionEvents.push(`connect:${server.host}`);
-				const sameServer =
+				let sameServer =
 					client.peer?.host === server.host &&
 					client.peer?.port === port &&
 					client.peer?.protocol === protocol;
+				if (sameServer && socketIsDead) {
+					// The client pings the peer it believes it is connected to and,
+					// when that fails, runs its own disconnect, which clears every
+					// bit of the per-network state, before building a replacement
+					// client for the very same server.
+					socketIsDead = false;
+					connectionEvents.push('self-disconnect');
+					resetClient();
+					sameServer = false;
+				}
 				if (!sameServer) {
 					// A brand new client object: the emitter carrying the subscription
 					// handlers is gone, while the per-network bookkeeping survives.
@@ -206,6 +229,10 @@ const stubHelpers = (): void => {
 			return { error: false, data: { id: 1, jsonrpc: '2.0', result: null } };
 		}
 	);
+
+	sinon
+		.stub(electrumHelpers, 'getAddressScriptHashBalance')
+		.callsFake(async () => ({ error: false, data: stubbedBalance }));
 };
 
 /** The wallet's stored header, updated by the header subscription. */
@@ -275,37 +302,42 @@ const flush = async (): Promise<void> => {
 	}
 };
 
+let electrum: Electrum;
+let refreshSpy: sinon.SinonStub;
+let messageSpy: sinon.SinonStub;
+
+const startTest = (): void => {
+	resetClient();
+	protocolSubscribes = [];
+	connectionEvents = [];
+	nextHeaderHeight = 100;
+	subscriptionFailures = new Set();
+	subscriptionGate = null;
+	reachableHosts = new Set([serverA.host, serverB.host]);
+	disconnectFails = false;
+	socketIsDead = false;
+	storedHeader = { height: 0, hash: '', hex: '' };
+	stubHelpers();
+	refreshSpy = sinon.spy();
+	messageSpy = sinon.spy();
+	electrum = createElectrum(refreshSpy, messageSpy);
+};
+
+const endTest = async (): Promise<void> => {
+	disconnectFails = false;
+	socketIsDead = false;
+	subscriptionGate?.release();
+	subscriptionGate = null;
+	for (const instance of createdInstances) {
+		await instance.disconnect();
+	}
+	createdInstances.length = 0;
+	sinon.restore();
+};
+
 describe('Electrum failover to a different server (issue #482)', () => {
-	let electrum: Electrum;
-	let refreshSpy: sinon.SinonStub;
-	let messageSpy: sinon.SinonStub;
-
-	beforeEach(() => {
-		resetClient();
-		protocolSubscribes = [];
-		connectionEvents = [];
-		nextHeaderHeight = 100;
-		subscriptionFailures = new Set();
-		subscriptionGate = null;
-		reachableHosts = new Set([serverA.host, serverB.host]);
-		disconnectFails = false;
-		storedHeader = { height: 0, hash: '', hex: '' };
-		stubHelpers();
-		refreshSpy = sinon.spy();
-		messageSpy = sinon.spy();
-		electrum = createElectrum(refreshSpy, messageSpy);
-	});
-
-	afterEach(async () => {
-		disconnectFails = false;
-		subscriptionGate?.release();
-		subscriptionGate = null;
-		for (const instance of createdInstances) {
-			await instance.disconnect();
-		}
-		createdInstances.length = 0;
-		sinon.restore();
-	});
+	beforeEach(startTest);
+	afterEach(endTest);
 
 	it('disconnects the old peer before connecting to a different server', async () => {
 		const connected = await electrum.connectToElectrum({ servers: serverA });
@@ -705,5 +737,86 @@ describe('Electrum failover to a different server (issue #482)', () => {
 		);
 		expect(client.subscribedHeaders).to.equal(true);
 		expect(client.addressHandler).to.equal(handler);
+	});
+});
+
+describe('Electrum reconnect to the same server after a dead socket (issue #485)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	it('re-issues tracked script hash subscriptions the client reset', async () => {
+		const onReceive = sinon.spy();
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.subscribeToAddresses({ scriptHashes: ['aaaa'], onReceive });
+		expect(protocolSubscribes).to.include('aaaa');
+
+		socketIsDead = true;
+		protocolSubscribes = [];
+		connectionEvents = [];
+		const reconnected = await electrum.connectToElectrum({ servers: serverA });
+		expect(reconnected.isOk()).to.equal(true);
+		await flush();
+
+		expect(
+			connectionEvents,
+			'the client tore itself down without the server changing'
+		).to.include('self-disconnect');
+		expect(
+			protocolSubscribes,
+			'blockchain.scripthash.subscribe must reach the replacement client'
+		).to.include('aaaa');
+		expect(
+			client.addressHandler,
+			'the replacement client needs a script hash handler'
+		).to.not.equal(null);
+		await client.addressHandler?.(['aaaa', 'status-after-reconnect']);
+		expect(onReceive.calledOnce, 'the callback must still be reached').to.equal(
+			true
+		);
+	});
+
+	it("re-subscribes the wallet's own addresses", async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.subscribeToAddresses({});
+		expect(protocolSubscribes).to.include(walletScriptHash);
+
+		socketIsDead = true;
+		protocolSubscribes = [];
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(
+			protocolSubscribes,
+			'wallet addresses must be re-subscribed on the replacement client'
+		).to.include(walletScriptHash);
+	});
+
+	it('restores through the reconnect guard on an Electrum call', async () => {
+		const onReceive = sinon.spy();
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.subscribeToAddresses({ scriptHashes: ['aaaa'], onReceive });
+
+		// What the poll leaves behind when it notices the connection is gone:
+		// the next Electrum call reconnects through its own guard, which is the
+		// path that used to restore nothing at all.
+		electrum.connectedToElectrum = false;
+		socketIsDead = true;
+		protocolSubscribes = [];
+		const balance = await electrum.getAddressBalance(walletScriptHash);
+		await flush();
+
+		expect(balance.error, 'the call itself still answers').to.equal(false);
+		expect(balance.confirmed).to.equal(stubbedBalance.confirmed);
+		expect(
+			protocolSubscribes,
+			'the reconnect the call triggered must restore the subscriptions'
+		).to.include('aaaa');
+		expect(protocolSubscribes).to.include(walletScriptHash);
+		expect(client.addressHandler).to.not.equal(null);
+		await client.addressHandler?.(['aaaa', 'status-after-guard-reconnect']);
+		expect(onReceive.calledOnce).to.equal(true);
 	});
 });
