@@ -154,11 +154,15 @@ const client: {
  *  every registered listener, in registration order. */
 const fireHeader = async (height: number, hex?: string): Promise<void> => {
 	// One payload object for every listener, which is what the emitter does:
-	// it hands each of them the same parsed params.
+	// it hands each of them the same parsed params. And every listener is
+	// invoked SYNCHRONOUSLY, back to back, because EventEmitter.emit does not
+	// await the promise an async listener returns. That is the whole point of
+	// the dispatcher's identity guard, which is assigned before its first
+	// await: awaiting each listener in turn here would let dispatch #1 finish
+	// before #2 begins and the guard would never be under test.
 	const payload = [{ height, hex: hex ?? headerHexAt(height) }];
-	for (const handler of [...client.headerHandlers]) {
-		await handler(payload);
-	}
+	const running = [...client.headerHandlers].map((handler) => handler(payload));
+	await Promise.all(running);
 };
 
 /** Every subscription actually sent to a server ('headers' or a script hash). */
@@ -1641,8 +1645,15 @@ describe('Electrum concurrent header subscribes (issue #507)', () => {
 	afterEach(endTest);
 
 	it('issues one subscription for two concurrent subscribes', async () => {
+		// A real overlap: the first request is still in flight, inside the
+		// window the client leaves open between registering its listener and
+		// marking the network subscribed, when the second one is issued.
+		const inFlight = createGate();
+		headerSubscribeControls.set(0, { gate: inFlight, fails: false });
 		const first = electrum.subscribeToHeader();
 		const second = electrum.subscribeToHeader();
+		await flush();
+		inFlight.release();
 		expect((await first).isOk()).to.equal(true);
 		expect((await second).isOk()).to.equal(true);
 
