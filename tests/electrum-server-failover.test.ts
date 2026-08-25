@@ -26,6 +26,14 @@
  * ElectrumBackend reconnect monitor still ticking after wallet.stop()) put the
  * stopped instance straight back into the shared routers.
  *
+ * And for issue #496: the header a (re)subscribe answers with was written
+ * straight to storage without the reorg check the notification path runs, so a
+ * rollback that happened while this process was away lowered the stored height
+ * unreconciled, and every notification after it, higher than what was written,
+ * read as ordinary growth. Only one instance is ever handed that header, a
+ * reconciliation that failed had to be owed rather than reported as a restore,
+ * and a notification that overtook the response had to keep its place.
+ *
  * Fully OFFLINE: the client helpers are stubbed with a faithful model of that
  * per-network state, including the upstream asymmetry (a server swap drops the
  * handlers but keeps the bookkeeping), and notifications are fired by invoking
@@ -50,6 +58,8 @@ import {
 	EProtocol,
 	err,
 	IHeader,
+	ok,
+	Result,
 	TServer,
 	Wallet
 } from '../src';
@@ -99,11 +109,17 @@ let nextHeaderHeight: number;
 /** Script hashes whose next subscription request should fail. */
 let subscriptionFailures: Set<string>;
 /** Per-call control over blockchain.headers.subscribe, keyed by call index, so
- *  a test can decide the order two concurrent subscribes resolve in and which
- *  of them fails. */
+ *  a test can decide the order two concurrent subscribes resolve in, which of
+ *  them fails, and whether a notification overtakes the response. */
 let headerSubscribeControls: Map<
 	number,
-	{ gate: { promise: Promise<void>; release: () => void }; fails: boolean }
+	{
+		gate: { promise: Promise<void>; release: () => void };
+		fails: boolean;
+		/** Height of a header notification delivered through the handler this
+		 *  very call installs, before it answers with the current one. */
+		deliverWhileInFlight?: number;
+	}
 >;
 let headerSubscribeCalls: number;
 /** Held open to keep a subscription request in flight for as long as a test
@@ -226,6 +242,14 @@ const stubHelpers = (): void => {
 			if (onReceive) client.headerHandler = onReceive;
 			client.subscribedHeaders = true;
 			protocolSubscribes.push('headers');
+			if (control?.deliverWhileInFlight !== undefined) {
+				// The client installs the notification listener before it asks
+				// for the current header, so a block found in between reaches
+				// the wallet ahead of the response below.
+				await onReceive?.([
+					{ height: control.deliverWhileInFlight, hex: headerHex }
+				]);
+			}
 			return {
 				error: false,
 				data: { height: nextHeaderHeight, hex: headerHex }
@@ -269,23 +293,48 @@ const stubHelpers = (): void => {
 	}));
 };
 
-/** The wallet's stored header, updated by the header subscription. */
-let storedHeader: IHeader;
+/** One wallet's header bookkeeping. Per wallet, because a header applies to
+ *  every instance on the network and the tests have to tell them apart. */
+type TWalletHeader = {
+	/** The wallet's stored header, updated by the header subscription. */
+	stored: IHeader;
+	/** The reorg flag of every checkUnconfirmedTransactions call, in order. */
+	reorgChecks: boolean[];
+	/** Makes checkUnconfirmedTransactions answer an error, so a test can fail
+	 *  the reconciliation without failing the header write before it. */
+	reconcileFails: boolean;
+};
+
+const createWalletHeader = (): TWalletHeader => ({
+	stored: { height: 0, hash: '', hex: '' },
+	reorgChecks: [],
+	reconcileFails: false
+});
+
+/** The header bookkeeping of the wallet behind the default instance. */
+let walletHeader: TWalletHeader;
 
 const createFakeWallet = (
 	refreshSpy: sinon.SinonStub,
 	messageSpy: sinon.SinonStub,
-	scriptHash: string = walletScriptHash
+	scriptHash: string = walletScriptHash,
+	header: TWalletHeader = walletHeader
 ): Wallet => {
 	return {
 		sendMessage: messageSpy,
 		isSwitchingNetworks: false,
 		refreshWallet: refreshSpy,
-		updateHeader: async (header: IHeader): Promise<void> => {
+		updateHeader: async (newHeader: IHeader): Promise<void> => {
 			if (headerHandlerGate) await headerHandlerGate.promise;
-			storedHeader = header;
+			header.stored = newHeader;
 		},
-		checkUnconfirmedTransactions: async (): Promise<void> => {},
+		checkUnconfirmedTransactions: async (
+			reorgDetected = false
+		): Promise<Result<string>> => {
+			header.reorgChecks.push(reorgDetected);
+			if (header.reconcileFails) return err('Unable to reconcile.');
+			return ok('Reconciled.');
+		},
 		addressTypesToMonitor: [EAddressType.p2wpkh],
 		gapLimitOptions: {
 			lookAhead: 2,
@@ -296,7 +345,7 @@ const createFakeWallet = (
 		get data() {
 			return {
 				utxos: [],
-				header: storedHeader,
+				header: header.stored,
 				addresses: {
 					[EAddressType.p2wpkh]: {
 						'0': { index: 0, scriptHash }
@@ -315,10 +364,11 @@ const createdInstances: Electrum[] = [];
 const createElectrum = (
 	refreshSpy: sinon.SinonStub,
 	messageSpy: sinon.SinonStub,
-	scriptHash: string = walletScriptHash
+	scriptHash: string = walletScriptHash,
+	header: TWalletHeader = walletHeader
 ): Electrum => {
 	const electrum = new Electrum({
-		wallet: createFakeWallet(refreshSpy, messageSpy, scriptHash),
+		wallet: createFakeWallet(refreshSpy, messageSpy, scriptHash, header),
 		network: EAvailableNetworks.testnet,
 		net,
 		tls,
@@ -362,7 +412,7 @@ const startTest = (): void => {
 	reachableHosts = new Set([serverA.host, serverB.host]);
 	disconnectFails = false;
 	socketIsDead = false;
-	storedHeader = { height: 0, hash: '', hex: '' };
+	walletHeader = createWalletHeader();
 	stubHelpers();
 	refreshSpy = sinon.spy();
 	messageSpy = sinon.spy();
@@ -426,7 +476,7 @@ describe('Electrum failover to a different server (issue #482)', () => {
 			'a header handler must be wired to the new client'
 		).to.not.equal(null);
 		expect(
-			storedHeader.height,
+			walletHeader.stored.height,
 			'the header must come from the new server, not local storage'
 		).to.equal(250);
 	});
@@ -1163,7 +1213,7 @@ describe('Electrum subscriptions after disconnect (issue #494)', () => {
 			'the subscribe the disconnect outran must not report success'
 		).to.equal(true);
 		expect(
-			storedHeader.height,
+			walletHeader.stored.height,
 			'nor write the header into a stopped wallet'
 		).to.equal(0);
 	});
@@ -1237,5 +1287,208 @@ describe('Electrum subscriptions after disconnect (issue #494)', () => {
 		expect(onReceive.calledOnce, 'the revived instance is wired').to.equal(
 			true
 		);
+	});
+});
+
+describe('Electrum reconnect header reorg reconciliation (issue #496)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	it('reconciles a rollback the reconnect header reports', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(walletHeader.stored.height).to.equal(100);
+		walletHeader.reorgChecks = [];
+
+		// The chain rolled back while the socket was dead, so the restore's
+		// header subscription answers below the stored tip.
+		nextHeaderHeight = 96;
+		socketIsDead = true;
+		const reconnected = await electrum.connectToElectrum({ servers: serverA });
+		expect(reconnected.isOk()).to.equal(true);
+		await flush();
+
+		expect(walletHeader.stored.height, 'the shorter chain is stored').to.equal(
+			96
+		);
+		expect(
+			walletHeader.reorgChecks,
+			'and the rollback it implies is reconciled'
+		).to.deep.equal([true]);
+	});
+
+	it('reconciles a rollback a failover to a shorter chain reports', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		walletHeader.reorgChecks = [];
+
+		nextHeaderHeight = 90;
+		const swapped = await electrum.connectToElectrum({ servers: serverB });
+		expect(swapped.isOk()).to.equal(true);
+		await flush();
+
+		expect(walletHeader.stored.height).to.equal(90);
+		expect(walletHeader.reorgChecks).to.deep.equal([true]);
+	});
+
+	it('leaves no rollback for a notification that could no longer see it', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		walletHeader.reorgChecks = [];
+
+		nextHeaderHeight = 96;
+		socketIsDead = true;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// The shorter chain grows past the reconnect header but stays below the
+		// tip that was stored before it, which is exactly the notification that
+		// used to be the only chance to notice the rollback, and could not:
+		// the unreconciled write had already lowered the stored height.
+		expect(client.headerHandler).to.not.equal(null);
+		await client.headerHandler?.([{ height: 98, hex: headerHex }]);
+		await flush();
+
+		expect(walletHeader.stored.height).to.equal(98);
+		expect(
+			walletHeader.reorgChecks,
+			'the reconnect reconciled it once, and the block on top is growth'
+		).to.deep.equal([true]);
+	});
+
+	it('reconciles nothing when the reconnect header extends the stored chain', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		walletHeader.reorgChecks = [];
+
+		nextHeaderHeight = 140;
+		socketIsDead = true;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(walletHeader.stored.height).to.equal(140);
+		expect(
+			walletHeader.reorgChecks,
+			'a taller chain is not a rollback'
+		).to.deep.equal([]);
+	});
+
+	it('still reconciles a rollback a notification reports', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		walletHeader.reorgChecks = [];
+
+		await client.headerHandler?.([{ height: 95, hex: headerHex }]);
+		await flush();
+
+		expect(walletHeader.stored.height).to.equal(95);
+		expect(walletHeader.reorgChecks).to.deep.equal([true]);
+	});
+
+	it('reconciles the rollback for every wallet on the network', async () => {
+		const otherHeader = createWalletHeader();
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'eeee', otherHeader);
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(otherHeader.stored.height).to.equal(100);
+		walletHeader.reorgChecks = [];
+		otherHeader.reorgChecks = [];
+
+		nextHeaderHeight = 96;
+		socketIsDead = true;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// Only the reconnecting instance is handed the header the subscribe
+		// answers with, and the notification that follows is too high to reveal
+		// the rollback to anyone who missed it.
+		expect(walletHeader.reorgChecks).to.deep.equal([true]);
+		expect(
+			otherHeader.stored.height,
+			'a wallet that did not reconnect still sees the shorter chain'
+		).to.equal(96);
+		expect(
+			otherHeader.reorgChecks,
+			'and reconciles the rollback it implies'
+		).to.deep.equal([true]);
+	});
+
+	it('reconciles the rollback for a wallet that subscribes after it', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		nextHeaderHeight = 96;
+		socketIsDead = true;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// Its own storage says 100, and the client answers the subscribe it
+		// issues with a bare "Already Subscribed." carrying no header at all.
+		const otherHeader = createWalletHeader();
+		otherHeader.stored = { height: 100, hash: '', hex: headerHex };
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'eeee', otherHeader);
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(otherHeader.stored.height).to.equal(96);
+		expect(otherHeader.reorgChecks).to.deep.equal([true]);
+	});
+
+	it('keeps the restore owed when the reconciliation fails', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		walletHeader.reorgChecks = [];
+		walletHeader.reconcileFails = true;
+
+		nextHeaderHeight = 96;
+		socketIsDead = true;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(walletHeader.reorgChecks, 'the rollback was noticed').to.deep.equal([
+			true
+		]);
+
+		// The header write already replaced the height the rollback was read
+		// from, so nothing else would ever notice it again: the restore has to
+		// still owe it, and the poll is what retries.
+		walletHeader.reconcileFails = false;
+		await pollConnection(electrum);
+		await flush();
+
+		expect(
+			walletHeader.reorgChecks,
+			'and is reconciled again until it succeeds'
+		).to.deep.equal([true, true]);
+
+		// Settled now: a later healthy poll reconciles nothing.
+		await pollConnection(electrum);
+		await flush();
+		expect(walletHeader.reorgChecks).to.deep.equal([true, true]);
+	});
+
+	it('keeps a header notification that overtook the subscribe response', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		walletHeader.reorgChecks = [];
+
+		// The reconnect asks the server for the current header, and block 101 is
+		// found before the answer comes back.
+		socketIsDead = true;
+		const overtaken = {
+			gate: createGate(),
+			fails: false,
+			deliverWhileInFlight: 101
+		};
+		overtaken.gate.release();
+		headerSubscribeControls.set(1, overtaken);
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(walletHeader.stored.height, 'the newer header stands').to.equal(101);
+		expect(
+			walletHeader.reorgChecks,
+			'and the block it reported is growth, not a rollback'
+		).to.deep.equal([]);
 	});
 });
