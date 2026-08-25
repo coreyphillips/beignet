@@ -589,6 +589,17 @@ export function decodeInvoiceInput(
 }
 
 /**
+ * What an msat amount can cost the sat-denominated spending limits, rounded UP.
+ * Truncating instead made every sub-satoshi invoice invisible to admission and
+ * to the daily total alike: a 999 msat invoice was checked and recorded as 0
+ * sats, which skips both limits outright, and any fractional amount above that
+ * was understated. Rounding up is the direction a limit has to err in.
+ */
+export function spendLimitSats(amountMsat: bigint): number {
+	return Number((amountMsat + 999n) / 1000n);
+}
+
+/**
  * Decode a user-supplied BOLT 12 offer string. Same contract as
  * decodeInvoiceInput: parse failures become a typed INVALID_OFFER (400).
  */
@@ -715,14 +726,32 @@ export function jsonToRouteHops(hops: RouteHop[]): Array<{
 /** Hard page-size cap for GET /graph/describe (the graph can be huge). */
 const GRAPH_DESCRIBE_MAX_LIMIT = 500;
 
+/** One dispatched async payment attempt's claim on the daily budget. */
+export interface AsyncSpendClaim {
+	sats: number;
+	/** Epoch ms after which the claim stops counting (see the TTL below). */
+	expiresAt: number;
+}
+
 /**
- * How many failed async payments stay charge-able against the daily budget in
- * case they settle late (see _asyncLateSpendSats). A failed payment whose HTLC
- * is still live resolves within its CLTV window at the latest, so the oldest
- * entries are the ones that can no longer settle; the bound is what stops a
- * node that fails payments all day from growing the map without limit.
+ * How long a dispatched async payment keeps counting against the daily budget
+ * before the accounting gives up on it. It has to outlive the payment's own
+ * FAILED report: BOLT 2 has no way to retract an update_add_htlc, so
+ * cancelPayment(), the engine's stuck-payment sweep and its expired-invoice
+ * sweep all mark a payment failed while its HTLC is still live, and the engine
+ * deliberately completes such a payment when the preimage turns up. One full
+ * daily window is where it ends, because by then the budget the payment was
+ * admitted against has itself rolled over.
  */
-export const MAX_LATE_ASYNC_SPEND_ENTRIES = 512;
+export const ASYNC_SPEND_CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Last-resort memory guard on the claim ledger, in payment hashes. Expiry above
+ * is what normally bounds it, and every outstanding claim holds daily budget,
+ * so a configured limit already caps how much can be claimed at once. Hitting
+ * this means the accounting has gone approximate, so it is logged.
+ */
+export const MAX_ASYNC_SPEND_CLAIM_HASHES = 4096;
 
 /**
  * Default ceiling on an L402 response body. The body is buffered and then
@@ -1039,25 +1068,26 @@ export class BeignetNode extends EventEmitter {
 	private _dailySpendResetTime = 0;
 	private _pendingSpendSats = 0;
 	/**
-	 * paymentHash hex -> sats reserved in _pendingSpendSats for a payment
-	 * submitted through the fire-and-forget path, which returns before the
-	 * payment settles and so has no local listener to release the reservation.
-	 * The forwarding payment:sent / payment:failed handlers installed in
-	 * create() settle these, which keeps the listener count constant no matter
-	 * how many async payments are in flight.
+	 * paymentHash hex -> the budget claim of every async attempt dispatched for
+	 * that hash, oldest first. A payment submitted through the fire-and-forget
+	 * path returns before it settles and so has no local listener to release
+	 * its reservation; the forwarding payment:sent handler installed in
+	 * create() charges one claim per settlement, which keeps the listener count
+	 * constant no matter how many async payments are in flight.
+	 *
+	 * A claim's sats stay counted in _pendingSpendSats for its whole life, and
+	 * a payment reporting FAILED does NOT end it: the HTLC cannot be retracted
+	 * and the engine completes the payment if the preimage turns up, so
+	 * releasing the budget there let a caller cancel a live payment to win its
+	 * daily allowance back and spend it twice. A claim ends only when a
+	 * settlement charges it, when the engine refused the submission outright,
+	 * or when it expires (ASYNC_SPEND_CLAIM_TTL_MS).
+	 *
+	 * One claim per ATTEMPT, not per hash: a resubmission dispatched while an
+	 * earlier attempt's HTLC may still be out there is a second live claim, and
+	 * either of them can be the one that settles.
 	 */
-	private readonly _asyncSpendReservations = new Map<string, number>();
-	/**
-	 * paymentHash hex -> sats an async payment would spend if it settles after
-	 * having already failed. cancelPayment() and the engine's stuck-payment
-	 * sweep both mark a payment FAILED without retracting its HTLC (BOLT 2 has
-	 * no way to withdraw an update_add_htlc), and the engine deliberately
-	 * completes such a payment when the preimage turns up. Dropping the amount
-	 * on failure would let a caller cancel to win its daily budget back while
-	 * the payment is still live, so it is kept here until either the late
-	 * success charges it or the bound below evicts it.
-	 */
-	private readonly _asyncLateSpendSats = new Map<string, number>();
+	private readonly _asyncSpendClaims = new Map<string, AsyncSpendClaim[]>();
 	private _maxPaymentSats?: number;
 	/**
 	 * Paid L402 credentials, so a gated API is paid for once rather than per
@@ -1572,7 +1602,7 @@ export class BeignetNode extends EventEmitter {
 			const pi = this.toPaymentInfo(info);
 			// Before the forward, so a subscriber reading the daily spend from
 			// this event sees the settled payment already counted.
-			this._settleAsyncReservation(pi.paymentHash, true);
+			this._chargeAsyncSpendClaim(pi.paymentHash);
 			this.log('info', 'Payment sent', {
 				paymentHash: pi.paymentHash,
 				amountSats: pi.amountSats,
@@ -1582,7 +1612,11 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('payment:failed', (info: IPaymentInfo) => {
 			const pi = this.toPaymentInfo(info);
-			this._settleAsyncReservation(pi.paymentHash, false);
+			// Deliberately no spend accounting here. A failure report is not the
+			// end of an async payment's claim on the daily budget: the HTLC it
+			// dispatched cannot be withdrawn and can still be fulfilled, so the
+			// claim runs until a settlement charges it or it expires. See
+			// _asyncSpendClaims.
 			// A bare failure code cannot be acted on: the same code means very
 			// different things depending on WHICH hop returned it. Log the erring hop
 			// and the channel it was asked to forward over, so a route failure can be
@@ -4975,6 +5009,10 @@ export class BeignetNode extends EventEmitter {
 	private _checkSpendLimit(amountSats: number): void {
 		if (this._dailySpendLimitSats === undefined) return;
 		this._resetDailySpendIfNeeded();
+		// An async payment holds its claim past its own failure report, so the
+		// sweep is what stops one that can no longer settle from pinning the
+		// budget for good.
+		this._expireAsyncSpendClaims();
 		const effectiveSpent = this._dailySpentSats + this._pendingSpendSats;
 		if (effectiveSpent + amountSats > this._dailySpendLimitSats) {
 			const remaining = Math.max(0, this._dailySpendLimitSats - effectiveSpent);
@@ -5015,66 +5053,142 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Settles the reservation an async payment holds when a terminal event
-	 * arrives: the pending sats are released either way, a success is recorded
-	 * against the daily budget, and a failure keeps the amount claimable in
-	 * case the payment settles anyway (see _asyncLateSpendSats).
-	 *
-	 * Keyed on the maps, so it charges a payment exactly once however many
-	 * terminal events arrive, and is a no-op for payments whose caller holds
-	 * its own reservation (payInvoice, sendKeysend).
+	 * Reserves the budget one async attempt can still spend, and returns the
+	 * claim so its caller can drop that exact attempt again. Appended rather
+	 * than replacing what the hash already holds: see _asyncSpendClaims.
 	 */
-	private _settleAsyncReservation(
+	private _openAsyncSpendClaim(
 		paymentHashHex: string,
-		completed: boolean
-	): void {
-		const reservedSats = this._asyncSpendReservations.get(paymentHashHex);
-		if (reservedSats === undefined) {
-			// No live reservation: the only thing left to settle is a payment
-			// that failed earlier and has now delivered the preimage after all.
-			if (!completed) return;
-			const lateSats = this._asyncLateSpendSats.get(paymentHashHex);
-			if (lateSats === undefined) return;
-			this._asyncLateSpendSats.delete(paymentHashHex);
-			this._recordSpend(lateSats);
-			return;
-		}
-		this._asyncSpendReservations.delete(paymentHashHex);
-		// Released before the spend is recorded, so a concurrent
-		// _checkSpendLimit never sees the same sats counted twice.
-		this._pendingSpendSats -= reservedSats;
-		if (completed) {
-			this._recordSpend(reservedSats);
-			return;
-		}
-		this._rememberLateAsyncSpend(paymentHashHex, reservedSats);
+		amountSats: number
+	): AsyncSpendClaim {
+		this._expireAsyncSpendClaims();
+		const claim: AsyncSpendClaim = {
+			sats: amountSats,
+			expiresAt: Date.now() + ASYNC_SPEND_CLAIM_TTL_MS
+		};
+		const claims = this._asyncSpendClaims.get(paymentHashHex);
+		if (claims) claims.push(claim);
+		else this._asyncSpendClaims.set(paymentHashHex, [claim]);
+		this._pendingSpendSats += amountSats;
+		this._capAsyncSpendClaims();
+		return claim;
 	}
 
 	/**
-	 * Drops a reservation for a payment the engine refused outright, which
-	 * holds no capacity and cannot settle later. A no-op once a synchronous
-	 * terminal event has already settled the payment.
+	 * Drops one attempt's claim, for a submission the engine refused outright:
+	 * it dispatched no HTLC, so it holds no capacity and cannot settle later.
+	 * Matched by identity, so it never takes another attempt's claim, and a
+	 * no-op once a synchronous settlement has already charged this one.
 	 */
-	private _dropAsyncReservation(paymentHashHex: string): void {
-		const reservedSats = this._asyncSpendReservations.get(paymentHashHex);
-		if (reservedSats === undefined) return;
-		this._asyncSpendReservations.delete(paymentHashHex);
-		this._pendingSpendSats -= reservedSats;
+	private _closeAsyncSpendClaim(
+		paymentHashHex: string,
+		claim: AsyncSpendClaim
+	): void {
+		const claims = this._asyncSpendClaims.get(paymentHashHex);
+		if (!claims) return;
+		const index = claims.indexOf(claim);
+		if (index === -1) return;
+		claims.splice(index, 1);
+		if (claims.length === 0) this._asyncSpendClaims.delete(paymentHashHex);
+		this._pendingSpendSats -= claim.sats;
 	}
 
-	/** Records what a failed async payment costs if it settles after all. */
-	private _rememberLateAsyncSpend(
+	/**
+	 * Charges one async attempt against the daily budget when a payment
+	 * settles. Oldest claim first and exactly one per settlement: a hash can
+	 * carry several live attempts, each able to settle on its own, and a repeat
+	 * terminal event for a hash with nothing left to charge is a no-op.
+	 *
+	 * A no-op too for payments whose caller records the spend itself
+	 * (payInvoice, sendKeysend), which is what _takeAsyncSpendClaims arranges.
+	 */
+	private _chargeAsyncSpendClaim(paymentHashHex: string): void {
+		this._expireAsyncSpendClaims();
+		const claims = this._asyncSpendClaims.get(paymentHashHex);
+		const claim = claims?.shift();
+		if (!claim) return;
+		if (claims!.length === 0) this._asyncSpendClaims.delete(paymentHashHex);
+		// Released before the spend is recorded, so a concurrent
+		// _checkSpendLimit never sees the same sats counted twice.
+		this._pendingSpendSats -= claim.sats;
+		this._recordSpend(claim.sats);
+	}
+
+	/**
+	 * Hands a hash's outstanding async claims to a caller that owns the
+	 * payment's accounting itself, which is what a blocking re-send of a hash
+	 * an async attempt already dispatched needs: otherwise the forwarding
+	 * handler in create() charges a claim for the one settlement and the
+	 * caller's own listener records it a second time.
+	 *
+	 * Returns the claims so the caller can put them back with
+	 * _restoreAsyncSpendClaims when its own attempt does not settle.
+	 */
+	private _takeAsyncSpendClaims(paymentHashHex: string): AsyncSpendClaim[] {
+		this._expireAsyncSpendClaims();
+		const claims = this._asyncSpendClaims.get(paymentHashHex);
+		if (!claims) return [];
+		this._asyncSpendClaims.delete(paymentHashHex);
+		for (const claim of claims) this._pendingSpendSats -= claim.sats;
+		return claims;
+	}
+
+	/** Returns claims taken above, for a caller whose own attempt did not settle. */
+	private _restoreAsyncSpendClaims(
 		paymentHashHex: string,
-		amountSats: number
+		taken: AsyncSpendClaim[]
 	): void {
-		// Re-inserted rather than updated in place, so Map insertion order is
-		// oldest-first and the eviction below drops the least recent failure.
-		this._asyncLateSpendSats.delete(paymentHashHex);
-		this._asyncLateSpendSats.set(paymentHashHex, amountSats);
-		while (this._asyncLateSpendSats.size > MAX_LATE_ASYNC_SPEND_ENTRIES) {
-			const oldest = this._asyncLateSpendSats.keys().next().value;
-			if (oldest === undefined) break;
-			this._asyncLateSpendSats.delete(oldest);
+		const now = Date.now();
+		// The original deadlines are kept: the HTLCs behind them are no younger
+		// for having been held by another caller in the meantime.
+		const live = taken.filter((claim) => claim.expiresAt > now);
+		if (live.length === 0) return;
+		const claims = this._asyncSpendClaims.get(paymentHashHex);
+		if (claims) claims.unshift(...live);
+		else this._asyncSpendClaims.set(paymentHashHex, live);
+		for (const claim of live) this._pendingSpendSats += claim.sats;
+		this._capAsyncSpendClaims();
+	}
+
+	/**
+	 * Drops claims whose window has passed. Called wherever the ledger is read
+	 * or written, so the accounting needs no timer of its own.
+	 */
+	private _expireAsyncSpendClaims(): void {
+		const now = Date.now();
+		for (const [paymentHashHex, claims] of this._asyncSpendClaims) {
+			for (let i = claims.length - 1; i >= 0; i--) {
+				if (claims[i].expiresAt > now) continue;
+				this._pendingSpendSats -= claims[i].sats;
+				claims.splice(i, 1);
+			}
+			if (claims.length === 0) this._asyncSpendClaims.delete(paymentHashHex);
+		}
+	}
+
+	/**
+	 * Memory backstop only: expiry above is what normally bounds the ledger.
+	 * Dropping a claim here releases budget a live HTLC may still spend, so it
+	 * is logged rather than done quietly.
+	 */
+	private _capAsyncSpendClaims(): void {
+		while (this._asyncSpendClaims.size > MAX_ASYNC_SPEND_CLAIM_HASHES) {
+			// Map iteration is insertion-ordered, so the first key is the hash
+			// whose oldest claim is oldest: the one least able to still settle.
+			const oldest = this._asyncSpendClaims.keys().next().value;
+			if (oldest === undefined) return;
+			const claims = this._asyncSpendClaims.get(oldest) ?? [];
+			this._asyncSpendClaims.delete(oldest);
+			let droppedSats = 0;
+			for (const claim of claims) {
+				this._pendingSpendSats -= claim.sats;
+				droppedSats += claim.sats;
+			}
+			this.log(
+				'warn',
+				'Async spend claim ledger full; released a claim that may still settle',
+				{ paymentHash: oldest, droppedSats }
+			);
 		}
 	}
 
@@ -5257,6 +5371,9 @@ export class BeignetNode extends EventEmitter {
 			// 5. Daily spending limit
 			if (this._dailySpendLimitSats !== undefined) {
 				this._resetDailySpendIfNeeded();
+				// Same sweep _checkSpendLimit runs, so the preview reports the
+				// budget the real check would apply.
+				this._expireAsyncSpendClaims();
 				const effectiveSpent = this._dailySpentSats + this._pendingSpendSats;
 				const remaining = Math.max(
 					0,
@@ -5387,7 +5504,7 @@ export class BeignetNode extends EventEmitter {
 		const spendAmountSats =
 			amountSats ??
 			(decoded.amountMsat !== undefined
-				? Number(decoded.amountMsat / 1000n)
+				? spendLimitSats(decoded.amountMsat)
 				: 0);
 		// Converted BEFORE the spend accounting below, not after it. Every
 		// decrement of _pendingSpendSats lives inside the Promise executor
@@ -5406,10 +5523,17 @@ export class BeignetNode extends EventEmitter {
 				  1000n
 				: undefined;
 
+		// Claims a fire-and-forget attempt on this hash still holds, taken over
+		// for as long as this call owns the payment. Its own listener records
+		// the spend below, and the forwarding handler in create() would charge
+		// an async claim for that same settlement: the accounting has to move
+		// across exactly once, and move back if this attempt does not settle.
+		let takenAsyncClaims: AsyncSpendClaim[] = [];
 		if (spendAmountSats > 0) {
 			this._checkMaxPayment(spendAmountSats);
 			this._checkSpendLimit(spendAmountSats);
 			this._pendingSpendSats += spendAmountSats;
+			takenAsyncClaims = this._takeAsyncSpendClaims(paymentHashHex);
 		}
 
 		// One release shared by every exit, and idempotent, because more than
@@ -5424,6 +5548,12 @@ export class BeignetNode extends EventEmitter {
 			released = true;
 			this._pendingSpendSats -= spendAmountSats;
 		};
+		const restoreAsyncClaims = (): void => {
+			if (takenAsyncClaims.length === 0) return;
+			const claims = takenAsyncClaims;
+			takenAsyncClaims = [];
+			this._restoreAsyncSpendClaims(paymentHashHex, claims);
+		};
 
 		// Store metadata on the payment if provided. Guarded, because nothing
 		// between the reservation above and the executor below may strand it.
@@ -5433,6 +5563,7 @@ export class BeignetNode extends EventEmitter {
 			}
 		} catch (err: unknown) {
 			releaseReservation();
+			restoreAsyncClaims();
 			throw err;
 		}
 
@@ -5440,6 +5571,7 @@ export class BeignetNode extends EventEmitter {
 			const timer = setTimeout(() => {
 				cleanup();
 				releaseReservation();
+				restoreAsyncClaims();
 				// Clean up the ghost payment to free channel capacity
 				this.node.failPayment(decoded.paymentHash);
 				reject(
@@ -5462,6 +5594,9 @@ export class BeignetNode extends EventEmitter {
 					// Released before the spend is recorded, so a concurrent
 					// _checkSpendLimit never sees the same sats counted twice.
 					releaseReservation();
+					// This settlement is the one the taken-over claims were
+					// holding budget for, so they are spent, not restored.
+					takenAsyncClaims = [];
 					if (spendAmountSats > 0) this._recordSpend(spendAmountSats);
 					resolve(this.toPaymentInfo(info));
 				}
@@ -5470,6 +5605,7 @@ export class BeignetNode extends EventEmitter {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
 					releaseReservation();
+					restoreAsyncClaims();
 					const failDesc =
 						info.failureCode !== undefined
 							? describeFailureCode(info.failureCode)
@@ -5496,6 +5632,7 @@ export class BeignetNode extends EventEmitter {
 				// duplicate, a peer that is gone) and ratcheted the counter up
 				// until the daily limit refused real payments (issue #474).
 				releaseReservation();
+				restoreAsyncClaims();
 				const msg = err instanceof Error ? err.message : String(err);
 				// Use typed error code if available, fall back to string matching
 				let code = 'PAYMENT_FAILED';
@@ -5702,9 +5839,9 @@ export class BeignetNode extends EventEmitter {
 	): { paymentHash: string; status: 'PENDING' } {
 		// Returning before the payment settles is the point of this method, not
 		// a licence to skip admission: drain mode, the per-payment limit and the
-		// daily limit all apply, and the reservation they raise is settled by
-		// the forwarding handlers in create() rather than by a listener of our
-		// own (issue #526).
+		// daily limit all apply, and the claim they raise is charged by the
+		// forwarding payment:sent handler in create() rather than by a listener
+		// of our own (issue #526).
 		this._checkDraining();
 		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
@@ -5715,7 +5852,7 @@ export class BeignetNode extends EventEmitter {
 		// any size past both limits.
 		const spendAmountSats =
 			decoded.amountMsat !== undefined
-				? Number(decoded.amountMsat / 1000n)
+				? spendLimitSats(decoded.amountMsat)
 				: amountSats ?? 0;
 		// Converted BEFORE the spend accounting below, for the reason
 		// payInvoice's copy documents: a RangeError out of BigInt() must not
@@ -5731,32 +5868,19 @@ export class BeignetNode extends EventEmitter {
 				  1000n
 				: undefined;
 
-		// A resubmission of a hash already in flight must not overwrite that
-		// payment's reservation: the send below refuses the duplicate, and
-		// releasing on the way out would free capacity the first payment still
-		// holds. Its limits are still checked.
-		let reserved = false;
+		// This attempt's own claim, opened BEFORE the send both because a later
+		// submission must not pass the daily limit on capacity this one already
+		// holds and because sendPayment can emit a terminal event synchronously
+		// (an expired invoice fails inside the call) that the handler in
+		// create() has to find a claim for. A resubmission of a hash whose
+		// earlier attempt may still be live gets a claim of its own rather than
+		// replacing that one: either attempt can be the one that settles.
+		let claim: AsyncSpendClaim | undefined;
 		if (spendAmountSats > 0) {
 			this._checkMaxPayment(spendAmountSats);
 			this._checkSpendLimit(spendAmountSats);
-			if (!this._asyncSpendReservations.has(paymentHashHex)) {
-				// Reserved BEFORE the send, both because a later submission must
-				// not pass the daily limit on capacity this one already holds and
-				// because sendPayment can emit a terminal event synchronously (an
-				// expired invoice fails inside the call) that the handler in
-				// create() has to find a reservation for.
-				this._pendingSpendSats += spendAmountSats;
-				this._asyncSpendReservations.set(paymentHashHex, spendAmountSats);
-				// A retry of a hash that failed before is accounted for by this
-				// reservation from here on; leaving the old late-settlement entry
-				// behind would charge the one settlement twice.
-				this._asyncLateSpendSats.delete(paymentHashHex);
-				reserved = true;
-			}
+			claim = this._openAsyncSpendClaim(paymentHashHex, spendAmountSats);
 		}
-		const releaseReservation = (): void => {
-			if (reserved) this._dropAsyncReservation(paymentHashHex);
-		};
 
 		try {
 			if (metadata) {
@@ -5764,8 +5888,10 @@ export class BeignetNode extends EventEmitter {
 			}
 			this.node.sendPayment(bolt11, undefined, maxFeeMsat, amountMsat);
 		} catch (err: unknown) {
-			// A payment that never started holds no capacity.
-			releaseReservation();
+			// A payment that never started holds no capacity. Matched by
+			// identity, so a refused duplicate frees only this submission's
+			// claim and leaves the in-flight attempt's alone.
+			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
 			throw err;
 		}
 		return {
