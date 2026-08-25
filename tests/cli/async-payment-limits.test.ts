@@ -18,7 +18,7 @@ import {
 	AsyncSpendClaim,
 	ASYNC_SPEND_CLAIM_TTL_MS,
 	BeignetNode,
-	MAX_ASYNC_SPEND_CLAIM_HASHES
+	MAX_ASYNC_SPEND_CLAIMS
 } from '../../src/cli/beignet-node';
 import { startDaemon } from '../../src/cli/daemon';
 
@@ -47,17 +47,21 @@ type Internals = {
 	_pendingSpendSats: number;
 	_dailySpendResetTime: number;
 	_asyncSpendClaims: Map<string, AsyncSpendClaim[]>;
+	_blockingPaymentHashes: Map<string, number>;
 };
 
 const internals = (node: BeignetNode): Internals =>
 	node as unknown as Internals;
 
-/** Sats every outstanding async claim for a hash still holds. */
+/** Sats the claims of a hash still hold against the daily budget. */
 const claimedSats = (node: BeignetNode, paymentHash: string): number =>
-	(internals(node)._asyncSpendClaims.get(paymentHash) ?? []).reduce(
-		(total, claim) => total + claim.sats,
-		0
-	);
+	(internals(node)._asyncSpendClaims.get(paymentHash) ?? [])
+		.filter((claim) => claim.reserved)
+		.reduce((total, claim) => total + claim.sats, 0);
+
+/** Claim records for a hash, reserved or not. */
+const claimRecords = (node: BeignetNode, paymentHash: string): number =>
+	(internals(node)._asyncSpendClaims.get(paymentHash) ?? []).length;
 
 /** Ages every outstanding claim past its window, as the clock would. */
 const ageClaimsPastExpiry = (node: BeignetNode): void => {
@@ -66,13 +70,20 @@ const ageClaimsPastExpiry = (node: BeignetNode): void => {
 	}
 };
 
-/** Replaces sendPayment with a recorder; returns the recorded submissions. */
-const stubSendPayment = (node: BeignetNode, throws?: Error): string[] => {
+/**
+ * Replaces sendPayment with a recorder; returns the recorded submissions.
+ * `status` is what the engine hands back synchronously: PENDING once an HTLC
+ * is out, FAILED for the refusals it reports by return rather than by throwing.
+ */
+const stubSendPayment = (
+	node: BeignetNode,
+	opts: { throws?: Error; status?: 'PENDING' | 'FAILED' } = {}
+): string[] => {
 	const calls: string[] = [];
 	internals(node).node.sendPayment = (...args: unknown[]): unknown => {
 		calls.push(String(args[0]));
-		if (throws) throw throws;
-		return undefined;
+		if (opts.throws) throw opts.throws;
+		return { status: opts.status ?? 'PENDING' };
 	};
 	return calls;
 };
@@ -264,7 +275,28 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		// and no settlement — and only once the amount can no longer be spent.
 		node.sendPaymentAsync(node.createInvoice(5_000, 'after expiry').bolt11);
 		expect(internals(node)._pendingSpendSats).to.equal(5_000);
-		expect(internals(node)._asyncSpendClaims.has(paymentHash)).to.equal(false);
+		expect(claimedSats(node, paymentHash)).to.equal(0);
+		// The record outlives the hold: 24 hours is where pinning a DAILY
+		// budget stops making sense, not where the HTLC stops being able to
+		// settle (routing tolerates a fortnight of it).
+		expect(claimRecords(node, paymentHash)).to.equal(1);
+	});
+
+	it('charges a settlement that arrives after its claim expired to the day it lands on', () => {
+		stubSendPayment(node);
+		const { paymentHash } = node.sendPaymentAsync(
+			node.createInvoice(5_000, 'slow settlement').bolt11
+		);
+		ageClaimsPastExpiry(node);
+		node.sendPaymentAsync(node.createInvoice(5_000, 'admitted after').bolt11);
+		expect(internals(node)._pendingSpendSats).to.equal(5_000);
+
+		settle(node, paymentHash, 5_000, 'COMPLETED');
+		// Forgetting the expired claim outright made this settlement free: the
+		// money left, and neither the old day's budget nor the new one saw it.
+		expect(node.getDailySpendInfo().spentSats).to.equal(5_000);
+		expect(internals(node)._pendingSpendSats).to.equal(5_000);
+		expect(claimRecords(node, paymentHash)).to.equal(0);
 	});
 
 	it('holds a claim for one full daily window', () => {
@@ -282,7 +314,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	});
 
 	it('releases the claim when the engine refuses the submission', () => {
-		stubSendPayment(node, new Error('No route found'));
+		stubSendPayment(node, { throws: new Error('No route found') });
 		const { bolt11 } = node.createInvoice(3_000, 'no route');
 
 		expect(() => node.sendPaymentAsync(bolt11)).to.throw('No route found');
@@ -372,7 +404,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 
 		// The retry dispatched nothing, so only its own claim goes: taking the
 		// first attempt's with it lost a live HTLC's amount entirely.
-		stubSendPayment(node, new Error('No route found'));
+		stubSendPayment(node, { throws: new Error('No route found') });
 		expect(() => node.sendPaymentAsync(bolt11)).to.throw('No route found');
 		expect(claimedSats(node, paymentHash)).to.equal(3_000);
 		expect(internals(node)._pendingSpendSats).to.equal(3_000);
@@ -414,7 +446,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		expect(calls).to.have.length(0);
 	});
 
-	it('charges a failed async payment retried through payInvoice once', async () => {
+	it('records a payInvoice retry once and leaves the async attempt claimed', async () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'blocking retry');
 		const { paymentHash } = node.sendPaymentAsync(bolt11);
@@ -425,16 +457,40 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		// handler in create() and its own listener otherwise both record the
 		// one settlement.
 		const retried = node.payInvoice(bolt11, 5_000);
-		expect(internals(node)._asyncSpendClaims.has(paymentHash)).to.equal(false);
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		await retried;
 
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
-		expect(internals(node)._pendingSpendSats).to.equal(0);
-		expect(internals(node)._asyncSpendClaims.size).to.equal(0);
+		// The async attempt's HTLC is still out there, and the engine reports
+		// nothing more for a hash it has marked completed, so nobody will ever
+		// tell us it settled. Discarding its claim on the retry's success handed
+		// back budget 3 000 sats could still leave on.
+		expect(claimedSats(node, paymentHash)).to.equal(3_000);
+		expect(internals(node)._pendingSpendSats).to.equal(3_000);
+		expect(internals(node)._blockingPaymentHashes.size).to.equal(0);
 	});
 
-	it('gives the claim back when the payInvoice retry does not settle', async () => {
+	it('holds the budget of every attempt a blocking retry could not report', async () => {
+		stubSendPayment(node);
+		const { bolt11 } = node.createInvoice(3_000, 'retried twice');
+		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		settle(node, paymentHash, 3_000, 'FAILED');
+		node.sendPaymentAsync(bolt11);
+		settle(node, paymentHash, 3_000, 'FAILED');
+
+		const retried = node.payInvoice(bolt11, 5_000);
+		settle(node, paymentHash, 3_000, 'COMPLETED');
+		await retried;
+
+		// Three attempts dispatched and one reported: 6 000 sats can still go.
+		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
+		expect(internals(node)._pendingSpendSats).to.equal(6_000);
+		expect(() =>
+			node.sendPaymentAsync(node.createInvoice(2_000, 'on top').bolt11)
+		).to.throw('Daily spend limit exceeded');
+	});
+
+	it('keeps the async claim when the payInvoice retry does not settle', async () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'failed blocking retry');
 		const { paymentHash } = node.sendPaymentAsync(bolt11);
@@ -452,35 +508,120 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		expect(claimedSats(node, paymentHash)).to.equal(3_000);
 		expect(internals(node)._pendingSpendSats).to.equal(3_000);
 
+		// The hash is the async ledger's again, so the forwarding handler in
+		// create() charges the settlement the blocking call never saw.
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
 		expect(internals(node)._pendingSpendSats).to.equal(0);
 	});
 
-	it('bounds the claim ledger, releasing the oldest hash and saying so', () => {
+	it('drops lapsed claim records to make room, never live ones', () => {
 		const int = internals(node);
 		const hashAt = (i: number): string => i.toString(16).padStart(64, '0');
 		// Seeded directly: this is the ledger after a run of payments long
 		// enough to outgrow the guard, and the path that fills it is covered
-		// above. Every seeded claim is still well inside its window, so nothing
-		// but the guard itself can drop one.
-		const seeded = MAX_ASYNC_SPEND_CLAIM_HASHES + 9;
-		for (let i = 0; i < seeded; i++) {
+		// above. The oldest records have already given their reservations back;
+		// the newest still hold theirs.
+		const live = 8;
+		for (let i = 0; i < MAX_ASYNC_SPEND_CLAIMS; i++) {
+			const reserved = i >= MAX_ASYNC_SPEND_CLAIMS - live;
 			int._asyncSpendClaims.set(hashAt(i), [
-				{ sats: 1, expiresAt: Date.now() + ASYNC_SPEND_CLAIM_TTL_MS }
+				{
+					sats: 1,
+					expiresAt: Date.now() + ASYNC_SPEND_CLAIM_TTL_MS,
+					reserved
+				}
 			]);
-			int._pendingSpendSats += 1;
+			if (reserved) int._pendingSpendSats += 1;
 		}
 
 		stubSendPayment(node);
 		node.sendPaymentAsync(node.createInvoice(1, 'overflow').bolt11);
 
-		expect(int._asyncSpendClaims.size).to.equal(MAX_ASYNC_SPEND_CLAIM_HASHES);
-		// The oldest go first: they are the ones least able to still settle.
+		// The oldest lapsed record goes: all it can still do is charge a late
+		// settlement, and the newer ones are likelier to see one.
 		expect(int._asyncSpendClaims.has(hashAt(0))).to.equal(false);
-		expect(int._asyncSpendClaims.has(hashAt(seeded - 1))).to.equal(true);
-		// A released claim gives its reservation back with it.
-		expect(int._pendingSpendSats).to.equal(MAX_ASYNC_SPEND_CLAIM_HASHES);
+		expect(
+			int._asyncSpendClaims.has(hashAt(MAX_ASYNC_SPEND_CLAIMS - 1))
+		).to.equal(true);
+		// Nothing live was released for the room, so the only budget movement is
+		// the new payment's own reservation.
+		expect(int._pendingSpendSats).to.equal(live + 1);
+	});
+
+	it('refuses a submission rather than release a live claim for room', () => {
+		const int = internals(node);
+		const hashAt = (i: number): string => i.toString(16).padStart(64, '0');
+		for (let i = 0; i < MAX_ASYNC_SPEND_CLAIMS; i++) {
+			int._asyncSpendClaims.set(hashAt(i), [
+				{
+					sats: 1,
+					expiresAt: Date.now() + ASYNC_SPEND_CLAIM_TTL_MS,
+					reserved: true
+				}
+			]);
+		}
+		int._pendingSpendSats += MAX_ASYNC_SPEND_CLAIMS;
+
+		const calls = stubSendPayment(node);
+		// Evicting the oldest live claim to admit this one gave back budget an
+		// outstanding HTLC could still spend: the ledger then admitted more than
+		// the limit allows while reporting less than it had claimed.
+		expect(() =>
+			node.sendPaymentAsync(node.createInvoice(1, 'over the cap').bolt11)
+		).to.throw('Too many unsettled async payments');
+		expect(calls).to.have.length(0);
+		expect(int._pendingSpendSats).to.equal(MAX_ASYNC_SPEND_CLAIMS);
+	});
+
+	it('counts the guard in claims, so repeats of one invoice cannot outgrow it', () => {
+		const int = internals(node);
+		const hashAt = (i: number): string => i.toString(16).padStart(64, '0');
+		// One hash, one claim per attempt: counting the guard in payment hashes
+		// never ran on this at all, and resubmitting a single invoice is the
+		// fastest way there is to grow the ledger.
+		const lapsed: AsyncSpendClaim[] = [];
+		for (let i = 0; i < MAX_ASYNC_SPEND_CLAIMS; i++) {
+			lapsed.push({ sats: 1, expiresAt: Date.now() - 1, reserved: false });
+		}
+		int._asyncSpendClaims.set(hashAt(0), lapsed);
+
+		stubSendPayment(node);
+		node.sendPaymentAsync(node.createInvoice(1, 'one more').bolt11);
+
+		let total = 0;
+		for (const claims of int._asyncSpendClaims.values()) total += claims.length;
+		expect(total).to.equal(MAX_ASYNC_SPEND_CLAIMS);
+	});
+
+	it('releases the claim when the engine reports a failure by return', () => {
+		// An expired invoice and a locally refused addHtlc both emit
+		// payment:failed inside sendPayment and hand back a failed payment
+		// rather than throwing, and a failure report releases nothing.
+		stubSendPayment(node, { status: 'FAILED' });
+		const { bolt11 } = node.createInvoice(5_000, 'expired');
+
+		const result = node.sendPaymentAsync(bolt11);
+		expect(result.status).to.equal('FAILED');
+		// Half the day's allowance used to go on a payment that never left the
+		// node, and stay gone for 24 hours.
+		expect(internals(node)._pendingSpendSats).to.equal(0);
+		expect(claimedSats(node, result.paymentHash)).to.equal(0);
+		expect(node.sendPaymentAsync(bolt11).status).to.equal('FAILED');
+	});
+
+	it('still charges a settlement of a submission reported failed by return', () => {
+		// The same report covers an MPP part that could not be dispatched, which
+		// fails the payment with its earlier parts already out on the wire, so
+		// the record has to outlive the reservation.
+		stubSendPayment(node, { status: 'FAILED' });
+		const { paymentHash } = node.sendPaymentAsync(
+			node.createInvoice(4_000, 'partial mpp').bolt11
+		);
+		expect(internals(node)._pendingSpendSats).to.equal(0);
+
+		settle(node, paymentHash, 4_000, 'COMPLETED');
+		expect(node.getDailySpendInfo().spentSats).to.equal(4_000);
 	});
 
 	it('counts a settlement that arrives after midnight UTC against the new day', () => {

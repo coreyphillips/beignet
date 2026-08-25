@@ -466,12 +466,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}),
 					responses: {
 						'200': {
-							description: 'Pending payment',
+							description:
+								'Pending payment, or FAILED when the engine refused it without dispatching an HTLC (an expired invoice, a locally refused HTLC)',
 							content: jsonContent({
 								type: 'object',
 								properties: {
 									paymentHash: { type: 'string' },
-									status: { type: 'string' }
+									status: { type: 'string', enum: ['PENDING', 'FAILED'] }
 								}
 							})
 						}

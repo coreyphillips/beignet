@@ -568,6 +568,7 @@ describe('Issue #474: the payment and invoice paths guard before BigInt()', () =
 		return Object.assign(nodeWithEngine(engine), {
 			_pendingSpendSats: 0,
 			_asyncSpendClaims: new Map(),
+			_blockingPaymentHashes: new Map(),
 			_dailySpentSats: 0,
 			_dailySpentLightningSats: 0,
 			_dailySpentOnchainSats: 0,
