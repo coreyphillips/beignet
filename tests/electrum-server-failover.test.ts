@@ -1915,6 +1915,74 @@ describe('Electrum hash aware rollback detection (issues #511, #515)', () => {
 		expect(walletHeader.reorgChecks).to.deep.equal([true]);
 	});
 
+	it('reconciles a NOTIFICATION that reports the stored tip parent', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(walletHeader.stored.height).to.equal(100);
+		walletHeader.reorgChecks = [];
+
+		// The client only notifies when the server's tip CHANGES, so a server
+		// announcing the parent of the block this wallet holds is saying that
+		// block was undone. Ignoring it the way a subscribe answer is ignored
+		// would lose the rollback for good once the rebuilt chain came back two
+		// or more blocks up, where the height-only reading takes over.
+		await fireHeader(99);
+		await flush();
+
+		expect(walletHeader.stored.height).to.equal(99);
+		expect(walletHeader.reorgChecks).to.deep.equal([true]);
+	});
+
+	it('reconciles a rollback the ignored reconnect header preceded', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		walletHeader.reorgChecks = [];
+
+		// A failover lands on a server one block behind, which is ignored.
+		nextHeaderHeight = 99;
+		await electrum.connectToElectrum({ servers: serverB });
+		await flush();
+		expect(walletHeader.stored.height).to.equal(100);
+		expect(walletHeader.reorgChecks).to.deep.equal([]);
+
+		// That server then produces a DIFFERENT block 100, which is the
+		// rollback showing itself.
+		await fireHeader(100, siblingHeaderHexAt(100));
+		await flush();
+
+		expect(walletHeader.reorgChecks).to.deep.equal([true]);
+	});
+
+	it('keeps applying a header after one wallet storage throws', async () => {
+		const brokenHeader = createWalletHeader();
+		const broken = createElectrum(
+			sinon.spy(),
+			sinon.spy(),
+			'dddd',
+			brokenHeader
+		);
+		const otherHeader = createWalletHeader();
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'eeee', otherHeader);
+		await broken.connectToElectrum({ servers: serverA });
+		await flush();
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// A stored hex too short to parse used to throw out of applyHeader,
+		// which aborted the fan-out and left every wallet behind it unreached.
+		brokenHeader.stored = { height: 100, hash: '', hex: '0x0100abcd' };
+		otherHeader.stored = { height: 100, hash: '', hex: '0x0100abcd' };
+		brokenHeader.writeFails = true;
+
+		await fireHeader(101);
+		await flush();
+
+		expect(
+			otherHeader.stored.height,
+			'a wallet whose sibling threw must still get the header'
+		).to.equal(101);
+	});
+
 	it('leaves a fresh wallet with no stored hash alone', async () => {
 		const freshHeader = createWalletHeader();
 		const fresh = createElectrum(sinon.spy(), sinon.spy(), 'dddd', freshHeader);

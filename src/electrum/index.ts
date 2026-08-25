@@ -1359,6 +1359,22 @@ export class Electrum {
 	}
 
 	/**
+	 * Block id of an 80 byte header hex, or '' when there is no hex or it does
+	 * not parse. getBlockHashFromHex is the public form and throws on a hex it
+	 * cannot read, which is fine for a caller handing it a header a server just
+	 * sent; this one is for reading back STORAGE, where a short or corrupt hex
+	 * must not become an exception on every block.
+	 */
+	private getBlockHashOf(blockHex?: string): string {
+		if (!blockHex) return '';
+		try {
+			return Block.fromHex(blockHex).getId();
+		} catch {
+			return '';
+		}
+	}
+
+	/**
 	 * Returns transactions associated with the provided transaction hashes.
 	 * @param {ITxHash[]} txHashes
 	 * @return {Promise<Result<IGetTransactionsFromInputs>>}
@@ -1435,15 +1451,23 @@ export class Electrum {
 	 * on the network. Every header carries its parent, so the three are told
 	 * apart from what is already in hand.
 	 */
-	private async applyHeader(header: IHeader): Promise<Result<string>> {
+	private async applyHeader(
+		header: IHeader,
+		/** Whether this header is a server's answer about its CURRENT tip (a
+		 *  subscribe response) rather than a notification that its tip just
+		 *  changed. The two mean different things one block below the stored
+		 *  tip: see the parent case below. */
+		reported = false
+	): Promise<Result<string>> {
 		const stored = this.getBlockHeader();
 		// A fresh wallet's header is { height: 0, hash: '', hex: '' } and older
 		// storage may carry a hex with no hash, so the hash is derived when it
-		// has to be. With nothing to compare against, the height-only reading
-		// this always had is kept.
-		const storedHash =
-			stored.hash ||
-			(stored.hex ? this.getBlockHashFromHex({ blockHex: stored.hex }) : '');
+		// has to be. Derived through the same guarded read the parent link uses,
+		// because a stored hex too short or too malformed to parse would
+		// otherwise throw out of here, wedging this wallet on every block and
+		// aborting the fan-out to the rest. With nothing to compare against,
+		// the height-only reading this always had is kept.
+		const storedHash = stored.hash || this.getBlockHashOf(stored.hex);
 		let reorgDetected = this._reorgOwed || header.height < stored.height;
 		if (!this._reorgOwed && storedHash && stored.height) {
 			if (header.height === stored.height) {
@@ -1457,17 +1481,24 @@ export class Electrum {
 				// stored tip is gone, however much taller the chain now is.
 				reorgDetected = this.getPrevBlockHash(header.hex) !== storedHash;
 			} else if (
+				reported &&
 				header.height === stored.height - 1 &&
 				this.getPrevBlockHash(stored.hex) === header.hash
 			) {
-				// Exactly the stored tip's parent, on this very chain: the
-				// server is simply a block behind, which is the common state
-				// right after a failover. It holds no block at the stored
-				// height and so has nothing to say about it. Not stored either:
-				// lowering the tip here would spend the evidence of a rollback
-				// that orphaned it, and the server's next header settles it
-				// (a replacement at the stored height reads as a rollback, the
-				// stored tip rebuilt reads as the header already stored).
+				// Exactly the stored tip's parent, on this very chain, and
+				// REPORTED rather than notified: the server is answering with
+				// the tip it currently holds, and after a failover that is
+				// commonly a server one block behind. It holds no block at the
+				// stored height and so has nothing to say about it. Not stored
+				// either: lowering the tip would spend the evidence of a
+				// rollback that orphaned it.
+				//
+				// A NOTIFICATION at the same height means something else
+				// entirely, which is why this is gated. The client only
+				// notifies when the server's tip CHANGES, so a server that
+				// announces the parent of the block this wallet holds is
+				// telling it that block was undone. That one keeps the reading
+				// it always had, below.
 				return ok('Header below the stored tip ignored.');
 			}
 			// A gap of more than one block in either direction is left with the
@@ -1522,11 +1553,17 @@ export class Electrum {
 			// an instance that withdrew while a wallet ahead of it was writing
 			// must not have a header applied to it after all.
 			if (!router.handlers.has(instance)) continue;
-			const applied = await instance.applyHeader(header);
 			// Reported, so the caller keeps the restore owed and retries, which
 			// is what re-drives the reconciliation for every wallet here. One
-			// failing wallet must not stop the rest from being reconciled.
-			if (applied.isErr()) failure = applied.error.message;
+			// failing wallet must not stop the rest from being reconciled, and
+			// a wallet whose storage THROWS rather than answering an error must
+			// not either, which is what the catch is for.
+			try {
+				const applied = await instance.applyHeader(header, true);
+				if (applied.isErr()) failure = applied.error.message;
+			} catch (e) {
+				failure = e instanceof Error ? e.message : String(e);
+			}
 		}
 		return failure ? err(failure) : ok('Header applied.');
 	}
