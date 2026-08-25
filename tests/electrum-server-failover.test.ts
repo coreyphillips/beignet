@@ -16,6 +16,11 @@
  * observable to the teardown above, so the restore after a successful connect
  * is unconditional.
  *
+ * And for issue #494: the public subscribeToHeader/subscribeToAddresses did not
+ * check the disconnected flag, so a caller that outlived disconnect() (an
+ * ElectrumBackend reconnect monitor still ticking after wallet.stop()) put the
+ * stopped instance straight back into the shared routers.
+ *
  * Fully OFFLINE: the client helpers are stubbed with a faithful model of that
  * per-network state, including the upstream asymmetry (a server swap drops the
  * handlers but keeps the bookkeeping), and notifications are fired by invoking
@@ -954,5 +959,127 @@ describe('Electrum reconnect to the same server after a dead socket (issue #485)
 					call.args[0] === 'newBlock'
 			);
 		expect(blocks.length, 'the rolled back handler must stay gone').to.equal(0);
+	});
+});
+
+describe('Electrum subscriptions after disconnect (issue #494)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	it('refuses a header subscribe from a stopped instance', async () => {
+		const otherMessageSpy = sinon.spy();
+		const other = createElectrum(sinon.spy(), otherMessageSpy, 'eeee');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// The wallet stops, and a reconnect monitor that was mid-tick pings on
+		// with the instance it still holds while another one keeps the network's
+		// headers wired.
+		await electrum.disconnect();
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+
+		const late = await electrum.subscribeToHeader();
+
+		expect(client.headerHandler).to.not.equal(null);
+		await client.headerHandler?.([{ height: 700, hex: headerHex }]);
+		await flush();
+
+		const ownBlocks = messageSpy
+			.getCalls()
+			.filter(
+				(call: { args: [string, { height: number }] }) =>
+					call.args[0] === 'newBlock'
+			);
+		expect(
+			ownBlocks.length,
+			'a stopped wallet must not be refreshed by a new block'
+		).to.equal(0);
+		const otherBlocks = otherMessageSpy
+			.getCalls()
+			.filter(
+				(call: { args: [string, { height: number }] }) =>
+					call.args[0] === 'newBlock'
+			);
+		expect(
+			otherBlocks.length,
+			'the live instance still receives them'
+		).to.equal(1);
+		expect(late.isErr(), 'a stopped instance cannot subscribe').to.equal(true);
+	});
+
+	it('refuses a script hash subscribe from a stopped instance', async () => {
+		const onReceive = sinon.spy();
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'eeee');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.subscribeToAddresses({ scriptHashes: ['aaaa'], onReceive });
+
+		await electrum.disconnect();
+		await other.connectToElectrum({ servers: serverA });
+		await flush();
+
+		refreshSpy.resetHistory();
+		const late = await electrum.subscribeToAddresses({
+			scriptHashes: ['aaaa'],
+			onReceive
+		});
+
+		expect(client.addressHandler).to.not.equal(null);
+		await client.addressHandler?.(['aaaa', 'status-after-stop']);
+		await flush();
+
+		expect(
+			onReceive.called,
+			'a stopped wallet must not be called back'
+		).to.equal(false);
+		expect(refreshSpy.called, 'nor refreshed by the notification').to.equal(
+			false
+		);
+		expect(late.isErr(), 'a stopped instance cannot subscribe').to.equal(true);
+	});
+
+	it('leaves a header subscribe the disconnect outran unwired', async () => {
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
+		const gate = { gate: createGate(), fails: false };
+		headerSubscribeControls.set(0, gate);
+
+		const pending = other.subscribeToHeader();
+		await other.disconnect();
+		gate.gate.release();
+
+		expect(
+			(await pending).isErr(),
+			'the subscribe the disconnect outran must not report success'
+		).to.equal(true);
+		expect(
+			storedHeader.height,
+			'nor write the header into a stopped wallet'
+		).to.equal(0);
+	});
+
+	it('subscribes again once the instance reconnects', async () => {
+		const onReceive = sinon.spy();
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.disconnect();
+
+		expect((await electrum.subscribeToHeader()).isErr()).to.equal(true);
+
+		const reconnected = await electrum.connectToElectrum({ servers: serverA });
+		expect(reconnected.isOk()).to.equal(true);
+		await flush();
+
+		expect((await electrum.subscribeToHeader()).isOk()).to.equal(true);
+		const subscribed = await electrum.subscribeToAddresses({
+			scriptHashes: ['aaaa'],
+			onReceive
+		});
+		expect(subscribed.isOk()).to.equal(true);
+		expect(client.addressHandler).to.not.equal(null);
+		await client.addressHandler?.(['aaaa', 'status-after-revival']);
+		expect(onReceive.calledOnce, 'the revived instance is wired').to.equal(
+			true
+		);
 	});
 });

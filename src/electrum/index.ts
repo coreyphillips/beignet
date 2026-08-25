@@ -62,6 +62,9 @@ import {
 	POLLING_INTERVAL
 } from '../shapes';
 
+/** Answer of every subscribe refused because the instance has disconnected. */
+const DISCONNECTED_ERROR = 'Electrum instance is disconnected.';
+
 type TScriptHashSubscription = {
 	callbacks: Set<(data: TSubscribedReceive) => void>;
 	/** Address index of a UTXO tracked beyond the gap limit; that index is
@@ -502,6 +505,10 @@ export class Electrum {
 				}
 			},
 			() => {
+				// A restore that failed because the instance disconnected owes
+				// nothing: disconnect() cleared the debt, its retry hook is
+				// stopped, and the next connect restores unconditionally.
+				if (this._disconnected) return;
 				this._restoreOwed = electrumNetwork;
 			}
 		);
@@ -1278,6 +1285,11 @@ export class Electrum {
 	 * @return {Promise<Result<string>>}
 	 */
 	public async subscribeToHeader(): Promise<Result<IHeader>> {
+		// disconnect() withdrew this instance from the shared header router, and
+		// a caller that outlived it (an ElectrumBackend reconnect monitor still
+		// ticking after wallet.stop()) must not put it back: _onNewBlock would
+		// then refresh a wallet that has shut down.
+		if (this._disconnected) return err(DISCONNECTED_ERROR);
 		const electrumNetwork = this.electrumNetwork;
 		const router = getHeaderRouter(electrumNetwork);
 		// Registered before the call, and left registered on "Already
@@ -1303,6 +1315,10 @@ export class Electrum {
 		} finally {
 			state.inFlight--;
 		}
+		// Checked again: a disconnect that landed while the subscribe was in
+		// flight already withdrew the handler registered above, so it stays
+		// withdrawn and the header stays out of a stopped wallet.
+		if (this._disconnected) return err(DISCONNECTED_ERROR);
 		if (subscribeResponse.error) {
 			// Rolled back only when this attempt is the last word: a concurrent
 			// call that already succeeded, or one still in flight, owns the
@@ -1388,6 +1404,11 @@ export class Electrum {
 		scriptHashes?: string[];
 		onReceive?: (data: TSubscribedReceive) => void;
 	} = {}): Promise<Result<string>> {
+		// Same guard the restore path carries: every subscribe below registers
+		// this instance in the shared script hash router, where a notification
+		// refreshes its wallet. A caller that outlived disconnect() must not put
+		// a stopped wallet back on that path.
+		if (this._disconnected) return err(DISCONNECTED_ERROR);
 		const allUtxos: IUtxo[] = [];
 		const currentWallet = this._wallet.data;
 		const addressTypeKeys = this._wallet.addressTypesToMonitor;
