@@ -402,3 +402,122 @@ describe('Electrum script hash subscription routing (issue #478)', () => {
 		});
 	});
 });
+
+/**
+ * Issue #501 (and its duplicate #505): the script hash dispatcher iterated a
+ * snapshot of the ENTRIES and never re-read the map, so an instance that
+ * disconnected while an earlier entry was parked in getUtxos still had its
+ * callbacks fired and its wallet refreshed. The header dispatcher already
+ * re-read its handler at the moment of the call; this is its sibling.
+ *
+ * Issue #502: a stopped instance answers every subscribe with the disconnected
+ * refusal by design, and ElectrumBackend's reconnect monitor could not tell
+ * that apart from a server failure. It counted the refusal toward
+ * onFailoverNeeded, whose handler calls connectToElectrum and puts the stopped
+ * wallet fully back on the network.
+ */
+describe('Electrum dispatch and monitor against a stopped instance', () => {
+	let refreshSpy: sinon.SinonStub;
+	let electrum: Electrum;
+
+	beforeEach(() => {
+		globalHandler = null;
+		subscribedHashes = [];
+		failNextSubscribes = 0;
+		hangNextSubscribes = 0;
+		sinon.stub(electrumHelpers, 'subscribeAddress').callsFake(
+			async ({
+				scriptHash = '',
+				onReceive = undefined
+			}: {
+				scriptHash?: string;
+				onReceive?: (data: TNotification) => void;
+			} = {}) => {
+				if (onReceive && !globalHandler) globalHandler = onReceive;
+				if (subscribedHashes.includes(scriptHash)) {
+					return { error: false, data: 'Already Subscribed.' };
+				}
+				subscribedHashes.push(scriptHash);
+				return { error: false, data: { id: 1, jsonrpc: '2.0', result: null } };
+			}
+		);
+		refreshSpy = sinon.spy();
+		electrum = createElectrum(refreshSpy);
+	});
+
+	afterEach(async () => {
+		for (const instance of createdInstances) {
+			await instance.disconnect();
+		}
+		createdInstances.length = 0;
+		sinon.restore();
+	});
+
+	it('does not refresh a wallet that disconnects mid-dispatch (#501)', async () => {
+		const refreshB = sinon.spy();
+		const electrumB = createElectrum(refreshB);
+		const cbB = sinon.spy();
+
+		// Both instances subscribe the SAME hash, and the first tracks a UTXO
+		// on it, so its entry parks the dispatch inside getUtxos.
+		let release = (): void => {};
+		const parked = new Promise<void>((resolve) => {
+			release = (): void => resolve();
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(electrum as any).getUtxos = async (): Promise<void> => parked;
+		await electrum.subscribeToAddresses({
+			scriptHashes: ['abab'],
+			onReceive: sinon.spy()
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(electrum as any)._scriptHashRecord('abab').utxoIndex = 0;
+		await electrumB.subscribeToAddresses({
+			scriptHashes: ['abab'],
+			onReceive: cbB
+		});
+
+		const dispatched = fireNotification(['abab', 's1']);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await electrumB.disconnect();
+		release();
+		await dispatched;
+
+		expect(
+			refreshB.called,
+			'a wallet that shut down must not be refreshed'
+		).to.equal(false);
+		expect(cbB.called, 'and its callback must not be called either').to.equal(
+			false
+		);
+	});
+
+	it('lets the reconnect monitor tick past a stopped instance (#502)', async () => {
+		const backend = new ElectrumBackend(electrum);
+		let failovers = 0;
+		backend.onFailoverNeeded = (): void => {
+			failovers++;
+		};
+		await electrum.disconnect();
+
+		// The monitor's tick pings with subscribeToHeader, which a stopped
+		// instance refuses by design. Three of those used to reach the default
+		// failover threshold and reconnect the wallet.
+		const tick = async (): Promise<void> => {
+			backend.startReconnectMonitor(10);
+			await new Promise((resolve) => setTimeout(resolve, 40));
+			backend.stopReconnectMonitor();
+		};
+		await tick();
+
+		expect(
+			backend.getConsecutiveFailures(),
+			'a refusal by design is not a server failure'
+		).to.equal(0);
+		expect(failovers, 'and must not drive a failover').to.equal(0);
+		expect(
+			electrum.isDisconnected,
+			'the stopped instance stays stopped'
+		).to.equal(true);
+	});
+});

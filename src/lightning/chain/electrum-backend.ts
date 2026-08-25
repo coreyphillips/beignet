@@ -223,6 +223,13 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 	startReconnectMonitor(intervalMs = 30_000): void {
 		this.stopReconnectMonitor();
 		const tick = async (): Promise<void> => {
+			// A stopped Electrum instance refuses every subscribe by design, and
+			// that refusal is not a server fault: counted, it drives
+			// onFailoverNeeded, whose daemon handler calls connectToElectrum and
+			// puts the stopped wallet fully back on the network. Skipped rather
+			// than stopping the monitor, because an explicit connect revives the
+			// same instance and the next tick has to resume watching it.
+			if (this.electrum.isDisconnected) return;
 			try {
 				// Lightweight ping: attempt to subscribe to header (no-op if already
 				// subscribed). Wrapped in the call timeout — a hanging server (e.g.
@@ -241,6 +248,10 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 					'reconnectMonitorPing'
 				);
 				if (result.isErr()) {
+					// Re-checked after the await: a disconnect that landed while
+					// the ping was in flight is what produced this error, not
+					// the server.
+					if (this.electrum.isDisconnected) return;
 					this._consecutiveFailures++;
 					if (
 						this._consecutiveFailures >= this.failoverThreshold &&
@@ -253,6 +264,7 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 					this._consecutiveFailures = 0;
 				}
 			} catch {
+				if (this.electrum.isDisconnected) return;
 				this._consecutiveFailures++;
 				if (
 					this._consecutiveFailures >= this.failoverThreshold &&

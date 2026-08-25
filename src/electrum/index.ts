@@ -65,6 +65,14 @@ import {
 /** Answer of every subscribe refused because the instance has disconnected. */
 const DISCONNECTED_ERROR = 'Electrum instance is disconnected.';
 
+/**
+ * A well formed script hash used only to ask a server whether it is still
+ * answering. It addresses nothing; the balance in the reply is discarded. The
+ * same value rn-electrum-client uses for its own post-connect probe.
+ */
+const LIVENESS_SCRIPT_HASH =
+	'77ca78f9a84b48041ad71f7cc6ff6c33460c25f0cb99f558f9813ed9e63727dd';
+
 type TScriptHashSubscription = {
 	callbacks: Set<(data: TSubscribedReceive) => void>;
 	/** Address index of a UTXO tracked beyond the gap limit; that index is
@@ -166,6 +174,53 @@ const headerSubscribeGates: Map<EElectrumNetworks, Promise<void>> = new Map();
  */
 const HEADER_SUBSCRIBE_GATE_MS = 30_000;
 
+/**
+ * Networks whose shared client may still hold unwired subscriptions because a
+ * restore failed.
+ *
+ * Module state for the same reason the routers are. restoreSubscriptions
+ * re-issues the ONE per-network client's subscriptions: the header handler and
+ * every instance's script hashes in the shared router, not just the ones
+ * belonging to whichever instance happens to be running it. A failure
+ * therefore strands wallets that never ran a restore and have no reconnect
+ * coming, and the instance that noticed may disconnect (taking its own debt
+ * with it) or move to another network. The debt belongs to the network, and
+ * any instance still polling it discharges it.
+ */
+const subscriptionRestoreOwed: Set<EElectrumNetworks> = new Set();
+
+/**
+ * Restores in flight per network, so the poll hook does not stack one restore
+ * per instance onto the same client every tick. The connect path never
+ * consults it: that restore is unconditional (see _doConnect).
+ */
+const restoresInFlight: Map<EElectrumNetworks, number> = new Map();
+
+/**
+ * Server keys (host|protocol|port) that an instance in this process connected
+ * on a network, and has not disconnected from.
+ *
+ * There is one client per network for the whole process, so the peer it holds
+ * may well have been chosen by a sibling instance rather than by the one
+ * asking, and that client is still the one carrying the shared router's
+ * subscriptions. What this set exists to reject is a peer NOBODY here chose:
+ * rn-electrum-client dials a random peers.json server whenever a network's
+ * client is missing, which produces a live socket with none of this process's
+ * subscriptions on it. See isOurPeer.
+ */
+const connectedServers: Map<
+	EElectrumNetworks,
+	Map<string, Set<Electrum>>
+> = new Map();
+
+/** Whether any instance in this process holds `serverKey` on `network`. */
+function isConnectedServer(
+	network: EElectrumNetworks,
+	serverKey: string
+): boolean {
+	return (connectedServers.get(network)?.get(serverKey)?.size ?? 0) > 0;
+}
+
 function getHeaderRouter(network: EElectrumNetworks): THeaderRouter {
 	let router = headerRouters.get(network);
 	if (!router) {
@@ -251,7 +306,15 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					}
 					return;
 				}
-				for (const [instance, sub] of [...subs]) {
+				for (const instance of [...subs.keys()]) {
+					// Re-read rather than taken from the snapshot, as the header
+					// dispatch does: the entry ahead of this one parks for as
+					// long as a single index scan takes, and an instance that
+					// withdrew in the meantime (disconnect() deletes it from
+					// exactly this map) must not be called back or refreshed by
+					// a notification it is merely still queued for.
+					const sub = subs.get(instance);
+					if (!sub) continue;
 					// Snapshots: a callback may unregister itself or a sibling
 					// mid-dispatch.
 					for (const callback of [...sub.callbacks]) {
@@ -267,6 +330,10 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 							addressIndex: sub.utxoIndex,
 							changeAddressIndex: sub.utxoIndex
 						});
+						// Checked again: the withdrawal can land while this
+						// instance's own scan is in flight, and the refresh
+						// below would restart a wallet that has shut down.
+						if (!subs.has(instance)) continue;
 					}
 					void instance.wallet.refreshWallet({});
 				}
@@ -296,6 +363,10 @@ export class Electrum {
 	private _currentServer: TServer | null = null;
 	/** Number of times the connected server changed after the first connect. */
 	private _rotationCount = 0;
+	/** The entry this instance holds in connectedServers, so it can release
+	 *  exactly that one when it moves or stops. */
+	private _heldServer: { network: EElectrumNetworks; key: string } | null =
+		null;
 	/** Network whose subscription restore last failed, cleared once one
 	 *  succeeds. A restore only fails on a socket that can stay healthy
 	 *  indefinitely, and nothing else reconnects while it does, so the
@@ -363,6 +434,20 @@ export class Electrum {
 		this.connectionPollingInterval = setInterval((): void => {
 			void this.checkConnection();
 		}, POLLING_INTERVAL);
+	}
+
+	/**
+	 * True from disconnect() until an explicit connectToElectrum revives this
+	 * instance.
+	 *
+	 * A different question from connectedToElectrum, which is also false for a
+	 * server that is merely down. This one says the instance was STOPPED, so
+	 * every subscribe is refused by design (see subscribeToHeader and
+	 * subscribeToAddresses), and a caller running its own liveness loop must
+	 * read that refusal as "nothing to monitor" rather than as a server fault.
+	 */
+	public get isDisconnected(): boolean {
+		return this._disconnected;
 	}
 
 	public get wallet(): Wallet {
@@ -443,7 +528,7 @@ export class Electrum {
 				lastError = String(startResponse.error);
 				continue;
 			}
-			this.recordServerSuccess(candidate);
+			this.recordServerSuccess(candidate, electrumNetwork);
 			connected = true;
 			break;
 		}
@@ -468,6 +553,26 @@ export class Electrum {
 		// network has no reachable server, but that must never be reported as
 		// success: every Electrum call gates on connectedToElectrum, and a
 		// false success leaves them all believing a connection exists.
+		// A network switch leaves the OLD network's client alive:
+		// rn-electrum-client keys its client by network and
+		// stopPeerIfServerChanged only tears down the target network's peer, so
+		// the old socket can keep dispatching into the shared routers this
+		// instance is still registered in. _onNewBlock and _scriptHashRecord
+		// resolve their router from this.electrumNetwork, so an old-network
+		// notification would write a foreign chain's header into the NEW
+		// network's router.last, and the next subscribe there would fan that
+		// tip out to every wallet on the network.
+		if (electrumNetwork !== this.electrumNetwork) {
+			this.withdrawFromRouters();
+			// The debt names the network being left, and the poll only retries
+			// one equal to the current electrumNetwork, so it could never be
+			// discharged again. The network keeps it in subscriptionRestoreOwed
+			// for whichever instance is still there.
+			if (this._restoreOwed === this.electrumNetwork) {
+				subscriptionRestoreOwed.add(this._restoreOwed);
+				this._restoreOwed = null;
+			}
+		}
 		this.network = network;
 		this.electrumNetwork = electrumNetwork;
 		if (customPeers.length) {
@@ -557,7 +662,23 @@ export class Electrum {
 		const peer = electrum.getConnectedPeer(electrumNetwork);
 		if (!peer?.host) return {};
 		const peerKey = `${peer.host}|${peer.protocol}|${peer.port}`;
-		if (peerKey === this.serverKey(server)) return {};
+		// The target IS the connected peer. The client would handle that case
+		// itself, and for a live peer it does the right thing: it pings, finds
+		// the socket healthy and no-ops, keeping every handler wired. But when
+		// the ping fails it runs its own disconnect, which calls close() FIRST
+		// and clears subscribedAddresses/subscribedHeaders/onAddressReceive
+		// only afterwards, discards the result, and builds the replacement
+		// client regardless. A close() that throws therefore leaves that
+		// bookkeeping pointing at a client that no longer exists: every restore
+		// is then answered "Already Subscribed." without touching the socket,
+		// and since the peer is rewritten with the same host, port and
+		// protocol, there is nothing left for us to notice. RPCs keep working
+		// and no notification ever arrives again. So when the peer does not
+		// answer, the reset is done here instead, where a teardown that did not
+		// happen refuses the candidate rather than building on stale state.
+		if (peerKey === this.serverKey(server)) {
+			if (await this.peerResponds(electrumNetwork)) return {};
+		}
 		const stopResponse = await electrum.stop({ network: electrumNetwork });
 		// The cleared peer is the observable proof that the bookkeeping went
 		// with it, so it decides, and the reported error only sharpens the
@@ -568,10 +689,33 @@ export class Electrum {
 				? `: ${String(stopResponse.data ?? '')}`
 				: '.';
 			return {
-				error: `Unable to disconnect from ${peer.host} before switching Electrum servers${reason}`
+				error: `Unable to disconnect from ${peer.host} before reconnecting${reason}`
 			};
 		}
 		return {};
+	}
+
+	/**
+	 * Whether the peer connected on this network still answers.
+	 *
+	 * Network scoped on purpose: the unscoped helpers key off the module-global
+	 * clients.network and dial a random peer when that network has no client.
+	 * Only ever called with a peer already connected on `electrumNetwork`,
+	 * which is what guarantees the helper holds a client object for it and its
+	 * connectToRandomPeer fallback cannot fire.
+	 */
+	private async peerResponds(
+		electrumNetwork: EElectrumNetworks
+	): Promise<boolean> {
+		try {
+			const response = await electrum.getAddressScriptHashBalance({
+				scriptHash: LIVENESS_SCRIPT_HASH,
+				network: electrumNetwork
+			});
+			return !response?.error;
+		} catch {
+			return false;
+		}
 	}
 
 	/**
@@ -591,7 +735,10 @@ export class Electrum {
 	private async restoreSubscriptions(
 		electrumNetwork: EElectrumNetworks
 	): Promise<void> {
-		if (this._disconnected) return;
+		// A bail is not a restore: whatever the shared client was left holding
+		// is still unwired, so the network's debt has to stay owed for whoever
+		// is left to discharge it.
+		if (this._disconnected) throw new Error(DISCONNECTED_ERROR);
 		// Re-issues the shared header dispatcher, so every instance subscribed
 		// to this network's headers is wired to the new client, not just this
 		// one. Started before the hashes and awaited after them, so neither
@@ -621,8 +768,9 @@ export class Electrum {
 		}
 		// Checked again: disconnect() can land while the hashes above are in
 		// flight, and subscribeToAddresses would register this instance back
-		// into the router it just withdrew from.
-		if (this._disconnected) return;
+		// into the router it just withdrew from. A bail here is not a restore
+		// either.
+		if (this._disconnected) throw new Error(DISCONNECTED_ERROR);
 		const walletSubscriptions = await this.subscribeToAddresses({});
 		if (walletSubscriptions.isErr()) {
 			throw walletSubscriptions.error;
@@ -649,20 +797,40 @@ export class Electrum {
 	private restoreSubscriptionsBestEffort(
 		electrumNetwork: EElectrumNetworks
 	): void {
-		this.restoreSubscriptions(electrumNetwork).then(
-			() => {
-				if (this._restoreOwed === electrumNetwork) {
-					this._restoreOwed = null;
-				}
-			},
-			() => {
-				// A restore that failed because the instance disconnected owes
-				// nothing: disconnect() cleared the debt, its retry hook is
-				// stopped, and the next connect restores unconditionally.
-				if (this._disconnected) return;
-				this._restoreOwed = electrumNetwork;
-			}
+		restoresInFlight.set(
+			electrumNetwork,
+			(restoresInFlight.get(electrumNetwork) ?? 0) + 1
 		);
+		this.restoreSubscriptions(electrumNetwork)
+			.then(
+				() => {
+					if (this._restoreOwed === electrumNetwork) {
+						this._restoreOwed = null;
+					}
+					// Every hash in the shared router and the header
+					// subscription were re-issued on the one client the network
+					// has, whichever instance ran it.
+					subscriptionRestoreOwed.delete(electrumNetwork);
+				},
+				() => {
+					// Recorded before the disconnect check: the hashes left
+					// unwired are the shared router's, so an instance that walks
+					// away mid-restore leaves the debt behind rather than taking
+					// it with it.
+					subscriptionRestoreOwed.add(electrumNetwork);
+					// A restore that failed because THIS instance disconnected
+					// owes nothing of its OWN: disconnect() cleared that field,
+					// its retry hook is stopped, and the next connect restores
+					// unconditionally.
+					if (this._disconnected) return;
+					this._restoreOwed = electrumNetwork;
+				}
+			)
+			.finally(() => {
+				const left = (restoresInFlight.get(electrumNetwork) ?? 1) - 1;
+				if (left > 0) restoresInFlight.set(electrumNetwork, left);
+				else restoresInFlight.delete(electrumNetwork);
+			});
 	}
 
 	/**
@@ -731,15 +899,52 @@ export class Electrum {
 		});
 	}
 
-	private recordServerSuccess(server: TServer): void {
-		this._serverFailures.delete(this.serverKey(server));
-		if (
-			this._currentServer &&
-			this.serverKey(this._currentServer) !== this.serverKey(server)
-		) {
+	private recordServerSuccess(
+		server: TServer,
+		electrumNetwork: EElectrumNetworks
+	): void {
+		const key = this.serverKey(server);
+		this._serverFailures.delete(key);
+		if (this._currentServer && this.serverKey(this._currentServer) !== key) {
 			this._rotationCount++;
 		}
 		this._currentServer = server;
+		// Taken here rather than from this.electrumNetwork, which a network
+		// switch only adopts further down _doConnect.
+		this.holdConnectedServer(electrumNetwork, key);
+	}
+
+	/**
+	 * Records that this instance holds `serverKey` on `network`, releasing
+	 * whatever it held before. Refcounted by instance, because isOurPeer asks
+	 * whether ANY instance in this process chose the connected peer.
+	 */
+	private holdConnectedServer(
+		network: EElectrumNetworks | null,
+		serverKey: string | null
+	): void {
+		if (this._heldServer) {
+			const { network: held, key } = this._heldServer;
+			const holders = connectedServers.get(held)?.get(key);
+			holders?.delete(this);
+			if (holders && holders.size === 0) {
+				connectedServers.get(held)?.delete(key);
+			}
+			this._heldServer = null;
+		}
+		if (!network || !serverKey) return;
+		let byKey = connectedServers.get(network);
+		if (!byKey) {
+			byKey = new Map();
+			connectedServers.set(network, byKey);
+		}
+		let holders = byKey.get(serverKey);
+		if (!holders) {
+			holders = new Set();
+			byKey.set(serverKey, holders);
+		}
+		holders.add(this);
+		this._heldServer = { network, key: serverKey };
 	}
 
 	/** The server of the most recent successful connect, if any. */
@@ -753,8 +958,36 @@ export class Electrum {
 	}
 
 	async isConnected(): Promise<boolean> {
+		// Guarded for the reason checkConnection is: a ping with no client for
+		// the network dials a random peers.json server rather than answering
+		// false, so a bare ping both lies and connects.
+		if (!this.isOurPeer()) return false;
 		const { error } = await electrum.pingServer();
 		return !error;
+	}
+
+	/**
+	 * Whether the client this process holds for our network is the one this
+	 * instance connected.
+	 *
+	 * rn-electrum-client's helpers dial a random peers.json server whenever
+	 * clients.mainClient[network] is falsy (pingServer, subscribeAddress,
+	 * getAddressScriptHashBalance and the rest all do it), and
+	 * disconnectFromPeer clears clients.peers[network] on the way out, so the
+	 * fallback list is the hardcoded one. After a failover where every
+	 * candidate failed, or after any instance's disconnect, the next ping would
+	 * silently connect to a default peer and the health check would report a
+	 * live connection forever with zero script hashes subscribed to it.
+	 */
+	private isOurPeer(): boolean {
+		const peer = electrum.getConnectedPeer(this.electrumNetwork);
+		if (!peer?.host) return false;
+		const key = `${peer.host}|${peer.protocol}|${peer.port}`;
+		// Any instance in this process, not only this one: there is a single
+		// client per network, so a sibling may have moved it to a server from
+		// its own list, and that client is still the one carrying the shared
+		// router's subscriptions. Only a peer nobody here chose is a stray dial.
+		return isConnectedServer(this.electrumNetwork, key);
 	}
 
 	/**
@@ -2052,12 +2285,36 @@ export class Electrum {
 	 * @returns {Promise<void>}
 	 */
 	private async checkConnection(): Promise<void> {
+		// disconnect() stops the poll, but the tick it was already inside is
+		// not cancelled, and pinging a stopped client is itself a reconnect:
+		// with mainClient cleared, the helper dials a random peers.json server.
+		if (this._disconnected) return;
 		try {
-			const { error } = await electrum.pingServer();
+			// Never pinged blind. Every rn-electrum-client helper calls
+			// connectToRandomPeer when clients.mainClient[network] is falsy, so
+			// a bare ping can CREATE a connection nobody asked for, to a
+			// hardcoded peers.json server, on a socket carrying none of this
+			// process's subscriptions. The healthy branch would then report a
+			// live connection forever with nothing subscribed to it. A peer
+			// that is not the one this instance connected reads as a lost
+			// connection, and the reconnect below is the repair: it tears the
+			// foreign peer down and restores every subscription the network
+			// holds.
+			const ours = this.isOurPeer();
+			const { error } = ours ? await electrum.pingServer() : { error: true };
+			// A disconnect that landed while the ping was in flight has already
+			// withdrawn this instance. Nothing past here may run for it:
+			// connectToElectrum clears _disconnected for an EXPLICIT revive, so
+			// reconnecting from a poll would put the stopped wallet back on the
+			// network, and publishing would speak for a wallet that is shutting
+			// down (disconnect() deliberately publishes nothing itself).
+			if (this._disconnected) return;
 
 			if (error) {
 				this.wallet.logger.info(
-					'Connection to Electrum Server lost, reconnecting...'
+					ours
+						? 'Connection to Electrum Server lost, reconnecting...'
+						: 'Electrum peer changed behind us, reconnecting...'
 				);
 				// A successful connect re-subscribes every script hash this
 				// process holds and re-issues the header subscription itself, so
@@ -2073,13 +2330,28 @@ export class Electrum {
 			} else {
 				this.publishConnectionChange(true);
 				// The socket is fine, so no reconnect will run the restore a
-				// previous connect left owed. This is its only other retry hook.
-				if (this._restoreOwed === this.electrumNetwork && !this._disconnected) {
+				// previous connect left owed. This is its only other retry hook,
+				// and it answers for the NETWORK as well as for this instance:
+				// the client is shared, so the instance whose restore failed may
+				// have disconnected or moved on while the hashes it left unwired
+				// are still in the shared router. One restore at a time, because
+				// every instance on the network is now a retry candidate.
+				const owed =
+					this._restoreOwed === this.electrumNetwork ||
+					subscriptionRestoreOwed.has(this.electrumNetwork);
+				if (
+					owed &&
+					!this._disconnected &&
+					!restoresInFlight.has(this.electrumNetwork)
+				) {
 					this.restoreSubscriptionsBestEffort(this.electrumNetwork);
 				}
 			}
 		} catch (e) {
 			this.wallet.logger.error('Electrum connection check failed.', e);
+			// A rejection that raced the shutdown must not publish for a
+			// withdrawn instance either.
+			if (this._disconnected) return;
 			this.publishConnectionChange(false);
 		}
 	}
@@ -2099,16 +2371,16 @@ export class Electrum {
 		this.latestConnectionState = isConnected;
 	}
 
-	public async disconnect(): Promise<void> {
-		this.stopConnectionPolling();
-		// Withdraw from the shared routers: a notification routed after this
-		// point must not refresh or call back into a wallet that is shutting
-		// down. The flag keeps work still in flight (a subscription restore
-		// mid-await) from quietly registering the instance back.
-		this._disconnected = true;
-		// The debt goes with the instance: the next connect restores
-		// unconditionally anyway, and the poll that would retry it is stopped.
-		this._restoreOwed = null;
+	/**
+	 * Removes this instance from every shared per-network router.
+	 *
+	 * Shared by disconnect() and the network switch in _doConnect: a router
+	 * entry only ever belongs to the network the instance was on when it
+	 * registered, and both _onNewBlock and _scriptHashRecord resolve their
+	 * router from this.electrumNetwork, so an entry left behind on a network
+	 * the instance has left is answered by the wrong router.
+	 */
+	private withdrawFromRouters(): void {
 		for (const router of headerRouters.values()) {
 			router.handlers.delete(this);
 		}
@@ -2128,7 +2400,31 @@ export class Electrum {
 				}
 			}
 		}
-		await electrum.stop();
+	}
+
+	public async disconnect(): Promise<void> {
+		this.stopConnectionPolling();
+		// Withdraw from the shared routers: a notification routed after this
+		// point must not refresh or call back into a wallet that is shutting
+		// down. The flag keeps work still in flight (a subscription restore
+		// mid-await) from quietly registering the instance back.
+		this._disconnected = true;
+		// This instance no longer vouches for the server it was on, so a peer
+		// left behind on it reads as a stray dial to whoever is still polling.
+		this.holdConnectedServer(null, null);
+		// This instance's own debt goes with it: the next connect restores
+		// unconditionally anyway, and the poll that would retry it is stopped.
+		// The NETWORK's debt in subscriptionRestoreOwed deliberately stays: the
+		// hashes it names belong to the shared router, so whichever instance is
+		// still polling this network is the one that discharges them.
+		this._restoreOwed = null;
+		this.withdrawFromRouters();
+		// Named, because the client resolves a missing network from
+		// clients.network, which is whatever network connected LAST by any
+		// instance in this process: a bare stop() tears down a sibling's socket
+		// on another network, along with every subscription that network holds,
+		// and leaves this instance's own client running with nothing polling it.
+		await electrum.stop({ network: this.electrumNetwork });
 	}
 
 	public startConnectionPolling(): void {
