@@ -227,8 +227,17 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 				// Lightweight ping: attempt to subscribe to header (no-op if already
 				// subscribed). Wrapped in the call timeout — a hanging server (e.g.
 				// Fulcrum mid-restart) must not stall the monitor itself.
+				//
+				// pingHeaderSubscription rather than subscribeToHeader: a
+				// reconciliation the reported header could not complete is left
+				// out of the subscription result (it is not a subscription
+				// fault, and ChainWatcher.start refuses work without one), but
+				// the history RPCs behind it are this server's. A server that
+				// answers blockchain.headers.subscribe while failing those
+				// batches is precisely what this monitor exists to rotate away
+				// from, and in the daemon it is the only path to a second one.
 				const result = await this.withTimeout(
-					this.electrum.subscribeToHeader(),
+					this.electrum.pingHeaderSubscription(),
 					'reconnectMonitorPing'
 				);
 				if (result.isErr()) {

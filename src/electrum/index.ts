@@ -109,6 +109,9 @@ type THeaderRouter = {
 	 *  the fresher word from the same socket, and writing the response on top of
 	 *  it would lower the stored height and read the next block as a rollback. */
 	seq: number;
+	/** The notification payload this dispatcher last accepted, compared by
+	 *  identity to swallow a duplicate registration: see the dispatch. */
+	lastDispatched: unknown;
 };
 
 /**
@@ -122,6 +125,47 @@ type THeaderRouter = {
  */
 const headerRouters: Map<EElectrumNetworks, THeaderRouter> = new Map();
 
+/**
+ * Per-network gate over blockchain.headers.subscribe.
+ *
+ * rn-electrum-client registers the notification listener on the client's
+ * shared emitter BEFORE the awaited request and only sets
+ * clients.subscribedHeaders[network] AFTER it returns, so two subscribes that
+ * overlap that window both pass its "Already Subscribed." guard and both
+ * append the router's dispatcher to the same EventEmitter. Every later
+ * notification then runs the whole router queue twice for the life of that
+ * client: two header writes, two wallet refreshes and two newBlock messages
+ * per block, per instance. Three overlapping calls triple it. That overlap is
+ * the normal case rather than an exotic one, because restoreSubscriptions
+ * issues one after every successful connect while an ElectrumBackend reconnect
+ * monitor (or application code) can issue another at the same moment.
+ *
+ * Module level for the same reason the routers are: the state being protected
+ * belongs to the client, and the client is process-wide, so two different
+ * Electrum instances racing on one network is exactly the case to cover.
+ *
+ * Serialised rather than de-duplicated. The caller behind the gate still
+ * issues its OWN subscribe, so a restore that runs after a client was torn
+ * down and rebuilt wires the new client instead of inheriting an answer from
+ * the old one; it simply finds the network already subscribed and is answered
+ * "Already Subscribed." without a second listener.
+ */
+const headerSubscribeGates: Map<EElectrumNetworks, Promise<void>> = new Map();
+
+/**
+ * How long a subscribe may hold the gate before the next caller stops waiting
+ * for it.
+ *
+ * The gate must be bounded, because the attempt behind it is not: the client
+ * falls into connectToRandomPeer when a network has no client, and the
+ * server_version handshake in there carries no timeout of its own, on a socket
+ * whose timeout it disables. One server that accepts the connection and then
+ * says nothing would otherwise wedge every later subscribe on that network for
+ * as long as the process lives. Well above the client's own 10s request
+ * timeouts, so an attempt that is merely slow is still waited for.
+ */
+const HEADER_SUBSCRIBE_GATE_MS = 30_000;
+
 function getHeaderRouter(network: EElectrumNetworks): THeaderRouter {
 	let router = headerRouters.get(network);
 	if (!router) {
@@ -129,23 +173,56 @@ function getHeaderRouter(network: EElectrumNetworks): THeaderRouter {
 			handlers: new Map(),
 			last: null,
 			seq: 0,
+			lastDispatched: null,
 			dispatch: async (data: INewBlock[]): Promise<void> => {
+				// One notification, dispatched once, however many times the
+				// client holds this dispatcher.
+				//
+				// rn-electrum-client appends it to the client's emitter once
+				// per subscribe that gets past its "Already Subscribed." guard,
+				// and it sets that guard only AFTER the awaited request: two
+				// subscribes that overlap the window both register, and a
+				// subscribe that FAILS leaves its registration behind with the
+				// network still marked unsubscribed, so the next one registers
+				// on top of it. Serialising the requests (see
+				// headerSubscribeGates) closes the overlap but not the retry.
+				//
+				// The emitter hands every listener the identical payload object
+				// for one notification, while a genuine second notification is
+				// always a freshly parsed one, so identity is what tells a
+				// duplicate registration apart from a repeated block.
+				if (created.lastDispatched === data) return;
+				created.lastDispatched = data;
 				// The instances are snapshotted so a handler may withdraw itself
 				// or a sibling mid-dispatch, but each handler is read at the
-				// moment it is called rather than taken from that snapshot: the
-				// handler ahead of it in the queue can await for as long as a
-				// wallet refresh takes, and an instance that disconnects in the
-				// meantime must not be refreshed by a header it is merely still
-				// queued for.
-				for (const instance of [...created.handlers.keys()]) {
-					const handler = created.handlers.get(instance);
-					if (!handler) continue;
-					try {
-						await handler(data);
-					} catch {
-						// One instance must not starve the rest.
-					}
-				}
+				// moment it is called rather than taken from that snapshot: an
+				// instance that disconnects while this dispatch is in flight
+				// must not be refreshed by a header it is merely still
+				// registered for.
+				//
+				// Dispatched concurrently rather than one wallet at a time. The
+				// handler awaits caller-supplied storage and a whole wallet
+				// refresh, neither of which this library can bound, and a
+				// wallet whose updateHeader never settles used to park every
+				// instance behind it in the map, for that block and for every
+				// block after it: the catch below only ever covered a
+				// rejection, never a promise that does not settle. The client
+				// emits notifications without awaiting this handler, so
+				// per-instance handling could already overlap across blocks and
+				// nothing here relied on the order.
+				await Promise.all(
+					[...created.handlers.keys()].map(async (instance) => {
+						const handler = created.handlers.get(instance);
+						if (!handler) return;
+						try {
+							await handler(data);
+						} catch {
+							// One instance must not starve the rest. Kept inside
+							// the callback, so a rejection neither short-circuits
+							// Promise.all nor escapes it unhandled.
+						}
+					})
+				);
 			}
 		};
 		router = created;
@@ -239,6 +316,11 @@ export class Electrum {
 	 *  evidence of it, so a reconciliation that fails is owed here and every
 	 *  later header retries it until one succeeds. */
 	private _reorgOwed = false;
+	/** Set when a server answered with the stored tip's own parent, which says
+	 *  it does not hold that tip. Until something confirms the tip again, a
+	 *  header that arrives too far away to be compared is read as a rollback
+	 *  rather than as growth: see applyHeader. */
+	private _tipUnverified = false;
 
 	public servers?: TServer | TServer[];
 	public network: EAvailableNetworks;
@@ -515,8 +597,11 @@ export class Electrum {
 		// one. Started before the hashes and awaited after them, so neither
 		// failure defers the other, and settled the moment it is started, so a
 		// rejection is never left unhandled when the hashes fail first.
-		const headerFailed = this.subscribeToHeader().then(
-			(result) => result.isErr(),
+		// The internal form, because the restore is the one caller that may read
+		// a failed reconciliation: it is what retries it. Every other caller
+		// sees only whether the subscription itself is live.
+		const headerFailed = this.subscribeToHeaderInternal().then(
+			({ result, reconcileOwed }) => result.isErr() || reconcileOwed,
 			() => true
 		);
 		const router = scriptHashRouters.get(electrumNetwork);
@@ -546,7 +631,10 @@ export class Electrum {
 		// rather than a rejection, so nothing outside the restore would ever
 		// notice one, and the socket it failed on can stay healthy
 		// indefinitely: without the debt below the wallet would receive no
-		// header notification until the next reconnect.
+		// header notification until the next reconnect. The debt also covers a
+		// reconciliation the reported header revealed and could not complete,
+		// which is deliberately invisible to every other caller: the
+		// subscription is live, and the retry is this one's job.
 		if (await headerFailed) {
 			throw new Error('Unable to restore the header subscription.');
 		}
@@ -1271,6 +1359,41 @@ export class Electrum {
 	}
 
 	/**
+	 * Block id of the PARENT recorded inside an 80 byte header hex, or '' when
+	 * there is no hex or it does not parse. Every header carries its parent, so
+	 * whether one block builds on another is answerable from what is already in
+	 * hand, with no round trip to a server.
+	 */
+	private getPrevBlockHash(blockHex?: string): string {
+		if (!blockHex) return '';
+		try {
+			const { prevHash } = Block.fromHex(blockHex);
+			if (!prevHash) return '';
+			// Internal byte order on the wire, display order everywhere the
+			// wallet compares hashes.
+			return Buffer.from(prevHash).reverse().toString('hex');
+		} catch {
+			return '';
+		}
+	}
+
+	/**
+	 * Block id of an 80 byte header hex, or '' when there is no hex or it does
+	 * not parse. getBlockHashFromHex is the public form and throws on a hex it
+	 * cannot read, which is fine for a caller handing it a header a server just
+	 * sent; this one is for reading back STORAGE, where a short or corrupt hex
+	 * must not become an exception on every block.
+	 */
+	private getBlockHashOf(blockHex?: string): string {
+		if (!blockHex) return '';
+		try {
+			return Block.fromHex(blockHex).getId();
+		} catch {
+			return '';
+		}
+	}
+
+	/**
 	 * Returns transactions associated with the provided transaction hashes.
 	 * @param {ITxHash[]} txHashes
 	 * @return {Promise<Result<IGetTransactionsFromInputs>>}
@@ -1336,10 +1459,89 @@ export class Electrum {
 	 * growth, so a chain that rolled back while this process was away, or
 	 * while it was talking to a server that has since been swapped out, is
 	 * never reconciled at all.
+	 *
+	 * The height alone does not settle it, and the hash is right there in the
+	 * header. A tip REPLACED at the same height is a rollback although the
+	 * chain never got shorter: the block this wallet's transactions were
+	 * confirmed in is gone. A chain that rolled back and rebuilt taller while
+	 * the process was away arrives ABOVE the stored tip and read as ordinary
+	 * growth. And a server one block behind, which is what a failover normally
+	 * lands on, read as a rollback and fired a 'reorg' message at every wallet
+	 * on the network. Every header carries its parent, so the three are told
+	 * apart from what is already in hand.
 	 */
-	private async applyHeader(header: IHeader): Promise<Result<string>> {
+	private async applyHeader(
+		header: IHeader,
+		/** Whether this header is a server's answer about its CURRENT tip (a
+		 *  subscribe response) rather than a notification that its tip just
+		 *  changed. The two mean different things one block below the stored
+		 *  tip: see the parent case below. */
+		reported = false
+	): Promise<Result<string>> {
 		const stored = this.getBlockHeader();
-		const reorgDetected = this._reorgOwed || header.height < stored.height;
+		// A fresh wallet's header is { height: 0, hash: '', hex: '' } and older
+		// storage may carry a hex with no hash, so the hash is derived when it
+		// has to be. Derived through the same guarded read the parent link uses,
+		// because a stored hex too short or too malformed to parse would
+		// otherwise throw out of here, wedging this wallet on every block and
+		// aborting the fan-out to the rest. With nothing to compare against,
+		// the height-only reading this always had is kept.
+		const storedHash = stored.hash || this.getBlockHashOf(stored.hex);
+		let reorgDetected = this._reorgOwed || header.height < stored.height;
+		if (!this._reorgOwed && storedHash && stored.height) {
+			if (header.height === stored.height) {
+				// A different block at the stored height: the stored one was
+				// orphaned, and writing this one on top is what spends the
+				// evidence.
+				reorgDetected = header.hash !== storedHash;
+				// The same block: a server holds the stored tip after all.
+				if (!reorgDetected) this._tipUnverified = false;
+			} else if (header.height === stored.height + 1) {
+				// The ordinary block-by-block case, and the only hot one. A
+				// successor that does not build on the stored tip means the
+				// stored tip is gone, however much taller the chain now is.
+				reorgDetected = this.getPrevBlockHash(header.hex) !== storedHash;
+				// A block built on it is the same confirmation.
+				if (!reorgDetected) this._tipUnverified = false;
+			} else if (
+				reported &&
+				header.height === stored.height - 1 &&
+				this.getPrevBlockHash(stored.hex) === header.hash
+			) {
+				// Exactly the stored tip's parent, on this very chain, and
+				// REPORTED rather than notified: the server is answering with
+				// the tip it currently holds, and after a failover that is
+				// commonly a server one block behind. It holds no block at the
+				// stored height and so has nothing to say about it. Not stored
+				// either: lowering the tip would spend the evidence of a
+				// rollback that orphaned it.
+				//
+				// A NOTIFICATION at the same height means something else
+				// entirely, which is why this is gated. The client only
+				// notifies when the server's tip CHANGES, so a server that
+				// announces the parent of the block this wallet holds is
+				// telling it that block was undone. That one keeps the reading
+				// it always had, below.
+				//
+				// Remembered, though: a server that answers with this tip's
+				// parent is saying it does not hold the tip. If the next header
+				// this wallet applies lands close enough to be compared, that
+				// settles it either way. If it lands further out, the gap rule
+				// below would read it as growth and the rollback would be lost
+				// for good, so an unconfirmed tip makes that case a rollback.
+				this._tipUnverified = true;
+				return ok('Header below the stored tip ignored.');
+			} else if (this._tipUnverified) {
+				// Too far away to compare, on a tip a server has already
+				// declined to confirm. Reconciling a chain that was fine costs
+				// a reorg message with nothing in it; reading a rollback as
+				// growth loses it permanently.
+				reorgDetected = true;
+			}
+			// Otherwise a gap of more than one block in either direction is left
+			// with the height-only reading: the wallet stores one tip, so it
+			// holds no evidence about the blocks in between.
+		}
 		// The header this wallet already holds, with nothing owed on it: the
 		// tip is re-applied on every subscribe, and the reconnect monitor makes
 		// one of those a poll, so this is the common case rather than the rare
@@ -1347,17 +1549,21 @@ export class Electrum {
 		if (
 			!reorgDetected &&
 			header.height === stored.height &&
-			header.hash === stored.hash
+			header.hash === storedHash
 		) {
 			return ok('Header already stored.');
 		}
+		// Owed before the WRITE, not after it, for the same reason the
+		// comparison above exists: Wallet.updateHeader replaces the in-memory
+		// header before it awaits storage, so a write that rejects has already
+		// replaced the height the rollback was read from. The debt has to
+		// outlive the write as well as the reconciliation, and be retried by
+		// the next header rather than forgotten.
+		if (reorgDetected) this._reorgOwed = true;
 		await this._wallet.updateHeader(header);
+		// The tip this doubt was about has been replaced.
+		this._tipUnverified = false;
 		if (!reorgDetected) return ok('Header stored.');
-		// Owed before the attempt, for the same reason the comparison above
-		// exists: the write has already replaced the height the rollback was
-		// read from, so a reconciliation that fails has to be retried by the
-		// next header rather than forgotten.
-		this._reorgOwed = true;
 		const reconciled = await this._wallet.checkUnconfirmedTransactions(true);
 		if (reconciled.isErr()) return err(reconciled.error.message);
 		this._reorgOwed = false;
@@ -1376,8 +1582,16 @@ export class Electrum {
 	 * that rolled back, with the notification that follows too high to reveal
 	 * it, which is the same bug the reconnect one had.
 	 */
-	private async applyReportedHeader(header: IHeader): Promise<Result<string>> {
-		const router = getHeaderRouter(this.electrumNetwork);
+	private async applyReportedHeader(
+		header: IHeader,
+		/** The network the subscribe was ISSUED on, captured before its await.
+		 *  Not re-read from this.electrumNetwork, which a network change may
+		 *  have moved in the meantime: the old network's tip would then be
+		 *  written into the new network's router and fanned out to every wallet
+		 *  on it, where the height gap reads as an enormous rollback. */
+		electrumNetwork: EElectrumNetworks
+	): Promise<Result<string>> {
+		const router = getHeaderRouter(electrumNetwork);
 		router.last = header;
 		router.seq++;
 		let failure = '';
@@ -1386,11 +1600,17 @@ export class Electrum {
 			// an instance that withdrew while a wallet ahead of it was writing
 			// must not have a header applied to it after all.
 			if (!router.handlers.has(instance)) continue;
-			const applied = await instance.applyHeader(header);
 			// Reported, so the caller keeps the restore owed and retries, which
 			// is what re-drives the reconciliation for every wallet here. One
-			// failing wallet must not stop the rest from being reconciled.
-			if (applied.isErr()) failure = applied.error.message;
+			// failing wallet must not stop the rest from being reconciled, and
+			// a wallet whose storage THROWS rather than answering an error must
+			// not either, which is what the catch is for.
+			try {
+				const applied = await instance.applyHeader(header, true);
+				if (applied.isErr()) failure = applied.error.message;
+			} catch (e) {
+				failure = e instanceof Error ? e.message : String(e);
+			}
 		}
 		return failure ? err(failure) : ok('Header applied.');
 	}
@@ -1413,6 +1633,13 @@ export class Electrum {
 		// A failed reconciliation is owed inside applyHeader and retried by the
 		// next header, so there is nothing for a notification to report.
 		await this.applyHeader(header);
+		// The dispatch no longer runs the instances one at a time, so the
+		// withdrawal it used to honour by re-reading the map before each call
+		// is honoured here instead: disconnect() may have landed while the
+		// header write above was in flight, and a wallet that has stopped must
+		// not be refreshed or called back into. Checked after applyHeader, so a
+		// reconciliation this instance owes is still recorded in _reorgOwed.
+		if (this._disconnected) return;
 		await this._wallet.refreshWallet();
 		this.onReceive?.(data);
 		this.sendMessage(onMessageKeys.newBlock, data[0]);
@@ -1423,11 +1650,55 @@ export class Electrum {
 	 * @return {Promise<Result<string>>}
 	 */
 	public async subscribeToHeader(): Promise<Result<IHeader>> {
+		return (await this.subscribeToHeaderInternal()).result;
+	}
+
+	/**
+	 * The same subscribe, answered as a liveness check on the SERVER rather
+	 * than on the subscription.
+	 *
+	 * A failed reconciliation is left out of the subscription result on
+	 * purpose: the subscription is registered, wired and answering, and a
+	 * caller that only needs headers (ChainWatcher, which refuses to accept
+	 * work at all without one) must not be told otherwise. But the RPCs the
+	 * reconciliation runs are the same server's, and a server that serves
+	 * blockchain.headers.subscribe while failing the history batches behind
+	 * checkUnconfirmedTransactions is exactly what a reconnect monitor exists
+	 * to rotate away from. So the monitor asks with this instead, and gets the
+	 * debt as the failure it is for that question.
+	 */
+	public async pingHeaderSubscription(): Promise<Result<IHeader>> {
+		const { result, reconcileOwed } = await this.subscribeToHeaderInternal();
+		if (result.isErr() || !reconcileOwed) return result;
+		return err('Unable to reconcile the header this server reported.');
+	}
+
+	/**
+	 * The subscribe itself, with the reconciliation debt reported apart from
+	 * the subscription result.
+	 *
+	 * A reconciliation that failed is wallet data debt on a subscription that
+	 * is registered, wired and answering, and only the restore may read it: it
+	 * is the one caller that retries it. Reported as a subscribe failure, it
+	 * told ElectrumBackend's reconnect monitor to count a ping failure, three
+	 * of which fail the server over although the debt is not the server's, and
+	 * told ChainWatcher.start it had no header subscription, so the watcher
+	 * refused to accept work at all. It is another wallet's debt as often as
+	 * this one's: applyReportedHeader reports whichever instance on the
+	 * network failed.
+	 */
+	private async subscribeToHeaderInternal(): Promise<{
+		result: Result<IHeader>;
+		reconcileOwed: boolean;
+	}> {
 		// disconnect() withdrew this instance from the shared header router, and
 		// a caller that outlived it (an ElectrumBackend reconnect monitor still
 		// ticking after wallet.stop()) must not put it back: _onNewBlock would
-		// then refresh a wallet that has shut down.
-		if (this._disconnected) return err(DISCONNECTED_ERROR);
+		// then refresh a wallet that has shut down. A stopped instance owes
+		// nothing either: disconnect() cleared the restore debt.
+		if (this._disconnected) {
+			return { result: err(DISCONNECTED_ERROR), reconcileOwed: false };
+		}
 		const electrumNetwork = this.electrumNetwork;
 		const router = getHeaderRouter(electrumNetwork);
 		// Registered before the call, and left registered on "Already
@@ -1443,23 +1714,71 @@ export class Electrum {
 		// must not withdraw it.
 		if (router.handlers.has(this)) state.committed = true;
 		router.handlers.set(this, this._onNewBlock);
-		// Read before the request goes out, so the response below can be told
-		// apart from a header that overtook it: see THeaderRouter.seq.
-		const seenAt = router.seq;
-		state.inFlight++;
-		let subscribeResponse: ISubscribeToHeader;
-		try {
-			subscribeResponse = await electrum.subscribeHeader({
+		// Read when the request actually goes out, not when this caller queued
+		// behind another one, so the response below can be told apart from a
+		// header that overtook it: see THeaderRouter.seq.
+		let seenAt = router.seq;
+		const run = async (): Promise<ISubscribeToHeader> => {
+			// Re-checked here, not only on the way in: this caller can sit
+			// queued behind another subscribe for as long as that one takes,
+			// and a disconnect can land in the meantime. Issuing the request
+			// then would dial from a stopped instance, because the client falls
+			// into connectToRandomPeer whenever the network it is asked about
+			// has no client, and disconnect() is exactly what leaves it with
+			// none.
+			if (this._disconnected) {
+				return {
+					error: true,
+					data: DISCONNECTED_ERROR
+				} as unknown as ISubscribeToHeader;
+			}
+			seenAt = router.seq;
+			return electrum.subscribeHeader({
 				network: electrumNetwork,
 				onReceive: router.dispatch
 			});
+		};
+		// Queued behind whatever subscribe this network already has in flight,
+		// settled or thrown: see headerSubscribeGates. A failed predecessor
+		// leaves the network unsubscribed, and the caller behind it is the one
+		// that re-issues the request.
+		const previous = headerSubscribeGates.get(electrumNetwork);
+		const attempt = previous ? previous.then(run, run) : run();
+		// Bounded on purpose: see HEADER_SUBSCRIBE_GATE_MS. The caller still
+		// awaits the attempt itself, and its own timeout is its own business;
+		// what must not hang is the next subscribe on this network.
+		const gate = Promise.race([
+			attempt.then(
+				() => undefined,
+				() => undefined
+			),
+			new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, HEADER_SUBSCRIBE_GATE_MS);
+				if (timer.unref) timer.unref();
+			})
+		]);
+		headerSubscribeGates.set(electrumNetwork, gate);
+		void gate.then(() => {
+			if (headerSubscribeGates.get(electrumNetwork) === gate) {
+				headerSubscribeGates.delete(electrumNetwork);
+			}
+		});
+		// Counted around the wait as a whole, the queued part included, so a
+		// caller still waiting its turn keeps a failing sibling from rolling
+		// back the handler it is about to rely on.
+		state.inFlight++;
+		let subscribeResponse: ISubscribeToHeader;
+		try {
+			subscribeResponse = await attempt;
 		} finally {
 			state.inFlight--;
 		}
 		// Checked again: a disconnect that landed while the subscribe was in
 		// flight already withdrew the handler registered above, so it stays
 		// withdrawn and the header stays out of a stopped wallet.
-		if (this._disconnected) return err(DISCONNECTED_ERROR);
+		if (this._disconnected) {
+			return { result: err(DISCONNECTED_ERROR), reconcileOwed: false };
+		}
 		if (subscribeResponse.error) {
 			// Rolled back only when this attempt is the last word: a concurrent
 			// call that already succeeded, or one still in flight, owns the
@@ -1467,7 +1786,13 @@ export class Electrum {
 			if (!state.committed && state.inFlight === 0) {
 				router.handlers.delete(this);
 			}
-			return err('Unable to subscribe to headers.');
+			// A real subscription fault, which every caller must see: this is
+			// what the reconnect monitor counts and what ChainWatcher.start
+			// refuses to start without.
+			return {
+				result: err('Unable to subscribe to headers.'),
+				reconcileOwed: false
+			};
 		}
 		state.committed = true;
 		// eslint-disable-next-line @typescript-eslint/ban-ts-comment
@@ -1481,10 +1806,16 @@ export class Electrum {
 			// restore retries with, and a reconciliation that failed the first
 			// time is owed by whichever wallets it failed for.
 			if (router.last) {
-				const applied = await this.applyReportedHeader(router.last);
-				if (applied.isErr()) return err(applied.error.message);
+				const applied = await this.applyReportedHeader(
+					router.last,
+					electrumNetwork
+				);
+				return {
+					result: ok(this.getBlockHeader()),
+					reconcileOwed: applied.isErr()
+				};
 			}
-			return ok(this.getBlockHeader());
+			return { result: ok(this.getBlockHeader()), reconcileOwed: false };
 		}
 		// Update local storage with current height and hex. Reconciled rather
 		// than written, because a subscribe is exactly where a rollback shows
@@ -1499,12 +1830,17 @@ export class Electrum {
 		// applied and reconciled. Writing this one on top of it would lower the
 		// stored height and turn the next block into a rollback that never
 		// happened.
-		if (router.seq !== seenAt) return ok(this.getBlockHeader());
-		const applied = await this.applyReportedHeader(header);
+		if (router.seq !== seenAt) {
+			// The notification that overtook this response applied and owes its
+			// own reconciliation through _reorgOwed.
+			return { result: ok(this.getBlockHeader()), reconcileOwed: false };
+		}
+		const applied = await this.applyReportedHeader(header, electrumNetwork);
 		// The restore reads this: a wallet left holding an unreconciled
 		// rollback has not been restored, whatever the subscription itself did.
-		if (applied.isErr()) return err(applied.error.message);
-		return ok(header);
+		// The header is stored either way, because applyHeader writes before it
+		// reconciles, so the subscription answers ok with it.
+		return { result: ok(header), reconcileOwed: applied.isErr() };
 	}
 
 	/**
