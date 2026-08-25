@@ -200,9 +200,9 @@ flows, just-in-time inventory checks, atomic swaps.
 |--------|---------|-------------|
 | `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). `maxFeeSats` caps routing fees. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. |
 | `payInvoiceSafe(bolt11, timeoutMs?, maxFeeSats?, amountSats?)` | `Promise<PaymentInfo>` | Like `payInvoice` but **never throws** — catches all errors and resolves with `status: 'FAILED'` instead. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
-| `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?)` | `{ paymentHash, status: 'PENDING' }` | Fire-and-forget pay. Returns immediately. Poll `getPayment()` for settlement. |
+| `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?)` | `{ paymentHash, status: 'PENDING' \| 'FAILED' }` | Fire-and-forget pay. Returns immediately, `FAILED` when the engine refused the submission outright (an expired invoice, an HTLC the channel would not take). Poll `getPayment()` for settlement. Drain mode and the spending limits are applied at submission, so it can throw `SERVICE_DRAINING` or `SPENDING_LIMIT_EXCEEDED`; the limits use the invoice's own amount whenever it carries one, since that is what gets paid. |
 | `payInvoiceWithRetry(bolt11, opts?)` | `Promise<RetryPaymentResult>` | Pay with exponential backoff retry. `opts: { maxRetries? (3), backoffMs? (2000), maxFeeSats?, amountSats?, metadata? }`. Emits `payment:retry` events. |
-| `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED) |
+| `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until it settles or its claim expires (24h). |
 | `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. |
 | `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment |
 | `setPaymentMetadata(paymentHash, metadata)` | `void` | Attach key-value metadata to an existing payment |
@@ -1794,7 +1794,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels) |
 | POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. |
 | POST | `/invoice/pay-retry` | `{ bolt11, maxRetries?, backoffMs?, maxFeeSats?, amountSats?, metadata? }` | Pay with exponential backoff retry. Returns `RetryPaymentResult` with `attempts`. |
-| POST | `/invoice/pay-async` | `{ bolt11, maxFeeSats?, amountSats?, metadata? }` | Fire-and-forget pay; returns `{ paymentHash, status }` immediately. Poll `GET /payment` for settlement. |
+| POST | `/invoice/pay-async` | `{ bolt11, maxFeeSats?, amountSats?, metadata? }` | Fire-and-forget pay; returns `{ paymentHash, status }` immediately. Poll `GET /payment` for settlement. Answers 409 while draining and 403 over a spending limit. |
 | POST | `/payment/cancel` | `{ paymentHash }` | Cancel a pending outbound payment (marks as FAILED) |
 | POST | `/payment/metadata` | `{ paymentHash, metadata }` | Attach key-value metadata to an existing payment |
 | POST | `/route/estimate` | `{ bolt11, amountSats? }` | Estimate route fee without sending |
