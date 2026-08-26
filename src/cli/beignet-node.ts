@@ -600,6 +600,27 @@ export function spendLimitSats(amountMsat: bigint): number {
 }
 
 /**
+ * The amount an invoice payment has to be admitted and accounted for, in sats.
+ *
+ * The ENCODED amount wins wherever the invoice carries one, because that is
+ * what the engine pays: sendPayment applies the caller's override only to an
+ * amountless invoice. Preferring the override let `amountSats: 1` — or 0, which
+ * skips the checks, the reservation and the accounting entirely — walk a fixed
+ * invoice of any size past both limits (issues #526, #528).
+ *
+ * Zero means there is nothing to admit or record: an amountless invoice with no
+ * usable override, which the engine refuses on its own.
+ */
+export function paymentSpendSats(
+	amountMsat: bigint | undefined,
+	amountSats?: number
+): number {
+	return amountMsat !== undefined
+		? spendLimitSats(amountMsat)
+		: amountSats ?? 0;
+}
+
+/**
  * Decode a user-supplied BOLT 12 offer string. Same contract as
  * decodeInvoiceInput: parse failures become a typed INVALID_OFFER (400).
  */
@@ -5358,11 +5379,12 @@ export class BeignetNode extends EventEmitter {
 			return this._buildValidationResult(checks, decodedInfo);
 		}
 
-		const invoiceAmountSats =
+		// The amount payInvoice would admit and the engine would pay, so the
+		// preview cannot report limits for an amount nobody will spend (#528).
+		const effectiveAmountSats =
 			decoded.amountMsat !== undefined
-				? Number(decoded.amountMsat / 1000n)
-				: undefined;
-		const effectiveAmountSats = amountSats ?? invoiceAmountSats;
+				? spendLimitSats(decoded.amountMsat)
+				: amountSats;
 
 		// 2. Amount specified
 		if (effectiveAmountSats === undefined || effectiveAmountSats <= 0) {
@@ -5561,12 +5583,9 @@ export class BeignetNode extends EventEmitter {
 		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
 
-		// Per-payment and daily spending limit checks
-		const spendAmountSats =
-			amountSats ??
-			(decoded.amountMsat !== undefined
-				? spendLimitSats(decoded.amountMsat)
-				: 0);
+		// Per-payment and daily spending limit checks, applied to what the engine
+		// will actually pay rather than to what the caller asked for (#528).
+		const spendAmountSats = paymentSpendSats(decoded.amountMsat, amountSats);
 		// Converted BEFORE the spend accounting below, not after it. Every
 		// decrement of _pendingSpendSats lives inside the Promise executor
 		// further down, which a RangeError out of BigInt() never reaches: the
@@ -5910,15 +5929,8 @@ export class BeignetNode extends EventEmitter {
 		this._checkDraining();
 		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
-		// The ENCODED amount wins wherever the invoice carries one: the engine
-		// applies amountMsat only to an amountless invoice, so limiting a fixed
-		// invoice by the caller's override would let `amountSats: 1` (or 0,
-		// which skips the checks and the accounting entirely) walk a payment of
-		// any size past both limits.
-		const spendAmountSats =
-			decoded.amountMsat !== undefined
-				? spendLimitSats(decoded.amountMsat)
-				: amountSats ?? 0;
+		// Admitted on what the engine will pay, not on the caller's override.
+		const spendAmountSats = paymentSpendSats(decoded.amountMsat, amountSats);
 		// Converted BEFORE the spend accounting below, for the reason
 		// payInvoice's copy documents: a RangeError out of BigInt() must not
 		// leave the reservation raised for the life of the process (issue #474).

@@ -380,4 +380,47 @@ describe('Payment Intelligence — estimatePayment()', () => {
 		expect(result).to.be.null;
 		node.destroy();
 	});
+
+	it('estimates a fixed invoice at its encoded amount, not the override', () => {
+		const node = createNode(513);
+		const { destPrivkey } = buildChain(node, 2, {
+			feeProportionalMillionths: 10_000 // 1% per hop, so the fee tracks the amount
+		});
+		const invoice = createTestInvoice(destPrivkey, 100_000_000n);
+
+		const encoded = node.estimatePayment(invoice);
+		const overridden = node.estimatePayment(invoice, 1);
+		expect(encoded).to.not.be.null;
+		// sendPayment ignores the override on a fixed invoice, so an estimate
+		// built on it described a payment that would never be made (issue #528).
+		expect(overridden!.estimatedFeeSats).to.equal(encoded!.estimatedFeeSats);
+		expect(encoded!.estimatedFeeSats).to.be.greaterThan(100);
+		node.destroy();
+	});
+
+	it('still uses the override for an amount-less invoice', () => {
+		const node = createNode(514);
+		const { destPrivkey } = buildChain(node, 1);
+		const invoice = createTestInvoice(destPrivkey, undefined);
+
+		const estimate = node.estimatePayment(invoice, 100_000);
+		expect(estimate).to.not.be.null;
+		expect(estimate!.hopCount).to.equal(1);
+		node.destroy();
+	});
+
+	it('estimateRouteFee follows the same precedence', () => {
+		const node = createNode(515);
+		const { destPrivkey } = buildChain(node, 2, {
+			feeProportionalMillionths: 10_000
+		});
+		const invoice = createTestInvoice(destPrivkey, 100_000_000n);
+
+		const encoded = node.estimateRouteFee(invoice);
+		const overridden = node.estimateRouteFee(invoice, 1);
+		expect(encoded).to.not.be.null;
+		expect(overridden!.feeSats).to.equal(encoded!.feeSats);
+		expect(encoded!.feeSats).to.be.greaterThan(100);
+		node.destroy();
+	});
 });

@@ -15830,10 +15830,10 @@ export class LightningNode extends EventEmitter {
 	): { feeSats: number; hops: number; cltvDelta: number } | null {
 		try {
 			const decoded = decodeInvoice(bolt11);
+			// Same precedence sendPayment applies (see estimatePayment).
 			const amountMsat =
-				amountSats !== undefined
-					? BigInt(amountSats) * 1000n
-					: decoded.amountMsat;
+				decoded.amountMsat ??
+				(amountSats !== undefined ? BigInt(amountSats) * 1000n : undefined);
 			if (amountMsat === undefined) return null;
 
 			const destination = decoded.payeeNodeKey || decoded.recoveredPubkey;
@@ -15880,10 +15880,13 @@ export class LightningNode extends EventEmitter {
 	): IPaymentEstimate | null {
 		try {
 			const decoded = decodeInvoice(bolt11);
+			// The precedence sendPayment applies: a fixed invoice is paid for its
+			// ENCODED amount and the override serves an amountless one, so an
+			// estimate built on the override describes a payment that will never
+			// be made (issue #528).
 			const amountMsat =
-				amountSats !== undefined
-					? BigInt(amountSats) * 1000n
-					: decoded.amountMsat;
+				decoded.amountMsat ??
+				(amountSats !== undefined ? BigInt(amountSats) * 1000n : undefined);
 			if (amountMsat === undefined) return null;
 
 			const destination = decoded.payeeNodeKey || decoded.recoveredPubkey;
