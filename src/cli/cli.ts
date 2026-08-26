@@ -54,6 +54,30 @@ function parseRepeatedFlag(name: string): string[] {
 	return out;
 }
 
+// Flags every command accepts (the HTTP plumbing reads them on each request),
+// so they may trail any command's positional arguments.
+const GLOBAL_VALUE_FLAGS = new Set(['--api-key', '--api-token']);
+
+/**
+ * Positional arguments with the global flag/value pairs removed. A command
+ * with an OPTIONAL trailing positional must read it from here, not from
+ * filteredArgs: when the positional is omitted, a raw index read swallows the
+ * first trailing flag token instead (issue #534 review: `channel splice-out
+ * <id> <sats> <feerate> --api-key k` sent the literal string --api-key as the
+ * address).
+ */
+function positionalArgs(): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < filteredArgs.length; i++) {
+		if (GLOBAL_VALUE_FLAGS.has(filteredArgs[i])) {
+			i++; // skip the flag's value too
+			continue;
+		}
+		out.push(filteredArgs[i]);
+	}
+	return out;
+}
+
 // Resolve the bearer credential for HTTP requests: CLI flag, env, or config
 // file. A named scoped key's secret works anywhere the legacy token does
 // (--api-key/BEIGNET_API_KEY are aliases for supplying one explicitly).
@@ -844,14 +868,20 @@ async function handleChannel(): Promise<void> {
 					feeratePerkw: parseInt(filteredArgs[4], 10)
 				})
 			);
-		case 'splice-out':
+		case 'splice-out': {
+			// Optional external destination (issue #534); omitted, the
+			// spliced-out funds go to the wallet. Resolved from the flag-free
+			// positionals so a trailing --api-key never becomes the address.
+			const pos = positionalArgs();
 			return outputResult(
 				await httpRequest('POST', '/channel/splice-out', {
-					channelId: filteredArgs[2],
-					amountSats: parseInt(filteredArgs[3], 10),
-					feeratePerkw: parseInt(filteredArgs[4], 10)
+					channelId: pos[2],
+					amountSats: parseInt(pos[3], 10),
+					feeratePerkw: parseInt(pos[4], 10),
+					...(pos[5] !== undefined ? { address: pos[5] } : {})
 				})
 			);
+		}
 		case 'ensure-minimum':
 			return outputResult(
 				await httpRequest('POST', '/channels/ensure-minimum', {
@@ -2447,7 +2477,9 @@ Channels:
   channel splice-quote <id> <in|out> <feerate>
                                          Quote a splice: fee + max amount
   channel splice-in <id> <sats> <feerate>   Add funds to channel
-  channel splice-out <id> <sats> <feerate>  Withdraw funds from channel
+  channel splice-out <id> <sats> <feerate> [address]
+                                         Withdraw funds from channel, to the
+                                         wallet or an external address
   channel ensure-minimum <count> <sats>  Auto-open channels to minimum count
   channel update-policy <id|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N]
                         [--htlc-min-msat N] [--htlc-max-msat N]

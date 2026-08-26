@@ -2496,7 +2496,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					requestBody: bodyContent({
 						channelId: 'string',
 						amountSats: 'number',
-						feeratePerkw: 'number'
+						feeratePerkw: 'number',
+						// Optional external destination (issue #534): the splice tx
+						// pays this address directly. Omitted, funds go to the wallet.
+						address: 'string?'
 					}),
 					responses: {
 						'200': {
@@ -2507,7 +2510,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'400': {
 							description:
-								'INVALID_PARAMS: malformed channelId, non-integer amount, or a feeratePerkw outside 1..4294967295'
+								'INVALID_PARAMS: malformed channelId, non-integer amount, a feeratePerkw outside 1..4294967295, or an address this network cannot decode'
 						},
 						'404': { description: 'CHANNEL_NOT_FOUND' }
 					}
