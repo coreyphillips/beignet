@@ -35,6 +35,10 @@ import { createWalletStorage } from './wallet-storage';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
 import {
+	estimateSpliceTxWeight,
+	spliceFeeSats
+} from '../lightning/channel/splice-weight';
+import {
 	isPrivateNetworkUrl,
 	l402Fetch,
 	IL402Credential,
@@ -6736,7 +6740,20 @@ export class BeignetNode extends EventEmitter {
 		requirePositiveSafeInteger(amountSats, 'amountSats');
 		requireU32(feeratePerkw, 'feeratePerkw');
 		let destinationScript: Buffer | undefined;
-		if (destinationAddress) {
+		if (destinationAddress !== undefined) {
+			// A provided-but-empty (or non-string) destination is a caller bug,
+			// not a request for the wallet default: a truthy check here let an
+			// empty address fall through and silently pay the wallet instead
+			// (issue #534 review).
+			if (
+				typeof destinationAddress !== 'string' ||
+				destinationAddress.length === 0
+			) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					'destinationAddress must be a non-empty string when provided'
+				);
+			}
 			const bitcoin = require('bitcoinjs-lib');
 			try {
 				destinationScript = bitcoin.address.toOutputScript(
@@ -6754,6 +6771,30 @@ export class BeignetNode extends EventEmitter {
 				);
 			}
 		}
+		// An address-targeted splice-out is an external send: the destination
+		// receives the full amount and the channel additionally pays the
+		// on-chain fee (the engine declares relative = -(amount + fee), same
+		// fee formula as below), so both count against the shared daily
+		// budget, like sendOnchain (issue #534 review). Wallet-credited
+		// splice-outs stay outside the limit: those funds return to our own
+		// wallet. Checked before the engine call (fail fast, like sendOnchain)
+		// and recorded only when the engine accepts the initiation; a splice
+		// that later fails in negotiation holds the budget until the UTC
+		// midnight reset, which errs on the safe side.
+		let externalSpendSats: number | undefined;
+		if (destinationScript !== undefined) {
+			const feeSats = Number(
+				spliceFeeSats(
+					estimateSpliceTxWeight({
+						walletInputCount: 0,
+						destinationScriptLen: destinationScript.length
+					}),
+					feeratePerkw
+				)
+			);
+			externalSpendSats = amountSats + feeSats;
+			this._checkSpendLimit(externalSpendSats);
+		}
 		const result = fundingOrRefuse(() =>
 			this.node.spliceOut(
 				idBuf,
@@ -6762,6 +6803,9 @@ export class BeignetNode extends EventEmitter {
 				destinationScript
 			)
 		);
+		if (externalSpendSats !== undefined && result.ok) {
+			this._recordSpend(externalSpendSats, 'onchain');
+		}
 		// The SCB is refreshed on the splice:complete event (when fundingTxid holds
 		// the new outpoint), NOT here at initiation where it still holds the old one.
 		return result;

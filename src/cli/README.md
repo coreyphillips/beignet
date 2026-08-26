@@ -162,7 +162,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `closeChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error? }` | Cooperative close; a capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
 | `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; a capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
-| `spliceOut(channelId, amountSats, feerate)` | `SpliceResult` | Withdraw funds from channel |
+| `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `dailySpendLimitSats` |
 | `listChannels()` | `ChannelInfo[]` | List all channels |
 | `getChannel(channelId)` | `ChannelInfo \| null` | Get specific channel |
 | `updateChannelFee(channelId, feeratePerKw)` | `{ ok: true }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |

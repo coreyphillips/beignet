@@ -130,6 +130,37 @@ describe('Daemon splice-out address passthrough', function () {
 		expect(error.message).to.include('destinationAddress');
 	});
 
+	it('refuses a provided empty address instead of paying the wallet', async () => {
+		const res = await request(port, {
+			channelId: UNKNOWN_CHANNEL_ID,
+			amountSats: 50_000,
+			feeratePerkw: 2500,
+			address: ''
+		});
+		// Before the guard an empty string failed spliceOut's truthy check and
+		// silently fell back to the wallet destination (issue #534 review):
+		// funds moved, but not where the caller pointed.
+		expect(res.status).to.equal(400);
+		expect(res.body.ok).to.equal(false);
+		const error = res.body.error as { code: string; message: string };
+		expect(error.code).to.equal('INVALID_PARAMS');
+		expect(error.message).to.include('destinationAddress');
+	});
+
+	it('refuses a non-string address', async () => {
+		const res = await request(port, {
+			channelId: UNKNOWN_CHANNEL_ID,
+			amountSats: 50_000,
+			feeratePerkw: 2500,
+			address: 42
+		});
+		expect(res.status).to.equal(400);
+		expect(res.body.ok).to.equal(false);
+		const error = res.body.error as { code: string; message: string };
+		expect(error.code).to.equal('INVALID_PARAMS');
+		expect(error.message).to.include('destinationAddress');
+	});
+
 	it('refuses a mainnet address on a regtest node (network binding)', async () => {
 		const res = await request(port, {
 			channelId: UNKNOWN_CHANNEL_ID,
