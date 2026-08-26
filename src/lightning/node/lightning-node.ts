@@ -1226,7 +1226,19 @@ export class LightningNode extends EventEmitter {
 			// (reusing the offer's message paths advertised fabricated zero
 			// fees, leaving the payment underfunded at the LSP hop).
 			buildHoldPaymentPaths: (pathId: Buffer): IBlindedPaymentPath[] =>
-				this.buildBlindedPaymentPaths(true, 3, pathId)
+				this.buildBlindedPaymentPaths(true, 3, pathId),
+			// Unannounced nodes: invoice payment paths run through a peer with
+			// the peer's true payinfo, so the payer can route to the
+			// introduction node (issue #544). Announced nodes keep the
+			// CLN-style single-hop path and are reached through the public
+			// graph.
+			buildPrivatePaymentPaths: (pathId: Buffer): IBlindedPaymentPath[] => {
+				const announced = this.channelManager
+					.listChannels()
+					.some((c) => c.getFullState().announceChannel === true);
+				if (announced) return [];
+				return this.buildBlindedPaymentPaths(false, 2, pathId);
+			}
 		});
 		this.wireOfferManagerEvents();
 
