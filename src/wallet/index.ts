@@ -178,6 +178,7 @@ export class Wallet {
 	// them until the last one finishes.
 	private _activeRefreshes = 0;
 	private _disableMessagesOnCreate: boolean;
+	private _disableRefreshOnCreate: boolean;
 	// BIP32 account index as a path segment string ('0' by default).
 	private readonly _account: string;
 	// Requested at create time; merged with the stored value in setWalletData.
@@ -232,6 +233,7 @@ export class Wallet {
 		feeEstimationSource = 'auto',
 		disableMessages = false,
 		disableMessagesOnCreate = false,
+		disableRefreshOnCreate = false,
 		logger,
 		addressTypesToMonitor = Object.values(EAddressType),
 		gapLimitOptions = {
@@ -335,6 +337,7 @@ export class Wallet {
 		this._getData = storage?.getData ?? getDataFallback;
 		this._setData = storage?.setData;
 		this._disableMessagesOnCreate = disableMessagesOnCreate;
+		this._disableRefreshOnCreate = disableRefreshOnCreate;
 		if (customGetAddress) this._customGetAddress = customGetAddress;
 		if (customGetScriptHash) this._customGetScriptHash = customGetScriptHash;
 		this.name = name ?? this.id;
@@ -448,7 +451,10 @@ export class Wallet {
 			const res = await wallet.setWalletData();
 			if (res.isErr()) return err(res.error.message);
 			void wallet.updateFeeEstimates(true);
-			void wallet.refreshWallet({});
+			// A host that owns the startup refresh (and must hold its ONE
+			// promise, e.g. BeignetNode.waitForInitialSync) opts out here so
+			// the wallet never scans twice at boot (issue #548).
+			if (!wallet._disableRefreshOnCreate) void wallet.refreshWallet({});
 			return ok(wallet);
 		} catch (e) {
 			return err(e);
@@ -3419,7 +3425,9 @@ export class Wallet {
 					// directly to a wallet address on regtest. Requesting it
 					// spams the Electrum server with invalid-params errors
 					// (issue #548).
-					if (v?.txid === undefined || v?.vout === undefined) return;
+					if (!('txid' in v) || v.txid === undefined || v.vout === undefined) {
+						return;
+					}
 					inputs.push({ tx_hash: v.txid, vout: v.vout });
 				});
 			}
@@ -3479,22 +3487,36 @@ export class Wallet {
 			let messages: string[] = []; // Array of OP_RETURN messages.
 
 			//Iterate over each input
-			result.vin.map(({ txid, scriptSig, vout, sequence }) => {
+			let isCoinbase = false;
+			result.vin.map((vin) => {
 				//Push any OP_RETURN messages to messages array
 				try {
-					const asm = scriptSig.asm;
-					if (asm !== '' && asm.includes('OP_RETURN')) {
-						const OpReturnMessages = decodeOpReturnMessage(asm);
-						messages = messages.concat(OpReturnMessages);
+					if ('scriptSig' in vin) {
+						const asm = vin.scriptSig.asm;
+						if (asm !== '' && asm.includes('OP_RETURN')) {
+							const OpReturnMessages = decodeOpReturnMessage(asm);
+							messages = messages.concat(OpReturnMessages);
+						}
 					}
 				} catch {}
 
 				try {
 					// Check if rbf was enabled for this transaction.
-					if (sequence < 0xffffffff - 1) rbf = true;
+					if (vin.sequence < 0xffffffff - 1) rbf = true;
 				} catch {}
 
-				const key = `${txid}${vout}`;
+				// A coinbase input has no previous output (issue #548): nothing
+				// to look up, and its presence marks the whole transaction as
+				// coinbase for the fee handling below.
+				if (
+					!('txid' in vin) ||
+					vin.txid === undefined ||
+					vin.vout === undefined
+				) {
+					isCoinbase = true;
+					return;
+				}
+				const key = `${vin.txid}${vin.vout}`;
 				if (key in inputData) {
 					const { addresses: _addresses, value } = inputData[key];
 					totalInputValue = totalInputValue + value;
@@ -3528,7 +3550,13 @@ export class Wallet {
 					: EPaymentType.received;
 			const totalMatchedValue = matchedOutputValue - matchedInputValue;
 			const value = Number(totalMatchedValue.toFixed(8));
-			const totalValue = totalInputValue - totalOutputValue;
+			// A coinbase transaction has no funding inputs: with its nonexistent
+			// prevout filtered, totalInputValue is 0 and the generic
+			// |inputs - outputs| formula would report the ENTIRE block reward
+			// as the fee at an absurd feerate (issue #548 review: a 50 BTC
+			// coinbase read as a 50 BTC fee). A coinbase pays no fee; it
+			// collects the block's fees.
+			const totalValue = isCoinbase ? 0 : totalInputValue - totalOutputValue;
 			const fee = Number(Math.abs(totalValue).toFixed(8));
 			const vsize = result.vsize;
 			const satsPerByte = Math.round(btcToSats(fee) / vsize);
@@ -4673,6 +4701,11 @@ export class Wallet {
 		for (let i = 0; i < vins.length; i++) {
 			try {
 				const input = vins[i];
+				// A coinbase input has no prevout and can never be RBF'd; the
+				// union carries it since issue #548, so refuse by name.
+				if (!('txid' in input)) {
+					return err('Cannot rebuild a coinbase transaction.');
+				}
 				const txId = input.txid;
 				const tx = await this.electrum.getTransactions({
 					txHashes: [{ tx_hash: txId }]

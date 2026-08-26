@@ -938,6 +938,9 @@ export interface BeignetNodeEvents {
 	'transaction:received': (info: OnchainTxInfo) => void;
 	'transaction:sent': (info: OnchainTxInfo) => void;
 	'transaction:confirmed': (info: OnchainTxInfo) => void;
+	/** A replacement was observed: the listed txids were replaced (RBF) and
+	 *  are dead; whatever was watching them should stop (issue #548). */
+	'onchain:rbf': (data: { txids: string[] }) => void;
 	'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
 	'channel:ready': (data: { channelId: string }) => void;
 	'channel:pending-close': (data: {

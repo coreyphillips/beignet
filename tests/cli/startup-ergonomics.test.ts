@@ -17,7 +17,10 @@ import { expect } from 'chai';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as net from 'net';
 import { BeignetNode } from '../../src/cli/beignet-node';
+import { BeignetError } from '../../src/cli/errors';
+import { Wallet } from '../../src/wallet';
 import { EPaymentType } from '../../src/types/wallet';
 
 const MNEMONIC =
@@ -80,9 +83,9 @@ describe('Startup and wallet ergonomics (issue #548)', function () {
 	it('relays a wallet rbf report as onchain:rbf, transaction:* untouched', () => {
 		const rbf: Array<{ txids: string[] }> = [];
 		const received: unknown[] = [];
-		bn.on('onchain:rbf', (...args: unknown[]) =>
-			rbf.push(args[0] as { txids: string[] })
-		);
+		// Typed straight off BeignetNodeEvents (issue #548 review): the
+		// payload arrives as { txids: string[] }, no cast.
+		bn.on('onchain:rbf', (data) => rbf.push(data));
 		bn.on('transaction:received', (e: unknown) => received.push(e));
 		const internals = bn as unknown as {
 			onWalletMessage: (key: string, data: unknown) => void;
@@ -103,6 +106,113 @@ describe('Startup and wallet ergonomics (issue #548)', function () {
 		expect(rbf).to.have.length(1);
 		expect(rbf[0].txids).to.deep.equal(['aa'.repeat(32), 'bb'.repeat(32)]);
 		expect(received, 'transaction:received still relays').to.have.length(1);
+	});
+
+	it('settles at the startup bound against a silent Electrum server', async function () {
+		// A server that accepts the socket but never answers server_version
+		// has no timeout of its own; unbounded, waitForInitialSync would hang
+		// for the life of the process (issue #548 review). Budget: the header
+		// subscribe path carries its own 30s gate (HEADER_SUBSCRIBE_GATE_MS)
+		// that this scenario also rides through, so the proof here is
+		// "settles within a bounded budget", not "settles fast".
+		this.timeout(120_000);
+		const socks: net.Socket[] = [];
+		const silent = net.createServer((sock) => {
+			// Accept and say nothing; keep the socket so teardown can sever
+			// it (server.close() alone leaves live sockets, and the wallet's
+			// reconnect loop would wedge destroy() on them).
+			socks.push(sock);
+		});
+		await new Promise<void>((resolve) => silent.listen(0, resolve));
+		const port = (silent.address() as net.AddressInfo).port;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ergo-silent-'));
+		const statics = BeignetNode as unknown as {
+			INITIAL_SYNC_TIMEOUT_MS: number;
+			STARTUP_ADDRESS_LOOKUP_TIMEOUT_MS: number;
+		};
+		const originalBound = statics.INITIAL_SYNC_TIMEOUT_MS;
+		const originalLookup = statics.STARTUP_ADDRESS_LOOKUP_TIMEOUT_MS;
+		statics.INITIAL_SYNC_TIMEOUT_MS = 1500;
+		// init's own sweep-address resolution hits the silent server first and
+		// is bounded separately; shorten it too or create() eats the timeout.
+		statics.STARTUP_ADDRESS_LOOKUP_TIMEOUT_MS = 1500;
+		let silentNode: BeignetNode | undefined;
+		try {
+			silentNode = await BeignetNode.create({
+				...offlineOpts(dir),
+				electrumPort: port
+			});
+			let settled = false;
+			await Promise.race([
+				silentNode.waitForInitialSync().then(() => {
+					settled = true;
+				}),
+				new Promise((resolve) => setTimeout(resolve, 90_000))
+			]);
+			expect(settled, 'settled at the bound, not hanging').to.equal(true);
+		} finally {
+			statics.INITIAL_SYNC_TIMEOUT_MS = originalBound;
+			statics.STARTUP_ADDRESS_LOOKUP_TIMEOUT_MS = originalLookup;
+			// Sever the silent sockets FIRST: reconnect attempts then fail
+			// fast (ECONNREFUSED) instead of re-entering the untimed
+			// handshake under destroy().
+			for (const sock of socks) sock.destroy();
+			silent.close();
+			if (silentNode) await silentNode.destroy();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('runs exactly ONE startup refresh (create no longer double-scans)', async function () {
+		// Wallet.create used to fire its own refreshWallet beside init step
+		// 15's tracked one; if the first finished during init, boot scanned
+		// the whole wallet twice (issue #548 review).
+		this.timeout(30_000);
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ergo-once-'));
+		const original = Wallet.prototype.refreshWallet;
+		let calls = 0;
+		Wallet.prototype.refreshWallet = function (
+			...args: Parameters<typeof original>
+		): ReturnType<typeof original> {
+			calls++;
+			return original.apply(this, args);
+		};
+		let counted: BeignetNode | undefined;
+		try {
+			counted = await BeignetNode.create(offlineOpts(dir));
+			await counted.waitForInitialSync();
+			expect(calls, 'one startup refresh, one owner').to.equal(1);
+		} finally {
+			Wallet.prototype.refreshWallet = original;
+			if (counted) await counted.destroy();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('names the restore-pending hold instead of returning undefined', async () => {
+		// Guardian restore-pending startup returns before node/wallet exist;
+		// the getters and the waiter must say so rather than hand back
+		// undefined behind non-optional types (issue #548 review).
+		const held = Object.create(BeignetNode.prototype) as BeignetNode;
+		for (const call of [
+			(): unknown => held.lightningNode,
+			(): unknown => held.onchainWallet
+		]) {
+			try {
+				call();
+				expect.fail('expected NODE_RESTORE_PENDING');
+			} catch (err) {
+				expect(err).to.be.instanceOf(BeignetError);
+				expect((err as BeignetError).code).to.equal('NODE_RESTORE_PENDING');
+			}
+		}
+		try {
+			await held.waitForInitialSync();
+			expect.fail('expected NODE_RESTORE_PENDING');
+		} catch (err) {
+			expect(err).to.be.instanceOf(BeignetError);
+			expect((err as BeignetError).code).to.equal('NODE_RESTORE_PENDING');
+		}
 	});
 
 	it('addressType p2tr yields taproot deposit addresses (default p2wpkh)', async () => {
