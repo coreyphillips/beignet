@@ -216,7 +216,7 @@ flows, just-in-time inventory checks, atomic swaps.
 | `createOffer({ description, amountSats?, issuer? })` | `OfferInfo` | Create a reusable BOLT 12 offer |
 | `decodeOfferString(offerStr)` | `OfferInfo` | Decode a BOLT 12 offer string without paying |
 | `listOffers()` | `OfferInfo[]` | List local offers |
-| `payOffer(offerStr, amountSats?, timeoutMs?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays) |
+| `payOffer(offerStr, amountSats?, timeoutMs?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). Drain mode and the spending limits apply to the returned invoice's amount |
 
 #### Channel Readiness
 
@@ -564,7 +564,9 @@ Every invoice payment (`payInvoice`, `payInvoiceSafe`, `payInvoiceWithRetry`,
 amount that actually gets paid: the invoice's own amount whenever it carries
 one, and `amountSats` only for an amount-less invoice. A fractional msat amount
 rounds up. `validatePayment`, `estimatePayment` and `estimateRouteFee` preview
-the same amount.
+the same amount. `payOffer` is checked and recorded the same way, against the
+amount of the BOLT 12 invoice the payee returns for the offer, which is what
+gets paid whatever `amountSats` asked for.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
@@ -574,7 +576,7 @@ the same amount.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `setDraining(enabled)` | `void` | Enable/disable drain mode. When enabled, `payInvoice()` and `sendKeysend()` throw `SERVICE_DRAINING`. |
+| `setDraining(enabled)` | `void` | Enable/disable drain mode. When enabled, every payment entry point (`payInvoice()`, `sendPaymentAsync()`, `sendKeysend()`, `payOffer()`) throws `SERVICE_DRAINING`. `payOffer()` re-checks after the invoice request, so a drain that starts during it still stops the payment. |
 | `isDraining()` | `boolean` | Whether the node is currently draining |
 | `hasPendingPayments()` | `boolean` | Whether there are in-flight payments |
 
@@ -1831,7 +1833,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/payment/wait` | `{ paymentHash, timeoutMs? }` | Wait for payment to settle (default 60s) |
 | POST | `/offer/create` | `{ description, amountSats?, issuer? }` | Create BOLT 12 offer |
 | POST | `/offer/decode` | `{ offer }` | Decode a BOLT 12 offer string |
-| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs? }` | Pay BOLT 12 offer |
+| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs? }` | Pay BOLT 12 offer. Answers 409 while draining and 403 over a spending limit, judged on the invoice the payee returns. |
 | GET | `/payment/proof` | `?paymentHash=<hex>` | Cryptographic payment proof (preimage, invoice, route) |
 | GET | `/payment/verify-proof` | `?paymentHash=<hex>` | Verify proof: `sha256(preimage) === paymentHash` |
 | GET | `/node/uri` | `?host=<addr>` | Node connection URI (`pubkey@host:port`). Optional external host override. |

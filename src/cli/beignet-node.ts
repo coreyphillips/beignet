@@ -6849,6 +6849,12 @@ export class BeignetNode extends EventEmitter {
 		amountSats?: number,
 		timeoutMs = 60_000
 	): Promise<PaymentInfo> {
+		// Paying an offer spends outbound liquidity exactly as payInvoice does,
+		// so it runs the same admission: drain mode, both spending limits, a
+		// reservation for the in-flight window and the daily accounting on
+		// settlement (issue #529). Checked here so a draining node does not even
+		// go asking a payee for an invoice.
+		this._checkDraining();
 		const offer = decodeOfferInput(offerStr);
 
 		// Request invoice from the offer. Guarded before BigInt(): a fractional
@@ -6864,11 +6870,47 @@ export class BeignetNode extends EventEmitter {
 				: undefined;
 
 		const bolt12Invoice = await this.node.requestInvoice(offer, requestOptions);
+		// Re-checked after the await: the request is a round trip to the payee,
+		// and it is the dispatch below, not the request above, that a drain
+		// started meanwhile has to stop.
+		this._checkDraining();
 		const paymentHashHex = bolt12Invoice.paymentHash.toString('hex');
+
+		// What payBolt12Invoice will actually pay is the invoice's own amount:
+		// the payee prices the offer, and there is nothing else to pay (an
+		// amountless BOLT 12 invoice is refused outright). Admitting on the
+		// caller's amountSats instead is the precedence #528 removed from the
+		// BOLT 11 paths, so the shared helper decides it here too.
+		const spendAmountSats = paymentSpendSats(bolt12Invoice.amount, amountSats);
+
+		if (spendAmountSats > 0) {
+			this._checkMaxPayment(spendAmountSats);
+			this._checkSpendLimit(spendAmountSats);
+			this._pendingSpendSats += spendAmountSats;
+		}
+
+		// This call owns the hash's spend accounting for as long as its own
+		// listener is installed, for the reason payInvoice's copy documents:
+		// the forwarding handler in create() would otherwise charge an async
+		// claim on this hash for the settlement the listener below records.
+		this._acquireBlockingPayment(paymentHashHex);
+
+		// One release shared by every exit, and idempotent, because more than
+		// one can run for a single payment (a timeout followed by a late
+		// payment:failed). Held for the whole in-flight window: it is what
+		// stops two concurrent offer payments both passing the daily limit
+		// before either records a spend.
+		let released = false;
+		const releaseReservation = (): void => {
+			if (spendAmountSats <= 0 || released) return;
+			released = true;
+			this._pendingSpendSats -= spendAmountSats;
+		};
 
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
+				releaseReservation();
 				this.node.failPayment(bolt12Invoice.paymentHash);
 				reject(
 					new BeignetError(
@@ -6882,17 +6924,26 @@ export class BeignetNode extends EventEmitter {
 				clearTimeout(timer);
 				this.node.removeListener('payment:sent', onSent);
 				this.node.removeListener('payment:failed', onFailed);
+				// Safe here rather than after the accounting below: the handler
+				// in create() is registered first, so it has already seen this
+				// same event and declined to charge for it.
+				this._releaseBlockingPayment(paymentHashHex);
 			};
 
 			const onSent = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
+					// Released before the spend is recorded, so a concurrent
+					// _checkSpendLimit never sees the same sats counted twice.
+					releaseReservation();
+					if (spendAmountSats > 0) this._recordSpend(spendAmountSats);
 					resolve(this.toPaymentInfo(info));
 				}
 			};
 			const onFailed = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
+					releaseReservation();
 					const failDesc =
 						info.failureCode !== undefined
 							? describeFailureCode(info.failureCode)
@@ -6914,6 +6965,11 @@ export class BeignetNode extends EventEmitter {
 				this.node.payBolt12Invoice(bolt12Invoice);
 			} catch (err: unknown) {
 				cleanup();
+				// A payment that never started holds no capacity. Without this a
+				// refused dispatch (no route, a duplicate, a missing amount)
+				// ratcheted the counter up until the daily limit refused real
+				// payments, as it did on the BOLT 11 path (issue #474).
+				releaseReservation();
 				const msg = err instanceof Error ? err.message : String(err);
 				reject(new BeignetError('PAYMENT_FAILED', msg));
 			}
