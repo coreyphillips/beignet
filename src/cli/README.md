@@ -559,6 +559,13 @@ Operational notes:
 > `bumpFeeOnchain`/`boostOnchain` (fee-only). PSBT building is also not
 > counted (nothing is broadcast). Resets at midnight UTC.
 
+Every invoice payment (`payInvoice`, `payInvoiceSafe`, `payInvoiceWithRetry`,
+`sendPaymentAsync`, the queue and their routes) is checked and recorded at the
+amount that actually gets paid: the invoice's own amount whenever it carries
+one, and `amountSats` only for an amount-less invoice. A fractional msat amount
+rounds up. `validatePayment`, `estimatePayment` and `estimateRouteFee` preview
+the same amount.
+
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `getDailySpendInfo()` | `DailySpendInfo` | Current combined limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt }` plus the legacy `spentSats` field (equals `totalSats`) for back-compat |
