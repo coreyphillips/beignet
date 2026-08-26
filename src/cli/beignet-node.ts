@@ -19,7 +19,7 @@ import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { Wallet } from '../wallet';
 import { getDefaultSendTransaction } from '../shapes/wallet';
-import { ISendTransaction } from '../types/wallet';
+import { EAddressType, ISendTransaction } from '../types/wallet';
 import { ILogger, TLogLevel, LOG_LEVEL_PRIORITY } from '../logger';
 import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
 import { btcToSats } from '../utils/conversion';
@@ -213,6 +213,12 @@ export interface BeignetNodeOptions {
 	 * falls back to HTTP when Electrum is unavailable.
 	 */
 	feeEstimationSource?: 'electrum' | 'http' | 'auto';
+	/**
+	 * On-chain address type for the wallet (default 'p2wpkh'). 'p2tr' gives
+	 * taproot deposit addresses; channel funding and splices can spend both
+	 * kinds (issue #548, LFBW port #532 workstream 1F).
+	 */
+	addressType?: 'p2wpkh' | 'p2tr';
 	listenPort?: number;
 	/**
 	 * Accept inbound Lightning peers over WebSocket (RFC 6455) on this port.
@@ -1086,6 +1092,8 @@ export class BeignetNode extends EventEmitter {
 	 * request timeouts, so a lookup that is merely slow still wins.
 	 */
 	private _closeAddressLookupTimeoutMs = 15_000;
+	/** The startup wallet refresh; waitForInitialSync awaits it (issue #548). */
+	private _initialSync?: Promise<void>;
 	// ─── Recovery Protocol surface (docs/RECOVERY-PROTOCOL.md section 8) ───
 	/** Parsed mode; 'off' unless a recognized mode was configured. */
 	private recoveryMode: RecoveryMode = 'off';
@@ -1537,6 +1545,11 @@ export class BeignetNode extends EventEmitter {
 		const walletResult = await Wallet.create({
 			mnemonic: this.mnemonic,
 			network: beignetNetwork,
+			// The option strings match EAddressType's values, so the cast is a
+			// vocabulary bridge, not a coercion (issue #548).
+			...(opts.addressType
+				? { addressType: opts.addressType as EAddressType }
+				: {}),
 			...(opts.feeEstimationSource
 				? { feeEstimationSource: opts.feeEstimationSource }
 				: {}),
@@ -2201,6 +2214,39 @@ export class BeignetNode extends EventEmitter {
 		if (this._recoveryRun) {
 			this.startRecoveryConfirmLoop();
 		}
+
+		// 15. Initial wallet sync, in the background so create() keeps its
+		// historical timing (issue #548). Without this the wallet never calls
+		// subscribeToAddresses, so incoming on-chain deposits are invisible
+		// until someone manually refreshes. Await waitForInitialSync() when
+		// the balance and live deposit events must be reliable. The promise
+		// settles on failure too (Electrum down at boot is normal); the
+		// wallet's own reconnect-and-refresh machinery catches up later.
+		this._initialSync = this.wallet
+			.refreshWallet({})
+			.then((res) => {
+				if (res.isErr()) {
+					this.log('warn', 'Initial wallet refresh failed', {
+						error: res.error.message
+					});
+				}
+			})
+			.catch((err) => {
+				this.log('warn', 'Initial wallet refresh failed', {
+					error: err instanceof Error ? err.message : String(err)
+				});
+			});
+	}
+
+	/**
+	 * Resolves once the startup wallet refresh (balance scan plus Electrum
+	 * address subscriptions) has settled. After this, getBalance() reflects
+	 * the chain and the transaction:* events fire for live activity. Settles
+	 * even when the refresh failed (offline boot): it signals "the attempt
+	 * finished", not "the wallet is synced".
+	 */
+	async waitForInitialSync(): Promise<void> {
+		await this._initialSync;
 	}
 
 	/**
@@ -3289,6 +3335,22 @@ export class BeignetNode extends EventEmitter {
 		return result;
 	}
 
+	// ─────────────── Escape hatches ───────────────
+
+	/**
+	 * Direct access to the underlying LightningNode for features BeignetNode
+	 * does not proxy (held forwards, routing-hint injection, custom
+	 * messages). Issue #548, LFBW port #532 workstream 1F.
+	 */
+	get lightningNode(): LightningNode {
+		return this.node;
+	}
+
+	/** Direct access to the underlying on-chain Wallet. */
+	get onchainWallet(): Wallet {
+		return this.wallet;
+	}
+
 	// ─────────────── Info ───────────────
 
 	getInfo(): NodeInfo {
@@ -4247,6 +4309,16 @@ export class BeignetNode extends EventEmitter {
 		key: K,
 		data: TMessageDataMap[K]
 	): void {
+		// A replacement is its own kind of news: the txids a client was
+		// watching are now dead, and nothing else says so (issue #548). The
+		// payload is the wallet's replaced-txid list, not a transaction.
+		if (key === 'rbf') {
+			this.log('info', 'Onchain transaction replaced (RBF)', {
+				txids: data as string[]
+			});
+			this.emit('onchain:rbf', { txids: data as string[] });
+			return;
+		}
 		const relayed = {
 			transactionReceived: {
 				event: 'transaction:received',

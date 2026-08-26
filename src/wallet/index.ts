@@ -3413,9 +3413,15 @@ export class Wallet {
 		const inputs: { tx_hash: string; vout: number }[] = [];
 		transactions.forEach(({ result }) => {
 			if (result?.vin) {
-				result.vin.forEach((v) =>
-					inputs.push({ tx_hash: v.txid, vout: v.vout })
-				);
+				result.vin.forEach((v) => {
+					// A coinbase input has no previous output to fetch (its vin
+					// carries `coinbase` instead of txid/vout), e.g. mining
+					// directly to a wallet address on regtest. Requesting it
+					// spams the Electrum server with invalid-params errors
+					// (issue #548).
+					if (v?.txid === undefined || v?.vout === undefined) return;
+					inputs.push({ tx_hash: v.txid, vout: v.vout });
+				});
 			}
 		});
 		const inputDataResponse = await this.getInputData({
@@ -3578,6 +3584,12 @@ export class Wallet {
 		inputs: { tx_hash: string; vout: number }[];
 	}): Promise<Result<InputData>> {
 		try {
+			// Defense-in-depth behind the updateTransactions guard: never ask
+			// the server for a prevout that does not exist (coinbase inputs
+			// surface as undefined tx_hash/vout; issue #548).
+			inputs = inputs.filter(
+				(i) => i.tx_hash !== undefined && i.vout !== undefined
+			);
 			const inputData: InputData = {};
 			const failedRequests: { tx_hash: string; vout: number }[] = [];
 
