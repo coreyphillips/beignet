@@ -101,6 +101,21 @@ export interface IVin {
 	vout: number;
 }
 
+/**
+ * A coinbase input: no previous output exists, so bitcoind reports the
+ * coinbase script instead of txid/vout/scriptSig. Mining directly to a
+ * wallet address (regtest) puts these into the wallet's transaction flow
+ * (issue #548), so the vin type models them rather than promising fields
+ * the runtime value does not carry. Narrow with `'txid' in vin`.
+ */
+export interface ICoinbaseVin {
+	coinbase: string;
+	sequence: number;
+	txinwitness?: string[];
+}
+
+export type TVin = IVin | ICoinbaseVin;
+
 export interface IFormattedTransaction {
 	address: string;
 	blockhash?: string;
@@ -120,7 +135,7 @@ export interface IFormattedTransaction {
 	value: number; // BTC
 	txid: string;
 	messages: string[];
-	vin: IVin[];
+	vin: TVin[];
 	timestamp: number;
 	confirmTimestamp?: number;
 	exists?: boolean;
@@ -254,6 +269,10 @@ export interface IWallet {
 	feeEstimationSource?: TFeeEstimationSource;
 	disableMessages?: boolean;
 	disableMessagesOnCreate?: boolean;
+	/** Skip the refreshWallet Wallet.create fires in the background, for a
+	 *  host that owns the startup refresh itself and needs to hold the ONE
+	 *  refresh promise (issue #548; BeignetNode's waitForInitialSync). */
+	disableRefreshOnCreate?: boolean;
 	// Leveled diagnostic logger (debug/info/warn/error). Defaults to a
 	// console-backed logger at 'info' so existing console output is
 	// preserved; inject your own to reroute or silence diagnostics.
@@ -411,7 +430,7 @@ export type TTxDetails = {
 	size: number;
 	txid: string;
 	version: number;
-	vin: IVin[];
+	vin: TVin[];
 	vout: IVout[];
 	vsize: number;
 	weight: number;

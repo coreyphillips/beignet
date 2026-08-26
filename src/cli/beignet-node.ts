@@ -19,7 +19,7 @@ import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { Wallet } from '../wallet';
 import { getDefaultSendTransaction } from '../shapes/wallet';
-import { ISendTransaction } from '../types/wallet';
+import { EAddressType, ISendTransaction } from '../types/wallet';
 import { ILogger, TLogLevel, LOG_LEVEL_PRIORITY } from '../logger';
 import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
 import { btcToSats } from '../utils/conversion';
@@ -213,6 +213,12 @@ export interface BeignetNodeOptions {
 	 * falls back to HTTP when Electrum is unavailable.
 	 */
 	feeEstimationSource?: 'electrum' | 'http' | 'auto';
+	/**
+	 * On-chain address type for the wallet (default 'p2wpkh'). 'p2tr' gives
+	 * taproot deposit addresses; channel funding and splices can spend both
+	 * kinds (issue #548, LFBW port #532 workstream 1F).
+	 */
+	addressType?: 'p2wpkh' | 'p2tr';
 	listenPort?: number;
 	/**
 	 * Accept inbound Lightning peers over WebSocket (RFC 6455) on this port.
@@ -1086,6 +1092,8 @@ export class BeignetNode extends EventEmitter {
 	 * request timeouts, so a lookup that is merely slow still wins.
 	 */
 	private _closeAddressLookupTimeoutMs = 15_000;
+	/** The startup wallet refresh; waitForInitialSync awaits it (issue #548). */
+	private _initialSync?: Promise<void>;
 	// ─── Recovery Protocol surface (docs/RECOVERY-PROTOCOL.md section 8) ───
 	/** Parsed mode; 'off' unless a recognized mode was configured. */
 	private recoveryMode: RecoveryMode = 'off';
@@ -1537,6 +1545,16 @@ export class BeignetNode extends EventEmitter {
 		const walletResult = await Wallet.create({
 			mnemonic: this.mnemonic,
 			network: beignetNetwork,
+			// BeignetNode owns the ONE startup refresh (init step 15) so
+			// waitForInitialSync can hold its promise; without this flag
+			// Wallet.create fires its own and the wallet could scan twice at
+			// boot (issue #548 review).
+			disableRefreshOnCreate: true,
+			// The option strings match EAddressType's values, so the cast is a
+			// vocabulary bridge, not a coercion (issue #548).
+			...(opts.addressType
+				? { addressType: opts.addressType as EAddressType }
+				: {}),
 			...(opts.feeEstimationSource
 				? { feeEstimationSource: opts.feeEstimationSource }
 				: {}),
@@ -1642,7 +1660,13 @@ export class BeignetNode extends EventEmitter {
 		// retrying in the background (see scheduleSweepAddressRefresh) and redirect
 		// sweeps to the wallet once an address resolves, instead of being stuck on
 		// the funding-key fallback for the whole session.
-		const sweepDestinationScript = await this.resolveWalletSweepScript();
+		// Bounded: the fresh-address leg can enter the untimed Electrum
+		// handshake, and unbounded it hangs create() itself (issue #548
+		// review). scheduleSweepAddressRefresh below keeps retrying.
+		const sweepDestinationScript = await this.raceWithTimeout(
+			this.resolveWalletSweepScript().catch(() => undefined),
+			BeignetNode.STARTUP_ADDRESS_LOOKUP_TIMEOUT_MS
+		);
 		if (sweepDestinationScript) {
 			this.sweepDestinationScript = sweepDestinationScript;
 		}
@@ -2201,6 +2225,111 @@ export class BeignetNode extends EventEmitter {
 		if (this._recoveryRun) {
 			this.startRecoveryConfirmLoop();
 		}
+
+		// 15. Initial wallet sync, in the background so create() keeps its
+		// historical timing (issue #548). Without this the wallet never calls
+		// subscribeToAddresses, so incoming on-chain deposits are invisible
+		// until someone manually refreshes. Await waitForInitialSync() when
+		// the balance and live deposit events must be reliable. The promise
+		// settles on failure too (Electrum down at boot is normal); the
+		// wallet's own reconnect-and-refresh machinery catches up later. The
+		// wait is BOUNDED: an Electrum server that accepts the socket but
+		// never answers server_version has no timeout of its own, and an
+		// unbounded refresh would leave the documented settling guarantee a
+		// lie (issue #548 review). On the bound the promise settles while the
+		// refresh keeps running in the background.
+		this._initialSync = (async (): Promise<void> => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const deadline = new Promise<'timeout'>((resolve) => {
+				timer = setTimeout(
+					() => resolve('timeout'),
+					BeignetNode.INITIAL_SYNC_TIMEOUT_MS
+				);
+				timer.unref?.();
+			});
+			const attempt = this.wallet
+				.refreshWallet({})
+				.then((res) => {
+					if (res.isErr()) {
+						this.log('warn', 'Initial wallet refresh failed', {
+							error: res.error.message
+						});
+					}
+				})
+				.catch((err) => {
+					this.log('warn', 'Initial wallet refresh failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				});
+			const winner = await Promise.race([attempt, deadline]);
+			if (timer) clearTimeout(timer);
+			if (winner === 'timeout') {
+				this.log(
+					'warn',
+					'Initial wallet refresh still running at the startup bound; ' +
+						'continuing in the background',
+					{ boundMs: BeignetNode.INITIAL_SYNC_TIMEOUT_MS }
+				);
+			}
+		})();
+	}
+
+	/**
+	 * Bound on the startup wallet refresh wait: the Electrum server_version
+	 * handshake carries no timeout of its own, so a server that accepts the
+	 * socket and says nothing would otherwise leave waitForInitialSync
+	 * pending for the life of the process (issue #548 review). Generous,
+	 * because a large wallet's first scan is legitimately slow.
+	 */
+	private static INITIAL_SYNC_TIMEOUT_MS = 120_000;
+
+	/**
+	 * Bound on init's wallet sweep-address resolution: the same untimed
+	 * handshake would otherwise hang BeignetNode.create() itself, before any
+	 * later bound can apply (issue #548 review, found by the silent-server
+	 * test). On expiry init proceeds with the funding-key fallback and the
+	 * background refresh keeps retrying.
+	 */
+	private static STARTUP_ADDRESS_LOOKUP_TIMEOUT_MS = 15_000;
+
+	/**
+	 * Race a promise against a timeout, resolving undefined on expiry. The
+	 * loser keeps running in the background; callers own any fallback.
+	 */
+	private async raceWithTimeout<T>(
+		promise: Promise<T>,
+		timeoutMs: number
+	): Promise<T | undefined> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<undefined>((resolve) => {
+			timer = setTimeout(() => resolve(undefined), timeoutMs);
+			timer.unref?.();
+		});
+		try {
+			return await Promise.race([promise, deadline]);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+
+	/**
+	 * Resolves once the startup wallet refresh (balance scan plus Electrum
+	 * address subscriptions) has settled or the startup bound elapsed. After
+	 * this, getBalance() reflects the chain and the transaction:* events fire
+	 * for live activity. Settles even when the refresh failed (offline boot):
+	 * it signals "the attempt finished", not "the wallet is synced". Throws
+	 * NODE_RESTORE_PENDING during guardian restore-pending startup, where no
+	 * sync was attempted at all.
+	 */
+	async waitForInitialSync(): Promise<void> {
+		if (!this._initialSync) {
+			throw new BeignetError(
+				'NODE_RESTORE_PENDING',
+				'No wallet sync was attempted: this node is holding for a ' +
+					'Recovery Protocol restore. Complete POST /recovery/restore first.'
+			);
+		}
+		await this._initialSync;
 	}
 
 	/**
@@ -3289,6 +3418,42 @@ export class BeignetNode extends EventEmitter {
 		return result;
 	}
 
+	// ─────────────── Escape hatches ───────────────
+
+	/**
+	 * Direct access to the underlying LightningNode for features BeignetNode
+	 * does not proxy (held forwards, routing-hint injection, custom
+	 * messages). Issue #548, LFBW port #532 workstream 1F. Throws
+	 * NODE_RESTORE_PENDING during guardian restore-pending startup, where the
+	 * node deliberately does not exist yet: returning undefined behind a
+	 * non-optional type would move the crash to the caller (issue #548
+	 * review).
+	 */
+	get lightningNode(): LightningNode {
+		if (!this.node) {
+			throw new BeignetError(
+				'NODE_RESTORE_PENDING',
+				'The Lightning node does not exist yet: this daemon is holding ' +
+					'for a Recovery Protocol restore. Complete POST /recovery/restore ' +
+					'first.'
+			);
+		}
+		return this.node;
+	}
+
+	/** Direct access to the underlying on-chain Wallet. Same restore-pending
+	 *  contract as lightningNode. */
+	get onchainWallet(): Wallet {
+		if (!this.wallet) {
+			throw new BeignetError(
+				'NODE_RESTORE_PENDING',
+				'The wallet does not exist yet: this daemon is holding for a ' +
+					'Recovery Protocol restore. Complete POST /recovery/restore first.'
+			);
+		}
+		return this.wallet;
+	}
+
 	// ─────────────── Info ───────────────
 
 	getInfo(): NodeInfo {
@@ -4247,6 +4412,16 @@ export class BeignetNode extends EventEmitter {
 		key: K,
 		data: TMessageDataMap[K]
 	): void {
+		// A replacement is its own kind of news: the txids a client was
+		// watching are now dead, and nothing else says so (issue #548). The
+		// payload is the wallet's replaced-txid list, not a transaction.
+		if (key === 'rbf') {
+			this.log('info', 'Onchain transaction replaced (RBF)', {
+				txids: data as string[]
+			});
+			this.emit('onchain:rbf', { txids: data as string[] });
+			return;
+		}
 		const relayed = {
 			transactionReceived: {
 				event: 'transaction:received',
@@ -4744,22 +4919,10 @@ export class BeignetNode extends EventEmitter {
 	private async boundedCurrentWalletAddressScript(): Promise<
 		Buffer | undefined
 	> {
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const deadline = new Promise<undefined>((resolve) => {
-			timer = setTimeout(
-				() => resolve(undefined),
-				this._closeAddressLookupTimeoutMs
-			);
-			timer.unref?.();
-		});
-		try {
-			return await Promise.race([
-				this.resolveCurrentWalletAddressScript().catch(() => undefined),
-				deadline
-			]);
-		} finally {
-			if (timer) clearTimeout(timer);
-		}
+		return this.raceWithTimeout(
+			this.resolveCurrentWalletAddressScript().catch(() => undefined),
+			this._closeAddressLookupTimeoutMs
+		);
 	}
 
 	forceCloseChannel(
