@@ -1103,7 +1103,7 @@ async function bootDaemon(
 				node.openChannel(pubkey, amountSats, pushSats, satsPerVbyte, max)
 			);
 		},
-		'POST /channel/close': (body) => {
+		'POST /channel/close': async (body) => {
 			const { channelId, acceptStaleStateRisk } = body as {
 				channelId: string;
 				acceptStaleStateRisk?: boolean;
@@ -1111,7 +1111,9 @@ async function bootDaemon(
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
 			// Strict boolean, the same rule the force close uses: the
 			// acknowledgement is authorization, so only the exact value counts.
-			const result = node.closeChannel(
+			// Async since issue #542: the close resolves a fresh wallet address
+			// for its payout before signing.
+			const result = await node.closeChannel(
 				channelId,
 				acceptStaleStateRisk === true
 			);

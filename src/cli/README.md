@@ -1369,6 +1369,9 @@ beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
 beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
 beignet channel close <channelId> [--accept-stale-state-risk]
 beignet channel forceclose <channelId> [--accept-stale-state-risk]
+# Both closes pay out to a fresh on-chain wallet address (falling back to the
+# startup sweep address, then the funding-key address), so the closed balance
+# is tracked and spendable without a rescue sweep.
 # A channel restored from a Recovery Capsule refuses either close without the
 # flag. Cooperative: a mutual close pays out restored balances that cannot be
 # proven current. Force: if the peer holds a newer state the broadcast is
