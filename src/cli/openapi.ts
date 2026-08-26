@@ -551,7 +551,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/channel/close': {
 				post: {
 					summary:
-						'Cooperatively close a channel. The payout goes to a fresh on-chain wallet address (falling back to the startup sweep address, then the funding-key address) so the closed balance is tracked and spendable without a rescue sweep. A channel restored from a Recovery Capsule needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway',
+						'Cooperatively close a channel. The payout goes to a wallet-scanned address: the current unused wallet address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address, else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel restored from a Recovery Capsule needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',

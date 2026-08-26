@@ -159,7 +159,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `openChannelAndWait(pubkey, amountSats, opts?)` | `Promise<ChannelInfo>` | Open channel + wait for NORMAL state. `opts: { pushSats?, timeoutMs? }` |
 | `openZeroConfChannel(pubkey, sats, pushSats?)` | `ChannelInfo` | Open zero-conf channel (peer must be trusted) |
 | `openChannelV2(pubkey, params)` | `ChannelInfo` | Open dual-funded v2 channel |
-| `closeChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error? }` | Cooperative close; a capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
+| `closeChannel(channelId, acceptStaleStateRisk?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): the payout resolves to a wallet-scanned address first. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
 | `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; a capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
 | `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `dailySpendLimitSats` |
@@ -1369,9 +1369,11 @@ beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
 beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
 beignet channel close <channelId> [--accept-stale-state-risk]
 beignet channel forceclose <channelId> [--accept-stale-state-risk]
-# Both closes pay out to a fresh on-chain wallet address (falling back to the
-# startup sweep address, then the funding-key address), so the closed balance
-# is tracked and spendable without a rescue sweep.
+# Both closes pay out to a wallet-owned address the wallet scans (the current
+# unused address when the wallet can produce one; consecutive closes may get
+# the same address until it sees use), falling back to the startup sweep
+# address and then the funding-key address, so the closed balance is tracked
+# and spendable without a rescue sweep.
 # A channel restored from a Recovery Capsule refuses either close without the
 # flag. Cooperative: a mutual close pays out restored balances that cannot be
 # proven current. Force: if the peer holds a newer state the broadcast is

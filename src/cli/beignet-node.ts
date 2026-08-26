@@ -1076,6 +1076,16 @@ export class BeignetNode extends EventEmitter {
 	private _sweepRefreshTimer?: ReturnType<typeof setInterval>;
 	/** Background timer waiting for Electrum before fallback-fund recovery (see runFallbackRecoveryWhenConnected). */
 	private _fallbackRecoveryTimer?: ReturnType<typeof setInterval>;
+	/**
+	 * Bound on the cooperative close's wallet-address lookup (issue #542
+	 * review): getNextAvailableAddress can enter an Electrum reconnect whose
+	 * server_version handshake carries no timeout of its own (the same hazard
+	 * HEADER_SUBSCRIBE_GATE_MS bounds in electrum/index.ts), and an unbounded
+	 * wait here means the close never reaches the engine and the cached or
+	 * funding-key fallbacks never run. Well above the client's own 10s
+	 * request timeouts, so a lookup that is merely slow still wins.
+	 */
+	private _closeAddressLookupTimeoutMs = 15_000;
 	// ─── Recovery Protocol surface (docs/RECOVERY-PROTOCOL.md section 8) ───
 	/** Parsed mode; 'off' unless a recognized mode was configured. */
 	private recoveryMode: RecoveryMode = 'off';
@@ -3441,27 +3451,22 @@ export class BeignetNode extends EventEmitter {
 	 * (e.g. Electrum not connected). Never throws.
 	 */
 	private async resolveWalletSweepScript(): Promise<Buffer | undefined> {
-		const bitcoin = require('bitcoinjs-lib');
-		// Preferred: a fresh, unused wallet address. This requires Electrum to
-		// gap-scan for the next unused index.
-		try {
-			const res = await this.wallet.getNextAvailableAddress();
-			if (res.isOk()) {
-				return bitcoin.address.toOutputScript(
-					res.value.addressIndex.address,
-					this.getBitcoinNetwork()
-				);
-			}
-		} catch {
-			// fall through to deterministic derivation
-		}
+		// Preferred: the current unused wallet address. This requires Electrum
+		// to gap-scan for the next unused index.
+		const fresh = await this.resolveCurrentWalletAddressScript();
+		if (fresh) return fresh;
 		// Fallback: deterministically derive a wallet-owned address (index 0) with
 		// NO network dependency. Reusing index 0 is a minor privacy tradeoff, but
 		// it guarantees force-close sweeps always target a wallet-scanned address
 		// rather than the invisible funding-key P2WPKH — even when Electrum is down
 		// at startup, which is exactly when an offline force-close is detected on
 		// restart and a sweep gets built. recoverFallbackFunds remains a safety net
-		// for funds stranded by older sessions.
+		// for funds stranded by older sessions. (The cooperative-close path
+		// deliberately does NOT use this leg: on a mature wallet index 0 can
+		// sit outside the 20-address scan window behind the current index, and
+		// nothing rescues it, so the close chain prefers its cached script and
+		// then the rescuable funding key instead; issue #542 review.)
+		const bitcoin = require('bitcoinjs-lib');
 		try {
 			const address = await this.wallet.getAddress({ index: '0' });
 			if (address) {
@@ -3472,6 +3477,28 @@ export class BeignetNode extends EventEmitter {
 			}
 		} catch {
 			// give up — caller keeps the funding-key fallback + background refresh
+		}
+		return undefined;
+	}
+
+	/**
+	 * The current unused wallet address as an output script, or undefined when
+	 * the wallet cannot produce one (Electrum needed for the gap scan).
+	 */
+	private async resolveCurrentWalletAddressScript(): Promise<
+		Buffer | undefined
+	> {
+		const bitcoin = require('bitcoinjs-lib');
+		try {
+			const res = await this.wallet.getNextAvailableAddress();
+			if (res.isOk()) {
+				return bitcoin.address.toOutputScript(
+					res.value.addressIndex.address,
+					this.getBitcoinNetwork()
+				) as Buffer;
+			}
+		} catch {
+			// fall through to the caller's next leg
 		}
 		return undefined;
 	}
@@ -4682,19 +4709,22 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		// Pay the cooperative-close output to an address the on-chain wallet
-		// actually scans (issue #542, LFBW port #532 workstream 1C; the same
-		// chain forceCloseChannel already walks). The old funding-key script
-		// was invisible to the wallet: the payout sat confirmed on-chain while
-		// the balance read zero until recoverFallbackFunds swept it, a second
-		// transaction and fee. Prefer a fresh wallet address per close (which
-		// itself falls back to the deterministic index-0 wallet address when
-		// Electrum is down), then the sweep script resolved at startup, then
-		// the funding-key P2WPKH that recoverFallbackFunds can still rescue.
-		// Every leg is derived locally from our own keys, so the chain always
-		// terminates in a script we control.
-		let scriptPubkey = await this.resolveWalletSweepScript().catch(
-			() => undefined
-		);
+		// actually scans (issue #542, LFBW port #532 workstream 1C). The old
+		// funding-key script was invisible to the wallet: the payout sat
+		// confirmed on-chain while the balance read zero until
+		// recoverFallbackFunds swept it, a second transaction and fee. The
+		// chain: the current unused wallet address (BOUNDED, because the
+		// lookup can enter an Electrum handshake with no timeout of its own
+		// and the close must reach the engine regardless), then the sweep
+		// script resolved at startup, then the funding-key P2WPKH that
+		// recoverFallbackFunds can still rescue. The index-0 leg the
+		// force-close startup resolution uses is deliberately NOT in this
+		// chain: on a mature wallet index 0 can sit outside the 20-address
+		// scan window behind the current index and nothing rescues it, which
+		// would recreate the invisible payout this change removes (issue #542
+		// review). Every leg is derived locally from our own keys, so the
+		// chain always terminates in a script we control.
+		let scriptPubkey = await this.boundedCurrentWalletAddressScript();
 		if (!scriptPubkey) scriptPubkey = this.sweepDestinationScript;
 		if (!scriptPubkey) {
 			const bitcoin = require('bitcoinjs-lib');
@@ -4704,6 +4734,32 @@ export class BeignetNode extends EventEmitter {
 			) as Buffer;
 		}
 		return this.node.closeChannel(idBuf, scriptPubkey, acceptStaleStateRisk);
+	}
+
+	/**
+	 * The close path's wallet-address lookup, raced against
+	 * _closeAddressLookupTimeoutMs so a non-settling Electrum handshake can
+	 * never park the close before it reaches the engine.
+	 */
+	private async boundedCurrentWalletAddressScript(): Promise<
+		Buffer | undefined
+	> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<undefined>((resolve) => {
+			timer = setTimeout(
+				() => resolve(undefined),
+				this._closeAddressLookupTimeoutMs
+			);
+			timer.unref?.();
+		});
+		try {
+			return await Promise.race([
+				this.resolveCurrentWalletAddressScript().catch(() => undefined),
+				deadline
+			]);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
 	}
 
 	forceCloseChannel(

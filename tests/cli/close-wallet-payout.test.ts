@@ -3,11 +3,14 @@
  * workstream 1C).
  *
  * closeChannel pays the mutual-close output to an address the on-chain
- * wallet actually scans: a fresh wallet address first, then the deterministic
- * index-0 wallet address (resolveWalletSweepScript's own fallback when
- * Electrum cannot gap-scan), then the sweep script resolved at startup, and
- * only then the funding-key P2WPKH the old behavior always paid, which
- * recoverFallbackFunds can still rescue. Every leg is derived locally from
+ * wallet actually scans: the current unused wallet address first (a BOUNDED
+ * lookup, because it can enter an Electrum handshake with no timeout of its
+ * own and the close must reach the engine regardless), then the sweep script
+ * resolved at startup, and only then the funding-key P2WPKH the old behavior
+ * always paid, which recoverFallbackFunds can still rescue. The index-0 leg
+ * the force-close startup resolution uses is deliberately NOT in this chain:
+ * on a mature wallet index 0 can sit outside the 20-address scan window and
+ * nothing rescues it (issue #542 review). Every leg is derived locally from
  * our own keys, so the chain always terminates in a script we control.
  *
  * Engine-stub harness (the funding-refusal-statuses idiom): the captured
@@ -39,6 +42,7 @@ function closableNode(opts: {
 	wallet: Record<string, unknown>;
 	sweepDestinationScript?: Buffer;
 	capture: ICloseCapture;
+	lookupTimeoutMs?: number;
 }): BeignetNode {
 	return Object.assign(Object.create(BeignetNode.prototype), {
 		node: {
@@ -56,7 +60,10 @@ function closableNode(opts: {
 		},
 		networkName: 'regtest',
 		wallet: opts.wallet,
-		sweepDestinationScript: opts.sweepDestinationScript
+		sweepDestinationScript: opts.sweepDestinationScript,
+		// Object.create skips the constructor, so the class-field initializer
+		// never runs; give the bound a real value (short: tests must be fast).
+		_closeAddressLookupTimeoutMs: opts.lookupTimeoutMs ?? 500
 	}) as unknown as BeignetNode;
 }
 
@@ -77,9 +84,33 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 		expect(capture.script?.equals(scriptOf(FRESH_ADDR))).to.equal(true);
 	});
 
-	it('falls back to the deterministic index-0 wallet address offline', async () => {
-		// getNextAvailableAddress needs Electrum (gap scan); getAddress does
-		// not. The close must still land on a wallet-scanned script.
+	it('a never-settling address lookup cannot park the close (issue #542 review)', async () => {
+		// getNextAvailableAddress can enter an Electrum handshake with no
+		// timeout of its own. The close must fall through to the cached
+		// script at the bound instead of waiting forever.
+		const capture: ICloseCapture = {};
+		const sweepScript = scriptOf(FRESH_ADDR);
+		const bn = closableNode({
+			capture,
+			sweepDestinationScript: sweepScript,
+			lookupTimeoutMs: 50,
+			wallet: {
+				getNextAvailableAddress: (): Promise<never> =>
+					new Promise<never>(() => {
+						/* never settles */
+					})
+			}
+		});
+		const result = await bn.closeChannel(CHANNEL_ID);
+		expect(result.ok).to.equal(true);
+		expect(capture.script?.equals(sweepScript)).to.equal(true);
+	});
+
+	it('skips the index-0 leg: offline with no cached script pays the funding key', async () => {
+		// getAddress({index: '0'}) works offline, but on a mature wallet
+		// index 0 can sit outside the 20-address scan window and nothing
+		// rescues it; the funding key IS rescued (recoverFallbackFunds), so
+		// the close chain must prefer it (issue #542 review).
 		const capture: ICloseCapture = {};
 		const bn = closableNode({
 			capture,
@@ -91,7 +122,8 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 			}
 		});
 		await bn.closeChannel(CHANNEL_ID);
-		expect(capture.script?.equals(scriptOf(INDEX0_ADDR))).to.equal(true);
+		expect(capture.script?.equals(scriptOf(INDEX0_ADDR))).to.equal(false);
+		expect(capture.script?.equals(scriptOf(FUNDING_ADDR))).to.equal(true);
 	});
 
 	it('falls back to the startup sweep script when the wallet has no address', async () => {
