@@ -17,6 +17,7 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	BEIGNET_CUSTOM_MESSAGE_TYPE,
+	BEIGNET_CUSTOM_MAX_PAYLOAD,
 	BEIGNET_CUSTOM_PROTOCOL_VERSION,
 	BeignetCustomSubtype,
 	encodeCustomMessage,
@@ -92,6 +93,23 @@ describe('Custom message codec (type 44069)', () => {
 	it('refuses an envelope shorter than its header', () => {
 		expect(() => decodeCustomMessage(Buffer.alloc(3))).to.throw(/too short/);
 	});
+
+	it('caps the payload at the BOLT 8 frame minus type and header, exactly', () => {
+		// 65535 - 2 (wire type) - 4 (envelope header): one byte more would be
+		// rejected deep in the transport cipher AFTER the caller thinks it
+		// sent (issue #546 review); it must fail here, named.
+		const max = encodeCustomMessage(
+			1,
+			Buffer.alloc(BEIGNET_CUSTOM_MAX_PAYLOAD)
+		);
+		expect(decodeCustomMessage(max).payload.length).to.equal(
+			BEIGNET_CUSTOM_MAX_PAYLOAD
+		);
+		expect(BEIGNET_CUSTOM_MAX_PAYLOAD).to.equal(65_529);
+		expect(() =>
+			encodeCustomMessage(1, Buffer.alloc(BEIGNET_CUSTOM_MAX_PAYLOAD + 1))
+		).to.throw(/exceeds the 65529-byte maximum/);
+	});
 });
 
 describe('LightningNode custom message surface (issue #546)', () => {
@@ -164,6 +182,57 @@ describe('LightningNode custom message surface (issue #546)', () => {
 				encodeCustomMessage(1, Buffer.alloc(0))
 			);
 			expect(forwarded).to.have.length(0);
+		} finally {
+			node.destroy();
+		}
+	});
+
+	it('a throwing listener is contained and labeled as its own failure', () => {
+		// A listener error is the observer's bug: it must not be mislabeled
+		// as a peer decode failure, and it must never escape into the
+		// transport (issue #546 review).
+		const node = makeNode();
+		try {
+			const logs: Array<{ action: string }> = [];
+			node.on('log', (...args: unknown[]) =>
+				logs.push(args[0] as { action: string })
+			);
+			node.on('custom-message', () => {
+				throw new Error('observer bug');
+			});
+			expect(() =>
+				node.handlePeerMessage(
+					PEER,
+					BEIGNET_CUSTOM_MESSAGE_TYPE,
+					encodeCustomMessage(1, Buffer.alloc(0))
+				)
+			).to.not.throw();
+			expect(
+				logs.some((l) => l.action === 'custom_message_listener_failed'),
+				'labeled as a listener failure'
+			).to.equal(true);
+			expect(
+				logs.some((l) => l.action === 'custom_message_decode_failed'),
+				'never labeled as a decode failure'
+			).to.equal(false);
+		} finally {
+			node.destroy();
+		}
+	});
+
+	it('a throwing log listener on a malformed envelope never reaches the transport', () => {
+		const node = makeNode();
+		try {
+			node.on('log', () => {
+				throw new Error('log observer bug');
+			});
+			expect(() =>
+				node.handlePeerMessage(
+					PEER,
+					BEIGNET_CUSTOM_MESSAGE_TYPE,
+					Buffer.alloc(2)
+				)
+			).to.not.throw();
 		} finally {
 			node.destroy();
 		}

@@ -154,6 +154,7 @@ import {
 } from '../message/peer-storage';
 import {
 	BEIGNET_CUSTOM_MESSAGE_TYPE,
+	ICustomMessage,
 	encodeCustomMessage,
 	decodeCustomMessage
 } from '../message/custom';
@@ -16268,8 +16269,26 @@ export class LightningNode extends EventEmitter {
 		// tolerate them); an undecodable envelope is logged and dropped
 		// without disconnecting the peer.
 		if (type === BEIGNET_CUSTOM_MESSAGE_TYPE) {
+			// Decode failures and observer failures are DIFFERENT errors and
+			// neither may reach the transport (issue #546 review): a throwing
+			// 'custom-message' listener is the observer's bug, not a peer
+			// decode failure, and a throwing 'log' listener during either
+			// report would otherwise escape and cost the peer its connection.
+			let msg: ICustomMessage;
 			try {
-				const msg = decodeCustomMessage(payload);
+				msg = decodeCustomMessage(payload);
+			} catch (err) {
+				try {
+					this.emitStructuredLog('peer', 'custom_message_decode_failed', {
+						pubkey,
+						error: err instanceof Error ? err.message : String(err)
+					});
+				} catch {
+					// A throwing log observer must not disconnect the peer.
+				}
+				return;
+			}
+			try {
 				this.emit('custom-message', {
 					peerPubkey: pubkey,
 					version: msg.version,
@@ -16277,10 +16296,15 @@ export class LightningNode extends EventEmitter {
 					payload: msg.payload
 				});
 			} catch (err) {
-				this.emitStructuredLog('peer', 'custom_message_decode_failed', {
-					pubkey,
-					error: err instanceof Error ? err.message : String(err)
-				});
+				try {
+					this.emitStructuredLog('peer', 'custom_message_listener_failed', {
+						pubkey,
+						subtype: msg.subtype,
+						error: err instanceof Error ? err.message : String(err)
+					});
+				} catch {
+					// Same rule: observers never take the transport down.
+				}
 			}
 			return;
 		}

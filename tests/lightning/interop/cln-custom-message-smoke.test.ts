@@ -73,6 +73,15 @@ describe('Interop: CLN ignores the beignet custom odd type (44069)', function ()
 		node.on('node:error', () => {
 			/* absorb */
 		});
+		// createInteropNode enables auto-reconnect, whose first retry can land
+		// inside the waits below: a "still connected" check alone would pass
+		// even if CLN dropped us on the odd type and we quietly reconnected
+		// (issue #546 review). Track every disconnect from the moment we
+		// connect and demand zero.
+		const disconnects: string[] = [];
+		node.on('peer:disconnect', (...args: unknown[]) => {
+			disconnects.push(String(args[0]));
+		});
 		await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
 		await sleep(1500);
 
@@ -90,6 +99,11 @@ describe('Interop: CLN ignores the beignet custom odd type (44069)', function ()
 			crypto.randomBytes(16_384)
 		);
 		await sleep(2000);
+
+		// The connection was never dropped, not merely re-established: an
+		// auto-reconnect after a CLN disconnect would leave the later checks
+		// green while disproving the whole odd-type-tolerance claim.
+		expect(disconnects, 'no disconnect at any point').to.have.length(0);
 
 		// Our side still lists the peer ready (no error/disconnect came back)...
 		const peers = node.listPeers();

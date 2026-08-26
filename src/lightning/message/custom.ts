@@ -20,6 +20,15 @@ export const BEIGNET_CUSTOM_MESSAGE_TYPE = 44069;
 export const BEIGNET_CUSTOM_PROTOCOL_VERSION = 1;
 
 /**
+ * Largest application payload one envelope can carry: BOLT 8 caps a Lightning
+ * message at 65535 bytes, of which the wire type takes 2 and this envelope's
+ * header 4. Enforced at encode so an oversized payload fails HERE, named,
+ * instead of deep in the transport cipher after the caller thinks it sent
+ * (issue #546 review).
+ */
+export const BEIGNET_CUSTOM_MAX_PAYLOAD = 65_535 - 2 - 4;
+
+/**
  * Subtype registry. The numbers are RESERVED here ahead of the workstreams
  * that implement them (#532 phases 3 and 4) so no later protocol collides:
  * 1 and 2 belong to JIT receive, 16 to 22 to direct funding. 3
@@ -69,6 +78,13 @@ export function encodeCustomMessage(
 	}
 	if (!Number.isInteger(version) || version < 0 || version > 0xffff) {
 		throw new Error(`custom message version out of range: ${version}`);
+	}
+	if (payload.length > BEIGNET_CUSTOM_MAX_PAYLOAD) {
+		throw new Error(
+			`custom message payload ${payload.length} bytes exceeds the ` +
+				`${BEIGNET_CUSTOM_MAX_PAYLOAD}-byte maximum (BOLT 8 message cap ` +
+				'minus the wire type and envelope header)'
+		);
 	}
 	const header = Buffer.alloc(4);
 	header.writeUInt16BE(version, 0);
