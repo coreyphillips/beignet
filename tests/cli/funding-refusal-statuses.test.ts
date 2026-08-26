@@ -59,6 +59,20 @@ function refusalFrom(fn: () => unknown, label: string): BeignetError {
 	expect.fail(`${label}: expected a refusal`);
 }
 
+/** The async twin: closeChannel rejects since issue #542 (wallet payout). */
+async function refusalFromAsync(
+	fn: () => Promise<unknown>,
+	label: string
+): Promise<BeignetError> {
+	try {
+		await fn();
+	} catch (err: unknown) {
+		expect(err, label).to.be.instanceOf(BeignetError);
+		return err as BeignetError;
+	}
+	expect.fail(`${label}: expected a refusal`);
+}
+
 describe('Issue #471: state and config refusals carry a code, not a 500', () => {
 	const MESSAGES: Record<ChannelFundingUnavailableCode, string> = {
 		[ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED]:
@@ -853,7 +867,7 @@ describe('Issue #474: the payment and invoice paths guard before BigInt()', () =
 		expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
 	});
 
-	it('closes: an unknown channel is CHANNEL_NOT_FOUND, not a 500 grab-bag', () => {
+	it('closes: an unknown channel is CHANNEL_NOT_FOUND, not a 500 grab-bag', async () => {
 		const bn = nodeWithEngine({
 			getChannel: (): undefined => undefined,
 			getFundingAddress: (): string =>
@@ -862,34 +876,44 @@ describe('Issue #474: the payment and invoice paths guard before BigInt()', () =
 			closeChannel: (): never => expect.fail('the engine was reached'),
 			forceCloseChannel: (): never => expect.fail('the engine was reached')
 		});
-		for (const [label, call] of [
-			['closeChannel', (): unknown => bn.closeChannel(CHANNEL_ID)],
-			['forceCloseChannel', (): unknown => bn.forceCloseChannel(CHANNEL_ID)]
-		] as Array<[string, () => unknown]>) {
-			const err = refusalFrom(call, label);
+		for (const [label, err] of [
+			[
+				'closeChannel',
+				await refusalFromAsync(() => bn.closeChannel(CHANNEL_ID), 'close')
+			],
+			[
+				'forceCloseChannel',
+				refusalFrom(() => bn.forceCloseChannel(CHANNEL_ID), 'force')
+			]
+		] as Array<[string, BeignetError]>) {
 			expect(err.code, label).to.equal(BeignetErrorCode.CHANNEL_NOT_FOUND);
 			expect(statusForErrorCode(err.code), label).to.equal(404);
 			expect(err.message, label).to.contain(CHANNEL_ID);
 		}
 	});
 
-	it('closes: a malformed channel id is refused, not truncated', () => {
+	it('closes: a malformed channel id is refused, not truncated', async () => {
 		const bn = nodeWithEngine({
 			getChannel: (): never => expect.fail('the id guard was skipped'),
 			getFundingAddress: (): never => expect.fail('the id guard was skipped'),
 			getRecoveryStatus: (): unknown => ({ channels: [] })
 		});
-		for (const [label, call] of [
-			['closeChannel', (): unknown => bn.closeChannel('cd')],
-			['forceCloseChannel', (): unknown => bn.forceCloseChannel('cd')]
-		] as Array<[string, () => unknown]>) {
-			const err = refusalFrom(call, label);
+		for (const [label, err] of [
+			[
+				'closeChannel',
+				await refusalFromAsync(() => bn.closeChannel('cd'), 'close')
+			],
+			[
+				'forceCloseChannel',
+				refusalFrom(() => bn.forceCloseChannel('cd'), 'force')
+			]
+		] as Array<[string, BeignetError]>) {
 			expect(err.code, label).to.equal(BeignetErrorCode.INVALID_PARAMS);
 			expect(statusForErrorCode(err.code), label).to.equal(400);
 		}
 	});
 
-	it('keeps CLOSE_FAILED for a channel that exists and would not close', () => {
+	it('keeps CLOSE_FAILED for a channel that exists and would not close', async () => {
 		const bn = nodeWithEngine({
 			getChannel: (): unknown => ({ channelId: Buffer.alloc(32) }),
 			getFundingAddress: (): string =>
@@ -899,7 +923,7 @@ describe('Issue #474: the payment and invoice paths guard before BigInt()', () =
 				error: 'channel is quiescing'
 			})
 		});
-		const result = bn.closeChannel(CHANNEL_ID);
+		const result = await bn.closeChannel(CHANNEL_ID);
 		expect(result.ok).to.equal(false);
 		expect(result.error).to.equal('channel is quiescing');
 	});

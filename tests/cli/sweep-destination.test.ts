@@ -24,8 +24,14 @@ const UNUSED_ADDR = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4';
 const DERIVED_ADDR = 'bc1qa4kyhz5j36mynpvj75hg6ms4nrq58h60n2ghv0';
 
 function callResolve(wallet: any): Promise<Buffer | undefined> {
-	const fakeThis = { wallet, getBitcoinNetwork: () => NETWORK };
-	return (BeignetNode.prototype as any).resolveWalletSweepScript.call(fakeThis);
+	// Inherit the prototype (the funding-refusal-statuses idiom):
+	// resolveWalletSweepScript delegates to another private method since
+	// issue #542, so a bare literal `this` no longer resolves it.
+	const fakeThis = Object.assign(Object.create(BeignetNode.prototype), {
+		wallet,
+		getBitcoinNetwork: () => NETWORK
+	});
+	return (fakeThis as any).resolveWalletSweepScript();
 }
 
 const okResult = (address: string): any => ({
