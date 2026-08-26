@@ -557,6 +557,24 @@ export interface BeignetConfig {
 	 *  (default 600000, 0 answers immediately). Env:
 	 *  BEIGNET_RECOVERY_REESTABLISH_HOLD_MS. */
 	recoveryReestablishHoldMs?: number;
+	/** Node-wide default routing fee policy advertised in channel_update
+	 *  (BOLT 7; base u32 msat, proportional u32 millionths, cltv delta u16).
+	 *  Per-channel overrides set through the channel policy update surface win
+	 *  over these defaults. Envs: BEIGNET_FEE_BASE_MSAT, BEIGNET_FEE_PPM,
+	 *  BEIGNET_CLTV_DELTA (whole integers; anything else refuses startup).
+	 *  Issue #532 workstream 1B. */
+	routingFeeBaseMsat?: number;
+	routingFeePpm?: number;
+	routingCltvDelta?: number;
+	/** Liquidity ads (bLIP-0051, option_will_fund) SELLER policy: answer a
+	 *  buyer's request_funds by leasing inbound at these rates. Env:
+	 *  BEIGNET_LEASE_RATES, a JSON object with the five lease_rates fields
+	 *  (fundingWeightWitness, leaseFeeBasis, leaseFeeBaseSat,
+	 *  channelFeeMaxBaseMsat, channelFeeMaxProportionalThousandths). A
+	 *  malformed or out-of-range value refuses startup: the rates are encoded
+	 *  into the signed will_fund record, where an out-of-range field would
+	 *  silently wrap on the wire. Unset means never sell. */
+	leaseRates?: import('../lightning/gossip/types').ILeaseRates;
 }
 
 export interface HealthInfo {

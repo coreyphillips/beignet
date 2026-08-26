@@ -12,6 +12,7 @@ import { Console } from 'console';
 import {
 	BeignetNode,
 	BeignetNodeOptions,
+	leaseRatesRefusal,
 	parseRecoveryMode
 } from './beignet-node';
 import { parseGuardianEntry } from '../lightning/recovery';
@@ -584,6 +585,64 @@ async function bootDaemon(
 				`"${opts.recoveryMode ?? 'off'}" (resolved: ${recoveryMode}); ` +
 				'guardians need async-remote or quorum'
 		);
+	}
+	// Routing fee defaults ride in channel_update as u32/u32/u16 (BOLT 7),
+	// so a value the wire cannot hold refuses startup here, naming the env
+	// var, before it can wrap into an advertised policy the operator never
+	// wrote (issue #532 workstream 1B). integerEnv turns a partially numeric
+	// env value into NaN, which these same checks refuse.
+	if (
+		opts.routingFeeBaseMsat !== undefined &&
+		(!Number.isInteger(opts.routingFeeBaseMsat) ||
+			opts.routingFeeBaseMsat < 0 ||
+			opts.routingFeeBaseMsat > 0xffffffff)
+	) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Invalid routing base fee "${String(opts.routingFeeBaseMsat)}"; ` +
+				'BEIGNET_FEE_BASE_MSAT must be an integer between 0 and 4294967295'
+		);
+	}
+	if (
+		opts.routingFeePpm !== undefined &&
+		(!Number.isInteger(opts.routingFeePpm) ||
+			opts.routingFeePpm < 0 ||
+			opts.routingFeePpm > 0xffffffff)
+	) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Invalid routing proportional fee "${String(opts.routingFeePpm)}"; ` +
+				'BEIGNET_FEE_PPM must be an integer between 0 and 4294967295'
+		);
+	}
+	if (
+		opts.routingCltvDelta !== undefined &&
+		(!Number.isInteger(opts.routingCltvDelta) ||
+			opts.routingCltvDelta < 1 ||
+			opts.routingCltvDelta > 0xffff)
+	) {
+		// Floor 1, not 0: a zero delta leaves no window to claim a forwarded
+		// HTLC on-chain after learning the preimage. BOLT 2/7 recommend 18.
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Invalid routing CLTV delta "${String(opts.routingCltvDelta)}"; ` +
+				'BEIGNET_CLTV_DELTA must be an integer between 1 and 65535 ' +
+				'(>= 18 recommended)'
+		);
+	}
+	if (opts.leaseRates !== undefined) {
+		// The rates end up inside the SIGNED will_fund record, whose tu32
+		// encoder silently wraps an out-of-range channelFeeMaxBaseMsat, so a
+		// malformed policy refuses startup rather than selling at numbers the
+		// operator never wrote. leaseRatesEnv surfaces unparseable JSON as
+		// NaN fields that fail this same check.
+		const refusal = leaseRatesRefusal(opts.leaseRates);
+		if (refusal !== null) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`Invalid lease rates; BEIGNET_LEASE_RATES ${refusal}`
+			);
+		}
 	}
 	// Diagnostic logger: an injected opts.logger wins; otherwise a configured
 	// logLevel creates a console logger on stderr (stdout stays reserved for
@@ -1616,13 +1675,23 @@ async function bootDaemon(
 				amountSats,
 				fundingFeeratePerkw,
 				commitmentFeeratePerkw,
-				locktime
+				locktime,
+				requestFunds,
+				maxLeaseRates
 			} = body as {
 				pubkey: string;
 				amountSats: number;
 				fundingFeeratePerkw?: number;
 				commitmentFeeratePerkw?: number;
 				locktime?: number;
+				/** Liquidity ads buyer (issue #532 1B): lease this much inbound
+				 *  into the channel being opened. Shape and ranges are enforced
+				 *  in BeignetNode.openChannelV2; the pairing rule (requestFunds
+				 *  needs maxLeaseRates) stays with the library. */
+				requestFunds?: { requestedSats: number; blockheight: number };
+				/** Buyer's own price ceiling for the lease; never echo the
+				 *  seller's advertised rates here. */
+				maxLeaseRates?: import('../lightning/gossip/types').ILeaseRates;
 			};
 			if (!pubkey || amountSats === undefined)
 				return failure('INVALID_PARAMS', 'pubkey and amountSats required');
@@ -1631,7 +1700,9 @@ async function bootDaemon(
 					amountSats,
 					fundingFeeratePerkw,
 					commitmentFeeratePerkw,
-					locktime
+					locktime,
+					requestFunds,
+					maxLeaseRates
 				})
 			);
 		},

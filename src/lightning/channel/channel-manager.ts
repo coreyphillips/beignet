@@ -167,7 +167,11 @@ import {
 	IDualFundingParams
 } from './dual-funding';
 import { ILeaseRates } from '../gossip/types';
-import { signWillFund, verifyWillFund } from './liquidity-ads';
+import {
+	LEASE_DURATION_BLOCKS,
+	signWillFund,
+	verifyWillFund
+} from './liquidity-ads';
 import { decodeAnnouncementSignaturesMessage } from '../gossip/messages';
 import { Feature, FeatureFlags } from '../features/flags';
 
@@ -5760,6 +5764,39 @@ export class ChannelManager extends EventEmitter {
 		if (this._namespaceCannotRecordANewChannel()) {
 			this.refuseInboundOpen(peerPubkey, msg.channelId, NAMESPACE_LOST_REFUSAL);
 			return;
+		}
+
+		// Liquidity ads: when this open would make us SIGN a will_fund (the
+		// buyer requested funds and we sell), the buyer-supplied blockheight
+		// must be bounded BEFORE any key derivation or temp-channel retention.
+		// The signed witness data writes lease_expiry = blockheight +
+		// LEASE_DURATION_BLOCKS as a u32, so a wire-valid 0xffffffff would
+		// throw out of signWillFund AFTER the temporary channel was stored:
+		// repeated opens then accumulate retained channels with no
+		// wire-visible answer (issue #536 review). The finer tip-window check
+		// stays in the channel (it needs the channel's current height); this
+		// bound only guarantees the arithmetic the signature commits to
+		// cannot overflow.
+		if (
+			msg.requestFunds &&
+			msg.requestFunds.requestedSats > 0n &&
+			this.config.leaseRates &&
+			this.config.nodePrivateKey &&
+			!isTaprootChannel(msg.channelType ?? null)
+		) {
+			const bh = msg.requestFunds.blockheight;
+			if (
+				!Number.isInteger(bh) ||
+				bh < 1 ||
+				bh > 0xffffffff - LEASE_DURATION_BLOCKS
+			) {
+				this.refuseInboundOpen(
+					peerPubkey,
+					msg.channelId,
+					`Buyer lease blockheight ${bh} is out of the acceptable range`
+				);
+				return;
+			}
 		}
 
 		const chKeys = this.deriveKeysForNewChannel();
