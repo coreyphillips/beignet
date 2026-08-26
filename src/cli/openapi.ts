@@ -2370,9 +2370,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 											description:
 												'Liquidity ads buyer (option_will_fund): ask the peer to lease this much inbound into the channel being opened. Requires maxLeaseRates.',
 											properties: {
-												requestedSats: { type: 'number' },
+												requestedSats: {
+													type: 'integer',
+													minimum: 1
+												},
 												blockheight: {
-													type: 'number',
+													type: 'integer',
+													minimum: 1,
+													maximum: 4294967295,
 													description:
 														'Current chain tip height; the seller refuses a stale value'
 												}
@@ -2382,14 +2387,32 @@ export function getOpenApiSpec(): Record<string, unknown> {
 										maxLeaseRates: {
 											type: 'object',
 											description:
-												"The buyer's own price ceiling for the lease, compared as a computed total fee. Choose it locally; echoing the seller's advertised rates back makes any price acceptable.",
+												"The buyer's own price ceiling for the lease, compared as a computed total fee. Choose it locally; echoing the seller's advertised rates back makes any price acceptable. Field bounds are the option_will_fund wire widths.",
 											properties: {
-												fundingWeightWitness: { type: 'number' },
-												leaseFeeBasis: { type: 'number' },
-												leaseFeeBaseSat: { type: 'number' },
-												channelFeeMaxBaseMsat: { type: 'number' },
+												fundingWeightWitness: {
+													type: 'integer',
+													minimum: 0,
+													maximum: 65535
+												},
+												leaseFeeBasis: {
+													type: 'integer',
+													minimum: 0,
+													maximum: 65535
+												},
+												leaseFeeBaseSat: {
+													type: 'integer',
+													minimum: 0,
+													maximum: 4294967295
+												},
+												channelFeeMaxBaseMsat: {
+													type: 'integer',
+													minimum: 0,
+													maximum: 4294967295
+												},
 												channelFeeMaxProportionalThousandths: {
-													type: 'number'
+													type: 'integer',
+													minimum: 0,
+													maximum: 65535
 												}
 											},
 											required: [
@@ -2401,7 +2424,15 @@ export function getOpenApiSpec(): Record<string, unknown> {
 											]
 										}
 									},
-									required: ['pubkey', 'amountSats']
+									required: ['pubkey', 'amountSats'],
+									// OpenAPI 3.0 has no dependentRequired, so the
+									// "requestFunds needs maxLeaseRates" rule is the
+									// 3.0-compatible implication: either no
+									// requestFunds, or maxLeaseRates present.
+									anyOf: [
+										{ not: { required: ['requestFunds'] } },
+										{ required: ['maxLeaseRates'] }
+									]
 								}
 							}
 						}

@@ -8875,7 +8875,7 @@ export class LightningNode extends EventEmitter {
 			state.remoteConfig.maxHtlcValueInFlightMsat > capacityMsat
 				? capacityMsat
 				: state.remoteConfig.maxHtlcValueInFlightMsat;
-		return {
+		const policy: IChannelPolicy = {
 			feeBaseMsat: override?.feeBaseMsat ?? this.forwardingFeeBaseMsat,
 			feeProportionalMillionths:
 				override?.feeProportionalMillionths ?? this.forwardingFeePropMillionths,
@@ -8886,6 +8886,7 @@ export class LightningNode extends EventEmitter {
 			source:
 				override && Object.keys(override).length > 0 ? 'override' : 'default'
 		};
+		return this.applyLeaseFeeCaps(channelId, policy);
 	}
 
 	/**
@@ -8900,12 +8901,54 @@ export class LightningNode extends EventEmitter {
 		const override = channelId
 			? this.channelPolicies.get(channelId.toString('hex'))
 			: undefined;
-		return {
+		return this.applyLeaseFeeCaps(channelId, {
 			feeBaseMsat: override?.feeBaseMsat ?? this.forwardingFeeBaseMsat,
 			feeProportionalMillionths:
 				override?.feeProportionalMillionths ?? this.forwardingFeePropMillionths,
 			cltvExpiryDelta: override?.cltvExpiryDelta ?? this.forwardingCltvDelta
-		};
+		});
+	}
+
+	/**
+	 * Clamp a fee policy to the caps we signed into will_fund while WE are
+	 * the lessor and the lease is still active (bLIP-0051). The buyer paid
+	 * for capped routing fees, so every surface that speaks for the channel
+	 * must apply the same caps: the announced and unannounced channel_update
+	 * builders, the policy reporting surface, AND the forwarding enforcement.
+	 * Clamping only the advertisement while enforcing the raw defaults or
+	 * override makes routes that pay the advertised fee die with
+	 * fee_insufficient (issue #536 review); this helper is the single
+	 * effective-policy point both sides read.
+	 */
+	private applyLeaseFeeCaps<
+		T extends { feeBaseMsat: number; feeProportionalMillionths: number }
+	>(channelId: Buffer | undefined, policy: T): T {
+		if (!channelId) return policy;
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return policy;
+		const st = channel.getFullState();
+		if (
+			!st.isLessor ||
+			st.leaseExpiry === undefined ||
+			(this.currentBlockHeight !== 0 &&
+				this.currentBlockHeight >= st.leaseExpiry)
+		) {
+			return policy;
+		}
+		const capped = { ...policy };
+		if (
+			st.leaseChannelFeeMaxBaseMsat !== undefined &&
+			capped.feeBaseMsat > st.leaseChannelFeeMaxBaseMsat
+		) {
+			capped.feeBaseMsat = st.leaseChannelFeeMaxBaseMsat;
+		}
+		if (st.leaseChannelFeeMaxProportionalThousandths !== undefined) {
+			const capMillionths = st.leaseChannelFeeMaxProportionalThousandths * 1000;
+			if (capped.feeProportionalMillionths > capMillionths) {
+				capped.feeProportionalMillionths = capMillionths;
+			}
+		}
+		return capped;
 	}
 
 	private validateChannelPolicyFields(policy: IChannelPolicyUpdate): void {
@@ -10942,30 +10985,10 @@ export class LightningNode extends EventEmitter {
 					policy.htlcMaximumMsat > capacityMsat
 						? capacityMsat
 						: policy.htlcMaximumMsat;
-				// Liquidity ads (bLIP-0051): while WE are the lessor and the lease is
-				// still active, clamp our advertised routing fees to the caps we
-				// signed into will_fund. The buyer paid for capped fees; exceeding
-				// them breaks the lease promise.
-				if (
-					st.isLessor &&
-					st.leaseExpiry !== undefined &&
-					(this.currentBlockHeight === 0 ||
-						this.currentBlockHeight < st.leaseExpiry)
-				) {
-					if (
-						st.leaseChannelFeeMaxBaseMsat !== undefined &&
-						msg.feeBaseMsat > st.leaseChannelFeeMaxBaseMsat
-					) {
-						msg.feeBaseMsat = st.leaseChannelFeeMaxBaseMsat;
-					}
-					if (st.leaseChannelFeeMaxProportionalThousandths !== undefined) {
-						const capMillionths =
-							st.leaseChannelFeeMaxProportionalThousandths * 1000;
-						if (msg.feeProportionalMillionths > capMillionths) {
-							msg.feeProportionalMillionths = capMillionths;
-						}
-					}
-				}
+				// The bLIP-0051 lessor fee clamp already happened inside
+				// getChannelPolicy (applyLeaseFeeCaps), the same effective
+				// policy the forwarding checks enforce, so what this update
+				// advertises is exactly what an HTLC will be held to.
 			}
 			const payload = encodeChannelUpdateMessage(msg);
 			const sig = signChannelUpdate(payload, this.nodePrivkey);

@@ -869,10 +869,15 @@ async function handleChannel(): Promise<void> {
 					// it like the daemon's other clients do rather than making
 					// the operator look it up.
 					const info = await httpRequest('GET', '/info');
+					if (!info.ok) {
+						// A failed /info (auth refusal, daemon fault) must surface
+						// as itself; rewriting it into a blockheight complaint
+						// hides the actual problem (issue #536 review).
+						return outputResult(info);
+					}
 					const height =
-						info.ok &&
 						typeof (info.result as { blockHeight?: unknown })?.blockHeight ===
-							'number'
+						'number'
 							? (info.result as { blockHeight: number }).blockHeight
 							: 0;
 					if (!(height > 0)) {

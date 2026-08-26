@@ -177,6 +177,57 @@ describe('CLI open-v2 lease flags', function () {
 		expect(code).to.equal(1);
 	});
 
+	it('a failed /info surfaces as itself, not as a blockheight complaint', async () => {
+		// Auth-enabled daemon, CLI with no credential: the automatic
+		// blockheight lookup's GET /info comes back 401. Rewriting that into
+		// "block height unavailable" hid the real problem (issue #536
+		// review); the original refusal must reach the operator.
+		const authDataDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), 'beignet-open-v2-auth-')
+		);
+		const authHome = fs.mkdtempSync(
+			path.join(os.tmpdir(), 'beignet-cli-auth-home-')
+		);
+		const authDaemon = await startDaemon({
+			electrumHost: '127.0.0.1',
+			electrumPort: 65529,
+			electrumTls: false,
+			rapidGossipSync: false,
+			autoGossipSync: false,
+			logLevel: 'silent',
+			network: 'regtest',
+			mnemonic: MNEMONIC,
+			daemonPort: 0,
+			dataDir: authDataDir,
+			apiKeys: [{ name: 'ops', key: 'secret', scopes: ['admin'] }]
+		});
+		try {
+			const authPort = (authDaemon.server.address() as AddressInfo).port;
+			fs.mkdirSync(path.join(authHome, '.beignet'), { recursive: true });
+			fs.writeFileSync(
+				path.join(authHome, '.beignet', 'daemon.pid'),
+				JSON.stringify({ pid: process.pid, port: authPort })
+			);
+			const { stdout, code } = await runCli(authHome, [
+				'channel',
+				'open-v2',
+				PEER,
+				'100000',
+				'--request-funds',
+				'50000'
+			]);
+			const parsed = JSON.parse(stdout) as ICliResult;
+			expect(parsed.ok).to.equal(false);
+			expect(parsed.error?.code).to.equal('UNAUTHORIZED');
+			expect(parsed.error?.message ?? '').to.not.include('block height');
+			expect(code).to.equal(1);
+		} finally {
+			await authDaemon.stop();
+			fs.rmSync(authDataDir, { recursive: true, force: true });
+			fs.rmSync(authHome, { recursive: true, force: true });
+		}
+	});
+
 	it('--request-funds on an unsynced node demands an explicit --blockheight', async () => {
 		// The offline daemon's tip is 0; request_funds carries the buyer's
 		// blockheight, so the CLI refuses locally rather than sending a

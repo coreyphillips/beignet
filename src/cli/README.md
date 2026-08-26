@@ -1362,7 +1362,9 @@ beignet trusted-peer list
 ```bash
 beignet channel open <pubkey> <sats> [pushSats]
 beignet channel open-zeroconf <pubkey> <sats> [pushSats]
-beignet channel open-v2 <pubkey> <sats> [fundingFeeratePerkw]
+beignet channel open-v2 <pubkey> <sats> [fundingFeeratePerkw] [--request-funds <sats>] [--blockheight <n>] [--max-lease-rates '<json>']
+# The lease flags buy inbound liquidity (option_will_fund) at or under the
+# given rate ceiling; --blockheight defaults to the node's current tip.
 beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
 beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
 beignet channel close <channelId> [--accept-stale-state-risk]
