@@ -520,6 +520,8 @@ export class LightningNode extends EventEmitter {
 	private forwardingCltvDelta: number;
 	private forwardingFeeBaseMsat: number;
 	private forwardingFeePropMillionths: number;
+	/** Liquidity ads seller policy; also published in node_announcement. */
+	private readonly leaseRates?: import('../gossip/types').ILeaseRates;
 	/** Per-channel routing-policy overrides (channelId hex -> partial policy). */
 	private channelPolicies: Map<string, IChannelPolicyUpdate> = new Map();
 	private gossipSyncManagers: Map<string, GossipSyncManager> = new Map();
@@ -1029,7 +1031,11 @@ export class LightningNode extends EventEmitter {
 		}
 		// option_will_fund: advertised only when a seller policy is configured —
 		// a CLN buyer refuses to even request funds (fundchannel request_amt)
-		// from a peer that does not advertise the bit.
+		// from a peer that does not advertise the bit. The rates themselves are
+		// kept for node_announcement's lease_rates TLV (issue #539): a buyer
+		// pricing from the gossip ad needs the terms, and verifyWillFund's
+		// contract says the signed rates must match the advertised ones.
+		this.leaseRates = config.leaseRates;
 		if (config.leaseRates) {
 			localFeatures.setOptional(Feature.OPTION_WILL_FUND);
 		}
@@ -10939,7 +10945,14 @@ export class LightningNode extends EventEmitter {
 				nodeId,
 				rgbColor: Buffer.from([0, 0, 0]),
 				alias: aliasBuffer,
-				addresses: this.announcedAddresses
+				addresses: this.announcedAddresses,
+				// A configured seller publishes its rates in the lease_rates TLV
+				// (issue #539). The option_will_fund bit alone told buyers we
+				// sell but not at what price, so anything pricing from the
+				// gossip ad skipped us or requested blind; these are the exact
+				// rates will_fund signs (verifyWillFund's contract). Undefined
+				// for non-sellers: no TLV is emitted.
+				leaseRates: this.leaseRates
 			});
 			const sig = signNodeAnnouncement(payload, this.nodePrivkey);
 			sig.copy(payload, 0);
