@@ -849,7 +849,10 @@ async function handleChannel(): Promise<void> {
 				await httpRequest('POST', '/channel/splice-out', {
 					channelId: filteredArgs[2],
 					amountSats: parseInt(filteredArgs[3], 10),
-					feeratePerkw: parseInt(filteredArgs[4], 10)
+					feeratePerkw: parseInt(filteredArgs[4], 10),
+					// Optional external destination (issue #534); omitted, the
+					// spliced-out funds go to the wallet.
+					...(filteredArgs[5] !== undefined ? { address: filteredArgs[5] } : {})
 				})
 			);
 		case 'ensure-minimum':
@@ -2447,7 +2450,9 @@ Channels:
   channel splice-quote <id> <in|out> <feerate>
                                          Quote a splice: fee + max amount
   channel splice-in <id> <sats> <feerate>   Add funds to channel
-  channel splice-out <id> <sats> <feerate>  Withdraw funds from channel
+  channel splice-out <id> <sats> <feerate> [address]
+                                         Withdraw funds from channel, to the
+                                         wallet or an external address
   channel ensure-minimum <count> <sats>  Auto-open channels to minimum count
   channel update-policy <id|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N]
                         [--htlc-min-msat N] [--htlc-max-msat N]

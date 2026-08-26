@@ -1373,7 +1373,9 @@ beignet channel forceclose <channelId> [--accept-stale-state-risk]
 # revoked and the whole channel balance goes to the justice path.
 beignet channel rebroadcast-close <channelId>
 beignet channel splice-in <channelId> <sats> <feeratePerkw>
-beignet channel splice-out <channelId> <sats> <feeratePerkw>
+beignet channel splice-out <channelId> <sats> <feeratePerkw> [address]
+# [address] pays the spliced-out funds to an external address directly (one
+# transaction, no wallet hop); omitted, they go to the wallet
 beignet channel ensure-minimum 3 500000
 # Auto-open channels to at least 3 using graph suggestions, 500k sats each
 beignet channel update-policy <channelId|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N] [--htlc-min-msat N] [--htlc-max-msat N]
@@ -1793,7 +1795,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/channel/forceclose` | `{ channelId, acceptStaleStateRisk? }` | Force close; the flag is required for a capsule-restored channel |
 | POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
 | POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds |
-| POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw }` | Splice-out funds |
+| POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address |
 | POST | `/invoice/create` | `{ amountSats?, description? }` | Create invoice (omit amountSats for amount-less) |
 | POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel) |
 | POST | `/invoice/settle-hold` | `{ preimage }` | Settle a parked hold invoice (fulfills all MPP parts) |
