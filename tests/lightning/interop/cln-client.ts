@@ -214,7 +214,10 @@ export class ClnRestClient {
 	async fundChannel(
 		id: string,
 		amount: number | string,
-		pushMsat?: number
+		pushMsat?: number,
+		// announce: false keeps the channel out of gossip regardless of depth,
+		// pinning tests that need an UNANNOUNCED channel (issue #544).
+		announce?: boolean
 	): Promise<IClnFundChannelResponse> {
 		const body: Record<string, unknown> = {
 			id,
@@ -222,6 +225,9 @@ export class ClnRestClient {
 		};
 		if (pushMsat !== undefined) {
 			body.push_msat = pushMsat;
+		}
+		if (announce !== undefined) {
+			body.announce = announce;
 		}
 		return this.request('POST', '/v1/fundchannel', body);
 	}

@@ -203,6 +203,18 @@ export class OfferManager extends EventEmitter {
 	private buildHoldPaymentPaths:
 		| ((pathId: Buffer) => IBlindedPaymentPath[])
 		| null = null;
+	/**
+	 * Node-injected builder for the payment paths of an invoice issued by a
+	 * node with NO announced channels (issue #544, LFBW port #532 1D): real
+	 * blinded paths through its peers with the peers' true payinfo, so the
+	 * payer can route to the introduction node at all. A single-hop path
+	 * terminating at an unannounced node names an introduction nobody can
+	 * find a route to. Returns [] for announced nodes, which keep the
+	 * CLN-style single-hop self path below.
+	 */
+	private buildPrivatePaymentPaths:
+		| ((pathId: Buffer) => IBlindedPaymentPath[])
+		| null = null;
 	/** Persistent backend for offers; null keeps the manager memory-only. */
 	private storage: IStorageBackend | null = null;
 	private storageAttached = false;
@@ -214,6 +226,7 @@ export class OfferManager extends EventEmitter {
 			invoiceRequestTimeoutMs?: number;
 			allowUnboundInvoiceFallback?: boolean;
 			buildHoldPaymentPaths?: (pathId: Buffer) => IBlindedPaymentPath[];
+			buildPrivatePaymentPaths?: (pathId: Buffer) => IBlindedPaymentPath[];
 		}
 	) {
 		super();
@@ -223,6 +236,7 @@ export class OfferManager extends EventEmitter {
 		this.allowUnboundInvoiceFallback =
 			options?.allowUnboundInvoiceFallback ?? false;
 		this.buildHoldPaymentPaths = options?.buildHoldPaymentPaths ?? null;
+		this.buildPrivatePaymentPaths = options?.buildPrivatePaymentPaths ?? null;
 
 		if (options?.onionMessageManager) {
 			this.attachOnionMessageManager(options.onionMessageManager);
@@ -760,15 +774,34 @@ export class OfferManager extends EventEmitter {
 		// single-hop path terminating at us — the same shape CLN issues for a
 		// node without announced channels.
 		const invoicePathId = crypto.randomBytes(32);
+		const isAsyncHold = this.offers.get(matchedOfferIdHex!)?.asyncHold === true;
 		let holdPaths: IBlindedPaymentPath[] = [];
-		if (this.offers.get(matchedOfferIdHex!)?.asyncHold) {
+		if (isAsyncHold) {
 			holdPaths = this.buildHoldPaymentPaths?.(invoicePathId) ?? [];
+		}
+		// A node with no announced channels gets real paths through its peers
+		// (intro = the peer, with the peer's true payinfo): the single-hop
+		// shape below names an introduction node no payer can route to when
+		// nothing about this node is in the public graph (issue #544). The
+		// private builder is consulted ONLY for non-hold offers: an async-hold
+		// offer whose hold builder found no path must fall through to the self
+		// path, never to a normal private path, because a private hop carries
+		// no hold_htlc and the LSP would forward the HTLC to an offline
+		// recipient instead of parking it (issue #544 review). The builder
+		// answers [] for publicly reachable nodes so their invoices are
+		// unchanged.
+		let privatePaths: IBlindedPaymentPath[] = [];
+		if (!isAsyncHold) {
+			privatePaths = this.buildPrivatePaymentPaths?.(invoicePathId) ?? [];
 		}
 		let invoicePaths: IBlindedPath[];
 		let invoicePayInfo: IBolt12Invoice['blindedPayInfo'];
 		if (holdPaths.length > 0) {
 			invoicePaths = holdPaths.map((p) => p.path);
 			invoicePayInfo = holdPaths.map((p) => p.payInfo);
+		} else if (privatePaths.length > 0) {
+			invoicePaths = privatePaths.map((p) => p.path);
+			invoicePayInfo = privatePaths.map((p) => p.payInfo);
 		} else {
 			invoicePaths = [
 				constructBlindedPath(

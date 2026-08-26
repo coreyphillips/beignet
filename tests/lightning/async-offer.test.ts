@@ -103,17 +103,26 @@ describe('BOLT 12 async offer (M2.4)', function () {
 			Buffer.from(node.getNodeId(), 'hex')
 		);
 
-		// The LSP decrypts its hop and sees hold_htlc + where to forward (us).
+		// The LSP decrypts its MESSAGE hop: next_node_id only (message relay
+		// is node-id-addressed, BOLT 4). The hold semantics ride the
+		// per-invoice PAYMENT paths (next test), not the offer's message
+		// paths; nothing ever consumed hold_htlc at message time, and payment
+		// records on a message hop are a spec violation (issue #544 review).
 		const { hopData } = processBlindedHop(
 			path.blindingPoint,
 			lspPriv,
 			path.blindedHops[0].encryptedData
 		);
-		expect(hopData.holdHtlc, 'LSP hop is marked hold_htlc').to.equal(true);
 		expect(hopData.nextNodeId).to.deep.equal(
 			Buffer.from(node.getNodeId(), 'hex')
 		);
-		expect(hopData.shortChannelId).to.deep.equal(scid);
+		expect(hopData.holdHtlc, 'no hold record on a message hop').to.equal(
+			undefined
+		);
+		expect(hopData.shortChannelId, 'message hops are not SCID-addressed').to.be
+			.undefined;
+		expect(hopData.paymentRelay, 'no payment records on a message hop').to.be
+			.undefined;
 
 		node.destroy();
 	});
@@ -212,22 +221,27 @@ describe('BOLT 12 async offer (M2.4)', function () {
 		);
 
 		// The advertised payinfo is the LSP's REAL policy, not fabricated
-		// zeros: the payer sizes fees and CLTV from this.
+		// zeros: the payer sizes fees and CLTV from this. The delta covers
+		// the WHOLE path including our final min_final delta (a blinded path
+		// hides the hops, so the payer cannot add it; issue #544 review):
+		// LSP relay 40 + our DEFAULT_MIN_FINAL_CLTV_EXPIRY 40.
 		const payInfo = b12.blindedPayInfo![0];
 		expect(payInfo.feeBaseMsat).to.equal(1_000);
 		expect(payInfo.feeProportionalMillionths).to.equal(250);
-		expect(payInfo.cltvExpiryDelta).to.equal(40);
+		expect(payInfo.cltvExpiryDelta).to.equal(40 + 40);
 
-		// The LSP hop still carries hold_htlc + the forward instructions.
+		// The LSP hop still carries hold_htlc + the forward instructions,
+		// SCID-addressed only: BOLT 4 allows exactly one of short_channel_id
+		// and next_node_id per relay hop, and payment relay resolves the SCID
+		// (issue #544 review).
 		const lspHop = processBlindedHop(
 			invoicePath.blindingPoint,
 			lspPriv,
 			invoicePath.blindedHops[0].encryptedData
 		);
 		expect(lspHop.hopData.holdHtlc, 'LSP hop is hold_htlc').to.equal(true);
-		expect(lspHop.hopData.nextNodeId).to.deep.equal(
-			Buffer.from(node.getNodeId(), 'hex')
-		);
+		expect(lspHop.hopData.shortChannelId).to.deep.equal(scid);
+		expect(lspHop.hopData.nextNodeId, 'exactly one identifier').to.be.undefined;
 		expect(lspHop.hopData.paymentRelay!.feeBaseMsat).to.equal(1_000);
 
 		// The final hop carries THIS invoice's registered path_id, distinct

@@ -252,7 +252,9 @@ describe('Private-channel peer forwarding policy', function () {
 		expect(paths.length).to.be.gte(1);
 		expect(paths[0].payInfo.feeBaseMsat).to.equal(3210);
 		expect(paths[0].payInfo.feeProportionalMillionths).to.equal(42);
-		expect(paths[0].payInfo.cltvExpiryDelta).to.equal(96);
+		// Relay delta 96 + our final min_final delta 40: a blinded path hides
+		// the hops, so the payer cannot add what it cannot see (issue #544).
+		expect(paths[0].payInfo.cltvExpiryDelta).to.equal(96 + 40);
 	});
 
 	it('rejects an update not signed by the channel peer', function () {
