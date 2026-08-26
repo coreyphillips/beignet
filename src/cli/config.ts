@@ -57,20 +57,60 @@ function parseApiKeysEnv(): BeignetConfig['apiKeys'] {
 }
 
 /**
- * An env value that must be a COMPLETE base-10 integer, in milliseconds.
+ * An env value that must be a COMPLETE base-10 integer.
  *
  * parseInt stops at the first character it cannot use, so it reads '0.5' as 0
- * and '10m' as 10: for these settings that silently disables a protection
- * whose 0 means off, or turns ten minutes into ten milliseconds. Anything that
- * is not wholly an integer becomes NaN here instead, which the daemon's range
- * check refuses at startup with a message naming the variable, matching what
- * the docs promise. Absent or empty stays undefined so the config file still
- * gets its turn.
+ * and '10m' as 10: for a timer that silently disables a protection whose 0
+ * means off or turns ten minutes into ten milliseconds, and for a fee it
+ * advertises a policy the operator never wrote. Anything that is not wholly an
+ * integer becomes NaN here instead, which the daemon's range check refuses at
+ * startup with a message naming the variable, matching what the docs promise.
+ * Absent or empty stays undefined so the config file still gets its turn.
  */
 function integerEnv(raw: string | undefined): number | undefined {
 	const trimmed = raw?.trim();
 	if (!trimmed) return undefined;
 	return /^[+-]?\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
+}
+
+/**
+ * BEIGNET_LEASE_RATES: a JSON object with the five option_will_fund
+ * lease_rates fields (issue #532 workstream 1B). Same fail-closed contract as
+ * integerEnv, extended to an object: absent or empty stays undefined (config
+ * file's turn), while malformed JSON, a non-object, or a missing/non-numeric
+ * field surfaces as NaN in that field so the daemon's leaseRatesRefusal check
+ * refuses startup naming the variable. Never the parseApiKeysEnv treat-as-
+ * unset direction: a seller policy that is set but unreadable must not
+ * silently become "never sell". Field ranges are enforced by
+ * leaseRatesRefusal in beignet-node.ts, which owns the field-to-width table.
+ */
+function leaseRatesEnv(raw: string | undefined): BeignetConfig['leaseRates'] {
+	const trimmed = raw?.trim();
+	if (!trimmed) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		parsed = undefined;
+	}
+	const obj = (
+		typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+			? parsed
+			: {}
+	) as Record<string, unknown>;
+	const field = (name: string): number => {
+		const v = obj[name];
+		return typeof v === 'number' ? v : Number.NaN;
+	};
+	return {
+		fundingWeightWitness: field('fundingWeightWitness'),
+		leaseFeeBasis: field('leaseFeeBasis'),
+		leaseFeeBaseSat: field('leaseFeeBaseSat'),
+		channelFeeMaxBaseMsat: field('channelFeeMaxBaseMsat'),
+		channelFeeMaxProportionalThousandths: field(
+			'channelFeeMaxProportionalThousandths'
+		)
+	};
 }
 
 /**
@@ -272,7 +312,26 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 		recoveryReestablishHoldMs:
 			cliFlags.recoveryReestablishHoldMs ??
 			integerEnv(process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS) ??
-			file.recoveryReestablishHoldMs
+			file.recoveryReestablishHoldMs,
+		// Routing fee defaults and the lease seller policy use ?? throughout:
+		// a configured 0 (free base fee, zero ppm) is a real policy and must
+		// survive the merge.
+		routingFeeBaseMsat:
+			cliFlags.routingFeeBaseMsat ??
+			integerEnv(process.env.BEIGNET_FEE_BASE_MSAT) ??
+			file.routingFeeBaseMsat,
+		routingFeePpm:
+			cliFlags.routingFeePpm ??
+			integerEnv(process.env.BEIGNET_FEE_PPM) ??
+			file.routingFeePpm,
+		routingCltvDelta:
+			cliFlags.routingCltvDelta ??
+			integerEnv(process.env.BEIGNET_CLTV_DELTA) ??
+			file.routingCltvDelta,
+		leaseRates:
+			cliFlags.leaseRates ??
+			leaseRatesEnv(process.env.BEIGNET_LEASE_RATES) ??
+			file.leaseRates
 	};
 }
 

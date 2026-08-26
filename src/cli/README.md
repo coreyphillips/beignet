@@ -1679,6 +1679,10 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_RECOVERY_PROFILE` | Recovery fault-model profile; `crash-v1` is the only accepted value and the default |
 | `BEIGNET_RECOVERY_LEASE_CHECK_MS` | Guardian modes: idle writer lease re-check cadence in ms, an integer in 0..2147483647 (default: 300000; 0 disables; anything else refuses startup) |
 | `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS` | peer-storage mode: how long an unknown channel's `channel_reestablish` is held before the BOLT 1 error goes out, an integer in 0..2147483647 (default: 600000; 0 answers immediately; anything else refuses startup) |
+| `BEIGNET_FEE_BASE_MSAT` | Node-wide default routing base fee advertised in `channel_update`, an integer in 0..4294967295 msat (default: 1000; anything else refuses startup). Per-channel `channel update-policy` overrides win |
+| `BEIGNET_FEE_PPM` | Node-wide default proportional routing fee in millionths, an integer in 0..4294967295 (default: 1; anything else refuses startup). Per-channel overrides win |
+| `BEIGNET_CLTV_DELTA` | Node-wide default forwarding CLTV delta, an integer in 1..65535, `>= 18` recommended (default: 40; anything else refuses startup). Per-channel overrides win |
+| `BEIGNET_LEASE_RATES` | Liquidity ads (`option_will_fund`) seller policy: a JSON object `{"fundingWeightWitness":n,"leaseFeeBasis":n,"leaseFeeBaseSat":n,"channelFeeMaxBaseMsat":n,"channelFeeMaxProportionalThousandths":n}` (u16/u16/u32/u32/u16). Setting it sells inbound liquidity at these rates and advertises the feature bit; malformed or out-of-range values refuse startup; unset means never sell |
 
 ### Priority Order
 

@@ -64,12 +64,17 @@ const GLOBAL_VALUE_FLAGS = new Set(['--api-key', '--api-token']);
  * filteredArgs: when the positional is omitted, a raw index read swallows the
  * first trailing flag token instead (issue #534 review: `channel splice-out
  * <id> <sats> <feerate> --api-key k` sent the literal string --api-key as the
- * address).
+ * address). A command that takes its own value flags passes them in
+ * localValueFlags so they are stripped the same way, or the flag token
+ * re-creates the identical bug one column over.
  */
-function positionalArgs(): string[] {
+function positionalArgs(localValueFlags?: ReadonlySet<string>): string[] {
 	const out: string[] = [];
 	for (let i = 0; i < filteredArgs.length; i++) {
-		if (GLOBAL_VALUE_FLAGS.has(filteredArgs[i])) {
+		if (
+			GLOBAL_VALUE_FLAGS.has(filteredArgs[i]) ||
+			localValueFlags?.has(filteredArgs[i])
+		) {
 			i++; // skip the flag's value too
 			continue;
 		}
@@ -506,7 +511,11 @@ async function handleStart(): Promise<void> {
 			recoveryGuardians: config.recoveryGuardians,
 			recoveryProfile: config.recoveryProfile,
 			recoveryLeaseCheckIntervalMs: config.recoveryLeaseCheckIntervalMs,
-			recoveryReestablishHoldMs: config.recoveryReestablishHoldMs
+			recoveryReestablishHoldMs: config.recoveryReestablishHoldMs,
+			routingFeeBaseMsat: config.routingFeeBaseMsat,
+			routingFeePpm: config.routingFeePpm,
+			routingCltvDelta: config.routingCltvDelta,
+			leaseRates: config.leaseRates
 		});
 
 		writePidFile(process.pid, daemonPort);
@@ -833,16 +842,84 @@ async function handleChannel(): Promise<void> {
 					pushSats: filteredArgs[4] ? parseInt(filteredArgs[4], 10) : undefined
 				})
 			);
-		case 'open-v2':
+		case 'open-v2': {
+			// Liquidity ads buyer flags (issue #532 1B). These are command-local
+			// value flags, so they must be stripped from the positionals like
+			// the global ones or `open-v2 <pubkey> <sats> --request-funds n`
+			// reads the flag token as the feerate (the issue #534 bug class).
+			const pos = positionalArgs(
+				new Set(['--request-funds', '--blockheight', '--max-lease-rates'])
+			);
+			const requestFundsArg = parseFlag('--request-funds');
+			const maxLeaseRatesArg = parseFlag('--max-lease-rates');
+			let requestFunds:
+				| { requestedSats: number; blockheight: number }
+				| undefined;
+			if (requestFundsArg !== undefined) {
+				// Number(), not parseInt: parseInt would silently truncate
+				// "50000.5" to 50000; Number preserves it so the daemon's
+				// whole-number check refuses it instead.
+				const requestedSats = Number(requestFundsArg);
+				const blockheightArg = parseFlag('--blockheight');
+				let blockheight: number;
+				if (blockheightArg !== undefined) {
+					blockheight = Number(blockheightArg);
+				} else {
+					// request_funds carries the buyer's current chain tip; fetch
+					// it like the daemon's other clients do rather than making
+					// the operator look it up.
+					const info = await httpRequest('GET', '/info');
+					const height =
+						info.ok &&
+						typeof (info.result as { blockHeight?: unknown })?.blockHeight ===
+							'number'
+							? (info.result as { blockHeight: number }).blockHeight
+							: 0;
+					if (!(height > 0)) {
+						output({
+							ok: false,
+							error: {
+								code: 'INVALID_PARAMS',
+								message:
+									'Node block height unavailable; pass --blockheight <n> ' +
+									'with --request-funds'
+							}
+						});
+						process.exitCode = 1;
+						return;
+					}
+					blockheight = height;
+				}
+				requestFunds = { requestedSats, blockheight };
+			}
+			let maxLeaseRates: unknown;
+			if (maxLeaseRatesArg !== undefined) {
+				try {
+					maxLeaseRates = JSON.parse(maxLeaseRatesArg);
+				} catch {
+					output({
+						ok: false,
+						error: {
+							code: 'INVALID_PARAMS',
+							message:
+								'--max-lease-rates is not valid JSON; expected an object ' +
+								'with the five lease_rates fields'
+						}
+					});
+					process.exitCode = 1;
+					return;
+				}
+			}
 			return outputResult(
 				await httpRequest('POST', '/channel/open-v2', {
-					pubkey: filteredArgs[2],
-					amountSats: parseInt(filteredArgs[3], 10),
-					fundingFeeratePerkw: filteredArgs[4]
-						? parseInt(filteredArgs[4], 10)
-						: undefined
+					pubkey: pos[2],
+					amountSats: parseInt(pos[3], 10),
+					fundingFeeratePerkw: pos[4] ? parseInt(pos[4], 10) : undefined,
+					requestFunds,
+					maxLeaseRates
 				})
 			);
+		}
 		case 'funding-quote':
 			return outputResult(
 				await httpRequest('POST', '/channel/funding-quote', {
@@ -2453,7 +2530,11 @@ Channels:
   channel open <pubkey> <sats> [push] [--sats-per-vbyte N] [--max]
                                          Open channel (auto-funded)
   channel open-zeroconf <pk> <sats> [push]  Open zero-conf channel
-  channel open-v2 <pubkey> <sats> [feerate]  Open dual-funded v2 channel
+  channel open-v2 <pubkey> <sats> [feerate] [--request-funds <sats>] [--blockheight <n>] [--max-lease-rates '<json>']
+                                         Open dual-funded v2 channel; the
+                                         lease flags buy inbound liquidity
+                                         (option_will_fund) at or under the
+                                         given rate ceiling
   channel open-and-wait <pubkey> <sats> [push] [--timeout ms]
                                          Open channel + block until NORMAL
   channel connect-and-open <pubkey> <host> <port> <sats> [push] [--sats-per-vbyte N] [--max] [--trusted]

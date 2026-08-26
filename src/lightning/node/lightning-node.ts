@@ -16851,6 +16851,10 @@ export class LightningNode extends EventEmitter {
 			autoReconnect?: boolean;
 			autoUpdateChannelFees?: boolean;
 			forwardingEnabled?: boolean;
+			forwardingFeeBaseMsat?: number;
+			forwardingFeePropMillionths?: number;
+			forwardingCltvDelta?: number;
+			leaseRates?: import('../gossip/types').ILeaseRates;
 			eagerGossipVerify?: boolean;
 			sweepDestinationScript?: Buffer;
 			peerStorageEnabled?: boolean;
@@ -16907,6 +16911,10 @@ export class LightningNode extends EventEmitter {
 			autoReconnect: options?.autoReconnect,
 			autoUpdateChannelFees: options?.autoUpdateChannelFees,
 			forwardingEnabled: options?.forwardingEnabled,
+			forwardingFeeBaseMsat: options?.forwardingFeeBaseMsat,
+			forwardingFeePropMillionths: options?.forwardingFeePropMillionths,
+			forwardingCltvDelta: options?.forwardingCltvDelta,
+			leaseRates: options?.leaseRates,
 			eagerGossipVerify: options?.eagerGossipVerify,
 			localFeatures: options?.localFeatures,
 			chainHashes: options?.chainHashes,

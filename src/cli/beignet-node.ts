@@ -241,6 +241,28 @@ export interface BeignetNodeOptions {
 	 */
 	forwardingEnabled?: boolean;
 	/**
+	 * Node-wide default routing fee policy advertised in channel_update, mapped
+	 * onto the library's forwardingFeeBaseMsat / forwardingFeePropMillionths /
+	 * forwardingCltvDelta (defaults 1000 / 1 / 40). BOLT 7 encodes them as
+	 * u32 / u32 / u16; out-of-range values are refused in init because the wire
+	 * write would otherwise wrap or throw only after gossip is being built.
+	 * Per-channel overrides via updateChannelPolicy win over these defaults.
+	 * Issue #532 workstream 1B.
+	 */
+	routingFeeBaseMsat?: number;
+	routingFeePpm?: number;
+	routingCltvDelta?: number;
+	/**
+	 * Liquidity ads (bLIP-0051, option_will_fund) SELLER policy: answer a
+	 * buyer's request_funds by leasing inbound liquidity at these rates, funded
+	 * from this wallet. Setting it advertises the option_will_fund feature bit.
+	 * Refused in init unless every field is an integer within its wire width
+	 * (u16 or u32): the rates are encoded into the SIGNED will_fund record,
+	 * where channel_fee_max_base_msat is a tu32 whose encoder silently wraps an
+	 * out-of-range value, i.e. the node would sign rates it never configured.
+	 */
+	leaseRates?: import('../lightning/gossip/types').ILeaseRates;
+	/**
 	 * Request a gossip graph sync from each peer on connect (default true).
 	 * Without this the node only knows its own channels and cannot route
 	 * multi-hop payments to destinations beyond its direct peers.
@@ -945,6 +967,51 @@ function requireU32(value: unknown, field: string, min = 1): number {
 }
 
 /**
+ * Wire widths of the five option_will_fund lease_rates fields (see
+ * encodeLeaseRates in lightning/gossip/types.ts). leaseFeeBaseSat is written
+ * as a u32 and channelFeeMaxBaseMsat as a tu32 whose encoder silently WRAPS
+ * an out-of-range value, so an unchecked field would land inside a record
+ * this node signs (seller) or a fee ceiling it enforces (buyer) holding a
+ * different number than the operator wrote.
+ */
+const LEASE_RATE_FIELD_MAX: ReadonlyArray<
+	[keyof import('../lightning/gossip/types').ILeaseRates, number]
+> = [
+	['fundingWeightWitness', 0xffff],
+	['leaseFeeBasis', 0xffff],
+	['channelFeeMaxProportionalThousandths', 0xffff],
+	['leaseFeeBaseSat', 0xffffffff],
+	['channelFeeMaxBaseMsat', 0xffffffff]
+];
+
+/**
+ * Why a lease-rates value is unacceptable, or null when it is valid. Shared
+ * by daemon startup (naming BEIGNET_LEASE_RATES), BeignetNode.init (naming
+ * the leaseRates option), and openChannelV2 (naming maxLeaseRates), so every
+ * entry path enforces the same field-and-width table (issue #532).
+ */
+export function leaseRatesRefusal(value: unknown): string | null {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return (
+			'must be a JSON object with fundingWeightWitness, leaseFeeBasis, ' +
+			'leaseFeeBaseSat, channelFeeMaxBaseMsat and ' +
+			'channelFeeMaxProportionalThousandths'
+		);
+	}
+	const record = value as Record<string, unknown>;
+	for (const [field, max] of LEASE_RATE_FIELD_MAX) {
+		const v = record[field];
+		if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > max) {
+			return (
+				`${field} must be an integer between 0 and ${max} ` +
+				`(got ${String(v)})`
+			);
+		}
+	}
+	return null;
+}
+
+/**
  * A 32-byte channel id as hex. Buffer.from(x, 'hex') silently truncates at the
  * first non-hex character, so an unchecked id reaches the engine as a short
  * buffer and reads as a malformed-argument fault rather than a bad request.
@@ -1263,6 +1330,49 @@ export class BeignetNode extends EventEmitter {
 				);
 			}
 			this._reestablishHoldMs = ms;
+		}
+		// Routing fee defaults ride in channel_update as u32/u32/u16 (BOLT 7);
+		// an out-of-range value would wrap on the wire or throw only once
+		// gossip is being rebuilt, so it is refused here instead, matching the
+		// per-channel updateChannelPolicy bounds (issue #532 workstream 1B).
+		if (opts.routingFeeBaseMsat !== undefined) {
+			const v = opts.routingFeeBaseMsat;
+			if (!Number.isInteger(v) || v < 0 || v > 0xffffffff) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					`routingFeeBaseMsat must be an integer between 0 and ` +
+						`4294967295 (got ${String(v)})`
+				);
+			}
+		}
+		if (opts.routingFeePpm !== undefined) {
+			const v = opts.routingFeePpm;
+			if (!Number.isInteger(v) || v < 0 || v > 0xffffffff) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					`routingFeePpm must be an integer between 0 and ` +
+						`4294967295 (got ${String(v)})`
+				);
+			}
+		}
+		if (opts.routingCltvDelta !== undefined) {
+			// Zero would leave no window to claim a forwarded HTLC on-chain
+			// after learning the preimage, so the floor is 1 as on the
+			// per-channel surface; BOLT 2/7 guidance recommends >= 18.
+			const v = opts.routingCltvDelta;
+			if (!Number.isInteger(v) || v < 1 || v > 0xffff) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					`routingCltvDelta must be an integer between 1 and 65535 ` +
+						`(>= 18 recommended, got ${String(v)})`
+				);
+			}
+		}
+		if (opts.leaseRates !== undefined) {
+			const refusal = leaseRatesRefusal(opts.leaseRates);
+			if (refusal !== null) {
+				throw new BeignetError('INVALID_PARAMS', `leaseRates: ${refusal}`);
+			}
 		}
 		const networkName = this.networkName;
 
@@ -1585,6 +1695,14 @@ export class BeignetNode extends EventEmitter {
 			autoReconnect: opts.autoReconnect ?? true,
 			autoUpdateChannelFees: opts.autoUpdateChannelFees ?? false,
 			forwardingEnabled: opts.forwardingEnabled ?? true,
+			// The routing* -> forwarding* rename seam: the CLI layer speaks the
+			// operator vocabulary (and the BEIGNET_FEE_* envs), the library
+			// speaks BOLT 7 forwarding terms. Undefined keeps the library
+			// defaults (1000 / 1 / 40).
+			forwardingFeeBaseMsat: opts.routingFeeBaseMsat,
+			forwardingFeePropMillionths: opts.routingFeePpm,
+			forwardingCltvDelta: opts.routingCltvDelta,
+			leaseRates: opts.leaseRates,
 			eagerGossipVerify: opts.eagerGossipVerify ?? false,
 			localFeatures: LightningNode.defaultFeatures(),
 			chainHashes: [chainHash],
@@ -6668,6 +6786,13 @@ export class BeignetNode extends EventEmitter {
 			fundingFeeratePerkw?: number;
 			commitmentFeeratePerkw?: number;
 			locktime?: number;
+			/** Liquidity ads buyer (issue #532 1B): ask the peer to lease us
+			 *  this much inbound into the channel being opened. */
+			requestFunds?: { requestedSats: number; blockheight: number };
+			/** The buyer's own price ceiling for the lease. The library
+			 *  refuses requestFunds without it; the seller's advertised rates
+			 *  must never be echoed back here, or any price is "acceptable". */
+			maxLeaseRates?: import('../lightning/gossip/types').ILeaseRates;
 		}
 	): ChannelInfo {
 		requireOpenAmounts(params.amountSats);
@@ -6677,12 +6802,57 @@ export class BeignetNode extends EventEmitter {
 			requireU32(params.commitmentFeeratePerkw, 'commitmentFeeratePerkw');
 		if (params.locktime !== undefined)
 			requireU32(params.locktime, 'locktime', 0);
+		if (params.requestFunds !== undefined) {
+			// Shape-check before touching fields: a null or scalar body value
+			// would otherwise TypeError into a scrubbed 500 instead of a 400.
+			if (
+				typeof params.requestFunds !== 'object' ||
+				params.requestFunds === null
+			) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					'requestFunds must be an object with requestedSats and blockheight'
+				);
+			}
+			// Guard before BigInt(): a fractional requestedSats throws an
+			// uncaught RangeError there. The u64 wire field is wider than
+			// Number, so the safe-integer bound is the honest JSON limit.
+			requirePositiveSafeInteger(
+				params.requestFunds.requestedSats,
+				'requestFunds.requestedSats'
+			);
+			// The seller re-windows blockheight against its own tip
+			// (LEASE_BLOCKHEIGHT_*_TOLERANCE); here only the u32 wire width is
+			// enforced, since encode throws after the channel already exists.
+			requireU32(params.requestFunds.blockheight, 'requestFunds.blockheight');
+		}
+		if (params.maxLeaseRates !== undefined) {
+			// A fractional or oversized field would only surface inside the
+			// lease fee math AFTER open_channel2 has gone out; refuse at the
+			// JSON edge instead. The requestFunds/maxLeaseRates pairing rule
+			// stays with the library, which throws an InvalidRequestError that
+			// fundingOrRefuse maps to INVALID_PARAMS.
+			const refusal = leaseRatesRefusal(params.maxLeaseRates);
+			if (refusal !== null) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					`maxLeaseRates: ${refusal}`
+				);
+			}
+		}
 		const channel = fundingOrRefuse(() =>
 			this.node.openChannelV2(peerPubkey, {
 				fundingSatoshis: BigInt(params.amountSats),
 				fundingFeeratePerkw: params.fundingFeeratePerkw,
 				commitmentFeeratePerkw: params.commitmentFeeratePerkw,
-				locktime: params.locktime
+				locktime: params.locktime,
+				requestFunds: params.requestFunds
+					? {
+							requestedSats: BigInt(params.requestFunds.requestedSats),
+							blockheight: params.requestFunds.blockheight
+					  }
+					: undefined,
+				maxLeaseRates: params.maxLeaseRates
 			})
 		);
 		const state = channel.getFullState();

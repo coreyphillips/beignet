@@ -2351,13 +2351,61 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary: 'Open a dual-funded (v2) channel',
 					tags: ['Channels'],
-					requestBody: bodyContent({
-						pubkey: 'string',
-						amountSats: 'number',
-						fundingFeeratePerkw: 'number?',
-						commitmentFeeratePerkw: 'number?',
-						locktime: 'number?'
-					}),
+					// Hand-written body: the lease params are nested objects,
+					// which the flat bodyContent() helper cannot express
+					// (issue #532 workstream 1B).
+					requestBody: {
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										pubkey: { type: 'string' },
+										amountSats: { type: 'number' },
+										fundingFeeratePerkw: { type: 'number' },
+										commitmentFeeratePerkw: { type: 'number' },
+										locktime: { type: 'number' },
+										requestFunds: {
+											type: 'object',
+											description:
+												'Liquidity ads buyer (option_will_fund): ask the peer to lease this much inbound into the channel being opened. Requires maxLeaseRates.',
+											properties: {
+												requestedSats: { type: 'number' },
+												blockheight: {
+													type: 'number',
+													description:
+														'Current chain tip height; the seller refuses a stale value'
+												}
+											},
+											required: ['requestedSats', 'blockheight']
+										},
+										maxLeaseRates: {
+											type: 'object',
+											description:
+												"The buyer's own price ceiling for the lease, compared as a computed total fee. Choose it locally; echoing the seller's advertised rates back makes any price acceptable.",
+											properties: {
+												fundingWeightWitness: { type: 'number' },
+												leaseFeeBasis: { type: 'number' },
+												leaseFeeBaseSat: { type: 'number' },
+												channelFeeMaxBaseMsat: { type: 'number' },
+												channelFeeMaxProportionalThousandths: {
+													type: 'number'
+												}
+											},
+											required: [
+												'fundingWeightWitness',
+												'leaseFeeBasis',
+												'leaseFeeBaseSat',
+												'channelFeeMaxBaseMsat',
+												'channelFeeMaxProportionalThousandths'
+											]
+										}
+									},
+									required: ['pubkey', 'amountSats']
+								}
+							}
+						}
+					},
 					responses: {
 						'200': {
 							description: 'Channel info',
@@ -2365,7 +2413,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'400': {
 							description:
-								'INVALID_PARAMS: the request cannot be served as written (fractional amount, push toward a dual-fund peer, out-of-range feerate)'
+								'INVALID_PARAMS: the request cannot be served as written (fractional amount, push toward a dual-fund peer, out-of-range feerate, requestFunds without maxLeaseRates, or a lease field outside its wire width)'
 						},
 						'409': {
 							description:
