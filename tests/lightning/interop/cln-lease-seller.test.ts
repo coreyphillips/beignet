@@ -44,6 +44,8 @@ import {
 	setupRoutingForChannel
 } from './shared-helpers';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
+import { ChainMonitor } from '../../../src/lightning/chain/chain-monitor';
+import { CommitmentType } from '../../../src/lightning/chain/types';
 import { FeatureFlags, Feature } from '../../../src/lightning/features/flags';
 import {
 	REGTEST_CHAIN_HASH,
@@ -359,6 +361,16 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 			hash: crypto.randomBytes(20),
 			network: bitcoin.networks.regtest
 		}).address!;
+		// Disconnect FIRST so the close is genuinely unilateral (issue #537).
+		// CLN's close RPC negotiates a MUTUAL close before the unilateraltimeout
+		// falls back to its commitment, and beignet's cooperative close has
+		// gotten fast enough (option_simple_close collapsed the negotiation
+		// rounds) to finish inside even a 1-second window. A mutual close pays
+		// plain outputs, so the lease-locked to_remote this phase exists to
+		// validate never reaches the chain and the sweep assertion below can
+		// never fire. With the transport down, CLN cannot negotiate and must
+		// broadcast its commitment.
+		node.disconnectPeer(clnPubkey);
 		await cln.closeChannel(node.getNodeId(), {
 			unilateraltimeout: 1,
 			destination: clnDest
@@ -390,6 +402,19 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 		node
 			.getChannelManager()
 			.handleFundingSpent(channelId!, closingTx, confHeight, destScript);
+		// Premise check: the spend must be CLN's COMMITMENT. If it classifies
+		// as a cooperative close the force-close setup above has rotted again
+		// and every later sweep assertion is unsatisfiable; fail here, not
+		// 4000 mined blocks later (issue #537).
+		const monitor = (
+			node.getChannelManager() as unknown as {
+				monitors: Map<string, ChainMonitor>;
+			}
+		).monitors.get(channelId!.toString('hex'))!;
+		expect(
+			monitor.getFullState().commitmentBroadcast?.commitmentType,
+			'CLN close classified as their commitment (not cooperative)'
+		).to.equal(CommitmentType.THEIR_CURRENT_COMMITMENT);
 
 		// The claim is HELD until the lease CSV matures (BIP68). Mine past it
 		// and release.
