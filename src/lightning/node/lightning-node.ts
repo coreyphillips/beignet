@@ -153,6 +153,11 @@ import {
 	decodePeerStorageRetrievalMessage
 } from '../message/peer-storage';
 import {
+	BEIGNET_CUSTOM_MESSAGE_TYPE,
+	encodeCustomMessage,
+	decodeCustomMessage
+} from '../message/custom';
+import {
 	INodeConfig,
 	IResourceConfig,
 	IPaymentInfo,
@@ -1318,6 +1323,7 @@ export class LightningNode extends EventEmitter {
 			this.registerGossipHandlers();
 			this.registerOnionMessageHandler();
 			this.registerPeerStorageHandlers();
+			this.registerCustomMessageHandler();
 			this.wirePeerManagerEvents();
 		}
 
@@ -16255,8 +16261,54 @@ export class LightningNode extends EventEmitter {
 			this.onionMessageManager.handleMessage(pubkey, payload);
 		}
 
+		// Beignet-to-beignet custom traffic (issue #546). Odd type: peers that
+		// do not speak it never send it, so anything arriving is addressed to
+		// this surface and never falls through to the channel manager. Unknown
+		// subtypes and versions ride the event untouched (receivers must
+		// tolerate them); an undecodable envelope is logged and dropped
+		// without disconnecting the peer.
+		if (type === BEIGNET_CUSTOM_MESSAGE_TYPE) {
+			try {
+				const msg = decodeCustomMessage(payload);
+				this.emit('custom-message', {
+					peerPubkey: pubkey,
+					version: msg.version,
+					subtype: msg.subtype,
+					payload: msg.payload
+				});
+			} catch (err) {
+				this.emitStructuredLog('peer', 'custom_message_decode_failed', {
+					pubkey,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+			return;
+		}
+
 		// Route channel messages to ChannelManager
 		this.channelManager.handleMessage(pubkey, type, payload);
+	}
+
+	/**
+	 * Send a beignet custom message to a connected peer. Carried on a single
+	 * odd wire type, so non-beignet peers silently ignore it (BOLT 1).
+	 * Outbound rides peerManager.sendToPeer, which the recovery outbound gate
+	 * already fences during startup quarantine.
+	 */
+	sendCustomMessage(
+		peerPubkeyHex: string,
+		subtype: number,
+		payload: Buffer
+	): void {
+		if (!this.peerManager) {
+			throw new Error('Networking is not enabled on this node');
+		}
+		const envelope = encodeCustomMessage(subtype, payload);
+		this.peerManager.sendToPeer(
+			peerPubkeyHex,
+			BEIGNET_CUSTOM_MESSAGE_TYPE,
+			envelope
+		);
 	}
 
 	// ─────────────── Chain Monitor Delegation ───────────────
@@ -17194,6 +17246,21 @@ export class LightningNode extends EventEmitter {
 					message: err.message,
 					timestamp: Date.now()
 				} as ILightningError);
+			}
+		);
+	}
+
+	private registerCustomMessageHandler(): void {
+		if (!this.peerManager) return;
+		// Beignet-to-beignet custom traffic rides one odd type (issue #546);
+		// route it through handlePeerMessage so it sits behind the same
+		// startup-quarantine gate as every other inbound message (the
+		// PeerManager inbound gate already dropped it at the transport when
+		// the fence is up; this is the event-transport twin).
+		this.peerManager.onMessage(
+			BEIGNET_CUSTOM_MESSAGE_TYPE,
+			(pubkey, msgType, payload) => {
+				this.handlePeerMessage(pubkey, msgType, payload);
 			}
 		);
 	}

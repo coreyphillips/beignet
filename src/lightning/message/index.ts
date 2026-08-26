@@ -15,3 +15,4 @@ export * from './peer-storage';
 export * from './interactive-tx';
 export * from './dual-funding';
 export * from './splice';
+export * from './custom';
