@@ -117,14 +117,14 @@ describe('Offer invoices via private payment paths (issue #544)', function () {
 	it('an unannounced issuer serves the two-hop path with the peer payinfo', async function () {
 		const peer = generateKeyPair();
 		const builderCalls: Buffer[] = [];
-		let issuerPubkey: Buffer | undefined;
+		const issuerPubkeyRef: { v?: Buffer } = {};
 		const parties = setupParties({
 			buildPrivatePaymentPaths: (pathId: Buffer): IBlindedPaymentPath[] => {
 				builderCalls.push(pathId);
-				return [twoHopPath(peer.pubkey, issuerPubkey!, pathId)];
+				return [twoHopPath(peer.pubkey, issuerPubkeyRef.v!, pathId)];
 			}
 		});
-		issuerPubkey = parties.issuer.pubkey;
+		issuerPubkeyRef.v = parties.issuer.pubkey;
 		try {
 			const { offer } = parties.issuer.mgr.createOffer({
 				description: 'private-path offer',
@@ -198,18 +198,18 @@ describe('Offer invoices via private payment paths (issue #544)', function () {
 
 	it('hold paths keep precedence; the private builder is never consulted', async function () {
 		const peer = generateKeyPair();
-		let privateCalls = 0;
-		let issuerPubkey: Buffer | undefined;
+		const counters = { privateCalls: 0 };
+		const issuerPubkeyRef: { v?: Buffer } = {};
 		const parties = setupParties({
 			buildHoldPaymentPaths: (pathId: Buffer): IBlindedPaymentPath[] => [
-				twoHopPath(peer.pubkey, issuerPubkey!, pathId)
+				twoHopPath(peer.pubkey, issuerPubkeyRef.v!, pathId)
 			],
 			buildPrivatePaymentPaths: (): IBlindedPaymentPath[] => {
-				privateCalls++;
+				counters.privateCalls++;
 				return [];
 			}
 		});
-		issuerPubkey = parties.issuer.pubkey;
+		issuerPubkeyRef.v = parties.issuer.pubkey;
 		try {
 			const { offer } = parties.issuer.mgr.createOffer({
 				description: 'hold offer',
@@ -221,7 +221,44 @@ describe('Offer invoices via private payment paths (issue #544)', function () {
 			expect(
 				Buffer.from(invoice.paths![0].introductionNodeId).equals(peer.pubkey)
 			).to.equal(true);
-			expect(privateCalls, 'private builder never consulted').to.equal(0);
+			expect(counters.privateCalls, 'private builder never consulted').to.equal(
+				0
+			);
+		} finally {
+			destroyParties(parties);
+		}
+	});
+
+	it('an async-hold offer with NO hold paths falls to the self path, never a private one', async function () {
+		// A private hop carries no hold_htlc: substituting it for a missing
+		// hold path would make the LSP forward the HTLC to an offline
+		// recipient instead of parking it (issue #544 review). The safe
+		// fallback is the self path, exactly as before this change.
+		const counters = { privateCalls: 0 };
+		const parties = setupParties({
+			buildHoldPaymentPaths: (): IBlindedPaymentPath[] => [],
+			buildPrivatePaymentPaths: (): IBlindedPaymentPath[] => {
+				counters.privateCalls++;
+				return [];
+			}
+		});
+		try {
+			const { offer } = parties.issuer.mgr.createOffer({
+				description: 'hold offer, no usable LSP path',
+				amount: 1000n,
+				asyncHold: true
+			});
+			const invoice = await parties.payer.mgr.requestInvoice(offer);
+			expect(
+				Buffer.from(invoice.paths![0].introductionNodeId).equals(
+					parties.issuer.pubkey
+				),
+				'self path'
+			).to.equal(true);
+			expect(
+				counters.privateCalls,
+				'private builder never consulted for a hold offer'
+			).to.equal(0);
 		} finally {
 			destroyParties(parties);
 		}

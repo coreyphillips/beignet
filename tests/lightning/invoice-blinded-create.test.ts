@@ -234,7 +234,8 @@ describe('createInvoice blinded paths (M1.2)', function () {
 				Math.ceil((introPolicy.feeProportionalMillionths * peerProp) / 1e6)
 		);
 		expect(bp.payInfo.cltvExpiryDelta).to.equal(
-			introPolicy.cltvExpiryDelta + peerCltv
+			// Relay deltas + our final min_final delta 40 (issue #544).
+			introPolicy.cltvExpiryDelta + peerCltv + 40
 		);
 
 		node.destroy();

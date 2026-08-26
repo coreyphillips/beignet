@@ -163,6 +163,19 @@ function openReadyChannel(
 	)!;
 	alice.handleFundingConfirmed(channelId);
 	bob.handleFundingConfirmed(channelId);
+
+	// The private-payment-path gate (issue #544) demands a PUBLISHED public
+	// channel before an issuer keeps the CLN-style self path; these suites
+	// were written against that self-path shape and test machinery orthogonal
+	// to path topology, so pin the published branch on both nodes.
+	for (const n of [alice, bob]) {
+		for (const ch of n.getChannelManager().listChannels()) {
+			const st = ch.getFullState();
+			st.announceChannel = true;
+			st.announcementSigsSent = true;
+			st.announcementSigsReceived = true;
+		}
+	}
 	return channelId;
 }
 

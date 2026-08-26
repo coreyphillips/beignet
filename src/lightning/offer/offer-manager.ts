@@ -774,18 +774,24 @@ export class OfferManager extends EventEmitter {
 		// single-hop path terminating at us — the same shape CLN issues for a
 		// node without announced channels.
 		const invoicePathId = crypto.randomBytes(32);
+		const isAsyncHold = this.offers.get(matchedOfferIdHex!)?.asyncHold === true;
 		let holdPaths: IBlindedPaymentPath[] = [];
-		if (this.offers.get(matchedOfferIdHex!)?.asyncHold) {
+		if (isAsyncHold) {
 			holdPaths = this.buildHoldPaymentPaths?.(invoicePathId) ?? [];
 		}
 		// A node with no announced channels gets real paths through its peers
 		// (intro = the peer, with the peer's true payinfo): the single-hop
 		// shape below names an introduction node no payer can route to when
-		// nothing about this node is in the public graph (issue #544). Hold
-		// paths keep absolute precedence; the builder answers [] for
-		// announced nodes so their invoices are unchanged.
+		// nothing about this node is in the public graph (issue #544). The
+		// private builder is consulted ONLY for non-hold offers: an async-hold
+		// offer whose hold builder found no path must fall through to the self
+		// path, never to a normal private path, because a private hop carries
+		// no hold_htlc and the LSP would forward the HTLC to an offline
+		// recipient instead of parking it (issue #544 review). The builder
+		// answers [] for publicly reachable nodes so their invoices are
+		// unchanged.
 		let privatePaths: IBlindedPaymentPath[] = [];
-		if (holdPaths.length === 0) {
+		if (!isAsyncHold) {
 			privatePaths = this.buildPrivatePaymentPaths?.(invoicePathId) ?? [];
 		}
 		let invoicePaths: IBlindedPath[];

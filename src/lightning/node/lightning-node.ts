@@ -19,6 +19,7 @@ import {
 	processBlindedHop,
 	deriveBlindedPrivkey,
 	IBlindedHopData,
+	IBlindedPath,
 	IBlindedPaymentPath
 } from '../onion/blinded-path';
 import {
@@ -1229,14 +1230,12 @@ export class LightningNode extends EventEmitter {
 				this.buildBlindedPaymentPaths(true, 3, pathId),
 			// Unannounced nodes: invoice payment paths run through a peer with
 			// the peer's true payinfo, so the payer can route to the
-			// introduction node (issue #544). Announced nodes keep the
-			// CLN-style single-hop path and are reached through the public
-			// graph.
+			// introduction node (issue #544). Nodes with a PUBLISHED public
+			// channel (announcement_signatures exchanged, not the bare intent
+			// flag) keep the CLN-style single-hop path and are reached through
+			// the public graph.
 			buildPrivatePaymentPaths: (pathId: Buffer): IBlindedPaymentPath[] => {
-				const announced = this.channelManager
-					.listChannels()
-					.some((c) => c.getFullState().announceChannel === true);
-				if (announced) return [];
+				if (this.hasPublishedPublicChannel()) return [];
 				return this.buildBlindedPaymentPaths(false, 2, pathId);
 			}
 		});
@@ -11246,8 +11245,17 @@ export class LightningNode extends EventEmitter {
 	): IBlindedPaymentPath[] {
 		const paths: IBlindedPaymentPath[] = [];
 		const ourNodeId = getPublicKey(this.nodePrivkey);
-		// Generous absolute CLTV bound for the path's payment constraints.
-		const maxCltvExpiry = (this.currentBlockHeight || 0) + 2016;
+		// Absolute CLTV bound for the path's payment constraints. Before the
+		// first block arrives the height is 0 and "0 + 2016" is an absolute
+		// bound the chain passed years ago: every relay would refuse the
+		// payment as expired (issue #544 review). Fall back to the largest
+		// height the CLTV encoding allows (500,000,000 is the height/timestamp
+		// boundary), which disables the anti-probing bound rather than
+		// shipping one that can never pass.
+		const maxCltvExpiry =
+			this.currentBlockHeight > 0
+				? this.currentBlockHeight + 2016
+				: 499_999_999;
 
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
@@ -11269,12 +11277,14 @@ export class LightningNode extends EventEmitter {
 			let feeProportionalMillionths = this.forwardingFeePropMillionths;
 			let cltvExpiryDelta = this.forwardingCltvDelta;
 			let htlcMinimumMsat = 0n;
+			let htlcMaximumMsat: bigint | null = null;
 			const directPolicy = state.remoteForwardingPolicy;
 			if (directPolicy) {
 				feeBaseMsat = directPolicy.feeBaseMsat;
 				feeProportionalMillionths = directPolicy.feeProportionalMillionths;
 				cltvExpiryDelta = directPolicy.cltvExpiryDelta;
 				htlcMinimumMsat = directPolicy.htlcMinimumMsat;
+				htlcMaximumMsat = directPolicy.htlcMaximumMsat;
 			}
 			if (state.shortChannelId) {
 				const graphChannel = this.graph.getChannel(state.shortChannelId);
@@ -11291,6 +11301,7 @@ export class LightningNode extends EventEmitter {
 					feeProportionalMillionths = peerUpdate.feeProportionalMillionths;
 					cltvExpiryDelta = peerUpdate.cltvExpiryDelta;
 					htlcMinimumMsat = peerUpdate.htlcMinimumMsat;
+					htlcMaximumMsat = peerUpdate.htlcMaximumMsat ?? null;
 				}
 			}
 
@@ -11298,10 +11309,15 @@ export class LightningNode extends EventEmitter {
 			// payment_constraints so the payer never sends a sub-minimum HTLC the
 			// peer would reject (the same masked-failure class as the fee gap).
 			const paymentConstraints = { maxCltvExpiry, htlcMinimumMsat };
-			// Peer hop: forward to us over this channel. For async receive, mark
-			// it hold_htlc so the LSP parks the HTLC until we return.
+			// Peer hop: forward to us over this channel, named by SCID ONLY.
+			// BOLT 4 route blinding allows exactly one of short_channel_id /
+			// next_node_id per relay hop, and payment relay is SCID-addressed
+			// (our own relay resolves hopData.shortChannelId too); emitting
+			// both made compliant introduction nodes reject the whole path
+			// (issue #544 review). next_node_id belongs to MESSAGE paths, which
+			// buildBlindedMessagePaths now builds. For async receive, mark the
+			// hop hold_htlc so the LSP parks the HTLC until we return.
 			const peerHop: IBlindedHopData = {
-				nextNodeId: ourNodeId,
 				shortChannelId: scid,
 				paymentRelay: {
 					cltvExpiryDelta,
@@ -11334,7 +11350,6 @@ export class LightningNode extends EventEmitter {
 				const ext = this.findBlindedIntroExtension(peerPubkey);
 				if (ext) {
 					const introHop: IBlindedHopData = {
-						nextNodeId: peerPubkey,
 						shortChannelId: ext.shortChannelId,
 						paymentRelay: {
 							cltvExpiryDelta: ext.cltvExpiryDelta,
@@ -11374,19 +11389,97 @@ export class LightningNode extends EventEmitter {
 				continue; // skip a channel whose key can't be blinded
 			}
 
+			// The advertised payInfo is everything the payer has to size the
+			// payment with; a blinded path hides the hops, so nothing can be
+			// left for the payer to infer (issue #544 review):
+			// - cltv_expiry_delta must INCLUDE our final min_final delta or
+			//   the payment arrives under-timelocked and we fail it;
+			// - min/max must reflect the peer's actual policy (bounded by
+			//   capacity) or the payer sends amounts the peer refuses.
+			const capacityMsat = state.fundingSatoshis * 1000n;
 			paths.push({
 				path,
 				payInfo: {
 					feeBaseMsat: aggBase,
 					feeProportionalMillionths: aggProp,
-					cltvExpiryDelta: aggCltv,
-					htlcMinimumMsat: 0n,
-					htlcMaximumMsat: state.fundingSatoshis * 1000n
+					cltvExpiryDelta: aggCltv + DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+					htlcMinimumMsat,
+					htlcMaximumMsat:
+						htlcMaximumMsat !== null && htlcMaximumMsat < capacityMsat
+							? htlcMaximumMsat
+							: capacityMsat
 				}
 			});
 		}
 
 		return paths;
+	}
+
+	/**
+	 * Blinded MESSAGE paths through our peers, for offer/reply delivery: per
+	 * usable channel, [peer → us] (or [intro → peer → us] with numHops >= 3
+	 * and a graph candidate). Message relay is next_node_id-addressed (BOLT 4;
+	 * our own OnionMessageManager forwards on hopData.nextNodeId), and a
+	 * message hop must not carry payment_relay/payment_constraints/hold
+	 * records, so these are built apart from the payment paths rather than
+	 * reusing them (issue #544 review). The optional path_id rides the final
+	 * hop for receiver-side binding (e.g. a BOLT 12 offer's invoice_requests).
+	 */
+	private buildBlindedMessagePaths(
+		numHops = 2,
+		pathId?: Buffer
+	): IBlindedPath[] {
+		const paths: IBlindedPath[] = [];
+		const ourNodeId = getPublicKey(this.nodePrivkey);
+		for (const channel of this.channelManager.listChannels()) {
+			if (!channel.acceptsNewHtlcs(true)) continue;
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			const peerPubkeyHex = this.channelManager.getPeerForChannel(channelId);
+			if (!peerPubkeyHex) continue;
+			const peerPubkey = Buffer.from(peerPubkeyHex, 'hex');
+
+			const peerHop: IBlindedHopData = { nextNodeId: ourNodeId };
+			const finalHop: IBlindedHopData = pathId ? { pathId } : {};
+			let nodeIds = [peerPubkey, ourNodeId];
+			let hopDataList: IBlindedHopData[] = [peerHop, finalHop];
+			if (numHops >= 3) {
+				const ext = this.findBlindedIntroExtension(peerPubkey);
+				if (ext) {
+					nodeIds = [ext.introPubkey, peerPubkey, ourNodeId];
+					hopDataList = [{ nextNodeId: peerPubkey }, peerHop, finalHop];
+				}
+			}
+			try {
+				paths.push(
+					constructBlindedPath(crypto.randomBytes(32), nodeIds, hopDataList)
+				);
+			} catch {
+				continue; // skip a channel whose key can't be blinded
+			}
+		}
+		return paths;
+	}
+
+	/**
+	 * Whether this node has a channel a payer can actually find in the public
+	 * graph: usable, marked for announcement AND with announcement_signatures
+	 * exchanged (that is when the channel_announcement exists and goes out).
+	 * announceChannel alone is an INTENT flag: it stays true on pending and
+	 * closed channels, and a preferTaproot opener keeps it true while the
+	 * wire flag is private, so gating on it suppressed valid private paths
+	 * (issue #544 review).
+	 */
+	private hasPublishedPublicChannel(): boolean {
+		return this.channelManager.listChannels().some((channel) => {
+			const st = channel.getFullState();
+			return (
+				st.announceChannel === true &&
+				st.announcementSigsSent &&
+				st.announcementSigsReceived &&
+				channel.acceptsNewHtlcs(true)
+			);
+		});
 	}
 
 	// ─────────────── Gossip Handling ───────────────
@@ -17145,15 +17238,35 @@ export class LightningNode extends EventEmitter {
 		encoded: string;
 	} {
 		const createOpts = { ...options };
-		if (createOpts.asyncHold && !createOpts.paths) {
+		// BOLT 12: an offer without offer_chains implies bitcoin MAINNET, so a
+		// regtest/testnet node's offer read by a compliant payer fails with
+		// "wrong chain" before anything else happens (observed live: CLN
+		// refuses fetchinvoice on such an offer; issue #544 review's interop
+		// gate found it). Stamp our chain whenever it is not the implied one.
+		if (!createOpts.chains) {
+			const ours = this.acceptableChainHashes[0] ?? this.chainHash();
+			if (!ours.equals(BITCOIN_CHAIN_HASH)) {
+				createOpts.chains = [ours];
+			}
+		}
+		if (
+			!createOpts.paths &&
+			(createOpts.asyncHold || !this.hasPublishedPublicChannel())
+		) {
 			// One path_id shared by every path of this offer: invoice_requests
 			// must arrive over one of them (verified in handleInvoiceRequest).
-			// These are the offer's MESSAGE paths; the payment paths of each
-			// issued invoice are rebuilt fresh at issuance (asyncHold is
-			// persisted with the offer so that survives a restart).
+			// These are the offer's MESSAGE paths (next_node_id-addressed, no
+			// payment records); the payment paths of each issued invoice are
+			// rebuilt fresh at issuance (asyncHold is persisted with the offer
+			// so that survives a restart). An UNANNOUNCED node builds them for
+			// every offer, not just async ones: BOLT 12 requires a private
+			// node's offer to carry reachable paths, because an external payer
+			// cannot deliver an invoice_request to a node id that is in no
+			// public graph (issue #544 review).
 			const pathId = crypto.randomBytes(32);
-			const paths = this.buildBlindedPaymentPaths(true, 3, pathId).map(
-				(p) => p.path
+			const paths = this.buildBlindedMessagePaths(
+				createOpts.asyncHold ? 3 : 2,
+				pathId
 			);
 			if (paths.length > 0) {
 				createOpts.paths = paths;
