@@ -2572,11 +2572,24 @@ export class Channel {
 				);
 			}
 		}
+		// An EARLY channel_ready: an eager zero-conf peer that signed first may
+		// send its ready before OUR tx_signatures have left, and a withheld
+		// external witness (issue #572) makes that window arbitrarily long.
+		// The commitment exchange is complete (a durable v2InFlight record
+		// exists), so the ready is legitimate: record it below and hold the
+		// state, and the release path consumes remoteChannelReady to complete
+		// straight to NORMAL when our signatures finally go out. Evaluated
+		// after the RBF-abandon arms above, which may have already moved a
+		// superseded attempt out of AWAITING_TX_SIGNATURES.
+		const earlyDuringV2Sigs =
+			this._state.state === ChannelState.AWAITING_TX_SIGNATURES &&
+			this._state.v2InFlight != null;
 		if (
 			this._state.state !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
 			this._state.state !== ChannelState.AWAITING_CHANNEL_READY &&
 			this._state.state !== ChannelState.SENT_FUNDING_CREATED &&
-			this._state.state !== ChannelState.AWAITING_REESTABLISH
+			this._state.state !== ChannelState.AWAITING_REESTABLISH &&
+			!earlyDuringV2Sigs
 		) {
 			// Per BOLT 2: if already NORMAL, just ignore duplicate channel_ready
 			if (this._state.state === ChannelState.NORMAL) {
@@ -2610,6 +2623,14 @@ export class Channel {
 		// Store remote's SCID alias if provided
 		if (msg.shortChannelId) {
 			this._state.remoteScidAlias = msg.shortChannelId;
+		}
+
+		// Early ready recorded: the state MUST stay AWAITING_TX_SIGNATURES so
+		// the withheld release still owes and can still send our
+		// tx_signatures; its fast-track then reads remoteChannelReady and
+		// finishes to NORMAL in the same batch.
+		if (earlyDuringV2Sigs) {
+			return prefix;
 		}
 
 		if (this._state.localChannelReady) {
@@ -13639,6 +13660,17 @@ export class Channel {
 		};
 		this._dualFundingContribs = null;
 		this._dualFundingContribIndex = 0;
+	}
+
+	/**
+	 * Whether a v2 contribution (setDualFundingContribution) is registered.
+	 * The manager's opener auto-funding must not select on top of one: a
+	 * second setDualFundingContribution would overwrite an embedder-registered
+	 * contribution (possibly carrying EXTERNAL inputs, issue #572) and corrupt
+	 * the negotiated funding.
+	 */
+	hasDualFundingContribution(): boolean {
+		return this._dualFundingContribution !== null;
 	}
 
 	/**

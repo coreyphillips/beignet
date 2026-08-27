@@ -235,6 +235,20 @@ export interface IDualFundingParams {
 	 * inputs instead of covering a fixed amount.
 	 */
 	fundMax?: boolean;
+	/**
+	 * Restrict the auto-funded opener contribution to exactly these wallet
+	 * outpoints (txid in display byte order, as listUtxos reports), e.g. to
+	 * channelize a specific deposit (issue #572). ALL named coins are
+	 * contributed; allowTopUp permits adding other spendable coins when they
+	 * fall short of amount + fee (otherwise the selection fails as
+	 * underfunded and the open aborts as "v2 open not funded"). Local-only
+	 * (NOT sent on the wire); consumed by autoFundDualFundedOpen.
+	 * Incompatible with fundMax, which already sweeps everything.
+	 */
+	fundingUtxos?: {
+		utxos: Array<{ txid: string; vout: number }>;
+		allowTopUp?: boolean;
+	};
 }
 
 /** Result of a dual-funding operation */

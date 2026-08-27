@@ -1713,6 +1713,70 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Deliver a third-party input owner's witness for an EXTERNAL funding
+	 * input of a v2 open (issue #572): the out-of-band answer to the
+	 * externalInputIndices half of channel:txsigs-needed. The channel
+	 * validates the witness against the recorded prevouts before storing it,
+	 * and the last delivery releases our withheld tx_signatures. The same
+	 * dual-map lookup as provideTxSignatures applies: during the live
+	 * exchange the channel may still be temp-resident while the signal
+	 * carries the PERMANENT id. Promotion after dispatch keeps the fork's
+	 * promote-on-ready guarantee (97df373): when the peer signed first, this
+	 * flush is the last step of the open and the channel must leave the temp
+	 * map before its early channel_ready or confirmation dispatch arrives.
+	 */
+	provideV2ExternalWitness(
+		channelId: Buffer,
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel =
+			this.channels.get(idHex) ?? this.findChannelByChannelIdInTemp(channelId);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		// A temp-resident channel's peer binding is keyed by its temporary id.
+		const peerPubkey =
+			this.channelPeers.get(idHex) ??
+			this.channelPeers.get(channel.getTemporaryChannelId().toString('hex'));
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+
+		let actions: ChannelAction[];
+		try {
+			actions = channel.provideV2ExternalWitness(
+				prevTxid,
+				prevOutputIndex,
+				witness
+			);
+		} catch (err) {
+			// The channel throws WITHOUT touching state: a refusal of the
+			// caller's delivery, not a channel failure. Nothing to dispatch
+			// and no 'error' event (the initiateFundingRbf refusal
+			// convention); the caller retries with a correct witness.
+			return { ok: false, actions: [], error: (err as Error).message };
+		}
+		this.processActions(peerPubkey, channel, actions);
+		this._promoteV2ChannelIfReady(peerPubkey, channel);
+		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
+		if (errorAction) {
+			return {
+				ok: false,
+				actions,
+				error: (errorAction as { message: string }).message
+			};
+		}
+		return { ok: true, actions };
+	}
+
+	/**
 	 * Handle peer disconnection: mark all channels with this peer as AWAITING_REESTABLISH.
 	 */
 	handlePeerDisconnected(peerPubkey: string): void {
@@ -6173,6 +6237,16 @@ export class ChannelManager extends EventEmitter {
 		const session = channel.getDualFundingSession();
 		const local = session?.getLocalParams();
 		if (!session || !session.isInitiator() || !local) return;
+		// A contribution the embedder already registered (possibly carrying an
+		// EXTERNAL input, issue #572) wins outright: selecting on top of it
+		// would overwrite it. It still must DRIVE on accept_channel2 (the
+		// initiator sends the first tx_add_input), and this arm sits before
+		// the provider checks so a provider-less manager drives it too.
+		if (channel.hasDualFundingContribution()) {
+			const driveActions = channel.beginDualFundingContribution();
+			this.processActions(peerPubkey, channel, driveActions);
+			return;
+		}
 		// A max open contributes EVERY spendable UTXO (change nets out to zero
 		// against the committed amount); a fixed open covers amount + fee.
 		// Without the matching provider method the legacy behavior holds: the
@@ -6201,7 +6275,9 @@ export class ChannelManager extends EventEmitter {
 						fp!,
 						contributionSats,
 						feeratePerKw,
-						true
+						true,
+						false,
+						local.fundingUtxos
 				  );
 		} catch (err) {
 			selection = Promise.reject(err);
@@ -6214,6 +6290,17 @@ export class ChannelManager extends EventEmitter {
 					// anywhere, so their pledges release at once (issue #311).
 					if (!isCurrentOpen()) {
 						this.releaseStaleSelectionPledges(inputs);
+						return;
+					}
+					// The embedder registered a contribution while the wallet
+					// selection was in flight (a synchronous transport runs
+					// accept_channel2 inside createDualFundedChannel, so this
+					// race is real). The registered one wins; the just-selected
+					// coins were never registered, so their pledges release.
+					if (channel.hasDualFundingContribution()) {
+						this.releaseStaleSelectionPledges(inputs);
+						const driveActions = channel.beginDualFundingContribution();
+						this.processActions(peerPubkey, channel, driveActions);
 						return;
 					}
 					channel.setDualFundingContribution(

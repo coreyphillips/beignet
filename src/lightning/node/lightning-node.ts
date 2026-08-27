@@ -2998,26 +2998,31 @@ export class LightningNode extends EventEmitter {
 
 		// A caller-driven v2 open owes its tx_signatures and only the embedder
 		// holds the witnesses (issue 307): relay the reminder so it can answer
-		// with sendTxSignatures.
+		// with sendTxSignatures. externalInputIndices names the subset whose
+		// witnesses a third party owes (issue #572): those slots are answered
+		// out of band via provideV2ExternalWitness, not sendTxSignatures.
 		this.channelManager.on(
 			'channel:txsigs-needed',
 			(
 				channelId: Buffer,
 				fundingTxid: Buffer,
 				fundingOutputIndex: number,
-				inputIndices: number[]
+				inputIndices: number[],
+				externalInputIndices?: number[]
 			) => {
 				this.emit('channel:txsigs-needed', {
 					channelId,
 					fundingTxid,
 					fundingOutputIndex,
-					inputIndices
+					inputIndices,
+					externalInputIndices
 				});
 				this.emitStructuredLog('channel', 'txsigs_needed', {
 					channelId: channelId.toString('hex'),
 					fundingTxid: fundingTxid.toString('hex'),
 					fundingOutputIndex,
-					inputIndices
+					inputIndices,
+					externalInputIndices
 				});
 			}
 		);
@@ -7936,6 +7941,126 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * Open a zero-conf channel with a trusted peer and wait for it to reach
+	 * NORMAL, resolving with the funding-derived channel id (issue #572). The
+	 * id changes from temporary to permanent during the open, so the wait
+	 * holds the Channel object rather than an id. Funding failures reject
+	 * fast instead of spinning to the timeout, so a caller's retry loop (the
+	 * JIT engine) can engage: the v1 route aborts via channel:aborted after
+	 * AUTO_FUNDING_FAILED, the v2 route surfaces "v2 open not funded" as a
+	 * CHANNEL_ERROR and its abort teardown terminates in channel:voided.
+	 * Throws synchronously whatever openChannel throws (untrusted peer, no
+	 * fee estimate, invalid params).
+	 */
+	async openZeroConfChannelAndWait(
+		peerPubkey: string,
+		fundingSatoshis: bigint,
+		timeoutMs = 120_000
+	): Promise<Buffer> {
+		if (this._destroyed) throw new Error('Node destroyed');
+		const channel = this.openChannel(
+			peerPubkey,
+			fundingSatoshis,
+			undefined,
+			undefined,
+			false,
+			true
+		);
+		// A synchronous transport can complete the whole open inside
+		// openChannel (zero-conf needs no confirmation), so check before
+		// subscribing.
+		if (channel.getState() === ChannelState.NORMAL) {
+			return channel.getChannelId()!;
+		}
+		const matchesOpen = (id: Buffer): boolean => {
+			const cid = channel.getChannelId();
+			return (
+				(cid !== null && cid.equals(id)) ||
+				channel.getTemporaryChannelId().equals(id)
+			);
+		};
+		return new Promise<Buffer>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				cleanup();
+				reject(
+					new Error(
+						`zero-conf channel to ${peerPubkey.slice(
+							0,
+							12
+						)} not ready within ${timeoutMs}ms`
+					)
+				);
+			}, timeoutMs);
+
+			const cleanup = (): void => {
+				clearTimeout(timer);
+				this.removeListener('channel:ready', onReady);
+				this.removeListener('channel:aborted', onAborted);
+				this.removeListener('channel:voided', onVoided);
+				this.removeListener('node:error', onError);
+				this._activeWaitCleanups.delete(destroyCleanup);
+			};
+
+			const destroyCleanup = (): void => {
+				cleanup();
+				reject(new Error('Node destroyed'));
+			};
+			this._activeWaitCleanups.add(destroyCleanup);
+
+			const onReady = (data: { channelId: Buffer }): void => {
+				const cid = channel.getChannelId();
+				if (cid !== null && cid.equals(data.channelId)) {
+					cleanup();
+					resolve(cid);
+				}
+			};
+			// The v1 funding failure path (AUTO_FUNDING_FAILED carries no
+			// channelId) tears the open down via abortPendingOpen, whose
+			// channel:aborted names OUR temporary id: the precise scope.
+			const onAborted = (temporaryChannelId: Buffer, reason: string): void => {
+				if (!channel.getTemporaryChannelId().equals(temporaryChannelId)) {
+					return;
+				}
+				cleanup();
+				reject(new Error(`channel open aborted: ${reason}`));
+			};
+			// The v2 abort teardown's terminal event once the abandoned row is
+			// durably removed.
+			const onVoided = (data: { channelId: Buffer }): void => {
+				if (!matchesOpen(data.channelId)) return;
+				cleanup();
+				reject(new Error('channel open aborted: v2 open torn down'));
+			};
+			const onError = (err: ILightningError): void => {
+				// Unscoped v1 fallback: AUTO_FUNDING_FAILED names no channel,
+				// so only treat it as ours while our open is still unfunded.
+				if (
+					err.code === 'AUTO_FUNDING_FAILED' &&
+					!channel.getFullState().fundingTxid
+				) {
+					cleanup();
+					reject(new Error(`auto-funding failed: ${err.message}`));
+					return;
+				}
+				if (
+					err.code === 'CHANNEL_ERROR' &&
+					/^v2 open not funded/.test(err.message) &&
+					err.channelId !== undefined &&
+					matchesOpen(err.channelId)
+				) {
+					cleanup();
+					reject(new Error(`auto-funding failed: ${err.message}`));
+				}
+			};
+
+			this.on('channel:ready', onReady);
+			this.on('channel:aborted', onAborted);
+			this.on('channel:voided', onVoided);
+			this.on('node:error', onError);
+		});
+	}
+
 	destroy(): void {
 		this._destroyed = true;
 		// Retires any chain startup sequence still working through its awaits.
@@ -8554,6 +8679,17 @@ export class LightningNode extends EventEmitter {
 			 * Requires the peer in the zero-conf trusted set.
 			 */
 			trusted?: boolean;
+			/**
+			 * Fund the open from exactly these wallet outpoints (txid in
+			 * display byte order), e.g. to channelize a specific deposit
+			 * (issue #572). All named coins are contributed; allowTopUp
+			 * permits adding other spendable coins when they fall short of
+			 * amount + fee. Incompatible with fundMax.
+			 */
+			fundingUtxos?: {
+				utxos: Array<{ txid: string; vout: number }>;
+				allowTopUp?: boolean;
+			};
 		}
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
@@ -8578,6 +8714,31 @@ export class LightningNode extends EventEmitter {
 			throw new InvalidChannelOpenError(
 				'max funding cannot be combined with requestFunds (the lease fee is not known when the max is committed)'
 			);
+		}
+		if (params.fundMax && params.fundingUtxos) {
+			throw new InvalidChannelOpenError(
+				'max funding cannot be combined with fundingUtxos (a max open already sweeps every spendable UTXO)'
+			);
+		}
+		if (params.fundingUtxos) {
+			const list = params.fundingUtxos.utxos;
+			if (!Array.isArray(list) || list.length === 0) {
+				throw new InvalidChannelOpenError(
+					'fundingUtxos.utxos must be a non-empty array'
+				);
+			}
+			for (const u of list) {
+				if (typeof u?.txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(u.txid)) {
+					throw new InvalidChannelOpenError(
+						'fundingUtxos.utxos entries need a 64-hex txid'
+					);
+				}
+				if (!Number.isInteger(u.vout) || u.vout < 0) {
+					throw new InvalidChannelOpenError(
+						'fundingUtxos.utxos entries need a non-negative integer vout'
+					);
+				}
+			}
 		}
 		// open_channel2 carries all three as u32. Same reason as splice_init:
 		// encoding runs after the channel exists and is keyed by temporary id.
@@ -8620,7 +8781,8 @@ export class LightningNode extends EventEmitter {
 			requestFunds: params.requestFunds,
 			maxLeaseRates: params.maxLeaseRates,
 			channelType: params.channelType,
-			fundMax: params.fundMax
+			fundMax: params.fundMax,
+			fundingUtxos: params.fundingUtxos
 		};
 
 		return this.channelManager.createDualFundedChannel(peerPubkey, dualParams, {
@@ -8783,6 +8945,75 @@ export class LightningNode extends EventEmitter {
 			return { ok: false, error: result.error };
 		}
 		return { ok: true };
+	}
+
+	/**
+	 * Deliver a third-party input owner's witness for an EXTERNAL funding
+	 * input of a v2 open (issue #572): the out-of-band answer to the
+	 * externalInputIndices half of channel:txsigs-needed. The witness is
+	 * validated against the recorded funding prevouts before it is stored,
+	 * and delivering the last outstanding witness releases the withheld
+	 * tx_signatures. A refused delivery (unknown outpoint, invalid witness)
+	 * leaves the open untouched and can simply be retried with a correct
+	 * witness.
+	 * @param channelId - 32-byte channel ID from the event
+	 * @param prevTxid - txid of the input's previous transaction, INTERNAL
+	 *   byte order (tx.getHash(), not the display hex)
+	 * @param prevOutputIndex - output index the funding input spends
+	 * @param witness - the input's finished witness stack
+	 */
+	provideV2ExternalWitness(
+		channelId: Buffer,
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): { ok: boolean; error?: string } {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		const txidErr = validateBuffer(prevTxid, 32, 'prevTxid');
+		if (txidErr) throw new Error(txidErr);
+		if (!Number.isInteger(prevOutputIndex) || prevOutputIndex < 0) {
+			throw new Error(
+				`prevOutputIndex must be a non-negative integer, got ${prevOutputIndex}`
+			);
+		}
+		if (!Array.isArray(witness) || witness.some((b) => !Buffer.isBuffer(b))) {
+			throw new Error('witness must be an array of Buffers');
+		}
+		const result = this.channelManager.provideV2ExternalWitness(
+			channelId,
+			prevTxid,
+			prevOutputIndex,
+			witness
+		);
+		if (!result.ok) {
+			this.emit('node:error', {
+				code: 'PROVIDE_EXTERNAL_WITNESS_FAILED',
+				channelId,
+				message: result.error!,
+				timestamp: Date.now()
+			} as ILightningError);
+			return { ok: false, error: result.error };
+		}
+		return { ok: true };
+	}
+
+	/**
+	 * Raw channel object by id, for hosts that drive protocol extensions
+	 * (direct funding, issue #572) against the state machine directly. Covers
+	 * temp-resident channels looked up by their derived permanent id, which
+	 * getChannel's map lookup alone cannot resolve during a live v2 exchange.
+	 */
+	getRawChannel(channelId: Buffer): Channel | null {
+		return (
+			this.channelManager.getChannel(channelId) ??
+			(
+				this.channelManager as unknown as {
+					findChannelByChannelIdInTemp(id: Buffer): Channel | undefined;
+				}
+			).findChannelByChannelIdInTemp(channelId) ??
+			null
+		);
 	}
 
 	/**
@@ -9595,6 +9826,82 @@ export class LightningNode extends EventEmitter {
 			});
 
 		return { ok: true };
+	}
+
+	/**
+	 * Splice-in and wait for the splice to lock (issue #572): resolves on the
+	 * splice:complete event for this channel, rejects on a SPLICE_IN_FAILED
+	 * node error scoped to it or on timeout. The channel id is stable across
+	 * a splice, so both signals scope precisely. Listeners are registered
+	 * BEFORE spliceIn runs so a synchronous transport cannot lose the
+	 * completion; a synchronous spliceIn refusal throws.
+	 */
+	async spliceInAndWait(
+		channelId: Buffer,
+		amountSats: bigint,
+		timeoutMs = 120_000,
+		fundingFeeratePerkw?: number
+	): Promise<void> {
+		if (this._destroyed) throw new Error('Node destroyed');
+		const cidHex = channelId.toString('hex');
+		let cancelWait: () => void = () => undefined;
+		const done = new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				cleanup();
+				reject(
+					new Error(
+						`splice on ${cidHex.slice(0, 12)} not locked within ${timeoutMs}ms`
+					)
+				);
+			}, timeoutMs);
+
+			const cleanup = (): void => {
+				clearTimeout(timer);
+				this.removeListener('splice:complete', onComplete);
+				this.removeListener('node:error', onError);
+				this._activeWaitCleanups.delete(destroyCleanup);
+			};
+			// Some spliceIn refusals return without emitting SPLICE_IN_FAILED
+			// (unknown channel); the sync-throw path below unwinds through
+			// this so the timer and listeners never outlive the call.
+			cancelWait = cleanup;
+
+			const destroyCleanup = (): void => {
+				cleanup();
+				reject(new Error('Node destroyed'));
+			};
+			this._activeWaitCleanups.add(destroyCleanup);
+
+			const onComplete = (data: { channelId: Buffer }): void => {
+				if (data.channelId.toString('hex') !== cidHex) return;
+				cleanup();
+				resolve();
+			};
+			const onError = (err: ILightningError): void => {
+				if (err.code !== 'SPLICE_IN_FAILED') return;
+				if (err.channelId?.toString('hex') !== cidHex) return;
+				cleanup();
+				reject(new Error(err.message));
+			};
+
+			this.on('splice:complete', onComplete);
+			this.on('node:error', onError);
+		});
+		// Absorb the rejection when an emitted SPLICE_IN_FAILED settles the
+		// race before the synchronous throw below; without this the throw
+		// leaves `done` behind as an unhandled rejection.
+		done.catch(() => undefined);
+
+		const result = this.spliceIn(
+			channelId,
+			amountSats,
+			fundingFeeratePerkw ?? 253
+		);
+		if (!result.ok) {
+			cancelWait();
+			throw new Error(result.error ?? 'splice-in failed to start');
+		}
+		await done;
 	}
 
 	/**
@@ -10668,10 +10975,14 @@ export class LightningNode extends EventEmitter {
 			fundingSatoshis: state.fundingSatoshis,
 			channelType: state.channelType
 		};
-		if (state.fundingTxid)
+		if (state.fundingTxid) {
 			info.fundingTxid = Buffer.from(state.fundingTxid)
 				.reverse()
 				.toString('hex');
+			// Gated on fundingTxid: the state field defaults to 0 before any
+			// funding exists, and a fake 0 outpoint must not be reported.
+			info.fundingOutputIndex = state.fundingOutputIndex;
+		}
 		const pendingSplice = channel.getPendingSpliceLocalBalanceMsat();
 		if (pendingSplice !== null)
 			info.pendingSpliceLocalBalanceMsat = pendingSplice;

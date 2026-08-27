@@ -71,6 +71,22 @@ export function clampFeeRateSatPerVbyte(
 	return clamped;
 }
 
+/**
+ * Restriction on which wallet coins a selection may use (issue #572).
+ *
+ * `utxos` names outpoints (txid in display byte order, as listUtxos reports)
+ * that MUST all be contributed: a named outpoint that is missing, frozen or
+ * otherwise unspendable makes the selection throw naming it, never silently
+ * skip it. When the named coins fall short of amount + fee, `allowTopUp`
+ * permits completing the selection from the remaining spendable coins;
+ * without it the selection throws the normal insufficient-funds error.
+ * Omitted entirely, the selection is unrestricted (existing behavior).
+ */
+export interface IUtxoSelectionOpts {
+	utxos?: Array<{ txid: string; vout: number }>;
+	allowTopUp?: boolean;
+}
+
 export interface IFundingProvider {
 	/**
 	 * Build (but do not broadcast) the channel funding transaction.
@@ -134,7 +150,8 @@ export interface IFundingProvider {
 	 */
 	selectSpliceInputs?(
 		amountSats: bigint,
-		feeratePerKw: number
+		feeratePerKw: number,
+		opts?: IUtxoSelectionOpts
 	): Promise<{
 		inputs: import('../channel/channel').ISpliceWalletInput[];
 		changeScript: Buffer;
@@ -211,7 +228,8 @@ export interface IFundingProvider {
 		amountSats: bigint,
 		feeratePerKw: number,
 		initiator: boolean,
-		topUp?: boolean
+		topUp?: boolean,
+		opts?: IUtxoSelectionOpts
 	): Promise<{
 		inputs: import('../channel/channel').ISpliceWalletInput[];
 		changeScript: Buffer;
@@ -748,6 +766,12 @@ export interface IChannelInfo {
 	fundingSatoshis: bigint;
 	channelType: Buffer | null;
 	fundingTxid?: string;
+	/**
+	 * Funding output index in fundingTxid; present exactly when fundingTxid
+	 * is. With it a consumer holds the full funding outpoint (direct funding
+	 * builds its funding-output attestation from it, issue #572).
+	 */
+	fundingOutputIndex?: number;
 	shortChannelId?: string;
 	feeratePerKw?: number;
 	htlcCount?: number;

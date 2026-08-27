@@ -13,7 +13,7 @@
  * a leaf with no runtime imports keeps that edge free of a cycle.
  */
 
-import type { IFundingProvider } from './types';
+import type { IFundingProvider, IUtxoSelectionOpts } from './types';
 import type { ISpliceWalletInput } from '../channel/channel';
 
 /** What a contribution selection hands back: our inputs plus a change script. */
@@ -56,18 +56,20 @@ export function selectDualFundingContribution(
 	amountSats: bigint,
 	feeratePerKw: number,
 	initiator: boolean,
-	topUp = false
+	topUp = false,
+	opts?: IUtxoSelectionOpts
 ): Promise<IDualFundingSelection> {
 	if (fp.selectDualFundingInputs) {
 		return fp.selectDualFundingInputs(
 			amountSats,
 			feeratePerKw,
 			initiator,
-			topUp
+			topUp,
+			opts
 		);
 	}
 	if (fp.selectSpliceInputs) {
-		return fp.selectSpliceInputs(amountSats, feeratePerKw);
+		return fp.selectSpliceInputs(amountSats, feeratePerKw, opts);
 	}
 	throw new Error(
 		'funding provider cannot select wallet inputs (needs selectDualFundingInputs or selectSpliceInputs)'
