@@ -18,6 +18,7 @@ import {
 	DEFAULT_CHANNEL_CONFIG
 } from '../../src/lightning/channel/types';
 import { MessageType } from '../../src/lightning/message/types';
+import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import {
 	IClosingCompleteMessage,
 	encodeClosingCompleteMessage,
@@ -532,6 +533,127 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 			expect(h.aliceTxs.length).to.equal(0);
 		});
 
+		it('far-future or timestamp-space locktime is rejected before signing', function () {
+			const h = negotiatingHarness(23, 24);
+			h.bobChannel.setBlockHeight(800_000);
+			const errors: string[] = [];
+			h.bob.on('error', (_id, msg: string) => errors.push(msg));
+
+			// The issue #555 attack: a consensus-enforced locktime ~9000 years
+			// out, over which the peer's signature would verify just fine.
+			h.bob.handleMessage(
+				h.aPub,
+				MessageType.CLOSING_COMPLETE,
+				craftedClosingComplete(h, { locktime: 499_999_999 })
+			);
+			expect(
+				errors.some((e) => /locktime 499999999 is beyond our chain tip/.test(e))
+			).to.equal(true);
+
+			// Timestamp-space values are refused outright.
+			h.bob.handleMessage(
+				h.aPub,
+				MessageType.CLOSING_COMPLETE,
+				craftedClosingComplete(h, { locktime: 500_000_000 })
+			);
+			expect(
+				errors.some((e) => /locktime 500000000 is not a block height/.test(e))
+			).to.equal(true);
+
+			expect(h.bobChannel.getState()).to.equal(
+				ChannelState.NEGOTIATING_CLOSING
+			);
+			expect(h.bobTxs.length).to.equal(0);
+			expect(h.bobOut.some((m) => m.type === MessageType.CLOSING_SIG)).to.equal(
+				false
+			);
+		});
+
+		it('locktime within the tip tolerance is admitted; one block past it is not', function () {
+			const h = negotiatingHarness(25, 26);
+			h.bobChannel.setBlockHeight(800_000);
+			const errors: string[] = [];
+			h.bob.on('error', (_id, msg: string) => errors.push(msg));
+
+			// tip + tolerance: the locktime gate admits it, so the garbage
+			// signature is what gets refused.
+			h.bob.handleMessage(
+				h.aPub,
+				MessageType.CLOSING_COMPLETE,
+				craftedClosingComplete(h, { locktime: 800_006 })
+			);
+			expect(errors.some((e) => /locktime/.test(e))).to.equal(false);
+			expect(errors.some((e) => /signature failed to verify/.test(e))).to.equal(
+				true
+			);
+
+			h.bob.handleMessage(
+				h.aPub,
+				MessageType.CLOSING_COMPLETE,
+				craftedClosingComplete(h, { locktime: 800_007 })
+			);
+			expect(
+				errors.some((e) =>
+					/locktime 800007 is beyond our chain tip 800000/.test(e)
+				)
+			).to.equal(true);
+			expect(h.bobTxs.length).to.equal(0);
+		});
+
+		it('nonzero locktime with no chain tip is refused', function () {
+			const h = negotiatingHarness(27, 28);
+			const errors: string[] = [];
+			h.bob.on('error', (_id, msg: string) => errors.push(msg));
+
+			h.bob.handleMessage(
+				h.aPub,
+				MessageType.CLOSING_COMPLETE,
+				craftedClosingComplete(h, { locktime: 800_000 })
+			);
+			expect(
+				errors.some((e) => /no chain tip to validate locktime/.test(e))
+			).to.equal(true);
+			expect(h.bobChannel.getState()).to.equal(
+				ChannelState.NEGOTIATING_CLOSING
+			);
+			expect(h.bobTxs.length).to.equal(0);
+		});
+
+		it('force close exits a negotiation wedged on a rejected locktime', function () {
+			const h = negotiatingHarness(31, 32);
+			h.bobChannel.setBlockHeight(800_000);
+			const errors: string[] = [];
+			h.bob.on('error', (_id, msg: string) => errors.push(msg));
+
+			h.bob.handleMessage(
+				h.aPub,
+				MessageType.CLOSING_COMPLETE,
+				craftedClosingComplete(h, { locktime: 499_999_999 })
+			);
+			expect(errors.some((e) => /beyond our chain tip/.test(e))).to.equal(true);
+			expect(h.bobChannel.getState()).to.equal(
+				ChannelState.NEGOTIATING_CLOSING
+			);
+
+			// The refusal must not strand the channel: the peer may never send
+			// an acceptable locktime, so the unilateral exit has to be available
+			// from NEGOTIATING_CLOSING while the peer is still connected.
+			const destScript = Buffer.from('0014' + 'ee'.repeat(20), 'hex');
+			const result = h.bob.forceClose(h.channelId, destScript, 10);
+			expect(result.ok).to.equal(true);
+			const broadcast = result.actions.find(
+				(a) => a.type === ChannelActionType.BROADCAST_TX
+			) as { tx: Buffer } | undefined;
+			expect(broadcast).to.exist;
+			const bobState = h.bobChannel.getFullState();
+			const commitment = bitcoin.Transaction.fromBuffer(broadcast!.tx);
+			expect(
+				commitment.ins[0].hash.equals(bobState.fundingTxid!),
+				'commitment spends the funding outpoint'
+			).to.equal(true);
+			expect(h.bobChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+		});
+
 		it('blocks a second closing_complete while awaiting closing_sig (RBF gate)', function () {
 			const h = negotiatingHarness(15, 16);
 			h.alice.on('error', () => {}); // guard emits error; observed via result
@@ -594,6 +716,50 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 		expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
 		expect(h.bobChannel.getState()).to.equal(ChannelState.CLOSED);
 		expect(h.aliceTxs.length).to.be.greaterThan(0);
+	});
+
+	it('force close recovers a CLOSED channel whose recorded mutual close cannot be broadcast', function () {
+		const h = openChannelHarness(29, 30, 400_000_000n);
+		h.alice.on('error', () => {});
+		expect(h.alice.initiateShutdown(h.channelId, ALICE_SCRIPT).ok).to.equal(
+			true
+		);
+		pump(h.aliceOut, h.bob, h.aPub);
+		pump(h.bobOut, h.alice, h.bPub);
+		pump(h.aliceOut, h.bob, h.aPub);
+		pump(h.bobOut, h.alice, h.bPub);
+		expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+		const state = h.aliceChannel.getFullState();
+		expect(state.lastCooperativeCloseTxHex).to.be.a('string');
+
+		// A broadcastable close (locktime 0) keeps CLOSED terminal.
+		const destScript = Buffer.from('0014' + 'dd'.repeat(20), 'hex');
+		h.aliceChannel.setBlockHeight(800_000);
+		const refused = h.alice.forceClose(h.channelId, destScript, 10);
+		expect(refused.ok).to.equal(false);
+		expect(refused.error).to.match(/wrong state/);
+
+		// A victim row persisted before the locktime bound existed: the
+		// recorded close carries a far-future locktime, so no broadcast of it
+		// can ever be accepted. Force close must offer the unilateral exit.
+		const mangled = bitcoin.Transaction.fromHex(
+			state.lastCooperativeCloseTxHex!
+		);
+		mangled.locktime = 499_999_999;
+		h.aliceChannel.recordCooperativeCloseTx(mangled.toHex());
+
+		const result = h.alice.forceClose(h.channelId, destScript, 10);
+		expect(result.ok).to.equal(true);
+		const broadcast = result.actions.find(
+			(a) => a.type === ChannelActionType.BROADCAST_TX
+		) as { tx: Buffer } | undefined;
+		expect(broadcast).to.exist;
+		const commitment = bitcoin.Transaction.fromBuffer(broadcast!.tx);
+		expect(
+			commitment.ins[0].hash.equals(state.fundingTxid!),
+			'commitment spends the funding outpoint'
+		).to.equal(true);
+		expect(h.aliceChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
 	});
 
 	it('falls back to legacy closing_signed when the peer lacks the feature', function () {
