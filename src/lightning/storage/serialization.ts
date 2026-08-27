@@ -590,6 +590,9 @@ export interface ISerializedV2InFlight {
 	weSignFirst: boolean;
 	ourWitnesses: string[][];
 	ourWalletInputIndices: number[];
+	// Issue #554: tx-input indices of externally owned inputs whose witnesses
+	// arrive out of band; absent on records without external inputs.
+	externalInputIndices?: number[];
 	inputPrevouts?: Array<{ script: string; valueSats: string }>;
 	remoteCommitmentSig: string | null;
 	sentTxSignatures: boolean;
@@ -621,6 +624,9 @@ export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
 		weSignFirst: f.weSignFirst,
 		ourWitnesses: f.ourWitnesses.map((w) => w.map((b) => b.toString('hex'))),
 		ourWalletInputIndices: [...f.ourWalletInputIndices],
+		externalInputIndices: f.externalInputIndices
+			? [...f.externalInputIndices]
+			: undefined,
 		inputPrevouts: f.inputPrevouts.map((p) => ({
 			script: p.script.toString('hex'),
 			valueSats: bigintToStr(p.valueSats)
@@ -668,6 +674,9 @@ export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 			w.map((h) => Buffer.from(h, 'hex'))
 		),
 		ourWalletInputIndices: [...s.ourWalletInputIndices],
+		externalInputIndices: s.externalInputIndices
+			? [...s.externalInputIndices]
+			: undefined,
 		inputPrevouts: (s.inputPrevouts ?? []).map((p) => ({
 			script: Buffer.from(p.script, 'hex'),
 			valueSats: strToBigint(p.valueSats)

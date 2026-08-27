@@ -117,6 +117,18 @@ export interface IV2InFlight {
 	ourWitnesses: Buffer[][];
 	ourWalletInputIndices: number[];
 	/**
+	 * Direct funding (issue #554): the tx-input indices among
+	 * ourWalletInputIndices whose inputs belong to a THIRD PARTY. Their
+	 * parallel ourWitnesses slots hold empty placeholders until the owner's
+	 * witness arrives via provideV2ExternalWitness; the release predicate
+	 * treats an unfilled slot as a hole, and our tx_signatures never leaves
+	 * with one. Durable so the wait survives disconnect and restart, and
+	 * per-attempt by construction (each RBF attempt records itself fresh, so
+	 * a witness signed over a superseded attempt can never release). Absent
+	 * on records without external inputs.
+	 */
+	externalInputIndices?: number[];
+	/**
 	 * The complete prevout set of the negotiated funding tx (scriptPubkey and
 	 * value per input, in tx-input order). The interactive-tx prev_txs die
 	 * with the process, and witness validation needs the set after a restart:
