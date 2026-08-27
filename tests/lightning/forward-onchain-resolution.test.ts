@@ -359,6 +359,70 @@ describe('S-2.M3: on-chain timeout of a forwarded outgoing leg', function () {
 		fx.carol.destroy();
 	});
 
+	it('settles upstream after a splice on the inbound channel (issue 558)', async () => {
+		const fx = setupForwardWithResolvingOutgoingLeg();
+		const { alice, inChannelId, outChannelId, outKey } = fx;
+
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const inChan = (alice as any).channelManager.getChannel(inChannelId);
+		const outChan = (alice as any).channelManager.getChannel(outChannelId);
+		inChan.getFullState().htlcs.get('received-7').paymentHash = paymentHash;
+		outChan.getFullState().htlcs.get('offered-7').paymentHash = paymentHash;
+
+		// The inbound channel is quiescing for a splice when the downstream
+		// HTLC-success confirms on-chain.
+		inChan.getFullState().state = ChannelState.SPLICING;
+
+		const UPDATE_FULFILL_HTLC = 130;
+		let fulfillsSentUpstream = 0;
+		alice.on('message:outbound', (pubkey: string, type: number) => {
+			if (pubkey === fx.bob.getNodeId() && type === UPDATE_FULFILL_HTLC)
+				fulfillsSentUpstream++;
+		});
+
+		(alice as any).channelManager.emit(
+			'preimage:learned',
+			paymentHash,
+			preimage
+		);
+
+		expect(fulfillsSentUpstream).to.equal(0);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(true);
+
+		// quiescence:ended fires while the channel still cannot carry updates
+		// (taproot channels stay parked until splice_locked): the owed pass
+		// runs, refuses again, and keeps the linkage.
+		(alice as any).channelManager.emit(
+			'quiescence:ended',
+			inChannelId.toString('hex')
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(fulfillsSentUpstream).to.equal(0);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(true);
+		expect(inChan.getFullState().htlcs.get('received-7').state).to.equal(
+			HtlcState.COMMITTED
+		);
+
+		// splice_locked exchanged both ways: the channel is NORMAL again and
+		// splice:complete (not channel:reestablished) is what a live splice
+		// emits. The owed pass must settle upstream from here.
+		inChan.getFullState().state = ChannelState.NORMAL;
+		(alice as any).channelManager.emit('splice:complete', inChannelId);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		expect(fulfillsSentUpstream).to.equal(1);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(false);
+		const inbound = inChan.getFullState().htlcs.get('received-7');
+		expect(
+			inbound === undefined || inbound.state === HtlcState.FULFILLED
+		).to.equal(true);
+
+		fx.alice.destroy();
+		fx.bob.destroy();
+		fx.carol.destroy();
+	});
+
 	it('leaves the forward alone when the preimage is already known', () => {
 		const fx = setupForwardWithResolvingOutgoingLeg();
 		const { alice, inChannelId, paymentHash, outKey, height } = fx;
