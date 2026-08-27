@@ -46,10 +46,7 @@ function generateFiller(
 		const fillerStart = routingInfoLength - filler.length;
 
 		const keys = deriveHopKeys(sharedSecrets[i]);
-		const stream = generateCipherStream(
-			keys.rho,
-			routingInfoLength + hopSize
-		);
+		const stream = generateCipherStream(keys.rho, routingInfoLength + hopSize);
 
 		// Extend filler by hopSize zeros
 		const newFiller = Buffer.alloc(filler.length + hopSize);
