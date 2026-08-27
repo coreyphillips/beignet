@@ -649,6 +649,16 @@ export interface ISpliceWalletInput {
 	 * require_confirmed_inputs; treated as unknown when omitted.
 	 */
 	confirmed?: boolean;
+	/**
+	 * Direct funding (issue #554): this input belongs to a THIRD PARTY. It is
+	 * contributed and emitted on the wire like any of our inputs (our serial
+	 * parity, full prevTx), but its witness cannot be produced locally:
+	 * signWitness is never called for it. The host collects the owner's
+	 * signature out of band and delivers it via provideV2ExternalWitness,
+	 * which releases our tx_signatures once every external slot is filled.
+	 * Callers typically pass a throwing stub as signWitness.
+	 */
+	external?: boolean;
 }
 
 /**
@@ -14294,14 +14304,21 @@ export class Channel {
 	 * argument). Witnesses are applied to built.tx in place. With no
 	 * contribution registered the witness list is empty: either we own no
 	 * inputs (a complete answer) or the caller drives sendTxSignatures itself
-	 * (the witnesses are recorded when they are released). Returns null when a
-	 * prevout cannot be resolved or a contributed input has no closure —
+	 * (the witnesses are recorded when they are released). An EXTERNAL input
+	 * (issue #554) is never signed here: its slot holds an empty placeholder
+	 * and its tx-input index is reported in externalIndices, to be filled by
+	 * provideV2ExternalWitness before anything can release. Returns null when
+	 * a prevout cannot be resolved or a contributed OWN input has no closure —
 	 * nothing must be signed or recorded in that case.
 	 */
 	private _signV2ContributionWitnesses(built: {
 		tx: import('bitcoinjs-lib').Transaction;
 		outputIndex: number;
-	}): { witnesses: Buffer[][]; indices: number[] } | null {
+	}): {
+		witnesses: Buffer[][];
+		indices: number[];
+		externalIndices: number[];
+	} | null {
 		const session = this._state.dualFundingSession;
 		const builder = session?.getTxBuilder();
 		if (!session || !builder) return null;
@@ -14316,10 +14333,11 @@ export class Channel {
 			}
 		}
 		const c = this._dualFundingContribution;
-		if (!c) return { witnesses: [], indices };
+		if (!c) return { witnesses: [], indices, externalIndices: [] };
 		const prevouts = this._collectPrevouts(built.tx, sorted);
 		if (!prevouts) return null;
 		const witnesses: Buffer[][] = [];
+		const externalIndices: number[] = [];
 		for (const i of indices) {
 			const prevTxid = Buffer.from(built.tx.ins[i].hash);
 			const vout = built.tx.ins[i].index;
@@ -14329,11 +14347,16 @@ export class Channel {
 					wi.prevOutputIndex === vout
 			);
 			if (!w) return null;
+			if (w.external) {
+				externalIndices.push(i);
+				witnesses.push([]);
+				continue;
+			}
 			const witness = w.signWitness(built.tx, i, w.value, prevouts);
 			built.tx.setWitness(i, witness);
 			witnesses.push(witness);
 		}
-		return { witnesses, indices };
+		return { witnesses, indices, externalIndices };
 	}
 
 	/**
@@ -14397,6 +14420,23 @@ export class Channel {
 	}
 
 	/**
+	 * The tx-input indices of EXTERNAL inputs whose witness slot is still an
+	 * empty placeholder (issue #554). Non-empty means our tx_signatures is
+	 * owed a third-party witness and must not release: an empty stack in the
+	 * message would be a witness hole the funding tx can never recover from.
+	 */
+	private _v2OwedExternalIndices(record: IV2InFlight): number[] {
+		if (!record.externalInputIndices?.length) return [];
+		const owed: number[] = [];
+		for (const idx of record.externalInputIndices) {
+			const pos = record.ourWalletInputIndices.indexOf(idx);
+			const witness = pos >= 0 ? record.ourWitnesses[pos] : undefined;
+			if (!witness || witness.length === 0) owed.push(idx);
+		}
+		return owed;
+	}
+
+	/**
 	 * Assemble the complete in-flight record for the CURRENT attempt from
 	 * the live session and builder, or null when any step fails. Pure
 	 * construction: nothing on the channel is mutated.
@@ -14430,6 +14470,8 @@ export class Channel {
 			weSignFirst: this._v2ShouldSignFirst(),
 			ourWitnesses: signed.witnesses,
 			ourWalletInputIndices: signed.indices,
+			externalInputIndices:
+				signed.externalIndices.length > 0 ? signed.externalIndices : undefined,
 			inputPrevouts: prevouts.scripts.map((s, i) => ({
 				script: Buffer.from(s),
 				valueSats: prevouts.values[i]
@@ -15361,13 +15403,15 @@ export class Channel {
 
 		if (!this._v2PendingTxSigs) {
 			const record = this._state.v2InFlight;
+			const owedExternal = record ? this._v2OwedExternalIndices(record) : [];
 			if (
 				record &&
-				record.ourWitnesses.length === record.ourWalletInputIndices.length
+				record.ourWitnesses.length === record.ourWalletInputIndices.length &&
+				owedExternal.length === 0
 			) {
 				// The record was created at the commitment point with our inputs
-				// already signed (or with none to sign): release those witnesses
-				// verbatim.
+				// already signed (or with none to sign) and every external slot
+				// filled: release those witnesses verbatim.
 				this._v2PendingTxSigs = {
 					txid: Buffer.from(record.fundingTxid),
 					outputIndex: record.fundingOutputIndex,
@@ -15376,13 +15420,20 @@ export class Channel {
 					)
 				};
 			} else if (record) {
-				// Empty witnesses beside non-empty indices: the caller-driven
-				// flow still owes them via sendTxSignatures. Every other release
-				// gate has passed, so the send is due NOW and only the caller
-				// can supply the bytes. Surface the obligation once per
-				// connection cycle instead of waiting silently: after a restart
-				// the pending witnesses died with the process and nothing else
-				// tells the embedder to re-drive (issue 307).
+				// Witnesses are owed: either the caller-driven flow still owes
+				// them all via sendTxSignatures (empty witnesses beside
+				// non-empty indices), or external input slots are unfilled and
+				// their owners' witnesses come via provideV2ExternalWitness
+				// (issue #554). Every other release gate has passed, so the
+				// send is due NOW and only the caller can supply the bytes.
+				// Surface the obligation once per connection cycle instead of
+				// waiting silently: after a restart the pending witnesses died
+				// with the process and nothing else tells the embedder to
+				// re-drive (issue 307). inputIndices always names EVERY input
+				// we contributed, because the documented answer is a COMPLETE
+				// sendTxSignatures set; externalInputIndices additionally names
+				// the still-owed external slots, deliverable one at a time via
+				// provideV2ExternalWitness (either response path releases).
 				if (this._v2CallerTxSigsSignaled) return [];
 				this._v2CallerTxSigsSignaled = true;
 				return [
@@ -15391,7 +15442,10 @@ export class Channel {
 						channelId: this._v2ChannelId(),
 						fundingTxid: Buffer.from(record.fundingTxid),
 						fundingOutputIndex: record.fundingOutputIndex,
-						inputIndices: [...record.ourWalletInputIndices]
+						inputIndices: [...record.ourWalletInputIndices],
+						...(owedExternal.length > 0
+							? { externalInputIndices: owedExternal }
+							: {})
 					}
 				];
 			} else if (this._dualFundingContribution) {
@@ -15401,6 +15455,11 @@ export class Channel {
 				if (!built) return [];
 				const signed = this._signV2ContributionWitnesses(built);
 				if (!signed) return [];
+				// External inputs require the durable record path (their
+				// witnesses live there); a record-less release would emit
+				// placeholder holes. Unreachable in practice: the record is
+				// created before the commitment round that gates this release.
+				if (signed.externalIndices.length > 0) return [];
 				this._v2PendingTxSigs = {
 					txid: Buffer.from(built.tx.getHash()),
 					outputIndex: built.outputIndex,
@@ -15575,12 +15634,153 @@ export class Channel {
 			];
 		}
 
+		// The supplied array is the COMPLETE local witness set, one stack per
+		// input we contributed, in tx-input order. A short set would leave the
+		// wire as a witness hole the peer rejects AFTER we recorded the
+		// release, splitting the exchange (issue #554 review): refuse it here,
+		// before anything is staged or recorded.
+		const record = this._state.v2InFlight;
+		let expectedCount: number | null = null;
+		if (record && !this._v2RecordIsStaleRollback()) {
+			expectedCount = record.ourWalletInputIndices.length;
+		} else {
+			const builder = session.getTxBuilder();
+			if (builder) {
+				expectedCount = builder
+					.getInputs()
+					.filter(
+						(i) => (i.serialId % 2n === 0n) === session.isInitiator()
+					).length;
+			}
+		}
+		if (expectedCount !== null && witnesses.length !== expectedCount) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `tx_signatures must carry ${expectedCount} witness stacks (one per contributed input), got ${witnesses.length}`
+				}
+			];
+		}
+
+		// External slots inside a caller-supplied set get the same
+		// verification provideV2ExternalWitness applies: a third-party stack
+		// that does not verify must never leave (issue #554).
+		if (record?.externalInputIndices?.length) {
+			const prevouts = this._v2InputPrevouts();
+			let negotiated: import('bitcoinjs-lib').Transaction | null = null;
+			try {
+				negotiated = bitcoin.Transaction.fromHex(record.fundingTxHex);
+			} catch {
+				negotiated = null;
+			}
+			if (!prevouts || !negotiated) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'external funding inputs cannot be verified: negotiated tx or prevouts unresolvable'
+					}
+				];
+			}
+			for (const extIndex of record.externalInputIndices) {
+				const pos = record.ourWalletInputIndices.indexOf(extIndex);
+				const stack = pos >= 0 ? witnesses[pos] : undefined;
+				const problem = stack
+					? this._validateWitnessForInput(negotiated, extIndex, stack, prevouts)
+					: 'missing witness stack';
+				if (problem) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: `external witness rejected: ${problem}`
+						}
+					];
+				}
+			}
+		}
+
 		this._v2PendingTxSigs = {
 			txid: Buffer.from(txid),
 			outputIndex,
 			witnesses
 		};
 		return this._maybeSendV2TxSigs();
+	}
+
+	/**
+	 * Deliver a third-party witness for an EXTERNAL funding input of a v2
+	 * open (issue #554). The witness is cryptographically verified against
+	 * the recorded prevout set before anything is stored (P2WPKH over the
+	 * BIP 143 sighash, P2TR key-spend over BIP 341; anything unverifiable is
+	 * refused), then persisted into the in-flight record's slot; when the
+	 * last slot fills, the pending tx_signatures release flushes through the
+	 * ordinary gates. Works on a live channel and on one restored after a
+	 * restart (the record carries the negotiated tx and prevouts).
+	 *
+	 * `prevTxid` is in tx.getHash() INTERNAL byte order, matching
+	 * extractTxidFromPrevTx and the negotiated tx's input hashes.
+	 *
+	 * Throws on misuse or an invalid witness without touching channel state;
+	 * a late delivery after our tx_signatures already left is a no-op.
+	 */
+	provideV2ExternalWitness(
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): ChannelAction[] {
+		if (prevTxid.length !== 32) {
+			throw new Error('prevTxid must be 32 bytes (internal byte order)');
+		}
+		const record = this._state.v2InFlight;
+		if (!record || this._v2RecordIsStaleRollback()) {
+			throw new Error(
+				'no current v2 in-flight record to deliver an external witness to'
+			);
+		}
+		if (!record.externalInputIndices?.length) {
+			throw new Error('this v2 open has no external funding inputs');
+		}
+		if (record.sentTxSignatures) {
+			return [];
+		}
+		let tx: import('bitcoinjs-lib').Transaction;
+		try {
+			tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
+		} catch {
+			throw new Error('negotiated funding tx cannot be resolved');
+		}
+		const index = tx.ins.findIndex(
+			(i) => Buffer.from(i.hash).equals(prevTxid) && i.index === prevOutputIndex
+		);
+		if (index < 0) {
+			throw new Error('outpoint is not an input of the negotiated funding tx');
+		}
+		if (!record.externalInputIndices.includes(index)) {
+			throw new Error('outpoint is not an external funding input');
+		}
+		const pos = record.ourWalletInputIndices.indexOf(index);
+		if (pos < 0) {
+			throw new Error('external input is not among our funding inputs');
+		}
+		const prevouts = this._v2InputPrevouts();
+		if (!prevouts) {
+			throw new Error('funding prevouts cannot be resolved');
+		}
+		const problem = this._validateWitnessForInput(tx, index, witness, prevouts);
+		if (problem) {
+			throw new Error(`external witness rejected: ${problem}`);
+		}
+		const updated = record.ourWitnesses.map((w, p) =>
+			p === pos ? witness.map((b) => Buffer.from(b)) : w
+		);
+		this._syncV2InFlight({ ourWitnesses: updated });
+		// Persist the filled slot even when the release is not yet due (other
+		// slots or the commitment round still owed): a restart must not lose a
+		// verified witness. The flush emits its own persist when it releases.
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			...this._maybeSendV2TxSigs()
+		];
 	}
 
 	/**
@@ -15960,6 +16160,9 @@ export class Channel {
 			if (record.ourWitnesses.length !== record.ourWalletInputIndices.length) {
 				return null;
 			}
+			// An unfilled external slot is a witness hole (issue #554): the
+			// assembled tx would carry an empty stack and can never be valid.
+			if (this._v2OwedExternalIndices(record).length > 0) return null;
 			let tx: import('bitcoinjs-lib').Transaction;
 			try {
 				tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
@@ -16003,6 +16206,17 @@ export class Channel {
 							wi.prevOutputIndex === vout
 					);
 					if (!w) return null;
+					if (w.external) {
+						// A third-party input has no closure to re-sign with:
+						// its witness is whatever the owner delivered, held in
+						// the record (issue #554). An unfilled slot fails the
+						// assembly rather than emitting a hole.
+						const pos = record?.ourWalletInputIndices.indexOf(i) ?? -1;
+						const witness = pos >= 0 ? record!.ourWitnesses[pos] : null;
+						if (!witness || witness.length === 0) return null;
+						built.tx.setWitness(i, witness);
+						continue;
+					}
 					built.tx.setWitness(
 						i,
 						w.signWitness(built.tx, i, w.value, prevouts!)
@@ -17859,6 +18073,15 @@ export class Channel {
 					this._v2RollbackAbortPending = false;
 					return this._maybeSendV2TxSigs();
 				}
+				// The completed exchange may have been the freeze that held a
+				// due release: an operator abort cancelled by a crossed
+				// tx_init_rbf lands its echo here with _v2AbortPending already
+				// cleared, and a witness that arrived during the freeze (e.g.
+				// an external input's, issue #554) was persisted but never
+				// sent. Re-drive the flush now instead of waiting for a
+				// reconnect; every gate inside it still applies, so this is a
+				// no-op whenever nothing is due.
+				return this._maybeSendV2TxSigs();
 			}
 			return [];
 		}
