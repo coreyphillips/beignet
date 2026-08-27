@@ -606,6 +606,7 @@ function classifyOurCommitmentOutputs(
 	);
 
 	let htlcSigCounter = 0;
+	const claimedHtlcKeys = new Set<string>();
 	for (let i = 0; i < tx.outs.length; i++) {
 		const outScript = tx.outs[i].script;
 
@@ -673,7 +674,8 @@ function classifyOurCommitmentOutputs(
 			revocationPubkey,
 			localHtlcPubkey,
 			remoteHtlcPubkey,
-			true
+			true,
+			claimedHtlcKeys
 		);
 		if (htlcMatch) {
 			outputs.push({
@@ -687,6 +689,7 @@ function classifyOurCommitmentOutputs(
 				status: OutputStatus.CONFIRMED,
 				confirmationHeight: 0,
 				paymentHash: htlcMatch.paymentHash,
+				htlcId: htlcMatch.htlcId,
 				cltvExpiry: htlcMatch.cltvExpiry,
 				witnessScript: htlcMatch.witnessScript,
 				htlcSigIndex: htlcSigCounter++
@@ -790,6 +793,7 @@ function classifyTheirCommitmentOutputs(
 		perCommitmentPoint
 	);
 
+	const claimedHtlcKeys = new Set<string>();
 	for (let i = 0; i < tx.outs.length; i++) {
 		const outScript = tx.outs[i].script;
 
@@ -859,7 +863,8 @@ function classifyTheirCommitmentOutputs(
 			revocationPubkey,
 			theirHtlcPubkey,
 			ourHtlcPubkey,
-			false
+			false,
+			claimedHtlcKeys
 		);
 		if (htlcMatch) {
 			outputs.push({
@@ -873,6 +878,7 @@ function classifyTheirCommitmentOutputs(
 				status: OutputStatus.CONFIRMED,
 				confirmationHeight: 0,
 				paymentHash: htlcMatch.paymentHash,
+				htlcId: htlcMatch.htlcId,
 				cltvExpiry: htlcMatch.cltvExpiry,
 				witnessScript: htlcMatch.witnessScript
 			});
@@ -959,6 +965,8 @@ interface IHtlcMatch {
 	paymentHash: Buffer;
 	cltvExpiry: number;
 	witnessScript: Buffer;
+	/** The channel HTLC id of the entry this output was attributed to. */
+	htlcId: bigint;
 }
 
 /**
@@ -1029,14 +1037,22 @@ function matchHtlcOutput(
 	revocationPubkey: Buffer,
 	localHtlcPubkey: Buffer,
 	remoteHtlcPubkey: Buffer,
-	isLocal: boolean
+	isLocal: boolean,
+	// Entry keys already attributed to an earlier output of the SAME
+	// commitment. Same-hash HTLCs (MPP parts, retries) have IDENTICAL
+	// scripts, so without this each identical output would claim the same
+	// first entry and the recorded htlcId would double-count one leg.
+	claimedKeys?: Set<string>
 ): IHtlcMatch | null {
 	// Anchor channels add a 1-block CSV to every HTLC output script, so the
 	// scripts (and thus the P2WSH we match against) differ. Build the variant
 	// that matches the on-chain commitment.
 	const useAnchors = isAnchorChannel(state.channelType);
 
-	for (const entry of state.htlcs.values()) {
+	for (const [entryKey, entry] of state.htlcs.entries()) {
+		if (claimedKeys?.has(entryKey)) {
+			continue;
+		}
 		if (!htlcEntryCanBePresent(entry, isLocal)) {
 			continue;
 		}
@@ -1094,11 +1110,13 @@ function matchHtlcOutput(
 
 		const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: script } });
 		if (p2wsh.output && outScript.equals(p2wsh.output)) {
+			claimedKeys?.add(entryKey);
 			return {
 				direction,
 				paymentHash: entry.paymentHash,
 				cltvExpiry: entry.cltvExpiry,
-				witnessScript: script
+				witnessScript: script,
+				htlcId: entry.id
 			};
 		}
 	}
@@ -1212,9 +1230,15 @@ function matchTaprootHtlcOutput(
 	outScript: Buffer,
 	state: IChannelState,
 	keys: ITaprootCommitKeys,
-	isOurs: boolean
+	isOurs: boolean,
+	// Same one-to-one attribution as matchHtlcOutput: identical same-hash
+	// scripts must each claim a DISTINCT entry.
+	claimedKeys?: Set<string>
 ): IHtlcMatch | null {
-	for (const entry of state.htlcs.values()) {
+	for (const [entryKey, entry] of state.htlcs.entries()) {
+		if (claimedKeys?.has(entryKey)) {
+			continue;
+		}
 		if (!htlcEntryCanBePresent(entry, isOurs)) {
 			continue;
 		}
@@ -1242,12 +1266,14 @@ function matchTaprootHtlcOutput(
 			  );
 
 		if (outScript.equals(built.output)) {
+			claimedKeys?.add(entryKey);
 			return {
 				// outputType reflects OUR perspective on the HTLC.
 				direction: entry.direction,
 				paymentHash: entry.paymentHash,
 				cltvExpiry: entry.cltvExpiry,
-				witnessScript: built.output
+				witnessScript: built.output,
+				htlcId: entry.id
 			};
 		}
 	}
@@ -1288,6 +1314,7 @@ function classifyTaprootCommitmentOutputs(
 	const toRemoteSpk = buildTaprootToRemoteOutput(keys.paymentPubkey).output;
 
 	let htlcSigCounter = 0;
+	const claimedHtlcKeys = new Set<string>();
 	for (let i = 0; i < tx.outs.length; i++) {
 		const outScript = tx.outs[i].script;
 		const base = {
@@ -1306,7 +1333,13 @@ function classifyTaprootCommitmentOutputs(
 			outputs.push({ ...base, outputType: OutputType.TO_REMOTE });
 			continue;
 		}
-		const htlc = matchTaprootHtlcOutput(outScript, state, keys, isOurs);
+		const htlc = matchTaprootHtlcOutput(
+			outScript,
+			state,
+			keys,
+			isOurs,
+			claimedHtlcKeys
+		);
 		if (htlc) {
 			outputs.push({
 				...base,
@@ -1315,6 +1348,7 @@ function classifyTaprootCommitmentOutputs(
 						? OutputType.OFFERED_HTLC
 						: OutputType.RECEIVED_HTLC,
 				paymentHash: htlc.paymentHash,
+				htlcId: htlc.htlcId,
 				cltvExpiry: htlc.cltvExpiry,
 				htlcSigIndex: htlcSigCounter++
 			});

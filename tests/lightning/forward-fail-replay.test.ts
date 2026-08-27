@@ -426,6 +426,71 @@ describe('Replayed update_fail_htlc re-drives the refund (issue 297)', () => {
 		bob.destroy();
 	});
 
+	it('a quiescing inbound channel during the downstream fail keeps the linkage and refunds at session end (issue 569)', async function () {
+		this.timeout(30_000);
+		const world = await setupForwardWorld();
+		const { alice, bob, charlie } = world;
+
+		const invoice = charlie.createInvoice({
+			amountMsat: 80_000n,
+			description: 'quiesce fail',
+			hold: true
+		});
+		const payment = alice.sendPayment(invoice.bolt11);
+		await waitFor(
+			() => charlie.listHoldInvoices().some((h) => h.state === 'ACCEPTED'),
+			'the HTLC to park at Charlie'
+		);
+
+		// Real quiescence on the inbound channel: stfu exchanged over the
+		// wire while the ChannelState stays NORMAL, so the fail owed
+		// upstream must be refused with the linkage retained, not parked in
+		// memory around a durable linkage delete.
+		expect(
+			bob.getChannelManager().initiateQuiescence(world.abChannelId).ok
+		).to.equal(true);
+		const inbound = bob.getChannelManager().getChannel(world.abChannelId)!;
+		expect(inbound.isQuiescing()).to.equal(true);
+		expect(inbound.getState()).to.equal(ChannelState.NORMAL);
+
+		charlie.cancelHoldInvoice(invoice.paymentHash);
+		await settle(10);
+
+		const bobInternals = bob as unknown as {
+			forwardedHtlcs: Map<string, unknown>;
+		};
+		expect(
+			bobInternals.forwardedHtlcs.size,
+			'forward linkage survives the refused fail'
+		).to.equal(1);
+		expect(payment.status, 'payer still pending').to.equal(
+			PaymentStatus.PENDING
+		);
+
+		// The session dies with the connection; the reestablish tail owes the
+		// refund and only now consumes the linkage.
+		await cycleConnection(alice, bob, world.cutAB, world.gateAB);
+		await waitFor(
+			() => payment.status === PaymentStatus.FAILED,
+			'the payer to be refunded after the quiescent session ended'
+		);
+		await waitFor(
+			() =>
+				![...inbound.getFullState().htlcs.values()].some(
+					(h) => h.state === HtlcState.COMMITTED
+				),
+			'the inbound HTLC to leave COMMITTED'
+		);
+		expect(
+			bobInternals.forwardedHtlcs.size,
+			'linkage cleared by the refund'
+		).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+		charlie.destroy();
+	});
+
 	it('a live inbound disconnect during the downstream fail keeps the linkage and refunds on reconnect', async function () {
 		this.timeout(30_000);
 		const world = await setupForwardWorld();

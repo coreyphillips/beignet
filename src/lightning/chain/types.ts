@@ -46,6 +46,16 @@ export interface ITrackedOutput {
 	status: OutputStatus;
 	confirmationHeight: number;
 	paymentHash?: Buffer;
+	/**
+	 * The channel HTLC id this output was attributed to at classification.
+	 * Same-hash HTLCs (MPP parts, payment retries) produce IDENTICAL output
+	 * scripts, so the hash alone cannot say WHICH forward an output belongs
+	 * to; consumers keying follow-up actions to a forward (the upstream fail
+	 * of a timed-out outgoing leg) must match on this, never on the hash.
+	 * Attribution among identical scripts is one-to-one but arbitrary, which
+	 * is sufficient: one resolved output licenses exactly one leg's action.
+	 */
+	htlcId?: bigint;
 	cltvExpiry?: number;
 	witnessScript?: Buffer;
 	resolutionTxid?: string;
@@ -250,6 +260,12 @@ export interface IOutputResolvedChainAction {
 	channelId?: Buffer;
 	outputType: OutputType;
 	paymentHash?: Buffer;
+	/**
+	 * Exact HTLC identity of the resolved output (see ITrackedOutput.htlcId).
+	 * Consumers must prefer this over paymentHash: same-hash MPP parts and
+	 * retries make the hash ambiguous across forwards.
+	 */
+	htlcId?: bigint;
 }
 
 export interface IChannelFullyResolvedChainAction {
