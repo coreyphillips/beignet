@@ -32,7 +32,11 @@ import {
 	buildLocalCommitment,
 	buildRemoteCommitment
 } from '../../src/lightning/channel/commitment-builder';
-import { buildClosingTx } from '../../src/lightning/chain/closing';
+import {
+	buildClosingTx,
+	buildSimpleClosingTx,
+	SimpleCloseVariant
+} from '../../src/lightning/chain/closing';
 import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import {
 	MonitorState,
@@ -358,6 +362,91 @@ describe('Chain Monitor (Phase 4C)', function () {
 				openerPrivkeys
 			};
 		}
+
+		function simpleCloseTxFor(
+			state: ReturnType<Channel['getFullState']>,
+			destScript: Buffer
+		): bitcoin.Transaction {
+			// Simple-close shape: sequence 0xfffffffd, negotiated (nonzero)
+			// locktime. Issue #568: the old classifier only matched locktime 0
+			// with sequence 0xffffffff, so this shape decoded as a fabricated
+			// future commitment and the monitor pinned in RESOLVING.
+			return buildSimpleClosingTx({
+				fundingTxid: state.fundingTxid!.toString('hex'),
+				fundingOutputIndex: state.fundingOutputIndex,
+				closerScriptPubkey: destScript,
+				closeeScriptPubkey: Buffer.alloc(22, 0x02),
+				closerAmount: 800_000n,
+				closeeAmount: 199_000n,
+				feeSatoshis: 1_000n,
+				locktime: 100,
+				variant: SimpleCloseVariant.CLOSER_AND_CLOSEE
+			}).tx;
+		}
+
+		it('resolves an option_simple_close spend at IRREVOCABLE_DEPTH instead of pinning RESOLVING', function () {
+			const { monitor, state, destScript } = coopCloseFixture();
+			const closingTx = simpleCloseTxFor(state, destScript);
+
+			monitor.handleFundingSpent(closingTx, 100);
+			expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+			expect(
+				monitor.getFullState().commitmentBroadcast!.commitmentType
+			).to.equal(CommitmentType.COOPERATIVE_CLOSE);
+
+			expect(
+				monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH - 1)
+			).to.have.length(0);
+			expect(monitor.isFullyResolved()).to.be.false;
+
+			const atDepth = monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+			expect(
+				atDepth.filter((a) => a.type === ChainActionType.OUTPUT_RESOLVED)
+			).to.have.length(2);
+			expect(
+				atDepth.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(monitor.isFullyResolved()).to.be.true;
+		});
+
+		it('repairs a persisted THEIR_FUTURE record of a simple close on re-report', function () {
+			const { monitor, state, destScript, openerPrivkeys } = coopCloseFixture();
+			const closingTx = simpleCloseTxFor(state, destScript);
+			monitor.handleFundingSpent(closingTx, 100);
+
+			// Pre-issue-568-fix persisted shape: the simple close decoded as a
+			// fabricated future commitment whose output matcher tracked nothing.
+			const saved = monitor.getFullState();
+			saved.commitmentBroadcast!.commitmentType =
+				CommitmentType.THEIR_FUTURE_COMMITMENT;
+			saved.commitmentBroadcast!.commitmentNumber = 1n << 47n;
+			saved.trackedOutputs = [];
+
+			const restored = ChainMonitor.restore(
+				saved,
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			expect(restored.getState()).to.equal(MonitorState.RESOLVING);
+
+			// The re-armed funding watch re-reports the same confirmed spend; the
+			// re-report reclassifies and re-enters as a fresh coop sighting.
+			restored.handleFundingSpent(closingTx, 100);
+			expect(
+				restored.getFullState().commitmentBroadcast!.commitmentType
+			).to.equal(CommitmentType.COOPERATIVE_CLOSE);
+			expect(restored.getTrackedOutputs()).to.have.length(2);
+
+			const atDepth = restored.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+			expect(
+				atDepth.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED)
+			).to.exist;
+			expect(restored.isFullyResolved()).to.be.true;
+		});
 
 		it('never counts depth for a mempool-only sighting and adopts the confirmed height', function () {
 			const { monitor, closingTx } = coopCloseFixture();

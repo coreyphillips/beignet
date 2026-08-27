@@ -5015,7 +5015,18 @@ export class Channel {
 			return true;
 		}
 		if (this._state.state === ChannelState.FORCE_CLOSED) {
-			return false;
+			if (force) return false;
+			// Mirror of the escalation above: the close that is actually
+			// confirmed is classified cooperative, and a commitment can never
+			// classify as one (it always carries the BOLT 3 locktime/sequence
+			// stamp). The recorded force close was either reorg-swapped out by
+			// a confirming mutual close or was a pre-repair misclassification
+			// of one (issue 568). Demote so lifecycle and pending-close
+			// accounting follow the real close now, instead of waiting for
+			// terminal resolution at irrevocable depth, which an unconfirmed
+			// close never reaches.
+			this._state.state = ChannelState.CLOSED;
+			return true;
 		}
 		this._state.state = force ? ChannelState.FORCE_CLOSED : ChannelState.CLOSED;
 		return true;
