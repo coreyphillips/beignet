@@ -8,7 +8,7 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { ECPairFactory } from 'ecpair';
-import { IFundingProvider } from '../node/types';
+import { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
 import { ISpliceWalletInput } from '../channel/channel';
 import {
 	estimateSpliceTxWeight,
@@ -485,7 +485,8 @@ export class WalletFundingProvider implements IFundingProvider {
 	 */
 	async selectSpliceInputs(
 		amountSats: bigint,
-		feeratePerKw: number
+		feeratePerKw: number,
+		opts?: IUtxoSelectionOpts
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		// Cover the splice amount plus the splice tx fee, recomputed per added
 		// input using the SAME weight formula the channel uses to derive change.
@@ -499,7 +500,9 @@ export class WalletFundingProvider implements IFundingProvider {
 						changeScriptLen: 22
 					}),
 					feeratePerKw
-				)
+				),
+			false,
+			opts
 		);
 	}
 
@@ -672,7 +675,8 @@ export class WalletFundingProvider implements IFundingProvider {
 		amountSats: bigint,
 		feeratePerKw: number,
 		initiator: boolean,
-		topUp = false
+		topUp = false,
+		opts?: IUtxoSelectionOpts
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		return this.gatherWalletInputs(
 			topUp ? 'v2 open contribution top-up' : 'v2 open contribution',
@@ -683,7 +687,9 @@ export class WalletFundingProvider implements IFundingProvider {
 						? dualFundingTopUpWeight(selectedCount)
 						: dualFundingContributionWeight(selectedCount, initiator),
 					feeratePerKw
-				)
+				),
+			false,
+			opts
 		);
 	}
 
@@ -699,17 +705,19 @@ export class WalletFundingProvider implements IFundingProvider {
 	private async gatherWalletInputs(
 		purpose: string,
 		computeTarget: (selectedCount: number) => bigint,
-		p2wpkhOnly = false
+		p2wpkhOnly = false,
+		opts?: IUtxoSelectionOpts
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		return this.runSelection(() =>
-			this.gatherWalletInputsLocked(purpose, computeTarget, p2wpkhOnly)
+			this.gatherWalletInputsLocked(purpose, computeTarget, p2wpkhOnly, opts)
 		);
 	}
 
 	private async gatherWalletInputsLocked(
 		purpose: string,
 		computeTarget: (selectedCount: number) => bigint,
-		p2wpkhOnly = false
+		p2wpkhOnly = false,
+		opts?: IUtxoSelectionOpts
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		const wallet = this.wallet;
 		if (
@@ -724,13 +732,42 @@ export class WalletFundingProvider implements IFundingProvider {
 		}
 
 		await this.prunePledges();
-		const candidates = this.spendableP2wpkhUtxos(p2wpkhOnly);
+		let candidates = this.spendableP2wpkhUtxos(p2wpkhOnly);
 		const network = this.bitcoinJsNetwork();
 
 		const selected: ISpliceUtxo[] = [];
 		let selectedSum = 0n;
 		let target = 0n;
+		if (opts?.utxos?.length) {
+			// Caller-directed selection (issue #572): every named outpoint is
+			// contributed, and a named coin the wallet cannot spend fails the
+			// selection outright rather than being silently skipped (the
+			// caller named it for a reason, e.g. channelizing that deposit).
+			for (const wanted of opts.utxos) {
+				// Case-normalized: the public API accepts uppercase hex while
+				// the wallet reports lowercase tx_hash values.
+				const wantedTxid = wanted.txid.toLowerCase();
+				const match = candidates.find(
+					(u) => u.tx_hash === wantedTxid && u.tx_pos === wanted.vout
+				);
+				if (!match) {
+					throw new Error(
+						`requested funding utxo not spendable: ${wantedTxid}:${wanted.vout}`
+					);
+				}
+				if (selected.includes(match)) continue;
+				selected.push(match);
+				selectedSum += BigInt(match.value);
+			}
+			target = computeTarget(selected.length);
+			// Without allowTopUp the named coins must carry the whole target;
+			// the shared shortfall error below reports the deficit.
+			candidates = opts.allowTopUp
+				? candidates.filter((u) => !selected.includes(u))
+				: [];
+		}
 		for (const utxo of candidates) {
+			if (selectedSum >= target && selected.length > 0) break;
 			selected.push(utxo);
 			selectedSum += BigInt(utxo.value);
 			// Each added input grows the tx (and thus the fee) — recompute.
@@ -738,7 +775,11 @@ export class WalletFundingProvider implements IFundingProvider {
 			if (selectedSum >= target) break;
 		}
 		if (selectedSum < target || selected.length === 0) {
-			const have = candidates.reduce((s, u) => s + BigInt(u.value), 0n);
+			// Directed selections filtered the seeded coins out of candidates,
+			// so the spendable total is the seeded sum plus what remains.
+			const have =
+				candidates.reduce((s, u) => s + BigInt(u.value), 0n) +
+				(opts?.utxos?.length ? selectedSum : 0n);
 			throw new Error(
 				`insufficient wallet funds for ${purpose}: need ${
 					target > 0n ? target : 0n

@@ -10,10 +10,12 @@
  *
  * Type-only imports by design: channel/channel-manager consumes this module at
  * runtime while node/types references channel/channel-manager, so keeping this
- * a leaf with no runtime imports keeps that edge free of a cycle.
+ * a leaf with no runtime imports keeps that edge free of a cycle. (bitcoinjs
+ * below is an external package, not part of that edge.)
  */
 
-import type { IFundingProvider } from './types';
+import * as bitcoin from 'bitcoinjs-lib';
+import type { IFundingProvider, IUtxoSelectionOpts } from './types';
 import type { ISpliceWalletInput } from '../channel/channel';
 
 /** What a contribution selection hands back: our inputs plus a change script. */
@@ -56,20 +58,71 @@ export function selectDualFundingContribution(
 	amountSats: bigint,
 	feeratePerKw: number,
 	initiator: boolean,
-	topUp = false
+	topUp = false,
+	opts?: IUtxoSelectionOpts
 ): Promise<IDualFundingSelection> {
 	if (fp.selectDualFundingInputs) {
 		return fp.selectDualFundingInputs(
 			amountSats,
 			feeratePerKw,
 			initiator,
-			topUp
+			topUp,
+			opts
 		);
 	}
 	if (fp.selectSpliceInputs) {
-		return fp.selectSpliceInputs(amountSats, feeratePerKw);
+		return fp.selectSpliceInputs(amountSats, feeratePerKw, opts);
 	}
 	throw new Error(
 		'funding provider cannot select wallet inputs (needs selectDualFundingInputs or selectSpliceInputs)'
 	);
+}
+
+/**
+ * Verify that a selection honored a directed IUtxoSelectionOpts. The opts are
+ * a trailing OPTIONAL parameter, so a third-party provider written against
+ * the older signature silently ignores them and still returns a successful
+ * selection over arbitrary coins; the caller's promise ("these outpoints fund
+ * this open") must therefore be checked against what actually came back
+ * before anything is registered (issue #572 review).
+ *
+ * Returns null when the selection complies: every named outpoint is among the
+ * returned inputs, and without allowTopUp nothing else is. Txid comparison is
+ * case-normalized (the public API accepts uppercase hex). A non-null return
+ * names the first violation and the selection must be treated as a funding
+ * failure, releasing its pledges.
+ */
+export function verifyDirectedSelection(
+	inputs: ISpliceWalletInput[],
+	directed: NonNullable<IUtxoSelectionOpts>
+): string | null {
+	if (!directed.utxos?.length) return null;
+	const selected = new Set<string>();
+	for (const input of inputs) {
+		try {
+			selected.add(
+				`${bitcoin.Transaction.fromBuffer(input.prevTx).getId()}:${
+					input.prevOutputIndex
+				}`
+			);
+		} catch {
+			return 'directed selection returned an unreadable prevTx';
+		}
+	}
+	const named = new Set(
+		directed.utxos.map((u) => `${u.txid.toLowerCase()}:${u.vout}`)
+	);
+	for (const key of named) {
+		if (!selected.has(key)) {
+			return `provider ignored fundingUtxos (missing requested outpoint ${key})`;
+		}
+	}
+	if (!directed.allowTopUp) {
+		for (const key of selected) {
+			if (!named.has(key)) {
+				return `provider ignored fundingUtxos (unrequested input ${key} without allowTopUp)`;
+			}
+		}
+	}
+	return null;
 }

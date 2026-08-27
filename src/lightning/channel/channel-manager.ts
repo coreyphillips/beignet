@@ -87,7 +87,8 @@ import {
 import type { IFundingProvider } from '../node/types';
 import {
 	canSelectDualFundingInputs,
-	selectDualFundingContribution
+	selectDualFundingContribution,
+	verifyDirectedSelection
 } from '../node/funding-selection';
 import type { IDualFundingSelection } from '../node/funding-selection';
 import { ChannelSigner, ISigner, SignerFactory } from '../keys/signer';
@@ -1699,6 +1700,70 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		const actions = channel.sendTxSignatures(txid, outputIndex, witnesses);
+		this.processActions(peerPubkey, channel, actions);
+		this._promoteV2ChannelIfReady(peerPubkey, channel);
+		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
+		if (errorAction) {
+			return {
+				ok: false,
+				actions,
+				error: (errorAction as { message: string }).message
+			};
+		}
+		return { ok: true, actions };
+	}
+
+	/**
+	 * Deliver a third-party input owner's witness for an EXTERNAL funding
+	 * input of a v2 open (issue #572): the out-of-band answer to the
+	 * externalInputIndices half of channel:txsigs-needed. The channel
+	 * validates the witness against the recorded prevouts before storing it,
+	 * and the last delivery releases our withheld tx_signatures. The same
+	 * dual-map lookup as provideTxSignatures applies: during the live
+	 * exchange the channel may still be temp-resident while the signal
+	 * carries the PERMANENT id. Promotion after dispatch keeps the fork's
+	 * promote-on-ready guarantee (97df373): when the peer signed first, this
+	 * flush is the last step of the open and the channel must leave the temp
+	 * map before its early channel_ready or confirmation dispatch arrives.
+	 */
+	provideV2ExternalWitness(
+		channelId: Buffer,
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel =
+			this.channels.get(idHex) ?? this.findChannelByChannelIdInTemp(channelId);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		// A temp-resident channel's peer binding is keyed by its temporary id.
+		const peerPubkey =
+			this.channelPeers.get(idHex) ??
+			this.channelPeers.get(channel.getTemporaryChannelId().toString('hex'));
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+
+		let actions: ChannelAction[];
+		try {
+			actions = channel.provideV2ExternalWitness(
+				prevTxid,
+				prevOutputIndex,
+				witness
+			);
+		} catch (err) {
+			// The channel throws WITHOUT touching state: a refusal of the
+			// caller's delivery, not a channel failure. Nothing to dispatch
+			// and no 'error' event (the initiateFundingRbf refusal
+			// convention); the caller retries with a correct witness.
+			return { ok: false, actions: [], error: (err as Error).message };
+		}
 		this.processActions(peerPubkey, channel, actions);
 		this._promoteV2ChannelIfReady(peerPubkey, channel);
 		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
@@ -5486,11 +5551,24 @@ export class ChannelManager extends EventEmitter {
 	 * opts.trusted opens it zero-conf (see openChannel): the zero_conf channel
 	 * type is added to the negotiated type and both sides fast-track
 	 * channel_ready after tx_signatures. Requires the peer in the trusted set.
+	 *
+	 * opts.contribution registers the opener's funding inputs (possibly
+	 * carrying EXTERNAL ones, issue #572) BEFORE the open_channel2 is
+	 * dispatched, so it wins over auto-funding in every message ordering,
+	 * including a fully synchronous transport whose accept_channel2 is
+	 * processed inside this call. Registering on the returned Channel after
+	 * this call returns also works, but only when the accept cannot arrive
+	 * first (any asynchronous transport). Not combinable with fundMax,
+	 * fundingUtxos or a lease request; the node-level openChannelV2 refuses
+	 * those combinations up front.
 	 */
 	createDualFundedChannel(
 		peerPubkey: string,
 		params: IDualFundingParams,
-		opts?: { trusted?: boolean }
+		opts?: {
+			trusted?: boolean;
+			contribution?: { inputs: ISpliceWalletInput[]; changeScript: Buffer };
+		}
 	): Channel {
 		if (opts?.trusted && !this.zeroConfManager.isTrustedPeer(peerPubkey)) {
 			throw new Error(
@@ -5644,6 +5722,17 @@ export class ChannelManager extends EventEmitter {
 		}
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
+		// Registered BEFORE the open_channel2 dispatch below: a synchronous
+		// transport can deliver accept_channel2 inside processActions, and
+		// autoFundDualFundedOpen must already see this contribution then.
+		if (opts?.contribution) {
+			channel.setDualFundingContribution(
+				opts.contribution.inputs,
+				opts.contribution.changeScript,
+				alignedParams.fundingSatoshis,
+				alignedParams.fundingFeeratePerkw
+			);
+		}
 		this.processActions(peerPubkey, channel, actions);
 
 		this.emit('channel:opened', channel.getTemporaryChannelId());
@@ -6173,6 +6262,20 @@ export class ChannelManager extends EventEmitter {
 		const session = channel.getDualFundingSession();
 		const local = session?.getLocalParams();
 		if (!session || !session.isInitiator() || !local) return;
+		// A contribution the embedder already registered (possibly carrying an
+		// EXTERNAL input, issue #572) wins outright: selecting on top of it
+		// would overwrite it. It still must DRIVE on accept_channel2 (the
+		// initiator sends the first tx_add_input), and this arm sits before
+		// the provider checks so a provider-less manager drives it too.
+		if (channel.hasDualFundingContribution()) {
+			const driveActions = channel.beginDualFundingContribution();
+			this.processActions(peerPubkey, channel, driveActions);
+			return;
+		}
+		const tempId = channel.getTemporaryChannelId().toString('hex');
+		const isCurrentOpen = (): boolean =>
+			this.tempChannels.get(tempId) === channel &&
+			this.channelPeers.get(tempId) === peerPubkey;
 		// A max open contributes EVERY spendable UTXO (change nets out to zero
 		// against the committed amount); a fixed open covers amount + fee.
 		// Without the matching provider method the legacy behavior holds: the
@@ -6183,16 +6286,28 @@ export class ChannelManager extends EventEmitter {
 				? !fp?.selectMaxDualFundingInputs
 				: !canSelectDualFundingInputs(fp)
 		) {
+			// Directed funding (fundingUtxos) cannot fall back to the legacy
+			// caller-driven flow: the caller named specific coins, so a
+			// provider that cannot select is a funding failure the peer must
+			// hear about, never a silent stall (issue #572 review).
+			if (local.fundingUtxos) {
+				this.emitContained(
+					'error',
+					channel.getChannelId() ?? channel.getTemporaryChannelId(),
+					'v2 open not funded: fundingUtxos requires a funding provider that can select wallet inputs'
+				);
+				if (!isCurrentOpen()) return;
+				const abortActions = channel.abortDualFunding(
+					'opener funding unavailable: fundingUtxos requires a wallet-selection funding provider'
+				);
+				this.processActions(peerPubkey, channel, abortActions);
+			}
 			return;
 		}
 
 		const state = channel.getFullState();
 		const contributionSats = local.fundingSatoshis + (state.leaseFeeSats ?? 0n);
 		const feeratePerKw = local.fundingFeeratePerkw;
-		const tempId = channel.getTemporaryChannelId().toString('hex');
-		const isCurrentOpen = (): boolean =>
-			this.tempChannels.get(tempId) === channel &&
-			this.channelPeers.get(tempId) === peerPubkey;
 		let selection: Promise<IDualFundingSelection>;
 		try {
 			selection = fundMax
@@ -6201,7 +6316,9 @@ export class ChannelManager extends EventEmitter {
 						fp!,
 						contributionSats,
 						feeratePerKw,
-						true
+						true,
+						false,
+						local.fundingUtxos
 				  );
 		} catch (err) {
 			selection = Promise.reject(err);
@@ -6216,6 +6333,50 @@ export class ChannelManager extends EventEmitter {
 						this.releaseStaleSelectionPledges(inputs);
 						return;
 					}
+					// The embedder registered a contribution while the wallet
+					// selection was in flight (a synchronous transport runs
+					// accept_channel2 inside createDualFundedChannel, so this
+					// race is real). The registered one wins; of the selected
+					// coins, only those the winning contribution does NOT
+					// spend release their pledges. The overlap set can be
+					// non-empty (the wallet legitimately re-offers a coin whose
+					// pledge TTL lapsed), and releasing a coin the live funding
+					// tx depends on lets the next wallet spend orphan the
+					// channel (issue #572 review).
+					if (channel.hasDualFundingContribution()) {
+						this.releaseStaleSelectionPledges(
+							channel.unregisteredV2TopUpInputs(inputs)
+						);
+						const driveActions = channel.beginDualFundingContribution();
+						this.processActions(peerPubkey, channel, driveActions);
+						return;
+					}
+					// Directed selection (fundingUtxos) is a promise to the
+					// caller, not a hint: a provider that ignored the trailing
+					// opts (a third-party implementation predating them) must
+					// not fund the open with arbitrary coins. Verify before
+					// registering; a violation is a funding failure and the
+					// unusable selection's pledges release (issue #572 review).
+					if (local.fundingUtxos) {
+						const directedError = verifyDirectedSelection(
+							inputs,
+							local.fundingUtxos
+						);
+						if (directedError) {
+							this.releaseStaleSelectionPledges(inputs);
+							this.emitContained(
+								'error',
+								channel.getChannelId() ?? channel.getTemporaryChannelId(),
+								`v2 open not funded: ${directedError}`
+							);
+							if (!isCurrentOpen()) return;
+							const abortActions = channel.abortDualFunding(
+								`opener funding unavailable: ${directedError}`
+							);
+							this.processActions(peerPubkey, channel, abortActions);
+							return;
+						}
+					}
 					channel.setDualFundingContribution(
 						inputs,
 						changeScript,
@@ -6227,6 +6388,16 @@ export class ChannelManager extends EventEmitter {
 				},
 				(err) => {
 					if (!isCurrentOpen()) return;
+					// The embedder registered a contribution while the wallet
+					// selection was in flight: the selection's failure is moot,
+					// the registered contribution funds the open. Drive it
+					// instead of aborting a perfectly viable open (issue #572
+					// review).
+					if (channel.hasDualFundingContribution()) {
+						const driveActions = channel.beginDualFundingContribution();
+						this.processActions(peerPubkey, channel, driveActions);
+						return;
+					}
 					const reason = (err as Error)?.message ?? err;
 					// The opener cannot downgrade to a zero contribution. Report the
 					// wallet failure, then abort so the peer does not wait indefinitely.
@@ -6649,6 +6820,7 @@ export class ChannelManager extends EventEmitter {
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
+		const stateBeforeAbort = channel.getState();
 		const actions = channel.handleTxAbort();
 		const progress: IActionDispatchProgress = {
 			index: -1,
@@ -6682,6 +6854,26 @@ export class ChannelManager extends EventEmitter {
 					'v2 open aborted'
 				);
 				this.releaseAbandonedV2Pledges(channel);
+			}
+		}
+		// A tx_abort that settles a SPLICE negotiation lands the channel back
+		// in NORMAL (a v2 OPEN abort never does: it ends ERRORED/abandoned,
+		// and a stale abort on a NORMAL channel never left it). That unwind
+		// was previously observable by nobody, so a caller waiting on the
+		// splice (spliceInAndWait, the JIT engine) burned its full timeout
+		// (issue #572 review). Fires at settle time for both directions: the
+		// peer's initiating abort, and the echo answering ours.
+		if (
+			stateBeforeAbort !== ChannelState.NORMAL &&
+			channel.getState() === ChannelState.NORMAL
+		) {
+			const channelId = channel.getChannelId();
+			if (channelId) {
+				this.emitContained(
+					'splice:aborted',
+					channelId,
+					'splice aborted (tx_abort)'
+				);
 			}
 		}
 	}

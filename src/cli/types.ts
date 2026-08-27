@@ -113,6 +113,8 @@ export interface ChannelInfo {
 	isAnchor: boolean;
 	isPrivate?: boolean;
 	fundingTxid?: string;
+	/** Funding output index in fundingTxid; present exactly when it is. */
+	fundingOutputIndex?: number;
 	shortChannelId?: string;
 	feeratePerKw?: number;
 	htlcCount?: number;

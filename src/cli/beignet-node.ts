@@ -5125,6 +5125,7 @@ export class BeignetNode extends EventEmitter {
 		fundingSatoshis: bigint;
 		channelType?: Buffer | null;
 		fundingTxid?: string;
+		fundingOutputIndex?: number;
 		shortChannelId?: string;
 		feeratePerKw?: number;
 		htlcCount?: number;
@@ -5167,7 +5168,12 @@ export class BeignetNode extends EventEmitter {
 			const splice = this.node.peerSupportsSplicing(peerPubkey);
 			if (splice !== null) info.peerSupportsSplicing = splice;
 		}
-		if (ch.fundingTxid) info.fundingTxid = ch.fundingTxid;
+		if (ch.fundingTxid) {
+			info.fundingTxid = ch.fundingTxid;
+			if (ch.fundingOutputIndex !== undefined) {
+				info.fundingOutputIndex = ch.fundingOutputIndex;
+			}
+		}
 		if (ch.shortChannelId) info.shortChannelId = ch.shortChannelId;
 		if (ch.feeratePerKw !== undefined) info.feeratePerKw = ch.feeratePerKw;
 		if (ch.htlcCount !== undefined) info.htlcCount = ch.htlcCount;
