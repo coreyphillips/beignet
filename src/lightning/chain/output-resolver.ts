@@ -82,6 +82,7 @@ import {
 	ChannelRole,
 	HtlcDirection,
 	HtlcState,
+	IHtlcEntry,
 	isAnchorChannel,
 	isTaprootChannel
 } from '../channel/types';
@@ -935,6 +936,47 @@ interface IHtlcMatch {
 	witnessScript: Buffer;
 }
 
+/**
+ * Whether an HTLC entry's output can be PRESENT in the commitment being
+ * classified (issue #561). PENDING/COMMITTED entries are candidates as
+ * before. A FULFILLED/FAILED entry is a candidate exactly while the
+ * commitment builder still includes its output (the two-phase removal
+ * window): on OUR commitment a RECEIVED entry until the peer revokes for
+ * the removal (removalRemoteCommitted === false, mirroring
+ * buildHtlcOutputsForLocal), on THEIR commitment an OFFERED entry until
+ * WE revoke for it (removalLocallyRevoked === false, mirroring
+ * buildHtlcOutputsForRemote). Without the window arm, a force-close
+ * right after fulfilling an inbound HTLC left its output untracked: no
+ * HTLC-success despite holding the preimage and the peer's signature,
+ * and every later HTLC output's htlcSigIndex shifted onto the wrong
+ * remote signature (issue #556).
+ *
+ * Deliberately ADDITIVE relative to the old PENDING/COMMITTED gate:
+ * classifyTheirCommitmentOutputs also serves revoked commitments, where
+ * the live flags describe a newer commitment than the one on chain, so
+ * nothing that matched before may stop matching. The byte-equality
+ * script comparison stays the final arbiter either way.
+ */
+function htlcEntryCanBePresent(
+	entry: IHtlcEntry,
+	isLocalCommitment: boolean
+): boolean {
+	if (
+		entry.state === HtlcState.PENDING ||
+		entry.state === HtlcState.COMMITTED
+	) {
+		return true;
+	}
+	if (entry.state !== HtlcState.FULFILLED && entry.state !== HtlcState.FAILED) {
+		return false;
+	}
+	return isLocalCommitment
+		? entry.direction === HtlcDirection.RECEIVED &&
+				entry.removalRemoteCommitted === false
+		: entry.direction === HtlcDirection.OFFERED &&
+				entry.removalLocallyRevoked === false;
+}
+
 function matchHtlcOutput(
 	outScript: Buffer,
 	state: IChannelState,
@@ -949,10 +991,7 @@ function matchHtlcOutput(
 	const useAnchors = isAnchorChannel(state.channelType);
 
 	for (const entry of state.htlcs.values()) {
-		if (
-			entry.state !== HtlcState.PENDING &&
-			entry.state !== HtlcState.COMMITTED
-		) {
+		if (!htlcEntryCanBePresent(entry, isLocal)) {
 			continue;
 		}
 
@@ -1130,10 +1169,7 @@ function matchTaprootHtlcOutput(
 	isOurs: boolean
 ): IHtlcMatch | null {
 	for (const entry of state.htlcs.values()) {
-		if (
-			entry.state !== HtlcState.PENDING &&
-			entry.state !== HtlcState.COMMITTED
-		) {
+		if (!htlcEntryCanBePresent(entry, isOurs)) {
 			continue;
 		}
 
