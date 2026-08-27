@@ -374,6 +374,15 @@ const ENFORCED_RESERVE_VERSION = 1;
  */
 const LEASE_BLOCKHEIGHT_PAST_TOLERANCE = 6;
 const LEASE_BLOCKHEIGHT_FUTURE_TOLERANCE = 144;
+
+/**
+ * option_simple_close: how far above our tip a closing_complete locktime may
+ * sit before we refuse to co-sign it. The closer stamps its own tip for
+ * anti-fee-sniping, so a few blocks of skew is honest; anything further would
+ * have us co-sign, and go CLOSED on, a close tx the chain refuses to accept,
+ * with no unilateral exit left (issue #555).
+ */
+const SIMPLE_CLOSE_LOCKTIME_FUTURE_TOLERANCE = 6;
 function bigIntMax(a: bigint, b: bigint): bigint {
 	return a > b ? a : b;
 }
@@ -5389,6 +5398,34 @@ export class Channel {
 	}
 
 	/**
+	 * CLOSED with a co-signed mutual close the chain will not accept: the one
+	 * shape of CLOSED that still needs a unilateral exit (issue #555). A
+	 * peer-chosen future locktime signed before handleClosingComplete bounded
+	 * it leaves the funding output unspent and every rebroadcast rejected, so
+	 * our latest commitment is the only spend of it that can confirm. Judged
+	 * from the recorded tx itself, not from how the close was negotiated, so a
+	 * victim row persisted before the bound existed qualifies too.
+	 */
+	private closedWithUnbroadcastableCoopClose(): boolean {
+		if (this._state.state !== ChannelState.CLOSED) return false;
+		const hex = this._state.lastCooperativeCloseTxHex;
+		if (!hex) return false;
+		let locktime: number;
+		try {
+			locktime = bitcoin.Transaction.fromHex(hex).locktime;
+		} catch {
+			// A recorded close tx that does not even parse cannot be broadcast.
+			return true;
+		}
+		// Timestamp-space locktimes never come from our own negotiation and
+		// cannot be judged against a block tip; treat them as unbroadcastable.
+		if (locktime >= 500_000_000) return true;
+		// Height-space: non-final while our tip is provably below it. With no
+		// tip yet (0) nothing is provable, and the normal CLOSED refusal holds.
+		return this._currentBlockHeight > 0 && locktime > this._currentBlockHeight;
+	}
+
+	/**
 	 * Decide whether this channel can force close, and build the commitment it
 	 * would broadcast, WITHOUT touching the live channel.
 	 *
@@ -5439,7 +5476,13 @@ export class Channel {
 			// (deterministic signatures): the rebroadcast path when the first
 			// broadcast never reached the network. If it confirmed meanwhile the
 			// network simply rejects the duplicate.
-			this._state.state !== ChannelState.FORCE_CLOSED
+			this._state.state !== ChannelState.FORCE_CLOSED &&
+			// CLOSED refuses, except when the recorded mutual close cannot be
+			// broadcast: that CLOSED is a dead end (nothing on chain and nothing
+			// that can reach it), and broadcasting our latest commitment is
+			// fund-safe: both txs spend the same funding output, and either
+			// confirmation pays out the same final balances.
+			!this.closedWithUnbroadcastableCoopClose()
 		) {
 			return { ok: false, error: 'Cannot force close: wrong state' };
 		}
@@ -6723,6 +6766,33 @@ export class Channel {
 		// The closer pays the fee from its own (remote, from our view) balance.
 		if (msg.feeSatoshis > this._state.remoteBalanceMsat / 1000n) {
 			return err('closing_complete: fee exceeds closer balance');
+		}
+		// BOLT 2 lets the closer pick any nLockTime, but the RBF-signalling
+		// input sequence makes it consensus-enforced: co-signing a far-future
+		// value and reaching CLOSED on it would strand our whole balance in a
+		// tx nobody can broadcast (issue #555). Accept only height-space values
+		// at most a small skew above our tip (the closer stamps its own tip for
+		// anti-fee-sniping), and refuse any nonzero value while we have no tip
+		// to judge against.
+		if (msg.locktime >= 500_000_000) {
+			return err(
+				`closing_complete: locktime ${msg.locktime} is not a block height`
+			);
+		}
+		if (msg.locktime > 0) {
+			if (this._currentBlockHeight <= 0) {
+				return err(
+					`closing_complete: no chain tip to validate locktime ${msg.locktime} against`
+				);
+			}
+			if (
+				msg.locktime >
+				this._currentBlockHeight + SIMPLE_CLOSE_LOCKTIME_FUTURE_TOLERANCE
+			) {
+				return err(
+					`closing_complete: locktime ${msg.locktime} is beyond our chain tip ${this._currentBlockHeight}`
+				);
+			}
 		}
 		// Their view of OUR script must match what we sent in shutdown.
 		if (
