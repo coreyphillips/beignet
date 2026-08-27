@@ -3121,6 +3121,12 @@ export class Channel {
 	 */
 	canFulfillHtlc(htlcId: bigint): boolean {
 		if (!this.canSettleHtlcs()) return false;
+		// BOLT 2 quiescence: fulfillHtlc below refuses while quiescing, and the
+		// manager defers the settle in MEMORY ONLY before ever reaching it. The
+		// predicate must refuse too, or a caller pairing irreversible
+		// bookkeeping with the settle (the forwarder's linkage delete) consumes
+		// it around a deferral a crash can lose (issue 569).
+		if (this._quiescence.isQuiescing()) return false;
 		const entry = this._state.htlcs.get(`received-${htlcId}`);
 		if (!entry) return false;
 		return (

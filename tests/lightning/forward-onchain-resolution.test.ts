@@ -423,6 +423,175 @@ describe('S-2.M3: on-chain timeout of a forwarded outgoing leg', function () {
 		fx.carol.destroy();
 	});
 
+	it('retains the forward linkage when the inbound channel is quiescing (issue 569)', async () => {
+		const fx = setupForwardWithResolvingOutgoingLeg();
+		const { alice, inChannelId, outChannelId, outKey } = fx;
+
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const inChan = (alice as any).channelManager.getChannel(inChannelId);
+		const outChan = (alice as any).channelManager.getChannel(outChannelId);
+		inChan.getFullState().htlcs.get('received-7').paymentHash = paymentHash;
+		outChan.getFullState().htlcs.get('offered-7').paymentHash = paymentHash;
+
+		// Real quiescence, not a state mutation: stfu exchanged over the wire,
+		// while the ChannelState stays NORMAL for the whole session. This is
+		// the shape the issue-558 gate missed.
+		expect(
+			(alice as any).channelManager.initiateQuiescence(inChannelId).ok
+		).to.equal(true);
+		expect(inChan.isQuiescing()).to.equal(true);
+		expect(inChan.getState()).to.equal(ChannelState.NORMAL);
+
+		const UPDATE_FULFILL_HTLC = 130;
+		let fulfillsSentUpstream = 0;
+		alice.on('message:outbound', (pubkey: string, type: number) => {
+			if (pubkey === fx.bob.getNodeId() && type === UPDATE_FULFILL_HTLC)
+				fulfillsSentUpstream++;
+		});
+
+		(alice as any).channelManager.emit(
+			'preimage:learned',
+			paymentHash,
+			preimage
+		);
+
+		// Refused, not deferred around a durable delete: nothing on the wire,
+		// the linkage survives as the durable retry token, the inbound HTLC is
+		// untouched, and the preimage is durable for the retry.
+		expect(fulfillsSentUpstream).to.equal(0);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(true);
+		expect(inChan.getFullState().htlcs.get('received-7').state).to.equal(
+			HtlcState.COMMITTED
+		);
+		expect((alice as any).preimages.has(paymentHash.toString('hex'))).to.equal(
+			true
+		);
+
+		// A crash in this window must not re-forward on restart: the linkage
+		// row still answers findOutgoingLeg.
+		let redispatched = 0;
+		(alice as any).handleIncomingHtlc = () => {
+			redispatched++;
+		};
+		inChan.getFullState().htlcs.get('received-7').forwardEmitted = true;
+		(alice as any).redispatchUnresolvedReceivedHtlcs(inChannelId);
+		expect(redispatched).to.equal(0);
+
+		// Quiescence ends: the owed pass settles upstream and only now
+		// consumes the linkage.
+		inChan.exitQuiescence();
+		(alice as any).channelManager.emit(
+			'quiescence:ended',
+			inChannelId.toString('hex')
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		expect(fulfillsSentUpstream).to.equal(1);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(false);
+		const inbound = inChan.getFullState().htlcs.get('received-7');
+		expect(
+			inbound === undefined || inbound.state === HtlcState.FULFILLED
+		).to.equal(true);
+
+		fx.alice.destroy();
+		fx.bob.destroy();
+		fx.carol.destroy();
+	});
+
+	it('per-block owed pass completes the settle after a quiescence exit that emits no event (issue 569)', () => {
+		const fx = setupForwardWithResolvingOutgoingLeg();
+		const { alice, inChannelId, outChannelId, outKey, height } = fx;
+
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const inChan = (alice as any).channelManager.getChannel(inChannelId);
+		const outChan = (alice as any).channelManager.getChannel(outChannelId);
+		inChan.getFullState().htlcs.get('received-7').paymentHash = paymentHash;
+		outChan.getFullState().htlcs.get('offered-7').paymentHash = paymentHash;
+
+		expect(
+			(alice as any).channelManager.initiateQuiescence(inChannelId).ok
+		).to.equal(true);
+		expect(inChan.isQuiescing()).to.equal(true);
+
+		const UPDATE_FULFILL_HTLC = 130;
+		let fulfillsSentUpstream = 0;
+		alice.on('message:outbound', (pubkey: string, type: number) => {
+			if (pubkey === fx.bob.getNodeId() && type === UPDATE_FULFILL_HTLC)
+				fulfillsSentUpstream++;
+		});
+
+		(alice as any).channelManager.emit(
+			'preimage:learned',
+			paymentHash,
+			preimage
+		);
+		expect(fulfillsSentUpstream).to.equal(0);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(true);
+
+		// Terminal-shaped exit: the session ends without 'quiescence:ended'.
+		// The per-block invariant keeper must finish the owed settle.
+		inChan.exitQuiescence();
+		(alice as any).handleNewBlock(height + 1);
+
+		expect(fulfillsSentUpstream).to.equal(1);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(false);
+		const inbound = inChan.getFullState().htlcs.get('received-7');
+		expect(
+			inbound === undefined || inbound.state === HtlcState.FULFILLED
+		).to.equal(true);
+
+		fx.alice.destroy();
+		fx.bob.destroy();
+		fx.carol.destroy();
+	});
+
+	it('refuses the on-chain-timeout upstream fail while quiescing and keeps the linkage (issue 569)', () => {
+		const fx = setupForwardWithResolvingOutgoingLeg();
+		const { alice, inChannelId, outKey, height } = fx;
+		const inChan = (alice as any).channelManager.getChannel(inChannelId);
+
+		expect(
+			(alice as any).channelManager.initiateQuiescence(inChannelId).ok
+		).to.equal(true);
+		expect(inChan.isQuiescing()).to.equal(true);
+
+		const UPDATE_FAIL_HTLC = 131;
+		let failsSentUpstream = 0;
+		alice.on('message:outbound', (pubkey: string, type: number) => {
+			if (pubkey === fx.bob.getNodeId() && type === UPDATE_FAIL_HTLC)
+				failsSentUpstream++;
+		});
+
+		// Irrevocable depth reached while the inbound channel is quiescing:
+		// the upstream fail must be refused with the linkage and shared
+		// secret intact, not parked in memory around a durable delete.
+		(alice as any).channelManager.handleNewBlock(height + 1);
+		expect(failsSentUpstream).to.equal(0);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(true);
+		expect(inChan.getFullState().htlcs.get('received-7').state).to.equal(
+			HtlcState.COMMITTED
+		);
+
+		// Terminal-shaped quiescence exit (no event): the per-block owed pass
+		// re-derives the fail from the monitor's resolved-without-preimage
+		// record and refunds upstream.
+		inChan.exitQuiescence();
+		(alice as any).handleNewBlock(height + 2);
+
+		expect(failsSentUpstream).to.equal(1);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(false);
+		const inbound = inChan.getFullState().htlcs.get('received-7');
+		expect(
+			inbound === undefined || inbound.state === HtlcState.FAILED
+		).to.equal(true);
+
+		fx.alice.destroy();
+		fx.bob.destroy();
+		fx.carol.destroy();
+	});
+
 	it('harvests a preimage stranded in restored monitor state (issue 557)', () => {
 		const fx = setupForwardWithResolvingOutgoingLeg();
 		const { alice, inChannelId, outChannelId, outKey } = fx;

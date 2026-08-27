@@ -810,6 +810,149 @@ describe('Replayed update_fulfill_htlc re-drives settlement (issue 295)', () => 
 		charlie.destroy();
 	});
 
+	it('a quiescing inbound channel during the downstream settle keeps the linkage durable (issue 569)', async function () {
+		this.timeout(30_000);
+		const dbPath = tempDb('quiesce-settle');
+		const raw = new SqliteStorage(dbPath);
+		raw.open();
+		const world = await setupForwardWorld(raw, quorumRecovery());
+		const { alice, bob, charlie } = world;
+
+		const invoice = charlie.createInvoice({
+			amountMsat: 80_000n,
+			description: 'quiesce settle',
+			hold: true
+		});
+		const payment = alice.sendPayment(invoice.bolt11);
+		await waitFor(
+			() => charlie.listHoldInvoices().some((h) => h.state === 'ACCEPTED'),
+			'the HTLC to park at Charlie'
+		);
+
+		// Real quiescence on the inbound channel: stfu exchanged over the
+		// wire while the ChannelState stays NORMAL for the whole session.
+		expect(
+			bob.getChannelManager().initiateQuiescence(world.abChannelId).ok
+		).to.equal(true);
+		const inbound = bob.getChannelManager().getChannel(world.abChannelId)!;
+		expect(inbound.isQuiescing()).to.equal(true);
+		expect(inbound.getState()).to.equal(ChannelState.NORMAL);
+
+		charlie.settleHeldHtlc(invoice.paymentHash);
+		await settle(10);
+
+		// The downstream leg settled and Bob holds the preimage, but the
+		// settle owed upstream was refused: the linkage survives in memory
+		// AND on disk, instead of an in-memory deferral around a durable
+		// delete_forwarded_htlc.
+		const bobInternals = bob as unknown as {
+			forwardedHtlcs: Map<string, unknown>;
+		};
+		expect(
+			bobInternals.forwardedHtlcs.size,
+			'forward linkage survives the refused fulfill'
+		).to.equal(1);
+		expect(
+			raw.loadAllForwardedHtlcs().length,
+			'forward linkage row still durable'
+		).to.equal(1);
+		expect(payment.status, 'payer still pending').to.equal(
+			PaymentStatus.PENDING
+		);
+
+		// The session dies with the connection; the reestablish tail owes the
+		// settle and only now consumes the linkage.
+		await cycleConnection(alice, bob, world.cutAB, world.gateAB);
+		await waitFor(
+			() => payment.status === PaymentStatus.COMPLETED,
+			'the payer to settle after the quiescent session ended'
+		);
+		await waitFor(
+			() =>
+				![...inbound.getFullState().htlcs.values()].some(
+					(h) => h.state === HtlcState.COMMITTED
+				),
+			'the inbound HTLC to leave COMMITTED'
+		);
+		expect(bobInternals.forwardedHtlcs.size).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+		charlie.destroy();
+	});
+
+	it('a forwarder killed mid-quiescence does not re-forward on restart (issue 569)', async function () {
+		this.timeout(30_000);
+		const dbPath = tempDb('quiesce-kill');
+		const raw = new SqliteStorage(dbPath);
+		raw.open();
+		const world = await setupForwardWorld(raw, quorumRecovery());
+		const { alice, bob, charlie } = world;
+
+		const invoice = charlie.createInvoice({
+			amountMsat: 80_000n,
+			description: 'quiesce kill',
+			hold: true
+		});
+		const payment = alice.sendPayment(invoice.bolt11);
+		await waitFor(
+			() => charlie.listHoldInvoices().some((h) => h.state === 'ACCEPTED'),
+			'the HTLC to park at Charlie'
+		);
+
+		expect(
+			bob.getChannelManager().initiateQuiescence(world.abChannelId).ok
+		).to.equal(true);
+		charlie.settleHeldHtlc(invoice.paymentHash);
+		await settle(10);
+
+		// Crash before the quiescent session ends: nothing in the in-memory
+		// deferral queue survives, so the durable linkage row is the only
+		// record tying the preimage Bob paid for to the inbound HTLC.
+		world.cutAB.val = true;
+		world.cutBC.val = true;
+		bob.destroy();
+		const bobId = bob.getNodeId();
+		alice.getChannelManager().handlePeerDisconnected(bobId);
+		charlie.getChannelManager().handlePeerDisconnected(bobId);
+		alice.removeAllListeners('message:outbound');
+		charlie.removeAllListeners('message:outbound');
+
+		const inspect = new SqliteStorage(dbPath);
+		inspect.open();
+		expect(
+			inspect.loadAllForwardedHtlcs().length,
+			'linkage row survived the crash'
+		).to.equal(1);
+
+		// Restart: the retained linkage must suppress the redispatch (no
+		// second downstream forward for value Charlie already claimed) and
+		// the owed pass must settle upstream from the durable preimage.
+		const restored = createNode(BOB_SEED, inspect, quorumRecovery());
+		let reForwards = 0;
+		restored.on('message:outbound', (pk: string, t: number) => {
+			if (pk === charlie.getNodeId() && t === MessageType.UPDATE_ADD_HTLC) {
+				reForwards++;
+			}
+		});
+		await reconnect(restored, charlie);
+		await settle(10);
+		await reconnect(restored, alice);
+		await waitFor(
+			() => payment.status === PaymentStatus.COMPLETED,
+			'the payer to settle from the retained linkage'
+		);
+		expect(reForwards, 'no duplicate downstream forward').to.equal(0);
+		await waitFor(
+			() => inspect.loadAllForwardedHtlcs().length === 0,
+			'the settled forward linkage to clear'
+		);
+
+		restored.destroy();
+		alice.destroy();
+		charlie.destroy();
+	});
+
 	it('a live inbound disconnect during the downstream settle keeps the linkage and settles on reconnect', async function () {
 		this.timeout(30_000);
 		const world = await setupForwardWorld();

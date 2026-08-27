@@ -15079,6 +15079,13 @@ export class LightningNode extends EventEmitter {
 				inHtlc.state !== HtlcState.COMMITTED
 			)
 				continue;
+			// Same discipline as failForwardUpstream (issue 297): a refusal must
+			// be established BEFORE the shared-secret cleanup and the linkage
+			// delete below, or a quiescence-deferred fail leaves the durable
+			// state claiming the refund happened (issue 569). The retained
+			// linkage plus the monitor's resolved-without-preimage record
+			// re-drive the upstream fail from settleForwardsOwedUpstream.
+			if (!inChannel!.canFailHtlc(forward.inHtlcId)) continue;
 
 			const inSecretKey = `${forward.inChannelId.toString('hex')}:${
 				forward.inHtlcId
@@ -15325,11 +15332,27 @@ export class LightningNode extends EventEmitter {
 			// channel stays ambiguous (an on-chain claim can still reveal the
 			// preimage later) and is left to the chain machinery and the CLTV
 			// sweeper, exactly like scanForwardTimeouts.
+			// The on-chain form of the same fact (issue 569): the offered output
+			// for this hash resolved irrevocably and no preimage was ever
+			// learned (the settle branch above takes the entry when one
+			// exists). This is exactly the predicate handleOnChainOutputResolved
+			// acted on; a fail refused there (inbound quiescing) retries here.
+			const outgoingTimedOutOnChain =
+				this.channelManager
+					.getMonitor(Buffer.from(outParts[0], 'hex'))
+					?.getTrackedOutputs()
+					.some(
+						(o) =>
+							o.outputType === OutputType.OFFERED_HTLC &&
+							o.status === OutputStatus.IRREVOCABLY_RESOLVED &&
+							o.paymentHash?.equals(entry.paymentHash) === true
+					) === true;
 			const outgoingFailed =
 				outHtlc?.state === HtlcState.FAILED ||
 				(outHtlc === undefined &&
 					outState !== undefined &&
-					outState.state === ChannelState.NORMAL);
+					outState.state === ChannelState.NORMAL) ||
+				outgoingTimedOutOnChain;
 			if (!outgoingFailed) continue;
 			const secretKey = `${forward.inChannelId.toString('hex')}:${
 				forward.inHtlcId
@@ -16455,6 +16478,20 @@ export class LightningNode extends EventEmitter {
 		// 'quiescence:ended', so retry every parked channel each block.
 		for (const channelIdHex of [...this.parkedQuiescentHtlcs.keys()]) {
 			this.drainParkedQuiescentHtlcs(channelIdHex);
+		}
+		// Same invariant keeper for settles owed upstream (issue 569): a settle
+		// refused while the inbound channel was quiescing left its forward
+		// linkage row as the durable retry token, and a terminal quiescence
+		// exit emits no 'quiescence:ended' to finish it. Runs before the
+		// timeout scans below so an owed settle consumes its linkage before
+		// scanForwardTimeouts judges the same HTLC. Refusals are
+		// pure-predicate cheap, so re-running per block costs nothing.
+		const owedInbound = new Set<string>();
+		for (const forward of this.forwardedHtlcs.values()) {
+			owedInbound.add(forward.inChannelId.toString('hex'));
+		}
+		for (const inChannelIdHex of owedInbound) {
+			this.settleForwardsOwedUpstream(Buffer.from(inChannelIdHex, 'hex'));
 		}
 		this.scanExpiringOfferedHtlcs(blockHeight);
 		this.scanExpiringHeldHtlcs(blockHeight);
