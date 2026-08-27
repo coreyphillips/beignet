@@ -37,6 +37,14 @@ export function processOnionPacket(
 	if (packet.version !== ONION_VERSION) {
 		throw new Error(`Invalid onion version: ${packet.version}`);
 	}
+	// Payment onions are exactly 1366 bytes on the wire; the large onion
+	// form exists for onion messages only, and decodeOnionPacket now admits
+	// both sizes, so pin the payment path here.
+	if (packet.routingInfo.length !== ROUTING_INFO_LENGTH) {
+		throw new Error(
+			`Payment onion routing info must be 1300 bytes, got ${packet.routingInfo.length}`
+		);
+	}
 
 	// Compute shared secret
 	const sharedSecret = ecdh(nodePrivkey, packet.ephemeralKey);

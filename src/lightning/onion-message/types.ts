@@ -3,8 +3,9 @@
  *
  * Onion messages (type 513) allow nodes to communicate arbitrary data
  * through the Lightning Network without requiring channels or HTLCs.
- * They use the same Sphinx onion routing as payments but with 1300-byte
- * payloads and no payment-specific fields.
+ * They use the same Sphinx onion routing as payments but with no
+ * payment-specific fields, over a 1300-byte routing info or the BOLT 4
+ * large 32768-byte form when the hop payloads need it.
  */
 
 import { IBlindedPath } from '../onion/blinded-path';
@@ -14,10 +15,10 @@ import { IBlindedPath } from '../onion/blinded-path';
 /** Onion message type ID (BOLT 7, odd = can be ignored if unsupported) */
 export const ONION_MESSAGE_TYPE = 513;
 
-/** Onion packet length for onion messages: version(1) + ephemeral_key(33) + routing_info(1300) + hmac(32) */
+/** Standard onion packet length for onion messages: version(1) + ephemeral_key(33) + routing_info(1300) + hmac(32) */
 export const ONION_MESSAGE_PACKET_LENGTH = 1366;
 
-/** Routing info length within the onion packet */
+/** Standard-form routing info length; the large form's constants live in onion/types.ts */
 export const ONION_MESSAGE_ROUTING_INFO_LENGTH = 1300;
 
 // ── TLV Type Constants for Onion Message Payloads ────────────────
@@ -35,12 +36,12 @@ export const TLV_MESSAGE_DATA_BASE = 64;
 
 /**
  * Wire-format onion_message (type 513).
- * Fields: blinding_point (33 bytes) + len + onion_routing_packet (1366 bytes)
+ * Fields: blinding_point (33 bytes) + len + onion_routing_packet (1366 or 32834 bytes)
  */
 export interface IOnionMessage {
 	/** Ephemeral blinding point for route blinding (33-byte compressed pubkey) */
 	blindingPoint: Buffer;
-	/** Sphinx onion routing packet (1366 bytes) */
+	/** Sphinx onion routing packet (1366 or 32834 bytes) */
 	onionRoutingPacket: Buffer;
 }
 

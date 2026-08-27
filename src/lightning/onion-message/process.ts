@@ -8,7 +8,7 @@
 
 import crypto from 'crypto';
 import { ecdh, pointMultiply } from '../crypto/ecdh';
-import { ONION_VERSION, ROUTING_INFO_LENGTH } from '../onion/types';
+import { ONION_VERSION } from '../onion/types';
 import {
 	computeBlindingFactor,
 	deriveHopKeys,
@@ -35,7 +35,7 @@ import {
  * - Intermediate hop: next hop ID + forwarding onion
  * - Final hop: message payload with application data
  *
- * @param onionPacketBuf - The 1366-byte onion routing packet
+ * @param onionPacketBuf - The 1366-byte or 32834-byte onion routing packet
  * @param nodePrivkey - This node's private key (32 bytes)
  * @param blindingPoint - The blinding point from the onion_message (33 bytes), or undefined for non-blinded
  * @returns Processing result: forward or delivery
@@ -85,8 +85,13 @@ export function processOnionMessage(
 		throw new Error('HMAC verification failed');
 	}
 
-	// Decrypt routing info using a 2x-length stream
-	const extendedLen = 2 * ROUTING_INFO_LENGTH;
+	// Decrypt routing info using a 2x-length stream. The routing info length
+	// comes from the packet itself (we construct 1300 or 32768, but BOLT 4
+	// readers size the payload space from the packet, so peers' other
+	// bounded sizes peel too); the forwarded onion keeps whatever size
+	// arrived.
+	const routingInfoLength = packet.routingInfo.length;
+	const extendedLen = 2 * routingInfoLength;
 	const stream = generateCipherStream(keys.rho, extendedLen);
 	const extended = Buffer.alloc(extendedLen);
 	packet.routingInfo.copy(extended, 0);
@@ -103,10 +108,19 @@ export function processOnionMessage(
 	// Extract next HMAC
 	const nextHmac = Buffer.from(extended.subarray(bytesRead, bytesRead + 32));
 
-	// Build next routing info
+	// Build next routing info. A valid construction packs each hop's
+	// payload plus its 32-byte HMAC inside the routing info, so an overrun
+	// only happens on a malformed packet; failing here (instead of slicing
+	// short) guarantees a forwarded onion is byte-for-byte the size that
+	// arrived.
 	const shiftStart = bytesRead + 32;
+	if (shiftStart + routingInfoLength > extendedLen) {
+		throw new Error(
+			`Onion message hop payload overruns the routing info (${shiftStart} > ${routingInfoLength})`
+		);
+	}
 	const nextRoutingInfo = Buffer.from(
-		extended.subarray(shiftStart, shiftStart + ROUTING_INFO_LENGTH)
+		extended.subarray(shiftStart, shiftStart + routingInfoLength)
 	);
 
 	// Blind ephemeral key for next hop

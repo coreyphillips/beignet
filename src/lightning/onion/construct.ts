@@ -1,9 +1,11 @@
 /**
  * BOLT 4: Onion Packet Construction
  *
- * Builds 1366-byte onion packets from a list of hop payloads.
- * Construction works right-to-left (last hop first), wrapping each
- * hop's payload into the routing info with XOR encryption and HMAC.
+ * Builds onion packets from a list of hop payloads. Payment onions are
+ * always 1366 bytes; onion messages may use the BOLT 4 large form
+ * (32834 bytes). Construction works right-to-left (last hop first),
+ * wrapping each hop's payload into the routing info with XOR encryption
+ * and HMAC.
  */
 
 import crypto from 'crypto';
@@ -146,29 +148,38 @@ export function constructOnionPacket(
 }
 
 /**
- * Serialize an onion packet to a 1366-byte buffer.
- * Format: version(1) + ephemeralKey(33) + routingInfo(1300) + hmac(32)
+ * Serialize an onion packet.
+ * Format: version(1) + ephemeralKey(33) + routingInfo(n) + hmac(32).
+ * Payment construction always emits n = 1300 and our onion message
+ * construction emits 1300 or 32768, but a relayed onion message keeps
+ * whatever bounded size arrived, so the encoder sizes from the packet.
  */
 export function encodeOnionPacket(packet: IOnionPacket): Buffer {
-	const buf = Buffer.alloc(1366);
+	const riLen = packet.routingInfo.length;
+	const buf = Buffer.alloc(66 + riLen);
 	buf[0] = packet.version;
 	packet.ephemeralKey.copy(buf, 1);
 	packet.routingInfo.copy(buf, 34);
-	packet.hmac.copy(buf, 1334);
+	packet.hmac.copy(buf, 34 + riLen);
 	return buf;
 }
 
 /**
- * Deserialize a 1366-byte buffer into an onion packet.
+ * Deserialize a buffer into an onion packet. The routing info length is
+ * derived from the total length (BOLT 4: readers size the payload space
+ * from the packet); the buffer must at least hold the fixed fields plus
+ * one routing byte. Payment processing separately pins its packets at
+ * 1300 bytes of routing info.
  */
 export function decodeOnionPacket(buf: Buffer): IOnionPacket {
-	if (buf.length !== 1366) {
-		throw new Error(`Onion packet must be 1366 bytes, got ${buf.length}`);
+	if (buf.length < 67) {
+		throw new Error(`Onion packet too short: ${buf.length} bytes (minimum 67)`);
 	}
+	const riLen = buf.length - 66;
 	return {
 		version: buf[0],
 		ephemeralKey: Buffer.from(buf.subarray(1, 34)),
-		routingInfo: Buffer.from(buf.subarray(34, 1334)),
-		hmac: Buffer.from(buf.subarray(1334, 1366))
+		routingInfo: Buffer.from(buf.subarray(34, 34 + riLen)),
+		hmac: Buffer.from(buf.subarray(34 + riLen, 66 + riLen))
 	};
 }

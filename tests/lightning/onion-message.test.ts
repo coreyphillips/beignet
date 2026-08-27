@@ -116,14 +116,14 @@ describe('Onion Messages (Phase 8)', () => {
 			).to.throw('blinding_point must be 33 bytes');
 		});
 
-		it('should reject onion_routing_packet with wrong length', () => {
+		it('should reject onion_routing_packet too short to hold a packet', () => {
 			const kp = generateKeyPair();
 			expect(() =>
 				encodeOnionMessage({
 					blindingPoint: kp.pubkey,
-					onionRoutingPacket: Buffer.alloc(100)
+					onionRoutingPacket: Buffer.alloc(50)
 				})
-			).to.throw('onion_routing_packet must be 1366 bytes');
+			).to.throw('onion_routing_packet must be 67 to 65535 bytes');
 		});
 
 		it('should reject truncated wire message', () => {

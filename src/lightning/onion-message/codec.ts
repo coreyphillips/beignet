@@ -5,10 +5,13 @@
  * Wire format:
  *   [33: blinding_point] [2: len] [len: onion_routing_packet]
  *
- * The onion_routing_packet is always 1366 bytes for onion messages.
+ * We only ever construct the two BOLT 4 writer-recommended packet sizes
+ * (1366 standard, 32834 large form), but readers derive the payload
+ * space from the packet length, so other bounded sizes from peers are
+ * accepted and preserved when forwarding.
  */
 
-import { IOnionMessage, ONION_MESSAGE_PACKET_LENGTH } from './types';
+import { IOnionMessage } from './types';
 import {
 	IOnionMessagePayload,
 	TLV_ENCRYPTED_RECIPIENT_DATA,
@@ -24,7 +27,11 @@ import { encodeBigSize, decodeBigSize } from '../message/codec';
 
 /**
  * Encode an onion_message for the wire (type 513 payload, excluding the 2-byte type prefix).
- * Format: blinding_point(33) + len(2) + onion_routing_packet(1366)
+ * Format: blinding_point(33) + len(2) + onion_routing_packet
+ *
+ * The packet must at least hold the fixed onion fields plus one routing
+ * byte and must fit the u16 len field; within those bounds any size is
+ * serialized as-is so a relayed foreign-size onion keeps its length.
  */
 export function encodeOnionMessage(msg: IOnionMessage): Buffer {
 	if (msg.blindingPoint.length !== 33) {
@@ -32,15 +39,16 @@ export function encodeOnionMessage(msg: IOnionMessage): Buffer {
 			`blinding_point must be 33 bytes, got ${msg.blindingPoint.length}`
 		);
 	}
-	if (msg.onionRoutingPacket.length !== ONION_MESSAGE_PACKET_LENGTH) {
+	const packetLen = msg.onionRoutingPacket.length;
+	if (packetLen < 67 || packetLen > 65535) {
 		throw new Error(
-			`onion_routing_packet must be ${ONION_MESSAGE_PACKET_LENGTH} bytes, got ${msg.onionRoutingPacket.length}`
+			`onion_routing_packet must be 67 to 65535 bytes, got ${packetLen}`
 		);
 	}
 
-	const buf = Buffer.alloc(33 + 2 + ONION_MESSAGE_PACKET_LENGTH);
+	const buf = Buffer.alloc(33 + 2 + packetLen);
 	msg.blindingPoint.copy(buf, 0);
-	buf.writeUInt16BE(ONION_MESSAGE_PACKET_LENGTH, 33);
+	buf.writeUInt16BE(packetLen, 33);
 	msg.onionRoutingPacket.copy(buf, 35);
 	return buf;
 }
