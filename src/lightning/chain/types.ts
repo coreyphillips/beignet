@@ -217,6 +217,13 @@ export interface IFeeBumpAndBroadcastChainAction {
 	 * tree, used to tweak the local delayed privkey for the BIP341 key-path spend.
 	 */
 	taprootAnchorMerkleRoot?: Buffer;
+	/**
+	 * anchor-cpfp taproot only: which of our keys spends the anchor. Our anchor
+	 * on OUR commitment is keyed to the to_local delayed pubkey ('delayed', the
+	 * default when absent); on the PEER's commitment it is keyed to our static
+	 * to_remote payment basepoint ('payment', issue #559).
+	 */
+	taprootAnchorKeyRole?: 'delayed' | 'payment';
 }
 
 export interface IWatchOutputChainAction {

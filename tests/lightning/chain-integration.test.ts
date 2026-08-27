@@ -43,6 +43,7 @@ import { buildClosingTx } from '../../src/lightning/chain/closing';
 import {
 	MonitorState,
 	ChainActionType,
+	CommitmentType,
 	OutputStatus,
 	OutputType,
 	ITrackedOutput
@@ -1008,6 +1009,283 @@ describe('Chain Integration (Phase 4D)', function () {
 
 			expect(opener.getState()).to.equal(ChannelState.CLOSED);
 			expect(closedCount).to.equal(1);
+		});
+	});
+
+	describe('Mempool-only peer commitment sighting (issue #559)', function () {
+		// A peer commitment reported at height 0 (mempool) must not flip the
+		// channel to FORCE_CLOSED: that disarms the scanExpiringHtlcs deadline
+		// backstop, so a peer parking a below-floor commitment could wait out
+		// cltv_expiry with our CPFP-able commitment never broadcast as a
+		// competing spend.
+
+		function theirCommitmentFixture(): {
+			opener: Channel;
+			acceptor: Channel;
+			manager: ChannelManager;
+			channelId: Buffer;
+			destScript: Buffer;
+			theirTx: bitcoin.Transaction;
+			openerPrivkeys: Buffer[];
+		} {
+			const {
+				opener,
+				acceptor,
+				openerPrivkeys,
+				openerBasepoints,
+				openerCommitmentSeed
+			} = setupNormalChannels();
+			const channelId = opener.getChannelId()!;
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const built = buildRemoteCommitment(
+				state,
+				state.remoteCurrentPerCommitmentPoint!
+			);
+			const config: IChannelManagerConfig = {
+				localBasepoints: openerBasepoints,
+				localPerCommitmentSeed: openerCommitmentSeed,
+				localFundingPrivkey: openerPrivkeys[0]
+			};
+			const manager = new ChannelManager(config);
+			(manager as any).channels.set(channelId.toString('hex'), opener);
+			(manager as any).channelPeers.set(channelId.toString('hex'), 'test-peer');
+			return {
+				opener,
+				acceptor,
+				manager,
+				channelId,
+				destScript,
+				theirTx: built.result.tx,
+				openerPrivkeys
+			};
+		}
+
+		it('keeps the channel NORMAL while their commitment sits in the mempool, closing on confirmation', function () {
+			const fx = theirCommitmentFixture();
+			const events: string[] = [];
+			fx.manager.on('channel:force-closing', () =>
+				events.push('force-closing')
+			);
+			fx.manager.on('channel:closed', () => events.push('closed'));
+
+			fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				0,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+
+			// The sighting is classified and tracked, but the channel stays in a
+			// state the HTLC deadline backstop still services.
+			expect(fx.opener.getState()).to.equal(ChannelState.NORMAL);
+			expect(events).to.deep.equal([]);
+			const broadcast = fx.manager
+				.getMonitor(fx.channelId)!
+				.getFullState().commitmentBroadcast;
+			expect(broadcast).to.exist;
+			expect(broadcast!.blockHeight).to.equal(0);
+
+			// The funding watch re-reports the spend at its confirmed height: NOW
+			// the channel closes, with both events.
+			fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				120,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+			expect(fx.opener.getState()).to.equal(ChannelState.FORCE_CLOSED);
+			expect(events).to.deep.equal(['force-closing', 'closed']);
+		});
+
+		it('arms the peer-commitment anchor CPFP hook on the mempool sighting only', function () {
+			const fx = theirCommitmentFixture();
+			const calls: any[] = [];
+			(fx.manager as any)._maybeCpfpTheirCommitment = (
+				...args: any[]
+			): void => {
+				calls.push(args);
+			};
+
+			fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				0,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+			expect(calls.length).to.equal(1);
+			expect((calls[0][2] as bitcoin.Transaction).getId()).to.equal(
+				fx.theirTx.getId()
+			);
+
+			// A commitment first seen confirmed needs no CPFP.
+			const confirmed = theirCommitmentFixture();
+			const confirmedCalls: any[] = [];
+			(confirmed.manager as any)._maybeCpfpTheirCommitment = (
+				...args: any[]
+			): void => {
+				confirmedCalls.push(args);
+			};
+			confirmed.manager.handleFundingSpent(
+				confirmed.channelId,
+				confirmed.theirTx,
+				120,
+				confirmed.destScript,
+				10,
+				confirmed.openerPrivkeys[1],
+				confirmed.openerPrivkeys[2],
+				network
+			);
+			expect(confirmedCalls.length).to.equal(0);
+		});
+
+		it('reclassifies a parked commitment revoked during the mempool window when it confirms', function () {
+			// The deferral keeps the channel NORMAL, so commitment rounds keep
+			// completing while the peer's commitment sits in the mempool. A
+			// completed round revokes the parked tx; adopting its confirmation
+			// under the stale THEIR_CURRENT record would pay out the pre-window
+			// balances with no penalty.
+			const fx = theirCommitmentFixture();
+			const events: string[] = [];
+			fx.manager.on('channel:force-closing', () =>
+				events.push('force-closing')
+			);
+			fx.manager.on('channel:closed', () => events.push('closed'));
+
+			fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				0,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+			expect(fx.opener.getState()).to.equal(ChannelState.NORMAL);
+
+			// A round completes during the window: the parked tx is now revoked.
+			exchangeCommitments(fx.opener, fx.acceptor);
+
+			const actions = fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				120,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+
+			const broadcast = fx.manager.getMonitor(fx.channelId)!.getFullState()
+				.commitmentBroadcast!;
+			expect(broadcast.commitmentType).to.equal(
+				CommitmentType.THEIR_REVOKED_COMMITMENT
+			);
+			expect(broadcast.blockHeight).to.equal(120);
+			const penalty = actions.filter(
+				(a) =>
+					a.type === ChainActionType.BROADCAST_TX &&
+					(a as any).description.includes('penalty')
+			);
+			expect(penalty.length).to.be.greaterThan(0);
+			expect(fx.opener.getState()).to.equal(ChannelState.FORCE_CLOSED);
+			expect(events).to.deep.equal(['force-closing', 'closed']);
+		});
+
+		it('flips the record to revoked on a mempool re-report, keeping the channel NORMAL', function () {
+			// The funding watch re-reports the parked spend every block, so the
+			// revocation is picked up before confirmation: the penalty sweeps
+			// broadcast as descendants of the parked tx, while the deferral (and
+			// with it the deadline backstop) holds until confirmation.
+			const fx = theirCommitmentFixture();
+
+			fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				0,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+			exchangeCommitments(fx.opener, fx.acceptor);
+
+			const actions = fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				0,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+
+			const broadcast = fx.manager.getMonitor(fx.channelId)!.getFullState()
+				.commitmentBroadcast!;
+			expect(broadcast.commitmentType).to.equal(
+				CommitmentType.THEIR_REVOKED_COMMITMENT
+			);
+			expect(broadcast.blockHeight).to.equal(0);
+			const penalty = actions.filter(
+				(a) =>
+					a.type === ChainActionType.BROADCAST_TX &&
+					(a as any).description.includes('penalty')
+			);
+			expect(penalty.length).to.be.greaterThan(0);
+			expect(fx.opener.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('still reconciles OUR OWN commitment seen in the mempool immediately', function () {
+			const { opener, openerPrivkeys, openerBasepoints, openerCommitmentSeed } =
+				setupNormalChannels();
+			const signer = new ChannelSigner(openerPrivkeys[0]);
+			const channelId = opener.getChannelId()!;
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const forceCloseActions = opener.forceClose(signer);
+			const broadcastAction = forceCloseActions.find(
+				(a) => a.type === ChannelActionType.BROADCAST_TX
+			);
+			const commitmentTx = bitcoin.Transaction.fromBuffer(
+				(broadcastAction as any).tx
+			);
+			// Restart while our own force-close sits unconfirmed: the watcher
+			// re-detects it from the mempool.
+			(opener as any)._state.state = ChannelState.AWAITING_REESTABLISH;
+
+			const manager = new ChannelManager({
+				localBasepoints: openerBasepoints,
+				localPerCommitmentSeed: openerCommitmentSeed,
+				localFundingPrivkey: openerPrivkeys[0]
+			});
+			(manager as any).channels.set(channelId.toString('hex'), opener);
+
+			manager.handleFundingSpent(
+				channelId,
+				commitmentTx,
+				0,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			expect(opener.getState()).to.equal(ChannelState.FORCE_CLOSED);
 		});
 	});
 
