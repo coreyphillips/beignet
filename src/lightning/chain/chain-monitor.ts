@@ -502,6 +502,19 @@ export class ChainMonitor {
 		// outpoint the retracting scan actually covered.
 		spentOutpoint?: { txid: string; outputIndex: number }
 	): ChainAction[] {
+		// A transaction with no inputs cannot spend the funding output, so a
+		// report of one is a broken backend feed, not chain evidence. Reject
+		// it before ANY record or state mutation: persisting it would hand the
+		// manager an UNKNOWN commitment record that drives a live channel to
+		// FORCE_CLOSED over a transaction that closes nothing (issue 568).
+		if (spendingTx.ins.length === 0) {
+			return [
+				{
+					type: ChainActionType.ERROR,
+					message: `Ignoring reported funding spend with no inputs: ${spendingTx.getId()}`
+				}
+			];
+		}
 		if (this._state !== MonitorState.WATCHING) {
 			// Commitment SWAP: a DIFFERENT tx now spends the funding output. The
 			// funding outpoint can only be spent once per chain, so a confirmed

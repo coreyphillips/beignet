@@ -39,7 +39,11 @@ import {
 	buildLocalCommitment,
 	buildRemoteCommitment
 } from '../../src/lightning/channel/commitment-builder';
-import { buildClosingTx } from '../../src/lightning/chain/closing';
+import {
+	buildClosingTx,
+	buildSimpleClosingTx,
+	SimpleCloseVariant
+} from '../../src/lightning/chain/closing';
 import {
 	MonitorState,
 	ChainActionType,
@@ -905,6 +909,113 @@ describe('Chain Integration (Phase 4D)', function () {
 			expect(closedChannelId).to.not.be.null;
 			expect((closedChannelId as unknown as Buffer).equals(channelId)).to.be
 				.true;
+		});
+
+		it('ignores a reported funding spend with no inputs instead of force-closing (issue 568)', function () {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+
+			const config: IChannelManagerConfig = {
+				localBasepoints: state.localBasepoints,
+				localPerCommitmentSeed: state.localPerCommitmentSeed,
+				localFundingPrivkey: openerPrivkeys[0]
+			};
+			const manager = new ChannelManager(config);
+			manager.on('error', () => {});
+			const channelId = opener.getChannelId()!;
+			(manager as any).channels.set(channelId.toString('hex'), opener);
+			(manager as any).channelPeers.set(channelId.toString('hex'), 'test-peer');
+
+			// A zero-input transaction cannot spend anything: a broken backend
+			// feed, not chain evidence. It must be rejected before any monitor
+			// record or channel transition.
+			const actions = manager.handleFundingSpent(
+				channelId,
+				new bitcoin.Transaction(),
+				100,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			expect(actions.find((a) => a.type === ChainActionType.ERROR)).to.exist;
+			expect(opener.getState()).to.equal(ChannelState.NORMAL);
+			const monitor = manager.getMonitor(channelId);
+			expect(monitor!.getState()).to.equal(MonitorState.WATCHING);
+			expect(monitor!.getFullState().commitmentBroadcast).to.equal(null);
+		});
+
+		it('repairs a pre-fix FORCE_CLOSED record of a simple close to CLOSED on re-report (issue 568)', function () {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+
+			const config: IChannelManagerConfig = {
+				localBasepoints: state.localBasepoints,
+				localPerCommitmentSeed: state.localPerCommitmentSeed,
+				localFundingPrivkey: openerPrivkeys[0]
+			};
+			const manager = new ChannelManager(config);
+			const channelId = opener.getChannelId()!;
+			(manager as any).channels.set(channelId.toString('hex'), opener);
+			(manager as any).channelPeers.set(channelId.toString('hex'), 'test-peer');
+
+			const closingResult = buildSimpleClosingTx({
+				fundingTxid: state.fundingTxid!.toString('hex'),
+				fundingOutputIndex: state.fundingOutputIndex,
+				closerScriptPubkey: destScript,
+				closeeScriptPubkey: Buffer.alloc(22, 0x02),
+				closerAmount: 800_000n,
+				closeeAmount: 199_000n,
+				feeSatoshis: 1_000n,
+				locktime: 100,
+				variant: SimpleCloseVariant.CLOSER_AND_CLOSEE
+			});
+
+			manager.handleFundingSpent(
+				channelId,
+				closingResult.tx,
+				100,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			expect(opener.getState()).to.equal(ChannelState.CLOSED);
+
+			// Rewind to the shape a pre-fix node persisted: the simple close
+			// decoded as a fabricated future commitment tracking no outputs,
+			// and the channel driven to FORCE_CLOSED by that record.
+			const monitor = manager.getMonitor(channelId)!;
+			(monitor as any)._commitmentBroadcast.commitmentType =
+				CommitmentType.THEIR_FUTURE_COMMITMENT;
+			(monitor as any)._commitmentBroadcast.commitmentNumber = 1n << 47n;
+			(monitor as any)._trackedOutputs = [];
+			(opener as any)._state.state = ChannelState.FORCE_CLOSED;
+
+			// The funding watch re-reports the same confirmed spend each block:
+			// the monitor record must repair to COOPERATIVE_CLOSE and the
+			// channel lifecycle must follow it back to CLOSED, not wait for
+			// irrevocable depth.
+			manager.handleFundingSpent(
+				channelId,
+				closingResult.tx,
+				100,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			expect(
+				monitor.getFullState().commitmentBroadcast!.commitmentType
+			).to.equal(CommitmentType.COOPERATIVE_CLOSE);
+			expect(opener.getState()).to.equal(ChannelState.CLOSED);
 		});
 
 		it('should transition an AWAITING_REESTABLISH channel to FORCE_CLOSED on a detected commitment broadcast', function () {
