@@ -175,18 +175,43 @@ export function extractCommitmentNumber(
 // ─────────────── Commitment Classification ───────────────
 
 /**
+ * BOLT 3 commitment transactions stamp the obscured commitment number into
+ * locktime and sequence with fixed type bytes: locktime = 0x20000000 | lower24
+ * and sequence = 0x80000000 | upper24 (script/commitment.ts, one stamping site
+ * shared by segwit and taproot commitments). No cooperative close can carry
+ * both: accepted close locktimes are block heights below 500_000_000 (never
+ * prefix 0x20) and close sequences are 0xffffffff or the RBF-signalling
+ * 0xfffffffd (prefix 0xff, never 0x80).
+ */
+const COMMITMENT_LOCKTIME_PREFIX = 0x20;
+const COMMITMENT_SEQUENCE_PREFIX = 0x80;
+
+/**
  * Classify a commitment transaction by comparing it against expected values.
  */
 export function classifyCommitmentTx(
 	tx: bitcoin.Transaction,
 	state: IChannelState
 ): IClassifiedCommitment {
-	// Cooperative close needs no key material to identify (BOLT 3 commitments
-	// stamp the obscured commitment number into locktime/sequence with the
-	// 0x20/0x80 type bits, so a commitment's sequence is never 0xffffffff).
+	// A funding spend with no inputs is not evidence of anything; route it to
+	// the ERROR arm rather than throwing or silently resolving the channel.
+	if (tx.ins.length === 0) {
+		return { type: CommitmentType.UNKNOWN, commitmentNumber: 0n };
+	}
+	// Cooperative close needs no key material to identify: commitments are the
+	// only funding spends carrying the BOLT 3 type stamp, and every funding
+	// spend reaching this classifier is one we co-signed, so anything unstamped
+	// is a mutual close (legacy 0/0xffffffff, taproot legacy 0xfffffffd, simple
+	// close negotiated-locktime/0xfffffffd). Splice transactions also lack the
+	// stamp but never reach here: the chain watcher filters them by txid via
+	// the pre-splice leg's ignoreSpendTxid (expectedSpenderFor) before
+	// reporting a funding spend, and this classifier depends on that filter.
 	// Checked before the key-material guard so a recovery state without remote
 	// basepoints still recognizes a mutual close.
-	if (tx.locktime === 0 && tx.ins[0].sequence === 0xffffffff) {
+	const isCommitmentStamped =
+		tx.locktime >>> 24 === COMMITMENT_LOCKTIME_PREFIX &&
+		tx.ins[0].sequence >>> 24 === COMMITMENT_SEQUENCE_PREFIX;
+	if (!isCommitmentStamped) {
 		return { type: CommitmentType.COOPERATIVE_CLOSE, commitmentNumber: 0n };
 	}
 

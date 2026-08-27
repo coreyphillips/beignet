@@ -37,7 +37,11 @@ import {
 	buildToLocalScript
 } from '../../src/lightning/script/commitment';
 import { buildPenaltyTx } from '../../src/lightning/script/revocation';
-import { buildClosingTx } from '../../src/lightning/chain/closing';
+import {
+	buildClosingTx,
+	buildSimpleClosingTx,
+	SimpleCloseVariant
+} from '../../src/lightning/chain/closing';
 import {
 	extractCommitmentNumber,
 	classifyCommitmentTx,
@@ -341,6 +345,59 @@ describe('Output Resolver (Phase 4B)', function () {
 
 			const result = classifyCommitmentTx(closingResult.tx, state);
 			expect(result.type).to.equal(CommitmentType.COOPERATIVE_CLOSE);
+		});
+
+		it('classifies an option_simple_close tx (nonzero locktime, RBF sequence) as a cooperative close', function () {
+			const { opener } = setupNormalChannels();
+			const state = opener.getFullState();
+
+			// Simple-close txs carry sequence 0xfffffffd and a negotiated
+			// locktime, neither of which the old locktime-0/0xffffffff test
+			// matched, so they fell through to commitment-number decoding.
+			const closingResult = buildSimpleClosingTx({
+				fundingTxid: state.fundingTxid!.toString('hex'),
+				fundingOutputIndex: state.fundingOutputIndex,
+				closerScriptPubkey: Buffer.alloc(22, 0x01),
+				closeeScriptPubkey: Buffer.alloc(22, 0x02),
+				closerAmount: 500_000n,
+				closeeAmount: 499_000n,
+				feeSatoshis: 1_000n,
+				locktime: 800_000,
+				variant: SimpleCloseVariant.CLOSER_AND_CLOSEE
+			});
+
+			const result = classifyCommitmentTx(closingResult.tx, state);
+			expect(result.type).to.equal(CommitmentType.COOPERATIVE_CLOSE);
+		});
+
+		it('classifies a taproot legacy coop close (sequence 0xfffffffd) as a cooperative close', function () {
+			const { opener } = setupNormalChannels();
+			const state = opener.getFullState();
+
+			// Taproot channels build the legacy coop close RBF-signalled to
+			// match LND's MuSig2 sighash.
+			const closingResult = buildClosingTx({
+				fundingTxid: state.fundingTxid!.toString('hex'),
+				fundingOutputIndex: state.fundingOutputIndex,
+				fundingAmount: state.fundingSatoshis,
+				localScriptPubkey: Buffer.alloc(22, 0x01),
+				remoteScriptPubkey: Buffer.alloc(22, 0x02),
+				localAmount: 500_000n,
+				remoteAmount: 499_000n,
+				feeAmount: 1_000n,
+				sequence: 0xfffffffd
+			});
+
+			const result = classifyCommitmentTx(closingResult.tx, state);
+			expect(result.type).to.equal(CommitmentType.COOPERATIVE_CLOSE);
+		});
+
+		it('returns UNKNOWN without throwing for a transaction with no inputs', function () {
+			const { opener } = setupNormalChannels();
+			const state = opener.getFullState();
+
+			const result = classifyCommitmentTx(new bitcoin.Transaction(), state);
+			expect(result.type).to.equal(CommitmentType.UNKNOWN);
 		});
 
 		it('should classify our commitment', function () {
