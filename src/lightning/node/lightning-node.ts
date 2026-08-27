@@ -3145,6 +3145,13 @@ export class LightningNode extends EventEmitter {
 			// outpoint, so an SCB restore would watch an outpoint the splice consumed
 			// and miss the peer's force-close on the new one (FS-7).
 			this.emit('splice:complete', { channelId, fundingTxid });
+			// A settle owed upstream that was still refused at quiescence:ended
+			// (a taproot channel parks updates until splice_locked) is carried
+			// now that the channel is NORMAL again. Deferred: this event fires
+			// from inside a processActions dispatch.
+			setImmediate(() => {
+				this.settleForwardsOwedUpstream(channelId);
+			});
 		});
 
 		// A channel was failed by a BOLT 1 error (received or sent). Drive the
@@ -3402,12 +3409,17 @@ export class LightningNode extends EventEmitter {
 		);
 
 		// Quiescence over on a channel: re-drive any incoming-HTLC dispatches
-		// parked while it was quiescing (issue 411). Deferred: the event fires
-		// from inside a processActions dispatch, and the re-driven dispositions
-		// start a dispatch of their own.
+		// parked while it was quiescing (issue 411), and any settle owed
+		// upstream that was refused while the channel could not carry updates
+		// (an on-chain preimage learned mid-splice; a live splice never emits
+		// channel:reestablished, so the reestablish-tail pass cannot cover
+		// it). Deferred: the event fires from inside a processActions
+		// dispatch, and the re-driven dispositions start a dispatch of their
+		// own.
 		this.channelManager.on('quiescence:ended', (channelIdHex: string) => {
 			setImmediate(() => {
 				this.drainParkedQuiescentHtlcs(channelIdHex);
+				this.settleForwardsOwedUpstream(Buffer.from(channelIdHex, 'hex'));
 			});
 		});
 
@@ -14961,6 +14973,11 @@ export class LightningNode extends EventEmitter {
 	 *     hash can be claimed on-chain if its channel force-closes (the core fix).
 	 *  2. Off-chain settle any still-live INBOUND (received) HTLC matching the hash,
 	 *     so a healthy inbound channel resolves cleanly instead of forcing a close.
+	 * A channel that cannot carry the fulfill right now (mid-reestablish after a
+	 * restart or disconnect, or quiescing for a splice) is skipped with its
+	 * forward linkage intact, and settleForwardsOwedUpstream completes the settle
+	 * from the persisted preimage at the reestablish tail, at quiescence end, or
+	 * at splice completion.
 	 * recordPreimage is idempotent, so re-learning a preimage is harmless.
 	 */
 	private handleOnChainPreimageLearned(
@@ -14989,6 +15006,16 @@ export class LightningNode extends EventEmitter {
 				)
 					continue;
 				if (!htlc.paymentHash.equals(paymentHash)) continue;
+				// The gate that keeps the linkage delete below honest, same
+				// discipline as settleForwardUpstream: a channel that cannot
+				// carry the fulfill refuses it without throwing, and consuming
+				// the forward linkage around that refusal would prime the
+				// restore-time redispatch to re-forward the same inbound HTLC
+				// for value the downstream already claimed on-chain. The
+				// preimage is already durable (saved above), so the retained
+				// linkage lets settleForwardsOwedUpstream finish the settle
+				// when the channel can carry updates again.
+				if (!channel.canFulfillHtlc(htlc.id)) continue;
 				this.cleanupHtlcSharedSecret(`${cid.toString('hex')}:${htlc.id}`);
 				// Re-stage the preimage with the fulfill it authorizes. The
 				// save above already ran, but staging makes the pairing
@@ -15250,8 +15277,10 @@ export class LightningNode extends EventEmitter {
 	 * Settle upstream any forward on this inbound channel whose downstream
 	 * leg already revealed its preimage while the channel could not carry
 	 * the fulfill: the process was killed after the downstream settle
-	 * became durable, or the inbound peer was disconnected when it arrived.
-	 * Driven from every return to NORMAL (channel:ready).
+	 * became durable, the inbound peer was disconnected when it arrived, or
+	 * the channel was quiescing for a splice. Driven from every point where
+	 * the channel regains the ability to carry updates: the reestablish
+	 * tail, quiescence end, and splice completion.
 	 *
 	 * Gated on durable facts only: the linkage row survives exactly until
 	 * the upstream fulfill commits, the preimage exists only once the
