@@ -2,8 +2,9 @@
  * BOLT 7.5: Onion Message Construction
  *
  * Builds onion packets for message delivery (similar to payment onions
- * but without HTLC-specific fields). Uses 1300-byte payloads with
- * Sphinx onion routing.
+ * but without HTLC-specific fields). Uses Sphinx onion routing over a
+ * 1300-byte routing info, or the BOLT 4 large 32768-byte form when the
+ * hop payloads need it.
  */
 
 import crypto from 'crypto';
@@ -13,7 +14,11 @@ import {
 	ISendOnionMessageOptions
 } from './types';
 import { encodeOnionMessagePayload } from './codec';
-import { ONION_VERSION, ROUTING_INFO_LENGTH } from '../onion/types';
+import {
+	LARGE_ROUTING_INFO_LENGTH,
+	ONION_VERSION,
+	ROUTING_INFO_LENGTH
+} from '../onion/types';
 import {
 	computeSharedSecrets,
 	deriveHopKeys,
@@ -26,22 +31,24 @@ import { encodeOnionPacket } from '../onion/construct';
 
 /**
  * Generate filler bytes for onion message construction.
- * Same algorithm as payment onion filler but for onion message payloads.
+ * Same algorithm as payment onion filler but for onion message payloads,
+ * parameterized on the routing info length (1300 standard, 32768 large).
  */
 function generateFiller(
 	sharedSecrets: Buffer[],
-	payloadSizes: number[]
+	payloadSizes: number[],
+	routingInfoLength: number
 ): Buffer {
 	let filler = Buffer.alloc(0);
 
 	for (let i = 0; i < sharedSecrets.length - 1; i++) {
 		const hopSize = payloadSizes[i] + 32; // payload + HMAC
-		const fillerStart = ROUTING_INFO_LENGTH - filler.length;
+		const fillerStart = routingInfoLength - filler.length;
 
 		const keys = deriveHopKeys(sharedSecrets[i]);
 		const stream = generateCipherStream(
 			keys.rho,
-			ROUTING_INFO_LENGTH + hopSize
+			routingInfoLength + hopSize
 		);
 
 		// Extend filler by hopSize zeros
@@ -63,7 +70,7 @@ function generateFiller(
  *
  * @param sessionKey - 32-byte random session key (ephemeral private key)
  * @param hops - Array of { pubkey, payload } for each hop in the path
- * @returns Encoded onion packet as a 1366-byte buffer
+ * @returns Encoded onion packet as a 1366-byte or 32834-byte buffer
  */
 export function constructOnionMessagePacket(
 	sessionKey: Buffer,
@@ -84,8 +91,22 @@ export function constructOnionMessagePacket(
 
 	const payloadSizes = hops.map((h) => h.payload.length);
 
+	// BOLT 4 gives onion messages exactly two fixed sizes: the 1300-byte
+	// standard routing info or the 32768-byte large form, chosen from the
+	// payloads alone so packet length leaks at most one bit.
+	const needed = payloadSizes.reduce((sum, len) => sum + len + 32, 0);
+	const routingInfoLength =
+		needed <= ROUTING_INFO_LENGTH
+			? ROUTING_INFO_LENGTH
+			: LARGE_ROUTING_INFO_LENGTH;
+	if (needed > routingInfoLength) {
+		throw new Error(
+			`Onion message payloads need ${needed} bytes, exceeding the large form (${LARGE_ROUTING_INFO_LENGTH})`
+		);
+	}
+
 	// Generate filler
-	const filler = generateFiller(sharedSecrets, payloadSizes);
+	const filler = generateFiller(sharedSecrets, payloadSizes, routingInfoLength);
 
 	// BOLT 4: initialize routing_info from the pseudo-random `pad`-key stream
 	// keyed by the SESSION private key, NOT zeros and NOT any per-hop secret.
@@ -94,7 +115,7 @@ export function constructOnionMessagePacket(
 	// that hop regenerate the stream and locate the padding boundary.
 	let routingInfo = generateCipherStream(
 		generateKey('pad', sessionKey),
-		ROUTING_INFO_LENGTH
+		routingInfoLength
 	);
 	let currentHmac = Buffer.alloc(32); // Start with zero HMAC (last hop marker)
 
@@ -105,35 +126,35 @@ export function constructOnionMessagePacket(
 		const shiftSize = payloadBytes.length + 32; // payload + HMAC
 
 		// Right-shift routing info to make room
-		const newRoutingInfo = Buffer.alloc(ROUTING_INFO_LENGTH);
+		const newRoutingInfo = Buffer.alloc(routingInfoLength);
 		payloadBytes.copy(newRoutingInfo, 0);
 		currentHmac.copy(newRoutingInfo, payloadBytes.length);
 		routingInfo.copy(
 			newRoutingInfo,
 			shiftSize,
 			0,
-			ROUTING_INFO_LENGTH - shiftSize
+			routingInfoLength - shiftSize
 		);
 		routingInfo = newRoutingInfo;
 
 		// XOR with cipher stream
-		const stream = generateCipherStream(keys.rho, ROUTING_INFO_LENGTH);
-		for (let j = 0; j < ROUTING_INFO_LENGTH; j++) {
+		const stream = generateCipherStream(keys.rho, routingInfoLength);
+		for (let j = 0; j < routingInfoLength; j++) {
 			routingInfo[j] ^= stream[j];
 		}
 
 		// For the innermost hop, apply filler AFTER XOR
 		if (i === hops.length - 1 && filler.length > 0) {
-			filler.copy(routingInfo, ROUTING_INFO_LENGTH - filler.length);
+			filler.copy(routingInfo, routingInfoLength - filler.length);
 		}
 
-		// Compute HMAC for this hop
+		// Compute HMAC for this hop. The HMAC covers the whole routing info,
+		// so it also authenticates which of the two forms was used.
 		currentHmac = Buffer.from(
 			crypto.createHmac('sha256', keys.mu).update(routingInfo).digest()
 		);
 	}
 
-	// Serialize to 1366-byte onion packet
 	return encodeOnionPacket({
 		version: ONION_VERSION,
 		ephemeralKey: ephemeralKeys[0],

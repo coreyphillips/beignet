@@ -66,6 +66,15 @@ export const KEYSEND_TLV_TYPE = 5482373484;
 
 export const ONION_PACKET_LENGTH = 1366;
 export const ROUTING_INFO_LENGTH = 1300;
+/**
+ * BOLT 4 large onion form (onion messages only): 32768 bytes of routing info,
+ * 32834 bytes total. Onion message construction selects it automatically when
+ * hop payloads exceed the 1300-byte standard form; exactly two on-wire sizes
+ * ever exist, so a packet's length leaks at most one bit about the content.
+ * Payment onions never use it (update_add_htlc fixes them at 1366).
+ */
+export const LARGE_ROUTING_INFO_LENGTH = 32768;
+export const LARGE_ONION_PACKET_LENGTH = 32834;
 export const ONION_VERSION = 0;
 export const HOP_DATA_LEGACY_LENGTH = 32;
 
