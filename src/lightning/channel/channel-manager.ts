@@ -127,6 +127,7 @@ import {
 	ChannelState,
 	ChannelRole,
 	HtlcDirection,
+	HtlcState,
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
@@ -2438,7 +2439,37 @@ export class ChannelManager extends EventEmitter {
 			if (channel) {
 				const isCoop =
 					broadcast.commitmentType === CommitmentType.COOPERATIVE_CLOSE;
-				if (channel.markClosedOnChain(!isCoop)) {
+				// A peer commitment seen only in the MEMPOOL must not close the
+				// channel yet (issue #559): flipping to FORCE_CLOSED here disarms
+				// the scanExpiringHtlcs deadline backstop, so a peer parking a
+				// below-floor commitment could wait out cltv_expiry with our own
+				// CPFP-able commitment never broadcast as a competing spend, while
+				// our preimage claim on their tx (CSV-1) stays unreleasable until
+				// THEY choose to confirm. The funding watch re-reports the spend
+				// with its current height every block, so the flip and its events
+				// simply move to confirmation. OUR commitment is exempt
+				// (forceClose() already moved the state), and so is a FUTURE
+				// commitment: our state is provably stale there, and the backstop
+				// broadcasting it would forfeit the balance to the justice path.
+				const mempoolOnlyPeerCommitment =
+					broadcast.blockHeight <= 0 &&
+					(broadcast.commitmentType ===
+						CommitmentType.THEIR_CURRENT_COMMITMENT ||
+						broadcast.commitmentType ===
+							CommitmentType.THEIR_REVOKED_COMMITMENT);
+				if (mempoolOnlyPeerCommitment) {
+					// Only when the record describes THIS report: a mempool sighting
+					// of a competitor to an already-recorded spend keeps the old
+					// record (demotion, issue 352) and must not CPFP the newcomer.
+					if (broadcast.txid === spendingTx.getId()) {
+						this._maybeCpfpTheirCommitment(
+							channelId,
+							channel.getFullState(),
+							spendingTx,
+							feeRatePerVbyte
+						);
+					}
+				} else if (channel.markClosedOnChain(!isCoop)) {
 					// A non-coop spend of a channel we did not already force-close
 					// is the peer's unilateral close (current, future, or revoked
 					// commitment). Our own broadcast emits at forceClose() time.
@@ -8568,10 +8599,13 @@ export class ChannelManager extends EventEmitter {
 				anchorOutputIndex: action.anchorOutputIndex,
 				anchorAmount: ANCHOR_OUTPUT_VALUE,
 				anchorWitnessScript: action.anchorWitnessScript,
-				// Taproot anchors are key-path spent by the local delayed privkey;
-				// legacy anchors by the funding privkey.
+				// Taproot anchors are key-path spent by the local delayed privkey
+				// on our own commitment, or by our static payment basepoint secret
+				// on the peer's (issue #559); legacy anchors by the funding privkey.
 				localFundingPrivkey: action.taprootAnchorMerkleRoot
-					? this._channelTaprootAnchorPrivkey(channelId)
+					? action.taprootAnchorKeyRole === 'payment'
+						? this._channelPaymentBasepointSecret(channelId)
+						: this._channelTaprootAnchorPrivkey(channelId)
 					: this._channelFundingPrivkey(channelId),
 				parentVbytes: action.parentVbytes,
 				parentFeeSats: action.parentFeeSats,
@@ -8705,6 +8739,105 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * The peer's commitment was seen in the MEMPOOL on an anchor channel and we
+	 * hold the preimage of an inbound HTLC riding on it (issue #559). Our claim
+	 * of that HTLC spends their commitment with a 1-CSV, so it cannot even be
+	 * broadcast until their commitment confirms — timing the PEER controls: an
+	 * adversarial one parks a below-floor commitment, waits out cltv_expiry,
+	 * then bumps it and races our claim with their pre-signed HTLC-timeout.
+	 * Their commitment carries an anchor keyed to US for exactly this: attach a
+	 * wallet-funded CPFP child so the package confirms while the deadline is
+	 * still comfortably ahead. Tracked in _pendingCommitmentCpfp so
+	 * reCpfpStuckCommitments re-bids (and re-inserts an evicted parent) until
+	 * it confirms. Best-effort, like _maybeCpfpAnchorCommitment.
+	 */
+	private _maybeCpfpTheirCommitment(
+		channelId: Buffer,
+		state: IChannelState,
+		commitmentTx: bitcoin.Transaction,
+		feeRatePerVbyte: number
+	): void {
+		if (!isAnchorChannel(state.channelType)) return;
+		if (!this.fundingProvider?.selectFeeBumpInputs) return;
+		const idHex = channelId.toString('hex');
+		// A tracked package (ours from a force-close, or theirs from an earlier
+		// report of this same sighting) is already being re-bid.
+		if (this._pendingCommitmentCpfp.has(idHex)) return;
+		// Spend wallet fees only when confirmation is deadline-bound: an inbound
+		// HTLC whose preimage we hold must be claimed before its cltv_expiry.
+		// Everything else on their commitment can wait for their fee bump.
+		let deadlineBound = false;
+		for (const [key, htlc] of state.htlcs) {
+			if (!key.startsWith('received-')) continue;
+			const hashHex = htlc.paymentHash?.toString('hex');
+			if (
+				htlc.state === HtlcState.FULFILLED ||
+				(hashHex !== undefined && this._knownPreimages.has(hashHex))
+			) {
+				deadlineBound = true;
+				break;
+			}
+		}
+		if (!deadlineBound) return;
+		try {
+			// On THEIR commitment our anchor is the remote-side one. Legacy anchor
+			// channels key each anchor to that side's funding pubkey, so ours is
+			// the same script as on our own commitment; taproot channels key the
+			// remote anchor to our STATIC to_remote payment basepoint
+			// (deriveCommitmentKeys uses the basepoint raw), not the delayed key.
+			const taprootAnchor = isTaprootChannel(state.channelType)
+				? buildTaprootAnchorOutput(state.localBasepoints.paymentBasepoint)
+				: null;
+			const anchorScript = taprootAnchor
+				? taprootAnchor.output
+				: buildAnchorOutput(state.localBasepoints.fundingPubkey).script;
+			const anchorOutputIndex = commitmentTx.outs.findIndex((o) =>
+				o.script.equals(anchorScript)
+			);
+			if (anchorOutputIndex < 0) return; // our anchor trimmed — nothing to bump with
+			const outsSum = commitmentTx.outs.reduce(
+				(s, o) => s + BigInt(o.value),
+				0n
+			);
+			const parentFeeSats =
+				state.fundingSatoshis > outsSum ? state.fundingSatoshis - outsSum : 0n;
+			const cpfpAction: IFeeBumpAndBroadcastChainAction = {
+				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
+				kind: 'anchor-cpfp',
+				tx: commitmentTx.toBuffer(),
+				description: 'peer commitment anchor CPFP',
+				feeratePerVbyte: feeRatePerVbyte,
+				anchorOutputIndex,
+				anchorWitnessScript: taprootAnchor
+					? Buffer.alloc(0)
+					: buildAnchorScript(state.localBasepoints.fundingPubkey),
+				parentVbytes: commitmentTx.virtualSize(),
+				parentFeeSats,
+				commitmentTxid: commitmentTx.getId(),
+				...(taprootAnchor
+					? {
+							taprootAnchorScript: taprootAnchor.output,
+							taprootAnchorMerkleRoot: taprootAnchor.merkleRoot,
+							taprootAnchorKeyRole: 'payment' as const
+					  }
+					: {})
+			};
+			void this._handleFeeBumpAndBroadcast(channelId, cpfpAction);
+			this._pendingCommitmentCpfp.set(idHex, {
+				action: cpfpAction,
+				broadcastHeight: this._currentBlockHeight,
+				lastFeeRate: feeRatePerVbyte
+			});
+		} catch (err) {
+			this.emit(
+				'error',
+				channelId,
+				`peer commitment anchor CPFP setup failed: ${(err as Error).message}`
+			);
+		}
+	}
+
+	/**
 	 * Re-CPFP any anchor force-close commitment package that is still unconfirmed,
 	 * bidding a higher (live) feerate so a fee spike AFTER the original broadcast
 	 * cannot pin the commitment. The initial CPFP is one-shot; without this a stuck
@@ -8713,7 +8846,9 @@ export class ChannelManager extends EventEmitter {
 	 *
 	 * Driven by the node each block with a live feerate (the ChannelManager has no fee
 	 * estimator). An entry is dropped once its monitor leaves WATCHING (the commitment
-	 * confirmed, or the channel otherwise resolved).
+	 * confirmed, or the channel otherwise resolved). The entry may also carry the
+	 * PEER's mempool commitment (_maybeCpfpTheirCommitment, issue #559); the same
+	 * re-bid applies, and the parent re-broadcast re-inserts it if evicted.
 	 *
 	 * @param blockHeight - current chain tip
 	 * @param feeRatePerVbyte - live force-close feerate from the node's estimator
@@ -8974,6 +9109,23 @@ export class ChannelManager extends EventEmitter {
 			delayedSecret,
 			point,
 			state.localBasepoints.delayedPaymentBasepoint
+		);
+	}
+
+	/**
+	 * The private key that spends OUR anchor on the PEER's taproot commitment
+	 * (issue #559): the remote anchor there is keyed to our static to_remote
+	 * payment basepoint, so the basepoint secret itself signs (no
+	 * per-commitment derivation — deriveCommitmentKeys uses the basepoint raw).
+	 * Same secret resolution the chain monitor uses for the to_remote sweep.
+	 */
+	private _channelPaymentBasepointSecret(channelId: Buffer): Buffer {
+		const channel = this.channels.get(channelId.toString('hex'));
+		const perCh = this.perChannelMonitorKeys(channel);
+		return (
+			perCh?.paymentBasepointSecret ||
+			this.config.paymentBasepointSecret ||
+			this.config.localFundingPrivkey
 		);
 	}
 
