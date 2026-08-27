@@ -2586,7 +2586,32 @@ export class ChannelManager extends EventEmitter {
 	 */
 	restoreMonitor(channelId: string, monitor: ChainMonitor): void {
 		this.monitors.set(channelId, monitor);
+		this._harvestMonitorPreimages(monitor);
 		this._seedMonitorPreimages(channelId, monitor);
+	}
+
+	/**
+	 * Recover a preimage that is durable only in a restored monitor's state
+	 * (issue 557). handleOutputSpent persists the monitor, whose spend scan
+	 * already stored the learned preimage in knownPreimages, and routes the
+	 * PREIMAGE_LEARNED action into a separate later commit; a crash between
+	 * the two strands the preimage here. The next boot's re-reported spend is
+	 * dropped as already recorded and the fresh scan is suppressed by the
+	 * knownPreimages dedup, so without this harvest the inbound HTLC of the
+	 * forward is never fulfilled and the forwarded amount is lost. The node
+	 * re-records every stored preimage into _knownPreimages before monitors
+	 * are restored, so an entry missing from it is exactly a stranded one:
+	 * re-emitting preimage:learned re-runs the full consumption path (durable
+	 * node-store save, monitor seeding, upstream settle now or at the
+	 * reestablish tail). The typeof guard tolerates stub monitors.
+	 */
+	private _harvestMonitorPreimages(monitor: ChainMonitor): void {
+		if (typeof monitor.getKnownPreimages !== 'function') return;
+		for (const [hashHex, preimage] of monitor.getKnownPreimages()) {
+			if (this._knownPreimages.has(hashHex)) continue;
+			this._knownPreimages.set(hashHex, preimage);
+			this.emit('preimage:learned', Buffer.from(hashHex, 'hex'), preimage);
+		}
 	}
 
 	/**

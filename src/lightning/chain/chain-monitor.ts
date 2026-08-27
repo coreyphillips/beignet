@@ -481,6 +481,15 @@ export class ChainMonitor {
 	}
 
 	/**
+	 * Preimages this monitor holds (scanned from on-chain spends, or seeded by
+	 * the manager), keyed by payment-hash hex. The manager harvests these on
+	 * restore to recover a preimage a crash left durable only here.
+	 */
+	getKnownPreimages(): ReadonlyMap<string, Buffer> {
+		return this._knownPreimages;
+	}
+
+	/**
 	 * Called when the funding outpoint is spent on-chain.
 	 * Classifies the spending transaction and begins output resolution.
 	 */
