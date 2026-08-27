@@ -24,6 +24,8 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IFundingProvider } from '../../src/lightning/node/types';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
+import { MessageType } from '../../src/lightning/message/types';
+import { encodeErrorMessage } from '../../src/lightning/message/error';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -113,7 +115,10 @@ interface IPair {
 	bob: LightningNode;
 }
 
-function nodePair(aliceProvider?: IFundingProvider): IPair {
+function nodePair(
+	aliceProvider?: IFundingProvider,
+	opts?: { bobTrustsAlice?: boolean }
+): IPair {
 	const alice = new LightningNode({
 		...makeNodeConfig(1),
 		...(aliceProvider ? { fundingProvider: aliceProvider } : {})
@@ -134,7 +139,9 @@ function nodePair(aliceProvider?: IFundingProvider): IPair {
 		}
 	});
 	alice.addTrustedPeer(bob.getNodeId());
-	bob.addTrustedPeer(alice.getNodeId());
+	if (opts?.bobTrustsAlice !== false) {
+		bob.addTrustedPeer(alice.getNodeId());
+	}
 	return { alice, bob };
 }
 
@@ -280,6 +287,109 @@ describe('LightningNode.openZeroConfChannelAndWait (issue #572)', function () {
 			error = (err as Error).message;
 		}
 		expect(error).to.match(/not ready within 100ms/);
+	});
+
+	it('a foreign AUTO_FUNDING_FAILED does not reject this wait', async function () {
+		// AUTO_FUNDING_FAILED carries no channel id: with two concurrent
+		// opens, one wallet failure must not reject every unfunded wait.
+		// The v1 failure path is scoped through channel:aborted instead.
+		const pair = nodePair(
+			autofundProvider(
+				() =>
+					new Promise<{
+						inputs: ISpliceWalletInput[];
+						changeScript: Buffer;
+					}>(() => {})
+			)
+		);
+		pairs.push(pair);
+		const { alice, bob } = pair;
+		wireDualFundPeer(alice, bob.getNodeId());
+
+		const wait = alice.openZeroConfChannelAndWait(
+			bob.getNodeId(),
+			150_000n,
+			400
+		);
+		alice.emit('node:error', {
+			code: 'AUTO_FUNDING_FAILED',
+			message: 'some other open ran out of coins',
+			timestamp: Date.now()
+		});
+
+		let error = '';
+		try {
+			await wait;
+		} catch (err) {
+			error = (err as Error).message;
+		}
+		// The wait survived the foreign failure and only the timeout ended it.
+		expect(error).to.match(/not ready within 400ms/);
+	});
+
+	it('throws immediately when the peer rejects the open inside openChannel', async function () {
+		// A synchronous transport settles bob's zero-conf refusal (alice is
+		// not in HIS trusted set) before any listener could exist: the
+		// terminal check fails the call now instead of burning the timeout.
+		const pair = nodePair(undefined, { bobTrustsAlice: false });
+		pairs.push(pair);
+		const { alice, bob } = pair;
+		wireDualFundPeer(alice, bob.getNodeId());
+
+		let error = '';
+		const started = Date.now();
+		try {
+			await alice.openZeroConfChannelAndWait(bob.getNodeId(), 150_000n);
+		} catch (err) {
+			error = (err as Error).message;
+		}
+		expect(error).to.match(/channel open failed/);
+		expect(Date.now() - started).to.be.lessThan(2_000);
+	});
+
+	it('a scoped error that leaves the open ERRORED rejects the wait fast', async function () {
+		// Not every fatal opening failure says "v2 open not funded": a BOLT 1
+		// error from the peer scoped to this open fails the channel with its
+		// own message, and the wait must settle on it rather than time out.
+		const pair = nodePair(
+			autofundProvider(
+				() =>
+					new Promise<{
+						inputs: ISpliceWalletInput[];
+						changeScript: Buffer;
+					}>(() => {})
+			)
+		);
+		pairs.push(pair);
+		const { alice, bob } = pair;
+		wireDualFundPeer(alice, bob.getNodeId());
+
+		const wait = alice.openZeroConfChannelAndWait(bob.getNodeId(), 150_000n);
+		// The open_channel2 already went to bob; alice's channel is the only
+		// temp-resident one. Fail it with a peer error scoped to its id.
+		const mgr = alice.getChannelManager();
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const temp = [...(mgr as any).tempChannels.values()][0] as {
+			getTemporaryChannelId(): Buffer;
+		};
+		alice.handlePeerMessage(
+			bob.getNodeId(),
+			MessageType.ERROR,
+			encodeErrorMessage({
+				channelId: temp.getTemporaryChannelId(),
+				data: Buffer.from('no thanks', 'ascii')
+			})
+		);
+
+		let error = '';
+		const started = Date.now();
+		try {
+			await wait;
+		} catch (err) {
+			error = (err as Error).message;
+		}
+		expect(error).to.match(/channel open failed/);
+		expect(Date.now() - started).to.be.lessThan(2_000);
 	});
 
 	it('throws synchronously for an untrusted peer', function () {

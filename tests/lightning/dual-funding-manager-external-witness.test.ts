@@ -142,7 +142,14 @@ const FEERATE_PERKW = 1000;
  * then drive the registered contribution (neither manager has a funding
  * provider, so any selection attempt would fail loudly).
  */
-function driveToWithhold(): IWithholdSetup {
+function driveToWithhold(opts?: {
+	/**
+	 * Stop delivering the peer's (B-to-A) messages at the first one of this
+	 * type, leaving it and everything after queued: lets a test observe the
+	 * opener BEFORE the peer's tx_signatures arrive.
+	 */
+	holdPeerFrom?: MessageType;
+}): IWithholdSetup {
 	const sideA = makeSide();
 	const sideB = makeSide();
 	const mgrA = new ChannelManager(sideA.config);
@@ -174,11 +181,15 @@ function driveToWithhold(): IWithholdSetup {
 		}
 	);
 
-	// A-to-B queued (drained by pump), B-to-A synchronous: the opener's
-	// contribution registers before its open_channel2 is delivered.
+	// Both directions queued and relayed by pump(), so the opener's
+	// contribution registers before its open_channel2 is delivered and a
+	// test can hold the peer's later messages back (holdPeerFrom). Each
+	// A-to-B delivery is followed by draining B's responses, matching the
+	// per-direction FIFO a real transport gives.
 	const aSent: number[] = [];
 	const bSent: number[] = [];
 	const aToB: Array<[number, Buffer]> = [];
+	const bToA: Array<[number, Buffer]> = [];
 	mgrA.on(
 		'message:outbound',
 		(_peer: string, type: number, payload: Buffer) => {
@@ -190,13 +201,33 @@ function driveToWithhold(): IWithholdSetup {
 		'message:outbound',
 		(_peer: string, type: number, payload: Buffer) => {
 			bSent.push(type);
-			mgrA.handleMessage(sideB.pubkey, type, payload);
+			bToA.push([type, payload]);
 		}
 	);
+	const deliverPeerQueue = (): boolean => {
+		let moved = false;
+		while (bToA.length > 0) {
+			if (
+				opts?.holdPeerFrom !== undefined &&
+				bToA[0][0] === opts.holdPeerFrom
+			) {
+				return moved;
+			}
+			const [type, payload] = bToA.shift()!;
+			mgrA.handleMessage(sideB.pubkey, type, payload);
+			moved = true;
+		}
+		return moved;
+	};
 	const pump = (): void => {
-		while (aToB.length > 0) {
-			const [type, payload] = aToB.shift()!;
-			mgrB.handleMessage(sideA.pubkey, type, payload);
+		let progressed = true;
+		while (progressed) {
+			progressed = deliverPeerQueue();
+			if (aToB.length > 0) {
+				const [type, payload] = aToB.shift()!;
+				mgrB.handleMessage(sideA.pubkey, type, payload);
+				progressed = true;
+			}
 		}
 	};
 
@@ -523,6 +554,37 @@ describe('ChannelManager.provideV2ExternalWitness (issue #572)', function () {
 		s.pump();
 		expect(s.chA.getState()).to.equal(ChannelState.NORMAL);
 		expect(acceptorChannel(s.mgrB)!.getState()).to.equal(ChannelState.NORMAL);
+	});
+
+	it('a PREMATURE channel_ready (before the peer signed) is refused, not recorded', function () {
+		// The early tolerance requires the peer's tx_signatures to already be
+		// in: a ready recorded any earlier would WEDGE the open, because
+		// handleTxSignatures ignores everything once remoteChannelReady is
+		// set and the release would wait forever for signatures that can no
+		// longer land (issue #572 review).
+		const s = driveToWithhold({ holdPeerFrom: MessageType.TX_SIGNATURES });
+		expect(s.chA.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		const record = s.chA.getFullState().v2InFlight!;
+		expect(record.receivedTxSignatures, 'peer signatures held back').to.equal(
+			false
+		);
+		const permanentId = s.chA.getChannelId()!;
+		const chB = acceptorChannel(s.mgrB)!;
+
+		s.mgrA.handleMessage(
+			s.sideB.pubkey,
+			MessageType.CHANNEL_READY,
+			earlyChannelReadyFrom(chB, permanentId)
+		);
+
+		expect(
+			s.errors.some((e) => /Unexpected channel_ready/.test(e)),
+			`premature ready refused (got: ${s.errors.join(' | ')})`
+		).to.equal(true);
+		expect(
+			s.chA.getFullState().remoteChannelReady ?? false,
+			'nothing recorded'
+		).to.equal(false);
 	});
 
 	it('the early-ready arm does not loosen the gate before the commitment exchange', function () {

@@ -213,6 +213,23 @@ describe('WalletFundingProvider directed UTXO selection (issue #572)', function 
 		expect(total >= 50_000n).to.equal(true);
 	});
 
+	it('an uppercase named txid selects the same coin (case-normalized)', async function () {
+		const w = makeWallet([100_000, 30_000]);
+		const provider = new WalletFundingProvider(w.wallet as never);
+		const named = w.utxos[1];
+
+		const result = await provider.selectDualFundingInputs(
+			10_000n,
+			1000,
+			true,
+			false,
+			{ utxos: [{ txid: named.tx_hash.toUpperCase(), vout: named.tx_pos }] }
+		);
+		expect(selectedOutpoints(result.inputs)).to.deep.equal([
+			`${named.tx_hash}:${named.tx_pos}`
+		]);
+	});
+
 	it('selectSpliceInputs honors the same opts', async function () {
 		const w = makeWallet([100_000, 50_000, 30_000]);
 		const provider = new WalletFundingProvider(w.wallet as never);

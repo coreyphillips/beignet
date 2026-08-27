@@ -3159,6 +3159,22 @@ export class LightningNode extends EventEmitter {
 			});
 		});
 
+		// A splice negotiation was unwound by tx_abort (the peer's initiating
+		// abort, or the echo answering ours) and the channel is back in
+		// NORMAL. Relayed so a caller waiting on the splice (spliceInAndWait,
+		// the JIT engine) settles now instead of burning its timeout (issue
+		// #572).
+		this.channelManager.on(
+			'splice:aborted',
+			(channelId: Buffer, reason: string) => {
+				this.emitStructuredLog('channel', 'splice_aborted', {
+					channelId: channelId.toString('hex'),
+					reason
+				});
+				this.emit('splice:aborted', { channelId, reason });
+			}
+		);
+
 		// A channel was failed by a BOLT 1 error (received or sent). Drive the
 		// prescription to its conclusion: fail the channel ON CHAIN, rather than
 		// leaving ERRORED in limbo waiting for a peer broadcast that may never
@@ -7945,13 +7961,17 @@ export class LightningNode extends EventEmitter {
 	 * Open a zero-conf channel with a trusted peer and wait for it to reach
 	 * NORMAL, resolving with the funding-derived channel id (issue #572). The
 	 * id changes from temporary to permanent during the open, so the wait
-	 * holds the Channel object rather than an id. Funding failures reject
-	 * fast instead of spinning to the timeout, so a caller's retry loop (the
-	 * JIT engine) can engage: the v1 route aborts via channel:aborted after
-	 * AUTO_FUNDING_FAILED, the v2 route surfaces "v2 open not funded" as a
-	 * CHANNEL_ERROR and its abort teardown terminates in channel:voided.
-	 * Throws synchronously whatever openChannel throws (untrusted peer, no
-	 * fee estimate, invalid params).
+	 * holds the Channel object rather than an id. Failures reject fast
+	 * instead of spinning to the timeout, so a caller's retry loop (the JIT
+	 * engine) can engage, and every failure signal is SCOPED to this open:
+	 * channel:aborted by our temporary id (the v1 funding-failure teardown),
+	 * CHANNEL_ERROR by our id (the v2 "v2 open not funded" failure, or any
+	 * error leaving this channel ERRORED, such as a peer's synchronous
+	 * rejection), and channel:voided (the v2 abort teardown terminal). An
+	 * open already dead when openChannel returns (a synchronous transport
+	 * can settle the rejection inside the call) throws immediately. Throws
+	 * synchronously whatever openChannel throws (untrusted peer, no fee
+	 * estimate, invalid params).
 	 */
 	async openZeroConfChannelAndWait(
 		peerPubkey: string,
@@ -7967,11 +7987,28 @@ export class LightningNode extends EventEmitter {
 			false,
 			true
 		);
-		// A synchronous transport can complete the whole open inside
-		// openChannel (zero-conf needs no confirmation), so check before
-		// subscribing.
+		// A synchronous transport can settle the whole open inside openChannel
+		// (zero-conf needs no confirmation), in EITHER direction: complete to
+		// NORMAL, or reject and tear down before any listener below exists.
+		// Check both before subscribing so an already-dead open fails now
+		// instead of burning the full timeout (issue #572 review).
 		if (channel.getState() === ChannelState.NORMAL) {
 			return channel.getChannelId()!;
+		}
+		const terminalReason = (): string | null => {
+			if (channel.getState() === ChannelState.ERRORED) {
+				return 'channel errored';
+			}
+			const cid = channel.getChannelId();
+			const tracked =
+				this.channelManager.getTempChannel(channel.getTemporaryChannelId()) ===
+					channel ||
+				(cid !== null && this.channelManager.getChannel(cid) === channel);
+			return tracked ? null : 'open was torn down';
+		};
+		const early = terminalReason();
+		if (early !== null) {
+			throw new Error(`channel open failed: ${early}`);
 		}
 		const matchesOpen = (id: Buffer): boolean => {
 			const cid = channel.getChannelId();
@@ -8032,25 +8069,31 @@ export class LightningNode extends EventEmitter {
 				cleanup();
 				reject(new Error('channel open aborted: v2 open torn down'));
 			};
+			// AUTO_FUNDING_FAILED itself is deliberately NOT watched: it
+			// carries no channel id, so with two concurrent opens one wallet
+			// failure would reject every unfunded wait while the other open
+			// kept running (issue #572 review). The v1 failure path always
+			// follows it with abortPendingOpen, whose channel:aborted above
+			// names OUR temporary id: that is the scoped signal.
 			const onError = (err: ILightningError): void => {
-				// Unscoped v1 fallback: AUTO_FUNDING_FAILED names no channel,
-				// so only treat it as ours while our open is still unfunded.
 				if (
-					err.code === 'AUTO_FUNDING_FAILED' &&
-					!channel.getFullState().fundingTxid
+					err.code !== 'CHANNEL_ERROR' ||
+					err.channelId === undefined ||
+					!matchesOpen(err.channelId)
 				) {
-					cleanup();
-					reject(new Error(`auto-funding failed: ${err.message}`));
 					return;
 				}
+				// Scoped to this open: the v2 funding failure by message, or
+				// any error that left the channel terminally ERRORED (a
+				// peer's synchronous rejection, a failed negotiation). A
+				// scoped diagnostic on a still-live channel (dispatch
+				// failures deliberately do not abort) keeps waiting.
 				if (
-					err.code === 'CHANNEL_ERROR' &&
-					/^v2 open not funded/.test(err.message) &&
-					err.channelId !== undefined &&
-					matchesOpen(err.channelId)
+					/^v2 open not funded/.test(err.message) ||
+					channel.getState() === ChannelState.ERRORED
 				) {
 					cleanup();
-					reject(new Error(`auto-funding failed: ${err.message}`));
+					reject(new Error(`channel open failed: ${err.message}`));
 				}
 			};
 
@@ -8684,11 +8727,28 @@ export class LightningNode extends EventEmitter {
 			 * display byte order), e.g. to channelize a specific deposit
 			 * (issue #572). All named coins are contributed; allowTopUp
 			 * permits adding other spendable coins when they fall short of
-			 * amount + fee. Incompatible with fundMax.
+			 * amount + fee. Requires a funding provider that can select
+			 * wallet inputs, and the returned selection is verified against
+			 * the named outpoints before it funds anything. Incompatible
+			 * with fundMax and contribution.
 			 */
 			fundingUtxos?: {
 				utxos: Array<{ txid: string; vout: number }>;
 				allowTopUp?: boolean;
+			};
+			/**
+			 * Register the opener's funding inputs (possibly carrying
+			 * EXTERNAL ones, issue #572) before the open_channel2 goes out,
+			 * bypassing wallet selection entirely. This is the race-free way
+			 * to fund an open with caller-built inputs: it wins over
+			 * auto-funding in every message ordering, including a fully
+			 * synchronous transport. Incompatible with fundMax, fundingUtxos
+			 * and requestFunds (a lease fee is only known at accept time and
+			 * cannot be added to a pre-built contribution).
+			 */
+			contribution?: {
+				inputs: import('../channel/channel').ISpliceWalletInput[];
+				changeScript: Buffer;
 			};
 		}
 	): Channel {
@@ -8720,6 +8780,22 @@ export class LightningNode extends EventEmitter {
 				'max funding cannot be combined with fundingUtxos (a max open already sweeps every spendable UTXO)'
 			);
 		}
+		if (params.contribution) {
+			if (params.fundMax || params.fundingUtxos || params.requestFunds) {
+				throw new InvalidChannelOpenError(
+					'contribution cannot be combined with fundMax, fundingUtxos or requestFunds (it replaces wallet selection outright)'
+				);
+			}
+			if (
+				!Array.isArray(params.contribution.inputs) ||
+				params.contribution.inputs.length === 0 ||
+				!Buffer.isBuffer(params.contribution.changeScript)
+			) {
+				throw new InvalidChannelOpenError(
+					'contribution needs a non-empty inputs array and a changeScript Buffer'
+				);
+			}
+		}
 		if (params.fundingUtxos) {
 			const list = params.fundingUtxos.utxos;
 			if (!Array.isArray(list) || list.length === 0) {
@@ -8738,6 +8814,17 @@ export class LightningNode extends EventEmitter {
 						'fundingUtxos.utxos entries need a non-negative integer vout'
 					);
 				}
+			}
+			// Directed funding needs a provider that can select wallet inputs
+			// AT ALL; without one the open would stall silently as a legacy
+			// caller-driven negotiation nobody drives (issue #572 review).
+			// Retryable and typed, mirroring the fee-estimate refusal.
+			const fp = this.fundingProvider;
+			if (!fp?.selectDualFundingInputs && !fp?.selectSpliceInputs) {
+				throw new ChannelFundingUnavailableError(
+					ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED,
+					'fundingUtxos requires a funding provider that can select wallet inputs (selectDualFundingInputs or selectSpliceInputs)'
+				);
 			}
 		}
 		// open_channel2 carries all three as u32. Same reason as splice_init:
@@ -8782,11 +8869,25 @@ export class LightningNode extends EventEmitter {
 			maxLeaseRates: params.maxLeaseRates,
 			channelType: params.channelType,
 			fundMax: params.fundMax,
+			// Txids case-normalized here so every downstream comparison
+			// (provider selection, directed-selection verification) sees the
+			// wallet's lowercase form.
 			fundingUtxos: params.fundingUtxos
+				? {
+						utxos: params.fundingUtxos.utxos.map((u) => ({
+							txid: u.txid.toLowerCase(),
+							vout: u.vout
+						})),
+						...(params.fundingUtxos.allowTopUp !== undefined
+							? { allowTopUp: params.fundingUtxos.allowTopUp }
+							: {})
+				  }
+				: undefined
 		};
 
 		return this.channelManager.createDualFundedChannel(peerPubkey, dualParams, {
-			trusted: params.trusted
+			trusted: params.trusted,
+			contribution: params.contribution
 		});
 	}
 
@@ -9831,10 +9932,12 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Splice-in and wait for the splice to lock (issue #572): resolves on the
 	 * splice:complete event for this channel, rejects on a SPLICE_IN_FAILED
-	 * node error scoped to it or on timeout. The channel id is stable across
-	 * a splice, so both signals scope precisely. Listeners are registered
-	 * BEFORE spliceIn runs so a synchronous transport cannot lose the
-	 * completion; a synchronous spliceIn refusal throws.
+	 * node error scoped to it, on splice:aborted for it (a peer tx_abort
+	 * unwinds the splice back to NORMAL without any failure error), or on
+	 * timeout. The channel id is stable across a splice, so every signal
+	 * scopes precisely. Listeners are registered BEFORE spliceIn runs so a
+	 * synchronous transport cannot lose the completion; a synchronous
+	 * spliceIn refusal (returned or thrown) unwinds the wait and throws.
 	 */
 	async spliceInAndWait(
 		channelId: Buffer,
@@ -9858,11 +9961,12 @@ export class LightningNode extends EventEmitter {
 			const cleanup = (): void => {
 				clearTimeout(timer);
 				this.removeListener('splice:complete', onComplete);
+				this.removeListener('splice:aborted', onSpliceAborted);
 				this.removeListener('node:error', onError);
 				this._activeWaitCleanups.delete(destroyCleanup);
 			};
-			// Some spliceIn refusals return without emitting SPLICE_IN_FAILED
-			// (unknown channel); the sync-throw path below unwinds through
+			// Some spliceIn refusals return (or throw) without emitting
+			// SPLICE_IN_FAILED; the sync failure paths below unwind through
 			// this so the timer and listeners never outlive the call.
 			cancelWait = cleanup;
 
@@ -9877,6 +9981,17 @@ export class LightningNode extends EventEmitter {
 				cleanup();
 				resolve();
 			};
+			// A peer tx_abort unwinds the splice back to NORMAL without any
+			// SPLICE_IN_FAILED; without this arm the wait burned its full
+			// timeout on a splice that was already over (issue #572 review).
+			const onSpliceAborted = (data: {
+				channelId: Buffer;
+				reason: string;
+			}): void => {
+				if (data.channelId.toString('hex') !== cidHex) return;
+				cleanup();
+				reject(new Error(data.reason));
+			};
 			const onError = (err: ILightningError): void => {
 				if (err.code !== 'SPLICE_IN_FAILED') return;
 				if (err.channelId?.toString('hex') !== cidHex) return;
@@ -9885,6 +10000,7 @@ export class LightningNode extends EventEmitter {
 			};
 
 			this.on('splice:complete', onComplete);
+			this.on('splice:aborted', onSpliceAborted);
 			this.on('node:error', onError);
 		});
 		// Absorb the rejection when an emitted SPLICE_IN_FAILED settles the
@@ -9892,11 +10008,15 @@ export class LightningNode extends EventEmitter {
 		// leaves `done` behind as an unhandled rejection.
 		done.catch(() => undefined);
 
-		const result = this.spliceIn(
-			channelId,
-			amountSats,
-			fundingFeeratePerkw ?? 253
-		);
+		let result: { ok: boolean; error?: string };
+		try {
+			result = this.spliceIn(channelId, amountSats, fundingFeeratePerkw ?? 253);
+		} catch (err) {
+			// Validation throws (InvalidSpliceError) must not leave the timer
+			// and listeners armed for the full window.
+			cancelWait();
+			throw err;
+		}
 		if (!result.ok) {
 			cancelWait();
 			throw new Error(result.error ?? 'splice-in failed to start');

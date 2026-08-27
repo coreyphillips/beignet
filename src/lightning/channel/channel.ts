@@ -2576,14 +2576,25 @@ export class Channel {
 		// send its ready before OUR tx_signatures have left, and a withheld
 		// external witness (issue #572) makes that window arbitrarily long.
 		// The commitment exchange is complete (a durable v2InFlight record
-		// exists), so the ready is legitimate: record it below and hold the
-		// state, and the release path consumes remoteChannelReady to complete
-		// straight to NORMAL when our signatures finally go out. Evaluated
-		// after the RBF-abandon arms above, which may have already moved a
-		// superseded attempt out of AWAITING_TX_SIGNATURES.
+		// exists) AND the peer's own tx_signatures are already in hand (they
+		// live in the session until OUR release completes the exchange;
+		// receivedTxSignatures on the record only flips at completion), so
+		// the ready is legitimate: record it below and hold the state, and
+		// the release path consumes remoteChannelReady to complete straight
+		// to NORMAL when our signatures finally go out. The witnesses-in-hand
+		// requirement is load-bearing, not pedantry: an eager first-signer
+		// sends ready AFTER its signatures (ordered transport delivers them
+		// first), while a ready accepted any earlier would WEDGE the open,
+		// because handleTxSignatures ignores everything once
+		// remoteChannelReady is set (the BOLT 2 exchange-over gate) and the
+		// release would wait forever for signatures that can no longer land.
+		// Evaluated after the RBF-abandon arms above, which may have already
+		// moved a superseded attempt out of AWAITING_TX_SIGNATURES.
 		const earlyDuringV2Sigs =
 			this._state.state === ChannelState.AWAITING_TX_SIGNATURES &&
-			this._state.v2InFlight != null;
+			this._state.v2InFlight != null &&
+			(this._state.v2InFlight.receivedTxSignatures === true ||
+				this._state.dualFundingSession?.getRemoteWitnesses() != null);
 		if (
 			this._state.state !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
 			this._state.state !== ChannelState.AWAITING_CHANNEL_READY &&

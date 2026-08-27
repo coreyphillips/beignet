@@ -744,12 +744,15 @@ export class WalletFundingProvider implements IFundingProvider {
 			// selection outright rather than being silently skipped (the
 			// caller named it for a reason, e.g. channelizing that deposit).
 			for (const wanted of opts.utxos) {
+				// Case-normalized: the public API accepts uppercase hex while
+				// the wallet reports lowercase tx_hash values.
+				const wantedTxid = wanted.txid.toLowerCase();
 				const match = candidates.find(
-					(u) => u.tx_hash === wanted.txid && u.tx_pos === wanted.vout
+					(u) => u.tx_hash === wantedTxid && u.tx_pos === wanted.vout
 				);
 				if (!match) {
 					throw new Error(
-						`requested funding utxo not spendable: ${wanted.txid}:${wanted.vout}`
+						`requested funding utxo not spendable: ${wantedTxid}:${wanted.vout}`
 					);
 				}
 				if (selected.includes(match)) continue;
