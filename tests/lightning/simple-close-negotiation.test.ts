@@ -619,6 +619,41 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 			expect(h.bobTxs.length).to.equal(0);
 		});
 
+		it('force close exits a negotiation wedged on a rejected locktime', function () {
+			const h = negotiatingHarness(31, 32);
+			h.bobChannel.setBlockHeight(800_000);
+			const errors: string[] = [];
+			h.bob.on('error', (_id, msg: string) => errors.push(msg));
+
+			h.bob.handleMessage(
+				h.aPub,
+				MessageType.CLOSING_COMPLETE,
+				craftedClosingComplete(h, { locktime: 499_999_999 })
+			);
+			expect(errors.some((e) => /beyond our chain tip/.test(e))).to.equal(true);
+			expect(h.bobChannel.getState()).to.equal(
+				ChannelState.NEGOTIATING_CLOSING
+			);
+
+			// The refusal must not strand the channel: the peer may never send
+			// an acceptable locktime, so the unilateral exit has to be available
+			// from NEGOTIATING_CLOSING while the peer is still connected.
+			const destScript = Buffer.from('0014' + 'ee'.repeat(20), 'hex');
+			const result = h.bob.forceClose(h.channelId, destScript, 10);
+			expect(result.ok).to.equal(true);
+			const broadcast = result.actions.find(
+				(a) => a.type === ChannelActionType.BROADCAST_TX
+			) as { tx: Buffer } | undefined;
+			expect(broadcast).to.exist;
+			const bobState = h.bobChannel.getFullState();
+			const commitment = bitcoin.Transaction.fromBuffer(broadcast!.tx);
+			expect(
+				commitment.ins[0].hash.equals(bobState.fundingTxid!),
+				'commitment spends the funding outpoint'
+			).to.equal(true);
+			expect(h.bobChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+		});
+
 		it('blocks a second closing_complete while awaiting closing_sig (RBF gate)', function () {
 			const h = negotiatingHarness(15, 16);
 			h.alice.on('error', () => {}); // guard emits error; observed via result

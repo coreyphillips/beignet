@@ -5464,6 +5464,15 @@ export class Channel {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			// NEGOTIATING_CLOSING for the same reason as SHUTTING_DOWN: a
+			// negotiation the peer wedges (a closing_complete we refuse, e.g.
+			// over its locktime, with nothing acceptable ever following) has no
+			// other exit while the peer stays connected, and this method is the
+			// one gate both the operator and the stuck-channel scan go through.
+			// Fund-safe: negotiation admits no pending HTLCs, and any close the
+			// peer completes from our earlier signatures spends the same funding
+			// output for the same final balances as our commitment.
+			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
 			this._state.state !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
 			this._state.state !== ChannelState.AWAITING_CHANNEL_READY &&
 			this._state.state !== ChannelState.AWAITING_REESTABLISH &&
