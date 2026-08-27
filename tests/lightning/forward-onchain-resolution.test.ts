@@ -17,6 +17,7 @@ import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
+	ChannelState,
 	HtlcDirection,
 	HtlcState,
 	IHtlcEntry,
@@ -283,6 +284,75 @@ describe('S-2.M3: on-chain timeout of a forwarded outgoing leg', function () {
 		expect(malformedCalls).to.have.length(1);
 		expect(malformedCalls[0].failureCode).to.equal(INVALID_ONION_BLINDING);
 		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(false);
+
+		fx.alice.destroy();
+		fx.bob.destroy();
+		fx.carol.destroy();
+	});
+
+	it('retains the forward linkage when the inbound fulfill is refused (issue 558)', () => {
+		const fx = setupForwardWithResolvingOutgoingLeg();
+		const { alice, inChannelId, outChannelId, outKey } = fx;
+
+		// A real preimage/hash pair on both legs: the eventual fulfill
+		// verifies sha256(preimage) against the HTLC's payment hash.
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const inChan = (alice as any).channelManager.getChannel(inChannelId);
+		const outChan = (alice as any).channelManager.getChannel(outChannelId);
+		inChan.getFullState().htlcs.get('received-7').paymentHash = paymentHash;
+		outChan.getFullState().htlcs.get('offered-7').paymentHash = paymentHash;
+
+		// The inbound channel is mid-reestablish (restart, or the peer
+		// disconnected) when the downstream HTLC-success confirms on-chain.
+		inChan.getFullState().state = ChannelState.AWAITING_REESTABLISH;
+
+		const UPDATE_FULFILL_HTLC = 130;
+		let fulfillsSentUpstream = 0;
+		alice.on('message:outbound', (pubkey: string, type: number) => {
+			if (pubkey === fx.bob.getNodeId() && type === UPDATE_FULFILL_HTLC)
+				fulfillsSentUpstream++;
+		});
+
+		(alice as any).channelManager.emit(
+			'preimage:learned',
+			paymentHash,
+			preimage
+		);
+
+		// The fulfill was refused (wrong state): no settle went out, the
+		// linkage survives for the retry pass, the inbound HTLC is untouched,
+		// and the preimage is durable on the node for that retry.
+		expect(fulfillsSentUpstream).to.equal(0);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(true);
+		expect(inChan.getFullState().htlcs.get('received-7').state).to.equal(
+			HtlcState.COMMITTED
+		);
+		expect((alice as any).preimages.has(paymentHash.toString('hex'))).to.equal(
+			true
+		);
+
+		// The restore-time redispatch pass still sees the outgoing leg and
+		// skips: no second forward for value the downstream already claimed.
+		let redispatched = 0;
+		(alice as any).handleIncomingHtlc = () => {
+			redispatched++;
+		};
+		inChan.getFullState().htlcs.get('received-7').forwardEmitted = true;
+		(alice as any).redispatchUnresolvedReceivedHtlcs(inChannelId);
+		expect(redispatched).to.equal(0);
+
+		// Reestablish completes: the owed pass settles upstream from the
+		// persisted preimage and only now consumes the linkage.
+		inChan.getFullState().state = ChannelState.NORMAL;
+		(alice as any).channelManager.emit('channel:reestablished', inChannelId);
+
+		expect(fulfillsSentUpstream).to.equal(1);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(false);
+		const inbound = inChan.getFullState().htlcs.get('received-7');
+		expect(
+			inbound === undefined || inbound.state === HtlcState.FULFILLED
+		).to.equal(true);
 
 		fx.alice.destroy();
 		fx.bob.destroy();

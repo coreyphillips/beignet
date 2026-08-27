@@ -14961,6 +14961,10 @@ export class LightningNode extends EventEmitter {
 	 *     hash can be claimed on-chain if its channel force-closes (the core fix).
 	 *  2. Off-chain settle any still-live INBOUND (received) HTLC matching the hash,
 	 *     so a healthy inbound channel resolves cleanly instead of forcing a close.
+	 * A channel that cannot carry the fulfill right now (mid-reestablish after a
+	 * restart or disconnect) is skipped with its forward linkage intact, and
+	 * settleForwardsOwedUpstream completes the settle from the persisted preimage
+	 * at the reestablish tail.
 	 * recordPreimage is idempotent, so re-learning a preimage is harmless.
 	 */
 	private handleOnChainPreimageLearned(
@@ -14989,6 +14993,16 @@ export class LightningNode extends EventEmitter {
 				)
 					continue;
 				if (!htlc.paymentHash.equals(paymentHash)) continue;
+				// The gate that keeps the linkage delete below honest, same
+				// discipline as settleForwardUpstream: a channel that cannot
+				// carry the fulfill refuses it without throwing, and consuming
+				// the forward linkage around that refusal would prime the
+				// restore-time redispatch to re-forward the same inbound HTLC
+				// for value the downstream already claimed on-chain. The
+				// preimage is already durable (saved above), so the retained
+				// linkage lets settleForwardsOwedUpstream finish the settle
+				// when the channel can carry updates again.
+				if (!channel.canFulfillHtlc(htlc.id)) continue;
 				this.cleanupHtlcSharedSecret(`${cid.toString('hex')}:${htlc.id}`);
 				// Re-stage the preimage with the fulfill it authorizes. The
 				// save above already ran, but staging makes the pairing
