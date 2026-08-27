@@ -48,7 +48,8 @@ import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { deriveChannelId } from '../../src/lightning/channel/validation';
 import {
 	classifyOutputs,
-	resolveOurCommitmentOutputs
+	resolveOurCommitmentOutputs,
+	resolveTheirCurrentCommitmentOutputs
 } from '../../src/lightning/chain/output-resolver';
 import { CommitmentType, OutputType } from '../../src/lightning/chain/types';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
@@ -91,6 +92,19 @@ function anchorChannelType(): Buffer {
 	f.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
 	return f.toBuffer();
 }
+function taprootChannelType(): Buffer {
+	const f = FeatureFlags.empty();
+	f.setCompulsory(Feature.STATIC_REMOTE_KEY);
+	f.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+	f.setCompulsory(Feature.OPTION_TAPROOT);
+	return f.toBuffer();
+}
+type ChannelKind = 'legacy' | 'anchor' | 'taproot';
+function channelTypeFor(kind: ChannelKind): Buffer | null {
+	if (kind === 'anchor') return anchorChannelType();
+	if (kind === 'taproot') return taprootChannelType();
+	return null;
+}
 
 interface IHtlcSpec {
 	key: string;
@@ -129,7 +143,7 @@ function makeHtlcSpec(
  */
 function makeChannelPair(
 	specs: IHtlcSpec[],
-	anchor: boolean
+	kind: ChannelKind
 ): {
 	openerState: IChannelState;
 	acceptorState: IChannelState;
@@ -152,7 +166,7 @@ function makeChannelPair(
 		.update(Buffer.from('fund'))
 		.digest();
 	const channelId = deriveChannelId(fundingTxid, 0);
-	const channelType = anchor ? anchorChannelType() : null;
+	const channelType = channelTypeFor(kind);
 
 	const openerState = createOpenerState({
 		temporaryChannelId: crypto.randomBytes(32),
@@ -233,17 +247,20 @@ function makeChannelPair(
 		acceptorState.htlcs.set(s.key, mirror);
 	}
 
-	const acceptorSigner = new ChannelSigner(
-		priv(acceptorSeed, 0),
-		priv(acceptorSeed, 4)
-	);
 	const openerLocalPoint = point(openerCommitSeed, 0n);
-	const { htlcSignatures } = signRemoteCommitment(
-		acceptorState,
-		acceptorSigner,
-		openerLocalPoint
-	);
-	openerState.remoteHtlcSignatures = htlcSignatures;
+	let htlcSignatures: Buffer[] = [];
+	if (kind !== 'taproot') {
+		const acceptorSigner = new ChannelSigner(
+			priv(acceptorSeed, 0),
+			priv(acceptorSeed, 4)
+		);
+		({ htlcSignatures } = signRemoteCommitment(
+			acceptorState,
+			acceptorSigner,
+			openerLocalPoint
+		));
+		openerState.remoteHtlcSignatures = htlcSignatures;
+	}
 
 	return {
 		openerState,
@@ -256,8 +273,9 @@ function makeChannelPair(
 }
 
 describe('HTLC removal-window force-close resolution (issues #561/#556)', function () {
-	for (const anchor of [false, true]) {
-		const label = anchor ? 'anchor' : 'non-anchor';
+	for (const kind of ['legacy', 'anchor'] as const) {
+		const anchor = kind === 'anchor';
+		const label = kind;
 
 		it(`claims a just-fulfilled inbound HTLC via HTLC-success (${label})`, function () {
 			const spec = makeHtlcSpec(
@@ -268,7 +286,7 @@ describe('HTLC removal-window force-close resolution (issues #561/#556)', functi
 				true
 			);
 			const { openerState, openerLocalPoint, openerSeed, htlcSignatures } =
-				makeChannelPair([spec], anchor);
+				makeChannelPair([spec], kind);
 
 			// The broadcast commitment (prepareForceClose uses the same builder)
 			// still carries the HTLC output.
@@ -332,10 +350,13 @@ describe('HTLC removal-window force-close resolution (issues #561/#556)', functi
 		it(`aligns htlcSigIndex across a removal-window output (${label})`, function () {
 			// Three live outputs; the window entry must be counted, or the two
 			// later claims pair with the wrong remote signatures (#556).
+			// The window HTLC is the SMALLEST amount so BIP69 orders its output
+			// FIRST: skipping it would shift every later htlcSigIndex, which is
+			// exactly the #556 failure this test pins.
 			const specs = [
 				makeHtlcSpec(
 					'h0',
-					50_000_000n,
+					20_000_000n,
 					HtlcDirection.RECEIVED,
 					HtlcState.FULFILLED,
 					true
@@ -354,7 +375,7 @@ describe('HTLC removal-window force-close resolution (issues #561/#556)', functi
 				)
 			];
 			const { openerState, openerLocalPoint, openerSeed, htlcSignatures } =
-				makeChannelPair(specs, anchor);
+				makeChannelPair(specs, kind);
 
 			const built = buildLocalCommitment(openerState, openerLocalPoint);
 			expect(built.result.outputMap.htlcs.length).to.equal(3);
@@ -374,6 +395,19 @@ describe('HTLC removal-window force-close resolution (issues #561/#556)', functi
 			expect(htlcOutputs.length, 'every present HTLC output tracked').to.equal(
 				3
 			);
+			// Guard the fixture's premise: the window HTLC's output must come
+			// FIRST among the HTLC outputs, or a skip could not shift anything.
+			const windowHash = crypto
+				.createHash('sha256')
+				.update(specs[0].preimage)
+				.digest();
+			const firstHtlc = htlcOutputs.reduce((a, b) =>
+				a.outputIndex < b.outputIndex ? a : b
+			);
+			expect(
+				firstHtlc.paymentHash!.equals(windowHash),
+				'the window output sorts first'
+			).to.equal(true);
 			// The invariant that broke: the k-th HTLC output of the commitment
 			// (ascending output order) pairs with remoteHtlcSignatures[k].
 			for (const o of htlcOutputs) {
@@ -440,23 +474,29 @@ describe('HTLC removal-window force-close resolution (issues #561/#556)', functi
 		});
 	}
 
-	it('a fully removed entry still never matches (the gate stays strict)', function () {
-		// Removal committed: the builder excludes the output and the matcher
-		// must not resurrect the entry (additive-only fix).
+	it('a fully removed entry never matches an output still present in an old tx', function () {
+		// Build the commitment WHILE the HTLC is live, so the transaction being
+		// classified genuinely CONTAINS the output; then promote the entry to
+		// fully-removed. The matcher must reject the candidate even though the
+		// byte match would succeed: past the window that transaction is a
+		// superseded (revoked-line) commitment, not a claimable current one,
+		// and admitting settled entries unconditionally would track it.
 		const spec = makeHtlcSpec(
 			'h0',
 			50_000_000n,
 			HtlcDirection.RECEIVED,
-			HtlcState.FULFILLED
+			HtlcState.COMMITTED
 		);
-		const { openerState, openerLocalPoint } = makeChannelPair([spec], false);
+		const { openerState, openerLocalPoint } = makeChannelPair([spec], 'legacy');
+		const withHtlc = buildLocalCommitment(openerState, openerLocalPoint);
+		expect(withHtlc.result.outputMap.htlcs.length).to.equal(1);
+
 		const entry = openerState.htlcs.get('h0')!;
+		entry.state = HtlcState.FULFILLED;
 		entry.removalRemoteCommitted = true;
 
-		const built = buildLocalCommitment(openerState, openerLocalPoint);
-		expect(built.result.outputMap.htlcs.length).to.equal(0);
 		const tracked = classifyOutputs(
-			built.result.tx,
+			withHtlc.result.tx,
 			openerState,
 			CommitmentType.OUR_COMMITMENT,
 			0n
@@ -466,7 +506,8 @@ describe('HTLC removal-window force-close resolution (issues #561/#556)', functi
 				(o) =>
 					o.outputType === OutputType.RECEIVED_HTLC ||
 					o.outputType === OutputType.OFFERED_HTLC
-			)
+			),
+			'output present in the tx, entry past the window: not tracked'
 		).to.equal(false);
 	});
 
@@ -484,7 +525,7 @@ describe('HTLC removal-window force-close resolution (issues #561/#556)', functi
 		);
 		const { openerState, acceptorState, acceptorLocalPoint } = makeChannelPair(
 			[spec],
-			false
+			'legacy'
 		);
 
 		// Their commitment is the acceptor's local one; its builder includes
@@ -502,5 +543,141 @@ describe('HTLC removal-window force-close resolution (issues #561/#556)', functi
 			(o) => o.outputType === OutputType.OFFERED_HTLC
 		);
 		expect(htlcOut, 'window OFFERED HTLC tracked on their commitment').to.exist;
+	});
+
+	for (const kind of ['legacy', 'anchor'] as const) {
+		it(`their commitment: a just-fulfilled inbound HTLC stays claimable by preimage (${kind})`, function () {
+			// The peer's CURRENT signed commitment predates our update_fulfill,
+			// so its HTLC output survives our settle until the peer revokes for
+			// the removal. The matcher used to drop the RECEIVED/FULFILLED
+			// entry here, so a peer force-closing right after our fulfill left
+			// the preimage-paid output to its own timeout sweep.
+			const spec = makeHtlcSpec(
+				'h0',
+				50_000_000n,
+				HtlcDirection.RECEIVED,
+				HtlcState.COMMITTED
+			);
+			const { openerState, acceptorState, acceptorLocalPoint, openerSeed } =
+				makeChannelPair([spec], kind);
+
+			// The on-chain tx: the peer's commitment as signed BEFORE the
+			// fulfill (its builder still includes the live HTLC).
+			const theirs = buildLocalCommitment(acceptorState, acceptorLocalPoint);
+			expect(theirs.result.outputMap.htlcs.length).to.equal(1);
+
+			const before = classifyOutputs(
+				theirs.result.tx,
+				openerState,
+				CommitmentType.THEIR_CURRENT_COMMITMENT,
+				0n
+			).filter((o) => o.outputType === OutputType.RECEIVED_HTLC);
+			expect(before.length, 'baseline: live HTLC tracked').to.equal(1);
+
+			// Exactly fulfillHtlc's mutation: preimage revealed, removal begun.
+			const entry = openerState.htlcs.get('h0')!;
+			entry.state = HtlcState.FULFILLED;
+			entry.removalRemoteCommitted = false;
+
+			const after = classifyOutputs(
+				theirs.result.tx,
+				openerState,
+				CommitmentType.THEIR_CURRENT_COMMITMENT,
+				0n
+			).filter((o) => o.outputType === OutputType.RECEIVED_HTLC);
+			expect(
+				after.length,
+				'the SAME tx keeps its HTLC tracked through the window'
+			).to.equal(1);
+
+			// And the tracked output resolves to a real preimage spend.
+			const paymentHash = crypto
+				.createHash('sha256')
+				.update(spec.preimage)
+				.digest();
+			const resolved = resolveTheirCurrentCommitmentOutputs(
+				openerState,
+				after,
+				Buffer.concat([Buffer.from([0x00, 0x14]), Buffer.alloc(20)]),
+				10,
+				new Map([[paymentHash.toString('hex'), spec.preimage]]),
+				priv(openerSeed, 2),
+				priv(openerSeed, 4),
+				acceptorLocalPoint
+			);
+			const claim = resolved.find(
+				(r) => r.trackedOutput.outputType === OutputType.RECEIVED_HTLC
+			);
+			expect(claim?.spendTx, 'preimage claim built').to.exist;
+			expect(claim?.witness, 'preimage claim witnessed').to.exist;
+		});
+	}
+
+	it('taproot: removal-window outputs are tracked with aligned indices (our commitment)', function () {
+		const specs = [
+			makeHtlcSpec(
+				'h0',
+				20_000_000n,
+				HtlcDirection.RECEIVED,
+				HtlcState.FULFILLED,
+				true
+			),
+			makeHtlcSpec(
+				'h1',
+				40_000_000n,
+				HtlcDirection.RECEIVED,
+				HtlcState.COMMITTED
+			)
+		];
+		const { openerState, openerLocalPoint } = makeChannelPair(specs, 'taproot');
+		const built = buildLocalCommitment(openerState, openerLocalPoint);
+		expect(built.result.outputMap.htlcs.length).to.equal(2);
+
+		const tracked = classifyOutputs(
+			built.result.tx,
+			openerState,
+			CommitmentType.OUR_COMMITMENT,
+			0n
+		);
+		const htlcOutputs = tracked.filter(
+			(o) => o.outputType === OutputType.RECEIVED_HTLC
+		);
+		expect(htlcOutputs.length, 'both taproot HTLC outputs tracked').to.equal(2);
+		for (const o of htlcOutputs) {
+			expect(o.htlcSigIndex).to.not.equal(undefined);
+			expect(built.result.outputMap.htlcs[o.htlcSigIndex!]).to.equal(
+				o.outputIndex
+			);
+		}
+	});
+
+	it('taproot: a just-fulfilled inbound HTLC stays tracked on their commitment', function () {
+		const spec = makeHtlcSpec(
+			'h0',
+			50_000_000n,
+			HtlcDirection.RECEIVED,
+			HtlcState.COMMITTED
+		);
+		const { openerState, acceptorState, acceptorLocalPoint } = makeChannelPair(
+			[spec],
+			'taproot'
+		);
+		const theirs = buildLocalCommitment(acceptorState, acceptorLocalPoint);
+		expect(theirs.result.outputMap.htlcs.length).to.equal(1);
+
+		const entry = openerState.htlcs.get('h0')!;
+		entry.state = HtlcState.FULFILLED;
+		entry.removalRemoteCommitted = false;
+
+		const tracked = classifyOutputs(
+			theirs.result.tx,
+			openerState,
+			CommitmentType.THEIR_CURRENT_COMMITMENT,
+			0n
+		);
+		expect(
+			tracked.some((o) => o.outputType === OutputType.RECEIVED_HTLC),
+			'window RECEIVED HTLC tracked on their taproot commitment'
+		).to.equal(true);
 	});
 });

@@ -940,16 +940,30 @@ interface IHtlcMatch {
  * Whether an HTLC entry's output can be PRESENT in the commitment being
  * classified (issue #561). PENDING/COMMITTED entries are candidates as
  * before. A FULFILLED/FAILED entry is a candidate exactly while the
- * commitment builder still includes its output (the two-phase removal
- * window): on OUR commitment a RECEIVED entry until the peer revokes for
- * the removal (removalRemoteCommitted === false, mirroring
- * buildHtlcOutputsForLocal), on THEIR commitment an OFFERED entry until
- * WE revoke for it (removalLocallyRevoked === false, mirroring
- * buildHtlcOutputsForRemote). Without the window arm, a force-close
- * right after fulfilling an inbound HTLC left its output untracked: no
- * HTLC-success despite holding the preimage and the peer's signature,
- * and every later HTLC output's htlcSigIndex shifted onto the wrong
- * remote signature (issue #556).
+ * removal is not irrevocably committed on the classified side (the
+ * two-phase removal window):
+ *
+ * - OUR commitment: a RECEIVED entry until the peer revokes for the
+ *   removal (removalRemoteCommitted === false, mirroring
+ *   buildHtlcOutputsForLocal, which is also what prepareForceClose
+ *   broadcasts).
+ * - THEIR commitment: an OFFERED entry the peer settled, until WE
+ *   revoke for it (removalLocallyRevoked === false, mirroring
+ *   buildHtlcOutputsForRemote), AND a RECEIVED entry WE settled, until
+ *   THE PEER revokes for it (removalRemoteCommitted === false). The
+ *   remote builder describes the NEXT commitment we would sign, which
+ *   drops our own settle immediately; the commitment the peer can put
+ *   ON CHAIN is its CURRENT signed one, which predates our
+ *   update_fulfill/fail and still carries the output until the peer's
+ *   revoke_and_ack for the covering commitment_signed. Without this
+ *   arm, a peer force-closing right after we fulfilled kept the
+ *   preimage-paid output unclaimed until its own timeout sweep.
+ *
+ * Without the window arms, a force-close right after fulfilling an
+ * inbound HTLC left its output untracked on EITHER side's commitment:
+ * no claim despite holding the preimage (and, on ours, the peer's
+ * signature), and on our commitment every later HTLC output's
+ * htlcSigIndex shifted onto the wrong remote signature (issue #556).
  *
  * Deliberately ADDITIVE relative to the old PENDING/COMMITTED gate:
  * classifyTheirCommitmentOutputs also serves revoked commitments, where
@@ -970,11 +984,18 @@ function htlcEntryCanBePresent(
 	if (entry.state !== HtlcState.FULFILLED && entry.state !== HtlcState.FAILED) {
 		return false;
 	}
-	return isLocalCommitment
-		? entry.direction === HtlcDirection.RECEIVED &&
-				entry.removalRemoteCommitted === false
-		: entry.direction === HtlcDirection.OFFERED &&
-				entry.removalLocallyRevoked === false;
+	if (isLocalCommitment) {
+		return (
+			entry.direction === HtlcDirection.RECEIVED &&
+			entry.removalRemoteCommitted === false
+		);
+	}
+	return (
+		(entry.direction === HtlcDirection.OFFERED &&
+			entry.removalLocallyRevoked === false) ||
+		(entry.direction === HtlcDirection.RECEIVED &&
+			entry.removalRemoteCommitted === false)
+	);
 }
 
 function matchHtlcOutput(
