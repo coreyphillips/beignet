@@ -43,6 +43,7 @@ import { buildClosingTx } from '../../src/lightning/chain/closing';
 import {
 	MonitorState,
 	ChainActionType,
+	CommitmentType,
 	OutputStatus,
 	OutputType,
 	ITrackedOutput
@@ -1020,14 +1021,20 @@ describe('Chain Integration (Phase 4D)', function () {
 
 		function theirCommitmentFixture(): {
 			opener: Channel;
+			acceptor: Channel;
 			manager: ChannelManager;
 			channelId: Buffer;
 			destScript: Buffer;
 			theirTx: bitcoin.Transaction;
 			openerPrivkeys: Buffer[];
 		} {
-			const { opener, openerPrivkeys, openerBasepoints, openerCommitmentSeed } =
-				setupNormalChannels();
+			const {
+				opener,
+				acceptor,
+				openerPrivkeys,
+				openerBasepoints,
+				openerCommitmentSeed
+			} = setupNormalChannels();
 			const channelId = opener.getChannelId()!;
 			const state = opener.getFullState();
 			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
@@ -1045,6 +1052,7 @@ describe('Chain Integration (Phase 4D)', function () {
 			(manager as any).channelPeers.set(channelId.toString('hex'), 'test-peer');
 			return {
 				opener,
+				acceptor,
 				manager,
 				channelId,
 				destScript,
@@ -1141,6 +1149,106 @@ describe('Chain Integration (Phase 4D)', function () {
 				network
 			);
 			expect(confirmedCalls.length).to.equal(0);
+		});
+
+		it('reclassifies a parked commitment revoked during the mempool window when it confirms', function () {
+			// The deferral keeps the channel NORMAL, so commitment rounds keep
+			// completing while the peer's commitment sits in the mempool. A
+			// completed round revokes the parked tx; adopting its confirmation
+			// under the stale THEIR_CURRENT record would pay out the pre-window
+			// balances with no penalty.
+			const fx = theirCommitmentFixture();
+			const events: string[] = [];
+			fx.manager.on('channel:force-closing', () =>
+				events.push('force-closing')
+			);
+			fx.manager.on('channel:closed', () => events.push('closed'));
+
+			fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				0,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+			expect(fx.opener.getState()).to.equal(ChannelState.NORMAL);
+
+			// A round completes during the window: the parked tx is now revoked.
+			exchangeCommitments(fx.opener, fx.acceptor);
+
+			const actions = fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				120,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+
+			const broadcast = fx.manager.getMonitor(fx.channelId)!.getFullState()
+				.commitmentBroadcast!;
+			expect(broadcast.commitmentType).to.equal(
+				CommitmentType.THEIR_REVOKED_COMMITMENT
+			);
+			expect(broadcast.blockHeight).to.equal(120);
+			const penalty = actions.filter(
+				(a) =>
+					a.type === ChainActionType.BROADCAST_TX &&
+					(a as any).description.includes('penalty')
+			);
+			expect(penalty.length).to.be.greaterThan(0);
+			expect(fx.opener.getState()).to.equal(ChannelState.FORCE_CLOSED);
+			expect(events).to.deep.equal(['force-closing', 'closed']);
+		});
+
+		it('flips the record to revoked on a mempool re-report, keeping the channel NORMAL', function () {
+			// The funding watch re-reports the parked spend every block, so the
+			// revocation is picked up before confirmation: the penalty sweeps
+			// broadcast as descendants of the parked tx, while the deferral (and
+			// with it the deadline backstop) holds until confirmation.
+			const fx = theirCommitmentFixture();
+
+			fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				0,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+			exchangeCommitments(fx.opener, fx.acceptor);
+
+			const actions = fx.manager.handleFundingSpent(
+				fx.channelId,
+				fx.theirTx,
+				0,
+				fx.destScript,
+				10,
+				fx.openerPrivkeys[1],
+				fx.openerPrivkeys[2],
+				network
+			);
+
+			const broadcast = fx.manager.getMonitor(fx.channelId)!.getFullState()
+				.commitmentBroadcast!;
+			expect(broadcast.commitmentType).to.equal(
+				CommitmentType.THEIR_REVOKED_COMMITMENT
+			);
+			expect(broadcast.blockHeight).to.equal(0);
+			const penalty = actions.filter(
+				(a) =>
+					a.type === ChainActionType.BROADCAST_TX &&
+					(a as any).description.includes('penalty')
+			);
+			expect(penalty.length).to.be.greaterThan(0);
+			expect(fx.opener.getState()).to.equal(ChannelState.NORMAL);
 		});
 
 		it('still reconciles OUR OWN commitment seen in the mempool immediately', function () {

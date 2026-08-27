@@ -1674,6 +1674,29 @@ export class ChainMonitor {
 		if (!this._commitmentBroadcast.spentOutpoint && spentOutpoint) {
 			this._commitmentBroadcast.spentOutpoint = spentOutpoint;
 		}
+		// The recorded classification can go STALE against the live channel
+		// state: a peer commitment sighted in the mempool no longer closes the
+		// channel (issue #559), so commitment rounds keep completing during the
+		// window, and a round that revokes the parked tx hands us its
+		// per-commitment secret. Adopting its confirmation under the old
+		// THEIR_CURRENT record would pay out the stale, pre-window balances
+		// with no penalty. Reclassify on every re-report; only the revoked
+		// transition swaps (a revocation secret never disappears, so it cannot
+		// thrash), and a degraded restored state classifying UNKNOWN cannot
+		// tear down a good record. Reset and re-enter handleFundingSpent so
+		// the penalty resolution runs exactly as a fresh sighting would.
+		if (
+			this._commitmentBroadcast.commitmentType !==
+				CommitmentType.THEIR_REVOKED_COMMITMENT &&
+			classifyCommitmentTx(spendingTx, this._channelState).type ===
+				CommitmentType.THEIR_REVOKED_COMMITMENT
+		) {
+			const knownOutpoint = this._commitmentBroadcast.spentOutpoint;
+			this._trackedOutputs = [];
+			this._commitmentBroadcast = null;
+			this._state = MonitorState.WATCHING;
+			return this.handleFundingSpent(spendingTx, blockHeight, knownOutpoint);
+		}
 		const recorded = this._commitmentBroadcast.blockHeight;
 		if (blockHeight <= 0) {
 			// The recorded spend is now reported UNCONFIRMED: a reorg pushed it
