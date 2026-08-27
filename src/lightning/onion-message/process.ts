@@ -86,8 +86,9 @@ export function processOnionMessage(
 	}
 
 	// Decrypt routing info using a 2x-length stream. The routing info length
-	// comes from the packet itself and is guaranteed to be 1300 or 32768 by
-	// decodeOnionPacket's whitelist; the forwarded onion keeps whatever size
+	// comes from the packet itself (we construct 1300 or 32768, but BOLT 4
+	// readers size the payload space from the packet, so peers' other
+	// bounded sizes peel too); the forwarded onion keeps whatever size
 	// arrived.
 	const routingInfoLength = packet.routingInfo.length;
 	const extendedLen = 2 * routingInfoLength;
@@ -107,8 +108,17 @@ export function processOnionMessage(
 	// Extract next HMAC
 	const nextHmac = Buffer.from(extended.subarray(bytesRead, bytesRead + 32));
 
-	// Build next routing info
+	// Build next routing info. A valid construction packs each hop's
+	// payload plus its 32-byte HMAC inside the routing info, so an overrun
+	// only happens on a malformed packet; failing here (instead of slicing
+	// short) guarantees a forwarded onion is byte-for-byte the size that
+	// arrived.
 	const shiftStart = bytesRead + 32;
+	if (shiftStart + routingInfoLength > extendedLen) {
+		throw new Error(
+			`Onion message hop payload overruns the routing info (${shiftStart} > ${routingInfoLength})`
+		);
+	}
 	const nextRoutingInfo = Buffer.from(
 		extended.subarray(shiftStart, shiftStart + routingInfoLength)
 	);

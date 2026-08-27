@@ -69,9 +69,12 @@ export const ROUTING_INFO_LENGTH = 1300;
 /**
  * BOLT 4 large onion form (onion messages only): 32768 bytes of routing info,
  * 32834 bytes total. Onion message construction selects it automatically when
- * hop payloads exceed the 1300-byte standard form; exactly two on-wire sizes
- * ever exist, so a packet's length leaks at most one bit about the content.
- * Payment onions never use it (update_add_htlc fixes them at 1366).
+ * hop payloads exceed the 1300-byte standard form; we only ever WRITE the two
+ * spec-recommended sizes, so our packets' length leaks at most one bit about
+ * the content. Readers derive the payload space from the packet length, so
+ * other bounded sizes from peers are accepted and relayed unchanged (BOLT 4
+ * discourages them for privacy but does not forbid them). Payment onions
+ * never use the large form (update_add_htlc fixes them at 1366).
  */
 export const LARGE_ROUTING_INFO_LENGTH = 32768;
 export const LARGE_ONION_PACKET_LENGTH = 32834;

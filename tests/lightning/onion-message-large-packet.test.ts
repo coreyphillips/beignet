@@ -1,15 +1,19 @@
 /**
  * Tests for the BOLT 4 large onion message form (issue #552).
  *
- * Onion messages have exactly two on-wire sizes: the 1366-byte standard
- * packet (1300-byte routing info) and the 32834-byte large form
- * (32768-byte routing info), auto-selected from the hop payloads alone
- * so packet length leaks at most one bit. These tests pin:
+ * We only ever WRITE the two spec-recommended packet sizes: the
+ * 1366-byte standard packet (1300-byte routing info) and the 32834-byte
+ * large form (32768-byte routing info), auto-selected from the hop
+ * payloads alone so our packets' length leaks at most one bit. Readers
+ * derive the payload space from the packet length (BOLT 4), so other
+ * bounded sizes from peers peel and relay at their own size. These
+ * tests pin:
  * - form selection at the 1300/1301 needed-bytes boundary
  * - large-form construct -> peel round trips (single and multi hop)
  * - relay size preservation (a forwarded onion keeps the inbound size)
  * - the overflow throw past the large form
- * - wire codec whitelists in both directions
+ * - wire codec bounds (min packet, u16 len) in both directions
+ * - foreign bounded sizes peeling and relaying unchanged
  * - the previously corrupt 1269-1300 window now yields a valid onion
  * - manager end-to-end delivery and reply with large payloads
  * - payment onions stay pinned at exactly 1366
@@ -33,6 +37,12 @@ import { OnionMessageManager } from '../../src/lightning/onion-message/manager';
 import { ONION_MESSAGE_PACKET_LENGTH } from '../../src/lightning/onion-message/types';
 import { constructBlindedPath } from '../../src/lightning/onion/blinded-path';
 import {
+	computeSharedSecrets,
+	deriveHopKeys,
+	generateCipherStream,
+	generateKey
+} from '../../src/lightning/onion/sphinx-crypto';
+import {
 	encodeOnionPacket,
 	decodeOnionPacket
 } from '../../src/lightning/onion/construct';
@@ -51,6 +61,75 @@ function generateKeyPair(): { privkey: Buffer; pubkey: Buffer } {
 	} while (privkey[0] === 0);
 	const pubkey = getPublicKey(privkey);
 	return { privkey, pubkey };
+}
+
+/**
+ * Sphinx-construct an onion message packet at an arbitrary routing info
+ * length. Mirrors the production wrap loop, which only ever emits the
+ * two spec-recommended sizes; this stands in for a peer that chose a
+ * different bounded size, which BOLT 4 discourages but permits.
+ */
+function constructForeignSizePacket(
+	sessionKey: Buffer,
+	hops: { pubkey: Buffer; payload: Buffer }[],
+	routingInfoLength: number
+): Buffer {
+	const { sharedSecrets, ephemeralKeys } = computeSharedSecrets(
+		sessionKey,
+		hops.map((h) => h.pubkey)
+	);
+
+	let filler = Buffer.alloc(0);
+	for (let i = 0; i < sharedSecrets.length - 1; i++) {
+		const hopSize = hops[i].payload.length + 32;
+		const fillerStart = routingInfoLength - filler.length;
+		const keys = deriveHopKeys(sharedSecrets[i]);
+		const stream = generateCipherStream(keys.rho, routingInfoLength + hopSize);
+		const newFiller = Buffer.alloc(filler.length + hopSize);
+		filler.copy(newFiller, 0);
+		filler = newFiller;
+		for (let j = 0; j < filler.length; j++) {
+			filler[j] ^= stream[fillerStart + j];
+		}
+	}
+
+	let routingInfo = generateCipherStream(
+		generateKey('pad', sessionKey),
+		routingInfoLength
+	);
+	let currentHmac = Buffer.alloc(32);
+	for (let i = hops.length - 1; i >= 0; i--) {
+		const keys = deriveHopKeys(sharedSecrets[i]);
+		const payloadBytes = hops[i].payload;
+		const shiftSize = payloadBytes.length + 32;
+		const newRoutingInfo = Buffer.alloc(routingInfoLength);
+		payloadBytes.copy(newRoutingInfo, 0);
+		currentHmac.copy(newRoutingInfo, payloadBytes.length);
+		routingInfo.copy(
+			newRoutingInfo,
+			shiftSize,
+			0,
+			routingInfoLength - shiftSize
+		);
+		routingInfo = newRoutingInfo;
+		const stream = generateCipherStream(keys.rho, routingInfoLength);
+		for (let j = 0; j < routingInfoLength; j++) {
+			routingInfo[j] ^= stream[j];
+		}
+		if (i === hops.length - 1 && filler.length > 0) {
+			filler.copy(routingInfo, routingInfoLength - filler.length);
+		}
+		currentHmac = Buffer.from(
+			crypto.createHmac('sha256', keys.mu).update(routingInfo).digest()
+		);
+	}
+
+	return encodeOnionPacket({
+		version: ONION_VERSION,
+		ephemeralKey: ephemeralKeys[0],
+		routingInfo,
+		hmac: currentHmac
+	});
 }
 
 describe('Onion Messages: BOLT 4 large form', () => {
@@ -237,7 +316,7 @@ describe('Onion Messages: BOLT 4 large form', () => {
 		});
 	});
 
-	describe('Wire codec whitelists', () => {
+	describe('Wire codec bounds', () => {
 		it('encodes and decodes the large form round-trip', () => {
 			const kp = generateKeyPair();
 			const packet = crypto.randomBytes(LARGE_ONION_PACKET_LENGTH);
@@ -253,44 +332,151 @@ describe('Onion Messages: BOLT 4 large form', () => {
 			expect(decoded.onionRoutingPacket.equals(packet)).to.be.true;
 		});
 
-		it('encode rejects a packet that is neither form', () => {
+		it('encode preserves a foreign bounded size and stamps its real len', () => {
+			const kp = generateKeyPair();
+			const packet = crypto.randomBytes(5000);
+			const encoded = encodeOnionMessage({
+				blindingPoint: kp.pubkey,
+				onionRoutingPacket: packet
+			});
+			expect(encoded.length).to.equal(33 + 2 + 5000);
+			expect(encoded.readUInt16BE(33)).to.equal(5000);
+
+			const decoded = decodeOnionMessage(encoded);
+			expect(decoded.onionRoutingPacket.equals(packet)).to.be.true;
+		});
+
+		it('encode rejects packets outside the structural bounds', () => {
 			const kp = generateKeyPair();
 			expect(() =>
 				encodeOnionMessage({
 					blindingPoint: kp.pubkey,
-					onionRoutingPacket: Buffer.alloc(5000)
+					onionRoutingPacket: Buffer.alloc(50)
 				})
-			).to.throw('onion_routing_packet must be 1366 or 32834 bytes, got 5000');
-		});
-
-		it('decode rejects a len field that is neither form', () => {
-			const buf = Buffer.alloc(35 + 5000);
-			buf.writeUInt16BE(5000, 33);
-			expect(() => decodeOnionMessage(buf)).to.throw(
-				'onion_routing_packet len must be 1366 or 32834, got 5000'
-			);
-		});
-
-		it('decodeOnionPacket accepts 32834 and rejects other sizes', () => {
-			const decoded = decodeOnionPacket(
-				Buffer.alloc(LARGE_ONION_PACKET_LENGTH)
-			);
-			expect(decoded.routingInfo.length).to.equal(LARGE_ROUTING_INFO_LENGTH);
-			expect(() => decodeOnionPacket(Buffer.alloc(5000))).to.throw(
-				'Onion packet must be 1366 or 32834 bytes, got 5000'
-			);
-		});
-
-		it('encodeOnionPacket rejects a routing info that is neither form', () => {
-			const kp = generateKeyPair();
+			).to.throw('onion_routing_packet must be 67 to 65535 bytes, got 50');
 			expect(() =>
-				encodeOnionPacket({
-					version: ONION_VERSION,
-					ephemeralKey: kp.pubkey,
-					routingInfo: Buffer.alloc(1301),
-					hmac: Buffer.alloc(32)
+				encodeOnionMessage({
+					blindingPoint: kp.pubkey,
+					onionRoutingPacket: Buffer.alloc(70000)
 				})
-			).to.throw('Onion packet routing info must be 1300 or 32768 bytes');
+			).to.throw('onion_routing_packet must be 67 to 65535 bytes, got 70000');
+		});
+
+		it('decodeOnionPacket sizes from the buffer and rejects only too-short', () => {
+			const large = decodeOnionPacket(Buffer.alloc(LARGE_ONION_PACKET_LENGTH));
+			expect(large.routingInfo.length).to.equal(LARGE_ROUTING_INFO_LENGTH);
+			const foreign = decodeOnionPacket(Buffer.alloc(5000));
+			expect(foreign.routingInfo.length).to.equal(5000 - 66);
+			expect(() => decodeOnionPacket(Buffer.alloc(66))).to.throw(
+				'Onion packet too short'
+			);
+		});
+
+		it('encodeOnionPacket round-trips a foreign routing info size', () => {
+			const kp = generateKeyPair();
+			const routingInfo = crypto.randomBytes(1301);
+			const encoded = encodeOnionPacket({
+				version: ONION_VERSION,
+				ephemeralKey: kp.pubkey,
+				routingInfo,
+				hmac: Buffer.alloc(32)
+			});
+			expect(encoded.length).to.equal(66 + 1301);
+			expect(decodeOnionPacket(encoded).routingInfo.equals(routingInfo)).to.be
+				.true;
+		});
+	});
+
+	describe('Foreign bounded sizes (BOLT 4 reader semantics)', () => {
+		// A peer that chose a non-recommended bounded size: spec-discouraged
+		// for privacy, but protocol-permitted. CLN peels these dynamically,
+		// so must we, and a relay must forward them at their own size.
+		const FOREIGN_TOTAL = 5000;
+		const FOREIGN_RI = FOREIGN_TOTAL - 66;
+
+		it('a route-blinded 5000-byte packet peels and delivers', () => {
+			const dest = generateKeyPair();
+			const data = crypto.randomBytes(1500);
+			const path = constructBlindedPath(
+				crypto.randomBytes(32),
+				[dest.pubkey],
+				[{}]
+			);
+			const payload = encodeOnionMessagePayload({
+				encryptedRecipientData: path.blindedHops[0].encryptedData,
+				messageTlvs: new Map([[65, data]])
+			});
+			const packet = constructForeignSizePacket(
+				crypto.randomBytes(32),
+				[{ pubkey: path.blindedHops[0].blindedNodeId, payload }],
+				FOREIGN_RI
+			);
+			expect(packet.length).to.equal(FOREIGN_TOTAL);
+
+			const result = processOnionMessage(
+				packet,
+				dest.privkey,
+				path.blindingPoint
+			);
+			expect(result.type).to.equal('delivery');
+			if (result.type === 'delivery') {
+				expect(result.payload.messageTlvs.get(65)!.equals(data)).to.be.true;
+			}
+		});
+
+		it('a relay forwards a 5000-byte packet at exactly 5000 bytes', () => {
+			const mid = generateKeyPair();
+			const dest = generateKeyPair();
+			const data = crypto.randomBytes(1500);
+			const path = constructBlindedPath(
+				crypto.randomBytes(32),
+				[mid.pubkey, dest.pubkey],
+				[{ nextNodeId: dest.pubkey }, {}]
+			);
+			const payloads = [
+				encodeOnionMessagePayload({
+					encryptedRecipientData: path.blindedHops[0].encryptedData,
+					messageTlvs: new Map()
+				}),
+				encodeOnionMessagePayload({
+					encryptedRecipientData: path.blindedHops[1].encryptedData,
+					messageTlvs: new Map([[65, data]])
+				})
+			];
+			const packet = constructForeignSizePacket(
+				crypto.randomBytes(32),
+				[
+					{ pubkey: path.blindedHops[0].blindedNodeId, payload: payloads[0] },
+					{ pubkey: path.blindedHops[1].blindedNodeId, payload: payloads[1] }
+				],
+				FOREIGN_RI
+			);
+			expect(packet.length).to.equal(FOREIGN_TOTAL);
+
+			const atMid = processOnionMessage(
+				packet,
+				mid.privkey,
+				path.blindingPoint
+			);
+			expect(atMid.type).to.equal('forward');
+			if (atMid.type !== 'forward') return;
+			expect(atMid.nextNodeId.equals(dest.pubkey)).to.be.true;
+			expect(atMid.nextOnionMessage.onionRoutingPacket.length).to.equal(
+				FOREIGN_TOTAL
+			);
+			// The forwarded packet must survive the wire codec unchanged.
+			const wire = encodeOnionMessage(atMid.nextOnionMessage);
+			expect(wire.readUInt16BE(33)).to.equal(FOREIGN_TOTAL);
+
+			const atDest = processOnionMessage(
+				atMid.nextOnionMessage.onionRoutingPacket,
+				dest.privkey,
+				atMid.nextOnionMessage.blindingPoint
+			);
+			expect(atDest.type).to.equal('delivery');
+			if (atDest.type === 'delivery') {
+				expect(atDest.payload.messageTlvs.get(65)!.equals(data)).to.be.true;
+			}
 		});
 	});
 

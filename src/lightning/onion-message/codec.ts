@@ -5,12 +5,13 @@
  * Wire format:
  *   [33: blinding_point] [2: len] [len: onion_routing_packet]
  *
- * The onion_routing_packet is 1366 bytes (standard form) or 32834 bytes
- * (BOLT 4 large form) for onion messages; no other length is valid.
+ * We only ever construct the two BOLT 4 writer-recommended packet sizes
+ * (1366 standard, 32834 large form), but readers derive the payload
+ * space from the packet length, so other bounded sizes from peers are
+ * accepted and preserved when forwarding.
  */
 
-import { IOnionMessage, ONION_MESSAGE_PACKET_LENGTH } from './types';
-import { LARGE_ONION_PACKET_LENGTH } from '../onion/types';
+import { IOnionMessage } from './types';
 import {
 	IOnionMessagePayload,
 	TLV_ENCRYPTED_RECIPIENT_DATA,
@@ -26,7 +27,11 @@ import { encodeBigSize, decodeBigSize } from '../message/codec';
 
 /**
  * Encode an onion_message for the wire (type 513 payload, excluding the 2-byte type prefix).
- * Format: blinding_point(33) + len(2) + onion_routing_packet(1366 or 32834)
+ * Format: blinding_point(33) + len(2) + onion_routing_packet
+ *
+ * The packet must at least hold the fixed onion fields plus one routing
+ * byte and must fit the u16 len field; within those bounds any size is
+ * serialized as-is so a relayed foreign-size onion keeps its length.
  */
 export function encodeOnionMessage(msg: IOnionMessage): Buffer {
 	if (msg.blindingPoint.length !== 33) {
@@ -35,12 +40,9 @@ export function encodeOnionMessage(msg: IOnionMessage): Buffer {
 		);
 	}
 	const packetLen = msg.onionRoutingPacket.length;
-	if (
-		packetLen !== ONION_MESSAGE_PACKET_LENGTH &&
-		packetLen !== LARGE_ONION_PACKET_LENGTH
-	) {
+	if (packetLen < 67 || packetLen > 65535) {
 		throw new Error(
-			`onion_routing_packet must be 1366 or 32834 bytes, got ${packetLen}`
+			`onion_routing_packet must be 67 to 65535 bytes, got ${packetLen}`
 		);
 	}
 
@@ -63,17 +65,6 @@ export function decodeOnionMessage(buf: Buffer): IOnionMessage {
 
 	const blindingPoint = Buffer.from(buf.subarray(0, 33));
 	const len = buf.readUInt16BE(33);
-
-	// Only the two BOLT 4 sizes are valid; rejecting here also bounds the
-	// packet copy below before any sphinx processing sees the message.
-	if (
-		len !== ONION_MESSAGE_PACKET_LENGTH &&
-		len !== LARGE_ONION_PACKET_LENGTH
-	) {
-		throw new Error(
-			`onion_routing_packet len must be 1366 or 32834, got ${len}`
-		);
-	}
 
 	if (buf.length < 35 + len) {
 		throw new Error(
