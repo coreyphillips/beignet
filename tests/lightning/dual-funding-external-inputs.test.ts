@@ -56,7 +56,8 @@ import {
 	decodeTxAddInputMessage,
 	decodeTxAddOutputMessage,
 	decodeTxSignaturesMessage,
-	decodeTxAbortMessage
+	decodeTxAbortMessage,
+	ITxInitRbfMessage
 } from '../../src/lightning/message/interactive-tx';
 import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 import {
@@ -90,8 +91,10 @@ function findError(actions: any[]): string | null {
 	return null;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function findTxSigsNeeded(actions: any[]): { inputIndices: number[] } | null {
+function findTxSigsNeeded(
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	actions: any[]
+): { inputIndices: number[]; externalInputIndices?: number[] } | null {
 	for (const a of actions) {
 		if (a.type === ChannelActionType.TX_SIGNATURES_NEEDED) return a;
 	}
@@ -448,7 +451,12 @@ describe('Dual funding external inputs (issue #554)', function () {
 		const extIdx = externalIndexOf(record, s.extPrevTx);
 		const needed = findTxSigsNeeded(s.aCommitHandle);
 		expect(needed, 'the owed slot is surfaced').to.not.equal(null);
-		expect(needed!.inputIndices).to.deep.equal([extIdx]);
+		// inputIndices stays the COMPLETE set (the sendTxSignatures contract);
+		// the owed external slot rides the dedicated field.
+		expect(needed!.inputIndices).to.deep.equal([
+			...record.ourWalletInputIndices
+		]);
+		expect(needed!.externalInputIndices).to.deep.equal([extIdx]);
 		expect(record.externalInputIndices).to.deep.equal([extIdx]);
 		// The OWN input was signed at record creation; the external slot is
 		// an empty placeholder.
@@ -735,5 +743,106 @@ describe('Dual funding external inputs (issue #554)', function () {
 			serializeV2InFlight({ ...record, externalInputIndices: undefined })
 		);
 		expect(plain.externalInputIndices).to.equal(undefined);
+	});
+
+	it('sendTxSignatures refuses a witness set that does not cover every input', function () {
+		// The signal's documented answer is a COMPLETE set; a short one used to
+		// leave the wire and split the exchange after recording the release.
+		const s = driveToWithhold('p2wpkh');
+		const { acceptor } = s;
+		const record = acceptor.getFullState().v2InFlight!;
+		const extIdx = externalIndexOf(record, s.extPrevTx);
+		const ownPos = record.ourWalletInputIndices.indexOf(extIdx) === 0 ? 1 : 0;
+
+		const short = acceptor.sendTxSignatures(
+			acceptor.getFullState().fundingTxid!,
+			acceptor.getFullState().fundingOutputIndex,
+			[record.ourWitnesses[ownPos]]
+		);
+		expect(findError(short)).to.contain('must carry 2 witness stacks');
+		expect(findPayload(short, MessageType.TX_SIGNATURES)).to.equal(null);
+		expect(record.sentTxSignatures).to.equal(false);
+	});
+
+	it('sendTxSignatures validates external stacks inside a complete set', function () {
+		const s = driveToWithhold('p2wpkh');
+		const { acceptor, opener } = s;
+		const record = acceptor.getFullState().v2InFlight!;
+		const extIdx = externalIndexOf(record, s.extPrevTx);
+		const extPos = record.ourWalletInputIndices.indexOf(extIdx);
+		const ownPos = extPos === 0 ? 1 : 0;
+
+		// Garbage at the external slot is refused by name; nothing releases.
+		const full: Buffer[][] = [];
+		full[ownPos] = record.ourWitnesses[ownPos];
+		full[extPos] = [crypto.randomBytes(71), s.extPub];
+		const bad = acceptor.sendTxSignatures(
+			acceptor.getFullState().fundingTxid!,
+			acceptor.getFullState().fundingOutputIndex,
+			full
+		);
+		expect(findError(bad)).to.contain('external witness rejected');
+		expect(record.sentTxSignatures).to.equal(false);
+
+		// The owner's real witness inside a complete set releases, and the
+		// peer validates the result like any tx_signatures.
+		full[extPos] = signExternalP2wpkh(record, s.extPrevTx, s.extPriv, s.extPub);
+		const good = acceptor.sendTxSignatures(
+			acceptor.getFullState().fundingTxid!,
+			acceptor.getFullState().fundingOutputIndex,
+			full
+		);
+		expect(findError(good)).to.equal(null);
+		const sigs = findPayload(good, MessageType.TX_SIGNATURES);
+		expect(sigs, 'complete validated set releases').to.not.equal(null);
+		const decoded = decodeTxSignaturesMessage(sigs!);
+		expect(decoded.witnesses.length).to.equal(2);
+		expect(findError(opener.handleTxSignatures(decoded))).to.equal(null);
+	});
+
+	it('a witness persisted during an abort freeze releases when the crossed exchange settles', function () {
+		// The reviewer's lost-wakeup: witness arrives under _v2AbortPending, a
+		// crossed tx_init_rbf cancels the abort, and the echo used to clear the
+		// latch without re-driving the flush, stalling the open until reconnect.
+		const s = driveToWithhold('p2wpkh');
+		const { acceptor } = s;
+		const record = acceptor.getFullState().v2InFlight!;
+
+		const abort = acceptor.abortDualFunding('operator abort');
+		expect(findPayload(abort, MessageType.TX_ABORT)).to.not.equal(null);
+
+		const witness = signExternalP2wpkh(
+			record,
+			s.extPrevTx,
+			s.extPriv,
+			s.extPub
+		);
+		const during = acceptor.provideV2ExternalWitness(
+			Buffer.from(s.extPrevTx.getHash()),
+			0,
+			witness
+		);
+		// Persisted, but frozen: nothing may cross our own un-echoed abort.
+		expect(
+			during.some((a) => a.type === ChannelActionType.PERSIST_STATE)
+		).to.equal(true);
+		expect(findPayload(during, MessageType.TX_SIGNATURES)).to.equal(null);
+
+		// The peer's tx_init_rbf crosses our abort: the wire abort becomes the
+		// refusal and the pending teardown is cancelled.
+		const rbfMsg: ITxInitRbfMessage = {
+			channelId: acceptor.getFullState().channelId!,
+			locktime: 0,
+			feerate: 2000
+		};
+		expect(acceptor.handleTxInitRbf(rbfMsg)).to.deep.equal([]);
+
+		// The echo settles the exchange, and the thaw re-drives the flush: the
+		// witness persisted during the freeze leaves NOW, not at reconnect.
+		const echo = acceptor.handleTxAbort();
+		const sigs = findPayload(echo, MessageType.TX_SIGNATURES);
+		expect(sigs, 'release fires at the thaw').to.not.equal(null);
+		expect(decodeTxSignaturesMessage(sigs!).witnesses.length).to.equal(2);
+		expect(record.sentTxSignatures).to.equal(true);
 	});
 });

@@ -7729,7 +7729,8 @@ export class ChannelManager extends EventEmitter {
 						action.channelId,
 						action.fundingTxid,
 						action.fundingOutputIndex,
-						action.inputIndices
+						action.inputIndices,
+						action.externalInputIndices
 					);
 					break;
 				case ChannelActionType.ANNOUNCEMENT_READY:

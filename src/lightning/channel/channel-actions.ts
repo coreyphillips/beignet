@@ -243,8 +243,20 @@ export interface ITxSignaturesNeededAction {
 	channelId: Buffer;
 	fundingTxid: Buffer;
 	fundingOutputIndex: number;
-	/** The negotiated tx input indices our witnesses must cover. */
+	/**
+	 * The negotiated tx input indices our witnesses must cover — always the
+	 * COMPLETE set, because a sendTxSignatures answer supplies one stack per
+	 * contributed input in this order (a partial set is refused).
+	 */
 	inputIndices: number[];
+	/**
+	 * Issue #554: the subset of inputIndices that are EXTERNAL inputs whose
+	 * witness is still owed by a third party. Deliver them individually via
+	 * provideV2ExternalWitness (own slots are already recorded), or answer
+	 * with a complete sendTxSignatures set covering them; either path
+	 * releases. Absent when nothing external is owed.
+	 */
+	externalInputIndices?: number[];
 }
 
 /**

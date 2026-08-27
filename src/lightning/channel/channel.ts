@@ -15429,9 +15429,11 @@ export class Channel {
 				// Surface the obligation once per connection cycle instead of
 				// waiting silently: after a restart the pending witnesses died
 				// with the process and nothing else tells the embedder to
-				// re-drive (issue 307). inputIndices names exactly what is
-				// owed: the unfilled external slots, or all our indices in the
-				// caller-driven shape.
+				// re-drive (issue 307). inputIndices always names EVERY input
+				// we contributed, because the documented answer is a COMPLETE
+				// sendTxSignatures set; externalInputIndices additionally names
+				// the still-owed external slots, deliverable one at a time via
+				// provideV2ExternalWitness (either response path releases).
 				if (this._v2CallerTxSigsSignaled) return [];
 				this._v2CallerTxSigsSignaled = true;
 				return [
@@ -15440,10 +15442,10 @@ export class Channel {
 						channelId: this._v2ChannelId(),
 						fundingTxid: Buffer.from(record.fundingTxid),
 						fundingOutputIndex: record.fundingOutputIndex,
-						inputIndices:
-							owedExternal.length > 0
-								? owedExternal
-								: [...record.ourWalletInputIndices]
+						inputIndices: [...record.ourWalletInputIndices],
+						...(owedExternal.length > 0
+							? { externalInputIndices: owedExternal }
+							: {})
 					}
 				];
 			} else if (this._dualFundingContribution) {
@@ -15630,6 +15632,71 @@ export class Channel {
 						'tx_signatures txid/output does not match the negotiated funding tx'
 				}
 			];
+		}
+
+		// The supplied array is the COMPLETE local witness set, one stack per
+		// input we contributed, in tx-input order. A short set would leave the
+		// wire as a witness hole the peer rejects AFTER we recorded the
+		// release, splitting the exchange (issue #554 review): refuse it here,
+		// before anything is staged or recorded.
+		const record = this._state.v2InFlight;
+		let expectedCount: number | null = null;
+		if (record && !this._v2RecordIsStaleRollback()) {
+			expectedCount = record.ourWalletInputIndices.length;
+		} else {
+			const builder = session.getTxBuilder();
+			if (builder) {
+				expectedCount = builder
+					.getInputs()
+					.filter(
+						(i) => (i.serialId % 2n === 0n) === session.isInitiator()
+					).length;
+			}
+		}
+		if (expectedCount !== null && witnesses.length !== expectedCount) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `tx_signatures must carry ${expectedCount} witness stacks (one per contributed input), got ${witnesses.length}`
+				}
+			];
+		}
+
+		// External slots inside a caller-supplied set get the same
+		// verification provideV2ExternalWitness applies: a third-party stack
+		// that does not verify must never leave (issue #554).
+		if (record?.externalInputIndices?.length) {
+			const prevouts = this._v2InputPrevouts();
+			let negotiated: import('bitcoinjs-lib').Transaction | null = null;
+			try {
+				negotiated = bitcoin.Transaction.fromHex(record.fundingTxHex);
+			} catch {
+				negotiated = null;
+			}
+			if (!prevouts || !negotiated) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'external funding inputs cannot be verified: negotiated tx or prevouts unresolvable'
+					}
+				];
+			}
+			for (const extIndex of record.externalInputIndices) {
+				const pos = record.ourWalletInputIndices.indexOf(extIndex);
+				const stack = pos >= 0 ? witnesses[pos] : undefined;
+				const problem = stack
+					? this._validateWitnessForInput(negotiated, extIndex, stack, prevouts)
+					: 'missing witness stack';
+				if (problem) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: `external witness rejected: ${problem}`
+						}
+					];
+				}
+			}
 		}
 
 		this._v2PendingTxSigs = {
@@ -18006,6 +18073,15 @@ export class Channel {
 					this._v2RollbackAbortPending = false;
 					return this._maybeSendV2TxSigs();
 				}
+				// The completed exchange may have been the freeze that held a
+				// due release: an operator abort cancelled by a crossed
+				// tx_init_rbf lands its echo here with _v2AbortPending already
+				// cleared, and a witness that arrived during the freeze (e.g.
+				// an external input's, issue #554) was persisted but never
+				// sent. Re-drive the flush now instead of waiting for a
+				// reconnect; every gate inside it still applies, so this is a
+				// no-op whenever nothing is due.
+				return this._maybeSendV2TxSigs();
 			}
 			return [];
 		}
