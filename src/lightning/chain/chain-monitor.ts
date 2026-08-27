@@ -1680,17 +1680,27 @@ export class ChainMonitor {
 		// window, and a round that revokes the parked tx hands us its
 		// per-commitment secret. Adopting its confirmation under the old
 		// THEIR_CURRENT record would pay out the stale, pre-window balances
-		// with no penalty. Reclassify on every re-report; only the revoked
-		// transition swaps (a revocation secret never disappears, so it cannot
-		// thrash), and a degraded restored state classifying UNKNOWN cannot
-		// tear down a good record. Reset and re-enter handleFundingSpent so
-		// the penalty resolution runs exactly as a fresh sighting would.
-		if (
-			this._commitmentBroadcast.commitmentType !==
-				CommitmentType.THEIR_REVOKED_COMMITMENT &&
-			classifyCommitmentTx(spendingTx, this._channelState).type ===
-				CommitmentType.THEIR_REVOKED_COMMITMENT
-		) {
+		// with no penalty. Reclassify on every re-report; only two transitions
+		// swap, and neither can thrash or tear down a good record:
+		// - anything -> THEIR_REVOKED (a revocation secret never disappears);
+		// - THEIR_FUTURE -> COOPERATIVE_CLOSE (issue #568: records persisted
+		//   before the classifier learned the simple-close and taproot RBF
+		//   shapes hold a fabricated future-commitment type for a mutual close
+		//   and would pin RESOLVING forever; coop classification is purely
+		//   structural, so the same tx re-reports the same answer every time,
+		//   and a real commitment carries the BOLT 3 stamp so it can never
+		//   re-classify as cooperative).
+		// Reset and re-enter handleFundingSpent so resolution runs exactly as
+		// a fresh sighting would.
+		const recordedType = this._commitmentBroadcast.commitmentType;
+		const liveType = classifyCommitmentTx(spendingTx, this._channelState).type;
+		const revokedRepair =
+			recordedType !== CommitmentType.THEIR_REVOKED_COMMITMENT &&
+			liveType === CommitmentType.THEIR_REVOKED_COMMITMENT;
+		const coopRepair =
+			recordedType === CommitmentType.THEIR_FUTURE_COMMITMENT &&
+			liveType === CommitmentType.COOPERATIVE_CLOSE;
+		if (revokedRepair || coopRepair) {
 			const knownOutpoint = this._commitmentBroadcast.spentOutpoint;
 			this._trackedOutputs = [];
 			this._commitmentBroadcast = null;
