@@ -701,7 +701,8 @@ export class ChainMonitor {
 						outputIndex: output.outputIndex,
 						channelId: this._channelState.channelId ?? undefined,
 						outputType: output.outputType,
-						paymentHash: output.paymentHash
+						paymentHash: output.paymentHash,
+						htlcId: output.htlcId
 					});
 				}
 				this._state = MonitorState.FULLY_RESOLVED;
@@ -750,7 +751,8 @@ export class ChainMonitor {
 						outputIndex: output.outputIndex,
 						channelId: this._channelState.channelId ?? undefined,
 						outputType: output.outputType,
-						paymentHash: output.paymentHash
+						paymentHash: output.paymentHash,
+						htlcId: output.htlcId
 					});
 					continue;
 				}

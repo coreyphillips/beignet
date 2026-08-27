@@ -3850,10 +3850,16 @@ export class LightningNode extends EventEmitter {
 				_outputIndex: number,
 				channelId?: Buffer,
 				outputType?: OutputType,
-				paymentHash?: Buffer
+				paymentHash?: Buffer,
+				htlcId?: bigint
 			) => {
 				if (outputType === undefined) return;
-				this.handleOnChainOutputResolved(channelId, outputType, paymentHash);
+				this.handleOnChainOutputResolved(
+					channelId,
+					outputType,
+					paymentHash,
+					htlcId
+				);
 			}
 		);
 
@@ -15058,7 +15064,8 @@ export class LightningNode extends EventEmitter {
 	private handleOnChainOutputResolved(
 		channelId: Buffer | undefined,
 		outputType: OutputType,
-		paymentHash?: Buffer
+		paymentHash?: Buffer,
+		htlcId?: bigint
 	): void {
 		if (outputType !== OutputType.OFFERED_HTLC) return;
 		if (!channelId || !paymentHash) return;
@@ -15069,6 +15076,16 @@ export class LightningNode extends EventEmitter {
 		const outChannelIdHex = channelId.toString('hex');
 		for (const [outKey, forward] of this.forwardedHtlcs) {
 			if (!outKey.startsWith(`${outChannelIdHex}:offered-`)) continue;
+			// Exact identity first: same-hash HTLCs (MPP parts, retries) are
+			// separate forwards, and one resolved output licenses failing
+			// exactly ONE of them. Only a legacy record with no recorded
+			// htlcId falls back to the hash match (and its `break` below still
+			// bounds it to one leg).
+			if (
+				htlcId !== undefined &&
+				outKey !== `${outChannelIdHex}:offered-${htlcId}`
+			)
+				continue;
 			const inChannel = this.channelManager.getChannel(forward.inChannelId);
 			const inHtlc = inChannel
 				?.getFullState()
@@ -15092,7 +15109,10 @@ export class LightningNode extends EventEmitter {
 			}`;
 			// BOLT 4 route blinding: failures of a blinded forward must surface as
 			// invalid_onion_blinding (update_fail_malformed_htlc for a 'mid' hop).
-			const blindedRole = this.blindedIncomingHtlcs.get(inSecretKey);
+			const blindedRole = this.blindedRoleFor(
+				forward.inChannelId,
+				forward.inHtlcId
+			);
 			if (blindedRole) {
 				this.failBlindedIncomingHtlc(
 					forward.inChannelId,
@@ -15332,11 +15352,18 @@ export class LightningNode extends EventEmitter {
 			// channel stays ambiguous (an on-chain claim can still reveal the
 			// preimage later) and is left to the chain machinery and the CLTV
 			// sweeper, exactly like scanForwardTimeouts.
-			// The on-chain form of the same fact (issue 569): the offered output
-			// for this hash resolved irrevocably and no preimage was ever
+			// The on-chain form of the same fact (issue 569): THIS forward's
+			// offered output resolved irrevocably and no preimage was ever
 			// learned (the settle branch above takes the entry when one
 			// exists). This is exactly the predicate handleOnChainOutputResolved
 			// acted on; a fail refused there (inbound quiescing) retries here.
+			// Matched on the output's recorded htlcId, never the hash alone:
+			// same-hash MPP parts and retries are separate forwards, and one
+			// timed-out output must not fail every same-hash leg upstream while
+			// another leg's output is still unresolved and claimable. A legacy
+			// record with no htlcId never matches; those forwards keep the
+			// pre-retry behavior (chain machinery and the CLTV sweeper).
+			const outHtlcId = BigInt(outParts[1].slice('offered-'.length));
 			const outgoingTimedOutOnChain =
 				this.channelManager
 					.getMonitor(Buffer.from(outParts[0], 'hex'))
@@ -15345,6 +15372,7 @@ export class LightningNode extends EventEmitter {
 						(o) =>
 							o.outputType === OutputType.OFFERED_HTLC &&
 							o.status === OutputStatus.IRREVOCABLY_RESOLVED &&
+							o.htlcId === outHtlcId &&
 							o.paymentHash?.equals(entry.paymentHash) === true
 					) === true;
 			const outgoingFailed =
@@ -15393,6 +15421,30 @@ export class LightningNode extends EventEmitter {
 	 * complete failure message (the owed-pass synthesis) rather than the
 	 * downstream's bytes to wrap.
 	 */
+	/**
+	 * The blinded-route role of an inbound HTLC, surviving a restart. The
+	 * live map is memory-only; a MID hop's blinding point arrived in
+	 * update_add_htlc and is durable on the HTLC entry, so the required
+	 * update_fail_malformed_htlc wire form can be reconstructed after a
+	 * crash (issue 569 review: a retried fail must not degrade to a plain
+	 * update_fail_htlc). An INTRO node's blinding lived only in the onion
+	 * payload and is not reconstructible, but its required form IS the
+	 * plain update_fail_htlc, so the fallback stays correct there too.
+	 */
+	private blindedRoleFor(
+		inChannelId: Buffer,
+		inHtlcId: bigint
+	): 'intro' | 'mid' | undefined {
+		const key = `${inChannelId.toString('hex')}:${inHtlcId}`;
+		const live = this.blindedIncomingHtlcs.get(key);
+		if (live) return live;
+		const entry = this.channelManager
+			.getChannel(inChannelId)
+			?.getFullState()
+			.htlcs.get(`received-${inHtlcId}`);
+		return entry?.blindingPoint ? 'mid' : undefined;
+	}
+
 	private failForwardUpstream(
 		outKey: string,
 		forward: { inChannelId: Buffer; inHtlcId: bigint },
@@ -15401,6 +15453,18 @@ export class LightningNode extends EventEmitter {
 		reason: Buffer,
 		preWrapped = false
 	): boolean {
+		// The gate that keeps the staged consumption honest, exactly as in
+		// settleForwardUpstream: a refusal must be established BEFORE the
+		// linkage delete is staged, or the flush commits it standalone. It
+		// also precedes the failure events below: a refused retry (inbound
+		// quiescing, per-block owed pass) leaves the HTLC COMMITTED and its
+		// linkage intact, so reporting forward_failed there would be false
+		// and would repeat on every retry.
+		const inChannel = this.channelManager.getChannel(forward.inChannelId);
+		if (!inChannel || !inChannel.canFailHtlc(forward.inHtlcId)) {
+			return false;
+		}
+
 		// Resolution counterpart to forward_attempt for the failure case, so
 		// every attempted forward pairs with a 'forwarded' or 'forward_failed'
 		// line rather than going silent when the downstream leg fails.
@@ -15415,21 +15479,16 @@ export class LightningNode extends EventEmitter {
 			outChannelId
 		});
 
-		// The gate that keeps the staged consumption honest, exactly as in
-		// settleForwardUpstream: a refusal must be established BEFORE the
-		// linkage delete is staged, or the flush commits it standalone.
-		const inChannel = this.channelManager.getChannel(forward.inChannelId);
-		if (!inChannel || !inChannel.canFailHtlc(forward.inHtlcId)) {
-			return false;
-		}
-
 		const inHtlcSecretKey = `${forward.inChannelId.toString('hex')}:${
 			forward.inHtlcId
 		}`;
 		// BOLT 4 route blinding: a downstream failure of a blinded forward must
 		// NOT be relayed (it would leak the blinded portion); replace it with
 		// invalid_onion_blinding.
-		const blindedRole = this.blindedIncomingHtlcs.get(inHtlcSecretKey);
+		const blindedRole = this.blindedRoleFor(
+			forward.inChannelId,
+			forward.inHtlcId
+		);
 		if (blindedRole) {
 			this.withStagedMutations(
 				[{ type: 'delete_forwarded_htlc', outKey }],
@@ -16971,7 +17030,7 @@ export class LightningNode extends EventEmitter {
 				if (htlc.cltvExpiry - blockHeight <= this.htlcSafetyMargin) {
 					const channelId = state.channelId || state.temporaryChannelId;
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
-					const blindedRole = this.blindedIncomingHtlcs.get(htlcSecretKey);
+					const blindedRole = this.blindedRoleFor(channelId, htlc.id);
 					if (blindedRole) {
 						this.failBlindedIncomingHtlc(channelId, htlc.id, blindedRole);
 						continue;
@@ -17060,7 +17119,7 @@ export class LightningNode extends EventEmitter {
 				if (outgoingFailed && !errored) {
 					// Safe: complete the failure upstream off-chain.
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
-					const blindedRole = this.blindedIncomingHtlcs.get(htlcSecretKey);
+					const blindedRole = this.blindedRoleFor(channelId, htlc.id);
 					if (blindedRole) {
 						this.failBlindedIncomingHtlc(channelId, htlc.id, blindedRole);
 						this.forwardedHtlcs.delete(outKey);

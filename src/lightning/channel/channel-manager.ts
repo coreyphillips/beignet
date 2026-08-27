@@ -8457,7 +8457,8 @@ export class ChannelManager extends EventEmitter {
 						action.outputIndex,
 						action.channelId,
 						action.outputType,
-						action.paymentHash
+						action.paymentHash,
+						action.htlcId
 					);
 					break;
 				case ChainActionType.CHANNEL_FULLY_RESOLVED:

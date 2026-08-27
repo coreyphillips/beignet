@@ -16,7 +16,12 @@ import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { Channel } from '../../src/lightning/channel/channel';
 import { createOpenerState } from '../../src/lightning/channel/channel-state';
-import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import {
+	ChannelState,
+	DEFAULT_CHANNEL_CONFIG,
+	HtlcDirection,
+	HtlcState
+} from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
@@ -275,7 +280,22 @@ describe('Issue #176: forwarding opt-out and forward logging', function () {
 
 	it('logs and emits when a forwarded HTLC fails downstream', function () {
 		wire(makeNode());
-		const inChannelId = crypto.randomBytes(32);
+		// The failure events fire only for a fail the inbound channel actually
+		// carries (issue 569 review: a refused retry must not report
+		// forward_failed), so the inbound leg must be a real channel able to
+		// accept the fail.
+		const { channelId: inChannelId } = installChannel(node);
+		const inChannel = (node as any).channelManager.getChannel(inChannelId);
+		inChannel.getFullState().state = ChannelState.NORMAL;
+		inChannel.getFullState().htlcs.set('received-2', {
+			id: 2n,
+			amountMsat: 50_000n,
+			paymentHash: crypto.randomBytes(32),
+			cltvExpiry: 800_040,
+			onionRoutingPacket: Buffer.alloc(1366),
+			direction: HtlcDirection.RECEIVED,
+			state: HtlcState.COMMITTED
+		});
 		const outChannelId = crypto.randomBytes(32);
 		const outHtlcId = 4n;
 		const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
