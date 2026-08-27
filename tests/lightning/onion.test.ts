@@ -530,7 +530,9 @@ describe('BOLT 4: Onion Routing', () => {
 		});
 
 		it('should reject deserializing wrong-size buffer', () => {
-			expect(() => decodeOnionPacket(Buffer.alloc(100))).to.throw('1366 bytes');
+			expect(() => decodeOnionPacket(Buffer.alloc(100))).to.throw(
+				'Onion packet must be 1366 or 32834 bytes'
+			);
 		});
 
 		it('should produce non-zero HMAC for constructed packets', () => {
