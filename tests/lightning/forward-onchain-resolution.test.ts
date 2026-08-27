@@ -423,6 +423,91 @@ describe('S-2.M3: on-chain timeout of a forwarded outgoing leg', function () {
 		fx.carol.destroy();
 	});
 
+	it('harvests a preimage stranded in restored monitor state (issue 557)', () => {
+		const fx = setupForwardWithResolvingOutgoingLeg();
+		const { alice, inChannelId, outChannelId, outKey } = fx;
+
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const inChan = (alice as any).channelManager.getChannel(inChannelId);
+		const outChan = (alice as any).channelManager.getChannel(outChannelId);
+		inChan.getFullState().htlcs.get('received-7').paymentHash = paymentHash;
+		outChan.getFullState().htlcs.get('offered-7').paymentHash = paymentHash;
+
+		// Crash aftermath: the outgoing monitor was persisted with the scanned
+		// preimage in knownPreimages (first commit), but the process died before
+		// PREIMAGE_LEARNED reached the node's preimage store (second commit).
+		// The restored monitor already records the spend, so the re-reported
+		// spend and a fresh scan are both suppressed on the next boot.
+		const monitor = (alice as any).channelManager.monitors.get(
+			outChannelId.toString('hex')
+		);
+		monitor._trackedOutputs[0].paymentHash = paymentHash;
+		monitor._knownPreimages.set(paymentHash.toString('hex'), preimage);
+
+		const UPDATE_FULFILL_HTLC = 130;
+		let fulfillsSentUpstream = 0;
+		alice.on('message:outbound', (pubkey: string, type: number) => {
+			if (pubkey === fx.bob.getNodeId() && type === UPDATE_FULFILL_HTLC)
+				fulfillsSentUpstream++;
+		});
+
+		// The startup restore path.
+		(alice as any).channelManager.restoreMonitor(
+			outChannelId.toString('hex'),
+			monitor
+		);
+
+		// The harvest re-emitted preimage:learned: the preimage reached the
+		// node store, the inbound leg settled upstream, and the linkage was
+		// consumed. Before the fix nothing recovered the preimage, so the
+		// inbound HTLC stayed COMMITTED until it was failed back or timed out.
+		expect((alice as any).preimages.has(paymentHash.toString('hex'))).to.equal(
+			true
+		);
+		expect(fulfillsSentUpstream).to.equal(1);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(false);
+		const inbound = inChan.getFullState().htlcs.get('received-7');
+		expect(
+			inbound === undefined || inbound.state === HtlcState.FULFILLED
+		).to.equal(true);
+
+		fx.alice.destroy();
+		fx.bob.destroy();
+		fx.carol.destroy();
+	});
+
+	it('does not re-emit a harvested preimage the node store already holds (issue 557)', () => {
+		const fx = setupForwardWithResolvingOutgoingLeg();
+		const { alice, outChannelId } = fx;
+
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+
+		// Both commits landed before the restart: the restore path re-records
+		// every stored preimage into the manager before monitors are restored.
+		(alice as any).preimages.set(paymentHash.toString('hex'), preimage);
+		(alice as any).channelManager.recordPreimage(paymentHash, preimage);
+
+		const monitor = (alice as any).channelManager.monitors.get(
+			outChannelId.toString('hex')
+		);
+		monitor._knownPreimages.set(paymentHash.toString('hex'), preimage);
+
+		let learned = 0;
+		(alice as any).channelManager.on('preimage:learned', () => learned++);
+		(alice as any).channelManager.restoreMonitor(
+			outChannelId.toString('hex'),
+			monitor
+		);
+
+		expect(learned).to.equal(0);
+
+		fx.alice.destroy();
+		fx.bob.destroy();
+		fx.carol.destroy();
+	});
+
 	it('leaves the forward alone when the preimage is already known', () => {
 		const fx = setupForwardWithResolvingOutgoingLeg();
 		const { alice, inChannelId, paymentHash, outKey, height } = fx;
