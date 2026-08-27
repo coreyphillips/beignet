@@ -12456,9 +12456,89 @@ export class LightningNode extends EventEmitter {
 		paymentSecret?: Buffer,
 		totalMsat?: bigint
 	): IPaymentInfo {
-		const hops = route.hops;
+		let hops = route.hops;
 		if (hops.length === 0) {
 			throw new Error('Route must have at least one hop');
+		}
+
+		// BOLT 4 self-introduction (issue #550): a blinded path can name US as
+		// its introduction node; the routine case is an unannounced node's
+		// BOLT 12 offer whose payment path runs through its direct peer, and
+		// we ARE that peer. There is no channel to ourselves, so the generic
+		// first-hop selection below failed the payment outright. A compliant
+		// payer processes its own introduction hop exactly as it would when
+		// relaying: decrypt the encrypted_data with the node key for the
+		// onward SCID and payment_relay, derive the next blinding point, and
+		// send the HTLC straight into the blinded segment with that point on
+		// update_add_htlc (the same field a relaying forward uses). We apply
+		// our own payment_relay inversion for the wire amount/CLTV, which
+		// means we do not charge ourselves the introduction fee.
+		let selfIntroBlinding: Buffer | undefined;
+		let selfIntroChannel: Channel | undefined;
+		let selfIntroAmountMsat: bigint | undefined;
+		let selfIntroCltvRel: number | undefined;
+		if (
+			hops.length >= 2 &&
+			hops[0].blindingPoint &&
+			hops[0].encryptedRecipientData &&
+			hops[0].pubkey.equals(getPublicKey(this.nodePrivkey))
+		) {
+			let hopData: IBlindedHopData;
+			let nextBlindingKey: Buffer;
+			try {
+				({ hopData, nextBlindingKey } = processBlindedHop(
+					hops[0].blindingPoint,
+					this.nodePrivkey,
+					hops[0].encryptedRecipientData
+				));
+			} catch {
+				throw new LightningPaymentError(
+					LightningErrorCode.NO_ROUTE,
+					'Cannot decrypt our own introduction hop of the blinded path'
+				);
+			}
+			if (!hopData.shortChannelId || !hopData.paymentRelay) {
+				throw new LightningPaymentError(
+					LightningErrorCode.NO_ROUTE,
+					'Our introduction hop names no onward channel or payment_relay'
+				);
+			}
+			const channel = this.resolveLocalChannelByScid(hopData.shortChannelId);
+			if (!channel) {
+				throw new LightningPaymentError(
+					LightningErrorCode.NO_CHANNEL_TO_HOP,
+					`No usable channel for the blinded path's onward SCID ` +
+						hopData.shortChannelId.toString('hex')
+				);
+			}
+			// The same ceiling inversion the relaying forward applies (BOLT 4):
+			// charging the proportional fee on the incoming amount instead
+			// forwards a few msat short and the downstream node fails the HTLC.
+			const relay = hopData.paymentRelay;
+			const inAmount = hops[0].amountToForwardMsat;
+			const propPlusOne = 1_000_000n + BigInt(relay.feeProportionalMillionths);
+			const outAmount =
+				((inAmount - BigInt(relay.feeBaseMsat)) * 1_000_000n +
+					propPlusOne -
+					1n) /
+				propPlusOne;
+			const outCltv = hops[0].outgoingCltvValue - relay.cltvExpiryDelta;
+			if (outAmount <= 0n || outCltv <= 0) {
+				throw new LightningPaymentError(
+					LightningErrorCode.NO_ROUTE,
+					'Blinded path payment_relay leaves nothing to forward'
+				);
+			}
+			selfIntroBlinding = nextBlindingKey;
+			selfIntroChannel = channel;
+			selfIntroAmountMsat = outAmount;
+			selfIntroCltvRel = outCltv;
+			// The onion starts at the SECOND blinded hop (it must be encrypted
+			// to the blinded node ids; the peer derives its key from the
+			// blinding point we attach to the add). The hops' own fields stay
+			// untouched: the final payload keeps the recipient's exact amount
+			// and CLTV, while the wire amount/CLTV above carry our headroom.
+			hops = hops.slice(1);
 		}
 
 		// Route CLTV values are RELATIVE deltas (from pathfinding). Each hop's
@@ -12533,9 +12613,13 @@ export class LightningNode extends EventEmitter {
 		// Find outgoing channel to first hop. When the route's first-hop SCID
 		// names one of OUR channels to that peer (e.g. a circular rebalance that
 		// must leave over a specific channel), honor it; otherwise fall back to
-		// smart selection by balance (Fix 3.3).
+		// smart selection by balance (Fix 3.3). A self-introduction send has
+		// already resolved its channel from OUR decrypted hop's onward SCID:
+		// the first remaining hop's pubkey is a BLINDED id, which no peer
+		// lookup can resolve.
 		const firstHopPubkey = hops[0].pubkey.toString('hex');
 		const outChannel =
+			selfIntroChannel ??
 			this.findLocalChannelByScid(hops[0].shortChannelId, firstHopPubkey) ??
 			this.findChannelForPeer(firstHopPubkey, hops[0].amountToForwardMsat);
 		if (!outChannel) {
@@ -12546,8 +12630,9 @@ export class LightningNode extends EventEmitter {
 		}
 
 		const channelId = outChannel.getChannelId()!;
-		const cltvExpiry = hops[0].outgoingCltvValue + baseHeight;
-		const amount = hops[0].amountToForwardMsat;
+		const cltvExpiry =
+			(selfIntroCltvRel ?? hops[0].outgoingCltvValue) + baseHeight;
+		const amount = selfIntroAmountMsat ?? hops[0].amountToForwardMsat;
 
 		// Create payment info BEFORE addHtlc because in synchronous loopback
 		// the entire fulfill chain runs during addHtlc
@@ -12603,7 +12688,11 @@ export class LightningNode extends EventEmitter {
 			amount,
 			paymentHash,
 			cltvExpiry,
-			onionBuf
+			onionBuf,
+			// Self-introduction send (issue #550): the peer inside the blinded
+			// segment derives its key from this point, delivered on
+			// update_add_htlc exactly as a relaying forward delivers it.
+			selfIntroBlinding
 		);
 		if (!result.ok) {
 			payment.status = PaymentStatus.FAILED;
@@ -18671,6 +18760,34 @@ export class LightningNode extends EventEmitter {
 	 * of OUR usable channels to that peer. Returns undefined when the SCID does
 	 * not name a local channel -- callers then fall back to peer-based selection.
 	 */
+	/**
+	 * Resolve one of OUR usable channels by any SCID it answers to: the real
+	 * SCID, our alias, or the alias the peer gave us. Peer-agnostic, for the
+	 * self-introduction blinded send (issue #550), where the SCID comes out
+	 * of our own decrypted hop and the next node is known only by its blinded
+	 * id. Prefers the registered mapping, falls back to a channel scan so
+	 * alias-only channels resolve too.
+	 */
+	private resolveLocalChannelByScid(scid: Buffer): Channel | undefined {
+		const mapped = this.scidToChannelId.get(scid.toString('hex'));
+		if (mapped) {
+			const channel = this.channelManager.getChannel(mapped);
+			if (channel && channel.acceptsNewHtlcs()) return channel;
+		}
+		for (const channel of this.channelManager.listChannels()) {
+			if (!channel.acceptsNewHtlcs()) continue;
+			const st = channel.getFullState();
+			if (
+				(st.shortChannelId && st.shortChannelId.equals(scid)) ||
+				(st.scidAlias && st.scidAlias.equals(scid)) ||
+				(st.remoteScidAlias && st.remoteScidAlias.equals(scid))
+			) {
+				return channel;
+			}
+		}
+		return undefined;
+	}
+
 	private findLocalChannelByScid(
 		scid: Buffer | undefined,
 		peerPubkeyHex: string
