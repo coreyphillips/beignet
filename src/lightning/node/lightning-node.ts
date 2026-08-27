@@ -12304,7 +12304,15 @@ export class LightningNode extends EventEmitter {
 					'No route to blinded path introduction node'
 				);
 			}
-			if (maxFeeMsat !== undefined && blindedRoute.totalFeeMsat > maxFeeMsat) {
+			// The fee cap judges the fee actually PAID: a self-introduction
+			// send removes our own introduction fee on the wire, so a
+			// genuinely zero-fee payment must pass maxFeeMsat 0 (issue #550
+			// review). prepareSelfIntroSend also validates the path, so an
+			// unusable self-intro path fails here by name.
+			const selfIntroForCap = this.prepareSelfIntroSend(blindedRoute);
+			const effectiveFeeMsat =
+				selfIntroForCap?.wireRoute.totalFeeMsat ?? blindedRoute.totalFeeMsat;
+			if (maxFeeMsat !== undefined && effectiveFeeMsat > maxFeeMsat) {
 				throw new LightningPaymentError(
 					LightningErrorCode.FEE_EXCEEDS_MAX,
 					'Route fee exceeds maximum'
@@ -12456,90 +12464,24 @@ export class LightningNode extends EventEmitter {
 		paymentSecret?: Buffer,
 		totalMsat?: bigint
 	): IPaymentInfo {
-		let hops = route.hops;
-		if (hops.length === 0) {
+		if (route.hops.length === 0) {
 			throw new Error('Route must have at least one hop');
 		}
 
 		// BOLT 4 self-introduction (issue #550): a blinded path can name US as
 		// its introduction node; the routine case is an unannounced node's
 		// BOLT 12 offer whose payment path runs through its direct peer, and
-		// we ARE that peer. There is no channel to ourselves, so the generic
-		// first-hop selection below failed the payment outright. A compliant
-		// payer processes its own introduction hop exactly as it would when
-		// relaying: decrypt the encrypted_data with the node key for the
-		// onward SCID and payment_relay, derive the next blinding point, and
-		// send the HTLC straight into the blinded segment with that point on
-		// update_add_htlc (the same field a relaying forward uses). We apply
-		// our own payment_relay inversion for the wire amount/CLTV, which
-		// means we do not charge ourselves the introduction fee.
-		let selfIntroBlinding: Buffer | undefined;
-		let selfIntroChannel: Channel | undefined;
-		let selfIntroAmountMsat: bigint | undefined;
-		let selfIntroCltvRel: number | undefined;
-		if (
-			hops.length >= 2 &&
-			hops[0].blindingPoint &&
-			hops[0].encryptedRecipientData &&
-			hops[0].pubkey.equals(getPublicKey(this.nodePrivkey))
-		) {
-			let hopData: IBlindedHopData;
-			let nextBlindingKey: Buffer;
-			try {
-				({ hopData, nextBlindingKey } = processBlindedHop(
-					hops[0].blindingPoint,
-					this.nodePrivkey,
-					hops[0].encryptedRecipientData
-				));
-			} catch {
-				throw new LightningPaymentError(
-					LightningErrorCode.NO_ROUTE,
-					'Cannot decrypt our own introduction hop of the blinded path'
-				);
-			}
-			if (!hopData.shortChannelId || !hopData.paymentRelay) {
-				throw new LightningPaymentError(
-					LightningErrorCode.NO_ROUTE,
-					'Our introduction hop names no onward channel or payment_relay'
-				);
-			}
-			const channel = this.resolveLocalChannelByScid(hopData.shortChannelId);
-			if (!channel) {
-				throw new LightningPaymentError(
-					LightningErrorCode.NO_CHANNEL_TO_HOP,
-					`No usable channel for the blinded path's onward SCID ` +
-						hopData.shortChannelId.toString('hex')
-				);
-			}
-			// The same ceiling inversion the relaying forward applies (BOLT 4):
-			// charging the proportional fee on the incoming amount instead
-			// forwards a few msat short and the downstream node fails the HTLC.
-			const relay = hopData.paymentRelay;
-			const inAmount = hops[0].amountToForwardMsat;
-			const propPlusOne = 1_000_000n + BigInt(relay.feeProportionalMillionths);
-			const outAmount =
-				((inAmount - BigInt(relay.feeBaseMsat)) * 1_000_000n +
-					propPlusOne -
-					1n) /
-				propPlusOne;
-			const outCltv = hops[0].outgoingCltvValue - relay.cltvExpiryDelta;
-			if (outAmount <= 0n || outCltv <= 0) {
-				throw new LightningPaymentError(
-					LightningErrorCode.NO_ROUTE,
-					'Blinded path payment_relay leaves nothing to forward'
-				);
-			}
-			selfIntroBlinding = nextBlindingKey;
-			selfIntroChannel = channel;
-			selfIntroAmountMsat = outAmount;
-			selfIntroCltvRel = outCltv;
-			// The onion starts at the SECOND blinded hop (it must be encrypted
-			// to the blinded node ids; the peer derives its key from the
-			// blinding point we attach to the add). The hops' own fields stay
-			// untouched: the final payload keeps the recipient's exact amount
-			// and CLTV, while the wire amount/CLTV above carry our headroom.
-			hops = hops.slice(1);
-		}
+		// we ARE that peer. prepareSelfIntroSend processes our own hop the way
+		// a relaying forward would and hands back the wire-true view: the
+		// onion starts at the SECOND blinded hop, the amount/CLTV have our
+		// payment_relay inverted away (we do not charge ourselves the
+		// introduction fee), and the next blinding point rides
+		// update_add_htlc. Everything recorded below (payment.route, shared
+		// secrets, failure indices) uses that wire-true route, so failure
+		// attribution and the height-skew retry read the hop that actually
+		// erred (issue #550 review).
+		const selfIntro = this.prepareSelfIntroSend(route);
+		const hops = selfIntro ? selfIntro.wireRoute.hops : route.hops;
 
 		// Route CLTV values are RELATIVE deltas (from pathfinding). Each hop's
 		// outgoing_cltv_value on the wire must be ABSOLUTE (current block height +
@@ -12619,7 +12561,7 @@ export class LightningNode extends EventEmitter {
 		// lookup can resolve.
 		const firstHopPubkey = hops[0].pubkey.toString('hex');
 		const outChannel =
-			selfIntroChannel ??
+			selfIntro?.outChannel ??
 			this.findLocalChannelByScid(hops[0].shortChannelId, firstHopPubkey) ??
 			this.findChannelForPeer(firstHopPubkey, hops[0].amountToForwardMsat);
 		if (!outChannel) {
@@ -12631,8 +12573,8 @@ export class LightningNode extends EventEmitter {
 
 		const channelId = outChannel.getChannelId()!;
 		const cltvExpiry =
-			(selfIntroCltvRel ?? hops[0].outgoingCltvValue) + baseHeight;
-		const amount = selfIntroAmountMsat ?? hops[0].amountToForwardMsat;
+			(selfIntro?.wireCltvRel ?? hops[0].outgoingCltvValue) + baseHeight;
+		const amount = selfIntro?.wireAmountMsat ?? hops[0].amountToForwardMsat;
 
 		// Create payment info BEFORE addHtlc because in synchronous loopback
 		// the entire fulfill chain runs during addHtlc
@@ -12642,7 +12584,12 @@ export class LightningNode extends EventEmitter {
 			status: PaymentStatus.PENDING,
 			direction: PaymentDirection.OUTGOING,
 			cltvBaseHeight: baseHeight,
-			route: route as {
+			// The WIRE-TRUE route: for a self-introduction send this is the
+			// sliced tail with the intro fee removed from the totals, so
+			// failure indices decoded against sharedSecrets name the hop that
+			// actually erred and the reported fee is the fee actually paid
+			// (issue #550 review).
+			route: (selfIntro?.wireRoute ?? route) as {
 				hops: Array<{
 					pubkey: Buffer;
 					shortChannelId: Buffer;
@@ -12692,7 +12639,7 @@ export class LightningNode extends EventEmitter {
 			// Self-introduction send (issue #550): the peer inside the blinded
 			// segment derives its key from this point, delivered on
 			// update_add_htlc exactly as a relaying forward delivers it.
-			selfIntroBlinding
+			selfIntro?.blindingPoint
 		);
 		if (!result.ok) {
 			payment.status = PaymentStatus.FAILED;
@@ -15701,7 +15648,23 @@ export class LightningNode extends EventEmitter {
 
 		// Decrypt failure message if we have shared secrets
 		let failureData: Buffer | undefined;
-		if (failureSecrets && reason.length > 0) {
+		// BOLT 2: update_fail_malformed_htlc carries a BARE failure code with
+		// the BADONION bit (the channel layer surfaces it as a synthetic
+		// 4-byte reason), not an onion-encrypted blob. Only our DIRECT peer
+		// can send it (a downstream malformed gets wrapped by the relays), so
+		// attribute it to wire hop 0 instead of feeding it to the failure
+		// decryptor, where it can never match an HMAC. Without this a
+		// compliant blinded peer's invalid_onion_blinding was unreadable, the
+		// broken path was never excluded, and the retry hammered it while a
+		// working path sat unused (issue #550 review).
+		if (
+			reason.length === 4 &&
+			(reason.readUInt16BE(0) & 0x8000) !== 0 &&
+			reason.readUInt16BE(2) === 0
+		) {
+			payment.failureCode = reason.readUInt16BE(0);
+			payment.failureSourceIndex = 0;
+		} else if (failureSecrets && reason.length > 0) {
 			const result = decryptFailureMessage(failureSecrets, reason);
 			if (result) {
 				payment.failureCode = result.failure.failureCode;
@@ -17556,6 +17519,27 @@ export class LightningNode extends EventEmitter {
 					// (private channels; a fresh interop channel paying a CLN offer).
 					this.getLocalChannelEdges()
 				);
+				// A self-introduction path is accepted by route construction as
+				// the bare tail BEFORE its decryption, constraints or channel
+				// resolution ran, so a locally unusable path would end the scan
+				// here and abort the payment even when the invoice advertises
+				// another usable path (issue #550 review). Validate now and
+				// keep scanning on a typed local refusal.
+				if (blindedRoute) {
+					try {
+						this.prepareSelfIntroSend(blindedRoute);
+					} catch (err) {
+						if (
+							err instanceof LightningPaymentError &&
+							(err.code === LightningErrorCode.NO_ROUTE ||
+								err.code === LightningErrorCode.NO_CHANNEL_TO_HOP)
+						) {
+							blindedRoute = null;
+							continue;
+						}
+						throw err;
+					}
+				}
 				if (blindedRoute) pathIndex = i;
 			}
 			if (!blindedRoute) {
@@ -18760,6 +18744,165 @@ export class LightningNode extends EventEmitter {
 	 * of OUR usable channels to that peer. Returns undefined when the SCID does
 	 * not name a local channel -- callers then fall back to peer-based selection.
 	 */
+	/**
+	 * Process OUR OWN introduction hop of a blinded route (issue #550), or
+	 * return null when the route's first hop is not us-as-introduction.
+	 *
+	 * Mirrors the relaying forward's blinded-hop handling, checks included
+	 * (issue #550 review): the encrypted_data must carry payment_relay and
+	 * EXACTLY ONE of short_channel_id / next_node_id (BOLT 4); the onward
+	 * channel resolves by SCID or, for a next_node_id path, by peer; and
+	 * payment_constraints are enforced here the way the relay enforces them,
+	 * because past this point no one else will on our behalf. The wire
+	 * amount/CLTV apply the relay's ceiling inversion, so we never charge
+	 * ourselves the introduction fee, and the returned wireRoute (sliced
+	 * tail, adjusted totals) is what callers must store and check fee caps
+	 * against. Throws LightningPaymentError (NO_ROUTE / NO_CHANNEL_TO_HOP)
+	 * on an unusable path, which path-selection loops treat as "try the
+	 * invoice's next path".
+	 */
+	private prepareSelfIntroSend(route: {
+		hops: Array<{
+			pubkey: Buffer;
+			shortChannelId: Buffer;
+			amountToForwardMsat: bigint;
+			outgoingCltvValue: number;
+			encryptedRecipientData?: Buffer;
+			blindingPoint?: Buffer;
+		}>;
+		totalAmountMsat?: bigint;
+		totalCltvDelta?: number;
+		totalFeeMsat?: bigint;
+	}): {
+		wireRoute: {
+			hops: typeof route.hops;
+			totalAmountMsat: bigint;
+			totalCltvDelta: number;
+			totalFeeMsat: bigint;
+		};
+		outChannel: Channel;
+		blindingPoint: Buffer;
+		wireAmountMsat: bigint;
+		wireCltvRel: number;
+		introFeeMsat: bigint;
+	} | null {
+		const hops = route.hops;
+		if (
+			hops.length < 2 ||
+			!hops[0].blindingPoint ||
+			!hops[0].encryptedRecipientData ||
+			!hops[0].pubkey.equals(getPublicKey(this.nodePrivkey))
+		) {
+			return null;
+		}
+		let hopData: IBlindedHopData;
+		let nextBlindingKey: Buffer;
+		try {
+			({ hopData, nextBlindingKey } = processBlindedHop(
+				hops[0].blindingPoint,
+				this.nodePrivkey,
+				hops[0].encryptedRecipientData
+			));
+		} catch {
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_ROUTE,
+				'Cannot decrypt our own introduction hop of the blinded path'
+			);
+		}
+		if (!hopData.paymentRelay) {
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_ROUTE,
+				'Our introduction hop carries no payment_relay'
+			);
+		}
+		// BOLT 4: exactly one of short_channel_id / next_node_id per relay
+		// hop. Both present is the malformed shape a relay rejects; neither
+		// names no onward direction at all.
+		if (hopData.shortChannelId && hopData.nextNodeId) {
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_ROUTE,
+				'Our introduction hop carries both short_channel_id and next_node_id'
+			);
+		}
+		if (!hopData.shortChannelId && !hopData.nextNodeId) {
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_ROUTE,
+				'Our introduction hop names no onward channel'
+			);
+		}
+		// The relay's ceiling inversion (BOLT 4): charging the proportional
+		// fee on the incoming amount instead forwards a few msat short and
+		// the downstream node fails the HTLC.
+		const relay = hopData.paymentRelay;
+		const inAmount = hops[0].amountToForwardMsat;
+		const propPlusOne = 1_000_000n + BigInt(relay.feeProportionalMillionths);
+		const outAmount =
+			((inAmount - BigInt(relay.feeBaseMsat)) * 1_000_000n + propPlusOne - 1n) /
+			propPlusOne;
+		const outCltv = hops[0].outgoingCltvValue - relay.cltvExpiryDelta;
+		if (outAmount <= 0n || outCltv <= 0) {
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_ROUTE,
+				'Blinded path payment_relay leaves nothing to forward'
+			);
+		}
+		// payment_constraints, enforced the way the relay enforces them
+		// (issue #550 review): the notional incoming expiry must sit under
+		// the path's absolute bound, and the amount over its minimum. An
+		// expired path must fail HERE by name, not complete or die opaquely
+		// downstream.
+		const constraints = hopData.paymentConstraints;
+		if (constraints) {
+			const absIncomingCltv =
+				hops[0].outgoingCltvValue + this.currentBlockHeight;
+			if (absIncomingCltv > constraints.maxCltvExpiry) {
+				throw new LightningPaymentError(
+					LightningErrorCode.NO_ROUTE,
+					'Blinded path expired: max_cltv_expiry is behind the required expiry'
+				);
+			}
+			if (inAmount < constraints.htlcMinimumMsat) {
+				throw new LightningPaymentError(
+					LightningErrorCode.NO_ROUTE,
+					'Amount below the blinded path htlc_minimum_msat'
+				);
+			}
+		}
+		const outChannel = hopData.shortChannelId
+			? this.resolveLocalChannelByScid(hopData.shortChannelId)
+			: this.findChannelForPeer(hopData.nextNodeId!.toString('hex'), outAmount);
+		if (!outChannel) {
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_CHANNEL_TO_HOP,
+				hopData.shortChannelId
+					? `No usable channel for the blinded path's onward SCID ` +
+					  hopData.shortChannelId.toString('hex')
+					: `No usable channel to the blinded path's next node ` +
+					  hopData.nextNodeId!.toString('hex')
+			);
+		}
+		// The wire-true route: the onion starts at the SECOND blinded hop
+		// (still encrypted to the blinded node ids; the peer derives its key
+		// from the blinding point on the add). The hops' own fields stay
+		// untouched, so the final payload keeps the recipient's exact amount
+		// and CLTV; only the totals shed our introduction fee.
+		const introFeeMsat = inAmount - outAmount;
+		const totalFee = route.totalFeeMsat ?? 0n;
+		return {
+			wireRoute: {
+				hops: hops.slice(1),
+				totalAmountMsat: outAmount,
+				totalCltvDelta: outCltv,
+				totalFeeMsat: totalFee > introFeeMsat ? totalFee - introFeeMsat : 0n
+			},
+			outChannel,
+			blindingPoint: nextBlindingKey,
+			wireAmountMsat: outAmount,
+			wireCltvRel: outCltv,
+			introFeeMsat
+		};
+	}
+
 	/**
 	 * Resolve one of OUR usable channels by any SCID it answers to: the real
 	 * SCID, our alias, or the alias the peer gave us. Peer-agnostic, for the
