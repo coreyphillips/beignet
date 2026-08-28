@@ -178,6 +178,7 @@ import {
 	PaymentDirection,
 	IPendingMppPayment,
 	IPaymentPart,
+	IForwardablePart,
 	IInvoiceInfo,
 	LightningErrorCode,
 	LightningPaymentError,
@@ -15909,59 +15910,17 @@ export class LightningNode extends EventEmitter {
 		// complete the whole fulfillment chain during addHtlc, so we track the
 		// outgoing→incoming link BEFORE forwarding (same timing as payment storage).
 		const performForward = (): void => {
-			const nextOnionBuf = encodeOnionPacket(nextPacket);
-			const outChannel = this.channelManager.getChannel(outChannelId);
-			const outHtlcId = outChannel
-				? outChannel.getFullState().localHtlcCounter
-				: 0n;
-			const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
-			this.forwardedHtlcs.set(outKey, { inChannelId, inHtlcId });
-
-			// The linkage and the outgoing add are ONE safety transition
-			// (docs/RECOVERY-PROTOCOL.md 5.1): a crash between them would leave
-			// an HTLC in flight downstream with no record of the inbound leg it
-			// pays for, so the downstream preimage could never be applied
-			// upstream and the forwarded value would be lost.
-			let result: ChannelResult | null = null;
-			this.withStagedMutations(
-				[{ type: 'forwarded_htlc', outKey, inChannelId, inHtlcId }],
-				() => {
-					// For a blinded forward, hand the next hop its blinding point and
-					// use the payment_relay-derived amount/CLTV.
-					result = this.channelManager.addHtlc(
-						outChannelId,
-						forwardAmount,
-						paymentHash,
-						forwardCltv,
-						nextOnionBuf,
-						nextBlindingPoint
-					);
-				}
-			);
-
-			if (!result || !(result as ChannelResult).ok) {
-				// Forward failed — fail the incoming HTLC back. Drop the persisted
-				// row too, not just the in-memory one: the outgoing id was read off
-				// localHtlcCounter before the add, and a refused add does not consume
-				// it, so a surviving row maps an id a later unrelated HTLC will take
-				// onto this inbound leg and would settle it against the wrong payment.
-				this.forwardedHtlcs.delete(outKey);
-				this.withStagedMutations(
-					[{ type: 'delete_forwarded_htlc', outKey }],
-					() => {
-						failIncoming(TEMPORARY_CHANNEL_FAILURE);
-					}
-				);
-				return;
-			}
-
-			this.emit(
-				'htlc:forward',
+			this.forwardHtlcOnto(outChannelId, {
 				inChannelId,
-				outChannelId,
-				forwardAmount,
-				paymentHash
-			);
+				inHtlcId,
+				paymentHash,
+				forwardAmountMsat: forwardAmount,
+				forwardCltv,
+				incomingCltvExpiry,
+				nextPacket,
+				nextBlindingPoint,
+				failIncoming
+			});
 		};
 
 		// Async payments (LSP role): the recipient's blinded path marked this hop
@@ -15995,6 +15954,83 @@ export class LightningNode extends EventEmitter {
 		}
 
 		performForward();
+	}
+
+	/**
+	 * Place one forward onto an outgoing channel. Shared by the normal
+	 * forwarding path, async-payment releases, and JIT releases, where the
+	 * outgoing channel did not exist when the HTLC arrived.
+	 *
+	 * The linkage write and the outgoing add are ONE safety transition
+	 * (docs/RECOVERY-PROTOCOL.md 5.1) and stay that way here: a crash between
+	 * them would leave an HTLC in flight downstream with no record of the
+	 * inbound leg it pays for, so the downstream preimage could never be
+	 * applied upstream and the forwarded value would be lost. A caller that
+	 * retries a refused forward is therefore re-entering this method, not
+	 * patching up half a transition from outside it.
+	 */
+	private forwardHtlcOnto(
+		outChannelId: Buffer,
+		part: IForwardablePart
+	): void {
+		const nextOnionBuf = encodeOnionPacket(part.nextPacket);
+		const outChannel = this.channelManager.getChannel(outChannelId);
+		const outHtlcId = outChannel
+			? outChannel.getFullState().localHtlcCounter
+			: 0n;
+		const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
+		this.forwardedHtlcs.set(outKey, {
+			inChannelId: part.inChannelId,
+			inHtlcId: part.inHtlcId
+		});
+
+		let result: ChannelResult | null = null;
+		this.withStagedMutations(
+			[
+				{
+					type: 'forwarded_htlc',
+					outKey,
+					inChannelId: part.inChannelId,
+					inHtlcId: part.inHtlcId
+				}
+			],
+			() => {
+				// For a blinded forward, hand the next hop its blinding point and
+				// use the payment_relay-derived amount/CLTV.
+				result = this.channelManager.addHtlc(
+					outChannelId,
+					part.forwardAmountMsat,
+					part.paymentHash,
+					part.forwardCltv,
+					nextOnionBuf,
+					part.nextBlindingPoint
+				);
+			}
+		);
+
+		if (!result || !(result as ChannelResult).ok) {
+			// Forward failed — fail the incoming HTLC back. Drop the persisted
+			// row too, not just the in-memory one: the outgoing id was read off
+			// localHtlcCounter before the add, and a refused add does not consume
+			// it, so a surviving row maps an id a later unrelated HTLC will take
+			// onto this inbound leg and would settle it against the wrong payment.
+			this.forwardedHtlcs.delete(outKey);
+			this.withStagedMutations(
+				[{ type: 'delete_forwarded_htlc', outKey }],
+				() => {
+					part.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+				}
+			);
+			return;
+		}
+
+		this.emit(
+			'htlc:forward',
+			part.inChannelId,
+			outChannelId,
+			part.forwardAmountMsat,
+			part.paymentHash
+		);
 	}
 
 	/**

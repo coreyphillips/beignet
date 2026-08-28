@@ -970,6 +970,32 @@ export interface ILightningBalance {
 	unsettledBalanceMsat: bigint;
 }
 
+/**
+ * Everything needed to place one forward onto an outgoing channel, carried as
+ * a record so the forward can happen LATER than the HTLC that asked for it:
+ * after an async-payment release, or onto a channel that did not exist when
+ * the HTLC arrived (JIT receive). `forwardAmountMsat` is deliberately mutable
+ * so an LSP can deduct an agreed opening fee before the add.
+ */
+export interface IForwardablePart {
+	inChannelId: Buffer;
+	inHtlcId: bigint;
+	paymentHash: Buffer;
+	forwardAmountMsat: bigint;
+	forwardCltv: number;
+	/** The INBOUND leg's expiry: the deadline every hold is bounded by. */
+	incomingCltvExpiry: number;
+	nextPacket: {
+		version: number;
+		ephemeralKey: Buffer;
+		routingInfo: Buffer;
+		hmac: Buffer;
+	};
+	nextBlindingPoint?: Buffer;
+	/** Fail the inbound leg upstream, blinded-safe (see handleForwardHtlc). */
+	failIncoming: (failureCode: number) => void;
+}
+
 export interface ICreateInvoiceResult {
 	bolt11: string;
 	paymentHash: Buffer;
