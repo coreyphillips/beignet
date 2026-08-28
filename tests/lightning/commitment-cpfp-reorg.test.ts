@@ -386,6 +386,65 @@ describe('Issue #578: commitment CPFP survives a confirmation and a reorg', func
 		fx.destroy();
 	});
 
+	it('keeps bumping ours while a competitor holds the mempool (#589 scope)', async () => {
+		// The differing-txid check is scoped to the demoted arm on purpose. On the
+		// ordinary unconfirmed path a differing record is the live force-close
+		// race: whichever spend the watcher saw first becomes the record, and a
+		// peer's mempool commitment recorded ahead of ours does NOT replace our
+		// entry (_maybeCpfpTheirCommitment defers to a tracked package). Dropping
+		// the entry there would leave OUR commitment unbumped for the whole race,
+		// which is the issue #578 fund loss.
+		const fx = await setup(5787);
+		fx.alice.handleNewBlock(99);
+		const forced = fx.alice.forceCloseChannel(
+			fx.channelId,
+			destScript(fx.alice)
+		);
+		await tick();
+		const closeTx = bitcoin.Transaction.fromHex(
+			fx.backend.broadcasts.find(
+				(hex) =>
+					bitcoin.Transaction.fromHex(hex).getId() === forced.commitmentTxid
+			)!
+		);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const cm = fx.alice.getChannelManager() as any;
+		const idHex = fx.channelId.toString('hex');
+		cm.on('error', () => {});
+
+		const competitor = new bitcoin.Transaction();
+		competitor.version = 2;
+		competitor.addInput(closeTx.ins[0].hash, closeTx.ins[0].index);
+		competitor.addOutput(destScript(fx.alice), 900_000);
+		cm.handleFundingSpent(fx.channelId, competitor, 0, destScript(fx.alice));
+		await tick();
+		const monitor = cm.getMonitor(fx.channelId);
+		expect(monitor.isCommitmentConfirmed(), 'competitor unconfirmed').to.equal(
+			false
+		);
+		expect(monitor.getFullState().commitmentBroadcast.txid).to.equal(
+			competitor.getId()
+		);
+		const entry = cm._pendingCommitmentCpfp.get(idHex);
+		expect(entry.action.commitmentTxid, 'entry still ours').to.equal(
+			closeTx.getId()
+		);
+		expect(entry.sawConfirmation, 'never confirmed').to.not.equal(true);
+
+		const rebroadcast: Buffer[] = [];
+		cm.on('broadcast:tx', (tx: Buffer) => rebroadcast.push(tx));
+		cm.reCpfpStuckCommitments(105, 500);
+		await tick();
+
+		expect(
+			rebroadcast.some(
+				(tx) => bitcoin.Transaction.fromBuffer(tx).getId() === closeTx.getId()
+			),
+			'our commitment still re-bid'
+		).to.equal(true);
+		fx.destroy();
+	});
+
 	it('does not re-broadcast on an ordinary unconfirmed re-report', async () => {
 		// The commitment was never confirmed, so nothing was demoted. The watch
 		// re-reports the mempool sighting every sweep; re-broadcasting there would
