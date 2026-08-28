@@ -335,21 +335,29 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		);
 		driveForward(alice, first.interceptScid);
 		await opened;
-		// A second intent keeps bob a JIT client after the first was consumed.
-		registerIntent(pair);
+		// The splice spends an intent of its own: the payment below is 900_000
+		// sat, so an intent that does not cover it authorizes nothing.
+		registerIntent(pair, { maxAmountMsat: 900_000_000n });
 
 		const events: string[] = [];
 		alice.on('jit:funding', (d: { channelIdHex?: string }) =>
 			events.push(`funding:${d.channelIdHex ?? 'open'}`)
 		);
 		alice.on('jit:failed', () => events.push('failed'));
-		const settled = new Promise<void>((resolve) =>
-			alice.once('jit:failed', () => resolve())
-		);
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const scidHex = [...(alice as any).scidToChannelId.keys()][0] as string;
 		const channelId = alice.listChannels()[0].channelId.toString('hex');
+		// A payment past what the live intent registered for is never spliced
+		// for: being a JIT client is not the authorization, the intent is.
+		driveForward(alice, Buffer.from(scidHex, 'hex'), {
+			amountMsat: 950_000_000n
+		});
+		expect(events.filter((e) => e.startsWith('funding'))).to.deep.equal([]);
+
+		const settled = new Promise<void>((resolve) =>
+			alice.once('jit:failed', () => resolve())
+		);
 		// Far past alice's 37000 sat side of the channel, so the add is refused
 		// for liquidity: for a JIT client that is a splice, not a dead end.
 		driveForward(alice, Buffer.from(scidHex, 'hex'), {
@@ -361,7 +369,7 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		// anything failed: the hook sits in forwardHtlcOnto's refusal arm.
 		// The splice itself cannot run without a wallet selection provider, so
 		// it then fails the part cleanly rather than leaking it.
-		expect(events[0]).to.equal(`funding:${channelId}`);
+		expect(events).to.include(`funding:${channelId}`);
 		expect(events).to.include('failed');
 	});
 
@@ -418,8 +426,9 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 					routingInfo: Buffer.alloc(ROUTING_INFO_LENGTH),
 					hmac: crypto.randomBytes(32)
 				},
-				failIncoming: (code: number): void => {
+				failIncoming: (code: number): boolean => {
 					failures.push(code);
+					return true;
 				}
 			})
 		).to.equal(true);
@@ -588,6 +597,78 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 				false
 			);
 			expect(storage.loadMetadata('jit:held')).to.equal('[]');
+		} finally {
+			node.destroy();
+			storage.close?.();
+		}
+	});
+
+	it('never re-dispatches an HTLC the restored hold queue owes a refund', function () {
+		// The restore repair re-dispatches committed inbound HTLCs whose
+		// forward this process lost. One the JIT engine was holding is already
+		// owed a refund, so dispatching it would forward a payment the sweep is
+		// about to fail upstream: paid downstream and refunded upstream.
+		const inChannelId = crypto.randomBytes(32);
+		const peerId = '02' + 'ee'.repeat(32);
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const node = new LightningNode({
+			...nodeConfig('redispatch'),
+			storage,
+			jitReceive: { enabled: true }
+		});
+		node.on('error', () => undefined);
+		node.on('node:error', () => undefined);
+		try {
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 200_000n,
+				pushMsat: 100_000_000n,
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			state.channelId = inChannelId;
+			for (const id of [4n, 5n]) {
+				state.htlcs.set(`received-${id}`, {
+					id,
+					amountMsat: 1_000_000n,
+					paymentHash: crypto.randomBytes(32),
+					cltvExpiry: 800_400,
+					direction: HtlcDirection.RECEIVED,
+					state: HtlcState.COMMITTED,
+					onionRoutingPacket: Buffer.alloc(1366),
+					forwardEmitted: true
+				});
+			}
+			const manager = node.getChannelManager();
+			manager.restoreChannel(new Channel(state), peerId);
+
+			// Only HTLC 4 was held by the engine when the process went away.
+			storage.saveMetadata(
+				'jit:held',
+				JSON.stringify([
+					{
+						inChannelIdHex: inChannelId.toString('hex'),
+						inHtlcId: '4',
+						paymentHashHex: crypto.randomBytes(32).toString('hex'),
+						amountMsat: '1000000',
+						incomingCltvExpiry: 800_400,
+						disposition: 'fail'
+					}
+				])
+			);
+			node.getJitReceiveManager()!.restore();
+
+			const dispatched: bigint[] = [];
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(node as any).handleIncomingHtlc = (_cid: Buffer, id: bigint): void => {
+				dispatched.push(id);
+			};
+			manager.emit('channel:restore-ready', inChannelId);
+
+			// The unheld one is still repaired: the guard is scoped to the queue.
+			expect(dispatched).to.deep.equal([5n]);
 		} finally {
 			node.destroy();
 			storage.close?.();

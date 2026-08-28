@@ -116,8 +116,13 @@ describe('Issue #176: forwarding opt-out and forward logging', function () {
 			addHtlcCalls++;
 			return { ok: true };
 		};
-		cm.failHtlc = (_c: Buffer, _id: bigint, reason: Buffer): void => {
+		cm.failHtlc = (
+			_c: Buffer,
+			_id: bigint,
+			reason: Buffer
+		): { ok: boolean } => {
 			failHtlcCalls.push({ reason });
+			return { ok: true };
 		};
 		node.on('log', (l: IStructuredLog) => logs.push(l));
 		node.on('error', () => {});

@@ -1008,8 +1008,13 @@ export interface IForwardablePart {
 		hmac: Buffer;
 	};
 	nextBlindingPoint?: Buffer;
-	/** Fail the inbound leg upstream, blinded-safe (see handleForwardHtlc). */
-	failIncoming: (failureCode: number) => void;
+	/**
+	 * Fail the inbound leg upstream, blinded-safe (see handleForwardHtlc).
+	 * Returns false when the channel could not carry the failure (it is
+	 * reestablishing, say), which a holder must treat as an obligation it
+	 * still owes rather than as a resolution.
+	 */
+	failIncoming: (failureCode: number) => boolean;
 }
 
 export interface ICreateInvoiceResult {
@@ -1150,6 +1155,20 @@ export class InvalidSpliceError extends InvalidRequestError {
 	constructor(message: string) {
 		super(message);
 		this.name = 'InvalidSpliceError';
+	}
+}
+
+/**
+ * An open or splice that did not FINISH within the wait's timeout. Distinct
+ * from every other funding failure because it says nothing about the
+ * operation: the wait only stopped listening, and the funding it started is
+ * still live. A caller that retries on this runs a second funding beside the
+ * first (issue #594).
+ */
+export class FundingWaitTimeoutError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'FundingWaitTimeoutError';
 	}
 }
 

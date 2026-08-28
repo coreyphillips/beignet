@@ -118,8 +118,13 @@ describe('Issue #177: forwarding failures carry their BOLT 4 data', function () 
 			ok: false,
 			error: 'refused'
 		});
-		cm.failHtlc = (_c: Buffer, _id: bigint, reason: Buffer): void => {
+		cm.failHtlc = (
+			_c: Buffer,
+			_id: bigint,
+			reason: Buffer
+		): { ok: boolean } => {
 			failHtlcCalls.push({ reason });
+			return { ok: true };
 		};
 		node.on('error', () => {});
 	});

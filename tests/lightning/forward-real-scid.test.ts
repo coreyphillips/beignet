@@ -278,6 +278,7 @@ describe('Forwarding by real SCID: handleForwardHtlc', function () {
 		};
 		cm.failHtlc = (_inChannelId: Buffer, _htlcId: bigint, reason: Buffer) => {
 			failHtlcCalls.push({ reason });
+			return { ok: true };
 		};
 	});
 

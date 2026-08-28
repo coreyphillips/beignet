@@ -27,6 +27,7 @@ import {
 import {
 	ChannelFundingUnavailableCode,
 	ChannelFundingUnavailableError,
+	FundingWaitTimeoutError,
 	InvalidChannelOpenError
 } from '../../src/lightning/node/types';
 import { decodeShortChannelId } from '../../src/lightning/gossip/types';
@@ -53,7 +54,10 @@ interface IHarness {
 	spliceResult: { fn: (amountSats: bigint) => Promise<void> };
 	restoredFail: { fn: (part: IPersistedHeldPart) => boolean };
 	scidInUse: { fn: (scidHex: string) => boolean };
-	jitClient: { fn: (channelId: Buffer) => boolean };
+	channelPeer: { fn: (channelId: Buffer) => string | null };
+	/** Set false to make every upstream failure refuse (a reestablishing channel). */
+	failsDeliver: { value: boolean };
+	storageWrites: { failKeys: Set<string> };
 }
 
 function makeHarness(
@@ -75,7 +79,9 @@ function makeHarness(
 		spliceResult: { fn: async (): Promise<void> => undefined },
 		restoredFail: { fn: (): boolean => true },
 		scidInUse: { fn: (): boolean => false },
-		jitClient: { fn: (): boolean => true }
+		channelPeer: { fn: (): string | null => CLIENT },
+		failsDeliver: { value: true },
+		storageWrites: { failKeys: new Set<string>() }
 	};
 
 	const deps: IJitManagerDeps = {
@@ -95,13 +101,16 @@ function makeHarness(
 		setJitClients: (pubkeys) => {
 			h.jitClients = [...pubkeys];
 		},
-		isJitClientChannel: (channelId) => h.jitClient.fn(channelId),
+		peerForChannel: (channelId) => h.channelPeer.fn(channelId),
 		spliceInAndWait: async (channelId, amountSats) => {
 			h.splices.push({ channelId: channelId.toString('hex'), amountSats });
 			return h.spliceResult.fn(amountSats);
 		},
 		storage: {
 			saveMetadata: (k, v) => {
+				if (h.storageWrites.failKeys.has(k)) {
+					throw new Error(`storage refused ${k}`);
+				}
 				metadata.set(k, v);
 			},
 			loadMetadata: (k) => metadata.get(k) ?? null
@@ -141,8 +150,9 @@ function makePart(
 			routingInfo: Buffer.alloc(ROUTING_INFO_LENGTH),
 			hmac: crypto.randomBytes(32)
 		},
-		failIncoming: (code: number): void => {
+		failIncoming: (code: number): boolean => {
 			h.failed.push({ part, code });
+			return h.failsDeliver.value;
 		}
 	};
 	return part;
@@ -183,7 +193,8 @@ describe('JIT receive wire payloads', function () {
 	it('round-trips an authorization, bound and unbound', function () {
 		const bound = auth({
 			paymentHash: crypto.randomBytes(32),
-			expectedTotalMsat: 42_000n
+			expectedTotalMsat: 42_000n,
+			acceptsSkimmedFee: true
 		});
 		const back = decodeJitAuthorization(encodeJitAuthorization(bound));
 		expect(back.requestId.equals(bound.requestId)).to.equal(true);
@@ -192,10 +203,21 @@ describe('JIT receive wire payloads', function () {
 		expect(back.expectedTotalMsat).to.equal(42_000n);
 		expect(back.targetRemainingInboundSat).to.equal(50_000n);
 		expect(back.expirySeconds).to.equal(600);
+		expect(back.acceptsSkimmedFee).to.equal(true);
 
 		const unbound = decodeJitAuthorization(encodeJitAuthorization(auth()));
 		expect(unbound.paymentHash).to.equal(undefined);
 		expect(unbound.expectedTotalMsat).to.equal(undefined);
+		expect(unbound.acceptsSkimmedFee).to.equal(false);
+	});
+
+	it('reads an authorization without the skim flag as not accepting one', function () {
+		// The flag byte is the last one: a payload that predates it must decode
+		// as a client that never agreed to a skimmed HTLC, never as one that did.
+		const legacy = encodeJitAuthorization(
+			auth({ acceptsSkimmedFee: true })
+		).subarray(0, 68);
+		expect(decodeJitAuthorization(legacy).acceptsSkimmedFee).to.equal(false);
 	});
 
 	it('round-trips an ack including its refusal reason', function () {
@@ -261,7 +283,7 @@ describe('JIT intercept SCID minting', function () {
 describe('JIT intent registration', function () {
 	it('mints the SCID itself and returns it in the ack', function () {
 		const h = makeHarness({ flatFeeSat: 500n, feePpm: 1_000 });
-		const request = auth();
+		const request = auth({ acceptsSkimmedFee: true });
 		const ack = h.manager.registerIntent(CLIENT, request);
 		expect(ack.accepted).to.equal(true);
 		expect(ack.requestId.equals(request.requestId)).to.equal(true);
@@ -475,12 +497,51 @@ describe('JIT MPP aggregation', function () {
 // ── Opening fee ────────────────────────────────────────────────────
 
 describe('JIT opening fee', function () {
+	it('refuses an intent from a client that will not accept the skim', function () {
+		// The fee is deducted from a forward whose onion still names the full
+		// amount, and BOLT 4 has the final hop fail anything short of it. A
+		// client that has not agreed to that gets a refusal, not a channel it
+		// would have paid for and a payment that then fails.
+		const h = makeHarness({ flatFeeSat: 100n });
+		const ack = h.manager.registerIntent(CLIENT, auth());
+		expect(ack.accepted).to.equal(false);
+		expect(ack.reason).to.match(/skimmed/);
+		expect(h.manager.listIntents()).to.have.length(0);
+		// Advertised all the same, so the client knows what to agree to.
+		expect(ack.flatFeeSat).to.equal(0n);
+		expect(
+			h.manager.registerIntent(CLIENT, auth({ acceptsSkimmedFee: true }))
+				.accepted
+		).to.equal(true);
+	});
+
+	it('skims nothing from a client that never agreed to it', async function () {
+		// A fee configured after the intent was registered (or restored from a
+		// record that predates the flag) must still not shrink the forward.
+		const h = makeHarness({ flatFeeSat: 100n });
+		const ack = h.manager.registerIntent(
+			CLIENT,
+			auth({ acceptsSkimmedFee: true })
+		);
+		h.manager.listIntents()[0].acceptsSkimmedFee = false;
+		h.manager.tryInterceptUnknownScid(
+			ack.interceptScid.toString('hex'),
+			makePart(h, { amountMsat: 1_000_000n })
+		);
+		await waitFor(h.manager, 'jit:forwarded');
+		expect(h.forwarded[0].part.forwardAmountMsat).to.equal(1_000_000n);
+	});
+
 	it('deducts the fee once, from the largest part', async function () {
 		const h = makeHarness({ flatFeeSat: 100n, feePpm: 1_000 });
 		const hash = crypto.randomBytes(32);
 		const ack = h.manager.registerIntent(
 			CLIENT,
-			auth({ paymentHash: hash, expectedTotalMsat: 3_000_000n })
+			auth({
+				paymentHash: hash,
+				expectedTotalMsat: 3_000_000n,
+				acceptsSkimmedFee: true
+			})
 		);
 		const scidHex = ack.interceptScid.toString('hex');
 		h.manager.tryInterceptUnknownScid(
@@ -508,7 +569,11 @@ describe('JIT opening fee', function () {
 		const hash = crypto.randomBytes(32);
 		const ack = h.manager.registerIntent(
 			CLIENT,
-			auth({ paymentHash: hash, expectedTotalMsat: 2_000_000n })
+			auth({
+				paymentHash: hash,
+				expectedTotalMsat: 2_000_000n,
+				acceptsSkimmedFee: true
+			})
 		);
 		const scidHex = ack.interceptScid.toString('hex');
 		h.manager.tryInterceptUnknownScid(
@@ -556,11 +621,15 @@ describe('JIT funding caps', function () {
 			maxClientFundingSats: 25_000n,
 			fundingBufferSats: 10_000n
 		});
+		h.manager.registerIntent(
+			CLIENT,
+			auth({ maxAmountMsat: 20_000_000n, targetRemainingInboundSat: 500_000n })
+		);
 		const channelId = crypto.randomBytes(32);
 		expect(
 			h.manager.tryHoldForSplice(
 				channelId,
-				makePart(h, { amountMsat: 900_000_000n })
+				makePart(h, { amountMsat: 20_000_000n })
 			)
 		).to.equal(true);
 		await waitFor(h.manager, 'jit:forwarded');
@@ -762,6 +831,31 @@ describe('JIT funding retries', function () {
 		expect(h.failed).to.have.length(1);
 	});
 
+	it('never starts a second funding beside one that only timed out', async function () {
+		// The wait helper stops listening; it does not cancel the open. A retry
+		// would run a duplicate open, of our coins, beside the live one.
+		const h = makeHarness({ fundingAttempts: 5, fundingBufferSats: 10_000n });
+		let calls = 0;
+		h.openResult.fn = async (): Promise<Buffer> => {
+			calls++;
+			throw new FundingWaitTimeoutError('not ready within 1ms');
+		};
+		const ack = h.manager.registerIntent(
+			CLIENT,
+			auth({ targetRemainingInboundSat: 20_000n })
+		);
+		const failure = waitFor<{ reason: string }>(h.manager, 'jit:failed');
+		h.manager.tryInterceptUnknownScid(
+			ack.interceptScid.toString('hex'),
+			makePart(h, { amountMsat: 1_000_000n })
+		);
+		expect((await failure).reason).to.match(/not ready within/);
+		expect(calls).to.equal(1);
+		expect(h.failed).to.have.length(1);
+		// The open may still land, so the budget is charged rather than refunded.
+		expect(h.manager.getFrontedTotalSats()).to.equal(31_000n);
+	});
+
 	it('gives up when the hold budget runs out', async function () {
 		const h = makeHarness({
 			fundingAttempts: 10,
@@ -787,14 +881,82 @@ describe('JIT funding retries', function () {
 describe('JIT on-the-fly splice', function () {
 	it('declines a channel whose peer is not a JIT client', function () {
 		const h = makeHarness();
-		h.jitClient.fn = (): boolean => false;
+		h.channelPeer.fn = (): string | null => null;
 		expect(
 			h.manager.tryHoldForSplice(crypto.randomBytes(32), makePart(h))
 		).to.equal(false);
 	});
 
+	it('declines a peer with no live intent the part fits', function () {
+		// Being a JIT client is derived from holding ANY live intent, so it
+		// cannot be the authorization: a 1 msat intent would otherwise buy a
+		// splice, of our coins, for every unrelated payment this peer receives.
+		const h = makeHarness();
+		const channelId = crypto.randomBytes(32);
+		expect(h.manager.tryHoldForSplice(channelId, makePart(h))).to.equal(false);
+
+		h.manager.registerIntent(CLIENT, auth({ maxAmountMsat: 1n }));
+		expect(
+			h.manager.tryHoldForSplice(
+				channelId,
+				makePart(h, { amountMsat: 1_000_000n })
+			)
+		).to.equal(false);
+		expect(h.splices).to.have.length(0);
+
+		// Another client's intent is not this peer's authorization either.
+		h.manager.registerIntent(OTHER_CLIENT, auth());
+		expect(
+			h.manager.tryHoldForSplice(
+				channelId,
+				makePart(h, { amountMsat: 1_000_000n })
+			)
+		).to.equal(false);
+	});
+
+	it('declines a part the intent did not bind, and spends the intent once', async function () {
+		const h = makeHarness();
+		const bound = crypto.randomBytes(32);
+		h.manager.registerIntent(CLIENT, auth({ paymentHash: bound }));
+		const channelId = crypto.randomBytes(32);
+
+		expect(h.manager.tryHoldForSplice(channelId, makePart(h))).to.equal(false);
+		expect(
+			h.manager.tryHoldForSplice(channelId, makePart(h, { paymentHash: bound }))
+		).to.equal(true);
+		await waitFor(h.manager, 'jit:forwarded');
+		// Consumed by the payment it funded, exactly as the open path consumes
+		// its own: a second payment needs a second intent.
+		expect(h.manager.listIntents()).to.have.length(0);
+		expect(
+			h.manager.tryHoldForSplice(channelId, makePart(h, { paymentHash: bound }))
+		).to.equal(false);
+		expect(h.splices).to.have.length(1);
+	});
+
+	it('refuses to queue past what the intent registered for', function () {
+		const h = makeHarness();
+		h.manager.registerIntent(CLIENT, auth({ maxAmountMsat: 3_000_000n }));
+		const channelId = crypto.randomBytes(32);
+		// Stall the splice so the second part meets a queue, not a fresh intent.
+		h.spliceResult.fn = (): Promise<void> => new Promise<void>(() => undefined);
+		expect(
+			h.manager.tryHoldForSplice(
+				channelId,
+				makePart(h, { amountMsat: 2_000_000n })
+			)
+		).to.equal(true);
+		expect(
+			h.manager.tryHoldForSplice(
+				channelId,
+				makePart(h, { amountMsat: 2_000_000n })
+			)
+		).to.equal(false);
+	});
+
 	it('retries the forward once, and never a second time', async function () {
 		const h = makeHarness();
+		h.manager.registerIntent(CLIENT, auth());
 		const channelId = crypto.randomBytes(32);
 		const part = makePart(h);
 		expect(h.manager.tryHoldForSplice(channelId, part)).to.equal(true);
@@ -805,8 +967,30 @@ describe('JIT on-the-fly splice', function () {
 		expect(h.manager.tryHoldForSplice(channelId, part)).to.equal(false);
 	});
 
+	it('sizes the splice from the intent, fee included', async function () {
+		const h = makeHarness({ flatFeeSat: 100n, fundingBufferSats: 10_000n });
+		h.manager.registerIntent(
+			CLIENT,
+			auth({ targetRemainingInboundSat: 25_000n, acceptsSkimmedFee: true })
+		);
+		h.manager.tryHoldForSplice(
+			crypto.randomBytes(32),
+			makePart(h, { amountMsat: 2_000_000n })
+		);
+		await waitFor(h.manager, 'jit:forwarded');
+		// 2000 sat received + 25000 target inbound + 10000 buffer, the same
+		// arithmetic the open path does.
+		expect(h.splices[0].amountSats).to.equal(37_000n);
+		// The configured fee is charged on this path too; the fork's splice
+		// forwarded the whole amount and earned nothing.
+		expect(h.forwarded[0].part.forwardAmountMsat).to.equal(
+			2_000_000n - 100_000n
+		);
+	});
+
 	it('fails the queue upstream when the splice never locks', async function () {
 		const h = makeHarness({ fundingAttempts: 1 });
+		h.manager.registerIntent(CLIENT, auth());
 		h.spliceResult.fn = async (): Promise<void> => {
 			throw new Error('splice aborted by peer');
 		};
@@ -897,6 +1081,65 @@ describe('JIT persistence across a restart', function () {
 		second.manager.restore();
 		expect(second.manager.listIntents()).to.have.length(0);
 		expect(second.manager.getFrontedTotalSats()).to.equal(fronted);
+	});
+
+	it('never forwards while the durable hold record still says fail', async function () {
+		// The row is an instruction to refund after a restart. Forwarding with
+		// it still on disk pays downstream for a leg the next boot refunds.
+		const h = makeHarness();
+		let releaseOpen = (): void => undefined;
+		h.openResult.fn = (): Promise<Buffer> =>
+			new Promise<Buffer>((resolve) => {
+				releaseOpen = (): void => resolve(crypto.randomBytes(32));
+			});
+		const ack = h.manager.registerIntent(CLIENT, auth());
+		h.manager.tryInterceptUnknownScid(
+			ack.interceptScid.toString('hex'),
+			makePart(h)
+		);
+		await new Promise((r) => setImmediate(r));
+
+		h.storageWrites.failKeys.add('jit:held');
+		const failure = waitFor<{ reason: string }>(h.manager, 'jit:failed');
+		releaseOpen();
+		expect((await failure).reason).to.match(/durable hold record/);
+		expect(h.forwarded).to.have.length(0);
+		expect(h.failed).to.have.length(1);
+	});
+
+	it('keeps owing a failure the inbound channel could not carry', function () {
+		// A held part is failed long after it arrived, so its channel may be
+		// reestablishing by then. The refund cannot simply evaporate: the part
+		// joins the durable queue and the sweep retries it.
+		const h = makeHarness({ aggregationTimeoutMs: 20 });
+		h.failsDeliver.value = false;
+		const ack = h.manager.registerIntent(
+			CLIENT,
+			auth({ expectedTotalMsat: 5_000_000n })
+		);
+		const part = makePart(h, { amountMsat: 1_000_000n });
+		h.manager.tryInterceptUnknownScid(ack.interceptScid.toString('hex'), part);
+
+		return new Promise<void>((resolve) => setTimeout(resolve, 60)).then(() => {
+			expect(h.failed).to.have.length(1);
+			expect(JSON.parse(h.metadata.get('jit:held')!)).to.have.length(1);
+			expect(
+				h.manager.hasRestoredHold(
+					part.inChannelId.toString('hex'),
+					part.inHtlcId
+				)
+			).to.equal(true);
+
+			const swept: IPersistedHeldPart[] = [];
+			h.restoredFail.fn = (row): boolean => {
+				swept.push(row);
+				return true;
+			};
+			h.manager.sweep();
+			expect(swept).to.have.length(1);
+			expect(swept[0].inHtlcId).to.equal(part.inHtlcId.toString());
+			expect(JSON.parse(h.metadata.get('jit:held')!)).to.have.length(0);
+		});
 	});
 
 	it('survives corrupt persisted state rather than taking the node down', function () {

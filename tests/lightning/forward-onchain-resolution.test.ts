@@ -275,9 +275,9 @@ describe('S-2.M3: on-chain timeout of a forwarded outgoing leg', function () {
 			htlcId: bigint,
 			sha256OfOnion: Buffer,
 			failureCode: number
-		): void => {
+		): ReturnType<typeof realFailMalformed> => {
 			malformedCalls.push({ failureCode });
-			realFailMalformed(channelId, htlcId, sha256OfOnion, failureCode);
+			return realFailMalformed(channelId, htlcId, sha256OfOnion, failureCode);
 		};
 
 		(alice as any).channelManager.handleNewBlock(height + 1);
@@ -687,9 +687,9 @@ describe('S-2.M3: on-chain timeout of a forwarded outgoing leg', function () {
 			htlcId: bigint,
 			sha256OfOnion: Buffer,
 			failureCode: number
-		): void => {
+		): ReturnType<typeof realFailMalformed> => {
 			malformedCalls.push({ failureCode });
-			realFailMalformed(channelId, htlcId, sha256OfOnion, failureCode);
+			return realFailMalformed(channelId, htlcId, sha256OfOnion, failureCode);
 		};
 
 		(alice as any).channelManager.handleNewBlock(height + 1);

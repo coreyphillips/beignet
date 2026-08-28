@@ -195,6 +195,7 @@ import {
 	ChannelFundingUnavailableCode,
 	InvalidSpliceError,
 	InvalidPeerConnectError,
+	FundingWaitTimeoutError,
 	IChannelHealth,
 	IStructuredLog,
 	IPaymentProof,
@@ -2377,6 +2378,17 @@ export class LightningNode extends EventEmitter {
 			// Parked against a hold invoice. settle/cancel drives it, not the
 			// forwarding machinery.
 			if (this.isHeldHtlc(channelId, htlc.id)) continue;
+			// Held by the JIT engine before the restart, and already owed a
+			// refund by the restored-hold queue. Dispatching it again would
+			// forward a payment the sweep is about to fail upstream.
+			if (
+				this.jitReceiveManager?.hasRestoredHold(
+					channelId.toString('hex'),
+					htlc.id
+				)
+			) {
+				continue;
+			}
 
 			this.handleIncomingHtlc(
 				channelId,
@@ -8257,8 +8269,11 @@ export class LightningNode extends EventEmitter {
 		return new Promise<Buffer>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
+				// Typed, because this open is still running: only a caller that
+				// can tell a timeout from a failure can avoid starting a second
+				// one beside it (issue #594).
 				reject(
-					new Error(
+					new FundingWaitTimeoutError(
 						`zero-conf channel to ${peerPubkey.slice(
 							0,
 							12
@@ -10534,8 +10549,10 @@ export class LightningNode extends EventEmitter {
 		const done = new Promise<void>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
+				// Typed for the same reason as the open above: the splice this
+				// stopped waiting on is still in flight.
 				reject(
-					new Error(
+					new FundingWaitTimeoutError(
 						`splice on ${cidHex.slice(0, 12)} not locked within ${timeoutMs}ms`
 					)
 				);
@@ -15546,10 +15563,8 @@ export class LightningNode extends EventEmitter {
 				},
 				setJitClients: (pubkeyHexes) =>
 					this.channelManager.setJitClients(pubkeyHexes),
-				isJitClientChannel: (outChannelId): boolean => {
-					const peer = this.channelManager.getPeerForChannel(outChannelId);
-					return !!peer && this.channelManager.isJitClient(peer);
-				},
+				peerForChannel: (outChannelId): string | null =>
+					this.channelManager.getPeerForChannel(outChannelId) ?? null,
 				spliceInAndWait: (channelId, amountSats, timeoutMs) =>
 					this.spliceInAndWait(channelId, amountSats, timeoutMs),
 				storage: this.storage ?? undefined,
@@ -15655,13 +15670,19 @@ export class LightningNode extends EventEmitter {
 		// Already resolved (the peer failed it during reestablish, say).
 		const htlc = channel.getFullState().htlcs.get(`received-${inHtlcId}`);
 		if (!htlc) return true;
+		// An outgoing leg pays for this inbound one: whatever put it there owns
+		// the resolution now, and refunding upstream would be the loss this
+		// queue exists to prevent. Drop the row instead of failing.
+		if (this.findOutgoingLeg(channelId, inHtlcId)) return true;
 
 		// A blinded leg owes update_fail_malformed_htlc / invalid_onion_blinding,
 		// not a plain failure that would leak the cause; blindedRoleFor
 		// reconstructs the role from the durable HTLC entry after a restart.
 		const blindedRole = this.blindedRoleFor(channelId, inHtlcId);
 		if (blindedRole) {
-			this.failBlindedIncomingHtlc(channelId, inHtlcId, blindedRole);
+			if (!this.failBlindedIncomingHtlc(channelId, inHtlcId, blindedRole)) {
+				return false;
+			}
 			this.emitStructuredLog('htlc', 'jit_restored_failed_upstream', {
 				channelId: part.inChannelIdHex,
 				htlcId: part.inHtlcId,
@@ -16010,18 +16031,16 @@ export class LightningNode extends EventEmitter {
 		const failIncoming = (
 			failureCode: number,
 			fields?: { htlcMsat?: bigint; cltvExpiry?: number }
-		): void => {
+		): boolean => {
 			if (inBlindedRole) {
-				this.failBlindedIncomingHtlc(
+				return this.failBlindedIncomingHtlc(
 					inChannelId,
 					inHtlcId,
 					inBlindedRole,
 					sharedSecret
 				);
-				return;
 			}
-			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-			this.channelManager.failHtlc(
+			const result = this.channelManager.failHtlc(
 				inChannelId,
 				inHtlcId,
 				createFailureMessage(
@@ -16030,6 +16049,13 @@ export class LightningNode extends EventEmitter {
 					this.updateFlaggedFailureData(failureCode, fields)
 				)
 			);
+			// The shared secret goes only once the failure is actually on its
+			// way. A holder that keeps this closure for later (the JIT engine)
+			// retries a refused failure, and a retry that has lost the secret
+			// can only send a zeroed packet the payer cannot decrypt.
+			if (result.ok === false) return false;
+			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
+			return true;
 		};
 
 		// Forwarding opt-out: a node that does not want to be a routing hop
@@ -16273,7 +16299,12 @@ export class LightningNode extends EventEmitter {
 						});
 						return;
 					}
-					part.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+					// A refund the inbound channel cannot carry right now (it is
+					// reestablishing) must not evaporate: the engine owes it and
+					// retries it on every block.
+					if (!part.failIncoming(TEMPORARY_CHANNEL_FAILURE)) {
+						this.jitReceiveManager?.owedUpstreamFailure(part);
+					}
 				}
 			);
 			return;
@@ -16881,13 +16912,16 @@ export class LightningNode extends EventEmitter {
 	 * portion. A hop whose blinding point arrived in update_add_htlc ('mid')
 	 * MUST use update_fail_malformed_htlc; the introduction node ('intro')
 	 * returns a normally encrypted failure.
+	 *
+	 * Returns whether the channel could carry the failure, so a caller holding
+	 * the HTLC for later can retry one it could not.
 	 */
 	private failBlindedIncomingHtlc(
 		inChannelId: Buffer,
 		inHtlcId: bigint,
 		role: 'intro' | 'mid',
 		sharedSecret?: Buffer
-	): void {
+	): boolean {
 		const inHtlcSecretKey = `${inChannelId.toString('hex')}:${inHtlcId}`;
 		const htlcEntry = this.channelManager
 			.getChannel(inChannelId)
@@ -16901,25 +16935,28 @@ export class LightningNode extends EventEmitter {
 			: Buffer.alloc(32);
 		const secret =
 			sharedSecret ?? this.receivedHtlcSharedSecrets.get(inHtlcSecretKey);
+		const result =
+			role === 'mid'
+				? this.channelManager.failMalformedHtlc(
+						inChannelId,
+						inHtlcId,
+						sha256OfOnion,
+						INVALID_ONION_BLINDING
+				  )
+				: this.channelManager.failHtlc(
+						inChannelId,
+						inHtlcId,
+						createFailureMessage(
+							secret ?? Buffer.alloc(32),
+							INVALID_ONION_BLINDING,
+							sha256OfOnion
+						)
+				  );
+		// The secret outlives a refused failure on purpose: this is retried,
+		// and a retry without it can only send an undecryptable packet.
+		if (result.ok === false) return false;
 		this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-		if (role === 'mid') {
-			this.channelManager.failMalformedHtlc(
-				inChannelId,
-				inHtlcId,
-				sha256OfOnion,
-				INVALID_ONION_BLINDING
-			);
-			return;
-		}
-		this.channelManager.failHtlc(
-			inChannelId,
-			inHtlcId,
-			createFailureMessage(
-				secret ?? Buffer.alloc(32),
-				INVALID_ONION_BLINDING,
-				sha256OfOnion
-			)
-		);
+		return true;
 	}
 
 	/**

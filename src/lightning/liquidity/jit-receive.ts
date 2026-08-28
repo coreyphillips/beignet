@@ -33,9 +33,11 @@
  *    and fails it upstream, and a revoked part can never be forwarded
  *    afterwards, so a funding that completes late cannot pay downstream for an
  *    inbound leg that was already refunded.
- *  - Fronting is bounded. Accepting an intent widens nothing but our own
- *    outbound zero-conf authorization for that peer (see `setJitClients`); it
- *    never makes us accept an INBOUND zero-conf channel from them.
+ *  - Fronting is bounded. Every funding, open or splice, spends a registered
+ *    intent, and each is bounded by what that intent asked for and by the
+ *    engine's caps. Accepting an intent widens nothing but our own outbound
+ *    zero-conf authorization for that peer (see `setJitClients`); it never
+ *    makes us accept an INBOUND zero-conf channel from them.
  */
 
 import { EventEmitter } from 'events';
@@ -44,6 +46,7 @@ import { encodeShortChannelId } from '../gossip/types';
 import {
 	ChannelFundingUnavailableCode,
 	ChannelFundingUnavailableError,
+	FundingWaitTimeoutError,
 	IForwardablePart,
 	InvalidRequestError
 } from '../node/types';
@@ -62,6 +65,13 @@ export interface IJitReceiveAuthorization {
 	/** Inbound liquidity the wallet wants left over after the receive (sat). */
 	targetRemainingInboundSat: bigint;
 	expirySeconds: number;
+	/**
+	 * The wallet will accept an HTLC smaller than its onion's amt_to_forward by
+	 * the agreed opening fee. Without this the LSP cannot charge one at all:
+	 * the fee is skimmed off a forward whose onion the LSP cannot rewrite, and
+	 * BOLT 4 makes a final hop fail anything short of amt_to_forward.
+	 */
+	acceptsSkimmedFee?: boolean;
 }
 
 export interface IJitReceiveAck {
@@ -76,7 +86,9 @@ export interface IJitReceiveAck {
 	reason?: string;
 }
 
+/** Everything through `expirySeconds`; the skim flag byte follows it. */
 const AUTHORIZATION_LENGTH = 68;
+const AUTHORIZATION_WITH_FLAGS_LENGTH = 69;
 const ACK_HEADER_LENGTH = 31;
 /** Refusal reasons are ours; a long one is truncated rather than refused. */
 const MAX_ACK_REASON_BYTES = 200;
@@ -85,13 +97,14 @@ export function encodeJitAuthorization(a: IJitReceiveAuthorization): Buffer {
 	if (a.requestId.length !== 8) {
 		throw new Error('jit authorization requestId must be 8 bytes');
 	}
-	const buf = Buffer.alloc(AUTHORIZATION_LENGTH);
+	const buf = Buffer.alloc(AUTHORIZATION_WITH_FLAGS_LENGTH);
 	(a.paymentHash ?? Buffer.alloc(32)).copy(buf, 0);
 	a.requestId.copy(buf, 32);
 	buf.writeBigUInt64BE(a.maxAmountMsat, 40);
 	buf.writeBigUInt64BE(a.expectedTotalMsat ?? 0n, 48);
 	buf.writeBigUInt64BE(a.targetRemainingInboundSat, 56);
 	buf.writeUInt32BE(a.expirySeconds, 64);
+	buf.writeUInt8(a.acceptsSkimmedFee ? 1 : 0, 68);
 	return buf;
 }
 
@@ -105,7 +118,11 @@ export function decodeJitAuthorization(data: Buffer): IJitReceiveAuthorization {
 		requestId: Buffer.from(data.subarray(32, 40)),
 		maxAmountMsat: data.readBigUInt64BE(40),
 		targetRemainingInboundSat: data.readBigUInt64BE(56),
-		expirySeconds: data.readUInt32BE(64)
+		expirySeconds: data.readUInt32BE(64),
+		// A payload that predates the flag byte is a client that never agreed
+		// to a skim, which is exactly what its absence means here.
+		acceptsSkimmedFee:
+			data.length >= AUTHORIZATION_WITH_FLAGS_LENGTH && data.readUInt8(68) === 1
 	};
 	if (!paymentHash.every((b) => b === 0)) {
 		result.paymentHash = Buffer.from(paymentHash);
@@ -242,10 +259,18 @@ export interface IJitIntent {
 	expectedTotalMsat?: bigint;
 	targetRemainingInboundSat: bigint;
 	expiresAt: number;
+	/** The client will accept the opening fee skimmed off its payment. */
+	acceptsSkimmedFee: boolean;
 }
 
 /** A forward held by the engine, plus the engine's own bookkeeping. */
 export interface IHeldJitPart extends IForwardablePart {
+	/**
+	 * The intent this part is being funded against. Both paths spend an
+	 * intent: the open path by its intercept SCID, the splice path by the one
+	 * matched from the channel's peer.
+	 */
+	intentScidHex?: string;
 	/** Set once a splice retry has been attempted: a second failure is final. */
 	spliceRetried?: boolean;
 	/**
@@ -277,8 +302,8 @@ export interface IJitManagerDeps {
 	 * accept an inbound zero-conf channel from the peer.
 	 */
 	setJitClients(pubkeyHexes: string[]): void;
-	/** Is this channel's peer a JIT client with a live intent? */
-	isJitClientChannel?(outChannelId: Buffer): boolean;
+	/** The peer on the other end of one of our channels. */
+	peerForChannel?(outChannelId: Buffer): string | null;
 	/** Splice our own funds in and resolve once the channel is usable again. */
 	spliceInAndWait?(
 		channelId: Buffer,
@@ -307,6 +332,7 @@ interface IPersistedIntent {
 	expectedTotalMsat?: string;
 	targetRemainingInboundSat: string;
 	expiresAt: number;
+	acceptsSkimmedFee?: boolean;
 }
 
 /**
@@ -448,7 +474,8 @@ export class JitReceiveManager extends EventEmitter {
 						walletPubkeyHex: p.walletPubkeyHex,
 						maxAmountMsat: BigInt(p.maxAmountMsat),
 						targetRemainingInboundSat: BigInt(p.targetRemainingInboundSat),
-						expiresAt: p.expiresAt
+						expiresAt: p.expiresAt,
+						acceptsSkimmedFee: p.acceptsSkimmedFee === true
 					};
 					if (p.paymentHashHex) intent.paymentHashHex = p.paymentHashHex;
 					if (p.expectedTotalMsat) {
@@ -510,7 +537,8 @@ export class JitReceiveManager extends EventEmitter {
 				walletPubkeyHex: i.walletPubkeyHex,
 				maxAmountMsat: i.maxAmountMsat.toString(),
 				targetRemainingInboundSat: i.targetRemainingInboundSat.toString(),
-				expiresAt: i.expiresAt
+				expiresAt: i.expiresAt,
+				acceptsSkimmedFee: i.acceptsSkimmedFee
 			};
 			if (i.paymentHashHex) p.paymentHashHex = i.paymentHashHex;
 			if (i.expectedTotalMsat) {
@@ -536,8 +564,14 @@ export class JitReceiveManager extends EventEmitter {
 		};
 	}
 
-	private persistHeld(): void {
-		if (!this.deps.storage) return;
+	/**
+	 * Write the hold record, and REPORT whether it landed. Every row in it says
+	 * `fail`, so a stale one is an instruction to refund an inbound leg after a
+	 * restart: a caller about to forward must know the clearing write happened,
+	 * or it can pay downstream for a leg the next boot refunds.
+	 */
+	private persistHeld(): boolean {
+		if (!this.deps.storage) return true;
 		const live: IPersistedHeldPart[] = [];
 		for (const parts of this.heldParts.values()) {
 			for (const p of parts) live.push(JitReceiveManager.persistedShape(p));
@@ -550,9 +584,22 @@ export class JitReceiveManager extends EventEmitter {
 				STORAGE_KEY_HELD,
 				JSON.stringify([...this.restoredToFail, ...live])
 			);
+			return true;
 		} catch {
-			// best-effort persistence
+			return false;
 		}
+	}
+
+	/**
+	 * Is this inbound HTLC one the engine held before a restart and still owes
+	 * a refund? The node asks before re-dispatching a restored HTLC: dispatching
+	 * one of these would forward a payment this queue is about to fail upstream.
+	 */
+	hasRestoredHold(inChannelIdHex: string, inHtlcId: bigint): boolean {
+		const id = inHtlcId.toString();
+		return this.restoredToFail.some(
+			(p) => p.inChannelIdHex === inChannelIdHex && p.inHtlcId === id
+		);
 	}
 
 	private persistFronted(): void {
@@ -651,6 +698,16 @@ export class JitReceiveManager extends EventEmitter {
 				`at most ${this.cfg.maxLiveIntentsPerPeer} live intents per peer`
 			);
 		}
+		// The opening fee is skimmed off a forward whose onion we cannot
+		// rewrite, so a client that will not accept a short HTLC would only
+		// fail the payment at its final hop (BOLT 4 final_incorrect_htlc_amount)
+		// after we had already funded the channel. Refuse instead of charging
+		// into a payment that cannot complete.
+		if (this.chargesAnOpeningFee() && auth.acceptsSkimmedFee !== true) {
+			return refuse(
+				`this LSP deducts an opening fee (${this.cfg.flatFeeSat} sat + ${this.cfg.feePpm} ppm) from the payment; the client must accept a skimmed HTLC`
+			);
+		}
 
 		// The LSP mints the SCID. A value that collides with a real SCID, an
 		// alias or another client's intent is refused, never overwritten: an
@@ -669,7 +726,8 @@ export class JitReceiveManager extends EventEmitter {
 			maxAmountMsat: auth.maxAmountMsat,
 			targetRemainingInboundSat: auth.targetRemainingInboundSat,
 			expiresAt:
-				Date.now() + Math.min(auth.expirySeconds * 1000, this.cfg.intentTtlMs)
+				Date.now() + Math.min(auth.expirySeconds * 1000, this.cfg.intentTtlMs),
+			acceptsSkimmedFee: auth.acceptsSkimmedFee === true
 		};
 		if (auth.paymentHash) {
 			intent.paymentHashHex = auth.paymentHash.toString('hex');
@@ -720,10 +778,12 @@ export class JitReceiveManager extends EventEmitter {
 		let removed = false;
 		for (const [scidHex, intent] of this.intents) {
 			if (intent.expiresAt > now) continue;
-			// An intent whose funding is running, or whose parts are held, is
-			// still doing its job; its parts are bounded by their own deadline.
+			// An intent whose funding is running, or whose parts are held on
+			// either path, is still doing its job; its parts are bounded by
+			// their own deadline.
 			if (this.fundingInFlight.has(scidHex)) continue;
 			if ((this.heldParts.get(scidHex)?.length ?? 0) > 0) continue;
+			if (this.hasQueuedSpliceParts(scidHex)) continue;
 			this.intents.delete(scidHex);
 			removed = true;
 		}
@@ -778,6 +838,7 @@ export class JitReceiveManager extends EventEmitter {
 			return false;
 		}
 
+		part.intentScidHex = scidHex;
 		held.push(part);
 		this.heldParts.set(scidHex, held);
 		this.persistHeld();
@@ -865,12 +926,7 @@ export class JitReceiveManager extends EventEmitter {
 	/** Mark parts unforwardable for good, then fail them upstream. */
 	private revokeAll(parts: IHeldJitPart[], scope: string): void {
 		for (const part of parts) {
-			part.revoked = true;
-			try {
-				part.failIncoming(this.deps.failureCodes.expiryTooSoon);
-			} catch {
-				// best-effort: the inbound channel may already be gone
-			}
+			this.failPart(part, this.deps.failureCodes.expiryTooSoon);
 		}
 		this.safeEmit('jit:failed', {
 			scidHex: scope,
@@ -894,7 +950,7 @@ export class JitReceiveManager extends EventEmitter {
 		// The fee is checked against the parts BEFORE any state is consumed, so
 		// a fee that cannot be taken fails every part upstream instead of
 		// throwing past an already-emptied held map and dropping them.
-		const feeError = this.validateFee(parts, totalMsat);
+		const feeError = this.validateFee(parts, totalMsat, [intent]);
 		if (feeError) {
 			this.failFunding(scidHex, feeError);
 			return;
@@ -939,7 +995,8 @@ export class JitReceiveManager extends EventEmitter {
 			}
 			const lateFeeError = this.validateFee(
 				toForward,
-				toForward.reduce((s, p) => s + p.forwardAmountMsat, 0n)
+				toForward.reduce((s, p) => s + p.forwardAmountMsat, 0n),
+				[intent]
 			);
 			if (lateFeeError) throw new Error(lateFeeError);
 
@@ -948,8 +1005,20 @@ export class JitReceiveManager extends EventEmitter {
 			// intent is retired only once they have all been placed.
 			this.heldParts.delete(scidHex);
 			this.clearAggregation(scidHex);
-			this.persistHeld();
-			this.applyFee(toForward);
+			// The clearing write has to land before the forward: while the hold
+			// row survives, a restart owes these parts a refund, and refunding
+			// an inbound leg we have already paid downstream for is the loss.
+			if (!this.persistHeld()) {
+				for (const part of toForward) {
+					this.failPart(part, this.deps.failureCodes.temporaryChannelFailure);
+				}
+				this.safeEmit('jit:failed', {
+					scidHex,
+					reason: 'could not clear the durable hold record'
+				});
+				return;
+			}
+			this.applyFee(toForward, [intent]);
 			for (const part of toForward) {
 				this.forwardOrFail(channelId, part);
 			}
@@ -958,6 +1027,10 @@ export class JitReceiveManager extends EventEmitter {
 			this.refreshJitClients();
 			this.safeEmit('jit:forwarded', { scidHex, parts: toForward.length });
 		} catch (err) {
+			// A wait timeout is the one failure that leaves the funding LIVE, so
+			// its reservation is charged rather than refunded: the channel may
+			// still land, and a budget that under-counts is no budget.
+			if (err instanceof FundingWaitTimeoutError) fronted = true;
 			this.failFunding(
 				scidHex,
 				err instanceof Error ? err.message : String(err)
@@ -972,28 +1045,37 @@ export class JitReceiveManager extends EventEmitter {
 
 	/**
 	 * Called when forwarding onto an EXISTING channel was refused (too little
-	 * of our balance on that side, or the channel is mid-splice). When the peer
-	 * is a JIT client, hold the part, splice our own funds in, and retry the
-	 * forward once. Returns true when held, and the caller must then NOT fail
-	 * the HTLC.
+	 * of our balance on that side, or the channel is mid-splice). When the
+	 * channel's peer has a live intent this part fits, hold the part, splice
+	 * our own funds in, and retry the forward once. Returns true when held, and
+	 * the caller must then NOT fail the HTLC.
 	 *
 	 * Which path runs is decided by which failure fired: an unknown SCID is a
 	 * client with no channel and goes to the zero-conf open above, an addHtlc
 	 * refusal on a JIT client's existing channel goes here.
+	 *
+	 * The intent is the authorization on BOTH paths. Being a JIT client is not
+	 * one: it is derived from having any live intent at all, so treating it as
+	 * sufficient would let one 1 msat intent spend a splice, of our coins and
+	 * our on-chain fees, on every unrelated payment that peer ever receives.
 	 */
 	tryHoldForSplice(outChannelId: Buffer, part: IHeldJitPart): boolean {
 		if (this.destroyed) return false;
-		if (!this.deps.isJitClientChannel || !this.deps.spliceInAndWait) {
+		if (!this.deps.peerForChannel || !this.deps.spliceInAndWait) {
 			return false;
 		}
 		if (part.spliceRetried) return false; // one retry only
 		if (part.revoked) return false;
-		if (!this.deps.isJitClientChannel(outChannelId)) return false;
 		if (this.pastDeadline(part)) return false;
+		const peer = this.deps.peerForChannel(outChannelId);
+		if (!peer) return false;
+		const intent = this.matchIntent(peer, part);
+		if (!intent) return false;
 
 		const key = outChannelId.toString('hex');
 		if (!this.spliceInFlight.has(key) && !this.fundingSlotsFree()) return false;
 
+		part.intentScidHex = intent.interceptScidHex;
 		const queue = this.spliceQueues.get(key) ?? [];
 		queue.push(part);
 		this.spliceQueues.set(key, queue);
@@ -1016,7 +1098,21 @@ export class JitReceiveManager extends EventEmitter {
 		// are forwarded together once this one locks.
 		const queued = this.spliceQueues.get(key) ?? [];
 		const totalMsat = queued.reduce((s, p) => s + p.forwardAmountMsat, 0n);
-		let amountSats = (totalMsat + 999n) / 1000n + this.cfg.fundingBufferSats;
+		const intents = this.intentsBehind(queued);
+		const feeError = this.validateFee(queued, totalMsat, intents);
+		if (feeError) {
+			this.failSplice(key, feeError);
+			return;
+		}
+		// The inbound the intents asked to be left over comes from the largest
+		// ask among them, the way the open path takes it from its one intent.
+		const targetInbound = intents.reduce(
+			(max, i) =>
+				i.targetRemainingInboundSat > max ? i.targetRemainingInboundSat : max,
+			0n
+		);
+		let amountSats =
+			(totalMsat + 999n) / 1000n + targetInbound + this.cfg.fundingBufferSats;
 		// The same per-client ceiling the open path clamps to, and the same
 		// budget: the fork clamped only the open, so a splice could front
 		// arbitrarily much.
@@ -1049,17 +1145,45 @@ export class JitReceiveManager extends EventEmitter {
 			if (toForward.some((p) => p.revoked || this.pastDeadline(p))) {
 				throw new Error('held part reached its inbound CLTV deadline');
 			}
+			const forwardIntents = this.intentsBehind(toForward);
+			const lateFeeError = this.validateFee(
+				toForward,
+				toForward.reduce((s, p) => s + p.forwardAmountMsat, 0n),
+				forwardIntents
+			);
+			if (lateFeeError) throw new Error(lateFeeError);
 			this.spliceQueues.delete(key);
-			this.persistHeld();
+			// Same rule as the open path: no forward while a hold row on disk
+			// still tells the next boot to refund these parts.
+			if (!this.persistHeld()) {
+				for (const part of toForward) {
+					this.failPart(part, this.deps.failureCodes.temporaryChannelFailure);
+				}
+				this.safeEmit('jit:failed', {
+					channelIdHex: key,
+					reason: 'could not clear the durable hold record'
+				});
+				return;
+			}
+			this.applyFee(toForward, forwardIntents);
 			for (const part of toForward) {
 				part.spliceRetried = true;
 				this.forwardOrFail(outChannelId, part);
 			}
+			// The intents these parts spent are consumed, exactly as the open
+			// path consumes the one it funded against.
+			for (const intent of forwardIntents) {
+				this.intents.delete(intent.interceptScidHex);
+			}
+			this.persistIntents();
+			this.refreshJitClients();
 			this.safeEmit('jit:forwarded', {
 				channelIdHex: key,
 				parts: toForward.length
 			});
 		} catch (err) {
+			// As in fund(): a timeout leaves the splice live, so it is charged.
+			if (err instanceof FundingWaitTimeoutError) fronted = true;
 			this.failSplice(key, err instanceof Error ? err.message : String(err));
 		} finally {
 			this.releaseFunding(amountSats, fronted);
@@ -1102,6 +1226,12 @@ export class JitReceiveManager extends EventEmitter {
 			} catch (err) {
 				lastErr = err;
 				if (isPermanentFundingRefusal(err)) throw err;
+				// A timeout says only that the funding did not FINISH. The open
+				// or splice it started is still live, and a second attempt would
+				// run a duplicate beside it: two channels for one payment, both
+				// out of our coins. Every other failure proves the operation is
+				// over, which is what makes it safe to retry.
+				if (err instanceof FundingWaitTimeoutError) throw err;
 			}
 			if (i + 1 < this.cfg.fundingAttempts) {
 				await new Promise((r) => {
@@ -1122,16 +1252,86 @@ export class JitReceiveManager extends EventEmitter {
 		try {
 			this.deps.forwardOnto(outChannelId, part);
 		} catch {
-			part.revoked = true;
-			try {
-				part.failIncoming(this.deps.failureCodes.temporaryChannelFailure);
-			} catch {
-				// best-effort: the inbound channel may already be gone
-			}
+			this.failPart(part, this.deps.failureCodes.temporaryChannelFailure);
 		}
 	}
 
-	private feeMsatFor(totalMsat: bigint): bigint {
+	// ─────────────── Intent matching ───────────────
+
+	/**
+	 * The live intent a part arriving on an EXISTING channel may spend, or null.
+	 * A hash-bound intent serves only its own payment and is preferred over an
+	 * unbound one, and neither serves more than it registered for.
+	 */
+	private matchIntent(
+		walletPubkeyHex: string,
+		part: IHeldJitPart
+	): IJitIntent | null {
+		const now = Date.now();
+		const hashHex = part.paymentHash.toString('hex');
+		const fits = (intent: IJitIntent): boolean =>
+			this.claimedAgainst(intent.interceptScidHex) + part.forwardAmountMsat <=
+			intent.maxAmountMsat;
+		const candidates = [...this.intents.values()].filter(
+			(i) => i.walletPubkeyHex === walletPubkeyHex && i.expiresAt > now
+		);
+		return (
+			candidates.find((i) => i.paymentHashHex === hashHex && fits(i)) ??
+			candidates.find((i) => i.paymentHashHex === undefined && fits(i)) ??
+			null
+		);
+	}
+
+	/** Msat already spending against one intent, on either path. */
+	private claimedAgainst(scidHex: string): bigint {
+		let claimed = this.heldTotalMsat(scidHex);
+		for (const parts of this.spliceQueues.values()) {
+			for (const p of parts) {
+				if (p.intentScidHex === scidHex) claimed += p.forwardAmountMsat;
+			}
+		}
+		return claimed;
+	}
+
+	/** Is a splice queue holding parts that spend this intent? */
+	private hasQueuedSpliceParts(scidHex: string): boolean {
+		for (const parts of this.spliceQueues.values()) {
+			if (parts.some((p) => p.intentScidHex === scidHex)) return true;
+		}
+		return false;
+	}
+
+	/** The live intents a set of parts is spending against. */
+	private intentsBehind(parts: IHeldJitPart[]): IJitIntent[] {
+		const seen = new Set<string>();
+		const intents: IJitIntent[] = [];
+		for (const part of parts) {
+			if (!part.intentScidHex || seen.has(part.intentScidHex)) continue;
+			seen.add(part.intentScidHex);
+			const intent = this.intents.get(part.intentScidHex);
+			if (intent) intents.push(intent);
+		}
+		return intents;
+	}
+
+	// ─────────────── Opening fee ───────────────
+
+	/** Is an opening fee configured at all? */
+	private chargesAnOpeningFee(): boolean {
+		return this.cfg.flatFeeSat > 0n || Math.floor(this.cfg.feePpm) > 0;
+	}
+
+	/**
+	 * The fee these parts owe. Zero unless every intent behind them accepted a
+	 * skimmed HTLC: the deduction shrinks a forward whose onion still names the
+	 * original amount, and BOLT 4 has the final hop fail anything short of it
+	 * (final_incorrect_htlc_amount), so skimming at a client that did not agree
+	 * would only destroy the payment after we had funded the channel.
+	 */
+	private feeMsatFor(totalMsat: bigint, intents: IJitIntent[]): bigint {
+		if (intents.length === 0 || !intents.every((i) => i.acceptsSkimmedFee)) {
+			return 0n;
+		}
 		// The ppm is operator config reaching bigint arithmetic; a fractional or
 		// negative one would throw out of BigInt() mid-funding rather than be
 		// refused, so it is normalised here.
@@ -1140,8 +1340,12 @@ export class JitReceiveManager extends EventEmitter {
 	}
 
 	/** Null when the opening fee can be taken out of these parts. */
-	private validateFee(parts: IHeldJitPart[], totalMsat: bigint): string | null {
-		const feeMsat = this.feeMsatFor(totalMsat);
+	private validateFee(
+		parts: IHeldJitPart[],
+		totalMsat: bigint,
+		intents: IJitIntent[]
+	): string | null {
+		const feeMsat = this.feeMsatFor(totalMsat, intents);
 		if (feeMsat <= 0n) return null;
 		if (parts.length === 0) return 'no held part to take the JIT fee from';
 		const largest = parts.reduce((a, b) =>
@@ -1158,9 +1362,9 @@ export class JitReceiveManager extends EventEmitter {
 	 * taken ONCE from the largest part so the aggregate shortfall equals the
 	 * fee the wallet agreed to when it registered the intent.
 	 */
-	private applyFee(parts: IHeldJitPart[]): void {
+	private applyFee(parts: IHeldJitPart[], intents: IJitIntent[]): void {
 		const totalMsat = parts.reduce((s, p) => s + p.forwardAmountMsat, 0n);
-		const feeMsat = this.feeMsatFor(totalMsat);
+		const feeMsat = this.feeMsatFor(totalMsat, intents);
 		if (feeMsat <= 0n || parts.length === 0) return;
 		const largest = parts.reduce((a, b) =>
 			b.forwardAmountMsat > a.forwardAmountMsat ? b : a
@@ -1188,34 +1392,52 @@ export class JitReceiveManager extends EventEmitter {
 		this.safeEmit('jit:failed', { channelIdHex, reason });
 	}
 
+	/**
+	 * Fail ONE part upstream, and keep owing it when the channel could not
+	 * carry the failure. A held part is failed long after it arrived, so the
+	 * inbound channel may be reestablishing by then, and the in-memory hold is
+	 * already gone: without this the refund would simply vanish and the sender
+	 * would wait out the CLTV. The part joins the durable queue the restart
+	 * path drains, which retries on every block until it lands.
+	 */
+	private failPart(part: IHeldJitPart, failureCode: number): void {
+		part.revoked = true;
+		let delivered = false;
+		try {
+			delivered = part.failIncoming(failureCode);
+		} catch {
+			delivered = false;
+		}
+		if (!delivered) this.owedUpstreamFailure(part);
+	}
+
+	/**
+	 * Take ownership of a refund the caller could not deliver: the part is
+	 * queued durably and retried on every block until its inbound channel can
+	 * carry the failure. The node calls this for a JIT part whose forward was
+	 * refused at the same moment its inbound channel went away.
+	 */
+	owedUpstreamFailure(part: IHeldJitPart): void {
+		const owed = JitReceiveManager.persistedShape(part);
+		if (this.hasRestoredHold(owed.inChannelIdHex, part.inHtlcId)) return;
+		this.restoredToFail.push(owed);
+		this.persistHeld();
+	}
+
 	/** Fail every part held for an intercept scid. The preimage is not involved. */
 	private failAllHeld(scidHex: string, failureCode: number): void {
 		this.clearAggregation(scidHex);
 		const parts = this.heldParts.get(scidHex) ?? [];
 		this.heldParts.delete(scidHex);
 		this.persistHeld();
-		for (const part of parts) {
-			part.revoked = true;
-			try {
-				part.failIncoming(failureCode);
-			} catch {
-				// best-effort: the channel may already be gone
-			}
-		}
+		for (const part of parts) this.failPart(part, failureCode);
 	}
 
 	private failAllSpliceQueued(channelIdHex: string, failureCode: number): void {
 		const parts = this.spliceQueues.get(channelIdHex) ?? [];
 		this.spliceQueues.delete(channelIdHex);
 		this.persistHeld();
-		for (const part of parts) {
-			part.revoked = true;
-			try {
-				part.failIncoming(failureCode);
-			} catch {
-				// best-effort
-			}
-		}
+		for (const part of parts) this.failPart(part, failureCode);
 	}
 
 	/** An observer's failure must never take a hold down with it. */
