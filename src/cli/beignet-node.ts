@@ -7133,13 +7133,20 @@ export class BeignetNode extends EventEmitter {
 	spliceIn(
 		channelId: string,
 		amountSats: number,
-		feeratePerkw: number
+		feeratePerkw: number,
+		fundingUtxos?: {
+			utxos: Array<{ txid: string; vout: number }>;
+			allowTopUp?: boolean;
+		}
 	): SpliceResult {
 		const idBuf = requireChannelIdHex(channelId);
 		requirePositiveSafeInteger(amountSats, 'amountSats');
 		requireU32(feeratePerkw, 'feeratePerkw');
+		// fundingUtxos is shape-checked by the node, one copy of the rules; its
+		// InvalidSpliceError converts to INVALID_PARAMS through fundingOrRefuse
+		// like every other splice refusal.
 		const result = fundingOrRefuse(() =>
-			this.node.spliceIn(idBuf, BigInt(amountSats), feeratePerkw)
+			this.node.spliceIn(idBuf, BigInt(amountSats), feeratePerkw, fundingUtxos)
 		);
 		// The SCB is refreshed on the splice:complete event (when fundingTxid holds
 		// the new outpoint), NOT here at initiation where it still holds the old one.

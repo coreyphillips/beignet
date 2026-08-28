@@ -106,6 +106,34 @@ export function selectDualFundingContribution(
 }
 
 /**
+ * Shape check for caller-directed selection opts, before they reach a provider
+ * or a channel. Rejects the empty list for the same reason
+ * selectDualFundingContribution does: it would combine with the providers'
+ * unrestricted fallback and fund with arbitrary coins. `label` names the
+ * caller's own parameter so the message points at what they passed.
+ *
+ * Returns the problem, or null when the opts are well formed.
+ */
+export function validateUtxoSelectionOpts(
+	opts: IUtxoSelectionOpts,
+	label: string
+): string | null {
+	const list = opts.utxos;
+	if (!Array.isArray(list) || list.length === 0) {
+		return `${label} must be a non-empty array`;
+	}
+	for (const u of list) {
+		if (typeof u?.txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(u.txid)) {
+			return `${label} entries need a 64-hex txid`;
+		}
+		if (!Number.isInteger(u.vout) || u.vout < 0) {
+			return `${label} entries need a non-negative integer vout`;
+		}
+	}
+	return null;
+}
+
+/**
  * Verify that a selection honored a directed IUtxoSelectionOpts. The opts are
  * a trailing OPTIONAL parameter, so a third-party provider written against
  * the older signature silently ignores them and still returns a successful
