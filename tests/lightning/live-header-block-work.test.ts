@@ -8,8 +8,10 @@
  * retries only, so on every production node the commitment CPFP re-bump and
  * every timeout scan were driven by nothing at all.
  *
- * Both tests deliver the tip the way the backend does, through the captured
- * subscribeToHeaders callback.
+ * Every test delivers the tip the way the backend does, through the captured
+ * subscribeToHeaders callback. That includes the limit on the work: a block
+ * arrives over no transport, so the header path is where the recovery fence
+ * has to refuse an automatic force close itself.
  */
 import { expect } from 'chai';
 import crypto from 'crypto';
@@ -28,6 +30,7 @@ import {
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import type { GuardianStartupGate } from '../../src/lightning/recovery';
 import type { ISpliceWalletInput } from '../../src/lightning/channel/channel';
 
 bitcoin.initEccLib(ecc);
@@ -65,7 +68,41 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	};
 }
 
-function makeNodeConfig(seedId: number, backend?: IChainBackend): INodeConfig {
+/**
+ * The startup gate's shape, enough for the node: confirmed from the start, so
+ * the channel opens, and fenced on demand afterwards.
+ */
+class FakeGate {
+	state: 'confirmed' | 'fenced' = 'confirmed';
+	blocked: string[] = [];
+	private fencedListeners: Array<() => void> = [];
+	onOpen(listener: () => void): void {
+		if (this.state === 'confirmed') listener();
+	}
+	onFenced(listener: () => void): void {
+		this.fencedListeners.push(listener);
+		if (this.state === 'fenced') listener();
+	}
+	getState(): string {
+		return this.state;
+	}
+	permitsPeerTraffic(): boolean {
+		return this.state === 'confirmed';
+	}
+	reportBlocked(detail: string): void {
+		this.blocked.push(detail);
+	}
+	fence(): void {
+		this.state = 'fenced';
+		for (const listener of this.fencedListeners) listener();
+	}
+}
+
+function makeNodeConfig(
+	seedId: number,
+	backend?: IChainBackend,
+	gate?: FakeGate
+): INodeConfig {
 	const seed = makeSeed(seedId);
 	return {
 		nodePrivateKey: crypto
@@ -84,7 +121,14 @@ function makeNodeConfig(seedId: number, backend?: IChainBackend): INodeConfig {
 			.digest(),
 		// Pinned so the two timeout thresholds (6 and 12 blocks) are explicit.
 		htlcSafetyMargin: 6,
-		...(backend ? { chainBackend: backend } : {})
+		...(backend ? { chainBackend: backend } : {}),
+		...(gate
+			? {
+					recovery: {
+						startupGate: gate as unknown as GuardianStartupGate
+					}
+			  }
+			: {})
 	};
 }
 
@@ -142,8 +186,12 @@ function makeWalletInput(valueSats: number, seed: string): ISpliceWalletInput {
 
 const tick = (ms = 40): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-function createNode(seedId: number, backend?: IChainBackend): LightningNode {
-	const node = new LightningNode(makeNodeConfig(seedId, backend));
+function createNode(
+	seedId: number,
+	backend?: IChainBackend,
+	gate?: FakeGate
+): LightningNode {
+	const node = new LightningNode(makeNodeConfig(seedId, backend, gate));
 	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
@@ -316,6 +364,113 @@ describe('Issue #588: backend headers drive the per-block work', function () {
 			),
 			'commitment re-broadcast'
 		).to.equal(true);
+
+		fx.destroy();
+	});
+
+	/**
+	 * Alice holds the preimage for an inbound HTLC inside the claim buffer, so
+	 * the per-block scan's only way to collect is an on-chain HTLC-success and
+	 * the claim backstop force-closes.
+	 */
+	async function claimBackstop(
+		seedBase: number,
+		gate: FakeGate
+	): Promise<{
+		alice: LightningNode;
+		backend: HeaderCaptureBackend;
+		channelId: Buffer;
+		closes: number;
+		destroy: () => void;
+	}> {
+		const backend = new HeaderCaptureBackend();
+		const alice = createNode(seedBase, backend, gate);
+		const bob = createNode(seedBase + 1);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		await tick(60);
+		expect(backend.onHeader, 'header callback captured').to.not.equal(null);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
+		a.currentBlockHeight = HEIGHT;
+		const htlcs: Map<string, IHtlcEntry> = a.channelManager
+			.getChannel(channelId)
+			.getFullState().htlcs;
+		htlcs.set('received-3', {
+			id: 3n,
+			amountMsat: 40_000n,
+			paymentHash: crypto.randomBytes(32),
+			cltvExpiry: HEIGHT + 10,
+			onionRoutingPacket: Buffer.alloc(1366),
+			direction: HtlcDirection.RECEIVED,
+			state: HtlcState.FULFILLED
+		});
+
+		const fixture = {
+			alice,
+			backend,
+			channelId,
+			closes: 0,
+			destroy: (): void => {
+				alice.destroy();
+				bob.destroy();
+			}
+		};
+		alice.on('node:error', (err: { code: string }) => {
+			if (err.code === 'HTLC_CLAIM_FORCE_CLOSE') fixture.closes++;
+		});
+		return fixture;
+	}
+
+	it('a backend header force-closes to claim a held preimage', async () => {
+		const fx = await claimBackstop(5891, new FakeGate());
+		fx.backend.broadcasts.length = 0;
+
+		fx.backend.onHeader!(HEIGHT + 1);
+		await tick(80);
+
+		expect(fx.closes, 'claim backstop fired').to.equal(1);
+		expect(
+			fx.backend.broadcasts.length,
+			'commitment broadcast'
+		).to.be.greaterThan(0);
+
+		fx.destroy();
+	});
+
+	it('a fenced node broadcasts nothing on a backend header', async () => {
+		// The same backstop on a superseded writer (recovery 5.6). The gate
+		// holds the transports, but a block arrives over no transport, so
+		// without a guard here the scan would publish a commitment the writer
+		// that replaced us may already hold a revocation for.
+		const gate = new FakeGate();
+		const fx = await claimBackstop(5893, gate);
+		gate.fence();
+		fx.backend.broadcasts.length = 0;
+
+		fx.backend.onHeader!(HEIGHT + 1);
+		await tick(80);
+
+		expect(fx.closes, 'no close announced').to.equal(0);
+		expect(fx.backend.broadcasts, 'nothing reached the chain').to.deep.equal(
+			[]
+		);
+		expect(
+			gate.blocked.some((detail) => detail.includes('HTLC_CLAIM_FORCE_CLOSE')),
+			'the refusal is reported to the gate'
+		).to.equal(true);
+
+		// 5.6's labelled escape hatch is the operator's, and it still opens.
+		const forced = fx.alice.forceCloseChannel(
+			fx.channelId,
+			destScript(fx.alice)
+		);
+		expect(forced.ok, 'operator force close still admitted').to.equal(true);
+		expect(
+			fx.backend.broadcasts.length,
+			'the operator close does reach the chain'
+		).to.be.greaterThan(0);
 
 		fx.destroy();
 	});
