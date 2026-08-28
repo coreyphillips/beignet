@@ -249,6 +249,11 @@ export function classifyCommitmentTx(
 
 	const matchesLocal = commitmentNumber === state.localCommitmentNumber;
 	const matchesRemote = commitmentNumber === state.remoteCommitmentNumber;
+	const possibleLivePeerPrevious =
+		commitmentNumber < state.remoteCommitmentNumber &&
+		(state.remoteRevocationNumber !== undefined
+			? commitmentNumber === state.remoteRevocationNumber
+			: commitmentNumber + 1n === state.remoteCommitmentNumber);
 
 	if (matchesLocal && matchesRemote) {
 		// Both commitment numbers are equal — differentiate by comparing
@@ -280,30 +285,21 @@ export function classifyCommitmentTx(
 		// misread as OUR close: zero outputs match our keys, the whole
 		// balance sits unwatched, and preimage-held HTLCs time out back to
 		// the peer.
-		const revCount =
-			state.remoteRevocationNumber ?? state.remoteCommitmentNumber;
-		const livePeerPrevious =
-			!revokedSecret &&
-			commitmentNumber < state.remoteCommitmentNumber &&
-			commitmentNumber === revCount;
+		const livePeerPrevious = !revokedSecret && possibleLivePeerPrevious;
 		if (revokedSecret || livePeerPrevious) {
 			const byScript = disambiguateCommitmentTx(tx, state, commitmentNumber);
-			if (byScript !== CommitmentType.OUR_COMMITMENT) {
-				if (revokedSecret) {
-					// Our to_local is absent from this tx → it is the peer's revoked
-					// commitment sharing our index; route it to the penalty path.
-					return {
-						type: CommitmentType.THEIR_REVOKED_COMMITMENT,
-						commitmentNumber
-					};
-				}
-				// Live and unrevoked: treat as the peer's current commitment.
-				// This includes the ambiguous both-to_locals-trimmed case
-				// deliberately: under THEIR classification our static
-				// to_remote output (our whole balance on the peer's tx) is
-				// tracked and claimed, while OUR classification would track
-				// nothing of ours; if the tx really were our own trimmed
-				// commitment, at most dust is at stake either way.
+			if (revokedSecret && byScript !== CommitmentType.OUR_COMMITMENT) {
+				// Our outputs are absent from this tx, so route the peer's revoked
+				// commitment sharing our index to the penalty path.
+				return {
+					type: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					commitmentNumber
+				};
+			}
+			if (
+				livePeerPrevious &&
+				byScript === CommitmentType.THEIR_CURRENT_COMMITMENT
+			) {
 				return {
 					type: CommitmentType.THEIR_CURRENT_COMMITMENT,
 					commitmentNumber
@@ -336,14 +332,9 @@ export function classifyCommitmentTx(
 	// index any more. No secret exists (the revoked arm above returned),
 	// so this is a live, fully valid peer commitment, never UNKNOWN.
 	{
-		const revCount =
-			state.remoteRevocationNumber ?? state.remoteCommitmentNumber;
-		if (
-			commitmentNumber === revCount &&
-			commitmentNumber < state.remoteCommitmentNumber
-		) {
+		if (possibleLivePeerPrevious) {
 			const byScript = disambiguateCommitmentTx(tx, state, commitmentNumber);
-			if (byScript !== CommitmentType.OUR_COMMITMENT) {
+			if (byScript === CommitmentType.THEIR_CURRENT_COMMITMENT) {
 				return {
 					type: CommitmentType.THEIR_CURRENT_COMMITMENT,
 					commitmentNumber
@@ -375,9 +366,8 @@ export function classifyCommitmentTx(
  * stored secret. Byte-matching derived scripts against the actual outputs
  * remains the final arbiter everywhere these candidates are used, so a
  * wrong candidate can never misattribute an output - it simply fails to
- * match. Legacy states without remoteRevocationNumber read as in-sync (the
- * counter defaults to remoteCommitmentNumber), preserving the pre-window
- * behavior exactly.
+ * match. Legacy states without remoteRevocationNumber try both the in-sync
+ * and in-flight shapes, then use the actual output scripts to select one.
  */
 function candidateTheirPerCommitmentPoints(
 	state: IChannelState,
@@ -389,22 +379,30 @@ function candidateTheirPerCommitmentPoints(
 	};
 	const secret = state.shaChainStore.getSecret(MAX_INDEX - commitmentNumber);
 	if (secret) push(perCommitmentPointFromSecret(secret));
-	const revCount = state.remoteRevocationNumber ?? state.remoteCommitmentNumber;
+	const explicitRevCount = state.remoteRevocationNumber;
+	const revCount = explicitRevCount ?? state.remoteCommitmentNumber;
 	// remoteCurrentPerCommitmentPoint IS point(remoteRevocationNumber): the
 	// unrevoked previous commitment during the window, or the current one
 	// when the counters are in sync.
-	if (commitmentNumber === revCount) {
+	if (
+		commitmentNumber === revCount ||
+		(explicitRevCount === undefined &&
+			commitmentNumber + 1n === state.remoteCommitmentNumber)
+	) {
 		push(state.remoteCurrentPerCommitmentPoint);
 	}
-	if (
-		commitmentNumber === state.remoteCommitmentNumber &&
-		commitmentNumber !== revCount
-	) {
+	if (commitmentNumber === state.remoteCommitmentNumber) {
 		// The newly signed, not-yet-revoked commitment (issue #574): built
-		// with the NEXT point. The stale current point rides last, purely
-		// defensively for counter-invariant drift; byte-matching decides.
-		push(state.remoteNextPerCommitmentPoint);
-		push(state.remoteCurrentPerCommitmentPoint);
+		// with the NEXT point. A legacy row without the revocation counter may
+		// be either in sync or in this window, so retain both orders and let
+		// byte-matching decide.
+		if (explicitRevCount === undefined) {
+			push(state.remoteCurrentPerCommitmentPoint);
+			push(state.remoteNextPerCommitmentPoint);
+		} else if (commitmentNumber !== revCount) {
+			push(state.remoteNextPerCommitmentPoint);
+			push(state.remoteCurrentPerCommitmentPoint);
+		}
 	}
 	return candidates;
 }
@@ -453,13 +451,70 @@ function theirToLocalSpksFor(state: IChannelState, point: Buffer): Buffer[] {
 	return spks;
 }
 
+/** Count peer HTLC outputs whose scripts were derived from `point`. */
+function countTheirHtlcMatches(
+	tx: bitcoin.Transaction,
+	state: IChannelState,
+	point: Buffer
+): number {
+	if (!state.remoteBasepoints) return 0;
+	const claimedKeys = new Set<string>();
+	let matches = 0;
+	if (isTaprootChannel(state.channelType)) {
+		const keys = deriveTaprootCommitKeys(state, point, false);
+		for (const out of tx.outs) {
+			if (
+				matchTaprootHtlcOutput(
+					Buffer.from(out.script),
+					state,
+					keys,
+					false,
+					claimedKeys
+				)
+			) {
+				matches++;
+			}
+		}
+		return matches;
+	}
+
+	const revocationPubkey = deriveRevocationPubkey(
+		state.localBasepoints.revocationBasepoint,
+		point
+	);
+	const theirHtlcPubkey = derivePublicKey(
+		state.remoteBasepoints.htlcBasepoint,
+		point
+	);
+	const ourHtlcPubkey = derivePublicKey(
+		state.localBasepoints.htlcBasepoint,
+		point
+	);
+	for (const out of tx.outs) {
+		if (
+			matchHtlcOutput(
+				Buffer.from(out.script),
+				state,
+				revocationPubkey,
+				theirHtlcPubkey,
+				ourHtlcPubkey,
+				false,
+				claimedKeys
+			)
+		) {
+			matches++;
+		}
+	}
+	return matches;
+}
+
 /**
  * The per-commitment point that actually built a PEER commitment now on
- * chain (issues #573/#574): probes each candidate's to_local against the
- * tx outputs and returns the first that matches. When nothing matches (a
- * trimmed to_local), the first candidate wins - candidate order already
- * prefers the counter-correct point for every window state, so the probe
- * only guards against invariant drift.
+ * chain (issues #573/#574): probes each candidate's to_local and HTLC scripts
+ * against the tx outputs. HTLC matching handles a trimmed to_local, including
+ * legacy rows whose missing revocation counter leaves both point orders
+ * possible. If no point-dependent output exists, only the static to_remote is
+ * claimable and the first candidate is sufficient.
  */
 export function selectTheirPerCommitmentPoint(
 	tx: bitcoin.Transaction,
@@ -476,6 +531,16 @@ export function selectTheirPerCommitmentPoint(
 			}
 		}
 	}
+	let bestHtlcPoint: Buffer | undefined;
+	let bestHtlcMatches = 0;
+	for (const point of candidates) {
+		const matches = countTheirHtlcMatches(tx, state, point);
+		if (matches > bestHtlcMatches) {
+			bestHtlcPoint = point;
+			bestHtlcMatches = matches;
+		}
+	}
+	if (bestHtlcPoint) return bestHtlcPoint;
 	return candidates[0];
 }
 
@@ -622,8 +687,32 @@ function disambiguateCommitmentTx(
 		}
 	}
 
-	// Both to_local scripts are absent (e.g. trimmed on both sides) — cannot decide
-	// ownership from scripts; the caller falls back to the commitment index.
+	// A valid commitment can trim to_local while retaining a static to_remote or
+	// an HTLC worth much more than dust. Compare every other output before the
+	// caller applies its index fallback, or our HTLC-bearing commitment can be
+	// mistaken for the peer's live previous commitment.
+	const txid = tx.getId();
+	const ourMatches = classifyOurCommitmentOutputs(
+		tx,
+		state,
+		txid,
+		commitmentNumber
+	);
+	const theirMatches = classifyTheirCommitmentOutputs(
+		tx,
+		state,
+		txid,
+		commitmentNumber
+	);
+	if (ourMatches.length > 0 && theirMatches.length === 0) {
+		return CommitmentType.OUR_COMMITMENT;
+	}
+	if (theirMatches.length > 0 && ourMatches.length === 0) {
+		return CommitmentType.THEIR_CURRENT_COMMITMENT;
+	}
+
+	// No output gives exclusive ownership evidence. The caller applies the
+	// commitment-index fallback appropriate to the counter state.
 	return CommitmentType.UNKNOWN;
 }
 

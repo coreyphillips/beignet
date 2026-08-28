@@ -1727,8 +1727,8 @@ export class ChainMonitor {
 		// window, and a round that revokes the parked tx hands us its
 		// per-commitment secret. Adopting its confirmation under the old
 		// THEIR_CURRENT record would pay out the stale, pre-window balances
-		// with no penalty. Reclassify on every re-report; only two transitions
-		// swap, and neither can thrash or tear down a good record:
+		// with no penalty. Reclassify on every re-report. The repairs below rebuild
+		// only when durable evidence proves the stored record is stale or incomplete:
 		// - anything -> THEIR_REVOKED (a revocation secret never disappears);
 		// - THEIR_FUTURE -> COOPERATIVE_CLOSE (issue #568: records persisted
 		//   before the classifier learned the simple-close and taproot RBF
@@ -1736,25 +1736,45 @@ export class ChainMonitor {
 		//   and would pin RESOLVING forever; coop classification is purely
 		//   structural, so the same tx re-reports the same answer every time,
 		//   and a real commitment carries the BOLT 3 stamp so it can never
-		//   re-classify as cooperative).
+		//   re-classify as cooperative);
+		// - OUR -> THEIR_CURRENT for a pre-#573 misclassification;
+		// - THEIR_CURRENT without a pinned point for a pre-#574 incomplete record.
 		// Reset and re-enter handleFundingSpent so resolution runs exactly as
 		// a fresh sighting would.
 		const recordedType = this._commitmentBroadcast.commitmentType;
-		const liveType = classifyCommitmentTx(spendingTx, this._channelState).type;
+		const liveClassification = classifyCommitmentTx(
+			spendingTx,
+			this._channelState
+		);
+		const liveType = liveClassification.type;
 		const ourToTheirRepair =
 			recordedType === CommitmentType.OUR_COMMITMENT &&
 			liveType === CommitmentType.THEIR_CURRENT_COMMITMENT;
+		const missingTheirPointRepair =
+			recordedType === CommitmentType.THEIR_CURRENT_COMMITMENT &&
+			liveType === CommitmentType.THEIR_CURRENT_COMMITMENT &&
+			this._commitmentBroadcast.remotePerCommitmentPoint === undefined &&
+			selectTheirPerCommitmentPoint(
+				spendingTx,
+				this._channelState,
+				liveClassification.commitmentNumber
+			) !== undefined;
 		const revokedRepair =
 			recordedType !== CommitmentType.THEIR_REVOKED_COMMITMENT &&
 			liveType === CommitmentType.THEIR_REVOKED_COMMITMENT;
 		const coopRepair =
 			recordedType === CommitmentType.THEIR_FUTURE_COMMITMENT &&
 			liveType === CommitmentType.COOPERATIVE_CLOSE;
-		// OUR -> THEIR_CURRENT repairs records persisted by pre-#573 builds
-		// (the peer's unrevoked previous commitment misread as our close) on
-		// the next re-report. Monotone: our to_local either is in the tx or
-		// is not, so the corrected verdict cannot thrash back.
-		if (revokedRepair || coopRepair || ourToTheirRepair) {
+		// OUR -> THEIR_CURRENT repairs records persisted by pre-#573 builds.
+		// A THEIR_CURRENT record without a pinned point comes from a pre-#574
+		// build and may contain only the static to_remote output. Rebuilding it
+		// restores every point-dependent output and pins the selected point.
+		if (
+			revokedRepair ||
+			coopRepair ||
+			ourToTheirRepair ||
+			missingTheirPointRepair
+		) {
 			const knownOutpoint = this._commitmentBroadcast.spentOutpoint;
 			this._trackedOutputs = [];
 			this._commitmentBroadcast = null;

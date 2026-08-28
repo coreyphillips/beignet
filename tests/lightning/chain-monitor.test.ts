@@ -1436,6 +1436,58 @@ describe('Chain Monitor (Phase 4C)', function () {
 			expect(toRemoteClaim, 'the repaired record re-resolves').to.exist;
 		});
 
+		it('repairs a pre-fix THEIR_CURRENT record missing point-dependent outputs on re-report', function () {
+			// A pre-#574 build classified the newest signed commitment correctly,
+			// but used the stale current point. It persisted only the static
+			// to_remote output and had no pinned point for later resolution.
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const preState = opener.getFullState();
+			const nextPoint = preState.remoteNextPerCommitmentPoint!;
+
+			const sigs = realCommitmentSigs(opener);
+			opener.signCommitment(sigs.signature, sigs.htlcSignatures);
+			const winState = opener.getFullState();
+			const peerTx = buildRemoteCommitment(winState, nextPoint, 1n).result.tx;
+
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				winState,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			monitor.handleFundingSpent(peerTx, 100);
+
+			const staleRecord = monitor.getFullState().commitmentBroadcast!;
+			staleRecord.remotePerCommitmentPoint = undefined;
+			const staticOutputs = staleRecord.trackedOutputs.filter(
+				(output) => output.outputType === OutputType.TO_REMOTE
+			);
+			staleRecord.trackedOutputs.splice(
+				0,
+				staleRecord.trackedOutputs.length,
+				...staticOutputs
+			);
+
+			monitor.handleFundingSpent(peerTx, 100);
+
+			const repaired = monitor.getFullState();
+			expect(
+				repaired.commitmentBroadcast?.remotePerCommitmentPoint?.equals(
+					nextPoint
+				),
+				'record pins the point on upgrade'
+			).to.equal(true);
+			expect(
+				repaired.trackedOutputs.some(
+					(output) => output.outputType === OutputType.TO_LOCAL
+				),
+				'point-dependent outputs are rebuilt'
+			).to.equal(true);
+		});
+
 		it('should detect their commitment and claim to_remote immediately', function () {
 			const { opener, openerPrivkeys } = setupNormalChannels();
 			const state = opener.getFullState();

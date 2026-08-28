@@ -10,7 +10,9 @@ import {
 import {
 	ChannelState,
 	ChannelRole,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	HtlcDirection,
+	HtlcState
 } from '../../src/lightning/channel/types';
 import { Channel } from '../../src/lightning/channel/channel';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
@@ -576,6 +578,82 @@ describe('Output Resolver (Phase 4B)', function () {
 			expect(classifyCommitmentTx(ourTx, winState).type).to.equal(
 				CommitmentType.OUR_COMMITMENT
 			);
+
+			// A row written before remoteRevocationNumber existed can persist this
+			// same in-flight state. The scripts still disambiguate both owners.
+			winState.remoteRevocationNumber = undefined;
+			expect(classifyCommitmentTx(peerUnrevokedTx, winState).type).to.equal(
+				CommitmentType.THEIR_CURRENT_COMMITMENT
+			);
+			expect(classifyCommitmentTx(ourTx, winState).type).to.equal(
+				CommitmentType.OUR_COMMITMENT
+			);
+		});
+
+		it('keeps our HTLC-bearing commitment classified as ours when to_local is trimmed', function () {
+			// This is the valid removal window after we signed the peer's next
+			// commitment and its answering revoke_and_ack remains outstanding.
+			const { opener, acceptor, acceptorCommitmentSeed } =
+				setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+			const winState = acceptor.getFullState();
+			winState.remoteCommitmentNumber = 2n;
+			winState.remoteRevocationNumber = 1n;
+			winState.localBalanceMsat = 0n;
+			winState.remoteBalanceMsat = 900_000_000n;
+			winState.htlcs.clear();
+			winState.htlcs.set('received-0', {
+				id: 0n,
+				amountMsat: 100_000_000n,
+				paymentHash: crypto.randomBytes(32),
+				cltvExpiry: 700_000,
+				onionRoutingPacket: Buffer.alloc(1366),
+				direction: HtlcDirection.RECEIVED,
+				state: HtlcState.FULFILLED,
+				removalRemoteCommitted: false,
+				commitCoverPending: true
+			});
+
+			const ourPoint1 = perCommitmentPointFromSecret(
+				generateFromSeed(acceptorCommitmentSeed, MAX_INDEX - 1n)
+			);
+			const ourTx = buildLocalCommitment(winState, ourPoint1, 1n).result.tx;
+			expect(winState.localCommitmentNumber).to.equal(1n);
+			expect(winState.remoteCommitmentNumber).to.equal(2n);
+			expect(winState.remoteRevocationNumber).to.equal(1n);
+			const expectedOutputs = classifyOutputs(
+				ourTx,
+				winState,
+				CommitmentType.OUR_COMMITMENT,
+				1n
+			);
+			expect(
+				expectedOutputs.some(
+					(output) => output.outputType === OutputType.TO_LOCAL
+				),
+				'to_local is trimmed'
+			).to.equal(false);
+			expect(
+				expectedOutputs.some(
+					(output) => output.outputType === OutputType.RECEIVED_HTLC
+				),
+				'the non-dust HTLC remains'
+			).to.equal(true);
+
+			const verdict = classifyCommitmentTx(ourTx, winState);
+			expect(verdict.type).to.equal(CommitmentType.OUR_COMMITMENT);
+			const tracked = classifyOutputs(
+				ourTx,
+				winState,
+				verdict.type,
+				verdict.commitmentNumber
+			);
+			expect(
+				tracked.some(
+					(output) => output.outputType === OutputType.RECEIVED_HTLC
+				),
+				'our HTLC remains tracked'
+			).to.equal(true);
 		});
 
 		it("resolves the peer's NEWLY SIGNED pre-revocation commitment with the point that built it (issue #574)", function () {
@@ -623,6 +701,78 @@ describe('Output Resolver (Phase 4B)', function () {
 			expect(
 				tracked.some((o) => o.outputType === OutputType.TO_LOCAL),
 				'their to_local matched under the NEXT point'
+			).to.equal(true);
+
+			// Legacy rows have no explicit revocation counter. The on-chain outputs
+			// must still select the next point for an in-flight newest commitment.
+			winState.remoteRevocationNumber = undefined;
+			expect(
+				selectTheirPerCommitmentPoint(peerNewTx, winState, 1n)!.equals(
+					nextPoint
+				),
+				'next point selected for a legacy in-flight row'
+			).to.equal(true);
+			const legacyTracked = classifyOutputs(
+				peerNewTx,
+				winState,
+				verdict.type,
+				verdict.commitmentNumber
+			);
+			expect(
+				legacyTracked.some((o) => o.outputType === OutputType.TO_LOCAL),
+				'legacy point-dependent outputs are tracked'
+			).to.equal(true);
+
+			// If their to_local is trimmed, an HTLC script still identifies the
+			// point. This is the case where candidate order alone is insufficient.
+			winState.remoteRevocationNumber = 0n;
+			winState.localBalanceMsat = 900_000_000n;
+			winState.remoteBalanceMsat = 0n;
+			winState.htlcs.clear();
+			winState.htlcs.set('offered-0', {
+				id: 0n,
+				amountMsat: 100_000_000n,
+				paymentHash: crypto.randomBytes(32),
+				cltvExpiry: 700_000,
+				onionRoutingPacket: Buffer.alloc(1366),
+				direction: HtlcDirection.OFFERED,
+				state: HtlcState.COMMITTED
+			});
+			const trimmedPeerTx = buildRemoteCommitment(winState, nextPoint, 1n)
+				.result.tx;
+			const explicitTracked = classifyOutputs(
+				trimmedPeerTx,
+				winState,
+				CommitmentType.THEIR_CURRENT_COMMITMENT,
+				1n
+			);
+			expect(
+				explicitTracked.some((o) => o.outputType === OutputType.TO_LOCAL),
+				'their to_local is trimmed'
+			).to.equal(false);
+			expect(
+				explicitTracked.some((o) => o.outputType === OutputType.OFFERED_HTLC),
+				'the point-dependent HTLC remains'
+			).to.equal(true);
+
+			winState.remoteRevocationNumber = undefined;
+			expect(
+				selectTheirPerCommitmentPoint(trimmedPeerTx, winState, 1n)!.equals(
+					nextPoint
+				),
+				'HTLC selects the next point for a legacy row'
+			).to.equal(true);
+			const legacyTrimmedTracked = classifyOutputs(
+				trimmedPeerTx,
+				winState,
+				CommitmentType.THEIR_CURRENT_COMMITMENT,
+				1n
+			);
+			expect(
+				legacyTrimmedTracked.some(
+					(o) => o.outputType === OutputType.OFFERED_HTLC
+				),
+				'legacy HTLC remains tracked'
 			).to.equal(true);
 		});
 
@@ -1211,8 +1361,6 @@ describe('Output Resolver (Phase 4B)', function () {
 			const {
 				buildReceivedHtlcScript
 			} = require('../../src/lightning/script/htlc');
-			const { HtlcDirection } = require('../../src/lightning/channel/types');
-
 			// An HTLC we offered that was present in revoked commitment #0 but has
 			// since settled and been removed from live state.htlcs.
 			const paymentHash = crypto.randomBytes(32);
