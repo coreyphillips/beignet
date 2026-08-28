@@ -1003,6 +1003,17 @@ export class ChainMonitor {
 			return [];
 		}
 
+		const spentIndices = new Set<number>();
+		for (const input of spendingTx.ins) {
+			if (Buffer.from(input.hash).reverse().toString('hex') === txid) {
+				spentIndices.add(input.index);
+			}
+		}
+		const spentTrackedOutputs = this._trackedOutputs.filter(
+			(candidate) =>
+				candidate.txid === txid && spentIndices.has(candidate.outputIndex)
+		);
+
 		// Idempotent: the watch is retained after a spend (so a reorg can be detected),
 		// which re-fires the subscription. If we already recorded THIS exact spend,
 		// don't reprocess it (avoids duplicate second-level tracking / preimage scans).
@@ -1015,26 +1026,28 @@ export class ChainMonitor {
 			output.status === OutputStatus.SPEND_CONFIRMED &&
 			output.resolutionTxid === spendingTx.getId()
 		) {
-			// The manager persists the monitor on every report, so the
-			// refreshed height and cleared flag are durable without an action.
-			output.confirmationHeight = blockHeight;
-			delete output.spendReverifyPending;
+			// One report proves every output already recorded against this
+			// transaction, not just the watched one: a batched penalty's other
+			// members are otherwise left parked on watches of their own that may
+			// never fire. The manager persists the monitor on every report, so
+			// the refreshed heights and cleared flags are durable without an
+			// action.
+			for (const proven of [output, ...spentTrackedOutputs]) {
+				if (proven.resolutionTxid !== spendingTx.getId()) continue;
+				proven.confirmationHeight = blockHeight;
+				delete proven.spendReverifyPending;
+			}
 			return [];
 		}
 
 		output.status = OutputStatus.SPEND_CONFIRMED;
 		output.resolutionTxid = spendingTx.getId();
 		output.confirmationHeight = blockHeight;
-		const spentIndices = new Set<number>();
-		for (const input of spendingTx.ins) {
-			if (Buffer.from(input.hash).reverse().toString('hex') === txid) {
-				spentIndices.add(input.index);
-			}
-		}
-		const spentTrackedOutputs = this._trackedOutputs.filter(
-			(candidate) =>
-				candidate.txid === txid && spentIndices.has(candidate.outputIndex)
-		);
+		// A spend we had not recorded is live evidence as much as a re-report of
+		// one we had, so it releases a parked finality clock (issue #576). A
+		// replacement spender arrives here, and so does the original spend once
+		// an eviction has cleared its resolution.
+		delete output.spendReverifyPending;
 
 		// Scan the whole spending tx for any preimages it reveals — not just the
 		// one matched output. A single counterparty tx can claim several HTLC
@@ -1216,6 +1229,7 @@ export class ChainMonitor {
 			spentTrackedOutput.status = OutputStatus.SPEND_CONFIRMED;
 			spentTrackedOutput.resolutionTxid = spendingTx.getId();
 			spentTrackedOutput.confirmationHeight = blockHeight;
+			delete spentTrackedOutput.spendReverifyPending;
 		}
 
 		this._repairRevokedSharedSweepAfterConflict(spendingTx, actions);

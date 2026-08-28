@@ -244,6 +244,92 @@ describe('Spend finality waits for live re-verification (issues #576/#577)', fun
 		).to.have.length(1);
 	});
 
+	it('a different spender releases the parked clock too', function () {
+		// The re-armed watch can find a spend we never recorded (a replacement,
+		// or the counterparty winning the race). That report is live evidence
+		// just the same, so the clock must restart against the new spend
+		// instead of waiting for a report of the old one that will never come.
+		const f = monitorWithConfirmedPenalty(8);
+		const restored = restoreFrom(f);
+		const replacement = new bitcoin.Transaction();
+		replacement.version = 2;
+		replacement.addInput(
+			Buffer.from(COMMITMENT_TXID, 'hex').reverse(),
+			0,
+			0xfffffffd
+		);
+		replacement.addOutput(f.destScript, 80_000);
+		const seenAt = SPEND_HEIGHT + 3;
+		restored.handleOutputSpent(COMMITMENT_TXID, 0, replacement, seenAt);
+
+		expect(trackedOutput(restored).spendReverifyPending).to.equal(undefined);
+		expect(trackedOutput(restored).resolutionTxid).to.equal(
+			replacement.getId()
+		);
+		expect(
+			resolvedActions(restored, seenAt + IRREVOCABLE_DEPTH)
+		).to.have.length(1);
+	});
+
+	it('one live report clears every output that spend proves', function () {
+		// A batched penalty resolves several outputs at once and only one of
+		// their watches reports it. The transaction proves all of them, so
+		// their clocks restart together rather than waiting for a per-output
+		// report each.
+		const f = monitorWithConfirmedPenalty(10);
+		const batch = new bitcoin.Transaction();
+		batch.version = 2;
+		for (const index of [0, 1]) {
+			batch.addInput(
+				Buffer.from(COMMITMENT_TXID, 'hex').reverse(),
+				index,
+				0xfffffffd
+			);
+		}
+		batch.addOutput(f.destScript, 170_000);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const m = f.monitor as any;
+		const first = m._trackedOutputs[0] as ITrackedOutput;
+		first.resolutionTxid = batch.getId();
+		first.sweepTxHex = batch.toHex();
+		m._trackedOutputs.push({ ...first, outputIndex: 1 });
+
+		const restored = restoreFrom(f);
+		const outputs = restored.getTrackedOutputs();
+		expect(outputs).to.have.length(2);
+		expect(outputs.every((o) => o.spendReverifyPending === true)).to.equal(
+			true
+		);
+
+		const seenAt = SPEND_HEIGHT + 2;
+		restored.handleOutputSpent(COMMITMENT_TXID, 0, batch, seenAt);
+		expect(
+			restored
+				.getTrackedOutputs()
+				.every((o) => o.spendReverifyPending === undefined),
+			'the member the report never named is proven too'
+		).to.equal(true);
+		expect(
+			resolvedActions(restored, seenAt + IRREVOCABLE_DEPTH)
+		).to.have.length(2);
+	});
+
+	it('an eviction and re-confirmation releases the parked clock', function () {
+		// handleSpendUnconfirmed drops the recorded resolution, so the same
+		// penalty confirming again is no longer the idempotent re-report — it
+		// arrives as a fresh spend and must clear the flag on that path.
+		const f = monitorWithConfirmedPenalty(9);
+		const restored = restoreFrom(f);
+		restored.handleSpendUnconfirmed(COMMITMENT_TXID, 0);
+		const reminedAt = SPEND_HEIGHT + 12;
+		restored.handleOutputSpent(COMMITMENT_TXID, 0, f.penalty, reminedAt);
+
+		expect(trackedOutput(restored).spendReverifyPending).to.equal(undefined);
+		expect(
+			resolvedActions(restored, reminedAt + IRREVOCABLE_DEPTH)
+		).to.have.length(1);
+	});
+
 	it('a re-mined spend recounts depth from where it actually sits', function () {
 		const f = monitorWithConfirmedPenalty(4);
 		const restored = restoreFrom(f);
