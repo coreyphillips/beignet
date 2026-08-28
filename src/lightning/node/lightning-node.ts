@@ -2277,6 +2277,13 @@ export class LightningNode extends EventEmitter {
 		if (this.currentBlockHeight > 0) {
 			this.scanExpiringOfferedHtlcs(this.currentBlockHeight);
 			this.scanExpiringHtlcs(this.currentBlockHeight);
+			// Forwards get their own scan here too (issue #575), matching the
+			// per-block ordering: it acts a margin earlier than the scan above
+			// and is the reason a downtime that crossed the wider threshold
+			// still resolves a stuck forward on chain rather than waiting for
+			// the next block. Rows whose recency is unproven skip the
+			// force-close on their own (issue #469).
+			this.scanForwardTimeouts(this.currentBlockHeight);
 		}
 	}
 
@@ -17460,6 +17467,52 @@ export class LightningNode extends EventEmitter {
 
 				if (htlc.cltvExpiry - blockHeight <= this.htlcSafetyMargin) {
 					const channelId = state.channelId || state.temporaryChannelId;
+
+					// A FORWARDED inbound leg is never failed on time alone (issue
+					// #575). scanForwardTimeouts applies this rule at twice this
+					// margin and normally settles the forward first, but it only
+					// wins when blocks arrive one at a time: a node offline across
+					// [expiry-2m, expiry-m] catches up in a single handleNewBlock
+					// past both thresholds, and the restore-time scan runs this
+					// scanner with no forward scan in the same pass at all. Failing
+					// here would refund upstream while the downstream can still
+					// claim, and the FAILED entry then hides the forward from
+					// scanForwardTimeouts AND makes the late preimage unusable
+					// upstream (canFulfillHtlc refuses it): we would pay downstream
+					// and refund upstream for the same forward. Force-close the
+					// inbound instead, exactly as scanForwardTimeouts does, and keep
+					// the linkage so a late settlement is still honored. Checked
+					// before the blinded arm, which fails inbound the same way.
+					const outKey = this.findOutgoingLeg(channelId, htlc.id);
+					if (outKey && !this.isOutgoingLegTerminallyFailed(outKey)) {
+						if (
+							this.skipAutoCloseRestoreUnproven(
+								state,
+								'FORWARD_TIMEOUT_FORCE_CLOSE'
+							) ||
+							this.skipAutoCloseFundingNotOnChain(
+								channel,
+								state,
+								'FORWARD_TIMEOUT_FORCE_CLOSE'
+							)
+						) {
+							continue;
+						}
+						this.emit('node:error', {
+							code: 'FORWARD_TIMEOUT_FORCE_CLOSE',
+							channelId,
+							message: `forwarded HTLC ${htlc.id} inbound expiry near (${htlc.cltvExpiry}) with outbound leg unresolved; force-closing inbound to resolve on-chain`,
+							timestamp: Date.now()
+						} as ILightningError);
+						this._forceCloseWithReason(
+							channelId,
+							this.getSweepDestinationScript(),
+							this.resolveForceCloseFeeRatePerVbyte(),
+							'FORWARD_TIMEOUT_FORCE_CLOSE'
+						);
+						break; // channel is closing; stop scanning it
+					}
+
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
 					const blindedRole = this.blindedRoleFor(channelId, htlc.id);
 					if (blindedRole) {
@@ -17524,25 +17577,9 @@ export class LightningNode extends EventEmitter {
 
 				if (htlc.cltvExpiry - blockHeight > doubleMargin) continue;
 
-				// Determine the outgoing leg's resolution state. outKey encodes the
-				// outgoing channel + the offered HTLC id we sent downstream.
-				const outParts = outKey.split(':');
-				const outChannelIdHex = outParts[0];
-				const outHtlcIdStr = outParts[1]?.replace('offered-', '');
-				let outgoingFailed = false;
-				if (outChannelIdHex && outHtlcIdStr) {
-					const outChannel = this.channelManager.getChannel(
-						Buffer.from(outChannelIdHex, 'hex')
-					);
-					const outHtlc = outChannel
-						?.getFullState()
-						.htlcs.get(`offered-${outHtlcIdStr}`);
-					// Only an explicitly FAILED outgoing HTLC is safe to refund upstream
-					// for: we owe the downstream nothing. Anything else (still in-flight,
-					// FULFILLED, or already removed/ambiguous) means the downstream can
-					// still legitimately claim, so refunding upstream would double-pay.
-					outgoingFailed = outHtlc?.state === HtlcState.FAILED;
-				}
+				// Only an explicitly FAILED outgoing leg is safe to refund upstream
+				// for; the shared predicate is the same one scanExpiringHtlcs uses.
+				const outgoingFailed = this.isOutgoingLegTerminallyFailed(outKey);
 
 				// An errored inbound channel cannot carry the update_fail_htlc even
 				// when the outbound leg failed cleanly, so it always takes the
@@ -17610,6 +17647,32 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Find the outgoing leg key for a forwarded HTLC given its incoming channel+htlcId.
 	 */
+	/**
+	 * Whether a forward's OUTGOING leg is irrevocably resolved as FAILED, the
+	 * only condition under which refunding the inbound leg upstream is safe.
+	 *
+	 * BOLT 2 fund safety: anything else (still in flight, FULFILLED, or already
+	 * removed and therefore ambiguous) leaves the downstream able to claim, so
+	 * an upstream refund would pay B and refund A for the same forward. Shared
+	 * by both expiry scanners (issue #575) so the two can never drift: one of
+	 * them used to fail the inbound on time alone.
+	 *
+	 * @param outKey - "outChannelIdHex:offered-<id>", as forwardedHtlcs keys it
+	 */
+	private isOutgoingLegTerminallyFailed(outKey: string): boolean {
+		const outParts = outKey.split(':');
+		const outChannelIdHex = outParts[0];
+		const outHtlcIdStr = outParts[1]?.replace('offered-', '');
+		if (!outChannelIdHex || !outHtlcIdStr) return false;
+		const outChannel = this.channelManager.getChannel(
+			Buffer.from(outChannelIdHex, 'hex')
+		);
+		const outHtlc = outChannel
+			?.getFullState()
+			.htlcs.get(`offered-${outHtlcIdStr}`);
+		return outHtlc?.state === HtlcState.FAILED;
+	}
+
 	private findOutgoingLeg(
 		inChannelId: Buffer,
 		inHtlcId: bigint
