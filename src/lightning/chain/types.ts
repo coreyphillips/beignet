@@ -107,6 +107,23 @@ export interface ITrackedOutput {
 	 * commitment to_local tree and strand the second-level funds.
 	 */
 	isSecondLevelHtlc?: boolean;
+	/**
+	 * This output's recorded spend has not been re-verified against the chain
+	 * this session, so its height must not count toward finality (issue #576).
+	 *
+	 * Set on restore for every persisted SPEND_CONFIRMED output, and whenever
+	 * the parent commitment is demoted (issue #577): the spend may have been
+	 * reorged out while we were offline or while the funding watch was
+	 * un-armed, and the session's first header reaches the monitor BEFORE any
+	 * per-output watch re-arms, so a stale height could otherwise reach
+	 * IRREVOCABLE_DEPTH with nothing able to contradict it. Cleared by the
+	 * re-armed watch's first live report of the spend (which also refreshes
+	 * confirmationHeight), or by the eviction path, which repairs the height
+	 * itself. The recorded height is deliberately KEPT while the flag is set:
+	 * it seeds the watch, and a re-report of the same height must lose no
+	 * progress.
+	 */
+	spendReverifyPending?: boolean;
 }
 
 /** Info about a confirmed commitment transaction */

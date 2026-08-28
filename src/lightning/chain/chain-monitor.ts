@@ -239,6 +239,30 @@ export class ChainMonitor {
 			monitor._commitmentBroadcast.trackedOutputs = monitor._trackedOutputs;
 		}
 		monitor._currentBlockHeight = saved.currentBlockHeight;
+		// Fresh-evidence rule, per output (issue #576), the sibling of the
+		// cooperative-close rule below. A commitment close resolves through
+		// individual sweeps whose spends carry their OWN heights, and those
+		// were trusted verbatim across a restart: a restored breach monitor
+		// promoted a penalty sweep to irrevocable off a stale height on the
+		// session's FIRST header, which reaches monitors before
+		// restoreChainWatches can re-arm the per-output watch that would have
+		// reported the spend evicted. A penalty reorged out while we were
+		// offline then counted as resolved, the channel as fully swept, and
+		// nothing ever rebroadcast it: the breach went unpunished. The height
+		// is KEPT (it seeds the re-armed watch, and re-reporting the same
+		// height must lose no progress); only its use as finality evidence
+		// waits for that watch. Runs before the revoked-snapshot repair below
+		// so an inferred member copies its source's verification state:
+		// inheriting from an already-irrevocable source needs no re-proof,
+		// since a reorg that deep is outside the threat model this whole
+		// depth rule encodes.
+		if (monitor._state !== MonitorState.FULLY_RESOLVED) {
+			for (const output of monitor._trackedOutputs) {
+				if (output.status === OutputStatus.SPEND_CONFIRMED) {
+					output.spendReverifyPending = true;
+				}
+			}
+		}
 		if (
 			monitor._commitmentBroadcast?.commitmentType ===
 				CommitmentType.THEIR_REVOKED_COMMITMENT &&
@@ -330,7 +354,15 @@ export class ChainMonitor {
 						originalFeeRate: sourceOutput?.originalFeeRate,
 						currentFeeRate: sourceOutput?.currentFeeRate,
 						resolutionTxid: sourceOutput?.resolutionTxid,
-						maturityHeight: sourceOutput?.maturityHeight
+						maturityHeight: sourceOutput?.maturityHeight,
+						// Inherited, not re-derived (issue #576): this member's
+						// spend IS the source's, so it needs re-verification
+						// exactly when the source does. A source already
+						// irrevocable carries no flag and the member promotes
+						// on the next block, as it did before.
+						...(sourceOutput?.spendReverifyPending === true
+							? { spendReverifyPending: true }
+							: {})
 					};
 					monitor._trackedOutputs.push(restoredOutput);
 					if (!sourceOutput) {
@@ -739,7 +771,12 @@ export class ChainMonitor {
 			// Check if confirmed spend has reached irrevocable depth
 			if (
 				output.status === OutputStatus.SPEND_CONFIRMED &&
-				output.resolutionTxid
+				output.resolutionTxid &&
+				// Only heights this session has positively verified count
+				// toward finality (issue #576), and a zeroed height is not a
+				// depth of blockHeight.
+				!output.spendReverifyPending &&
+				output.confirmationHeight > 0
 			) {
 				// The resolution was confirmed; check depth
 				const depth = blockHeight - output.confirmationHeight;
@@ -969,10 +1006,19 @@ export class ChainMonitor {
 		// Idempotent: the watch is retained after a spend (so a reorg can be detected),
 		// which re-fires the subscription. If we already recorded THIS exact spend,
 		// don't reprocess it (avoids duplicate second-level tracking / preimage scans).
+		// The report is still LIVE evidence of the spend, though: it refreshes the
+		// height and releases the finality clock a restart or a demotion parked
+		// (issue #576). Without this the parked clock would never restart, because
+		// the watcher reports an unchanged spend to nobody and the output would sit
+		// SPEND_CONFIRMED forever.
 		if (
 			output.status === OutputStatus.SPEND_CONFIRMED &&
 			output.resolutionTxid === spendingTx.getId()
 		) {
+			// The manager persists the monitor on every report, so the
+			// refreshed height and cleared flag are durable without an action.
+			output.confirmationHeight = blockHeight;
+			delete output.spendReverifyPending;
 			return [];
 		}
 
@@ -1848,13 +1894,27 @@ export class ChainMonitor {
 		const tip = Math.max(this._currentBlockHeight, blockHeight);
 		for (const output of this._trackedOutputs) {
 			// Outputs whose height came from the commitment's confirmation follow
-			// it. A SPEND_CONFIRMED output's height is its own spend's (its reorg
-			// handling is per-output, via handleSpendUnconfirmed), and a resolved
-			// output's finality is not re-litigated here.
+			// it. A SPEND_CONFIRMED output's height is its own spend's, and a
+			// resolved output's finality is not re-litigated here.
 			if (
 				output.status === OutputStatus.SPEND_CONFIRMED ||
 				output.status === OutputStatus.IRREVOCABLY_RESOLVED
 			) {
+				// A SPEND_CONFIRMED output's own reorg handling runs per output,
+				// via handleSpendUnconfirmed — but only while a per-output watch
+				// is armed to deliver it. When the COMMITMENT is demoted to
+				// unconfirmed (blockHeight 0), the sweeps spending its outputs
+				// cannot be confirmed either, since they spend outputs that no
+				// longer exist: park their finality clocks until a live report
+				// re-establishes them (issues #576/#577). Without this a
+				// commitment-evicting reorg left those clocks running against
+				// heights nothing could contradict.
+				if (
+					blockHeight <= 0 &&
+					output.status === OutputStatus.SPEND_CONFIRMED
+				) {
+					output.spendReverifyPending = true;
+				}
 				continue;
 			}
 			if (
