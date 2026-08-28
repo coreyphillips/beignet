@@ -9015,7 +9015,7 @@ export class LightningNode extends EventEmitter {
 		if (params.fundingUtxos) {
 			const shapeErr = validateUtxoSelectionOpts(
 				params.fundingUtxos,
-				'fundingUtxos.utxos'
+				'fundingUtxos'
 			);
 			if (shapeErr) throw new InvalidChannelOpenError(shapeErr);
 			// Directed funding needs a provider that can select wallet inputs
@@ -10250,10 +10250,7 @@ export class LightningNode extends EventEmitter {
 		});
 		if (feeErr) throw new InvalidSpliceError(feeErr);
 		if (fundingUtxos) {
-			const optsErr = validateUtxoSelectionOpts(
-				fundingUtxos,
-				'fundingUtxos.utxos'
-			);
+			const optsErr = validateUtxoSelectionOpts(fundingUtxos, 'fundingUtxos');
 			if (optsErr) throw new InvalidSpliceError(optsErr);
 		}
 

@@ -30,7 +30,10 @@ import {
 	IAcceptChannel2Message
 } from '../../src/lightning/message/dual-funding';
 import { decodeTxAddInputMessage } from '../../src/lightning/message/interactive-tx';
-import { verifyDirectedSelection } from '../../src/lightning/node/funding-selection';
+import {
+	validateUtxoSelectionOpts,
+	verifyDirectedSelection
+} from '../../src/lightning/node/funding-selection';
 import { IDualFundingParams } from '../../src/lightning/channel/dual-funding';
 import { ISpliceWalletInput } from '../../src/lightning/channel/channel';
 import { ChannelState } from '../../src/lightning/channel/types';
@@ -699,6 +702,32 @@ describe('autoFundDualFundedOpen embedder-contribution guard (issue #572)', () =
 			verifyDirectedSelection([makeInput(100_000)], { utxos: [] })
 		).to.match(/empty/);
 		expect(verifyDirectedSelection([makeInput(100_000)], {})).to.equal(null);
+	});
+
+	it('a non-boolean allowTopUp never authorizes unrequested coins', () => {
+		const named = makeInput(100_000);
+		const namedTxid = bitcoin.Transaction.fromBuffer(named.prevTx).getId();
+		const directed = {
+			utxos: [{ txid: namedTxid, vout: 0 }],
+			// "false" from an untyped caller is truthy: it would both widen the
+			// provider's selection and skip the check below that catches it.
+			allowTopUp: 'false'
+		} as unknown as IUtxoSelectionOpts;
+
+		expect(validateUtxoSelectionOpts(directed, 'fundingUtxos')).to.match(
+			/allowTopUp must be a boolean/
+		);
+		expect(
+			verifyDirectedSelection([named, makeInput(50_000)], directed),
+			'the verification refuses the unrequested coin regardless'
+		).to.match(/unrequested input/);
+		expect(
+			verifyDirectedSelection([named, makeInput(50_000)], {
+				utxos: [{ txid: namedTxid, vout: 0 }],
+				allowTopUp: true
+			}),
+			'a real boolean still permits the top-up'
+		).to.equal(null);
 	});
 
 	it('fundingUtxos with a provider that cannot select aborts loudly instead of stalling', async () => {

@@ -359,6 +359,14 @@ describe('LightningNode splice external-input surface (issue #592)', function ()
 				utxos: [{ txid: 'zz', vout: 0 }]
 			})
 		).to.throw(/64-hex txid/);
+		// An untyped caller's "false" is truthy at every site that consumes
+		// allowTopUp, so it would authorize coins the caller never named.
+		expect(() =>
+			node.spliceIn(channelId, 100_000n, 253, {
+				utxos: [{ txid: 'aa'.repeat(32), vout: 0 }],
+				allowTopUp: 'false'
+			} as unknown as IUtxoSelectionOpts)
+		).to.throw(/allowTopUp must be a boolean/);
 		expect(calls, 'a bad request never reaches the provider').to.have.length(0);
 
 		// A provider that ignores the named coins fails the splice instead of
