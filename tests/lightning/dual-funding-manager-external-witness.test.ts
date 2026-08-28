@@ -43,6 +43,12 @@ import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
 import { encodeChannelReadyMessage } from '../../src/lightning/message/channel-funding';
+import { decodeTxSignaturesMessage } from '../../src/lightning/message/interactive-tx';
+import {
+	serializeChannelState,
+	deserializeChannelState
+} from '../../src/lightning/storage/serialization';
+import { ChannelSigner } from '../../src/lightning/keys/signer';
 
 // ─────────────── Helpers ───────────────
 
@@ -116,6 +122,8 @@ interface IWithholdSetup {
 	aSent: number[];
 	bSent: number[];
 	needed: ITxSigsNeededEvent[];
+	/** Last payload the acceptor sent, per message type (for retransmits). */
+	bLastPayload: Map<number, Buffer>;
 	extPrevTx: bitcoin.Transaction;
 	extPriv: Buffer;
 	extPub: Buffer;
@@ -190,6 +198,7 @@ function driveToWithhold(opts?: {
 	const bSent: number[] = [];
 	const aToB: Array<[number, Buffer]> = [];
 	const bToA: Array<[number, Buffer]> = [];
+	const bLastPayload = new Map<number, Buffer>();
 	mgrA.on(
 		'message:outbound',
 		(_peer: string, type: number, payload: Buffer) => {
@@ -201,6 +210,7 @@ function driveToWithhold(opts?: {
 		'message:outbound',
 		(_peer: string, type: number, payload: Buffer) => {
 			bSent.push(type);
+			bLastPayload.set(type, payload);
 			bToA.push([type, payload]);
 		}
 	);
@@ -316,6 +326,7 @@ function driveToWithhold(opts?: {
 		aSent,
 		bSent,
 		needed,
+		bLastPayload,
 		extPrevTx,
 		extPriv,
 		extPub,
@@ -437,7 +448,10 @@ describe('ChannelManager.provideV2ExternalWitness (issue #572)', function () {
 		expect(s.chA.getState(), 'still owing tx_signatures').to.equal(
 			ChannelState.AWAITING_TX_SIGNATURES
 		);
-		expect(s.chA.getFullState().remoteChannelReady).to.equal(true);
+		// TRANSIENT by design: the peer witnesses backing the early ready live
+		// only in the session, so the ready must not reach durable state until
+		// the release actually completes (issue #572 review).
+		expect(s.chA.getFullState().remoteChannelReady ?? false).to.equal(false);
 
 		// Out-of-band delivery through the manager API releases everything:
 		// the release batch consumes the recorded remoteChannelReady and the
@@ -554,6 +568,69 @@ describe('ChannelManager.provideV2ExternalWitness (issue #572)', function () {
 		s.pump();
 		expect(s.chA.getState()).to.equal(ChannelState.NORMAL);
 		expect(acceptorChannel(s.mgrB)!.getState()).to.equal(ChannelState.NORMAL);
+	});
+
+	it('an early ready never persists: a restart accepts the retransmitted tx_signatures', function () {
+		// The peer witnesses backing an early ready live only in the SESSION.
+		// If the ready reached durable state and a later persist (an external
+		// witness delivery) wrote it, a restart would keep remoteChannelReady
+		// while losing the witnesses: the tx_signatures gate would then
+		// swallow the peer's retransmission forever and the open could never
+		// complete (issue #572 review). The stash design makes the restart
+		// path self-healing: nothing durable, gate open, retransmit accepted.
+		const s = driveToWithhold();
+		const record = s.chA.getFullState().v2InFlight!;
+		const permanentId = s.chA.getChannelId()!;
+		const chB = acceptorChannel(s.mgrB)!;
+		s.mgrA.handleMessage(
+			s.sideB.pubkey,
+			MessageType.CHANNEL_READY,
+			earlyChannelReadyFrom(chB, permanentId)
+		);
+		expect(s.errors).to.deep.equal([]);
+
+		// The process dies before any witness arrives: the serialized row
+		// must NOT carry the early ready.
+		const row = deserializeChannelState(
+			serializeChannelState(s.chA.getFullState())
+		);
+		expect(
+			row.remoteChannelReady ?? false,
+			'early ready not persisted'
+		).to.equal(false);
+
+		const restored = new Channel(
+			row,
+			new ChannelSigner(crypto.randomBytes(32))
+		);
+		restored.restoreV2InFlight();
+
+		// The peer retransmits its tx_signatures over reestablish; the
+		// restored gate must consume it, not ignore it.
+		const retransmit = decodeTxSignaturesMessage(
+			s.bLastPayload.get(MessageType.TX_SIGNATURES)!
+		);
+		restored.handleTxSignatures(retransmit);
+		expect(
+			restored.getDualFundingSession()?.getRemoteWitnesses() ?? null,
+			'peer witnesses accepted after restart'
+		).to.not.equal(null);
+
+		// The remaining external witness then completes the exchange.
+		const release = restored.provideV2ExternalWitness(
+			Buffer.from(s.extPrevTx.getHash()),
+			0,
+			signExternalP2wpkh(record, s.extPrevTx, s.extPriv, s.extPub)
+		);
+		expect(
+			release.some(
+				(a) =>
+					(a as { messageType?: number }).messageType ===
+					MessageType.TX_SIGNATURES
+			),
+			'restored channel releases tx_signatures'
+		).to.equal(true);
+		expect(row.v2InFlight!.sentTxSignatures).to.equal(true);
 	});
 
 	it('a PREMATURE channel_ready (before the peer signed) is refused, not recorded', function () {

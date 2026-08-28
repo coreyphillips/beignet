@@ -242,6 +242,79 @@ describe('LightningNode.spliceInAndWait (issue #572)', function () {
 		node.destroy();
 	});
 
+	it('a LOCAL abort settles the wait; the later echo does not double-fire', async function () {
+		// ChannelManager.abortSplice restores the channel to NORMAL before
+		// the tx_abort echo ever returns, so the echo handler's transition
+		// predicate cannot fire for it: the local site must emit the terminal
+		// event itself or the wait burns its full timeout (issue #572
+		// review). The two sites stay mutually exclusive.
+		const node = createTestNode();
+		const peer = '02'.padEnd(66, 'ab');
+		const seed = crypto.randomBytes(32);
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(seed),
+			localPerCommitmentSeed: seed
+		});
+		state.channelId = crypto.randomBytes(32);
+		state.state = ChannelState.NORMAL;
+		state.fundingTxid = crypto.randomBytes(32);
+		state.localBalanceMsat = 1_000_000_000n;
+		state.remoteBalanceMsat = 0n;
+		const channel = new Channel(state);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const manager = (node as any).channelManager;
+		manager.channels.set(state.channelId!.toString('hex'), channel);
+		manager.channelPeers.set(state.channelId!.toString('hex'), peer);
+		const channelId = state.channelId!;
+
+		channel.handleStfuMessage({ channelId, initiator: true });
+		channel.handleSplice({
+			channelId,
+			fundingPubkey: Buffer.alloc(33, 0x02),
+			relativeSatoshis: 0n,
+			fundingFeeratePerkw: 253,
+			locktime: 0
+		});
+		expect(channel.getState()).to.equal(ChannelState.SPLICING);
+
+		const aborted: string[] = [];
+		node.on('splice:aborted', (data: { reason: string }) =>
+			aborted.push(data.reason)
+		);
+		stubSpliceIn(node, { ok: true });
+		const wait = node.spliceInAndWait(channelId, 50_000n);
+		const result = node
+			.getChannelManager()
+			.abortSplice(channelId, 'operator changed their mind');
+		expect(result.ok).to.equal(true);
+
+		let error = '';
+		try {
+			await wait;
+		} catch (err) {
+			error = (err as Error).message;
+		}
+		expect(error).to.equal('operator changed their mind');
+		expect(channel.getState()).to.equal(ChannelState.NORMAL);
+
+		// The peer's echo arrives afterwards: the transition predicate sees
+		// NORMAL before and after, so no second event fires.
+		node.getChannelManager().handleMessage(
+			peer,
+			MessageType.TX_ABORT,
+			encodeTxAbortMessage({
+				channelId,
+				data: Buffer.from('ack', 'ascii')
+			})
+		);
+		expect(aborted).to.deep.equal(['operator changed their mind']);
+		node.destroy();
+	});
+
 	it('rejects when the peer aborts the splice back to NORMAL', async function () {
 		// A peer tx_abort unwinds the splice without emitting any
 		// SPLICE_IN_FAILED; the dedicated splice:aborted signal settles the
