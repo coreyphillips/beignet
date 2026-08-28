@@ -13091,8 +13091,13 @@ export class LightningNode extends EventEmitter {
 			this.heldInvoiceHashes.add(paymentHash.toString('hex'));
 		}
 
-		// Build routing hints for all channels
-		const routingHints = this.getPrivateChannelRoutingHints();
+		// Build routing hints for all channels, plus any the caller supplied. A
+		// JIT-receive hint (issue #594) names the LSP and an intercept SCID for
+		// a channel that does not exist yet, so it can only come from outside.
+		const routingHints = [
+			...this.getPrivateChannelRoutingHints(),
+			...(options.extraRoutingHints ?? [])
+		];
 
 		// Warn if we have a NORMAL channel that could receive (has inbound) but
 		// produced no hint — payers may then be unable to find a route to us
@@ -18730,6 +18735,7 @@ export class LightningNode extends EventEmitter {
 			forwardingFeeBaseMsat?: number;
 			forwardingFeePropMillionths?: number;
 			forwardingCltvDelta?: number;
+			jitReceive?: INodeConfig['jitReceive'];
 			leaseRates?: import('../gossip/types').ILeaseRates;
 			eagerGossipVerify?: boolean;
 			sweepDestinationScript?: Buffer;
@@ -18790,6 +18796,7 @@ export class LightningNode extends EventEmitter {
 			forwardingFeeBaseMsat: options?.forwardingFeeBaseMsat,
 			forwardingFeePropMillionths: options?.forwardingFeePropMillionths,
 			forwardingCltvDelta: options?.forwardingCltvDelta,
+			jitReceive: options?.jitReceive,
 			leaseRates: options?.leaseRates,
 			eagerGossipVerify: options?.eagerGossipVerify,
 			localFeatures: options?.localFeatures,

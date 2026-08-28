@@ -6,7 +6,7 @@
  * channel/node info queries.
  */
 
-import { Network } from '../invoice/types';
+import { IRoutingHintHop, Network } from '../invoice/types';
 import { IBolt12Invoice } from '../offer/types';
 import { IChannelConfig, ChannelState } from '../channel/types';
 import { IChannelBasepoints } from '../keys/derivation';
@@ -744,6 +744,14 @@ export interface ICreateInvoiceOptions {
 	 * blinding is meant to hide, so this trades that privacy for routability.
 	 */
 	includeCleartextHintsWithBlinded?: boolean;
+	/**
+	 * Routing hints the CALLER supplies, emitted alongside the ones built from
+	 * our own channels. The case this exists for is JIT receive (issue #594): a
+	 * wallet with no channel at all is payable through a hint naming its LSP
+	 * and the intercept SCID that LSP minted, which no channel of ours can
+	 * produce because the channel does not exist yet.
+	 */
+	extraRoutingHints?: IRoutingHintHop[][];
 	/**
 	 * Hold invoice: park matching HTLCs instead of settling immediately. The
 	 * payment is held until settleHeldHtlc() (reveals the preimage) or
