@@ -433,6 +433,14 @@ export interface INodeConfig {
 	 * from peers so their signed copies become servable.
 	 */
 	eagerGossipVerify?: boolean;
+	/**
+	 * JIT channel receive, LSP role (issue #594): hold HTLCs addressed to
+	 * intercept SCIDs this node minted for wallet peers, fund a zero-conf
+	 * channel to the client (or splice its existing one bigger), then forward.
+	 * Off unless `enabled` is set; the caps in IJitReceiveConfig are the only
+	 * ceiling on what this node will front with its own coins.
+	 */
+	jitReceive?: import('../liquidity/jit-receive').IJitReceiveConfig;
 	/** CLTV delta for forwarding (default 40) */
 	forwardingCltvDelta?: number;
 	/** Base fee in msat for forwarding (default 1000) */

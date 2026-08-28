@@ -852,6 +852,20 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Replace the set of peers whose JIT receive intent authorizes an OUTBOUND
+	 * zero-conf open from us (issue #594). Separate from the trusted set, which
+	 * is symmetric; see ZeroConfManager.setJitClients.
+	 */
+	setJitClients(pubkeyHexes: Iterable<string>): void {
+		this.zeroConfManager.setJitClients(pubkeyHexes);
+	}
+
+	/** Is this peer a JIT client with a live receive intent? */
+	isJitClient(pubkeyHex: string): boolean {
+		return this.zeroConfManager.isJitClient(pubkeyHex);
+	}
+
+	/**
 	 * Open a zero-conf channel with a peer.
 	 * Peer must be in the trusted set.
 	 *
@@ -867,7 +881,7 @@ export class ChannelManager extends EventEmitter {
 		fundingSatoshis: bigint,
 		pushMsat?: bigint
 	): Channel | null {
-		if (!this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+		if (!this.zeroConfManager.canOpenZeroConfTo(peerPubkey)) {
 			this.emit('error', null, 'Peer is not trusted for zero-conf channels');
 			return null;
 		}
@@ -945,9 +959,9 @@ export class ChannelManager extends EventEmitter {
 			throw new Error(`Not connected to peer ${peerPubkey}`);
 		}
 		this._assertNamespaceCanRecordANewChannel();
-		if (opts?.trusted && !this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+		if (opts?.trusted && !this.zeroConfManager.canOpenZeroConfTo(peerPubkey)) {
 			throw new Error(
-				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer before a trusted open`
+				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer (or let it register a JIT receive intent) before a trusted open`
 			);
 		}
 
@@ -5703,9 +5717,9 @@ export class ChannelManager extends EventEmitter {
 			contribution?: { inputs: ISpliceWalletInput[]; changeScript: Buffer };
 		}
 	): Channel {
-		if (opts?.trusted && !this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+		if (opts?.trusted && !this.zeroConfManager.canOpenZeroConfTo(peerPubkey)) {
 			throw new Error(
-				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer before a trusted open`
+				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer (or let it register a JIT receive intent) before a trusted open`
 			);
 		}
 		// V2 establishment is conditioned on NEGOTIATED option_dual_fund on

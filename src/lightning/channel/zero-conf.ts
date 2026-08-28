@@ -11,6 +11,7 @@
 
 export class ZeroConfManager {
 	private trustedPeers: Set<string> = new Set();
+	private jitClients: Set<string> = new Set();
 
 	/**
 	 * Add a peer to the trusted set for zero-conf channels.
@@ -38,6 +39,36 @@ export class ZeroConfManager {
 	 */
 	listTrustedPeers(): string[] {
 		return [...this.trustedPeers];
+	}
+
+	/**
+	 * Replace the JIT-client set: peers whose registered receive intent
+	 * authorizes an OUTBOUND zero-conf open from us (issue #594).
+	 *
+	 * Deliberately NOT the trusted set. Membership there is symmetric: it also
+	 * makes us accept an INBOUND zero-conf channel from the peer and treat it
+	 * as usable at depth 0, which is a claim about the peer's honesty. A JIT
+	 * client has made no such claim on us; we are the one taking the funding
+	 * risk, with our own coins and our own caps. So this set is consulted only
+	 * where WE are the opener, and the operator's explicit trust stays the only
+	 * way an inbound zero-conf channel is accepted.
+	 */
+	setJitClients(pubkeyHexes: Iterable<string>): void {
+		this.jitClients = new Set(pubkeyHexes);
+	}
+
+	/** Is this peer a JIT client with a live receive intent? */
+	isJitClient(pubkeyHex: string): boolean {
+		return this.jitClients.has(pubkeyHex);
+	}
+
+	listJitClients(): string[] {
+		return [...this.jitClients];
+	}
+
+	/** May WE open a zero-conf channel to this peer? */
+	canOpenZeroConfTo(pubkeyHex: string): boolean {
+		return this.trustedPeers.has(pubkeyHex) || this.jitClients.has(pubkeyHex);
 	}
 
 	/**
