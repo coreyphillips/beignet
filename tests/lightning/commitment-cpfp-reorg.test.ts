@@ -253,6 +253,36 @@ describe('Issue #578: commitment CPFP survives a confirmation and a reorg', func
 		fx.destroy();
 	});
 
+	it('re-bumps a retained entry demoted between two re-CPFP passes', async () => {
+		// No pass ran while the commitment read confirmed, so the demotion report
+		// is the only thing that can mark the parked entry. Re-arming alone does
+		// not: rearmCommitmentCpfp no-ops while an entry is parked.
+		const fx = await setup(5785);
+		fx.alice.handleNewBlock(99); // stamps the entry's broadcast height
+		const { cm, idHex, closeTx } = await closeAndConfirm(fx, 100);
+		await tick();
+		const entry = cm._pendingCommitmentCpfp.get(idHex);
+		expect(entry.lastAttemptFailed, 'CPFP child built').to.not.equal(true);
+		expect(entry.sawConfirmation, 'no pass while confirmed').to.not.equal(true);
+
+		const rebroadcast: Buffer[] = [];
+		cm.on('broadcast:tx', (tx: Buffer) => rebroadcast.push(tx));
+		cm.handleFundingSpent(fx.channelId, closeTx, 0, destScript(fx.alice));
+		await tick();
+		// Two blocks since the broadcast at an unchanged feerate: both pacing
+		// gates would hold a package that is merely slow.
+		cm.reCpfpStuckCommitments(101, entry.lastFeeRate);
+		await tick();
+
+		expect(
+			rebroadcast.some(
+				(tx) => bitcoin.Transaction.fromBuffer(tx).getId() === closeTx.getId()
+			),
+			'commitment re-broadcast'
+		).to.equal(true);
+		fx.destroy();
+	});
+
 	it('re-arms a lost CPFP entry when the re-report demotes our commitment', async () => {
 		const fx = await setup(5782);
 		const { cm, idHex, closeTx } = await closeAndConfirm(fx, 100);

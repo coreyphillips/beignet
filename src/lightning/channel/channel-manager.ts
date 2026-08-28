@@ -601,7 +601,9 @@ export class ChannelManager extends EventEmitter {
 			// The tracked commitment has been seen CONFIRMED while this entry was
 			// parked. If it ever reads unconfirmed again a reorg demoted it, and the
 			// package may be out of the mempool entirely, so the next re-CPFP pass
-			// skips the pacing gates instead of waiting them out (issue #578).
+			// skips the pacing gates instead of waiting them out (issue #578). Set
+			// by the re-CPFP pass and by a report that demotes the record itself,
+			// since a confirmation and its demotion can land between two passes.
 			sawConfirmation?: boolean;
 		}
 	> = new Map();
@@ -2559,7 +2561,7 @@ export class ChannelManager extends EventEmitter {
 				}
 				this._maybeRearmDemotedOurCommitment(
 					channelId,
-					broadcast.commitmentType,
+					broadcast,
 					wasCommitmentConfirmed,
 					monitor.isCommitmentConfirmed(),
 					feeRatePerVbyte
@@ -2587,13 +2589,23 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private _maybeRearmDemotedOurCommitment(
 		channelId: Buffer,
-		commitmentType: CommitmentType,
+		broadcast: { commitmentType: CommitmentType; txid: string },
 		wasConfirmed: boolean,
 		isConfirmed: boolean,
 		feeRatePerVbyte: number
 	): void {
 		if (!wasConfirmed || isConfirmed) return;
-		if (commitmentType !== CommitmentType.OUR_COMMITMENT) return;
+		if (broadcast.commitmentType !== CommitmentType.OUR_COMMITMENT) return;
+		// A still-parked entry makes rearmCommitmentCpfp a no-op, and only the
+		// re-CPFP loop's own confirmed pass sets sawConfirmation. The report that
+		// confirms and the one that demotes can both land between two passes (the
+		// funding watch fetches history off its own schedule), which would leave
+		// the demoted package waiting out the re-bump interval and the feerate
+		// gate. Mark it here so the next pass skips both.
+		const entry = this._pendingCommitmentCpfp.get(channelId.toString('hex'));
+		if (entry && entry.action.commitmentTxid === broadcast.txid) {
+			entry.sawConfirmation = true;
+		}
 		this.rearmCommitmentCpfp(channelId, feeRatePerVbyte);
 	}
 
@@ -2630,7 +2642,7 @@ export class ChannelManager extends EventEmitter {
 		if (broadcast) {
 			this._maybeRearmDemotedOurCommitment(
 				channelId,
-				broadcast.commitmentType,
+				broadcast,
 				wasCommitmentConfirmed,
 				monitor.isCommitmentConfirmed(),
 				feeRatePerVbyte
