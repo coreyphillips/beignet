@@ -34,7 +34,10 @@ import { verifyDirectedSelection } from '../../src/lightning/node/funding-select
 import { IDualFundingParams } from '../../src/lightning/channel/dual-funding';
 import { ISpliceWalletInput } from '../../src/lightning/channel/channel';
 import { ChannelState } from '../../src/lightning/channel/types';
-import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import {
+	ChannelManager,
+	IPerChannelKeys
+} from '../../src/lightning/channel/channel-manager';
 import { MessageType } from '../../src/lightning/message/types';
 import {
 	IFundingProvider,
@@ -123,7 +126,10 @@ function changeScript(): Buffer {
 	return bitcoin.payments.p2wpkh({ hash: crypto.randomBytes(20) }).output!;
 }
 
-function makeManager(provider: Partial<IFundingProvider>): {
+function makeManager(
+	provider: Partial<IFundingProvider>,
+	perChannelKeys = false
+): {
 	mgr: ChannelManager;
 	sent: Array<{ type: number; payload: Buffer }>;
 	errors: string[];
@@ -131,7 +137,14 @@ function makeManager(provider: Partial<IFundingProvider>): {
 	const mgr = new ChannelManager({
 		localBasepoints: makeBasepoints(),
 		localPerCommitmentSeed: crypto.randomBytes(32),
-		localFundingPrivkey: crypto.randomBytes(32)
+		localFundingPrivkey: crypto.randomBytes(32),
+		channelKeyDeriver: perChannelKeys
+			? (): IPerChannelKeys => ({
+					basepoints: makeBasepoints(),
+					perCommitmentSeed: crypto.randomBytes(32),
+					fundingPrivkey: crypto.randomBytes(32)
+			  })
+			: undefined
 	});
 	mgr.setFundingProvider({
 		buildFundingTransaction: async () => {
@@ -605,6 +618,40 @@ describe('autoFundDualFundedOpen embedder-contribution guard (issue #572)', () =
 			'cleanup failure stayed contained'
 		).to.deep.equal([]);
 		expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+	});
+
+	it('a synchronous pledge-release failure cannot interrupt disconnect cleanup', () => {
+		let releaseAttempts = 0;
+		const { mgr } = makeManager(
+			{
+				releaseInputPledges: () => {
+					releaseAttempts++;
+					throw new Error('synchronous release failure');
+				}
+			},
+			true
+		);
+		const channels = [
+			mgr.createDualFundedChannel(PEER, makeDualFundingParams()),
+			mgr.createDualFundedChannel(PEER, makeDualFundingParams())
+		];
+		for (const channel of channels) {
+			channel.setDualFundingContribution(
+				[makeInput(200_000)],
+				changeScript(),
+				100_000n,
+				1000
+			);
+		}
+
+		expect(() => mgr.handlePeerDisconnected(PEER)).not.to.throw();
+		expect(releaseAttempts, 'both cleanup attempts ran').to.equal(2);
+		for (const channel of channels) {
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(mgr.getTempChannel(channel.getTemporaryChannelId())).to.equal(
+				undefined
+			);
+		}
 	});
 
 	it('an empty directed list is a funding failure, never unrestricted selection', async () => {

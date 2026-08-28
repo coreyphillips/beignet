@@ -286,17 +286,25 @@ describe('LightningNode.spliceInAndWait (issue #572)', function () {
 		});
 		expect(channel.getState()).to.equal(ChannelState.SPLICING);
 
-		const aborted: string[] = [];
-		node.on('splice:aborted', (data: { reason: string }) =>
-			aborted.push(data.reason)
-		);
-		stubSpliceIn(node, { ok: true });
-		const wait = node.spliceInAndWait(channelId, 50_000n);
-		// A public observer failure must not escape through the manager or
-		// prevent the following tx_abort from reaching transport.
+		// Diagnostics and observers are public. Neither may suppress the waiter,
+		// later observers or the tx_abort owed to the peer.
+		node.on('log', (): void => {
+			throw new Error('log observer failed');
+		});
 		node.on('splice:aborted', (): void => {
 			throw new Error('observer failed');
 		});
+		const aborted: string[] = [];
+		const observerReceivers: unknown[] = [];
+		node.on(
+			'splice:aborted',
+			function (this: LightningNode, data: { reason: string }): void {
+				observerReceivers.push(this);
+				aborted.push(data.reason);
+			}
+		);
+		stubSpliceIn(node, { ok: true });
+		const wait = node.spliceInAndWait(channelId, 50_000n, 300);
 		const result = node
 			.getChannelManager()
 			.abortSplice(channelId, 'operator changed their mind');
@@ -313,6 +321,7 @@ describe('LightningNode.spliceInAndWait (issue #572)', function () {
 			error = (err as Error).message;
 		}
 		expect(error).to.equal('operator changed their mind');
+		expect(observerReceivers, 'observer receiver').to.deep.equal([node]);
 		expect(channel.getState()).to.equal(ChannelState.NORMAL);
 
 		// The peer's echo arrives afterwards: the transition predicate sees

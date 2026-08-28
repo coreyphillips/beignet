@@ -36,6 +36,23 @@ export function canSelectDualFundingInputs(
 }
 
 /**
+ * Release pledged inputs without allowing provider cleanup to interrupt the
+ * channel operation it follows. Providers normally return a promise, but an
+ * embedder can throw before returning one, so both failure forms are contained.
+ */
+export function releaseInputPledgesBestEffort(
+	fp: IFundingProvider | null | undefined,
+	outpoints: Array<{ txid: string; vout: number }>
+): void {
+	if (!fp?.releaseInputPledges || outpoints.length === 0) return;
+	try {
+		void fp.releaseInputPledges(outpoints).catch(() => undefined);
+	} catch {
+		// Cleanup is best effort. The pledge TTL remains the backstop.
+	}
+}
+
+/**
  * Source a dual-funding contribution, preferring the dual-funding-aware
  * selector.
  *

@@ -87,6 +87,7 @@ import {
 import type { IFundingProvider } from '../node/types';
 import {
 	canSelectDualFundingInputs,
+	releaseInputPledgesBestEffort,
 	selectDualFundingContribution,
 	verifyDirectedSelection
 } from '../node/funding-selection';
@@ -7306,9 +7307,7 @@ export class ChannelManager extends EventEmitter {
 		// resumes after a restart. The TTL remains the backstop.
 		if (id && this.config.hasResumableChannelRow?.(id) === true) return;
 		this._fundingPledgesReleased.add(channel);
-		void this.fundingProvider
-			.releaseInputPledges(outpoints)
-			.catch(() => undefined);
+		releaseInputPledgesBestEffort(this.fundingProvider, outpoints);
 	}
 
 	/**
@@ -7350,9 +7349,7 @@ export class ChannelManager extends EventEmitter {
 		const outpoints = txInputOutpoints(state.pendingFundingTxHex);
 		if (outpoints.length === 0) return;
 		this._fundingPledgesReleased.add(channel);
-		void this.fundingProvider
-			.releaseInputPledges(outpoints)
-			.catch(() => undefined);
+		releaseInputPledgesBestEffort(this.fundingProvider, outpoints);
 	}
 
 	/**
@@ -7377,14 +7374,7 @@ export class ChannelManager extends EventEmitter {
 			}
 		}
 		if (outpoints.length === 0) return;
-		try {
-			void this.fundingProvider
-				.releaseInputPledges(outpoints)
-				.catch(() => undefined);
-		} catch {
-			// A provider can throw before returning its promise. Cleanup is
-			// best effort and must not block the channel operation it follows.
-		}
+		releaseInputPledgesBestEffort(this.fundingProvider, outpoints);
 	}
 
 	/**
@@ -7399,9 +7389,7 @@ export class ChannelManager extends EventEmitter {
 		if (!this.fundingProvider?.releaseInputPledges) return;
 		const outpoints = channel.takeDanglingV2TopUpPledgeOutpoints();
 		if (outpoints.length === 0) return;
-		void this.fundingProvider
-			.releaseInputPledges(outpoints)
-			.catch(() => undefined);
+		releaseInputPledgesBestEffort(this.fundingProvider, outpoints);
 	}
 
 	/**

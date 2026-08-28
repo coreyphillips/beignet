@@ -201,6 +201,7 @@ import {
 } from './types';
 import {
 	canSelectDualFundingInputs,
+	releaseInputPledgesBestEffort,
 	selectDualFundingContribution
 } from './funding-selection';
 import {
@@ -3167,11 +3168,15 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on(
 			'splice:aborted',
 			(channelId: Buffer, reason: string) => {
-				this.emitStructuredLog('channel', 'splice_aborted', {
-					channelId: channelId.toString('hex'),
-					reason
-				});
-				this.emit('splice:aborted', { channelId, reason });
+				try {
+					this.emitStructuredLog('channel', 'splice_aborted', {
+						channelId: channelId.toString('hex'),
+						reason
+					});
+				} catch {
+					// Diagnostics are public too and cannot gate the terminal signal.
+				}
+				this.notifySpliceAbortedObservers(channelId, reason);
 			}
 		);
 
@@ -3918,6 +3923,32 @@ export class LightningNode extends EventEmitter {
 				this.emit('sweep:uneconomic', channelId, action);
 			}
 		);
+	}
+
+	/**
+	 * Notify every splice-aborted observer independently. The listener set also
+	 * contains spliceInAndWait, so a throwing application observer must not make
+	 * completion depend on registration order.
+	 */
+	private notifySpliceAbortedObservers(
+		channelId: Buffer,
+		reason: string
+	): void {
+		const data = { channelId, reason };
+		for (const listener of this.rawListeners('splice:aborted')) {
+			try {
+				Reflect.apply(listener, this, [data]);
+			} catch (err) {
+				try {
+					this.emitStructuredLog('channel', 'splice_abort_observer_failed', {
+						channelId: channelId.toString('hex'),
+						error: err instanceof Error ? err.message : String(err)
+					});
+				} catch {
+					// Reporting is best effort. Remaining observers still run.
+				}
+			}
+		}
 	}
 
 	/**
@@ -5738,7 +5769,7 @@ export class LightningNode extends EventEmitter {
 		if (!provider?.releaseInputPledges) return;
 		const outpoints = txInputOutpoints(txHex);
 		if (outpoints.length === 0) return;
-		void provider.releaseInputPledges(outpoints).catch(() => undefined);
+		releaseInputPledgesBestEffort(provider, outpoints);
 	}
 
 	/**
@@ -17170,9 +17201,7 @@ export class LightningNode extends EventEmitter {
 				state.fundingTxid.toString('hex')
 			);
 			if (voided && pledges.length > 0) {
-				void this.fundingProvider
-					?.releaseInputPledges?.(pledges)
-					.catch(() => undefined);
+				releaseInputPledgesBestEffort(this.fundingProvider, pledges);
 			}
 			return;
 		}
