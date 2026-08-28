@@ -30,10 +30,14 @@ import {
 	IAcceptChannel2Message
 } from '../../src/lightning/message/dual-funding';
 import { decodeTxAddInputMessage } from '../../src/lightning/message/interactive-tx';
+import { verifyDirectedSelection } from '../../src/lightning/node/funding-selection';
 import { IDualFundingParams } from '../../src/lightning/channel/dual-funding';
 import { ISpliceWalletInput } from '../../src/lightning/channel/channel';
 import { ChannelState } from '../../src/lightning/channel/types';
-import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import {
+	ChannelManager,
+	IPerChannelKeys
+} from '../../src/lightning/channel/channel-manager';
 import { MessageType } from '../../src/lightning/message/types';
 import {
 	IFundingProvider,
@@ -122,7 +126,10 @@ function changeScript(): Buffer {
 	return bitcoin.payments.p2wpkh({ hash: crypto.randomBytes(20) }).output!;
 }
 
-function makeManager(provider: Partial<IFundingProvider>): {
+function makeManager(
+	provider: Partial<IFundingProvider>,
+	perChannelKeys = false
+): {
 	mgr: ChannelManager;
 	sent: Array<{ type: number; payload: Buffer }>;
 	errors: string[];
@@ -130,7 +137,14 @@ function makeManager(provider: Partial<IFundingProvider>): {
 	const mgr = new ChannelManager({
 		localBasepoints: makeBasepoints(),
 		localPerCommitmentSeed: crypto.randomBytes(32),
-		localFundingPrivkey: crypto.randomBytes(32)
+		localFundingPrivkey: crypto.randomBytes(32),
+		channelKeyDeriver: perChannelKeys
+			? (): IPerChannelKeys => ({
+					basepoints: makeBasepoints(),
+					perCommitmentSeed: crypto.randomBytes(32),
+					fundingPrivkey: crypto.randomBytes(32)
+			  })
+			: undefined
 	});
 	mgr.setFundingProvider({
 		buildFundingTransaction: async () => {
@@ -497,6 +511,194 @@ describe('autoFundDualFundedOpen embedder-contribution guard (issue #572)', () =
 				vout: 0
 			}
 		]);
+	});
+
+	it('a malformed stale selection cannot block the registered contribution, and the parseable coins beside it still release', async () => {
+		// The overlap computation parses every selected prevTx; a broken
+		// third-party provider result must degrade to PER-INPUT best-effort
+		// cleanup (issue #581 review): the malformed coin's pledge is left to
+		// its TTL, the parseable coin beside it releases NOW, and the
+		// perfectly valid registered contribution always drives.
+		let resolveSelection:
+			| ((v: { inputs: ISpliceWalletInput[]; changeScript: Buffer }) => void)
+			| null = null;
+		const released: Array<{ txid: string; vout: number }> = [];
+		const { mgr, sent, errors } = makeManager({
+			selectDualFundingInputs: () =>
+				new Promise((resolve) => {
+					resolveSelection = resolve;
+				}),
+			releaseInputPledges: async (outpoints) => {
+				released.push(...outpoints);
+			}
+		});
+		const registered = makeInput(200_000);
+		const channel = mgr.createDualFundedChannel(PEER, makeDualFundingParams());
+		mgr.handleMessage(
+			PEER,
+			MessageType.ACCEPT_CHANNEL2,
+			encodeAcceptChannel2Message(
+				makeAcceptChannel2Msg(channel.getTemporaryChannelId())
+			)
+		);
+		channel.setDualFundingContribution(
+			[registered],
+			changeScript(),
+			100_000n,
+			1000
+		);
+		const malformed: ISpliceWalletInput = {
+			...makeInput(150_000),
+			prevTx: Buffer.from('not a transaction', 'ascii')
+		};
+		const parseableStale = makeInput(120_000);
+		resolveSelection!({
+			inputs: [malformed, parseableStale],
+			changeScript: changeScript()
+		});
+		await settlePromises();
+
+		const prevTxs = sentPrevTxs(sent);
+		expect(prevTxs, 'registered contribution still drove').to.have.length(1);
+		expect(prevTxs[0].equals(registered.prevTx)).to.equal(true);
+		expect(
+			errors.filter((e) => /dispatch failed/.test(e)),
+			'no dispatch failure'
+		).to.deep.equal([]);
+		expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+		// Per-input isolation: the parseable stale coin released immediately;
+		// only the unnameable malformed one is left to its TTL.
+		expect(released).to.deep.equal([
+			{
+				txid: bitcoin.Transaction.fromBuffer(parseableStale.prevTx).getId(),
+				vout: 0
+			}
+		]);
+	});
+
+	it('a synchronous stale-pledge release failure cannot block the registered contribution', async () => {
+		let resolveSelection:
+			| ((v: { inputs: ISpliceWalletInput[]; changeScript: Buffer }) => void)
+			| null = null;
+		const { mgr, sent, errors } = makeManager({
+			selectDualFundingInputs: () =>
+				new Promise((resolve) => {
+					resolveSelection = resolve;
+				}),
+			releaseInputPledges: () => {
+				throw new Error('synchronous release failure');
+			}
+		});
+		const registered = makeInput(200_000);
+		const channel = mgr.createDualFundedChannel(PEER, makeDualFundingParams());
+		mgr.handleMessage(
+			PEER,
+			MessageType.ACCEPT_CHANNEL2,
+			encodeAcceptChannel2Message(
+				makeAcceptChannel2Msg(channel.getTemporaryChannelId())
+			)
+		);
+		channel.setDualFundingContribution(
+			[registered],
+			changeScript(),
+			100_000n,
+			1000
+		);
+		resolveSelection!({
+			inputs: [makeInput(120_000)],
+			changeScript: changeScript()
+		});
+		await settlePromises();
+
+		const prevTxs = sentPrevTxs(sent);
+		expect(prevTxs, 'registered contribution still drove').to.have.length(1);
+		expect(prevTxs[0].equals(registered.prevTx)).to.equal(true);
+		expect(
+			errors.filter((e) => /dispatch failed/.test(e)),
+			'cleanup failure stayed contained'
+		).to.deep.equal([]);
+		expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+	});
+
+	it('a synchronous pledge-release failure cannot interrupt disconnect cleanup', () => {
+		let releaseAttempts = 0;
+		const { mgr } = makeManager(
+			{
+				releaseInputPledges: () => {
+					releaseAttempts++;
+					throw new Error('synchronous release failure');
+				}
+			},
+			true
+		);
+		const channels = [
+			mgr.createDualFundedChannel(PEER, makeDualFundingParams()),
+			mgr.createDualFundedChannel(PEER, makeDualFundingParams())
+		];
+		for (const channel of channels) {
+			channel.setDualFundingContribution(
+				[makeInput(200_000)],
+				changeScript(),
+				100_000n,
+				1000
+			);
+		}
+
+		expect(() => mgr.handlePeerDisconnected(PEER)).not.to.throw();
+		expect(releaseAttempts, 'both cleanup attempts ran').to.equal(2);
+		for (const channel of channels) {
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(mgr.getTempChannel(channel.getTemporaryChannelId())).to.equal(
+				undefined
+			);
+		}
+	});
+
+	it('an empty directed list is a funding failure, never unrestricted selection', async () => {
+		// A direct manager caller can hand IDualFundingParams.fundingUtxos an
+		// empty utxos array, bypassing the node-level validation; combined
+		// with the providers' unrestricted fallback that would fund with
+		// arbitrary coins while the caller believed the selection was
+		// constrained (issue #572 review). The shared selection entry refuses
+		// instead, failing the open loudly.
+		const { mgr, sent, errors } = makeManager({
+			selectDualFundingInputs: async () => ({
+				inputs: [makeInput(200_000)],
+				changeScript: changeScript()
+			})
+		});
+		const channel = mgr.createDualFundedChannel(
+			PEER,
+			makeDualFundingParams({ fundingUtxos: { utxos: [] } })
+		);
+		mgr.handleMessage(
+			PEER,
+			MessageType.ACCEPT_CHANNEL2,
+			encodeAcceptChannel2Message(
+				makeAcceptChannel2Msg(channel.getTemporaryChannelId())
+			)
+		);
+		await settlePromises();
+
+		expect(
+			errors.some((e) => /must not be empty/.test(e)),
+			`refusal reported (got: ${errors.join(' | ')})`
+		).to.equal(true);
+		expect(
+			sent.filter((m) => m.type === MessageType.TX_ADD_INPUT),
+			'no unrestricted coin ever contributed'
+		).to.have.length(0);
+		expect(
+			sent.filter((m) => m.type === MessageType.TX_ABORT),
+			'the open aborted on the wire'
+		).to.have.length(1);
+	});
+
+	it('verifyDirectedSelection treats an empty directed list as a violation', () => {
+		expect(
+			verifyDirectedSelection([makeInput(100_000)], { utxos: [] })
+		).to.match(/empty/);
+		expect(verifyDirectedSelection([makeInput(100_000)], {})).to.equal(null);
 	});
 
 	it('fundingUtxos with a provider that cannot select aborts loudly instead of stalling', async () => {

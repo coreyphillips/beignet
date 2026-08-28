@@ -36,6 +36,23 @@ export function canSelectDualFundingInputs(
 }
 
 /**
+ * Release pledged inputs without allowing provider cleanup to interrupt the
+ * channel operation it follows. Providers normally return a promise, but an
+ * embedder can throw before returning one, so both failure forms are contained.
+ */
+export function releaseInputPledgesBestEffort(
+	fp: IFundingProvider | null | undefined,
+	outpoints: Array<{ txid: string; vout: number }>
+): void {
+	if (!fp?.releaseInputPledges || outpoints.length === 0) return;
+	try {
+		void fp.releaseInputPledges(outpoints).catch(() => undefined);
+	} catch {
+		// Cleanup is best effort. The pledge TTL remains the backstop.
+	}
+}
+
+/**
  * Source a dual-funding contribution, preferring the dual-funding-aware
  * selector.
  *
@@ -61,6 +78,16 @@ export function selectDualFundingContribution(
 	topUp = false,
 	opts?: IUtxoSelectionOpts
 ): Promise<IDualFundingSelection> {
+	// An empty directed list is a caller error, not "no direction": passing
+	// it through would combine with the providers' unrestricted-selection
+	// fallback and fund with arbitrary coins while the caller believed the
+	// selection was constrained (issue #572 review). The throw lands in the
+	// auto-funding rejection arm, failing the open loudly.
+	if (opts?.utxos && opts.utxos.length === 0) {
+		throw new Error(
+			'fundingUtxos.utxos must not be empty (an empty directed list would select unrestricted coins)'
+		);
+	}
 	if (fp.selectDualFundingInputs) {
 		return fp.selectDualFundingInputs(
 			amountSats,
@@ -96,7 +123,13 @@ export function verifyDirectedSelection(
 	inputs: ISpliceWalletInput[],
 	directed: NonNullable<IUtxoSelectionOpts>
 ): string | null {
-	if (!directed.utxos?.length) return null;
+	if (!directed.utxos) return null;
+	// Defense in depth behind selectDualFundingContribution's throw: an
+	// empty directed list must read as a violation, never as compliance,
+	// or it silently authorizes whatever the fallback selection picked.
+	if (directed.utxos.length === 0) {
+		return 'fundingUtxos.utxos is empty (an empty directed list cannot authorize a selection)';
+	}
 	const selected = new Set<string>();
 	for (const input of inputs) {
 		try {

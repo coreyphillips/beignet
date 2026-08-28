@@ -213,6 +213,21 @@ describe('WalletFundingProvider directed UTXO selection (issue #572)', function 
 		expect(total >= 50_000n).to.equal(true);
 	});
 
+	it('an empty directed list is refused, never unrestricted selection', async function () {
+		const w = makeWallet([100_000, 50_000]);
+		const provider = new WalletFundingProvider(w.wallet as never);
+
+		let error = '';
+		try {
+			await provider.selectDualFundingInputs(10_000n, 1000, true, false, {
+				utxos: []
+			});
+		} catch (err) {
+			error = (err as Error).message;
+		}
+		expect(error).to.match(/at least one named outpoint/);
+	});
+
 	it('an uppercase named txid selects the same coin (case-normalized)', async function () {
 		const w = makeWallet([100_000, 30_000]);
 		const provider = new WalletFundingProvider(w.wallet as never);

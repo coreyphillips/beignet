@@ -905,6 +905,18 @@ export class Channel {
 	// point (issue 307): the pending witnesses died with the process and the
 	// embedder must be told to re-drive sendTxSignatures.
 	private _v2CallerTxSigsSignaled = false;
+	// An eager peer's EARLY channel_ready received while our v2 tx_signatures
+	// are withheld on an external witness (issue #572). TRANSIENT by design:
+	// the peer witnesses backing it live only in the session, so recording
+	// remoteChannelReady durably would survive a restart the witnesses do not
+	// and the restored tx_signatures gate would swallow the peer's
+	// retransmission forever. Consumed by fundingConfirmed's ready flow at
+	// release; dropped on disconnect (the peer retransmits) and on restart.
+	private _v2EarlyChannelReady: {
+		secondPerCommitmentPoint: Buffer;
+		shortChannelId?: Buffer;
+		nextLocalNonce?: Buffer;
+	} | null = null;
 	// Our un-acked tx_init_rbf (feerate/locktime it proposed, and the
 	// recorded funding txid it was bound to; the ack revalidates the
 	// binding). Connection scoped: BOLT 2 starts the renegotiation only at
@@ -2444,6 +2456,12 @@ export class Channel {
 		// dead (each replacement double-spends all of its predecessors).
 		this._state.v2PreviousAttempts = undefined;
 
+		// An eager peer's early channel_ready parked during the withheld
+		// external-witness wait (issue #572) becomes real now that our own
+		// release is running: applying it here lets the zero-conf fast track
+		// finish straight to NORMAL in this same batch.
+		this._applyEarlyV2ChannelReady();
+
 		const secondPoint = getPerCommitmentPoint(
 			this._state.localPerCommitmentSeed,
 			1n
@@ -2489,6 +2507,44 @@ export class Channel {
 			...prefix,
 			sendMsg(MessageType.CHANNEL_READY, encodeChannelReadyMessage(msg))
 		];
+	}
+
+	/**
+	 * Whether a valid channel_ready has crossed in either direction for this
+	 * open, INCLUDING an early one still held transiently while our v2
+	 * tx_signatures are withheld on an external witness (issue #581): BOLT 2
+	 * closes the RBF window and makes tx_signatures replays ignorable the
+	 * moment the ready is RECEIVED, not the moment it becomes durable, so
+	 * every live guard must count the stash. The stash is dropped on
+	 * disconnect and restart, reopening the guards exactly when the peer
+	 * must retransmit anyway.
+	 */
+	private _channelReadySeen(): boolean {
+		return (
+			this._state.localChannelReady ||
+			this._state.remoteChannelReady ||
+			this._v2EarlyChannelReady !== null
+		);
+	}
+
+	/**
+	 * Consume a stashed early channel_ready (issue #572): the peer's ready
+	 * arrived while our v2 tx_signatures were withheld on an external
+	 * witness, and only becomes durable state now that the open is actually
+	 * completing. No-op when nothing is stashed.
+	 */
+	private _applyEarlyV2ChannelReady(): void {
+		const early = this._v2EarlyChannelReady;
+		if (!early) return;
+		this._v2EarlyChannelReady = null;
+		this._state.remoteChannelReady = true;
+		this._state.remoteNextPerCommitmentPoint = early.secondPerCommitmentPoint;
+		if (early.nextLocalNonce) {
+			this._state.remoteNonce = early.nextLocalNonce;
+		}
+		if (early.shortChannelId) {
+			this._state.remoteScidAlias = early.shortChannelId;
+		}
 	}
 
 	/**
@@ -2611,6 +2667,44 @@ export class Channel {
 			];
 		}
 
+		// Early ready recorded TRANSIENTLY, never into durable state: the peer
+		// witnesses backing it live only in the session, so persisting
+		// remoteChannelReady here (a later external-witness delivery persists
+		// the whole state) would survive a restart the witnesses do not, and
+		// the restored handleTxSignatures gate would then swallow the peer's
+		// retransmission forever. The stash dies with the process instead:
+		// after a restart the gate is open, the peer retransmits both its
+		// tx_signatures and its channel_ready over reestablish, and the open
+		// completes normally. The release path (fundingConfirmed's ready
+		// flow) consumes the stash to finish straight to NORMAL, and the
+		// state MUST stay AWAITING_TX_SIGNATURES meanwhile so the withheld
+		// release still owes our tx_signatures.
+		if (earlyDuringV2Sigs) {
+			if (
+				isTaprootChannel(this._state.channelType) &&
+				msg.nextLocalNonce &&
+				msg.nextLocalNonce.length !== 66
+			) {
+				return [
+					...prefix,
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Taproot channel_ready has an invalid next_local_nonce'
+					}
+				];
+			}
+			this._v2EarlyChannelReady = {
+				secondPerCommitmentPoint: Buffer.from(msg.secondPerCommitmentPoint),
+				...(msg.shortChannelId
+					? { shortChannelId: Buffer.from(msg.shortChannelId) }
+					: {}),
+				...(msg.nextLocalNonce
+					? { nextLocalNonce: Buffer.from(msg.nextLocalNonce) }
+					: {})
+			};
+			return prefix;
+		}
+
 		this._state.remoteChannelReady = true;
 		this._state.remoteNextPerCommitmentPoint = msg.secondPerCommitmentPoint;
 
@@ -2634,14 +2728,6 @@ export class Channel {
 		// Store remote's SCID alias if provided
 		if (msg.shortChannelId) {
 			this._state.remoteScidAlias = msg.shortChannelId;
-		}
-
-		// Early ready recorded: the state MUST stay AWAITING_TX_SIGNATURES so
-		// the withheld release still owes and can still send our
-		// tx_signatures; its fast-track then reads remoteChannelReady and
-		// finishes to NORMAL in the same batch.
-		if (earlyDuringV2Sigs) {
-			return prefix;
 		}
 
 		if (this._state.localChannelReady) {
@@ -7323,6 +7409,10 @@ export class Channel {
 			// the next reestablish reminds the embedder while witnesses are
 			// still owed (issue 307).
 			this._v2CallerTxSigsSignaled = false;
+			// A stashed early channel_ready dies with the connection: the peer
+			// retransmits it over reestablish, and holding a stale one across
+			// an RBF renegotiation would apply the wrong attempt's ready.
+			this._v2EarlyChannelReady = null;
 			// Phase-aware, mirroring the SPLICING block below: BOLT 2's boundary
 			// for a v2 open is the initial commitment_signed. Before it the open
 			// is not resumable (the interactive-tx negotiation dies with the
@@ -9257,10 +9347,12 @@ export class Channel {
 					)
 				);
 				if (!actions.some((a) => a.type === ChannelActionType.ERROR)) {
+					// The first cancel already emitted SPLICE_ABORTED. This call
+					// only completes the deferred wire and persistence unwind.
 					actions.push(
 						...this.initiateSpliceAbort(
 							'splice cancelled while awaiting quiescence'
-						)
+						).filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
 					);
 				}
 			}
@@ -10545,8 +10637,9 @@ export class Channel {
 			// completes (splice_init + immediate tx_abort, issue #370). Repeat
 			// cancels re-hit this arm and stay a no-op success.
 			if (this._pendingSplice) {
+				if (this._pendingSplice.cancelled) return [];
 				this._pendingSplice.cancelled = true;
-				return [];
+				return [this._spliceAbortedAction(reason)];
 			}
 			// An unsigned in-flight record without a live session (restored from
 			// disk before the signature exchange started) is safe to drop.
@@ -10562,7 +10655,7 @@ export class Channel {
 					this._state.state = this._state.preSpliceState ?? ChannelState.NORMAL;
 					this._state.preSpliceState = null;
 				}
-				return [];
+				return [this._spliceAbortedAction(reason)];
 			}
 			return [
 				{ type: ChannelActionType.ERROR, message: 'No splice session to abort' }
@@ -10613,7 +10706,20 @@ export class Channel {
 		// crash safety) dies with the aborted splice.
 		this._state.spliceInFlight = null;
 
-		return [];
+		return [this._spliceAbortedAction(reason)];
+	}
+
+	/**
+	 * The newly-aborted signal (issue #581): appended exactly once by the arm
+	 * that makes the cancel decision, whatever state the channel lands in (a
+	 * disconnected abort stays in AWAITING_REESTABLISH and still signals).
+	 */
+	private _spliceAbortedAction(reason?: string): ChannelAction {
+		return {
+			type: ChannelActionType.SPLICE_ABORTED,
+			channelId: this._state.channelId!,
+			reason: reason ?? 'splice aborted'
+		};
 	}
 
 	/**
@@ -10655,6 +10761,12 @@ export class Channel {
 			// the tx_abort's wire bytes into the same persist transaction.
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
 		}
+		// The unwind's newly-aborted signal (issue #581) must survive this
+		// recomposition, or a local abort of a live session would never
+		// reach the manager's splice:aborted emit.
+		actions.push(
+			...unwind.filter((a) => a.type === ChannelActionType.SPLICE_ABORTED)
+		);
 
 		// The peer may still hold the splice: we owe it a tx_abort until its
 		// echo acknowledges the forget. The disposition is part of the state
@@ -15250,6 +15362,7 @@ export class Channel {
 		this._v2PendingTxSigs = null;
 		this._v2TxSigsReleased = false;
 		this._v2CallerTxSigsSignaled = false;
+		this._v2EarlyChannelReady = null;
 	}
 
 	/**
@@ -16101,8 +16214,12 @@ export class Channel {
 		// record is cleared at NORMAL while the live session object remains,
 		// so without this gate a replay of the original (valid) message would
 		// recreate the record, re-persist, rebroadcast, and pull the channel
-		// from NORMAL back to AWAITING_FUNDING_CONFIRMED.
-		if (this._state.localChannelReady || this._state.remoteChannelReady) {
+		// from NORMAL back to AWAITING_FUNDING_CONFIRMED. The shared predicate
+		// counts a transiently stashed early ready too (issue #581): the
+		// peer's witnesses are necessarily already in the session by stash
+		// time, so anything landing here afterwards is a replay to ignore,
+		// never the original delivery.
+		if (this._state.localChannelReady || this._channelReadySeen()) {
 			return [];
 		}
 
@@ -16459,8 +16576,9 @@ export class Channel {
 		// channel_ready crosses in either direction. Broadcastable attempts
 		// ARE replaceable (the spec's own window is a completed, broadcast,
 		// unconfirmed attempt); superseded attempts stay tracked in
-		// v2PreviousAttempts until one confirms.
-		if (this._state.localChannelReady || this._state.remoteChannelReady) {
+		// v2PreviousAttempts until one confirms. A transiently stashed early
+		// ready closes the window too (issue #581).
+		if (this._channelReadySeen()) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -16932,14 +17050,28 @@ export class Channel {
 		inputs: ISpliceWalletInput[]
 	): ISpliceWalletInput[] {
 		if (!inputs.length) return [];
-		const registered = new Set(
-			(this._dualFundingContribution?.inputs ?? []).map((i) =>
-				this._walletInputOutpointKey(i)
-			)
-		);
-		return inputs.filter(
-			(i) => !registered.has(this._walletInputOutpointKey(i))
-		);
+		// Per-input isolation on BOTH sides (issue #581): one malformed
+		// prevTx in a third-party provider's result must not throw away the
+		// cleanup of every parseable coin beside it, and a registered input
+		// whose key cannot be computed simply cannot block a release. An
+		// unkeyable candidate is EXCLUDED from the returned set: a pledge the
+		// parse cannot name cannot be released by outpoint anyway, and the
+		// provider's TTL covers it.
+		const registered = new Set<string>();
+		for (const i of this._dualFundingContribution?.inputs ?? []) {
+			try {
+				registered.add(this._walletInputOutpointKey(i));
+			} catch {
+				// Unkeyable registered input: it cannot match anything.
+			}
+		}
+		return inputs.filter((i) => {
+			try {
+				return !registered.has(this._walletInputOutpointKey(i));
+			} catch {
+				return false;
+			}
+		});
 	}
 
 	private _restoreDualFundingContributionFor(record: IV2InFlight): void {
@@ -17394,8 +17526,8 @@ export class Channel {
 		if (
 			!bound ||
 			!bound.fundingTxid.equals(pending.fundingTxid) ||
-			this._state.localChannelReady ||
-			this._state.remoteChannelReady ||
+			// Includes a transiently stashed early ready (issue #581).
+			this._channelReadySeen() ||
 			this._v2AnyAttemptConfirmed()
 		) {
 			// The abort expects the peer's echo; serialize the exchange so a
@@ -17577,8 +17709,9 @@ export class Channel {
 		// a completed, broadcast, unconfirmed attempt; that is where Eclair
 		// and CLN RBF). Superseded broadcastable attempts stay tracked in
 		// v2PreviousAttempts until one confirms, so accepting a replacement
-		// never orphans a tx that can still appear on chain.
-		if (this._state.localChannelReady || this._state.remoteChannelReady) {
+		// never orphans a tx that can still appear on chain. A transiently
+		// stashed early ready closes the window too (issue #581).
+		if (this._channelReadySeen()) {
 			return [
 				this._txAbort(
 					this._v2ChannelId(),

@@ -87,6 +87,7 @@ import {
 import type { IFundingProvider } from '../node/types';
 import {
 	canSelectDualFundingInputs,
+	releaseInputPledgesBestEffort,
 	selectDualFundingContribution,
 	verifyDirectedSelection
 } from '../node/funding-selection';
@@ -5535,6 +5536,11 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
+		// The splice:aborted event rides the channel's SPLICE_ABORTED action
+		// through the dispatch below (issue #581): the channel arm that makes
+		// the cancel decision is the one source of truth, so local aborts
+		// that settle before the echo, disconnected aborts that never pass
+		// through NORMAL, and repeated no-op cancels all behave correctly.
 		const actions = channel.initiateSpliceAbort(reason);
 		this.processActions(peerPubkey, channel, actions);
 		return {
@@ -6344,6 +6350,12 @@ export class ChannelManager extends EventEmitter {
 					// tx depends on lets the next wallet spend orphan the
 					// channel (issue #572 review).
 					if (channel.hasDualFundingContribution()) {
+						// Best-effort cleanup, never a gate on driving: the
+						// overlap helper isolates prevTx parsing PER INPUT
+						// (issue #581), so a malformed coin in a third-party
+						// provider's result neither throws past the drive nor
+						// discards the cleanup of the parseable coins beside
+						// it. What the parse cannot name, the TTL releases.
 						this.releaseStaleSelectionPledges(
 							channel.unregisteredV2TopUpInputs(inputs)
 						);
@@ -6820,7 +6832,6 @@ export class ChannelManager extends EventEmitter {
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
-		const stateBeforeAbort = channel.getState();
 		const actions = channel.handleTxAbort();
 		const progress: IActionDispatchProgress = {
 			index: -1,
@@ -6856,26 +6867,11 @@ export class ChannelManager extends EventEmitter {
 				this.releaseAbandonedV2Pledges(channel);
 			}
 		}
-		// A tx_abort that settles a SPLICE negotiation lands the channel back
-		// in NORMAL (a v2 OPEN abort never does: it ends ERRORED/abandoned,
-		// and a stale abort on a NORMAL channel never left it). That unwind
-		// was previously observable by nobody, so a caller waiting on the
-		// splice (spliceInAndWait, the JIT engine) burned its full timeout
-		// (issue #572 review). Fires at settle time for both directions: the
-		// peer's initiating abort, and the echo answering ours.
-		if (
-			stateBeforeAbort !== ChannelState.NORMAL &&
-			channel.getState() === ChannelState.NORMAL
-		) {
-			const channelId = channel.getChannelId();
-			if (channelId) {
-				this.emitContained(
-					'splice:aborted',
-					channelId,
-					'splice aborted (tx_abort)'
-				);
-			}
-		}
+		// splice:aborted now rides the channel's SPLICE_ABORTED action through
+		// processActions (issue #581): the peer-initiated unwind appends it
+		// inside abortSplice, and the echo of OUR local abort appends nothing
+		// (the local initiateSpliceAbort already signaled), so the event
+		// fires exactly once per attempt in every ordering.
 	}
 
 	private handleAnnouncementSignaturesMsg(
@@ -7311,9 +7307,7 @@ export class ChannelManager extends EventEmitter {
 		// resumes after a restart. The TTL remains the backstop.
 		if (id && this.config.hasResumableChannelRow?.(id) === true) return;
 		this._fundingPledgesReleased.add(channel);
-		void this.fundingProvider
-			.releaseInputPledges(outpoints)
-			.catch(() => undefined);
+		releaseInputPledgesBestEffort(this.fundingProvider, outpoints);
 	}
 
 	/**
@@ -7355,9 +7349,7 @@ export class ChannelManager extends EventEmitter {
 		const outpoints = txInputOutpoints(state.pendingFundingTxHex);
 		if (outpoints.length === 0) return;
 		this._fundingPledgesReleased.add(channel);
-		void this.fundingProvider
-			.releaseInputPledges(outpoints)
-			.catch(() => undefined);
+		releaseInputPledgesBestEffort(this.fundingProvider, outpoints);
 	}
 
 	/**
@@ -7382,9 +7374,7 @@ export class ChannelManager extends EventEmitter {
 			}
 		}
 		if (outpoints.length === 0) return;
-		void this.fundingProvider
-			.releaseInputPledges(outpoints)
-			.catch(() => undefined);
+		releaseInputPledgesBestEffort(this.fundingProvider, outpoints);
 	}
 
 	/**
@@ -7399,9 +7389,7 @@ export class ChannelManager extends EventEmitter {
 		if (!this.fundingProvider?.releaseInputPledges) return;
 		const outpoints = channel.takeDanglingV2TopUpPledgeOutpoints();
 		if (outpoints.length === 0) return;
-		void this.fundingProvider
-			.releaseInputPledges(outpoints)
-			.catch(() => undefined);
+		releaseInputPledgesBestEffort(this.fundingProvider, outpoints);
 	}
 
 	/**
@@ -8024,6 +8012,14 @@ export class ChannelManager extends EventEmitter {
 					break;
 				case ChannelActionType.SPLICE_COMPLETE:
 					this.emit('splice:complete', channel.getChannelId());
+					break;
+				case ChannelActionType.SPLICE_ABORTED:
+					// The channel's newly-aborted signal (issue #581): the ONE
+					// source of truth for splice:aborted, covering local
+					// aborts (which settle before the echo), peer aborts,
+					// disconnected aborts that never pass through NORMAL, and
+					// reestablish unwinds, exactly once per attempt.
+					this.emitContained('splice:aborted', action.channelId, action.reason);
 					break;
 			}
 			if (progress) progress.completedIndex = index;

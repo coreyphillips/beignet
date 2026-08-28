@@ -43,6 +43,15 @@ import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
 import { encodeChannelReadyMessage } from '../../src/lightning/message/channel-funding';
+import {
+	decodeTxSignaturesMessage,
+	encodeTxInitRbfMessage
+} from '../../src/lightning/message/interactive-tx';
+import {
+	serializeChannelState,
+	deserializeChannelState
+} from '../../src/lightning/storage/serialization';
+import { ChannelSigner } from '../../src/lightning/keys/signer';
 
 // ─────────────── Helpers ───────────────
 
@@ -116,6 +125,8 @@ interface IWithholdSetup {
 	aSent: number[];
 	bSent: number[];
 	needed: ITxSigsNeededEvent[];
+	/** Last payload the acceptor sent, per message type (for retransmits). */
+	bLastPayload: Map<number, Buffer>;
 	extPrevTx: bitcoin.Transaction;
 	extPriv: Buffer;
 	extPub: Buffer;
@@ -149,6 +160,12 @@ function driveToWithhold(opts?: {
 	 * opener BEFORE the peer's tx_signatures arrive.
 	 */
 	holdPeerFrom?: MessageType;
+	/**
+	 * Open WITHOUT the zero-conf trusted fast track: exercises guards the
+	 * zero-conf refusals would otherwise mask (the RBF ready-window,
+	 * issue #581).
+	 */
+	plain?: boolean;
 }): IWithholdSetup {
 	const sideA = makeSide();
 	const sideB = makeSide();
@@ -190,6 +207,7 @@ function driveToWithhold(opts?: {
 	const bSent: number[] = [];
 	const aToB: Array<[number, Buffer]> = [];
 	const bToA: Array<[number, Buffer]> = [];
+	const bLastPayload = new Map<number, Buffer>();
 	mgrA.on(
 		'message:outbound',
 		(_peer: string, type: number, payload: Buffer) => {
@@ -201,6 +219,7 @@ function driveToWithhold(opts?: {
 		'message:outbound',
 		(_peer: string, type: number, payload: Buffer) => {
 			bSent.push(type);
+			bLastPayload.set(type, payload);
 			bToA.push([type, payload]);
 		}
 	);
@@ -231,12 +250,16 @@ function driveToWithhold(opts?: {
 		}
 	};
 
-	mgrA.addTrustedPeer(sideB.pubkey);
-	mgrB.addTrustedPeer(sideA.pubkey);
+	if (!opts?.plain) {
+		mgrA.addTrustedPeer(sideB.pubkey);
+		mgrB.addTrustedPeer(sideA.pubkey);
+	}
 
-	const chA = mgrA.createDualFundedChannel(sideB.pubkey, openerParams(sideA), {
-		trusted: true
-	});
+	const chA = mgrA.createDualFundedChannel(
+		sideB.pubkey,
+		openerParams(sideA),
+		opts?.plain ? undefined : { trusted: true }
+	);
 
 	// Own P2WPKH wallet input with a real signing closure.
 	const ownPriv = crypto.randomBytes(32);
@@ -316,6 +339,7 @@ function driveToWithhold(opts?: {
 		aSent,
 		bSent,
 		needed,
+		bLastPayload,
 		extPrevTx,
 		extPriv,
 		extPub,
@@ -437,7 +461,10 @@ describe('ChannelManager.provideV2ExternalWitness (issue #572)', function () {
 		expect(s.chA.getState(), 'still owing tx_signatures').to.equal(
 			ChannelState.AWAITING_TX_SIGNATURES
 		);
-		expect(s.chA.getFullState().remoteChannelReady).to.equal(true);
+		// TRANSIENT by design: the peer witnesses backing the early ready live
+		// only in the session, so the ready must not reach durable state until
+		// the release actually completes (issue #572 review).
+		expect(s.chA.getFullState().remoteChannelReady ?? false).to.equal(false);
 
 		// Out-of-band delivery through the manager API releases everything:
 		// the release batch consumes the recorded remoteChannelReady and the
@@ -554,6 +581,142 @@ describe('ChannelManager.provideV2ExternalWitness (issue #572)', function () {
 		s.pump();
 		expect(s.chA.getState()).to.equal(ChannelState.NORMAL);
 		expect(acceptorChannel(s.mgrB)!.getState()).to.equal(ChannelState.NORMAL);
+	});
+
+	it('a stashed early ready closes the live guards: replays ignored, RBF refused', function () {
+		// BOLT 2 closes the RBF window and makes tx_signatures replays
+		// ignorable the moment a valid channel_ready is RECEIVED, not the
+		// moment it becomes durable: the transient stash must count in every
+		// live guard (issue #581 review) or the exchange stays active after
+		// a valid ready.
+		// PLAIN (non-zero-conf) open: the zero-conf RBF refusal would mask
+		// the ready-window guard under test.
+		const s = driveToWithhold({ plain: true });
+		const record = s.chA.getFullState().v2InFlight!;
+		const permanentId = s.chA.getChannelId()!;
+		const chB = acceptorChannel(s.mgrB)!;
+		s.mgrA.handleMessage(
+			s.sideB.pubkey,
+			MessageType.CHANNEL_READY,
+			earlyChannelReadyFrom(chB, permanentId)
+		);
+		expect(s.errors).to.deep.equal([]);
+
+		// A replayed tx_signatures is IGNORED, not errored: the peer's
+		// witnesses are necessarily already in the session by stash time.
+		const before = s.errors.length;
+		s.mgrA.handleMessage(
+			s.sideB.pubkey,
+			MessageType.TX_SIGNATURES,
+			s.bLastPayload.get(MessageType.TX_SIGNATURES)!
+		);
+		expect(s.errors.length, 'replay ignored, never failed').to.equal(before);
+		expect(s.chA.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+
+		// Outbound RBF is refused: the window closed at the ready.
+		const rbf = s.mgrA.initiateFundingRbf(permanentId, FEERATE_PERKW * 2);
+		expect(rbf.ok).to.equal(false);
+		expect(rbf.error).to.match(/after channel_ready/);
+
+		// Inbound RBF is refused on the wire with tx_abort, never accepted.
+		const aSentBefore = s.aSent.length;
+		s.mgrA.handleMessage(
+			s.sideB.pubkey,
+			MessageType.TX_INIT_RBF,
+			encodeTxInitRbfMessage({
+				channelId: permanentId,
+				locktime: 0,
+				feerate: FEERATE_PERKW * 2
+			})
+		);
+		const answered = s.aSent.slice(aSentBefore);
+		expect(
+			answered.filter((t) => t === MessageType.TX_ABORT),
+			'inbound RBF refused with tx_abort'
+		).to.have.length(1);
+		expect(
+			answered.filter((t) => t === MessageType.TX_ACK_RBF),
+			'inbound RBF never acked'
+		).to.have.length(0);
+
+		// The witness delivery still completes the open normally afterwards.
+		const result = s.mgrA.provideV2ExternalWitness(
+			permanentId,
+			Buffer.from(s.extPrevTx.getHash()),
+			0,
+			signExternalP2wpkh(record, s.extPrevTx, s.extPriv, s.extPub)
+		);
+		expect(result.ok, `delivery accepted (${result.error})`).to.equal(true);
+		// Plain open: no zero-conf fast track, so the release parks the open
+		// at the confirmation wait (the stash is consumed at depth).
+		expect(s.chA.getState()).to.equal(ChannelState.AWAITING_FUNDING_CONFIRMED);
+		expect(
+			s.aSent.filter((t) => t === MessageType.TX_SIGNATURES),
+			'release sent'
+		).to.have.length(1);
+	});
+
+	it('an early ready never persists: a restart accepts the retransmitted tx_signatures', function () {
+		// The peer witnesses backing an early ready live only in the SESSION.
+		// If the ready reached durable state and a later persist (an external
+		// witness delivery) wrote it, a restart would keep remoteChannelReady
+		// while losing the witnesses: the tx_signatures gate would then
+		// swallow the peer's retransmission forever and the open could never
+		// complete (issue #572 review). The stash design makes the restart
+		// path self-healing: nothing durable, gate open, retransmit accepted.
+		const s = driveToWithhold();
+		const record = s.chA.getFullState().v2InFlight!;
+		const permanentId = s.chA.getChannelId()!;
+		const chB = acceptorChannel(s.mgrB)!;
+		s.mgrA.handleMessage(
+			s.sideB.pubkey,
+			MessageType.CHANNEL_READY,
+			earlyChannelReadyFrom(chB, permanentId)
+		);
+		expect(s.errors).to.deep.equal([]);
+
+		// The process dies before any witness arrives: the serialized row
+		// must NOT carry the early ready.
+		const row = deserializeChannelState(
+			serializeChannelState(s.chA.getFullState())
+		);
+		expect(
+			row.remoteChannelReady ?? false,
+			'early ready not persisted'
+		).to.equal(false);
+
+		const restored = new Channel(
+			row,
+			new ChannelSigner(crypto.randomBytes(32))
+		);
+		restored.restoreV2InFlight();
+
+		// The peer retransmits its tx_signatures over reestablish; the
+		// restored gate must consume it, not ignore it.
+		const retransmit = decodeTxSignaturesMessage(
+			s.bLastPayload.get(MessageType.TX_SIGNATURES)!
+		);
+		restored.handleTxSignatures(retransmit);
+		expect(
+			restored.getDualFundingSession()?.getRemoteWitnesses() ?? null,
+			'peer witnesses accepted after restart'
+		).to.not.equal(null);
+
+		// The remaining external witness then completes the exchange.
+		const release = restored.provideV2ExternalWitness(
+			Buffer.from(s.extPrevTx.getHash()),
+			0,
+			signExternalP2wpkh(record, s.extPrevTx, s.extPriv, s.extPub)
+		);
+		expect(
+			release.some(
+				(a) =>
+					(a as { messageType?: number }).messageType ===
+					MessageType.TX_SIGNATURES
+			),
+			'restored channel releases tx_signatures'
+		).to.equal(true);
+		expect(row.v2InFlight!.sentTxSignatures).to.equal(true);
 	});
 
 	it('a PREMATURE channel_ready (before the peer signed) is refused, not recorded', function () {
