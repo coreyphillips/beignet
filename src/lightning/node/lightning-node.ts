@@ -15777,49 +15777,12 @@ export class LightningNode extends EventEmitter {
 			// downstream fail arrived). The downstream reason bytes died with
 			// the process, so the refund carries a synthesized
 			// temporary_channel_failure, which refunds the payer identically.
-			const outParts = outKey.split(':');
-			const outChannel = this.channelManager.getChannel(
-				Buffer.from(outParts[0], 'hex')
-			);
-			const outState = outChannel?.getFullState();
-			const outHtlc = outState?.htlcs.get(outParts[1]);
-			// An entry that is GONE from a live NORMAL outbound channel also
-			// means the leg failed: an off-chain fulfill makes its preimage
-			// durable BEFORE any removal round can complete, so the settle
-			// branch above would have taken it. A missing or closed outbound
-			// channel stays ambiguous (an on-chain claim can still reveal the
-			// preimage later) and is left to the chain machinery and the CLTV
-			// sweeper, exactly like scanForwardTimeouts.
-			// The on-chain form of the same fact (issue 569): THIS forward's
-			// offered output resolved irrevocably and no preimage was ever
-			// learned (the settle branch above takes the entry when one
-			// exists). This is exactly the predicate handleOnChainOutputResolved
-			// acted on; a fail refused there (inbound quiescing) retries here.
-			// Matched on the output's recorded htlcId, never the hash alone:
-			// same-hash MPP parts and retries are separate forwards, and one
-			// timed-out output must not fail every same-hash leg upstream while
-			// another leg's output is still unresolved and claimable. A legacy
-			// record with no htlcId never matches; those forwards keep the
-			// pre-retry behavior (chain machinery and the CLTV sweeper).
-			const outHtlcId = BigInt(outParts[1].slice('offered-'.length));
-			const outgoingTimedOutOnChain =
-				this.channelManager
-					.getMonitor(Buffer.from(outParts[0], 'hex'))
-					?.getTrackedOutputs()
-					.some(
-						(o) =>
-							o.outputType === OutputType.OFFERED_HTLC &&
-							o.status === OutputStatus.IRREVOCABLY_RESOLVED &&
-							o.htlcId === outHtlcId &&
-							o.paymentHash?.equals(entry.paymentHash) === true
-					) === true;
-			const outgoingFailed =
-				outHtlc?.state === HtlcState.FAILED ||
-				(outHtlc === undefined &&
-					outState !== undefined &&
-					outState.state === ChannelState.NORMAL) ||
-				outgoingTimedOutOnChain;
-			if (!outgoingFailed) continue;
+			// The on-chain arm of the predicate is exactly what
+			// handleOnChainOutputResolved acted on; a fail refused there
+			// (inbound quiescing) retries here.
+			if (!this.isOutgoingLegTerminallyFailed(outKey, entry.paymentHash))
+				continue;
+			const outChannelId = Buffer.from(outKey.split(':')[0], 'hex');
 			const secretKey = `${forward.inChannelId.toString('hex')}:${
 				forward.inHtlcId
 			}`;
@@ -15839,7 +15802,7 @@ export class LightningNode extends EventEmitter {
 			this.failForwardUpstream(
 				outKey,
 				forward,
-				Buffer.from(outParts[0], 'hex'),
+				outChannelId,
 				forward.inHtlcId,
 				reason,
 				true
@@ -17483,8 +17446,16 @@ export class LightningNode extends EventEmitter {
 					// inbound instead, exactly as scanForwardTimeouts does, and keep
 					// the linkage so a late settlement is still honored. Checked
 					// before the blinded arm, which fails inbound the same way.
+					//
+					// A leg the predicate DOES clear falls through to the ordinary
+					// refund below: the same block runs settleForwardsOwedUpstream,
+					// which would resolve those off-chain, and force-closing here
+					// first would burn a usable channel ahead of it.
 					const outKey = this.findOutgoingLeg(channelId, htlc.id);
-					if (outKey && !this.isOutgoingLegTerminallyFailed(outKey)) {
+					if (
+						outKey &&
+						!this.isOutgoingLegTerminallyFailed(outKey, htlc.paymentHash)
+					) {
 						if (
 							this.skipAutoCloseRestoreUnproven(
 								state,
@@ -17577,9 +17548,13 @@ export class LightningNode extends EventEmitter {
 
 				if (htlc.cltvExpiry - blockHeight > doubleMargin) continue;
 
-				// Only an explicitly FAILED outgoing leg is safe to refund upstream
-				// for; the shared predicate is the same one scanExpiringHtlcs uses.
-				const outgoingFailed = this.isOutgoingLegTerminallyFailed(outKey);
+				// Only a durably failed outgoing leg is safe to refund upstream
+				// for; the shared predicate is the same one scanExpiringHtlcs and
+				// settleForwardsOwedUpstream use.
+				const outgoingFailed = this.isOutgoingLegTerminallyFailed(
+					outKey,
+					htlc.paymentHash
+				);
 
 				// An errored inbound channel cannot carry the update_fail_htlc even
 				// when the outbound leg failed cleanly, so it always takes the
@@ -17645,34 +17620,78 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Find the outgoing leg key for a forwarded HTLC given its incoming channel+htlcId.
-	 */
-	/**
-	 * Whether a forward's OUTGOING leg is irrevocably resolved as FAILED, the
+	 * Whether a forward's OUTGOING leg is irrevocably resolved as failed, the
 	 * only condition under which refunding the inbound leg upstream is safe.
 	 *
-	 * BOLT 2 fund safety: anything else (still in flight, FULFILLED, or already
-	 * removed and therefore ambiguous) leaves the downstream able to claim, so
-	 * an upstream refund would pay B and refund A for the same forward. Shared
-	 * by both expiry scanners (issue #575) so the two can never drift: one of
-	 * them used to fail the inbound on time alone.
+	 * BOLT 2 fund safety: anything else (still in flight, FULFILLED, or gone
+	 * from a channel that is no longer live and therefore ambiguous) leaves
+	 * the downstream able to claim, so an upstream refund would pay B and
+	 * refund A for the same forward.
+	 *
+	 * The one copy of that judgment, used by both expiry scanners and by the
+	 * owed-fail reconciliation (issue #575). They run in the same block, so a
+	 * narrower copy is not merely a drift risk: a leg this predicate fails to
+	 * recognize gets force-closed by whichever scanner reaches it first, on a
+	 * channel the reconciliation was about to resolve off-chain.
 	 *
 	 * @param outKey - "outChannelIdHex:offered-<id>", as forwardedHtlcs keys it
+	 * @param inboundPaymentHash - the forward's payment hash, from the inbound entry
 	 */
-	private isOutgoingLegTerminallyFailed(outKey: string): boolean {
+	private isOutgoingLegTerminallyFailed(
+		outKey: string,
+		inboundPaymentHash: Buffer
+	): boolean {
 		const outParts = outKey.split(':');
 		const outChannelIdHex = outParts[0];
-		const outHtlcIdStr = outParts[1]?.replace('offered-', '');
-		if (!outChannelIdHex || !outHtlcIdStr) return false;
-		const outChannel = this.channelManager.getChannel(
-			Buffer.from(outChannelIdHex, 'hex')
+		const outEntryKey = outParts[1];
+		if (!outChannelIdHex || !outEntryKey?.startsWith('offered-')) return false;
+		const outChannelId = Buffer.from(outChannelIdHex, 'hex');
+		const outState = this.channelManager
+			.getChannel(outChannelId)
+			?.getFullState();
+		const outHtlc = outState?.htlcs.get(outEntryKey);
+		if (outHtlc?.state === HtlcState.FAILED) return true;
+
+		// The two arms below infer the failure from an absence rather than
+		// reading it off the leg, and both inferences rest on no preimage ever
+		// having arrived. Holding one inverts the answer: the forward was
+		// fulfilled, and refunding upstream is the double-pay this predicate
+		// exists to prevent.
+		if (this.preimages.has(inboundPaymentHash.toString('hex'))) return false;
+
+		// An entry GONE from a live NORMAL outbound channel also means the leg
+		// failed: an off-chain fulfill makes its preimage durable BEFORE any
+		// removal round can complete, so the check above would hold it. A
+		// missing or closed outbound channel stays ambiguous (an on-chain claim
+		// can still reveal the preimage later) and is left to the chain
+		// machinery and the CLTV sweeper.
+		if (outHtlc === undefined && outState?.state === ChannelState.NORMAL)
+			return true;
+
+		// The on-chain form of the same fact (issue 569): THIS forward's offered
+		// output resolved irrevocably with no preimage learned. Matched on the
+		// output's recorded htlcId, never the hash alone, so one timed-out
+		// output cannot fail every same-hash MPP leg upstream while another
+		// leg's output is still unresolved and claimable. A legacy record with
+		// no htlcId never matches.
+		const outHtlcId = BigInt(outEntryKey.slice('offered-'.length));
+		return (
+			this.channelManager
+				.getMonitor(outChannelId)
+				?.getTrackedOutputs()
+				.some(
+					(o) =>
+						o.outputType === OutputType.OFFERED_HTLC &&
+						o.status === OutputStatus.IRREVOCABLY_RESOLVED &&
+						o.htlcId === outHtlcId &&
+						o.paymentHash?.equals(inboundPaymentHash) === true
+				) === true
 		);
-		const outHtlc = outChannel
-			?.getFullState()
-			.htlcs.get(`offered-${outHtlcIdStr}`);
-		return outHtlc?.state === HtlcState.FAILED;
 	}
 
+	/**
+	 * Find the outgoing leg key for a forwarded HTLC given its incoming channel+htlcId.
+	 */
 	private findOutgoingLeg(
 		inChannelId: Buffer,
 		inHtlcId: bigint

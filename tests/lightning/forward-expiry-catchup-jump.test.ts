@@ -26,6 +26,12 @@ import {
 	IHtlcEntry,
 	DEFAULT_CHANNEL_CONFIG
 } from '../../src/lightning/channel/types';
+import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
+import {
+	MonitorState,
+	OutputStatus,
+	OutputType
+} from '../../src/lightning/chain/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
@@ -121,6 +127,7 @@ interface IForwardFixture {
 	inChannelId: Buffer;
 	outChannelId: Buffer;
 	outKey: string;
+	paymentHash: Buffer;
 	inHtlcs: Map<string, IHtlcEntry>;
 	outHtlcs: Map<string, IHtlcEntry>;
 	/** Every failHtlc the node asked the manager for, in order. */
@@ -136,7 +143,16 @@ interface IForwardFixture {
  */
 function makeForward(
 	seedBase: number,
-	opts?: { outboundState?: HtlcState; linkage?: boolean }
+	opts?: {
+		outboundState?: HtlcState;
+		linkage?: boolean;
+		/** Drop the outgoing entry, as a completed removal round does. */
+		outboundGone?: boolean;
+		/** Give the outgoing channel a monitor with a timed-out HTLC output. */
+		outboundTimedOutOnChain?: boolean;
+		/** Record the forward's preimage before the scan runs. */
+		preimageKnown?: boolean;
+	}
 ): IForwardFixture {
 	const alice = createNode(seedBase); // forwarder
 	const bob = createNode(seedBase + 1); // upstream (inbound)
@@ -180,6 +196,40 @@ function makeForward(
 		state: opts?.outboundState ?? HtlcState.COMMITTED
 	});
 
+	if (opts?.outboundGone) outHtlcs.delete('offered-7');
+
+	if (opts?.outboundTimedOutOnChain) {
+		// Outgoing channel force-closed and our HTLC-timeout claim is buried:
+		// the durable proof that the downstream can never claim.
+		const outState = a.channelManager.getChannel(outChannelId).getFullState();
+		const monitor = new ChainMonitor(
+			outState,
+			Buffer.alloc(22),
+			1,
+			crypto.randomBytes(32),
+			crypto.randomBytes(32)
+		);
+		monitor._state = MonitorState.RESOLVING;
+		monitor._trackedOutputs = [
+			{
+				txid: crypto.randomBytes(32).toString('hex'),
+				outputIndex: 0,
+				amount: 49n,
+				outputType: OutputType.OFFERED_HTLC,
+				status: OutputStatus.IRREVOCABLY_RESOLVED,
+				confirmationHeight: HEIGHT - 100,
+				paymentHash,
+				htlcId: 7n,
+				resolutionTxid: crypto.randomBytes(32).toString('hex')
+			}
+		];
+		a.channelManager.monitors.set(outChannelId.toString('hex'), monitor);
+	}
+
+	if (opts?.preimageKnown) {
+		a.preimages.set(paymentHash.toString('hex'), crypto.randomBytes(32));
+	}
+
 	const outKey = `${outChannelId.toString('hex')}:offered-7`;
 	if (opts?.linkage !== false) {
 		a.forwardedHtlcs.set(outKey, { inChannelId, inHtlcId: 7n });
@@ -210,6 +260,7 @@ function makeForward(
 		inChannelId,
 		outChannelId,
 		outKey,
+		paymentHash,
 		inHtlcs,
 		outHtlcs,
 		failed,
@@ -292,6 +343,50 @@ describe('Forwarded inbound expiry on a catch-up block jump (issue #575)', funct
 
 		expect(failedInbound(f), 'inbound refunded upstream').to.equal(true);
 		expect(forceClosedInbound(f), 'no force-close needed').to.equal(false);
+		f.destroy();
+	});
+
+	it('still fails upstream when the outbound entry is gone from a live channel', function () {
+		// The shape settleForwardsOwedUpstream reconciles later in the same
+		// block: the downstream fail completed its removal round but the fail
+		// owed upstream never became durable. Force-closing here would burn a
+		// usable channel minutes before the reconciliation refunds it.
+		const f = makeForward(350, { outboundGone: true });
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(f.alice as any).currentBlockHeight = HEIGHT - 20;
+		f.alice.handleNewBlock(HEIGHT + 1);
+
+		expect(failedInbound(f), 'inbound refunded upstream').to.equal(true);
+		expect(forceClosedInbound(f), 'no force-close needed').to.equal(false);
+		f.destroy();
+	});
+
+	it('still fails upstream when the outbound leg timed out on chain', function () {
+		// The on-chain form of the same durable failure (issue 569).
+		const f = makeForward(360, {
+			outboundGone: true,
+			outboundTimedOutOnChain: true
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(f.alice as any).scanExpiringHtlcs(HEIGHT + 1);
+
+		expect(failedInbound(f), 'inbound refunded upstream').to.equal(true);
+		expect(forceClosedInbound(f), 'no force-close needed').to.equal(false);
+		f.destroy();
+	});
+
+	it('never reads an absent outbound leg as failed while we hold its preimage', function () {
+		// Absence means "failed" only because a fulfill would have made the
+		// preimage durable first. Holding one inverts that: the downstream was
+		// paid, so refunding upstream is the double-pay the rule exists to
+		// prevent. Driven through the forward scan, whose refund arm is the one
+		// the inference can reach.
+		const f = makeForward(370, { outboundGone: true, preimageKnown: true });
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(f.alice as any).scanForwardTimeouts(HEIGHT + 1);
+
+		expect(failedInbound(f), 'inbound never refunded upstream').to.equal(false);
+		expect(forceClosedInbound(f), 'resolved on chain instead').to.equal(true);
 		f.destroy();
 	});
 
