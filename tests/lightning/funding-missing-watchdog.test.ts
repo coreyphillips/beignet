@@ -912,6 +912,121 @@ describe('Funding-missing quarantine (issue #593)', function () {
 		bob.destroy();
 	});
 
+	it('refuses a new outbound HTLC at the admission point, not just in selection', async function () {
+		// acceptsNewHtlcs keeps the router, the forwarder, the hint builder and
+		// the sender away from the channel, but selection is advice: anything
+		// reaching ChannelManager.addHtlc directly arrives here instead. An add
+		// admitted now is enforceable only by a commitment spending an outpoint
+		// nobody has seen.
+		const { alice, bob, channelId, displayTxid } = setupPair(930, 931);
+		await tick(60);
+		const channel = alice.getChannelManager().getChannel(channelId)!;
+		alice.handleNewBlock(700_000);
+		alice.getChainWatcher()!.emit('funding:missing', channelId, displayTxid);
+		expect(channel.isFundingUnaccounted()).to.equal(true);
+
+		const actions = channel.addHtlc(
+			50_000_000n,
+			crypto.randomBytes(32),
+			500_000,
+			crypto.randomBytes(1366)
+		);
+		expect(
+			actions.filter((a) => a.type === ChannelActionType.SEND_MESSAGE),
+			'no update_add_htlc goes out'
+		).to.have.length(0);
+		const err = actions.find((a) => a.type === ChannelActionType.ERROR) as
+			| { message: string }
+			| undefined;
+		expect(err, 'refused with a reason').to.not.equal(undefined);
+		expect(err!.message).to.contain('quarantined');
+		expect(
+			[...channel.getFullState().htlcs.keys()],
+			'and nothing was written into the channel'
+		).to.have.length(0);
+
+		// The refusal is exactly as reversible as the quarantine.
+		alice.getChainWatcher()!.emit('funding:recovered', channelId, displayTxid);
+		const after = channel.addHtlc(
+			50_000_000n,
+			crypto.randomBytes(32),
+			500_000,
+			crypto.randomBytes(1366)
+		);
+		expect(
+			after.some((a) => a.type === ChannelActionType.SEND_MESSAGE),
+			'the add goes out once the funding is accounted for'
+		).to.equal(true);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('stamps an inbound add with admission-time provenance, and persists it', async function () {
+		// BOLT 2 gives no way to refuse an add on the wire, so a quarantined
+		// channel commits to it and the node fails it back afterwards. Which
+		// adds those are is decided by WHEN each entered, not by the quarantine
+		// alone: the restart redispatch replays committed HTLCs through the
+		// same path, and one admitted before the quarantine still settles.
+		const { alice, bob, channelId } = setupPair(932, 933);
+		await tick(60);
+		const aliceChannel = alice.getChannelManager().getChannel(channelId)!;
+		const bobChannel = bob.getChannelManager().getChannel(channelId)!;
+
+		const send = (): void => {
+			const addMsg = aliceChannel
+				.addHtlc(
+					50_000_000n,
+					crypto.randomBytes(32),
+					500_000,
+					crypto.randomBytes(1366)
+				)
+				.find((a) => a.type === ChannelActionType.SEND_MESSAGE) as
+				| { payload: Buffer }
+				| undefined;
+			expect(addMsg, 'the add went out').to.not.equal(undefined);
+			bobChannel.handleUpdateAddHtlc(
+				decodeUpdateAddHtlcMessage(addMsg!.payload)
+			);
+		};
+
+		send();
+		// Only the receiving side loses sight of the funding, so alice still
+		// offers: what is under test is the admission, not how each end reached
+		// its own verdict about the chain.
+		bobChannel.markFundingUnaccounted();
+		send();
+
+		const htlcs = bobChannel.getFullState().htlcs;
+		expect(
+			htlcs.get('received-0')!.addedWhileFundingUnaccounted,
+			'the earlier add predates the quarantine'
+		).to.equal(undefined);
+		expect(
+			htlcs.get('received-1')!.addedWhileFundingUnaccounted,
+			'the later one carries the provenance'
+		).to.equal(true);
+
+		// It has to survive the crash between the commitment and the fail-back.
+		const restored = new Channel(
+			deserializeChannelState(
+				JSON.parse(
+					JSON.stringify(serializeChannelState(bobChannel.getFullState()))
+				)
+			)
+		);
+		const restoredHtlcs = restored.getFullState().htlcs;
+		expect(
+			restoredHtlcs.get('received-0')!.addedWhileFundingUnaccounted
+		).to.equal(undefined);
+		expect(
+			restoredHtlcs.get('received-1')!.addedWhileFundingUnaccounted
+		).to.equal(true);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	describe('guard parity: quarantine refuses wherever disposal does', function () {
 		const cases: Array<{
 			name: string;

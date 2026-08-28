@@ -318,6 +318,51 @@ describe('Policy fail-backs and quiescence parking (issues 410/411)', function (
 		).to.equal(ChannelState.NORMAL);
 	});
 
+	it('fails an HTLC back when the receiving channel has an unaccounted-for funding (issue #593)', function () {
+		const alice = createNode(23);
+		const bob = createNode(24);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		buildGraph(alice, bob, [channelId]);
+
+		// Neither mempool nor chain can find BOB's funding, so his balance is a
+		// claim on an outpoint nobody has seen and a new HTLC on the channel has
+		// no enforcement behind it. Alice's side is ordinary, so she still
+		// routes over it and the refusal has to reach her as a readable failure.
+		const bobChannel = bob.getChannelManager().getChannel(channelId)!;
+		bobChannel.markFundingUnaccounted();
+
+		const inv = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'funding-unaccounted'
+		});
+		alice.sendPayment(inv.bolt11);
+
+		const failed = alice.getPayment(inv.paymentHash)!;
+		expect(failed.status).to.equal(PaymentStatus.FAILED);
+		expect(failed.failureCode, 'the payer could decrypt the failure').to.equal(
+			INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+		);
+		expect(bob.getPayment(inv.paymentHash)?.status).to.not.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(bobChannel.getState(), 'the channel survives').to.equal(
+			ChannelState.NORMAL
+		);
+
+		// And unlike the capsule-restore hold above, this quarantine lifts: the
+		// funding reappearing makes the channel ordinary again.
+		bobChannel.clearFundingUnaccounted();
+		const inv2 = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'funding-back'
+		});
+		alice.sendPayment(inv2.bolt11);
+		expect(alice.getPayment(inv2.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+	});
+
 	it('fails a final-hop far-future CLTV back, not the channel', function () {
 		const alice = createNode(3);
 		const bob = createNode(4);

@@ -14113,6 +14113,31 @@ export class LightningNode extends EventEmitter {
 			policyCode = finalHop
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				: TEMPORARY_CHANNEL_FAILURE;
+		} else if (
+			channel.isFundingUnaccounted() &&
+			htlcEntry.addedWhileFundingUnaccounted === true
+		) {
+			// A channel whose funding the chain cannot account for takes no NEW
+			// HTLCs (issue #593). Settling one would trade a preimage for a
+			// balance that only a commitment spending an unseen outpoint could
+			// ever claim, and forwarding it would pay real value out on a real
+			// channel against it. The outbound half is refused in
+			// Channel.addHtlc; this is the same refusal for the half BOLT 2
+			// makes us commit to first.
+			//
+			// Both conditions, for two different reasons. The provenance keeps
+			// the redispatch of HTLCs committed before the quarantine settling
+			// as they always did, and the live check means an HTLC held across
+			// the funding reappearing settles too: unlike the capsule-restore
+			// hold above, this quarantine lifts.
+			this.emitStructuredLog('htlc', 'refused_funding_unaccounted', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				finalHop
+			});
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_CHANNEL_FAILURE;
 		} else if (channel.receivedHtlcExceedsDustExposure(htlcId)) {
 			policyCode = finalHop
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS

@@ -148,6 +148,8 @@ export interface ISerializedHtlcEntry {
 	dustExposureFailback?: boolean;
 	/** Admitted while the capsule-restore hold stood (see IHtlcEntry). */
 	addedWhileRestoreUnproven?: boolean;
+	/** Admitted while the funding-missing quarantine stood (see IHtlcEntry). */
+	addedWhileFundingUnaccounted?: boolean;
 }
 
 export interface ISerializedHtlcSnapshot {
@@ -199,6 +201,9 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.addedWhileRestoreUnproven !== undefined
 			? { addedWhileRestoreUnproven: e.addedWhileRestoreUnproven }
+			: {}),
+		...(e.addedWhileFundingUnaccounted !== undefined
+			? { addedWhileFundingUnaccounted: e.addedWhileFundingUnaccounted }
 			: {})
 	};
 }
@@ -243,6 +248,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.addedWhileRestoreUnproven !== undefined
 				? { addedWhileRestoreUnproven: s.addedWhileRestoreUnproven }
+				: {}),
+			...(s.addedWhileFundingUnaccounted !== undefined
+				? { addedWhileFundingUnaccounted: s.addedWhileFundingUnaccounted }
 				: {})
 		}
 	};
