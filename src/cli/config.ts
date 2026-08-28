@@ -114,6 +114,45 @@ function leaseRatesEnv(raw: string | undefined): BeignetConfig['leaseRates'] {
 }
 
 /**
+ * BEIGNET_JIT_RECEIVE / _FLAT_FEE_SAT / _FEE_PPM / _MAX_FLAT_FEE_SAT /
+ * _MAX_FEE_PPM, assembled into one config block. Returns undefined when none
+ * of them is set, so the config file still gets its turn.
+ *
+ * `enabled` is the autoReconnect rule (exact 'true'/'false', anything else
+ * ignored): the safe direction for this switch is OFF, because it decides
+ * whether this node fronts channel funding with its own coins for peers. The
+ * fork's `=== 'true'` made BEIGNET_JIT_RECEIVE=1 read as an explicit false,
+ * which is the same result by accident rather than by rule. The fee fields go
+ * through integerEnv, so a partly numeric one surfaces as NaN and refuses
+ * startup naming the variable instead of advertising a price nobody wrote.
+ */
+function jitReceiveEnv(): BeignetConfig['jitReceive'] {
+	const enabledRaw = process.env.BEIGNET_JIT_RECEIVE?.trim();
+	const enabled =
+		enabledRaw === 'true' ? true : enabledRaw === 'false' ? false : undefined;
+	const flatFeeSat = integerEnv(process.env.BEIGNET_JIT_FLAT_FEE_SAT);
+	const feePpm = integerEnv(process.env.BEIGNET_JIT_FEE_PPM);
+	const maxFlatFeeSat = integerEnv(process.env.BEIGNET_JIT_MAX_FLAT_FEE_SAT);
+	const maxFeePpm = integerEnv(process.env.BEIGNET_JIT_MAX_FEE_PPM);
+	if (
+		enabled === undefined &&
+		flatFeeSat === undefined &&
+		feePpm === undefined &&
+		maxFlatFeeSat === undefined &&
+		maxFeePpm === undefined
+	) {
+		return undefined;
+	}
+	return {
+		...(enabled !== undefined ? { enabled } : {}),
+		...(flatFeeSat !== undefined ? { flatFeeSat } : {}),
+		...(feePpm !== undefined ? { feePpm } : {}),
+		...(maxFlatFeeSat !== undefined ? { maxFlatFeeSat } : {}),
+		...(maxFeePpm !== undefined ? { maxFeePpm } : {})
+	};
+}
+
+/**
  * Merge CLI flags > env vars > config file, returning final config.
  */
 export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
@@ -331,7 +370,8 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 		leaseRates:
 			cliFlags.leaseRates ??
 			leaseRatesEnv(process.env.BEIGNET_LEASE_RATES) ??
-			file.leaseRates
+			file.leaseRates,
+		jitReceive: cliFlags.jitReceive ?? jitReceiveEnv() ?? file.jitReceive
 	};
 }
 

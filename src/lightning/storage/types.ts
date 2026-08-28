@@ -522,4 +522,14 @@ export interface IInvoiceInfo {
 	 * re-arm parking for a hash the operator already cancelled.
 	 */
 	cancelledAt?: number;
+	/**
+	 * JIT receive (issue #595): the LSPS2-style opening fee this invoice's LSP
+	 * is allowed to skim off the delivery. The QUOTE is stored, not an amount,
+	 * so the allowance is evaluated against the total the payment actually
+	 * declares; an amount-less invoice can then never authorize more than the
+	 * quoted fee on the amount that turns up. It rides the invoice record so a
+	 * restart between issuing and payment does not reject a legitimate skim.
+	 * Numbers, not bigints: this record is persisted as JSON.
+	 */
+	jitFee?: { flatFeeSat: number; feePpm: number };
 }

@@ -1011,7 +1011,8 @@ export class SqliteStorage implements IStorageBackend {
 			createdAt: invoice.createdAt,
 			hold: invoice.hold,
 			bolt12: invoice.bolt12,
-			cancelledAt: invoice.cancelledAt
+			cancelledAt: invoice.cancelledAt,
+			jitFee: invoice.jitFee
 		});
 		this.db
 			.prepare(
@@ -1043,7 +1044,10 @@ export class SqliteStorage implements IStorageBackend {
 						createdAt: parsed.createdAt,
 						hold: parsed.hold,
 						bolt12: parsed.bolt12,
-						cancelledAt: parsed.cancelledAt
+						cancelledAt: parsed.cancelledAt,
+						// A row written before #595 has none; the allowance is then
+						// absent and the final hop enforces BOLT 4 unchanged.
+						jitFee: parsed.jitFee
 					}
 				});
 			} catch (err) {

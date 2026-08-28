@@ -515,7 +515,8 @@ async function handleStart(): Promise<void> {
 			routingFeeBaseMsat: config.routingFeeBaseMsat,
 			routingFeePpm: config.routingFeePpm,
 			routingCltvDelta: config.routingCltvDelta,
-			leaseRates: config.leaseRates
+			leaseRates: config.leaseRates,
+			jitReceive: config.jitReceive
 		});
 
 		writePidFile(process.pid, daemonPort);
@@ -1110,13 +1111,53 @@ async function handleChannel(): Promise<void> {
 async function handleInvoice(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
-		case 'create':
+		case 'create': {
+			const minFinalCltv = parseFlag('--min-final-cltv');
 			return outputResult(
 				await httpRequest('POST', '/invoice/create', {
 					amountSats: parseInt(filteredArgs[2], 10),
-					description: filteredArgs[3] || ''
+					description: filteredArgs[3] || '',
+					minFinalCltvExpiry: minFinalCltv
+						? parseInt(minFinalCltv, 10)
+						: undefined
 				})
 			);
+		}
+		case 'jit': {
+			// Payable with no channel: the LSP holds the HTLC, funds a channel
+			// and forwards, taking the quoted opening fee out of the delivery.
+			const lspPubkey = filteredArgs[2];
+			if (!lspPubkey) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet invoice jit <lspPubkey> [amountSats] [description] ' +
+							'[--expiry secs] [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const numberFlag = (name: string): number | undefined => {
+				const raw = parseFlag(name);
+				return raw === undefined ? undefined : parseInt(raw, 10);
+			};
+			return outputResult(
+				await httpRequest('POST', '/jit/invoice', {
+					lspPubkey,
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined,
+					description: filteredArgs[4] || '',
+					expirySecs: numberFlag('--expiry'),
+					targetRemainingInboundSat: numberFlag('--target-inbound'),
+					maxFlatFeeSat: numberFlag('--max-flat-fee-sat'),
+					maxFeePpm: numberFlag('--max-fee-ppm')
+				})
+			);
+		}
 		case 'create-hold': {
 			// The caller supplies sha256(preimage) and keeps the preimage until
 			// `invoice settle-hold`. The incoming HTLC parks instead of settling.
@@ -1237,7 +1278,7 @@ async function handleInvoice(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet invoice [create|create-hold|settle-hold|cancel-hold|held|decode|validate|get|pay|pay-safe|pay-async|pay-retry|list]'
+						'Usage: beignet invoice [create|jit|create-hold|settle-hold|cancel-hold|held|decode|validate|get|pay|pay-safe|pay-async|pay-retry|list]'
 				}
 			});
 			process.exitCode = 1;
@@ -2583,7 +2624,13 @@ Channels:
   channel wait-ready <id> [--timeout ms] Block until a channel reaches NORMAL
 
 Invoices & Payments:
-  invoice create <sats> [description]    Create BOLT 11 invoice
+  invoice create <sats> [description] [--min-final-cltv blocks]
+                                         Create BOLT 11 invoice
+  invoice jit <lspPubkey> [sats] [description] [--expiry secs]
+             [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n]
+                                         Create an invoice payable with no
+                                         channel: the LSP funds one mid-payment
+                                         and skims the agreed opening fee
   invoice create-hold <hash> [sats] [description] [--expiry secs]
                                          Create hold invoice for a payment hash
                                          you supply (keep the preimage; HTLCs

@@ -5,6 +5,7 @@ export {
 	decodeJitAuthorization,
 	encodeJitAck,
 	encodeJitAuthorization,
+	jitOpeningFeeMsat,
 	mintInterceptScid
 } from './jit-receive';
 export type {

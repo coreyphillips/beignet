@@ -108,6 +108,7 @@ describe('OpenAPI Spec Completeness', () => {
 		'/rebalance',
 		'/advisor/recommendations',
 		'/advisor/execute-rebalances',
+		'/jit/invoice',
 		'/invoice/create-hold',
 		'/invoice/settle-hold',
 		'/invoice/cancel-hold',

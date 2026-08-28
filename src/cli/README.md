@@ -1690,6 +1690,11 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_FEE_PPM` | Node-wide default proportional routing fee in millionths, an integer in 0..4294967295 (default: 1; anything else refuses startup). Per-channel overrides win |
 | `BEIGNET_CLTV_DELTA` | Node-wide default forwarding CLTV delta, an integer in 1..65535, `>= 18` recommended (default: 40; anything else refuses startup). Per-channel overrides win |
 | `BEIGNET_LEASE_RATES` | Liquidity ads (`option_will_fund`) seller policy: a JSON object `{"fundingWeightWitness":n,"leaseFeeBasis":n,"leaseFeeBaseSat":n,"channelFeeMaxBaseMsat":n,"channelFeeMaxProportionalThousandths":n}` (u16/u16/u32/u32/u16). Setting it sells inbound liquidity at these rates and advertises the feature bit; malformed or out-of-range values refuse startup; unset means never sell |
+| `BEIGNET_JIT_RECEIVE` | JIT channel receive, LSP role: hold HTLCs addressed to intercept SCIDs registered by wallet peers, fund a zero-conf channel with THIS node's coins, then forward (`true`/`false`, default off) |
+| `BEIGNET_JIT_FLAT_FEE_SAT` | Flat part of the opening fee the LSP role deducts from a JIT delivery, an integer in 0..4294967295 (default 0) |
+| `BEIGNET_JIT_FEE_PPM` | Proportional part of that fee in millionths of the delivered total, an integer in 0..1000000 (default 0) |
+| `BEIGNET_JIT_MAX_FLAT_FEE_SAT` | Wallet role: most an LSP may quote `POST /jit/invoice` as a flat fee before the intent is refused (default 10000) |
+| `BEIGNET_JIT_MAX_FEE_PPM` | Wallet role: most an LSP may quote as a proportional fee, in millionths (default 50000). Applies whether or not the LSP role is on |
 
 ### Priority Order
 
@@ -1807,7 +1812,8 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
 | POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds |
 | POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address |
-| POST | `/invoice/create` | `{ amountSats?, description? }` | Create invoice (omit amountSats for amount-less) |
+| POST | `/invoice/create` | `{ amountSats?, description?, minFinalCltvExpiry? }` | Create invoice (omit amountSats for amount-less; `minFinalCltvExpiry` buys final-CLTV headroom for a receive an LSP may settle through a splice) |
+| POST | `/jit/invoice` | `{ lspPubkey, amountSats?, description?, expirySecs?, targetRemainingInboundSat?, maxFlatFeeSat?, maxFeePpm? }` | Create an invoice payable with no channel: registers a receive intent with the LSP, which funds a channel mid-payment and deducts the quoted opening fee. Returns the invoice plus `flatFeeSat` and `feePpm` |
 | POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel) |
 | POST | `/invoice/settle-hold` | `{ preimage }` | Settle a parked hold invoice (fulfills all MPP parts) |
 | POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |

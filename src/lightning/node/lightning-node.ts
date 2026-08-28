@@ -161,11 +161,15 @@ import {
 } from '../message/custom';
 import {
 	IHeldJitPart,
+	IJitReceiveAck,
 	IJitReceiveConfig,
 	IPersistedHeldPart,
 	JitReceiveManager,
+	decodeJitAck,
 	decodeJitAuthorization,
-	encodeJitAck
+	encodeJitAck,
+	encodeJitAuthorization,
+	jitOpeningFeeMsat
 } from '../liquidity/jit-receive';
 import {
 	INodeConfig,
@@ -445,6 +449,48 @@ const PAYER_UNDERSTOOD_INVOICE_FEATURES: ReadonlySet<number> = new Set([
 const FUNDING_FORGET_BLOCKS = 2016;
 
 /**
+ * How long `requestJitReceive` waits for the LSP's ack. Kept at 15 s because
+ * the round trip sits inside the caller's own request budget: the daemon's
+ * only consumer allows 20 s for the whole POST /jit/invoice call, so raising
+ * this turns an LSP that is merely slow into a client-side timeout with an
+ * intent registered anyway.
+ */
+const JIT_RECEIVE_ACK_TIMEOUT_MS = 15_000;
+
+/** Default lifetime asked for a receive intent when the caller says nothing. */
+const JIT_RECEIVE_DEFAULT_EXPIRY_SECONDS = 3600;
+
+/**
+ * Cap an amount-less JIT invoice asks the LSP to hold and fund against. It
+ * bounds the LSP's side only; what bounds OUR exposure is the fee quote, which
+ * is charged against the total the payment declares rather than against this.
+ */
+const JIT_RECEIVE_DEFAULT_MAX_MSAT = 1_000_000_000n;
+
+/**
+ * cltv_expiry_delta advertised in the JIT routing hint. The LSP has to fund a
+ * channel between receiving the HTLC and forwarding it, so the sender is asked
+ * for materially more headroom than an ordinary hop would need; the engine's
+ * own minCltvDeltaBlocks (40 by default) is what it then enforces on arrival.
+ */
+const JIT_RECEIVE_HINT_CLTV_DELTA = 80;
+
+/**
+ * Final-CLTV headroom a JIT invoice asks payers for. Blocks mined while the
+ * LSP is funding must not push the delivered HTLC under our own minimum.
+ */
+const JIT_RECEIVE_MIN_FINAL_CLTV_EXPIRY = 72;
+
+/**
+ * Wallet-role refusal ceilings on an LSP's opening-fee quote. Blunt guards,
+ * not a price: they exist so a peer cannot answer an intent with a quote the
+ * operator never agreed to and have the wallet register an allowance for it.
+ * Both are configurable through `jitReceiveClient`.
+ */
+export const JIT_CLIENT_MAX_FLAT_FEE_SAT = 10_000n;
+export const JIT_CLIENT_MAX_FEE_PPM = 50_000;
+
+/**
  * A signed funding transaction and whether BOLT 2 yet obliges us to put it on
  * the network.
  *
@@ -714,6 +760,21 @@ export class LightningNode extends EventEmitter {
 	private asyncPaymentManager: AsyncPaymentManager;
 	/** JIT channel receive engine (LSP role); set when config.jitReceive.enabled. */
 	private jitReceiveManager?: JitReceiveManager;
+	/** JIT receive, wallet role: refusal ceilings on an LSP's fee quote. */
+	private readonly jitClientMaxFlatFeeSat: bigint;
+	private readonly jitClientMaxFeePpm: number;
+	/**
+	 * Skim already conceded to a JIT LSP, keyed by incoming HTLC. The bound is
+	 * AGGREGATE across a payment's parts, so what each part is allowed to be
+	 * short by depends on what its siblings already took; a per-part bound
+	 * would let an MPP payment be skimmed the whole fee on every part.
+	 * In-memory: it only has to outlive an HTLC set in flight, and a restart
+	 * fails those parts back rather than settling them.
+	 */
+	private jitSkimTaken = new Map<
+		string,
+		{ hashHex: string; shortfallMsat: bigint }
+	>();
 	// LSP-side: forwards parked for offline receivers, keyed by payment hash hex.
 	private heldForwards: Map<
 		string,
@@ -1284,6 +1345,10 @@ export class LightningNode extends EventEmitter {
 		if (config.jitReceive?.enabled) {
 			this.wireJitReceive(config.jitReceive);
 		}
+		this.jitClientMaxFlatFeeSat =
+			config.jitReceiveClient?.maxFlatFeeSat ?? JIT_CLIENT_MAX_FLAT_FEE_SAT;
+		this.jitClientMaxFeePpm =
+			config.jitReceiveClient?.maxFeePpm ?? JIT_CLIENT_MAX_FEE_PPM;
 
 		// Resolved once and held: the PeerManager's disconnect-time redials and
 		// the startup recovery below must answer to the same switch, or turning
@@ -13087,6 +13152,24 @@ export class LightningNode extends EventEmitter {
 			throw new Error('Must specify either description or descriptionHash');
 		}
 
+		// A JIT allowance is an authorization to be paid LESS than the onion
+		// says, so a malformed quote must not reach the invoice record: it is
+		// read back at settle time and a NaN or negative there would size the
+		// allowance out of BigInt() while an HTLC waits.
+		const jitFee = options.jitFeeAllowance;
+		if (jitFee !== undefined) {
+			for (const [field, value] of [
+				['flatFeeSat', jitFee.flatFeeSat],
+				['feePpm', jitFee.feePpm]
+			] as const) {
+				if (!Number.isSafeInteger(value) || value < 0) {
+					throw new Error(
+						`jitFeeAllowance.${field} must be a non-negative integer`
+					);
+				}
+			}
+		}
+
 		// Hold invoice with an externally-held preimage: the caller supplies only
 		// the hash, so we never learn the preimage until settle time. Otherwise we
 		// generate the preimage ourselves (and can hold it for a hold invoice).
@@ -13191,23 +13274,7 @@ export class LightningNode extends EventEmitter {
 		// Persist
 		const createdAtSecs = Math.floor(Date.now() / 1000);
 
-		this.persistInvoiceRecords(
-			paymentHash,
-			{
-				paymentHash: paymentHash.toString('hex'),
-				bolt11: invoiceStr,
-				amountMsat: options.amountMsat,
-				description: options.description,
-				expiry: options.expiry ?? DEFAULT_EXPIRY,
-				createdAt: createdAtSecs,
-				hold: options.hold
-			},
-			preimage,
-			paymentSecret
-		);
-
-		// Store invoice info
-		this.invoices.set(paymentHash.toString('hex'), {
+		const record: IInvoiceInfo = {
 			paymentHash: paymentHash.toString('hex'),
 			bolt11: invoiceStr,
 			amountMsat: options.amountMsat,
@@ -13215,7 +13282,16 @@ export class LightningNode extends EventEmitter {
 			expiry: options.expiry ?? DEFAULT_EXPIRY,
 			createdAt: createdAtSecs,
 			hold: options.hold
-		});
+		};
+		// The allowance rides the invoice, so it survives a restart between
+		// issuing and payment: held apart it would be gone by the time the
+		// skimmed HTLC arrived, and a legitimate JIT receive would fail.
+		if (jitFee) record.jitFee = { ...jitFee };
+
+		this.persistInvoiceRecords(paymentHash, record, preimage, paymentSecret);
+
+		// Store invoice info
+		this.invoices.set(paymentHash.toString('hex'), { ...record });
 
 		return { bolt11: invoiceStr, paymentHash, paymentSecret };
 	}
@@ -14707,7 +14783,8 @@ export class LightningNode extends EventEmitter {
 		hopPayload: IHopPayload | undefined,
 		incomingCltvExpiry: number | undefined,
 		amountMsat: bigint,
-		hashHex: string
+		hashHex: string,
+		htlcKey: string
 	): Buffer | null {
 		const fail = (code: number): Buffer =>
 			sharedSecret
@@ -14764,16 +14841,36 @@ export class LightningNode extends EventEmitter {
 		// final_incorrect_htlc_amount: the HTLC amount MUST be >= the onion's
 		// amt_to_forward. This catches a hop that skimmed the amount even for
 		// keysend / zero-amount invoices, which have no invoice-amount check.
+		//
+		// The one exception is a JIT receive whose invoice registered an
+		// opening-fee allowance (issue #595). The LSP takes its fee out of a
+		// forward whose onion it cannot rewrite, so the shortfall lands here;
+		// admitJitSkim accepts it only up to the fee quoted on the declared
+		// total, counted across the whole HTLC set. With no allowance
+		// registered nothing below changes, which is every other invoice.
 		if (
 			hopPayload?.amountToForwardMsat !== undefined &&
 			amountMsat < hopPayload.amountToForwardMsat
 		) {
-			this.emitStructuredLog('htlc', 'final_incorrect_htlc_amount', {
-				paymentHash: hashHex,
-				received: amountMsat.toString(),
-				amtToForward: hopPayload.amountToForwardMsat.toString()
-			});
-			return fail(FINAL_INCORRECT_HTLC_AMOUNT);
+			const declaredTotalMsat =
+				hopPayload.totalMsat ??
+				hopPayload.totalAmountMsat ??
+				hopPayload.amountToForwardMsat;
+			if (
+				!this.admitJitSkim(
+					hashHex,
+					htlcKey,
+					hopPayload.amountToForwardMsat - amountMsat,
+					declaredTotalMsat
+				)
+			) {
+				this.emitStructuredLog('htlc', 'final_incorrect_htlc_amount', {
+					paymentHash: hashHex,
+					received: amountMsat.toString(),
+					amtToForward: hopPayload.amountToForwardMsat.toString()
+				});
+				return fail(FINAL_INCORRECT_HTLC_AMOUNT);
+			}
 		}
 
 		return null;
@@ -14802,7 +14899,8 @@ export class LightningNode extends EventEmitter {
 			hopPayload,
 			incomingCltvExpiry,
 			amountMsat,
-			hashHex
+			hashHex,
+			htlcSecretKey
 		);
 		if (safetyReason) {
 			this.cleanupHtlcSharedSecret(htlcSecretKey);
@@ -15311,6 +15409,7 @@ export class LightningNode extends EventEmitter {
 	private markHoldInvoiceCancelled(hashHex: string): void {
 		this.preimages.delete(hashHex);
 		this.paymentSecrets.delete(hashHex);
+		this.clearJitSkim(hashHex);
 		const mutations: RecoveryMutation[] = [
 			{ type: 'delete_payment_secret', paymentHash: hashHex }
 		];
@@ -15636,6 +15735,256 @@ export class LightningNode extends EventEmitter {
 		});
 	}
 
+	// ─────────────── JIT channel receive (wallet role, issue #595) ───────────
+
+	/**
+	 * Register a receive intent with an LSP and return the routing hint that
+	 * makes an invoice payable through a channel that does not exist yet.
+	 *
+	 * The intent is one round trip over the beignet custom message type
+	 * (#546): we send an authorization naming what we will accept, the LSP
+	 * mints an intercept SCID and answers with it plus its opening-fee quote.
+	 * The caller then puts the hint in `createInvoice({ extraRoutingHints })`
+	 * and the quote in `jitFeeAllowance`, which is what lets the skimmed HTLC
+	 * settle at our final hop.
+	 *
+	 * A quote above our ceilings is REFUSED here rather than carried into an
+	 * invoice: an ack is the peer's number, and registering an allowance for
+	 * it would authorize a deduction the operator never agreed to.
+	 */
+	async requestJitReceive(
+		lspPubkeyHex: string,
+		params: {
+			/** Bind the intent to one payment hash (optional). */
+			paymentHash?: Buffer;
+			/** Hard cap the LSP may hold and fund against (msat). */
+			maxAmountMsat: bigint;
+			/** Invoice total when it is known (fixed-amount invoices). */
+			expectedTotalMsat?: bigint;
+			/** Inbound we want left over after the receive (sat). */
+			targetRemainingInboundSat: bigint;
+			expirySeconds?: number;
+			timeoutMs?: number;
+			/** Per-request overrides of the configured quote ceilings. */
+			maxFlatFeeSat?: bigint;
+			maxFeePpm?: number;
+		}
+	): Promise<{
+		interceptScid: Buffer;
+		hint: IRoutingHintHop;
+		flatFeeSat: bigint;
+		feePpm: number;
+	}> {
+		const pubkeyErr = validateHexPubkey(lspPubkeyHex, 'lspPubkeyHex');
+		if (pubkeyErr) throw new Error(pubkeyErr);
+		if (params.maxAmountMsat <= 0n) {
+			throw new Error('maxAmountMsat must be positive');
+		}
+		// Our own correlation id: the LSP mints the SCID, so until the ack
+		// arrives this is the only thing tying an answer to this request.
+		const requestId = crypto.randomBytes(8);
+
+		let cleanup = (): void => undefined;
+		const ackPromise = new Promise<IJitReceiveAck>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				cleanup();
+				reject(new Error('timed out waiting for the LSP JIT receive ack'));
+			}, params.timeoutMs ?? JIT_RECEIVE_ACK_TIMEOUT_MS);
+			timer.unref?.();
+			const onMsg = (msg: {
+				peerPubkey: string;
+				subtype: number;
+				payload: Buffer;
+			}): void => {
+				if (msg.peerPubkey !== lspPubkeyHex) return;
+				if (msg.subtype !== BeignetCustomSubtype.JIT_RECEIVE_ACK) return;
+				let ack: IJitReceiveAck;
+				try {
+					ack = decodeJitAck(msg.payload);
+				} catch {
+					return; // malformed ack: keep waiting for a well-formed one
+				}
+				if (!ack.requestId.equals(requestId)) return;
+				cleanup();
+				resolve(ack);
+			};
+			cleanup = (): void => {
+				clearTimeout(timer);
+				this.removeListener('custom-message', onMsg);
+			};
+			this.on('custom-message', onMsg);
+		});
+
+		try {
+			this.sendCustomMessage(
+				lspPubkeyHex,
+				BeignetCustomSubtype.JIT_RECEIVE_AUTHORIZATION,
+				encodeJitAuthorization({
+					requestId,
+					paymentHash: params.paymentHash,
+					maxAmountMsat: params.maxAmountMsat,
+					expectedTotalMsat: params.expectedTotalMsat,
+					targetRemainingInboundSat: params.targetRemainingInboundSat,
+					expirySeconds:
+						params.expirySeconds ?? JIT_RECEIVE_DEFAULT_EXPIRY_SECONDS,
+					// The LSP refuses an intent it would charge a fee on unless we
+					// say this, because it cannot rewrite the onion and BOLT 4 would
+					// have us fail the short HTLC after the channel was funded.
+					acceptsSkimmedFee: true
+				})
+			);
+		} catch (err) {
+			// The listener and the timer are already armed at this point; without
+			// this the failed request would leave both behind and the node would
+			// accumulate one of each per unsendable intent.
+			cleanup();
+			throw err;
+		}
+
+		const ack = await ackPromise;
+		if (!ack.accepted) {
+			throw new Error(
+				`LSP declined the JIT receive intent: ${
+					ack.reason ?? 'no reason given'
+				}`
+			);
+		}
+		// An accepted ack whose SCID is the refusal placeholder would produce a
+		// hint routing to nothing, so the invoice would simply be unpayable.
+		if (ack.interceptScid.every((b) => b === 0)) {
+			throw new Error('LSP accepted the intent without an intercept scid');
+		}
+		const maxFlatFeeSat = params.maxFlatFeeSat ?? this.jitClientMaxFlatFeeSat;
+		const maxFeePpm = params.maxFeePpm ?? this.jitClientMaxFeePpm;
+		if (ack.flatFeeSat > maxFlatFeeSat || ack.feePpm > maxFeePpm) {
+			throw new Error(
+				`LSP quoted ${ack.flatFeeSat} sat + ${ack.feePpm} ppm, above the ` +
+					`accepted maximum of ${maxFlatFeeSat} sat + ${maxFeePpm} ppm`
+			);
+		}
+		return {
+			interceptScid: ack.interceptScid,
+			hint: {
+				pubkey: Buffer.from(lspPubkeyHex, 'hex'),
+				shortChannelId: ack.interceptScid,
+				// The LSP is paid by the skim, not by a hop fee: a non-zero fee
+				// here would have the sender over-deliver on top of the deduction.
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0,
+				cltvExpiryDelta: JIT_RECEIVE_HINT_CLTV_DELTA
+			},
+			flatFeeSat: ack.flatFeeSat,
+			feePpm: ack.feePpm
+		};
+	}
+
+	/**
+	 * Wallet side of JIT receive end to end: register the intent, then issue an
+	 * invoice carrying the intercept hint, the extra final-CLTV headroom
+	 * on-the-fly funding needs, and the allowance for the quoted opening fee.
+	 */
+	async createJitInvoice(opts: {
+		lspPubkeyHex: string;
+		amountMsat?: bigint;
+		description?: string;
+		expiry?: number;
+		/** Inbound to leave over after the receive (sat); default none. */
+		targetRemainingInboundSat?: bigint;
+		/** Cap the LSP may fund against for an amount-less invoice (msat). */
+		maxAmountMsat?: bigint;
+		maxFlatFeeSat?: bigint;
+		maxFeePpm?: number;
+		timeoutMs?: number;
+	}): Promise<
+		ICreateInvoiceResult & {
+			interceptScid: Buffer;
+			flatFeeSat: bigint;
+			feePpm: number;
+		}
+	> {
+		const expiry = opts.expiry ?? JIT_RECEIVE_DEFAULT_EXPIRY_SECONDS;
+		const maxAmountMsat =
+			opts.amountMsat ?? opts.maxAmountMsat ?? JIT_RECEIVE_DEFAULT_MAX_MSAT;
+		const grant = await this.requestJitReceive(opts.lspPubkeyHex, {
+			maxAmountMsat,
+			...(opts.amountMsat !== undefined
+				? { expectedTotalMsat: opts.amountMsat }
+				: {}),
+			targetRemainingInboundSat: opts.targetRemainingInboundSat ?? 0n,
+			expirySeconds: expiry,
+			...(opts.maxFlatFeeSat !== undefined
+				? { maxFlatFeeSat: opts.maxFlatFeeSat }
+				: {}),
+			...(opts.maxFeePpm !== undefined ? { maxFeePpm: opts.maxFeePpm } : {}),
+			...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {})
+		});
+		const result = this.createInvoice({
+			amountMsat: opts.amountMsat,
+			description: opts.description ?? '',
+			expiry,
+			minFinalCltvExpiry: JIT_RECEIVE_MIN_FINAL_CLTV_EXPIRY,
+			extraRoutingHints: [[grant.hint]],
+			// The quote, never a msat figure: the allowance is sized against the
+			// total the payment declares, so an amount-less invoice authorizes
+			// only the fee owed on what actually arrives.
+			jitFeeAllowance: {
+				flatFeeSat: Number(grant.flatFeeSat),
+				feePpm: grant.feePpm
+			}
+		});
+		return {
+			...result,
+			interceptScid: grant.interceptScid,
+			flatFeeSat: grant.flatFeeSat,
+			feePpm: grant.feePpm
+		};
+	}
+
+	/**
+	 * Skim the LSP may still take on this payment, or null when the shortfall
+	 * exceeds it. Recording the concession is what makes the bound aggregate:
+	 * the fee is quoted once on the whole delivery, so a second part may only
+	 * be short by what the first left unused. A re-dispatched HTLC replaces its
+	 * own earlier record rather than adding to it.
+	 */
+	private admitJitSkim(
+		hashHex: string,
+		htlcKey: string,
+		shortfallMsat: bigint,
+		declaredTotalMsat: bigint
+	): boolean {
+		const quote = this.invoices.get(hashHex)?.jitFee;
+		if (!quote) return false;
+		const allowanceMsat = jitOpeningFeeMsat(declaredTotalMsat, {
+			flatFeeSat: BigInt(Math.max(0, Math.floor(quote.flatFeeSat))),
+			feePpm: quote.feePpm
+		});
+		if (allowanceMsat <= 0n) return false;
+		let claimed = shortfallMsat;
+		for (const [key, taken] of this.jitSkimTaken) {
+			if (key !== htlcKey && taken.hashHex === hashHex) {
+				claimed += taken.shortfallMsat;
+			}
+		}
+		if (claimed > allowanceMsat) return false;
+		this.jitSkimTaken.set(htlcKey, { hashHex, shortfallMsat });
+		this.emitStructuredLog('htlc', 'jit_fee_skim_accepted', {
+			paymentHash: hashHex,
+			shortfallMsat: shortfallMsat.toString(),
+			claimedMsat: claimed.toString(),
+			allowanceMsat: allowanceMsat.toString()
+		});
+		return true;
+	}
+
+	/** Forget every skim conceded against a payment (terminal outcome). */
+	private clearJitSkim(hashHex: string): void {
+		if (this.jitSkimTaken.size === 0) return;
+		for (const [key, taken] of this.jitSkimTaken) {
+			if (taken.hashHex === hashHex) this.jitSkimTaken.delete(key);
+		}
+	}
+
 	/** Does any channel of ours answer to this SCID (real, alias, or mapping)? */
 	private scidAddressesAChannel(scidHex: string): boolean {
 		if (this.scidToChannelId.has(scidHex)) return true;
@@ -15764,6 +16113,7 @@ export class LightningNode extends EventEmitter {
 				this.channelManager.failHtlc(p.channelId, p.htlcId, partReason);
 			}
 			this.pendingMppPayments.delete(hashHex);
+			this.clearJitSkim(hashHex);
 			const secretKey = `${channelId.toString('hex')}:${htlcId}`;
 			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
 			const reason = sharedSecret
@@ -15824,6 +16174,9 @@ export class LightningNode extends EventEmitter {
 				this.channelManager.fulfillHtlc(p.channelId, p.htlcId, preimage);
 			}
 			this.pendingMppPayments.delete(hashHex);
+			// Settle here goes straight to fulfillHtlc, so this is the MPP set's
+			// only terminal point: the JIT allowance it consumed retires with it.
+			this.clearJitSkim(hashHex);
 
 			// Update payment status
 			const payment = this.payments.get(hashHex);
@@ -15861,6 +16214,7 @@ export class LightningNode extends EventEmitter {
 					}
 				}
 				this.pendingMppPayments.delete(hashHex);
+				this.clearJitSkim(hashHex);
 			}
 		}
 	}
@@ -15874,6 +16228,7 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		// Clean up shared secret on fulfillment
 		this.cleanupHtlcSharedSecret(`${channelId.toString('hex')}:${htlcId}`);
+		this.clearJitSkim(hashHex);
 
 		// Deliver the preimage to the chain monitors so this received HTLC can be
 		// claimed on-chain if the channel force-closes before/around settlement
@@ -18776,6 +19131,7 @@ export class LightningNode extends EventEmitter {
 			forwardingFeePropMillionths?: number;
 			forwardingCltvDelta?: number;
 			jitReceive?: INodeConfig['jitReceive'];
+			jitReceiveClient?: INodeConfig['jitReceiveClient'];
 			leaseRates?: import('../gossip/types').ILeaseRates;
 			eagerGossipVerify?: boolean;
 			sweepDestinationScript?: Buffer;
@@ -18837,6 +19193,7 @@ export class LightningNode extends EventEmitter {
 			forwardingFeePropMillionths: options?.forwardingFeePropMillionths,
 			forwardingCltvDelta: options?.forwardingCltvDelta,
 			jitReceive: options?.jitReceive,
+			jitReceiveClient: options?.jitReceiveClient,
 			leaseRates: options?.leaseRates,
 			eagerGossipVerify: options?.eagerGossipVerify,
 			localFeatures: options?.localFeatures,
@@ -19501,6 +19858,9 @@ export class LightningNode extends EventEmitter {
 			this.invoices.delete(hashHex);
 			this.payments.delete(hashHex);
 			this.offerManager.removeInvoiceState(hashHex);
+			// The allowance lives ON the invoice record, so dropping the record
+			// already withdraws it; this drops what an in-flight part conceded.
+			this.clearJitSkim(hashHex);
 		}
 		this.emitStructuredLog('payment', 'issued_invoice_sweep', {
 			removed: toRemove.length,
@@ -20400,6 +20760,10 @@ export class LightningNode extends EventEmitter {
 	private cleanupHtlcSharedSecret(key: string): void {
 		this.receivedHtlcSharedSecrets.delete(key);
 		this.blindedIncomingHtlcs.delete(key);
+		// This runs at every per-HTLC terminal point on the receive path, which
+		// is exactly where a conceded JIT skim stops counting: a part failed
+		// after being admitted must not keep spending the payment's allowance.
+		this.jitSkimTaken.delete(key);
 		// Journaled, so a reconstruction does not resurrect the secret of an
 		// HTLC that already resolved.
 		this.commitMutations('deleteHtlcSharedSecret', [

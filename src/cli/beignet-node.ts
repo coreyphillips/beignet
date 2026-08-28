@@ -269,6 +269,20 @@ export interface BeignetNodeOptions {
 	 */
 	leaseRates?: import('../lightning/gossip/types').ILeaseRates;
 	/**
+	 * JIT channel receive (issue #595). `enabled` turns on the LSP role, which
+	 * fronts channel funding with this node's own coins for wallet peers and
+	 * charges flatFeeSat + feePpm for it. maxFlatFeeSat / maxFeePpm are the
+	 * other role, and apply whether or not the LSP role is on: they cap what
+	 * this node accepts when it asks an LSP for a JIT receive of its own.
+	 */
+	jitReceive?: {
+		enabled?: boolean;
+		flatFeeSat?: number;
+		feePpm?: number;
+		maxFlatFeeSat?: number;
+		maxFeePpm?: number;
+	};
+	/**
 	 * Request a gossip graph sync from each peer on connect (default true).
 	 * Without this the node only knows its own channels and cannot route
 	 * multi-hop payments to destinations beyond its direct peers.
@@ -890,6 +904,31 @@ function requireNonNegativeSafeInteger(value: unknown, field: string): number {
 }
 
 /**
+ * Blocks of final-CLTV headroom an invoice may ask payers for. The value goes
+ * straight into the BOLT 11 `c` tag, so an absurd one produces a syntactically
+ * valid invoice that no sender will pay: 2016 is a fortnight of blocks, well
+ * past any real settlement window and under the max_cltv_expiry senders cap
+ * whole routes at. Floor 1, since zero leaves no window to claim at all.
+ */
+const MAX_MIN_FINAL_CLTV_EXPIRY = 2016;
+
+function requireFinalCltvExpiry(value: unknown): number {
+	if (
+		typeof value !== 'number' ||
+		!Number.isInteger(value) ||
+		value < 1 ||
+		value > MAX_MIN_FINAL_CLTV_EXPIRY
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`minFinalCltvExpiry must be an integer between 1 and ` +
+				`${MAX_MIN_FINAL_CLTV_EXPIRY} blocks`
+		);
+	}
+	return value;
+}
+
+/**
  * A millisatoshi field that reaches the library as a bigint but is accepted
  * from callers as a number or a decimal string. BigInt() is the only thing
  * that ever validated it, by throwing, so both spellings are checked here
@@ -1012,6 +1051,46 @@ export function leaseRatesRefusal(value: unknown): string | null {
 				`${field} must be an integer between 0 and ${max} ` +
 				`(got ${String(v)})`
 			);
+		}
+	}
+	return null;
+}
+
+/**
+ * Wire and arithmetic bounds of the JIT receive fee fields. The ack writes
+ * flatFeeSat as a u64 and feePpm as a u32, but a ppm above a million is a fee
+ * larger than the payment it is taken from, which is not a policy anybody can
+ * mean, and it would have the LSP refuse every one of its own fundings.
+ */
+const JIT_FEE_FIELD_MAX: ReadonlyArray<[string, number]> = [
+	['flatFeeSat', 0xffffffff],
+	['feePpm', 1_000_000],
+	['maxFlatFeeSat', 0xffffffff],
+	['maxFeePpm', 1_000_000]
+];
+
+/**
+ * Why a JIT receive config is unacceptable, or null when it is valid. Shared
+ * by daemon startup (naming the BEIGNET_JIT_* variables) and BeignetNode.init
+ * (naming the option), so both entry paths refuse the same values. `enabled`
+ * is the only boolean and is checked separately: integerEnv surfaces a partly
+ * numeric env value as NaN, which every numeric field below rejects.
+ */
+export function jitReceiveRefusal(value: unknown): string | null {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return 'must be an object';
+	}
+	const record = value as Record<string, unknown>;
+	if (record.enabled !== undefined && typeof record.enabled !== 'boolean') {
+		return `enabled must be a boolean (got ${String(record.enabled)})`;
+	}
+	for (const [field, max] of JIT_FEE_FIELD_MAX) {
+		const v = record[field];
+		if (v === undefined) continue;
+		if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > max) {
+			return `${field} must be an integer between 0 and ${max} (got ${String(
+				v
+			)})`;
 		}
 	}
 	return null;
@@ -1392,6 +1471,12 @@ export class BeignetNode extends EventEmitter {
 				throw new BeignetError('INVALID_PARAMS', `leaseRates: ${refusal}`);
 			}
 		}
+		if (opts.jitReceive !== undefined) {
+			const refusal = jitReceiveRefusal(opts.jitReceive);
+			if (refusal !== null) {
+				throw new BeignetError('INVALID_PARAMS', `jitReceive: ${refusal}`);
+			}
+		}
 		const networkName = this.networkName;
 
 		// 2. Acquire the single-instance lock before touching storage. Two
@@ -1737,6 +1822,33 @@ export class BeignetNode extends EventEmitter {
 			forwardingFeePropMillionths: opts.routingFeePpm,
 			forwardingCltvDelta: opts.routingCltvDelta,
 			leaseRates: opts.leaseRates,
+			// The LSP engine only exists when explicitly switched on; the client
+			// ceilings apply either way, because asking an LSP for a JIT receive
+			// is not the same role as being one.
+			jitReceive:
+				opts.jitReceive?.enabled === true
+					? {
+							enabled: true,
+							...(opts.jitReceive.flatFeeSat !== undefined
+								? { flatFeeSat: BigInt(opts.jitReceive.flatFeeSat) }
+								: {}),
+							...(opts.jitReceive.feePpm !== undefined
+								? { feePpm: opts.jitReceive.feePpm }
+								: {})
+					  }
+					: undefined,
+			jitReceiveClient:
+				opts.jitReceive?.maxFlatFeeSat !== undefined ||
+				opts.jitReceive?.maxFeePpm !== undefined
+					? {
+							...(opts.jitReceive.maxFlatFeeSat !== undefined
+								? { maxFlatFeeSat: BigInt(opts.jitReceive.maxFlatFeeSat) }
+								: {}),
+							...(opts.jitReceive.maxFeePpm !== undefined
+								? { maxFeePpm: opts.jitReceive.maxFeePpm }
+								: {})
+					  }
+					: undefined,
 			eagerGossipVerify: opts.eagerGossipVerify ?? false,
 			localFeatures: LightningNode.defaultFeatures(),
 			chainHashes: [chainHash],
@@ -5216,7 +5328,8 @@ export class BeignetNode extends EventEmitter {
 		amountSats?: number,
 		description?: string,
 		expirySecs?: number,
-		descriptionHash?: Buffer
+		descriptionHash?: Buffer,
+		minFinalCltvExpiry?: number
 	): InvoiceInfo {
 		// Zero and undefined both mean "amountless invoice"; anything else has
 		// to survive BigInt(), which a fractional amountSats does not (#474).
@@ -5229,7 +5342,12 @@ export class BeignetNode extends EventEmitter {
 			amountMsat,
 			description: descriptionHash ? undefined : description || '',
 			descriptionHash,
-			expiry: expirySecs
+			expiry: expirySecs,
+			// Extra final-CLTV headroom for a receive whose settlement may fund a
+			// channel on the fly (a JIT open, or an LSP splice).
+			...(minFinalCltvExpiry !== undefined
+				? { minFinalCltvExpiry: requireFinalCltvExpiry(minFinalCltvExpiry) }
+				: {})
 		});
 		const info: InvoiceInfo = {
 			bolt11: result.bolt11,
@@ -5238,6 +5356,78 @@ export class BeignetNode extends EventEmitter {
 			amountSats: amountSats || undefined
 		};
 		if (expirySecs !== undefined) info.expiry = expirySecs;
+		return info;
+	}
+
+	/**
+	 * Wallet side of JIT receive as one call: register the intent with the LSP
+	 * over the beignet custom-message protocol and return an invoice payable
+	 * through a channel that does not exist yet. The LSP intercepts the HTLC on
+	 * the intercept SCID in the returned hint, funds the channel, forwards, and
+	 * deducts the quoted opening fee from the delivery.
+	 *
+	 * Needs the LSP peer connected and running the JIT receive engine. A
+	 * declined, timed-out or over-priced intent throws, and no invoice is
+	 * created: nothing then carries an allowance for a fee nobody agreed.
+	 */
+	async createJitInvoice(opts: {
+		lspPubkey: string;
+		amountSats?: number;
+		description?: string;
+		expirySecs?: number;
+		/** Inbound to leave over after the receive (sat). */
+		targetRemainingInboundSat?: number;
+		/** Ceilings on the LSP's quote; default to the node's configured ones. */
+		maxFlatFeeSat?: number;
+		maxFeePpm?: number;
+	}): Promise<InvoiceInfo & { flatFeeSat: number; feePpm: number }> {
+		if (!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
+			);
+		}
+		const amountMsat =
+			opts.amountSats !== undefined && opts.amountSats !== 0
+				? BigInt(requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')) *
+				  1000n
+				: undefined;
+		const result = await this.node.createJitInvoice({
+			lspPubkeyHex: opts.lspPubkey,
+			amountMsat,
+			description: opts.description || '',
+			...(opts.expirySecs !== undefined ? { expiry: opts.expirySecs } : {}),
+			targetRemainingInboundSat: BigInt(
+				requireNonNegativeSafeInteger(
+					opts.targetRemainingInboundSat ?? 0,
+					'targetRemainingInboundSat'
+				)
+			),
+			...(opts.maxFlatFeeSat !== undefined
+				? {
+						maxFlatFeeSat: BigInt(
+							requireNonNegativeSafeInteger(opts.maxFlatFeeSat, 'maxFlatFeeSat')
+						)
+				  }
+				: {}),
+			...(opts.maxFeePpm !== undefined
+				? {
+						maxFeePpm: requireNonNegativeSafeInteger(
+							opts.maxFeePpm,
+							'maxFeePpm'
+						)
+				  }
+				: {})
+		});
+		const info: InvoiceInfo & { flatFeeSat: number; feePpm: number } = {
+			bolt11: result.bolt11,
+			paymentHash: result.paymentHash.toString('hex'),
+			paymentSecret: result.paymentSecret.toString('hex'),
+			amountSats: opts.amountSats || undefined,
+			flatFeeSat: Number(result.flatFeeSat),
+			feePpm: result.feePpm
+		};
+		if (opts.expirySecs !== undefined) info.expiry = opts.expirySecs;
 		return info;
 	}
 

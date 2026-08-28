@@ -441,6 +441,19 @@ export interface INodeConfig {
 	 * ceiling on what this node will front with its own coins.
 	 */
 	jitReceive?: import('../liquidity/jit-receive').IJitReceiveConfig;
+	/**
+	 * JIT channel receive, WALLET role (issue #595): the most this node will
+	 * let an LSP quote before `requestJitReceive` refuses the ack. Separate
+	 * from `jitReceive`, which is the LSP role: a wallet that only receives
+	 * runs no engine, and a node that runs the engine need not buy from
+	 * anybody. Defaults are blunt refusal ceilings, not a price.
+	 */
+	jitReceiveClient?: {
+		/** Flat part ceiling (sat); default JIT_CLIENT_MAX_FLAT_FEE_SAT. */
+		maxFlatFeeSat?: bigint;
+		/** Proportional part ceiling (ppm); default JIT_CLIENT_MAX_FEE_PPM. */
+		maxFeePpm?: number;
+	};
 	/** CLTV delta for forwarding (default 40) */
 	forwardingCltvDelta?: number;
 	/** Base fee in msat for forwarding (default 1000) */
@@ -752,6 +765,15 @@ export interface ICreateInvoiceOptions {
 	 * produce because the channel does not exist yet.
 	 */
 	extraRoutingHints?: IRoutingHintHop[][];
+	/**
+	 * JIT receive, wallet side (issue #595): the opening-fee QUOTE the LSP
+	 * returned in its ack. The final hop then accepts HTLCs short of their
+	 * onion's amt_to_forward by at most that fee, evaluated against the total
+	 * the payment declares and bounded in AGGREGATE across the payment's parts.
+	 * Without it the invoice behaves exactly as any other, so this is the one
+	 * thing that makes a skimmed JIT delivery settle rather than fail BOLT 4.
+	 */
+	jitFeeAllowance?: { flatFeeSat: number; feePpm: number };
 	/**
 	 * Hold invoice: park matching HTLCs instead of settling immediately. The
 	 * payment is held until settleHeldHtlc() (reveals the preimage) or

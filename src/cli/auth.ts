@@ -177,6 +177,11 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 
 	// ── Receive-side mutations (invoice scope) ──
 	'POST /invoice/create': ['invoice'],
+	// Same scope as any other issued invoice: it registers an intent with an
+	// LSP and returns a BOLT 11 string. The funding it may trigger is the
+	// LSP's, out of the LSP's coins, and the fee it authorizes is bounded by
+	// the node's own configured ceilings, not by the caller's.
+	'POST /jit/invoice': ['invoice'],
 	'POST /invoice/create-hold': ['invoice'],
 	'POST /invoice/settle-hold': ['invoice'],
 	'POST /invoice/cancel-hold': ['invoice'],
