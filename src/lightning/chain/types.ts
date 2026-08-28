@@ -141,6 +141,18 @@ export interface ICommitmentBroadcast {
 	 */
 	spentOutpoint?: { txid: string; outputIndex: number };
 	/**
+	 * The per-commitment point that actually BUILT a THEIR_CURRENT commitment
+	 * (issues #573/#574): selected at classification time, when the live
+	 * channel state still distinguishes the two commitments the peer holds
+	 * during the commitment_signed -> revoke_and_ack window. Resolution and
+	 * every later rebuild read it from here instead of the live
+	 * remoteCurrentPerCommitmentPoint, which rotates when the window closes
+	 * and is simply wrong for the newest signed commitment while it is open.
+	 * Absent on records written before this field existed and on non-THEIR
+	 * records; readers fall back to the live current point.
+	 */
+	remotePerCommitmentPoint?: Buffer;
+	/**
 	 * Output indices of this commitment that one of our broadcast claims already
 	 * spends. A penalty batch can also spend settled-HTLC outputs reconstructed
 	 * from revokedHtlcSnapshots, which never become tracked outputs, so the

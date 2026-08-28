@@ -50,7 +50,8 @@ import {
 	resolveTheirCurrentCommitmentOutputs,
 	resolveRevokedCommitmentOutputs,
 	resolveSecondLevelHtlcOutput,
-	extractPreimageFromWitness
+	extractPreimageFromWitness,
+	selectTheirPerCommitmentPoint
 } from '../../src/lightning/chain/output-resolver';
 import {
 	CommitmentType,
@@ -519,6 +520,110 @@ describe('Output Resolver (Phase 4B)', function () {
 			const ourTx = buildLocalCommitment(c1State, ourPoint0, 0n).result.tx;
 			const ours = classifyCommitmentTx(ourTx, c1State);
 			expect(ours.type).to.equal(CommitmentType.OUR_COMMITMENT);
+		});
+
+		it("classifies the peer's still-UNREVOKED previous commitment as THEIR_CURRENT, not ours (issue #573)", function () {
+			// The other half of the C1 window: the peer WITHHOLDS its
+			// revoke_and_ack, so its previous commitment #0 is still fully
+			// valid (no secret stored) while sharing our local index. Index
+			// equality must not read it as OUR close: that tracked zero
+			// outputs and stranded the whole channel balance.
+			const { opener } = setupNormalChannels();
+			const preState = opener.getFullState();
+			const peerPoint0 = preState.remoteCurrentPerCommitmentPoint!;
+			const peerUnrevokedTx = buildRemoteCommitment(preState, peerPoint0, 0n)
+				.result.tx;
+
+			// Half a round WITHOUT the revoke_and_ack: opener signs
+			// (remoteCommitmentNumber 0 -> 1), the peer never revokes #0.
+			const sigs = realCommitmentSigs(opener);
+			opener.signCommitment(sigs.signature, sigs.htlcSignatures);
+
+			const winState = opener.getFullState();
+			expect(winState.localCommitmentNumber).to.equal(0n);
+			expect(winState.remoteCommitmentNumber).to.equal(1n);
+			expect(winState.remoteRevocationNumber).to.equal(0n);
+			expect(winState.shaChainStore.getSecret(MAX_INDEX - 0n)).to.equal(null);
+
+			const verdict = classifyCommitmentTx(peerUnrevokedTx, winState);
+			expect(verdict.type).to.equal(CommitmentType.THEIR_CURRENT_COMMITMENT);
+			expect(verdict.commitmentNumber).to.equal(0n);
+
+			// The verdict's output pass tracks the peer tx's outputs: our
+			// whole balance rides to_remote, and their to_local (the pushed
+			// 200k) matches under the unrevoked point.
+			const tracked = classifyOutputs(
+				peerUnrevokedTx,
+				winState,
+				verdict.type,
+				verdict.commitmentNumber
+			);
+			expect(
+				tracked.some((o) => o.outputType === OutputType.TO_REMOTE),
+				'our balance tracked'
+			).to.equal(true);
+			expect(
+				tracked.some((o) => o.outputType === OutputType.TO_LOCAL),
+				'their to_local matched under the unrevoked point'
+			).to.equal(true);
+
+			// C1 constraint preserved: our OWN commitment #0 in the same
+			// state still classifies as ours.
+			const ourPoint0 = perCommitmentPointFromSecret(
+				generateFromSeed(winState.localPerCommitmentSeed, MAX_INDEX - 0n)
+			);
+			const ourTx = buildLocalCommitment(winState, ourPoint0, 0n).result.tx;
+			expect(classifyCommitmentTx(ourTx, winState).type).to.equal(
+				CommitmentType.OUR_COMMITMENT
+			);
+		});
+
+		it("resolves the peer's NEWLY SIGNED pre-revocation commitment with the point that built it (issue #574)", function () {
+			// Same window, other commitment: the peer force-closes on the
+			// #1 we just signed, which was built with the NEXT per-commitment
+			// point. remoteCurrentPerCommitmentPoint still holds point(0)
+			// until the revoke_and_ack, so deriving from it matched nothing
+			// point-dependent and lost every in-flight HTLC and their
+			// to_local tracking.
+			const { opener } = setupNormalChannels();
+			const preState = opener.getFullState();
+			const nextPoint = preState.remoteNextPerCommitmentPoint!;
+			const currentPoint = preState.remoteCurrentPerCommitmentPoint!;
+			expect(nextPoint.equals(currentPoint)).to.equal(false);
+
+			const sigs = realCommitmentSigs(opener);
+			opener.signCommitment(sigs.signature, sigs.htlcSignatures);
+			const winState = opener.getFullState();
+
+			const peerNewTx = buildRemoteCommitment(winState, nextPoint, 1n).result
+				.tx;
+			const verdict = classifyCommitmentTx(peerNewTx, winState);
+			expect(verdict.type).to.equal(CommitmentType.THEIR_CURRENT_COMMITMENT);
+			expect(verdict.commitmentNumber).to.equal(1n);
+
+			// The selector picks the point that BUILT the tx, and the output
+			// pass therefore matches their to_local, not just our static
+			// to_remote.
+			expect(
+				selectTheirPerCommitmentPoint(peerNewTx, winState, 1n)!.equals(
+					nextPoint
+				),
+				'next point selected'
+			).to.equal(true);
+			const tracked = classifyOutputs(
+				peerNewTx,
+				winState,
+				verdict.type,
+				verdict.commitmentNumber
+			);
+			expect(
+				tracked.some((o) => o.outputType === OutputType.TO_REMOTE),
+				'our balance tracked'
+			).to.equal(true);
+			expect(
+				tracked.some((o) => o.outputType === OutputType.TO_LOCAL),
+				'their to_local matched under the NEXT point'
+			).to.equal(true);
 		});
 
 		it('should classify a commitment beyond our remote number as THEIR_FUTURE_COMMITMENT', function () {
