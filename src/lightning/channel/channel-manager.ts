@@ -73,6 +73,7 @@ import {
 	CommitmentType,
 	IFeeBumpAndBroadcastChainAction,
 	IFundingSpendScan,
+	IRREVOCABLE_DEPTH,
 	satPerVbyteToSatPerKw
 } from '../chain/types';
 import {
@@ -585,7 +586,7 @@ export class ChannelManager extends EventEmitter {
 	private _currentBlockHeight = 0;
 	// Anchor force-close commitment CPFPs awaiting confirmation, keyed by channelId
 	// hex. Retained so a stuck commitment package can be re-CPFP'd at a higher feerate
-	// each block (reCpfpStuckCommitments) until the commitment confirms.
+	// each block (reCpfpStuckCommitments) until the commitment reaches irrevocable depth.
 	private _pendingCommitmentCpfp: Map<
 		string,
 		{
@@ -597,6 +598,13 @@ export class ChannelManager extends EventEmitter {
 			// cycle even at an unchanged feerate, so a CPFP is re-attempted once wallet
 			// change confirms instead of being permanently blocked by the feerate gate.
 			lastAttemptFailed?: boolean;
+			// The tracked commitment has been seen CONFIRMED while this entry was
+			// parked. If it ever reads unconfirmed again a reorg demoted it, and the
+			// package may be out of the mempool entirely, so the next re-CPFP pass
+			// skips the pacing gates instead of waiting them out (issue #578). Set
+			// by the re-CPFP pass and by a report that demotes the record itself,
+			// since a confirmation and its demotion can land between two passes.
+			sawConfirmation?: boolean;
 		}
 	> = new Map();
 	// Learned payment preimages, retained so monitors created later (on
@@ -2489,6 +2497,10 @@ export class ChannelManager extends EventEmitter {
 			this._seedMonitorPreimages(channelIdHex, monitor);
 		}
 
+		// Captured BEFORE the report so a DEMOTION (a confirmed spend pushed back
+		// to the mempool by a reorg, or its clock stopped by a valid competing
+		// mempool spend) can be told from an ordinary mempool-first sighting.
+		const wasCommitmentConfirmed = monitor.isCommitmentConfirmed();
 		const chainActions = monitor.handleFundingSpent(
 			spendingTx,
 			blockHeight,
@@ -2547,11 +2559,54 @@ export class ChannelManager extends EventEmitter {
 					}
 					this.emit('channel:closed', channelId);
 				}
+				this._maybeRearmDemotedOurCommitment(
+					channelId,
+					broadcast,
+					wasCommitmentConfirmed,
+					monitor.isCommitmentConfirmed(),
+					feeRatePerVbyte
+				);
 			}
 		}
 
 		this.emit('monitor:updated', channelIdHex, monitor);
 		return chainActions;
+	}
+
+	/**
+	 * OUR commitment was confirmed and this report demoted it back to
+	 * unconfirmed. The per-block re-CPFP entry is memory-only, so a restart
+	 * during the confirmed window leaves nothing to resume and the demoted
+	 * floor-feerate commitment rides unbumped past cltv_expiry (issue #578).
+	 * rearmCommitmentCpfp re-broadcasts the commitment and re-attaches a CPFP
+	 * child; it no-ops when a parked entry is already resuming, and carries the
+	 * guards that keep us off a peer's (possibly revoked) close.
+	 *
+	 * Keyed on the classification the report LEFT behind, not the one it found:
+	 * a re-report that repairs OUR -> THEIR_CURRENT (issue #573) is not a
+	 * demotion of our commitment, and re-broadcasting ours over theirs would
+	 * forgo a justice claim.
+	 */
+	private _maybeRearmDemotedOurCommitment(
+		channelId: Buffer,
+		broadcast: { commitmentType: CommitmentType; txid: string },
+		wasConfirmed: boolean,
+		isConfirmed: boolean,
+		feeRatePerVbyte: number
+	): void {
+		if (!wasConfirmed || isConfirmed) return;
+		if (broadcast.commitmentType !== CommitmentType.OUR_COMMITMENT) return;
+		// A still-parked entry makes rearmCommitmentCpfp a no-op, and only the
+		// re-CPFP loop's own confirmed pass sets sawConfirmation. The report that
+		// confirms and the one that demotes can both land between two passes (the
+		// funding watch fetches history off its own schedule), which would leave
+		// the demoted package waiting out the re-bump interval and the feerate
+		// gate. Mark it here so the next pass skips both.
+		const entry = this._pendingCommitmentCpfp.get(channelId.toString('hex'));
+		if (entry && entry.action.commitmentTxid === broadcast.txid) {
+			entry.sawConfirmation = true;
+		}
+		this.rearmCommitmentCpfp(channelId, feeRatePerVbyte);
 	}
 
 	/**
@@ -2568,13 +2623,31 @@ export class ChannelManager extends EventEmitter {
 	 */
 	handleFundingSpendAbsent(
 		channelId: Buffer,
-		scan?: IFundingSpendScan
+		scan?: IFundingSpendScan,
+		// Live force-close feerate, used only to re-arm OUR commitment's CPFP
+		// when the retraction demotes a confirmed close. APPENDED, never
+		// inserted, for the same published-API reason as handleFundingSpent.
+		feeRatePerVbyte = 10
 	): boolean {
 		const channelIdHex = channelId.toString('hex');
 		const monitor = this.monitors.get(channelIdHex);
 		if (!monitor) return false;
+		const wasCommitmentConfirmed = monitor.isCommitmentConfirmed();
 		if (!monitor.handleFundingSpendAbsent(scan)) return false;
 		this.emit('monitor:updated', channelIdHex, monitor);
+		// A spend absent from a successfully fetched history is gone from the
+		// chain AND the mempool, so an unbumped commitment here is the same
+		// fund-loss shape the re-report path guards (issue #578).
+		const broadcast = monitor.getFullState().commitmentBroadcast;
+		if (broadcast) {
+			this._maybeRearmDemotedOurCommitment(
+				channelId,
+				broadcast,
+				wasCommitmentConfirmed,
+				monitor.isCommitmentConfirmed(),
+				feeRatePerVbyte
+			);
+		}
 		return true;
 	}
 
@@ -9034,8 +9107,9 @@ export class ChannelManager extends EventEmitter {
 	 * output) and an HTLC we hold the preimage for is lost to the peer's timeout.
 	 *
 	 * Driven by the node each block with a live feerate (the ChannelManager has no fee
-	 * estimator). An entry is dropped once its monitor leaves WATCHING (the commitment
-	 * confirmed, or the channel otherwise resolved). The entry may also carry the
+	 * estimator). An entry is dropped once its monitor is gone or fully resolved, once
+	 * a DIFFERENT transaction confirms as the funding spend, or once the tracked
+	 * commitment is buried IRREVOCABLE_DEPTH deep. The entry may also carry the
 	 * PEER's mempool commitment (_maybeCpfpTheirCommitment, issue #559); the same
 	 * re-bid applies, and the parent re-broadcast re-inserts it if evicted.
 	 *
@@ -9046,33 +9120,62 @@ export class ChannelManager extends EventEmitter {
 		this._currentBlockHeight = blockHeight;
 		for (const [channelIdHex, entry] of this._pendingCommitmentCpfp) {
 			const monitor = this.monitors.get(channelIdHex);
-			// Stop CPFP only once the monitor is gone, fully resolved, or our commitment
-			// has CONFIRMED. Do NOT stop merely because the funding spend was DETECTED:
-			// the monitor leaves WATCHING the instant our own commitment is seen in the
-			// mempool (chain-watcher feeds unconfirmed spends), which is exactly when a
-			// fee spike can pin the package and re-CPFP is needed. Gating on WATCHING
-			// alone made this re-bump inert.
-			if (
-				!monitor ||
-				monitor.isFullyResolved() ||
-				monitor.isCommitmentConfirmed()
-			) {
+			// Stop CPFP only once the monitor is gone or fully resolved. Do NOT stop
+			// merely because the funding spend was DETECTED: the monitor leaves WATCHING
+			// the instant our own commitment is seen in the mempool (chain-watcher feeds
+			// unconfirmed spends), which is exactly when a fee spike can pin the package
+			// and re-CPFP is needed. Gating on WATCHING alone made this re-bump inert.
+			if (!monitor || monitor.isFullyResolved()) {
 				this._pendingCommitmentCpfp.delete(channelIdHex);
 				continue;
 			}
-			// Only re-bump after a stall.
-			if (
-				blockHeight - entry.broadcastHeight <
-				COMMITMENT_CPFP_REBUMP_INTERVAL
-			) {
+			if (monitor.isCommitmentConfirmed()) {
+				// A first confirmation is NOT the end of this. A reorg can evict the
+				// block and drop a floor-feerate commitment (and its now-underpriced
+				// child) back into a spiked mempool that accepts neither, and nothing
+				// else re-arms OUR package: the re-report path only re-CPFPs peer
+				// commitments, and rearmCommitmentCpfp runs on restore. Deleting at
+				// 1-conf left the demoted commitment unbumped past cltv_expiry, so the
+				// peer's HTLC-timeout took an HTLC we held the preimage for (issue
+				// #578). Park the entry instead; the demotion branch below resumes it.
+				//
+				// Two things do end it: a DIFFERENT transaction confirming as the
+				// funding spend (ours lost the race, or a splice adoption replaced it
+				// per issue #357), which this package can never outrace, and the
+				// recorded confirmation reaching IRREVOCABLE_DEPTH.
+				const broadcast = monitor.getFullState().commitmentBroadcast;
+				const confirmedAt = broadcast ? broadcast.blockHeight : 0;
+				if (
+					broadcast?.txid !== entry.action.commitmentTxid ||
+					blockHeight - confirmedAt >= IRREVOCABLE_DEPTH
+				) {
+					this._pendingCommitmentCpfp.delete(channelIdHex);
+					continue;
+				}
+				entry.sawConfirmation = true;
 				continue;
 			}
-			// Re-bump if the live feerate beats what we last paid, OR the previous
-			// attempt failed to emit a child at all (e.g. no confirmed UTXOs then).
-			// Without the failure escape a failed attempt still advanced lastFeeRate,
-			// so the `<=` gate blocked every retry even after wallet change confirmed.
-			if (feeRatePerVbyte <= entry.lastFeeRate && !entry.lastAttemptFailed) {
-				continue;
+			// The tracked commitment confirmed earlier and now reads unconfirmed: a
+			// reorg demoted it, or a valid competing spend appeared in the mempool.
+			// Both gates below describe a package that is merely slow; a demoted one
+			// may not be in any mempool at all, so re-broadcast and re-bid at once.
+			const demoted = entry.sawConfirmation === true;
+			entry.sawConfirmation = false;
+			if (!demoted) {
+				// Only re-bump after a stall.
+				if (
+					blockHeight - entry.broadcastHeight <
+					COMMITMENT_CPFP_REBUMP_INTERVAL
+				) {
+					continue;
+				}
+				// Re-bump if the live feerate beats what we last paid, OR the previous
+				// attempt failed to emit a child at all (e.g. no confirmed UTXOs then).
+				// Without the failure escape a failed attempt still advanced lastFeeRate,
+				// so the `<=` gate blocked every retry even after wallet change confirmed.
+				if (feeRatePerVbyte <= entry.lastFeeRate && !entry.lastAttemptFailed) {
+					continue;
+				}
 			}
 
 			const channelId = Buffer.from(channelIdHex, 'hex');

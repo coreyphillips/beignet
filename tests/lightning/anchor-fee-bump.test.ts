@@ -14,7 +14,10 @@ import {
 } from '../../src/lightning/wallet/wallet-funding-provider';
 import type { ISpliceWalletInput } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
-import { ChainActionType } from '../../src/lightning/chain/types';
+import {
+	ChainActionType,
+	IRREVOCABLE_DEPTH
+} from '../../src/lightning/chain/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 
@@ -528,14 +531,27 @@ describe('anchor fee bumping', () => {
 		// re-CPFP'd at a higher live feerate each block until it confirms.
 		describe('reCpfpStuckCommitments (commitment package re-bump)', () => {
 			function managerWithPendingCpfp(
-				opts: { fullyResolved?: boolean; commitmentConfirmed?: boolean } = {}
+				opts: {
+					fullyResolved?: boolean;
+					commitmentConfirmed?: boolean;
+					// Height the monitor records for the confirmed commitment, and the
+					// txid it records as the funding spender. Both drive the retention
+					// rules the parked entry lives under (issue #578).
+					confirmedAtHeight?: number;
+					recordedTxid?: string;
+				} = {}
 			): {
 				cm: ChannelManager;
 				channelIdHex: string;
 				calls: any[];
+				// The stub monitor answers from `opts` on every call, so a test can
+				// flip the chain's verdict mid-run (confirm, then reorg).
+				opts: { fullyResolved?: boolean; commitmentConfirmed?: boolean };
+				broadcasts: Buffer[];
 			} {
 				const cm = makeManager(createFeeBumpProvider([200_000]));
 				const channelIdHex = 'ab'.repeat(32);
+				const commitmentTxid = 'cd'.repeat(32);
 				(cm as any)._pendingCommitmentCpfp.set(channelIdHex, {
 					action: {
 						type: ChainActionType.FEE_BUMP_AND_BROADCAST,
@@ -547,17 +563,28 @@ describe('anchor fee bumping', () => {
 						anchorWitnessScript: Buffer.alloc(34),
 						parentVbytes: 200,
 						parentFeeSats: 0n,
-						commitmentTxid: 'cd'.repeat(32)
+						commitmentTxid
 					},
 					broadcastHeight: 100,
 					lastFeeRate: 10
 				});
 				// Stub monitor exposing the confirmation-driven guards the re-CPFP loop
 				// now uses (isFullyResolved / isCommitmentConfirmed) instead of getState().
-				(cm as any).monitors.set(channelIdHex, {
-					isFullyResolved: () => opts.fullyResolved === true,
-					isCommitmentConfirmed: () => opts.commitmentConfirmed === true
-				});
+				const monitor = {
+					isFullyResolved: (): boolean => opts.fullyResolved === true,
+					isCommitmentConfirmed: (): boolean =>
+						opts.commitmentConfirmed === true,
+					getFullState: () => ({
+						commitmentBroadcast: {
+							txid: opts.recordedTxid ?? commitmentTxid,
+							blockHeight:
+								opts.commitmentConfirmed === true
+									? opts.confirmedAtHeight ?? 101
+									: 0
+						}
+					})
+				};
+				(cm as any).monitors.set(channelIdHex, monitor);
 				// Spy on the CPFP re-issue instead of building a real wallet tx. The
 				// production _handleFeeBumpAndBroadcast now advances the pending entry's
 				// bookkeeping ONLY once a child is actually emitted (so a failed attempt
@@ -576,7 +603,9 @@ describe('anchor fee bumping', () => {
 					}
 					return Promise.resolve();
 				};
-				return { cm, channelIdHex, calls };
+				const broadcasts: Buffer[] = [];
+				cm.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
+				return { cm, channelIdHex, calls, opts, broadcasts };
 			}
 
 			it('re-issues the CPFP for a mempool-detected but UNCONFIRMED commitment (H1)', () => {
@@ -609,11 +638,66 @@ describe('anchor fee bumping', () => {
 				expect(sameFee.calls.length).to.equal(0);
 			});
 
-			it('drops the entry once the commitment CONFIRMS (not merely detected)', () => {
+			it('PARKS the entry while the commitment is confirmed, without bumping', () => {
+				// Issue #578: deleting at 1-conf left nothing to resume when a reorg
+				// demoted the commitment. Keep the entry, do no work.
 				const { cm, channelIdHex, calls } = managerWithPendingCpfp({
-					commitmentConfirmed: true
+					commitmentConfirmed: true,
+					confirmedAtHeight: 101
 				});
-				cm.reCpfpStuckCommitments(200, 100);
+				cm.reCpfpStuckCommitments(110, 100);
+				expect(calls.length).to.equal(0);
+				expect((cm as any)._pendingCommitmentCpfp.has(channelIdHex)).to.be.true;
+				expect(
+					(cm as any)._pendingCommitmentCpfp.get(channelIdHex).sawConfirmation
+				).to.be.true;
+			});
+
+			it('resumes bidding immediately when a reorg demotes the confirmed commitment (#578)', () => {
+				const { cm, channelIdHex, calls, opts, broadcasts } =
+					managerWithPendingCpfp({
+						commitmentConfirmed: true,
+						confirmedAtHeight: 101
+					});
+				cm.reCpfpStuckCommitments(101, 10);
+				expect(calls.length).to.equal(0);
+
+				// Block 101 is reorged out; the monitor demotes to unconfirmed.
+				opts.commitmentConfirmed = false;
+				// Neither pacing gate would pass on its own: only 2 blocks since the
+				// last broadcast (100) and the live feerate matches what we paid. A
+				// demoted package may be out of the mempool entirely, so it goes now.
+				cm.reCpfpStuckCommitments(102, 10);
+
+				expect(calls.length).to.equal(1);
+				expect(calls[0].description).to.match(/re-bump/);
+				// The parent rides along: a CPFP child alone is an orphan.
+				expect(broadcasts.length).to.equal(1);
+				expect(
+					(cm as any)._pendingCommitmentCpfp.get(channelIdHex).sawConfirmation
+				).to.be.false;
+			});
+
+			it('drops the entry once the confirmed commitment is irrevocably buried', () => {
+				const { cm, channelIdHex, calls } = managerWithPendingCpfp({
+					commitmentConfirmed: true,
+					confirmedAtHeight: 101
+				});
+				cm.reCpfpStuckCommitments(101 + IRREVOCABLE_DEPTH, 100);
+				expect(calls.length).to.equal(0);
+				expect((cm as any)._pendingCommitmentCpfp.has(channelIdHex)).to.be
+					.false;
+			});
+
+			it('drops the entry when a DIFFERENT transaction confirms as the funding spend', () => {
+				// Ours lost the race (or a splice adoption replaced it): the tracked
+				// package can never confirm, so re-broadcasting it is pure noise.
+				const { cm, channelIdHex, calls } = managerWithPendingCpfp({
+					commitmentConfirmed: true,
+					confirmedAtHeight: 101,
+					recordedTxid: 'ef'.repeat(32)
+				});
+				cm.reCpfpStuckCommitments(105, 100);
 				expect(calls.length).to.equal(0);
 				expect((cm as any)._pendingCommitmentCpfp.has(channelIdHex)).to.be
 					.false;
