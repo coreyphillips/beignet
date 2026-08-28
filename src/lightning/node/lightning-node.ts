@@ -28,7 +28,7 @@ import {
 	txInputOutpoints
 } from '../channel/channel-manager';
 import { ChannelResult } from '../channel/types';
-import { Channel } from '../channel/channel';
+import { Channel, ISpliceWalletInput } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
 import {
 	estimateSpliceTxWeight,
@@ -170,6 +170,7 @@ import {
 	ILightningError,
 	ILightningBalance,
 	IFundingProvider,
+	IUtxoSelectionOpts,
 	IFeeEstimator,
 	IPaymentRetryContext,
 	IOutboundMppState,
@@ -202,7 +203,9 @@ import {
 import {
 	canSelectDualFundingInputs,
 	releaseInputPledgesBestEffort,
-	selectDualFundingContribution
+	selectDualFundingContribution,
+	validateUtxoSelectionOpts,
+	verifyDirectedSelection
 } from './funding-selection';
 import {
 	validateHexPubkey,
@@ -3043,6 +3046,33 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// A splice is withholding its tx_signatures on an EXTERNAL input whose
+		// witness a third party owes (issue #592): relay the reminder so the
+		// host can collect it out of band and answer with
+		// provideSpliceExternalWitness. Re-armed per connection cycle.
+		this.channelManager.on(
+			'channel:splice-txsigs-needed',
+			(
+				channelId: Buffer,
+				spliceTxid: Buffer,
+				newFundingOutputIndex: number,
+				externalInputIndices: number[]
+			) => {
+				this.emit('channel:splice-txsigs-needed', {
+					channelId,
+					spliceTxid,
+					newFundingOutputIndex,
+					externalInputIndices
+				});
+				this.emitStructuredLog('channel', 'splice_txsigs_needed', {
+					channelId: channelId.toString('hex'),
+					spliceTxid: spliceTxid.toString('hex'),
+					newFundingOutputIndex,
+					externalInputIndices
+				});
+			}
+		);
+
 		this.channelManager.on(
 			'channel:pending-close',
 			(channelId: Buffer, initiator: 'local' | 'remote') => {
@@ -5783,6 +5813,30 @@ export class LightningNode extends EventEmitter {
 		const provider = this.fundingProvider;
 		if (!provider?.releaseInputPledges) return;
 		const outpoints = txInputOutpoints(txHex);
+		if (outpoints.length === 0) return;
+		releaseInputPledgesBestEffort(provider, outpoints);
+	}
+
+	/**
+	 * Best-effort release of the pledges behind a wallet selection nothing
+	 * will spend (a splice-in whose directed selection was refused before the
+	 * inputs reached the channel). Same rules as the manager's twin: unreadable
+	 * prevTxs simply age out on the pledge TTL.
+	 */
+	private releaseSelectionPledges(inputs: ISpliceWalletInput[]): void {
+		const provider = this.fundingProvider;
+		if (!provider?.releaseInputPledges || inputs.length === 0) return;
+		const outpoints: Array<{ txid: string; vout: number }> = [];
+		for (const input of inputs) {
+			try {
+				outpoints.push({
+					txid: bitcoin.Transaction.fromBuffer(input.prevTx).getId(),
+					vout: input.prevOutputIndex
+				});
+			} catch {
+				// Unreadable prevTx cannot name a pledge; the TTL covers it.
+			}
+		}
 		if (outpoints.length === 0) return;
 		releaseInputPledgesBestEffort(provider, outpoints);
 	}
@@ -8959,24 +9013,11 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 		if (params.fundingUtxos) {
-			const list = params.fundingUtxos.utxos;
-			if (!Array.isArray(list) || list.length === 0) {
-				throw new InvalidChannelOpenError(
-					'fundingUtxos.utxos must be a non-empty array'
-				);
-			}
-			for (const u of list) {
-				if (typeof u?.txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(u.txid)) {
-					throw new InvalidChannelOpenError(
-						'fundingUtxos.utxos entries need a 64-hex txid'
-					);
-				}
-				if (!Number.isInteger(u.vout) || u.vout < 0) {
-					throw new InvalidChannelOpenError(
-						'fundingUtxos.utxos entries need a non-negative integer vout'
-					);
-				}
-			}
+			const shapeErr = validateUtxoSelectionOpts(
+				params.fundingUtxos,
+				'fundingUtxos'
+			);
+			if (shapeErr) throw new InvalidChannelOpenError(shapeErr);
 			// Directed funding needs a provider that can select wallet inputs
 			// AT ALL; without one the open would stall silently as a legacy
 			// caller-driven negotiation nobody drives (issue #572 review).
@@ -9262,6 +9303,75 @@ export class LightningNode extends EventEmitter {
 			return { ok: false, error: result.error };
 		}
 		return { ok: true };
+	}
+
+	/**
+	 * Deliver a third-party input owner's witness for an EXTERNAL input of a
+	 * splice-in (issue #592): the answer to the channel:splice-txsigs-needed
+	 * event. The witness is validated against the recorded splice prevouts
+	 * before it is stored, and delivering the last outstanding witness
+	 * releases the withheld tx_signatures (and with it the broadcast). A
+	 * refused delivery (unknown outpoint, invalid witness) leaves the splice
+	 * untouched and can simply be retried with a correct witness.
+	 * @param channelId - 32-byte channel ID from the event
+	 * @param prevTxid - txid of the input's previous transaction, INTERNAL
+	 *   byte order (tx.getHash(), not the display hex)
+	 * @param prevOutputIndex - output index the splice input spends
+	 * @param witness - the input's finished witness stack
+	 */
+	provideSpliceExternalWitness(
+		channelId: Buffer,
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): { ok: boolean; error?: string } {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		const txidErr = validateBuffer(prevTxid, 32, 'prevTxid');
+		if (txidErr) throw new Error(txidErr);
+		if (!Number.isInteger(prevOutputIndex) || prevOutputIndex < 0) {
+			throw new Error(
+				`prevOutputIndex must be a non-negative integer, got ${prevOutputIndex}`
+			);
+		}
+		if (!Array.isArray(witness) || witness.some((b) => !Buffer.isBuffer(b))) {
+			throw new Error('witness must be an array of Buffers');
+		}
+		const result = this.channelManager.provideSpliceExternalWitness(
+			channelId,
+			prevTxid,
+			prevOutputIndex,
+			witness
+		);
+		if (!result.ok) {
+			this.emit('node:error', {
+				code: 'PROVIDE_EXTERNAL_WITNESS_FAILED',
+				channelId,
+				message: result.error!,
+				timestamp: Date.now()
+			} as ILightningError);
+			return { ok: false, error: result.error };
+		}
+		return { ok: true };
+	}
+
+	/**
+	 * The negotiated splice transaction of an in-flight splice, with the data
+	 * a third-party input owner needs to sign its input (issue #592): the
+	 * complete prevout set (BIP 341 sighashes commit to every input's script
+	 * and value) and the outpoints whose witnesses are still owed. The
+	 * transaction is a copy, so nothing a caller does to it can reach the
+	 * channel's own. Null when the channel is unknown or has no built splice.
+	 * @param channelId - 32-byte channel ID
+	 */
+	getPendingSpliceTx(
+		channelId: Buffer
+	): ReturnType<Channel['getPendingSpliceTx']> {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		return (
+			this.channelManager.getChannel(channelId)?.getPendingSpliceTx() ?? null
+		);
 	}
 
 	/**
@@ -10117,11 +10227,16 @@ export class LightningNode extends EventEmitter {
 	 * @param channelId - The channel to splice into
 	 * @param amountSats - Amount to add (positive value)
 	 * @param fundingFeeratePerkw - Feerate for the splice tx (default 253)
+	 * @param fundingUtxos - Restrict the wallet selection to these outpoints
+	 *   (issue #592). Every named outpoint must be contributed; `allowTopUp`
+	 *   lets the selection complete from the rest of the wallet when they fall
+	 *   short.
 	 */
 	spliceIn(
 		channelId: Buffer,
 		amountSats: bigint,
-		fundingFeeratePerkw = 253
+		fundingFeeratePerkw = 253,
+		fundingUtxos?: IUtxoSelectionOpts
 	): { ok: boolean; error?: string } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new InvalidSpliceError(cidErr);
@@ -10134,6 +10249,10 @@ export class LightningNode extends EventEmitter {
 			min: 1
 		});
 		if (feeErr) throw new InvalidSpliceError(feeErr);
+		if (fundingUtxos) {
+			const optsErr = validateUtxoSelectionOpts(fundingUtxos, 'fundingUtxos');
+			if (optsErr) throw new InvalidSpliceError(optsErr);
+		}
 
 		// Splice-in must fund the channel increase with wallet inputs. Source them
 		// from the funding provider (UTXO selection + change + per-input signing),
@@ -10175,8 +10294,27 @@ export class LightningNode extends EventEmitter {
 		}
 
 		this.fundingProvider
-			.selectSpliceInputs(amountSats, fundingFeeratePerkw)
+			.selectSpliceInputs(amountSats, fundingFeeratePerkw, fundingUtxos)
 			.then(({ inputs, changeScript }) => {
+				// The opts are a trailing OPTIONAL provider parameter, so a
+				// third-party provider written against the older signature
+				// silently ignores them and still returns a selection over
+				// arbitrary coins. A caller that named its coins gets them or
+				// gets a failure, never a splice funded with something else
+				// (issue #572 review, same rule as the v2 open path).
+				const directedError = fundingUtxos
+					? verifyDirectedSelection(inputs, fundingUtxos)
+					: null;
+				if (directedError) {
+					this.releaseSelectionPledges(inputs);
+					this.emit('node:error', {
+						code: 'SPLICE_IN_FAILED',
+						channelId,
+						message: directedError,
+						timestamp: Date.now()
+					} as ILightningError);
+					return;
+				}
 				channel.setSpliceInInputs(inputs, changeScript);
 				const result = this.channelManager.initiateSplice(
 					channelId,
@@ -10205,6 +10343,153 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Splice-in funded by CALLER-SUPPLIED inputs (issue #592), the splice twin
+	 * of a registered dual-funding contribution: no funding provider is
+	 * consulted and no wallet selection happens, so the host owns the coins and
+	 * their freezing. An input marked `external` belongs to a third party: it
+	 * is contributed and emitted on the wire like any of ours, its
+	 * `signWitness` is never called (pass a throwing stub), and its witness
+	 * arrives later through provideSpliceExternalWitness. Our tx_signatures is
+	 * withheld, and the splice neither broadcast nor locked, until every
+	 * external slot is filled.
+	 *
+	 * Synchronous throughout: unlike spliceIn there is nothing to select, so a
+	 * refusal is returned rather than surfacing later on node:error.
+	 *
+	 * @param channelId - The channel to splice into
+	 * @param amountSats - Amount to add (positive value)
+	 * @param inputs - The inputs funding the increase; their values must cover
+	 *   the amount plus the splice fee, or the negotiation's own audit fails
+	 * @param changeScript - Where the selection's change is paid
+	 * @param fundingFeeratePerkw - Feerate for the splice tx (default 253)
+	 */
+	spliceInWithInputs(
+		channelId: Buffer,
+		amountSats: bigint,
+		inputs: ISpliceWalletInput[],
+		changeScript: Buffer,
+		fundingFeeratePerkw = 253
+	): { ok: boolean; error?: string } {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new InvalidSpliceError(cidErr);
+		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
+		if (satsErr) throw new InvalidSpliceError(satsErr);
+		// Same reason as spliceIn: splice_init encodes the feerate as a u32
+		// AFTER the channel has moved to SPLICING, so a late throw wedges it.
+		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
+			min: 1
+		});
+		if (feeErr) throw new InvalidSpliceError(feeErr);
+		if (!Array.isArray(inputs) || inputs.length === 0) {
+			throw new InvalidSpliceError('inputs must be a non-empty array');
+		}
+		if (!Buffer.isBuffer(changeScript) || changeScript.length === 0) {
+			throw new InvalidSpliceError('changeScript must be a non-empty Buffer');
+		}
+		let inputTotal = 0n;
+		for (const [i, input] of inputs.entries()) {
+			const where = `inputs[${i}]`;
+			if (!Buffer.isBuffer(input?.prevTx)) {
+				throw new InvalidSpliceError(`${where}.prevTx must be a Buffer`);
+			}
+			let prevTx: bitcoin.Transaction;
+			try {
+				prevTx = bitcoin.Transaction.fromBuffer(input.prevTx);
+			} catch {
+				throw new InvalidSpliceError(
+					`${where}.prevTx is not a parseable transaction`
+				);
+			}
+			if (
+				!Number.isInteger(input.prevOutputIndex) ||
+				input.prevOutputIndex < 0 ||
+				input.prevOutputIndex >= prevTx.outs.length
+			) {
+				throw new InvalidSpliceError(
+					`${where}.prevOutputIndex is not an output of its prevTx`
+				);
+			}
+			if (typeof input.value !== 'bigint' || input.value <= 0n) {
+				throw new InvalidSpliceError(
+					`${where}.value must be a positive bigint`
+				);
+			}
+			// A value disagreeing with the named prevout corrupts the change and
+			// fee arithmetic the channel derives from it, and only surfaces much
+			// later as the peer's tx_complete audit refusing the negotiation.
+			if (input.value !== BigInt(prevTx.outs[input.prevOutputIndex].value)) {
+				throw new InvalidSpliceError(
+					`${where}.value does not match the value of the output it names`
+				);
+			}
+			const seqErr = validateU32(input.sequence, `${where}.sequence`, {
+				min: 0
+			});
+			if (seqErr) throw new InvalidSpliceError(seqErr);
+			if (typeof input.signWitness !== 'function') {
+				throw new InvalidSpliceError(`${where}.signWitness must be a function`);
+			}
+			if (input.external) {
+				// Its witness will be judged by _validateWitnessForInput on
+				// delivery, which can only verify P2WPKH and P2TR key-spends.
+				// Refuse here rather than after the negotiation has committed to
+				// a transaction whose witness we could never accept.
+				const script = prevTx.outs[input.prevOutputIndex].script;
+				const isP2wpkh =
+					script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
+				const isP2tr =
+					script.length === 34 && script[0] === 0x51 && script[1] === 0x20;
+				if (!isP2wpkh && !isP2tr) {
+					throw new InvalidSpliceError(
+						`${where} is external and pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)`
+					);
+				}
+			}
+			inputTotal += input.value;
+		}
+		if (inputTotal < amountSats) {
+			throw new InvalidSpliceError(
+				`inputs total ${inputTotal} sats, below the splice amount ${amountSats} sats`
+			);
+		}
+
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) {
+			return {
+				ok: false,
+				error: `Channel not found: ${channelId.toString('hex')}`
+			};
+		}
+		const spliceInErr = this._validateSpliceRequest(channelId, amountSats);
+		if (spliceInErr) {
+			this.emit('node:error', {
+				code: 'SPLICE_IN_FAILED',
+				channelId,
+				message: spliceInErr,
+				timestamp: Date.now()
+			} as ILightningError);
+			return { ok: false, error: spliceInErr };
+		}
+
+		channel.setSpliceInInputs(inputs, changeScript);
+		const result = this.channelManager.initiateSplice(
+			channelId,
+			amountSats,
+			fundingFeeratePerkw
+		);
+		if (!result.ok) {
+			this.emit('node:error', {
+				code: 'SPLICE_IN_FAILED',
+				channelId,
+				message: result.error!,
+				timestamp: Date.now()
+			} as ILightningError);
+			return { ok: false, error: result.error };
+		}
+		return { ok: true };
+	}
+
+	/**
 	 * Splice-in and wait for the splice to lock (issue #572): resolves on the
 	 * splice:complete event for this channel, rejects on a SPLICE_IN_FAILED
 	 * node error scoped to it, on splice:aborted for it (a peer tx_abort
@@ -10218,7 +10503,8 @@ export class LightningNode extends EventEmitter {
 		channelId: Buffer,
 		amountSats: bigint,
 		timeoutMs = 120_000,
-		fundingFeeratePerkw?: number
+		fundingFeeratePerkw?: number,
+		fundingUtxos?: IUtxoSelectionOpts
 	): Promise<void> {
 		if (this._destroyed) throw new Error('Node destroyed');
 		const cidHex = channelId.toString('hex');
@@ -10285,7 +10571,12 @@ export class LightningNode extends EventEmitter {
 
 		let result: { ok: boolean; error?: string };
 		try {
-			result = this.spliceIn(channelId, amountSats, fundingFeeratePerkw ?? 253);
+			result = this.spliceIn(
+				channelId,
+				amountSats,
+				fundingFeeratePerkw ?? 253,
+				fundingUtxos
+			);
 		} catch (err) {
 			// Validation throws (InvalidSpliceError) must not leave the timer
 			// and listeners armed for the full window.

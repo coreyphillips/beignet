@@ -1787,6 +1787,60 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Deliver a third-party input owner's witness for an EXTERNAL input of a
+	 * splice-in (issue #592): the answer to channel:splice-txsigs-needed. The
+	 * channel validates the witness against the recorded prevouts before
+	 * storing it, and the last delivery releases our withheld tx_signatures,
+	 * which is what makes the splice broadcastable. Permanent map only: a
+	 * splice exists only on an established channel.
+	 */
+	provideSpliceExternalWitness(
+		channelId: Buffer,
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+
+		let actions: ChannelAction[];
+		try {
+			actions = channel.provideSpliceExternalWitness(
+				prevTxid,
+				prevOutputIndex,
+				witness
+			);
+		} catch (err) {
+			// The channel throws WITHOUT touching state: a refusal of the
+			// caller's delivery, not a channel failure. Nothing to dispatch and
+			// no 'error' event (the initiateFundingRbf refusal convention); the
+			// caller retries with a correct witness.
+			return { ok: false, actions: [], error: (err as Error).message };
+		}
+		this.processActions(peerPubkey, channel, actions);
+		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
+		if (errorAction) {
+			return {
+				ok: false,
+				actions,
+				error: (errorAction as { message: string }).message
+			};
+		}
+		return { ok: true, actions };
+	}
+
+	/**
 	 * Handle peer disconnection: mark all channels with this peer as AWAITING_REESTABLISH.
 	 */
 	handlePeerDisconnected(peerPubkey: string): void {
@@ -8039,6 +8093,24 @@ export class ChannelManager extends EventEmitter {
 						action.fundingTxid,
 						action.fundingOutputIndex,
 						action.inputIndices,
+						action.externalInputIndices
+					);
+					break;
+				case ChannelActionType.SPLICE_TX_SIGNATURES_NEEDED:
+					// Suppressed on a failed persist for the same reason as the
+					// v2 signal above: answering it (provideSpliceExternalWitness)
+					// releases tx_signatures in a FRESH batch no failed-persist
+					// marker withholds, ahead of a splice commitment_signed the
+					// peer never received. The reconnect re-arms the reminder
+					// (markForReestablish).
+					if (persistSeen && sendsBlocked()) {
+						break;
+					}
+					this.emit(
+						'channel:splice-txsigs-needed',
+						action.channelId,
+						action.spliceTxid,
+						action.newFundingOutputIndex,
 						action.externalInputIndices
 					);
 					break;

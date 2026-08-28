@@ -106,6 +106,41 @@ export function selectDualFundingContribution(
 }
 
 /**
+ * Shape check for caller-directed selection opts, before they reach a provider
+ * or a channel. Rejects the empty list for the same reason
+ * selectDualFundingContribution does: it would combine with the providers'
+ * unrestricted fallback and fund with arbitrary coins. `label` names the
+ * caller's own parameter so the message points at what they passed.
+ *
+ * Returns the problem, or null when the opts are well formed.
+ */
+export function validateUtxoSelectionOpts(
+	opts: IUtxoSelectionOpts,
+	label: string
+): string | null {
+	const list = opts.utxos;
+	if (!Array.isArray(list) || list.length === 0) {
+		return `${label}.utxos must be a non-empty array`;
+	}
+	for (const u of list) {
+		if (typeof u?.txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(u.txid)) {
+			return `${label}.utxos entries need a 64-hex txid`;
+		}
+		if (!Number.isInteger(u.vout) || u.vout < 0) {
+			return `${label}.utxos entries need a non-negative integer vout`;
+		}
+	}
+	// allowTopUp is read for truthiness by both the selection and the
+	// verification below, so an untyped caller's "false" would widen the
+	// selection past the named coins AND disarm the check that would have
+	// caught it. Only a real boolean may express the permission.
+	if (opts.allowTopUp !== undefined && typeof opts.allowTopUp !== 'boolean') {
+		return `${label}.allowTopUp must be a boolean when provided`;
+	}
+	return null;
+}
+
+/**
  * Verify that a selection honored a directed IUtxoSelectionOpts. The opts are
  * a trailing OPTIONAL parameter, so a third-party provider written against
  * the older signature silently ignores them and still returns a successful
@@ -150,7 +185,10 @@ export function verifyDirectedSelection(
 			return `provider ignored fundingUtxos (missing requested outpoint ${key})`;
 		}
 	}
-	if (!directed.allowTopUp) {
+	// Strict true, not truthy: a caller reaching a provider directly (the
+	// manager's own params) never passed the shape check, and a non-boolean
+	// must not authorize coins the caller did not name.
+	if (directed.allowTopUp !== true) {
 		for (const key of selected) {
 			if (!named.has(key)) {
 				return `provider ignored fundingUtxos (unrequested input ${key} without allowTopUp)`;

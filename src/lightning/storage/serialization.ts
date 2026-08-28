@@ -510,6 +510,9 @@ export interface ISerializedSpliceInFlight {
 	ourSharedInputSig: string;
 	ourWalletWitnesses: string[][];
 	ourWalletInputIndices: number[];
+	// Issue #592: tx-input indices of externally owned splice inputs whose
+	// witnesses arrive out of band; absent on records without external inputs.
+	externalInputIndices?: number[];
 	inputPrevouts?: Array<{ script: string; valueSats: string }>;
 	remoteCommitmentSig: string | null;
 	remoteCommitmentSigFeeratePerKw?: number;
@@ -540,6 +543,9 @@ export function serializeSpliceInFlight(
 			w.map((b) => b.toString('hex'))
 		),
 		ourWalletInputIndices: [...f.ourWalletInputIndices],
+		externalInputIndices: f.externalInputIndices
+			? [...f.externalInputIndices]
+			: undefined,
 		inputPrevouts: f.inputPrevouts.map((p) => ({
 			script: p.script.toString('hex'),
 			valueSats: bigintToStr(p.valueSats)
@@ -574,6 +580,9 @@ export function deserializeSpliceInFlight(
 			w.map((h) => Buffer.from(h, 'hex'))
 		),
 		ourWalletInputIndices: [...s.ourWalletInputIndices],
+		externalInputIndices: s.externalInputIndices
+			? [...s.externalInputIndices]
+			: undefined,
 		inputPrevouts: (s.inputPrevouts ?? []).map((p) => ({
 			script: Buffer.from(p.script, 'hex'),
 			valueSats: strToBigint(p.valueSats)

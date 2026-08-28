@@ -13,6 +13,8 @@
  *   B1 CLN-INITIATED splice (beignet as pure acceptor) via CLN's splice RPCs
  *   C1 multi-UTXO splice-in (real on-chain wallet inputs, spec witness
  *      serialization with >1 input)
+ *   C2 splice-in carrying a THIRD-PARTY input: our tx_signatures is withheld
+ *      until the owner's witness is delivered out of band (issue #592)
  *   D1 mid-splice disconnect after the commitment round (beignet's
  *      tx_signatures dropped) -> reconnect -> next_funding_txid resume
  *
@@ -352,6 +354,80 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 
 	// ── Tier C: multi-UTXO splice-in with real on-chain inputs ──
 	describe('Tier C: multi-UTXO splice-in', function () {
+		interface IRealInput {
+			input: ISpliceWalletInput;
+			/** Sign this input as its owner would, out of band. */
+			sign: (tx: bitcoin.Transaction, inputIndex: number) => Buffer[];
+		}
+
+		/**
+		 * A REAL confirmed P2WPKH UTXO we hold the key for, as a splice input.
+		 * `external: true` marks it as owned by a THIRD PARTY: the channel must
+		 * never call its closure, and its witness comes back through `sign`.
+		 */
+		const makeRealInput = async (
+			tag: string,
+			valueSat: number,
+			external = false
+		): Promise<IRealInput> => {
+			const priv = crypto
+				.createHash('sha256')
+				.update(`splice-matrix-${tag}`)
+				.digest();
+			const pub = Buffer.from(ecc.pointFromScalar(priv, true)!);
+			const payment = bitcoin.payments.p2wpkh({
+				pubkey: pub,
+				network: bitcoin.networks.regtest
+			});
+			const scriptCode = bitcoin.payments.p2pkh({ pubkey: pub }).output!;
+			const txid = (await bitcoinRpc('sendtoaddress', [
+				payment.address!,
+				valueSat / 1e8
+			])) as string;
+			await mineBlocks(1);
+			const raw = (await bitcoinRpc('getrawtransaction', [txid])) as string;
+			const prevTx = bitcoin.Transaction.fromHex(raw);
+			const vout = prevTx.outs.findIndex((o) =>
+				Buffer.from(o.script).equals(payment.output!)
+			);
+			expect(vout, 'funded output present').to.be.gte(0);
+			const sign = (tx: bitcoin.Transaction, inputIndex: number): Buffer[] => {
+				const sighash = tx.hashForWitnessV0(
+					inputIndex,
+					scriptCode,
+					valueSat,
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				return [
+					bitcoin.script.signature.encode(
+						Buffer.from(ecc.sign(sighash, priv)),
+						bitcoin.Transaction.SIGHASH_ALL
+					),
+					pub
+				];
+			};
+			return {
+				sign,
+				input: {
+					prevTx: prevTx.toBuffer(),
+					prevOutputIndex: vout,
+					value: BigInt(valueSat),
+					sequence: 0xfffffffd,
+					confirmed: true,
+					external: external || undefined,
+					signWitness: (
+						tx: bitcoin.Transaction,
+						inputIndex: number
+					): Buffer[] => {
+						if (external) {
+							throw new Error('external input: the owner signs out of band');
+						}
+						return sign(tx, inputIndex);
+					}
+				}
+			};
+		};
+
 		it('C1: beignet splices in from TWO real wallet UTXOs with change', async function () {
 			if (skipAll) this.skip();
 			const setup = await setupClnChannel(cln, clnPubkey, 222, 500_000, 0);
@@ -364,61 +440,8 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 			const oldTxid = Buffer.from(before.fundingTxid!).toString('hex');
 			const oldCap = before.fundingSatoshis;
 
-			// Create two REAL confirmed P2WPKH UTXOs we control.
-			const makeRealInput = async (
-				tag: string,
-				valueSat: number
-			): Promise<ISpliceWalletInput> => {
-				const priv = crypto
-					.createHash('sha256')
-					.update(`splice-matrix-c1-${tag}`)
-					.digest();
-				const pub = Buffer.from(ecc.pointFromScalar(priv, true)!);
-				const payment = bitcoin.payments.p2wpkh({
-					pubkey: pub,
-					network: bitcoin.networks.regtest
-				});
-				const scriptCode = bitcoin.payments.p2pkh({ pubkey: pub }).output!;
-				const txid = (await bitcoinRpc('sendtoaddress', [
-					payment.address!,
-					valueSat / 1e8
-				])) as string;
-				await mineBlocks(1);
-				const raw = (await bitcoinRpc('getrawtransaction', [txid])) as string;
-				const prevTx = bitcoin.Transaction.fromHex(raw);
-				const vout = prevTx.outs.findIndex((o) =>
-					Buffer.from(o.script).equals(payment.output!)
-				);
-				expect(vout, 'funded output present').to.be.gte(0);
-				return {
-					prevTx: prevTx.toBuffer(),
-					prevOutputIndex: vout,
-					value: BigInt(valueSat),
-					sequence: 0xfffffffd,
-					confirmed: true,
-					signWitness: (
-						tx: bitcoin.Transaction,
-						inputIndex: number,
-						v: bigint
-					): Buffer[] => {
-						const sighash = tx.hashForWitnessV0(
-							inputIndex,
-							scriptCode,
-							Number(v),
-							bitcoin.Transaction.SIGHASH_ALL
-						);
-						const sig64 = Buffer.from(ecc.sign(sighash, priv));
-						const der = bitcoin.script.signature.encode(
-							sig64,
-							bitcoin.Transaction.SIGHASH_ALL
-						);
-						return [der, pub];
-					}
-				};
-			};
-
-			const in1 = await makeRealInput('a', 60_000);
-			const in2 = await makeRealInput('b', 50_000);
+			const in1 = (await makeRealInput('c1-a', 60_000)).input;
+			const in2 = (await makeRealInput('c1-b', 50_000)).input;
 			const changePriv = crypto
 				.createHash('sha256')
 				.update('splice-matrix-c1-change')
@@ -440,6 +463,91 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 			await waitForClnSplicedNormal(node.getNodeId(), spliceTxid);
 			console.log(
 				`    C1 spliced in 80k from 2 UTXOs: cap ${oldCap} -> ${after.fundingSatoshis}`
+			);
+		});
+
+		it('C2: a THIRD-PARTY input withholds tx_signatures until its owner signs', async function () {
+			if (skipAll) this.skip();
+			const setup = await setupClnChannel(cln, clnPubkey, 226, 500_000, 0);
+			const node = setup.node;
+			nodes.push(node);
+			const channelId = setup.channelId;
+			const cm = node.getChannelManager();
+			const before = cm.getChannel(channelId)!.getFullState();
+			const oldTxid = Buffer.from(before.fundingTxid!).toString('hex');
+			const oldCap = before.fundingSatoshis;
+
+			const own = await makeRealInput('c2-own', 60_000);
+			const ext = await makeRealInput('c2-ext', 50_000, true);
+			const changeScript = bitcoin.payments.p2wpkh({
+				pubkey: Buffer.from(
+					ecc.pointFromScalar(
+						crypto
+							.createHash('sha256')
+							.update('splice-matrix-c2-change')
+							.digest(),
+						true
+					)!
+				)
+			}).output!;
+
+			// CLN contributes nothing, so its tx_signatures arrives FIRST: this
+			// is the received-first withhold, the path with the most new code.
+			const needed = new Promise<{ externalInputIndices: number[] }>(
+				(resolve, reject) => {
+					const timer = setTimeout(
+						() => reject(new Error('no splice-txsigs-needed signal')),
+						60_000
+					);
+					node.once(
+						'channel:splice-txsigs-needed',
+						(data: { externalInputIndices: number[] }) => {
+							clearTimeout(timer);
+							resolve(data);
+						}
+					);
+				}
+			);
+			const prevSplice = spliceTxidHex(node, channelId);
+			const started = node.spliceInWithInputs(
+				channelId,
+				80_000n,
+				[own.input, ext.input],
+				changeScript,
+				1000
+			);
+			expect(started.ok, 'splice-in with caller inputs started').to.equal(true);
+			const signal = await needed;
+
+			// Nothing of ours left, and nothing was broadcast: the peer signed,
+			// we did not.
+			const withheld = cm.getChannel(channelId)!.getFullState().spliceInFlight!;
+			expect(withheld.receivedTxSignatures).to.equal(true);
+			expect(withheld.sentTxSignatures).to.equal(false);
+			expect(withheld.fullySigned).to.equal(false);
+			expect(signal.externalInputIndices).to.deep.equal(
+				withheld.externalInputIndices
+			);
+
+			// The owner signs the negotiated transaction out of band.
+			const pending = node.getPendingSpliceTx(channelId)!;
+			expect(pending.owedExternalInputs).to.have.length(1);
+			const owed = pending.owedExternalInputs[0];
+			const delivered = node.provideSpliceExternalWitness(
+				channelId,
+				owed.prevTxid,
+				owed.prevOutputIndex,
+				ext.sign(pending.tx, owed.inputIndex)
+			);
+			expect(delivered.ok, delivered.error ?? '').to.equal(true);
+
+			const spliceTxid = await confirmSplice(node, channelId, prevSplice);
+			await waitForSpliceComplete(node, channelId, oldTxid);
+			const after = cm.getChannel(channelId)!.getFullState();
+			expect(after.fundingSatoshis).to.equal(oldCap + 80_000n);
+			await waitForClnSplicedNormal(node.getNodeId(), spliceTxid);
+			console.log(
+				`    C2 spliced in 80k with a third-party input: cap ${oldCap} -> ${after.fundingSatoshis}`
 			);
 		});
 	});
