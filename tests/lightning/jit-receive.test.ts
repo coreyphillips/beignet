@@ -650,6 +650,40 @@ describe('JIT hold deadlines', function () {
 		expect(h.manager.heldTotalMsat(scidHex)).to.equal(0n);
 	});
 
+	it('revokes the whole MPP set when one part reaches its deadline', async function () {
+		// The parts held for one intent are one payment: forwarding the
+		// survivors could only park HTLCs on the client's fresh channel until
+		// they time out, since the sender can never complete the set.
+		const h = makeHarness({ holdExpiryMarginBlocks: 18 });
+		const hash = crypto.randomBytes(32);
+		const ack = h.manager.registerIntent(
+			CLIENT,
+			auth({ paymentHash: hash, expectedTotalMsat: 9_000_000n })
+		);
+		const scidHex = ack.interceptScid.toString('hex');
+		const near = makePart(h, {
+			paymentHash: hash,
+			forwardCltv: 800_000,
+			incomingCltvExpiry: 800_100
+		});
+		const far = makePart(h, {
+			paymentHash: hash,
+			forwardCltv: 800_000,
+			incomingCltvExpiry: 900_000
+		});
+		expect(h.manager.tryInterceptUnknownScid(scidHex, near)).to.equal(true);
+		expect(h.manager.tryInterceptUnknownScid(scidHex, far)).to.equal(true);
+
+		h.height.value = 800_090;
+		h.manager.scanExpiringHolds();
+
+		expect(h.failed).to.have.length(2);
+		expect(near.revoked).to.equal(true);
+		expect(far.revoked).to.equal(true);
+		expect(h.manager.heldTotalMsat(scidHex)).to.equal(0n);
+		expect(h.opens).to.have.length(0);
+	});
+
 	it('never forwards a part the deadline already revoked', async function () {
 		const h = makeHarness({ holdExpiryMarginBlocks: 18 });
 		let releaseOpen = (): void => undefined;

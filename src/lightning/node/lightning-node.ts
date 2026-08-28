@@ -15678,9 +15678,12 @@ export class LightningNode extends EventEmitter {
 					this.updateFlaggedFailureData(TEMPORARY_CHANNEL_FAILURE)
 			  )
 			: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-		this.cleanupHtlcSharedSecret(secretKey);
 		const result = this.channelManager.failHtlc(channelId, inHtlcId, reason);
+		// The shared secret goes only once the failure is actually on its way:
+		// this path RETRIES, and a retry that has lost the secret can only send
+		// a zeroed packet the payer cannot decrypt.
 		if (result.ok === false) return false;
+		this.cleanupHtlcSharedSecret(secretKey);
 		this.emitStructuredLog('htlc', 'jit_restored_failed_upstream', {
 			channelId: part.inChannelIdHex,
 			htlcId: part.inHtlcId

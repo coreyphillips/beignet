@@ -540,7 +540,16 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 				])
 			);
 
+			// The onion shared secret comes back from storage with the channel,
+			// and the failure the payer decrypts is built from it.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(node as any).receivedHtlcSharedSecrets.set(
+				`${inChannelId.toString('hex')}:4`,
+				crypto.randomBytes(32)
+			);
+
 			const failed: bigint[] = [];
+			const reasons: Buffer[] = [];
 			const original = manager.failHtlc.bind(manager);
 			manager.failHtlc = (
 				cid: Buffer,
@@ -548,7 +557,10 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 				reason: Buffer
 			): ReturnType<typeof original> => {
 				const result = original(cid, htlcId, reason);
-				if (result.ok !== false) failed.push(htlcId);
+				if (result.ok !== false) {
+					failed.push(htlcId);
+					reasons.push(reason);
+				}
 				return result;
 			};
 
@@ -569,6 +581,12 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 			node.handleNewBlock(800_001);
 
 			expect(failed).to.deep.equal([4n]);
+			// The refused first attempt must not have consumed the shared
+			// secret: a retry without it can only send a zeroed packet the
+			// payer cannot decrypt.
+			expect(reasons[0].equals(Buffer.alloc(reasons[0].length))).to.equal(
+				false
+			);
 			expect(storage.loadMetadata('jit:held')).to.equal('[]');
 		} finally {
 			node.destroy();

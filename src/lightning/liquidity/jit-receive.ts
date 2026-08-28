@@ -830,29 +830,34 @@ export class JitReceiveManager extends EventEmitter {
 	scanExpiringHolds(): void {
 		if (this.deps.currentBlockHeight() <= 0) return;
 		let revoked = false;
-		const sweep = (
-			collection: Map<string, IHeldJitPart[]>,
-			onEmpty?: (key: string) => void
-		): void => {
-			for (const [key, parts] of [...collection]) {
-				const doomed: IHeldJitPart[] = [];
-				const survivors: IHeldJitPart[] = [];
-				for (const part of parts) {
-					(this.pastDeadline(part) ? doomed : survivors).push(part);
-				}
-				if (doomed.length === 0) continue;
-				if (survivors.length > 0) {
-					collection.set(key, survivors);
-				} else {
-					collection.delete(key);
-					onEmpty?.(key);
-				}
-				this.revokeAll(doomed, key);
-				revoked = true;
+		// The parts held for one intercept SCID are ONE payment's set: losing
+		// any of them to the deadline means the sender can never complete it, so
+		// forwarding the survivors would only park HTLCs on the client's fresh
+		// channel until they time out. The whole set goes.
+		for (const [scidHex, parts] of [...this.heldParts]) {
+			if (!parts.some((p) => this.pastDeadline(p))) continue;
+			this.heldParts.delete(scidHex);
+			this.clearAggregation(scidHex);
+			this.revokeAll(parts, scidHex);
+			revoked = true;
+		}
+		// A splice queue holds unrelated payments to the same channel, so here
+		// only the parts actually at their deadline are revoked.
+		for (const [key, parts] of [...this.spliceQueues]) {
+			const doomed: IHeldJitPart[] = [];
+			const survivors: IHeldJitPart[] = [];
+			for (const part of parts) {
+				(this.pastDeadline(part) ? doomed : survivors).push(part);
 			}
-		};
-		sweep(this.heldParts, (key) => this.clearAggregation(key));
-		sweep(this.spliceQueues);
+			if (doomed.length === 0) continue;
+			if (survivors.length > 0) {
+				this.spliceQueues.set(key, survivors);
+			} else {
+				this.spliceQueues.delete(key);
+			}
+			this.revokeAll(doomed, key);
+			revoked = true;
+		}
 		if (revoked) this.persistHeld();
 		this.sweepExpiredIntents();
 	}
@@ -1127,10 +1132,11 @@ export class JitReceiveManager extends EventEmitter {
 	}
 
 	private feeMsatFor(totalMsat: bigint): bigint {
-		return (
-			this.cfg.flatFeeSat * 1000n +
-			(totalMsat * BigInt(this.cfg.feePpm)) / 1_000_000n
-		);
+		// The ppm is operator config reaching bigint arithmetic; a fractional or
+		// negative one would throw out of BigInt() mid-funding rather than be
+		// refused, so it is normalised here.
+		const ppm = BigInt(Math.max(0, Math.floor(this.cfg.feePpm)));
+		return this.cfg.flatFeeSat * 1000n + (totalMsat * ppm) / 1_000_000n;
 	}
 
 	/** Null when the opening fee can be taken out of these parts. */
