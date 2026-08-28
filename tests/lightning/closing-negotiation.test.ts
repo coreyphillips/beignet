@@ -246,8 +246,11 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			expect(decoded.feeSatoshis >= 139n, 'ideal fee clears CLN floor').to.be
 				.true;
 
-			// The peer counters at its 139-sat floor; that must now fall inside
-			// our acceptable range and complete the close.
+			// The peer counters at its 139-sat floor. That is 0.82 sat/vB on a
+			// ~169-vbyte tx, under the relay floor, so we counter at the floor
+			// rather than closing on a tx no mempool would take (issue #579).
+			// The peer is not paying the fee here, so its own band accepts the
+			// higher counter and the close still completes.
 			const counter = opener.handleClosingSigned(
 				{
 					channelId: opener.getChannelId()!,
@@ -256,7 +259,21 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 				},
 				signFn
 			);
-			expect(hasAction(counter, ChannelActionType.CHANNEL_CLOSED)).to.be.true;
+			expect(hasAction(counter, ChannelActionType.CHANNEL_CLOSED)).to.be.false;
+			const countered = decodeClosingSignedMessage(
+				findSendAction(counter, MessageType.CLOSING_SIGNED)!
+			);
+			expect(countered.feeSatoshis).to.equal(169n);
+
+			const agreed = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 169n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+			expect(hasAction(agreed, ChannelActionType.CHANNEL_CLOSED)).to.be.true;
 		});
 
 		it('uses an injected live closing feerate over the commitment floor', function () {
@@ -580,9 +597,104 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 
 			expect(opener.getState()).to.equal(ChannelState.CLOSED);
 		});
+
+		it('refuses to counter when the opener balance cannot pay the relay floor (issue #579)', function () {
+			// The upper clamp is the opener's spendable balance, so it can drag a
+			// counter back under the relay floor. Our counter is an offer the peer
+			// can echo straight into CLOSED, so proposing there wedges us on an
+			// unbroadcastable tx exactly as accepting one does.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+			// 400 sat balance minus the 354 sat dust reserve leaves a 46 sat cap.
+			opener.getFullState().localBalanceMsat = 400_000n;
+
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 20n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+
+			expect(findSendAction(actions, MessageType.CLOSING_SIGNED)).to.be.null;
+			expect(findErrorAction(actions)).to.include('minimum relay fee');
+			expect(opener.getFullState().lastProposedClosingFeeSat).to.be.null;
+			// NEGOTIATING_CLOSING, so the unilateral exit stays available.
+			expect(opener.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+		});
 	});
 
 	describe('Fee range', function () {
+		it('floors closingFeeMin at the min-relay fee (issue #579)', function () {
+			// 0.5x the ideal fee is 0.5 sat/vB at the 253 sat/kw anchor floor: a
+			// tx no default-policy node relays, and the legacy close does not
+			// signal RBF, so signing one strands the balance in CLOSED.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+			opener.proposeClosingFee(crypto.randomBytes(64));
+
+			// 100 sat clears the old 0.5x floor (ideal is 171 sat) but pays only
+			// 0.59 sat/vB on the 169-vbyte closing tx.
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 100n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+
+			expect(opener.getFullState().closingFeeMin).to.equal(169n);
+			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.false;
+			expect(opener.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+			// We counter at the floor rather than revealing a sub-relay fee as
+			// acceptable: the midpoint (135 sat) is below it.
+			const countered = decodeClosingSignedMessage(
+				findSendAction(actions, MessageType.CLOSING_SIGNED)!
+			);
+			expect(countered.feeSatoshis).to.equal(169n);
+		});
+
+		it('raises a restored sub-relay range and refuses the echo of a pre-floor proposal (issue #579)', function () {
+			// Both fields are persisted, so a negotiation restored from a snapshot
+			// written before the floor existed reaches the acceptance branches
+			// without ever passing initClosingFeeRange.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+			const state = opener.getFullState();
+			state.closingFeeMin = 85n;
+			state.closingFeeMax = 342n;
+			state.lastProposedClosingFeeSat = 90n;
+
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 90n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+
+			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.false;
+			expect(state.closingFeeMin).to.equal(169n);
+			// Re-offered at the floor rather than closed on the old fee.
+			const countered = decodeClosingSignedMessage(
+				findSendAction(actions, MessageType.CLOSING_SIGNED)!
+			);
+			expect(countered.feeSatoshis).to.equal(169n);
+			expect(opener.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+		});
+
 		it('should initialize fee range on first closing_signed', function () {
 			const { opener } = setupNegotiatingChannels();
 			opener.handleShutdown({

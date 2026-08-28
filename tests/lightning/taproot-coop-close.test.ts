@@ -426,6 +426,42 @@ describe('Taproot cooperative close (MuSig2)', function () {
 		expect(bobChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
 	});
 
+	it('responder rejects an in-band fee below the min-relay floor (issue #579)', function () {
+		// The band floor is ideal/5, i.e. 0.2 sat/vB at the 253 sat/kw anchor
+		// floor. Single-round negotiation means accepting IS closing, so a fee
+		// in that gap put us in CLOSED holding a tx no mempool takes, with only
+		// the peer (whose output pays the fee) able to replace it.
+		const { bobChannel, channelId } = readyTaprootChannel(63, 64);
+		bobChannel.handleShutdown(
+			{
+				channelId,
+				scriptPubkey: P2WPKH_A,
+				shutdownNonce: crypto.randomBytes(66)
+			},
+			P2WPKH_A
+		);
+		expect(bobChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+
+		// 100 sat is well above ideal/5 (26 sat) but pays 0.77 sat/vB on the
+		// 130-vbyte taproot closing tx.
+		const actions = bobChannel.handleClosingSigned(
+			{
+				channelId,
+				feeSatoshis: 100n,
+				signature: Buffer.alloc(64),
+				partialSignature: crypto.randomBytes(32)
+			},
+			() => crypto.randomBytes(32)
+		);
+		const err = actions.find((a) => a.type === ChannelActionType.ERROR) as {
+			message: string;
+		};
+		expect(err, 'sub-relay fee rejected').to.exist;
+		expect(err.message).to.match(/outside acceptable range \[130,/);
+		expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
+		expect(bobChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+	});
+
 	it('responder rejects a fee exceeding the opener balance', function () {
 		// bob (non-opener responder): the fee comes out of ALICE's output, and a
 		// fee above her whole balance can never produce a valid closing tx. The

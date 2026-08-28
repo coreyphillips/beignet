@@ -137,6 +137,23 @@ export function calculateClosingFee(
 	remoteScriptLen: number,
 	isTaproot = false
 ): bigint {
+	const totalWeight = closingTxWeight(
+		localScriptLen,
+		remoteScriptLen,
+		isTaproot
+	);
+	// fee = weight * feeRatePerKw / 1000
+	return BigInt(Math.ceil((totalWeight * feeratePerKw) / 1000));
+}
+
+/**
+ * Weight (WU) of a cooperative-close transaction with the given output scripts.
+ */
+export function closingTxWeight(
+	localScriptLen: number,
+	remoteScriptLen: number,
+	isTaproot = false
+): number {
 	// Base weight: header (40) + 1 input (164 witness-adjusted) + segwit marker (2)
 	// = 206 weight units for base + input
 	const baseWeight = 206;
@@ -151,11 +168,23 @@ export function calculateClosingFee(
 	//   sig = 66 weight units
 	const witnessWeight = isTaproot ? 66 : 220;
 
-	const totalWeight =
-		baseWeight + localOutputWeight + remoteOutputWeight + witnessWeight;
+	return baseWeight + localOutputWeight + remoteOutputWeight + witnessWeight;
+}
 
-	// fee = weight * feeRatePerKw / 1000
-	return BigInt(Math.ceil((totalWeight * feeratePerKw) / 1000));
+/**
+ * Bitcoin Core's default minimum relay feerate, in sat/kvB (1 sat/vB).
+ */
+export const MIN_RELAY_FEERATE_SAT_PER_KVB = 1000n;
+
+/**
+ * Smallest fee (sat) a transaction of this weight needs to be relayed by a
+ * default-policy node. A tx paying less is not "cheap", it is unbroadcastable:
+ * every mempool rejects it, so it can neither confirm nor be replaced (the
+ * legacy closing tx does not even signal RBF).
+ */
+export function minRelayFeeForWeight(weightUnits: number | bigint): bigint {
+	const vbytes = (BigInt(weightUnits) + 3n) / 4n;
+	return (vbytes * MIN_RELAY_FEERATE_SAT_PER_KVB + 999n) / 1000n;
 }
 
 // ─────────────── option_simple_close ───────────────

@@ -67,7 +67,12 @@ import {
 	encodeClosingCompleteMessage,
 	encodeClosingSigMessage
 } from '../message/channel-close';
-import { isDustOutput, calculateClosingFee } from '../chain/closing';
+import {
+	isDustOutput,
+	calculateClosingFee,
+	closingTxWeight,
+	minRelayFeeForWeight
+} from '../chain/closing';
 import {
 	encodeChannelReestablishMessage,
 	IChannelReestablishMessage
@@ -5545,19 +5550,34 @@ export class Channel {
 		if (this._state.state !== ChannelState.CLOSED) return false;
 		const hex = this._state.lastCooperativeCloseTxHex;
 		if (!hex) return false;
-		let locktime: number;
+		let tx: bitcoin.Transaction;
 		try {
-			locktime = bitcoin.Transaction.fromHex(hex).locktime;
+			tx = bitcoin.Transaction.fromHex(hex);
 		} catch {
 			// A recorded close tx that does not even parse cannot be broadcast.
 			return true;
 		}
 		// Timestamp-space locktimes never come from our own negotiation and
 		// cannot be judged against a block tip; treat them as unbroadcastable.
-		if (locktime >= 500_000_000) return true;
+		if (tx.locktime >= 500_000_000) return true;
 		// Height-space: non-final while our tip is provably below it. With no
 		// tip yet (0) nothing is provable, and the normal CLOSED refusal holds.
-		return this._currentBlockHeight > 0 && locktime > this._currentBlockHeight;
+		if (
+			this._currentBlockHeight > 0 &&
+			tx.locktime > this._currentBlockHeight
+		) {
+			return true;
+		}
+		// A fee under the default relay floor is the same dead end by a different
+		// route (issue #579): rejected by every mempool, and the legacy close does
+		// not signal RBF, so only the peer whose output pays the fee could ever
+		// replace it. The funding value is the sole input, so outputs exceeding it
+		// mean the recorded tx and our capacity disagree, which proves nothing.
+		let outputTotal = 0n;
+		for (const out of tx.outs) outputTotal += BigInt(out.value);
+		if (outputTotal > this._state.fundingSatoshis) return false;
+		const fee = this._state.fundingSatoshis - outputTotal;
+		return fee < minRelayFeeForWeight(tx.weight());
 	}
 
 	/**
@@ -6326,6 +6346,14 @@ export class Channel {
 			this.initClosingFeeRange(idealFee);
 		}
 
+		// The range is persisted, so a negotiation restored from a snapshot
+		// written before this floor existed carries a sub-relay minimum. Raise it
+		// at the point of use, not just where it is built.
+		const relayFloor = this.minRelayClosingFee();
+		if (this._state.closingFeeMin! < relayFloor) {
+			this._state.closingFeeMin = relayFloor;
+		}
+
 		// Fund-safety: never transition to CLOSED (which tears down the funding-output
 		// watch upstream) on fee agreement ALONE. A peer can echo our proposed fee with
 		// a garbage signature; if we closed + stopped watching we could not punish a
@@ -6350,10 +6378,15 @@ export class Channel {
 			);
 		}
 
-		// If their fee matches our last proposal → agreement reached
+		// If their fee matches our last proposal → agreement reached. Our own
+		// proposal is relay-floored, but the recorded one is persisted too: a
+		// negotiation restored from a pre-floor snapshot could otherwise be
+		// closed by echoing the fee we offered back then. Falling through
+		// re-offers at the floor instead of closing on a tx we cannot broadcast.
 		if (
 			this._state.lastProposedClosingFeeSat !== null &&
-			msg.feeSatoshis === this._state.lastProposedClosingFeeSat
+			msg.feeSatoshis === this._state.lastProposedClosingFeeSat &&
+			msg.feeSatoshis >= relayFloor
 		) {
 			this._state.state = ChannelState.CLOSED;
 			return [
@@ -6399,6 +6432,21 @@ export class Channel {
 			counterFee = this._state.closingFeeMin!;
 		if (counterFee > this._state.closingFeeMax!)
 			counterFee = this._state.closingFeeMax!;
+
+		// closingFeeMin carries the relay floor, but the upper clamp (the opener's
+		// spendable balance) can push the counter back under it. A counter is an
+		// offer: the peer echoes it and we close on it, so proposing a sub-relay
+		// fee wedges us exactly as accepting one does. Refuse instead (bare and
+		// local): the channel stays in NEGOTIATING_CLOSING, from which force
+		// close is available.
+		if (counterFee < relayFloor) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot counter-propose a closing fee: the opener's balance cannot pay the ${relayFloor} sat minimum relay fee`
+				}
+			];
+		}
 
 		this._state.lastProposedClosingFeeSat = counterFee;
 
@@ -6504,10 +6552,16 @@ export class Channel {
 		const bandLocalLen = this._state.localShutdownScript?.length ?? 22;
 		const bandRemoteLen = this._state.remoteShutdownScript?.length ?? 22;
 		const bandWeight = BigInt(
-			206 + 4 * (9 + bandLocalLen) + 4 * (9 + bandRemoteLen) + 66
+			closingTxWeight(bandLocalLen, bandRemoteLen, true)
 		);
 		const idealFee = (bandWeight * bandFeeRate + 999n) / 1000n;
-		const minAcceptableFee = idealFee / 5n;
+		// The lenient interop floor, but never below what the tx needs to relay:
+		// single-round negotiation means accepting is closing, and a sub-relay
+		// close leaves CLOSED with a tx no mempool takes and no RBF to replace
+		// it (issue #579).
+		const relayFloor = minRelayFeeForWeight(bandWeight);
+		const bandFloor = idealFee / 5n;
+		const minAcceptableFee = bandFloor > relayFloor ? bandFloor : relayFloor;
 		// The fee comes out of the OPENER's output only. When WE are the opener the
 		// fee is paid from OUR balance, so bound it tightly (the legacy 2x cap) and
 		// reserve our dust limit: without this an adversarial non-opener could send
@@ -6610,11 +6664,37 @@ export class Channel {
 		// real weight.
 		const localLen = this._state.localShutdownScript?.length ?? 22;
 		const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
-		return calculateClosingFee(
+		const fee = calculateClosingFee(
 			feeRate,
 			localLen,
 			remoteLen,
 			isTaprootChannel(this._state.channelType)
+		);
+		// A feerate below ~1 sat/vB (a stale or lowballed commitment feerate on a
+		// non-anchor channel) prices a tx nothing will relay, and the acceptance
+		// range and counter clamp are both fractions of this one fee.
+		const floor = this.minRelayClosingFee();
+		return fee > floor ? fee : floor;
+	}
+
+	/**
+	 * Smallest fee the closing tx we would sign can be broadcast with.
+	 *
+	 * Fund-safety floor, not a fee preference: agreement puts us in CLOSED with
+	 * the funding watch torn down, and a sub-relay close tx confirms in no
+	 * mempool while the legacy close (sequence 0xffffffff) is not RBF-signalled
+	 * either. Only the peer, whose output pays the fee, could ever replace it
+	 * (issue #579).
+	 */
+	private minRelayClosingFee(): bigint {
+		const localLen = this._state.localShutdownScript?.length ?? 22;
+		const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
+		return minRelayFeeForWeight(
+			closingTxWeight(
+				localLen,
+				remoteLen,
+				isTaprootChannel(this._state.channelType)
+			)
 		);
 	}
 
@@ -6623,7 +6703,9 @@ export class Channel {
 		// When WE are the opener the fee comes out of OUR output, so also reserve
 		// our dust limit: a fee that pushes our output below dust would silently
 		// drop it from the closing tx and burn the remainder to fees.
-		const min = idealFee / 2n;
+		const halfIdeal = idealFee / 2n;
+		const relayFloor = this.minRelayClosingFee();
+		const min = halfIdeal > relayFloor ? halfIdeal : relayFloor;
 		const max = idealFee * 2n;
 		const isOpener = this._state.role === ChannelRole.OPENER;
 		let openerBalance = isOpener
