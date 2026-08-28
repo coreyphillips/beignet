@@ -16793,10 +16793,10 @@ export class Channel {
 			// above withheld it), so the peer cannot complete the splice
 			// either. Record the peer's material and wait; the witness
 			// delivery runs the completion tail.
-			const owedExternal = this._state.spliceInFlight
-				? this._spliceOwedExternalIndices(this._state.spliceInFlight)
-				: [];
-			if (owedExternal.length > 0) {
+			// Read through the same predicate the send helper above withheld
+			// on, record or not: the two must never disagree, or a withheld
+			// send would be followed by a broadcast of the same hole.
+			if (this._spliceOwedExternal().length > 0) {
 				this._state.spliceFundingTxid = Buffer.from(tx.getHash());
 				this._state.spliceFundingOutputIndex =
 					this._spliceTx!.newFundingOutputIndex;
