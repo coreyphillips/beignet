@@ -17768,10 +17768,11 @@ export class LightningNode extends EventEmitter {
 	 * Whether a forward's OUTGOING leg is irrevocably resolved as failed, the
 	 * only condition under which refunding the inbound leg upstream is safe.
 	 *
-	 * BOLT 2 fund safety: anything else (still in flight, FULFILLED, or gone
-	 * from a channel that is no longer live and therefore ambiguous) leaves
-	 * the downstream able to claim, so an upstream refund would pay B and
-	 * refund A for the same forward.
+	 * BOLT 2 fund safety: anything else (still in flight, a fail whose removal
+	 * round has not completed, FULFILLED, or gone from a channel that is no
+	 * longer live and therefore ambiguous) leaves the downstream able to
+	 * claim, so an upstream refund would pay B and refund A for the same
+	 * forward.
 	 *
 	 * The one copy of that judgment, used by both expiry scanners and by the
 	 * owed-fail reconciliation (issue #575). They run in the same block, so a
@@ -17795,7 +17796,21 @@ export class LightningNode extends EventEmitter {
 			.getChannel(outChannelId)
 			?.getFullState();
 		const outHtlc = outState?.htlcs.get(outEntryKey);
-		if (outHtlc?.state === HtlcState.FAILED) return true;
+		// FAILED means the removal round is RUNNING, not finished: the
+		// settlement loop deletes the entry the moment the removal is
+		// irrevocable, so a FAILED entry still in the map has both phases to
+		// go, and the downstream can still claim through either of them. While
+		// removalLocallyRevoked is false a disconnect rolls the leg back to
+		// COMMITTED (markForReestablish) and the peer may retransmit a fulfill
+		// instead; while removalRemoteCommitted is false the peer's last signed
+		// commitment still carries the offered output for an HTLC-success.
+		// Absent flags are the legacy "already committed" encoding.
+		if (
+			outHtlc?.state === HtlcState.FAILED &&
+			outHtlc.removalLocallyRevoked !== false &&
+			outHtlc.removalRemoteCommitted !== false
+		)
+			return true;
 
 		// The two arms below infer the failure from an absence rather than
 		// reading it off the leg, and both inferences rest on no preimage ever
