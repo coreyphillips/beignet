@@ -762,6 +762,53 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 		expect(h.aliceChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
 	});
 
+	it('force close recovers a CLOSED channel whose recorded mutual close pays under the relay floor', function () {
+		// Issue #579: the sibling dead end. A close signed below the default
+		// 1 sat/vB relay floor is rejected by every mempool, and only the peer
+		// (whose output pays the fee) could replace it, so CLOSED must not be
+		// terminal for it either.
+		const h = openChannelHarness(31, 32, 400_000_000n);
+		h.alice.on('error', () => {});
+		expect(h.alice.initiateShutdown(h.channelId, ALICE_SCRIPT).ok).to.equal(
+			true
+		);
+		pump(h.aliceOut, h.bob, h.aPub);
+		pump(h.bobOut, h.alice, h.bPub);
+		pump(h.aliceOut, h.bob, h.aPub);
+		pump(h.bobOut, h.alice, h.bPub);
+		expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+		const state = h.aliceChannel.getFullState();
+		h.aliceChannel.setBlockHeight(800_000);
+
+		// The negotiated close pays a relayable fee, so CLOSED stands.
+		const destScript = Buffer.from('0014' + 'dd'.repeat(20), 'hex');
+		const refused = h.alice.forceClose(h.channelId, destScript, 10);
+		expect(refused.ok).to.equal(false);
+		expect(refused.error).to.match(/wrong state/);
+
+		// Hand the fee back to the outputs, leaving 1 sat of fee on a ~169
+		// vbyte tx: the shape a peer-chosen sub-relay fee records.
+		const starved = bitcoin.Transaction.fromHex(
+			state.lastCooperativeCloseTxHex!
+		);
+		const outputTotal = starved.outs.reduce((sum, o) => sum + o.value, 0);
+		starved.outs[0].value += Number(state.fundingSatoshis) - outputTotal - 1;
+		h.aliceChannel.recordCooperativeCloseTx(starved.toHex());
+
+		const result = h.alice.forceClose(h.channelId, destScript, 10);
+		expect(result.ok).to.equal(true);
+		const broadcast = result.actions.find(
+			(a) => a.type === ChannelActionType.BROADCAST_TX
+		) as { tx: Buffer } | undefined;
+		expect(broadcast).to.exist;
+		const commitment = bitcoin.Transaction.fromBuffer(broadcast!.tx);
+		expect(
+			commitment.ins[0].hash.equals(state.fundingTxid!),
+			'commitment spends the funding outpoint'
+		).to.equal(true);
+		expect(h.aliceChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+	});
+
 	it('falls back to legacy closing_signed when the peer lacks the feature', function () {
 		const h = openChannelHarness(17, 18, 400_000_000n, false);
 

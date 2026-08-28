@@ -137,13 +137,39 @@ export function calculateClosingFee(
 	remoteScriptLen: number,
 	isTaproot = false
 ): bigint {
+	const totalWeight = closingTxWeight(
+		localScriptLen,
+		remoteScriptLen,
+		isTaproot
+	);
+	// fee = weight * feeRatePerKw / 1000
+	return BigInt(Math.ceil((totalWeight * feeratePerKw) / 1000));
+}
+
+/**
+ * Weight (WU) of a cooperative-close transaction with the given output scripts.
+ */
+export function closingTxWeight(
+	localScriptLen: number,
+	remoteScriptLen: number,
+	isTaproot = false
+): number {
+	return closingWeightForOutputs([localScriptLen, remoteScriptLen], isTaproot);
+}
+
+function closingWeightForOutputs(
+	outputScriptLens: number[],
+	isTaproot: boolean
+): number {
 	// Base weight: header (40) + 1 input (164 witness-adjusted) + segwit marker (2)
 	// = 206 weight units for base + input
 	const baseWeight = 206;
 
 	// Output weight: 4 * (8 + 1 + scriptLen) per output
-	const localOutputWeight = 4 * (8 + 1 + localScriptLen);
-	const remoteOutputWeight = 4 * (8 + 1 + remoteScriptLen);
+	let outputWeight = 0;
+	for (const scriptLen of outputScriptLens) {
+		outputWeight += 4 * (8 + 1 + scriptLen);
+	}
 
 	// Witness:
 	// - P2WSH 2-of-2 (OP_0 + 2 sigs + redeemScript) ≈ 220 weight units
@@ -151,11 +177,68 @@ export function calculateClosingFee(
 	//   sig = 66 weight units
 	const witnessWeight = isTaproot ? 66 : 220;
 
-	const totalWeight =
-		baseWeight + localOutputWeight + remoteOutputWeight + witnessWeight;
+	return baseWeight + outputWeight + witnessWeight;
+}
 
-	// fee = weight * feeRatePerKw / 1000
-	return BigInt(Math.ceil((totalWeight * feeratePerKw) / 1000));
+export interface IClosingRelayParams {
+	fundingAmount: bigint;
+	localScriptPubkey: Buffer;
+	remoteScriptPubkey: Buffer;
+	localAmount: bigint;
+	remoteAmount: bigint;
+	isTaproot?: boolean;
+}
+
+/**
+ * Fee the closing tx built from these amounts would actually pay, and the
+ * weight it would actually have.
+ *
+ * Neither follows from the negotiated fee. buildClosingTx drops any output
+ * below dust, so a fee the payer's balance cannot cover does not shrink its
+ * output, it deletes it: the tx then pays exactly the payer's balance, on a
+ * one-output tx that is ~31 vbytes smaller. Both directions matter (issue
+ * #579) — the deleted output can leave a fee of zero, and the smaller tx
+ * needs less to relay than the two-output estimate.
+ */
+export function closingTxRelayProfile(params: IClosingRelayParams): {
+	feePaid: bigint;
+	weight: number;
+} {
+	const scriptLens: number[] = [];
+	let outputTotal = 0n;
+	if (params.localAmount >= BigInt(getDustLimit(params.localScriptPubkey))) {
+		scriptLens.push(params.localScriptPubkey.length);
+		outputTotal += params.localAmount;
+	}
+	if (params.remoteAmount >= BigInt(getDustLimit(params.remoteScriptPubkey))) {
+		scriptLens.push(params.remoteScriptPubkey.length);
+		outputTotal += params.remoteAmount;
+	}
+	return {
+		// Outputs above the funding value describe no signable tx; report the
+		// worst case rather than a negative fee.
+		feePaid:
+			params.fundingAmount > outputTotal
+				? params.fundingAmount - outputTotal
+				: 0n,
+		weight: closingWeightForOutputs(scriptLens, params.isTaproot === true)
+	};
+}
+
+/**
+ * Bitcoin Core's default minimum relay feerate, in sat/kvB (1 sat/vB).
+ */
+export const MIN_RELAY_FEERATE_SAT_PER_KVB = 1000n;
+
+/**
+ * Smallest fee (sat) a transaction of this weight needs to be relayed by a
+ * default-policy node. A tx paying less is not "cheap", it is unbroadcastable:
+ * every mempool rejects it, so it can neither confirm nor be replaced (the
+ * legacy closing tx does not even signal RBF).
+ */
+export function minRelayFeeForWeight(weightUnits: number | bigint): bigint {
+	const vbytes = (BigInt(weightUnits) + 3n) / 4n;
+	return (vbytes * MIN_RELAY_FEERATE_SAT_PER_KVB + 999n) / 1000n;
 }
 
 // ─────────────── option_simple_close ───────────────
