@@ -3138,6 +3138,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'The channel was restored from a Recovery Capsule and no channel_reestablish has proven its state current, so it takes no new HTLCs and is offered to no router. Existing HTLCs still settle; a cooperative close is refused in both directions without the acceptStaleStateRisk acknowledgement on /channel/close. Present only while the hold stands'
 						},
+						fundingUnaccounted: {
+							type: 'boolean',
+							description:
+								'Neither mempool nor chain can account for the funding transaction and this node has no broadcast left to answer with, so the channel is quarantined: no new HTLCs, no router edge, no routing hint. Existing HTLCs still settle and a close still negotiates. Reversible and not a forget decision: it clears by itself when the funding is seen again. Present only while the quarantine stands'
+						},
 						peerSupportsSplicing: {
 							type: 'boolean',
 							description:

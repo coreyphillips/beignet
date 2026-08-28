@@ -299,12 +299,28 @@ export async function classifyRemoteFundingInput(
  *   confirmation from the original funding without trusting channel state
  * - 'funding:spent' (channelId: Buffer, spendingTx: Transaction)
  * - 'funding:missing' (channelId: Buffer, txid: string): the watched funding
- *   tx disappeared from mempool AND chain before confirming (evicted/replaced)
+ *   tx disappeared from mempool AND chain before confirming (evicted/replaced).
+ *   Latched: it fires once per continuous absence, so a consumer running a
+ *   per-block policy against it must also poll getFundingPresence (issue #463)
+ * - 'funding:recovered' (channelId: Buffer, txid: string): a funding reported
+ *   missing is accounted for again, either back in mempool or chain or backed
+ *   by provisional on-chain evidence. Edge-triggered on the report clearing,
+ *   and the exact counterpart of the 'funding:missing' above (issue #593)
  * - 'funding:discovered' (channelId: Buffer, txid: string): a restored watch
  *   bound to a funding in the script's history that the restored record never
  *   named, having seen it spent by the two parties that alone can (issue #463)
+ * - 'funding:presplice-retired' (channelId: Buffer, txid: string,
+ *   outputIndex: number): a superseded pre-splice outpoint was seen spent by
+ *   the splice, so its extra watch and the durable record behind it retire
+ * - 'announcement:depth' (channelId: Buffer, height: number, txIndex: number)
+ * - 'output:spent' (txid: string, outputIndex: number)
+ * - 'output:unspent' (txid: string, outputIndex: number)
+ * - 'watch:output:requested' (txid: string, outputIndex: number): this watcher
+ *   needs an output watched and cannot arm it itself
+ * - 'block' (height: number)
  * - 'broadcast:success' (txid: string)
  * - 'broadcast:failure' (error: Error)
+ * - 'broadcast:permanent_failure' (error: Error): retries exhausted
  * - 'error' (error: Error)
  *
  * CONTRACT: register an 'error' listener. Chain failures are reported there
@@ -1370,6 +1386,24 @@ export class ChainWatcher extends EventEmitter {
 		});
 	}
 
+	/**
+	 * The funding is accounted for: reset the absence debounce and, if an
+	 * absence was actually REPORTED, tell listeners it is over (issue #593).
+	 *
+	 * One helper rather than an assignment at each site, because a consumer
+	 * holding a restriction raised by 'funding:missing' needs the counterpart
+	 * from EVERY arm that clears the report, not just the one that motivated
+	 * it: a lift that a provisional finding reaches but a mempool reappearance
+	 * does not is a channel left quarantined by the arm nobody wired.
+	 * Edge-triggered, so an ordinary present check emits nothing.
+	 */
+	private clearMissingReport(watched: IWatchedFunding): void {
+		watched.missingChecks = 0;
+		if (!watched.missingReported) return;
+		watched.missingReported = false;
+		this.emit('funding:recovered', watched.channelId, watched.txid);
+	}
+
 	private async checkFundingConfirmation(
 		key: string,
 		// Defaults to the current generation for callers that ARE the start of
@@ -1453,8 +1487,7 @@ export class ChainWatcher extends EventEmitter {
 				// its funding value. It is NOT reported as a confirmation and
 				// the watched outpoint does not move, because the evidence
 				// that it is ours has not arrived yet.
-				watched.missingChecks = 0;
-				watched.missingReported = false;
+				this.clearMissingReport(watched);
 				return;
 			}
 		}
@@ -1472,8 +1505,7 @@ export class ChainWatcher extends EventEmitter {
 			return;
 		}
 		// Present again (mempool or chain): a reorg can bounce a tx back.
-		watched.missingChecks = 0;
-		watched.missingReported = false;
+		this.clearMissingReport(watched);
 		const entry = entries.find((h) => h.height > 0);
 		if (!entry) return; // in the mempool, not yet confirmed
 

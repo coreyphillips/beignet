@@ -5064,6 +5064,10 @@ export class BeignetNode extends EventEmitter {
 			issues.push(
 				'HELD_RESTORE: Channel was restored from a Recovery Capsule and its state has not been proven current, so it takes no new HTLCs. Routing hints will be skipped.'
 			);
+		if (state.fundingUnaccounted === true)
+			issues.push(
+				'FUNDING_UNACCOUNTED: Neither mempool nor chain can account for the funding transaction, so the channel takes no new HTLCs. Routing hints will be skipped. Existing HTLCs still settle, and the quarantine lifts by itself if the funding reappears.'
+			);
 		if (
 			state.state !== 'NORMAL' &&
 			state.preReestablishState !== 'NORMAL' &&
@@ -5132,6 +5136,7 @@ export class BeignetNode extends EventEmitter {
 		pendingSpliceLocalBalanceMsat?: bigint;
 		htlcUsable?: boolean;
 		restoreRecencyUnproven?: boolean;
+		fundingUnaccounted?: boolean;
 		payThroughSplice?: boolean;
 		localReserveMsat?: bigint;
 		remoteReserveMsat?: bigint;
@@ -5187,6 +5192,7 @@ export class BeignetNode extends EventEmitter {
 		if (ch.htlcUsable !== undefined) info.htlcUsable = ch.htlcUsable;
 		if (ch.restoreRecencyUnproven)
 			info.restoreRecencyUnproven = ch.restoreRecencyUnproven;
+		if (ch.fundingUnaccounted) info.fundingUnaccounted = ch.fundingUnaccounted;
 		if (ch.payThroughSplice !== undefined)
 			info.payThroughSplice = ch.payThroughSplice;
 		if (ch.isPrivate !== undefined) info.isPrivate = ch.isPrivate;

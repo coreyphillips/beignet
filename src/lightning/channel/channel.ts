@@ -5503,6 +5503,38 @@ export class Channel {
 	}
 
 	/**
+	 * Quarantine the channel against NEW HTLCs while the chain cannot account
+	 * for its funding (issue #593). Returns true when THIS call raised it, so
+	 * the caller knows it owes a persist.
+	 *
+	 * Layered over the forget clock, not a step of it: the clock decides when
+	 * the channel may be forgotten, and this decides whether we may keep
+	 * writing new obligations against an outpoint nothing has seen. Reversible,
+	 * where the clock's verdict is not.
+	 */
+	markFundingUnaccounted(): boolean {
+		if (this._state.fundingUnaccounted === true) return false;
+		this._state.fundingUnaccounted = true;
+		return true;
+	}
+
+	/**
+	 * Lift the quarantine: the funding is accounted for again. Returns true
+	 * when this call lifted a standing one, so the caller knows it owes a
+	 * persist of its own.
+	 */
+	clearFundingUnaccounted(): boolean {
+		if (this._state.fundingUnaccounted === undefined) return false;
+		delete this._state.fundingUnaccounted;
+		return true;
+	}
+
+	/** Whether the funding-missing quarantine stands (issue #593). */
+	isFundingUnaccounted(): boolean {
+		return this._state.fundingUnaccounted === true;
+	}
+
+	/**
 	 * Retire the retained funding payload, which lives with the broadcast
 	 * obligation it serves. Returns true when this call dropped one.
 	 */
@@ -11439,6 +11471,13 @@ export class Channel {
 	 * its on-chain HTLC deadline backstops can never fire, and an obligation
 	 * taken on here has no enforcement behind it: the peer can simply stall.
 	 *
+	 * A channel whose funding the chain cannot account for answers false too
+	 * (issue #593). Its balance is a claim on an outpoint no one has seen, and
+	 * every enforcement route for a new HTLC ends at a commitment spending that
+	 * outpoint, so an obligation taken on here is unenforceable in the same
+	 * way. The BOLT 2 forget clock runs alongside and is untouched by this: the
+	 * quarantine is reversible and forgetting is not.
+	 *
 	 * A SEPARATE predicate from isHtlcUsable rather than a clause inside it,
 	 * because existing HTLCs must still settle and fail off chain. Folding the
 	 * hold into isHtlcUsable stopped the deferred-settle drains, and a held
@@ -11453,6 +11492,7 @@ export class Channel {
 	 */
 	acceptsNewHtlcs(lookThroughReestablish = false): boolean {
 		if (this._state.restoreRecencyUnproven === true) return false;
+		if (this._state.fundingUnaccounted === true) return false;
 		return this.isHtlcUsable(lookThroughReestablish);
 	}
 
