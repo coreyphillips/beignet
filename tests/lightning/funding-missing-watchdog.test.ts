@@ -107,6 +107,41 @@ class ControlledBackend implements IChainBackend {
 	}
 }
 
+/**
+ * A backend that can PARK history requests, so a test can choose the order two
+ * overlapping scans finish in independently of the order they started in.
+ * Each request captures the history that was queued when it was issued.
+ */
+class ParkingBackend implements IChainBackend {
+	/** Served to the next request, and captured by it. */
+	next: Array<{ txid: string; height: number }> = [];
+	/** False makes every subsequent request park until released by index. */
+	autoResolve = true;
+	private parked: Array<() => void> = [];
+	async subscribeToHeaders(): Promise<void> {}
+	async subscribeToScriptHash(): Promise<void> {}
+	getScriptHashHistory(): Promise<Array<{ txid: string; height: number }>> {
+		const history = this.next;
+		if (this.autoResolve) return Promise.resolve(history);
+		return new Promise((resolve) => {
+			this.parked.push(() => resolve(history));
+		});
+	}
+	release(index: number): void {
+		const [resolve] = this.parked.splice(index, 1);
+		resolve();
+	}
+	get parkedCount(): number {
+		return this.parked.length;
+	}
+	async getTransaction(): Promise<Buffer> {
+		throw new Error('not needed');
+	}
+	async broadcastTransaction(): Promise<string> {
+		return '';
+	}
+}
+
 const tick = (ms = 25) => new Promise((r) => setTimeout(r, ms));
 
 /** The white-box view of a channel's mutable state these suites poke at. */
@@ -298,6 +333,71 @@ describe('Funding-missing watchdog', function () {
 
 		await recheck(3);
 		expect(recovered, 'once, not once per check').to.have.length(1);
+	});
+
+	it('a stale presence answer cannot lift a newer absence verdict', async function () {
+		// Scans of one watch overlap routinely, and each holds a history it
+		// fetched before its awaits. Presence and absence are verdicts about
+		// the same question, so an older scan resolving last must not overwrite
+		// the newer one: it would clear a standing quarantine and cost three
+		// fresh absences to raise again.
+		const parking = new ParkingBackend();
+		const channelManager = new ChannelManager({
+			localBasepoints: makeBasepoints(makeSeed(2)),
+			localPerCommitmentSeed: crypto.randomBytes(32),
+			localFundingPrivkey: crypto.randomBytes(32)
+		});
+		channelManager.on('error', () => {});
+		const w = new ChainWatcher({ backend: parking, channelManager });
+		w.on('error', () => {});
+		const recovered: string[] = [];
+		w.on('funding:recovered', (_id: Buffer, txid: string) =>
+			recovered.push(txid)
+		);
+
+		parking.next = [{ txid: fundingTxid, height: 0 }];
+		await w.watchFundingOutput(channelId, fundingTxid, 0, 1, fundingScript);
+		await tick();
+		parking.next = [];
+		for (let i = 0; i < 3; i++) {
+			w.recheckAllWatches();
+			await tick();
+		}
+		expect(w.getFundingPresence(channelId), 'reported absent').to.equal(
+			'absent'
+		);
+
+		// Scan A starts first and sees the funding present; scan B starts after
+		// it and sees it gone. B answers first, then A.
+		parking.autoResolve = false;
+		parking.next = [{ txid: fundingTxid, height: 0 }];
+		w.recheckAllWatches();
+		await tick();
+		parking.next = [];
+		w.recheckAllWatches();
+		await tick();
+		expect(parking.parkedCount, 'two scans in flight').to.equal(2);
+		parking.release(1);
+		await tick();
+		parking.release(0);
+		await tick();
+
+		expect(recovered, 'the older answer is discarded').to.have.length(0);
+		expect(
+			w.getFundingPresence(channelId),
+			'and the newer verdict stands'
+		).to.equal('absent');
+
+		// A scan that genuinely starts after the absence still lifts it, so the
+		// arbitration is an ordering rule and not a block.
+		parking.autoResolve = true;
+		parking.next = [{ txid: fundingTxid, height: 0 }];
+		w.recheckAllWatches();
+		await tick();
+		expect(recovered, 'a fresh presence answer is honoured').to.have.length(1);
+		expect(w.getFundingPresence(channelId)).to.equal('present');
+
+		w.stop();
 	});
 
 	it('a merely unconfirmed (mempool) tx never alarms', async function () {

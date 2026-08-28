@@ -142,10 +142,8 @@ interface IWatchedFunding {
 	 */
 	provisional?: Array<{ txid: string; outputIndex: number; height: number }>;
 	/**
-	 * Bumped whenever a check adopts an outpoint or records a confirmation.
-	 * Every check captures it before its first await and re-reads it after,
-	 * so a scan that stalled while another finished retires instead of
-	 * overwriting the newer answer with its own stale one (issue #463).
+	 * Monotonic dispenser: every confirmation scan of this watch takes the
+	 * next value before its first await (issue #463).
 	 *
 	 * CONFIRMATION half only. The spend half is arbitrated per CHANNEL
 	 * instead, by `channelSpendScans`, because a channel has more than one
@@ -153,7 +151,20 @@ interface IWatchedFunding {
 	 * answer for one shared monitor; a per-watch counter cannot express that.
 	 * Do not merge the two.
 	 */
-	scanRevision?: number;
+	nextScanTicket?: number;
+	/**
+	 * Ticket of the newest scan whose verdict this watch now holds: an
+	 * adopted outpoint, a recorded confirmation, and equally an absence or a
+	 * presence, which are verdicts about the same question and were once left
+	 * out of the arbitration entirely (issue #593).
+	 *
+	 * Arbitrating on START order rather than on which scan finishes first is
+	 * what makes the answer the same in both interleavings. Overlapping scans
+	 * are routine (a subscription callback, a block and the recheck timer each
+	 * start one) and each holds a history it fetched before its awaits, so
+	 * "first to finish wins" discards the fresher evidence half the time.
+	 */
+	appliedScanTicket?: number;
 	/**
 	 * Per-txid results of the discovery scan, so each transaction in the
 	 * history is fetched once and not again on every recheck. Transactions are
@@ -1416,8 +1427,15 @@ export class ChainWatcher extends EventEmitter {
 		// Checks for one watch can overlap (a subscription callback, a block
 		// and the recheck timer all start them), and each one holds a history
 		// it fetched before its awaits. Whatever this scan concludes is only
-		// safe to apply while nothing else has concluded anything since.
-		const revision = watched.scanRevision ?? 0;
+		// safe to apply while no scan that STARTED LATER has concluded
+		// anything since: its history is the fresher of the two.
+		const ticket = watched.nextScanTicket ?? 0;
+		watched.nextScanTicket = ticket + 1;
+		const superseded = (): boolean =>
+			!this.isCurrentGeneration(generation) ||
+			this.watchedFundings.get(key) !== watched ||
+			watched.confirmed ||
+			(watched.appliedScanTicket ?? -1) > ticket;
 
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
 
@@ -1425,14 +1443,7 @@ export class ChainWatcher extends EventEmitter {
 		// advance the ChannelManager for a watcher that is no longer watching,
 		// and the map identity check catches the entry being replaced by a
 		// restart rather than merely cleared.
-		if (
-			!this.isCurrentGeneration(generation) ||
-			this.watchedFundings.get(key) !== watched ||
-			watched.confirmed ||
-			(watched.scanRevision ?? 0) !== revision
-		) {
-			return;
-		}
+		if (superseded()) return;
 
 		// Find our funding tx in the history. With RBF candidates the set is
 		// "any attempt of this open": the attempts double-spend one another,
@@ -1458,17 +1469,10 @@ export class ChainWatcher extends EventEmitter {
 				history,
 				generation
 			);
-			if (
-				!this.isCurrentGeneration(generation) ||
-				this.watchedFundings.get(key) !== watched ||
-				watched.confirmed ||
-				(watched.scanRevision ?? 0) !== revision
-			) {
-				return;
-			}
+			if (superseded()) return;
 			if (discovery.bound) {
 				const bound = discovery.bound;
-				watched.scanRevision = revision + 1;
+				watched.appliedScanTicket = ticket;
 				watched.txid = bound.txid;
 				watched.outputIndex = bound.outputIndex;
 				watched.candidates = undefined;
@@ -1487,6 +1491,7 @@ export class ChainWatcher extends EventEmitter {
 				// its funding value. It is NOT reported as a confirmation and
 				// the watched outpoint does not move, because the evidence
 				// that it is ours has not arrived yet.
+				watched.appliedScanTicket = ticket;
 				this.clearMissingReport(watched);
 				return;
 			}
@@ -1497,6 +1502,7 @@ export class ChainWatcher extends EventEmitter {
 			// zero-conf channel that is already NORMAL this means the channel
 			// no longer exists on the network. Alarm after a debounce so a
 			// transient Electrum hiccup does not cry wolf.
+			watched.appliedScanTicket = ticket;
 			watched.missingChecks = (watched.missingChecks ?? 0) + 1;
 			if (watched.missingChecks >= 3 && !watched.missingReported) {
 				watched.missingReported = true;
@@ -1505,6 +1511,7 @@ export class ChainWatcher extends EventEmitter {
 			return;
 		}
 		// Present again (mempool or chain): a reorg can bounce a tx back.
+		watched.appliedScanTicket = ticket;
 		this.clearMissingReport(watched);
 		const entry = entries.find((h) => h.height > 0);
 		if (!entry) return; // in the mempool, not yet confirmed
@@ -1523,7 +1530,7 @@ export class ChainWatcher extends EventEmitter {
 				: [{ txid: watched.txid, outputIndex: watched.outputIndex }];
 			const winner = active.find((c) => c.txid === entry.txid);
 			if (!winner) return;
-			watched.scanRevision = (watched.scanRevision ?? 0) + 1;
+			watched.appliedScanTicket = ticket;
 			watched.txid = winner.txid;
 			watched.outputIndex = winner.outputIndex;
 			watched.candidates = undefined;
