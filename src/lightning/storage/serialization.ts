@@ -148,6 +148,8 @@ export interface ISerializedHtlcEntry {
 	dustExposureFailback?: boolean;
 	/** Admitted while the capsule-restore hold stood (see IHtlcEntry). */
 	addedWhileRestoreUnproven?: boolean;
+	/** Admitted while the funding-missing quarantine stood (see IHtlcEntry). */
+	addedWhileFundingUnaccounted?: boolean;
 }
 
 export interface ISerializedHtlcSnapshot {
@@ -199,6 +201,9 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.addedWhileRestoreUnproven !== undefined
 			? { addedWhileRestoreUnproven: e.addedWhileRestoreUnproven }
+			: {}),
+		...(e.addedWhileFundingUnaccounted !== undefined
+			? { addedWhileFundingUnaccounted: e.addedWhileFundingUnaccounted }
 			: {})
 	};
 }
@@ -243,6 +248,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.addedWhileRestoreUnproven !== undefined
 				? { addedWhileRestoreUnproven: s.addedWhileRestoreUnproven }
+				: {}),
+			...(s.addedWhileFundingUnaccounted !== undefined
+				? { addedWhileFundingUnaccounted: s.addedWhileFundingUnaccounted }
 				: {})
 		}
 	};
@@ -291,6 +299,12 @@ export interface ISerializedChannelState {
 	fundingTxid: string | null;
 	pendingFundingTxHex?: string;
 	fundingMissingSinceHeight?: number;
+	/**
+	 * Issue #593: the funding is unaccounted for on chain and the channel is
+	 * quarantined against NEW HTLCs. MUST persist - a restart must not lift a
+	 * quarantine the chain has not lifted.
+	 */
+	fundingUnaccounted?: boolean;
 	fundingOutputIndex: number;
 	minimumDepth: number;
 	localConfig: ISerializedChannelConfig;
@@ -743,6 +757,7 @@ export function serializeChannelState(
 		fundingTxid: bufToHex(s.fundingTxid),
 		pendingFundingTxHex: s.pendingFundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
+		fundingUnaccounted: s.fundingUnaccounted,
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: serializeChannelConfig(s.localConfig),
@@ -928,6 +943,7 @@ export function deserializeChannelState(
 		fundingTxid: hexToBuf(s.fundingTxid),
 		pendingFundingTxHex: s.pendingFundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
+		fundingUnaccounted: s.fundingUnaccounted,
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: deserializeChannelConfig(s.localConfig),

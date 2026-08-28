@@ -7003,10 +7003,9 @@ export class LightningNode extends EventEmitter {
 		// handled elsewhere; we only act when a splice is in flight.
 		// The funding tx of a not-yet-confirmed channel vanished from mempool
 		// AND chain (evicted or an input was double-spent). For a zero-conf
-		// channel that is already NORMAL, every balance shown against it is
-		// fiction: alarm, then VOID the channel. It never existed on the
-		// network, so there is nothing to close and the contributed coins
-		// remain onchain. 'channel:voided' lets the embedder re-handle them.
+		// channel that is already NORMAL, every balance shown against it is a
+		// claim on an outpoint nobody has seen: alarm, quarantine it against
+		// new HTLCs, and let BOLT 2's forget clock decide the rest.
 		this.chainWatcher.on(
 			'funding:missing',
 			(channelId: Buffer, txid: string) => {
@@ -7021,6 +7020,18 @@ export class LightningNode extends EventEmitter {
 					timestamp: Date.now()
 				} as ILightningError);
 				this.disposeMissingFunding(channelId, txid);
+			}
+		);
+		// And its counterpart: the funding is accounted for again, so whatever
+		// the absence raised comes back off (issue #593).
+		this.chainWatcher.on(
+			'funding:recovered',
+			(channelId: Buffer, txid: string) => {
+				this.emitStructuredLog('chain', 'funding_recovered', {
+					channelId: channelId.toString('hex'),
+					txid
+				});
+				this.liftFundingMissingHold(channelId, txid);
 			}
 		);
 
@@ -7123,6 +7134,17 @@ export class LightningNode extends EventEmitter {
 						txid,
 						error: (err as Error)?.message ?? String(err)
 					});
+					// Absence was NOT answered: we tried to send and the network
+					// would not take it. Nothing here says the transaction is
+					// permanently invalid, which is why nothing is voided, but
+					// it is no longer merely unobserved either. Quarantine, and
+					// leave the lift to the chain's own answer: an accepted
+					// rebroadcast that is evicted again never reached anyone.
+					this.quarantineMissingFunding(
+						channelId,
+						txid,
+						'rebroadcast rejected'
+					);
 				});
 			return;
 		}
@@ -7140,6 +7162,21 @@ export class LightningNode extends EventEmitter {
 		// Otherwise this is the fundee, or a funder whose payload is
 		// gone. Nothing to send, so the only question is the clock.
 		//
+		// The clock is about FORGETTING, and there is a second question it does
+		// not answer: whether we may keep taking NEW HTLCs meanwhile (issue
+		// #593). For the whole 2016 blocks the channel would otherwise stay a
+		// router edge, an invoice hint and a send candidate, writing
+		// obligations enforceable only by a commitment that spends an outpoint
+		// no one has seen. Quarantine says no to that and nothing else: the
+		// clock below is untouched, existing HTLCs still settle and fail, and
+		// the funding reappearing lifts it. Deliberately NOT raised on the two
+		// arms above, which answer the absence rather than merely observe it.
+		this.quarantineMissingFunding(
+			channelId,
+			txid,
+			'no broadcast to answer with'
+		);
+
 		// ABSENCE IS A CLOCK, NOT A VERDICT. This alarm fires after
 		// three checks find nothing and does not require that the
 		// transaction was ever seen, so it cannot on its own tell an
@@ -7208,6 +7245,12 @@ export class LightningNode extends EventEmitter {
 	 * during one outage is still ticking during the next. A funding the watcher
 	 * still reports absent runs the ordinary disposition, which is where the
 	 * clock starts and where 2016 blocks later it ends.
+	 *
+	 * Presence lifts the quarantine through the same method the funding:recovered
+	 * event does, so a dropped event is never permanent and an event that
+	 * arrives against a chain still answering "absent" is corrected on the next
+	 * block. Absence re-raises it through disposeMissingFunding for the same
+	 * reason.
 	 */
 	private reviewFundingMissingClocks(blockHeight: number): void {
 		if (!this.chainWatcher || blockHeight <= 0) return;
@@ -7217,12 +7260,7 @@ export class LightningNode extends EventEmitter {
 			const channelId = state.channelId ?? state.temporaryChannelId;
 			const presence = this.chainWatcher.getFundingPresence(channelId);
 			if (presence === 'present') {
-				if (channel.clearFundingMissingClock()) {
-					this.persistChannel(channelId);
-					this.emitStructuredLog('chain', 'funding_missing_clock_cleared', {
-						channelId: channelId.toString('hex')
-					});
-				}
+				this.liftFundingMissingHold(channelId);
 				continue;
 			}
 			if (presence !== 'absent') continue;
@@ -7230,6 +7268,68 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				Buffer.from(state.fundingTxid).reverse().toString('hex')
 			);
+		}
+	}
+
+	/**
+	 * Quarantine a channel whose funding the chain cannot account for: it takes
+	 * no NEW HTLCs until the funding is seen again (issue #593).
+	 *
+	 * Reached only from the dispositions that fall through to BOLT 2's forget
+	 * clock, and from a rebroadcast the network rejected. A funder that answers
+	 * absence by successfully re-sending is not here, because on that path
+	 * absence has been answered rather than merely observed.
+	 *
+	 * Persisted best-effort rather than fail-closed, which is the opposite of
+	 * the clock start beside it and for the opposite reason. An unwritten clock
+	 * start silently restarts the countdown at every restart, so a node that
+	 * restarts often enough never voids; an unwritten quarantine is merely
+	 * lifted early, and the next absence poll raises it again a block later.
+	 * Refusing the restriction because it could not be written would leave the
+	 * channel taking new HTLCs, which is the outcome the restriction exists to
+	 * prevent.
+	 */
+	private quarantineMissingFunding(
+		channelId: Buffer,
+		txid: string,
+		reason: string
+	): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel || !channel.markFundingUnaccounted()) return;
+		this.persistChannel(channelId);
+		this.emitStructuredLog('chain', 'funding_missing_quarantined', {
+			channelId: channelId.toString('hex'),
+			txid,
+			reason
+		});
+	}
+
+	/**
+	 * The funding is accounted for again: lift the quarantine and stop the
+	 * clock, in one place so the watcher's funding:recovered event and the
+	 * per-block presence poll can never disagree about what absence left behind.
+	 *
+	 * Both halves are edge-triggered, so a channel that was never restricted
+	 * costs nothing and writes nothing.
+	 */
+	private liftFundingMissingHold(channelId: Buffer, txid?: string): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const lifted = channel.clearFundingUnaccounted();
+		const stopped = channel.clearFundingMissingClock();
+		if (!lifted && !stopped) return;
+		this.persistChannel(channelId);
+		const idHex = channelId.toString('hex');
+		if (lifted) {
+			this.emitStructuredLog('chain', 'funding_missing_quarantine_lifted', {
+				channelId: idHex,
+				...(txid !== undefined ? { txid } : {})
+			});
+		}
+		if (stopped) {
+			this.emitStructuredLog('chain', 'funding_missing_clock_cleared', {
+				channelId: idHex
+			});
 		}
 	}
 
@@ -7255,8 +7355,10 @@ export class LightningNode extends EventEmitter {
 		// persisted here rather than left for some later transition to
 		// carry: a clock left on disk after its funding CONFIRMED keeps
 		// counting across the next restart, toward voiding a channel that
-		// is on the chain.
-		let retired = channel.clearFundingMissingClock();
+		// is on the chain. A quarantine outlives its reason the same way,
+		// and confirmation is the strongest answer the chain has (issue #593).
+		let retired = channel.clearFundingUnaccounted();
+		retired = channel.clearFundingMissingClock() || retired;
 		if (state.fundingTxid) {
 			retired = channel.clearRetainedFundingPayload() || retired;
 			this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
@@ -8982,8 +9084,11 @@ export class LightningNode extends EventEmitter {
 		// The confirmation ends the broadcast obligation on manually driven
 		// chains too, exactly as onFundingWatchConfirmed retires it on
 		// watcher-driven ones: without this the retained parent rebroadcast
-		// and renewed its pledges forever (review of issue #412).
-		let retired = channel.clearFundingMissingClock();
+		// and renewed its pledges forever (review of issue #412). The
+		// funding-missing quarantine and clock go the same way, for the same
+		// reason (issue #593).
+		let retired = channel.clearFundingUnaccounted();
+		retired = channel.clearFundingMissingClock() || retired;
 		if (state.fundingTxid) {
 			retired = channel.clearRetainedFundingPayload() || retired;
 			this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
@@ -11278,9 +11383,13 @@ export class LightningNode extends EventEmitter {
 			info.pendingSpliceLocalBalanceMsat = pendingSplice;
 		info.htlcUsable = channel.acceptsNewHtlcs();
 		// The reason a NORMAL channel can still answer false, so a consumer can
-		// tell "mid-splice and parked" from "restored and held" (issue #469).
+		// tell "mid-splice and parked" from "restored and held" (issue #469) and
+		// from "funding unaccounted for" (issue #593).
 		if (state.restoreRecencyUnproven === true) {
 			info.restoreRecencyUnproven = true;
+		}
+		if (state.fundingUnaccounted === true) {
+			info.fundingUnaccounted = true;
 		}
 		// Present exactly when the channel is mid-splice by EFFECTIVE state
 		// (looking through a reconnect): true = pay-through accounting (counted
@@ -13997,6 +14106,31 @@ export class LightningNode extends EventEmitter {
 			// actually be read, and so it takes the same role-correct and
 			// blinded-route handling as every other policy fail-back below.
 			this.emitStructuredLog('htlc', 'refused_restore_unproven', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				finalHop
+			});
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_CHANNEL_FAILURE;
+		} else if (
+			channel.isFundingUnaccounted() &&
+			htlcEntry.addedWhileFundingUnaccounted === true
+		) {
+			// A channel whose funding the chain cannot account for takes no NEW
+			// HTLCs (issue #593). Settling one would trade a preimage for a
+			// balance that only a commitment spending an unseen outpoint could
+			// ever claim, and forwarding it would pay real value out on a real
+			// channel against it. The outbound half is refused in
+			// Channel.addHtlc; this is the same refusal for the half BOLT 2
+			// makes us commit to first.
+			//
+			// Both conditions, for two different reasons. The provenance keeps
+			// the redispatch of HTLCs committed before the quarantine settling
+			// as they always did, and the live check means an HTLC held across
+			// the funding reappearing settles too: unlike the capsule-restore
+			// hold above, this quarantine lifts.
+			this.emitStructuredLog('htlc', 'refused_funding_unaccounted', {
 				channelId: channelId.toString('hex'),
 				htlcId: htlcId.toString(),
 				finalHop

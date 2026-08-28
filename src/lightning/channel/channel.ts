@@ -2814,6 +2814,23 @@ export class Channel {
 			];
 		}
 
+		// A channel whose funding the chain cannot account for takes no NEW
+		// HTLCs either (issue #593). acceptsNewHtlcs keeps the routing and
+		// first-hop selection away from it, but selection is advice and this is
+		// the admission point: every enforcement route for this HTLC ends at a
+		// commitment spending an outpoint no one has seen, so the obligation
+		// has nothing behind it. Lifts as soon as the funding is seen again.
+		if (this._state.fundingUnaccounted === true) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot add HTLC: the funding transaction is in neither the ' +
+						'mempool nor the chain, so the channel is quarantined'
+				}
+			];
+		}
+
 		// Reject during quiescence.
 		if (this._quiescence.isQuiescing()) {
 			return [
@@ -3167,6 +3184,12 @@ export class Channel {
 			// already committed in the capsule predates it and still settles.
 			...(this._state.restoreRecencyUnproven === true
 				? { addedWhileRestoreUnproven: true }
+				: {}),
+			// Same provenance for the funding-missing quarantine (issue #593).
+			// BOLT 2 gives no way to refuse an add on the wire, so it enters the
+			// commitment and the node fails it back once committed.
+			...(this._state.fundingUnaccounted === true
+				? { addedWhileFundingUnaccounted: true }
 				: {})
 		};
 
@@ -5500,6 +5523,38 @@ export class Channel {
 		if (this._state.fundingMissingSinceHeight === undefined) return false;
 		delete this._state.fundingMissingSinceHeight;
 		return true;
+	}
+
+	/**
+	 * Quarantine the channel against NEW HTLCs while the chain cannot account
+	 * for its funding (issue #593). Returns true when THIS call raised it, so
+	 * the caller knows it owes a persist.
+	 *
+	 * Layered over the forget clock, not a step of it: the clock decides when
+	 * the channel may be forgotten, and this decides whether we may keep
+	 * writing new obligations against an outpoint nothing has seen. Reversible,
+	 * where the clock's verdict is not.
+	 */
+	markFundingUnaccounted(): boolean {
+		if (this._state.fundingUnaccounted === true) return false;
+		this._state.fundingUnaccounted = true;
+		return true;
+	}
+
+	/**
+	 * Lift the quarantine: the funding is accounted for again. Returns true
+	 * when this call lifted a standing one, so the caller knows it owes a
+	 * persist of its own.
+	 */
+	clearFundingUnaccounted(): boolean {
+		if (this._state.fundingUnaccounted === undefined) return false;
+		delete this._state.fundingUnaccounted;
+		return true;
+	}
+
+	/** Whether the funding-missing quarantine stands (issue #593). */
+	isFundingUnaccounted(): boolean {
+		return this._state.fundingUnaccounted === true;
 	}
 
 	/**
@@ -11439,6 +11494,13 @@ export class Channel {
 	 * its on-chain HTLC deadline backstops can never fire, and an obligation
 	 * taken on here has no enforcement behind it: the peer can simply stall.
 	 *
+	 * A channel whose funding the chain cannot account for answers false too
+	 * (issue #593). Its balance is a claim on an outpoint no one has seen, and
+	 * every enforcement route for a new HTLC ends at a commitment spending that
+	 * outpoint, so an obligation taken on here is unenforceable in the same
+	 * way. The BOLT 2 forget clock runs alongside and is untouched by this: the
+	 * quarantine is reversible and forgetting is not.
+	 *
 	 * A SEPARATE predicate from isHtlcUsable rather than a clause inside it,
 	 * because existing HTLCs must still settle and fail off chain. Folding the
 	 * hold into isHtlcUsable stopped the deferred-settle drains, and a held
@@ -11453,6 +11515,7 @@ export class Channel {
 	 */
 	acceptsNewHtlcs(lookThroughReestablish = false): boolean {
 		if (this._state.restoreRecencyUnproven === true) return false;
+		if (this._state.fundingUnaccounted === true) return false;
 		return this.isHtlcUsable(lookThroughReestablish);
 	}
 

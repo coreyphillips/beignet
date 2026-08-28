@@ -134,6 +134,12 @@ export interface ChannelInfo {
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**
+	 * Neither mempool nor chain can account for the funding, so the channel is
+	 * quarantined: no new HTLCs, no router edge, no routing hint. Reversible
+	 * and not a close; it clears by itself when the funding is seen again.
+	 */
+	fundingUnaccounted?: boolean;
+	/**
 	 * Present exactly when mid-splice by effective state: true = paying
 	 * through the splice (counted in the canonical balance), false = parked.
 	 */

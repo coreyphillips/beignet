@@ -802,6 +802,19 @@ export interface IChannelInfo {
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**
+	 * Neither mempool nor chain can account for this channel's funding and this
+	 * node has no broadcast left to answer with, so the channel is quarantined:
+	 * it takes no NEW HTLCs and is offered to no router or planner (issue #593).
+	 * Existing HTLCs still settle and fail, and a close still negotiates.
+	 *
+	 * Reversible, and NOT the BOLT 2 forget decision: the channel keeps every
+	 * key, commitment and watch, and the flag clears by itself when the funding
+	 * is seen again. Present only while the quarantine stands; it is, alongside
+	 * restoreRecencyUnproven, the other reason a NORMAL channel can report
+	 * htlcUsable false.
+	 */
+	fundingUnaccounted?: boolean;
+	/**
 	 * Present exactly when the channel is mid-splice by effective state
 	 * (looking through a reconnect): true = pay-through accounting (counted in
 	 * the canonical balance at min(live, settle-to)); false = parked (its

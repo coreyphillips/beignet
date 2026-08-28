@@ -329,6 +329,16 @@ export interface IHtlcEntry {
 	 * so the refusal survives a crash between the commit and the fail-back.
 	 */
 	addedWhileRestoreUnproven?: boolean;
+	/**
+	 * Admission-time provenance (issue #593): this received HTLC entered the
+	 * channel while its funding-missing quarantine (fundingUnaccounted) was
+	 * already standing, so the node fails it back once committed rather than
+	 * settling it. Same shape and same reason as the field above: an HTLC
+	 * committed before the quarantine still settles off chain, and the
+	 * redispatch after a restart must be able to tell the two apart. Persisted
+	 * so the refusal survives a crash between the commit and the fail-back.
+	 */
+	addedWhileFundingUnaccounted?: boolean;
 }
 
 /**

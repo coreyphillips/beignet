@@ -271,6 +271,27 @@ export interface IChannelState {
 	 * guardian restore rather than starting again from zero each time.
 	 */
 	fundingMissingSinceHeight?: number;
+	/**
+	 * The chain cannot account for this channel's funding: neither mempool nor
+	 * chain has it, and this node has no answer left to give (it is the fundee,
+	 * or a funder whose retained payload is gone, or a funder whose rebroadcast
+	 * was rejected). While set the channel is QUARANTINED and takes no NEW
+	 * HTLCs; every existing one still settles and fails off chain.
+	 *
+	 * Layered over the 2016-block clock above, never a substitute for it. The
+	 * clock answers "may this channel be forgotten"; this answers the different
+	 * question of whether we may keep writing new obligations against a funding
+	 * output nothing has seen. Reversible in both directions: the funding
+	 * reappearing lifts it, from the watcher's funding:recovered event and from
+	 * the per-block presence poll alike.
+	 *
+	 * MUST persist. Held only in memory a restart silently lifts the
+	 * quarantine and the channel takes new HTLCs again until the next absence
+	 * re-raises it. Failing closed across a restart is safe here precisely
+	 * because the poll is a lift path: a funding that is actually there clears
+	 * the flag on the first block after the watch re-arms.
+	 */
+	fundingUnaccounted?: boolean;
 	fundingOutputIndex: number;
 	minimumDepth: number;
 
