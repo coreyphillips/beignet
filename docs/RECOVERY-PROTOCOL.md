@@ -540,6 +540,8 @@ because silence is not evidence either way.
 
 Additional startup rule (closes the pre-reestablish window): channels may not leave quarantine, and the node may not even connect to channel peers, until current writer ownership is confirmed with the quorum (or the operator explicitly runs in a mode without guardians). A stale device therefore discovers it was superseded before it can touch the Lightning protocol.
 
+The freeze covers the CHAIN as well as the wire, and the two need separate enforcement: a block arrives over no transport, so the node's per-block scans (the HTLC claim and expiry backstops, the forward timeout, the stuck-channel timeouts) refuse to force close while traffic is denied, exactly as the restore-recency rule refuses one. Their broadcast is the same revoked commitment the transport rules exist to keep in. The operator's own force close is admitted, unchanged: it is the labelled escape hatch above, and the only exit a fenced node has.
+
 Honest limits, to be documented verbatim in user-facing docs: fencing is cooperative. It cannot revoke Bitcoin keys on the old device. A non-compliant or modified instance can still sign. What fencing guarantees is that two compliant beignet instances can never advance the same channels independently. And if a fenced stale device (or an attacker with the old device) broadcasts its stale commitment anyway, that commitment is revoked, so the standard penalty mechanism plus the existing watchtower protection applies: the broadcaster loses the channel funds to the peer, not to the new device's detriment beyond that channel closing.
 
 ### 5.7 Restoration flow and quarantine (Phase 5)

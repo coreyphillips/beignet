@@ -6900,26 +6900,28 @@ export class LightningNode extends EventEmitter {
 
 		this.chainWatcher.on('block', (height: number) => {
 			this.currentBlockHeight = height;
-			// The internal watcher path does not go through handleNewBlock, so
-			// keep the fee advisor warm here too — force-closes and v2 opens
-			// both price themselves synchronously off its latest sample.
-			this.warmFeeAdvisor();
-			// Same reason for the splice close re-drive retry (issue #357):
-			// production headers run through the watcher, so a re-drive queued
-			// after a transient failure must get its per-block retry here, not
-			// only in handleNewBlock.
-			this.retrySpliceCloseRedrives();
-			// Same reasoning for un-armed output watches (issue #577).
-			this.retryPendingOutputWatches();
-			// And for the funding broadcast obligation (issue #412): the
-			// per-block rebroadcast, the pledge renewals that ride it, and
-			// the dead-entry retirement (which releases v1 pledges) must all
-			// run on live headers, not only when an embedder drives
-			// handleNewBlock itself.
-			this.retryPendingFundingBroadcasts();
-			// And the BOLT 2 forget clock, for the same reason: its only other
-			// driver is a one-shot alarm (issue #463).
-			this.reviewFundingMissingClocks(height);
+			// A configured chain backend drives blocks HERE, not through
+			// handleNewBlock, so this is where the node's per-block work runs in
+			// production: the CPFP re-bump, the timeout scans, the retries. The
+			// watcher advanced the ChannelManager before emitting, so this path
+			// deliberately does not.
+			try {
+				this.runPerBlockWork(height);
+			} catch (err) {
+				// This callback belongs to the backend's header dispatch, and the
+				// first header is delivered inside chainWatcher.start(): a throw
+				// escaping here fails the subscription and leaves the node with no
+				// header feed at all. The next block retries everything, so report
+				// and keep the feed. handleNewBlock stays unguarded, since an
+				// embedder driving blocks itself should see its own failures.
+				this.emit('node:error', {
+					code: 'BLOCK_WORK_FAILED',
+					message: `Per-block work failed at height ${height}: ${
+						(err as Error).message
+					}`,
+					timestamp: Date.now()
+				} as ILightningError);
+			}
 		});
 		this.chainWatcher.on('error', (err: Error) => {
 			this.emit('node:error', {
@@ -9603,6 +9605,11 @@ export class LightningNode extends EventEmitter {
 	 * FORCE_CLOSED, registers the commitment txid for broadcast-success
 	 * tracking, and clears the stamp again if the close was refused. Wraps
 	 * channelManager.forceClose and returns its result unchanged.
+	 *
+	 * Also the one place that can tell an AUTOMATIC close from the operator's
+	 * own, so it is where the recovery gate refuses the former: every caller
+	 * but forceCloseChannel reaches a commitment broadcast on this node's
+	 * initiative alone.
 	 */
 	private _forceCloseWithReason(
 		channelId: Buffer,
@@ -9610,6 +9617,16 @@ export class LightningNode extends EventEmitter {
 		feeRatePerVbyte: number,
 		reason: ChannelCloseReason
 	): ChannelResult {
+		if (
+			reason !== 'user' &&
+			this.skipAutoCloseRecoveryGated(channelId, reason)
+		) {
+			return {
+				ok: false,
+				actions: [],
+				error: `automatic force close refused: ${this.recoveryDenialReason()}`
+			};
+		}
 		const channel = this.channelManager.getChannel(channelId);
 		const prevReason = channel?.getFullState().closeReason;
 		const stamped = channel?.recordCloseReason(reason) ?? false;
@@ -17065,6 +17082,22 @@ export class LightningNode extends EventEmitter {
 	handleNewBlock(blockHeight: number): void {
 		this.currentBlockHeight = blockHeight;
 		this.channelManager.handleNewBlock(blockHeight);
+		this.runPerBlockWork(blockHeight);
+	}
+
+	/**
+	 * Every per-block obligation the NODE owns, for one header.
+	 *
+	 * Split out of handleNewBlock because a node with a configured chain
+	 * backend never calls that method: the backend's header callback runs
+	 * ChainWatcher.handleNewBlock, which advances the ChannelManager itself and
+	 * then emits 'block'. The listener there used to run a handful of retries
+	 * and nothing else, each added one issue at a time (#357, #412, #463, #577),
+	 * so the CPFP re-bump and every timeout scan were dead on production headers
+	 * (issue #588). Both drivers now converge here, each advancing the
+	 * ChannelManager exactly once before calling it.
+	 */
+	private runPerBlockWork(blockHeight: number): void {
 		// Funding txs we are obligated to broadcast (BOLT 2) but which have
 		// not confirmed yet: retry, so a transient failure at watch:funding
 		// or a mempool eviction never orphans a signed funding.
@@ -17386,6 +17419,53 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * The guard every AUTOMATIC force-close path runs before broadcasting a
+	 * commitment, whatever drove it: recovery denies peer traffic, so this
+	 * device cannot prove it still owns the state it stores (5.6). A
+	 * superseded writer's latest local commitment may be one the writer that
+	 * replaced it has already revoked, and publishing it hands the peer the
+	 * justice path and the whole balance.
+	 *
+	 * The transport chokepoints stop an inbound error from reaching a
+	 * broadcast, but a block arrives over no transport at all, so the
+	 * per-block scans need the same answer stated here. Enforced centrally in
+	 * _forceCloseWithReason as well, so a path that forgets this call still
+	 * cannot broadcast; the calls exist so an arm does not announce a close
+	 * that will not happen, or clear the tracker holding its retry.
+	 *
+	 * The operator's own force close (reason 'user') stays admitted: it is
+	 * 5.6's labelled escape hatch, and the only exit a fenced node has.
+	 */
+	private skipAutoCloseRecoveryGated(
+		channelId: Buffer,
+		context: string
+	): boolean {
+		if (this.recoveryPermitsPeerTraffic()) return false;
+		const idHex = channelId.toString('hex');
+		const reason = this.recoveryDenialReason();
+		this.recoveryGate?.reportBlocked(
+			`refused automatic force close of ${idHex} (${context}): ${reason}`
+		);
+		this.emitStructuredLog('channel', 'close_skipped_recovery_gated', {
+			channelId: idHex,
+			context,
+			reason
+		});
+		return true;
+	}
+
+	/**
+	 * Why recovery is denying traffic. The gate's own state does not cover
+	 * it: a runtime supersession and an unreceipted startup repair both deny
+	 * traffic on a node whose gate reads 'disabled'.
+	 */
+	private recoveryDenialReason(): string {
+		if (this.startupRepairPending) return 'startup repair is unreceipted';
+		if (this._barrierFenced) return 'this writer was superseded';
+		return `the recovery gate is ${this.getRecoveryGateState()}`;
+	}
+
+	/**
 	 * The shared guard every AUTOMATIC v1 force-close path runs before
 	 * broadcasting a commitment (issue #413): a commitment spending an
 	 * outpoint not known to exist cannot "close on chain" - the broadcast
@@ -17526,8 +17606,13 @@ export class LightningNode extends EventEmitter {
 					// (issue #413).
 					// Or the row's recency is unproven (issue #469): one HTLC's
 					// value is a bounded loss, a revoked commitment is the whole
-					// balance.
+					// balance. The same arithmetic covers a fenced or
+					// quarantined node (issue #588).
 					if (
+						this.skipAutoCloseRecoveryGated(
+							channelId,
+							'HTLC_CLAIM_FORCE_CLOSE'
+						) ||
 						this.skipAutoCloseRestoreUnproven(
 							state,
 							'HTLC_CLAIM_FORCE_CLOSE'
@@ -17602,6 +17687,10 @@ export class LightningNode extends EventEmitter {
 						!this.isOutgoingLegTerminallyFailed(outKey, htlc.paymentHash)
 					) {
 						if (
+							this.skipAutoCloseRecoveryGated(
+								channelId,
+								'FORWARD_TIMEOUT_FORCE_CLOSE'
+							) ||
 							this.skipAutoCloseRestoreUnproven(
 								state,
 								'FORWARD_TIMEOUT_FORCE_CLOSE'
@@ -17733,8 +17822,13 @@ export class LightningNode extends EventEmitter {
 				// mapping so a late downstream settlement can still be honored.
 				// Unless the funding parent is not known on chain, in which case
 				// nothing built on it can resolve anything (issue #413).
-				// Or the row's recency is unproven (issue #469).
+				// Or the row's recency is unproven (issue #469), or recovery is
+				// denying traffic (issue #588).
 				if (
+					this.skipAutoCloseRecoveryGated(
+						channelId,
+						'FORWARD_TIMEOUT_FORCE_CLOSE'
+					) ||
 					this.skipAutoCloseRestoreUnproven(
 						state,
 						'FORWARD_TIMEOUT_FORCE_CLOSE'
@@ -18714,8 +18808,13 @@ export class LightningNode extends EventEmitter {
 					// Without the funding parent on chain the timeout claim
 					// cannot confirm and neither can the downstream's preimage
 					// claim: the close protects nothing (issue #413).
-					// Or the row's recency is unproven (issue #469).
+					// Or the row's recency is unproven (issue #469), or recovery
+					// is denying traffic (issue #588).
 					if (
+						this.skipAutoCloseRecoveryGated(
+							channelId,
+							'HTLC_EXPIRY_FORCE_CLOSE'
+						) ||
 						this.skipAutoCloseRestoreUnproven(
 							state,
 							'HTLC_EXPIRY_FORCE_CLOSE'
@@ -19202,6 +19301,15 @@ export class LightningNode extends EventEmitter {
 			// this node acting on its own initiative, which is exactly what a
 			// row of unproven recency may not do.
 			if (this.skipAutoCloseRestoreUnproven(state, 'stuck channel scan')) {
+				continue;
+			}
+			// And recovery denying traffic covers them the same way (issue
+			// #588): a timeout on a fenced or quarantined node would publish a
+			// commitment the writer that superseded us may already hold a
+			// revocation for. The whole scan is skipped, trackers included, so
+			// a channel that spent the quarantine unreachable is given its
+			// patience from the block the node could first act on.
+			if (this.skipAutoCloseRecoveryGated(channelId, 'stuck channel scan')) {
 				continue;
 			}
 
