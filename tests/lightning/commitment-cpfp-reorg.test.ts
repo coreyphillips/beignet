@@ -332,6 +332,60 @@ describe('Issue #578: commitment CPFP survives a confirmation and a reorg', func
 		fx.destroy();
 	});
 
+	it('drops a parked entry a different funding spend superseded (#589)', async () => {
+		// Retention (#578) lets a parked entry outlive the commitment it tracks:
+		// another transaction can confirm as the funding spend and then be demoted
+		// before the next pass, so the confirmed branch's differing-txid check never
+		// runs and the parked flag reads as OUR demotion. Re-broadcasting there buys
+		// a CPFP child, with wallet funds, for a parent that can never confirm.
+		const fx = await setup(5786);
+		const { cm, idHex, closeTx } = await closeAndConfirm(fx, 100);
+		cm.on('error', () => {});
+
+		cm.reCpfpStuckCommitments(101, 1);
+		expect(
+			cm._pendingCommitmentCpfp.get(idHex).sawConfirmation,
+			'entry parked on our commitment'
+		).to.equal(true);
+
+		// A different spend of the same funding outpoint confirms (the splice
+		// adoption shape of issue #357: a spender we do not classify as any
+		// commitment of ours), then reorgs back to the mempool.
+		const superseding = new bitcoin.Transaction();
+		superseding.version = 2;
+		superseding.addInput(closeTx.ins[0].hash, closeTx.ins[0].index);
+		superseding.addOutput(destScript(fx.alice), 900_000);
+		cm.handleFundingSpent(fx.channelId, superseding, 102, destScript(fx.alice));
+		cm.handleFundingSpent(fx.channelId, superseding, 0, destScript(fx.alice));
+		await tick();
+		const monitor = cm.getMonitor(fx.channelId);
+		expect(
+			monitor.isCommitmentConfirmed(),
+			'recorded spend unconfirmed'
+		).to.equal(false);
+		expect(monitor.getFullState().commitmentBroadcast.txid).to.equal(
+			superseding.getId()
+		);
+
+		const rebroadcast: Buffer[] = [];
+		cm.on('broadcast:tx', (tx: Buffer) => rebroadcast.push(tx));
+		// A feerate far above what the entry last paid: the pacing gates would not
+		// hold this pass either, so only the txid check can stop it.
+		cm.reCpfpStuckCommitments(103, 500);
+		await tick();
+
+		expect(
+			rebroadcast.some(
+				(tx) => bitcoin.Transaction.fromBuffer(tx).getId() === closeTx.getId()
+			),
+			'superseded commitment not re-broadcast'
+		).to.equal(false);
+		expect(cm._pendingCommitmentCpfp.has(idHex), 'entry dropped').to.equal(
+			false
+		);
+		fx.destroy();
+	});
+
 	it('does not re-broadcast on an ordinary unconfirmed re-report', async () => {
 		// The commitment was never confirmed, so nothing was demoted. The watch
 		// re-reports the mempool sighting every sweep; re-broadcasting there would

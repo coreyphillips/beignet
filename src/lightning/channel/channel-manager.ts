@@ -9161,7 +9161,21 @@ export class ChannelManager extends EventEmitter {
 			// may not be in any mempool at all, so re-broadcast and re-bid at once.
 			const demoted = entry.sawConfirmation === true;
 			entry.sawConfirmation = false;
-			if (!demoted) {
+			if (demoted) {
+				// The flag only says the tracked commitment was the recorded spend
+				// when it was set. A DIFFERENT transaction can confirm as the spend
+				// and then itself be demoted before the next pass runs, and the
+				// confirmed branch above never sees it because the monitor already
+				// reads unconfirmed. Re-broadcasting here would bid wallet funds on a
+				// child of a parent the chain has superseded, so end the entry exactly
+				// as that branch does. Same check _maybeRearmDemotedOurCommitment
+				// makes before it sets the flag.
+				const recorded = monitor.getFullState().commitmentBroadcast;
+				if (recorded && recorded.txid !== entry.action.commitmentTxid) {
+					this._pendingCommitmentCpfp.delete(channelIdHex);
+					continue;
+				}
+			} else {
 				// Only re-bump after a stall.
 				if (
 					blockHeight - entry.broadcastHeight <
