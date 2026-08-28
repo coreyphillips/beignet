@@ -583,6 +583,21 @@ export interface BeignetConfig {
 	 *  into the signed will_fund record, where an out-of-range field would
 	 *  silently wrap on the wire. Unset means never sell. */
 	leaseRates?: import('../lightning/gossip/types').ILeaseRates;
+	/** JIT channel receive (issue #532 workstream 3B). `enabled`
+	 *  (BEIGNET_JIT_RECEIVE, exact 'true'/'false') runs the LSP role: HTLCs
+	 *  addressed to intercept SCIDs registered by wallet peers are held while a
+	 *  zero-conf channel is funded with THIS node's coins, charged at
+	 *  BEIGNET_JIT_FLAT_FEE_SAT + BEIGNET_JIT_FEE_PPM. BEIGNET_JIT_MAX_FLAT_FEE_SAT
+	 *  and BEIGNET_JIT_MAX_FEE_PPM are the other role and apply regardless: they
+	 *  cap what an LSP may quote us when POST /jit/invoice asks for one. Whole
+	 *  integers; anything else refuses startup. */
+	jitReceive?: {
+		enabled?: boolean;
+		flatFeeSat?: number;
+		feePpm?: number;
+		maxFlatFeeSat?: number;
+		maxFeePpm?: number;
+	};
 }
 
 export interface HealthInfo {

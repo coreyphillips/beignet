@@ -12,6 +12,7 @@ import { Console } from 'console';
 import {
 	BeignetNode,
 	BeignetNodeOptions,
+	jitReceiveRefusal,
 	leaseRatesRefusal,
 	parseRecoveryMode
 } from './beignet-node';
@@ -641,6 +642,20 @@ async function bootDaemon(
 			throw new BeignetError(
 				'INVALID_PARAMS',
 				`Invalid lease rates; BEIGNET_LEASE_RATES ${refusal}`
+			);
+		}
+	}
+	if (opts.jitReceive !== undefined) {
+		// One of these prices what this node charges to front a channel with
+		// its own coins, the others cap what it will pay an LSP to do the same.
+		// integerEnv surfaces a partly numeric env value as NaN, which this
+		// check turns into a startup refusal naming the variable rather than a
+		// fee policy nobody wrote.
+		const refusal = jitReceiveRefusal(opts.jitReceive);
+		if (refusal !== null) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`Invalid JIT receive config; BEIGNET_JIT_* ${refusal}`
 			);
 		}
 	}
@@ -1289,17 +1304,67 @@ async function bootDaemon(
 			return success(node.validatePayment(bolt11, amountSats));
 		},
 		'POST /invoice/create': (body) => {
-			const { amountSats, description, expirySecs, descriptionHash } = body as {
+			const {
+				amountSats,
+				description,
+				expirySecs,
+				descriptionHash,
+				minFinalCltvExpiry
+			} = body as {
 				amountSats?: number;
 				description?: string;
 				expirySecs?: number;
 				descriptionHash?: string;
+				/** Extra final-CLTV headroom for a receive whose settlement may
+				 *  fund a channel on the fly (an LSP splice). */
+				minFinalCltvExpiry?: number;
 			};
 			const hashBuf = descriptionHash
 				? Buffer.from(descriptionHash, 'hex')
 				: undefined;
 			return success(
-				node.createInvoice(amountSats, description, expirySecs, hashBuf)
+				node.createInvoice(
+					amountSats,
+					description,
+					expirySecs,
+					hashBuf,
+					minFinalCltvExpiry
+				)
+			);
+		},
+		// Wallet side of JIT receive: registers a receive intent with the LSP
+		// over the beignet custom-message protocol and returns an invoice
+		// payable through a channel that does not exist yet. Needs the LSP peer
+		// connected and running the JIT receive engine.
+		'POST /jit/invoice': async (body) => {
+			const {
+				lspPubkey,
+				amountSats,
+				description,
+				expirySecs,
+				targetRemainingInboundSat,
+				maxFlatFeeSat,
+				maxFeePpm
+			} = body as {
+				lspPubkey?: string;
+				amountSats?: number;
+				description?: string;
+				expirySecs?: number;
+				targetRemainingInboundSat?: number;
+				maxFlatFeeSat?: number;
+				maxFeePpm?: number;
+			};
+			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
+			return success(
+				await node.createJitInvoice({
+					lspPubkey,
+					amountSats,
+					description,
+					expirySecs,
+					targetRemainingInboundSat,
+					maxFlatFeeSat,
+					maxFeePpm
+				})
 			);
 		},
 		'POST /invoice/create-hold': (body) => {

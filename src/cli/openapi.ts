@@ -290,12 +290,46 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						amountSats: 'number?',
 						description: 'string?',
 						expirySecs: 'number?',
-						descriptionHash: 'string?'
+						descriptionHash: 'string?',
+						minFinalCltvExpiry: 'number?'
 					}),
 					responses: {
 						'200': {
 							description: 'Created invoice',
 							content: jsonContent({ $ref: '#/components/schemas/InvoiceInfo' })
+						}
+					}
+				}
+			},
+			'/jit/invoice': {
+				post: {
+					summary:
+						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards, deducting the quoted opening fee (flatFeeSat + feePpm) from the delivery. Requires the LSP peer to be connected and running the JIT receive engine',
+					tags: ['Invoices'],
+					requestBody: bodyContent({
+						lspPubkey: 'string',
+						amountSats: 'number?',
+						description: 'string?',
+						expirySecs: 'number?',
+						targetRemainingInboundSat: 'number?',
+						maxFlatFeeSat: 'number?',
+						maxFeePpm: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Created invoice plus the agreed opening fee',
+							content: jsonContent({
+								allOf: [
+									{ $ref: '#/components/schemas/InvoiceInfo' },
+									{
+										type: 'object',
+										properties: {
+											flatFeeSat: { type: 'number' },
+											feePpm: { type: 'number' }
+										}
+									}
+								]
+							})
 						}
 					}
 				}
