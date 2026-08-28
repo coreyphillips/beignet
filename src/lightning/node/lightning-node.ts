@@ -6900,26 +6900,28 @@ export class LightningNode extends EventEmitter {
 
 		this.chainWatcher.on('block', (height: number) => {
 			this.currentBlockHeight = height;
-			// The internal watcher path does not go through handleNewBlock, so
-			// keep the fee advisor warm here too — force-closes and v2 opens
-			// both price themselves synchronously off its latest sample.
-			this.warmFeeAdvisor();
-			// Same reason for the splice close re-drive retry (issue #357):
-			// production headers run through the watcher, so a re-drive queued
-			// after a transient failure must get its per-block retry here, not
-			// only in handleNewBlock.
-			this.retrySpliceCloseRedrives();
-			// Same reasoning for un-armed output watches (issue #577).
-			this.retryPendingOutputWatches();
-			// And for the funding broadcast obligation (issue #412): the
-			// per-block rebroadcast, the pledge renewals that ride it, and
-			// the dead-entry retirement (which releases v1 pledges) must all
-			// run on live headers, not only when an embedder drives
-			// handleNewBlock itself.
-			this.retryPendingFundingBroadcasts();
-			// And the BOLT 2 forget clock, for the same reason: its only other
-			// driver is a one-shot alarm (issue #463).
-			this.reviewFundingMissingClocks(height);
+			// A configured chain backend drives blocks HERE, not through
+			// handleNewBlock, so this is where the node's per-block work runs in
+			// production: the CPFP re-bump, the timeout scans, the retries. The
+			// watcher advanced the ChannelManager before emitting, so this path
+			// deliberately does not.
+			try {
+				this.runPerBlockWork(height);
+			} catch (err) {
+				// This callback belongs to the backend's header dispatch, and the
+				// first header is delivered inside chainWatcher.start(): a throw
+				// escaping here fails the subscription and leaves the node with no
+				// header feed at all. The next block retries everything, so report
+				// and keep the feed. handleNewBlock stays unguarded, since an
+				// embedder driving blocks itself should see its own failures.
+				this.emit('node:error', {
+					code: 'BLOCK_WORK_FAILED',
+					message: `Per-block work failed at height ${height}: ${
+						(err as Error).message
+					}`,
+					timestamp: Date.now()
+				} as ILightningError);
+			}
 		});
 		this.chainWatcher.on('error', (err: Error) => {
 			this.emit('node:error', {
@@ -17065,6 +17067,22 @@ export class LightningNode extends EventEmitter {
 	handleNewBlock(blockHeight: number): void {
 		this.currentBlockHeight = blockHeight;
 		this.channelManager.handleNewBlock(blockHeight);
+		this.runPerBlockWork(blockHeight);
+	}
+
+	/**
+	 * Every per-block obligation the NODE owns, for one header.
+	 *
+	 * Split out of handleNewBlock because a node with a configured chain
+	 * backend never calls that method: the backend's header callback runs
+	 * ChainWatcher.handleNewBlock, which advances the ChannelManager itself and
+	 * then emits 'block'. The listener there used to run a handful of retries
+	 * and nothing else, each added one issue at a time (#357, #412, #463, #577),
+	 * so the CPFP re-bump and every timeout scan were dead on production headers
+	 * (issue #588). Both drivers now converge here, each advancing the
+	 * ChannelManager exactly once before calling it.
+	 */
+	private runPerBlockWork(blockHeight: number): void {
 		// Funding txs we are obligated to broadcast (BOLT 2) but which have
 		// not confirmed yet: retry, so a transient failure at watch:funding
 		// or a mempool eviction never orphans a signed funding.
