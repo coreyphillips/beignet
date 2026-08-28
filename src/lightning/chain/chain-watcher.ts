@@ -1816,16 +1816,22 @@ export class ChainWatcher extends EventEmitter {
 		// survives the process. A sibling's silence and a leg's silence then
 		// fall out of the same question instead of needing rules of their own.
 		const retracted =
-			this.channelManager.handleFundingSpendAbsent?.(watched.channelId, {
-				txid: watched.txid,
-				outputIndex: watched.outputIndex,
-				// The channel-scoped answer, not this watch's own field: during
-				// the splice window the channel's own watch shares the leg's
-				// expected spender, and without it here that watch would offer
-				// to retract a monitor record of the splice transaction itself
-				// - a demotion nothing could ever undo.
-				expectedSpendTxid: expectedSpender
-			}) ?? false;
+			this.channelManager.handleFundingSpendAbsent?.(
+				watched.channelId,
+				{
+					txid: watched.txid,
+					outputIndex: watched.outputIndex,
+					// The channel-scoped answer, not this watch's own field: during
+					// the splice window the channel's own watch shares the leg's
+					// expected spender, and without it here that watch would offer
+					// to retract a monitor record of the splice transaction itself
+					// - a demotion nothing could ever undo.
+					expectedSpendTxid: expectedSpender
+				},
+				// Prices the CPFP the manager re-arms when this retraction demotes
+				// our own confirmed commitment (issue #578).
+				this.getSweepFeeRatePerVbyte?.() ?? 10
+			) ?? false;
 		// Completion advances the outpoint's freshness whether or not the
 		// monitor had anything to retract: this scan's history IS the newest
 		// evidence about the outpoint, and an older scan still stalled in an
