@@ -178,6 +178,26 @@ export function decodeJitAck(data: Buffer): IJitReceiveAck {
 }
 
 /**
+ * The LSPS2-style opening fee owed on a delivered total.
+ *
+ * Both sides run this: the LSP to size the skim it takes off the forward, the
+ * wallet to size the shortfall it will accept at its final hop. They have to
+ * agree to the msat, so the arithmetic lives in one place rather than being
+ * written out twice.
+ */
+export function jitOpeningFeeMsat(
+	totalMsat: bigint,
+	quote: { flatFeeSat: bigint; feePpm: number }
+): bigint {
+	// The quote reaches bigint arithmetic from operator config on one side and
+	// from a peer's ack on the other, so a fractional or negative number is
+	// normalised here rather than thrown out of BigInt() mid-payment.
+	const ppm = BigInt(Math.max(0, Math.floor(quote.feePpm)));
+	const flat = quote.flatFeeSat > 0n ? quote.flatFeeSat : 0n;
+	return flat * 1000n + (totalMsat * ppm) / 1_000_000n;
+}
+
+/**
  * Block height every minted intercept SCID carries. BOLT 7 packs an SCID as
  * [u24 block][u24 txIndex][u16 outputIndex], so pinning the block field to its
  * maximum puts every synthetic SCID roughly three centuries beyond any real
@@ -1332,11 +1352,10 @@ export class JitReceiveManager extends EventEmitter {
 		if (intents.length === 0 || !intents.every((i) => i.acceptsSkimmedFee)) {
 			return 0n;
 		}
-		// The ppm is operator config reaching bigint arithmetic; a fractional or
-		// negative one would throw out of BigInt() mid-funding rather than be
-		// refused, so it is normalised here.
-		const ppm = BigInt(Math.max(0, Math.floor(this.cfg.feePpm)));
-		return this.cfg.flatFeeSat * 1000n + (totalMsat * ppm) / 1_000_000n;
+		return jitOpeningFeeMsat(totalMsat, {
+			flatFeeSat: this.cfg.flatFeeSat,
+			feePpm: this.cfg.feePpm
+		});
 	}
 
 	/** Null when the opening fee can be taken out of these parts. */
