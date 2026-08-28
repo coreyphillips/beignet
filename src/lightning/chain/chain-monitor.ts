@@ -28,7 +28,8 @@ import {
 	resolveRevokedCommitmentOutputs,
 	matchRevokedHtlcSnapshotOutputs,
 	resolveSecondLevelHtlcOutput,
-	resolveRevokedSecondLevelOutput
+	resolveRevokedSecondLevelOutput,
+	selectTheirPerCommitmentPoint
 } from './output-resolver';
 import { csvFromToLocalScript } from '../script/commitment';
 import { IChannelState } from '../channel/channel-state';
@@ -110,6 +111,22 @@ export class ChainMonitor {
 	}
 
 	/**
+	 * The per-commitment point for resolving a THEIR_CURRENT record: the
+	 * point pinned at classification time (issues #573/#574), falling back
+	 * to the live current point for records written before the field
+	 * existed. The live point alone is wrong whenever the record was made
+	 * during the commitment_signed -> revoke_and_ack window and the window
+	 * has since closed (the field rotates at the revoke_and_ack).
+	 */
+	private _theirCurrentPoint(): Buffer | undefined {
+		return (
+			this._commitmentBroadcast?.remotePerCommitmentPoint ??
+			this._channelState.remoteCurrentPerCommitmentPoint ??
+			undefined
+		);
+	}
+
+	/**
 	 * Rebuild sweeps that are built but still held for timelock maturity
 	 * (status CONFIRMED with a stored sweepTxHex) against the current
 	 * destination script. Maturity is unchanged: the rebuilt sweep spends the
@@ -155,7 +172,7 @@ export class ChainMonitor {
 						this._knownPreimages,
 						this._paymentPrivkey,
 						this._htlcBasepointSecret,
-						this._channelState.remoteCurrentPerCommitmentPoint ?? undefined
+						this._theirCurrentPoint()
 					);
 					break;
 				case CommitmentType.THEIR_FUTURE_COMMITMENT:
@@ -610,7 +627,22 @@ export class ChainMonitor {
 			trackedOutputs,
 			// Assigned even when the caller supplies nothing, so a report that
 			// does not name an outpoint cannot inherit the previous record's.
-			spentOutpoint
+			spentOutpoint,
+			// The point that built a peer commitment is pinned AT
+			// CLASSIFICATION TIME (issues #573/#574): the live
+			// remoteCurrentPerCommitmentPoint rotates when the in-flight
+			// round's revoke_and_ack lands, so resolution running any later
+			// (restarts included) must read the recorded point, not the
+			// rotated one.
+			...(classified.type === CommitmentType.THEIR_CURRENT_COMMITMENT
+				? {
+						remotePerCommitmentPoint: selectTheirPerCommitmentPoint(
+							spendingTx,
+							this._channelState,
+							classified.commitmentNumber
+						)
+				  }
+				: {})
 		};
 
 		this._state = MonitorState.COMMITMENT_DETECTED;
@@ -1590,7 +1622,7 @@ export class ChainMonitor {
 				this._knownPreimages,
 				this._paymentPrivkey,
 				this._htlcBasepointSecret,
-				this._channelState.remoteCurrentPerCommitmentPoint ?? undefined
+				this._theirCurrentPoint()
 			);
 			for (const r of resolved) {
 				// _scheduleSweep sets the witness, computes maturity, broadcasts (or
@@ -1695,8 +1727,8 @@ export class ChainMonitor {
 		// window, and a round that revokes the parked tx hands us its
 		// per-commitment secret. Adopting its confirmation under the old
 		// THEIR_CURRENT record would pay out the stale, pre-window balances
-		// with no penalty. Reclassify on every re-report; only two transitions
-		// swap, and neither can thrash or tear down a good record:
+		// with no penalty. Reclassify on every re-report. The repairs below rebuild
+		// only when durable evidence proves the stored record is stale or incomplete:
 		// - anything -> THEIR_REVOKED (a revocation secret never disappears);
 		// - THEIR_FUTURE -> COOPERATIVE_CLOSE (issue #568: records persisted
 		//   before the classifier learned the simple-close and taproot RBF
@@ -1704,18 +1736,45 @@ export class ChainMonitor {
 		//   and would pin RESOLVING forever; coop classification is purely
 		//   structural, so the same tx re-reports the same answer every time,
 		//   and a real commitment carries the BOLT 3 stamp so it can never
-		//   re-classify as cooperative).
+		//   re-classify as cooperative);
+		// - OUR -> THEIR_CURRENT for a pre-#573 misclassification;
+		// - THEIR_CURRENT without a pinned point for a pre-#574 incomplete record.
 		// Reset and re-enter handleFundingSpent so resolution runs exactly as
 		// a fresh sighting would.
 		const recordedType = this._commitmentBroadcast.commitmentType;
-		const liveType = classifyCommitmentTx(spendingTx, this._channelState).type;
+		const liveClassification = classifyCommitmentTx(
+			spendingTx,
+			this._channelState
+		);
+		const liveType = liveClassification.type;
+		const ourToTheirRepair =
+			recordedType === CommitmentType.OUR_COMMITMENT &&
+			liveType === CommitmentType.THEIR_CURRENT_COMMITMENT;
+		const missingTheirPointRepair =
+			recordedType === CommitmentType.THEIR_CURRENT_COMMITMENT &&
+			liveType === CommitmentType.THEIR_CURRENT_COMMITMENT &&
+			this._commitmentBroadcast.remotePerCommitmentPoint === undefined &&
+			selectTheirPerCommitmentPoint(
+				spendingTx,
+				this._channelState,
+				liveClassification.commitmentNumber
+			) !== undefined;
 		const revokedRepair =
 			recordedType !== CommitmentType.THEIR_REVOKED_COMMITMENT &&
 			liveType === CommitmentType.THEIR_REVOKED_COMMITMENT;
 		const coopRepair =
 			recordedType === CommitmentType.THEIR_FUTURE_COMMITMENT &&
 			liveType === CommitmentType.COOPERATIVE_CLOSE;
-		if (revokedRepair || coopRepair) {
+		// OUR -> THEIR_CURRENT repairs records persisted by pre-#573 builds.
+		// A THEIR_CURRENT record without a pinned point comes from a pre-#574
+		// build and may contain only the static to_remote output. Rebuilding it
+		// restores every point-dependent output and pins the selected point.
+		if (
+			revokedRepair ||
+			coopRepair ||
+			ourToTheirRepair ||
+			missingTheirPointRepair
+		) {
 			const knownOutpoint = this._commitmentBroadcast.spentOutpoint;
 			this._trackedOutputs = [];
 			this._commitmentBroadcast = null;
@@ -2026,7 +2085,7 @@ export class ChainMonitor {
 			this._knownPreimages,
 			this._paymentPrivkey,
 			this._htlcBasepointSecret,
-			this._channelState.remoteCurrentPerCommitmentPoint ?? undefined
+			this._theirCurrentPoint()
 		);
 
 		for (const r of resolved) {
@@ -2212,7 +2271,7 @@ export class ChainMonitor {
 						this._knownPreimages,
 						this._paymentPrivkey,
 						this._htlcBasepointSecret,
-						this._channelState.remoteCurrentPerCommitmentPoint ?? undefined
+						this._theirCurrentPoint()
 					);
 					break;
 				case CommitmentType.THEIR_FUTURE_COMMITMENT:
@@ -3152,7 +3211,7 @@ export class ChainMonitor {
 				this._paymentPrivkey,
 				this._htlcBasepointSecret,
 				currentCommitment
-					? this._channelState.remoteCurrentPerCommitmentPoint ?? undefined
+					? this._theirCurrentPoint()
 					: this._channelState.dlpRemotePerCommitmentPoint ??
 							this._channelState.remoteCurrentPerCommitmentPoint ??
 							undefined

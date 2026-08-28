@@ -1342,6 +1342,152 @@ describe('Chain Monitor (Phase 4C)', function () {
 	});
 
 	describe('Their Current Commitment', function () {
+		it('claims the window force-close: the newly signed pre-revocation commitment (issues #573/#574)', function () {
+			// The peer force-closes on the commitment we JUST signed, before
+			// its revoke_and_ack: classification must say THEIR_CURRENT (not
+			// ours), the record must pin the point that built the tx (the
+			// NEXT point, since remoteCurrentPerCommitmentPoint has not
+			// rotated), and the to_remote claim must broadcast.
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			const preState = opener.getFullState();
+			const nextPoint = preState.remoteNextPerCommitmentPoint!;
+
+			// Half a round: sign, peer withholds the revoke_and_ack.
+			const sigs = realCommitmentSigs(opener);
+			opener.signCommitment(sigs.signature, sigs.htlcSignatures);
+			void acceptor;
+
+			const winState = opener.getFullState();
+			expect(winState.remoteCommitmentNumber).to.equal(1n);
+			expect(winState.remoteRevocationNumber).to.equal(0n);
+
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				winState,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			const built = buildRemoteCommitment(winState, nextPoint, 1n);
+			const actions = monitor.handleFundingSpent(built.result.tx, 100);
+
+			expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+			const record = monitor.getFullState().commitmentBroadcast!;
+			expect(record.commitmentType).to.equal(
+				CommitmentType.THEIR_CURRENT_COMMITMENT
+			);
+			expect(
+				record.remotePerCommitmentPoint?.equals(nextPoint),
+				'record pins the point that built the tx'
+			).to.equal(true);
+			const toRemoteClaim = actions
+				.filter((a) => a.type === ChainActionType.BROADCAST_TX)
+				.find(
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					(a: any) => a.description && a.description.includes('to_remote')
+				);
+			expect(toRemoteClaim, 'our balance claimed').to.exist;
+		});
+
+		it('repairs a pre-fix OUR_COMMITMENT record to THEIR_CURRENT on re-report (#567 discipline)', function () {
+			// A record persisted by a pre-#573 build misread the peer's
+			// unrevoked previous commitment as OUR close. A re-report of the
+			// same tx must reclassify and re-resolve instead of trusting the
+			// stale record.
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const preState = opener.getFullState();
+			const peerPoint0 = preState.remoteCurrentPerCommitmentPoint!;
+			const peerTx = buildRemoteCommitment(preState, peerPoint0, 0n).result.tx;
+
+			const sigs = realCommitmentSigs(opener);
+			opener.signCommitment(sigs.signature, sigs.htlcSignatures);
+			const winState = opener.getFullState();
+
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				winState,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			// First report classifies correctly under the fixed build; force
+			// the stale pre-fix record shape onto the monitor to model a
+			// restored row.
+			monitor.handleFundingSpent(peerTx, 100);
+			const record = monitor.getFullState().commitmentBroadcast!;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(record as any).commitmentType = CommitmentType.OUR_COMMITMENT;
+
+			const actions = monitor.handleFundingSpent(peerTx, 100);
+			const repaired = monitor.getFullState().commitmentBroadcast!;
+			expect(repaired.commitmentType).to.equal(
+				CommitmentType.THEIR_CURRENT_COMMITMENT
+			);
+			const toRemoteClaim = actions
+				.filter((a) => a.type === ChainActionType.BROADCAST_TX)
+				.find(
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					(a: any) => a.description && a.description.includes('to_remote')
+				);
+			expect(toRemoteClaim, 'the repaired record re-resolves').to.exist;
+		});
+
+		it('repairs a pre-fix THEIR_CURRENT record missing point-dependent outputs on re-report', function () {
+			// A pre-#574 build classified the newest signed commitment correctly,
+			// but used the stale current point. It persisted only the static
+			// to_remote output and had no pinned point for later resolution.
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const preState = opener.getFullState();
+			const nextPoint = preState.remoteNextPerCommitmentPoint!;
+
+			const sigs = realCommitmentSigs(opener);
+			opener.signCommitment(sigs.signature, sigs.htlcSignatures);
+			const winState = opener.getFullState();
+			const peerTx = buildRemoteCommitment(winState, nextPoint, 1n).result.tx;
+
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				winState,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+			monitor.handleFundingSpent(peerTx, 100);
+
+			const staleRecord = monitor.getFullState().commitmentBroadcast!;
+			staleRecord.remotePerCommitmentPoint = undefined;
+			const staticOutputs = staleRecord.trackedOutputs.filter(
+				(output) => output.outputType === OutputType.TO_REMOTE
+			);
+			staleRecord.trackedOutputs.splice(
+				0,
+				staleRecord.trackedOutputs.length,
+				...staticOutputs
+			);
+
+			monitor.handleFundingSpent(peerTx, 100);
+
+			const repaired = monitor.getFullState();
+			expect(
+				repaired.commitmentBroadcast?.remotePerCommitmentPoint?.equals(
+					nextPoint
+				),
+				'record pins the point on upgrade'
+			).to.equal(true);
+			expect(
+				repaired.trackedOutputs.some(
+					(output) => output.outputType === OutputType.TO_LOCAL
+				),
+				'point-dependent outputs are rebuilt'
+			).to.equal(true);
+		});
+
 		it('should detect their commitment and claim to_remote immediately', function () {
 			const { opener, openerPrivkeys } = setupNormalChannels();
 			const state = opener.getFullState();
