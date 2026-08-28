@@ -680,9 +680,10 @@ export interface ISpliceWalletInput {
 	 * contributed and emitted on the wire like any of our inputs (our serial
 	 * parity, full prevTx), but its witness cannot be produced locally:
 	 * signWitness is never called for it. The host collects the owner's
-	 * signature out of band and delivers it via provideV2ExternalWitness,
-	 * which releases our tx_signatures once every external slot is filled.
-	 * Callers typically pass a throwing stub as signWitness.
+	 * signature out of band and delivers it via provideV2ExternalWitness (a v2
+	 * open) or provideSpliceExternalWitness (a splice-in, issue #592), which
+	 * releases our tx_signatures once every external slot is filled. Callers
+	 * typically pass a throwing stub as signWitness.
 	 */
 	external?: boolean;
 }
@@ -922,6 +923,11 @@ export class Channel {
 	// point (issue 307): the pending witnesses died with the process and the
 	// embedder must be told to re-drive sendTxSignatures.
 	private _v2CallerTxSigsSignaled = false;
+	// One-shot latch for SPLICE_TX_SIGNATURES_NEEDED, the splice twin of the
+	// above (issue #592): a splice withholding its tx_signatures on an owed
+	// external witness reminds the embedder once per connection cycle.
+	// In-memory only; markForReestablish and _resetSpliceDriver re-arm it.
+	private _spliceCallerTxSigsSignaled = false;
 	// An eager peer's EARLY channel_ready received while our v2 tx_signatures
 	// are withheld on an external witness (issue #572). TRANSIENT by design:
 	// the peer witnesses backing it live only in the session, so recording
@@ -993,6 +999,10 @@ export class Channel {
 		// tx-input order, and the input indices they were applied to.
 		ourWalletWitnesses: Buffer[][];
 		ourWalletInputIndices: number[];
+		// The subset of ourWalletInputIndices belonging to a third party
+		// (issue #592): their witness slots start empty and are filled by
+		// provideSpliceExternalWitness, never by a signing closure.
+		ourExternalInputIndices: number[];
 	} | null = null;
 	// ─── Taproot cooperative close (MuSig2 key-spend) ───
 	// All in-memory only, NEVER persisted: BOLT 2 retransmits shutdown on
@@ -7673,6 +7683,10 @@ export class Channel {
 		}
 
 		if (this._state.state === ChannelState.SPLICING) {
+			// A new connection cycle: re-arm the owed-external-witness reminder
+			// so a splice still withholding its tx_signatures asks again
+			// (issue #592), exactly as the v2 open re-arm above.
+			this._spliceCallerTxSigsSignaled = false;
 			// Phase-aware: before the mid-splice commitment round the splice is not
 			// resumable (interactive-tx negotiation dies with the connection) —
 			// forget it; the peer learns via our reestablish omitting
@@ -8232,6 +8246,13 @@ export class Channel {
 							actions.push(...this._maybeSendSpliceTxSigsOrdered());
 						}
 					}
+				} else if (!inflight.sentTxSignatures) {
+					// The peer's tx_signatures crossed but ours never left: an
+					// external witness is still owed (issue #592). There is
+					// nothing to retransmit, so remind the embedder instead —
+					// markForReestablish re-armed the one-shot for this
+					// connection cycle.
+					actions.push(...this._maybeSignalSpliceTxSigsNeeded());
 				} else {
 					// We are fully signed; the peer only needs our tx_signatures again.
 					actions.push(...this._retransmitSpliceTxSignatures());
@@ -8489,6 +8510,13 @@ export class Channel {
 	 */
 	private _retransmitSpliceTxSignatures(): ChannelAction[] {
 		if (!this._state.channelId) return [];
+		// Never retransmit a message that never left. An owed external witness
+		// (issue #592) means our tx_signatures is still withheld, and replaying
+		// it here would put an empty witness stack on the wire AND hand the
+		// peer our shared-input signature, which is exactly what the withhold
+		// exists to prevent. The guard lives here rather than only at the call
+		// sites so no caller can reintroduce the hole.
+		if (this._spliceOwedExternal().length > 0) return [];
 		const inflight = this._state.spliceInFlight;
 		if (inflight) {
 			return [
@@ -8552,7 +8580,10 @@ export class Channel {
 			oldWitnessScript: oldFunding.witnessScript,
 			localSig: inflight.ourSharedInputSig,
 			ourWalletWitnesses: inflight.ourWalletWitnesses,
-			ourWalletInputIndices: inflight.ourWalletInputIndices
+			ourWalletInputIndices: inflight.ourWalletInputIndices,
+			ourExternalInputIndices: inflight.externalInputIndices
+				? [...inflight.externalInputIndices]
+				: []
 		};
 		this._spliceSession = SpliceSession.restore({
 			channelId: this._state.channelId,
@@ -10532,6 +10563,7 @@ export class Channel {
 		// (shared funding input included) for the BIP 341 sighash.
 		const ourWalletWitnesses: Buffer[][] = [];
 		const ourWalletInputIndices: number[] = [];
+		const ourExternalInputIndices: number[] = [];
 		if (this._spliceInInputs) {
 			const p2wshScript = bitcoin.payments.p2wsh({
 				redeem: { output: oldFunding.witnessScript }
@@ -10556,6 +10588,19 @@ export class Channel {
 						wi.prevOutputIndex === vout
 				);
 				if (!w) continue;
+				if (w.external) {
+					// A third party's input (issue #592): its witness cannot be
+					// produced here (signWitness is a throwing stub). Hold an
+					// empty placeholder slot for provideSpliceExternalWitness and
+					// still claim the index as ours, so the peer-witness
+					// partitioning (_validateSplicePeerWitnesses,
+					// applyPeerSpliceSignature) keeps counting and placing the
+					// peer's stacks correctly.
+					ourExternalInputIndices.push(i);
+					ourWalletWitnesses.push([]);
+					ourWalletInputIndices.push(i);
+					continue;
+				}
 				const witness = w.signWitness(tx, i, w.value, prevouts);
 				tx.setWitness(i, witness);
 				ourWalletWitnesses.push(witness);
@@ -10570,7 +10615,8 @@ export class Channel {
 			oldWitnessScript: oldFunding.witnessScript,
 			localSig: signature,
 			ourWalletWitnesses,
-			ourWalletInputIndices
+			ourWalletInputIndices,
+			ourExternalInputIndices
 		};
 
 		return {
@@ -11048,6 +11094,7 @@ export class Channel {
 		this._spliceOutDestination = null;
 		this._spliceInInputs = null;
 		this._spliceTx = null;
+		this._spliceCallerTxSigsSignaled = false;
 	}
 
 	/**
@@ -11084,6 +11131,10 @@ export class Channel {
 					w.map((b) => Buffer.from(b))
 				),
 				ourWalletInputIndices: [...st.ourWalletInputIndices],
+				externalInputIndices:
+					st.ourExternalInputIndices.length > 0
+						? [...st.ourExternalInputIndices]
+						: undefined,
 				inputPrevouts: prevouts
 					? prevouts.scripts.map((s, i) => ({
 							script: Buffer.from(s),
@@ -11989,6 +12040,80 @@ export class Channel {
 	}
 
 	/**
+	 * The tx-input indices of EXTERNAL splice inputs whose witness slot is
+	 * still an empty placeholder (issue #592). Non-empty means our
+	 * tx_signatures is owed a third-party witness and must not release: an
+	 * empty stack in the message would be a witness hole the splice tx can
+	 * never recover from, and our shared-input signature would travel with it.
+	 */
+	private _spliceOwedExternalIndices(record: ISpliceInFlight): number[] {
+		if (!record.externalInputIndices?.length) return [];
+		const owed: number[] = [];
+		for (const idx of record.externalInputIndices) {
+			const pos = record.ourWalletInputIndices.indexOf(idx);
+			const witness = pos >= 0 ? record.ourWalletWitnesses[pos] : undefined;
+			if (!witness || witness.length === 0) owed.push(idx);
+		}
+		return owed;
+	}
+
+	/**
+	 * The same predicate over the in-memory build, for the window before the
+	 * durable record exists (_syncSpliceInFlight can decline to create it when
+	 * the session or the built tx is missing). A withhold must never depend on
+	 * the record having been written.
+	 */
+	private _spliceOwedExternalIndicesFromBuild(): number[] {
+		const st = this._spliceTx;
+		if (!st) return [];
+		return st.ourExternalInputIndices.filter((idx) => {
+			const pos = st.ourWalletInputIndices.indexOf(idx);
+			const witness = pos >= 0 ? st.ourWalletWitnesses[pos] : undefined;
+			return !witness || witness.length === 0;
+		});
+	}
+
+	/** Owed external slots from the record when it exists, else from the build. */
+	private _spliceOwedExternal(): number[] {
+		const record = this._state.spliceInFlight;
+		return record
+			? this._spliceOwedExternalIndices(record)
+			: this._spliceOwedExternalIndicesFromBuild();
+	}
+
+	/**
+	 * Tell the embedder, once per connection cycle, that a withheld splice
+	 * tx_signatures is waiting on third-party witnesses (issue #592). Only the
+	 * owner can supply them, and after a restart nothing else would ever
+	 * prompt the delivery: our own witnesses are in the record, but the
+	 * external slots are holes that stay holes.
+	 */
+	private _maybeSignalSpliceTxSigsNeeded(): ChannelAction[] {
+		const record = this._state.spliceInFlight;
+		const owed = this._spliceOwedExternal();
+		if (owed.length === 0 || !this._state.channelId) return [];
+		const spliceTxid = record
+			? Buffer.from(record.spliceTxid)
+			: this._spliceTx
+			? Buffer.from(this._spliceTx.tx.getHash())
+			: null;
+		const newFundingOutputIndex =
+			record?.newFundingOutputIndex ?? this._spliceTx?.newFundingOutputIndex;
+		if (!spliceTxid || newFundingOutputIndex === undefined) return [];
+		if (this._spliceCallerTxSigsSignaled) return [];
+		this._spliceCallerTxSigsSignaled = true;
+		return [
+			{
+				type: ChannelActionType.SPLICE_TX_SIGNATURES_NEEDED,
+				channelId: this._state.channelId,
+				spliceTxid,
+				newFundingOutputIndex,
+				externalInputIndices: owed
+			}
+		];
+	}
+
+	/**
 	 * Once the interactive tx is complete (AWAITING_TX_SIGNATURES), build and sign
 	 * the splice transaction and send our tx_signatures (carrying our shared-input
 	 * signature). Idempotent — only sends once.
@@ -12017,6 +12142,14 @@ export class Channel {
 					message: 'Failed to build/sign splice tx'
 				}
 			];
+		}
+		// A third party still owes a witness for one of our contributed inputs
+		// (issue #592): withhold. Our shared-input signature travels in this
+		// same message, so releasing it would let the peer hold a splice tx
+		// nobody can complete while the pre-splice funding is already spendable
+		// by it. Remind the embedder instead; the delivery releases.
+		if (this._spliceOwedExternal().length > 0) {
+			return this._maybeSignalSpliceTxSigsNeeded();
 		}
 		this._spliceSentTxSigs = true;
 
@@ -12077,6 +12210,62 @@ export class Channel {
 		if (
 			this._isZeroConfChannelType() &&
 			this._state.spliceInFlight?.receivedTxSignatures
+		) {
+			actions.push(...this.sendSpliceLocked());
+		}
+		return actions;
+	}
+
+	/**
+	 * The splice signature exchange is complete on both sides: record the
+	 * splice outpoint, persist BEFORE broadcasting (a crash must not lose a
+	 * splice tx the network has seen), arm both watches and lock when due.
+	 *
+	 * One helper, two callers: the ordinary tx_signatures completion and the
+	 * external-witness delivery that releases a withheld exchange (issue
+	 * #592). The order is the fund-safety contract of issue #350/#479 and must
+	 * not drift between them.
+	 */
+	private _spliceCompletionTail(
+		tx: import('bitcoinjs-lib').Transaction,
+		newFundingOutputIndex: number
+	): ChannelAction[] {
+		const spliceTxid = Buffer.from(tx.getHash());
+		this._state.spliceFundingTxid = spliceTxid;
+		this._state.spliceFundingOutputIndex = newFundingOutputIndex;
+		this._syncSpliceInFlight({
+			receivedTxSignatures: true,
+			fullySigned: true,
+			spliceTxHex: tx.toHex()
+		});
+		const actions: ChannelAction[] = [
+			{ type: ChannelActionType.PERSIST_STATE },
+			// Marked: this creates a funding output naming us. When WE signed
+			// first the batch carries no tx_signatures of our own, so without
+			// the mark nothing in it is barrier-class and the transaction would
+			// reach the network ahead of the frame recording the splice.
+			{
+				type: ChannelActionType.BROADCAST_TX,
+				tx: tx.toBuffer(),
+				fundingCritical: true
+			},
+			...this._recordPreSpliceSpendWatch(spliceTxid),
+			{
+				type: ChannelActionType.WATCH_FUNDING,
+				fundingTxid: spliceTxid,
+				fundingOutputIndex: newFundingOutputIndex,
+				minimumDepth: this._state.minimumDepth
+			}
+		];
+		// Zero-conf channels lock the splice immediately after tx_signatures
+		// (BOLT 2): confirmation gating would idle the channel in exactly the
+		// window zero-conf exists for. Ordinary channels lock at depth; the
+		// confirmed check covers a confirmation that arrived while we were
+		// missing the peer's signatures (e.g. it completed and broadcast
+		// during a disconnect).
+		if (
+			this._isZeroConfChannelType() ||
+			this._state.spliceInFlight?.confirmed
 		) {
 			actions.push(...this.sendSpliceLocked());
 		}
@@ -14576,15 +14765,27 @@ export class Channel {
 			const remoteOwned = (input.serialId % 2n === 0n) !== weAreInitiator;
 			const isShared =
 				kind === 'splice' && (!input.prevTx || input.prevTx.length === 0);
-			if ((kind === 'v2' || (kind === 'splice' && remoteOwned)) && !isShared) {
+			// Our own EXTERNAL splice inputs (issue #592) are judged like a
+			// peer's: their witnesses arrive out of band and go through
+			// _validateWitnessForInput, so an unverifiable prevout type would
+			// make the delivery impossible to accept and wedge the splice.
+			const ourExternalSpliceInput =
+				kind === 'splice' &&
+				!remoteOwned &&
+				!isShared &&
+				this._spliceInputIsExternal(input);
+			if (
+				((kind === 'v2' || (kind === 'splice' && remoteOwned)) && !isShared) ||
+				ourExternalSpliceInput
+			) {
 				// Witnesses can only be VERIFIED for P2WPKH and P2TR key-spend
 				// prevouts; every other type would have to be accepted on
 				// shape alone. Refuse the negotiation HERE, before the
 				// commitment round signs anything for this transaction, rather
 				// than at tx_signatures when signatures may already be out.
-				// Splice checks REMOTE inputs only: our own splice-in inputs
-				// are signed by the wallet's own closures (any script type)
-				// and never pass through our witness validator.
+				// Splice checks REMOTE inputs and our own external ones: our
+				// closure-signed splice-in inputs (any script type) never pass
+				// through our witness validator.
 				const unsupported = this._v2CheckInputSpendable(input);
 				if (unsupported) return unsupported;
 			}
@@ -15420,8 +15621,25 @@ export class Channel {
 	}
 
 	/**
+	 * Whether a negotiated splice input is one of OUR registered EXTERNAL
+	 * inputs (issue #592). Only the splice initiator holds _spliceInInputs, so
+	 * the acceptor side of this question is always false.
+	 */
+	private _spliceInputIsExternal(input: IInteractiveTxInput): boolean {
+		if (!this._spliceInInputs) return false;
+		const vout = input.prevTxVout ?? input.prevOutputIndex;
+		return this._spliceInInputs.inputs.some(
+			(wi) =>
+				wi.external === true &&
+				wi.prevOutputIndex === vout &&
+				extractTxidFromPrevTx(wi.prevTx).equals(input.prevTxid)
+		);
+	}
+
+	/**
 	 * Interactive-tx funding inputs we will have to judge witnesses for (v2
-	 * open inputs, splice remote inputs) must pay P2WPKH or P2TR: those are
+	 * open inputs, splice remote inputs, and our own EXTERNAL splice inputs
+	 * whose witnesses arrive out of band) must pay P2WPKH or P2TR: those are
 	 * the only prevout types whose tx_signatures witnesses can be
 	 * cryptographically verified, and an unverifiable input must never make
 	 * it into the negotiated tx.
@@ -16266,6 +16484,180 @@ export class Channel {
 	}
 
 	/**
+	 * Deliver a third-party witness for an EXTERNAL input of a splice-in
+	 * (issue #592), the splice twin of provideV2ExternalWitness. The witness
+	 * is cryptographically verified against the recorded prevout set before
+	 * anything is stored (P2WPKH over the BIP 143 sighash, P2TR key-spend over
+	 * BIP 341; anything unverifiable is refused), then persisted into the
+	 * in-flight record's slot. Filling the last slot releases the withheld
+	 * tx_signatures, which is also what makes the splice broadcastable and
+	 * lockable. Works on a live channel and on one restored after a restart
+	 * (the record carries the negotiated tx and its prevouts).
+	 *
+	 * `prevTxid` is in tx.getHash() INTERNAL byte order, matching
+	 * extractTxidFromPrevTx and the negotiated tx's input hashes.
+	 *
+	 * Throws on misuse or an invalid witness without touching channel state; a
+	 * late delivery after our tx_signatures already left is a no-op. While a
+	 * witness is owed the channel stays quiescent and HTLC-unusable
+	 * (isSplicePendingLock requires both tx_signatures), and abortSplice stays
+	 * refused once the peer's tx_signatures crossed: delivery is the only exit.
+	 */
+	provideSpliceExternalWitness(
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): ChannelAction[] {
+		if (prevTxid.length !== 32) {
+			throw new Error('prevTxid must be 32 bytes (internal byte order)');
+		}
+		const record = this._state.spliceInFlight;
+		if (!record) {
+			throw new Error(
+				'no in-flight splice record to deliver an external witness to'
+			);
+		}
+		if (!record.externalInputIndices?.length) {
+			throw new Error('this splice has no external inputs');
+		}
+		if (record.sentTxSignatures || record.fullySigned) {
+			return [];
+		}
+		let tx: import('bitcoinjs-lib').Transaction;
+		if (this._spliceTx) {
+			tx = this._spliceTx.tx;
+		} else {
+			try {
+				tx = bitcoin.Transaction.fromHex(record.spliceTxHex);
+			} catch {
+				throw new Error('negotiated splice tx cannot be resolved');
+			}
+		}
+		const index = tx.ins.findIndex(
+			(i) => Buffer.from(i.hash).equals(prevTxid) && i.index === prevOutputIndex
+		);
+		if (index < 0) {
+			throw new Error('outpoint is not an input of the negotiated splice tx');
+		}
+		if (!record.externalInputIndices.includes(index)) {
+			throw new Error('outpoint is not an external splice input');
+		}
+		const pos = record.ourWalletInputIndices.indexOf(index);
+		if (pos < 0) {
+			throw new Error('external input is not among our splice inputs');
+		}
+		const prevouts = this._spliceInputPrevouts();
+		if (!prevouts) {
+			throw new Error('splice prevouts cannot be resolved');
+		}
+		const problem = this._validateWitnessForInput(tx, index, witness, prevouts);
+		if (problem) {
+			throw new Error(`external witness rejected: ${problem}`);
+		}
+
+		const stack = witness.map((b) => Buffer.from(b));
+		const updated = record.ourWalletWitnesses.map((w, p) =>
+			p === pos ? stack : w
+		);
+		tx.setWitness(index, stack);
+		if (this._spliceTx) this._spliceTx.ourWalletWitnesses = updated;
+		// The hex carries our applied witnesses, so refresh it here too: a
+		// restart rebuilds _spliceTx from it (restoreSpliceInFlight), and a
+		// rebuild without this stack would drop a witness the record itself
+		// still claims to hold.
+		this._syncSpliceInFlight({
+			ourWalletWitnesses: updated,
+			spliceTxHex: tx.toHex()
+		});
+
+		if (this._spliceOwedExternalIndices(record).length > 0) {
+			// More slots owed: persist the verified witness (a restart must not
+			// lose it) and keep waiting.
+			return [{ type: ChannelActionType.PERSIST_STATE }];
+		}
+
+		if (!record.receivedTxSignatures) {
+			// We are still owed the peer's tx_signatures; release ours only if
+			// the ordering says we sign first. Otherwise this persists and the
+			// peer's message completes the exchange through handleTxSignatures.
+			return [
+				{ type: ChannelActionType.PERSIST_STATE },
+				...this._maybeSendSpliceTxSigsOrdered()
+			];
+		}
+
+		// The peer signed first (the common shape: the splice initiator
+		// contributes the shared input and so signs second). applyPeerSpliceSignature
+		// already advanced the session out of AWAITING_TX_SIGNATURES, which is
+		// the state _maybeSendSpliceTxSigs gates on, so our message is composed
+		// from the record instead — the same bytes it would have sent.
+		this._spliceSentTxSigs = true;
+		const spliceTxid = Buffer.from(tx.getHash());
+		this._state.spliceFundingTxid = spliceTxid;
+		this._state.spliceFundingOutputIndex = record.newFundingOutputIndex;
+		this._syncSpliceInFlight({ sentTxSignatures: true });
+		const msg: ITxSignaturesMessage = {
+			channelId: this._state.channelId!,
+			txid: spliceTxid,
+			witnesses: updated,
+			sharedInputSignature: record.ourSharedInputSig
+		};
+		// Same order as _maybeSendSpliceTxSigs: persist, arm both watches, then
+		// let our signature out; the completion tail then broadcasts and locks
+		// when due. Its repeated persist and watches are idempotent (one commit
+		// per batch, arming is per-outpoint).
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			...this._recordPreSpliceSpendWatch(spliceTxid),
+			{
+				type: ChannelActionType.WATCH_FUNDING,
+				fundingTxid: spliceTxid,
+				fundingOutputIndex: record.newFundingOutputIndex,
+				minimumDepth: this._state.minimumDepth
+			},
+			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg)),
+			...this._spliceCompletionTail(tx, record.newFundingOutputIndex)
+		];
+	}
+
+	/**
+	 * The negotiated splice transaction and the data a third-party input owner
+	 * needs to sign against (issue #592): a DEFENSIVE COPY of the tx (a
+	 * caller mutating the channel's live splice tx would invalidate every
+	 * signature already made over it), the shared-input and new-funding
+	 * indices, the full prevout set BIP 341 sighashes need, and the outpoints
+	 * whose witnesses are still owed. Null when no splice tx is built.
+	 */
+	getPendingSpliceTx(): {
+		tx: import('bitcoinjs-lib').Transaction;
+		spliceTxid: Buffer;
+		sharedInputIndex: number;
+		newFundingOutputIndex: number;
+		prevouts: { scripts: Buffer[]; values: bigint[] } | null;
+		owedExternalInputs: Array<{
+			inputIndex: number;
+			prevTxid: Buffer;
+			prevOutputIndex: number;
+		}>;
+	} | null {
+		const st = this._spliceTx;
+		if (!st) return null;
+		const clone = bitcoin.Transaction.fromBuffer(st.tx.toBuffer());
+		return {
+			tx: clone,
+			spliceTxid: Buffer.from(st.tx.getHash()),
+			sharedInputIndex: st.sharedInputIndex,
+			newFundingOutputIndex: st.newFundingOutputIndex,
+			prevouts: this._spliceInputPrevouts(),
+			owedExternalInputs: this._spliceOwedExternal().map((inputIndex) => ({
+				inputIndex,
+				prevTxid: Buffer.from(st.tx.ins[inputIndex].hash),
+				prevOutputIndex: st.tx.ins[inputIndex].index
+			}))
+		};
+	}
+
+	/**
 	 * Handle tx_signatures from peer.
 	 */
 	handleTxSignatures(msg: ITxSignaturesMessage): ChannelAction[] {
@@ -16394,48 +16786,40 @@ export class Channel {
 				];
 			}
 
-			// Record the splice outpoint and broadcast + watch it. Persist BEFORE
-			// broadcasting so a crash cannot lose a splice tx the network has seen.
-			const spliceTxid = Buffer.from(tx.getHash());
-			this._state.spliceFundingTxid = spliceTxid;
-			this._state.spliceFundingOutputIndex =
-				this._spliceTx!.newFundingOutputIndex;
-			this._syncSpliceInFlight({
-				receivedTxSignatures: true,
-				fullySigned: true,
-				spliceTxHex: tx.toHex()
-			});
-			actions.push({ type: ChannelActionType.PERSIST_STATE });
-			// Marked: this creates a funding output naming us. When WE signed
-			// first the batch carries no tx_signatures of our own, so without
-			// the mark nothing in it is barrier-class and the transaction would
-			// reach the network ahead of the frame recording the splice.
-			actions.push({
-				type: ChannelActionType.BROADCAST_TX,
-				tx: tx.toBuffer(),
-				fundingCritical: true
-			});
-			actions.push(...this._recordPreSpliceSpendWatch(spliceTxid));
-			actions.push({
-				type: ChannelActionType.WATCH_FUNDING,
-				fundingTxid: spliceTxid,
-				fundingOutputIndex: this._spliceTx!.newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
-			});
-
-			// Zero-conf channels lock the splice immediately after tx_signatures
-			// (BOLT 2): confirmation gating would idle the channel in exactly the
-			// window zero-conf exists for. Ordinary channels lock at depth; the
-			// confirmed check covers a confirmation that arrived while we were
-			// missing the peer's signatures (e.g. it completed and broadcast
-			// during a disconnect).
-			if (
-				this._isZeroConfChannelType() ||
-				this._state.spliceInFlight?.confirmed
-			) {
-				actions.push(...this.sendSpliceLocked());
+			// A third party still owes a witness for an input we contributed
+			// (issue #592): the transaction is NOT complete, so nothing may be
+			// broadcast, watched as the new funding, or locked, and the record
+			// must say so. Our own tx_signatures never left (the send helper
+			// above withheld it), so the peer cannot complete the splice
+			// either. Record the peer's material and wait; the witness
+			// delivery runs the completion tail.
+			const owedExternal = this._state.spliceInFlight
+				? this._spliceOwedExternalIndices(this._state.spliceInFlight)
+				: [];
+			if (owedExternal.length > 0) {
+				this._state.spliceFundingTxid = Buffer.from(tx.getHash());
+				this._state.spliceFundingOutputIndex =
+					this._spliceTx!.newFundingOutputIndex;
+				this._syncSpliceInFlight({
+					receivedTxSignatures: true,
+					fullySigned: false,
+					spliceTxHex: tx.toHex()
+				});
+				// The persist leads: the withheld send produced no wire actions,
+				// so `actions` holds at most the same one-shot reminder (the
+				// latch dedupes), and a reminder must sit behind the persist to
+				// be suppressible when that persist fails.
+				return [
+					{ type: ChannelActionType.PERSIST_STATE },
+					...actions,
+					...this._maybeSignalSpliceTxSigsNeeded()
+				];
 			}
-			return actions;
+
+			return [
+				...actions,
+				...this._spliceCompletionTail(tx, this._spliceTx!.newFundingOutputIndex)
+			];
 		}
 
 		// BOLT 2: tx_signatures MUST be ignored once either side has sent or

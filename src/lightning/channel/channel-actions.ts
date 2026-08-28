@@ -32,7 +32,8 @@ export enum ChannelActionType {
 	PERSIST_STATE = 'PERSIST_STATE',
 	SPLICE_COMPLETE = 'SPLICE_COMPLETE',
 	SPLICE_ABORTED = 'SPLICE_ABORTED',
-	TX_SIGNATURES_NEEDED = 'TX_SIGNATURES_NEEDED'
+	TX_SIGNATURES_NEEDED = 'TX_SIGNATURES_NEEDED',
+	SPLICE_TX_SIGNATURES_NEEDED = 'SPLICE_TX_SIGNATURES_NEEDED'
 }
 
 export interface ISendMessageAction {
@@ -278,6 +279,28 @@ export interface ITxSignaturesNeededAction {
 }
 
 /**
+ * A splice past its commitment round is withholding our tx_signatures because
+ * an EXTERNAL input's witness is still owed by its third-party owner
+ * (issue #592). Emitted once per connection cycle, and re-armed on reconnect
+ * so a restart (or a peer that reconnects mid-wait) is reminded.
+ *
+ * Unlike TX_SIGNATURES_NEEDED, whose documented answer is a complete
+ * sendTxSignatures set, the ONLY answer here is provideSpliceExternalWitness:
+ * our own splice-in witnesses were produced at build time and already live in
+ * the durable record. The witnesses are signed over the recorded splice tx;
+ * state.spliceInFlight carries spliceTxHex and inputPrevouts to sign against.
+ */
+export interface ISpliceTxSignaturesNeededAction {
+	type: ChannelActionType.SPLICE_TX_SIGNATURES_NEEDED;
+	channelId: Buffer;
+	/** Splice txid in tx.getHash() internal byte order. */
+	spliceTxid: Buffer;
+	newFundingOutputIndex: number;
+	/** The still-owed external inputs' tx-input indices (never empty). */
+	externalInputIndices: number[];
+}
+
+/**
  * Wire messages BOLT 2 can require us to retransmit after a reconnect, and so
  * the ones worth retaining byte-exactly in the recovery outbox
  * (docs/RECOVERY-PROTOCOL.md 5.2). Anything outside this set is either
@@ -500,4 +523,5 @@ export type ChannelAction =
 	| IPersistStateAction
 	| ISpliceCompleteAction
 	| ISpliceAbortedAction
-	| ITxSignaturesNeededAction;
+	| ITxSignaturesNeededAction
+	| ISpliceTxSignaturesNeededAction;

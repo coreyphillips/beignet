@@ -43,6 +43,16 @@ export interface ISpliceInFlight {
 	ourWalletWitnesses: Buffer[][];
 	ourWalletInputIndices: number[];
 	/**
+	 * Direct funding (issue #592): the tx-input indices among
+	 * ourWalletInputIndices whose inputs belong to a THIRD PARTY. Their
+	 * parallel ourWalletWitnesses slots hold empty placeholders until the
+	 * owner's witness arrives via provideSpliceExternalWitness; the release
+	 * predicate treats an unfilled slot as a hole, and our tx_signatures never
+	 * leaves with one. Durable so the wait survives disconnect and restart.
+	 * Absent on records without external inputs.
+	 */
+	externalInputIndices?: number[];
+	/**
 	 * The complete prevout set of the negotiated splice tx (scriptPubkey and
 	 * value per input, in tx-input order, the shared funding input included).
 	 * The interactive-tx prev_txs die with the process, and peer witness
