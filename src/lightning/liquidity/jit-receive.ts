@@ -497,7 +497,7 @@ export class JitReceiveManager extends EventEmitter {
 		if (remaining.length !== this.restoredToFail.length) {
 			this.restoredToFail = remaining;
 			this.persistHeld();
-			this.emit('jit:restored-failed', { remaining: remaining.length });
+			this.safeEmit('jit:restored-failed', { remaining: remaining.length });
 		}
 	}
 
@@ -680,7 +680,7 @@ export class JitReceiveManager extends EventEmitter {
 		this.intents.set(scidHex, intent);
 		this.persistIntents();
 		this.refreshJitClients();
-		this.emit('jit:intent', intent);
+		this.safeEmit('jit:intent', intent);
 
 		return {
 			requestId: auth.requestId,
@@ -781,7 +781,7 @@ export class JitReceiveManager extends EventEmitter {
 		held.push(part);
 		this.heldParts.set(scidHex, held);
 		this.persistHeld();
-		this.emit('jit:intercepted', {
+		this.safeEmit('jit:intercepted', {
 			scidHex,
 			amountMsat: part.forwardAmountMsat
 		});
@@ -791,7 +791,10 @@ export class JitReceiveManager extends EventEmitter {
 		if (target === undefined || newTotal >= target) {
 			// Single part, unknown total, or a complete MPP set: fund now.
 			this.clearAggregation(scidHex);
-			void this.fund(intent);
+			// Nothing in fund() should reject (every arm resolves its parts and
+			// reports through safeEmit), but an unhandled rejection would take
+			// the process down; the deadline backstop still owns the parts.
+			this.fund(intent).catch(() => undefined);
 		} else if (!this.aggregationTimers.has(scidHex)) {
 			// MPP: wait, bounded, for the remaining parts.
 			const t = setTimeout(() => {
@@ -864,7 +867,7 @@ export class JitReceiveManager extends EventEmitter {
 				// best-effort: the inbound channel may already be gone
 			}
 		}
-		this.emit('jit:failed', {
+		this.safeEmit('jit:failed', {
 			scidHex: scope,
 			parts: parts.length,
 			reason: 'held part reached its inbound CLTV deadline'
@@ -888,8 +891,7 @@ export class JitReceiveManager extends EventEmitter {
 		// throwing past an already-emptied held map and dropping them.
 		const feeError = this.validateFee(parts, totalMsat);
 		if (feeError) {
-			this.emit('jit:failed', { scidHex, reason: feeError });
-			this.failAllHeld(scidHex, this.deps.failureCodes.temporaryChannelFailure);
+			this.failFunding(scidHex, feeError);
 			return;
 		}
 
@@ -901,18 +903,14 @@ export class JitReceiveManager extends EventEmitter {
 			fundingSats = this.cfg.maxClientFundingSats;
 		}
 		if (!this.reserveFunding(fundingSats)) {
-			this.emit('jit:failed', {
-				scidHex,
-				reason: 'cumulative JIT funding cap reached'
-			});
-			this.failAllHeld(scidHex, this.deps.failureCodes.temporaryChannelFailure);
+			this.failFunding(scidHex, 'cumulative JIT funding cap reached');
 			return;
 		}
 
 		this.fundingInFlight.add(scidHex);
 		let fronted = false;
 		try {
-			this.emit('jit:funding', { scidHex, fundingSats });
+			this.safeEmit('jit:funding', { scidHex, fundingSats });
 			const channelId = await this.attempt(
 				(timeoutMs) =>
 					this.deps.openZeroConfChannelAndWait(
@@ -953,13 +951,12 @@ export class JitReceiveManager extends EventEmitter {
 			this.intents.delete(scidHex);
 			this.persistIntents();
 			this.refreshJitClients();
-			this.emit('jit:forwarded', { scidHex, parts: toForward.length });
+			this.safeEmit('jit:forwarded', { scidHex, parts: toForward.length });
 		} catch (err) {
-			this.emit('jit:failed', {
+			this.failFunding(
 				scidHex,
-				reason: err instanceof Error ? err.message : String(err)
-			});
-			this.failAllHeld(scidHex, this.deps.failureCodes.temporaryChannelFailure);
+				err instanceof Error ? err.message : String(err)
+			);
 		} finally {
 			this.releaseFunding(fundingSats, fronted);
 			this.fundingInFlight.delete(scidHex);
@@ -996,13 +993,13 @@ export class JitReceiveManager extends EventEmitter {
 		queue.push(part);
 		this.spliceQueues.set(key, queue);
 		this.persistHeld();
-		this.emit('jit:intercepted', {
+		this.safeEmit('jit:intercepted', {
 			channelIdHex: key,
 			amountMsat: part.forwardAmountMsat
 		});
 
 		if (!this.spliceInFlight.has(key)) {
-			void this.spliceAndRetry(outChannelId);
+			this.spliceAndRetry(outChannelId).catch(() => undefined);
 		}
 		return true;
 	}
@@ -1022,21 +1019,17 @@ export class JitReceiveManager extends EventEmitter {
 			amountSats = this.cfg.maxClientFundingSats;
 		}
 		if (!this.reserveFunding(amountSats)) {
-			this.emit('jit:failed', {
-				channelIdHex: key,
-				reason: 'cumulative JIT funding cap reached'
-			});
-			this.failAllSpliceQueued(
-				key,
-				this.deps.failureCodes.temporaryChannelFailure
-			);
+			this.failSplice(key, 'cumulative JIT funding cap reached');
 			return;
 		}
 
 		this.spliceInFlight.add(key);
 		let fronted = false;
 		try {
-			this.emit('jit:funding', { channelIdHex: key, fundingSats: amountSats });
+			this.safeEmit('jit:funding', {
+				channelIdHex: key,
+				fundingSats: amountSats
+			});
 			await this.attempt(
 				(timeoutMs) =>
 					this.deps.spliceInAndWait!(outChannelId, amountSats, timeoutMs),
@@ -1057,19 +1050,12 @@ export class JitReceiveManager extends EventEmitter {
 				part.spliceRetried = true;
 				this.forwardOrFail(outChannelId, part);
 			}
-			this.emit('jit:forwarded', {
+			this.safeEmit('jit:forwarded', {
 				channelIdHex: key,
 				parts: toForward.length
 			});
 		} catch (err) {
-			this.emit('jit:failed', {
-				channelIdHex: key,
-				reason: err instanceof Error ? err.message : String(err)
-			});
-			this.failAllSpliceQueued(
-				key,
-				this.deps.failureCodes.temporaryChannelFailure
-			);
+			this.failSplice(key, err instanceof Error ? err.message : String(err));
 		} finally {
 			this.releaseFunding(amountSats, fronted);
 			this.spliceInFlight.delete(key);
@@ -1178,6 +1164,24 @@ export class JitReceiveManager extends EventEmitter {
 
 	// ─────────────── Resolution ───────────────
 
+	/**
+	 * Resolve a funding's parts and then report it. Resolution comes FIRST on
+	 * every arm: a throwing observer must never be what stops a held HTLC from
+	 * being failed back.
+	 */
+	private failFunding(scidHex: string, reason: string): void {
+		this.failAllHeld(scidHex, this.deps.failureCodes.temporaryChannelFailure);
+		this.safeEmit('jit:failed', { scidHex, reason });
+	}
+
+	private failSplice(channelIdHex: string, reason: string): void {
+		this.failAllSpliceQueued(
+			channelIdHex,
+			this.deps.failureCodes.temporaryChannelFailure
+		);
+		this.safeEmit('jit:failed', { channelIdHex, reason });
+	}
+
 	/** Fail every part held for an intercept scid. The preimage is not involved. */
 	private failAllHeld(scidHex: string, failureCode: number): void {
 		this.clearAggregation(scidHex);
@@ -1205,6 +1209,15 @@ export class JitReceiveManager extends EventEmitter {
 			} catch {
 				// best-effort
 			}
+		}
+	}
+
+	/** An observer's failure must never take a hold down with it. */
+	private safeEmit(event: string, payload: unknown): void {
+		try {
+			this.emit(event, payload);
+		} catch {
+			// deliberately swallowed; see the method comment
 		}
 	}
 

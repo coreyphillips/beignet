@@ -274,7 +274,9 @@ function driveForward(
 			},
 			sharedSecret: crypto.randomBytes(32)
 		},
-		(opts.amountMsat ?? 2_000_000n) + 1_000n,
+		// Generous relay fee, so a forward onto a real channel clears the
+		// outgoing policy check and reaches the add.
+		(opts.amountMsat ?? 2_000_000n) + 100_000n,
 		opts.incomingCltvExpiry ?? 800_200
 	);
 	return { paymentHash };
@@ -319,6 +321,48 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		expect(bob.listChannels()).to.have.length(1);
 		expect(forwards).to.have.length(1);
 		expect(forwards[0].equals(channels[0].channelId)).to.equal(true);
+	});
+
+	it('holds for a splice when the add onto a JIT client channel is refused', async function () {
+		const pair = nodePair();
+		open.push(pair);
+		const { alice } = pair;
+
+		// Open the client's channel through the JIT path first.
+		const first = registerIntent(pair, { targetRemainingInboundSat: 25_000n });
+		const opened = new Promise<void>((resolve) =>
+			alice.once('jit:forwarded', () => resolve())
+		);
+		driveForward(alice, first.interceptScid);
+		await opened;
+		// A second intent keeps bob a JIT client after the first was consumed.
+		registerIntent(pair);
+
+		const events: string[] = [];
+		alice.on('jit:funding', (d: { channelIdHex?: string }) =>
+			events.push(`funding:${d.channelIdHex ?? 'open'}`)
+		);
+		alice.on('jit:failed', () => events.push('failed'));
+		const settled = new Promise<void>((resolve) =>
+			alice.once('jit:failed', () => resolve())
+		);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const scidHex = [...(alice as any).scidToChannelId.keys()][0] as string;
+		const channelId = alice.listChannels()[0].channelId.toString('hex');
+		// Far past alice's 37000 sat side of the channel, so the add is refused
+		// for liquidity: for a JIT client that is a splice, not a dead end.
+		driveForward(alice, Buffer.from(scidHex, 'hex'), {
+			amountMsat: 900_000_000n
+		});
+		await settled;
+
+		// The part was HELD (a splice was attempted for this channel) before
+		// anything failed: the hook sits in forwardHtlcOnto's refusal arm.
+		// The splice itself cannot run without a wallet selection provider, so
+		// it then fails the part cleanly rather than leaking it.
+		expect(events[0]).to.equal(`funding:${channelId}`);
+		expect(events).to.include('failed');
 	});
 
 	it('authorizes only OUR outbound open, never an inbound zero-conf channel', function () {

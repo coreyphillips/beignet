@@ -601,7 +601,7 @@ describe('JIT funding caps', function () {
 	it('refuses to hold once every funding slot is busy', async function () {
 		const h = makeHarness({ maxConcurrentFundings: 1 });
 		let releaseOpen = (): void => undefined;
-		h.openResult.fn = () =>
+		h.openResult.fn = (): Promise<Buffer> =>
 			new Promise<Buffer>((resolve) => {
 				releaseOpen = (): void => resolve(crypto.randomBytes(32));
 			});
@@ -653,7 +653,7 @@ describe('JIT hold deadlines', function () {
 	it('never forwards a part the deadline already revoked', async function () {
 		const h = makeHarness({ holdExpiryMarginBlocks: 18 });
 		let releaseOpen = (): void => undefined;
-		h.openResult.fn = () =>
+		h.openResult.fn = (): Promise<Buffer> =>
 			new Promise<Buffer>((resolve) => {
 				releaseOpen = (): void => resolve(crypto.randomBytes(32));
 			});
