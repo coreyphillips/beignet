@@ -7377,9 +7377,14 @@ export class ChannelManager extends EventEmitter {
 			}
 		}
 		if (outpoints.length === 0) return;
-		void this.fundingProvider
-			.releaseInputPledges(outpoints)
-			.catch(() => undefined);
+		try {
+			void this.fundingProvider
+				.releaseInputPledges(outpoints)
+				.catch(() => undefined);
+		} catch {
+			// A provider can throw before returning its promise. Cleanup is
+			// best effort and must not block the channel operation it follows.
+		}
 	}
 
 	/**
@@ -8026,7 +8031,7 @@ export class ChannelManager extends EventEmitter {
 					// aborts (which settle before the echo), peer aborts,
 					// disconnected aborts that never pass through NORMAL, and
 					// reestablish unwinds, exactly once per attempt.
-					this.emit('splice:aborted', action.channelId, action.reason);
+					this.emitContained('splice:aborted', action.channelId, action.reason);
 					break;
 			}
 			if (progress) progress.completedIndex = index;

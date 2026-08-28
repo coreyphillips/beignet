@@ -17,6 +17,7 @@ import {
 } from '../../src/lightning/channel/types';
 import { MessageType } from '../../src/lightning/message/types';
 import { encodeTxAbortMessage } from '../../src/lightning/message/interactive-tx';
+import { encodeStfuMessage } from '../../src/lightning/message/stfu';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { ILightningError } from '../../src/lightning/node/types';
@@ -270,6 +271,10 @@ describe('LightningNode.spliceInAndWait (issue #572)', function () {
 		manager.channels.set(state.channelId!.toString('hex'), channel);
 		manager.channelPeers.set(state.channelId!.toString('hex'), peer);
 		const channelId = state.channelId!;
+		const outbound: MessageType[] = [];
+		manager.on('message:outbound', (_peer: string, type: MessageType): void => {
+			outbound.push(type);
+		});
 
 		channel.handleStfuMessage({ channelId, initiator: true });
 		channel.handleSplice({
@@ -287,10 +292,19 @@ describe('LightningNode.spliceInAndWait (issue #572)', function () {
 		);
 		stubSpliceIn(node, { ok: true });
 		const wait = node.spliceInAndWait(channelId, 50_000n);
+		// A public observer failure must not escape through the manager or
+		// prevent the following tx_abort from reaching transport.
+		node.on('splice:aborted', (): void => {
+			throw new Error('observer failed');
+		});
 		const result = node
 			.getChannelManager()
 			.abortSplice(channelId, 'operator changed their mind');
 		expect(result.ok).to.equal(true);
+		expect(
+			outbound.filter((type) => type === MessageType.TX_ABORT),
+			'the observer cannot suppress tx_abort'
+		).to.have.length(1);
 
 		let error = '';
 		try {
@@ -355,6 +369,17 @@ describe('LightningNode.spliceInAndWait (issue #572)', function () {
 		const second = node.getChannelManager().abortSplice(channelId, 'again');
 		expect(second.ok, 'repeat cancel stays a no-op success').to.equal(true);
 		expect(aborted, 'exactly one event').to.deep.equal(['first']);
+
+		// Completing the peer side of quiescence performs the deferred wire
+		// unwind. It is still the same cancelled attempt, so it must not emit
+		// another terminal event.
+		manager.handleMessage(
+			peer,
+			MessageType.STFU,
+			encodeStfuMessage({ channelId, initiator: false })
+		);
+		expect(aborted, 'deferred unwind stays silent').to.deep.equal(['first']);
+		expect(channel.getState()).to.equal(ChannelState.NORMAL);
 		node.destroy();
 	});
 

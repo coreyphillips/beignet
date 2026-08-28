@@ -9347,10 +9347,12 @@ export class Channel {
 					)
 				);
 				if (!actions.some((a) => a.type === ChannelActionType.ERROR)) {
+					// The first cancel already emitted SPLICE_ABORTED. This call
+					// only completes the deferred wire and persistence unwind.
 					actions.push(
 						...this.initiateSpliceAbort(
 							'splice cancelled while awaiting quiescence'
-						)
+						).filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
 					);
 				}
 			}

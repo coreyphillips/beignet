@@ -563,6 +563,50 @@ describe('autoFundDualFundedOpen embedder-contribution guard (issue #572)', () =
 		]);
 	});
 
+	it('a synchronous stale-pledge release failure cannot block the registered contribution', async () => {
+		let resolveSelection:
+			| ((v: { inputs: ISpliceWalletInput[]; changeScript: Buffer }) => void)
+			| null = null;
+		const { mgr, sent, errors } = makeManager({
+			selectDualFundingInputs: () =>
+				new Promise((resolve) => {
+					resolveSelection = resolve;
+				}),
+			releaseInputPledges: () => {
+				throw new Error('synchronous release failure');
+			}
+		});
+		const registered = makeInput(200_000);
+		const channel = mgr.createDualFundedChannel(PEER, makeDualFundingParams());
+		mgr.handleMessage(
+			PEER,
+			MessageType.ACCEPT_CHANNEL2,
+			encodeAcceptChannel2Message(
+				makeAcceptChannel2Msg(channel.getTemporaryChannelId())
+			)
+		);
+		channel.setDualFundingContribution(
+			[registered],
+			changeScript(),
+			100_000n,
+			1000
+		);
+		resolveSelection!({
+			inputs: [makeInput(120_000)],
+			changeScript: changeScript()
+		});
+		await settlePromises();
+
+		const prevTxs = sentPrevTxs(sent);
+		expect(prevTxs, 'registered contribution still drove').to.have.length(1);
+		expect(prevTxs[0].equals(registered.prevTx)).to.equal(true);
+		expect(
+			errors.filter((e) => /dispatch failed/.test(e)),
+			'cleanup failure stayed contained'
+		).to.deep.equal([]);
+		expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+	});
+
 	it('an empty directed list is a funding failure, never unrestricted selection', async () => {
 		// A direct manager caller can hand IDualFundingParams.fundingUtxos an
 		// empty utxos array, bypassing the node-level validation; combined
