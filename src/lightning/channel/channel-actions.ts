@@ -31,6 +31,7 @@ export enum ChannelActionType {
 	/** Persist channel state before sending messages (Fix 2.2) */
 	PERSIST_STATE = 'PERSIST_STATE',
 	SPLICE_COMPLETE = 'SPLICE_COMPLETE',
+	SPLICE_ABORTED = 'SPLICE_ABORTED',
 	TX_SIGNATURES_NEEDED = 'TX_SIGNATURES_NEEDED'
 }
 
@@ -225,6 +226,23 @@ export interface IPersistStateAction {
  *  a NEW funding outpoint and must be re-announced with its new SCID. */
 export interface ISpliceCompleteAction {
 	type: ChannelActionType.SPLICE_COMPLETE;
+}
+
+/**
+ * A splice attempt was NEWLY aborted, in any direction and from any state
+ * (issue #581): the operator's initiateSpliceAbort, the peer's tx_abort, a
+ * reestablish unwind, or the cancellation of a splice still parked behind
+ * quiescence. Appended exactly once per attempt by the channel arm that
+ * makes the cancel decision (repeated cancels of an already-cancelled
+ * pending splice stay silent), so the manager can emit its splice:aborted
+ * event from ONE source of truth instead of inferring the abort from state
+ * transitions, which missed local aborts settling before the echo and
+ * disconnected aborts that never pass through NORMAL.
+ */
+export interface ISpliceAbortedAction {
+	type: ChannelActionType.SPLICE_ABORTED;
+	channelId: Buffer;
+	reason: string;
 }
 
 /**
@@ -481,4 +499,5 @@ export type ChannelAction =
 	| IProposeClosingFeeAction
 	| IPersistStateAction
 	| ISpliceCompleteAction
+	| ISpliceAbortedAction
 	| ITxSignaturesNeededAction;

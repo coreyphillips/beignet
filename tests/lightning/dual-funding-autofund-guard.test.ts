@@ -500,20 +500,24 @@ describe('autoFundDualFundedOpen embedder-contribution guard (issue #572)', () =
 		]);
 	});
 
-	it('a malformed stale selection cannot block the registered contribution', async () => {
+	it('a malformed stale selection cannot block the registered contribution, and the parseable coins beside it still release', async () => {
 		// The overlap computation parses every selected prevTx; a broken
-		// third-party provider result must degrade to best-effort pledge
-		// cleanup (the TTL covers what cannot be named), never block driving
-		// the perfectly valid registered contribution (issue #572 review).
+		// third-party provider result must degrade to PER-INPUT best-effort
+		// cleanup (issue #581 review): the malformed coin's pledge is left to
+		// its TTL, the parseable coin beside it releases NOW, and the
+		// perfectly valid registered contribution always drives.
 		let resolveSelection:
 			| ((v: { inputs: ISpliceWalletInput[]; changeScript: Buffer }) => void)
 			| null = null;
+		const released: Array<{ txid: string; vout: number }> = [];
 		const { mgr, sent, errors } = makeManager({
 			selectDualFundingInputs: () =>
 				new Promise((resolve) => {
 					resolveSelection = resolve;
 				}),
-			releaseInputPledges: async () => undefined
+			releaseInputPledges: async (outpoints) => {
+				released.push(...outpoints);
+			}
 		});
 		const registered = makeInput(200_000);
 		const channel = mgr.createDualFundedChannel(PEER, makeDualFundingParams());
@@ -534,8 +538,9 @@ describe('autoFundDualFundedOpen embedder-contribution guard (issue #572)', () =
 			...makeInput(150_000),
 			prevTx: Buffer.from('not a transaction', 'ascii')
 		};
+		const parseableStale = makeInput(120_000);
 		resolveSelection!({
-			inputs: [malformed],
+			inputs: [malformed, parseableStale],
 			changeScript: changeScript()
 		});
 		await settlePromises();
@@ -548,6 +553,14 @@ describe('autoFundDualFundedOpen embedder-contribution guard (issue #572)', () =
 			'no dispatch failure'
 		).to.deep.equal([]);
 		expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+		// Per-input isolation: the parseable stale coin released immediately;
+		// only the unnameable malformed one is left to its TTL.
+		expect(released).to.deep.equal([
+			{
+				txid: bitcoin.Transaction.fromBuffer(parseableStale.prevTx).getId(),
+				vout: 0
+			}
+		]);
 	});
 
 	it('an empty directed list is a funding failure, never unrestricted selection', async () => {

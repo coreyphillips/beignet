@@ -5206,8 +5206,11 @@ describe('Splice', function () {
 
 					const actions = opener.initiateSpliceAbort('operator requested');
 					// splice_init never left: the peer has no splice to forget and
-					// nothing is on disk.
-					expect(actions).to.be.empty;
+					// nothing is on disk. Only the informational newly-aborted
+					// signal rides out (issue #581).
+					expect(
+						actions.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
 					expect(opener.getState()).to.equal(ChannelState.NORMAL);
 				});
 
@@ -5511,7 +5514,12 @@ describe('Splice', function () {
 				it('unwinds the completed handshake with splice_init + tx_abort', function () {
 					const { opener } = makeNormalChannel();
 					opener.initiateSplice(100_000n, 253); // stfu out, quiescence pending
-					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+					expect(
+						opener
+							.initiateSpliceAbort('operator requested')
+							// Issue #581: only the informational newly-aborted signal.
+							.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
 
 					// The peer's stfu completes a handshake we cannot recall: the
 					// unwind must open the announced conversation and abort it at
@@ -5558,8 +5566,14 @@ describe('Splice', function () {
 						pair.opener.initiateSplice(100_000n, 253)
 					);
 					// Cancelled while our stfu is still in flight.
-					expect(pair.opener.initiateSpliceAbort('operator requested')).to.be
-						.empty;
+					expect(
+						pair.opener
+							.initiateSpliceAbort('operator requested')
+							// The informational newly-aborted signal (issue #581) is the
+							// one action a first cancel carries; the wire and disk stay
+							// silent.
+							.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
 					pair.pump();
 
 					for (const ch of [pair.opener, pair.acceptor]) {
@@ -5600,7 +5614,12 @@ describe('Splice', function () {
 				it('a fresh splice before the handshake completes supersedes the unwind', function () {
 					const { opener } = makeNormalChannel();
 					opener.initiateSplice(100_000n, 253);
-					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+					expect(
+						opener
+							.initiateSpliceAbort('operator requested')
+							// Issue #581: only the informational newly-aborted signal.
+							.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
 					// Re-requested before the peer answered our stfu: nothing beyond
 					// that stfu has left, so the new request simply replaces the
 					// cancelled one.
@@ -5623,8 +5642,18 @@ describe('Splice', function () {
 				it('repeat cancels stay silent no-op successes', function () {
 					const { opener } = makeNormalChannel();
 					opener.initiateSplice(100_000n, 253);
-					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
-					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+					expect(
+						opener
+							.initiateSpliceAbort('operator requested')
+							// Issue #581: only the informational newly-aborted signal.
+							.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
+					expect(
+						opener
+							.initiateSpliceAbort('operator requested')
+							// Issue #581: only the informational newly-aborted signal.
+							.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
 
 					// Still exactly one unwind when the handshake completes.
 					const actions = opener.handleStfuMessage({
@@ -5650,8 +5679,14 @@ describe('Splice', function () {
 						pair.opener.initiateSplice(100_000n, 253)
 					);
 					pair.pump();
-					expect(pair.opener.initiateSpliceAbort('operator requested')).to.be
-						.empty;
+					expect(
+						pair.opener
+							.initiateSpliceAbort('operator requested')
+							// The informational newly-aborted signal (issue #581) is the
+							// one action a first cancel carries; the wire and disk stay
+							// silent.
+							.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
 
 					disconnect(pair);
 					reconnect(pair);
@@ -5687,7 +5722,12 @@ describe('Splice', function () {
 					const stfuActions = opener.initiateQuiescence();
 					expect(findSendAction(stfuActions, MessageType.STFU)).to.exist;
 					expect(opener.initiateSplice(100_000n, 253)).to.be.empty;
-					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+					expect(
+						opener
+							.initiateSpliceAbort('operator requested')
+							// Issue #581: only the informational newly-aborted signal.
+							.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
 
 					const actions = opener.handleStfuMessage({
 						channelId: opener.getChannelId()!,
@@ -5709,9 +5749,20 @@ describe('Splice', function () {
 					// inherits that ownership, so cancelling the replacement must
 					// still unwind or the channel would wedge (issue #370).
 					opener.initiateSplice(100_000n, 253); // stfu out, splice-owned
-					expect(opener.initiateSpliceAbort('operator requested')).to.be.empty;
+					expect(
+						opener
+							.initiateSpliceAbort('operator requested')
+							// Issue #581: only the informational newly-aborted signal.
+							.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
 					expect(opener.initiateSplice(200_000n, 253)).to.be.empty;
-					expect(opener.initiateSpliceAbort('changed my mind')).to.be.empty;
+					// The replacement is a fresh attempt: its own first cancel
+					// carries the newly-aborted signal again (issue #581).
+					expect(
+						opener
+							.initiateSpliceAbort('changed my mind')
+							.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
 
 					const actions = opener.handleStfuMessage({
 						channelId: opener.getChannelId()!,
@@ -5766,8 +5817,14 @@ describe('Splice', function () {
 				it('a cancelled parked splice on the losing side drops silently', function () {
 					const { acceptor } = makeNormalChannel();
 					acceptor.initiateSplice(100_000n, 253);
-					expect(acceptor.initiateSpliceAbort('operator requested')).to.be
-						.empty;
+					expect(
+						acceptor
+							.initiateSpliceAbort('operator requested')
+							// The informational newly-aborted signal (issue #581) is the
+							// one action a first cancel carries; the wire and disk stay
+							// silent.
+							.filter((a) => a.type !== ChannelActionType.SPLICE_ABORTED)
+					).to.be.empty;
 					const actions = acceptor.handleStfuMessage({
 						channelId: acceptor.getChannelId()!,
 						initiator: true
