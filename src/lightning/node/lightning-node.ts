@@ -154,10 +154,19 @@ import {
 } from '../message/peer-storage';
 import {
 	BEIGNET_CUSTOM_MESSAGE_TYPE,
+	BeignetCustomSubtype,
 	ICustomMessage,
 	encodeCustomMessage,
 	decodeCustomMessage
 } from '../message/custom';
+import {
+	IHeldJitPart,
+	IJitReceiveConfig,
+	IPersistedHeldPart,
+	JitReceiveManager,
+	decodeJitAuthorization,
+	encodeJitAck
+} from '../liquidity/jit-receive';
 import {
 	INodeConfig,
 	IResourceConfig,
@@ -186,6 +195,7 @@ import {
 	ChannelFundingUnavailableCode,
 	InvalidSpliceError,
 	InvalidPeerConnectError,
+	FundingWaitTimeoutError,
 	IChannelHealth,
 	IStructuredLog,
 	IPaymentProof,
@@ -702,6 +712,8 @@ export class LightningNode extends EventEmitter {
 	private onionMessageManager: OnionMessageManager;
 	private offerManager: OfferManager;
 	private asyncPaymentManager: AsyncPaymentManager;
+	/** JIT channel receive engine (LSP role); set when config.jitReceive.enabled. */
+	private jitReceiveManager?: JitReceiveManager;
 	// LSP-side: forwards parked for offline receivers, keyed by payment hash hex.
 	private heldForwards: Map<
 		string,
@@ -1268,6 +1280,10 @@ export class LightningNode extends EventEmitter {
 		this.asyncPaymentManager.on('wake', (paymentHash?: Buffer) => {
 			this.emit('payment:async-wake', paymentHash);
 		});
+
+		if (config.jitReceive?.enabled) {
+			this.wireJitReceive(config.jitReceive);
+		}
 
 		// Resolved once and held: the PeerManager's disconnect-time redials and
 		// the startup recovery below must answer to the same switch, or turning
@@ -2285,6 +2301,12 @@ export class LightningNode extends EventEmitter {
 		// Prune stale gossip immediately on restore (BOLT 7: >2 weeks = stale)
 		this.pruneStaleGossipWithStorage();
 
+		// JIT receive: bring back the live intents (so invoices already out
+		// there stay payable) and queue every pre-restart held HTLC to be
+		// failed upstream. Runs after the channels and their onion shared
+		// secrets are back, since failing a held part needs both.
+		this.jitReceiveManager?.restore();
+
 		// Scan for expiring HTLCs immediately on restore (may have missed blocks while down)
 		if (this.currentBlockHeight > 0) {
 			this.scanExpiringOfferedHtlcs(this.currentBlockHeight);
@@ -2356,6 +2378,17 @@ export class LightningNode extends EventEmitter {
 			// Parked against a hold invoice. settle/cancel drives it, not the
 			// forwarding machinery.
 			if (this.isHeldHtlc(channelId, htlc.id)) continue;
+			// Held by the JIT engine before the restart, and already owed a
+			// refund by the restored-hold queue. Dispatching it again would
+			// forward a payment the sweep is about to fail upstream.
+			if (
+				this.jitReceiveManager?.hasRestoredHold(
+					channelId.toString('hex'),
+					htlc.id
+				)
+			) {
+				continue;
+			}
 
 			this.handleIncomingHtlc(
 				channelId,
@@ -8236,8 +8269,11 @@ export class LightningNode extends EventEmitter {
 		return new Promise<Buffer>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
+				// Typed, because this open is still running: only a caller that
+				// can tell a timeout from a failure can avoid starting a second
+				// one beside it (issue #594).
 				reject(
-					new Error(
+					new FundingWaitTimeoutError(
 						`zero-conf channel to ${peerPubkey.slice(
 							0,
 							12
@@ -8332,6 +8368,7 @@ export class LightningNode extends EventEmitter {
 		// A shutdown is not permission either, and the barrier's retry timer
 		// must not keep the process alive.
 		this.recoveryBarrier?.stop();
+		this.jitReceiveManager?.destroy();
 		this.stopCleanupTimer();
 		if (this.mppCleanupTimer) {
 			clearInterval(this.mppCleanupTimer);
@@ -10512,8 +10549,10 @@ export class LightningNode extends EventEmitter {
 		const done = new Promise<void>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
+				// Typed for the same reason as the open above: the splice this
+				// stopped waiting on is still in flight.
 				reject(
-					new Error(
+					new FundingWaitTimeoutError(
 						`splice on ${cidHex.slice(0, 12)} not locked within ${timeoutMs}ms`
 					)
 				);
@@ -11861,9 +11900,27 @@ export class LightningNode extends EventEmitter {
 	// ─────────────── SCID Registration ───────────────
 
 	registerChannelScid(channelId: Buffer, scid: Buffer): void {
-		this.scidToChannelId.set(scid.toString('hex'), channelId);
+		const scidHex = scid.toString('hex');
+		// A live JIT intercept SCID keeps its meaning. Minting checks against
+		// every SCID a channel already answers to, but a peer chooses its own
+		// alias and could send one matching an intent it learned of; registering
+		// it would divert that client's incoming HTLCs onto the peer's channel.
+		// The mapping is consulted before the intercept, so this is the only
+		// side of the collision the mint cannot close.
+		if (
+			this.jitReceiveManager
+				?.listIntents()
+				.some((i) => i.interceptScidHex === scidHex)
+		) {
+			this.emitStructuredLog('channel', 'scid_collides_with_jit_intent', {
+				channelId: channelId.toString('hex'),
+				scid: scidHex
+			});
+			return;
+		}
+		this.scidToChannelId.set(scidHex, channelId);
 		this.safeStorage(
-			() => this.storage!.saveScidMapping(scid.toString('hex'), channelId),
+			() => this.storage!.saveScidMapping(scidHex, channelId),
 			'saveScidMapping'
 		);
 	}
@@ -13051,8 +13108,13 @@ export class LightningNode extends EventEmitter {
 			this.heldInvoiceHashes.add(paymentHash.toString('hex'));
 		}
 
-		// Build routing hints for all channels
-		const routingHints = this.getPrivateChannelRoutingHints();
+		// Build routing hints for all channels, plus any the caller supplied. A
+		// JIT-receive hint (issue #594) names the LSP and an intercept SCID for
+		// a channel that does not exist yet, so it can only come from outside.
+		const routingHints = [
+			...this.getPrivateChannelRoutingHints(),
+			...(options.extraRoutingHints ?? [])
+		];
 
 		// Warn if we have a NORMAL channel that could receive (has inbound) but
 		// produced no hint — payers may then be unable to find a route to us
@@ -15472,6 +15534,184 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	// ─────────────── JIT channel receive (LSP role, issue #594) ───────────────
+
+	/** The JIT receive engine, when this node runs the LSP role. */
+	getJitReceiveManager(): JitReceiveManager | undefined {
+		return this.jitReceiveManager;
+	}
+
+	private wireJitReceive(config: IJitReceiveConfig): void {
+		this.jitReceiveManager = new JitReceiveManager(
+			{
+				currentBlockHeight: () => this.currentBlockHeight,
+				// Mint-time collision check. resolveLocalChannelByScid's rule,
+				// widened to every channel (a closing one still owns its SCID)
+				// and to the registered forwarding map.
+				isScidInUse: (scidHex) => this.scidAddressesAChannel(scidHex),
+				openZeroConfChannelAndWait: (walletPubkeyHex, fundingSats, timeoutMs) =>
+					this.openZeroConfChannelAndWait(
+						walletPubkeyHex,
+						fundingSats,
+						timeoutMs
+					),
+				forwardOnto: (outChannelId, part) =>
+					this.forwardHtlcOnto(outChannelId, part),
+				failureCodes: {
+					temporaryChannelFailure: TEMPORARY_CHANNEL_FAILURE,
+					expiryTooSoon: EXPIRY_TOO_SOON
+				},
+				setJitClients: (pubkeyHexes) =>
+					this.channelManager.setJitClients(pubkeyHexes),
+				peerForChannel: (outChannelId): string | null =>
+					this.channelManager.getPeerForChannel(outChannelId) ?? null,
+				spliceInAndWait: (channelId, amountSats, timeoutMs) =>
+					this.spliceInAndWait(channelId, amountSats, timeoutMs),
+				storage: this.storage ?? undefined,
+				failRestoredHtlc: (part) => this.failRestoredHeldHtlc(part)
+			},
+			{
+				...config,
+				// A hold must be revoked no later than the node's own expiring-HTLC
+				// scan would fail the same leg, or that scan refunds upstream while
+				// the engine still believes it may forward.
+				holdExpiryMarginBlocks:
+					config.holdExpiryMarginBlocks ??
+					Math.max(HELD_HTLC_EXPIRY_MARGIN, this.htlcSafetyMargin)
+			}
+		);
+		for (const evt of [
+			'jit:intent',
+			'jit:intercepted',
+			'jit:funding',
+			'jit:forwarded',
+			'jit:failed',
+			'jit:restored-failed'
+		]) {
+			this.jitReceiveManager.on(evt, (data) => this.emit(evt, data));
+		}
+		// Ride the ISOLATED custom-message dispatch (issue #546) rather than
+		// handling the subtype inline before it: a malformed authorization must
+		// not cost the peer its connection. Our own handler is additionally
+		// self-contained so a throw here cannot skip the application's
+		// listeners, which run after ours.
+		this.on(
+			'custom-message',
+			(msg: { peerPubkey: string; subtype: number; payload: Buffer }) => {
+				try {
+					this.handleJitAuthorization(msg);
+				} catch (err) {
+					this.emitStructuredLog('peer', 'jit_authorization_failed', {
+						pubkey: msg.peerPubkey,
+						error: err instanceof Error ? err.message : String(err)
+					});
+				}
+			}
+		);
+	}
+
+	private handleJitAuthorization(msg: {
+		peerPubkey: string;
+		subtype: number;
+		payload: Buffer;
+	}): void {
+		const manager = this.jitReceiveManager;
+		if (!manager) return;
+		if (msg.subtype !== BeignetCustomSubtype.JIT_RECEIVE_AUTHORIZATION) return;
+		const auth = decodeJitAuthorization(msg.payload);
+		// Registration grants nothing beyond an outbound zero-conf open to this
+		// peer, derived from the intent itself (JitReceiveManager.setJitClients).
+		// The fork added the peer to the SYMMETRIC trusted set here, which also
+		// made us accept an inbound zero-conf channel from it.
+		const ack = manager.registerIntent(msg.peerPubkey, auth);
+		this.sendCustomMessage(
+			msg.peerPubkey,
+			BeignetCustomSubtype.JIT_RECEIVE_ACK,
+			encodeJitAck(ack)
+		);
+		this.emitStructuredLog('peer', 'jit_intent', {
+			pubkey: msg.peerPubkey,
+			accepted: ack.accepted,
+			scid: ack.interceptScid.toString('hex')
+		});
+	}
+
+	/** Does any channel of ours answer to this SCID (real, alias, or mapping)? */
+	private scidAddressesAChannel(scidHex: string): boolean {
+		if (this.scidToChannelId.has(scidHex)) return true;
+		for (const channel of this.channelManager.listChannels()) {
+			const st = channel.getFullState();
+			for (const scid of [
+				st.shortChannelId,
+				st.scidAlias,
+				st.remoteScidAlias
+			]) {
+				if (scid && scid.toString('hex') === scidHex) return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Fail upstream an incoming HTLC the JIT engine was holding BEFORE a
+	 * restart. The channel state (the committed HTLC included) and its onion
+	 * shared secret are restored from storage, so once the channel is back to
+	 * NORMAL the failure is delivered like any other. Returns false while the
+	 * channel is not ready yet; the block tick retries.
+	 */
+	private failRestoredHeldHtlc(part: IPersistedHeldPart): boolean {
+		const channelId = Buffer.from(part.inChannelIdHex, 'hex');
+		const inHtlcId = BigInt(part.inHtlcId);
+		const channel = this.channelManager.getChannel(channelId);
+		// Channel gone entirely (closed while we were down): nothing to fail.
+		if (!channel) return true;
+		if (channel.getState() !== ChannelState.NORMAL) return false;
+		if (channel.isQuiescing()) return false;
+		// Already resolved (the peer failed it during reestablish, say).
+		const htlc = channel.getFullState().htlcs.get(`received-${inHtlcId}`);
+		if (!htlc) return true;
+		// An outgoing leg pays for this inbound one: whatever put it there owns
+		// the resolution now, and refunding upstream would be the loss this
+		// queue exists to prevent. Drop the row instead of failing.
+		if (this.findOutgoingLeg(channelId, inHtlcId)) return true;
+
+		// A blinded leg owes update_fail_malformed_htlc / invalid_onion_blinding,
+		// not a plain failure that would leak the cause; blindedRoleFor
+		// reconstructs the role from the durable HTLC entry after a restart.
+		const blindedRole = this.blindedRoleFor(channelId, inHtlcId);
+		if (blindedRole) {
+			if (!this.failBlindedIncomingHtlc(channelId, inHtlcId, blindedRole)) {
+				return false;
+			}
+			this.emitStructuredLog('htlc', 'jit_restored_failed_upstream', {
+				channelId: part.inChannelIdHex,
+				htlcId: part.inHtlcId,
+				blinded: true
+			});
+			return true;
+		}
+		const secretKey = `${part.inChannelIdHex}:${inHtlcId}`;
+		const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
+		const reason = sharedSecret
+			? createFailureMessage(
+					sharedSecret,
+					TEMPORARY_CHANNEL_FAILURE,
+					this.updateFlaggedFailureData(TEMPORARY_CHANNEL_FAILURE)
+			  )
+			: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+		const result = this.channelManager.failHtlc(channelId, inHtlcId, reason);
+		// The shared secret goes only once the failure is actually on its way:
+		// this path RETRIES, and a retry that has lost the secret can only send
+		// a zeroed packet the payer cannot decrypt.
+		if (result.ok === false) return false;
+		this.cleanupHtlcSharedSecret(secretKey);
+		this.emitStructuredLog('htlc', 'jit_restored_failed_upstream', {
+			channelId: part.inChannelIdHex,
+			htlcId: part.inHtlcId
+		});
+		return true;
+	}
+
 	/**
 	 * Accumulate one part of a multi-part payment. Parts group by payment
 	 * hash; each part's authenticity was already enforced upstream in
@@ -15791,18 +16031,16 @@ export class LightningNode extends EventEmitter {
 		const failIncoming = (
 			failureCode: number,
 			fields?: { htlcMsat?: bigint; cltvExpiry?: number }
-		): void => {
+		): boolean => {
 			if (inBlindedRole) {
-				this.failBlindedIncomingHtlc(
+				return this.failBlindedIncomingHtlc(
 					inChannelId,
 					inHtlcId,
 					inBlindedRole,
 					sharedSecret
 				);
-				return;
 			}
-			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-			this.channelManager.failHtlc(
+			const result = this.channelManager.failHtlc(
 				inChannelId,
 				inHtlcId,
 				createFailureMessage(
@@ -15811,6 +16049,13 @@ export class LightningNode extends EventEmitter {
 					this.updateFlaggedFailureData(failureCode, fields)
 				)
 			);
+			// The shared secret goes only once the failure is actually on its
+			// way. A holder that keeps this closure for later (the JIT engine)
+			// retries a refused failure, and a retry that has lost the secret
+			// can only send a zeroed packet the payer cannot decrypt.
+			if (result.ok === false) return false;
+			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
+			return true;
 		};
 
 		// Forwarding opt-out: a node that does not want to be a routing hop
@@ -15855,6 +16100,31 @@ export class LightningNode extends EventEmitter {
 		const scidHex = outgoingScid.toString('hex');
 		const outChannelId = this.scidToChannelId.get(scidHex);
 		if (!outChannelId) {
+			// JIT receive (LSP role): an unknown SCID may be an intercept SCID we
+			// minted for a wallet peer, so hold the HTLC and fund a channel to it
+			// rather than failing. Before the outgoing-policy, fee and CLTV checks
+			// below, which are all about a channel that does not exist yet; the
+			// engine applies its own CLTV cushion and its agreed opening fee.
+			if (
+				this.jitReceiveManager?.tryInterceptUnknownScid(scidHex, {
+					inChannelId,
+					inHtlcId,
+					paymentHash,
+					forwardAmountMsat: forwardAmount,
+					forwardCltv,
+					incomingCltvExpiry,
+					nextPacket,
+					nextBlindingPoint,
+					failIncoming
+				})
+			) {
+				this.emitStructuredLog('htlc', 'jit_intercepted', {
+					scid: scidHex,
+					paymentHash: paymentHash.toString('hex'),
+					amountMsat: Number(forwardAmount)
+				});
+				return;
+			}
 			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
 		}
@@ -15909,59 +16179,17 @@ export class LightningNode extends EventEmitter {
 		// complete the whole fulfillment chain during addHtlc, so we track the
 		// outgoing→incoming link BEFORE forwarding (same timing as payment storage).
 		const performForward = (): void => {
-			const nextOnionBuf = encodeOnionPacket(nextPacket);
-			const outChannel = this.channelManager.getChannel(outChannelId);
-			const outHtlcId = outChannel
-				? outChannel.getFullState().localHtlcCounter
-				: 0n;
-			const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
-			this.forwardedHtlcs.set(outKey, { inChannelId, inHtlcId });
-
-			// The linkage and the outgoing add are ONE safety transition
-			// (docs/RECOVERY-PROTOCOL.md 5.1): a crash between them would leave
-			// an HTLC in flight downstream with no record of the inbound leg it
-			// pays for, so the downstream preimage could never be applied
-			// upstream and the forwarded value would be lost.
-			let result: ChannelResult | null = null;
-			this.withStagedMutations(
-				[{ type: 'forwarded_htlc', outKey, inChannelId, inHtlcId }],
-				() => {
-					// For a blinded forward, hand the next hop its blinding point and
-					// use the payment_relay-derived amount/CLTV.
-					result = this.channelManager.addHtlc(
-						outChannelId,
-						forwardAmount,
-						paymentHash,
-						forwardCltv,
-						nextOnionBuf,
-						nextBlindingPoint
-					);
-				}
-			);
-
-			if (!result || !(result as ChannelResult).ok) {
-				// Forward failed — fail the incoming HTLC back. Drop the persisted
-				// row too, not just the in-memory one: the outgoing id was read off
-				// localHtlcCounter before the add, and a refused add does not consume
-				// it, so a surviving row maps an id a later unrelated HTLC will take
-				// onto this inbound leg and would settle it against the wrong payment.
-				this.forwardedHtlcs.delete(outKey);
-				this.withStagedMutations(
-					[{ type: 'delete_forwarded_htlc', outKey }],
-					() => {
-						failIncoming(TEMPORARY_CHANNEL_FAILURE);
-					}
-				);
-				return;
-			}
-
-			this.emit(
-				'htlc:forward',
+			this.forwardHtlcOnto(outChannelId, {
 				inChannelId,
-				outChannelId,
-				forwardAmount,
-				paymentHash
-			);
+				inHtlcId,
+				paymentHash,
+				forwardAmountMsat: forwardAmount,
+				forwardCltv,
+				incomingCltvExpiry,
+				nextPacket,
+				nextBlindingPoint,
+				failIncoming
+			});
 		};
 
 		// Async payments (LSP role): the recipient's blinded path marked this hop
@@ -15995,6 +16223,100 @@ export class LightningNode extends EventEmitter {
 		}
 
 		performForward();
+	}
+
+	/**
+	 * Place one forward onto an outgoing channel. Shared by the normal
+	 * forwarding path, async-payment releases, and JIT releases, where the
+	 * outgoing channel did not exist when the HTLC arrived.
+	 *
+	 * The linkage write and the outgoing add are ONE safety transition
+	 * (docs/RECOVERY-PROTOCOL.md 5.1) and stay that way here: a crash between
+	 * them would leave an HTLC in flight downstream with no record of the
+	 * inbound leg it pays for, so the downstream preimage could never be
+	 * applied upstream and the forwarded value would be lost. A caller that
+	 * retries a refused forward is therefore re-entering this method, not
+	 * patching up half a transition from outside it.
+	 */
+	private forwardHtlcOnto(outChannelId: Buffer, part: IHeldJitPart): void {
+		const nextOnionBuf = encodeOnionPacket(part.nextPacket);
+		const outChannel = this.channelManager.getChannel(outChannelId);
+		const outHtlcId = outChannel
+			? outChannel.getFullState().localHtlcCounter
+			: 0n;
+		const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
+		this.forwardedHtlcs.set(outKey, {
+			inChannelId: part.inChannelId,
+			inHtlcId: part.inHtlcId
+		});
+
+		let result: ChannelResult | null = null;
+		this.withStagedMutations(
+			[
+				{
+					type: 'forwarded_htlc',
+					outKey,
+					inChannelId: part.inChannelId,
+					inHtlcId: part.inHtlcId
+				}
+			],
+			() => {
+				// For a blinded forward, hand the next hop its blinding point and
+				// use the payment_relay-derived amount/CLTV.
+				result = this.channelManager.addHtlc(
+					outChannelId,
+					part.forwardAmountMsat,
+					part.paymentHash,
+					part.forwardCltv,
+					nextOnionBuf,
+					part.nextBlindingPoint
+				);
+			}
+		);
+
+		if (!result || !(result as ChannelResult).ok) {
+			// Forward failed — fail the incoming HTLC back. Drop the persisted
+			// row too, not just the in-memory one: the outgoing id was read off
+			// localHtlcCounter before the add, and a refused add does not consume
+			// it, so a surviving row maps an id a later unrelated HTLC will take
+			// onto this inbound leg and would settle it against the wrong payment.
+			this.forwardedHtlcs.delete(outKey);
+			this.withStagedMutations(
+				[{ type: 'delete_forwarded_htlc', outKey }],
+				() => {
+					// JIT receive: for a channel whose peer is a JIT client this
+					// refusal is a liquidity shortfall, not a dead end. Hold the
+					// part, splice our own funds in, and retry the forward once.
+					// The hook sits INSIDE the staged transition, after the
+					// linkage rollback, because a held-for-splice part is a
+					// forward whose linkage was deliberately rolled back and is
+					// re-registered when the retry re-enters this method.
+					if (this.jitReceiveManager?.tryHoldForSplice(outChannelId, part)) {
+						this.emitStructuredLog('htlc', 'jit_held_for_splice', {
+							channelId: outChannelId.toString('hex'),
+							paymentHash: part.paymentHash.toString('hex'),
+							amountMsat: Number(part.forwardAmountMsat)
+						});
+						return;
+					}
+					// A refund the inbound channel cannot carry right now (it is
+					// reestablishing) must not evaporate: the engine owes it and
+					// retries it on every block.
+					if (!part.failIncoming(TEMPORARY_CHANNEL_FAILURE)) {
+						this.jitReceiveManager?.owedUpstreamFailure(part);
+					}
+				}
+			);
+			return;
+		}
+
+		this.emit(
+			'htlc:forward',
+			part.inChannelId,
+			outChannelId,
+			part.forwardAmountMsat,
+			part.paymentHash
+		);
 	}
 
 	/**
@@ -16590,13 +16912,16 @@ export class LightningNode extends EventEmitter {
 	 * portion. A hop whose blinding point arrived in update_add_htlc ('mid')
 	 * MUST use update_fail_malformed_htlc; the introduction node ('intro')
 	 * returns a normally encrypted failure.
+	 *
+	 * Returns whether the channel could carry the failure, so a caller holding
+	 * the HTLC for later can retry one it could not.
 	 */
 	private failBlindedIncomingHtlc(
 		inChannelId: Buffer,
 		inHtlcId: bigint,
 		role: 'intro' | 'mid',
 		sharedSecret?: Buffer
-	): void {
+	): boolean {
 		const inHtlcSecretKey = `${inChannelId.toString('hex')}:${inHtlcId}`;
 		const htlcEntry = this.channelManager
 			.getChannel(inChannelId)
@@ -16610,25 +16935,28 @@ export class LightningNode extends EventEmitter {
 			: Buffer.alloc(32);
 		const secret =
 			sharedSecret ?? this.receivedHtlcSharedSecrets.get(inHtlcSecretKey);
+		const result =
+			role === 'mid'
+				? this.channelManager.failMalformedHtlc(
+						inChannelId,
+						inHtlcId,
+						sha256OfOnion,
+						INVALID_ONION_BLINDING
+				  )
+				: this.channelManager.failHtlc(
+						inChannelId,
+						inHtlcId,
+						createFailureMessage(
+							secret ?? Buffer.alloc(32),
+							INVALID_ONION_BLINDING,
+							sha256OfOnion
+						)
+				  );
+		// The secret outlives a refused failure on purpose: this is retried,
+		// and a retry without it can only send an undecryptable packet.
+		if (result.ok === false) return false;
 		this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-		if (role === 'mid') {
-			this.channelManager.failMalformedHtlc(
-				inChannelId,
-				inHtlcId,
-				sha256OfOnion,
-				INVALID_ONION_BLINDING
-			);
-			return;
-		}
-		this.channelManager.failHtlc(
-			inChannelId,
-			inHtlcId,
-			createFailureMessage(
-				secret ?? Buffer.alloc(32),
-				INVALID_ONION_BLINDING,
-				sha256OfOnion
-			)
-		);
+		return true;
 	}
 
 	/**
@@ -17537,6 +17865,13 @@ export class LightningNode extends EventEmitter {
 			blockHeight,
 			this.resolveForceCloseFeeRatePerVbyte()
 		);
+		// JIT holds are revoked BEFORE the generic expiring-HTLC scan below: a
+		// held part has no outgoing leg yet, so that scan would refund it
+		// upstream without telling the engine, and a funding completing
+		// afterwards would still forward it. This also sweeps expired intents
+		// and retries failing the parts held across a restart.
+		this.jitReceiveManager?.scanExpiringHolds();
+		this.jitReceiveManager?.sweep();
 		this.scanExpiringHtlcs(blockHeight);
 		// Invariant keeper for HTLC dispatches parked during quiescence: the
 		// terminal quiescence exits (disconnect, errored, force close) emit no
@@ -18440,6 +18775,7 @@ export class LightningNode extends EventEmitter {
 			forwardingFeeBaseMsat?: number;
 			forwardingFeePropMillionths?: number;
 			forwardingCltvDelta?: number;
+			jitReceive?: INodeConfig['jitReceive'];
 			leaseRates?: import('../gossip/types').ILeaseRates;
 			eagerGossipVerify?: boolean;
 			sweepDestinationScript?: Buffer;
@@ -18500,6 +18836,7 @@ export class LightningNode extends EventEmitter {
 			forwardingFeeBaseMsat: options?.forwardingFeeBaseMsat,
 			forwardingFeePropMillionths: options?.forwardingFeePropMillionths,
 			forwardingCltvDelta: options?.forwardingCltvDelta,
+			jitReceive: options?.jitReceive,
 			leaseRates: options?.leaseRates,
 			eagerGossipVerify: options?.eagerGossipVerify,
 			localFeatures: options?.localFeatures,

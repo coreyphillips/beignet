@@ -6,7 +6,7 @@
  * channel/node info queries.
  */
 
-import { Network } from '../invoice/types';
+import { IRoutingHintHop, Network } from '../invoice/types';
 import { IBolt12Invoice } from '../offer/types';
 import { IChannelConfig, ChannelState } from '../channel/types';
 import { IChannelBasepoints } from '../keys/derivation';
@@ -433,6 +433,14 @@ export interface INodeConfig {
 	 * from peers so their signed copies become servable.
 	 */
 	eagerGossipVerify?: boolean;
+	/**
+	 * JIT channel receive, LSP role (issue #594): hold HTLCs addressed to
+	 * intercept SCIDs this node minted for wallet peers, fund a zero-conf
+	 * channel to the client (or splice its existing one bigger), then forward.
+	 * Off unless `enabled` is set; the caps in IJitReceiveConfig are the only
+	 * ceiling on what this node will front with its own coins.
+	 */
+	jitReceive?: import('../liquidity/jit-receive').IJitReceiveConfig;
 	/** CLTV delta for forwarding (default 40) */
 	forwardingCltvDelta?: number;
 	/** Base fee in msat for forwarding (default 1000) */
@@ -737,6 +745,14 @@ export interface ICreateInvoiceOptions {
 	 */
 	includeCleartextHintsWithBlinded?: boolean;
 	/**
+	 * Routing hints the CALLER supplies, emitted alongside the ones built from
+	 * our own channels. The case this exists for is JIT receive (issue #594): a
+	 * wallet with no channel at all is payable through a hint naming its LSP
+	 * and the intercept SCID that LSP minted, which no channel of ours can
+	 * produce because the channel does not exist yet.
+	 */
+	extraRoutingHints?: IRoutingHintHop[][];
+	/**
 	 * Hold invoice: park matching HTLCs instead of settling immediately. The
 	 * payment is held until settleHeldHtlc() (reveals the preimage) or
 	 * cancelHeldHtlc() (fails it). Underpins async receive and escrow-style flows.
@@ -970,6 +986,37 @@ export interface ILightningBalance {
 	unsettledBalanceMsat: bigint;
 }
 
+/**
+ * Everything needed to place one forward onto an outgoing channel, carried as
+ * a record so the forward can happen LATER than the HTLC that asked for it:
+ * after an async-payment release, or onto a channel that did not exist when
+ * the HTLC arrived (JIT receive). `forwardAmountMsat` is deliberately mutable
+ * so an LSP can deduct an agreed opening fee before the add.
+ */
+export interface IForwardablePart {
+	inChannelId: Buffer;
+	inHtlcId: bigint;
+	paymentHash: Buffer;
+	forwardAmountMsat: bigint;
+	forwardCltv: number;
+	/** The INBOUND leg's expiry: the deadline every hold is bounded by. */
+	incomingCltvExpiry: number;
+	nextPacket: {
+		version: number;
+		ephemeralKey: Buffer;
+		routingInfo: Buffer;
+		hmac: Buffer;
+	};
+	nextBlindingPoint?: Buffer;
+	/**
+	 * Fail the inbound leg upstream, blinded-safe (see handleForwardHtlc).
+	 * Returns false when the channel could not carry the failure (it is
+	 * reestablishing, say), which a holder must treat as an obligation it
+	 * still owes rather than as a resolution.
+	 */
+	failIncoming: (failureCode: number) => boolean;
+}
+
 export interface ICreateInvoiceResult {
 	bolt11: string;
 	paymentHash: Buffer;
@@ -1108,6 +1155,20 @@ export class InvalidSpliceError extends InvalidRequestError {
 	constructor(message: string) {
 		super(message);
 		this.name = 'InvalidSpliceError';
+	}
+}
+
+/**
+ * An open or splice that did not FINISH within the wait's timeout. Distinct
+ * from every other funding failure because it says nothing about the
+ * operation: the wait only stopped listening, and the funding it started is
+ * still live. A caller that retries on this runs a second funding beside the
+ * first (issue #594).
+ */
+export class FundingWaitTimeoutError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'FundingWaitTimeoutError';
 	}
 }
 
