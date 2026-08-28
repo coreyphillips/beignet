@@ -72,6 +72,17 @@ function signFn(_fee: bigint): Buffer {
 }
 
 /**
+ * Shrink the opener's balance, moving the difference to the peer. The fee a
+ * closing tx actually pays is funding minus its outputs, so the two balances
+ * have to keep summing to the funding value for that fee to be the real one.
+ */
+function setOpenerBalance(opener: Channel, balanceMsat: bigint): void {
+	const state = opener.getFullState();
+	state.remoteBalanceMsat += state.localBalanceMsat - balanceMsat;
+	state.localBalanceMsat = balanceMsat;
+}
+
+/**
  * Create two channels in NEGOTIATING_CLOSING state.
  */
 function setupNegotiatingChannels(opts?: { withPendingHtlc?: boolean }): {
@@ -274,6 +285,38 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 				signFn
 			);
 			expect(hasAction(agreed, ChannelActionType.CHANNEL_CLOSED)).to.be.true;
+		});
+
+		it('refuses to propose a fee our output cannot pay (issue #579)', function () {
+			// A fully pushed channel leaves the opener at 0 sat. The fee comes out
+			// of our output, so the builder drops it and the tx pays NOTHING: the
+			// fee on the wire clears the relay floor while the tx it stands for
+			// pays zero, and the peer's echo would close us on it.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+			setOpenerBalance(opener, 0n);
+
+			const actions = opener.proposeClosingFee(crypto.randomBytes(64));
+
+			expect(findSendAction(actions, MessageType.CLOSING_SIGNED)).to.be.null;
+			expect(findErrorAction(actions)).to.include('minimum relay fee');
+			expect(opener.getFullState().lastProposedClosingFeeSat).to.be.null;
+			expect(opener.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+
+			// And the same fee arriving from the peer does not close us either.
+			const echoed = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 171n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+			expect(hasAction(echoed, ChannelActionType.CHANNEL_CLOSED)).to.be.false;
+			expect(opener.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
 		});
 
 		it('uses an injected live closing feerate over the commitment floor', function () {
@@ -608,8 +651,9 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 				channelId: opener.getChannelId()!,
 				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
 			});
-			// 400 sat balance minus the 354 sat dust reserve leaves a 46 sat cap.
-			opener.getFullState().localBalanceMsat = 400_000n;
+			// 100 sat: our output is dropped as dust at any fee, so the tx pays
+			// exactly 100 sat, under the 138 sat floor of the one-output close.
+			setOpenerBalance(opener, 100_000n);
 
 			const actions = opener.handleClosingSigned(
 				{
@@ -625,6 +669,45 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			expect(opener.getFullState().lastProposedClosingFeeSat).to.be.null;
 			// NEGOTIATING_CLOSING, so the unilateral exit stays available.
 			expect(opener.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+		});
+
+		it('counters with the whole opener balance when the dust reserve puts the floor out of reach (issue #579)', function () {
+			// 150 sat cannot pay the 169 sat two-output floor, but that close is
+			// not the one that gets built: our output is below dust either way,
+			// so the builder drops it and the tx pays our 150 sat on 138 vbytes.
+			// That relays, so refusing to counter would strand a close that works.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+			setOpenerBalance(opener, 150_000n);
+
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 150n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+
+			expect(findErrorAction(actions)).to.be.null;
+			const countered = decodeClosingSignedMessage(
+				findSendAction(actions, MessageType.CLOSING_SIGNED)!
+			);
+			expect(countered.feeSatoshis).to.equal(150n);
+
+			// The echo closes: the tx it agrees to is broadcastable.
+			const agreed = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 150n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+			expect(hasAction(agreed, ChannelActionType.CHANNEL_CLOSED)).to.be.true;
 		});
 	});
 
