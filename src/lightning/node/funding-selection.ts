@@ -61,6 +61,16 @@ export function selectDualFundingContribution(
 	topUp = false,
 	opts?: IUtxoSelectionOpts
 ): Promise<IDualFundingSelection> {
+	// An empty directed list is a caller error, not "no direction": passing
+	// it through would combine with the providers' unrestricted-selection
+	// fallback and fund with arbitrary coins while the caller believed the
+	// selection was constrained (issue #572 review). The throw lands in the
+	// auto-funding rejection arm, failing the open loudly.
+	if (opts?.utxos && opts.utxos.length === 0) {
+		throw new Error(
+			'fundingUtxos.utxos must not be empty (an empty directed list would select unrestricted coins)'
+		);
+	}
 	if (fp.selectDualFundingInputs) {
 		return fp.selectDualFundingInputs(
 			amountSats,
@@ -96,7 +106,13 @@ export function verifyDirectedSelection(
 	inputs: ISpliceWalletInput[],
 	directed: NonNullable<IUtxoSelectionOpts>
 ): string | null {
-	if (!directed.utxos?.length) return null;
+	if (!directed.utxos) return null;
+	// Defense in depth behind selectDualFundingContribution's throw: an
+	// empty directed list must read as a violation, never as compliance,
+	// or it silently authorizes whatever the fallback selection picked.
+	if (directed.utxos.length === 0) {
+		return 'fundingUtxos.utxos is empty (an empty directed list cannot authorize a selection)';
+	}
 	const selected = new Set<string>();
 	for (const input of inputs) {
 		try {

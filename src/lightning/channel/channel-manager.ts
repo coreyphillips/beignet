@@ -5537,10 +5537,26 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.initiateSpliceAbort(reason);
 		this.processActions(peerPubkey, channel, actions);
-		return {
-			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),
-			actions
-		};
+		const ok = !actions.some((a) => a.type === ChannelActionType.ERROR);
+		// A LOCAL abort restores the channel to NORMAL right here (or cancels
+		// a splice still parked behind quiescence without ever leaving
+		// NORMAL), so the tx_abort echo later reaches handleTxAbortMsg with
+		// the channel already NORMAL and its transition predicate stays
+		// silent: without this emit a caller waiting on the splice
+		// (spliceInAndWait) burned its full timeout after a successful local
+		// abort (issue #572 review). ok is the discriminator: the no-splice
+		// arm returns an ERROR action, so a successful abort always cancelled
+		// a real attempt. A flavor that defers the unwind to the echo leaves
+		// the channel non-NORMAL here and the echo site's transition
+		// predicate emits instead, so the two sites stay mutually exclusive.
+		if (ok && channel.getState() === ChannelState.NORMAL) {
+			this.emitContained(
+				'splice:aborted',
+				channelId,
+				reason ?? 'splice aborted (local abort)'
+			);
+		}
+		return { ok, actions };
 	}
 
 	// ─────────────── Dual Funding (v2) ───────────────
@@ -6344,9 +6360,19 @@ export class ChannelManager extends EventEmitter {
 					// tx depends on lets the next wallet spend orphan the
 					// channel (issue #572 review).
 					if (channel.hasDualFundingContribution()) {
-						this.releaseStaleSelectionPledges(
-							channel.unregisteredV2TopUpInputs(inputs)
-						);
+						// Best-effort cleanup, never a gate on driving: computing
+						// the overlap parses every prevTx, and a malformed one in
+						// a third-party provider's result would otherwise throw
+						// here and strand the perfectly valid registered
+						// contribution (issue #572 review). A pledge the parse
+						// cannot name is released by its TTL instead.
+						let stale: ISpliceWalletInput[] = [];
+						try {
+							stale = channel.unregisteredV2TopUpInputs(inputs);
+						} catch {
+							stale = [];
+						}
+						this.releaseStaleSelectionPledges(stale);
 						const driveActions = channel.beginDualFundingContribution();
 						this.processActions(peerPubkey, channel, driveActions);
 						return;

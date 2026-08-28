@@ -738,6 +738,14 @@ export class WalletFundingProvider implements IFundingProvider {
 		const selected: ISpliceUtxo[] = [];
 		let selectedSum = 0n;
 		let target = 0n;
+		// An empty directed list must not degrade into unrestricted greedy
+		// selection (issue #572 review): direct provider callers get the same
+		// refusal the shared selection entry enforces.
+		if (opts?.utxos && opts.utxos.length === 0) {
+			throw new Error(
+				`directed ${purpose} selection requires at least one named outpoint`
+			);
+		}
 		if (opts?.utxos?.length) {
 			// Caller-directed selection (issue #572): every named outpoint is
 			// contributed, and a named coin the wallet cannot spend fails the
