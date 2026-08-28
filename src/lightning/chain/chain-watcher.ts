@@ -177,6 +177,15 @@ interface IWatchedOutput {
 	 */
 	spendTxid?: string;
 	spendHeight?: number;
+	/**
+	 * This spend was SEEDED from persisted state, not observed by this
+	 * watcher, so it has not been verified against the chain yet (issue
+	 * #576). The first successful check reports it to the monitor even when
+	 * txid and height are unchanged: that report is the live evidence the
+	 * monitor's finality clock waits for after a restart. Cleared once
+	 * reported (or by the eviction branch, which reports on its own).
+	 */
+	spendUnverified?: boolean;
 }
 
 /**
@@ -347,6 +356,15 @@ interface IFailedOutputWatch {
 	txid: string;
 	outputIndex: number;
 	scriptPubkey: Buffer;
+	/**
+	 * The seed the failed registration carried, replayed on retry (issue
+	 * #576). Dropping it silently disarmed eviction detection for exactly the
+	 * outputs whose first subscription attempt failed: the retried watch
+	 * would hold no recorded spend, so a reorg that evicted our penalty or
+	 * HTLC claim could never be noticed.
+	 */
+	spendTxid?: string;
+	spendHeight?: number;
 }
 
 /** A failed broadcast queued for retry */
@@ -579,7 +597,13 @@ export class ChainWatcher extends EventEmitter {
 			const pendingOutputs = [...this.failedOutputWatches];
 			this.failedOutputWatches = [];
 			for (const w of pendingOutputs) {
-				this.watchOutput(w.txid, w.outputIndex, w.scriptPubkey).catch(() => {
+				this.watchOutput(
+					w.txid,
+					w.outputIndex,
+					w.scriptPubkey,
+					w.spendTxid,
+					w.spendHeight
+				).catch(() => {
 					/* re-queued inside watchOutput */
 				});
 			}
@@ -913,7 +937,11 @@ export class ChainWatcher extends EventEmitter {
 			outputIndex,
 			scriptHash,
 			spendTxid,
-			spendHeight
+			spendHeight,
+			// A seeded spend is recorded state, not something this watcher
+			// saw: the monitor's finality clock stays parked until the first
+			// live check confirms it (issue #576).
+			...(spendTxid !== undefined ? { spendUnverified: true } : {})
 		};
 		this.watchedOutputs.set(key, watched);
 
@@ -936,7 +964,13 @@ export class ChainWatcher extends EventEmitter {
 				this.isCurrentGeneration(generation) &&
 				this.watchedOutputs.get(key) === watched
 			) {
-				this.failedOutputWatches.push({ txid, outputIndex, scriptPubkey });
+				this.failedOutputWatches.push({
+					txid,
+					outputIndex,
+					scriptPubkey,
+					spendTxid,
+					spendHeight
+				});
 			}
 			return;
 		}
@@ -1174,7 +1208,9 @@ export class ChainWatcher extends EventEmitter {
 				this.watchOutput(
 					watch.txid,
 					watch.outputIndex,
-					watch.scriptPubkey
+					watch.scriptPubkey,
+					watch.spendTxid,
+					watch.spendHeight
 				).catch(() => {
 					// Still failing — already re-queued inside watchOutput
 				});
@@ -2049,10 +2085,20 @@ export class ChainWatcher extends EventEmitter {
 
 		if (spend) {
 			// Idempotent: the subscription re-fires on any scripthash change, so skip
-			// re-reporting a spend we already recorded.
-			if (watched.spendTxid !== spend.txid) {
+			// re-reporting a spend we already recorded. Two cases are NOT idempotent
+			// re-fires and must reach the monitor (issue #576): a spend seeded from
+			// persisted state, which nothing has verified against the chain this
+			// session and whose finality clock is parked until this report, and a
+			// recorded spend that has since been re-mined at a DIFFERENT height,
+			// whose depth must be recounted from where it actually sits.
+			if (
+				watched.spendTxid !== spend.txid ||
+				watched.spendUnverified === true ||
+				watched.spendHeight !== spend.height
+			) {
 				watched.spendTxid = spend.txid;
 				watched.spendHeight = spend.height;
+				delete watched.spendUnverified;
 				this.channelManager.handleOutputSpent(
 					watched.txid,
 					watched.outputIndex,
@@ -2078,6 +2124,7 @@ export class ChainWatcher extends EventEmitter {
 		if (watched.spendTxid !== undefined) {
 			watched.spendTxid = undefined;
 			watched.spendHeight = undefined;
+			delete watched.spendUnverified;
 			this.channelManager.handleOutputUnspent(
 				watched.txid,
 				watched.outputIndex

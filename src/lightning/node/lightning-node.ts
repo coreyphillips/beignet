@@ -731,6 +731,14 @@ export class LightningNode extends EventEmitter {
 	// broadcast (issue #357): retried each block until the adopted-funding
 	// commitment reaches the network.
 	private _pendingSpliceCloseRedrives: Set<string> = new Set();
+	/**
+	 * Per-output watches whose arming failed, keyed "txid:outputIndex" so a
+	 * repeated failure cannot grow the queue (issue #577).
+	 */
+	private _pendingOutputWatches: Map<
+		string,
+		{ channelIdHex: string; txid: string; outputIndex: number }
+	> = new Map();
 	private reestablishTimeoutBlocks: number;
 	private readonly autoReconnect: boolean;
 	private walCheckpointTimer: ReturnType<typeof setInterval> | null = null;
@@ -6901,6 +6909,8 @@ export class LightningNode extends EventEmitter {
 			// after a transient failure must get its per-block retry here, not
 			// only in handleNewBlock.
 			this.retrySpliceCloseRedrives();
+			// Same reasoning for un-armed output watches (issue #577).
+			this.retryPendingOutputWatches();
 			// And for the funding broadcast obligation (issue #412): the
 			// per-block rebroadcast, the pledge renewals that ride it, and
 			// the dead-entry retirement (which releases v1 pledges) must all
@@ -6943,6 +6953,21 @@ export class LightningNode extends EventEmitter {
 			'watch:output:requested',
 			(txid: string, outputIndex: number) => {
 				this.chainWatcher!.watchOutputByTxid(txid, outputIndex).catch((err) => {
+					// Reported AND queued (issue #577): the same commitment fetch
+					// that fails here after a reorg would otherwise leave this
+					// output permanently unwatched, with only a log line to show
+					// for it.
+					const channelIdHex = this._channelHexForTrackedOutput(
+						txid,
+						outputIndex
+					);
+					if (channelIdHex) {
+						this._pendingOutputWatches.set(`${txid}:${outputIndex}`, {
+							channelIdHex,
+							txid,
+							outputIndex
+						});
+					}
 					this.emit('node:error', {
 						code: 'WATCH_OUTPUT_FAILED',
 						message: `Failed to watch output ${txid}:${outputIndex}: ${
@@ -7398,6 +7423,9 @@ export class LightningNode extends EventEmitter {
 			// Only watch channels that have funding info and are not yet closed
 			if (!state.fundingTxid || state.fundingOutputIndex === undefined)
 				continue;
+			const channelIdHex = (
+				state.channelId ?? state.temporaryChannelId
+			).toString('hex');
 			// A cooperative close sets CLOSED at fee/sig agreement, BEFORE the
 			// mutual-close tx confirms. Until the close is irrevocably buried a peer
 			// could still broadcast a revoked commitment on the still-live funding
@@ -7415,23 +7443,18 @@ export class LightningNode extends EventEmitter {
 				if (monitor) {
 					for (const output of monitor.getTrackedOutputs()) {
 						if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) continue;
-						try {
-							const seedTxid =
-								output.status === OutputStatus.SPEND_CONFIRMED
-									? output.resolutionTxid
-									: undefined;
-							const seedHeight =
-								seedTxid !== undefined ? output.confirmationHeight : undefined;
-							await this.chainWatcher.watchOutputByTxid(
-								output.txid,
-								output.outputIndex,
-								seedTxid,
-								seedHeight
-							);
-						} catch {
-							// Electrum hiccup: the funding watch below still drives
-							// detection of any commitment spend on the funding output.
-						}
+						const seedTxid =
+							output.status === OutputStatus.SPEND_CONFIRMED
+								? output.resolutionTxid
+								: undefined;
+						// Queued on failure rather than swallowed (issue #577).
+						await this.armOutputWatch(
+							channelIdHex,
+							output.txid,
+							output.outputIndex,
+							seedTxid,
+							seedTxid !== undefined ? output.confirmationHeight : undefined
+						);
 					}
 				}
 				if (
@@ -7468,28 +7491,25 @@ export class LightningNode extends EventEmitter {
 				if (monitor) {
 					for (const output of monitor.getTrackedOutputs()) {
 						if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) continue;
-						try {
-							// Seed a previously recorded spend so a reorg that evicts our
-							// penalty / HTLC claim after restart is detected (checkOutputSpend
-							// only fires its eviction branch when spendTxid is set). Without
-							// this the monitor would promote SPEND_CONFIRMED to irrevocable off
-							// the stale height and hide a reorg-then-theft.
-							const seedTxid =
-								output.status === OutputStatus.SPEND_CONFIRMED
-									? output.resolutionTxid
-									: undefined;
-							const seedHeight =
-								seedTxid !== undefined ? output.confirmationHeight : undefined;
-							await this.chainWatcher.watchOutputByTxid(
-								output.txid,
-								output.outputIndex,
-								seedTxid,
-								seedHeight
-							);
-						} catch {
-							// Electrum hiccup — the funding watch below still drives
-							// detection of the commitment itself.
-						}
+						// Seed a previously recorded spend so a reorg that evicts our
+						// penalty / HTLC claim after restart is detected (checkOutputSpend
+						// only fires its eviction branch when spendTxid is set). Without
+						// this the monitor would promote SPEND_CONFIRMED to irrevocable off
+						// the stale height and hide a reorg-then-theft.
+						const seedTxid =
+							output.status === OutputStatus.SPEND_CONFIRMED
+								? output.resolutionTxid
+								: undefined;
+						// A failure here is queued, not swallowed (issue #577): the
+						// commitment fetch fails for as long as a reorg keeps it
+						// evicted, and nothing else would ever arm these watches.
+						await this.armOutputWatch(
+							channelIdHex,
+							output.txid,
+							output.outputIndex,
+							seedTxid,
+							seedTxid !== undefined ? output.confirmationHeight : undefined
+						);
 					}
 				}
 				// NO persisted monitor (force-closed in a session that ended before
@@ -9856,6 +9876,101 @@ export class LightningNode extends EventEmitter {
 	 * failed (issue #357): the channel is terminal, so no later transition
 	 * exists for the broadcast to ride.
 	 */
+	/**
+	 * Arm a per-output watch, queueing it for per-block retry if the backend
+	 * cannot serve it right now (issue #577).
+	 *
+	 * The failure this exists for is not a transient hiccup: a reorg that
+	 * evicts the commitment makes getTransaction(commitment txid) fail for as
+	 * long as the eviction lasts, and the swallowed catch left those outputs
+	 * with NO watch for the rest of the process's life, while the monitor's
+	 * per-output state kept advancing as though one were arming. Nothing else
+	 * re-arms them: restoreChainWatches runs once per start, and the watcher's
+	 * own retry queue only covers subscription failures, not this fetch.
+	 */
+	private async armOutputWatch(
+		channelIdHex: string,
+		txid: string,
+		outputIndex: number,
+		seedTxid?: string,
+		seedHeight?: number
+	): Promise<void> {
+		try {
+			await this.chainWatcher!.watchOutputByTxid(
+				txid,
+				outputIndex,
+				seedTxid,
+				seedHeight
+			);
+		} catch {
+			this._pendingOutputWatches.set(`${txid}:${outputIndex}`, {
+				channelIdHex,
+				txid,
+				outputIndex
+			});
+		}
+	}
+
+	/**
+	 * Per-block drain of output watches whose arming failed (issue #577). The
+	 * seed is re-read from the monitor each attempt rather than remembered, so
+	 * a spend recorded, evicted or resolved since the failure re-arms with
+	 * what is true NOW, and an output that has since resolved (or whose
+	 * channel is gone) simply drops out of the queue.
+	 */
+	/**
+	 * The channel whose monitor tracks this output, resolved by scan because
+	 * the watch:output:requested event carries only the outpoint. Called only
+	 * when arming failed (issue #577), so the scan is off the hot path.
+	 */
+	private _channelHexForTrackedOutput(
+		txid: string,
+		outputIndex: number
+	): string | null {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			const id = state.channelId ?? state.temporaryChannelId;
+			const monitor = this.channelManager.getMonitor(id);
+			if (!monitor) continue;
+			const tracked = monitor
+				.getTrackedOutputs()
+				.some((o) => o.txid === txid && o.outputIndex === outputIndex);
+			if (tracked) return id.toString('hex');
+		}
+		return null;
+	}
+
+	private retryPendingOutputWatches(): void {
+		if (this._pendingOutputWatches.size === 0 || !this.chainWatcher) return;
+		const pending = [...this._pendingOutputWatches.values()];
+		this._pendingOutputWatches.clear();
+		for (const entry of pending) {
+			const monitor = this.channelManager.getMonitor(
+				Buffer.from(entry.channelIdHex, 'hex')
+			);
+			if (!monitor || monitor.isFullyResolved()) continue;
+			const output = monitor
+				.getTrackedOutputs()
+				.find(
+					(o) => o.txid === entry.txid && o.outputIndex === entry.outputIndex
+				);
+			if (!output || output.status === OutputStatus.IRREVOCABLY_RESOLVED) {
+				continue;
+			}
+			const seedTxid =
+				output.status === OutputStatus.SPEND_CONFIRMED
+					? output.resolutionTxid
+					: undefined;
+			void this.armOutputWatch(
+				entry.channelIdHex,
+				entry.txid,
+				entry.outputIndex,
+				seedTxid,
+				seedTxid !== undefined ? output.confirmationHeight : undefined
+			);
+		}
+	}
+
 	private retrySpliceCloseRedrives(): void {
 		if (this._pendingSpliceCloseRedrives.size === 0) return;
 		for (const idHex of [...this._pendingSpliceCloseRedrives]) {
@@ -16957,6 +17072,7 @@ export class LightningNode extends EventEmitter {
 		this.retryPendingSpliceBroadcasts();
 		this.retryFailedTerminalPersists();
 		this.retrySpliceCloseRedrives();
+		this.retryPendingOutputWatches();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(
