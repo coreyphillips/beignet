@@ -5693,6 +5693,53 @@ export class ChannelManager extends EventEmitter {
 	// ─────────────── Dual Funding (v2) ───────────────
 
 	/**
+	 * Abort an in-flight dual-funded open: the v2 twin of abortSplice, for a
+	 * host that started an open on a third party's behalf and needs to release
+	 * the peer's half of it when its own exchange fails (issue #612). Without
+	 * it a failed direct-funding session leaves a live negotiation the peer
+	 * keeps holding open.
+	 *
+	 * The channel is resolved by permanent id, by the permanent id of a
+	 * temp-resident channel, and by temporary id, because a v2 open answers to
+	 * all three at different points of its life. Channel.abortDualFunding owns
+	 * every refusal (post-tx_signatures, fully signed, RBF in flight); this
+	 * only routes and dispatches.
+	 */
+	abortDualFundedOpen(
+		channelId: Buffer,
+		reason?: string
+	): { ok: boolean; error?: string } {
+		const idHex = channelId.toString('hex');
+		const channel =
+			this.channels.get(idHex) ??
+			this.findChannelByChannelIdInTemp(channelId) ??
+			this.tempChannels.get(idHex);
+		if (!channel) return { ok: false, error: `Channel not found: ${idHex}` };
+		const peerPubkey = this.findPeerForChannel(channel);
+		if (!peerPubkey) {
+			return { ok: false, error: `Peer not found for channel: ${idHex}` };
+		}
+		const actions = channel.abortDualFunding(reason);
+		// A refusal comes back as a bare local ERROR with no wire message, and
+		// dispatching it would tear down a channel the refusal exists to
+		// protect (the same read abortDualFunding's own callers apply).
+		const refusal = actions.find((a) => a.type === ChannelActionType.ERROR) as
+			| { message?: string }
+			| undefined;
+		if (
+			refusal &&
+			!actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)
+		) {
+			return {
+				ok: false,
+				error: refusal.message ?? 'dual-funding abort refused'
+			};
+		}
+		this.processActions(peerPubkey, channel, actions);
+		return { ok: true };
+	}
+
+	/**
 	 * Open a dual-funded channel (v2) with a peer.
 	 *
 	 * opts.trusted opens it zero-conf (see openChannel): the zero_conf channel

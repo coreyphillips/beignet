@@ -9477,6 +9477,42 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * The negotiated funding transaction of an in-flight dual-funded open,
+	 * with the data a third-party input owner needs to sign its input (issue
+	 * #612): the v2 twin of getPendingSpliceTx. Null while the interactive
+	 * transaction is not yet final (see Channel.getPendingV2FundingTx). The
+	 * channel is resolved by its permanent id, which a v2 open carries from
+	 * accept_channel2 onward, so an open still resident under its temporary id
+	 * resolves too.
+	 * @param channelId - 32-byte channel ID
+	 */
+	getPendingV2FundingTx(
+		channelId: Buffer
+	): ReturnType<Channel['getPendingV2FundingTx']> {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		return this.getRawChannel(channelId)?.getPendingV2FundingTx() ?? null;
+	}
+
+	/**
+	 * Unwind an in-flight dual-funded open with a wire tx_abort, so a host
+	 * driving the open on behalf of a third party can release the peer's half
+	 * of it when its own exchange fails (issue #612). The channel-level rules
+	 * apply unchanged: an open whose tx_signatures already left, or whose
+	 * funding transaction is fully signed, owes the network a broadcast rather
+	 * than the peer an abort, and is refused here.
+	 * @param channelId - 32-byte channel ID, temporary or permanent
+	 */
+	abortDualFundedOpen(
+		channelId: Buffer,
+		reason?: string
+	): { ok: boolean; error?: string } {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		return this.channelManager.abortDualFundedOpen(channelId, reason);
+	}
+
+	/**
 	 * Raw channel object by id, for hosts that drive protocol extensions
 	 * (direct funding, issue #572) against the state machine directly. Covers
 	 * temp-resident channels looked up by their derived permanent id, which

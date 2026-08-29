@@ -16658,6 +16658,63 @@ export class Channel {
 	}
 
 	/**
+	 * The v2 twin of getPendingSpliceTx (issue #612): the negotiated funding
+	 * transaction of a dual-funded open, with what a third-party input owner
+	 * needs to sign against. A DEFENSIVE COPY of the tx (a caller mutating the
+	 * channel's own would invalidate every signature already made over it), the
+	 * funding output index, the complete prevout set BIP 341 sighashes commit
+	 * to, and the outpoints whose witnesses are still owed.
+	 *
+	 * Sourced from the durable in-flight record rather than the live builder,
+	 * and null while there is none. That is the BOLT 2 ordering gate rather
+	 * than a limitation: the record is written at the point of no return, as
+	 * our initial commitment_signed leaves, so its existence is the evidence
+	 * that the interactive transaction is final and the commitment round has
+	 * happened. A third party asked to sign anything earlier would be signing a
+	 * transaction still open to renegotiation. A retained record describing a
+	 * REPLACED attempt (mid-RBF rollback state) answers nothing for the same
+	 * reason.
+	 */
+	getPendingV2FundingTx(): {
+		tx: import('bitcoinjs-lib').Transaction;
+		fundingTxid: Buffer;
+		fundingOutputIndex: number;
+		prevouts: { scripts: Buffer[]; values: bigint[] } | null;
+		owedExternalInputs: Array<{
+			inputIndex: number;
+			prevTxid: Buffer;
+			prevOutputIndex: number;
+		}>;
+	} | null {
+		const record = this._state.v2InFlight;
+		if (!record || this._v2RecordIsStaleRollback()) return null;
+		let tx: bitcoin.Transaction;
+		try {
+			tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
+		} catch {
+			return null;
+		}
+		const prevouts = this._v2InputPrevouts();
+		return {
+			tx,
+			fundingTxid: Buffer.from(record.fundingTxid),
+			fundingOutputIndex: record.fundingOutputIndex,
+			// Prevouts that do not cover the transaction are worse than none:
+			// a BIP 341 signer indexes them positionally, so a short set would
+			// silently sign against the wrong script and value.
+			prevouts:
+				prevouts && prevouts.scripts.length === tx.ins.length ? prevouts : null,
+			owedExternalInputs: this._v2OwedExternalIndices(record)
+				.filter((inputIndex) => inputIndex < tx.ins.length)
+				.map((inputIndex) => ({
+					inputIndex,
+					prevTxid: Buffer.from(tx.ins[inputIndex].hash),
+					prevOutputIndex: tx.ins[inputIndex].index
+				}))
+		};
+	}
+
+	/**
 	 * Handle tx_signatures from peer.
 	 */
 	handleTxSignatures(msg: ITxSignaturesMessage): ChannelAction[] {
