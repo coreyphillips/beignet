@@ -255,12 +255,23 @@ export class DirectFundingRequestStore {
 	 * path was ever reached and the payer could never obtain its receipt.
 	 * Effects stay single-use because 4C keys them on the offer session; what
 	 * survives is the ability to answer.
+	 *
+	 * Throws NOT_PERSISTED when the tombstone does not reach storage, for the
+	 * same reason mint does: a receipt revealed against a request that comes
+	 * back looking unpaid is a paid request the next restart cannot recognise.
+	 * The in-memory mark stands either way, so a caller that retries writes the
+	 * whole set again rather than losing the reveal.
 	 */
 	markReceiptRevealed(receiptHashHex: string): void {
 		const record = this.byReceiptHash(receiptHashHex);
-		if (!record || record.revealedAt !== undefined) return;
-		record.revealedAt = this.now();
-		this.persist();
+		if (!record) return;
+		if (record.revealedAt === undefined) record.revealedAt = this.now();
+		if (!this.persist()) {
+			throw new DirectFundingError(
+				DirectFundingErrorCode.NOT_PERSISTED,
+				'direct-funding receipt tombstone could not be persisted'
+			);
+		}
 	}
 
 	isTombstoned(receiptHashHex: string): boolean {

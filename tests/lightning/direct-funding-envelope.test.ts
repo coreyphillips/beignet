@@ -199,6 +199,22 @@ describe('Direct funding: request envelope v3', () => {
 			expect(() =>
 				mint({ transports: [{ type: 4, value: Buffer.alloc(4) }] })
 			).to.throw(/refusing to mint unimplemented transport 4/);
+			// The refusal is on the TYPE. A descriptor shaped like a known
+			// transport but numbered 4 carries no `value` and so is not
+			// "unknown"; a JS caller can build one, and signing it would claim
+			// the type #533 is reserving.
+			expect(() =>
+				mint({
+					transports: [
+						{
+							type: 4,
+							relayNodeId: getPublicKey(Buffer.alloc(32, 0x55)),
+							host: 'relay.example',
+							port: 9735
+						} as unknown as IDfEnvelopeMintParams['transports'][0]
+					]
+				})
+			).to.throw(/refusing to mint unimplemented transport 4/);
 		});
 	});
 

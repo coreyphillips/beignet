@@ -55,6 +55,7 @@ import {
 	DirectFundingError,
 	DirectFundingErrorCode,
 	IDfRequestEnvelope,
+	IDfUnknownTransport,
 	isUnknownTransport,
 	malformed
 } from './types';
@@ -66,6 +67,17 @@ const SIGNED_MESSAGE_PREFIX = 'beignet-df-req:v3:';
 const FLAG_AMOUNT_PRESENT = 1;
 
 const BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Types this module may put into an envelope it signs. Type 4 is reserved for
+ * the deferred rendezvous transport (#533): decoded and skipped, never
+ * emitted, so it stays claimable by whatever implements it.
+ */
+const EMITTABLE_TRANSPORTS: ReadonlySet<number> = new Set([
+	DfTransportType.DIRECT_PEER,
+	DfTransportType.ONION_MESSAGE,
+	DfTransportType.LSP_RELAY
+]);
 
 // ─────────────── base64url ───────────────
 
@@ -160,11 +172,20 @@ export function encodeTransportDescriptor(t: DfTransportDescriptor): Buffer {
 			);
 		}
 		value = Buffer.concat(parts);
-	} else {
+	} else if (t.type === DfTransportType.LSP_RELAY) {
 		value = Buffer.concat([
 			pubkey(t.relayNodeId, 'relay node id'),
 			hostField(t.host, t.port)
 		]);
+	} else {
+		// The only descriptor this module emits for a type it does not
+		// implement is one it decoded, verbatim, above. Reaching here means a
+		// caller built a structured descriptor under an unimplemented type,
+		// reserved type 4 included, and guessing a layout for it would sign
+		// bytes no reader can interpret.
+		throw malformed(
+			`cannot encode transport type ${(t as IDfUnknownTransport).type}`
+		);
 	}
 	if (!Number.isInteger(t.type) || t.type < 0 || t.type > 0xff) {
 		throw malformed(`transport type must be a u8, got ${t.type}`);
@@ -275,7 +296,9 @@ export function mintRequestEnvelope(
 		);
 	}
 	for (const t of params.transports) {
-		if (isUnknownTransport(t)) {
+		// Type, not shape: a JS caller can hand us a relay-shaped object under
+		// reserved type 4, which carries no `value` and so is not "unknown".
+		if (isUnknownTransport(t) || !EMITTABLE_TRANSPORTS.has(t.type)) {
 			throw malformed(`refusing to mint unimplemented transport ${t.type}`);
 		}
 	}

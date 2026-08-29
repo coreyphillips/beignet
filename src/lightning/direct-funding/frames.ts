@@ -219,6 +219,11 @@ export function openFrame(
  * The subtype is not in here: it rides the custom-message envelope (#546) and
  * is bound into the frame's associated data, so a relay cannot re-label a
  * frame without breaking authentication.
+ *
+ * Rev 2 fixes what an opening frame carries, not how it is framed, so the form
+ * byte is this codec's. Every lane hands the reader an opaque payload, and the
+ * subtype it arrives under does not say which form it is: a payer re-sends its
+ * offer under the same subtype whether or not the receiver has answered.
  */
 export function encodeSealedFrame(
 	frame: IDfSealedFrame,

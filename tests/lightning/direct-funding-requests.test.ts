@@ -60,6 +60,15 @@ function harness(
 	};
 }
 
+const errorCode = (fn: () => unknown): string | undefined => {
+	try {
+		fn();
+	} catch (e) {
+		return (e as DirectFundingError).code;
+	}
+	return undefined;
+};
+
 describe('Direct funding: outstanding requests', () => {
 	it('mints a distinct secret set per request', () => {
 		const { store } = harness();
@@ -167,13 +176,9 @@ describe('Direct funding: outstanding requests', () => {
 		// the next restart, so the mint has to fail rather than the request.
 		const h = harness();
 		h.failWrites.value = true;
-		let code: string | undefined;
-		try {
-			h.store.mint();
-		} catch (e) {
-			code = (e as DirectFundingError).code;
-		}
-		expect(code).to.equal(DirectFundingErrorCode.NOT_PERSISTED);
+		expect(errorCode(() => h.store.mint())).to.equal(
+			DirectFundingErrorCode.NOT_PERSISTED
+		);
 		expect(h.store.size()).to.equal(0);
 		expect(h.wallet.has(DF_REQUESTS_STORAGE_KEY)).to.equal(false);
 	});
@@ -247,6 +252,23 @@ describe('Direct funding: outstanding requests', () => {
 			const second = harness({}, { wallet: first.wallet, clock: first.clock });
 			second.store.restore();
 			expect(second.store.isTombstoned(record.receiptHash)).to.equal(true);
+		});
+
+		it('reports a tombstone that did not reach storage, and retries', () => {
+			// Swallowing the failed write leaves a paid request looking unpaid
+			// after the next restart.
+			const h = harness();
+			const record = h.store.mint();
+			h.failWrites.value = true;
+			expect(
+				errorCode(() => h.store.markReceiptRevealed(record.receiptHash))
+			).to.equal(DirectFundingErrorCode.NOT_PERSISTED);
+
+			h.failWrites.value = false;
+			h.store.markReceiptRevealed(record.receiptHash);
+			const restarted = harness({}, { wallet: h.wallet, clock: h.clock });
+			restarted.store.restore();
+			expect(restarted.store.isTombstoned(record.receiptHash)).to.equal(true);
 		});
 	});
 
