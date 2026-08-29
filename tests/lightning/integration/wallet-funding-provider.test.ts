@@ -25,6 +25,12 @@
  *
  * Missing infrastructure is an auto-skip locally, but a FAILURE under CI: a
  * regression test that silently skips in CI protects nothing.
+ *
+ * The wallet half is imported from `src`, not from the package root. The root
+ * resolves to dist/, so an unbuilt checkout threw at module load and took the
+ * whole suite down before this file could reach its own skip; and where it did
+ * load, a second compiled copy of the library ran beside the src one in the
+ * same process.
  */
 
 import BitcoinJsonRpc from 'bitcoin-json-rpc';
@@ -40,7 +46,7 @@ import {
 	EProtocol,
 	generateMnemonic,
 	Wallet
-} from '../../../';
+} from '../../../src';
 import {
 	bitcoinURL,
 	electrumHost,
