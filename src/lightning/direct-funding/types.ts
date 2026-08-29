@@ -83,6 +83,7 @@ export const DF_MAX_MESSAGE_BYTES = 32_768;
 
 /** Rev 2 caps a direct-funded transaction at 16 inputs and 8 outputs. */
 export const DF_MAX_PREVOUTS = 16;
+export const DF_MAX_TX_OUTPUTS = 8;
 export const DF_MAX_RAW_TX_BYTES = 20_000;
 export const DF_MAX_SCRIPT_BYTES = 520;
 /** The ownership proof admits P2WPKH and P2TR key path, so one or two items. */
@@ -262,6 +263,15 @@ export interface IDfRequestRecord {
 	/** Milliseconds since epoch, matching the envelope's u48. */
 	expiresAt: number;
 	/**
+	 * The amount the envelope fixed, as decimal satoshis, when it fixed one.
+	 * Persisted rather than derived from the envelope the payer holds: the
+	 * envelope is signed but it is the PAYER's copy, and the offer that arrives
+	 * carries only an amount of the payer's choosing. Without the receiver's own
+	 * record of it a fixed-amount request can be settled for any amount inside
+	 * the global bounds.
+	 */
+	amountSat?: string;
+	/**
 	 * Set when the receipt preimage was revealed. The record is TOMBSTONED,
 	 * not deleted: the encryption key has to survive so a payer whose receipt
 	 * frame was lost can re-send its offer and be replayed the recorded
@@ -269,6 +279,23 @@ export interface IDfRequestRecord {
 	 * effects"). 4C owns the session half; this is the persistence half.
 	 */
 	revealedAt?: number;
+	/**
+	 * The offer this request was paid by, and the funding it was paid into.
+	 * Written in the same store write as the tombstone, so a receiver restarted
+	 * after a successful exchange can still replay the receipt: the session
+	 * that recorded it lives in memory only, and without this the payer whose
+	 * receipt frame was lost gets a bare "already paid" and no proof of it.
+	 */
+	paidBy?: { offerIdHex: string; fundingTxidHex: string };
+	/** Offers this request has spent a funding session on, over its whole life. */
+	attempts?: number;
+	/**
+	 * The offer holding this request's one funding session, and when that slot
+	 * lapses. Durable for the same reason the count is: a restart mid-session
+	 * would otherwise let the duplicate offer that follows it begin a SECOND
+	 * channel session for one payment.
+	 */
+	activeAttempt?: { offerIdHex: string; expiresAt: number };
 	/** Reserved for the deferred rendezvous transport (#533), never minted. */
 	swarmSeedHex?: string;
 }

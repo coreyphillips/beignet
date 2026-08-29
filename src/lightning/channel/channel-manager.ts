@@ -240,6 +240,24 @@ interface IActionDispatchProgress {
 	attemptedMessageTypes: Set<number>;
 	/** A failed persist withheld one or more wire effects. */
 	sendsWithheld: boolean;
+	/**
+	 * One or more sends were parked behind the quorum durability barrier, or
+	 * dropped for want of frame attribution, instead of reaching the transport.
+	 * Kept apart from `sendsWithheld` because the two have opposite dispositions
+	 * here: a withheld batch committed nothing, while a held one committed its
+	 * state and is waiting for a receipt that may still be refused.
+	 */
+	sendsHeld: boolean;
+}
+
+function newDispatchProgress(): IActionDispatchProgress {
+	return {
+		index: -1,
+		completedIndex: -1,
+		attemptedMessageTypes: new Set<number>(),
+		sendsWithheld: false,
+		sendsHeld: false
+	};
 }
 
 /** Why a new channel is refused once the recovery namespace is finished. */
@@ -1787,7 +1805,11 @@ export class ChannelManager extends EventEmitter {
 			// convention); the caller retries with a correct witness.
 			return { ok: false, actions: [], error: (err as Error).message };
 		}
-		this.processActions(peerPubkey, channel, actions);
+		// The caller's obligation to the input owner is discharged by the
+		// tx_signatures this release sends, not by the channel accepting the
+		// witness, so a dispatch that stopped short of the wire has to reach it.
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
 		this._promoteV2ChannelIfReady(peerPubkey, channel);
 		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
 		if (errorAction) {
@@ -1797,7 +1819,14 @@ export class ChannelManager extends EventEmitter {
 				error: (errorAction as { message: string }).message
 			};
 		}
-		return { ok: true, actions };
+		return {
+			ok: true,
+			actions,
+			sendsWithheld:
+				progress.sendsWithheld ||
+				progress.sendsHeld ||
+				this._txSignaturesStillHeld(channel)
+		};
 	}
 
 	/**
@@ -1842,7 +1871,8 @@ export class ChannelManager extends EventEmitter {
 			// caller retries with a correct witness.
 			return { ok: false, actions: [], error: (err as Error).message };
 		}
-		this.processActions(peerPubkey, channel, actions);
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
 		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
 		if (errorAction) {
 			return {
@@ -1851,7 +1881,14 @@ export class ChannelManager extends EventEmitter {
 				error: (errorAction as { message: string }).message
 			};
 		}
-		return { ok: true, actions };
+		return {
+			ok: true,
+			actions,
+			sendsWithheld:
+				progress.sendsWithheld ||
+				progress.sendsHeld ||
+				this._txSignaturesStillHeld(channel)
+		};
 	}
 
 	/**
@@ -5693,6 +5730,75 @@ export class ChannelManager extends EventEmitter {
 	// ─────────────── Dual Funding (v2) ───────────────
 
 	/**
+	 * Abort an in-flight dual-funded open: the v2 twin of abortSplice, for a
+	 * host that started an open on a third party's behalf and needs to release
+	 * the peer's half of it when its own exchange fails (issue #612). Without
+	 * it a failed direct-funding session leaves a live negotiation the peer
+	 * keeps holding open.
+	 *
+	 * The channel is resolved by permanent id, by the permanent id of a
+	 * temp-resident channel, and by temporary id, because a v2 open answers to
+	 * all three at different points of its life. Channel.abortDualFunding owns
+	 * every refusal (post-tx_signatures, fully signed, RBF in flight); this
+	 * only routes and dispatches.
+	 *
+	 * `pending` says the tx_abort went out and the attempt is still fully live:
+	 * a RECORDED attempt tears down only on the peer's echo, and a disconnect
+	 * before it resumes the negotiation. A caller holding an obligation to a
+	 * third party must not read that as a release.
+	 */
+	abortDualFundedOpen(
+		channelId: Buffer,
+		reason?: string
+	): { ok: boolean; error?: string; pending?: boolean } {
+		const idHex = channelId.toString('hex');
+		const channel =
+			this.channels.get(idHex) ??
+			this.findChannelByChannelIdInTemp(channelId) ??
+			this.tempChannels.get(idHex);
+		if (!channel) return { ok: false, error: `Channel not found: ${idHex}` };
+		const peerPubkey = this.findPeerForChannel(channel);
+		if (!peerPubkey) {
+			return { ok: false, error: `Peer not found for channel: ${idHex}` };
+		}
+		const actions = channel.abortDualFunding(reason);
+		// A refusal comes back as a bare local ERROR with no wire message, and
+		// dispatching it would tear down a channel the refusal exists to
+		// protect (the same read abortDualFunding's own callers apply).
+		const refusal = actions.find((a) => a.type === ChannelActionType.ERROR) as
+			| { message?: string }
+			| undefined;
+		if (
+			refusal &&
+			!actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)
+		) {
+			return {
+				ok: false,
+				error: refusal.message ?? 'dual-funding abort refused'
+			};
+		}
+		try {
+			this.processActions(peerPubkey, channel, actions);
+		} finally {
+			// A pre-record abort kills the negotiation on the spot, so nothing
+			// will ever answer for this channel again and leaving it registered
+			// strands an ERRORED lifecycle in the maps and in listChannels. The
+			// echo normally reaches handleTxAbortMsg, which removes it there, but
+			// a peer that never echoes (or a dispatch that throws) would leave it
+			// until the disconnect sweep. A RECORDED attempt is not abandoned and
+			// is deliberately untouched: it tears down on the echo.
+			if (channel.isAbandonedV2Open()) {
+				const id = channel.getChannelId() ?? channel.getTemporaryChannelId();
+				if (this.removeCurrentChannelLifecycle(peerPubkey, channel)) {
+					this.emitContained('channel:abandoned', id, 'v2 open aborted');
+					this.releaseAbandonedV2Pledges(channel);
+				}
+			}
+		}
+		return { ok: true, pending: channel.isV2AbortAwaitingEcho() };
+	}
+
+	/**
 	 * Open a dual-funded channel (v2) with a peer.
 	 *
 	 * opts.trusted opens it zero-conf (see openChannel): the zero_conf channel
@@ -5880,7 +5986,19 @@ export class ChannelManager extends EventEmitter {
 				alignedParams.fundingFeeratePerkw
 			);
 		}
-		this.processActions(peerPubkey, channel, actions);
+		try {
+			this.processActions(peerPubkey, channel, actions);
+		} catch (err) {
+			// The registration above happens BEFORE the dispatch, so a throw here
+			// leaves a temp channel and a peer binding for a negotiation whose
+			// caller got an exception instead of the handle it would need to
+			// unwind them. Nothing else can reach this channel again, so it goes
+			// with the throw rather than answering an accept_channel2 nobody is
+			// waiting for.
+			this.removeCurrentTempChannel(peerPubkey, channel);
+			this.releaseErroredTempV2Pledges(channel);
+			throw err;
+		}
 
 		this.emit('channel:opened', channel.getTemporaryChannelId());
 		return channel;
@@ -6974,12 +7092,7 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		const actions = channel.handleTxAbort();
-		const progress: IActionDispatchProgress = {
-			index: -1,
-			completedIndex: -1,
-			attemptedMessageTypes: new Set<number>(),
-			sendsWithheld: false
-		};
+		const progress = newDispatchProgress();
 		let dispatchCompleted = false;
 		try {
 			this.processActions(peerPubkey, channel, actions, progress);
@@ -7671,12 +7784,7 @@ export class ChannelManager extends EventEmitter {
 	): void {
 		this._syncQuiescenceWatchdog(channel);
 		if (actions.length === 0) return;
-		const dispatchProgress = progress ?? {
-			index: -1,
-			completedIndex: -1,
-			attemptedMessageTypes: new Set<number>(),
-			sendsWithheld: false
-		};
+		const dispatchProgress = progress ?? newDispatchProgress();
 		const errorIndex = actions.findIndex(
 			(action) => action.type === ChannelActionType.ERROR
 		);
@@ -7813,6 +7921,7 @@ export class ChannelManager extends EventEmitter {
 		// leads with its persist, so a violation is a producer bug, and the
 		// safe response to a producer bug on a fund-critical path is silence.
 		if (channelIdHex && this._lacksFrameAttribution(actions, persistIndex)) {
+			this._noteSendsHeld(progress, actions, 0);
 			this._refuseUnattributed(channelIdHex, peerPubkey, channel, actions);
 			return;
 		}
@@ -7830,6 +7939,7 @@ export class ChannelManager extends EventEmitter {
 			persistIndex < 0 &&
 			this.barrierQueues.has(channelIdHex)
 		) {
+			this._noteSendsHeld(progress, actions, 0);
 			this._holdBatch(channelIdHex, peerPubkey, channel, {
 				actions,
 				from: 0,
@@ -7875,6 +7985,7 @@ export class ChannelManager extends EventEmitter {
 			this.emitContained('transition:end', channelIdHex);
 		}
 		if (heldFrom >= 0 && channelIdHex) {
+			this._noteSendsHeld(progress, actions, heldFrom);
 			this._holdBatch(channelIdHex, peerPubkey, channel, {
 				actions,
 				from: heldFrom,
@@ -8264,6 +8375,51 @@ export class ChannelManager extends EventEmitter {
 		);
 	}
 
+	/**
+	 * Note that a suffix the barrier parked (or dropped) still owes the wire.
+	 *
+	 * Only sends count. A held suffix carries broadcasts and internal emits too,
+	 * but no peer is waiting on those, and a caller asking whether its message
+	 * left is asking about the socket.
+	 */
+	private _noteSendsHeld(
+		progress: IActionDispatchProgress,
+		actions: ChannelAction[],
+		from: number
+	): void {
+		for (let index = Math.max(from, 0); index < actions.length; index++) {
+			if (actions[index].type === ChannelActionType.SEND_MESSAGE) {
+				progress.sendsHeld = true;
+				return;
+			}
+		}
+	}
+
+	/**
+	 * Is a tx_signatures for this channel still parked behind the barrier?
+	 *
+	 * The witness entry points ask after their own dispatch, because a repeat
+	 * delivery is a no-op at the channel: the record already says our
+	 * tx_signatures were released, so the second call produces no actions and no
+	 * progress of its own. Reading that as a clean dispatch would tell a caller
+	 * holding an obligation to the input's owner that it was discharged by bytes
+	 * still sitting in the queue, which a refused release then drops.
+	 */
+	private _txSignaturesStillHeld(channel: Channel): boolean {
+		const channelIdHex = channel.getChannelId()?.toString('hex');
+		if (!channelIdHex) return false;
+		const queue = this.barrierQueues.get(channelIdHex);
+		if (!queue) return false;
+		return queue.batches.some((batch) =>
+			batch.actions.some(
+				(action, index) =>
+					index >= batch.from &&
+					action.type === ChannelActionType.SEND_MESSAGE &&
+					action.messageType === MessageType.TX_SIGNATURES
+			)
+		);
+	}
+
 	/** Does the suffix from `from` put a message the barrier gates on the wire? */
 	private _carriesBarrierMessage(
 		actions: ChannelAction[],
@@ -8538,10 +8694,9 @@ export class ChannelManager extends EventEmitter {
 		let blocked = false;
 		const channelIdHex = queue.channel.getChannelId()?.toString('hex') ?? null;
 		const progress: IActionDispatchProgress = {
+			...newDispatchProgress(),
 			index: held.from,
-			completedIndex: held.from - 1,
-			attemptedMessageTypes: new Set<number>(),
-			sendsWithheld: false
+			completedIndex: held.from - 1
 		};
 		// Same bracket a live batch runs in, so a monitor change caused by the
 		// released actions still rides its channel's transition instead of

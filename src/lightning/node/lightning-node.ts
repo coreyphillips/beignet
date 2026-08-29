@@ -9365,6 +9365,12 @@ export class LightningNode extends EventEmitter {
 	 * tx_signatures. A refused delivery (unknown outpoint, invalid witness)
 	 * leaves the open untouched and can simply be retried with a correct
 	 * witness.
+	 *
+	 * `sendsWithheld` on a successful delivery says the tx_signatures the
+	 * release produced did NOT reach the peer: the batch's persist failed and
+	 * only a reconnect retries them, or the durability barrier parked them and
+	 * may yet drop them. A caller answering to the input's owner has not
+	 * discharged anything until that is false.
 	 * @param channelId - 32-byte channel ID from the event
 	 * @param prevTxid - txid of the input's previous transaction, INTERNAL
 	 *   byte order (tx.getHash(), not the display hex)
@@ -9376,7 +9382,7 @@ export class LightningNode extends EventEmitter {
 		prevTxid: Buffer,
 		prevOutputIndex: number,
 		witness: Buffer[]
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; sendsWithheld?: boolean } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
 		const txidErr = validateBuffer(prevTxid, 32, 'prevTxid');
@@ -9404,7 +9410,7 @@ export class LightningNode extends EventEmitter {
 			} as ILightningError);
 			return { ok: false, error: result.error };
 		}
-		return { ok: true };
+		return { ok: true, sendsWithheld: result.sendsWithheld === true };
 	}
 
 	/**
@@ -9415,6 +9421,9 @@ export class LightningNode extends EventEmitter {
 	 * releases the withheld tx_signatures (and with it the broadcast). A
 	 * refused delivery (unknown outpoint, invalid witness) leaves the splice
 	 * untouched and can simply be retried with a correct witness.
+	 *
+	 * `sendsWithheld` carries the same meaning as on the v2 twin: the delivery
+	 * landed, and the tx_signatures it released did not leave.
 	 * @param channelId - 32-byte channel ID from the event
 	 * @param prevTxid - txid of the input's previous transaction, INTERNAL
 	 *   byte order (tx.getHash(), not the display hex)
@@ -9426,7 +9435,7 @@ export class LightningNode extends EventEmitter {
 		prevTxid: Buffer,
 		prevOutputIndex: number,
 		witness: Buffer[]
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; sendsWithheld?: boolean } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
 		const txidErr = validateBuffer(prevTxid, 32, 'prevTxid');
@@ -9454,7 +9463,7 @@ export class LightningNode extends EventEmitter {
 			} as ILightningError);
 			return { ok: false, error: result.error };
 		}
-		return { ok: true };
+		return { ok: true, sendsWithheld: result.sendsWithheld === true };
 	}
 
 	/**
@@ -9474,6 +9483,46 @@ export class LightningNode extends EventEmitter {
 		return (
 			this.channelManager.getChannel(channelId)?.getPendingSpliceTx() ?? null
 		);
+	}
+
+	/**
+	 * The negotiated funding transaction of an in-flight dual-funded open,
+	 * with the data a third-party input owner needs to sign its input (issue
+	 * #612): the v2 twin of getPendingSpliceTx. Null while the interactive
+	 * transaction is not yet final (see Channel.getPendingV2FundingTx). The
+	 * channel is resolved by its permanent id, which a v2 open carries from
+	 * accept_channel2 onward, so an open still resident under its temporary id
+	 * resolves too.
+	 * @param channelId - 32-byte channel ID
+	 */
+	getPendingV2FundingTx(
+		channelId: Buffer
+	): ReturnType<Channel['getPendingV2FundingTx']> {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		return this.getRawChannel(channelId)?.getPendingV2FundingTx() ?? null;
+	}
+
+	/**
+	 * Unwind an in-flight dual-funded open with a wire tx_abort, so a host
+	 * driving the open on behalf of a third party can release the peer's half
+	 * of it when its own exchange fails (issue #612). The channel-level rules
+	 * apply unchanged: an open whose tx_signatures already left, or whose
+	 * funding transaction is fully signed, owes the network a broadcast rather
+	 * than the peer an abort, and is refused here.
+	 *
+	 * `pending` means the tx_abort left and the peer's echo is outstanding. A
+	 * recorded attempt tears down only on that echo, so until it arrives the
+	 * negotiation is still live and a disconnect resumes it.
+	 * @param channelId - 32-byte channel ID, temporary or permanent
+	 */
+	abortDualFundedOpen(
+		channelId: Buffer,
+		reason?: string
+	): { ok: boolean; error?: string; pending?: boolean } {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		return this.channelManager.abortDualFundedOpen(channelId, reason);
 	}
 
 	/**

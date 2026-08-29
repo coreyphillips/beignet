@@ -419,6 +419,13 @@ export interface ChannelResult {
 	ok: boolean;
 	actions: import('./channel-actions').ChannelAction[];
 	error?: string;
+	/**
+	 * The batch's messages did not reach the wire. Either a failed persist
+	 * withheld them, which only a reconnect retries, or the quorum durability
+	 * barrier parked them, which a refused release then drops. Set by the entry
+	 * points whose caller has an obligation riding on the send actually leaving.
+	 */
+	sendsWithheld?: boolean;
 }
 
 /** Bitcoin mainnet chain hash */
