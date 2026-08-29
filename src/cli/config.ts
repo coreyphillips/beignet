@@ -16,17 +16,33 @@ function parseLogLevel(value?: string): TLogLevel | undefined {
 		: undefined;
 }
 
-const BEIGNET_DIR = path.join(
-	process.env.HOME || process.env.USERPROFILE || '.',
-	'.beignet'
-);
+/**
+ * Resolved on every call, never frozen at module load. These paths follow HOME,
+ * and HOME is not a constant: the CLI tests redirect it per-test to keep their
+ * writes inside a temp dir. A module-level `const` captured the value at import
+ * time, so those redirects were silently ignored and saveConfig() wrote the
+ * developer's real ~/.beignet/config.json instead (issue #604). It also made
+ * every test that touches config contend on one file outside the repo, which is
+ * a cross-process race the moment test:cli runs with --parallel.
+ */
+function beignetDir(): string {
+	return path.join(
+		process.env.HOME || process.env.USERPROFILE || '.',
+		'.beignet'
+	);
+}
 
-const CONFIG_PATH = path.join(BEIGNET_DIR, 'config.json');
-const PID_PATH = path.join(BEIGNET_DIR, 'daemon.pid');
+function configPath(): string {
+	return path.join(beignetDir(), 'config.json');
+}
+
+function pidPath(): string {
+	return path.join(beignetDir(), 'daemon.pid');
+}
 
 export function loadConfig(): BeignetConfig {
 	try {
-		const raw = fs.readFileSync(CONFIG_PATH, 'utf-8');
+		const raw = fs.readFileSync(configPath(), 'utf-8');
 		return JSON.parse(raw) as BeignetConfig;
 	} catch {
 		return {};
@@ -34,8 +50,8 @@ export function loadConfig(): BeignetConfig {
 }
 
 export function saveConfig(config: BeignetConfig): void {
-	fs.mkdirSync(BEIGNET_DIR, { recursive: true });
-	fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n');
+	fs.mkdirSync(beignetDir(), { recursive: true });
+	fs.writeFileSync(configPath(), JSON.stringify(config, null, 2) + '\n');
 }
 
 /**
@@ -376,13 +392,13 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 }
 
 export function writePidFile(pid: number, port: number): void {
-	fs.mkdirSync(BEIGNET_DIR, { recursive: true });
-	fs.writeFileSync(PID_PATH, JSON.stringify({ pid, port }));
+	fs.mkdirSync(beignetDir(), { recursive: true });
+	fs.writeFileSync(pidPath(), JSON.stringify({ pid, port }));
 }
 
 export function readPidFile(): { pid: number; port: number } | null {
 	try {
-		const raw = fs.readFileSync(PID_PATH, 'utf-8');
+		const raw = fs.readFileSync(pidPath(), 'utf-8');
 		return JSON.parse(raw);
 	} catch {
 		return null;
@@ -391,7 +407,7 @@ export function readPidFile(): { pid: number; port: number } | null {
 
 export function removePidFile(): void {
 	try {
-		fs.unlinkSync(PID_PATH);
+		fs.unlinkSync(pidPath());
 	} catch {
 		// ignore
 	}
@@ -402,4 +418,4 @@ export function getDaemonPort(): number {
 	return pidInfo?.port || 2112;
 }
 
-export { BEIGNET_DIR, CONFIG_PATH };
+export { beignetDir, configPath, pidPath };

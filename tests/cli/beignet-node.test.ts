@@ -237,11 +237,50 @@ describe('Config management', () => {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	});
 
-	it('loadConfig returns object if no config in fresh dir', () => {
-		// Note: CONFIG_PATH is a module-level constant, so loadConfig reads from
-		// the path computed at module-load time. We verify it doesn't throw.
-		const config = loadConfig();
-		expect(config).to.be.an('object');
+	it('loadConfig returns an empty object in a fresh dir', () => {
+		// This used to only assert "does not throw", because the config paths
+		// were frozen at module load and loadConfig read the developer's REAL
+		// ~/.beignet/config.json no matter what HOME said. Now the redirect
+		// holds, so a fresh HOME genuinely has no config to find.
+		expect(
+			fs.existsSync(path.join(tmpDir, '.beignet', 'config.json'))
+		).to.equal(false);
+		expect(loadConfig()).to.deep.equal({});
+	});
+
+	it('writes under the redirected HOME, never the real one (issue #604)', () => {
+		const realConfig = path.join(origHome ?? '.', '.beignet', 'config.json');
+		const before = fs.existsSync(realConfig)
+			? fs.readFileSync(realConfig)
+			: null;
+
+		saveConfig({ network: 'mainnet' });
+		writePidFile(4242, 2112);
+
+		// The whole point: both writes land in the temp HOME.
+		expect(
+			fs.existsSync(path.join(tmpDir, '.beignet', 'config.json')),
+			'config.json under the redirected HOME'
+		).to.equal(true);
+		expect(
+			fs.existsSync(path.join(tmpDir, '.beignet', 'daemon.pid')),
+			'daemon.pid under the redirected HOME'
+		).to.equal(true);
+
+		// And the real one is untouched, whether or not it existed.
+		const after = fs.existsSync(realConfig)
+			? fs.readFileSync(realConfig)
+			: null;
+		if (before === null) {
+			expect(after, 'no config.json created in the real HOME').to.equal(null);
+		} else {
+			expect(
+				after !== null && after.equals(before),
+				'the real config.json is byte-identical'
+			).to.equal(true);
+		}
+
+		removePidFile();
 	});
 
 	it('saveConfig and loadConfig roundtrip', () => {
