@@ -2164,6 +2164,49 @@ describe('Phase 4: Chain Watcher', () => {
 					'the eviction reached the ChannelManager'
 				).to.deep.equal([{ txid: watchedTxid, outputIndex: 0 }]);
 			});
+
+			it('does not let a stalled scan retire the watch across the boundary', async () => {
+				const unspent: Array<{ txid: string; outputIndex: number }> = [];
+				(
+					channelManager as unknown as {
+						handleOutputUnspent: (txid: string, outputIndex: number) => void;
+					}
+				).handleOutputUnspent = (txid, outputIndex): void => {
+					unspent.push({ txid, outputIndex });
+				};
+				const { watchedTxid, scriptHash } = await armSpentOutput();
+
+				backend.simulateNewBlock(SPEND_HEIGHT + IRREVOCABLE_DEPTH - 1);
+				await check(scriptHash);
+
+				// Scan A snapshots the history that still holds the spend, then stalls.
+				backend.holdHistory(2);
+				backend.simulateScriptHashChange(scriptHash);
+				await new Promise((resolve) => setTimeout(resolve, 20));
+
+				// The reorg drops the spend and the boundary block lands. Scan B
+				// snapshots the chain that no longer has it and stalls behind A.
+				backend.setHistory(scriptHash, [
+					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 }
+				]);
+				backend.simulateNewBlock(SPEND_HEIGHT + IRREVOCABLE_DEPTH);
+				backend.simulateScriptHashChange(scriptHash);
+				await new Promise((resolve) => setTimeout(resolve, 20));
+
+				backend.releaseNextHistory();
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				expect(
+					watchedOutputCount(),
+					'the stalled scan may not retire on a tip its history predates'
+				).to.equal(1);
+
+				backend.releaseNextHistory();
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				expect(
+					unspent,
+					'so the fresher scan still gets to report the eviction'
+				).to.deep.equal([{ txid: watchedTxid, outputIndex: 0 }]);
+			});
 		});
 	});
 
