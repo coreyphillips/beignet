@@ -79,15 +79,13 @@ jobs:
       - name: Run lightning unit tests
         run: npm run test:lightning
 
-      # The process-level chaos matrix SIGKILLs a real LightningNode child
-      # (built against dist) at every recorded boundary; its cost and any
-      # flakes stay visible in their own step instead of hiding inside the
-      # lightning suite.
-      - name: Run SIGKILL chaos matrix
-        run: npm run test:sigkill
-
-      - name: Run CLI unit tests
-        run: npm run test:cli
+      # test:sigkill and test:cli used to run here. They were 325s and 230s of a
+      # 17m30s job that is the whole workflow's critical path, and neither needs
+      # the regtest stack: recovery-phase7-sigkill.test.ts references no electrum,
+      # bitcoind or docker port (it needs dist, which its own script builds), and
+      # every docker-shaped string left in the test:cli set is a literal in a
+      # type-shape assertion, not a connection. They are now the `sigkill` and
+      # `cli` jobs below, which run beside this one instead of inside it.
 
       # daemon-security and daemon-integration need the live Electrum the
       # regtest stack already provides; test:cli deliberately excludes them.
@@ -104,8 +102,15 @@ jobs:
   # boundary). As a step they would simply stay on the critical path they were
   # already on. Nothing here needs docker or dist, so the job skips both: only
   # recovery-phase7-sigkill.test.ts spawns a child built against dist, and that
-  # stays in the `tests` job's test:sigkill step. They stay serial too, because
-  # helpers/chaos-quorum.ts holds one current-run trio per process.
+  # has its own `sigkill` job below.
+  #
+  # test:chaos now runs --parallel. helpers/chaos-quorum.ts still holds one
+  # current-run per process, and that still holds: mocha gives each file to a
+  # worker and never runs two files at once inside one worker, so no two runs
+  # are ever live in the same process. 30/30 both ways, and stressed over 11
+  # runs at --jobs 2 through 8 plus three probes under CPU hogs, 0 failures.
+  # The floor is one test: "S2 forwarder ... in quorum mode" alone is 66.1s of
+  # the suite's 204.7s, so extra workers beyond a few buy nothing here.
   chaos:
     name: Run recovery chaos matrix
     runs-on: ubuntu-latest
@@ -127,3 +132,57 @@ jobs:
 
       - name: Run recovery chaos matrix
         run: npm run test:chaos
+
+  # Split out of the `tests` job, which was 17m30s of serial steps and the whole
+  # workflow's critical path. This is the single most expensive step in the repo
+  # after the chaos matrix (325s), and it only needs a build, so it has no
+  # reason to queue behind the regtest stack.
+  sigkill:
+    name: Run SIGKILL chaos matrix
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      # test:sigkill runs npm run build itself; the child it SIGKILLs is loaded
+      # from dist by path, so the build is not optional here.
+      - name: Run SIGKILL chaos matrix
+        run: npm run test:sigkill
+
+  # Also split out of `tests` (230s there). test:cli excludes daemon-security and
+  # daemon-integration, which are the only CLI files that want a live Electrum,
+  # so this job needs no docker. Those two keep running in the `tests` job via
+  # test:integration.
+  cli:
+    name: Run CLI unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Run CLI unit tests
+        run: npm run test:cli

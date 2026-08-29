@@ -591,10 +591,11 @@ LightningNode              High-level API (EventEmitter)
 ## Tests
 
 ```bash
-npm run test:lightning     # 5400+ Lightning unit tests (parallel), no infrastructure needed
-npm run test:cli           # 900+ CLI + daemon unit tests, no infrastructure needed
+npm run test:local         # test:lightning + test:cli at once; no infrastructure needed
+npm run test:lightning     # 6200+ Lightning unit tests (parallel), no infrastructure needed
+npm run test:cli           # 1350+ CLI + daemon unit tests (parallel), no infrastructure needed
 npm run test:conformance   # 250+ official BOLT vector cases (subset of test:lightning)
-npm run test:chaos         # recovery kill matrices, split out of test:lightning
+npm run test:chaos         # recovery kill matrices (parallel), split out of test:lightning
 npm run test:sigkill       # process-level SIGKILL chaos matrix (builds dist first)
 npm run test:integration   # daemon/Electrum integration (needs an Electrum server)
 npm run test:interop       # 190+ cases vs LND/CLN/Eclair (needs Docker)
@@ -602,6 +603,20 @@ npm run test:all           # Lightning + CLI + interop (needs Docker + Electrum)
 ```
 
 Counts are floors, not snapshots. Run the suites for exact numbers.
+
+`test:local` is the fast inner loop. `test:lightning` and `test:cli` are
+independent processes and neither saturates the machine alone, so running them at
+once beats running them in sequence. Measured on 8 cores: 195.6s in sequence
+before this existed, 106.1s in sequence once `test:cli` gained `--parallel`, and
+**77.1s together**. It prints a per-suite summary and, on
+failure, the failing suite's output.
+
+`test:chaos` is deliberately not in that bundle. Its cases carry real wall-clock
+budgets that do not care how loaded the box is (`chaosWait` defaults to 15s, the
+quorum barrier to 20s), and sharing the machine ate one of them: running all
+three concurrently failed with `chaosWait timed out with the victim alive` while
+the same suite passes 30/30 on its own. Run it separately. See
+`scripts/run-suites.js` for the worker split and why more workers is not better.
 
 The on-chain wallet suites live in `tests/*.test.ts` and connect to **live public
 Electrum servers**, so they need network access and can fail on a server outage
