@@ -167,17 +167,18 @@ describe('Splice-out daily spend limit: daemon route', function () {
 	it('leaves wallet-credited splice-outs outside the limit', async () => {
 		// Same over-limit amount, no address: the funds would return to our
 		// own wallet, so the request passes admission and proceeds to the
-		// channel lookup (in-band Channel not found on this fresh node).
+		// channel lookup, which on this fresh node answers CHANNEL_NOT_FOUND
+		// rather than the budget refusal.
 		const res = await request(port, {
 			channelId: UNKNOWN_CHANNEL_ID,
 			amountSats: DAILY_LIMIT_SATS * 5,
 			feeratePerkw: 2500
 		});
-		expect(res.status).to.equal(200);
-		expect(res.body.ok).to.equal(true);
-		const result = res.body.result as { ok: boolean; error?: string };
-		expect(result.ok).to.equal(false);
-		expect(result.error).to.include('Channel not found');
+		expect(res.status).to.equal(404);
+		expect(res.body.ok).to.equal(false);
+		const error = res.body.error as { code: string; message: string };
+		expect(error.code).to.equal('CHANNEL_NOT_FOUND');
+		expect(error.message).to.include('Channel not found');
 	});
 });
 

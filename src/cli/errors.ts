@@ -45,6 +45,10 @@ export enum BeignetErrorCode {
 	FUNDING_PROVIDER_REQUIRED = 'FUNDING_PROVIDER_REQUIRED',
 	/** The fee estimator has not delivered its first sample; retry shortly. */
 	FEE_ESTIMATE_NOT_READY = 'FEE_ESTIMATE_NOT_READY',
+	/** option_splice/option_quiesce is missing on one side of the pair. */
+	SPLICING_NOT_NEGOTIATED = 'SPLICING_NOT_NEGOTIATED',
+	/** The channel exists but would not start the splice (state, peer, size). */
+	SPLICE_REFUSED = 'SPLICE_REFUSED',
 
 	// Budget
 	SPENDING_LIMIT_EXCEEDED = 'SPENDING_LIMIT_EXCEEDED',
