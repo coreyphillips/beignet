@@ -332,6 +332,8 @@ async function main(): Promise<void> {
 			return handleWebhooks();
 		case 'queue':
 			return handleQueue();
+		case 'direct-funding':
+			return handleDirectFunding();
 		case 'l402':
 			return handleL402();
 		case 'auth':
@@ -516,7 +518,9 @@ async function handleStart(): Promise<void> {
 			routingFeePpm: config.routingFeePpm,
 			routingCltvDelta: config.routingCltvDelta,
 			leaseRates: config.leaseRates,
-			jitReceive: config.jitReceive
+			jitReceive: config.jitReceive,
+			dfRelay: config.dfRelay,
+			dfMinAmountSat: config.dfMinAmountSat
 		});
 
 		writePidFile(process.pid, daemonPort);
@@ -1818,6 +1822,85 @@ async function handleQueue(): Promise<void> {
 	}
 }
 
+/**
+ * Third-party direct funding (issue #613): a payer's ordinary on-chain payment
+ * becomes this node's channel funding.
+ */
+async function handleDirectFunding(): Promise<void> {
+	const sub = filteredArgs[1];
+	const numberFlag = (name: string): number | undefined => {
+		const raw = parseFlag(name);
+		return raw === undefined ? undefined : parseInt(raw, 10);
+	};
+	switch (sub) {
+		case 'configure': {
+			// Every field is optional and the daemon MERGES: naming one leaves the
+			// rest as they were.
+			const trusted = parseFlag('--trusted');
+			return outputResult(
+				await httpRequest('POST', '/direct-funding/configure', {
+					lspPubkey: parseFlag('--lsp'),
+					lspHost: parseFlag('--lsp-host'),
+					lspPort: numberFlag('--lsp-port'),
+					targetInboundSat: numberFlag('--target-inbound'),
+					trusted: trusted === undefined ? undefined : trusted === 'true',
+					minAmountSat: numberFlag('--min-amount')
+				})
+			);
+		}
+		case 'config':
+			return outputResult(await httpRequest('GET', '/direct-funding/config'));
+		case 'request': {
+			// host/port are the operator's: they are signed into the request as the
+			// address a payer can reach this node on, and the daemon never guesses.
+			return outputResult(
+				await httpRequest('POST', '/direct-funding/request', {
+					host: parseFlag('--host'),
+					port: numberFlag('--port'),
+					amountSats: filteredArgs[2]
+						? parseInt(filteredArgs[2], 10)
+						: undefined
+				})
+			);
+		}
+		case 'send': {
+			const request = filteredArgs[2];
+			if (!request) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet direct-funding send <request> [sats] ' +
+							'[--max-total-fee sats]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/direct-funding/send', {
+					request,
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined,
+					maxTotalFeeSat: numberFlag('--max-total-fee')
+				})
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet direct-funding [configure|config|request|send]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
 async function handleGraph(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
@@ -2708,6 +2791,24 @@ BOLT 12 Offers:
   offer list                             List local offers
   offer decode <offer>                   Decode a BOLT 12 offer string
   offer pay <offer> [amountSats]         Pay a BOLT 12 offer
+
+Direct funding (a payer's on-chain payment IS this node's channel funding):
+  direct-funding configure [--lsp <pubkey>] [--lsp-host H] [--lsp-port P]
+                           [--min-amount sats] [--trusted true|false]
+                           [--target-inbound sats]
+                                         Set the liquidity peer and policy.
+                                         MERGES: a field you do not name keeps
+                                         its value
+  direct-funding config                  Read the effective policy back
+  direct-funding request [sats] [--host H] [--port P]
+                                         Mint a payment request; the receipt
+                                         preimage stays here. --host/--port are
+                                         where a payer can reach this node
+  direct-funding send <request> [sats] [--max-total-fee sats]
+                                         Pay a request from one of our coins.
+                                         Refuses only before our witness leaves
+                                         the device; after that it reports what
+                                         is known rather than failing
 
 Webhooks (event push; see also GET /events SSE):
   webhooks register <url> <events> [--secret S]

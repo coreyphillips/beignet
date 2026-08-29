@@ -137,7 +137,14 @@ export function isRetryableError(err: BeignetError): boolean {
 		'NODE_RESTORE_PENDING',
 		'NODE_RESTART_REQUIRED',
 		'RESTORE_NO_QUORUM',
-		'RESTORE_CAS_EXHAUSTED'
+		'RESTORE_CAS_EXHAUSTED',
+		// Direct funding (issue #613): no lane could carry a frame, the receiver
+		// never finished the exchange, or a storage write did not land. All three
+		// are refused BEFORE the witness leaves, so nothing was spent and the next
+		// attempt reaches a different world.
+		'UNREACHABLE',
+		'EXCHANGE_TIMEOUT',
+		'NOT_PERSISTED'
 	]);
 	if (retryableCodes.has(err.code)) return true;
 

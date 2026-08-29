@@ -1695,6 +1695,8 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_JIT_FEE_PPM` | Proportional part of that fee in millionths of the delivered total, an integer in 0..1000000 (default 0) |
 | `BEIGNET_JIT_MAX_FLAT_FEE_SAT` | Wallet role: most an LSP may quote `POST /jit/invoice` as a flat fee before the intent is refused (default 10000) |
 | `BEIGNET_JIT_MAX_FEE_PPM` | Wallet role: most an LSP may quote as a proportional fee, in millionths (default 50000). Applies whether or not the LSP role is on |
+| `BEIGNET_DF_RELAY` | Relay direct-funding frames for OTHER nodes (`true`/`false`, default off). Paying and being paid needs nothing switched on; this is work done for strangers, metered but not free |
+| `BEIGNET_DF_MIN_AMOUNT` | Smallest direct-funding offer this node serves, a whole number of satoshis. Clamps up to the 5000 sat protocol floor; a partly numeric value refuses startup |
 
 ### Priority Order
 
@@ -1814,6 +1816,10 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address |
 | POST | `/invoice/create` | `{ amountSats?, description?, minFinalCltvExpiry? }` | Create invoice (omit amountSats for amount-less; `minFinalCltvExpiry` buys final-CLTV headroom for a receive an LSP may settle through a splice) |
 | POST | `/jit/invoice` | `{ lspPubkey, amountSats?, description?, expirySecs?, targetRemainingInboundSat?, maxFlatFeeSat?, maxFeePpm? }` | Create an invoice payable with no channel: registers a receive intent with the LSP, which funds a channel mid-payment and deducts the quoted opening fee. Returns the invoice plus `flatFeeSat` and `feePpm` |
+| POST | `/direct-funding/configure` | `{ lspPubkey?, lspHost?, lspPort?, targetInboundSat?, trusted?, minAmountSat? }` | Set the direct-funding policy. A partial MERGE, never a replace: a field the body does not name keeps its value. `minAmountSat` clamps up to the 5000 sat floor and the response reports the clamped value. Returns the full effective config |
+| GET | `/direct-funding/config` | -- | Read the effective policy; `lspPubkey` is null when no liquidity peer is set, in which case no offer is served |
+| POST | `/direct-funding/request` | `{ host?, port?, amountSats? }` | Mint a payment request: returns `{ paymentHash, expiresAt, request }`, where `request` is the base64url envelope a payer pays (BIP 21 parameter `bgnq`). `host`/`port` are the address a payer can reach this node on and are used exactly as given |
+| POST | `/direct-funding/send` | `{ request, amountSats?, maxTotalFeeSat? }` | Pay a request from one of our coins. **Rejects only before our witness leaves the device**; after that it resolves with what is known plus a `caveat`, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Idempotent on the request id, sets no deadline of its own, and accepts `feeHeadroomSats` as an alias for `maxTotalFeeSat` |
 | POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel) |
 | POST | `/invoice/settle-hold` | `{ preimage }` | Settle a parked hold invoice (fulfills all MPP parts) |
 | POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |

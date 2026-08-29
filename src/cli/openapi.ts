@@ -334,6 +334,90 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/direct-funding/configure': {
+				post: {
+					summary:
+						'Set the direct-funding policy: the liquidity peer every direct-funded channel is negotiated with, where it is reachable, whether such an open may go zero-conf, and the minimum offer served. A partial MERGE, never a replace: a field the body does not name keeps its value. minAmountSat clamps up to the 5000 sat protocol floor and the response reports the clamped value. targetInboundSat is recorded and reported but not yet consumed. Admin scope',
+					tags: ['DirectFunding'],
+					requestBody: bodyContent({
+						lspPubkey: 'string?',
+						lspHost: 'string?',
+						lspPort: 'number?',
+						targetInboundSat: 'number?',
+						trusted: 'boolean?',
+						minAmountSat: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'The full effective policy after the merge',
+							content: jsonContent({
+								$ref: '#/components/schemas/DirectFundingConfig'
+							})
+						}
+					}
+				}
+			},
+			'/direct-funding/config': {
+				get: {
+					summary:
+						'Read the effective direct-funding policy. lspPubkey is null when no liquidity peer has been set, in which case this node serves no offers. Readonly scope',
+					tags: ['DirectFunding'],
+					responses: {
+						'200': {
+							description: 'The effective policy',
+							content: jsonContent({
+								$ref: '#/components/schemas/DirectFundingConfig'
+							})
+						}
+					}
+				}
+			},
+			'/direct-funding/request': {
+				post: {
+					summary:
+						'Mint a direct-funding payment request. Returns the receipt hash (its preimage stays here and is revealed to the payer after broadcast, as a delivery receipt) and `request`, the base64url envelope a payer pays; put it in a BIP 21 URI under the bgnq parameter. host and port are the address a payer can reach this node on and are used exactly as given: the daemon has no way to know which of a browser hostname and a public host is right. With neither, no direct-peer descriptor is emitted and the payer reaches this node through the liquidity peer. Invoice scope',
+					tags: ['DirectFunding'],
+					requestBody: bodyContent({
+						host: 'string?',
+						port: 'number?',
+						amountSats: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'The minted request',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									paymentHash: { type: 'string' },
+									expiresAt: { type: 'number' },
+									request: { type: 'string' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/direct-funding/send': {
+				post: {
+					summary:
+						'Pay a direct-funding request by funding the receiver channel from one of our coins. THIS CALL REJECTS ONLY BEFORE OUR WITNESS LEAVES THE DEVICE: after that it resolves, with whatever is known and a `caveat` saying what was lost. That is a protocol MUST, and it is load bearing, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Anyone adding an error path here must keep it on the pre-witness side. The call sets no deadline of its own and may block for the whole offer to receipt exchange. Idempotent on the request id: a second send against a request that already has an attempt returns that attempt rather than starting a new one, so a retry can never commit a second coin. feeHeadroomSats is a documented alias for maxTotalFeeSat, the ceiling on our own cost above the amount. Admin scope',
+					tags: ['DirectFunding'],
+					requestBody: bodyContent({
+						request: 'string',
+						amountSats: 'number?',
+						maxTotalFeeSat: 'number?',
+						feeHeadroomSats: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'The payment as it stands',
+							content: jsonContent({
+								$ref: '#/components/schemas/DirectFundingSendResult'
+							})
+						}
+					}
+				}
+			},
 			'/invoice/create-hold': {
 				post: {
 					summary:
@@ -3335,6 +3419,73 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						description: { type: 'string' },
 						expiry: { type: 'integer' },
 						createdAt: { type: 'integer' }
+					}
+				},
+				DirectFundingConfig: {
+					type: 'object',
+					properties: {
+						lspPubkey: {
+							type: 'string',
+							nullable: true,
+							description:
+								'The liquidity peer every direct-funded channel is negotiated with. Null means this node serves no offers'
+						},
+						lspHost: { type: 'string', nullable: true },
+						lspPort: { type: 'integer', nullable: true },
+						targetInboundSat: {
+							type: 'integer',
+							description:
+								'Inbound the operator would like bought alongside. Recorded and reported; nothing consumes it yet'
+						},
+						trusted: {
+							type: 'boolean',
+							description: 'Whether a direct-funded open may go zero-conf'
+						},
+						minAmountSat: {
+							type: 'integer',
+							description:
+								'Smallest offer served, never below the 5000 sat protocol floor'
+						}
+					}
+				},
+				DirectFundingSendResult: {
+					type: 'object',
+					properties: {
+						offerId: { type: 'string' },
+						spentTxid: { type: 'string' },
+						spentVout: { type: 'integer' },
+						amountSat: { type: 'integer' },
+						fundingTxid: { type: 'string' },
+						attested: {
+							type: 'boolean',
+							description:
+								'True once the receiver node-key attestation over the funding output verified against the node the payment request named'
+						},
+						receiptPreimageHex: {
+							type: 'string',
+							nullable: true,
+							description:
+								'The delivery receipt. Null when it did not arrive in time, which is not a failure: delivery is chain-atomic by then'
+						},
+						rawTxHex: { type: 'string' },
+						broadcastTxHex: { type: 'string' },
+						status: {
+							type: 'string',
+							enum: [
+								'CREATED',
+								'OFFERED',
+								'SIGNED_PENDING',
+								'MEMPOOL_SEEN',
+								'CONFIRMED',
+								'ABORTED',
+								'FAILED'
+							]
+						},
+						caveat: {
+							type: 'string',
+							description:
+								'What went wrong AFTER the witness left. The call resolves in that case, so this is the only place a caller learns of it'
+						}
 					}
 				},
 				OfferInfo: {

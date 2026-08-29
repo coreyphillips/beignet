@@ -19692,6 +19692,7 @@ export class LightningNode extends EventEmitter {
 			forwardingCltvDelta?: number;
 			jitReceive?: INodeConfig['jitReceive'];
 			jitReceiveClient?: INodeConfig['jitReceiveClient'];
+			directFunding?: INodeConfig['directFunding'];
 			leaseRates?: import('../gossip/types').ILeaseRates;
 			eagerGossipVerify?: boolean;
 			sweepDestinationScript?: Buffer;
@@ -19754,6 +19755,7 @@ export class LightningNode extends EventEmitter {
 			forwardingCltvDelta: options?.forwardingCltvDelta,
 			jitReceive: options?.jitReceive,
 			jitReceiveClient: options?.jitReceiveClient,
+			directFunding: options?.directFunding,
 			leaseRates: options?.leaseRates,
 			eagerGossipVerify: options?.eagerGossipVerify,
 			localFeatures: options?.localFeatures,
