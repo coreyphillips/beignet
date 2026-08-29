@@ -25,6 +25,7 @@ import {
 	Channel,
 	ISpliceWalletInput
 } from '../../src/lightning/channel/channel';
+import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import {
 	createOpenerState,
 	createAcceptorState,
@@ -355,5 +356,44 @@ describe('Channel.getPendingV2FundingTx (issue #612)', () => {
 		const second = acceptor.getPendingV2FundingTx()!;
 		expect(second.tx.toHex()).to.equal(before);
 		expect(second.tx.getHash().equals(first.fundingTxid)).to.be.true;
+	});
+});
+
+describe('ChannelManager.createDualFundedChannel dispatch failure (issue #612)', () => {
+	it('retains no channel when the open_channel2 dispatch throws', () => {
+		const fundingPriv = crypto.randomBytes(32);
+		const seed = crypto.randomBytes(32);
+		const mgr = new ChannelManager({
+			localBasepoints: makeBasepoints(getPublicKey(fundingPriv), seed),
+			localPerCommitmentSeed: seed,
+			localFundingPrivkey: fundingPriv,
+			htlcBasepointSecret: crypto.randomBytes(32)
+		});
+		const peer = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		mgr.on('message:outbound', () => {
+			throw new Error('transport is gone');
+		});
+
+		// The caller gets an exception and no Channel, so nothing it can do
+		// would ever reach this negotiation again.
+		expect(() =>
+			mgr.createDualFundedChannel(peer, {
+				fundingSatoshis: OPENER_FUNDING,
+				fundingFeeratePerkw: FUNDING_FEERATE,
+				commitmentFeeratePerkw: DEFAULT_CHANNEL_CONFIG.feeratePerKw,
+				dustLimitSatoshis: DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis,
+				maxHtlcValueInFlightMsat:
+					DEFAULT_CHANNEL_CONFIG.maxHtlcValueInFlightMsat,
+				htlcMinimumMsat: DEFAULT_CHANNEL_CONFIG.htlcMinimumMsat,
+				toSelfDelay: DEFAULT_CHANNEL_CONFIG.toSelfDelay,
+				maxAcceptedHtlcs: DEFAULT_CHANNEL_CONFIG.maxAcceptedHtlcs,
+				locktime: 0,
+				localBasepoints: makeBasepoints(getPublicKey(fundingPriv), seed),
+				localPerCommitmentSeed: seed,
+				secondPerCommitmentPoint: getPerCommitmentPoint(seed, 1n)
+			})
+		).to.throw('transport is gone');
+		expect(mgr.listChannels()).to.have.length(0);
+		expect(mgr.getChannelsByPeer(peer)).to.have.length(0);
 	});
 });

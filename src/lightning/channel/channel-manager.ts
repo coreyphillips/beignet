@@ -242,6 +242,15 @@ interface IActionDispatchProgress {
 	sendsWithheld: boolean;
 }
 
+function newDispatchProgress(): IActionDispatchProgress {
+	return {
+		index: -1,
+		completedIndex: -1,
+		attemptedMessageTypes: new Set<number>(),
+		sendsWithheld: false
+	};
+}
+
 /** Why a new channel is refused once the recovery namespace is finished. */
 const NAMESPACE_LOST_REFUSAL =
 	'recovery: this namespace lost its guardian backfill, so a new channel ' +
@@ -1787,7 +1796,11 @@ export class ChannelManager extends EventEmitter {
 			// convention); the caller retries with a correct witness.
 			return { ok: false, actions: [], error: (err as Error).message };
 		}
-		this.processActions(peerPubkey, channel, actions);
+		// The caller's obligation to the input owner is discharged by the
+		// tx_signatures this release sends, not by the channel accepting the
+		// witness, so a withheld dispatch has to reach it.
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
 		this._promoteV2ChannelIfReady(peerPubkey, channel);
 		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
 		if (errorAction) {
@@ -1797,7 +1810,7 @@ export class ChannelManager extends EventEmitter {
 				error: (errorAction as { message: string }).message
 			};
 		}
-		return { ok: true, actions };
+		return { ok: true, actions, sendsWithheld: progress.sendsWithheld };
 	}
 
 	/**
@@ -1842,7 +1855,8 @@ export class ChannelManager extends EventEmitter {
 			// caller retries with a correct witness.
 			return { ok: false, actions: [], error: (err as Error).message };
 		}
-		this.processActions(peerPubkey, channel, actions);
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
 		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
 		if (errorAction) {
 			return {
@@ -1851,7 +1865,7 @@ export class ChannelManager extends EventEmitter {
 				error: (errorAction as { message: string }).message
 			};
 		}
-		return { ok: true, actions };
+		return { ok: true, actions, sendsWithheld: progress.sendsWithheld };
 	}
 
 	/**
@@ -5927,7 +5941,19 @@ export class ChannelManager extends EventEmitter {
 				alignedParams.fundingFeeratePerkw
 			);
 		}
-		this.processActions(peerPubkey, channel, actions);
+		try {
+			this.processActions(peerPubkey, channel, actions);
+		} catch (err) {
+			// The registration above happens BEFORE the dispatch, so a throw here
+			// leaves a temp channel and a peer binding for a negotiation whose
+			// caller got an exception instead of the handle it would need to
+			// unwind them. Nothing else can reach this channel again, so it goes
+			// with the throw rather than answering an accept_channel2 nobody is
+			// waiting for.
+			this.removeCurrentTempChannel(peerPubkey, channel);
+			this.releaseErroredTempV2Pledges(channel);
+			throw err;
+		}
 
 		this.emit('channel:opened', channel.getTemporaryChannelId());
 		return channel;

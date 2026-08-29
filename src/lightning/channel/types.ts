@@ -419,6 +419,12 @@ export interface ChannelResult {
 	ok: boolean;
 	actions: import('./channel-actions').ChannelAction[];
 	error?: string;
+	/**
+	 * The batch committed nothing and its messages were withheld: a failed
+	 * persist, which only a reconnect retries. Set by the entry points whose
+	 * caller has an obligation riding on the send actually leaving.
+	 */
+	sendsWithheld?: boolean;
 }
 
 /** Bitcoin mainnet chain hash */

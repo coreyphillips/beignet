@@ -9365,6 +9365,11 @@ export class LightningNode extends EventEmitter {
 	 * tx_signatures. A refused delivery (unknown outpoint, invalid witness)
 	 * leaves the open untouched and can simply be retried with a correct
 	 * witness.
+	 *
+	 * `sendsWithheld` on a successful delivery says the tx_signatures the
+	 * release produced did NOT reach the peer, because the batch's persist
+	 * failed; only a reconnect retries them. A caller answering to the input's
+	 * owner has not discharged anything until that is false.
 	 * @param channelId - 32-byte channel ID from the event
 	 * @param prevTxid - txid of the input's previous transaction, INTERNAL
 	 *   byte order (tx.getHash(), not the display hex)
@@ -9376,7 +9381,7 @@ export class LightningNode extends EventEmitter {
 		prevTxid: Buffer,
 		prevOutputIndex: number,
 		witness: Buffer[]
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; sendsWithheld?: boolean } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
 		const txidErr = validateBuffer(prevTxid, 32, 'prevTxid');
@@ -9404,7 +9409,7 @@ export class LightningNode extends EventEmitter {
 			} as ILightningError);
 			return { ok: false, error: result.error };
 		}
-		return { ok: true };
+		return { ok: true, sendsWithheld: result.sendsWithheld === true };
 	}
 
 	/**
@@ -9415,6 +9420,9 @@ export class LightningNode extends EventEmitter {
 	 * releases the withheld tx_signatures (and with it the broadcast). A
 	 * refused delivery (unknown outpoint, invalid witness) leaves the splice
 	 * untouched and can simply be retried with a correct witness.
+	 *
+	 * `sendsWithheld` carries the same meaning as on the v2 twin: the delivery
+	 * landed, and the tx_signatures it released did not leave.
 	 * @param channelId - 32-byte channel ID from the event
 	 * @param prevTxid - txid of the input's previous transaction, INTERNAL
 	 *   byte order (tx.getHash(), not the display hex)
@@ -9426,7 +9434,7 @@ export class LightningNode extends EventEmitter {
 		prevTxid: Buffer,
 		prevOutputIndex: number,
 		witness: Buffer[]
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; sendsWithheld?: boolean } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
 		const txidErr = validateBuffer(prevTxid, 32, 'prevTxid');
@@ -9454,7 +9462,7 @@ export class LightningNode extends EventEmitter {
 			} as ILightningError);
 			return { ok: false, error: result.error };
 		}
-		return { ok: true };
+		return { ok: true, sendsWithheld: result.sendsWithheld === true };
 	}
 
 	/**
