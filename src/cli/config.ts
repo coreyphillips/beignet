@@ -131,8 +131,9 @@ function leaseRatesEnv(raw: string | undefined): BeignetConfig['leaseRates'] {
 
 /**
  * BEIGNET_JIT_RECEIVE / _FLAT_FEE_SAT / _FEE_PPM / _MAX_FLAT_FEE_SAT /
- * _MAX_FEE_PPM, assembled into one config block. Returns undefined when none
- * of them is set, so the config file still gets its turn.
+ * _MAX_FEE_PPM, assembled into one config block. A variable that is not set
+ * leaves its field out rather than writing an undefined, so mergeJitReceive
+ * can let the config file answer for that field alone.
  *
  * `enabled` is the autoReconnect rule (exact 'true'/'false', anything else
  * ignored): the safe direction for this switch is OFF, because it decides
@@ -159,6 +160,40 @@ function jitReceiveEnv(): BeignetConfig['jitReceive'] {
 	) {
 		return undefined;
 	}
+	return {
+		...(enabled !== undefined ? { enabled } : {}),
+		...(flatFeeSat !== undefined ? { flatFeeSat } : {}),
+		...(feePpm !== undefined ? { feePpm } : {}),
+		...(maxFlatFeeSat !== undefined ? { maxFlatFeeSat } : {}),
+		...(maxFeePpm !== undefined ? { maxFeePpm } : {})
+	};
+}
+
+/**
+ * Merge the jitReceive block FIELD BY FIELD, cliFlag ?? env ?? file.
+ *
+ * The five fields are two independent policies: enabled/flatFeeSat/feePpm are
+ * what this node charges as an LSP, maxFlatFeeSat/maxFeePpm are the most it
+ * will pay as a client. A whole-block `??` gave the first layer that named any
+ * field all five, so setting BEIGNET_JIT_RECEIVE (which the LFBW app does on
+ * every daemon it spawns, along with the two fee variables) dropped a client
+ * ceiling the operator had written in config.json and quietly restored the
+ * built-in default, which is higher than anyone who edits that field wants.
+ * NaN from integerEnv passes through untouched, so a partly numeric variable
+ * still refuses startup naming itself.
+ */
+function mergeJitReceive(
+	cli: BeignetConfig['jitReceive'],
+	env: BeignetConfig['jitReceive'],
+	file: BeignetConfig['jitReceive']
+): BeignetConfig['jitReceive'] {
+	if (!cli && !env && !file) return undefined;
+	const enabled = cli?.enabled ?? env?.enabled ?? file?.enabled;
+	const flatFeeSat = cli?.flatFeeSat ?? env?.flatFeeSat ?? file?.flatFeeSat;
+	const feePpm = cli?.feePpm ?? env?.feePpm ?? file?.feePpm;
+	const maxFlatFeeSat =
+		cli?.maxFlatFeeSat ?? env?.maxFlatFeeSat ?? file?.maxFlatFeeSat;
+	const maxFeePpm = cli?.maxFeePpm ?? env?.maxFeePpm ?? file?.maxFeePpm;
 	return {
 		...(enabled !== undefined ? { enabled } : {}),
 		...(flatFeeSat !== undefined ? { flatFeeSat } : {}),
@@ -387,7 +422,11 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			cliFlags.leaseRates ??
 			leaseRatesEnv(process.env.BEIGNET_LEASE_RATES) ??
 			file.leaseRates,
-		jitReceive: cliFlags.jitReceive ?? jitReceiveEnv() ?? file.jitReceive,
+		jitReceive: mergeJitReceive(
+			cliFlags.jitReceive,
+			jitReceiveEnv(),
+			file.jitReceive
+		),
 		// Same exact-string rule as the JIT trio, and the same reasoning: the
 		// safe direction for this switch is OFF, because it decides whether this
 		// node forwards frames on behalf of strangers. `=== 'true'` alone would
