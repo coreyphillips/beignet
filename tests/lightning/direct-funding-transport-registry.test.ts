@@ -440,6 +440,38 @@ describe('Direct-funding transport registry', () => {
 			await registry.run([onion()], CTX, async (l) => l.type);
 			expect(onionLoads).to.equal(1);
 		});
+
+		it('loads once when two first uses overlap', async () => {
+			// A slow loader (a dynamic import is one) leaves a window between the
+			// first call and the factory being recorded. Two loads there would
+			// install two sets of listeners, and destroy() would reach one.
+			const onionLane = new StubFactory(DfTransportType.ONION_MESSAGE);
+			let onionLoads = 0;
+			let release = (): void => undefined;
+			const held = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const registry = new DfTransportRegistry();
+			registry.register({
+				type: DfTransportType.ONION_MESSAGE,
+				enabled: true,
+				load: async () => {
+					onionLoads++;
+					await held;
+					return onionLane;
+				}
+			});
+
+			const both = Promise.all([
+				registry.run([onion()], CTX, async (l) => l.type),
+				registry.attachInbound(() => undefined)
+			]);
+			release();
+			await both;
+
+			expect(onionLoads).to.equal(1);
+			expect(onionLane.attaches).to.equal(1);
+		});
 	});
 
 	describe('inbound attachment', () => {

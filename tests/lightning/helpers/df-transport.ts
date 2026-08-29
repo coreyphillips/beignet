@@ -10,6 +10,7 @@
 
 import crypto from 'crypto';
 import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
+import { BEIGNET_CUSTOM_PROTOCOL_VERSION } from '../../../src/lightning/message/custom';
 import {
 	IDfCustomMessage,
 	IDfPeerMessaging
@@ -90,10 +91,20 @@ export class FakeDfPeer implements IDfPeerMessaging {
 		};
 	}
 
-	/** The node's dispatch, faithfully: one try/catch around all listeners. */
-	deliver(msg: IDfCustomMessage): void {
+	/**
+	 * The node's dispatch, faithfully: one try/catch around all listeners. The
+	 * version defaults to the one this build speaks, so a test that says nothing
+	 * about it gets an ordinary peer.
+	 */
+	deliver(msg: Omit<IDfCustomMessage, 'version'> & { version?: number }): void {
+		const full: IDfCustomMessage = {
+			version: msg.version ?? BEIGNET_CUSTOM_PROTOCOL_VERSION,
+			peerPubkey: msg.peerPubkey,
+			subtype: msg.subtype,
+			payload: msg.payload
+		};
 		try {
-			for (const listener of [...this.listeners]) listener(msg);
+			for (const listener of [...this.listeners]) listener(full);
 		} catch (err) {
 			this.escapedErrors.push(err);
 		}

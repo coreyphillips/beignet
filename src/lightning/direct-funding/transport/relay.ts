@@ -58,7 +58,8 @@ import {
 	IDfOpenContext,
 	IDfPeerMessaging,
 	IDfRelayServerConfig,
-	IDfTransport
+	IDfTransport,
+	isSupportedDfVersion
 } from './types';
 
 const TRANSPORT = 'relay';
@@ -155,6 +156,13 @@ export class DfRelayLaneFactory implements IDfLaneFactory {
 
 	private handle(msg: IDfCustomMessage): void {
 		if (msg.subtype !== BeignetCustomSubtype.DIRECT_FUNDING_RELAY) return;
+		if (!isSupportedDfVersion(msg.version)) {
+			this.drop(DfDropReason.UNSUPPORTED_VERSION, {
+				pubkey: msg.peerPubkey,
+				version: msg.version
+			});
+			return;
+		}
 		let wrapper: IDfRelayFrame;
 		try {
 			wrapper = decodeDfRelayFrame(msg.payload);
@@ -376,6 +384,15 @@ export class DfRelayForwarder {
 			this.drop(DfDropReason.RELAY_OVER_BUDGET, { pubkey: msg.peerPubkey });
 			return;
 		}
+		if (!isSupportedDfVersion(msg.version)) {
+			// The forward is a re-encode, and this node can only write the version
+			// it speaks, so a wrapper it cannot read is one it cannot carry either.
+			this.drop(DfDropReason.UNSUPPORTED_VERSION, {
+				pubkey: msg.peerPubkey,
+				version: msg.version
+			});
+			return;
+		}
 		if (msg.payload.length > this.maxFrameBytes + DF_RELAY_WRAPPER_OVERHEAD) {
 			this.drop(DfDropReason.FRAME_TOO_LARGE, {
 				pubkey: msg.peerPubkey,
@@ -438,10 +455,13 @@ export class DfRelayForwarder {
 					payload: wrapper.payload
 				})
 			);
-		} catch (err) {
+		} catch {
+			// The send error names the target it was given (`Not connected to peer
+			// <id>`, or the outbound gate's refusal), and the sender is already on
+			// this line: keeping the text would put both ends of one relayed
+			// exchange on disk, which is exactly what this log refuses to do.
 			this.drop(DfDropReason.RELAY_FORWARD_FAILED, {
-				pubkey: msg.peerPubkey,
-				error: errorText(err)
+				pubkey: msg.peerPubkey
 			});
 		}
 		// A successful forward logs nothing at all.

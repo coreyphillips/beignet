@@ -18,7 +18,10 @@
  * knows nothing about offers, transactions or channels; 4C and 4D own those.
  */
 
-import { BeignetCustomSubtype } from '../../message/custom';
+import {
+	BEIGNET_CUSTOM_PROTOCOL_VERSION,
+	BeignetCustomSubtype
+} from '../../message/custom';
 import { DF_FRAME_NONCE_BYTES, DF_FRAME_TAG_BYTES } from '../frames';
 import {
 	DF_MAX_MESSAGE_BYTES,
@@ -91,6 +94,8 @@ export enum DfDropReason {
 	NOT_A_SEALED_FRAME = 'not_a_sealed_frame',
 	/** A direct-funding subtype this lane does not carry (20 and 22). */
 	UNHANDLED_SUBTYPE = 'unhandled_subtype',
+	/** A custom-message envelope version this build does not speak. */
+	UNSUPPORTED_VERSION = 'unsupported_version',
 	FRAME_TOO_LARGE = 'frame_too_large',
 	/** Nothing claimed the frame: no payer lane, no receiver sink attached. */
 	NO_LISTENER = 'no_listener',
@@ -208,8 +213,20 @@ export interface IDfTransport extends IDfLaneSender {
 /** The `custom-message` event payload (issue #546). */
 export interface IDfCustomMessage {
 	peerPubkey: string;
+	/**
+	 * Envelope protocol version. Carried rather than discarded because the
+	 * envelope's own rule is that a receiver ignores versions it does not speak,
+	 * and a lane cannot ignore what it never sees: a version 2 frame would
+	 * otherwise reach a handler that can only read version 1.
+	 */
+	version: number;
 	subtype: number;
 	payload: Buffer;
+}
+
+/** The one envelope version the direct-funding lanes read and write. */
+export function isSupportedDfVersion(version: number): boolean {
+	return version === BEIGNET_CUSTOM_PROTOCOL_VERSION;
 }
 
 /**

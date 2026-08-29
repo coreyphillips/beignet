@@ -55,6 +55,21 @@ import {
 const OFFER = BeignetCustomSubtype.DIRECT_FUNDING_OFFER;
 const RECEIPT = BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT;
 
+/** An opening frame naming a request, and a continuation naming none. */
+function opening(requestId: Buffer, ephemeralPublicKey: Buffer): Buffer {
+	return encodeSealedFrame(
+		{ nonce: Buffer.alloc(12, 1), ciphertext: Buffer.alloc(32, 2) },
+		{ requestId, ephemeralPublicKey }
+	);
+}
+
+function cont(): Buffer {
+	return encodeSealedFrame({
+		nonce: Buffer.alloc(12, 3),
+		ciphertext: Buffer.alloc(32, 4)
+	});
+}
+
 interface IOnionHarness {
 	net: FakeDfNetwork;
 	payer: FakeDfPeer;
@@ -240,6 +255,69 @@ describe('Direct-funding lane 2: onion messages', () => {
 		expect(tx.openLaneCount).to.equal(0);
 	});
 
+	it('keeps the lane reply path on a payer answer, so the exchange continues', async () => {
+		const store = new DirectFundingRequestStore({});
+		const record = store.mint();
+		const requestId = Buffer.from(record.requestId, 'hex');
+		const recorder = recordingLog();
+
+		const inbound: IDfInboundFrame[] = [];
+		receiverFactory(h, store, recorder.log).attachInbound((f) =>
+			inbound.push(f)
+		);
+		const lane = (await payerFactory(h, recorder.log).open(
+			descriptorFor(receiverPath(h, record)),
+			{ requestId, receiverNodeId: h.receiver.pubkey }
+		)) as IDfTransport;
+		const answers: IDfInboundFrame[] = [];
+		lane.onMessage((f) => answers.push(f));
+
+		lane.send(OFFER, opening(requestId, h.payer.pubkey));
+		expect(inbound.length).to.equal(1);
+		inbound[0].reply.send(
+			BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK,
+			cont()
+		);
+		expect(answers.length).to.equal(1);
+
+		// The payer answers through the frame it was handed. Without the lane's
+		// own reply path on that send the receiver has nothing to answer on and
+		// the exchange dies at the sign request.
+		answers[0].reply.send(
+			BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST,
+			cont()
+		);
+		expect(inbound.length).to.equal(2);
+		inbound[1].reply.send(BeignetCustomSubtype.DIRECT_FUNDING_WITNESS, cont());
+		expect(answers.length).to.equal(2);
+		expect(recorder.lines).to.deep.equal([]);
+		lane.close();
+	});
+
+	it('refuses a send whose introduction node is gone, and counts nothing', async () => {
+		const store = new DirectFundingRequestStore({});
+		const record = store.mint();
+		const recorder = recordingLog();
+		const lane = (await payerFactory(h, recorder.log).open(
+			descriptorFor(receiverPath(h, record)),
+			{
+				requestId: Buffer.from(record.requestId, 'hex'),
+				receiverNodeId: h.receiver.pubkey
+			}
+		)) as IDfTransport;
+
+		// The node's onion send hook swallows a `sendToPeer` failure, so a lane
+		// that trusted it would count a frame that never left the process and
+		// deny the registry the fall-through it is owed.
+		h.payer.connections.delete(h.intro.id);
+
+		expect(() => lane.send(OFFER, cont())).to.throw(/introduction node/);
+		expect(lane.trySend(OFFER, cont())).to.equal(false);
+		expect(lane.framesExchanged()).to.equal(0);
+		expect(recorder.reasons()).to.deep.equal([DfDropReason.SEND_FAILED]);
+		lane.close();
+	});
+
 	it('selects the BOLT 4 large form for a sign_request-sized frame', async () => {
 		const store = new DirectFundingRequestStore({});
 		const record = store.mint();
@@ -344,10 +422,7 @@ describe('Direct-funding lane 2: onion messages', () => {
 		}
 
 		function frameFor(requestId: Buffer): Buffer {
-			return encodeSealedFrame(
-				{ nonce: Buffer.alloc(12, 1), ciphertext: Buffer.alloc(32, 2) },
-				{ requestId, ephemeralPublicKey: h.payer.pubkey }
-			);
+			return opening(requestId, h.payer.pubkey);
 		}
 
 		function anyReplyPath(): IBlindedPath {
@@ -440,19 +515,10 @@ describe('Direct-funding lane 2: onion messages', () => {
 		it('accepts a continuation frame, which declares no request id', () => {
 			// The path_id alone proves the route was ours; the seal proves the
 			// rest, and 4C refuses a frame it cannot open under boundRequestId.
-			hostileSend(
-				encodeDfOnionBody(
-					OFFER,
-					encodeSealedFrame({
-						nonce: Buffer.alloc(12, 1),
-						ciphertext: Buffer.alloc(32, 2)
-					})
-				),
-				{
-					pathId: Buffer.from(record.onionPathSecretHex, 'hex'),
-					replyPath: anyReplyPath()
-				}
-			);
+			hostileSend(encodeDfOnionBody(OFFER, cont()), {
+				pathId: Buffer.from(record.onionPathSecretHex, 'hex'),
+				replyPath: anyReplyPath()
+			});
 			expect(seen.length).to.equal(1);
 			expect(seen[0].boundRequestId?.toString('hex')).to.equal(
 				record.requestId

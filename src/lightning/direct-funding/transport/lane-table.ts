@@ -8,8 +8,9 @@
  * The discriminator is the frame itself. An opening frame names its request in
  * the clear (4A `decodeSealedFrame`), so it routes to the payer lane bound to
  * that request, or, when no lane is, to the receiver sink. A continuation frame
- * names nothing, so it routes to whichever lanes hold the counterparty key; the
- * seal sorts out which one it was for, and a lane that cannot open it drops it.
+ * names nothing, so it goes to every payer lane holding the counterparty key AND
+ * to the sink; the seal sorts out whose it was, and whoever cannot open it drops
+ * it.
  *
  * The lifecycle rule is the fix for defect D21. The fork's onion dispatcher
  * inserted a lane entry unconditionally and deleted it only when the last
@@ -75,8 +76,10 @@ export class DfLaneTable {
 			if (owner.length > 0) return owner.map((c) => c.deliver);
 			return [...this.sinks];
 		}
-		if (claims.length > 0) return claims.map((c) => c.deliver);
-		return [...this.sinks];
+		// Both roles can be live with one counterparty, and a continuation names
+		// nothing that would separate them, so every holder of the key gets a
+		// look. Whoever cannot open the seal drops it.
+		return [...claims.map((c) => c.deliver), ...this.sinks];
 	}
 
 	clear(): void {

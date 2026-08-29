@@ -39,6 +39,12 @@ import {
 /** A registration plus whatever its loader has produced so far. */
 interface IResolvedRegistration extends IDfLaneRegistration {
 	factory?: IDfLaneFactory;
+	/**
+	 * The load in flight. Recorded before the first await, so two first uses
+	 * that overlap share one factory: a second one would install a second set of
+	 * listeners, and `destroy` could only ever reach the last one stored.
+	 */
+	loading?: Promise<IDfLaneFactory>;
 	/** Set once the loader has thrown; it is never called a second time. */
 	unavailable?: boolean;
 }
@@ -161,8 +167,13 @@ export class DfTransportRegistry {
 	): Promise<IDfLaneFactory | null> {
 		if (registration.factory) return registration.factory;
 		if (registration.unavailable) return null;
+		if (!registration.loading) {
+			// Through a promise rather than a bare call, so a loader that throws
+			// synchronously fails the same way an async one does.
+			registration.loading = (async () => registration.load())();
+		}
 		try {
-			registration.factory = await registration.load();
+			registration.factory = await registration.loading;
 		} catch (err) {
 			registration.unavailable = true;
 			this.skip(registration.type, DfLaneSkipReason.MODULE_UNAVAILABLE, {

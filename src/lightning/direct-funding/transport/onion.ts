@@ -48,6 +48,8 @@ import {
 	DF_PATH_SECRET_BYTES,
 	DfTransportDescriptor,
 	DfTransportType,
+	DirectFundingError,
+	DirectFundingErrorCode,
 	IDfOnionTransport,
 	malformed
 } from '../types';
@@ -146,8 +148,12 @@ export interface IDfOnionLaneDeps {
 /** A payer lane's claim on a path id it minted for one request. */
 interface IDfPathClaim {
 	requestIdHex: string;
-	/** The request's own blinded path: where this lane's frames go. */
-	sendPath: IBlindedPath;
+	/**
+	 * The lane itself. An answer to a payer-role frame goes back out the way the
+	 * lane went, reply path and all: a bare sender built from the send path alone
+	 * would attach none, and the receiver would have nothing to answer on.
+	 */
+	reply: IDfLaneSender;
 	deliver: DfFrameHandler;
 }
 
@@ -195,6 +201,7 @@ export class DfOnionLaneFactory implements IDfLaneFactory {
 		this.ensureHandlerRegistered();
 		return new DfOnionLane(this, {
 			manager: this.deps.manager,
+			peers: this.deps.peers,
 			pathIdHex: localPathId.toString('hex'),
 			requestIdHex: ctx.requestId.toString('hex'),
 			sendPath,
@@ -300,10 +307,20 @@ export class DfOnionLaneFactory implements IDfLaneFactory {
 			this.drop(DfDropReason.REQUEST_ID_MISMATCH, { subtype: body.subtype });
 			return;
 		}
-		// A payer answers down the request's own path; a receiver has only what
-		// the frame carried, so a frame with no reply path is unanswerable.
-		const answerPath = claim ? claim.sendPath : replyPath;
-		if (!answerPath) {
+		// A payer answers on its own lane; a receiver has only what the frame
+		// carried, so a frame with no reply path is unanswerable.
+		let reply: IDfLaneSender;
+		if (claim) {
+			reply = claim.reply;
+		} else if (replyPath) {
+			reply = new DfOnionSender(
+				this.deps.manager,
+				this.deps.peers,
+				replyPath,
+				undefined,
+				this.log
+			);
+		} else {
 			this.drop(DfDropReason.NO_REPLY_PATH, { subtype: body.subtype });
 			return;
 		}
@@ -312,12 +329,7 @@ export class DfOnionLaneFactory implements IDfLaneFactory {
 			laneKey: pathIdHex,
 			subtype: body.subtype,
 			payload: body.frame,
-			reply: new DfOnionSender(
-				this.deps.manager,
-				answerPath,
-				undefined,
-				this.log
-			),
+			reply,
 			boundRequestId: Buffer.from(boundRequestIdHex, 'hex')
 		};
 		const handlers = claim ? [claim.deliver] : [...this.sinks];
@@ -341,6 +353,7 @@ class DfOnionSender implements IDfLaneSender {
 
 	constructor(
 		protected readonly manager: OnionMessageManager,
+		protected readonly peers: IDfPeerMessaging,
 		protected readonly sendPath: IBlindedPath,
 		protected readonly replyPath: IBlindedPath | undefined,
 		protected readonly log: DfTransportLog
@@ -350,6 +363,17 @@ class DfOnionSender implements IDfLaneSender {
 		if (payload.length > DF_MAX_FRAME_BYTES) {
 			throw malformed(
 				`direct-funding frame is ${payload.length} bytes, max ${DF_MAX_FRAME_BYTES}`
+			);
+		}
+		// The node's onion send hook swallows a `sendToPeer` failure, so nothing
+		// downstream can tell a delivered frame from one that never left. Refuse
+		// here instead: a lane that counted an undelivered frame as exchanged
+		// would also deny the registry the fall-through it is owed.
+		const introHex = this.sendPath.introductionNodeId.toString('hex');
+		if (!this.peers.isPeerConnected(introHex)) {
+			throw new DirectFundingError(
+				DirectFundingErrorCode.UNREACHABLE,
+				'not connected to the blinded path introduction node'
 			);
 		}
 		// The BOLT 4 form is chosen from the payload alone (1300 or 32768 bytes
@@ -392,6 +416,7 @@ class DfOnionLane extends DfOnionSender implements IDfTransport {
 		factory: DfOnionLaneFactory,
 		opts: {
 			manager: OnionMessageManager;
+			peers: IDfPeerMessaging;
 			pathIdHex: string;
 			requestIdHex: string;
 			sendPath: IBlindedPath;
@@ -399,10 +424,10 @@ class DfOnionLane extends DfOnionSender implements IDfTransport {
 			log: DfTransportLog;
 		}
 	) {
-		super(opts.manager, opts.sendPath, opts.replyPath, opts.log);
+		super(opts.manager, opts.peers, opts.sendPath, opts.replyPath, opts.log);
 		this.release = factory.claimPath(opts.pathIdHex, {
 			requestIdHex: opts.requestIdHex,
-			sendPath: opts.sendPath,
+			reply: this,
 			deliver: (frame) => {
 				this.exchanged++;
 				deliverIsolated([...this.handlers], frame, (err) =>

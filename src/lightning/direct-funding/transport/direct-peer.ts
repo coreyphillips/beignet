@@ -39,7 +39,8 @@ import {
 	IDfLaneFactory,
 	IDfOpenContext,
 	IDfPeerMessaging,
-	IDfTransport
+	IDfTransport,
+	isSupportedDfVersion
 } from './types';
 
 const TRANSPORT = 'direct_peer';
@@ -132,6 +133,16 @@ export class DfDirectPeerLaneFactory implements IDfLaneFactory {
 					subtype: msg.subtype
 				});
 			}
+			return;
+		}
+		if (!isSupportedDfVersion(msg.version)) {
+			// The envelope's rule is that a receiver ignores versions it does not
+			// speak. A version 2 frame reaching a version 1 handler would be read
+			// under the wrong layout, so it stops here, named.
+			this.drop(DfDropReason.UNSUPPORTED_VERSION, {
+				pubkey: msg.peerPubkey,
+				version: msg.version
+			});
 			return;
 		}
 		if (msg.payload.length > DF_MAX_FRAME_BYTES) {

@@ -19,6 +19,7 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { GuardianStartupGate } from '../../src/lightning/recovery/startup-gate';
 import {
+	BEIGNET_CUSTOM_PROTOCOL_VERSION,
 	BeignetCustomSubtype,
 	encodeCustomMessage
 } from '../../src/lightning/message/custom';
@@ -195,14 +196,34 @@ describe('Direct-funding lane 1: direct peer', () => {
 		expect(sunk.length).to.equal(1);
 		expect(claimed.length).to.equal(0);
 
-		// A continuation frame from the same peer belongs to the open lane.
+		// A continuation names no request, so the open lane AND the session the
+		// offer just started both get a look; each drops what it cannot open.
+		// Giving it to the payer lane alone starved the receiving session.
 		payer.deliver({
 			peerPubkey: receiver.id,
 			subtype: RECEIPT,
 			payload: continuationFrame()
 		});
 		expect(claimed.length).to.equal(1);
+		expect(sunk.length).to.equal(2);
 		lane!.close();
+	});
+
+	it('drops a frame in a protocol version it does not speak', () => {
+		const recorder = recordingLog();
+		const factory = new DfDirectPeerLaneFactory(payer, recorder.log);
+		const seen: IDfInboundFrame[] = [];
+		factory.attachInbound((f) => seen.push(f));
+		payer.deliver({
+			peerPubkey: receiver.id,
+			version: BEIGNET_CUSTOM_PROTOCOL_VERSION + 1,
+			subtype: OFFER,
+			payload: openingFrame(Buffer.alloc(16, 1))
+		});
+		expect(seen).to.deep.equal([]);
+		expect(recorder.reasons()).to.deep.equal([
+			DfDropReason.UNSUPPORTED_VERSION
+		]);
 	});
 
 	it('drops a frame nothing is listening for, and says so', () => {
@@ -567,6 +588,27 @@ describe('Direct-funding lane 3: blind relay', () => {
 			DfDropReason.MALFORMED_RELAY_FRAME
 		]);
 	});
+
+	it('drops a wrapper in a protocol version it does not speak', () => {
+		const recorder = recordingLog();
+		const factory = new DfRelayLaneFactory(receiver, recorder.log);
+		const seen: IDfInboundFrame[] = [];
+		factory.attachInbound((f) => seen.push(f));
+		receiver.deliver({
+			peerPubkey: lsp.id,
+			version: BEIGNET_CUSTOM_PROTOCOL_VERSION + 1,
+			subtype: RELAY,
+			payload: encodeDfRelayFrame({
+				from: Buffer.from(payer.id, 'hex'),
+				subtype: OFFER,
+				payload: openingFrame(Buffer.alloc(16, 1))
+			})
+		});
+		expect(seen).to.deep.equal([]);
+		expect(recorder.reasons()).to.deep.equal([
+			DfDropReason.UNSUPPORTED_VERSION
+		]);
+	});
 });
 
 describe('Direct-funding relay server (defect D29)', () => {
@@ -776,6 +818,53 @@ describe('Direct-funding relay server (defect D29)', () => {
 		const written = JSON.stringify(recorder.lines);
 		expect(written).to.not.include(stranger.id);
 		expect(written).to.include(payer.id);
+		forwarder.stop();
+	});
+
+	it('never writes the target into a failed forward', () => {
+		// The connected check passes and the send still fails: a disconnect in
+		// between, or the outbound recovery gate. Both errors name the target,
+		// which would put one exchange's two endpoints on the same log line.
+		const recorder = recordingLog();
+		const racing: IDfPeerMessaging = {
+			nodeIdHex: () => lsp.id,
+			isPeerConnected: () => true,
+			connectPeer: async () => undefined,
+			onCustomMessage: (cb) => lsp.onCustomMessage(cb),
+			sendCustomMessage: (to): void => {
+				throw new Error(`Not connected to peer ${to}`);
+			}
+		};
+		const forwarder = new DfRelayForwarder(racing, {}, recorder.log);
+		forwarder.start();
+		lsp.deliver({
+			peerPubkey: payer.id,
+			subtype: RELAY,
+			payload: originator(receiver)
+		});
+		expect(recorder.reasons()).to.deep.equal([
+			DfDropReason.RELAY_FORWARD_FAILED
+		]);
+		const written = JSON.stringify(recorder.lines);
+		expect(written).to.not.include(receiver.id);
+		expect(written).to.include(payer.id);
+		forwarder.stop();
+	});
+
+	it('refuses to forward a wrapper in a version it cannot re-encode', () => {
+		const recorder = recordingLog();
+		const forwarder = new DfRelayForwarder(lsp, {}, recorder.log);
+		forwarder.start();
+		lsp.deliver({
+			peerPubkey: payer.id,
+			version: BEIGNET_CUSTOM_PROTOCOL_VERSION + 1,
+			subtype: RELAY,
+			payload: originator(receiver)
+		});
+		expect(lsp.sent.length).to.equal(0);
+		expect(recorder.reasons()).to.deep.equal([
+			DfDropReason.UNSUPPORTED_VERSION
+		]);
 		forwarder.stop();
 	});
 
