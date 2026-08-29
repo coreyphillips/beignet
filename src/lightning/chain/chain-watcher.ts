@@ -197,14 +197,21 @@ interface IWatchedOutput {
 	 * reported (or by the eviction branch, which reports on its own).
 	 */
 	spendUnverified?: boolean;
+	/**
+	 * Spend-scan arbitration for this outpoint (issue #625). Overlapping scans
+	 * are routine (a script-hash notification and the 60s sweep each start one),
+	 * and each carries a history it fetched before its awaits, so a scan that
+	 * finishes must know whether a fresher one has already spoken.
+	 *
+	 * `nextScanTicket` is the dispenser; a scan takes the next value before its
+	 * first await. `appliedScanTicket` is the newest scan that ran to
+	 * completion. The funding side keeps the equivalent per channel in
+	 * `channelSpendScans`; a generic watch is already one outpoint, so the
+	 * counters live on the entry and die with it.
+	 */
+	nextScanTicket: number;
+	appliedScanTicket: number;
 }
-
-/**
- * Confirmations after which a spend is treated as irreversible and its watch may be
- * torn down. A reorg deeper than this is out of scope for any practical LN threat
- * model (matches the monitor's IRREVOCABLY_RESOLVED depth).
- */
-const SPEND_FINALITY_DEPTH = 100;
 
 /**
  * Separates a pre-splice spend watch's registry key from the plain channelId
@@ -965,6 +972,8 @@ export class ChainWatcher extends EventEmitter {
 			scriptHash,
 			spendTxid,
 			spendHeight,
+			nextScanTicket: 0,
+			appliedScanTicket: 0,
 			// A seeded spend is recorded state, not something this watcher
 			// saw: the monitor's finality clock stays parked until the first
 			// live check confirms it (issue #576).
@@ -1835,10 +1844,10 @@ export class ChainWatcher extends EventEmitter {
 			ignoredSpend !== null &&
 			this.currentBlockHeight > 0 &&
 			// The monitor's own boundary, `blockHeight - confirmationHeight >=
-			// IRREVOCABLE_DEPTH` (chain-monitor.ts, OUTPUT_RESOLVED), and NOT
-			// the `+ 1` form the watchedOutputs teardown uses: that one retires
-			// a block EARLY, which for a breach watch means going blind for the
-			// last block before the spend is irrevocable.
+			// IRREVOCABLE_DEPTH` (chain-monitor.ts, OUTPUT_RESOLVED). A `+ 1`
+			// depth here would retire a block EARLY, which for a breach watch
+			// means going blind for the last block before the spend is
+			// irrevocable.
 			this.currentBlockHeight - ignoredSpend.height >= IRREVOCABLE_DEPTH
 		) {
 			// Confirm it really spent THIS outpoint before acting on it. The
@@ -2082,10 +2091,17 @@ export class ChainWatcher extends EventEmitter {
 		const watched = this.watchedOutputs.get(key);
 		if (!watched) return;
 
+		// Both taken before the first await, so they date this scan's evidence.
+		// The tip matters as much as the ticket: a header arriving mid-scan must
+		// not be counted as depth a history fetched before it can vouch for.
+		const ticket = ++watched.nextScanTicket;
+		const tipAtScan = this.currentBlockHeight;
+
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
 		if (
 			!this.isCurrentGeneration(generation) ||
-			this.watchedOutputs.get(key) !== watched
+			this.watchedOutputs.get(key) !== watched ||
+			watched.appliedScanTicket > ticket
 		) {
 			return;
 		}
@@ -2104,7 +2120,8 @@ export class ChainWatcher extends EventEmitter {
 			const rawTx = await this.backend.getTransaction(entry.txid);
 			if (
 				!this.isCurrentGeneration(generation) ||
-				this.watchedOutputs.get(key) !== watched
+				this.watchedOutputs.get(key) !== watched ||
+				watched.appliedScanTicket > ticket
 			) {
 				return;
 			}
@@ -2146,11 +2163,24 @@ export class ChainWatcher extends EventEmitter {
 				);
 				this.emit('output:spent', watched.txid, watched.outputIndex);
 			}
+			watched.appliedScanTicket = ticket;
 			// Retain the watch until the spend is buried deep enough to be final, so a
 			// reorg before then re-fires this check and is caught by the branch below.
+			// The boundary is the monitor's own, `blockHeight - confirmationHeight >=
+			// IRREVOCABLE_DEPTH` (chain-monitor.ts, OUTPUT_RESOLVED): retiring on a
+			// `+ 1` depth drops the watch a block early, and a reorg in that gap has
+			// nothing left to report the eviction (issue #625).
+			//
+			// Retirement is the one verdict that cannot be corrected later, because
+			// the deleted entry retires every other scan at the map-identity guard
+			// above. So only the newest scan may take it, on the tip its own history
+			// was fetched against. A later scan still in flight holds the fresher
+			// answer and makes this same decision when it lands; deferring costs a
+			// re-check, retiring early loses the eviction for good.
 			if (
-				this.currentBlockHeight > 0 &&
-				this.currentBlockHeight - spend.height + 1 >= SPEND_FINALITY_DEPTH
+				tipAtScan > 0 &&
+				tipAtScan - spend.height >= IRREVOCABLE_DEPTH &&
+				ticket === watched.nextScanTicket
 			) {
 				this.watchedOutputs.delete(key);
 			}
@@ -2170,5 +2200,6 @@ export class ChainWatcher extends EventEmitter {
 			);
 			this.emit('output:unspent', watched.txid, watched.outputIndex);
 		}
+		watched.appliedScanTicket = ticket;
 	}
 }

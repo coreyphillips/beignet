@@ -3225,8 +3225,8 @@ export class LightningNode extends EventEmitter {
 			// mempool sighting — and the spend can still be replaced (reorg, or a
 			// conflicting revoked commitment winning the race). The monitor's
 			// commitment-swap handling needs the watch alive to see the
-			// replacement; the watcher retires spends itself after
-			// SPEND_FINALITY_DEPTH, and 'channel:resolved' cleans up below.
+			// replacement; the watcher retires spends itself at IRREVOCABLE_DEPTH,
+			// and 'channel:resolved' cleans up below.
 			this.emit('channel:closed', { channelId });
 			this.emitStructuredLog('channel', 'closed', {
 				channelId: channelId.toString('hex')
