@@ -18567,6 +18567,16 @@ export class Channel {
 	}
 
 	/**
+	 * Our tx_abort of a RECORDED v2 open has left and the peer's echo has not
+	 * come back. Nothing is torn down yet, and a disconnect forgets the abort
+	 * and resumes the attempt, so a caller that needs the negotiation actually
+	 * released cannot read the dispatch as one (issue #612).
+	 */
+	isV2AbortAwaitingEcho(): boolean {
+		return this._v2AbortPending;
+	}
+
+	/**
 	 * Abort the dual-funding session.
 	 */
 	abortDualFunding(reason?: string): ChannelAction[] {

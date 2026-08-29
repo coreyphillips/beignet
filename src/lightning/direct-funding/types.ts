@@ -262,6 +262,15 @@ export interface IDfRequestRecord {
 	/** Milliseconds since epoch, matching the envelope's u48. */
 	expiresAt: number;
 	/**
+	 * The amount the envelope fixed, as decimal satoshis, when it fixed one.
+	 * Persisted rather than derived from the envelope the payer holds: the
+	 * envelope is signed but it is the PAYER's copy, and the offer that arrives
+	 * carries only an amount of the payer's choosing. Without the receiver's own
+	 * record of it a fixed-amount request can be settled for any amount inside
+	 * the global bounds.
+	 */
+	amountSat?: string;
+	/**
 	 * Set when the receipt preimage was revealed. The record is TOMBSTONED,
 	 * not deleted: the encryption key has to survive so a payer whose receipt
 	 * frame was lost can re-send its offer and be replayed the recorded

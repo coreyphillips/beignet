@@ -113,6 +113,10 @@ async function captureUnhandledRejections(
 	return seen;
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 describe('Direct funding receiver: admission (issue #612)', () => {
 	it('declines an offer when no liquidity peer is configured', async () => {
 		const h = harness();
@@ -190,6 +194,86 @@ describe('Direct funding receiver: admission (issue #612)', () => {
 			accepted: false,
 			reason: 'this request has already been paid'
 		});
+		expect(engine.inflightCount()).to.equal(0);
+		engine.stop();
+	});
+
+	it('serves a fixed-amount request only at the amount it fixed', async () => {
+		const node = new FakeDfNode();
+		const engine = new DirectFundingReceiver(node, {
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		const record = node.mintRequest(undefined, 100_000n);
+		const coin = makeCoin('p2wpkh', 200_000);
+		node.publish(coin);
+
+		const underpayer = new FakePayerLane(record, 'under-lane');
+		engine.handleFrame(
+			underpayer.offerFrame(buildOffer(record, coin, { amountSat: 50_000n }))
+		);
+		await flush();
+		expect(node.opens).to.have.length(0);
+		expect(decodeDfOfferAck(underpayer.bodiesOf(ACK)[0]).reason).to.equal(
+			'this request must be paid exactly 100000 sat'
+		);
+
+		const payer = new FakePayerLane(record, 'exact-lane');
+		engine.handleFrame(
+			payer.offerFrame(buildOffer(record, coin, { amountSat: 100_000n }))
+		);
+		await flush();
+		expect(node.opens).to.have.length(1);
+		expect(node.opens[0].params.fundingSatoshis).to.equal(100_000n);
+		engine.stop();
+	});
+
+	/**
+	 * An expired record answers every attempt question as if the request were
+	 * untouched and takes no busy mark, so without an expiry re-read two offers
+	 * awaiting the chain across the same expiry would each open a channel for
+	 * one payment.
+	 */
+	it('declines both offers when the request expires under their chain lookups', async () => {
+		let clock = Date.now();
+		const node = new FakeDfNode(undefined, () => clock);
+		const record = node.mintRequest(60_000);
+		const firstCoin = makeCoin();
+		const secondCoin = makeCoin();
+		node.publish(firstCoin);
+		node.publish(secondCoin);
+		const held = new Map<string, () => void>();
+		const getTransaction = node.chain.getTransaction;
+		node.chain.getTransaction = (txid): Promise<Buffer> =>
+			new Promise((resolve) => {
+				held.set(txid, () => resolve(getTransaction(txid)));
+			});
+		const engine = new DirectFundingReceiver(node, {
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+
+		const first = new FakePayerLane(record, 'first-lane');
+		const second = new FakePayerLane(record, 'second-lane');
+		engine.handleFrame(first.offerFrame(buildOffer(record, firstCoin)));
+		engine.handleFrame(
+			second.offerFrame(buildOffer(record, secondCoin, { amountSat: 51_000n }))
+		);
+		await flush();
+		expect(held.size).to.equal(2);
+
+		clock += 120_000;
+		for (const release of held.values()) release();
+		await flush(8);
+
+		expect(node.opens).to.have.length(0);
+		for (const payer of [first, second]) {
+			expect(decodeDfOfferAck(payer.bodiesOf(ACK)[0]).reason).to.equal(
+				'this request has expired'
+			);
+		}
 		expect(engine.inflightCount()).to.equal(0);
 		engine.stop();
 	});
@@ -952,7 +1036,12 @@ describe('Direct funding receiver: the exchange (issue #612)', () => {
 
 	it('keeps the witness obligation open when the splice cannot be aborted', async () => {
 		const h = harness(
-			{ allowSplice: true, negotiationTimeoutMs: 5_000, witnessTimeoutMs: 5 },
+			{
+				allowSplice: true,
+				negotiationTimeoutMs: 5_000,
+				witnessTimeoutMs: 5,
+				outpointCooldownMs: 5
+			},
 			{ authenticatedPeer: 'payer-node-id' }
 		);
 		h.node.spliceChannel = crypto.randomBytes(32);
@@ -969,6 +1058,40 @@ describe('Direct funding receiver: the exchange (issue #612)', () => {
 		// Delivery is the only exit the channel left, so the payer is not told
 		// the exchange is over.
 		expect(h.acks().filter((a) => !a.accepted)).to.be.empty;
+		const competingPayer = new FakePayerLane(
+			h.node.mintRequest(),
+			'competing-lane',
+			'payer-node-id'
+		);
+		const competing = buildOffer(competingPayer.requestRecord, h.coin, {
+			amountSat: 60_000n
+		});
+		h.engine.handleFrame(competingPayer.offerFrame(competing));
+		await flush();
+		expect(h.node.splices).to.have.length(1);
+		expect(decodeDfOfferAck(competingPayer.bodiesOf(ACK)[0]).reason).to.equal(
+			'input already committed to another offer'
+		);
+		// Nor is the REQUEST free again: the funding still owed a witness can
+		// complete and reveal its receipt, so a second coin cannot buy a second
+		// one against the same payment.
+		const otherCoin = makeCoin('p2wpkh', 400_000);
+		h.node.publish(otherCoin);
+		const sameRequest = new FakePayerLane(
+			h.payer.requestRecord,
+			'same-request-lane',
+			'payer-node-id'
+		);
+		h.engine.handleFrame(
+			sameRequest.offerFrame(
+				buildOffer(h.payer.requestRecord, otherCoin, { amountSat: 70_000n })
+			)
+		);
+		await flush();
+		expect(h.node.splices).to.have.length(1);
+		expect(decodeDfOfferAck(sameRequest.bodiesOf(ACK)[0]).reason).to.equal(
+			'request already has an active funding attempt'
+		);
 
 		h.engine.handleFrame(
 			h.payer.witnessFrame(h.offer.offerId, [Buffer.alloc(64, 3)])
@@ -980,6 +1103,34 @@ describe('Direct funding receiver: the exchange (issue #612)', () => {
 });
 
 describe('Direct funding receiver: unwind (issue #612)', () => {
+	/**
+	 * A tx_abort of a recorded v2 attempt tears nothing down until the peer
+	 * echoes it, and a disconnect before that resumes the negotiation. So the
+	 * funding is still live and the payer is not told otherwise.
+	 */
+	it('keeps the witness obligation open when the open abort awaits its echo', async () => {
+		const h = harness({
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5,
+			outpointCooldownMs: 5
+		});
+		h.node.abortPending = true;
+		await h.sendOffer();
+		h.node.completeNegotiation(h.coin, h.offer, { witnessesFilled: true });
+		await flush();
+		expect(h.payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		await flush(20);
+		expect(h.node.aborts.map((a) => a.kind)).to.deep.equal(['open']);
+		expect(h.acks().filter((a) => !a.accepted)).to.be.empty;
+
+		h.engine.handleFrame(
+			h.payer.witnessFrame(h.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(h.node.witnesses).to.have.length(1);
+		expect(h.payer.bodiesOf(RECEIPT)).to.have.length(1);
+	});
+
 	it('unwinds the open when the negotiation never completes', async () => {
 		const h = harness({ negotiationTimeoutMs: 5 });
 		await h.sendOffer();
@@ -1074,6 +1225,45 @@ describe('Direct funding receiver: unwind (issue #612)', () => {
 		expect(h.node.aborts).to.have.length(0);
 	});
 
+	it('keeps an abandoned open timer from cancelling an outpoint retry', async () => {
+		const node = new FakeDfNode();
+		const engine = new DirectFundingReceiver(node, {
+			negotiationTimeoutMs: 400,
+			witnessTimeoutMs: 5_000,
+			outpointCooldownMs: 20,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		const coin = makeCoin('p2wpkh', 500_000);
+		node.publish(coin);
+		const firstPayer = new FakePayerLane(node.mintRequest(), 'first-lane');
+		node.openThrows = new Error('funding provider unavailable');
+		engine.handleFrame(
+			firstPayer.offerFrame(buildOffer(firstPayer.requestRecord, coin))
+		);
+		await flush();
+
+		node.openThrows = null;
+		await sleep(200);
+		const secondPayer = new FakePayerLane(node.mintRequest(), 'second-lane');
+		const second = buildOffer(secondPayer.requestRecord, coin, {
+			amountSat: 60_000n
+		});
+		engine.handleFrame(secondPayer.offerFrame(second));
+		await flush();
+		expect(node.opens).to.have.length(1);
+
+		await sleep(250);
+		node.completeNegotiation(coin, second);
+		await flush();
+		expect(secondPayer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.handleFrame(
+			secondPayer.witnessFrame(second.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		engine.stop();
+	});
+
 	it('releases the slot without leaking when the splice throws', async () => {
 		const channelId = crypto.randomBytes(32);
 		const h = harness(
@@ -1113,6 +1303,56 @@ describe('Direct funding receiver: unwind (issue #612)', () => {
 		expect(h.lastAck()?.reason).to.contain('splice is unavailable');
 		expect(h.node.aborts).to.have.length(0);
 	});
+
+	it('keeps an abandoned splice timer from cancelling an outpoint retry', async () => {
+		const node = new FakeDfNode();
+		const engine = new DirectFundingReceiver(node, {
+			allowSplice: true,
+			negotiationTimeoutMs: 400,
+			witnessTimeoutMs: 5_000,
+			outpointCooldownMs: 20,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		node.spliceChannel = crypto.randomBytes(32);
+		node.trustedPayers.add('payer-node-id');
+		const coin = makeCoin('p2wpkh', 500_000);
+		node.publish(coin);
+		const firstPayer = new FakePayerLane(
+			node.mintRequest(),
+			'first-lane',
+			'payer-node-id'
+		);
+		node.spliceError = 'splice is unavailable';
+		engine.handleFrame(
+			firstPayer.offerFrame(buildOffer(firstPayer.requestRecord, coin))
+		);
+		await flush();
+
+		node.spliceError = null;
+		await sleep(200);
+		const secondPayer = new FakePayerLane(
+			node.mintRequest(),
+			'second-lane',
+			'payer-node-id'
+		);
+		const second = buildOffer(secondPayer.requestRecord, coin, {
+			amountSat: 60_000n
+		});
+		engine.handleFrame(secondPayer.offerFrame(second));
+		await flush();
+		expect(node.splices).to.have.length(2);
+
+		await sleep(250);
+		node.completeSpliceNegotiation(coin, second, 200_000n);
+		await flush();
+		expect(secondPayer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.handleFrame(
+			secondPayer.witnessFrame(second.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		engine.stop();
+	});
 });
 
 describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
@@ -1120,10 +1360,14 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 		authenticated?: boolean;
 		trusted?: boolean;
 		zeroConf?: boolean;
+		allowZeroConf?: boolean;
 	}): Promise<FakeDfNode> {
 		const peer = 'payer-node-id';
 		const h = harness(
-			{ negotiationTimeoutMs: 5_000 },
+			{
+				negotiationTimeoutMs: 5_000,
+				allowZeroConf: opts.allowZeroConf ?? true
+			},
 			{ authenticatedPeer: opts.authenticated ? peer : undefined }
 		);
 		if (opts.trusted) h.node.trustedPayers.add(peer);
@@ -1148,6 +1392,22 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 			zeroConf: true
 		});
 		expect(allowed.opens[0].params.trusted).to.equal(true);
+	});
+
+	/**
+	 * The node's zero-conf trust in the liquidity peer authorizes an open funded
+	 * with the operator's OWN confirmed coins. Putting a stranger's
+	 * double-spendable input under a channel the counterparty treats as live at
+	 * depth zero is a different risk, and needs its own consent.
+	 */
+	it('never asks for zero-conf while direct funding has not been allowed it', async () => {
+		const node = await open({
+			authenticated: true,
+			trusted: true,
+			zeroConf: true,
+			allowZeroConf: false
+		});
+		expect(node.opens[0].params.trusted).to.equal(undefined);
 	});
 
 	it('keeps an anonymous payer on the new-channel path even with a channel to splice', async () => {

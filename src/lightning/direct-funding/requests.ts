@@ -27,13 +27,15 @@ import {
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	DF_DEFAULT_REQUEST_TTL_MS,
+	DF_MAX_AMOUNT_SAT,
 	DF_MAX_REQUEST_TTL_MS,
 	DF_PATH_SECRET_BYTES,
 	DF_PREIMAGE_BYTES,
 	DF_REQUEST_ID_BYTES,
 	DirectFundingError,
 	DirectFundingErrorCode,
-	IDfRequestRecord
+	IDfRequestRecord,
+	malformed
 } from './types';
 
 /** Wallet-data key holding the whole outstanding set. */
@@ -182,14 +184,24 @@ export class DirectFundingRequestStore {
 	 * the fork had no cap at all and every mint persists a secret record), and
 	 * NOT_PERSISTED when the write fails, because an envelope whose secrets did
 	 * not reach storage must never be handed out.
+	 *
+	 * `amountSat` fixes the amount, and must be the same value the envelope is
+	 * minted with. It is recorded here because this is the copy the receiver
+	 * checks an arriving offer against; the envelope's is the payer's.
 	 */
-	mint(opts: { ttlMs?: number } = {}): IDfRequestRecord {
+	mint(opts: { ttlMs?: number; amountSat?: bigint } = {}): IDfRequestRecord {
 		this.sweep();
 		if (this.byHash.size >= this.maxOutstanding) {
 			throw new DirectFundingError(
 				DirectFundingErrorCode.TOO_MANY_REQUESTS,
 				`${this.byHash.size} direct-funding requests already outstanding`
 			);
+		}
+		if (
+			opts.amountSat !== undefined &&
+			(opts.amountSat <= 0n || opts.amountSat > DF_MAX_AMOUNT_SAT)
+		) {
+			throw malformed(`amount_sat out of range: ${opts.amountSat}`);
 		}
 		const ttl = Math.min(opts.ttlMs ?? this.ttlMs, DF_MAX_REQUEST_TTL_MS);
 		const preimage = crypto.randomBytes(DF_PREIMAGE_BYTES);
@@ -206,7 +218,10 @@ export class DirectFundingRequestStore {
 			onionPathSecretHex: crypto
 				.randomBytes(DF_PATH_SECRET_BYTES)
 				.toString('hex'),
-			expiresAt: this.now() + ttl
+			expiresAt: this.now() + ttl,
+			...(opts.amountSat !== undefined
+				? { amountSat: opts.amountSat.toString() }
+				: {})
 		};
 		this.index(record);
 		if (!this.persist()) {
@@ -328,16 +343,41 @@ export class DirectFundingRequestStore {
 	 * A failed write is logged nowhere and does not throw, unlike mint's: the
 	 * attempt is real either way, and refusing a payment over a storage hiccup
 	 * costs more than the restart-crossing guard it loses.
+	 *
+	 * False means there is no live record to charge, which is the request
+	 * expiring between an admission's checks and its insert. The caller must
+	 * unwind rather than run a session nothing can mark busy: a request past its
+	 * expiry answers every attempt question with zero, so two offers would
+	 * otherwise each believe they hold its only funding session.
 	 */
 	beginAttempt(
 		receiptHashHex: string,
 		offerIdHex: string,
 		slotExpiresAt: number
-	): void {
+	): boolean {
 		const record = this.byReceiptHash(receiptHashHex);
-		if (!record) return;
+		if (!record) return false;
 		record.attempts = (record.attempts ?? 0) + 1;
 		record.activeAttempt = { offerIdHex, expiresAt: slotExpiresAt };
+		this.persist();
+		return true;
+	}
+
+	/**
+	 * Hold the busy mark past the session that took it, for a funding the
+	 * channel would not release: that funding can still complete on a late
+	 * witness, so the request has not become free for another one. Extends only,
+	 * and charges no second attempt.
+	 */
+	extendAttempt(
+		receiptHashHex: string,
+		offerIdHex: string,
+		expiresAt: number
+	): void {
+		const record = this.byReceiptHash(receiptHashHex);
+		if (!record || record.activeAttempt?.offerIdHex !== offerIdHex) return;
+		if (record.activeAttempt.expiresAt >= expiresAt) return;
+		record.activeAttempt.expiresAt = expiresAt;
 		this.persist();
 	}
 
@@ -438,6 +478,17 @@ function isWellFormedRecord(entry: unknown): entry is IDfRequestRecord {
 		isHex(r.encryptionPrivateKeyHex, 32) &&
 		isHex(r.onionPathSecretHex, DF_PATH_SECRET_BYTES) &&
 		typeof r.expiresAt === 'number' &&
-		Number.isFinite(r.expiresAt)
+		Number.isFinite(r.expiresAt) &&
+		// A fixed amount that did not come back intact must not read as "any
+		// amount will do": the record is dropped and the request goes unpayable,
+		// which is the recoverable half of that choice.
+		(r.amountSat === undefined || isPositiveDecimal(r.amountSat))
 	);
+}
+
+function isPositiveDecimal(value: unknown): boolean {
+	if (typeof value !== 'string' || !/^[1-9][0-9]{0,17}$/.test(value)) {
+		return false;
+	}
+	return BigInt(value) <= DF_MAX_AMOUNT_SAT;
 }

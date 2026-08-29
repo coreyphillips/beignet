@@ -110,6 +110,8 @@ interface ISetup {
 	acceptor: Channel;
 	acceptorActions: unknown[];
 	extPrevTx: bitcoin.Transaction;
+	extPriv: Buffer;
+	extPub: Buffer;
 }
 
 /**
@@ -157,7 +159,8 @@ function driveToOwedWitness(): ISetup {
 		new ChannelSigner(acceptorFundingPriv)
 	);
 
-	const extPub = getPublicKey(crypto.randomBytes(32));
+	const extPriv = crypto.randomBytes(32);
+	const extPub = getPublicKey(extPriv);
 	const extScript = bitcoin.payments.p2wpkh({ pubkey: extPub }).output!;
 	const extPrevTx = new bitcoin.Transaction();
 	extPrevTx.version = 2;
@@ -281,7 +284,62 @@ function driveToOwedWitness(): ISetup {
 	expect(findError(acceptorActions)).to.equal(null);
 	opener.handleCommitmentSigned(decodeCommitmentSignedMessage(acceptorCommit!));
 
-	return { acceptor, acceptorActions, extPrevTx };
+	return { acceptor, acceptorActions, extPrevTx, extPriv, extPub };
+}
+
+/** The third party's witness over the negotiated transaction. */
+function signExternalInput(setup: ISetup): Buffer[] {
+	const pending = setup.acceptor.getPendingV2FundingTx()!;
+	const owed = pending.owedExternalInputs[0];
+	const sighash = pending.tx.hashForWitnessV0(
+		owed.inputIndex,
+		bitcoin.payments.p2pkh({ pubkey: setup.extPub }).output!,
+		EXT_UTXO_SATS,
+		bitcoin.Transaction.SIGHASH_ALL
+	);
+	return [
+		bitcoin.script.signature.encode(
+			Buffer.from(ecc.sign(sighash, setup.extPriv)),
+			bitcoin.Transaction.SIGHASH_ALL
+		),
+		setup.extPub
+	];
+}
+
+/**
+ * A ChannelManager holding the acceptor from `driveToOwedWitness`, resident
+ * under its temporary id the way a live v2 exchange keeps it.
+ */
+function managerHolding(
+	acceptor: Channel,
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	barrier?: any
+): ChannelManager {
+	const fundingPriv = crypto.randomBytes(32);
+	const seed = crypto.randomBytes(32);
+	const mgr = new ChannelManager({
+		localBasepoints: makeBasepoints(getPublicKey(fundingPriv), seed),
+		localPerCommitmentSeed: seed,
+		localFundingPrivkey: fundingPriv,
+		htlcBasepointSecret: crypto.randomBytes(32),
+		...(barrier ? { durabilityBarrier: barrier } : {})
+	});
+	mgr.on('error', () => {});
+	const tempHex = acceptor.getTemporaryChannelId().toString('hex');
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const internals = mgr as any;
+	internals.tempChannels.set(tempHex, acceptor);
+	internals.channelPeers.set(tempHex, getPublicKey(seed).toString('hex'));
+	return mgr;
+}
+
+/** Quorum mode with nothing ever released: the first gated batch parks. */
+function heldQueueBarrier(): unknown {
+	return {
+		enforcing: true,
+		isReleased: (): boolean => false,
+		whenReleased: (): Promise<never> => new Promise(() => undefined)
+	};
 }
 
 // ─────────────── Tests ───────────────
@@ -395,5 +453,78 @@ describe('ChannelManager.createDualFundedChannel dispatch failure (issue #612)',
 		).to.throw('transport is gone');
 		expect(mgr.listChannels()).to.have.length(0);
 		expect(mgr.getChannelsByPeer(peer)).to.have.length(0);
+	});
+});
+
+describe('ChannelManager.provideV2ExternalWitness reporting (issue #612)', () => {
+	it('reports a clean release when the tx_signatures reach the wire', () => {
+		const setup = driveToOwedWitness();
+		const mgr = managerHolding(setup.acceptor);
+		const sent: number[] = [];
+		mgr.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
+
+		const result = mgr.provideV2ExternalWitness(
+			setup.acceptor.getChannelId()!,
+			Buffer.from(setup.extPrevTx.getHash()),
+			0,
+			signExternalInput(setup)
+		);
+		expect(result.ok).to.equal(true);
+		expect(result.sendsWithheld).to.equal(false);
+		expect(sent).to.include(MessageType.TX_SIGNATURES);
+	});
+
+	/**
+	 * The obligation to the input's owner is discharged by the tx_signatures,
+	 * and a batch the quorum barrier parked has not sent them: a refused
+	 * release drops the held bytes outright. `ok` alone would tell a caller
+	 * holding a receipt for that owner to hand it over.
+	 */
+	it('reports a witness whose tx_signatures the barrier parked', () => {
+		const setup = driveToOwedWitness();
+		const mgr = managerHolding(setup.acceptor, heldQueueBarrier());
+		const sent: number[] = [];
+		mgr.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
+
+		const result = mgr.provideV2ExternalWitness(
+			setup.acceptor.getChannelId()!,
+			Buffer.from(setup.extPrevTx.getHash()),
+			0,
+			signExternalInput(setup)
+		);
+		expect(result.ok, 'the channel took the witness').to.equal(true);
+		expect(result.sendsWithheld, 'and nothing left').to.equal(true);
+		expect(sent).to.not.include(MessageType.TX_SIGNATURES);
+	});
+});
+
+describe('ChannelManager.abortDualFundedOpen (issue #612)', () => {
+	/**
+	 * A RECORDED attempt tears down only on the peer's echo, and a disconnect
+	 * before it resumes the negotiation. Reporting that as a release would let
+	 * a host tell a third party the exchange is over while its funding is live.
+	 */
+	it('reports a tx_abort still awaiting the peer echo as pending', () => {
+		const setup = driveToOwedWitness();
+		const mgr = managerHolding(setup.acceptor);
+		const sent: number[] = [];
+		mgr.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
+
+		const result = mgr.abortDualFundedOpen(
+			setup.acceptor.getChannelId()!,
+			'direct funding session failed'
+		);
+		expect(result.ok).to.equal(true);
+		expect(result.pending).to.equal(true);
+		expect(sent).to.include(MessageType.TX_ABORT);
+		expect(setup.acceptor.isV2AbortAwaitingEcho()).to.equal(true);
+		// Nothing is torn down: the peer holds our verified commitment_signed.
+		expect(setup.acceptor.getPendingV2FundingTx()).to.not.equal(null);
 	});
 });

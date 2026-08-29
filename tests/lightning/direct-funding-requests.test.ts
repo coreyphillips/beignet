@@ -89,6 +89,41 @@ describe('Direct funding: outstanding requests', () => {
 		expect(a.swarmSeedHex).to.equal(undefined);
 	});
 
+	/**
+	 * The envelope's amount is the payer's copy, and the offer that arrives
+	 * carries an amount of the payer's choosing. A fixed-amount request is only
+	 * enforceable against a figure the receiver kept, so it has to be durable
+	 * and it has to survive a restart intact or not at all.
+	 */
+	it('records a fixed amount and keeps it across a restart', () => {
+		const first = harness();
+		const record = first.store.mint({ amountSat: 100_000n });
+		expect(record.amountSat).to.equal('100000');
+		expect(first.store.mint().amountSat).to.equal(undefined);
+		expect(errorCode(() => first.store.mint({ amountSat: 0n }))).to.equal(
+			DirectFundingErrorCode.MALFORMED
+		);
+
+		const second = harness({}, { wallet: first.wallet, clock: first.clock });
+		expect(second.store.restore()).to.equal(2);
+		expect(second.store.byReceiptHash(record.receiptHash)?.amountSat).to.equal(
+			'100000'
+		);
+	});
+
+	it('drops a restored record whose fixed amount did not survive', () => {
+		const first = harness();
+		const record = first.store.mint({ amountSat: 100_000n });
+		const rows = JSON.parse(first.wallet.get(DF_REQUESTS_STORAGE_KEY)!);
+		rows[0].amountSat = 'not-a-number';
+		first.wallet.set(DF_REQUESTS_STORAGE_KEY, JSON.stringify(rows));
+
+		const second = harness({}, { wallet: first.wallet, clock: first.clock });
+		// Unpayable beats payable at any amount.
+		expect(second.store.restore()).to.equal(0);
+		expect(second.store.byReceiptHash(record.receiptHash)).to.equal(null);
+	});
+
 	it('restores across a restart with both indexes rebuilt', () => {
 		const first = harness();
 		const record = first.store.mint();

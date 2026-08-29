@@ -116,7 +116,11 @@ interface IDfFinalTx {
 	sharedInputIndex?: number;
 }
 
-type DfFinalTxWaiter = (final: IDfFinalTx) => void;
+interface DfFinalTxWaiter {
+	final: Promise<IDfFinalTx>;
+	resolve(final: IDfFinalTx): void;
+	cancel(): void;
+}
 
 /**
  * The payer's witnesses as they arrive, buffered.
@@ -217,7 +221,8 @@ export class DirectFundingReceiver extends EventEmitter {
 			sweepIntervalMs: config.sweepIntervalMs ?? DF_RECEIVER_SWEEP_INTERVAL_MS,
 			spliceFeeratePerKw:
 				config.spliceFeeratePerKw ?? DF_DEFAULT_SPLICE_FEERATE_PERKW,
-			allowSplice: config.allowSplice ?? false
+			allowSplice: config.allowSplice ?? false,
+			allowZeroConf: config.allowZeroConf ?? false
 		};
 		this.state = new DfOfferSessions(this.cfg.maxSessions);
 	}
@@ -514,6 +519,16 @@ export class DirectFundingReceiver extends EventEmitter {
 			decline('this request has already been paid');
 			return;
 		}
+		// A request minted for a fixed amount is payable at that amount and no
+		// other. The envelope carries it too, but that copy is the payer's; the
+		// offer arrives with an amount of the payer's choosing, so this is the
+		// only place the receiver's own figure is enforced.
+		if (record.amountSat !== undefined) {
+			if (offer.amountSat !== BigInt(record.amountSat)) {
+				decline(`this request must be paid exactly ${record.amountSat} sat`);
+				return;
+			}
+		}
 
 		// 6. The offer's own fields: identity, amount bounds, sequence, change
 		// script. All free, and all of them things the fork checked late or not
@@ -590,6 +605,16 @@ export class DirectFundingReceiver extends EventEmitter {
 
 		// Re-read what a concurrent admission could have changed while this one
 		// was awaiting the chain.
+		//
+		// Expiry first, and it is not a courtesy: an expired record answers every
+		// question below as if the request were untouched (not tombstoned, no
+		// active attempt, zero attempts) and takes no busy mark, so two offers
+		// that await across the same expiry would each pass and each open a
+		// channel for one payment.
+		if (!this.deps.requests.byReceiptHash(receiptHashHex)) {
+			decline('this request has expired');
+			return;
+		}
 		if (this.deps.requests.isTombstoned(receiptHashHex)) {
 			decline('this request has already been paid');
 			return;
@@ -646,11 +671,22 @@ export class DirectFundingReceiver extends EventEmitter {
 		// per-request lifetime budget and the marker is what stops a duplicate
 		// arriving after a restart from starting a second channel session, and
 		// neither can do its job from memory alone.
-		this.deps.requests.beginAttempt(
-			receiptHashHex,
-			offerIdHex,
-			session.slotExpiresAt
-		);
+		//
+		// A refusal here is the request expiring on the store's clock inside this
+		// block. The session cannot run without the mark (nothing else keeps a
+		// second offer off the same request), so it is unwound outright.
+		if (
+			!this.deps.requests.beginAttempt(
+				receiptHashHex,
+				offerIdHex,
+				session.slotExpiresAt
+			)
+		) {
+			this.state.forget(offerIdHex);
+			this.state.release(outpoint, offerIdHex);
+			decline('this request has expired');
+			return;
+		}
 		// The slot is the session's from here, so the admission guard hands it
 		// over rather than counting a second time for the whole exchange.
 		this.state.endAdmission(offerIdHex);
@@ -777,7 +813,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		// Registered BEFORE the open: a fully synchronous transport runs the
 		// whole negotiation inside openChannelV2, and a waiter installed after
 		// it would already have missed the event.
-		const final = this.awaitFinalTx(
+		const waiter = this.awaitFinalTx(
 			this.v2Waiters,
 			ctx.session.outpoint,
 			this.cfg.negotiationTimeoutMs
@@ -790,22 +826,27 @@ export class DirectFundingReceiver extends EventEmitter {
 					inputs: [input],
 					changeScript: ctx.offer.changeScript
 				},
-				// Zero-conf only for an authenticated, paired payer, on top of
-				// upstream's own two factors (canOpenZeroConfTo and a negotiated
-				// option_zeroconf). An anonymous payer's coin can be double spent
-				// before it confirms, and that risk belongs to the funder; here
-				// the funder is the payer, not the trusted liquidity peer.
-				...(ctx.paired && this.deps.canOpenZeroConfTo(ctx.liquidityPeer)
+				// Zero-conf needs the operator's consent for DIRECT FUNDING
+				// specifically, an authenticated and paired payer, and upstream's
+				// own two factors (canOpenZeroConfTo and a negotiated
+				// option_zeroconf). The first is not redundant with the third:
+				// canOpenZeroConfTo says the operator will open a zero-conf channel
+				// to this peer with its own confirmed coins, and this input is a
+				// stranger's and can be double spent at depth zero. Delegating that
+				// risk to the counterparty is a decision only the operator can make.
+				...(this.cfg.allowZeroConf &&
+				ctx.paired &&
+				this.deps.canOpenZeroConfTo(ctx.liquidityPeer)
 					? { trusted: true }
 					: {})
 			});
 		} catch (err) {
-			this.v2Waiters.delete(ctx.session.outpoint);
-			void final.catch(() => undefined);
+			void waiter.final.catch(() => undefined);
+			waiter.cancel();
 			throw err;
 		}
 		return {
-			final,
+			final: waiter.final,
 			unwind: (): boolean => this.unwindFunding(false, handle.channelId(), ctx)
 		};
 	}
@@ -815,7 +856,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		channelId: Buffer,
 		input: ISpliceWalletInput
 	): { final: Promise<IDfFinalTx>; unwind: () => boolean } {
-		const final = this.awaitFinalTx(
+		const waiter = this.awaitFinalTx(
 			this.spliceWaiters,
 			ctx.session.outpoint,
 			this.cfg.negotiationTimeoutMs
@@ -833,16 +874,16 @@ export class DirectFundingReceiver extends EventEmitter {
 				this.cfg.spliceFeeratePerKw
 			);
 		} catch (err) {
-			this.spliceWaiters.delete(ctx.session.outpoint);
-			void final.catch(() => undefined);
+			void waiter.final.catch(() => undefined);
+			waiter.cancel();
 			throw err;
 		}
 		if (!result.ok) {
-			this.spliceWaiters.delete(ctx.session.outpoint);
-			void final.catch(() => undefined);
+			void waiter.final.catch(() => undefined);
+			waiter.cancel();
 			throw new Error(`splice initiation failed: ${result.error}`);
 		}
-		return { final, unwind };
+		return { final: waiter.final, unwind };
 	}
 
 	/**
@@ -1025,6 +1066,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			}
 			session.onWitness = undefined;
 			session.committed = true;
+			this.state.release(session.outpoint, session.offerIdHex);
 			try {
 				this.sendReceipt(ctx, final);
 			} catch (err) {
@@ -1082,22 +1124,38 @@ export class DirectFundingReceiver extends EventEmitter {
 
 	// ─────────────── Terminal outcomes ───────────────
 
-	private finish(ctx: IDfSessionContext, ok: boolean): void {
+	private finish(
+		ctx: IDfSessionContext,
+		ok: boolean,
+		hasWitnessObligation = false
+	): void {
 		const { session } = ctx;
 		session.inflight = false;
 		session.terminal = true;
 		session.onWitness = undefined;
 		this.v2Waiters.delete(session.outpoint);
 		this.spliceWaiters.delete(session.outpoint);
-		this.deps.requests.endAttempt(session.receiptHashHex, session.offerIdHex);
-		// A success releases the coin outright (it is spent); a failure holds it
-		// as a cooldown, so the same coin cannot immediately burn another
-		// session under a fresh offer id.
-		this.state.release(
-			session.outpoint,
-			session.offerIdHex,
-			ok ? undefined : this.now() + this.cfg.outpointCooldownMs
-		);
+		// A funding that could not be unwound is still a funding: its late
+		// witness can complete it and reveal the receipt, so neither the request
+		// nor the coin is free for a second one. Both holds run to the record's
+		// own expiry, which is where the late-witness handler goes too.
+		if (hasWitnessObligation) {
+			this.deps.requests.extendAttempt(
+				session.receiptHashHex,
+				session.offerIdHex,
+				session.expiresAt
+			);
+		} else {
+			this.deps.requests.endAttempt(session.receiptHashHex, session.offerIdHex);
+		}
+		const failureHold = ok
+			? undefined
+			: this.now() + this.cfg.outpointCooldownMs;
+		const holdUntil =
+			hasWitnessObligation && failureHold !== undefined
+				? Math.max(session.expiresAt, failureHold)
+				: failureHold;
+		this.state.release(session.outpoint, session.offerIdHex, holdUntil);
 		// The record's own expiry was bound to the request's at admission, so a
 		// terminal session keeps answering for as long as the request can still
 		// be paid: that is what a payer whose receipt frame was lost replays
@@ -1140,7 +1198,7 @@ export class DirectFundingReceiver extends EventEmitter {
 				})
 			);
 		}
-		this.finish(ctx, false);
+		this.finish(ctx, false, stillOwed !== null);
 		// After finish(), which clears the callback every settled session drops.
 		stillOwed?.();
 		this.log(DF_LOG_OFFER_FAILED, {
@@ -1158,6 +1216,13 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * rather than the peer an abort. It is not something to swallow either, and
 	 * the caller keeps the witness obligation open on the strength of it.
 	 *
+	 * A v2 abort awaiting the peer's echo counts as a refusal for the same
+	 * reason. A recorded attempt tears down only when the echo confirms the peer
+	 * heard us; until then the negotiation is fully live, and a disconnect
+	 * forgets the abort and resumes it. So the obligation stays open, and a late
+	 * witness either completes a funding that survived or is refused by a
+	 * channel that did not.
+	 *
 	 * Nothing is released back to the funding provider here, unlike the fork's
 	 * abort path: a registered contribution bypasses wallet selection outright,
 	 * so a direct-funded open or splice never pledges a coin of ours.
@@ -1168,19 +1233,29 @@ export class DirectFundingReceiver extends EventEmitter {
 		ctx: IDfSessionContext
 	): boolean {
 		try {
-			const result = isSplice
-				? this.deps.abortSplice(channelId, 'direct funding session failed')
-				: this.deps.abortDualFundedOpen(
-						channelId,
-						'direct funding session failed'
-				  );
+			const result: { ok: boolean; error?: string; pending?: boolean } =
+				isSplice
+					? this.deps.abortSplice(channelId, 'direct funding session failed')
+					: this.deps.abortDualFundedOpen(
+							channelId,
+							'direct funding session failed'
+					  );
 			if (!result.ok) {
 				this.log(DF_LOG_OFFER_FAILED, {
 					offerId: ctx.session.offerIdHex,
 					error: `unwind refused: ${result.error}`
 				});
+				return false;
 			}
-			return result.ok;
+			if (result.pending === true) {
+				this.log(DF_LOG_OFFER_FAILED, {
+					offerId: ctx.session.offerIdHex,
+					error:
+						'unwind is awaiting the peer echo, so the funding is still live'
+				});
+				return false;
+			}
+			return true;
 		} catch (err) {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: ctx.session.offerIdHex,
@@ -1196,19 +1271,43 @@ export class DirectFundingReceiver extends EventEmitter {
 		waiters: Map<string, DfFinalTxWaiter>,
 		key: string,
 		timeoutMs: number
-	): Promise<IDfFinalTx> {
-		return new Promise<IDfFinalTx>((resolve, reject) => {
-			const timer = setTimeout(() => {
-				waiters.delete(key);
-				reject(new Error('funding negotiation did not complete in time'));
-			}, timeoutMs);
-			timer.unref?.();
-			waiters.set(key, (final) => {
-				clearTimeout(timer);
-				waiters.delete(key);
-				resolve(final);
-			});
+	): DfFinalTxWaiter {
+		let resolveFinal!: (final: IDfFinalTx) => void;
+		let rejectFinal!: (reason: Error) => void;
+		const final = new Promise<IDfFinalTx>((resolve, reject) => {
+			resolveFinal = resolve;
+			rejectFinal = reject;
 		});
+		let settled = false;
+		const remove = (waiter: DfFinalTxWaiter): void => {
+			if (waiters.get(key) === waiter) waiters.delete(key);
+		};
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			remove(waiter);
+			rejectFinal(new Error('funding negotiation did not complete in time'));
+		}, timeoutMs);
+		timer.unref?.();
+		const waiter: DfFinalTxWaiter = {
+			final,
+			resolve: (value): void => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				remove(waiter);
+				resolveFinal(value);
+			},
+			cancel: (): void => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				remove(waiter);
+				rejectFinal(new Error('funding negotiation was cancelled'));
+			}
+		};
+		waiters.set(key, waiter);
+		return waiter;
 	}
 
 	/**
@@ -1238,7 +1337,7 @@ export class DirectFundingReceiver extends EventEmitter {
 				owedExternalIndices: pending.owedExternalInputs.map((o) => o.inputIndex)
 			};
 			if ('sharedInputIndex' in pending) {
-				waiter({
+				waiter.resolve({
 					...common,
 					fundingTxidDisplay: displayTxid(pending.spliceTxid),
 					fundingOutputIndex: pending.newFundingOutputIndex,
@@ -1248,7 +1347,7 @@ export class DirectFundingReceiver extends EventEmitter {
 					sharedInputIndex: pending.sharedInputIndex
 				});
 			} else {
-				waiter({
+				waiter.resolve({
 					...common,
 					fundingTxidDisplay: displayTxid(pending.fundingTxid),
 					fundingOutputIndex: pending.fundingOutputIndex,

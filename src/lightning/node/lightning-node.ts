@@ -9367,9 +9367,10 @@ export class LightningNode extends EventEmitter {
 	 * witness.
 	 *
 	 * `sendsWithheld` on a successful delivery says the tx_signatures the
-	 * release produced did NOT reach the peer, because the batch's persist
-	 * failed; only a reconnect retries them. A caller answering to the input's
-	 * owner has not discharged anything until that is false.
+	 * release produced did NOT reach the peer: the batch's persist failed and
+	 * only a reconnect retries them, or the durability barrier parked them and
+	 * may yet drop them. A caller answering to the input's owner has not
+	 * discharged anything until that is false.
 	 * @param channelId - 32-byte channel ID from the event
 	 * @param prevTxid - txid of the input's previous transaction, INTERNAL
 	 *   byte order (tx.getHash(), not the display hex)
@@ -9509,12 +9510,16 @@ export class LightningNode extends EventEmitter {
 	 * apply unchanged: an open whose tx_signatures already left, or whose
 	 * funding transaction is fully signed, owes the network a broadcast rather
 	 * than the peer an abort, and is refused here.
+	 *
+	 * `pending` means the tx_abort left and the peer's echo is outstanding. A
+	 * recorded attempt tears down only on that echo, so until it arrives the
+	 * negotiation is still live and a disconnect resumes it.
 	 * @param channelId - 32-byte channel ID, temporary or permanent
 	 */
 	abortDualFundedOpen(
 		channelId: Buffer,
 		reason?: string
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; pending?: boolean } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
 		return this.channelManager.abortDualFundedOpen(channelId, reason);

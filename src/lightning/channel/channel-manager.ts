@@ -240,6 +240,14 @@ interface IActionDispatchProgress {
 	attemptedMessageTypes: Set<number>;
 	/** A failed persist withheld one or more wire effects. */
 	sendsWithheld: boolean;
+	/**
+	 * One or more sends were parked behind the quorum durability barrier, or
+	 * dropped for want of frame attribution, instead of reaching the transport.
+	 * Kept apart from `sendsWithheld` because the two have opposite dispositions
+	 * here: a withheld batch committed nothing, while a held one committed its
+	 * state and is waiting for a receipt that may still be refused.
+	 */
+	sendsHeld: boolean;
 }
 
 function newDispatchProgress(): IActionDispatchProgress {
@@ -247,7 +255,8 @@ function newDispatchProgress(): IActionDispatchProgress {
 		index: -1,
 		completedIndex: -1,
 		attemptedMessageTypes: new Set<number>(),
-		sendsWithheld: false
+		sendsWithheld: false,
+		sendsHeld: false
 	};
 }
 
@@ -1798,7 +1807,7 @@ export class ChannelManager extends EventEmitter {
 		}
 		// The caller's obligation to the input owner is discharged by the
 		// tx_signatures this release sends, not by the channel accepting the
-		// witness, so a withheld dispatch has to reach it.
+		// witness, so a dispatch that stopped short of the wire has to reach it.
 		const progress = newDispatchProgress();
 		this.processActions(peerPubkey, channel, actions, progress);
 		this._promoteV2ChannelIfReady(peerPubkey, channel);
@@ -1810,7 +1819,11 @@ export class ChannelManager extends EventEmitter {
 				error: (errorAction as { message: string }).message
 			};
 		}
-		return { ok: true, actions, sendsWithheld: progress.sendsWithheld };
+		return {
+			ok: true,
+			actions,
+			sendsWithheld: progress.sendsWithheld || progress.sendsHeld
+		};
 	}
 
 	/**
@@ -1865,7 +1878,11 @@ export class ChannelManager extends EventEmitter {
 				error: (errorAction as { message: string }).message
 			};
 		}
-		return { ok: true, actions, sendsWithheld: progress.sendsWithheld };
+		return {
+			ok: true,
+			actions,
+			sendsWithheld: progress.sendsWithheld || progress.sendsHeld
+		};
 	}
 
 	/**
@@ -5718,11 +5735,16 @@ export class ChannelManager extends EventEmitter {
 	 * all three at different points of its life. Channel.abortDualFunding owns
 	 * every refusal (post-tx_signatures, fully signed, RBF in flight); this
 	 * only routes and dispatches.
+	 *
+	 * `pending` says the tx_abort went out and the attempt is still fully live:
+	 * a RECORDED attempt tears down only on the peer's echo, and a disconnect
+	 * before it resumes the negotiation. A caller holding an obligation to a
+	 * third party must not read that as a release.
 	 */
 	abortDualFundedOpen(
 		channelId: Buffer,
 		reason?: string
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; pending?: boolean } {
 		const idHex = channelId.toString('hex');
 		const channel =
 			this.channels.get(idHex) ??
@@ -5750,7 +5772,7 @@ export class ChannelManager extends EventEmitter {
 			};
 		}
 		this.processActions(peerPubkey, channel, actions);
-		return { ok: true };
+		return { ok: true, pending: channel.isV2AbortAwaitingEcho() };
 	}
 
 	/**
@@ -7047,12 +7069,7 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		const actions = channel.handleTxAbort();
-		const progress: IActionDispatchProgress = {
-			index: -1,
-			completedIndex: -1,
-			attemptedMessageTypes: new Set<number>(),
-			sendsWithheld: false
-		};
+		const progress = newDispatchProgress();
 		let dispatchCompleted = false;
 		try {
 			this.processActions(peerPubkey, channel, actions, progress);
@@ -7744,12 +7761,7 @@ export class ChannelManager extends EventEmitter {
 	): void {
 		this._syncQuiescenceWatchdog(channel);
 		if (actions.length === 0) return;
-		const dispatchProgress = progress ?? {
-			index: -1,
-			completedIndex: -1,
-			attemptedMessageTypes: new Set<number>(),
-			sendsWithheld: false
-		};
+		const dispatchProgress = progress ?? newDispatchProgress();
 		const errorIndex = actions.findIndex(
 			(action) => action.type === ChannelActionType.ERROR
 		);
@@ -7886,6 +7898,7 @@ export class ChannelManager extends EventEmitter {
 		// leads with its persist, so a violation is a producer bug, and the
 		// safe response to a producer bug on a fund-critical path is silence.
 		if (channelIdHex && this._lacksFrameAttribution(actions, persistIndex)) {
+			this._noteSendsHeld(progress, actions, 0);
 			this._refuseUnattributed(channelIdHex, peerPubkey, channel, actions);
 			return;
 		}
@@ -7903,6 +7916,7 @@ export class ChannelManager extends EventEmitter {
 			persistIndex < 0 &&
 			this.barrierQueues.has(channelIdHex)
 		) {
+			this._noteSendsHeld(progress, actions, 0);
 			this._holdBatch(channelIdHex, peerPubkey, channel, {
 				actions,
 				from: 0,
@@ -7948,6 +7962,7 @@ export class ChannelManager extends EventEmitter {
 			this.emitContained('transition:end', channelIdHex);
 		}
 		if (heldFrom >= 0 && channelIdHex) {
+			this._noteSendsHeld(progress, actions, heldFrom);
 			this._holdBatch(channelIdHex, peerPubkey, channel, {
 				actions,
 				from: heldFrom,
@@ -8337,6 +8352,26 @@ export class ChannelManager extends EventEmitter {
 		);
 	}
 
+	/**
+	 * Note that a suffix the barrier parked (or dropped) still owes the wire.
+	 *
+	 * Only sends count. A held suffix carries broadcasts and internal emits too,
+	 * but no peer is waiting on those, and a caller asking whether its message
+	 * left is asking about the socket.
+	 */
+	private _noteSendsHeld(
+		progress: IActionDispatchProgress,
+		actions: ChannelAction[],
+		from: number
+	): void {
+		for (let index = Math.max(from, 0); index < actions.length; index++) {
+			if (actions[index].type === ChannelActionType.SEND_MESSAGE) {
+				progress.sendsHeld = true;
+				return;
+			}
+		}
+	}
+
 	/** Does the suffix from `from` put a message the barrier gates on the wire? */
 	private _carriesBarrierMessage(
 		actions: ChannelAction[],
@@ -8611,10 +8646,9 @@ export class ChannelManager extends EventEmitter {
 		let blocked = false;
 		const channelIdHex = queue.channel.getChannelId()?.toString('hex') ?? null;
 		const progress: IActionDispatchProgress = {
+			...newDispatchProgress(),
 			index: held.from,
-			completedIndex: held.from - 1,
-			attemptedMessageTypes: new Set<number>(),
-			sendsWithheld: false
+			completedIndex: held.from - 1
 		};
 		// Same bracket a live batch runs in, so a monitor change caused by the
 		// released actions still rides its channel's transition instead of

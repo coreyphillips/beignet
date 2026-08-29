@@ -322,6 +322,8 @@ export class FakeDfNode implements IDfReceiverDeps {
 	witnessSendsWithheld = false;
 	/** Set to make abortDualFundedOpen report a refusal. */
 	abortError: string | null = null;
+	/** Set to make abortDualFundedOpen report a tx_abort awaiting its echo. */
+	abortPending = false;
 	/** Set to make abortSplice report a refusal (the peer signed first). */
 	spliceAbortError: string | null = null;
 	spliceError: string | null = null;
@@ -377,8 +379,11 @@ export class FakeDfNode implements IDfReceiverDeps {
 		this.requests.restore();
 	}
 
-	mintRequest(ttlMs?: number): IDfRequestRecord {
-		return this.requests.mint(ttlMs === undefined ? {} : { ttlMs });
+	mintRequest(ttlMs?: number, amountSat?: bigint): IDfRequestRecord {
+		return this.requests.mint({
+			...(ttlMs === undefined ? {} : { ttlMs }),
+			...(amountSat === undefined ? {} : { amountSat })
+		});
 	}
 
 	/** Make a coin resolvable, unspent and confirmed, from our chain source. */
@@ -452,11 +457,15 @@ export class FakeDfNode implements IDfReceiverDeps {
 		return { channelId: (): Buffer => channelId };
 	}
 
-	abortDualFundedOpen(channelId: Buffer): { ok: boolean; error?: string } {
+	abortDualFundedOpen(channelId: Buffer): {
+		ok: boolean;
+		error?: string;
+		pending?: boolean;
+	} {
 		this.aborts.push({ kind: 'open', channelId: channelId.toString('hex') });
 		return this.abortError
 			? { ok: false, error: this.abortError }
-			: { ok: true };
+			: { ok: true, pending: this.abortPending };
 	}
 
 	spliceInWithInputs(

@@ -93,6 +93,17 @@ export interface IDfReceiverConfig {
 	 * off leaves every offer on the simpler new-channel path.
 	 */
 	allowSplice?: boolean;
+	/**
+	 * Let a direct-funded open go zero-conf.
+	 *
+	 * Its own switch rather than a read of the node's zero-conf trust, because
+	 * the two authorize different risks. `canOpenZeroConfTo` says the operator
+	 * will open a zero-conf channel to this peer with ITS OWN confirmed coins;
+	 * here the funding input belongs to a stranger and can be double spent out
+	 * from under the counterparty at depth zero. Delegating that needs the
+	 * operator to say so about direct funding specifically.
+	 */
+	allowZeroConf?: boolean;
 }
 
 // ─────────────── Node surface ───────────────
@@ -198,10 +209,16 @@ export interface IDfReceiverDeps {
 	 */
 	isTrustedPayer(peerHex: string): boolean;
 	openChannelV2(peerHex: string, params: IDfOpenParams): IDfChannelHandle;
+	/**
+	 * `pending` says the tx_abort left and the peer's echo has not: a recorded
+	 * attempt tears down only on that echo, so the funding is still live and a
+	 * disconnect resumes it. Not a release, and the engine treats it as a
+	 * refusal for exactly that reason.
+	 */
 	abortDualFundedOpen(
 		channelId: Buffer,
 		reason: string
-	): { ok: boolean; error?: string };
+	): { ok: boolean; error?: string; pending?: boolean };
 	spliceInWithInputs(
 		channelId: Buffer,
 		amountSats: bigint,
