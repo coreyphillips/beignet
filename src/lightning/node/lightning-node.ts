@@ -172,6 +172,22 @@ import {
 	jitOpeningFeeMsat
 } from '../liquidity/jit-receive';
 import {
+	DF_DEFAULT_REQUEST_TTL_MS,
+	DfTransportType,
+	DirectFundingReceiver,
+	DirectFundingRequestStore,
+	DfTransportRegistry,
+	IDfRequestRecord,
+	IDfOnionTransport,
+	DfTransportDescriptor,
+	chainHashForNetwork as dfChainHashForNetwork,
+	createDirectFundingTransports,
+	encodeRequestEnvelope,
+	mintDfBlindedPath,
+	mintRequestEnvelope,
+	requestEncryptionPublicKey
+} from '../direct-funding';
+import {
 	INodeConfig,
 	IResourceConfig,
 	IPaymentInfo,
@@ -212,7 +228,9 @@ import {
 	IAutoTuneFeesConfig,
 	IRebalanceResult,
 	IRebalanceAttempt,
-	IRebalanceExecutionSummary
+	IRebalanceExecutionSummary,
+	IDirectFundingNodeConfig,
+	IDirectFundingPolicy
 } from './types';
 import {
 	canSelectDualFundingInputs,
@@ -491,6 +509,13 @@ export const JIT_CLIENT_MAX_FLAT_FEE_SAT = 10_000n;
 export const JIT_CLIENT_MAX_FEE_PPM = 50_000;
 
 /**
+ * Wallet-data key holding the direct-funding operator policy (issue #613). The
+ * colon segments can never collide with on-chain wallet keys, which always end
+ * in an IWalletData field name.
+ */
+export const DF_POLICY_STORAGE_KEY = 'df:policy';
+
+/**
  * A signed funding transaction and whether BOLT 2 yet obliges us to put it on
  * the network.
  *
@@ -763,6 +788,15 @@ export class LightningNode extends EventEmitter {
 	/** JIT receive, wallet role: refusal ceilings on an LSP's fee quote. */
 	private readonly jitClientMaxFlatFeeSat: bigint;
 	private readonly jitClientMaxFeePpm: number;
+	/** Third-party direct funding (#613); constructed only when configured. */
+	private directFunding?: {
+		requests: DirectFundingRequestStore;
+		registry: DfTransportRegistry;
+		receiver: DirectFundingReceiver;
+		policy: IDirectFundingPolicy;
+		requestTtlMs: number;
+		detach?: () => void;
+	};
 	/**
 	 * Skim already conceded to a JIT LSP, keyed by incoming HTLC. The bound is
 	 * AGGREGATE across a payment's parts, so what each part is allowed to be
@@ -1344,6 +1378,13 @@ export class LightningNode extends EventEmitter {
 
 		if (config.jitReceive?.enabled) {
 			this.wireJitReceive(config.jitReceive);
+		}
+		if (config.directFunding) {
+			// At CONSTRUCTION, like the JIT engine: the lanes have to be subscribed
+			// to 'custom-message' before the first peer message arrives, and a
+			// listener attached later would miss an offer sent to a request this
+			// node minted in a previous run.
+			this.wireDirectFunding(config.directFunding);
 		}
 		this.jitClientMaxFlatFeeSat =
 			config.jitReceiveClient?.maxFlatFeeSat ?? JIT_CLIENT_MAX_FLAT_FEE_SAT;
@@ -2371,6 +2412,12 @@ export class LightningNode extends EventEmitter {
 		// failed upstream. Runs after the channels and their onion shared
 		// secrets are back, since failing a held part needs both.
 		this.jitReceiveManager?.restore();
+
+		// Direct funding: the operator policy and every outstanding request. A
+		// request already in the wild is unpayable without its secrets, so this
+		// runs whether or not the lanes are ever attached.
+		this.restoreDirectFundingPolicy();
+		this.directFunding?.requests.restore();
 
 		// Scan for expiring HTLCs immediately on restore (may have missed blocks while down)
 		if (this.currentBlockHeight > 0) {
@@ -8434,6 +8481,7 @@ export class LightningNode extends EventEmitter {
 		// must not keep the process alive.
 		this.recoveryBarrier?.stop();
 		this.jitReceiveManager?.destroy();
+		this.stopDirectFunding();
 		this.stopCleanupTimer();
 		if (this.mppCleanupTimer) {
 			clearInterval(this.mppCleanupTimer);
@@ -18217,6 +18265,469 @@ export class LightningNode extends EventEmitter {
 			BEIGNET_CUSTOM_MESSAGE_TYPE,
 			envelope
 		);
+	}
+
+	// ─────────────── Third-party direct funding (issue #613) ───────────────
+
+	/** The lane registry, for a payer built on top of this node. */
+	getDirectFundingRegistry(): DfTransportRegistry | undefined {
+		return this.directFunding?.registry;
+	}
+
+	/** The outstanding-request store (4A), or undefined when not configured. */
+	getDirectFundingRequests(): DirectFundingRequestStore | undefined {
+		return this.directFunding?.requests;
+	}
+
+	/** The receiver engine (4C), or undefined when not configured. */
+	getDirectFundingReceiver(): DirectFundingReceiver | undefined {
+		return this.directFunding?.receiver;
+	}
+
+	/** The operator policy as it stands. */
+	getDirectFundingPolicy(): IDirectFundingPolicy | null {
+		return this.directFunding ? { ...this.directFunding.policy } : null;
+	}
+
+	/**
+	 * Merge a policy update in and persist it.
+	 *
+	 * A MERGE, never a replace: the LFBW dashboard posts `{minAmountSat}` on its
+	 * own and then requires `lspPubkey` to still be present in the readback, and
+	 * the app's manager posts the other five without `minAmountSat`. A field the
+	 * caller did not name keeps its value.
+	 */
+	setDirectFundingPolicy(update: IDirectFundingPolicy): IDirectFundingPolicy {
+		if (!this.directFunding) {
+			throw new Error('direct funding is not configured on this node');
+		}
+		const policy = this.directFunding.policy;
+		for (const [key, value] of Object.entries(update)) {
+			if (value === undefined) continue;
+			(policy as Record<string, unknown>)[key] = value;
+		}
+		this.directFunding.receiver.setConfig({
+			...(policy.minAmountSat !== undefined
+				? { minAmountSat: BigInt(policy.minAmountSat) }
+				: {}),
+			...(policy.maxAmountSat !== undefined
+				? { maxAmountSat: BigInt(policy.maxAmountSat) }
+				: {}),
+			allowZeroConf: policy.allowZeroConf === true,
+			allowSplice: policy.allowSplice === true
+		});
+		this.persistDirectFundingPolicy();
+		return { ...policy };
+	}
+
+	/**
+	 * Mint one payment request and return the envelope a payer pays.
+	 *
+	 * `host` and `port` come from the CALLER and are never second guessed: the
+	 * dashboard passes `window.location.hostname` and the app's manager passes
+	 * PUBLIC_HOST, both with this wallet's listen port, and this node has no way
+	 * to know which is right. With neither, no direct-peer descriptor is emitted
+	 * and the payer reaches us through the liquidity peer.
+	 */
+	mintDirectFundingRequest(opts: {
+		host?: string;
+		port?: number;
+		amountSat?: bigint;
+		ttlMs?: number;
+	}): { record: IDfRequestRecord; request: string; expiresAt: number } {
+		const df = this.directFunding;
+		if (!df) throw new Error('direct funding is not configured on this node');
+		const record = df.requests.mint({
+			ttlMs: opts.ttlMs ?? df.requestTtlMs,
+			...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {})
+		});
+		let envelope: string;
+		try {
+			envelope = encodeRequestEnvelope(
+				mintRequestEnvelope(
+					{
+						requestId: Buffer.from(record.requestId, 'hex'),
+						chainHash: dfChainHashForNetwork(this.network),
+						receiverNodeId: Buffer.from(this.getNodeId(), 'hex'),
+						expiresAt: record.expiresAt,
+						...(opts.amountSat !== undefined
+							? { amountSat: opts.amountSat }
+							: {}),
+						receiptHash: Buffer.from(record.receiptHash, 'hex'),
+						encryptionKey: requestEncryptionPublicKey(record),
+						transports: this.directFundingTransports(record, opts)
+					},
+					(message) => this.signMessage(message)
+				)
+			);
+		} catch (err) {
+			// The record holds secrets for an envelope nobody will ever pay, so it
+			// goes rather than sitting in the store until it expires.
+			df.requests.forget(record.receiptHash);
+			throw err;
+		}
+		return { record, request: envelope, expiresAt: record.expiresAt };
+	}
+
+	/**
+	 * The descriptors one request publishes, in the order a payer should try
+	 * them: the direct peer connection when the caller told us where we are, then
+	 * a blinded path through the liquidity peer.
+	 *
+	 * Only ONE onion descriptor is emitted where the fork emitted an onion and a
+	 * relay: the registry synthesizes the relay fall-back from the onion's
+	 * introduction node, so the second descriptor would duplicate the first byte
+	 * for byte and a request has to survive a scannable QR.
+	 */
+	private directFundingTransports(
+		record: IDfRequestRecord,
+		opts: { host?: string; port?: number }
+	): DfTransportDescriptor[] {
+		const df = this.directFunding;
+		if (!df) return [];
+		const transports: DfTransportDescriptor[] = [];
+		if (opts.host && opts.port) {
+			transports.push({
+				type: DfTransportType.DIRECT_PEER,
+				host: opts.host,
+				port: opts.port
+			});
+		}
+		const { liquidityPeer, liquidityHost, liquidityPort } = df.policy;
+		if (!liquidityPeer || !liquidityHost || !liquidityPort) return transports;
+		try {
+			const path = mintDfBlindedPath(
+				Buffer.from(liquidityPeer, 'hex'),
+				Buffer.from(this.getNodeId(), 'hex'),
+				Buffer.from(record.onionPathSecretHex, 'hex')
+			);
+			const onion: IDfOnionTransport = {
+				type: DfTransportType.ONION_MESSAGE,
+				host: liquidityHost,
+				port: liquidityPort,
+				introNodeId: path.introductionNodeId,
+				pathKey: path.blindingPoint,
+				hops: path.blindedHops
+			};
+			transports.push(onion);
+		} catch (err) {
+			// A path we could not mint is one descriptor short, not a failed
+			// request: the relay descriptor below still reaches us.
+			this.emitStructuredLog('channel', 'df_blinded_path_failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+			transports.push({
+				type: DfTransportType.LSP_RELAY,
+				relayNodeId: Buffer.from(liquidityPeer, 'hex'),
+				host: liquidityHost,
+				port: liquidityPort
+			});
+		}
+		return transports;
+	}
+
+	/**
+	 * Build the request store, the lanes and the receiver, and route inbound
+	 * frames into it.
+	 *
+	 * Constructed but inert: with no liquidity peer named the receiver declines
+	 * every offer, and with no request minted every frame is dropped as unknown.
+	 * What this does at construction is make sure a request minted later can be
+	 * ANSWERED, which needs the lanes subscribed before the first frame arrives.
+	 */
+	private wireDirectFunding(config: IDirectFundingNodeConfig): void {
+		const log = (action: string, data: Record<string, unknown>): void => {
+			this.emitStructuredLog('channel', action, data);
+		};
+		const requests = new DirectFundingRequestStore(
+			// Wallet data is optional on IStorageBackend, and a store without it
+			// runs in memory: the requests are then lost on a restart, which the
+			// store already treats as "unpayable", rather than half-persisted.
+			{
+				...(this.walletDataStore() ? { storage: this.walletDataStore()! } : {})
+			},
+			config.requestTtlMs !== undefined
+				? { requestTtlMs: config.requestTtlMs }
+				: {}
+		);
+		const { registry } = createDirectFundingTransports(
+			{
+				peers: {
+					nodeIdHex: () => this.getNodeId(),
+					sendCustomMessage: (peer, subtype, payload): void =>
+						this.sendCustomMessage(peer, subtype, payload),
+					onCustomMessage: (cb): (() => void) => {
+						const handler = (msg: {
+							peerPubkey: string;
+							version: number;
+							subtype: number;
+							payload: Buffer;
+						}): void => cb(msg);
+						this.on('custom-message', handler);
+						return () => {
+							this.removeListener('custom-message', handler);
+						};
+					},
+					isPeerConnected: (peer): boolean =>
+						this.listPeers().some((p) => p.pubkey === peer),
+					connectPeer: async (peer, host, port): Promise<void> => {
+						await this.connectPeer(peer, host, port);
+					}
+				},
+				nodeId: () => Buffer.from(this.getNodeId(), 'hex'),
+				onionManager: this.onionMessageManager,
+				// The path_id is a per-request secret the payer never sees, so only
+				// a path this node minted resolves here.
+				resolvePathSecret: (hex): string | null =>
+					requests.byOnionPathSecret(hex)?.requestId ?? null
+			},
+			{
+				...(config.directPeer !== undefined
+					? { directPeer: config.directPeer }
+					: {}),
+				...(config.onion !== undefined ? { onion: config.onion } : {}),
+				...(config.relay !== undefined ? { relay: config.relay } : {}),
+				...(config.relayServer !== undefined
+					? { relayServer: config.relayServer }
+					: {})
+			},
+			log
+		);
+		const policy: IDirectFundingPolicy = { ...(config.policy ?? {}) };
+		const receiver = new DirectFundingReceiver(
+			{
+				signMessage: (message) => this.signMessage(message),
+				requests,
+				chain: {
+					getTransaction: (txid) =>
+						this.directFundingChain().getTransaction(txid),
+					listUnspent: (
+						scriptHash
+					): Promise<
+						Array<{
+							txid: string;
+							outputIndex: number;
+							valueSat: number;
+							height: number;
+						}>
+					> => {
+						const backend = this.directFundingChain();
+						if (!backend.listUnspent) return Promise.resolve([]);
+						return backend.listUnspent(scriptHash);
+					},
+					getScriptHashHistory: (scriptHash) =>
+						this.directFundingChain().getScriptHashHistory(scriptHash)
+				},
+				liquidityPeer: () => policy.liquidityPeer ?? null,
+				usableChannelWith: (peerHex) => this.usableChannelWith(peerHex),
+				fundingPubkeys: (channelId) =>
+					this.getRawChannel(channelId)?.getFundingPubkeys() ?? null,
+				canOpenZeroConfTo: (peerHex) =>
+					this.channelManager.canOpenZeroConfTo(peerHex),
+				isTrustedPayer: (peerHex) => this.channelManager.isTrustedPeer(peerHex),
+				openChannelV2: (peerHex, params): { channelId(): Buffer } => {
+					const channel = this.openChannelV2(peerHex, {
+						fundingSatoshis: params.fundingSatoshis,
+						contribution: params.contribution,
+						...(params.trusted ? { trusted: true } : {})
+					});
+					// Read through, never captured: the open answers to its temporary
+					// id until accept_channel2 and to its permanent one afterwards.
+					return { channelId: (): Buffer => channel.getCurrentChannelId() };
+				},
+				abortDualFundedOpen: (channelId, reason) =>
+					this.abortDualFundedOpen(channelId, reason),
+				spliceInWithInputs: (
+					channelId,
+					amountSats,
+					inputs,
+					changeScript,
+					feeratePerKw
+				) =>
+					this.spliceInWithInputs(
+						channelId,
+						amountSats,
+						inputs,
+						changeScript,
+						feeratePerKw
+					),
+				abortSplice: (channelId, reason) =>
+					this.channelManager.abortSplice(channelId, reason),
+				getPendingV2FundingTx: (channelId) =>
+					this.getPendingV2FundingTx(channelId),
+				getPendingSpliceTx: (channelId) => this.getPendingSpliceTx(channelId),
+				provideV2ExternalWitness: (
+					channelId,
+					prevTxid,
+					prevOutputIndex,
+					witness
+				) =>
+					this.provideV2ExternalWitness(
+						channelId,
+						prevTxid,
+						prevOutputIndex,
+						witness
+					),
+				provideSpliceExternalWitness: (
+					channelId,
+					prevTxid,
+					prevOutputIndex,
+					witness
+				) =>
+					this.provideSpliceExternalWitness(
+						channelId,
+						prevTxid,
+						prevOutputIndex,
+						witness
+					),
+				onTxSigsNeeded: (cb): (() => void) => {
+					this.on('channel:txsigs-needed', cb);
+					return () => {
+						this.removeListener('channel:txsigs-needed', cb);
+					};
+				},
+				onSpliceTxSigsNeeded: (cb): (() => void) => {
+					this.on('channel:splice-txsigs-needed', cb);
+					return () => {
+						this.removeListener('channel:splice-txsigs-needed', cb);
+					};
+				},
+				log
+			},
+			{
+				...(policy.minAmountSat !== undefined
+					? { minAmountSat: BigInt(policy.minAmountSat) }
+					: {}),
+				...(policy.maxAmountSat !== undefined
+					? { maxAmountSat: BigInt(policy.maxAmountSat) }
+					: {}),
+				allowZeroConf: policy.allowZeroConf === true,
+				allowSplice: policy.allowSplice === true
+			}
+		);
+		for (const evt of [
+			'offer:accepted',
+			'offer:declined',
+			'offer:failed',
+			'offer:completed'
+		]) {
+			receiver.on(evt, (data) => this.emit(`direct-funding:${evt}`, data));
+		}
+		this.directFunding = {
+			requests,
+			registry,
+			receiver,
+			policy,
+			requestTtlMs: config.requestTtlMs ?? DF_DEFAULT_REQUEST_TTL_MS
+		};
+	}
+
+	/**
+	 * Start serving direct funding: arm the sweeps and route every enabled
+	 * lane's inbound frames into the receiver. Idempotent, and a no-op when the
+	 * feature was never configured.
+	 *
+	 * Separate from construction because attaching the lanes is asynchronous (a
+	 * lane behind an optional dependency is loaded on first use) and a
+	 * constructor cannot await. The persisted requests and policy come back in
+	 * `restoreFromStorage`, so a node that never calls this still holds them.
+	 */
+	async startDirectFunding(): Promise<void> {
+		const df = this.directFunding;
+		if (!df || df.detach) return;
+		df.requests.start();
+		df.receiver.start();
+		df.detach = await df.receiver.attach(df.registry);
+	}
+
+	stopDirectFunding(): void {
+		const df = this.directFunding;
+		if (!df) return;
+		df.detach?.();
+		df.detach = undefined;
+		df.receiver.stop();
+		df.requests.stop();
+		df.registry.destroy();
+	}
+
+	/**
+	 * The chain source the receiver reads offered coins from. Ours, never the
+	 * payer's word: the whole admission argument depends on the transaction and
+	 * the unspent set coming from a server this node chose.
+	 */
+	private directFundingChain(): import('../chain/chain-watcher').IChainBackend {
+		if (!this._chainBackend) {
+			throw new Error('direct funding needs a chain backend');
+		}
+		return this._chainBackend;
+	}
+
+	/** A channel with this peer a splice could ride, or null. */
+	private usableChannelWith(peerHex: string): Buffer | null {
+		for (const channel of this.listChannels()) {
+			if (channel.peerPubkey !== peerHex) continue;
+			if (channel.state !== ChannelState.NORMAL) continue;
+			return channel.channelId;
+		}
+		return null;
+	}
+
+	/** The wallet-data slice of the backend, when it has one. */
+	private walletDataStore(): {
+		saveWalletData(key: string, value: string): void;
+		loadWalletData(key: string): string | null;
+	} | null {
+		const storage = this.storage;
+		if (!storage?.saveWalletData || !storage.loadWalletData) return null;
+		return {
+			saveWalletData: (key, value): void => storage.saveWalletData!(key, value),
+			loadWalletData: (key): string | null => storage.loadWalletData!(key)
+		};
+	}
+
+	private persistDirectFundingPolicy(): void {
+		const store = this.walletDataStore();
+		if (!store || !this.directFunding) return;
+		try {
+			store.saveWalletData(
+				DF_POLICY_STORAGE_KEY,
+				JSON.stringify(this.directFunding.policy)
+			);
+		} catch (err) {
+			// The policy is operator configuration, not money: a failed write is
+			// worth a line and no more, and the caller's change still applies for
+			// the life of this process.
+			this.emitStructuredLog('channel', 'df_policy_not_persisted', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	private restoreDirectFundingPolicy(): void {
+		const df = this.directFunding;
+		const store = this.walletDataStore();
+		if (!df || !store) return;
+		let raw: string | null = null;
+		try {
+			raw = store.loadWalletData(DF_POLICY_STORAGE_KEY);
+		} catch {
+			return;
+		}
+		if (!raw) return;
+		try {
+			const parsed = JSON.parse(raw);
+			if (
+				typeof parsed !== 'object' ||
+				parsed === null ||
+				Array.isArray(parsed)
+			) {
+				return;
+			}
+			this.setDirectFundingPolicy(parsed as IDirectFundingPolicy);
+		} catch {
+			// A policy we cannot read leaves the configured defaults standing,
+			// which is the safe direction: they name no liquidity peer.
+		}
 	}
 
 	// ─────────────── Chain Monitor Delegation ───────────────

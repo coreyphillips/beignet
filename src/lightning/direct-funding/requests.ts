@@ -416,6 +416,27 @@ export class DirectFundingRequestStore {
 		}
 	}
 
+	/**
+	 * Drop a request that was never handed out, the mint's own unwind: an
+	 * envelope that could not be built leaves a record holding secrets nothing
+	 * will ever pay, and it would otherwise sit in the store until it expired.
+	 *
+	 * A record that has been touched by an offer is NEVER dropped here: the
+	 * tombstone and the encryption key are what a payer whose receipt was lost
+	 * replays against, and losing them costs it the proof of a payment it has
+	 * already made.
+	 */
+	forget(receiptHashHex: string): boolean {
+		const record = this.byHash.get(receiptHashHex);
+		if (!record) return false;
+		if (record.revealedAt !== undefined || record.attempts !== undefined) {
+			return false;
+		}
+		this.unindex(record);
+		this.persist();
+		return true;
+	}
+
 	/** Live records, expired ones excluded. */
 	list(): IDfRequestRecord[] {
 		const now = this.now();
