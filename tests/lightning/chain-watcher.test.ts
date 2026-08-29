@@ -20,7 +20,10 @@ import {
 	computeScriptHash
 } from '../../src/lightning/chain/chain-watcher';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
-import { IFundingSpendScan } from '../../src/lightning/chain/types';
+import {
+	IFundingSpendScan,
+	IRREVOCABLE_DEPTH
+} from '../../src/lightning/chain/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 
@@ -1214,7 +1217,7 @@ describe('Phase 4: Chain Watcher', () => {
 				'a shallow splice confirmation retires nothing'
 			).to.have.length(1);
 
-			// Buried past SPEND_FINALITY_DEPTH: the old outpoint is spent for
+			// Buried past IRREVOCABLE_DEPTH: the old outpoint is spent for
 			// good and the watch has nothing left to catch.
 			backend.simulateNewBlock(202);
 			await new Promise((resolve) => setTimeout(resolve, 50));
@@ -2072,6 +2075,95 @@ describe('Phase 4: Chain Watcher', () => {
 			await new Promise((resolve) => setTimeout(resolve, 50));
 
 			expect(spentEmitted).to.be.true;
+		});
+
+		// A watched output is the only thing that can tell the monitor a spend it
+		// recorded has been reorged out, and the monitor keeps taking that news
+		// until `tip - confirmationHeight >= IRREVOCABLE_DEPTH` (issue #625).
+		describe('finality boundary', () => {
+			const SPEND_HEIGHT = 700;
+
+			/** Watch an output that is already spent at SPEND_HEIGHT. */
+			async function armSpentOutput(): Promise<{
+				watchedTxid: string;
+				scriptHash: string;
+			}> {
+				const watchedTxid = crypto.randomBytes(32).toString('hex');
+				const scriptPubkey = Buffer.from(
+					'0020' + crypto.randomBytes(32).toString('hex'),
+					'hex'
+				);
+				const scriptHash = computeScriptHash(scriptPubkey);
+
+				const spendTx = new bitcoin.Transaction();
+				spendTx.addInput(Buffer.from(watchedTxid, 'hex').reverse(), 0);
+				spendTx.addOutput(scriptPubkey, 50000);
+				backend.setTransaction(spendTx.getId(), spendTx.toBuffer());
+				backend.setHistory(scriptHash, [
+					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 },
+					{ txid: spendTx.getId(), height: SPEND_HEIGHT }
+				]);
+
+				await watcher.watchOutput(watchedTxid, 0, scriptPubkey);
+				return { watchedTxid, scriptHash };
+			}
+
+			/** Run a check and let its two backend fetches settle. */
+			async function check(scriptHash: string): Promise<void> {
+				backend.simulateScriptHashChange(scriptHash);
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+
+			function watchedOutputCount(): number {
+				return (watcher as unknown as { watchedOutputs: Map<string, unknown> })
+					.watchedOutputs.size;
+			}
+
+			it('keeps the watch until the spend reaches the monitor boundary', async () => {
+				const { scriptHash } = await armSpentOutput();
+
+				backend.simulateNewBlock(SPEND_HEIGHT + IRREVOCABLE_DEPTH - 1);
+				await check(scriptHash);
+				expect(
+					watchedOutputCount(),
+					'still armed one block short of the boundary'
+				).to.equal(1);
+
+				backend.simulateNewBlock(SPEND_HEIGHT + IRREVOCABLE_DEPTH);
+				await check(scriptHash);
+				expect(
+					watchedOutputCount(),
+					'retired at the boundary the monitor uses'
+				).to.equal(0);
+			});
+
+			it('reports a reorg in the last block before the spend is irrevocable', async () => {
+				const unspent: Array<{ txid: string; outputIndex: number }> = [];
+				(
+					channelManager as unknown as {
+						handleOutputUnspent: (txid: string, outputIndex: number) => void;
+					}
+				).handleOutputUnspent = (txid, outputIndex): void => {
+					unspent.push({ txid, outputIndex });
+				};
+				const { watchedTxid, scriptHash } = await armSpentOutput();
+
+				backend.simulateNewBlock(SPEND_HEIGHT + IRREVOCABLE_DEPTH - 1);
+				await check(scriptHash);
+
+				// The reorg evicts the spend with one block still to run on the
+				// monitor's finality clock. Nothing else re-arms the sweep, so a
+				// watch retired here loses a penalty or HTLC claim.
+				backend.setHistory(scriptHash, [
+					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 }
+				]);
+				await check(scriptHash);
+
+				expect(
+					unspent,
+					'the eviction reached the ChannelManager'
+				).to.deep.equal([{ txid: watchedTxid, outputIndex: 0 }]);
+			});
 		});
 	});
 

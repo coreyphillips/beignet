@@ -200,13 +200,6 @@ interface IWatchedOutput {
 }
 
 /**
- * Confirmations after which a spend is treated as irreversible and its watch may be
- * torn down. A reorg deeper than this is out of scope for any practical LN threat
- * model (matches the monitor's IRREVOCABLY_RESOLVED depth).
- */
-const SPEND_FINALITY_DEPTH = 100;
-
-/**
  * Separates a pre-splice spend watch's registry key from the plain channelId
  * hex every other funding watch is keyed by (issue #479). The pre-splice leg
  * shares a channel with the watch on the post-splice outpoint, so it needs a
@@ -1835,10 +1828,10 @@ export class ChainWatcher extends EventEmitter {
 			ignoredSpend !== null &&
 			this.currentBlockHeight > 0 &&
 			// The monitor's own boundary, `blockHeight - confirmationHeight >=
-			// IRREVOCABLE_DEPTH` (chain-monitor.ts, OUTPUT_RESOLVED), and NOT
-			// the `+ 1` form the watchedOutputs teardown uses: that one retires
-			// a block EARLY, which for a breach watch means going blind for the
-			// last block before the spend is irrevocable.
+			// IRREVOCABLE_DEPTH` (chain-monitor.ts, OUTPUT_RESOLVED). A `+ 1`
+			// depth here would retire a block EARLY, which for a breach watch
+			// means going blind for the last block before the spend is
+			// irrevocable.
 			this.currentBlockHeight - ignoredSpend.height >= IRREVOCABLE_DEPTH
 		) {
 			// Confirm it really spent THIS outpoint before acting on it. The
@@ -2148,9 +2141,13 @@ export class ChainWatcher extends EventEmitter {
 			}
 			// Retain the watch until the spend is buried deep enough to be final, so a
 			// reorg before then re-fires this check and is caught by the branch below.
+			// The boundary is the monitor's own, `blockHeight - confirmationHeight >=
+			// IRREVOCABLE_DEPTH` (chain-monitor.ts, OUTPUT_RESOLVED): retiring on a
+			// `+ 1` depth drops the watch a block early, and a reorg in that gap has
+			// nothing left to report the eviction (issue #625).
 			if (
 				this.currentBlockHeight > 0 &&
-				this.currentBlockHeight - spend.height + 1 >= SPEND_FINALITY_DEPTH
+				this.currentBlockHeight - spend.height >= IRREVOCABLE_DEPTH
 			) {
 				this.watchedOutputs.delete(key);
 			}
