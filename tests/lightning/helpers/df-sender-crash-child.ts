@@ -160,4 +160,7 @@ async function main(): Promise<void> {
 	storage.close();
 }
 
-void main();
+// Only when spawned as the entry point. The parent test imports the label type
+// and the database key from here, and an unguarded call would run a payment
+// inside the test runner and then exit(2) out of it.
+if (require.main === module) void main();
