@@ -1036,6 +1036,13 @@ export interface BeignetNodeEvents {
 		code: string;
 		message: string;
 		timestamp: number;
+		/**
+		 * The channel the error belongs to, when there is one. Relayed over SSE
+		 * and webhooks since #464 and carried by the onError callback, but it was
+		 * missing from this signature, so a typed subscriber could not read the
+		 * one field that says which open just failed.
+		 */
+		channelId?: string;
 	}) => void;
 	'node:ready': () => void;
 	log: (entry: {

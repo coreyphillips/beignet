@@ -455,6 +455,21 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 	return events;
 }
 
+/**
+ * One SSE frame. Both lines are contract: a client's parser keys its handlers
+ * off the `event:` name and drops a frame that has none, and it JSON.parses
+ * `data:` unconditionally.
+ *
+ * `?? {}` because node:ready is emitted with no payload at all, and
+ * JSON.stringify(undefined) returns the value undefined, which interpolates as
+ * the literal text `data: undefined` and throws in that parser. The webhook
+ * path never had this: its payload is an object, and an undefined member is
+ * simply left out of the JSON.
+ */
+export function formatSseFrame(eventName: string, data: unknown): string {
+	return `event: ${eventName}\ndata: ${JSON.stringify(data ?? {})}\n\n`;
+}
+
 /** What a boot has taken so far, so a failed start can hand it all back. */
 interface IStartedResources {
 	node?: BeignetNode;
@@ -2784,7 +2799,7 @@ async function bootDaemon(
 	for (const eventName of sseEvents) {
 		node.on(eventName, (data: unknown) => {
 			if (sseClients.size === 0) return;
-			const message = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
+			const message = formatSseFrame(eventName, data);
 			for (const client of sseClients) {
 				client.write(message);
 			}
