@@ -38,6 +38,35 @@ export type {
 } from './frames';
 
 export {
+	attestationMessage,
+	decodeDfOffer,
+	decodeDfOfferAck,
+	decodeDfReceipt,
+	decodeDfRelayFrame,
+	decodeDfSignRequest,
+	decodeDfWitness,
+	deriveOfferId,
+	encodeDfOffer,
+	encodeDfOfferAck,
+	encodeDfReceipt,
+	encodeDfRelayFrame,
+	encodeDfSignRequest,
+	encodeDfWitness,
+	ownershipDigest
+} from './messages';
+export type {
+	IDfAttestation,
+	IDfOffer,
+	IDfOfferAck,
+	IDfOwnershipProof,
+	IDfPrevout,
+	IDfReceipt,
+	IDfRelayFrame,
+	IDfSignRequest,
+	IDfWitness
+} from './messages';
+
+export {
 	DF_BIP21_PARAM,
 	DF_DEFAULT_REQUEST_TTL_MS,
 	DF_ENVELOPE_MIN_BYTES,
