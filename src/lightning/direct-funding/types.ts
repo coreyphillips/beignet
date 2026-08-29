@@ -83,6 +83,7 @@ export const DF_MAX_MESSAGE_BYTES = 32_768;
 
 /** Rev 2 caps a direct-funded transaction at 16 inputs and 8 outputs. */
 export const DF_MAX_PREVOUTS = 16;
+export const DF_MAX_TX_OUTPUTS = 8;
 export const DF_MAX_RAW_TX_BYTES = 20_000;
 export const DF_MAX_SCRIPT_BYTES = 520;
 /** The ownership proof admits P2WPKH and P2TR key path, so one or two items. */

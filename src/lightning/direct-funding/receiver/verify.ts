@@ -21,7 +21,12 @@ import { schnorrVerify } from '../../offer/schnorr';
 import { isValidShutdownScript } from '../../channel/validation';
 import { scriptKind } from '../../wallet/wallet-funding-provider';
 import { deriveOfferId, IDfOffer, ownershipDigest } from '../messages';
-import { DF_MAX_SCRIPT_BYTES, DF_NODE_ID_BYTES } from '../types';
+import {
+	DF_MAX_PREVOUTS,
+	DF_MAX_SCRIPT_BYTES,
+	DF_MAX_TX_OUTPUTS,
+	DF_NODE_ID_BYTES
+} from '../types';
 import {
 	DF_HARD_MIN_OFFER_AMOUNT_SAT,
 	IDfChainSource,
@@ -213,6 +218,17 @@ export interface IDfFundingCheck {
  * offered.
  */
 export function fundingTransactionProblem(c: IDfFundingCheck): string | null {
+	// Rev 2's shape cap, before the attestation rather than after it. A payer
+	// that enforces the cap refuses to sign anything past it, so attesting here
+	// would put this node's identity key over bytes the exchange cannot use;
+	// the sign request's own prevout list would not encode past the input cap
+	// either, and that throw comes after the signature is already made.
+	if (c.tx.ins.length > DF_MAX_PREVOUTS) {
+		return `negotiated transaction has ${c.tx.ins.length} inputs, above the ${DF_MAX_PREVOUTS} direct funding allows`;
+	}
+	if (c.tx.outs.length > DF_MAX_TX_OUTPUTS) {
+		return `negotiated transaction has ${c.tx.outs.length} outputs, above the ${DF_MAX_TX_OUTPUTS} direct funding allows`;
+	}
 	const spending: number[] = [];
 	for (let i = 0; i < c.tx.ins.length; i++) {
 		if (

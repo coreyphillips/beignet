@@ -744,9 +744,15 @@ export class DirectFundingReceiver extends EventEmitter {
 			// afterwards, and an unwind has to name whichever is current.
 			unwind = (): boolean =>
 				this.unwindFunding(isSplice, final.channelId, ctx);
+			// Installed with the unwind it belongs to, not after the sign request
+			// goes out: the funding is live from here, so anything that throws in
+			// between (an unavailable signer, a transaction we refuse to attest
+			// to) leaves the same funding a refused unwind leaves, and the request
+			// and the coin are held on that rather than on how far the exchange
+			// got.
+			stillOwed = (): void => this.keepWitnessObligation(ctx, final, isSplice);
 			witnesses = new DfWitnessQueue(ctx.session);
 			this.sendSignRequest(ctx, final);
-			stillOwed = (): void => this.keepWitnessObligation(ctx, final, isSplice);
 			await this.collectWitness(ctx, final, isSplice, witnesses);
 			// The witness reached the channel: our tx_signatures are out and
 			// there is nothing left that could be unwound.
@@ -763,7 +769,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			const released = unwind ? unwind() : true;
 			witnesses?.close();
 			witnesses = null;
-			this.fail(ctx, errorText(err), released ? null : stillOwed);
+			this.fail(ctx, errorText(err), released, released ? null : stillOwed);
 		} finally {
 			witnesses?.close();
 		}
@@ -1127,7 +1133,7 @@ export class DirectFundingReceiver extends EventEmitter {
 	private finish(
 		ctx: IDfSessionContext,
 		ok: boolean,
-		hasWitnessObligation = false
+		fundingUnreleased = false
 	): void {
 		const { session } = ctx;
 		session.inflight = false;
@@ -1139,7 +1145,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		// witness can complete it and reveal the receipt, so neither the request
 		// nor the coin is free for a second one. Both holds run to the record's
 		// own expiry, which is where the late-witness handler goes too.
-		if (hasWitnessObligation) {
+		if (fundingUnreleased) {
 			this.deps.requests.extendAttempt(
 				session.receiptHashHex,
 				session.offerIdHex,
@@ -1152,7 +1158,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			? undefined
 			: this.now() + this.cfg.outpointCooldownMs;
 		const holdUntil =
-			hasWitnessObligation && failureHold !== undefined
+			fundingUnreleased && failureHold !== undefined
 				? Math.max(session.expiresAt, failureHold)
 				: failureHold;
 		this.state.release(session.outpoint, session.offerIdHex, holdUntil);
@@ -1174,18 +1180,20 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * is NOT declinable: the funding belongs to the network, and what its
 	 * record still owes the payer is a receipt.
 	 *
-	 * `stillOwed` says the same thing about a funding that could not be
-	 * released: the transaction can still complete, so declining it would be a
-	 * lie, and the witness obligation it installs is the only exit the channel
-	 * left open.
+	 * A funding that could NOT be released says the same thing: the transaction
+	 * can still complete, so declining it would be a lie, and the request and
+	 * the coin stay held for as long as that is true. `stillOwed` is the late
+	 * witness handler that goes with it, and exists only once there is a
+	 * negotiated transaction to deliver against; the holds do not depend on it.
 	 */
 	private fail(
 		ctx: IDfSessionContext,
 		reason: string,
+		released: boolean,
 		stillOwed: (() => void) | null
 	): void {
 		const { session } = ctx;
-		if (!session.committed && !stillOwed) {
+		if (!session.committed && released) {
 			session.responses = [];
 			this.send(
 				session.reply,
@@ -1198,7 +1206,7 @@ export class DirectFundingReceiver extends EventEmitter {
 				})
 			);
 		}
-		this.finish(ctx, false, stillOwed !== null);
+		this.finish(ctx, false, !released);
 		// After finish(), which clears the callback every settled session drops.
 		stillOwed?.();
 		this.log(DF_LOG_OFFER_FAILED, {

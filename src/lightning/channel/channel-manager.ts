@@ -1822,7 +1822,10 @@ export class ChannelManager extends EventEmitter {
 		return {
 			ok: true,
 			actions,
-			sendsWithheld: progress.sendsWithheld || progress.sendsHeld
+			sendsWithheld:
+				progress.sendsWithheld ||
+				progress.sendsHeld ||
+				this._txSignaturesStillHeld(channel)
 		};
 	}
 
@@ -1881,7 +1884,10 @@ export class ChannelManager extends EventEmitter {
 		return {
 			ok: true,
 			actions,
-			sendsWithheld: progress.sendsWithheld || progress.sendsHeld
+			sendsWithheld:
+				progress.sendsWithheld ||
+				progress.sendsHeld ||
+				this._txSignaturesStillHeld(channel)
 		};
 	}
 
@@ -5771,7 +5777,24 @@ export class ChannelManager extends EventEmitter {
 				error: refusal.message ?? 'dual-funding abort refused'
 			};
 		}
-		this.processActions(peerPubkey, channel, actions);
+		try {
+			this.processActions(peerPubkey, channel, actions);
+		} finally {
+			// A pre-record abort kills the negotiation on the spot, so nothing
+			// will ever answer for this channel again and leaving it registered
+			// strands an ERRORED lifecycle in the maps and in listChannels. The
+			// echo normally reaches handleTxAbortMsg, which removes it there, but
+			// a peer that never echoes (or a dispatch that throws) would leave it
+			// until the disconnect sweep. A RECORDED attempt is not abandoned and
+			// is deliberately untouched: it tears down on the echo.
+			if (channel.isAbandonedV2Open()) {
+				const id = channel.getChannelId() ?? channel.getTemporaryChannelId();
+				if (this.removeCurrentChannelLifecycle(peerPubkey, channel)) {
+					this.emitContained('channel:abandoned', id, 'v2 open aborted');
+					this.releaseAbandonedV2Pledges(channel);
+				}
+			}
+		}
 		return { ok: true, pending: channel.isV2AbortAwaitingEcho() };
 	}
 
@@ -8370,6 +8393,31 @@ export class ChannelManager extends EventEmitter {
 				return;
 			}
 		}
+	}
+
+	/**
+	 * Is a tx_signatures for this channel still parked behind the barrier?
+	 *
+	 * The witness entry points ask after their own dispatch, because a repeat
+	 * delivery is a no-op at the channel: the record already says our
+	 * tx_signatures were released, so the second call produces no actions and no
+	 * progress of its own. Reading that as a clean dispatch would tell a caller
+	 * holding an obligation to the input's owner that it was discharged by bytes
+	 * still sitting in the queue, which a refused release then drops.
+	 */
+	private _txSignaturesStillHeld(channel: Channel): boolean {
+		const channelIdHex = channel.getChannelId()?.toString('hex');
+		if (!channelIdHex) return false;
+		const queue = this.barrierQueues.get(channelIdHex);
+		if (!queue) return false;
+		return queue.batches.some((batch) =>
+			batch.actions.some(
+				(action, index) =>
+					index >= batch.from &&
+					action.type === ChannelActionType.SEND_MESSAGE &&
+					action.messageType === MessageType.TX_SIGNATURES
+			)
+		);
 	}
 
 	/** Does the suffix from `from` put a message the barrier gates on the wire? */

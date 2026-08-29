@@ -867,6 +867,20 @@ describe('Direct funding receiver: the exchange (issue #612)', () => {
 		expect(h.lastAck()?.reason).to.contain('in fees');
 	});
 
+	/**
+	 * Rev 2 caps the transaction at 16 inputs and 8 outputs, so a payer that
+	 * enforces the cap will not sign a ninth output: attesting to one spends the
+	 * session on bytes the exchange cannot use.
+	 */
+	it('refuses to attest above the rev 2 output cap', async () => {
+		const h = await drive();
+		h.node.completeNegotiation(h.coin, h.offer, { extraOutputs: 7 });
+		await flush();
+		expect(h.payer.bodiesOf(SIGN_REQUEST)).to.be.empty;
+		expect(h.lastAck()?.reason).to.contain('9 outputs, above the 8');
+		expect(h.node.aborts.map((a) => a.kind)).to.deep.equal(['open']);
+	});
+
 	it('delivers the witness, reveals the receipt and tombstones the request', async () => {
 		const h = await drive();
 		const { tx } = h.node.completeNegotiation(h.coin, h.offer, {
@@ -1151,6 +1165,40 @@ describe('Direct funding receiver: unwind (issue #612)', () => {
 		await flush();
 		expect(h.node.aborts.map((a) => a.kind)).to.deep.equal(['open']);
 		expect(h.lastAck()?.reason).to.contain('funding pubkeys are unavailable');
+	});
+
+	/**
+	 * The failure came before the sign request, so there is no witness to wait
+	 * for, but the abort is still awaiting its echo and the funding is live. The
+	 * request and the coin are held on that, not on how far the exchange got.
+	 */
+	it('holds the request when a pending abort follows a failed sign request', async () => {
+		const h = harness({ negotiationTimeoutMs: 5_000, outpointCooldownMs: 5 });
+		h.node.abortPending = true;
+		await h.sendOffer();
+		h.node.pubkeysAvailable = false;
+		h.node.completeNegotiation(h.coin, h.offer);
+		await flush();
+		expect(h.payer.bodiesOf(SIGN_REQUEST)).to.be.empty;
+		expect(h.node.aborts.map((a) => a.kind)).to.deep.equal(['open']);
+		expect(
+			h.acks().filter((a) => !a.accepted),
+			'a live funding is not declined'
+		).to.be.empty;
+
+		const otherCoin = makeCoin('p2wpkh', 400_000);
+		h.node.publish(otherCoin);
+		const again = new FakePayerLane(h.payer.requestRecord, 'second-lane');
+		h.engine.handleFrame(
+			again.offerFrame(
+				buildOffer(h.payer.requestRecord, otherCoin, { amountSat: 70_000n })
+			)
+		);
+		await flush();
+		expect(h.node.opens, 'no second channel for one payment').to.have.length(1);
+		expect(decodeDfOfferAck(again.bodiesOf(ACK)[0]).reason).to.equal(
+			'request already has an active funding attempt'
+		);
 	});
 
 	it('unwinds the open when the payer never delivers its witness', async () => {

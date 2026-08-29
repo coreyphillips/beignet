@@ -333,6 +333,31 @@ function managerHolding(
 	return mgr;
 }
 
+/** The opener side of a v2 open, as createDualFundedChannel takes it. */
+function openerParams(
+	fundingPriv: Buffer,
+	seed: Buffer
+): IDualFundingParams & {
+	localBasepoints: IChannelBasepoints;
+	localPerCommitmentSeed: Buffer;
+	secondPerCommitmentPoint: Buffer;
+} {
+	return {
+		fundingSatoshis: OPENER_FUNDING,
+		fundingFeeratePerkw: FUNDING_FEERATE,
+		commitmentFeeratePerkw: DEFAULT_CHANNEL_CONFIG.feeratePerKw,
+		dustLimitSatoshis: DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis,
+		maxHtlcValueInFlightMsat: DEFAULT_CHANNEL_CONFIG.maxHtlcValueInFlightMsat,
+		htlcMinimumMsat: DEFAULT_CHANNEL_CONFIG.htlcMinimumMsat,
+		toSelfDelay: DEFAULT_CHANNEL_CONFIG.toSelfDelay,
+		maxAcceptedHtlcs: DEFAULT_CHANNEL_CONFIG.maxAcceptedHtlcs,
+		locktime: 0,
+		localBasepoints: makeBasepoints(getPublicKey(fundingPriv), seed),
+		localPerCommitmentSeed: seed,
+		secondPerCommitmentPoint: getPerCommitmentPoint(seed, 1n)
+	};
+}
+
 /** Quorum mode with nothing ever released: the first gated batch parks. */
 function heldQueueBarrier(): unknown {
 	return {
@@ -435,21 +460,7 @@ describe('ChannelManager.createDualFundedChannel dispatch failure (issue #612)',
 		// The caller gets an exception and no Channel, so nothing it can do
 		// would ever reach this negotiation again.
 		expect(() =>
-			mgr.createDualFundedChannel(peer, {
-				fundingSatoshis: OPENER_FUNDING,
-				fundingFeeratePerkw: FUNDING_FEERATE,
-				commitmentFeeratePerkw: DEFAULT_CHANNEL_CONFIG.feeratePerKw,
-				dustLimitSatoshis: DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis,
-				maxHtlcValueInFlightMsat:
-					DEFAULT_CHANNEL_CONFIG.maxHtlcValueInFlightMsat,
-				htlcMinimumMsat: DEFAULT_CHANNEL_CONFIG.htlcMinimumMsat,
-				toSelfDelay: DEFAULT_CHANNEL_CONFIG.toSelfDelay,
-				maxAcceptedHtlcs: DEFAULT_CHANNEL_CONFIG.maxAcceptedHtlcs,
-				locktime: 0,
-				localBasepoints: makeBasepoints(getPublicKey(fundingPriv), seed),
-				localPerCommitmentSeed: seed,
-				secondPerCommitmentPoint: getPerCommitmentPoint(seed, 1n)
-			})
+			mgr.createDualFundedChannel(peer, openerParams(fundingPriv, seed))
 		).to.throw('transport is gone');
 		expect(mgr.listChannels()).to.have.length(0);
 		expect(mgr.getChannelsByPeer(peer)).to.have.length(0);
@@ -500,6 +511,34 @@ describe('ChannelManager.provideV2ExternalWitness reporting (issue #612)', () =>
 		expect(result.sendsWithheld, 'and nothing left').to.equal(true);
 		expect(sent).to.not.include(MessageType.TX_SIGNATURES);
 	});
+
+	/**
+	 * The owner re-sends its witness, as it must when no receipt came back. The
+	 * channel already holds it and releases nothing, so the repeat carries no
+	 * progress of its own: without consulting the queue it would report a clean
+	 * dispatch for the same parked bytes.
+	 */
+	it('still reports withheld when the witness is retried behind the queue', () => {
+		const setup = driveToOwedWitness();
+		const mgr = managerHolding(setup.acceptor, heldQueueBarrier());
+		const sent: number[] = [];
+		mgr.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
+		const witness = signExternalInput(setup);
+		const channelId = setup.acceptor.getChannelId()!;
+		const prevTxid = Buffer.from(setup.extPrevTx.getHash());
+
+		mgr.provideV2ExternalWitness(channelId, prevTxid, 0, witness);
+		const retry = mgr.provideV2ExternalWitness(channelId, prevTxid, 0, witness);
+		expect(retry.ok).to.equal(true);
+		expect(
+			retry.actions,
+			'the channel had nothing left to release'
+		).to.have.length(0);
+		expect(retry.sendsWithheld).to.equal(true);
+		expect(sent).to.not.include(MessageType.TX_SIGNATURES);
+	});
 });
 
 describe('ChannelManager.abortDualFundedOpen (issue #612)', () => {
@@ -526,5 +565,69 @@ describe('ChannelManager.abortDualFundedOpen (issue #612)', () => {
 		expect(setup.acceptor.isV2AbortAwaitingEcho()).to.equal(true);
 		// Nothing is torn down: the peer holds our verified commitment_signed.
 		expect(setup.acceptor.getPendingV2FundingTx()).to.not.equal(null);
+		// And the channel stays registered, because the echo is what ends it.
+		expect(mgr.listChannels()).to.have.length(1);
+	});
+
+	/**
+	 * A pre-record abort kills the negotiation on the spot: nothing was signed
+	 * and nothing durable exists. Leaving the ERRORED lifecycle registered would
+	 * strand it in listChannels until the peer echoed or the connection dropped.
+	 */
+	it('retains nothing when the abort killed the open outright', () => {
+		const fundingPriv = crypto.randomBytes(32);
+		const seed = crypto.randomBytes(32);
+		const mgr = new ChannelManager({
+			localBasepoints: makeBasepoints(getPublicKey(fundingPriv), seed),
+			localPerCommitmentSeed: seed,
+			localFundingPrivkey: fundingPriv,
+			htlcBasepointSecret: crypto.randomBytes(32)
+		});
+		mgr.on('error', () => {});
+		const peer = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const sent: number[] = [];
+		mgr.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
+		const channel = mgr.createDualFundedChannel(
+			peer,
+			openerParams(fundingPriv, seed)
+		);
+
+		const result = mgr.abortDualFundedOpen(
+			channel.getTemporaryChannelId(),
+			'direct funding session failed'
+		);
+		expect(result.ok).to.equal(true);
+		expect(result.pending).to.equal(false);
+		expect(sent).to.include(MessageType.TX_ABORT);
+		expect(mgr.listChannels()).to.have.length(0);
+		expect(mgr.getChannelsByPeer(peer)).to.have.length(0);
+	});
+
+	it('retains nothing when the tx_abort dispatch throws', () => {
+		const fundingPriv = crypto.randomBytes(32);
+		const seed = crypto.randomBytes(32);
+		const mgr = new ChannelManager({
+			localBasepoints: makeBasepoints(getPublicKey(fundingPriv), seed),
+			localPerCommitmentSeed: seed,
+			localFundingPrivkey: fundingPriv,
+			htlcBasepointSecret: crypto.randomBytes(32)
+		});
+		mgr.on('error', () => {});
+		const peer = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const channel = mgr.createDualFundedChannel(
+			peer,
+			openerParams(fundingPriv, seed)
+		);
+		mgr.on('message:outbound', () => {
+			throw new Error('transport is gone');
+		});
+
+		expect(() =>
+			mgr.abortDualFundedOpen(channel.getTemporaryChannelId())
+		).to.throw('transport is gone');
+		expect(mgr.listChannels()).to.have.length(0);
+		expect(mgr.getChannelsByPeer(peer)).to.have.length(0);
 	});
 });

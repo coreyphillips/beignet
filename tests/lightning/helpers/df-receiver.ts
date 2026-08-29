@@ -561,6 +561,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 			changeScript?: Buffer;
 			witnessesFilled?: boolean;
 			channelId?: Buffer;
+			extraOutputs?: number;
 		} = {}
 	): { channelId: Buffer; tx: bitcoin.Transaction } {
 		const channelId =
@@ -623,7 +624,8 @@ export class FakeDfNode implements IDfReceiverDeps {
 	/**
 	 * The transaction the channel would have negotiated: the payer's input, the
 	 * funding output, the payer's change. `sharedInput` adds the splice's shared
-	 * old-funding input behind the payer's.
+	 * old-funding input behind the payer's, `extraOutputs` pads it past rev 2's
+	 * shape cap.
 	 */
 	buildNegotiatedTx(
 		coin: IDfTestCoin,
@@ -634,6 +636,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 			changeScript?: Buffer;
 			witnessesFilled?: boolean;
 			sharedInput?: bigint;
+			extraOutputs?: number;
 		} = {}
 	): bitcoin.Transaction {
 		const fee = opts.feeSat ?? 500n;
@@ -650,6 +653,9 @@ export class FakeDfNode implements IDfReceiverDeps {
 		const change = offer.valueSat - offer.amountSat - fee;
 		if (change > 0n) {
 			tx.addOutput(opts.changeScript ?? offer.changeScript, Number(change));
+		}
+		for (let i = 0; i < (opts.extraOutputs ?? 0); i++) {
+			tx.addOutput(Buffer.alloc(34, 0x80 + i), 1_000);
 		}
 		if (opts.witnessesFilled) {
 			tx.ins.forEach((_, i) => tx.setWitness(i, [Buffer.alloc(64, 7)]));
