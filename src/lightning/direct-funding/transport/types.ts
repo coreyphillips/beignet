@@ -98,6 +98,8 @@ export enum DfDropReason {
 	SEND_FAILED = 'send_failed',
 	/** A relay wrapper that already carries `from`: never re-forwarded. */
 	RELAY_ALREADY_FORWARDED = 'relay_already_forwarded',
+	/** An originator wrapper arrived at a node that does not relay. */
+	RELAY_NOT_A_SERVER = 'relay_not_a_server',
 	/** A relay wrapper addressed to the relay itself or back at its sender. */
 	RELAY_SELF_ADDRESSED = 'relay_self_addressed',
 	RELAY_TARGET_NOT_CONNECTED = 'relay_target_not_connected',

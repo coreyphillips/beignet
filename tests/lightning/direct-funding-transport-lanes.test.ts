@@ -538,7 +538,7 @@ describe('Direct-funding lane 3: blind relay', () => {
 		expect(lane).to.equal(null);
 	});
 
-	it('drops an originator-shaped wrapper arriving at a client', () => {
+	it('refuses to relay for a peer when it is only a client', () => {
 		const recorder = recordingLog();
 		const factory = new DfRelayLaneFactory(receiver, recorder.log);
 		factory.attachInbound(() => undefined);
@@ -551,9 +551,7 @@ describe('Direct-funding lane 3: blind relay', () => {
 				payload: openingFrame(Buffer.alloc(16, 1))
 			})
 		});
-		expect(recorder.reasons()).to.deep.equal([
-			DfDropReason.RELAY_ALREADY_FORWARDED
-		]);
+		expect(recorder.reasons()).to.deep.equal([DfDropReason.RELAY_NOT_A_SERVER]);
 	});
 
 	it('drops a malformed relay wrapper', () => {

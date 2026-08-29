@@ -166,12 +166,10 @@ export class DfRelayLaneFactory implements IDfLaneFactory {
 			return;
 		}
 		if (!wrapper.from) {
-			// Addressed with `to`: this is an ORIGINATOR frame, which only the
-			// relay server half answers. A client seeing one is being asked to
-			// relay, and it does not relay.
-			this.drop(DfDropReason.RELAY_ALREADY_FORWARDED, {
-				pubkey: msg.peerPubkey
-			});
+			// Addressed with `to`: an ORIGINATOR frame, which only the relay
+			// server half answers. A peer sending one here is asking a node that
+			// did not opt into relaying to relay.
+			this.drop(DfDropReason.RELAY_NOT_A_SERVER, { pubkey: msg.peerPubkey });
 			return;
 		}
 		if (!DF_FRAME_SUBTYPES.has(wrapper.subtype)) {
