@@ -576,7 +576,7 @@ LightningNode              High-level API (EventEmitter)
 | `backup/` | Static channel backup (SCB) export/import |
 | `recovery/` | Safety transition layer: atomic persistence, the durable outbound-message outbox, the opt-in hash-chained recovery journal, and the peer_storage Recovery Capsule |
 | `liquidity/` | JIT channel receive (LSP role): intercept SCIDs, held HTLCs, zero-conf open or splice, then forward |
-| `direct-funding/` | Third-party direct funding: the signed payment request envelope, sealed frames, protocol messages, outstanding-request store |
+| `direct-funding/` | Third-party direct funding: the signed payment request envelope, sealed frames, protocol messages, outstanding-request store, and the transport registry with its direct-peer, onion and blind-relay lanes |
 | `l402/` | L402 (Lightning HTTP 402) client: challenge parsing, macaroon reading, paid credentials |
 | `node/` | LightningNode orchestrator, the main protocol-layer entry point |
 | `wallet/` | WalletFundingProvider, adapts the on-chain Wallet for auto-funded opens |

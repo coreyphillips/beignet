@@ -112,7 +112,9 @@ export enum DirectFundingErrorCode {
 	/** The outstanding-request cap is full; a later mint succeeds. */
 	TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
 	/** The request's secrets did not reach durable storage. */
-	NOT_PERSISTED = 'NOT_PERSISTED'
+	NOT_PERSISTED = 'NOT_PERSISTED',
+	/** No transport in the envelope could carry a frame to the receiver. */
+	UNREACHABLE = 'UNREACHABLE'
 }
 
 /**
