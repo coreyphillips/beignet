@@ -437,11 +437,20 @@ export interface BeignetNodeOptions {
 	};
 }
 
-const DEFAULT_DATA_DIR = path.join(
-	process.env.HOME || process.env.USERPROFILE || '.',
-	'.beignet',
-	'data'
-);
+/**
+ * Resolved on every call for the same reason as the config paths (issue #604):
+ * a module-level const froze HOME at import time, so a caller that redirected
+ * HOME still got the developer's real ~/.beignet/data. Every daemon boot that
+ * omits an explicit dataDir lands here, so the freeze put real wallet
+ * databases outside the caller's chosen directory.
+ */
+function defaultDataDir(): string {
+	return path.join(
+		process.env.HOME || process.env.USERPROFILE || '.',
+		'.beignet',
+		'data'
+	);
+}
 
 export type RecoveryMode = 'off' | 'peer-storage' | 'async-remote' | 'quorum';
 
@@ -554,7 +563,7 @@ const RESTORE_ERROR_CODES: Record<RestoreRefusedError['reason'], string> = {
  */
 export function defaultDataDirForMnemonic(
 	mnemonic: string,
-	baseDir: string = DEFAULT_DATA_DIR
+	baseDir: string = defaultDataDir()
 ): string {
 	const walletTag = crypto
 		.createHash('sha256')
@@ -1527,12 +1536,13 @@ export class BeignetNode extends EventEmitter {
 		// pre-existing data at the legacy path is no longer auto-loaded — surface it
 		// rather than silently appearing to have lost the channels.
 		if (!opts.dataDir) {
-			const legacyDb = path.join(DEFAULT_DATA_DIR, `${networkName}.db`);
+			const legacyDir = defaultDataDir();
+			const legacyDb = path.join(legacyDir, `${networkName}.db`);
 			if (fs.existsSync(legacyDb) && !fs.existsSync(dbPath)) {
 				const legacyMsg =
 					`[beignet] Found a legacy shared database at ${legacyDb}. ` +
 					`Storage is now per-wallet (${dbPath}), so it is no longer auto-loaded. ` +
-					`If it held this wallet's channels, re-run with dataDir set to "${DEFAULT_DATA_DIR}" to use it.`;
+					`If it held this wallet's channels, re-run with dataDir set to "${legacyDir}" to use it.`;
 				this.log('warn', legacyMsg);
 				if (!this.logger) {
 					// Preserve the historical console notice when no logger is injected.
