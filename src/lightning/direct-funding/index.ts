@@ -67,6 +67,15 @@ export type {
 } from './messages';
 
 export {
+	DF_DEFAULT_MAX_OUTSTANDING,
+	DF_DEFAULT_SWEEP_INTERVAL_MS,
+	DF_REQUESTS_STORAGE_KEY,
+	DirectFundingRequestStore,
+	requestEncryptionPublicKey
+} from './requests';
+export type { IDfRequestStoreConfig, IDfRequestStoreDeps } from './requests';
+
+export {
 	DF_BIP21_PARAM,
 	DF_DEFAULT_REQUEST_TTL_MS,
 	DF_ENVELOPE_MIN_BYTES,
