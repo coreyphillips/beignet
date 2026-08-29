@@ -24,6 +24,7 @@ import {
 	taprootTweakPrivateKey
 } from '../lightning/wallet/wallet-funding-provider';
 import { schnorrSign } from '../lightning/offer/schnorr';
+import { getPublicKey } from '../lightning/crypto/ecdh';
 import {
 	IDfCoinSigner,
 	IDfSenderCoin,
@@ -153,9 +154,13 @@ export function directFundingWallet(
 				const tweaked = taprootTweakPrivateKey(privKey, pubkey);
 				return {
 					kind,
-					// x-only: the width is what tells the receiver to verify under
+					// The x-only OUTPUT key, not the internal one: the ownership proof
+					// is a Schnorr signature by the tweaked key, and the receiver lifts
+					// the key it verifies under straight out of the scriptPubKey. The
+					// internal key would name a key the signature does not belong to,
+					// and 32 bytes is also what tells the receiver to verify under
 					// Schnorr rather than ECDSA.
-					ownershipPubkey: pubkey.subarray(1, 33),
+					ownershipPubkey: getPublicKey(tweaked).subarray(1, 33),
 					signOwnership: (digest): Buffer => schnorrSign(digest, tweaked),
 					signInput: (tx, inputIndex, prevouts): Buffer[] => [
 						// SIGHASH_DEFAULT, the 64-byte form: this is an ordinary wallet

@@ -321,16 +321,19 @@ export class DirectFundingSender {
 	): Promise<IDfAttempt | null> {
 		const existing = this.deps.payments.get(requestIdHex);
 		if (existing) {
-			if (DF_POST_WITNESS_STATES.has(existing.status)) return null;
-			if (existing.status === 'ABORTED') return null;
+			// The amount first, and ahead of the replay: the offer id is derived
+			// over the amount, so a caller asking to pay a different one is asking
+			// for a different offer against a coin this request has already
+			// committed. Answering it with the recorded attempt would report a
+			// payment of one amount as a payment of another.
 			if (existing.amountSat !== amountSat.toString()) {
-				// The offer id is derived over the amount, so a different amount is a
-				// different offer against a coin this request has already committed.
 				throw new DirectFundingError(
 					DirectFundingErrorCode.AMOUNT_MISMATCH,
 					`this request already has an attempt for ${existing.amountSat} sat`
 				);
 			}
+			if (DF_POST_WITNESS_STATES.has(existing.status)) return null;
+			if (existing.status === 'ABORTED') return null;
 			return this.resume(env, existing);
 		}
 		const maxTotalFeeSat =
@@ -644,15 +647,32 @@ export class DirectFundingSender {
 				},
 				committed: () => committed,
 				commit: (witness): void => {
-					lane.send(
+					const payload = sealed(
 						BeignetCustomSubtype.DIRECT_FUNDING_WITNESS,
-						sealed(
-							BeignetCustomSubtype.DIRECT_FUNDING_WITNESS,
-							encodeDfWitness({ offerId: attempt.offer.offerId, witness }),
-							false
-						)
+						encodeDfWitness({ offerId: attempt.offer.offerId, witness }),
+						false
 					);
+					// The latch goes up BEFORE the send, not after. A synchronous lane
+					// (payer and receiver in one process, which rev 2 names as the
+					// intended first deployment) runs the receiver's whole answer inside
+					// this call, so a decline or a malformed receipt arrives while this
+					// line is still on the stack. Setting the latch afterwards made
+					// those read as PRE-witness problems and reject a call whose
+					// witness was already out, which is the double payment the whole
+					// contract exists to prevent.
 					committed = true;
+					try {
+						lane.send(BeignetCustomSubtype.DIRECT_FUNDING_WITNESS, payload);
+					} catch (err) {
+						// The lane refused the frame outright, so the witness never
+						// reached the wire and nothing can have answered it: a refusal is
+						// still free. (A throw from a HANDLER cannot arrive here; the
+						// subscription isolates those, as the node's own dispatch does.)
+						committed = false;
+						fail(asError(err));
+						return;
+					}
+					if (settled) return;
 					// The receipt is proof, not delivery. Its own, shorter window opens
 					// here, and its expiry is a SUCCESS.
 					for (const timer of timers) clearTimeout(timer);
