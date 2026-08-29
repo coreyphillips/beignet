@@ -115,7 +115,23 @@ export enum DirectFundingErrorCode {
 	/** The request's secrets did not reach durable storage. */
 	NOT_PERSISTED = 'NOT_PERSISTED',
 	/** No transport in the envelope could carry a frame to the receiver. */
-	UNREACHABLE = 'UNREACHABLE'
+	UNREACHABLE = 'UNREACHABLE',
+	/** The request fixes no amount and the caller named none. */
+	AMOUNT_REQUIRED = 'AMOUNT_REQUIRED',
+	/** The caller's amount contradicts the one the request fixed. */
+	AMOUNT_MISMATCH = 'AMOUNT_MISMATCH',
+	/**
+	 * No single coin covers the payment and its fee ceiling. Its own code
+	 * because a payer that cannot fund is not a payer that could not connect,
+	 * and only one of those is worth falling back to a plain address payment on.
+	 */
+	NO_SUITABLE_UTXO = 'NO_SUITABLE_UTXO',
+	/** The receiver refused the offer, with its reason. */
+	OFFER_DECLINED = 'OFFER_DECLINED',
+	/** The transaction we were asked to sign failed one of rev 2's checks. */
+	SIGN_REQUEST_REFUSED = 'SIGN_REQUEST_REFUSED',
+	/** The exchange ran out of time before the witness left the device. */
+	EXCHANGE_TIMEOUT = 'EXCHANGE_TIMEOUT'
 }
 
 /**
