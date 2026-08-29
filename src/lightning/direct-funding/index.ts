@@ -77,6 +77,8 @@ export type { IDfRequestStoreConfig, IDfRequestStoreDeps } from './requests';
 
 export * from './transport';
 
+export * from './receiver';
+
 export {
 	DF_BIP21_PARAM,
 	DF_DEFAULT_REQUEST_TTL_MS,
