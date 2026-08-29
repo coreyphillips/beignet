@@ -109,6 +109,13 @@ export interface IDfCoinSigner {
 export interface IDfSenderWallet {
 	/** Coins this wallet can spend right now: unfrozen, of a supported kind. */
 	listSpendable(): IDfSenderCoin[];
+	/**
+	 * One coin by outpoint, FROZEN ONES INCLUDED. Resuming needs it: a run that
+	 * died between reserving a coin and recording its witness leaves the payer's
+	 * own freeze behind, and a spendable-only lookup would read that as a coin
+	 * that went somewhere else and abandon a payment over it.
+	 */
+	findCoin(txidHex: string, vout: number): IDfSenderCoin | null;
 	/** Raw previous transaction for a DISPLAY txid. */
 	getTransaction(txidHex: string): Promise<Buffer>;
 	/** A fresh change script. */
@@ -211,6 +218,20 @@ export const DF_POST_WITNESS_STATES: ReadonlySet<DfPaymentStatus> =
 		'MEMPOOL_SEEN',
 		'CONFIRMED',
 		'FAILED'
+	]);
+
+/**
+ * The states in which a record still holds its coin, so no OTHER request may
+ * select it. The freeze cannot carry this on its own: it only lands when an
+ * exchange reaches its sign request, and until then the wallet still reports
+ * the coin as spendable.
+ */
+export const DF_COIN_HELD_STATES: ReadonlySet<DfPaymentStatus> =
+	new Set<DfPaymentStatus>([
+		'CREATED',
+		'OFFERED',
+		'SIGNED_PENDING',
+		'MEMPOOL_SEEN'
 	]);
 
 /**

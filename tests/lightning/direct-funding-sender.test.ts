@@ -31,16 +31,19 @@ import { chainHashForNetwork } from '../../src/lightning/direct-funding/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	acceptingReceiver,
+	flush,
 	FakeSenderWallet,
 	ISignRequestOptions,
 	ITestRequest,
 	makeCoin,
 	memoryStorage,
 	mintRequest,
+	registryRouting,
 	registryWith,
 	ScriptedReceiverLane,
 	unreachableRegistry
 } from './helpers/df-sender';
+import type { IDfTransport } from '../../src/lightning/direct-funding/transport/types';
 
 const REGTEST_HASH = chainHashForNetwork(Network.REGTEST);
 
@@ -1118,5 +1121,343 @@ describe('Direct funding sender: frames that are not ours', () => {
 		);
 		expect(err.code).to.equal(DirectFundingErrorCode.UNREACHABLE);
 		expect(h.payments.list()[0].status).to.equal('ABORTED');
+	});
+});
+
+describe('Direct funding sender: an exchange that has already settled', () => {
+	const sleep = (ms: number): Promise<void> =>
+		new Promise((resolve) => setTimeout(resolve, ms));
+
+	/** A sender over a wallet and a store the test keeps hold of. */
+	function senderOver(
+		wallet: FakeSenderWallet,
+		payments: DirectFundingPaymentStore,
+		lane: IDfTransport,
+		config: ConstructorParameters<typeof DirectFundingSender>[1] = {}
+	): DirectFundingSender {
+		return new DirectFundingSender(
+			{
+				wallet,
+				registry: registryWith(lane),
+				payments,
+				chainHash: (): Buffer => REGTEST_HASH
+			},
+			{ offerResendDelaysMs: [], receiptTimeoutMs: 100, ...config }
+		);
+	}
+
+	it('emits no witness once the send has already rejected', async () => {
+		const request = mintRequest();
+		const coin = makeCoin(200_000);
+		const wallet = new FakeSenderWallet([coin]);
+		// The freeze holds long enough for the offer window to close while the
+		// sign request is still being honored, which is where the two race.
+		wallet.freezeDelayMs = 120;
+		const payments = new DirectFundingPaymentStore({
+			storage: memoryStorage()
+		});
+		let witnesses = 0;
+		const lane = new ScriptedReceiverLane(
+			request,
+			acceptingReceiver(request, {
+				noReceipt: true,
+				onWitness: (): void => {
+					witnesses++;
+				}
+			})
+		);
+		const sender = senderOver(wallet, payments, lane, { offerTimeoutMs: 20 });
+		const err = await refusal(
+			sender.send(request.encoded, { amountSat: 100_000n })
+		);
+		expect(err.code).to.equal(DirectFundingErrorCode.EXCHANGE_TIMEOUT);
+		// The caller is already sending its fallback payment by now. A witness
+		// after this point is a second payment of the same money.
+		await sleep(200);
+		expect(witnesses, 'a witness left after the send had rejected').to.equal(0);
+		expect(wallet.frozen.size, 'the coin stayed reserved').to.equal(0);
+		expect(payments.get(request.requestId.toString('hex'))!.status).to.equal(
+			'ABORTED'
+		);
+	});
+
+	it('never offers one coin to two requests at once', async () => {
+		const coin = makeCoin(200_000);
+		const wallet = new FakeSenderWallet([coin]);
+		const payments = new DirectFundingPaymentStore({
+			storage: memoryStorage()
+		});
+		const witnessed: string[] = [];
+		const requests = [mintRequest(), mintRequest()];
+		const lanes = new Map<string, IDfTransport>();
+		for (const request of requests) {
+			const id = request.requestId.toString('hex');
+			lanes.set(
+				id,
+				new ScriptedReceiverLane(
+					request,
+					acceptingReceiver(request, {
+						noReceipt: true,
+						onWitness: (): void => {
+							witnessed.push(id);
+						}
+					})
+				)
+			);
+		}
+		const sender = new DirectFundingSender(
+			{
+				wallet,
+				registry: registryRouting(lanes),
+				payments,
+				chainHash: (): Buffer => REGTEST_HASH
+			},
+			{ offerResendDelaysMs: [], offerTimeoutMs: 500, receiptTimeoutMs: 50 }
+		);
+		const outcomes = await Promise.allSettled(
+			requests.map((r) => sender.send(r.encoded, { amountSat: 100_000n }))
+		);
+		// Two fundings over one input are two transactions that conflict: one of
+		// them can never confirm, and the payer signed both.
+		expect(witnessed, 'the same coin was signed twice').to.have.length(1);
+		const refused = outcomes.filter((o) => o.status === 'rejected');
+		expect(refused).to.have.length(1);
+		expect(
+			((refused[0] as PromiseRejectedResult).reason as DirectFundingError).code
+		).to.equal(DirectFundingErrorCode.NO_SUITABLE_UTXO);
+	});
+
+	it('reports a running send, which is what the daemon drains on', async () => {
+		const request = mintRequest();
+		const coin = makeCoin(200_000);
+		const wallet = new FakeSenderWallet([coin]);
+		const payments = new DirectFundingPaymentStore({
+			storage: memoryStorage()
+		});
+		// A receiver that answers nothing: the send is in flight until it times
+		// out, which is the window a shutdown must not fall inside.
+		const lane = new ScriptedReceiverLane(request, (): void => undefined);
+		const sender = senderOver(wallet, payments, lane, { offerTimeoutMs: 60 });
+		const running = refusal(
+			sender.send(request.encoded, { amountSat: 100_000n })
+		);
+		await flush();
+		expect(sender.inFlight()).to.equal(1);
+		await running;
+		expect(sender.inFlight()).to.equal(0);
+	});
+
+	it('does not leave a payment committed when the witness cannot be sent', async () => {
+		const request = mintRequest();
+		const coin = makeCoin(200_000);
+		const wallet = new FakeSenderWallet([coin]);
+		const payments = new DirectFundingPaymentStore({
+			storage: memoryStorage()
+		});
+		const inner = acceptingReceiver(request, {});
+		const lane = new ScriptedReceiverLane(request, (l, subtype, body): void => {
+			inner(l, subtype, body);
+			if (subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER) {
+				// The lane dies between the sign request and the witness, so the
+				// witness never reaches the wire.
+				l.sendThrows = new Error('not connected to peer');
+			}
+		});
+		const sender = senderOver(wallet, payments, lane);
+		const err = await refusal(
+			sender.send(request.encoded, { amountSat: 100_000n })
+		);
+		// A transport failure, which is what the caller falls back on.
+		expect(err.code).to.equal(DirectFundingErrorCode.UNREACHABLE);
+		await flush();
+		const record = payments.get(request.requestId.toString('hex'))!;
+		// Nothing was spent, so nothing may still describe a spend: a record left
+		// at SIGNED_PENDING would hold the coin frozen against a funding no one
+		// holds, and reconciliation would watch for it forever.
+		expect(record.status).to.equal('ABORTED');
+		expect(record.witness).to.equal(undefined);
+		expect(record.negotiatedTx).to.equal(undefined);
+		expect(record.fundingTxid).to.equal(undefined);
+		expect(wallet.frozen.size).to.equal(0);
+	});
+
+	it('ignores a receipt that arrives before any witness', async () => {
+		const request = mintRequest();
+		const coin = makeCoin(200_000);
+		const wallet = new FakeSenderWallet([coin]);
+		const payments = new DirectFundingPaymentStore({
+			storage: memoryStorage()
+		});
+		const lane = new ScriptedReceiverLane(request, (l, subtype, body): void => {
+			if (subtype !== BeignetCustomSubtype.DIRECT_FUNDING_OFFER) return;
+			// The request's real preimage, and no exchange at all behind it. It
+			// proves the sender minted the request, never that anything was paid.
+			l.reply(
+				BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT,
+				encodeDfReceipt({
+					offerId: decodeDfOffer(body).offerId,
+					preimage: request.preimage,
+					fundingTxid: crypto.randomBytes(32)
+				})
+			);
+		});
+		const sender = senderOver(wallet, payments, lane, { offerTimeoutMs: 80 });
+		const err = await refusal(
+			sender.send(request.encoded, { amountSat: 100_000n })
+		);
+		// A success here would be the one answer that stops the caller paying by
+		// the ordinary route instead.
+		expect(err.code).to.equal(DirectFundingErrorCode.EXCHANGE_TIMEOUT);
+		const record = payments.get(request.requestId.toString('hex'))!;
+		expect(record.receiptPreimage).to.equal(undefined);
+		expect(record.fundingTxid).to.equal(undefined);
+		expect(wallet.frozen.size).to.equal(0);
+	});
+
+	it('keeps the transaction it verified when a receipt names another', async () => {
+		const request = mintRequest();
+		const coin = makeCoin(200_000);
+		const wallet = new FakeSenderWallet([coin]);
+		const payments = new DirectFundingPaymentStore({
+			storage: memoryStorage()
+		});
+		const other = new bitcoin.Transaction();
+		other.version = 2;
+		other.addInput(crypto.randomBytes(32), 0);
+		other.addOutput(Buffer.alloc(22, 7), 1_000);
+		let offer: IDfOffer | null = null;
+		const inner = acceptingReceiver(request, { noReceipt: true });
+		const lane = new ScriptedReceiverLane(request, (l, subtype, body): void => {
+			if (subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER) {
+				offer = decodeDfOffer(body);
+			}
+			inner(l, subtype, body);
+			if (subtype === BeignetCustomSubtype.DIRECT_FUNDING_WITNESS && offer) {
+				l.reply(
+					BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT,
+					encodeDfReceipt({
+						offerId: offer.offerId,
+						preimage: request.preimage,
+						fundingTxid: Buffer.from(other.getHash()).reverse(),
+						rawTx: other.toBuffer()
+					})
+				);
+			}
+		});
+		const sender = senderOver(wallet, payments, lane, {
+			receiptTimeoutMs: 150
+		});
+		const result = await sender.send(request.encoded, { amountSat: 100_000n });
+		const record = payments.get(request.requestId.toString('hex'))!;
+		// Reconciliation confirms and unfreezes against this txid, so a peer that
+		// could name it could release the coin against a spend that is not ours.
+		expect(record.fundingTxid).to.not.equal(other.getId());
+		expect(record.broadcastTx).to.equal(undefined);
+		expect(record.receiptPreimage).to.equal(undefined);
+		expect(result.caveat).to.contain('receipt');
+	});
+});
+
+describe('Direct funding sender: a freeze that outlived its run', () => {
+	/**
+	 * The disk state a kill between the freeze and the record leaves: the coin
+	 * is durably frozen, and nothing on the record says why.
+	 */
+	function rewindToPrePersist(storage: ReturnType<typeof memoryStorage>): void {
+		const rows = JSON.parse(storage.loadWalletData(DF_PAYMENTS_STORAGE_KEY)!);
+		delete rows[0].witness;
+		delete rows[0].attestation;
+		delete rows[0].negotiatedTx;
+		delete rows[0].fundingTxid;
+		rows[0].status = 'OFFERED';
+		rows[0].frozen = false;
+		storage.saveWalletData(DF_PAYMENTS_STORAGE_KEY, JSON.stringify(rows));
+	}
+
+	/** One life: a fresh store and sender over storage the test keeps. */
+	function life(
+		request: ITestRequest,
+		wallet: FakeSenderWallet,
+		storage: ReturnType<typeof memoryStorage>
+	): { sender: DirectFundingSender; payments: DirectFundingPaymentStore } {
+		const payments = new DirectFundingPaymentStore({ storage });
+		payments.restore();
+		const lane = new ScriptedReceiverLane(
+			request,
+			acceptingReceiver(request, { noReceipt: true })
+		);
+		return {
+			payments,
+			sender: new DirectFundingSender(
+				{
+					wallet,
+					registry: registryWith(lane),
+					payments,
+					chainHash: (): Buffer => REGTEST_HASH
+				},
+				{ offerResendDelaysMs: [], receiptTimeoutMs: 100 }
+			)
+		};
+	}
+
+	it('resumes over the coin, rather than reading the freeze as a coin that left', async () => {
+		const storage = memoryStorage();
+		const request = mintRequest();
+		const coin = makeCoin(200_000);
+		const wallet = new FakeSenderWallet([coin]);
+		await life(request, wallet, storage).sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		rewindToPrePersist(storage);
+		expect(wallet.listSpendable(), 'the freeze is durable').to.deep.equal([]);
+
+		const result = await life(request, wallet, storage).sender.send(
+			request.encoded,
+			{ amountSat: 100_000n }
+		);
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.spentTxid).to.equal(coin.txidHex);
+	});
+
+	it('releases it at start, when no retry ever comes', async () => {
+		const storage = memoryStorage();
+		const request = mintRequest();
+		const coin = makeCoin(200_000);
+		const wallet = new FakeSenderWallet([coin]);
+		await life(request, wallet, storage).sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		rewindToPrePersist(storage);
+
+		const { sender } = life(request, wallet, storage);
+		sender.start();
+		await flush();
+		sender.stop();
+		// Nothing was signed under it, so holding the coin protects nothing and
+		// costs the wallet a coin it can never select again.
+		expect(wallet.frozen.size).to.equal(0);
+	});
+
+	it('closes the request, and holds no freeze, when the coin really is gone', async () => {
+		const storage = memoryStorage();
+		const request = mintRequest();
+		const coin = makeCoin(200_000);
+		const wallet = new FakeSenderWallet([coin]);
+		await life(request, wallet, storage).sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		rewindToPrePersist(storage);
+		wallet.coins = [];
+
+		const { sender, payments } = life(request, wallet, storage);
+		const err = await refusal(
+			sender.send(request.encoded, { amountSat: 100_000n })
+		);
+		expect(err.code).to.equal(DirectFundingErrorCode.NO_SUITABLE_UTXO);
+		await flush();
+		expect(payments.get(request.requestId.toString('hex'))!.status).to.equal(
+			'ABORTED'
+		);
+		expect(wallet.frozen.size).to.equal(0);
 	});
 });

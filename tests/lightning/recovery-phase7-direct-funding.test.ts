@@ -33,7 +33,11 @@ import readline from 'readline';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { DirectFundingPaymentStore } from '../../src/lightning/direct-funding/sender/records';
 import { IDfPaymentRecord } from '../../src/lightning/direct-funding/sender/types';
-import { DF_CRASH_DB_KEY, DfKillLabel } from './helpers/df-sender-crash-child';
+import {
+	DF_CRASH_DB_KEY,
+	DF_CRASH_FROZEN_KEY,
+	DfKillLabel
+} from './helpers/df-sender-crash-child';
 
 const CHILD = path.join(__dirname, 'helpers', 'df-sender-crash-child.ts');
 const REPO_ROOT = path.join(__dirname, '..', '..');
@@ -101,6 +105,19 @@ function recordsOnDisk(dbPath: string): IDfPaymentRecord[] {
 		});
 		store.restore();
 		return store.list();
+	} finally {
+		storage.close();
+	}
+}
+
+/** The outpoints the victim's wallet had frozen when it died. */
+function frozenOnDisk(dbPath: string): string[] {
+	const storage = new SqliteStorage(dbPath, undefined, {
+		encryptionKey: DF_CRASH_DB_KEY
+	});
+	storage.open();
+	try {
+		return JSON.parse(storage.loadWalletData(DF_CRASH_FROZEN_KEY) ?? '[]');
 	} finally {
 		storage.close();
 	}
@@ -177,6 +194,32 @@ describe('Recovery phase 7: direct funding payer (5.10 D1)', function () {
 		expect(record.witness).to.have.length(2);
 		expect(record.negotiatedTx).to.be.a('string');
 		expect(record.fundingTxid).to.be.a('string');
+	});
+
+	it('the freeze a pre-persist kill leaves behind strands nothing', async () => {
+		const dbPath = path.join(dir, 'frozen.db');
+		const seed = crypto.randomBytes(32);
+		const first = await runLife(dbPath, seed, 'pre-persist');
+		expect(first.signal).to.equal('SIGKILL');
+		// The freeze goes to disk before the record does, so this is the state a
+		// kill at the boundary leaves: a reserved coin, and a record that knows
+		// nothing about it.
+		expect(frozenOnDisk(dbPath), 'the freeze was not durable').to.deep.equal([
+			valueOf(first.lines, 'coin:')
+		]);
+		expect(recordsOnDisk(dbPath)[0].status).to.equal('OFFERED');
+
+		const second = await runLife(dbPath, seed, 'none');
+		expect(second.signal).to.equal(null);
+		// The second life finds the coin its own freeze holds and finishes the
+		// payment over it. Searching only spendable coins read that freeze as a
+		// coin that had gone elsewhere, abandoned the request, and left the coin
+		// reserved for good.
+		expect(second.lines).to.include('settled:SIGNED_PENDING');
+		expect(valueOf(second.lines, 'coin:')).to.equal(
+			valueOf(first.lines, 'coin:')
+		);
+		expect(recordsOnDisk(dbPath)).to.have.length(1);
 	});
 
 	it('a second life resumes the recorded attempt, never a second coin', async () => {

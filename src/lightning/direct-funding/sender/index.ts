@@ -14,6 +14,7 @@ export { DF_MAX_LOCKTIME, prevoutProblem, signRequestProblem } from './verify';
 export type { IDfSignRequestCheck, IDfSignRequestVerdict } from './verify';
 
 export {
+	DF_COIN_HELD_STATES,
 	DF_DEFAULT_MAX_TOTAL_FEE_SAT,
 	DF_LOG_FORGED_RECEIPT,
 	DF_LOG_PAYMENT_RECONCILED,

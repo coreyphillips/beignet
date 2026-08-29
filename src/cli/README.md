@@ -554,8 +554,12 @@ Operational notes:
 > (`POST /send-max`) each count **amount + fee** against the daily limit and
 > are rejected with `SPENDING_LIMIT_EXCEEDED` once it is exhausted. For
 > send-max the check runs against the actual computed sweep total before
-> broadcast. Excluded by design (they are not external spends):
-> `consolidateUtxos` (self-pay), channel opens/splices/funding, and
+> broadcast. An address-targeted `spliceOut` and `sendDirectFunding`
+> (`POST /direct-funding/send`) count the same way; direct funding is charged
+> its amount plus the fee ceiling it was given, because the exact fee is only
+> known once the receiver has built the transaction. Excluded by design (they
+> are not external spends): `consolidateUtxos` (self-pay), our own channel
+> opens/splices/funding, and
 > `bumpFeeOnchain`/`boostOnchain` (fee-only). PSBT building is also not
 > counted (nothing is broadcast). Resets at midnight UTC.
 
@@ -1819,7 +1823,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/direct-funding/configure` | `{ lspPubkey?, lspHost?, lspPort?, targetInboundSat?, trusted?, minAmountSat? }` | Set the direct-funding policy. A partial MERGE, never a replace: a field the body does not name keeps its value. `minAmountSat` clamps up to the 5000 sat floor and the response reports the clamped value. Returns the full effective config |
 | GET | `/direct-funding/config` | -- | Read the effective policy; `lspPubkey` is null when no liquidity peer is set, in which case no offer is served |
 | POST | `/direct-funding/request` | `{ host?, port?, amountSats? }` | Mint a payment request: returns `{ paymentHash, expiresAt, request }`, where `request` is the base64url envelope a payer pays (BIP 21 parameter `bgnq`). `host`/`port` are the address a payer can reach this node on and are used exactly as given |
-| POST | `/direct-funding/send` | `{ request, amountSats?, maxTotalFeeSat? }` | Pay a request from one of our coins. **Rejects only before our witness leaves the device**; after that it resolves with what is known plus a `caveat`, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Idempotent on the request id, sets no deadline of its own, and accepts `feeHeadroomSats` as an alias for `maxTotalFeeSat` |
+| POST | `/direct-funding/send` | `{ request, amountSats?, maxTotalFeeSat? }` | Pay a request from one of our coins. **Rejects only before our witness leaves the device**; after that it resolves with what is known plus a `caveat`, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Idempotent on the request id, sets no deadline of its own, and accepts `feeHeadroomSats` as an alias for `maxTotalFeeSat`. The money leaves for a stranger's channel, so amount + fee ceiling counts against the combined daily spend limit, and a draining node refuses it (both before the exchange opens) |
 | POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel) |
 | POST | `/invoice/settle-hold` | `{ preimage }` | Settle a parked hold invoice (fulfills all MPP parts) |
 | POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |

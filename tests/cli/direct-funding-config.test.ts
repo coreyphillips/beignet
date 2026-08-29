@@ -49,6 +49,38 @@ const OFFLINE = {
 
 const VARS = ['BEIGNET_DF_RELAY', 'BEIGNET_DF_MIN_AMOUNT'];
 
+/** One daemon call, JSON in and out. */
+function httpCall(
+	port: number,
+	method: 'GET' | 'POST',
+	route: string,
+	body?: unknown
+): Promise<{ status: number; json: Record<string, unknown> }> {
+	return new Promise((resolve, reject) => {
+		const req = http.request(
+			{
+				host: '127.0.0.1',
+				port,
+				path: route,
+				method,
+				headers: { 'content-type': 'application/json' }
+			},
+			(res) => {
+				let raw = '';
+				res.on('data', (c) => (raw += c));
+				res.on('end', () =>
+					resolve({ status: res.statusCode ?? 0, json: JSON.parse(raw) })
+				);
+			}
+		);
+		req.on('error', reject);
+		req.end(body === undefined ? undefined : JSON.stringify(body));
+	});
+}
+
+const errorOf = (json: Record<string, unknown>): { code: string } =>
+	json.error as { code: string };
+
 describe('resolveConfig direct funding', () => {
 	afterEach(() => {
 		for (const v of VARS) delete process.env[v];
@@ -137,32 +169,11 @@ describe('direct funding daemon surface', function () {
 
 	const LSP = '02' + 'ab'.repeat(32);
 
-	async function call(
+	const call = (
 		method: 'GET' | 'POST',
 		route: string,
 		body?: unknown
-	): Promise<{ status: number; json: Record<string, unknown> }> {
-		return new Promise((resolve, reject) => {
-			const req = http.request(
-				{
-					host: '127.0.0.1',
-					port,
-					path: route,
-					method,
-					headers: { 'content-type': 'application/json' }
-				},
-				(res) => {
-					let raw = '';
-					res.on('data', (c) => (raw += c));
-					res.on('end', () =>
-						resolve({ status: res.statusCode ?? 0, json: JSON.parse(raw) })
-					);
-				}
-			);
-			req.on('error', reject);
-			req.end(body === undefined ? undefined : JSON.stringify(body));
-		});
-	}
+	): ReturnType<typeof httpCall> => httpCall(port, method, route, body);
 
 	const resultOf = (json: Record<string, unknown>): Record<string, unknown> =>
 		json.result as Record<string, unknown>;
@@ -371,5 +382,88 @@ describe('direct funding daemon surface', function () {
 		expect(resultOf(json).lspPubkey).to.equal(LSP);
 		expect(resultOf(json).minAmountSat).to.equal(30_000);
 		expect(resultOf(json).trusted).to.equal(true);
+	});
+});
+
+/**
+ * A direct-funding send pays a stranger out of our own coin and holds the
+ * request open for the whole exchange, so it answers to the same two node-wide
+ * gates every other outgoing payment does. Both refuse before the engine is
+ * entered, which keeps them on the pre-witness side of the never-reject rule.
+ */
+describe('direct funding under the node-wide payment gates', function () {
+	this.timeout(30_000);
+	let dataDir: string;
+	let daemon: Awaited<ReturnType<typeof startDaemon>>;
+	let port: number;
+
+	const call = (
+		method: 'GET' | 'POST',
+		route: string,
+		body?: unknown
+	): ReturnType<typeof httpCall> => httpCall(port, method, route, body);
+
+	/** A request minted by this node, which is payable and cheap to make. */
+	async function mintedRequest(): Promise<string> {
+		const { json } = await call('POST', '/direct-funding/request', {});
+		return (json.result as { request: string }).request;
+	}
+
+	before(async () => {
+		dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-df-gates-'));
+		daemon = await startDaemon({
+			...OFFLINE,
+			dataDir,
+			dailySpendLimitSats: 1
+		});
+		port = (daemon.server.address() as AddressInfo).port;
+	});
+
+	after(async () => {
+		await daemon.stop();
+		fs.rmSync(dataDir, { recursive: true, force: true });
+	});
+
+	it('refuses a send while the node is draining', async () => {
+		const request = await mintedRequest();
+		daemon.node.setDraining(true);
+		try {
+			const { json } = await call('POST', '/direct-funding/send', {
+				request,
+				amountSats: 50_000
+			});
+			// /stop closes storage and networking once the drain poll comes back
+			// empty, and this exchange would still have been running inside it.
+			expect(errorOf(json).code).to.equal('SERVICE_DRAINING');
+		} finally {
+			daemon.node.setDraining(false);
+		}
+	});
+
+	it('counts a direct-funding send against the daily spend limit', async () => {
+		const request = await mintedRequest();
+		const { json } = await call('POST', '/direct-funding/send', {
+			request,
+			amountSats: 50_000
+		});
+		// The receiver is a stranger's channel: the money leaves, exactly as it
+		// does on an address-targeted splice-out.
+		expect(errorOf(json).code).to.equal('SPENDING_LIMIT_EXCEEDED');
+	});
+
+	it('is quiet about the amount a fixed-amount request names', async () => {
+		// The app posts no amount for a request that fixes one, so the limit has
+		// to read it off the envelope rather than off the body.
+		const minted = await call('POST', '/direct-funding/request', {
+			amountSats: 60_000
+		});
+		const { json } = await call('POST', '/direct-funding/send', {
+			request: (minted.json.result as { request: string }).request
+		});
+		expect(errorOf(json).code).to.equal('SPENDING_LIMIT_EXCEEDED');
+	});
+
+	it('has no pending payment when nothing is running', () => {
+		expect(daemon.node.hasPendingPayments()).to.equal(false);
 	});
 });

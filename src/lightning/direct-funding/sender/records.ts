@@ -152,6 +152,25 @@ export class DirectFundingPaymentStore {
 		return this.update(requestIdHex, { ...commit, status: 'SIGNED_PENDING' });
 	}
 
+	/**
+	 * Undo a commit whose witness never reached the wire.
+	 *
+	 * A lane throws from `send` only when it could not carry the frame at all,
+	 * so nothing can have answered it and the record must stop describing a
+	 * spend: the commitment is dropped, the coin comes free, and the request
+	 * goes back to the offer it was. Leaving SIGNED_PENDING behind would pin the
+	 * coin to a payment that never happened.
+	 */
+	rollbackWitness(requestIdHex: string): boolean {
+		const record = this.byRequest.get(requestIdHex);
+		if (!record) return false;
+		delete record.attestation;
+		delete record.negotiatedTx;
+		delete record.witness;
+		delete record.fundingTxid;
+		return this.update(requestIdHex, { status: 'OFFERED', frozen: false });
+	}
+
 	/** Drop a record outright. Only ever a record no witness was built for. */
 	forget(requestIdHex: string): void {
 		const record = this.byRequest.get(requestIdHex);

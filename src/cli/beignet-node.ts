@@ -100,6 +100,7 @@ import {
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import {
 	DF_HARD_MIN_OFFER_AMOUNT_SAT,
+	DF_POST_WITNESS_STATES,
 	DirectFundingError,
 	DirectFundingPaymentStore,
 	DirectFundingSender,
@@ -355,8 +356,9 @@ export interface BeignetNodeOptions {
 	/**
 	 * COMBINED daily spending limit in satoshis, shared by Lightning payments
 	 * (payInvoice/sendKeysend/sendPaymentAsync) AND external on-chain sends
-	 * (sendOnchain and sendMaxOnchain, counted as amount + fee). Excluded by
-	 * design: consolidateUtxos (self-pay), channel opens/splices/funding, and
+	 * (sendOnchain and sendMaxOnchain, address-targeted spliceOut and
+	 * sendDirectFunding, counted as amount + fee). Excluded by design:
+	 * consolidateUtxos (self-pay), our own channel opens/splices/funding, and
 	 * bumpFeeOnchain/boostOnchain (fee-only). Resets at midnight UTC.
 	 * NOTE: before v0.3.0 this limit covered Lightning only.
 	 */
@@ -873,6 +875,13 @@ export const ASYNC_SPEND_CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
 export const MAX_ASYNC_SPEND_CLAIMS = 4096;
 
 /**
+ * Direct-funding offers remembered as charged to the daily budget. Only a
+ * retry of a payment this process already made ever reads one, so the oldest
+ * entries are the safe ones to drop.
+ */
+const MAX_DIRECT_FUNDING_CHARGES = 1024;
+
+/**
  * Default ceiling on an L402 response body. The body is buffered and then
  * re-serialized into the daemon's JSON envelope, so a remote server's response
  * size is a memory cost here, not just a transfer one.
@@ -1242,6 +1251,8 @@ export class BeignetNode extends EventEmitter {
 	private _deferredOpts?: BeignetNodeOptions;
 	/** The direct-funding payer, built over the node's own lane registry. */
 	private directFundingSender?: DirectFundingSender;
+	/** Offers already charged to the daily budget, so a replay is not. */
+	private readonly _directFundingCharged = new Set<string>();
 	/** Backoff timer for the startup gate confirmation loop. */
 	private _confirmTimer?: ReturnType<typeof setTimeout>;
 	private _leaseCheckTimer?: ReturnType<typeof setInterval>;
@@ -5674,7 +5685,9 @@ export class BeignetNode extends EventEmitter {
 	 * Rejects only BEFORE our witness leaves the device. After that it resolves
 	 * with whatever is known, because the caller's fallback on a throw is a
 	 * second on-chain payment of the same amount, and a late rejection would
-	 * make that a double spend of the user's money rather than a recovery.
+	 * make that a double spend of the user's money rather than a recovery. Both
+	 * refusals below are pre-witness by construction: they run before the engine
+	 * is entered at all.
 	 */
 	async sendDirectFunding(opts: {
 		request?: string;
@@ -5696,27 +5709,76 @@ export class BeignetNode extends EventEmitter {
 				'request (the payment request from the BIP 21 URI) is required'
 			);
 		}
+		// A draining node takes no new payment, and this one holds a socket open
+		// for a whole offer-to-receipt exchange: admitting it would let /stop tear
+		// down storage and networking around a witness that had already left.
+		this._checkDraining();
 		const ceiling = opts.maxTotalFeeSat ?? opts.feeHeadroomSats;
+		const sendOpts = {
+			...(opts.amountSats !== undefined && opts.amountSats !== 0
+				? {
+						amountSat: BigInt(
+							requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
+						)
+				  }
+				: {}),
+			...(ceiling !== undefined
+				? {
+						maxTotalFeeSat: BigInt(
+							requireNonNegativeSafeInteger(ceiling, 'maxTotalFeeSat')
+						)
+				  }
+				: {})
+		};
+		// This pays a STRANGER's channel out of our own coin, so it is an external
+		// spend like an address-targeted splice-out, not the internal funding the
+		// limit excludes. Quoted rather than read off the request body: the
+		// envelope may fix the amount and the app then posts none. The ceiling is
+		// what is charged, since the exact fee is only known once the receiver has
+		// built the transaction, and over-charging a fee allowance errs the safe
+		// way.
+		let costSats: number;
 		try {
-			return await sender.send(opts.request, {
-				...(opts.amountSats !== undefined && opts.amountSats !== 0
-					? {
-							amountSat: BigInt(
-								requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
-							)
-					  }
-					: {}),
-				...(ceiling !== undefined
-					? {
-							maxTotalFeeSat: BigInt(
-								requireNonNegativeSafeInteger(ceiling, 'maxTotalFeeSat')
-							)
-					  }
-					: {})
-			});
+			const quote = sender.quote(opts.request, sendOpts);
+			costSats = Number(quote.amountSat + quote.maxTotalFeeSat);
+			this._checkSpendLimit(costSats);
 		} catch (err) {
 			throw this.directFundingFailure(err);
 		}
+		const reserving = this._dailySpendLimitSats !== undefined;
+		// Reserved for the length of the exchange, so two sends cannot both pass
+		// the check before either has recorded anything.
+		if (reserving) this._pendingSpendSats += costSats;
+		try {
+			const result = await sender.send(opts.request, sendOpts);
+			// Only a witness that actually left is money spent, and only once: a
+			// retried send replays its recorded attempt rather than paying again.
+			if (
+				DF_POST_WITNESS_STATES.has(result.status) &&
+				!this._directFundingCharged.has(result.offerId)
+			) {
+				this._chargeDirectFunding(result.offerId, costSats);
+			}
+			return result;
+		} catch (err) {
+			throw this.directFundingFailure(err);
+		} finally {
+			if (reserving) this._pendingSpendSats -= costSats;
+		}
+	}
+
+	/**
+	 * Charge one direct-funding payment to the daily budget, once. The offer id
+	 * is stable for a request, so a replay of the same payment is recognised;
+	 * the set is bounded because it is only ever read for a live send.
+	 */
+	private _chargeDirectFunding(offerId: string, costSats: number): void {
+		if (this._directFundingCharged.size >= MAX_DIRECT_FUNDING_CHARGES) {
+			const oldest = this._directFundingCharged.values().next().value;
+			if (oldest !== undefined) this._directFundingCharged.delete(oldest);
+		}
+		this._directFundingCharged.add(offerId);
+		this._recordSpend(costSats, 'onchain');
 	}
 
 	/** Every direct-funding payment this device has a record of. */
@@ -6198,6 +6260,10 @@ export class BeignetNode extends EventEmitter {
 		// A restore-pending daemon has no node and therefore no payments; the
 		// stop route's drain poll must not crash on it.
 		if (this._restorePending) return false;
+		// A direct-funding exchange holds an HTTP request open across a witness
+		// that may already be broadcast. Shutting down under one loses the only
+		// response the caller has, and it falls back to a second payment.
+		if ((this.directFundingSender?.inFlight() ?? 0) > 0) return true;
 		const payments = this.node.listPayments();
 		return payments.some((p) => p.status === 'PENDING');
 	}

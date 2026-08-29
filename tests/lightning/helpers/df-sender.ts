@@ -83,9 +83,13 @@ export interface ITestCoin extends IDfSenderCoin {
 
 export function makeCoin(
 	valueSat = 200_000,
-	kind: 'p2wpkh' | 'p2tr' = 'p2wpkh'
+	kind: 'p2wpkh' | 'p2tr' = 'p2wpkh',
+	/** Derive the whole coin, so a second life rebuilds the same outpoint. */
+	seed?: Buffer
 ): ITestCoin {
-	const privkey = crypto.randomBytes(32);
+	const from = (label: string): Buffer =>
+		crypto.createHash('sha256').update(seed!).update(label).digest();
+	const privkey = seed ? from('key') : crypto.randomBytes(32);
 	const pubkey = getPublicKey(privkey);
 	const script =
 		kind === 'p2wpkh'
@@ -94,7 +98,7 @@ export function makeCoin(
 					.output!;
 	const prevTx = new bitcoin.Transaction();
 	prevTx.version = 2;
-	prevTx.addInput(crypto.randomBytes(32), 0);
+	prevTx.addInput(seed ? from('prevout') : crypto.randomBytes(32), 0);
 	prevTx.addOutput(script, valueSat);
 	return {
 		prevTx,
@@ -111,10 +115,18 @@ export function makeCoin(
 
 // ─────────────── The payer's wallet ───────────────
 
+/** Somewhere a freeze can outlive the process, as the real wallet's does. */
+export interface IFreezeStore {
+	load(): string[];
+	save(outpoints: string[]): void;
+}
+
 export class FakeSenderWallet implements IDfSenderWallet {
 	coins: ITestCoin[] = [];
 	readonly frozen = new Set<string>();
 	readonly changeScript_: Buffer;
+	/** Held before the freeze resolves, to open a window mid-honor. */
+	freezeDelayMs = 0;
 	/** Transactions this wallet knows, txid -> confirmed. */
 	readonly known = new Map<string, boolean>();
 	/** Outpoint key -> the confirmed txid that spent it. */
@@ -125,17 +137,30 @@ export class FakeSenderWallet implements IDfSenderWallet {
 	readonly chain = new Map<string, Buffer>();
 	chainFails = false;
 
-	constructor(coins: ITestCoin[] = []) {
+	constructor(
+		coins: ITestCoin[] = [],
+		/** Persist freezes, so a second life sees the one a crash left behind. */
+		private readonly freezes?: IFreezeStore
+	) {
 		this.coins = coins;
 		this.changeScript_ = bitcoin.payments.p2wpkh({
 			hash: crypto.randomBytes(20)
 		}).output!;
 		for (const coin of coins)
 			this.chain.set(coin.txidHex, coin.prevTx.toBuffer());
+		for (const outpoint of freezes?.load() ?? []) this.frozen.add(outpoint);
 	}
 
 	listSpendable(): IDfSenderCoin[] {
 		return this.coins.filter((c) => !this.frozen.has(`${c.txidHex}:${c.vout}`));
+	}
+
+	findCoin(txidHex: string, vout: number): IDfSenderCoin | null {
+		// Frozen coins included, as the real wallet's does: a freeze is the payer's
+		// own reservation, not a coin that left.
+		return (
+			this.coins.find((c) => c.txidHex === txidHex && c.vout === vout) ?? null
+		);
 	}
 
 	ownsOutpoint(txidHex: string, vout: number): boolean {
@@ -208,12 +233,19 @@ export class FakeSenderWallet implements IDfSenderWallet {
 
 	async freezeUtxo(txidHex: string, vout: number): Promise<boolean> {
 		if (this.freezeFails) return false;
+		// The write lands first, exactly like the real wallet: a crash in the
+		// delay leaves the freeze behind with no record of why.
 		this.frozen.add(`${txidHex}:${vout}`);
+		this.freezes?.save([...this.frozen]);
+		if (this.freezeDelayMs > 0) {
+			await new Promise((resolve) => setTimeout(resolve, this.freezeDelayMs));
+		}
 		return true;
 	}
 
 	async unfreezeUtxo(txidHex: string, vout: number): Promise<boolean> {
 		this.frozen.delete(`${txidHex}:${vout}`);
+		this.freezes?.save([...this.frozen]);
 		return true;
 	}
 
@@ -273,14 +305,27 @@ export function mintRequest(
 		transports?: DfTransportDescriptor[];
 		network?: Network;
 		nodePrivkey?: Buffer;
+		/**
+		 * Pin the identity a lane's sealing depends on. A second life against a
+		 * persisted envelope has to rebuild the SAME receiver, or its lane cannot
+		 * open a frame the payer sealed for the first one.
+		 */
+		requestId?: Buffer;
+		preimage?: Buffer;
+		encryptionPrivateKey?: Buffer;
 	} = {}
 ): ITestRequest {
 	const nodePrivkey = opts.nodePrivkey ?? crypto.randomBytes(32);
 	const nodeId = getPublicKey(nodePrivkey);
-	const preimage = crypto.randomBytes(32);
+	const preimage = opts.preimage ?? crypto.randomBytes(32);
 	const receiptHash = crypto.createHash('sha256').update(preimage).digest();
-	const requestId = crypto.randomBytes(16);
-	const encryption = mintRequestEncryptionKeys();
+	const requestId = opts.requestId ?? crypto.randomBytes(16);
+	const encryption = opts.encryptionPrivateKey
+		? {
+				privateKey: opts.encryptionPrivateKey,
+				publicKey: getPublicKey(opts.encryptionPrivateKey)
+		  }
+		: mintRequestEncryptionKeys();
 	const transports = opts.transports ?? [
 		{ type: DfTransportType.DIRECT_PEER, host: '127.0.0.1', port: 9735 }
 	];
@@ -434,6 +479,24 @@ export function registryWith(lane: IDfTransport): DfTransportRegistry {
 		type: DfTransportType.DIRECT_PEER,
 		enabled: true,
 		load: () => factory
+	});
+	return registry;
+}
+
+/** A registry that hands each request its own lane, by request id. */
+export function registryRouting(
+	lanes: Map<string, IDfTransport>
+): DfTransportRegistry {
+	const registry = new DfTransportRegistry();
+	registry.register({
+		type: DfTransportType.DIRECT_PEER,
+		enabled: true,
+		load: () => ({
+			type: DfTransportType.DIRECT_PEER,
+			open: async (_descriptor, ctx) =>
+				lanes.get(ctx.requestId.toString('hex')) ?? null,
+			attachInbound: () => (): void => undefined
+		})
 	});
 	return registry;
 }

@@ -60,6 +60,7 @@ import {
 import type { IDfInboundFrame, IDfTransport } from '../transport/types';
 import { prevoutProblem, signRequestProblem } from './verify';
 import {
+	DF_COIN_HELD_STATES,
 	DF_DEFAULT_MAX_TOTAL_FEE_SAT,
 	DF_LOG_FORGED_RECEIPT,
 	DF_LOG_PAYMENT_RECONCILED,
@@ -114,6 +115,13 @@ interface IDfAttempt {
 	signer: IDfCoinSigner;
 	/** Prev txid in INTERNAL byte order, as transaction inputs carry it. */
 	prevTxid: Buffer;
+	/**
+	 * Set once a witness for this attempt has actually reached a lane. The
+	 * record cannot answer this on its own: `commitWitness` marks it
+	 * SIGNED_PENDING in memory even when the write it was refusing on failed,
+	 * and that case is a refusal with nothing emitted.
+	 */
+	witnessEmitted?: boolean;
 }
 
 /** The exchange's control surface, handed to the frame handlers. */
@@ -122,6 +130,8 @@ interface IDfExchangeControl {
 	sawSignRequest(): boolean;
 	markSignRequest(): void;
 	committed(): boolean;
+	/** The send has already resolved or rejected; nothing more may be emitted. */
+	settled(): boolean;
 	commit(witness: Buffer[]): void;
 	done(caveat?: string): void;
 	fail(err: Error): void;
@@ -138,6 +148,13 @@ export class DirectFundingSender {
 	 * help, because the retry never gets that far.
 	 */
 	private readonly inflight = new Map<string, Promise<IDfSendResult>>();
+	/**
+	 * The coin a running send has committed to, by request id. The durable
+	 * records hold a coin from the moment one is opened; this covers the window
+	 * before that, in which two sends for DIFFERENT requests would otherwise
+	 * select the same coin and both sign it.
+	 */
+	private readonly reserved = new Map<string, string>();
 	private sweepTimer: NodeJS.Timeout | null = null;
 
 	constructor(
@@ -161,6 +178,7 @@ export class DirectFundingSender {
 	/** Arm the reconciliation sweep over records whose funding is in flight. */
 	start(): void {
 		if (this.sweepTimer) return;
+		this.releaseUnwitnessedFreezes();
 		this.sweepTimer = setInterval(() => {
 			void this.reconcile();
 		}, this.cfg.sweepIntervalMs);
@@ -171,6 +189,30 @@ export class DirectFundingSender {
 		if (!this.sweepTimer) return;
 		clearInterval(this.sweepTimer);
 		this.sweepTimer = null;
+	}
+
+	/** Sends running right now. The daemon's drain waits on these. */
+	inFlight(): number {
+		return this.inflight.size;
+	}
+
+	/**
+	 * Release a freeze left behind by a run that died between reserving a coin
+	 * and recording its witness.
+	 *
+	 * Persist-before-emit means a record still short of SIGNED_PENDING has no
+	 * witness on any wire, so its coin was never spent. Nothing else would ever
+	 * lift that freeze: the wallet reports a frozen coin as unspendable, so even
+	 * a retry of the same request could not find the coin it was offered.
+	 */
+	private releaseUnwitnessedFreezes(): void {
+		for (const record of this.deps.payments.list()) {
+			if (record.status !== 'CREATED' && record.status !== 'OFFERED') continue;
+			if (this.inflight.has(record.requestId)) continue;
+			void this.deps.wallet
+				.unfreezeUtxo(record.spentTxid, record.spentVout)
+				.catch(() => undefined);
+		}
 	}
 
 	// ─────────────── The send ───────────────
@@ -208,7 +250,26 @@ export class DirectFundingSender {
 			return await run;
 		} finally {
 			this.inflight.delete(requestIdHex);
+			this.reserved.delete(requestIdHex);
 		}
+	}
+
+	/**
+	 * What a send of this request would cost us at most, without starting one.
+	 *
+	 * The daemon's spend accounting needs the amount BEFORE the exchange opens,
+	 * and when the caller names none only the envelope knows it. Throws exactly
+	 * what `send` would throw for the same arguments.
+	 */
+	quote(
+		encodedRequest: string,
+		opts: IDfSendOptions = {}
+	): { amountSat: bigint; maxTotalFeeSat: bigint } {
+		const env = this.decode(encodedRequest, opts.now);
+		return {
+			amountSat: resolveAmount(env, opts.amountSat),
+			maxTotalFeeSat: opts.maxTotalFeeSat ?? this.cfg.defaultMaxTotalFeeSat
+		};
 	}
 
 	/** Every payment this device has a record of. */
@@ -344,7 +405,14 @@ export class DirectFundingSender {
 				'maxTotalFeeSat must not be negative'
 			);
 		}
-		const coin = this.selectCoin(amountSat, maxTotalFeeSat);
+		const coin = this.selectCoin(
+			amountSat,
+			maxTotalFeeSat,
+			this.heldOutpoints(requestIdHex)
+		);
+		// Before the first await, and before the record exists: a send for
+		// another request arriving in that window must not select this coin.
+		this.reserved.set(requestIdHex, `${coin.txidHex}:${coin.vout}`);
 		const signer = this.signerFor(coin);
 		const changeScript = await this.deps.wallet.changeScript();
 		const txid = Buffer.from(coin.txidHex, 'hex');
@@ -420,11 +488,10 @@ export class DirectFundingSender {
 		env: IDfRequestEnvelope,
 		record: IDfPaymentRecord
 	): IDfAttempt {
-		const coin = this.deps.wallet
-			.listSpendable()
-			.find(
-				(c) => c.txidHex === record.spentTxid && c.vout === record.spentVout
-			);
+		// findCoin, not listSpendable: our own freeze may already be on this coin,
+		// and reading that as a coin that went elsewhere would abandon a payment
+		// over a reservation this request made itself.
+		const coin = this.deps.wallet.findCoin(record.spentTxid, record.spentVout);
 		if (!coin) {
 			// The coin went somewhere else before the offer was ever answered. The
 			// attempt can never complete, and leaving the record live would wedge the
@@ -434,6 +501,11 @@ export class DirectFundingSender {
 				status: 'ABORTED',
 				reason: `the offered coin ${record.spentTxid}:${record.spentVout} is no longer spendable`
 			});
+			// Nothing was signed in this state, so a freeze this request took has
+			// nothing left to protect and must not outlive it.
+			void this.deps.wallet
+				.unfreezeUtxo(record.spentTxid, record.spentVout)
+				.catch(() => undefined);
 			throw new DirectFundingError(
 				DirectFundingErrorCode.NO_SUITABLE_UTXO,
 				`the coin this request was offered, ${record.spentTxid}:${record.spentVout}, is no longer spendable`
@@ -469,7 +541,27 @@ export class DirectFundingSender {
 	}
 
 	/**
-	 * The largest single coin covering the payment and its fee ceiling.
+	 * Coins another request has already committed to. The freeze cannot carry
+	 * this on its own: it only lands when an exchange reaches its sign request,
+	 * so between selection and the witness the wallet still reports the coin as
+	 * spendable and a second request would sign the same input.
+	 */
+	private heldOutpoints(exceptRequestIdHex: string): ReadonlySet<string> {
+		const held = new Set<string>();
+		for (const [requestId, outpoint] of this.reserved) {
+			if (requestId !== exceptRequestIdHex) held.add(outpoint);
+		}
+		for (const record of this.deps.payments.list()) {
+			if (record.requestId === exceptRequestIdHex) continue;
+			if (!DF_COIN_HELD_STATES.has(record.status)) continue;
+			held.add(`${record.spentTxid}:${record.spentVout}`);
+		}
+		return held;
+	}
+
+	/**
+	 * The largest single coin covering the payment and its fee ceiling, out of
+	 * those no other request holds.
 	 *
 	 * Single-input offers are the protocol's shape: the receiver verifies ONE
 	 * ownership proof and holds ONE witness slot. What changes from the fork is
@@ -477,18 +569,30 @@ export class DirectFundingSender {
 	 * failure; those two want opposite things from the caller, so they carry
 	 * different codes.
 	 */
-	private selectCoin(amountSat: bigint, maxTotalFeeSat: bigint): IDfSenderCoin {
+	private selectCoin(
+		amountSat: bigint,
+		maxTotalFeeSat: bigint,
+		held: ReadonlySet<string>
+	): IDfSenderCoin {
 		const need = amountSat + maxTotalFeeSat;
 		let best: IDfSenderCoin | null = null;
+		let heldCandidates = 0;
 		for (const coin of this.deps.wallet.listSpendable()) {
 			if (coin.valueSat < need) continue;
+			if (held.has(`${coin.txidHex}:${coin.vout}`)) {
+				heldCandidates++;
+				continue;
+			}
 			if (!best || coin.valueSat > best.valueSat) best = coin;
 		}
 		if (!best) {
 			throw new DirectFundingError(
 				DirectFundingErrorCode.NO_SUITABLE_UTXO,
 				`direct funding needs one coin worth at least ${need} sat ` +
-					`(${amountSat} sat plus the ${maxTotalFeeSat} sat fee allowance)`
+					`(${amountSat} sat plus the ${maxTotalFeeSat} sat fee allowance)` +
+					(heldCandidates > 0
+						? `; ${heldCandidates} large enough coin(s) are already offered to another direct-funding payment`
+						: '')
 			);
 		}
 		return best;
@@ -532,8 +636,22 @@ export class DirectFundingSender {
 				(lane) => this.exchange(attempt, lane)
 			);
 		} catch (err) {
-			// Everything reaching here is pre-witness: `exchange` resolves once the
-			// witness is out, and the registry only propagates what a lane raised
+			if (attempt.witnessEmitted) {
+				// A witness is out, whatever the lane went on to raise. Rejecting here
+				// would send the caller into its fallback for a funding that may
+				// already be broadcast, so the contract outranks the error and it
+				// comes back as a caveat on what is known.
+				const caveat = errorText(err);
+				const record =
+					this.deps.payments.get(attempt.record.requestId) ?? attempt.record;
+				this.log(DF_LOG_SEND_CAVEAT, {
+					requestId: record.requestId,
+					caveat
+				});
+				return { ...resultFrom(record), caveat };
+			}
+			// Everything else reaching here is pre-witness: `exchange` resolves once
+			// the witness is out, and the registry only propagates what a lane raised
 			// before that. So the coin is unspent, and the record is closed with the
 			// reason a retry then replays instead of re-offering.
 			const reason = errorText(err);
@@ -646,6 +764,7 @@ export class DirectFundingSender {
 					signRequestSeen = true;
 				},
 				committed: () => committed,
+				settled: () => settled,
 				commit: (witness): void => {
 					const payload = sealed(
 						BeignetCustomSubtype.DIRECT_FUNDING_WITNESS,
@@ -669,9 +788,26 @@ export class DirectFundingSender {
 						// still free. (A throw from a HANDLER cannot arrive here; the
 						// subscription isolates those, as the node's own dispatch does.)
 						committed = false;
-						fail(asError(err));
+						// And the record has to say so too. It was written before the
+						// send, so leaving SIGNED_PENDING behind would pin the coin to a
+						// payment nothing ever made: reconciliation would watch a funding
+						// no one holds, and the freeze would outlive every retry.
+						this.deps.payments.rollbackWitness(attempt.record.requestId);
+						void this.deps.wallet
+							.unfreezeUtxo(attempt.coin.txidHex, attempt.coin.vout)
+							.catch(() => undefined);
+						// Coded as the transport failure it is: the caller reads the code
+						// to decide whether a plain address payment is the right answer,
+						// and here, with nothing spent, it is.
+						fail(
+							new DirectFundingError(
+								DirectFundingErrorCode.UNREACHABLE,
+								`the lane could not carry the witness: ${errorText(err)}`
+							)
+						);
 						return;
 					}
+					attempt.witnessEmitted = true;
 					if (settled) return;
 					// The receipt is proof, not delivery. Its own, shorter window opens
 					// here, and its expiry is a SUCCESS.
@@ -806,30 +942,63 @@ export class DirectFundingSender {
 		this.honor(attempt, request, ctl).catch((err) => ctl.fail(asError(err)));
 	}
 
+	/**
+	 * A delivery receipt, which is a claim about ONE transaction: the one we
+	 * verified and signed. The preimage proves the sender minted this request,
+	 * and nothing more, so it is never allowed to say WHICH transaction was
+	 * delivered or WHEN the exchange reached delivery.
+	 */
 	private onReceipt(
 		attempt: IDfAttempt,
 		receipt: ReturnType<typeof decodeDfReceipt>,
 		ctl: IDfExchangeControl
 	): void {
 		if (receipt.offerId.toString('hex') !== ctl.offerIdHex) return;
+		const reject = (reason: string): void => {
+			// The fork ignored a bad receipt, which is right, and said nothing, which
+			// is not: a receipt we cannot accept is a party claiming a delivery it
+			// cannot prove.
+			this.log(DF_LOG_FORGED_RECEIPT, {
+				requestId: attempt.record.requestId,
+				offerId: ctl.offerIdHex,
+				reason
+			});
+		};
+		if (!ctl.committed()) {
+			// Nothing has been signed yet, so there is no funding to have delivered.
+			// Resolving on this would report a payment that never happened as a
+			// success, which is the one answer that stops the caller falling back.
+			reject('no witness has left this device');
+			return;
+		}
 		const hash = crypto
 			.createHash('sha256')
 			.update(receipt.preimage)
 			.digest('hex');
 		if (hash !== attempt.record.receiptHash) {
-			// The fork ignored this, which is right, and said nothing, which is not:
-			// a receipt that does not open the request's hash is a party claiming a
-			// delivery it cannot prove.
-			this.log(DF_LOG_FORGED_RECEIPT, {
-				requestId: attempt.record.requestId,
-				offerId: ctl.offerIdHex
-			});
+			reject('the preimage does not open the request receipt hash');
+			return;
+		}
+		// The funding txid the commit recorded: OUR reading of the transaction we
+		// checked, not the peer's claim about it.
+		const fundingTxid = this.deps.payments.get(attempt.record.requestId)
+			?.fundingTxid;
+		if (!fundingTxid) {
+			reject('this payment has no committed transaction');
+			return;
+		}
+		if (receipt.fundingTxid.toString('hex') !== fundingTxid) {
+			// Taking this would point reconciliation at a transaction nothing here
+			// verified, and confirming it would release the coin against a spend
+			// that is not ours.
+			reject('the receipt names a different transaction');
 			return;
 		}
 		this.deps.payments.update(attempt.record.requestId, {
 			receiptPreimage: receipt.preimage.toString('hex'),
-			fundingTxid: receipt.fundingTxid.toString('hex'),
-			...(receipt.rawTx ? { broadcastTx: receipt.rawTx.toString('hex') } : {})
+			...(isTransactionWithId(receipt.rawTx, fundingTxid)
+				? { broadcastTx: receipt.rawTx!.toString('hex') }
+				: {})
 		});
 		this.log(DF_LOG_SEND_COMPLETED, {
 			requestId: attempt.record.requestId,
@@ -901,6 +1070,12 @@ export class DirectFundingSender {
 			refuse(prevoutIssue);
 			return;
 		}
+		// This runs detached from the exchange, and every await above is a window
+		// the exchange can settle in: a timeout or a decline rejects the send while
+		// this is still on the chain lookup. The caller's fallback payment starts
+		// there, so a witness emitted afterwards is the second payment of the same
+		// money that the whole contract exists to prevent.
+		if (ctl.settled()) return;
 
 		// The witness may broadcast the moment it lands, so the coin stops being
 		// selectable here rather than afterwards. Freezes are persisted and matched
@@ -919,6 +1094,13 @@ export class DirectFundingSender {
 				.unfreezeUtxo(attempt.coin.txidHex, attempt.coin.vout)
 				.catch(() => undefined);
 		};
+		// The last await before the commit, and the last chance to notice. Nothing
+		// below this line yields, so a witness that gets past here is one the send
+		// is still waiting on.
+		if (ctl.settled()) {
+			await release();
+			return;
+		}
 
 		let witness: Buffer[];
 		try {
@@ -1023,6 +1205,20 @@ function resultFrom(record: IDfPaymentRecord): IDfSendResult {
 		...(record.negotiatedTx ? { rawTxHex: record.negotiatedTx } : {}),
 		...(record.broadcastTx ? { broadcastTxHex: record.broadcastTx } : {})
 	};
+}
+
+/**
+ * Whether these bytes are the transaction we committed to. The receipt SHOULD
+ * carry the complete signed transaction, and a witness does not change a txid,
+ * so anything else is somebody else's transaction and is not stored.
+ */
+function isTransactionWithId(raw: Buffer | undefined, txid: string): boolean {
+	if (!raw) return false;
+	try {
+		return bitcoin.Transaction.fromBuffer(raw).getId() === txid;
+	} catch {
+		return false;
+	}
 }
 
 function asError(err: unknown): Error {

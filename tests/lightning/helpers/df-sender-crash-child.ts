@@ -38,6 +38,9 @@ import {
 
 export const DF_CRASH_DB_KEY = Buffer.alloc(32, 0x5d);
 
+/** Where the child's wallet keeps its freezes, so they outlive a kill. */
+export const DF_CRASH_FROZEN_KEY = 'df:test-frozen';
+
 /** Where a life may be killed. `none` runs to completion. */
 export type DfKillLabel =
 	| 'pre-persist'
@@ -70,36 +73,36 @@ async function main(): Promise<void> {
 	storage.open();
 
 	// Everything about the request is derived from the seed, so a second life
-	// against the same database pays the SAME request.
+	// against the same database pays the SAME request. The lane keys and the
+	// request id are part of that: a life that rebuilt a different receiver
+	// could not open a frame the first one was sealed for.
+	const from = (name: string): Buffer =>
+		crypto.createHash('sha256').update(seed).update(name).digest();
 	const request = mintRequest({
 		nodePrivkey: crypto.createHash('sha256').update(seed).digest(),
+		requestId: from('request-id').subarray(0, 16),
+		preimage: from('preimage'),
+		encryptionPrivateKey: from('encryption'),
 		amountSat: 100_000n
 	});
 	const persisted = storage.loadWalletData('df:test-request');
 	const encoded = persisted ?? request.encoded;
 	if (!persisted) storage.saveWalletData('df:test-request', encoded);
-	// The coin is derived too: a resumed life must find the same outpoint the
-	// record pinned.
-	const coin = makeCoin(200_000);
-	const coinSeed = storage.loadWalletData('df:test-coin');
-	if (coinSeed) {
-		const kept = JSON.parse(coinSeed) as { hex: string; privkey: string };
-		coin.prevTx = require('bitcoinjs-lib').Transaction.fromHex(kept.hex);
-		coin.txidHex = coin.prevTx.getId();
-		coin.privkey = Buffer.from(kept.privkey, 'hex');
-	} else {
-		storage.saveWalletData(
-			'df:test-coin',
-			JSON.stringify({
-				hex: coin.prevTx.toHex(),
-				privkey: coin.privkey.toString('hex')
-			})
-		);
-	}
+	// The coin is derived too, key and script included: a resumed life must find
+	// the same outpoint the record pinned, and re-offer the same terms over it.
+	const coin = makeCoin(200_000, 'p2wpkh', from('coin'));
 	process.stdout.write(`request:${encoded}\n`);
 	process.stdout.write(`coin:${coin.txidHex}:${coin.vout}\n`);
 
-	const wallet = new FakeSenderWallet([coin]);
+	// The freeze goes to the same file the record does, so the two orderings can
+	// be judged against each other after the kill: an in-memory freeze would
+	// vanish with the process and hide a coin stranded on disk.
+	const wallet = new FakeSenderWallet([coin], {
+		load: (): string[] =>
+			JSON.parse(storage.loadWalletData(DF_CRASH_FROZEN_KEY) ?? '[]'),
+		save: (outpoints): void =>
+			storage.saveWalletData(DF_CRASH_FROZEN_KEY, JSON.stringify(outpoints))
+	});
 	const payments = new DirectFundingPaymentStore({
 		storage: {
 			saveWalletData: (key, value): void => {
@@ -131,7 +134,9 @@ async function main(): Promise<void> {
 	const lane = new ScriptedReceiverLane(
 		request,
 		acceptingReceiver(request, {
-			noReceipt: true,
+			// The receipt closes a life that runs to completion, so it settles on
+			// the frame rather than on an unref'd timer. A killed life never gets
+			// this far: the spin below happens first.
 			onWitness: (): void => {
 				process.stdout.write('witness-seen\n');
 				if (label === 'post-witness') {

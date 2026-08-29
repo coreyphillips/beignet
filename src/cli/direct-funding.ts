@@ -92,6 +92,25 @@ export function directFundingWallet(
 			return coins;
 		},
 
+		findCoin(txidHex: string, vout: number): IDfSenderCoin | null {
+			// Frozen coins included: this is how a resumed attempt finds the coin it
+			// froze before the run that took it died. A freeze is this payer's own
+			// reservation, not a coin that went somewhere else.
+			const utxo = (wallet.listUtxos() ?? []).find(
+				(u) => u.tx_hash === txidHex && u.tx_pos === vout
+			);
+			if (!utxo) return null;
+			const script = scriptFor(utxo.address);
+			if (!script || !scriptKind(script)) return null;
+			return {
+				txidHex: utxo.tx_hash,
+				vout: utxo.tx_pos,
+				valueSat: BigInt(utxo.value),
+				script,
+				height: utxo.height
+			};
+		},
+
 		ownsOutpoint(txidHex: string, vout: number): boolean {
 			// Frozen coins included on purpose: the question is whether spending
 			// this outpoint moves OUR money, and a freeze does not change that.

@@ -1489,6 +1489,10 @@ async function bootDaemon(
 		// and the browser fetch has none, so it may block for the whole offer to
 		// receipt exchange. That is what makes the contract implementable rather
 		// than a race against a deadline.
+		//
+		// It answers to the two node-wide gates every other outgoing payment
+		// does, both of them ahead of the exchange: a draining node refuses it,
+		// and its amount plus fee ceiling counts against the daily spend limit.
 		'POST /direct-funding/send': async (body) => {
 			const { request, amountSats, maxTotalFeeSat, feeHeadroomSats } = body as {
 				request?: string;
