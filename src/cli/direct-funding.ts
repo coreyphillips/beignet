@@ -19,6 +19,7 @@ import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { ECPairFactory } from 'ecpair';
 import type { Wallet } from '../wallet';
+import type { IUtxo } from '../types';
 import {
 	scriptKind,
 	taprootTweakPrivateKey
@@ -43,6 +44,7 @@ export type IDfWallet = Pick<
 	Wallet,
 	| 'listUtxos'
 	| 'isUtxoFrozen'
+	| 'listFrozenUtxos'
 	| 'freezeUtxo'
 	| 'unfreezeUtxo'
 	| 'getPrivateKey'
@@ -50,6 +52,25 @@ export type IDfWallet = Pick<
 	| 'transactions'
 	| 'electrum'
 >;
+
+/**
+ * Marks a freeze as this payer's reservation. The wallet answers Ok for a coin
+ * that is already frozen, so the result alone cannot say whose reservation one
+ * is; an operator's freeze carries no tag and the funding provider's pledges
+ * carry theirs. Taking one of those as our own would sign a coin somebody
+ * withheld, and releasing it at the end would delete their entry.
+ */
+const DF_FREEZE_TAG = 'direct-funding';
+
+/**
+ * Whether a wallet transaction is mined. Electrum reports an unconfirmed
+ * transaction at height 0 and one with an unconfirmed parent at -1, so a
+ * truthiness test would read the second as confirmed and release the payer's
+ * coin against a funding still sitting in the mempool.
+ */
+function isConfirmed(height?: number): boolean {
+	return (height ?? 0) > 0;
+}
 
 /**
  * Adapt the on-chain wallet for the payer engine.
@@ -69,6 +90,12 @@ export function directFundingWallet(
 			return null;
 		}
 	};
+
+	/** The frozen-list entry for an outpoint, which carries whose freeze it is. */
+	const frozenEntry = (txidHex: string, vout: number): IUtxo | undefined =>
+		wallet
+			.listFrozenUtxos()
+			.find((f) => f.tx_hash === txidHex && f.tx_pos === vout);
 
 	return {
 		listSpendable(): IDfSenderCoin[] {
@@ -224,11 +251,23 @@ export function directFundingWallet(
 		},
 
 		async freezeUtxo(txidHex: string, vout: number): Promise<boolean> {
-			const result = await wallet.freezeUtxo({ txid: txidHex, index: vout });
+			const held = frozenEntry(txidHex, vout);
+			// A freeze already on the coin is only a reservation this payer may sign
+			// against when this payer took it. Anyone else's is a coin withheld from
+			// us, and the wallet's Ok would otherwise read as our own.
+			if (held) return held.freezeTag === DF_FREEZE_TAG;
+			const result = await wallet.freezeUtxo({
+				txid: txidHex,
+				index: vout,
+				tag: DF_FREEZE_TAG
+			});
 			return result.isOk();
 		},
 
 		async unfreezeUtxo(txidHex: string, vout: number): Promise<boolean> {
+			// Ours only. A payment settling must not lift the freeze an operator put
+			// on the same coin, which outlives this payment by design.
+			if (frozenEntry(txidHex, vout)?.freezeTag !== DF_FREEZE_TAG) return false;
 			const result = await wallet.unfreezeUtxo({ txid: txidHex, index: vout });
 			return result.isOk();
 		},
@@ -236,7 +275,7 @@ export function directFundingWallet(
 		txStatus(txidHex: string): { known: boolean; confirmed: boolean } | null {
 			const tx = wallet.transactions[txidHex];
 			if (!tx) return null;
-			return { known: true, confirmed: Boolean(tx.height) };
+			return { known: true, confirmed: isConfirmed(tx.height) };
 		},
 
 		confirmedSpendOf(txidHex: string, vout: number): string | null {
@@ -245,7 +284,7 @@ export function directFundingWallet(
 			// one counts: rev 2 makes a payment FAILED on a conflict that confirmed,
 			// never on one merely seen.
 			for (const tx of Object.values(wallet.transactions)) {
-				if (!tx.height) continue;
+				if (!isConfirmed(tx.height)) continue;
 				for (const vin of tx.vin) {
 					if (!('txid' in vin)) continue;
 					if (vin.txid === txidHex && vin.vout === vout) return tx.txid;

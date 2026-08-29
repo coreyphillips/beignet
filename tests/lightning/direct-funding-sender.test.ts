@@ -908,11 +908,12 @@ describe('Direct funding sender: idempotency (defect D6)', () => {
 		};
 		await refusal(makeSender().send(request.encoded, { amountSat: 100_000n }));
 		// The first attempt died pre-witness and closed the record, so a retry
-		// replays that refusal rather than committing a second coin.
+		// replays that refusal, code included, rather than committing a second
+		// coin.
 		const err = await refusal(
 			makeSender().send(request.encoded, { amountSat: 100_000n })
 		);
-		expect(err.code).to.equal(DirectFundingErrorCode.OFFER_DECLINED);
+		expect(err.code).to.equal(DirectFundingErrorCode.EXCHANGE_TIMEOUT);
 		expect(bodies, 'the retry re-ran the exchange').to.have.length(1);
 	});
 
@@ -1459,5 +1460,162 @@ describe('Direct funding sender: a freeze that outlived its run', () => {
 			'ABORTED'
 		);
 		expect(wallet.frozen.size).to.equal(0);
+	});
+});
+
+/**
+ * SIGNED_PENDING is written BEFORE the witness reaches a lane, so on its own it
+ * cannot say which side of that a kill landed on. Replaying it there reports an
+ * undelivered payment as done and holds its coin frozen forever, so the attempt
+ * is re-run instead, and, because the earlier life may in fact have delivered
+ * it, that re-run may no longer reject.
+ */
+describe('Direct funding sender: a commit the wire may never have taken', () => {
+	/** The disk a kill between the commit write and the lane send leaves. */
+	function rewindToPreEmit(storage: ReturnType<typeof memoryStorage>): void {
+		const rows = JSON.parse(storage.loadWalletData(DF_PAYMENTS_STORAGE_KEY)!);
+		delete rows[0].witnessSent;
+		delete rows[0].receiptPreimage;
+		delete rows[0].broadcastTx;
+		rows[0].status = 'SIGNED_PENDING';
+		storage.saveWalletData(DF_PAYMENTS_STORAGE_KEY, JSON.stringify(rows));
+	}
+
+	/** One life over storage the test keeps, reporting what its lane carried. */
+	function life(
+		request: ITestRequest,
+		wallet: FakeSenderWallet,
+		storage: ReturnType<typeof memoryStorage>,
+		opts: { unreachable?: boolean } = {}
+	): {
+		sender: DirectFundingSender;
+		payments: DirectFundingPaymentStore;
+		offers: number;
+		witnesses: Buffer[][];
+	} {
+		const payments = new DirectFundingPaymentStore({ storage });
+		payments.restore();
+		const seen = { offers: 0, witnesses: [] as Buffer[][] };
+		const inner = acceptingReceiver(request, {
+			onWitness: (w): void => {
+				seen.witnesses.push(w);
+			}
+		});
+		const lane = new ScriptedReceiverLane(request, (l, subtype, body): void => {
+			if (subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER) seen.offers++;
+			inner(l, subtype, body);
+		});
+		const sender = new DirectFundingSender(
+			{
+				wallet,
+				registry: opts.unreachable ? unreachableRegistry() : registryWith(lane),
+				payments,
+				chainHash: (): Buffer => REGTEST_HASH
+			},
+			{ offerResendDelaysMs: [], offerTimeoutMs: 200, receiptTimeoutMs: 100 }
+		);
+		return {
+			sender,
+			payments,
+			get offers(): number {
+				return seen.offers;
+			},
+			witnesses: seen.witnesses
+		};
+	}
+
+	/** A first life that pays, over storage and a wallet the caller keeps. */
+	async function firstLife(): Promise<{
+		request: ITestRequest;
+		wallet: FakeSenderWallet;
+		storage: ReturnType<typeof memoryStorage>;
+	}> {
+		const storage = memoryStorage();
+		const request = mintRequest();
+		const wallet = new FakeSenderWallet([makeCoin(200_000)]);
+		await life(request, wallet, storage).sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		return { request, wallet, storage };
+	}
+
+	it('retransmits the witness when nothing recorded the wire taking it', async () => {
+		const { request, wallet, storage } = await firstLife();
+		rewindToPreEmit(storage);
+
+		const second = life(request, wallet, storage);
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(second.offers, 'the offer was re-sent').to.equal(1);
+		expect(second.witnesses, 'the witness reached the lane').to.have.length(1);
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.spentTxid).to.equal(wallet.coins[0].txidHex);
+	});
+
+	it('records that the wire took the witness, and then replays', async () => {
+		const { request, wallet, storage } = await firstLife();
+		const record = JSON.parse(
+			storage.loadWalletData(DF_PAYMENTS_STORAGE_KEY)!
+		)[0];
+		expect(record.witnessSent).to.equal(true);
+
+		const second = life(request, wallet, storage);
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(second.offers, 'a delivered payment is not re-offered').to.equal(0);
+		expect(result.status).to.equal('SIGNED_PENDING');
+	});
+
+	it('cannot reject, because the earlier life may already have paid', async () => {
+		const { request, wallet, storage } = await firstLife();
+		rewindToPreEmit(storage);
+
+		// No lane at all on the retransmission: refusing here would send the caller
+		// into the fallback that pays the same money a second time.
+		const result = await life(request, wallet, storage, {
+			unreachable: true
+		}).sender.send(request.encoded, { amountSat: 100_000n });
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.caveat).to.be.a('string');
+	});
+});
+
+describe('Direct funding sender: a duplicate call that arrives late', () => {
+	it('replays a payment whose request has since expired', async () => {
+		const request = mintRequest({ ttlMs: 60_000 });
+		const h = harness({ request });
+		const first = await h.sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		// The app retries a send it never saw the answer to, an hour later. An
+		// EXPIRED here would be read as "nothing happened", which is the one
+		// answer that sends it off to pay the same money over a plain address.
+		const replayed = await h.sender.send(request.encoded, {
+			amountSat: 100_000n,
+			now: Date.now() + 3_600_000
+		});
+		expect(replayed.offerId).to.equal(first.offerId);
+		expect(replayed.status).to.equal('SIGNED_PENDING');
+	});
+
+	it('still refuses an expired request it has never attempted', async () => {
+		const h = harness({ request: mintRequest({ ttlMs: 1 }) });
+		const err = await refusal(
+			h.sender.send(h.request.encoded, {
+				amountSat: 100_000n,
+				now: Date.now() + 60_000
+			})
+		);
+		expect(err.code).to.equal(DirectFundingErrorCode.EXPIRED);
+	});
+
+	it('reports a duplicate as a replay, so no caller re-runs its spend gates', async () => {
+		const h = harness({ request: mintRequest() });
+		expect(h.sender.isReplay(h.request.encoded)).to.equal(false);
+		expect(h.sender.isReplay('not a request at all')).to.equal(false);
+		await h.sender.send(h.request.encoded, { amountSat: 100_000n });
+		expect(h.sender.isReplay(h.request.encoded)).to.equal(true);
 	});
 });

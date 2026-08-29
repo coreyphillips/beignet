@@ -227,20 +227,43 @@ describe('Recovery phase 7: direct funding payer (5.10 D1)', function () {
 		const seed = crypto.randomBytes(32);
 		const first = await runLife(dbPath, seed, 'post-witness');
 		const before = recordsOnDisk(dbPath)[0];
+		// The kill lands inside the receiver's handler, so the send that carried
+		// the witness never returned and nothing on disk can say the wire took it.
+		// SIGNED_PENDING alone is written BEFORE that send, so a life that read it
+		// as proof would report an undelivered payment as done.
+		expect(before.witnessSent).to.equal(undefined);
 		const second = await runLife(dbPath, seed, 'none');
 		expect(second.signal, 'the second life should settle on its own').to.equal(
 			null
 		);
-		// It replays the record rather than re-running the exchange, so the
-		// receiver never sees a second witness for the same request.
-		expect(second.lines).to.not.include('witness-seen');
+		// So it retransmits, over the SAME offer and the SAME coin, which is what
+		// 4C's offer idempotency exists to absorb. What must never happen is a
+		// second attempt: that is the fork's defect D6 under a crash.
+		expect(second.lines).to.include('witness-seen');
 		expect(second.lines).to.include('settled:SIGNED_PENDING');
 		const after = recordsOnDisk(dbPath);
 		expect(after, 'a second attempt was opened').to.have.length(1);
 		expect(after[0].offerId).to.equal(before.offerId);
 		expect(after[0].spentTxid).to.equal(before.spentTxid);
+		expect(after[0].witnessSent, 'the retransmission went unrecorded').to.equal(
+			true
+		);
 		expect(valueOf(first.lines, 'coin:')).to.equal(
 			valueOf(second.lines, 'coin:')
 		);
+	});
+
+	it('replays, and sends nothing, once the wire is known to have taken one', async () => {
+		const dbPath = path.join(dir, 'delivered.db');
+		const seed = crypto.randomBytes(32);
+		const first = await runLife(dbPath, seed, 'none');
+		expect(first.lines).to.include('settled:SIGNED_PENDING');
+		expect(recordsOnDisk(dbPath)[0].witnessSent).to.equal(true);
+
+		const second = await runLife(dbPath, seed, 'none');
+		// A payment the wire is known to have taken is answered from the record.
+		expect(second.lines).to.not.include('witness-seen');
+		expect(second.lines).to.include('settled:SIGNED_PENDING');
+		expect(recordsOnDisk(dbPath)).to.have.length(1);
 	});
 });

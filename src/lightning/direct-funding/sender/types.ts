@@ -16,6 +16,7 @@
 import type * as bitcoin from 'bitcoinjs-lib';
 import type { DfTransportRegistry } from '../transport/registry';
 import type { DfTransportLog } from '../transport/types';
+import type { DirectFundingErrorCode } from '../types';
 import type { DirectFundingPaymentStore } from './records';
 
 // ─────────────── Limits ───────────────
@@ -271,6 +272,13 @@ export interface IDfPaymentRecord {
 	updatedAt: number;
 	/** Set once the coin was excluded from this wallet's coin selection. */
 	frozen?: boolean;
+	/**
+	 * Set once a lane accepted the witness frame. SIGNED_PENDING cannot carry
+	 * this: the record is written BEFORE the send, so a crash in that window
+	 * leaves a record claiming a payment the receiver never heard of. This is
+	 * what tells a resumed attempt whether to retransmit or to replay.
+	 */
+	witnessSent?: boolean;
 	/** The receiver's attestation, kept as proof of what we were told. */
 	attestation?: {
 		fundingOutputIndex: number;
@@ -288,6 +296,13 @@ export interface IDfPaymentRecord {
 	receiptPreimage?: string;
 	/** Why a terminal record ended where it did. */
 	reason?: string;
+	/**
+	 * The code of the refusal that closed an ABORTED record, so a replay hands
+	 * back the refusal the first call got rather than a generic decline. The
+	 * caller reads it to decide whether a plain address payment is the right
+	 * answer.
+	 */
+	reasonCode?: DirectFundingErrorCode;
 }
 
 // ─────────────── Logging ───────────────

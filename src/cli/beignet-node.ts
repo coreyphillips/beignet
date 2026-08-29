@@ -5687,7 +5687,8 @@ export class BeignetNode extends EventEmitter {
 	 * second on-chain payment of the same amount, and a late rejection would
 	 * make that a double spend of the user's money rather than a recovery. Both
 	 * refusals below are pre-witness by construction: they run before the engine
-	 * is entered at all.
+	 * is entered at all, and only for a request that has no attempt yet, since a
+	 * duplicate's witness may already be out.
 	 */
 	async sendDirectFunding(opts: {
 		request?: string;
@@ -5709,10 +5710,6 @@ export class BeignetNode extends EventEmitter {
 				'request (the payment request from the BIP 21 URI) is required'
 			);
 		}
-		// A draining node takes no new payment, and this one holds a socket open
-		// for a whole offer-to-receipt exchange: admitting it would let /stop tear
-		// down storage and networking around a witness that had already left.
-		this._checkDraining();
 		const ceiling = opts.maxTotalFeeSat ?? opts.feeHeadroomSats;
 		const sendOpts = {
 			...(opts.amountSats !== undefined && opts.amountSats !== 0
@@ -5730,30 +5727,49 @@ export class BeignetNode extends EventEmitter {
 				  }
 				: {})
 		};
-		// This pays a STRANGER's channel out of our own coin, so it is an external
-		// spend like an address-targeted splice-out, not the internal funding the
-		// limit excludes. Quoted rather than read off the request body: the
-		// envelope may fix the amount and the app then posts none. The ceiling is
-		// what is charged, since the exact fee is only known once the receiver has
-		// built the transaction, and over-charging a fee allowance errs the safe
-		// way.
-		let costSats: number;
-		try {
-			const quote = sender.quote(opts.request, sendOpts);
-			costSats = Number(quote.amountSat + quote.maxTotalFeeSat);
-			this._checkSpendLimit(costSats);
-		} catch (err) {
-			throw this.directFundingFailure(err);
+		// A request this device has already attempted spends nothing new: the send
+		// joins the run that is already going or replays what that run recorded.
+		// The gates below must not see it. Both of them can refuse, a refusal is a
+		// throw, and rev 2's caller answers a throw by paying the same money again
+		// over a plain address, so applying them to a duplicate would turn the
+		// idempotency the engine provides back into a double payment. The
+		// concrete case is a concurrent duplicate: the first call's reservation
+		// alone can put the second over the daily limit.
+		const replay = sender.isReplay(opts.request);
+		let costSats = 0;
+		let reserving = false;
+		if (!replay) {
+			// A draining node takes no new payment, and this one holds a socket open
+			// for a whole offer-to-receipt exchange: admitting it would let /stop
+			// tear down storage and networking around a witness that had already
+			// left.
+			this._checkDraining();
+			// This pays a STRANGER's channel out of our own coin, so it is an
+			// external spend like an address-targeted splice-out, not the internal
+			// funding the limit excludes. Quoted rather than read off the request
+			// body: the envelope may fix the amount and the app then posts none. The
+			// ceiling is what is charged, since the exact fee is only known once the
+			// receiver has built the transaction, and over-charging a fee allowance
+			// errs the safe way.
+			try {
+				const quote = sender.quote(opts.request, sendOpts);
+				costSats = Number(quote.amountSat + quote.maxTotalFeeSat);
+				this._checkSpendLimit(costSats);
+			} catch (err) {
+				throw this.directFundingFailure(err);
+			}
+			reserving = this._dailySpendLimitSats !== undefined;
+			// Reserved for the length of the exchange, so two sends cannot both pass
+			// the check before either has recorded anything.
+			if (reserving) this._pendingSpendSats += costSats;
 		}
-		const reserving = this._dailySpendLimitSats !== undefined;
-		// Reserved for the length of the exchange, so two sends cannot both pass
-		// the check before either has recorded anything.
-		if (reserving) this._pendingSpendSats += costSats;
 		try {
 			const result = await sender.send(opts.request, sendOpts);
 			// Only a witness that actually left is money spent, and only once: a
-			// retried send replays its recorded attempt rather than paying again.
+			// retried send replays its recorded attempt rather than paying again,
+			// and the call that opened the attempt is the one that charges for it.
 			if (
+				!replay &&
 				DF_POST_WITNESS_STATES.has(result.status) &&
 				!this._directFundingCharged.has(result.offerId)
 			) {

@@ -460,6 +460,14 @@ export interface IDfVerifyOptions {
 	now?: number;
 	/** Furthest expiry accepted, defaulting to DF_MAX_REQUEST_TTL_MS out. */
 	maxTtlMs?: number;
+	/**
+	 * Accept an envelope whose expiry has passed. Only ever set for a request
+	 * this device has already attempted: freshness decides whether to START a
+	 * payment, and a duplicate call starts nothing. Refusing one would turn an
+	 * outcome we already have into a throw, which is the caller's cue to pay the
+	 * same money again over a plain address.
+	 */
+	allowExpired?: boolean;
 }
 
 /**
@@ -480,7 +488,7 @@ export function verifyRequestEnvelope(
 ): void {
 	const now = opts.now ?? Date.now();
 	const maxTtl = opts.maxTtlMs ?? DF_MAX_REQUEST_TTL_MS;
-	if (env.expiresAt <= now) {
+	if (env.expiresAt <= now && !opts.allowExpired) {
 		throw new DirectFundingError(
 			DirectFundingErrorCode.EXPIRED,
 			'payment request has expired; ask the receiver for a fresh one'

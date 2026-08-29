@@ -1832,6 +1832,22 @@ async function handleDirectFunding(): Promise<void> {
 		const raw = parseFlag(name);
 		return raw === undefined ? undefined : parseInt(raw, 10);
 	};
+	// Both `request` and `send` end in an OPTIONAL amount, so the positionals
+	// have to come with every local value flag stripped: a raw index read turns
+	// `request --host h` into an amount of "--host" (the issue #534 bug class).
+	const pos = positionalArgs(
+		new Set([
+			'--lsp',
+			'--lsp-host',
+			'--lsp-port',
+			'--target-inbound',
+			'--trusted',
+			'--min-amount',
+			'--host',
+			'--port',
+			'--max-total-fee'
+		])
+	);
 	switch (sub) {
 		case 'configure': {
 			// Every field is optional and the daemon MERGES: naming one leaves the
@@ -1857,14 +1873,12 @@ async function handleDirectFunding(): Promise<void> {
 				await httpRequest('POST', '/direct-funding/request', {
 					host: parseFlag('--host'),
 					port: numberFlag('--port'),
-					amountSats: filteredArgs[2]
-						? parseInt(filteredArgs[2], 10)
-						: undefined
+					amountSats: pos[2] ? parseInt(pos[2], 10) : undefined
 				})
 			);
 		}
 		case 'send': {
-			const request = filteredArgs[2];
+			const request = pos[2];
 			if (!request) {
 				output({
 					ok: false,
@@ -1881,9 +1895,7 @@ async function handleDirectFunding(): Promise<void> {
 			return outputResult(
 				await httpRequest('POST', '/direct-funding/send', {
 					request,
-					amountSats: filteredArgs[3]
-						? parseInt(filteredArgs[3], 10)
-						: undefined,
+					amountSats: pos[3] ? parseInt(pos[3], 10) : undefined,
 					maxTotalFeeSat: numberFlag('--max-total-fee')
 				})
 			);

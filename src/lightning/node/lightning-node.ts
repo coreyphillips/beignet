@@ -176,6 +176,7 @@ import {
 	DfTransportType,
 	DirectFundingReceiver,
 	DirectFundingRequestStore,
+	DfRelayForwarder,
 	DfTransportRegistry,
 	IDfRequestRecord,
 	IDfOnionTransport,
@@ -792,6 +793,7 @@ export class LightningNode extends EventEmitter {
 	private directFunding?: {
 		requests: DirectFundingRequestStore;
 		registry: DfTransportRegistry;
+		forwarder: DfRelayForwarder | null;
 		receiver: DirectFundingReceiver;
 		policy: IDirectFundingPolicy;
 		requestTtlMs: number;
@@ -18450,7 +18452,7 @@ export class LightningNode extends EventEmitter {
 				? { requestTtlMs: config.requestTtlMs }
 				: {}
 		);
-		const { registry } = createDirectFundingTransports(
+		const { registry, forwarder } = createDirectFundingTransports(
 			{
 				peers: {
 					nodeIdHex: () => this.getNodeId(),
@@ -18616,6 +18618,7 @@ export class LightningNode extends EventEmitter {
 		this.directFunding = {
 			requests,
 			registry,
+			forwarder,
 			receiver,
 			policy,
 			requestTtlMs: config.requestTtlMs ?? DF_DEFAULT_REQUEST_TTL_MS
@@ -18637,12 +18640,14 @@ export class LightningNode extends EventEmitter {
 		if (!df || df.detach) return;
 		df.requests.start();
 		df.receiver.start();
+		df.forwarder?.start();
 		df.detach = await df.receiver.attach(df.registry);
 	}
 
 	stopDirectFunding(): void {
 		const df = this.directFunding;
 		if (!df) return;
+		df.forwarder?.stop();
 		df.detach?.();
 		df.detach = undefined;
 		df.receiver.stop();

@@ -466,4 +466,45 @@ describe('direct funding under the node-wide payment gates', function () {
 	it('has no pending payment when nothing is running', () => {
 		expect(daemon.node.hasPendingPayments()).to.equal(false);
 	});
+
+	it('lets a duplicate past the gates that would refuse a new payment', async () => {
+		// Both gates can only refuse, a refusal is a throw, and rev 2's caller
+		// answers a throw by paying the same money again over a plain address. A
+		// duplicate spends nothing new, so seeing either gate would turn the
+		// engine's idempotency back into the double payment it exists to stop:
+		// the first call's own reservation alone can put a concurrent duplicate
+		// over the daily limit.
+		const internals = daemon.node as unknown as {
+			directFundingSender: unknown;
+		};
+		const real = internals.directFundingSender;
+		internals.directFundingSender = {
+			isReplay: (): boolean => true,
+			quote: (): never => {
+				throw new Error('a replay must not be quoted');
+			},
+			send: async (): Promise<Record<string, unknown>> => ({
+				offerId: 'ab'.repeat(8),
+				spentTxid: 'cd'.repeat(32),
+				spentVout: 0,
+				amountSat: 50_000,
+				attested: true,
+				receiptPreimageHex: null,
+				status: 'SIGNED_PENDING'
+			})
+		};
+		daemon.node.setDraining(true);
+		try {
+			const { json } = await call('POST', '/direct-funding/send', {
+				request: 'whatever the first call was given',
+				amountSats: 50_000
+			});
+			expect((json.result as { status: string }).status).to.equal(
+				'SIGNED_PENDING'
+			);
+		} finally {
+			daemon.node.setDraining(false);
+			internals.directFundingSender = real;
+		}
+	});
 });

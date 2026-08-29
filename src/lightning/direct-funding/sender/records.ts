@@ -168,6 +168,7 @@ export class DirectFundingPaymentStore {
 		delete record.negotiatedTx;
 		delete record.witness;
 		delete record.fundingTxid;
+		delete record.witnessSent;
 		return this.update(requestIdHex, { status: 'OFFERED', frozen: false });
 	}
 
