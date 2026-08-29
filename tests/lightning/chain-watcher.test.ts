@@ -2099,6 +2099,54 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(spentEmitted).to.be.true;
 		});
 
+		it('retries a failed subscription without replacing the active watch', async () => {
+			const subscribe = backend.subscribeToScriptHash.bind(backend);
+			let attempts = 0;
+			backend.subscribeToScriptHash = async (
+				scriptHash,
+				onChange
+			): Promise<void> => {
+				attempts++;
+				if (attempts === 1) throw new Error('subscription unavailable');
+				await subscribe(scriptHash, onChange);
+			};
+			const watchedTxid = crypto.randomBytes(32).toString('hex');
+			const scriptPubkey = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			const scriptHash = computeScriptHash(scriptPubkey);
+			await watcher.watchOutput(watchedTxid, 0, scriptPubkey);
+			const outputs = (
+				watcher as unknown as {
+					watchedOutputs: Map<string, unknown>;
+				}
+			).watchedOutputs;
+			const key = `${watchedTxid}:0`;
+			const registered = outputs.get(key);
+
+			watcher.recheckAllWatches();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(attempts).to.equal(2);
+			expect(outputs.get(key)).to.equal(registered);
+
+			const spendTx = new bitcoin.Transaction();
+			spendTx.addInput(Buffer.from(watchedTxid, 'hex').reverse(), 0);
+			spendTx.addOutput(scriptPubkey, 50000);
+			backend.setTransaction(spendTx.getId(), spendTx.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid: watchedTxid, height: 99 },
+				{ txid: spendTx.getId(), height: 100 }
+			]);
+			let spent = false;
+			watcher.on('output:spent', () => {
+				spent = true;
+			});
+			backend.simulateScriptHashChange(scriptHash);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(spent).to.equal(true);
+		});
+
 		// A watched output is the only thing that can tell the monitor a spend it
 		// recorded has been reorged out, and the monitor keeps taking that news
 		// until `tip - confirmationHeight >= IRREVOCABLE_DEPTH` (issue #625).
@@ -2206,8 +2254,8 @@ describe('Phase 4: Chain Watcher', () => {
 				backend.simulateScriptHashChange(scriptHash);
 				await new Promise((resolve) => setTimeout(resolve, 20));
 
-				// The reorg drops the spend and the boundary block lands. Scan B
-				// snapshots the chain that no longer has it and stalls behind A.
+				// The reorg drops the spend and the boundary block lands. The
+				// notification invalidates A and queues a fresh scan.
 				backend.setHistory(scriptHash, [
 					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 }
 				]);
@@ -2229,14 +2277,45 @@ describe('Phase 4: Chain Watcher', () => {
 					'so the fresher scan still gets to report the eviction'
 				).to.deep.equal([{ txid: watchedTxid, outputIndex: 0 }]);
 			});
+
+			it('validates a queued sweep before retiring a stalled scan', async () => {
+				const unspent: Array<{ txid: string; outputIndex: number }> = [];
+				(
+					channelManager as unknown as {
+						handleOutputUnspent: (txid: string, outputIndex: number) => void;
+					}
+				).handleOutputUnspent = (txid, outputIndex): void => {
+					unspent.push({ txid, outputIndex });
+				};
+				const { watchedTxid, scriptHash } = await armSpentOutput();
+
+				backend.simulateNewBlock(SPEND_HEIGHT + IRREVOCABLE_DEPTH - 1);
+				await check(scriptHash);
+				backend.simulateNewBlock(SPEND_HEIGHT + IRREVOCABLE_DEPTH);
+				backend.holdTransaction(1);
+				backend.simulateScriptHashChange(scriptHash);
+				await new Promise((resolve) => setTimeout(resolve, 20));
+
+				backend.setHistory(scriptHash, [
+					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 }
+				]);
+				watcher.recheckAllWatches();
+				backend.releaseNextTransaction();
+				await new Promise((resolve) => setTimeout(resolve, 20));
+
+				expect(unspent, 'the queued sweep reports the eviction').to.deep.equal([
+					{ txid: watchedTxid, outputIndex: 0 }
+				]);
+				expect(watchedOutputCount(), 'the reorg watch remains armed').to.equal(
+					1
+				);
+			});
 		});
 
-		// Two scans of one output overlap in normal operation: a block starts
-		// one per watched output and the script-hash notification starts
-		// another, and each carries the history it fetched before its awaits.
-		// The spend height they report is the monitor's finality clock, so an
-		// older scan resuming with a stale one is the #576 fund-loss shape
-		// (issue #621).
+		// Spend checks can arrive while a scan is still fetching. A script hash
+		// notification means its history is stale, while a periodic sweep only
+		// needs one queued follow-up. Reporting stale evidence can advance the
+		// monitor's finality clock too early (issue #621).
 		describe('overlapping scans', () => {
 			const SPEND_HEIGHT = 100;
 			const REMINE_HEIGHT = 190;
@@ -2268,6 +2347,43 @@ describe('Phase 4: Chain Watcher', () => {
 				return outputs.get(`${txid}:0`)?.spendHeight;
 			}
 
+			it('reports a spend while recurring sweeps outpace the backend', async () => {
+				const heights = recordSpends();
+				const watchedTxid = crypto.randomBytes(32).toString('hex');
+				const scriptPubkey = Buffer.from(
+					'0020' + crypto.randomBytes(32).toString('hex'),
+					'hex'
+				);
+				const scriptHash = computeScriptHash(scriptPubkey);
+				const spendTx = new bitcoin.Transaction();
+				spendTx.addInput(Buffer.from(watchedTxid, 'hex').reverse(), 0);
+				spendTx.addOutput(scriptPubkey, 50000);
+				backend.setTransaction(spendTx.getId(), spendTx.toBuffer());
+				backend.setHistory(scriptHash, [
+					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 },
+					{ txid: spendTx.getId(), height: SPEND_HEIGHT }
+				]);
+				await watcher.watchOutput(watchedTxid, 0, scriptPubkey);
+
+				backend.holdHistory(6);
+				watcher.recheckAllWatches();
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				for (let sweep = 0; sweep < 5; sweep++) {
+					watcher.recheckAllWatches();
+					backend.releaseNextHistory();
+					await new Promise((resolve) => setTimeout(resolve, 20));
+				}
+
+				const reportsBeforeDrain = [...heights];
+				watcher.stop();
+				backend.releaseHistory();
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				expect(
+					reportsBeforeDrain,
+					'a completed scan reports despite later sweeps'
+				).to.deep.equal([SPEND_HEIGHT]);
+			});
+
 			it('does not let a stalled scan move a recorded spend height backward', async () => {
 				const heights = recordSpends();
 
@@ -2295,19 +2411,13 @@ describe('Phase 4: Chain Watcher', () => {
 				backend.simulateScriptHashChange(scriptHash);
 				await new Promise((resolve) => setTimeout(resolve, 20));
 
-				// A reorg re-mines the same spend 90 blocks higher. Scan B starts
-				// after A, so its history is the fresher of the two, and here it
-				// also finishes first.
+				// A reorg re-mines the same spend 90 blocks higher. The notification
+				// invalidates A and queues a scan against the new history.
 				backend.setHistory(scriptHash, [
 					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 },
 					{ txid: spendTx.getId(), height: REMINE_HEIGHT }
 				]);
 				backend.simulateScriptHashChange(scriptHash);
-				await new Promise((resolve) => setTimeout(resolve, 20));
-				expect(heights, 'the fresher scan reported the re-mine').to.deep.equal([
-					REMINE_HEIGHT
-				]);
-
 				backend.releaseNextTransaction();
 				await new Promise((resolve) => setTimeout(resolve, 20));
 
@@ -2362,20 +2472,19 @@ describe('Phase 4: Chain Watcher', () => {
 				backend.simulateScriptHashChange(scriptHash);
 				await new Promise((resolve) => setTimeout(resolve, 20));
 
-				// The spend confirms. Scan B starts after A and finishes first.
+				// The spend confirms. The notification invalidates A and queues a
+				// scan against the confirmed history.
 				backend.setHistory(scriptHash, [
 					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 },
 					{ txid: spendTx.getId(), height: SPEND_HEIGHT }
 				]);
 				backend.simulateScriptHashChange(scriptHash);
-				await new Promise((resolve) => setTimeout(resolve, 20));
-				expect(heights, 'the fresher scan reported the spend').to.deep.equal([
-					SPEND_HEIGHT
-				]);
-
 				backend.releaseNextHistory();
 				await new Promise((resolve) => setTimeout(resolve, 20));
 
+				expect(heights, 'the fresh scan reported the spend').to.deep.equal([
+					SPEND_HEIGHT
+				]);
 				expect(
 					unspent,
 					'the older scan may not retract it afterwards'
@@ -2422,8 +2531,8 @@ describe('Phase 4: Chain Watcher', () => {
 				backend.simulateScriptHashChange(scriptHash);
 				await new Promise((resolve) => setTimeout(resolve, 20));
 
-				// Scan B starts after A and stalls too, so A comes back with the
-				// fresher scan still pending rather than already finished.
+				// The next notification queues B. It stalls after A exits, so A
+				// cannot publish before the fresh scan completes.
 				backend.setHistory(scriptHash, [
 					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 },
 					{ txid: spendTx.getId(), height: REMINE_HEIGHT }
@@ -2458,68 +2567,250 @@ describe('Phase 4: Chain Watcher', () => {
 			// One transaction spending several watched outpoints is the normal
 			// shape of a penalty or an aggregated HTLC claim, and the monitor dates
 			// EVERY input it spends from whichever report arrives. So the stale
-			// member re-dates the batch, and the stale member is the newest scan
-			// its own outpoint ever had.
-			it('does not let a stale member of a batched spend re-date the others', async () => {
-				const reports: Array<{ outputIndex: number; height: number }> = [];
-				(
-					channelManager as unknown as {
-						handleOutputSpent: (
-							txid: string,
-							outputIndex: number,
-							tx: bitcoin.Transaction,
-							height: number
-						) => void;
+			// member re-dates the whole batch, and the stale member is the newest
+			// scan its own outpoint ever had. The monitor's report only reaches
+			// outputs it has already recorded against the transaction, though, so
+			// silencing that member strands its own outpoint instead.
+			describe('batched spends', () => {
+				/** Reports the ChannelManager was given, in order. */
+				function recordBatchReports(): Array<{
+					txid: string;
+					outputIndex: number;
+					height: number;
+				}> {
+					const reports: Array<{
+						txid: string;
+						outputIndex: number;
+						height: number;
+					}> = [];
+					(
+						channelManager as unknown as {
+							handleOutputSpent: (
+								txid: string,
+								outputIndex: number,
+								tx: bitcoin.Transaction,
+								height: number
+							) => void;
+						}
+					).handleOutputSpent = (txid, outputIndex, _tx, height): void => {
+						reports.push({ txid, outputIndex, height });
+					};
+					return reports;
+				}
+
+				/**
+				 * Watch output 0 of each named parent and spend them all in one
+				 * transaction. Two parents is the second shape the monitor draws a
+				 * line through: a sweep can batch a commitment output with a
+				 * second-level HTLC output, and a report of one never reaches the
+				 * other's tracked outputs.
+				 */
+				async function armBatchedSpend(parents: string[]): Promise<{
+					spendTxid: string;
+					hashes: string[];
+					setSpendHeight: (height: number) => void;
+				}> {
+					// Repeating a parent means two of ITS outputs are in the batch, so
+					// each occurrence takes the next vout of that parent.
+					const vouts = parents.map(
+						(parent, index) =>
+							parents.slice(0, index).filter((other) => other === parent).length
+					);
+					const scripts = parents.map(() =>
+						Buffer.from('0020' + crypto.randomBytes(32).toString('hex'), 'hex')
+					);
+					const hashes = scripts.map(computeScriptHash);
+					const spendTx = new bitcoin.Transaction();
+					parents.forEach((parent, index) =>
+						spendTx.addInput(Buffer.from(parent, 'hex').reverse(), vouts[index])
+					);
+					spendTx.addOutput(scripts[0], 90000);
+					backend.setTransaction(spendTx.getId(), spendTx.toBuffer());
+
+					const setSpendHeight = (height: number): void => {
+						parents.forEach((parent, index) =>
+							backend.setHistory(hashes[index], [
+								{ txid: parent, height: SPEND_HEIGHT - 1 },
+								{ txid: spendTx.getId(), height }
+							])
+						);
+					};
+					setSpendHeight(SPEND_HEIGHT);
+					for (const [index, parent] of parents.entries()) {
+						await watcher.watchOutput(parent, vouts[index], scripts[index]);
 					}
-				).handleOutputSpent = (_txid, outputIndex, _tx, height): void => {
-					reports.push({ outputIndex, height });
-				};
+					return { spendTxid: spendTx.getId(), hashes, setSpendHeight };
+				}
 
-				const parentTxid = crypto.randomBytes(32).toString('hex');
-				const scripts = [0, 1].map(() =>
-					Buffer.from('0020' + crypto.randomBytes(32).toString('hex'), 'hex')
-				);
-				const hashes = scripts.map(computeScriptHash);
-				const spendTx = new bitcoin.Transaction();
-				spendTx.addInput(Buffer.from(parentTxid, 'hex').reverse(), 0);
-				spendTx.addInput(Buffer.from(parentTxid, 'hex').reverse(), 1);
-				spendTx.addOutput(scripts[0], 90000);
-				backend.setTransaction(spendTx.getId(), spendTx.toBuffer());
-				const historyAt = (
-					height: number
-				): Array<{ txid: string; height: number }> => [
-					{ txid: parentTxid, height: SPEND_HEIGHT - 1 },
-					{ txid: spendTx.getId(), height }
-				];
-				hashes.forEach((hash) => backend.setHistory(hash, historyAt(100)));
+				it('re-checks a stale member rather than let it re-date the batch', async () => {
+					const reports = recordBatchReports();
+					const parent = crypto.randomBytes(32).toString('hex');
+					const { hashes, setSpendHeight } = await armBatchedSpend([
+						parent,
+						parent
+					]);
 
-				await watcher.watchOutput(parentTxid, 0, scripts[0]);
-				await watcher.watchOutput(parentTxid, 1, scripts[1]);
+					// Output 0's scan snapshots the spend where it was, then stalls.
+					backend.holdTransaction(1);
+					backend.simulateScriptHashChange(hashes[0]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
 
-				// Output 0's scan snapshots the spend where it was, then stalls.
-				backend.holdTransaction(1);
-				backend.simulateScriptHashChange(hashes[0]);
-				await new Promise((resolve) => setTimeout(resolve, 20));
+					// The reorg re-mines the batch 90 blocks higher, and output 1's
+					// scan reports it while output 0 is still stalled.
+					setSpendHeight(REMINE_HEIGHT);
+					backend.simulateScriptHashChange(hashes[1]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
 
-				// The reorg re-mines the batch 90 blocks higher. Output 1's scan
-				// starts after output 0's, so its history is the fresher of the two.
-				hashes.forEach((hash) =>
-					backend.setHistory(hash, historyAt(REMINE_HEIGHT))
-				);
-				backend.simulateScriptHashChange(hashes[1]);
-				await new Promise((resolve) => setTimeout(resolve, 20));
-				expect(
-					reports,
-					'the fresher member reported the re-mine'
-				).to.deep.equal([{ outputIndex: 1, height: REMINE_HEIGHT }]);
+					backend.releaseNextTransaction();
+					await new Promise((resolve) => setTimeout(resolve, 20));
 
-				backend.releaseNextTransaction();
-				await new Promise((resolve) => setTimeout(resolve, 20));
+					expect(
+						reports.map((report) => report.height),
+						'the stale member re-checked instead of re-dating the batch'
+					).to.deep.equal([REMINE_HEIGHT, REMINE_HEIGHT]);
+					expect(
+						reports.map((report) => report.outputIndex),
+						'and still reported its own outpoint'
+					).to.deep.equal([1, 0]);
+				});
 
-				expect(
-					reports,
-					'the stale member may not re-date a transaction it shares'
-				).to.deep.equal([{ outputIndex: 1, height: REMINE_HEIGHT }]);
+				it('re-checks a stale member while the fresher scan is still in flight', async () => {
+					const reports = recordBatchReports();
+					const parent = crypto.randomBytes(32).toString('hex');
+					const { hashes, setSpendHeight } = await armBatchedSpend([
+						parent,
+						parent
+					]);
+
+					// Both scans stall in their transaction fetch, output 0's first.
+					backend.holdTransaction(2);
+					backend.simulateScriptHashChange(hashes[0]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
+					setSpendHeight(REMINE_HEIGHT);
+					backend.simulateScriptHashChange(hashes[1]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					// Output 0 comes back first, so nothing has recorded the re-mine
+					// yet: the only sign its history is stale is the fresher scan
+					// still running over the other member.
+					backend.releaseNextTransaction();
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					expect(
+						reports,
+						'a pending fresher scan is reason enough to re-check'
+					).to.deep.equal([
+						{ txid: parent, outputIndex: 0, height: REMINE_HEIGHT }
+					]);
+				});
+
+				it('re-checks a stale member after the fresher one retired', async () => {
+					const reports = recordBatchReports();
+					const parent = crypto.randomBytes(32).toString('hex');
+					const { hashes, setSpendHeight } = await armBatchedSpend([
+						parent,
+						parent
+					]);
+
+					backend.holdTransaction(1);
+					backend.simulateScriptHashChange(hashes[0]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					// The re-mine lands deep enough that output 1 reports it and
+					// retires, leaving no sibling watch for output 0 to consult.
+					setSpendHeight(REMINE_HEIGHT);
+					backend.simulateNewBlock(REMINE_HEIGHT + IRREVOCABLE_DEPTH);
+					backend.simulateScriptHashChange(hashes[1]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					backend.releaseNextTransaction();
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					expect(
+						reports.map((report) => report.height),
+						'a retired sibling still dates the transaction'
+					).to.deep.equal([REMINE_HEIGHT, REMINE_HEIGHT]);
+				});
+
+				it('re-checks a stale absence rather than retract a fresher spend', async () => {
+					const reports = recordBatchReports();
+					const unspent: Array<{ txid: string; outputIndex: number }> = [];
+					(
+						channelManager as unknown as {
+							handleOutputUnspent: (txid: string, outputIndex: number) => void;
+						}
+					).handleOutputUnspent = (txid, outputIndex): void => {
+						unspent.push({ txid, outputIndex });
+					};
+					const parent = crypto.randomBytes(32).toString('hex');
+					const { hashes, setSpendHeight } = await armBatchedSpend([
+						parent,
+						parent
+					]);
+
+					// Both members record the spend where it first confirmed.
+					backend.simulateScriptHashChange(hashes[0]);
+					backend.simulateScriptHashChange(hashes[1]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					// A reorg drops the spend, and output 0's scan snapshots that
+					// absence and stalls.
+					backend.setHistory(hashes[0], [
+						{ txid: parent, height: SPEND_HEIGHT - 1 }
+					]);
+					backend.holdHistory(1);
+					backend.simulateScriptHashChange(hashes[0]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					// The spend is re-mined and output 1 reports it.
+					setSpendHeight(REMINE_HEIGHT);
+					backend.simulateScriptHashChange(hashes[1]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					backend.releaseNextHistory();
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					expect(
+						unspent,
+						'a stale absence may not reopen a spend a fresher scan proved'
+					).to.deep.equal([]);
+					expect(
+						reports.filter((report) => report.height === REMINE_HEIGHT).length,
+						'both members ended on the re-mined height'
+					).to.equal(2);
+				});
+
+				it('re-checks a stale member of a batch spanning two parents', async () => {
+					const reports = recordBatchReports();
+					const parents = [
+						crypto.randomBytes(32).toString('hex'),
+						crypto.randomBytes(32).toString('hex')
+					];
+					const { hashes, setSpendHeight } = await armBatchedSpend(parents);
+
+					backend.holdTransaction(1);
+					backend.simulateScriptHashChange(hashes[0]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					setSpendHeight(REMINE_HEIGHT);
+					backend.simulateScriptHashChange(hashes[1]);
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					backend.releaseNextTransaction();
+					await new Promise((resolve) => setTimeout(resolve, 20));
+
+					// The second parent's report never reached the first parent's
+					// tracked outputs, so the first parent has to speak for itself,
+					// with the height the transaction actually sits at.
+					expect(
+						reports,
+						'the other parent is corrected, not silenced'
+					).to.deep.equal([
+						{ txid: parents[1], outputIndex: 0, height: REMINE_HEIGHT },
+						{ txid: parents[0], outputIndex: 0, height: REMINE_HEIGHT }
+					]);
+					expect(recordedSpendHeight(parents[0])).to.equal(REMINE_HEIGHT);
+				});
 			});
 		});
 	});
