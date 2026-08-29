@@ -198,19 +198,24 @@ interface IWatchedOutput {
 	 */
 	spendUnverified?: boolean;
 	/**
-	 * Spend-scan arbitration for this outpoint (issue #625). Overlapping scans
-	 * are routine (a script-hash notification and the 60s sweep each start one),
-	 * and each carries a history it fetched before its awaits, so a scan that
-	 * finishes must know whether a fresher one has already spoken.
+	 * Spend-scan arbitration for this outpoint (issues #625, #621). Overlapping
+	 * scans are routine (a script-hash notification and the 60s sweep each start
+	 * one), and each carries a history it fetched before its awaits, so a scan
+	 * that finishes must know whether a fresher one is around.
 	 *
-	 * `nextScanTicket` is the dispenser; a scan takes the next value before its
-	 * first await. `appliedScanTicket` is the newest scan that ran to
-	 * completion. The funding side keeps the equivalent per channel in
-	 * `channelSpendScans`; a generic watch is already one outpoint, so the
-	 * counters live on the entry and die with it.
+	 * `startedScanSequence` is the newest scan of this outpoint to have STARTED,
+	 * and only that scan may speak: a scan that started later holds the fresher
+	 * history whether or not it has finished yet. `appliedScanSequence` is the
+	 * scan whose evidence the spend fields above now hold, and it is what a
+	 * sibling input of the same batched spend consults.
+	 *
+	 * Both are values of the watcher-wide `outputScanSequence`, not per-outpoint
+	 * counters, because a batched spend has to be arbitrated ACROSS outpoints.
+	 * The funding side keeps its own equivalent per channel in
+	 * `channelSpendScans`.
 	 */
-	nextScanTicket: number;
-	appliedScanTicket: number;
+	startedScanSequence: number;
+	appliedScanSequence?: number;
 }
 
 /**
@@ -455,6 +460,14 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	private channelSpendScans: Map<string, IChannelSpendScan> = new Map();
 	private watchedOutputs: Map<string, IWatchedOutput> = new Map(); // "txid:vout" → output
+	/**
+	 * Dispenser for output spend scans, watcher-wide rather than per outpoint. A
+	 * batched spend (a penalty, an aggregated HTLC claim) is one transaction over
+	 * several watched outpoints, and the monitor dates every input it spends from
+	 * whichever report arrives, so "whose history is fresher" has to be a question
+	 * two different outpoints can answer against each other (issue #621).
+	 */
+	private outputScanSequence = 0;
 	private failedFundingWatches: IFailedFundingWatch[] = [];
 	private failedOutputWatches: IFailedOutputWatch[] = [];
 	private failedBroadcasts: IFailedBroadcast[] = [];
@@ -972,8 +985,7 @@ export class ChainWatcher extends EventEmitter {
 			scriptHash,
 			spendTxid,
 			spendHeight,
-			nextScanTicket: 0,
-			appliedScanTicket: 0,
+			startedScanSequence: 0,
 			// A seeded spend is recorded state, not something this watcher
 			// saw: the monitor's finality clock stays parked until the first
 			// live check confirms it (issue #576).
@@ -2092,19 +2104,27 @@ export class ChainWatcher extends EventEmitter {
 		if (!watched) return;
 
 		// Both taken before the first await, so they date this scan's evidence.
-		// The tip matters as much as the ticket: a header arriving mid-scan must
+		// The tip matters as much as the sequence: a header arriving mid-scan must
 		// not be counted as depth a history fetched before it can vouch for.
-		const ticket = ++watched.nextScanTicket;
+		const sequence = ++this.outputScanSequence;
+		watched.startedScanSequence = sequence;
 		const tipAtScan = this.currentBlockHeight;
 
-		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
-		if (
+		// Arbitrating on START order rather than on which scan finishes first is
+		// what makes the answer the same in both interleavings. A scan that
+		// started later fetched its history later, so it is the fresher of the
+		// two whether or not it has come back yet, and this one has nothing to
+		// contribute that it will not report itself. Waiting for it costs a
+		// re-check; speaking over it can hand the monitor a stale height, and a
+		// stale height is what carries an output to IRREVOCABLY_RESOLVED and the
+		// channel to FULLY_RESOLVED, which nothing can take back (issue #621).
+		const superseded = (): boolean =>
 			!this.isCurrentGeneration(generation) ||
 			this.watchedOutputs.get(key) !== watched ||
-			watched.appliedScanTicket > ticket
-		) {
-			return;
-		}
+			watched.startedScanSequence !== sequence;
+
+		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
+		if (superseded()) return;
 
 		// Find the confirmed spend of our output. The script's history may contain
 		// several non-spending entries with the same script (address reuse — e.g.
@@ -2118,13 +2138,7 @@ export class ChainWatcher extends EventEmitter {
 			if (entry.txid === watched.txid || entry.height <= 0) continue;
 
 			const rawTx = await this.backend.getTransaction(entry.txid);
-			if (
-				!this.isCurrentGeneration(generation) ||
-				this.watchedOutputs.get(key) !== watched ||
-				watched.appliedScanTicket > ticket
-			) {
-				return;
-			}
+			if (superseded()) return;
 			const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
 
 			const spendsOurs = spendingTx.ins.some((input) => {
@@ -2140,6 +2154,7 @@ export class ChainWatcher extends EventEmitter {
 		}
 
 		if (spend) {
+			if (this.spendDatedByNewerScan(watched, spend, sequence)) return;
 			// Idempotent: the subscription re-fires on any scripthash change, so skip
 			// re-reporting a spend we already recorded. Two cases are NOT idempotent
 			// re-fires and must reach the monitor (issue #576): a spend seeded from
@@ -2163,7 +2178,7 @@ export class ChainWatcher extends EventEmitter {
 				);
 				this.emit('output:spent', watched.txid, watched.outputIndex);
 			}
-			watched.appliedScanTicket = ticket;
+			watched.appliedScanSequence = sequence;
 			// Retain the watch until the spend is buried deep enough to be final, so a
 			// reorg before then re-fires this check and is caught by the branch below.
 			// The boundary is the monitor's own, `blockHeight - confirmationHeight >=
@@ -2171,17 +2186,11 @@ export class ChainWatcher extends EventEmitter {
 			// `+ 1` depth drops the watch a block early, and a reorg in that gap has
 			// nothing left to report the eviction (issue #625).
 			//
-			// Retirement is the one verdict that cannot be corrected later, because
-			// the deleted entry retires every other scan at the map-identity guard
-			// above. So only the newest scan may take it, on the tip its own history
-			// was fetched against. A later scan still in flight holds the fresher
-			// answer and makes this same decision when it lands; deferring costs a
-			// re-check, retiring early loses the eviction for good.
-			if (
-				tipAtScan > 0 &&
-				tipAtScan - spend.height >= IRREVOCABLE_DEPTH &&
-				ticket === watched.nextScanTicket
-			) {
+			// Retirement is measured against the tip this scan's own history was
+			// fetched against, never the current one: a header arriving mid-scan is
+			// depth the history cannot vouch for, and a watch retired on it is gone
+			// for good. The scan being the newest is already settled above.
+			if (tipAtScan > 0 && tipAtScan - spend.height >= IRREVOCABLE_DEPTH) {
 				this.watchedOutputs.delete(key);
 			}
 			return;
@@ -2200,6 +2209,38 @@ export class ChainWatcher extends EventEmitter {
 			);
 			this.emit('output:unspent', watched.txid, watched.outputIndex);
 		}
-		watched.appliedScanTicket = ticket;
+		watched.appliedScanSequence = sequence;
+	}
+
+	/**
+	 * Has a scan that started later already dated this spending transaction
+	 * differently, on one of the OTHER outpoints it spends?
+	 *
+	 * A batched spend is one transaction over several watched outpoints, and
+	 * ChainMonitor.handleOutputSpent applies the height it is handed to every
+	 * tracked input the transaction spends, not just the reported one. So a
+	 * stale scan of one member re-dates the whole batch, and no amount of
+	 * per-outpoint arbitration sees it coming: the stale scan is the newest one
+	 * its own outpoint ever had (issue #621).
+	 *
+	 * Only disagreement counts. A later scan that dated the transaction the same
+	 * way leaves this one nothing to correct, and treating that as a conflict
+	 * would starve the slower member of every sweep that rescans both outpoints
+	 * together, since the sweep hands them ascending sequences in map order.
+	 */
+	private spendDatedByNewerScan(
+		watched: IWatchedOutput,
+		spend: { tx: bitcoin.Transaction; txid: string; height: number },
+		sequence: number
+	): boolean {
+		return spend.tx.ins.some((input) => {
+			const inputTxid = Buffer.from(input.hash).reverse().toString('hex');
+			const sibling = this.watchedOutputs.get(`${inputTxid}:${input.index}`);
+			if (sibling === undefined || sibling === watched) return false;
+			if ((sibling.appliedScanSequence ?? 0) <= sequence) return false;
+			return (
+				sibling.spendTxid !== spend.txid || sibling.spendHeight !== spend.height
+			);
+		});
 	}
 }
