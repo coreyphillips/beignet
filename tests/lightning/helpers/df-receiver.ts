@@ -284,8 +284,22 @@ export interface IDfSpliceCall {
 	feeratePerKw: number;
 }
 
+/** A wallet-data store two FakeDfNodes can share, i.e. survive a restart. */
+export function memoryStorage(): {
+	saveWalletData(key: string, value: string): void;
+	loadWalletData(key: string): string | null;
+} {
+	const rows = new Map<string, string>();
+	return {
+		saveWalletData: (key, value): void => {
+			rows.set(key, value);
+		},
+		loadWalletData: (key): string | null => rows.get(key) ?? null
+	};
+}
+
 export class FakeDfNode implements IDfReceiverDeps {
-	readonly requests = new DirectFundingRequestStore({});
+	readonly requests: DirectFundingRequestStore;
 	readonly transactions = new Map<string, Buffer>();
 	readonly unspent = new Map<
 		string,
@@ -304,8 +318,12 @@ export class FakeDfNode implements IDfReceiverDeps {
 		[];
 	/** Set to make the channel refuse a delivered witness. */
 	witnessError: string | null = null;
+	/** Set to make the channel take the witness and withhold its tx_signatures. */
+	witnessSendsWithheld = false;
 	/** Set to make abortDualFundedOpen report a refusal. */
 	abortError: string | null = null;
+	/** Set to make abortSplice report a refusal (the peer signed first). */
+	spliceAbortError: string | null = null;
 	spliceError: string | null = null;
 	openThrows: Error | null = null;
 	lspPubkey: string | null = LSP_PUBKEY;
@@ -345,8 +363,22 @@ export class FakeDfNode implements IDfReceiverDeps {
 
 	// ─── setup ───
 
-	mintRequest(): IDfRequestRecord {
-		return this.requests.mint();
+	constructor(
+		storage?: {
+			saveWalletData(key: string, value: string): void;
+			loadWalletData(key: string): string | null;
+		},
+		now?: () => number
+	) {
+		this.requests = new DirectFundingRequestStore({
+			...(storage ? { storage } : {}),
+			...(now ? { now } : {})
+		});
+		this.requests.restore();
+	}
+
+	mintRequest(ttlMs?: number): IDfRequestRecord {
+		return this.requests.mint(ttlMs === undefined ? {} : { ttlMs });
 	}
 
 	/** Make a coin resolvable, unspent and confirmed, from our chain source. */
@@ -448,7 +480,9 @@ export class FakeDfNode implements IDfReceiverDeps {
 
 	abortSplice(channelId: Buffer): { ok: boolean; error?: string } {
 		this.aborts.push({ kind: 'splice', channelId: channelId.toString('hex') });
-		return { ok: true };
+		return this.spliceAbortError
+			? { ok: false, error: this.spliceAbortError }
+			: { ok: true };
 	}
 
 	getPendingV2FundingTx(channelId: Buffer): IDfPendingV2FundingTx | null {
@@ -464,11 +498,9 @@ export class FakeDfNode implements IDfReceiverDeps {
 		_prevTxid: Buffer,
 		_prevOutputIndex: number,
 		witness: Buffer[]
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; sendsWithheld?: boolean } {
 		this.witnesses.push({ kind: 'open', witness });
-		return this.witnessError
-			? { ok: false, error: this.witnessError }
-			: { ok: true };
+		return this.deliveryResult();
 	}
 
 	provideSpliceExternalWitness(
@@ -476,11 +508,18 @@ export class FakeDfNode implements IDfReceiverDeps {
 		_prevTxid: Buffer,
 		_prevOutputIndex: number,
 		witness: Buffer[]
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; sendsWithheld?: boolean } {
 		this.witnesses.push({ kind: 'splice', witness });
-		return this.witnessError
-			? { ok: false, error: this.witnessError }
-			: { ok: true };
+		return this.deliveryResult();
+	}
+
+	private deliveryResult(): {
+		ok: boolean;
+		error?: string;
+		sendsWithheld?: boolean;
+	} {
+		if (this.witnessError) return { ok: false, error: this.witnessError };
+		return { ok: true, sendsWithheld: this.witnessSendsWithheld };
 	}
 
 	onTxSigsNeeded(cb: (e: IDfTxSigsNeeded) => void): () => void {

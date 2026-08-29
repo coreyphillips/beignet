@@ -28,7 +28,8 @@ import {
 	IDfOfferOverrides,
 	IDfTestCoin,
 	LSP_PUBKEY,
-	makeCoin
+	makeCoin,
+	memoryStorage
 } from './helpers/df-receiver';
 import { IDfReceiverConfig } from '../../src/lightning/direct-funding/receiver/types';
 
@@ -91,6 +92,27 @@ function harness(
 	};
 }
 
+async function captureUnhandledRejections(
+	fn: () => Promise<void>
+): Promise<unknown[]> {
+	const prior = process.listeners('unhandledRejection');
+	process.removeAllListeners('unhandledRejection');
+	const seen: unknown[] = [];
+	const probe = (reason: unknown): void => {
+		seen.push(reason);
+	};
+	process.on('unhandledRejection', probe);
+	try {
+		await fn();
+	} finally {
+		process.removeListener('unhandledRejection', probe);
+		for (const listener of prior) {
+			process.on('unhandledRejection', listener);
+		}
+	}
+	return seen;
+}
+
 describe('Direct funding receiver: admission (issue #612)', () => {
 	it('declines an offer when no liquidity peer is configured', async () => {
 		const h = harness();
@@ -117,6 +139,59 @@ describe('Direct funding receiver: admission (issue #612)', () => {
 		h.node.requests.markReceiptRevealed(h.payer.requestRecord.receiptHash);
 		await h.sendOffer();
 		expect(h.lastAck()?.reason).to.equal('this request has already been paid');
+	});
+
+	it('rechecks payment state after a concurrent chain lookup', async () => {
+		const node = new FakeDfNode();
+		const record = node.mintRequest();
+		const firstCoin = makeCoin();
+		const delayedCoin = makeCoin();
+		node.publish(firstCoin);
+		node.publish(delayedCoin);
+		const firstOffer = buildOffer(record, firstCoin);
+		const delayedOffer = buildOffer(record, delayedCoin, {
+			amountSat: 51_000n
+		});
+		const firstPayer = new FakePayerLane(record, 'first-lane');
+		const delayedPayer = new FakePayerLane(record, 'delayed-lane');
+		const getTransaction = node.chain.getTransaction;
+		let releaseDelayed!: () => void;
+		const delayedTransaction = new Promise<Buffer>((resolve) => {
+			releaseDelayed = (): void => resolve(delayedCoin.prevTx.toBuffer());
+		});
+		node.chain.getTransaction = async (txid): Promise<Buffer> =>
+			txid === delayedCoin.txidHex ? delayedTransaction : getTransaction(txid);
+		const engine = new DirectFundingReceiver(node, {
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+
+		engine.handleFrame(delayedPayer.offerFrame(delayedOffer));
+		engine.handleFrame(firstPayer.offerFrame(firstOffer));
+		await flush();
+		node.completeNegotiation(firstCoin, firstOffer, {
+			witnessesFilled: true
+		});
+		await flush();
+		engine.handleFrame(
+			firstPayer.witnessFrame(firstOffer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(firstPayer.bodiesOf(RECEIPT)).to.have.length(1);
+
+		releaseDelayed();
+		await flush(8);
+		expect(node.opens).to.have.length(1);
+		expect(node.witnesses).to.have.length(1);
+		expect(delayedPayer.bodiesOf(RECEIPT)).to.have.length(0);
+		expect(decodeDfOfferAck(delayedPayer.bodiesOf(ACK)[0])).to.deep.equal({
+			offerId: delayedOffer.offerId,
+			accepted: false,
+			reason: 'this request has already been paid'
+		});
+		expect(engine.inflightCount()).to.equal(0);
+		engine.stop();
 	});
 
 	it('applies the 5000 sat protocol floor under a lower configured minimum', async () => {
@@ -502,6 +577,41 @@ describe('Direct funding receiver: idempotency (issue #612)', () => {
 		).to.equal(true);
 	});
 
+	it('continues an in-flight replay on the new lane', async () => {
+		const node = new FakeDfNode();
+		const record = node.mintRequest();
+		const coin = makeCoin();
+		node.publish(coin);
+		const offer = buildOffer(record, coin);
+		const firstLane = new FakePayerLane(record, 'first-lane');
+		const replayLane = new FakePayerLane(record, 'replay-lane');
+		const engine = new DirectFundingReceiver(node, {
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+
+		engine.handleFrame(firstLane.offerFrame(offer));
+		await flush();
+		engine.handleFrame(replayLane.offerFrame(offer));
+		await flush();
+		node.completeNegotiation(coin, offer, { witnessesFilled: true });
+		await flush();
+
+		expect(node.opens).to.have.length(1);
+		expect(firstLane.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		expect(replayLane.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.handleFrame(
+			replayLane.witnessFrame(offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(node.witnesses).to.have.length(1);
+		expect(firstLane.bodiesOf(RECEIPT)).to.have.length(0);
+		expect(replayLane.bodiesOf(RECEIPT)).to.have.length(1);
+		expect(engine.inflightCount()).to.equal(0);
+		engine.stop();
+	});
+
 	it('refuses an offer id reused with different content', async () => {
 		const h = harness({ negotiationTimeoutMs: 5_000 });
 		await h.sendOffer();
@@ -526,6 +636,90 @@ describe('Direct funding receiver: idempotency (issue #612)', () => {
 		expect(h.engine.sessionCount()).to.equal(0);
 		await h.sendOffer();
 		expect(h.lastAck()).to.deep.equal({ accepted: true });
+	});
+
+	it('replays the receipt over a restart that took the session with it', async () => {
+		const storage = memoryStorage();
+		const first = new FakeDfNode(storage);
+		const record = first.mintRequest();
+		const coin = makeCoin();
+		first.publish(coin);
+		const offer = buildOffer(record, coin);
+		const payer = new FakePayerLane(record, 'lane-before');
+		const engine = new DirectFundingReceiver(first, {
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(payer.offerFrame(offer));
+		await flush();
+		first.completeNegotiation(coin, offer, { witnessesFilled: true });
+		await flush();
+		engine.handleFrame(
+			payer.witnessFrame(offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		const paid = decodeDfReceipt(payer.bodiesOf(RECEIPT)[0]);
+		engine.stop();
+
+		const second = new FakeDfNode(storage);
+		second.publish(coin);
+		expect(second.requests.byReceiptHash(record.receiptHash)).to.not.equal(
+			null
+		);
+		const again = new FakePayerLane(record, 'lane-after');
+		const restarted = new DirectFundingReceiver(second, {
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		restarted.start();
+		restarted.handleFrame(again.offerFrame(offer));
+		await flush();
+		expect(second.opens).to.have.length(0);
+		const replayed = decodeDfReceipt(again.bodiesOf(RECEIPT)[0]);
+		expect(replayed.preimage).to.deep.equal(paid.preimage);
+		expect(replayed.fundingTxid).to.deep.equal(paid.fundingTxid);
+		// The response log went with the process, so the complete transaction
+		// cannot come back with it; the field is optional for exactly this.
+		expect(replayed.rawTx).to.equal(undefined);
+		restarted.stop();
+	});
+
+	it('refuses a duplicate whose attempt a restart left in flight', async () => {
+		const storage = memoryStorage();
+		const first = new FakeDfNode(storage);
+		const record = first.mintRequest();
+		const coin = makeCoin();
+		first.publish(coin);
+		const offer = buildOffer(record, coin);
+		const payer = new FakePayerLane(record, 'lane-before');
+		const engine = new DirectFundingReceiver(first, {
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(payer.offerFrame(offer));
+		await flush();
+		expect(first.opens).to.have.length(1);
+		engine.stop();
+
+		const second = new FakeDfNode(storage);
+		second.publish(coin);
+		const again = new FakePayerLane(record, 'lane-after');
+		const restarted = new DirectFundingReceiver(second, {
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		restarted.start();
+		restarted.handleFrame(again.offerFrame(offer));
+		await flush();
+		expect(second.opens).to.have.length(0);
+		expect(decodeDfOfferAck(again.bodiesOf(ACK)[0])).to.deep.equal({
+			offerId: offer.offerId,
+			accepted: false,
+			reason: 'request already has an active funding attempt'
+		});
+		restarted.stop();
 	});
 });
 
@@ -692,6 +886,97 @@ describe('Direct funding receiver: the exchange (issue #612)', () => {
 		expect(h.node.witnesses).to.have.length(1);
 		expect(h.payer.bodiesOf(RECEIPT)).to.have.length(1);
 	});
+
+	it('still delivers the receipt when the request expires mid-session', async () => {
+		let clock = Date.now();
+		const node = new FakeDfNode(undefined, () => clock);
+		const record = node.mintRequest(400);
+		const coin = makeCoin();
+		node.publish(coin);
+		const offer = buildOffer(record, coin);
+		const payer = new FakePayerLane(record, 'payer-lane');
+		const engine = new DirectFundingReceiver(node, {
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(payer.offerFrame(offer));
+		await flush();
+		node.completeNegotiation(coin, offer, { witnessesFilled: true });
+		await flush();
+		expect(payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+
+		// The request outlives neither the negotiation nor the payer's signing,
+		// and the coin is about to be spent either way.
+		clock += 1_000;
+		expect(node.requests.byReceiptHash(record.receiptHash)).to.equal(null);
+		engine.handleFrame(
+			payer.witnessFrame(offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(node.witnesses).to.have.length(1);
+		const receipt = decodeDfReceipt(payer.bodiesOf(RECEIPT)[0]);
+		expect(
+			crypto.createHash('sha256').update(receipt.preimage).digest('hex')
+		).to.equal(record.receiptHash);
+		engine.stop();
+	});
+
+	it('does not take a withheld dispatch for a delivered tx_signatures', async () => {
+		const h = await drive({ witnessTimeoutMs: 5_000 });
+		h.node.witnessSendsWithheld = true;
+		h.node.abortError = 'cannot abort a v2 open after tx_signatures';
+		h.node.completeNegotiation(h.coin, h.offer, { witnessesFilled: true });
+		await flush();
+		h.engine.handleFrame(
+			h.payer.witnessFrame(h.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(h.node.witnesses).to.have.length(1);
+		expect(h.payer.bodiesOf(RECEIPT), 'no receipt for signatures still here').to
+			.be.empty;
+		expect(
+			h.acks().filter((a) => !a.accepted),
+			'not declined either'
+		).to.be.empty;
+
+		// Once the channel can dispatch again, the retried witness completes it.
+		h.node.witnessSendsWithheld = false;
+		h.engine.handleFrame(
+			h.payer.witnessFrame(h.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(h.payer.bodiesOf(RECEIPT)).to.have.length(1);
+	});
+
+	it('keeps the witness obligation open when the splice cannot be aborted', async () => {
+		const h = harness(
+			{ allowSplice: true, negotiationTimeoutMs: 5_000, witnessTimeoutMs: 5 },
+			{ authenticatedPeer: 'payer-node-id' }
+		);
+		h.node.spliceChannel = crypto.randomBytes(32);
+		h.node.trustedPayers.add('payer-node-id');
+		h.node.spliceAbortError = 'tx_signatures already exchanged';
+		await h.sendOffer();
+		expect(h.node.splices).to.have.length(1);
+		h.node.completeSpliceNegotiation(h.coin, h.offer, 200_000n);
+		await flush();
+		expect(h.payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		await flush(20);
+		expect(h.node.aborts.map((a) => a.kind)).to.deep.equal(['splice']);
+		expect(h.engine.inflightCount()).to.equal(0);
+		// Delivery is the only exit the channel left, so the payer is not told
+		// the exchange is over.
+		expect(h.acks().filter((a) => !a.accepted)).to.be.empty;
+
+		h.engine.handleFrame(
+			h.payer.witnessFrame(h.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(h.node.witnesses).to.have.length(1);
+		expect(h.payer.bodiesOf(RECEIPT)).to.have.length(1);
+	});
 });
 
 describe('Direct funding receiver: unwind (issue #612)', () => {
@@ -776,12 +1061,56 @@ describe('Direct funding receiver: unwind (issue #612)', () => {
 		]);
 	});
 
-	it('releases the slot when the open itself throws', async () => {
-		const h = harness();
+	it('releases the slot without leaking when the open itself throws', async () => {
+		const h = harness({ negotiationTimeoutMs: 5 });
 		h.node.openThrows = new Error('funding provider unavailable');
-		await h.sendOffer();
+		const rejections = await captureUnhandledRejections(async () => {
+			await h.sendOffer();
+			await flush(20);
+		});
+		expect(rejections).to.deep.equal([]);
 		expect(h.engine.inflightCount()).to.equal(0);
 		expect(h.lastAck()?.reason).to.contain('funding provider unavailable');
+		expect(h.node.aborts).to.have.length(0);
+	});
+
+	it('releases the slot without leaking when the splice throws', async () => {
+		const channelId = crypto.randomBytes(32);
+		const h = harness(
+			{ allowSplice: true, negotiationTimeoutMs: 5 },
+			{ authenticatedPeer: 'payer-node-id' }
+		);
+		h.node.spliceChannel = channelId;
+		h.node.trustedPayers.add('payer-node-id');
+		h.node.spliceInWithInputs = (): never => {
+			throw new Error('splice provider unavailable');
+		};
+		const rejections = await captureUnhandledRejections(async () => {
+			await h.sendOffer();
+			await flush(20);
+		});
+		expect(rejections).to.deep.equal([]);
+		expect(h.engine.inflightCount()).to.equal(0);
+		expect(h.lastAck()?.reason).to.contain('splice provider unavailable');
+		expect(h.node.aborts).to.have.length(0);
+	});
+
+	it('releases the slot without leaking when the splice is refused', async () => {
+		const channelId = crypto.randomBytes(32);
+		const h = harness(
+			{ allowSplice: true, negotiationTimeoutMs: 5 },
+			{ authenticatedPeer: 'payer-node-id' }
+		);
+		h.node.spliceChannel = channelId;
+		h.node.trustedPayers.add('payer-node-id');
+		h.node.spliceError = 'splice is unavailable';
+		const rejections = await captureUnhandledRejections(async () => {
+			await h.sendOffer();
+			await flush(20);
+		});
+		expect(rejections).to.deep.equal([]);
+		expect(h.engine.inflightCount()).to.equal(0);
+		expect(h.lastAck()?.reason).to.contain('splice is unavailable');
 		expect(h.node.aborts).to.have.length(0);
 	});
 });

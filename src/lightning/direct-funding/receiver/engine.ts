@@ -19,10 +19,15 @@
  *  - At-least-once delivery, exactly-once effects. Every response is recorded
  *    per offer id; a duplicate offer with the same content replays the record
  *    and starts nothing, up to and including the receipt. An offer id reused
- *    with different content is refused, never served.
+ *    with different content is refused, never served. The response log is
+ *    per-process; what crosses a restart is on the request record itself (the
+ *    attempt budget, the busy mark, and the receipt a paid request replays).
  *  - Every failure path releases the concurrency slot, the outpoint
  *    reservation and any channel or splice the session started. The fork left
- *    a live channel behind on three separate failure paths (defect D5).
+ *    a live channel behind on three separate failure paths (defect D5). A
+ *    funding the channel REFUSES to release is the one exception, and it keeps
+ *    the payer's witness obligation open rather than declaring the exchange
+ *    over: delivering the witness is the only exit the channel left.
  */
 
 import { EventEmitter } from 'events';
@@ -175,7 +180,6 @@ interface IDfSessionContext {
 	liquidityPeer: string;
 	/** Authenticated on the lane AND in the operator's trusted set. */
 	paired: boolean;
-	reply: IDfLaneSender;
 }
 
 type ResolvedConfig = Required<
@@ -431,6 +435,17 @@ export class DirectFundingReceiver extends EventEmitter {
 			this.replay(existing, frame, keys);
 			return;
 		}
+		// No session, and the request says this very offer already paid it: the
+		// exchange ran before a restart, which took the session record with it.
+		// The receipt is the one thing the payer still needs and the only thing
+		// left that can answer it, so it is replayed from the request itself.
+		if (offer.receiptHash.toString('hex') === record.receiptHash) {
+			const paid = this.deps.requests.paidOffer(record.receiptHash);
+			if (paid?.offerIdHex === offerIdHex) {
+				this.replayPaidReceipt(frame, keys, record, offer, paid);
+				return;
+			}
+		}
 		if (!this.state.beginAdmission(offerIdHex)) {
 			this.drop(DfOfferDropReason.ADMISSION_IN_PROGRESS, frame);
 			return;
@@ -509,16 +524,19 @@ export class DirectFundingReceiver extends EventEmitter {
 			return;
 		}
 
-		// 7. One active offer per request.
-		const attempts = this.state.attemptsFor(receiptHashHex);
-		if (attempts?.activeOfferId && attempts.activeOfferId !== offerIdHex) {
+		// 7. One active offer per request. A marker naming THIS offer id and no
+		// session to go with it is one a restart left behind: serving it would
+		// be a second channel session for one payment, not the replay a live
+		// duplicate gets above.
+		const attempts = this.deps.requests.attemptsFor(receiptHashHex);
+		if (attempts.activeOfferId) {
 			decline('request already has an active funding attempt');
 			return;
 		}
 
 		// 8. Per-request lifetime attempt cap. Out of attempts means a new
 		// request has to be minted; nothing about this one comes back.
-		if ((attempts?.attempts ?? 0) >= this.cfg.maxRequestAttempts) {
+		if (attempts.attempts >= this.cfg.maxRequestAttempts) {
 			decline('too many funding attempts for this request');
 			return;
 		}
@@ -572,6 +590,10 @@ export class DirectFundingReceiver extends EventEmitter {
 
 		// Re-read what a concurrent admission could have changed while this one
 		// was awaiting the chain.
+		if (this.deps.requests.isTombstoned(receiptHashHex)) {
+			decline('this request has already been paid');
+			return;
+		}
 		if (
 			this.state.get(offerIdHex) ||
 			this.state.atSessionCeiling() ||
@@ -580,10 +602,10 @@ export class DirectFundingReceiver extends EventEmitter {
 			decline('too many concurrent funding sessions');
 			return;
 		}
-		const current = this.state.attemptsFor(receiptHashHex);
+		const current = this.deps.requests.attemptsFor(receiptHashHex);
 		if (
-			(current?.activeOfferId && current.activeOfferId !== offerIdHex) ||
-			(current?.attempts ?? 0) >= this.cfg.maxRequestAttempts
+			current.activeOfferId ||
+			current.attempts >= this.cfg.maxRequestAttempts
 		) {
 			decline('request already has an active funding attempt');
 			return;
@@ -609,6 +631,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			requestId: Buffer.from(record.requestId, 'hex'),
 			keys,
 			laneKey: frame.laneKey,
+			reply: frame.reply,
 			responses: [],
 			inflight: true,
 			terminal: false,
@@ -619,7 +642,15 @@ export class DirectFundingReceiver extends EventEmitter {
 			expiresAt: Math.max(now + this.cfg.sessionTtlMs, record.expiresAt)
 		};
 		this.state.open(session);
-		this.state.chargeAttempt(receiptHashHex, offerIdHex, record.expiresAt);
+		// Charged on the REQUEST rather than in this map: the count is a
+		// per-request lifetime budget and the marker is what stops a duplicate
+		// arriving after a restart from starting a second channel session, and
+		// neither can do its job from memory alone.
+		this.deps.requests.beginAttempt(
+			receiptHashHex,
+			offerIdHex,
+			session.slotExpiresAt
+		);
 		// The slot is the session's from here, so the admission guard hands it
 		// over rather than counting a second time for the whole exchange.
 		this.state.endAdmission(offerIdHex);
@@ -641,8 +672,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			prevTx,
 			confirmed: coin.confirmed,
 			liquidityPeer: lsp,
-			paired,
-			reply: frame.reply
+			paired
 		});
 	}
 
@@ -651,20 +681,23 @@ export class DirectFundingReceiver extends EventEmitter {
 	/**
 	 * Drive the funding, then hand over the receipt. Every exit releases the
 	 * concurrency slot, the outpoint reservation and the request's active-offer
-	 * mark; a failure additionally unwinds whatever channel work had started.
+	 * mark; a failure additionally unwinds whatever channel work had started,
+	 * and keeps the witness obligation open when that unwind is refused.
 	 */
 	private async serve(ctx: IDfSessionContext): Promise<void> {
-		let unwind: (() => void) | null = null;
+		let unwind: (() => boolean) | null = null;
 		let witnesses: DfWitnessQueue | null = null;
+		let stillOwed: (() => void) | null = null;
 		try {
 			this.send(
-				ctx.reply,
+				ctx.session.reply,
 				ctx.session,
 				BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK,
 				encodeDfOfferAck({ offerId: ctx.offer.offerId, accepted: true })
 			);
 			const input = this.externalInputFor(ctx);
 			const spliceChannel = this.spliceTarget(ctx);
+			const isSplice = spliceChannel !== null;
 			const started = spliceChannel
 				? this.startSplice(ctx, spliceChannel, input)
 				: this.startOpen(ctx, input);
@@ -673,19 +706,28 @@ export class DirectFundingReceiver extends EventEmitter {
 			// The channel id the event carried is authoritative: a v2 open answers
 			// to its temporary id until accept_channel2 and to its permanent one
 			// afterwards, and an unwind has to name whichever is current.
-			unwind = (): void =>
-				this.unwindFunding(spliceChannel !== null, final.channelId, ctx);
+			unwind = (): boolean =>
+				this.unwindFunding(isSplice, final.channelId, ctx);
 			witnesses = new DfWitnessQueue(ctx.session);
 			this.sendSignRequest(ctx, final);
-			await this.collectWitness(ctx, final, spliceChannel !== null, witnesses);
+			stillOwed = (): void => this.keepWitnessObligation(ctx, final, isSplice);
+			await this.collectWitness(ctx, final, isSplice, witnesses);
 			// The witness reached the channel: our tx_signatures are out and
 			// there is nothing left that could be unwound.
 			unwind = null;
+			stillOwed = null;
 			this.sendReceipt(ctx, final);
 			this.finish(ctx, true);
 		} catch (err) {
-			if (unwind) unwind();
-			this.fail(ctx, errorText(err));
+			// A refused unwind means the channel is past the point where our word
+			// alone could take the funding back, and delivering the witness is the
+			// only exit it leaves (Channel.provideSpliceExternalWitness says so
+			// outright). The obligation therefore outlives the session's own
+			// deadlines, up to the request's.
+			const released = unwind ? unwind() : true;
+			witnesses?.close();
+			witnesses = null;
+			this.fail(ctx, errorText(err), released ? null : stillOwed);
 		} finally {
 			witnesses?.close();
 		}
@@ -731,7 +773,7 @@ export class DirectFundingReceiver extends EventEmitter {
 	private startOpen(
 		ctx: IDfSessionContext,
 		input: ISpliceWalletInput
-	): { final: Promise<IDfFinalTx>; unwind: () => void } {
+	): { final: Promise<IDfFinalTx>; unwind: () => boolean } {
 		// Registered BEFORE the open: a fully synchronous transport runs the
 		// whole negotiation inside openChannelV2, and a waiter installed after
 		// it would already have missed the event.
@@ -759,11 +801,12 @@ export class DirectFundingReceiver extends EventEmitter {
 			});
 		} catch (err) {
 			this.v2Waiters.delete(ctx.session.outpoint);
+			void final.catch(() => undefined);
 			throw err;
 		}
 		return {
 			final,
-			unwind: (): void => this.unwindFunding(false, handle.channelId(), ctx)
+			unwind: (): boolean => this.unwindFunding(false, handle.channelId(), ctx)
 		};
 	}
 
@@ -771,13 +814,13 @@ export class DirectFundingReceiver extends EventEmitter {
 		ctx: IDfSessionContext,
 		channelId: Buffer,
 		input: ISpliceWalletInput
-	): { final: Promise<IDfFinalTx>; unwind: () => void } {
+	): { final: Promise<IDfFinalTx>; unwind: () => boolean } {
 		const final = this.awaitFinalTx(
 			this.spliceWaiters,
 			ctx.session.outpoint,
 			this.cfg.negotiationTimeoutMs
 		);
-		const unwind = (): void => this.unwindFunding(true, channelId, ctx);
+		const unwind = (): boolean => this.unwindFunding(true, channelId, ctx);
 		let result: { ok: boolean; error?: string };
 		try {
 			// Synchronous, and it pre-refuses an external input whose output type
@@ -791,10 +834,12 @@ export class DirectFundingReceiver extends EventEmitter {
 			);
 		} catch (err) {
 			this.spliceWaiters.delete(ctx.session.outpoint);
+			void final.catch(() => undefined);
 			throw err;
 		}
 		if (!result.ok) {
 			this.spliceWaiters.delete(ctx.session.outpoint);
+			void final.catch(() => undefined);
 			throw new Error(`splice initiation failed: ${result.error}`);
 		}
 		return { final, unwind };
@@ -844,7 +889,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			valueSat: final.prevouts.values[i]
 		}));
 		this.send(
-			ctx.reply,
+			ctx.session.reply,
 			ctx.session,
 			BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST,
 			encodeDfSignRequest({
@@ -883,22 +928,24 @@ export class DirectFundingReceiver extends EventEmitter {
 			const remaining = deadline - this.now();
 			if (remaining <= 0) throw new Error(lastError);
 			const witness = await witnesses.next(remaining);
-			const result = isSplice
-				? this.deps.provideSpliceExternalWitness(
-						final.channelId,
-						prevTxid,
-						ctx.offer.vout,
-						witness.witness
-				  )
-				: this.deps.provideV2ExternalWitness(
-						final.channelId,
-						prevTxid,
-						ctx.offer.vout,
-						witness.witness
-				  );
+			const result = this.deliverWitness(
+				ctx,
+				final,
+				isSplice,
+				prevTxid,
+				witness.witness
+			);
 			if (result.ok) {
 				ctx.session.committed = true;
 				return;
+			}
+			if (result.withheld) {
+				// The channel took the witness and could not dispatch what it
+				// released: the batch's persist failed, and only a reconnect
+				// retries it. Nothing here may reveal the receipt for signatures
+				// that have not left, and a retry of the same witness cannot help,
+				// so the session fails and keeps the obligation open.
+				throw new Error(`payer witness accepted but ${result.error}`);
 			}
 			lastError = `payer witness rejected: ${result.error}`;
 			this.log(DF_LOG_OFFER_FAILED, {
@@ -908,20 +955,120 @@ export class DirectFundingReceiver extends EventEmitter {
 		}
 	}
 
+	/**
+	 * One delivery to the channel. `withheld` is the case the boolean cannot
+	 * carry: the channel accepted the witness and released our tx_signatures,
+	 * and the dispatch that would have sent them was blocked by a failed
+	 * persist. The obligation is not discharged by that, so it is never mistaken
+	 * for one that is.
+	 */
+	private deliverWitness(
+		ctx: IDfSessionContext,
+		final: IDfFinalTx,
+		isSplice: boolean,
+		prevTxid: Buffer,
+		witness: Buffer[]
+	): { ok: boolean; withheld?: boolean; error?: string } {
+		const result = isSplice
+			? this.deps.provideSpliceExternalWitness(
+					final.channelId,
+					prevTxid,
+					ctx.offer.vout,
+					witness
+			  )
+			: this.deps.provideV2ExternalWitness(
+					final.channelId,
+					prevTxid,
+					ctx.offer.vout,
+					witness
+			  );
+		if (result.ok && result.sendsWithheld) {
+			return {
+				ok: false,
+				withheld: true,
+				error: 'the channel could not dispatch its tx_signatures'
+			};
+		}
+		return result;
+	}
+
+	/**
+	 * Keep taking the payer's witness after the session itself has failed.
+	 *
+	 * Installed only when the funding could not be released: the channel is
+	 * then past the point where an abort could take it back, so the payment
+	 * either completes or the channel stays wedged, and only the payer's
+	 * witness decides which. The handler outlives every session deadline and
+	 * goes when the record does, which is bound to the request's own life.
+	 */
+	private keepWitnessObligation(
+		ctx: IDfSessionContext,
+		final: IDfFinalTx,
+		isSplice: boolean
+	): void {
+		const { session } = ctx;
+		const prevTxid = ctx.prevTx.getHash();
+		session.onWitness = (witness): void => {
+			const result = this.deliverWitness(
+				ctx,
+				final,
+				isSplice,
+				prevTxid,
+				witness.witness
+			);
+			if (!result.ok) {
+				this.log(DF_LOG_OFFER_FAILED, {
+					offerId: session.offerIdHex,
+					error: `late witness rejected: ${result.error}`
+				});
+				return;
+			}
+			session.onWitness = undefined;
+			session.committed = true;
+			try {
+				this.sendReceipt(ctx, final);
+			} catch (err) {
+				this.log(DF_LOG_OFFER_FAILED, {
+					offerId: session.offerIdHex,
+					error: `late receipt failed: ${errorText(err)}`
+				});
+				return;
+			}
+			this.log(DF_LOG_OFFER_COMPLETED, { offerId: session.offerIdHex });
+			this.emit('offer:completed', { offerId: session.offerIdHex });
+		};
+	}
+
 	private sendReceipt(ctx: IDfSessionContext, final: IDfFinalTx): void {
-		const preimage = this.deps.requests.receiptPreimage(
-			ctx.session.receiptHashHex
-		);
+		// From the admitted request record, not a fresh lookup: the request can
+		// expire while its funding is in flight, and reloading here would spend
+		// the payer's coin and then find the secret that acknowledges it gone.
+		const preimage = ctx.record.preimageHex;
 		if (!preimage) throw new Error('receipt preimage is no longer available');
 		// Tombstone BEFORE the receipt leaves: a request that comes back looking
-		// unpaid after a restart is a paid request nothing can recognise.
-		this.deps.requests.markReceiptRevealed(ctx.session.receiptHashHex);
+		// unpaid after a restart is a paid request nothing can recognise. The
+		// same write records what paid it, which is what a restart replays.
+		try {
+			this.deps.requests.markReceiptRevealed(ctx.session.receiptHashHex, {
+				offerIdHex: ctx.session.offerIdHex,
+				fundingTxidHex: final.fundingTxidDisplay.toString('hex')
+			});
+		} catch (err) {
+			// Only the write failed; the in-memory tombstone stands. Withholding
+			// the receipt over it would leave a payer whose coin is already
+			// committed with no proof of what it bought, which is the worse of
+			// the two failures by a distance.
+			this.log(DF_LOG_OFFER_FAILED, {
+				offerId: ctx.session.offerIdHex,
+				error: `receipt tombstone not persisted: ${errorText(err)}`
+			});
+		}
 		// The complete transaction, when every witness is in: no chain round
 		// trip, and a payer holding it can rebroadcast alone. Omitted while the
 		// channel counterparty's own tx_signatures are still outstanding.
 		const complete = final.tx.ins.every((i) => i.witness.length > 0);
 		this.send(
-			ctx.reply,
+			ctx.session.reply,
 			ctx.session,
 			BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT,
 			encodeDfReceipt({
@@ -942,7 +1089,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		session.onWitness = undefined;
 		this.v2Waiters.delete(session.outpoint);
 		this.spliceWaiters.delete(session.outpoint);
-		this.state.releaseActiveOffer(session.receiptHashHex, session.offerIdHex);
+		this.deps.requests.endAttempt(session.receiptHashHex, session.offerIdHex);
 		// A success releases the coin outright (it is spent); a failure holds it
 		// as a cooldown, so the same coin cannot immediately burn another
 		// session under a fresh offer id.
@@ -968,13 +1115,22 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * never be broadcast. A session whose witness already reached the channel
 	 * is NOT declinable: the funding belongs to the network, and what its
 	 * record still owes the payer is a receipt.
+	 *
+	 * `stillOwed` says the same thing about a funding that could not be
+	 * released: the transaction can still complete, so declining it would be a
+	 * lie, and the witness obligation it installs is the only exit the channel
+	 * left open.
 	 */
-	private fail(ctx: IDfSessionContext, reason: string): void {
+	private fail(
+		ctx: IDfSessionContext,
+		reason: string,
+		stillOwed: (() => void) | null
+	): void {
 		const { session } = ctx;
-		if (!session.committed) {
+		if (!session.committed && !stillOwed) {
 			session.responses = [];
 			this.send(
-				ctx.reply,
+				session.reply,
 				session,
 				BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK,
 				encodeDfOfferAck({
@@ -985,6 +1141,8 @@ export class DirectFundingReceiver extends EventEmitter {
 			);
 		}
 		this.finish(ctx, false);
+		// After finish(), which clears the callback every settled session drops.
+		stillOwed?.();
 		this.log(DF_LOG_OFFER_FAILED, {
 			offerId: session.offerIdHex,
 			error: reason
@@ -993,10 +1151,12 @@ export class DirectFundingReceiver extends EventEmitter {
 	}
 
 	/**
-	 * Release the peer's half of a funding this session started. A refusal is
-	 * not an error: it means the operation is past the point where it could be
-	 * unwound (our tx_signatures left, or the transaction is fully signed), so
-	 * the channel owes the network a broadcast rather than the peer an abort.
+	 * Release the peer's half of a funding this session started, and report
+	 * whether it went. A refusal is not an error: it means the operation is past
+	 * the point where it could be unwound (our tx_signatures left, or the
+	 * transaction is fully signed), so the channel owes the network a broadcast
+	 * rather than the peer an abort. It is not something to swallow either, and
+	 * the caller keeps the witness obligation open on the strength of it.
 	 *
 	 * Nothing is released back to the funding provider here, unlike the fork's
 	 * abort path: a registered contribution bypasses wallet selection outright,
@@ -1006,7 +1166,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		isSplice: boolean,
 		channelId: Buffer,
 		ctx: IDfSessionContext
-	): void {
+	): boolean {
 		try {
 			const result = isSplice
 				? this.deps.abortSplice(channelId, 'direct funding session failed')
@@ -1020,11 +1180,13 @@ export class DirectFundingReceiver extends EventEmitter {
 					error: `unwind refused: ${result.error}`
 				});
 			}
+			return result.ok;
 		} catch (err) {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: ctx.session.offerIdHex,
 				error: `unwind threw: ${errorText(err)}`
 			});
+			return false;
 		}
 	}
 
@@ -1140,6 +1302,7 @@ export class DirectFundingReceiver extends EventEmitter {
 	): void {
 		session.keys = keys;
 		session.laneKey = frame.laneKey;
+		session.reply = frame.reply;
 		for (const response of session.responses) {
 			this.emitSealed(
 				frame.reply,
@@ -1149,6 +1312,33 @@ export class DirectFundingReceiver extends EventEmitter {
 				response.body
 			);
 		}
+	}
+
+	/**
+	 * Answer a re-sent offer whose exchange completed before a restart. The
+	 * session record is gone with the process, so the receipt is rebuilt from
+	 * the request's own durable mark rather than replayed from a response log;
+	 * the complete transaction is not part of it, which the receipt's rawTx
+	 * field is already optional for.
+	 */
+	private replayPaidReceipt(
+		frame: IDfInboundFrame,
+		keys: IDfLaneKeys,
+		record: IDfRequestRecord,
+		offer: IDfOffer,
+		paid: { offerIdHex: string; fundingTxidHex: string }
+	): void {
+		this.emitSealed(
+			frame.reply,
+			keys,
+			Buffer.from(record.requestId, 'hex'),
+			BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT,
+			encodeDfReceipt({
+				offerId: offer.offerId,
+				preimage: Buffer.from(record.preimageHex, 'hex'),
+				fundingTxid: Buffer.from(paid.fundingTxidHex, 'hex')
+			})
+		);
 	}
 
 	/**

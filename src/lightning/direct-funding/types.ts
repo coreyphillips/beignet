@@ -269,6 +269,23 @@ export interface IDfRequestRecord {
 	 * effects"). 4C owns the session half; this is the persistence half.
 	 */
 	revealedAt?: number;
+	/**
+	 * The offer this request was paid by, and the funding it was paid into.
+	 * Written in the same store write as the tombstone, so a receiver restarted
+	 * after a successful exchange can still replay the receipt: the session
+	 * that recorded it lives in memory only, and without this the payer whose
+	 * receipt frame was lost gets a bare "already paid" and no proof of it.
+	 */
+	paidBy?: { offerIdHex: string; fundingTxidHex: string };
+	/** Offers this request has spent a funding session on, over its whole life. */
+	attempts?: number;
+	/**
+	 * The offer holding this request's one funding session, and when that slot
+	 * lapses. Durable for the same reason the count is: a restart mid-session
+	 * would otherwise let the duplicate offer that follows it begin a SECOND
+	 * channel session for one payment.
+	 */
+	activeAttempt?: { offerIdHex: string; expiresAt: number };
 	/** Reserved for the deferred rendezvous transport (#533), never minted. */
 	swarmSeedHex?: string;
 }

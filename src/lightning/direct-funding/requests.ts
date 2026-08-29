@@ -262,10 +262,18 @@ export class DirectFundingRequestStore {
 	 * The in-memory mark stands either way, so a caller that retries writes the
 	 * whole set again rather than losing the reveal.
 	 */
-	markReceiptRevealed(receiptHashHex: string): void {
+	markReceiptRevealed(
+		receiptHashHex: string,
+		paidBy?: { offerIdHex: string; fundingTxidHex: string }
+	): void {
 		const record = this.byReceiptHash(receiptHashHex);
 		if (!record) return;
 		if (record.revealedAt === undefined) record.revealedAt = this.now();
+		// The FIRST payment's receipt stands: a later offer against a tombstoned
+		// request is refused, so anything overwriting this would be answering a
+		// replay with someone else's funding.
+		if (paidBy && !record.paidBy) record.paidBy = paidBy;
+		record.activeAttempt = undefined;
 		if (!this.persist()) {
 			throw new DirectFundingError(
 				DirectFundingErrorCode.NOT_PERSISTED,
@@ -276,6 +284,69 @@ export class DirectFundingRequestStore {
 
 	isTombstoned(receiptHashHex: string): boolean {
 		return this.byReceiptHash(receiptHashHex)?.revealedAt !== undefined;
+	}
+
+	/**
+	 * The offer this request was paid by, or null. What a receiver restarted
+	 * after the exchange answers a re-sent offer with: the in-memory session
+	 * holding the recorded receipt is gone, and a bare tombstone would leave
+	 * the payer with a spent coin and no proof of what it bought.
+	 */
+	paidOffer(
+		receiptHashHex: string
+	): { offerIdHex: string; fundingTxidHex: string } | null {
+		return this.byReceiptHash(receiptHashHex)?.paidBy ?? null;
+	}
+
+	/**
+	 * Funding attempts this request has spent, and the offer holding its one
+	 * session right now. A LAPSED marker answers as none: the session it
+	 * belonged to did not survive whatever ended it, and a crash must not lock
+	 * a request for the rest of its life.
+	 */
+	attemptsFor(receiptHashHex: string): {
+		attempts: number;
+		activeOfferId?: string;
+	} {
+		const record = this.byReceiptHash(receiptHashHex);
+		if (!record) return { attempts: 0 };
+		const active = record.activeAttempt;
+		return {
+			attempts: record.attempts ?? 0,
+			...(active && active.expiresAt > this.now()
+				? { activeOfferId: active.offerIdHex }
+				: {})
+		};
+	}
+
+	/**
+	 * Charge one attempt and mark the request busy. Durable, because the
+	 * session it belongs to is not: a restart that forgot both would hand the
+	 * duplicate offer that follows a fresh budget and a second channel session
+	 * for a funding already in flight.
+	 *
+	 * A failed write is logged nowhere and does not throw, unlike mint's: the
+	 * attempt is real either way, and refusing a payment over a storage hiccup
+	 * costs more than the restart-crossing guard it loses.
+	 */
+	beginAttempt(
+		receiptHashHex: string,
+		offerIdHex: string,
+		slotExpiresAt: number
+	): void {
+		const record = this.byReceiptHash(receiptHashHex);
+		if (!record) return;
+		record.attempts = (record.attempts ?? 0) + 1;
+		record.activeAttempt = { offerIdHex, expiresAt: slotExpiresAt };
+		this.persist();
+	}
+
+	/** Release the busy mark on a settled attempt. The COUNT stays charged. */
+	endAttempt(receiptHashHex: string, offerIdHex: string): void {
+		const record = this.byReceiptHash(receiptHashHex);
+		if (!record || record.activeAttempt?.offerIdHex !== offerIdHex) return;
+		record.activeAttempt = undefined;
+		this.persist();
 	}
 
 	/**

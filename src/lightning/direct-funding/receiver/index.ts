@@ -3,8 +3,7 @@ export { DfOfferSessions, contentHashOf, outpointKey } from './sessions';
 export type {
 	IDfOfferSession,
 	IDfOutpointReservation,
-	IDfRecordedResponse,
-	IDfRequestAttempts
+	IDfRecordedResponse
 } from './sessions';
 export {
 	classifyOfferedCoin,

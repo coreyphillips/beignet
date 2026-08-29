@@ -1,17 +1,22 @@
 /**
- * Per-instance receiver state: offer sessions, outpoint reservations and
- * per-request attempt records (issue #612).
+ * Per-instance receiver state: offer sessions and outpoint reservations
+ * (issue #612).
  *
- * All three were MODULE-level maps in the fork, shared by every node in the
+ * Both were MODULE-level maps in the fork, shared by every node in the
  * process, pruned only from inside the offer handler and capped only by an
  * in-flight counter that was itself off by one (defects D15, D16). Here they
  * belong to one engine instance, a timer sweeps them whether or not offers are
  * arriving, and the map itself has a ceiling.
+ *
+ * The per-request attempt budget is deliberately NOT here: it has to survive a
+ * restart, so it lives on the request record itself (DirectFundingRequestStore
+ * beginAttempt/endAttempt), whose life it was already bound to.
  */
 
 import crypto from 'crypto';
 import type { IDfLaneKeys } from '../frames';
 import type { IDfWitness } from '../messages';
+import type { IDfLaneSender } from '../transport/types';
 
 /** One frame this receiver sent, kept so a duplicate offer replays it. */
 export interface IDfRecordedResponse {
@@ -36,6 +41,8 @@ export interface IDfOfferSession {
 	 */
 	keys: IDfLaneKeys;
 	laneKey: string;
+	/** The response path paired with the current lane keys. */
+	reply: IDfLaneSender;
 	responses: IDfRecordedResponse[];
 	/** Holding a concurrency slot: driving a channel or splice right now. */
 	inflight: boolean;
@@ -69,25 +76,9 @@ export interface IDfOutpointReservation {
 	expiresAt: number;
 }
 
-/**
- * One request's lifetime attempt budget. `attempts` counts offers that
- * actually consumed a session, never offers that were declined at admission:
- * the fork incremented before the attempt could succeed or fail, so three
- * benign refusals used up the request (defect D18). A caller out of attempts
- * gets a fresh budget by minting a new request, and only that way; the record
- * lives exactly as long as the request it belongs to.
- */
-export interface IDfRequestAttempts {
-	attempts: number;
-	/** The one offer currently allowed to spend a session on this request. */
-	activeOfferId?: string;
-	expiresAt: number;
-}
-
 export class DfOfferSessions {
 	private readonly sessions = new Map<string, IDfOfferSession>();
 	private readonly reservations = new Map<string, IDfOutpointReservation>();
-	private readonly attempts = new Map<string, IDfRequestAttempts>();
 	/**
 	 * Offer ids between the start of admission and its verdict. An admission
 	 * awaits a chain lookup, so without this a burst of offers would all pass
@@ -178,36 +169,6 @@ export class DfOfferSessions {
 		held.expiresAt = holdUntil;
 	}
 
-	// ─────────────── Per-request attempts ───────────────
-
-	attemptsFor(receiptHashHex: string): IDfRequestAttempts | undefined {
-		return this.attempts.get(receiptHashHex);
-	}
-
-	/** Charge one attempt and mark the request busy. Called once a session opens. */
-	chargeAttempt(
-		receiptHashHex: string,
-		offerIdHex: string,
-		requestExpiresAt: number
-	): void {
-		const record = this.attempts.get(receiptHashHex) ?? {
-			attempts: 0,
-			expiresAt: requestExpiresAt
-		};
-		record.attempts += 1;
-		record.activeOfferId = offerIdHex;
-		// Bound to the REQUEST's life, not a rolling window: the cap is a
-		// per-request lifetime budget, and a window would silently hand out a
-		// fresh one to anyone patient enough.
-		record.expiresAt = requestExpiresAt;
-		this.attempts.set(receiptHashHex, record);
-	}
-
-	releaseActiveOffer(receiptHashHex: string, offerIdHex: string): void {
-		const record = this.attempts.get(receiptHashHex);
-		if (record?.activeOfferId === offerIdHex) record.activeOfferId = undefined;
-	}
-
 	// ─────────────── Sweep ───────────────
 
 	/** Drop everything expired. Returns how many records went. */
@@ -232,12 +193,6 @@ export class DfOfferSessions {
 				dropped++;
 			}
 		}
-		for (const [key, record] of this.attempts) {
-			if (record.expiresAt <= now) {
-				this.attempts.delete(key);
-				dropped++;
-			}
-		}
 		return dropped;
 	}
 
@@ -253,7 +208,6 @@ export class DfOfferSessions {
 	clear(): void {
 		this.sessions.clear();
 		this.reservations.clear();
-		this.attempts.clear();
 		this.admitting.clear();
 	}
 }

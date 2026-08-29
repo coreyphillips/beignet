@@ -215,18 +215,24 @@ export interface IDfReceiverDeps {
 	): { ok: boolean; error?: string };
 	getPendingV2FundingTx(channelId: Buffer): IDfPendingV2FundingTx | null;
 	getPendingSpliceTx(channelId: Buffer): IDfPendingSpliceTx | null;
+	/**
+	 * `sendsWithheld` says the channel took the witness and could not dispatch
+	 * the tx_signatures it released, because the batch's persist failed. It is
+	 * NOT a discharged obligation, and without it in the answer `ok` alone
+	 * cannot tell one from the other.
+	 */
 	provideV2ExternalWitness(
 		channelId: Buffer,
 		prevTxid: Buffer,
 		prevOutputIndex: number,
 		witness: Buffer[]
-	): { ok: boolean; error?: string };
+	): { ok: boolean; error?: string; sendsWithheld?: boolean };
 	provideSpliceExternalWitness(
 		channelId: Buffer,
 		prevTxid: Buffer,
 		prevOutputIndex: number,
 		witness: Buffer[]
-	): { ok: boolean; error?: string };
+	): { ok: boolean; error?: string; sendsWithheld?: boolean };
 	/** Subscribe to `channel:txsigs-needed`; the return value unsubscribes. */
 	onTxSigsNeeded(cb: (e: IDfTxSigsNeeded) => void): () => void;
 	/** Subscribe to `channel:splice-txsigs-needed`. */
