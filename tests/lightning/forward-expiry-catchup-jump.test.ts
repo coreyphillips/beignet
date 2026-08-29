@@ -209,8 +209,11 @@ function makeForward(
 			crypto.randomBytes(32),
 			crypto.randomBytes(32)
 		);
-		monitor._state = MonitorState.RESOLVING;
-		monitor._trackedOutputs = [
+		// Cast to reach the private fields, matching the convention in
+		// chain-monitor.test.ts (:1966, :2031, :2089, :2116, :2124).
+		/* eslint-disable @typescript-eslint/no-explicit-any */
+		(monitor as any)._state = MonitorState.RESOLVING;
+		(monitor as any)._trackedOutputs = [
 			{
 				txid: crypto.randomBytes(32).toString('hex'),
 				outputIndex: 0,
@@ -223,6 +226,7 @@ function makeForward(
 				resolutionTxid: crypto.randomBytes(32).toString('hex')
 			}
 		];
+		/* eslint-enable @typescript-eslint/no-explicit-any */
 		a.channelManager.monitors.set(outChannelId.toString('hex'), monitor);
 	}
 
