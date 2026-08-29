@@ -21,4 +21,5 @@ export * as advisor from './advisor';
 export * as backup from './backup';
 export * as recovery from './recovery';
 export * as liquidity from './liquidity';
+export * as directFunding from './direct-funding';
 export * as l402 from './l402';
