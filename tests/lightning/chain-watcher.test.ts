@@ -158,9 +158,31 @@ class MockChainBackend implements IChainBackend {
 		return snapshot;
 	}
 
+	private transactionHolds = 0;
+	/** Staged release, as for the history gates: a scan can stall in either
+	 * fetch, and the spend-height race turns on stalling in this one. */
+	private transactionGates: Array<() => void> = [];
+
+	/** Park the next `count` transaction fetches until they are released. */
+	holdTransaction(count = 1): void {
+		this.transactionHolds = count;
+	}
+
+	/** Release the oldest parked transaction fetch only. */
+	releaseNextTransaction(): void {
+		const release = this.transactionGates.shift();
+		release?.();
+	}
+
 	async getTransaction(txid: string): Promise<Buffer> {
 		const tx = this.transactions.get(txid);
 		if (!tx) throw new Error(`Transaction not found: ${txid}`);
+		if (this.transactionHolds > 0) {
+			this.transactionHolds--;
+			await new Promise<void>((resolve) => {
+				this.transactionGates.push(resolve);
+			});
+		}
 		return tx;
 	}
 
@@ -2206,6 +2228,162 @@ describe('Phase 4: Chain Watcher', () => {
 					unspent,
 					'so the fresher scan still gets to report the eviction'
 				).to.deep.equal([{ txid: watchedTxid, outputIndex: 0 }]);
+			});
+		});
+
+		// Two scans of one output overlap in normal operation: a block starts
+		// one per watched output and the script-hash notification starts
+		// another, and each carries the history it fetched before its awaits.
+		// The spend height they report is the monitor's finality clock, so an
+		// older scan resuming with a stale one is the #576 fund-loss shape
+		// (issue #621).
+		describe('overlapping scans', () => {
+			const SPEND_HEIGHT = 100;
+			const REMINE_HEIGHT = 190;
+
+			/** Spend heights the ChannelManager was told about, in order. */
+			function recordSpends(): number[] {
+				const heights: number[] = [];
+				(
+					channelManager as unknown as {
+						handleOutputSpent: (
+							txid: string,
+							outputIndex: number,
+							tx: bitcoin.Transaction,
+							height: number
+						) => void;
+					}
+				).handleOutputSpent = (_txid, _outputIndex, _tx, height): void => {
+					heights.push(height);
+				};
+				return heights;
+			}
+
+			function recordedSpendHeight(txid: string): number | undefined {
+				const outputs = (
+					watcher as unknown as {
+						watchedOutputs: Map<string, { spendHeight?: number }>;
+					}
+				).watchedOutputs;
+				return outputs.get(`${txid}:0`)?.spendHeight;
+			}
+
+			it('does not let a stalled scan move a recorded spend height backward', async () => {
+				const heights = recordSpends();
+
+				const watchedTxid = crypto.randomBytes(32).toString('hex');
+				const scriptPubkey = Buffer.from(
+					'0020' + crypto.randomBytes(32).toString('hex'),
+					'hex'
+				);
+				const scriptHash = computeScriptHash(scriptPubkey);
+				const spendTx = new bitcoin.Transaction();
+				spendTx.addInput(Buffer.from(watchedTxid, 'hex').reverse(), 0);
+				spendTx.addOutput(scriptPubkey, 50000);
+				backend.setTransaction(spendTx.getId(), spendTx.toBuffer());
+				backend.setHistory(scriptHash, [
+					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 },
+					{ txid: spendTx.getId(), height: SPEND_HEIGHT }
+				]);
+
+				backend.simulateNewBlock(REMINE_HEIGHT);
+				await watcher.watchOutput(watchedTxid, 0, scriptPubkey);
+
+				// Scan A snapshots the spend where it was, then stalls fetching
+				// the transaction.
+				backend.holdTransaction(1);
+				backend.simulateScriptHashChange(scriptHash);
+				await new Promise((resolve) => setTimeout(resolve, 20));
+
+				// A reorg re-mines the same spend 90 blocks higher. Scan B starts
+				// after A, so its history is the fresher of the two, and here it
+				// also finishes first.
+				backend.setHistory(scriptHash, [
+					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 },
+					{ txid: spendTx.getId(), height: REMINE_HEIGHT }
+				]);
+				backend.simulateScriptHashChange(scriptHash);
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				expect(heights, 'the fresher scan reported the re-mine').to.deep.equal([
+					REMINE_HEIGHT
+				]);
+
+				backend.releaseNextTransaction();
+				await new Promise((resolve) => setTimeout(resolve, 20));
+
+				expect(
+					heights,
+					'the older scan may not re-date the spend it fetched'
+				).to.deep.equal([REMINE_HEIGHT]);
+				expect(
+					recordedSpendHeight(watchedTxid),
+					'and the watch keeps the height the chain actually has'
+				).to.equal(REMINE_HEIGHT);
+			});
+
+			it('does not let a stalled scan retract a spend a newer scan found', async () => {
+				const heights = recordSpends();
+				const unspent: Array<{ txid: string; outputIndex: number }> = [];
+				(
+					channelManager as unknown as {
+						handleOutputUnspent: (txid: string, outputIndex: number) => void;
+					}
+				).handleOutputUnspent = (txid, outputIndex): void => {
+					unspent.push({ txid, outputIndex });
+				};
+
+				const watchedTxid = crypto.randomBytes(32).toString('hex');
+				const scriptPubkey = Buffer.from(
+					'0020' + crypto.randomBytes(32).toString('hex'),
+					'hex'
+				);
+				const scriptHash = computeScriptHash(scriptPubkey);
+				const spendTx = new bitcoin.Transaction();
+				spendTx.addInput(Buffer.from(watchedTxid, 'hex').reverse(), 0);
+				spendTx.addOutput(scriptPubkey, 50000);
+				backend.setTransaction(spendTx.getId(), spendTx.toBuffer());
+				// The spend is in the mempool, so scan A's history has no
+				// confirmed spender: it is heading for the eviction branch.
+				backend.setHistory(scriptHash, [
+					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 },
+					{ txid: spendTx.getId(), height: 0 }
+				]);
+
+				backend.simulateNewBlock(SPEND_HEIGHT);
+				await watcher.watchOutput(
+					watchedTxid,
+					0,
+					scriptPubkey,
+					spendTx.getId(),
+					SPEND_HEIGHT
+				);
+
+				backend.holdHistory(1);
+				backend.simulateScriptHashChange(scriptHash);
+				await new Promise((resolve) => setTimeout(resolve, 20));
+
+				// The spend confirms. Scan B starts after A and finishes first.
+				backend.setHistory(scriptHash, [
+					{ txid: watchedTxid, height: SPEND_HEIGHT - 1 },
+					{ txid: spendTx.getId(), height: SPEND_HEIGHT }
+				]);
+				backend.simulateScriptHashChange(scriptHash);
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				expect(heights, 'the fresher scan reported the spend').to.deep.equal([
+					SPEND_HEIGHT
+				]);
+
+				backend.releaseNextHistory();
+				await new Promise((resolve) => setTimeout(resolve, 20));
+
+				expect(
+					unspent,
+					'the older scan may not retract it afterwards'
+				).to.deep.equal([]);
+				expect(
+					recordedSpendHeight(watchedTxid),
+					'so the spend stays recorded'
+				).to.equal(SPEND_HEIGHT);
 			});
 		});
 	});
