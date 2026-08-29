@@ -198,6 +198,9 @@ import {
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode,
 	InvalidSpliceError,
+	SpliceRefusalCode,
+	ISpliceRefusal,
+	ISpliceRequestResult,
 	InvalidPeerConnectError,
 	FundingWaitTimeoutError,
 	IChannelHealth,
@@ -447,6 +450,13 @@ const PAYER_UNDERSTOOD_INVOICE_FEATURES: ReadonlySet<number> = new Set([
 
 /** BOLT 2: a node forgets an unconfirmed funding only after 2016 blocks. */
 const FUNDING_FORGET_BLOCKS = 2016;
+
+/**
+ * What a splice refusal says when the channel gave no reason of its own. The
+ * message reaches a caller as the whole explanation, so an absent one used to
+ * arrive as `undefined` (issue #618).
+ */
+const SPLICE_NOT_STARTED = 'the channel would not start the splice';
 
 /**
  * How long `requestJitReceive` waits for the LSP's ack. Kept at 15 s because
@@ -10388,7 +10398,7 @@ export class LightningNode extends EventEmitter {
 		amountSats: bigint,
 		fundingFeeratePerkw = 253,
 		fundingUtxos?: IUtxoSelectionOpts
-	): { ok: boolean; error?: string } {
+	): ISpliceRequestResult {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new InvalidSpliceError(cidErr);
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
@@ -10414,7 +10424,8 @@ export class LightningNode extends EventEmitter {
 		if (!channel) {
 			return {
 				ok: false,
-				error: `Channel not found: ${channelId.toString('hex')}`
+				error: `Channel not found: ${channelId.toString('hex')}`,
+				code: SpliceRefusalCode.CHANNEL_NOT_FOUND
 			};
 		}
 		const spliceInErr = this._validateSpliceRequest(channelId, amountSats);
@@ -10422,10 +10433,10 @@ export class LightningNode extends EventEmitter {
 			this.emit('node:error', {
 				code: 'SPLICE_IN_FAILED',
 				channelId,
-				message: spliceInErr,
+				message: spliceInErr.error,
 				timestamp: Date.now()
 			} as ILightningError);
-			return { ok: false, error: spliceInErr };
+			return { ok: false, ...spliceInErr };
 		}
 		// The issue #423 splice-in reserve rule lives in channel.initiateSplice
 		// (after input selection, below): it arms only when the selection's
@@ -10441,7 +10452,11 @@ export class LightningNode extends EventEmitter {
 				message: error,
 				timestamp: Date.now()
 			} as ILightningError);
-			return { ok: false, error };
+			return {
+				ok: false,
+				error,
+				code: SpliceRefusalCode.FUNDING_PROVIDER_REQUIRED
+			};
 		}
 
 		this.fundingProvider
@@ -10476,7 +10491,7 @@ export class LightningNode extends EventEmitter {
 					this.emit('node:error', {
 						code: 'SPLICE_IN_FAILED',
 						channelId,
-						message: result.error!,
+						message: result.error ?? SPLICE_NOT_STARTED,
 						timestamp: Date.now()
 					} as ILightningError);
 				}
@@ -10520,7 +10535,7 @@ export class LightningNode extends EventEmitter {
 		inputs: ISpliceWalletInput[],
 		changeScript: Buffer,
 		fundingFeeratePerkw = 253
-	): { ok: boolean; error?: string } {
+	): ISpliceRequestResult {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new InvalidSpliceError(cidErr);
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
@@ -10608,7 +10623,8 @@ export class LightningNode extends EventEmitter {
 		if (!channel) {
 			return {
 				ok: false,
-				error: `Channel not found: ${channelId.toString('hex')}`
+				error: `Channel not found: ${channelId.toString('hex')}`,
+				code: SpliceRefusalCode.CHANNEL_NOT_FOUND
 			};
 		}
 		const spliceInErr = this._validateSpliceRequest(channelId, amountSats);
@@ -10616,10 +10632,10 @@ export class LightningNode extends EventEmitter {
 			this.emit('node:error', {
 				code: 'SPLICE_IN_FAILED',
 				channelId,
-				message: spliceInErr,
+				message: spliceInErr.error,
 				timestamp: Date.now()
 			} as ILightningError);
-			return { ok: false, error: spliceInErr };
+			return { ok: false, ...spliceInErr };
 		}
 
 		channel.setSpliceInInputs(inputs, changeScript);
@@ -10629,13 +10645,14 @@ export class LightningNode extends EventEmitter {
 			fundingFeeratePerkw
 		);
 		if (!result.ok) {
+			const error = result.error ?? SPLICE_NOT_STARTED;
 			this.emit('node:error', {
 				code: 'SPLICE_IN_FAILED',
 				channelId,
-				message: result.error!,
+				message: error,
 				timestamp: Date.now()
 			} as ILightningError);
-			return { ok: false, error: result.error };
+			return { ok: false, error, code: SpliceRefusalCode.SPLICE_REFUSED };
 		}
 		return { ok: true };
 	}
@@ -11000,7 +11017,7 @@ export class LightningNode extends EventEmitter {
 		amountSats: bigint,
 		fundingFeeratePerkw = 253,
 		destinationScript?: Buffer
-	): { ok: boolean; error?: string } {
+	): ISpliceRequestResult {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new InvalidSpliceError(cidErr);
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
@@ -11037,7 +11054,8 @@ export class LightningNode extends EventEmitter {
 		if (!channel) {
 			return {
 				ok: false,
-				error: `Channel not found: ${channelId.toString('hex')}`
+				error: `Channel not found: ${channelId.toString('hex')}`,
+				code: SpliceRefusalCode.CHANNEL_NOT_FOUND
 			};
 		}
 
@@ -11056,21 +11074,27 @@ export class LightningNode extends EventEmitter {
 		// on-chain fee comes out of the channel (BOLT/CLN: new_funding =
 		// oldCap + relative_satoshis, and we declare relative = -(amount + fee)).
 		// So the channel must be able to spare amount + fee.
-		let error = this._validateSpliceRequest(channelId, amountSats);
+		let refusal = this._validateSpliceRequest(channelId, amountSats);
 		// The destination is an interactive-tx output, so it must clear the
 		// NEGOTIATED floor, not just the generic 546-sat one: a peer whose
 		// commitment dust limit is larger rejects the tx_add_output and the
 		// splice aborts after the fact (issue #389).
 		const destinationFloor = channel.spliceInteractiveTxDustFloor();
-		if (!error && amountSats < destinationFloor) {
-			error = `splice-out amount ${amountSats} sats is below this channel's negotiated dust floor (${destinationFloor} sats)`;
+		if (!refusal && amountSats < destinationFloor) {
+			refusal = {
+				error: `splice-out amount ${amountSats} sats is below this channel's negotiated dust floor (${destinationFloor} sats)`,
+				code: SpliceRefusalCode.INVALID_PARAMS
+			};
 		}
 		// Footgun guard: a fee at or above the withdrawal means you'd burn more
 		// on-chain than you take out — almost always a mistake (wrong feerate).
-		if (!error && fee >= amountSats) {
-			error = `splice-out fee (${fee} sats at ${fundingFeeratePerkw} sat/kw) meets or exceeds the amount (${amountSats} sats) — use a larger amount or a lower feerate`;
+		if (!refusal && fee >= amountSats) {
+			refusal = {
+				error: `splice-out fee (${fee} sats at ${fundingFeeratePerkw} sat/kw) meets or exceeds the amount (${amountSats} sats) — use a larger amount or a lower feerate`,
+				code: SpliceRefusalCode.INVALID_PARAMS
+			};
 		}
-		if (!error) {
+		if (!refusal) {
 			const state = channel.getFullState();
 			// The reserve the channel will actually keep after adoption: the
 			// stored value never falls across a splice (CLN keeps enforcing it)
@@ -11084,19 +11108,22 @@ export class LightningNode extends EventEmitter {
 			const reserve = derived > stored ? derived : stored;
 			const spendableSats = channel.getBalances().localMsat / 1000n - reserve;
 			if (amountSats + fee > spendableSats) {
-				error = `insufficient channel balance for splice-out: need ${
-					amountSats + fee
-				} sats (amount + ${fee}-sat fee at ${fundingFeeratePerkw} sat/kw), spendable ${spendableSats} sats after the ${reserve}-sat reserve at the post-splice capacity`;
+				refusal = {
+					error: `insufficient channel balance for splice-out: need ${
+						amountSats + fee
+					} sats (amount + ${fee}-sat fee at ${fundingFeeratePerkw} sat/kw), spendable ${spendableSats} sats after the ${reserve}-sat reserve at the post-splice capacity`,
+					code: SpliceRefusalCode.INSUFFICIENT_BALANCE
+				};
 			}
 		}
-		if (error) {
+		if (refusal) {
 			this.emit('node:error', {
 				code: 'SPLICE_OUT_FAILED',
 				channelId,
-				message: error,
+				message: refusal.error,
 				timestamp: Date.now()
 			} as ILightningError);
-			return { ok: false, error };
+			return { ok: false, ...refusal };
 		}
 
 		// Record where the withdrawn funds are paid (a wallet-owned or external
@@ -11117,13 +11144,14 @@ export class LightningNode extends EventEmitter {
 		);
 
 		if (!result.ok) {
+			const error = result.error ?? SPLICE_NOT_STARTED;
 			this.emit('node:error', {
 				code: 'SPLICE_OUT_FAILED',
 				channelId,
-				message: result.error!,
+				message: error,
 				timestamp: Date.now()
 			} as ILightningError);
-			return { ok: false, error: result.error };
+			return { ok: false, error, code: SpliceRefusalCode.SPLICE_REFUSED };
 		}
 
 		return { ok: true };
@@ -11166,13 +11194,16 @@ export class LightningNode extends EventEmitter {
 	private _validateSpliceRequest(
 		channelId: Buffer,
 		amountSats: bigint
-	): string | null {
+	): ISpliceRefusal | null {
 		// Strict: the interactive-tx builder (and the negotiated-floor check
 		// on splice-out destinations) accepts an output AT the floor, so the
 		// preflight must too — refusing equality here would reject a
 		// splice the negotiation itself is happy to complete.
 		if (amountSats < LightningNode.SPLICE_MIN_AMOUNT_SATS) {
-			return `splice amount ${amountSats} sats is below the dust floor (${LightningNode.SPLICE_MIN_AMOUNT_SATS} sats)`;
+			return {
+				error: `splice amount ${amountSats} sats is below the dust floor (${LightningNode.SPLICE_MIN_AMOUNT_SATS} sats)`,
+				code: SpliceRefusalCode.INVALID_PARAMS
+			};
 		}
 		const peerPubkey = this.channelManager.getPeerForChannel(channelId);
 		// Unknown support (no init to read) passes, as it always has: the
@@ -11183,7 +11214,11 @@ export class LightningNode extends EventEmitter {
 		// splicing), and blaming the peer for a local configuration sends
 		// whoever reads the error to debug the wrong node.
 		if (peerPubkey && this.peerSupportsSplicing(peerPubkey) === false) {
-			return 'splicing is not negotiated with this peer (option_splice/option_quiesce required on both sides)';
+			return {
+				error:
+					'splicing is not negotiated with this peer (option_splice/option_quiesce required on both sides)',
+				code: SpliceRefusalCode.SPLICING_NOT_NEGOTIATED
+			};
 		}
 		return null;
 	}

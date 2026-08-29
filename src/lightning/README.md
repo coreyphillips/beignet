@@ -546,11 +546,17 @@ Add or remove funds from an existing channel without closing it. Requires quiesc
 ```typescript
 // Splice-in: add 100,000 sats to the channel
 const inResult = node.spliceIn(channelId, 100_000n, 253);
-// => { ok: boolean; error?: string }
+// => { ok: boolean; error?: string; code?: SpliceRefusalCode }
 
 // Splice-out: withdraw 50,000 sats from the channel
 const outResult = node.spliceOut(channelId, 50_000n, 253);
-// => { ok: boolean; error?: string }
+// => { ok: boolean; error?: string; code?: SpliceRefusalCode }
+
+// A refusal carries both the sentence and the code that classifies it
+// (CHANNEL_NOT_FOUND, SPLICING_NOT_NEGOTIATED, INVALID_PARAMS,
+// INSUFFICIENT_BALANCE, FUNDING_PROVIDER_REQUIRED, SPLICE_REFUSED).
+// `ok: true` means the splice started, not that it completed: the outcome
+// arrives on splice:complete, splice:aborted or node:error.
 
 // Flow: STFU exchange -> splice/splice_ack -> interactive TX
 // -> tx_signatures -> splice_locked (both sides)

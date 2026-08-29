@@ -1181,6 +1181,44 @@ export class InvalidSpliceError extends InvalidRequestError {
 }
 
 /**
+ * Why a splice request was refused. These refusals are returned rather than
+ * thrown, because a splice starts asynchronously and the request that failed
+ * was well formed enough to reach the engine. Untyped, the reason survives
+ * only as an English sentence, which a boundary can neither classify nor
+ * answer with anything but a success (issue #618). The sibling for argument
+ * refusals is InvalidSpliceError, which still throws.
+ */
+export enum SpliceRefusalCode {
+	/** No such channel on this node. */
+	CHANNEL_NOT_FOUND = 'CHANNEL_NOT_FOUND',
+	/** option_splice/option_quiesce is missing on one side of the pair. */
+	SPLICING_NOT_NEGOTIATED = 'SPLICING_NOT_NEGOTIATED',
+	/** The amount cannot be spliced as asked (dust floors, fee above amount). */
+	INVALID_PARAMS = 'INVALID_PARAMS',
+	/** The channel cannot spare the amount plus the splice fee. */
+	INSUFFICIENT_BALANCE = 'INSUFFICIENT_BALANCE',
+	/** No funding provider able to source the splice-in's wallet inputs. */
+	FUNDING_PROVIDER_REQUIRED = 'FUNDING_PROVIDER_REQUIRED',
+	/** The channel exists but would not start the splice (state, peer, size). */
+	SPLICE_REFUSED = 'SPLICE_REFUSED'
+}
+
+/** A refused splice: why, in one sentence and as a code. */
+export interface ISpliceRefusal {
+	error: string;
+	code: SpliceRefusalCode;
+}
+
+/**
+ * The answer from a splice request (spliceIn, spliceInWithInputs, spliceOut):
+ * `ok: true` means the splice was started, not that it completed. A refusal
+ * carries both the human message and the code that classifies it.
+ */
+export interface ISpliceRequestResult extends Partial<ISpliceRefusal> {
+	ok: boolean;
+}
+
+/**
  * An open or splice that did not FINISH within the wait's timeout. Distinct
  * from every other funding failure because it says nothing about the
  * operation: the wait only stopped listening, and the funding it started is

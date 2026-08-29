@@ -5589,10 +5589,17 @@ export class ChannelManager extends EventEmitter {
 			locktime
 		);
 		this.processActions(peerPubkey, channel, actions);
-		return {
-			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),
-			actions
-		};
+		// Carry the channel's own reason out with the refusal: the callers
+		// report it as the whole explanation, and without this a refusal from
+		// initiateSplice itself (wrong state, splice in flight, reserve) left
+		// them with an undefined message (issue #618).
+		const errorAction = actions.find(
+			(a): a is IErrorAction => a.type === ChannelActionType.ERROR
+		);
+		if (errorAction) {
+			return { ok: false, actions, error: errorAction.message };
+		}
+		return { ok: true, actions };
 	}
 
 	/**
