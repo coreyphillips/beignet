@@ -2589,16 +2589,21 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}),
 					responses: {
 						'200': {
-							description: 'Splice result',
+							description:
+								'Splice started. The negotiation runs on: watch splice:complete / node:error for the outcome.',
 							content: jsonContent({
 								$ref: '#/components/schemas/SpliceResult'
 							})
 						},
 						'400': {
 							description:
-								'INVALID_PARAMS: malformed channelId, non-integer amount, or a feeratePerkw outside 1..4294967295'
+								'INVALID_PARAMS: malformed channelId, non-integer amount, a feeratePerkw outside 1..4294967295, or an amount below the dust floor'
 						},
-						'404': { description: 'CHANNEL_NOT_FOUND' }
+						'404': { description: 'CHANNEL_NOT_FOUND' },
+						'409': {
+							description:
+								'SPLICING_NOT_NEGOTIATED (option_splice/option_quiesce missing on either side), FUNDING_PROVIDER_REQUIRED (no wallet UTXO sourcing), or SPLICE_REFUSED (the channel would not start the splice)'
+						}
 					}
 				}
 			},
@@ -2616,16 +2621,25 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}),
 					responses: {
 						'200': {
-							description: 'Splice result',
+							description:
+								'Splice started. The negotiation runs on: watch splice:complete / node:error for the outcome.',
 							content: jsonContent({
 								$ref: '#/components/schemas/SpliceResult'
 							})
 						},
 						'400': {
 							description:
-								'INVALID_PARAMS: malformed channelId, non-integer amount, a feeratePerkw outside 1..4294967295, or an address this network cannot decode'
+								'INVALID_PARAMS: malformed channelId, non-integer amount, a feeratePerkw outside 1..4294967295, an address this network cannot decode, an amount below the channel dust floor, or a fee at or above the amount'
 						},
-						'404': { description: 'CHANNEL_NOT_FOUND' }
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: an address-targeted splice-out over dailySpendLimitSats'
+						},
+						'404': { description: 'CHANNEL_NOT_FOUND' },
+						'409': {
+							description:
+								'INSUFFICIENT_BALANCE (amount + fee above what the channel can spare), SPLICING_NOT_NEGOTIATED, or SPLICE_REFUSED (the channel would not start the splice)'
+						}
 					}
 				}
 			},
@@ -3590,9 +3604,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				},
 				SpliceResult: {
 					type: 'object',
+					description:
+						'A started splice. Refusals are answered as failure envelopes with their own status, so `ok` is always true here.',
 					properties: {
-						ok: { type: 'boolean' },
-						error: { type: 'string' }
+						ok: { type: 'boolean', enum: [true] }
 					}
 				},
 				BootstrapPeerInfo: {

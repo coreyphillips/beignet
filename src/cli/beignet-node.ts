@@ -103,7 +103,8 @@ import {
 	INodeConfig,
 	InvalidRequestError,
 	ChannelFundingUnavailableError,
-	ChannelFundingUnavailableCode
+	ChannelFundingUnavailableCode,
+	SpliceRefusalCode
 } from '../lightning/node/types';
 import {
 	BITCOIN_CHAIN_HASH,
@@ -712,6 +713,39 @@ const FUNDING_UNAVAILABLE_CODES: Record<
 	[ChannelFundingUnavailableCode.CHANNEL_NOT_FOUND]:
 		BeignetErrorCode.CHANNEL_NOT_FOUND
 };
+
+/**
+ * The code a splice refusal reaches the caller as. A splice refusal is
+ * returned, not thrown, so nothing above converts it: the two splice routes
+ * used to wrap it in a success envelope, which is the one daemon answer where
+ * a failure reads as a success (issue #618).
+ */
+const SPLICE_REFUSAL_CODES: Record<SpliceRefusalCode, BeignetErrorCode> = {
+	[SpliceRefusalCode.CHANNEL_NOT_FOUND]: BeignetErrorCode.CHANNEL_NOT_FOUND,
+	[SpliceRefusalCode.SPLICING_NOT_NEGOTIATED]:
+		BeignetErrorCode.SPLICING_NOT_NEGOTIATED,
+	[SpliceRefusalCode.INVALID_PARAMS]: BeignetErrorCode.INVALID_PARAMS,
+	[SpliceRefusalCode.INSUFFICIENT_BALANCE]:
+		BeignetErrorCode.INSUFFICIENT_BALANCE,
+	[SpliceRefusalCode.FUNDING_PROVIDER_REQUIRED]:
+		BeignetErrorCode.FUNDING_PROVIDER_REQUIRED,
+	[SpliceRefusalCode.SPLICE_REFUSED]: BeignetErrorCode.SPLICE_REFUSED
+};
+
+/**
+ * A refusing SpliceResult as the error the daemon answers with, or null for a
+ * splice that started. An untyped refusal (an older engine, a code this build
+ * does not know) is not silently promoted to a success: it answers the generic
+ * SPLICE_REFUSED, which is a 409 and permanent, so a caller neither retries it
+ * nor mistakes it for a splice in flight.
+ */
+export function spliceRefusalError(result: SpliceResult): BeignetError | null {
+	if (result.ok) return null;
+	const code =
+		(result.code && SPLICE_REFUSAL_CODES[result.code]) ||
+		BeignetErrorCode.SPLICE_REFUSED;
+	return new BeignetError(code, result.error ?? 'Splice refused');
+}
 
 /**
  * Run a channel-funding request (open, quote or splice), converting the engine's

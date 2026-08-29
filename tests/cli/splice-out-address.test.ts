@@ -182,14 +182,13 @@ describe('Daemon splice-out address passthrough', function () {
 			feeratePerkw: 2500,
 			address: REGTEST_ADDRESS
 		});
-		// The library reports an unknown channel in-band ({ok:false}), not as a
-		// thrown error, so the HTTP layer answers 200: reaching it proves the
-		// address decoded and the request proceeded past validation.
-		expect(res.status).to.equal(200);
-		expect(res.body.ok).to.equal(true);
-		const result = res.body.result as { ok: boolean; error?: string };
-		expect(result.ok).to.equal(false);
-		expect(result.error).to.include('Channel not found');
+		// A 404 for the channel, not a 400 for the address: reaching the lookup
+		// proves the address decoded and the request went past validation.
+		expect(res.status).to.equal(404);
+		expect(res.body.ok).to.equal(false);
+		const error = res.body.error as { code: string; message: string };
+		expect(error.code).to.equal('CHANNEL_NOT_FOUND');
+		expect(error.message).to.include('Channel not found');
 	});
 
 	it('behaves exactly as before when address is omitted', async () => {
@@ -198,10 +197,10 @@ describe('Daemon splice-out address passthrough', function () {
 			amountSats: 50_000,
 			feeratePerkw: 2500
 		});
-		expect(res.status).to.equal(200);
-		expect(res.body.ok).to.equal(true);
-		const result = res.body.result as { ok: boolean; error?: string };
-		expect(result.ok).to.equal(false);
-		expect(result.error).to.include('Channel not found');
+		expect(res.status).to.equal(404);
+		expect(res.body.ok).to.equal(false);
+		const error = res.body.error as { code: string; message: string };
+		expect(error.code).to.equal('CHANNEL_NOT_FOUND');
+		expect(error.message).to.include('Channel not found');
 	});
 });

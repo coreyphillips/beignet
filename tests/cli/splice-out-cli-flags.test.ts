@@ -90,7 +90,7 @@ describe('CLI splice-out with trailing global flags', function () {
 	});
 
 	it('an omitted address plus --api-key does not send the flag as the address', async () => {
-		const { stdout } = await runCli(home, [
+		const { stdout, code } = await runCli(home, [
 			'channel',
 			'splice-out',
 			UNKNOWN_CHANNEL_ID,
@@ -105,11 +105,14 @@ describe('CLI splice-out with trailing global flags', function () {
 			error?: { code: string; message: string };
 		};
 		// The regression sent "--api-key" as the address and the daemon
-		// refused INVALID_PARAMS. Reaching the in-band channel lookup proves
-		// no address was sent.
-		expect(parsed.ok).to.equal(true);
-		expect(parsed.result?.ok).to.equal(false);
-		expect(parsed.result?.error).to.include('Channel not found');
+		// refused INVALID_PARAMS naming destinationAddress. Reaching the
+		// channel lookup instead proves no address was sent. The refusal is a
+		// failure envelope, so the command exits non-zero (issue #618): it
+		// used to print the refusal and exit 0.
+		expect(parsed.ok).to.equal(false);
+		expect(parsed.error?.code).to.equal('CHANNEL_NOT_FOUND');
+		expect(parsed.error?.message).to.include('Channel not found');
+		expect(code).to.equal(1);
 	});
 
 	it('a present address is still sent when global flags trail it', async () => {

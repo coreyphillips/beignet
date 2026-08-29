@@ -5,6 +5,7 @@
 
 import { TLogLevel } from '../logger';
 import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
+import type { SpliceRefusalCode } from '../lightning/node/types';
 
 export interface NodeInfo {
 	nodeId: string;
@@ -448,9 +449,16 @@ export interface TrustedPeerInfo {
 	trusted: boolean;
 }
 
+/**
+ * A started splice, or the refusal that stopped it. The daemon routes answer a
+ * refusal as a failure envelope with the mapped error code, so over HTTP this
+ * is only ever `{ ok: true }` (issue #618); an embedder calling BeignetNode
+ * directly still gets the refusal in hand.
+ */
 export interface SpliceResult {
 	ok: boolean;
 	error?: string;
+	code?: SpliceRefusalCode;
 }
 
 export interface BootstrapPeerInfo {

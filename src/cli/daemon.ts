@@ -14,13 +14,14 @@ import {
 	BeignetNodeOptions,
 	jitReceiveRefusal,
 	leaseRatesRefusal,
-	parseRecoveryMode
+	parseRecoveryMode,
+	spliceRefusalError
 } from './beignet-node';
 import { parseGuardianEntry } from '../lightning/recovery';
 import { ILogger, createConsoleLogger } from '../logger';
 import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
-import { ApiResponse, RouteHop } from './types';
+import { ApiResponse, RouteHop, SpliceResult } from './types';
 import { getOpenApiSpec } from './openapi';
 import { WebhookManager } from './webhooks';
 import { PaymentQueue } from './payment-queue';
@@ -98,6 +99,19 @@ function success<T>(result: T): ApiResponse<T> {
 
 function failure(code: string, message: string): ApiResponse<never> {
 	return { ok: false, error: { code, message } };
+}
+
+/**
+ * A splice request as one of the daemon's two envelopes. The engine answers a
+ * refusal in band, and wrapping that in success() produced a third shape:
+ * 200 ok:true around ok:false, the only daemon answer where a failure is
+ * indistinguishable from a success to a client that reads the envelope and
+ * stops there (issue #618).
+ */
+function spliceOrRefuse(result: SpliceResult): ApiResponse<SpliceResult> {
+	const refusal = spliceRefusalError(result);
+	if (refusal) return failure(refusal.code, refusal.message);
+	return success(result);
 }
 
 /** 403 message: which scopes the route accepts (admin always qualifies). */
@@ -262,6 +276,11 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	NOTHING_TO_CONSOLIDATE: 409,
 	NODE_DESTROYED: 409,
 	FUNDING_PROVIDER_REQUIRED: 409,
+	// A splice the node would not start: the channel is in the wrong state, the
+	// pair never negotiated splicing, or the amount does not fit what the
+	// channel can spare. None is a node fault and none changes on a retry.
+	SPLICE_REFUSED: 409,
+	SPLICING_NOT_NEGOTIATED: 409,
 	CHANNEL_NOT_FOUND: 404,
 	INVOICE_EXPIRED: 410,
 	SPENDING_LIMIT_EXCEEDED: 403,
@@ -1817,7 +1836,7 @@ async function bootDaemon(
 					'INVALID_PARAMS',
 					'channelId, amountSats, and feeratePerkw required'
 				);
-			return success(node.spliceIn(channelId, amountSats, feeratePerkw));
+			return spliceOrRefuse(node.spliceIn(channelId, amountSats, feeratePerkw));
 		},
 		'POST /channel/splice-out': (body) => {
 			const { channelId, amountSats, feeratePerkw, address } = body as {
@@ -1836,7 +1855,7 @@ async function bootDaemon(
 					'INVALID_PARAMS',
 					'channelId, amountSats, and feeratePerkw required'
 				);
-			return success(
+			return spliceOrRefuse(
 				node.spliceOut(channelId, amountSats, feeratePerkw, address)
 			);
 		},

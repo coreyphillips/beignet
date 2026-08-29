@@ -18,7 +18,8 @@ import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 import {
 	InvalidSpliceError,
 	ChannelFundingUnavailableError,
-	ChannelFundingUnavailableCode
+	ChannelFundingUnavailableCode,
+	SpliceRefusalCode
 } from '../../src/lightning/node/types';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
@@ -435,6 +436,87 @@ describe('LightningNode splice validation', function () {
 		const below = node.spliceOut(channelId, 545n, 253);
 		expect(below.ok).to.be.false;
 		expect(below.error).to.include('below the dust floor');
+		node.destroy();
+	});
+});
+
+/**
+ * Issue #618: a splice refusal is returned, not thrown, so a caller above the
+ * engine has nothing but an English sentence to classify it by. Every arm now
+ * carries a code, and the daemon answers each with a status of its own instead
+ * of wrapping the refusal in a success envelope.
+ */
+describe('LightningNode splice refusal codes', function () {
+	it('codes the unknown channel on both directions', function () {
+		const node = createTestNode();
+		const unknown = crypto.randomBytes(32);
+		for (const result of [
+			node.spliceIn(unknown, 100_000n, 253),
+			node.spliceOut(unknown, 100_000n, 253)
+		]) {
+			expect(result.ok).to.be.false;
+			expect(result.code).to.equal(SpliceRefusalCode.CHANNEL_NOT_FOUND);
+			expect(result.error).to.include('Channel not found');
+		}
+		node.destroy();
+	});
+
+	it('codes the amount refusals as the caller argument they are', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		// Below the generic dust floor, then a fee at or above the amount:
+		// both are the caller's numbers, so both answer INVALID_PARAMS (400).
+		expect(node.spliceOut(channelId, 500n, 253).code).to.equal(
+			SpliceRefusalCode.INVALID_PARAMS
+		);
+		expect(node.spliceIn(channelId, 100n, 253).code).to.equal(
+			SpliceRefusalCode.INVALID_PARAMS
+		);
+		expect(node.spliceOut(channelId, 2000n, 3000).code).to.equal(
+			SpliceRefusalCode.INVALID_PARAMS
+		);
+		node.destroy();
+	});
+
+	it('codes a splice-out past the spendable balance', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const result = node.spliceOut(channelId, FUNDING_SATOSHIS, 253);
+		expect(result.code).to.equal(SpliceRefusalCode.INSUFFICIENT_BALANCE);
+		node.destroy();
+	});
+
+	it('codes a splice-in with no wallet UTXO sourcing', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const result = node.spliceIn(channelId, 100_000n, 253);
+		expect(result.code).to.equal(SpliceRefusalCode.FUNDING_PROVIDER_REQUIRED);
+		node.destroy();
+	});
+
+	it('codes the pre-flight that reads the negotiated features', function () {
+		const spliceOnly = new FeatureFlags();
+		spliceOnly.setOptional(Feature.SPLICE);
+		const node = createTestNode(spliceOnly);
+		const channelId = injectNormalChannel(node);
+		const result = node.spliceIn(channelId, 100_000n, 253);
+		expect(result.code).to.equal(SpliceRefusalCode.SPLICING_NOT_NEGOTIATED);
+		node.destroy();
+	});
+
+	it("carries the channel's own refusal instead of an undefined message", function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const channel = (node as any).channelManager.channels.get(
+			channelId.toString('hex')
+		);
+		channel._state.state = ChannelState.SHUTTING_DOWN;
+		const result = node.spliceOut(channelId, 10_000n, 2500);
+		expect(result.ok).to.be.false;
+		expect(result.code).to.equal(SpliceRefusalCode.SPLICE_REFUSED);
+		// The reason lived in the channel's ERROR action and never reached the
+		// caller: the refusal arrived as `{ ok: false, error: undefined }`.
+		expect(result.error).to.include('not in NORMAL state');
 		node.destroy();
 	});
 });

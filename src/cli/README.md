@@ -779,8 +779,11 @@ interface TrustedPeerInfo {
 }
 
 interface SpliceResult {
-  ok: boolean;
-  error?: string;
+  ok: boolean;              // true = the splice started, not that it completed
+  error?: string;           // set on a refusal
+  code?: SpliceRefusalCode; // CHANNEL_NOT_FOUND | SPLICING_NOT_NEGOTIATED |
+                            // INVALID_PARAMS | INSUFFICIENT_BALANCE |
+                            // FUNDING_PROVIDER_REQUIRED | SPLICE_REFUSED
 }
 
 interface BootstrapPeerInfo {
@@ -1050,6 +1053,8 @@ not repeat a 4xx unchanged.
 | `ZERO_CONF_FAILED` | Channels | 500 | Zero-conf channel open failed |
 | `FUNDING_PROVIDER_REQUIRED` | Channels | 409 | The node has no funding provider able to serve this open or splice |
 | `FEE_ESTIMATE_NOT_READY` | Channels | 503 | The fee estimator has not delivered its first sample; retry shortly |
+| `SPLICING_NOT_NEGOTIATED` | Channels | 409 | `option_splice`/`option_quiesce` is missing on one side of the pair |
+| `SPLICE_REFUSED` | Channels | 409 | The channel exists but would not start the splice (state, peer, size) |
 | `PEER_NOT_CONNECTED` | Peers | 409 | Peer is not connected |
 | `CONNECT_FAILED` | Peers | 502 | Dialing the peer failed |
 | `CONNECT_TIMEOUT` | Peers | 504 | The peer did not answer the dial in time |
@@ -1149,6 +1154,21 @@ try {
 ```
 
 Node faults are still deliberately untyped, so they keep scrubbing to a generic **500** with the detail in the daemon log only.
+
+#### Splice Refusals
+
+A splice starts asynchronously, so a refusal is **returned**, not thrown: `spliceIn`/`spliceOut` answer `{ ok: false, error, code }`. The daemon converts that code at the route boundary, so `POST /channel/splice-in` and `POST /channel/splice-out` answer a refused splice as a failure envelope, never a 200 carrying `ok: false` under `result`.
+
+| `SpliceRefusalCode` | Reaches the caller as | HTTP |
+|---|---|---|
+| `CHANNEL_NOT_FOUND` | `CHANNEL_NOT_FOUND` | 404 |
+| `INVALID_PARAMS` | `INVALID_PARAMS` | 400 |
+| `INSUFFICIENT_BALANCE` | `INSUFFICIENT_BALANCE` | 409 |
+| `FUNDING_PROVIDER_REQUIRED` | `FUNDING_PROVIDER_REQUIRED` | 409 |
+| `SPLICING_NOT_NEGOTIATED` | `SPLICING_NOT_NEGOTIATED` | 409 |
+| `SPLICE_REFUSED` | `SPLICE_REFUSED` | 409 |
+
+A 2xx means the splice **started**. Its outcome arrives on the `splice:complete`, `splice:aborted` and `node:error` events.
 
 ---
 
@@ -1810,8 +1830,8 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/channel/close` | `{ channelId, acceptStaleStateRisk? }` | Coop close; the flag is required for a capsule-restored channel |
 | POST | `/channel/forceclose` | `{ channelId, acceptStaleStateRisk? }` | Force close; the flag is required for a capsule-restored channel |
 | POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
-| POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds |
-| POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address |
+| POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds. A 2xx means the splice started; a refusal is a failure envelope (404 `CHANNEL_NOT_FOUND`, 409 `SPLICING_NOT_NEGOTIATED` / `FUNDING_PROVIDER_REQUIRED` / `SPLICE_REFUSED`, 400 `INVALID_PARAMS`) |
+| POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address. Same refusal codes, plus 409 `INSUFFICIENT_BALANCE` |
 | POST | `/invoice/create` | `{ amountSats?, description?, minFinalCltvExpiry? }` | Create invoice (omit amountSats for amount-less; `minFinalCltvExpiry` buys final-CLTV headroom for a receive an LSP may settle through a splice) |
 | POST | `/jit/invoice` | `{ lspPubkey, amountSats?, description?, expirySecs?, targetRemainingInboundSat?, maxFlatFeeSat?, maxFeePpm? }` | Create an invoice payable with no channel: registers a receive intent with the LSP, which funds a channel mid-payment and deducts the quoted opening fee. Returns the invoice plus `flatFeeSat` and `feePpm` |
 | POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel) |
