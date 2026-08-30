@@ -562,6 +562,8 @@ export class FakeDfNode implements IDfReceiverDeps {
 			witnessesFilled?: boolean;
 			channelId?: Buffer;
 			extraOutputs?: number;
+			/** The real 2-of-2, when a payer on the other end will check it. */
+			fundingScript?: Buffer;
 		} = {}
 	): { channelId: Buffer; tx: bitcoin.Transaction } {
 		const channelId =
@@ -590,7 +592,12 @@ export class FakeDfNode implements IDfReceiverDeps {
 		coin: IDfTestCoin,
 		offer: IDfOffer,
 		preCapacitySat: bigint,
-		opts: { feeSat?: bigint; fundingValueSat?: bigint } = {}
+		opts: {
+			feeSat?: bigint;
+			fundingValueSat?: bigint;
+			/** The real 2-of-2; the shared input spends it too. */
+			fundingScript?: Buffer;
+		} = {}
 	): { channelId: Buffer; tx: bitcoin.Transaction } {
 		const channelId = this.splices[this.splices.length - 1].channelId;
 		const built = this.buildNegotiatedTx(coin, offer, {
@@ -604,7 +611,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 			sharedInputIndex: 1,
 			newFundingOutputIndex: 0,
 			prevouts: {
-				scripts: [coin.script, Buffer.alloc(34, 2)],
+				scripts: [coin.script, opts.fundingScript ?? Buffer.alloc(34, 2)],
 				values: [coin.valueSat, preCapacitySat]
 			},
 			owedExternalInputs: [
@@ -637,6 +644,8 @@ export class FakeDfNode implements IDfReceiverDeps {
 			witnessesFilled?: boolean;
 			sharedInput?: bigint;
 			extraOutputs?: number;
+			/** The real 2-of-2, when a payer on the other end will check it. */
+			fundingScript?: Buffer;
 		} = {}
 	): bitcoin.Transaction {
 		const fee = opts.feeSat ?? 500n;
@@ -647,7 +656,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 			tx.addInput(crypto.randomBytes(32), 0, 0xfffffffd);
 		}
 		tx.addOutput(
-			Buffer.alloc(34, 1),
+			opts.fundingScript ?? Buffer.alloc(34, 1),
 			Number(opts.fundingValueSat ?? offer.amountSat)
 		);
 		const change = offer.valueSat - offer.amountSat - fee;

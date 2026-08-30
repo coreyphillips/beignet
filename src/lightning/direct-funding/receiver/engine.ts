@@ -286,6 +286,28 @@ export class DirectFundingReceiver extends EventEmitter {
 		return detach;
 	}
 
+	/**
+	 * Apply an operator policy change to the fields that carry one. Only the
+	 * keys present are touched, and only the four an operator can actually set:
+	 * the caps, timeouts and sweep interval are engine constants, and a live
+	 * session that already passed a check is not re-judged against a new value.
+	 */
+	setConfig(update: {
+		minAmountSat?: bigint;
+		maxAmountSat?: bigint;
+		allowZeroConf?: boolean;
+		allowSplice?: boolean;
+	}): void {
+		if ('minAmountSat' in update) this.cfg.minAmountSat = update.minAmountSat;
+		if ('maxAmountSat' in update) this.cfg.maxAmountSat = update.maxAmountSat;
+		if (update.allowZeroConf !== undefined) {
+			this.cfg.allowZeroConf = update.allowZeroConf;
+		}
+		if (update.allowSplice !== undefined) {
+			this.cfg.allowSplice = update.allowSplice;
+		}
+	}
+
 	/** Live and tombstoned offer records, for tests and diagnostics. */
 	sessionCount(): number {
 		return this.state.size();

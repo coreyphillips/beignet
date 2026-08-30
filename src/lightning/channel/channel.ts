@@ -1131,6 +1131,29 @@ export class Channel {
 		return this._state.temporaryChannelId;
 	}
 
+	/**
+	 * The id this channel currently answers to: the permanent one once
+	 * accept_channel2 has assigned it, the temporary one before that. A caller
+	 * driving an open on someone else's behalf (direct funding, issue #613) has
+	 * to name whichever is current, and cannot capture either one at open time.
+	 */
+	getCurrentChannelId(): Buffer {
+		return this._state.channelId ?? this._state.temporaryChannelId;
+	}
+
+	/**
+	 * The two funding keys of the 2-of-2, once both sides are known. What the
+	 * direct-funding attestation binds a payer's coin to: the payer rebuilds the
+	 * funding script from these and refuses if the transaction's output is not
+	 * it. Null before accept_channel2 has delivered the peer's key.
+	 */
+	getFundingPubkeys(): { local: Buffer; remote: Buffer } | null {
+		const local = this._state.localBasepoints?.fundingPubkey;
+		const remote = this._state.remoteBasepoints?.fundingPubkey;
+		if (!local || !remote) return null;
+		return { local, remote };
+	}
+
 	getRole(): ChannelRole {
 		return this._state.role;
 	}

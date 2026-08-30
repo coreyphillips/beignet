@@ -109,6 +109,10 @@ describe('OpenAPI Spec Completeness', () => {
 		'/advisor/recommendations',
 		'/advisor/execute-rebalances',
 		'/jit/invoice',
+		'/direct-funding/configure',
+		'/direct-funding/config',
+		'/direct-funding/request',
+		'/direct-funding/send',
 		'/invoice/create-hold',
 		'/invoice/settle-hold',
 		'/invoice/cancel-hold',
@@ -187,7 +191,9 @@ describe('OpenAPI Spec Completeness', () => {
 		'BoostResult',
 		'BoostableTransactions',
 		'ConsolidateResult',
-		'DescriptorsInfo'
+		'DescriptorsInfo',
+		'DirectFundingConfig',
+		'DirectFundingSendResult'
 	];
 
 	for (const schema of expectedSchemas) {

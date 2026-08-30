@@ -90,7 +90,12 @@ const IDEMPOTENT_ROUTES = new Set([
 	'POST /l402/fetch',
 	// Fee-spending advisor execution: retries must not double-spend fees.
 	'POST /rebalance',
-	'POST /advisor/execute-rebalances'
+	'POST /advisor/execute-rebalances',
+	// A direct-funding send spends a UTXO. The engine is idempotent on the
+	// request id whether or not a key is supplied, which is what the app needs
+	// since it sends none; this only lets a client that DOES supply one get the
+	// cached response without the engine re-deriving it.
+	'POST /direct-funding/send'
 ]);
 
 function success<T>(result: T): ApiResponse<T> {
@@ -292,7 +297,34 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// quorum, and a resource with nothing recorded yet: none is a node fault.
 	FEE_EXCEEDS_MAX: 409,
 	RECOVERY_UNAVAILABLE: 503,
-	NO_DATA: 404
+	NO_DATA: 404,
+	// Direct funding (issue #613). The dashboard's decoder validates nothing
+	// beyond a character-class check and surfaces error.message in a toast, so
+	// these are user-facing copy as well as codes. Every one of them is raised
+	// BEFORE the witness leaves the device: the send call cannot reject after
+	// that, so no status here ever describes a coin that may be spent.
+	MALFORMED: 400,
+	UNSUPPORTED_VERSION: 400,
+	EXPIRY_TOO_DISTANT: 400,
+	INVALID_SIGNATURE: 400,
+	WRONG_SIGNER: 400,
+	WRONG_CHAIN: 400,
+	AMOUNT_REQUIRED: 400,
+	AMOUNT_MISMATCH: 400,
+	EXPIRED: 410,
+	TOO_MANY_REQUESTS: 429,
+	// A refusal to fund, and a transport failure. The app falls back to a plain
+	// address payment on either, so telling them apart is the caller's whole
+	// reason for reading the code rather than the message.
+	NO_SUITABLE_UTXO: 409,
+	OFFER_DECLINED: 409,
+	SIGN_REQUEST_REFUSED: 409,
+	UNREACHABLE: 502,
+	EXCHANGE_TIMEOUT: 504,
+	// A storage write that did not land. Retryable on purpose: the request was
+	// refused precisely so it could be, and the next attempt reaches a
+	// different world.
+	NOT_PERSISTED: 503
 	// Left unmapped on purpose, so they keep the 500 default:
 	// WALLET_CREATE_FAILED, ADDRESS_FAILED, REFRESH_FAILED and
 	// DESCRIPTOR_EXPORT_FAILED are node faults, and SEND_FAILED, CLOSE_FAILED,
@@ -677,6 +709,19 @@ async function bootDaemon(
 				`Invalid JIT receive config; BEIGNET_JIT_* ${refusal}`
 			);
 		}
+	}
+	if (
+		opts.dfMinAmountSat !== undefined &&
+		(!Number.isInteger(opts.dfMinAmountSat) || opts.dfMinAmountSat < 0)
+	) {
+		// integerEnv surfaces a partly numeric value ('10m', '0.5') as NaN, and
+		// this turns that into a startup refusal naming the variable rather than a
+		// direct-funding minimum nobody wrote.
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Invalid direct funding minimum "${String(opts.dfMinAmountSat)}"; ` +
+				'BEIGNET_DF_MIN_AMOUNT must be a whole number of satoshis, zero or greater'
+		);
 	}
 	// Diagnostic logger: an injected opts.logger wins; otherwise a configured
 	// logLevel creates a console logger on stderr (stdout stays reserved for
@@ -1383,6 +1428,104 @@ async function bootDaemon(
 					targetRemainingInboundSat,
 					maxFlatFeeSat,
 					maxFeePpm
+				})
+			);
+		},
+		// ── Third-party direct funding (issue #613) ──
+		//
+		// A payer's ordinary on-chain payment becomes this node's channel
+		// funding. `configure` names the liquidity peer to negotiate with,
+		// `request` mints the payable artifact, and `send` is the paying half.
+		'POST /direct-funding/configure': (body) => {
+			const {
+				lspPubkey,
+				lspHost,
+				lspPort,
+				targetInboundSat,
+				trusted,
+				minAmountSat
+			} = body as {
+				lspPubkey?: string;
+				lspHost?: string;
+				lspPort?: number;
+				targetInboundSat?: number;
+				trusted?: boolean;
+				minAmountSat?: number;
+			};
+			// A partial MERGE, not a replace. The dashboard posts {minAmountSat}
+			// alone and then requires lspPubkey in the readback; the app's manager
+			// posts the other five without minAmountSat. A field the caller did not
+			// name keeps its value.
+			return success(
+				node.configureDirectFunding({
+					...(lspPubkey !== undefined ? { lspPubkey } : {}),
+					...(lspHost !== undefined ? { lspHost } : {}),
+					...(lspPort !== undefined ? { lspPort } : {}),
+					...(targetInboundSat !== undefined ? { targetInboundSat } : {}),
+					...(trusted !== undefined ? { trusted } : {}),
+					...(minAmountSat !== undefined ? { minAmountSat } : {})
+				})
+			);
+		},
+		'GET /direct-funding/config': () => success(node.getDirectFundingConfig()),
+		// Mint a payment request. The receipt preimage stays here; a payer whose
+		// funding carries the matching hash is answered with it after broadcast,
+		// which is a provable delivery receipt bound to this request.
+		//
+		// host and port come from the CALLER and are passed through untouched:
+		// the dashboard sends the browser's own hostname and the app's manager
+		// sends PUBLIC_HOST, and the daemon has no way to know which is right.
+		'POST /direct-funding/request': (body) => {
+			const {
+				host: dfHost,
+				port: dfPort,
+				amountSats
+			} = body as {
+				host?: string;
+				port?: number;
+				amountSats?: number;
+			};
+			return success(
+				node.createDirectFundingRequest({
+					...(dfHost !== undefined ? { host: dfHost } : {}),
+					...(dfPort !== undefined ? { port: dfPort } : {}),
+					...(amountSats !== undefined ? { amountSats } : {})
+				})
+			);
+		},
+		// Pay a request by funding the receiver's channel from one of our coins.
+		//
+		// This call REJECTS ONLY BEFORE OUR WITNESS LEAVES THE DEVICE. After that
+		// it resolves, with whatever is known and a `caveat` saying what was
+		// lost. That is a rev 2 MUST and it is load bearing: the LFBW app wraps
+		// this call in a try/catch and, on ANY throw, sends the same amount to
+		// the same address on chain. It cannot tell a late rejection from an
+		// early one, so a rejection after the witness is out is a second payment
+		// of the user's money. Anyone adding an error path here has to keep it
+		// on the pre-witness side of `commitWitness`.
+		//
+		// The call also has NO client timeout: the app's manager configures none
+		// and the browser fetch has none, so it may block for the whole offer to
+		// receipt exchange. That is what makes the contract implementable rather
+		// than a race against a deadline.
+		//
+		// It answers to the two node-wide gates every other outgoing payment
+		// does, both of them ahead of the exchange: a draining node refuses it,
+		// and its amount plus fee ceiling counts against the daily spend limit.
+		'POST /direct-funding/send': async (body) => {
+			const { request, amountSats, maxTotalFeeSat, feeHeadroomSats } = body as {
+				request?: string;
+				amountSats?: number;
+				maxTotalFeeSat?: number;
+				/** Documented alias for maxTotalFeeSat: what the app posts today. */
+				feeHeadroomSats?: number;
+			};
+			return success(
+				await node.sendDirectFunding({
+					...(request !== undefined ? { request } : {}),
+					...(amountSats !== undefined ? { amountSats } : {}),
+					...(maxTotalFeeSat !== undefined ? { maxTotalFeeSat } : {}),
+					...(feeHeadroomSats !== undefined ? { feeHeadroomSats } : {})
 				})
 			);
 		},

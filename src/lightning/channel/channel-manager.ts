@@ -884,6 +884,15 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * May WE open a zero-conf channel to this peer? Delegated rather than
+	 * rebuilt from isTrustedPeer/isJitClient by a caller (direct funding, issue
+	 * #613), so the two copies of the predicate cannot drift.
+	 */
+	canOpenZeroConfTo(pubkeyHex: string): boolean {
+		return this.zeroConfManager.canOpenZeroConfTo(pubkeyHex);
+	}
+
+	/**
 	 * Open a zero-conf channel with a peer.
 	 * Peer must be in the trusted set.
 	 *
