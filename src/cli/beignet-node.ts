@@ -754,6 +754,7 @@ const SPLICE_REFUSAL_CODES: Record<SpliceRefusalCode, BeignetErrorCode> = {
 		BeignetErrorCode.INSUFFICIENT_BALANCE,
 	[SpliceRefusalCode.FUNDING_PROVIDER_REQUIRED]:
 		BeignetErrorCode.FUNDING_PROVIDER_REQUIRED,
+	[SpliceRefusalCode.SPLICE_BUSY]: BeignetErrorCode.SPLICE_BUSY,
 	[SpliceRefusalCode.SPLICE_REFUSED]: BeignetErrorCode.SPLICE_REFUSED
 };
 

@@ -9522,7 +9522,9 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot quiesce: pending HTLCs exist'
+					message: 'Cannot quiesce: pending HTLCs exist',
+					// They settle or fail; either way the channel quiesces after.
+					transient: true
 				}
 			];
 		}
@@ -9778,7 +9780,8 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message:
-						'Cannot splice: a previous splice abort is not yet acknowledged'
+						'Cannot splice: a previous splice abort is not yet acknowledged',
+					transient: true
 				}
 			];
 		}
@@ -9923,7 +9926,8 @@ export class Channel {
 					{
 						type: ChannelActionType.ERROR,
 						message:
-							'Cannot splice: peer initiated the quiescence session; retry after it ends'
+							'Cannot splice: peer initiated the quiescence session; retry after it ends',
+						transient: true
 					}
 				];
 			}
@@ -9992,7 +9996,8 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message:
-						'Cannot splice: a previous splice abort is not yet acknowledged'
+						'Cannot splice: a previous splice abort is not yet acknowledged',
+					transient: true
 				}
 			];
 		}

@@ -478,6 +478,20 @@ const FUNDING_FORGET_BLOCKS = 2016;
 const SPLICE_NOT_STARTED = 'the channel would not start the splice';
 
 /**
+ * The code for a refusal the channel itself produced. Every such refusal used
+ * to answer SPLICE_REFUSED, which the CLI contract calls permanent, so a
+ * caller gave up on a splice held off only by an unacknowledged abort, a
+ * peer-owned quiescence session or settling HTLCs (issue #633). The channel
+ * arm that refused is the one that knows which it was, and says so on its
+ * ERROR action.
+ */
+function spliceRefusalCodeFor(result: ChannelResult): SpliceRefusalCode {
+	return result.transient
+		? SpliceRefusalCode.SPLICE_BUSY
+		: SpliceRefusalCode.SPLICE_REFUSED;
+}
+
+/**
  * How long `requestJitReceive` waits for the LSP's ack. Kept at 15 s because
  * the round trip sits inside the caller's own request budget: the daemon's
  * only consumer allows 20 s for the whole POST /jit/invoice call, so raising
@@ -10723,7 +10737,7 @@ export class LightningNode extends EventEmitter {
 				message: error,
 				timestamp: Date.now()
 			} as ILightningError);
-			return { ok: false, error, code: SpliceRefusalCode.SPLICE_REFUSED };
+			return { ok: false, error, code: spliceRefusalCodeFor(result) };
 		}
 		return { ok: true };
 	}
@@ -11222,7 +11236,7 @@ export class LightningNode extends EventEmitter {
 				message: error,
 				timestamp: Date.now()
 			} as ILightningError);
-			return { ok: false, error, code: SpliceRefusalCode.SPLICE_REFUSED };
+			return { ok: false, error, code: spliceRefusalCodeFor(result) };
 		}
 
 		return { ok: true };

@@ -2687,6 +2687,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'409': {
 							description:
 								'SPLICING_NOT_NEGOTIATED (option_splice/option_quiesce missing on either side), FUNDING_PROVIDER_REQUIRED (no wallet UTXO sourcing), or SPLICE_REFUSED (the channel would not start the splice)'
+						},
+						'503': {
+							description:
+								'SPLICE_BUSY: the channel is momentarily unable to splice (a previous abort awaiting its echo, a peer-owned quiescence session, HTLCs still settling). Retry the same request.'
 						}
 					}
 				}
@@ -2723,6 +2727,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'409': {
 							description:
 								'INSUFFICIENT_BALANCE (amount + fee above what the channel can spare), SPLICING_NOT_NEGOTIATED, or SPLICE_REFUSED (the channel would not start the splice)'
+						},
+						'503': {
+							description:
+								'SPLICE_BUSY: the channel is momentarily unable to splice (a previous abort awaiting its echo, a peer-owned quiescence session, HTLCs still settling). Retry the same request.'
 						}
 					}
 				}
