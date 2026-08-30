@@ -76,10 +76,9 @@ export class ChainMonitor {
 	private _currentBlockHeight = 0;
 	private _knownPreimages: Map<string, Buffer> = new Map();
 	/**
-	 * Restore reset a recorded cooperative close to unconfirmed and no live
-	 * report has answered yet, so this session cannot say whether the funding
-	 * spend is on chain. Session-only and deliberately not persisted: it
-	 * describes this process's ignorance, not the record.
+	 * A restored non-final cooperative close has not received a live funding
+	 * report in this session. This is not persisted because each session needs
+	 * fresh chain evidence.
 	 */
 	private _commitmentReverifyPending = false;
 
@@ -432,26 +431,19 @@ export class ChainMonitor {
 				}
 			}
 		}
-		// Fresh-evidence rule (issue 352): never trust a persisted cooperative
-		// close confirmation height across a restart. The close may have been
-		// reorged out while the node was offline, and the session's first header
-		// reaches the monitors BEFORE restoreChainWatches re-arms the funding
-		// watch, so a stale height could reach depth and resolve with no chance
-		// for the watch to correct it. Reset the clock to unconfirmed; the
-		// re-armed watch's immediate check re-reports the spend with its LIVE
-		// height (or its eviction), and depth counts from that positive evidence.
-		// Costs one Electrum round-trip after restart; depth is height math, so
-		// a re-report of the same height loses no progress.
+		// Never trust a stored non-final cooperative close until its funding watch
+		// reports in this session. A reorg may have removed it while the node was offline,
+		// and the first header arrives before the watch is rearmed. A stored zero
+		// is also unproved because an earlier startup may have persisted its reset
+		// before receiving that report.
 		if (
 			monitor._state !== MonitorState.FULLY_RESOLVED &&
 			monitor._commitmentBroadcast?.commitmentType ===
-				CommitmentType.COOPERATIVE_CLOSE &&
-			monitor._commitmentBroadcast.blockHeight > 0
+				CommitmentType.COOPERATIVE_CLOSE
 		) {
-			monitor._rebindCommitmentConfirmation(0);
-			// Unconfirmed here means UNPROVED, not disproved. A caller that must
-			// not act against a spend already on chain reads this rather than the
-			// zeroed height (issue #622); the first live report clears it.
+			if (monitor._commitmentBroadcast.blockHeight > 0) {
+				monitor._rebindCommitmentConfirmation(0);
+			}
 			monitor._commitmentReverifyPending = true;
 		}
 		// Restore known preimages if present
@@ -494,12 +486,8 @@ export class ChainMonitor {
 	}
 
 	/**
-	 * True while a recorded cooperative close carries a confirmation this
-	 * session has not re-proved: restore dropped the persisted height under the
-	 * fresh-evidence rule, and the re-armed funding watch has not reported yet.
-	 * isCommitmentConfirmed() answers false throughout that window, which is
-	 * right for counting depth (nothing may mature off an unproved height) and
-	 * wrong for anyone asking whether the funding output is still spendable.
+	 * True until this session's funding watch verifies a restored non-final
+	 * cooperative close.
 	 */
 	isCommitmentReverifyPending(): boolean {
 		return this._commitmentReverifyPending;

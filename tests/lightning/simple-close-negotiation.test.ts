@@ -906,6 +906,15 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 		expect(restored.isCommitmentConfirmed()).to.equal(false);
 		expect(restored.isCommitmentReverifyPending()).to.equal(true);
 
+		// Startup persists the reset height before the funding watch reports.
+		h.alice.handleNewBlock(800_010);
+		const restoredAgain = restartMonitor(h, destScript);
+		expect(
+			restoredAgain.getFullState().commitmentBroadcast?.blockHeight
+		).to.equal(0);
+		expect(restoredAgain.isCommitmentConfirmed()).to.equal(false);
+		expect(restoredAgain.isCommitmentReverifyPending()).to.equal(true);
+
 		const broadcastsBefore = h.aliceTxs.length;
 		const refused = h.alice.forceClose(h.channelId, destScript, 10);
 		expect(refused.ok).to.equal(false);
@@ -914,15 +923,15 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 		expect(h.aliceTxs.length, 'no commitment broadcast').to.equal(
 			broadcastsBefore
 		);
-		expect(h.alice.getMonitor(h.channelId)).to.equal(restored);
-		expect(restored.getFullState().commitmentBroadcast?.txid).to.equal(
+		expect(h.alice.getMonitor(h.channelId)).to.equal(restoredAgain);
+		expect(restoredAgain.getFullState().commitmentBroadcast?.txid).to.equal(
 			starved.getId()
 		);
 
 		// The watch re-reports the spend: the same refusal, now on proof.
 		h.alice.handleFundingSpent(h.channelId, starved, 800_000, destScript);
-		expect(restored.isCommitmentReverifyPending()).to.equal(false);
-		expect(restored.isCommitmentConfirmed()).to.equal(true);
+		expect(restoredAgain.isCommitmentReverifyPending()).to.equal(false);
+		expect(restoredAgain.isCommitmentConfirmed()).to.equal(true);
 		expect(h.alice.forceClose(h.channelId, destScript, 10).error).to.match(
 			/already confirmed on chain/
 		);
