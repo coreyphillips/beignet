@@ -414,4 +414,37 @@ describe('UTXO freeze durability', function () {
 		expect(persisted).to.have.length(1);
 		expect(persisted[0].tx_hash).to.equal(utxo.tx_hash);
 	});
+
+	it('a concurrent freeze of the same coin never rides a rolled-back entry', async () => {
+		// The blacklist entry is published before the write that may undo it,
+		// so a second caller reading it mid-flight would be told the coin is
+		// already frozen by a freeze about to disappear.
+		fail.on = true;
+		const [first, second] = await Promise.all([
+			wallet.freezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos }),
+			wallet.freezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos })
+		]);
+		expect(first.isErr()).to.equal(true);
+		expect(second.isErr(), 'the second freeze is no more durable').to.equal(
+			true
+		);
+		expect(wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)).to.equal(false);
+		expect(store.has('freezedurability-regtest-blacklistedUtxos')).to.equal(
+			false
+		);
+	});
+
+	it('a concurrent freeze of the same coin records it once', async () => {
+		const [first, second] = await Promise.all([
+			wallet.freezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos }),
+			wallet.freezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos })
+		]);
+		expect(first.isErr()).to.equal(false);
+		expect(second.isErr()).to.equal(false);
+		expect(wallet.listFrozenUtxos()).to.have.length(1);
+		const persisted = store.get(
+			'freezedurability-regtest-blacklistedUtxos'
+		) as IUtxo[];
+		expect(persisted).to.have.length(1);
+	});
 });

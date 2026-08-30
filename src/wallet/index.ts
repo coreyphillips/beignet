@@ -2459,6 +2459,22 @@ export class Wallet {
 	}
 
 	/**
+	 * Serializes blacklist mutations. Both freezeUtxo and unfreezeUtxo publish
+	 * their change to the in-memory list before the storage write that may
+	 * force them to roll it back, so a second caller landing in that window
+	 * would read a provisional entry: it would answer "already frozen" for a
+	 * freeze that then vanished, or "not frozen" for one that came back.
+	 * Queueing the mutations means every caller decides against a settled list.
+	 */
+	private blacklistLock: Promise<unknown> = Promise.resolve();
+
+	private runBlacklistWrite<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.blacklistLock.then(fn, fn);
+		this.blacklistLock = run.catch(() => undefined);
+		return run;
+	}
+
+	/**
 	 * Freezes a wallet UTXO: it is excluded from every wallet-driven coin
 	 * selection path (send/sendMany/sendMax/consolidate/buildPsbt) until
 	 * unfrozen, while still counting toward getBalance(). Persists through
@@ -2472,16 +2488,24 @@ export class Wallet {
 	 * @param {number} index
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async freezeUtxo({
+	public async freezeUtxo(params: {
+		txid: string;
+		index: number;
+		/** Optional origin marker (e.g. 'funding-pledge') persisted with the
+		 *  entry so automated freezers can recognize, and recover, their own
+		 *  freezes after a restart without touching user-frozen coins. */
+		tag?: string;
+	}): Promise<Result<string>> {
+		return this.runBlacklistWrite(() => this.freezeUtxoLocked(params));
+	}
+
+	private async freezeUtxoLocked({
 		txid,
 		index,
 		tag
 	}: {
 		txid: string;
 		index: number;
-		/** Optional origin marker (e.g. 'funding-pledge') persisted with the
-		 *  entry so automated freezers can recognize, and recover, their own
-		 *  freezes after a restart without touching user-frozen coins. */
 		tag?: string;
 	}): Promise<Result<string>> {
 		if (typeof txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(txid)) {
@@ -2534,7 +2558,14 @@ export class Wallet {
 	 * @param {number} index
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async unfreezeUtxo({
+	public async unfreezeUtxo(params: {
+		txid: string;
+		index: number;
+	}): Promise<Result<string>> {
+		return this.runBlacklistWrite(() => this.unfreezeUtxoLocked(params));
+	}
+
+	private async unfreezeUtxoLocked({
 		txid,
 		index
 	}: {
