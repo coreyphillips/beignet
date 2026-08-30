@@ -2483,11 +2483,19 @@ export class ChannelManager extends EventEmitter {
 		//
 		// The channel holds no monitor, so the fact only this side knows travels
 		// with the request: a CLOSED channel whose recorded mutual close is
-		// already on chain has no dead end to rescue (issue #622).
+		// already on chain has no dead end to rescue (issue #622). A restored
+		// monitor cannot say which it is until its watch reports, and travels as
+		// that third answer rather than as a no.
 		const existingMonitor = this.monitors.get(idHex);
 		const fundingSpendConfirmed =
 			existingMonitor !== undefined && existingMonitor.isCommitmentConfirmed();
-		const plan = channel.prepareForceClose(signer, { fundingSpendConfirmed });
+		const fundingSpendReverifyPending =
+			existingMonitor !== undefined &&
+			existingMonitor.isCommitmentReverifyPending();
+		const plan = channel.prepareForceClose(signer, {
+			fundingSpendConfirmed,
+			fundingSpendReverifyPending
+		});
 		if (!plan.ok) {
 			this.emit('error', channelId, plan.error);
 			return {
@@ -2535,10 +2543,16 @@ export class ChannelManager extends EventEmitter {
 		// funding outpoint, so the confirmed spend the monitor recorded belongs to
 		// the outpoint the channel just left and a monitor of the new one is
 		// exactly what is needed.
+		//
+		// A confirmation this session has yet to re-prove keeps the monitor for
+		// the same reason: the record it holds is the only copy, and discarding
+		// it on a height the restore itself zeroed would destroy it over an
+		// unanswered question.
 		let monitor: ChainMonitor;
 		if (
 			existingMonitor !== undefined &&
-			existingMonitor.isCommitmentConfirmed() &&
+			(existingMonitor.isCommitmentConfirmed() ||
+				existingMonitor.isCommitmentReverifyPending()) &&
 			plan.spliceAdoption === null &&
 			plan.v2Adoption === null
 		) {

@@ -30,9 +30,12 @@ import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Channel } from '../../src/lightning/channel/channel';
+import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import {
 	serializeChannelState,
-	deserializeChannelState
+	deserializeChannelState,
+	serializeChainMonitorState,
+	deserializeChainMonitorState
 } from '../../src/lightning/storage/serialization';
 
 function makeSeed(id: number): Buffer {
@@ -245,6 +248,53 @@ function verifyCloseTxWitness(
 	expect(tx.version).to.equal(2);
 	expect(tx.ins[0].sequence).to.equal(0xfffffffd);
 	return tx;
+}
+
+/**
+ * A CLOSED channel whose recorded mutual close pays a 1-sat fee: the shape the
+ * relay-floor rescue admits, because no mempool will relay it.
+ */
+function closedWithStarvedCoopClose(
+	seedA: number,
+	seedB: number
+): { h: IHarness; starved: bitcoin.Transaction; destScript: Buffer } {
+	const h = openChannelHarness(seedA, seedB, 400_000_000n);
+	h.alice.on('error', () => {});
+	expect(h.alice.initiateShutdown(h.channelId, ALICE_SCRIPT).ok).to.equal(true);
+	pump(h.aliceOut, h.bob, h.aPub);
+	pump(h.bobOut, h.alice, h.bPub);
+	pump(h.aliceOut, h.bob, h.aPub);
+	pump(h.bobOut, h.alice, h.bPub);
+	expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+	const state = h.aliceChannel.getFullState();
+	h.aliceChannel.setBlockHeight(800_000);
+
+	const starved = bitcoin.Transaction.fromHex(state.lastCooperativeCloseTxHex!);
+	const outputTotal = starved.outs.reduce((sum, o) => sum + o.value, 0);
+	starved.outs[0].value += Number(state.fundingSatoshis) - outputTotal - 1;
+	h.aliceChannel.recordCooperativeCloseTx(starved.toHex());
+	return {
+		h,
+		starved,
+		destScript: Buffer.from('0014' + 'dd'.repeat(20), 'hex')
+	};
+}
+
+/** Round-trip alice's monitor through storage, as a restart does. */
+function restartMonitor(h: IHarness, destScript: Buffer): ChainMonitor {
+	const live = h.alice.getMonitor(h.channelId)!;
+	const restored = ChainMonitor.restore(
+		deserializeChainMonitorState(
+			serializeChainMonitorState(live.getFullState())
+		),
+		h.aliceChannel.getFullState(),
+		destScript,
+		10,
+		h.alice['config'].localFundingPrivkey,
+		h.alice['config'].localFundingPrivkey
+	);
+	h.alice.restoreMonitor(h.channelId.toString('hex'), restored);
+	return restored;
 }
 
 describe('option_simple_close negotiation (ChannelManager)', function () {
@@ -814,29 +864,9 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 		// close under the floor is the one dead end a miner can still include
 		// out of band. Confirmed, it is not a dead end at all: it is the
 		// transaction that settled the channel.
-		const h = openChannelHarness(33, 34, 400_000_000n);
-		h.alice.on('error', () => {});
-		expect(h.alice.initiateShutdown(h.channelId, ALICE_SCRIPT).ok).to.equal(
-			true
-		);
-		pump(h.aliceOut, h.bob, h.aPub);
-		pump(h.bobOut, h.alice, h.bPub);
-		pump(h.aliceOut, h.bob, h.aPub);
-		pump(h.bobOut, h.alice, h.bPub);
-		expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
-		const state = h.aliceChannel.getFullState();
-		h.aliceChannel.setBlockHeight(800_000);
-
-		// The same 1-sat-fee close the relay-floor rescue admits.
-		const starved = bitcoin.Transaction.fromHex(
-			state.lastCooperativeCloseTxHex!
-		);
-		const outputTotal = starved.outs.reduce((sum, o) => sum + o.value, 0);
-		starved.outs[0].value += Number(state.fundingSatoshis) - outputTotal - 1;
-		h.aliceChannel.recordCooperativeCloseTx(starved.toHex());
+		const { h, starved, destScript } = closedWithStarvedCoopClose(33, 34);
 
 		// A miner included it anyway: the funding spend is confirmed at 800000.
-		const destScript = Buffer.from('0014' + 'dd'.repeat(20), 'hex');
 		h.alice.handleFundingSpent(h.channelId, starved, 800_000, destScript);
 		const monitor = h.alice.getMonitor(h.channelId)!;
 		expect(monitor.isCommitmentConfirmed()).to.equal(true);
@@ -858,6 +888,67 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 		expect(monitor.getFullState().commitmentBroadcast?.txid).to.equal(
 			starved.getId()
 		);
+	});
+
+	it('force close refuses while a restored close is still unproved', function () {
+		// Restore drops a cooperative close's persisted height (the
+		// fresh-evidence rule) until the re-armed funding watch reports, so
+		// isCommitmentConfirmed() answers false for a close that IS on chain.
+		// Reading the rescue's gate off that alone re-admitted the whole
+		// defect for as long as the window lasts.
+		const { h, starved, destScript } = closedWithStarvedCoopClose(37, 38);
+		h.alice.handleFundingSpent(h.channelId, starved, 800_000, destScript);
+		expect(h.alice.getMonitor(h.channelId)!.isCommitmentConfirmed()).to.equal(
+			true
+		);
+
+		const restored = restartMonitor(h, destScript);
+		expect(restored.isCommitmentConfirmed()).to.equal(false);
+		expect(restored.isCommitmentReverifyPending()).to.equal(true);
+
+		const broadcastsBefore = h.aliceTxs.length;
+		const refused = h.alice.forceClose(h.channelId, destScript, 10);
+		expect(refused.ok).to.equal(false);
+		expect(refused.error).to.match(/may already be confirmed/);
+		expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+		expect(h.aliceTxs.length, 'no commitment broadcast').to.equal(
+			broadcastsBefore
+		);
+		expect(h.alice.getMonitor(h.channelId)).to.equal(restored);
+		expect(restored.getFullState().commitmentBroadcast?.txid).to.equal(
+			starved.getId()
+		);
+
+		// The watch re-reports the spend: the same refusal, now on proof.
+		h.alice.handleFundingSpent(h.channelId, starved, 800_000, destScript);
+		expect(restored.isCommitmentReverifyPending()).to.equal(false);
+		expect(restored.isCommitmentConfirmed()).to.equal(true);
+		expect(h.alice.forceClose(h.channelId, destScript, 10).error).to.match(
+			/already confirmed on chain/
+		);
+	});
+
+	it('an absent-spend report reopens the rescue for a restored close', function () {
+		// The window has to CLOSE on evidence either way, or a close that was
+		// really reorged out while we were offline would leave the channel with
+		// no exit at all - the dead end the rescue exists for.
+		const { h, starved, destScript } = closedWithStarvedCoopClose(39, 40);
+		h.alice.handleFundingSpent(h.channelId, starved, 800_000, destScript);
+		const restored = restartMonitor(h, destScript);
+		expect(restored.isCommitmentReverifyPending()).to.equal(true);
+
+		const state = h.aliceChannel.getFullState();
+		const retracted = h.alice.handleFundingSpendAbsent(h.channelId, {
+			txid: Buffer.from(state.fundingTxid!).reverse().toString('hex'),
+			outputIndex: state.fundingOutputIndex!
+		});
+		// Nothing to demote: the restore already zeroed the recorded height.
+		expect(retracted).to.equal(false);
+		expect(restored.isCommitmentReverifyPending()).to.equal(false);
+
+		const rescued = h.alice.forceClose(h.channelId, destScript, 10);
+		expect(rescued.ok).to.equal(true);
+		expect(h.aliceChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
 	});
 
 	it('force close keeps a monitor whose funding spend is already confirmed', function () {

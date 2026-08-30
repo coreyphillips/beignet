@@ -656,6 +656,12 @@ export interface IForceCloseChainFacts {
 	 * seen in the mempool).
 	 */
 	fundingSpendConfirmed?: boolean;
+	/**
+	 * Whether that record's confirmation is merely UNPROVED this session: a
+	 * restored monitor drops the persisted height until its re-armed watch
+	 * reports, so the answer is unknown rather than no.
+	 */
+	fundingSpendReverifyPending?: boolean;
 }
 
 /**
@@ -5723,14 +5729,23 @@ export class Channel {
 		// output already spent, so it can never confirm, while admitting the
 		// plan relabels a settled channel FORCE_CLOSED and costs the caller the
 		// monitor that holds the confirmed close.
+		//
+		// An unproved confirmation refuses on the same terms. The damage is
+		// irreversible and the ignorance is not: a restart drops the recorded
+		// height until the re-armed watch reports, so a rescue admitted in that
+		// window destroys a settled channel's record over a question that
+		// answers itself moments later.
 		if (
-			chain?.fundingSpendConfirmed === true &&
+			(chain?.fundingSpendConfirmed === true ||
+				chain?.fundingSpendReverifyPending === true) &&
 			this.closedWithUnbroadcastableCoopClose()
 		) {
 			return {
 				ok: false,
 				error:
-					'Cannot force close: the recorded mutual close is already confirmed on chain'
+					chain.fundingSpendConfirmed === true
+						? 'Cannot force close: the recorded mutual close is already confirmed on chain'
+						: 'Cannot force close: the recorded mutual close may already be confirmed on chain; retry once the funding watch has re-checked it'
 			};
 		}
 

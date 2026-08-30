@@ -75,6 +75,13 @@ export class ChainMonitor {
 	private _trackedOutputs: ITrackedOutput[] = [];
 	private _currentBlockHeight = 0;
 	private _knownPreimages: Map<string, Buffer> = new Map();
+	/**
+	 * Restore reset a recorded cooperative close to unconfirmed and no live
+	 * report has answered yet, so this session cannot say whether the funding
+	 * spend is on chain. Session-only and deliberately not persisted: it
+	 * describes this process's ignorance, not the record.
+	 */
+	private _commitmentReverifyPending = false;
 
 	constructor(
 		channelState: IChannelState,
@@ -442,6 +449,10 @@ export class ChainMonitor {
 			monitor._commitmentBroadcast.blockHeight > 0
 		) {
 			monitor._rebindCommitmentConfirmation(0);
+			// Unconfirmed here means UNPROVED, not disproved. A caller that must
+			// not act against a spend already on chain reads this rather than the
+			// zeroed height (issue #622); the first live report clears it.
+			monitor._commitmentReverifyPending = true;
 		}
 		// Restore known preimages if present
 		if (saved.knownPreimages) {
@@ -480,6 +491,18 @@ export class ChainMonitor {
 			this._commitmentBroadcast !== null &&
 			this._commitmentBroadcast.blockHeight > 0
 		);
+	}
+
+	/**
+	 * True while a recorded cooperative close carries a confirmation this
+	 * session has not re-proved: restore dropped the persisted height under the
+	 * fresh-evidence rule, and the re-armed funding watch has not reported yet.
+	 * isCommitmentConfirmed() answers false throughout that window, which is
+	 * right for counting depth (nothing may mature off an unproved height) and
+	 * wrong for anyone asking whether the funding output is still spendable.
+	 */
+	isCommitmentReverifyPending(): boolean {
+		return this._commitmentReverifyPending;
 	}
 
 	private _allTrackedOutputsResolved(): boolean {
@@ -564,6 +587,10 @@ export class ChainMonitor {
 				}
 			];
 		}
+		// A live report of the funding outpoint, whatever it says, ends the
+		// window the restore reset opened: every arm below either binds a height,
+		// demotes on a competing spend, or replaces the record outright.
+		this._commitmentReverifyPending = false;
 		if (this._state !== MonitorState.WATCHING) {
 			// Commitment SWAP: a DIFFERENT tx now spends the funding output. The
 			// funding outpoint can only be spent once per chain, so a confirmed
@@ -1903,7 +1930,7 @@ export class ChainMonitor {
 	handleFundingSpendAbsent(scan?: IFundingSpendScan): boolean {
 		if (this._state === MonitorState.WATCHING) return false;
 		const broadcast = this._commitmentBroadcast;
-		if (!broadcast || broadcast.blockHeight <= 0) return false;
+		if (!broadcast) return false;
 		if (scan) {
 			// NEVER against the spender this scan exists to ignore. For a
 			// pre-splice leg that is the splice transaction, and a record of it
@@ -1948,6 +1975,12 @@ export class ChainMonitor {
 			// fail-safe: if the recorded spend is really on chain, the watch
 			// covering the outpoint it spent re-reports it every sweep.
 		}
+		// An absence this record answers to is the proof a restored cooperative
+		// close was waiting for: the history was fetched and holds no spender.
+		// Ahead of the height check below, which the reset already zeroed, so
+		// the window closes instead of lasting the whole session (issue #622).
+		this._commitmentReverifyPending = false;
+		if (broadcast.blockHeight <= 0) return false;
 		this._demoteRecordedConfirmation();
 		return true;
 	}
