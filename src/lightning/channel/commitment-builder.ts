@@ -259,6 +259,11 @@ function filterUntrimmedHtlcs<
  * Without it a force close inside the removal window rebuilt a commitment the
  * stored signature does not cover, so the broadcast witness was invalid and no
  * unilateral exit confirmed (issue #634).
+ *
+ * addRemoteSigned bounds the window at the other end. A peer may send its
+ * removal before it has signed the add into any commitment of ours (nothing on
+ * the wire stops it), and there the stored signature is over a commitment that
+ * never had the output — retaining it would break the very rebuild this fixes.
  */
 function signedLocalCarriesRemoval(
 	entry: IHtlcEntry,
@@ -267,7 +272,8 @@ function signedLocalCarriesRemoval(
 	return (
 		signedLocal &&
 		entry.direction === HtlcDirection.OFFERED &&
-		entry.removalLocallyRevoked === false
+		entry.removalLocallyRevoked === false &&
+		entry.addRemoteSigned !== false
 	);
 }
 

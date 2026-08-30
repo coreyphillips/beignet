@@ -2979,6 +2979,9 @@ export class Channel {
 			// Two-phase: the peer incorporates this add into its signatures over
 			// OUR commitment only after revoking a commitment of ours covering it.
 			addRemoteCommitted: false,
+			// ...and the signature we hold covers it only from the peer's next
+			// commitment_signed after that (see IHtlcEntry.addRemoteSigned).
+			addRemoteSigned: false,
 			...(blindingPoint ? { blindingPoint } : {})
 		};
 
@@ -4413,6 +4416,22 @@ export class Channel {
 		);
 		this._state.lastSignedCommitLeaseBlockheight =
 			getLocalCommitmentLeaseBlockheight(this._state);
+
+		// The HTLC SET the signature covers, same purpose: the offered adds this
+		// commitment carries are the ones buildHtlcOutputsForLocal just built it
+		// with. The force-close rebuild keeps an output whose removal the peer
+		// stalled, and only this stamp tells it apart from an add the peer
+		// removed before ever signing it into a commitment of ours (issue #634).
+		for (const entry of this._state.htlcs.values()) {
+			if (
+				entry.direction === HtlcDirection.OFFERED &&
+				entry.addRemoteCommitted !== false &&
+				(entry.state === HtlcState.PENDING ||
+					entry.state === HtlcState.COMMITTED)
+			) {
+				entry.addRemoteSigned = true;
+			}
+		}
 
 		// Two-phase update_fee, acceptor side: this commitment_signed from the
 		// opener covers its staged update_fee (the update always precedes its

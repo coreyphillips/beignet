@@ -286,6 +286,22 @@ export interface IHtlcEntry {
 	removalLocallyRevoked?: boolean;
 
 	/**
+	 * OFFERED entries: false from addHtlc until a commitment_signed we accepted
+	 * covered a local commitment carrying this add. That is one message LATER
+	 * than addRemoteCommitted, which the peer's revoke_and_ack sets: between the
+	 * two the peer has the add on its own commitment while the signature we
+	 * store still covers a commitment without it.
+	 *
+	 * The force-close rebuild is what needs the distinction. It keeps an offered
+	 * output the peer has removed but not yet signed away (issue #634), and a
+	 * peer that fails the HTLC inside the window above would otherwise have that
+	 * put an output into the rebuild the stored signature was made without,
+	 * leaving the broadcast witness invalid. Optional for the same reason as the
+	 * flags above: absent means "already signed".
+	 */
+	addRemoteSigned?: boolean;
+
+	/**
 	 * RECEIVED entries: set once handleRevokeAndAck has handed this HTLC to the
 	 * node layer with an HTLC_FORWARDED action. The dispatch is edge-triggered
 	 * (once per HTLC), not level-triggered: an entry stays COMMITTED for as long

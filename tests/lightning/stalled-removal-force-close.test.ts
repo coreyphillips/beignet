@@ -142,8 +142,15 @@ interface IStall {
  * Alice offers an HTLC Bob cannot make sense of; Bob fails it back and his
  * commitment_signed is dropped from that moment on, so the removal round
  * stops half-done exactly as a withholding payee's would.
+ *
+ * `signsTheAdd: false` drops Bob's commitment_signed from the start instead,
+ * so the fail arrives for an add no local commitment of ours ever carried.
  */
-function stalledRemoval(seedBase: number): IStall {
+function stalledRemoval(
+	seedBase: number,
+	opts: { signsTheAdd?: boolean } = {}
+): IStall {
+	const signsTheAdd = opts.signsTheAdd !== false;
 	const alice = createNode(seedBase);
 	const bob = createNode(seedBase + 1);
 	const filter: IFilter = { allow: () => true };
@@ -156,7 +163,7 @@ function stalledRemoval(seedBase: number): IStall {
 	alice.on('node:error', (err: { code: string }) => events.push(err.code));
 
 	const bobId = bob.getNodeId();
-	let failSeen = false;
+	let failSeen = !signsTheAdd;
 	filter.allow = (from: string, type: number): boolean => {
 		if (from !== bobId) return true;
 		if (type === MessageType.UPDATE_FAIL_HTLC) {
@@ -175,6 +182,13 @@ function stalledRemoval(seedBase: number): IStall {
 			EXPIRY,
 			Buffer.alloc(1366)
 		);
+
+	if (!signsTheAdd) {
+		// Bob never got our revoke_and_ack (his commitment_signed never
+		// arrived), so his own dispatch cannot reach the fail. A peer that
+		// fails ahead of the round is exactly what this covers, so send it.
+		bob.getChannelManager().failHtlc(channelId, 0n, Buffer.alloc(32));
+	}
 
 	const entry = alice
 		.getChannelManager()
@@ -329,6 +343,29 @@ describe('The commitment a stalled removal round leaves us (issue #634)', functi
 		// Index into remoteHtlcSignatures: an untracked output ahead of this
 		// one would pair every later claim with the wrong signature.
 		expect(tracked[0].htlcSigIndex).to.equal(0);
+		f.destroy();
+	});
+
+	it('drops an output no commitment of ours was ever signed with', function () {
+		// The peer revoked for our add (so it may not be rolled back) but never
+		// signed a commitment carrying it, then failed it anyway. Retaining the
+		// output here would put it in a commitment the stored signature was
+		// made without.
+		const f = stalledRemoval(345, { signsTheAdd: false });
+		expect(f.entry.addRemoteCommitted, 'the peer revoked for the add').to.equal(
+			true
+		);
+
+		const tx = plannedCommitment(f.alice, f.channelId);
+
+		expect(
+			tx.outs.some((o) => BigInt(o.value) === HTLC_MSAT / 1000n),
+			'no offered HTLC output'
+		).to.equal(false);
+		expect(
+			peerSigned(f.alice, f.channelId, tx),
+			'the stored remote signature covers what we broadcast'
+		).to.equal(true);
 		f.destroy();
 	});
 
