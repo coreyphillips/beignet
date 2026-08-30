@@ -809,6 +809,106 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 		expect(h.aliceChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
 	});
 
+	it('force close refuses a CLOSED channel whose sub-relay-fee close already confirmed', function () {
+		// Issue #622: the relay-floor arm judges the recorded tx alone, and a
+		// close under the floor is the one dead end a miner can still include
+		// out of band. Confirmed, it is not a dead end at all: it is the
+		// transaction that settled the channel.
+		const h = openChannelHarness(33, 34, 400_000_000n);
+		h.alice.on('error', () => {});
+		expect(h.alice.initiateShutdown(h.channelId, ALICE_SCRIPT).ok).to.equal(
+			true
+		);
+		pump(h.aliceOut, h.bob, h.aPub);
+		pump(h.bobOut, h.alice, h.bPub);
+		pump(h.aliceOut, h.bob, h.aPub);
+		pump(h.bobOut, h.alice, h.bPub);
+		expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+		const state = h.aliceChannel.getFullState();
+		h.aliceChannel.setBlockHeight(800_000);
+
+		// The same 1-sat-fee close the relay-floor rescue admits.
+		const starved = bitcoin.Transaction.fromHex(
+			state.lastCooperativeCloseTxHex!
+		);
+		const outputTotal = starved.outs.reduce((sum, o) => sum + o.value, 0);
+		starved.outs[0].value += Number(state.fundingSatoshis) - outputTotal - 1;
+		h.aliceChannel.recordCooperativeCloseTx(starved.toHex());
+
+		// A miner included it anyway: the funding spend is confirmed at 800000.
+		const destScript = Buffer.from('0014' + 'dd'.repeat(20), 'hex');
+		h.alice.handleFundingSpent(h.channelId, starved, 800_000, destScript);
+		const monitor = h.alice.getMonitor(h.channelId)!;
+		expect(monitor.isCommitmentConfirmed()).to.equal(true);
+		expect(monitor.getFullState().commitmentBroadcast?.txid).to.equal(
+			starved.getId()
+		);
+
+		const broadcastsBefore = h.aliceTxs.length;
+		const refused = h.alice.forceClose(h.channelId, destScript, 10);
+		expect(refused.ok).to.equal(false);
+		expect(refused.error).to.match(/already confirmed on chain/);
+		expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+		expect(h.aliceTxs.length, 'no commitment broadcast').to.equal(
+			broadcastsBefore
+		);
+		// The confirmed close's record survives, monitor object and all.
+		expect(h.alice.getMonitor(h.channelId)).to.equal(monitor);
+		expect(monitor.isCommitmentConfirmed()).to.equal(true);
+		expect(monitor.getFullState().commitmentBroadcast?.txid).to.equal(
+			starved.getId()
+		);
+	});
+
+	it('force close keeps a monitor whose funding spend is already confirmed', function () {
+		// The other half of issue #622: whatever admitted the plan, replacing
+		// the monitor throws away the tracked outputs, the classification and
+		// the irrevocable-depth clock of a spend that is already on chain.
+		const h = openChannelHarness(35, 36, 400_000_000n);
+		h.alice.on('error', () => {});
+		expect(h.alice.initiateShutdown(h.channelId, ALICE_SCRIPT).ok).to.equal(
+			true
+		);
+		pump(h.aliceOut, h.bob, h.aPub);
+		pump(h.bobOut, h.alice, h.bPub);
+		pump(h.aliceOut, h.bob, h.aPub);
+		pump(h.bobOut, h.alice, h.bPub);
+		expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+		const state = h.aliceChannel.getFullState();
+		h.aliceChannel.setBlockHeight(800_000);
+
+		// Reach FORCE_CLOSED through the locktime rescue, then confirm the
+		// commitment it broadcast.
+		const mangled = bitcoin.Transaction.fromHex(
+			state.lastCooperativeCloseTxHex!
+		);
+		mangled.locktime = 499_999_999;
+		h.aliceChannel.recordCooperativeCloseTx(mangled.toHex());
+		const destScript = Buffer.from('0014' + 'dd'.repeat(20), 'hex');
+		const closed = h.alice.forceClose(h.channelId, destScript, 10);
+		expect(closed.ok).to.equal(true);
+		const broadcast = closed.actions.find(
+			(a) => a.type === ChannelActionType.BROADCAST_TX
+		) as { tx: Buffer } | undefined;
+		const commitment = bitcoin.Transaction.fromBuffer(broadcast!.tx);
+		h.alice.handleFundingSpent(h.channelId, commitment, 800_001, destScript);
+		const monitor = h.alice.getMonitor(h.channelId)!;
+		expect(monitor.isCommitmentConfirmed()).to.equal(true);
+		const trackedOutputs = monitor.getTrackedOutputs().length;
+		expect(trackedOutputs).to.be.greaterThan(0);
+
+		// FORCE_CLOSED re-admits the plan (the rebroadcast path), so the
+		// refusal above cannot be what protects the monitor here.
+		const again = h.alice.forceClose(h.channelId, destScript, 10);
+		expect(again.ok).to.equal(true);
+		expect(h.alice.getMonitor(h.channelId)).to.equal(monitor);
+		expect(monitor.isCommitmentConfirmed()).to.equal(true);
+		expect(monitor.getFullState().commitmentBroadcast?.txid).to.equal(
+			commitment.getId()
+		);
+		expect(monitor.getTrackedOutputs().length).to.equal(trackedOutputs);
+	});
+
 	it('falls back to legacy closing_signed when the peer lacks the feature', function () {
 		const h = openChannelHarness(17, 18, 400_000_000n, false);
 
