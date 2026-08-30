@@ -547,7 +547,22 @@ export class LightningNode extends EventEmitter {
 	// For forwarded HTLCs: maps "outChannelId:outHtlcId" → { inChannelId, inHtlcId }
 	private forwardedHtlcs: Map<
 		string,
-		{ inChannelId: Buffer; inHtlcId: bigint }
+		{
+			inChannelId: Buffer;
+			inHtlcId: bigint;
+			/**
+			 * The downstream failure bytes held back while the outgoing leg's
+			 * removal round is still provisional (issue #623), replayed by
+			 * settleForwardsOwedUpstream once the leg is terminally failed.
+			 * Memory-only, and deliberately so: it hangs off the linkage row so
+			 * it cannot outlive it, and a restart falls back to the synthesized
+			 * temporary_channel_failure that pass already uses for a downstream
+			 * reason that died with the process.
+			 */
+			failReason?: Buffer;
+			/** Whether `failReason` is a complete failure message already. */
+			failPreWrapped?: boolean;
+		}
 	> = new Map();
 	// Payment secret for receiving: paymentHashHex → paymentSecret
 	private paymentSecrets: Map<string, Buffer> = new Map();
@@ -3760,6 +3775,12 @@ export class LightningNode extends EventEmitter {
 				this.emit('htlc:failed', { channelId, htlcId });
 			}
 		);
+
+		// A commitment round completed on this channel: any upstream refund
+		// held back on it as the outgoing leg may now be owed (issue #623).
+		this.channelManager.on('commitment:revoked', (channelId: Buffer) => {
+			this.drainForwardsAwaitingRemoval(channelId);
+		});
 
 		// An offered HTLC the channel dropped on a held restore rather than
 		// replay (issue #469). Nothing on chain resolves it, so whatever is
@@ -17122,10 +17143,9 @@ export class LightningNode extends EventEmitter {
 			}
 			// The fail side of the same debt (issue 297): the outgoing leg
 			// failed durably, but the fail owed upstream never became durable
-			// (killed process, or the inbound peer was disconnected when the
-			// downstream fail arrived). The downstream reason bytes died with
-			// the process, so the refund carries a synthesized
-			// temporary_channel_failure, which refunds the payer identically.
+			// (killed process, the inbound peer was disconnected when the
+			// downstream fail arrived, or the fail was held back until the
+			// downstream removal round finished, issue #623).
 			// The on-chain arm of the predicate is exactly what
 			// handleOnChainOutputResolved acted on; a fail refused there
 			// (inbound quiescing) retries here.
@@ -17135,26 +17155,90 @@ export class LightningNode extends EventEmitter {
 			const secretKey = `${forward.inChannelId.toString('hex')}:${
 				forward.inHtlcId
 			}`;
+			// The downstream's own bytes when they are still held (a deferred
+			// fail, so the payer learns the real reason and its culpable hop);
+			// otherwise they died with the process, and a synthesized
+			// temporary_channel_failure refunds the payer identically.
+			const held = forward.failReason;
 			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
-			const reason = sharedSecret
-				? createFailureMessage(
-						sharedSecret,
-						TEMPORARY_CHANNEL_FAILURE,
-						// TEMPORARY_CHANNEL_FAILURE carries the UPDATE flag, so
-						// BOLT 4 still requires the two-byte channel_update
-						// length even when the update itself is omitted. Empty
-						// data here is malformed, and a strict peer may treat
-						// the whole failure as such.
-						this.updateFlaggedFailureData(TEMPORARY_CHANNEL_FAILURE)
-				  )
-				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			const reason =
+				held ??
+				(sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							TEMPORARY_CHANNEL_FAILURE,
+							// TEMPORARY_CHANNEL_FAILURE carries the UPDATE flag, so
+							// BOLT 4 still requires the two-byte channel_update
+							// length even when the update itself is omitted. Empty
+							// data here is malformed, and a strict peer may treat
+							// the whole failure as such.
+							this.updateFlaggedFailureData(TEMPORARY_CHANNEL_FAILURE)
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH));
 			this.failForwardUpstream(
 				outKey,
 				forward,
 				outChannelId,
 				forward.inHtlcId,
 				reason,
-				true
+				held ? forward.failPreWrapped === true : true
+			);
+		}
+	}
+
+	/**
+	 * A forward's payment hash, read off the INBOUND leg exactly as
+	 * settleForwardsOwedUpstream reads it, so both callers put the same input
+	 * into isOutgoingLegTerminallyFailed. Undefined once the inbound entry is
+	 * gone, which is a forward with nothing left to refund.
+	 */
+	private forwardPaymentHash(forward: {
+		inChannelId: Buffer;
+		inHtlcId: bigint;
+	}): Buffer | undefined {
+		return this.channelManager
+			.getChannel(forward.inChannelId)
+			?.getFullState()
+			.htlcs.get(`received-${forward.inHtlcId}`)?.paymentHash;
+	}
+
+	/**
+	 * A commitment round completed on this channel; release any upstream refund
+	 * held back on it as the OUTGOING leg (issue #623).
+	 *
+	 * The peer's revoke_and_ack is the moment a downstream removal becomes
+	 * irrevocable, and the only event that says so: every other driver of
+	 * settleForwardsOwedUpstream watches the INBOUND channel regaining the
+	 * ability to carry updates, which a held fail is not waiting for. Without
+	 * this the refund would sit until the next block's owed pass.
+	 *
+	 * Deliberately narrower than that pass, which is why it does not just call
+	 * it: only a forward with a HELD reason is considered. The pass judges legs
+	 * it never saw fail, and its "entry gone from a live NORMAL channel" arm is
+	 * not a safe reading mid-reestablish, before the peer has replayed the
+	 * fulfill it owes us. A held reason is this session's own evidence that
+	 * THIS leg failed, so the arm is sound for it, and it is memory-only, so a
+	 * restart's replay window has nothing here to act on at all.
+	 */
+	private drainForwardsAwaitingRemoval(outChannelId: Buffer): void {
+		const prefix = `${outChannelId.toString('hex')}:offered-`;
+		for (const [outKey, forward] of [...this.forwardedHtlcs]) {
+			if (!outKey.startsWith(prefix)) continue;
+			if (forward.failReason === undefined) continue;
+			const entry = this.channelManager
+				.getChannel(forward.inChannelId)
+				?.getFullState()
+				.htlcs.get(`received-${forward.inHtlcId}`);
+			if (!entry || entry.state !== HtlcState.COMMITTED) continue;
+			if (!this.isOutgoingLegTerminallyFailed(outKey, entry.paymentHash))
+				continue;
+			this.failForwardUpstream(
+				outKey,
+				forward,
+				outChannelId,
+				BigInt(outKey.slice(prefix.length)),
+				forward.failReason,
+				forward.failPreWrapped === true
 			);
 		}
 	}
@@ -17482,6 +17566,37 @@ export class LightningNode extends EventEmitter {
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		const forward = this.forwardedHtlcs.get(outKey);
 		if (forward) {
+			// BOLT 2 fund safety (issue #623): the peer's update_fail_htlc is a
+			// removal STARTING, not a leg that failed. Refunding upstream on
+			// arrival is unretractable, while the downstream leg is not: a
+			// disconnect before we revoke rolls it back to COMMITTED
+			// (markForReestablish) and the peer may retransmit a fulfill
+			// instead, and until the peer commits our removal its last signed
+			// commitment still carries the offered output for an HTLC-success.
+			// Either way the late preimage is worthless upstream, because
+			// canFulfillHtlc refuses the FAILED inbound entry: we would pay
+			// downstream and refund upstream for one forward. A payee that
+			// withholds its commitment_signed holds that window open for as
+			// long as it likes, so hold the reason on the linkage instead and
+			// let the removal round decide. Every driver of
+			// settleForwardsOwedUpstream retries it, and a downstream that
+			// never finishes the round is force-closed out by
+			// scanForwardTimeouts at the forward-timeout margin.
+			const inboundHash = this.forwardPaymentHash(forward);
+			if (
+				inboundHash &&
+				!this.isOutgoingLegTerminallyFailed(outKey, inboundHash)
+			) {
+				forward.failReason = reason;
+				forward.failPreWrapped = localFailureReason !== undefined;
+				this.emitStructuredLog('htlc', 'forward_fail_deferred', {
+					inChannelId: forward.inChannelId.toString('hex'),
+					inHtlcId: Number(forward.inHtlcId),
+					outChannelId: channelId.toString('hex'),
+					outHtlcId: Number(htlcId)
+				});
+				return;
+			}
 			this.failForwardUpstream(
 				outKey,
 				forward,

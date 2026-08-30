@@ -3768,12 +3768,23 @@ export class ChannelManager extends EventEmitter {
 			}
 		}
 
+		const channelId = channel.getChannelId();
+
+		// This revoke_and_ack is what makes the removals it covers irrevocable:
+		// it flips removalRemoteCommitted and drops the settled entries. A node
+		// holding an upstream refund back until its DOWNSTREAM leg is terminally
+		// failed has no other event to learn that from, so announce the round
+		// rather than leave it to the next block (issue #623). Emitted after
+		// processActions so the state the listener reads is the persisted one.
+		if (!hadError && channelId) {
+			this.emit('commitment:revoked', channelId);
+		}
+
 		// BOLT 2: After processing revoke_and_ack, an HTLC_FORWARDED event above may
 		// have triggered a local fulfill/fail (setting needsCommitment). Send
 		// commitment_signed to commit those updates on the remote's side.
 		// autoSignAndSendCommitment is a no-op unless we owe a commitment, so this
 		// does not loop.
-		const channelId = channel.getChannelId();
 		if (channelId) {
 			this.autoSignAndSendCommitment(channelId);
 		}
