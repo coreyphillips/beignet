@@ -31,6 +31,7 @@ import {
 	ChannelRole,
 	HtlcDirection,
 	HtlcState,
+	IHtlcEntry,
 	isAnchorChannel,
 	isTaprootChannel
 } from './types';
@@ -242,6 +243,32 @@ function filterUntrimmedHtlcs<
 		}
 		return h.amount >= dustLimitSat + htlcFeeSat;
 	});
+}
+
+/**
+ * Whether the commitment the stored remote signature covers still carries an
+ * OFFERED HTLC the peer has fulfilled or failed.
+ *
+ * The peer's removal enters the commitments the PEER signs from its next
+ * commitment_signed on, so until that signature arrives
+ * (removalLocallyRevoked === false) the one we hold — and would broadcast on a
+ * force close — is the one that predates the removal, output and all. Only the
+ * signedLocal rebuild asks this: the commitment being VERIFIED is the next one,
+ * which drops the output, and the peer's signature is over that.
+ *
+ * Without it a force close inside the removal window rebuilt a commitment the
+ * stored signature does not cover, so the broadcast witness was invalid and no
+ * unilateral exit confirmed (issue #634).
+ */
+function signedLocalCarriesRemoval(
+	entry: IHtlcEntry,
+	signedLocal: boolean
+): boolean {
+	return (
+		signedLocal &&
+		entry.direction === HtlcDirection.OFFERED &&
+		entry.removalLocallyRevoked === false
+	);
 }
 
 /** The last COMMITTED channel feerate (fee rounds fully finalized). */
@@ -537,7 +564,7 @@ export function buildLocalCommitment(
 	// The SAME trimmed set feeds both the commitment outputs and the
 	// num_untrimmed_htlcs fee count so they can never diverge.
 	const htlcOutputs = filterUntrimmedHtlcs(
-		buildHtlcOutputsForLocal(state, keys),
+		buildHtlcOutputsForLocal(state, keys, signedLocal),
 		state.localConfig.dustLimitSatoshis,
 		feeratePerKw,
 		useAnchors
@@ -578,7 +605,7 @@ export function buildLocalCommitment(
 				if (entry.removalRemoteCommitted !== false) {
 					localMsat += entry.amountMsat;
 				}
-			} else {
+			} else if (!signedLocalCarriesRemoval(entry, signedLocal)) {
 				// We offered and remote fulfilled: credit their balance
 				remoteMsat += entry.amountMsat;
 			}
@@ -589,7 +616,7 @@ export function buildLocalCommitment(
 				if (entry.removalRemoteCommitted !== false) {
 					remoteMsat += entry.amountMsat;
 				}
-			} else {
+			} else if (!signedLocalCarriesRemoval(entry, signedLocal)) {
 				// We offered but failed: refund our balance
 				localMsat += entry.amountMsat;
 			}
@@ -1495,7 +1522,8 @@ export function verifyRemoteHtlcSignatures(
  */
 function buildHtlcOutputsForLocal(
 	state: IChannelState,
-	keys: ICommitmentKeys
+	keys: ICommitmentKeys,
+	signedLocal = false
 ): (IHtlcOutput & { direction: HtlcDirection; amountMsat: bigint })[] {
 	const outputs: (IHtlcOutput & {
 		direction: HtlcDirection;
@@ -1517,14 +1545,19 @@ function buildHtlcOutputsForLocal(
 		//   exclude it;
 		// - a removal WE sent for a RECEIVED HTLC that the peer has not
 		//   committed yet (removalRemoteCommitted === false) is not in the
-		//   peer's signatures either — the HTLC output is still present.
+		//   peer's signatures either — the HTLC output is still present;
+		// - a removal the PEER sent for an OFFERED HTLC is in the next
+		//   commitment it signs, so this build drops it — except in the
+		//   signedLocal rebuild, which reproduces the commitment the stored
+		//   signature covers (see signedLocalCarriesRemoval).
 		if (
 			entry.state === HtlcState.FULFILLED ||
 			entry.state === HtlcState.FAILED
 		) {
 			const stillPresent =
-				entry.direction === HtlcDirection.RECEIVED &&
-				entry.removalRemoteCommitted === false;
+				(entry.direction === HtlcDirection.RECEIVED &&
+					entry.removalRemoteCommitted === false) ||
+				signedLocalCarriesRemoval(entry, signedLocal);
 			if (!stillPresent) {
 				continue;
 			}

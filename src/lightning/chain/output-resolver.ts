@@ -1226,7 +1226,11 @@ interface IHtlcMatch {
  * - OUR commitment: a RECEIVED entry until the peer revokes for the
  *   removal (removalRemoteCommitted === false, mirroring
  *   buildHtlcOutputsForLocal, which is also what prepareForceClose
- *   broadcasts).
+ *   broadcasts), AND an OFFERED entry the peer settled, until WE revoke
+ *   for it (removalLocallyRevoked === false): the commitment we
+ *   broadcast is the one the stored signature covers, which predates
+ *   the peer's update_fulfill/fail and still carries the output
+ *   (issue #634).
  * - THEIR commitment: an OFFERED entry the peer settled, until WE
  *   revoke for it (removalLocallyRevoked === false, mirroring
  *   buildHtlcOutputsForRemote), AND a RECEIVED entry WE settled, until
@@ -1266,8 +1270,10 @@ function htlcEntryCanBePresent(
 	}
 	if (isLocalCommitment) {
 		return (
-			entry.direction === HtlcDirection.RECEIVED &&
-			entry.removalRemoteCommitted === false
+			(entry.direction === HtlcDirection.RECEIVED &&
+				entry.removalRemoteCommitted === false) ||
+			(entry.direction === HtlcDirection.OFFERED &&
+				entry.removalLocallyRevoked === false)
 		);
 	}
 	return (
