@@ -296,8 +296,11 @@ export interface IHtlcEntry {
 	 * output the peer has removed but not yet signed away (issue #634), and a
 	 * peer that fails the HTLC inside the window above would otherwise have that
 	 * put an output into the rebuild the stored signature was made without,
-	 * leaving the broadcast witness invalid. Optional for the same reason as the
-	 * flags above: absent means "already signed".
+	 * leaving the broadcast witness invalid.
+	 *
+	 * Optional like the flags above, but absent is NOT a default here: either
+	 * answer breaks one of the two shapes, so the rebuild reads the shape off
+	 * the stored per-HTLC signature count instead (resolveRetainedRemovals).
 	 */
 	addRemoteSigned?: boolean;
 

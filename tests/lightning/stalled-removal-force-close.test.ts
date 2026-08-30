@@ -369,6 +369,43 @@ describe('The commitment a stalled removal round leaves us (issue #634)', functi
 		f.destroy();
 	});
 
+	it('keeps the output for a legacy row the signature does cover', function () {
+		// Rows persisted before addRemoteSigned existed carry no answer, and the
+		// count of stored per-HTLC signatures is the one that does: one per
+		// untrimmed output of the commitment the signature covers.
+		const f = stalledRemoval(355);
+		delete f.entry.addRemoteSigned;
+
+		const tx = plannedCommitment(f.alice, f.channelId);
+
+		expect(
+			tx.outs.some((o) => BigInt(o.value) === HTLC_MSAT / 1000n),
+			'the offered HTLC output is still in the commitment'
+		).to.equal(true);
+		expect(
+			peerSigned(f.alice, f.channelId, tx),
+			'the stored remote signature covers what we broadcast'
+		).to.equal(true);
+		f.destroy();
+	});
+
+	it('drops the output for a legacy row the signature never covered', function () {
+		const f = stalledRemoval(360, { signsTheAdd: false });
+		delete f.entry.addRemoteSigned;
+
+		const tx = plannedCommitment(f.alice, f.channelId);
+
+		expect(
+			tx.outs.some((o) => BigInt(o.value) === HTLC_MSAT / 1000n),
+			'no offered HTLC output'
+		).to.equal(false);
+		expect(
+			peerSigned(f.alice, f.channelId, tx),
+			'the stored remote signature covers what we broadcast'
+		).to.equal(true);
+		f.destroy();
+	});
+
 	it('still holds an offered HTLC out of the commitment it verifies', function () {
 		// The gate is the signedLocal rebuild alone: the commitment the peer
 		// signs NEXT drops the removal, and admitting it there would reject

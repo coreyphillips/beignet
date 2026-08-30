@@ -264,17 +264,82 @@ function filterUntrimmedHtlcs<
  * removal before it has signed the add into any commitment of ours (nothing on
  * the wire stops it), and there the stored signature is over a commitment that
  * never had the output — retaining it would break the very rebuild this fixes.
+ * Rows persisted before that flag existed carry neither answer, which is what
+ * `admitLegacy` selects between; resolveRetainedRemovals settles those.
  */
-function signedLocalCarriesRemoval(
+function carriesStalledRemoval(
 	entry: IHtlcEntry,
-	signedLocal: boolean
+	admitLegacy: boolean
 ): boolean {
 	return (
-		signedLocal &&
 		entry.direction === HtlcDirection.OFFERED &&
+		(entry.state === HtlcState.FULFILLED || entry.state === HtlcState.FAILED) &&
 		entry.removalLocallyRevoked === false &&
-		entry.addRemoteSigned !== false
+		(admitLegacy
+			? entry.addRemoteSigned !== false
+			: entry.addRemoteSigned === true)
 	);
+}
+
+const NO_RETAINED_REMOVALS: ReadonlySet<IHtlcEntry> = new Set();
+
+/**
+ * The stalled removals this build keeps — empty for every build but the
+ * signedLocal rebuild, the others describing the commitment signed NEXT, which
+ * drops the removal.
+ *
+ * A row persisted before addRemoteSigned existed answers neither shape, and the
+ * two want opposite treatment, so ask the stored per-HTLC signatures: the peer
+ * sends exactly one per untrimmed HTLC output of the commitment its signature
+ * covers, so a retention that commitment never carried overshoots the count,
+ * and a strict set matching it is the shape the row really is. A count that
+ * fits neither set leaves the retention in place, that being the shape a
+ * removal round normally reaches (and the one issue #634 is about).
+ */
+function resolveRetainedRemovals(
+	state: IChannelState,
+	keys: ICommitmentKeys,
+	signedLocal: boolean,
+	feeratePerKw: number,
+	useAnchors: boolean
+): ReadonlySet<IHtlcEntry> {
+	if (!signedLocal) {
+		return NO_RETAINED_REMOVALS;
+	}
+	const retained = new Set<IHtlcEntry>();
+	let hasLegacy = false;
+	for (const entry of state.htlcs.values()) {
+		if (!carriesStalledRemoval(entry, true)) {
+			continue;
+		}
+		retained.add(entry);
+		if (entry.addRemoteSigned === undefined) {
+			hasLegacy = true;
+		}
+	}
+	if (!hasLegacy || !Array.isArray(state.remoteHtlcSignatures)) {
+		return retained;
+	}
+
+	const untrimmedCount = (set: ReadonlySet<IHtlcEntry>): number =>
+		filterUntrimmedHtlcs(
+			buildHtlcOutputsForLocal(state, keys, set),
+			state.localConfig.dustLimitSatoshis,
+			feeratePerKw,
+			useAnchors
+		).length;
+
+	const signedCount = state.remoteHtlcSignatures.length;
+	if (untrimmedCount(retained) === signedCount) {
+		return retained;
+	}
+	const strict = new Set<IHtlcEntry>();
+	for (const entry of retained) {
+		if (carriesStalledRemoval(entry, false)) {
+			strict.add(entry);
+		}
+	}
+	return untrimmedCount(strict) === signedCount ? strict : retained;
 }
 
 /** The last COMMITTED channel feerate (fee rounds fully finalized). */
@@ -566,11 +631,21 @@ export function buildLocalCommitment(
 	// Calculate commitment fee (BOLT 3): opener pays the fee
 	const feeratePerKw = getLocalCommitmentFeeRate(state, signedLocal);
 
+	// Decided once, because the outputs and the balances below have to agree on
+	// which stalled removals this commitment still carries.
+	const retained = resolveRetainedRemovals(
+		state,
+		keys,
+		signedLocal,
+		feeratePerKw,
+		useAnchors
+	);
+
 	// Build HTLC outputs, then trim per BOLT 3 (dust_limit + second-level fee).
 	// The SAME trimmed set feeds both the commitment outputs and the
 	// num_untrimmed_htlcs fee count so they can never diverge.
 	const htlcOutputs = filterUntrimmedHtlcs(
-		buildHtlcOutputsForLocal(state, keys, signedLocal),
+		buildHtlcOutputsForLocal(state, keys, retained),
 		state.localConfig.dustLimitSatoshis,
 		feeratePerKw,
 		useAnchors
@@ -611,7 +686,7 @@ export function buildLocalCommitment(
 				if (entry.removalRemoteCommitted !== false) {
 					localMsat += entry.amountMsat;
 				}
-			} else if (!signedLocalCarriesRemoval(entry, signedLocal)) {
+			} else if (!retained.has(entry)) {
 				// We offered and remote fulfilled: credit their balance
 				remoteMsat += entry.amountMsat;
 			}
@@ -622,7 +697,7 @@ export function buildLocalCommitment(
 				if (entry.removalRemoteCommitted !== false) {
 					remoteMsat += entry.amountMsat;
 				}
-			} else if (!signedLocalCarriesRemoval(entry, signedLocal)) {
+			} else if (!retained.has(entry)) {
 				// We offered but failed: refund our balance
 				localMsat += entry.amountMsat;
 			}
@@ -1529,7 +1604,7 @@ export function verifyRemoteHtlcSignatures(
 function buildHtlcOutputsForLocal(
 	state: IChannelState,
 	keys: ICommitmentKeys,
-	signedLocal = false
+	retained: ReadonlySet<IHtlcEntry> = NO_RETAINED_REMOVALS
 ): (IHtlcOutput & { direction: HtlcDirection; amountMsat: bigint })[] {
 	const outputs: (IHtlcOutput & {
 		direction: HtlcDirection;
@@ -1555,7 +1630,7 @@ function buildHtlcOutputsForLocal(
 		// - a removal the PEER sent for an OFFERED HTLC is in the next
 		//   commitment it signs, so this build drops it — except in the
 		//   signedLocal rebuild, which reproduces the commitment the stored
-		//   signature covers (see signedLocalCarriesRemoval).
+		//   signature covers (see resolveRetainedRemovals).
 		if (
 			entry.state === HtlcState.FULFILLED ||
 			entry.state === HtlcState.FAILED
@@ -1563,7 +1638,7 @@ function buildHtlcOutputsForLocal(
 			const stillPresent =
 				(entry.direction === HtlcDirection.RECEIVED &&
 					entry.removalRemoteCommitted === false) ||
-				signedLocalCarriesRemoval(entry, signedLocal);
+				retained.has(entry);
 			if (!stillPresent) {
 				continue;
 			}

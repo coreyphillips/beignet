@@ -1231,7 +1231,10 @@ interface IHtlcMatch {
  *   signature covers (addRemoteSigned !== false): the commitment we
  *   broadcast is the one the stored signature covers, which predates
  *   the peer's update_fulfill/fail and still carries the output
- *   (issue #634).
+ *   (issue #634). A legacy row missing that flag stays a candidate
+ *   here even where resolveRetainedRemovals has the rebuild drop it:
+ *   the candidate then matches no output script, which is what the
+ *   additive rule below asks for.
  * - THEIR commitment: an OFFERED entry the peer settled, until WE
  *   revoke for it (removalLocallyRevoked === false, mirroring
  *   buildHtlcOutputsForRemote), AND a RECEIVED entry WE settled, until
