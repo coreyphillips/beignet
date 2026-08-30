@@ -158,9 +158,29 @@ class MockChainBackend implements IChainBackend {
 		return snapshot;
 	}
 
+	private transactionHolds = 0;
+	private transactionGates: Array<() => void> = [];
+
+	/** Park the next `count` transaction fetches until they are released. */
+	holdTransactions(count = 1): void {
+		this.transactionHolds = count;
+	}
+
+	/** Release the oldest parked transaction fetch only. */
+	releaseNextTransaction(): void {
+		const release = this.transactionGates.shift();
+		release?.();
+	}
+
 	async getTransaction(txid: string): Promise<Buffer> {
 		const tx = this.transactions.get(txid);
 		if (!tx) throw new Error(`Transaction not found: ${txid}`);
+		if (this.transactionHolds > 0) {
+			this.transactionHolds--;
+			await new Promise<void>((resolve) => {
+				this.transactionGates.push(resolve);
+			});
+		}
 		return tx;
 	}
 
@@ -687,6 +707,112 @@ describe('Phase 4: Chain Watcher', () => {
 				held.missingChecks ?? 0,
 				'and did not count an absence against it either'
 			).to.equal(0);
+			watcher.stop();
+		});
+
+		it('a stalled discovery never restores a candidate a newer scan found gone', async () => {
+			// Discovery reads the history one transaction at a time, and the
+			// candidate set it produces answers the same question absence does:
+			// a stale 'present' lifts the missing-funding quarantine and stops
+			// BOLT 2's forget clock against a funding that is not there (#624).
+			const backend = new MockChainBackend();
+			const channelManager = new ChannelManager({
+				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				localFundingPrivkey: crypto.randomBytes(32)
+			});
+			channelManager.on('error', () => {});
+			const watcher = new ChainWatcher({ backend, channelManager });
+			watcher.on('error', () => {});
+			const recovered: string[] = [];
+			watcher.on('funding:recovered', (_id: Buffer, txid: string) =>
+				recovered.push(txid)
+			);
+
+			const channelId = crypto.randomBytes(32);
+			const script = bitcoin.payments.p2wsh({
+				redeem: { output: bitcoin.script.compile([bitcoin.opcodes.OP_TRUE]) }
+			}).output!;
+			const scriptHash = computeScriptHash(script);
+			// The attempt the restored record names, and the replacement that
+			// reached the chain instead: same input, so the lineage matches and
+			// discovery recognizes it as this channel's funding.
+			const attemptTxid = 'cc'.repeat(32);
+			const parentHash = crypto.randomBytes(32);
+			const lineage = [
+				[`${Buffer.from(parentHash).reverse().toString('hex')}:0`]
+			];
+			const replacement = new bitcoin.Transaction();
+			replacement.version = 2;
+			replacement.addInput(parentHash, 0);
+			replacement.addOutput(script, 100_000);
+			backend.setTransaction(replacement.getId(), replacement.toBuffer());
+
+			await watcher.start();
+			backend.simulateNewBlock(200);
+			// Arming checks once, so two more absences reach the debounce.
+			backend.setHistory(scriptHash, []);
+			await watcher.watchFundingOutput(
+				channelId,
+				attemptTxid,
+				0,
+				1,
+				script,
+				undefined,
+				undefined,
+				lineage
+			);
+			await new Promise((r) => setTimeout(r, 20));
+			for (let i = 0; i < 2; i++) {
+				watcher.recheckAllWatches();
+				await new Promise((r) => setTimeout(r, 20));
+			}
+			expect(watcher.getFundingPresence(channelId), 'reported absent').to.equal(
+				'absent'
+			);
+
+			// Scan A sees the replacement confirmed and stalls fetching it.
+			backend.setHistory(scriptHash, [
+				{ txid: replacement.getId(), height: 150 }
+			]);
+			backend.holdTransactions(1);
+			watcher.recheckAllWatches();
+			await new Promise((r) => setTimeout(r, 20));
+
+			// A reorg takes it out again, and scan B completes on that history
+			// while A is still parked mid-fetch.
+			backend.setHistory(scriptHash, []);
+			watcher.recheckAllWatches();
+			await new Promise((r) => setTimeout(r, 20));
+
+			backend.releaseNextTransaction();
+			await new Promise((r) => setTimeout(r, 20));
+			expect(
+				watcher.hasProvisionalFunding(channelId),
+				'the stalled scan cannot put its candidate back'
+			).to.equal(false);
+			expect(
+				watcher.getFundingPresence(channelId),
+				'so the newer absence stands'
+			).to.equal('absent');
+			expect(
+				recovered,
+				'and nothing was announced as recovered'
+			).to.have.length(0);
+
+			// A scan that genuinely starts after the absence still records the
+			// candidate, so this is an ordering rule and not a block.
+			backend.setHistory(scriptHash, [
+				{ txid: replacement.getId(), height: 150 }
+			]);
+			watcher.recheckAllWatches();
+			await new Promise((r) => setTimeout(r, 20));
+			expect(
+				watcher.hasProvisionalFunding(channelId),
+				'a fresh presence answer is honoured'
+			).to.equal(true);
+			expect(watcher.getFundingPresence(channelId)).to.equal('present');
+			expect(recovered, 'and reported').to.deep.equal([attemptTxid]);
 			watcher.stop();
 		});
 	});
