@@ -47,6 +47,8 @@ export enum BeignetErrorCode {
 	FEE_ESTIMATE_NOT_READY = 'FEE_ESTIMATE_NOT_READY',
 	/** option_splice/option_quiesce is missing on one side of the pair. */
 	SPLICING_NOT_NEGOTIATED = 'SPLICING_NOT_NEGOTIATED',
+	/** The channel would splice, but is busy with a state that ends on its own. */
+	SPLICE_BUSY = 'SPLICE_BUSY',
 	/** The channel exists but would not start the splice (state, peer, size). */
 	SPLICE_REFUSED = 'SPLICE_REFUSED',
 
@@ -127,6 +129,9 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.NO_ROUTE,
 		// The estimator's seed lands within milliseconds of construction.
 		BeignetErrorCode.FEE_ESTIMATE_NOT_READY,
+		// A splice held off by an unacknowledged abort, a peer-owned quiescence
+		// session or settling HTLCs: the same request works once that ends.
+		BeignetErrorCode.SPLICE_BUSY,
 		// A peer that is down or slow now can be up on the next attempt. These
 		// only read as permanent before because they fell through the default.
 		BeignetErrorCode.CONNECT_FAILED,

@@ -426,6 +426,12 @@ export interface ChannelResult {
 	 * points whose caller has an obligation riding on the send actually leaving.
 	 */
 	sendsWithheld?: boolean;
+	/**
+	 * The refusal's condition ends on its own, so the same request can succeed
+	 * later. Carried from the refusing channel arm's ERROR action (issue #633);
+	 * absent means permanent.
+	 */
+	transient?: boolean;
 }
 
 /** Bitcoin mainnet chain hash */

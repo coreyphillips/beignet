@@ -26,7 +26,11 @@ import {
 	statusForErrorCode
 } from '../../src/cli/daemon';
 import { spliceRefusalError } from '../../src/cli/beignet-node';
-import { BeignetErrorCode } from '../../src/cli/errors';
+import {
+	BeignetErrorCode,
+	isPermanentFailure,
+	isRetryableError
+} from '../../src/cli/errors';
 import { SpliceRefusalCode } from '../../src/lightning/node/types';
 
 const MNEMONIC =
@@ -139,7 +143,14 @@ describe('spliceRefusalError', () => {
 			expect(err, code).to.not.equal(null);
 			expect(err!.message).to.equal('nope');
 			const status = statusForErrorCode(err!.code);
-			expect(status, `${code} -> ${err!.code}`).to.be.lessThan(500);
+			expect(status, `${code} -> ${err!.code}`).to.not.equal(500);
+			// A refusal may answer a retryable 5xx (SPLICE_BUSY does), but only
+			// if the library predicate agrees the caller should try again.
+			if (status >= 500) {
+				expect(isRetryableError(err!), `${code} -> ${err!.code}`).to.equal(
+					true
+				);
+			}
 		}
 	});
 
@@ -166,7 +177,8 @@ describe('spliceRefusalError', () => {
 				BeignetErrorCode.SPLICING_NOT_NEGOTIATED,
 				409
 			],
-			[SpliceRefusalCode.SPLICE_REFUSED, BeignetErrorCode.SPLICE_REFUSED, 409]
+			[SpliceRefusalCode.SPLICE_REFUSED, BeignetErrorCode.SPLICE_REFUSED, 409],
+			[SpliceRefusalCode.SPLICE_BUSY, BeignetErrorCode.SPLICE_BUSY, 503]
 		];
 		for (const [refusal, expected, status] of cases) {
 			const err = spliceRefusalError({
@@ -177,6 +189,23 @@ describe('spliceRefusalError', () => {
 			expect(err!.code, refusal).to.equal(expected);
 			expect(statusForErrorCode(err!.code), refusal).to.equal(status);
 		}
+	});
+
+	it('tells a caller to retry the refusals that clear on their own', () => {
+		// Issue #633: the whole point of the code. A caller following the
+		// published contract retries SPLICE_BUSY and gives up on the rest.
+		const busy = spliceRefusalError({
+			ok: false,
+			error: 'peer initiated the quiescence session',
+			code: SpliceRefusalCode.SPLICE_BUSY
+		});
+		expect(isPermanentFailure(busy!)).to.equal(false);
+		const refused = spliceRefusalError({
+			ok: false,
+			error: 'channel not in NORMAL state',
+			code: SpliceRefusalCode.SPLICE_REFUSED
+		});
+		expect(isPermanentFailure(refused!)).to.equal(true);
 	});
 
 	it('leaves a started splice alone', () => {

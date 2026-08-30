@@ -554,7 +554,10 @@ const outResult = node.spliceOut(channelId, 50_000n, 253);
 
 // A refusal carries both the sentence and the code that classifies it
 // (CHANNEL_NOT_FOUND, SPLICING_NOT_NEGOTIATED, INVALID_PARAMS,
-// INSUFFICIENT_BALANCE, FUNDING_PROVIDER_REQUIRED, SPLICE_REFUSED).
+// INSUFFICIENT_BALANCE, FUNDING_PROVIDER_REQUIRED, SPLICE_BUSY,
+// SPLICE_REFUSED). SPLICE_BUSY is the one to retry unchanged: the channel
+// would splice but is held off by a state that ends on its own (an
+// unacknowledged abort, a peer-owned quiescence session, settling HTLCs).
 // `ok: true` means the splice started, not that it completed: the outcome
 // arrives on splice:complete, splice:aborted or node:error.
 

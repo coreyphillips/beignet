@@ -286,6 +286,9 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// channel can spare. None is a node fault and none changes on a retry.
 	SPLICE_REFUSED: 409,
 	SPLICING_NOT_NEGOTIATED: 409,
+	// Its transient sibling (issue #633): the splice was held off by a state
+	// that ends on its own, so waiting genuinely changes the answer.
+	SPLICE_BUSY: 503,
 	CHANNEL_NOT_FOUND: 404,
 	INVOICE_EXPIRED: 410,
 	SPENDING_LIMIT_EXCEEDED: 403,

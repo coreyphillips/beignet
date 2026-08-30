@@ -1,8 +1,12 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { Network } from '../../src/lightning/invoice/types';
-import { Channel } from '../../src/lightning/channel/channel';
+import {
+	Channel,
+	ISpliceWalletInput
+} from '../../src/lightning/channel/channel';
 import { createOpenerState } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
@@ -19,6 +23,7 @@ import {
 	InvalidSpliceError,
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode,
+	ISpliceRequestResult,
 	SpliceRefusalCode
 } from '../../src/lightning/node/types';
 
@@ -517,6 +522,111 @@ describe('LightningNode splice refusal codes', function () {
 		// The reason lived in the channel's ERROR action and never reached the
 		// caller: the refusal arrived as `{ ok: false, error: undefined }`.
 		expect(result.error).to.include('not in NORMAL state');
+		node.destroy();
+	});
+});
+
+/**
+ * Issue #633: a splice the channel would start, only not yet. A pending abort
+ * echo and a peer-owned quiescence session both end on their own, and coding
+ * them SPLICE_REFUSED (a 409 isPermanentFailure calls permanent) told an
+ * automated caller to give up on a splice that succeeds on the next attempt.
+ */
+describe('LightningNode transient splice refusals', function () {
+	const channelOf = (node: LightningNode, channelId: Buffer): any =>
+		(node as any).channelManager.channels.get(channelId.toString('hex'));
+
+	/** Quiesce the channel from the peer's side, so the session is theirs. */
+	const peerQuiesce = (node: LightningNode, channelId: Buffer): void => {
+		const channel = channelOf(node, channelId);
+		channel.handleStfuMessage({ channelId, initiator: true });
+		expect(channel.isQuiescent(), 'peer stfu completed the handshake').to.be
+			.true;
+	};
+
+	/**
+	 * The latch initiateSpliceAbort leaves set until the peer echoes our
+	 * tx_abort. Set directly: reaching it for real needs a live splice session
+	 * and a peer to negotiate it with.
+	 */
+	const abortAwaitingEcho = (node: LightningNode, channelId: Buffer): void => {
+		const channel = channelOf(node, channelId);
+		channel._spliceAbortPending = true;
+		expect(channel.isSpliceAbortPending()).to.be.true;
+	};
+
+	const p2wpkhScript = (): Buffer =>
+		Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]);
+
+	/** A caller-supplied splice input worth `valueSats`, paid to P2WPKH. */
+	const makeInput = (valueSats: number): ISpliceWalletInput => {
+		const prevTx = new bitcoin.Transaction();
+		prevTx.version = 2;
+		prevTx.addInput(crypto.randomBytes(32), 0);
+		prevTx.addOutput(p2wpkhScript(), valueSats);
+		return {
+			prevTx: prevTx.toBuffer(),
+			prevOutputIndex: 0,
+			value: BigInt(valueSats),
+			sequence: 0xfffffffd,
+			signWitness: (): Buffer[] => [Buffer.alloc(71, 1), Buffer.alloc(33, 2)]
+		};
+	};
+
+	/** The two request paths that hand the refusal back to their caller. */
+	const REQUESTS: Array<
+		[string, (node: LightningNode, channelId: Buffer) => ISpliceRequestResult]
+	> = [
+		[
+			'spliceOut',
+			(node, channelId): ISpliceRequestResult =>
+				node.spliceOut(channelId, 50_000n, 253)
+		],
+		[
+			'spliceInWithInputs',
+			(node, channelId): ISpliceRequestResult =>
+				node.spliceInWithInputs(
+					channelId,
+					100_000n,
+					[makeInput(200_000)],
+					p2wpkhScript()
+				)
+		]
+	];
+
+	it('codes a peer-owned quiescence session as busy on both paths', function () {
+		for (const [name, request] of REQUESTS) {
+			const node = createTestNode();
+			const channelId = injectNormalChannel(node);
+			peerQuiesce(node, channelId);
+			const result = request(node, channelId);
+			expect(result.ok, name).to.be.false;
+			expect(result.code, name).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+			// The message already said to retry; the code said not to.
+			expect(result.error, name).to.include('retry after it ends');
+			node.destroy();
+		}
+	});
+
+	it('codes an unacknowledged splice abort as busy on both paths', function () {
+		for (const [name, request] of REQUESTS) {
+			const node = createTestNode();
+			const channelId = injectNormalChannel(node);
+			abortAwaitingEcho(node, channelId);
+			const result = request(node, channelId);
+			expect(result.ok, name).to.be.false;
+			expect(result.code, name).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+			expect(result.error, name).to.include('not yet acknowledged');
+			node.destroy();
+		}
+	});
+
+	it('leaves a refusal that cannot clear coded permanent', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		channelOf(node, channelId)._state.state = ChannelState.SHUTTING_DOWN;
+		const result = node.spliceOut(channelId, 50_000n, 253);
+		expect(result.code).to.equal(SpliceRefusalCode.SPLICE_REFUSED);
 		node.destroy();
 	});
 });

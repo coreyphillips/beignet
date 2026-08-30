@@ -163,6 +163,16 @@ export interface IErrorAction {
 	 * broadcast.
 	 */
 	cleanup?: 'none' | 'lifecycle';
+	/**
+	 * The refusal names a state that ends on its own (an unacknowledged
+	 * tx_abort, a quiescence session the peer owns, HTLCs still settling), so
+	 * the same request can succeed once it clears. Set by the arm that refuses,
+	 * because only it knows which condition it read; a boundary re-deriving the
+	 * classification from the message text or from a second predicate drifts
+	 * from the arms it is meant to mirror. Absent means permanent, which is the
+	 * safe reading for every arm that has not been classified (issue #633).
+	 */
+	transient?: boolean;
 }
 
 export interface IHtlcForwardedAction {

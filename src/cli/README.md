@@ -787,7 +787,8 @@ interface SpliceResult {
   error?: string;           // set on a refusal
   code?: SpliceRefusalCode; // CHANNEL_NOT_FOUND | SPLICING_NOT_NEGOTIATED |
                             // INVALID_PARAMS | INSUFFICIENT_BALANCE |
-                            // FUNDING_PROVIDER_REQUIRED | SPLICE_REFUSED
+                            // FUNDING_PROVIDER_REQUIRED | SPLICE_BUSY |
+                            // SPLICE_REFUSED
 }
 
 interface BootstrapPeerInfo {
@@ -1059,6 +1060,7 @@ not repeat a 4xx unchanged.
 | `FEE_ESTIMATE_NOT_READY` | Channels | 503 | The fee estimator has not delivered its first sample; retry shortly |
 | `SPLICING_NOT_NEGOTIATED` | Channels | 409 | `option_splice`/`option_quiesce` is missing on one side of the pair |
 | `SPLICE_REFUSED` | Channels | 409 | The channel exists but would not start the splice (state, peer, size) |
+| `SPLICE_BUSY` | Channels | 503 | The channel would splice but is held off by a state that ends on its own; retry the same request |
 | `PEER_NOT_CONNECTED` | Peers | 409 | Peer is not connected |
 | `CONNECT_FAILED` | Peers | 502 | Dialing the peer failed |
 | `CONNECT_TIMEOUT` | Peers | 504 | The peer did not answer the dial in time |
@@ -1170,9 +1172,12 @@ A splice starts asynchronously, so a refusal is **returned**, not thrown: `splic
 | `INSUFFICIENT_BALANCE` | `INSUFFICIENT_BALANCE` | 409 |
 | `FUNDING_PROVIDER_REQUIRED` | `FUNDING_PROVIDER_REQUIRED` | 409 |
 | `SPLICING_NOT_NEGOTIATED` | `SPLICING_NOT_NEGOTIATED` | 409 |
+| `SPLICE_BUSY` | `SPLICE_BUSY` | 503 |
 | `SPLICE_REFUSED` | `SPLICE_REFUSED` | 409 |
 
 A 2xx means the splice **started**. Its outcome arrives on the `splice:complete`, `splice:aborted` and `node:error` events.
+
+`SPLICE_BUSY` is the one refusal to retry unchanged: the channel would splice but is held off by a state that ends on its own (a previous abort still awaiting the peer's echo, a quiescence session the peer owns, HTLCs still settling). `isRetryableError` agrees; every other refusal code is permanent for the request as sent.
 
 ---
 
@@ -1836,7 +1841,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/channel/close` | `{ channelId, acceptStaleStateRisk? }` | Coop close; the flag is required for a capsule-restored channel |
 | POST | `/channel/forceclose` | `{ channelId, acceptStaleStateRisk? }` | Force close; the flag is required for a capsule-restored channel |
 | POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
-| POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds. A 2xx means the splice started; a refusal is a failure envelope (404 `CHANNEL_NOT_FOUND`, 409 `SPLICING_NOT_NEGOTIATED` / `FUNDING_PROVIDER_REQUIRED` / `SPLICE_REFUSED`, 400 `INVALID_PARAMS`) |
+| POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds. A 2xx means the splice started; a refusal is a failure envelope (404 `CHANNEL_NOT_FOUND`, 409 `SPLICING_NOT_NEGOTIATED` / `FUNDING_PROVIDER_REQUIRED` / `SPLICE_REFUSED`, 503 `SPLICE_BUSY`, 400 `INVALID_PARAMS`) |
 | POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address. Same refusal codes, plus 409 `INSUFFICIENT_BALANCE` |
 | POST | `/invoice/create` | `{ amountSats?, description?, minFinalCltvExpiry? }` | Create invoice (omit amountSats for amount-less; `minFinalCltvExpiry` buys final-CLTV headroom for a receive an LSP may settle through a splice) |
 | POST | `/jit/invoice` | `{ lspPubkey, amountSats?, description?, expirySecs?, targetRemainingInboundSat?, maxFlatFeeSat?, maxFeePpm? }` | Create an invoice payable with no channel: registers a receive intent with the LSP, which funds a channel mid-payment and deducts the quoted opening fee. Returns the invoice plus `flatFeeSat` and `feePpm` |

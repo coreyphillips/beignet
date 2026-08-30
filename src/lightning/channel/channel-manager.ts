@@ -5662,7 +5662,17 @@ export class ChannelManager extends EventEmitter {
 			(a): a is IErrorAction => a.type === ChannelActionType.ERROR
 		);
 		if (errorAction) {
-			return { ok: false, actions, error: errorAction.message };
+			// The arm's own retry classification travels with its message: an
+			// abort awaiting its echo, a peer-owned quiescence session and
+			// settling HTLCs all clear on their own, and a caller told the
+			// splice was refused permanently gives up on one that would
+			// succeed on the next attempt (issue #633).
+			return {
+				ok: false,
+				actions,
+				error: errorAction.message,
+				transient: errorAction.transient
+			};
 		}
 		return { ok: true, actions };
 	}

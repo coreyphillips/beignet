@@ -1258,6 +1258,13 @@ export enum SpliceRefusalCode {
 	INSUFFICIENT_BALANCE = 'INSUFFICIENT_BALANCE',
 	/** No funding provider able to source the splice-in's wallet inputs. */
 	FUNDING_PROVIDER_REQUIRED = 'FUNDING_PROVIDER_REQUIRED',
+	/**
+	 * The channel would start the splice, but not yet: a previous abort is
+	 * still awaiting the peer's tx_abort echo, the peer owns the current
+	 * quiescence session, or HTLCs are still settling. Each ends on its own, so
+	 * the identical request succeeds once it does (issue #633).
+	 */
+	SPLICE_BUSY = 'SPLICE_BUSY',
 	/** The channel exists but would not start the splice (state, peer, size). */
 	SPLICE_REFUSED = 'SPLICE_REFUSED'
 }
