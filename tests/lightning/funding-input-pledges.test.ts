@@ -347,6 +347,32 @@ describe('Funding input pledges', function () {
 		expect(frozen.size).to.equal(0);
 	});
 
+	it('a freeze the wallet refuses aborts the selection (issue #626)', async function () {
+		// The wallet rejects a freeze it cannot persist. Handing the inputs back
+		// anyway would sign a funding against coins the next coin selection, in
+		// this process or the next one, is free to spend.
+		const { wallet, frozen } = makeWallet([100_000, 100_000]);
+		(wallet as { freezeUtxo: unknown }).freezeUtxo = async () => ({
+			isErr: () => true,
+			isOk: () => false,
+			error: { message: 'storage is down' }
+		});
+		const provider = new WalletFundingProvider(wallet as never);
+
+		let error = '';
+		try {
+			await provider.selectSpliceInputs!(80_000n, 1000);
+		} catch (e) {
+			error = (e as Error).message;
+		}
+		expect(error).to.include('Failed to reserve funding input');
+		expect(frozen.size).to.equal(0);
+		// And no phantom reservation is left behind claiming the coin is held.
+		const pledged = (provider as unknown as { pledged: Map<string, number> })
+			.pledged;
+		expect(pledged.size).to.equal(0);
+	});
+
 	it('never adopts or unfreezes a user freeze (no tag)', async function () {
 		const { wallet, utxos, unfrozenLog } = makeWallet([100_000, 100_000]);
 		// User froze coin 0 with no tag.

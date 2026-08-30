@@ -211,20 +211,35 @@ export class WalletFundingProvider implements IFundingProvider {
 		return run;
 	}
 
-	/** Freeze the outpoint and remember when we pledged it. */
+	/**
+	 * Freeze the outpoint and remember when we pledged it.
+	 *
+	 * Throws when the wallet cannot take the freeze. A reservation the wallet
+	 * refused is not a reservation: recording it here would leave this instance
+	 * believing a coin is held that the next coin selection, in this process or
+	 * the next one, is free to spend. Callers abort instead, before the
+	 * transaction the coin was selected for is signed or handed out.
+	 */
 	private async pledge(
 		txid: string,
 		vout: number,
 		renewed = false
 	): Promise<void> {
 		const key = `${txid}:${vout}`;
-		this.pledged.set(key, Date.now());
-		if (renewed) this.renewedPledges.add(key);
-		await this.wallet.freezeUtxo?.({
+		const res = await this.wallet.freezeUtxo?.({
 			txid,
 			index: vout,
 			tag: WalletFundingProvider.PLEDGE_TAG
 		});
+		if (res?.isErr()) {
+			throw new Error(
+				`Failed to reserve funding input ${key}: ${
+					(res as IResultErr).error.message
+				}`
+			);
+		}
+		this.pledged.set(key, Date.now());
+		if (renewed) this.renewedPledges.add(key);
 	}
 
 	/**
@@ -234,9 +249,10 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * Runs under the selection lock, so it can never interleave with the prune
 	 * a selection performs, and only touches coins the wallet still lists as
 	 * unspent: the inputs this transaction already spent need no reservation,
-	 * and freezing an outpoint the wallet does not hold is rejected anyway. An
-	 * input the transaction spent and a later eviction gave back IS listed
-	 * again, and that is precisely the coin this has to re-freeze.
+	 * and freezing an outpoint the wallet does not hold is rejected, which
+	 * pledge() now raises. An input the transaction spent and a later eviction
+	 * gave back IS listed again, and that is precisely the coin this has to
+	 * re-freeze.
 	 */
 	async pledgeTransactionInputs(txHex: string): Promise<void> {
 		let tx: bitcoin.Transaction;

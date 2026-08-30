@@ -1669,7 +1669,7 @@ export class Wallet {
 			}
 
 			// Save any addresses that have been created thus far if necessary.
-			const promises: Promise<string>[] = [];
+			const promises: Promise<Result<string>>[] = [];
 			if (shouldSaveAddresses) {
 				promises.push(this.saveWalletData('addresses', this._data.addresses));
 			}
@@ -2464,6 +2464,10 @@ export class Wallet {
 	 * unfrozen, while still counting toward getBalance(). Persists through
 	 * the existing blacklistedUtxos wallet data. Matching is by outpoint
 	 * (txid + index) so confirmation height changes cannot unfreeze it.
+	 *
+	 * A freeze that storage refuses is rolled back and reported as an error:
+	 * callers that reserve a coin for an in-flight funding need to know the
+	 * reservation would not survive a restart.
 	 * @param {string} txid
 	 * @param {number} index
 	 * @returns {Promise<Result<string>>}
@@ -2498,16 +2502,34 @@ export class Wallet {
 		// keyPair must never be persisted with the frozen entry.
 		const { keyPair, ...frozen } = utxo;
 		void keyPair;
-		this._data.blacklistedUtxos.push({
+		const entry = {
 			...frozen,
 			...(tag !== undefined ? { freezeTag: tag, frozenAt: Date.now() } : {})
-		});
-		await this.saveWalletData('blacklistedUtxos', this._data.blacklistedUtxos);
+		};
+		this._data.blacklistedUtxos.push(entry);
+		const saved = await this.saveWalletData(
+			'blacklistedUtxos',
+			this._data.blacklistedUtxos
+		);
+		if (saved.isErr()) {
+			// The row never reached storage, so the freeze dies with this
+			// process: the next run hands the coin back to coin selection while
+			// whatever reserved it (a funding pledge) believes it is held. Drop
+			// the in-memory entry so memory and storage agree, and let the
+			// caller decide whether it can proceed without the reservation.
+			const at = this._data.blacklistedUtxos.indexOf(entry);
+			if (at !== -1) this._data.blacklistedUtxos.splice(at, 1);
+			return err(
+				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`
+			);
+		}
 		return ok(`UTXO ${txid}:${index} frozen.`);
 	}
 
 	/**
-	 * Unfreezes a previously frozen UTXO, making it spendable again.
+	 * Unfreezes a previously frozen UTXO, making it spendable again. Like
+	 * freezeUtxo, a write storage refuses is rolled back and reported: the
+	 * persisted blacklist still holds the coin, so a restart re-freezes it.
 	 * @param {string} txid
 	 * @param {number} index
 	 * @returns {Promise<Result<string>>}
@@ -2519,14 +2541,31 @@ export class Wallet {
 		txid: string;
 		index: number;
 	}): Promise<Result<string>> {
-		const before = this._data.blacklistedUtxos.length;
+		const removed = this._data.blacklistedUtxos.filter(
+			(frozen) => frozen.tx_hash === txid && frozen.tx_pos === index
+		);
+		if (removed.length === 0) {
+			return err(`UTXO ${txid}:${index} is not frozen.`);
+		}
 		this._data.blacklistedUtxos = this._data.blacklistedUtxos.filter(
 			(frozen) => !(frozen.tx_hash === txid && frozen.tx_pos === index)
 		);
-		if (this._data.blacklistedUtxos.length === before) {
-			return err(`UTXO ${txid}:${index} is not frozen.`);
+		const saved = await this.saveWalletData(
+			'blacklistedUtxos',
+			this._data.blacklistedUtxos
+		);
+		if (saved.isErr()) {
+			// Storage still holds the freeze, so a restart would restore it.
+			// Put the entry back rather than report a release the wallet will
+			// take away again, unless a freeze landed while the write was in
+			// flight and already owns the outpoint.
+			if (!this.isUtxoFrozen(txid, index)) {
+				this._data.blacklistedUtxos.push(...removed);
+			}
+			return err(
+				`Failed to persist the unfreeze for UTXO ${txid}:${index}: ${saved.error.message}`
+			);
 		}
-		await this.saveWalletData('blacklistedUtxos', this._data.blacklistedUtxos);
 		return ok(`UTXO ${txid}:${index} unfrozen.`);
 	}
 
@@ -2759,18 +2798,26 @@ export class Wallet {
 
 	/**
 	 * Saves the wallet data object to storage if able.
+	 *
+	 * A storage adapter reports failure two ways: a rejected promise, or a
+	 * resolved Err result (what TSetData is declared to return, and what
+	 * createWalletStorage produces). Both are errors here, so a caller that
+	 * cannot proceed without a durable write (freezeUtxo) can tell.
+	 *
+	 * A wallet configured without a setData is not a failure: it never had
+	 * persistence to lose.
 	 * @private
 	 * @async
 	 * @param {TWalletDataKeys} key
 	 * @param {IWalletData[K]} data
-	 * @returns {Promise<void>}
+	 * @returns {Promise<Result<string>>}
 	 */
-	private savingOperations: Record<string, Promise<string>> = {};
+	private savingOperations: Record<string, Promise<Result<string>>> = {};
 	public async saveWalletData<K extends keyof IWalletData>(
 		key: TWalletDataKeys,
 		data: IWalletData[K]
-	): Promise<string> {
-		if (!this._setData) return 'No setData method has been provided';
+	): Promise<Result<string>> {
+		if (!this._setData) return ok('No setData method has been provided');
 
 		// Check if there's an ongoing save operation for the same key
 		if (key in this.savingOperations) {
@@ -2781,11 +2828,20 @@ export class Wallet {
 		const walletDataKey = this.getWalletDataKey(key);
 		// Create a new save operation
 		this.savingOperations[key] = this._setData(walletDataKey, data)
-			.then(() => {
-				return `${walletDataKey} data saved successfully`;
+			.then((res) => {
+				// Adapters written in JS may resolve something that is not a
+				// Result at all; only an explicit Err counts as a failure.
+				if (typeof res?.isErr === 'function' && res.isErr()) {
+					return err<string>(
+						`Error saving wallet data for ${walletDataKey}: ${res.error.message}`
+					);
+				}
+				return ok(`${walletDataKey} data saved successfully`);
 			})
 			.catch((error) => {
-				return `Error saving wallet data for ${walletDataKey}: ${error}`;
+				return err<string>(
+					`Error saving wallet data for ${walletDataKey}: ${error}`
+				);
 			})
 			.finally(() => {
 				// Remove the operation once it's completed
