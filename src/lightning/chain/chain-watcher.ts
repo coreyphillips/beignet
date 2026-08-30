@@ -202,19 +202,22 @@ interface IWatchedOutput {
 	 */
 	spendUnverified?: boolean;
 	/**
-	 * Spend-scan arbitration for this outpoint (issue #625). Overlapping scans
-	 * are routine (a script-hash notification and the 60s sweep each start one),
-	 * and each carries a history it fetched before its awaits, so a scan that
-	 * finishes must know whether a fresher one has already spoken.
+	 * Spend scan arbitration for this outpoint (issues #625, #621). One scan at
+	 * a time: calls arriving during it request a single follow-up instead of
+	 * queueing, so sweep backpressure cannot build an unbounded backlog and no
+	 * scan is ever silenced by a later one starting.
 	 *
-	 * `nextScanTicket` is the dispenser; a scan takes the next value before its
-	 * first await. `appliedScanTicket` is the newest scan that ran to
-	 * completion. The funding side keeps the equivalent per channel in
-	 * `channelSpendScans`; a generic watch is already one outpoint, so the
-	 * counters live on the entry and die with it.
+	 * A script hash notification means the history the active scan fetched may
+	 * already be wrong, so it invalidates that scan outright. A recheck carries
+	 * no such news and only asks for a re-fetch before the verdict is published.
+	 *
+	 * `activeScanSequence` is the watcher-wide sequence of the scan running now,
+	 * which is what a sibling of the same batched spend consults.
 	 */
-	nextScanTicket: number;
-	appliedScanTicket: number;
+	scanInFlight: boolean;
+	rescanRequested: boolean;
+	activeScanInvalidated: boolean;
+	activeScanSequence?: number;
 }
 
 /**
@@ -391,18 +394,13 @@ interface IFailedFundingWatch {
 
 /** A failed output watch queued for retry */
 interface IFailedOutputWatch {
-	txid: string;
-	outputIndex: number;
-	scriptPubkey: Buffer;
 	/**
-	 * The seed the failed registration carried, replayed on retry (issue
-	 * #576). Dropping it silently disarmed eviction detection for exactly the
-	 * outputs whose first subscription attempt failed: the retried watch
-	 * would hold no recorded spend, so a reorg that evicted our penalty or
-	 * HTLC claim could never be noticed.
+	 * Retry the registered object by identity. Rebuilding it would reset spend
+	 * evidence and scan state, while retrying after replacement would revive a
+	 * stale watch.
 	 */
-	spendTxid?: string;
-	spendHeight?: number;
+	key: string;
+	watched: IWatchedOutput;
 }
 
 /** A failed broadcast queued for retry */
@@ -459,6 +457,33 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	private channelSpendScans: Map<string, IChannelSpendScan> = new Map();
 	private watchedOutputs: Map<string, IWatchedOutput> = new Map(); // "txid:vout" → output
+	/**
+	 * Dispenser for output spend scans, watcher-wide rather than per outpoint. A
+	 * batched spend (a penalty, an aggregated HTLC claim) is one transaction over
+	 * several watched outpoints, and the monitor dates every input it spends from
+	 * whichever report arrives, so "whose history is fresher" has to be a question
+	 * two different outpoints can answer against each other (issue #621).
+	 */
+	private outputScanSequence = 0;
+	/**
+	 * The newest verdict each spending transaction has been given, keyed by its
+	 * txid. A batched spend is one transaction over several watched outpoints,
+	 * and the monitor dates a whole batch from whichever member reports, so the
+	 * unit of evidence is the transaction: a per-outpoint counter cannot see a
+	 * stale member coming, since that member is the newest scan its own outpoint
+	 * ever had (issue #621). A transaction confirms at one height, so a scan that
+	 * disagrees with a fresher one about it is simply out of date.
+	 *
+	 * Read only to decide whether a verdict needs re-checking before it is
+	 * published, never to suppress one. A scan silenced by a sibling leaves its
+	 * own outpoint unreported to the monitor, which fans a report out only to
+	 * outputs already recorded against that transaction, and its watch holding
+	 * evidence nothing will come back to correct.
+	 */
+	private outputSpendVerdicts: Map<
+		string,
+		{ height?: number; sequence: number }
+	> = new Map();
 	private failedFundingWatches: IFailedFundingWatch[] = [];
 	private failedOutputWatches: IFailedOutputWatch[] = [];
 	private failedBroadcasts: IFailedBroadcast[] = [];
@@ -631,21 +656,7 @@ export class ChainWatcher extends EventEmitter {
 			}
 		}
 		// Retry failed output-watch subscriptions.
-		if (this.failedOutputWatches.length > 0) {
-			const pendingOutputs = [...this.failedOutputWatches];
-			this.failedOutputWatches = [];
-			for (const w of pendingOutputs) {
-				this.watchOutput(
-					w.txid,
-					w.outputIndex,
-					w.scriptPubkey,
-					w.spendTxid,
-					w.spendHeight
-				).catch(() => {
-					/* re-queued inside watchOutput */
-				});
-			}
-		}
+		this.retryFailedOutputSubscriptions(this.lifecycleGeneration);
 		// Re-check unconfirmed fundings and watched output spends directly.
 		for (const [key, watched] of this.watchedFundings) {
 			if (!watched.confirmed) {
@@ -705,6 +716,7 @@ export class ChainWatcher extends EventEmitter {
 		this.watchedFundings.clear();
 		this.channelSpendScans.clear();
 		this.watchedOutputs.clear();
+		this.outputSpendVerdicts.clear();
 		this.failedFundingWatches.length = 0;
 		this.failedOutputWatches.length = 0;
 		this.failedBroadcasts.length = 0;
@@ -976,8 +988,9 @@ export class ChainWatcher extends EventEmitter {
 			scriptHash,
 			spendTxid,
 			spendHeight,
-			nextScanTicket: 0,
-			appliedScanTicket: 0,
+			scanInFlight: false,
+			rescanRequested: false,
+			activeScanInvalidated: false,
 			// A seeded spend is recorded state, not something this watcher
 			// saw: the monitor's finality clock stays parked until the first
 			// live check confirms it (issue #576).
@@ -985,14 +998,31 @@ export class ChainWatcher extends EventEmitter {
 		};
 		this.watchedOutputs.set(key, watched);
 
+		await this.subscribeToOutputSpend(key, watched, generation);
+
+		// Retired while subscribing: drop our own entry if it somehow outlived
+		// the clear in stop(). Never touch an entry a later generation owns.
+		if (
+			!this.isCurrentGeneration(generation) &&
+			this.watchedOutputs.get(key) === watched
+		) {
+			this.watchedOutputs.delete(key);
+		}
+	}
+
+	private async subscribeToOutputSpend(
+		key: string,
+		watched: IWatchedOutput,
+		generation: number
+	): Promise<void> {
 		try {
-			await this.backend.subscribeToScriptHash(scriptHash, () => {
+			await this.backend.subscribeToScriptHash(watched.scriptHash, () => {
 				// The backend retains this callback and re-invokes it across
 				// reconnects; stop() cannot reach into it. Without this check a
 				// callback registered before a stop could start a fresh check that
 				// captured the CURRENT generation and passed every guard.
 				if (!this.isCurrentGeneration(generation)) return;
-				this.checkOutputSpend(key, generation).catch((err) => {
+				this.checkOutputSpend(key, generation, true).catch((err) => {
 					this.emitError(err);
 				});
 			});
@@ -1002,26 +1032,23 @@ export class ChainWatcher extends EventEmitter {
 			// repopulating it afterwards revives a stale watch on the next start.
 			if (
 				this.isCurrentGeneration(generation) &&
-				this.watchedOutputs.get(key) === watched
+				this.watchedOutputs.get(key) === watched &&
+				!this.failedOutputWatches.some((entry) => entry.watched === watched)
 			) {
-				this.failedOutputWatches.push({
-					txid,
-					outputIndex,
-					scriptPubkey,
-					spendTxid,
-					spendHeight
-				});
+				this.failedOutputWatches.push({ key, watched });
 			}
-			return;
 		}
+	}
 
-		// Retired while subscribing: drop our own entry if it somehow outlived
-		// the clear in stop(). Never touch an entry a later generation owns.
-		if (
-			!this.isCurrentGeneration(generation) &&
-			this.watchedOutputs.get(key) === watched
-		) {
-			this.watchedOutputs.delete(key);
+	private retryFailedOutputSubscriptions(generation: number): void {
+		if (this.failedOutputWatches.length === 0) return;
+		const pending = [...this.failedOutputWatches];
+		this.failedOutputWatches = [];
+		for (const entry of pending) {
+			if (this.watchedOutputs.get(entry.key) !== entry.watched) continue;
+			this.subscribeToOutputSpend(entry.key, entry.watched, generation).catch(
+				(err) => this.emitError(err)
+			);
 		}
 	}
 
@@ -1241,21 +1268,7 @@ export class ChainWatcher extends EventEmitter {
 		}
 
 		// Retry failed output watch subscriptions
-		if (this.failedOutputWatches.length > 0) {
-			const pendingOutputs = [...this.failedOutputWatches];
-			this.failedOutputWatches = [];
-			for (const watch of pendingOutputs) {
-				this.watchOutput(
-					watch.txid,
-					watch.outputIndex,
-					watch.scriptPubkey,
-					watch.spendTxid,
-					watch.spendHeight
-				).catch(() => {
-					// Still failing — already re-queued inside watchOutput
-				});
-			}
-		}
+		this.retryFailedOutputSubscriptions(generation);
 
 		// Retry failed broadcasts
 		if (this.failedBroadcasts.length > 0) {
@@ -2128,121 +2141,253 @@ export class ChainWatcher extends EventEmitter {
 
 	private async checkOutputSpend(
 		key: string,
-		generation: number = this.lifecycleGeneration
+		generation: number = this.lifecycleGeneration,
+		invalidateInFlight = false
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		const watched = this.watchedOutputs.get(key);
 		if (!watched) return;
+		if (watched.scanInFlight) {
+			watched.rescanRequested = true;
+			if (invalidateInFlight) watched.activeScanInvalidated = true;
+			return;
+		}
 
-		// Both taken before the first await, so they date this scan's evidence.
-		// The tip matters as much as the ticket: a header arriving mid-scan must
-		// not be counted as depth a history fetched before it can vouch for.
-		const ticket = ++watched.nextScanTicket;
-		const tipAtScan = this.currentBlockHeight;
+		watched.scanInFlight = true;
+		let retryAfterFailure = false;
+		try {
+			do {
+				watched.rescanRequested = false;
+				watched.activeScanInvalidated = false;
+				await this.runOutputSpendScan(key, watched, generation);
+			} while (
+				this.isCurrentGeneration(generation) &&
+				this.watchedOutputs.get(key) === watched &&
+				watched.rescanRequested
+			);
+		} catch (err) {
+			retryAfterFailure =
+				this.isCurrentGeneration(generation) &&
+				this.watchedOutputs.get(key) === watched &&
+				watched.rescanRequested;
+			throw err;
+		} finally {
+			watched.scanInFlight = false;
+			delete watched.activeScanSequence;
+			if (retryAfterFailure) {
+				this.checkOutputSpend(key, generation).catch((err) => {
+					this.emitError(err);
+				});
+			}
+		}
+	}
 
-		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
-		if (
+	private async runOutputSpendScan(
+		key: string,
+		watched: IWatchedOutput,
+		generation: number
+	): Promise<void> {
+		// Both values date this scan's evidence. A header arriving during the
+		// fetch cannot add depth to history that predates it.
+		let sequence = ++this.outputScanSequence;
+		watched.activeScanSequence = sequence;
+		let tipAtScan = this.currentBlockHeight;
+		const superseded = (): boolean =>
 			!this.isCurrentGeneration(generation) ||
 			this.watchedOutputs.get(key) !== watched ||
-			watched.appliedScanTicket > ticket
-		) {
-			return;
-		}
+			watched.activeScanInvalidated;
 
-		// Find the confirmed spend of our output. The script's history may contain
-		// several non-spending entries with the same script (address reuse — e.g.
-		// sweeps to a fixed destination), so every confirmed candidate is checked.
-		let spend: {
-			tx: bitcoin.Transaction;
-			txid: string;
-			height: number;
-		} | null = null;
-		for (const entry of history) {
-			if (entry.txid === watched.txid || entry.height <= 0) continue;
+		let history = await this.backend.getScriptHashHistory(watched.scriptHash);
+		if (superseded()) return;
 
-			const rawTx = await this.backend.getTransaction(entry.txid);
+		for (;;) {
+			// Find the confirmed spend of our output. The script's history may
+			// contain unrelated entries when an address is reused.
+			let spend: {
+				tx: bitcoin.Transaction;
+				txid: string;
+				height: number;
+			} | null = null;
+			for (const entry of history) {
+				if (entry.txid === watched.txid || entry.height <= 0) continue;
+
+				const rawTx = await this.backend.getTransaction(entry.txid);
+				if (superseded()) return;
+				const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
+
+				const spendsOurs = spendingTx.ins.some((input) => {
+					const inputTxid = Buffer.from(input.hash).reverse().toString('hex');
+					return (
+						inputTxid === watched.txid && input.index === watched.outputIndex
+					);
+				});
+				if (!spendsOurs) continue;
+
+				spend = { tx: spendingTx, txid: entry.txid, height: entry.height };
+				break;
+			}
+
+			// Re-fetch before publishing whenever the history this verdict rests on
+			// may already have moved: a recheck arrived mid-scan, or a fresher scan
+			// of the same batched spend is around. Re-checking rather than standing
+			// aside is the whole point. A scan that stays silent leaves its own
+			// outpoint unreported, and the sibling that spoke over it covers the
+			// rest of the batch only once the monitor has already recorded this
+			// spending transaction against them (issue #621).
 			if (
-				!this.isCurrentGeneration(generation) ||
-				this.watchedOutputs.get(key) !== watched ||
-				watched.appliedScanTicket > ticket
+				watched.rescanRequested ||
+				this.outputVerdictContested(watched, spend, sequence)
 			) {
+				sequence = ++this.outputScanSequence;
+				watched.activeScanSequence = sequence;
+				tipAtScan = this.currentBlockHeight;
+				const validatedHistory = await this.backend.getScriptHashHistory(
+					watched.scriptHash
+				);
+				if (superseded()) return;
+				watched.rescanRequested = false;
+				const unchanged =
+					history.length === validatedHistory.length &&
+					history.every(
+						(entry, index) =>
+							entry.txid === validatedHistory[index].txid &&
+							entry.height === validatedHistory[index].height
+					);
+				if (!unchanged) {
+					history = validatedHistory;
+					continue;
+				}
+			}
+
+			if (spend) {
+				this.recordOutputSpendVerdict(spend.txid, spend.height, sequence);
+				// Idempotent: the subscription re-fires on any scripthash change, so skip
+				// re-reporting a spend we already recorded. Two cases are NOT idempotent
+				// re-fires and must reach the monitor (issue #576): a spend seeded from
+				// persisted state, which nothing has verified against the chain this
+				// session and whose finality clock is parked until this report, and a
+				// recorded spend that has since been re-mined at a DIFFERENT height,
+				// whose depth must be recounted from where it actually sits.
+				if (
+					watched.spendTxid !== spend.txid ||
+					watched.spendUnverified === true ||
+					watched.spendHeight !== spend.height
+				) {
+					watched.spendTxid = spend.txid;
+					watched.spendHeight = spend.height;
+					delete watched.spendUnverified;
+					this.channelManager.handleOutputSpent(
+						watched.txid,
+						watched.outputIndex,
+						spend.tx,
+						spend.height
+					);
+					this.emit('output:spent', watched.txid, watched.outputIndex);
+				}
+				// Retain the watch until the spend is buried deep enough to be final, so a
+				// reorg before then re-fires this check and is caught by the branch below.
+				// The boundary is the monitor's own, `blockHeight - confirmationHeight >=
+				// IRREVOCABLE_DEPTH` (chain-monitor.ts, OUTPUT_RESOLVED): retiring on a
+				// `+ 1` depth drops the watch a block early, and a reorg in that gap has
+				// nothing left to report the eviction (issue #625).
+				//
+				// Retirement is measured against the tip this scan's own history was
+				// fetched against, never the current one: a header arriving mid-scan is
+				// depth the history cannot vouch for, and a watch retired on it is gone
+				// for good. The history behind it was re-checked above if anything
+				// suggested it had moved.
+				if (tipAtScan > 0 && tipAtScan - spend.height >= IRREVOCABLE_DEPTH) {
+					this.watchedOutputs.delete(key);
+					this.pruneOutputSpendVerdicts(spend.txid);
+				}
 				return;
 			}
-			const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
 
-			const spendsOurs = spendingTx.ins.some((input) => {
-				const inputTxid = Buffer.from(input.hash).reverse().toString('hex');
-				return (
-					inputTxid === watched.txid && input.index === watched.outputIndex
-				);
-			});
-			if (!spendsOurs) continue;
-
-			spend = { tx: spendingTx, txid: entry.txid, height: entry.height };
-			break;
-		}
-
-		if (spend) {
-			// Idempotent: the subscription re-fires on any scripthash change, so skip
-			// re-reporting a spend we already recorded. Two cases are NOT idempotent
-			// re-fires and must reach the monitor (issue #576): a spend seeded from
-			// persisted state, which nothing has verified against the chain this
-			// session and whose finality clock is parked until this report, and a
-			// recorded spend that has since been re-mined at a DIFFERENT height,
-			// whose depth must be recounted from where it actually sits.
-			if (
-				watched.spendTxid !== spend.txid ||
-				watched.spendUnverified === true ||
-				watched.spendHeight !== spend.height
-			) {
-				watched.spendTxid = spend.txid;
-				watched.spendHeight = spend.height;
+			// No spend in the current history. A prior spend was evicted, so the
+			// monitor must rebroadcast any penalty or HTLC claim.
+			if (watched.spendTxid !== undefined) {
+				this.recordOutputSpendVerdict(watched.spendTxid, undefined, sequence);
+				watched.spendTxid = undefined;
+				watched.spendHeight = undefined;
 				delete watched.spendUnverified;
-				this.channelManager.handleOutputSpent(
+				this.channelManager.handleOutputUnspent(
 					watched.txid,
-					watched.outputIndex,
-					spend.tx,
-					spend.height
+					watched.outputIndex
 				);
-				this.emit('output:spent', watched.txid, watched.outputIndex);
-			}
-			watched.appliedScanTicket = ticket;
-			// Retain the watch until the spend is buried deep enough to be final, so a
-			// reorg before then re-fires this check and is caught by the branch below.
-			// The boundary is the monitor's own, `blockHeight - confirmationHeight >=
-			// IRREVOCABLE_DEPTH` (chain-monitor.ts, OUTPUT_RESOLVED): retiring on a
-			// `+ 1` depth drops the watch a block early, and a reorg in that gap has
-			// nothing left to report the eviction (issue #625).
-			//
-			// Retirement is the one verdict that cannot be corrected later, because
-			// the deleted entry retires every other scan at the map-identity guard
-			// above. So only the newest scan may take it, on the tip its own history
-			// was fetched against. A later scan still in flight holds the fresher
-			// answer and makes this same decision when it lands; deferring costs a
-			// re-check, retiring early loses the eviction for good.
-			if (
-				tipAtScan > 0 &&
-				tipAtScan - spend.height >= IRREVOCABLE_DEPTH &&
-				ticket === watched.nextScanTicket
-			) {
-				this.watchedOutputs.delete(key);
+				this.emit('output:unspent', watched.txid, watched.outputIndex);
 			}
 			return;
 		}
+	}
 
-		// No spend in the current history. If we had previously reported one, it has
-		// been evicted by a reorg — tell the monitor so it can re-broadcast our sweep
-		// (penalty / HTLC-success) before the counterparty's timelock matures.
-		if (watched.spendTxid !== undefined) {
-			watched.spendTxid = undefined;
-			watched.spendHeight = undefined;
-			delete watched.spendUnverified;
-			this.channelManager.handleOutputUnspent(
-				watched.txid,
-				watched.outputIndex
-			);
-			this.emit('output:unspent', watched.txid, watched.outputIndex);
+	/**
+	 * Would this verdict move a spending transaction a fresher scan has a say in?
+	 *
+	 * A fresher scan is one that recorded a different height for the same
+	 * transaction, or one still in flight over another outpoint the transaction
+	 * spends. Pending counts: it fetched its history later, so it is the fresher
+	 * of the two whether or not it has come back yet. Only a verdict that would
+	 * MOVE the transaction asks the question, so the ordinary sweep, where
+	 * every member of a batch re-confirms the height already recorded, costs
+	 * nothing extra.
+	 *
+	 * The answer is a reason to re-fetch, never a reason to stay quiet, so it can
+	 * afford to be asked across parent transactions as well as within one: the
+	 * spend that batches them is a single transaction at a single height, but the
+	 * monitor's report of it is per outpoint and reaches only one parent's
+	 * outputs.
+	 */
+	private outputVerdictContested(
+		watched: IWatchedOutput,
+		spend: { tx: bitcoin.Transaction; txid: string; height: number } | null,
+		sequence: number
+	): boolean {
+		// An absence answers for the spend it retracts; with none recorded there
+		// is no transaction in question, and nothing is reported either.
+		const spendTxid = spend?.txid ?? watched.spendTxid;
+		if (spendTxid === undefined) return false;
+		const height = spend?.height;
+
+		const recorded = this.outputSpendVerdicts.get(spendTxid);
+		if (recorded !== undefined && recorded.height === height) return false;
+		if (recorded !== undefined && recorded.sequence > sequence) return true;
+
+		for (const sibling of this.watchedOutputs.values()) {
+			if (sibling === watched) continue;
+			if ((sibling.activeScanSequence ?? 0) <= sequence) continue;
+			const shared = spend
+				? spend.tx.ins.some(
+						(input) =>
+							input.index === sibling.outputIndex &&
+							Buffer.from(input.hash).reverse().toString('hex') === sibling.txid
+				  )
+				: sibling.spendTxid === spendTxid;
+			if (shared) return true;
 		}
-		watched.appliedScanTicket = ticket;
+		return false;
+	}
+
+	/** Record the freshest verdict a spending transaction has been given. */
+	private recordOutputSpendVerdict(
+		spendTxid: string,
+		height: number | undefined,
+		sequence: number
+	): void {
+		const recorded = this.outputSpendVerdicts.get(spendTxid);
+		if (recorded !== undefined && recorded.sequence > sequence) return;
+		this.outputSpendVerdicts.set(spendTxid, { height, sequence });
+	}
+
+	/**
+	 * Drop a retired spend's verdict once no watch still answers for it. A scan
+	 * in flight anywhere holds it back: that scan may come back holding this
+	 * transaction at a height a reorg has since moved, and the record is the only
+	 * thing left that can tell it so once the members that saw the move retire.
+	 */
+	private pruneOutputSpendVerdicts(spendTxid: string): void {
+		for (const watched of this.watchedOutputs.values()) {
+			if (watched.spendTxid === spendTxid || watched.scanInFlight) return;
+		}
+		this.outputSpendVerdicts.delete(spendTxid);
 	}
 }
