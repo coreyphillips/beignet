@@ -1967,10 +1967,40 @@ export class ChainMonitor {
 		// close was waiting for: the history was fetched and holds no spender.
 		// Ahead of the height check below, which the reset already zeroed, so
 		// the window closes instead of lasting the whole session (issue #622).
-		this._commitmentReverifyPending = false;
+		//
+		// Only on a scan of the outpoint the record spent, never on the
+		// fall-through that lets the demotion act. A demotion a sibling leg
+		// triggers stays fail-safe, because a spend really on chain is
+		// re-reported every sweep; re-admitting the force-close rescue is not.
+		if (this._scanCoversRecordedSpend(scan)) {
+			this._commitmentReverifyPending = false;
+		}
 		if (broadcast.blockHeight <= 0) return false;
 		this._demoteRecordedConfirmation();
 		return true;
+	}
+
+	/**
+	 * Whether an absence scan is evidence about the outpoint the recorded spend
+	 * consumed. The record names it once `spentOutpoint` is written; a row from
+	 * before that field falls back to the channel's funding outpoint, which is
+	 * what a cooperative close spends. A report naming no outpoint predates legs
+	 * entirely and answers for the record.
+	 */
+	private _scanCoversRecordedSpend(scan?: IFundingSpendScan): boolean {
+		if (!scan) return true;
+		const recorded = this._commitmentBroadcast?.spentOutpoint;
+		if (recorded) {
+			return (
+				recorded.txid === scan.txid && recorded.outputIndex === scan.outputIndex
+			);
+		}
+		const fundingTxid = this._channelState.fundingTxid;
+		if (!fundingTxid) return false;
+		return (
+			Buffer.from(fundingTxid).reverse().toString('hex') === scan.txid &&
+			this._channelState.fundingOutputIndex === scan.outputIndex
+		);
 	}
 
 	/**

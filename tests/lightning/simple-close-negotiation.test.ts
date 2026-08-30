@@ -960,6 +960,39 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 		expect(h.aliceChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
 	});
 
+	it("a sibling outpoint's absence leaves a restored close unproved", function () {
+		// A pre-splice leg is re-armed ahead of the canonical funding watch and
+		// scans a different outpoint. Its silence is evidence about that outpoint
+		// alone, so it may stop the depth clock but must not answer the rescue's
+		// question about this close.
+		const { h, starved, destScript } = closedWithStarvedCoopClose(41, 42);
+		h.alice.handleFundingSpent(h.channelId, starved, 800_000, destScript);
+		const restored = restartMonitor(h, destScript);
+		expect(restored.isCommitmentReverifyPending()).to.equal(true);
+		expect(
+			restored.getFullState().commitmentBroadcast?.spentOutpoint,
+			'a record written without an outpoint'
+		).to.equal(undefined);
+
+		const retracted = h.alice.handleFundingSpendAbsent(h.channelId, {
+			txid: 'ee'.repeat(32),
+			outputIndex: 0,
+			expectedSpendTxid: 'ff'.repeat(32)
+		});
+		expect(retracted).to.equal(false);
+		expect(restored.isCommitmentReverifyPending()).to.equal(true);
+
+		const broadcastsBefore = h.aliceTxs.length;
+		const refused = h.alice.forceClose(h.channelId, destScript, 10);
+		expect(refused.ok).to.equal(false);
+		expect(refused.error).to.match(/may already be confirmed/);
+		expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+		expect(h.aliceTxs.length, 'no commitment broadcast').to.equal(
+			broadcastsBefore
+		);
+		expect(h.alice.getMonitor(h.channelId)).to.equal(restored);
+	});
+
 	it('force close keeps a monitor whose funding spend is already confirmed', function () {
 		// The other half of issue #622: whatever admitted the plan, replacing
 		// the monitor throws away the tracked outputs, the classification and
