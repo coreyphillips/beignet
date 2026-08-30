@@ -358,3 +358,51 @@ describe('The commitment a stalled removal round leaves us (issue #634)', functi
 		f.destroy();
 	});
 });
+
+describe('The expiry backstop on a stalled removal round (issue #634)', function () {
+	this.timeout(20_000);
+
+	it('force-closes once the stall outlasts the grace period', function () {
+		const f = stalledRemoval(320);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(f.alice as any).scanExpiringOfferedHtlcs(EXPIRY + GRACE);
+
+		expect(f.events).to.include('HTLC_EXPIRY_FORCE_CLOSE');
+		expect(
+			f.alice.getChannelManager().getChannel(f.channelId)!.getState()
+		).to.equal(ChannelState.FORCE_CLOSED);
+		f.destroy();
+	});
+
+	it('gives the off-chain removal its grace period first', function () {
+		const f = stalledRemoval(330);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(f.alice as any).scanExpiringOfferedHtlcs(EXPIRY + GRACE - 1);
+
+		expect(f.events).to.not.include('HTLC_EXPIRY_FORCE_CLOSE');
+		expect(
+			f.alice.getChannelManager().getChannel(f.channelId)!.getState()
+		).to.equal(ChannelState.NORMAL);
+		f.destroy();
+	});
+
+	it('leaves a completed removal alone', function () {
+		// Both phases done (here in the legacy flagless encoding): the leg is
+		// gone from every commitment either side can put on chain, so there is
+		// nothing on it to close for.
+		const f = stalledRemoval(340);
+		delete f.entry.removalLocallyRevoked;
+		delete f.entry.removalRemoteCommitted;
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(f.alice as any).scanExpiringOfferedHtlcs(EXPIRY + GRACE + 100);
+
+		expect(f.events).to.not.include('HTLC_EXPIRY_FORCE_CLOSE');
+		expect(
+			f.alice.getChannelManager().getChannel(f.channelId)!.getState()
+		).to.equal(ChannelState.NORMAL);
+		f.destroy();
+	});
+});

@@ -38,6 +38,7 @@ import {
 	ChannelState,
 	ChannelRole,
 	HtlcState,
+	IHtlcEntry,
 	DEFAULT_CHANNEL_CONFIG,
 	BITCOIN_CHAIN_HASH,
 	TESTNET_CHAIN_HASH,
@@ -19703,6 +19704,31 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Whether a peer's fail of an OFFERED HTLC is irrevocable, the point at
+	 * which the leg stops being claimable through the removal round.
+	 *
+	 * FAILED alone means the round is RUNNING, not finished: the settlement
+	 * loop deletes the entry the moment the removal is irrevocable, so a FAILED
+	 * entry still in the map has a phase to go. While removalLocallyRevoked is
+	 * false a disconnect rolls the leg back to COMMITTED (markForReestablish)
+	 * and the peer may retransmit a fulfill instead; while
+	 * removalRemoteCommitted is false the peer's last signed commitment still
+	 * carries the offered output for an HTLC-success. Absent flags are the
+	 * legacy "already committed" encoding.
+	 *
+	 * One copy, shared by the upstream-refund predicate below and by the
+	 * offered-expiry backstop that force-closes a round left unfinished
+	 * (issue #634): the two must not disagree about when a fail is over.
+	 */
+	private static isOfferedFailIrrevocable(htlc: IHtlcEntry): boolean {
+		return (
+			htlc.state === HtlcState.FAILED &&
+			htlc.removalLocallyRevoked !== false &&
+			htlc.removalRemoteCommitted !== false
+		);
+	}
+
+	/**
 	 * Whether a forward's OUTGOING leg is irrevocably resolved as failed, the
 	 * only condition under which refunding the inbound leg upstream is safe.
 	 *
@@ -19734,20 +19760,7 @@ export class LightningNode extends EventEmitter {
 			.getChannel(outChannelId)
 			?.getFullState();
 		const outHtlc = outState?.htlcs.get(outEntryKey);
-		// FAILED means the removal round is RUNNING, not finished: the
-		// settlement loop deletes the entry the moment the removal is
-		// irrevocable, so a FAILED entry still in the map has both phases to
-		// go, and the downstream can still claim through either of them. While
-		// removalLocallyRevoked is false a disconnect rolls the leg back to
-		// COMMITTED (markForReestablish) and the peer may retransmit a fulfill
-		// instead; while removalRemoteCommitted is false the peer's last signed
-		// commitment still carries the offered output for an HTLC-success.
-		// Absent flags are the legacy "already committed" encoding.
-		if (
-			outHtlc?.state === HtlcState.FAILED &&
-			outHtlc.removalLocallyRevoked !== false &&
-			outHtlc.removalRemoteCommitted !== false
-		)
+		if (outHtlc && LightningNode.isOfferedFailIrrevocable(outHtlc))
 			return true;
 
 		// The two arms below infer the failure from an absence rather than
@@ -20621,13 +20634,23 @@ export class LightningNode extends EventEmitter {
 
 			for (const [key, htlc] of state.htlcs) {
 				if (!key.startsWith('offered-')) continue;
-				if (
-					htlc.state !== HtlcState.PENDING &&
-					htlc.state !== HtlcState.COMMITTED
-				)
-					continue;
+				const live =
+					htlc.state === HtlcState.PENDING ||
+					htlc.state === HtlcState.COMMITTED;
+				// A fail the peer started and never finished leaves the leg just as
+				// claimable as a live one: a disconnect rolls it back to COMMITTED,
+				// and the commitment we would broadcast still carries the offered
+				// output. So the backstop below covers it too, or a payee stalls the
+				// removal round past its expiry and collects downstream after our
+				// inbound leg has timed out on chain (issue #634).
+				const stalledRemoval =
+					htlc.state === HtlcState.FAILED &&
+					!LightningNode.isOfferedFailIrrevocable(htlc);
+				if (!live && !stalledRemoval) continue;
 
-				if (blockHeight >= htlc.cltvExpiry) {
+				// Only a live leg has a payment left to fail: a removal round that
+				// started already reported the failure upstream.
+				if (live && blockHeight >= htlc.cltvExpiry) {
 					// Find associated payment
 					const htlcKey = `${channelId.toString('hex')}:${key}`;
 					const hashHex = this.htlcPaymentMap.get(htlcKey);
