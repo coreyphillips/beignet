@@ -24,7 +24,8 @@
  *    attempt budget, the busy mark, the funding that mark left in flight, and
  *    the receipt a paid request replays). A re-sent offer whose funding is
  *    still owed a witness is served FROM that funding, never by opening a
- *    second one (issue #635).
+ *    second one, and the witness itself is taken from that funding too, on the
+ *    lane it names, so a payer that sends one once is still paid (issue #635).
  *  - Every failure path releases the concurrency slot, the outpoint
  *    reservation and any channel or splice the session started. The fork left
  *    a live channel behind on three separate failure paths (defect D5). A
@@ -42,6 +43,7 @@ import {
 	decodeSealedFrame,
 	encodeSealedFrame,
 	IDfLaneKeys,
+	IDfWireFrame,
 	openFrame,
 	sealFrame
 } from '../frames';
@@ -189,6 +191,12 @@ interface IDfSessionContext {
 	 * earlier life negotiated never fetches it.
 	 */
 	prevTxid: Buffer;
+	/**
+	 * The payer's ephemeral public key for the lane this offer arrived on. It is
+	 * recorded with the funding so a later life can open the witness frame the
+	 * payer sends over that same lane (issue #635).
+	 */
+	payerEphemeralKey: Buffer;
 	/** Authenticated on the lane AND in the operator's trusted set. */
 	paired: boolean;
 }
@@ -296,6 +304,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			this.state.reserve(
 				held.funding.outpoint,
 				held.offerIdHex,
+				held.receiptHash,
 				held.expiresAt
 			);
 		}
@@ -410,7 +419,14 @@ export class DirectFundingReceiver extends EventEmitter {
 			this.drop(DfOfferDropReason.MALFORMED_MESSAGE, frame);
 			return;
 		}
-		void this.admit(frame, lane.record, lane.keys, offer, body);
+		void this.admit(
+			frame,
+			lane.record,
+			lane.keys,
+			offer,
+			body,
+			wire.ephemeralPublicKey
+		);
 	}
 
 	/**
@@ -443,7 +459,140 @@ export class DirectFundingReceiver extends EventEmitter {
 			session.onWitness?.(witness);
 			return;
 		}
+		if (this.serveWitnessFromFunding(frame, wire)) return;
 		this.drop(DfOfferDropReason.NO_SESSION, frame);
+	}
+
+	/**
+	 * A witness no session claimed, taken from the funding the request left in
+	 * flight (issue #635).
+	 *
+	 * The exchange that asked for it ran in a previous life: its session and its
+	 * lane keys went with the process, and the payer sends a witness once, so
+	 * without this the funding strands with the payer's input unwitnessed and
+	 * nothing on either side re-drives it. The lane the funding recorded is what
+	 * opens the frame, and opening it is the payer's proof: only the holder of
+	 * this request's envelope can seal to it.
+	 */
+	private serveWitnessFromFunding(
+		frame: IDfInboundFrame,
+		wire: IDfWireFrame
+	): boolean {
+		for (const held of this.deps.requests.activeFundings()) {
+			// A session in this life owns its own witnesses, including the
+			// terminal one a late-witness handler is still holding open.
+			if (this.state.get(held.offerIdHex)) continue;
+			const record = this.deps.requests.byReceiptHash(held.receiptHash);
+			if (!record) continue;
+			const lane = this.deps.requests.laneKeysFor(
+				record,
+				Buffer.from(held.funding.payerEphemeralKey, 'hex')
+			);
+			if (!lane) continue;
+			const body = openFrame(
+				lane.keys.recvKey,
+				Buffer.from(record.requestId, 'hex'),
+				frame.subtype,
+				wire
+			);
+			if (!body) continue;
+			let witness: IDfWitness;
+			try {
+				witness = decodeDfWitness(body);
+			} catch {
+				this.drop(DfOfferDropReason.MALFORMED_MESSAGE, frame);
+				return true;
+			}
+			if (witness.offerId.toString('hex') !== held.offerIdHex) continue;
+			this.completeFundingFromWitness(frame, record, held, lane.keys, witness);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Deliver a late witness to the channel that is waiting for it, and hand
+	 * back the receipt it earns.
+	 *
+	 * The transaction is read from the channel BEFORE the delivery: it is the
+	 * receipt's subject, and a channel that has moved on cannot be asked for it
+	 * afterwards. A channel with nothing to answer keeps the funding and the
+	 * mark exactly as they were, because the witness costs the payer nothing to
+	 * send again once its peer is back.
+	 */
+	private completeFundingFromWitness(
+		frame: IDfInboundFrame,
+		record: IDfRequestRecord,
+		held: {
+			receiptHash: string;
+			offerIdHex: string;
+			funding: IDfAttemptFunding;
+		},
+		keys: IDfLaneKeys,
+		witness: IDfWitness
+	): void {
+		const { funding } = held;
+		const channelId = Buffer.from(funding.channelId, 'hex');
+		const isSplice = funding.splice;
+		const final = this.finalTxFor(
+			isSplice
+				? this.deps.getPendingSpliceTx(channelId)
+				: this.deps.getPendingV2FundingTx(channelId),
+			channelId,
+			funding.outpoint
+		);
+		if (!final) {
+			this.log(DF_LOG_OFFER_FAILED, {
+				offerId: held.offerIdHex,
+				error: 'late witness arrived before the channel could answer for it'
+			});
+			return;
+		}
+		const [txidHex, voutText] = funding.outpoint.split(':');
+		const result = this.deliverWitness(
+			final,
+			isSplice,
+			Buffer.from(txidHex, 'hex').reverse(),
+			Number(voutText),
+			witness.witness
+		);
+		if (!result.ok) {
+			this.log(DF_LOG_OFFER_FAILED, {
+				offerId: held.offerIdHex,
+				error: `late witness rejected: ${result.error}`
+			});
+			return;
+		}
+		this.state.release(funding.outpoint, held.offerIdHex);
+		try {
+			// Tombstone before the receipt, as the session path does: the payment
+			// is made, and a request that comes back looking unpaid is one a second
+			// offer could fund all over again. The write also clears the mark.
+			this.deps.requests.markReceiptRevealed(held.receiptHash, {
+				offerIdHex: held.offerIdHex,
+				fundingTxidHex: final.fundingTxidDisplay.toString('hex')
+			});
+		} catch (err) {
+			this.log(DF_LOG_OFFER_FAILED, {
+				offerId: held.offerIdHex,
+				error: `receipt tombstone not persisted: ${errorText(err)}`
+			});
+		}
+		const complete = final.tx.ins.every((i) => i.witness.length > 0);
+		this.emitSealed(
+			frame.reply,
+			keys,
+			Buffer.from(record.requestId, 'hex'),
+			BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT,
+			encodeDfReceipt({
+				offerId: witness.offerId,
+				preimage: Buffer.from(record.preimageHex, 'hex'),
+				fundingTxid: final.fundingTxidDisplay,
+				...(complete ? { rawTx: final.tx.toBuffer() } : {})
+			})
+		);
+		this.log(DF_LOG_OFFER_COMPLETED, { offerId: held.offerIdHex });
+		this.emit('offer:completed', { offerId: held.offerIdHex });
 	}
 
 	// ─────────────── Admission ───────────────
@@ -463,7 +612,8 @@ export class DirectFundingReceiver extends EventEmitter {
 		record: IDfRequestRecord,
 		keys: IDfLaneKeys,
 		offer: IDfOffer,
-		offerBytes: Buffer
+		offerBytes: Buffer,
+		ephemeralPublicKey: Buffer
 	): Promise<void> {
 		const offerIdHex = offer.offerId.toString('hex');
 		const contentHash = contentHashOf(offerBytes);
@@ -527,7 +677,8 @@ export class DirectFundingReceiver extends EventEmitter {
 					offer,
 					offerIdHex,
 					contentHash,
-					funding
+					funding,
+					ephemeralPublicKey
 				);
 			} else {
 				await this.admitGuarded(
@@ -536,7 +687,8 @@ export class DirectFundingReceiver extends EventEmitter {
 					keys,
 					offer,
 					offerIdHex,
-					contentHash
+					contentHash,
+					ephemeralPublicKey
 				);
 			}
 		} catch (err) {
@@ -556,7 +708,8 @@ export class DirectFundingReceiver extends EventEmitter {
 		keys: IDfLaneKeys,
 		offer: IDfOffer,
 		offerIdHex: string,
-		contentHash: string
+		contentHash: string,
+		ephemeralPublicKey: Buffer
 	): Promise<void> {
 		const decline = (reason: string): void =>
 			this.declineUnrecorded(frame, keys, record, offer, reason);
@@ -713,15 +866,28 @@ export class DirectFundingReceiver extends EventEmitter {
 
 		// 12. One outpoint funds at most one in-flight session. A duplicate
 		// offer never reaches here, so a conflicting reservation is a DIFFERENT
-		// offer wanting the same coin.
+		// offer wanting the same coin. The request has to match too: the offer id
+		// covers the coin and the amount only, so the same coin offered to a
+		// second request at the same amount carries the same id, and a hold
+		// re-taken at startup (issue #635) has no session record behind it to
+		// refuse that on.
 		const outpoint = outpointKey(txidHex, offer.vout);
 		const reserved = this.state.reservationFor(outpoint);
-		if (reserved && reserved.offerIdHex !== offerIdHex) {
+		if (
+			reserved &&
+			(reserved.offerIdHex !== offerIdHex ||
+				reserved.receiptHashHex !== receiptHashHex)
+		) {
 			decline('input already committed to another offer');
 			return;
 		}
 		const now = this.now();
-		this.state.reserve(outpoint, offerIdHex, now + this.cfg.sessionTtlMs);
+		this.state.reserve(
+			outpoint,
+			offerIdHex,
+			receiptHashHex,
+			now + this.cfg.sessionTtlMs
+		);
 
 		const session: IDfOfferSession = {
 			offerIdHex,
@@ -781,6 +947,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			session,
 			record,
 			prevTxid: prevTx.getHash(),
+			payerEphemeralKey: ephemeralPublicKey,
 			paired
 		};
 		await this.serve(ctx, () =>
@@ -809,23 +976,51 @@ export class DirectFundingReceiver extends EventEmitter {
 		offer: IDfOffer,
 		offerIdHex: string,
 		contentHash: string,
-		funding: IDfAttemptFunding
+		funding: IDfAttemptFunding,
+		ephemeralPublicKey: Buffer
 	): Promise<void> {
-		const decline = (reason: string): void =>
-			this.declineUnrecorded(frame, keys, record, offer, reason);
 		if (funding.contentHash !== contentHash) {
 			// The same refusal a live duplicate gets, for the same reason: an id
 			// reused with different content is not the offer this funding pays.
-			decline('offer id reused with different content');
+			this.declineUnrecorded(
+				frame,
+				keys,
+				record,
+				offer,
+				'offer id reused with different content'
+			);
 			return;
 		}
-		if (
-			this.state.atSessionCeiling() ||
-			this.state.inflightCount() > this.cfg.maxInflightSessions
-		) {
-			decline('too many concurrent funding sessions');
+		// The transaction first, and no session until there is one. A channel
+		// that has not re-armed yet is a WAIT, not a verdict: recording a
+		// terminal session over it would answer every later re-send from the
+		// refusal, and the payer answers a decline by abandoning the payment the
+		// funding is still holding its coin for. Silence costs it one re-send.
+		const channelId = Buffer.from(funding.channelId, 'hex');
+		const final = await this.resumedFinalTx(funding, channelId);
+		if (!final) {
+			this.log(DF_LOG_OFFER_DROPPED, {
+				reason: 'funding_not_ready',
+				offerId: offerIdHex
+			});
 			return;
 		}
+		// The wait can be minutes, so the mark is read again: a witness that
+		// arrived on the old lane meanwhile has already completed this funding,
+		// and the request it paid is not one to ask for a signature on. The
+		// payer's next re-send is answered with the receipt.
+		const current = this.deps.requests.attemptsFor(record.receiptHash);
+		if (current.activeOfferId !== offerIdHex || !current.funding) {
+			this.log(DF_LOG_OFFER_DROPPED, {
+				reason: 'funding_settled',
+				offerId: offerIdHex
+			});
+			return;
+		}
+		// No concurrency cap here, unlike admission: this offer starts nothing,
+		// its request already holds the funding session it is charged for, and
+		// refusing it over an unrelated burst would strand a channel that only
+		// this payer's witness can finish.
 		const now = this.now();
 		const session: IDfOfferSession = {
 			offerIdHex,
@@ -846,7 +1041,12 @@ export class DirectFundingReceiver extends EventEmitter {
 		this.state.open(session);
 		// The durable mark is the reservation's authority here, not a fresh
 		// admission: the coin is already an input of a negotiated transaction.
-		this.state.reserve(funding.outpoint, offerIdHex, session.expiresAt);
+		this.state.reserve(
+			funding.outpoint,
+			offerIdHex,
+			record.receiptHash,
+			session.expiresAt
+		);
 		this.state.endAdmission(offerIdHex);
 
 		const paired =
@@ -860,15 +1060,19 @@ export class DirectFundingReceiver extends EventEmitter {
 		});
 		this.emit('offer:accepted', { offerId: offerIdHex, paired, resumed: true });
 
-		const channelId = Buffer.from(funding.channelId, 'hex');
 		const ctx: IDfSessionContext = {
 			offer,
 			session,
 			record,
 			prevTxid: Buffer.from(offer.txid).reverse(),
+			payerEphemeralKey: ephemeralPublicKey,
 			paired
 		};
-		await this.serve(ctx, () => this.resumeFunding(ctx, funding, channelId));
+		await this.serve(ctx, () => ({
+			final: Promise.resolve(final),
+			unwind: (): boolean => this.unwindFunding(funding.splice, channelId, ctx),
+			isSplice: funding.splice
+		}));
 	}
 
 	// ─────────────── Serving an admitted offer ───────────────
@@ -958,7 +1162,8 @@ export class DirectFundingReceiver extends EventEmitter {
 				outpoint: session.outpoint,
 				channelId: final.channelId.toString('hex'),
 				splice: isSplice,
-				contentHash: session.contentHash
+				contentHash: session.contentHash,
+				payerEphemeralKey: ctx.payerEphemeralKey.toString('hex')
 			},
 			session.expiresAt
 		);
@@ -1014,29 +1219,31 @@ export class DirectFundingReceiver extends EventEmitter {
 	}
 
 	/**
-	 * Pick up the funding a previous life negotiated (issue #635). Nothing is
-	 * started: the transaction comes back off the channel, or off the
-	 * owed-witness event a reconnect re-arms when the channel has not answered
-	 * for it yet.
+	 * The transaction a funding a previous life negotiated is waiting on a
+	 * witness for, or null when this channel cannot answer for it (issue #635).
+	 *
+	 * Nothing is started: it comes back off the channel, or off the owed-witness
+	 * event a reconnect re-arms when the channel has not answered yet.
 	 */
-	private resumeFunding(
-		ctx: IDfSessionContext,
+	private async resumedFinalTx(
 		funding: IDfAttemptFunding,
 		channelId: Buffer
-	): IDfStartedFunding {
-		const isSplice = funding.splice;
-		const unwind = (): boolean => this.unwindFunding(isSplice, channelId, ctx);
-		const pending = isSplice
+	): Promise<IDfFinalTx | null> {
+		const pending = funding.splice
 			? this.deps.getPendingSpliceTx(channelId)
 			: this.deps.getPendingV2FundingTx(channelId);
 		const ready = this.finalTxFor(pending, channelId, funding.outpoint);
-		if (ready) return { final: Promise.resolve(ready), unwind, isSplice };
+		if (ready) return ready;
 		const waiter = this.awaitFinalTx(
-			isSplice ? this.spliceWaiters : this.v2Waiters,
+			funding.splice ? this.spliceWaiters : this.v2Waiters,
 			funding.outpoint,
 			this.cfg.negotiationTimeoutMs
 		);
-		return { final: waiter.final, unwind, isSplice };
+		try {
+			return await waiter.final;
+		} catch {
+			return null;
+		}
 	}
 
 	/**
@@ -1221,10 +1428,10 @@ export class DirectFundingReceiver extends EventEmitter {
 			if (remaining <= 0) throw new Error(lastError);
 			const witness = await witnesses.next(remaining);
 			const result = this.deliverWitness(
-				ctx,
 				final,
 				isSplice,
 				prevTxid,
+				ctx.offer.vout,
 				witness.witness
 			);
 			if (result.ok) {
@@ -1255,23 +1462,23 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * for one that is.
 	 */
 	private deliverWitness(
-		ctx: IDfSessionContext,
 		final: IDfFinalTx,
 		isSplice: boolean,
 		prevTxid: Buffer,
+		vout: number,
 		witness: Buffer[]
 	): { ok: boolean; withheld?: boolean; error?: string } {
 		const result = isSplice
 			? this.deps.provideSpliceExternalWitness(
 					final.channelId,
 					prevTxid,
-					ctx.offer.vout,
+					vout,
 					witness
 			  )
 			: this.deps.provideV2ExternalWitness(
 					final.channelId,
 					prevTxid,
-					ctx.offer.vout,
+					vout,
 					witness
 			  );
 		if (result.ok && result.sendsWithheld) {
@@ -1302,10 +1509,10 @@ export class DirectFundingReceiver extends EventEmitter {
 		const prevTxid = ctx.prevTxid;
 		session.onWitness = (witness): void => {
 			const result = this.deliverWitness(
-				ctx,
 				final,
 				isSplice,
 				prevTxid,
+				ctx.offer.vout,
 				witness.witness
 			);
 			if (!result.ok) {

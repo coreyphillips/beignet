@@ -277,6 +277,13 @@ export interface IDfAttemptFunding {
 	 * the refusal a live duplicate already gets from its session record.
 	 */
 	contentHash: string;
+	/**
+	 * The payer's ephemeral public key for the lane this funding was negotiated
+	 * on, 33-byte hex. It travels on the OPENING frame only, so without it a
+	 * restarted receiver cannot open the witness frame the payer sends next: the
+	 * lane keys are an ECDH over this key, and the payer sends its witness once.
+	 */
+	payerEphemeralKey: string;
 }
 
 /**

@@ -314,7 +314,8 @@ describe('Direct funding: outstanding requests', () => {
 			outpoint: `${'ab'.repeat(32)}:1`,
 			channelId: 'cd'.repeat(32),
 			splice: false,
-			contentHash: 'ef'.repeat(32)
+			contentHash: 'ef'.repeat(32),
+			payerEphemeralKey: `02${'ab'.repeat(32)}`
 		};
 
 		it('holds the busy mark to the request expiry and restores the binding', () => {
@@ -382,6 +383,30 @@ describe('Direct funding: outstanding requests', () => {
 				undefined
 			);
 			expect(store.activeFundings()).to.deep.equal([]);
+		});
+
+		it('drops a marker whose payer lane key did not come back', () => {
+			const first = harness();
+			const record = first.store.mint();
+			first.store.beginAttempt(
+				record.receiptHash,
+				OFFER_A,
+				first.clock.now + 1000
+			);
+			const { payerEphemeralKey: _dropped, ...noLane } = funding;
+			first.store.markAttemptFunding(
+				record.receiptHash,
+				OFFER_A,
+				noLane as typeof funding,
+				record.expiresAt
+			);
+			const second = harness({}, { wallet: first.wallet, clock: first.clock });
+			second.store.restore();
+			// Without the lane key the witness the funding is waiting for can
+			// never be opened, so the marker answers nothing it is trusted for.
+			expect(second.store.attemptsFor(record.receiptHash)).to.deep.equal({
+				attempts: 1
+			});
 		});
 
 		it('drops a marker that did not come back intact', () => {

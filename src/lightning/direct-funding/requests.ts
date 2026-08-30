@@ -29,6 +29,7 @@ import {
 	DF_DEFAULT_REQUEST_TTL_MS,
 	DF_MAX_AMOUNT_SAT,
 	DF_MAX_REQUEST_TTL_MS,
+	DF_NODE_ID_BYTES,
 	DF_OFFER_ID_BYTES,
 	DF_PATH_SECRET_BYTES,
 	DF_PREIMAGE_BYTES,
@@ -472,13 +473,27 @@ export class DirectFundingRequestStore {
 		if (!frame.requestId || !frame.ephemeralPublicKey) return null;
 		const record = this.byRequestId(frame.requestId.toString('hex'));
 		if (!record) return null;
+		return this.laneKeysFor(record, frame.ephemeralPublicKey);
+	}
+
+	/**
+	 * The lane keys for a payer ephemeral key recorded earlier, or null when
+	 * they cannot be derived. What a continuation frame arriving after a restart
+	 * is opened with (issue #635): only the opening frame carries the ephemeral
+	 * key, so the witness that follows one is unreadable without the copy the
+	 * funding kept.
+	 */
+	laneKeysFor(
+		record: IDfRequestRecord,
+		ephemeralPublicKey: Buffer
+	): { record: IDfRequestRecord; keys: IDfLaneKeys } | null {
 		try {
 			return {
 				record,
 				keys: receiverLaneKeys(
 					Buffer.from(record.encryptionPrivateKeyHex, 'hex'),
-					frame.ephemeralPublicKey,
-					frame.requestId
+					ephemeralPublicKey,
+					Buffer.from(record.requestId, 'hex')
 				)
 			};
 		} catch {
@@ -610,7 +625,8 @@ function isWellFormedFunding(funding: unknown): boolean {
 		/^[0-9a-f]{64}:(0|[1-9][0-9]{0,9})$/i.test(f.outpoint) &&
 		isHex(f.channelId, 32) &&
 		typeof f.splice === 'boolean' &&
-		isHex(f.contentHash, 32)
+		isHex(f.contentHash, 32) &&
+		isHex(f.payerEphemeralKey, DF_NODE_ID_BYTES)
 	);
 }
 
