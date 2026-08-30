@@ -1483,6 +1483,20 @@ export class ChainWatcher extends EventEmitter {
 				superseded
 			);
 			if (superseded()) return;
+			// A scan that could not read the whole history and found nothing has
+			// concluded nothing: its empty candidate set may be no more than the
+			// entries it failed to fetch. Recording that would wipe the set an
+			// older but COMPLETE scan is about to report, and claiming the ticket
+			// would silence that scan for good, leaving live funding marked
+			// absent. Candidates it did find still count, because an unreadable
+			// entry can only add to the set.
+			if (
+				!discovery.complete &&
+				!discovery.bound &&
+				!discovery.provisional?.length
+			) {
+				return;
+			}
 			// The candidate set is a verdict about the same question absence and
 			// presence answer, so it is applied HERE, under the scan-order check,
 			// and never inside the scan that computed it. Discovery reads the
@@ -1506,8 +1520,8 @@ export class ChainWatcher extends EventEmitter {
 				// Part of the history could not be read, so this scan does not
 				// know whether the funding is there. Absence is a verdict and
 				// this is not one: leave the debounce untouched and ask again.
-				// The ticket above stands regardless: the candidate set this scan
-				// wrote is still the newest answer anything has to that question.
+				// It reached here holding candidates, so the ticket above stands:
+				// that set is the newest answer anything has to that question.
 				return;
 			} else if (watched.provisional?.length) {
 				// Unproven but real enough to stop the clock: something is

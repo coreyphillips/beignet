@@ -172,7 +172,18 @@ class MockChainBackend implements IChainBackend {
 		release?.();
 	}
 
+	private transactionFailures = 0;
+
+	/** Fail the next `count` transaction fetches, parked calls excepted. */
+	failTransactions(count = 1): void {
+		this.transactionFailures = count;
+	}
+
 	async getTransaction(txid: string): Promise<Buffer> {
+		if (this.transactionFailures > 0) {
+			this.transactionFailures--;
+			throw new Error(`Transaction unavailable: ${txid}`);
+		}
 		const tx = this.transactions.get(txid);
 		if (!tx) throw new Error(`Transaction not found: ${txid}`);
 		if (this.transactionHolds > 0) {
@@ -813,6 +824,86 @@ describe('Phase 4: Chain Watcher', () => {
 			).to.equal(true);
 			expect(watcher.getFundingPresence(channelId)).to.equal('present');
 			expect(recovered, 'and reported').to.deep.equal([attemptTxid]);
+			watcher.stop();
+		});
+
+		it('an unreadable newer scan cannot bury an older complete discovery', async () => {
+			// The other side of the same ordering rule: a scan that could not
+			// read the history has concluded nothing, so it must not take the
+			// ticket away from an older scan that did find the funding (#624).
+			const backend = new MockChainBackend();
+			const channelManager = new ChannelManager({
+				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				localFundingPrivkey: crypto.randomBytes(32)
+			});
+			channelManager.on('error', () => {});
+			const watcher = new ChainWatcher({ backend, channelManager });
+			watcher.on('error', () => {});
+
+			const channelId = crypto.randomBytes(32);
+			const script = bitcoin.payments.p2wsh({
+				redeem: { output: bitcoin.script.compile([bitcoin.opcodes.OP_TRUE]) }
+			}).output!;
+			const scriptHash = computeScriptHash(script);
+			const attemptTxid = 'dd'.repeat(32);
+			const parentHash = crypto.randomBytes(32);
+			const lineage = [
+				[`${Buffer.from(parentHash).reverse().toString('hex')}:0`]
+			];
+			const replacement = new bitcoin.Transaction();
+			replacement.version = 2;
+			replacement.addInput(parentHash, 0);
+			replacement.addOutput(script, 100_000);
+			backend.setTransaction(replacement.getId(), replacement.toBuffer());
+
+			await watcher.start();
+			backend.simulateNewBlock(200);
+			backend.setHistory(scriptHash, []);
+			await watcher.watchFundingOutput(
+				channelId,
+				attemptTxid,
+				0,
+				1,
+				script,
+				undefined,
+				undefined,
+				lineage
+			);
+			await new Promise((r) => setTimeout(r, 20));
+			for (let i = 0; i < 2; i++) {
+				watcher.recheckAllWatches();
+				await new Promise((r) => setTimeout(r, 20));
+			}
+			expect(watcher.getFundingPresence(channelId), 'reported absent').to.equal(
+				'absent'
+			);
+
+			// Scan A stalls fetching the confirmed replacement.
+			backend.setHistory(scriptHash, [
+				{ txid: replacement.getId(), height: 150 }
+			]);
+			backend.holdTransactions(1);
+			watcher.recheckAllWatches();
+			await new Promise((r) => setTimeout(r, 20));
+
+			// Scan B starts on the same history and its fetch fails, so it holds
+			// no answer at all.
+			backend.failTransactions(1);
+			watcher.recheckAllWatches();
+			await new Promise((r) => setTimeout(r, 20));
+			expect(
+				watcher.getFundingPresence(channelId),
+				'an unreadable scan is not a verdict either way'
+			).to.equal('absent');
+
+			backend.releaseNextTransaction();
+			await new Promise((r) => setTimeout(r, 20));
+			expect(
+				watcher.hasProvisionalFunding(channelId),
+				'the completed scan still gets to report its candidate'
+			).to.equal(true);
+			expect(watcher.getFundingPresence(channelId)).to.equal('present');
 			watcher.stop();
 		});
 	});
