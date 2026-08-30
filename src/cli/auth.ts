@@ -182,6 +182,13 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	// LSP's, out of the LSP's coins, and the fee it authorizes is bounded by
 	// the node's own configured ceilings, not by the caller's.
 	'POST /jit/invoice': ['invoice'],
+	// Mints a receipt secret and hands out a payable artifact. It moves no
+	// money: the same shape as POST /invoice/create and POST /jit/invoice.
+	// Its two siblings are admin by ABSENCE, deliberately: configure sets the
+	// liquidity peer and the trust flag, and send spends a UTXO.
+	'POST /direct-funding/request': ['invoice'],
+	// Policy readback, no secrets in it.
+	'GET /direct-funding/config': ['readonly'],
 	'POST /invoice/create-hold': ['invoice'],
 	'POST /invoice/settle-hold': ['invoice'],
 	'POST /invoice/cancel-hold': ['invoice'],
@@ -220,6 +227,9 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /rebalance': [],
 	'POST /advisor/execute-rebalances': [],
 	'POST /recover-fallback-funds': [],
+	// Spends a UTXO into a stranger's channel funding. As fund-moving as
+	// POST /send, and the empty list is what says so.
+	'POST /direct-funding/send': [],
 
 	// ── Admin-only: on-chain wallet mutation ──
 	'POST /utxo/freeze': [],
@@ -237,6 +247,9 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /peers/connect-seeds': [],
 	'POST /trusted-peer/add': [],
 	'POST /trusted-peer/remove': [],
+	// Sets the liquidity peer every direct-funded channel is negotiated with,
+	// and whether such an open may go zero-conf.
+	'POST /direct-funding/configure': [],
 	'POST /channel/open': [],
 	'POST /channel/open-zeroconf': [],
 	'POST /channel/open-v2': [],

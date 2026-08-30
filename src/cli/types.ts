@@ -228,6 +228,30 @@ export interface InvoiceInfo {
 	status?: 'PENDING' | 'PAID' | 'EXPIRED';
 }
 
+/**
+ * The direct-funding policy as the LFBW app reads it (issue #613). The field
+ * names are the app's, not the library's: the dashboard hides its whole policy
+ * card when `GET /direct-funding/config` fails and requires `lspPubkey` to be
+ * present in a readback after posting `{minAmountSat}` alone, so this shape is
+ * a contract until that app is updated under its own tracking issue.
+ */
+export interface DirectFundingConfigInfo {
+	/** The liquidity peer every direct-funded channel is negotiated with. */
+	lspPubkey: string | null;
+	lspHost: string | null;
+	lspPort: number | null;
+	/**
+	 * Inbound the operator would like bought alongside. Recorded and reported
+	 * so the app can round-trip it; nothing consumes it yet, because buying a
+	 * lease alongside a direct-funded open is not part of the ported protocol.
+	 */
+	targetInboundSat: number;
+	/** Whether a direct-funded open may go zero-conf. */
+	trusted: boolean;
+	/** Smallest offer served, never below the 5000 sat protocol floor. */
+	minAmountSat: number;
+}
+
 export interface HoldInvoiceInfo {
 	paymentHash: string;
 	bolt11: string;
@@ -606,6 +630,15 @@ export interface BeignetConfig {
 		maxFlatFeeSat?: number;
 		maxFeePpm?: number;
 	};
+	/** Relay direct-funding frames for OTHER nodes (BEIGNET_DF_RELAY, exact
+	 *  'true'/'false'). Off by default: forwarding opaque frames between
+	 *  strangers is work done for other people. Paying and being paid over the
+	 *  three lanes needs nothing switched on. */
+	dfRelay?: boolean;
+	/** Smallest direct-funding offer this node serves (BEIGNET_DF_MIN_AMOUNT).
+	 *  Clamps up to the 5000 sat protocol floor; below that the payer's own fee
+	 *  share dominates the payment. A partly numeric value refuses startup. */
+	dfMinAmountSat?: number;
 }
 
 export interface HealthInfo {

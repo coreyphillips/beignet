@@ -454,6 +454,16 @@ export interface INodeConfig {
 		/** Proportional part ceiling (ppm); default JIT_CLIENT_MAX_FEE_PPM. */
 		maxFeePpm?: number;
 	};
+	/**
+	 * Third-party direct funding (issue #532 phase 4): an unrelated payer's
+	 * on-chain payment becomes this node's channel funding. Absent means the
+	 * whole feature, lanes included, is never constructed.
+	 *
+	 * Present is not the same as active: the receiver serves nothing until an
+	 * operator names a liquidity peer to negotiate the funding with, and mints
+	 * nothing until `mintDirectFundingRequest` is called.
+	 */
+	directFunding?: IDirectFundingNodeConfig;
 	/** CLTV delta for forwarding (default 40) */
 	forwardingCltvDelta?: number;
 	/** Base fee in msat for forwarding (default 1000) */
@@ -582,6 +592,55 @@ export interface INodeConfig {
 	 * no forwards in the window, clamped to [floorPpm, ceilPpm].
 	 */
 	autoTuneFees?: IAutoTuneFeesConfig;
+}
+
+// ─── Direct funding ───
+
+/**
+ * The operator policy for third-party direct funding (#613). Everything here is
+ * settable at runtime through `LightningNode.setDirectFundingPolicy`, which is
+ * what `POST /direct-funding/configure` drives; the values passed at
+ * construction are the starting point, and the persisted policy wins over them
+ * on a restart.
+ */
+export interface IDirectFundingPolicy {
+	/** The peer every direct-funded channel is negotiated with. */
+	liquidityPeer?: string;
+	/** Where that peer is reachable, for the relay and onion descriptors. */
+	liquidityHost?: string;
+	liquidityPort?: number;
+	/** Smallest offer this receiver serves; the 5000 sat floor applies under it. */
+	minAmountSat?: number;
+	/** Largest offer this receiver serves. Unset means no ceiling. */
+	maxAmountSat?: number;
+	/** Let a direct-funded open go zero-conf (the app calls this `trusted`). */
+	allowZeroConf?: boolean;
+	/** Serve offers by splicing an existing channel rather than opening one. */
+	allowSplice?: boolean;
+	/**
+	 * Inbound liquidity the operator would like bought alongside. Recorded and
+	 * reported so the operator surface can round-trip it; nothing consumes it
+	 * yet, because buying a lease alongside a direct-funded open is not part of
+	 * the ported protocol.
+	 */
+	targetInboundSat?: number;
+}
+
+export interface IDirectFundingNodeConfig {
+	/** Which lanes this node runs; every one is on unless switched off. */
+	directPeer?: boolean;
+	onion?: boolean;
+	relay?: boolean;
+	/**
+	 * Relay direct-funding frames for OTHER nodes. A separate operator opt-in
+	 * (BEIGNET_DF_RELAY) because it is work done for strangers, metered but not
+	 * free.
+	 */
+	relayServer?: boolean;
+	/** Life of a minted request, capped at a week. */
+	requestTtlMs?: number;
+	/** The starting policy; a persisted one replaces it on restore. */
+	policy?: IDirectFundingPolicy;
 }
 
 // ─── Advisor Execution ───

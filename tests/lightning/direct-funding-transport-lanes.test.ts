@@ -17,6 +17,7 @@ import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { IDirectFundingNodeConfig } from '../../src/lightning/node/types';
 import { GuardianStartupGate } from '../../src/lightning/recovery/startup-gate';
 import {
 	BEIGNET_CUSTOM_PROTOCOL_VERSION,
@@ -333,8 +334,11 @@ describe('Direct-funding lane 1: direct peer', () => {
 	});
 });
 
-describe('Direct-funding lane 1 and the recovery gates', () => {
-	function makeNode(gate?: FakeGate): LightningNode {
+describe('Direct-funding transport node wiring', () => {
+	function makeNode(
+		gate?: FakeGate,
+		directFunding?: IDirectFundingNodeConfig
+	): LightningNode {
 		const seed = crypto.randomBytes(32);
 		const k = (i: number): Buffer =>
 			getPublicKey(
@@ -359,6 +363,7 @@ describe('Direct-funding lane 1 and the recovery gates', () => {
 			channelBasepoints: basepoints,
 			perCommitmentSeed: crypto.randomBytes(32),
 			fundingPrivkey: crypto.randomBytes(32),
+			...(directFunding ? { directFunding } : {}),
 			...(gate
 				? {
 						recovery: {
@@ -442,6 +447,58 @@ describe('Direct-funding lane 1 and the recovery gates', () => {
 		expect(seen.length).to.equal(0);
 		expect(gate.blocked.length).to.be.greaterThan(0);
 		node.destroy();
+	});
+
+	it('forwards only while the relay server is enabled and started', async () => {
+		for (const relayServer of [false, true]) {
+			const net = new FakeDfNetwork();
+			const payer = net.add(`node relay payer ${relayServer}`);
+			const relay = net.add(`node relay ${relayServer}`);
+			const receiver = net.add(`node relay receiver ${relayServer}`);
+			net.connect(payer, relay);
+			net.connect(relay, receiver);
+			const delivered: number[] = [];
+			receiver.onCustomMessage((msg): void => {
+				delivered.push(msg.subtype);
+			});
+			const message = encodeCustomMessage(
+				RELAY,
+				encodeDfRelayFrame({
+					to: receiver.pubkey,
+					subtype: OFFER,
+					payload: openingFrame(Buffer.alloc(16, 1))
+				})
+			);
+			const node = makeNode(undefined, {
+				directPeer: false,
+				onion: false,
+				relay: false,
+				relayServer
+			});
+			node.listPeers = (): ReturnType<LightningNode['listPeers']> => [
+				{
+					pubkey: receiver.id,
+					host: 'receiver.example',
+					port: 9735,
+					state: 'connected',
+					remoteInit: null
+				}
+			];
+			node.sendCustomMessage = (peer, subtype, payload): void =>
+				relay.sendCustomMessage(peer, subtype, payload);
+
+			try {
+				await node.startDirectFunding();
+				node.handlePeerMessage(payer.id, 44069, message);
+				expect(delivered).to.deep.equal(relayServer ? [RELAY] : []);
+
+				node.stopDirectFunding();
+				node.handlePeerMessage(payer.id, 44069, message);
+				expect(delivered).to.have.length(relayServer ? 1 : 0);
+			} finally {
+				node.destroy();
+			}
+		}
 	});
 });
 

@@ -301,7 +301,12 @@ describe('Issue #176: forwarding opt-out and forward logging', function () {
 			direction: HtlcDirection.RECEIVED,
 			state: HtlcState.COMMITTED
 		});
-		const outChannelId = crypto.randomBytes(32);
+		// The outgoing leg has to be terminally failed for the refund to leave at
+		// all (issue #623), and a live NORMAL channel whose entry the removal
+		// round already dropped is exactly that shape.
+		const { channelId: outChannelId } = installChannel(node);
+		(node as any).channelManager.getChannel(outChannelId).getFullState().state =
+			ChannelState.NORMAL;
 		const outHtlcId = 4n;
 		const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
 		(node as any).forwardedHtlcs.set(outKey, { inChannelId, inHtlcId: 2n });

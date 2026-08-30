@@ -22,6 +22,10 @@ function ok<T>(value: T) {
 	return { isErr: () => false, value };
 }
 
+function errResult(message: string) {
+	return { isErr: () => true, isOk: () => false, error: { message } };
+}
+
 interface IFrozenEntry {
 	tx_hash: string;
 	tx_pos: number;
@@ -347,6 +351,82 @@ describe('Funding input pledges', function () {
 		expect(frozen.size).to.equal(0);
 	});
 
+	it('a freeze the wallet refuses aborts the selection (issue #626)', async function () {
+		// The wallet rejects a freeze it cannot persist. Handing the inputs back
+		// anyway would sign a funding against coins the next coin selection, in
+		// this process or the next one, is free to spend.
+		const { wallet, frozen } = makeWallet([100_000, 100_000]);
+		(wallet as { freezeUtxo: unknown }).freezeUtxo = async () => ({
+			isErr: () => true,
+			isOk: () => false,
+			error: { message: 'storage is down' }
+		});
+		const provider = new WalletFundingProvider(wallet as never);
+
+		let error = '';
+		try {
+			await provider.selectSpliceInputs!(80_000n, 1000);
+		} catch (e) {
+			error = (e as Error).message;
+		}
+		expect(error).to.include('Failed to reserve funding input');
+		expect(frozen.size).to.equal(0);
+		// And no phantom reservation is left behind claiming the coin is held.
+		const pledged = (provider as unknown as { pledged: Map<string, number> })
+			.pledged;
+		expect(pledged.size).to.equal(0);
+	});
+
+	it('a refused renewal attempts every input and keeps the reservation (issue #626)', async function () {
+		// A renewal has nothing to abort: the transaction exists and the node
+		// still owes its broadcast. One input the wallet will not freeze says
+		// nothing about the next, and forgetting the reservation would hand the
+		// coin to the very selection that must not have it.
+		const { wallet, utxos, payment } = makeWallet([100_000, 100_000]);
+		const retained = new bitcoin.Transaction();
+		retained.version = 2;
+		for (const u of utxos) {
+			retained.addInput(Buffer.from(u.tx_hash, 'hex').reverse(), u.tx_pos);
+		}
+		retained.addOutput(payment.output!, 190_000);
+
+		const attempted: string[] = [];
+		(wallet as { freezeUtxo: unknown }).freezeUtxo = async (p: {
+			txid: string;
+			index: number;
+		}) => {
+			attempted.push(`${p.txid}:${p.index}`);
+			return errResult('storage is down');
+		};
+
+		const provider = new WalletFundingProvider(wallet as never);
+		let error = '';
+		try {
+			await provider.pledgeTransactionInputs(retained.toHex());
+		} catch (e) {
+			error = (e as Error).message;
+		}
+		// Reported, so the node logs it and the next block renews again.
+		expect(error).to.include('Failed to reserve retained transaction inputs');
+		expect(attempted).to.deep.equal([
+			`${utxos[0].tx_hash}:0`,
+			`${utxos[1].tx_hash}:0`
+		]);
+
+		const pledged = (provider as unknown as { pledged: Map<string, number> })
+			.pledged;
+		expect([...pledged.keys()].sort()).to.deep.equal(
+			[`${utxos[0].tx_hash}:0`, `${utxos[1].tx_hash}:0`].sort()
+		);
+		let selectError = '';
+		try {
+			await provider.selectSpliceInputs!(50_000n, 1000);
+		} catch (e) {
+			selectError = (e as Error).message;
+		}
+		expect(selectError).to.include('insufficient wallet funds');
+	});
+
 	it('never adopts or unfreezes a user freeze (no tag)', async function () {
 		const { wallet, utxos, unfrozenLog } = makeWallet([100_000, 100_000]);
 		// User froze coin 0 with no tag.
@@ -475,6 +555,71 @@ describe('Funding input pledges', function () {
 			await provider.releaseInputPledges([asOutpoint(key)]);
 			expect(unfrozenLog).to.deep.equal([key]);
 			expect(frozen.has(key)).to.equal(false);
+		});
+
+		it('a refused release keeps the pledge so a retry can lift it (issue #626)', async function () {
+			const { wallet, frozen, unfrozenLog } = makeWallet([100_000, 100_000]);
+			const provider = new WalletFundingProvider(wallet as never);
+			const { inputs } = await provider.selectSpliceInputs!(150_000n, 1000);
+			const pledgedOps = outpoints(inputs).map(asOutpoint);
+			expect(pledgedOps.length).to.equal(2);
+
+			const realUnfreeze = wallet.unfreezeUtxo;
+			(wallet as { unfreezeUtxo: unknown }).unfreezeUtxo = async () =>
+				errResult('storage is down');
+			await provider.releaseInputPledges(pledgedOps);
+
+			// Nothing was released, so nothing may be forgotten: only this map
+			// knows the freezes still holding the coins are ours to lift.
+			const pledged = (provider as unknown as { pledged: Map<string, number> })
+				.pledged;
+			expect(pledged.size).to.equal(2);
+			expect(frozen.size).to.equal(2);
+			expect(unfrozenLog).to.deep.equal([]);
+
+			// Storage recovers and the next prune finishes the release without a
+			// second call from the caller.
+			(wallet as { unfreezeUtxo: unknown }).unfreezeUtxo = realUnfreeze;
+			await provider.selectSpliceInputs!(80_000n, 1000);
+			expect(unfrozenLog.sort()).to.deep.equal(
+				pledgedOps.map((o) => `${o.txid}:${o.vout}`).sort()
+			);
+		});
+
+		it('a refused prune unfreeze retries on the next prune (issue #626)', async function () {
+			const { wallet, utxos, frozen, payment } = makeWallet([
+				100_000, 100_000, 100_000
+			]);
+			const key = `${utxos[0].tx_hash}:0`;
+			const spend = new bitcoin.Transaction();
+			spend.version = 2;
+			spend.addInput(
+				Buffer.from(utxos[0].tx_hash, 'hex').reverse(),
+				utxos[0].tx_pos
+			);
+			spend.addOutput(payment.output!, 90_000);
+			wallet.send = async () => ok(spend.toHex());
+
+			const provider = new WalletFundingProvider(wallet as never);
+			await provider.buildFundingTransaction(payment.address!, 90_000n);
+			expect(frozen.has(key)).to.equal(true);
+
+			// The funding confirmed, so the pledge is due to be pruned, but the
+			// wallet refuses the write that would lift it.
+			utxos.splice(0, 1);
+			const realUnfreeze = wallet.unfreezeUtxo;
+			(wallet as { unfreezeUtxo: unknown }).unfreezeUtxo = async () =>
+				errResult('storage is down');
+			await provider.selectSpliceInputs!(50_000n, 1000);
+			const pledged = (provider as unknown as { pledged: Map<string, number> })
+				.pledged;
+			expect(frozen.has(key), 'the coin is still frozen').to.equal(true);
+			expect(pledged.has(key), 'kept for the retry').to.equal(true);
+
+			(wallet as { unfreezeUtxo: unknown }).unfreezeUtxo = realUnfreeze;
+			await provider.selectSpliceInputs!(50_000n, 1000);
+			expect(frozen.has(key)).to.equal(false);
+			expect(pledged.has(key)).to.equal(false);
 		});
 	});
 });

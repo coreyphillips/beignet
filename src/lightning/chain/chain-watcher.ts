@@ -139,6 +139,10 @@ interface IWatchedFunding {
 	 * it exists only if both of them signed one, which nobody who merely
 	 * copied the script can arrange. A decoy therefore stays provisional
 	 * forever while the search continues past it (issue #463).
+	 *
+	 * Written only by checkFundingConfirmation, under the ticket check below.
+	 * The set answers the same question absence does, and a scan that computed
+	 * it before a newer one recorded absence must not put it back (issue #624).
 	 */
 	provisional?: Array<{ txid: string; outputIndex: number; height: number }>;
 	/**
@@ -1489,12 +1493,35 @@ export class ChainWatcher extends EventEmitter {
 			const discovery = await this.discoverRestoredFunding(
 				watched,
 				history,
-				generation
+				superseded
 			);
 			if (superseded()) return;
+			// A scan that could not read the whole history and found nothing has
+			// concluded nothing: its empty candidate set may be no more than the
+			// entries it failed to fetch. Recording that would wipe the set an
+			// older but COMPLETE scan is about to report, and claiming the ticket
+			// would silence that scan for good, leaving live funding marked
+			// absent. Candidates it did find still count, because an unreadable
+			// entry can only add to the set.
+			if (
+				!discovery.complete &&
+				!discovery.bound &&
+				!discovery.provisional?.length
+			) {
+				return;
+			}
+			// The candidate set is a verdict about the same question absence and
+			// presence answer, so it is applied HERE, under the scan-order check,
+			// and never inside the scan that computed it. Discovery reads the
+			// whole history a transaction at a time, which is the longest stall in
+			// this method: a scan overtaken in there would otherwise restore
+			// candidates the newer scan already found gone, and a stale 'present'
+			// lifts a missing-funding quarantine and stops BOLT 2's forget clock
+			// (issue #624).
+			watched.appliedScanTicket = ticket;
+			watched.provisional = discovery.provisional;
 			if (discovery.bound) {
 				const bound = discovery.bound;
-				watched.appliedScanTicket = ticket;
 				watched.txid = bound.txid;
 				watched.outputIndex = bound.outputIndex;
 				watched.candidates = undefined;
@@ -1506,6 +1533,8 @@ export class ChainWatcher extends EventEmitter {
 				// Part of the history could not be read, so this scan does not
 				// know whether the funding is there. Absence is a verdict and
 				// this is not one: leave the debounce untouched and ask again.
+				// It reached here holding candidates, so the ticket above stands:
+				// that set is the newest answer anything has to that question.
 				return;
 			} else if (watched.provisional?.length) {
 				// Unproven but real enough to stop the clock: something is
@@ -1513,7 +1542,6 @@ export class ChainWatcher extends EventEmitter {
 				// its funding value. It is NOT reported as a confirmation and
 				// the watched outpoint does not move, because the evidence
 				// that it is ours has not arrived yet.
-				watched.appliedScanTicket = ticket;
 				this.clearMissingReport(watched);
 				return;
 			}
@@ -1596,17 +1624,29 @@ export class ChainWatcher extends EventEmitter {
 	 * incomplete scan must never be reported as absence: a backend that fails
 	 * selectively would otherwise run BOLT 2's forget clock against a funding
 	 * that is sitting on chain.
+	 *
+	 * Reports the candidate set rather than writing it to the watch (issue
+	 * #624). Every transaction in the history is an await this scan can be
+	 * overtaken in, and the caller is where the scan-order check lives, so the
+	 * result is applied there or not at all. `superseded` is that same check,
+	 * so a scan already answered for stops fetching instead of reading out a
+	 * history nothing will use.
 	 */
 	private async discoverRestoredFunding(
 		watched: IWatchedFunding,
 		history: Array<{ txid: string; height: number }>,
-		generation: number
+		superseded: () => boolean
 	): Promise<{
 		bound: { txid: string; outputIndex: number } | null;
 		complete: boolean;
+		provisional:
+			| Array<{ txid: string; outputIndex: number; height: number }>
+			| undefined;
 	}> {
 		const lineage = watched.discoverAttemptInputs ?? [];
-		if (lineage.length === 0) return { bound: null, complete: true };
+		if (lineage.length === 0) {
+			return { bound: null, complete: true, provisional: undefined };
+		}
 		const scan = (watched.discoveryScan ??= new Map());
 		let complete = true;
 		for (const entry of history) {
@@ -1614,8 +1654,8 @@ export class ChainWatcher extends EventEmitter {
 			let tx: import('bitcoinjs-lib').Transaction;
 			try {
 				const raw = await this.backend.getTransaction(entry.txid);
-				if (!this.isCurrentGeneration(generation)) {
-					return { bound: null, complete: false };
+				if (superseded()) {
+					return { bound: null, complete: false, provisional: undefined };
 				}
 				tx = bitcoin.Transaction.fromBuffer(raw);
 			} catch {
@@ -1651,8 +1691,10 @@ export class ChainWatcher extends EventEmitter {
 				height: h.height
 			}))
 			.sort((a, b) => a.height - b.height);
-		watched.provisional = provisional.length ? provisional : undefined;
-		if (provisional.length === 0) return { bound: null, complete };
+		const found = provisional.length ? provisional : undefined;
+		if (provisional.length === 0) {
+			return { bound: null, complete, provisional: found };
+		}
 
 		// Phase two: one of them spent, by anyone, at any depth.
 		const spent = new Set<string>();
@@ -1663,10 +1705,11 @@ export class ChainWatcher extends EventEmitter {
 			if (!spent.has(`${candidate.txid}:${candidate.outputIndex}`)) continue;
 			return {
 				bound: { txid: candidate.txid, outputIndex: candidate.outputIndex },
-				complete
+				complete,
+				provisional: found
 			};
 		}
-		return { bound: null, complete };
+		return { bound: null, complete, provisional: found };
 	}
 
 	/**

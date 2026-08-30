@@ -98,6 +98,17 @@ import {
 	deriveRecoveryMasterKey
 } from '../lightning/recovery';
 import { getPublicKey } from '../lightning/crypto/ecdh';
+import {
+	DF_HARD_MIN_OFFER_AMOUNT_SAT,
+	DF_POST_WITNESS_STATES,
+	DirectFundingError,
+	DirectFundingPaymentStore,
+	DirectFundingSender,
+	IDfPaymentRecord,
+	IDfSendResult,
+	chainHashForNetwork
+} from '../lightning/direct-funding';
+import { directFundingWallet } from './direct-funding';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
 import {
 	INodeConfig,
@@ -180,7 +191,8 @@ import {
 	RebalanceResult,
 	RebalanceExecutionSummary,
 	TOnchainQuote,
-	TChannelFundingQuote
+	TChannelFundingQuote,
+	DirectFundingConfigInfo
 } from './types';
 
 export type LogLevel = TLogLevel;
@@ -284,6 +296,18 @@ export interface BeignetNodeOptions {
 		maxFeePpm?: number;
 	};
 	/**
+	 * Relay direct-funding frames for OTHER nodes (BEIGNET_DF_RELAY, issue
+	 * #613). Off by default: forwarding opaque frames between strangers is work
+	 * done for other people, metered but not free. The three lanes this node
+	 * uses for its own payments and receives are always available.
+	 */
+	dfRelay?: boolean;
+	/**
+	 * Smallest direct-funding offer this node will serve (BEIGNET_DF_MIN_AMOUNT).
+	 * Values under the 5000 sat protocol floor, zero included, clamp up to it.
+	 */
+	dfMinAmountSat?: number;
+	/**
 	 * Request a gossip graph sync from each peer on connect (default true).
 	 * Without this the node only knows its own channels and cannot route
 	 * multi-hop payments to destinations beyond its direct peers.
@@ -333,8 +357,9 @@ export interface BeignetNodeOptions {
 	/**
 	 * COMBINED daily spending limit in satoshis, shared by Lightning payments
 	 * (payInvoice/sendKeysend/sendPaymentAsync) AND external on-chain sends
-	 * (sendOnchain and sendMaxOnchain, counted as amount + fee). Excluded by
-	 * design: consolidateUtxos (self-pay), channel opens/splices/funding, and
+	 * (sendOnchain and sendMaxOnchain, address-targeted spliceOut and
+	 * sendDirectFunding, counted as amount + fee). Excluded by design:
+	 * consolidateUtxos (self-pay), our own channel opens/splices/funding, and
 	 * bumpFeeOnchain/boostOnchain (fee-only). Resets at midnight UTC.
 	 * NOTE: before v0.3.0 this limit covered Lightning only.
 	 */
@@ -884,6 +909,13 @@ export const ASYNC_SPEND_CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
 export const MAX_ASYNC_SPEND_CLAIMS = 4096;
 
 /**
+ * Direct-funding offers remembered as charged to the daily budget. Only a
+ * retry of a payment this process already made ever reads one, so the oldest
+ * entries are the safe ones to drop.
+ */
+const MAX_DIRECT_FUNDING_CHARGES = 1024;
+
+/**
  * Default ceiling on an L402 response body. The body is buffered and then
  * re-serialized into the daemon's JSON envelope, so a remote server's response
  * size is a memory cost here, not just a transfer one.
@@ -944,6 +976,21 @@ function requireNonNegativeSafeInteger(value: unknown, field: string): number {
 		);
 	}
 	return value;
+}
+
+/**
+ * Raise a direct-funding minimum to the protocol floor.
+ *
+ * Below 5000 sat the payer's own share of the transaction fee starts to
+ * dominate the payment and a channel is the wrong instrument for it, so the
+ * receiver engine enforces the floor whatever it is configured with. Applied at
+ * the CLI boundary as well, because the dashboard compares the value it reads
+ * back against the one it asked for and would otherwise show a minimum this
+ * node does not have.
+ */
+export function clampDirectFundingMinimum(value: number): number {
+	const floor = Number(DF_HARD_MIN_OFFER_AMOUNT_SAT);
+	return value > floor ? value : floor;
 }
 
 /**
@@ -1236,6 +1283,10 @@ export class BeignetNode extends EventEmitter {
 	private _lastRestoreEvent?: { type: string; detail: string };
 	/** init opts, kept so a restore can run the deferred node construction. */
 	private _deferredOpts?: BeignetNodeOptions;
+	/** The direct-funding payer, built over the node's own lane registry. */
+	private directFundingSender?: DirectFundingSender;
+	/** Offers already charged to the daily budget, so a replay is not. */
+	private readonly _directFundingCharged = new Set<string>();
 	/** Backoff timer for the startup gate confirmation loop. */
 	private _confirmTimer?: ReturnType<typeof setTimeout>;
 	private _leaseCheckTimer?: ReturnType<typeof setInterval>;
@@ -1893,6 +1944,17 @@ export class BeignetNode extends EventEmitter {
 								: {})
 					  }
 					: undefined,
+			// Third-party direct funding (#613). Always constructed on the daemon:
+			// the lanes have to be listening before an offer for a request minted
+			// in a previous run arrives, and nothing is served until an operator
+			// names a liquidity peer through POST /direct-funding/configure.
+			directFunding: {
+				relayServer: opts.dfRelay === true,
+				policy:
+					opts.dfMinAmountSat !== undefined
+						? { minAmountSat: clampDirectFundingMinimum(opts.dfMinAmountSat) }
+						: {}
+			},
 			eagerGossipVerify: opts.eagerGossipVerify ?? false,
 			localFeatures: LightningNode.defaultFeatures(),
 			chainHashes: [chainHash],
@@ -2363,6 +2425,12 @@ export class BeignetNode extends EventEmitter {
 				void rgs.then(release);
 			}
 		}
+
+		// 12b. Direct funding: attach the lanes to the receiver and build the
+		// payer over the same registry. Both halves need the node up, and the
+		// receiver has to be listening before an offer arrives for a request
+		// minted before the last restart.
+		await this.startDirectFunding();
 
 		// 13. Recover any funds stranded at the funding-key fallback address from
 		// past force-close sweeps (sessions where no wallet address was available).
@@ -5475,6 +5543,312 @@ export class BeignetNode extends EventEmitter {
 		return info;
 	}
 
+	// ───────── Third-party direct funding (issue #613) ─────────
+
+	/**
+	 * Build the payer over the node's own lane registry and start serving as a
+	 * receiver. Both halves share one registry, which is what lets a node pay
+	 * and be paid over the same connection.
+	 */
+	private async startDirectFunding(): Promise<void> {
+		const registry = this.node.getDirectFundingRegistry();
+		if (!registry) return;
+		const payments = new DirectFundingPaymentStore({
+			storage: {
+				saveWalletData: (key, value): void =>
+					this.getStorage().saveWalletData(key, value),
+				loadWalletData: (key): string | null =>
+					this.getStorage().loadWalletData(key)
+			}
+		});
+		payments.restore();
+		this.directFundingSender = new DirectFundingSender({
+			wallet: directFundingWallet(
+				this.wallet,
+				this.getBitcoinNetwork() as import('bitcoinjs-lib').Network
+			),
+			registry,
+			payments,
+			chainHash: (): Buffer =>
+				chainHashForNetwork(this.toLnNetwork(this.networkName)),
+			log: (action, data): void => this.log('info', action, data)
+		});
+		this.directFundingSender.start();
+		await this.node.startDirectFunding();
+	}
+
+	/**
+	 * Merge an operator policy update in and return the whole effective config.
+	 *
+	 * A MERGE, never a replace: the LFBW dashboard posts `{minAmountSat}` alone
+	 * and then requires `lspPubkey` to still be present in the readback, and the
+	 * app's manager posts the other five without `minAmountSat`.
+	 */
+	configureDirectFunding(update: {
+		lspPubkey?: string;
+		lspHost?: string;
+		lspPort?: number;
+		targetInboundSat?: number;
+		trusted?: boolean;
+		minAmountSat?: number;
+	}): DirectFundingConfigInfo {
+		if (
+			update.lspPubkey !== undefined &&
+			!/^0[23][0-9a-fA-F]{64}$/.test(update.lspPubkey)
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
+			);
+		}
+		if (update.lspPort !== undefined) {
+			if (
+				!Number.isInteger(update.lspPort) ||
+				update.lspPort < 1 ||
+				update.lspPort > 65535
+			) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					'lspPort must be a TCP port between 1 and 65535'
+				);
+			}
+		}
+		if (update.lspHost !== undefined && update.lspHost.length === 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'lspHost must not be empty'
+			);
+		}
+		this.node.setDirectFundingPolicy({
+			...(update.lspPubkey !== undefined
+				? { liquidityPeer: update.lspPubkey }
+				: {}),
+			...(update.lspHost !== undefined
+				? { liquidityHost: update.lspHost }
+				: {}),
+			...(update.lspPort !== undefined
+				? { liquidityPort: update.lspPort }
+				: {}),
+			...(update.trusted !== undefined
+				? { allowZeroConf: update.trusted }
+				: {}),
+			...(update.targetInboundSat !== undefined
+				? {
+						targetInboundSat: requireNonNegativeSafeInteger(
+							update.targetInboundSat,
+							'targetInboundSat'
+						)
+				  }
+				: {}),
+			...(update.minAmountSat !== undefined
+				? {
+						// Clamped here rather than at the engine, because the dashboard
+						// compares the value it reads back against the one it asked for.
+						minAmountSat: clampDirectFundingMinimum(
+							requireNonNegativeSafeInteger(update.minAmountSat, 'minAmountSat')
+						)
+				  }
+				: {})
+		});
+		return this.getDirectFundingConfig();
+	}
+
+	/** The effective direct-funding policy, in the shape the app reads. */
+	getDirectFundingConfig(): DirectFundingConfigInfo {
+		const policy = this.node.getDirectFundingPolicy() ?? {};
+		return {
+			lspPubkey: policy.liquidityPeer ?? null,
+			lspHost: policy.liquidityHost ?? null,
+			lspPort: policy.liquidityPort ?? null,
+			targetInboundSat: policy.targetInboundSat ?? 0,
+			trusted: policy.allowZeroConf === true,
+			minAmountSat: clampDirectFundingMinimum(policy.minAmountSat ?? 0)
+		};
+	}
+
+	/**
+	 * Mint a payment request: a receipt hash whose preimage stays here, and the
+	 * base64url envelope a payer pays.
+	 *
+	 * `host` and `port` are the caller's and are passed through untouched. The
+	 * dashboard sends the browser's own hostname and the app's manager sends
+	 * PUBLIC_HOST, both with this wallet's listen port, and this node has no way
+	 * to know which is right.
+	 */
+	createDirectFundingRequest(opts: {
+		host?: string;
+		port?: number;
+		amountSats?: number;
+	}): { paymentHash: string; expiresAt: number; request: string } {
+		if (opts.port !== undefined) {
+			if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					'port must be a TCP port between 1 and 65535'
+				);
+			}
+		}
+		const amountSats =
+			opts.amountSats !== undefined && opts.amountSats !== 0
+				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
+				: undefined;
+		try {
+			const minted = this.node.mintDirectFundingRequest({
+				...(opts.host !== undefined ? { host: opts.host } : {}),
+				...(opts.port !== undefined ? { port: opts.port } : {}),
+				...(amountSats !== undefined ? { amountSat: BigInt(amountSats) } : {})
+			});
+			return {
+				paymentHash: minted.record.receiptHash,
+				expiresAt: minted.expiresAt,
+				request: minted.request
+			};
+		} catch (err) {
+			// A mint that fails degrades to a plain BIP 21 URI in the app, silently,
+			// so the log line is the only place the operator can see it happened.
+			this.log('warn', 'direct funding request mint failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+			throw this.directFundingFailure(err);
+		}
+	}
+
+	/**
+	 * Pay a direct-funding request out of one of our coins.
+	 *
+	 * Rejects only BEFORE our witness leaves the device. After that it resolves
+	 * with whatever is known, because the caller's fallback on a throw is a
+	 * second on-chain payment of the same amount, and a late rejection would
+	 * make that a double spend of the user's money rather than a recovery. Both
+	 * refusals below are pre-witness by construction: they run before the engine
+	 * is entered at all, and only for a request that has no attempt yet, since a
+	 * duplicate's witness may already be out.
+	 */
+	async sendDirectFunding(opts: {
+		request?: string;
+		amountSats?: number;
+		maxTotalFeeSat?: number;
+		/** Documented alias for maxTotalFeeSat: what the LFBW app posts today. */
+		feeHeadroomSats?: number;
+	}): Promise<IDfSendResult> {
+		const sender = this.directFundingSender;
+		if (!sender) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'direct funding is not available on this node'
+			);
+		}
+		if (!opts.request || typeof opts.request !== 'string') {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'request (the payment request from the BIP 21 URI) is required'
+			);
+		}
+		const ceiling = opts.maxTotalFeeSat ?? opts.feeHeadroomSats;
+		const sendOpts = {
+			...(opts.amountSats !== undefined && opts.amountSats !== 0
+				? {
+						amountSat: BigInt(
+							requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
+						)
+				  }
+				: {}),
+			...(ceiling !== undefined
+				? {
+						maxTotalFeeSat: BigInt(
+							requireNonNegativeSafeInteger(ceiling, 'maxTotalFeeSat')
+						)
+				  }
+				: {})
+		};
+		// A request this device has already attempted spends nothing new: the send
+		// joins the run that is already going or replays what that run recorded.
+		// The gates below must not see it. Both of them can refuse, a refusal is a
+		// throw, and rev 2's caller answers a throw by paying the same money again
+		// over a plain address, so applying them to a duplicate would turn the
+		// idempotency the engine provides back into a double payment. The
+		// concrete case is a concurrent duplicate: the first call's reservation
+		// alone can put the second over the daily limit.
+		const replay = sender.isReplay(opts.request);
+		let costSats = 0;
+		let reserving = false;
+		if (!replay) {
+			// A draining node takes no new payment, and this one holds a socket open
+			// for a whole offer-to-receipt exchange: admitting it would let /stop
+			// tear down storage and networking around a witness that had already
+			// left.
+			this._checkDraining();
+			// This pays a STRANGER's channel out of our own coin, so it is an
+			// external spend like an address-targeted splice-out, not the internal
+			// funding the limit excludes. Quoted rather than read off the request
+			// body: the envelope may fix the amount and the app then posts none. The
+			// ceiling is what is charged, since the exact fee is only known once the
+			// receiver has built the transaction, and over-charging a fee allowance
+			// errs the safe way.
+			try {
+				const quote = sender.quote(opts.request, sendOpts);
+				costSats = Number(quote.amountSat + quote.maxTotalFeeSat);
+				this._checkSpendLimit(costSats);
+			} catch (err) {
+				throw this.directFundingFailure(err);
+			}
+			reserving = this._dailySpendLimitSats !== undefined;
+			// Reserved for the length of the exchange, so two sends cannot both pass
+			// the check before either has recorded anything.
+			if (reserving) this._pendingSpendSats += costSats;
+		}
+		try {
+			const result = await sender.send(opts.request, sendOpts);
+			// Only a witness that actually left is money spent, and only once: a
+			// retried send replays its recorded attempt rather than paying again,
+			// and the call that opened the attempt is the one that charges for it.
+			if (
+				!replay &&
+				DF_POST_WITNESS_STATES.has(result.status) &&
+				!this._directFundingCharged.has(result.offerId)
+			) {
+				this._chargeDirectFunding(result.offerId, costSats);
+			}
+			return result;
+		} catch (err) {
+			throw this.directFundingFailure(err);
+		} finally {
+			if (reserving) this._pendingSpendSats -= costSats;
+		}
+	}
+
+	/**
+	 * Charge one direct-funding payment to the daily budget, once. The offer id
+	 * is stable for a request, so a replay of the same payment is recognised;
+	 * the set is bounded because it is only ever read for a live send.
+	 */
+	private _chargeDirectFunding(offerId: string, costSats: number): void {
+		if (this._directFundingCharged.size >= MAX_DIRECT_FUNDING_CHARGES) {
+			const oldest = this._directFundingCharged.values().next().value;
+			if (oldest !== undefined) this._directFundingCharged.delete(oldest);
+		}
+		this._directFundingCharged.add(offerId);
+		this._recordSpend(costSats, 'onchain');
+	}
+
+	/** Every direct-funding payment this device has a record of. */
+	listDirectFundingPayments(): IDfPaymentRecord[] {
+		return this.directFundingSender?.payments() ?? [];
+	}
+
+	/**
+	 * Map a coded protocol refusal onto the daemon's error vocabulary. The codes
+	 * are carried through verbatim: they are what tells the app a refusal to
+	 * fund apart from a transport failure, and only one of those is worth
+	 * falling back on.
+	 */
+	private directFundingFailure(err: unknown): Error {
+		if (err instanceof DirectFundingError) {
+			return new BeignetError(err.code, err.message);
+		}
+		return err instanceof Error ? err : new Error(String(err));
+	}
+
 	/**
 	 * Create a hold invoice for a caller-supplied payment hash. The preimage
 	 * stays with the caller: an incoming HTLC parks (payer sees the payment as
@@ -5936,6 +6310,10 @@ export class BeignetNode extends EventEmitter {
 		// A restore-pending daemon has no node and therefore no payments; the
 		// stop route's drain poll must not crash on it.
 		if (this._restorePending) return false;
+		// A direct-funding exchange holds an HTTP request open across a witness
+		// that may already be broadcast. Shutting down under one loses the only
+		// response the caller has, and it falls back to a second payment.
+		if ((this.directFundingSender?.inFlight() ?? 0) > 0) return true;
 		const payments = this.node.listPayments();
 		return payments.some((p) => p.status === 'PENDING');
 	}
@@ -9185,6 +9563,7 @@ export class BeignetNode extends EventEmitter {
 			this._fallbackRecoveryTimer = undefined;
 		}
 		this.paymentQueue?.removeAllListeners();
+		this.directFundingSender?.stop();
 		if (this._confirmTimer) {
 			clearTimeout(this._confirmTimer);
 			this._confirmTimer = undefined;
@@ -9229,6 +9608,7 @@ export class BeignetNode extends EventEmitter {
 		}
 		this.stopRecoveryLeaseCheck();
 		this.paymentQueue?.removeAllListeners();
+		this.directFundingSender?.stop();
 		// A restore-pending daemon never built the node or the wallet; the
 		// definite-assignment assertions on the fields do not change that.
 		(this.node as LightningNode | undefined)?.destroy();

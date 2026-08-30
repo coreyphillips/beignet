@@ -387,7 +387,28 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			cliFlags.leaseRates ??
 			leaseRatesEnv(process.env.BEIGNET_LEASE_RATES) ??
 			file.leaseRates,
-		jitReceive: cliFlags.jitReceive ?? jitReceiveEnv() ?? file.jitReceive
+		jitReceive: cliFlags.jitReceive ?? jitReceiveEnv() ?? file.jitReceive,
+		// Same exact-string rule as the JIT trio, and the same reasoning: the
+		// safe direction for this switch is OFF, because it decides whether this
+		// node forwards frames on behalf of strangers. `=== 'true'` alone would
+		// make BEIGNET_DF_RELAY=1 read as an explicit false, which is the right
+		// answer by accident rather than by rule, and it would also mask a typo
+		// in the config file it is supposed to defer to.
+		dfRelay:
+			cliFlags.dfRelay ??
+			(process.env.BEIGNET_DF_RELAY === 'true'
+				? true
+				: process.env.BEIGNET_DF_RELAY === 'false'
+				? false
+				: undefined) ??
+			file.dfRelay,
+		// integerEnv, so '10m' or '0.5' surfaces as NaN and refuses startup
+		// naming the variable rather than silently becoming 10 or 0. ?? rather
+		// than ||, so a configured 0 survives the merge and clamps to the floor.
+		dfMinAmountSat:
+			cliFlags.dfMinAmountSat ??
+			integerEnv(process.env.BEIGNET_DF_MIN_AMOUNT) ??
+			file.dfMinAmountSat
 	};
 }
 

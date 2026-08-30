@@ -646,6 +646,25 @@ export interface IForceClosePlanReady {
 export type ForceClosePlan = IForceClosePlanRefused | IForceClosePlanReady;
 
 /**
+ * What the chain says about this channel, for the refusals a Channel cannot
+ * decide on its own. The Channel holds no monitor, so the caller that does
+ * supplies the facts; omitting them keeps the pre-existing behaviour.
+ */
+export interface IForceCloseChainFacts {
+	/**
+	 * Whether a spend of the funding outpoint is recorded CONFIRMED (not merely
+	 * seen in the mempool).
+	 */
+	fundingSpendConfirmed?: boolean;
+	/**
+	 * Whether that record's confirmation is merely UNPROVED this session: a
+	 * restored monitor drops the persisted height until its re-armed watch
+	 * reports, so the answer is unknown rather than no.
+	 */
+	fundingSpendReverifyPending?: boolean;
+}
+
+/**
  * A wallet-owned input contributed to a splice-in. The wallet provides the full
  * previous transaction (so the peer can build the identical tx) and a closure
  * that signs this input on the assembled splice transaction, returning its
@@ -1129,6 +1148,29 @@ export class Channel {
 
 	getTemporaryChannelId(): Buffer {
 		return this._state.temporaryChannelId;
+	}
+
+	/**
+	 * The id this channel currently answers to: the permanent one once
+	 * accept_channel2 has assigned it, the temporary one before that. A caller
+	 * driving an open on someone else's behalf (direct funding, issue #613) has
+	 * to name whichever is current, and cannot capture either one at open time.
+	 */
+	getCurrentChannelId(): Buffer {
+		return this._state.channelId ?? this._state.temporaryChannelId;
+	}
+
+	/**
+	 * The two funding keys of the 2-of-2, once both sides are known. What the
+	 * direct-funding attestation binds a payer's coin to: the payer rebuilds the
+	 * funding script from these and refuses if the transaction's output is not
+	 * it. Null before accept_channel2 has delivered the peer's key.
+	 */
+	getFundingPubkeys(): { local: Buffer; remote: Buffer } | null {
+		const local = this._state.localBasepoints?.fundingPubkey;
+		const remote = this._state.remoteBasepoints?.fundingPubkey;
+		if (!local || !remote) return null;
+		return { local, remote };
 	}
 
 	getRole(): ChannelRole {
@@ -5606,8 +5648,8 @@ export class Channel {
 	 * so it has to happen after the plan is known to be possible and before
 	 * the live channel moves, which is the whole reason the two halves exist.
 	 */
-	forceClose(signer: ISigner): ChannelAction[] {
-		const plan = this.prepareForceClose(signer);
+	forceClose(signer: ISigner, chain?: IForceCloseChainFacts): ChannelAction[] {
+		const plan = this.prepareForceClose(signer, chain);
 		if (!plan.ok) {
 			return [{ type: ChannelActionType.ERROR, message: plan.error }];
 		}
@@ -5622,6 +5664,10 @@ export class Channel {
 	 * our latest commitment is the only spend of it that can confirm. Judged
 	 * from the recorded tx itself, not from how the close was negotiated, so a
 	 * victim row persisted before the bound existed qualifies too.
+	 *
+	 * Says only that the recorded tx cannot be relayed, which for the fee arm
+	 * does not mean it is off chain: prepareForceClose asks the caller whether
+	 * the funding spend already confirmed (issue #622).
 	 */
 	private closedWithUnbroadcastableCoopClose(): boolean {
 		if (this._state.state !== ChannelState.CLOSED) return false;
@@ -5675,8 +5721,14 @@ export class Channel {
 	 * So every refusal is decided here, against a CANDIDATE view, and the
 	 * commitment is built against that same view. Once this returns ok the
 	 * caller may burn its irreversible bridges before applying.
+	 *
+	 * `chain` carries the refusals this view cannot see for itself, currently
+	 * whether the funding spend already confirmed.
 	 */
-	prepareForceClose(signer: ISigner): ForceClosePlan {
+	prepareForceClose(
+		signer: ISigner,
+		chain?: IForceCloseChainFacts
+	): ForceClosePlan {
 		// The recovery never-broadcast invariant (5.6): proven stale
 		// (dataLossDetected) or unprovable (stateUncertain), our latest local
 		// commitment may be revoked in the peer's view - broadcasting it hands
@@ -5690,6 +5742,33 @@ export class Channel {
 				error: this._state.dataLossDetected
 					? 'Refusing to broadcast stale commitment after data loss'
 					: 'Refusing to broadcast: restored state is not proven current'
+			};
+		}
+
+		// The CLOSED rescue below reads the recorded mutual close alone, and a
+		// sub-relay-fee close is the one shape it calls a dead end that a miner
+		// can still have included out of band (issue #622). Once that spend is
+		// confirmed the rescue has nothing to rescue: our commitment spends an
+		// output already spent, so it can never confirm, while admitting the
+		// plan relabels a settled channel FORCE_CLOSED and costs the caller the
+		// monitor that holds the confirmed close.
+		//
+		// An unproved confirmation refuses on the same terms. The damage is
+		// irreversible and the ignorance is not: a restart drops the recorded
+		// height until the re-armed watch reports, so a rescue admitted in that
+		// window destroys a settled channel's record over a question that
+		// answers itself moments later.
+		if (
+			(chain?.fundingSpendConfirmed === true ||
+				chain?.fundingSpendReverifyPending === true) &&
+			this.closedWithUnbroadcastableCoopClose()
+		) {
+			return {
+				ok: false,
+				error:
+					chain.fundingSpendConfirmed === true
+						? 'Cannot force close: the recorded mutual close is already confirmed on chain'
+						: 'Cannot force close: the recorded mutual close may already be confirmed on chain; retry once the funding watch has re-checked it'
 			};
 		}
 

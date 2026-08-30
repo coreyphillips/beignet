@@ -172,6 +172,23 @@ import {
 	jitOpeningFeeMsat
 } from '../liquidity/jit-receive';
 import {
+	DF_DEFAULT_REQUEST_TTL_MS,
+	DfTransportType,
+	DirectFundingReceiver,
+	DirectFundingRequestStore,
+	DfRelayForwarder,
+	DfTransportRegistry,
+	IDfRequestRecord,
+	IDfOnionTransport,
+	DfTransportDescriptor,
+	chainHashForNetwork as dfChainHashForNetwork,
+	createDirectFundingTransports,
+	encodeRequestEnvelope,
+	mintDfBlindedPath,
+	mintRequestEnvelope,
+	requestEncryptionPublicKey
+} from '../direct-funding';
+import {
 	INodeConfig,
 	IResourceConfig,
 	IPaymentInfo,
@@ -215,7 +232,9 @@ import {
 	IAutoTuneFeesConfig,
 	IRebalanceResult,
 	IRebalanceAttempt,
-	IRebalanceExecutionSummary
+	IRebalanceExecutionSummary,
+	IDirectFundingNodeConfig,
+	IDirectFundingPolicy
 } from './types';
 import {
 	canSelectDualFundingInputs,
@@ -501,6 +520,13 @@ export const JIT_CLIENT_MAX_FLAT_FEE_SAT = 10_000n;
 export const JIT_CLIENT_MAX_FEE_PPM = 50_000;
 
 /**
+ * Wallet-data key holding the direct-funding operator policy (issue #613). The
+ * colon segments can never collide with on-chain wallet keys, which always end
+ * in an IWalletData field name.
+ */
+export const DF_POLICY_STORAGE_KEY = 'df:policy';
+
+/**
  * A signed funding transaction and whether BOLT 2 yet obliges us to put it on
  * the network.
  *
@@ -547,7 +573,22 @@ export class LightningNode extends EventEmitter {
 	// For forwarded HTLCs: maps "outChannelId:outHtlcId" → { inChannelId, inHtlcId }
 	private forwardedHtlcs: Map<
 		string,
-		{ inChannelId: Buffer; inHtlcId: bigint }
+		{
+			inChannelId: Buffer;
+			inHtlcId: bigint;
+			/**
+			 * The downstream failure bytes held back while the outgoing leg's
+			 * removal round is still provisional (issue #623), replayed by
+			 * settleForwardsOwedUpstream once the leg is terminally failed.
+			 * Memory-only, and deliberately so: it hangs off the linkage row so
+			 * it cannot outlive it, and a restart falls back to the synthesized
+			 * temporary_channel_failure that pass already uses for a downstream
+			 * reason that died with the process.
+			 */
+			failReason?: Buffer;
+			/** Whether `failReason` is a complete failure message already. */
+			failPreWrapped?: boolean;
+		}
 	> = new Map();
 	// Payment secret for receiving: paymentHashHex → paymentSecret
 	private paymentSecrets: Map<string, Buffer> = new Map();
@@ -773,6 +814,16 @@ export class LightningNode extends EventEmitter {
 	/** JIT receive, wallet role: refusal ceilings on an LSP's fee quote. */
 	private readonly jitClientMaxFlatFeeSat: bigint;
 	private readonly jitClientMaxFeePpm: number;
+	/** Third-party direct funding (#613); constructed only when configured. */
+	private directFunding?: {
+		requests: DirectFundingRequestStore;
+		registry: DfTransportRegistry;
+		forwarder: DfRelayForwarder | null;
+		receiver: DirectFundingReceiver;
+		policy: IDirectFundingPolicy;
+		requestTtlMs: number;
+		detach?: () => void;
+	};
 	/**
 	 * Skim already conceded to a JIT LSP, keyed by incoming HTLC. The bound is
 	 * AGGREGATE across a payment's parts, so what each part is allowed to be
@@ -1354,6 +1405,13 @@ export class LightningNode extends EventEmitter {
 
 		if (config.jitReceive?.enabled) {
 			this.wireJitReceive(config.jitReceive);
+		}
+		if (config.directFunding) {
+			// At CONSTRUCTION, like the JIT engine: the lanes have to be subscribed
+			// to 'custom-message' before the first peer message arrives, and a
+			// listener attached later would miss an offer sent to a request this
+			// node minted in a previous run.
+			this.wireDirectFunding(config.directFunding);
 		}
 		this.jitClientMaxFlatFeeSat =
 			config.jitReceiveClient?.maxFlatFeeSat ?? JIT_CLIENT_MAX_FLAT_FEE_SAT;
@@ -2381,6 +2439,12 @@ export class LightningNode extends EventEmitter {
 		// failed upstream. Runs after the channels and their onion shared
 		// secrets are back, since failing a held part needs both.
 		this.jitReceiveManager?.restore();
+
+		// Direct funding: the operator policy and every outstanding request. A
+		// request already in the wild is unpayable without its secrets, so this
+		// runs whether or not the lanes are ever attached.
+		this.restoreDirectFundingPolicy();
+		this.directFunding?.requests.restore();
 
 		// Scan for expiring HTLCs immediately on restore (may have missed blocks while down)
 		if (this.currentBlockHeight > 0) {
@@ -3760,6 +3824,12 @@ export class LightningNode extends EventEmitter {
 				this.emit('htlc:failed', { channelId, htlcId });
 			}
 		);
+
+		// A commitment round completed on this channel: any upstream refund
+		// held back on it as the outgoing leg may now be owed (issue #623).
+		this.channelManager.on('commitment:revoked', (channelId: Buffer) => {
+			this.drainForwardsAwaitingRemoval(channelId);
+		});
 
 		// An offered HTLC the channel dropped on a held restore rather than
 		// replay (issue #469). Nothing on chain resolves it, so whatever is
@@ -8444,6 +8514,7 @@ export class LightningNode extends EventEmitter {
 		// must not keep the process alive.
 		this.recoveryBarrier?.stop();
 		this.jitReceiveManager?.destroy();
+		this.stopDirectFunding();
 		this.stopCleanupTimer();
 		if (this.mppCleanupTimer) {
 			clearInterval(this.mppCleanupTimer);
@@ -17122,10 +17193,9 @@ export class LightningNode extends EventEmitter {
 			}
 			// The fail side of the same debt (issue 297): the outgoing leg
 			// failed durably, but the fail owed upstream never became durable
-			// (killed process, or the inbound peer was disconnected when the
-			// downstream fail arrived). The downstream reason bytes died with
-			// the process, so the refund carries a synthesized
-			// temporary_channel_failure, which refunds the payer identically.
+			// (killed process, the inbound peer was disconnected when the
+			// downstream fail arrived, or the fail was held back until the
+			// downstream removal round finished, issue #623).
 			// The on-chain arm of the predicate is exactly what
 			// handleOnChainOutputResolved acted on; a fail refused there
 			// (inbound quiescing) retries here.
@@ -17135,26 +17205,90 @@ export class LightningNode extends EventEmitter {
 			const secretKey = `${forward.inChannelId.toString('hex')}:${
 				forward.inHtlcId
 			}`;
+			// The downstream's own bytes when they are still held (a deferred
+			// fail, so the payer learns the real reason and its culpable hop);
+			// otherwise they died with the process, and a synthesized
+			// temporary_channel_failure refunds the payer identically.
+			const held = forward.failReason;
 			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
-			const reason = sharedSecret
-				? createFailureMessage(
-						sharedSecret,
-						TEMPORARY_CHANNEL_FAILURE,
-						// TEMPORARY_CHANNEL_FAILURE carries the UPDATE flag, so
-						// BOLT 4 still requires the two-byte channel_update
-						// length even when the update itself is omitted. Empty
-						// data here is malformed, and a strict peer may treat
-						// the whole failure as such.
-						this.updateFlaggedFailureData(TEMPORARY_CHANNEL_FAILURE)
-				  )
-				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			const reason =
+				held ??
+				(sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							TEMPORARY_CHANNEL_FAILURE,
+							// TEMPORARY_CHANNEL_FAILURE carries the UPDATE flag, so
+							// BOLT 4 still requires the two-byte channel_update
+							// length even when the update itself is omitted. Empty
+							// data here is malformed, and a strict peer may treat
+							// the whole failure as such.
+							this.updateFlaggedFailureData(TEMPORARY_CHANNEL_FAILURE)
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH));
 			this.failForwardUpstream(
 				outKey,
 				forward,
 				outChannelId,
 				forward.inHtlcId,
 				reason,
-				true
+				held ? forward.failPreWrapped === true : true
+			);
+		}
+	}
+
+	/**
+	 * A forward's payment hash, read off the INBOUND leg exactly as
+	 * settleForwardsOwedUpstream reads it, so both callers put the same input
+	 * into isOutgoingLegTerminallyFailed. Undefined once the inbound entry is
+	 * gone, which is a forward with nothing left to refund.
+	 */
+	private forwardPaymentHash(forward: {
+		inChannelId: Buffer;
+		inHtlcId: bigint;
+	}): Buffer | undefined {
+		return this.channelManager
+			.getChannel(forward.inChannelId)
+			?.getFullState()
+			.htlcs.get(`received-${forward.inHtlcId}`)?.paymentHash;
+	}
+
+	/**
+	 * A commitment round completed on this channel; release any upstream refund
+	 * held back on it as the OUTGOING leg (issue #623).
+	 *
+	 * The peer's revoke_and_ack is the moment a downstream removal becomes
+	 * irrevocable, and the only event that says so: every other driver of
+	 * settleForwardsOwedUpstream watches the INBOUND channel regaining the
+	 * ability to carry updates, which a held fail is not waiting for. Without
+	 * this the refund would sit until the next block's owed pass.
+	 *
+	 * Deliberately narrower than that pass, which is why it does not just call
+	 * it: only a forward with a HELD reason is considered. The pass judges legs
+	 * it never saw fail, and its "entry gone from a live NORMAL channel" arm is
+	 * not a safe reading mid-reestablish, before the peer has replayed the
+	 * fulfill it owes us. A held reason is this session's own evidence that
+	 * THIS leg failed, so the arm is sound for it, and it is memory-only, so a
+	 * restart's replay window has nothing here to act on at all.
+	 */
+	private drainForwardsAwaitingRemoval(outChannelId: Buffer): void {
+		const prefix = `${outChannelId.toString('hex')}:offered-`;
+		for (const [outKey, forward] of [...this.forwardedHtlcs]) {
+			if (!outKey.startsWith(prefix)) continue;
+			if (forward.failReason === undefined) continue;
+			const entry = this.channelManager
+				.getChannel(forward.inChannelId)
+				?.getFullState()
+				.htlcs.get(`received-${forward.inHtlcId}`);
+			if (!entry || entry.state !== HtlcState.COMMITTED) continue;
+			if (!this.isOutgoingLegTerminallyFailed(outKey, entry.paymentHash))
+				continue;
+			this.failForwardUpstream(
+				outKey,
+				forward,
+				outChannelId,
+				BigInt(outKey.slice(prefix.length)),
+				forward.failReason,
+				forward.failPreWrapped === true
 			);
 		}
 	}
@@ -17482,6 +17616,37 @@ export class LightningNode extends EventEmitter {
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		const forward = this.forwardedHtlcs.get(outKey);
 		if (forward) {
+			// BOLT 2 fund safety (issue #623): the peer's update_fail_htlc is a
+			// removal STARTING, not a leg that failed. Refunding upstream on
+			// arrival is unretractable, while the downstream leg is not: a
+			// disconnect before we revoke rolls it back to COMMITTED
+			// (markForReestablish) and the peer may retransmit a fulfill
+			// instead, and until the peer commits our removal its last signed
+			// commitment still carries the offered output for an HTLC-success.
+			// Either way the late preimage is worthless upstream, because
+			// canFulfillHtlc refuses the FAILED inbound entry: we would pay
+			// downstream and refund upstream for one forward. A payee that
+			// withholds its commitment_signed holds that window open for as
+			// long as it likes, so hold the reason on the linkage instead and
+			// let the removal round decide. Every driver of
+			// settleForwardsOwedUpstream retries it, and a downstream that
+			// never finishes the round is force-closed out by
+			// scanForwardTimeouts at the forward-timeout margin.
+			const inboundHash = this.forwardPaymentHash(forward);
+			if (
+				inboundHash &&
+				!this.isOutgoingLegTerminallyFailed(outKey, inboundHash)
+			) {
+				forward.failReason = reason;
+				forward.failPreWrapped = localFailureReason !== undefined;
+				this.emitStructuredLog('htlc', 'forward_fail_deferred', {
+					inChannelId: forward.inChannelId.toString('hex'),
+					inHtlcId: Number(forward.inHtlcId),
+					outChannelId: channelId.toString('hex'),
+					outHtlcId: Number(htlcId)
+				});
+				return;
+			}
 			this.failForwardUpstream(
 				outKey,
 				forward,
@@ -18252,6 +18417,472 @@ export class LightningNode extends EventEmitter {
 			BEIGNET_CUSTOM_MESSAGE_TYPE,
 			envelope
 		);
+	}
+
+	// ─────────────── Third-party direct funding (issue #613) ───────────────
+
+	/** The lane registry, for a payer built on top of this node. */
+	getDirectFundingRegistry(): DfTransportRegistry | undefined {
+		return this.directFunding?.registry;
+	}
+
+	/** The outstanding-request store (4A), or undefined when not configured. */
+	getDirectFundingRequests(): DirectFundingRequestStore | undefined {
+		return this.directFunding?.requests;
+	}
+
+	/** The receiver engine (4C), or undefined when not configured. */
+	getDirectFundingReceiver(): DirectFundingReceiver | undefined {
+		return this.directFunding?.receiver;
+	}
+
+	/** The operator policy as it stands. */
+	getDirectFundingPolicy(): IDirectFundingPolicy | null {
+		return this.directFunding ? { ...this.directFunding.policy } : null;
+	}
+
+	/**
+	 * Merge a policy update in and persist it.
+	 *
+	 * A MERGE, never a replace: the LFBW dashboard posts `{minAmountSat}` on its
+	 * own and then requires `lspPubkey` to still be present in the readback, and
+	 * the app's manager posts the other five without `minAmountSat`. A field the
+	 * caller did not name keeps its value.
+	 */
+	setDirectFundingPolicy(update: IDirectFundingPolicy): IDirectFundingPolicy {
+		if (!this.directFunding) {
+			throw new Error('direct funding is not configured on this node');
+		}
+		const policy = this.directFunding.policy;
+		for (const [key, value] of Object.entries(update)) {
+			if (value === undefined) continue;
+			(policy as Record<string, unknown>)[key] = value;
+		}
+		this.directFunding.receiver.setConfig({
+			...(policy.minAmountSat !== undefined
+				? { minAmountSat: BigInt(policy.minAmountSat) }
+				: {}),
+			...(policy.maxAmountSat !== undefined
+				? { maxAmountSat: BigInt(policy.maxAmountSat) }
+				: {}),
+			allowZeroConf: policy.allowZeroConf === true,
+			allowSplice: policy.allowSplice === true
+		});
+		this.persistDirectFundingPolicy();
+		return { ...policy };
+	}
+
+	/**
+	 * Mint one payment request and return the envelope a payer pays.
+	 *
+	 * `host` and `port` come from the CALLER and are never second guessed: the
+	 * dashboard passes `window.location.hostname` and the app's manager passes
+	 * PUBLIC_HOST, both with this wallet's listen port, and this node has no way
+	 * to know which is right. With neither, no direct-peer descriptor is emitted
+	 * and the payer reaches us through the liquidity peer.
+	 */
+	mintDirectFundingRequest(opts: {
+		host?: string;
+		port?: number;
+		amountSat?: bigint;
+		ttlMs?: number;
+	}): { record: IDfRequestRecord; request: string; expiresAt: number } {
+		const df = this.directFunding;
+		if (!df) throw new Error('direct funding is not configured on this node');
+		const record = df.requests.mint({
+			ttlMs: opts.ttlMs ?? df.requestTtlMs,
+			...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {})
+		});
+		let envelope: string;
+		try {
+			envelope = encodeRequestEnvelope(
+				mintRequestEnvelope(
+					{
+						requestId: Buffer.from(record.requestId, 'hex'),
+						chainHash: dfChainHashForNetwork(this.network),
+						receiverNodeId: Buffer.from(this.getNodeId(), 'hex'),
+						expiresAt: record.expiresAt,
+						...(opts.amountSat !== undefined
+							? { amountSat: opts.amountSat }
+							: {}),
+						receiptHash: Buffer.from(record.receiptHash, 'hex'),
+						encryptionKey: requestEncryptionPublicKey(record),
+						transports: this.directFundingTransports(record, opts)
+					},
+					(message) => this.signMessage(message)
+				)
+			);
+		} catch (err) {
+			// The record holds secrets for an envelope nobody will ever pay, so it
+			// goes rather than sitting in the store until it expires.
+			df.requests.forget(record.receiptHash);
+			throw err;
+		}
+		return { record, request: envelope, expiresAt: record.expiresAt };
+	}
+
+	/**
+	 * The descriptors one request publishes, in the order a payer should try
+	 * them: the direct peer connection when the caller told us where we are, then
+	 * a blinded path through the liquidity peer.
+	 *
+	 * Only ONE onion descriptor is emitted where the fork emitted an onion and a
+	 * relay: the registry synthesizes the relay fall-back from the onion's
+	 * introduction node, so the second descriptor would duplicate the first byte
+	 * for byte and a request has to survive a scannable QR.
+	 */
+	private directFundingTransports(
+		record: IDfRequestRecord,
+		opts: { host?: string; port?: number }
+	): DfTransportDescriptor[] {
+		const df = this.directFunding;
+		if (!df) return [];
+		const transports: DfTransportDescriptor[] = [];
+		if (opts.host && opts.port) {
+			transports.push({
+				type: DfTransportType.DIRECT_PEER,
+				host: opts.host,
+				port: opts.port
+			});
+		}
+		const { liquidityPeer, liquidityHost, liquidityPort } = df.policy;
+		if (!liquidityPeer || !liquidityHost || !liquidityPort) return transports;
+		try {
+			const path = mintDfBlindedPath(
+				Buffer.from(liquidityPeer, 'hex'),
+				Buffer.from(this.getNodeId(), 'hex'),
+				Buffer.from(record.onionPathSecretHex, 'hex')
+			);
+			const onion: IDfOnionTransport = {
+				type: DfTransportType.ONION_MESSAGE,
+				host: liquidityHost,
+				port: liquidityPort,
+				introNodeId: path.introductionNodeId,
+				pathKey: path.blindingPoint,
+				hops: path.blindedHops
+			};
+			transports.push(onion);
+		} catch (err) {
+			// A path we could not mint is one descriptor short, not a failed
+			// request: the relay descriptor below still reaches us.
+			this.emitStructuredLog('channel', 'df_blinded_path_failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+			transports.push({
+				type: DfTransportType.LSP_RELAY,
+				relayNodeId: Buffer.from(liquidityPeer, 'hex'),
+				host: liquidityHost,
+				port: liquidityPort
+			});
+		}
+		return transports;
+	}
+
+	/**
+	 * Build the request store, the lanes and the receiver, and route inbound
+	 * frames into it.
+	 *
+	 * Constructed but inert: with no liquidity peer named the receiver declines
+	 * every offer, and with no request minted every frame is dropped as unknown.
+	 * What this does at construction is make sure a request minted later can be
+	 * ANSWERED, which needs the lanes subscribed before the first frame arrives.
+	 */
+	private wireDirectFunding(config: IDirectFundingNodeConfig): void {
+		const log = (action: string, data: Record<string, unknown>): void => {
+			this.emitStructuredLog('channel', action, data);
+		};
+		const requests = new DirectFundingRequestStore(
+			// Wallet data is optional on IStorageBackend, and a store without it
+			// runs in memory: the requests are then lost on a restart, which the
+			// store already treats as "unpayable", rather than half-persisted.
+			{
+				...(this.walletDataStore() ? { storage: this.walletDataStore()! } : {})
+			},
+			config.requestTtlMs !== undefined
+				? { requestTtlMs: config.requestTtlMs }
+				: {}
+		);
+		const { registry, forwarder } = createDirectFundingTransports(
+			{
+				peers: {
+					nodeIdHex: () => this.getNodeId(),
+					sendCustomMessage: (peer, subtype, payload): void =>
+						this.sendCustomMessage(peer, subtype, payload),
+					onCustomMessage: (cb): (() => void) => {
+						const handler = (msg: {
+							peerPubkey: string;
+							version: number;
+							subtype: number;
+							payload: Buffer;
+						}): void => cb(msg);
+						this.on('custom-message', handler);
+						return () => {
+							this.removeListener('custom-message', handler);
+						};
+					},
+					isPeerConnected: (peer): boolean =>
+						this.listPeers().some((p) => p.pubkey === peer),
+					connectPeer: async (peer, host, port): Promise<void> => {
+						await this.connectPeer(peer, host, port);
+					}
+				},
+				nodeId: () => Buffer.from(this.getNodeId(), 'hex'),
+				onionManager: this.onionMessageManager,
+				// The path_id is a per-request secret the payer never sees, so only
+				// a path this node minted resolves here.
+				resolvePathSecret: (hex): string | null =>
+					requests.byOnionPathSecret(hex)?.requestId ?? null
+			},
+			{
+				...(config.directPeer !== undefined
+					? { directPeer: config.directPeer }
+					: {}),
+				...(config.onion !== undefined ? { onion: config.onion } : {}),
+				...(config.relay !== undefined ? { relay: config.relay } : {}),
+				...(config.relayServer !== undefined
+					? { relayServer: config.relayServer }
+					: {})
+			},
+			log
+		);
+		const policy: IDirectFundingPolicy = { ...(config.policy ?? {}) };
+		const receiver = new DirectFundingReceiver(
+			{
+				signMessage: (message) => this.signMessage(message),
+				requests,
+				chain: {
+					getTransaction: (txid) =>
+						this.directFundingChain().getTransaction(txid),
+					listUnspent: (
+						scriptHash
+					): Promise<
+						Array<{
+							txid: string;
+							outputIndex: number;
+							valueSat: number;
+							height: number;
+						}>
+					> => {
+						const backend = this.directFundingChain();
+						if (!backend.listUnspent) return Promise.resolve([]);
+						return backend.listUnspent(scriptHash);
+					},
+					getScriptHashHistory: (scriptHash) =>
+						this.directFundingChain().getScriptHashHistory(scriptHash)
+				},
+				liquidityPeer: () => policy.liquidityPeer ?? null,
+				usableChannelWith: (peerHex) => this.usableChannelWith(peerHex),
+				fundingPubkeys: (channelId) =>
+					this.getRawChannel(channelId)?.getFundingPubkeys() ?? null,
+				canOpenZeroConfTo: (peerHex) =>
+					this.channelManager.canOpenZeroConfTo(peerHex),
+				isTrustedPayer: (peerHex) => this.channelManager.isTrustedPeer(peerHex),
+				openChannelV2: (peerHex, params): { channelId(): Buffer } => {
+					const channel = this.openChannelV2(peerHex, {
+						fundingSatoshis: params.fundingSatoshis,
+						contribution: params.contribution,
+						...(params.trusted ? { trusted: true } : {})
+					});
+					// Read through, never captured: the open answers to its temporary
+					// id until accept_channel2 and to its permanent one afterwards.
+					return { channelId: (): Buffer => channel.getCurrentChannelId() };
+				},
+				abortDualFundedOpen: (channelId, reason) =>
+					this.abortDualFundedOpen(channelId, reason),
+				spliceInWithInputs: (
+					channelId,
+					amountSats,
+					inputs,
+					changeScript,
+					feeratePerKw
+				) =>
+					this.spliceInWithInputs(
+						channelId,
+						amountSats,
+						inputs,
+						changeScript,
+						feeratePerKw
+					),
+				abortSplice: (channelId, reason) =>
+					this.channelManager.abortSplice(channelId, reason),
+				getPendingV2FundingTx: (channelId) =>
+					this.getPendingV2FundingTx(channelId),
+				getPendingSpliceTx: (channelId) => this.getPendingSpliceTx(channelId),
+				provideV2ExternalWitness: (
+					channelId,
+					prevTxid,
+					prevOutputIndex,
+					witness
+				) =>
+					this.provideV2ExternalWitness(
+						channelId,
+						prevTxid,
+						prevOutputIndex,
+						witness
+					),
+				provideSpliceExternalWitness: (
+					channelId,
+					prevTxid,
+					prevOutputIndex,
+					witness
+				) =>
+					this.provideSpliceExternalWitness(
+						channelId,
+						prevTxid,
+						prevOutputIndex,
+						witness
+					),
+				onTxSigsNeeded: (cb): (() => void) => {
+					this.on('channel:txsigs-needed', cb);
+					return () => {
+						this.removeListener('channel:txsigs-needed', cb);
+					};
+				},
+				onSpliceTxSigsNeeded: (cb): (() => void) => {
+					this.on('channel:splice-txsigs-needed', cb);
+					return () => {
+						this.removeListener('channel:splice-txsigs-needed', cb);
+					};
+				},
+				log
+			},
+			{
+				...(policy.minAmountSat !== undefined
+					? { minAmountSat: BigInt(policy.minAmountSat) }
+					: {}),
+				...(policy.maxAmountSat !== undefined
+					? { maxAmountSat: BigInt(policy.maxAmountSat) }
+					: {}),
+				allowZeroConf: policy.allowZeroConf === true,
+				allowSplice: policy.allowSplice === true
+			}
+		);
+		for (const evt of [
+			'offer:accepted',
+			'offer:declined',
+			'offer:failed',
+			'offer:completed'
+		]) {
+			receiver.on(evt, (data) => this.emit(`direct-funding:${evt}`, data));
+		}
+		this.directFunding = {
+			requests,
+			registry,
+			forwarder,
+			receiver,
+			policy,
+			requestTtlMs: config.requestTtlMs ?? DF_DEFAULT_REQUEST_TTL_MS
+		};
+	}
+
+	/**
+	 * Start serving direct funding: arm the sweeps and route every enabled
+	 * lane's inbound frames into the receiver. Idempotent, and a no-op when the
+	 * feature was never configured.
+	 *
+	 * Separate from construction because attaching the lanes is asynchronous (a
+	 * lane behind an optional dependency is loaded on first use) and a
+	 * constructor cannot await. The persisted requests and policy come back in
+	 * `restoreFromStorage`, so a node that never calls this still holds them.
+	 */
+	async startDirectFunding(): Promise<void> {
+		const df = this.directFunding;
+		if (!df || df.detach) return;
+		df.requests.start();
+		df.receiver.start();
+		df.forwarder?.start();
+		df.detach = await df.receiver.attach(df.registry);
+	}
+
+	stopDirectFunding(): void {
+		const df = this.directFunding;
+		if (!df) return;
+		df.forwarder?.stop();
+		df.detach?.();
+		df.detach = undefined;
+		df.receiver.stop();
+		df.requests.stop();
+		df.registry.destroy();
+	}
+
+	/**
+	 * The chain source the receiver reads offered coins from. Ours, never the
+	 * payer's word: the whole admission argument depends on the transaction and
+	 * the unspent set coming from a server this node chose.
+	 */
+	private directFundingChain(): import('../chain/chain-watcher').IChainBackend {
+		if (!this._chainBackend) {
+			throw new Error('direct funding needs a chain backend');
+		}
+		return this._chainBackend;
+	}
+
+	/** A channel with this peer a splice could ride, or null. */
+	private usableChannelWith(peerHex: string): Buffer | null {
+		for (const channel of this.listChannels()) {
+			if (channel.peerPubkey !== peerHex) continue;
+			if (channel.state !== ChannelState.NORMAL) continue;
+			return channel.channelId;
+		}
+		return null;
+	}
+
+	/** The wallet-data slice of the backend, when it has one. */
+	private walletDataStore(): {
+		saveWalletData(key: string, value: string): void;
+		loadWalletData(key: string): string | null;
+	} | null {
+		const storage = this.storage;
+		if (!storage?.saveWalletData || !storage.loadWalletData) return null;
+		return {
+			saveWalletData: (key, value): void => storage.saveWalletData!(key, value),
+			loadWalletData: (key): string | null => storage.loadWalletData!(key)
+		};
+	}
+
+	private persistDirectFundingPolicy(): void {
+		const store = this.walletDataStore();
+		if (!store || !this.directFunding) return;
+		try {
+			store.saveWalletData(
+				DF_POLICY_STORAGE_KEY,
+				JSON.stringify(this.directFunding.policy)
+			);
+		} catch (err) {
+			// The policy is operator configuration, not money: a failed write is
+			// worth a line and no more, and the caller's change still applies for
+			// the life of this process.
+			this.emitStructuredLog('channel', 'df_policy_not_persisted', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	private restoreDirectFundingPolicy(): void {
+		const df = this.directFunding;
+		const store = this.walletDataStore();
+		if (!df || !store) return;
+		let raw: string | null = null;
+		try {
+			raw = store.loadWalletData(DF_POLICY_STORAGE_KEY);
+		} catch {
+			return;
+		}
+		if (!raw) return;
+		try {
+			const parsed = JSON.parse(raw);
+			if (
+				typeof parsed !== 'object' ||
+				parsed === null ||
+				Array.isArray(parsed)
+			) {
+				return;
+			}
+			this.setDirectFundingPolicy(parsed as IDirectFundingPolicy);
+		} catch {
+			// A policy we cannot read leaves the configured defaults standing,
+			// which is the safe direction: they name no liquidity peer.
+		}
 	}
 
 	// ─────────────── Chain Monitor Delegation ───────────────
@@ -19216,6 +19847,7 @@ export class LightningNode extends EventEmitter {
 			forwardingCltvDelta?: number;
 			jitReceive?: INodeConfig['jitReceive'];
 			jitReceiveClient?: INodeConfig['jitReceiveClient'];
+			directFunding?: INodeConfig['directFunding'];
 			leaseRates?: import('../gossip/types').ILeaseRates;
 			eagerGossipVerify?: boolean;
 			sweepDestinationScript?: Buffer;
@@ -19278,6 +19910,7 @@ export class LightningNode extends EventEmitter {
 			forwardingCltvDelta: options?.forwardingCltvDelta,
 			jitReceive: options?.jitReceive,
 			jitReceiveClient: options?.jitReceiveClient,
+			directFunding: options?.directFunding,
 			leaseRates: options?.leaseRates,
 			eagerGossipVerify: options?.eagerGossipVerify,
 			localFeatures: options?.localFeatures,

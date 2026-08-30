@@ -18,6 +18,7 @@ import {
 	Result,
 	TStorage,
 	Wallet,
+	err,
 	ok
 } from '../src';
 
@@ -56,6 +57,41 @@ const makeStorage = (): { store: Map<string, unknown>; storage: TStorage } => {
 				key: string,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
+				store.set(key, value);
+				return ok(true);
+			}
+		}
+	};
+};
+
+/**
+ * Same, but blacklistedUtxos writes can be made to fail on demand, either as a
+ * resolved Err (what createWalletStorage produces) or as a rejection.
+ */
+const makeFailableStorage = (): {
+	store: Map<string, unknown>;
+	storage: TStorage;
+	fail: { on: boolean; reject: boolean };
+} => {
+	const store = new Map<string, unknown>();
+	const fail = { on: false, reject: false };
+	return {
+		store,
+		fail,
+		storage: {
+			getData: async <K extends keyof IWalletData>(
+				key: string
+			): Promise<Result<IWalletData[K]>> => {
+				return ok(store.get(key) as IWalletData[K]);
+			},
+			setData: async <K extends keyof IWalletData>(
+				key: string,
+				value: IWalletData[K]
+			): Promise<Result<boolean>> => {
+				if (fail.on && key.endsWith('blacklistedUtxos')) {
+					if (fail.reject) throw new Error('storage is down');
+					return err('storage is down');
+				}
 				store.set(key, value);
 				return ok(true);
 			}
@@ -264,5 +300,151 @@ describe('UTXO freeze/unfreeze', function () {
 		if (decoded.isErr()) throw decoded.error;
 		expect(decoded.value.vin).to.have.length(2);
 		await wallet.resetSendTransaction();
+	});
+});
+
+/**
+ * A freeze that never reached storage is not a freeze: the next process loads
+ * the old blacklist and hands the coin back to coin selection, so a caller
+ * holding the outpoint for an in-flight funding has to hear about it (#626).
+ */
+describe('UTXO freeze durability', function () {
+	this.timeout(testTimeout);
+
+	let wallet: Wallet;
+	let store: Map<string, unknown>;
+	let storage: TStorage;
+	let fail: { on: boolean; reject: boolean };
+	let utxo: IUtxo;
+
+	beforeEach(async function () {
+		({ store, storage, fail } = makeFailableStorage());
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			name: 'freezedurability',
+			network,
+			storage,
+			electrumOptions
+		});
+		if (res.isErr()) throw res.error;
+		wallet = res.value;
+		await wallet.refreshWallet({});
+		utxo = injectUtxo(wallet, TXID_A, 60000);
+	});
+
+	afterEach(async function () {
+		await wallet?.stop();
+	});
+
+	it('saveWalletData reports a resolved storage error', async () => {
+		fail.on = true;
+		const res = await wallet.saveWalletData('blacklistedUtxos', []);
+		expect(res.isErr()).to.equal(true);
+	});
+
+	it('saveWalletData reports a rejected storage write', async () => {
+		fail.on = true;
+		fail.reject = true;
+		const res = await wallet.saveWalletData('blacklistedUtxos', []);
+		expect(res.isErr()).to.equal(true);
+	});
+
+	it('freezeUtxo fails and rolls back when the write is rejected', async () => {
+		fail.on = true;
+		const res = await wallet.freezeUtxo({
+			txid: utxo.tx_hash,
+			index: utxo.tx_pos
+		});
+		expect(res.isErr()).to.equal(true);
+		expect(wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)).to.equal(false);
+		expect(wallet.listFrozenUtxos()).to.have.length(0);
+		expect(store.has('freezedurability-regtest-blacklistedUtxos')).to.equal(
+			false
+		);
+		// The coin is spendable, which is what the next process would see too:
+		// nothing is left claiming a reservation that did not survive.
+		expect(wallet.getBalanceBreakdown().frozen).to.equal(0);
+	});
+
+	it('freezeUtxo fails and rolls back when the write throws', async () => {
+		fail.on = true;
+		fail.reject = true;
+		const res = await wallet.freezeUtxo({
+			txid: utxo.tx_hash,
+			index: utxo.tx_pos
+		});
+		expect(res.isErr()).to.equal(true);
+		expect(wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)).to.equal(false);
+	});
+
+	it('a failed freeze leaves the coin selectable rather than half frozen', async () => {
+		fail.on = true;
+		await wallet.freezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos });
+		fail.on = false;
+		const sendRes = await wallet.sendMax({
+			address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+			satsPerByte: 2,
+			broadcast: false
+		});
+		if (sendRes.isErr()) throw sendRes.error;
+		const decoded = decodeRawTransaction(sendRes.value, wallet.network);
+		if (decoded.isErr()) throw decoded.error;
+		expect(decoded.value.vin).to.have.length(1);
+		await wallet.resetSendTransaction();
+	});
+
+	it('unfreezeUtxo fails and keeps the freeze storage still holds', async () => {
+		const frozen = await wallet.freezeUtxo({
+			txid: utxo.tx_hash,
+			index: utxo.tx_pos
+		});
+		if (frozen.isErr()) throw frozen.error;
+
+		fail.on = true;
+		const res = await wallet.unfreezeUtxo({
+			txid: utxo.tx_hash,
+			index: utxo.tx_pos
+		});
+		expect(res.isErr()).to.equal(true);
+		expect(wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)).to.equal(true);
+		// The persisted blacklist still holds it, so memory must agree.
+		const persisted = store.get(
+			'freezedurability-regtest-blacklistedUtxos'
+		) as IUtxo[];
+		expect(persisted).to.have.length(1);
+		expect(persisted[0].tx_hash).to.equal(utxo.tx_hash);
+	});
+
+	it('a concurrent freeze of the same coin never rides a rolled-back entry', async () => {
+		// The blacklist entry is published before the write that may undo it,
+		// so a second caller reading it mid-flight would be told the coin is
+		// already frozen by a freeze about to disappear.
+		fail.on = true;
+		const [first, second] = await Promise.all([
+			wallet.freezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos }),
+			wallet.freezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos })
+		]);
+		expect(first.isErr()).to.equal(true);
+		expect(second.isErr(), 'the second freeze is no more durable').to.equal(
+			true
+		);
+		expect(wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)).to.equal(false);
+		expect(store.has('freezedurability-regtest-blacklistedUtxos')).to.equal(
+			false
+		);
+	});
+
+	it('a concurrent freeze of the same coin records it once', async () => {
+		const [first, second] = await Promise.all([
+			wallet.freezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos }),
+			wallet.freezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos })
+		]);
+		expect(first.isErr()).to.equal(false);
+		expect(second.isErr()).to.equal(false);
+		expect(wallet.listFrozenUtxos()).to.have.length(1);
+		const persisted = store.get(
+			'freezedurability-regtest-blacklistedUtxos'
+		) as IUtxo[];
+		expect(persisted).to.have.length(1);
 	});
 });

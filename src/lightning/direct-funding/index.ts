@@ -79,6 +79,8 @@ export * from './transport';
 
 export * from './receiver';
 
+export * from './sender';
+
 export {
 	DF_BIP21_PARAM,
 	DF_DEFAULT_REQUEST_TTL_MS,

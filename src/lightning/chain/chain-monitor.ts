@@ -75,6 +75,12 @@ export class ChainMonitor {
 	private _trackedOutputs: ITrackedOutput[] = [];
 	private _currentBlockHeight = 0;
 	private _knownPreimages: Map<string, Buffer> = new Map();
+	/**
+	 * A restored non-final cooperative close has not received a live funding
+	 * report in this session. This is not persisted because each session needs
+	 * fresh chain evidence.
+	 */
+	private _commitmentReverifyPending = false;
 
 	constructor(
 		channelState: IChannelState,
@@ -425,23 +431,20 @@ export class ChainMonitor {
 				}
 			}
 		}
-		// Fresh-evidence rule (issue 352): never trust a persisted cooperative
-		// close confirmation height across a restart. The close may have been
-		// reorged out while the node was offline, and the session's first header
-		// reaches the monitors BEFORE restoreChainWatches re-arms the funding
-		// watch, so a stale height could reach depth and resolve with no chance
-		// for the watch to correct it. Reset the clock to unconfirmed; the
-		// re-armed watch's immediate check re-reports the spend with its LIVE
-		// height (or its eviction), and depth counts from that positive evidence.
-		// Costs one Electrum round-trip after restart; depth is height math, so
-		// a re-report of the same height loses no progress.
+		// Never trust a stored non-final cooperative close until its funding watch
+		// reports in this session. A reorg may have removed it while the node was offline,
+		// and the first header arrives before the watch is rearmed. A stored zero
+		// is also unproved because an earlier startup may have persisted its reset
+		// before receiving that report.
 		if (
 			monitor._state !== MonitorState.FULLY_RESOLVED &&
 			monitor._commitmentBroadcast?.commitmentType ===
-				CommitmentType.COOPERATIVE_CLOSE &&
-			monitor._commitmentBroadcast.blockHeight > 0
+				CommitmentType.COOPERATIVE_CLOSE
 		) {
-			monitor._rebindCommitmentConfirmation(0);
+			if (monitor._commitmentBroadcast.blockHeight > 0) {
+				monitor._rebindCommitmentConfirmation(0);
+			}
+			monitor._commitmentReverifyPending = true;
 		}
 		// Restore known preimages if present
 		if (saved.knownPreimages) {
@@ -480,6 +483,14 @@ export class ChainMonitor {
 			this._commitmentBroadcast !== null &&
 			this._commitmentBroadcast.blockHeight > 0
 		);
+	}
+
+	/**
+	 * True until this session's funding watch verifies a restored non-final
+	 * cooperative close.
+	 */
+	isCommitmentReverifyPending(): boolean {
+		return this._commitmentReverifyPending;
 	}
 
 	private _allTrackedOutputsResolved(): boolean {
@@ -564,6 +575,10 @@ export class ChainMonitor {
 				}
 			];
 		}
+		// A live report of the funding outpoint, whatever it says, ends the
+		// window the restore reset opened: every arm below either binds a height,
+		// demotes on a competing spend, or replaces the record outright.
+		this._commitmentReverifyPending = false;
 		if (this._state !== MonitorState.WATCHING) {
 			// Commitment SWAP: a DIFFERENT tx now spends the funding output. The
 			// funding outpoint can only be spent once per chain, so a confirmed
@@ -1903,7 +1918,7 @@ export class ChainMonitor {
 	handleFundingSpendAbsent(scan?: IFundingSpendScan): boolean {
 		if (this._state === MonitorState.WATCHING) return false;
 		const broadcast = this._commitmentBroadcast;
-		if (!broadcast || broadcast.blockHeight <= 0) return false;
+		if (!broadcast) return false;
 		if (scan) {
 			// NEVER against the spender this scan exists to ignore. For a
 			// pre-splice leg that is the splice transaction, and a record of it
@@ -1948,8 +1963,44 @@ export class ChainMonitor {
 			// fail-safe: if the recorded spend is really on chain, the watch
 			// covering the outpoint it spent re-reports it every sweep.
 		}
+		// An absence this record answers to is the proof a restored cooperative
+		// close was waiting for: the history was fetched and holds no spender.
+		// Ahead of the height check below, which the reset already zeroed, so
+		// the window closes instead of lasting the whole session (issue #622).
+		//
+		// Only on a scan of the outpoint the record spent, never on the
+		// fall-through that lets the demotion act. A demotion a sibling leg
+		// triggers stays fail-safe, because a spend really on chain is
+		// re-reported every sweep; re-admitting the force-close rescue is not.
+		if (this._scanCoversRecordedSpend(scan)) {
+			this._commitmentReverifyPending = false;
+		}
+		if (broadcast.blockHeight <= 0) return false;
 		this._demoteRecordedConfirmation();
 		return true;
+	}
+
+	/**
+	 * Whether an absence scan is evidence about the outpoint the recorded spend
+	 * consumed. The record names it once `spentOutpoint` is written; a row from
+	 * before that field falls back to the channel's funding outpoint, which is
+	 * what a cooperative close spends. A report naming no outpoint predates legs
+	 * entirely and answers for the record.
+	 */
+	private _scanCoversRecordedSpend(scan?: IFundingSpendScan): boolean {
+		if (!scan) return true;
+		const recorded = this._commitmentBroadcast?.spentOutpoint;
+		if (recorded) {
+			return (
+				recorded.txid === scan.txid && recorded.outputIndex === scan.outputIndex
+			);
+		}
+		const fundingTxid = this._channelState.fundingTxid;
+		if (!fundingTxid) return false;
+		return (
+			Buffer.from(fundingTxid).reverse().toString('hex') === scan.txid &&
+			this._channelState.fundingOutputIndex === scan.outputIndex
+		);
 	}
 
 	/**
