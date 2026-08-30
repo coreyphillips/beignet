@@ -2334,6 +2334,67 @@ describe('Phase 4: Chain Watcher', () => {
 				).to.deep.equal([{ txid: watchedTxid, outputIndex: 0 }]);
 			});
 		});
+
+		// A spend the chain no longer has must not be reported as current: the
+		// monitor would count finality against it and eventually retire the
+		// watch, and nothing else re-broadcasts the claim (issue #624).
+		it('a scan stalled reading the spending tx cannot revive it after a reorg', async () => {
+			const events: string[] = [];
+			watcher.on('output:spent', () => events.push('spent'));
+			watcher.on('output:unspent', () => events.push('unspent'));
+
+			const watchedTxid = crypto.randomBytes(32).toString('hex');
+			const scriptPubkey = Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+			const scriptHash = computeScriptHash(scriptPubkey);
+			const spendTx = new bitcoin.Transaction();
+			spendTx.addInput(Buffer.from(watchedTxid, 'hex').reverse(), 0);
+			spendTx.addOutput(scriptPubkey, 50000);
+			backend.setTransaction(spendTx.getId(), spendTx.toBuffer());
+			backend.setHistory(scriptHash, [
+				{ txid: watchedTxid, height: 100 },
+				{ txid: spendTx.getId(), height: 101 }
+			]);
+			backend.simulateNewBlock(101);
+
+			await watcher.watchOutput(watchedTxid, 0, scriptPubkey);
+			backend.simulateScriptHashChange(scriptHash);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(events, 'the spend is reported').to.deep.equal(['spent']);
+
+			// Scan A snapshots the history that still holds the spend and stalls
+			// reading the spending transaction.
+			backend.holdTransactions(1);
+			backend.simulateScriptHashChange(scriptHash);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			// The reorg evicts it. Scan B starts after that and finishes first,
+			// with a history that names no spender at all.
+			backend.setHistory(scriptHash, [{ txid: watchedTxid, height: 100 }]);
+			backend.simulateScriptHashChange(scriptHash);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(events, 'the eviction is reported').to.deep.equal([
+				'spent',
+				'unspent'
+			]);
+
+			backend.releaseNextTransaction();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(events, 'and the stalled scan does not undo it').to.deep.equal([
+				'spent',
+				'unspent'
+			]);
+			const held = (
+				watcher as unknown as {
+					watchedOutputs: Map<string, { spendTxid?: string }>;
+				}
+			).watchedOutputs.get(`${watchedTxid}:0`)!;
+			expect(held.spendTxid, 'the watch still reads unspent').to.equal(
+				undefined
+			);
+		});
 	});
 
 	describe('LightningNode integration', () => {
