@@ -135,6 +135,14 @@ interface IDfAttempt {
 	witnessMayBeOut?: boolean;
 }
 
+/**
+ * What setting an attempt up decided: an exchange to run, or nothing to run and
+ * the recorded outcome to answer with. The caveat is what a resumed attempt
+ * whose witness may already be out reports instead of throwing, because a throw
+ * is the caller's cue to pay the same money again.
+ */
+type IDfBeginOutcome = { attempt: IDfAttempt } | { caveat?: string };
+
 /** The exchange's control surface, handed to the frame handlers. */
 interface IDfExchangeControl {
 	offerIdHex: string;
@@ -240,7 +248,6 @@ export class DirectFundingSender {
 		opts: IDfSendOptions = {}
 	): Promise<IDfSendResult> {
 		const env = this.decode(encodedRequest, opts.now);
-		const amountSat = resolveAmount(env, opts.amountSat);
 		const requestIdHex = env.requestId.toString('hex');
 
 		const running = this.inflight.get(requestIdHex);
@@ -252,9 +259,15 @@ export class DirectFundingSender {
 			return running;
 		}
 		// The map entry has to exist before the first await inside begin(), or a
-		// second caller arriving in that window starts a second attempt.
-		const run = this.begin(env, requestIdHex, amountSat, opts).then(
-			(attempt) => (attempt ? this.run(attempt) : this.replay(requestIdHex))
+		// second caller arriving in that window starts a second attempt. The
+		// amount is resolved inside it too, after the record has been consulted: a
+		// request whose witness may be out answers with what it recorded, and the
+		// options this call brought are not grounds to refuse a payment already
+		// made.
+		const run = this.begin(env, requestIdHex, opts).then((outcome) =>
+			'attempt' in outcome
+				? this.run(outcome.attempt)
+				: this.replay(requestIdHex, outcome.caveat)
 		);
 		this.inflight.set(requestIdHex, run);
 		try {
@@ -428,37 +441,48 @@ export class DirectFundingSender {
 	private async begin(
 		env: IDfRequestEnvelope,
 		requestIdHex: string,
-		amountSat: bigint,
 		opts: IDfSendOptions
-	): Promise<IDfAttempt | null> {
+	): Promise<IDfBeginOutcome> {
 		const existing = this.deps.payments.get(requestIdHex);
 		if (existing) {
-			// The amount first, and ahead of the replay: the offer id is derived
-			// over the amount, so a caller asking to pay a different one is asking
-			// for a different offer against a coin this request has already
-			// committed. Answering it with the recorded attempt would report a
-			// payment of one amount as a payment of another.
-			if (existing.amountSat !== amountSat.toString()) {
+			// Terminal and pre-witness: the recorded refusal is the answer, and it
+			// is the one the first call already got.
+			if (existing.status === 'ABORTED') return {};
+			if (DF_POST_WITNESS_STATES.has(existing.status)) {
+				// SIGNED_PENDING is written BEFORE the witness reaches the lane, so on
+				// its own it does not say which side of that the process died on: a
+				// crash in that window leaves a record claiming a payment the receiver
+				// never heard of, and replaying it would report an undelivered payment
+				// as done while its coin stays frozen forever. `witnessSent` is the one
+				// field that proves the wire took the frame; without it the attempt is
+				// re-run so the witness gets another chance to leave. Every other
+				// post-witness state is proof in itself (the funding is in a mempool or
+				// a block), and those replay.
+				//
+				// Nothing the caller passed is judged on the way here. The witness may
+				// be out, and rev 2's caller answers a throw by paying the same money
+				// again over a plain address, so a retry that names a different amount
+				// gets the amount that was actually paid rather than a refusal.
+				return existing.status === 'SIGNED_PENDING' &&
+					existing.witnessSent !== true
+					? this.resume(env, existing, true)
+					: {};
+			}
+			// Still short of a witness, so a refusal costs nothing and the amount is
+			// worth checking: the offer id is derived over it, so a caller asking to
+			// pay a different one is asking for a different offer against a coin this
+			// request has already committed.
+			if (
+				existing.amountSat !== resolveAmount(env, opts.amountSat).toString()
+			) {
 				throw new DirectFundingError(
 					DirectFundingErrorCode.AMOUNT_MISMATCH,
 					`this request already has an attempt for ${existing.amountSat} sat`
 				);
 			}
-			if (existing.status === 'ABORTED') return null;
-			// SIGNED_PENDING is written BEFORE the witness reaches the lane, so on
-			// its own it does not say which side of that the process died on: a
-			// crash in that window leaves a record claiming a payment the receiver
-			// never heard of, and replaying it would report an undelivered payment
-			// as done while its coin stays frozen forever. `witnessSent` is the one
-			// field that proves the wire took the frame; without it the attempt is
-			// re-run so the witness gets another chance to leave. Every other
-			// post-witness state is proof in itself (the funding is in a mempool or
-			// a block), and those still replay.
-			const unproven =
-				existing.status === 'SIGNED_PENDING' && existing.witnessSent !== true;
-			if (DF_POST_WITNESS_STATES.has(existing.status) && !unproven) return null;
-			return this.resume(env, existing, unproven);
+			return this.resume(env, existing);
 		}
+		const amountSat = resolveAmount(env, opts.amountSat);
 		const maxTotalFeeSat =
 			opts.maxTotalFeeSat ?? this.cfg.defaultMaxTotalFeeSat;
 		if (maxTotalFeeSat < 0n) {
@@ -531,13 +555,15 @@ export class DirectFundingSender {
 			resumed: false
 		});
 		return {
-			env,
-			record,
-			offer,
-			offerBody,
-			coin,
-			signer,
-			prevTxid: Buffer.from(txid).reverse()
+			attempt: {
+				env,
+				record,
+				offer,
+				offerBody,
+				coin,
+				signer,
+				prevTxid: Buffer.from(txid).reverse()
+			}
 		};
 	}
 
@@ -545,24 +571,38 @@ export class DirectFundingSender {
 	 * Rebuild an attempt from a record whose exchange did not finish. Nothing is
 	 * chosen again: the offer comes back off the record verbatim, and only the
 	 * signer is looked up, because a key is not something to persist.
+	 *
+	 * Everything that can stop a rebuild here is pre-witness for a record that
+	 * never committed, and so a refusal. For one whose witness may already be out
+	 * it is the opposite: the commitment on disk is the payment, the freeze is
+	 * what protects it, and all that is lost is the chance to send the witness
+	 * again. That comes back as a caveat on the recorded outcome.
 	 */
 	private resume(
 		env: IDfRequestEnvelope,
 		record: IDfPaymentRecord,
 		witnessMayBeOut = false
-	): IDfAttempt {
+	): IDfBeginOutcome {
+		const outpoint = `${record.spentTxid}:${record.spentVout}`;
 		// findCoin, not listSpendable: our own freeze may already be on this coin,
 		// and reading that as a coin that went elsewhere would abandon a payment
 		// over a reservation this request made itself.
 		const coin = this.deps.wallet.findCoin(record.spentTxid, record.spentVout);
 		if (!coin) {
+			if (witnessMayBeOut) {
+				// A committed coin leaving the wallet is most likely the funding
+				// spending it, which is the payment arriving rather than failing.
+				return {
+					caveat: `the coin ${outpoint} is no longer in this wallet, so the witness could not be sent again`
+				};
+			}
 			// The coin went somewhere else before the offer was ever answered. The
 			// attempt can never complete, and leaving the record live would wedge the
 			// request against every later retry, so it is closed here and the
 			// refusal is what a retry replays.
 			this.deps.payments.update(record.requestId, {
 				status: 'ABORTED',
-				reason: `the offered coin ${record.spentTxid}:${record.spentVout} is no longer spendable`
+				reason: `the offered coin ${outpoint} is no longer spendable`
 			});
 			// Nothing was signed in this state, so a freeze this request took has
 			// nothing left to protect and must not outlive it.
@@ -571,7 +611,19 @@ export class DirectFundingSender {
 				.catch(() => undefined);
 			throw new DirectFundingError(
 				DirectFundingErrorCode.NO_SUITABLE_UTXO,
-				`the coin this request was offered, ${record.spentTxid}:${record.spentVout}, is no longer spendable`
+				`the coin this request was offered, ${outpoint}, is no longer spendable`
+			);
+		}
+		const signer = this.deps.wallet.signerFor(coin);
+		if (!signer) {
+			if (witnessMayBeOut) {
+				return {
+					caveat: `this wallet can no longer sign for ${outpoint}, so the witness could not be sent again`
+				};
+			}
+			throw new DirectFundingError(
+				DirectFundingErrorCode.NO_SUITABLE_UTXO,
+				`this wallet cannot sign for ${outpoint}`
 			);
 		}
 		const offerBody = Buffer.from(record.offerBody, 'hex');
@@ -583,14 +635,16 @@ export class DirectFundingSender {
 			...(witnessMayBeOut ? { witnessMayBeOut } : {})
 		});
 		return {
-			env,
-			record,
-			offer: decodeDfOffer(offerBody),
-			offerBody,
-			coin,
-			signer: this.signerFor(coin),
-			prevTxid: Buffer.from(record.spentTxid, 'hex').reverse(),
-			...(witnessMayBeOut ? { witnessMayBeOut } : {})
+			attempt: {
+				env,
+				record,
+				offer: decodeDfOffer(offerBody),
+				offerBody,
+				coin,
+				signer,
+				prevTxid: Buffer.from(record.spentTxid, 'hex').reverse(),
+				...(witnessMayBeOut ? { witnessMayBeOut } : {})
+			}
 		};
 	}
 
@@ -663,8 +717,11 @@ export class DirectFundingSender {
 		return best;
 	}
 
-	/** The recorded outcome of a request whose attempt has already run. */
-	private replay(requestIdHex: string): IDfSendResult {
+	/**
+	 * The recorded outcome of a request whose attempt has already run, plus what
+	 * this call could not do about it.
+	 */
+	private replay(requestIdHex: string, caveat?: string): IDfSendResult {
 		const record = this.deps.payments.get(requestIdHex);
 		if (!record) {
 			throw new DirectFundingError(
@@ -674,7 +731,8 @@ export class DirectFundingSender {
 		}
 		this.log(DF_LOG_SEND_REPLAYED, {
 			requestId: requestIdHex,
-			status: record.status
+			status: record.status,
+			...(caveat ? { caveat } : {})
 		});
 		if (record.status === 'ABORTED') {
 			// Pre-witness and terminal: nothing was spent, and rev 2 allows the
@@ -687,7 +745,7 @@ export class DirectFundingSender {
 				record.reason ?? 'this request was already attempted and abandoned'
 			);
 		}
-		return resultFrom(record);
+		return { ...resultFrom(record), ...(caveat ? { caveat } : {}) };
 	}
 
 	// ─────────────── The exchange ───────────────
@@ -869,6 +927,16 @@ export class DirectFundingSender {
 					try {
 						lane.send(BeignetCustomSubtype.DIRECT_FUNDING_WITNESS, payload);
 					} catch (err) {
+						const failure = new DirectFundingError(
+							DirectFundingErrorCode.UNREACHABLE,
+							`the lane could not carry the witness: ${errorText(err)}`
+						);
+						if (attempt.witnessMayBeOut) {
+							// This refusal says nothing about the earlier send. Its durable
+							// commitment and freeze must remain until reconciliation settles it.
+							fail(failure);
+							return;
+						}
 						// The lane refused the frame outright, so the witness never
 						// reached the wire and nothing can have answered it: a refusal is
 						// still free. (A throw from a HANDLER cannot arrive here; the
@@ -885,12 +953,7 @@ export class DirectFundingSender {
 						// Coded as the transport failure it is: the caller reads the code
 						// to decide whether a plain address payment is the right answer,
 						// and here, with nothing spent, it is.
-						fail(
-							new DirectFundingError(
-								DirectFundingErrorCode.UNREACHABLE,
-								`the lane could not carry the witness: ${errorText(err)}`
-							)
-						);
+						fail(failure);
 						return;
 					}
 					attempt.witnessEmitted = true;
@@ -1127,6 +1190,28 @@ export class DirectFundingSender {
 					problem
 				)
 			);
+		// A resumed attempt whose earlier life committed is retransmitting, not
+		// negotiating. The transaction on the record is the one whose witness may
+		// already be on a wire this device cannot see, so it is the only one this
+		// run may answer for: signing a second would put two conflicting fundings
+		// out, and the record would go on to name whichever the last run happened
+		// to see, pointing reconciliation at the wrong one.
+		if (attempt.witnessMayBeOut) {
+			const held =
+				this.deps.payments.get(attempt.record.requestId) ?? attempt.record;
+			if (held.negotiatedTx && held.witness?.length) {
+				if (held.negotiatedTx !== request.rawTx.toString('hex')) {
+					// A caveat, not a rejection: this says the receiver moved on, not
+					// that our own commitment went anywhere.
+					refuse(
+						'the sign request is for a different transaction than this request already signed'
+					);
+					return;
+				}
+				ctl.commit(held.witness.map((item) => Buffer.from(item, 'hex')));
+				return;
+			}
+		}
 		let tx: bitcoin.Transaction;
 		try {
 			tx = bitcoin.Transaction.fromBuffer(request.rawTx);
@@ -1146,6 +1231,7 @@ export class DirectFundingSender {
 			amountSat: attempt.offer.amountSat,
 			maxTotalFeeSat: attempt.offer.maxTotalFeeSat,
 			receiverNodeId: attempt.env.receiverNodeId,
+			tipHeight: this.deps.wallet.blockHeight(),
 			ownsOutpoint: (txid, vout) => this.deps.wallet.ownsOutpoint(txid, vout)
 		});
 		if ('problem' in checked) {
@@ -1186,6 +1272,9 @@ export class DirectFundingSender {
 			return;
 		}
 		const release = async (): Promise<void> => {
+			// A resumed attempt may protect a funding an earlier life delivered.
+			// Only a fresh attempt can release its freeze before this run emits.
+			if (attempt.witnessMayBeOut) return;
 			await this.deps.wallet
 				.unfreezeUtxo(attempt.coin.txidHex, attempt.coin.vout)
 				.catch(() => undefined);

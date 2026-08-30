@@ -28,6 +28,7 @@ import {
 	DF_PAYMENTS_STORAGE_KEY
 } from '../../src/lightning/direct-funding/sender/records';
 import { chainHashForNetwork } from '../../src/lightning/direct-funding/types';
+import type { IDfPaymentRecord } from '../../src/lightning/direct-funding/sender/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	acceptingReceiver,
@@ -410,6 +411,33 @@ describe('Direct funding sender: the seven sign-request checks', () => {
 		expect(await refusedBy({ locktime: 500_000_000 })).to.contain('locktime');
 	});
 
+	it('refuses a locktime this chain tip cannot reach', async () => {
+		// Every input is non-final at the sequence we offer, so the locktime alone
+		// decides when the funding may be mined. Unbounded, this is a coin signed
+		// away into a transaction nobody can broadcast for centuries, with the
+		// freeze held the whole time.
+		expect(await refusedBy({ locktime: 499_999_999 })).to.contain(
+			'above the 800144 this chain tip allows'
+		);
+	});
+
+	it('accepts an anti-fee-sniping locktime at the tip', async () => {
+		const h = harness({ receiver: { locktime: 800_000 } });
+		const result = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.status).to.equal('SIGNED_PENDING');
+	});
+
+	it('refuses a height locktime with no tip to judge it against', async () => {
+		const h = withSignRequest({ locktime: 800_000 });
+		h.wallet.tipHeight = 0;
+		const err = await refusal(
+			h.sender.send(h.request.encoded, { amountSat: 100_000n })
+		);
+		expect(err.message).to.contain('no chain tip');
+	});
+
 	it('refuses more than eight outputs', async () => {
 		expect(await refusedBy({ extraOutputs: 8 })).to.contain('outputs');
 	});
@@ -521,6 +549,34 @@ describe('Direct funding sender: the seven sign-request checks', () => {
 				fundingValueSat: 100_000n
 			})
 		).to.contain('below the');
+	});
+
+	it('refuses a splice that keeps the fee headroom nobody spent', async () => {
+		// 500,000 shared plus the 100,000 we pay, and the transaction already
+		// charges 500 sat of fee to our own coin. The 500 sat of ceiling left over
+		// is headroom, not delivery, and off the funding output it is a receiver
+		// keeping what we paid.
+		expect(
+			await refusedBy({
+				sharedInput: { valueSat: 500_000n },
+				fundingValueSat: 599_000n,
+				feeSat: 500n
+			})
+		).to.contain('below the 599500 sat');
+	});
+
+	it('accepts a splice short by only the fee it charged us', async () => {
+		const h = harness({
+			receiver: {
+				sharedInput: { valueSat: 500_000n },
+				fundingValueSat: 599_500n,
+				feeSat: 500n
+			}
+		});
+		const result = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.status).to.equal('SIGNED_PENDING');
 	});
 
 	// ── 5. Attestation ──
@@ -931,9 +987,31 @@ describe('Direct funding sender: idempotency (defect D6)', () => {
 		expect(witnesses).to.have.length(1);
 	});
 
-	it('refuses a retry that changes the amount', async () => {
+	it('answers a retry that changes the amount with the payment it made', async () => {
+		// The witness is out, so a refusal here is the caller's cue to pay the same
+		// money again over a plain address. It gets the amount that actually left
+		// instead, which is the only honest answer and the only safe one.
+		const h = harness({ receiver: { noReceipt: true } });
+		const first = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		const retry = await h.sender.send(h.request.encoded, {
+			amountSat: 120_000n
+		});
+		expect(retry.offerId).to.equal(first.offerId);
+		expect(retry.amountSat).to.equal(100_000);
+		expect(retry.status).to.equal('SIGNED_PENDING');
+	});
+
+	it('refuses a retry that changes the amount while nothing is signed', async () => {
 		const h = harness({ receiver: { noReceipt: true } });
 		await h.sender.send(h.request.encoded, { amountSat: 100_000n });
+		// Back to the offer, which is where a refusal is still free: the offer id
+		// is derived over the amount, so a caller naming a different one is asking
+		// for a different offer against a coin this request already committed.
+		h.payments.update(h.request.requestId.toString('hex'), {
+			status: 'OFFERED'
+		});
 		const err = await refusal(
 			h.sender.send(h.request.encoded, { amountSat: 120_000n })
 		);
@@ -1486,7 +1564,12 @@ describe('Direct funding sender: a commit the wire may never have taken', () => 
 		request: ITestRequest,
 		wallet: FakeSenderWallet,
 		storage: ReturnType<typeof memoryStorage>,
-		opts: { unreachable?: boolean } = {}
+		opts: {
+			unreachable?: boolean;
+			refuseWitness?: boolean;
+			/** What this life's receiver builds its sign request from. */
+			signRequest?: ISignRequestOptions;
+		} = {}
 	): {
 		sender: DirectFundingSender;
 		payments: DirectFundingPaymentStore;
@@ -1497,6 +1580,7 @@ describe('Direct funding sender: a commit the wire may never have taken', () => 
 		payments.restore();
 		const seen = { offers: 0, witnesses: [] as Buffer[][] };
 		const inner = acceptingReceiver(request, {
+			...(opts.signRequest ?? {}),
 			onWitness: (w): void => {
 				seen.witnesses.push(w);
 			}
@@ -1505,6 +1589,12 @@ describe('Direct funding sender: a commit the wire may never have taken', () => 
 			if (subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER) seen.offers++;
 			inner(l, subtype, body);
 		});
+		if (opts.refuseWitness) {
+			// The offer gets through and the witness does not, which is the window a
+			// retransmission actually dies in.
+			lane.sendThrows = new Error('not connected to peer');
+			lane.sendThrowsFor = BeignetCustomSubtype.DIRECT_FUNDING_WITNESS;
+		}
 		const sender = new DirectFundingSender(
 			{
 				wallet,
@@ -1539,8 +1629,16 @@ describe('Direct funding sender: a commit the wire may never have taken', () => 
 		return { request, wallet, storage };
 	}
 
+	/** The commitment the first life wrote, as it stands on disk. */
+	function committedRow(
+		storage: ReturnType<typeof memoryStorage>
+	): IDfPaymentRecord {
+		return JSON.parse(storage.loadWalletData(DF_PAYMENTS_STORAGE_KEY)!)[0];
+	}
+
 	it('retransmits the witness when nothing recorded the wire taking it', async () => {
 		const { request, wallet, storage } = await firstLife();
+		const committed = committedRow(storage);
 		rewindToPreEmit(storage);
 
 		const second = life(request, wallet, storage);
@@ -1549,8 +1647,42 @@ describe('Direct funding sender: a commit the wire may never have taken', () => 
 		});
 		expect(second.offers, 'the offer was re-sent').to.equal(1);
 		expect(second.witnesses, 'the witness reached the lane').to.have.length(1);
+		// The recorded witness, byte for byte: this is a re-send of the payment
+		// the first life made, not a second signature over the same coin.
+		expect(
+			second.witnesses[0].map((item) => item.toString('hex'))
+		).to.deep.equal(committed.witness);
+		const record = second.payments.get(request.requestId.toString('hex'))!;
+		expect(record.negotiatedTx).to.equal(committed.negotiatedTx);
+		expect(record.fundingTxid).to.equal(committed.fundingTxid);
 		expect(result.status).to.equal('SIGNED_PENDING');
 		expect(result.spentTxid).to.equal(wallet.coins[0].txidHex);
+	});
+
+	it('will not sign a second transaction for a payment it already made', async () => {
+		const { request, wallet, storage } = await firstLife();
+		const committed = committedRow(storage);
+		rewindToPreEmit(storage);
+
+		// The receiver answers the resumed offer with a different transaction. Our
+		// witness for the first may be on a wire this device cannot see, so signing
+		// this one would put two conflicting fundings out over one coin and leave
+		// the record naming whichever this run happened to see last.
+		const second = life(request, wallet, storage, {
+			signRequest: { locktime: 799_999 }
+		});
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		const record = second.payments.get(request.requestId.toString('hex'))!;
+		expect(second.witnesses, 'a second witness went out').to.have.length(0);
+		expect(record.negotiatedTx).to.equal(committed.negotiatedTx);
+		expect(record.fundingTxid).to.equal(committed.fundingTxid);
+		expect(record.witness).to.deep.equal(committed.witness);
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.fundingTxid).to.equal(committed.fundingTxid);
+		expect(result.caveat).to.contain('different transaction');
+		expect(wallet.frozen.size).to.equal(1);
 	});
 
 	it('records that the wire took the witness, and then replays', async () => {
@@ -1579,6 +1711,106 @@ describe('Direct funding sender: a commit the wire may never have taken', () => 
 		}).sender.send(request.encoded, { amountSat: 100_000n });
 		expect(result.status).to.equal('SIGNED_PENDING');
 		expect(result.caveat).to.be.a('string');
+	});
+
+	it('keeps the commitment when the funding spend removed its coin', async () => {
+		const { request, wallet, storage } = await firstLife();
+		rewindToPreEmit(storage);
+		wallet.coins = [];
+
+		const second = life(request, wallet, storage);
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		const record = second.payments.get(request.requestId.toString('hex'))!;
+		expect(second.offers, 'the missing coin was re-offered').to.equal(0);
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.caveat).to.contain('no longer in this wallet');
+		expect(record.status).to.equal('SIGNED_PENDING');
+		expect(record.attestation).to.not.equal(undefined);
+		expect(record.negotiatedTx).to.be.a('string');
+		expect(record.witness).to.not.equal(undefined);
+		expect(record.fundingTxid).to.be.a('string');
+		expect(record.frozen).to.equal(true);
+		expect(record.witnessSent).to.equal(undefined);
+		expect(wallet.frozen.size).to.equal(1);
+		expect(second.payments.pending()).to.have.length(1);
+
+		wallet.known.set(record.fundingTxid!, true);
+		await second.sender.reconcile();
+		await flush();
+		expect(second.payments.get(record.requestId)!.status).to.equal('CONFIRMED');
+		expect(wallet.frozen.size).to.equal(0);
+	});
+
+	it('keeps the commitment when a retransmission is refused', async () => {
+		const { request, wallet, storage } = await firstLife();
+		rewindToPreEmit(storage);
+
+		const second = life(request, wallet, storage, { refuseWitness: true });
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		const record = second.payments.get(request.requestId.toString('hex'))!;
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.caveat).to.contain('lane could not carry the witness');
+		expect(record.status).to.equal('SIGNED_PENDING');
+		expect(record.attestation).to.not.equal(undefined);
+		expect(record.negotiatedTx).to.be.a('string');
+		expect(record.witness).to.not.equal(undefined);
+		expect(record.fundingTxid).to.be.a('string');
+		expect(record.frozen).to.equal(true);
+		expect(record.witnessSent).to.equal(undefined);
+		expect(wallet.frozen.size).to.equal(1);
+		expect(second.payments.pending()).to.have.length(1);
+	});
+
+	it('keeps the commitment when this wallet can no longer sign the coin', async () => {
+		const { request, wallet, storage } = await firstLife();
+		rewindToPreEmit(storage);
+		wallet.signerMissing = true;
+
+		const second = life(request, wallet, storage);
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		const record = second.payments.get(request.requestId.toString('hex'))!;
+		expect(second.offers, 'an unsignable coin was re-offered').to.equal(0);
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.caveat).to.contain('can no longer sign');
+		expect(record.status).to.equal('SIGNED_PENDING');
+		expect(record.fundingTxid).to.be.a('string');
+		expect(record.frozen).to.equal(true);
+		expect(wallet.frozen.size).to.equal(1);
+		expect(second.payments.pending()).to.have.length(1);
+	});
+
+	it('holds the coin when a record that cannot prove its commitment re-signs', async () => {
+		const { request, wallet, storage } = await firstLife();
+		rewindToPreEmit(storage);
+		// A torn write: SIGNED_PENDING with nothing under it. There is no recorded
+		// witness to re-send, so the exchange runs again, and the write it needs
+		// before emitting fails. An earlier life may still have emitted one, so
+		// nothing here may release the coin.
+		const rows = JSON.parse(storage.loadWalletData(DF_PAYMENTS_STORAGE_KEY)!);
+		delete rows[0].attestation;
+		delete rows[0].negotiatedTx;
+		delete rows[0].witness;
+		delete rows[0].fundingTxid;
+		storage.saveWalletData(DF_PAYMENTS_STORAGE_KEY, JSON.stringify(rows));
+		storage.failWhen = (value): boolean => value.includes('negotiatedTx');
+
+		const second = life(request, wallet, storage);
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.caveat).to.contain('signed funding could not be persisted');
+		expect(
+			second.witnesses,
+			'the witness left on a failed write'
+		).to.have.length(0);
+		expect(wallet.frozen.size, 'the coin came free').to.equal(1);
 	});
 });
 

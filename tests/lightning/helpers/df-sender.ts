@@ -133,6 +133,10 @@ export class FakeSenderWallet implements IDfSenderWallet {
 	readonly conflicts = new Map<string, string>();
 	freezeFails = false;
 	changeScriptThrows = false;
+	/** The chain tip the locktime check is judged against; 0 means unsynced. */
+	tipHeight = 800_000;
+	/** Answer no signer for any coin, whatever the wallet still holds. */
+	signerMissing = false;
 	/** Prevouts a chain lookup will answer with, txid -> raw transaction. */
 	readonly chain = new Map<string, Buffer>();
 	chainFails = false;
@@ -180,6 +184,8 @@ export class FakeSenderWallet implements IDfSenderWallet {
 	}
 
 	signerFor(coin: IDfSenderCoin): IDfCoinSigner | null {
+		// A watch-only restore: the coin is still findable, the key is not there.
+		if (this.signerMissing) return null;
 		const known = this.coins.find(
 			(c) => c.txidHex === coin.txidHex && c.vout === coin.vout
 		);
@@ -247,6 +253,10 @@ export class FakeSenderWallet implements IDfSenderWallet {
 		this.frozen.delete(`${txidHex}:${vout}`);
 		this.freezes?.save([...this.frozen]);
 		return true;
+	}
+
+	blockHeight(): number {
+		return this.tipHeight;
 	}
 
 	txStatus(txidHex: string): { known: boolean; confirmed: boolean } | null {
@@ -369,6 +379,8 @@ export class ScriptedReceiverLane implements IDfTransport {
 	closed = false;
 	/** Set to make the first send throw, i.e. a lane that never established. */
 	sendThrows: Error | null = null;
+	/** Narrow `sendThrows` to one subtype, i.e. a lane that dies mid-exchange. */
+	sendThrowsFor: number | null = null;
 	private keys: { sendKey: Buffer; recvKey: Buffer } | null = null;
 
 	constructor(
@@ -382,7 +394,12 @@ export class ScriptedReceiverLane implements IDfTransport {
 	) {}
 
 	send(subtype: number, payload: Buffer): void {
-		if (this.sendThrows) throw this.sendThrows;
+		if (
+			this.sendThrows &&
+			(this.sendThrowsFor === null || this.sendThrowsFor === subtype)
+		) {
+			throw this.sendThrows;
+		}
 		this.exchanged++;
 		this.deliverToReceiver(subtype, payload);
 	}

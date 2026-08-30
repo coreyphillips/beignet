@@ -26,6 +26,8 @@ function stubWallet(
 	opts: {
 		frozen?: IUtxo[];
 		transactions?: Record<string, { txid: string; height?: number; vin: [] }>;
+		/** What the stored header says, or a throw when there is none. */
+		header?: { height: number } | 'throws';
 	} = {}
 ): IStubWallet {
 	const utxo = {
@@ -66,7 +68,13 @@ function stubWallet(
 			);
 			return stub.frozen.length === before ? err('not frozen') : ok('unfrozen');
 		},
-		transactions: opts.transactions ?? {}
+		transactions: opts.transactions ?? {},
+		electrum: {
+			getBlockHeader: (): { height: number } => {
+				if (opts.header === 'throws') throw new Error('no header yet');
+				return opts.header ?? { height: 800_000 };
+			}
+		}
 	};
 	return stub as unknown as IStubWallet;
 }
@@ -132,6 +140,20 @@ describe('direct funding wallet: what counts as confirmed', () => {
 		);
 		expect(mined.txStatus(TXID)?.confirmed).to.equal(true);
 		expect(mined.txStatus(CONFLICT)).to.equal(null);
+	});
+
+	it('answers 0 for a tip it does not have', () => {
+		// The locktime check refuses a future-locked transaction outright rather
+		// than judge it against a height this wallet is guessing at.
+		expect(directFundingWallet(stubWallet(), NETWORK).blockHeight()).to.equal(
+			800_000
+		);
+		expect(
+			directFundingWallet(
+				stubWallet({ header: 'throws' }),
+				NETWORK
+			).blockHeight()
+		).to.equal(0);
 	});
 
 	it('does not call a conflict won until it has actually confirmed', () => {

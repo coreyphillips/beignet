@@ -24,6 +24,13 @@ import { DF_MAX_PREVOUTS, DF_MAX_TX_OUTPUTS } from '../types';
 /** Rev 2: height-based locktimes only, so the transaction is final on a block. */
 export const DF_MAX_LOCKTIME = 500_000_000;
 
+/**
+ * How far above our own chain tip a funding transaction may be locked. A day of
+ * blocks: wide enough for a receiver doing anti-fee-sniping against a tip we are
+ * behind on, and narrow enough that anything we sign is minable now.
+ */
+export const DF_MAX_LOCKTIME_AHEAD = 144;
+
 export interface IDfSignRequestCheck {
 	request: IDfSignRequest;
 	/** Parsed from `request.rawTx`; the exact bytes that would be signed. */
@@ -41,6 +48,8 @@ export interface IDfSignRequestCheck {
 	maxTotalFeeSat: bigint;
 	/** The node the payment request named; the attestation MUST recover to it. */
 	receiverNodeId: Buffer;
+	/** Our own chain tip, or 0 when this wallet does not have one yet. */
+	tipHeight: number;
 	/** Does this wallet control the outpoint? */
 	ownsOutpoint(txidDisplayHex: string, vout: number): boolean;
 }
@@ -73,6 +82,28 @@ export function signRequestProblem(
 		// and rev 2 refuses it rather than leave the payer guessing when the coin
 		// becomes spendable by this transaction.
 		return { problem: 'funding transaction uses a time-based locktime' };
+	}
+	if (c.tx.locktime > 0) {
+		// Every input is non-final at the sequence we offer, so the locktime is
+		// what decides when this transaction may be mined at all. Unbounded, a
+		// receiver can name a height centuries away: we would sign, freeze the
+		// coin, and hold a payment that cannot confirm and that we may not spend
+		// against. So it is judged against the tip, and a payer with no tip to
+		// judge it against refuses while refusing is still free.
+		if (c.tipHeight <= 0) {
+			return {
+				problem: `funding transaction is locked to height ${c.tx.locktime} and we have no chain tip to check it against`
+			};
+		}
+		if (c.tx.locktime > c.tipHeight + DF_MAX_LOCKTIME_AHEAD) {
+			return {
+				problem: `funding transaction is locked to height ${
+					c.tx.locktime
+				}, above the ${
+					c.tipHeight + DF_MAX_LOCKTIME_AHEAD
+				} this chain tip allows`
+			};
+		}
 	}
 	if (c.tx.ins.length > DF_MAX_PREVOUTS) {
 		return {
@@ -191,7 +222,11 @@ export function signRequestProblem(
 		if (!sharedPrevout || !sharedPrevout.script.equals(funding)) {
 			return { problem: 'shared input is not the attested channel funding' };
 		}
-		const floor = sharedPrevout.valueSat + c.amountSat - c.maxTotalFeeSat;
+		// The fee this transaction actually charges us, not the ceiling we were
+		// willing to pay: the difference is headroom nobody spent, and allowing it
+		// off the funding output would let a receiver keep it in an output of its
+		// own while we paid the amount in full.
+		const floor = sharedPrevout.valueSat + c.amountSat - payerFee;
 		if (fundingValue < floor) {
 			return {
 				problem: `spliced funding output holds ${fundingValue} sat, below the ${floor} sat the old channel plus our payment requires`

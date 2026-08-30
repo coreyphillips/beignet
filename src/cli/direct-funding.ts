@@ -272,6 +272,17 @@ export function directFundingWallet(
 			return result.isOk();
 		},
 
+		blockHeight(): number {
+			// The stored header, which is what every other height question in this
+			// wallet reads. A node that has not synced one yet answers 0, and the
+			// payer refuses a future-locked transaction rather than guess.
+			try {
+				return wallet.electrum.getBlockHeader()?.height ?? 0;
+			} catch {
+				return 0;
+			}
+		},
+
 		txStatus(txidHex: string): { known: boolean; confirmed: boolean } | null {
 			const tx = wallet.transactions[txidHex];
 			if (!tx) return null;

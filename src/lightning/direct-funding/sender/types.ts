@@ -132,6 +132,13 @@ export interface IDfSenderWallet {
 	 */
 	freezeUtxo(txidHex: string, vout: number): Promise<boolean>;
 	unfreezeUtxo(txidHex: string, vout: number): Promise<boolean>;
+	/**
+	 * Our chain tip, or 0 when this wallet has none yet. The locktime check needs
+	 * it: at the sequence we offer every input is non-final, so without a tip to
+	 * measure it against a receiver could lock the funding to a height no miner
+	 * will reach in our lifetime.
+	 */
+	blockHeight(): number;
 	/** What this wallet knows about a transaction, or null when unknown. */
 	txStatus(txidHex: string): { known: boolean; confirmed: boolean } | null;
 	/**
