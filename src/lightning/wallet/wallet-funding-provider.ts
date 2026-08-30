@@ -211,20 +211,59 @@ export class WalletFundingProvider implements IFundingProvider {
 		return run;
 	}
 
-	/** Freeze the outpoint and remember when we pledged it. */
+	/**
+	 * Freeze the outpoint and remember when we pledged it. Returns the wallet's
+	 * refusal, or null once the coin is held.
+	 *
+	 * A refused freeze is recorded only for a renewal. A fresh selection can
+	 * still abort, and recording the pledge would leave this instance believing
+	 * a coin is held that the next coin selection, in this process or the next
+	 * one, is free to spend. A renewal has nothing left to abort: the
+	 * transaction exists and is still owed, so keeping the record is what lets
+	 * this provider's own selections stay off the coin and lets the release and
+	 * expiry bookkeeping still reach it.
+	 */
 	private async pledge(
 		txid: string,
 		vout: number,
 		renewed = false
-	): Promise<void> {
+	): Promise<string | null> {
 		const key = `${txid}:${vout}`;
-		this.pledged.set(key, Date.now());
-		if (renewed) this.renewedPledges.add(key);
-		await this.wallet.freezeUtxo?.({
+		const res = await this.wallet.freezeUtxo?.({
 			txid,
 			index: vout,
 			tag: WalletFundingProvider.PLEDGE_TAG
 		});
+		const refusal = res?.isErr() ? (res as IResultErr).error.message : null;
+		if (refusal === null || renewed) {
+			this.pledged.set(key, Date.now());
+			if (renewed) this.renewedPledges.add(key);
+		}
+		return refusal;
+	}
+
+	/** pledge() for a fresh selection, which must abort on a refusal. */
+	private async pledgeOrThrow(txid: string, vout: number): Promise<void> {
+		const refusal = await this.pledge(txid, vout);
+		if (refusal !== null) {
+			throw new Error(
+				`Failed to reserve funding input ${txid}:${vout}: ${refusal}`
+			);
+		}
+	}
+
+	/**
+	 * Lift the freeze behind a pledge. Returns whether the coin ended up
+	 * released, so a caller only forgets the pledge once it no longer holds
+	 * anything: a wallet that refused the write still has the coin frozen, and
+	 * dropping the record would leave nothing able to try again. A wallet that
+	 * no longer lists the outpoint as frozen is released whatever it called the
+	 * refusal ("not frozen" is the answer to a double release).
+	 */
+	private async releasePledge(txid: string, vout: number): Promise<boolean> {
+		const res = await this.wallet.unfreezeUtxo?.({ txid, index: vout });
+		if (!res?.isErr()) return true;
+		return this.wallet.isUtxoFrozen?.(txid, vout) === false;
 	}
 
 	/**
@@ -233,10 +272,15 @@ export class WalletFundingProvider implements IFundingProvider {
 	 *
 	 * Runs under the selection lock, so it can never interleave with the prune
 	 * a selection performs, and only touches coins the wallet still lists as
-	 * unspent: the inputs this transaction already spent need no reservation,
-	 * and freezing an outpoint the wallet does not hold is rejected anyway. An
-	 * input the transaction spent and a later eviction gave back IS listed
+	 * unspent: the inputs this transaction already spent need no reservation.
+	 * An input the transaction spent and a later eviction gave back IS listed
 	 * again, and that is precisely the coin this has to re-freeze.
+	 *
+	 * Every input is attempted before a refusal is reported: one coin the
+	 * wallet will not freeze (it dropped out of the UTXO set mid-loop, or the
+	 * blacklist write failed) says nothing about the rest, and stopping there
+	 * would skip renewals the transaction needs just as much. The caller logs
+	 * the refusal and the next block renews again.
 	 */
 	async pledgeTransactionInputs(txHex: string): Promise<void> {
 		let tx: bitcoin.Transaction;
@@ -253,11 +297,22 @@ export class WalletFundingProvider implements IFundingProvider {
 			// expires a pledge, so neither needs a renewal.
 			if (!utxos || utxos.length === 0) return;
 			const live = new Set(utxos.map((u) => `${u.tx_hash}:${u.tx_pos}`));
+			const refused: string[] = [];
 			for (const input of tx.ins) {
 				// Transaction inputs hold the txid in internal byte order.
 				const txid = Buffer.from(input.hash).reverse().toString('hex');
 				if (!live.has(`${txid}:${input.index}`)) continue;
-				await this.pledge(txid, input.index, true);
+				const refusal = await this.pledge(txid, input.index, true);
+				if (refusal !== null) {
+					refused.push(`${txid}:${input.index}: ${refusal}`);
+				}
+			}
+			if (refused.length > 0) {
+				throw new Error(
+					`Failed to reserve retained transaction inputs (${refused.join(
+						'; '
+					)})`
+				);
 			}
 		});
 	}
@@ -305,13 +360,18 @@ export class WalletFundingProvider implements IFundingProvider {
 			const spent = !live.has(key);
 			const expired = now - ts > ttl;
 			if (spent || expired) {
+				const sep = key.lastIndexOf(':');
+				const released = await this.releasePledge(
+					key.slice(0, sep),
+					Number(key.slice(sep + 1))
+				);
+				// A refused unfreeze keeps the coin frozen, so keep the entry
+				// that the next prune retries it from. Forgetting it here would
+				// strand the coin: nothing else in this process knows the freeze
+				// is ours to lift.
+				if (!released) continue;
 				this.pledged.delete(key);
 				this.renewedPledges.delete(key);
-				const sep = key.lastIndexOf(':');
-				await this.wallet.unfreezeUtxo?.({
-					txid: key.slice(0, sep),
-					index: Number(key.slice(sep + 1))
-				});
 			}
 		}
 	}
@@ -337,9 +397,16 @@ export class WalletFundingProvider implements IFundingProvider {
 			for (const { txid, vout } of outpoints) {
 				const key = `${txid}:${vout}`;
 				if (!this.pledged.has(key)) continue;
-				this.pledged.delete(key);
+				if (await this.releasePledge(txid, vout)) {
+					this.pledged.delete(key);
+					this.renewedPledges.delete(key);
+					continue;
+				}
+				// The coin is still frozen. Keep the entry, but age it out so
+				// the next prune retries the unfreeze instead of holding the
+				// release for a TTL nothing is waiting on any more.
+				this.pledged.set(key, 0);
 				this.renewedPledges.delete(key);
-				await this.wallet.unfreezeUtxo?.({ txid, index: vout });
 			}
 		});
 	}
@@ -414,7 +481,7 @@ export class WalletFundingProvider implements IFundingProvider {
 		// must be off limits to every other funding.
 		for (const input of tx.ins) {
 			const txid = Buffer.from(input.hash).reverse().toString('hex');
-			await this.pledge(txid, input.index);
+			await this.pledgeOrThrow(txid, input.index);
 		}
 
 		// Find the output that pays to the P2WSH funding address
@@ -553,8 +620,12 @@ export class WalletFundingProvider implements IFundingProvider {
 		const candidates = this.wallet.listUtxos().filter((u) => {
 			// Frozen coins (pledged to an in-flight funding, or frozen by the
 			// user) are excluded from selection; listUtxos itself does not
-			// filter them.
+			// filter them. A renewal whose freeze the wallet refused is held in
+			// the pledged map alone, and a coin a transaction still owes must
+			// not go to a second selection just because the blacklist write
+			// failed.
 			if (this.wallet.isUtxoFrozen?.(u.tx_hash, u.tx_pos)) return false;
+			if (this.pledged.has(`${u.tx_hash}:${u.tx_pos}`)) return false;
 			try {
 				const kind = scriptKind(
 					bitcoin.address.toOutputScript(u.address, network)
@@ -924,7 +995,7 @@ export class WalletFundingProvider implements IFundingProvider {
 		// whose tx may not broadcast for a while, and no concurrent funding
 		// (this method OR wallet.send) may double-spend it in the meantime.
 		for (const utxo of selected) {
-			await this.pledge(utxo.tx_hash, utxo.tx_pos);
+			await this.pledgeOrThrow(utxo.tx_hash, utxo.tx_pos);
 		}
 
 		return { inputs, changeScript };
