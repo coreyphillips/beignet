@@ -2489,7 +2489,22 @@ export class ChannelManager extends EventEmitter {
 		// ready nothing is left that can decline, so ending the off-chain
 		// protocol and preserving off-chain order behind an unreachable quorum
 		// are no longer in tension.
-		const plan = channel.prepareForceClose(signer);
+		//
+		// The channel holds no monitor, so the fact only this side knows travels
+		// with the request: a CLOSED channel whose recorded mutual close is
+		// already on chain has no dead end to rescue (issue #622). A restored
+		// monitor cannot say which it is until its watch reports, and travels as
+		// that third answer rather than as a no.
+		const existingMonitor = this.monitors.get(idHex);
+		const fundingSpendConfirmed =
+			existingMonitor !== undefined && existingMonitor.isCommitmentConfirmed();
+		const fundingSpendReverifyPending =
+			existingMonitor !== undefined &&
+			existingMonitor.isCommitmentReverifyPending();
+		const plan = channel.prepareForceClose(signer, {
+			fundingSpendConfirmed,
+			fundingSpendReverifyPending
+		});
 		if (!plan.ok) {
 			this.emit('error', channelId, plan.error);
 			return {
@@ -2519,30 +2534,60 @@ export class ChannelManager extends EventEmitter {
 		this._settleDetachedQueueAfterTerminalClose(idHex, detached);
 		this.emit('channel:force-closing', channelId, 'local');
 
-		// Create a ChainMonitor for this channel, signing with the channel's own
-		// per-channel keys when present (falling back to node-level base secrets).
 		const state = channel.getFullState();
 
 		// Anchor channels: the commitment is broadcast at a low feerate, so attach
 		// a wallet-funded CPFP child spending our local anchor to speed confirmation.
 		this._maybeCpfpAnchorCommitment(channelId, state, actions, feeRatePerVbyte);
-		const perCh = this.perChannelMonitorKeys(channel);
-		const monitor = new ChainMonitor(
-			state,
-			destinationScript,
-			feeRatePerVbyte,
-			perCh?.revocationBasepointSecret ||
-				this.config.revocationBasepointSecret ||
-				this.config.localFundingPrivkey,
-			perCh?.paymentBasepointSecret ||
-				this.config.paymentBasepointSecret ||
-				this.config.localFundingPrivkey,
-			network,
-			perCh?.delayedPaymentBasepointSecret ||
-				this.config.delayedPaymentBasepointSecret ||
-				this.config.localFundingPrivkey,
-			perCh?.htlcBasepointSecret || this.config.htlcBasepointSecret
-		);
+
+		// A fresh monitor starts blank: no tracked outputs, no classification and
+		// no irrevocable-depth clock. Handing one to a channel whose funding spend
+		// is already CONFIRMED destroys the record of the transaction that
+		// actually settled and leaves the replacement waiting on a commitment that
+		// can never confirm, so the close never resolves and the watch is never
+		// retired (issue #622). Keep the existing monitor instead, aiming its
+		// sweeps at this call's destination.
+		//
+		// An adoption is the exception: the plan moved the close onto a NEW
+		// funding outpoint, so the confirmed spend the monitor recorded belongs to
+		// the outpoint the channel just left and a monitor of the new one is
+		// exactly what is needed.
+		//
+		// A confirmation this session has yet to re-prove keeps the monitor for
+		// the same reason: the record it holds is the only copy, and discarding
+		// it on a height the restore itself zeroed would destroy it over an
+		// unanswered question.
+		let monitor: ChainMonitor;
+		if (
+			existingMonitor !== undefined &&
+			(existingMonitor.isCommitmentConfirmed() ||
+				existingMonitor.isCommitmentReverifyPending()) &&
+			plan.spliceAdoption === null &&
+			plan.v2Adoption === null
+		) {
+			monitor = existingMonitor;
+			monitor.setDestinationScript(destinationScript);
+		} else {
+			// Signing with the channel's own per-channel keys when present,
+			// falling back to node-level base secrets.
+			const perCh = this.perChannelMonitorKeys(channel);
+			monitor = new ChainMonitor(
+				state,
+				destinationScript,
+				feeRatePerVbyte,
+				perCh?.revocationBasepointSecret ||
+					this.config.revocationBasepointSecret ||
+					this.config.localFundingPrivkey,
+				perCh?.paymentBasepointSecret ||
+					this.config.paymentBasepointSecret ||
+					this.config.localFundingPrivkey,
+				network,
+				perCh?.delayedPaymentBasepointSecret ||
+					this.config.delayedPaymentBasepointSecret ||
+					this.config.localFundingPrivkey,
+				perCh?.htlcBasepointSecret || this.config.htlcBasepointSecret
+			);
+		}
 		this.monitors.set(idHex, monitor);
 		this._seedMonitorPreimages(idHex, monitor);
 		// Persist the monitor NOW. Without this it only reaches storage once the
