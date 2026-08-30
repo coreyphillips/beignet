@@ -29,11 +29,13 @@ import {
 	DF_DEFAULT_REQUEST_TTL_MS,
 	DF_MAX_AMOUNT_SAT,
 	DF_MAX_REQUEST_TTL_MS,
+	DF_OFFER_ID_BYTES,
 	DF_PATH_SECRET_BYTES,
 	DF_PREIMAGE_BYTES,
 	DF_REQUEST_ID_BYTES,
 	DirectFundingError,
 	DirectFundingErrorCode,
+	IDfAttemptFunding,
 	IDfRequestRecord,
 	malformed
 } from './types';
@@ -126,6 +128,7 @@ export class DirectFundingRequestStore {
 		if (!Array.isArray(parsed)) return 0;
 		const now = this.now();
 		let dropped = 0;
+		let stripped = false;
 		for (const entry of parsed as IDfRequestRecord[]) {
 			if (!isWellFormedRecord(entry)) {
 				dropped++;
@@ -135,11 +138,12 @@ export class DirectFundingRequestStore {
 				dropped++;
 				continue;
 			}
+			if (stripMalformedAttempt(entry)) stripped = true;
 			this.index(entry);
 		}
 		// Only rewrite when the set actually changed, so a restart with nothing
 		// to drop does not touch storage at all.
-		if (dropped > 0) this.persist();
+		if (dropped > 0 || stripped) this.persist();
 		return this.byHash.size;
 	}
 
@@ -322,16 +326,83 @@ export class DirectFundingRequestStore {
 	attemptsFor(receiptHashHex: string): {
 		attempts: number;
 		activeOfferId?: string;
+		/** The funding that attempt left in flight, when it got that far. */
+		funding?: IDfAttemptFunding;
 	} {
 		const record = this.byReceiptHash(receiptHashHex);
 		if (!record) return { attempts: 0 };
 		const active = record.activeAttempt;
+		if (!active || active.expiresAt <= this.now()) {
+			return { attempts: record.attempts ?? 0 };
+		}
 		return {
 			attempts: record.attempts ?? 0,
-			...(active && active.expiresAt > this.now()
-				? { activeOfferId: active.offerIdHex }
-				: {})
+			activeOfferId: active.offerIdHex,
+			...(active.funding ? { funding: active.funding } : {})
 		};
+	}
+
+	/**
+	 * Name the funding an attempt negotiated, and hold the busy mark for as long
+	 * as that funding can still complete.
+	 *
+	 * Written before the payer is asked to sign, because the window the sign
+	 * request opens is exactly the one a crash strands a channel in: the
+	 * negotiated transaction spends the payer's coin into a channel the peer
+	 * already signed for, and only the payer's witness can finish it. Holding to
+	 * the request's own expiry rather than the session TTL is what stops the
+	 * request going free under a funding still waiting on that witness.
+	 *
+	 * Reports whether the write landed. A false answer leaves the mark standing
+	 * in memory, so the funding is still held for this process's life; what is
+	 * lost is the binding a restart would have rebuilt from it.
+	 */
+	markAttemptFunding(
+		receiptHashHex: string,
+		offerIdHex: string,
+		funding: IDfAttemptFunding,
+		expiresAt: number
+	): boolean {
+		const record = this.byReceiptHash(receiptHashHex);
+		if (!record || record.activeAttempt?.offerIdHex !== offerIdHex)
+			return false;
+		record.activeAttempt.funding = funding;
+		if (record.activeAttempt.expiresAt < expiresAt) {
+			record.activeAttempt.expiresAt = expiresAt;
+		}
+		return this.persist();
+	}
+
+	/**
+	 * Every request holding a funding in flight right now. What a restarting
+	 * receiver re-takes its outpoint reservations from, so a coin already
+	 * committed to one request's funding cannot be offered to another's.
+	 */
+	activeFundings(): Array<{
+		receiptHash: string;
+		offerIdHex: string;
+		expiresAt: number;
+		funding: IDfAttemptFunding;
+	}> {
+		const now = this.now();
+		const out: Array<{
+			receiptHash: string;
+			offerIdHex: string;
+			expiresAt: number;
+			funding: IDfAttemptFunding;
+		}> = [];
+		for (const record of this.byHash.values()) {
+			const active = record.activeAttempt;
+			if (!active?.funding || active.expiresAt <= now) continue;
+			if (record.expiresAt <= now) continue;
+			out.push({
+				receiptHash: record.receiptHash,
+				offerIdHex: active.offerIdHex,
+				expiresAt: active.expiresAt,
+				funding: active.funding
+			});
+		}
+		return out;
 	}
 
 	/**
@@ -504,6 +575,42 @@ function isWellFormedRecord(entry: unknown): entry is IDfRequestRecord {
 		// amount will do": the record is dropped and the request goes unpayable,
 		// which is the recoverable half of that choice.
 		(r.amountSat === undefined || isPositiveDecimal(r.amountSat))
+	);
+}
+
+/**
+ * Drop an attempt marker that did not come back intact.
+ *
+ * It decides whether a second offer may fund this request at all, and through
+ * the funding it names, which channel a re-sent offer is served from. A
+ * half-restored marker would answer both with garbage, where no marker only
+ * costs the request the guard until its next attempt takes one.
+ */
+function stripMalformedAttempt(record: IDfRequestRecord): boolean {
+	const active = record.activeAttempt;
+	if (active === undefined) return false;
+	if (
+		isHex(active.offerIdHex, DF_OFFER_ID_BYTES) &&
+		typeof active.expiresAt === 'number' &&
+		Number.isFinite(active.expiresAt) &&
+		isWellFormedFunding(active.funding)
+	) {
+		return false;
+	}
+	record.activeAttempt = undefined;
+	return true;
+}
+
+function isWellFormedFunding(funding: unknown): boolean {
+	if (funding === undefined) return true;
+	const f = funding as IDfAttemptFunding | null;
+	return (
+		!!f &&
+		typeof f.outpoint === 'string' &&
+		/^[0-9a-f]{64}:(0|[1-9][0-9]{0,9})$/i.test(f.outpoint) &&
+		isHex(f.channelId, 32) &&
+		typeof f.splice === 'boolean' &&
+		isHex(f.contentHash, 32)
 	);
 }
 

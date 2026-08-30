@@ -21,7 +21,10 @@
  *    and starts nothing, up to and including the receipt. An offer id reused
  *    with different content is refused, never served. The response log is
  *    per-process; what crosses a restart is on the request record itself (the
- *    attempt budget, the busy mark, and the receipt a paid request replays).
+ *    attempt budget, the busy mark, the funding that mark left in flight, and
+ *    the receipt a paid request replays). A re-sent offer whose funding is
+ *    still owed a witness is served FROM that funding, never by opening a
+ *    second one (issue #635).
  *  - Every failure path releases the concurrency slot, the outpoint
  *    reservation and any channel or splice the session started. The fork left
  *    a live channel behind on three separate failure paths (defect D5). A
@@ -56,6 +59,7 @@ import {
 import {
 	DF_SIGNATURE_BYTES,
 	DirectFundingError,
+	IDfAttemptFunding,
 	IDfRequestRecord
 } from '../types';
 import type { DfTransportRegistry } from '../transport/registry';
@@ -179,11 +183,21 @@ interface IDfSessionContext {
 	offer: IDfOffer;
 	session: IDfOfferSession;
 	record: IDfRequestRecord;
-	prevTx: bitcoin.Transaction;
-	confirmed?: boolean;
-	liquidityPeer: string;
+	/**
+	 * The offered coin's txid in INTERNAL byte order. The whole transaction is
+	 * only needed to CONTRIBUTE the input, so a session resuming a funding an
+	 * earlier life negotiated never fetches it.
+	 */
+	prevTxid: Buffer;
 	/** Authenticated on the lane AND in the operator's trusted set. */
 	paired: boolean;
+}
+
+/** A funding under way, however it got there. */
+interface IDfStartedFunding {
+	final: Promise<IDfFinalTx>;
+	unwind: () => boolean;
+	isSplice: boolean;
 }
 
 type ResolvedConfig = Required<
@@ -240,6 +254,7 @@ export class DirectFundingReceiver extends EventEmitter {
 	start(): void {
 		if (this.started) return;
 		this.started = true;
+		this.restoreFundingHolds();
 		this.detachers.push(
 			this.deps.onTxSigsNeeded((e) => {
 				if (!e.externalInputIndices?.length) return;
@@ -265,6 +280,25 @@ export class DirectFundingReceiver extends EventEmitter {
 			this.cfg.sweepIntervalMs
 		);
 		this.sweepTimer.unref?.();
+	}
+
+	/**
+	 * Re-take the outpoint reservation of every funding a previous life left in
+	 * flight (issue #635).
+	 *
+	 * The reservations are memory only, and the request's own busy mark stops a
+	 * second offer against the SAME request; this is what stops the payer's coin
+	 * being pledged to a second one. It runs before the lanes are attached, so
+	 * no offer can be judged against an empty reservation table.
+	 */
+	private restoreFundingHolds(): void {
+		for (const held of this.deps.requests.activeFundings()) {
+			this.state.reserve(
+				held.funding.outpoint,
+				held.offerIdHex,
+				held.expiresAt
+			);
+		}
 	}
 
 	stop(): void {
@@ -478,14 +512,33 @@ export class DirectFundingReceiver extends EventEmitter {
 			return;
 		}
 		try {
-			await this.admitGuarded(
-				frame,
-				record,
-				keys,
-				offer,
-				offerIdHex,
-				contentHash
-			);
+			// No session, and the request's busy mark names THIS offer over a
+			// funding that is already negotiated: a restart took the session and
+			// left the channel. It is answered by that funding and never by a
+			// second one (issue #635).
+			const attempt = this.deps.requests.attemptsFor(record.receiptHash);
+			const funding =
+				attempt.activeOfferId === offerIdHex ? attempt.funding : undefined;
+			if (funding) {
+				await this.serveResumedOffer(
+					frame,
+					record,
+					keys,
+					offer,
+					offerIdHex,
+					contentHash,
+					funding
+				);
+			} else {
+				await this.admitGuarded(
+					frame,
+					record,
+					keys,
+					offer,
+					offerIdHex,
+					contentHash
+				);
+			}
 		} catch (err) {
 			// Nothing below may escape into the lane's dispatch.
 			this.log(DF_LOG_OFFER_FAILED, {
@@ -723,15 +776,99 @@ export class DirectFundingReceiver extends EventEmitter {
 		});
 		this.emit('offer:accepted', { offerId: offerIdHex, paired });
 
-		await this.serve({
+		const ctx: IDfSessionContext = {
 			offer,
 			session,
 			record,
-			prevTx,
-			confirmed: coin.confirmed,
-			liquidityPeer: lsp,
+			prevTxid: prevTx.getHash(),
 			paired
+		};
+		await this.serve(ctx, () =>
+			this.startFunding(ctx, lsp, prevTx, coin.confirmed)
+		);
+	}
+
+	/**
+	 * Serve a re-sent offer from the funding a previous life left in flight
+	 * (issue #635).
+	 *
+	 * Nothing is replayed and nothing is opened: the session that drove the
+	 * funding was memory only, so the sign request is built again from the
+	 * transaction the channel still holds and sent over the lane this offer
+	 * arrived on. The offer's own fields are not re-judged and the coin is not
+	 * re-read from the chain, because the bytes are the ones already admitted
+	 * (the content hash says so) and the transaction they funded is negotiated
+	 * and signed for by the peer. What still judges them is
+	 * `fundingTransactionProblem`, which binds this offer to that transaction
+	 * before the attestation is made.
+	 */
+	private async serveResumedOffer(
+		frame: IDfInboundFrame,
+		record: IDfRequestRecord,
+		keys: IDfLaneKeys,
+		offer: IDfOffer,
+		offerIdHex: string,
+		contentHash: string,
+		funding: IDfAttemptFunding
+	): Promise<void> {
+		const decline = (reason: string): void =>
+			this.declineUnrecorded(frame, keys, record, offer, reason);
+		if (funding.contentHash !== contentHash) {
+			// The same refusal a live duplicate gets, for the same reason: an id
+			// reused with different content is not the offer this funding pays.
+			decline('offer id reused with different content');
+			return;
+		}
+		if (
+			this.state.atSessionCeiling() ||
+			this.state.inflightCount() > this.cfg.maxInflightSessions
+		) {
+			decline('too many concurrent funding sessions');
+			return;
+		}
+		const now = this.now();
+		const session: IDfOfferSession = {
+			offerIdHex,
+			contentHash,
+			receiptHashHex: record.receiptHash,
+			outpoint: funding.outpoint,
+			requestId: Buffer.from(record.requestId, 'hex'),
+			keys,
+			laneKey: frame.laneKey,
+			reply: frame.reply,
+			responses: [],
+			inflight: true,
+			terminal: false,
+			committed: false,
+			slotExpiresAt: now + this.cfg.sessionTtlMs,
+			expiresAt: Math.max(now + this.cfg.sessionTtlMs, record.expiresAt)
+		};
+		this.state.open(session);
+		// The durable mark is the reservation's authority here, not a fresh
+		// admission: the coin is already an input of a negotiated transaction.
+		this.state.reserve(funding.outpoint, offerIdHex, session.expiresAt);
+		this.state.endAdmission(offerIdHex);
+
+		const paired =
+			frame.authenticatedPeer !== undefined &&
+			this.deps.isTrustedPayer(frame.authenticatedPeer);
+		this.log(DF_LOG_OFFER_ACCEPTED, {
+			offerId: offerIdHex,
+			amountSat: offer.amountSat.toString(),
+			paired,
+			resumed: true
 		});
+		this.emit('offer:accepted', { offerId: offerIdHex, paired, resumed: true });
+
+		const channelId = Buffer.from(funding.channelId, 'hex');
+		const ctx: IDfSessionContext = {
+			offer,
+			session,
+			record,
+			prevTxid: Buffer.from(offer.txid).reverse(),
+			paired
+		};
+		await this.serve(ctx, () => this.resumeFunding(ctx, funding, channelId));
 	}
 
 	// ─────────────── Serving an admitted offer ───────────────
@@ -742,7 +879,10 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * mark; a failure additionally unwinds whatever channel work had started,
 	 * and keeps the witness obligation open when that unwind is refused.
 	 */
-	private async serve(ctx: IDfSessionContext): Promise<void> {
+	private async serve(
+		ctx: IDfSessionContext,
+		start: () => IDfStartedFunding
+	): Promise<void> {
 		let unwind: (() => boolean) | null = null;
 		let witnesses: DfWitnessQueue | null = null;
 		let stillOwed: (() => void) | null = null;
@@ -753,12 +893,8 @@ export class DirectFundingReceiver extends EventEmitter {
 				BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK,
 				encodeDfOfferAck({ offerId: ctx.offer.offerId, accepted: true })
 			);
-			const input = this.externalInputFor(ctx);
-			const spliceChannel = this.spliceTarget(ctx);
-			const isSplice = spliceChannel !== null;
-			const started = spliceChannel
-				? this.startSplice(ctx, spliceChannel, input)
-				: this.startOpen(ctx, input);
+			const started = start();
+			const isSplice = started.isSplice;
 			unwind = started.unwind;
 			const final = await started.final;
 			// The channel id the event carried is authoritative: a v2 open answers
@@ -766,6 +902,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			// afterwards, and an unwind has to name whichever is current.
 			unwind = (): boolean =>
 				this.unwindFunding(isSplice, final.channelId, ctx);
+			this.markFunding(ctx, final, isSplice);
 			// Installed with the unwind it belongs to, not after the sign request
 			// goes out: the funding is live from here, so anything that throws in
 			// between (an unavailable signer, a transaction we refuse to attest
@@ -798,13 +935,55 @@ export class DirectFundingReceiver extends EventEmitter {
 	}
 
 	/**
+	 * Record the funding this session negotiated on the request, before the
+	 * payer is asked to sign it (issue #635).
+	 *
+	 * Persist before emit, and the window it covers is the one the sign request
+	 * opens: from here the transaction is final and the peer has signed for it,
+	 * so a crash before the payer's witness arrives leaves a channel only that
+	 * witness can finish. The mark is what a restarted receiver rebinds the
+	 * payer's re-sent offer to, and what holds the request and the coin until
+	 * the funding settles rather than until the session TTL.
+	 */
+	private markFunding(
+		ctx: IDfSessionContext,
+		final: IDfFinalTx,
+		isSplice: boolean
+	): void {
+		const { session } = ctx;
+		const marked = this.deps.requests.markAttemptFunding(
+			session.receiptHashHex,
+			session.offerIdHex,
+			{
+				outpoint: session.outpoint,
+				channelId: final.channelId.toString('hex'),
+				splice: isSplice,
+				contentHash: session.contentHash
+			},
+			session.expiresAt
+		);
+		if (marked) return;
+		// The exchange goes on regardless. Withholding the sign request over a
+		// storage hiccup would strand the same funding with certainty, where
+		// sending it still leaves the payer able to complete it in this life.
+		this.log(DF_LOG_OFFER_FAILED, {
+			offerId: session.offerIdHex,
+			error: 'funding binding was not recorded on the request'
+		});
+	}
+
+	/**
 	 * Our "wallet input" IS the payer's. It is contributed and emitted on the
 	 * wire like any of ours, its signWitness is never called, and our
 	 * tx_signatures is withheld until its slot is filled (issue #554).
 	 */
-	private externalInputFor(ctx: IDfSessionContext): ISpliceWalletInput {
+	private externalInputFor(
+		ctx: IDfSessionContext,
+		prevTx: bitcoin.Transaction,
+		confirmed?: boolean
+	): ISpliceWalletInput {
 		return {
-			prevTx: ctx.prevTx.toBuffer(),
+			prevTx: prevTx.toBuffer(),
 			prevOutputIndex: ctx.offer.vout,
 			value: ctx.offer.valueSat,
 			sequence: ctx.offer.sequence,
@@ -813,11 +992,51 @@ export class DirectFundingReceiver extends EventEmitter {
 			// nothing conclusive: the fork asserted true unconditionally (defect
 			// D13), which would satisfy a peer's require_confirmed_inputs over a
 			// coin still in the mempool.
-			...(ctx.confirmed !== undefined ? { confirmed: ctx.confirmed } : {}),
+			...(confirmed !== undefined ? { confirmed } : {}),
 			signWitness: (): Buffer[] => {
 				throw new Error('external input: the witness comes from the payer');
 			}
 		};
+	}
+
+	/** Contribute the payer's coin to a splice or to a new channel. */
+	private startFunding(
+		ctx: IDfSessionContext,
+		liquidityPeer: string,
+		prevTx: bitcoin.Transaction,
+		confirmed?: boolean
+	): IDfStartedFunding {
+		const input = this.externalInputFor(ctx, prevTx, confirmed);
+		const spliceChannel = this.spliceTarget(ctx, liquidityPeer);
+		return spliceChannel
+			? { ...this.startSplice(ctx, spliceChannel, input), isSplice: true }
+			: { ...this.startOpen(ctx, liquidityPeer, input), isSplice: false };
+	}
+
+	/**
+	 * Pick up the funding a previous life negotiated (issue #635). Nothing is
+	 * started: the transaction comes back off the channel, or off the
+	 * owed-witness event a reconnect re-arms when the channel has not answered
+	 * for it yet.
+	 */
+	private resumeFunding(
+		ctx: IDfSessionContext,
+		funding: IDfAttemptFunding,
+		channelId: Buffer
+	): IDfStartedFunding {
+		const isSplice = funding.splice;
+		const unwind = (): boolean => this.unwindFunding(isSplice, channelId, ctx);
+		const pending = isSplice
+			? this.deps.getPendingSpliceTx(channelId)
+			: this.deps.getPendingV2FundingTx(channelId);
+		const ready = this.finalTxFor(pending, channelId, funding.outpoint);
+		if (ready) return { final: Promise.resolve(ready), unwind, isSplice };
+		const waiter = this.awaitFinalTx(
+			isSplice ? this.spliceWaiters : this.v2Waiters,
+			funding.outpoint,
+			this.cfg.negotiationTimeoutMs
+		);
+		return { final: waiter.final, unwind, isSplice };
 	}
 
 	/**
@@ -829,13 +1048,17 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * payment. Rev 2 classes splice-in as an extension, so it is additionally
 	 * off unless the operator asked for it.
 	 */
-	private spliceTarget(ctx: IDfSessionContext): Buffer | null {
+	private spliceTarget(
+		ctx: IDfSessionContext,
+		liquidityPeer: string
+	): Buffer | null {
 		if (!this.cfg.allowSplice || !ctx.paired) return null;
-		return this.deps.usableChannelWith(ctx.liquidityPeer);
+		return this.deps.usableChannelWith(liquidityPeer);
 	}
 
 	private startOpen(
 		ctx: IDfSessionContext,
+		liquidityPeer: string,
 		input: ISpliceWalletInput
 	): { final: Promise<IDfFinalTx>; unwind: () => boolean } {
 		// Registered BEFORE the open: a fully synchronous transport runs the
@@ -848,7 +1071,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		);
 		let handle: IDfChannelHandle;
 		try {
-			handle = this.deps.openChannelV2(ctx.liquidityPeer, {
+			handle = this.deps.openChannelV2(liquidityPeer, {
 				fundingSatoshis: ctx.offer.amountSat,
 				contribution: {
 					inputs: [input],
@@ -864,7 +1087,7 @@ export class DirectFundingReceiver extends EventEmitter {
 				// risk to the counterparty is a decision only the operator can make.
 				...(this.cfg.allowZeroConf &&
 				ctx.paired &&
-				this.deps.canOpenZeroConfTo(ctx.liquidityPeer)
+				this.deps.canOpenZeroConfTo(liquidityPeer)
 					? { trusted: true }
 					: {})
 			});
@@ -931,7 +1154,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			tx: final.tx,
 			fundingOutputIndex: final.fundingOutputIndex,
 			minFundingValueSat: final.baseFundingValueSat + ctx.offer.amountSat,
-			payerPrevTxid: ctx.prevTx.getHash(),
+			payerPrevTxid: ctx.prevTxid,
 			payerVout: ctx.offer.vout,
 			owedExternalIndices: final.owedExternalIndices,
 			offer: ctx.offer
@@ -991,7 +1214,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		witnesses: DfWitnessQueue
 	): Promise<void> {
 		const deadline = this.now() + this.cfg.witnessTimeoutMs;
-		const prevTxid = ctx.prevTx.getHash();
+		const prevTxid = ctx.prevTxid;
 		let lastError = 'payer never delivered its witness';
 		for (;;) {
 			const remaining = deadline - this.now();
@@ -1076,7 +1299,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		isSplice: boolean
 	): void {
 		const { session } = ctx;
-		const prevTxid = ctx.prevTx.getHash();
+		const prevTxid = ctx.prevTxid;
 		session.onWitness = (witness): void => {
 			const result = this.deliverWitness(
 				ctx,
@@ -1352,7 +1575,6 @@ export class DirectFundingReceiver extends EventEmitter {
 		channelId: Buffer
 	): void {
 		if (!pending?.prevouts) return;
-		const prevouts = pending.prevouts;
 		for (const owed of pending.owedExternalInputs) {
 			const key = outpointKey(
 				Buffer.from(owed.prevTxid).reverse().toString('hex'),
@@ -1360,32 +1582,57 @@ export class DirectFundingReceiver extends EventEmitter {
 			);
 			const waiter = waiters.get(key);
 			if (!waiter) continue;
-			const common = {
-				channelId: Buffer.from(channelId),
-				tx: pending.tx,
-				prevouts,
-				owedExternalIndices: pending.owedExternalInputs.map((o) => o.inputIndex)
-			};
-			if ('sharedInputIndex' in pending) {
-				waiter.resolve({
-					...common,
-					fundingTxidDisplay: displayTxid(pending.spliceTxid),
-					fundingOutputIndex: pending.newFundingOutputIndex,
-					// The new funding output carries the pre-splice capacity as
-					// well, and the shared input's value IS that capacity.
-					baseFundingValueSat: prevouts.values[pending.sharedInputIndex],
-					sharedInputIndex: pending.sharedInputIndex
-				});
-			} else {
-				waiter.resolve({
-					...common,
-					fundingTxidDisplay: displayTxid(pending.fundingTxid),
-					fundingOutputIndex: pending.fundingOutputIndex,
-					baseFundingValueSat: 0n
-				});
-			}
+			const final = this.finalTxFor(pending, channelId, key);
+			if (final) waiter.resolve(final);
 			return;
 		}
+	}
+
+	/**
+	 * The negotiated transaction as one outpoint's session needs it, or null
+	 * when this channel is not holding a witness owed for that outpoint. Read
+	 * on demand as well as on the event, because a receiver restarted mid
+	 * exchange has to rebuild the sign request from a channel that has already
+	 * re-armed (issue #635).
+	 */
+	private finalTxFor(
+		pending: IDfPendingV2FundingTx | IDfPendingSpliceTx | null,
+		channelId: Buffer,
+		outpoint: string
+	): IDfFinalTx | null {
+		if (!pending?.prevouts) return null;
+		const prevouts = pending.prevouts;
+		const owes = pending.owedExternalInputs.some(
+			(owed) =>
+				outpointKey(
+					Buffer.from(owed.prevTxid).reverse().toString('hex'),
+					owed.prevOutputIndex
+				) === outpoint
+		);
+		if (!owes) return null;
+		const common = {
+			channelId: Buffer.from(channelId),
+			tx: pending.tx,
+			prevouts,
+			owedExternalIndices: pending.owedExternalInputs.map((o) => o.inputIndex)
+		};
+		if ('sharedInputIndex' in pending) {
+			return {
+				...common,
+				fundingTxidDisplay: displayTxid(pending.spliceTxid),
+				fundingOutputIndex: pending.newFundingOutputIndex,
+				// The new funding output carries the pre-splice capacity as well,
+				// and the shared input's value IS that capacity.
+				baseFundingValueSat: prevouts.values[pending.sharedInputIndex],
+				sharedInputIndex: pending.sharedInputIndex
+			};
+		}
+		return {
+			...common,
+			fundingTxidDisplay: displayTxid(pending.fundingTxid),
+			fundingOutputIndex: pending.fundingOutputIndex,
+			baseFundingValueSat: 0n
+		};
 	}
 
 	// ─────────────── Frames out ───────────────

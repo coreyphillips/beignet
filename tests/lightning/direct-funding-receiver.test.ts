@@ -807,6 +807,207 @@ describe('Direct funding receiver: idempotency (issue #612)', () => {
 	});
 });
 
+describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
+	/**
+	 * A receiver taken down between its sign request and the payer's witness.
+	 * The channel is restored and still owes the payer's input a witness; the
+	 * sessions and waiters that bound the two are gone with the process.
+	 */
+	async function crashAfterSignRequest(
+		opts: { restartAtMs?: number } = {}
+	): Promise<{
+		storage: ReturnType<typeof memoryStorage>;
+		record: ReturnType<FakeDfNode['mintRequest']>;
+		coin: IDfTestCoin;
+		offer: ReturnType<typeof buildOffer>;
+		channelId: Buffer;
+		signedTx: bitcoin.Transaction;
+		second: FakeDfNode;
+	}> {
+		const storage = memoryStorage();
+		const first = new FakeDfNode(storage);
+		const record = first.mintRequest();
+		const coin = makeCoin();
+		first.publish(coin);
+		const offer = buildOffer(record, coin);
+		const payer = new FakePayerLane(record, 'lane-before');
+		const engine = new DirectFundingReceiver(first, {
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(payer.offerFrame(offer));
+		await flush();
+		const { channelId, tx } = first.completeNegotiation(coin, offer);
+		await flush();
+		expect(payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+
+		const second = new FakeDfNode(
+			storage,
+			opts.restartAtMs === undefined
+				? undefined
+				: (): number => Date.now() + opts.restartAtMs!
+		);
+		second.publish(coin);
+		return { storage, record, coin, offer, channelId, signedTx: tx, second };
+	}
+
+	function restart(node: FakeDfNode): DirectFundingReceiver {
+		const engine = new DirectFundingReceiver(node, {
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		return engine;
+	}
+
+	it('asks the payer to sign the funding the restart left in flight', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+
+		expect(c.second.opens, 'no second channel session').to.have.length(0);
+		const bodies = again.bodiesOf(SIGN_REQUEST);
+		expect(bodies).to.have.length(1);
+		const request = decodeDfSignRequest(bodies[0]);
+		expect(request.rawTx.equals(c.signedTx.toBuffer())).to.equal(true);
+
+		engine.handleFrame(
+			again.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(c.second.witnesses).to.have.length(1);
+		expect(again.bodiesOf(RECEIPT)).to.have.length(1);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		engine.stop();
+	});
+
+	it('serves the re-sent offer long after the session TTL has passed', async () => {
+		const c = await crashAfterSignRequest({ restartAtMs: 20 * 60 * 1000 });
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+
+		expect(c.second.opens, 'no second channel session').to.have.length(0);
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		expect(
+			again.bodiesOf(ACK).map((b) => decodeDfOfferAck(b).accepted)
+		).to.deep.equal([true]);
+		engine.stop();
+	});
+
+	it('waits for the re-armed owed-witness event when the channel has not answered yet', async () => {
+		const c = await crashAfterSignRequest();
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+
+		c.second.completeNegotiation(c.coin, c.offer, { channelId: c.channelId });
+		await flush();
+		expect(c.second.opens).to.have.length(0);
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('resumes a splice from the channel it was negotiated into', async () => {
+		const storage = memoryStorage();
+		const first = new FakeDfNode(storage);
+		first.spliceChannel = crypto.randomBytes(32);
+		first.trustedPayers.add(LSP_PUBKEY);
+		const record = first.mintRequest();
+		const coin = makeCoin();
+		first.publish(coin);
+		const offer = buildOffer(record, coin);
+		const payer = new FakePayerLane(record, 'lane-before', LSP_PUBKEY);
+		const engine = new DirectFundingReceiver(first, {
+			allowSplice: true,
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(payer.offerFrame(offer));
+		await flush();
+		const { channelId } = first.completeSpliceNegotiation(coin, offer, 40_000n);
+		await flush();
+		expect(payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+
+		const second = new FakeDfNode(storage);
+		second.publish(coin);
+		second.stagePendingSplice(channelId, coin, offer, 40_000n);
+		const again = new FakePayerLane(record, 'lane-after', LSP_PUBKEY);
+		const restarted = new DirectFundingReceiver(second, {
+			allowSplice: true,
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		restarted.start();
+		restarted.handleFrame(again.offerFrame(offer));
+		await flush();
+
+		expect(second.splices, 'no second splice').to.have.length(0);
+		const bodies = again.bodiesOf(SIGN_REQUEST);
+		expect(bodies).to.have.length(1);
+		expect(decodeDfSignRequest(bodies[0]).sharedInputIndex).to.equal(1);
+		restarted.stop();
+	});
+
+	it('refuses an offer id re-sent with different content', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		// The id is derived from the outpoint and the amount, so a changed
+		// change script keeps it and changes what it means.
+		engine.handleFrame(
+			again.offerFrame(
+				buildOffer(c.record, c.coin, {
+					changeScript: bitcoin.payments.p2wpkh({
+						hash: crypto.randomBytes(20)
+					}).output!
+				})
+			)
+		);
+		await flush();
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		expect(decodeDfOfferAck(again.bodiesOf(ACK)[0])).to.deep.equal({
+			offerId: c.offer.offerId,
+			accepted: false,
+			reason: 'offer id reused with different content'
+		});
+		engine.stop();
+	});
+
+	it('keeps the payer coin committed to its funding across the restart', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		// Another request, the same coin, a different amount: a different offer
+		// id, so nothing about the first request's busy mark refuses it.
+		const other = c.second.mintRequest();
+		const otherPayer = new FakePayerLane(other, 'other-lane');
+		engine.handleFrame(
+			otherPayer.offerFrame(buildOffer(other, c.coin, { amountSat: 40_000n }))
+		);
+		await flush();
+		expect(c.second.opens).to.have.length(0);
+		expect(decodeDfOfferAck(otherPayer.bodiesOf(ACK)[0]).reason).to.equal(
+			'input already committed to another offer'
+		);
+		engine.stop();
+	});
+});
+
 describe('Direct funding receiver: the exchange (issue #612)', () => {
 	async function drive(
 		config: IDfReceiverConfig = {},

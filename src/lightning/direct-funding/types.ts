@@ -257,6 +257,29 @@ export interface IDfRequestEnvelope {
 // ─────────────── Persisted request record ───────────────
 
 /**
+ * The funding an attempt left in flight, as a restarted receiver reads it.
+ *
+ * The outpoint is the payer's coin and the key the channel's owed-witness
+ * event resolves on; the channel id is what the negotiated transaction and the
+ * witness delivery are addressed to. Both are recorded once the interactive
+ * transaction is final, which for either kind is the point where the channel's
+ * own record became durable and the id stopped changing.
+ */
+export interface IDfAttemptFunding {
+	/** `txid:vout`, display byte order. */
+	outpoint: string;
+	channelId: string;
+	/** A splice into an existing channel rather than a new v2 open. */
+	splice: boolean;
+	/**
+	 * SHA256 of the offer bytes the funding was negotiated for. A re-sent offer
+	 * is served from the funding only if it is that offer to the byte, which is
+	 * the refusal a live duplicate already gets from its session record.
+	 */
+	contentHash: string;
+}
+
+/**
  * One outstanding request. Every field is a secret the receiver needs to
  * answer an envelope it already handed out, which is why this lives in the
  * encrypted wallet-data store rather than a JSON file next to it.
@@ -311,7 +334,18 @@ export interface IDfRequestRecord {
 	 * would otherwise let the duplicate offer that follows it begin a SECOND
 	 * channel session for one payment.
 	 */
-	activeAttempt?: { offerIdHex: string; expiresAt: number };
+	activeAttempt?: {
+		offerIdHex: string;
+		expiresAt: number;
+		/**
+		 * The funding this attempt negotiated, once there is one. Written before
+		 * the payer is asked to sign, and what a restarted receiver rebinds the
+		 * re-sent offer to: the session that drove it was memory only, so without
+		 * this the channel is stranded with the payer's input unwitnessed and the
+		 * request goes free at the session TTL (issue #635).
+		 */
+		funding?: IDfAttemptFunding;
+	};
 	/** Reserved for the deferred rendezvous transport (#533), never minted. */
 	swarmSeedHex?: string;
 }

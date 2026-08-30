@@ -307,6 +307,108 @@ describe('Direct funding: outstanding requests', () => {
 		});
 	});
 
+	describe('the funding an attempt leaves in flight (issue #635)', () => {
+		const OFFER_A = 'a1'.repeat(16);
+		const OFFER_B = 'b2'.repeat(16);
+		const funding = {
+			outpoint: `${'ab'.repeat(32)}:1`,
+			channelId: 'cd'.repeat(32),
+			splice: false,
+			contentHash: 'ef'.repeat(32)
+		};
+
+		it('holds the busy mark to the request expiry and restores the binding', () => {
+			const first = harness({ requestTtlMs: HOUR });
+			const record = first.store.mint();
+			const slotExpiresAt = first.clock.now + 15 * 60 * 1000;
+			expect(
+				first.store.beginAttempt(record.receiptHash, OFFER_A, slotExpiresAt)
+			).to.equal(true);
+			expect(
+				first.store.markAttemptFunding(
+					record.receiptHash,
+					OFFER_A,
+					funding,
+					record.expiresAt
+				)
+			).to.equal(true);
+
+			// Past the slot the attempt took, and still inside the request's life:
+			// the funding can only be finished by the payer's witness, so the
+			// request is not free for a second one.
+			const second = harness({}, { wallet: first.wallet, clock: first.clock });
+			second.store.restore();
+			second.clock.now = slotExpiresAt + 1;
+			const attempt = second.store.attemptsFor(record.receiptHash);
+			expect(attempt.activeOfferId).to.equal(OFFER_A);
+			expect(attempt.funding).to.deep.equal(funding);
+			expect(second.store.activeFundings()).to.deep.equal([
+				{
+					receiptHash: record.receiptHash,
+					offerIdHex: OFFER_A,
+					expiresAt: record.expiresAt,
+					funding
+				}
+			]);
+		});
+
+		it('names no funding for an attempt another offer holds', () => {
+			const { store, clock } = harness();
+			const record = store.mint();
+			store.beginAttempt(record.receiptHash, OFFER_A, clock.now + 1000);
+			expect(
+				store.markAttemptFunding(
+					record.receiptHash,
+					OFFER_B,
+					funding,
+					clock.now
+				)
+			).to.equal(false);
+			expect(store.attemptsFor(record.receiptHash).funding).to.equal(undefined);
+		});
+
+		it('lets the funding go when the attempt settles', () => {
+			const { store, clock } = harness();
+			const record = store.mint();
+			store.beginAttempt(record.receiptHash, OFFER_A, clock.now + 1000);
+			store.markAttemptFunding(
+				record.receiptHash,
+				OFFER_A,
+				funding,
+				record.expiresAt
+			);
+			store.endAttempt(record.receiptHash, OFFER_A);
+			expect(store.attemptsFor(record.receiptHash).activeOfferId).to.equal(
+				undefined
+			);
+			expect(store.activeFundings()).to.deep.equal([]);
+		});
+
+		it('drops a marker that did not come back intact', () => {
+			const first = harness();
+			const record = first.store.mint();
+			first.store.beginAttempt(
+				record.receiptHash,
+				OFFER_A,
+				first.clock.now + 1000
+			);
+			first.store.markAttemptFunding(
+				record.receiptHash,
+				OFFER_A,
+				{ ...funding, channelId: 'cd' },
+				record.expiresAt
+			);
+			const second = harness({}, { wallet: first.wallet, clock: first.clock });
+			expect(second.store.restore()).to.equal(1);
+			// The record itself is intact, so the request stays payable; only the
+			// marker that would have answered with a truncated channel id goes.
+			expect(second.store.byReceiptHash(record.receiptHash)).to.not.equal(null);
+			expect(second.store.attemptsFor(record.receiptHash)).to.deep.equal({
+				attempts: 1
+			});
+		});
+	});
+
 	describe('frames for requests we did not mint', () => {
 		it('yields silence rather than an error', () => {
 			const { store } = harness();
