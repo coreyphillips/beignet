@@ -1282,11 +1282,19 @@ export class DirectFundingReceiver extends EventEmitter {
 			: this.deps.getPendingV2FundingTx(channelId);
 		const ready = this.finalTxFor(pending, channelId, funding.outpoint);
 		if (ready) return ready;
-		const waiter = this.awaitFinalTx(
-			funding.splice ? this.spliceWaiters : this.v2Waiters,
-			funding.outpoint,
-			this.cfg.negotiationTimeoutMs
-		);
+		const waiters = funding.splice ? this.spliceWaiters : this.v2Waiters;
+		// Whatever is already parked on this outpoint is shared rather than
+		// replaced. A late witness and a re-sent offer can both be waiting for the
+		// same re-arm, and only the waiter the map holds is resolved: installing a
+		// second one would strand the first, and when that is the witness it is the
+		// one frame the payer never sends again.
+		const waiter =
+			waiters.get(funding.outpoint) ??
+			this.awaitFinalTx(
+				waiters,
+				funding.outpoint,
+				this.cfg.negotiationTimeoutMs
+			);
 		try {
 			return await waiter.final;
 		} catch {

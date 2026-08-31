@@ -1390,6 +1390,29 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		engine.stop();
 	});
 
+	it('holds that witness through a duplicate offer waiting on the same re-arm', async () => {
+		const c = await crashAfterSignRequest();
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		// A re-send lands in the same window and waits on the same re-arm. It
+		// cannot take the witness's place in that wait: the payer sends one
+		// witness, so the one already here is all there is to finish the funding.
+		const again = new FakePayerLane(c.record, 'lane-after');
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(c.second.witnesses).to.have.length(0);
+
+		c.second.completeNegotiation(c.coin, c.offer, { channelId: c.channelId });
+		await flush();
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		expect(c.second.aborts).to.have.length(0);
+		engine.stop();
+	});
+
 	it('serves a re-sent offer after an earlier resume gave up waiting', async () => {
 		const c = await crashAfterSignRequest();
 		const again = new FakePayerLane(c.record, 'lane-after');
