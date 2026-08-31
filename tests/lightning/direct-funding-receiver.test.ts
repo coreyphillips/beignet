@@ -20,6 +20,7 @@ import {
 	decodeDfReceipt,
 	decodeDfSignRequest
 } from '../../src/lightning/direct-funding/messages';
+import { DF_REQUESTS_STORAGE_KEY } from '../../src/lightning/direct-funding/requests';
 import {
 	buildOffer,
 	FakeDfNode,
@@ -804,6 +805,658 @@ describe('Direct funding receiver: idempotency (issue #612)', () => {
 			reason: 'request already has an active funding attempt'
 		});
 		restarted.stop();
+	});
+});
+
+describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
+	/**
+	 * A receiver taken down between its sign request and the payer's witness.
+	 * The channel is restored and still owes the payer's input a witness; the
+	 * sessions and waiters that bound the two are gone with the process.
+	 */
+	async function crashAfterSignRequest(
+		opts: {
+			restartAtMs?: number;
+			/** Re-send the offer over a second lane, before the crash. */
+			movedTo?: string;
+			/** Move before the negotiation finishes rather than after. */
+			movedEarly?: boolean;
+			/** The second lane takes the offer but can carry nothing back. */
+			moveRefused?: boolean;
+		} = {}
+	): Promise<{
+		storage: ReturnType<typeof memoryStorage>;
+		record: ReturnType<FakeDfNode['mintRequest']>;
+		coin: IDfTestCoin;
+		offer: ReturnType<typeof buildOffer>;
+		channelId: Buffer;
+		signedTx: bitcoin.Transaction;
+		second: FakeDfNode;
+		/** The lane the payer last reached us on, still open at its end. */
+		payer: FakePayerLane;
+	}> {
+		const storage = memoryStorage();
+		const first = new FakeDfNode(storage);
+		const record = first.mintRequest();
+		const coin = makeCoin();
+		first.publish(coin);
+		const offer = buildOffer(record, coin);
+		let payer = new FakePayerLane(record, 'lane-before');
+		const engine = new DirectFundingReceiver(first, {
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(payer.offerFrame(offer));
+		await flush();
+		// A payer that lost our answer comes back over another transport, with
+		// the fresh lane keys a new exchange mints. The session follows it, so
+		// the sign request and the witness that answers it are both that lane's.
+		const move = async (): Promise<void> => {
+			const next = new FakePayerLane(record, opts.movedTo!);
+			const frame = next.offerFrame(offer);
+			if (opts.moveRefused) {
+				engine.handleFrame({
+					...frame,
+					reply: {
+						type: frame.reply.type,
+						send: (): void => {
+							throw new Error('lane is gone');
+						},
+						trySend: (): boolean => false
+					}
+				});
+				await flush();
+				return;
+			}
+			payer = next;
+			engine.handleFrame(frame);
+			await flush();
+		};
+		if (opts.movedTo && opts.movedEarly) await move();
+		const { channelId, tx } = first.completeNegotiation(coin, offer);
+		await flush();
+		if (opts.movedTo && !opts.movedEarly) await move();
+		expect(payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+
+		const second = new FakeDfNode(
+			storage,
+			opts.restartAtMs === undefined
+				? undefined
+				: (): number => Date.now() + opts.restartAtMs!
+		);
+		second.publish(coin);
+		return {
+			storage,
+			record,
+			coin,
+			offer,
+			channelId,
+			signedTx: tx,
+			second,
+			payer
+		};
+	}
+
+	/** Wallet storage exactly as it stood at this instant. */
+	function snapshotOf(
+		storage: ReturnType<typeof memoryStorage>
+	): ReturnType<typeof memoryStorage> {
+		const copy = memoryStorage();
+		const raw = storage.loadWalletData(DF_REQUESTS_STORAGE_KEY);
+		if (raw !== null) copy.saveWalletData(DF_REQUESTS_STORAGE_KEY, raw);
+		return copy;
+	}
+
+	function restart(node: FakeDfNode): DirectFundingReceiver {
+		const engine = new DirectFundingReceiver(node, {
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		return engine;
+	}
+
+	it('asks the payer to sign the funding the restart left in flight', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+
+		expect(c.second.opens, 'no second channel session').to.have.length(0);
+		const bodies = again.bodiesOf(SIGN_REQUEST);
+		expect(bodies).to.have.length(1);
+		const request = decodeDfSignRequest(bodies[0]);
+		expect(request.rawTx.equals(c.signedTx.toBuffer())).to.equal(true);
+
+		engine.handleFrame(
+			again.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(c.second.witnesses).to.have.length(1);
+		expect(again.bodiesOf(RECEIPT)).to.have.length(1);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		engine.stop();
+	});
+
+	it('serves the re-sent offer long after the session TTL has passed', async () => {
+		const c = await crashAfterSignRequest({ restartAtMs: 20 * 60 * 1000 });
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+
+		expect(c.second.opens, 'no second channel session').to.have.length(0);
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		expect(
+			again.bodiesOf(ACK).map((b) => decodeDfOfferAck(b).accepted)
+		).to.deep.equal([true]);
+		engine.stop();
+	});
+
+	it('waits for the re-armed owed-witness event when the channel has not answered yet', async () => {
+		const c = await crashAfterSignRequest();
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+
+		c.second.completeNegotiation(c.coin, c.offer, { channelId: c.channelId });
+		await flush();
+		expect(c.second.opens).to.have.length(0);
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('resumes a splice from the channel it was negotiated into', async () => {
+		const storage = memoryStorage();
+		const first = new FakeDfNode(storage);
+		first.spliceChannel = crypto.randomBytes(32);
+		first.trustedPayers.add(LSP_PUBKEY);
+		const record = first.mintRequest();
+		const coin = makeCoin();
+		first.publish(coin);
+		const offer = buildOffer(record, coin);
+		const payer = new FakePayerLane(record, 'lane-before', LSP_PUBKEY);
+		const engine = new DirectFundingReceiver(first, {
+			allowSplice: true,
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(payer.offerFrame(offer));
+		await flush();
+		const { channelId } = first.completeSpliceNegotiation(coin, offer, 40_000n);
+		await flush();
+		expect(payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+
+		const second = new FakeDfNode(storage);
+		second.publish(coin);
+		second.stagePendingSplice(channelId, coin, offer, 40_000n);
+		const again = new FakePayerLane(record, 'lane-after', LSP_PUBKEY);
+		const restarted = new DirectFundingReceiver(second, {
+			allowSplice: true,
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		restarted.start();
+		restarted.handleFrame(again.offerFrame(offer));
+		await flush();
+
+		expect(second.splices, 'no second splice').to.have.length(0);
+		const bodies = again.bodiesOf(SIGN_REQUEST);
+		expect(bodies).to.have.length(1);
+		expect(decodeDfSignRequest(bodies[0]).sharedInputIndex).to.equal(1);
+		restarted.stop();
+	});
+
+	it('refuses an offer id re-sent with different content', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		// The id is derived from the outpoint and the amount, so a changed
+		// change script keeps it and changes what it means.
+		engine.handleFrame(
+			again.offerFrame(
+				buildOffer(c.record, c.coin, {
+					changeScript: bitcoin.payments.p2wpkh({
+						hash: crypto.randomBytes(20)
+					}).output!
+				})
+			)
+		);
+		await flush();
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		expect(decodeDfOfferAck(again.bodiesOf(ACK)[0])).to.deep.equal({
+			offerId: c.offer.offerId,
+			accepted: false,
+			reason: 'offer id reused with different content'
+		});
+		engine.stop();
+	});
+
+	it('keeps the payer coin committed to its funding across the restart', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		// Another request, the same coin, a different amount: a different offer
+		// id, so nothing about the first request's busy mark refuses it.
+		const other = c.second.mintRequest();
+		const otherPayer = new FakePayerLane(other, 'other-lane');
+		engine.handleFrame(
+			otherPayer.offerFrame(buildOffer(other, c.coin, { amountSat: 40_000n }))
+		);
+		await flush();
+		expect(c.second.opens).to.have.length(0);
+		expect(decodeDfOfferAck(otherPayer.bodiesOf(ACK)[0]).reason).to.equal(
+			'input already committed to another offer'
+		);
+		engine.stop();
+	});
+
+	it('keeps it committed against the same coin at the same amount', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		// The offer id covers the coin and the amount and nothing else, so this
+		// one carries the id the restored hold was taken under.
+		const other = c.second.mintRequest();
+		const otherPayer = new FakePayerLane(other, 'other-lane');
+		engine.handleFrame(otherPayer.offerFrame(buildOffer(other, c.coin)));
+		await flush();
+		expect(c.second.opens, 'no second channel session').to.have.length(0);
+		expect(decodeDfOfferAck(otherPayer.bodiesOf(ACK)[0]).reason).to.equal(
+			'input already committed to another offer'
+		);
+		engine.stop();
+	});
+
+	it('completes the funding from a witness that arrives after the restart', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		// The payer's exchange outlived ours: it signed what we asked for before
+		// we went down and sends the witness over the lane it already has, which
+		// it will not send twice.
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(1);
+		const receipts = c.payer.bodiesOf(RECEIPT);
+		expect(receipts).to.have.length(1);
+		expect(decodeDfReceipt(receipts[0]).preimage.toString('hex')).to.equal(
+			c.record.preimageHex
+		);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		engine.stop();
+	});
+
+	it('takes it on the lane a duplicate offer moved the exchange to', async () => {
+		const c = await crashAfterSignRequest({ movedTo: 'lane-moved' });
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('takes it on that lane when the move came before the funding was marked', async () => {
+		const c = await crashAfterSignRequest({
+			movedTo: 'lane-moved',
+			movedEarly: true
+		});
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('keeps the old lane when the duplicate arrived on one that carries nothing', async () => {
+		const c = await crashAfterSignRequest({
+			movedTo: 'lane-dead',
+			moveRefused: true
+		});
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		// The sign request never reached the second lane, so the payer answers
+		// the one it did reach, on keys the funding must still name.
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('takes a witness answered inside the replayed sign request send', async () => {
+		const node = new FakeDfNode();
+		const record = node.mintRequest();
+		const coin = makeCoin();
+		node.publish(coin);
+		const offer = buildOffer(record, coin);
+		const before = new FakePayerLane(record, 'lane-before');
+		const engine = new DirectFundingReceiver(node, {
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(before.offerFrame(offer));
+		await flush();
+		node.completeNegotiation(coin, offer);
+		await flush();
+		expect(before.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+
+		// The payer comes back over another transport and answers the replayed
+		// sign request inside the send, the way one in the same process does.
+		const moved = new FakePayerLane(record, 'lane-moved');
+		moved.onReceive = (subtype): void => {
+			if (subtype !== SIGN_REQUEST) return;
+			engine.handleFrame(
+				moved.witnessFrame(offer.offerId, [Buffer.alloc(64, 3)])
+			);
+		};
+		engine.handleFrame(moved.offerFrame(offer));
+		await flush();
+
+		expect(node.witnesses).to.have.length(1);
+		expect(moved.bodiesOf(RECEIPT)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('records the moved lane before the replayed sign request leaves', async () => {
+		const storage = memoryStorage();
+		const node = new FakeDfNode(storage);
+		const record = node.mintRequest();
+		const coin = makeCoin();
+		node.publish(coin);
+		const offer = buildOffer(record, coin);
+		const before = new FakePayerLane(record, 'lane-before');
+		const engine = restart(node);
+		engine.handleFrame(before.offerFrame(offer));
+		await flush();
+		const { channelId } = node.completeNegotiation(coin, offer);
+		await flush();
+
+		// Taken down INSIDE the replayed send. The payer answers the lane that
+		// send reached, so the mark has to name it already: written afterwards it
+		// would be the old lane that came back, and the witness is sent once.
+		let snapshot: ReturnType<typeof memoryStorage> | null = null;
+		const moved = new FakePayerLane(record, 'lane-moved');
+		moved.onReceive = (subtype): void => {
+			if (subtype === SIGN_REQUEST) snapshot = snapshotOf(storage);
+		};
+		engine.handleFrame(moved.offerFrame(offer));
+		await flush();
+		expect(moved.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+
+		const second = new FakeDfNode(snapshot!);
+		second.publish(coin);
+		second.stagePendingV2(channelId, coin, offer);
+		const restarted = restart(second);
+		restarted.handleFrame(
+			moved.witnessFrame(offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(second.witnesses).to.have.length(1);
+		restarted.stop();
+	});
+
+	it('keeps the working lane when a duplicate arrives on one that refuses the ack', async () => {
+		const node = new FakeDfNode();
+		const record = node.mintRequest();
+		const coin = makeCoin();
+		node.publish(coin);
+		const offer = buildOffer(record, coin);
+		const before = new FakePayerLane(record, 'lane-before');
+		const engine = restart(node);
+		engine.handleFrame(before.offerFrame(offer));
+		await flush();
+		// The duplicate arrives with only the ack recorded, and that lane cannot
+		// carry it. A session with nothing at stake still has nothing to gain
+		// from a lane that refuses the one frame it did have.
+		const dead = new FakePayerLane(record, 'lane-dead');
+		const frame = dead.offerFrame(offer);
+		engine.handleFrame({
+			...frame,
+			reply: {
+				type: frame.reply.type,
+				send: (): void => {
+					throw new Error('lane is gone');
+				},
+				trySend: (): boolean => false
+			}
+		});
+		await flush();
+		node.completeNegotiation(coin, offer);
+		await flush();
+
+		expect(before.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('records the resumed lane before its sign request leaves', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		let snapshot: ReturnType<typeof memoryStorage> | null = null;
+		const again = new FakePayerLane(c.record, 'lane-after');
+		again.onReceive = (subtype): void => {
+			if (subtype === SIGN_REQUEST) snapshot = snapshotOf(c.storage);
+		};
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+
+		const third = new FakeDfNode(snapshot!);
+		third.publish(c.coin);
+		third.stagePendingV2(c.channelId, c.coin, c.offer);
+		const restarted = restart(third);
+		restarted.handleFrame(
+			again.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(third.witnesses).to.have.length(1);
+		restarted.stop();
+	});
+
+	it('replays the receipt a late witness earned over the session it settled', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		const dead = new FakePayerLane(c.record, 'lane-dead');
+		const deadFrame = dead.offerFrame(c.offer);
+		const refuse = {
+			type: deadFrame.reply.type,
+			send: (): void => {
+				throw new Error('lane is gone');
+			},
+			trySend: (): boolean => false
+		};
+		engine.handleFrame({ ...deadFrame, reply: refuse });
+		await flush();
+		// The witness completes the funding on the old lane and its receipt is
+		// lost. What is owed now is that receipt, and the session left over from
+		// the resume must not answer the next re-send ahead of it.
+		const witnessFrame = c.payer.witnessFrame(c.offer.offerId, [
+			Buffer.alloc(64, 3)
+		]);
+		engine.handleFrame({ ...witnessFrame, reply: refuse });
+		await flush();
+		expect(c.second.witnesses).to.have.length(1);
+
+		const again = new FakePayerLane(c.record, 'lane-again');
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		const receipts = again.bodiesOf(RECEIPT);
+		expect(receipts).to.have.length(1);
+		expect(decodeDfReceipt(receipts[0]).preimage.toString('hex')).to.equal(
+			c.record.preimageHex
+		);
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		engine.stop();
+	});
+
+	it('keeps the funding lane when a resumed offer cannot be answered', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		// A lane that takes the resumed offer and carries nothing back: the payer
+		// was never asked on it, so it still owes the witness to the lane the
+		// previous life asked on, and that lane must still be able to answer.
+		const dead = new FakePayerLane(c.record, 'lane-dead');
+		const frame = dead.offerFrame(c.offer);
+		engine.handleFrame({
+			...frame,
+			reply: {
+				type: frame.reply.type,
+				send: (): void => {
+					throw new Error('lane is gone');
+				},
+				trySend: (): boolean => false
+			}
+		});
+		await flush();
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('keeps the funding for the payer when the channel cannot answer for it yet', async () => {
+		const c = await crashAfterSignRequest();
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(0);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(
+			false
+		);
+		expect(
+			c.second.requests.attemptsFor(c.record.receiptHash).funding
+		).to.not.equal(undefined);
+		engine.stop();
+	});
+
+	it('holds that witness until the channel re-arms', async () => {
+		const c = await crashAfterSignRequest();
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(c.second.witnesses).to.have.length(0);
+
+		// The payer marks the witness sent the moment the wire takes it and never
+		// offers again, so nothing re-drives one dropped here.
+		c.second.completeNegotiation(c.coin, c.offer, { channelId: c.channelId });
+		await flush();
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		engine.stop();
+	});
+
+	it('holds that witness through a duplicate offer waiting on the same re-arm', async () => {
+		const c = await crashAfterSignRequest();
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		// A re-send lands in the same window and waits on the same re-arm. It
+		// cannot take the witness's place in that wait: the payer sends one
+		// witness, so the one already here is all there is to finish the funding.
+		const again = new FakePayerLane(c.record, 'lane-after');
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(c.second.witnesses).to.have.length(0);
+
+		c.second.completeNegotiation(c.coin, c.offer, { channelId: c.channelId });
+		await flush();
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		expect(c.second.aborts).to.have.length(0);
+		engine.stop();
+	});
+
+	it('serves a re-sent offer after an earlier resume gave up waiting', async () => {
+		const c = await crashAfterSignRequest();
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = new DirectFundingReceiver(c.second, {
+			negotiationTimeoutMs: 20,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(again.offerFrame(c.offer));
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		await flush();
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		expect(again.bodiesOf(ACK), 'a wait is not a refusal').to.have.length(0);
+		expect(c.second.aborts, 'nor a reason to abort the channel').to.have.length(
+			0
+		);
+
+		// The peer reconnects and the channel answers; the payer is still
+		// re-sending the offer it never got a sign request for.
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(c.second.opens).to.have.length(0);
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('serves the resumed offer with every fresh-admission slot taken', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = new DirectFundingReceiver(c.second, {
+			maxInflightSessions: 0,
+			maxSessions: 1,
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
 	});
 });
 

@@ -43,6 +43,12 @@ export interface IDfOfferSession {
 	laneKey: string;
 	/** The response path paired with the current lane keys. */
 	reply: IDfLaneSender;
+	/**
+	 * The payer ephemeral key the current lane keys came from, refreshed with
+	 * them. It is what the funding records, so a session that moved lanes must
+	 * not leave the mark naming the one it started on (issue #635).
+	 */
+	payerEphemeralKey: Buffer;
 	responses: IDfRecordedResponse[];
 	/** Holding a concurrency slot: driving a channel or splice right now. */
 	inflight: boolean;
@@ -73,6 +79,13 @@ export interface IDfOfferSession {
 
 export interface IDfOutpointReservation {
 	offerIdHex: string;
+	/**
+	 * The request the reservation was taken for. The offer id is a hash of the
+	 * coin and the amount alone, so two requests can reach the same one; with no
+	 * session in the map to catch that (a hold re-taken at startup has none),
+	 * this is what keeps one request's coin out of another's funding.
+	 */
+	receiptHashHex: string;
 	expiresAt: number;
 }
 
@@ -147,8 +160,13 @@ export class DfOfferSessions {
 		return this.reservations.get(outpoint);
 	}
 
-	reserve(outpoint: string, offerIdHex: string, expiresAt: number): void {
-		this.reservations.set(outpoint, { offerIdHex, expiresAt });
+	reserve(
+		outpoint: string,
+		offerIdHex: string,
+		receiptHashHex: string,
+		expiresAt: number
+	): void {
+		this.reservations.set(outpoint, { offerIdHex, receiptHashHex, expiresAt });
 	}
 
 	/**

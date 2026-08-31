@@ -365,6 +365,9 @@ export class FakeDfNode implements IDfReceiverDeps {
 
 	// ─── setup ───
 
+	/** The clock the engine and the request store share. */
+	readonly now: () => number;
+
 	constructor(
 		storage?: {
 			saveWalletData(key: string, value: string): void;
@@ -372,6 +375,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 		},
 		now?: () => number
 	) {
+		this.now = now ?? ((): number => Date.now());
 		this.requests = new DirectFundingRequestStore({
 			...(storage ? { storage } : {}),
 			...(now ? { now } : {})
@@ -568,6 +572,31 @@ export class FakeDfNode implements IDfReceiverDeps {
 	): { channelId: Buffer; tx: bitcoin.Transaction } {
 		const channelId =
 			opts.channelId ?? this.opens[this.opens.length - 1].channelId;
+		const built = this.stagePendingV2(channelId, coin, offer, opts);
+		for (const cb of [...this.txSigsListeners]) {
+			cb({ channelId, externalInputIndices: [0] });
+		}
+		return { channelId, tx: built };
+	}
+
+	/**
+	 * Hold a negotiated funding without announcing it, the way a channel
+	 * restored from disk answers getPendingV2FundingTx before its peer has
+	 * reconnected and re-armed the owed-witness event.
+	 */
+	stagePendingV2(
+		channelId: Buffer,
+		coin: IDfTestCoin,
+		offer: IDfOffer,
+		opts: {
+			feeSat?: bigint;
+			fundingValueSat?: bigint;
+			changeScript?: Buffer;
+			witnessesFilled?: boolean;
+			extraOutputs?: number;
+			fundingScript?: Buffer;
+		} = {}
+	): bitcoin.Transaction {
 		const built = this.buildNegotiatedTx(coin, offer, opts);
 		this.pendingV2.set(channelId.toString('hex'), {
 			tx: built,
@@ -582,10 +611,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 				}
 			]
 		});
-		for (const cb of [...this.txSigsListeners]) {
-			cb({ channelId, externalInputIndices: [0] });
-		}
-		return { channelId, tx: built };
+		return built;
 	}
 
 	completeSpliceNegotiation(
@@ -595,11 +621,38 @@ export class FakeDfNode implements IDfReceiverDeps {
 		opts: {
 			feeSat?: bigint;
 			fundingValueSat?: bigint;
+			channelId?: Buffer;
 			/** The real 2-of-2; the shared input spends it too. */
 			fundingScript?: Buffer;
 		} = {}
 	): { channelId: Buffer; tx: bitcoin.Transaction } {
-		const channelId = this.splices[this.splices.length - 1].channelId;
+		const channelId =
+			opts.channelId ?? this.splices[this.splices.length - 1].channelId;
+		const built = this.stagePendingSplice(
+			channelId,
+			coin,
+			offer,
+			preCapacitySat,
+			opts
+		);
+		for (const cb of [...this.spliceListeners]) {
+			cb({ channelId, externalInputIndices: [0] });
+		}
+		return { channelId, tx: built };
+	}
+
+	/** The splice twin of stagePendingV2. */
+	stagePendingSplice(
+		channelId: Buffer,
+		coin: IDfTestCoin,
+		offer: IDfOffer,
+		preCapacitySat: bigint,
+		opts: {
+			feeSat?: bigint;
+			fundingValueSat?: bigint;
+			fundingScript?: Buffer;
+		} = {}
+	): bitcoin.Transaction {
 		const built = this.buildNegotiatedTx(coin, offer, {
 			...opts,
 			fundingValueSat: opts.fundingValueSat ?? preCapacitySat + offer.amountSat,
@@ -622,10 +675,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 				}
 			]
 		});
-		for (const cb of [...this.spliceListeners]) {
-			cb({ channelId, externalInputIndices: [0] });
-		}
-		return { channelId, tx: built };
+		return built;
 	}
 
 	/**
