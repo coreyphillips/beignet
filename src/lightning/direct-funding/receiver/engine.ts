@@ -191,12 +191,6 @@ interface IDfSessionContext {
 	 * earlier life negotiated never fetches it.
 	 */
 	prevTxid: Buffer;
-	/**
-	 * The payer's ephemeral public key for the lane this offer arrived on. It is
-	 * recorded with the funding so a later life can open the witness frame the
-	 * payer sends over that same lane (issue #635).
-	 */
-	payerEphemeralKey: Buffer;
 	/** Authenticated on the lane AND in the operator's trusted set. */
 	paired: boolean;
 }
@@ -643,7 +637,7 @@ export class DirectFundingReceiver extends EventEmitter {
 				);
 				return;
 			}
-			this.replay(existing, frame, keys);
+			this.replay(existing, frame, keys, ephemeralPublicKey);
 			return;
 		}
 		// No session, and the request says this very offer already paid it: the
@@ -898,6 +892,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			keys,
 			laneKey: frame.laneKey,
 			reply: frame.reply,
+			payerEphemeralKey: ephemeralPublicKey,
 			responses: [],
 			inflight: true,
 			terminal: false,
@@ -947,7 +942,6 @@ export class DirectFundingReceiver extends EventEmitter {
 			session,
 			record,
 			prevTxid: prevTx.getHash(),
-			payerEphemeralKey: ephemeralPublicKey,
 			paired
 		};
 		await this.serve(ctx, () =>
@@ -1031,6 +1025,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			keys,
 			laneKey: frame.laneKey,
 			reply: frame.reply,
+			payerEphemeralKey: ephemeralPublicKey,
 			responses: [],
 			inflight: true,
 			terminal: false,
@@ -1065,7 +1060,6 @@ export class DirectFundingReceiver extends EventEmitter {
 			session,
 			record,
 			prevTxid: Buffer.from(offer.txid).reverse(),
-			payerEphemeralKey: ephemeralPublicKey,
 			paired
 		};
 		await this.serve(ctx, () => ({
@@ -1163,7 +1157,7 @@ export class DirectFundingReceiver extends EventEmitter {
 				channelId: final.channelId.toString('hex'),
 				splice: isSplice,
 				contentHash: session.contentHash,
-				payerEphemeralKey: ctx.payerEphemeralKey.toString('hex')
+				payerEphemeralKey: session.payerEphemeralKey.toString('hex')
 			},
 			session.expiresAt
 		);
@@ -1881,11 +1875,18 @@ export class DirectFundingReceiver extends EventEmitter {
 	private replay(
 		session: IDfOfferSession,
 		frame: IDfInboundFrame,
-		keys: IDfLaneKeys
+		keys: IDfLaneKeys,
+		ephemeralPublicKey: Buffer
 	): void {
 		session.keys = keys;
 		session.laneKey = frame.laneKey;
 		session.reply = frame.reply;
+		session.payerEphemeralKey = ephemeralPublicKey;
+		// The sign request is among the responses replayed below, so the witness
+		// that answers it will be sealed to THIS lane. A funding still naming the
+		// lane the offer first arrived on could not be opened with it after a
+		// restart, and would strand with the payer's input unwitnessed (#635).
+		this.rebindFundingLane(session);
 		for (const response of session.responses) {
 			this.emitSealed(
 				frame.reply,
@@ -1895,6 +1896,32 @@ export class DirectFundingReceiver extends EventEmitter {
 				response.body
 			);
 		}
+	}
+
+	/**
+	 * Put the session's current lane on the funding it has already marked.
+	 * Nothing to do before that point: markFunding writes whichever lane the
+	 * session holds when it runs.
+	 */
+	private rebindFundingLane(session: IDfOfferSession): void {
+		const attempt = this.deps.requests.attemptsFor(session.receiptHashHex);
+		if (attempt.activeOfferId !== session.offerIdHex || !attempt.funding) {
+			return;
+		}
+		const rebound = this.deps.requests.markAttemptFunding(
+			session.receiptHashHex,
+			session.offerIdHex,
+			{
+				...attempt.funding,
+				payerEphemeralKey: session.payerEphemeralKey.toString('hex')
+			},
+			session.expiresAt
+		);
+		if (rebound) return;
+		this.log(DF_LOG_OFFER_FAILED, {
+			offerId: session.offerIdHex,
+			error: 'funding lane rebinding was not recorded on the request'
+		});
 	}
 
 	/**

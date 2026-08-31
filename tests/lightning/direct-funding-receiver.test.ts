@@ -814,7 +814,13 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 	 * sessions and waiters that bound the two are gone with the process.
 	 */
 	async function crashAfterSignRequest(
-		opts: { restartAtMs?: number } = {}
+		opts: {
+			restartAtMs?: number;
+			/** Re-send the offer over a second lane, before the crash. */
+			movedTo?: string;
+			/** Move before the negotiation finishes rather than after. */
+			movedEarly?: boolean;
+		} = {}
 	): Promise<{
 		storage: ReturnType<typeof memoryStorage>;
 		record: ReturnType<FakeDfNode['mintRequest']>;
@@ -823,7 +829,7 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		channelId: Buffer;
 		signedTx: bitcoin.Transaction;
 		second: FakeDfNode;
-		/** The lane the funding was negotiated on, still open at the payer. */
+		/** The lane the payer last reached us on, still open at its end. */
 		payer: FakePayerLane;
 	}> {
 		const storage = memoryStorage();
@@ -832,7 +838,7 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		const coin = makeCoin();
 		first.publish(coin);
 		const offer = buildOffer(record, coin);
-		const payer = new FakePayerLane(record, 'lane-before');
+		let payer = new FakePayerLane(record, 'lane-before');
 		const engine = new DirectFundingReceiver(first, {
 			negotiationTimeoutMs: 5_000,
 			witnessTimeoutMs: 5_000,
@@ -841,8 +847,18 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		engine.start();
 		engine.handleFrame(payer.offerFrame(offer));
 		await flush();
+		// A payer that lost our answer comes back over another transport, with
+		// the fresh lane keys a new exchange mints. The session follows it, so
+		// the sign request and the witness that answers it are both that lane's.
+		const move = async (): Promise<void> => {
+			payer = new FakePayerLane(record, opts.movedTo!);
+			engine.handleFrame(payer.offerFrame(offer));
+			await flush();
+		};
+		if (opts.movedTo && opts.movedEarly) await move();
 		const { channelId, tx } = first.completeNegotiation(coin, offer);
 		await flush();
+		if (opts.movedTo && !opts.movedEarly) await move();
 		expect(payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
 		engine.stop();
 
@@ -1054,6 +1070,37 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 			c.record.preimageHex
 		);
 		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		engine.stop();
+	});
+
+	it('takes it on the lane a duplicate offer moved the exchange to', async () => {
+		const c = await crashAfterSignRequest({ movedTo: 'lane-moved' });
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('takes it on that lane when the move came before the funding was marked', async () => {
+		const c = await crashAfterSignRequest({
+			movedTo: 'lane-moved',
+			movedEarly: true
+		});
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
 		engine.stop();
 	});
 

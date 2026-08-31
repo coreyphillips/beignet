@@ -43,6 +43,12 @@ export interface IDfOfferSession {
 	laneKey: string;
 	/** The response path paired with the current lane keys. */
 	reply: IDfLaneSender;
+	/**
+	 * The payer ephemeral key the current lane keys came from, refreshed with
+	 * them. It is what the funding records, so a session that moved lanes must
+	 * not leave the mark naming the one it started on (issue #635).
+	 */
+	payerEphemeralKey: Buffer;
 	responses: IDfRecordedResponse[];
 	/** Holding a concurrency slot: driving a channel or splice right now. */
 	inflight: boolean;
