@@ -820,6 +820,8 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 			movedTo?: string;
 			/** Move before the negotiation finishes rather than after. */
 			movedEarly?: boolean;
+			/** The second lane takes the offer but can carry nothing back. */
+			moveRefused?: boolean;
 		} = {}
 	): Promise<{
 		storage: ReturnType<typeof memoryStorage>;
@@ -851,8 +853,24 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		// the fresh lane keys a new exchange mints. The session follows it, so
 		// the sign request and the witness that answers it are both that lane's.
 		const move = async (): Promise<void> => {
-			payer = new FakePayerLane(record, opts.movedTo!);
-			engine.handleFrame(payer.offerFrame(offer));
+			const next = new FakePayerLane(record, opts.movedTo!);
+			const frame = next.offerFrame(offer);
+			if (opts.moveRefused) {
+				engine.handleFrame({
+					...frame,
+					reply: {
+						type: frame.reply.type,
+						send: (): void => {
+							throw new Error('lane is gone');
+						},
+						trySend: (): boolean => false
+					}
+				});
+				await flush();
+				return;
+			}
+			payer = next;
+			engine.handleFrame(frame);
 			await flush();
 		};
 		if (opts.movedTo && opts.movedEarly) await move();
@@ -1094,6 +1112,25 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		});
 		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
 		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('keeps the old lane when the duplicate arrived on one that carries nothing', async () => {
+		const c = await crashAfterSignRequest({
+			movedTo: 'lane-dead',
+			moveRefused: true
+		});
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		// The sign request never reached the second lane, so the payer answers
+		// the one it did reach, on keys the funding must still name.
 		engine.handleFrame(
 			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
 		);

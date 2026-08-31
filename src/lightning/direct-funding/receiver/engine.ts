@@ -1855,22 +1855,24 @@ export class DirectFundingReceiver extends EventEmitter {
 		this.emitSealed(reply, session.keys, session.requestId, subtype, body);
 	}
 
+	/** False when the lane refused the frame outright, so nothing left. */
 	private emitSealed(
 		reply: IDfLaneSender,
 		keys: IDfLaneKeys,
 		requestId: Buffer,
 		subtype: number,
 		body: Buffer
-	): void {
+	): boolean {
 		const sealed = sealFrame(keys.sendKey, requestId, subtype, body);
-		reply.trySend(subtype, encodeSealedFrame(sealed));
+		return reply.trySend(subtype, encodeSealedFrame(sealed));
 	}
 
 	/**
 	 * Replay a session's recorded responses on the lane the duplicate arrived
-	 * on, and rebind the session to it. A payer whose answer was lost may well
-	 * come back over a different transport, and rebinding is the only way it
-	 * can be served: nothing is re-run and no second channel session begins.
+	 * on, and, once they have reached it, rebind the session to it. A payer
+	 * whose answer was lost may well come back over a different transport, and
+	 * rebinding is the only way it can be served: nothing is re-run and no
+	 * second channel session begins.
 	 */
 	private replay(
 		session: IDfOfferSession,
@@ -1878,24 +1880,34 @@ export class DirectFundingReceiver extends EventEmitter {
 		keys: IDfLaneKeys,
 		ephemeralPublicKey: Buffer
 	): void {
-		session.keys = keys;
-		session.laneKey = frame.laneKey;
-		session.reply = frame.reply;
-		session.payerEphemeralKey = ephemeralPublicKey;
-		// The sign request is among the responses replayed below, so the witness
-		// that answers it will be sealed to THIS lane. A funding still naming the
-		// lane the offer first arrived on could not be opened with it after a
-		// restart, and would strand with the payer's input unwitnessed (#635).
-		this.rebindFundingLane(session);
+		let signRequestOut = true;
 		for (const response of session.responses) {
-			this.emitSealed(
+			const sent = this.emitSealed(
 				frame.reply,
 				keys,
 				session.requestId,
 				response.subtype,
 				response.body
 			);
+			if (
+				!sent &&
+				response.subtype === BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST
+			) {
+				signRequestOut = false;
+			}
 		}
+		// The witness answers the sign request, and the payer sends it once. So
+		// the session and its funding follow the lane the sign request reached:
+		// this one when the replay carried it, and otherwise the lane that
+		// already holds it. Moving to a lane the sign request never left would
+		// invalidate the only keys that witness can be opened with, live and
+		// after a restart both, stranding the payer's input unwitnessed (#635).
+		if (!signRequestOut) return;
+		session.keys = keys;
+		session.laneKey = frame.laneKey;
+		session.reply = frame.reply;
+		session.payerEphemeralKey = ephemeralPublicKey;
+		this.rebindFundingLane(session);
 	}
 
 	/**
