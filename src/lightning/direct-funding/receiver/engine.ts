@@ -508,7 +508,18 @@ export class DirectFundingReceiver extends EventEmitter {
 				return true;
 			}
 			if (witness.offerId.toString('hex') !== held.offerIdHex) continue;
-			this.completeFundingFromWitness(frame, record, held, lane.keys, witness);
+			void this.completeFundingFromWitness(
+				frame,
+				record,
+				held,
+				lane.keys,
+				witness
+			).catch((err) => {
+				this.log(DF_LOG_OFFER_FAILED, {
+					offerId: held.offerIdHex,
+					error: errorText(err)
+				});
+			});
 			return true;
 		}
 		return false;
@@ -520,11 +531,12 @@ export class DirectFundingReceiver extends EventEmitter {
 	 *
 	 * The transaction is read from the channel BEFORE the delivery: it is the
 	 * receipt's subject, and a channel that has moved on cannot be asked for it
-	 * afterwards. A channel with nothing to answer keeps the funding and the
-	 * mark exactly as they were, because the witness costs the payer nothing to
-	 * send again once its peer is back.
+	 * afterwards. A channel that has not re-armed YET is waited for, on the same
+	 * owed-witness event a resumed offer waits on: the payer marks the witness
+	 * sent the moment the wire takes the frame and never offers again (sender
+	 * engine ~466), so a witness dropped here is one nothing re-sends.
 	 */
-	private completeFundingFromWitness(
+	private async completeFundingFromWitness(
 		frame: IDfInboundFrame,
 		record: IDfRequestRecord,
 		held: {
@@ -534,17 +546,11 @@ export class DirectFundingReceiver extends EventEmitter {
 		},
 		keys: IDfLaneKeys,
 		witness: IDfWitness
-	): void {
+	): Promise<void> {
 		const { funding } = held;
 		const channelId = Buffer.from(funding.channelId, 'hex');
 		const isSplice = funding.splice;
-		const final = this.finalTxFor(
-			isSplice
-				? this.deps.getPendingSpliceTx(channelId)
-				: this.deps.getPendingV2FundingTx(channelId),
-			channelId,
-			funding.outpoint
-		);
+		const final = await this.resumedFinalTx(funding, channelId);
 		if (!final) {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: held.offerIdHex,
@@ -583,17 +589,36 @@ export class DirectFundingReceiver extends EventEmitter {
 			});
 		}
 		const complete = final.tx.ins.every((i) => i.witness.length > 0);
+		const receipt = encodeDfReceipt({
+			offerId: witness.offerId,
+			preimage: Buffer.from(record.preimageHex, 'hex'),
+			fundingTxid: final.fundingTxidDisplay,
+			...(complete ? { rawTx: final.tx.toBuffer() } : {})
+		});
+		// A session for this offer is still driving this funding on a lane the
+		// payer never answered on, and the funding is finished without it. Settle
+		// it here on the receipt: left live it answers every later re-send with its
+		// own ACK and sign request, ahead of the paid-receipt replay, and the
+		// receipt frame below is exactly the one that can be lost (issue #635).
+		const live = this.state.get(held.offerIdHex);
+		if (live) {
+			live.committed = true;
+			live.inflight = false;
+			live.terminal = true;
+			live.onWitness = undefined;
+			live.responses = [];
+			this.state.record(
+				live,
+				BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT,
+				receipt
+			);
+		}
 		this.emitSealed(
 			frame.reply,
 			keys,
 			Buffer.from(record.requestId, 'hex'),
 			BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT,
-			encodeDfReceipt({
-				offerId: witness.offerId,
-				preimage: Buffer.from(record.preimageHex, 'hex'),
-				fundingTxid: final.fundingTxidDisplay,
-				...(complete ? { rawTx: final.tx.toBuffer() } : {})
-			})
+			receipt
 		);
 		this.log(DF_LOG_OFFER_COMPLETED, { offerId: held.offerIdHex });
 		this.emit('offer:completed', { offerId: held.offerIdHex });
@@ -1110,7 +1135,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			// afterwards, and an unwind has to name whichever is current.
 			unwind = (): boolean =>
 				this.unwindFunding(isSplice, final.channelId, ctx);
-			this.markFunding(ctx, final, isSplice);
+			const displaced = this.markFunding(ctx, final, isSplice);
 			// Installed with the unwind it belongs to, not after the sign request
 			// goes out: the funding is live from here, so anything that throws in
 			// between (an unavailable signer, a transaction we refuse to attest
@@ -1119,11 +1144,13 @@ export class DirectFundingReceiver extends EventEmitter {
 			// got.
 			stillOwed = (): void => this.keepWitnessObligation(ctx, final, isSplice);
 			witnesses = new DfWitnessQueue(ctx.session);
-			// The funding's lane moves with the sign request, never ahead of it:
-			// until this one leaves, the witness is still owed to the lane the mark
-			// already names (issue #635).
-			if (this.sendSignRequest(ctx, final)) {
-				this.rebindFundingLane(ctx.session);
+			// The mark already names this session's lane, and goes back to the lane
+			// it displaced when the sign request does not leave: the move has to be
+			// earned, but it cannot be made after the send either, because a crash
+			// in that gap leaves the mark naming a lane the witness the payer is
+			// answering with can never be opened on (issue #635).
+			if (!this.sendSignRequest(ctx, final) && displaced) {
+				this.rebindFundingLane(ctx.session, displaced);
 			}
 			await this.collectWitness(ctx, final, isSplice, witnesses);
 			// The witness reached the channel: our tx_signatures are out and
@@ -1157,20 +1184,23 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * witness can finish. The mark is what a restarted receiver rebinds the
 	 * payer's re-sent offer to, and what holds the request and the coin until
 	 * the funding settles rather than until the session TTL.
+	 *
+	 * Returns the payer lane the write displaced, which is a resumed offer's
+	 * previous life and nothing on a fresh admission. The caller puts it back if
+	 * the sign request never leaves: this session's lane is only the one the
+	 * witness is owed to once the payer has been asked for it on it.
 	 */
 	private markFunding(
 		ctx: IDfSessionContext,
 		final: IDfFinalTx,
 		isSplice: boolean
-	): void {
+	): string | undefined {
 		const { session } = ctx;
-		// A resumed offer arrives on a lane of its own, and the mark names the one
-		// a previous life asked on: the only keys the witness the payer already
-		// owes can be opened with. So this write keeps that lane, and the move
-		// waits for this session's own sign request to leave, as a replay does.
 		const held = this.deps.requests.attemptsFor(session.receiptHashHex);
-		const owed =
-			held.activeOfferId === session.offerIdHex ? held.funding : undefined;
+		const displaced =
+			held.activeOfferId === session.offerIdHex
+				? held.funding?.payerEphemeralKey
+				: undefined;
 		const marked = this.deps.requests.markAttemptFunding(
 			session.receiptHashHex,
 			session.offerIdHex,
@@ -1179,19 +1209,20 @@ export class DirectFundingReceiver extends EventEmitter {
 				channelId: final.channelId.toString('hex'),
 				splice: isSplice,
 				contentHash: session.contentHash,
-				payerEphemeralKey:
-					owed?.payerEphemeralKey ?? session.payerEphemeralKey.toString('hex')
+				payerEphemeralKey: session.payerEphemeralKey.toString('hex')
 			},
 			session.expiresAt
 		);
-		if (marked) return;
-		// The exchange goes on regardless. Withholding the sign request over a
-		// storage hiccup would strand the same funding with certainty, where
-		// sending it still leaves the payer able to complete it in this life.
-		this.log(DF_LOG_OFFER_FAILED, {
-			offerId: session.offerIdHex,
-			error: 'funding binding was not recorded on the request'
-		});
+		if (!marked) {
+			// The exchange goes on regardless. Withholding the sign request over a
+			// storage hiccup would strand the same funding with certainty, where
+			// sending it still leaves the payer able to complete it in this life.
+			this.log(DF_LOG_OFFER_FAILED, {
+				offerId: session.offerIdHex,
+				error: 'funding binding was not recorded on the request'
+			});
+		}
+		return displaced;
 	}
 
 	/**
@@ -1924,7 +1955,12 @@ export class DirectFundingReceiver extends EventEmitter {
 		session.laneKey = frame.laneKey;
 		session.reply = frame.reply;
 		session.payerEphemeralKey = ephemeralPublicKey;
-		let signRequestOut = true;
+		// The funding's mark moves with the session, and before the frames go for
+		// the same reason: a crash between a sign request the payer answers and a
+		// mark still naming the old lane leaves that answer unopenable for good.
+		this.rebindFundingLane(session);
+		let signRequestOut: boolean | undefined;
+		let everyResponseOut = true;
 		for (const response of session.responses) {
 			const sent = this.emitSealed(
 				frame.reply,
@@ -1933,11 +1969,11 @@ export class DirectFundingReceiver extends EventEmitter {
 				response.subtype,
 				response.body
 			);
+			if (!sent) everyResponseOut = false;
 			if (
-				!sent &&
 				response.subtype === BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST
 			) {
-				signRequestOut = false;
+				signRequestOut = sent;
 			}
 		}
 		// The witness answers the sign request, and the payer sends it once. So
@@ -1945,28 +1981,30 @@ export class DirectFundingReceiver extends EventEmitter {
 		// one when the replay carried it, and otherwise the lane that already
 		// holds it. Staying on a lane the sign request never left would invalidate
 		// the only keys that witness can be opened with, live and after a restart
-		// both, stranding the payer's input unwitnessed (#635).
-		if (!signRequestOut) {
-			session.keys = previous.keys;
-			session.laneKey = previous.laneKey;
-			session.reply = previous.reply;
-			session.payerEphemeralKey = previous.payerEphemeralKey;
-			return;
-		}
+		// both, stranding the payer's input unwitnessed (#635). A session with no
+		// sign request yet has nothing at stake and moves on any lane that took
+		// what it did have; a lane that refused even the ACK is not one.
+		if (signRequestOut ?? everyResponseOut) return;
+		session.keys = previous.keys;
+		session.laneKey = previous.laneKey;
+		session.reply = previous.reply;
+		session.payerEphemeralKey = previous.payerEphemeralKey;
 		this.rebindFundingLane(session);
 	}
 
 	/**
-	 * Put the session's current lane on the funding, once its sign request has
-	 * left on that lane. Nothing to do before there is a funding to name, and
-	 * nothing to do when the mark already names this lane.
+	 * Put a payer lane on the funding, defaulting to the session's own. Nothing
+	 * to do before there is a funding to name, and nothing to do when the mark
+	 * already names that lane.
 	 */
-	private rebindFundingLane(session: IDfOfferSession): void {
+	private rebindFundingLane(
+		session: IDfOfferSession,
+		payerEphemeralKey = session.payerEphemeralKey.toString('hex')
+	): void {
 		const attempt = this.deps.requests.attemptsFor(session.receiptHashHex);
 		if (attempt.activeOfferId !== session.offerIdHex || !attempt.funding) {
 			return;
 		}
-		const payerEphemeralKey = session.payerEphemeralKey.toString('hex');
 		if (attempt.funding.payerEphemeralKey === payerEphemeralKey) return;
 		const rebound = this.deps.requests.markAttemptFunding(
 			session.receiptHashHex,

@@ -20,6 +20,7 @@ import {
 	decodeDfReceipt,
 	decodeDfSignRequest
 } from '../../src/lightning/direct-funding/messages';
+import { DF_REQUESTS_STORAGE_KEY } from '../../src/lightning/direct-funding/requests';
 import {
 	buildOffer,
 	FakeDfNode,
@@ -899,6 +900,16 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		};
 	}
 
+	/** Wallet storage exactly as it stood at this instant. */
+	function snapshotOf(
+		storage: ReturnType<typeof memoryStorage>
+	): ReturnType<typeof memoryStorage> {
+		const copy = memoryStorage();
+		const raw = storage.loadWalletData(DF_REQUESTS_STORAGE_KEY);
+		if (raw !== null) copy.saveWalletData(DF_REQUESTS_STORAGE_KEY, raw);
+		return copy;
+	}
+
 	function restart(node: FakeDfNode): DirectFundingReceiver {
 		const engine = new DirectFundingReceiver(node, {
 			negotiationTimeoutMs: 5_000,
@@ -1177,6 +1188,141 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		engine.stop();
 	});
 
+	it('records the moved lane before the replayed sign request leaves', async () => {
+		const storage = memoryStorage();
+		const node = new FakeDfNode(storage);
+		const record = node.mintRequest();
+		const coin = makeCoin();
+		node.publish(coin);
+		const offer = buildOffer(record, coin);
+		const before = new FakePayerLane(record, 'lane-before');
+		const engine = restart(node);
+		engine.handleFrame(before.offerFrame(offer));
+		await flush();
+		const { channelId } = node.completeNegotiation(coin, offer);
+		await flush();
+
+		// Taken down INSIDE the replayed send. The payer answers the lane that
+		// send reached, so the mark has to name it already: written afterwards it
+		// would be the old lane that came back, and the witness is sent once.
+		let snapshot: ReturnType<typeof memoryStorage> | null = null;
+		const moved = new FakePayerLane(record, 'lane-moved');
+		moved.onReceive = (subtype): void => {
+			if (subtype === SIGN_REQUEST) snapshot = snapshotOf(storage);
+		};
+		engine.handleFrame(moved.offerFrame(offer));
+		await flush();
+		expect(moved.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+
+		const second = new FakeDfNode(snapshot!);
+		second.publish(coin);
+		second.stagePendingV2(channelId, coin, offer);
+		const restarted = restart(second);
+		restarted.handleFrame(
+			moved.witnessFrame(offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(second.witnesses).to.have.length(1);
+		restarted.stop();
+	});
+
+	it('keeps the working lane when a duplicate arrives on one that refuses the ack', async () => {
+		const node = new FakeDfNode();
+		const record = node.mintRequest();
+		const coin = makeCoin();
+		node.publish(coin);
+		const offer = buildOffer(record, coin);
+		const before = new FakePayerLane(record, 'lane-before');
+		const engine = restart(node);
+		engine.handleFrame(before.offerFrame(offer));
+		await flush();
+		// The duplicate arrives with only the ack recorded, and that lane cannot
+		// carry it. A session with nothing at stake still has nothing to gain
+		// from a lane that refuses the one frame it did have.
+		const dead = new FakePayerLane(record, 'lane-dead');
+		const frame = dead.offerFrame(offer);
+		engine.handleFrame({
+			...frame,
+			reply: {
+				type: frame.reply.type,
+				send: (): void => {
+					throw new Error('lane is gone');
+				},
+				trySend: (): boolean => false
+			}
+		});
+		await flush();
+		node.completeNegotiation(coin, offer);
+		await flush();
+
+		expect(before.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('records the resumed lane before its sign request leaves', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		let snapshot: ReturnType<typeof memoryStorage> | null = null;
+		const again = new FakePayerLane(c.record, 'lane-after');
+		again.onReceive = (subtype): void => {
+			if (subtype === SIGN_REQUEST) snapshot = snapshotOf(c.storage);
+		};
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+
+		const third = new FakeDfNode(snapshot!);
+		third.publish(c.coin);
+		third.stagePendingV2(c.channelId, c.coin, c.offer);
+		const restarted = restart(third);
+		restarted.handleFrame(
+			again.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(third.witnesses).to.have.length(1);
+		restarted.stop();
+	});
+
+	it('replays the receipt a late witness earned over the session it settled', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		const dead = new FakePayerLane(c.record, 'lane-dead');
+		const deadFrame = dead.offerFrame(c.offer);
+		const refuse = {
+			type: deadFrame.reply.type,
+			send: (): void => {
+				throw new Error('lane is gone');
+			},
+			trySend: (): boolean => false
+		};
+		engine.handleFrame({ ...deadFrame, reply: refuse });
+		await flush();
+		// The witness completes the funding on the old lane and its receipt is
+		// lost. What is owed now is that receipt, and the session left over from
+		// the resume must not answer the next re-send ahead of it.
+		const witnessFrame = c.payer.witnessFrame(c.offer.offerId, [
+			Buffer.alloc(64, 3)
+		]);
+		engine.handleFrame({ ...witnessFrame, reply: refuse });
+		await flush();
+		expect(c.second.witnesses).to.have.length(1);
+
+		const again = new FakePayerLane(c.record, 'lane-again');
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		const receipts = again.bodiesOf(RECEIPT);
+		expect(receipts).to.have.length(1);
+		expect(decodeDfReceipt(receipts[0]).preimage.toString('hex')).to.equal(
+			c.record.preimageHex
+		);
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		engine.stop();
+	});
+
 	it('keeps the funding lane when a resumed offer cannot be answered', async () => {
 		const c = await crashAfterSignRequest();
 		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
@@ -1222,6 +1368,25 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		expect(
 			c.second.requests.attemptsFor(c.record.receiptHash).funding
 		).to.not.equal(undefined);
+		engine.stop();
+	});
+
+	it('holds that witness until the channel re-arms', async () => {
+		const c = await crashAfterSignRequest();
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(c.second.witnesses).to.have.length(0);
+
+		// The payer marks the witness sent the moment the wire takes it and never
+		// offers again, so nothing re-drives one dropped here.
+		c.second.completeNegotiation(c.coin, c.offer, { channelId: c.channelId });
+		await flush();
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
 		engine.stop();
 	});
 
