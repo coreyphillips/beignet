@@ -1141,6 +1141,72 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		engine.stop();
 	});
 
+	it('takes a witness answered inside the replayed sign request send', async () => {
+		const node = new FakeDfNode();
+		const record = node.mintRequest();
+		const coin = makeCoin();
+		node.publish(coin);
+		const offer = buildOffer(record, coin);
+		const before = new FakePayerLane(record, 'lane-before');
+		const engine = new DirectFundingReceiver(node, {
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(before.offerFrame(offer));
+		await flush();
+		node.completeNegotiation(coin, offer);
+		await flush();
+		expect(before.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+
+		// The payer comes back over another transport and answers the replayed
+		// sign request inside the send, the way one in the same process does.
+		const moved = new FakePayerLane(record, 'lane-moved');
+		moved.onReceive = (subtype): void => {
+			if (subtype !== SIGN_REQUEST) return;
+			engine.handleFrame(
+				moved.witnessFrame(offer.offerId, [Buffer.alloc(64, 3)])
+			);
+		};
+		engine.handleFrame(moved.offerFrame(offer));
+		await flush();
+
+		expect(node.witnesses).to.have.length(1);
+		expect(moved.bodiesOf(RECEIPT)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('keeps the funding lane when a resumed offer cannot be answered', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const engine = restart(c.second);
+		// A lane that takes the resumed offer and carries nothing back: the payer
+		// was never asked on it, so it still owes the witness to the lane the
+		// previous life asked on, and that lane must still be able to answer.
+		const dead = new FakePayerLane(c.record, 'lane-dead');
+		const frame = dead.offerFrame(c.offer);
+		engine.handleFrame({
+			...frame,
+			reply: {
+				type: frame.reply.type,
+				send: (): void => {
+					throw new Error('lane is gone');
+				},
+				trySend: (): boolean => false
+			}
+		});
+		await flush();
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(1);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		engine.stop();
+	});
+
 	it('keeps the funding for the payer when the channel cannot answer for it yet', async () => {
 		const c = await crashAfterSignRequest();
 		const engine = restart(c.second);

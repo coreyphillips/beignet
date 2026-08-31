@@ -473,9 +473,19 @@ export class DirectFundingReceiver extends EventEmitter {
 		wire: IDfWireFrame
 	): boolean {
 		for (const held of this.deps.requests.activeFundings()) {
-			// A session in this life owns its own witnesses, including the
-			// terminal one a late-witness handler is still holding open.
-			if (this.state.get(held.offerIdHex)) continue;
+			// A session in this life owns the witnesses for the lane its funding
+			// names, the terminal one a late-witness handler is still holding open
+			// included. A session that has not earned that lane owns none of them:
+			// a resumed offer whose own sign request has not left is not who the
+			// payer owes the witness to, and shadowing the funding would drop the
+			// one frame that can complete it.
+			const live = this.state.get(held.offerIdHex);
+			if (
+				live?.payerEphemeralKey.toString('hex') ===
+				held.funding.payerEphemeralKey
+			) {
+				continue;
+			}
 			const record = this.deps.requests.byReceiptHash(held.receiptHash);
 			if (!record) continue;
 			const lane = this.deps.requests.laneKeysFor(
@@ -1109,7 +1119,12 @@ export class DirectFundingReceiver extends EventEmitter {
 			// got.
 			stillOwed = (): void => this.keepWitnessObligation(ctx, final, isSplice);
 			witnesses = new DfWitnessQueue(ctx.session);
-			this.sendSignRequest(ctx, final);
+			// The funding's lane moves with the sign request, never ahead of it:
+			// until this one leaves, the witness is still owed to the lane the mark
+			// already names (issue #635).
+			if (this.sendSignRequest(ctx, final)) {
+				this.rebindFundingLane(ctx.session);
+			}
 			await this.collectWitness(ctx, final, isSplice, witnesses);
 			// The witness reached the channel: our tx_signatures are out and
 			// there is nothing left that could be unwound.
@@ -1149,6 +1164,13 @@ export class DirectFundingReceiver extends EventEmitter {
 		isSplice: boolean
 	): void {
 		const { session } = ctx;
+		// A resumed offer arrives on a lane of its own, and the mark names the one
+		// a previous life asked on: the only keys the witness the payer already
+		// owes can be opened with. So this write keeps that lane, and the move
+		// waits for this session's own sign request to leave, as a replay does.
+		const held = this.deps.requests.attemptsFor(session.receiptHashHex);
+		const owed =
+			held.activeOfferId === session.offerIdHex ? held.funding : undefined;
 		const marked = this.deps.requests.markAttemptFunding(
 			session.receiptHashHex,
 			session.offerIdHex,
@@ -1157,7 +1179,8 @@ export class DirectFundingReceiver extends EventEmitter {
 				channelId: final.channelId.toString('hex'),
 				splice: isSplice,
 				contentHash: session.contentHash,
-				payerEphemeralKey: session.payerEphemeralKey.toString('hex')
+				payerEphemeralKey:
+					owed?.payerEphemeralKey ?? session.payerEphemeralKey.toString('hex')
 			},
 			session.expiresAt
 		);
@@ -1344,8 +1367,10 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * exactly this transaction. The transaction is hashed rather than embedded
 	 * so the signed string stays fixed size; the payer recomputes the hash from
 	 * the bytes it was handed.
+	 *
+	 * False when the lane refused the frame, so the payer was never asked.
 	 */
-	private sendSignRequest(ctx: IDfSessionContext, final: IDfFinalTx): void {
+	private sendSignRequest(ctx: IDfSessionContext, final: IDfFinalTx): boolean {
 		if (final.baseFundingValueSat === undefined) {
 			throw new Error(
 				'the shared input value is unresolvable, so the new funding output has no floor'
@@ -1381,7 +1406,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			script: Buffer.from(s),
 			valueSat: final.prevouts.values[i]
 		}));
-		this.send(
+		return this.send(
 			ctx.session.reply,
 			ctx.session,
 			BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST,
@@ -1850,9 +1875,15 @@ export class DirectFundingReceiver extends EventEmitter {
 		session: IDfOfferSession,
 		subtype: number,
 		body: Buffer
-	): void {
+	): boolean {
 		this.state.record(session, subtype, body);
-		this.emitSealed(reply, session.keys, session.requestId, subtype, body);
+		return this.emitSealed(
+			reply,
+			session.keys,
+			session.requestId,
+			subtype,
+			body
+		);
 	}
 
 	/** False when the lane refused the frame outright, so nothing left. */
@@ -1869,10 +1900,10 @@ export class DirectFundingReceiver extends EventEmitter {
 
 	/**
 	 * Replay a session's recorded responses on the lane the duplicate arrived
-	 * on, and, once they have reached it, rebind the session to it. A payer
-	 * whose answer was lost may well come back over a different transport, and
-	 * rebinding is the only way it can be served: nothing is re-run and no
-	 * second channel session begins.
+	 * on, and keep the session there when they reach it. A payer whose answer
+	 * was lost may well come back over a different transport, and rebinding is
+	 * the only way it can be served: nothing is re-run and no second channel
+	 * session begins.
 	 */
 	private replay(
 		session: IDfOfferSession,
@@ -1880,6 +1911,19 @@ export class DirectFundingReceiver extends EventEmitter {
 		keys: IDfLaneKeys,
 		ephemeralPublicKey: Buffer
 	): void {
+		// The lane goes on before the frames do, as the witness queue does around
+		// a first sign request: on a synchronous lane the payer answers inside the
+		// send, and only a session already naming that lane can open the witness.
+		const previous = {
+			keys: session.keys,
+			laneKey: session.laneKey,
+			reply: session.reply,
+			payerEphemeralKey: session.payerEphemeralKey
+		};
+		session.keys = keys;
+		session.laneKey = frame.laneKey;
+		session.reply = frame.reply;
+		session.payerEphemeralKey = ephemeralPublicKey;
 		let signRequestOut = true;
 		for (const response of session.responses) {
 			const sent = this.emitSealed(
@@ -1897,36 +1941,37 @@ export class DirectFundingReceiver extends EventEmitter {
 			}
 		}
 		// The witness answers the sign request, and the payer sends it once. So
-		// the session and its funding follow the lane the sign request reached:
-		// this one when the replay carried it, and otherwise the lane that
-		// already holds it. Moving to a lane the sign request never left would
-		// invalidate the only keys that witness can be opened with, live and
-		// after a restart both, stranding the payer's input unwitnessed (#635).
-		if (!signRequestOut) return;
-		session.keys = keys;
-		session.laneKey = frame.laneKey;
-		session.reply = frame.reply;
-		session.payerEphemeralKey = ephemeralPublicKey;
+		// the session and its funding keep the lane the sign request reached: this
+		// one when the replay carried it, and otherwise the lane that already
+		// holds it. Staying on a lane the sign request never left would invalidate
+		// the only keys that witness can be opened with, live and after a restart
+		// both, stranding the payer's input unwitnessed (#635).
+		if (!signRequestOut) {
+			session.keys = previous.keys;
+			session.laneKey = previous.laneKey;
+			session.reply = previous.reply;
+			session.payerEphemeralKey = previous.payerEphemeralKey;
+			return;
+		}
 		this.rebindFundingLane(session);
 	}
 
 	/**
-	 * Put the session's current lane on the funding it has already marked.
-	 * Nothing to do before that point: markFunding writes whichever lane the
-	 * session holds when it runs.
+	 * Put the session's current lane on the funding, once its sign request has
+	 * left on that lane. Nothing to do before there is a funding to name, and
+	 * nothing to do when the mark already names this lane.
 	 */
 	private rebindFundingLane(session: IDfOfferSession): void {
 		const attempt = this.deps.requests.attemptsFor(session.receiptHashHex);
 		if (attempt.activeOfferId !== session.offerIdHex || !attempt.funding) {
 			return;
 		}
+		const payerEphemeralKey = session.payerEphemeralKey.toString('hex');
+		if (attempt.funding.payerEphemeralKey === payerEphemeralKey) return;
 		const rebound = this.deps.requests.markAttemptFunding(
 			session.receiptHashHex,
 			session.offerIdHex,
-			{
-				...attempt.funding,
-				payerEphemeralKey: session.payerEphemeralKey.toString('hex')
-			},
+			{ ...attempt.funding, payerEphemeralKey },
 			session.expiresAt
 		);
 		if (rebound) return;
