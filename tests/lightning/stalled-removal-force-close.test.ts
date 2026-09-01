@@ -389,6 +389,89 @@ describe('The commitment a stalled removal round leaves us (issue #634)', functi
 		f.destroy();
 	});
 
+	it('attributes a retained same-hash output to the retained part', function () {
+		// The mirror image: here the LIVE part is the trimmed one, so the only
+		// offered output is the retained part's and must be recorded with its
+		// id and expiry.
+		const f = stalledRemoval(366);
+		const st = f.alice
+			.getChannelManager()
+			.getChannel(f.channelId)!
+			.getFullState();
+		const live: IHtlcEntry = {
+			...f.entry,
+			id: 1n,
+			state: HtlcState.COMMITTED,
+			amountMsat: 1_000n,
+			cltvExpiry: EXPIRY + 40
+		};
+		delete live.removalLocallyRevoked;
+		st.htlcs.set('offered-1', live);
+
+		const tx = plannedCommitment(f.alice, f.channelId);
+		f.alice
+			.getChannelManager()
+			.handleFundingSpent(
+				f.channelId,
+				tx,
+				EXPIRY,
+				Buffer.from('0014' + '11'.repeat(20), 'hex')
+			);
+
+		const tracked = f.alice
+			.getChannelManager()
+			.getMonitor(f.channelId)!
+			.getTrackedOutputs()
+			.filter((o) => o.outputType === OutputType.OFFERED_HTLC);
+		expect(tracked, 'only the retained part has an output').to.have.length(1);
+		expect(tracked[0].htlcId).to.equal(0n);
+		expect(tracked[0].cltvExpiry).to.equal(EXPIRY);
+		f.destroy();
+	});
+
+	it('pairs two same-hash outputs with the parts they were built from', function () {
+		// Both parts untrimmed: the commitment sorts their identical scripts by
+		// amount, so an attribution that ignores the amount hands each output
+		// the other part's expiry.
+		const f = stalledRemoval(367);
+		const st = f.alice
+			.getChannelManager()
+			.getChannel(f.channelId)!
+			.getFullState();
+		const live: IHtlcEntry = {
+			...f.entry,
+			id: 1n,
+			state: HtlcState.COMMITTED,
+			amountMsat: HTLC_MSAT * 2n,
+			cltvExpiry: EXPIRY + 40
+		};
+		delete live.removalLocallyRevoked;
+		st.htlcs.set('offered-1', live);
+
+		const tx = plannedCommitment(f.alice, f.channelId);
+		f.alice
+			.getChannelManager()
+			.handleFundingSpent(
+				f.channelId,
+				tx,
+				EXPIRY,
+				Buffer.from('0014' + '11'.repeat(20), 'hex')
+			);
+
+		const tracked = f.alice
+			.getChannelManager()
+			.getMonitor(f.channelId)!
+			.getTrackedOutputs()
+			.filter((o) => o.outputType === OutputType.OFFERED_HTLC);
+		expect(tracked, 'both parts have an output').to.have.length(2);
+		const byId = new Map(tracked.map((o) => [o.htlcId, o]));
+		expect(byId.get(0n)!.amount).to.equal(HTLC_MSAT / 1000n);
+		expect(byId.get(0n)!.cltvExpiry).to.equal(EXPIRY);
+		expect(byId.get(1n)!.amount).to.equal((HTLC_MSAT * 2n) / 1000n);
+		expect(byId.get(1n)!.cltvExpiry).to.equal(EXPIRY + 40);
+		f.destroy();
+	});
+
 	it('drops an output no commitment of ours was ever signed with', function () {
 		// The peer revoked for our add (so it may not be rolled back) but never
 		// signed a commitment carrying it, then failed it anyway. Retaining the

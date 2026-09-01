@@ -466,6 +466,7 @@ function countTheirHtlcMatches(
 			if (
 				matchTaprootHtlcOutput(
 					Buffer.from(out.script),
+					BigInt(out.value),
 					state,
 					keys,
 					false,
@@ -494,6 +495,7 @@ function countTheirHtlcMatches(
 		if (
 			matchHtlcOutput(
 				Buffer.from(out.script),
+				BigInt(out.value),
 				state,
 				revocationPubkey,
 				theirHtlcPubkey,
@@ -921,6 +923,7 @@ function classifyOurCommitmentOutputs(
 		// Try to match HTLC outputs
 		const htlcMatch = matchHtlcOutput(
 			outScript,
+			BigInt(tx.outs[i].value),
 			state,
 			revocationPubkey,
 			localHtlcPubkey,
@@ -1106,6 +1109,7 @@ function classifyTheirCommitmentOutputs(
 		// On their commitment: their offered = our received, their received = our offered
 		const htlcMatch = matchHtlcOutput(
 			outScript,
+			BigInt(tx.outs[i].value),
 			state,
 			revocationPubkey,
 			theirHtlcPubkey,
@@ -1290,30 +1294,40 @@ function htlcEntryCanBePresent(
 }
 
 /**
- * The entries an output is attributed from, stalled removals (the OUR
- * commitment arm above) LAST.
+ * The entries an output of `amount` is attributed from, best first.
  *
  * An offered HTLC script commits to neither amount nor expiry, so the parts of
- * one payment share it byte for byte. A removed part reached first therefore
- * claims a live part's output and records ITS htlcId and cltvExpiry, and the
- * HTLC-timeout tx built from that carries a locktime the stored signature was
- * never made over. Trying removed parts last is what keeps the arm additive:
- * they take only the outputs no previously eligible entry accounts for.
+ * one payment share it byte for byte and the script comparison cannot say which
+ * part an output belongs to. The commitment orders identical HTLC scripts by
+ * amount and then by cltv_expiry ascending (BOLT 3) and the callers walk the
+ * outputs in that order, so the entry of the output's OWN amount with the
+ * lowest expiry is the one it was built from. Attributing across parts records
+ * the other part's id and expiry, and the HTLC-timeout tx built from that
+ * carries a locktime the stored signature was never made over.
+ *
+ * Entries of another amount stay on as a fallback rather than being filtered
+ * out: the script comparison is still the arbiter, and this classification also
+ * serves revoked commitments, where nothing that matched before may stop
+ * matching.
  */
 function htlcMatchOrder(
 	state: IChannelState,
-	isLocalCommitment: boolean
+	amount: bigint
 ): [string, IHtlcEntry][] {
-	const stalled = ([, entry]: [string, IHtlcEntry]): boolean =>
-		isLocalCommitment &&
-		entry.direction === HtlcDirection.OFFERED &&
-		(entry.state === HtlcState.FULFILLED || entry.state === HtlcState.FAILED);
-	const entries = [...state.htlcs.entries()];
-	return [...entries.filter((e) => !stalled(e)), ...entries.filter(stalled)];
+	const entries = [...state.htlcs.entries()].sort(
+		([, a], [, b]) => a.cltvExpiry - b.cltvExpiry
+	);
+	const sameAmount = ([, entry]: [string, IHtlcEntry]): boolean =>
+		entry.amountMsat / 1000n === amount;
+	return [
+		...entries.filter(sameAmount),
+		...entries.filter((e) => !sameAmount(e))
+	];
 }
 
 function matchHtlcOutput(
 	outScript: Buffer,
+	outAmount: bigint,
 	state: IChannelState,
 	revocationPubkey: Buffer,
 	localHtlcPubkey: Buffer,
@@ -1330,7 +1344,7 @@ function matchHtlcOutput(
 	// that matches the on-chain commitment.
 	const useAnchors = isAnchorChannel(state.channelType);
 
-	for (const [entryKey, entry] of htlcMatchOrder(state, isLocal)) {
+	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount)) {
 		if (claimedKeys?.has(entryKey)) {
 			continue;
 		}
@@ -1509,6 +1523,7 @@ function deriveTaprootCommitKeys(
 
 function matchTaprootHtlcOutput(
 	outScript: Buffer,
+	outAmount: bigint,
 	state: IChannelState,
 	keys: ITaprootCommitKeys,
 	isOurs: boolean,
@@ -1516,7 +1531,7 @@ function matchTaprootHtlcOutput(
 	// scripts must each claim a DISTINCT entry.
 	claimedKeys?: Set<string>
 ): IHtlcMatch | null {
-	for (const [entryKey, entry] of htlcMatchOrder(state, isOurs)) {
+	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount)) {
 		if (claimedKeys?.has(entryKey)) {
 			continue;
 		}
@@ -1615,6 +1630,7 @@ function classifyTaprootCommitmentOutputs(
 		}
 		const htlc = matchTaprootHtlcOutput(
 			outScript,
+			base.amount,
 			state,
 			keys,
 			isOurs,
