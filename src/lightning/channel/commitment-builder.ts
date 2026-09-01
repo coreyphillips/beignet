@@ -604,9 +604,15 @@ export function buildLocalCommitment(
 				if (entry.removalRemoteCommitted !== false) {
 					localMsat += entry.amountMsat;
 				}
-			} else {
-				// We offered and remote fulfilled: credit their balance
+			} else if (localCommitmentCarriesAdd(entry, signedLocal)) {
+				// We offered and remote fulfilled: credit their balance.
 				remoteMsat += entry.amountMsat;
+			} else {
+				// The peer revealed the preimage for an add this commitment
+				// never carried. It holds neither the HTLC output nor the
+				// credit, so our provisional deduction comes back instead of
+				// the peer being paid (issue #643).
+				localMsat += entry.amountMsat;
 			}
 		} else if (entry.state === HtlcState.FAILED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {

@@ -145,7 +145,7 @@ interface IStall {
  */
 function stalledAdd(
 	seedBase: number,
-	opts: { signsTheAdd?: boolean } = {}
+	opts: { signsTheAdd?: boolean; preimage?: Buffer } = {}
 ): IStall {
 	const signsTheAdd = opts.signsTheAdd !== false;
 	const alice = createNode(seedBase);
@@ -176,15 +176,12 @@ function stalledAdd(
 		return !failSeen;
 	};
 
+	const paymentHash = opts.preimage
+		? crypto.createHash('sha256').update(opts.preimage).digest()
+		: crypto.randomBytes(32);
 	alice
 		.getChannelManager()
-		.addHtlc(
-			channelId,
-			HTLC_MSAT,
-			crypto.randomBytes(32),
-			EXPIRY,
-			Buffer.alloc(1366)
-		);
+		.addHtlc(channelId, HTLC_MSAT, paymentHash, EXPIRY, Buffer.alloc(1366));
 
 	const entry = alice
 		.getChannelManager()
@@ -321,6 +318,27 @@ describe('The force-close rebuild and an unsigned add (issue #643)', function ()
 		expect(hasHtlcOutput(tx), 'the HTLC output is in the commitment').to.equal(
 			true
 		);
+		expect(
+			peerSigned(f.alice, f.channelId, tx),
+			'the stored remote signature covers what we broadcast'
+		).to.equal(true);
+		f.destroy();
+	});
+
+	it('returns the deduction when the peer fulfills an add it never signed', function () {
+		// The peer can reveal the preimage inside the same gap. The stored
+		// signature covers the pre-add balances, so the ordinary fulfill
+		// accounting (credit the peer, keep our deduction) rebuilds a
+		// commitment that signature does not verify.
+		const preimage = crypto.randomBytes(32);
+		const f = stalledAdd(640, { signsTheAdd: false, preimage });
+		f.bob.getChannelManager().fulfillHtlc(f.channelId, 0n, preimage);
+		expect(f.entry.state, 'the peer fulfilled it').to.equal(
+			HtlcState.FULFILLED
+		);
+
+		const tx = plannedCommitment(f.alice, f.channelId);
+
 		expect(
 			peerSigned(f.alice, f.channelId, tx),
 			'the stored remote signature covers what we broadcast'
