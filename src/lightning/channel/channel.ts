@@ -9781,7 +9781,10 @@ export class Channel {
 	/**
 	 * Why a splice started right now would be refused transiently, or null.
 	 * Every arm here is one initiateSplice raises with `transient: true`, in the
-	 * same order, so the two agree on what the caller is told.
+	 * same order, so the two agree on what the caller is told. The one addition
+	 * is a peer-owned handshake we have not answered yet: initiateSplice parks
+	 * the request there, and our reply makes the peer the session initiator, so
+	 * the parked request would never get to send splice_init.
 	 *
 	 * It exists because spliceIn sources its wallet inputs asynchronously and
 	 * cannot wait for initiateSplice to answer: the refusal would arrive on
@@ -9802,13 +9805,16 @@ export class Channel {
 				: null;
 		}
 		if (this._spliceAbortPending) return SPLICE_BUSY_ABORT_PENDING;
-		if (this._quiescence.isQuiescent()) {
+		// From the peer's stfu on, the session is the peer's whether or not the
+		// handshake has finished: a RECEIVED_STFU only owes the reply that turns
+		// it QUIESCENT, and that reply names the peer initiator.
+		if (this._quiescence.peerHasSentStfu()) {
 			return this._quiescence.isInitiator()
 				? null
 				: SPLICE_BUSY_PEER_QUIESCENCE;
 		}
-		// Not quiescent: this request would be the one to drive the handshake,
-		// so initiateQuiescence's own transient arm is ours too. A handshake
+		// Our own handshake, or none yet: this request would be the one to drive
+		// it, so initiateQuiescence's own transient arm is ours too. A handshake
 		// already in flight parks the request instead and refuses nothing.
 		if (!this._quiescence.isQuiescing() && this.hasPendingHtlcs()) {
 			return QUIESCE_BUSY_PENDING_HTLCS;

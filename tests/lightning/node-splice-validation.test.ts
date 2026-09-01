@@ -14,6 +14,7 @@ import {
 	HtlcDirection,
 	HtlcState
 } from '../../src/lightning/channel/types';
+import { QuiescenceState } from '../../src/lightning/channel/quiescence';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
@@ -706,7 +707,20 @@ describe('LightningNode transient splice refusals', function () {
 					channelOf(node, channelId).markForReestablish(),
 				/reconnecting/
 			],
-			['settling HTLCs', settlingHtlc, /pending HTLCs/]
+			['settling HTLCs', settlingHtlc, /pending HTLCs/],
+			[
+				'peer stfu still draining',
+				(node, channelId): void => {
+					settlingHtlc(node, channelId);
+					const channel = channelOf(node, channelId);
+					channel.handleStfuMessage({ channelId, initiator: true });
+					expect(
+						channel.getQuiescenceState(),
+						'the peer stfu latched, its reply owed'
+					).to.equal(QuiescenceState.RECEIVED_STFU);
+				},
+				/retry after it ends/
+			]
 		];
 		for (const [name, makeBusy, message] of busyStates) {
 			const node = createTestNode();
