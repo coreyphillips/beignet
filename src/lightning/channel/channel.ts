@@ -757,6 +757,15 @@ export class Channel {
 		locktime: number;
 		cancelled: boolean;
 		ownsQuiescence: boolean;
+		// The direction this request was made with, carried with the request
+		// rather than left on the channel (issue #640): the channel stays NORMAL
+		// while the stfu is unanswered, so a later request refused before it
+		// parks has already recorded ITS direction over the channel fields.
+		spliceOutDestination: { script: Buffer; sats: bigint } | null;
+		spliceInInputs: {
+			inputs: ISpliceWalletInput[];
+			changeScript: Buffer;
+		} | null;
 	} | null = null;
 	// Splice interactive-tx driving (initiator side). The ordered contributions
 	// we still need to send (shared input, new funding output, splice-out
@@ -9656,6 +9665,10 @@ export class Channel {
 		) {
 			const pending = this._pendingSplice;
 			this._pendingSplice = null;
+			// Splice from the direction the request carried, not from whatever a
+			// request refused since then left on the channel (issue #640).
+			this._spliceOutDestination = pending.spliceOutDestination;
+			this._spliceInInputs = pending.spliceInInputs;
 			if (!pending.cancelled) {
 				actions.push(
 					...this._startSplice(
@@ -9967,7 +9980,9 @@ export class Channel {
 			fundingFeeratePerkw,
 			locktime,
 			cancelled: false,
-			ownsQuiescence
+			ownsQuiescence,
+			spliceOutDestination: this._spliceOutDestination,
+			spliceInInputs: this._spliceInInputs
 		};
 
 		if (this._quiescence.isQuiescing()) {

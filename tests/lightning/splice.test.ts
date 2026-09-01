@@ -5427,6 +5427,61 @@ describe('Splice', function () {
 					).to.be.false;
 				});
 
+				/**
+				 * The window the state guard cannot see: a request awaiting the
+				 * peer's stfu leaves the channel NORMAL, so a second request
+				 * records its direction before being refused. The parked splice
+				 * must still splice what it asked for.
+				 */
+				it('a splice-out awaiting stfu ignores a refused splice-in requested meanwhile', function () {
+					const pair = makeWirePair();
+					const destScript = Buffer.concat([
+						Buffer.from([0x00, 0x14]),
+						crypto.randomBytes(20)
+					]);
+					const withdraw = 50_000n;
+					pair.opener.setSpliceOutDestination(destScript, withdraw);
+					// Queued, not delivered: the splice stays parked on our
+					// unanswered stfu, with the channel still NORMAL.
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.initiateSplice(-(withdraw + SPLICE_OUT_TEST_FEE), 253)
+					);
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+
+					// A splice-in over the funding cap: refused, inputs already set.
+					const wallet = makeSpliceInWallet(20_000_000n);
+					pair.opener.setSpliceInInputs(
+						[wallet.walletInput],
+						wallet.changeScript
+					);
+					expect(
+						findAction(
+							pair.opener.initiateSplice(20_000_000n, 253),
+							ChannelActionType.ERROR
+						).message
+					).to.include('exceeds maximum');
+
+					// The stfu handshake completes and the parked splice-out runs.
+					pair.pump();
+
+					expect(pair.errors).to.deep.equal([]);
+					expect(pair.broadcasts.length, 'both sides broadcast').to.equal(2);
+					const tx = bitcoin.Transaction.fromBuffer(pair.broadcasts[0]);
+					expect(tx.ins.length, 'shared input only').to.equal(1);
+					expect(
+						tx.outs.some(
+							(o) => o.script.equals(destScript) && BigInt(o.value) === withdraw
+						),
+						'withdrawal paid to the requested destination'
+					).to.be.true;
+					expect(
+						tx.outs.some((o) => o.script.equals(wallet.changeScript)),
+						'no change output from the refused splice-in'
+					).to.be.false;
+				});
+
 				it('an inbound splice_init crossing our unacked abort is ignored', function () {
 					const { acceptor } = makeNormalChannel();
 					quiesceAsResponder(acceptor);
