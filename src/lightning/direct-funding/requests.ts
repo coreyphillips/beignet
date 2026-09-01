@@ -298,6 +298,15 @@ export class DirectFundingRequestStore {
 		// request is refused, so anything overwriting this would be answering a
 		// replay with someone else's funding.
 		if (paidBy && !record.paidBy) record.paidBy = paidBy;
+		// A funding that completed past its request's own expiry leaves a
+		// tombstone the next sweep takes at once, and the payer has spent its coin
+		// by then: a receipt frame lost on the way could never be replayed. The row
+		// answers to the end of the hold that funding ran under, which is the
+		// window the payer's lane was live in anyway (issue #644).
+		const held = record.activeAttempt;
+		if (held?.funding && record.expiresAt < held.expiresAt) {
+			record.expiresAt = held.expiresAt;
+		}
 		record.activeAttempt = undefined;
 		if (!this.persist()) {
 			throw new DirectFundingError(

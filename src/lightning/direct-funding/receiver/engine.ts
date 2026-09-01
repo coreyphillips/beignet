@@ -320,10 +320,12 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * any of it: the transaction was never broadcast, so a request it can no
 	 * longer be paid against costs it nothing but the wait.
 	 *
-	 * The mark is cleared whatever the channel answers, which is what lets the
-	 * record go with the next sweep. A refused abort would otherwise keep a dead
-	 * request's secrets on disk for the rest of the node's life, and the log line
-	 * is the operator's signal that a pending channel needs a closer look.
+	 * Only an abort the channel actually completed clears the mark, the same read
+	 * `unwindFunding` applies: a v2 tx_abort awaiting its echo has released
+	 * nothing (a disconnect forgets it and resumes the negotiation), and a
+	 * refusal means the funding is past unwinding and can still complete. Either
+	 * way the hold stands and the next tick tries again, because clearing on one
+	 * of those answers strands the very channel this exists to retire.
 	 */
 	private retireLapsedFundings(): void {
 		for (const held of this.deps.requests.lapsedFundings()) {
@@ -337,16 +339,27 @@ export class DirectFundingReceiver extends EventEmitter {
 				continue;
 			}
 			const channelId = Buffer.from(held.funding.channelId, 'hex');
+			let released = false;
 			let outcome: string;
 			try {
-				const result = held.funding.splice
+				const result: { ok: boolean; error?: string; pending?: boolean } = held
+					.funding.splice
 					? this.deps.abortSplice(channelId, DF_LAPSED_ABORT_REASON)
 					: this.deps.abortDualFundedOpen(channelId, DF_LAPSED_ABORT_REASON);
-				outcome = result.ok
-					? 'the pending funding was aborted'
-					: `the pending funding could not be aborted: ${result.error}`;
+				released = result.ok && result.pending !== true;
+				if (released) outcome = 'the pending funding was aborted';
+				else if (result.ok) outcome = 'its tx_abort is awaiting the peer echo';
+				else outcome = `the abort was refused: ${result.error}`;
 			} catch (err) {
-				outcome = `the pending funding could not be aborted: ${errorText(err)}`;
+				outcome = `the abort threw: ${errorText(err)}`;
+			}
+			if (!released) {
+				this.log(DF_LOG_OFFER_FAILED, {
+					offerId: held.offerIdHex,
+					channelId: held.funding.channelId,
+					error: `${DF_LAPSED_ABORT_REASON}, and the funding is still live: ${outcome}`
+				});
+				continue;
 			}
 			this.state.release(held.funding.outpoint, held.offerIdHex);
 			this.deps.requests.endAttempt(held.receiptHash, held.offerIdHex);

@@ -1538,6 +1538,78 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 			expect(c.second.requests.byRequestId(c.record.requestId)).to.equal(null);
 			engine.stop();
 		});
+
+		it('keeps the funding held while the abort releases nothing', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 30 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			c.second.abortPending = true;
+			const failed: Array<{ offerId: string; reason: string }> = [];
+			const engine = new DirectFundingReceiver(c.second, {
+				negotiationTimeoutMs: 5_000,
+				witnessTimeoutMs: 5_000,
+				sweepIntervalMs: 60_000
+			});
+			engine.on('offer:failed', (e) => failed.push(e));
+			engine.start();
+
+			// The tx_abort is out but the peer has not echoed it, so the
+			// negotiation is fully live and a disconnect would resume it.
+			expect(c.second.aborts).to.have.length(1);
+			expect(failed).to.be.empty;
+			expect(c.second.requests.sweep()).to.equal(0);
+			expect(
+				c.second.requests.byReceiptHash(c.record.receiptHash)
+			).to.not.equal(null);
+
+			// A refusal says the same thing: the funding is past unwinding and can
+			// still complete.
+			c.second.abortError = 'cannot abort a v2 open after tx_signatures';
+			engine.stop();
+			engine.start();
+			expect(c.second.aborts).to.have.length(2);
+			expect(c.second.requests.sweep()).to.equal(0);
+
+			// Only the abort that lands lets the record go.
+			c.second.abortError = null;
+			c.second.abortPending = false;
+			engine.stop();
+			engine.start();
+			expect(c.second.aborts).to.have.length(3);
+			expect(failed).to.have.length(1);
+			expect(c.second.requests.sweep()).to.equal(1);
+			engine.stop();
+		});
+
+		it('replays the receipt of a funding that completed past the expiry', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 5 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			const engine = restart(c.second);
+			engine.handleFrame(
+				c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+			);
+			await flush();
+			expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+
+			// The coin is spent and that one receipt frame is the losable one, so
+			// the tombstone answers a re-sent offer for the rest of the window the
+			// funding was held for, restart included.
+			const again = new FakePayerLane(c.record, 'lane-after');
+			engine.handleFrame(again.offerFrame(c.offer));
+			await flush();
+			expect(again.bodiesOf(RECEIPT)).to.have.length(1);
+			const third = new FakeDfNode(
+				c.storage,
+				(): number => Date.now() + 5 * 60 * 1000
+			);
+			expect(third.requests.paidOffer(c.record.receiptHash)).to.not.equal(null);
+			engine.stop();
+		});
 	});
 });
 
