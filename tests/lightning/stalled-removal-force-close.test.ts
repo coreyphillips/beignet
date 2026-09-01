@@ -346,6 +346,49 @@ describe('The commitment a stalled removal round leaves us (issue #634)', functi
 		f.destroy();
 	});
 
+	it('attributes a live same-hash output to the live part', function () {
+		// An offered script carries neither amount nor expiry, so two parts of
+		// one payment share theirs byte for byte. Here the retained part is
+		// trimmed away and the only offered output is the live part's; taking
+		// it for the retained part would give the HTLC-timeout tx a locktime
+		// the stored signature was not made over.
+		const f = stalledRemoval(365);
+		const st = f.alice
+			.getChannelManager()
+			.getChannel(f.channelId)!
+			.getFullState();
+		f.entry.amountMsat = 1_000n;
+		const live: IHtlcEntry = {
+			...f.entry,
+			id: 1n,
+			state: HtlcState.COMMITTED,
+			amountMsat: HTLC_MSAT,
+			cltvExpiry: EXPIRY + 40
+		};
+		delete live.removalLocallyRevoked;
+		st.htlcs.set('offered-1', live);
+
+		const tx = plannedCommitment(f.alice, f.channelId);
+		f.alice
+			.getChannelManager()
+			.handleFundingSpent(
+				f.channelId,
+				tx,
+				EXPIRY,
+				Buffer.from('0014' + '11'.repeat(20), 'hex')
+			);
+
+		const tracked = f.alice
+			.getChannelManager()
+			.getMonitor(f.channelId)!
+			.getTrackedOutputs()
+			.filter((o) => o.outputType === OutputType.OFFERED_HTLC);
+		expect(tracked, 'only the live part has an output').to.have.length(1);
+		expect(tracked[0].htlcId).to.equal(1n);
+		expect(tracked[0].cltvExpiry).to.equal(EXPIRY + 40);
+		f.destroy();
+	});
+
 	it('drops an output no commitment of ours was ever signed with', function () {
 		// The peer revoked for our add (so it may not be rolled back) but never
 		// signed a commitment carrying it, then failed it anyway. Retaining the

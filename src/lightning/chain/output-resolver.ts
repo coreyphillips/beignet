@@ -1289,6 +1289,29 @@ function htlcEntryCanBePresent(
 	);
 }
 
+/**
+ * The entries an output is attributed from, stalled removals (the OUR
+ * commitment arm above) LAST.
+ *
+ * An offered HTLC script commits to neither amount nor expiry, so the parts of
+ * one payment share it byte for byte. A removed part reached first therefore
+ * claims a live part's output and records ITS htlcId and cltvExpiry, and the
+ * HTLC-timeout tx built from that carries a locktime the stored signature was
+ * never made over. Trying removed parts last is what keeps the arm additive:
+ * they take only the outputs no previously eligible entry accounts for.
+ */
+function htlcMatchOrder(
+	state: IChannelState,
+	isLocalCommitment: boolean
+): [string, IHtlcEntry][] {
+	const stalled = ([, entry]: [string, IHtlcEntry]): boolean =>
+		isLocalCommitment &&
+		entry.direction === HtlcDirection.OFFERED &&
+		(entry.state === HtlcState.FULFILLED || entry.state === HtlcState.FAILED);
+	const entries = [...state.htlcs.entries()];
+	return [...entries.filter((e) => !stalled(e)), ...entries.filter(stalled)];
+}
+
 function matchHtlcOutput(
 	outScript: Buffer,
 	state: IChannelState,
@@ -1307,7 +1330,7 @@ function matchHtlcOutput(
 	// that matches the on-chain commitment.
 	const useAnchors = isAnchorChannel(state.channelType);
 
-	for (const [entryKey, entry] of state.htlcs.entries()) {
+	for (const [entryKey, entry] of htlcMatchOrder(state, isLocal)) {
 		if (claimedKeys?.has(entryKey)) {
 			continue;
 		}
@@ -1493,7 +1516,7 @@ function matchTaprootHtlcOutput(
 	// scripts must each claim a DISTINCT entry.
 	claimedKeys?: Set<string>
 ): IHtlcMatch | null {
-	for (const [entryKey, entry] of state.htlcs.entries()) {
+	for (const [entryKey, entry] of htlcMatchOrder(state, isOurs)) {
 		if (claimedKeys?.has(entryKey)) {
 			continue;
 		}
