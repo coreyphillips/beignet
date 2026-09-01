@@ -107,9 +107,9 @@ export class DirectFundingRequestStore {
 	// ─────────────── Lifecycle ───────────────
 
 	/**
-	 * Reload outstanding requests, dropping the expired, and rebuild both
-	 * indexes. Returns how many came back. Call once, after the node's own
-	 * storage restore.
+	 * Reload outstanding requests, dropping the expired ones no funding still
+	 * needs (see `answersFor`), and rebuild both indexes. Returns how many came
+	 * back. Call once, after the node's own storage restore.
 	 */
 	restore(): number {
 		this.byHash.clear();
@@ -135,11 +135,13 @@ export class DirectFundingRequestStore {
 				dropped++;
 				continue;
 			}
-			if (entry.expiresAt <= now) {
+			// The strip comes FIRST: a row whose only claim on life is a marker
+			// that did not come back intact has no funding to answer for.
+			if (stripMalformedAttempt(entry)) stripped = true;
+			if (!answersFor(entry, now)) {
 				dropped++;
 				continue;
 			}
-			if (stripMalformedAttempt(entry)) stripped = true;
 			this.index(entry);
 		}
 		// Only rewrite when the set actually changed, so a restart with nothing
@@ -165,12 +167,15 @@ export class DirectFundingRequestStore {
 		this.sweepTimer = null;
 	}
 
-	/** Drop every expired record. Returns how many went. */
+	/**
+	 * Drop every expired record, save one still answering for a funding it left
+	 * in flight. Returns how many went.
+	 */
 	sweep(): number {
 		const now = this.now();
 		let dropped = 0;
 		for (const record of [...this.byHash.values()]) {
-			if (record.expiresAt <= now) {
+			if (!answersFor(record, now)) {
 				this.unindex(record);
 				dropped++;
 			}
@@ -256,7 +261,7 @@ export class DirectFundingRequestStore {
 	byReceiptHash(receiptHashHex: string): IDfRequestRecord | null {
 		const record = this.byHash.get(receiptHashHex);
 		if (!record) return null;
-		return record.expiresAt > this.now() ? record : null;
+		return answersFor(record, this.now()) ? record : null;
 	}
 
 	/**
@@ -352,7 +357,9 @@ export class DirectFundingRequestStore {
 	 * negotiated transaction spends the payer's coin into a channel the peer
 	 * already signed for, and only the payer's witness can finish it. Holding to
 	 * the request's own expiry rather than the session TTL is what stops the
-	 * request going free under a funding still waiting on that witness.
+	 * request going free under a funding still waiting on that witness, and the
+	 * record answers for the mark for as long as it stands, its own expiry
+	 * included (issue #644).
 	 *
 	 * Reports whether the write landed. A false answer leaves the mark standing
 	 * in memory, so the funding is still held for this process's life; what is
@@ -395,11 +402,43 @@ export class DirectFundingRequestStore {
 		for (const record of this.byHash.values()) {
 			const active = record.activeAttempt;
 			if (!active?.funding || active.expiresAt <= now) continue;
-			if (record.expiresAt <= now) continue;
 			out.push({
 				receiptHash: record.receiptHash,
 				offerIdHex: active.offerIdHex,
 				expiresAt: active.expiresAt,
+				funding: active.funding
+			});
+		}
+		return out;
+	}
+
+	/**
+	 * Fundings whose hold has run out on a request that is itself past its
+	 * expiry: the rows the sweep will not take (issue #644).
+	 *
+	 * The store cannot retire one of these on its own. Only the receiver knows
+	 * whether the channel the funding names can still be told to give it up, so
+	 * it is handed the row and clears the mark with `endAttempt` when it has;
+	 * the record then goes with the next sweep like any other expired one.
+	 */
+	lapsedFundings(): Array<{
+		receiptHash: string;
+		offerIdHex: string;
+		funding: IDfAttemptFunding;
+	}> {
+		const now = this.now();
+		const out: Array<{
+			receiptHash: string;
+			offerIdHex: string;
+			funding: IDfAttemptFunding;
+		}> = [];
+		for (const record of this.byHash.values()) {
+			const active = record.activeAttempt;
+			if (!active?.funding) continue;
+			if (active.expiresAt > now || record.expiresAt > now) continue;
+			out.push({
+				receiptHash: record.receiptHash,
+				offerIdHex: active.offerIdHex,
 				funding: active.funding
 			});
 		}
@@ -428,7 +467,10 @@ export class DirectFundingRequestStore {
 		slotExpiresAt: number
 	): boolean {
 		const record = this.byReceiptHash(receiptHashHex);
-		if (!record) return false;
+		// On the REQUEST'S own clock, not the record's: one still answering for a
+		// funding it outlived its expiry for (issue #644) is past being payable,
+		// and a fresh attempt would take the mark that funding is held by.
+		if (!record || record.expiresAt <= this.now()) return false;
 		record.attempts = (record.attempts ?? 0) + 1;
 		record.activeAttempt = { offerIdHex, expiresAt: slotExpiresAt };
 		this.persist();
@@ -560,6 +602,23 @@ export class DirectFundingRequestStore {
 			return false;
 		}
 	}
+}
+
+/**
+ * Whether a record still answers, which is not the question of whether the
+ * request it belongs to can still be paid.
+ *
+ * A record holding a funding in flight outlives its own expiry (issue #644).
+ * That funding names a channel the peer has already signed for and only the
+ * payer's witness can finish, and this row holds the only copy of the lane key
+ * that witness can be opened on and of the preimage that acknowledges it: swept
+ * on the request's clock, the channel can be completed by no route at all and
+ * nothing retires it either. The mark is cleared when the funding settles, or
+ * by the receiver when it gives the funding up, and the record goes with the
+ * next sweep after that.
+ */
+function answersFor(record: IDfRequestRecord, now: number): boolean {
+	return record.expiresAt > now || record.activeAttempt?.funding !== undefined;
 }
 
 function isHex(value: unknown, bytes: number): boolean {
