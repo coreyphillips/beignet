@@ -557,7 +557,8 @@ const outResult = node.spliceOut(channelId, 50_000n, 253);
 // INSUFFICIENT_BALANCE, FUNDING_PROVIDER_REQUIRED, SPLICE_BUSY,
 // SPLICE_REFUSED). SPLICE_BUSY is the one to retry unchanged: the channel
 // would splice but is held off by a state that ends on its own (an
-// unacknowledged abort, a peer-owned quiescence session, settling HTLCs).
+// unacknowledged abort, a peer-owned quiescence session, settling HTLCs,
+// a peer reconnecting).
 // `ok: true` means the splice started, not that it completed: the outcome
 // arrives on splice:complete, splice:aborted or node:error.
 
