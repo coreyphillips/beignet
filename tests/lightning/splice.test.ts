@@ -5376,6 +5376,57 @@ describe('Splice', function () {
 					).to.be.false;
 				});
 
+				/**
+				 * The mirror case: the refused request is the SECOND one, and the
+				 * configuration already on the channel belongs to the splice running
+				 * right now. Recording the refused direction there would rebuild the
+				 * running splice from it.
+				 */
+				it('a splice-out refused mid-splice leaves the running splice-in intact', function () {
+					const pair = makeWirePair();
+					quiesceAsResponder(pair.acceptor);
+					quiesce(pair.opener);
+
+					const wallet = makeSpliceInWallet(300_000n);
+					pair.opener.setSpliceInInputs(
+						[wallet.walletInput],
+						wallet.changeScript
+					);
+					const init = pair.opener.initiateSplice(300_000n, 253);
+					expect(findSendAction(init, MessageType.SPLICE), 'splice_init out').to
+						.exist;
+					expect(pair.opener.getState()).to.equal(ChannelState.SPLICING);
+
+					const destScript = Buffer.concat([
+						Buffer.from([0x00, 0x14]),
+						crypto.randomBytes(20)
+					]);
+					pair.opener.setSpliceOutDestination(destScript, 50_000n);
+					expect(
+						findAction(
+							pair.opener.initiateSplice(-(50_000n + SPLICE_OUT_TEST_FEE), 253),
+							ChannelActionType.ERROR
+						).message
+					).to.include('not in NORMAL state');
+
+					// splice_ack and the rest of the negotiation follow the refusal.
+					pair.enqueue(pair.acceptor, pair.opener, init);
+					pair.pump();
+
+					expect(pair.errors).to.deep.equal([]);
+					expect(pair.broadcasts.length, 'both sides broadcast').to.equal(2);
+					const tx = bitcoin.Transaction.fromBuffer(pair.broadcasts[0]);
+					expect(tx.ins.length, 'shared input + wallet input').to.equal(2);
+					expect(
+						tx.outs.some((o) => o.script.equals(wallet.changeScript)),
+						'change output of the running splice-in'
+					).to.be.true;
+					expect(
+						tx.outs.some((o) => o.script.equals(destScript)),
+						'nothing paid to the refused destination'
+					).to.be.false;
+				});
+
 				it('an inbound splice_init crossing our unacked abort is ignored', function () {
 					const { acceptor } = makeNormalChannel();
 					quiesceAsResponder(acceptor);

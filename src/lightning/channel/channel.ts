@@ -10300,8 +10300,13 @@ export class Channel {
 	 * refused before initiation (a busy channel, say) leaves its wallet inputs
 	 * on the channel, and _computeSpliceContributions takes the splice-in branch
 	 * whenever inputs are present, which would drop this destination.
+	 *
+	 * Outside NORMAL nothing is recorded at all: initiateSplice refuses such a
+	 * request on the state anyway, and the configuration on the channel there
+	 * belongs to the splice already running, not to this request.
 	 */
 	setSpliceOutDestination(script: Buffer, sats: bigint): void {
+		if (this._state.state !== ChannelState.NORMAL) return;
 		this._spliceInInputs = null;
 		this._spliceOutDestination = { script, sats };
 	}
@@ -10309,9 +10314,11 @@ export class Channel {
 	/**
 	 * Record the wallet inputs + change script funding a splice-in. Called by the
 	 * node (which sourced the UTXOs from its on-chain wallet) before initiating.
-	 * Clears the other direction for the same reason as setSpliceOutDestination.
+	 * Clears the other direction, and defers to a running splice, for the same
+	 * reasons as setSpliceOutDestination.
 	 */
 	setSpliceInInputs(inputs: ISpliceWalletInput[], changeScript: Buffer): void {
+		if (this._state.state !== ChannelState.NORMAL) return;
 		this._spliceOutDestination = null;
 		this._spliceInInputs = { inputs, changeScript };
 	}
