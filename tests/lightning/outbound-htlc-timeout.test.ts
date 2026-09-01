@@ -8,6 +8,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import {
+	ILightningError,
 	INodeConfig,
 	IPaymentInfo,
 	PaymentStatus,
@@ -15,6 +16,7 @@ import {
 } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
+	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
 	BITCOIN_CHAIN_HASH
 } from '../../src/lightning/channel/types';
@@ -246,6 +248,48 @@ function setupPendingPayment(cltvExpiry?: number): {
 	alice.sendPayment(invoiceStr.bolt11);
 
 	return { alice, bob, paymentHash: decoded.paymentHash, channelId };
+}
+
+/**
+ * The same pending payment, with a cooperative shutdown started underneath it
+ * (issue #646). The peer is gone, so it never answers the shutdown and never
+ * resolves the offered HTLC: the channel parks in SHUTTING_DOWN, which the
+ * close cannot leave while the HTLC is outstanding.
+ */
+function setupShuttingDownPayment(): {
+	alice: LightningNode;
+	bob: LightningNode;
+	paymentHash: Buffer;
+	channelId: Buffer;
+	cltvExpiry: number;
+	errors: string[];
+} {
+	const fx = setupPendingPayment();
+	const closeScript = Buffer.alloc(22);
+	closeScript[0] = 0x00; // OP_0
+	closeScript[1] = 0x14; // push 20 bytes
+	crypto.randomBytes(20).copy(closeScript, 2);
+	expect(fx.alice.closeChannel(fx.channelId, closeScript).ok).to.be.true;
+
+	const state = fx.alice
+		.getChannelManager()
+		.getChannel(fx.channelId)!
+		.getFullState();
+	expect(state.state).to.equal(ChannelState.SHUTTING_DOWN);
+
+	let cltvExpiry = 0;
+	for (const [key, htlc] of state.htlcs) {
+		if (key.startsWith('offered-')) cltvExpiry = htlc.cltvExpiry;
+	}
+	expect(cltvExpiry).to.be.greaterThan(0);
+
+	const errors: string[] = [];
+	fx.alice.on('node:error', (err: ILightningError) => errors.push(err.code));
+	return { ...fx, cltvExpiry, errors };
+}
+
+function channelStateOf(node: LightningNode, channelId: Buffer): ChannelState {
+	return node.getChannelManager().getChannel(channelId)!.getFullState().state;
 }
 
 // ─────────────── Tests ───────────────
@@ -524,6 +568,62 @@ describe('Phase 2: Outbound HTLC Timeout + Payment Cleanup', function () {
 			expect(updatedPayment).to.exist;
 			expect(updatedPayment!.status).to.equal(PaymentStatus.FAILED);
 			expect(updatedPayment!.completedAt).to.be.a('number');
+
+			alice.destroy();
+			bob.destroy();
+		});
+	});
+
+	describe('issue #646: expiry backstop during cooperative shutdown', function () {
+		it('force-closes past the grace period on a SHUTTING_DOWN channel', function () {
+			const { alice, bob, paymentHash, channelId, cltvExpiry, errors } =
+				setupShuttingDownPayment();
+
+			alice.handleNewBlock(cltvExpiry + 6);
+
+			expect(errors).to.include('HTLC_EXPIRY_FORCE_CLOSE');
+			expect(channelStateOf(alice, channelId)).to.equal(
+				ChannelState.FORCE_CLOSED
+			);
+			expect(alice.getPayment(paymentHash)!.status).to.equal(
+				PaymentStatus.FAILED
+			);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('keeps the off-chain grace period while shutting down', function () {
+			const { alice, bob, channelId, cltvExpiry, errors } =
+				setupShuttingDownPayment();
+
+			// The peer can still fail the HTLC here (update_fail_htlc is accepted
+			// in SHUTTING_DOWN), so the close must not fire yet.
+			alice.handleNewBlock(cltvExpiry + 5);
+
+			expect(errors).to.not.include('HTLC_EXPIRY_FORCE_CLOSE');
+			expect(channelStateOf(alice, channelId)).to.equal(
+				ChannelState.SHUTTING_DOWN
+			);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('stays away from a shutting-down channel with detected data loss', function () {
+			const { alice, bob, channelId, cltvExpiry, errors } =
+				setupShuttingDownPayment();
+			alice
+				.getChannelManager()
+				.getChannel(channelId)!
+				.getFullState().dataLossDetected = true;
+
+			alice.handleNewBlock(cltvExpiry + 6);
+
+			expect(errors).to.not.include('HTLC_EXPIRY_FORCE_CLOSE');
+			expect(channelStateOf(alice, channelId)).to.equal(
+				ChannelState.SHUTTING_DOWN
+			);
 
 			alice.destroy();
 			bob.destroy();
