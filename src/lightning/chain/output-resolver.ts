@@ -1227,17 +1227,19 @@ interface IHtlcMatch {
  *   removal (removalRemoteCommitted === false, mirroring
  *   buildHtlcOutputsForLocal, which is also what prepareForceClose
  *   broadcasts).
- * - THEIR commitment: an OFFERED entry the peer settled, until WE
- *   revoke for it (removalLocallyRevoked === false, mirroring
- *   buildHtlcOutputsForRemote), AND a RECEIVED entry WE settled, until
- *   THE PEER revokes for it (removalRemoteCommitted === false). The
- *   remote builder describes the NEXT commitment we would sign, which
- *   drops our own settle immediately; the commitment the peer can put
- *   ON CHAIN is its CURRENT signed one, which predates our
- *   update_fulfill/fail and still carries the output until the peer's
- *   revoke_and_ack for the covering commitment_signed. Without this
- *   arm, a peer force-closing right after we fulfilled kept the
- *   preimage-paid output unclaimed until its own timeout sweep.
+ * - THEIR commitment: an OFFERED entry the peer settled and a RECEIVED
+ *   entry WE settled, both until THE PEER revokes the commitment that
+ *   carried the output (removalRemoteCommitted === false). The remote
+ *   builder describes the NEXT commitment we would sign, which drops
+ *   the settle immediately; the commitment the peer can put ON CHAIN is
+ *   its CURRENT signed one, which predates the removal and still
+ *   carries the output until the peer's revoke_and_ack for our covering
+ *   commitment_signed. Without this, a peer force-closing right after
+ *   we fulfilled kept the preimage-paid output unclaimed until its own
+ *   timeout sweep, and an offered HTLC the peer settled went untracked
+ *   for the whole second phase of its removal — our revoke_and_ack
+ *   flips removalLocallyRevoked one round EARLIER, while the peer's
+ *   previous commitment is still broadcastable (issue #641).
  *
  * Without the window arms, a force-close right after fulfilling an
  * inbound HTLC left its output untracked on EITHER side's commitment:
@@ -1271,10 +1273,10 @@ function htlcEntryCanBePresent(
 		);
 	}
 	return (
+		entry.removalRemoteCommitted === false ||
+		// Second arm only for states that carry the first-phase flag alone.
 		(entry.direction === HtlcDirection.OFFERED &&
-			entry.removalLocallyRevoked === false) ||
-		(entry.direction === HtlcDirection.RECEIVED &&
-			entry.removalRemoteCommitted === false)
+			entry.removalLocallyRevoked === false)
 	);
 }
 
