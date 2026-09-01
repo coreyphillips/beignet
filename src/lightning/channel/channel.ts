@@ -400,6 +400,20 @@ const PLACEHOLDER_SHUTDOWN_SCRIPT = Buffer.concat([
 	Buffer.alloc(20)
 ]);
 
+/**
+ * The refusals a splice request outlives: each names a state that ends on its
+ * own, so the identical request starts the splice afterwards. Shared by the
+ * arms that raise them and by spliceBusyReason, which reports them before a
+ * caller has committed anything to the request (issue #642).
+ */
+const SPLICE_BUSY_RECONNECTING =
+	'Cannot splice: channel is reconnecting; retry after reestablishment';
+const SPLICE_BUSY_ABORT_PENDING =
+	'Cannot splice: a previous splice abort is not yet acknowledged';
+const SPLICE_BUSY_PEER_QUIESCENCE =
+	'Cannot splice: peer initiated the quiescence session; retry after it ends';
+const QUIESCE_BUSY_PENDING_HTLCS = 'Cannot quiesce: pending HTLCs exist';
+
 function bigIntMax(a: bigint, b: bigint): bigint {
 	return a > b ? a : b;
 }
@@ -9531,7 +9545,7 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot quiesce: pending HTLCs exist',
+					message: QUIESCE_BUSY_PENDING_HTLCS,
 					// They settle or fail; either way the channel quiesces after.
 					transient: true
 				}
@@ -9765,6 +9779,44 @@ export class Channel {
 	}
 
 	/**
+	 * Why a splice started right now would be refused transiently, or null.
+	 * Every arm here is one initiateSplice raises with `transient: true`, in the
+	 * same order, so the two agree on what the caller is told.
+	 *
+	 * It exists because spliceIn sources its wallet inputs asynchronously and
+	 * cannot wait for initiateSplice to answer: the refusal would arrive on
+	 * node:error long after the request returned `ok: true`, leaving an HTTP
+	 * caller with a 200 and no retryable status (issue #642). Advice, not
+	 * enforcement: initiateSplice re-reads the same states at the point they
+	 * matter, and a state that ends between the two calls is one this correctly
+	 * stops reporting.
+	 */
+	spliceBusyReason(): string | null {
+		if (this._state.state !== ChannelState.NORMAL) {
+			// A disconnect wraps a NORMAL channel in AWAITING_REESTABLISH and
+			// handleReestablish unwraps it; any other state is a refusal that
+			// does not clear on its own (issue #639).
+			return this._state.state === ChannelState.AWAITING_REESTABLISH &&
+				this._state.preReestablishState === ChannelState.NORMAL
+				? SPLICE_BUSY_RECONNECTING
+				: null;
+		}
+		if (this._spliceAbortPending) return SPLICE_BUSY_ABORT_PENDING;
+		if (this._quiescence.isQuiescent()) {
+			return this._quiescence.isInitiator()
+				? null
+				: SPLICE_BUSY_PEER_QUIESCENCE;
+		}
+		// Not quiescent: this request would be the one to drive the handshake,
+		// so initiateQuiescence's own transient arm is ours too. A handshake
+		// already in flight parks the request instead and refuses nothing.
+		if (!this._quiescence.isQuiescing() && this.hasPendingHtlcs()) {
+			return QUIESCE_BUSY_PENDING_HTLCS;
+		}
+		return null;
+	}
+
+	/**
 	 * Initiate a splice operation.
 	 * Channel must be quiescent (QUIESCENT state) before splicing.
 	 * @param relativeSatoshis - positive for splice-in, negative for splice-out
@@ -9789,8 +9841,7 @@ export class Channel {
 				return [
 					{
 						type: ChannelActionType.ERROR,
-						message:
-							'Cannot splice: channel is reconnecting; retry after reestablishment',
+						message: SPLICE_BUSY_RECONNECTING,
 						transient: true
 					}
 				];
@@ -9810,8 +9861,7 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message:
-						'Cannot splice: a previous splice abort is not yet acknowledged',
+					message: SPLICE_BUSY_ABORT_PENDING,
 					transient: true
 				}
 			];
@@ -9956,8 +10006,7 @@ export class Channel {
 				return [
 					{
 						type: ChannelActionType.ERROR,
-						message:
-							'Cannot splice: peer initiated the quiescence session; retry after it ends',
+						message: SPLICE_BUSY_PEER_QUIESCENCE,
 						transient: true
 					}
 				];
@@ -10028,8 +10077,7 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message:
-						'Cannot splice: a previous splice abort is not yet acknowledged',
+					message: SPLICE_BUSY_ABORT_PENDING,
 					transient: true
 				}
 			];

@@ -10544,6 +10544,27 @@ export class LightningNode extends EventEmitter {
 			};
 		}
 
+		// Last thing before the selection goes async. From here on a refusal can
+		// only reach the caller as a node:error, so the states that would be
+		// coded SPLICE_BUSY are read while the answer can still be returned:
+		// otherwise an HTTP caller is told 200 and never sees the 503 it is
+		// meant to retry on (issue #642). Ordered after the argument and
+		// provider refusals above, which are permanent and must win.
+		const busyReason = channel.spliceBusyReason();
+		if (busyReason) {
+			this.emit('node:error', {
+				code: 'SPLICE_IN_FAILED',
+				channelId,
+				message: busyReason,
+				timestamp: Date.now()
+			} as ILightningError);
+			return {
+				ok: false,
+				error: busyReason,
+				code: SpliceRefusalCode.SPLICE_BUSY
+			};
+		}
+
 		this.fundingProvider
 			.selectSpliceInputs(amountSats, fundingFeeratePerkw, fundingUtxos)
 			.then(({ inputs, changeScript }) => {
