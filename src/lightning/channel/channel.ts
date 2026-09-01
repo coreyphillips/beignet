@@ -2988,6 +2988,9 @@ export class Channel {
 			// Two-phase: the peer incorporates this add into its signatures over
 			// OUR commitment only after revoking a commitment of ours covering it.
 			addRemoteCommitted: false,
+			// ...and the signature we hold covers it only from the peer's next
+			// commitment_signed after that (see IHtlcEntry.addRemoteSigned).
+			addRemoteSigned: false,
 			...(blindingPoint ? { blindingPoint } : {})
 		};
 
@@ -4201,6 +4204,36 @@ export class Channel {
 	}
 
 	/**
+	 * Record that a peer commitment_signed we just verified covers these offered
+	 * adds: the ones buildHtlcOutputsForLocal put into the commitment it signed.
+	 *
+	 * addRemoteCommitted cannot stand in for this. The peer's revoke_and_ack
+	 * sets it one message EARLIER, and until the commitment_signed that follows
+	 * arrives, the signature we hold covers a commitment without the add — so a
+	 * force-close rebuild that admitted the add on that flag alone broadcast a
+	 * transaction the stored signature does not verify (issue #643).
+	 *
+	 * Called for the splice commitment round too: it signs the same local
+	 * commitment over the new funding output, built with the same rule, and its
+	 * signature is what the force close rebuilds against once the splice is
+	 * adopted. An abandoned splice leaves the stamp standing while the
+	 * pre-splice signature applies again, which is the pre-existing gap of a
+	 * commitment round that only ever ran for the splice.
+	 */
+	private _markOfferedAddsRemoteSigned(): void {
+		for (const entry of this._state.htlcs.values()) {
+			if (
+				entry.direction === HtlcDirection.OFFERED &&
+				entry.addRemoteCommitted !== false &&
+				(entry.state === HtlcState.PENDING ||
+					entry.state === HtlcState.COMMITTED)
+			) {
+				entry.addRemoteSigned = true;
+			}
+		}
+	}
+
+	/**
 	 * Handle commitment_signed from remote.
 	 * Returns revoke_and_ack.
 	 */
@@ -4422,6 +4455,9 @@ export class Channel {
 		);
 		this._state.lastSignedCommitLeaseBlockheight =
 			getLocalCommitmentLeaseBlockheight(this._state);
+
+		// The HTLC SET the signature covers, same purpose (issue #643).
+		this._markOfferedAddsRemoteSigned();
 
 		// Two-phase update_fee, acceptor side: this commitment_signed from the
 		// opener covers its staged update_fee (the update always precedes its
@@ -12106,6 +12142,10 @@ export class Channel {
 		this._spliceRemoteCommitmentSig = Buffer.from(msg.signature);
 		this._spliceRemoteHtlcSigs = msg.htlcSignatures.map((s) => Buffer.from(s));
 		this._spliceReceivedCommitment = true;
+		// This signature is what a force close rebuilds against once the splice
+		// is adopted, so the adds it carries are signed for that rebuild's
+		// purposes exactly as an ordinary commitment_signed's are (issue #643).
+		this._markOfferedAddsRemoteSigned();
 		// Keep the persisted in-flight record in sync (it may already exist from
 		// our own commitment send): the peer's commitment sig must survive a
 		// crash, and reestablish derives retransmit_flags from it.
