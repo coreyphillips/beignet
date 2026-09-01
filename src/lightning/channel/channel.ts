@@ -757,6 +757,15 @@ export class Channel {
 		locktime: number;
 		cancelled: boolean;
 		ownsQuiescence: boolean;
+		// The direction this request was made with, carried with the request
+		// rather than left on the channel (issue #640): the channel stays NORMAL
+		// while the stfu is unanswered, so a later request refused before it
+		// parks has already recorded ITS direction over the channel fields.
+		spliceOutDestination: { script: Buffer; sats: bigint } | null;
+		spliceInInputs: {
+			inputs: ISpliceWalletInput[];
+			changeScript: Buffer;
+		} | null;
 	} | null = null;
 	// Splice interactive-tx driving (initiator side). The ordered contributions
 	// we still need to send (shared input, new funding output, splice-out
@@ -9656,6 +9665,10 @@ export class Channel {
 		) {
 			const pending = this._pendingSplice;
 			this._pendingSplice = null;
+			// Splice from the direction the request carried, not from whatever a
+			// request refused since then left on the channel (issue #640).
+			this._spliceOutDestination = pending.spliceOutDestination;
+			this._spliceInInputs = pending.spliceInInputs;
 			if (!pending.cancelled) {
 				actions.push(
 					...this._startSplice(
@@ -9967,7 +9980,9 @@ export class Channel {
 			fundingFeeratePerkw,
 			locktime,
 			cancelled: false,
-			ownsQuiescence
+			ownsQuiescence,
+			spliceOutDestination: this._spliceOutDestination,
+			spliceInInputs: this._spliceInInputs
 		};
 
 		if (this._quiescence.isQuiescing()) {
@@ -10295,16 +10310,31 @@ export class Channel {
 	/**
 	 * Record the splice-out destination (where withdrawn funds are paid). Called
 	 * by the node before initiating a splice-out.
+	 *
+	 * Exactly one direction is configured at a time (issue #640): a request
+	 * refused before initiation (a busy channel, say) leaves its wallet inputs
+	 * on the channel, and _computeSpliceContributions takes the splice-in branch
+	 * whenever inputs are present, which would drop this destination.
+	 *
+	 * Outside NORMAL nothing is recorded at all: initiateSplice refuses such a
+	 * request on the state anyway, and the configuration on the channel there
+	 * belongs to the splice already running, not to this request.
 	 */
 	setSpliceOutDestination(script: Buffer, sats: bigint): void {
+		if (this._state.state !== ChannelState.NORMAL) return;
+		this._spliceInInputs = null;
 		this._spliceOutDestination = { script, sats };
 	}
 
 	/**
 	 * Record the wallet inputs + change script funding a splice-in. Called by the
 	 * node (which sourced the UTXOs from its on-chain wallet) before initiating.
+	 * Clears the other direction, and defers to a running splice, for the same
+	 * reasons as setSpliceOutDestination.
 	 */
 	setSpliceInInputs(inputs: ISpliceWalletInput[], changeScript: Buffer): void {
+		if (this._state.state !== ChannelState.NORMAL) return;
+		this._spliceOutDestination = null;
 		this._spliceInInputs = { inputs, changeScript };
 	}
 
