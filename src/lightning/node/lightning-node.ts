@@ -20616,7 +20616,17 @@ export class LightningNode extends EventEmitter {
 			const errored =
 				state.state === ChannelState.ERRORED &&
 				!mustNotBroadcastCommitment(state);
-			if (effectiveState !== ChannelState.NORMAL && !errored) continue;
+			// SHUTTING_DOWN carries the same exposure: BOLT 2 lets an offered HTLC
+			// ride into a cooperative shutdown, and the close cannot finish while
+			// that HTLC is unresolved, so a peer that never fulfills or fails it
+			// parks the channel there past the expiry. The off-chain removal path
+			// is still open (handleUpdateFailHtlc accepts the state), so unlike
+			// ERRORED the grace period below still has something to wait for.
+			const shuttingDown =
+				effectiveState === ChannelState.SHUTTING_DOWN &&
+				!mustNotBroadcastCommitment(state);
+			if (effectiveState !== ChannelState.NORMAL && !errored && !shuttingDown)
+				continue;
 			const channelId = state.channelId || state.temporaryChannelId;
 
 			for (const [key, htlc] of state.htlcs) {
