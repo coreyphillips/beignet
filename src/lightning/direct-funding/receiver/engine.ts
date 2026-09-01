@@ -324,8 +324,9 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * `unwindFunding` applies: a v2 tx_abort awaiting its echo has released
 	 * nothing (a disconnect forgets it and resumes the negotiation), and a
 	 * refusal means the funding is past unwinding and can still complete. Either
-	 * way the hold stands and the next tick tries again, because clearing on one
-	 * of those answers strands the very channel this exists to retire.
+	 * way the hold stands, the coin stays reserved with it, and the next tick
+	 * tries again, because clearing on one of those answers strands the very
+	 * channel this exists to retire.
 	 */
 	private retireLapsedFundings(): void {
 		for (const held of this.deps.requests.lapsedFundings()) {
@@ -349,11 +350,31 @@ export class DirectFundingReceiver extends EventEmitter {
 				released = result.ok && result.pending !== true;
 				if (released) outcome = 'the pending funding was aborted';
 				else if (result.ok) outcome = 'its tx_abort is awaiting the peer echo';
-				else outcome = `the abort was refused: ${result.error}`;
+				else if (this.deps.fundingPubkeys(channelId) === null) {
+					// A refusal from a channel the node no longer holds at all says
+					// the funding is gone, not that it is past unwinding: the echo of
+					// our own tx_abort forgets the open, and this is the retry that
+					// followed it. Holding the mark on that answer would keep the row
+					// and the coin for the rest of the process's life, with nothing
+					// left for either to protect.
+					released = true;
+					outcome = 'the pending funding was already gone';
+				} else outcome = `the abort was refused: ${result.error}`;
 			} catch (err) {
 				outcome = `the abort threw: ${errorText(err)}`;
 			}
 			if (!released) {
+				// The coin stays committed for as long as the funding does. Its
+				// reservation lapsed with the funding's hold, and a restart takes none
+				// for a funding already lapsed, so re-taking it here is what keeps the
+				// same coin out of a second channel: the busy mark guards one request,
+				// and a fresh request is not covered by it.
+				this.state.reserve(
+					held.funding.outpoint,
+					held.offerIdHex,
+					held.receiptHash,
+					this.now() + this.cfg.sessionTtlMs
+				);
 				this.log(DF_LOG_OFFER_FAILED, {
 					offerId: held.offerIdHex,
 					channelId: held.funding.channelId,

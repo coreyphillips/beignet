@@ -625,9 +625,19 @@ export class DirectFundingRequestStore {
  * nothing retires it either. The mark is cleared when the funding settles, or
  * by the receiver when it gives the funding up, and the record goes with the
  * next sweep after that.
+ *
+ * A LIVE attempt counts before it has named a funding, because the negotiation
+ * that names one can itself outlast the request: the binding is written only
+ * when the transaction is final, and a row taken in that window refuses the
+ * write and strands the same channel. The marker's own deadline bounds it, and
+ * `beginAttempt` still judges the request's clock, so nothing here makes an
+ * expired request payable again.
  */
 function answersFor(record: IDfRequestRecord, now: number): boolean {
-	return record.expiresAt > now || record.activeAttempt?.funding !== undefined;
+	if (record.expiresAt > now) return true;
+	const active = record.activeAttempt;
+	if (active === undefined) return false;
+	return active.funding !== undefined || active.expiresAt > now;
 }
 
 function isHex(value: unknown, bytes: number): boolean {

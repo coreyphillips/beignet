@@ -1583,6 +1583,64 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 			engine.stop();
 		});
 
+		it('keeps the coin committed while the abort releases nothing', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 30 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			c.second.abortPending = true;
+			const engine = new DirectFundingReceiver(c.second, {
+				negotiationTimeoutMs: 5_000,
+				witnessTimeoutMs: 5_000,
+				sweepIntervalMs: 60_000
+			});
+			engine.start();
+			expect(c.second.aborts).to.have.length(1);
+
+			// The peer has not echoed, so the coin is still an input of a
+			// transaction it signed for. The busy mark guards this request alone,
+			// and a fresh one reaches for the same coin outside it.
+			const fresh = c.second.mintRequest();
+			const other = new FakePayerLane(fresh, 'lane-other');
+			engine.handleFrame(other.offerFrame(buildOffer(fresh, c.coin)));
+			await flush();
+			expect(c.second.opens, 'no second channel for the coin').to.have.length(
+				0
+			);
+			expect(decodeDfOfferAck(other.bodiesOf(ACK)[0]).reason).to.equal(
+				'input already committed to another offer'
+			);
+			engine.stop();
+		});
+
+		it('gives the row up once the echo has taken the channel with it', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 30 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			c.second.abortPending = true;
+			const engine = new DirectFundingReceiver(c.second, {
+				negotiationTimeoutMs: 5_000,
+				witnessTimeoutMs: 5_000,
+				sweepIntervalMs: 60_000
+			});
+			engine.start();
+			expect(c.second.requests.sweep()).to.equal(0);
+
+			// The echo of our own tx_abort forgets the open, so every retry after it
+			// finds no channel to abort. Holding the mark on that answer would keep
+			// the request and the coin for the rest of the process's life.
+			c.second.abortError = `Channel not found: ${c.channelId.toString('hex')}`;
+			c.second.pubkeysAvailable = false;
+			engine.stop();
+			engine.start();
+			expect(c.second.aborts).to.have.length(2);
+			expect(c.second.requests.sweep()).to.equal(1);
+			engine.stop();
+		});
+
 		it('replays the receipt of a funding that completed past the expiry', async () => {
 			const c = await crashAfterSignRequest({
 				ttlMs: 60_000,

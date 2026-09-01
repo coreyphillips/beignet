@@ -495,6 +495,43 @@ describe('Direct funding: outstanding requests', () => {
 			expect(second.store.lapsedFundings()).to.deep.equal([]);
 		});
 
+		it('holds the row through a negotiation the request expires under', () => {
+			const h = harness({ requestTtlMs: HOUR });
+			const record = h.store.mint();
+			h.clock.now = record.expiresAt - 1_000;
+			const heldUntil = h.clock.now + HOLD_MS;
+			expect(
+				h.store.beginAttempt(record.receiptHash, OFFER_A, heldUntil)
+			).to.equal(true);
+
+			// The funding is named only once the transaction is final, which is
+			// minutes after the offer was admitted. A row taken in that window
+			// refuses the binding, and the channel the peer has signed for by then
+			// is stranded exactly as it is when the mark itself goes.
+			h.clock.now = record.expiresAt + 1;
+			expect(h.store.sweep()).to.equal(0);
+			expect(
+				h.store.markAttemptFunding(
+					record.receiptHash,
+					OFFER_A,
+					funding,
+					heldUntil
+				)
+			).to.equal(true);
+			expect(h.store.attemptsFor(record.receiptHash).funding).to.deep.equal(
+				funding
+			);
+		});
+
+		it('lets the row go when that attempt lapses naming no funding', () => {
+			const h = harness({ requestTtlMs: HOUR });
+			const record = h.store.mint();
+			h.clock.now = record.expiresAt - 1_000;
+			h.store.beginAttempt(record.receiptHash, OFFER_A, record.expiresAt);
+			h.clock.now = record.expiresAt + 1;
+			expect(h.store.sweep()).to.equal(1);
+		});
+
 		it('refuses a fresh attempt on a request only its funding keeps alive', () => {
 			const { harness: h, record } = fundedNearExpiry();
 			h.clock.now = record.expiresAt + 1;
