@@ -629,6 +629,48 @@ describe('LightningNode transient splice refusals', function () {
 		expect(result.code).to.equal(SpliceRefusalCode.SPLICE_REFUSED);
 		node.destroy();
 	});
+
+	/**
+	 * Issue #639: an ordinary peer reconnect. markForReestablish wraps the
+	 * NORMAL channel in AWAITING_REESTABLISH, and the same request that was
+	 * refused starts the splice once handleReestablish unwraps it.
+	 */
+	it('codes a reconnecting channel as busy, then starts on both paths', function () {
+		for (const [name, request] of REQUESTS) {
+			const node = createTestNode();
+			const channelId = injectNormalChannel(node);
+			const channel = channelOf(node, channelId);
+			channel.markForReestablish();
+			expect(channel.getState(), name).to.equal(
+				ChannelState.AWAITING_REESTABLISH
+			);
+
+			const refused = request(node, channelId);
+			expect(refused.ok, name).to.be.false;
+			expect(refused.code, name).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+			expect(refused.error, name).to.include('reconnecting');
+
+			// Reestablishment done: the wrapped state comes back, and the
+			// identical request is the one that used to be called permanent.
+			channel._state.state = channel._state.preReestablishState;
+			channel._state.preReestablishState = null;
+			expect(request(node, channelId).ok, name).to.be.true;
+			node.destroy();
+		}
+	});
+
+	it('keeps a channel that closed while marked coded permanent', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const channel = channelOf(node, channelId);
+		channel.markForReestablish();
+		// Nothing clears preReestablishState on the way out, so the wrapped
+		// NORMAL outlives the channel: the marker is what says it comes back.
+		channel._state.state = ChannelState.CLOSED;
+		const result = node.spliceOut(channelId, 50_000n, 253);
+		expect(result.code).to.equal(SpliceRefusalCode.SPLICE_REFUSED);
+		node.destroy();
+	});
 });
 
 describe('LightningNode peerSupportsSplicing', function () {

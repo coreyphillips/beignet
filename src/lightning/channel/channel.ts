@@ -9764,6 +9764,24 @@ export class Channel {
 		locktime = 0
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.NORMAL) {
+			// A disconnect wraps a NORMAL channel in AWAITING_REESTABLISH and
+			// handleReestablish unwraps it, so this refusal clears by itself and
+			// the identical request then starts the splice (issue #639). Both
+			// halves are read because nothing clears preReestablishState when a
+			// marked channel closes: only the marker says it is coming back.
+			if (
+				this._state.state === ChannelState.AWAITING_REESTABLISH &&
+				this._state.preReestablishState === ChannelState.NORMAL
+			) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Cannot splice: channel is reconnecting; retry after reestablishment',
+						transient: true
+					}
+				];
+			}
 			return [
 				{
 					type: ChannelActionType.ERROR,
