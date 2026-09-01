@@ -5319,6 +5319,63 @@ describe('Splice', function () {
 					expect(findAction(retry, ChannelActionType.ERROR)).to.not.exist;
 				});
 
+				/**
+				 * Issue #640: the refusal above happens AFTER the caller has set
+				 * the request's wallet inputs on the channel, and no refusal arm
+				 * reached before initiation clears them. A caller that changes
+				 * direction once the echo lands must still get the splice-out it
+				 * asked for.
+				 */
+				it('a splice-out after a busy splice-in pays its destination, not the refused inputs', function () {
+					const pair = makeBilateralWindowPair();
+					// Deliver our tx_abort (the acceptor forgets the splice) but
+					// drop its echo, so the latch stays set on our side.
+					pair.drop(MessageType.TX_ABORT, 1, 1);
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.initiateSpliceAbort('operator requested')
+					);
+					pair.pump();
+					expect(pair.opener.isSpliceAbortPending(), 'echo still owed').to.be
+						.true;
+					expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+
+					// Busy: the splice-in is refused with its inputs already set.
+					const wallet = makeSpliceInWallet(300_000n);
+					pair.opener.setSpliceInInputs(
+						[wallet.walletInput],
+						wallet.changeScript
+					);
+					expect(
+						findAction(
+							pair.opener.initiateSplice(300_000n, 253),
+							ChannelActionType.ERROR
+						).message
+					).to.include('not yet acknowledged');
+
+					// The delayed echo settles the exchange; the caller changes
+					// direction and splices out instead.
+					pair.opener.handleTxAbort();
+					pair.clearDrops();
+					const destScript = startSpliceOut(pair, 50_000n);
+
+					expect(pair.errors).to.deep.equal([]);
+					expect(pair.broadcasts.length, 'both sides broadcast').to.equal(2);
+					const tx = bitcoin.Transaction.fromBuffer(pair.broadcasts[0]);
+					expect(tx.ins.length, 'shared input only').to.equal(1);
+					expect(
+						tx.outs.some(
+							(o) => o.script.equals(destScript) && BigInt(o.value) === 50_000n
+						),
+						'withdrawal paid to the requested destination'
+					).to.be.true;
+					expect(
+						tx.outs.some((o) => o.script.equals(wallet.changeScript)),
+						'no change output from the refused splice-in'
+					).to.be.false;
+				});
+
 				it('an inbound splice_init crossing our unacked abort is ignored', function () {
 					const { acceptor } = makeNormalChannel();
 					quiesceAsResponder(acceptor);

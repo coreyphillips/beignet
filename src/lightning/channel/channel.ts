@@ -10295,16 +10295,24 @@ export class Channel {
 	/**
 	 * Record the splice-out destination (where withdrawn funds are paid). Called
 	 * by the node before initiating a splice-out.
+	 *
+	 * Exactly one direction is configured at a time (issue #640): a request
+	 * refused before initiation (a busy channel, say) leaves its wallet inputs
+	 * on the channel, and _computeSpliceContributions takes the splice-in branch
+	 * whenever inputs are present, which would drop this destination.
 	 */
 	setSpliceOutDestination(script: Buffer, sats: bigint): void {
+		this._spliceInInputs = null;
 		this._spliceOutDestination = { script, sats };
 	}
 
 	/**
 	 * Record the wallet inputs + change script funding a splice-in. Called by the
 	 * node (which sourced the UTXOs from its on-chain wallet) before initiating.
+	 * Clears the other direction for the same reason as setSpliceOutDestination.
 	 */
 	setSpliceInInputs(inputs: ISpliceWalletInput[], changeScript: Buffer): void {
+		this._spliceOutDestination = null;
 		this._spliceInInputs = { inputs, changeScript };
 	}
 
