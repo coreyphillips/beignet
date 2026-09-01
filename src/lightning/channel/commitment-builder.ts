@@ -295,6 +295,13 @@ const NO_RETAINED_REMOVALS: ReadonlySet<IHtlcEntry> = new Set();
  * and a strict set matching it is the shape the row really is. A count that
  * fits neither set leaves the retention in place, that being the shape a
  * removal round normally reaches (and the one issue #634 is about).
+ *
+ * A retention that trims away moves the balance alone, so the count cannot see
+ * it and it keeps the retention too. Nothing stored separates the two shapes
+ * there (both build the same commitment, and only the peer's signature says
+ * which one it signed), and retention is the shape a conforming peer leaves:
+ * the other needs a peer that removed an add before it was irrevocably
+ * committed, which BOLT 2 forbids.
  */
 function resolveRetainedRemovals(
 	state: IChannelState,
