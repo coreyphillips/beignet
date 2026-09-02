@@ -32,6 +32,7 @@ import { createFundingScript } from '../../src/lightning/script/funding';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
+import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
 
 // ─── Node plumbing (model: errored-channel-backstops.test.ts) ───
 
@@ -277,6 +278,32 @@ function plannedCommitmentPoint(
 	);
 }
 
+/**
+ * The commitment this state rebuilds for the stored signature, taken from the
+ * builder rather than from prepareForceClose.
+ *
+ * prepareForceClose refuses a rebuild the stored signature does not cover
+ * (issue #657), which a hand-built second part of a payment never is: the
+ * fixture's peer only ever signed one. The subject here is the RESOLVER's
+ * attribution of the outputs, so the commitment such a state produces is the
+ * honest input for it.
+ */
+function rebuiltCommitment(
+	node: LightningNode,
+	channelId: Buffer
+): bitcoin.Transaction {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const st = (
+		node.getChannelManager().getChannel(channelId) as any
+	).getFullState();
+	return buildLocalCommitment(
+		st,
+		plannedCommitmentPoint(node, channelId),
+		undefined,
+		true
+	).result.tx;
+}
+
 describe('The commitment a stalled removal round leaves us (issue #634)', function () {
 	this.timeout(20_000);
 
@@ -448,7 +475,7 @@ describe('The commitment a stalled removal round leaves us (issue #634)', functi
 		delete live.removalLocallyRevoked;
 		st.htlcs.set('offered-1', live);
 
-		const tx = plannedCommitment(f.alice, f.channelId);
+		const tx = rebuiltCommitment(f.alice, f.channelId);
 		f.alice
 			.getChannelManager()
 			.handleFundingSpent(
@@ -496,9 +523,9 @@ describe('The commitment a stalled removal round leaves us (issue #634)', functi
 	});
 
 	it('keeps the output for a legacy row the signature does cover', function () {
-		// Rows persisted before addRemoteSigned existed carry no answer, and the
-		// count of stored per-HTLC signatures is the one that does: one per
-		// untrimmed output of the commitment the signature covers.
+		// Rows persisted before addRemoteSigned existed carry no answer, so the
+		// retention is the default reading and the STORED SIGNATURE settles it:
+		// this row's add was signed, so the first rebuild verifies and stands.
 		const f = stalledRemoval(355);
 		delete f.entry.addRemoteSigned;
 
@@ -516,6 +543,10 @@ describe('The commitment a stalled removal round leaves us (issue #634)', functi
 	});
 
 	it('drops the output for a legacy row the signature never covered', function () {
+		// The other shape of the same unanswered row. The default rebuild keeps
+		// an output the signature was made without, so it fails to verify, and
+		// the candidate that reads the unstamped add as unsigned drops the
+		// retention with it (issue #657).
 		const f = stalledRemoval(360, { signsTheAdd: false });
 		delete f.entry.addRemoteSigned;
 
@@ -541,9 +572,6 @@ describe('The commitment a stalled removal round leaves us (issue #634)', functi
 		const st = (
 			f.alice.getChannelManager().getChannel(f.channelId) as any
 		).getFullState();
-		const {
-			buildLocalCommitment
-		} = require('../../src/lightning/channel/commitment-builder');
 		const point = plannedCommitmentPoint(f.alice, f.channelId);
 
 		const next = buildLocalCommitment(st, point, st.localCommitmentNumber + 1n);

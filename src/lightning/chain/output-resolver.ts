@@ -1230,26 +1230,28 @@ interface IHtlcMatch {
  * - OUR commitment: a RECEIVED entry until the peer revokes for the
  *   removal (removalRemoteCommitted === false, mirroring
  *   buildHtlcOutputsForLocal, which is also what prepareForceClose
- *   broadcasts), AND an OFFERED entry the peer settled, until WE revoke
- *   for it (removalLocallyRevoked === false) and whose add that
- *   signature covers (addRemoteSigned !== false): the commitment we
- *   broadcast is the one the stored signature covers, which predates
- *   the peer's update_fulfill/fail and still carries the output
- *   (issue #634). A legacy row missing that flag stays a candidate
- *   here even where resolveRetainedRemovals has the rebuild drop it:
- *   the candidate then matches no output script, which is what the
- *   additive rule below asks for.
- * - THEIR commitment: an OFFERED entry the peer settled, until WE
- *   revoke for it (removalLocallyRevoked === false, mirroring
- *   buildHtlcOutputsForRemote), AND a RECEIVED entry WE settled, until
- *   THE PEER revokes for it (removalRemoteCommitted === false). The
- *   remote builder describes the NEXT commitment we would sign, which
- *   drops our own settle immediately; the commitment the peer can put
- *   ON CHAIN is its CURRENT signed one, which predates our
- *   update_fulfill/fail and still carries the output until the peer's
- *   revoke_and_ack for the covering commitment_signed. Without this
- *   arm, a peer force-closing right after we fulfilled kept the
- *   preimage-paid output unclaimed until its own timeout sweep.
+ *   broadcasts), AND an OFFERED entry the peer settled, until WE
+ *   revoke for it (removalLocallyRevoked === false) with an add the
+ *   stored signature covers (addRemoteSigned !== false): the commitment
+ *   we broadcast is the one that signature covers, which predates the
+ *   peer's update_fulfill/fail and still carries the output
+ *   (issue #634, mirroring signedLocalCarriesRemoval). A row whose
+ *   rebuild ends up dropping that output stays a candidate here: it
+ *   then matches no output script, which is what the additive rule
+ *   below asks for.
+ * - THEIR commitment: an OFFERED entry the peer settled and a RECEIVED
+ *   entry WE settled, both until THE PEER revokes the commitment that
+ *   carried the output (removalRemoteCommitted === false). The remote
+ *   builder describes the NEXT commitment we would sign, which drops
+ *   the settle immediately; the commitment the peer can put ON CHAIN is
+ *   its CURRENT signed one, which predates the removal and still
+ *   carries the output until the peer's revoke_and_ack for our covering
+ *   commitment_signed. Without this, a peer force-closing right after
+ *   we fulfilled kept the preimage-paid output unclaimed until its own
+ *   timeout sweep, and an offered HTLC the peer settled went untracked
+ *   for the whole second phase of its removal: our revoke_and_ack
+ *   flips removalLocallyRevoked one round EARLIER, while the peer's
+ *   previous commitment is still broadcastable (issue #641).
  *
  * Without the window arms, a force-close right after fulfilling an
  * inbound HTLC left its output untracked on EITHER side's commitment:
@@ -1286,10 +1288,10 @@ function htlcEntryCanBePresent(
 		);
 	}
 	return (
+		entry.removalRemoteCommitted === false ||
+		// Second arm only for states that carry the first-phase flag alone.
 		(entry.direction === HtlcDirection.OFFERED &&
-			entry.removalLocallyRevoked === false) ||
-		(entry.direction === HtlcDirection.RECEIVED &&
-			entry.removalRemoteCommitted === false)
+			entry.removalLocallyRevoked === false)
 	);
 }
 

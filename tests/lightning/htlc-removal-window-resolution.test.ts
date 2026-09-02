@@ -4,8 +4,9 @@
  *
  * An HTLC that was just fulfilled or failed off-chain keeps its output in
  * the broadcast commitment until the removal is irrevocably committed
- * (removalRemoteCommitted on our commitment, removalLocallyRevoked on
- * theirs), and the stored remote HTLC signatures cover it. The output
+ * (removalRemoteCommitted on either side's commitment, since the peer's
+ * previous commitment stays broadcastable through the second phase), and
+ * the stored remote HTLC signatures cover it. The output
  * matcher used to skip every non PENDING/COMMITTED entry, so:
  *  - a preimage-held received HTLC was never claimed via HTLC-success
  *    and fell to the peer's timeout (#561), on the exact path
@@ -544,6 +545,57 @@ describe('HTLC removal-window force-close resolution (issues #561/#556)', functi
 		);
 		expect(htlcOut, 'window OFFERED HTLC tracked on their commitment').to.exist;
 	});
+
+	for (const kind of ['legacy', 'anchor', 'taproot'] as const) {
+		it(`their commitment: an offered HTLC the peer failed stays tracked through the SECOND removal phase (${kind})`, function () {
+			// Our revoke_and_ack for the peer's removal round flips
+			// removalLocallyRevoked one round BEFORE the peer revokes the
+			// commitment that carries the output. Matching on that first-phase
+			// flag alone dropped the entry there, so a peer confirming its still
+			// valid previous commitment left the offered output unwatched and the
+			// timeout sweep unarmed (issue #641).
+			const spec = makeHtlcSpec(
+				'h0',
+				50_000_000n,
+				HtlcDirection.OFFERED,
+				HtlcState.COMMITTED
+			);
+			const { openerState, acceptorState, acceptorLocalPoint } =
+				makeChannelPair([spec], kind);
+
+			// The transaction under classification: the peer's commitment as
+			// signed BEFORE the removal, which it can still broadcast.
+			const theirs = buildLocalCommitment(acceptorState, acceptorLocalPoint);
+			expect(theirs.result.outputMap.htlcs.length).to.equal(1);
+
+			const offeredCount = (): number =>
+				classifyOutputs(
+					theirs.result.tx,
+					openerState,
+					CommitmentType.THEIR_CURRENT_COMMITMENT,
+					0n
+				).filter((o) => o.outputType === OutputType.OFFERED_HTLC).length;
+
+			// handleUpdateFailHtlc's exact mutation: first phase, both to go.
+			const entry = openerState.htlcs.get('h0')!;
+			entry.state = HtlcState.FAILED;
+			entry.removalLocallyRevoked = false;
+			entry.removalRemoteCommitted = false;
+			expect(offeredCount(), 'first phase: output tracked').to.equal(1);
+
+			// handleCommitmentSigned's: we revoked, the peer has not.
+			entry.removalLocallyRevoked = true;
+			expect(
+				offeredCount(),
+				'second phase: the SAME tx keeps its offered HTLC tracked'
+			).to.equal(1);
+
+			// The peer's revoke_and_ack for our covering commitment_signed ends
+			// the window; past it the transaction is a revoked-line commitment.
+			entry.removalRemoteCommitted = true;
+			expect(offeredCount(), 'fully removed: not tracked').to.equal(0);
+		});
+	}
 
 	for (const kind of ['legacy', 'anchor'] as const) {
 		it(`their commitment: a just-fulfilled inbound HTLC stays claimable by preimage (${kind})`, function () {

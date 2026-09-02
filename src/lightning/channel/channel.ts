@@ -128,6 +128,7 @@ import { ChannelSigner, ISigner } from '../keys/signer';
 import {
 	buildLocalCommitment,
 	aggregateLocalCommitmentSig,
+	IBuiltCommitment,
 	buildRemoteCommitment,
 	signRemoteCommitment,
 	verifyRemoteCommitmentSig,
@@ -149,6 +150,11 @@ import {
 	validateV2ChannelType
 } from './types';
 import { generateNonce } from '../crypto/musig';
+import {
+	taprootCommitmentSighash,
+	startCommitmentSigningSession,
+	verifyPartialCommitmentSig
+} from './commitment-musig';
 import { isValidPublicKey } from '../crypto/ecdh';
 import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
@@ -399,6 +405,22 @@ const PLACEHOLDER_SHUTDOWN_SCRIPT = Buffer.concat([
 	Buffer.from([0x00, 0x14]),
 	Buffer.alloc(20)
 ]);
+
+/**
+ * The refusals a splice request outlives: each names a state that ends on its
+ * own, so the identical request starts the splice afterwards. Shared by the
+ * arms that raise them and by spliceBusyReason, which reports them before a
+ * caller has committed anything to the request (issue #642).
+ */
+const SPLICE_BUSY_RECONNECTING =
+	'Cannot splice: channel is reconnecting; retry after reestablishment';
+const SPLICE_BUSY_ABORT_PENDING =
+	'Cannot splice: a previous splice abort is not yet acknowledged';
+const SPLICE_BUSY_PEER_QUIESCENCE =
+	'Cannot splice: peer initiated the quiescence session; retry after it ends';
+const SPLICE_BUSY_REQUEST_PENDING =
+	'Cannot splice: another splice request is already awaiting quiescence; retry after it completes';
+const QUIESCE_BUSY_PENDING_HTLCS = 'Cannot quiesce: pending HTLCs exist';
 
 function bigIntMax(a: bigint, b: bigint): bigint {
 	return a > b ? a : b;
@@ -749,14 +771,25 @@ export class Channel {
 	// joined it. When the funder peer initiates quiescence concurrently and
 	// wins the BOLT 2 tie-break (issue #372), the request is dropped instead
 	// (with a surfaced error unless cancelled): the session belongs to the
-	// peer and a non-initiator must not send splice_init. Memory-only:
-	// quiescence never survives a disconnect.
+	// peer and a non-initiator must not send splice_init. At most one LIVE
+	// request is parked here: a second is refused rather than replacing it,
+	// since only one can be fired (issue #655). Memory-only: quiescence never
+	// survives a disconnect.
 	private _pendingSplice: {
 		relativeSatoshis: bigint;
 		fundingFeeratePerkw: number;
 		locktime: number;
 		cancelled: boolean;
 		ownsQuiescence: boolean;
+		// The direction this request was made with, carried with the request
+		// rather than left on the channel (issue #640): the channel stays NORMAL
+		// while the stfu is unanswered, so a later request refused before it
+		// parks has already recorded ITS direction over the channel fields.
+		spliceOutDestination: { script: Buffer; sats: bigint } | null;
+		spliceInInputs: {
+			inputs: ISpliceWalletInput[];
+			changeScript: Buffer;
+		} | null;
 	} | null = null;
 	// Splice interactive-tx driving (initiator side). The ordered contributions
 	// we still need to send (shared input, new funding output, splice-out
@@ -4195,6 +4228,41 @@ export class Channel {
 	}
 
 	/**
+	 * Record that a peer commitment_signed we just verified covers these offered
+	 * adds: every one the peer has committed, whether the commitment it signed
+	 * holds the add as an HTLC output or (once the peer has settled it) as the
+	 * peer's credit. A peer may fulfill an add one message before it signs, so
+	 * the first signature to reach an add can be one that also settles it, and
+	 * the rebuild reads this flag to choose between crediting the peer and
+	 * returning our deduction. FAILED is left out: the signature carries such an
+	 * add only as our refund, which the rebuild applies without asking.
+	 *
+	 * addRemoteCommitted cannot stand in for this. The peer's revoke_and_ack
+	 * sets it one message EARLIER, and until the commitment_signed that follows
+	 * arrives, the signature we hold covers a commitment without the add — so a
+	 * force-close rebuild that admitted the add on that flag alone broadcast a
+	 * transaction the stored signature does not verify (issue #643).
+	 *
+	 * Called for the splice commitment round too: it signs the same local
+	 * commitment over the new funding output, built with the same rule, and its
+	 * signature is what the force close rebuilds against once the splice is
+	 * adopted. An abandoned splice leaves the stamp standing while the
+	 * pre-splice signature applies again, which is the pre-existing gap of a
+	 * commitment round that only ever ran for the splice.
+	 */
+	private _markOfferedAddsRemoteSigned(): void {
+		for (const entry of this._state.htlcs.values()) {
+			if (
+				entry.direction === HtlcDirection.OFFERED &&
+				entry.addRemoteCommitted !== false &&
+				entry.state !== HtlcState.FAILED
+			) {
+				entry.addRemoteSigned = true;
+			}
+		}
+	}
+
+	/**
 	 * Handle commitment_signed from remote.
 	 * Returns revoke_and_ack.
 	 */
@@ -4417,21 +4485,8 @@ export class Channel {
 		this._state.lastSignedCommitLeaseBlockheight =
 			getLocalCommitmentLeaseBlockheight(this._state);
 
-		// The HTLC SET the signature covers, same purpose: the offered adds this
-		// commitment carries are the ones buildHtlcOutputsForLocal just built it
-		// with. The force-close rebuild keeps an output whose removal the peer
-		// stalled, and only this stamp tells it apart from an add the peer
-		// removed before ever signing it into a commitment of ours (issue #634).
-		for (const entry of this._state.htlcs.values()) {
-			if (
-				entry.direction === HtlcDirection.OFFERED &&
-				entry.addRemoteCommitted !== false &&
-				(entry.state === HtlcState.PENDING ||
-					entry.state === HtlcState.COMMITTED)
-			) {
-				entry.addRemoteSigned = true;
-			}
-		}
+		// The HTLC SET the signature covers, same purpose (issue #643).
+		this._markOfferedAddsRemoteSigned();
 
 		// Two-phase update_fee, acceptor side: this commitment_signed from the
 		// opener covers its staged update_fee (the update always precedes its
@@ -5950,81 +6005,250 @@ export class Channel {
 
 		// A transaction with no outputs is consensus-invalid, so a plan built
 		// around one is not a close, it is a broadcast that will be rejected.
-		// The admission rules keep a channel out of that state (issues #386,
-		// #388); refusing here is the backstop that turns a silent failure at
-		// the network into an answer the caller can act on.
-		if (built.result.tx.outs.length === 0) {
-			return {
-				ok: false,
-				error:
-					'Cannot force close: every commitment output is below the dust limit'
-			};
+		// Judged only once the rebuilds below have been tried: reading an
+		// unstamped add as unsigned returns its amount to our balance, which
+		// can lift the trimmed output back over the dust limit, and a legacy
+		// row predates the send guard that keeps a channel out of this state
+		// (issues #386, #388).
+		const outputless = built.result.tx.outs.length === 0;
+
+		// option_taproot: our verification nonce is deterministic per height, so
+		// re-deriving it here reproduces the EXACT nonce the peer's stored
+		// partial was made against (which is what keeps the pre-reconnect
+		// commitment force-closeable), and gives a fresh single-use secret-nonce
+		// registration: the MuSig2 library purges a secret nonce after one
+		// partialSign, so a force-close retry would otherwise find no secret.
+		// Derived once, before the rebuilds below, because it does not depend on
+		// which of them the peer signed. The peer's signing nonce is persisted
+		// (remoteSigningNonce); without it we cannot aggregate, which is why that
+		// is the very first thing asked.
+		const localNonce = taproot
+			? this._deriveVerificationNonce(closing.localCommitmentNumber)
+			: null;
+		if (localNonce) closing.localNonce = localNonce;
+
+		let witnessed = outputless
+			? null
+			: this._witnessForceCloseCommitment(
+					closing,
+					built,
+					signer,
+					perCommitmentPoint,
+					localNonce
+			  );
+
+		if (!witnessed) {
+			// The rebuild reconstructs what the peer signed from flags on our own
+			// records, and one shape of record cannot express the answer: an
+			// offered add persisted before addRemoteSigned existed, inside the
+			// window between the peer's revoke_and_ack and its commitment_signed
+			// (issue #657). Absent has to read as "already signed", or every
+			// upgraded channel with an offered add in flight would drop a genuine
+			// HTLC output. So the signature decides: rebuild with the unstamped
+			// adds read as unsigned, and take the first rebuild the stored
+			// signature covers.
+			for (const candidate of this._viewsWithUnstampedAddsUnsigned(closing)) {
+				const rebuilt = buildLocalCommitment(
+					candidate,
+					perCommitmentPoint,
+					undefined,
+					true
+				);
+				if (rebuilt.result.tx.outs.length === 0) continue;
+				witnessed = this._witnessForceCloseCommitment(
+					candidate,
+					rebuilt,
+					signer,
+					perCommitmentPoint,
+					localNonce
+				);
+				if (witnessed) break;
+			}
 		}
 
-		let localNonce: Uint8Array | null = null;
-		if (taproot) {
-			// option_taproot: the funding output is a MuSig2 key-spend P2TR. The
-			// broadcast witness is the single 64-byte BIP340 Schnorr signature
-			// obtained by aggregating our partial with the peer's stored partial over
-			// THIS local commitment (remoteCommitmentSignature = their 32-byte
-			// partial; remoteSigningNonce = the signing nonce that accompanied it;
-			// localNonce = our verification nonce for the current commitment).
-			// Our verification nonce is deterministic per height, so re-derive it
-			// fresh here — this reproduces the EXACT nonce the peer's stored partial
-			// was made against (so the pre-reconnect commitment is force-closeable),
-			// and ALWAYS re-deriving gives a fresh single-use secret-nonce
-			// registration: the MuSig2 library purges a secret nonce after one
-			// partialSign, so a force-close retry would otherwise find no secret.
-			// Safe — same height + same persisted peer nonce + same commitment ⇒ the
-			// identical signature, never a reused nonce over a different message. The
-			// peer's signing nonce is persisted (remoteSigningNonce); without it we
-			// cannot aggregate, which is why that is the very first thing asked.
-			localNonce = this._deriveVerificationNonce(closing.localCommitmentNumber);
-			closing.localNonce = localNonce;
-			const aggSig = aggregateLocalCommitmentSig(
-				closing,
-				signer,
-				localNonce,
-				closing.remoteSigningNonce!,
-				closing.remoteCommitmentSignature,
-				perCommitmentPoint,
-				closing.localCommitmentNumber
-			);
-			built.result.tx.setWitness(0, buildTaprootKeySpendWitness(aggSig));
-		} else {
-			// Create the funding witness using stored remote signature
-			const funding = createFundingScript(
-				closing.localBasepoints.fundingPubkey,
-				closing.remoteBasepoints.fundingPubkey
-			);
-
-			// Sign our side
-			const localSig = signer.signCommitmentTx(
-				built.result.tx,
-				funding.witnessScript,
-				built.fundingAmount
-			);
-
-			// Build the 2-of-2 witness
-			const witness = ChannelSigner.buildFundingWitness(
-				localSig,
-				closing.remoteCommitmentSignature,
-				closing.localBasepoints.fundingPubkey,
-				closing.remoteBasepoints.fundingPubkey,
-				funding.witnessScript
-			);
-
-			built.result.tx.setWitness(0, witness);
+		if (!witnessed) {
+			// No rebuild is both broadcastable and covered by the stored
+			// signature, so the close would relay nowhere while the caller was
+			// told its channel force closed. An answer it can act on beats a
+			// silent dead end.
+			return {
+				ok: false,
+				error: outputless
+					? 'Cannot force close: every commitment output is below the dust limit'
+					: 'Cannot force close: the stored peer signature does not cover the commitment we would broadcast'
+			};
 		}
 
 		return {
 			ok: true,
-			commitmentTx: built.result.tx.toBuffer(),
+			commitmentTx: witnessed.toBuffer(),
 			spliceAdoption,
 			v2Adoption,
 			localNonce,
 			channelId: closing.channelId!
 		};
+	}
+
+	/**
+	 * Attach the funding witness to a rebuilt local commitment, but only if the
+	 * peer's stored signature actually covers that rebuild (issue #657). Null
+	 * means "not this commitment" — the caller either tries another rebuild or
+	 * refuses; nothing unverified is ever handed back.
+	 *
+	 * `view` is the candidate state the tx was built from, never the live
+	 * channel: the taproot aggregation rebuilds internally, so it has to see the
+	 * same view the caller did.
+	 *
+	 * Taproot asks the question of the peer's PARTIAL rather than of the
+	 * aggregate. Verifying the aggregate would mean producing our own partial
+	 * for every candidate, and our verification nonce for a height is allowed to
+	 * sign exactly one sighash (see _deriveVerificationNonce): partials over two
+	 * different rebuilds under one nonce is the reuse that derivation exists to
+	 * rule out. partialVerify is a public operation, so only the surviving
+	 * rebuild is ever signed, and the aggregate it produces is still checked as
+	 * the Schnorr signature the network will see.
+	 */
+	private _witnessForceCloseCommitment(
+		view: IChannelState,
+		built: IBuiltCommitment,
+		signer: ISigner,
+		perCommitmentPoint: Buffer,
+		taprootNonce: Uint8Array | null
+	): bitcoin.Transaction | null {
+		const tx = built.result.tx;
+		const remoteSig = view.remoteCommitmentSignature!;
+		const remoteFundingPubkey = view.remoteBasepoints!.fundingPubkey;
+
+		if (taprootNonce) {
+			// option_taproot: the funding output is a MuSig2 key-spend P2TR, so
+			// the broadcast witness is the single 64-byte BIP340 Schnorr
+			// signature aggregating our partial with the peer's stored one
+			// (remoteCommitmentSignature = their 32-byte partial;
+			// remoteSigningNonce = the signing nonce that accompanied it).
+			// A peer nonce or partial the musig backend cannot decode makes it
+			// THROW rather than return false, and that is the same answer here:
+			// no witness this rebuild can carry.
+			try {
+				const { p2trOutput, outputKey } = createTaprootFundingScript(
+					view.localBasepoints.fundingPubkey,
+					remoteFundingPubkey
+				);
+				const sighash = taprootCommitmentSighash(
+					tx,
+					p2trOutput,
+					Number(view.fundingSatoshis)
+				);
+				const session = startCommitmentSigningSession(
+					sighash,
+					view.localBasepoints.fundingPubkey,
+					remoteFundingPubkey,
+					taprootNonce,
+					view.remoteSigningNonce!
+				);
+				if (
+					!verifyPartialCommitmentSig(
+						session,
+						remoteSig,
+						remoteFundingPubkey,
+						view.remoteSigningNonce!
+					)
+				) {
+					return null;
+				}
+				const aggSig = aggregateLocalCommitmentSig(
+					view,
+					signer,
+					taprootNonce,
+					view.remoteSigningNonce!,
+					remoteSig,
+					perCommitmentPoint,
+					view.localCommitmentNumber
+				);
+				if (!ecc.verifySchnorr(sighash, outputKey, aggSig)) return null;
+				tx.setWitness(0, buildTaprootKeySpendWitness(aggSig));
+			} catch {
+				return null;
+			}
+			return tx;
+		}
+
+		const funding = createFundingScript(
+			view.localBasepoints.fundingPubkey,
+			remoteFundingPubkey
+		);
+
+		// A custom ISigner is free to throw where the built-in returns false; the
+		// judgment is over stored bytes either way, so it never escapes as an
+		// exception into a close the caller has already committed to.
+		let covered = false;
+		try {
+			covered = signer.verifyCommitmentSig(
+				tx,
+				remoteSig,
+				remoteFundingPubkey,
+				funding.witnessScript,
+				built.fundingAmount
+			);
+		} catch {
+			covered = false;
+		}
+		if (!covered) return null;
+
+		const localSig = signer.signCommitmentTx(
+			tx,
+			funding.witnessScript,
+			built.fundingAmount
+		);
+		tx.setWitness(
+			0,
+			ChannelSigner.buildFundingWitness(
+				localSig,
+				remoteSig,
+				view.localBasepoints.fundingPubkey,
+				remoteFundingPubkey,
+				funding.witnessScript
+			)
+		);
+		return tx;
+	}
+
+	/**
+	 * Close views with the offered adds that carry no addRemoteSigned stamp read
+	 * as unsigned: the newest one alone, then the two newest, and so on. Yields
+	 * nothing when there is no such add (the rebuild would be byte-identical).
+	 *
+	 * Cumulative, newest first, because a peer commitment_signed covers every
+	 * offered add committed when it was sent: the unsigned ones are the newest
+	 * run by htlc id. A state persisted before the stamp existed can hold a
+	 * signed add next to an unsigned one, and flipping the whole set together
+	 * would reach neither commitment.
+	 *
+	 * A copy down to the entries it changes: these rows are the live channel's,
+	 * and this is a question asked of a candidate, not a repair.
+	 */
+	private *_viewsWithUnstampedAddsUnsigned(
+		closing: IChannelState
+	): Generator<IChannelState> {
+		const unstamped: [string, IHtlcEntry][] = [];
+		for (const [id, entry] of closing.htlcs) {
+			if (
+				entry.direction !== HtlcDirection.OFFERED ||
+				entry.addRemoteSigned !== undefined ||
+				entry.addRemoteCommitted === false
+			) {
+				continue;
+			}
+			unstamped.push([id, entry]);
+		}
+		unstamped.sort(([, a], [, b]) =>
+			a.id === b.id ? 0 : a.id > b.id ? -1 : 1
+		);
+
+		const htlcs = new Map(closing.htlcs);
+		for (const [id, entry] of unstamped) {
+			htlcs.set(id, { ...entry, addRemoteSigned: false });
+			yield { ...closing, htlcs: new Map(htlcs) } as IChannelState;
+		}
 	}
 
 	/**
@@ -9541,7 +9765,7 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot quiesce: pending HTLCs exist',
+					message: QUIESCE_BUSY_PENDING_HTLCS,
 					// They settle or fail; either way the channel quiesces after.
 					transient: true
 				}
@@ -9675,6 +9899,10 @@ export class Channel {
 		) {
 			const pending = this._pendingSplice;
 			this._pendingSplice = null;
+			// Splice from the direction the request carried, not from whatever a
+			// request refused since then left on the channel (issue #640).
+			this._spliceOutDestination = pending.spliceOutDestination;
+			this._spliceInInputs = pending.spliceInInputs;
 			if (!pending.cancelled) {
 				actions.push(
 					...this._startSplice(
@@ -9771,6 +9999,53 @@ export class Channel {
 	}
 
 	/**
+	 * Why a splice started right now would be refused transiently, or null.
+	 * Every arm here is one initiateSplice raises with `transient: true`, in the
+	 * same order, so the two agree on what the caller is told.
+	 *
+	 * It exists because spliceIn sources its wallet inputs asynchronously and
+	 * cannot wait for initiateSplice to answer: the refusal would arrive on
+	 * node:error long after the request returned `ok: true`, leaving an HTTP
+	 * caller with a 200 and no retryable status (issue #642). Advice, not
+	 * enforcement: initiateSplice re-reads the same states at the point they
+	 * matter, and a state that ends between the two calls is one this correctly
+	 * stops reporting.
+	 */
+	spliceBusyReason(): string | null {
+		if (this._state.state !== ChannelState.NORMAL) {
+			// A disconnect wraps a NORMAL channel in AWAITING_REESTABLISH and
+			// handleReestablish unwraps it; any other state is a refusal that
+			// does not clear on its own (issue #639).
+			return this._state.state === ChannelState.AWAITING_REESTABLISH &&
+				this._state.preReestablishState === ChannelState.NORMAL
+				? SPLICE_BUSY_RECONNECTING
+				: null;
+		}
+		if (this._spliceAbortPending) return SPLICE_BUSY_ABORT_PENDING;
+		// From the peer's stfu on, the session is the peer's whether or not the
+		// handshake has finished: a RECEIVED_STFU only owes the reply that turns
+		// it QUIESCENT, and that reply names the peer initiator.
+		if (this._quiescence.peerHasSentStfu()) {
+			return this._quiescence.isInitiator()
+				? null
+				: SPLICE_BUSY_PEER_QUIESCENCE;
+		}
+		// A live request is already parked on our own unanswered stfu, and it is
+		// the one the deferred hook will fire (issue #655).
+		if (this._pendingSplice && !this._pendingSplice.cancelled) {
+			return SPLICE_BUSY_REQUEST_PENDING;
+		}
+		// Our own handshake, or none yet: this request would be the one to drive
+		// it, so initiateQuiescence's own transient arm is ours too. A handshake
+		// in flight with nothing live parked on it takes this request as its
+		// deferred splice and refuses nothing.
+		if (!this._quiescence.isQuiescing() && this.hasPendingHtlcs()) {
+			return QUIESCE_BUSY_PENDING_HTLCS;
+		}
+		return null;
+	}
+
+	/**
 	 * Initiate a splice operation.
 	 * Channel must be quiescent (QUIESCENT state) before splicing.
 	 * @param relativeSatoshis - positive for splice-in, negative for splice-out
@@ -9783,6 +10058,23 @@ export class Channel {
 		locktime = 0
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.NORMAL) {
+			// A disconnect wraps a NORMAL channel in AWAITING_REESTABLISH and
+			// handleReestablish unwraps it, so this refusal clears by itself and
+			// the identical request then starts the splice (issue #639). Both
+			// halves are read because nothing clears preReestablishState when a
+			// marked channel closes: only the marker says it is coming back.
+			if (
+				this._state.state === ChannelState.AWAITING_REESTABLISH &&
+				this._state.preReestablishState === ChannelState.NORMAL
+			) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: SPLICE_BUSY_RECONNECTING,
+						transient: true
+					}
+				];
+			}
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -9798,8 +10090,7 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message:
-						'Cannot splice: a previous splice abort is not yet acknowledged',
+					message: SPLICE_BUSY_ABORT_PENDING,
 					transient: true
 				}
 			];
@@ -9931,25 +10222,52 @@ export class Channel {
 			}
 		}
 
-		// Already quiescent — start the splice immediately. Only the
-		// quiescence initiator may send splice_init (BOLT 2): a side that
-		// merely answered the peer's stfu (or lost the concurrent-stfu funder
-		// tie-break) must not drive a dependent protocol into the peer's
-		// session.
+		// The session is the peer's from its stfu on, finished handshake or not.
+		// Only the quiescence initiator may send splice_init (BOLT 2): a side
+		// that merely answered the peer's stfu (or lost the concurrent-stfu
+		// funder tie-break) must not drive a dependent protocol into the peer's
+		// session. A RECEIVED_STFU is refused here rather than parked below,
+		// because the reply that completes it goes out from _maybeAnswerOwedStfu
+		// when the last pending update drains, and that path has no deferred
+		// splice hook: the request would sit parked for the life of the peer's
+		// session with no splice and no refusal ever emitted (issue #656).
+		if (this._quiescence.peerHasSentStfu() && !this._quiescence.isInitiator()) {
+			// The refused request's wallet configuration dies with it
+			// (see the tie-break drop in handleStfuMessage).
+			this._resetSpliceDriver();
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: SPLICE_BUSY_PEER_QUIESCENCE,
+					transient: true
+				}
+			];
+		}
+
+		// One live request per handshake: the deferred hook fires exactly one
+		// splice, so a second request used to overwrite the first while both
+		// callers were told their splice had started (issue #655). The parked
+		// request keeps the quiescence it drove and this one is refused as
+		// transient: the handshake ends either way, in that splice or in a
+		// drop. A CANCELLED request stays replaceable: it owes the handshake
+		// only an unwind, which the replacement's own splice conversation
+		// supplies.
+		if (this._pendingSplice && !this._pendingSplice.cancelled) {
+			// The refused request's wallet configuration dies with it, leaving
+			// the channel fields free for the parked request's own copy
+			// (see the deferred hook in handleStfuMessage).
+			this._resetSpliceDriver();
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: SPLICE_BUSY_REQUEST_PENDING,
+					transient: true
+				}
+			];
+		}
+
+		// Already quiescent — start the splice immediately.
 		if (this._quiescence.isQuiescent()) {
-			if (!this._quiescence.isInitiator()) {
-				// The refused request's wallet configuration dies with it
-				// (see the tie-break drop in handleStfuMessage).
-				this._resetSpliceDriver();
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'Cannot splice: peer initiated the quiescence session; retry after it ends',
-						transient: true
-					}
-				];
-			}
 			return this._startSplice(relativeSatoshis, fundingFeeratePerkw, locktime);
 		}
 
@@ -9968,7 +10286,9 @@ export class Channel {
 			fundingFeeratePerkw,
 			locktime,
 			cancelled: false,
-			ownsQuiescence
+			ownsQuiescence,
+			spliceOutDestination: this._spliceOutDestination,
+			spliceInInputs: this._spliceInInputs
 		};
 
 		if (this._quiescence.isQuiescing()) {
@@ -10014,8 +10334,7 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message:
-						'Cannot splice: a previous splice abort is not yet acknowledged',
+					message: SPLICE_BUSY_ABORT_PENDING,
 					transient: true
 				}
 			];
@@ -10296,16 +10615,31 @@ export class Channel {
 	/**
 	 * Record the splice-out destination (where withdrawn funds are paid). Called
 	 * by the node before initiating a splice-out.
+	 *
+	 * Exactly one direction is configured at a time (issue #640): a request
+	 * refused before initiation (a busy channel, say) leaves its wallet inputs
+	 * on the channel, and _computeSpliceContributions takes the splice-in branch
+	 * whenever inputs are present, which would drop this destination.
+	 *
+	 * Outside NORMAL nothing is recorded at all: initiateSplice refuses such a
+	 * request on the state anyway, and the configuration on the channel there
+	 * belongs to the splice already running, not to this request.
 	 */
 	setSpliceOutDestination(script: Buffer, sats: bigint): void {
+		if (this._state.state !== ChannelState.NORMAL) return;
+		this._spliceInInputs = null;
 		this._spliceOutDestination = { script, sats };
 	}
 
 	/**
 	 * Record the wallet inputs + change script funding a splice-in. Called by the
 	 * node (which sourced the UTXOs from its on-chain wallet) before initiating.
+	 * Clears the other direction, and defers to a running splice, for the same
+	 * reasons as setSpliceOutDestination.
 	 */
 	setSpliceInInputs(inputs: ISpliceWalletInput[], changeScript: Buffer): void {
+		if (this._state.state !== ChannelState.NORMAL) return;
+		this._spliceOutDestination = null;
 		this._spliceInInputs = { inputs, changeScript };
 	}
 
@@ -12077,6 +12411,10 @@ export class Channel {
 		this._spliceRemoteCommitmentSig = Buffer.from(msg.signature);
 		this._spliceRemoteHtlcSigs = msg.htlcSignatures.map((s) => Buffer.from(s));
 		this._spliceReceivedCommitment = true;
+		// This signature is what a force close rebuilds against once the splice
+		// is adopted, so the adds it carries are signed for that rebuild's
+		// purposes exactly as an ordinary commitment_signed's are (issue #643).
+		this._markOfferedAddsRemoteSigned();
 		// Keep the persisted in-flight record in sync (it may already exist from
 		// our own commitment send): the peer's commitment sig must survive a
 		// crash, and reestablish derives retransmit_flags from it.

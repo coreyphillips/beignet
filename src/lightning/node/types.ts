@@ -1261,8 +1261,9 @@ export enum SpliceRefusalCode {
 	/**
 	 * The channel would start the splice, but not yet: a previous abort is
 	 * still awaiting the peer's tx_abort echo, the peer owns the current
-	 * quiescence session, or HTLCs are still settling. Each ends on its own, so
-	 * the identical request succeeds once it does (issue #633).
+	 * quiescence session, HTLCs are still settling, or the peer is reconnecting
+	 * (issue #639). Each ends on its own, so the identical request succeeds
+	 * once it does (issue #633).
 	 */
 	SPLICE_BUSY = 'SPLICE_BUSY',
 	/** The channel exists but would not start the splice (state, peer, size). */

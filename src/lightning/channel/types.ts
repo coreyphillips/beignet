@@ -288,19 +288,20 @@ export interface IHtlcEntry {
 	/**
 	 * OFFERED entries: false from addHtlc until a commitment_signed we accepted
 	 * covered a local commitment carrying this add. That is one message LATER
-	 * than addRemoteCommitted, which the peer's revoke_and_ack sets: between the
-	 * two the peer has the add on its own commitment while the signature we
-	 * store still covers a commitment without it.
+	 * than addRemoteCommitted, which the peer's revoke_and_ack sets: in between,
+	 * the peer holds the add on its own commitment while the signature we store
+	 * still covers a commitment without it.
 	 *
-	 * The force-close rebuild is what needs the distinction. It keeps an offered
-	 * output the peer has removed but not yet signed away (issue #634), and a
-	 * peer that fails the HTLC inside the window above would otherwise have that
-	 * put an output into the rebuild the stored signature was made without,
-	 * leaving the broadcast witness invalid.
+	 * Only the force-close rebuild (buildLocalCommitment signedLocal=true) needs
+	 * the distinction — it must reproduce the commitment the STORED signature
+	 * covers, and an add from inside that window is not in it (issue #643).
+	 * Optional for the same reason as the flags above: absent means "already
+	 * signed", so legacy persisted entries keep the old reading.
 	 *
-	 * Optional like the flags above, but absent is NOT a default here: either
-	 * answer breaks one of the two shapes, so the rebuild reads the shape off
-	 * the stored per-HTLC signature count instead (resolveRetainedRemovals).
+	 * The same stamp bounds the retention at the other end: the rebuild keeps
+	 * an offered output whose removal the peer has not signed away yet (issue
+	 * #634), and an add the peer removed before it had ever been signed in has
+	 * no such output to keep.
 	 */
 	addRemoteSigned?: boolean;
 

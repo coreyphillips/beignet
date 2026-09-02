@@ -251,8 +251,8 @@ function filterUntrimmedHtlcs<
  *
  * The peer's removal enters the commitments the PEER signs from its next
  * commitment_signed on, so until that signature arrives
- * (removalLocallyRevoked === false) the one we hold — and would broadcast on a
- * force close — is the one that predates the removal, output and all. Only the
+ * (removalLocallyRevoked === false) the one we hold, and would broadcast on a
+ * force close, is the one that predates the removal, output and all. Only the
  * signedLocal rebuild asks this: the commitment being VERIFIED is the next one,
  * which drops the output, and the peer's signature is over that.
  *
@@ -263,90 +263,24 @@ function filterUntrimmedHtlcs<
  * addRemoteSigned bounds the window at the other end. A peer may send its
  * removal before it has signed the add into any commitment of ours (nothing on
  * the wire stops it), and there the stored signature is over a commitment that
- * never had the output — retaining it would break the very rebuild this fixes.
- * Rows persisted before that flag existed carry neither answer, which is what
- * `admitLegacy` selects between; resolveRetainedRemovals settles those.
+ * never had the output, so retaining it would break the very rebuild this
+ * fixes. Absent reads as "already signed", the same default
+ * localCommitmentCarriesAdd takes, and a row that predates the stamp is
+ * settled the same way: prepareForceClose verifies each rebuild against the
+ * stored signature and re-reads the unstamped adds as unsigned when the first
+ * does not hold (issue #657), which drops the retention with them.
  */
-function carriesStalledRemoval(
+function signedLocalCarriesRemoval(
 	entry: IHtlcEntry,
-	admitLegacy: boolean
+	signedLocal: boolean
 ): boolean {
 	return (
+		signedLocal &&
 		entry.direction === HtlcDirection.OFFERED &&
 		(entry.state === HtlcState.FULFILLED || entry.state === HtlcState.FAILED) &&
 		entry.removalLocallyRevoked === false &&
-		(admitLegacy
-			? entry.addRemoteSigned !== false
-			: entry.addRemoteSigned === true)
+		entry.addRemoteSigned !== false
 	);
-}
-
-const NO_RETAINED_REMOVALS: ReadonlySet<IHtlcEntry> = new Set();
-
-/**
- * The stalled removals this build keeps — empty for every build but the
- * signedLocal rebuild, the others describing the commitment signed NEXT, which
- * drops the removal.
- *
- * A row persisted before addRemoteSigned existed answers neither shape, and the
- * two want opposite treatment, so ask the stored per-HTLC signatures: the peer
- * sends exactly one per untrimmed HTLC output of the commitment its signature
- * covers, so a retention that commitment never carried overshoots the count,
- * and a strict set matching it is the shape the row really is. A count that
- * fits neither set leaves the retention in place, that being the shape a
- * removal round normally reaches (and the one issue #634 is about).
- *
- * A retention that trims away moves the balance alone, so the count cannot see
- * it and it keeps the retention too. Nothing stored separates the two shapes
- * there (both build the same commitment, and only the peer's signature says
- * which one it signed), and retention is the shape a conforming peer leaves:
- * the other needs a peer that removed an add before it was irrevocably
- * committed, which BOLT 2 forbids.
- */
-function resolveRetainedRemovals(
-	state: IChannelState,
-	keys: ICommitmentKeys,
-	signedLocal: boolean,
-	feeratePerKw: number,
-	useAnchors: boolean
-): ReadonlySet<IHtlcEntry> {
-	if (!signedLocal) {
-		return NO_RETAINED_REMOVALS;
-	}
-	const retained = new Set<IHtlcEntry>();
-	let hasLegacy = false;
-	for (const entry of state.htlcs.values()) {
-		if (!carriesStalledRemoval(entry, true)) {
-			continue;
-		}
-		retained.add(entry);
-		if (entry.addRemoteSigned === undefined) {
-			hasLegacy = true;
-		}
-	}
-	if (!hasLegacy || !Array.isArray(state.remoteHtlcSignatures)) {
-		return retained;
-	}
-
-	const untrimmedCount = (set: ReadonlySet<IHtlcEntry>): number =>
-		filterUntrimmedHtlcs(
-			buildHtlcOutputsForLocal(state, keys, set),
-			state.localConfig.dustLimitSatoshis,
-			feeratePerKw,
-			useAnchors
-		).length;
-
-	const signedCount = state.remoteHtlcSignatures.length;
-	if (untrimmedCount(retained) === signedCount) {
-		return retained;
-	}
-	const strict = new Set<IHtlcEntry>();
-	for (const entry of retained) {
-		if (carriesStalledRemoval(entry, false)) {
-			strict.add(entry);
-		}
-	}
-	return untrimmedCount(strict) === signedCount ? strict : retained;
 }
 
 /** The last COMMITTED channel feerate (fee rounds fully finalized). */
@@ -589,6 +523,31 @@ export interface IBuiltCommitment {
 }
 
 /**
+ * Whether an offered add of ours is carried by the local commitment being
+ * built. The output loop and the balance loop below both ask through here so
+ * they can never disagree about it.
+ *
+ * Verifying the peer's next commitment_signed: the peer's revoke_and_ack for
+ * our covering commitment_signed (addRemoteCommitted) is the boundary.
+ *
+ * signedLocal (the force-close rebuild of the commitment the STORED signature
+ * covers): the boundary is the peer's commitment_signed AFTER that
+ * (addRemoteSigned), one message later. An add admitted on the earlier flag
+ * alone goes into the rebuild the stored signature was made without, and the
+ * broadcast witness does not verify (issue #643).
+ */
+function localCommitmentCarriesAdd(
+	entry: IHtlcEntry,
+	signedLocal: boolean
+): boolean {
+	if (entry.addRemoteCommitted === false) {
+		return false;
+	}
+	// Absent means "already signed" — see IHtlcEntry.addRemoteSigned.
+	return !signedLocal || entry.addRemoteSigned !== false;
+}
+
+/**
  * Build the local commitment transaction (the one we hold).
  *
  * From our perspective:
@@ -638,21 +597,11 @@ export function buildLocalCommitment(
 	// Calculate commitment fee (BOLT 3): opener pays the fee
 	const feeratePerKw = getLocalCommitmentFeeRate(state, signedLocal);
 
-	// Decided once, because the outputs and the balances below have to agree on
-	// which stalled removals this commitment still carries.
-	const retained = resolveRetainedRemovals(
-		state,
-		keys,
-		signedLocal,
-		feeratePerKw,
-		useAnchors
-	);
-
 	// Build HTLC outputs, then trim per BOLT 3 (dust_limit + second-level fee).
 	// The SAME trimmed set feeds both the commitment outputs and the
 	// num_untrimmed_htlcs fee count so they can never diverge.
 	const htlcOutputs = filterUntrimmedHtlcs(
-		buildHtlcOutputsForLocal(state, keys, retained),
+		buildHtlcOutputsForLocal(state, keys, signedLocal),
 		state.localConfig.dustLimitSatoshis,
 		feeratePerKw,
 		useAnchors
@@ -685,6 +634,12 @@ export function buildLocalCommitment(
 	let localMsat = state.localBalanceMsat;
 	let remoteMsat = state.remoteBalanceMsat;
 	for (const entry of state.htlcs.values()) {
+		if (signedLocalCarriesRemoval(entry, signedLocal)) {
+			// This rebuild still carries the HTLC output (the stored signature
+			// predates the peer's removal), so nothing has been settled on it:
+			// neither the peer's credit nor our refund belongs here (issue #634).
+			continue;
+		}
 		if (entry.state === HtlcState.FULFILLED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
 				// We received and fulfilled: credit our balance — unless the peer
@@ -693,9 +648,15 @@ export function buildLocalCommitment(
 				if (entry.removalRemoteCommitted !== false) {
 					localMsat += entry.amountMsat;
 				}
-			} else if (!retained.has(entry)) {
-				// We offered and remote fulfilled: credit their balance
+			} else if (localCommitmentCarriesAdd(entry, signedLocal)) {
+				// We offered and remote fulfilled: credit their balance.
 				remoteMsat += entry.amountMsat;
+			} else {
+				// The peer revealed the preimage for an add this commitment
+				// never carried. It holds neither the HTLC output nor the
+				// credit, so our provisional deduction comes back instead of
+				// the peer being paid (issue #643).
+				localMsat += entry.amountMsat;
 			}
 		} else if (entry.state === HtlcState.FAILED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
@@ -704,17 +665,17 @@ export function buildLocalCommitment(
 				if (entry.removalRemoteCommitted !== false) {
 					remoteMsat += entry.amountMsat;
 				}
-			} else if (!retained.has(entry)) {
+			} else {
 				// We offered but failed: refund our balance
 				localMsat += entry.amountMsat;
 			}
 		} else if (
 			entry.direction === HtlcDirection.OFFERED &&
-			entry.addRemoteCommitted === false
+			!localCommitmentCarriesAdd(entry, signedLocal)
 		) {
-			// An add of ours the peer has not committed yet: the provisional
-			// balance deduction from addHtlc is not in the peer's signatures —
-			// return it for this build (the output is excluded above).
+			// An add of ours this commitment does not carry: the provisional
+			// balance deduction from addHtlc is not in the peer's signature over
+			// it — return it for this build (the output is excluded above).
 			localMsat += entry.amountMsat;
 		}
 	}
@@ -1611,7 +1572,7 @@ export function verifyRemoteHtlcSignatures(
 function buildHtlcOutputsForLocal(
 	state: IChannelState,
 	keys: ICommitmentKeys,
-	retained: ReadonlySet<IHtlcEntry> = NO_RETAINED_REMOVALS
+	signedLocal = false
 ): (IHtlcOutput & { direction: HtlcDirection; amountMsat: bigint })[] {
 	const outputs: (IHtlcOutput & {
 		direction: HtlcDirection;
@@ -1629,7 +1590,7 @@ function buildHtlcOutputsForLocal(
 		// define its contents, and the peer only incorporates OUR updates after
 		// revoking a commitment that covers them):
 		// - an add WE offered that the peer has not committed yet
-		//   (addRemoteCommitted === false) is NOT in the peer's signatures —
+		//   (localCommitmentCarriesAdd) is NOT in the peer's signatures —
 		//   exclude it;
 		// - a removal WE sent for a RECEIVED HTLC that the peer has not
 		//   committed yet (removalRemoteCommitted === false) is not in the
@@ -1637,7 +1598,7 @@ function buildHtlcOutputsForLocal(
 		// - a removal the PEER sent for an OFFERED HTLC is in the next
 		//   commitment it signs, so this build drops it — except in the
 		//   signedLocal rebuild, which reproduces the commitment the stored
-		//   signature covers (see resolveRetainedRemovals).
+		//   signature covers (signedLocalCarriesRemoval).
 		if (
 			entry.state === HtlcState.FULFILLED ||
 			entry.state === HtlcState.FAILED
@@ -1645,7 +1606,7 @@ function buildHtlcOutputsForLocal(
 			const stillPresent =
 				(entry.direction === HtlcDirection.RECEIVED &&
 					entry.removalRemoteCommitted === false) ||
-				retained.has(entry);
+				signedLocalCarriesRemoval(entry, signedLocal);
 			if (!stillPresent) {
 				continue;
 			}
@@ -1656,7 +1617,7 @@ function buildHtlcOutputsForLocal(
 			continue;
 		} else if (
 			entry.direction === HtlcDirection.OFFERED &&
-			entry.addRemoteCommitted === false
+			!localCommitmentCarriesAdd(entry, signedLocal)
 		) {
 			continue;
 		}

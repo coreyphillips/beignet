@@ -105,6 +105,7 @@ export {
 } from './types';
 export type {
 	DfTransportDescriptor,
+	IDfAttemptFunding,
 	IDfBlindedHop,
 	IDfDirectPeerTransport,
 	IDfOnionTransport,
