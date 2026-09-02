@@ -134,6 +134,9 @@ const HEIGHT = 800_000;
 const EXPIRY = HEIGHT + 100;
 const HTLC_MSAT = 50_000_000n;
 const HTLC_SATS = HTLC_MSAT / 1000n;
+/** A second add, at an amount that tells its output apart from the first. */
+const SECOND_MSAT = 60_000_000n;
+const SECOND_SATS = SECOND_MSAT / 1000n;
 /** LightningNode.OFFERED_HTLC_FORCE_CLOSE_GRACE_BLOCKS. */
 const GRACE = 6;
 
@@ -470,6 +473,73 @@ describe('The force-close rebuild and an unsigned add (issue #643)', function ()
 			'the key-spend witness is a valid signature'
 		).to.equal(true);
 		f.destroy();
+	});
+
+	it('keeps the older add when only the newer one is unsigned (issue #657)', function () {
+		// A legacy state can hold both readings at once: an older add the stored
+		// signature covers, a newer one inside the window, and no stamp on
+		// either. Reading the whole unstamped set one way or the other reaches
+		// neither commitment, so a close that is there would be refused.
+		const alice = createNode(680);
+		const bob = createNode(681);
+		const filter: IFilter = { allow: () => true };
+		wire(alice, bob, filter);
+		const channelId = openReadyChannel(alice, bob);
+		const bobId = bob.getNodeId();
+		let signedRounds = 0;
+		filter.allow = (from: string, type: number): boolean => {
+			if (from !== bobId) return true;
+			// Bob has no invoice for either add. Holding his removals back leaves
+			// both entries in place to rebuild.
+			if (type === MessageType.UPDATE_FAIL_HTLC) return false;
+			if (type !== MessageType.COMMITMENT_SIGNED) return true;
+			// Only the first add's round is signed in. The second stalls between
+			// Bob's revoke_and_ack and the commitment_signed that would cover it.
+			return signedRounds++ === 0;
+		};
+
+		const manager = alice.getChannelManager();
+		const onion = Buffer.alloc(1366);
+		manager.addHtlc(
+			channelId,
+			HTLC_MSAT,
+			crypto.randomBytes(32),
+			EXPIRY,
+			onion
+		);
+		manager.addHtlc(
+			channelId,
+			SECOND_MSAT,
+			crypto.randomBytes(32),
+			EXPIRY,
+			onion
+		);
+
+		const htlcs = manager.getChannel(channelId)!.getFullState().htlcs;
+		const older = htlcs.get('offered-0')!;
+		const newer = htlcs.get('offered-1')!;
+		expect(older.addRemoteSigned, 'the older add is signed in').to.equal(true);
+		expect(
+			newer.addRemoteCommitted,
+			'the peer revoked for the newer add'
+		).to.equal(true);
+		expect(newer.addRemoteSigned, 'the newer add is not').to.equal(false);
+		delete older.addRemoteSigned;
+		delete newer.addRemoteSigned;
+
+		const tx = plannedCommitment(alice, channelId);
+
+		expect(hasHtlcOutput(tx), 'the signed add keeps its output').to.equal(true);
+		expect(
+			tx.outs.some((o) => BigInt(o.value) === SECOND_SATS),
+			'the unsigned add has none'
+		).to.equal(false);
+		expect(
+			peerSigned(alice, channelId, tx),
+			'the stored remote signature covers what we broadcast'
+		).to.equal(true);
+		alice.destroy();
+		bob.destroy();
 	});
 
 	it('refuses a close no rebuild the signature covers (issue #657)', function () {

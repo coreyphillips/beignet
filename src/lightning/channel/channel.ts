@@ -6046,26 +6046,25 @@ export class Channel {
 			// window between the peer's revoke_and_ack and its commitment_signed
 			// (issue #657). Absent has to read as "already signed", or every
 			// upgraded channel with an offered add in flight would drop a genuine
-			// HTLC output. So the signature decides: rebuild once more with the
-			// unstamped adds treated as unsigned, and use that only if it is the
-			// commitment the stored signature covers.
-			const unstamped = this._viewWithUnstampedAddsUnsigned(closing);
-			if (unstamped) {
+			// HTLC output. So the signature decides: rebuild with the unstamped
+			// adds read as unsigned, and take the first rebuild the stored
+			// signature covers.
+			for (const candidate of this._viewsWithUnstampedAddsUnsigned(closing)) {
 				const rebuilt = buildLocalCommitment(
-					unstamped,
+					candidate,
 					perCommitmentPoint,
 					undefined,
 					true
 				);
-				if (rebuilt.result.tx.outs.length > 0) {
-					witnessed = this._witnessForceCloseCommitment(
-						unstamped,
-						rebuilt,
-						signer,
-						perCommitmentPoint,
-						localNonce
-					);
-				}
+				if (rebuilt.result.tx.outs.length === 0) continue;
+				witnessed = this._witnessForceCloseCommitment(
+					candidate,
+					rebuilt,
+					signer,
+					perCommitmentPoint,
+					localNonce
+				);
+				if (witnessed) break;
 			}
 		}
 
@@ -6215,17 +6214,23 @@ export class Channel {
 	}
 
 	/**
-	 * The same close view with every offered add that carries no addRemoteSigned
-	 * stamp read as unsigned, or null when there is none (the rebuild would be
-	 * byte-identical, so there is nothing to try).
+	 * Close views with the offered adds that carry no addRemoteSigned stamp read
+	 * as unsigned: the newest one alone, then the two newest, and so on. Yields
+	 * nothing when there is no such add (the rebuild would be byte-identical).
+	 *
+	 * Cumulative, newest first, because a peer commitment_signed covers every
+	 * offered add committed when it was sent: the unsigned ones are the newest
+	 * run by htlc id. A state persisted before the stamp existed can hold a
+	 * signed add next to an unsigned one, and flipping the whole set together
+	 * would reach neither commitment.
 	 *
 	 * A copy down to the entries it changes: these rows are the live channel's,
 	 * and this is a question asked of a candidate, not a repair.
 	 */
-	private _viewWithUnstampedAddsUnsigned(
+	private *_viewsWithUnstampedAddsUnsigned(
 		closing: IChannelState
-	): IChannelState | null {
-		let htlcs: Map<string, IHtlcEntry> | null = null;
+	): Generator<IChannelState> {
+		const unstamped: [string, IHtlcEntry][] = [];
 		for (const [id, entry] of closing.htlcs) {
 			if (
 				entry.direction !== HtlcDirection.OFFERED ||
@@ -6234,11 +6239,17 @@ export class Channel {
 			) {
 				continue;
 			}
-			htlcs = htlcs ?? new Map(closing.htlcs);
-			htlcs.set(id, { ...entry, addRemoteSigned: false });
+			unstamped.push([id, entry]);
 		}
-		if (!htlcs) return null;
-		return { ...closing, htlcs } as IChannelState;
+		unstamped.sort(([, a], [, b]) =>
+			a.id === b.id ? 0 : a.id > b.id ? -1 : 1
+		);
+
+		const htlcs = new Map(closing.htlcs);
+		for (const [id, entry] of unstamped) {
+			htlcs.set(id, { ...entry, addRemoteSigned: false });
+			yield { ...closing, htlcs: new Map(htlcs) } as IChannelState;
+		}
 	}
 
 	/**
