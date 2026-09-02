@@ -1460,6 +1460,230 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 	});
 });
 
+describe('Direct funding receiver: a completed funding (issue #658)', () => {
+	interface ICompleted {
+		storage: ReturnType<typeof memoryStorage>;
+		record: ReturnType<FakeDfNode['mintRequest']>;
+		coin: IDfTestCoin;
+		offer: ReturnType<typeof buildOffer>;
+		channelId: Buffer;
+		fundingTx: bitcoin.Transaction;
+		second: FakeDfNode;
+		/** The lane the payer sent its witness on, still open at its end. */
+		payer: FakePayerLane;
+	}
+
+	/**
+	 * A receiver taken down between the payer's witness reaching the channel and
+	 * the receipt tombstone. On the zero-conf fast track the tx_signatures
+	 * release, the early channel_ready, NORMAL and `v2InFlight = null` are one
+	 * persisted batch, so the restarted channel answers no in-flight record at
+	 * all. What is left of the exchange is the funding on the request record and
+	 * the transaction on the chain.
+	 */
+	async function crashBeforeReceipt(
+		opts: { splice?: boolean } = {}
+	): Promise<ICompleted> {
+		const storage = memoryStorage();
+		const first = new FakeDfNode(storage);
+		if (opts.splice) {
+			first.spliceChannel = crypto.randomBytes(32);
+			first.trustedPayers.add(LSP_PUBKEY);
+		}
+		const record = first.mintRequest();
+		const coin = makeCoin();
+		first.publish(coin);
+		const offer = buildOffer(record, coin);
+		const payer = new FakePayerLane(
+			record,
+			'lane-before',
+			opts.splice ? LSP_PUBKEY : undefined
+		);
+		const engine = new DirectFundingReceiver(first, {
+			allowSplice: opts.splice === true,
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(payer.offerFrame(offer));
+		await flush();
+		const { channelId, tx } = opts.splice
+			? first.completeSpliceNegotiation(coin, offer, 40_000n)
+			: first.completeNegotiation(coin, offer);
+		await flush();
+		expect(payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+
+		const second = new FakeDfNode(storage);
+		second.publish(coin);
+		return {
+			storage,
+			record,
+			coin,
+			offer,
+			channelId,
+			fundingTx: tx,
+			second,
+			payer
+		};
+	}
+
+	/** The channel broadcast the funding before it retired its record. */
+	function broadcast(node: FakeDfNode, tx: bitcoin.Transaction): void {
+		node.transactions.set(tx.getId(), tx.toBuffer());
+	}
+
+	function restart(node: FakeDfNode, splice = false): DirectFundingReceiver {
+		const engine = new DirectFundingReceiver(node, {
+			allowSplice: splice,
+			negotiationTimeoutMs: 5_000,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		return engine;
+	}
+
+	it('answers a re-sent witness with the receipt it never got', async () => {
+		const c = await crashBeforeReceipt();
+		broadcast(c.second, c.fundingTx);
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		// Nothing is delivered: the channel is long past taking a witness.
+		expect(c.second.witnesses).to.have.length(0);
+		const receipts = c.payer.bodiesOf(RECEIPT);
+		expect(receipts).to.have.length(1);
+		const receipt = decodeDfReceipt(receipts[0]);
+		expect(receipt.preimage.toString('hex')).to.equal(c.record.preimageHex);
+		expect(receipt.fundingTxid.toString('hex')).to.equal(c.fundingTx.getId());
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		engine.stop();
+	});
+
+	it('answers a re-sent offer with the receipt and starts nothing', async () => {
+		const c = await crashBeforeReceipt();
+		broadcast(c.second, c.fundingTx);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+
+		expect(c.second.opens, 'no second channel session').to.have.length(0);
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		const receipts = again.bodiesOf(RECEIPT);
+		expect(receipts).to.have.length(1);
+		expect(decodeDfReceipt(receipts[0]).fundingTxid.toString('hex')).to.equal(
+			c.fundingTx.getId()
+		);
+		// The busy mark went with the tombstone, so the request is no longer
+		// burned until expiry.
+		expect(
+			c.second.requests.attemptsFor(c.record.receiptHash).activeOfferId
+		).to.equal(undefined);
+
+		// And a payer that comes back once more is replayed from the tombstone.
+		const third = new FakePayerLane(c.record, 'lane-later');
+		engine.handleFrame(third.offerFrame(c.offer));
+		await flush();
+		expect(
+			decodeDfReceipt(third.bodiesOf(RECEIPT)[0]).fundingTxid
+		).to.deep.equal(decodeDfReceipt(receipts[0]).fundingTxid);
+		engine.stop();
+	});
+
+	it('answers a record the channel retires mid-recovery', async () => {
+		const c = await crashBeforeReceipt();
+		broadcast(c.second, c.fundingTx);
+		// The channel is still holding the record when the offer lands and has
+		// retired it by the time the wait is armed. Which side of that transition
+		// each read falls on is not something the payer's receipt can depend on.
+		// The negotiation timeout stays at its normal length: an answer that waits
+		// that out arrives after the payer has stopped listening, so the receipt
+		// has to be here without it.
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		queueMicrotask(() => c.second.retirePendingV2(c.channelId));
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+
+		const receipts = again.bodiesOf(RECEIPT);
+		expect(receipts).to.have.length(1);
+		expect(decodeDfReceipt(receipts[0]).fundingTxid.toString('hex')).to.equal(
+			c.fundingTx.getId()
+		);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		engine.stop();
+	});
+
+	it('answers the splice twin, whose record goes at splice_locked', async () => {
+		const c = await crashBeforeReceipt({ splice: true });
+		broadcast(c.second, c.fundingTx);
+		const engine = restart(c.second, true);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses).to.have.length(0);
+		expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		engine.stop();
+	});
+
+	it('reveals nothing for a funding that never reached the chain', async () => {
+		const c = await crashBeforeReceipt();
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(again.bodiesOf(RECEIPT)).to.have.length(0);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(
+			false
+		);
+
+		// It was the peer that had not reconnected, not a payment. The exchange
+		// resumes on the re-armed event exactly as it did before.
+		c.second.completeNegotiation(c.coin, c.offer, { channelId: c.channelId });
+		await flush();
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+		engine.stop();
+	});
+
+	it('reveals nothing for a transaction that spends some other coin', async () => {
+		const c = await crashBeforeReceipt();
+		const decoy = new bitcoin.Transaction();
+		decoy.version = 2;
+		decoy.addInput(crypto.randomBytes(32), 0);
+		decoy.addOutput(Buffer.alloc(34, 9), 50_000);
+		c.second.transactions.set(decoy.getId(), decoy.toBuffer());
+		// A recorded txid that resolves to a real transaction is not enough: the
+		// receipt says a transaction spent the payer's coin, so that is what has
+		// to be true of it.
+		const rows = JSON.parse(
+			c.storage.loadWalletData(DF_REQUESTS_STORAGE_KEY)!
+		) as Array<{ activeAttempt: { funding: { fundingTxid: string } } }>;
+		rows[0].activeAttempt.funding.fundingTxid = decoy.getId();
+		c.storage.saveWalletData(DF_REQUESTS_STORAGE_KEY, JSON.stringify(rows));
+		c.second.requests.restore();
+
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(again.bodiesOf(RECEIPT)).to.have.length(0);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(
+			false
+		);
+		engine.stop();
+	});
+});
+
 describe('Direct funding receiver: the exchange (issue #612)', () => {
 	async function drive(
 		config: IDfReceiverConfig = {},

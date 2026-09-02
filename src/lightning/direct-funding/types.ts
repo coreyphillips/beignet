@@ -284,6 +284,16 @@ export interface IDfAttemptFunding {
 	 * lane keys are an ECDH over this key, and the payer sends its witness once.
 	 */
 	payerEphemeralKey: string;
+	/**
+	 * The negotiated funding transaction's txid, DISPLAY byte order hex. The one
+	 * handle on that transaction that survives the channel COMPLETING: a channel
+	 * reaching channel_ready, or a splice reaching splice_locked, drops the
+	 * in-flight record every recovery path reads, and a crash before the receipt
+	 * tombstone then leaves a payment that is made and nothing to rebuild the
+	 * proof of it from (issue #658). Optional so a record written before this
+	 * field still restores.
+	 */
+	fundingTxid?: string;
 }
 
 /**
