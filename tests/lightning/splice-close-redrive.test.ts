@@ -21,6 +21,10 @@ import {
 	DEFAULT_CHANNEL_CONFIG
 } from '../../src/lightning/channel/types';
 import { ISpliceInFlight } from '../../src/lightning/channel/channel-state';
+import { ChannelSigner } from '../../src/lightning/keys/signer';
+import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
+import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 
 bitcoin.initEccLib(ecc);
 
@@ -162,11 +166,24 @@ function destScript(node: LightningNode): Buffer {
 	}).output!;
 }
 
+/** The peer funding key the grafted record's commitment signature is made with. */
+const PEER_FUNDING_PRIV = crypto
+	.createHash('sha256')
+	.update(Buffer.from('splice-close-redrive-peer-funding'))
+	.digest();
+
 /**
  * Graft a session-free point-of-no-return splice record onto the channel:
  * the markErrored / crash-restart shape where only the persisted record
  * survives. A real splice needs a full interactive negotiation; the
  * adoption path deliberately judges the record alone.
+ *
+ * The record's `remoteCommitmentSig` is the signature the peer would really
+ * have made: prepareForceClose verifies its rebuild against the stored
+ * signature and refuses when none is covered (issue #657), so a random 64
+ * bytes here would have the adoption produce a plan the node correctly throws
+ * away. Signed AFTER the record is grafted, because the commitment it covers
+ * is the one the adoption of that record builds.
  */
 function graftSpliceRecord(
 	node: LightningNode,
@@ -174,8 +191,10 @@ function graftSpliceRecord(
 ): { spliceTxid: Buffer; displayHex: string } {
 	const channel = node.getChannelManager().getChannel(channelId)!;
 	const spliceTxid = crypto.randomBytes(32);
+	const peer = new ChannelSigner(PEER_FUNDING_PRIV);
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	(channel.getFullState() as any).spliceInFlight = {
+	const raw = channel.getFullState() as any;
+	raw.spliceInFlight = {
 		spliceTxid,
 		newFundingOutputIndex: 0,
 		newFundingSatoshis: 1_000_000n,
@@ -184,22 +203,57 @@ function graftSpliceRecord(
 		isInitiator: true,
 		localRelativeSatoshis: 0n,
 		remoteRelativeSatoshis: 0n,
-		remoteFundingPubkey: getPublicKey(crypto.randomBytes(32)),
+		remoteFundingPubkey: peer.fundingPubkey,
 		ourSharedInputSig: Buffer.alloc(64),
 		ourWalletWitnesses: [],
 		ourWalletInputIndices: [],
 		inputPrevouts: [],
-		remoteCommitmentSig: crypto.randomBytes(64),
+		remoteCommitmentSig: Buffer.alloc(64),
 		sentTxSignatures: true,
 		receivedTxSignatures: true,
 		localSpliceLocked: false,
 		remoteSpliceLocked: false,
 		confirmed: false
 	};
+	raw.spliceInFlight.remoteCommitmentSig = signAdoptedCommitment(channel, peer);
 	return {
 		spliceTxid,
 		displayHex: Buffer.from(spliceTxid).reverse().toString('hex')
 	};
+}
+
+/**
+ * The peer's signature over the local commitment the grafted record adopts to.
+ *
+ * Built through the channel's OWN adoption view, so it tracks whatever that
+ * view does to the funding outpoint, the capacity and the balances rather than
+ * restating it here.
+ */
+function signAdoptedCommitment(
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	channel: any,
+	peer: ChannelSigner
+): Buffer {
+	const view = {
+		...channel.getFullState(),
+		...channel._computeSpliceAdoption()
+	};
+	const built = buildLocalCommitment(
+		view,
+		perCommitmentPointFromSecret(
+			generateFromSeed(
+				view.localPerCommitmentSeed,
+				MAX_INDEX - view.localCommitmentNumber
+			)
+		),
+		undefined,
+		true
+	);
+	return peer.signCommitmentTx(
+		built.result.tx,
+		built.fundingWitnessScript,
+		built.fundingAmount
+	);
 }
 
 function record(
