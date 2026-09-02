@@ -128,6 +128,7 @@ import { ChannelSigner, ISigner } from '../keys/signer';
 import {
 	buildLocalCommitment,
 	aggregateLocalCommitmentSig,
+	IBuiltCommitment,
 	buildRemoteCommitment,
 	signRemoteCommitment,
 	verifyRemoteCommitmentSig,
@@ -149,6 +150,11 @@ import {
 	validateV2ChannelType
 } from './types';
 import { generateNonce } from '../crypto/musig';
+import {
+	taprootCommitmentSighash,
+	startCommitmentSigningSession,
+	verifyPartialCommitmentSig
+} from './commitment-musig';
 import { isValidPublicKey } from '../crypto/ecdh';
 import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
@@ -5999,81 +6005,250 @@ export class Channel {
 
 		// A transaction with no outputs is consensus-invalid, so a plan built
 		// around one is not a close, it is a broadcast that will be rejected.
-		// The admission rules keep a channel out of that state (issues #386,
-		// #388); refusing here is the backstop that turns a silent failure at
-		// the network into an answer the caller can act on.
-		if (built.result.tx.outs.length === 0) {
-			return {
-				ok: false,
-				error:
-					'Cannot force close: every commitment output is below the dust limit'
-			};
+		// Judged only once the rebuilds below have been tried: reading an
+		// unstamped add as unsigned returns its amount to our balance, which
+		// can lift the trimmed output back over the dust limit, and a legacy
+		// row predates the send guard that keeps a channel out of this state
+		// (issues #386, #388).
+		const outputless = built.result.tx.outs.length === 0;
+
+		// option_taproot: our verification nonce is deterministic per height, so
+		// re-deriving it here reproduces the EXACT nonce the peer's stored
+		// partial was made against (which is what keeps the pre-reconnect
+		// commitment force-closeable), and gives a fresh single-use secret-nonce
+		// registration: the MuSig2 library purges a secret nonce after one
+		// partialSign, so a force-close retry would otherwise find no secret.
+		// Derived once, before the rebuilds below, because it does not depend on
+		// which of them the peer signed. The peer's signing nonce is persisted
+		// (remoteSigningNonce); without it we cannot aggregate, which is why that
+		// is the very first thing asked.
+		const localNonce = taproot
+			? this._deriveVerificationNonce(closing.localCommitmentNumber)
+			: null;
+		if (localNonce) closing.localNonce = localNonce;
+
+		let witnessed = outputless
+			? null
+			: this._witnessForceCloseCommitment(
+					closing,
+					built,
+					signer,
+					perCommitmentPoint,
+					localNonce
+			  );
+
+		if (!witnessed) {
+			// The rebuild reconstructs what the peer signed from flags on our own
+			// records, and one shape of record cannot express the answer: an
+			// offered add persisted before addRemoteSigned existed, inside the
+			// window between the peer's revoke_and_ack and its commitment_signed
+			// (issue #657). Absent has to read as "already signed", or every
+			// upgraded channel with an offered add in flight would drop a genuine
+			// HTLC output. So the signature decides: rebuild with the unstamped
+			// adds read as unsigned, and take the first rebuild the stored
+			// signature covers.
+			for (const candidate of this._viewsWithUnstampedAddsUnsigned(closing)) {
+				const rebuilt = buildLocalCommitment(
+					candidate,
+					perCommitmentPoint,
+					undefined,
+					true
+				);
+				if (rebuilt.result.tx.outs.length === 0) continue;
+				witnessed = this._witnessForceCloseCommitment(
+					candidate,
+					rebuilt,
+					signer,
+					perCommitmentPoint,
+					localNonce
+				);
+				if (witnessed) break;
+			}
 		}
 
-		let localNonce: Uint8Array | null = null;
-		if (taproot) {
-			// option_taproot: the funding output is a MuSig2 key-spend P2TR. The
-			// broadcast witness is the single 64-byte BIP340 Schnorr signature
-			// obtained by aggregating our partial with the peer's stored partial over
-			// THIS local commitment (remoteCommitmentSignature = their 32-byte
-			// partial; remoteSigningNonce = the signing nonce that accompanied it;
-			// localNonce = our verification nonce for the current commitment).
-			// Our verification nonce is deterministic per height, so re-derive it
-			// fresh here — this reproduces the EXACT nonce the peer's stored partial
-			// was made against (so the pre-reconnect commitment is force-closeable),
-			// and ALWAYS re-deriving gives a fresh single-use secret-nonce
-			// registration: the MuSig2 library purges a secret nonce after one
-			// partialSign, so a force-close retry would otherwise find no secret.
-			// Safe — same height + same persisted peer nonce + same commitment ⇒ the
-			// identical signature, never a reused nonce over a different message. The
-			// peer's signing nonce is persisted (remoteSigningNonce); without it we
-			// cannot aggregate, which is why that is the very first thing asked.
-			localNonce = this._deriveVerificationNonce(closing.localCommitmentNumber);
-			closing.localNonce = localNonce;
-			const aggSig = aggregateLocalCommitmentSig(
-				closing,
-				signer,
-				localNonce,
-				closing.remoteSigningNonce!,
-				closing.remoteCommitmentSignature,
-				perCommitmentPoint,
-				closing.localCommitmentNumber
-			);
-			built.result.tx.setWitness(0, buildTaprootKeySpendWitness(aggSig));
-		} else {
-			// Create the funding witness using stored remote signature
-			const funding = createFundingScript(
-				closing.localBasepoints.fundingPubkey,
-				closing.remoteBasepoints.fundingPubkey
-			);
-
-			// Sign our side
-			const localSig = signer.signCommitmentTx(
-				built.result.tx,
-				funding.witnessScript,
-				built.fundingAmount
-			);
-
-			// Build the 2-of-2 witness
-			const witness = ChannelSigner.buildFundingWitness(
-				localSig,
-				closing.remoteCommitmentSignature,
-				closing.localBasepoints.fundingPubkey,
-				closing.remoteBasepoints.fundingPubkey,
-				funding.witnessScript
-			);
-
-			built.result.tx.setWitness(0, witness);
+		if (!witnessed) {
+			// No rebuild is both broadcastable and covered by the stored
+			// signature, so the close would relay nowhere while the caller was
+			// told its channel force closed. An answer it can act on beats a
+			// silent dead end.
+			return {
+				ok: false,
+				error: outputless
+					? 'Cannot force close: every commitment output is below the dust limit'
+					: 'Cannot force close: the stored peer signature does not cover the commitment we would broadcast'
+			};
 		}
 
 		return {
 			ok: true,
-			commitmentTx: built.result.tx.toBuffer(),
+			commitmentTx: witnessed.toBuffer(),
 			spliceAdoption,
 			v2Adoption,
 			localNonce,
 			channelId: closing.channelId!
 		};
+	}
+
+	/**
+	 * Attach the funding witness to a rebuilt local commitment, but only if the
+	 * peer's stored signature actually covers that rebuild (issue #657). Null
+	 * means "not this commitment" — the caller either tries another rebuild or
+	 * refuses; nothing unverified is ever handed back.
+	 *
+	 * `view` is the candidate state the tx was built from, never the live
+	 * channel: the taproot aggregation rebuilds internally, so it has to see the
+	 * same view the caller did.
+	 *
+	 * Taproot asks the question of the peer's PARTIAL rather than of the
+	 * aggregate. Verifying the aggregate would mean producing our own partial
+	 * for every candidate, and our verification nonce for a height is allowed to
+	 * sign exactly one sighash (see _deriveVerificationNonce): partials over two
+	 * different rebuilds under one nonce is the reuse that derivation exists to
+	 * rule out. partialVerify is a public operation, so only the surviving
+	 * rebuild is ever signed, and the aggregate it produces is still checked as
+	 * the Schnorr signature the network will see.
+	 */
+	private _witnessForceCloseCommitment(
+		view: IChannelState,
+		built: IBuiltCommitment,
+		signer: ISigner,
+		perCommitmentPoint: Buffer,
+		taprootNonce: Uint8Array | null
+	): bitcoin.Transaction | null {
+		const tx = built.result.tx;
+		const remoteSig = view.remoteCommitmentSignature!;
+		const remoteFundingPubkey = view.remoteBasepoints!.fundingPubkey;
+
+		if (taprootNonce) {
+			// option_taproot: the funding output is a MuSig2 key-spend P2TR, so
+			// the broadcast witness is the single 64-byte BIP340 Schnorr
+			// signature aggregating our partial with the peer's stored one
+			// (remoteCommitmentSignature = their 32-byte partial;
+			// remoteSigningNonce = the signing nonce that accompanied it).
+			// A peer nonce or partial the musig backend cannot decode makes it
+			// THROW rather than return false, and that is the same answer here:
+			// no witness this rebuild can carry.
+			try {
+				const { p2trOutput, outputKey } = createTaprootFundingScript(
+					view.localBasepoints.fundingPubkey,
+					remoteFundingPubkey
+				);
+				const sighash = taprootCommitmentSighash(
+					tx,
+					p2trOutput,
+					Number(view.fundingSatoshis)
+				);
+				const session = startCommitmentSigningSession(
+					sighash,
+					view.localBasepoints.fundingPubkey,
+					remoteFundingPubkey,
+					taprootNonce,
+					view.remoteSigningNonce!
+				);
+				if (
+					!verifyPartialCommitmentSig(
+						session,
+						remoteSig,
+						remoteFundingPubkey,
+						view.remoteSigningNonce!
+					)
+				) {
+					return null;
+				}
+				const aggSig = aggregateLocalCommitmentSig(
+					view,
+					signer,
+					taprootNonce,
+					view.remoteSigningNonce!,
+					remoteSig,
+					perCommitmentPoint,
+					view.localCommitmentNumber
+				);
+				if (!ecc.verifySchnorr(sighash, outputKey, aggSig)) return null;
+				tx.setWitness(0, buildTaprootKeySpendWitness(aggSig));
+			} catch {
+				return null;
+			}
+			return tx;
+		}
+
+		const funding = createFundingScript(
+			view.localBasepoints.fundingPubkey,
+			remoteFundingPubkey
+		);
+
+		// A custom ISigner is free to throw where the built-in returns false; the
+		// judgment is over stored bytes either way, so it never escapes as an
+		// exception into a close the caller has already committed to.
+		let covered = false;
+		try {
+			covered = signer.verifyCommitmentSig(
+				tx,
+				remoteSig,
+				remoteFundingPubkey,
+				funding.witnessScript,
+				built.fundingAmount
+			);
+		} catch {
+			covered = false;
+		}
+		if (!covered) return null;
+
+		const localSig = signer.signCommitmentTx(
+			tx,
+			funding.witnessScript,
+			built.fundingAmount
+		);
+		tx.setWitness(
+			0,
+			ChannelSigner.buildFundingWitness(
+				localSig,
+				remoteSig,
+				view.localBasepoints.fundingPubkey,
+				remoteFundingPubkey,
+				funding.witnessScript
+			)
+		);
+		return tx;
+	}
+
+	/**
+	 * Close views with the offered adds that carry no addRemoteSigned stamp read
+	 * as unsigned: the newest one alone, then the two newest, and so on. Yields
+	 * nothing when there is no such add (the rebuild would be byte-identical).
+	 *
+	 * Cumulative, newest first, because a peer commitment_signed covers every
+	 * offered add committed when it was sent: the unsigned ones are the newest
+	 * run by htlc id. A state persisted before the stamp existed can hold a
+	 * signed add next to an unsigned one, and flipping the whole set together
+	 * would reach neither commitment.
+	 *
+	 * A copy down to the entries it changes: these rows are the live channel's,
+	 * and this is a question asked of a candidate, not a repair.
+	 */
+	private *_viewsWithUnstampedAddsUnsigned(
+		closing: IChannelState
+	): Generator<IChannelState> {
+		const unstamped: [string, IHtlcEntry][] = [];
+		for (const [id, entry] of closing.htlcs) {
+			if (
+				entry.direction !== HtlcDirection.OFFERED ||
+				entry.addRemoteSigned !== undefined ||
+				entry.addRemoteCommitted === false
+			) {
+				continue;
+			}
+			unstamped.push([id, entry]);
+		}
+		unstamped.sort(([, a], [, b]) =>
+			a.id === b.id ? 0 : a.id > b.id ? -1 : 1
+		);
+
+		const htlcs = new Map(closing.htlcs);
+		for (const [id, entry] of unstamped) {
+			htlcs.set(id, { ...entry, addRemoteSigned: false });
+			yield { ...closing, htlcs: new Map(htlcs) } as IChannelState;
+		}
 	}
 
 	/**
