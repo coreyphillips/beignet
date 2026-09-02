@@ -849,6 +849,50 @@ describe('LightningNode transient splice refusals', function () {
 		}
 	});
 
+	/**
+	 * Issue #655, the asynchronous half: spliceIn selects its wallet inputs
+	 * before anything reaches the channel, so a second caller passed the busy
+	 * check while the first was still selecting. Both were told ok and the
+	 * request whose selection resolved second was refused with its answer long
+	 * gone.
+	 */
+	it('refuses a second splice-in while the first is still selecting inputs', async function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const errors: string[] = [];
+		node.on('node:error', (e: { message: string }) => errors.push(e.message));
+		let release: () => void = () => undefined;
+		const held = new Promise<void>((r) => (release = r));
+		let selections = 0;
+		(node as any).fundingProvider = {
+			selectSpliceInputs: async () => {
+				selections++;
+				await held;
+				return { inputs: [makeInput(200_000)], changeScript: p2wpkhScript() };
+			}
+		};
+
+		expect(node.spliceIn(channelId, 100_000n, 253).ok).to.be.true;
+		const second = node.spliceIn(channelId, 120_000n, 253);
+		expect(second.ok).to.be.false;
+		expect(second.code).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+		expect(second.error).to.include('still selecting its inputs');
+		expect(selections, 'no coins selected for the refused request').to.equal(1);
+		// Returned, never emitted: SPLICE_IN_FAILED is scoped by channel alone,
+		// so an emission here would reject the spliceInAndWait belonging to the
+		// request that survives.
+		expect(errors).to.deep.equal([]);
+
+		release();
+		await new Promise((r) => setTimeout(r, 20));
+		const channel = channelOf(node, channelId);
+		expect(channel.isQuiescing(), 'the first request drove the handshake').to.be
+			.true;
+		expect(channel._pendingSplice.relativeSatoshis).to.equal(100_000n);
+		expect(errors, 'and it failed for nothing').to.deep.equal([]);
+		node.destroy();
+	});
+
 	it('still starts a splice-in on a channel that is ready', async function () {
 		const node = createTestNode();
 		const channelId = injectNormalChannel(node);
