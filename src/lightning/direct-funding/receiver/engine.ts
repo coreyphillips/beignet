@@ -101,6 +101,9 @@ import {
 	IDfReceiverDeps
 } from './types';
 
+/** What a funding given up with its request is aborted with (issue #644). */
+const DF_LAPSED_ABORT_REASON = 'the direct funding request expired';
+
 /** The negotiated transaction, however it was negotiated. */
 interface IDfFinalTx {
 	channelId: Buffer;
@@ -257,6 +260,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		if (this.started) return;
 		this.started = true;
 		this.restoreFundingHolds();
+		this.retireLapsedFundings();
 		this.detachers.push(
 			this.deps.onTxSigsNeeded((e) => {
 				if (!e.externalInputIndices?.length) return;
@@ -277,10 +281,10 @@ export class DirectFundingReceiver extends EventEmitter {
 				);
 			})
 		);
-		this.sweepTimer = setInterval(
-			() => this.state.sweep(this.now()),
-			this.cfg.sweepIntervalMs
-		);
+		this.sweepTimer = setInterval(() => {
+			this.state.sweep(this.now());
+			this.retireLapsedFundings();
+		}, this.cfg.sweepIntervalMs);
 		this.sweepTimer.unref?.();
 	}
 
@@ -301,6 +305,92 @@ export class DirectFundingReceiver extends EventEmitter {
 				held.receiptHash,
 				held.expiresAt
 			);
+		}
+	}
+
+	/**
+	 * Give a funding up once its hold has run out on a request that has itself
+	 * expired (issue #644).
+	 *
+	 * The store keeps that row rather than sweeping it, because the lane key and
+	 * the preimage it carries are the only ones that could still answer the
+	 * payer; what it cannot do is decide the funding is over. Nothing else
+	 * retires the channel either, so it sits pending with the payer's input
+	 * unwitnessed until the abort goes out here. The payer's coin is untouched by
+	 * any of it: the transaction was never broadcast, so a request it can no
+	 * longer be paid against costs it nothing but the wait.
+	 *
+	 * Only an abort the channel actually completed clears the mark, the same read
+	 * `unwindFunding` applies: a v2 tx_abort awaiting its echo has released
+	 * nothing (a disconnect forgets it and resumes the negotiation), and a
+	 * refusal means the funding is past unwinding and can still complete. Either
+	 * way the hold stands, the coin stays reserved with it, and the next tick
+	 * tries again, because clearing on one of those answers strands the very
+	 * channel this exists to retire.
+	 */
+	private retireLapsedFundings(): void {
+		for (const held of this.deps.requests.lapsedFundings()) {
+			// Something is still parked on this outpoint's owed-witness event: a
+			// late witness or a re-sent offer that could yet complete the funding,
+			// and its own timeout ends the wait soon enough.
+			if (
+				this.v2Waiters.has(held.funding.outpoint) ||
+				this.spliceWaiters.has(held.funding.outpoint)
+			) {
+				continue;
+			}
+			const channelId = Buffer.from(held.funding.channelId, 'hex');
+			let released = false;
+			let outcome: string;
+			try {
+				const result: { ok: boolean; error?: string; pending?: boolean } = held
+					.funding.splice
+					? this.deps.abortSplice(channelId, DF_LAPSED_ABORT_REASON)
+					: this.deps.abortDualFundedOpen(channelId, DF_LAPSED_ABORT_REASON);
+				released = result.ok && result.pending !== true;
+				if (released) outcome = 'the pending funding was aborted';
+				else if (result.ok) outcome = 'its tx_abort is awaiting the peer echo';
+				else if (this.deps.fundingPubkeys(channelId) === null) {
+					// A refusal from a channel the node no longer holds at all says
+					// the funding is gone, not that it is past unwinding: the echo of
+					// our own tx_abort forgets the open, and this is the retry that
+					// followed it. Holding the mark on that answer would keep the row
+					// and the coin for the rest of the process's life, with nothing
+					// left for either to protect.
+					released = true;
+					outcome = 'the pending funding was already gone';
+				} else outcome = `the abort was refused: ${result.error}`;
+			} catch (err) {
+				outcome = `the abort threw: ${errorText(err)}`;
+			}
+			if (!released) {
+				// The coin stays committed for as long as the funding does. Its
+				// reservation lapsed with the funding's hold, and a restart takes none
+				// for a funding already lapsed, so re-taking it here is what keeps the
+				// same coin out of a second channel: the busy mark guards one request,
+				// and a fresh request is not covered by it.
+				this.state.reserve(
+					held.funding.outpoint,
+					held.offerIdHex,
+					held.receiptHash,
+					this.now() + this.cfg.sessionTtlMs
+				);
+				this.log(DF_LOG_OFFER_FAILED, {
+					offerId: held.offerIdHex,
+					channelId: held.funding.channelId,
+					error: `${DF_LAPSED_ABORT_REASON}, and the funding is still live: ${outcome}`
+				});
+				continue;
+			}
+			this.state.release(held.funding.outpoint, held.offerIdHex);
+			this.deps.requests.endAttempt(held.receiptHash, held.offerIdHex);
+			const reason = `${DF_LAPSED_ABORT_REASON} before the payer's witness arrived; ${outcome}`;
+			this.log(DF_LOG_OFFER_FAILED, {
+				offerId: held.offerIdHex,
+				channelId: held.funding.channelId,
+				error: reason
+			});
+			this.emit('offer:failed', { offerId: held.offerIdHex, reason });
 		}
 	}
 

@@ -817,6 +817,8 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 	async function crashAfterSignRequest(
 		opts: {
 			restartAtMs?: number;
+			/** Mint the request with a life shorter than the funding's hold. */
+			ttlMs?: number;
 			/** Re-send the offer over a second lane, before the crash. */
 			movedTo?: string;
 			/** Move before the negotiation finishes rather than after. */
@@ -837,7 +839,7 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 	}> {
 		const storage = memoryStorage();
 		const first = new FakeDfNode(storage);
-		const record = first.mintRequest();
+		const record = first.mintRequest(opts.ttlMs);
 		const coin = makeCoin();
 		first.publish(coin);
 		const offer = buildOffer(record, coin);
@@ -1458,6 +1460,215 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
 		engine.stop();
 	});
+
+	/**
+	 * A request paid close enough to its expiry that the funding it left in
+	 * flight outlives it (issue #644). The hold on that funding is the later of
+	 * the request's expiry and the session TTL, so a one-minute request funded
+	 * at the last moment is answerable for another fifteen.
+	 */
+	describe('and a request that lapsed under it (issue #644)', () => {
+		it('completes the funding from a witness the expired request still opens', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 5 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			const engine = restart(c.second);
+			engine.handleFrame(
+				c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+			);
+			await flush();
+
+			expect(c.second.witnesses).to.have.length(1);
+			const receipts = c.payer.bodiesOf(RECEIPT);
+			expect(receipts).to.have.length(1);
+			expect(decodeDfReceipt(receipts[0]).preimage.toString('hex')).to.equal(
+				c.record.preimageHex
+			);
+			expect(c.second.aborts).to.have.length(0);
+			engine.stop();
+		});
+
+		it('serves a re-sent offer for it rather than dropping it as unknown', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 5 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			const again = new FakePayerLane(c.record, 'lane-after');
+			const engine = restart(c.second);
+			engine.handleFrame(again.offerFrame(c.offer));
+			await flush();
+
+			expect(c.second.opens, 'no second channel session').to.have.length(0);
+			expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+			engine.stop();
+		});
+
+		it('aborts the pending open once the hold on the funding runs out too', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 30 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			const engine = new DirectFundingReceiver(c.second, {
+				negotiationTimeoutMs: 5_000,
+				witnessTimeoutMs: 5_000,
+				sweepIntervalMs: 60_000
+			});
+			const failed: Array<{ offerId: string; reason: string }> = [];
+			engine.on('offer:failed', (e) => failed.push(e));
+			engine.start();
+
+			// Nothing can finish this funding now: the payer sends one witness and
+			// the window both it and the request were held open for is past. Left
+			// alone the channel stays pending with the payer's input unwitnessed.
+			expect(c.second.aborts).to.deep.equal([
+				{ kind: 'open', channelId: c.channelId.toString('hex') }
+			]);
+			expect(failed).to.have.length(1);
+			expect(failed[0].offerId).to.equal(c.offer.offerId.toString('hex'));
+			// The mark is gone with it, so the row is an expired row again: it
+			// answers nothing, and the next sweep takes it.
+			expect(c.second.requests.byReceiptHash(c.record.receiptHash)).to.equal(
+				null
+			);
+			expect(c.second.requests.sweep()).to.equal(1);
+			expect(c.second.requests.byRequestId(c.record.requestId)).to.equal(null);
+			engine.stop();
+		});
+
+		it('keeps the funding held while the abort releases nothing', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 30 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			c.second.abortPending = true;
+			const failed: Array<{ offerId: string; reason: string }> = [];
+			const engine = new DirectFundingReceiver(c.second, {
+				negotiationTimeoutMs: 5_000,
+				witnessTimeoutMs: 5_000,
+				sweepIntervalMs: 60_000
+			});
+			engine.on('offer:failed', (e) => failed.push(e));
+			engine.start();
+
+			// The tx_abort is out but the peer has not echoed it, so the
+			// negotiation is fully live and a disconnect would resume it.
+			expect(c.second.aborts).to.have.length(1);
+			expect(failed).to.be.empty;
+			expect(c.second.requests.sweep()).to.equal(0);
+			expect(
+				c.second.requests.byReceiptHash(c.record.receiptHash)
+			).to.not.equal(null);
+
+			// A refusal says the same thing: the funding is past unwinding and can
+			// still complete.
+			c.second.abortError = 'cannot abort a v2 open after tx_signatures';
+			engine.stop();
+			engine.start();
+			expect(c.second.aborts).to.have.length(2);
+			expect(c.second.requests.sweep()).to.equal(0);
+
+			// Only the abort that lands lets the record go.
+			c.second.abortError = null;
+			c.second.abortPending = false;
+			engine.stop();
+			engine.start();
+			expect(c.second.aborts).to.have.length(3);
+			expect(failed).to.have.length(1);
+			expect(c.second.requests.sweep()).to.equal(1);
+			engine.stop();
+		});
+
+		it('keeps the coin committed while the abort releases nothing', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 30 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			c.second.abortPending = true;
+			const engine = new DirectFundingReceiver(c.second, {
+				negotiationTimeoutMs: 5_000,
+				witnessTimeoutMs: 5_000,
+				sweepIntervalMs: 60_000
+			});
+			engine.start();
+			expect(c.second.aborts).to.have.length(1);
+
+			// The peer has not echoed, so the coin is still an input of a
+			// transaction it signed for. The busy mark guards this request alone,
+			// and a fresh one reaches for the same coin outside it.
+			const fresh = c.second.mintRequest();
+			const other = new FakePayerLane(fresh, 'lane-other');
+			engine.handleFrame(other.offerFrame(buildOffer(fresh, c.coin)));
+			await flush();
+			expect(c.second.opens, 'no second channel for the coin').to.have.length(
+				0
+			);
+			expect(decodeDfOfferAck(other.bodiesOf(ACK)[0]).reason).to.equal(
+				'input already committed to another offer'
+			);
+			engine.stop();
+		});
+
+		it('gives the row up once the echo has taken the channel with it', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 30 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			c.second.abortPending = true;
+			const engine = new DirectFundingReceiver(c.second, {
+				negotiationTimeoutMs: 5_000,
+				witnessTimeoutMs: 5_000,
+				sweepIntervalMs: 60_000
+			});
+			engine.start();
+			expect(c.second.requests.sweep()).to.equal(0);
+
+			// The echo of our own tx_abort forgets the open, so every retry after it
+			// finds no channel to abort. Holding the mark on that answer would keep
+			// the request and the coin for the rest of the process's life.
+			c.second.abortError = `Channel not found: ${c.channelId.toString('hex')}`;
+			c.second.pubkeysAvailable = false;
+			engine.stop();
+			engine.start();
+			expect(c.second.aborts).to.have.length(2);
+			expect(c.second.requests.sweep()).to.equal(1);
+			engine.stop();
+		});
+
+		it('replays the receipt of a funding that completed past the expiry', async () => {
+			const c = await crashAfterSignRequest({
+				ttlMs: 60_000,
+				restartAtMs: 5 * 60 * 1000
+			});
+			c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+			const engine = restart(c.second);
+			engine.handleFrame(
+				c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+			);
+			await flush();
+			expect(c.payer.bodiesOf(RECEIPT)).to.have.length(1);
+
+			// The coin is spent and that one receipt frame is the losable one, so
+			// the tombstone answers a re-sent offer for the rest of the window the
+			// funding was held for, restart included.
+			const again = new FakePayerLane(c.record, 'lane-after');
+			engine.handleFrame(again.offerFrame(c.offer));
+			await flush();
+			expect(again.bodiesOf(RECEIPT)).to.have.length(1);
+			const third = new FakeDfNode(
+				c.storage,
+				(): number => Date.now() + 5 * 60 * 1000
+			);
+			expect(third.requests.paidOffer(c.record.receiptHash)).to.not.equal(null);
+			engine.stop();
+		});
+	});
 });
 
 describe('Direct funding receiver: a completed funding (issue #658)', () => {
@@ -1883,9 +2094,13 @@ describe('Direct funding receiver: the exchange (issue #612)', () => {
 		expect(payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
 
 		// The request outlives neither the negotiation nor the payer's signing,
-		// and the coin is about to be spent either way.
+		// and the coin is about to be spent either way. It is no longer payable;
+		// what the row answers for now is the funding it left in flight (#644).
 		clock += 1_000;
-		expect(node.requests.byReceiptHash(record.receiptHash)).to.equal(null);
+		expect(node.requests.list()).to.have.length(0);
+		expect(node.requests.attemptsFor(record.receiptHash).funding).to.not.equal(
+			undefined
+		);
 		engine.handleFrame(
 			payer.witnessFrame(offer.offerId, [Buffer.alloc(64, 3)])
 		);
