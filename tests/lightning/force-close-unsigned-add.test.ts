@@ -91,6 +91,8 @@ function createNode(seedId: number): LightningNode {
 
 interface IFilter {
 	allow: (from: string, type: number) => boolean;
+	/** Runs once the message has been handled, to act mid-round. */
+	after?: (from: string, type: number) => void;
 }
 
 function wire(a: LightningNode, b: LightningNode, filter: IFilter): void {
@@ -99,6 +101,7 @@ function wire(a: LightningNode, b: LightningNode, filter: IFilter): void {
 			if (pk !== to.getNodeId()) return;
 			if (!filter.allow(from.getNodeId(), t)) return;
 			to.handlePeerMessage(from.getNodeId(), t, p);
+			filter.after?.(from.getNodeId(), t);
 		});
 	};
 	route(a, b);
@@ -344,6 +347,53 @@ describe('The force-close rebuild and an unsigned add (issue #643)', function ()
 			'the stored remote signature covers what we broadcast'
 		).to.equal(true);
 		f.destroy();
+	});
+
+	it('keeps the credit when one signature covers the add and its fulfillment', function () {
+		// The peer may reveal the preimage between its revoke_and_ack and its own
+		// commitment_signed, so the FIRST signature to reach the add is one that
+		// also settles it. That signature credits the peer, and the rebuild must
+		// credit the peer too: the flag has to be stamped on a settled entry.
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const alice = createNode(650);
+		const bob = createNode(651);
+		const filter: IFilter = { allow: () => true };
+		wire(alice, bob, filter);
+		const channelId = openReadyChannel(alice, bob);
+		const aliceId = alice.getNodeId();
+		let holdAlice = false;
+		filter.allow = (from: string): boolean => !(holdAlice && from === aliceId);
+		filter.after = (from: string, type: number): void => {
+			if (from === aliceId || type !== MessageType.REVOKE_AND_ACK) return;
+			// Withhold our revocation from here on, so the settled entry is still
+			// there to rebuild instead of being dropped by the round completing.
+			holdAlice = true;
+			bob.getChannelManager().fulfillHtlc(channelId, 0n, preimage);
+		};
+
+		alice
+			.getChannelManager()
+			.addHtlc(channelId, HTLC_MSAT, paymentHash, EXPIRY, Buffer.alloc(1366));
+
+		const entry = alice
+			.getChannelManager()
+			.getChannel(channelId)!
+			.getFullState()
+			.htlcs.get('offered-0')!;
+		expect(entry.state, 'the peer fulfilled it').to.equal(HtlcState.FULFILLED);
+		expect(entry.addRemoteCommitted, 'the peer revoked for the add').to.equal(
+			true
+		);
+
+		const tx = plannedCommitment(alice, channelId);
+
+		expect(
+			peerSigned(alice, channelId, tx),
+			'the stored remote signature covers what we broadcast'
+		).to.equal(true);
+		alice.destroy();
+		bob.destroy();
 	});
 
 	it('keeps the output for a row persisted before the flag existed', function () {

@@ -4205,7 +4205,13 @@ export class Channel {
 
 	/**
 	 * Record that a peer commitment_signed we just verified covers these offered
-	 * adds: the ones buildHtlcOutputsForLocal put into the commitment it signed.
+	 * adds: every one the peer has committed, whether the commitment it signed
+	 * holds the add as an HTLC output or (once the peer has settled it) as the
+	 * peer's credit. A peer may fulfill an add one message before it signs, so
+	 * the first signature to reach an add can be one that also settles it, and
+	 * the rebuild reads this flag to choose between crediting the peer and
+	 * returning our deduction. FAILED is left out: the signature carries such an
+	 * add only as our refund, which the rebuild applies without asking.
 	 *
 	 * addRemoteCommitted cannot stand in for this. The peer's revoke_and_ack
 	 * sets it one message EARLIER, and until the commitment_signed that follows
@@ -4225,8 +4231,7 @@ export class Channel {
 			if (
 				entry.direction === HtlcDirection.OFFERED &&
 				entry.addRemoteCommitted !== false &&
-				(entry.state === HtlcState.PENDING ||
-					entry.state === HtlcState.COMMITTED)
+				entry.state !== HtlcState.FAILED
 			) {
 				entry.addRemoteSigned = true;
 			}
