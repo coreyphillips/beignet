@@ -10545,33 +10545,19 @@ export class LightningNode extends EventEmitter {
 				code: SpliceRefusalCode.CHANNEL_NOT_FOUND
 			};
 		}
+		// Returned, never emitted, for the reason on the busy arm below.
 		const spliceInErr = this._validateSpliceRequest(channelId, amountSats);
-		if (spliceInErr) {
-			this.emit('node:error', {
-				code: 'SPLICE_IN_FAILED',
-				channelId,
-				message: spliceInErr.error,
-				timestamp: Date.now()
-			} as ILightningError);
-			return { ok: false, ...spliceInErr };
-		}
+		if (spliceInErr) return { ok: false, ...spliceInErr };
 		// The issue #423 splice-in reserve rule lives in channel.initiateSplice
 		// (after input selection, below): it arms only when the selection's
 		// change output will actually be emitted, which a pre-selection check
 		// here cannot know, and it must read the balance current at initiation,
 		// not the one from before the asynchronous selection.
 		if (!this.fundingProvider?.selectSpliceInputs) {
-			const error =
-				'splice-in requires a funding provider with selectSpliceInputs (wallet UTXO sourcing)';
-			this.emit('node:error', {
-				code: 'SPLICE_IN_FAILED',
-				channelId,
-				message: error,
-				timestamp: Date.now()
-			} as ILightningError);
 			return {
 				ok: false,
-				error,
+				error:
+					'splice-in requires a funding provider with selectSpliceInputs (wallet UTXO sourcing)',
 				code: SpliceRefusalCode.FUNDING_PROVIDER_REQUIRED
 			};
 		}
@@ -10776,16 +10762,12 @@ export class LightningNode extends EventEmitter {
 				code: SpliceRefusalCode.CHANNEL_NOT_FOUND
 			};
 		}
+		// Every refusal from here on is returned, never emitted: SPLICE_IN_FAILED
+		// is scoped by channel alone, so an emission would reject the
+		// spliceInAndWait belonging to a request still live on this channel,
+		// which is what the refusal below usually means (issue #655).
 		const spliceInErr = this._validateSpliceRequest(channelId, amountSats);
-		if (spliceInErr) {
-			this.emit('node:error', {
-				code: 'SPLICE_IN_FAILED',
-				channelId,
-				message: spliceInErr.error,
-				timestamp: Date.now()
-			} as ILightningError);
-			return { ok: false, ...spliceInErr };
-		}
+		if (spliceInErr) return { ok: false, ...spliceInErr };
 
 		const selectionBusy = this._spliceSelectionBusy(channelId);
 		if (selectionBusy) return selectionBusy;
@@ -10797,14 +10779,11 @@ export class LightningNode extends EventEmitter {
 			fundingFeeratePerkw
 		);
 		if (!result.ok) {
-			const error = result.error ?? SPLICE_NOT_STARTED;
-			this.emit('node:error', {
-				code: 'SPLICE_IN_FAILED',
-				channelId,
-				message: error,
-				timestamp: Date.now()
-			} as ILightningError);
-			return { ok: false, error, code: spliceRefusalCodeFor(result) };
+			return {
+				ok: false,
+				error: result.error ?? SPLICE_NOT_STARTED,
+				code: spliceRefusalCodeFor(result)
+			};
 		}
 		return { ok: true };
 	}

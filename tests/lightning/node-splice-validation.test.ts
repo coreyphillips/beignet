@@ -856,6 +856,48 @@ describe('LightningNode transient splice refusals', function () {
 	});
 
 	/**
+	 * Issue #655: a refusal that reaches its caller used to be emitted as well
+	 * as returned. SPLICE_IN_FAILED is scoped by channel alone, so refusing the
+	 * second request rejected the spliceInAndWait of the first one, which was
+	 * parked and still ran.
+	 */
+	it('emits nothing for a request refused beside a parked one', async function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		withSpliceProvider(node);
+		// Only the channel-scoped splice failure matters: it is the one
+		// spliceInAndWait rejects on.
+		const failures: string[] = [];
+		node.on('node:error', (e: { code: string; message: string }) => {
+			if (e.code === 'SPLICE_IN_FAILED') failures.push(e.message);
+		});
+
+		// The first request selects its inputs and parks on the stfu it sent.
+		expect(node.spliceIn(channelId, 100_000n, 253).ok).to.be.true;
+		await new Promise((r) => setTimeout(r, 20));
+		const channel = channelOf(node, channelId);
+		expect(channel._pendingSplice, 'the first request is parked').to.not.be
+			.null;
+
+		// A valid second request, refused by the channel itself.
+		const busy = node.spliceInWithInputs(
+			channelId,
+			100_000n,
+			[makeInput(200_000)],
+			p2wpkhScript()
+		);
+		expect(busy.code).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+		expect(busy.error).to.include('already awaiting quiescence');
+		// And an invalid one, refused before the channel is asked.
+		const invalid = node.spliceIn(channelId, 100n, 253);
+		expect(invalid.code).to.equal(SpliceRefusalCode.INVALID_PARAMS);
+
+		expect(failures, 'the parked request keeps its wait').to.deep.equal([]);
+		expect(channel._pendingSplice.relativeSatoshis).to.equal(100_000n);
+		node.destroy();
+	});
+
+	/**
 	 * Issue #655, the asynchronous half: spliceIn selects its wallet inputs
 	 * before anything reaches the channel, so a second caller passed the busy
 	 * check while the first was still selecting. Both were told ok and the
