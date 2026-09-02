@@ -638,6 +638,11 @@ export class FakeDfNode implements IDfReceiverDeps {
 		return built;
 	}
 
+	/** Drop the in-flight record, the way a channel does at channel_ready. */
+	retirePendingV2(channelId: Buffer): void {
+		this.pendingV2.delete(channelId.toString('hex'));
+	}
+
 	completeSpliceNegotiation(
 		coin: IDfTestCoin,
 		offer: IDfOffer,

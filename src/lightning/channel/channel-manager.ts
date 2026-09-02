@@ -1984,6 +1984,7 @@ export class ChannelManager extends EventEmitter {
 			) {
 				this.channels.delete(channelIdHex);
 				this.channelPeers.delete(channelIdHex);
+				this.txSignaturesDropped.delete(channelIdHex);
 				this.emit(
 					'channel:abandoned',
 					channel.getChannelId(),
@@ -7332,6 +7333,7 @@ export class ChannelManager extends EventEmitter {
 		this.purgeBarrierQueue(idHex);
 		this.channels.delete(idHex);
 		this.channelPeers.delete(idHex);
+		this.txSignaturesDropped.delete(idHex);
 		this.channelsAwaitingRestoreRepair.delete(idHex);
 		return true;
 	}
@@ -7604,6 +7606,7 @@ export class ChannelManager extends EventEmitter {
 		) {
 			this.channels.delete(channelId);
 			this.channelPeers.delete(channelId);
+			this.txSignaturesDropped.delete(channelId);
 			removed = true;
 		}
 		const tempId = channel.getTemporaryChannelId().toString('hex');
