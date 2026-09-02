@@ -1443,6 +1443,120 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		engine.stop();
 	});
 
+	it('completes a funding whose witness the crash left with the channel (issue #645)', async () => {
+		const c = await crashAfterSignRequest();
+		// The witness reached the channel and was persisted, and the crash came
+		// before the tombstone: the filled slot has left the owed list, so the
+		// funding answers nothing about a witness it is holding.
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer, {
+			externalWitness: 'released'
+		});
+		const engine = restart(c.second);
+		engine.handleFrame(
+			c.payer.witnessFrame(c.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+
+		expect(c.second.witnesses, 'nothing to re-deliver').to.have.length(0);
+		const receipts = c.payer.bodiesOf(RECEIPT);
+		expect(receipts).to.have.length(1);
+		expect(decodeDfReceipt(receipts[0]).preimage.toString('hex')).to.equal(
+			c.record.preimageHex
+		);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		engine.stop();
+	});
+
+	it('answers a re-sent offer for that funding with its receipt (issue #645)', async () => {
+		const c = await crashAfterSignRequest();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer, {
+			externalWitness: 'released'
+		});
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+
+		expect(
+			again.bodiesOf(SIGN_REQUEST),
+			'the payer has already signed this transaction'
+		).to.have.length(0);
+		expect(again.bodiesOf(RECEIPT)).to.have.length(1);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		expect(
+			c.second.requests.attemptsFor(c.record.receiptHash).activeOfferId,
+			'the request is free again'
+		).to.equal(undefined);
+		engine.stop();
+	});
+
+	it('completes a spliced funding the same way (issue #645)', async () => {
+		const storage = memoryStorage();
+		const first = new FakeDfNode(storage);
+		first.spliceChannel = crypto.randomBytes(32);
+		first.trustedPayers.add(LSP_PUBKEY);
+		const record = first.mintRequest();
+		const coin = makeCoin();
+		first.publish(coin);
+		const offer = buildOffer(record, coin);
+		const payer = new FakePayerLane(record, 'lane-before', LSP_PUBKEY);
+		const engine = new DirectFundingReceiver(first, {
+			allowSplice: true,
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(payer.offerFrame(offer));
+		await flush();
+		const { channelId } = first.completeSpliceNegotiation(coin, offer, 40_000n);
+		await flush();
+		engine.stop();
+
+		const second = new FakeDfNode(storage);
+		second.publish(coin);
+		second.stagePendingSplice(channelId, coin, offer, 40_000n, {
+			externalWitness: 'released'
+		});
+		const again = new FakePayerLane(record, 'lane-after', LSP_PUBKEY);
+		const restarted = new DirectFundingReceiver(second, {
+			allowSplice: true,
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		restarted.start();
+		restarted.handleFrame(again.offerFrame(offer));
+		await flush();
+
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		expect(again.bodiesOf(RECEIPT)).to.have.length(1);
+		expect(second.requests.isTombstoned(record.receiptHash)).to.equal(true);
+		restarted.stop();
+	});
+
+	it('holds the request while the released signatures are withheld (issue #645)', async () => {
+		const c = await crashAfterSignRequest();
+		// The channel took the witness and its tx_signatures have not been
+		// released. The funding is still abortable, so the payment is not made
+		// and the receipt is not owed.
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer, {
+			externalWitness: 'filled'
+		});
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+
+		expect(again.bodiesOf(RECEIPT)).to.have.length(0);
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(
+			false
+		);
+		expect(
+			c.second.requests.attemptsFor(c.record.receiptHash).funding
+		).to.not.equal(undefined);
+		engine.stop();
+	});
+
 	it('serves the resumed offer with every fresh-admission slot taken', async () => {
 		const c = await crashAfterSignRequest();
 		c.second.stagePendingV2(c.channelId, c.coin, c.offer);

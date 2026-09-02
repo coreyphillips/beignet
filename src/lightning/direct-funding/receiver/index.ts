@@ -33,6 +33,7 @@ export {
 export type {
 	IDfChainSource,
 	IDfChannelHandle,
+	IDfExternalInput,
 	IDfOpenParams,
 	IDfPendingSpliceTx,
 	IDfPendingV2FundingTx,

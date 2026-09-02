@@ -39,6 +39,7 @@ import {
 import { IDfRequestRecord } from '../../../src/lightning/direct-funding/types';
 import {
 	IDfChannelHandle,
+	IDfExternalInput,
 	IDfOpenParams,
 	IDfPendingSpliceTx,
 	IDfPendingV2FundingTx,
@@ -282,6 +283,34 @@ export interface IDfSpliceCall {
 	inputs: ISpliceWalletInput[];
 	changeScript: Buffer;
 	feeratePerKw: number;
+}
+
+/**
+ * Where the payer's input stands on a staged funding (issue #645): its witness
+ * still owed, taken but with our tx_signatures not yet released, or taken and
+ * released.
+ */
+export type DfExternalWitnessState = 'owed' | 'filled' | 'released';
+
+/** The owed/filled/released triple a staged pending transaction carries. */
+function externalSlot(
+	coin: IDfTestCoin,
+	state: DfExternalWitnessState = 'owed'
+): {
+	owedExternalInputs: IDfExternalInput[];
+	filledExternalInputs: IDfExternalInput[];
+	sentTxSignatures: boolean;
+} {
+	const input = {
+		inputIndex: 0,
+		prevTxid: Buffer.from(coin.prevTx.getHash()),
+		prevOutputIndex: coin.vout
+	};
+	return {
+		owedExternalInputs: state === 'owed' ? [input] : [],
+		filledExternalInputs: state === 'owed' ? [] : [input],
+		sentTxSignatures: state === 'released'
+	};
 }
 
 /** A wallet-data store two FakeDfNodes can share, i.e. survive a restart. */
@@ -595,6 +624,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 			witnessesFilled?: boolean;
 			extraOutputs?: number;
 			fundingScript?: Buffer;
+			externalWitness?: DfExternalWitnessState;
 		} = {}
 	): bitcoin.Transaction {
 		const built = this.buildNegotiatedTx(coin, offer, opts);
@@ -603,13 +633,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 			fundingTxid: Buffer.from(built.getHash()),
 			fundingOutputIndex: 0,
 			prevouts: { scripts: [coin.script], values: [coin.valueSat] },
-			owedExternalInputs: [
-				{
-					inputIndex: 0,
-					prevTxid: Buffer.from(coin.prevTx.getHash()),
-					prevOutputIndex: coin.vout
-				}
-			]
+			...externalSlot(coin, opts.externalWitness)
 		});
 		return built;
 	}
@@ -656,6 +680,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 			feeSat?: bigint;
 			fundingValueSat?: bigint;
 			fundingScript?: Buffer;
+			externalWitness?: DfExternalWitnessState;
 		} = {}
 	): bitcoin.Transaction {
 		const built = this.buildNegotiatedTx(coin, offer, {
@@ -672,13 +697,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 				scripts: [coin.script, opts.fundingScript ?? Buffer.alloc(34, 2)],
 				values: [coin.valueSat, preCapacitySat]
 			},
-			owedExternalInputs: [
-				{
-					inputIndex: 0,
-					prevTxid: Buffer.from(coin.prevTx.getHash()),
-					prevOutputIndex: coin.vout
-				}
-			]
+			...externalSlot(coin, opts.externalWitness)
 		});
 		return built;
 	}

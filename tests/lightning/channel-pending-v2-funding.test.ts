@@ -26,6 +26,8 @@ import {
 	ISpliceWalletInput
 } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { Network } from '../../src/lightning/invoice/types';
 import {
 	createOpenerState,
 	createAcceptorState,
@@ -367,6 +369,47 @@ function heldQueueBarrier(): unknown {
 	};
 }
 
+/** Quorum mode that refuses: the first gated batch parks, then is dropped. */
+function refusingBarrier(): unknown {
+	return {
+		enforcing: true,
+		isReleased: (): boolean => false,
+		// 'fenced' is the one refusal the node does not answer with a
+		// disconnect, so the channel this asserts on is still there afterwards.
+		whenReleased: async (): Promise<{ released: boolean; reason: string }> => ({
+			released: false,
+			reason: 'fenced'
+		})
+	};
+}
+
+/**
+ * A LightningNode whose manager holds the acceptor the same way managerHolding
+ * does, optionally in quorum mode under the given barrier.
+ */
+function nodeHolding(acceptor: Channel, barrier?: unknown): LightningNode {
+	const seed = crypto.randomBytes(32);
+	const node = new LightningNode({
+		nodePrivateKey: crypto.randomBytes(32),
+		channelBasepoints: makeBasepoints(
+			getPublicKey(crypto.randomBytes(32)),
+			seed
+		),
+		perCommitmentSeed: seed,
+		fundingPrivkey: crypto.randomBytes(32),
+		network: Network.REGTEST
+	});
+	node.on('error', () => undefined);
+	node.on('node:error', () => undefined);
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const internals = (node as any).channelManager;
+	if (barrier) internals.config.durabilityBarrier = barrier;
+	const tempHex = acceptor.getTemporaryChannelId().toString('hex');
+	internals.tempChannels.set(tempHex, acceptor);
+	internals.channelPeers.set(tempHex, getPublicKey(seed).toString('hex'));
+	return node;
+}
+
 // ─────────────── Tests ───────────────
 
 describe('Channel.getPendingV2FundingTx (issue #612)', () => {
@@ -428,6 +471,34 @@ describe('Channel.getPendingV2FundingTx (issue #612)', () => {
 		expect(pending.tx.outs[pending.fundingOutputIndex].value).to.equal(
 			Number(OPENER_FUNDING + ACCEPTOR_FUNDING)
 		);
+	});
+
+	/**
+	 * The owed list empties as slots fill, so on its own it reads a funding that
+	 * has taken a third party's witness as one that never had an external input
+	 * at all. A caller resuming a delivery it crashed part way through needs to
+	 * tell those two apart (issue #645).
+	 */
+	it('moves a delivered slot to filled and reports the release', () => {
+		const setup = driveToOwedWitness();
+		const before = setup.acceptor.getPendingV2FundingTx()!;
+		expect(before.filledExternalInputs).to.deep.equal([]);
+		expect(before.sentTxSignatures).to.equal(false);
+
+		setup.acceptor.provideV2ExternalWitness(
+			Buffer.from(setup.extPrevTx.getHash()),
+			0,
+			signExternalInput(setup)
+		);
+		const after = setup.acceptor.getPendingV2FundingTx()!;
+		expect(after.owedExternalInputs).to.deep.equal([]);
+		expect(after.filledExternalInputs.map((i) => i.inputIndex)).to.deep.equal(
+			before.owedExternalInputs.map((i) => i.inputIndex)
+		);
+		expect(
+			after.filledExternalInputs[0].prevTxid.equals(setup.extPrevTx.getHash())
+		).to.equal(true);
+		expect(after.sentTxSignatures).to.equal(true);
 	});
 
 	it('returns a copy: mutating it cannot reach the channel', () => {
@@ -538,6 +609,76 @@ describe('ChannelManager.provideV2ExternalWitness reporting (issue #612)', () =>
 		).to.have.length(0);
 		expect(retry.sendsWithheld).to.equal(true);
 		expect(sent).to.not.include(MessageType.TX_SIGNATURES);
+	});
+});
+
+describe('LightningNode.getPendingV2FundingTx release flag (issue #645)', () => {
+	/**
+	 * The channel marks the release as it BUILDS the batch, so recovery reading
+	 * that mark alone would hand over a receipt earned by tx_signatures the
+	 * barrier is still holding, and a refused release drops those outright.
+	 */
+	it('answers no release while the tx_signatures are parked', () => {
+		const setup = driveToOwedWitness();
+		const node = nodeHolding(setup.acceptor, heldQueueBarrier());
+		const channelId = setup.acceptor.getChannelId()!;
+
+		const result = node.provideV2ExternalWitness(
+			channelId,
+			Buffer.from(setup.extPrevTx.getHash()),
+			0,
+			signExternalInput(setup)
+		);
+		expect(result.sendsWithheld, 'nothing left').to.equal(true);
+		expect(
+			setup.acceptor.getPendingV2FundingTx()!.sentTxSignatures,
+			'the channel recorded the release'
+		).to.equal(true);
+		const pending = node.getPendingV2FundingTx(channelId)!;
+		expect(pending.filledExternalInputs).to.have.length(1);
+		expect(pending.sentTxSignatures).to.equal(false);
+	});
+
+	/**
+	 * A refusal drops the parked bytes and deletes the queue with them, so the
+	 * mask has to outlive the queue: the peer never got the tx_signatures the
+	 * record says were released, and a receipt handed over here is one nothing
+	 * paid for.
+	 */
+	it('answers no release after the barrier refuses them', async () => {
+		const setup = driveToOwedWitness();
+		const node = nodeHolding(setup.acceptor, refusingBarrier());
+		const channelId = setup.acceptor.getChannelId()!;
+
+		const result = node.provideV2ExternalWitness(
+			channelId,
+			Buffer.from(setup.extPrevTx.getHash()),
+			0,
+			signExternalInput(setup)
+		);
+		expect(result.sendsWithheld, 'nothing left').to.equal(true);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		const pending = node.getPendingV2FundingTx(channelId)!;
+		expect(pending.filledExternalInputs).to.have.length(1);
+		expect(pending.sentTxSignatures).to.equal(false);
+	});
+
+	it('answers the release once the tx_signatures reach the wire', () => {
+		const setup = driveToOwedWitness();
+		const node = nodeHolding(setup.acceptor);
+		const channelId = setup.acceptor.getChannelId()!;
+
+		const result = node.provideV2ExternalWitness(
+			channelId,
+			Buffer.from(setup.extPrevTx.getHash()),
+			0,
+			signExternalInput(setup)
+		);
+		expect(result.sendsWithheld).to.equal(false);
+		expect(node.getPendingV2FundingTx(channelId)!.sentTxSignatures).to.equal(
+			true
+		);
 	});
 });
 

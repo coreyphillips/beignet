@@ -131,17 +131,33 @@ export interface IDfChainSource {
 	): Promise<Array<{ txid: string; height: number }>>;
 }
 
+/** An external input of a negotiated transaction, as the channel names it. */
+export interface IDfExternalInput {
+	inputIndex: number;
+	prevTxid: Buffer;
+	prevOutputIndex: number;
+}
+
 /** What Channel.getPendingV2FundingTx hands back, verbatim. */
 export interface IDfPendingV2FundingTx {
 	tx: Transaction;
 	fundingTxid: Buffer;
 	fundingOutputIndex: number;
 	prevouts: { scripts: Buffer[]; values: bigint[] } | null;
-	owedExternalInputs: Array<{
-		inputIndex: number;
-		prevTxid: Buffer;
-		prevOutputIndex: number;
-	}>;
+	owedExternalInputs: IDfExternalInput[];
+	/**
+	 * External inputs the channel already holds a witness for (issue #645). A
+	 * filled slot leaves `owedExternalInputs`, so that list alone reads a
+	 * funding whose witness was taken as one this channel knows nothing about.
+	 */
+	filledExternalInputs: IDfExternalInput[];
+	/**
+	 * Our tx_signatures released, as the record has it, and not still parked
+	 * behind the durability barrier. True is the point the payer's coin is
+	 * committed and its receipt becomes owed; a witness taken while this is
+	 * false is a delivery still in progress.
+	 */
+	sentTxSignatures: boolean;
 }
 
 /** What Channel.getPendingSpliceTx hands back, verbatim. */
@@ -151,11 +167,9 @@ export interface IDfPendingSpliceTx {
 	sharedInputIndex: number;
 	newFundingOutputIndex: number;
 	prevouts: { scripts: Buffer[]; values: bigint[] } | null;
-	owedExternalInputs: Array<{
-		inputIndex: number;
-		prevTxid: Buffer;
-		prevOutputIndex: number;
-	}>;
+	owedExternalInputs: IDfExternalInput[];
+	filledExternalInputs: IDfExternalInput[];
+	sentTxSignatures: boolean;
 }
 
 /**

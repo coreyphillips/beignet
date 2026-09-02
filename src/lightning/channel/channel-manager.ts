@@ -669,6 +669,12 @@ export class ChannelManager extends EventEmitter {
 	 * requirement that guardian latency not stall unrelated channels.
 	 */
 	private readonly barrierQueues = new Map<string, IBarrierQueue>();
+	/**
+	 * Channels whose held tx_signatures were dropped rather than released, so
+	 * the record says released while nothing reached the peer. Cleared by the
+	 * retransmission that finally puts one on the wire.
+	 */
+	private readonly txSignaturesDropped = new Set<string>();
 
 	constructor(config: IChannelManagerConfig) {
 		super();
@@ -1834,7 +1840,7 @@ export class ChannelManager extends EventEmitter {
 			sendsWithheld:
 				progress.sendsWithheld ||
 				progress.sendsHeld ||
-				this._txSignaturesStillHeld(channel)
+				this.txSignaturesStillHeld(channel)
 		};
 	}
 
@@ -1896,7 +1902,7 @@ export class ChannelManager extends EventEmitter {
 			sendsWithheld:
 				progress.sendsWithheld ||
 				progress.sendsHeld ||
-				this._txSignaturesStillHeld(channel)
+				this.txSignaturesStillHeld(channel)
 		};
 	}
 
@@ -1978,6 +1984,7 @@ export class ChannelManager extends EventEmitter {
 			) {
 				this.channels.delete(channelIdHex);
 				this.channelPeers.delete(channelIdHex);
+				this.txSignaturesDropped.delete(channelIdHex);
 				this.emit(
 					'channel:abandoned',
 					channel.getChannelId(),
@@ -7326,6 +7333,7 @@ export class ChannelManager extends EventEmitter {
 		this.purgeBarrierQueue(idHex);
 		this.channels.delete(idHex);
 		this.channelPeers.delete(idHex);
+		this.txSignaturesDropped.delete(idHex);
 		this.channelsAwaitingRestoreRepair.delete(idHex);
 		return true;
 	}
@@ -7598,6 +7606,7 @@ export class ChannelManager extends EventEmitter {
 		) {
 			this.channels.delete(channelId);
 			this.channelPeers.delete(channelId);
+			this.txSignaturesDropped.delete(channelId);
 			removed = true;
 		}
 		const tempId = channel.getTemporaryChannelId().toString('hex');
@@ -8146,6 +8155,15 @@ export class ChannelManager extends EventEmitter {
 					}
 					progress?.attemptedMessageTypes.add(action.messageType);
 					this.sendMessage(peerPubkey, action.messageType, action.payload);
+					// The peer has our tx_signatures now, whatever an earlier drop
+					// of one left behind (issue #645).
+					if (
+						action.messageType === MessageType.TX_SIGNATURES &&
+						this.txSignaturesDropped.size > 0
+					) {
+						const sentIdHex = channel.getChannelId()?.toString('hex');
+						if (sentIdHex) this.txSignaturesDropped.delete(sentIdHex);
+					}
 					// BOLT 1: the SENDER of an error must fail the channel too. A
 					// channel that just emitted a wire error and sits ERRORED (peer
 					// protocol violation, DLP fell-behind) gets its close driven by
@@ -8478,7 +8496,7 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
-	 * Is a tx_signatures for this channel still parked behind the barrier?
+	 * Is a tx_signatures for this channel one the peer has yet to be sent?
 	 *
 	 * The witness entry points ask after their own dispatch, because a repeat
 	 * delivery is a no-op at the channel: the record already says our
@@ -8486,20 +8504,42 @@ export class ChannelManager extends EventEmitter {
 	 * progress of its own. Reading that as a clean dispatch would tell a caller
 	 * holding an obligation to the input's owner that it was discharged by bytes
 	 * still sitting in the queue, which a refused release then drops.
+	 *
+	 * Public because a reader with no dispatch of its own asks it too: the
+	 * channel records the release when it BUILDS the batch, so anything reading
+	 * that record to decide whether the owner has been paid (issue #645) is
+	 * asking this same question.
+	 *
+	 * A drop answers the same as a park, and has to: the queue is deleted on
+	 * the way out, so a predicate reading only what is still parked calls a
+	 * tx_signatures that was thrown away sent.
 	 */
-	private _txSignaturesStillHeld(channel: Channel): boolean {
+	txSignaturesStillHeld(channel: Channel): boolean {
 		const channelIdHex = channel.getChannelId()?.toString('hex');
 		if (!channelIdHex) return false;
+		if (this.txSignaturesDropped.has(channelIdHex)) return true;
 		const queue = this.barrierQueues.get(channelIdHex);
 		if (!queue) return false;
 		return queue.batches.some((batch) =>
-			batch.actions.some(
-				(action, index) =>
-					index >= batch.from &&
-					action.type === ChannelActionType.SEND_MESSAGE &&
-					action.messageType === MessageType.TX_SIGNATURES
-			)
+			this._carriesTxSignatures(batch.actions, batch.from)
 		);
+	}
+
+	/** Does the suffix from `from` put a tx_signatures on the wire? */
+	private _carriesTxSignatures(
+		actions: ChannelAction[],
+		from: number
+	): boolean {
+		for (let index = Math.max(from, 0); index < actions.length; index++) {
+			const action = actions[index];
+			if (
+				action.type === ChannelActionType.SEND_MESSAGE &&
+				action.messageType === MessageType.TX_SIGNATURES
+			) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Does the suffix from `from` put a message the barrier gates on the wire? */
@@ -8749,6 +8789,14 @@ export class ChannelManager extends EventEmitter {
 		held: IHeldBatch
 	): void {
 		const channelIdHex = channel.getChannelId()?.toString('hex') ?? null;
+		// A tx_signatures suppressed here is not late, it is gone: nothing
+		// re-sends it on this connection. The channel recorded the release while
+		// it BUILT the batch, so a caller reading that record to decide whether
+		// the input's owner has been paid must keep reading it as unsent until a
+		// retransmission puts one on the wire (issue #645).
+		if (channelIdHex && this._carriesTxSignatures(held.actions, held.from)) {
+			this.txSignaturesDropped.add(channelIdHex);
+		}
 		// Contained on both edges so the pair is always balanced: a listener
 		// that throws out of `begin` would otherwise leave every listener that
 		// already ran holding an open transition that never closes.

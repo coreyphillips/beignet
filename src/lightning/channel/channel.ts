@@ -12523,6 +12523,21 @@ export class Channel {
 	}
 
 	/**
+	 * The external splice inputs whose witness slot is FILLED (issue #645). A
+	 * slot leaves the owed list the moment it fills, so a caller that has to
+	 * tell a splice still waiting on a third party's witness from one that has
+	 * already taken it cannot read the owed list alone.
+	 */
+	private _spliceFilledExternal(): number[] {
+		const all =
+			this._state.spliceInFlight?.externalInputIndices ??
+			this._spliceTx?.ourExternalInputIndices ??
+			[];
+		const owed = new Set(this._spliceOwedExternal());
+		return all.filter((idx) => !owed.has(idx));
+	}
+
+	/**
 	 * Tell the embedder, once per connection cycle, that a withheld splice
 	 * tx_signatures is waiting on third-party witnesses (issue #592). Only the
 	 * owner can supply them, and after a restart nothing else would ever
@@ -15560,6 +15575,18 @@ export class Channel {
 	}
 
 	/**
+	 * The splice twin's counterpart for a v2 open (issue #645): the external
+	 * input indices whose witness slot is FILLED. A filled slot drops out of the
+	 * owed list, so that list cannot distinguish a funding still waiting on a
+	 * third party's witness from one that already holds it.
+	 */
+	private _v2FilledExternalIndices(record: IV2InFlight): number[] {
+		if (!record.externalInputIndices?.length) return [];
+		const owed = new Set(this._v2OwedExternalIndices(record));
+		return record.externalInputIndices.filter((idx) => !owed.has(idx));
+	}
+
+	/**
 	 * Assemble the complete in-flight record for the CURRENT attempt from
 	 * the live session and builder, or null when any step fails. Pure
 	 * construction: nothing on the channel is mutated.
@@ -17068,6 +17095,11 @@ export class Channel {
 	 * signature already made over it), the shared-input and new-funding
 	 * indices, the full prevout set BIP 341 sighashes need, and the outpoints
 	 * whose witnesses are still owed. Null when no splice tx is built.
+	 *
+	 * `filledExternalInputs` and `sentTxSignatures` are what a caller recovering
+	 * a delivery it crashed part way through reads (issue #645): an owner that
+	 * has been credited leaves the owed list, and only the release flag says
+	 * whether its witness bought anything.
 	 */
 	getPendingSpliceTx(): {
 		tx: import('bitcoinjs-lib').Transaction;
@@ -17080,21 +17112,41 @@ export class Channel {
 			prevTxid: Buffer;
 			prevOutputIndex: number;
 		}>;
+		filledExternalInputs: Array<{
+			inputIndex: number;
+			prevTxid: Buffer;
+			prevOutputIndex: number;
+		}>;
+		sentTxSignatures: boolean;
 	} | null {
 		const st = this._spliceTx;
 		if (!st) return null;
 		const clone = bitcoin.Transaction.fromBuffer(st.tx.toBuffer());
+		const outpointsOf = (
+			indices: number[]
+		): Array<{
+			inputIndex: number;
+			prevTxid: Buffer;
+			prevOutputIndex: number;
+		}> =>
+			indices.map((inputIndex) => ({
+				inputIndex,
+				prevTxid: Buffer.from(st.tx.ins[inputIndex].hash),
+				prevOutputIndex: st.tx.ins[inputIndex].index
+			}));
 		return {
 			tx: clone,
 			spliceTxid: Buffer.from(st.tx.getHash()),
 			sharedInputIndex: st.sharedInputIndex,
 			newFundingOutputIndex: st.newFundingOutputIndex,
 			prevouts: this._spliceInputPrevouts(),
-			owedExternalInputs: this._spliceOwedExternal().map((inputIndex) => ({
-				inputIndex,
-				prevTxid: Buffer.from(st.tx.ins[inputIndex].hash),
-				prevOutputIndex: st.tx.ins[inputIndex].index
-			}))
+			owedExternalInputs: outpointsOf(this._spliceOwedExternal()),
+			filledExternalInputs: outpointsOf(this._spliceFilledExternal()),
+			// The record's flag rather than the in-memory `_spliceSentTxSigs`,
+			// because the record is what a restart restores. It is set as the
+			// batch is BUILT, so a reader asking whether the release reached the
+			// peer has to ask the dispatcher too (LightningNode.getPendingSpliceTx).
+			sentTxSignatures: this._state.spliceInFlight?.sentTxSignatures === true
 		};
 	}
 
@@ -17126,6 +17178,12 @@ export class Channel {
 			prevTxid: Buffer;
 			prevOutputIndex: number;
 		}>;
+		filledExternalInputs: Array<{
+			inputIndex: number;
+			prevTxid: Buffer;
+			prevOutputIndex: number;
+		}>;
+		sentTxSignatures: boolean;
 	} | null {
 		const record = this._state.v2InFlight;
 		if (!record || this._v2RecordIsStaleRollback()) return null;
@@ -17136,6 +17194,20 @@ export class Channel {
 			return null;
 		}
 		const prevouts = this._v2InputPrevouts();
+		const outpointsOf = (
+			indices: number[]
+		): Array<{
+			inputIndex: number;
+			prevTxid: Buffer;
+			prevOutputIndex: number;
+		}> =>
+			indices
+				.filter((inputIndex) => inputIndex < tx.ins.length)
+				.map((inputIndex) => ({
+					inputIndex,
+					prevTxid: Buffer.from(tx.ins[inputIndex].hash),
+					prevOutputIndex: tx.ins[inputIndex].index
+				}));
 		return {
 			tx,
 			fundingTxid: Buffer.from(record.fundingTxid),
@@ -17145,13 +17217,10 @@ export class Channel {
 			// silently sign against the wrong script and value.
 			prevouts:
 				prevouts && prevouts.scripts.length === tx.ins.length ? prevouts : null,
-			owedExternalInputs: this._v2OwedExternalIndices(record)
-				.filter((inputIndex) => inputIndex < tx.ins.length)
-				.map((inputIndex) => ({
-					inputIndex,
-					prevTxid: Buffer.from(tx.ins[inputIndex].hash),
-					prevOutputIndex: tx.ins[inputIndex].index
-				}))
+			owedExternalInputs: outpointsOf(this._v2OwedExternalIndices(record)),
+			// The splice twin's fields, for the same reader (issue #645).
+			filledExternalInputs: outpointsOf(this._v2FilledExternalIndices(record)),
+			sentTxSignatures: record.sentTxSignatures === true
 		};
 	}
 

@@ -9587,9 +9587,18 @@ export class LightningNode extends EventEmitter {
 	): ReturnType<Channel['getPendingSpliceTx']> {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
-		return (
-			this.channelManager.getChannel(channelId)?.getPendingSpliceTx() ?? null
-		);
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return null;
+		const pending = channel.getPendingSpliceTx();
+		// The channel records the release when it BUILDS the batch. A
+		// tx_signatures the barrier parked has not reached the peer and a refused
+		// release drops it outright, so a caller reading this flag to decide
+		// whether the input's owner has been paid must not see it as sent
+		// (issue #645).
+		if (pending && this.channelManager.txSignaturesStillHeld(channel)) {
+			pending.sentTxSignatures = false;
+		}
+		return pending;
 	}
 
 	/**
@@ -9607,7 +9616,14 @@ export class LightningNode extends EventEmitter {
 	): ReturnType<Channel['getPendingV2FundingTx']> {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
-		return this.getRawChannel(channelId)?.getPendingV2FundingTx() ?? null;
+		const channel = this.getRawChannel(channelId);
+		if (!channel) return null;
+		const pending = channel.getPendingV2FundingTx();
+		// The splice twin's mask, for the same reason (issue #645).
+		if (pending && this.channelManager.txSignaturesStillHeld(channel)) {
+			pending.sentTxSignatures = false;
+		}
+		return pending;
 	}
 
 	/**
