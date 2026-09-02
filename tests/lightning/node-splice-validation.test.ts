@@ -722,12 +722,24 @@ describe('LightningNode transient splice refusals', function () {
 					).to.equal(QuiescenceState.RECEIVED_STFU);
 				},
 				/retry after it ends/
+			],
+			[
+				'a request already parked on our stfu',
+				(node, channelId): void => {
+					expect(
+						node.spliceOut(channelId, 40_000n, 253).ok,
+						'the first request parks on the stfu it sent'
+					).to.be.true;
+				},
+				/already awaiting quiescence/
 			]
 		];
 		for (const [name, makeBusy, message] of busyStates) {
 			const node = createTestNode();
 			const channelId = injectNormalChannel(node);
 			const provider = withSpliceProvider(node);
+			const errors: string[] = [];
+			node.on('node:error', (e: { message: string }) => errors.push(e.message));
 			makeBusy(node, channelId);
 
 			const result = node.spliceIn(channelId, 100_000n, 253);
@@ -737,6 +749,10 @@ describe('LightningNode transient splice refusals', function () {
 			// And no coins were selected for a splice that never started.
 			await new Promise((r) => setTimeout(r, 10));
 			expect(provider.selections, name).to.equal(0);
+			// The refusal is returned, never emitted: what the channel is busy
+			// with is often a request of ours, and SPLICE_IN_FAILED is scoped by
+			// channel alone, so an emission would reject its spliceInAndWait.
+			expect(errors, name).to.be.empty;
 			node.destroy();
 		}
 	});
@@ -784,6 +800,178 @@ describe('LightningNode transient splice refusals', function () {
 				QuiescenceState.QUIESCENT
 			);
 			expect(channel._pendingSplice, name).to.be.null;
+			node.destroy();
+		}
+	});
+
+	/**
+	 * Issue #655: a request parked on our own unanswered stfu used to be
+	 * replaced by the next one, and both callers were told their splice had
+	 * started. Only the later request ran, with the earlier one's direction
+	 * already overwritten on the channel.
+	 */
+	it('codes a request displacing one parked on our stfu as busy on both paths', function () {
+		for (const [name, request] of REQUESTS) {
+			const node = createTestNode();
+			const channelId = injectNormalChannel(node);
+			const channel = channelOf(node, channelId);
+
+			// The first request drives quiescence and parks until the peer answers.
+			const destination = p2wpkhScript();
+			expect(node.spliceOut(channelId, 40_000n, 253, destination).ok, name).to
+				.be.true;
+			expect(channel.isQuiescing(), name).to.be.true;
+			const parked = channel._pendingSplice;
+			expect(parked, name).to.not.be.null;
+
+			const second = request(node, channelId);
+			expect(second.ok, name).to.be.false;
+			expect(second.code, name).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+			expect(second.error, name).to.include('already awaiting quiescence');
+			// The parked request is untouched, and the refused one's direction
+			// dies with it rather than sitting on the channel.
+			expect(channel._pendingSplice, name).to.equal(parked);
+			expect(channel._spliceOutDestination, name).to.be.null;
+			expect(channel._spliceInInputs, name).to.be.null;
+
+			// The peer's stfu fires the FIRST request, with the direction that
+			// request was made with.
+			const actions = channel.handleStfuMessage({
+				channelId,
+				initiator: false
+			});
+			expect(
+				actions.some(
+					(a: { messageType?: MessageType }) =>
+						a.messageType === MessageType.SPLICE
+				),
+				name
+			).to.be.true;
+			expect(channel._spliceInInputs, name).to.be.null;
+			expect(channel._spliceOutDestination.script.equals(destination), name).to
+				.be.true;
+			expect(channel._spliceOutDestination.sats, name).to.equal(40_000n);
+			node.destroy();
+		}
+	});
+
+	/**
+	 * Issue #655: a refusal that reaches its caller used to be emitted as well
+	 * as returned. SPLICE_IN_FAILED is scoped by channel alone, so refusing the
+	 * second request rejected the spliceInAndWait of the first one, which was
+	 * parked and still ran.
+	 */
+	it('emits nothing for a request refused beside a parked one', async function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		withSpliceProvider(node);
+		// Only the channel-scoped splice failure matters: it is the one
+		// spliceInAndWait rejects on.
+		const failures: string[] = [];
+		node.on('node:error', (e: { code: string; message: string }) => {
+			if (e.code === 'SPLICE_IN_FAILED') failures.push(e.message);
+		});
+
+		// The first request selects its inputs and parks on the stfu it sent.
+		expect(node.spliceIn(channelId, 100_000n, 253).ok).to.be.true;
+		await new Promise((r) => setTimeout(r, 20));
+		const channel = channelOf(node, channelId);
+		expect(channel._pendingSplice, 'the first request is parked').to.not.be
+			.null;
+
+		// A valid second request, refused by the channel itself.
+		const busy = node.spliceInWithInputs(
+			channelId,
+			100_000n,
+			[makeInput(200_000)],
+			p2wpkhScript()
+		);
+		expect(busy.code).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+		expect(busy.error).to.include('already awaiting quiescence');
+		// And an invalid one, refused before the channel is asked.
+		const invalid = node.spliceIn(channelId, 100n, 253);
+		expect(invalid.code).to.equal(SpliceRefusalCode.INVALID_PARAMS);
+
+		expect(failures, 'the parked request keeps its wait').to.deep.equal([]);
+		expect(channel._pendingSplice.relativeSatoshis).to.equal(100_000n);
+		node.destroy();
+	});
+
+	/**
+	 * Issue #655, the asynchronous half: spliceIn selects its wallet inputs
+	 * before anything reaches the channel, so a second caller passed the busy
+	 * check while the first was still selecting. Both were told ok and the
+	 * request whose selection resolved second was refused with its answer long
+	 * gone.
+	 */
+	it('refuses a second splice-in while the first is still selecting inputs', async function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const errors: string[] = [];
+		node.on('node:error', (e: { message: string }) => errors.push(e.message));
+		let release: () => void = () => undefined;
+		const held = new Promise<void>((r) => (release = r));
+		let selections = 0;
+		(node as any).fundingProvider = {
+			selectSpliceInputs: async () => {
+				selections++;
+				await held;
+				return { inputs: [makeInput(200_000)], changeScript: p2wpkhScript() };
+			}
+		};
+
+		expect(node.spliceIn(channelId, 100_000n, 253).ok).to.be.true;
+		const second = node.spliceIn(channelId, 120_000n, 253);
+		expect(second.ok).to.be.false;
+		expect(second.code).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+		expect(second.error).to.include('still selecting its inputs');
+		expect(selections, 'no coins selected for the refused request').to.equal(1);
+		// Returned, never emitted: SPLICE_IN_FAILED is scoped by channel alone,
+		// so an emission here would reject the spliceInAndWait belonging to the
+		// request that survives.
+		expect(errors).to.deep.equal([]);
+
+		release();
+		await new Promise((r) => setTimeout(r, 20));
+		const channel = channelOf(node, channelId);
+		expect(channel.isQuiescing(), 'the first request drove the handshake').to.be
+			.true;
+		expect(channel._pendingSplice.relativeSatoshis).to.equal(100_000n);
+		expect(errors, 'and it failed for nothing').to.deep.equal([]);
+		node.destroy();
+	});
+
+	/**
+	 * Issue #655: the reservation a pending selection takes has to hold against
+	 * every entry point. A synchronous request slipping in beside it parked its
+	 * own splice, and the selection that started first was refused once it
+	 * resolved, its caller having been told ok long before.
+	 */
+	it('refuses the synchronous paths while a splice-in is selecting inputs', async function () {
+		for (const [name, request] of REQUESTS) {
+			const node = createTestNode();
+			const channelId = injectNormalChannel(node);
+			let release: () => void = () => undefined;
+			const held = new Promise<void>((r) => (release = r));
+			(node as any).fundingProvider = {
+				selectSpliceInputs: async () => {
+					await held;
+					return { inputs: [makeInput(200_000)], changeScript: p2wpkhScript() };
+				}
+			};
+
+			expect(node.spliceIn(channelId, 100_000n, 253).ok, name).to.be.true;
+			const second = request(node, channelId);
+			expect(second.ok, name).to.be.false;
+			expect(second.code, name).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+			expect(second.error, name).to.include('still selecting its inputs');
+
+			// The request that reserved the channel is the one that drives it.
+			release();
+			await new Promise((r) => setTimeout(r, 20));
+			const channel = channelOf(node, channelId);
+			expect(channel.isQuiescing(), name).to.be.true;
+			expect(channel._pendingSplice.relativeSatoshis, name).to.equal(100_000n);
 			node.destroy();
 		}
 	});

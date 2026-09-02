@@ -412,6 +412,8 @@ const SPLICE_BUSY_ABORT_PENDING =
 	'Cannot splice: a previous splice abort is not yet acknowledged';
 const SPLICE_BUSY_PEER_QUIESCENCE =
 	'Cannot splice: peer initiated the quiescence session; retry after it ends';
+const SPLICE_BUSY_REQUEST_PENDING =
+	'Cannot splice: another splice request is already awaiting quiescence; retry after it completes';
 const QUIESCE_BUSY_PENDING_HTLCS = 'Cannot quiesce: pending HTLCs exist';
 
 function bigIntMax(a: bigint, b: bigint): bigint {
@@ -763,8 +765,10 @@ export class Channel {
 	// joined it. When the funder peer initiates quiescence concurrently and
 	// wins the BOLT 2 tie-break (issue #372), the request is dropped instead
 	// (with a surfaced error unless cancelled): the session belongs to the
-	// peer and a non-initiator must not send splice_init. Memory-only:
-	// quiescence never survives a disconnect.
+	// peer and a non-initiator must not send splice_init. At most one LIVE
+	// request is parked here: a second is refused rather than replacing it,
+	// since only one can be fired (issue #655). Memory-only: quiescence never
+	// survives a disconnect.
 	private _pendingSplice: {
 		relativeSatoshis: bigint;
 		fundingFeeratePerkw: number;
@@ -9851,9 +9855,15 @@ export class Channel {
 				? null
 				: SPLICE_BUSY_PEER_QUIESCENCE;
 		}
+		// A live request is already parked on our own unanswered stfu, and it is
+		// the one the deferred hook will fire (issue #655).
+		if (this._pendingSplice && !this._pendingSplice.cancelled) {
+			return SPLICE_BUSY_REQUEST_PENDING;
+		}
 		// Our own handshake, or none yet: this request would be the one to drive
 		// it, so initiateQuiescence's own transient arm is ours too. A handshake
-		// already in flight parks the request instead and refuses nothing.
+		// in flight with nothing live parked on it takes this request as its
+		// deferred splice and refuses nothing.
 		if (!this._quiescence.isQuiescing() && this.hasPendingHtlcs()) {
 			return QUIESCE_BUSY_PENDING_HTLCS;
 		}
@@ -10054,6 +10064,28 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: SPLICE_BUSY_PEER_QUIESCENCE,
+					transient: true
+				}
+			];
+		}
+
+		// One live request per handshake: the deferred hook fires exactly one
+		// splice, so a second request used to overwrite the first while both
+		// callers were told their splice had started (issue #655). The parked
+		// request keeps the quiescence it drove and this one is refused as
+		// transient: the handshake ends either way, in that splice or in a
+		// drop. A CANCELLED request stays replaceable: it owes the handshake
+		// only an unwind, which the replacement's own splice conversation
+		// supplies.
+		if (this._pendingSplice && !this._pendingSplice.cancelled) {
+			// The refused request's wallet configuration dies with it, leaving
+			// the channel fields free for the parked request's own copy
+			// (see the deferred hook in handleStfuMessage).
+			this._resetSpliceDriver();
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: SPLICE_BUSY_REQUEST_PENDING,
 					transient: true
 				}
 			];

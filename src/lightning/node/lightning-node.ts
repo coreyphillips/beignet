@@ -477,6 +477,9 @@ const FUNDING_FORGET_BLOCKS = 2016;
  */
 const SPLICE_NOT_STARTED = 'the channel would not start the splice';
 
+const SPLICE_BUSY_SELECTION_PENDING =
+	'Cannot splice: another splice-in on this channel is still selecting its inputs; retry after it completes';
+
 /**
  * The code for a refusal the channel itself produced. Every such refusal used
  * to answer SPLICE_REFUSED, which the CLI contract calls permanent, so a
@@ -882,6 +885,14 @@ export class LightningNode extends EventEmitter {
 	// broadcast (issue #357): retried each block until the adopted-funding
 	// commitment reaches the network.
 	private _pendingSpliceCloseRedrives: Set<string> = new Set();
+	/**
+	 * Channels with a splice-in wallet selection in flight (issue #655). The
+	 * selection is asynchronous and nothing reaches the channel until it
+	 * resolves, so channel.spliceBusyReason() cannot see a request that has
+	 * only been started here: without this, two concurrent callers are both
+	 * told ok and the loser is refused later, once its answer is gone.
+	 */
+	private _spliceInSelections: Set<string> = new Set();
 	/**
 	 * Per-output watches whose arming failed, keyed "txid:outputIndex" so a
 	 * repeated failure cannot grow the queue (issue #577).
@@ -10465,6 +10476,27 @@ export class LightningNode extends EventEmitter {
 	// ─────────────── Splicing ───────────────
 
 	/**
+	 * The refusal owed to any splice request made while a splice-in is still
+	 * selecting its inputs for this channel (issue #655): that selection
+	 * reserves the channel from its start until it resolves, and only one of
+	 * the two requests can be driven. Every entry point asks: a synchronous one
+	 * that skipped the check parked its own splice, and the selection that
+	 * started first lost to it long after its caller was told ok.
+	 *
+	 * Returned, never emitted: the failure events are scoped by channel alone,
+	 * so an emission would reject the wait belonging to the request that
+	 * survives.
+	 */
+	private _spliceSelectionBusy(channelId: Buffer): ISpliceRequestResult | null {
+		if (!this._spliceInSelections.has(channelId.toString('hex'))) return null;
+		return {
+			ok: false,
+			error: SPLICE_BUSY_SELECTION_PENDING,
+			code: SpliceRefusalCode.SPLICE_BUSY
+		};
+	}
+
+	/**
 	 * Splice-in: add funds to an existing channel.
 	 * The channel must first be quiesced. This method handles quiescence
 	 * initiation if the channel is in NORMAL state, or proceeds directly
@@ -10513,33 +10545,19 @@ export class LightningNode extends EventEmitter {
 				code: SpliceRefusalCode.CHANNEL_NOT_FOUND
 			};
 		}
+		// Returned, never emitted, for the reason on the busy arm below.
 		const spliceInErr = this._validateSpliceRequest(channelId, amountSats);
-		if (spliceInErr) {
-			this.emit('node:error', {
-				code: 'SPLICE_IN_FAILED',
-				channelId,
-				message: spliceInErr.error,
-				timestamp: Date.now()
-			} as ILightningError);
-			return { ok: false, ...spliceInErr };
-		}
+		if (spliceInErr) return { ok: false, ...spliceInErr };
 		// The issue #423 splice-in reserve rule lives in channel.initiateSplice
 		// (after input selection, below): it arms only when the selection's
 		// change output will actually be emitted, which a pre-selection check
 		// here cannot know, and it must read the balance current at initiation,
 		// not the one from before the asynchronous selection.
 		if (!this.fundingProvider?.selectSpliceInputs) {
-			const error =
-				'splice-in requires a funding provider with selectSpliceInputs (wallet UTXO sourcing)';
-			this.emit('node:error', {
-				code: 'SPLICE_IN_FAILED',
-				channelId,
-				message: error,
-				timestamp: Date.now()
-			} as ILightningError);
 			return {
 				ok: false,
-				error,
+				error:
+					'splice-in requires a funding provider with selectSpliceInputs (wallet UTXO sourcing)',
 				code: SpliceRefusalCode.FUNDING_PROVIDER_REQUIRED
 			};
 		}
@@ -10552,21 +10570,29 @@ export class LightningNode extends EventEmitter {
 		// provider refusals above, which are permanent and must win.
 		const busyReason = channel.spliceBusyReason();
 		if (busyReason) {
-			this.emit('node:error', {
-				code: 'SPLICE_IN_FAILED',
-				channelId,
-				message: busyReason,
-				timestamp: Date.now()
-			} as ILightningError);
+			// Returned, never emitted: what the channel is busy with is usually
+			// another request of ours, and SPLICE_IN_FAILED is scoped by channel
+			// alone, so an emission here would reject the spliceInAndWait
+			// belonging to that surviving request (issue #655).
 			return {
 				ok: false,
 				error: busyReason,
 				code: SpliceRefusalCode.SPLICE_BUSY
 			};
 		}
+		const selectionBusy = this._spliceSelectionBusy(channelId);
+		if (selectionBusy) return selectionBusy;
+		const cidHex = channelId.toString('hex');
+		// Marked once the selection is under way, so a provider that refuses
+		// synchronously does not leave the channel reserved for good.
+		const selection = this.fundingProvider.selectSpliceInputs(
+			amountSats,
+			fundingFeeratePerkw,
+			fundingUtxos
+		);
+		this._spliceInSelections.add(cidHex);
 
-		this.fundingProvider
-			.selectSpliceInputs(amountSats, fundingFeeratePerkw, fundingUtxos)
+		selection
 			.then(({ inputs, changeScript }) => {
 				// The opts are a trailing OPTIONAL provider parameter, so a
 				// third-party provider written against the older signature
@@ -10609,7 +10635,10 @@ export class LightningNode extends EventEmitter {
 					message: (err as Error).message,
 					timestamp: Date.now()
 				} as ILightningError);
-			});
+			})
+			// After initiateSplice above, so the reservation is only dropped once
+			// the channel itself holds the request.
+			.finally(() => this._spliceInSelections.delete(cidHex));
 
 		return { ok: true };
 	}
@@ -10733,16 +10762,15 @@ export class LightningNode extends EventEmitter {
 				code: SpliceRefusalCode.CHANNEL_NOT_FOUND
 			};
 		}
+		// Every refusal from here on is returned, never emitted: SPLICE_IN_FAILED
+		// is scoped by channel alone, so an emission would reject the
+		// spliceInAndWait belonging to a request still live on this channel,
+		// which is what the refusal below usually means (issue #655).
 		const spliceInErr = this._validateSpliceRequest(channelId, amountSats);
-		if (spliceInErr) {
-			this.emit('node:error', {
-				code: 'SPLICE_IN_FAILED',
-				channelId,
-				message: spliceInErr.error,
-				timestamp: Date.now()
-			} as ILightningError);
-			return { ok: false, ...spliceInErr };
-		}
+		if (spliceInErr) return { ok: false, ...spliceInErr };
+
+		const selectionBusy = this._spliceSelectionBusy(channelId);
+		if (selectionBusy) return selectionBusy;
 
 		channel.setSpliceInInputs(inputs, changeScript);
 		const result = this.channelManager.initiateSplice(
@@ -10751,14 +10779,11 @@ export class LightningNode extends EventEmitter {
 			fundingFeeratePerkw
 		);
 		if (!result.ok) {
-			const error = result.error ?? SPLICE_NOT_STARTED;
-			this.emit('node:error', {
-				code: 'SPLICE_IN_FAILED',
-				channelId,
-				message: error,
-				timestamp: Date.now()
-			} as ILightningError);
-			return { ok: false, error, code: spliceRefusalCodeFor(result) };
+			return {
+				ok: false,
+				error: result.error ?? SPLICE_NOT_STARTED,
+				code: spliceRefusalCodeFor(result)
+			};
 		}
 		return { ok: true };
 	}
@@ -11231,6 +11256,9 @@ export class LightningNode extends EventEmitter {
 			} as ILightningError);
 			return { ok: false, ...refusal };
 		}
+
+		const selectionBusy = this._spliceSelectionBusy(channelId);
+		if (selectionBusy) return selectionBusy;
 
 		// Record where the withdrawn funds are paid (a wallet-owned or external
 		// script) before initiating, so the interactive-tx driver can add the
