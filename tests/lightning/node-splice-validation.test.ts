@@ -10,8 +10,11 @@ import {
 import { createOpenerState } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	HtlcDirection,
+	HtlcState
 } from '../../src/lightning/channel/types';
+import { QuiescenceState } from '../../src/lightning/channel/quiescence';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
@@ -657,6 +660,93 @@ describe('LightningNode transient splice refusals', function () {
 			expect(request(node, channelId).ok, name).to.be.true;
 			node.destroy();
 		}
+	});
+
+	/** An offered HTLC still awaiting its commitment round on both sides. */
+	const settlingHtlc = (node: LightningNode, channelId: Buffer): void => {
+		channelOf(node, channelId)
+			.getFullState()
+			.htlcs.set('offered-0', {
+				id: 0n,
+				direction: HtlcDirection.OFFERED,
+				amountMsat: 5_000_000n,
+				paymentHash: crypto.randomBytes(32),
+				cltvExpiry: 500,
+				state: HtlcState.PENDING,
+				onionRoutingPacket: Buffer.alloc(1366)
+			});
+	};
+
+	/** A funding provider whose selection resolves, counting its calls. */
+	const withSpliceProvider = (node: LightningNode): { selections: number } => {
+		const calls = { selections: 0 };
+		(node as any).fundingProvider = {
+			selectSpliceInputs: async () => {
+				calls.selections++;
+				return { inputs: [makeInput(200_000)], changeScript: p2wpkhScript() };
+			}
+		};
+		return calls;
+	};
+
+	/**
+	 * Issue #642: spliceIn sources its wallet inputs asynchronously, so a
+	 * refusal raised after the selection reached the caller only as a
+	 * node:error. The route had already answered 200, and the 503 the contract
+	 * tells a caller to retry on never happened.
+	 */
+	it('codes a busy splice-in before the wallet selection runs', async function () {
+		const busyStates: Array<
+			[string, (node: LightningNode, channelId: Buffer) => void, RegExp]
+		> = [
+			['peer quiescence', peerQuiesce, /retry after it ends/],
+			['abort awaiting echo', abortAwaitingEcho, /not yet acknowledged/],
+			[
+				'reconnecting',
+				(node, channelId): void =>
+					channelOf(node, channelId).markForReestablish(),
+				/reconnecting/
+			],
+			['settling HTLCs', settlingHtlc, /pending HTLCs/],
+			[
+				'peer stfu still draining',
+				(node, channelId): void => {
+					settlingHtlc(node, channelId);
+					const channel = channelOf(node, channelId);
+					channel.handleStfuMessage({ channelId, initiator: true });
+					expect(
+						channel.getQuiescenceState(),
+						'the peer stfu latched, its reply owed'
+					).to.equal(QuiescenceState.RECEIVED_STFU);
+				},
+				/retry after it ends/
+			]
+		];
+		for (const [name, makeBusy, message] of busyStates) {
+			const node = createTestNode();
+			const channelId = injectNormalChannel(node);
+			const provider = withSpliceProvider(node);
+			makeBusy(node, channelId);
+
+			const result = node.spliceIn(channelId, 100_000n, 253);
+			expect(result.ok, name).to.be.false;
+			expect(result.code, name).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+			expect(result.error, name).to.match(message);
+			// And no coins were selected for a splice that never started.
+			await new Promise((r) => setTimeout(r, 10));
+			expect(provider.selections, name).to.equal(0);
+			node.destroy();
+		}
+	});
+
+	it('still starts a splice-in on a channel that is ready', async function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const provider = withSpliceProvider(node);
+		expect(node.spliceIn(channelId, 100_000n, 253).ok).to.be.true;
+		await new Promise((r) => setTimeout(r, 20));
+		expect(provider.selections, 'the selection ran').to.equal(1);
+		node.destroy();
 	});
 
 	it('keeps a channel that closed while marked coded permanent', function () {
