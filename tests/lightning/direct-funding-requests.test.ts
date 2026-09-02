@@ -13,6 +13,7 @@ import {
 	DF_REQUESTS_STORAGE_KEY,
 	DirectFundingErrorCode,
 	DirectFundingRequestStore,
+	IDfRequestRecord,
 	IDfRequestStoreDeps,
 	encodeSealedFrame,
 	openFrame,
@@ -431,6 +432,147 @@ describe('Direct funding: outstanding requests', () => {
 			expect(second.store.attemptsFor(record.receiptHash)).to.deep.equal({
 				attempts: 1
 			});
+		});
+	});
+
+	describe('a request that expires under a live funding (issue #644)', () => {
+		const OFFER_A = 'a1'.repeat(16);
+		const HOLD_MS = 15 * 60 * 1000;
+		const funding = {
+			outpoint: `${'ab'.repeat(32)}:1`,
+			channelId: 'cd'.repeat(32),
+			splice: false,
+			contentHash: 'ef'.repeat(32),
+			payerEphemeralKey: `02${'ab'.repeat(32)}`
+		};
+
+		/**
+		 * A request paid so late in its life that the funding it negotiated is
+		 * held past its own expiry, which is what the receiver's session does:
+		 * the hold is the later of the request's expiry and the session TTL.
+		 */
+		function fundedNearExpiry(): {
+			harness: IHarness;
+			record: IDfRequestRecord;
+			heldUntil: number;
+		} {
+			const h = harness({ requestTtlMs: HOUR });
+			const record = h.store.mint();
+			h.clock.now = record.expiresAt - 1_000;
+			const heldUntil = h.clock.now + HOLD_MS;
+			expect(
+				h.store.beginAttempt(record.receiptHash, OFFER_A, h.clock.now + 1_000)
+			).to.equal(true);
+			expect(
+				h.store.markAttemptFunding(
+					record.receiptHash,
+					OFFER_A,
+					funding,
+					heldUntil
+				)
+			).to.equal(true);
+			return { harness: h, record, heldUntil };
+		}
+
+		it('answers for the funding after the request itself has lapsed', () => {
+			const { harness: first, record } = fundedNearExpiry();
+			first.clock.now = record.expiresAt + 1;
+
+			// The payer's witness rides a continuation frame opened with the lane
+			// key this row holds, and the receipt is this row's preimage: swept on
+			// the request's clock, the channel could be finished by no route.
+			const second = harness({}, { wallet: first.wallet, clock: first.clock });
+			expect(second.store.restore()).to.equal(1);
+			expect(second.store.byRequestId(record.requestId)).to.not.equal(null);
+			expect(second.store.receiptPreimage(record.receiptHash)).to.equal(
+				record.preimageHex
+			);
+			expect(
+				second.store.attemptsFor(record.receiptHash).funding
+			).to.deep.equal(funding);
+			expect(second.store.activeFundings()).to.have.length(1);
+			expect(second.store.sweep()).to.equal(0);
+			expect(second.store.lapsedFundings()).to.deep.equal([]);
+		});
+
+		it('holds the row through a negotiation the request expires under', () => {
+			const h = harness({ requestTtlMs: HOUR });
+			const record = h.store.mint();
+			h.clock.now = record.expiresAt - 1_000;
+			const heldUntil = h.clock.now + HOLD_MS;
+			expect(
+				h.store.beginAttempt(record.receiptHash, OFFER_A, heldUntil)
+			).to.equal(true);
+
+			// The funding is named only once the transaction is final, which is
+			// minutes after the offer was admitted. A row taken in that window
+			// refuses the binding, and the channel the peer has signed for by then
+			// is stranded exactly as it is when the mark itself goes.
+			h.clock.now = record.expiresAt + 1;
+			expect(h.store.sweep()).to.equal(0);
+			expect(
+				h.store.markAttemptFunding(
+					record.receiptHash,
+					OFFER_A,
+					funding,
+					heldUntil
+				)
+			).to.equal(true);
+			expect(h.store.attemptsFor(record.receiptHash).funding).to.deep.equal(
+				funding
+			);
+		});
+
+		it('lets the row go when that attempt lapses naming no funding', () => {
+			const h = harness({ requestTtlMs: HOUR });
+			const record = h.store.mint();
+			h.clock.now = record.expiresAt - 1_000;
+			h.store.beginAttempt(record.receiptHash, OFFER_A, record.expiresAt);
+			h.clock.now = record.expiresAt + 1;
+			expect(h.store.sweep()).to.equal(1);
+		});
+
+		it('refuses a fresh attempt on a request only its funding keeps alive', () => {
+			const { harness: h, record } = fundedNearExpiry();
+			h.clock.now = record.expiresAt + 1;
+			// The mark this funding is held by is not one another offer may take.
+			expect(
+				h.store.beginAttempt(record.receiptHash, 'b2'.repeat(16), h.clock.now)
+			).to.equal(false);
+			expect(h.store.attemptsFor(record.receiptHash).activeOfferId).to.equal(
+				OFFER_A
+			);
+		});
+
+		it('hands the funding over rather than sweeping the row from under it', () => {
+			const { harness: h, record, heldUntil } = fundedNearExpiry();
+			h.clock.now = heldUntil + 1;
+
+			// The store cannot abort the channel the funding names, so it holds the
+			// row until the receiver has: the sweep dropping it here is what leaves
+			// a pending channel nothing can finish and nothing retires.
+			expect(h.store.sweep()).to.equal(0);
+			expect(h.store.size()).to.equal(1);
+			expect(h.store.activeFundings()).to.deep.equal([]);
+			expect(h.store.lapsedFundings()).to.deep.equal([
+				{ receiptHash: record.receiptHash, offerIdHex: OFFER_A, funding }
+			]);
+
+			h.store.endAttempt(record.receiptHash, OFFER_A);
+			expect(h.store.lapsedFundings()).to.deep.equal([]);
+			expect(h.store.sweep()).to.equal(1);
+			expect(h.store.byRequestId(record.requestId)).to.equal(null);
+			expect(h.wallet.get(DF_REQUESTS_STORAGE_KEY)).to.equal('[]');
+		});
+
+		it('keeps a lapsed funding across a restart, for the receiver to retire', () => {
+			const { harness: first, record, heldUntil } = fundedNearExpiry();
+			first.clock.now = heldUntil + 1;
+			const second = harness({}, { wallet: first.wallet, clock: first.clock });
+			expect(second.store.restore()).to.equal(1);
+			expect(second.store.lapsedFundings()).to.deep.equal([
+				{ receiptHash: record.receiptHash, offerIdHex: OFFER_A, funding }
+			]);
 		});
 	});
 

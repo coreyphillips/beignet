@@ -466,6 +466,7 @@ function countTheirHtlcMatches(
 			if (
 				matchTaprootHtlcOutput(
 					Buffer.from(out.script),
+					BigInt(out.value),
 					state,
 					keys,
 					false,
@@ -494,6 +495,7 @@ function countTheirHtlcMatches(
 		if (
 			matchHtlcOutput(
 				Buffer.from(out.script),
+				BigInt(out.value),
 				state,
 				revocationPubkey,
 				theirHtlcPubkey,
@@ -921,6 +923,7 @@ function classifyOurCommitmentOutputs(
 		// Try to match HTLC outputs
 		const htlcMatch = matchHtlcOutput(
 			outScript,
+			BigInt(tx.outs[i].value),
 			state,
 			revocationPubkey,
 			localHtlcPubkey,
@@ -1106,6 +1109,7 @@ function classifyTheirCommitmentOutputs(
 		// On their commitment: their offered = our received, their received = our offered
 		const htlcMatch = matchHtlcOutput(
 			outScript,
+			BigInt(tx.outs[i].value),
 			state,
 			revocationPubkey,
 			theirHtlcPubkey,
@@ -1226,7 +1230,15 @@ interface IHtlcMatch {
  * - OUR commitment: a RECEIVED entry until the peer revokes for the
  *   removal (removalRemoteCommitted === false, mirroring
  *   buildHtlcOutputsForLocal, which is also what prepareForceClose
- *   broadcasts).
+ *   broadcasts), AND an OFFERED entry the peer settled, until WE
+ *   revoke for it (removalLocallyRevoked === false) with an add the
+ *   stored signature covers (addRemoteSigned !== false): the commitment
+ *   we broadcast is the one that signature covers, which predates the
+ *   peer's update_fulfill/fail and still carries the output
+ *   (issue #634, mirroring signedLocalCarriesRemoval). A row whose
+ *   rebuild ends up dropping that output stays a candidate here: it
+ *   then matches no output script, which is what the additive rule
+ *   below asks for.
  * - THEIR commitment: an OFFERED entry the peer settled and a RECEIVED
  *   entry WE settled, both until THE PEER revokes the commitment that
  *   carried the output (removalRemoteCommitted === false). The remote
@@ -1237,7 +1249,7 @@ interface IHtlcMatch {
  *   commitment_signed. Without this, a peer force-closing right after
  *   we fulfilled kept the preimage-paid output unclaimed until its own
  *   timeout sweep, and an offered HTLC the peer settled went untracked
- *   for the whole second phase of its removal — our revoke_and_ack
+ *   for the whole second phase of its removal: our revoke_and_ack
  *   flips removalLocallyRevoked one round EARLIER, while the peer's
  *   previous commitment is still broadcastable (issue #641).
  *
@@ -1268,8 +1280,11 @@ function htlcEntryCanBePresent(
 	}
 	if (isLocalCommitment) {
 		return (
-			entry.direction === HtlcDirection.RECEIVED &&
-			entry.removalRemoteCommitted === false
+			(entry.direction === HtlcDirection.RECEIVED &&
+				entry.removalRemoteCommitted === false) ||
+			(entry.direction === HtlcDirection.OFFERED &&
+				entry.removalLocallyRevoked === false &&
+				entry.addRemoteSigned !== false)
 		);
 	}
 	return (
@@ -1280,8 +1295,41 @@ function htlcEntryCanBePresent(
 	);
 }
 
+/**
+ * The entries an output of `amount` is attributed from, best first.
+ *
+ * An offered HTLC script commits to neither amount nor expiry, so the parts of
+ * one payment share it byte for byte and the script comparison cannot say which
+ * part an output belongs to. The commitment orders identical HTLC scripts by
+ * amount and then by cltv_expiry ascending (BOLT 3) and the callers walk the
+ * outputs in that order, so the entry of the output's OWN amount with the
+ * lowest expiry is the one it was built from. Attributing across parts records
+ * the other part's id and expiry, and the HTLC-timeout tx built from that
+ * carries a locktime the stored signature was never made over.
+ *
+ * Entries of another amount stay on as a fallback rather than being filtered
+ * out: the script comparison is still the arbiter, and this classification also
+ * serves revoked commitments, where nothing that matched before may stop
+ * matching.
+ */
+function htlcMatchOrder(
+	state: IChannelState,
+	amount: bigint
+): [string, IHtlcEntry][] {
+	const entries = [...state.htlcs.entries()].sort(
+		([, a], [, b]) => a.cltvExpiry - b.cltvExpiry
+	);
+	const sameAmount = ([, entry]: [string, IHtlcEntry]): boolean =>
+		entry.amountMsat / 1000n === amount;
+	return [
+		...entries.filter(sameAmount),
+		...entries.filter((e) => !sameAmount(e))
+	];
+}
+
 function matchHtlcOutput(
 	outScript: Buffer,
+	outAmount: bigint,
 	state: IChannelState,
 	revocationPubkey: Buffer,
 	localHtlcPubkey: Buffer,
@@ -1298,7 +1346,7 @@ function matchHtlcOutput(
 	// that matches the on-chain commitment.
 	const useAnchors = isAnchorChannel(state.channelType);
 
-	for (const [entryKey, entry] of state.htlcs.entries()) {
+	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount)) {
 		if (claimedKeys?.has(entryKey)) {
 			continue;
 		}
@@ -1477,6 +1525,7 @@ function deriveTaprootCommitKeys(
 
 function matchTaprootHtlcOutput(
 	outScript: Buffer,
+	outAmount: bigint,
 	state: IChannelState,
 	keys: ITaprootCommitKeys,
 	isOurs: boolean,
@@ -1484,7 +1533,7 @@ function matchTaprootHtlcOutput(
 	// scripts must each claim a DISTINCT entry.
 	claimedKeys?: Set<string>
 ): IHtlcMatch | null {
-	for (const [entryKey, entry] of state.htlcs.entries()) {
+	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount)) {
 		if (claimedKeys?.has(entryKey)) {
 			continue;
 		}
@@ -1583,6 +1632,7 @@ function classifyTaprootCommitmentOutputs(
 		}
 		const htlc = matchTaprootHtlcOutput(
 			outScript,
+			base.amount,
 			state,
 			keys,
 			isOurs,

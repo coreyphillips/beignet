@@ -297,6 +297,11 @@ export interface IHtlcEntry {
 	 * covers, and an add from inside that window is not in it (issue #643).
 	 * Optional for the same reason as the flags above: absent means "already
 	 * signed", so legacy persisted entries keep the old reading.
+	 *
+	 * The same stamp bounds the retention at the other end: the rebuild keeps
+	 * an offered output whose removal the peer has not signed away yet (issue
+	 * #634), and an add the peer removed before it had ever been signed in has
+	 * no such output to keep.
 	 */
 	addRemoteSigned?: boolean;
 
