@@ -722,6 +722,16 @@ describe('LightningNode transient splice refusals', function () {
 					).to.equal(QuiescenceState.RECEIVED_STFU);
 				},
 				/retry after it ends/
+			],
+			[
+				'a request already parked on our stfu',
+				(node, channelId): void => {
+					expect(
+						node.spliceOut(channelId, 40_000n, 253).ok,
+						'the first request parks on the stfu it sent'
+					).to.be.true;
+				},
+				/already awaiting quiescence/
 			]
 		];
 		for (const [name, makeBusy, message] of busyStates) {
@@ -784,6 +794,57 @@ describe('LightningNode transient splice refusals', function () {
 				QuiescenceState.QUIESCENT
 			);
 			expect(channel._pendingSplice, name).to.be.null;
+			node.destroy();
+		}
+	});
+
+	/**
+	 * Issue #655: a request parked on our own unanswered stfu used to be
+	 * replaced by the next one, and both callers were told their splice had
+	 * started. Only the later request ran, with the earlier one's direction
+	 * already overwritten on the channel.
+	 */
+	it('codes a request displacing one parked on our stfu as busy on both paths', function () {
+		for (const [name, request] of REQUESTS) {
+			const node = createTestNode();
+			const channelId = injectNormalChannel(node);
+			const channel = channelOf(node, channelId);
+
+			// The first request drives quiescence and parks until the peer answers.
+			const destination = p2wpkhScript();
+			expect(node.spliceOut(channelId, 40_000n, 253, destination).ok, name).to
+				.be.true;
+			expect(channel.isQuiescing(), name).to.be.true;
+			const parked = channel._pendingSplice;
+			expect(parked, name).to.not.be.null;
+
+			const second = request(node, channelId);
+			expect(second.ok, name).to.be.false;
+			expect(second.code, name).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+			expect(second.error, name).to.include('already awaiting quiescence');
+			// The parked request is untouched, and the refused one's direction
+			// dies with it rather than sitting on the channel.
+			expect(channel._pendingSplice, name).to.equal(parked);
+			expect(channel._spliceOutDestination, name).to.be.null;
+			expect(channel._spliceInInputs, name).to.be.null;
+
+			// The peer's stfu fires the FIRST request, with the direction that
+			// request was made with.
+			const actions = channel.handleStfuMessage({
+				channelId,
+				initiator: false
+			});
+			expect(
+				actions.some(
+					(a: { messageType?: MessageType }) =>
+						a.messageType === MessageType.SPLICE
+				),
+				name
+			).to.be.true;
+			expect(channel._spliceInInputs, name).to.be.null;
+			expect(channel._spliceOutDestination.script.equals(destination), name).to
+				.be.true;
+			expect(channel._spliceOutDestination.sats, name).to.equal(40_000n);
 			node.destroy();
 		}
 	});
