@@ -1602,17 +1602,14 @@ describe('Direct funding receiver: a completed funding (issue #658)', () => {
 		// The channel is still holding the record when the offer lands and has
 		// retired it by the time the wait is armed. Which side of that transition
 		// each read falls on is not something the payer's receipt can depend on.
+		// The negotiation timeout stays at its normal length: an answer that waits
+		// that out arrives after the payer has stopped listening, so the receipt
+		// has to be here without it.
 		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
 		const again = new FakePayerLane(c.record, 'lane-after');
-		const engine = new DirectFundingReceiver(c.second, {
-			negotiationTimeoutMs: 20,
-			witnessTimeoutMs: 5_000,
-			sweepIntervalMs: 60_000
-		});
-		engine.start();
+		const engine = restart(c.second);
 		queueMicrotask(() => c.second.retirePendingV2(c.channelId));
 		engine.handleFrame(again.offerFrame(c.offer));
-		await new Promise((resolve) => setTimeout(resolve, 40));
 		await flush();
 
 		const receipts = again.bodiesOf(RECEIPT);

@@ -1309,13 +1309,27 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * waiter is installed, and retiring it re-arms nothing, so that waiter is one
 	 * no event will ever resolve. Its timeout says this channel cannot answer,
 	 * never that the payment was not made.
+	 *
+	 * A retirement caught between the two reads is asked about there and then,
+	 * because the trailing check alone answers too late to be of any use: it
+	 * runs after the negotiation timeout, and the payer's offer timeout is the
+	 * same 120 seconds and was armed before ours.
 	 */
 	private async recoveredFunding(
 		funding: IDfAttemptFunding,
 		channelId: Buffer
 	): Promise<{ final: IDfFinalTx | null; settled: Buffer | null }> {
+		// Read before the first await, so the record retired under us is told
+		// apart from the one this channel never had.
+		const wasHeld = this.pendingFinalTx(funding, channelId) !== null;
 		const settled = await this.completedFundingTxid(funding, channelId);
 		if (settled) return { final: null, settled };
+		if (wasHeld && !this.pendingFinalTx(funding, channelId)) {
+			// A chain that still says nothing is not a verdict either: the record
+			// may be a rollback that comes back, so that case keeps its wait.
+			const retired = await this.completedFundingTxid(funding, channelId);
+			if (retired) return { final: null, settled: retired };
+		}
 		const final = await this.resumedFinalTx(funding, channelId);
 		if (final) return { final, settled: null };
 		return {
