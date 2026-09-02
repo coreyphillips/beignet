@@ -704,7 +704,8 @@ function isWellFormedFunding(funding: unknown): boolean {
 		isHex(f.channelId, 32) &&
 		typeof f.splice === 'boolean' &&
 		isHex(f.contentHash, 32) &&
-		isHex(f.payerEphemeralKey, DF_NODE_ID_BYTES)
+		isHex(f.payerEphemeralKey, DF_NODE_ID_BYTES) &&
+		(f.fundingTxid === undefined || isHex(f.fundingTxid, 32))
 	);
 }
 

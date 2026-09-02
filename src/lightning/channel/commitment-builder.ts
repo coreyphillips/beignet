@@ -31,6 +31,7 @@ import {
 	ChannelRole,
 	HtlcDirection,
 	HtlcState,
+	IHtlcEntry,
 	isAnchorChannel,
 	isTaprootChannel
 } from './types';
@@ -484,6 +485,31 @@ export interface IBuiltCommitment {
 }
 
 /**
+ * Whether an offered add of ours is carried by the local commitment being
+ * built. The output loop and the balance loop below both ask through here so
+ * they can never disagree about it.
+ *
+ * Verifying the peer's next commitment_signed: the peer's revoke_and_ack for
+ * our covering commitment_signed (addRemoteCommitted) is the boundary.
+ *
+ * signedLocal (the force-close rebuild of the commitment the STORED signature
+ * covers): the boundary is the peer's commitment_signed AFTER that
+ * (addRemoteSigned), one message later. An add admitted on the earlier flag
+ * alone goes into the rebuild the stored signature was made without, and the
+ * broadcast witness does not verify (issue #643).
+ */
+function localCommitmentCarriesAdd(
+	entry: IHtlcEntry,
+	signedLocal: boolean
+): boolean {
+	if (entry.addRemoteCommitted === false) {
+		return false;
+	}
+	// Absent means "already signed" — see IHtlcEntry.addRemoteSigned.
+	return !signedLocal || entry.addRemoteSigned !== false;
+}
+
+/**
  * Build the local commitment transaction (the one we hold).
  *
  * From our perspective:
@@ -537,7 +563,7 @@ export function buildLocalCommitment(
 	// The SAME trimmed set feeds both the commitment outputs and the
 	// num_untrimmed_htlcs fee count so they can never diverge.
 	const htlcOutputs = filterUntrimmedHtlcs(
-		buildHtlcOutputsForLocal(state, keys),
+		buildHtlcOutputsForLocal(state, keys, signedLocal),
 		state.localConfig.dustLimitSatoshis,
 		feeratePerKw,
 		useAnchors
@@ -578,9 +604,15 @@ export function buildLocalCommitment(
 				if (entry.removalRemoteCommitted !== false) {
 					localMsat += entry.amountMsat;
 				}
-			} else {
-				// We offered and remote fulfilled: credit their balance
+			} else if (localCommitmentCarriesAdd(entry, signedLocal)) {
+				// We offered and remote fulfilled: credit their balance.
 				remoteMsat += entry.amountMsat;
+			} else {
+				// The peer revealed the preimage for an add this commitment
+				// never carried. It holds neither the HTLC output nor the
+				// credit, so our provisional deduction comes back instead of
+				// the peer being paid (issue #643).
+				localMsat += entry.amountMsat;
 			}
 		} else if (entry.state === HtlcState.FAILED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
@@ -595,11 +627,11 @@ export function buildLocalCommitment(
 			}
 		} else if (
 			entry.direction === HtlcDirection.OFFERED &&
-			entry.addRemoteCommitted === false
+			!localCommitmentCarriesAdd(entry, signedLocal)
 		) {
-			// An add of ours the peer has not committed yet: the provisional
-			// balance deduction from addHtlc is not in the peer's signatures —
-			// return it for this build (the output is excluded above).
+			// An add of ours this commitment does not carry: the provisional
+			// balance deduction from addHtlc is not in the peer's signature over
+			// it — return it for this build (the output is excluded above).
 			localMsat += entry.amountMsat;
 		}
 	}
@@ -1495,7 +1527,8 @@ export function verifyRemoteHtlcSignatures(
  */
 function buildHtlcOutputsForLocal(
 	state: IChannelState,
-	keys: ICommitmentKeys
+	keys: ICommitmentKeys,
+	signedLocal = false
 ): (IHtlcOutput & { direction: HtlcDirection; amountMsat: bigint })[] {
 	const outputs: (IHtlcOutput & {
 		direction: HtlcDirection;
@@ -1513,7 +1546,7 @@ function buildHtlcOutputsForLocal(
 		// define its contents, and the peer only incorporates OUR updates after
 		// revoking a commitment that covers them):
 		// - an add WE offered that the peer has not committed yet
-		//   (addRemoteCommitted === false) is NOT in the peer's signatures —
+		//   (localCommitmentCarriesAdd) is NOT in the peer's signatures —
 		//   exclude it;
 		// - a removal WE sent for a RECEIVED HTLC that the peer has not
 		//   committed yet (removalRemoteCommitted === false) is not in the
@@ -1535,7 +1568,7 @@ function buildHtlcOutputsForLocal(
 			continue;
 		} else if (
 			entry.direction === HtlcDirection.OFFERED &&
-			entry.addRemoteCommitted === false
+			!localCommitmentCarriesAdd(entry, signedLocal)
 		) {
 			continue;
 		}

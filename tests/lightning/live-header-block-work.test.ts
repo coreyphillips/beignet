@@ -397,6 +397,11 @@ describe('Issue #588: backend headers drive the per-block work', function () {
 		const htlcs: Map<string, IHtlcEntry> = a.channelManager
 			.getChannel(channelId)
 			.getFullState().htlcs;
+		// removalRemoteCommitted: false is what a just-fulfilled entry carries,
+		// and here it also keeps the injected row out of the commitment the
+		// channel's stored signature covers: the credit is not ours until the
+		// peer signs the removal in, and at 40 sats the output is trimmed. The
+		// force close verifies its rebuild against that signature (issue #657).
 		htlcs.set('received-3', {
 			id: 3n,
 			amountMsat: 40_000n,
@@ -404,7 +409,8 @@ describe('Issue #588: backend headers drive the per-block work', function () {
 			cltvExpiry: HEIGHT + 10,
 			onionRoutingPacket: Buffer.alloc(1366),
 			direction: HtlcDirection.RECEIVED,
-			state: HtlcState.FULFILLED
+			state: HtlcState.FULFILLED,
+			removalRemoteCommitted: false
 		});
 
 		const fixture = {
