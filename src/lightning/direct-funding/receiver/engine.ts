@@ -552,7 +552,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		const isSplice = funding.splice;
 		// The witness may be answering a funding that is already finished: what
 		// the crash cost was the receipt, not the delivery (issue #658).
-		const settled = await this.completedFundingTxid(funding, channelId);
+		const { final, settled } = await this.recoveredFunding(funding, channelId);
 		if (settled) {
 			this.settleCompletedFunding(
 				frame.reply,
@@ -564,7 +564,6 @@ export class DirectFundingReceiver extends EventEmitter {
 			);
 			return;
 		}
-		const final = await this.resumedFinalTx(funding, channelId);
 		if (!final) {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: held.offerIdHex,
@@ -1037,8 +1036,13 @@ export class DirectFundingReceiver extends EventEmitter {
 		const channelId = Buffer.from(funding.channelId, 'hex');
 		// A funding whose channel completed is answered with the receipt, not
 		// with a sign request for a transaction that is already the network's
-		// (issue #658).
-		const settled = await this.completedFundingTxid(funding, channelId);
+		// (issue #658). Otherwise the transaction first, and no session until
+		// there is one. A channel that has not re-armed yet is a WAIT, not a
+		// verdict: recording a terminal session over it would answer every later
+		// re-send from the refusal, and the payer answers a decline by abandoning
+		// the payment the funding is still holding its coin for. Silence costs it
+		// one re-send.
+		const { final, settled } = await this.recoveredFunding(funding, channelId);
 		if (settled) {
 			this.settleCompletedFunding(
 				frame.reply,
@@ -1050,12 +1054,6 @@ export class DirectFundingReceiver extends EventEmitter {
 			);
 			return;
 		}
-		// The transaction first, and no session until there is one. A channel
-		// that has not re-armed yet is a WAIT, not a verdict: recording a
-		// terminal session over it would answer every later re-send from the
-		// refusal, and the payer answers a decline by abandoning the payment the
-		// funding is still holding its coin for. Silence costs it one re-send.
-		const final = await this.resumedFinalTx(funding, channelId);
 		if (!final) {
 			this.log(DF_LOG_OFFER_DROPPED, {
 				reason: 'funding_not_ready',
@@ -1299,6 +1297,31 @@ export class DirectFundingReceiver extends EventEmitter {
 		return spliceChannel
 			? { ...this.startSplice(ctx, spliceChannel, input), isSplice: true }
 			: { ...this.startOpen(ctx, liquidityPeer, input), isSplice: false };
+	}
+
+	/**
+	 * What this funding can still be answered with: the transaction the channel
+	 * is holding for it, or the txid of one the chain says is already made
+	 * (issue #658).
+	 *
+	 * The completed check brackets the wait rather than only preceding it. A
+	 * channel holding the record when it is first read can retire it before the
+	 * waiter is installed, and retiring it re-arms nothing, so that waiter is one
+	 * no event will ever resolve. Its timeout says this channel cannot answer,
+	 * never that the payment was not made.
+	 */
+	private async recoveredFunding(
+		funding: IDfAttemptFunding,
+		channelId: Buffer
+	): Promise<{ final: IDfFinalTx | null; settled: Buffer | null }> {
+		const settled = await this.completedFundingTxid(funding, channelId);
+		if (settled) return { final: null, settled };
+		const final = await this.resumedFinalTx(funding, channelId);
+		if (final) return { final, settled: null };
+		return {
+			final: null,
+			settled: await this.completedFundingTxid(funding, channelId)
+		};
 	}
 
 	/**

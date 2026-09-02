@@ -1596,6 +1596,34 @@ describe('Direct funding receiver: a completed funding (issue #658)', () => {
 		engine.stop();
 	});
 
+	it('answers a record the channel retires mid-recovery', async () => {
+		const c = await crashBeforeReceipt();
+		broadcast(c.second, c.fundingTx);
+		// The channel is still holding the record when the offer lands and has
+		// retired it by the time the wait is armed. Which side of that transition
+		// each read falls on is not something the payer's receipt can depend on.
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = new DirectFundingReceiver(c.second, {
+			negotiationTimeoutMs: 20,
+			witnessTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		queueMicrotask(() => c.second.retirePendingV2(c.channelId));
+		engine.handleFrame(again.offerFrame(c.offer));
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		await flush();
+
+		const receipts = again.bodiesOf(RECEIPT);
+		expect(receipts).to.have.length(1);
+		expect(decodeDfReceipt(receipts[0]).fundingTxid.toString('hex')).to.equal(
+			c.fundingTx.getId()
+		);
+		expect(c.second.requests.isTombstoned(c.record.receiptHash)).to.equal(true);
+		engine.stop();
+	});
+
 	it('answers the splice twin, whose record goes at splice_locked', async () => {
 		const c = await crashBeforeReceipt({ splice: true });
 		broadcast(c.second, c.fundingTx);
