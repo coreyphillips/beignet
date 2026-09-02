@@ -142,6 +142,8 @@ export interface ISerializedHtlcEntry {
 	commitCoverPending?: boolean;
 	addLocallyRevoked?: boolean;
 	removalLocallyRevoked?: boolean;
+	/** Whether the stored remote signature covers this add (see IHtlcEntry). */
+	addRemoteSigned?: boolean;
 	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
 	forwardEmitted?: boolean;
 	/** Admission-time dust-exposure classification (see IHtlcEntry). */
@@ -193,6 +195,9 @@ export function serializeHtlcEntry(
 		...(e.removalLocallyRevoked !== undefined
 			? { removalLocallyRevoked: e.removalLocallyRevoked }
 			: {}),
+		...(e.addRemoteSigned !== undefined
+			? { addRemoteSigned: e.addRemoteSigned }
+			: {}),
 		...(e.forwardEmitted !== undefined
 			? { forwardEmitted: e.forwardEmitted }
 			: {}),
@@ -239,6 +244,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.removalLocallyRevoked !== undefined
 				? { removalLocallyRevoked: s.removalLocallyRevoked }
+				: {}),
+			...(s.addRemoteSigned !== undefined
+				? { addRemoteSigned: s.addRemoteSigned }
 				: {}),
 			...(s.forwardEmitted !== undefined
 				? { forwardEmitted: s.forwardEmitted }
