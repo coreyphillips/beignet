@@ -15,6 +15,8 @@ import {
 	HtlcState
 } from '../../src/lightning/channel/types';
 import { QuiescenceState } from '../../src/lightning/channel/quiescence';
+import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
@@ -735,6 +737,53 @@ describe('LightningNode transient splice refusals', function () {
 			// And no coins were selected for a splice that never started.
 			await new Promise((r) => setTimeout(r, 10));
 			expect(provider.selections, name).to.equal(0);
+			node.destroy();
+		}
+	});
+
+	/**
+	 * Issue #656: the same latched handshake on the two synchronous paths. The
+	 * request used to park on it, but the reply that completes a peer-initiated
+	 * stfu goes out from _maybeAnswerOwedStfu, which has no deferred-splice
+	 * hook, so an accepted request sat there for the life of the peer's session
+	 * with its wallet inputs pledged.
+	 */
+	it('codes a peer stfu that is still draining as busy on both paths', function () {
+		for (const [name, request] of REQUESTS) {
+			const node = createTestNode();
+			const channelId = injectNormalChannel(node);
+			const channel = channelOf(node, channelId);
+			settlingHtlc(node, channelId);
+			channel.handleStfuMessage({ channelId, initiator: true });
+			expect(channel.getQuiescenceState(), name).to.equal(
+				QuiescenceState.RECEIVED_STFU
+			);
+
+			const result = request(node, channelId);
+			expect(result.ok, name).to.be.false;
+			expect(result.code, name).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+			expect(result.error, name).to.include('retry after it ends');
+			expect(channel._pendingSplice, name).to.be.null;
+			// The refused request's direction dies with it, so the coins are
+			// freed and nothing leaks into a later splice.
+			expect(channel._spliceOutDestination, name).to.be.null;
+			expect(channel._spliceInInputs, name).to.be.null;
+
+			// The drain completes the peer's handshake and does nothing else.
+			channel.getFullState().htlcs.delete('offered-0');
+			const drained = channel._maybeAnswerOwedStfu();
+			expect(
+				drained.filter(
+					(a: { type: ChannelActionType; messageType?: MessageType }) =>
+						a.type === ChannelActionType.ERROR ||
+						a.messageType === MessageType.SPLICE
+				),
+				name
+			).to.be.empty;
+			expect(channel.getQuiescenceState(), name).to.equal(
+				QuiescenceState.QUIESCENT
+			);
+			expect(channel._pendingSplice, name).to.be.null;
 			node.destroy();
 		}
 	});
