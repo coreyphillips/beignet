@@ -9822,10 +9822,7 @@ export class Channel {
 	/**
 	 * Why a splice started right now would be refused transiently, or null.
 	 * Every arm here is one initiateSplice raises with `transient: true`, in the
-	 * same order, so the two agree on what the caller is told. The one addition
-	 * is a peer-owned handshake we have not answered yet: initiateSplice parks
-	 * the request there, and our reply makes the peer the session initiator, so
-	 * the parked request would never get to send splice_init.
+	 * same order, so the two agree on what the caller is told.
 	 *
 	 * It exists because spliceIn sources its wallet inputs asynchronously and
 	 * cannot wait for initiateSplice to answer: the refusal would arrive on
@@ -10040,24 +10037,30 @@ export class Channel {
 			}
 		}
 
-		// Already quiescent — start the splice immediately. Only the
-		// quiescence initiator may send splice_init (BOLT 2): a side that
-		// merely answered the peer's stfu (or lost the concurrent-stfu funder
-		// tie-break) must not drive a dependent protocol into the peer's
-		// session.
+		// The session is the peer's from its stfu on, finished handshake or not.
+		// Only the quiescence initiator may send splice_init (BOLT 2): a side
+		// that merely answered the peer's stfu (or lost the concurrent-stfu
+		// funder tie-break) must not drive a dependent protocol into the peer's
+		// session. A RECEIVED_STFU is refused here rather than parked below,
+		// because the reply that completes it goes out from _maybeAnswerOwedStfu
+		// when the last pending update drains, and that path has no deferred
+		// splice hook: the request would sit parked for the life of the peer's
+		// session with no splice and no refusal ever emitted (issue #656).
+		if (this._quiescence.peerHasSentStfu() && !this._quiescence.isInitiator()) {
+			// The refused request's wallet configuration dies with it
+			// (see the tie-break drop in handleStfuMessage).
+			this._resetSpliceDriver();
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: SPLICE_BUSY_PEER_QUIESCENCE,
+					transient: true
+				}
+			];
+		}
+
+		// Already quiescent — start the splice immediately.
 		if (this._quiescence.isQuiescent()) {
-			if (!this._quiescence.isInitiator()) {
-				// The refused request's wallet configuration dies with it
-				// (see the tie-break drop in handleStfuMessage).
-				this._resetSpliceDriver();
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: SPLICE_BUSY_PEER_QUIESCENCE,
-						transient: true
-					}
-				];
-			}
 			return this._startSplice(relativeSatoshis, fundingFeeratePerkw, locktime);
 		}
 
