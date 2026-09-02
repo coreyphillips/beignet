@@ -738,6 +738,8 @@ describe('LightningNode transient splice refusals', function () {
 			const node = createTestNode();
 			const channelId = injectNormalChannel(node);
 			const provider = withSpliceProvider(node);
+			const errors: string[] = [];
+			node.on('node:error', (e: { message: string }) => errors.push(e.message));
 			makeBusy(node, channelId);
 
 			const result = node.spliceIn(channelId, 100_000n, 253);
@@ -747,6 +749,10 @@ describe('LightningNode transient splice refusals', function () {
 			// And no coins were selected for a splice that never started.
 			await new Promise((r) => setTimeout(r, 10));
 			expect(provider.selections, name).to.equal(0);
+			// The refusal is returned, never emitted: what the channel is busy
+			// with is often a request of ours, and SPLICE_IN_FAILED is scoped by
+			// channel alone, so an emission would reject its spliceInAndWait.
+			expect(errors, name).to.be.empty;
 			node.destroy();
 		}
 	});
@@ -891,6 +897,41 @@ describe('LightningNode transient splice refusals', function () {
 		expect(channel._pendingSplice.relativeSatoshis).to.equal(100_000n);
 		expect(errors, 'and it failed for nothing').to.deep.equal([]);
 		node.destroy();
+	});
+
+	/**
+	 * Issue #655: the reservation a pending selection takes has to hold against
+	 * every entry point. A synchronous request slipping in beside it parked its
+	 * own splice, and the selection that started first was refused once it
+	 * resolved, its caller having been told ok long before.
+	 */
+	it('refuses the synchronous paths while a splice-in is selecting inputs', async function () {
+		for (const [name, request] of REQUESTS) {
+			const node = createTestNode();
+			const channelId = injectNormalChannel(node);
+			let release: () => void = () => undefined;
+			const held = new Promise<void>((r) => (release = r));
+			(node as any).fundingProvider = {
+				selectSpliceInputs: async () => {
+					await held;
+					return { inputs: [makeInput(200_000)], changeScript: p2wpkhScript() };
+				}
+			};
+
+			expect(node.spliceIn(channelId, 100_000n, 253).ok, name).to.be.true;
+			const second = request(node, channelId);
+			expect(second.ok, name).to.be.false;
+			expect(second.code, name).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+			expect(second.error, name).to.include('still selecting its inputs');
+
+			// The request that reserved the channel is the one that drives it.
+			release();
+			await new Promise((r) => setTimeout(r, 20));
+			const channel = channelOf(node, channelId);
+			expect(channel.isQuiescing(), name).to.be.true;
+			expect(channel._pendingSplice.relativeSatoshis, name).to.equal(100_000n);
+			node.destroy();
+		}
 	});
 
 	it('still starts a splice-in on a channel that is ready', async function () {
