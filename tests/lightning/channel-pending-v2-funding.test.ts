@@ -430,6 +430,34 @@ describe('Channel.getPendingV2FundingTx (issue #612)', () => {
 		);
 	});
 
+	/**
+	 * The owed list empties as slots fill, so on its own it reads a funding that
+	 * has taken a third party's witness as one that never had an external input
+	 * at all. A caller resuming a delivery it crashed part way through needs to
+	 * tell those two apart (issue #645).
+	 */
+	it('moves a delivered slot to filled and reports the release', () => {
+		const setup = driveToOwedWitness();
+		const before = setup.acceptor.getPendingV2FundingTx()!;
+		expect(before.filledExternalInputs).to.deep.equal([]);
+		expect(before.sentTxSignatures).to.equal(false);
+
+		setup.acceptor.provideV2ExternalWitness(
+			Buffer.from(setup.extPrevTx.getHash()),
+			0,
+			signExternalInput(setup)
+		);
+		const after = setup.acceptor.getPendingV2FundingTx()!;
+		expect(after.owedExternalInputs).to.deep.equal([]);
+		expect(after.filledExternalInputs.map((i) => i.inputIndex)).to.deep.equal(
+			before.owedExternalInputs.map((i) => i.inputIndex)
+		);
+		expect(
+			after.filledExternalInputs[0].prevTxid.equals(setup.extPrevTx.getHash())
+		).to.equal(true);
+		expect(after.sentTxSignatures).to.equal(true);
+	});
+
 	it('returns a copy: mutating it cannot reach the channel', () => {
 		const { acceptor } = driveToOwedWitness();
 		const first = acceptor.getPendingV2FundingTx()!;

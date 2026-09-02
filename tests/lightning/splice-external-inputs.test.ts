@@ -910,6 +910,40 @@ describe('Splice external inputs (issue #592)', function () {
 		).to.equal(true);
 	});
 
+	/**
+	 * The owed list empties as slots fill, so on its own it reads a splice that
+	 * has taken a third party's witness as one that never had an external input
+	 * at all. A caller resuming a delivery it crashed part way through needs to
+	 * tell those two apart (issue #645).
+	 */
+	it('moves a delivered slot to filled and reports the release', function () {
+		const { pair, wallet, record, extIdx } = driveToWithhold();
+		const before = pair.opener.getPendingSpliceTx()!;
+		expect(before.filledExternalInputs).to.deep.equal([]);
+		expect(before.sentTxSignatures).to.equal(false);
+
+		pair.enqueue(
+			pair.acceptor,
+			pair.opener,
+			pair.opener.provideSpliceExternalWitness(
+				Buffer.from(wallet.extPrevTx.getHash()),
+				0,
+				signExternalP2wpkh(record, wallet)
+			)
+		);
+		pair.pump();
+		expect(pair.errors).to.deep.equal([]);
+
+		const after = pair.opener.getPendingSpliceTx()!;
+		expect(after.owedExternalInputs).to.deep.equal([]);
+		expect(after.filledExternalInputs).to.have.length(1);
+		expect(after.filledExternalInputs[0].inputIndex).to.equal(extIdx);
+		expect(
+			after.filledExternalInputs[0].prevTxid.equals(wallet.extPrevTx.getHash())
+		).to.equal(true);
+		expect(after.sentTxSignatures).to.equal(true);
+	});
+
 	it('serializes the external slots and tolerates rows written before them', function () {
 		const { record, extIdx } = driveToWithhold();
 		const round = deserializeSpliceInFlight(

@@ -95,6 +95,7 @@ import {
 	DF_WITNESS_TIMEOUT_MS,
 	DfOfferDropReason,
 	IDfChannelHandle,
+	IDfExternalInput,
 	IDfPendingSpliceTx,
 	IDfPendingV2FundingTx,
 	IDfReceiverConfig,
@@ -535,6 +536,10 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * owed-witness event a resumed offer waits on: the payer marks the witness
 	 * sent the moment the wire takes the frame and never offers again (sender
 	 * engine ~466), so a witness dropped here is one nothing re-sends.
+	 *
+	 * A channel that already HOLDS this witness is answered from that instead
+	 * (issue #645): the delivery ran before a crash that took the tombstone with
+	 * it, so what the payer is still owed is the receipt.
 	 */
 	private async completeFundingFromWitness(
 		frame: IDfInboundFrame,
@@ -550,6 +555,11 @@ export class DirectFundingReceiver extends EventEmitter {
 		const { funding } = held;
 		const channelId = Buffer.from(funding.channelId, 'hex');
 		const isSplice = funding.splice;
+		const settled = this.settledFinalTx(funding, channelId);
+		if (settled) {
+			this.completeFunding(frame, record, held, keys, settled, witness.offerId);
+			return;
+		}
 		const final = await this.resumedFinalTx(funding, channelId);
 		if (!final) {
 			this.log(DF_LOG_OFFER_FAILED, {
@@ -573,6 +583,30 @@ export class DirectFundingReceiver extends EventEmitter {
 			});
 			return;
 		}
+		this.completeFunding(frame, record, held, keys, final, witness.offerId);
+	}
+
+	/**
+	 * Free the coin, tombstone the request and hand back the receipt for a
+	 * funding the channel is holding the payer's witness for.
+	 *
+	 * Shared by the two recovery entry points: a late witness that reached the
+	 * channel just now, and one it took before a crash (issue #645). Nothing
+	 * here touches the channel, so it is as correct for the second as the first.
+	 */
+	private completeFunding(
+		frame: IDfInboundFrame,
+		record: IDfRequestRecord,
+		held: {
+			receiptHash: string;
+			offerIdHex: string;
+			funding: IDfAttemptFunding;
+		},
+		keys: IDfLaneKeys,
+		final: IDfFinalTx,
+		offerId: Buffer
+	): void {
+		const { funding } = held;
 		this.state.release(funding.outpoint, held.offerIdHex);
 		try {
 			// Tombstone before the receipt, as the session path does: the payment
@@ -590,7 +624,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		}
 		const complete = final.tx.ins.every((i) => i.witness.length > 0);
 		const receipt = encodeDfReceipt({
-			offerId: witness.offerId,
+			offerId,
 			preimage: Buffer.from(record.preimageHex, 'hex'),
 			fundingTxid: final.fundingTxidDisplay,
 			...(complete ? { rawTx: final.tx.toBuffer() } : {})
@@ -997,6 +1031,10 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * and signed for by the peer. What still judges them is
 	 * `fundingTransactionProblem`, which binds this offer to that transaction
 	 * before the attestation is made.
+	 *
+	 * A funding the channel has already been given its witness for is answered
+	 * with the receipt rather than a second sign request (issue #645): the
+	 * signature the payer would be asked for is one it has already made.
 	 */
 	private async serveResumedOffer(
 		frame: IDfInboundFrame,
@@ -1020,12 +1058,27 @@ export class DirectFundingReceiver extends EventEmitter {
 			);
 			return;
 		}
+		const channelId = Buffer.from(funding.channelId, 'hex');
+		// Before the wait, because a settled funding never re-arms the event that
+		// wait is on: the witness reached the channel in the life that crashed,
+		// and the tombstone it should have earned is what this re-send collects.
+		const settled = this.settledFinalTx(funding, channelId);
+		if (settled) {
+			this.completeFunding(
+				frame,
+				record,
+				{ receiptHash: record.receiptHash, offerIdHex, funding },
+				keys,
+				settled,
+				offer.offerId
+			);
+			return;
+		}
 		// The transaction first, and no session until there is one. A channel
 		// that has not re-armed yet is a WAIT, not a verdict: recording a
 		// terminal session over it would answer every later re-send from the
 		// refusal, and the payer answers a decline by abandoning the payment the
 		// funding is still holding its coin for. Silence costs it one re-send.
-		const channelId = Buffer.from(funding.channelId, 'hex');
 		const final = await this.resumedFinalTx(funding, channelId);
 		if (!final) {
 			this.log(DF_LOG_OFFER_DROPPED, {
@@ -1865,16 +1918,46 @@ export class DirectFundingReceiver extends EventEmitter {
 		channelId: Buffer,
 		outpoint: string
 	): IDfFinalTx | null {
-		if (!pending?.prevouts) return null;
+		if (!pending || !holdsOutpoint(pending.owedExternalInputs, outpoint)) {
+			return null;
+		}
+		return this.buildFinalTx(pending, channelId);
+	}
+
+	/**
+	 * The transaction of a funding whose external witness the channel has
+	 * ALREADY taken, or null (issue #645).
+	 *
+	 * A crash between the channel's persist of that witness and the request's
+	 * tombstone leaves a payment that is made and a request that still looks
+	 * busy: the filled slot has left `owedExternalInputs`, so `finalTxFor`
+	 * answers nothing for it and both recovery entry points give up. Recovery
+	 * reads the filled list instead, gated on the tx_signatures having been
+	 * released: that is the point the payer's coin is committed and the receipt
+	 * becomes owed. A witness the channel took while the release is still
+	 * withheld leaves the funding abortable, and tombstoning it there would burn
+	 * the request for a payment that never happened.
+	 */
+	private settledFinalTx(
+		funding: IDfAttemptFunding,
+		channelId: Buffer
+	): IDfFinalTx | null {
+		const pending = funding.splice
+			? this.deps.getPendingSpliceTx(channelId)
+			: this.deps.getPendingV2FundingTx(channelId);
+		if (!pending?.sentTxSignatures) return null;
+		if (!holdsOutpoint(pending.filledExternalInputs, funding.outpoint)) {
+			return null;
+		}
+		return this.buildFinalTx(pending, channelId);
+	}
+
+	private buildFinalTx(
+		pending: IDfPendingV2FundingTx | IDfPendingSpliceTx,
+		channelId: Buffer
+	): IDfFinalTx | null {
 		const prevouts = pending.prevouts;
-		const owes = pending.owedExternalInputs.some(
-			(owed) =>
-				outpointKey(
-					Buffer.from(owed.prevTxid).reverse().toString('hex'),
-					owed.prevOutputIndex
-				) === outpoint
-		);
-		if (!owes) return null;
+		if (!prevouts) return null;
 		const common = {
 			channelId: Buffer.from(channelId),
 			tx: pending.tx,
@@ -2105,6 +2188,17 @@ export class DirectFundingReceiver extends EventEmitter {
 /** Internal byte order in, display byte order out. */
 function displayTxid(internal: Buffer): Buffer {
 	return Buffer.from(internal).reverse();
+}
+
+/** Is this outpoint one of the external inputs the channel listed? */
+function holdsOutpoint(inputs: IDfExternalInput[], outpoint: string): boolean {
+	return inputs.some(
+		(input) =>
+			outpointKey(
+				Buffer.from(input.prevTxid).reverse().toString('hex'),
+				input.prevOutputIndex
+			) === outpoint
+	);
 }
 
 function errorText(err: unknown): string {
