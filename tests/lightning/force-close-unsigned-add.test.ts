@@ -9,11 +9,16 @@
  * signature covers, so admitting the add on addRemoteCommitted alone broadcasts
  * a transaction that signature does not verify: the funding witness is invalid,
  * nothing confirms, and the expiry backstop takes that close by itself.
+ *
+ * A row persisted before the flag existed cannot say which side of that gap it
+ * is on, so the close verifies its rebuild against the stored signature and
+ * refuses what nothing covers (issue #657).
  */
 
 import { expect } from 'chai';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
+import * as ecc from '@bitcoinerlab/secp256k1';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
@@ -21,9 +26,12 @@ import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
 	HtlcState,
-	IHtlcEntry
+	IHtlcEntry,
+	isTaprootChannel
 } from '../../src/lightning/channel/types';
 import { createFundingScript } from '../../src/lightning/script/funding';
+import { createTaprootFundingScript } from '../../src/lightning/script/funding-taproot';
+import { taprootCommitmentSighash } from '../../src/lightning/channel/commitment-musig';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
@@ -58,9 +66,10 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	};
 }
 
-function makeNodeConfig(seedId: number): INodeConfig {
+function makeNodeConfig(seedId: number, taproot = false): INodeConfig {
 	const seed = makeSeed(seedId);
 	return {
+		preferTaproot: taproot,
 		nodePrivateKey: crypto
 			.createHash('sha256')
 			.update(seed)
@@ -83,8 +92,8 @@ function makeNodeConfig(seedId: number): INodeConfig {
 	};
 }
 
-function createNode(seedId: number): LightningNode {
-	const node = new LightningNode(makeNodeConfig(seedId));
+function createNode(seedId: number, taproot = false): LightningNode {
+	const node = new LightningNode(makeNodeConfig(seedId, taproot));
 	node.on('error', () => {});
 	return node;
 }
@@ -148,11 +157,11 @@ interface IStall {
  */
 function stalledAdd(
 	seedBase: number,
-	opts: { signsTheAdd?: boolean; preimage?: Buffer } = {}
+	opts: { signsTheAdd?: boolean; preimage?: Buffer; taproot?: boolean } = {}
 ): IStall {
 	const signsTheAdd = opts.signsTheAdd !== false;
-	const alice = createNode(seedBase);
-	const bob = createNode(seedBase + 1);
+	const alice = createNode(seedBase, opts.taproot);
+	const bob = createNode(seedBase + 1, opts.taproot);
 	const filter: IFilter = { allow: () => true };
 	wire(alice, bob, filter);
 	const channelId = openReadyChannel(alice, bob);
@@ -249,6 +258,31 @@ function peerSigned(
 			funding.witnessScript,
 			Number(st.fundingSatoshis)
 		);
+}
+
+/**
+ * Whether the key-spend witness the plan carries is a valid signature for the
+ * taproot funding output: the taproot form of the same question, since the
+ * stored value is a MuSig2 partial and only the aggregate is verifiable.
+ */
+function taprootWitnessValid(
+	node: LightningNode,
+	channelId: Buffer,
+	tx: bitcoin.Transaction
+): boolean {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const manager = node.getChannelManager() as any;
+	const st = manager.getChannel(channelId).getFullState();
+	const { p2trOutput, outputKey } = createTaprootFundingScript(
+		st.localBasepoints.fundingPubkey,
+		st.remoteBasepoints.fundingPubkey
+	);
+	const sighash = taprootCommitmentSighash(
+		tx,
+		p2trOutput,
+		Number(st.fundingSatoshis)
+	);
+	return ecc.verifySchnorr(sighash, outputKey, tx.ins[0].witness[0]);
 }
 
 function hasHtlcOutput(tx: bitcoin.Transaction): boolean {
@@ -394,6 +428,69 @@ describe('The force-close rebuild and an unsigned add (issue #643)', function ()
 		).to.equal(true);
 		alice.destroy();
 		bob.destroy();
+	});
+
+	it('drops an unstamped add the stored signature does not cover (issue #657)', function () {
+		// The residue of the legacy default: a row persisted by pre-flag code
+		// INSIDE the window, where absent reads as signed and the rebuild is not
+		// the commitment the stored signature covers. Nothing on the row says so,
+		// so the signature is what says so.
+		const f = stalledAdd(660, { signsTheAdd: false });
+		delete f.entry.addRemoteSigned;
+
+		const tx = plannedCommitment(f.alice, f.channelId);
+
+		expect(hasHtlcOutput(tx), 'no HTLC output').to.equal(false);
+		expect(
+			peerSigned(f.alice, f.channelId, tx),
+			'the stored remote signature covers what we broadcast'
+		).to.equal(true);
+		f.destroy();
+	});
+
+	it('drops an unstamped taproot add the stored partial does not cover (issue #657)', function () {
+		// The taproot half of the same question. The stored value is a MuSig2
+		// partial, so what has to verify is the aggregated key-spend signature
+		// the witness carries.
+		const f = stalledAdd(690, { signsTheAdd: false, taproot: true });
+		const state = f.alice
+			.getChannelManager()
+			.getChannel(f.channelId)!
+			.getFullState();
+		expect(isTaprootChannel(state.channelType), 'taproot channel').to.equal(
+			true
+		);
+		delete f.entry.addRemoteSigned;
+
+		const tx = plannedCommitment(f.alice, f.channelId);
+
+		expect(hasHtlcOutput(tx), 'no HTLC output').to.equal(false);
+		expect(
+			taprootWitnessValid(f.alice, f.channelId, tx),
+			'the key-spend witness is a valid signature'
+		).to.equal(true);
+		f.destroy();
+	});
+
+	it('refuses a close no rebuild the signature covers (issue #657)', function () {
+		// Neither reading of the adds produces the commitment the stored
+		// signature covers. Returning the plan anyway means broadcasting a
+		// transaction with an invalid funding witness and calling the channel
+		// closed.
+		const f = stalledAdd(670, { signsTheAdd: false });
+		delete f.entry.addRemoteSigned;
+		const channel = f.alice.getChannelManager().getChannel(f.channelId)!;
+		channel.getFullState().remoteCommitmentSignature = crypto.randomBytes(64);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const manager = f.alice.getChannelManager() as any;
+		const plan = channel.prepareForceClose(manager.signerFor(channel, true));
+
+		expect(plan.ok).to.equal(false);
+		expect((plan as { error: string }).error).to.match(
+			/stored peer signature does not cover/
+		);
+		f.destroy();
 	});
 
 	it('keeps the output for a row persisted before the flag existed', function () {
