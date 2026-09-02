@@ -369,11 +369,25 @@ function heldQueueBarrier(): unknown {
 	};
 }
 
+/** Quorum mode that refuses: the first gated batch parks, then is dropped. */
+function refusingBarrier(): unknown {
+	return {
+		enforcing: true,
+		isReleased: (): boolean => false,
+		// 'fenced' is the one refusal the node does not answer with a
+		// disconnect, so the channel this asserts on is still there afterwards.
+		whenReleased: async (): Promise<{ released: boolean; reason: string }> => ({
+			released: false,
+			reason: 'fenced'
+		})
+	};
+}
+
 /**
  * A LightningNode whose manager holds the acceptor the same way managerHolding
- * does, optionally in quorum mode with nothing released.
+ * does, optionally in quorum mode under the given barrier.
  */
-function nodeHolding(acceptor: Channel, parked = false): LightningNode {
+function nodeHolding(acceptor: Channel, barrier?: unknown): LightningNode {
 	const seed = crypto.randomBytes(32);
 	const node = new LightningNode({
 		nodePrivateKey: crypto.randomBytes(32),
@@ -389,7 +403,7 @@ function nodeHolding(acceptor: Channel, parked = false): LightningNode {
 	node.on('node:error', () => undefined);
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const internals = (node as any).channelManager;
-	if (parked) internals.config.durabilityBarrier = heldQueueBarrier();
+	if (barrier) internals.config.durabilityBarrier = barrier;
 	const tempHex = acceptor.getTemporaryChannelId().toString('hex');
 	internals.tempChannels.set(tempHex, acceptor);
 	internals.channelPeers.set(tempHex, getPublicKey(seed).toString('hex'));
@@ -606,7 +620,7 @@ describe('LightningNode.getPendingV2FundingTx release flag (issue #645)', () => 
 	 */
 	it('answers no release while the tx_signatures are parked', () => {
 		const setup = driveToOwedWitness();
-		const node = nodeHolding(setup.acceptor, true);
+		const node = nodeHolding(setup.acceptor, heldQueueBarrier());
 		const channelId = setup.acceptor.getChannelId()!;
 
 		const result = node.provideV2ExternalWitness(
@@ -620,6 +634,31 @@ describe('LightningNode.getPendingV2FundingTx release flag (issue #645)', () => 
 			setup.acceptor.getPendingV2FundingTx()!.sentTxSignatures,
 			'the channel recorded the release'
 		).to.equal(true);
+		const pending = node.getPendingV2FundingTx(channelId)!;
+		expect(pending.filledExternalInputs).to.have.length(1);
+		expect(pending.sentTxSignatures).to.equal(false);
+	});
+
+	/**
+	 * A refusal drops the parked bytes and deletes the queue with them, so the
+	 * mask has to outlive the queue: the peer never got the tx_signatures the
+	 * record says were released, and a receipt handed over here is one nothing
+	 * paid for.
+	 */
+	it('answers no release after the barrier refuses them', async () => {
+		const setup = driveToOwedWitness();
+		const node = nodeHolding(setup.acceptor, refusingBarrier());
+		const channelId = setup.acceptor.getChannelId()!;
+
+		const result = node.provideV2ExternalWitness(
+			channelId,
+			Buffer.from(setup.extPrevTx.getHash()),
+			0,
+			signExternalInput(setup)
+		);
+		expect(result.sendsWithheld, 'nothing left').to.equal(true);
+		await new Promise((resolve) => setImmediate(resolve));
+
 		const pending = node.getPendingV2FundingTx(channelId)!;
 		expect(pending.filledExternalInputs).to.have.length(1);
 		expect(pending.sentTxSignatures).to.equal(false);
