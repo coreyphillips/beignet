@@ -6005,16 +6005,12 @@ export class Channel {
 
 		// A transaction with no outputs is consensus-invalid, so a plan built
 		// around one is not a close, it is a broadcast that will be rejected.
-		// The admission rules keep a channel out of that state (issues #386,
-		// #388); refusing here is the backstop that turns a silent failure at
-		// the network into an answer the caller can act on.
-		if (built.result.tx.outs.length === 0) {
-			return {
-				ok: false,
-				error:
-					'Cannot force close: every commitment output is below the dust limit'
-			};
-		}
+		// Judged only once the rebuilds below have been tried: reading an
+		// unstamped add as unsigned returns its amount to our balance, which
+		// can lift the trimmed output back over the dust limit, and a legacy
+		// row predates the send guard that keeps a channel out of this state
+		// (issues #386, #388).
+		const outputless = built.result.tx.outs.length === 0;
 
 		// option_taproot: our verification nonce is deterministic per height, so
 		// re-deriving it here reproduces the EXACT nonce the peer's stored
@@ -6031,13 +6027,15 @@ export class Channel {
 			: null;
 		if (localNonce) closing.localNonce = localNonce;
 
-		let witnessed = this._witnessForceCloseCommitment(
-			closing,
-			built,
-			signer,
-			perCommitmentPoint,
-			localNonce
-		);
+		let witnessed = outputless
+			? null
+			: this._witnessForceCloseCommitment(
+					closing,
+					built,
+					signer,
+					perCommitmentPoint,
+					localNonce
+			  );
 
 		if (!witnessed) {
 			// The rebuild reconstructs what the peer signed from flags on our own
@@ -6069,14 +6067,15 @@ export class Channel {
 		}
 
 		if (!witnessed) {
-			// Neither rebuild is the one the stored signature covers, so the
-			// funding witness would be invalid: the transaction relays nowhere,
-			// nothing confirms, and the caller would have been told its channel
-			// force closed. An answer it can act on beats a silent dead end.
+			// No rebuild is both broadcastable and covered by the stored
+			// signature, so the close would relay nowhere while the caller was
+			// told its channel force closed. An answer it can act on beats a
+			// silent dead end.
 			return {
 				ok: false,
-				error:
-					'Cannot force close: the stored peer signature does not cover the commitment we would broadcast'
+				error: outputless
+					? 'Cannot force close: every commitment output is below the dust limit'
+					: 'Cannot force close: the stored peer signature does not cover the commitment we would broadcast'
 			};
 		}
 

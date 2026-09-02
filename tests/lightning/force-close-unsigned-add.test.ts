@@ -32,7 +32,12 @@ import {
 import { createFundingScript } from '../../src/lightning/script/funding';
 import { createTaprootFundingScript } from '../../src/lightning/script/funding-taproot';
 import { taprootCommitmentSighash } from '../../src/lightning/channel/commitment-musig';
-import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
+import {
+	IChannelBasepoints,
+	perCommitmentPointFromSecret
+} from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
 
@@ -540,6 +545,66 @@ describe('The force-close rebuild and an unsigned add (issue #643)', function ()
 		).to.equal(true);
 		alice.destroy();
 		bob.destroy();
+	});
+
+	it('rebuilds when the default reading trims every output (issue #657)', function () {
+		// The dust refusal judges the DEFAULT reading, and legacy code had no
+		// send guard against an add that trims every output. On those rows the
+		// reading the signature covers can be the one that still has an output,
+		// so refusing before the candidates leaves a closeable channel with no
+		// unilateral exit.
+		const f = stalledAdd(720, { signsTheAdd: false });
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const manager = f.alice.getChannelManager() as any;
+		const state = manager.getChannel(f.channelId).getFullState();
+		// Legacy, because anchor outputs would survive the trimming regardless.
+		state.channelType = null;
+		state.fundingSatoshis = 2_500n;
+		state.localConfig.dustLimitSatoshis = 1_062n;
+		state.localConfig.feeratePerKw = 253;
+		state.remoteConfig.feeratePerKw = 253;
+		state.lastSignedCommitFeeratePerKw = 253;
+		state.localBalanceMsat = 1_062_000n;
+		state.remoteBalanceMsat = 638_000n;
+		f.entry.amountMsat = 800_000n;
+
+		// Bob's stored signature covers the unsigned reading, where the add's
+		// amount is still ours and lifts our output back over the dust limit.
+		f.entry.addRemoteSigned = false;
+		const built = buildLocalCommitment(
+			state,
+			perCommitmentPointFromSecret(
+				generateFromSeed(
+					state.localPerCommitmentSeed,
+					MAX_INDEX - state.localCommitmentNumber
+				)
+			),
+			undefined,
+			true
+		);
+		expect(
+			built.result.tx.outs,
+			'the unsigned reading has an output'
+		).to.have.length(1);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const bobManager = f.bob.getChannelManager() as any;
+		state.remoteCommitmentSignature = bobManager
+			.signerFor(bobManager.getChannel(f.channelId), true)
+			.signCommitmentTx(
+				built.result.tx,
+				built.fundingWitnessScript,
+				built.fundingAmount
+			);
+		delete f.entry.addRemoteSigned;
+
+		const tx = plannedCommitment(f.alice, f.channelId);
+
+		expect(tx.outs, 'the close keeps that output').to.have.length(1);
+		expect(
+			peerSigned(f.alice, f.channelId, tx),
+			'the stored remote signature covers what we broadcast'
+		).to.equal(true);
+		f.destroy();
 	});
 
 	it('refuses a close no rebuild the signature covers (issue #657)', function () {
