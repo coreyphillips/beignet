@@ -550,6 +550,20 @@ export class DirectFundingReceiver extends EventEmitter {
 		const { funding } = held;
 		const channelId = Buffer.from(funding.channelId, 'hex');
 		const isSplice = funding.splice;
+		// The witness may be answering a funding that is already finished: what
+		// the crash cost was the receipt, not the delivery (issue #658).
+		const settled = await this.completedFundingTxid(funding, channelId);
+		if (settled) {
+			this.settleCompletedFunding(
+				frame.reply,
+				keys,
+				record,
+				witness.offerId,
+				funding,
+				settled
+			);
+			return;
+		}
 		const final = await this.resumedFinalTx(funding, channelId);
 		if (!final) {
 			this.log(DF_LOG_OFFER_FAILED, {
@@ -1020,12 +1034,27 @@ export class DirectFundingReceiver extends EventEmitter {
 			);
 			return;
 		}
+		const channelId = Buffer.from(funding.channelId, 'hex');
+		// A funding whose channel completed is answered with the receipt, not
+		// with a sign request for a transaction that is already the network's
+		// (issue #658).
+		const settled = await this.completedFundingTxid(funding, channelId);
+		if (settled) {
+			this.settleCompletedFunding(
+				frame.reply,
+				keys,
+				record,
+				offer.offerId,
+				funding,
+				settled
+			);
+			return;
+		}
 		// The transaction first, and no session until there is one. A channel
 		// that has not re-armed yet is a WAIT, not a verdict: recording a
 		// terminal session over it would answer every later re-send from the
 		// refusal, and the payer answers a decline by abandoning the payment the
 		// funding is still holding its coin for. Silence costs it one re-send.
-		const channelId = Buffer.from(funding.channelId, 'hex');
 		const final = await this.resumedFinalTx(funding, channelId);
 		if (!final) {
 			this.log(DF_LOG_OFFER_DROPPED, {
@@ -1209,7 +1238,13 @@ export class DirectFundingReceiver extends EventEmitter {
 				channelId: final.channelId.toString('hex'),
 				splice: isSplice,
 				contentHash: session.contentHash,
-				payerEphemeralKey: session.payerEphemeralKey.toString('hex')
+				payerEphemeralKey: session.payerEphemeralKey.toString('hex'),
+				// Written here rather than at the delivery it proves, because the
+				// delivery is the crash window: the channel retires its in-flight
+				// record in the same batch that releases our tx_signatures, and a
+				// txid recorded afterwards would be lost by exactly the crash it
+				// exists for (issue #658).
+				fundingTxid: final.fundingTxidDisplay.toString('hex')
 			},
 			session.expiresAt
 		);
@@ -1277,10 +1312,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		funding: IDfAttemptFunding,
 		channelId: Buffer
 	): Promise<IDfFinalTx | null> {
-		const pending = funding.splice
-			? this.deps.getPendingSpliceTx(channelId)
-			: this.deps.getPendingV2FundingTx(channelId);
-		const ready = this.finalTxFor(pending, channelId, funding.outpoint);
+		const ready = this.pendingFinalTx(funding, channelId);
 		if (ready) return ready;
 		const waiters = funding.splice ? this.spliceWaiters : this.v2Waiters;
 		// Whatever is already parked on this outpoint is shared rather than
@@ -1300,6 +1332,132 @@ export class DirectFundingReceiver extends EventEmitter {
 		} catch {
 			return null;
 		}
+	}
+
+	/** What the channel is holding for this funding right now, if anything. */
+	private pendingFinalTx(
+		funding: IDfAttemptFunding,
+		channelId: Buffer
+	): IDfFinalTx | null {
+		return this.finalTxFor(
+			funding.splice
+				? this.deps.getPendingSpliceTx(channelId)
+				: this.deps.getPendingV2FundingTx(channelId),
+			channelId,
+			funding.outpoint
+		);
+	}
+
+	/**
+	 * The funding transaction of an exchange that already completed, or null
+	 * (issue #658).
+	 *
+	 * A channel that reached channel_ready, or a splice that reached
+	 * splice_locked, has retired the in-flight record every other recovery path
+	 * reads, so a crash between the witness delivery and the receipt tombstone
+	 * leaves a payment that is made and nothing to answer the payer with. The
+	 * txid the funding recorded before the payer was asked to sign outlives
+	 * that; the chain is what turns it into evidence, and the evidence has to be
+	 * about the payer's own coin rather than about the channel, because the
+	 * receipt says a specific transaction spent it. A funding that was abandoned
+	 * rather than broadcast cannot produce that transaction, which is what keeps
+	 * a receipt from being revealed for a payment that never happened.
+	 */
+	private async completedFundingTxid(
+		funding: IDfAttemptFunding,
+		channelId: Buffer
+	): Promise<Buffer | null> {
+		// A channel still holding the record answers for itself, witness and all.
+		if (this.pendingFinalTx(funding, channelId)) return null;
+		const txidHex = funding.fundingTxid;
+		if (!txidHex) return null;
+		let tx: bitcoin.Transaction;
+		try {
+			tx = bitcoin.Transaction.fromBuffer(
+				await this.deps.chain.getTransaction(txidHex)
+			);
+		} catch {
+			return null;
+		}
+		// A backend answering with some other transaction would otherwise have us
+		// read the spend out of bytes nobody named.
+		if (tx.getId() !== txidHex) return null;
+		const [prevTxidHex, voutText] = funding.outpoint.split(':');
+		const prevHash = Buffer.from(prevTxidHex, 'hex').reverse();
+		const vout = Number(voutText);
+		const spends = tx.ins.some(
+			(input) =>
+				Buffer.from(input.hash).equals(prevHash) && input.index === vout
+		);
+		return spends ? Buffer.from(txidHex, 'hex') : null;
+	}
+
+	/**
+	 * Hand back the receipt a completed funding still owes, and tombstone the
+	 * request behind it (issue #658).
+	 *
+	 * The session path's own success minus the delivery, which already happened:
+	 * the coin is released, the request is marked paid against the transaction
+	 * the chain says spends it, and the receipt goes out on the lane the payer
+	 * came back on. The complete transaction is not part of it, which the
+	 * receipt's rawTx field is already optional for.
+	 */
+	private settleCompletedFunding(
+		reply: IDfLaneSender,
+		keys: IDfLaneKeys,
+		record: IDfRequestRecord,
+		offerId: Buffer,
+		funding: IDfAttemptFunding,
+		fundingTxid: Buffer
+	): void {
+		const offerIdHex = offerId.toString('hex');
+		this.state.release(funding.outpoint, offerIdHex);
+		// Tombstone before the receipt, as every other success path does: the
+		// payment is made, and a request that comes back looking unpaid is one a
+		// second offer could fund all over again. The write also clears the busy
+		// mark this request has been carrying since the crash.
+		try {
+			this.deps.requests.markReceiptRevealed(record.receiptHash, {
+				offerIdHex,
+				fundingTxidHex: fundingTxid.toString('hex')
+			});
+		} catch (err) {
+			this.log(DF_LOG_OFFER_FAILED, {
+				offerId: offerIdHex,
+				error: `receipt tombstone not persisted: ${errorText(err)}`
+			});
+		}
+		const receipt = encodeDfReceipt({
+			offerId,
+			preimage: Buffer.from(record.preimageHex, 'hex'),
+			fundingTxid
+		});
+		// A session for this offer is still driving this funding on a lane the
+		// payer stopped answering on. Settle it on the receipt for the reason the
+		// late-witness path does: left live it answers every later re-send with its
+		// own ACK and sign request, ahead of the paid-receipt replay.
+		const live = this.state.get(offerIdHex);
+		if (live) {
+			live.committed = true;
+			live.inflight = false;
+			live.terminal = true;
+			live.onWitness = undefined;
+			live.responses = [];
+			this.state.record(
+				live,
+				BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT,
+				receipt
+			);
+		}
+		this.emitSealed(
+			reply,
+			keys,
+			Buffer.from(record.requestId, 'hex'),
+			BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT,
+			receipt
+		);
+		this.log(DF_LOG_OFFER_COMPLETED, { offerId: offerIdHex });
+		this.emit('offer:completed', { offerId: offerIdHex });
 	}
 
 	/**
