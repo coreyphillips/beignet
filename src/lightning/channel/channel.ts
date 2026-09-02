@@ -16833,10 +16833,10 @@ export class Channel {
 			prevouts: this._spliceInputPrevouts(),
 			owedExternalInputs: outpointsOf(this._spliceOwedExternal()),
 			filledExternalInputs: outpointsOf(this._spliceFilledExternal()),
-			// From the durable record, which is written BEFORE the message goes:
-			// an in-memory release whose persist failed never left, and a reader
-			// treating it as final would answer for a signature the peer has not
-			// got and may never get.
+			// The record's flag rather than the in-memory `_spliceSentTxSigs`,
+			// because the record is what a restart restores. It is set as the
+			// batch is BUILT, so a reader asking whether the release reached the
+			// peer has to ask the dispatcher too (LightningNode.getPendingSpliceTx).
 			sentTxSignatures: this._state.spliceInFlight?.sentTxSignatures === true
 		};
 	}

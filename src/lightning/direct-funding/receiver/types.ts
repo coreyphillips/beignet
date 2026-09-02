@@ -152,9 +152,10 @@ export interface IDfPendingV2FundingTx {
 	 */
 	filledExternalInputs: IDfExternalInput[];
 	/**
-	 * Our tx_signatures released, as the DURABLE record has it. True is the
-	 * point the payer's coin is committed and its receipt becomes owed; a
-	 * witness taken while this is false is a delivery still in progress.
+	 * Our tx_signatures released, as the record has it, and not still parked
+	 * behind the durability barrier. True is the point the payer's coin is
+	 * committed and its receipt becomes owed; a witness taken while this is
+	 * false is a delivery still in progress.
 	 */
 	sentTxSignatures: boolean;
 }

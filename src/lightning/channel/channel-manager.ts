@@ -1834,7 +1834,7 @@ export class ChannelManager extends EventEmitter {
 			sendsWithheld:
 				progress.sendsWithheld ||
 				progress.sendsHeld ||
-				this._txSignaturesStillHeld(channel)
+				this.txSignaturesStillHeld(channel)
 		};
 	}
 
@@ -1896,7 +1896,7 @@ export class ChannelManager extends EventEmitter {
 			sendsWithheld:
 				progress.sendsWithheld ||
 				progress.sendsHeld ||
-				this._txSignaturesStillHeld(channel)
+				this.txSignaturesStillHeld(channel)
 		};
 	}
 
@@ -8486,8 +8486,13 @@ export class ChannelManager extends EventEmitter {
 	 * progress of its own. Reading that as a clean dispatch would tell a caller
 	 * holding an obligation to the input's owner that it was discharged by bytes
 	 * still sitting in the queue, which a refused release then drops.
+	 *
+	 * Public because a reader with no dispatch of its own asks it too: the
+	 * channel records the release when it BUILDS the batch, so anything reading
+	 * that record to decide whether the owner has been paid (issue #645) is
+	 * asking this same question.
 	 */
-	private _txSignaturesStillHeld(channel: Channel): boolean {
+	txSignaturesStillHeld(channel: Channel): boolean {
 		const channelIdHex = channel.getChannelId()?.toString('hex');
 		if (!channelIdHex) return false;
 		const queue = this.barrierQueues.get(channelIdHex);

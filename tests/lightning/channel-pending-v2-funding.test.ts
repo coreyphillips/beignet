@@ -26,6 +26,8 @@ import {
 	ISpliceWalletInput
 } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { Network } from '../../src/lightning/invoice/types';
 import {
 	createOpenerState,
 	createAcceptorState,
@@ -367,6 +369,33 @@ function heldQueueBarrier(): unknown {
 	};
 }
 
+/**
+ * A LightningNode whose manager holds the acceptor the same way managerHolding
+ * does, optionally in quorum mode with nothing released.
+ */
+function nodeHolding(acceptor: Channel, parked = false): LightningNode {
+	const seed = crypto.randomBytes(32);
+	const node = new LightningNode({
+		nodePrivateKey: crypto.randomBytes(32),
+		channelBasepoints: makeBasepoints(
+			getPublicKey(crypto.randomBytes(32)),
+			seed
+		),
+		perCommitmentSeed: seed,
+		fundingPrivkey: crypto.randomBytes(32),
+		network: Network.REGTEST
+	});
+	node.on('error', () => undefined);
+	node.on('node:error', () => undefined);
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const internals = (node as any).channelManager;
+	if (parked) internals.config.durabilityBarrier = heldQueueBarrier();
+	const tempHex = acceptor.getTemporaryChannelId().toString('hex');
+	internals.tempChannels.set(tempHex, acceptor);
+	internals.channelPeers.set(tempHex, getPublicKey(seed).toString('hex'));
+	return node;
+}
+
 // ─────────────── Tests ───────────────
 
 describe('Channel.getPendingV2FundingTx (issue #612)', () => {
@@ -566,6 +595,51 @@ describe('ChannelManager.provideV2ExternalWitness reporting (issue #612)', () =>
 		).to.have.length(0);
 		expect(retry.sendsWithheld).to.equal(true);
 		expect(sent).to.not.include(MessageType.TX_SIGNATURES);
+	});
+});
+
+describe('LightningNode.getPendingV2FundingTx release flag (issue #645)', () => {
+	/**
+	 * The channel marks the release as it BUILDS the batch, so recovery reading
+	 * that mark alone would hand over a receipt earned by tx_signatures the
+	 * barrier is still holding, and a refused release drops those outright.
+	 */
+	it('answers no release while the tx_signatures are parked', () => {
+		const setup = driveToOwedWitness();
+		const node = nodeHolding(setup.acceptor, true);
+		const channelId = setup.acceptor.getChannelId()!;
+
+		const result = node.provideV2ExternalWitness(
+			channelId,
+			Buffer.from(setup.extPrevTx.getHash()),
+			0,
+			signExternalInput(setup)
+		);
+		expect(result.sendsWithheld, 'nothing left').to.equal(true);
+		expect(
+			setup.acceptor.getPendingV2FundingTx()!.sentTxSignatures,
+			'the channel recorded the release'
+		).to.equal(true);
+		const pending = node.getPendingV2FundingTx(channelId)!;
+		expect(pending.filledExternalInputs).to.have.length(1);
+		expect(pending.sentTxSignatures).to.equal(false);
+	});
+
+	it('answers the release once the tx_signatures reach the wire', () => {
+		const setup = driveToOwedWitness();
+		const node = nodeHolding(setup.acceptor);
+		const channelId = setup.acceptor.getChannelId()!;
+
+		const result = node.provideV2ExternalWitness(
+			channelId,
+			Buffer.from(setup.extPrevTx.getHash()),
+			0,
+			signExternalInput(setup)
+		);
+		expect(result.sendsWithheld).to.equal(false);
+		expect(node.getPendingV2FundingTx(channelId)!.sentTxSignatures).to.equal(
+			true
+		);
 	});
 });
 
