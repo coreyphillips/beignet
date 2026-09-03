@@ -235,6 +235,39 @@ export interface InvoiceInfo {
  * present in a readback after posting `{minAmountSat}` alone, so this shape is
  * a contract until that app is updated under its own tracking issue.
  */
+/**
+ * GET /jit/status (issue #668): the JIT receive role as it stands. `lsp` is
+ * null when the role is off (BEIGNET_JIT_RECEIVE unset); the client ceilings
+ * apply either way.
+ */
+export interface JitStatusInfo {
+	/** Whether this node runs the LSP role (fronts channel funding for peers). */
+	enabled: boolean;
+	/** The most this node accepts from an LSP's quote for its own receives. */
+	client: { maxFlatFeeSat: number; maxFeePpm: number };
+	lsp: {
+		/** Opening fee deducted from a delivery. */
+		flatFeeSat: number;
+		feePpm: number;
+		/** Most fronted for one client, open or splice. */
+		maxClientFundingSats: number;
+		/** Fundings (opens plus splices) allowed in flight at once. */
+		maxConcurrentFundings: number;
+		/** Lifetime budget across restarts; null means none. */
+		maxTotalFundingSats: number | null;
+		maxLiveIntentsPerPeer: number;
+		maxLiveIntents: number;
+		/** Sats a live funding has claimed against the budget right now. */
+		reservedSats: number;
+		/** Cumulative sats fronted, across restarts. */
+		frontedSats: number;
+		liveIntents: number;
+		/** HTLCs held while a funding runs. */
+		heldParts: number;
+		fundingsInFlight: number;
+	} | null;
+}
+
 export interface DirectFundingConfigInfo {
 	/** The liquidity peer every direct-funded channel is negotiated with. */
 	lspPubkey: string | null;

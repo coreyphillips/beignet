@@ -144,6 +144,31 @@ describe('JIT receive daemon surface', function () {
 	// Issue #665: the exposure caps reach the LSP engine as the bigint and
 	// count the library keeps, so what the operator wrote is what bounds
 	// the coins this node fronts.
+	// Issue #668: an operator who turned the role on could otherwise only
+	// guess at the exposure. The readback reports the caps as configured and
+	// what is committed right now.
+	it('GET /jit/status reports the role, its caps and its exposure', () => {
+		const status = daemon.node.getJitStatus();
+		expect(status.enabled).to.equal(true);
+		expect(status.client).to.deep.equal({
+			maxFlatFeeSat: 250,
+			maxFeePpm: 3_000
+		});
+		expect(status.lsp).to.include({
+			flatFeeSat: 100,
+			feePpm: 2_000,
+			maxClientFundingSats: 400_000,
+			maxConcurrentFundings: 2,
+			maxTotalFundingSats: 5_000_000,
+			reservedSats: 0,
+			frontedSats: 0,
+			liveIntents: 0,
+			heldParts: 0,
+			fundingsInFlight: 0
+		});
+		expect(status.lsp!.maxLiveIntentsPerPeer).to.be.a('number');
+	});
+
 	it('threads the exposure caps into the LSP engine', () => {
 		const inner = (daemon.node as unknown as { node: LightningNode }).node;
 		const manager = inner.getJitReceiveManager() as unknown as {
@@ -261,6 +286,20 @@ describe('JIT receive daemon surface', function () {
 		expect(jitInvoiceError(fault)).to.equal(fault);
 		expect(statusForErrorCode('JIT_REFUSED')).to.equal(400);
 		expect(statusForErrorCode('JIT_TIMEOUT')).to.equal(504);
+	});
+
+	it('GET /jit/status answers lsp null when the role is off', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-jit-off-'));
+		const off = await startDaemon({ ...OFFLINE, dataDir: dir });
+		try {
+			const status = off.node.getJitStatus();
+			expect(status.enabled).to.equal(false);
+			expect(status.lsp).to.equal(null);
+			expect(status.client.maxFlatFeeSat).to.equal(10_000);
+		} finally {
+			await off.stop();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it('dispatches POST /jit/invoice and requires the LSP pubkey', async () => {

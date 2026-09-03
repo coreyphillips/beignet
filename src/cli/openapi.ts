@@ -2167,6 +2167,19 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/jit/status': {
+				get: {
+					summary:
+						'The JIT receive role as it stands: whether this node fronts channel funding for peers, the opening fee it charges, the exposure caps that bound what it fronts (per client, in flight at once, lifetime), and what is committed right now (sats reserved by live fundings, sats fronted so far, live intents, held HTLCs). The client ceilings on what an LSP may quote this node apply whether or not the role is on. Readonly scope',
+					tags: ['Invoices'],
+					responses: {
+						'200': {
+							description: 'The role, or lsp null when it is off',
+							content: jsonContent({ $ref: '#/components/schemas/JitStatus' })
+						}
+					}
+				}
+			},
 			'/events': {
 				get: {
 					summary:
@@ -3442,6 +3455,37 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						description: { type: 'string' },
 						expiry: { type: 'integer' },
 						createdAt: { type: 'integer' }
+					}
+				},
+				JitStatus: {
+					type: 'object',
+					properties: {
+						enabled: { type: 'boolean' },
+						client: {
+							type: 'object',
+							properties: {
+								maxFlatFeeSat: { type: 'integer' },
+								maxFeePpm: { type: 'integer' }
+							}
+						},
+						lsp: {
+							type: 'object',
+							nullable: true,
+							properties: {
+								flatFeeSat: { type: 'integer' },
+								feePpm: { type: 'integer' },
+								maxClientFundingSats: { type: 'integer' },
+								maxConcurrentFundings: { type: 'integer' },
+								maxTotalFundingSats: { type: 'integer', nullable: true },
+								maxLiveIntentsPerPeer: { type: 'integer' },
+								maxLiveIntents: { type: 'integer' },
+								reservedSats: { type: 'integer' },
+								frontedSats: { type: 'integer' },
+								liveIntents: { type: 'integer' },
+								heldParts: { type: 'integer' },
+								fundingsInFlight: { type: 'integer' }
+							}
+						}
 					}
 				},
 				DirectFundingConfig: {

@@ -251,6 +251,8 @@ async function main(): Promise<void> {
 			return handleChannel();
 		case 'invoice':
 			return handleInvoice();
+		case 'jit':
+			return handleJit();
 		case 'payment':
 			return handlePayment();
 		case 'keysend':
@@ -1107,6 +1109,20 @@ async function handleChannel(): Promise<void> {
 					message:
 						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|rebroadcast-close|funding-quote|splice-quote|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
 				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleJit(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'status':
+			return outputResult(await httpRequest('GET', '/jit/status'));
+		default:
+			output({
+				ok: false,
+				error: { code: 'INVALID_PARAMS', message: 'Usage: beignet jit status' }
 			});
 			process.exitCode = 1;
 	}
@@ -2726,6 +2742,9 @@ Invoices & Payments:
                                          Create an invoice payable with no
                                          channel: the LSP funds one mid-payment
                                          and skims the agreed opening fee
+  jit status                             The JIT receive role as it stands:
+                                         fee, exposure caps, sats reserved and
+                                         fronted, live intents
   invoice create-hold <hash> [sats] [description] [--expiry secs]
                                          Create hold invoice for a payment hash
                                          you supply (keep the preimage; HTLCs

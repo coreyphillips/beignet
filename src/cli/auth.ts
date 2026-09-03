@@ -182,6 +182,8 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	// LSP's, out of the LSP's coins, and the fee it authorizes is bounded by
 	// the node's own configured ceilings, not by the caller's.
 	'POST /jit/invoice': ['invoice'],
+	// Role readback, no secrets in it: fees, caps, sats reserved and fronted.
+	'GET /jit/status': ['readonly'],
 	// Mints a receipt secret and hands out a payable artifact. It moves no
 	// money: the same shape as POST /invoice/create and POST /jit/invoice.
 	// Its two siblings are admin by ABSENCE, deliberately: configure sets the
