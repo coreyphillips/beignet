@@ -256,7 +256,8 @@ describe('Phase 4: Chain Watcher', () => {
 
 			watcher = new ChainWatcher({
 				backend,
-				channelManager
+				channelManager,
+				missingDebounceMs: 0
 			});
 		});
 
@@ -316,7 +317,8 @@ describe('Phase 4: Chain Watcher', () => {
 
 			watcher = new ChainWatcher({
 				backend,
-				channelManager
+				channelManager,
+				missingDebounceMs: 0
 			});
 			await watcher.start();
 		});
@@ -658,7 +660,11 @@ describe('Phase 4: Chain Watcher', () => {
 				localFundingPrivkey: crypto.randomBytes(32)
 			});
 			channelManager.on('error', () => {});
-			const watcher = new ChainWatcher({ backend, channelManager });
+			const watcher = new ChainWatcher({
+				backend,
+				channelManager,
+				missingDebounceMs: 0
+			});
 			watcher.on('error', () => {});
 
 			const channelId = crypto.randomBytes(32);
@@ -735,7 +741,11 @@ describe('Phase 4: Chain Watcher', () => {
 				localFundingPrivkey: crypto.randomBytes(32)
 			});
 			channelManager.on('error', () => {});
-			const watcher = new ChainWatcher({ backend, channelManager });
+			const watcher = new ChainWatcher({
+				backend,
+				channelManager,
+				missingDebounceMs: 0
+			});
 			watcher.on('error', () => {});
 			const recovered: string[] = [];
 			watcher.on('funding:recovered', (_id: Buffer, txid: string) =>
@@ -840,7 +850,11 @@ describe('Phase 4: Chain Watcher', () => {
 				localFundingPrivkey: crypto.randomBytes(32)
 			});
 			channelManager.on('error', () => {});
-			const watcher = new ChainWatcher({ backend, channelManager });
+			const watcher = new ChainWatcher({
+				backend,
+				channelManager,
+				missingDebounceMs: 0
+			});
 			watcher.on('error', () => {});
 
 			const channelId = crypto.randomBytes(32);
@@ -938,7 +952,8 @@ describe('Phase 4: Chain Watcher', () => {
 
 			watcher = new ChainWatcher({
 				backend,
-				channelManager
+				channelManager,
+				missingDebounceMs: 0
 			});
 			await watcher.start();
 		});
@@ -1031,7 +1046,11 @@ describe('Phase 4: Chain Watcher', () => {
 					feeRatePerVbyte
 				);
 			};
-			watcher = new ChainWatcher({ backend, channelManager });
+			watcher = new ChainWatcher({
+				backend,
+				channelManager,
+				missingDebounceMs: 0
+			});
 			spends = [];
 			watcher.on('funding:spent', (cid: Buffer) => spends.push(cid));
 			await watcher.start();
@@ -1281,7 +1300,11 @@ describe('Phase 4: Chain Watcher', () => {
 					feeRatePerVbyte
 				);
 			};
-			watcher = new ChainWatcher({ backend, channelManager });
+			watcher = new ChainWatcher({
+				backend,
+				channelManager,
+				missingDebounceMs: 0
+			});
 			watcher.on('error', () => {});
 			spends = [];
 			watcher.on('funding:spent', (cid: Buffer) => spends.push(cid));
@@ -2144,7 +2167,8 @@ describe('Phase 4: Chain Watcher', () => {
 
 			watcher = new ChainWatcher({
 				backend,
-				channelManager
+				channelManager,
+				missingDebounceMs: 0
 			});
 			await watcher.start();
 		});
@@ -2203,7 +2227,8 @@ describe('Phase 4: Chain Watcher', () => {
 
 			watcher = new ChainWatcher({
 				backend,
-				channelManager
+				channelManager,
+				missingDebounceMs: 0
 			});
 			await watcher.start();
 		});
@@ -2253,7 +2278,8 @@ describe('Phase 4: Chain Watcher', () => {
 
 			watcher = new ChainWatcher({
 				backend,
-				channelManager
+				channelManager,
+				missingDebounceMs: 0
 			});
 			await watcher.start();
 		});
