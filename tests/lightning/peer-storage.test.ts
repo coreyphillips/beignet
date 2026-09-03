@@ -612,6 +612,10 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 				mnemonic,
 				networkName: 'regtest',
 				log: (): void => {},
+				// A candidate capsule is announced (recovery:capsule-retrieved)
+				// and offered to the auto-apply window; neither matters here.
+				emit: (): boolean => true,
+				noteCapsuleForAutoApply: (): void => {},
 				_peerRetrievedScb: null,
 				_peerRetrievedCapsules: new Map(),
 				recoveryGuardianSet: [],
