@@ -266,6 +266,11 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// when waiting genuinely changes the answer.
 	CONNECT_FAILED: 502,
 	CONNECT_TIMEOUT: 504,
+	// JIT receive (issue #671): a refusal is the LSP's or the wallet's own
+	// policy, answered with the reason so the user can act on it; a silent
+	// LSP is upstream trouble, retryable.
+	JIT_REFUSED: 400,
+	JIT_TIMEOUT: 504,
 	PAYMENT_FAILED: 502,
 	PAYMENT_TIMEOUT: 504,
 	NO_ROUTE: 502,

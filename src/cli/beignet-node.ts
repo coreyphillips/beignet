@@ -1198,6 +1198,34 @@ export function jitReceiveRefusal(value: unknown): string | null {
 }
 
 /**
+ * The typed refusal a JIT receive request resolves to (issue #671). The
+ * wallet side of the protocol throws plain Errors for the LSP's decline, a
+ * quote above the configured ceiling, an ack with no intercept scid, the
+ * ack window elapsing and a peer that is not connected; over the daemon a
+ * plain Error is scrubbed to INTERNAL_ERROR, so the user saw "Internal
+ * server error" on what is an ordinary policy refusal. Anything not
+ * recognised here stays untyped and is still scrubbed, as a fault should be.
+ */
+export function jitInvoiceError(err: unknown): unknown {
+	if (err instanceof BeignetError) return err;
+	const message = err instanceof Error ? err.message : String(err);
+	if (
+		/^LSP declined the JIT receive intent|above the accepted maximum|without an intercept scid/.test(
+			message
+		)
+	) {
+		return new BeignetError(BeignetErrorCode.JIT_REFUSED, message);
+	}
+	if (/timed out waiting for the LSP/.test(message)) {
+		return new BeignetError(BeignetErrorCode.JIT_TIMEOUT, message);
+	}
+	if (/^Not connected to peer/.test(message)) {
+		return new BeignetError(BeignetErrorCode.PEER_NOT_CONNECTED, message);
+	}
+	return err;
+}
+
+/**
  * A 32-byte channel id as hex. Buffer.from(x, 'hex') silently truncates at the
  * first non-hex character, so an unchecked id reaches the engine as a short
  * buffer and reads as a malformed-argument fault rather than a bad request.
@@ -5536,33 +5564,41 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
-		const result = await this.node.createJitInvoice({
-			lspPubkeyHex: opts.lspPubkey,
-			amountMsat,
-			description: opts.description || '',
-			...(opts.expirySecs !== undefined ? { expiry: opts.expirySecs } : {}),
-			targetRemainingInboundSat: BigInt(
-				requireNonNegativeSafeInteger(
-					opts.targetRemainingInboundSat ?? 0,
-					'targetRemainingInboundSat'
-				)
-			),
-			...(opts.maxFlatFeeSat !== undefined
-				? {
-						maxFlatFeeSat: BigInt(
-							requireNonNegativeSafeInteger(opts.maxFlatFeeSat, 'maxFlatFeeSat')
-						)
-				  }
-				: {}),
-			...(opts.maxFeePpm !== undefined
-				? {
-						maxFeePpm: requireNonNegativeSafeInteger(
-							opts.maxFeePpm,
-							'maxFeePpm'
-						)
-				  }
-				: {})
-		});
+		let result: Awaited<ReturnType<typeof this.node.createJitInvoice>>;
+		try {
+			result = await this.node.createJitInvoice({
+				lspPubkeyHex: opts.lspPubkey,
+				amountMsat,
+				description: opts.description || '',
+				...(opts.expirySecs !== undefined ? { expiry: opts.expirySecs } : {}),
+				targetRemainingInboundSat: BigInt(
+					requireNonNegativeSafeInteger(
+						opts.targetRemainingInboundSat ?? 0,
+						'targetRemainingInboundSat'
+					)
+				),
+				...(opts.maxFlatFeeSat !== undefined
+					? {
+							maxFlatFeeSat: BigInt(
+								requireNonNegativeSafeInteger(
+									opts.maxFlatFeeSat,
+									'maxFlatFeeSat'
+								)
+							)
+					  }
+					: {}),
+				...(opts.maxFeePpm !== undefined
+					? {
+							maxFeePpm: requireNonNegativeSafeInteger(
+								opts.maxFeePpm,
+								'maxFeePpm'
+							)
+					  }
+					: {})
+			});
+		} catch (err) {
+			throw jitInvoiceError(err);
+		}
 		const info: InvoiceInfo & { flatFeeSat: number; feePpm: number } = {
 			bolt11: result.bolt11,
 			paymentHash: result.paymentHash.toString('hex'),
