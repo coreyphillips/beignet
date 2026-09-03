@@ -1199,6 +1199,26 @@ export function jitReceiveRefusal(value: unknown): string | null {
 }
 
 /**
+ * An engine event payload made safe for JSON.stringify: bigints become
+ * decimal strings, Buffers hex, nested objects and arrays walked. Everything
+ * else passes through. Used for the JIT and direct-funding progress events
+ * (issue #669), whose engines carry satoshi and millisatoshi bigints.
+ */
+export function jsonSafeEvent(value: unknown): unknown {
+	if (typeof value === 'bigint') return value.toString();
+	if (Buffer.isBuffer(value)) return value.toString('hex');
+	if (Array.isArray(value)) return value.map(jsonSafeEvent);
+	if (value && typeof value === 'object') {
+		const out: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+			if (v !== undefined) out[k] = jsonSafeEvent(v);
+		}
+		return out;
+	}
+	return value;
+}
+
+/**
  * The typed refusal a JIT receive request resolves to (issue #671). The
  * wallet side of the protocol throws plain Errors for the LSP's decline, a
  * quote above the configured ceiling, an ack with no intercept scid, the
@@ -2354,6 +2374,26 @@ export class BeignetNode extends EventEmitter {
 			this.log('info', 'Node ready');
 			this.emit('node:ready');
 		});
+
+		// JIT receive (LSP side) and direct funding (receiver side) progress
+		// (issue #669), relayed JSON-safe: the engines carry bigints, and a
+		// frame is JSON.stringify'd on its way to SSE and webhooks.
+		for (const evt of [
+			'jit:intent',
+			'jit:intent-superseded',
+			'jit:intercepted',
+			'jit:funding',
+			'jit:forwarded',
+			'jit:failed',
+			'direct-funding:offer:accepted',
+			'direct-funding:offer:declined',
+			'direct-funding:offer:failed',
+			'direct-funding:offer:completed'
+		] as const) {
+			this.node.on(evt, (data: unknown) => {
+				this.emit(evt, jsonSafeEvent(data) as never);
+			});
+		}
 
 		// Recovery Protocol events (docs/RECOVERY-PROTOCOL.md section 8),
 		// relayed with JSON-safe payloads. recovery:guardian_unreachable and

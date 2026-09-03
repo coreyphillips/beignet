@@ -452,7 +452,23 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'recovery:reestablish-held',
 		'recovery:guardian_unreachable',
 		'recovery:restore-progress',
-		'recovery:restored'
+		'recovery:restored',
+		// JIT receive, LSP side (issue #669): the progress of a funding this
+		// node fronts for a wallet, from the intent it accepted to the parts it
+		// forwarded. Low volume (one intent, one funding, one forward per
+		// receive) and the only way a dashboard can follow it without polling.
+		'jit:intent',
+		'jit:intent-superseded',
+		'jit:intercepted',
+		'jit:funding',
+		'jit:forwarded',
+		'jit:failed',
+		// Direct funding, receiver side: an offer accepted (paired or not),
+		// declined, failed, or completed with the funding out.
+		'direct-funding:offer:accepted',
+		'direct-funding:offer:declined',
+		'direct-funding:offer:failed',
+		'direct-funding:offer:completed'
 	];
 	if (htlcEvents === true) {
 		events.push('htlc:forwarded', 'htlc:fulfilled', 'htlc:failed');
