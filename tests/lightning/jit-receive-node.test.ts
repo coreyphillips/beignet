@@ -323,6 +323,60 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		expect(forwards[0].equals(channels[0].channelId)).to.equal(true);
 	});
 
+	// Issue #687: the price belongs before the decision to create an invoice.
+	it('answers a quote without registering an intent', async function () {
+		const pair = nodePair({
+			jitReceive: {
+				enabled: true,
+				fundingBufferSats: 10_000n,
+				flatFeeSat: 100n,
+				feePpm: 2_000
+			}
+		});
+		open.push(pair);
+		const { alice, bob } = pair;
+		const quote = await bob.requestJitQuote(alice.getNodeId(), {
+			maxAmountMsat: 2_000_000n,
+			targetRemainingInboundSat: 25_000n
+		});
+		expect(quote.accepted).to.equal(true);
+		expect(quote.flatFeeSat).to.equal(100n);
+		expect(quote.feePpm).to.equal(2_000);
+		// 100 sat flat + 2000 ppm of 2000 sat = 104 sat.
+		expect(quote.feeSats).to.equal(104n);
+		// 2000 sat + 25000 target inbound + 10000 buffer, the open's own sizing.
+		expect(quote.fundingSats).to.equal(37_000n);
+		expect(quote.withinCeilings).to.equal(true);
+		expect(alice.getJitReceiveManager()!.listIntents()).to.have.length(0);
+		expect(alice.listChannels()).to.have.length(0);
+	});
+
+	it('declines a quote the LSP cannot front from its on-chain funds', async function () {
+		const pair = nodePair({
+			fundingProvider: {
+				...fundingProvider(),
+				quoteSpliceIn: () => ({
+					spendableSats: 12_000n,
+					feeSats: 2_000n,
+					maxAmountSats: 10_000n,
+					inputCount: 1
+				})
+			} as IFundingProvider
+		});
+		open.push(pair);
+		const { alice, bob } = pair;
+		const quote = await bob.requestJitQuote(alice.getNodeId(), {
+			maxAmountMsat: 2_000_000n,
+			targetRemainingInboundSat: 25_000n
+		});
+		expect(quote.accepted).to.equal(false);
+		expect(quote.reason).to.equal(
+			'the provider does not hold enough on-chain funds to front this receive right now'
+		);
+		expect(quote.fundingSats).to.equal(0n);
+		expect(alice.getJitReceiveManager()!.listIntents()).to.have.length(0);
+	});
+
 	it('holds for a splice when the add onto a JIT client channel is refused', async function () {
 		const pair = nodePair();
 		open.push(pair);

@@ -1474,6 +1474,25 @@ async function bootDaemon(
 		// is committed right now. An operator who turned the role on could
 		// otherwise only guess at the exposure.
 		'GET /jit/status': () => success(node.getJitStatus()),
+		// The price of a JIT receive BEFORE the invoice exists (issue #687):
+		// asks the LSP over the custom message type and registers nothing.
+		// The LSP's decline is an answer (accepted false, reason); only the
+		// transport failures are errors.
+		'GET /jit/quote': async (_body, query) => {
+			const lspPubkey = query.get('lspPubkey');
+			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
+			return success(
+				await node.getJitQuote({
+					lspPubkey,
+					amountSats: parseIntParam(query, 'amountSats', { min: 0 }),
+					targetRemainingInboundSat: parseIntParam(
+						query,
+						'targetRemainingInboundSat',
+						{ min: 0 }
+					)
+				})
+			);
+		},
 		// ── Third-party direct funding (issue #613) ──
 		//
 		// A payer's ordinary on-chain payment becomes this node's channel

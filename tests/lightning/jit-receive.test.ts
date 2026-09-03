@@ -15,13 +15,18 @@ import {
 	IJitManagerDeps,
 	IJitReceiveAuthorization,
 	IJitReceiveConfig,
+	IJitReceiveQuoteRequest,
 	IPersistedHeldPart,
 	JIT_INTERCEPT_SCID_BLOCK,
 	JitReceiveManager,
 	decodeJitAck,
 	decodeJitAuthorization,
+	decodeJitQuote,
+	decodeJitQuoteRequest,
 	encodeJitAck,
 	encodeJitAuthorization,
+	encodeJitQuote,
+	encodeJitQuoteRequest,
 	mintInterceptScid
 } from '../../src/lightning/liquidity/jit-receive';
 import {
@@ -58,6 +63,8 @@ interface IHarness {
 	/** Set false to make every upstream failure refuse (a reestablishing channel). */
 	failsDeliver: { value: boolean };
 	storageWrites: { failKeys: Set<string> };
+	/** What the node could front on-chain right now; null = no figure. */
+	fundable: { value: bigint | null };
 }
 
 function makeHarness(
@@ -81,7 +88,8 @@ function makeHarness(
 		scidInUse: { fn: (): boolean => false },
 		channelPeer: { fn: (): string | null => CLIENT },
 		failsDeliver: { value: true },
-		storageWrites: { failKeys: new Set<string>() }
+		storageWrites: { failKeys: new Set<string>() },
+		fundable: { value: null }
 	};
 
 	const deps: IJitManagerDeps = {
@@ -106,6 +114,7 @@ function makeHarness(
 			h.splices.push({ channelId: channelId.toString('hex'), amountSats });
 			return h.spliceResult.fn(amountSats);
 		},
+		maxFundableSats: () => h.fundable.value,
 		storage: {
 			saveMetadata: (k, v) => {
 				if (h.storageWrites.failKeys.has(k)) {
@@ -166,6 +175,17 @@ function auth(
 		maxAmountMsat: 100_000_000n,
 		targetRemainingInboundSat: 50_000n,
 		expirySeconds: 600,
+		...overrides
+	};
+}
+
+function quoteReq(
+	overrides: Partial<IJitReceiveQuoteRequest> = {}
+): IJitReceiveQuoteRequest {
+	return {
+		requestId: crypto.randomBytes(8),
+		maxAmountMsat: 100_000_000n,
+		targetRemainingInboundSat: 50_000n,
 		...overrides
 	};
 }
@@ -250,6 +270,64 @@ describe('JIT receive wire payloads', function () {
 		});
 		// A silently truncated reason reads as a legitimate (wrong) message.
 		expect(() => decodeJitAck(ack.subarray(0, ack.length - 2))).to.throw(
+			/runs past the payload/
+		);
+	});
+});
+
+// ── Quote wire payloads (issue #687) ───────────────────────────────
+
+describe('JIT quote wire payloads', function () {
+	it('round-trips a quote request and a quote including its reason', function () {
+		const req = quoteReq();
+		const back = decodeJitQuoteRequest(encodeJitQuoteRequest(req));
+		expect(back.requestId.equals(req.requestId)).to.equal(true);
+		expect(back.maxAmountMsat).to.equal(100_000_000n);
+		expect(back.targetRemainingInboundSat).to.equal(50_000n);
+
+		const quote = {
+			requestId: req.requestId,
+			accepted: false,
+			flatFeeSat: 1_000n,
+			feePpm: 2_500,
+			maxClientFundingSats: 400_000n,
+			fundingSats: 0n,
+			reason: 'the provider funds at most 400000 sats for one receive'
+		};
+		const q = decodeJitQuote(encodeJitQuote(quote));
+		expect(q.requestId.equals(req.requestId)).to.equal(true);
+		expect(q.accepted).to.equal(false);
+		expect(q.flatFeeSat).to.equal(1_000n);
+		expect(q.feePpm).to.equal(2_500);
+		expect(q.maxClientFundingSats).to.equal(400_000n);
+		expect(q.fundingSats).to.equal(0n);
+		expect(q.reason).to.equal(quote.reason);
+
+		const accepted = decodeJitQuote(
+			encodeJitQuote({
+				...quote,
+				accepted: true,
+				fundingSats: 160_000n,
+				reason: undefined
+			})
+		);
+		expect(accepted.accepted).to.equal(true);
+		expect(accepted.fundingSats).to.equal(160_000n);
+		expect(accepted.reason).to.equal(undefined);
+	});
+
+	it('refuses a truncated request and a quote whose reason runs past the payload', function () {
+		expect(() => decodeJitQuoteRequest(Buffer.alloc(23))).to.throw(/too short/);
+		const quote = encodeJitQuote({
+			requestId: Buffer.alloc(8),
+			accepted: true,
+			flatFeeSat: 0n,
+			feePpm: 0,
+			maxClientFundingSats: 0n,
+			fundingSats: 0n,
+			reason: 'hello'
+		});
+		expect(() => decodeJitQuote(quote.subarray(0, quote.length - 2))).to.throw(
 			/runs past the payload/
 		);
 	});
@@ -412,6 +490,141 @@ describe('JIT intent registration', function () {
 });
 
 // ── Interception ───────────────────────────────────────────────────
+
+// ── Quotes (issue #687) ────────────────────────────────────────────
+
+describe('JIT quote', function () {
+	it('prices a receive without registering anything', function () {
+		const h = makeHarness({
+			flatFeeSat: 500n,
+			feePpm: 1_000,
+			fundingBufferSats: 10_000n
+		});
+		const events: string[] = [];
+		h.manager.on('jit:intent', () => events.push('jit:intent'));
+		const req = quoteReq({
+			maxAmountMsat: 2_000_500n,
+			targetRemainingInboundSat: 25_000n
+		});
+		const q = h.manager.quote(CLIENT, req);
+		expect(q.accepted).to.equal(true);
+		expect(q.requestId.equals(req.requestId)).to.equal(true);
+		expect(q.flatFeeSat).to.equal(500n);
+		expect(q.feePpm).to.equal(1_000);
+		expect(q.maxClientFundingSats).to.equal(1_000_000n);
+		// ceil(2000.5) + 25000 target + 10000 buffer: the open path's formula.
+		expect(q.fundingSats).to.equal(37_001n);
+		expect(q.reason).to.equal(undefined);
+		expect(h.manager.listIntents()).to.have.length(0);
+		expect(h.jitClients).to.deep.equal([]);
+		expect(events).to.deep.equal([]);
+		expect(h.metadata.has('jit:intents')).to.equal(false);
+	});
+
+	it('reports the clamped funding and refuses past the per-client cap', function () {
+		const h = makeHarness({
+			maxClientFundingSats: 30_000n,
+			fundingBufferSats: 10_000n
+		});
+		const clamped = h.manager.quote(
+			CLIENT,
+			quoteReq({
+				maxAmountMsat: 20_000_000n,
+				targetRemainingInboundSat: 500_000n
+			})
+		);
+		expect(clamped.accepted).to.equal(true);
+		expect(clamped.fundingSats).to.equal(30_000n);
+		const over = h.manager.quote(
+			CLIENT,
+			quoteReq({ maxAmountMsat: 40_000_000n })
+		);
+		expect(over.accepted).to.equal(false);
+		expect(over.reason).to.equal(
+			'the provider funds at most 30000 sats for one receive'
+		);
+		expect(over.fundingSats).to.equal(0n);
+		expect(over.flatFeeSat, 'the fee still rides a refusal').to.equal(0n);
+		expect(over.maxClientFundingSats).to.equal(30_000n);
+	});
+
+	it('refuses a zero amount', function () {
+		const h = makeHarness();
+		const q = h.manager.quote(CLIENT, quoteReq({ maxAmountMsat: 0n }));
+		expect(q.accepted).to.equal(false);
+		expect(q.reason).to.equal('the amount must be positive');
+	});
+
+	it('ignores idle intents the next registration would retire', function () {
+		// Issue #674 lets a fresh authorization retire an idle intent, so a
+		// wallet at its per-peer cap with nothing spent against those intents
+		// is not refused a price it would be granted a moment later.
+		const h = makeHarness({ maxLiveIntentsPerPeer: 2 });
+		expect(h.manager.registerIntent(CLIENT, auth()).accepted).to.equal(true);
+		expect(h.manager.registerIntent(CLIENT, auth()).accepted).to.equal(true);
+		expect(h.manager.quote(CLIENT, quoteReq()).accepted).to.equal(true);
+	});
+
+	it('refuses while the wallet has a funding running and slots are full', async function () {
+		const h = makeHarness({
+			maxLiveIntentsPerPeer: 1,
+			maxConcurrentFundings: 1
+		});
+		h.openResult.fn = (): Promise<Buffer> => new Promise(() => undefined);
+		const ack = h.manager.registerIntent(
+			CLIENT,
+			auth({ expectedTotalMsat: 2_000_000n })
+		);
+		const funding = waitFor(h.manager, 'jit:funding');
+		h.manager.tryInterceptUnknownScid(
+			ack.interceptScid.toString('hex'),
+			makePart(h, { amountMsat: 2_000_000n })
+		);
+		await funding;
+		const own = h.manager.quote(CLIENT, quoteReq());
+		expect(own.accepted).to.equal(false);
+		expect(own.reason).to.equal(
+			'the provider is already funding 1 receive(s) for this wallet; wait for one to finish'
+		);
+		const other = h.manager.quote(OTHER_CLIENT, quoteReq());
+		expect(other.accepted).to.equal(false);
+		expect(other.reason).to.equal(
+			'the provider has its maximum number of channel fundings in flight; try again shortly'
+		);
+	});
+
+	it('refuses past the lifetime budget and when the on-chain funds are short', function () {
+		const h = makeHarness({
+			maxTotalFundingSats: 40_000n,
+			fundingBufferSats: 10_000n
+		});
+		const budget = h.manager.quote(
+			CLIENT,
+			quoteReq({
+				maxAmountMsat: 20_000_000n,
+				targetRemainingInboundSat: 20_000n
+			})
+		);
+		expect(budget.accepted).to.equal(false);
+		expect(budget.reason).to.equal(
+			'the provider has reached its lifetime funding budget'
+		);
+
+		const within = quoteReq({
+			maxAmountMsat: 5_000_000n,
+			targetRemainingInboundSat: 5_000n
+		});
+		expect(h.manager.quote(CLIENT, within).accepted).to.equal(true);
+		h.fundable.value = 19_999n;
+		const short = h.manager.quote(CLIENT, within);
+		expect(short.accepted).to.equal(false);
+		expect(short.reason).to.equal(
+			'the provider does not hold enough on-chain funds to front this receive right now'
+		);
+		h.fundable.value = 20_000n;
+		expect(h.manager.quote(CLIENT, within).accepted).to.equal(true);
+	});
+});
 
 describe('JIT interception', function () {
 	it('holds an HTLC for a live intent and funds against the held total', async function () {

@@ -276,6 +276,9 @@ describe('JIT receive daemon surface', function () {
 		expect(
 			typed('timed out waiting for the LSP JIT receive ack').code
 		).to.equal('JIT_TIMEOUT');
+		expect(typed('timed out waiting for the LSP JIT quote').code).to.equal(
+			'JIT_TIMEOUT'
+		);
 		expect(typed('Not connected to peer 02ab').code).to.equal(
 			'PEER_NOT_CONNECTED'
 		);
@@ -300,6 +303,80 @@ describe('JIT receive daemon surface', function () {
 			await off.stop();
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
+	});
+
+	// Issue #687: a price asked of a peer that is not there is the same
+	// typed refusal an invoice gets, never a scrubbed fault.
+	it('fails a JIT quote for a peer that is not connected', async () => {
+		let error: unknown = null;
+		try {
+			await daemon.node.getJitQuote({
+				lspPubkey: '02'.padEnd(66, 'a'),
+				amountSats: 1_000
+			});
+		} catch (e) {
+			error = e;
+		}
+		expect(error, 'an unreachable LSP is an error').to.not.equal(null);
+		expect((error as BeignetError).code).to.equal('PEER_NOT_CONNECTED');
+	});
+
+	it('refuses a malformed quote request before any peer work', async () => {
+		for (const [opts, message] of [
+			[{ lspPubkey: 'nope' }, /lspPubkey must be/],
+			[{ lspPubkey: '02'.padEnd(66, 'a'), amountSats: -5 }, /amountSats/],
+			[
+				{ lspPubkey: '02'.padEnd(66, 'a'), targetRemainingInboundSat: 1.5 },
+				/targetRemainingInboundSat/
+			]
+		] as Array<[Parameters<typeof daemon.node.getJitQuote>[0], RegExp]>) {
+			let error: unknown = null;
+			try {
+				await daemon.node.getJitQuote(opts);
+			} catch (e) {
+				error = e;
+			}
+			expect(
+				(error as BeignetError | null)?.code,
+				JSON.stringify(opts)
+			).to.equal('INVALID_PARAMS');
+			expect((error as Error).message).to.match(message);
+		}
+	});
+
+	it('dispatches GET /jit/quote and requires the LSP pubkey', async () => {
+		const { port } = daemon.server.address() as AddressInfo;
+		const get = (route: string): Promise<{ status: number; body: string }> =>
+			new Promise((resolve, reject) => {
+				const req = http.request(
+					{ host: '127.0.0.1', port, path: route, method: 'GET' },
+					(res) => {
+						let body = '';
+						res.on('data', (c) => (body += c));
+						res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+					}
+				);
+				req.on('error', reject);
+				req.end();
+			});
+		const missing = await get('/jit/quote?amountSats=1000');
+		expect(JSON.parse(missing.body).error.code).to.equal('INVALID_PARAMS');
+		expect(JSON.parse(missing.body).error.message).to.match(/lspPubkey/);
+		const fraction = await get(
+			`/jit/quote?lspPubkey=${'02'.padEnd(66, 'a')}&amountSats=1.5`
+		);
+		expect(JSON.parse(fraction.body).error.code).to.equal('INVALID_PARAMS');
+		// Well-formed, so the route reaches the peer layer: 409 for the
+		// peer that is not there, the same typed answer POST /jit/invoice gives.
+		const unreachable = await get(
+			`/jit/quote?lspPubkey=${'02'.padEnd(66, 'a')}&amountSats=1000`
+		);
+		expect(unreachable.status).to.equal(
+			statusForErrorCode('PEER_NOT_CONNECTED')
+		);
+		expect(JSON.parse(unreachable.body).error.code).to.equal(
+			'PEER_NOT_CONNECTED'
+		);
 	});
 
 	it('dispatches POST /jit/invoice and requires the LSP pubkey', async () => {

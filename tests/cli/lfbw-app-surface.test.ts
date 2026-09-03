@@ -195,6 +195,24 @@ describe('LFBW app surface (issue #614)', () => {
 			]);
 		});
 
+		// Issue #687: the app prices a receive on its form before minting,
+		// and shows the LSP's decline as written.
+		it('GET /jit/quote answers with the fee, the verdict and its reason', () => {
+			expect(responseFields('/jit/quote', 'get')).to.include.members([
+				'accepted',
+				'reason',
+				'flatFeeSat',
+				'feePpm',
+				'feeSats',
+				'fundingSats',
+				'maxClientFundingSats',
+				'withinCeilings'
+			]);
+			expect(handlerSource('GET /jit/quote')).to.include(
+				"if (!lspPubkey) return failure('INVALID_PARAMS'"
+			);
+		});
+
 		// The app sends neither expirySecs nor targetRemainingInboundSat, so
 		// both defaults are load bearing: an omitted expiry has to reach the
 		// library's own default rather than arrive as an explicit undefined,

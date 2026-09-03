@@ -184,6 +184,8 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /jit/invoice': ['invoice'],
 	// Role readback, no secrets in it: fees, caps, sats reserved and fronted.
 	'GET /jit/status': ['readonly'],
+	// A price, asked of a peer: registers nothing, moves nothing.
+	'GET /jit/quote': ['readonly'],
 	// Mints a receipt secret and hands out a payable artifact. It moves no
 	// money: the same shape as POST /invoice/create and POST /jit/invoice.
 	// Its two siblings are admin by ABSENCE, deliberately: configure sets the

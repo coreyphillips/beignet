@@ -268,6 +268,35 @@ export interface JitStatusInfo {
 	} | null;
 }
 
+/**
+ * GET /jit/quote (issue #687): what a just-in-time receive of this size
+ * would cost at the named LSP and whether it would be served right now,
+ * asked without registering an intent. A decline is an answer, not an
+ * error: `accepted` false with `reason` in plain language.
+ */
+export interface JitQuoteInfo {
+	lspPubkey: string;
+	/** The receive priced; null for an amount-less invoice (the cap is priced). */
+	amountSats: number | null;
+	/** Whether the LSP would register this receive as things stand. */
+	accepted: boolean;
+	/** Plain-language refusal, shown as is; null when accepted. */
+	reason: string | null;
+	/** Opening fee the LSP would deduct from the delivery. */
+	flatFeeSat: number;
+	feePpm: number;
+	/** That fee on this receive (sat, rounded up). */
+	feeSats: number;
+	/** Most the LSP fronts for one client, open or splice. */
+	maxClientFundingSats: number;
+	/** What the LSP would front for this receive; 0 when refused. */
+	fundingSats: number;
+	/** Whether this node's own ceilings would accept the quoted fee. */
+	withinCeilings: boolean;
+	/** Those ceilings, so a refusal on them can be explained. */
+	client: { maxFlatFeeSat: number; maxFeePpm: number };
+}
+
 export interface DirectFundingConfigInfo {
 	/** The liquidity peer every direct-funded channel is negotiated with. */
 	lspPubkey: string | null;
