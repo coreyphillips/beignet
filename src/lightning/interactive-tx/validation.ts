@@ -232,6 +232,14 @@ export function calculateTxFee(
 
 /**
  * Check that fee is sufficient given a fee rate.
+ *
+ * The minimum is FLOORED. weight * feerate / 1000 is rarely a whole number
+ * of satoshis, and the peer paying it computes its share by flooring (CLN's
+ * amount_tx_fee, LND and eclair likewise), so a ceiling here refused every
+ * CLN-initiated dual-funded open at a feerate where the product had a
+ * fraction: 657 WU at 865 sat/kw is 568.3, CLN paid 568, and the ceiling
+ * demanded 569 (issue #670). BOLT 2 asks that the peer's fee not fall below
+ * the agreed feerate; a satoshi of rounding is not a feerate.
  * @param fee - Fee in satoshis
  * @param weight - Transaction weight in weight units
  * @param minFeeratePerKw - Minimum fee rate in sat/kw
@@ -241,7 +249,7 @@ export function checkFeeSufficiency(
 	weight: number,
 	minFeeratePerKw: number
 ): string | null {
-	const minFee = BigInt(Math.ceil((weight * minFeeratePerKw) / 1000));
+	const minFee = BigInt(Math.floor((weight * minFeeratePerKw) / 1000));
 	if (fee < minFee) {
 		return `Fee ${fee} is below minimum ${minFee} for weight ${weight} at ${minFeeratePerKw} sat/kw`;
 	}
