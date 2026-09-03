@@ -15916,6 +15916,7 @@ export class LightningNode extends EventEmitter {
 		);
 		for (const evt of [
 			'jit:intent',
+			'jit:intent-superseded',
 			'jit:intercepted',
 			'jit:funding',
 			'jit:forwarded',

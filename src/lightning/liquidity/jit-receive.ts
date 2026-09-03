@@ -709,11 +709,32 @@ export class JitReceiveManager extends EventEmitter {
 		if (this.intents.size >= this.cfg.maxLiveIntents) {
 			return refuse('the LSP is holding its maximum number of live intents');
 		}
-		let perPeer = 0;
-		for (const i of this.intents.values()) {
-			if (i.walletPubkeyHex === walletPubkeyHex) perPeer++;
+		// A wallet asking again is not another peer: its own earlier intents
+		// that nothing has spent against (no held part, no funding running)
+		// are the ones it no longer needs, so the oldest of them makes room
+		// rather than locking the wallet out until they expire (issue #674).
+		// The cap keeps bounding what one peer holds OPEN; only idle intents
+		// are ever retired, and only for the peer that is asking.
+		let own = [...this.intents.values()].filter(
+			(i) => i.walletPubkeyHex === walletPubkeyHex
+		);
+		while (own.length >= this.cfg.maxLiveIntentsPerPeer) {
+			const idle = own
+				.filter((i) => this.intentIsIdle(i.interceptScidHex))
+				.sort((a, b) => a.expiresAt - b.expiresAt)[0];
+			if (!idle) break;
+			this.intents.delete(idle.interceptScidHex);
+			// Durable and derived state follow at once, whatever this request
+			// goes on to decide: a retired intent must not come back on restart.
+			this.persistIntents();
+			this.refreshJitClients();
+			this.safeEmit('jit:intent-superseded', {
+				scidHex: idle.interceptScidHex,
+				walletPubkeyHex
+			});
+			own = own.filter((i) => i !== idle);
 		}
-		if (perPeer >= this.cfg.maxLiveIntentsPerPeer) {
+		if (own.length >= this.cfg.maxLiveIntentsPerPeer) {
 			return refuse(
 				`at most ${this.cfg.maxLiveIntentsPerPeer} live intents per peer`
 			);
@@ -1300,6 +1321,13 @@ export class JitReceiveManager extends EventEmitter {
 			candidates.find((i) => i.paymentHashHex === undefined && fits(i)) ??
 			null
 		);
+	}
+
+	/** Nothing held, queued or funding against this intent: safe to retire. */
+	private intentIsIdle(scidHex: string): boolean {
+		if (this.fundingInFlight.has(scidHex)) return false;
+		if ((this.heldParts.get(scidHex) ?? []).length > 0) return false;
+		return this.claimedAgainst(scidHex) === 0n;
 	}
 
 	/** Msat already spending against one intent, on either path. */
