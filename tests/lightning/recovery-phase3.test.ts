@@ -35,6 +35,7 @@ import {
 	RecoveryMutation,
 	RecoveryOutboundMessage,
 	CAPSULE_MAX_BYTES,
+	PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES,
 	PROBE_MUTATION_COVERAGE,
 	PROBE_SNAPSHOT_COVERAGE,
 	JOURNAL_META_KEYS,
@@ -682,6 +683,114 @@ describe('Recovery phase 3: capsule composition', () => {
 		const state = JSON.parse(capsule.inlineRecoveryState!.toString('utf8'));
 		expect('backfillLost' in state.meta).to.equal(false);
 		storage.close();
+	});
+
+	/**
+	 * A journal whose commits are the size a live channel produces (the
+	 * regtest run behind issue #695 saw 6 to 13 KB per frame), appended
+	 * until it would overflow the capsule under the default byte trigger.
+	 */
+	function bulkyJournal(snapshotIntervalBytes?: number): {
+		storage: SqliteStorage;
+		frames: number;
+	} {
+		const storage = openStorage();
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			getPublicKey(NODE_SECRET),
+			deriveRecoveryRoot(NODE_SECRET).recoveryId,
+			snapshotIntervalBytes === undefined ? {} : { snapshotIntervalBytes }
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		// Each commit writes sixty preimage rows and deletes the previous
+		// sixty, the way a channel transition REPLACES its state: the live
+		// set (and so the snapshot) stays channel-sized while every delta
+		// frame runs to roughly 10 KB. Fifteen commits is the 100 KB journal
+		// the live run held for one channel.
+		const commits = 15;
+		const hashAt = (i: number, j: number): Buffer => {
+			const seed = Buffer.alloc(32);
+			seed.writeUInt32BE(i * 1000 + j, 0);
+			return seed;
+		};
+		for (let i = 0; i < commits; i++) {
+			const mutations: RecoveryMutation[] = [];
+			for (let j = 0; j < 60; j++) {
+				if (i > 0) {
+					mutations.push({
+						type: 'delete_preimage',
+						paymentHash: hashAt(i - 1, j).toString('hex')
+					});
+				}
+				const seed = hashAt(i, j);
+				mutations.push({
+					type: 'payment_preimage',
+					paymentHash: seed.toString('hex'),
+					preimage: seed
+				});
+			}
+			const result = manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations,
+				outboundMessages: []
+			});
+			expect(result.committed).to.equal(true);
+		}
+		return { storage, frames: storage.loadRecoveryFrames!().length };
+	}
+
+	it('drops an oversized inline journal loudly, naming the sizes (issue #695)', () => {
+		const { storage, frames } = bulkyJournal();
+		// The 4 MiB default never snapshots at this size: every frame is
+		// still retained, and their sum is past the capsule ceiling.
+		expect(frames).to.be.greaterThan(10);
+		const { blob, inline, inlineError } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		expect(inline).to.equal(false);
+		expect(blob.length).to.be.at.most(CAPSULE_MAX_BYTES);
+		expect(inlineError).to.match(/does not fit the capsule/);
+		expect(inlineError).to.match(
+			new RegExp(`${CAPSULE_MAX_BYTES} byte ceiling`)
+		);
+		expect(inlineError).to.match(/frame\(s\) inlined/);
+		storage.close();
+	});
+
+	it('stays inline under the peer-storage budget by snapshotting to it (issue #695)', () => {
+		const { storage, frames } = bulkyJournal(
+			PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES
+		);
+		// The byte trigger snapshotted and compacted along the way, so the
+		// retained chain is the last snapshot plus at most a few deltas.
+		expect(frames).to.be.lessThan(6);
+		const { blob, capsule, inline, inlineError } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		expect(inlineError).to.equal(undefined);
+		expect(inline).to.equal(true);
+		expect(blob.length).to.be.at.most(CAPSULE_MAX_BYTES);
+		expect(Number(capsule.latestSequence)).to.be.greaterThan(15);
+		const decoded = decodeRecoveryCapsuleBlob(blob, NODE_SECRET);
+		expect(decoded!.inlineRecoveryState).to.not.equal(undefined);
+		storage.close();
+	});
+
+	it('derives the peer-storage budget from the capsule ceiling', () => {
+		// Two base64 layers (16/9) over the ceiling minus the reserve, half
+		// of it left to the snapshot: the delta budget is what remains.
+		expect(PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES).to.equal(
+			Math.floor(((CAPSULE_MAX_BYTES - 8 * 1024) * 9) / 16 / 2)
+		);
+		expect(PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES).to.be.greaterThan(8 * 1024);
+		expect(PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES).to.be.lessThan(
+			CAPSULE_MAX_BYTES / 2
+		);
 	});
 });
 

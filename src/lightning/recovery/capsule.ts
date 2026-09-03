@@ -537,6 +537,37 @@ const ZERO_HASH = Buffer.alloc(32);
 export const CAPSULE_MAX_BYTES = PEER_STORAGE_MAX_BYTES - 8;
 
 /**
+ * Capsule bytes held back from the inline journal for everything else the
+ * capsule carries: the encrypted SCB (about a kilobyte per channel), the
+ * locator fields and the guardian list. Sized for a few channels; a wallet
+ * whose SCB alone approaches this is past inline restore anyway.
+ */
+export const CAPSULE_INLINE_RESERVE_BYTES = 8 * 1024;
+
+/**
+ * Delta plaintext budget between snapshots for a node whose journal has to
+ * fit the peer-storage capsule (issue #695). The default byte trigger (4 MiB)
+ * is sized for a guardian-replicated journal; against a 64 KiB capsule a
+ * single channel outgrew inline restore after a handful of frames and stayed
+ * there for the next 250, so Tier 2 over peer storage never ran.
+ *
+ * The arithmetic, from the ceiling down: the inline state encodes each
+ * frame's ciphertext as base64 inside a JSON document, and encodeCapsule
+ * base64-encodes that document again, so frame bytes cost 16/9 of themselves
+ * on the wire (ciphertext is plaintext plus a constant tag). What is left of
+ * CAPSULE_MAX_BYTES after the reserve, scaled by 9/16, is the frame budget
+ * for the whole inline set, which is the last snapshot plus the deltas since
+ * it. Half of that is left to the snapshot (one to three channels of full
+ * state) and the other half is this delta budget: once the deltas reach it
+ * the journal snapshots and compacts, and the capsule composed next carries
+ * the snapshot alone. A wallet whose snapshot alone exceeds its half falls
+ * back to SCB plus locator, now with inlineError naming the sizes.
+ */
+export const PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES = Math.floor(
+	((CAPSULE_MAX_BYTES - CAPSULE_INLINE_RESERVE_BYTES) * 9) / 16 / 2
+);
+
+/**
  * A recoverable transport credential (wire spec 2.4). Safe to carry here
  * precisely because the whole capsule is encrypted under the seed-derived
  * capsule key: storage peers never see credentials, and a seed restore
@@ -876,7 +907,10 @@ export interface IComposedCapsule {
 	capsule: RecoveryCapsule;
 	/** Whether the full journal fit inline (Tier 2 from peer_storage alone). */
 	inline: boolean;
-	/** Set when a journal existed but failed verification and was dropped. */
+	/**
+	 * Set when a journal existed but was dropped: it failed verification, or
+	 * it verified and did not fit the capsule (the message names the sizes).
+	 */
 	inlineError?: string;
 }
 
@@ -992,6 +1026,13 @@ export function composeRecoveryCapsule(
 		if (blob.length <= maxBytes) {
 			return { blob, capsule: withInline, inline: true };
 		}
+		// Loud degradation (issue #695): the chain verified but does not fit,
+		// so the owner learns the wallet has outgrown inline restore instead
+		// of finding out at the restore that only the SCB came back.
+		inlineError =
+			`inline journal does not fit the capsule: ${blob.length} bytes with ` +
+			`${frames.length} frame(s) inlined against a ${maxBytes} byte ceiling; ` +
+			'the capsule carries the SCB and locator only';
 	}
 
 	const blob = encryptRecoveryCapsule(capsule, options.nodeSecret);

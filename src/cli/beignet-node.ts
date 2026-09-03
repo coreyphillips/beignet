@@ -95,7 +95,8 @@ import {
 	CapsuleCandidateError,
 	GuardianDescriptor,
 	chainPromisedQuorum,
-	deriveRecoveryMasterKey
+	deriveRecoveryMasterKey,
+	PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES
 } from '../lightning/recovery';
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import {
@@ -2802,10 +2803,16 @@ export class BeignetNode extends EventEmitter {
 			// capsule. Hold an unknown channel's reestablish for that window
 			// rather than failing the channel the restore is about to resume
 			// (spec 5.7, issue #462).
+			//
+			// The capsule is this mode's only replica, so the journal has to
+			// keep fitting it: snapshot to the capsule budget rather than the
+			// 4 MiB guardian default, or one channel outgrows inline restore
+			// after a handful of frames (issue #695).
 			this.recoveryNodeConfig = {
 				enabled: true,
 				durability: 'local',
-				unknownChannelReestablishHoldMs: this._reestablishHoldMs
+				unknownChannelReestablishHoldMs: this._reestablishHoldMs,
+				snapshotIntervalBytes: PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES
 			};
 			return;
 		}

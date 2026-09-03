@@ -24,7 +24,8 @@ import {
 	composeRecoveryCapsule,
 	decodeRecoveryCapsuleBlob,
 	encryptRecoveryCapsule,
-	xOnlyFromSecret
+	xOnlyFromSecret,
+	PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES
 } from '../../src/lightning/recovery';
 import { decodeScb, encodeScb } from '../../src/lightning/backup/scb';
 import { encodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
@@ -883,6 +884,17 @@ describe('Recovery surface: peer-storage mode', () => {
 			expect(result.state).to.equal('running');
 			expect(result.node?.durability).to.equal('local');
 			expect(result.node?.gate).to.equal('disabled');
+			// The journal snapshots to the capsule budget in this mode, not
+			// the guardian default, or one channel outgrows inline restore
+			// after a handful of frames (issue #695).
+			const journal = (
+				daemon.node.getNode() as unknown as {
+					recoveryJournal: { snapshotIntervalBytes: number };
+				}
+			).recoveryJournal;
+			expect(journal.snapshotIntervalBytes).to.equal(
+				PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES
+			);
 			const readiness = await request(portOf(daemon), 'GET', '/readiness');
 			const check = readinessCheck(readiness.body, 'CHANNEL_BACKUP');
 			expect(check.status).to.equal('WARN');
