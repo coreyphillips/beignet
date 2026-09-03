@@ -177,6 +177,107 @@ export function decodeJitAck(data: Buffer): IJitReceiveAck {
 	return result;
 }
 
+// ─────────────── Wire payloads (custom subtypes 4/5, issue #687) ───────────────
+
+/**
+ * What a wallet asks before it decides to create an invoice: the price of a
+ * just-in-time receive of this size, and whether the LSP would serve it right
+ * now. Registers nothing; the same numbers an ack carries, without the SCID.
+ */
+export interface IJitReceiveQuoteRequest {
+	/** Client-chosen correlation id, echoed in the quote. */
+	requestId: Buffer;
+	/** The receive the wallet has in mind (msat); the cap it would register. */
+	maxAmountMsat: bigint;
+	/** Inbound liquidity the wallet wants left over after the receive (sat). */
+	targetRemainingInboundSat: bigint;
+}
+
+export interface IJitReceiveQuote {
+	requestId: Buffer;
+	/** Whether the LSP would register this intent as things stand. */
+	accepted: boolean;
+	/** LSPS2-style opening fee the LSP would deduct: flat part (sat). */
+	flatFeeSat: bigint;
+	/** Proportional part, in parts-per-million of the received total. */
+	feePpm: number;
+	/** Most the LSP fronts for one client, open or splice (sat). */
+	maxClientFundingSats: bigint;
+	/** What the LSP would front for this receive (sat); 0 when refused. */
+	fundingSats: bigint;
+	/** Plain-language refusal, meant to be shown as is. */
+	reason?: string;
+}
+
+const QUOTE_REQUEST_LENGTH = 24;
+const QUOTE_HEADER_LENGTH = 39;
+
+export function encodeJitQuoteRequest(q: IJitReceiveQuoteRequest): Buffer {
+	if (q.requestId.length !== 8) {
+		throw new Error('jit quote request requestId must be 8 bytes');
+	}
+	const buf = Buffer.alloc(QUOTE_REQUEST_LENGTH);
+	q.requestId.copy(buf, 0);
+	buf.writeBigUInt64BE(q.maxAmountMsat, 8);
+	buf.writeBigUInt64BE(q.targetRemainingInboundSat, 16);
+	return buf;
+}
+
+export function decodeJitQuoteRequest(data: Buffer): IJitReceiveQuoteRequest {
+	if (data.length < QUOTE_REQUEST_LENGTH) {
+		throw new Error('jit quote request too short');
+	}
+	return {
+		requestId: Buffer.from(data.subarray(0, 8)),
+		maxAmountMsat: data.readBigUInt64BE(8),
+		targetRemainingInboundSat: data.readBigUInt64BE(16)
+	};
+}
+
+export function encodeJitQuote(q: IJitReceiveQuote): Buffer {
+	if (q.requestId.length !== 8) {
+		throw new Error('jit quote requestId must be 8 bytes');
+	}
+	let reason = q.reason ? Buffer.from(q.reason, 'utf8') : Buffer.alloc(0);
+	if (reason.length > MAX_ACK_REASON_BYTES) {
+		reason = reason.subarray(0, MAX_ACK_REASON_BYTES);
+	}
+	const buf = Buffer.alloc(QUOTE_HEADER_LENGTH + reason.length);
+	q.requestId.copy(buf, 0);
+	buf.writeUInt8(q.accepted ? 1 : 0, 8);
+	buf.writeBigUInt64BE(q.flatFeeSat, 9);
+	buf.writeUInt32BE(q.feePpm >>> 0, 17);
+	buf.writeBigUInt64BE(q.maxClientFundingSats, 21);
+	buf.writeBigUInt64BE(q.fundingSats, 29);
+	buf.writeUInt16BE(reason.length, 37);
+	reason.copy(buf, QUOTE_HEADER_LENGTH);
+	return buf;
+}
+
+export function decodeJitQuote(data: Buffer): IJitReceiveQuote {
+	if (data.length < QUOTE_HEADER_LENGTH) throw new Error('jit quote too short');
+	const reasonLen = data.readUInt16BE(37);
+	// Same rule as the ack: a declared length the buffer cannot supply is a
+	// malformed quote, not a short reason.
+	if (QUOTE_HEADER_LENGTH + reasonLen > data.length) {
+		throw new Error('jit quote reason runs past the payload');
+	}
+	const result: IJitReceiveQuote = {
+		requestId: Buffer.from(data.subarray(0, 8)),
+		accepted: data.readUInt8(8) === 1,
+		flatFeeSat: data.readBigUInt64BE(9),
+		feePpm: data.readUInt32BE(17),
+		maxClientFundingSats: data.readBigUInt64BE(21),
+		fundingSats: data.readBigUInt64BE(29)
+	};
+	if (reasonLen > 0) {
+		result.reason = data
+			.subarray(QUOTE_HEADER_LENGTH, QUOTE_HEADER_LENGTH + reasonLen)
+			.toString('utf8');
+	}
+	return result;
+}
+
 /**
  * The LSPS2-style opening fee owed on a delivered total.
  *
@@ -330,6 +431,14 @@ export interface IJitManagerDeps {
 		amountSats: bigint,
 		timeoutMs: number
 	): Promise<void>;
+	/**
+	 * Most the node could front from its on-chain funds right now, priced at
+	 * the current feerate (sat), or null when no figure is available (no
+	 * funding provider, or a fee estimator that has not delivered a sample
+	 * yet). Consulted by a quote only: a funding attempt still learns the
+	 * truth from the provider at selection time.
+	 */
+	maxFundableSats?(): bigint | null;
 	/** Durable KV (the node's storage backend); without it the engine is in-memory. */
 	storage?: {
 		saveMetadata(key: string, value: string): void;
@@ -832,6 +941,89 @@ export class JitReceiveManager extends EventEmitter {
 	/** Live intents, for the daemon surface and tests. */
 	listIntents(): IJitIntent[] {
 		return [...this.intents.values()];
+	}
+
+	/**
+	 * Price a receive without registering anything (issue #687). The answer
+	 * runs the same admission rules registerIntent applies, then the checks a
+	 * funding would hit later (a free funding slot, the lifetime budget, the
+	 * on-chain funds to front it), so a wallet learns BEFORE it mints an
+	 * invoice whether the payment could be served right now and at what
+	 * price. No intent, no SCID, no persistence, no event: asking a price
+	 * must not hold anything open.
+	 *
+	 * The reasons are written to be shown to a person as they are.
+	 */
+	quote(
+		walletPubkeyHex: string,
+		req: IJitReceiveQuoteRequest
+	): IJitReceiveQuote {
+		this.sweepExpiredIntents();
+		const base = {
+			requestId: req.requestId,
+			flatFeeSat: this.cfg.flatFeeSat,
+			feePpm: this.cfg.feePpm,
+			maxClientFundingSats: this.cfg.maxClientFundingSats
+		};
+		const refuse = (reason: string): IJitReceiveQuote => ({
+			...base,
+			accepted: false,
+			fundingSats: 0n,
+			reason
+		});
+
+		if (req.maxAmountMsat <= 0n) {
+			return refuse('the amount must be positive');
+		}
+		const requestedSat = req.maxAmountMsat / 1000n;
+		if (requestedSat > this.cfg.maxClientFundingSats) {
+			return refuse(
+				`the provider funds at most ${this.cfg.maxClientFundingSats} sats for one receive`
+			);
+		}
+		if (this.intents.size >= this.cfg.maxLiveIntents) {
+			return refuse(
+				'the provider is holding its maximum number of live receive intents'
+			);
+		}
+		// An intent nothing has spent against would make room for a new one
+		// (issue #674), so only the ACTIVE ones count against this wallet.
+		const active = [...this.intents.values()].filter(
+			(i) =>
+				i.walletPubkeyHex === walletPubkeyHex &&
+				!this.intentIsIdle(i.interceptScidHex)
+		);
+		if (active.length >= this.cfg.maxLiveIntentsPerPeer) {
+			return refuse(
+				`the provider is already funding ${active.length} receive(s) for this wallet; wait for one to finish`
+			);
+		}
+		if (!this.fundingSlotsFree()) {
+			return refuse(
+				'the provider has its maximum number of channel fundings in flight; try again shortly'
+			);
+		}
+		let fundingSats =
+			(req.maxAmountMsat + 999n) / 1000n +
+			req.targetRemainingInboundSat +
+			this.cfg.fundingBufferSats;
+		if (fundingSats > this.cfg.maxClientFundingSats) {
+			fundingSats = this.cfg.maxClientFundingSats;
+		}
+		const cap = this.cfg.maxTotalFundingSats;
+		if (
+			cap !== undefined &&
+			this.frontedSats + this.reservedSats + fundingSats > cap
+		) {
+			return refuse('the provider has reached its lifetime funding budget');
+		}
+		const fundable = this.deps.maxFundableSats?.() ?? null;
+		if (fundable !== null && fundable < fundingSats) {
+			return refuse(
+				'the provider does not hold enough on-chain funds to front this receive right now'
+			);
+		}
+		return { ...base, accepted: true, fundingSats };
 	}
 
 	/** Total msat currently held for an intercept scid. */

@@ -193,7 +193,8 @@ import {
 	TOnchainQuote,
 	TChannelFundingQuote,
 	DirectFundingConfigInfo,
-	JitStatusInfo
+	JitStatusInfo,
+	JitQuoteInfo
 } from './types';
 
 export type LogLevel = TLogLevel;
@@ -5811,6 +5812,62 @@ export class BeignetNode extends EventEmitter {
 						fundingsInFlight: status.fundingsInFlight
 				  }
 				: null
+		};
+	}
+
+	/**
+	 * Price a JIT receive at an LSP without registering an intent (issue
+	 * #687). Transport failures (peer not connected, no reply in time) are
+	 * typed the way POST /jit/invoice types them; the LSP's own decline is
+	 * carried in the answer.
+	 */
+	async getJitQuote(opts: {
+		lspPubkey: string;
+		amountSats?: number;
+		targetRemainingInboundSat?: number;
+	}): Promise<JitQuoteInfo> {
+		if (!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
+			);
+		}
+		const amountSats =
+			opts.amountSats !== undefined && opts.amountSats !== 0
+				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
+				: null;
+		let quote: Awaited<ReturnType<typeof this.node.requestJitQuote>>;
+		try {
+			quote = await this.node.requestJitQuote(opts.lspPubkey, {
+				...(amountSats !== null
+					? { maxAmountMsat: BigInt(amountSats) * 1000n }
+					: {}),
+				targetRemainingInboundSat: BigInt(
+					requireNonNegativeSafeInteger(
+						opts.targetRemainingInboundSat ?? 0,
+						'targetRemainingInboundSat'
+					)
+				)
+			});
+		} catch (err) {
+			throw jitInvoiceError(err);
+		}
+		const ceilings = this.node.getJitClientCeilings();
+		return {
+			lspPubkey: opts.lspPubkey,
+			amountSats,
+			accepted: quote.accepted,
+			reason: quote.reason ?? null,
+			flatFeeSat: Number(quote.flatFeeSat),
+			feePpm: quote.feePpm,
+			feeSats: Number(quote.feeSats),
+			maxClientFundingSats: Number(quote.maxClientFundingSats),
+			fundingSats: Number(quote.fundingSats),
+			withinCeilings: quote.withinCeilings,
+			client: {
+				maxFlatFeeSat: Number(ceilings.maxFlatFeeSat),
+				maxFeePpm: ceilings.maxFeePpm
+			}
 		};
 	}
 

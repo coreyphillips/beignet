@@ -3,8 +3,12 @@ export {
 	JitReceiveManager,
 	decodeJitAck,
 	decodeJitAuthorization,
+	decodeJitQuote,
+	decodeJitQuoteRequest,
 	encodeJitAck,
 	encodeJitAuthorization,
+	encodeJitQuote,
+	encodeJitQuoteRequest,
 	jitOpeningFeeMsat,
 	mintInterceptScid
 } from './jit-receive';
@@ -15,5 +19,7 @@ export type {
 	IJitReceiveAck,
 	IJitReceiveAuthorization,
 	IJitReceiveConfig,
+	IJitReceiveQuote,
+	IJitReceiveQuoteRequest,
 	IPersistedHeldPart
 } from './jit-receive';

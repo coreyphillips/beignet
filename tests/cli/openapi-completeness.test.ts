@@ -109,6 +109,8 @@ describe('OpenAPI Spec Completeness', () => {
 		'/advisor/recommendations',
 		'/advisor/execute-rebalances',
 		'/jit/invoice',
+		'/jit/status',
+		'/jit/quote',
 		'/direct-funding/configure',
 		'/direct-funding/config',
 		'/direct-funding/request',
@@ -193,7 +195,9 @@ describe('OpenAPI Spec Completeness', () => {
 		'ConsolidateResult',
 		'DescriptorsInfo',
 		'DirectFundingConfig',
-		'DirectFundingSendResult'
+		'DirectFundingSendResult',
+		'JitStatus',
+		'JitQuote'
 	];
 
 	for (const schema of expectedSchemas) {

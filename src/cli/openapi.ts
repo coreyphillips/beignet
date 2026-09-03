@@ -2180,6 +2180,41 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/jit/quote': {
+				get: {
+					summary:
+						'Price a JIT receive at the named LSP without registering an intent: the opening fee it would deduct, the fee on this amount, what it would front, and whether it would serve the receive right now (a decline is an answer with a plain-language reason, not an error). Asked over the beignet custom message type, so the LSP peer must be connected and running the JIT receive engine; PEER_NOT_CONNECTED and JIT_TIMEOUT are the transport failures. Readonly scope',
+					tags: ['Invoices'],
+					parameters: [
+						{
+							name: 'lspPubkey',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' },
+							description: 'The LSP peer, 33-byte compressed pubkey as hex'
+						},
+						{
+							name: 'amountSats',
+							in: 'query',
+							schema: { type: 'integer' },
+							description:
+								'The receive to price; omitted or 0 prices the amount-less cap'
+						},
+						{
+							name: 'targetRemainingInboundSat',
+							in: 'query',
+							schema: { type: 'integer' },
+							description: 'Inbound to leave over after the receive (default 0)'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'The quote, accepted or declined',
+							content: jsonContent({ $ref: '#/components/schemas/JitQuote' })
+						}
+					}
+				}
+			},
 			'/events': {
 				get: {
 					summary:
@@ -3484,6 +3519,28 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								liveIntents: { type: 'integer' },
 								heldParts: { type: 'integer' },
 								fundingsInFlight: { type: 'integer' }
+							}
+						}
+					}
+				},
+				JitQuote: {
+					type: 'object',
+					properties: {
+						lspPubkey: { type: 'string' },
+						amountSats: { type: 'integer', nullable: true },
+						accepted: { type: 'boolean' },
+						reason: { type: 'string', nullable: true },
+						flatFeeSat: { type: 'integer' },
+						feePpm: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						maxClientFundingSats: { type: 'integer' },
+						fundingSats: { type: 'integer' },
+						withinCeilings: { type: 'boolean' },
+						client: {
+							type: 'object',
+							properties: {
+								maxFlatFeeSat: { type: 'integer' },
+								maxFeePpm: { type: 'integer' }
 							}
 						}
 					}

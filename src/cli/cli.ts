@@ -1119,10 +1119,36 @@ async function handleJit(): Promise<void> {
 	switch (sub) {
 		case 'status':
 			return outputResult(await httpRequest('GET', '/jit/status'));
+		case 'quote': {
+			// What a JIT receive would cost, before any invoice exists.
+			const lspPubkey = filteredArgs[2];
+			if (!lspPubkey) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet jit quote <lspPubkey> [amountSats] [--target-inbound sats]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const params = new URLSearchParams({ lspPubkey });
+			if (filteredArgs[3]) params.set('amountSats', filteredArgs[3]);
+			const target = parseFlag('--target-inbound');
+			if (target !== undefined) params.set('targetRemainingInboundSat', target);
+			return outputResult(
+				await httpRequest('GET', `/jit/quote?${params.toString()}`)
+			);
+		}
 		default:
 			output({
 				ok: false,
-				error: { code: 'INVALID_PARAMS', message: 'Usage: beignet jit status' }
+				error: {
+					code: 'INVALID_PARAMS',
+					message: 'Usage: beignet jit [status|quote]'
+				}
 			});
 			process.exitCode = 1;
 	}
@@ -2745,6 +2771,10 @@ Invoices & Payments:
   jit status                             The JIT receive role as it stands:
                                          fee, exposure caps, sats reserved and
                                          fronted, live intents
+  jit quote <lspPubkey> [sats] [--target-inbound sats]
+                                         What a JIT receive would cost at that
+                                         LSP and whether it would be served
+                                         right now; registers nothing
   invoice create-hold <hash> [sats] [description] [--expiry secs]
                                          Create hold invoice for a payment hash
                                          you supply (keep the preimage; HTLCs

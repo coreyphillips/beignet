@@ -31,7 +31,7 @@ export const BEIGNET_CUSTOM_MAX_PAYLOAD = 65_535 - 2 - 4;
 /**
  * Subtype registry. The numbers are RESERVED here ahead of the workstreams
  * that implement them (#532 phases 3 and 4) so no later protocol collides:
- * 1 and 2 belong to JIT receive, 16 to 22 to direct funding. 3
+ * 1, 2, 4 and 5 belong to JIT receive, 16 to 22 to direct funding. 3
  * (LIQUIDITY_POLICY) and 20 (DIRECT_FUNDING_ABORT) are numbers the LFBW
  * fork declared but never used; they stay reserved and deliberately
  * unimplemented.
@@ -42,6 +42,10 @@ export enum BeignetCustomSubtype {
 	JIT_RECEIVE_ACK = 2,
 	/** Reserved, never implemented. */
 	LIQUIDITY_POLICY = 3,
+	/** A wallet asks what a JIT receive would cost and whether the LSP would
+	 *  serve it right now; registers nothing on the LSP (issue #687). */
+	JIT_RECEIVE_QUOTE = 4,
+	JIT_RECEIVE_QUOTE_ACK = 5,
 	// ── Direct funding (#532 phase 4) ──
 	DIRECT_FUNDING_OFFER = 16,
 	DIRECT_FUNDING_OFFER_ACK = 17,

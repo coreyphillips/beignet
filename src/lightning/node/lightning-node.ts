@@ -162,14 +162,18 @@ import {
 } from '../message/custom';
 import {
 	IHeldJitPart,
-	IJitReceiveAck,
 	IJitReceiveConfig,
+	IJitReceiveQuote,
 	IPersistedHeldPart,
 	JitReceiveManager,
 	decodeJitAck,
 	decodeJitAuthorization,
+	decodeJitQuote,
+	decodeJitQuoteRequest,
 	encodeJitAck,
 	encodeJitAuthorization,
+	encodeJitQuote,
+	encodeJitQuoteRequest,
 	jitOpeningFeeMsat
 } from '../liquidity/jit-receive';
 import {
@@ -15910,6 +15914,7 @@ export class LightningNode extends EventEmitter {
 					this.channelManager.getPeerForChannel(outChannelId) ?? null,
 				spliceInAndWait: (channelId, amountSats, timeoutMs) =>
 					this.spliceInAndWait(channelId, amountSats, timeoutMs),
+				maxFundableSats: () => this.jitMaxFundableSats(),
 				storage: this.storage ?? undefined,
 				failRestoredHtlc: (part) => this.failRestoredHeldHtlc(part)
 			},
@@ -15944,6 +15949,7 @@ export class LightningNode extends EventEmitter {
 			(msg: { peerPubkey: string; subtype: number; payload: Buffer }) => {
 				try {
 					this.handleJitAuthorization(msg);
+					this.handleJitQuoteRequest(msg);
 				} catch (err) {
 					this.emitStructuredLog('peer', 'jit_authorization_failed', {
 						pubkey: msg.peerPubkey,
@@ -15952,6 +15958,55 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 		);
+	}
+
+	/**
+	 * Most this node could front from its on-chain funds right now, priced
+	 * at the fee advisor's latest sample: the figure a JIT quote checks a
+	 * request against (issue #687). Null when there is nothing to price
+	 * with (no wallet-backed funding provider, or no fee sample yet), in
+	 * which case the quote does not claim either way. A splice-in quote is
+	 * the right shape for both fronting paths: the LSP's own coins fund a
+	 * v1 open or a splice-in, and both pay one transaction of about the
+	 * same weight out of the same UTXO set.
+	 */
+	private jitMaxFundableSats(): bigint | null {
+		const fp = this.fundingProvider;
+		if (!fp?.quoteSpliceIn) return null;
+		const satPerVbyte = this.feeAdvisor.getCurrentRate();
+		if (!(satPerVbyte > 0)) return null;
+		const feeratePerKw = Math.max(253, Math.round(satPerVbyte * 250));
+		try {
+			return fp.quoteSpliceIn(feeratePerKw).maxAmountSats;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * LSP side of a quote (issue #687): answer what this receive would cost
+	 * and whether it would be served, registering nothing.
+	 */
+	private handleJitQuoteRequest(msg: {
+		peerPubkey: string;
+		subtype: number;
+		payload: Buffer;
+	}): void {
+		const manager = this.jitReceiveManager;
+		if (!manager) return;
+		if (msg.subtype !== BeignetCustomSubtype.JIT_RECEIVE_QUOTE) return;
+		const req = decodeJitQuoteRequest(msg.payload);
+		const quote = manager.quote(msg.peerPubkey, req);
+		this.sendCustomMessage(
+			msg.peerPubkey,
+			BeignetCustomSubtype.JIT_RECEIVE_QUOTE_ACK,
+			encodeJitQuote(quote)
+		);
+		this.emitStructuredLog('peer', 'jit_quote', {
+			pubkey: msg.peerPubkey,
+			accepted: quote.accepted,
+			fundingSats: quote.fundingSats.toString()
+		});
 	}
 
 	private handleJitAuthorization(msg: {
@@ -15981,6 +16036,123 @@ export class LightningNode extends EventEmitter {
 	}
 
 	// ─────────────── JIT channel receive (wallet role, issue #595) ───────────
+
+	/**
+	 * Arm a listener for ONE reply on the beignet custom message type: the
+	 * given subtype, from the given peer, echoing our request id. Malformed
+	 * frames are ignored (a well-formed one may still follow); the timer and
+	 * the listener are both released whichever way the wait ends. The
+	 * cleanup is returned so a send that throws after arming can release
+	 * them too, or the node would keep one of each per unsendable request.
+	 */
+	private awaitJitReply<T extends { requestId: Buffer }>(
+		peerPubkeyHex: string,
+		subtype: BeignetCustomSubtype,
+		requestId: Buffer,
+		decode: (payload: Buffer) => T,
+		timeoutMs: number,
+		timeoutMessage: string
+	): { reply: Promise<T>; cleanup: () => void } {
+		let cleanup = (): void => undefined;
+		const reply = new Promise<T>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				cleanup();
+				reject(new Error(timeoutMessage));
+			}, timeoutMs);
+			timer.unref?.();
+			const onMsg = (msg: {
+				peerPubkey: string;
+				subtype: number;
+				payload: Buffer;
+			}): void => {
+				if (msg.peerPubkey !== peerPubkeyHex) return;
+				if (msg.subtype !== subtype) return;
+				let decoded: T;
+				try {
+					decoded = decode(msg.payload);
+				} catch {
+					return;
+				}
+				if (!decoded.requestId.equals(requestId)) return;
+				cleanup();
+				resolve(decoded);
+			};
+			cleanup = (): void => {
+				clearTimeout(timer);
+				this.removeListener('custom-message', onMsg);
+			};
+			this.on('custom-message', onMsg);
+		});
+		return { reply, cleanup: () => cleanup() };
+	}
+
+	/**
+	 * Ask an LSP what a just-in-time receive would cost and whether it would
+	 * be served right now, without registering an intent (issue #687). The
+	 * price belongs BEFORE the decision to create an invoice: on a receive
+	 * form beside the amount, or when a wallet picks between providers.
+	 *
+	 * A decline is returned, not thrown: it is an answer ("not right now,
+	 * because ..."), and the caller shows it. Only the transport failures
+	 * throw (peer not connected, no reply in time). `withinCeilings` says
+	 * whether this node would accept the quoted fee when it comes to
+	 * register the intent, judged against its configured ceilings.
+	 */
+	async requestJitQuote(
+		lspPubkeyHex: string,
+		params: {
+			/** The receive in mind (msat); the default is the amount-less cap. */
+			maxAmountMsat?: bigint;
+			/** Inbound to leave over after the receive (sat). */
+			targetRemainingInboundSat?: bigint;
+			timeoutMs?: number;
+		} = {}
+	): Promise<
+		IJitReceiveQuote & {
+			/** The opening fee on this receive at the quoted rate (sat, rounded up). */
+			feeSats: bigint;
+			withinCeilings: boolean;
+		}
+	> {
+		const pubkeyErr = validateHexPubkey(lspPubkeyHex, 'lspPubkeyHex');
+		if (pubkeyErr) throw new Error(pubkeyErr);
+		const maxAmountMsat = params.maxAmountMsat ?? JIT_RECEIVE_DEFAULT_MAX_MSAT;
+		if (maxAmountMsat <= 0n) {
+			throw new Error('maxAmountMsat must be positive');
+		}
+		const requestId = crypto.randomBytes(8);
+		const { reply, cleanup } = this.awaitJitReply(
+			lspPubkeyHex,
+			BeignetCustomSubtype.JIT_RECEIVE_QUOTE_ACK,
+			requestId,
+			decodeJitQuote,
+			params.timeoutMs ?? JIT_RECEIVE_ACK_TIMEOUT_MS,
+			'timed out waiting for the LSP JIT quote'
+		);
+		try {
+			this.sendCustomMessage(
+				lspPubkeyHex,
+				BeignetCustomSubtype.JIT_RECEIVE_QUOTE,
+				encodeJitQuoteRequest({
+					requestId,
+					maxAmountMsat,
+					targetRemainingInboundSat: params.targetRemainingInboundSat ?? 0n
+				})
+			);
+		} catch (err) {
+			cleanup();
+			throw err;
+		}
+		const quote = await reply;
+		const feeMsat = jitOpeningFeeMsat(maxAmountMsat, quote);
+		return {
+			...quote,
+			feeSats: (feeMsat + 999n) / 1000n,
+			withinCeilings:
+				quote.flatFeeSat <= this.jitClientMaxFlatFeeSat &&
+				quote.feePpm <= this.jitClientMaxFeePpm
+		};
+	}
 
 	/**
 	 * Register a receive intent with an LSP and return the routing hint that
@@ -16029,36 +16201,14 @@ export class LightningNode extends EventEmitter {
 		// arrives this is the only thing tying an answer to this request.
 		const requestId = crypto.randomBytes(8);
 
-		let cleanup = (): void => undefined;
-		const ackPromise = new Promise<IJitReceiveAck>((resolve, reject) => {
-			const timer = setTimeout(() => {
-				cleanup();
-				reject(new Error('timed out waiting for the LSP JIT receive ack'));
-			}, params.timeoutMs ?? JIT_RECEIVE_ACK_TIMEOUT_MS);
-			timer.unref?.();
-			const onMsg = (msg: {
-				peerPubkey: string;
-				subtype: number;
-				payload: Buffer;
-			}): void => {
-				if (msg.peerPubkey !== lspPubkeyHex) return;
-				if (msg.subtype !== BeignetCustomSubtype.JIT_RECEIVE_ACK) return;
-				let ack: IJitReceiveAck;
-				try {
-					ack = decodeJitAck(msg.payload);
-				} catch {
-					return; // malformed ack: keep waiting for a well-formed one
-				}
-				if (!ack.requestId.equals(requestId)) return;
-				cleanup();
-				resolve(ack);
-			};
-			cleanup = (): void => {
-				clearTimeout(timer);
-				this.removeListener('custom-message', onMsg);
-			};
-			this.on('custom-message', onMsg);
-		});
+		const { reply: ackPromise, cleanup } = this.awaitJitReply(
+			lspPubkeyHex,
+			BeignetCustomSubtype.JIT_RECEIVE_ACK,
+			requestId,
+			decodeJitAck,
+			params.timeoutMs ?? JIT_RECEIVE_ACK_TIMEOUT_MS,
+			'timed out waiting for the LSP JIT receive ack'
+		);
 
 		try {
 			this.sendCustomMessage(
