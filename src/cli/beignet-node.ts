@@ -7460,7 +7460,14 @@ export class BeignetNode extends EventEmitter {
 		};
 	}
 
-	cancelPayment(paymentHash: string): { ok: boolean } {
+	/**
+	 * `{ ok: true }` rather than `{ ok: boolean }`: this is served through
+	 * POST /payment/cancel, and a `result` carrying its own `ok: false` is a
+	 * third envelope shape most clients do not look for (issue #614). A
+	 * refusal here has to be a thrown BeignetError, so the daemon answers with
+	 * the failure envelope and a status to match.
+	 */
+	cancelPayment(paymentHash: string): { ok: true } {
 		this.node.failPayment(Buffer.from(paymentHash, 'hex'));
 		return { ok: true };
 	}

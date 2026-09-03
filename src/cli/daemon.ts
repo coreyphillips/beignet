@@ -456,15 +456,15 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 }
 
 /**
- * One SSE frame. Both lines are contract: a client's parser keys its handlers
- * off the `event:` name and drops a frame that has none, and it JSON.parses
- * `data:` unconditionally.
+ * One SSE frame. Both lines are contract: a consumer keys its handlers off the
+ * `event:` name (the LFBW dashboard drops a frame that has none) and parses
+ * `data:` as JSON.
  *
  * `?? {}` because node:ready is emitted with no payload at all, and
  * JSON.stringify(undefined) returns the value undefined, which interpolates as
- * the literal text `data: undefined` and throws in that parser. The webhook
- * path never had this: its payload is an object, and an undefined member is
- * simply left out of the JSON.
+ * the literal text `data: undefined`. That is not JSON, so a consumer parsing
+ * the line gets an exception in place of the event. The webhook path never had
+ * this: its payload is an object, and an undefined member is simply left out.
  */
 export function formatSseFrame(eventName: string, data: unknown): string {
 	return `event: ${eventName}\ndata: ${JSON.stringify(data ?? {})}\n\n`;
