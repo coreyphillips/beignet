@@ -18,7 +18,8 @@ import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
-import { startDaemon } from '../../src/cli/daemon';
+import { startDaemon, statusForErrorCode } from '../../src/cli/daemon';
+import { jitInvoiceError } from '../../src/cli/beignet-node';
 import { BeignetError } from '../../src/cli/errors';
 import { decode } from '../../src/lightning/invoice/decode';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
@@ -223,6 +224,43 @@ describe('JIT receive daemon surface', function () {
 			error,
 			'an unreachable LSP is an error, never an invoice'
 		).to.not.equal(null);
+		// Typed (issue #671): the daemon answers 409 PEER_NOT_CONNECTED with
+		// the reason rather than scrubbing it to INTERNAL_ERROR.
+		expect((error as BeignetError).code).to.equal('PEER_NOT_CONNECTED');
+	});
+
+	// Issue #671: every refusal the wallet side throws as a plain Error has a
+	// typed code and a status the app can act on; a genuine fault stays
+	// untyped and scrubbed.
+	it('types the LSP decline, the ceiling refusal and the ack timeout', () => {
+		const typed = (message: string): BeignetError =>
+			jitInvoiceError(new Error(message)) as BeignetError;
+		expect(
+			typed(
+				'LSP declined the JIT receive intent: at most 2 live intents per peer'
+			).code
+		).to.equal('JIT_REFUSED');
+		expect(
+			typed(
+				'LSP quoted 500 sat + 0 ppm, above the accepted maximum of 250 sat + 3000 ppm'
+			).code
+		).to.equal('JIT_REFUSED');
+		expect(
+			typed('LSP accepted the intent without an intercept scid').code
+		).to.equal('JIT_REFUSED');
+		expect(
+			typed('timed out waiting for the LSP JIT receive ack').code
+		).to.equal('JIT_TIMEOUT');
+		expect(typed('Not connected to peer 02ab').code).to.equal(
+			'PEER_NOT_CONNECTED'
+		);
+		expect(typed('LSP declined the JIT receive intent: x').message).to.match(
+			/at most|declined/
+		);
+		const fault = new Error('database is locked');
+		expect(jitInvoiceError(fault)).to.equal(fault);
+		expect(statusForErrorCode('JIT_REFUSED')).to.equal(400);
+		expect(statusForErrorCode('JIT_TIMEOUT')).to.equal(504);
 	});
 
 	it('dispatches POST /jit/invoice and requires the LSP pubkey', async () => {

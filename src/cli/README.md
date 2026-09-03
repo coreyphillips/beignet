@@ -1062,6 +1062,8 @@ not repeat a 4xx unchanged.
 | `SPLICE_REFUSED` | Channels | 409 | The channel exists but would not start the splice (state, peer, size) |
 | `SPLICE_BUSY` | Channels | 503 | The channel would splice but is held off by a state that ends on its own; retry the same request |
 | `PEER_NOT_CONNECTED` | Peers | 409 | Peer is not connected |
+| `JIT_REFUSED` | Invoices | 400 | JIT receive: the LSP declined the intent, quoted above the wallet's ceiling, or answered with no intercept scid; the message carries the reason |
+| `JIT_TIMEOUT` | Invoices | 504 | JIT receive: the LSP never answered the intent inside the ack window (retryable) |
 | `CONNECT_FAILED` | Peers | 502 | Dialing the peer failed |
 | `CONNECT_TIMEOUT` | Peers | 504 | The peer did not answer the dial in time |
 | `NODE_DESTROYED` | Node | 409 | Operation on destroyed node |
