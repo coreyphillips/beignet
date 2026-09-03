@@ -1144,4 +1144,67 @@ export interface BeignetNodeEvents {
 		/** Capsule restores only: true after a Tier 2 install replaced the database. */
 		restartRequired?: boolean;
 	}) => void;
+	/**
+	 * JIT receive, LSP side (issue #669). Relayed JSON-safe: every satoshi and
+	 * millisatoshi figure is a decimal string. `jit:intent` is a wallet's
+	 * accepted request, keyed by the intercept scid the LSP minted for it;
+	 * `jit:intercepted` a payment part held for it (or, on the splice path,
+	 * for an existing channel); `jit:funding` the open or splice starting;
+	 * `jit:forwarded` the held parts delivered; `jit:failed` the parts failed
+	 * back upstream with the reason.
+	 */
+	'jit:intent': (data: {
+		scidHex: string;
+		walletPubkeyHex: string;
+		paymentHashHex?: string;
+		maxAmountMsat: string;
+		expectedTotalMsat?: string;
+		targetRemainingInboundSat: string;
+		expiresAt: number;
+	}) => void;
+	'jit:intent-superseded': (data: {
+		scidHex: string;
+		walletPubkeyHex: string;
+	}) => void;
+	'jit:intercepted': (data: {
+		scidHex?: string;
+		channelIdHex?: string;
+		amountMsat: string;
+	}) => void;
+	'jit:funding': (data: {
+		scidHex?: string;
+		channelIdHex?: string;
+		fundingSats: string;
+	}) => void;
+	'jit:forwarded': (data: {
+		scidHex?: string;
+		channelIdHex?: string;
+		parts: number;
+	}) => void;
+	'jit:failed': (data: {
+		scidHex?: string;
+		channelIdHex?: string;
+		parts: number;
+		reason: string;
+	}) => void;
+	/**
+	 * Direct funding, receiver side (issue #669): a payer's offer accepted
+	 * (`paired` says whether it came from a peer in the trusted set, which is
+	 * what decides zero-conf and the splice path), declined or failed with the
+	 * reason, or completed with the funding out.
+	 */
+	'direct-funding:offer:accepted': (data: {
+		offerId: string;
+		paired: boolean;
+		resumed?: boolean;
+	}) => void;
+	'direct-funding:offer:declined': (data: {
+		offerId: string;
+		reason: string;
+	}) => void;
+	'direct-funding:offer:failed': (data: {
+		offerId: string;
+		reason: string;
+	}) => void;
+	'direct-funding:offer:completed': (data: { offerId: string }) => void;
 }

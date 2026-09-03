@@ -16,6 +16,7 @@
  * envelope check #614 asks for against a live daemon rather than a fixture.
  */
 
+import { jsonSafeEvent } from '../../src/cli/beignet-node';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
@@ -476,14 +477,37 @@ describe('LFBW app surface (issue #614)', () => {
 			);
 		});
 
-		// Phase 4's jit:* events stop at the liquidity engine: nothing in the
-		// daemon relays them and nothing in the app listens. Recorded so the
-		// absence reads as a decision if someone goes looking for progress.
-		it('relays no jit or direct-funding event', () => {
-			for (const e of getRelayedEvents(true)) {
-				expect(e.startsWith('jit:'), e).to.equal(false);
-				expect(e.startsWith('df:'), e).to.equal(false);
+		// Issue #669: the progress of a funding the node fronts (JIT, LSP side)
+		// or receives (direct funding) is relayed, so the app follows it without
+		// polling. The engines carry bigints; the relay stringifies them.
+		it('relays the jit and direct-funding progress events, JSON-safe', () => {
+			const relayed = getRelayedEvents(true);
+			for (const e of [
+				'jit:intent',
+				'jit:intent-superseded',
+				'jit:intercepted',
+				'jit:funding',
+				'jit:forwarded',
+				'jit:failed',
+				'direct-funding:offer:accepted',
+				'direct-funding:offer:declined',
+				'direct-funding:offer:failed',
+				'direct-funding:offer:completed'
+			]) {
+				expect(relayed, e).to.include(e);
 			}
+			const safe = jsonSafeEvent({
+				interceptScidHex: 'ab',
+				maxAmountMsat: 5_000_000n,
+				nested: { fundingSats: 21n, id: Buffer.from('cd', 'hex') },
+				gone: undefined
+			}) as Record<string, unknown>;
+			expect(() => JSON.stringify(safe)).to.not.throw();
+			expect(safe).to.deep.equal({
+				interceptScidHex: 'ab',
+				maxAmountMsat: '5000000',
+				nested: { fundingSats: '21', id: 'cd' }
+			});
 		});
 	});
 
