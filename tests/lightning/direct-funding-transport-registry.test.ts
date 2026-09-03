@@ -178,6 +178,134 @@ describe('Direct-funding transport registry', () => {
 		});
 	});
 
+	describe('an existing connection to the receiver', () => {
+		// The beignet-umbrel case: a home node paying its own lightning-first
+		// wallet, which published no address (an Umbrel publishes no ports)
+		// and named that same node as its relay. The connection between them
+		// already exists; dialing the relay meant the node dialing itself.
+		it('tries the direct lane first when the payer is already connected, whatever the receiver listed', async () => {
+			const peerLane = new StubFactory(DfTransportType.DIRECT_PEER);
+			const relayLane = new StubFactory(DfTransportType.LSP_RELAY);
+			const registry = new DfTransportRegistry(undefined, {
+				isPeerConnected: (hex) => hex === NODE_A.toString('hex')
+			});
+			registry.register({
+				type: DfTransportType.DIRECT_PEER,
+				enabled: true,
+				load: () => peerLane
+			});
+			registry.register({
+				type: DfTransportType.LSP_RELAY,
+				enabled: true,
+				load: () => relayLane
+			});
+
+			const used = await registry.run(
+				[relay()],
+				CTX,
+				async (lane) => lane.type
+			);
+			expect(used).to.equal(DfTransportType.DIRECT_PEER);
+			expect(relayLane.opens).to.equal(0);
+		});
+
+		it("falls back to the receiver's descriptors when the direct lane does not establish", async () => {
+			const peerLane = new StubFactory(DfTransportType.DIRECT_PEER, 'null');
+			const relayLane = new StubFactory(DfTransportType.LSP_RELAY);
+			const registry = new DfTransportRegistry(undefined, {
+				isPeerConnected: () => true
+			});
+			registry.register({
+				type: DfTransportType.DIRECT_PEER,
+				enabled: true,
+				load: () => peerLane
+			});
+			registry.register({
+				type: DfTransportType.LSP_RELAY,
+				enabled: true,
+				load: () => relayLane
+			});
+
+			const used = await registry.run(
+				[relay()],
+				CTX,
+				async (lane) => lane.type
+			);
+			expect(used).to.equal(DfTransportType.LSP_RELAY);
+			expect(peerLane.opens).to.equal(1);
+		});
+
+		it('leaves the order alone when not connected, or when the receiver listed a direct address itself', async () => {
+			const peerLane = new StubFactory(DfTransportType.DIRECT_PEER);
+			const relayLane = new StubFactory(DfTransportType.LSP_RELAY);
+			const registry = new DfTransportRegistry(undefined, {
+				isPeerConnected: () => false
+			});
+			registry.register({
+				type: DfTransportType.DIRECT_PEER,
+				enabled: true,
+				load: () => peerLane
+			});
+			registry.register({
+				type: DfTransportType.LSP_RELAY,
+				enabled: true,
+				load: () => relayLane
+			});
+			expect(
+				await registry.run([relay()], CTX, async (lane) => lane.type)
+			).to.equal(DfTransportType.LSP_RELAY);
+			expect(peerLane.opens).to.equal(0);
+
+			const connected = new DfTransportRegistry(undefined, {
+				isPeerConnected: () => true
+			});
+			const peer2 = new StubFactory(DfTransportType.DIRECT_PEER);
+			const relay2 = new StubFactory(DfTransportType.LSP_RELAY);
+			connected.register({
+				type: DfTransportType.DIRECT_PEER,
+				enabled: true,
+				load: () => peer2
+			});
+			connected.register({
+				type: DfTransportType.LSP_RELAY,
+				enabled: true,
+				load: () => relay2
+			});
+			expect(
+				await connected.run(
+					[relay(), directPeer()],
+					CTX,
+					async (lane) => lane.type
+				)
+			).to.equal(DfTransportType.LSP_RELAY);
+		});
+
+		it('skips a relay descriptor that names the payer itself', async () => {
+			const relayLane = new StubFactory(DfTransportType.LSP_RELAY);
+			const log = recordingLog();
+			const registry = new DfTransportRegistry(log.log, {
+				nodeId: () => NODE_B
+			});
+			registry.register({
+				type: DfTransportType.LSP_RELAY,
+				enabled: true,
+				load: () => relayLane
+			});
+			let refused: unknown;
+			try {
+				await registry.run([relay()], CTX, async (lane) => lane.type);
+			} catch (err) {
+				refused = err;
+			}
+			expect(refused).to.be.instanceOf(DirectFundingError);
+			expect((refused as DirectFundingError).code).to.equal(
+				DirectFundingErrorCode.UNREACHABLE
+			);
+			expect(relayLane.opens).to.equal(0);
+			expect(log.reasons()).to.include(DfLaneSkipReason.SELF_RELAY);
+		});
+	});
+
 	describe('unknown and disabled descriptors', () => {
 		it('skips a descriptor type nobody claims and keeps going', async () => {
 			const peerLane = new StubFactory(DfTransportType.DIRECT_PEER);

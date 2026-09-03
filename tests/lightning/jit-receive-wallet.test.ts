@@ -143,11 +143,13 @@ function isMintedScid(scid: Buffer): boolean {
 }
 
 /** A NORMAL channel with inbound, so a blinded path can be built from it. */
-function injectNormalChannel(node: LightningNode): void {
+function injectNormalChannel(node: LightningNode, peerHex?: string): void {
 	const channelId = crypto.randomBytes(32);
-	const peerPubkey = getPublicKey(
-		crypto.createHash('sha256').update('jit3b-blinded-peer').digest()
-	);
+	const peerPubkey = peerHex
+		? Buffer.from(peerHex, 'hex')
+		: getPublicKey(
+				crypto.createHash('sha256').update('jit3b-blinded-peer').digest()
+		  );
 	const state = createOpenerState({
 		temporaryChannelId: crypto.randomBytes(32),
 		fundingSatoshis: 1_000_000n,
@@ -400,6 +402,41 @@ describe('JIT receive wallet side (issue #595)', function () {
 		expect(record.jitFee).to.deep.equal({ flatFeeSat: 2, feePpm: 1000 });
 		expect(result.flatFeeSat).to.equal(2n);
 		expect(result.feePpm).to.equal(1000);
+	});
+
+	// The intent still stands, so a payment that outgrows the channel is held
+	// at the LSP's addHtlc refusal and answered with a splice (tryHoldForSplice)
+	// rather than a second channel, which is what the intercept hint alongside
+	// the channel's own hint had payers pick.
+	it('routes over an existing usable channel with the LSP rather than the intercept hint', async () => {
+		const pair = nodePair();
+		open.push(pair);
+		injectNormalChannel(pair.bob, pair.alice.getNodeId());
+		const result = await pair.bob.createJitInvoice({
+			lspPubkeyHex: pair.alice.getNodeId(),
+			amountMsat: 5_000_000n,
+			description: 'over the home channel'
+		});
+		const decoded = decode(result.bolt11);
+		const hops = (decoded.routingHints ?? []).flat();
+		expect(hops.length, "the channel's own hint only").to.equal(1);
+		expect(hops[0].pubkey.toString('hex')).to.equal(pair.alice.getNodeId());
+		expect(
+			hops[0].shortChannelId.equals(result.interceptScid),
+			'not the intercept'
+		).to.equal(false);
+		expect(
+			decoded.minFinalCltvExpiry,
+			'the splice needs the same headroom'
+		).to.equal(72);
+		expect(
+			isMintedScid(result.interceptScid),
+			'the intent was registered all the same'
+		).to.equal(true);
+		const record = (pair.bob as any).invoices.get(
+			result.paymentHash.toString('hex')
+		) as IInvoiceInfo;
+		expect(record.jitFee, 'and the fee allowance').to.not.equal(undefined);
 	});
 
 	it('keeps the intercept hint out of a blinded invoice', async () => {

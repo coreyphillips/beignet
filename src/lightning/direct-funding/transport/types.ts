@@ -126,7 +126,9 @@ export enum DfLaneSkipReason {
 	/** Connection establishment failed. The ONLY fall-through rev 2 allows. */
 	NOT_ESTABLISHED = 'lane_not_established',
 	/** The exchange failed before either side had put a frame on the lane. */
-	NO_FRAME_EXCHANGED = 'no_frame_exchanged'
+	NO_FRAME_EXCHANGED = 'no_frame_exchanged',
+	/** The relay descriptor names this node: a payer cannot relay through itself. */
+	SELF_RELAY = 'relay_is_self'
 }
 
 /** Structured-log sink. 4D maps this onto the node's `emitStructuredLog`. */
