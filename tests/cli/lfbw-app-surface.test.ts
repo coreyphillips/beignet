@@ -8,16 +8,26 @@
  * fails SILENTLY in the app: an SSE event is bound by name and a rename just
  * stops updating the UI, and a refusal served as a 200 reads as a success.
  *
- * The direct-funding rows of the checklist (POST /direct-funding/configure,
- * /config, /request, /send, and the BEIGNET_DF_* variables) arrive with
- * workstream 4D and are not on this branch, so they are not covered here.
+ * The behaviour behind these rows is tested by the workstream that added it;
+ * direct-funding-config.test.ts (4D) covers the configure merge, the minimum
+ * clamp and the BEIGNET_DF_* resolution, and direct-funding-envelope.test.ts
+ * (4A) covers the envelope against a fixture. What is here is the app's view of
+ * it: the parameter names it posts, the field names it reads back, and the one
+ * envelope check #614 asks for against a live daemon rather than a fixture.
  */
 
 import * as fs from 'fs';
+import * as http from 'http';
+import * as os from 'os';
 import * as path from 'path';
+import { AddressInfo } from 'net';
 import { expect } from 'chai';
 
-import { formatSseFrame, getRelayedEvents } from '../../src/cli/daemon';
+import {
+	formatSseFrame,
+	getRelayedEvents,
+	startDaemon
+} from '../../src/cli/daemon';
 import { getOpenApiSpec } from '../../src/cli/openapi';
 import { resolveConfig } from '../../src/cli/config';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
@@ -209,6 +219,83 @@ describe('LFBW app surface (issue #614)', () => {
 			);
 			expect(match, 'JIT_RECEIVE_ACK_TIMEOUT_MS').to.exist;
 			expect(Number(match![1].replace(/_/g, ''))).to.be.lessThan(20_000);
+		});
+
+		// 4D, issue #613. The dashboard posts {minAmountSat} alone and then
+		// requires lspPubkey in the readback, and the app's manager posts the
+		// other five without minAmountSat, so the route has to MERGE. Both
+		// halves of that are in the handler: it destructures each field and
+		// spreads it only when the caller named it.
+		it('POST /direct-funding/configure takes the six fields and merges them', () => {
+			const fields = [
+				'lspPubkey',
+				'lspHost',
+				'lspPort',
+				'targetInboundSat',
+				'trusted',
+				'minAmountSat'
+			];
+			expect(requestParams('/direct-funding/configure')).to.include.members(
+				fields
+			);
+			const handler = handlerSource('POST /direct-funding/configure', 1400);
+			for (const field of fields) {
+				expect(handler, `${field} is spread only when named`).to.include(
+					`...(${field} !== undefined ? { ${field} } : {})`
+				);
+			}
+		});
+
+		// The dashboard hides its policy card when this call fails, so the
+		// readback is the same object configure answers with.
+		it('GET /direct-funding/config answers the shape configure returns', () => {
+			const fields = [
+				'lspPubkey',
+				'lspHost',
+				'lspPort',
+				'targetInboundSat',
+				'trusted',
+				'minAmountSat'
+			];
+			expect(responseFields('/direct-funding/config', 'get')).to.have.members(
+				fields
+			);
+			expect(responseFields('/direct-funding/configure')).to.have.members(
+				fields
+			);
+		});
+
+		// host and port are the CALLER's: the dashboard sends the browser's own
+		// hostname and the manager sends PUBLIC_HOST, and the daemon cannot know
+		// which is right, so it must not substitute its own.
+		it('POST /direct-funding/request takes host, port and amountSats verbatim', () => {
+			expect(requestParams('/direct-funding/request')).to.include.members([
+				'host',
+				'port',
+				'amountSats'
+			]);
+			expect(responseFields('/direct-funding/request')).to.include.members([
+				'paymentHash',
+				'expiresAt',
+				'request'
+			]);
+			const handler = handlerSource('POST /direct-funding/request', 900);
+			expect(handler).to.include('...(dfHost !== undefined ? { host: dfHost }');
+			expect(handler).to.include('...(dfPort !== undefined ? { port: dfPort }');
+		});
+
+		// feeHeadroomSats is what the app posts today; maxTotalFeeSat is the
+		// documented name. Dropping the alias would silently uncap the fee.
+		it('POST /direct-funding/send takes maxTotalFeeSat and the feeHeadroomSats alias', () => {
+			expect(requestParams('/direct-funding/send')).to.include.members([
+				'request',
+				'amountSats',
+				'maxTotalFeeSat',
+				'feeHeadroomSats'
+			]);
+			const handler = handlerSource('POST /direct-funding/send', 900);
+			expect(handler).to.include('feeHeadroomSats');
+			expect(handler).to.include('maxTotalFeeSat');
 		});
 
 		// Deliberate, and recorded in src/lightning/README.md: third-party
@@ -404,6 +491,8 @@ describe('LFBW app surface (issue #614)', () => {
 			'BEIGNET_FEE_PPM',
 			'BEIGNET_CLTV_DELTA',
 			'BEIGNET_LEASE_RATES',
+			'BEIGNET_DF_RELAY',
+			'BEIGNET_DF_MIN_AMOUNT',
 			'BEIGNET_SWARM',
 			'BEIGNET_TRUSTED_ZERO_CONF_SPLICE'
 		];
@@ -419,6 +508,8 @@ describe('LFBW app surface (issue #614)', () => {
 			process.env.BEIGNET_FEE_BASE_MSAT = '1000';
 			process.env.BEIGNET_FEE_PPM = '100';
 			process.env.BEIGNET_CLTV_DELTA = '80';
+			process.env.BEIGNET_DF_RELAY = 'true';
+			process.env.BEIGNET_DF_MIN_AMOUNT = '25000';
 			process.env.BEIGNET_LEASE_RATES = JSON.stringify({
 				fundingWeightWitness: 666,
 				leaseFeeBasis: 100,
@@ -435,6 +526,8 @@ describe('LFBW app surface (issue #614)', () => {
 			expect(config.routingFeeBaseMsat).to.equal(1000);
 			expect(config.routingFeePpm).to.equal(100);
 			expect(config.routingCltvDelta).to.equal(80);
+			expect(config.dfRelay).to.equal(true);
+			expect(config.dfMinAmountSat).to.equal(25_000);
 			expect(config.leaseRates?.leaseFeeBaseSat).to.equal(500);
 		});
 
@@ -507,6 +600,97 @@ describe('LFBW app surface (issue #614)', () => {
 			expect(
 				Object.keys(require.cache).some((k) => k.includes('hyperswarm'))
 			).to.equal(false);
+		});
+	});
+
+	/**
+	 * The dashboard's own decode, run over an envelope a live daemon just
+	 * minted. #614 asks for this row end to end rather than against a fixture:
+	 * 4A pins the offsets against a constructed envelope, and this says the
+	 * daemon's minting path puts the same bytes in the same places.
+	 *
+	 * The decoder is hard coded to those offsets and FAILS OPEN. A field that
+	 * moves does not raise in the app, it shows a different node id, a
+	 * different expiry or a different amount, so the wrong number reaches the
+	 * person deciding whether to pay.
+	 */
+	describe('minted envelope, against a live daemon', function () {
+		this.timeout(30_000);
+		let dataDir: string;
+		let daemon: Awaited<ReturnType<typeof startDaemon>>;
+		let port: number;
+
+		const call = (
+			route: string,
+			body?: unknown
+		): Promise<Record<string, unknown>> =>
+			new Promise((resolve, reject) => {
+				const req = http.request(
+					{
+						host: '127.0.0.1',
+						port,
+						path: route,
+						method: body === undefined ? 'GET' : 'POST',
+						headers: { 'content-type': 'application/json' }
+					},
+					(res) => {
+						let raw = '';
+						res.on('data', (c) => (raw += c));
+						res.on('end', () =>
+							resolve(JSON.parse(raw) as Record<string, unknown>)
+						);
+					}
+				);
+				req.on('error', reject);
+				req.end(body === undefined ? undefined : JSON.stringify(body));
+			});
+
+		before(async () => {
+			dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-5a-'));
+			daemon = await startDaemon({
+				dataDir,
+				// No reachable Electrum: minting a request is local work, and a
+				// daemon that never syncs starts faster than one that does.
+				electrumHost: '127.0.0.1',
+				electrumPort: 65529,
+				electrumTls: false,
+				rapidGossipSync: false,
+				autoGossipSync: false,
+				logLevel: 'silent',
+				network: 'regtest',
+				mnemonic:
+					'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+				daemonPort: 0
+			});
+			port = (daemon.server.address() as AddressInfo).port;
+		});
+
+		after(async () => {
+			await daemon.stop();
+			fs.rmSync(dataDir, { recursive: true, force: true });
+		});
+
+		it('decodes at the offsets the dashboard reads', async () => {
+			const info = (await call('/info')).result as { nodeId: string };
+			const minted = (
+				await call('/direct-funding/request', {
+					host: '10.0.0.5',
+					port: 9736,
+					amountSats: 250_000
+				})
+			).result as { request: string; expiresAt: number };
+
+			// The dashboard's gate: unpadded base64url, or it does not decode at
+			// all. A '=' survives a BIP 21 round trip percent-encoded and would
+			// fail the regex on the far side.
+			expect(minted.request).to.match(/^[A-Za-z0-9_-]+$/);
+
+			const bytes = Buffer.from(minted.request, 'base64url');
+			expect(bytes.subarray(49, 82).toString('hex')).to.equal(info.nodeId);
+			expect(bytes.readUIntBE(82, 6)).to.equal(minted.expiresAt);
+			// Byte 88 is the flags bit that says an amount follows at 89.
+			expect(bytes[88] & 1).to.equal(1);
+			expect(bytes.readBigUInt64BE(89)).to.equal(250_000n);
 		});
 	});
 
