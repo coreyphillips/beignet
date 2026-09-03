@@ -458,6 +458,7 @@ async function handleStart(): Promise<void> {
 		cliFlags.recoveryGuardians = recoveryGuardianFlags;
 	const recoveryProfileFlag = parseFlag('--recovery-profile');
 	if (recoveryProfileFlag) cliFlags.recoveryProfile = recoveryProfileFlag;
+	if (hasFlag('--recovery-auto-apply')) cliFlags.recoveryAutoApply = true;
 
 	const config = resolveConfig(cliFlags);
 
@@ -516,6 +517,9 @@ async function handleStart(): Promise<void> {
 			recoveryProfile: config.recoveryProfile,
 			recoveryLeaseCheckIntervalMs: config.recoveryLeaseCheckIntervalMs,
 			recoveryReestablishHoldMs: config.recoveryReestablishHoldMs,
+			recoveryAutoApply: config.recoveryAutoApply,
+			recoveryAutoApplySettleMs: config.recoveryAutoApplySettleMs,
+			recoveryAutoApplyMaxWaitMs: config.recoveryAutoApplyMaxWaitMs,
 			routingFeeBaseMsat: config.routingFeeBaseMsat,
 			routingFeePpm: config.routingFeePpm,
 			routingCltvDelta: config.routingCltvDelta,
@@ -2912,6 +2916,14 @@ Start flags:
   --recovery-profile <name>              Recovery fault-model profile; crash-v1 is
                                          the only accepted value and the default
                                          (env BEIGNET_RECOVERY_PROFILE)
+  --recovery-auto-apply                  peer-storage mode: on a boot whose database
+                                         is empty, apply the best Recovery Capsule the
+                                         storage peers return with no operator call,
+                                         then resume the channels in-process. Cannot
+                                         fence a previous device that still runs
+                                         (default: off; env BEIGNET_RECOVERY_AUTO_APPLY;
+                                         BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS and
+                                         _MAX_WAIT_MS bound the wait for replicas)
 
 Pay-retry flags:
   --max-retries <N>                      Max retry attempts (default: 3)

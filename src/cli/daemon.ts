@@ -450,6 +450,7 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'recovery:fenced',
 		'recovery:backfill-lost',
 		'recovery:reestablish-held',
+		'recovery:capsule-retrieved',
 		'recovery:guardian_unreachable',
 		'recovery:restore-progress',
 		'recovery:restored',
@@ -649,6 +650,77 @@ async function bootDaemon(
 			)}"; BEIGNET_RECOVERY_REESTABLISH_HOLD_MS must be an integer ` +
 				'between 0 and 2147483647 (0 answers immediately)'
 		);
+	}
+	// Automatic capsule application (issue #690). The flag is an unfenced
+	// adoption of another device's channel state, so it is refused outside
+	// the one mode it applies to rather than ignored: an operator who set it
+	// under a guardian mode believed in an automation that does not exist
+	// there (the guardian path fences, and restores through its own route).
+	if (
+		opts.recoveryAutoApply !== undefined &&
+		typeof opts.recoveryAutoApply !== 'boolean'
+	) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'recoveryAutoApply must be a boolean (BEIGNET_RECOVERY_AUTO_APPLY ' +
+				'is exact true or false)'
+		);
+	}
+	if (opts.recoveryAutoApply === true && recoveryMode !== 'peer-storage') {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Recovery auto-apply is configured but the recovery mode is ` +
+				`"${opts.recoveryMode ?? 'off'}" (resolved: ${recoveryMode}); ` +
+				'BEIGNET_RECOVERY_AUTO_APPLY applies to peer-storage mode only'
+		);
+	}
+	for (const [name, value, env] of [
+		[
+			'recoveryAutoApplySettleMs',
+			opts.recoveryAutoApplySettleMs,
+			'BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS'
+		],
+		[
+			'recoveryAutoApplyMaxWaitMs',
+			opts.recoveryAutoApplyMaxWaitMs,
+			'BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS'
+		]
+	] as const) {
+		if (
+			value !== undefined &&
+			(!Number.isInteger(value) || value < 0 || value > 2_147_483_647)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`Invalid ${name} "${String(value)}"; ${env} must be an integer ` +
+					'between 0 and 2147483647'
+			);
+		}
+	}
+	{
+		const settle = opts.recoveryAutoApplySettleMs ?? 15_000;
+		const ceiling = opts.recoveryAutoApplyMaxWaitMs ?? 120_000;
+		const hold = opts.recoveryReestablishHoldMs ?? 600_000;
+		if (ceiling < settle) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`Recovery auto-apply ceiling ${ceiling} ms is below its settle ` +
+					`floor ${settle} ms; BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS ` +
+					'must be at least BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS'
+			);
+		}
+		// The whole point of applying automatically is to beat the unknown
+		// channel reestablish hold; a ceiling past it would let the peer
+		// force-close the channel the capsule was about to resume.
+		if (opts.recoveryAutoApply === true && hold > 0 && ceiling >= hold) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`Recovery auto-apply ceiling ${ceiling} ms does not fit inside ` +
+					`the reestablish hold ${hold} ms; lower ` +
+					'BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS or raise ' +
+					'BEIGNET_RECOVERY_REESTABLISH_HOLD_MS'
+			);
+		}
 	}
 	const guardianEntries = opts.recoveryGuardians ?? [];
 	if (recoveryMode === 'async-remote' || recoveryMode === 'quorum') {
@@ -2649,6 +2721,21 @@ async function bootDaemon(
 						'is fresh and the guardian set holds its namespace. Run the ' +
 						'admin-scoped restore under /recovery, or check its status ' +
 						'route.'
+				)
+			);
+			return;
+		}
+		if (node.resuming && !RESTART_REQUIRED_ROUTES.has(routeKey)) {
+			// The automatic capsule restore is rebuilding the node in-process
+			// (issue #690): a short window with no node underneath, held the
+			// way the guardian restore holds its deferred construction.
+			endWithResult(
+				res,
+				failure(
+					'NODE_RESTORE_PENDING',
+					'A capsule restore is rebuilding this node on the restored ' +
+						'database; retry shortly (the status route under /recovery ' +
+						'reports the restore).'
 				)
 			);
 			return;

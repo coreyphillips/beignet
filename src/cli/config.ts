@@ -438,6 +438,25 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			cliFlags.recoveryReestablishHoldMs ??
 			integerEnv(process.env.BEIGNET_RECOVERY_REESTABLISH_HOLD_MS) ??
 			file.recoveryReestablishHoldMs,
+		// Exact true/false like autoReconnect: an automatic, unfenced adoption
+		// of another device's channel state must never switch on because of
+		// a typo, and the default (off) is the safe direction.
+		recoveryAutoApply:
+			cliFlags.recoveryAutoApply ??
+			(process.env.BEIGNET_RECOVERY_AUTO_APPLY === 'true'
+				? true
+				: process.env.BEIGNET_RECOVERY_AUTO_APPLY === 'false'
+				? false
+				: undefined) ??
+			file.recoveryAutoApply,
+		recoveryAutoApplySettleMs:
+			cliFlags.recoveryAutoApplySettleMs ??
+			integerEnv(process.env.BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS) ??
+			file.recoveryAutoApplySettleMs,
+		recoveryAutoApplyMaxWaitMs:
+			cliFlags.recoveryAutoApplyMaxWaitMs ??
+			integerEnv(process.env.BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS) ??
+			file.recoveryAutoApplyMaxWaitMs,
 		// Routing fee defaults and the lease seller policy use ?? throughout:
 		// a configured 0 (free base fee, zero ppm) is a real policy and must
 		// survive the merge.

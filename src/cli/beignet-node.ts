@@ -430,6 +430,20 @@ export interface BeignetNodeOptions {
 	 */
 	recoveryReestablishHoldMs?: number;
 	/**
+	 * peer-storage mode: apply the best Recovery Capsule storage peers
+	 * return on a boot whose database is empty, with no operator call, and
+	 * rebuild the node in-process on it (issue #690). Local durability has
+	 * no fencing, so this automates an unfenced adoption: an old device
+	 * still running keeps acting on the same channels. Off by default;
+	 * refused outside peer-storage mode.
+	 */
+	recoveryAutoApply?: boolean;
+	/** Settle floor in ms from the first capsule's arrival (default 15000). */
+	recoveryAutoApplySettleMs?: number;
+	/** Ceiling in ms from the first arrival (default 120000); must be at
+	 *  least the settle floor and fit inside recoveryReestablishHoldMs. */
+	recoveryAutoApplyMaxWaitMs?: number;
+	/**
 	 * Encrypt the SQLite database at rest with a key derived from the wallet
 	 * seed (default true). An existing plaintext database is migrated in place
 	 * on first open; restoring a backup requires the same mnemonic. Set false
@@ -1354,6 +1368,30 @@ export class BeignetNode extends EventEmitter {
 	private _leaseCheckIntervalMs = BeignetNode.DEFAULT_LEASE_CHECK_INTERVAL_MS;
 	/** peer-storage unknown-reestablish hold window (issue #462). */
 	private _reestablishHoldMs = BeignetNode.DEFAULT_REESTABLISH_HOLD_MS;
+	// ─── Automatic capsule application, peer-storage mode (issue #690) ───
+	/** Configured opt-in: apply the best retrieved capsule on an empty boot. */
+	private _recoveryAutoApply = false;
+	private _autoApplySettleMs = BeignetNode.DEFAULT_AUTO_APPLY_SETTLE_MS;
+	private _autoApplyMaxWaitMs = BeignetNode.DEFAULT_AUTO_APPLY_MAX_WAIT_MS;
+	/** True when this boot opened a database with no channel or payment
+	 *  state: the only boot that is a restore target. Cleared once a node
+	 *  was rebuilt on restored state. */
+	private _bootTargetEmpty = false;
+	/** The boot options, kept so the automatic path can rebuild the node
+	 *  in-process on the installed database (the guardian restore keeps the
+	 *  same options under _deferredOpts for its deferred construction). */
+	private _bootOpts?: BeignetNodeOptions;
+	private _autoApply: {
+		phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused';
+		firstArrivalAt?: number;
+		settleUntil?: number;
+		lastReason?: string;
+		settleTimer?: ReturnType<typeof setTimeout>;
+		ceilingTimer?: ReturnType<typeof setTimeout>;
+	} = { phase: 'idle' };
+	/** True while a capsule restore rebuilds the node in-process: the
+	 *  daemon holds every non-recovery route for that window. */
+	private _resuming = false;
 	private mnemonic: string;
 	private networkName: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	private dataDir: string;
@@ -1386,6 +1424,15 @@ export class BeignetNode extends EventEmitter {
 	 * cycle.
 	 */
 	private static readonly DEFAULT_REESTABLISH_HOLD_MS = 10 * 60_000;
+	/**
+	 * Automatic capsule application (issue #690): the settle floor after the
+	 * first capsule arrives, so a replica answering a moment later still
+	 * competes, and the ceiling past which peers that never connected are
+	 * not waited for. Both sit well inside the reestablish hold above; the
+	 * daemon refuses a ceiling that does not.
+	 */
+	private static readonly DEFAULT_AUTO_APPLY_SETTLE_MS = 15_000;
+	private static readonly DEFAULT_AUTO_APPLY_MAX_WAIT_MS = 120_000;
 	/** Largest delay Node's timers honor; beyond it they fire after 1 ms. */
 	private static readonly MAX_TIMER_MS = 2_147_483_647;
 	/**
@@ -1582,6 +1629,52 @@ export class BeignetNode extends EventEmitter {
 			}
 			this._reestablishHoldMs = ms;
 		}
+		if (opts.recoveryAutoApply !== undefined) {
+			if (typeof opts.recoveryAutoApply !== 'boolean') {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'recoveryAutoApply must be a boolean'
+				);
+			}
+			this._recoveryAutoApply = opts.recoveryAutoApply;
+		}
+		for (const [name, value] of [
+			['recoveryAutoApplySettleMs', opts.recoveryAutoApplySettleMs],
+			['recoveryAutoApplyMaxWaitMs', opts.recoveryAutoApplyMaxWaitMs]
+		] as const) {
+			if (value === undefined) continue;
+			if (
+				!Number.isInteger(value) ||
+				value < 0 ||
+				value > BeignetNode.MAX_TIMER_MS
+			) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					`${name} must be an integer between 0 and ` +
+						`${BeignetNode.MAX_TIMER_MS} (got ${String(value)})`
+				);
+			}
+			if (name === 'recoveryAutoApplySettleMs') this._autoApplySettleMs = value;
+			else this._autoApplyMaxWaitMs = value;
+		}
+		if (this._autoApplyMaxWaitMs < this._autoApplySettleMs) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`recoveryAutoApplyMaxWaitMs (${this._autoApplyMaxWaitMs}) must be ` +
+					`at least recoveryAutoApplySettleMs (${this._autoApplySettleMs})`
+			);
+		}
+		if (
+			this._recoveryAutoApply &&
+			this._reestablishHoldMs > 0 &&
+			this._autoApplyMaxWaitMs >= this._reestablishHoldMs
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`recoveryAutoApplyMaxWaitMs (${this._autoApplyMaxWaitMs}) must fit ` +
+					`inside recoveryReestablishHoldMs (${this._reestablishHoldMs})`
+			);
+		}
 		// Routing fee defaults ride in channel_update as u32/u32/u16 (BOLT 7);
 		// an out-of-range value would wrap on the wire or throw only once
 		// gossip is being rebuilt, so it is refused here instead, matching the
@@ -1720,6 +1813,7 @@ export class BeignetNode extends EventEmitter {
 			encryptionKey ? { encryptionKey } : undefined
 		);
 		this.storage.open();
+		this._bootOpts = opts;
 
 		// Recovery Protocol boot decision (docs/RECOVERY-PROTOCOL.md section
 		// 8). Guardian modes ask the guardian set who owns this namespace
@@ -1727,6 +1821,28 @@ export class BeignetNode extends EventEmitter {
 		// guardians hold must restore, never run, and the daemon holds it in
 		// the restore-pending state until restoreFromGuardians completes.
 		await this.prepareRecovery(opts);
+		if (this._recoveryAutoApply && this.recoveryMode !== 'peer-storage') {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'recoveryAutoApply applies to peer-storage mode only'
+			);
+		}
+		// Automatic capsule application only ever targets the boot that
+		// opened an empty database (issue #690): decided once, here, so state
+		// this node creates later never turns a running node into a target.
+		if (this._recoveryAutoApply) {
+			try {
+				assertEmptyTarget(this.storage);
+				this._bootTargetEmpty = true;
+			} catch {
+				this._bootTargetEmpty = false;
+				this.log(
+					'info',
+					'Recovery auto-apply is armed but this database already holds ' +
+						'state; capsules storage peers return are reported, not applied'
+				);
+			}
+		}
 		if (this._restorePending) {
 			this._deferredOpts = opts;
 			this.log(
@@ -2907,7 +3023,17 @@ export class BeignetNode extends EventEmitter {
 			inProgress: boolean;
 			lastEvent?: { type: string; detail: string };
 		};
+		/** Automatic capsule application, peer-storage mode (issue #690). */
+		autoApply: {
+			enabled: boolean;
+			phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused';
+			/** While settling: when the next decision falls (the settle floor,
+			 *  then the ceiling while storage peers are still owed). */
+			settleUntil: number | null;
+			lastReason: string | null;
+		};
 	} {
+		const autoApply = this.describeAutoApply();
 		const guardians = this.recoveryGuardianSet.map((g) => ({
 			guardianId: g.guardianId.toString('hex'),
 			url: g.url
@@ -2929,7 +3055,8 @@ export class BeignetNode extends EventEmitter {
 				state: 'restart-required',
 				node: null,
 				capsules,
-				restore
+				restore,
+				autoApply
 			};
 		}
 		if (this.recoveryMode === 'off') {
@@ -2939,10 +3066,14 @@ export class BeignetNode extends EventEmitter {
 				guardians: [],
 				state: 'disabled',
 				node: null,
-				capsules
+				capsules,
+				autoApply
 			};
 		}
-		if (this._restorePending) {
+		if (this._restorePending || this._resuming) {
+			// A capsule restore rebuilding the node in-process has no node to
+			// ask for the window; it reads as restoring, like the guardian
+			// takeover does while its deferred node is built.
 			return {
 				mode: this.recoveryMode,
 				profile,
@@ -2950,7 +3081,8 @@ export class BeignetNode extends EventEmitter {
 				state: this._restoreInFlight ? 'restoring' : 'restore-required',
 				node: null,
 				capsules,
-				restore
+				restore,
+				autoApply
 			};
 		}
 		const node = this.node.getRecoveryStatus();
@@ -2960,7 +3092,9 @@ export class BeignetNode extends EventEmitter {
 			guardians,
 			state: node.fenced || node.gate === 'fenced' ? 'fenced' : 'running',
 			node,
-			capsules
+			capsules,
+			...(this._lastRestoreEvent ? { restore } : {}),
+			autoApply
 		};
 	}
 
@@ -3080,7 +3214,9 @@ export class BeignetNode extends EventEmitter {
 	 * journal refuses to boot unbarriered and so could only ever be restored
 	 * through its guardians or the SCB route.
 	 */
-	async restoreFromCapsules(options: { unfenced?: boolean } = {}): Promise<{
+	async restoreFromCapsules(
+		options: { unfenced?: boolean; resume?: boolean } = {}
+	): Promise<{
 		tier: 1 | 2;
 		channelCount: number;
 		framesApplied: number;
@@ -3088,6 +3224,14 @@ export class BeignetNode extends EventEmitter {
 		newestSeenHead: { writerEpoch: string; latestSequence: string };
 		rejectedCandidates: number;
 		restartRequired: boolean;
+		/**
+		 * Tier 2 with resume: the node was rebuilt in-process on the
+		 * installed database, so no restart follows (issue #690).
+		 */
+		resumed?: boolean;
+		/** Channels the capsule's SCB names that its journal did not carry:
+		 *  recovered through the peer (they close safely), never resumed. */
+		uncovered?: string[];
 		/**
 		 * Set when the escape hatch restored a guardian-backed capsule: the
 		 * old writer is NOT fenced, and these are the guardians it named.
@@ -3111,6 +3255,12 @@ export class BeignetNode extends EventEmitter {
 			throw new BeignetError('INVALID_PARAMS', 'unfenced must be a boolean');
 		}
 		const unfencedRequested = options.unfenced === true;
+		if (options.resume !== undefined && typeof options.resume !== 'boolean') {
+			throw new BeignetError('INVALID_PARAMS', 'resume must be a boolean');
+		}
+		// Rebuilding in-process needs the boot options; a caller that never
+		// booted through init holds for a restart like the manual route.
+		const resume = options.resume === true && this._bootOpts !== undefined;
 		if (this.recoveryMode !== 'peer-storage' || this._restorePending) {
 			throw new BeignetError(
 				'CAPSULE_RESTORE_UNSUPPORTED',
@@ -3326,6 +3476,7 @@ export class BeignetNode extends EventEmitter {
 				);
 				const { recovering, skipped } =
 					await this.node.recoverFromStaticChannelBackup(result.scb.channels);
+				this._bootTargetEmpty = false;
 				const info = {
 					tier: 1 as const,
 					...common,
@@ -3392,7 +3543,8 @@ export class BeignetNode extends EventEmitter {
 				dropStaged();
 				throw installFailure(err);
 			}
-			this._restartRequired = true;
+			if (resume) this._resuming = true;
+			else this._restartRequired = true;
 			// Tear the running node down (its destroy closes the database), then
 			// swap the files through the same path a crashed swap resumes on.
 			this.teardownNodeForRestart();
@@ -3400,6 +3552,8 @@ export class BeignetNode extends EventEmitter {
 				this.finishStagedCapsuleRestore(dbPath);
 			} catch (err) {
 				// The marker is still there: the next boot completes the swap.
+				this._resuming = false;
+				this._restartRequired = true;
 				this.log('error', 'Capsule restore swap did not complete', {
 					error: err instanceof Error ? err.message : String(err)
 				});
@@ -3411,16 +3565,131 @@ export class BeignetNode extends EventEmitter {
 						')'
 				);
 			}
+			if (!resume) {
+				const info = {
+					tier: 2 as const,
+					...common,
+					restartRequired: true
+				};
+				progress(
+					'restore:complete',
+					`restored database installed (previous kept at ${path.basename(
+						keptPath
+					)}); restart the daemon to resume ${common.channelCount} channel(s)`
+				);
+				this.emit('recovery:restored', {
+					exact: true,
+					framesApplied: result.framesApplied,
+					guardiansRepaired: 0,
+					epoch: head.writerEpoch,
+					tier: 2,
+					restartRequired: true
+				});
+				return info;
+			}
+
+			// The automatic path (issue #690): rebuild the node in-process on
+			// the installed database, the way the guardian restore builds its
+			// deferred node, so no restart stands between the install and the
+			// channels resuming. The daemon holds every non-recovery route for
+			// the window (resuming). A rebuild that fails falls back to the
+			// restart-required hold: the database is installed either way, and
+			// a restart runs on it.
+			progress(
+				'capsule:resuming',
+				`rebuilding the node in-process on the restored database (previous kept at ${path.basename(
+					keptPath
+				)})`
+			);
+			const opts = this._bootOpts!;
+			let uncoveredEntries: IStaticChannelBackup['channels'] = [];
+			try {
+				this.storage = new SqliteStorage(
+					dbPath,
+					(err) => {
+						this.log('warn', 'Skipped corrupted storage row during load', {
+							error: err instanceof Error ? err.message : String(err)
+						});
+					},
+					this._storageEncryptionKey
+						? { encryptionKey: this._storageEncryptionKey }
+						: undefined
+				);
+				this.storage.open();
+				await this.prepareRecovery(opts);
+				await this.initNode(opts);
+				// Every row the journal carried is now a live channel; what the
+				// SCB names beyond them the journal could not carry (the inline
+				// ceiling, or a checkpoint older than the channel).
+				const restoredIds = new Set(
+					this.storage.loadAllChannels().map((c) => c.channelId.toLowerCase())
+				);
+				uncoveredEntries = result.scb.channels.filter(
+					(entry) => !restoredIds.has(entry.channelId.toLowerCase())
+				);
+			} catch (err) {
+				this._resuming = false;
+				this._restartRequired = true;
+				this.log(
+					'error',
+					'Capsule restore installed but the in-process rebuild failed; ' +
+						'holding for a restart',
+					{ error: err instanceof Error ? err.message : String(err) }
+				);
+				throw new BeignetError(
+					'CAPSULE_RESTORE_INSTALL_FAILED',
+					'The restored database is installed but the node could not be ' +
+						'rebuilt on it in-process; restart the daemon, which runs on ' +
+						'the restored state (' +
+						(err instanceof Error ? err.message : String(err)) +
+						')'
+				);
+			}
+			this._resuming = false;
+			this._bootTargetEmpty = false;
+			// The candidates served their purpose; a fresh boot would hold
+			// none, and the peers re-send on their next connect anyway.
+			this._peerRetrievedCapsules.clear();
+			const uncovered = uncoveredEntries.map((e) => e.channelId);
+			if (uncovered.length > 0) {
+				// A channel the capsule's journal does not carry gets the BOLT 1
+				// unknown-channel answer on the rebuilt node's reestablish and
+				// the peer force-closes it: the documented SCB degradation,
+				// named here so nothing presents the restore as complete over
+				// a channel that is still going to close.
+				progress(
+					'capsule:uncovered',
+					`${
+						uncovered.length
+					} channel(s) the capsule's journal does not carry will close safely through the peer (SCB recovery): ${uncovered.join(
+						', '
+					)}`
+				);
+				try {
+					await this.node.recoverFromStaticChannelBackup(uncoveredEntries);
+				} catch (err) {
+					this.log('warn', 'SCB recovery of uncovered channels failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				}
+			}
 			const info = {
 				tier: 2 as const,
 				...common,
-				restartRequired: true
+				restartRequired: false,
+				resumed: true,
+				uncovered
 			};
 			progress(
 				'restore:complete',
 				`restored database installed (previous kept at ${path.basename(
 					keptPath
-				)}); restart the daemon to resume ${common.channelCount} channel(s)`
+				)}); node rebuilt in-process, ${
+					common.channelCount - uncovered.length
+				} channel(s) resuming` +
+					(uncovered.length > 0
+						? `, ${uncovered.length} closing safely through the peer`
+						: '')
 			);
 			this.emit('recovery:restored', {
 				exact: true,
@@ -3428,12 +3697,181 @@ export class BeignetNode extends EventEmitter {
 				guardiansRepaired: 0,
 				epoch: head.writerEpoch,
 				tier: 2,
-				restartRequired: true
+				restartRequired: false,
+				resumed: true
 			});
 			return info;
 		} finally {
 			this._restoreInFlight = false;
 		}
+	}
+
+	// ─── Automatic capsule application (issue #690) ───
+
+	/** Connected peers advertising option_provide_storage right now. */
+	private connectedStoragePeers(): string[] {
+		try {
+			return (this.node as LightningNode | undefined)?.listStoragePeers() ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	/**
+	 * A newer capsule just arrived. Arms the settle window on the first
+	 * arrival and re-evaluates it on every later one. Only the boot that
+	 * opened an empty database is a target, decided once at init; a restore
+	 * already running, held or staged (the marker) is never raced.
+	 */
+	private noteCapsuleForAutoApply(): void {
+		if (!this._recoveryAutoApply || this.recoveryMode !== 'peer-storage') {
+			return;
+		}
+		if (!this._bootTargetEmpty) return;
+		const a = this._autoApply;
+		if (a.phase !== 'idle' && a.phase !== 'settling') return;
+		if (this._restoreInFlight || this._restartRequired || this._resuming) {
+			return;
+		}
+		if (fs.existsSync(this.capsuleRestoreMarkerPath())) return;
+		if (a.phase === 'idle') {
+			const now = Date.now();
+			this._autoApply = { phase: 'settling', firstArrivalAt: now };
+			// The ceiling: storage peers that never connect are not waited
+			// for past it. It sits inside the reestablish hold by validation.
+			const ceiling = setTimeout(() => {
+				this._autoApply.ceilingTimer = undefined;
+				void this.runAutoApply('ceiling');
+			}, this._autoApplyMaxWaitMs);
+			ceiling.unref?.();
+			this._autoApply.ceilingTimer = ceiling;
+			this.log('info', 'Recovery auto-apply: first capsule arrived, settling', {
+				settleMs: this._autoApplySettleMs,
+				maxWaitMs: this._autoApplyMaxWaitMs
+			});
+		}
+		this.evaluateAutoApplySettle();
+	}
+
+	/**
+	 * The settle rule: apply once every connected storage peer has answered
+	 * AND the settle floor has passed since the first arrival, so a replica
+	 * answering a moment later still competes for the selection; otherwise
+	 * the ceiling timer applies whatever arrived. Peers that connect after
+	 * the floor are picked up by the next arrival or the ceiling.
+	 */
+	private evaluateAutoApplySettle(): void {
+		const a = this._autoApply;
+		if (a.phase !== 'settling' || a.firstArrivalAt === undefined) return;
+		const settleAt = a.firstArrivalAt + this._autoApplySettleMs;
+		const now = Date.now();
+		if (now < settleAt) {
+			a.settleUntil = settleAt;
+			if (!a.settleTimer) {
+				const t = setTimeout(() => {
+					this._autoApply.settleTimer = undefined;
+					this.evaluateAutoApplySettle();
+				}, settleAt - now);
+				t.unref?.();
+				a.settleTimer = t;
+			}
+			return;
+		}
+		const waiting = this.connectedStoragePeers().filter(
+			(p) => !this._peerRetrievedCapsules.has(p)
+		);
+		if (waiting.length === 0) {
+			void this.runAutoApply('settled');
+			return;
+		}
+		a.settleUntil = a.firstArrivalAt + this._autoApplyMaxWaitMs;
+		this.log('debug', 'Recovery auto-apply: waiting on storage peers', {
+			waiting: waiting.length,
+			until: a.settleUntil
+		});
+	}
+
+	private clearAutoApplyTimers(): void {
+		const a = this._autoApply;
+		if (a.settleTimer) {
+			clearTimeout(a.settleTimer);
+			a.settleTimer = undefined;
+		}
+		if (a.ceilingTimer) {
+			clearTimeout(a.ceilingTimer);
+			a.ceilingTimer = undefined;
+		}
+	}
+
+	/**
+	 * Apply the best capsule with no operator call and rebuild the node
+	 * in-process. Exactly the manual route's restore, so every refusal it
+	 * makes (a database that gained state, a capsule naming guardians, a
+	 * quorum namespace, nothing validating) is made here too, once, and
+	 * reported under autoApply.lastReason and restore.lastEvent; the manual
+	 * route stays available after a refusal.
+	 */
+	private async runAutoApply(trigger: 'settled' | 'ceiling'): Promise<void> {
+		const a = this._autoApply;
+		if (a.phase !== 'settling') return;
+		this.clearAutoApplyTimers();
+		a.phase = 'applying';
+		a.settleUntil = undefined;
+		this.log('info', 'Recovery auto-apply: applying the best capsule', {
+			trigger,
+			candidates: this._peerRetrievedCapsules.size
+		});
+		try {
+			const info = await this.restoreFromCapsules({ resume: true });
+			a.phase = 'applied';
+			this.log('info', 'Recovery auto-apply: complete', {
+				tier: info.tier,
+				channelCount: info.channelCount,
+				resumed: info.resumed === true
+			});
+		} catch (err) {
+			a.phase = 'refused';
+			const code = err instanceof BeignetError ? err.code : 'ERROR';
+			const message = err instanceof Error ? err.message : String(err);
+			a.lastReason = `${code}: ${message}`;
+			this._lastRestoreEvent = {
+				type: 'capsule:auto-refused',
+				detail: a.lastReason
+			};
+			this.log(
+				'warn',
+				'Recovery auto-apply refused; the manual route stays available',
+				{
+					code,
+					message
+				}
+			);
+			this.emit('recovery:restore-progress', {
+				type: 'capsule:auto-refused',
+				detail: a.lastReason
+			});
+		}
+	}
+
+	/** The autoApply block of GET /recovery/status. */
+	private describeAutoApply(): {
+		enabled: boolean;
+		phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused';
+		settleUntil: number | null;
+		lastReason: string | null;
+	} {
+		const a = this._autoApply;
+		return {
+			enabled: this._recoveryAutoApply,
+			phase: a.phase,
+			settleUntil: a.settleUntil ?? null,
+			lastReason: a.lastReason ?? null
+		};
+	}
+
+	/** True while a capsule restore rebuilds the node in-process. */
+	get resuming(): boolean {
+		return this._resuming;
 	}
 
 	/**
@@ -9563,6 +10001,18 @@ export class BeignetNode extends EventEmitter {
 					channelCount: embedded.channels.length,
 					guardians: capsule.guardians.length
 				});
+				// The arrival signal (issue #690): a dashboard following a
+				// restore no longer has to poll the status route for it, and the
+				// automatic path settles on it.
+				this.emit('recovery:capsule-retrieved', {
+					fromPeer: peerPubkey,
+					writerEpoch: capsule.writerEpoch.toString(),
+					latestSequence: capsule.latestSequence.toString(),
+					inline,
+					channelCount: embedded.channels.length,
+					candidates: this._peerRetrievedCapsules.size
+				});
+				this.noteCapsuleForAutoApply();
 				// The capsule's locators are reported, never adopted: a set
 				// that disagrees with the configured one is a stale
 				// pre-enablement capsule or an operator error (set replacement
@@ -9738,6 +10188,7 @@ export class BeignetNode extends EventEmitter {
 			this._confirmTimer = undefined;
 		}
 		this.stopRecoveryLeaseCheck();
+		this.clearAutoApplyTimers();
 		// Await any in-flight backup before closing storage
 		if (this._backupPromise) {
 			await this._backupPromise.catch(() => {
@@ -9776,6 +10227,7 @@ export class BeignetNode extends EventEmitter {
 			this._confirmTimer = undefined;
 		}
 		this.stopRecoveryLeaseCheck();
+		this.clearAutoApplyTimers();
 		this.paymentQueue?.removeAllListeners();
 		this.directFundingSender?.stop();
 		// A restore-pending daemon never built the node or the wallet; the

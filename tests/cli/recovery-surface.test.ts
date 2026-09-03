@@ -2058,3 +2058,500 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 		}
 	});
 });
+
+describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, issue #690)', () => {
+	const PEER_A = '02' + 'c3'.repeat(32);
+	const ADMIN_KEY = 'c'.repeat(64);
+	const emptyScb = (network: string): string =>
+		encodeScb(
+			{ version: 1, network, createdAt: Date.now(), channels: [] },
+			NODE_SECRET
+		);
+	/** Short windows: no storage peer is ever connected offline, so the
+	 *  settle floor is the whole wait and the ceiling only guards a hang. */
+	const AUTO = {
+		recoveryMode: 'peer-storage' as const,
+		recoveryAutoApply: true,
+		recoveryAutoApplySettleMs: 300,
+		recoveryAutoApplyMaxWaitMs: 3000,
+		apiToken: ADMIN_KEY
+	};
+	function retrieved(daemon: IStartedDaemon, peer: string, blob: Buffer): void {
+		daemon.node.getNode().emit('peer_storage:retrieved', peer, blob);
+	}
+	interface IAutoStatus {
+		state: string;
+		capsules: { candidates: number };
+		restore?: { inProgress: boolean; lastEvent?: { type: string } };
+		autoApply: {
+			enabled: boolean;
+			phase: string;
+			settleUntil: number | null;
+			lastReason: string | null;
+		};
+	}
+	async function statusOf(port: number): Promise<IAutoStatus> {
+		const res = await request(
+			port,
+			'GET',
+			'/recovery/status',
+			undefined,
+			ADMIN_KEY
+		);
+		expect(res.status).to.equal(200);
+		return res.body.result as IAutoStatus;
+	}
+	function waitForEvent<T = Record<string, unknown>>(
+		daemon: IStartedDaemon,
+		event: string,
+		timeoutMs = 20_000
+	): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const timer = setTimeout(
+				() => reject(new Error(`timed out waiting for ${event}`)),
+				timeoutMs
+			);
+			(
+				daemon.node as unknown as {
+					once: (name: string, handler: (data: T) => void) => void;
+				}
+			).once(event, (data) => {
+				clearTimeout(timer);
+				resolve(data);
+			});
+		});
+	}
+	const sleep = (ms: number): Promise<void> =>
+		new Promise((resolve) => setTimeout(resolve, ms));
+	/** The restore progress event of one type (the stream carries several). */
+	function waitForProgress(
+		daemon: IStartedDaemon,
+		type: string,
+		timeoutMs = 20_000
+	): Promise<{ type: string; detail: string }> {
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(
+				() => reject(new Error(`timed out waiting for progress ${type}`)),
+				timeoutMs
+			);
+			const handler = (data: { type: string; detail: string }): void => {
+				if (data.type !== type) return;
+				clearTimeout(timer);
+				daemon.node.off('recovery:restore-progress', handler);
+				resolve(data);
+			};
+			daemon.node.on('recovery:restore-progress', handler);
+		});
+	}
+
+	/**
+	 * Device A with one journaled commit: the capsule its node composes for
+	 * storage peers, plus a twin of the same head that names guardians.
+	 */
+	async function composeSource(
+		dir: string,
+		description: string
+	): Promise<{ inline: Buffer; guardianBacked: Buffer; paymentHash: string }> {
+		const source = await startDaemon({
+			...OFFLINE,
+			dataDir: dir,
+			recoveryMode: 'peer-storage'
+		});
+		try {
+			const invoice = await request(portOf(source), 'POST', '/invoice/create', {
+				amountSats: 2100,
+				description
+			});
+			expect(invoice.body.ok, JSON.stringify(invoice.body)).to.equal(true);
+			const paymentHash = (invoice.body.result as { paymentHash: string })
+				.paymentHash;
+			const inline = (
+				source.node.getNode() as unknown as {
+					ourPeerStorageBlob: Buffer | null;
+				}
+			).ourPeerStorageBlob;
+			expect(inline).to.not.equal(null);
+			const storage = (source.node as unknown as { storage: SqliteStorage })
+				.storage;
+			const guardianBacked = composeRecoveryCapsule({
+				storage,
+				encryptedScb: emptyScb('bcrt'),
+				nodeSecret: NODE_SECRET,
+				guardians: [
+					{
+						guardianId: '55'.repeat(32),
+						transports: [{ type: 'https' as const, url: 'https://g1.example' }]
+					}
+				]
+			}).blob;
+			return { inline: inline!, guardianBacked, paymentHash };
+		} finally {
+			await source.stop();
+		}
+	}
+
+	it('refuses auto-apply outside peer-storage mode and a window that cannot beat the hold', async () => {
+		const dir = tmpDir('auto-validate');
+		try {
+			await expectStartRefused(
+				{ dataDir: dir, recoveryMode: 'off', recoveryAutoApply: true },
+				/peer-storage mode only/
+			);
+			await expectStartRefused(
+				{
+					dataDir: dir,
+					recoveryMode: 'quorum',
+					recoveryGuardians: GUARDIAN_IDS.map(
+						(id, i) => `${id.toString('hex')}@http://127.0.0.1:${i + 1}`
+					),
+					recoveryAutoApply: true
+				},
+				/peer-storage mode only/
+			);
+			await expectStartRefused(
+				{
+					dataDir: dir,
+					recoveryMode: 'peer-storage',
+					recoveryAutoApply: true,
+					recoveryAutoApplySettleMs: 5000,
+					recoveryAutoApplyMaxWaitMs: 1000
+				},
+				/below its settle floor/
+			);
+			await expectStartRefused(
+				{
+					dataDir: dir,
+					recoveryMode: 'peer-storage',
+					recoveryAutoApply: true,
+					recoveryReestablishHoldMs: 1000,
+					recoveryAutoApplySettleMs: 500,
+					recoveryAutoApplyMaxWaitMs: 1000
+				},
+				/does not fit inside the reestablish hold/
+			);
+			await expectStartRefused(
+				{
+					dataDir: dir,
+					recoveryMode: 'peer-storage',
+					recoveryAutoApplySettleMs: -1
+				},
+				/BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS/
+			);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('applies the best capsule with no operator call and rebuilds the node in-process', async function (): Promise<void> {
+		this.timeout(120_000);
+		const dirA = tmpDir('auto-a');
+		const dirB = tmpDir('auto-b');
+		try {
+			const { inline, paymentHash } = await composeSource(
+				dirA,
+				'auto restore probe'
+			);
+			let deviceB = await startDaemon({ ...OFFLINE, dataDir: dirB, ...AUTO });
+			let portB = portOf(deviceB);
+			try {
+				const idle = await statusOf(portB);
+				expect(idle.state).to.equal('running');
+				expect(idle.autoApply).to.deep.equal({
+					enabled: true,
+					phase: 'idle',
+					settleUntil: null,
+					lastReason: null
+				});
+
+				const progress: string[] = [];
+				deviceB.node.on('recovery:restore-progress', (data) =>
+					progress.push((data as { type: string }).type)
+				);
+				const arrived = waitForEvent(deviceB, 'recovery:capsule-retrieved');
+				const restored = waitForEvent(deviceB, 'recovery:restored', 60_000);
+				const t0 = Date.now();
+				retrieved(deviceB, PEER_A, inline);
+				const arrival = await arrived;
+				expect(arrival.fromPeer).to.equal(PEER_A);
+				expect(arrival.inline).to.equal(true);
+				expect(arrival.candidates).to.equal(1);
+				// The settle window is open and the status says until when.
+				const settling = await statusOf(portB);
+				expect(settling.autoApply.phase).to.equal('settling');
+				expect(settling.autoApply.settleUntil).to.be.at.least(t0 + 300);
+				expect(settling.state).to.equal('running');
+
+				const done = await restored;
+				expect(Date.now() - t0, 'the settle floor is honored').to.be.at.least(
+					300
+				);
+				expect(done.tier).to.equal(2);
+				expect(done.restartRequired).to.equal(false);
+				expect(done.resumed).to.equal(true);
+				expect(progress).to.include('capsule:installed');
+				expect(progress).to.include('capsule:resuming');
+				expect(progress).to.include('restore:complete');
+				expect(progress).to.not.include('capsule:uncovered');
+
+				// No restart stood between the install and a serving node.
+				const after = await statusOf(portB);
+				expect(after.state).to.equal('running');
+				expect(after.autoApply.phase).to.equal('applied');
+				expect(after.autoApply.lastReason).to.equal(null);
+				expect(after.capsules.candidates).to.equal(0);
+				expect(after.restore?.lastEvent?.type).to.equal('restore:complete');
+				expect(
+					(await request(portB, 'GET', '/info', undefined, ADMIN_KEY)).status
+				).to.equal(200);
+				const found = await request(
+					portB,
+					'GET',
+					`/invoice?paymentHash=${paymentHash}`,
+					undefined,
+					ADMIN_KEY
+				);
+				expect(found.status, JSON.stringify(found.body)).to.equal(200);
+				expect(
+					(found.body.result as { description: string }).description
+				).to.equal('auto restore probe');
+				// A second capsule after the apply changes nothing: the node
+				// now holds state and is no longer a target.
+				retrieved(deviceB, PEER_A, inline);
+				await sleep(600);
+				expect((await statusOf(portB)).autoApply.phase).to.equal('applied');
+			} finally {
+				await deviceB.stop();
+			}
+			const files = fs.readdirSync(dirB);
+			expect(files).to.include('regtest.db');
+			expect(
+				files.some((f) => f.startsWith('regtest.db.pre-capsule-restore-'))
+			).to.equal(true);
+			expect(files.some((f) => f.endsWith('.capsule-restore'))).to.equal(false);
+			expect(files).to.not.include('regtest.capsule-restore.json');
+
+			// The installed state is what a plain restart runs on too.
+			deviceB = await startDaemon({ ...OFFLINE, dataDir: dirB, ...AUTO });
+			portB = portOf(deviceB);
+			try {
+				const found = await request(
+					portB,
+					'GET',
+					`/invoice?paymentHash=${paymentHash}`,
+					undefined,
+					ADMIN_KEY
+				);
+				expect(found.status).to.equal(200);
+				const status = await statusOf(portB);
+				expect(status.state).to.equal('running');
+				expect(status.autoApply.enabled).to.equal(true);
+				expect(status.autoApply.phase).to.equal('idle');
+			} finally {
+				await deviceB.stop();
+			}
+		} finally {
+			fs.rmSync(dirA, { recursive: true, force: true });
+			fs.rmSync(dirB, { recursive: true, force: true });
+		}
+	});
+
+	it('applies an SCB-only capsule on the live node (Tier 1) without a rebuild', async function (): Promise<void> {
+		this.timeout(60_000);
+		const dir = tmpDir('auto-tier1');
+		try {
+			const daemon = await startDaemon({ ...OFFLINE, dataDir: dir, ...AUTO });
+			try {
+				const scratch = new SqliteStorage(':memory:');
+				scratch.open();
+				const blob = composeRecoveryCapsule({
+					storage: scratch,
+					encryptedScb: emptyScb('bcrt'),
+					nodeSecret: NODE_SECRET
+				}).blob;
+				scratch.close();
+				const restored = waitForEvent(daemon, 'recovery:restored');
+				retrieved(daemon, PEER_A, blob);
+				const done = await restored;
+				expect(done.tier).to.equal(1);
+				expect(done.restartRequired).to.equal(false);
+				expect(done.resumed).to.equal(undefined);
+				const status = await statusOf(portOf(daemon));
+				expect(status.state).to.equal('running');
+				expect(status.autoApply.phase).to.equal('applied');
+				expect(
+					(await request(portOf(daemon), 'GET', '/info', undefined, ADMIN_KEY))
+						.status
+				).to.equal(200);
+			} finally {
+				await daemon.stop();
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('does nothing when off, and never targets a database that holds state', async function (): Promise<void> {
+		this.timeout(120_000);
+		const dirA = tmpDir('auto-off-a');
+		const dirOff = tmpDir('auto-off');
+		const dirDirty = tmpDir('auto-dirty');
+		try {
+			const { inline } = await composeSource(dirA, 'off and dirty');
+
+			// Off: the capsule is reported, the manual route is the only path.
+			const off = await startDaemon({
+				...OFFLINE,
+				dataDir: dirOff,
+				recoveryMode: 'peer-storage',
+				apiToken: ADMIN_KEY
+			});
+			try {
+				const port = portOf(off);
+				const arrived = waitForEvent(off, 'recovery:capsule-retrieved');
+				retrieved(off, PEER_A, inline);
+				await arrived;
+				await sleep(800);
+				const status = await statusOf(port);
+				expect(status.state).to.equal('running');
+				expect(status.capsules.candidates).to.equal(1);
+				expect(status.autoApply).to.deep.equal({
+					enabled: false,
+					phase: 'idle',
+					settleUntil: null,
+					lastReason: null
+				});
+				const manual = await request(
+					port,
+					'POST',
+					'/recovery/restore-capsule',
+					{ confirm: true },
+					ADMIN_KEY
+				);
+				expect(manual.body.ok, JSON.stringify(manual.body)).to.equal(true);
+				expect(
+					(manual.body.result as { restartRequired: boolean }).restartRequired
+				).to.equal(true);
+				expect((await statusOf(port)).state).to.equal('restart-required');
+			} finally {
+				await off.stop();
+			}
+
+			// Dirty: the boot was empty, then the node created state before a
+			// capsule came. The apply is attempted once and refused the way
+			// the manual route refuses, and the node keeps running.
+			let dirty = await startDaemon({ ...OFFLINE, dataDir: dirDirty, ...AUTO });
+			try {
+				const port = portOf(dirty);
+				const own = await request(
+					port,
+					'POST',
+					'/invoice/create',
+					{ amountSats: 1, description: 'local state' },
+					ADMIN_KEY
+				);
+				expect(own.body.ok).to.equal(true);
+				const refused = waitForProgress(dirty, 'capsule:auto-refused');
+				retrieved(dirty, PEER_A, inline);
+				const event = await refused;
+				expect(event.detail).to.match(/CAPSULE_RESTORE_TARGET_DIRTY/);
+				const status = await statusOf(port);
+				expect(status.state).to.equal('running');
+				expect(status.autoApply.phase).to.equal('refused');
+				expect(status.autoApply.lastReason).to.match(
+					/CAPSULE_RESTORE_TARGET_DIRTY/
+				);
+				expect(status.restore?.lastEvent?.type).to.equal(
+					'capsule:auto-refused'
+				);
+				expect(status.capsules.candidates).to.equal(1);
+				expect(
+					(await request(port, 'GET', '/info', undefined, ADMIN_KEY)).status
+				).to.equal(200);
+			} finally {
+				await dirty.stop();
+			}
+			// A boot that opens a database holding state is never a target:
+			// the window is not even armed.
+			dirty = await startDaemon({ ...OFFLINE, dataDir: dirDirty, ...AUTO });
+			try {
+				const port = portOf(dirty);
+				const arrived = waitForEvent(dirty, 'recovery:capsule-retrieved');
+				retrieved(dirty, PEER_A, inline);
+				await arrived;
+				await sleep(800);
+				const status = await statusOf(port);
+				expect(status.autoApply.phase).to.equal('idle');
+				expect(status.capsules.candidates).to.equal(1);
+				expect(status.state).to.equal('running');
+			} finally {
+				await dirty.stop();
+			}
+		} finally {
+			fs.rmSync(dirA, { recursive: true, force: true });
+			fs.rmSync(dirOff, { recursive: true, force: true });
+			fs.rmSync(dirDirty, { recursive: true, force: true });
+		}
+	});
+
+	it('refuses a capsule that names guardians, and never races a staged restore', async function (): Promise<void> {
+		this.timeout(120_000);
+		const dirA = tmpDir('auto-guard-a');
+		const dirB = tmpDir('auto-guard-b');
+		const dirC = tmpDir('auto-marker');
+		try {
+			const { inline, guardianBacked } = await composeSource(
+				dirA,
+				'guardian-backed state'
+			);
+			const guarded = await startDaemon({ ...OFFLINE, dataDir: dirB, ...AUTO });
+			try {
+				const port = portOf(guarded);
+				const refused = waitForProgress(guarded, 'capsule:auto-refused');
+				retrieved(guarded, PEER_A, guardianBacked);
+				const event = await refused;
+				expect(event.detail).to.match(/CAPSULE_RESTORE_GUARDIAN_BACKED/);
+				const status = await statusOf(port);
+				expect(status.state).to.equal('running');
+				expect(status.autoApply.phase).to.equal('refused');
+				// Refused once: a later arrival does not re-arm the window.
+				retrieved(guarded, PEER_A, inline);
+				await sleep(800);
+				expect((await statusOf(port)).autoApply.phase).to.equal('refused');
+				expect((await statusOf(port)).state).to.equal('running');
+			} finally {
+				await guarded.stop();
+			}
+
+			// A staged restore's marker means a swap is in flight (or was
+			// interrupted): the automatic path leaves it alone.
+			const marked = await startDaemon({ ...OFFLINE, dataDir: dirC, ...AUTO });
+			const markerPath = path.join(dirC, 'regtest.capsule-restore.json');
+			try {
+				fs.writeFileSync(
+					markerPath,
+					JSON.stringify({
+						version: 1,
+						stagedAt: Date.now(),
+						staged: 'regtest.db.capsule-restore',
+						keep: 'regtest.db.pre-capsule-restore-x',
+						head: { writerEpoch: '1', latestSequence: '1' },
+						tier: 2
+					})
+				);
+				retrieved(marked, PEER_A, inline);
+				await sleep(3600);
+				const status = await statusOf(portOf(marked));
+				expect(status.autoApply.phase).to.equal('idle');
+				expect(status.capsules.candidates).to.equal(1);
+				expect(status.state).to.equal('running');
+			} finally {
+				fs.rmSync(markerPath, { force: true });
+				await marked.stop();
+			}
+		} finally {
+			fs.rmSync(dirA, { recursive: true, force: true });
+			fs.rmSync(dirB, { recursive: true, force: true });
+			fs.rmSync(dirC, { recursive: true, force: true });
+		}
+	});
+});
