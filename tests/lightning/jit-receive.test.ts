@@ -334,16 +334,69 @@ describe('JIT intent registration', function () {
 
 	it('bounds live intents per peer and overall', function () {
 		const h = makeHarness({ maxLiveIntentsPerPeer: 1, maxLiveIntents: 2 });
-		expect(h.manager.registerIntent(CLIENT, auth()).accepted).to.equal(true);
+		const first = h.manager.registerIntent(CLIENT, auth());
+		expect(first.accepted).to.equal(true);
+		// Asking again retires the wallet's own idle intent rather than
+		// refusing (issue #674): the cap bounds what one peer holds open.
 		const second = h.manager.registerIntent(CLIENT, auth());
-		expect(second.accepted).to.equal(false);
-		expect(second.reason).to.match(/per peer/);
+		expect(second.accepted).to.equal(true);
+		expect(second.interceptScid.equals(first.interceptScid)).to.equal(false);
+		expect(h.manager.listIntents()).to.have.length(1);
 		expect(h.manager.registerIntent(OTHER_CLIENT, auth()).accepted).to.equal(
 			true
 		);
 		const third = h.manager.registerIntent('02' + 'cc'.repeat(32), auth());
 		expect(third.accepted).to.equal(false);
 		expect(third.reason).to.match(/maximum number of live intents/);
+	});
+
+	// Issue #674: two unpaid invoices are an ordinary afternoon for a wallet.
+	// Its next request must not be refused for an hour, but an intent a
+	// payment is already held against is not idle and is never retired.
+	it("supersedes the wallet's oldest idle intent, never one with a held part", function () {
+		const h = makeHarness({ maxLiveIntentsPerPeer: 2 });
+		const superseded: string[] = [];
+		h.manager.on('jit:intent-superseded', (d: { scidHex: string }) =>
+			superseded.push(d.scidHex)
+		);
+		const a = h.manager.registerIntent(CLIENT, auth({ expirySeconds: 100 }));
+		const b = h.manager.registerIntent(CLIENT, auth({ expirySeconds: 200 }));
+		const c = h.manager.registerIntent(CLIENT, auth({ expirySeconds: 300 }));
+		expect(c.accepted).to.equal(true);
+		expect(superseded).to.deep.equal([a.interceptScid.toString('hex')]);
+		expect(
+			h.manager.listIntents().map((i) => i.interceptScidHex)
+		).to.have.members([
+			b.interceptScid.toString('hex'),
+			c.interceptScid.toString('hex')
+		]);
+		// A part held against b makes it busy: the next request retires c
+		// (the idle one) and b stays.
+		expect(
+			h.manager.tryInterceptUnknownScid(
+				b.interceptScid.toString('hex'),
+				makePart(h, { amountMsat: 1_000_000n })
+			)
+		).to.equal(true);
+		const d = h.manager.registerIntent(CLIENT, auth({ expirySeconds: 400 }));
+		expect(d.accepted).to.equal(true);
+		expect(superseded).to.deep.equal([
+			a.interceptScid.toString('hex'),
+			c.interceptScid.toString('hex')
+		]);
+		expect(h.manager.listIntents().map((i) => i.interceptScidHex)).to.include(
+			b.interceptScid.toString('hex')
+		);
+		// Two busy intents: nothing idle to retire, so the cap refuses.
+		expect(
+			h.manager.tryInterceptUnknownScid(
+				d.interceptScid.toString('hex'),
+				makePart(h, { amountMsat: 1_000_000n })
+			)
+		).to.equal(true);
+		const e = h.manager.registerIntent(CLIENT, auth({ expirySeconds: 500 }));
+		expect(e.accepted).to.equal(false);
+		expect(e.reason).to.match(/per peer/);
 	});
 
 	it('derives the outbound zero-conf authorization from the live intents', function () {
