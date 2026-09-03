@@ -274,7 +274,14 @@ describe('isPermanentFailure', () => {
 		}
 	});
 
-	it('is exported from cli/index.ts', () => {
+	it('is exported from cli/index.ts', function () {
+		// The barrel re-exports the daemon, the node and the lightning types,
+		// so this one require compiles that whole graph under ts-node: 3.5 s
+		// on an idle box and several times that when the parallel workers are
+		// all compiling at once. That cost tracks machine load, not the export
+		// under test, so it gets a budget the box would have to be 30x slower
+		// to miss rather than the suite's 20 s default.
+		this.timeout(120_000);
 		// Dynamic import to verify export
 		const exports = require('../../src/cli/index');
 		expect(exports.isPermanentFailure).to.be.a('function');
