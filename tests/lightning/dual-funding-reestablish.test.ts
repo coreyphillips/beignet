@@ -8218,8 +8218,13 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			voided.push(e.channelId);
 		});
 
-		// Three absent answers arm the watcher's one and only alarm.
+		// Three absent answers arm the watcher's one and only alarm. The node
+		// builds its own watcher, so the time floor a run of absences must
+		// span (issue #672, 30 s in production) is zeroed here the way every
+		// other watcher test passes missingDebounceMs: 0; the rechecks below
+		// are a burst, and the subject here is the disposition, not the floor.
 		const watcher = opener2.getChainWatcher()!;
+		(watcher as unknown as { missingDebounceMs: number }).missingDebounceMs = 0;
 		await settle(() => opener2.listChannels().length === 1, 4000);
 		for (let i = 0; i < 4; i++) await watcher.recheckAllWatches();
 		await settle(() => alarms > 0, 4000);
