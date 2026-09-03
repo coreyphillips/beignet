@@ -280,9 +280,15 @@ describe('Funding-missing watchdog', function () {
 	// been broadcast yet. Three checks are a debounce against a flaky answer;
 	// the time floor is the debounce against a burst.
 	it('three absences inside the time floor do not alarm; a later one does', async function () {
+		const cm = new ChannelManager({
+			localBasepoints: makeBasepoints(makeSeed(2)),
+			localPerCommitmentSeed: crypto.randomBytes(32),
+			localFundingPrivkey: crypto.randomBytes(32)
+		});
+		cm.on('error', () => {});
 		const w = new ChainWatcher({
 			backend,
-			channelManager,
+			channelManager: cm,
 			missingDebounceMs: 80
 		});
 		w.on('error', () => {});
