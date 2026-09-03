@@ -286,14 +286,30 @@ describe('Funding-missing watchdog', function () {
 			localFundingPrivkey: crypto.randomBytes(32)
 		});
 		cm.on('error', () => {});
+		// The floor is far longer than the burst below can take, and the run's
+		// start is wound back by hand rather than slept through: a floor a
+		// loaded machine's own scheduling can cross is a coin flip, not a test.
+		const floorMs = 10_000;
 		const w = new ChainWatcher({
 			backend,
 			channelManager: cm,
-			missingDebounceMs: 80
+			missingDebounceMs: floorMs
 		});
 		w.on('error', () => {});
 		const alarms: string[] = [];
 		w.on('funding:missing', (_cid: Buffer, txid: string) => alarms.push(txid));
+		/** Age the current run of absences past the floor. */
+		const ageRunPastFloor = (): void => {
+			const watched = (
+				w as unknown as {
+					watchedFundings: Map<string, { missingSince?: number }>;
+				}
+			).watchedFundings.get(channelId.toString('hex'))!;
+			expect(watched.missingSince, 'a run is under way to age').to.be.a(
+				'number'
+			);
+			watched.missingSince = watched.missingSince! - floorMs;
+		};
 		backend.history = [{ txid: fundingTxid, height: 0 }];
 		await w.watchFundingOutput(channelId, fundingTxid, 0, 1, fundingScript);
 		await tick();
@@ -303,7 +319,7 @@ describe('Funding-missing watchdog', function () {
 			await tick();
 		}
 		expect(alarms, 'a burst is not a verdict').to.deep.equal([]);
-		await new Promise((resolve) => setTimeout(resolve, 100));
+		ageRunPastFloor();
 		w.recheckAllWatches();
 		await tick();
 		expect(alarms, 'an absence that persists past the floor is').to.deep.equal([
