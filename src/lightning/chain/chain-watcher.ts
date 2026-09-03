@@ -85,6 +85,8 @@ interface IWatchedFunding {
 	 */
 	missingChecks?: number;
 	missingReported?: boolean;
+	/** When the current run of absent answers began (ms since epoch). */
+	missingSince?: number;
 	/**
 	 * Every funding tx this open may still confirm as (post-signatures RBF,
 	 * issue #360): the current attempt plus every superseded broadcastable
@@ -251,7 +253,19 @@ export interface IChainWatcherConfig {
 	 * below the market rate while the cheater's to_self_delay matures.
 	 */
 	getSweepFeeRatePerVbyte?: () => number;
+	/**
+	 * The least time a run of absent answers must span before
+	 * 'funding:missing' fires, on top of the three-check debounce. Scans come
+	 * in bursts (a subscription, then status notifications on its heels),
+	 * so three absences can land within a hundred milliseconds of a watch
+	 * moving to a splice output whose transaction has not been broadcast yet
+	 * (issue #672). A real absence persists; a burst is not a verdict.
+	 * Defaults to 30 seconds; tests pass 0.
+	 */
+	missingDebounceMs?: number;
 }
+
+const DEFAULT_MISSING_DEBOUNCE_MS = 30_000;
 
 /**
  * Compute the Electrum-style script hash for a given scriptPubkey.
@@ -511,6 +525,7 @@ export class ChainWatcher extends EventEmitter {
 	private acceptingWork = true;
 	private destinationScript: Buffer;
 	private getSweepFeeRatePerVbyte?: () => number;
+	private readonly missingDebounceMs: number;
 	private _recheckTimer: ReturnType<typeof setInterval> | null = null;
 
 	constructor(config: IChainWatcherConfig) {
@@ -519,6 +534,8 @@ export class ChainWatcher extends EventEmitter {
 		this.channelManager = config.channelManager;
 		this.destinationScript = config.destinationScript || Buffer.alloc(22);
 		this.getSweepFeeRatePerVbyte = config.getSweepFeeRatePerVbyte;
+		this.missingDebounceMs =
+			config.missingDebounceMs ?? DEFAULT_MISSING_DEBOUNCE_MS;
 
 		this.wireChannelManagerEvents();
 	}
@@ -1436,6 +1453,7 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	private clearMissingReport(watched: IWatchedFunding): void {
 		watched.missingChecks = 0;
+		watched.missingSince = undefined;
 		if (!watched.missingReported) return;
 		watched.missingReported = false;
 		this.emit('funding:recovered', watched.channelId, watched.txid);
@@ -1554,7 +1572,12 @@ export class ChainWatcher extends EventEmitter {
 			// transient Electrum hiccup does not cry wolf.
 			watched.appliedScanTicket = ticket;
 			watched.missingChecks = (watched.missingChecks ?? 0) + 1;
-			if (watched.missingChecks >= 3 && !watched.missingReported) {
+			watched.missingSince ??= Date.now();
+			if (
+				watched.missingChecks >= 3 &&
+				Date.now() - watched.missingSince >= this.missingDebounceMs &&
+				!watched.missingReported
+			) {
 				watched.missingReported = true;
 				this.emit('funding:missing', watched.channelId, watched.txid);
 			}

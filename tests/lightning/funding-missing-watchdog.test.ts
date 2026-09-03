@@ -227,7 +227,11 @@ describe('Funding-missing watchdog', function () {
 			localFundingPrivkey: crypto.randomBytes(32)
 		});
 		channelManager.on('error', () => {});
-		watcher = new ChainWatcher({ backend, channelManager });
+		watcher = new ChainWatcher({
+			backend,
+			channelManager,
+			missingDebounceMs: 0
+		});
 		watcher.on('error', () => {});
 		missing = [];
 		watcher.on('funding:missing', (channelId: Buffer, txid: string) => {
@@ -269,6 +273,53 @@ describe('Funding-missing watchdog', function () {
 		expect(missing[0].txid).to.equal(fundingTxid);
 		await recheck(3);
 		expect(missing.length, 'debounced: no repeat alarms').to.equal(1);
+	});
+
+	// Issue #672: scans come in bursts, and three absences landed within
+	// 130 ms of a watch moving to a splice output whose transaction had not
+	// been broadcast yet. Three checks are a debounce against a flaky answer;
+	// the time floor is the debounce against a burst.
+	it('three absences inside the time floor do not alarm; a later one does', async function () {
+		const cm = new ChannelManager({
+			localBasepoints: makeBasepoints(makeSeed(2)),
+			localPerCommitmentSeed: crypto.randomBytes(32),
+			localFundingPrivkey: crypto.randomBytes(32)
+		});
+		cm.on('error', () => {});
+		const w = new ChainWatcher({
+			backend,
+			channelManager: cm,
+			missingDebounceMs: 80
+		});
+		w.on('error', () => {});
+		const alarms: string[] = [];
+		w.on('funding:missing', (_cid: Buffer, txid: string) => alarms.push(txid));
+		backend.history = [{ txid: fundingTxid, height: 0 }];
+		await w.watchFundingOutput(channelId, fundingTxid, 0, 1, fundingScript);
+		await tick();
+		backend.history = [];
+		for (let i = 0; i < 4; i++) {
+			w.recheckAllWatches();
+			await tick();
+		}
+		expect(alarms, 'a burst is not a verdict').to.deep.equal([]);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		w.recheckAllWatches();
+		await tick();
+		expect(alarms, 'an absence that persists past the floor is').to.deep.equal([
+			fundingTxid
+		]);
+		// Presence resets the floor as it resets the count.
+		backend.history = [{ txid: fundingTxid, height: 0 }];
+		w.recheckAllWatches();
+		await tick();
+		backend.history = [];
+		for (let i = 0; i < 3; i++) {
+			w.recheckAllWatches();
+			await tick();
+		}
+		expect(alarms, 'the floor starts over after a presence').to.have.length(1);
+		w.stop();
 	});
 
 	it('a reappearing tx resets the counter and the alarm can fire again', async function () {
@@ -348,7 +399,11 @@ describe('Funding-missing watchdog', function () {
 			localFundingPrivkey: crypto.randomBytes(32)
 		});
 		channelManager.on('error', () => {});
-		const w = new ChainWatcher({ backend: parking, channelManager });
+		const w = new ChainWatcher({
+			backend: parking,
+			channelManager,
+			missingDebounceMs: 0
+		});
 		w.on('error', () => {});
 		const recovered: string[] = [];
 		w.on('funding:recovered', (_id: Buffer, txid: string) =>
