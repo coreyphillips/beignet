@@ -192,7 +192,8 @@ import {
 	RebalanceExecutionSummary,
 	TOnchainQuote,
 	TChannelFundingQuote,
-	DirectFundingConfigInfo
+	DirectFundingConfigInfo,
+	JitStatusInfo
 } from './types';
 
 export type LogLevel = TLogLevel;
@@ -5727,6 +5728,43 @@ export class BeignetNode extends EventEmitter {
 				: {})
 		});
 		return this.getDirectFundingConfig();
+	}
+
+	/**
+	 * The JIT receive role as it stands (issue #668): fee, caps, and what is
+	 * committed right now. Satoshi figures are numbers; every cap is bounded
+	 * by the config validation to the safe-integer range.
+	 */
+	getJitStatus(): JitStatusInfo {
+		const ceilings = this.node.getJitClientCeilings();
+		const manager = this.node.getJitReceiveManager();
+		const status = manager?.getStatus();
+		return {
+			enabled: status !== undefined,
+			client: {
+				maxFlatFeeSat: Number(ceilings.maxFlatFeeSat),
+				maxFeePpm: ceilings.maxFeePpm
+			},
+			lsp: status
+				? {
+						flatFeeSat: Number(status.flatFeeSat),
+						feePpm: status.feePpm,
+						maxClientFundingSats: Number(status.maxClientFundingSats),
+						maxConcurrentFundings: status.maxConcurrentFundings,
+						maxTotalFundingSats:
+							status.maxTotalFundingSats === null
+								? null
+								: Number(status.maxTotalFundingSats),
+						maxLiveIntentsPerPeer: status.maxLiveIntentsPerPeer,
+						maxLiveIntents: status.maxLiveIntents,
+						reservedSats: Number(status.reservedSats),
+						frontedSats: Number(status.frontedSats),
+						liveIntents: status.liveIntents,
+						heldParts: status.heldParts,
+						fundingsInFlight: status.fundingsInFlight
+				  }
+				: null
+		};
 	}
 
 	/** The effective direct-funding policy, in the shape the app reads. */

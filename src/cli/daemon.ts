@@ -1454,6 +1454,10 @@ async function bootDaemon(
 				})
 			);
 		},
+		// The JIT receive role as it stands (issue #668): fee, caps, and what
+		// is committed right now. An operator who turned the role on could
+		// otherwise only guess at the exposure.
+		'GET /jit/status': () => success(node.getJitStatus()),
 		// ── Third-party direct funding (issue #613) ──
 		//
 		// A payer's ordinary on-chain payment becomes this node's channel

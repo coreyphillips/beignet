@@ -640,6 +640,45 @@ export class JitReceiveManager extends EventEmitter {
 		return this.frontedSats;
 	}
 
+	/**
+	 * The LSP role as it stands: the fee it charges, the caps that bound what
+	 * it fronts, and what is committed right now (issue #668). An operator who
+	 * turns the role on can otherwise only guess at the exposure.
+	 */
+	getStatus(): {
+		flatFeeSat: bigint;
+		feePpm: number;
+		maxClientFundingSats: bigint;
+		maxConcurrentFundings: number;
+		maxTotalFundingSats: bigint | null;
+		maxLiveIntentsPerPeer: number;
+		maxLiveIntents: number;
+		reservedSats: bigint;
+		frontedSats: bigint;
+		liveIntents: number;
+		heldParts: number;
+		fundingsInFlight: number;
+	} {
+		this.sweepExpiredIntents();
+		let held = 0;
+		for (const parts of this.heldParts.values()) held += parts.length;
+		for (const parts of this.spliceQueues.values()) held += parts.length;
+		return {
+			flatFeeSat: this.cfg.flatFeeSat,
+			feePpm: this.cfg.feePpm,
+			maxClientFundingSats: this.cfg.maxClientFundingSats,
+			maxConcurrentFundings: this.cfg.maxConcurrentFundings,
+			maxTotalFundingSats: this.cfg.maxTotalFundingSats ?? null,
+			maxLiveIntentsPerPeer: this.cfg.maxLiveIntentsPerPeer,
+			maxLiveIntents: this.cfg.maxLiveIntents,
+			reservedSats: this.reservedSats,
+			frontedSats: this.frontedSats,
+			liveIntents: this.intents.size,
+			heldParts: held,
+			fundingsInFlight: this.fundingInFlight.size + this.spliceInFlight.size
+		};
+	}
+
 	/** Clear the cumulative counter (operator action; the cap is a budget). */
 	resetFrontedTotal(): void {
 		this.frontedSats = 0n;

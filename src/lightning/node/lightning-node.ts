@@ -15871,6 +15871,14 @@ export class LightningNode extends EventEmitter {
 	// ─────────────── JIT channel receive (LSP role, issue #594) ───────────────
 
 	/** The JIT receive engine, when this node runs the LSP role. */
+	/** The most this node accepts from an LSP's quote when it asks for a JIT receive. */
+	getJitClientCeilings(): { maxFlatFeeSat: bigint; maxFeePpm: number } {
+		return {
+			maxFlatFeeSat: this.jitClientMaxFlatFeeSat,
+			maxFeePpm: this.jitClientMaxFeePpm
+		};
+	}
+
 	getJitReceiveManager(): JitReceiveManager | undefined {
 		return this.jitReceiveManager;
 	}
