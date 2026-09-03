@@ -67,7 +67,7 @@ const MOCHA = path.join(
 /**
  * Floors raised for #614 (5A), from 6211/1359 measured at 016053c, before 4A
  * through 4D and the direct-funding and splice fixes that followed them. This
- * branch rebased onto 6d48ff4 measures 6666 passing in lightning and 1449 in
+ * branch rebased onto 6d48ff4 measures 6666 passing in lightning and 1454 in
  * cli, with nothing pending in either.
  *
  * Lightning's floor is that 6666 less the five tests whose environment decides
@@ -101,7 +101,7 @@ const SUITES = [
 	},
 	{
 		name: 'cli',
-		expected: 1449,
+		expected: 1454,
 		args: [
 			'--exit',
 			'--parallel',
