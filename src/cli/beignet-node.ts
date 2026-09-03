@@ -2197,7 +2197,14 @@ export class BeignetNode extends EventEmitter {
 			'channel:opening',
 			(data: { channelId: Buffer; fundingTxid: Buffer }) => {
 				const channelId = data.channelId.toString('hex');
-				const fundingTxid = data.fundingTxid.toString('hex');
+				// The engine hands the funding hash in internal byte order; every
+				// other surface (GET /channels, the wallet's transaction log,
+				// bitcoind) names a transaction in display order. Printed the
+				// other way round, an operator grepping the log for the id they
+				// see on screen found nothing (issue #681).
+				const fundingTxid = Buffer.from(data.fundingTxid)
+					.reverse()
+					.toString('hex');
 				this.log('info', 'Channel opening', { channelId, fundingTxid });
 				this.emit('channel:opening', { channelId, fundingTxid });
 			}
