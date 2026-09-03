@@ -337,7 +337,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/direct-funding/configure': {
 				post: {
 					summary:
-						'Set the direct-funding policy: the liquidity peer every direct-funded channel is negotiated with, where it is reachable, whether such an open may go zero-conf, and the minimum offer served. A partial MERGE, never a replace: a field the body does not name keeps its value. minAmountSat clamps up to the 5000 sat protocol floor and the response reports the clamped value. targetInboundSat is recorded and reported but not yet consumed. Admin scope',
+						'Set the direct-funding policy: the liquidity peer every direct-funded channel is negotiated with, where it is reachable, whether such an open may go zero-conf, whether a paired payer may splice the existing channel instead of opening a second one, and the minimum offer served. A partial MERGE, never a replace: a field the body does not name keeps its value. minAmountSat clamps up to the 5000 sat protocol floor and the response reports the clamped value. targetInboundSat is recorded and reported but not yet consumed. Admin scope',
 					tags: ['DirectFunding'],
 					requestBody: bodyContent({
 						lspPubkey: 'string?',
@@ -345,6 +345,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						lspPort: 'number?',
 						targetInboundSat: 'number?',
 						trusted: 'boolean?',
+						allowSplice: 'boolean?',
 						minAmountSat: 'number?'
 					}),
 					responses: {
@@ -3462,6 +3463,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						trusted: {
 							type: 'boolean',
 							description: 'Whether a direct-funded open may go zero-conf'
+						},
+						allowSplice: {
+							type: 'boolean',
+							description:
+								'Whether a paired (trusted) payer is served by splicing the existing channel with the liquidity peer instead of opening a second one. Anonymous payers always get a new confirmed channel'
 						},
 						minAmountSat: {
 							type: 'integer',

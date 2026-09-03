@@ -49,10 +49,24 @@ interface IResolvedRegistration extends IDfLaneRegistration {
 	unavailable?: boolean;
 }
 
+/**
+ * What the registry may ask about the node it runs in. Both are optional so
+ * the registry stays constructible bare (tests, the swarm plugin seam).
+ */
+export interface IDfRegistryPeerView {
+	/** Is the payer already connected to this node id (hex)? */
+	isPeerConnected?(peerPubkeyHex: string): boolean;
+	/** This node's own id, to recognise a relay descriptor naming itself. */
+	nodeId?(): Buffer;
+}
+
 export class DfTransportRegistry {
 	private readonly lanes = new Map<number, IResolvedRegistration>();
 
-	constructor(private readonly log: DfTransportLog = (): void => undefined) {}
+	constructor(
+		private readonly log: DfTransportLog = (): void => undefined,
+		private readonly peerView: IDfRegistryPeerView = {}
+	) {}
 
 	/** Register a lane. A second registration of a type replaces the first. */
 	register(registration: IDfLaneRegistration): void {
@@ -110,7 +124,23 @@ export class DfTransportRegistry {
 		exchange: (lane: IDfTransport) => Promise<T>
 	): Promise<T> {
 		let attempted = 0;
-		for (const descriptor of withSynthesizedRelay(transports)) {
+		const self = this.peerView.nodeId?.();
+		for (const descriptor of this.withExistingConnection(
+			withSynthesizedRelay(transports),
+			ctx
+		)) {
+			// A relay descriptor naming the payer's own node is the ordinary case
+			// for a home node paying its own lightning-first wallets (it IS their
+			// relay). Dialing it meant two minutes of the node resetting its own
+			// connection before EXCHANGE_TIMEOUT; there is nothing to relay through.
+			if (
+				descriptor.type === DfTransportType.LSP_RELAY &&
+				self &&
+				(descriptor as IDfRelayTransport).relayNodeId.equals(self)
+			) {
+				this.skip(descriptor.type, DfLaneSkipReason.SELF_RELAY);
+				continue;
+			}
 			const registration = this.lanes.get(descriptor.type);
 			if (!registration) {
 				this.skip(descriptor.type, DfLaneSkipReason.UNKNOWN_TYPE);
@@ -182,6 +212,34 @@ export class DfTransportRegistry {
 			return null;
 		}
 		return registration.factory;
+	}
+
+	/**
+	 * A connection the payer already holds to the receiver is the best lane
+	 * there is, whatever the receiver published: it needs no dial, no relay
+	 * and no onion path. When one exists and the receiver listed no direct
+	 * descriptor (a wallet with no address to advertise), a direct descriptor
+	 * is tried FIRST. The direct lane's open() never dials a connected peer,
+	 * so the placeholder address is never used; should the connection drop in
+	 * between, the dial fails and the receiver's own descriptors follow.
+	 */
+	private withExistingConnection(
+		ordered: DfTransportDescriptor[],
+		ctx: IDfOpenContext
+	): DfTransportDescriptor[] {
+		if (ordered.some((t) => t.type === DfTransportType.DIRECT_PEER)) {
+			return ordered;
+		}
+		const direct = this.lanes.get(DfTransportType.DIRECT_PEER);
+		if (!direct?.enabled) return ordered;
+		const connected = this.peerView.isPeerConnected?.(
+			ctx.receiverNodeId.toString('hex')
+		);
+		if (!connected) return ordered;
+		return [
+			{ type: DfTransportType.DIRECT_PEER, host: '', port: 0 },
+			...ordered
+		];
 	}
 
 	private skip(

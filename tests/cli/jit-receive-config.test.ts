@@ -24,7 +24,10 @@ const VARS = [
 	'BEIGNET_JIT_FLAT_FEE_SAT',
 	'BEIGNET_JIT_FEE_PPM',
 	'BEIGNET_JIT_MAX_FLAT_FEE_SAT',
-	'BEIGNET_JIT_MAX_FEE_PPM'
+	'BEIGNET_JIT_MAX_FEE_PPM',
+	'BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT',
+	'BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS',
+	'BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT'
 ];
 
 describe('resolveConfig jitReceive', () => {
@@ -70,6 +73,35 @@ describe('resolveConfig jitReceive', () => {
 	it('honours an explicit false', () => {
 		process.env.BEIGNET_JIT_RECEIVE = 'false';
 		expect(resolveConfig({}).jitReceive).to.deep.equal({ enabled: false });
+	});
+
+	// Issue #665: the LSP role fronts this node's coins, and until these had
+	// a daemon surface an operator got the library defaults with no way to
+	// see or change them.
+	it('resolves the exposure caps of the LSP role', () => {
+		process.env.BEIGNET_JIT_RECEIVE = 'true';
+		process.env.BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT = '400000';
+		process.env.BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS = '2';
+		process.env.BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT = '5000000';
+		expect(resolveConfig({}).jitReceive).to.deep.equal({
+			enabled: true,
+			maxClientFundingSats: 400_000,
+			maxConcurrentFundings: 2,
+			maxTotalFundingSats: 5_000_000
+		});
+	});
+
+	it('leaves an unset cap out, so the library default keeps answering', () => {
+		process.env.BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS = '1';
+		expect(resolveConfig({}).jitReceive).to.deep.equal({
+			maxConcurrentFundings: 1
+		});
+	});
+
+	it('surfaces a partly numeric cap as NaN, not as a truncated number', () => {
+		process.env.BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT = '1m';
+		const resolved = resolveConfig({}).jitReceive;
+		expect(Number.isNaN(resolved?.maxClientFundingSats)).to.equal(true);
 	});
 
 	it('ignores anything that is not exactly true or false', () => {
@@ -133,6 +165,16 @@ describe('resolveConfig jitReceive', () => {
 				flatFeeSat: 9, // file keeps the one it does not
 				feePpm: 1500,
 				maxFlatFeeSat: 100 // and the client ceiling survives
+			});
+		});
+
+		it('merges an exposure cap from the environment over the file', () => {
+			process.env.BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS = '1';
+			expect(resolveConfig({}).jitReceive).to.deep.equal({
+				enabled: true,
+				flatFeeSat: 9,
+				maxFlatFeeSat: 100,
+				maxConcurrentFundings: 1
 			});
 		});
 

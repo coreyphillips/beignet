@@ -20,6 +20,7 @@ import { DfTransportRegistry } from './registry';
 import { DfTransportLog, IDfPeerMessaging, IDfTransportConfig } from './types';
 
 export { DfTransportRegistry, withSynthesizedRelay } from './registry';
+export type { IDfRegistryPeerView } from './registry';
 export { DfDirectPeerLaneFactory } from './direct-peer';
 export {
 	DF_ONION_TLV,
@@ -91,7 +92,10 @@ export function createDirectFundingTransports(
 	config: IDfTransportConfig = {},
 	log: DfTransportLog = (): void => undefined
 ): IDfTransportStack {
-	const registry = new DfTransportRegistry(log);
+	const registry = new DfTransportRegistry(log, {
+		isPeerConnected: (hex) => deps.peers.isPeerConnected(hex),
+		nodeId: () => deps.nodeId()
+	});
 
 	registry.register({
 		type: DfTransportType.DIRECT_PEER,

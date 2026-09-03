@@ -287,6 +287,8 @@ export interface BeignetNodeOptions {
 	 * charges flatFeeSat + feePpm for it. maxFlatFeeSat / maxFeePpm are the
 	 * other role, and apply whether or not the LSP role is on: they cap what
 	 * this node accepts when it asks an LSP for a JIT receive of its own.
+	 * maxClientFundingSats / maxConcurrentFundings / maxTotalFundingSats bound
+	 * what the LSP role fronts (issue #665); unset keeps the library defaults.
 	 */
 	jitReceive?: {
 		enabled?: boolean;
@@ -294,6 +296,9 @@ export interface BeignetNodeOptions {
 		feePpm?: number;
 		maxFlatFeeSat?: number;
 		maxFeePpm?: number;
+		maxClientFundingSats?: number;
+		maxConcurrentFundings?: number;
+		maxTotalFundingSats?: number;
 	};
 	/**
 	 * Relay direct-funding frames for OTHER nodes (BEIGNET_DF_RELAY, issue
@@ -1157,7 +1162,12 @@ const JIT_FEE_FIELD_MAX: ReadonlyArray<[string, number]> = [
 	['flatFeeSat', 0xffffffff],
 	['feePpm', 1_000_000],
 	['maxFlatFeeSat', 0xffffffff],
-	['maxFeePpm', 1_000_000]
+	['maxFeePpm', 1_000_000],
+	// Exposure caps (issue #665): satoshi amounts within the safe-integer
+	// range, and a small count of fundings in flight at once.
+	['maxClientFundingSats', Number.MAX_SAFE_INTEGER],
+	['maxConcurrentFundings', 1_000],
+	['maxTotalFundingSats', Number.MAX_SAFE_INTEGER]
 ];
 
 /**
@@ -1930,6 +1940,27 @@ export class BeignetNode extends EventEmitter {
 								: {}),
 							...(opts.jitReceive.feePpm !== undefined
 								? { feePpm: opts.jitReceive.feePpm }
+								: {}),
+							// Exposure caps (issue #665). Left out when unset so the
+							// library defaults keep answering, exactly as before.
+							...(opts.jitReceive.maxClientFundingSats !== undefined
+								? {
+										maxClientFundingSats: BigInt(
+											opts.jitReceive.maxClientFundingSats
+										)
+								  }
+								: {}),
+							...(opts.jitReceive.maxConcurrentFundings !== undefined
+								? {
+										maxConcurrentFundings: opts.jitReceive.maxConcurrentFundings
+								  }
+								: {}),
+							...(opts.jitReceive.maxTotalFundingSats !== undefined
+								? {
+										maxTotalFundingSats: BigInt(
+											opts.jitReceive.maxTotalFundingSats
+										)
+								  }
 								: {})
 					  }
 					: undefined,
@@ -5583,7 +5614,7 @@ export class BeignetNode extends EventEmitter {
 	 *
 	 * A MERGE, never a replace: the LFBW dashboard posts `{minAmountSat}` alone
 	 * and then requires `lspPubkey` to still be present in the readback, and the
-	 * app's manager posts the other five without `minAmountSat`.
+	 * app's manager posts the other six without `minAmountSat`.
 	 */
 	configureDirectFunding(update: {
 		lspPubkey?: string;
@@ -5591,6 +5622,7 @@ export class BeignetNode extends EventEmitter {
 		lspPort?: number;
 		targetInboundSat?: number;
 		trusted?: boolean;
+		allowSplice?: boolean;
 		minAmountSat?: number;
 	}): DirectFundingConfigInfo {
 		if (
@@ -5633,6 +5665,13 @@ export class BeignetNode extends EventEmitter {
 			...(update.trusted !== undefined
 				? { allowZeroConf: update.trusted }
 				: {}),
+			// The home-channel design of the LFBW app: a paired sender's payment
+			// grows the one channel with the liquidity peer rather than opening
+			// a second. The receiver engine still requires the payer to be
+			// paired; anonymous payers get a confirmed open whatever this says.
+			...(update.allowSplice !== undefined
+				? { allowSplice: update.allowSplice }
+				: {}),
 			...(update.targetInboundSat !== undefined
 				? {
 						targetInboundSat: requireNonNegativeSafeInteger(
@@ -5663,6 +5702,7 @@ export class BeignetNode extends EventEmitter {
 			lspPort: policy.liquidityPort ?? null,
 			targetInboundSat: policy.targetInboundSat ?? 0,
 			trusted: policy.allowZeroConf === true,
+			allowSplice: policy.allowSplice === true,
 			minAmountSat: clampDirectFundingMinimum(policy.minAmountSat ?? 0)
 		};
 	}

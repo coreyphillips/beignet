@@ -83,6 +83,18 @@ describe('daemon startup JIT receive config', function () {
 		);
 	});
 
+	// Issue #665: a cap that is not a whole number is a budget nobody wrote.
+	it('refuses a fractional or negative exposure cap', async () => {
+		await expectStartRefused(
+			{ enabled: true, maxConcurrentFundings: 0.5 },
+			/maxConcurrentFundings must be an integer/
+		);
+		await expectStartRefused(
+			{ enabled: true, maxTotalFundingSats: -1 },
+			/maxTotalFundingSats must be an integer/
+		);
+	});
+
 	it('refuses a non-boolean enabled', async () => {
 		await expectStartRefused({ enabled: 'true' }, /enabled must be a boolean/);
 	});
@@ -103,7 +115,10 @@ describe('JIT receive daemon surface', function () {
 				flatFeeSat: 100,
 				feePpm: 2_000,
 				maxFlatFeeSat: 250,
-				maxFeePpm: 3_000
+				maxFeePpm: 3_000,
+				maxClientFundingSats: 400_000,
+				maxConcurrentFundings: 2,
+				maxTotalFundingSats: 5_000_000
 			}
 		});
 	});
@@ -123,6 +138,23 @@ describe('JIT receive daemon surface', function () {
 		};
 		expect(cast.jitClientMaxFlatFeeSat).to.equal(250n);
 		expect(cast.jitClientMaxFeePpm).to.equal(3_000);
+	});
+
+	// Issue #665: the exposure caps reach the LSP engine as the bigint and
+	// count the library keeps, so what the operator wrote is what bounds
+	// the coins this node fronts.
+	it('threads the exposure caps into the LSP engine', () => {
+		const inner = (daemon.node as unknown as { node: LightningNode }).node;
+		const manager = inner.getJitReceiveManager() as unknown as {
+			cfg: {
+				maxClientFundingSats: bigint;
+				maxConcurrentFundings: number;
+				maxTotalFundingSats?: bigint;
+			};
+		};
+		expect(manager.cfg.maxClientFundingSats).to.equal(400_000n);
+		expect(manager.cfg.maxConcurrentFundings).to.equal(2);
+		expect(manager.cfg.maxTotalFundingSats).to.equal(5_000_000n);
 	});
 
 	it('puts minFinalCltvExpiry into the invoice c tag', () => {

@@ -16153,12 +16153,20 @@ export class LightningNode extends EventEmitter {
 			...(opts.maxFeePpm !== undefined ? { maxFeePpm: opts.maxFeePpm } : {}),
 			...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {})
 		});
+		// Over an existing usable channel with the LSP the invoice routes the
+		// way any private-channel invoice does (the channel's own hint is
+		// already built below): the intent still stands, and a payment that
+		// outgrows the channel is refused at the LSP's addHtlc and held while
+		// it splices the channel bigger (tryHoldForSplice). Carrying the
+		// intercept hint alongside had payers pick it and the LSP open a
+		// SECOND channel to a wallet that already had one.
+		const existing = this.usableChannelWith(opts.lspPubkeyHex);
 		const result = this.createInvoice({
 			amountMsat: opts.amountMsat,
 			description: opts.description ?? '',
 			expiry,
 			minFinalCltvExpiry: JIT_RECEIVE_MIN_FINAL_CLTV_EXPIRY,
-			extraRoutingHints: [[grant.hint]],
+			...(existing ? {} : { extraRoutingHints: [[grant.hint]] }),
 			// The quote, never a msat figure: the allowance is sized against the
 			// total the payment declares, so an amount-less invoice authorizes
 			// only the fee owed on what actually arrives.
