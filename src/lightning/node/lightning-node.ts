@@ -3208,7 +3208,8 @@ export class LightningNode extends EventEmitter {
 				this.emit('channel:opening', { channelId, fundingTxid });
 				this.emitStructuredLog('channel', 'opening', {
 					channelId: channelId.toString('hex'),
-					fundingTxid: fundingTxid.toString('hex')
+					// Display order, as bitcoind and GET /channels name it (#681).
+					fundingTxid: Buffer.from(fundingTxid).reverse().toString('hex')
 				});
 			}
 		);
@@ -3236,7 +3237,7 @@ export class LightningNode extends EventEmitter {
 				});
 				this.emitStructuredLog('channel', 'txsigs_needed', {
 					channelId: channelId.toString('hex'),
-					fundingTxid: fundingTxid.toString('hex'),
+					fundingTxid: Buffer.from(fundingTxid).reverse().toString('hex'),
 					fundingOutputIndex,
 					inputIndices,
 					externalInputIndices
