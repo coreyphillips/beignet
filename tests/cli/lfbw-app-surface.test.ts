@@ -97,10 +97,10 @@ function everyOperation(): Array<[string, string]> {
 }
 
 /** The body of one daemon route handler, for the parameters it destructures. */
-function handlerSource(routeKey: string): string {
+function handlerSource(routeKey: string, span = 2000): string {
 	const start = daemonSrc.indexOf(`'${routeKey}':`);
 	expect(start, `${routeKey} is not a daemon route`).to.be.greaterThan(-1);
-	return daemonSrc.slice(start, start + 2000);
+	return daemonSrc.slice(start, start + span);
 }
 
 /** A declaration block from a source file, for its field names. */
@@ -224,8 +224,17 @@ describe('LFBW app surface (issue #614)', () => {
 					).to.not.include(banned);
 				}
 			}
-			for (const banned of ['fundingUtxos', 'contribution']) {
-				expect(daemonSrc, banned).to.not.include(banned);
+			// The spec is documentation; the handlers are the surface. Both
+			// destructure their body, so a parameter they never name is a
+			// parameter they cannot forward.
+			for (const routeKey of [
+				'POST /channel/open-v2',
+				'POST /channel/splice-in'
+			]) {
+				const handler = handlerSource(routeKey, 900);
+				for (const banned of ['fundingUtxos', 'contribution', 'witness']) {
+					expect(handler, `${routeKey} ${banned}`).to.not.include(banned);
+				}
 			}
 		});
 	});
