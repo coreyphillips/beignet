@@ -771,6 +771,16 @@ describe('Interactive TX Construction', function () {
 				const err = checkFeeSufficiency(300n, 400, 1000);
 				expect(err).to.contain('below minimum');
 			});
+
+			// Issue #670: 657 WU at 865 sat/kw is 568.3 sat. CLN pays 568 (it
+			// floors); a ceiling of 569 aborted every CLN-initiated open at a
+			// feerate whose product carries a fraction.
+			it('floors the minimum, as the peer paying it does', function () {
+				expect(checkFeeSufficiency(568n, 657, 865)).to.be.null;
+				expect(checkFeeSufficiency(567n, 657, 865)).to.contain(
+					'below minimum 568'
+				);
+			});
 		});
 	});
 
