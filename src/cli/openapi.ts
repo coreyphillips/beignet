@@ -2169,7 +2169,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, peer:connect, peer:disconnect, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents)',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
 					tags: ['Node'],
 					responses: {
 						'200': {

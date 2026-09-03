@@ -64,10 +64,25 @@ const MOCHA = path.join(
 	process.platform === 'win32' ? 'mocha.cmd' : 'mocha'
 );
 
+/**
+ * Floors raised for #614 (5A), from 6211/1359 measured at 016053c, before 4A
+ * through 4D and the direct-funding and splice fixes that followed them. This
+ * branch rebased onto 6d48ff4 measures 6666 passing in lightning and 1454 in
+ * cli, with nothing pending in either.
+ *
+ * Lightning's floor is that 6666 less the five tests whose environment decides
+ * whether they run: one websocket case needs globalThis.WebSocket (Node 21+,
+ * and CI is on 20), two conformance cases need a captured eclair fixture, and
+ * the two integration cases need bitcoind and Electrum. All five ran in the
+ * measurement (Node 22, the docker stack up), and everything else in the suite
+ * runs everywhere, so 6661 is the number a silent elision has to clear.
+ * Nothing in the cli glob skips (daemon-security and daemon-integration are
+ * excluded from it), so that floor is the measurement itself.
+ */
 const SUITES = [
 	{
 		name: 'lightning',
-		expected: 6211,
+		expected: 6661,
 		args: [
 			'--exit',
 			'--parallel',
@@ -86,7 +101,7 @@ const SUITES = [
 	},
 	{
 		name: 'cli',
-		expected: 1359,
+		expected: 1454,
 		args: [
 			'--exit',
 			'--parallel',
@@ -160,10 +175,12 @@ async function main() {
 	}
 
 	// A suite can exit 0 while having quietly stopped running tests, so the count
-	// is checked too. The repo has no .only and no skipped tests, which is what
-	// makes these numbers a usable invariant. The comparison is "at least", so
-	// adding tests needs no change here; only losing them trips it, and then the
-	// floor in SUITES is meant to be updated deliberately rather than silently.
+	// is checked too. The repo has no .only, and the handful of tests that skip
+	// do so on the environment rather than at random, which is what makes these
+	// numbers a usable invariant (see the floors in SUITES). The comparison is
+	// "at least", so adding tests needs no change here; only losing them trips
+	// it, and then the floor is meant to be updated deliberately rather than
+	// silently.
 	const short = results.filter(
 		(r) => r.code === 0 && (r.passing === null || r.passing < r.suite.expected)
 	);

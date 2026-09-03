@@ -566,6 +566,42 @@ const outResult = node.spliceOut(channelId, 50_000n, 253);
 // -> tx_signatures -> splice_locked (both sides)
 ```
 
+### Third-party funding inputs (library only)
+
+An input someone else owns can fund a v2 open or a splice-in. It is contributed
+and negotiated like any of ours, but its `signWitness` is never called, our
+`tx_signatures` is withheld, and the finished witness arrives out of band.
+
+```typescript
+// Register the inputs ahead of the negotiation, bypassing wallet selection.
+node.openChannelV2(peerPubkey, {
+  fundingSatoshis,
+  contribution: { inputs, changeScript }   // issue #572
+});
+node.spliceInWithInputs(channelId, amountSats, inputs, changeScript, 253);
+
+// What the owner signs against: a defensive copy of the negotiated tx, the
+// full prevout set BIP 341 commits to, and the outpoints still owed.
+node.getPendingV2FundingTx(channelId);  // v2 open,   issue #612
+node.getPendingSpliceTx(channelId);     // splice-in, issue #592
+
+// Where the witness goes back. The last one released the withheld
+// tx_signatures; `sendsWithheld` says it did not actually reach the peer.
+node.provideV2ExternalWitness(channelId, prevTxid, prevOutputIndex, witness);
+node.provideSpliceExternalWitness(channelId, prevTxid, prevOutputIndex, witness);
+
+// For a host driving the state machine directly (resolves a v2 open still
+// resident under its temporary id).
+node.getRawChannel(channelId);
+```
+
+None of this has a daemon or CLI surface, deliberately. `POST /channel/open-v2`
+and `POST /channel/splice-in` take no `fundingUtxos` and no `contribution`, and
+no route accepts a witness. The only in-tree consumer is the direct-funding
+engine, which runs in process; over HTTP the same calls would let anything
+holding an API token choose the inputs of this node's funding transactions and
+co-sign them, which is a larger trust decision than an API token carries today.
+
 ### Invoice Management
 
 ```typescript

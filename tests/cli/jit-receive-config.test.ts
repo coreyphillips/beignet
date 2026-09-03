@@ -13,6 +13,9 @@
  * silently becomes a different number is a price nobody wrote.
  */
 
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { expect } from 'chai';
 import { resolveConfig } from '../../src/cli/config';
 
@@ -94,5 +97,63 @@ describe('resolveConfig jitReceive', () => {
 		process.env.BEIGNET_JIT_FEE_PPM = '9999';
 		const flag = { enabled: false, feePpm: 10 };
 		expect(resolveConfig({ jitReceive: flag }).jitReceive).to.deep.equal(flag);
+	});
+
+	// Per FIELD, not per block. The LFBW app sets BEIGNET_JIT_RECEIVE and the
+	// two LSP fee variables on every daemon it spawns; a whole-block `??` gave
+	// that env all five fields, so a client ceiling in config.json vanished and
+	// the higher built-in default came back on a node whose owner had lowered
+	// it (issue #614).
+	describe('layer merge', () => {
+		const origHome = process.env.HOME;
+		let tmpDir: string;
+
+		before(() => {
+			tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-jit-cfg-'));
+			fs.mkdirSync(path.join(tmpDir, '.beignet'), { recursive: true });
+			fs.writeFileSync(
+				path.join(tmpDir, '.beignet', 'config.json'),
+				JSON.stringify({
+					jitReceive: { enabled: true, flatFeeSat: 9, maxFlatFeeSat: 100 }
+				})
+			);
+			process.env.HOME = tmpDir;
+		});
+
+		after(() => {
+			process.env.HOME = origHome;
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		});
+
+		it('keeps the config file fields the environment does not name', () => {
+			process.env.BEIGNET_JIT_RECEIVE = 'false';
+			process.env.BEIGNET_JIT_FEE_PPM = '1500';
+			expect(resolveConfig({}).jitReceive).to.deep.equal({
+				enabled: false, // env wins the field it names
+				flatFeeSat: 9, // file keeps the one it does not
+				feePpm: 1500,
+				maxFlatFeeSat: 100 // and the client ceiling survives
+			});
+		});
+
+		it('lets the CLI flag win one field without taking the rest', () => {
+			process.env.BEIGNET_JIT_FEE_PPM = '1500';
+			expect(
+				resolveConfig({ jitReceive: { feePpm: 7 } }).jitReceive
+			).to.deep.equal({
+				enabled: true,
+				flatFeeSat: 9,
+				feePpm: 7,
+				maxFlatFeeSat: 100
+			});
+		});
+
+		it('reads the config file alone when nothing else is set', () => {
+			expect(resolveConfig({}).jitReceive).to.deep.equal({
+				enabled: true,
+				flatFeeSat: 9,
+				maxFlatFeeSat: 100
+			});
+		});
 	});
 });
