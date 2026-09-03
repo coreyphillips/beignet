@@ -7100,6 +7100,18 @@ export class LightningNode extends EventEmitter {
 		return this.peerManager.listPeers();
 	}
 
+	/**
+	 * Connected peers advertising option_provide_storage (BOLT 1 peer
+	 * storage): the set a restore can expect a Recovery Capsule from.
+	 */
+	listStoragePeers(): string[] {
+		if (!this.peerManager) return [];
+		return this.peerManager
+			.listPeers()
+			.filter((peer) => this.peerAdvertisesPeerStorage(peer.pubkey))
+			.map((peer) => peer.pubkey);
+	}
+
 	isNetworkingEnabled(): boolean {
 		return this.peerManager !== null;
 	}

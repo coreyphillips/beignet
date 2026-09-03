@@ -34,6 +34,7 @@ const RECOVERY_NODE_EVENTS = [
  * callbacks instead of relaying a LightningNode emission.
  */
 const RECOVERY_DAEMON_EVENTS = [
+	'recovery:capsule-retrieved',
 	'recovery:guardian_unreachable',
 	'recovery:restore-progress',
 	'recovery:restored'

@@ -393,6 +393,9 @@ BEIGNET_RECOVERY_MODE=quorum   # off | peer-storage | async-remote | quorum
 BEIGNET_RECOVERY_GUARDIANS=<64-hex-pubkey>@https://g1.example,<64-hex-pubkey>@https://g2.example,<64-hex-pubkey>@http://<v3>.onion
 BEIGNET_RECOVERY_PROFILE=crash-v1   # optional; crash-v1 is the only value
 BEIGNET_RECOVERY_REESTABLISH_HOLD_MS=600000   # peer-storage only; 0 disables
+BEIGNET_RECOVERY_AUTO_APPLY=false   # peer-storage only; apply the best capsule on an empty boot, no operator call
+BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS=15000   # wait this long after the first capsule for slower replicas
+BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS=120000   # never wait longer than this; must fit inside the hold
 ```
 
 - `off` (default): nothing changes.
@@ -519,10 +522,30 @@ Operational notes:
   default refusal, and it never applies to a quorum-durability journal:
   such a chain refuses to boot without its quorum, so its only paths are
   the guardians or the SCB route.
+- Zero-touch peer-storage restore (issue #690): with
+  `BEIGNET_RECOVERY_AUTO_APPLY=true` the daemon performs the capsule restore
+  itself on a boot whose database is empty. Every capsule a storage peer
+  returns is announced as `recovery:capsule-retrieved`; the first arrival
+  opens a settle window, and the best capsule is applied once every
+  connected storage peer has answered and
+  `BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS` (default 15 s) has passed, or at
+  `BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS` (default 2 minutes) at the
+  latest, which must fit inside the reestablish hold. A Tier 2 install then
+  rebuilds the node in-process on the restored database (no restart;
+  `recovery:restored` carries `resumed: true`), and channels the capsule's
+  journal did not carry are named in a `capsule:uncovered` progress event
+  and recovered through the peer (they close safely, the SCB degradation).
+  The flag automates an UNFENCED adoption: local durability cannot fence a
+  previous device that still runs, so an embedder asks the operator once
+  (at seed import) rather than defaulting it on. Refusals are the manual
+  route's, made once and reported under `autoApply.lastReason` on
+  `GET /recovery/status` (phases `idle`, `settling`, `applying`, `applied`,
+  `refused`); a database that already holds state is never a target.
 - Recovery events relayed over SSE and webhooks (always on):
   `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`,
-  `recovery:reestablish-held`, `recovery:guardian_unreachable`,
-  `recovery:restore-progress`, `recovery:restored`.
+  `recovery:reestablish-held`, `recovery:capsule-retrieved`,
+  `recovery:guardian_unreachable`, `recovery:restore-progress`,
+  `recovery:restored`.
 
 #### Health & Monitoring
 
@@ -1717,6 +1740,9 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_RECOVERY_PROFILE` | Recovery fault-model profile; `crash-v1` is the only accepted value and the default |
 | `BEIGNET_RECOVERY_LEASE_CHECK_MS` | Guardian modes: idle writer lease re-check cadence in ms, an integer in 0..2147483647 (default: 300000; 0 disables; anything else refuses startup) |
 | `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS` | peer-storage mode: how long an unknown channel's `channel_reestablish` is held before the BOLT 1 error goes out, an integer in 0..2147483647 (default: 600000; 0 answers immediately; anything else refuses startup) |
+| `BEIGNET_RECOVERY_AUTO_APPLY` | peer-storage mode: on a boot whose database is empty, apply the best Recovery Capsule the storage peers return with no operator call and rebuild the node in-process on it (exact `true`/`false`; default off; refused outside peer-storage mode). Cannot fence a previous device that still runs |
+| `BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS` | Auto-apply settle floor from the first capsule's arrival, so a slower replica still competes for the selection (default: 15000) |
+| `BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS` | Auto-apply ceiling from the first arrival; storage peers that never connect are not waited for past it (default: 120000; must be at least the settle floor and below `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS`) |
 | `BEIGNET_FEE_BASE_MSAT` | Node-wide default routing base fee advertised in `channel_update`, an integer in 0..4294967295 msat (default: 1000; anything else refuses startup). Per-channel `channel update-policy` overrides win |
 | `BEIGNET_FEE_PPM` | Node-wide default proportional routing fee in millionths, an integer in 0..4294967295 (default: 1; anything else refuses startup). Per-channel overrides win |
 | `BEIGNET_CLTV_DELTA` | Node-wide default forwarding CLTV delta, an integer in 1..65535, `>= 18` recommended (default: 40; anything else refuses startup). Per-channel overrides win |
@@ -1917,7 +1943,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |
 | POST | `/auth/keys/revoke` | `{ name }` | Disable a named API key immediately (admin scope; persisted, survives restarts) |
 | POST | `/auth/keys/rotate` | `{ name }` | Mint a new random secret for a named key; returned once, old secret dies immediately (admin scope; persisted) |
-| GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`restart-required`/`fenced`), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session (`capsules`, whose `best` names the guardian locators the capsule carries, credentials redacted). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
+| GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`restart-required`/`fenced`), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session (`capsules`, whose `best` names the guardian locators the capsule carries, credentials redacted), plus `autoApply` (the automatic capsule application: enabled, phase, settleUntil, lastReason). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
 | POST | `/recovery/restore` | `{ confirm: true }` | Restore from guardian replicas and start the node on the restored state (restore-pending daemons only; channels RESUME instead of force-closing; the takeover permanently fences the previous writer). Progress streams over SSE as `recovery:restore-progress` |
 | POST | `/recovery/restore-capsule` | `{ confirm: true, unfenced?: boolean }` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session. Tier 2 installs the exact state into a fresh database and holds the daemon until a restart (503 `NODE_RESTART_REQUIRED` elsewhere); Tier 1 recovers the embedded SCB on the live node. Progress streams over SSE as `recovery:restore-progress` |
 | POST | `/recovery/capsule-guardians` | `{ confirm: true }` | The guardian set the best retrieved capsule names, INCLUDING transport credentials, as config-file entries for `recoveryGuardians`. The status route redacts credentials; this admin handoff is how a seed restore whose guardians need authentication gets them back. Nothing is adopted or persisted |
@@ -1935,7 +1961,7 @@ event: channel:ready
 data: {"channelId":"cd34..."}
 ```
 
-Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`, and the Recovery Protocol events `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`, `recovery:reestablish-held`, `recovery:guardian_unreachable`, `recovery:restore-progress`, `recovery:restored` (always on; low volume, and operator dashboards ride them). JIT receive progress on the LSP side (`jit:intent`, `jit:intent-superseded`, `jit:intercepted`, `jit:funding`, `jit:forwarded`, `jit:failed`; satoshi and millisatoshi figures as decimal strings) and direct-funding receiver progress (`direct-funding:offer:accepted` with `paired`, `direct-funding:offer:declined`, `direct-funding:offer:failed`, `direct-funding:offer:completed`) are relayed too (issue #669), so a dashboard follows a funding it fronts or receives without polling.
+Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`, and the Recovery Protocol events `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`, `recovery:reestablish-held`, `recovery:capsule-retrieved`, `recovery:guardian_unreachable`, `recovery:restore-progress`, `recovery:restored` (always on; low volume, and operator dashboards ride them). JIT receive progress on the LSP side (`jit:intent`, `jit:intent-superseded`, `jit:intercepted`, `jit:funding`, `jit:forwarded`, `jit:failed`; satoshi and millisatoshi figures as decimal strings) and direct-funding receiver progress (`direct-funding:offer:accepted` with `paired`, `direct-funding:offer:declined`, `direct-funding:offer:failed`, `direct-funding:offer:completed`) are relayed too (issue #669), so a dashboard follows a funding it fronts or receives without polling.
 
 - `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
 - `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).

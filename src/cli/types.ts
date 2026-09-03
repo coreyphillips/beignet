@@ -665,6 +665,27 @@ export interface BeignetConfig {
 	 *  (default 600000, 0 answers immediately). Env:
 	 *  BEIGNET_RECOVERY_REESTABLISH_HOLD_MS. */
 	recoveryReestablishHoldMs?: number;
+	/** peer-storage mode: apply the best Recovery Capsule storage peers
+	 *  return, on a boot whose database is empty, with no operator call
+	 *  (issue #690). Local durability has no fencing, so this automates an
+	 *  unfenced adoption: an old device still running keeps acting on the
+	 *  same channels. Off by default; an embedder asks the operator once
+	 *  (at seed import) and passes it at spawn. Refused outside
+	 *  peer-storage mode. Env: BEIGNET_RECOVERY_AUTO_APPLY, exact 'true' or
+	 *  'false'; anything else is ignored and the default (off) rules. */
+	recoveryAutoApply?: boolean;
+	/** Auto-apply settle floor in ms from the first capsule's arrival
+	 *  (default 15000): the capsule is applied once every connected storage
+	 *  peer has answered and at least this long has passed, so a stale
+	 *  replica that answers a moment later still takes part. Env:
+	 *  BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS. */
+	recoveryAutoApplySettleMs?: number;
+	/** Auto-apply ceiling in ms from the first capsule's arrival (default
+	 *  120000): storage peers that never connect are not waited for past
+	 *  this. Must exceed the settle floor and fit inside the reestablish
+	 *  hold, which is the window this automation exists to beat. Env:
+	 *  BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS. */
+	recoveryAutoApplyMaxWaitMs?: number;
 	/** Node-wide default routing fee policy advertised in channel_update
 	 *  (BOLT 7; base u32 msat, proportional u32 millionths, cltv delta u16).
 	 *  Per-channel overrides set through the channel policy update surface win
@@ -1162,6 +1183,18 @@ export interface BeignetNodeEvents {
 		detail: string;
 		sequence?: string;
 	}) => void;
+	/** A storage peer returned a Recovery Capsule that became (or replaced)
+	 *  this node's best candidate from that peer (issue #690). Only newer
+	 *  heads are announced, so an equal-head re-send after a reconnect is
+	 *  silent. candidates counts the peers holding a valid capsule. */
+	'recovery:capsule-retrieved': (data: {
+		fromPeer: string;
+		writerEpoch: string;
+		latestSequence: string;
+		inline: boolean;
+		channelCount: number;
+		candidates: number;
+	}) => void;
 	'recovery:restore-progress': (data: { type: string; detail: string }) => void;
 	'recovery:restored': (data: {
 		exact: boolean;
@@ -1172,6 +1205,9 @@ export interface BeignetNodeEvents {
 		tier?: 1 | 2;
 		/** Capsule restores only: true after a Tier 2 install replaced the database. */
 		restartRequired?: boolean;
+		/** Capsule restores only: the node was rebuilt in-process on the
+		 *  installed state (the automatic path), so no restart follows. */
+		resumed?: boolean;
 	}) => void;
 	/**
 	 * JIT receive, LSP side (issue #669). Relayed JSON-safe: every satoshi and

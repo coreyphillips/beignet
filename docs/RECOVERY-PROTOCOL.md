@@ -17,6 +17,8 @@ Revision 12 (2026-08-22): a restored channel is never removed on the strength of
 
 Revision 13 (2026-08-23): a Tier 2 capsule restore records that its channels cannot be proven current, and never closes one on its own initiative (issue #469). RestoreDriver marks every restored channel StateUncertain unless it holds a re-verified wire-safety proof; restoreFromRecoveryCapsule reached the same reconstruction path and marked nothing, so a Tier 2 row looked exactly like a channel this device had been running. Byte-identical to the capsule is not the same as current: 5.4 says plainly that peer storage is rate limited and providers need not return the latest blob, which is why channel_reestablish is named as the safety net. The safety net only covers the paths that reach it, and the automatic force closes do not: a peer's BOLT 1 error, the reestablish and errored timeout backstops, and the HTLC deadline backstops each broadcast our latest local commitment, which a peer holding a newer state has already seen revoked, and the justice path then takes the whole balance. StateUncertain is the wrong marker for this: it never clears and it routes reestablish itself to DLP, so setting it would force close every capsule restore and undo issue #462. The install therefore stamps a narrower fact on each non-terminal restored row, restoreRecencyUnproven, which forbids an AUTOMATIC unilateral broadcast: the channel still resumes and keeps its funds, and that is what keeps this narrower than StateUncertain and keeps issue #462's fix working. A cooperative close is refused in BOTH directions unless the operator's acknowledgement covers it: a mutual close needs no revocation, but it pays out the balances the restored row carries, and a stale capsule's allocation can only be the peer-favourable one, since any payment received after the checkpoint is missing from it, so signing that split is a loss with no penalty attached and no way back. It takes no NEW HTLCs, because its on-chain HTLC deadline backstops can never fire while the hold stands and accepting an obligation whose only enforcement this node has disarmed is how a bounded risk becomes an unbounded one; existing HTLCs still settle and fail off chain. It is NOT lifted by a compatible reestablish, and review was right to insist on that: compatibility is not recency. BOLT 2's stale-state proof runs one way only, a valid FUTURE secret proves we fell behind while nothing in channel_reestablish attests the peer's HIGHEST state, and in peer-storage mode the peer holding the capsule is the same peer we would be trusting. One that holds a newer state can under-report compatible counters, replay the old secret it already has, and wait for an automatic close to publish a commitment it can penalize. The permanent hold IS the defence, because that attack needs US to broadcast: a peer that never gets a revoked commitment out of us has to close with a state we can sweep from, or leave the channel open. The exits are therefore the ones 5.6 already names, the peer closing or the operator explicitly accepting the risk, and the second is now labelled rather than implicit on both routes: the daemon's close and force-close routes each refuse such a channel without acceptStaleStateRisk, and an acknowledged cooperative close persists the acknowledgement for the whole negotiation, so the peer's mandatory shutdown reply, a reconnect and every closing signature stage honor it rather than refusing the close the operator just authorized. Because an ERRORED row never reaches the reestablish handler at all (the manager answers a reestablish for one with a wire error), the flag also DERIVES a peer-close disposition, restore-unproven, so such a channel asks its peer to close on every reconnect instead of waiting on nothing. That wait is reported per channel as restoreRecencyUnproven on GET /recovery/status, and an ERRORED one reports the new ChannelRecoveryStatus restore_recency_unproven rather than force_closing, which would claim a close is under way.
 
+Revision 14 (2026-09-03): the peer-storage restore is zero-touch behind an explicit flag (issue #690, piece 1). Every part of the restore existed; nothing joined them up inside the window the reestablish hold (revision 11) opens to protect the channels. With BEIGNET_RECOVERY_AUTO_APPLY the daemon now does: a boot that opened an EMPTY database (decided once, at init, never re-decided for state the node creates later) treats the first capsule a storage peer returns as the start of a settle window, applies the best candidate once every connected storage peer has answered and a settle floor has passed (so a slower replica still competes), or at a ceiling that the daemon refuses to let reach the hold, and then rebuilds the node in-process on the installed database rather than holding for a restart. The flag is OFF by default and refused outside peer-storage mode, because it automates an UNFENCED adoption: local durability cannot fence a previous device that still runs, so the consent moves to the one moment a person can give it, the seed import, and an embedder passes it at spawn. Every refusal the manual route makes (a database that gained state, a capsule naming guardians, a quorum namespace, nothing validating) is made once here and reported, and the manual route stays available after it. Channels the capsule's SCB names but its journal does not carry (the inline ceiling, or a checkpoint older than the channel) are named in a capsule:uncovered progress event and recovered through the peer, so nothing presents the restore as complete over a channel that is still going to close. New event recovery:capsule-retrieved; new status block autoApply.
+
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
 Audience: an implementing agent or engineer. Every code reference below was verified against the codebase as of beignet 0.7.0 (2026-07-22). Re-verify line numbers before editing; file and symbol names are the stable anchors.
 
@@ -849,6 +851,14 @@ BEIGNET_RECOVERY_REESTABLISH_HOLD_MS = peer-storage mode: how long an unknown
 channel's channel_reestablish is held before the BOLT 1 error goes out
 (default 600000; 0 answers immediately, the pre-#462 conduct; see 5.4; an
 integer in 0..2147483647, anything else refuses startup)
+BEIGNET_RECOVERY_AUTO_APPLY = peer-storage mode: apply the best retrieved
+capsule on a boot whose database is empty, with no operator call, and
+rebuild the node in-process (exact true or false; default off; refused
+outside peer-storage mode; automates an UNFENCED adoption, see below)
+BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS = settle floor from the first capsule's
+arrival (default 15000)
+BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS = ceiling from the first arrival
+(default 120000; at least the settle floor, and below the reestablish hold)
 ```
 
 Plus REST endpoints on the daemon: `GET /recovery/status` (readonly scope; the
@@ -900,6 +910,41 @@ swapped in: an operational fault, not a candidate defect). `GET /backup/peer-ret
 answers in every mode: the SCB embedded in a retrieved capsule is re-encoded
 under the wallet seed and reported with `source: 'capsule'`. CLI:
 `beignet recovery restore-capsule`.
+
+Automatic application (issue #690, revision 14). With
+`BEIGNET_RECOVERY_AUTO_APPLY=true` the daemon performs that restore itself,
+and only on a boot whose database was empty when it opened (decided once at
+init; state the node creates afterwards does not make a running node a
+target, and the manual route's dirty-target refusal still stands if it
+did). Every valid capsule a storage peer returns is announced as
+`recovery:capsule-retrieved`. The first arrival opens the settle window:
+the best candidate is applied once every connected storage peer
+(`option_provide_storage` in its init) has returned a capsule AND the settle
+floor has passed since the first arrival, so a slower replica of the same
+node still takes part in the selection; peers that never connect are not
+waited for past the ceiling, which the daemon refuses to let reach the
+reestablish hold, since beating that hold is the point. A Tier 1 result
+recovers on the live node as before. A Tier 2 install rebuilds the node
+in-process on the installed database (`recovery:restored` carries
+`resumed: true` and `restartRequired: false`; non-recovery routes answer
+503 NODE_RESTORE_PENDING for the rebuild window), and a rebuild that fails
+falls back to the restart-required hold with the database installed. The
+rebuilt node's fresh per-peer hold is benign for every channel the journal
+carried, which reestablish as known channels; a channel the capsule's SCB
+names that the journal did not carry (the 64 KB inline ceiling, or a
+checkpoint older than the channel) is named in a `capsule:uncovered`
+progress event and recovered through the peer, the SCB degradation, so an
+embedder never presents the restore as complete over a channel that is
+still going to close. The flag automates an UNFENCED adoption and is
+therefore off by default: local durability cannot fence a previous device
+that still runs, and if it does, both keep acting on the same channels. The
+consent belongs at the seed import, where the operator is already saying
+the seed lived somewhere else; an embedder asks there and passes the flag
+at spawn. Refusals are the manual route's, made once per boot and reported
+under `autoApply.lastReason` on `GET /recovery/status` (phases `idle`,
+`settling` with `settleUntil`, `applying`, `applied`, `refused`); the manual
+route stays available after one. A staged restore whose marker is present
+is never raced.
 
 Guardian locators (issue #457). `capsules.best.guardians` on `GET /recovery/status`
 lists the descriptors the best retrieved capsule names, credentials redacted
