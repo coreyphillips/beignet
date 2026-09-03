@@ -248,6 +248,12 @@ export interface DirectFundingConfigInfo {
 	targetInboundSat: number;
 	/** Whether a direct-funded open may go zero-conf. */
 	trusted: boolean;
+	/**
+	 * Whether a paired (trusted) payer's offer may be served by splicing the
+	 * existing channel with the liquidity peer instead of opening a second
+	 * one. Anonymous payers always get a new confirmed channel regardless.
+	 */
+	allowSplice: boolean;
 	/** Smallest offer served, never below the 5000 sat protocol floor. */
 	minAmountSat: number;
 }
@@ -621,14 +627,21 @@ export interface BeignetConfig {
 	 *  zero-conf channel is funded with THIS node's coins, charged at
 	 *  BEIGNET_JIT_FLAT_FEE_SAT + BEIGNET_JIT_FEE_PPM. BEIGNET_JIT_MAX_FLAT_FEE_SAT
 	 *  and BEIGNET_JIT_MAX_FEE_PPM are the other role and apply regardless: they
-	 *  cap what an LSP may quote us when POST /jit/invoice asks for one. Whole
-	 *  integers; anything else refuses startup. */
+	 *  cap what an LSP may quote us when POST /jit/invoice asks for one.
+	 *  BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT, BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS
+	 *  and BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT bound what the LSP role fronts
+	 *  (per client, in flight at once, and cumulatively across restarts; the
+	 *  last unset means no lifetime budget), issue #665. Whole integers;
+	 *  anything else refuses startup. */
 	jitReceive?: {
 		enabled?: boolean;
 		flatFeeSat?: number;
 		feePpm?: number;
 		maxFlatFeeSat?: number;
 		maxFeePpm?: number;
+		maxClientFundingSats?: number;
+		maxConcurrentFundings?: number;
+		maxTotalFundingSats?: number;
 	};
 	/** Relay direct-funding frames for OTHER nodes (BEIGNET_DF_RELAY, exact
 	 *  'true'/'false'). Off by default: forwarding opaque frames between

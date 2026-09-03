@@ -197,6 +197,7 @@ describe('direct funding daemon surface', function () {
 			lspPort: null,
 			targetInboundSat: 0,
 			trusted: false,
+			allowSplice: false,
 			minAmountSat: 20_000
 		});
 	});
@@ -221,10 +222,34 @@ describe('direct funding daemon surface', function () {
 			lspPort: 9735,
 			targetInboundSat: 500_000,
 			trusted: true,
+			allowSplice: false,
 			minAmountSat: 30_000
 		});
 		const readback = await call('GET', '/direct-funding/config');
 		expect(resultOf(readback.json).lspPubkey).to.equal(LSP);
+	});
+
+	// The app's home-channel design: a paired payer grows the one channel with
+	// the primary instead of opening a second. The receiver engine has had the
+	// splice path since 4C, but nothing over HTTP could switch it on.
+	it('configure takes allowSplice and reads it back, keeping the rest', async () => {
+		const on = await call('POST', '/direct-funding/configure', {
+			allowSplice: true
+		});
+		expect(resultOf(on.json)).to.include({
+			lspPubkey: LSP,
+			trusted: true,
+			allowSplice: true
+		});
+		const readback = await call('GET', '/direct-funding/config');
+		expect(resultOf(readback.json).allowSplice).to.equal(true);
+		const off = await call('POST', '/direct-funding/configure', {
+			allowSplice: false
+		});
+		expect(resultOf(off.json)).to.include({
+			lspPubkey: LSP,
+			allowSplice: false
+		});
 	});
 
 	it('clamps a minimum under the floor and reports the clamped value', async () => {

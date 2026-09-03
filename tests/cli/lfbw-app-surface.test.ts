@@ -223,16 +223,20 @@ describe('LFBW app surface (issue #614)', () => {
 
 		// 4D, issue #613. The dashboard posts {minAmountSat} alone and then
 		// requires lspPubkey in the readback, and the app's manager posts the
-		// other five without minAmountSat, so the route has to MERGE. Both
+		// other six without minAmountSat, so the route has to MERGE. Both
 		// halves of that are in the handler: it destructures each field and
-		// spreads it only when the caller named it.
-		it('POST /direct-funding/configure takes the six fields and merges them', () => {
+		// spreads it only when the caller named it. allowSplice is the seventh:
+		// the app's home-channel design needs a paired payer to grow the one
+		// channel with the primary rather than open a second, and the receiver
+		// engine's splice path is unreachable without it.
+		it('POST /direct-funding/configure takes the seven fields and merges them', () => {
 			const fields = [
 				'lspPubkey',
 				'lspHost',
 				'lspPort',
 				'targetInboundSat',
 				'trusted',
+				'allowSplice',
 				'minAmountSat'
 			];
 			expect(requestParams('/direct-funding/configure')).to.include.members(
@@ -255,6 +259,7 @@ describe('LFBW app surface (issue #614)', () => {
 				'lspPort',
 				'targetInboundSat',
 				'trusted',
+				'allowSplice',
 				'minAmountSat'
 			];
 			expect(responseFields('/direct-funding/config', 'get')).to.have.members(
@@ -487,6 +492,9 @@ describe('LFBW app surface (issue #614)', () => {
 			'BEIGNET_JIT_RECEIVE',
 			'BEIGNET_JIT_FLAT_FEE_SAT',
 			'BEIGNET_JIT_FEE_PPM',
+			'BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT',
+			'BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS',
+			'BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT',
 			'BEIGNET_FEE_BASE_MSAT',
 			'BEIGNET_FEE_PPM',
 			'BEIGNET_CLTV_DELTA',
@@ -505,6 +513,9 @@ describe('LFBW app surface (issue #614)', () => {
 			process.env.BEIGNET_JIT_RECEIVE = 'true';
 			process.env.BEIGNET_JIT_FLAT_FEE_SAT = '250';
 			process.env.BEIGNET_JIT_FEE_PPM = '1500';
+			process.env.BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT = '400000';
+			process.env.BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS = '2';
+			process.env.BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT = '5000000';
 			process.env.BEIGNET_FEE_BASE_MSAT = '1000';
 			process.env.BEIGNET_FEE_PPM = '100';
 			process.env.BEIGNET_CLTV_DELTA = '80';
@@ -521,7 +532,10 @@ describe('LFBW app surface (issue #614)', () => {
 			expect(config.jitReceive).to.include({
 				enabled: true,
 				flatFeeSat: 250,
-				feePpm: 1500
+				feePpm: 1500,
+				maxClientFundingSats: 400_000,
+				maxConcurrentFundings: 2,
+				maxTotalFundingSats: 5_000_000
 			});
 			expect(config.routingFeeBaseMsat).to.equal(1000);
 			expect(config.routingFeePpm).to.equal(100);

@@ -131,7 +131,8 @@ function leaseRatesEnv(raw: string | undefined): BeignetConfig['leaseRates'] {
 
 /**
  * BEIGNET_JIT_RECEIVE / _FLAT_FEE_SAT / _FEE_PPM / _MAX_FLAT_FEE_SAT /
- * _MAX_FEE_PPM, assembled into one config block. A variable that is not set
+ * _MAX_FEE_PPM / _MAX_CLIENT_FUNDING_SAT / _MAX_CONCURRENT_FUNDINGS /
+ * _MAX_TOTAL_FUNDING_SAT, assembled into one config block. A variable that is not set
  * leaves its field out rather than writing an undefined, so mergeJitReceive
  * can let the config file answer for that field alone.
  *
@@ -151,12 +152,28 @@ function jitReceiveEnv(): BeignetConfig['jitReceive'] {
 	const feePpm = integerEnv(process.env.BEIGNET_JIT_FEE_PPM);
 	const maxFlatFeeSat = integerEnv(process.env.BEIGNET_JIT_MAX_FLAT_FEE_SAT);
 	const maxFeePpm = integerEnv(process.env.BEIGNET_JIT_MAX_FEE_PPM);
+	// The LSP role's exposure caps (issue #665). Without a daemon surface the
+	// role ran on the library defaults, which an operator could neither see
+	// nor change: up to maxConcurrentFundings x maxClientFundingSats of this
+	// node's coins committed to strangers' channels at any instant.
+	const maxClientFundingSats = integerEnv(
+		process.env.BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT
+	);
+	const maxConcurrentFundings = integerEnv(
+		process.env.BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS
+	);
+	const maxTotalFundingSats = integerEnv(
+		process.env.BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT
+	);
 	if (
 		enabled === undefined &&
 		flatFeeSat === undefined &&
 		feePpm === undefined &&
 		maxFlatFeeSat === undefined &&
-		maxFeePpm === undefined
+		maxFeePpm === undefined &&
+		maxClientFundingSats === undefined &&
+		maxConcurrentFundings === undefined &&
+		maxTotalFundingSats === undefined
 	) {
 		return undefined;
 	}
@@ -165,16 +182,19 @@ function jitReceiveEnv(): BeignetConfig['jitReceive'] {
 		...(flatFeeSat !== undefined ? { flatFeeSat } : {}),
 		...(feePpm !== undefined ? { feePpm } : {}),
 		...(maxFlatFeeSat !== undefined ? { maxFlatFeeSat } : {}),
-		...(maxFeePpm !== undefined ? { maxFeePpm } : {})
+		...(maxFeePpm !== undefined ? { maxFeePpm } : {}),
+		...(maxClientFundingSats !== undefined ? { maxClientFundingSats } : {}),
+		...(maxConcurrentFundings !== undefined ? { maxConcurrentFundings } : {}),
+		...(maxTotalFundingSats !== undefined ? { maxTotalFundingSats } : {})
 	};
 }
 
 /**
  * Merge the jitReceive block FIELD BY FIELD, cliFlag ?? env ?? file.
  *
- * The five fields are two independent policies: enabled/flatFeeSat/feePpm are
- * what this node charges as an LSP, maxFlatFeeSat/maxFeePpm are the most it
- * will pay as a client. A whole-block `??` gave the first layer that named any
+ * The fields are two independent policies: enabled/flatFeeSat/feePpm and the
+ * three exposure caps are what this node charges and risks as an LSP,
+ * maxFlatFeeSat/maxFeePpm are the most it will pay as a client. A whole-block `??` gave the first layer that named any
  * field all five, so setting BEIGNET_JIT_RECEIVE (which the LFBW app does on
  * every daemon it spawns, along with the two fee variables) dropped a client
  * ceiling the operator had written in config.json and quietly restored the
@@ -194,12 +214,27 @@ function mergeJitReceive(
 	const maxFlatFeeSat =
 		cli?.maxFlatFeeSat ?? env?.maxFlatFeeSat ?? file?.maxFlatFeeSat;
 	const maxFeePpm = cli?.maxFeePpm ?? env?.maxFeePpm ?? file?.maxFeePpm;
+	const maxClientFundingSats =
+		cli?.maxClientFundingSats ??
+		env?.maxClientFundingSats ??
+		file?.maxClientFundingSats;
+	const maxConcurrentFundings =
+		cli?.maxConcurrentFundings ??
+		env?.maxConcurrentFundings ??
+		file?.maxConcurrentFundings;
+	const maxTotalFundingSats =
+		cli?.maxTotalFundingSats ??
+		env?.maxTotalFundingSats ??
+		file?.maxTotalFundingSats;
 	return {
 		...(enabled !== undefined ? { enabled } : {}),
 		...(flatFeeSat !== undefined ? { flatFeeSat } : {}),
 		...(feePpm !== undefined ? { feePpm } : {}),
 		...(maxFlatFeeSat !== undefined ? { maxFlatFeeSat } : {}),
-		...(maxFeePpm !== undefined ? { maxFeePpm } : {})
+		...(maxFeePpm !== undefined ? { maxFeePpm } : {}),
+		...(maxClientFundingSats !== undefined ? { maxClientFundingSats } : {}),
+		...(maxConcurrentFundings !== undefined ? { maxConcurrentFundings } : {}),
+		...(maxTotalFundingSats !== undefined ? { maxTotalFundingSats } : {})
 	};
 }
 
