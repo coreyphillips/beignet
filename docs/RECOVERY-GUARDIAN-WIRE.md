@@ -222,14 +222,24 @@ ids may interleave. A receiver drops the session on any framing violation
 (a chunk out of order, a header that changes mid-message, more partial
 messages than it allows), and answers a declared length over its cap with
 transportStatus 413 once while swallowing that id's remaining chunks, so
-the stream stays usable.
+the stream stays usable. A host configured with a credential decides it on
+chunk 0, before any of the body is buffered: a refused credential is
+answered 401 once and the id's remaining chunks are swallowed the same way.
+What one session may have retained, partial bodies and ids being swallowed
+together, is bounded, and entries that went stale are aged out.
 
 A host serves a set only once REGISTER_NODE has run for it (5.1). Before
 that, GET_HEAD and GET_STATE for the set answer `ERR_UNKNOWN_NODE`, which
 is the truthful "no namespace here" a writer's ownership check reads as
 "fresh, register"; every other verb but REGISTER_NODE answers
 `ERR_UNKNOWN_SET`. INFO advertises `accepts_registrations` so a writer
-binding to the host accepts the set being absent from its list.
+binding to the host accepts the set being absent from its list. A host
+verifies the whole registration, root signature included, before it
+allocates anything for a set it has never served: a refused registration
+leaves no store, no index entry and no served set. Its byte quota bounds the
+encoded content a set stores and refuses the write that would cross it
+(what is stored plus what the write would add); a replay the guardian
+answers from what it already holds costs nothing.
 
 `transportStatus` is the 2.5 HTTP-layer status, one to one: 200 for every
 well-formed protocol exchange INCLUDING protocol-level rejections (the

@@ -736,4 +736,93 @@ export class GuardianStore {
 			.prepare('DELETE FROM guardian_epochs WHERE recovery_id = ?')
 			.run(recoveryId);
 	}
+
+	// ─────────────── storage accounting ───────────────
+
+	/**
+	 * The encoded bytes the store holds: every column of every row, summed
+	 * across the four tables. This is what a hosted guardian's byte quota
+	 * measures (guardian-host.ts): a record costs exactly its columns, so a
+	 * host can charge an append before it happens and re-derive the total
+	 * after a restart from the rows themselves. Pages, indexes and the WAL
+	 * are SQLite's overhead on top and are reported separately as disk.
+	 */
+	contentBytes(recoveryId?: Buffer): number {
+		const where = recoveryId ? ' WHERE recovery_id = ?' : '';
+		const args = recoveryId ? [recoveryId] : [];
+		let total = 0;
+		for (const [table, columns] of CONTENT_COLUMNS) {
+			const sum = columns.map((c) => `COALESCE(length(${c}), 0)`).join(' + ');
+			const row = this.db
+				.prepare(
+					`SELECT COALESCE(SUM(${sum}), 0) AS bytes FROM ${table}${where}`
+				)
+				.get(...args) as { bytes: number | bigint };
+			total += Number(row.bytes);
+		}
+		return total;
+	}
 }
+
+/** The columns contentBytes() sums, per table; integers count their width. */
+const CONTENT_COLUMNS: ReadonlyArray<[string, string[]]> = [
+	[
+		'guardian_namespaces',
+		[
+			'recovery_id',
+			'guardian_set_id',
+			'state',
+			'possibly_stale',
+			'registration_state',
+			'registration_signature',
+			'registration_receipt_issued_at',
+			'registration_receipt_signature',
+			'receipt_issued_at',
+			'receipt_signature',
+			'generation',
+			'rotation'
+		]
+	],
+	[
+		'guardian_records',
+		[
+			'recovery_id',
+			'sequence',
+			'epoch',
+			'previous_hash',
+			'frame_hash',
+			'ciphertext_hash',
+			'ciphertext',
+			'writer_signature'
+		]
+	],
+	[
+		'guardian_orphan_records',
+		[
+			'recovery_id',
+			'epoch',
+			'sequence',
+			'previous_hash',
+			'frame_hash',
+			'ciphertext_hash',
+			'ciphertext',
+			'writer_signature',
+			'archived_at',
+			'reason'
+		]
+	],
+	[
+		'guardian_epochs',
+		[
+			'recovery_id',
+			'epoch',
+			'writer_public_key',
+			'cert_superseded_state',
+			'cert_issued_at',
+			'cert_signature',
+			'receipt_state',
+			'receipt_issued_at',
+			'receipt_signature'
+		]
+	]
+];

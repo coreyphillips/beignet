@@ -430,13 +430,201 @@ function tryParseState(buf: Buffer | null): GuardianState | null {
 	}
 }
 
-interface IErr {
+export interface IGuardianRefusal {
 	status: GuardianStatus;
 	detail: string;
 }
 
+type IErr = IGuardianRefusal;
+
 function err(status: GuardianStatus, detail: string): IErr {
 	return { status, detail };
+}
+
+function versionAndSetProblemFor(
+	servedSetId: Buffer,
+	protocolVersion: number,
+	guardianSetId: Buffer
+): IErr | null {
+	if (protocolVersion !== GUARDIAN_PROTOCOL_VERSION) {
+		return err(
+			GuardianStatus.ERR_UNSUPPORTED_VERSION,
+			`protocol_version ${protocolVersion} outside supported range 1..1`
+		);
+	}
+	if (!isLen(guardianSetId, 32) || !guardianSetId.equals(servedSetId)) {
+		return err(
+			GuardianStatus.ERR_UNKNOWN_SET,
+			'guardian_set_id is not served by this guardian'
+		);
+	}
+	return null;
+}
+
+/**
+ * The member list a registration MUST carry (wire 5.1): exactly the
+ * committed set, hashing to the request's guardian_set_id and naming this
+ * guardian. For a single-set guardian the set id check already implies
+ * this; the rule is uniform so a multi-set host and a configured guardian
+ * accept exactly the same registrations.
+ */
+function memberListProblemFor(
+	guardianId: Buffer,
+	guardianSetId: Buffer,
+	members: Buffer[] | undefined
+): IErr | null {
+	if (!Array.isArray(members) || members.length !== CRASH_V1_PROFILE.total) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			`guardian_members must list exactly ${CRASH_V1_PROFILE.total} keys`
+		);
+	}
+	let setId: Buffer;
+	try {
+		setId = computeGuardianSetId({
+			...CRASH_V1_PROFILE,
+			guardianIds: members
+		});
+	} catch (error) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			`guardian_members invalid: ${
+				error instanceof Error ? error.message : String(error)
+			}`
+		);
+	}
+	if (!setId.equals(guardianSetId)) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'guardian_members do not hash to guardian_set_id'
+		);
+	}
+	if (!members.some((m) => m.equals(guardianId))) {
+		return err(
+			GuardianStatus.ERR_UNKNOWN_SET,
+			'this guardian is not a member of guardian_members'
+		);
+	}
+	return null;
+}
+
+function stateShapeProblem(state: GuardianState): string | null {
+	if (!isLen(state.recoveryId, 32)) return 'recovery_id must be 32 bytes';
+	if (!validU64(state.lease.epoch) || state.lease.epoch === 0n) {
+		return 'lease epoch must be a nonzero u64';
+	}
+	if (!isLen(state.lease.writerPublicKey, 32)) {
+		return 'writer public key must be 32 bytes';
+	}
+	if (
+		!validU64(state.origin.firstSequence) ||
+		state.origin.firstSequence === 0n
+	) {
+		return 'origin firstSequence must be a nonzero u64';
+	}
+	if (!isLen(state.origin.previousHash, 32)) {
+		return 'origin previousHash must be 32 bytes';
+	}
+	if (
+		!validU64(state.logHead.sequence) ||
+		!validU64(state.logHead.recordEpoch)
+	) {
+		return 'log head integers must be u64';
+	}
+	if (
+		!isLen(state.logHead.frameHash, 32) ||
+		!isLen(state.logHead.ciphertextHash, 32)
+	) {
+		return 'log head hashes must be 32 bytes';
+	}
+	return null;
+}
+
+/**
+ * Everything REGISTER_NODE (wire 5.1) proves before a store is consulted:
+ * the version, the set and the member list binding, the shape of the
+ * initial state, and the root signature over the REGISTER transcript. The
+ * guardian's register() runs this first, and a host (guardian-host.ts)
+ * runs the SAME function before it opens a store for a set it has never
+ * served, so a registration that would be refused can never allocate one
+ * (issue #710). Pure: no store, no clock, nothing retained.
+ */
+export function registrationAdmissionProblem(
+	guardianId: Buffer,
+	guardianSetId: Buffer,
+	request: IGuardianRegisterNodeRequest
+): IGuardianRefusal | null {
+	const gate = versionAndSetProblemFor(
+		guardianSetId,
+		request.protocolVersion,
+		request.guardianSetId
+	);
+	if (gate) return gate;
+	const members = memberListProblemFor(
+		guardianId,
+		guardianSetId,
+		request.guardianMembers
+	);
+	if (members) return members;
+	const state = request.initialState;
+	const shape = stateShapeProblem(state);
+	if (shape) return err(GuardianStatus.ERR_MALFORMED, shape);
+	if (!ecc.isXOnlyPoint(state.recoveryId)) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'recovery_id is not a valid x-only point'
+		);
+	}
+	if (!ecc.isXOnlyPoint(state.lease.writerPublicKey)) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'writer public key is not a valid x-only point'
+		);
+	}
+	// Registration never claims records the guardian does not hold.
+	if (!isGenesisLogHead(state.logHead)) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'registration log head must be genesis'
+		);
+	}
+	// A fresh chain begins where the journal begins: sequence 1 has no
+	// predecessor, so a nonzero previousHash there is incoherent.
+	if (
+		state.origin.firstSequence === 1n &&
+		!state.origin.previousHash.equals(ZERO32)
+	) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'origin at firstSequence 1 requires a zero previousHash'
+		);
+	}
+	if (!isLen(request.rootSignature, 64)) {
+		return err(GuardianStatus.ERR_MALFORMED, 'root signature must be 64 bytes');
+	}
+	if (!validU64(request.generation) || request.generation === 0n) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'generation must be a nonzero u64'
+		);
+	}
+	let verified = false;
+	try {
+		verified = verifyTranscript(
+			registerTranscriptHash(guardianSetId, state, request.generation),
+			request.rootSignature,
+			state.recoveryId
+		);
+	} catch {
+		verified = false;
+	}
+	if (!verified) {
+		return err(
+			GuardianStatus.ERR_BAD_SIGNATURE,
+			'root signature over the REGISTER transcript failed'
+		);
+	}
+	return null;
 }
 
 /** A namespace row's generation; a row with none is at the first generation. */
@@ -547,6 +735,15 @@ export class ReferenceGuardian {
 		);
 	}
 
+	/**
+	 * The encoded bytes this guardian's store holds, for one namespace or
+	 * for all of them (GuardianStore.contentBytes): what a host's byte quota
+	 * measures and re-derives after a restart.
+	 */
+	contentBytes(recoveryId?: Buffer): number {
+		return this.store.read(() => this.store.contentBytes(recoveryId));
+	}
+
 	/** Orphan-archive audit view (never served by GET_STATE). */
 	listOrphanedRecords(recoveryId: Buffer): IGuardianOrphanRow[] {
 		return this.store.listOrphans(recoveryId);
@@ -601,97 +798,15 @@ export class ReferenceGuardian {
 		protocolVersion: number,
 		guardianSetId: Buffer
 	): IErr | null {
-		if (protocolVersion !== GUARDIAN_PROTOCOL_VERSION) {
-			return err(
-				GuardianStatus.ERR_UNSUPPORTED_VERSION,
-				`protocol_version ${protocolVersion} outside supported range 1..1`
-			);
-		}
-		if (
-			!isLen(guardianSetId, 32) ||
-			!guardianSetId.equals(this.guardianSetId)
-		) {
-			return err(
-				GuardianStatus.ERR_UNKNOWN_SET,
-				'guardian_set_id is not served by this guardian'
-			);
-		}
-		return null;
-	}
-
-	/**
-	 * The member list a registration MUST carry (wire 5.1): exactly the
-	 * committed set, hashing to the request's guardian_set_id and naming this
-	 * guardian. For a single-set guardian the set id check already implies
-	 * this; the rule is uniform so a multi-set host and a configured guardian
-	 * accept exactly the same registrations.
-	 */
-	private memberListProblem(members: Buffer[] | undefined): IErr | null {
-		if (!Array.isArray(members) || members.length !== CRASH_V1_PROFILE.total) {
-			return err(
-				GuardianStatus.ERR_MALFORMED,
-				`guardian_members must list exactly ${CRASH_V1_PROFILE.total} keys`
-			);
-		}
-		let setId: Buffer;
-		try {
-			setId = computeGuardianSetId({
-				...CRASH_V1_PROFILE,
-				guardianIds: members
-			});
-		} catch (error) {
-			return err(
-				GuardianStatus.ERR_MALFORMED,
-				`guardian_members invalid: ${
-					error instanceof Error ? error.message : String(error)
-				}`
-			);
-		}
-		if (!setId.equals(this.guardianSetId)) {
-			return err(
-				GuardianStatus.ERR_MALFORMED,
-				'guardian_members do not hash to guardian_set_id'
-			);
-		}
-		if (!members.some((m) => m.equals(this.guardianId))) {
-			return err(
-				GuardianStatus.ERR_UNKNOWN_SET,
-				'this guardian is not a member of guardian_members'
-			);
-		}
-		return null;
+		return versionAndSetProblemFor(
+			this.guardianSetId,
+			protocolVersion,
+			guardianSetId
+		);
 	}
 
 	private stateShapeProblem(state: GuardianState): string | null {
-		if (!isLen(state.recoveryId, 32)) return 'recovery_id must be 32 bytes';
-		if (!validU64(state.lease.epoch) || state.lease.epoch === 0n) {
-			return 'lease epoch must be a nonzero u64';
-		}
-		if (!isLen(state.lease.writerPublicKey, 32)) {
-			return 'writer public key must be 32 bytes';
-		}
-		if (
-			!validU64(state.origin.firstSequence) ||
-			state.origin.firstSequence === 0n
-		) {
-			return 'origin firstSequence must be a nonzero u64';
-		}
-		if (!isLen(state.origin.previousHash, 32)) {
-			return 'origin previousHash must be 32 bytes';
-		}
-		if (
-			!validU64(state.logHead.sequence) ||
-			!validU64(state.logHead.recordEpoch)
-		) {
-			return 'log head integers must be u64';
-		}
-		if (
-			!isLen(state.logHead.frameHash, 32) ||
-			!isLen(state.logHead.ciphertextHash, 32)
-		) {
-			return 'log head hashes must be 32 bytes';
-		}
-		return null;
+		return stateShapeProblem(state);
 	}
 
 	private cloneState(state: GuardianState): GuardianState {
@@ -809,71 +924,13 @@ export class ReferenceGuardian {
 		request: IGuardianRegisterNodeRequest
 	): IGuardianRegisterNodeResponse {
 		try {
-			const gate = this.versionAndSetProblem(
-				request.protocolVersion,
-				request.guardianSetId
-			);
-			if (gate) return gate;
-			const members = this.memberListProblem(request.guardianMembers);
-			if (members) return members;
-			const state = request.initialState;
-			const shape = this.stateShapeProblem(state);
-			if (shape) return err(GuardianStatus.ERR_MALFORMED, shape);
-			if (!ecc.isXOnlyPoint(state.recoveryId)) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'recovery_id is not a valid x-only point'
-				);
-			}
-			if (!ecc.isXOnlyPoint(state.lease.writerPublicKey)) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'writer public key is not a valid x-only point'
-				);
-			}
-			// Registration never claims records the guardian does not hold.
-			if (!isGenesisLogHead(state.logHead)) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'registration log head must be genesis'
-				);
-			}
-			// A fresh chain begins where the journal begins: sequence 1 has no
-			// predecessor, so a nonzero previousHash there is incoherent.
-			if (
-				state.origin.firstSequence === 1n &&
-				!state.origin.previousHash.equals(ZERO32)
-			) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'origin at firstSequence 1 requires a zero previousHash'
-				);
-			}
-			if (!isLen(request.rootSignature, 64)) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'root signature must be 64 bytes'
-				);
-			}
-			if (!validU64(request.generation) || request.generation === 0n) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'generation must be a nonzero u64'
-				);
-			}
-			const transcript = registerTranscriptHash(
+			const admission = registrationAdmissionProblem(
+				this.guardianId,
 				this.guardianSetId,
-				state,
-				request.generation
+				request
 			);
-			if (
-				!this.safeVerify(transcript, request.rootSignature, state.recoveryId)
-			) {
-				return err(
-					GuardianStatus.ERR_BAD_SIGNATURE,
-					'root signature over the REGISTER transcript failed'
-				);
-			}
+			if (admission) return admission;
+			const state = request.initialState;
 
 			const quarantine = this.quarantineGate(state.recoveryId);
 			if (quarantine) return quarantine;

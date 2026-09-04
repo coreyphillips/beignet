@@ -551,6 +551,46 @@ describe('bolt8 guardian frames', () => {
 			/zero chunks/
 		);
 	});
+
+	it('bounds the ids it discards and evicts them with the partials', () => {
+		let now = 1000;
+		const assembler = new GuardianBolt8Assembler({
+			kind: 'request',
+			maxBodyBytes: 100_000,
+			maxInFlight: 2,
+			staleMs: 500,
+			clock: (): number => now
+		});
+		const oversized = (id: number): Buffer =>
+			encodeGuardianBolt8Request({
+				requestId: id,
+				verb: GuardianBolt8Verb.PUT_STATE,
+				body: crypto.randomBytes(200_000)
+			})[0];
+		expect(assembler.push(oversized(1))?.kind).to.equal('too-large');
+		expect(assembler.push(oversized(2))?.kind).to.equal('too-large');
+		expect(assembler.discarding).to.equal(2);
+		expect(assembler.inFlight).to.equal(0);
+		expect(assembler.retained).to.equal(2);
+		// A third refused id, or a partial, is more than the session may hold.
+		expect(() => assembler.push(oversized(3))).to.throw(
+			/too many guardian requests/
+		);
+		const partial = encodeGuardianBolt8Request({
+			requestId: 4,
+			verb: GuardianBolt8Verb.PUT_STATE,
+			body: crypto.randomBytes(90_000)
+		})[0];
+		expect(() => assembler.push(partial)).to.throw(
+			/too many guardian requests/
+		);
+		now += 600;
+		expect(assembler.evictStale()).to.equal(2);
+		expect(assembler.retained).to.equal(0);
+		expect(assembler.push(oversized(3))?.kind).to.equal('too-large');
+		expect(assembler.push(partial)).to.equal(null);
+		expect(assembler.retained).to.equal(2);
+	});
 });
 
 describe('bolt8 guardian session end to end', () => {
@@ -888,6 +928,85 @@ describe('bolt8 guardian transport-level statuses', () => {
 		} finally {
 			transport.close();
 			await host.close();
+			guardian.close();
+		}
+	});
+
+	const statusOf = (frames: Buffer[]): number =>
+		decodeGuardianBolt8Frame(frames[0], 'response').status!;
+
+	it('refuses a credential on chunk 0 and never buffers the body sent with it', () => {
+		const guardian = makeGuardian(1_800_000_000_000n);
+		try {
+			const responder = new GuardianBolt8Responder({
+				guardian,
+				authenticate: bolt8BearerAuthenticator('s3cret'),
+				maxBodyBytes: 1 << 20
+			});
+			const frames = encodeGuardianBolt8Request({
+				requestId: 5,
+				verb: GuardianBolt8Verb.PUT_STATE,
+				auth: Buffer.from('Bearer wrong'),
+				body: crypto.randomBytes(200_000)
+			});
+			expect(frames.length).to.be.greaterThan(1);
+			const answer = responder.handle(frames[0]);
+			expect(answer).to.have.length(1);
+			expect(statusOf(answer)).to.equal(GuardianBolt8Status.UNAUTHORIZED);
+			expect(responder.inFlight).to.equal(0);
+			expect(responder.discarding).to.equal(1);
+			for (const frame of frames.slice(1)) {
+				expect(responder.handle(frame)).to.deep.equal([]);
+			}
+			expect(responder.discarding).to.equal(0);
+			// The id is free again, and the right credential is served.
+			const info = encodeGuardianBolt8Request({
+				requestId: 5,
+				verb: GuardianBolt8Verb.INFO,
+				auth: Buffer.from('Bearer s3cret'),
+				body: Buffer.alloc(0)
+			});
+			expect(statusOf(responder.handle(info[0]))).to.equal(
+				GuardianBolt8Status.OK
+			);
+		} finally {
+			guardian.close();
+		}
+	});
+
+	it('drops a session that keeps presenting a refused credential', () => {
+		const guardian = makeGuardian(1_800_000_000_000n);
+		try {
+			const responder = new GuardianBolt8Responder({
+				guardian,
+				authenticate: bolt8BearerAuthenticator('s3cret'),
+				maxUnauthorized: 2
+			});
+			const attempt = (id: number, token: string): Buffer =>
+				encodeGuardianBolt8Request({
+					requestId: id,
+					verb: GuardianBolt8Verb.INFO,
+					auth: Buffer.from(`Bearer ${token}`),
+					body: Buffer.alloc(0)
+				})[0];
+			expect(statusOf(responder.handle(attempt(1, 'nope')))).to.equal(
+				GuardianBolt8Status.UNAUTHORIZED
+			);
+			// An accepted request ends the run.
+			expect(statusOf(responder.handle(attempt(2, 's3cret')))).to.equal(
+				GuardianBolt8Status.OK
+			);
+			expect(statusOf(responder.handle(attempt(3, 'nope')))).to.equal(
+				GuardianBolt8Status.UNAUTHORIZED
+			);
+			expect(statusOf(responder.handle(attempt(4, 'nope')))).to.equal(
+				GuardianBolt8Status.UNAUTHORIZED
+			);
+			expect(() => responder.handle(attempt(5, 'nope'))).to.throw(
+				GuardianBolt8FrameError,
+				/refused credentials/
+			);
+		} finally {
 			guardian.close();
 		}
 	});
