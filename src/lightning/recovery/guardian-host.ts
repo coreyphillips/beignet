@@ -22,23 +22,23 @@
  * permanently (spec 5.8, the compaction retain floor), so an exhausted quota
  * answers ERR_QUOTA_EXCEEDED and the operator raises it or the writer moves
  * on. The byte quota bounds the encoded content a set stores (every column
- * of every row, GuardianStore.contentBytes) and is enforced on the write
- * that would cross it: a write is admitted only while
- * `bytes + delta <= maxBytesPerSet`, where delta is what the store grows by
- * if the guardian accepts and zero for a replay the guardian answers from
- * what it already holds. The host is synchronous, so the check, the
- * guardian's transaction and the charge are one unit against every other
- * request; the counter is re-derived from the store at open, so a restart
- * recovers it exactly. Disk is that content plus SQLite's overhead and is
- * reported alongside it.
+ * of every row, GuardianStore.contentBytes) and is the guardian's own
+ * `maxContentBytes`, judged inside each write's BEGIN IMMEDIATE after the
+ * retirement check and before the verb's own verdicts, against a counter
+ * the store itself keeps: every mutating verb is under it, a replay the
+ * guardian answers from what it holds costs nothing, a replaced row costs
+ * new minus old, and two hosts opened on one store admit against the same
+ * total. The counter is re-derived from the rows at every open. Disk is
+ * that content plus SQLite's overhead and is reported alongside it.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import {
+	GUARDIAN_RECORD_OVERHEAD_BYTES,
+	GUARDIAN_REGISTRATION_BYTES,
 	GuardianStatus,
 	IGuardianInfoResponse,
-	IGuardianRecord,
 	IGuardianRegisterNodeRequest,
 	ReferenceGuardian,
 	registrationAdmissionProblem
@@ -47,7 +47,6 @@ import {
 	GUARDIAN_PROTOCOL_VERSION,
 	CRASH_V1_PROFILE,
 	computeGuardianSetId,
-	isGenesisLogHead,
 	xOnlyFromSecret
 } from './guardian-wire';
 import {
@@ -79,21 +78,10 @@ export const GUARDIAN_HOST_DEFAULT_MAX_SETS = 16;
 const MAX_RECORDS_PER_GET = 256;
 const INDEX_FILE = 'sets.json';
 
-/**
- * What a record row stores besides its ciphertext: recovery_id, sequence,
- * epoch, previous_hash, frame_hash, ciphertext_hash, writer_signature
- * (guardian-store.ts). An accepted append grows the store by exactly this
- * plus the ciphertext; the namespace row it updates keeps its size.
- */
+/** What the guardian charges an accepted record and a fresh registration. */
 export const GUARDIAN_HOST_RECORD_OVERHEAD_BYTES =
-	32 + 8 + 8 + 32 + 32 + 32 + 64;
-/**
- * What a fresh registration stores: the namespace row (two 192-byte
- * states, three signatures, two issue times, the ids, the generation, the
- * stale flag) and the first epoch row (recovery_id, epoch, writer key).
- */
-export const GUARDIAN_HOST_REGISTRATION_BYTES =
-	32 + 32 + 192 + 1 + 192 + 64 + 8 + 64 + 8 + 64 + 8 + (32 + 8 + 32);
+	GUARDIAN_RECORD_OVERHEAD_BYTES;
+export const GUARDIAN_HOST_REGISTRATION_BYTES = GUARDIAN_REGISTRATION_BYTES;
 
 export interface IGuardianHostConfig {
 	/** Directory for the per-set stores and the host index. Created if absent. */
@@ -166,20 +154,16 @@ interface IServedSet {
 	guardian: ReferenceGuardian;
 	file: string;
 	registeredAt: number;
-	/** Encoded content stored, re-derived at open and charged per write. */
-	bytes: number;
 }
 
-/** How a verb that may grow the store is admitted and accounted. */
-interface IWritePlan {
-	recoveryId: Buffer;
-	/** Bytes the store grows by if the guardian accepts; 0 for a replay. */
-	delta: number;
-	/** True when delta is exact and charged as is; false measures the namespace. */
-	exact: boolean;
-	/** Whether the byte quota refuses the write when it would cross the limit. */
-	gated: boolean;
-}
+const WRITE_VERBS: ReadonlySet<GuardianVerbName> = new Set<GuardianVerbName>([
+	'register_node',
+	'put_state',
+	'sync_record',
+	'acquire_epoch',
+	'sync_epoch',
+	'rotate_set'
+]);
 
 const STORE_SUFFIXES = ['', '-wal', '-shm'];
 
@@ -284,24 +268,17 @@ export class GuardianHost implements IGuardianResolver {
 			encodeGuardianVerbRefusal(verb, status, detail);
 		let setId: Buffer;
 		let registration: IGuardianRegisterNodeRequest | null = null;
-		let record: IGuardianRecord | null = null;
-		let recoveryId: Buffer | null = null;
 		try {
 			switch (verb) {
 				case 'register_node':
 					registration = decodeRegisterNodeRequest(body);
 					setId = registration.guardianSetId;
-					recoveryId = registration.initialState.recoveryId;
 					break;
 				case 'put_state':
-					record = decodePutStateRequest(body).record;
-					setId = record.guardianSetId;
-					recoveryId = record.recoveryId;
+					setId = decodePutStateRequest(body).record.guardianSetId;
 					break;
 				case 'sync_record':
-					record = decodeSyncRecordRequest(body).record;
-					setId = record.guardianSetId;
-					recoveryId = record.recoveryId;
+					setId = decodeSyncRecordRequest(body).record.guardianSetId;
 					break;
 				case 'get_head':
 					setId = decodeGetHeadRequest(body).guardianSetId;
@@ -309,19 +286,13 @@ export class GuardianHost implements IGuardianResolver {
 				case 'get_state':
 					setId = decodeGetStateRequest(body).guardianSetId;
 					break;
-				case 'acquire_epoch': {
-					const request = decodeAcquireEpochRequest(body);
-					setId = request.guardianSetId;
-					recoveryId = request.expectedState.recoveryId;
+				case 'acquire_epoch':
+					setId = decodeAcquireEpochRequest(body).guardianSetId;
 					break;
-				}
-				case 'rotate_set': {
+				case 'rotate_set':
 					// Addressed to the OUTGOING set, which this host serves.
-					const request = decodeRotateSetRequest(body);
-					setId = request.guardianSetId;
-					recoveryId = request.recoveryId;
+					setId = decodeRotateSetRequest(body).guardianSetId;
 					break;
-				}
 				case 'sync_epoch': {
 					const certificates = decodeSyncEpochRequest(body).certificates;
 					if (certificates.length === 0) {
@@ -331,7 +302,6 @@ export class GuardianHost implements IGuardianResolver {
 						);
 					}
 					setId = certificates[0].guardianSetId;
-					recoveryId = certificates[0].supersededState.recoveryId;
 					break;
 				}
 			}
@@ -371,19 +341,20 @@ export class GuardianHost implements IGuardianResolver {
 				'guardian_set_id is not served by this host; register it first'
 			);
 		}
-		if (recoveryId === null) return served.guardian;
-		if (recoveryId.length !== 32) {
-			return refuse(
-				GuardianStatus.ERR_MALFORMED,
-				'recovery_id must be 32 bytes'
-			);
+		if (!WRITE_VERBS.has(verb)) return served.guardian;
+		// The quota is the guardian's, judged inside the write's transaction;
+		// the host runs the verb itself only to report what it refused.
+		const outcome = runGuardianVerb(served.guardian, verb, body);
+		if (outcome.status === GuardianStatus.ERR_QUOTA_EXCEEDED) {
+			this.emit({
+				type: 'guardian:quota-refused',
+				detail: `set ${key} holds ${served.guardian.contentBytes()} of ${
+					this.maxBytesPerSet
+				} bytes; a ${verb} was refused`,
+				setId: key
+			});
 		}
-		return this.write(
-			served,
-			verb,
-			body,
-			this.planWrite(served, verb, body, recoveryId, record)
-		);
+		return outcome.body;
 	}
 
 	// ─────────────── status and lifecycle ───────────────
@@ -397,7 +368,7 @@ export class GuardianHost implements IGuardianResolver {
 			setId: set.setId.toString('hex'),
 			members: set.members.map((m) => m.toString('hex')),
 			namespaces: set.guardian.listNamespaceIds().length,
-			bytes: set.bytes,
+			bytes: set.guardian.contentBytes(),
 			diskBytes: this.diskBytesOf(set),
 			registeredAt: set.registeredAt
 		}));
@@ -440,7 +411,9 @@ export class GuardianHost implements IGuardianResolver {
 	 * removes it if this attempt created it. A store already on disk that
 	 * the index does not name is a registration this host committed but
 	 * never answered (the index is saved before the answer leaves), so it
-	 * is reopened rather than replaced and the retry adopts it.
+	 * is reopened rather than replaced and the retry adopts it; that
+	 * adoption takes no new slot against maxSets, which its registration
+	 * already earned when the store was committed.
 	 */
 	private registerNewSet(
 		setId: Buffer,
@@ -456,7 +429,9 @@ export class GuardianHost implements IGuardianResolver {
 			request
 		);
 		if (problem) return refuse(problem.status, problem.detail);
-		if (this.sets.size >= this.maxSets) {
+		const file = this.fileFor(setId);
+		const created = !fs.existsSync(file);
+		if (created && this.sets.size >= this.maxSets) {
 			this.emit({
 				type: 'guardian:quota-refused',
 				detail: `refusing a new set: ${this.sets.size} of ${this.maxSets} served`,
@@ -467,16 +442,6 @@ export class GuardianHost implements IGuardianResolver {
 				`this host serves ${this.maxSets} sets and is full`
 			);
 		}
-		if (GUARDIAN_HOST_REGISTRATION_BYTES > this.maxBytesPerSet) {
-			return this.quotaRefusal(
-				'register_node',
-				key,
-				0,
-				GUARDIAN_HOST_REGISTRATION_BYTES
-			);
-		}
-		const file = this.fileFor(setId);
-		const created = !fs.existsSync(file);
 		const served = this.openSet(setId, request.guardianMembers, this.clock());
 		let outcome: IGuardianVerbOutcome;
 		try {
@@ -492,9 +457,15 @@ export class GuardianHost implements IGuardianResolver {
 			// Nothing was committed: the guardian's refusals and its internal
 			// errors both leave the transaction rolled back.
 			this.discardSet(served, created);
+			if (outcome.status === GuardianStatus.ERR_QUOTA_EXCEEDED) {
+				this.emit({
+					type: 'guardian:quota-refused',
+					detail: `set ${key} cannot hold a registration within ${this.maxBytesPerSet} bytes`,
+					setId: key
+				});
+			}
 			return outcome.body;
 		}
-		served.bytes = served.guardian.contentBytes();
 		this.sets.set(key, served);
 		try {
 			this.saveIndex();
@@ -511,116 +482,6 @@ export class GuardianHost implements IGuardianResolver {
 			setId: key
 		});
 		return outcome.body;
-	}
-
-	// ─────────────── writes on a served set ───────────────
-
-	/**
-	 * What a verb that may grow the store will cost if the guardian accepts
-	 * it, decided from what the guardian holds (GET_HEAD is a snapshot read):
-	 * an append inside the stored range is a replay or a conflict, which the
-	 * guardian answers without writing, so it costs nothing; a registration
-	 * of a namespace already held, or a rotation already stored, likewise.
-	 * Records are charged exactly (their row is the request); the small rows
-	 * of the other verbs are measured after the write.
-	 */
-	private planWrite(
-		served: IServedSet,
-		verb: GuardianVerbName,
-		body: Buffer,
-		recoveryId: Buffer,
-		record: IGuardianRecord | null
-	): IWritePlan {
-		const head = served.guardian.getHead({
-			protocolVersion: GUARDIAN_PROTOCOL_VERSION,
-			guardianSetId: served.setId,
-			recoveryId
-		});
-		const held = head.status === GuardianStatus.OK ? head.state ?? null : null;
-		switch (verb) {
-			case 'put_state':
-			case 'sync_record': {
-				const rec = record as IGuardianRecord;
-				const inRange =
-					held !== null &&
-					!isGenesisLogHead(held.logHead) &&
-					rec.sequence >= held.origin.firstSequence &&
-					rec.sequence <= held.logHead.sequence;
-				return {
-					recoveryId,
-					delta: inRange
-						? 0
-						: GUARDIAN_HOST_RECORD_OVERHEAD_BYTES + rec.ciphertext.length,
-					exact: true,
-					gated: true
-				};
-			}
-			case 'register_node':
-				return {
-					recoveryId,
-					delta: held !== null ? 0 : GUARDIAN_HOST_REGISTRATION_BYTES,
-					exact: false,
-					gated: true
-				};
-			case 'rotate_set':
-				return {
-					recoveryId,
-					delta: held !== null && head.rotation ? 0 : body.length,
-					exact: false,
-					gated: true
-				};
-			default:
-				// ACQUIRE_EPOCH and SYNC_EPOCH add epoch rows the quota does
-				// not refuse (takeover repair is not a storage decision), but
-				// the counter must still see them.
-				return { recoveryId, delta: 0, exact: false, gated: false };
-		}
-	}
-
-	/**
-	 * Admit, run and account one write. The host is synchronous, so from the
-	 * quota check through the guardian's transaction to the charge nothing
-	 * else touches the set: two writes that would each fit but not together
-	 * are decided one after the other, and the second sees the first's charge.
-	 */
-	private write(
-		served: IServedSet,
-		verb: GuardianVerbName,
-		body: Buffer,
-		plan: IWritePlan
-	): Buffer {
-		const key = served.setId.toString('hex');
-		if (plan.gated && served.bytes + plan.delta > this.maxBytesPerSet) {
-			return this.quotaRefusal(verb, key, served.bytes, plan.delta);
-		}
-		const before = plan.exact
-			? 0
-			: served.guardian.contentBytes(plan.recoveryId);
-		const outcome = runGuardianVerb(served.guardian, verb, body);
-		if (outcome.status === GuardianStatus.OK) {
-			served.bytes += plan.exact
-				? plan.delta
-				: served.guardian.contentBytes(plan.recoveryId) - before;
-		}
-		return outcome.body;
-	}
-
-	private quotaRefusal(
-		verb: GuardianVerbName,
-		key: string,
-		used: number,
-		delta: number
-	): Buffer {
-		this.emit({
-			type: 'guardian:quota-refused',
-			detail: `set ${key} holds ${used} of ${this.maxBytesPerSet} bytes; a write of ${delta} would exceed it`,
-			setId: key
-		});
-		return encodeGuardianVerbRefusal(
-			verb,
-			GuardianStatus.ERR_QUOTA_EXCEEDED,
-			`this host's storage quota for the set is exhausted`
-		);
 	}
 
 	// ─────────────── internals ───────────────
@@ -642,6 +503,7 @@ export class GuardianHost implements IGuardianResolver {
 			members,
 			maxCiphertextBytes: this.maxCiphertextBytes,
 			maxRecordsPerGet: MAX_RECORDS_PER_GET,
+			maxContentBytes: this.maxBytesPerSet,
 			clock: (): bigint => BigInt(this.clock())
 		});
 		return {
@@ -649,8 +511,7 @@ export class GuardianHost implements IGuardianResolver {
 			members: members.map((m) => Buffer.from(m)),
 			guardian,
 			file,
-			registeredAt,
-			bytes: guardian.contentBytes()
+			registeredAt
 		};
 	}
 

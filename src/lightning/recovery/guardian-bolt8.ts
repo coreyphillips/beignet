@@ -396,14 +396,16 @@ export class GuardianBolt8Assembler {
 	private readonly partials = new Map<number, IPartial>();
 	/**
 	 * Request ids being swallowed after a refused chunk 0 (too large, or
-	 * unauthenticated): the chunks left and when the swallowing began. An
-	 * entry is a few numbers, but a peer that never sends the rest would
-	 * otherwise grow this without bound, so it shares the in-flight cap
-	 * and the stale eviction with the partials (issue #710).
+	 * unauthenticated): the header chunk 0 declared, the chunk expected
+	 * next, and when the swallowing began. An entry is a few numbers, but a
+	 * peer that never sends the rest would otherwise grow this without
+	 * bound, so it shares the in-flight cap and the stale eviction with the
+	 * partials, and its continuation chunks are held to the same framing
+	 * rules as a partial's (issue #710).
 	 */
 	private readonly discards = new Map<
 		number,
-		{ remaining: number; startedAt: number }
+		{ header: IGuardianBolt8FrameHeader; expected: number; startedAt: number }
 	>();
 	private readonly kind: 'request' | 'response';
 	private readonly maxBodyBytes: (requestId: number, verb: number) => number;
@@ -465,7 +467,8 @@ export class GuardianBolt8Assembler {
 						fail('too many guardian requests in flight');
 					}
 					this.discards.set(header.requestId, {
-						remaining: header.chunkCount - 1,
+						header,
+						expected: 1,
 						startedAt: this.clock()
 					});
 				}
@@ -513,8 +516,23 @@ export class GuardianBolt8Assembler {
 
 		const discard = this.discards.get(header.requestId);
 		if (discard !== undefined) {
-			if (discard.remaining <= 1) this.discards.delete(header.requestId);
-			else discard.remaining--;
+			// Swallowed, not trusted: a chunk that does not continue the
+			// refused request exactly is the same violation it would be on a
+			// request being assembled.
+			if (
+				header.chunkIndex !== discard.expected ||
+				header.chunkCount !== discard.header.chunkCount ||
+				header.totalLength !== discard.header.totalLength ||
+				header.verb !== discard.header.verb
+			) {
+				this.discards.delete(header.requestId);
+				fail('guardian frame out of order or inconsistent with its request');
+			}
+			if (header.chunkIndex === header.chunkCount - 1) {
+				this.discards.delete(header.requestId);
+			} else {
+				discard.expected++;
+			}
 			return null;
 		}
 		const partial = this.partials.get(header.requestId);
@@ -638,9 +656,10 @@ export interface IGuardianBolt8ResponderOptions {
 	maxBodyBytes?: number;
 	maxInFlight?: number;
 	/**
-	 * Consecutive refused credentials a session may present before it is
-	 * dropped as a violation (default 8). A peer without the credential
-	 * gets its 401s, a peer guessing one gets a reconnect and its backoff.
+	 * Consecutive refused credentials at which a session is dropped as a
+	 * violation (default 8): the first N minus 1 are answered 401, the Nth
+	 * drops the session instead. A peer without the credential gets its
+	 * 401s, a peer guessing one gets a reconnect and its backoff.
 	 */
 	maxUnauthorized?: number;
 	clock?: () => number;
@@ -706,7 +725,7 @@ export class GuardianBolt8Responder {
 		const result = this.assembler.push(payload);
 		if (result === null) return [];
 		if (result.kind === 'unauthorized') {
-			if (++this.unauthorizedRun > this.maxUnauthorized) {
+			if (++this.unauthorizedRun >= this.maxUnauthorized) {
 				this.assembler.clear();
 				throw new GuardianBolt8FrameError(
 					`${this.unauthorizedRun} consecutive refused credentials`,

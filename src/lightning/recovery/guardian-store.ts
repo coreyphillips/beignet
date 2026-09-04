@@ -180,6 +180,10 @@ CREATE TABLE IF NOT EXISTS guardian_orphan_records (
 	reason TEXT NOT NULL,
 	PRIMARY KEY (recovery_id, epoch, sequence)
 );
+CREATE TABLE IF NOT EXISTS guardian_usage (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	content_bytes INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS guardian_epochs (
 	recovery_id BLOB NOT NULL,
 	epoch BLOB NOT NULL,
@@ -740,12 +744,44 @@ export class GuardianStore {
 	// ─────────────── storage accounting ───────────────
 
 	/**
-	 * The encoded bytes the store holds: every column of every row, summed
-	 * across the four tables. This is what a hosted guardian's byte quota
-	 * measures (guardian-host.ts): a record costs exactly its columns, so a
-	 * host can charge an append before it happens and re-derive the total
-	 * after a restart from the rows themselves. Pages, indexes and the WAL
-	 * are SQLite's overhead on top and are reported separately as disk.
+	 * The content counter: the encoded bytes the store holds, kept as a row
+	 * of the store itself so every writer, in this process or another,
+	 * reads and advances the same number under the same BEGIN IMMEDIATE it
+	 * writes under. Re-derived from the rows at every open (resetUsage), so
+	 * it is recoverable and can be audited against contentBytes().
+	 */
+	usageBytes(): number {
+		const row = this.db
+			.prepare('SELECT content_bytes FROM guardian_usage WHERE id = 1')
+			.get() as { content_bytes: number | bigint } | undefined;
+		return row ? Number(row.content_bytes) : 0;
+	}
+
+	resetUsage(bytes: number): void {
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO guardian_usage (id, content_bytes) VALUES (1, ?)'
+			)
+			.run(bytes);
+	}
+
+	/** Advance the counter by what a transaction wrote; call inside it. */
+	chargeUsage(delta: number): void {
+		this.db
+			.prepare(
+				'UPDATE guardian_usage SET content_bytes = content_bytes + ? WHERE id = 1'
+			)
+			.run(delta);
+	}
+
+	/**
+	 * The encoded bytes the store holds, measured from the rows: every
+	 * column of every row, summed across the four tables, or across one
+	 * namespace's rows. This is what a hosted guardian's byte quota bounds:
+	 * a record costs exactly its columns, so the cost of a write can be
+	 * known before it happens and the counter re-derived after a restart.
+	 * Pages, indexes and the WAL are SQLite's overhead on top and are
+	 * reported separately as disk.
 	 */
 	contentBytes(recoveryId?: Buffer): number {
 		const where = recoveryId ? ' WHERE recovery_id = ?' : '';

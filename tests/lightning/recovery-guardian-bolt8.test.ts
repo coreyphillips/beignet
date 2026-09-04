@@ -591,6 +591,42 @@ describe('bolt8 guardian frames', () => {
 		expect(assembler.push(partial)).to.equal(null);
 		expect(assembler.retained).to.equal(2);
 	});
+
+	it('holds the chunks it swallows to the same framing rules as a partial', () => {
+		const frames = encodeGuardianBolt8Request({
+			requestId: 9,
+			verb: GuardianBolt8Verb.PUT_STATE,
+			body: crypto.randomBytes(200_000)
+		});
+		const fresh = (): GuardianBolt8Assembler => {
+			const assembler = new GuardianBolt8Assembler({
+				kind: 'request',
+				maxBodyBytes: 100_000
+			});
+			expect(assembler.push(frames[0])?.kind).to.equal('too-large');
+			return assembler;
+		};
+		// A changed verb mid-request.
+		const verbChanged = Buffer.from(frames[1]);
+		verbChanged.writeUInt8(GuardianBolt8Verb.GET_HEAD, 4);
+		const a = fresh();
+		expect(() => a.push(verbChanged)).to.throw(
+			GuardianBolt8FrameError,
+			/inconsistent/
+		);
+		// The entry is gone with the violation: nothing continues it.
+		expect(() => a.push(frames[1])).to.throw(/unknown request/);
+		// A changed total length.
+		const lengthChanged = Buffer.from(frames[1]);
+		lengthChanged.writeUInt32BE(150_000, 5);
+		expect(() => fresh().push(lengthChanged)).to.throw(/inconsistent/);
+		// A chunk out of order.
+		expect(() => fresh().push(frames[2])).to.throw(/out of order/);
+		// The honest sequence is swallowed and frees the id.
+		const b = fresh();
+		for (const frame of frames.slice(1)) expect(b.push(frame)).to.equal(null);
+		expect(b.retained).to.equal(0);
+	});
 });
 
 describe('bolt8 guardian session end to end', () => {
@@ -974,13 +1010,13 @@ describe('bolt8 guardian transport-level statuses', () => {
 		}
 	});
 
-	it('drops a session that keeps presenting a refused credential', () => {
+	it('drops a session on the Nth consecutive refused credential, answering N minus 1', () => {
 		const guardian = makeGuardian(1_800_000_000_000n);
 		try {
 			const responder = new GuardianBolt8Responder({
 				guardian,
 				authenticate: bolt8BearerAuthenticator('s3cret'),
-				maxUnauthorized: 2
+				maxUnauthorized: 3
 			});
 			const attempt = (id: number, token: string): Buffer =>
 				encodeGuardianBolt8Request({

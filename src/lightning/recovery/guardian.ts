@@ -323,6 +323,14 @@ export interface IReferenceGuardianConfig {
 	members: Buffer[];
 	/** Advertised ciphertext limit; the 16 MiB protocol cap bounds it. */
 	maxCiphertextBytes?: number;
+	/**
+	 * Content the store may hold (GuardianStore.contentBytes) before a
+	 * write that would cross it is refused with ERR_QUOTA_EXCEEDED, judged
+	 * inside the write's own transaction. Absent runs unbounded, which is
+	 * what a configured guardian serving one set of its own wants; a host
+	 * sets it per set (guardian-host.ts).
+	 */
+	maxContentBytes?: number;
 	/** Advertised GET_STATE page limit; the protocol caps it at 256. */
 	maxRecordsPerGet?: number;
 	/** Unix milliseconds; injectable so tests pin issuedAt. */
@@ -627,6 +635,62 @@ export function registrationAdmissionProblem(
 	return null;
 }
 
+/**
+ * What a record row stores besides its ciphertext: recovery_id, sequence,
+ * epoch, previous_hash, frame_hash, ciphertext_hash, writer_signature
+ * (guardian-store.ts). An accepted append grows the store by exactly this
+ * plus the ciphertext; the namespace row it updates keeps its size.
+ */
+export const GUARDIAN_RECORD_OVERHEAD_BYTES = 32 + 8 + 8 + 32 + 32 + 32 + 64;
+/**
+ * What a fresh registration stores: the namespace row (two 192-byte
+ * states, three signatures, two issue times, the ids, the generation, the
+ * stale flag) and the first epoch row (recovery_id, epoch, writer key).
+ */
+export const GUARDIAN_REGISTRATION_BYTES =
+	32 + 32 + 192 + 1 + 192 + 64 + 8 + 64 + 8 + 64 + 8 + (32 + 8 + 32);
+/**
+ * The most an epoch row holds: the ids and key, a certificate over a
+ * 192-byte state with its issue time and signature, and the receipt over
+ * the state it fixes with its issue time and signature.
+ */
+export const GUARDIAN_EPOCH_ROW_MAX_BYTES =
+	32 + 8 + 32 + (192 + 8 + 64) + (192 + 8 + 64);
+
+/**
+ * What a mutating verb costs the store, judged from the namespace row
+ * under the write lock (fencedWrite).
+ */
+interface IWriteCost {
+	/**
+	 * Bytes the store grows by if the row is accepted as the verb intends;
+	 * 0 for a write the verb answers from the row without writing (a
+	 * replay, a conflict at an occupied slot). Checked against the quota
+	 * BEFORE the verb's own verdicts.
+	 */
+	delta: (ns: IGuardianNamespaceRow | null) => number;
+	/**
+	 * True when the body charges exactly what it wrote; otherwise the
+	 * namespace is measured before and after, which is exact for a row
+	 * replaced (new minus old) at the price of a scan of its rows.
+	 */
+	exact?: boolean;
+}
+
+/** Thrown inside a write transaction to roll it back at the quota. */
+class QuotaRollback extends Error {
+	constructor() {
+		super('write would cross the content quota');
+	}
+}
+
+function quotaRefusal(): IErr {
+	return err(
+		GuardianStatus.ERR_QUOTA_EXCEEDED,
+		"this guardian's content quota for the set is exhausted"
+	);
+}
+
 /** A namespace row's generation; a row with none is at the first generation. */
 function readGeneration(ns: IGuardianNamespaceRow): bigint {
 	return ns.generation && ns.generation.length === 8
@@ -643,6 +707,7 @@ export class ReferenceGuardian {
 	private readonly required: number;
 	private readonly maxCiphertextBytes: number;
 	private readonly maxRecordsPerGet: number;
+	private readonly maxContentBytes: number | undefined;
 	private readonly clock: () => bigint;
 	private readonly onAlarm?: (alarm: IGuardianAlarm) => void;
 	/**
@@ -699,11 +764,22 @@ export class ReferenceGuardian {
 			throw new Error('maxRecordsPerGet must be between 1 and 256');
 		}
 		this.maxRecordsPerGet = maxRecords;
+		if (
+			config.maxContentBytes !== undefined &&
+			(!Number.isInteger(config.maxContentBytes) || config.maxContentBytes < 0)
+		) {
+			throw new Error('maxContentBytes must be a non-negative integer');
+		}
+		this.maxContentBytes = config.maxContentBytes;
 		this.clock = config.clock ?? ((): bigint => BigInt(Date.now()));
 		this.onAlarm = config.onAlarm;
 		this.store = new GuardianStore(config.path);
 		try {
 			this.verifyStoreAtOpen();
+			// The content counter is re-derived from the rows at every open,
+			// after the open-time walk has archived what it archives, so a
+			// restart recovers it exactly and never trusts a stale number.
+			this.store.write(() => this.store.resetUsage(this.store.contentBytes()));
 		} catch (error) {
 			this.store.close();
 			throw error;
@@ -736,12 +812,19 @@ export class ReferenceGuardian {
 	}
 
 	/**
-	 * The encoded bytes this guardian's store holds, for one namespace or
-	 * for all of them (GuardianStore.contentBytes): what a host's byte quota
-	 * measures and re-derives after a restart.
+	 * The encoded bytes this guardian's store holds: the maintained counter
+	 * for the whole store (what the quota is judged against), or a
+	 * measurement of one namespace's rows.
 	 */
 	contentBytes(recoveryId?: Buffer): number {
-		return this.store.read(() => this.store.contentBytes(recoveryId));
+		return this.store.read(() =>
+			recoveryId ? this.store.contentBytes(recoveryId) : this.store.usageBytes()
+		);
+	}
+
+	/** The counter's truth, measured from every row; for audits and tests. */
+	auditContentBytes(): number {
+		return this.store.read(() => this.store.contentBytes());
 	}
 
 	/** Orphan-archive audit view (never served by GET_STATE). */
@@ -935,7 +1018,17 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(state.recoveryId);
 			if (quarantine) return quarantine;
 			const stateBuf = stateBytes(state);
-			const outcome = this.fencedWrite(state.recoveryId, (ns) => {
+			const cost: IWriteCost = {
+				// A fresh namespace costs its row and first epoch exactly. A
+				// held registration is answered from the row (duplicate or
+				// differing), writing nothing. Re-anchoring a tombstone
+				// replaces a smaller row and is bounded by the fresh cost: a
+				// conservative early refusal within GUARDIAN_REGISTRATION_BYTES
+				// of the limit, charged exactly from the measurement.
+				delta: (ns): number =>
+					ns && ns.registrationState ? 0 : GUARDIAN_REGISTRATION_BYTES
+			};
+			const outcome = this.fencedWrite(state.recoveryId, cost, (ns) => {
 				if (ns && ns.registrationState) {
 					if (
 						ns.registrationState.equals(stateBuf) &&
@@ -1121,7 +1214,25 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(record.recoveryId);
 			if (quarantine) return quarantine;
 
-			return this.fencedWrite(record.recoveryId, (ns) => {
+			const rowBytes =
+				GUARDIAN_RECORD_OVERHEAD_BYTES + record.ciphertext.length;
+			const cost: IWriteCost = {
+				// An append inside the stored range is a replay or a conflict,
+				// answered from the stored row; anything else that lands costs
+				// exactly the record's row (the namespace row keeps its size).
+				delta: (ns): number => {
+					if (!ns || !ns.state || !ns.registrationState) return 0;
+					const held = tryParseState(ns.state);
+					if (!held) return 0;
+					const inRange =
+						!isGenesisLogHead(held.logHead) &&
+						record.sequence >= held.origin.firstSequence &&
+						record.sequence <= held.logHead.sequence;
+					return inRange ? 0 : rowBytes;
+				},
+				exact: true
+			};
+			return this.fencedWrite(record.recoveryId, cost, (ns, charge) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -1280,6 +1391,7 @@ export class ReferenceGuardian {
 					ciphertext: Buffer.from(record.ciphertext),
 					writerSignature: Buffer.from(record.writerSignature)
 				});
+				charge(rowBytes);
 				const newState: GuardianState = {
 					recoveryId: state.recoveryId,
 					lease: state.lease,
@@ -1354,26 +1466,88 @@ export class ReferenceGuardian {
 	 *      told to freeze, not told to retry or that it succeeded;
 	 *   4. the remaining row-specific outcomes, in the verb's own order.
 	 *
+	 * The content quota (issue #710) is judged here too, in this order:
+	 *
+	 *   3b. after retirement and before any row-specific verdict, the
+	 *       write's cost (IWriteCost.delta, judged from the row under this
+	 *       lock) against the counter read under this lock: a write that
+	 *       would cross maxContentBytes is ERR_QUOTA_EXCEEDED. Two writers,
+	 *       in this process or another, therefore never admit against the
+	 *       same starting total, and a retired namespace is told so before
+	 *       it is told about space.
+	 *   5.  after the body ran, what it actually wrote (charged exactly by
+	 *       the body, or measured on the namespace's rows) is charged to
+	 *       the counter, and if that real growth would still cross the
+	 *       quota the whole transaction is rolled back: the estimate
+	 *       decides precedence, the measurement is the hard bound.
+	 *
 	 * ROTATE_SET itself does not use this helper: it is the transaction
 	 * that writes the marker, and it judges an existing marker under its own
 	 * idempotency rules (OK_DUPLICATE, ERR_CONFLICT, ERR_EPOCH_REGRESSION).
 	 * It runs in the same store.write, so the marker is written under the
-	 * same lock this fence reads it under.
+	 * same lock this fence reads it under, and it applies the same quota
+	 * gate and charge.
 	 */
 	private fencedWrite<T>(
 		recoveryId: Buffer,
-		body: (ns: IGuardianNamespaceRow | null) => T
+		cost: IWriteCost,
+		body: (
+			ns: IGuardianNamespaceRow | null,
+			charge: (bytes: number) => void
+		) => T
 	): T | IErr {
-		return this.store.write(() => {
-			const ns = this.store.getNamespace(recoveryId);
-			if (ns && ns.rotation !== null) {
-				return err(
-					GuardianStatus.ERR_SET_RETIRED,
-					'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
-				);
-			}
-			return body(ns);
-		});
+		try {
+			return this.store.write(() => {
+				const ns = this.store.getNamespace(recoveryId);
+				if (ns && ns.rotation !== null) {
+					return err(
+						GuardianStatus.ERR_SET_RETIRED,
+						'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
+					);
+				}
+				const gate = this.quotaGate(cost.delta(ns));
+				if (gate) return gate;
+				const before = cost.exact ? 0 : this.store.contentBytes(recoveryId);
+				let written = 0;
+				const result = body(ns, (bytes: number): void => {
+					written += bytes;
+				});
+				if (!cost.exact) {
+					written = this.store.contentBytes(recoveryId) - before;
+				}
+				this.chargeOrRollBack(written);
+				return result;
+			});
+		} catch (error) {
+			if (error instanceof QuotaRollback) return quotaRefusal();
+			throw error;
+		}
+	}
+
+	/** Inside a write transaction: refuse a cost the counter cannot absorb. */
+	private quotaGate(delta: number): IErr | null {
+		if (this.maxContentBytes === undefined || delta <= 0) return null;
+		if (this.store.usageBytes() + delta > this.maxContentBytes) {
+			return quotaRefusal();
+		}
+		return null;
+	}
+
+	/**
+	 * Inside a write transaction, after its writes: advance the counter by
+	 * what was written, or roll the transaction back if that growth crosses
+	 * the quota after all (an estimate below the truth never lands a write).
+	 */
+	private chargeOrRollBack(written: number): void {
+		if (written === 0) return;
+		if (
+			written > 0 &&
+			this.maxContentBytes !== undefined &&
+			this.store.usageBytes() + written > this.maxContentBytes
+		) {
+			throw new QuotaRollback();
+		}
+		this.store.chargeUsage(written);
 	}
 
 	/**
@@ -1578,6 +1752,16 @@ export class ReferenceGuardian {
 					);
 				}
 				const current = readGeneration(ns);
+				// The marker replaces the stored one: its cost is the new
+				// encoding minus the old, exactly, and a byte-identical replay
+				// costs nothing. Judged before the marker's own verdicts.
+				const storedBytes = ns.rotation !== null ? ns.rotation.length : 0;
+				const delta =
+					ns.rotation !== null && ns.rotation.equals(encoded)
+						? 0
+						: encoded.length - storedBytes;
+				const quota = this.quotaGate(delta);
+				if (quota) return quota;
 				if (ns.rotation !== null) {
 					const stored = decodeRotateSetRequest(ns.rotation);
 					if (ns.rotation.equals(encoded)) {
@@ -1605,6 +1789,7 @@ export class ReferenceGuardian {
 					);
 				}
 				this.store.setRotation(request.recoveryId, encoded);
+				this.chargeOrRollBack(delta);
 				return { status: GuardianStatus.OK, rotation: request };
 			});
 			return outcome;
@@ -1822,7 +2007,21 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(expected.recoveryId);
 			if (quarantine) return quarantine;
 
-			return this.fencedWrite(expected.recoveryId, (ns) => {
+			const cost: IWriteCost = {
+				// A stored acquisition under the same key is answered from its
+				// row; a new one adds one epoch row (the namespace row keeps
+				// its size). Measured exactly after the write.
+				delta: (): number => {
+					const held = this.store.getEpoch(
+						expected.recoveryId,
+						u64be(request.newEpoch)
+					);
+					return held && held.writerPublicKey.equals(request.newWriterPublicKey)
+						? 0
+						: GUARDIAN_EPOCH_ROW_MAX_BYTES;
+				}
+			};
+			return this.fencedWrite(expected.recoveryId, cost, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -2079,7 +2278,16 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(recoveryId);
 			if (quarantine) return quarantine;
 
-			return this.fencedWrite(recoveryId, (ns) => {
+			const cost: IWriteCost = {
+				// The epoch rows a bundle can add: this guardian's own
+				// certificate and one per quorum certificate. The truncated
+				// tail moves to the orphan archive, which grows each moved
+				// record by its archive columns; the measurement after the
+				// write, not this estimate, is the hard bound.
+				delta: (): number =>
+					GUARDIAN_EPOCH_ROW_MAX_BYTES * (request.certificates.length + 1)
+			};
+			return this.fencedWrite(recoveryId, cost, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -2360,7 +2568,9 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(request.recoveryId);
 			if (quarantine) return quarantine;
 
-			return this.fencedWrite(request.recoveryId, (ns) => {
+			// Lifting the stale flag flips one integer: no content is added.
+			const cost: IWriteCost = { delta: (): number => 0, exact: true };
+			return this.fencedWrite(request.recoveryId, cost, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
