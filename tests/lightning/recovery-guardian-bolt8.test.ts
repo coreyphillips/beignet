@@ -103,9 +103,10 @@ function buildRegistration(): IGuardianRegisterNodeRequest {
 		protocolVersion: 1,
 		guardianSetId: SET_ID,
 		guardianMembers: GUARDIAN_IDS,
+		generation: 1n,
 		initialState,
 		rootSignature: signTranscript(
-			registerTranscriptHash(SET_ID, initialState),
+			registerTranscriptHash(SET_ID, initialState, 1n),
 			ROOT.rootSecret
 		)
 	};

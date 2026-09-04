@@ -1240,6 +1240,25 @@ export interface BeignetNodeEvents {
 		peer?: string;
 	}) => void;
 	/**
+	 * Guardian-set rotation (wire 5.9, issue #701): each step of a rotation
+	 * this node runs; the switch, with the set that carries the journal from
+	 * then on; and a boot that followed a retired set to the live one.
+	 */
+	'recovery:rotation-progress': (data: {
+		type: string;
+		detail: string;
+		generation?: string;
+	}) => void;
+	'recovery:rotated': (data: {
+		generation: string;
+		guardians: Array<{ guardianId: string; url: string }>;
+	}) => void;
+	'recovery:rotation-followed': (data: {
+		generation: string;
+		from: string[];
+		to: string[];
+	}) => void;
+	/**
 	 * JIT receive, LSP side (issue #669). Relayed JSON-safe: every satoshi and
 	 * millisatoshi figure is a decimal string. `jit:intent` is a wallet's
 	 * accepted request, keyed by the intercept scid the LSP minted for it;

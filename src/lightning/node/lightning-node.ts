@@ -161,6 +161,7 @@ import {
 	decodeCustomMessage
 } from '../message/custom';
 import { GuardianHost, IGuardianHostStatus } from '../recovery/guardian-host';
+import { JOURNAL_META_KEYS } from '../recovery/journal';
 import {
 	IHeldJitPart,
 	IJitReceiveConfig,
@@ -966,7 +967,7 @@ export class LightningNode extends EventEmitter {
 	 * Guardian locators every composed capsule carries (5.4): the configured
 	 * set in the guardian modes, empty for a peer-storage-only node.
 	 */
-	private readonly recoveryGuardians: GuardianDescriptor[];
+	private recoveryGuardians: GuardianDescriptor[];
 	/**
 	 * Startup quarantine (recovery 5.6). Installed at CONSTRUCTION from
 	 * config.recovery.startupGate. While present and unconfirmed, the node
@@ -5025,6 +5026,50 @@ export class LightningNode extends EventEmitter {
 	/** The gate's view, for operators and tests. */
 	getRecoveryGateState(): string {
 		return this.recoveryGate ? this.recoveryGate.getState() : 'disabled';
+	}
+
+	// ─────────────── Guardian-set rotation (wire 5.9, issue #701) ───────────────
+
+	/**
+	 * The locators the next capsule carries, after a rotation switched the
+	 * configured set (wire 5.9 step 4). The capsule is re-composed on the
+	 * next refresh; forcing one here keeps storage peers from serving the
+	 * outgoing set's locators a minute longer than they must.
+	 */
+	setRecoveryGuardians(descriptors: GuardianDescriptor[]): void {
+		this.recoveryGuardians = descriptors.map((d) => ({ ...d }));
+		this.capsuleDirty = true;
+	}
+
+	/**
+	 * Freeze because another device rotated this namespace away (wire 5.9):
+	 * a retrieved capsule carried a higher generation, or a guardian
+	 * answered ERR_SET_RETIRED. The same hard freeze as a proven newer
+	 * epoch; it is not a cryptographic proof, and the spec says so.
+	 */
+	fenceForRotation(detail: string): void {
+		if (this._barrierFenced) return;
+		this.emitStructuredLog('channel', 'recovery_rotated_away', { detail });
+		if (this.recoveryBarrier) {
+			// The barrier's fence is the one place every consequence hangs off
+			// (the hard freeze, the status flag, the event); reuse it.
+			this.recoveryBarrier.fence(undefined);
+			return;
+		}
+		this._barrierFenced = true;
+		this.hardFreezeTransports();
+		this.emit('recovery:fenced', null);
+	}
+
+	/** The guardian-set generation the journal is at (wire 5.9). */
+	getRecoveryGeneration(): bigint {
+		const raw = this.storage?.getRecoveryMeta?.(JOURNAL_META_KEYS.generation);
+		if (raw == null) return 1n;
+		try {
+			return BigInt(raw);
+		} catch {
+			return 1n;
+		}
 	}
 
 	// ─────────────── Guardian host (wire 2.7, issue #699) ───────────────

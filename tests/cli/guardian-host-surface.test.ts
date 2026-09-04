@@ -22,7 +22,12 @@ import { BeignetError } from '../../src/cli/errors';
 import {
 	GuardianClient,
 	bolt8GuardianTransport,
-	decodeRecoveryCapsuleBlob
+	decodeRecoveryCapsuleBlob,
+	CRASH_V1_PROFILE,
+	GuardianStatus,
+	computeGuardianSetId,
+	deriveRecoveryRoot,
+	encryptRecoveryCapsule
 } from '../../src/lightning/recovery';
 import {
 	LnCoinType,
@@ -615,5 +620,284 @@ describe('Guardian host surface: the guardian-only lane', () => {
 			await a.stop();
 			fs.rmSync(dirA, { recursive: true, force: true });
 		}
+	});
+});
+
+describe('Guardian rotation surface: a wallet moves to a new set with the channels running', () => {
+	const hosts: Array<IHost | null> = [];
+	let wallet: IStartedDaemon | null = null;
+	let walletDir: string | null = null;
+	let restored: IStartedDaemon | null = null;
+	let restoredDir: string | null = null;
+
+	after(async function (): Promise<void> {
+		this.timeout(60_000);
+		for (const daemon of [restored, wallet]) {
+			if (!daemon) continue;
+			try {
+				await daemon.stop();
+			} catch {
+				// Already stopped.
+			}
+		}
+		for (const dir of [restoredDir, walletDir]) {
+			if (dir) fs.rmSync(dir, { recursive: true, force: true });
+		}
+		await stopAll(hosts.splice(0));
+	});
+
+	it('rotates one member, keeps journaling, retires the old set, and a restore with the old entries follows the rotation', async function (): Promise<void> {
+		this.timeout(240_000);
+		hosts.push(
+			await startHost(0),
+			await startHost(1),
+			await startHost(2),
+			await startHost(3)
+		);
+		const [a, b, c, d] = hosts as IHost[];
+		const resolve = async (uri: string): Promise<string> => {
+			const r = await request(
+				portOf(a.daemon),
+				'POST',
+				'/recovery/resolve-guardian',
+				{ uri }
+			);
+			expect(r.status, JSON.stringify(r.body)).to.equal(200);
+			return (r.body.result as { entry: string }).entry;
+		};
+		const entryA = await resolve(a.uri);
+		const entryB = await resolve(b.uri);
+		const entryC = await resolve(c.uri);
+		const entryD = await resolve(d.uri);
+		const oldEntries = [entryA, entryB, entryC];
+		const newEntries = [entryB, entryC, entryD];
+
+		walletDir = tmpDir('rotating-wallet');
+		wallet = await startDaemon({
+			...OFFLINE,
+			mnemonic: MNEMONICS[3],
+			dataDir: walletDir,
+			recoveryMode: 'quorum',
+			recoveryGuardians: oldEntries,
+			recoveryLeaseCheckIntervalMs: 200
+		});
+		const walletPort = portOf(wallet);
+		const status = async (port: number): Promise<Record<string, unknown>> =>
+			(await request(port, 'GET', '/recovery/status')).body.result as Record<
+				string,
+				unknown
+			>;
+		await waitFor(
+			async () =>
+				(await status(walletPort)).node !== null &&
+				((await status(walletPort)).node as { gate: string }).gate ===
+					'confirmed'
+		);
+		const before = await status(walletPort);
+		expect(before.generation).to.equal('1');
+		expect(before.configuredSetStale).to.equal(false);
+		const invoice1 = await request(walletPort, 'POST', '/invoice/create', {
+			amountSats: 1000,
+			description: 'before rotation'
+		});
+		expect(invoice1.body.ok).to.equal(true);
+		await waitFor(
+			async () =>
+				BigInt(
+					((await status(walletPort)).node as { lastDurableSequence: string })
+						.lastDurableSequence
+				) >= 1n
+		);
+		const durableBefore = BigInt(
+			((await status(walletPort)).node as { lastDurableSequence: string })
+				.lastDurableSequence
+		);
+
+		// Refusals first: no confirm, wrong count, the same set.
+		const unconfirmed = await request(
+			walletPort,
+			'POST',
+			'/recovery/rotate-guardians',
+			{ guardians: newEntries }
+		);
+		expect(unconfirmed.status).to.equal(400);
+		const sameSet = await request(
+			walletPort,
+			'POST',
+			'/recovery/rotate-guardians',
+			{ guardians: oldEntries, confirm: true }
+		);
+		expect(sameSet.status, JSON.stringify(sameSet.body)).to.equal(400);
+
+		// The rotation: A out, D in.
+		const progress: string[] = [];
+		wallet.node.on('recovery:rotation-progress', (data) =>
+			progress.push((data as { type: string }).type)
+		);
+		const rotatedEvents: unknown[] = [];
+		wallet.node.on('recovery:rotated', (data) => rotatedEvents.push(data));
+		const rotated = await request(
+			walletPort,
+			'POST',
+			'/recovery/rotate-guardians',
+			{ guardians: newEntries, confirm: true }
+		);
+		expect(rotated.status, JSON.stringify(rotated.body)).to.equal(200);
+		const result = rotated.body.result as {
+			generation: string;
+			guardians: Array<{ guardianId: string }>;
+			retired: number;
+		};
+		expect(result.generation).to.equal('2');
+		expect(result.guardians.map((g) => g.guardianId).sort()).to.deep.equal(
+			newEntries.map((e) => e.slice(0, 64)).sort()
+		);
+		expect(result.retired).to.be.greaterThan(0);
+		expect(progress).to.include('rotation:registered');
+		expect(progress).to.include('rotation:switched');
+		expect(progress).to.include('rotation:retired');
+		expect(rotatedEvents).to.have.length(1);
+
+		const after = await status(walletPort);
+		expect(after.generation).to.equal('2');
+		expect(after.configuredSetStale).to.equal(true);
+		expect(
+			(after.guardians as Array<{ guardianId: string }>)
+				.map((g) => g.guardianId)
+				.sort()
+		).to.deep.equal(newEntries.map((e) => e.slice(0, 64)).sort());
+		expect(
+			(
+				after.rotation as {
+					inProgress: boolean;
+					pending: boolean;
+					retirePending: boolean;
+				}
+			).inProgress
+		).to.equal(false);
+		expect((after.rotation as { pending: boolean }).pending).to.equal(false);
+		expect(
+			(after.rotation as { retirePending: boolean }).retirePending
+		).to.equal(false);
+		expect((after.node as { gate: string }).gate).to.equal('confirmed');
+
+		// Journaling continues on the new set: a commit goes durable there.
+		const invoice2 = await request(walletPort, 'POST', '/invoice/create', {
+			amountSats: 2000,
+			description: 'after rotation'
+		});
+		expect(invoice2.body.ok).to.equal(true);
+		await waitFor(
+			async () =>
+				BigInt(
+					((await status(walletPort)).node as { lastDurableSequence: string })
+						.lastDurableSequence
+				) > durableBefore
+		);
+
+		// D serves the set now; A's namespace is retired with the rotation attached.
+		const dView = (await request(portOf(d.daemon), 'GET', '/guardian/status'))
+			.body.result as { sets: Array<{ namespaces: number }> };
+		expect(dView.sets).to.have.length(1);
+		expect(dView.sets[0].namespaces).to.equal(1);
+		const oldIds = oldEntries.map((e) => Buffer.from(e.slice(0, 64), 'hex'));
+		const oldSetId = computeGuardianSetId({
+			...CRASH_V1_PROFILE,
+			guardianIds: oldIds
+		});
+		const probe = bolt8GuardianTransport();
+		try {
+			const client = new GuardianClient({
+				url: entryA.slice(65),
+				guardianSetId: oldSetId,
+				transport: probe,
+				timeoutMs: 10_000
+			});
+			const recoveryId = deriveRecoveryRoot(
+				deriveLightningKeysFromMnemonic(
+					MNEMONICS[3],
+					undefined,
+					LnCoinType.REGTEST
+				).nodePrivateKey
+			).recoveryId;
+			const head = await client.getHead(recoveryId);
+			expect(head.status).to.equal(GuardianStatus.OK);
+			expect(head.rotation, 'A holds the rotation').to.not.equal(undefined);
+			expect(head.rotation!.generation).to.equal(2n);
+		} finally {
+			probe.close();
+		}
+
+		// A fresh device with the OLD entries follows the rotation to the live set and restores there.
+		restoredDir = tmpDir('rotated-restore');
+		restored = await startDaemon({
+			...OFFLINE,
+			mnemonic: MNEMONICS[3],
+			dataDir: restoredDir,
+			recoveryMode: 'quorum',
+			recoveryGuardians: oldEntries
+		});
+		const restoredPort = portOf(restored);
+		const pending = await status(restoredPort);
+		expect(pending.state).to.equal('restore-required');
+		expect(
+			(pending.rotation as { followed: { generation: string } | null }).followed
+				?.generation
+		).to.equal('2');
+		expect(
+			(pending.guardians as Array<{ guardianId: string }>)
+				.map((g) => g.guardianId)
+				.sort()
+		).to.deep.equal(newEntries.map((e) => e.slice(0, 64)).sort());
+		const outcome = await request(restoredPort, 'POST', '/recovery/restore', {
+			confirm: true
+		});
+		expect(outcome.body.ok, JSON.stringify(outcome.body)).to.equal(true);
+		expect((outcome.body.result as { epoch: string }).epoch).to.equal('2');
+		await waitFor(
+			async () =>
+				((await status(restoredPort)).node as { gate: string } | null)?.gate ===
+				'confirmed'
+		);
+		expect((await status(restoredPort)).generation).to.equal('2');
+
+		// The rotated wallet is the old device now: the takeover fences it.
+		await waitFor(async () => {
+			const s = await status(walletPort);
+			return (
+				s.state === 'fenced' ||
+				(s.node as { fenced: boolean } | null)?.fenced === true
+			);
+		}, 60_000);
+
+		// And a capsule from a LATER generation fences the restored device too
+		// (wire 5.9): another device rotated the namespace away from it.
+		const nodeSecret = deriveLightningKeysFromMnemonic(
+			MNEMONICS[3],
+			undefined,
+			LnCoinType.REGTEST
+		).nodePrivateKey;
+		const blob = (
+			restored.node.getNode() as unknown as {
+				ourPeerStorageBlob: Buffer | null;
+			}
+		).ourPeerStorageBlob;
+		expect(blob).to.not.equal(null);
+		const capsule = decodeRecoveryCapsuleBlob(blob!, nodeSecret);
+		expect(capsule!.generation).to.equal(2n);
+		const later = encryptRecoveryCapsule(
+			{ ...capsule!, generation: 3n },
+			nodeSecret
+		);
+		restored.node
+			.getNode()
+			.emit('peer_storage:retrieved', '02' + 'a1'.repeat(32), later);
+		await waitFor(async () => {
+			const s = await status(restoredPort);
+			return (
+				s.state === 'fenced' ||
+				(s.node as { fenced: boolean } | null)?.fenced === true
+			);
+		});
 	});
 });

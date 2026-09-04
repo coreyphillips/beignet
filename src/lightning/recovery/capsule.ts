@@ -618,6 +618,8 @@ export interface RecoveryCapsule {
 	/** encodeScb output: always sufficient for Tier 1 emergency recovery. */
 	encryptedScb: string;
 	/** Journal locator: the latest locally durable head (zeros when none). */
+	/** The guardian-set generation (wire 5.9); ordered above writerEpoch. */
+	generation: bigint;
 	writerEpoch: bigint;
 	latestSequence: bigint;
 	frameHash: Buffer;
@@ -644,6 +646,7 @@ interface IEncodedCapsule {
 	version: 1;
 	encryptedScb: string;
 	writerEpoch: string;
+	generation?: string;
 	latestSequence: string;
 	frameHash: string;
 	snapshotHash: string;
@@ -686,6 +689,7 @@ function encodeCapsule(capsule: RecoveryCapsule): Buffer {
 		version: capsule.version,
 		encryptedScb: capsule.encryptedScb,
 		writerEpoch: capsule.writerEpoch.toString(),
+		generation: capsule.generation.toString(),
 		latestSequence: capsule.latestSequence.toString(),
 		frameHash: capsule.frameHash.toString('hex'),
 		snapshotHash: capsule.snapshotHash.toString('hex'),
@@ -791,6 +795,7 @@ function decodeCapsule(plaintext: Buffer): RecoveryCapsule {
 		version: 1,
 		encryptedScb: encoded.encryptedScb,
 		writerEpoch: BigInt(encoded.writerEpoch),
+		generation: encoded.generation != null ? BigInt(encoded.generation) : 1n,
 		latestSequence: BigInt(encoded.latestSequence),
 		frameHash: Buffer.from(encoded.frameHash, 'hex'),
 		snapshotHash: Buffer.from(encoded.snapshotHash, 'hex'),
@@ -885,9 +890,11 @@ export function selectRecoveryCapsule(
 	for (const capsule of capsules) {
 		if (
 			!best ||
-			capsule.writerEpoch > best.writerEpoch ||
-			(capsule.writerEpoch === best.writerEpoch &&
-				capsule.latestSequence > best.latestSequence)
+			capsule.generation > best.generation ||
+			(capsule.generation === best.generation &&
+				(capsule.writerEpoch > best.writerEpoch ||
+					(capsule.writerEpoch === best.writerEpoch &&
+						capsule.latestSequence > best.latestSequence)))
 		) {
 			best = capsule;
 		}
@@ -949,6 +956,9 @@ export function composeRecoveryCapsule(
 	const tipSequence = storage?.getRecoveryMeta?.(JOURNAL_META_KEYS.tipSequence);
 	const tipHash = storage?.getRecoveryMeta?.(JOURNAL_META_KEYS.tipHash);
 	const writerEpoch = storage?.getRecoveryMeta?.(JOURNAL_META_KEYS.writerEpoch);
+	const generationRaw = storage?.getRecoveryMeta?.(
+		JOURNAL_META_KEYS.generation
+	);
 	const lastSnapshot = storage?.getRecoveryMeta?.(
 		JOURNAL_META_KEYS.lastSnapshot
 	);
@@ -966,6 +976,7 @@ export function composeRecoveryCapsule(
 		version: 1,
 		encryptedScb: options.encryptedScb,
 		writerEpoch: writerEpoch != null ? BigInt(writerEpoch) : 0n,
+		generation: generationRaw != null ? BigInt(generationRaw) : 1n,
 		latestSequence: tipSequence != null ? BigInt(tipSequence) : 0n,
 		// Strict decode: a corrupt stored tip hash must not be replicated to
 		// guardians as the anti-rollback locator (issue #317).
@@ -1464,6 +1475,11 @@ export function restoreBestRecoveryCapsule(
 	}
 	// Highest head first.
 	const sorted = [...candidates].sort((a, b) => {
+		// A rotated set's capsule beats every capsule of the set before it
+		// (wire 5.9), whatever their epochs.
+		if (a.generation !== b.generation) {
+			return a.generation > b.generation ? -1 : 1;
+		}
 		if (a.writerEpoch !== b.writerEpoch) {
 			return a.writerEpoch > b.writerEpoch ? -1 : 1;
 		}
@@ -1505,6 +1521,7 @@ export function restoreBestRecoveryCapsule(
 		let j = i;
 		while (
 			j < sorted.length &&
+			sorted[j].generation === sorted[i].generation &&
 			sorted[j].writerEpoch === sorted[i].writerEpoch &&
 			sorted[j].latestSequence === sorted[i].latestSequence
 		) {

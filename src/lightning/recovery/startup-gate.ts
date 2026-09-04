@@ -71,7 +71,7 @@ export interface IConfirmationOutcome {
  * writer key, and once `fenced` the gate never reopens for that lease.
  */
 export class GuardianStartupGate {
-	private readonly config: IStartupGateConfig;
+	private config: IStartupGateConfig;
 	private readonly clock: () => bigint;
 	private state: StartupGateState = 'quarantined';
 	private supersededBy?: GuardianState;
@@ -81,6 +81,11 @@ export class GuardianStartupGate {
 	constructor(config: IStartupGateConfig) {
 		this.config = config;
 		this.clock = config.clock ?? ((): bigint => BigInt(Date.now()));
+	}
+
+	/** Point ownership checks at another replicator (a rotation's incoming set). */
+	swapReplicator(next: GuardianReplicator): void {
+		this.config = { ...this.config, replicator: next };
 	}
 
 	/**
@@ -195,7 +200,7 @@ export class GuardianStartupGate {
 				supersededBy: this.supersededBy
 			};
 		}
-		if (answer.superseded) {
+		if (answer.superseded || answer.rotated) {
 			return this.fenceOn(lease, answer.states, answer.confirming);
 		}
 		return { state: 'confirmed', confirming: answer.confirming };

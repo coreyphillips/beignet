@@ -349,11 +349,45 @@ function prefixBytes(guardianSetId: Buffer): Buffer {
 /** REGISTER: PREFIX || STATE, signed by the recovery root. */
 export function registerTranscriptHash(
 	guardianSetId: Buffer,
-	initialState: GuardianState
+	initialState: GuardianState,
+	generation: bigint
 ): Buffer {
 	return guardianTaggedHash(
 		'beignet/recovery/register/v1',
-		Buffer.concat([prefixBytes(guardianSetId), stateBytes(initialState)])
+		Buffer.concat([
+			prefixBytes(guardianSetId),
+			stateBytes(initialState),
+			u64(generation)
+		])
+	);
+}
+
+/** The ROTATE transcript fields (wire 4.2): what the recovery root signs. */
+export interface RotateFields {
+	recoveryId: Buffer;
+	newGuardianSetId: Buffer;
+	/** The INCOMING generation. */
+	generation: bigint;
+	/** The incoming set's members, any order; hashed in ascending order. */
+	newMembers: Buffer[];
+}
+
+export function rotateTranscriptHash(
+	outgoingSetId: Buffer,
+	fields: RotateFields
+): Buffer {
+	const members = fields.newMembers
+		.map((m) => expect32('newMember', m))
+		.sort(Buffer.compare);
+	return guardianTaggedHash(
+		'beignet/recovery/rotate/v1',
+		Buffer.concat([
+			prefixBytes(outgoingSetId),
+			expect32('recoveryId', fields.recoveryId),
+			expect32('newGuardianSetId', fields.newGuardianSetId),
+			u64(fields.generation),
+			...members
+		])
 	);
 }
 

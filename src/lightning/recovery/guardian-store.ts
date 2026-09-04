@@ -55,6 +55,10 @@ export interface IGuardianNamespaceRow {
 	/** Cumulative receipt over `state`, stored exactly as last returned. */
 	receiptIssuedAt: Buffer | null;
 	receiptSignature: Buffer | null;
+	/** The namespace generation, u64 big-endian (wire 5.9); null reads as 1. */
+	generation: Buffer | null;
+	/** The encoded RotateSetRequest once the namespace was retired (5.11). */
+	rotation: Buffer | null;
 }
 
 export interface IGuardianRecordRow {
@@ -101,6 +105,8 @@ interface INamespaceDbRow {
 	registration_receipt_signature: Buffer | null;
 	receipt_issued_at: Buffer | null;
 	receipt_signature: Buffer | null;
+	generation: Buffer | null;
+	rotation: Buffer | null;
 }
 
 interface IRecordDbRow {
@@ -146,7 +152,9 @@ CREATE TABLE IF NOT EXISTS guardian_namespaces (
 	registration_receipt_issued_at BLOB,
 	registration_receipt_signature BLOB,
 	receipt_issued_at BLOB,
-	receipt_signature BLOB
+	receipt_signature BLOB,
+	generation BLOB,
+	rotation BLOB
 );
 CREATE TABLE IF NOT EXISTS guardian_records (
 	recovery_id BLOB NOT NULL,
@@ -241,7 +249,9 @@ export class GuardianStore {
 			registrationReceiptIssuedAt: row.registration_receipt_issued_at,
 			registrationReceiptSignature: row.registration_receipt_signature,
 			receiptIssuedAt: row.receipt_issued_at,
-			receiptSignature: row.receipt_signature
+			receiptSignature: row.receipt_signature,
+			generation: row.generation ?? null,
+			rotation: row.rotation ?? null
 		};
 	}
 
@@ -266,8 +276,8 @@ export class GuardianStore {
 					recovery_id, guardian_set_id, state, possibly_stale,
 					registration_state, registration_signature,
 					registration_receipt_issued_at, registration_receipt_signature,
-					receipt_issued_at, receipt_signature
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					receipt_issued_at, receipt_signature, generation, rotation
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 			)
 			.run(
 				row.recoveryId,
@@ -279,7 +289,9 @@ export class GuardianStore {
 				row.registrationReceiptIssuedAt,
 				row.registrationReceiptSignature,
 				row.receiptIssuedAt,
-				row.receiptSignature
+				row.receiptSignature,
+				row.generation,
+				row.rotation
 			);
 	}
 
@@ -291,7 +303,7 @@ export class GuardianStore {
 					guardian_set_id = ?, state = ?, possibly_stale = ?,
 					registration_state = ?, registration_signature = ?,
 					registration_receipt_issued_at = ?, registration_receipt_signature = ?,
-					receipt_issued_at = ?, receipt_signature = ?
+					receipt_issued_at = ?, receipt_signature = ?, generation = ?, rotation = ?
 				WHERE recovery_id = ?`
 			)
 			.run(
@@ -304,8 +316,19 @@ export class GuardianStore {
 				row.registrationReceiptSignature,
 				row.receiptIssuedAt,
 				row.receiptSignature,
+				row.generation,
+				row.rotation,
 				row.recoveryId
 			);
+	}
+
+	/** Retire the namespace under this set: store the rotation (wire 5.11). */
+	setRotation(recoveryId: Buffer, rotation: Buffer): void {
+		this.db
+			.prepare(
+				'UPDATE guardian_namespaces SET rotation = ? WHERE recovery_id = ?'
+			)
+			.run(rotation, recoveryId);
 	}
 
 	/** Advance state and the cumulative receipt over it, atomically. */

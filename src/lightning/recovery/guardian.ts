@@ -42,7 +42,8 @@ import {
 	statesEqual,
 	takeoverTranscriptHash,
 	verifyTranscript,
-	xOnlyFromSecret
+	xOnlyFromSecret,
+	rotateTranscriptHash
 } from './guardian-wire';
 import {
 	GuardianStore,
@@ -53,6 +54,10 @@ import {
 	readU64be,
 	u64be
 } from './guardian-store';
+import {
+	decodeRotateSetRequest,
+	encodeRotateSetRequest
+} from './guardian-proto';
 
 /** Protocol status codes (wire spec section 7). */
 export enum GuardianStatus {
@@ -78,6 +83,8 @@ export enum GuardianStatus {
 	ERR_TOO_LARGE = 32,
 	/** A host's storage quota for new namespaces or records is exhausted. */
 	ERR_QUOTA_EXCEEDED = 33,
+	/** The namespace was rotated away from this set (wire 5.11); GET_HEAD carries the rotation. */
+	ERR_SET_RETIRED = 34,
 	ERR_INTERNAL = 50
 }
 
@@ -130,6 +137,38 @@ export interface IGuardianRegisterNodeRequest {
 	guardianMembers: Buffer[];
 	initialState: GuardianState;
 	rootSignature: Buffer;
+	/**
+	 * The namespace generation (wire 5.9): 1 at the first set a namespace
+	 * ever has, one higher at every rotation. Inside the REGISTER transcript.
+	 */
+	generation: bigint;
+}
+
+/** Where to reach one member of an incoming set (wire 5.11; unsigned). */
+export interface IGuardianTransportHint {
+	type: string;
+	url: string;
+}
+
+/** ROTATE_SET (wire 5.11): retire a namespace under the OUTGOING set. */
+export interface IGuardianRotateSetRequest {
+	protocolVersion: number;
+	/** The OUTGOING set. */
+	guardianSetId: Buffer;
+	recoveryId: Buffer;
+	newGuardianSetId: Buffer;
+	/** The INCOMING generation. */
+	generation: bigint;
+	newMembers: Buffer[];
+	rootSignature: Buffer;
+	/** Per incoming member, in newMembers order; informational. */
+	newTransports: IGuardianTransportHint[];
+}
+
+export interface IGuardianRotateSetResponse {
+	status: GuardianStatus;
+	detail?: string;
+	rotation?: IGuardianRotateSetRequest;
 }
 
 export interface IGuardianRegisterNodeResponse {
@@ -164,6 +203,10 @@ export interface IGuardianGetHeadResponse {
 	certificates?: IGuardianTakeoverCertificate[];
 	possiblyStale?: boolean;
 	registration?: IGuardianRegisterNodeRequest;
+	/** The namespace generation (wire 5.9). */
+	generation?: bigint;
+	/** Present once the namespace was rotated away from this set (5.11). */
+	rotation?: IGuardianRotateSetRequest;
 }
 
 export interface IGuardianGetStateRequest {
@@ -394,6 +437,13 @@ interface IErr {
 
 function err(status: GuardianStatus, detail: string): IErr {
 	return { status, detail };
+}
+
+/** A namespace row's generation; a row with none is at the first generation. */
+function readGeneration(ns: IGuardianNamespaceRow): bigint {
+	return ns.generation && ns.generation.length === 8
+		? ns.generation.readBigUInt64BE(0)
+		: 1n;
 }
 
 export class ReferenceGuardian {
@@ -805,7 +855,17 @@ export class ReferenceGuardian {
 					'root signature must be 64 bytes'
 				);
 			}
-			const transcript = registerTranscriptHash(this.guardianSetId, state);
+			if (!validU64(request.generation) || request.generation === 0n) {
+				return err(
+					GuardianStatus.ERR_MALFORMED,
+					'generation must be a nonzero u64'
+				);
+			}
+			const transcript = registerTranscriptHash(
+				this.guardianSetId,
+				state,
+				request.generation
+			);
 			if (
 				!this.safeVerify(transcript, request.rootSignature, state.recoveryId)
 			) {
@@ -821,7 +881,10 @@ export class ReferenceGuardian {
 			const outcome = this.store.write(() => {
 				const ns = this.store.getNamespace(state.recoveryId);
 				if (ns && ns.registrationState) {
-					if (ns.registrationState.equals(stateBuf)) {
+					if (
+						ns.registrationState.equals(stateBuf) &&
+						readGeneration(ns) === request.generation
+					) {
 						return { kind: 'duplicate' as const, ns };
 					}
 					return { kind: 'already' as const, ns };
@@ -867,7 +930,9 @@ export class ReferenceGuardian {
 					registrationReceiptIssuedAt: u64be(receipt.issuedAt),
 					registrationReceiptSignature: receipt.signature,
 					receiptIssuedAt: u64be(receipt.issuedAt),
-					receiptSignature: receipt.signature
+					receiptSignature: receipt.signature,
+					generation: u64be(request.generation),
+					rotation: null
 				};
 				if (ns) {
 					this.store.reanchorNamespace(row);
@@ -998,6 +1063,8 @@ export class ReferenceGuardian {
 			const ciphertextHash = sha256(record.ciphertext);
 			const quarantine = this.quarantineGate(record.recoveryId);
 			if (quarantine) return quarantine;
+			const retired = this.retiredGate(record.recoveryId);
+			if (retired) return retired;
 
 			return this.store.write(() => {
 				const ns = this.store.getNamespace(record.recoveryId);
@@ -1187,6 +1254,147 @@ export class ReferenceGuardian {
 		}
 	}
 
+	/**
+	 * A namespace rotated away from this set refuses every write (wire
+	 * 5.11): the live chain is with the incoming set, and a writer that
+	 * still addresses this one is a stale device that must freeze. Reads
+	 * stay open so a restore device can find the rotation.
+	 */
+	private retiredGate(recoveryId: Buffer): IErr | null {
+		const ns = this.store.read(() => this.store.getNamespace(recoveryId));
+		if (!ns || !ns.rotation) return null;
+		return err(
+			GuardianStatus.ERR_SET_RETIRED,
+			'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
+		);
+	}
+
+	// ─────────────── ROTATE_SET (wire 5.11) ───────────────
+
+	rotateSet(request: IGuardianRotateSetRequest): IGuardianRotateSetResponse {
+		try {
+			const gate = this.versionAndSetProblem(
+				request.protocolVersion,
+				request.guardianSetId
+			);
+			if (gate) return gate;
+			if (
+				!isLen(request.recoveryId, 32) ||
+				!isLen(request.newGuardianSetId, 32)
+			) {
+				return err(
+					GuardianStatus.ERR_MALFORMED,
+					'recovery_id and new_guardian_set_id must be 32 bytes'
+				);
+			}
+			if (!validU64(request.generation) || request.generation === 0n) {
+				return err(
+					GuardianStatus.ERR_MALFORMED,
+					'generation must be a nonzero u64'
+				);
+			}
+			if (
+				!Array.isArray(request.newMembers) ||
+				request.newMembers.length !== CRASH_V1_PROFILE.total
+			) {
+				return err(
+					GuardianStatus.ERR_MALFORMED,
+					`new_members must list exactly ${CRASH_V1_PROFILE.total} keys`
+				);
+			}
+			let computed: Buffer;
+			try {
+				computed = computeGuardianSetId({
+					...CRASH_V1_PROFILE,
+					guardianIds: request.newMembers
+				});
+			} catch (error) {
+				return err(
+					GuardianStatus.ERR_MALFORMED,
+					`new_members invalid: ${
+						error instanceof Error ? error.message : String(error)
+					}`
+				);
+			}
+			if (!computed.equals(request.newGuardianSetId)) {
+				return err(
+					GuardianStatus.ERR_MALFORMED,
+					'new_members do not hash to new_guardian_set_id'
+				);
+			}
+			if (request.newGuardianSetId.equals(this.guardianSetId)) {
+				return err(
+					GuardianStatus.ERR_MALFORMED,
+					'a rotation must name a different incoming set'
+				);
+			}
+			if (!isLen(request.rootSignature, 64)) {
+				return err(
+					GuardianStatus.ERR_MALFORMED,
+					'root signature must be 64 bytes'
+				);
+			}
+			const transcript = rotateTranscriptHash(this.guardianSetId, {
+				recoveryId: request.recoveryId,
+				newGuardianSetId: request.newGuardianSetId,
+				generation: request.generation,
+				newMembers: request.newMembers
+			});
+			if (
+				!this.safeVerify(transcript, request.rootSignature, request.recoveryId)
+			) {
+				return err(
+					GuardianStatus.ERR_BAD_SIGNATURE,
+					'root signature over the ROTATE transcript failed'
+				);
+			}
+			const quarantine = this.quarantineGate(request.recoveryId);
+			if (quarantine) return quarantine;
+			const encoded = encodeRotateSetRequest(request);
+			const outcome = this.store.write(() => {
+				const ns = this.store.getNamespace(request.recoveryId);
+				if (!ns || !ns.registrationState) {
+					return err(
+						GuardianStatus.ERR_UNKNOWN_NODE,
+						'recovery_id not registered'
+					);
+				}
+				const current = readGeneration(ns);
+				if (ns.rotation) {
+					const stored = decodeRotateSetRequest(ns.rotation);
+					if (ns.rotation.equals(encoded)) {
+						return { status: GuardianStatus.OK_DUPLICATE, rotation: stored };
+					}
+					if (stored.generation === request.generation) {
+						return {
+							status: GuardianStatus.ERR_CONFLICT,
+							detail: 'a different rotation is stored at this generation',
+							rotation: stored
+						};
+					}
+					if (stored.generation > request.generation) {
+						return {
+							status: GuardianStatus.ERR_EPOCH_REGRESSION,
+							detail: `the stored rotation is at generation ${stored.generation}`,
+							rotation: stored
+						};
+					}
+				}
+				if (request.generation <= current) {
+					return err(
+						GuardianStatus.ERR_EPOCH_REGRESSION,
+						`generation ${request.generation} does not exceed the namespace's ${current}`
+					);
+				}
+				this.store.setRotation(request.recoveryId, encoded);
+				return { status: GuardianStatus.OK, rotation: request };
+			});
+			return outcome;
+		} catch (error) {
+			return this.internalError(error);
+		}
+	}
+
 	// ─────────────── GET_HEAD (wire 5.3) ───────────────
 
 	getHead(request: IGuardianGetHeadRequest): IGuardianGetHeadResponse {
@@ -1231,8 +1439,13 @@ export class ReferenceGuardian {
 						// verified the list hashes to it (memberListProblem).
 						guardianMembers: this.members.map((m) => Buffer.from(m)),
 						initialState: parseStateBytes(ns.registrationState),
-						rootSignature: Buffer.from(ns.registrationSignature as Buffer)
-					}
+						rootSignature: Buffer.from(ns.registrationSignature as Buffer),
+						generation: readGeneration(ns)
+					},
+					generation: readGeneration(ns),
+					...(ns.rotation
+						? { rotation: decodeRotateSetRequest(ns.rotation) }
+						: {})
 				};
 			});
 		} catch (error) {
@@ -1380,6 +1593,8 @@ export class ReferenceGuardian {
 			}
 			const quarantine = this.quarantineGate(expected.recoveryId);
 			if (quarantine) return quarantine;
+			const retired = this.retiredGate(expected.recoveryId);
+			if (retired) return retired;
 
 			return this.store.write(() => {
 				const ns = this.store.getNamespace(expected.recoveryId);
@@ -1638,6 +1853,8 @@ export class ReferenceGuardian {
 			const recoveryId = certified.recoveryId;
 			const quarantine = this.quarantineGate(recoveryId);
 			if (quarantine) return quarantine;
+			const retired = this.retiredGate(recoveryId);
+			if (retired) return retired;
 
 			return this.store.write(() => {
 				const ns = this.store.getNamespace(recoveryId);
@@ -2059,7 +2276,11 @@ export class ReferenceGuardian {
 			regState.origin.firstSequence >= 1n &&
 			isGenesisLogHead(regState.logHead) &&
 			this.safeVerify(
-				registerTranscriptHash(this.guardianSetId, regState),
+				registerTranscriptHash(
+					this.guardianSetId,
+					regState,
+					readGeneration(ns)
+				),
 				ns.registrationSignature,
 				regState.recoveryId
 			);
@@ -2095,7 +2316,11 @@ export class ReferenceGuardian {
 			regState.origin.firstSequence >= 1n &&
 			isGenesisLogHead(regState.logHead) &&
 			this.safeVerify(
-				registerTranscriptHash(this.guardianSetId, regState),
+				registerTranscriptHash(
+					this.guardianSetId,
+					regState,
+					readGeneration(ns)
+				),
 				ns.registrationSignature,
 				regState.recoveryId
 			);

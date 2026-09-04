@@ -73,9 +73,10 @@ export function buildRegistrationFor(
 		protocolVersion: 1,
 		guardianSetId: setId,
 		guardianMembers: members,
+		generation: 1n,
 		initialState,
 		rootSignature: signTranscript(
-			registerTranscriptHash(setId, initialState),
+			registerTranscriptHash(setId, initialState, 1n),
 			root.rootSecret
 		)
 	};

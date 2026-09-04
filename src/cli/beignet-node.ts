@@ -104,6 +104,20 @@ import {
 	IGuardianHostStatus,
 	bolt8GuardianTransport,
 	deriveGuardianRoot,
+	GuardianRotation,
+	RotationRefusedError,
+	bindGuardianSet,
+	describeRotation,
+	loadWriterLease,
+	readGuardianSet,
+	readRetirePending,
+	readRotationIntent,
+	retireOutgoingSet,
+	deriveRecoveryRoot,
+	CRASH_V1_PROFILE,
+	JOURNAL_META_KEYS,
+	REPLICATION_META_KEYS,
+	IRotationEvent,
 	isOnionV3Hostname,
 	parseBolt8GuardianUrl
 } from '../lightning/recovery';
@@ -1375,6 +1389,38 @@ export class BeignetNode extends EventEmitter {
 	private recoveryNodeConfig?: INodeConfig['recovery'];
 	/** The assembled run decision (guardian modes only). */
 	private _recoveryRun?: Extract<GuardianBootDecision, { kind: 'run' }>;
+	/** The env named a guardian set the journal has since rotated away from. */
+	private _configuredSetStale = false;
+	private _rotationInFlight = false;
+	private _lastRotationEvent: { type: string; detail: string } | null = null;
+	/** A rotation the boot followed from a retired set to the live one (issue #701). */
+	private _followedRotation: {
+		generation: string;
+		from: string[];
+		to: string[];
+	} | null = null;
+	private _retireTimer?: ReturnType<typeof setInterval>;
+	private _lastRotationState: ReturnType<typeof describeRotation> = {
+		generation: '1',
+		pending: null,
+		retirePending: false,
+		guardianSet: null
+	};
+
+	/**
+	 * The rotation view for the status route. Once a restore has torn the
+	 * node down for a restart the database is closed, so the last reading
+	 * stands in until the next boot rereads it.
+	 */
+	private rotationStateForStatus(): ReturnType<typeof describeRotation> {
+		if (this._restartRequired) return this._lastRotationState;
+		try {
+			this._lastRotationState = describeRotation(this.storage);
+		} catch {
+			/* closed database: keep the last reading */
+		}
+		return this._lastRotationState;
+	}
 	/** Present while this device must restore before it can run. */
 	private _restoreDecision?: Extract<
 		GuardianBootDecision,
@@ -1563,6 +1609,7 @@ export class BeignetNode extends EventEmitter {
 	private readonly _peerRetrievedCapsules = new Map<
 		string,
 		{
+			generation: bigint;
 			blob: Buffer;
 			writerEpoch: bigint;
 			latestSequence: bigint;
@@ -2870,9 +2917,105 @@ export class BeignetNode extends EventEmitter {
 		}
 		// Guardian-backed modes. The daemon validates the guardian set before
 		// create; parsing again here gives library callers the same refusals.
-		const guardians = (opts.recoveryGuardians ?? []).map(parseGuardianEntry);
+		let guardians = (opts.recoveryGuardians ?? []).map(parseGuardianEntry);
+		// A rotation moves the configured set inside the journal (wire 5.9
+		// step 4); the env then names the outgoing set until the operator
+		// updates it. The journal wins, and the status route says so.
+		this._configuredSetStale = false;
+		const persisted = readGuardianSet(this.storage);
+		if (persisted && persisted.length === CRASH_V1_PROFILE.total) {
+			const persistedParsed = persisted.map(parseGuardianEntry);
+			if (
+				!sameGuardianIds(
+					persistedParsed.map((g) => g.guardianId.toString('hex')),
+					guardians.map((g) => g.guardianId.toString('hex'))
+				)
+			) {
+				this._configuredSetStale = true;
+				this.log(
+					'warn',
+					"Configured guardians predate a rotation; using the journal's set",
+					{
+						configured: guardians.map((g) => g.guardianId.toString('hex')),
+						journal: persisted.map((g) => g.guardianId)
+					}
+				);
+				guardians = persistedParsed;
+			}
+		}
+		let decision = await this.decideGuardianBoot(guardians, mode, opts);
+		// A set that retired this namespace hands over the rotation (wire
+		// 5.11); follow it to the live set, and adopt its generation so this
+		// device's own capsule and registration order correctly.
+		for (let hop = 0; hop < 8 && decision.kind === 'rotated'; hop++) {
+			const from = guardians.map((g) => g.guardianId.toString('hex'));
+			let next: IParsedGuardian[];
+			try {
+				next = decision.entries.map(parseGuardianEntry);
+			} catch (error) {
+				throw new BeignetError(
+					'RECOVERY_UNAVAILABLE',
+					`this namespace was rotated to generation ${
+						decision.generation
+					} but the rotation names a guardian this daemon cannot address: ${
+						error instanceof Error ? error.message : String(error)
+					}`
+				);
+			}
+			this._followedRotation = {
+				generation: decision.generation.toString(),
+				from,
+				to: next.map((g) => g.guardianId.toString('hex'))
+			};
+			this.log(
+				'info',
+				'Following a guardian-set rotation',
+				this._followedRotation
+			);
+			this.emit('recovery:rotation-followed', this._followedRotation);
+			this.storage.setRecoveryMeta?.(
+				JOURNAL_META_KEYS.generation,
+				decision.generation.toString()
+			);
+			this.storage.setRecoveryMeta?.(
+				REPLICATION_META_KEYS.guardianSet,
+				JSON.stringify(decision.entries)
+			);
+			guardians = next;
+			decision = await this.decideGuardianBoot(guardians, mode, opts);
+		}
+		if (decision.kind === 'rotated') {
+			throw new BeignetError(
+				'RECOVERY_UNAVAILABLE',
+				'this namespace was rotated more than 8 times in a row; refusing to follow further'
+			);
+		}
+		if (decision.kind === 'run') {
+			this._recoveryRun = decision;
+			this.recoveryNodeConfig = decision.recovery;
+			return;
+		}
+		if (decision.kind === 'restore-required') {
+			this._restoreDecision = decision;
+			this._restorePending = true;
+			return;
+		}
+		throw new BeignetError(
+			'RECOVERY_UNAVAILABLE',
+			`Recovery ${decision.outcome}: ${decision.detail}. Ownership of ` +
+				'this namespace cannot be decided without a guardian quorum; ' +
+				'retry when the guardian set is reachable.'
+		);
+	}
+
+	/** One boot decision against one guardian set (assembly.ts). */
+	private async decideGuardianBoot(
+		guardians: IParsedGuardian[],
+		mode: 'async-remote' | 'quorum',
+		opts: BeignetNodeOptions
+	): Promise<GuardianBootDecision> {
 		this.recoveryGuardianSet = guardians;
-		const decision = await buildGuardianRecovery({
+		return buildGuardianRecovery({
 			storage: this.storage,
 			nodeSecret: this.nodeSecret(),
 			durability: mode,
@@ -2905,22 +3048,6 @@ export class BeignetNode extends EventEmitter {
 				});
 			}
 		});
-		if (decision.kind === 'run') {
-			this._recoveryRun = decision;
-			this.recoveryNodeConfig = decision.recovery;
-			return;
-		}
-		if (decision.kind === 'restore-required') {
-			this._restoreDecision = decision;
-			this._restorePending = true;
-			return;
-		}
-		throw new BeignetError(
-			'RECOVERY_UNAVAILABLE',
-			`Recovery ${decision.outcome}: ${decision.detail}. Ownership of ` +
-				'this namespace cannot be decided without a guardian quorum; ' +
-				'retry when the guardian set is reachable.'
-		);
 	}
 
 	/**
@@ -2941,6 +3068,7 @@ export class BeignetNode extends EventEmitter {
 						confirming: outcome.confirming
 					});
 					this.startRecoveryLeaseCheck();
+					this.resumeRotationWork();
 					return;
 				}
 				if (outcome.state === 'fenced') {
@@ -3053,6 +3181,20 @@ export class BeignetNode extends EventEmitter {
 	getRecoverySurfaceStatus(): {
 		mode: RecoveryMode;
 		profile: 'crash-v1' | null;
+		/** The guardian-set generation the journal is at (wire 5.9). */
+		generation: string;
+		/** The env names a set the journal has rotated away from; the journal's set is in force. */
+		configuredSetStale: boolean;
+		rotation: {
+			inProgress: boolean;
+			/** An intent persisted before its switch; resumes once the gate confirms. */
+			pending: boolean;
+			/** A retirement still owed to an outgoing set; retried in the background. */
+			retirePending: boolean;
+			lastEvent: { type: string; detail: string } | null;
+			/** The rotation this boot followed from a retired set to the live one. */
+			followed: { generation: string; from: string[]; to: string[] } | null;
+		};
 		guardians: Array<{ guardianId: string; url: string }>;
 		state:
 			| 'disabled'
@@ -3100,6 +3242,18 @@ export class BeignetNode extends EventEmitter {
 			guardianId: g.guardianId.toString('hex'),
 			url: g.url
 		}));
+		const rotationState = this.rotationStateForStatus();
+		const rotationView = {
+			generation: rotationState.generation,
+			configuredSetStale: this._configuredSetStale,
+			rotation: {
+				inProgress: this._rotationInFlight,
+				pending: rotationState.pending !== null,
+				retirePending: rotationState.retirePending,
+				lastEvent: this._lastRotationEvent,
+				followed: this._followedRotation
+			}
+		};
 		const profile =
 			this.recoveryMode === 'async-remote' || this.recoveryMode === 'quorum'
 				? ('crash-v1' as const)
@@ -3113,6 +3267,7 @@ export class BeignetNode extends EventEmitter {
 			return {
 				mode: this.recoveryMode,
 				profile,
+				...rotationView,
 				guardians,
 				state: 'restart-required',
 				node: null,
@@ -3125,6 +3280,7 @@ export class BeignetNode extends EventEmitter {
 			return {
 				mode: 'off',
 				profile: null,
+				...rotationView,
 				guardians: [],
 				state: 'disabled',
 				node: null,
@@ -3139,6 +3295,7 @@ export class BeignetNode extends EventEmitter {
 			return {
 				mode: this.recoveryMode,
 				profile,
+				...rotationView,
 				guardians,
 				state: this._restoreInFlight ? 'restoring' : 'restore-required',
 				node: null,
@@ -3151,6 +3308,7 @@ export class BeignetNode extends EventEmitter {
 		return {
 			mode: this.recoveryMode,
 			profile,
+			...rotationView,
 			guardians,
 			state: node.fenced || node.gate === 'fenced' ? 'fenced' : 'running',
 			node,
@@ -4149,6 +4307,226 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		return { host: proxyHost, port };
+	}
+
+	// ─────────────── Guardian-set rotation (wire 5.9, issue #701) ───────────────
+
+	/**
+	 * Rotate this wallet's guardian set (wire 5.9): register the namespace
+	 * with the incoming set under the current lease, backfill it, switch,
+	 * retire the outgoing set. Runs on a confirmed writer only. The
+	 * configured env still names the outgoing set afterwards; the journal
+	 * carries the new one and the status route reports configuredSetStale.
+	 */
+	async rotateGuardians(
+		entries: Array<string | IGuardianConfigEntry>
+	): Promise<{
+		generation: string;
+		guardians: Array<{ guardianId: string; url: string }>;
+		retired: number;
+	}> {
+		const run = this._recoveryRun;
+		if (
+			!run ||
+			!this.node ||
+			this.recoveryMode === 'off' ||
+			this.recoveryMode === 'peer-storage'
+		) {
+			throw new BeignetError(
+				'ROTATION_UNAVAILABLE',
+				'Rotating guardians needs a running wallet in a guardian recovery mode (async-remote or quorum).'
+			);
+		}
+		if (this._rotationInFlight) {
+			throw new BeignetError(
+				'ROTATION_IN_PROGRESS',
+				'A guardian-set rotation is already running.'
+			);
+		}
+		const gate = this.node.getRecoveryGateState();
+		if (gate !== 'confirmed') {
+			throw new BeignetError(
+				'ROTATION_UNAVAILABLE',
+				`Rotating guardians needs a confirmed writer; the startup gate is ${gate}.`
+			);
+		}
+		if (this.node.getRecoveryStatus().fenced) {
+			throw new BeignetError(
+				'ROTATION_UNAVAILABLE',
+				'This device is fenced; it no longer owns the namespace.'
+			);
+		}
+		let incoming: IParsedGuardian[];
+		try {
+			incoming = entries.map(parseGuardianEntry);
+		} catch (error) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				error instanceof Error ? error.message : String(error)
+			);
+		}
+		if (incoming.length !== CRASH_V1_PROFILE.total) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`A guardian set is exactly ${CRASH_V1_PROFILE.total} entries (crash-v1 is 2-of-3); got ${incoming.length}`
+			);
+		}
+		const opts = this._bootOpts;
+		if (!opts) throw new BeignetError('INTERNAL_ERROR', 'node is not started');
+		const transportFor = (
+			guardian: IParsedGuardian
+		): IBolt8GuardianTransport | undefined =>
+			this.guardianTransportFor(guardian, opts);
+		const held = loadWriterLease(this.storage);
+		if (held.state !== 'present') {
+			throw new BeignetError(
+				'ROTATION_UNAVAILABLE',
+				'This device holds no writer lease to carry over.'
+			);
+		}
+		let rotation: GuardianRotation;
+		try {
+			rotation = new GuardianRotation({
+				storage: this.storage,
+				recoveryRoot: deriveRecoveryRoot(this.nodeSecret()),
+				lease: held.lease,
+				outgoing: {
+					guardians: this.recoveryGuardianSet,
+					...bindGuardianSet(this.recoveryGuardianSet, { transportFor })
+				},
+				incoming: {
+					guardians: incoming,
+					...bindGuardianSet(incoming, { transportFor })
+				},
+				required: CRASH_V1_PROFILE.required,
+				onEvent: (event) => this.noteRotationEvent(event),
+				onReplicationEvent: (event) => {
+					this.log('debug', `Rotation replication: ${event.type}`, {
+						detail: event.detail
+					});
+				}
+			});
+		} catch (error) {
+			throw this.rotationError(error);
+		}
+		this._rotationInFlight = true;
+		try {
+			const result = await rotation.rotate();
+			run.barrier.swapReplicator(result.replicator);
+			run.gate.swapReplicator(result.replicator);
+			run.replicator = result.replicator;
+			this.node.setRecoveryGuardians(result.descriptors);
+			this.recoveryGuardianSet = incoming;
+			this._configuredSetStale = true;
+			const guardians = incoming.map((g) => ({
+				guardianId: g.guardianId.toString('hex'),
+				url: g.url
+			}));
+			this.emit('recovery:rotated', {
+				generation: result.generation.toString(),
+				guardians
+			});
+			this.log('info', 'Guardian set rotated', {
+				generation: result.generation.toString(),
+				guardians
+			});
+			const retired = await rotation.retireOutgoing();
+			if (retired === 0) this.startRetireRetries();
+			return { generation: result.generation.toString(), guardians, retired };
+		} catch (error) {
+			throw this.rotationError(error);
+		} finally {
+			this._rotationInFlight = false;
+		}
+	}
+
+	private rotationError(error: unknown): Error {
+		if (error instanceof BeignetError) return error;
+		if (error instanceof RotationRefusedError) {
+			const code: Record<RotationRefusedError['reason'], string> = {
+				'in-progress': 'ROTATION_IN_PROGRESS',
+				'no-quorum': 'ROTATION_NO_QUORUM',
+				'not-catching-up': 'ROTATION_NOT_CATCHING_UP',
+				'same-set': 'INVALID_PARAMS',
+				malformed: 'INVALID_PARAMS'
+			};
+			return new BeignetError(code[error.reason], error.message);
+		}
+		return error instanceof Error ? error : new Error(String(error));
+	}
+
+	private noteRotationEvent(event: IRotationEvent): void {
+		this._lastRotationEvent = { type: event.type, detail: event.detail };
+		this.log('info', `Guardian rotation: ${event.type}`, {
+			detail: event.detail,
+			...(event.generation ? { generation: event.generation } : {})
+		});
+		this.emit('recovery:rotation-progress', {
+			type: event.type,
+			detail: event.detail,
+			...(event.generation ? { generation: event.generation } : {})
+		});
+	}
+
+	/**
+	 * After the gate confirms: a rotation interrupted before its switch
+	 * resumes (its intent is persisted), and a retirement still owed to an
+	 * outgoing set is retried.
+	 */
+	private resumeRotationWork(): void {
+		const intent = readRotationIntent(this.storage);
+		if (intent && !this._rotationInFlight) {
+			this.log('info', 'Resuming an interrupted guardian-set rotation', {
+				generation: intent.generation
+			});
+			this.rotateGuardians(intent.entries).catch((error) => {
+				this.log(
+					'warn',
+					'Resumed rotation did not complete; it stays pending',
+					{
+						error: error instanceof Error ? error.message : String(error)
+					}
+				);
+			});
+		}
+		if (readRetirePending(this.storage)) this.startRetireRetries();
+	}
+
+	private startRetireRetries(): void {
+		if (this._retireTimer) return;
+		const attempt = async (): Promise<void> => {
+			const pending = readRetirePending(this.storage);
+			if (!pending || this.destroyed) {
+				if (this._retireTimer) clearInterval(this._retireTimer);
+				this._retireTimer = undefined;
+				return;
+			}
+			const opts = this._bootOpts;
+			if (!opts) return;
+			try {
+				const outgoing = pending.entries.map(parseGuardianEntry);
+				const { bound } = bindGuardianSet(outgoing, {
+					transportFor: (guardian): IBolt8GuardianTransport | undefined =>
+						this.guardianTransportFor(guardian, opts)
+				});
+				await retireOutgoingSet(this.storage, bound, (event) =>
+					this.noteRotationEvent(event)
+				);
+			} catch (error) {
+				this.log(
+					'warn',
+					'Retiring the outgoing guardian set failed; will retry',
+					{
+						error: error instanceof Error ? error.message : String(error)
+					}
+				);
+			}
+		};
+		this._retireTimer = setInterval(() => {
+			void attempt();
+		}, 60_000);
+		if (this._retireTimer.unref) this._retireTimer.unref();
+		void attempt();
 	}
 
 	/**
@@ -10226,20 +10604,51 @@ export class BeignetNode extends EventEmitter {
 			}
 			const held = this._peerRetrievedCapsules.get(peerPubkey);
 			const inline = capsule.inlineRecoveryState !== undefined;
+			// A capsule from a HIGHER generation means another device holding
+			// this seed rotated the namespace away from this one (wire 5.9):
+			// this device is the stale writer and freezes, the same hard
+			// freeze a proven newer epoch causes.
+			if (
+				(this.recoveryMode === 'async-remote' ||
+					this.recoveryMode === 'quorum') &&
+				this.node &&
+				!this._restorePending &&
+				capsule.generation > this.node.getRecoveryGeneration()
+			) {
+				this.log(
+					'error',
+					'A storage peer returned a capsule from a later guardian-set generation; this device was rotated away from',
+					{
+						fromPeer: peerPubkey,
+						capsuleGeneration: capsule.generation.toString(),
+						ownGeneration: this.node.getRecoveryGeneration().toString()
+					}
+				);
+				this.node.fenceForRotation(
+					`peer ${peerPubkey} returned a capsule at generation ${
+						capsule.generation
+					}, above this device's ${this.node.getRecoveryGeneration()}`
+				);
+			}
 			// Higher head wins. At an equal head a replica carrying the inline
 			// Tier 2 journal is never displaced by an SCB-only twin (the same
 			// node composes both shapes of one head when a re-base fails).
 			if (
 				!held ||
-				capsule.writerEpoch > held.writerEpoch ||
-				(capsule.writerEpoch === held.writerEpoch &&
+				capsule.generation > held.generation ||
+				(capsule.generation === held.generation &&
+					capsule.writerEpoch > held.writerEpoch) ||
+				(capsule.generation === held.generation &&
+					capsule.writerEpoch === held.writerEpoch &&
 					capsule.latestSequence > held.latestSequence) ||
-				(capsule.writerEpoch === held.writerEpoch &&
+				(capsule.generation === held.generation &&
+					capsule.writerEpoch === held.writerEpoch &&
 					capsule.latestSequence === held.latestSequence &&
 					(inline || !held.inline))
 			) {
 				this._peerRetrievedCapsules.set(peerPubkey, {
 					blob: Buffer.from(blob),
+					generation: capsule.generation,
 					writerEpoch: capsule.writerEpoch,
 					latestSequence: capsule.latestSequence,
 					inline,
@@ -10464,6 +10873,10 @@ export class BeignetNode extends EventEmitter {
 	async destroy(): Promise<void> {
 		this._bolt8Transport?.close();
 		this._bolt8Transport = null;
+		if (this._retireTimer) {
+			clearInterval(this._retireTimer);
+			this._retireTimer = undefined;
+		}
 		if (this.destroyed) return;
 		this.destroyed = true;
 		if (this.backupTimer) {

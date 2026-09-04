@@ -404,6 +404,7 @@ describe('Recovery phase 3: capsule crypto', () => {
 			version: 1,
 			encryptedScb: makeScb(),
 			writerEpoch: 3n,
+			generation: 1n,
 			latestSequence: 41n,
 			frameHash: Buffer.alloc(32, 7),
 			snapshotHash: Buffer.alloc(32, 9),

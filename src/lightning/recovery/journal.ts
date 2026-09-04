@@ -238,7 +238,9 @@ export const JOURNAL_META_KEYS = {
 	lastSnapshot: META_LAST_SNAPSHOT,
 	lastSnapshotWritten: META_LAST_SNAPSHOT_WRITTEN,
 	durabilityFloor: META_DURABILITY_FLOOR,
-	backfillLost: META_BACKFILL_LOST
+	backfillLost: META_BACKFILL_LOST,
+	/** The guardian-set generation (wire 5.9); absent reads as 1. */
+	generation: 'guardian_generation_v1'
 } as const;
 
 /** Deltas between full-state snapshot frames. */

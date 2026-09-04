@@ -36,7 +36,10 @@ import {
 	IGuardianSyncEpochResponse,
 	IGuardianSyncRecordRequest,
 	IGuardianSyncRecordResponse,
-	IGuardianTakeoverCertificate
+	IGuardianTakeoverCertificate,
+	IGuardianRotateSetRequest,
+	IGuardianRotateSetResponse,
+	IGuardianTransportHint
 } from './guardian';
 
 export const GUARDIAN_CONTENT_TYPE = 'application/x-protobuf';
@@ -457,6 +460,7 @@ export function encodeRegisterNodeRequest(
 	for (const member of request.guardianMembers) {
 		writer.bytes(5, member);
 	}
+	writer.uint(6, request.generation);
 	return writer.finish();
 }
 
@@ -468,7 +472,8 @@ export function decodeRegisterNodeRequest(
 		guardianSetId: EMPTY(),
 		guardianMembers: [],
 		initialState: decodeGuardianState(EMPTY()),
-		rootSignature: EMPTY()
+		rootSignature: EMPTY(),
+		generation: 0n
 	};
 	const reader = new ProtoReader(buf);
 	while (!reader.done) {
@@ -483,6 +488,8 @@ export function decodeRegisterNodeRequest(
 			request.rootSignature = reader.readBytes();
 		} else if (field === 5 && wireType === WIRE_LEN) {
 			request.guardianMembers.push(reader.readBytes());
+		} else if (field === 6 && wireType === WIRE_VARINT) {
+			request.generation = reader.readVarint();
 		} else {
 			reader.skip(wireType);
 		}
@@ -766,6 +773,11 @@ export function encodeGetHeadResponse(
 			? encodeRegisterNodeRequest(response.registration)
 			: undefined
 	);
+	if (response.generation !== undefined) writer.uint(8, response.generation);
+	writer.message(
+		9,
+		response.rotation ? encodeRotateSetRequest(response.rotation) : undefined
+	);
 	return writer.finish();
 }
 
@@ -789,6 +801,10 @@ export function decodeGetHeadResponse(buf: Buffer): IGuardianGetHeadResponse {
 			response.possiblyStale = reader.readVarint() !== 0n;
 		} else if (field === 7 && wireType === WIRE_LEN) {
 			response.registration = decodeRegisterNodeRequest(reader.readBytes());
+		} else if (field === 8 && wireType === WIRE_VARINT) {
+			response.generation = reader.readVarint();
+		} else if (field === 9 && wireType === WIRE_LEN) {
+			response.rotation = decodeRotateSetRequest(reader.readBytes());
 		} else {
 			reader.skip(wireType);
 		}
@@ -969,6 +985,111 @@ export function decodeSyncEpochResponse(
 			response.certificate = decodeTakeoverCertificate(reader.readBytes());
 		} else if (field === 4 && wireType === WIRE_LEN) {
 			response.receipt = decodeReceipt(reader.readBytes());
+		} else {
+			reader.skip(wireType);
+		}
+	}
+	return response;
+}
+
+// ─────────────── ROTATE_SET (wire 5.11) ───────────────
+
+export function encodeRotateSetRequest(
+	request: IGuardianRotateSetRequest
+): Buffer {
+	const writer = new ProtoWriter();
+	writer.uint(1, request.protocolVersion);
+	writer.bytes(2, request.guardianSetId);
+	writer.bytes(3, request.recoveryId);
+	writer.bytes(4, request.newGuardianSetId);
+	writer.uint(5, request.generation);
+	for (const member of request.newMembers) writer.bytes(6, member);
+	writer.bytes(7, request.rootSignature);
+	for (const transport of request.newTransports) {
+		const inner = new ProtoWriter();
+		inner.string(1, transport.type);
+		inner.string(2, transport.url);
+		writer.message(8, inner.finish());
+	}
+	return writer.finish();
+}
+
+function decodeTransportHint(buf: Buffer): IGuardianTransportHint {
+	const hint: IGuardianTransportHint = { type: '', url: '' };
+	const reader = new ProtoReader(buf);
+	while (!reader.done) {
+		const { field, wireType } = reader.readTag();
+		if (field === 1 && wireType === WIRE_LEN) hint.type = reader.readString();
+		else if (field === 2 && wireType === WIRE_LEN)
+			hint.url = reader.readString();
+		else reader.skip(wireType);
+	}
+	return hint;
+}
+
+export function decodeRotateSetRequest(buf: Buffer): IGuardianRotateSetRequest {
+	const request: IGuardianRotateSetRequest = {
+		protocolVersion: 0,
+		guardianSetId: EMPTY(),
+		recoveryId: EMPTY(),
+		newGuardianSetId: EMPTY(),
+		generation: 0n,
+		newMembers: [],
+		rootSignature: EMPTY(),
+		newTransports: []
+	};
+	const reader = new ProtoReader(buf);
+	while (!reader.done) {
+		const { field, wireType } = reader.readTag();
+		if (field === 1 && wireType === WIRE_VARINT) {
+			request.protocolVersion = reader.readUint32();
+		} else if (field === 2 && wireType === WIRE_LEN) {
+			request.guardianSetId = reader.readBytes();
+		} else if (field === 3 && wireType === WIRE_LEN) {
+			request.recoveryId = reader.readBytes();
+		} else if (field === 4 && wireType === WIRE_LEN) {
+			request.newGuardianSetId = reader.readBytes();
+		} else if (field === 5 && wireType === WIRE_VARINT) {
+			request.generation = reader.readVarint();
+		} else if (field === 6 && wireType === WIRE_LEN) {
+			request.newMembers.push(reader.readBytes());
+		} else if (field === 7 && wireType === WIRE_LEN) {
+			request.rootSignature = reader.readBytes();
+		} else if (field === 8 && wireType === WIRE_LEN) {
+			request.newTransports.push(decodeTransportHint(reader.readBytes()));
+		} else {
+			reader.skip(wireType);
+		}
+	}
+	return request;
+}
+
+export function encodeRotateSetResponse(
+	response: IGuardianRotateSetResponse
+): Buffer {
+	const writer = new ProtoWriter();
+	writer.uint(1, response.status);
+	writer.string(2, response.detail ?? '');
+	writer.message(
+		3,
+		response.rotation ? encodeRotateSetRequest(response.rotation) : undefined
+	);
+	return writer.finish();
+}
+
+export function decodeRotateSetResponse(
+	buf: Buffer
+): IGuardianRotateSetResponse {
+	const response: IGuardianRotateSetResponse = { status: 0 };
+	const reader = new ProtoReader(buf);
+	while (!reader.done) {
+		const { field, wireType } = reader.readTag();
+		if (field === 1 && wireType === WIRE_VARINT) {
+			response.status = reader.readUint32();
+		} else if (field === 2 && wireType === WIRE_LEN) {
+			response.detail = reader.readString();
+		} else if (field === 3 && wireType === WIRE_LEN) {
+			response.rotation = decodeRotateSetRequest(reader.readBytes());
 		} else {
 			reader.skip(wireType);
 		}
