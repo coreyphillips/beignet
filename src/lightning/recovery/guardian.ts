@@ -232,6 +232,13 @@ export interface IGuardianInfoResponse {
 	maxCiphertextBytes: number;
 	maxRecordsPerGet: number;
 	rateLimitPerMinute: number;
+	/**
+	 * A HOST that registers sets on demand (wire 2.7): a writer binding to it
+	 * accepts the set being absent from guardianSetIds, because it appears
+	 * only once REGISTER_NODE has run. A configured single-set guardian says
+	 * false, and its set is always listed.
+	 */
+	acceptsRegistrations: boolean;
 }
 
 /**
@@ -478,7 +485,8 @@ export class ReferenceGuardian {
 			guardianSetIds: [Buffer.from(this.guardianSetId)],
 			maxCiphertextBytes: this.maxCiphertextBytes,
 			maxRecordsPerGet: this.maxRecordsPerGet,
-			rateLimitPerMinute: 0
+			rateLimitPerMinute: 0,
+			acceptsRegistrations: false
 		};
 	}
 

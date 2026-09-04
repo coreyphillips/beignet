@@ -383,6 +383,24 @@ Three very different restore modes:
   exact channel state and RESUMES the channels via `channel_reestablish`
   instead of force-closing. See "Guardian recovery" next.
 
+#### Hosting a guardian (bolt8)
+
+Any beignet node that listens for peers can serve the reference guardian to
+other beignet nodes (docs/RECOVERY-GUARDIAN-WIRE.md 2.7, issue #699). Start
+it with `BEIGNET_GUARDIAN_SERVE=true`; the guardian is reached at the node's
+ordinary Lightning address, over a dedicated BOLT 8 session the writer opens
+under a fresh key, so the host never learns which Lightning node it guards.
+Its guardian id is derived from the node seed, so a node rebuilt from its seed
+keeps the same id. A wallet adds it by resolving the node's URI
+(`beignet recovery resolve-guardian <node id>@host:port`, or the daemon's
+`POST /recovery/resolve-guardian`) to an entry of the form
+`<guardianId>@bolt8://<node id>@host:port`, and pins that in
+`BEIGNET_RECOVERY_GUARDIANS` like any other guardian. A host keeps serving
+while its own writer lease is quarantined (the guardian-only lane), so nodes
+that guard each other can restart together. Quotas
+(`BEIGNET_GUARDIAN_MAX_BYTES`, `_MAX_SETS`) refuse new writes rather than
+delete, because pruning a namespace wedges a stranger's node for good.
+
 #### Guardian recovery (Recovery Protocol)
 
 The Recovery Protocol (docs/RECOVERY-PROTOCOL.md) is configured entirely
@@ -1613,6 +1631,8 @@ beignet recovery restore-capsule  # peer-storage mode: restore from the
                             # guardian-backed capsule WITHOUT fencing the
                             # old writer (never for quorum journals)
 beignet recovery capsule-guardians  # the best retrieved capsule's guardian set
+beignet recovery resolve-guardian <node id>@host:port  # a beignet node as a guardian entry
+beignet guardian status             # the guardian this node serves to others
                             # with credentials, as config entries
 ```
 
@@ -1740,6 +1760,11 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_RECOVERY_PROFILE` | Recovery fault-model profile; `crash-v1` is the only accepted value and the default |
 | `BEIGNET_RECOVERY_LEASE_CHECK_MS` | Guardian modes: idle writer lease re-check cadence in ms, an integer in 0..2147483647 (default: 300000; 0 disables; anything else refuses startup) |
 | `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS` | peer-storage mode: how long an unknown channel's `channel_reestablish` is held before the BOLT 1 error goes out, an integer in 0..2147483647 (default: 600000; 0 answers immediately; anything else refuses startup) |
+| `BEIGNET_GUARDIAN_SERVE` | `true` to serve the reference guardian to other beignet nodes over bolt8 sessions at this node's Lightning address (docs/RECOVERY-GUARDIAN-WIRE.md 2.7); needs `BEIGNET_LISTEN_PORT`. Independent of this node's own recovery mode, and kept serving while this node's own writer lease is quarantined |
+| `BEIGNET_GUARDIAN_TOKEN` | Bearer token every guardian session must present; unset runs open (BOLT 8 already encrypts and authenticates the host, so the token is an allow-list) |
+| `BEIGNET_GUARDIAN_MAX_BYTES` | Disk one served guardian set may occupy before its writes are refused with `ERR_QUOTA_EXCEEDED` (default 268435456). Refuses, never deletes |
+| `BEIGNET_GUARDIAN_MAX_SETS` | Guardian sets this node will register (default 16) |
+| `BEIGNET_GUARDIAN_MAX_CIPHERTEXT_BYTES` | Advertised per-record ciphertext limit (default 4194304; protocol cap 16 MiB) |
 | `BEIGNET_RECOVERY_AUTO_APPLY` | peer-storage mode: on a boot whose database is empty, apply the best Recovery Capsule the storage peers return with no operator call and rebuild the node in-process on it (exact `true`/`false`; default off; refused outside peer-storage mode). Cannot fence a previous device that still runs |
 | `BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS` | Auto-apply settle floor from the first capsule's arrival, so a slower replica still competes for the selection (default: 15000) |
 | `BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS` | Auto-apply ceiling from the first arrival; storage peers that never connect are not waited for past it (default: 120000; must be at least the settle floor and below `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS`) |
@@ -1946,6 +1971,8 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`restart-required`/`fenced`), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session (`capsules`, whose `best` names the guardian locators the capsule carries, credentials redacted), plus `autoApply` (the automatic capsule application: enabled, phase, settleUntil, lastReason). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
 | POST | `/recovery/restore` | `{ confirm: true }` | Restore from guardian replicas and start the node on the restored state (restore-pending daemons only; channels RESUME instead of force-closing; the takeover permanently fences the previous writer). Progress streams over SSE as `recovery:restore-progress` |
 | POST | `/recovery/restore-capsule` | `{ confirm: true, unfenced?: boolean }` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session. Tier 2 installs the exact state into a fresh database and holds the daemon until a restart (503 `NODE_RESTART_REQUIRED` elsewhere); Tier 1 recovers the embedded SCB on the live node. Progress streams over SSE as `recovery:restore-progress` |
+| GET | `/guardian/status` | -- | The guardian this node serves to others: `{ serving }` plus guardian id, token requirement, sessions, served sets (members, namespaces, bytes) and limits |
+| POST | `/recovery/resolve-guardian` | `{ uri }` | A beignet node's `<node id>@host:port` to a guardian entry `<guardianId>@bolt8://<node id>@host:port`, by asking its guardian over a bolt8 session. Adopts nothing |
 | POST | `/recovery/capsule-guardians` | `{ confirm: true }` | The guardian set the best retrieved capsule names, INCLUDING transport credentials, as config-file entries for `recoveryGuardians`. The status route redacts credentials; this admin handoff is how a seed restore whose guardians need authentication gets them back. Nothing is adopted or persisted |
 | POST | `/stop` | `{ drain?, drainTimeoutMs? }` | Stop daemon. `drain: true` waits for in-flight payments before shutting down. |
 

@@ -331,8 +331,10 @@ describe('guardian host', () => {
 			record(alice, SET_A, 1n, Buffer.alloc(32))
 		);
 		expect(put.status).to.equal(GuardianStatus.ERR_UNKNOWN_SET);
+		// Reads answer "no namespace", which is what lets a fresh writer's
+		// ownership check conclude "register" against a host.
 		const head = await a.client.getHead(alice.root.recoveryId);
-		expect(head.status).to.equal(GuardianStatus.ERR_UNKNOWN_SET);
+		expect(head.status).to.equal(GuardianStatus.ERR_UNKNOWN_NODE);
 	});
 
 	it('caps the number of sets and the bytes per set, refusing rather than deleting', async () => {

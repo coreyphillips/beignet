@@ -203,7 +203,8 @@ export class GuardianHost implements IGuardianResolver {
 			),
 			maxCiphertextBytes: this.maxCiphertextBytes,
 			maxRecordsPerGet: MAX_RECORDS_PER_GET,
-			rateLimitPerMinute: 0
+			rateLimitPerMinute: 0,
+			acceptsRegistrations: this.sets.size < this.maxSets
 		};
 	}
 
@@ -284,6 +285,17 @@ export class GuardianHost implements IGuardianResolver {
 			}
 		}
 		if (!served) {
+			// A read on a set nobody registered is a truthful "no namespace
+			// here" (wire 2.6): the writer's ownership check relies on
+			// ERR_UNKNOWN_NODE meaning "fresh, register", and a host serves a
+			// set only once that registration has run. Writes other than
+			// registration name a set that does not exist here.
+			if (verb === 'get_head' || verb === 'get_state') {
+				return refuse(
+					GuardianStatus.ERR_UNKNOWN_NODE,
+					'recovery_id not registered: this host does not serve the set yet'
+				);
+			}
 			return refuse(
 				GuardianStatus.ERR_UNKNOWN_SET,
 				'guardian_set_id is not served by this host; register it first'

@@ -7294,7 +7294,15 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
-		this.assertPeerContactPermitted('listen');
+		// A quarantined node may not contact channel peers, and normally does
+		// not even listen. A node that HOSTS a guardian listens anyway
+		// (issue #699 D6): the connection gate still destroys ordinary inbound
+		// before the handshake, and the guardian-only lane is all a socket
+		// can become until ownership is confirmed. Fenced and frozen nodes
+		// still refuse (guardianHostAdmitsLane is false for them).
+		if (!this.guardianHostAdmitsLane()) {
+			this.assertPeerContactPermitted('listen');
+		}
 		await this.peerManager.listen(port, host);
 	}
 
@@ -20311,6 +20319,7 @@ export class LightningNode extends EventEmitter {
 			autoTuneFees?: IAutoTuneFeesConfig;
 			watchtowers?: string[];
 			recovery?: INodeConfig['recovery'];
+			guardianHost?: INodeConfig['guardianHost'];
 			channelKeyDeriver?: (
 				channelIndex: number
 			) => import('../channel/channel-manager').IPerChannelKeys;
@@ -20386,6 +20395,7 @@ export class LightningNode extends EventEmitter {
 			autoTuneFees: options?.autoTuneFees,
 			watchtowers: options?.watchtowers,
 			recovery: options?.recovery,
+			guardianHost: options?.guardianHost,
 			channelKeyDeriver
 		});
 	}

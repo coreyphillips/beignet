@@ -457,6 +457,31 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			cliFlags.recoveryAutoApplyMaxWaitMs ??
 			integerEnv(process.env.BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS) ??
 			file.recoveryAutoApplyMaxWaitMs,
+		// Guardian hosting (issue #699): exact true/false, like auto-apply.
+		guardianServe:
+			cliFlags.guardianServe ??
+			(process.env.BEIGNET_GUARDIAN_SERVE === 'true'
+				? true
+				: process.env.BEIGNET_GUARDIAN_SERVE === 'false'
+				? false
+				: undefined) ??
+			file.guardianServe,
+		guardianToken:
+			cliFlags.guardianToken ||
+			process.env.BEIGNET_GUARDIAN_TOKEN ||
+			file.guardianToken,
+		guardianMaxBytesPerSet:
+			cliFlags.guardianMaxBytesPerSet ??
+			integerEnv(process.env.BEIGNET_GUARDIAN_MAX_BYTES) ??
+			file.guardianMaxBytesPerSet,
+		guardianMaxSets:
+			cliFlags.guardianMaxSets ??
+			integerEnv(process.env.BEIGNET_GUARDIAN_MAX_SETS) ??
+			file.guardianMaxSets,
+		guardianMaxCiphertextBytes:
+			cliFlags.guardianMaxCiphertextBytes ??
+			integerEnv(process.env.BEIGNET_GUARDIAN_MAX_CIPHERTEXT_BYTES) ??
+			file.guardianMaxCiphertextBytes,
 		// Routing fee defaults and the lease seller policy use ?? throughout:
 		// a configured 0 (free base fee, zero ppm) is a real policy and must
 		// survive the merge.

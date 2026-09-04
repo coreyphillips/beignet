@@ -346,6 +346,8 @@ async function main(): Promise<void> {
 			return handleRestore();
 		case 'recovery':
 			return handleRecovery();
+		case 'guardian':
+			return handleGuardian();
 		default:
 			output({
 				ok: false,
@@ -459,6 +461,9 @@ async function handleStart(): Promise<void> {
 	const recoveryProfileFlag = parseFlag('--recovery-profile');
 	if (recoveryProfileFlag) cliFlags.recoveryProfile = recoveryProfileFlag;
 	if (hasFlag('--recovery-auto-apply')) cliFlags.recoveryAutoApply = true;
+	if (hasFlag('--guardian-serve')) cliFlags.guardianServe = true;
+	const guardianTokenFlag = parseFlag('--guardian-token');
+	if (guardianTokenFlag) cliFlags.guardianToken = guardianTokenFlag;
 
 	const config = resolveConfig(cliFlags);
 
@@ -2394,6 +2399,22 @@ async function handleBackup(): Promise<void> {
 	return outputResult(await httpRequest('POST', '/backup', { destPath: sub }));
 }
 
+async function handleGuardian(): Promise<void> {
+	const sub = filteredArgs[1];
+	if (sub === 'status') {
+		// The guardian this node serves to others (issue #699): the sets, their
+		// sizes, the sessions, the limits.
+		return outputResult(await httpRequest('GET', '/guardian/status'));
+	}
+	output({
+		ok: false,
+		error: {
+			code: 'INVALID_PARAMS',
+			message: 'Usage: beignet guardian status'
+		}
+	});
+}
+
 async function handleRecovery(): Promise<void> {
 	const sub = filteredArgs[1];
 	if (sub === 'status') {
@@ -2435,13 +2456,34 @@ async function handleRecovery(): Promise<void> {
 			})
 		);
 	}
+	if (sub === 'resolve-guardian') {
+		// A beignet node's Lightning URI to a guardian entry (issue #699):
+		// asks the node's guardian for its id over a bolt8 session. Adopts
+		// nothing; the entry is for the operator to pin.
+		const uri = filteredArgs[2];
+		if (!uri) {
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message:
+						'Usage: beignet recovery resolve-guardian <node id>@host:port'
+				}
+			});
+			return;
+		}
+		return outputResult(
+			await httpRequest('POST', '/recovery/resolve-guardian', { uri })
+		);
+	}
 	output({
 		ok: false,
 		error: {
 			code: 'INVALID_PARAMS',
 			message:
 				'Usage: beignet recovery status | beignet recovery restore | ' +
-				'beignet recovery restore-capsule | beignet recovery capsule-guardians'
+				'beignet recovery restore-capsule | beignet recovery capsule-guardians | ' +
+				'beignet recovery resolve-guardian <uri>'
 		}
 	});
 	process.exitCode = 1;
@@ -2696,6 +2738,14 @@ On-chain:
   recovery capsule-guardians             The guardian set the best retrieved
                                          capsule names, credentials included, as
                                          config entries for recoveryGuardians
+  recovery resolve-guardian <uri>        A beignet node's Lightning URI
+                                         (<node id>@host:port) to a guardian entry
+                                         <guardianId>@bolt8://<node id>@host:port,
+                                         by asking its guardian over a bolt8
+                                         session. Adopts nothing
+  guardian status                        The guardian this node serves to others:
+                                         sets, sizes, sessions, limits (needs
+                                         --guardian-serve)
 
 Peers:
   peer connect <pubkey> <host> <port>    Connect to peer
@@ -2946,6 +2996,14 @@ Start flags:
   --recovery-profile <name>              Recovery fault-model profile; crash-v1 is
                                          the only accepted value and the default
                                          (env BEIGNET_RECOVERY_PROFILE)
+  --guardian-serve                       Serve the reference guardian to other
+                                         beignet nodes at this node's Lightning
+                                         address, over bolt8 sessions; needs
+                                         --listen-port (env BEIGNET_GUARDIAN_SERVE;
+                                         BEIGNET_GUARDIAN_TOKEN, _MAX_BYTES,
+                                         _MAX_SETS, _MAX_CIPHERTEXT_BYTES tune it)
+  --guardian-token <token>               Bearer token guardian sessions must present
+                                         (default: open; env BEIGNET_GUARDIAN_TOKEN)
   --recovery-auto-apply                  peer-storage mode: on a boot whose database
                                          is empty, apply the best Recovery Capsule the
                                          storage peers return with no operator call,

@@ -95,6 +95,28 @@ export function isPrivateOrLoopbackHost(host: string): boolean {
 	return false;
 }
 
+/**
+ * A socket factory that dials through a SOCKS5 proxy (Tor), shared by the
+ * peer manager and by guardian sessions to onion hosts (recovery
+ * guardian-bolt8.ts). Tor circuit establishment can hang for minutes;
+ * without the timeout the SOCKS negotiation has no deadline of its own
+ * (SocksClient destroys its socket on timeout, so nothing leaks).
+ */
+export function socks5SocketFactory(
+	proxy: { host: string; port: number },
+	timeoutMs = 20_000
+): (host: string, port: number) => Promise<net.Socket> {
+	return async (host: string, port: number): Promise<net.Socket> => {
+		const { socket } = await SocksClient.createConnection({
+			proxy: { host: proxy.host, port: proxy.port, type: 5 },
+			command: 'connect',
+			destination: { host, port },
+			timeout: timeoutMs
+		});
+		return socket;
+	};
+}
+
 export interface IPeerManagerOptions {
 	/** Local node private key (32 bytes) */
 	localPrivateKey: Buffer;
@@ -1461,19 +1483,7 @@ export class PeerManager extends EventEmitter {
 		host: string;
 		port: number;
 	}): (host: string, port: number) => Promise<net.Socket> {
-		return async (host: string, port: number): Promise<net.Socket> => {
-			const { socket } = await SocksClient.createConnection({
-				proxy: { host: proxy.host, port: proxy.port, type: 5 },
-				command: 'connect',
-				destination: { host, port },
-				// Tor circuit establishment can hang for minutes; without this the
-				// SOCKS negotiation has no deadline of its own (SocksClient destroys
-				// its socket on timeout, so nothing leaks). Configurable so callers
-				// (and tests) can fail fast instead of waiting out a stalled proxy.
-				timeout: this.socks5TimeoutMs
-			});
-			return socket;
-		};
+		return socks5SocketFactory(proxy, this.socks5TimeoutMs);
 	}
 
 	private scheduleReconnect(pubkey: string): void {

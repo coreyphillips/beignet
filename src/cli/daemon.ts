@@ -454,6 +454,11 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'recovery:guardian_unreachable',
 		'recovery:restore-progress',
 		'recovery:restored',
+		// Guardian hosting (issue #699): a set this node started serving, a
+		// quota refusal, a session that violated framing.
+		'guardian:set-registered',
+		'guardian:quota-refused',
+		'guardian:session-violation',
 		// JIT receive, LSP side (issue #669): the progress of a funding this
 		// node fronts for a wallet, from the intent it accepted to the parts it
 		// forwarded. Low volume (one intent, one funding, one forward per
@@ -748,6 +753,52 @@ async function bootDaemon(
 				`"${opts.recoveryMode ?? 'off'}" (resolved: ${recoveryMode}); ` +
 				'guardians need async-remote or quorum'
 		);
+	}
+	// Guardian hosting (issue #699): a guardian nobody can dial is a
+	// misconfiguration, so serving needs an inbound listener; the limits are
+	// positive integers and the ciphertext cap stays under the protocol's.
+	if (
+		opts.guardianServe !== undefined &&
+		typeof opts.guardianServe !== 'boolean'
+	) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'guardianServe must be a boolean (BEIGNET_GUARDIAN_SERVE is exactly true or false)'
+		);
+	}
+	if (opts.guardianServe === true && !opts.listenPort) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'guardianServe needs listenPort: a guardian is reached at this ' +
+				"node's Lightning address (BEIGNET_LISTEN_PORT)"
+		);
+	}
+	if (
+		opts.guardianToken !== undefined &&
+		typeof opts.guardianToken !== 'string'
+	) {
+		throw new BeignetError('INVALID_PARAMS', 'guardianToken must be a string');
+	}
+	for (const [name, value, max] of [
+		[
+			'guardianMaxBytesPerSet',
+			opts.guardianMaxBytesPerSet,
+			Number.MAX_SAFE_INTEGER
+		],
+		['guardianMaxSets', opts.guardianMaxSets, 65535],
+		[
+			'guardianMaxCiphertextBytes',
+			opts.guardianMaxCiphertextBytes,
+			16 * 1024 * 1024
+		]
+	] as Array<[string, number | undefined, number]>) {
+		if (value === undefined) continue;
+		if (!Number.isInteger(value) || value < 1 || value > max) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`${name} must be an integer between 1 and ${max}`
+			);
+		}
 	}
 	// Routing fee defaults ride in channel_update as u32/u32/u16 (BOLT 7),
 	// so a value the wire cannot hold refuses startup here, naming the env
@@ -2439,6 +2490,18 @@ async function bootDaemon(
 		// Distinct from the SCB flows above: an SCB restore force-closes every
 		// channel; a guardian restore RESUMES them from replicated state.
 		'GET /recovery/status': () => success(node.getRecoverySurfaceStatus()),
+		// The guardian this node serves to OTHER nodes (issue #699), and the
+		// resolver that turns a beignet node's Lightning URI into a guardian
+		// entry. Resolving adopts nothing: pinning a set is the operator's
+		// explicit action, with the permanence named (#692).
+		'GET /guardian/status': () => success(node.getGuardianHostSurfaceStatus()),
+		'POST /recovery/resolve-guardian': async (body) => {
+			const { uri } = body as { uri?: string };
+			if (typeof uri !== 'string' || uri.length === 0) {
+				return failure('INVALID_PARAMS', 'uri required (<node id>@host:port)');
+			}
+			return success(await node.resolveGuardianUri(uri));
+		},
 		'POST /recovery/restore': async (body) => {
 			// The epoch takeover permanently fences any still-running old
 			// writer, so a bare POST must not trigger it by accident.

@@ -697,7 +697,13 @@ export async function verifyGuardianBindings(
 				)}, not the expected ${key}`
 			);
 		}
-		if (!info.guardianSetIds.some((id) => id.equals(context.guardianSetId))) {
+		// A host that registers sets on demand lists a set only after
+		// REGISTER_NODE has run (wire 2.7), so its willingness stands in for
+		// the listing until then; a configured guardian must list the set.
+		if (
+			!info.guardianSetIds.some((id) => id.equals(context.guardianSetId)) &&
+			!info.acceptsRegistrations
+		) {
 			throw new GuardianBindingError(
 				`guardian ${key} does not serve the configured guardian set`
 			);

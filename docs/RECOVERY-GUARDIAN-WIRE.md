@@ -219,6 +219,13 @@ messages than it allows), and answers a declared length over its cap with
 transportStatus 413 once while swallowing that id's remaining chunks, so
 the stream stays usable.
 
+A host serves a set only once REGISTER_NODE has run for it (5.1). Before
+that, GET_HEAD and GET_STATE for the set answer `ERR_UNKNOWN_NODE`, which
+is the truthful "no namespace here" a writer's ownership check reads as
+"fresh, register"; every other verb but REGISTER_NODE answers
+`ERR_UNKNOWN_SET`. INFO advertises `accepts_registrations` so a writer
+binding to the host accepts the set being absent from its list.
+
 `transportStatus` is the 2.5 HTTP-layer status, one to one: 200 for every
 well-formed protocol exchange INCLUDING protocol-level rejections (the
 result lives in the body's `status` field), 401 refused credential, 404
@@ -597,8 +604,12 @@ certificate (issued now if it never issued one) and a fresh RECEIPT.
 
 `GET /beignet-guardian/v1/info` returns the InfoResponse message
 (section 6): guardianId, supported protocol version range as integer
-fields, the guardian_set_ids served, size limits, and rate-limit hints.
-Discovery only; nothing in INFO is signed or load-bearing for safety.
+fields, the guardian_set_ids served, size limits, rate-limit hints, and
+whether the guardian registers sets on demand (`accepts_registrations`, a
+host per 2.7). A writer binding to a guardian requires its set to be listed
+OR the guardian to accept registrations, since a host lists a set only once
+REGISTER_NODE has run. Discovery only; nothing in INFO is signed or
+load-bearing for safety.
 
 ### 5.9 Guardian-set replacement: UNSUPPORTED in protocol v1, literally
 
@@ -864,6 +875,11 @@ message InfoResponse {
   uint64 max_ciphertext_bytes = 5;
   uint32 max_records_per_get  = 6;
   uint32 rate_limit_per_minute = 7; // 0 = unspecified
+  uint32 accepts_registrations = 8; // 1: a host that registers sets on
+                                    // demand (2.7); the set appears in
+                                    // guardian_set_ids only after
+                                    // REGISTER_NODE. A configured guardian
+                                    // omits it and always lists its set
 }
 ```
 

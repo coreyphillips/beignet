@@ -686,6 +686,25 @@ export interface BeignetConfig {
 	 *  hold, which is the window this automation exists to beat. Env:
 	 *  BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS. */
 	recoveryAutoApplyMaxWaitMs?: number;
+	/** Serve the reference guardian to other nodes over bolt8 sessions at
+	 *  this node's Lightning address (docs/RECOVERY-GUARDIAN-WIRE.md 2.7,
+	 *  issue #699). Needs listenPort. Independent of this node's own
+	 *  recovery mode. Env: BEIGNET_GUARDIAN_SERVE (exact true/false). */
+	guardianServe?: boolean;
+	/** Bearer token every guardian session must present; absent runs open
+	 *  (BOLT 8 already encrypts and authenticates the host, so the token is
+	 *  an allow-list, not confidentiality). Env: BEIGNET_GUARDIAN_TOKEN. */
+	guardianToken?: string;
+	/** Disk one guardian set may occupy before its writes are refused with
+	 *  ERR_QUOTA_EXCEEDED (default 268435456, 256 MiB). Refuses, never
+	 *  deletes. Env: BEIGNET_GUARDIAN_MAX_BYTES. */
+	guardianMaxBytesPerSet?: number;
+	/** Guardian sets this node will register (default 16). Env:
+	 *  BEIGNET_GUARDIAN_MAX_SETS. */
+	guardianMaxSets?: number;
+	/** Advertised per-record ciphertext limit (default 4194304, 4 MiB; the
+	 *  protocol cap is 16 MiB). Env: BEIGNET_GUARDIAN_MAX_CIPHERTEXT_BYTES. */
+	guardianMaxCiphertextBytes?: number;
 	/** Node-wide default routing fee policy advertised in channel_update
 	 *  (BOLT 7; base u32 msat, proportional u32 millionths, cltv delta u16).
 	 *  Per-channel overrides set through the channel policy update surface win

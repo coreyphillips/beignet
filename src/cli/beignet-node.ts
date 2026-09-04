@@ -97,8 +97,18 @@ import {
 	chainPromisedQuorum,
 	deriveRecoveryMasterKey,
 	PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES,
-	GuardianTransportType
+	GuardianTransportType,
+	GuardianClient,
+	IBolt8GuardianTransport,
+	IGuardianHostEvent,
+	IGuardianHostStatus,
+	bolt8GuardianTransport,
+	deriveGuardianRoot,
+	isOnionV3Hostname,
+	parseBolt8GuardianUrl
 } from '../lightning/recovery';
+import { socks5SocketFactory } from '../lightning/transport/peer-manager';
+import { parsePeerUri } from '../lightning/transport/peer-uri';
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import {
 	DF_HARD_MIN_OFFER_AMOUNT_SAT,
@@ -446,6 +456,22 @@ export interface BeignetNodeOptions {
 	/** Ceiling in ms from the first arrival (default 120000); must be at
 	 *  least the settle floor and fit inside recoveryReestablishHoldMs. */
 	recoveryAutoApplyMaxWaitMs?: number;
+	/**
+	 * Serve the reference guardian to other nodes over bolt8 sessions at
+	 * this node's Lightning address (docs/RECOVERY-GUARDIAN-WIRE.md 2.7,
+	 * issue #699). Needs an inbound listener (listenPort). Independent of
+	 * this node's own recovery mode, and kept serving while this node's own
+	 * writer lease is quarantined (the guardian-only lane).
+	 */
+	guardianServe?: boolean;
+	/** Bearer token every guardian session must present; absent runs open. */
+	guardianToken?: string;
+	/** Disk one served set may occupy before writes are refused (256 MiB). */
+	guardianMaxBytesPerSet?: number;
+	/** Sets this node will register (default 16). */
+	guardianMaxSets?: number;
+	/** Advertised per-record ciphertext limit (default 4 MiB). */
+	guardianMaxCiphertextBytes?: number;
 	/**
 	 * Encrypt the SQLite database at rest with a key derived from the wallet
 	 * seed (default true). An existing plaintext database is migrated in place
@@ -2168,6 +2194,31 @@ export class BeignetNode extends EventEmitter {
 			logger: this.logger,
 			sweepDestinationScript,
 			socks5Proxy,
+			...(opts.guardianServe
+				? {
+						guardianHost: {
+							path: path.join(this.dataDir, 'guardian'),
+							guardianSecret: deriveGuardianRoot(this.nodeSecret())
+								.guardianSecret,
+							token: opts.guardianToken,
+							maxBytesPerSet: opts.guardianMaxBytesPerSet,
+							maxSets: opts.guardianMaxSets,
+							maxCiphertextBytes: opts.guardianMaxCiphertextBytes,
+							onEvent: (event: IGuardianHostEvent): void => {
+								this.log(
+									event.type === 'guardian:set-registered' ? 'info' : 'warn',
+									`Guardian host: ${event.type}`,
+									{ detail: event.detail, setId: event.setId, peer: event.peer }
+								);
+								this.emit(event.type, {
+									detail: event.detail,
+									...(event.setId ? { setId: event.setId } : {}),
+									...(event.peer ? { peer: event.peer } : {})
+								});
+							}
+						}
+				  }
+				: {}),
 			peerStorageEnabled: this.peerStorageEnabled,
 			autoRebalance: opts.autoRebalance,
 			autoTuneFees: opts.autoTuneFees,
@@ -2826,6 +2877,8 @@ export class BeignetNode extends EventEmitter {
 			nodeSecret: this.nodeSecret(),
 			durability: mode,
 			guardians,
+			transportFor: (guardian): IBolt8GuardianTransport | undefined =>
+				this.guardianTransportFor(guardian, opts),
 			onBarrierEvent: (event) => {
 				if (event.type === 'barrier:unreachable') {
 					this.log('warn', 'Recovery guardian unreachable', {
@@ -4046,6 +4099,142 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/** Node identity secret; the capsule key and its embedded SCB derive from it. */
+	/**
+	 * One bolt8 transport per daemon (issue #699 D3): sessions persist across
+	 * requests, which is what keeps the quorum barrier's per-commitment round
+	 * trips to an established circuit. Onion hosts dial through the daemon's
+	 * Tor proxy; LAN and clearnet hosts dial directly. HTTP guardians keep the
+	 * client's default transport (returning undefined here).
+	 */
+	private _bolt8Transport: IBolt8GuardianTransport | null = null;
+
+	private guardianTransportFor(
+		guardian: IParsedGuardian,
+		opts: BeignetNodeOptions
+	): IBolt8GuardianTransport | undefined {
+		if (!guardian.url.toLowerCase().startsWith('bolt8:')) return undefined;
+		if (!this._bolt8Transport) {
+			const proxy = this.torProxyOf(opts);
+			const viaTor = proxy ? socks5SocketFactory(proxy) : undefined;
+			this._bolt8Transport = bolt8GuardianTransport({
+				createSocket: async (host, port) => {
+					// Only onion hosts ride the proxy: a LAN guardian must not
+					// depend on Tor being up, and a clearnet one need not.
+					if (isOnionV3Hostname(host)) {
+						if (!viaTor) {
+							throw new Error(
+								`guardian ${host} is an onion service but no torProxy is configured`
+							);
+						}
+						return viaTor(host, port);
+					}
+					return net.connect(port, host);
+				}
+			});
+		}
+		return this._bolt8Transport;
+	}
+
+	/** The daemon's Tor SOCKS5 proxy, parsed once from "host:port". */
+	private torProxyOf(
+		opts: BeignetNodeOptions
+	): { host: string; port: number } | undefined {
+		if (!opts.torProxy) return undefined;
+		const [proxyHost, proxyPort] = opts.torProxy.split(':');
+		const port = parseInt(proxyPort, 10);
+		if (!proxyHost || !Number.isFinite(port)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`Invalid torProxy "${opts.torProxy}": expected "host:port"`
+			);
+		}
+		return { host: proxyHost, port };
+	}
+
+	/**
+	 * The guardian this node serves to others (issue #699), for the status
+	 * route: `serving` false when hosting is off.
+	 */
+	getGuardianHostSurfaceStatus(): {
+		serving: boolean;
+	} & Partial<IGuardianHostStatus> {
+		const status = this.node?.getGuardianHostStatus() ?? null;
+		if (!status) return { serving: false };
+		return { serving: true, ...status };
+	}
+
+	/**
+	 * Resolve a beignet node's ordinary Lightning URI (`<node id>@host:port`)
+	 * to a guardian entry (issue #699 D7): open a bolt8 session, ask INFO,
+	 * and hand back `<guardianId>@bolt8://<node id>@host:port` plus what the
+	 * host advertises. Nothing is adopted or persisted; pinning a set stays
+	 * the operator's explicit action.
+	 */
+	async resolveGuardianUri(uri: string): Promise<{
+		guardianId: string;
+		url: string;
+		entry: string;
+		guardianSetIds: string[];
+		maxCiphertextBytes: number;
+	}> {
+		let parsed: ReturnType<typeof parsePeerUri>;
+		try {
+			parsed = parsePeerUri(uri);
+		} catch (error) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`guardian URI "${uri}" is not a <node id>@host:port peer URI: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
+		}
+		if (parsed.transport) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'guardian sessions ride plain TCP; a ws:// peer URI cannot host one'
+			);
+		}
+		const url = parseBolt8GuardianUrl(
+			`bolt8://${parsed.pubkey}@${parsed.host}:${parsed.port}`
+		).url;
+		const opts = this._bootOpts;
+		if (!opts) throw new BeignetError('NOT_READY', 'node is not started');
+		const transport = this.guardianTransportFor(
+			{ guardianId: Buffer.alloc(32), url },
+			opts
+		);
+		const client = new GuardianClient({
+			url,
+			guardianSetId: Buffer.alloc(32),
+			transport,
+			timeoutMs: 15_000
+		});
+		let info: Awaited<ReturnType<GuardianClient['info']>>;
+		try {
+			info = await client.info();
+		} catch (error) {
+			throw new BeignetError(
+				'GUARDIAN_UNREACHABLE',
+				`no guardian answered at ${url}: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
+		} finally {
+			// A probe is not a relationship: drop its session so an unused
+			// candidate does not hold a connection open.
+			this._bolt8Transport?.sessions().get(url)?.close();
+			this._bolt8Transport?.sessions().delete(url);
+		}
+		const guardianId = info.guardianId.toString('hex');
+		return {
+			guardianId,
+			url,
+			entry: `${guardianId}@${url}`,
+			guardianSetIds: info.guardianSetIds.map((id) => id.toString('hex')),
+			maxCiphertextBytes: info.maxCiphertextBytes
+		};
+	}
+
 	private nodeSecret(): Buffer {
 		if (!this._nodeSecret) {
 			this._nodeSecret = deriveLightningKeysFromMnemonic(
@@ -10273,6 +10462,8 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async destroy(): Promise<void> {
+		this._bolt8Transport?.close();
+		this._bolt8Transport = null;
 		if (this.destroyed) return;
 		this.destroyed = true;
 		if (this.backupTimer) {
