@@ -178,6 +178,15 @@ import {
 } from './liquidity-ads';
 import { decodeAnnouncementSignaturesMessage } from '../gossip/messages';
 import { Feature, FeatureFlags } from '../features/flags';
+import { sign as signWithNodeKey } from '../crypto/ecdh';
+import { decodeFforHeader } from '../ffor/messages';
+import {
+	FforAbortReason,
+	FforSlotState,
+	FforState,
+	IFforBookEntry,
+	IFforEpochRecord
+} from '../ffor/types';
 
 /**
  * The outpoints a raw transaction spends, txid in display-order hex (the
@@ -3129,7 +3138,17 @@ export class ChannelManager extends EventEmitter {
 			MessageType.TX_SIGNATURES,
 			MessageType.TX_INIT_RBF,
 			MessageType.TX_ACK_RBF,
-			MessageType.TX_ABORT
+			MessageType.TX_ABORT,
+			// FFOR Variant D: every message begins [32: channel_id][32: epoch_id].
+			MessageType.FF_INIT,
+			MessageType.FF_ACCEPT,
+			MessageType.FF_INVOICES,
+			MessageType.FF_ERROR,
+			MessageType.FF_ACTIVATE,
+			MessageType.FF_ACTIVATE_ACK,
+			MessageType.FF_ABORT,
+			MessageType.FF_CLOSE,
+			MessageType.FF_CLOSE_ACK
 		]);
 
 	/**
@@ -3284,6 +3303,17 @@ export class ChannelManager extends EventEmitter {
 					break;
 				case MessageType.WARNING:
 					this.handleWarningMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_INIT:
+				case MessageType.FF_ACCEPT:
+				case MessageType.FF_INVOICES:
+				case MessageType.FF_ERROR:
+				case MessageType.FF_ACTIVATE:
+				case MessageType.FF_ACTIVATE_ACK:
+				case MessageType.FF_ABORT:
+				case MessageType.FF_CLOSE:
+				case MessageType.FF_CLOSE_ACK:
+					this.handleFforMessage(peerPubkey, type, payload);
 					break;
 				default:
 					break;
@@ -5454,6 +5484,245 @@ export class ChannelManager extends EventEmitter {
 			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),
 			actions
 		};
+	}
+
+	// ─────────────── FFOR Variant D (specs/ffor-offline-receive.md) ───────────────
+
+	/** Last FFOR state reported per channel, for the ffor:state event. */
+	private _fforLastState = new Map<string, FforState | null>();
+
+	/**
+	 * Whether the peer's init features negotiated FFOR: option_ff_receive
+	 * (560/561) and option_quiesce (activation runs under quiescence). True
+	 * when the peer's init is unknown, as for splicing.
+	 */
+	private peerSupportsFfor(peerPubkey: string): boolean {
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (!init) return true;
+		return (
+			init.features.hasFeature(Feature.QUIESCE) &&
+			init.features.hasFeature(Feature.OPTION_FF_RECEIVE)
+		);
+	}
+
+	/** Hand the channel its peer's node id and our node-key signer. */
+	private _fforEnsureContext(peerPubkey: string, channel: Channel): void {
+		// Recovery suites drive dispatch with channel-shaped stubs.
+		if (typeof channel.setFforContext !== 'function') return;
+		if (!/^[0-9a-f]{66}$/i.test(peerPubkey)) return;
+		const nodeKey = this.config.nodePrivateKey ?? null;
+		channel.setFforContext({
+			remoteNodeId: Buffer.from(peerPubkey, 'hex'),
+			signFn: nodeKey
+				? (digest: Buffer): Buffer => signWithNodeKey(digest, nodeKey)
+				: null,
+			nodePrivateKey: nodeKey
+		});
+	}
+
+	/** Emit 'ffor:state' (channelId, state, record) when the state moved. */
+	private _fforEmitStateChange(channel: Channel): void {
+		if (typeof channel.getFforEpoch !== 'function') return;
+		const channelId = channel.getChannelId();
+		if (!channelId) return;
+		const hex = channelId.toString('hex');
+		const record = channel.getFforEpoch();
+		const state = record ? record.state : null;
+		const last = this._fforLastState.get(hex);
+		if (last === state) return;
+		this._fforLastState.set(hex, state);
+		if (record) this.emit('ffor:state', channelId, state, record);
+	}
+
+	private handleFforMessage(
+		peerPubkey: string,
+		type: number,
+		payload: Buffer
+	): void {
+		let channelId: Buffer;
+		try {
+			channelId = decodeFforHeader(payload).channelId;
+		} catch (err) {
+			this.emit(
+				'error',
+				null,
+				`FFOR message ${type} too short: ${(err as Error).message}`
+			);
+			return;
+		}
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+		this._fforEnsureContext(peerPubkey, channel);
+		let actions: ChannelAction[];
+		switch (type) {
+			case MessageType.FF_INIT:
+				if (!this.peerSupportsFfor(peerPubkey)) {
+					this.emit(
+						'error',
+						channelId,
+						'ff_init from a peer without option_ff_receive'
+					);
+					return;
+				}
+				actions = channel.handleFforInit(payload);
+				break;
+			case MessageType.FF_ACCEPT:
+				actions = channel.handleFforAccept(payload);
+				break;
+			case MessageType.FF_ACTIVATE:
+				actions = channel.handleFforActivate(payload);
+				break;
+			case MessageType.FF_ACTIVATE_ACK:
+				actions = channel.handleFforActivateAck(payload);
+				break;
+			case MessageType.FF_ABORT:
+				actions = channel.handleFforAbort(payload);
+				break;
+			case MessageType.FF_CLOSE:
+				actions = channel.handleFforClose(payload);
+				break;
+			case MessageType.FF_CLOSE_ACK:
+				actions = channel.handleFforCloseAck(payload);
+				break;
+			case MessageType.FF_ERROR:
+				actions = channel.handleFforError(payload);
+				break;
+			default:
+				// ff_invoices (section 7.3) is optional and S needs nothing from
+				// it: delegated payments are recognised from the hash set.
+				return;
+		}
+		this.processActions(peerPubkey, channel, actions);
+		// The voucher adds (after ff_init), the abort unwind and the drain all
+		// need a commitment round; a no-op when nothing is pending.
+		this.autoSignAndSendCommitment(channelId);
+		this._fforEmitStateChange(channel);
+	}
+
+	/** Run a channel's FFOR action producer and drive the round it needs. */
+	private _fforDrive(
+		channelId: Buffer,
+		produce: (channel: Channel) => ChannelAction[]
+	): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!channel || !peerPubkey) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		this._fforEnsureContext(peerPubkey, channel);
+		const actions = produce(channel);
+		this.processActions(peerPubkey, channel, actions);
+		this.autoSignAndSendCommitment(channelId);
+		this._fforEmitStateChange(channel);
+		const err = actions.find((a) => a.type === ChannelActionType.ERROR);
+		return {
+			ok: err === undefined,
+			actions,
+			...(err && err.type === ChannelActionType.ERROR
+				? { error: err.message }
+				: {})
+		};
+	}
+
+	/**
+	 * R: start a Variant D epoch on a channel (section 9.5.1 step 2). The
+	 * book is `voucherAmountsMsat` in slot order; the rest are ff_init's
+	 * terms. Refused unless the peer advertised option_ff_receive.
+	 */
+	initiateFforEpoch(
+		channelId: Buffer,
+		request: {
+			voucherAmountsMsat: bigint[];
+			minPaymentMsat: bigint;
+			settlementDeadline: number;
+			voucherExpiry: number;
+			feeBaseMsat: number;
+			feeProportionalMillionths: number;
+			epochId?: Buffer;
+		}
+	): ChannelResult {
+		const peerPubkey = this.channelPeers.get(channelId.toString('hex'));
+		if (peerPubkey && !this.peerSupportsFfor(peerPubkey)) {
+			const error = 'peer does not advertise option_ff_receive';
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		return this._fforDrive(channelId, (c) => c.initiateFforEpoch(request));
+	}
+
+	/** R: ff_close (section 7.5.4). */
+	closeFforEpoch(channelId: Buffer): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.closeFforEpoch());
+	}
+
+	/** Either side: abort a setup before ACTIVE. */
+	abortFforEpoch(
+		channelId: Buffer,
+		reason: FforAbortReason = FforAbortReason.OPERATOR,
+		text = 'operator abort'
+	): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.abortFforEpoch(reason, text));
+	}
+
+	/** R: credit a preimage learned from a payer or witness (section 7.5.6). */
+	fforAddPreimage(channelId: Buffer, preimage: Buffer): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforAddPreimage(preimage));
+	}
+
+	/** S: durable per-slot settlement state (section 9.5.1). */
+	fforSetSlot(
+		channelId: Buffer,
+		k: number,
+		state: FforSlotState,
+		upstream: string | null
+	): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforSetSlot(k, state, upstream));
+	}
+
+	/** The epoch record of a channel, if any. */
+	getFforEpoch(channelId: Buffer): IFforEpochRecord | null {
+		return this.channels.get(channelId.toString('hex'))?.getFforEpoch() ?? null;
+	}
+
+	/**
+	 * S: the voucher slot a payment hash names, across every channel with a
+	 * live epoch of ours (section 9.5.1 "Settlement"). Null when the hash is
+	 * in no book, so the HTLC takes the ordinary path.
+	 */
+	fforFindDelegatedSlot(paymentHash: Buffer): {
+		channelId: Buffer;
+		channel: Channel;
+		record: IFforEpochRecord;
+		entry: IFforBookEntry;
+	} | null {
+		for (const channel of this.channels.values()) {
+			// Every state, ABORTED and CLOSED included: a hash from a book of
+			// ours is single-use (section 7.3) and a payment on it outside
+			// ACTIVE is failed upstream (section 7.5.6), never forwarded to R.
+			const record = channel.getFforEpoch();
+			if (!record || record.role !== 'S') continue;
+			const idx = record.paymentHashes.findIndex((h) => h.equals(paymentHash));
+			if (idx < 0) continue;
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			return {
+				channelId,
+				channel,
+				record,
+				entry: {
+					k: idx + 1,
+					paymentHash: record.paymentHashes[idx],
+					amountMsat: record.params.voucherAmountsMsat[idx],
+					voucherExpiry: record.params.voucherExpiry,
+					settlementDeadline: record.params.settlementDeadline,
+					sHtlcId: (record.sHtlcIdBase ?? 0n) + BigInt(idx)
+				}
+			};
+		}
+		return null;
 	}
 
 	// ─────────────── Splice ───────────────
@@ -7874,6 +8143,8 @@ export class ChannelManager extends EventEmitter {
 		progress?: IActionDispatchProgress
 	): void {
 		this._syncQuiescenceWatchdog(channel);
+		this._fforEnsureContext(peerPubkey, channel);
+		this._fforEmitStateChange(channel);
 		if (actions.length === 0) return;
 		const dispatchProgress = progress ?? newDispatchProgress();
 		const errorIndex = actions.findIndex(

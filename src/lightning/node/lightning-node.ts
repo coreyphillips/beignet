@@ -137,6 +137,10 @@ import {
 	TEMPORARY_NODE_FAILURE,
 	EXPIRY_TOO_FAR
 } from '../onion/types';
+import {
+	FforAbortReason,
+	IFforEpochRecord
+} from '../ffor/types';
 import { encode as encodeInvoice } from '../invoice/encode';
 import { decode as decodeInvoice } from '../invoice/decode';
 import {
@@ -2599,6 +2603,9 @@ export class LightningNode extends EventEmitter {
 			// Parked against a hold invoice. settle/cancel drives it, not the
 			// forwarding machinery.
 			if (this.isHeldHtlc(channelId, htlc.id)) continue;
+			// An FFOR voucher (section 9.5.1): the epoch's drain or unwind
+			// resolves it, never the onion path.
+			if (htlc.fforVoucher === true) continue;
 			// Held by the JIT engine before the restart, and already owed a
 			// refund by the restored-hold queue. Dispatching it again would
 			// forward a payment the sweep is about to fail upstream.
@@ -15130,6 +15137,54 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	// ─────────────── FFOR Variant D (specs/ffor-offline-receive.md) ───────────────
+
+	/** The FFOR epoch record of a channel, if any. */
+	getFforEpoch(channelIdHex: string): IFforEpochRecord | null {
+		return this.channelManager.getFforEpoch(Buffer.from(channelIdHex, 'hex'));
+	}
+
+	/**
+	 * R: start a Variant D epoch on a channel (section 9.5.1). The book is
+	 * `voucherAmountsMsat` in slot order. Setup runs to ACTIVE on its own;
+	 * watch 'ffor:state' or poll getFforEpoch.
+	 */
+	startFforEpoch(
+		channelIdHex: string,
+		request: {
+			voucherAmountsMsat: bigint[];
+			minPaymentMsat: bigint;
+			settlementDeadline: number;
+			voucherExpiry: number;
+			feeBaseMsat: number;
+			feeProportionalMillionths: number;
+			epochId?: Buffer;
+		}
+	): ChannelResult {
+		return this.channelManager.initiateFforEpoch(
+			Buffer.from(channelIdHex, 'hex'),
+			request
+		);
+	}
+
+	/** R: close the ACTIVE epoch (ff_close, section 7.5.4). */
+	closeFforEpoch(channelIdHex: string): ChannelResult {
+		return this.channelManager.closeFforEpoch(Buffer.from(channelIdHex, 'hex'));
+	}
+
+	/** Either side: abort a setup before ACTIVE. */
+	abortFforEpoch(
+		channelIdHex: string,
+		reason: FforAbortReason = FforAbortReason.OPERATOR,
+		text = 'operator abort'
+	): ChannelResult {
+		return this.channelManager.abortFforEpoch(
+			Buffer.from(channelIdHex, 'hex'),
+			reason,
+			text
+		);
+	}
+
 	private parkQuiescentHtlc(
 		channelId: Buffer,
 		htlcId: bigint,
@@ -20491,6 +20546,9 @@ export class LightningNode extends EventEmitter {
 		// channel backup from us (and vice versa). Gated by peerStorageEnabled;
 		// the constructor clears the bit when that config flag is false.
 		flags.setOptional(Feature.PROVIDE_STORAGE);
+		// FFOR Variant D (specs/ffor-offline-receive.md section 5): both the
+		// recipient and the settlement-peer roles are implemented.
+		flags.setOptional(Feature.OPTION_FF_RECEIVE);
 		// LARGE_CHANNELS (18) is not set here but the constructor sets it by
 		// default (largeChannels defaults to true), so it is advertised unless
 		// opted out; the > 2^24 cap is still only lifted with a wumbo peer.

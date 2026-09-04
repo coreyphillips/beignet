@@ -327,6 +327,14 @@ export interface IHtlcEntry {
 	 */
 	forwardEmitted?: boolean;
 	/**
+	 * FFOR Variant D (section 9.5.1 step 3): this HTLC is a voucher of the
+	 * channel's epoch, recognised from the book by (id, amount, hash, cltv).
+	 * On R it is parked: never dispatched to the node's onion path, never
+	 * fulfilled or failed except by the epoch's own drain or unwind. On S it
+	 * marks the offered voucher for the same bookkeeping. Persisted.
+	 */
+	fforVoucher?: boolean;
+	/**
 	 * Admission-time classification (issue 410): this received HTLC was dust
 	 * and pushed total dust exposure past MAX_DUST_HTLC_EXPOSURE_MSAT when it
 	 * was admitted, so the node fails it back once committed (BOLT 2: SHOULD

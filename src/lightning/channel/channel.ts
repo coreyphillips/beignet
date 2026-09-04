@@ -159,6 +159,78 @@ import { isValidPublicKey } from '../crypto/ecdh';
 import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
 import {
+	FF_ABORT_TYPE,
+	FF_ACCEPT_TYPE,
+	FF_ACTIVATE_ACK_TYPE,
+	FF_ACTIVATE_TYPE,
+	FF_CLOSE_ACK_TYPE,
+	FF_CLOSE_TYPE,
+	FF_EPOCH_START_TOLERANCE_BLOCKS,
+	FF_INIT_TYPE,
+	FforAbortReason,
+	FforRole,
+	FforSlotState,
+	FforState,
+	FforVariant,
+	IFforAbortMessage,
+	IFforAcceptMessage,
+	IFforActivateAckMessage,
+	IFforActivateMessage,
+	IFforBookEntry,
+	IFforChannelContext,
+	IFforCloseAckMessage,
+	IFforCloseMessage,
+	IFforEpochParams,
+	IFforEpochRecord,
+	IFforErrorMessage,
+	IFforInitMessage,
+	IFforReestablishTlv
+} from '../ffor/types';
+import {
+	bitmapGet,
+	bitmapLength,
+	bitmapSet,
+	decodeFforAbortMessage,
+	decodeFforAcceptMessage,
+	decodeFforActivateAckMessage,
+	decodeFforActivateMessage,
+	decodeFforCloseAckMessage,
+	decodeFforCloseMessage,
+	decodeFforErrorMessage,
+	decodeFforInitMessage,
+	encodeFforAbortUnsigned,
+	encodeFforAcceptUnsigned,
+	encodeFforActivateAckUnsigned,
+	encodeFforActivateUnsigned,
+	encodeFforCloseAckUnsigned,
+	encodeFforCloseUnsigned,
+	encodeFforErrorMessage,
+	encodeFforInitUnsigned,
+	fforMessageDigest,
+	fforWireBytes,
+	verifyFforMessage
+} from '../ffor/messages';
+import {
+	buildVoucherBook,
+	computeHAct,
+	computeHBook,
+	computeHCommit,
+	computeTInit,
+	computeTSetup
+} from '../ffor/transcript';
+import { checkVoucherBook, IFforBookCheckContext } from '../ffor/amounts';
+import {
+	buildVoucherOnion,
+	matchVoucher,
+	verifyVoucherOnion
+} from '../ffor/voucher';
+import { decodeOnionPacket, processOnionPacket } from '../onion';
+import {
+	createFailureMessage,
+	FAILURE_MESSAGE_LENGTH
+} from '../onion/failures';
+import { TEMPORARY_NODE_FAILURE } from '../onion/types';
+import {
 	ISpliceMessage,
 	ISpliceAckMessage,
 	ISpliceLockedMessage,
@@ -757,6 +829,18 @@ export class Channel {
 	 * only: quiescence never survives a disconnect.
 	 */
 	private _stfuReplyOwed = false;
+	/** FFOR: host-supplied signing and peer identity (setFforContext). */
+	private _fforCtx: IFforChannelContext | null = null;
+	/**
+	 * FFOR, R side: ff_activate goes out when the quiescence handshake
+	 * completes (section 9.5.1 step 6). Memory-only, like quiescence.
+	 */
+	private _fforPendingActivate = false;
+	/**
+	 * FFOR: an abort ended a quiescence handshake our stfu had opened; the
+	 * peer's reply is still in flight and is consumed without effect.
+	 */
+	private _fforStfuReplyStale = false;
 	private _spliceSession: SpliceSession | null = null;
 	// A splice the caller requested while the channel was not yet quiescent.
 	// Fired automatically once we reach QUIESCENT (we drive quiescence ourselves
@@ -2926,6 +3010,17 @@ export class Channel {
 			];
 		}
 
+		// FFOR section 7.5.5: no ordinary update from ACTIVATING on.
+		const fforAddRefusal = this._fforUpdateRefusal('add');
+		if (fforAddRefusal) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot add HTLC: ${fforAddRefusal}`
+				}
+			];
+		}
+
 		// BOLT 2: cltv_expiry MUST be < 500000000 (values at or above are
 		// interpreted as unix timestamps, not block heights). Send-side check so
 		// we never emit an update_add_htlc a conformant peer must fail.
@@ -3146,6 +3241,13 @@ export class Channel {
 			return this._failChannelWithWireError('update_add_htlc after your stfu');
 		}
 
+		// FFOR section 7.5.5: from ACTIVATING on neither side may add. The
+		// freeze is durable and the peer signed it, so a violation is provable.
+		const fforPeerAddRefusal = this._fforUpdateRefusal('add');
+		if (fforPeerAddRefusal) {
+			return this._failChannelWithWireError(fforPeerAddRefusal);
+		}
+
 		// Validate inbound HTLC per BOLT 2
 		if (msg.amountMsat <= 0n) {
 			// BOLT 2 MUST fail: a zero-amount add can never enter our commitment.
@@ -3295,6 +3397,9 @@ export class Channel {
 			return this._failChannelWithWireError(wouldEmpty);
 		}
 
+		// FFOR section 9.5.1 step 3: a book match parks the add as a voucher.
+		this._fforClassifyAdd(entry);
+
 		this._state.htlcs.set(`received-${msg.id}`, entry);
 		// Two-phase: the peer's add enters commitments WE sign only after we
 		// revoke for the peer's covering commitment_signed (the peer builds its
@@ -3415,6 +3520,17 @@ export class Channel {
 			];
 		}
 
+		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
+		const fforSettleRefusal = this._fforUpdateRefusal('settle', htlcId);
+		if (fforSettleRefusal) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot fulfill HTLC: ${fforSettleRefusal}`
+				}
+			];
+		}
+
 		const key = `received-${htlcId}`;
 		const entry = this._state.htlcs.get(key);
 		if (!entry) {
@@ -3488,6 +3604,12 @@ export class Channel {
 					message: 'Unexpected update_fulfill_htlc'
 				}
 			];
+		}
+
+		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
+		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', msg.id);
+		if (fforPeerSettleRefusal) {
+			return this._failChannelWithWireError(fforPeerSettleRefusal);
 		}
 
 		const key = `offered-${msg.id}`;
@@ -3611,6 +3733,17 @@ export class Channel {
 			];
 		}
 
+		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
+		const fforSettleRefusal = this._fforUpdateRefusal('settle', htlcId);
+		if (fforSettleRefusal) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot fail HTLC: ${fforSettleRefusal}`
+				}
+			];
+		}
+
 		// BOLT 2: update_fail_htlc removes an HTLC the PEER offered us. Refuse to
 		// fail one we offered rather than fall through to the received-keyed lookup
 		// and corrupt the same-id inbound HTLC.
@@ -3702,6 +3835,17 @@ export class Channel {
 			];
 		}
 
+		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
+		const fforSettleRefusal = this._fforUpdateRefusal('settle', htlcId);
+		if (fforSettleRefusal) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot fail HTLC: ${fforSettleRefusal}`
+				}
+			];
+		}
+
 		if ((failureCode & 0x8000) === 0) {
 			return [
 				{
@@ -3765,6 +3909,12 @@ export class Channel {
 					message: 'Unexpected update_fail_htlc'
 				}
 			];
+		}
+
+		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
+		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', msg.id);
+		if (fforPeerSettleRefusal) {
+			return this._failChannelWithWireError(fforPeerSettleRefusal);
 		}
 
 		const key = `offered-${msg.id}`;
@@ -3841,6 +3991,12 @@ export class Channel {
 			return this._failChannelWithWireError(
 				'update_fail_malformed_htlc: failure_code missing BADONION bit'
 			);
+		}
+
+		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
+		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', msg.id);
+		if (fforPeerSettleRefusal) {
+			return this._failChannelWithWireError(fforPeerSettleRefusal);
 		}
 
 		const key = `offered-${msg.id}`;
@@ -4608,7 +4764,9 @@ export class Channel {
 			sendMsg(MessageType.REVOKE_AND_ACK, encodeRevokeAndAckMessage(revokeMsg)),
 			// An owed stfu reply (issue 431) goes out only after the revoke that
 			// completed the drain.
-			...this._maybeAnswerOwedStfu()
+			...this._maybeAnswerOwedStfu(),
+			// FFOR: the round boundary at which S's voucher round completes.
+			...this._fforAfterRound()
 		];
 	}
 
@@ -4823,7 +4981,9 @@ export class Channel {
 			if (
 				entry.state === HtlcState.COMMITTED &&
 				entry.direction === HtlcDirection.RECEIVED &&
-				entry.forwardEmitted !== true
+				entry.forwardEmitted !== true &&
+				// FFOR section 9.5.1 step 3: a parked voucher is never dispatched.
+				entry.fforVoucher !== true
 			) {
 				entry.forwardEmitted = true;
 				htlcActions.push({
@@ -4841,7 +5001,10 @@ export class Channel {
 			...htlcActions,
 			// An owed stfu reply (issue 431) goes out once this revoke completed
 			// the drain.
-			...this._maybeAnswerOwedStfu()
+			...this._maybeAnswerOwedStfu(),
+			// FFOR: the round boundary at which R's voucher round completes, an
+			// aborted round unwinds, and a drain reaches CLOSED.
+			...this._fforAfterRound()
 		];
 	}
 
@@ -4875,6 +5038,17 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Cannot update fee: channel is quiescing'
+				}
+			];
+		}
+
+		// FFOR section 5: the feerate is frozen for the epoch.
+		const fforFeeRefusal = this._fforUpdateRefusal('fee');
+		if (fforFeeRefusal) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot update fee: ${fforFeeRefusal}`
 				}
 			];
 		}
@@ -5006,6 +5180,11 @@ export class Channel {
 	 * Handle update_fee from remote.
 	 */
 	handleUpdateFee(msg: IUpdateFeeMessage): ChannelAction[] {
+		// FFOR section 5: the feerate is frozen for the epoch, on both sides.
+		const fforPeerFeeRefusal = this._fforUpdateRefusal('fee');
+		if (fforPeerFeeRefusal) {
+			return this._failChannelWithWireError(fforPeerFeeRefusal);
+		}
 		// A fully-signed splice awaiting its lock resumes normal update traffic
 		// (CLN routinely sends update_fee in this window). BOLT 2 also allows
 		// update_fee during shutdown while HTLCs remain (CLN sends it), exactly
@@ -6331,6 +6510,17 @@ export class Channel {
 						'Recovery Capsule and its balances cannot be proven current, ' +
 						'so a mutual close may sign away funds received after the ' +
 						'capsule was written',
+					cleanup: 'none'
+				}
+			];
+		}
+		// FFOR section 7.5.5: no close negotiation while the epoch is live.
+		const fforShutdownRefusal = this._fforUpdateRefusal('shutdown');
+		if (fforShutdownRefusal) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot close cooperatively: ${fforShutdownRefusal}`,
 					cleanup: 'none'
 				}
 			];
@@ -7955,6 +8145,9 @@ export class Channel {
 		// to start can never fire. Drop it rather than leave it dangling.
 		this._pendingSplice = null;
 
+		// FFOR section 7.5.5: before ACTIVE a disconnect aborts the setup.
+		this._fforOnDisconnect();
+
 		if (
 			this._state.state === ChannelState.AWAITING_TX_SIGNATURES ||
 			this._state.state === ChannelState.DUAL_FUNDING_V2
@@ -8062,6 +8255,7 @@ export class Channel {
 		// Quiescence never survives a disconnect (BOLT 2 quiescence).
 		this._quiescence.reset();
 		this._stfuReplyOwed = false;
+		this._fforStfuReplyStale = false;
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
 
@@ -8368,6 +8562,10 @@ export class Channel {
 			yourLastPerCommitmentSecret: lastSecret,
 			myCurrentPerCommitmentPoint: myCurrentPoint
 		};
+
+		// FFOR section 11.1: TLV 55001 names our epoch, state and H_act.
+		const fforTlv = this._fforReestablishTlv();
+		if (fforTlv) msg.ffor = fforTlv;
 
 		// option_taproot: our MuSig2 verification nonces are DETERMINISTIC per
 		// commitment height (see _deriveVerificationNonce), so re-derive the SAME
@@ -9609,6 +9807,9 @@ export class Channel {
 			actions.push(...this._handleReestablishSplice(msg));
 		}
 
+		// ── FFOR section 7.5.5 retransmission rules ──
+		actions.push(...this._handleReestablishFfor(msg));
+
 		// ── Retransmit channel_ready if we sent it previously (BOLT 2 §5) ──
 		// Spec trigger: the peer's next_commitment_number == 1 proves it never
 		// processed anything past the initial commitment, i.e. it may have
@@ -9760,6 +9961,18 @@ export class Channel {
 			];
 		}
 
+		// FFOR section 7.5.5: no stfu, splice or close negotiation while the
+		// epoch is live, except the one that carries ff_activate.
+		const fforStfuRefusal = this._fforUpdateRefusal('stfu');
+		if (fforStfuRefusal) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot quiesce: ${fforStfuRefusal}`
+				}
+			];
+		}
+
 		// Check for pending HTLCs
 		if (this.hasPendingHtlcs()) {
 			return [
@@ -9820,11 +10033,29 @@ export class Channel {
 	}
 
 	handleStfuMessage(msg: IStfuMessage): ChannelAction[] {
+		if (this._fforStfuReplyStale && !msg.initiator) {
+			// The reply to a stfu whose session an ff_abort already ended.
+			this._fforStfuReplyStale = false;
+			return [];
+		}
 		if (this._state.state !== ChannelState.NORMAL) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Unexpected STFU: channel not in NORMAL state'
+				}
+			];
+		}
+
+		// FFOR section 7.5.5: a peer stfu under the epoch freeze is a protocol
+		// error; R's own activation stfu is the exception the flag names.
+		const fforPeerStfuRefusal = this._fforUpdateRefusal('stfu');
+		if (fforPeerStfuRefusal) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Unexpected STFU: ${fforPeerStfuRefusal}`,
+					cleanup: 'none'
 				}
 			];
 		}
@@ -9889,6 +10120,12 @@ export class Channel {
 
 		this._state.quiescenceState = this._quiescence.getState();
 		this._state.quiescenceInitiator = this._quiescence.isInitiator();
+
+		// FFOR section 9.5.1 step 6: R sends ff_activate once quiescent.
+		if (this._fforPendingActivate && this._quiescence.isQuiescent()) {
+			this._fforPendingActivate = false;
+			actions.push(...this._fforSendActivate());
+		}
 
 		// If we drove quiescence in order to splice, fire the deferred splice now
 		// that we're quiescent. Only the quiescence initiator may send splice_init.
@@ -10012,6 +10249,8 @@ export class Channel {
 	 * stops reporting.
 	 */
 	spliceBusyReason(): string | null {
+		const fforSpliceBusy = this._fforUpdateRefusal('splice');
+		if (fforSpliceBusy) return fforSpliceBusy;
 		if (this._state.state !== ChannelState.NORMAL) {
 			// A disconnect wraps a NORMAL channel in AWAITING_REESTABLISH and
 			// handleReestablish unwraps it; any other state is a refusal that
@@ -10057,6 +10296,17 @@ export class Channel {
 		fundingFeeratePerkw: number,
 		locktime = 0
 	): ChannelAction[] {
+		// FFOR section 7.5.5: no splice while the epoch is live.
+		const fforSpliceRefusal = this._fforUpdateRefusal('splice');
+		if (fforSpliceRefusal) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot splice: ${fforSpliceRefusal}`,
+					cleanup: 'none'
+				}
+			];
+		}
 		if (this._state.state !== ChannelState.NORMAL) {
 			// A disconnect wraps a NORMAL channel in AWAITING_REESTABLISH and
 			// handleReestablish unwraps it, so this refusal clears by itself and
@@ -19660,6 +19910,1877 @@ export class Channel {
 			? [{ type: ChannelActionType.PERSIST_STATE }]
 			: [];
 		actions.push(this._txAbort(this._v2ChannelId()));
+		return actions;
+	}
+
+	// ─────────────── FFOR Variant D (specs/ffor-offline-receive.md) ───────────────
+	//
+	// The signed lifecycle of section 7.5 wrapped around one stock BOLT 2
+	// voucher round (section 9.5.1). The durable record rides
+	// IChannelState.ffor; the host supplies signing and the peer's node id
+	// through setFforContext. Every handler returns actions; the manager
+	// dispatches them and drives the commitment rounds the vouchers need.
+
+	/** The host-supplied signing and identity context (see setFforContext). */
+	setFforContext(ctx: IFforChannelContext): void {
+		this._fforCtx = ctx;
+	}
+
+	/** The epoch record, if any (aborted and closed epochs included). */
+	getFforEpoch(): IFforEpochRecord | null {
+		return this._state.ffor ?? null;
+	}
+
+	/** The record while the epoch is neither ABORTED nor CLOSED. */
+	private _fforLive(): IFforEpochRecord | null {
+		const f = this._state.ffor;
+		if (!f) return null;
+		if (f.state === FforState.ABORTED || f.state === FforState.CLOSED) {
+			return null;
+		}
+		return f;
+	}
+
+	/**
+	 * Section 7.5.5: from ACTIVATING on, no ordinary update from either side;
+	 * DRAINING admits only the voucher fulfils and fails and their rounds.
+	 */
+	fforIsFrozen(): boolean {
+		const f = this._fforLive();
+		return (
+			f !== null &&
+			(f.state === FforState.ACTIVATING ||
+				f.state === FforState.ACTIVE ||
+				f.state === FforState.DRAINING)
+		);
+	}
+
+	/**
+	 * The refusal an ordinary channel operation earns under the epoch
+	 * freeze, or null. `htlcId` names the S-offered id a settle targets: in
+	 * DRAINING the vouchers' own fulfils and fails are the drain and pass.
+	 */
+	private _fforUpdateRefusal(
+		kind: 'add' | 'settle' | 'fee' | 'stfu' | 'shutdown' | 'splice',
+		htlcId?: bigint
+	): string | null {
+		const f = this._fforLive();
+		if (!f) return null;
+		// R re-quiescing to retransmit ff_activate (section 7.5.5) is the one
+		// stfu the freeze itself asks for.
+		if (kind === 'stfu' && this._fforPendingActivate) return null;
+		if (f.state === FforState.ACTIVATING || f.state === FforState.ACTIVE) {
+			return `FFOR epoch is ${FforState[f.state]}: no ${kind} until it drains`;
+		}
+		if (f.state === FforState.DRAINING) {
+			if (
+				kind === 'settle' &&
+				htlcId !== undefined &&
+				this._fforVoucherEntry(f, htlcId) !== undefined
+			) {
+				return null;
+			}
+			return `FFOR epoch is DRAINING: only the voucher drain may ${kind}`;
+		}
+		return null;
+	}
+
+	/** The book, rebuilt from the record (section 7.5.3). */
+	private _fforBook(f: IFforEpochRecord): IFforBookEntry[] {
+		const base = f.sHtlcIdBase ?? 0n;
+		return f.paymentHashes.map((h, i) => ({
+			k: i + 1,
+			paymentHash: h,
+			amountMsat: f.params.voucherAmountsMsat[i],
+			voucherExpiry: f.params.voucherExpiry,
+			settlementDeadline: f.params.settlementDeadline,
+			sHtlcId: base + BigInt(i)
+		}));
+	}
+
+	/** The HTLC map key of voucher k on this side. */
+	private _fforVoucherKey(f: IFforEpochRecord, k: number): string {
+		const id = (f.sHtlcIdBase ?? 0n) + BigInt(k - 1);
+		return f.role === 'R' ? `received-${id}` : `offered-${id}`;
+	}
+
+	/** The voucher entry an S-offered id names, if it is one of the book's. */
+	private _fforVoucherEntry(
+		f: IFforEpochRecord,
+		htlcId: bigint
+	): IHtlcEntry | undefined {
+		if (f.sHtlcIdBase === null) return undefined;
+		const k = Number(htlcId - f.sHtlcIdBase) + 1;
+		if (k < 1 || k > f.params.maxPayments) return undefined;
+		const entry = this._state.htlcs.get(this._fforVoucherKey(f, k));
+		return entry?.fforVoucher === true ? entry : undefined;
+	}
+
+	/** Every voucher entry still on the channel, by slot. */
+	private _fforVoucherEntries(f: IFforEpochRecord): Map<number, IHtlcEntry> {
+		const out = new Map<number, IHtlcEntry>();
+		for (let k = 1; k <= f.params.maxPayments; k++) {
+			const e = this._state.htlcs.get(this._fforVoucherKey(f, k));
+			if (e && e.fforVoucher === true) out.set(k, e);
+		}
+		return out;
+	}
+
+	/** The channel facts the book checks need (sections 7.6, 8, 9.5.1). */
+	private _fforBookContext(role: FforRole): IFforBookCheckContext {
+		const local = this._state.localConfig;
+		const remote = this._state.remoteConfig;
+		// BOLT 2: a side's advertised limits bind what the PEER offers it, and
+		// its advertised reserve is the one it enforces on the peer.
+		const rCfg = role === 'R' ? local : remote;
+		const sIsLocal = role === 'S';
+		return {
+			rMaxAcceptedHtlcs: rCfg.maxAcceptedHtlcs,
+			rMaxHtlcValueInFlightMsat: rCfg.maxHtlcValueInFlightMsat,
+			htlcMinimumMsat: rCfg.htlcMinimumMsat,
+			dustLimitSatoshis:
+				local.dustLimitSatoshis > remote.dustLimitSatoshis
+					? local.dustLimitSatoshis
+					: remote.dustLimitSatoshis,
+			feeratePerKw: getCommitmentFeeRate(this._state),
+			sLocalBalanceMsat: sIsLocal
+				? this._state.localBalanceMsat
+				: this._state.remoteBalanceMsat,
+			rLocalBalanceMsat: sIsLocal
+				? this._state.remoteBalanceMsat
+				: this._state.localBalanceMsat,
+			sChannelReserveSat: sIsLocal
+				? remote.channelReserveSatoshis
+				: local.channelReserveSatoshis,
+			rChannelReserveSat: sIsLocal
+				? local.channelReserveSatoshis
+				: remote.channelReserveSatoshis,
+			sIsFunder: sIsLocal
+				? this._state.role === ChannelRole.OPENER
+				: this._state.role !== ChannelRole.OPENER,
+			anchors: isAnchorChannel(this._state.channelType)
+		};
+	}
+
+	/** Section 7: the epoch id must be new on this channel, aborted setups included. */
+	private _fforEpochIdUsed(epochId: Buffer): boolean {
+		const hex = epochId.toString('hex');
+		return (
+			(this._state.fforUsedEpochIds ?? []).includes(hex) ||
+			(this._state.ffor !== null &&
+				this._state.ffor !== undefined &&
+				this._state.ffor.epochId.equals(epochId))
+		);
+	}
+
+	private _fforBurnEpochId(epochId: Buffer): void {
+		const hex = epochId.toString('hex');
+		const used = this._state.fforUsedEpochIds ?? [];
+		if (!used.includes(hex)) {
+			this._state.fforUsedEpochIds = [...used, hex];
+		}
+	}
+
+	/** Sign an FFOR message body with the node key the host provided. */
+	private _fforSign(type: number, unsigned: Buffer): Buffer | null {
+		const signFn = this._fforCtx?.signFn ?? null;
+		if (!signFn) return null;
+		const sig = signFn(fforMessageDigest(type, unsigned));
+		if (sig.length !== 64) return null;
+		return Buffer.concat([unsigned, sig]);
+	}
+
+	/** Preconditions every epoch start shares (sections 5, 9.5.1 step 1). */
+	private _fforSetupPreconditionError(): string | null {
+		if (this._state.state !== ChannelState.NORMAL) {
+			return 'channel is not NORMAL';
+		}
+		if (!this._state.channelId) return 'channel has no id';
+		if (this._fforLive()) return 'an epoch is already in progress';
+		if (this._quiescence.isQuiescing()) return 'channel is quiescing';
+		if (!isAnchorChannel(this._state.channelType)) {
+			return 'FFOR requires an anchor channel';
+		}
+		if (isTaprootChannel(this._state.channelType)) {
+			return 'FFOR does not support simple-taproot channels';
+		}
+		if (this._state.htlcs.size > 0 || this.hasPendingHtlcs()) {
+			return 'channel must carry no HTLCs and no pending updates';
+		}
+		if (!this._fforCtx?.signFn) return 'no node key to sign with';
+		return null;
+	}
+
+	/**
+	 * R: start an epoch (section 9.5.1 step 2). Builds and signs ff_init with
+	 * the fixed-amount book `voucherAmountsMsat`; K is its length and
+	 * budget_msat its sum. `epochId` is random unless a test pins it.
+	 */
+	initiateFforEpoch(request: {
+		voucherAmountsMsat: bigint[];
+		minPaymentMsat: bigint;
+		settlementDeadline: number;
+		voucherExpiry: number;
+		feeBaseMsat: number;
+		feeProportionalMillionths: number;
+		epochId?: Buffer;
+	}): ChannelAction[] {
+		const pre = this._fforSetupPreconditionError();
+		if (pre) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot start FFOR epoch: ${pre}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		const params: IFforEpochParams = {
+			variant: FforVariant.D,
+			budgetMsat: request.voucherAmountsMsat.reduce((a, b) => a + b, 0n),
+			maxPayments: request.voucherAmountsMsat.length,
+			minPaymentMsat: request.minPaymentMsat,
+			settlementDeadline: request.settlementDeadline,
+			voucherExpiry: request.voucherExpiry,
+			feeBaseMsat: request.feeBaseMsat,
+			feeProportionalMillionths: request.feeProportionalMillionths,
+			escapeGranularityMsat: 0n,
+			rPerCommitmentPoints: [],
+			voucherAmountsMsat: [...request.voucherAmountsMsat]
+		};
+		const bookError = checkVoucherBook(params, this._fforBookContext('R'));
+		if (bookError) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot start FFOR epoch: ${bookError}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		const epochId = request.epochId ?? crypto.randomBytes(32);
+		if (epochId.length !== 32 || this._fforEpochIdUsed(epochId)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot start FFOR epoch: epoch id is not fresh',
+					cleanup: 'none'
+				}
+			];
+		}
+		const body = this._fforSign(
+			FF_INIT_TYPE,
+			encodeFforInitUnsigned({
+				channelId: this._state.channelId!,
+				epochId,
+				...params
+			})
+		);
+		if (!body) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot start FFOR epoch: signing failed',
+					cleanup: 'none'
+				}
+			];
+		}
+		const initWire = fforWireBytes(FF_INIT_TYPE, body);
+		this._state.ffor = this._fforNewRecord(
+			'R',
+			epochId,
+			params,
+			this._fforCtx!.remoteNodeId,
+			initWire
+		);
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.FF_INIT, body)
+		];
+	}
+
+	private _fforNewRecord(
+		role: FforRole,
+		epochId: Buffer,
+		params: IFforEpochParams,
+		remoteNodeId: Buffer,
+		initWire: Buffer
+	): IFforEpochRecord {
+		const K = params.maxPayments;
+		return {
+			role,
+			state: FforState.NEGOTIATING,
+			epochId,
+			params,
+			remoteNodeId,
+			initWire,
+			acceptWire: null,
+			sCommitmentNumber: null,
+			sHtlcIdBase: null,
+			paymentHashes: [],
+			preimages: [],
+			tInit: computeTInit(initWire),
+			tSetup: null,
+			hBook: null,
+			hCommit: null,
+			hAct: null,
+			epochStartHeight: null,
+			activateWire: null,
+			activateAckWire: null,
+			closeWire: null,
+			closeAckWire: null,
+			slotStates: Array.from({ length: K }, () => FforSlotState.UNUSED),
+			slotUpstream: Array.from({ length: K }, () => null),
+			settledBitmap: null,
+			knownPreimages: Array.from({ length: K }, () => null),
+			closeProcessed: false,
+			voucherRoundFailed: false,
+			unwindOwed: false,
+			abortReason: null,
+			closeSent: false,
+			activationMismatch: false
+		};
+	}
+
+	/** An ff_error followed by a signed ff_abort (section 11.1), pre-ACTIVE. */
+	private _fforRefuse(
+		epochId: Buffer,
+		transcriptHash: Buffer,
+		reason: FforAbortReason,
+		text: string
+	): ChannelAction[] {
+		const channelId = this._state.channelId!;
+		const data = Buffer.from(text, 'utf8');
+		const actions: ChannelAction[] = [
+			sendMsg(
+				MessageType.FF_ERROR,
+				encodeFforErrorMessage({ channelId, epochId, data })
+			)
+		];
+		const abort = this._fforSign(
+			FF_ABORT_TYPE,
+			encodeFforAbortUnsigned({
+				channelId,
+				epochId,
+				transcriptHash,
+				reason,
+				data
+			})
+		);
+		if (abort) actions.push(sendMsg(MessageType.FF_ABORT, abort));
+		actions.push({
+			type: ChannelActionType.ERROR,
+			message: `FFOR: ${text}`,
+			cleanup: 'none'
+		});
+		return actions;
+	}
+
+	/**
+	 * S: ff_init (sections 7.1, 7.2, 9.5.1 step 2). Verifies the terms and the
+	 * book, generates the preimages, answers ff_accept, and adds the K voucher
+	 * HTLCs (step 3). The manager signs the covering commitment afterwards.
+	 */
+	handleFforInit(payload: Buffer): ChannelAction[] {
+		let msg: IFforInitMessage;
+		try {
+			msg = decodeFforInitMessage(payload);
+		} catch (err) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: undecodable ff_init: ${(err as Error).message}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		const ctx = this._fforCtx;
+		const initWire = fforWireBytes(FF_INIT_TYPE, payload);
+		const tInit = computeTInit(initWire);
+		const refuse = (reason: FforAbortReason, text: string): ChannelAction[] => {
+			this._fforBurnEpochId(msg.epochId);
+			return [
+				{ type: ChannelActionType.PERSIST_STATE },
+				...this._fforRefuse(msg.epochId, tInit, reason, text)
+			];
+		};
+		if (!ctx || !verifyFforMessage(FF_INIT_TYPE, payload, ctx.remoteNodeId)) {
+			return refuse(
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_init signature invalid'
+			);
+		}
+		if (this._state.ffor?.epochId.equals(msg.epochId)) {
+			// Byte-identical replay of the init we already answered: idempotent.
+			if (this._state.ffor.initWire.equals(initWire)) return [];
+			return refuse(
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_init differs from the one processed'
+			);
+		}
+		if (this._fforEpochIdUsed(msg.epochId)) {
+			return refuse(
+				FforAbortReason.PROTOCOL_ERROR,
+				'epoch_id already used on this channel'
+			);
+		}
+		const pre = this._fforSetupPreconditionError();
+		if (pre) return refuse(FforAbortReason.TERMS_REFUSED, pre);
+		if (msg.variant !== FforVariant.D) {
+			return refuse(
+				FforAbortReason.TERMS_REFUSED,
+				`variant ${msg.variant} not supported`
+			);
+		}
+		if (msg.paymentHashes || msg.towerNodeId || msg.towerUri) {
+			return refuse(
+				FforAbortReason.TERMS_REFUSED,
+				'ff_init TLVs 1, 3 and 5 must be absent in Variant D'
+			);
+		}
+		if (msg.voucherAmountsMsat.length === 0) {
+			return refuse(
+				FforAbortReason.TERMS_REFUSED,
+				'ff_init TLV 9 is required in Variant D'
+			);
+		}
+		const params: IFforEpochParams = {
+			variant: msg.variant,
+			budgetMsat: msg.budgetMsat,
+			maxPayments: msg.maxPayments,
+			minPaymentMsat: msg.minPaymentMsat,
+			settlementDeadline: msg.settlementDeadline,
+			voucherExpiry: msg.voucherExpiry,
+			feeBaseMsat: msg.feeBaseMsat,
+			feeProportionalMillionths: msg.feeProportionalMillionths,
+			escapeGranularityMsat: msg.escapeGranularityMsat,
+			rPerCommitmentPoints: msg.rPerCommitmentPoints,
+			voucherAmountsMsat: msg.voucherAmountsMsat
+		};
+		const bookError = checkVoucherBook(params, this._fforBookContext('S'));
+		if (bookError) return refuse(FforAbortReason.TERMS_REFUSED, bookError);
+		if (
+			this._currentBlockHeight > 0 &&
+			params.settlementDeadline <= this._currentBlockHeight
+		) {
+			return refuse(
+				FforAbortReason.TERMS_REFUSED,
+				'settlement_deadline is not in the future'
+			);
+		}
+
+		const K = params.maxPayments;
+		const preimages = Array.from({ length: K }, () => crypto.randomBytes(32));
+		const hashes = preimages.map((p) =>
+			crypto.createHash('sha256').update(p).digest()
+		);
+		const sHtlcIdBase = this._state.localHtlcCounter;
+		const acceptBody = this._fforSign(
+			FF_ACCEPT_TYPE,
+			encodeFforAcceptUnsigned({
+				channelId: this._state.channelId!,
+				epochId: msg.epochId,
+				sCommitmentNumber: this._state.localCommitmentNumber,
+				paymentHashes: hashes,
+				sHtlcIdBase,
+				voucherAmountsMsat: params.voucherAmountsMsat,
+				initHash: tInit
+			})
+		);
+		if (!acceptBody) {
+			return refuse(FforAbortReason.PROTOCOL_ERROR, 'signing ff_accept failed');
+		}
+		const acceptWire = fforWireBytes(FF_ACCEPT_TYPE, acceptBody);
+		const f = this._fforNewRecord(
+			'S',
+			msg.epochId,
+			params,
+			ctx.remoteNodeId,
+			initWire
+		);
+		f.acceptWire = acceptWire;
+		f.sCommitmentNumber = this._state.localCommitmentNumber;
+		f.sHtlcIdBase = sHtlcIdBase;
+		f.paymentHashes = hashes;
+		f.preimages = preimages;
+		f.tSetup = computeTSetup(tInit, acceptWire);
+		f.hBook = computeHBook(
+			buildVoucherBook(msg.epochId, FforVariant.D, this._fforBook(f))
+		);
+		this._state.ffor = f;
+
+		const actions: ChannelAction[] = [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.FF_ACCEPT, acceptBody)
+		];
+		// Step 3: the K adds, in k order, each with the section 9.5.1 onion.
+		for (const entry of this._fforBook(f)) {
+			const expectedId = this._state.localHtlcCounter;
+			const onion = buildVoucherOnion({
+				recipientNodeId: ctx.remoteNodeId,
+				epochId: msg.epochId,
+				k: entry.k,
+				amountMsat: entry.amountMsat,
+				voucherExpiry: entry.voucherExpiry,
+				paymentHash: entry.paymentHash
+			});
+			const addActions = this.addHtlc(
+				entry.amountMsat,
+				entry.paymentHash,
+				entry.voucherExpiry,
+				onion
+			);
+			const failed =
+				addActions.some((a) => a.type === ChannelActionType.ERROR) ||
+				expectedId !== entry.sHtlcId;
+			if (failed) {
+				const err = addActions.find((a) => a.type === ChannelActionType.ERROR);
+				const text =
+					err && err.type === ChannelActionType.ERROR
+						? err.message
+						: 'voucher id diverged from s_htlc_id_base';
+				actions.push(
+					...this._fforAbortLocal(f, FforAbortReason.VOUCHER_ROUND_FAILED, text)
+				);
+				return actions;
+			}
+			const added = this._state.htlcs.get(`offered-${entry.sHtlcId}`);
+			if (added) added.fforVoucher = true;
+			actions.push(...addActions);
+		}
+		return actions;
+	}
+
+	/**
+	 * R: ff_accept (section 7.2). Verifies the signature, the echoed amounts
+	 * and the init hash, rechecks the book, and fixes T_setup and H_book.
+	 */
+	handleFforAccept(payload: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		let msg: IFforAcceptMessage;
+		try {
+			msg = decodeFforAcceptMessage(payload);
+		} catch (err) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: undecodable ff_accept: ${(err as Error).message}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (!f || f.role !== 'R' || !f.epochId.equals(msg.epochId)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: ff_accept for an unknown epoch',
+					cleanup: 'none'
+				}
+			];
+		}
+		const acceptWire = fforWireBytes(FF_ACCEPT_TYPE, payload);
+		if (f.acceptWire) {
+			if (f.acceptWire.equals(acceptWire)) return [];
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_accept differs from the one processed'
+			);
+		}
+		if (f.state !== FforState.NEGOTIATING) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_accept out of order'
+			);
+		}
+		if (!verifyFforMessage(FF_ACCEPT_TYPE, payload, f.remoteNodeId)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_accept signature invalid'
+			);
+		}
+		if (!msg.initHash.equals(f.tInit)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_accept TLV 11 is not the digest of our ff_init'
+			);
+		}
+		const K = f.params.maxPayments;
+		if (
+			msg.voucherAmountsMsat.length !== K ||
+			msg.voucherAmountsMsat.some(
+				(a, i) => a !== f.params.voucherAmountsMsat[i]
+			)
+		) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.BOOK_MISMATCH,
+				'ff_accept TLV 9 differs from ff_init'
+			);
+		}
+		if (msg.paymentHashes.length !== K) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.BOOK_MISMATCH,
+				`ff_accept carries ${msg.paymentHashes.length} hashes for K = ${K}`
+			);
+		}
+		const seen = new Set<string>();
+		for (const h of msg.paymentHashes) {
+			const hex = h.toString('hex');
+			if (seen.has(hex)) {
+				return this._fforAbortLocal(
+					f,
+					FforAbortReason.BOOK_MISMATCH,
+					'ff_accept repeats a payment hash'
+				);
+			}
+			seen.add(hex);
+		}
+		if (msg.sCommitmentNumber !== this._state.remoteCommitmentNumber) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				`ff_accept n0 ${msg.sCommitmentNumber} != ${this._state.remoteCommitmentNumber}`
+			);
+		}
+		// Section 7.2, Variant D: no H_k may be the hash of a secret S has
+		// revealed. The secrets revealed so far are the peer's revoked ones;
+		// n0's own arrives with the setup revoke_and_ack and is checked then.
+		if (this._fforHashesBindRevealedSecret(seen)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_accept binds a hash to a revealed per-commitment secret'
+			);
+		}
+		f.acceptWire = acceptWire;
+		f.sCommitmentNumber = msg.sCommitmentNumber;
+		f.sHtlcIdBase = msg.sHtlcIdBase;
+		f.paymentHashes = msg.paymentHashes;
+		f.tSetup = computeTSetup(f.tInit, acceptWire);
+		f.hBook = computeHBook(
+			buildVoucherBook(f.epochId, FforVariant.D, this._fforBook(f))
+		);
+		const bookError = checkVoucherBook(f.params, this._fforBookContext('R'));
+		if (bookError) {
+			return this._fforAbortLocal(f, FforAbortReason.BOOK_MISMATCH, bookError);
+		}
+		return [{ type: ChannelActionType.PERSIST_STATE }];
+	}
+
+	/**
+	 * Whether any of the given hashes (hex) is SHA256 of a per-commitment
+	 * secret the peer has revealed. Bounded to the most recent revocations so
+	 * a long-lived channel does not re-derive its whole shachain.
+	 */
+	private _fforHashesBindRevealedSecret(hashesHex: Set<string>): boolean {
+		const revealed = this._remoteRevocationCount();
+		const from = revealed > 2016n ? revealed - 2016n : 0n;
+		for (let i = from; i < revealed; i++) {
+			const secret = this._state.shaChainStore.getSecret(MAX_INDEX - i);
+			if (!secret) continue;
+			const h = crypto.createHash('sha256').update(secret).digest();
+			if (hashesHex.has(h.toString('hex'))) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Section 9.5.1 step 3, R side: classify a peer add against the book.
+	 * A match parks the HTLC as a voucher; a non-match inside the round
+	 * window fails the round, to be unwound after it completes.
+	 */
+	private _fforClassifyAdd(entry: IHtlcEntry): void {
+		const f = this._state.ffor;
+		if (!f || f.role !== 'R' || !f.acceptWire) return;
+		const match = matchVoucher(this._fforBook(f), {
+			id: entry.id,
+			amountMsat: entry.amountMsat,
+			paymentHash: entry.paymentHash,
+			cltvExpiry: entry.cltvExpiry
+		});
+		if (match) {
+			entry.fforVoucher = true;
+			const nodeKey = this._fforCtx?.nodePrivateKey ?? null;
+			if (nodeKey) {
+				const bad = verifyVoucherOnion(
+					entry.onionRoutingPacket,
+					nodeKey,
+					f.epochId,
+					match
+				);
+				if (bad && f.state === FforState.NEGOTIATING) {
+					f.voucherRoundFailed = true;
+				}
+			}
+			return;
+		}
+		if (f.state === FforState.NEGOTIATING) {
+			f.voucherRoundFailed = true;
+		}
+	}
+
+	/**
+	 * Called from the commitment_signed and revoke_and_ack tails: the round
+	 * boundaries at which the epoch can advance (VOUCHERS_COMMITTED, the
+	 * abort unwind, CLOSED). The batch these ride already persists.
+	 */
+	private _fforAfterRound(): ChannelAction[] {
+		const f = this._state.ffor;
+		if (!f) return [];
+		if (f.state === FforState.NEGOTIATING && f.acceptWire) {
+			return this._fforMaybeVouchersCommitted(f);
+		}
+		if (f.state === FforState.ABORTED && f.unwindOwed) {
+			return this._fforMaybeUnwind(f);
+		}
+		if (f.state === FforState.DRAINING) {
+			return this._fforMaybeClosed(f);
+		}
+		return [];
+	}
+
+	/** Section 9.5.1 steps 4 and 5: every voucher irrevocably in both views. */
+	private _fforMaybeVouchersCommitted(f: IFforEpochRecord): ChannelAction[] {
+		if (this._state.state !== ChannelState.NORMAL) return [];
+		if (this.hasPendingHtlcs()) return [];
+		const entries = this._fforVoucherEntries(f);
+		if (entries.size !== f.params.maxPayments) return [];
+		for (const e of entries.values()) {
+			// Irrevocable in BOTH views: committed, revoked on our side, covered
+			// by the peer's revoke (offered) and by a commitment_signed we
+			// accepted (offered: one message later than the peer's revoke).
+			if (
+				e.state !== HtlcState.COMMITTED ||
+				e.addLocallyRevoked === false ||
+				e.addRemoteCommitted === false ||
+				e.addRemoteSigned === false
+			) {
+				return [];
+			}
+		}
+		const commit = this._fforComputeCommit(f);
+		if (typeof commit === 'string') {
+			if (f.role === 'S') {
+				return this._fforAbortLocal(
+					f,
+					FforAbortReason.VOUCHER_ROUND_FAILED,
+					commit
+				);
+			}
+			f.voucherRoundFailed = true;
+		} else {
+			f.hCommit = commit;
+		}
+		if (f.role === 'R') {
+			// Section 7.2: n0's secret is revealed by the setup revoke_and_ack.
+			if (
+				this._fforHashesBindRevealedSecret(
+					new Set(f.paymentHashes.map((h) => h.toString('hex')))
+				)
+			) {
+				f.voucherRoundFailed = true;
+			}
+			if (f.voucherRoundFailed) {
+				return this._fforAbortLocal(
+					f,
+					FforAbortReason.VOUCHER_ROUND_FAILED,
+					'voucher round did not match the book'
+				);
+			}
+		}
+		f.state = FforState.VOUCHERS_COMMITTED;
+		if (f.role !== 'R') return [];
+		// Step 6: R quiesces and activates.
+		this._fforPendingActivate = true;
+		return this.initiateQuiescence().filter(
+			// Already quiescing (a crossing peer stfu): the pending flag fires
+			// the activation when the handshake completes.
+			(a) => a.type !== ChannelActionType.ERROR
+		);
+	}
+
+	/**
+	 * Section 7.5.2 H_commit from both current commitment views, after the
+	 * section 9.5.1 step 5 checks on the voucher outputs. Returns the hash,
+	 * or the first failing check.
+	 */
+	private _fforComputeCommit(f: IFforEpochRecord): Buffer | string {
+		const remotePoint = this._state.remoteCurrentPerCommitmentPoint;
+		if (!remotePoint) return 'no remote per-commitment point';
+		const nLocal = this._state.localCommitmentNumber;
+		const nRemote = this._state.remoteCommitmentNumber;
+		let local: IBuiltCommitment;
+		let remote: IBuiltCommitment;
+		try {
+			local = buildLocalCommitment(
+				this._state,
+				getPerCommitmentPoint(this._state.localPerCommitmentSeed, nLocal),
+				nLocal
+			);
+			remote = buildRemoteCommitment(this._state, remotePoint, nRemote);
+		} catch (err) {
+			return `commitment rebuild failed: ${(err as Error).message}`;
+		}
+		const bad =
+			this._fforCheckVoucherOutputs(f, local, 'local') ??
+			this._fforCheckVoucherOutputs(f, remote, 'remote');
+		if (bad) return bad;
+		if (
+			this._state.remoteHtlcSignatures.length !==
+			local.result.outputMap.htlcs.length
+		) {
+			return 'stored htlc_signature count does not cover every voucher';
+		}
+		const localTxid = local.result.tx.getHash();
+		const remoteTxid = remote.result.tx.getHash();
+		return f.role === 'R'
+			? computeHCommit(nLocal, localTxid, nRemote, remoteTxid)
+			: computeHCommit(nRemote, remoteTxid, nLocal, localTxid);
+	}
+
+	/** Step 5: count, amounts, cltv, none trimmed, on one view. */
+	private _fforCheckVoucherOutputs(
+		f: IFforEpochRecord,
+		built: IBuiltCommitment,
+		view: 'local' | 'remote'
+	): string | null {
+		const book = this._fforBook(f);
+		const { htlcs, htlcOriginalIndices } = built.result.outputMap;
+		if (htlcs.length !== book.length) {
+			return `${view} view carries ${htlcs.length} HTLC outputs, book has ${book.length}`;
+		}
+		const seen = new Set<number>();
+		for (let i = 0; i < htlcs.length; i++) {
+			const meta = built.htlcOutputs[htlcOriginalIndices[i]];
+			const entry = book.find((b) => b.paymentHash.equals(meta.paymentHash));
+			if (!entry || seen.has(entry.k)) {
+				return `${view} view HTLC output ${i} is not a book voucher`;
+			}
+			seen.add(entry.k);
+			if (meta.amount !== entry.amountMsat / 1000n) {
+				return `${view} view voucher ${entry.k} amount ${meta.amount} != floor(d_k / 1000)`;
+			}
+			if (meta.cltvExpiry !== entry.voucherExpiry) {
+				return `${view} view voucher ${entry.k} cltv_expiry != T_exp`;
+			}
+			if (BigInt(built.result.tx.outs[htlcs[i]].value) !== meta.amount) {
+				return `${view} view voucher ${entry.k} output value mismatch`;
+			}
+		}
+		return null;
+	}
+
+	/** R: ff_activate once quiescent (step 6); the stored bytes on a resend. */
+	private _fforSendActivate(): ChannelAction[] {
+		const f = this._fforLive();
+		if (!f || f.role !== 'R') return [];
+		if (
+			f.state !== FforState.VOUCHERS_COMMITTED &&
+			f.state !== FforState.ACTIVATING
+		) {
+			return [];
+		}
+		if (!this._quiescence.isQuiescent()) return [];
+		if (f.activateWire) {
+			return [
+				{ type: ChannelActionType.PERSIST_STATE },
+				replayMsg(MessageType.FF_ACTIVATE, f.activateWire.subarray(2))
+			];
+		}
+		if (!f.tSetup || !f.hBook || !f.hCommit) return [];
+		const epochStartHeight = this._currentBlockHeight;
+		const body = this._fforSign(
+			FF_ACTIVATE_TYPE,
+			encodeFforActivateUnsigned({
+				channelId: this._state.channelId!,
+				epochId: f.epochId,
+				setupHash: f.tSetup,
+				bookHash: f.hBook,
+				commitHash: f.hCommit,
+				epochStartHeight
+			})
+		);
+		if (!body) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'signing ff_activate failed'
+			);
+		}
+		f.activateWire = fforWireBytes(FF_ACTIVATE_TYPE, body);
+		f.epochStartHeight = epochStartHeight;
+		f.hAct = computeHAct(f.tSetup, f.hBook, f.hCommit, epochStartHeight);
+		f.state = FforState.ACTIVATING;
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.FF_ACTIVATE, body)
+		];
+	}
+
+	/**
+	 * S: ff_activate (section 7.5.4). Recomputes every hash, persists ACTIVE
+	 * with H_act and the book, answers ff_activate_ack and ends quiescence.
+	 */
+	handleFforActivate(payload: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		let msg: IFforActivateMessage;
+		try {
+			msg = decodeFforActivateMessage(payload);
+		} catch (err) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: undecodable ff_activate: ${(err as Error).message}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (!f || f.role !== 'S' || !f.epochId.equals(msg.epochId)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: ff_activate for an unknown epoch',
+					cleanup: 'none'
+				}
+			];
+		}
+		const wire = fforWireBytes(FF_ACTIVATE_TYPE, payload);
+		if (f.activateWire) {
+			if (f.activateWire.equals(wire) && f.activateAckWire) {
+				// Idempotent replay: the ack again (section 7.5.5).
+				return [
+					replayMsg(MessageType.FF_ACTIVATE_ACK, f.activateAckWire.subarray(2))
+				];
+			}
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: ff_activate differs from the one processed',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (f.state !== FforState.VOUCHERS_COMMITTED) {
+			if (f.state === FforState.NEGOTIATING) {
+				return this._fforAbortLocal(
+					f,
+					FforAbortReason.PROTOCOL_ERROR,
+					'ff_activate before the voucher round completed'
+				);
+			}
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: ff_activate in state ${FforState[f.state]}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (!verifyFforMessage(FF_ACTIVATE_TYPE, payload, f.remoteNodeId)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_activate signature invalid'
+			);
+		}
+		if (!this._quiescence.isQuiescent()) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_activate outside quiescence'
+			);
+		}
+		if (!f.tSetup || !msg.setupHash.equals(f.tSetup)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.BOOK_MISMATCH,
+				'ff_activate setup_hash mismatch'
+			);
+		}
+		if (!f.hBook || !msg.bookHash.equals(f.hBook)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.BOOK_MISMATCH,
+				'ff_activate book_hash mismatch'
+			);
+		}
+		const commit = this._fforComputeCommit(f);
+		if (typeof commit === 'string' || !msg.commitHash.equals(commit)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.COMMIT_MISMATCH,
+				typeof commit === 'string' ? commit : 'ff_activate commit_hash mismatch'
+			);
+		}
+		if (
+			this._currentBlockHeight > 0 &&
+			Math.abs(msg.epochStartHeight - this._currentBlockHeight) >
+				FF_EPOCH_START_TOLERANCE_BLOCKS
+		) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				`ff_activate epoch_start_height ${msg.epochStartHeight} not within ${FF_EPOCH_START_TOLERANCE_BLOCKS} of tip ${this._currentBlockHeight}`
+			);
+		}
+		const bookError = checkVoucherBook(f.params, this._fforBookContext('S'));
+		if (bookError) {
+			return this._fforAbortLocal(f, FforAbortReason.BOOK_MISMATCH, bookError);
+		}
+		const hAct = computeHAct(f.tSetup, f.hBook, commit, msg.epochStartHeight);
+		const ack = this._fforSign(
+			FF_ACTIVATE_ACK_TYPE,
+			encodeFforActivateAckUnsigned({
+				channelId: this._state.channelId!,
+				epochId: f.epochId,
+				activationHash: hAct
+			})
+		);
+		if (!ack) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'signing ff_activate_ack failed'
+			);
+		}
+		f.hCommit = commit;
+		f.hAct = hAct;
+		f.epochStartHeight = msg.epochStartHeight;
+		f.activateWire = wire;
+		f.activateAckWire = fforWireBytes(FF_ACTIVATE_ACK_TYPE, ack);
+		f.state = FforState.ACTIVE;
+		// ACTIVE is on disk before the ack leaves (the persist leads the batch
+		// and a failed persist withholds the send); the ack ends quiescence.
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.FF_ACTIVATE_ACK, ack),
+			...this.exitQuiescence()
+		];
+	}
+
+	/** R: ff_activate_ack (section 7.5.4). Persists ACTIVE, ends quiescence. */
+	handleFforActivateAck(payload: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		let msg: IFforActivateAckMessage;
+		try {
+			msg = decodeFforActivateAckMessage(payload);
+		} catch (err) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: undecodable ff_activate_ack: ${
+						(err as Error).message
+					}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (!f || f.role !== 'R' || !f.epochId.equals(msg.epochId)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: ff_activate_ack for an unknown epoch',
+					cleanup: 'none'
+				}
+			];
+		}
+		const wire = fforWireBytes(FF_ACTIVATE_ACK_TYPE, payload);
+		if (f.activateAckWire) {
+			if (f.activateAckWire.equals(wire)) return [];
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: ff_activate_ack differs from the one processed',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (f.state !== FforState.ACTIVATING || !f.hAct) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: ff_activate_ack in state ${FforState[f.state]}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (!verifyFforMessage(FF_ACTIVATE_ACK_TYPE, payload, f.remoteNodeId)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_activate_ack signature invalid'
+			);
+		}
+		if (!msg.activationHash.equals(f.hAct)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				'ff_activate_ack activation_hash != H_act'
+			);
+		}
+		f.activateAckWire = wire;
+		f.state = FforState.ACTIVE;
+		this._fforPendingActivate = false;
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			...(this._quiescence.isQuiescent() ? this.exitQuiescence() : [])
+		];
+	}
+
+	/** Either side: mark the record ABORTED and unwind what the abort leaves. */
+	private _fforMarkAborted(
+		f: IFforEpochRecord,
+		reason: FforAbortReason
+	): ChannelAction[] {
+		f.state = FforState.ABORTED;
+		f.abortReason = reason;
+		this._fforBurnEpochId(f.epochId);
+		this._fforPendingActivate = false;
+		const actions: ChannelAction[] = [];
+		if (this._quiescence.isQuiescent()) {
+			// Section 7.5.4: ff_abort terminates the quiescence session.
+			actions.push(...this.exitQuiescence());
+		} else if (this._quiescence.isQuiescing()) {
+			// The session this abort ends was still a handshake. Our stfu may
+			// already be on the wire, so its reply is expected and swallowed.
+			this._fforStfuReplyStale =
+				this._quiescence.getState() === QuiescenceState.SENT_STFU;
+			this._quiescence.reset();
+			this._stfuReplyOwed = false;
+			this._state.quiescenceState = QuiescenceState.NORMAL;
+			this._state.quiescenceInitiator = false;
+		}
+		if (f.role === 'R') {
+			f.unwindOwed = true;
+			actions.push(...this._fforMaybeUnwind(f));
+		}
+		return actions;
+	}
+
+	/** Send a signed ff_abort and abort locally (section 7.5.4). */
+	private _fforAbortLocal(
+		f: IFforEpochRecord,
+		reason: FforAbortReason,
+		text: string,
+		notify = true
+	): ChannelAction[] {
+		if (f.state === FforState.ABORTED) return [];
+		const actions: ChannelAction[] = [
+			{ type: ChannelActionType.PERSIST_STATE }
+		];
+		if (
+			f.state === FforState.ACTIVE ||
+			f.state === FforState.DRAINING ||
+			f.state === FforState.CLOSED
+		) {
+			// Section 7.5.1: there is no abort from ACTIVE.
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: cannot abort in state ${FforState[f.state]}: ${text}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		const abort = this._fforSign(
+			FF_ABORT_TYPE,
+			encodeFforAbortUnsigned({
+				channelId: this._state.channelId!,
+				epochId: f.epochId,
+				transcriptHash: f.acceptWire && f.tSetup ? f.tSetup : f.tInit,
+				reason,
+				data: Buffer.from(text, 'utf8')
+			})
+		);
+		if (abort) actions.push(sendMsg(MessageType.FF_ABORT, abort));
+		actions.push(...this._fforMarkAborted(f, reason));
+		if (notify) {
+			actions.push({
+				type: ChannelActionType.ERROR,
+				message: `FFOR epoch aborted (reason ${reason}): ${text}`,
+				cleanup: 'none'
+			});
+		}
+		return actions;
+	}
+
+	/** Operator abort of a setup before ACTIVE. */
+	abortFforEpoch(
+		reason: FforAbortReason = FforAbortReason.OPERATOR,
+		text = 'operator abort'
+	): ChannelAction[] {
+		const f = this._fforLive();
+		if (!f) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: no epoch to abort',
+					cleanup: 'none'
+				}
+			];
+		}
+		// The operator asked for this: not an error of the channel's.
+		return this._fforAbortLocal(f, reason, text, false);
+	}
+
+	/** Either side: the peer's ff_abort (section 7.5.4). */
+	handleFforAbort(payload: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		let msg: IFforAbortMessage;
+		try {
+			msg = decodeFforAbortMessage(payload);
+		} catch (err) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: undecodable ff_abort: ${(err as Error).message}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (!f || !f.epochId.equals(msg.epochId)) {
+			// An abort for an epoch we never recorded (a refused ff_init on the
+			// peer's side): nothing to unwind, but the id is spent.
+			this._fforBurnEpochId(msg.epochId);
+			return [{ type: ChannelActionType.PERSIST_STATE }];
+		}
+		if (f.state === FforState.ABORTED) return [];
+		if (
+			f.state === FforState.ACTIVE ||
+			f.state === FforState.DRAINING ||
+			f.state === FforState.CLOSED
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: ff_abort in state ${
+						FforState[f.state]
+					} is a protocol error`,
+					cleanup: 'none'
+				}
+			];
+		}
+		const actions: ChannelAction[] = [
+			{ type: ChannelActionType.PERSIST_STATE }
+		];
+		const expected = f.acceptWire && f.tSetup ? f.tSetup : f.tInit;
+		if (
+			!verifyFforMessage(FF_ABORT_TYPE, payload, f.remoteNodeId) ||
+			!msg.transcriptHash.equals(expected)
+		) {
+			actions.push({
+				type: ChannelActionType.ERROR,
+				message: 'FFOR: ff_abort signature or transcript hash invalid',
+				cleanup: 'none'
+			});
+		}
+		actions.push(...this._fforMarkAborted(f, msg.reason));
+		actions.push({
+			type: ChannelActionType.ERROR,
+			message: `FFOR epoch aborted by peer (reason ${
+				msg.reason
+			}): ${msg.data.toString('utf8')}`,
+			cleanup: 'none'
+		});
+		return actions;
+	}
+
+	/** Either side: ff_error (section 11.1): before ACTIVE it aborts. */
+	handleFforError(payload: Buffer): ChannelAction[] {
+		let msg: IFforErrorMessage;
+		try {
+			msg = decodeFforErrorMessage(payload);
+		} catch {
+			return [];
+		}
+		const f = this._state.ffor;
+		const text = `FFOR ff_error from peer: ${msg.data.toString('utf8')}`;
+		if (!f || !f.epochId.equals(msg.epochId) || f.state === FforState.ABORTED) {
+			return [
+				{ type: ChannelActionType.ERROR, message: text, cleanup: 'none' }
+			];
+		}
+		if (
+			f.state === FforState.ACTIVE ||
+			f.state === FforState.DRAINING ||
+			f.state === FforState.CLOSED
+		) {
+			return [
+				{ type: ChannelActionType.ERROR, message: text, cleanup: 'none' }
+			];
+		}
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			...this._fforMarkAborted(f, FforAbortReason.PROTOCOL_ERROR),
+			{ type: ChannelActionType.ERROR, message: text, cleanup: 'none' }
+		];
+	}
+
+	/**
+	 * Section 9.5.1 "Abort after the voucher round": R fails every voucher
+	 * once the channel is synchronized. Idempotent; re-run at every round
+	 * boundary until no voucher remains.
+	 */
+	private _fforMaybeUnwind(f: IFforEpochRecord): ChannelAction[] {
+		if (f.role !== 'R' || !f.unwindOwed) return [];
+		if (this._state.state !== ChannelState.NORMAL) return [];
+		if (this._quiescence.isQuiescing()) return [];
+		const actions: ChannelAction[] = [];
+		let remaining = false;
+		for (const entry of this._fforVoucherEntries(f).values()) {
+			if (entry.state !== HtlcState.COMMITTED) {
+				if (entry.state === HtlcState.PENDING) remaining = true;
+				continue;
+			}
+			const fail = this.failHtlc(entry.id, this._fforVoucherFailReason(entry));
+			if (fail.some((a) => a.type === ChannelActionType.ERROR)) {
+				remaining = true;
+				continue;
+			}
+			actions.push(...fail);
+		}
+		f.unwindOwed = remaining;
+		return actions;
+	}
+
+	/** temporary_node_failure for a voucher, encrypted when we can decode its onion. */
+	private _fforVoucherFailReason(entry: IHtlcEntry): Buffer {
+		const nodeKey = this._fforCtx?.nodePrivateKey ?? null;
+		if (nodeKey) {
+			try {
+				const processed = processOnionPacket(
+					decodeOnionPacket(entry.onionRoutingPacket),
+					nodeKey,
+					entry.paymentHash
+				);
+				return createFailureMessage(
+					processed.sharedSecret,
+					TEMPORARY_NODE_FAILURE
+				);
+			} catch {
+				/* fall through */
+			}
+		}
+		return Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+	}
+
+	/** Section 7.5.1: CLOSED once no voucher remains in either commitment. */
+	private _fforMaybeClosed(f: IFforEpochRecord): ChannelAction[] {
+		if (f.state !== FforState.DRAINING) return [];
+		if (this._fforVoucherEntries(f).size > 0) return [];
+		if (this.hasPendingHtlcs()) return [];
+		f.state = FforState.CLOSED;
+		return [];
+	}
+
+	/** R: ff_close (section 7.5.4), or its resend while the ack is owed. */
+	closeFforEpoch(): ChannelAction[] {
+		const f = this._fforLive();
+		if (!f || f.role !== 'R' || f.state !== FforState.ACTIVE || !f.hAct) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: no ACTIVE epoch of ours to close',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (f.closeWire) {
+			return [replayMsg(MessageType.FF_CLOSE, f.closeWire.subarray(2))];
+		}
+		const body = this._fforSign(
+			FF_CLOSE_TYPE,
+			encodeFforCloseUnsigned({
+				channelId: this._state.channelId!,
+				epochId: f.epochId,
+				activationHash: f.hAct
+			})
+		);
+		if (!body) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: signing ff_close failed',
+					cleanup: 'none'
+				}
+			];
+		}
+		f.closeWire = fforWireBytes(FF_CLOSE_TYPE, body);
+		f.closeSent = true;
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.FF_CLOSE, body)
+		];
+	}
+
+	/**
+	 * S: ff_close (section 7.5.4). The admission stop: DRAINING with the
+	 * settled bitmap and preimages is on disk before ff_close_ack leaves.
+	 */
+	handleFforClose(payload: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		let msg: IFforCloseMessage;
+		try {
+			msg = decodeFforCloseMessage(payload);
+		} catch (err) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: undecodable ff_close: ${(err as Error).message}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (!f || f.role !== 'S' || !f.epochId.equals(msg.epochId)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: ff_close for an unknown epoch',
+					cleanup: 'none'
+				}
+			];
+		}
+		const wire = fforWireBytes(FF_CLOSE_TYPE, payload);
+		if (f.closeWire) {
+			if (f.closeWire.equals(wire) && f.closeAckWire) {
+				return [
+					replayMsg(MessageType.FF_CLOSE_ACK, f.closeAckWire.subarray(2))
+				];
+			}
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: ff_close differs from the one processed',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (f.state !== FforState.ACTIVE || !f.hAct) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: ff_close in state ${FforState[f.state]}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (
+			!verifyFforMessage(FF_CLOSE_TYPE, payload, f.remoteNodeId) ||
+			!msg.activationHash.equals(f.hAct)
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: ff_close signature or activation_hash invalid',
+					cleanup: 'none'
+				}
+			];
+		}
+		// Section 7.5.6: the stopping condition, observed before anything acts
+		// on it. A slot still SETTLING committed to its settlement before the
+		// close: it counts as settled, and the upstream re-drive completes it.
+		f.closeProcessed = true;
+		f.closeWire = wire;
+		const K = f.params.maxPayments;
+		const bitmap = Buffer.alloc(bitmapLength(K));
+		const preimages: { k: number; preimage: Buffer }[] = [];
+		for (let k = 1; k <= K; k++) {
+			if (f.slotStates[k - 1] === FforSlotState.SETTLING) {
+				f.slotStates[k - 1] = FforSlotState.SETTLED;
+			}
+			if (f.slotStates[k - 1] === FforSlotState.SETTLED) {
+				bitmapSet(bitmap, k);
+				preimages.push({ k, preimage: f.preimages[k - 1] });
+			}
+		}
+		const ack = this._fforSign(
+			FF_CLOSE_ACK_TYPE,
+			encodeFforCloseAckUnsigned({
+				channelId: this._state.channelId!,
+				epochId: f.epochId,
+				activationHash: f.hAct,
+				numSlots: K,
+				settled: bitmap,
+				preimages
+			})
+		);
+		if (!ack) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: signing ff_close_ack failed',
+					cleanup: 'none'
+				}
+			];
+		}
+		f.settledBitmap = bitmap;
+		f.closeAckWire = fforWireBytes(FF_CLOSE_ACK_TYPE, ack);
+		f.state = FforState.DRAINING;
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.FF_CLOSE_ACK, ack)
+		];
+	}
+
+	/** R: ff_close_ack (section 7.5.4). Persists DRAINING, then drains. */
+	handleFforCloseAck(payload: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		let msg: IFforCloseAckMessage;
+		try {
+			msg = decodeFforCloseAckMessage(payload);
+		} catch (err) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: undecodable ff_close_ack: ${(err as Error).message}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (!f || f.role !== 'R' || !f.epochId.equals(msg.epochId)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: ff_close_ack for an unknown epoch',
+					cleanup: 'none'
+				}
+			];
+		}
+		const wire = fforWireBytes(FF_CLOSE_ACK_TYPE, payload);
+		if (f.closeAckWire) {
+			if (f.closeAckWire.equals(wire)) {
+				// A retransmission: re-drive whatever the drain still owes.
+				return this._fforDrain(f);
+			}
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: ff_close_ack differs from the one processed',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (f.state !== FforState.ACTIVE || !f.closeSent || !f.hAct) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: ff_close_ack in state ${
+						FforState[f.state]
+					} without ff_close`,
+					cleanup: 'none'
+				}
+			];
+		}
+		const K = f.params.maxPayments;
+		if (
+			!verifyFforMessage(FF_CLOSE_ACK_TYPE, payload, f.remoteNodeId) ||
+			!msg.activationHash.equals(f.hAct) ||
+			msg.numSlots !== K
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'FFOR: ff_close_ack signature, activation_hash or num_slots invalid',
+					cleanup: 'none'
+				}
+			];
+		}
+		// A set bit without its preimage, or a preimage that does not hash to
+		// H_k, is a protocol error: the ack is not adopted.
+		const byK = new Map<number, Buffer>();
+		for (const p of msg.preimages) {
+			if (p.k < 1 || p.k > K) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'FFOR: ff_close_ack preimage slot out of range',
+						cleanup: 'none'
+					}
+				];
+			}
+			const h = crypto.createHash('sha256').update(p.preimage).digest();
+			if (!h.equals(f.paymentHashes[p.k - 1])) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `FFOR: ff_close_ack preimage for slot ${p.k} does not hash to H_k`,
+						cleanup: 'none'
+					}
+				];
+			}
+			byK.set(p.k, p.preimage);
+		}
+		for (let k = 1; k <= K; k++) {
+			if (bitmapGet(msg.settled, k) && !byK.has(k)) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `FFOR: ff_close_ack marks slot ${k} settled without its preimage`,
+						cleanup: 'none'
+					}
+				];
+			}
+		}
+		for (const [k, p] of byK) f.knownPreimages[k - 1] = p;
+		f.settledBitmap = Buffer.from(msg.settled);
+		f.closeAckWire = wire;
+		f.state = FforState.DRAINING;
+		return [{ type: ChannelActionType.PERSIST_STATE }, ...this._fforDrain(f)];
+	}
+
+	/**
+	 * Section 7.5.6 draining: fulfil every slot we hold a preimage for, fail
+	 * every slot the bitmap marks unsettled for which we hold none, never
+	 * fail one we hold a preimage for. Idempotent: resolved slots are skipped.
+	 */
+	private _fforDrain(f: IFforEpochRecord): ChannelAction[] {
+		if (f.state !== FforState.DRAINING || !f.settledBitmap) return [];
+		if (this._state.state !== ChannelState.NORMAL) return [];
+		if (this._quiescence.isQuiescing()) return [];
+		const actions: ChannelAction[] = [];
+		for (const [k, entry] of this._fforVoucherEntries(f)) {
+			if (entry.state !== HtlcState.COMMITTED) continue;
+			const preimage = f.knownPreimages[k - 1];
+			if (preimage) {
+				const r = this.fulfillHtlc(entry.id, preimage);
+				if (!r.some((a) => a.type === ChannelActionType.ERROR))
+					actions.push(...r);
+			} else if (!bitmapGet(f.settledBitmap, k)) {
+				const r = this.failHtlc(entry.id, this._fforVoucherFailReason(entry));
+				if (!r.some((a) => a.type === ChannelActionType.ERROR))
+					actions.push(...r);
+			}
+			// A slot marked settled whose preimage we lack stays pending until
+			// a payer or witness supplies it, or T_exp resolves it on-chain.
+		}
+		return actions;
+	}
+
+	/**
+	 * R: a preimage learned outside the ack (a payer's receipt, a witness).
+	 * Section 7.5.6: a slot we hold a preimage for is fulfilled, never failed.
+	 */
+	fforAddPreimage(preimage: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		if (!f || f.role !== 'R') {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: no epoch of ours to credit',
+					cleanup: 'none'
+				}
+			];
+		}
+		const h = crypto.createHash('sha256').update(preimage).digest();
+		const idx = f.paymentHashes.findIndex((x) => x.equals(h));
+		if (idx < 0) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: preimage matches no voucher of this epoch',
+					cleanup: 'none'
+				}
+			];
+		}
+		f.knownPreimages[idx] = Buffer.from(preimage);
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			...(f.state === FforState.DRAINING ? this._fforDrain(f) : [])
+		];
+	}
+
+	/** S: per-slot settlement state, durable (section 9.5.1 "Settlement"). */
+	fforSetSlot(
+		k: number,
+		state: FforSlotState,
+		upstream: string | null
+	): ChannelAction[] {
+		const f = this._state.ffor;
+		if (!f || f.role !== 'S' || k < 1 || k > f.params.maxPayments) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: no such slot',
+					cleanup: 'none'
+				}
+			];
+		}
+		f.slotStates[k - 1] = state;
+		f.slotUpstream[k - 1] = upstream;
+		return [{ type: ChannelActionType.PERSIST_STATE }];
+	}
+
+	/**
+	 * S: whether slot k may begin a delegated settlement now (section 7.5.6
+	 * stopping conditions that the channel can judge; the node adds the
+	 * upstream CLTV margin and the amount checks). Returns the refusal.
+	 */
+	fforSettlementRefusal(k: number, tipHeight: number): string | null {
+		const f = this._state.ffor;
+		if (!f || f.role !== 'S') return 'no epoch';
+		if (f.state !== FforState.ACTIVE) return `epoch is ${FforState[f.state]}`;
+		if (f.activationMismatch) return 'activation hash mismatch at reestablish';
+		if (f.closeProcessed) return 'ff_close processed';
+		if (tipHeight > 0 && tipHeight >= f.params.settlementDeadline) {
+			return 'settlement_deadline reached';
+		}
+		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
+		return null;
+	}
+
+	/** The section 11.1 reestablish TLV for our epoch, if any. */
+	private _fforReestablishTlv(): IFforReestablishTlv | undefined {
+		const f = this._state.ffor;
+		if (!f) return undefined;
+		return {
+			epochId: f.epochId,
+			state: f.state,
+			lastSeq: 0,
+			activationHash: f.hAct ?? Buffer.alloc(32)
+		};
+	}
+
+	/** Section 7.5.5 "Disconnect and restart": what a disconnect does to the setup. */
+	private _fforOnDisconnect(): void {
+		this._fforPendingActivate = false;
+		const f = this._fforLive();
+		if (!f) return;
+		switch (f.state) {
+			case FforState.NEGOTIATING:
+				this._fforMarkAborted(f, FforAbortReason.DISCONNECT);
+				break;
+			case FforState.VOUCHERS_COMMITTED:
+				// Neither side has persisted ACTIVE (S does so only as it sends the
+				// ack), so nothing before it is worth resuming: abort.
+				this._fforMarkAborted(f, FforAbortReason.DISCONNECT);
+				break;
+			default:
+				// ACTIVATING (S may have persisted ACTIVE and owe the ack),
+				// ACTIVE, DRAINING: durable, resolved at reestablish.
+				break;
+		}
+	}
+
+	/**
+	 * Section 7.5.5 retransmission rules, resolved from the peer's TLV 55001
+	 * once the channel is back in its live state.
+	 */
+	private _handleReestablishFfor(
+		msg: IChannelReestablishMessage
+	): ChannelAction[] {
+		const f = this._state.ffor;
+		if (!f) return [];
+		const peer =
+			msg.ffor && msg.ffor.epochId.equals(f.epochId) ? msg.ffor : null;
+		const peerState: FforState | null = peer ? peer.state : null;
+		const actions: ChannelAction[] = [];
+		const error = (message: string): void => {
+			actions.push({ type: ChannelActionType.ERROR, message, cleanup: 'none' });
+		};
+		switch (f.state) {
+			case FforState.NEGOTIATING:
+				actions.push(
+					...this._fforAbortLocal(
+						f,
+						FforAbortReason.DISCONNECT,
+						'disconnected before the voucher round completed'
+					)
+				);
+				break;
+			case FforState.VOUCHERS_COMMITTED:
+				actions.push(
+					...this._fforAbortLocal(
+						f,
+						FforAbortReason.DISCONNECT,
+						'disconnected before activation'
+					)
+				);
+				break;
+			case FforState.ACTIVATING:
+				if (peerState === FforState.ACTIVE) {
+					// S persisted ACTIVE first and retransmits the ack.
+					break;
+				}
+				// S reports anything else: it never persisted ACTIVE, and a
+				// disconnect before ACTIVE aborts the setup on both sides.
+				actions.push(
+					...this._fforAbortLocal(
+						f,
+						FforAbortReason.DISCONNECT,
+						'peer did not reach ACTIVE'
+					)
+				);
+				break;
+			case FforState.ACTIVE:
+				if (peerState === null) {
+					f.activationMismatch = true;
+					actions.push({ type: ChannelActionType.PERSIST_STATE });
+					error('FFOR: peer reestablished without our ACTIVE epoch');
+					break;
+				}
+				if (
+					(peerState === FforState.ACTIVE ||
+						peerState === FforState.DRAINING ||
+						peerState === FforState.CLOSED) &&
+					f.hAct &&
+					!peer!.activationHash.equals(f.hAct)
+				) {
+					f.activationMismatch = true;
+					actions.push({ type: ChannelActionType.PERSIST_STATE });
+					error('FFOR: peer reports a different activation hash');
+					break;
+				}
+				if (
+					f.role === 'S' &&
+					peerState < FforState.ACTIVE &&
+					f.activateAckWire
+				) {
+					actions.push({ type: ChannelActionType.PERSIST_STATE });
+					actions.push(
+						replayMsg(
+							MessageType.FF_ACTIVATE_ACK,
+							f.activateAckWire.subarray(2)
+						)
+					);
+				}
+				if (
+					f.role === 'R' &&
+					peerState === FforState.ACTIVE &&
+					f.closeSent &&
+					f.closeWire
+				) {
+					actions.push({ type: ChannelActionType.PERSIST_STATE });
+					actions.push(
+						replayMsg(MessageType.FF_CLOSE, f.closeWire.subarray(2))
+					);
+				}
+				break;
+			case FforState.DRAINING:
+			case FforState.CLOSED:
+				if (
+					f.role === 'S' &&
+					peerState === FforState.ACTIVE &&
+					f.closeAckWire
+				) {
+					actions.push({ type: ChannelActionType.PERSIST_STATE });
+					actions.push(
+						replayMsg(MessageType.FF_CLOSE_ACK, f.closeAckWire.subarray(2))
+					);
+				}
+				if (f.role === 'R' && f.state === FforState.DRAINING) {
+					actions.push(...this._fforDrain(f));
+				}
+				break;
+			case FforState.ABORTED:
+				if (f.unwindOwed) actions.push(...this._fforMaybeUnwind(f));
+				break;
+		}
 		return actions;
 	}
 }
