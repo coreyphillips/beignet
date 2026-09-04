@@ -19,6 +19,7 @@ import {
 	GUARDIAN_PROTOCOL_VERSION,
 	GuardianState,
 	receiptTranscriptHash,
+	rotationEvidenceProblem,
 	takeoverTranscriptHash,
 	verifyTranscript
 } from './guardian-wire';
@@ -623,6 +624,46 @@ export function verifyGuardianCertificate(
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * The rotation a guardian attached to an answer, IF it is evidence
+ * (wire 5.11): root-signed over THIS set's prefix, bound to this
+ * recovery_id, naming a well-formed incoming set, and ABOVE the generation
+ * the caller already knows. Judged by rotationEvidenceProblem, the same
+ * rule the guardian applies to its own persisted marker, so the
+ * replication client and the restore driver can never disagree with each
+ * other or with the guardian about what a rotation is.
+ *
+ * The answer's status is deliberately NOT consulted: a retired namespace
+ * rides an OK head, a quarantined or tombstoned one an ERR_STORE_UNCERTAIN
+ * answer (wire 5.3), and one old guardian that still proves where the
+ * namespace went is the whole acceptance model of 5.9 step 5. The answer's
+ * own unsigned `generation`, when it carries one, raises the floor: a
+ * guardian that reports generation g beside a rotation at or below g
+ * contradicts itself, and neither half of that answer is evidence.
+ */
+export function verifyGuardianRotation(
+	response:
+		| { rotation?: IGuardianRotateSetRequest; generation?: bigint }
+		| undefined,
+	context: IGuardianSetContext,
+	recoveryId: Buffer,
+	knownGeneration: bigint
+): IGuardianRotateSetRequest | null {
+	const rotation = response?.rotation;
+	if (!rotation) return null;
+	const reported = response?.generation;
+	const floor =
+		typeof reported === 'bigint' && reported > knownGeneration
+			? reported
+			: knownGeneration;
+	const problem = rotationEvidenceProblem(rotation, {
+		guardianSetId: context.guardianSetId,
+		recoveryId,
+		generation: floor
+	});
+	return problem === null ? rotation : null;
 }
 
 // ─────────────── bound guardians ───────────────

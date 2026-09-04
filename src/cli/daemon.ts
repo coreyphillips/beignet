@@ -249,6 +249,11 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	RESTORE_UNKNOWN_NAMESPACE: 404,
 	RESTORE_CONFLICT: 409,
 	RESTORE_HEAD_UNVERIFIABLE: 502,
+	// The set retired this namespace (wire 5.11) and the restore could not
+	// follow the rotation to a set that answers restore-required: a state
+	// conflict the caller reacts to (restart to decide against the incoming
+	// set), not a fault of this node.
+	RESTORE_ROTATED: 409,
 	// A node-hosted guardian that did not answer a resolve probe (issue
 	// #699): the upstream, not this node, so 502 and retryable.
 	GUARDIAN_UNREACHABLE: 502,

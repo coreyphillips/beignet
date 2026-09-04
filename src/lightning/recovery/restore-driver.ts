@@ -32,6 +32,18 @@
  * committed one, taking over without a quorum, or treating one guardian's
  * word as proof would each trade a provable state for a plausible one, and
  * this protocol exists precisely to refuse that trade.
+ *
+ * One guardian's word IS enough for exactly one thing: a root-signed
+ * rotation (wire 5.9, 5.11). The set this driver was pointed at may have
+ * retired the namespace in favour of another, and the retirement is
+ * accepted by as few as one outgoing member. So every head read verifies
+ * the rotation evidence it carries before anything is reconciled, and an
+ * ERR_SET_RETIRED answer to the takeover re-reads the heads instead of
+ * being outvoted. A proven rotation ends the restore with
+ * RestoreRotatedError, having written nothing to the outgoing set; the
+ * caller follows it to the incoming set. Proceeding instead would acquire
+ * an epoch on a retired set and leave its members disagreeing about which
+ * generation is live.
  */
 
 import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
@@ -46,18 +58,23 @@ import {
 import {
 	GuardianStatus,
 	IGuardianAcquireEpochRequest,
+	IGuardianGetHeadResponse,
 	IGuardianRecord,
+	IGuardianRotateSetRequest,
 	IGuardianTakeoverCertificate
 } from './guardian';
 import {
 	GuardianClient,
 	IBoundGuardianClient,
+	IGuardianFanOutResult,
 	IGuardianSetContext,
 	boundFanOut,
 	verifyGuardianBindings,
 	verifyGuardianCertificate,
-	verifyGuardianReceipt
+	verifyGuardianReceipt,
+	verifyGuardianRotation
 } from './guardian-client';
+import type { IGuardianConfigEntry } from './assembly';
 import {
 	JOURNAL_META_KEYS,
 	deriveRecoveryMasterKey,
@@ -140,13 +157,57 @@ export class RestoreRefusedError extends Error {
 		| 'conflict'
 		| 'cas-exhausted'
 		| 'head-unverifiable'
-		| 'target-unsupported';
+		| 'target-unsupported'
+		| 'rotated';
 
 	constructor(reason: RestoreRefusedError['reason'], message: string) {
 		super(message);
 		this.name = 'RestoreRefusedError';
 		this.reason = reason;
 	}
+}
+
+/**
+ * The configured set retired this namespace in favour of the set the
+ * rotation names (wire 5.9, 5.11): the live chain is with the INCOMING
+ * set, and nothing on the outgoing one was touched. The restore refused
+ * with reason `rotated`, and this carries what a caller needs to follow:
+ * the verified rotation, its generation, and the incoming members as
+ * configuration entries (member id plus the transport hint the rotation
+ * carried). Rebuild the assembly with `entries`, decide again, and restore
+ * from the incoming set; the same shape the boot decision reports.
+ */
+export class RestoreRotatedError extends RestoreRefusedError {
+	readonly rotation: IGuardianRotateSetRequest;
+	readonly generation: bigint;
+	readonly entries: IGuardianConfigEntry[];
+
+	constructor(rotation: IGuardianRotateSetRequest) {
+		super(
+			'rotated',
+			`this namespace was rotated to generation ${rotation.generation}; ` +
+				'the outgoing set is retired and the incoming set holds the live chain'
+		);
+		this.name = 'RestoreRotatedError';
+		this.rotation = rotation;
+		this.generation = rotation.generation;
+		this.entries = rotationEntries(rotation);
+	}
+}
+
+/**
+ * The incoming set a rotation names, as configuration entries: the member
+ * ids are root-signed, the transports are the unsigned hints (wire 5.11)
+ * and are verified by the receipts the incoming members sign. Shared by
+ * the boot decision and the restore refusal so both report one shape.
+ */
+export function rotationEntries(
+	rotation: IGuardianRotateSetRequest
+): IGuardianConfigEntry[] {
+	return rotation.newMembers.map((member, i) => ({
+		guardianId: member.toString('hex'),
+		url: rotation.newTransports[i]?.url ?? ''
+	}));
 }
 
 export interface IRestoreDriverConfig {
@@ -179,6 +240,8 @@ export interface IRestoreEvent {
 		| 'epoch:cas-retry'
 		| 'epoch:resumed'
 		| 'epoch:abandoned'
+		| 'set:rotated'
+		| 'set:retired-unproven'
 		| 'frames:downloaded'
 		| 'restore:exactness'
 		| 'restore:complete';
@@ -358,6 +421,75 @@ export class RestoreDriver {
 		this.config.target.deleteRecoveryMeta?.(META_PENDING_ACQUISITION);
 	}
 
+	// ─────────────── rotation evidence (wire 5.11) ───────────────
+
+	/**
+	 * The generation this device already knows: 1 on an empty target, or the
+	 * generation a rotation it has followed persisted (the boot follow loop
+	 * writes it). A rotation is evidence only ABOVE this, so a replayed
+	 * older rotation for a set the namespace has since returned to cannot
+	 * send the restore back to a retired set.
+	 */
+	private knownGeneration(): bigint {
+		const raw = this.config.target.getRecoveryMeta?.(
+			JOURNAL_META_KEYS.generation
+		);
+		if (raw == null) return 1n;
+		try {
+			const value = BigInt(raw);
+			return value >= 1n ? value : 1n;
+		} catch {
+			return 1n;
+		}
+	}
+
+	/**
+	 * The first rotation among a set of head answers that proves itself:
+	 * verifyGuardianRotation, the judgement the replication client shares,
+	 * over the rule the guardian itself applies to the marker it serves. The
+	 * answer's status is not consulted (a quarantined or tombstoned old
+	 * guardian still attaches a rotation that verifies on its own, wire
+	 * 5.3), and an answer whose rotation fails is simply an answer without
+	 * one: malformed, mis-bound, stale or unsigned evidence fences nothing.
+	 */
+	private rotationAmong(
+		responses: Array<IGuardianFanOutResult<IGuardianGetHeadResponse>>
+	): IGuardianRotateSetRequest | null {
+		const known = this.knownGeneration();
+		for (const entry of responses) {
+			const rotation = verifyGuardianRotation(
+				entry.result,
+				this.config.context,
+				this.config.recoveryRoot.recoveryId,
+				known
+			);
+			if (rotation) return rotation;
+		}
+		return null;
+	}
+
+	/** Re-read every head for a rotation, after a guardian claimed retirement. */
+	private async refetchRotation(): Promise<IGuardianRotateSetRequest | null> {
+		const responses = await boundFanOut(this.config.guardians, (client) =>
+			client.getHead(this.config.recoveryRoot.recoveryId)
+		);
+		return this.rotationAmong(responses);
+	}
+
+	private rotated(rotation: IGuardianRotateSetRequest): RestoreRotatedError {
+		this.emit(
+			'set:rotated',
+			`this namespace was rotated to generation ${rotation.generation}; ` +
+				'the outgoing set is retired, nothing on it was written, follow the incoming set'
+		);
+		// A pending acquisition is kept while a guardian might be bound to
+		// it; on a retired set nothing bound to it can ever complete, and the
+		// record names no set, so a restore against the incoming set would
+		// otherwise resume it there.
+		this.clearPending();
+		return new RestoreRotatedError(rotation);
+	}
+
 	// ─────────────── head reading and reconciliation ───────────────
 
 	/**
@@ -377,6 +509,13 @@ export class RestoreDriver {
 		const responses = await boundFanOut(this.config.guardians, (client) =>
 			client.getHead(recoveryId)
 		);
+		// A rotation on ANY head redirects before anything else is decided,
+		// quorum included (wire 5.9 step 5, 5.11): one old guardian that
+		// still proves where the namespace went is the acceptance model, and
+		// reconciling, repairing or taking over here would advance a retired
+		// set. Nothing below this line runs once a rotation is proven.
+		const rotation = this.rotationAmong(responses);
+		if (rotation) throw this.rotated(rotation);
 		const answered = responses.filter((entry) => entry.result !== undefined);
 		if (answered.length < this.config.required) {
 			throw new RestoreRefusedError(
@@ -762,6 +901,26 @@ export class RestoreDriver {
 			const results = await boundFanOut(this.config.guardians, (client) =>
 				client.acquireEpoch(request)
 			);
+			// A guardian that answers ERR_SET_RETIRED is not a missing vote to
+			// be outnumbered by the others: it is the one old guardian the
+			// rotation protocol relies on (wire 5.9 step 5). The status is
+			// unsigned, so it proves nothing by itself; the root-signed
+			// rotation on its head does, and it is re-read and verified
+			// BEFORE any certificate quorum is counted. A retirement that
+			// landed between the head read and this request is found here.
+			if (
+				results.some(
+					(entry) => entry.result?.status === GuardianStatus.ERR_SET_RETIRED
+				)
+			) {
+				const rotation = await this.refetchRotation();
+				if (rotation) throw this.rotated(rotation);
+				this.emit(
+					'set:retired-unproven',
+					'a guardian answered ERR_SET_RETIRED but no head carries a rotation ' +
+						'that verifies; the claim is unproven and does not fence this restore'
+				);
+			}
 			const certificates = this.collectCertificates(results, pending);
 			if (certificates.length >= this.config.required) {
 				const lease: IWriterLeaseKeys = {
