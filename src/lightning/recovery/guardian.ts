@@ -878,8 +878,7 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(state.recoveryId);
 			if (quarantine) return quarantine;
 			const stateBuf = stateBytes(state);
-			const outcome = this.store.write(() => {
-				const ns = this.store.getNamespace(state.recoveryId);
+			const outcome = this.fencedWrite(state.recoveryId, (ns) => {
 				if (ns && ns.registrationState) {
 					if (
 						ns.registrationState.equals(stateBuf) &&
@@ -954,6 +953,7 @@ export class ReferenceGuardian {
 				return { kind: 'ok' as const, receipt };
 			});
 
+			if ('status' in outcome) return outcome;
 			if (outcome.kind === 'duplicate') {
 				const ns = outcome.ns;
 				return {
@@ -1063,11 +1063,8 @@ export class ReferenceGuardian {
 			const ciphertextHash = sha256(record.ciphertext);
 			const quarantine = this.quarantineGate(record.recoveryId);
 			if (quarantine) return quarantine;
-			const retired = this.retiredGate(record.recoveryId);
-			if (retired) return retired;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(record.recoveryId);
+			return this.fencedWrite(record.recoveryId, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -1255,18 +1252,56 @@ export class ReferenceGuardian {
 	}
 
 	/**
-	 * A namespace rotated away from this set refuses every write (wire
-	 * 5.11): the live chain is with the incoming set, and a writer that
-	 * still addresses this one is a stale device that must freeze. Reads
-	 * stay open so a restore device can find the rotation.
+	 * The write transaction every mutating verb runs in, with the retirement
+	 * fence INSIDE it (wire 5.11, issue #711).
+	 *
+	 * A namespace rotated away from this set refuses every write: the live
+	 * chain is with the incoming set, and a writer that still addresses this
+	 * one is a stale device that must freeze. Reads stay open so a restore
+	 * device can find the rotation. The fence is only final if it is judged
+	 * under the same BEGIN IMMEDIATE lock the mutation commits under: a
+	 * check made in a read transaction beforehand can be overtaken by a
+	 * ROTATE_SET that commits between that read and this lock, and the
+	 * stale write would then commit into a retired namespace. So there is
+	 * no preflight: the row is loaded here, under the write lock, and the
+	 * marker it carries is authoritative for the whole transaction. A verb
+	 * that mutates a namespace without going through here has a bug.
+	 *
+	 * Precedence when retirement races another verdict, in this order:
+	 *
+	 *   1. quarantine (ERR_STORE_UNCERTAIN, quarantineGate) comes BEFORE the
+	 *      transaction: the row is not trusted to be ours, so its rotation
+	 *      column is not trusted either; the set is fixed at open, so the
+	 *      order is deterministic;
+	 *   2. an absent row is ERR_UNKNOWN_NODE: nothing was ever retired;
+	 *   3. a row carrying a rotation is ERR_SET_RETIRED, before any verdict
+	 *      the row's other columns would yield: an uncertain store, an
+	 *      idempotent replay (OK_DUPLICATE), a stale or ahead epoch, a lease
+	 *      CAS mismatch, a sequence gap, a conflict. Retirement is the
+	 *      permanent, root-signed answer; every other verdict describes a
+	 *      chain that is no longer live here, and a stale writer must be
+	 *      told to freeze, not told to retry or that it succeeded.
+	 *
+	 * ROTATE_SET itself does not use this helper: it is the transaction
+	 * that writes the marker, and it judges an existing marker under its own
+	 * idempotency rules (OK_DUPLICATE, ERR_CONFLICT, ERR_EPOCH_REGRESSION).
+	 * It runs in the same store.write, so the marker is written under the
+	 * same lock this fence reads it under.
 	 */
-	private retiredGate(recoveryId: Buffer): IErr | null {
-		const ns = this.store.read(() => this.store.getNamespace(recoveryId));
-		if (!ns || !ns.rotation) return null;
-		return err(
-			GuardianStatus.ERR_SET_RETIRED,
-			'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
-		);
+	private fencedWrite<T>(
+		recoveryId: Buffer,
+		body: (ns: IGuardianNamespaceRow | null) => T
+	): T | IErr {
+		return this.store.write(() => {
+			const ns = this.store.getNamespace(recoveryId);
+			if (ns && ns.rotation) {
+				return err(
+					GuardianStatus.ERR_SET_RETIRED,
+					'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
+				);
+			}
+			return body(ns);
+		});
 	}
 
 	// ─────────────── ROTATE_SET (wire 5.11) ───────────────
@@ -1351,6 +1386,9 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(request.recoveryId);
 			if (quarantine) return quarantine;
 			const encoded = encodeRotateSetRequest(request);
+			// The retirement transaction itself: the same BEGIN IMMEDIATE every
+			// fencedWrite takes, so the marker written here is visible to the
+			// next writer the moment this lock is released, and never before.
 			const outcome = this.store.write(() => {
 				const ns = this.store.getNamespace(request.recoveryId);
 				if (!ns || !ns.registrationState) {
@@ -1593,11 +1631,8 @@ export class ReferenceGuardian {
 			}
 			const quarantine = this.quarantineGate(expected.recoveryId);
 			if (quarantine) return quarantine;
-			const retired = this.retiredGate(expected.recoveryId);
-			if (retired) return retired;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(expected.recoveryId);
+			return this.fencedWrite(expected.recoveryId, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -1853,11 +1888,8 @@ export class ReferenceGuardian {
 			const recoveryId = certified.recoveryId;
 			const quarantine = this.quarantineGate(recoveryId);
 			if (quarantine) return quarantine;
-			const retired = this.retiredGate(recoveryId);
-			if (retired) return retired;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(recoveryId);
+			return this.fencedWrite(recoveryId, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -2138,8 +2170,7 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(request.recoveryId);
 			if (quarantine) return quarantine;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(request.recoveryId);
+			return this.fencedWrite(request.recoveryId, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
