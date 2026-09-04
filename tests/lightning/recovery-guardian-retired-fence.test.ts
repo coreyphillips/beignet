@@ -17,7 +17,12 @@
  * - the same, under a real cross-thread lock wait behind the retirement
  *   transaction itself;
  * - the precedence of retirement over every verdict the row would
- *   otherwise yield, and of quarantine over retirement.
+ *   otherwise yield, and of quarantine over retirement;
+ * - a rotation that verifies on its own rides GET_HEAD even when the rest
+ *   of the row is uncertain or quarantined;
+ * - the persisted marker is validated at open, so a damaged column
+ *   quarantines the namespace instead of silently retiring or reopening
+ *   it, and presence is never judged by truthiness.
  */
 
 import { expect } from 'chai';
@@ -166,20 +171,27 @@ function record(
 const FIRST = record(1n, Buffer.alloc(32));
 const SECOND = record(2n, FIRST.frameHash);
 
-function rotation(): IGuardianRotateSetRequest {
+function rotation(
+	overrides: {
+		generation?: bigint;
+		guardianSetId?: Buffer;
+		signer?: typeof ROOT;
+	} = {}
+): IGuardianRotateSetRequest {
+	const setId = overrides.guardianSetId ?? OLD_SET;
 	const fields = {
 		recoveryId: ROOT.recoveryId,
 		newGuardianSetId: NEW_SET,
-		generation: 2n,
+		generation: overrides.generation ?? 2n,
 		newMembers: NEW_MEMBERS
 	};
 	return {
 		protocolVersion: 1,
-		guardianSetId: OLD_SET,
+		guardianSetId: setId,
 		...fields,
 		rootSignature: signTranscript(
-			rotateTranscriptHash(OLD_SET, fields),
-			ROOT.rootSecret
+			rotateTranscriptHash(setId, fields),
+			(overrides.signer ?? ROOT).rootSecret
 		),
 		newTransports: NEW_MEMBERS.map((m) => ({
 			type: 'https',
@@ -281,6 +293,23 @@ function markPossiblyStale(file: string): void {
 	const raw = new Database(file);
 	raw.prepare('UPDATE guardian_namespaces SET possibly_stale = 1').run();
 	raw.close();
+}
+
+function storeRotation(file: string, value: Buffer | bigint): void {
+	const raw = new Database(file);
+	raw.prepare('UPDATE guardian_namespaces SET rotation = ?').run(value);
+	raw.close();
+}
+
+function storedRotationCell(file: string): { type: string; value: unknown } {
+	const raw = new Database(file);
+	const row = raw
+		.prepare(
+			'SELECT typeof(rotation) AS type, rotation AS value FROM guardian_namespaces WHERE recovery_id = ?'
+		)
+		.get(ROOT.recoveryId) as { type: string; value: unknown };
+	raw.close();
+	return row;
 }
 
 function storedRotation(file: string): Buffer | null {
@@ -410,6 +439,18 @@ function expectRetiredSnapshot(
 	expect(answer.possiblyStale).to.equal(possiblyStale);
 	expect(answer.generation).to.equal(1n);
 	expect(answer.rotation, 'the rotation rides GET_HEAD').to.not.equal(
+		undefined
+	);
+	expect(
+		encodeRotateSetRequest(answer.rotation!).equals(ROTATION_BYTES)
+	).to.equal(true);
+}
+
+function expectUncertainWithRotation(answer: IGuardianGetHeadResponse): void {
+	expect(answer.status, answer.detail).to.equal(
+		GuardianStatus.ERR_STORE_UNCERTAIN
+	);
+	expect(answer.rotation, 'the rotation rides the uncertain head').to.not.equal(
 		undefined
 	);
 	expect(
@@ -553,7 +594,10 @@ describe('guardian retirement fence (#711): two connections, one store', () => {
 		expect(
 			alarms.some((al) => al.status === GuardianStatus.ERR_STORE_UNCERTAIN)
 		).to.equal(true);
-		expect(head(reopened).status).to.equal(GuardianStatus.ERR_STORE_UNCERTAIN);
+		// The row cannot be served, but the rotation proves itself and still
+		// rides the head: a restore device that only knows this guardian
+		// must learn where the namespace went (wire 5.3, 5.11).
+		expectUncertainWithRotation(head(reopened));
 		expect(storedRotation(file)!.equals(ROTATION_BYTES)).to.equal(true);
 
 		// A root-signed registration would re-anchor an ordinary tombstone
@@ -562,7 +606,7 @@ describe('guardian retirement fence (#711): two connections, one store', () => {
 		// write may overwrite.
 		expectRetired(reopened.register(registration(1n)), 'tombstone re-anchor');
 		expect(storedRotation(file)!.equals(ROTATION_BYTES)).to.equal(true);
-		expect(head(reopened).status).to.equal(GuardianStatus.ERR_STORE_UNCERTAIN);
+		expectUncertainWithRotation(head(reopened));
 	});
 
 	it('a writer blocked behind the retirement transaction itself sees the marker once it holds the lock', async () => {
@@ -766,13 +810,114 @@ describe('guardian retirement fence (#711): precedence over other verdicts', () 
 					GuardianStatus.ERR_STORE_UNCERTAIN
 				);
 			}
-			expect(head(reopened).status).to.equal(
-				GuardianStatus.ERR_STORE_UNCERTAIN
-			);
+			// Quarantine hides the row, not the rotation: it binds this set and
+			// this recovery_id inside the root signature, so it proves itself
+			// even though the row's set column does not.
+			expectUncertainWithRotation(head(reopened));
 			// Quarantine is non-destructive: the marker is still there.
 			expect(storedRotation(file)!.equals(ROTATION_BYTES)).to.equal(true);
 		} finally {
 			reopened.close();
+		}
+	});
+});
+
+describe('guardian retirement fence (#711): the persisted marker is validated at open', () => {
+	let dir: string;
+	let file: string;
+	let current: GuardianState;
+
+	beforeEach(() => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-guardian-fence-'));
+		file = path.join(dir, 'guardian.sqlite');
+		const g = guardianFor(file);
+		seed(g);
+		current = stateOf(g);
+		g.close();
+	});
+
+	afterEach(() => {
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	function reopen(): { g: ReferenceGuardian; alarms: IGuardianAlarm[] } {
+		const alarms: IGuardianAlarm[] = [];
+		const g = guardianFor(file, OLD_MEMBERS, (alarm) => alarms.push(alarm));
+		return { g, alarms };
+	}
+
+	const BAD: Array<{ name: string; value: Buffer | bigint }> = [
+		{ name: 'a malformed non-empty blob', value: sha('not-a-rotation') },
+		{ name: 'an empty blob', value: Buffer.alloc(0) },
+		{ name: 'the integer 0 (falsy, but not null)', value: 0n },
+		{
+			name: 'a rotation signed by another root',
+			value: encodeRotateSetRequest(rotation({ signer: OTHER_ROOT }))
+		},
+		{
+			name: 'a rotation bound to another guardian set',
+			value: encodeRotateSetRequest(rotation({ guardianSetId: NEW_SET }))
+		},
+		{
+			name: 'a rotation not above the namespace generation',
+			value: encodeRotateSetRequest(rotation({ generation: 1n }))
+		}
+	];
+
+	for (const bad of BAD) {
+		it(`quarantines ${bad.name}: neither silently retired nor silently open`, () => {
+			storeRotation(file, bad.value);
+			const { g, alarms } = reopen();
+			try {
+				expect(
+					alarms.some(
+						(al) =>
+							al.status === GuardianStatus.ERR_STORE_UNCERTAIN &&
+							/stored rotation is invalid/.test(al.detail) &&
+							al.recoveryId.equals(ROOT.recoveryId)
+					),
+					alarms.map((al) => al.detail).join('; ')
+				).to.equal(true);
+				// Not open: a valid write is refused. Not retired: the refusal
+				// is the quarantine's, and no rotation is served.
+				for (const verb of VERBS) {
+					expect(verb.apply(g, current).status, verb.name).to.equal(
+						GuardianStatus.ERR_STORE_UNCERTAIN
+					);
+				}
+				const answer = head(g);
+				expect(answer.status).to.equal(GuardianStatus.ERR_STORE_UNCERTAIN);
+				expect(answer.rotation).to.equal(undefined);
+				// Untouched: the cell is exactly what was stored.
+				const cell = storedRotationCell(file);
+				if (Buffer.isBuffer(bad.value)) {
+					expect(cell.type).to.equal('blob');
+					expect((cell.value as Buffer).equals(bad.value)).to.equal(true);
+				} else {
+					expect(cell.type).to.equal('integer');
+					expect(cell.value).to.equal(Number(bad.value));
+				}
+			} finally {
+				g.close();
+			}
+		});
+	}
+
+	it('a valid persisted rotation survives open: no alarm, attached to the head, and the fence holds', () => {
+		storeRotation(file, ROTATION_BYTES);
+		const { g, alarms } = reopen();
+		try {
+			expect(alarms).to.deep.equal([]);
+			expectRetiredSnapshot(head(g), current, false);
+			for (const verb of VERBS) {
+				if (verb.prepare) continue;
+				expectRetired(verb.apply(g, current), verb.name);
+			}
+			expect(g.rotateSet(ROTATION).status).to.equal(
+				GuardianStatus.OK_DUPLICATE
+			);
+		} finally {
+			g.close();
 		}
 	});
 });
