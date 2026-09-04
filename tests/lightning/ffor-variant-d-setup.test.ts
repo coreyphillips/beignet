@@ -51,7 +51,25 @@ import {
 	computeTSetup
 } from '../../src/lightning/ffor/transcript';
 import { FforVariant } from '../../src/lightning/ffor/types';
-import { encodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
+import {
+	encodeUpdateAddHtlcMessage,
+	encodeUpdateBlockheightMessage,
+	encodeUpdateFailHtlcMessage,
+	encodeUpdateFeeMessage,
+	encodeUpdateFulfillHtlcMessage
+} from '../../src/lightning/message/channel-update';
+import { encodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
+import { encodeShutdownMessage } from '../../src/lightning/message/channel-close';
+import { encodeStfuMessage } from '../../src/lightning/message/stfu';
+import { encodeSpliceMessage } from '../../src/lightning/message/splice';
+import {
+	encodeFforAbortUnsigned,
+	encodeFforAcceptUnsigned,
+	encodeFforErrorMessage,
+	signFforMessage
+} from '../../src/lightning/ffor/messages';
+import { FF_ABORT_TYPE, FF_ACCEPT_TYPE } from '../../src/lightning/ffor/types';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 
 // ─────────────── Harness ───────────────
 
@@ -714,7 +732,7 @@ describe('FFOR Variant D: voucher book setup and activation (M8.1)', function ()
 		expect(record(pair.sChannel).state).to.equal(FforState.ACTIVE);
 	});
 
-	it('S refuses a book that fails the setup checks with ff_error and ff_abort', () => {
+	it('S refuses a book that fails the setup checks with ff_abort alone', () => {
 		const pair = createPair();
 		// 353 sat trims at the 354 sat default dust limit.
 		const bad = [353_000n, 1_000_000n];
@@ -742,11 +760,19 @@ describe('FFOR Variant D: voucher book setup and activation (M8.1)', function ()
 		const res3 = pair.rManager.initiateFforEpoch(pair.channelId, terms());
 		sState.localBalanceMsat = saved;
 		expect(res3.ok).to.equal(true);
+		// Section 11.1: a declined book gets ff_abort alone (reason 2), no
+		// ff_error; ff_error is reserved for protocol violations.
 		expect(pair.link.types()).to.deep.equal([
 			MessageType.FF_INIT,
-			MessageType.FF_ERROR,
 			MessageType.FF_ABORT
 		]);
+		const refusal = pair.link.log.find((e) => e.type === MessageType.FF_ABORT)!;
+		expect(decodeFforAbortMessage(refusal.payload).reason).to.equal(
+			FforAbortReason.TERMS_REFUSED
+		);
+		expect(record(pair.rChannel).abortReason).to.equal(
+			FforAbortReason.TERMS_REFUSED
+		);
 		expect(pair.sChannel.getFforEpoch()).to.equal(null);
 		expect(record(pair.rChannel).state).to.equal(FforState.ABORTED);
 		expect(pair.sChannel.getFullState().htlcs.size).to.equal(0);
@@ -797,5 +823,492 @@ describe('FFOR Variant D: voucher book setup and activation (M8.1)', function ()
 		const again = pair.rManager.initiateFforEpoch(pair.channelId, terms());
 		expect(again.ok).to.be.false;
 		expect(again.error).to.include('already in progress');
+	});
+});
+
+// ─────────────── Review round 1 ───────────────
+
+type AddHtlcFn = Channel['addHtlc'];
+
+/** Replace S's addHtlc on the instance so the voucher round misbehaves. */
+function patchSAdds(
+	pair: IPair,
+	patch: (
+		orig: AddHtlcFn,
+		call: number,
+		...args: Parameters<AddHtlcFn>
+	) => ReturnType<AddHtlcFn>
+): void {
+	const orig: AddHtlcFn = pair.sChannel.addHtlc.bind(pair.sChannel);
+	let call = 0;
+	(pair.sChannel as unknown as { addHtlc: AddHtlcFn }).addHtlc = (...args) =>
+		patch(orig, ++call, ...args);
+}
+
+const ONION = Buffer.alloc(1366);
+const SHUTDOWN_SCRIPT = Buffer.from('0014' + '11'.repeat(20), 'hex');
+
+/** Every message the freeze forbids, as (name, side that receives it, payload). */
+function forbiddenMessages(
+	pair: IPair,
+	state: 'ACTIVATING' | 'ACTIVE' | 'DRAINING'
+): Array<{ name: string; into: 'S' | 'R'; type: number; payload: Buffer }> {
+	const channelId = pair.channelId;
+	const hash = crypto.randomBytes(32);
+	const out: Array<{
+		name: string;
+		into: 'S' | 'R';
+		type: number;
+		payload: Buffer;
+	}> = [];
+	const add = encodeUpdateAddHtlcMessage({
+		channelId,
+		id: 99n,
+		amountMsat: 10_000n,
+		paymentHash: hash,
+		cltvExpiry: TIP + 100,
+		onionRoutingPacket: ONION
+	});
+	const fulfil = encodeUpdateFulfillHtlcMessage({
+		channelId,
+		id: 99n,
+		paymentPreimage: crypto.randomBytes(32)
+	});
+	const fail = encodeUpdateFailHtlcMessage({
+		channelId,
+		id: 99n,
+		reason: Buffer.alloc(292)
+	});
+	const fee = encodeUpdateFeeMessage({ channelId, feeratePerKw: 3000 });
+	const blockheight = encodeUpdateBlockheightMessage({
+		channelId,
+		blockheight: TIP + 1
+	});
+	const shutdown = encodeShutdownMessage({
+		channelId,
+		scriptPubkey: SHUTDOWN_SCRIPT
+	});
+	const stfu = encodeStfuMessage({ channelId, initiator: true });
+	const splice = encodeSpliceMessage({
+		channelId,
+		fundingPubkey: pair.sConfig.localBasepoints.fundingPubkey,
+		relativeSatoshis: 10_000n,
+		fundingFeeratePerkw: 1000,
+		locktime: 0
+	});
+	const commit = encodeCommitmentSignedMessage({
+		channelId,
+		signature: Buffer.alloc(64),
+		htlcSignatures: []
+	});
+	const sides: Array<'S' | 'R'> = state === 'ACTIVATING' ? ['R'] : ['S', 'R'];
+	for (const into of sides) {
+		out.push({
+			name: 'update_add_htlc',
+			into,
+			type: MessageType.UPDATE_ADD_HTLC,
+			payload: add
+		});
+		out.push({
+			name: 'update_fee',
+			into,
+			type: MessageType.UPDATE_FEE,
+			payload: fee
+		});
+		out.push({
+			name: 'shutdown',
+			into,
+			type: MessageType.SHUTDOWN,
+			payload: shutdown
+		});
+		out.push({ name: 'stfu', into, type: MessageType.STFU, payload: stfu });
+		out.push({
+			name: 'splice_init',
+			into,
+			type: MessageType.SPLICE,
+			payload: splice
+		});
+		if (state !== 'DRAINING') {
+			out.push({
+				name: 'commitment_signed',
+				into,
+				type: MessageType.COMMITMENT_SIGNED,
+				payload: commit
+			});
+		}
+		if (into === 'S') {
+			out.push({
+				name: 'update_fulfill_htlc (non-voucher id)',
+				into,
+				type: MessageType.UPDATE_FULFILL_HTLC,
+				payload: fulfil
+			});
+			out.push({
+				name: 'update_fail_htlc (non-voucher id)',
+				into,
+				type: MessageType.UPDATE_FAIL_HTLC,
+				payload: fail
+			});
+			out.push({
+				name: 'update_blockheight',
+				into,
+				type: MessageType.UPDATE_BLOCKHEIGHT,
+				payload: blockheight
+			});
+		}
+	}
+	return out;
+}
+
+/** Bring a fresh pair to the named epoch state on both sides. */
+function pairIn(state: 'ACTIVATING' | 'ACTIVE' | 'DRAINING'): IPair {
+	const pair = createPair();
+	if (state === 'ACTIVATING') {
+		pair.link.drop = (_from, type): boolean =>
+			type === MessageType.FF_ACTIVATE_ACK;
+		expect(
+			pair.rManager.initiateFforEpoch(pair.channelId, terms()).ok
+		).to.equal(true);
+		expect(record(pair.rChannel).state).to.equal(FforState.ACTIVATING);
+		pair.link.drop = null;
+		return pair;
+	}
+	activate(pair);
+	if (state === 'DRAINING') {
+		// Hold R's drain so both sides stay DRAINING.
+		pair.link.drop = (from, type): boolean =>
+			from === 'R' &&
+			(type === MessageType.UPDATE_FULFILL_HTLC ||
+				type === MessageType.UPDATE_FAIL_HTLC ||
+				type === MessageType.COMMITMENT_SIGNED);
+		expect(pair.rManager.closeFforEpoch(pair.channelId).ok).to.equal(true);
+		expect(record(pair.sChannel).state).to.equal(FforState.DRAINING);
+		expect(record(pair.rChannel).state).to.equal(FforState.DRAINING);
+		pair.link.drop = null;
+	}
+	return pair;
+}
+
+describe('FFOR Variant D: review round 1 (setup)', function () {
+	this.timeout(60_000);
+
+	for (const state of ['ACTIVATING', 'ACTIVE', 'DRAINING'] as const) {
+		it(`refuses every forbidden peer message in ${state} as a protocol violation`, () => {
+			const probe = pairIn(state);
+			const cases = forbiddenMessages(probe, state);
+			for (const c of cases) {
+				const pair = pairIn(state);
+				const target = c.into === 'S' ? pair.sChannel : pair.rChannel;
+				const manager = c.into === 'S' ? pair.sManager : pair.rManager;
+				const fromPub = c.into === 'S' ? pair.rPub : pair.sPub;
+				const before = record(target).state;
+				const beforeHtlcs = target.getFullState().htlcs.size;
+				pair.link.log.length = 0;
+				const payload = forbiddenMessages(pair, state).find(
+					(m) => m.name === c.name && m.into === c.into
+				)!.payload;
+				manager.handleMessage(fromPub, c.type, payload);
+				const label = `${c.name} into ${c.into} in ${state}`;
+				expect(record(target).state, label).to.equal(before);
+				expect(target.getFullState().htlcs.size, label).to.equal(beforeHtlcs);
+				expect(target.getState(), label).to.equal(ChannelState.ERRORED);
+				expect(
+					pair.link.log.some(
+						(e) => e.from === c.into && e.type === MessageType.ERROR
+					),
+					`${label}: wire error`
+				).to.be.true;
+				expect(
+					pair.link.log.filter(
+						(e) => e.from === c.into && e.type !== MessageType.ERROR
+					),
+					`${label}: nothing else sent`
+				).to.deep.equal([]);
+			}
+		});
+	}
+
+	it('a slot that never arrives (K-1) aborts at the setup timeout and fails the vouchers that did', () => {
+		const pair = createPair();
+		patchSAdds(pair, (orig, call, ...args) =>
+			call === 3 ? [] : orig(...args)
+		);
+		expect(
+			pair.rManager.initiateFforEpoch(pair.channelId, terms()).ok
+		).to.equal(true);
+		// The round committed two vouchers; neither side can complete.
+		expect(record(pair.rChannel).state).to.equal(FforState.NEGOTIATING);
+		expect(record(pair.sChannel).state).to.equal(FforState.NEGOTIATING);
+		expect(vouchers(pair.rChannel).length).to.equal(2);
+		expect(
+			pair.link.types().filter((t) => t === MessageType.STFU)
+		).to.deep.equal([]);
+		pair.link.log.length = 0;
+		const timedOut = pair.rManager.fforSetupTimeout(pair.channelId);
+		expect(timedOut.ok, timedOut.error).to.equal(true);
+		expect(record(pair.rChannel).state).to.equal(FforState.ABORTED);
+		expect(record(pair.rChannel).abortReason).to.equal(FforAbortReason.TIMEOUT);
+		expect(record(pair.sChannel).state).to.equal(FforState.ABORTED);
+		expect(
+			pair.link.log.filter((e) => e.type === MessageType.UPDATE_FAIL_HTLC)
+				.length
+		).to.equal(2);
+		expect(pair.sChannel.getFullState().htlcs.size).to.equal(0);
+		expect(pair.rChannel.getFullState().htlcs.size).to.equal(0);
+		expect(pair.sChannel.getFullState().localBalanceMsat).to.equal(
+			FUNDING_SATOSHIS * 1000n
+		);
+		expect(pair.sChannel.getState()).to.equal(ChannelState.NORMAL);
+		expect(pair.rChannel.getState()).to.equal(ChannelState.NORMAL);
+		// A timeout on an already ACTIVE epoch is a no-op.
+		const fresh = createPair();
+		activate(fresh);
+		expect(fresh.rManager.fforSetupTimeout(fresh.channelId).ok).to.equal(true);
+		expect(record(fresh.rChannel).state).to.equal(FforState.ACTIVE);
+	});
+
+	it('a misbehaving S whose add does not match the book: R fails it and aborts with reason 5', () => {
+		const pair = createPair();
+		patchSAdds(pair, (orig, call, amount, ...rest) =>
+			orig(call === 2 ? amount + 1n : amount, ...rest)
+		);
+		expect(
+			pair.rManager.initiateFforEpoch(pair.channelId, terms()).ok
+		).to.equal(true);
+		expect(record(pair.rChannel).state).to.equal(FforState.ABORTED);
+		expect(record(pair.rChannel).abortReason).to.equal(
+			FforAbortReason.VOUCHER_ROUND_FAILED
+		);
+		expect(record(pair.sChannel).state).to.equal(FforState.ABORTED);
+		const fails = pair.link.log.filter(
+			(e) => e.type === MessageType.UPDATE_FAIL_HTLC
+		);
+		expect(fails.length).to.equal(3);
+		expect(fails.every((e) => e.from === 'R')).to.be.true;
+		const aborts = pair.link.log.filter((e) => e.type === MessageType.FF_ABORT);
+		expect(aborts.length).to.be.at.least(1);
+		expect(
+			aborts.every(
+				(e) =>
+					decodeFforAbortMessage(e.payload).reason ===
+					FforAbortReason.VOUCHER_ROUND_FAILED
+			)
+		).to.be.true;
+		expect(
+			pair.link.types().filter((t) => t === MessageType.STFU)
+		).to.deep.equal([]);
+		expect(pair.sChannel.getFullState().htlcs.size).to.equal(0);
+		expect(pair.rChannel.getFullState().htlcs.size).to.equal(0);
+		expect(pair.sChannel.getFullState().localBalanceMsat).to.equal(
+			FUNDING_SATOSHIS * 1000n
+		);
+		expect(pair.sChannel.getState()).to.equal(ChannelState.NORMAL);
+		expect(pair.rChannel.getState()).to.equal(ChannelState.NORMAL);
+	});
+
+	it('an extra add during the round (K+1) is a mismatch: failed, never forwarded, abort reason 5', () => {
+		const pair = createPair();
+		let forwarded = 0;
+		pair.rManager.on('htlc:forwarded', () => forwarded++);
+		patchSAdds(pair, (orig, call, ...args) => {
+			const actions = orig(...args);
+			if (call !== 3) return actions;
+			return [
+				...actions,
+				...orig(10_000n, crypto.randomBytes(32), T_EXP, ONION)
+			];
+		});
+		expect(
+			pair.rManager.initiateFforEpoch(pair.channelId, terms()).ok
+		).to.equal(true);
+		expect(record(pair.rChannel).state).to.equal(FforState.ABORTED);
+		expect(record(pair.rChannel).abortReason).to.equal(
+			FforAbortReason.VOUCHER_ROUND_FAILED
+		);
+		expect(record(pair.sChannel).state).to.equal(FforState.ABORTED);
+		expect(
+			forwarded,
+			'the extra add never reached the forwarding path'
+		).to.equal(0);
+		const fails = pair.link.log.filter(
+			(e) => e.type === MessageType.UPDATE_FAIL_HTLC
+		);
+		expect(fails.length).to.equal(4);
+		expect(pair.sChannel.getFullState().htlcs.size).to.equal(0);
+		expect(pair.rChannel.getFullState().htlcs.size).to.equal(0);
+		expect(pair.sChannel.getFullState().localBalanceMsat).to.equal(
+			FUNDING_SATOSHIS * 1000n
+		);
+	});
+
+	it('checks every revealed secret on a channel past 2016 revocations', () => {
+		const pair = createPair();
+		pair.link.drop = (_from, type): boolean => type === MessageType.FF_INIT;
+		expect(
+			pair.rManager.initiateFforEpoch(pair.channelId, terms()).ok
+		).to.equal(true);
+		expect(record(pair.rChannel).state).to.equal(FforState.NEGOTIATING);
+		pair.link.drop = null;
+		// R has seen 2100 of S's per-commitment secrets.
+		const rState = pair.rChannel.getFullState();
+		const sSeed = pair.sConfig.localPerCommitmentSeed;
+		const secretOf = (n: bigint): Buffer =>
+			generateFromSeed(sSeed, MAX_INDEX - n);
+		const REVEALED = 2100n;
+		for (let n = 0n; n < REVEALED; n++) {
+			expect(rState.shaChainStore.addSecret(MAX_INDEX - n, secretOf(n))).to.be
+				.true;
+		}
+		rState.remoteRevocationNumber = REVEALED;
+		const bound = (h: Buffer): boolean =>
+			(
+				pair.rChannel as unknown as {
+					_fforHashesBindRevealedSecret(x: Set<string>): boolean;
+				}
+			)._fforHashesBindRevealedSecret(new Set([h.toString('hex')]));
+		// Older than any 2016-wide window, and the newest, both caught.
+		expect(bound(sha(secretOf(5n)))).to.be.true;
+		expect(bound(sha(secretOf(0n)))).to.be.true;
+		expect(bound(sha(secretOf(REVEALED - 1n)))).to.be.true;
+		// A secret not yet revealed, and an unrelated hash, pass.
+		expect(bound(sha(secretOf(REVEALED)))).to.be.false;
+		expect(bound(crypto.randomBytes(32))).to.be.false;
+		// And the ff_accept path enforces it: H_1 bound to secret 5.
+		const f = record(pair.rChannel);
+		const body = signFforMessage(
+			FF_ACCEPT_TYPE,
+			encodeFforAcceptUnsigned({
+				channelId: pair.channelId,
+				epochId: f.epochId,
+				sCommitmentNumber: rState.remoteCommitmentNumber,
+				paymentHashes: [
+					sha(secretOf(5n)),
+					crypto.randomBytes(32),
+					crypto.randomBytes(32)
+				],
+				sHtlcIdBase: 0n,
+				voucherAmountsMsat: AMOUNTS,
+				initHash: f.tInit
+			}),
+			pair.sConfig.nodePrivateKey
+		);
+		pair.link.log.length = 0;
+		pair.rManager.handleMessage(pair.sPub, MessageType.FF_ACCEPT, body);
+		expect(record(pair.rChannel).state).to.equal(FforState.ABORTED);
+		expect(record(pair.rChannel).abortReason).to.equal(
+			FforAbortReason.BOOK_MISMATCH
+		);
+		const abort = pair.link.log.find((e) => e.type === MessageType.FF_ABORT)!;
+		expect(decodeFforAbortMessage(abort.payload).reason).to.equal(
+			FforAbortReason.BOOK_MISMATCH
+		);
+	});
+
+	it('acknowledgement loss: R completes on a matching H_act and aborts on any other report', () => {
+		// Matching: covered by the retransmission test above; here the other
+		// branch. S reports ACTIVE under a different H_act.
+		const pair = createPair();
+		pair.link.drop = (_from, type): boolean =>
+			type === MessageType.FF_ACTIVATE_ACK;
+		expect(
+			pair.rManager.initiateFforEpoch(pair.channelId, terms()).ok
+		).to.equal(true);
+		expect(record(pair.rChannel).state).to.equal(FforState.ACTIVATING);
+		expect(record(pair.sChannel).state).to.equal(FforState.ACTIVE);
+		pair.link.drop = null;
+		pair.link.disconnect();
+		// R keeps its ACTIVATING record across the disconnect.
+		expect(record(pair.rChannel).state).to.equal(FforState.ACTIVATING);
+		record(pair.sChannel).hAct = crypto.randomBytes(32);
+		pair.link.log.length = 0;
+		pair.link.reconnect();
+		expect(record(pair.rChannel).state).to.equal(FforState.ABORTED);
+		expect(record(pair.rChannel).abortReason).to.equal(
+			FforAbortReason.DISCONNECT
+		);
+		expect(
+			pair.link.log.filter((e) => e.type === MessageType.UPDATE_FAIL_HTLC)
+				.length
+		).to.equal(AMOUNTS.length);
+		// And S reporting VOUCHERS_COMMITTED (it never persisted ACTIVE) aborts too.
+		const pair2 = createPair();
+		pair2.link.drop = (_from, type): boolean =>
+			type === MessageType.FF_ACTIVATE;
+		expect(
+			pair2.rManager.initiateFforEpoch(pair2.channelId, terms()).ok
+		).to.equal(true);
+		expect(record(pair2.rChannel).state).to.equal(FforState.ACTIVATING);
+		expect(record(pair2.sChannel).state).to.equal(FforState.VOUCHERS_COMMITTED);
+		pair2.link.drop = null;
+		pair2.link.disconnect();
+		expect(record(pair2.sChannel).state).to.equal(FforState.ABORTED);
+		expect(record(pair2.rChannel).state).to.equal(FforState.ACTIVATING);
+		pair2.link.reconnect();
+		expect(record(pair2.rChannel).state).to.equal(FforState.ABORTED);
+		expect(record(pair2.rChannel).abortReason).to.equal(
+			FforAbortReason.DISCONNECT
+		);
+		expect(
+			pair2.link.types().filter((t) => t === MessageType.FF_ACTIVATE)
+		).to.deep.equal([]);
+		expect(pair2.rChannel.getFullState().htlcs.size).to.equal(0);
+	});
+
+	it('ff_error signals a violation only; the ff_abort that follows carries the reason', () => {
+		const pair = createPair();
+		pair.link.drop = (_from, type): boolean => type === MessageType.FF_INIT;
+		expect(
+			pair.rManager.initiateFforEpoch(pair.channelId, terms()).ok
+		).to.equal(true);
+		pair.link.drop = null;
+		const f = record(pair.rChannel);
+		pair.rManager.handleMessage(
+			pair.sPub,
+			MessageType.FF_ERROR,
+			encodeFforErrorMessage({
+				channelId: pair.channelId,
+				epochId: f.epochId,
+				data: Buffer.from('bad')
+			})
+		);
+		expect(record(pair.rChannel).state).to.equal(FforState.NEGOTIATING);
+		expect(pair.rErrors.some((e) => e.includes('ff_error from peer'))).to.be
+			.true;
+		const abort = signFforMessage(
+			FF_ABORT_TYPE,
+			encodeFforAbortUnsigned({
+				channelId: pair.channelId,
+				epochId: f.epochId,
+				transcriptHash: f.tInit,
+				reason: FforAbortReason.PROTOCOL_ERROR,
+				data: Buffer.from('bad')
+			}),
+			pair.sConfig.nodePrivateKey
+		);
+		pair.rManager.handleMessage(pair.sPub, MessageType.FF_ABORT, abort);
+		expect(record(pair.rChannel).state).to.equal(FforState.ABORTED);
+		expect(record(pair.rChannel).abortReason).to.equal(
+			FforAbortReason.PROTOCOL_ERROR
+		);
+		// The refused epoch id is spent: a retry needs a fresh one.
+		expect(
+			pair.rManager.initiateFforEpoch(pair.channelId, {
+				...terms(),
+				epochId: f.epochId
+			}).ok
+		).to.equal(false);
+		expect(
+			pair.rManager.initiateFforEpoch(pair.channelId, terms()).ok
+		).to.equal(true);
+	});
+
+	it('refuses to start without a known tip', () => {
+		const pair = createPair({ height: 0 });
+		const res = pair.rManager.initiateFforEpoch(pair.channelId, terms());
+		expect(res.ok).to.equal(false);
+		expect(res.error).to.include('tip height unknown');
+		pair.sManager.handleNewBlock(TIP);
+		pair.rManager.handleNewBlock(TIP);
+		activate(pair);
 	});
 });

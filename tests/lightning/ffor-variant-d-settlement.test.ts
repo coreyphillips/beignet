@@ -29,6 +29,8 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { IChannelState } from '../../src/lightning/channel/channel-state';
 import { MessageType } from '../../src/lightning/message/types';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import {
@@ -72,9 +74,10 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	};
 }
 
-function makeNodeConfig(seedId: number): INodeConfig {
+function makeNodeConfig(seedId: number, storage?: SqliteStorage): INodeConfig {
 	const seed = sha(`ffor-d-node-${seedId}`);
 	return {
+		...(storage ? { storage } : {}),
 		nodePrivateKey: sha(seed, 'node-identity'),
 		network: Network.REGTEST,
 		channelConfig: { ...DEFAULT_CHANNEL_CONFIG },
@@ -250,10 +253,10 @@ interface IWorld {
 
 let worldSeed = 0;
 
-function createWorld(): IWorld {
+function createWorld(opts: { sStorage?: SqliteStorage } = {}): IWorld {
 	worldSeed += 10;
 	const pConfig = makeNodeConfig(worldSeed + 1);
-	const sConfig = makeNodeConfig(worldSeed + 2);
+	const sConfig = makeNodeConfig(worldSeed + 2, opts.sStorage);
 	const rConfig = makeNodeConfig(worldSeed + 3);
 	const p = new LightningNode(pConfig);
 	const s = new LightningNode(sConfig);
@@ -921,5 +924,163 @@ describe('FFOR Variant D: cooperative return (M8.3)', function () {
 			(e) => e.type === MessageType.UPDATE_FULFILL_HTLC
 		);
 		expect(fulfils.length).to.equal(1);
+	});
+});
+
+// ─────────────── Review round 1 ───────────────
+
+/** S with real SQLite persistence whose channel write can be made to fail. */
+function worldWithStorage(): IWorld & { storage: SqliteStorage } {
+	const storage = new SqliteStorage(':memory:');
+	storage.open();
+	const w = createWorld({ sStorage: storage });
+	return { ...w, storage };
+}
+
+/** Make S's channel write fail whenever `when(state)` holds. */
+function failSaveWhen(
+	storage: SqliteStorage,
+	when: (state: IChannelState) => boolean
+): () => number {
+	const orig = storage.saveChannel.bind(storage);
+	let failures = 0;
+	storage.saveChannel = (
+		id: string,
+		state: IChannelState,
+		peer: string
+	): void => {
+		if (when(state)) {
+			failures++;
+			throw new Error('disk full');
+		}
+		orig(id, state, peer);
+	};
+	return () => failures;
+}
+
+describe('FFOR Variant D: review round 1 (settlement)', function () {
+	this.timeout(60_000);
+
+	it('a failed durable write at activation withholds the ack', () => {
+		const w = worldWithStorage();
+		let count = (): number => 0;
+		// Arm the fault as ff_activate crosses, so only the ACTIVE write fails.
+		w.sr.drop = (_from, type): boolean => {
+			if (type === MessageType.FF_ACTIVATE) {
+				count = failSaveWhen(
+					w.storage,
+					(st) => st.ffor?.state === FforState.ACTIVE
+				);
+			}
+			return false;
+		};
+		const res = w.r.startFforEpoch(w.srHex, {
+			voucherAmountsMsat: AMOUNTS,
+			minPaymentMsat: 400_000n,
+			settlementDeadline: D_DEADLINE,
+			voucherExpiry: T_EXP,
+			feeBaseMsat: FEE_BASE,
+			feeProportionalMillionths: FEE_PPM
+		});
+		expect(res.ok).to.equal(true);
+		expect(count()).to.be.at.least(1);
+		expect(
+			w.sr.log.filter((e) => e.type === MessageType.FF_ACTIVATE_ACK)
+		).to.deep.equal([]);
+		expect(record(w.r, w.srHex).state).to.equal(FforState.ACTIVATING);
+		expect(w.errors.s.some((e) => /disk full|persist/i.test(e))).to.be.true;
+		// Nothing left S after the failed write.
+		const activateIdx = w.sr.log.findIndex(
+			(e) => e.type === MessageType.FF_ACTIVATE
+		);
+		expect(
+			w.sr.log.slice(activateIdx + 1).filter((e) => e.from === w.s.getNodeId())
+		).to.deep.equal([]);
+	});
+
+	it('a failed durable SETTLING write reveals no preimage and sends nothing', () => {
+		const w = worldWithStorage();
+		activate(w);
+		const [inv] = exposeAndLeave(w, [1]);
+		const count = failSaveWhen(w.storage, (st) =>
+			(st.ffor?.slotStates ?? []).includes(FforSlotState.SETTLING)
+		);
+		const before = w.ps.log.length;
+		const decoded = decodeInvoice(inv);
+		w.p.sendPayment(inv);
+		expect(count()).to.be.at.least(1);
+		const payment = w.p.getPayment(decoded.paymentHash)!;
+		expect(payment.status).to.equal(PaymentStatus.PENDING);
+		expect(payment.preimage).to.be.undefined;
+		const fromS = w.ps.log
+			.slice(before)
+			.filter((e) => e.from === w.s.getNodeId())
+			.map((e) => e.type);
+		expect(fromS).to.not.include(MessageType.UPDATE_FULFILL_HTLC);
+		expect(fromS).to.not.include(MessageType.UPDATE_FAIL_HTLC);
+		// Memory follows disk: the slot is not SETTLING anywhere.
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+		expect(record(w.s, w.srHex).slotUpstream[0]).to.equal(null);
+		expect(w.storage.loadChannel(w.srHex)!.state.ffor!.slotStates[0]).to.equal(
+			FforSlotState.UNUSED
+		);
+	});
+
+	it('a failed durable DRAINING write withholds ff_close_ack and every preimage', () => {
+		const w = worldWithStorage();
+		activate(w);
+		const [inv] = exposeAndLeave(w, [1]);
+		expect(pay(w, inv).status).to.equal(PaymentStatus.COMPLETED);
+		w.sr.reconnect();
+		const count = failSaveWhen(
+			w.storage,
+			(st) => st.ffor?.state === FforState.DRAINING
+		);
+		w.sr.log.length = 0;
+		expect(w.r.closeFforEpoch(w.srHex).ok).to.equal(true);
+		expect(count()).to.be.at.least(1);
+		expect(
+			w.sr.log.filter((e) => e.type === MessageType.FF_CLOSE_ACK)
+		).to.deep.equal([]);
+		expect(w.sr.log.filter((e) => e.from === w.s.getNodeId())).to.deep.equal(
+			[]
+		);
+		expect(record(w.r, w.srHex).state).to.equal(FforState.ACTIVE);
+		expect(record(w.r, w.srHex).knownPreimages).to.deep.equal([
+			null,
+			null,
+			null
+		]);
+		expect(w.storage.loadChannel(w.srHex)!.state.ffor!.state).to.equal(
+			FforState.ACTIVE
+		);
+	});
+
+	it('invoice creation and settlement fail closed at D and on an unknown tip', () => {
+		const w = createWorld();
+		activate(w);
+		expect(() => w.r.createFforVoucherInvoice(w.srHex, 1)).to.not.throw();
+		w.r.handleNewBlock(D_DEADLINE);
+		expect(() => w.r.createFforVoucherInvoice(w.srHex, 2)).to.throw(
+			'at or past settlement_deadline'
+		);
+		(w.r as unknown as { currentBlockHeight: number }).currentBlockHeight = 0;
+		expect(() => w.r.createFforVoucherInvoice(w.srHex, 2)).to.throw(
+			'tip height unknown'
+		);
+
+		const w2 = createWorld();
+		activate(w2);
+		const [inv] = exposeAndLeave(w2, [1]);
+		const failures: { reason: string }[] = [];
+		w2.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		(w2.s as unknown as { currentBlockHeight: number }).currentBlockHeight = 0;
+		w2.s.getChannelManager().handleNewBlock(0);
+		const late = pay(w2, inv);
+		expect(late.status).to.equal(PaymentStatus.FAILED);
+		expect(failures.pop()!.reason).to.include('tip height unknown');
+		expect(record(w2.s, w2.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
 	});
 });

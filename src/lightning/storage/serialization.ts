@@ -151,6 +151,8 @@ export interface ISerializedHtlcEntry {
 	removalLocallyRevoked?: boolean;
 	/** FFOR Variant D voucher marker (see IHtlcEntry.fforVoucher). */
 	fforVoucher?: boolean;
+	/** FFOR Variant D mismatching-add marker (see IHtlcEntry.fforMismatch). */
+	fforMismatch?: boolean;
 	/** Whether the stored remote signature covers this add (see IHtlcEntry). */
 	addRemoteSigned?: boolean;
 	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
@@ -187,6 +189,7 @@ export function serializeHtlcEntry(
 		direction: e.direction,
 		state: e.state,
 		...(e.fforVoucher === true ? { fforVoucher: true } : {}),
+		...(e.fforMismatch === true ? { fforMismatch: true } : {}),
 		...(e.blindingPoint
 			? { blindingPoint: e.blindingPoint.toString('hex') }
 			: {}),
@@ -238,6 +241,7 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 			direction: s.direction as HtlcDirection,
 			state: s.state as HtlcState,
 			...(s.fforVoucher === true ? { fforVoucher: true } : {}),
+			...(s.fforMismatch === true ? { fforMismatch: true } : {}),
 			...(s.blindingPoint
 				? { blindingPoint: Buffer.from(s.blindingPoint, 'hex') }
 				: {}),

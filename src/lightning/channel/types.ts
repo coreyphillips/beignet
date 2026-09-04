@@ -335,6 +335,13 @@ export interface IHtlcEntry {
 	 */
 	fforVoucher?: boolean;
 	/**
+	 * FFOR Variant D (section 9.5.1 step 3): a peer add inside the voucher
+	 * round window that did not match the book. Parked like a voucher (never
+	 * dispatched to the onion path) and failed by the round's unwind once the
+	 * channel is synchronized. Persisted.
+	 */
+	fforMismatch?: boolean;
+	/**
 	 * Admission-time classification (issue 410): this received HTLC was dust
 	 * and pushed total dust exposure past MAX_DUST_HTLC_EXPOSURE_MSAT when it
 	 * was admitted, so the node fails it back once committed (BOLT 2: SHOULD

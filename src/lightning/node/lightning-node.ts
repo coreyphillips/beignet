@@ -2608,8 +2608,8 @@ export class LightningNode extends EventEmitter {
 			// forwarding machinery.
 			if (this.isHeldHtlc(channelId, htlc.id)) continue;
 			// An FFOR voucher (section 9.5.1): the epoch's drain or unwind
-			// resolves it, never the onion path.
-			if (htlc.fforVoucher === true) continue;
+			// resolves it, never the onion path. Same for a mismatching add.
+			if (htlc.fforVoucher === true || htlc.fforMismatch === true) continue;
 			// Held by the JIT engine before the restart, and already owed a
 			// refund by the restored-hold queue. Dispatching it again would
 			// forward a payment the sweep is about to fail upstream.
@@ -15301,8 +15301,21 @@ export class LightningNode extends EventEmitter {
 				FforSlotState.SETTLING,
 				htlcSecretKey
 			);
-			if (!marked.ok)
-				return fail(TEMPORARY_NODE_FAILURE, 'could not persist SETTLING');
+			if (!marked.ok) {
+				// The durable SETTLING did not land. Nothing may be revealed or
+				// sent on a state that is not on disk: memory follows disk
+				// (the slot reverts to UNUSED) and the HTLC stays pending for
+				// the reestablish re-drive, which retries the write.
+				record.slotStates[k - 1] = FforSlotState.UNUSED;
+				record.slotUpstream[k - 1] = null;
+				this.emitStructuredLog('htlc', 'ffor_delegated_settle_deferred', {
+					channelId: channelId.toString('hex'),
+					htlcId: htlcId.toString(),
+					slot: k,
+					reason: marked.error ?? 'durable write failed'
+				});
+				return true;
+			}
 		}
 		const hashHex = paymentHash.toString('hex');
 		this.preimages.set(hashHex, preimage);
@@ -15445,6 +15458,16 @@ export class LightningNode extends EventEmitter {
 		}
 		if (k < 1 || k > record.params.maxPayments) {
 			throw new Error(`voucher ${k} is not in the book`);
+		}
+		// Section 7.5.6, fail closed: an invoice exposed at or past D, or with
+		// no tip to judge D by, is one an honest S will not settle.
+		if (this.currentBlockHeight <= 0) {
+			throw new Error('tip height unknown: cannot bound the invoice by D');
+		}
+		if (this.currentBlockHeight >= record.params.settlementDeadline) {
+			throw new Error(
+				`tip ${this.currentBlockHeight} is at or past settlement_deadline ${record.params.settlementDeadline}`
+			);
 		}
 		const hint = this.buildRoutingHintForChannel(channel);
 		if (!hint) {

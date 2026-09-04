@@ -4463,6 +4463,12 @@ export class Channel {
 		}
 		// Fresh signed traffic ends the reestablish exchange (status machine).
 		this._lastReestablishOutcome = null;
+		// FFOR section 7.5.5: from ACTIVATING on there is nothing to sign
+		// until the drain; a commitment_signed under the freeze is a violation.
+		const fforCommitRefusal = this._fforUpdateRefusal('commit');
+		if (fforCommitRefusal) {
+			return this._failChannelWithWireError(fforCommitRefusal);
+		}
 		// start_batch collection: buffer the announced batch, then process all
 		// of its commitment_signed messages as one logical update.
 		if (this._pendingBatch) {
@@ -4982,8 +4988,10 @@ export class Channel {
 				entry.state === HtlcState.COMMITTED &&
 				entry.direction === HtlcDirection.RECEIVED &&
 				entry.forwardEmitted !== true &&
-				// FFOR section 9.5.1 step 3: a parked voucher is never dispatched.
-				entry.fforVoucher !== true
+				// FFOR section 9.5.1 step 3: a parked voucher is never dispatched,
+				// nor a mismatching add the round's unwind will fail.
+				entry.fforVoucher !== true &&
+				entry.fforMismatch !== true
 			) {
 				entry.forwardEmitted = true;
 				htlcActions.push({
@@ -5374,6 +5382,11 @@ export class Channel {
 					message: 'Unexpected update_blockheight'
 				}
 			];
+		}
+		// FFOR section 7.5.5: no update of any kind under the epoch freeze.
+		const fforBlockheightRefusal = this._fforUpdateRefusal('blockheight');
+		if (fforBlockheightRefusal) {
+			return this._failChannelWithWireError(fforBlockheightRefusal);
 		}
 
 		// Only the opener sends update_blockheight (CLN channeld enforces the
@@ -6644,6 +6657,13 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected shutdown' }
 			];
+		}
+		// FFOR section 7.5.5: no close negotiation while the epoch is live; a
+		// shutdown would also move the channel out of NORMAL and strand the
+		// drain.
+		const fforShutdownRefusal = this._fforUpdateRefusal('shutdown');
+		if (fforShutdownRefusal) {
+			return this._failChannelWithWireError(fforShutdownRefusal);
 		}
 
 		// The peer asking to close is the same trap from the other side (issue
@@ -10051,13 +10071,7 @@ export class Channel {
 		// error; R's own activation stfu is the exception the flag names.
 		const fforPeerStfuRefusal = this._fforUpdateRefusal('stfu');
 		if (fforPeerStfuRefusal) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `Unexpected STFU: ${fforPeerStfuRefusal}`,
-					cleanup: 'none'
-				}
-			];
+			return this._failChannelWithWireError(fforPeerStfuRefusal);
 		}
 
 		// Pending updates split by direction (BOLT 2). The peer's REPLY to our
@@ -10656,6 +10670,11 @@ export class Channel {
 					message: 'Unexpected splice: channel not in NORMAL state'
 				}
 			];
+		}
+		// FFOR section 7.5.5: no splice while the epoch is live.
+		const fforPeerSpliceRefusal = this._fforUpdateRefusal('splice');
+		if (fforPeerSpliceRefusal) {
+			return this._failChannelWithWireError(fforPeerSpliceRefusal);
 		}
 
 		if (!this._quiescence.isQuiescent()) {
@@ -19961,18 +19980,25 @@ export class Channel {
 	 * DRAINING the vouchers' own fulfils and fails are the drain and pass.
 	 */
 	private _fforUpdateRefusal(
-		kind: 'add' | 'settle' | 'fee' | 'stfu' | 'shutdown' | 'splice',
+		kind:
+			| 'add'
+			| 'settle'
+			| 'fee'
+			| 'blockheight'
+			| 'commit'
+			| 'stfu'
+			| 'shutdown'
+			| 'splice',
 		htlcId?: bigint
 	): string | null {
 		const f = this._fforLive();
 		if (!f) return null;
-		// R re-quiescing to retransmit ff_activate (section 7.5.5) is the one
-		// stfu the freeze itself asks for.
-		if (kind === 'stfu' && this._fforPendingActivate) return null;
 		if (f.state === FforState.ACTIVATING || f.state === FforState.ACTIVE) {
 			return `FFOR epoch is ${FforState[f.state]}: no ${kind} until it drains`;
 		}
 		if (f.state === FforState.DRAINING) {
+			// The drain is update_fulfill_htlc / update_fail_htlc for the
+			// vouchers and the commitment rounds they need, nothing else.
 			if (
 				kind === 'settle' &&
 				htlcId !== undefined &&
@@ -19980,6 +20006,7 @@ export class Channel {
 			) {
 				return null;
 			}
+			if (kind === 'commit') return null;
 			return `FFOR epoch is DRAINING: only the voucher drain may ${kind}`;
 		}
 		return null;
@@ -20108,6 +20135,8 @@ export class Channel {
 			return 'channel must carry no HTLCs and no pending updates';
 		}
 		if (!this._fforCtx?.signFn) return 'no node key to sign with';
+		// Every deadline check below fails closed on an unknown tip.
+		if (this._currentBlockHeight <= 0) return 'tip height unknown';
 		return null;
 	}
 
@@ -20251,12 +20280,18 @@ export class Channel {
 	): ChannelAction[] {
 		const channelId = this._state.channelId!;
 		const data = Buffer.from(text, 'utf8');
-		const actions: ChannelAction[] = [
-			sendMsg(
-				MessageType.FF_ERROR,
-				encodeFforErrorMessage({ channelId, epochId, data })
-			)
-		];
+		// Section 11.1: a declined ff_init gets ff_abort alone (reason 2, 3
+		// or 4); ff_error signals a violation and is then followed by ff_abort
+		// (reason 7).
+		const actions: ChannelAction[] =
+			reason === FforAbortReason.PROTOCOL_ERROR
+				? [
+						sendMsg(
+							MessageType.FF_ERROR,
+							encodeFforErrorMessage({ channelId, epochId, data })
+						)
+				  ]
+				: [];
 		const abort = this._fforSign(
 			FF_ABORT_TYPE,
 			encodeFforAbortUnsigned({
@@ -20359,10 +20394,7 @@ export class Channel {
 		};
 		const bookError = checkVoucherBook(params, this._fforBookContext('S'));
 		if (bookError) return refuse(FforAbortReason.TERMS_REFUSED, bookError);
-		if (
-			this._currentBlockHeight > 0 &&
-			params.settlementDeadline <= this._currentBlockHeight
-		) {
+		if (params.settlementDeadline <= this._currentBlockHeight) {
 			return refuse(
 				FforAbortReason.TERMS_REFUSED,
 				'settlement_deadline is not in the future'
@@ -20553,7 +20585,7 @@ export class Channel {
 		if (this._fforHashesBindRevealedSecret(seen)) {
 			return this._fforAbortLocal(
 				f,
-				FforAbortReason.PROTOCOL_ERROR,
+				FforAbortReason.BOOK_MISMATCH,
 				'ff_accept binds a hash to a revealed per-commitment secret'
 			);
 		}
@@ -20578,9 +20610,11 @@ export class Channel {
 	 * a long-lived channel does not re-derive its whole shachain.
 	 */
 	private _fforHashesBindRevealedSecret(hashesHex: Set<string>): boolean {
+		// Every secret the peer has revealed so far, exhaustively: the shachain
+		// store derives any older index from its stored entries, and a hash
+		// bound to any of them would let R redeem an unpaid voucher.
 		const revealed = this._remoteRevocationCount();
-		const from = revealed > 2016n ? revealed - 2016n : 0n;
-		for (let i = from; i < revealed; i++) {
+		for (let i = 0n; i < revealed; i++) {
 			const secret = this._state.shaChainStore.getSecret(MAX_INDEX - i);
 			if (!secret) continue;
 			const h = crypto.createHash('sha256').update(secret).digest();
@@ -20620,8 +20654,22 @@ export class Channel {
 			return;
 		}
 		if (f.state === FforState.NEGOTIATING) {
+			// Any add in the round window that is not a book voucher (a wrong
+			// amount or hash on a book id, or an extra add beyond K) fails the
+			// round: parked, failed with temporary_node_failure once
+			// committed, and the setup aborted with reason 5 (section 9.5.1).
+			entry.fforMismatch = true;
 			f.voucherRoundFailed = true;
 		}
+	}
+
+	/** Mismatching adds parked by the round window (section 9.5.1 step 3). */
+	private _fforMismatchEntries(): IHtlcEntry[] {
+		const out: IHtlcEntry[] = [];
+		for (const [key, e] of this._state.htlcs) {
+			if (key.startsWith('received-') && e.fforMismatch === true) out.push(e);
+		}
+		return out;
 	}
 
 	/**
@@ -20649,6 +20697,18 @@ export class Channel {
 		if (this._state.state !== ChannelState.NORMAL) return [];
 		if (this.hasPendingHtlcs()) return [];
 		const entries = this._fforVoucherEntries(f);
+		// A failed round (a mismatching add, a wrong onion, K+1 adds) aborts as
+		// soon as the channel is synchronized, whatever arrived; the unwind
+		// then fails every parked add.
+		if (f.role === 'R' && f.voucherRoundFailed) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.VOUCHER_ROUND_FAILED,
+				'voucher round did not match the book'
+			);
+		}
+		// K-1: a slot that never arrives leaves the round incomplete; the
+		// section 7.5.5 setup timeout aborts it (fforSetupTimedOut).
 		if (entries.size !== f.params.maxPayments) return [];
 		for (const e of entries.values()) {
 			// Irrevocable in BOTH views: committed, revoked on our side, covered
@@ -20683,7 +20743,11 @@ export class Channel {
 					new Set(f.paymentHashes.map((h) => h.toString('hex')))
 				)
 			) {
-				f.voucherRoundFailed = true;
+				return this._fforAbortLocal(
+					f,
+					FforAbortReason.BOOK_MISMATCH,
+					'a voucher hash binds a revealed per-commitment secret'
+				);
 			}
 			if (f.voucherRoundFailed) {
 				return this._fforAbortLocal(
@@ -21109,6 +21173,24 @@ export class Channel {
 		return actions;
 	}
 
+	/**
+	 * Section 7.5.5: the setup timeout fired. A setup still short of ACTIVE
+	 * aborts with reason 1 (a K-1 voucher round, a peer that never answered);
+	 * anything else is a no-op.
+	 */
+	fforSetupTimedOut(): ChannelAction[] {
+		const f = this._fforLive();
+		if (!f || f.state === FforState.ACTIVE || f.state === FforState.DRAINING) {
+			return [];
+		}
+		return this._fforAbortLocal(
+			f,
+			FforAbortReason.TIMEOUT,
+			'setup did not reach ACTIVE in time',
+			false
+		);
+	}
+
 	/** Operator abort of a setup before ACTIVE. */
 	abortFforEpoch(
 		reason: FforAbortReason = FforAbortReason.OPERATOR,
@@ -21214,11 +21296,9 @@ export class Channel {
 				{ type: ChannelActionType.ERROR, message: text, cleanup: 'none' }
 			];
 		}
-		return [
-			{ type: ChannelActionType.PERSIST_STATE },
-			...this._fforMarkAborted(f, FforAbortReason.PROTOCOL_ERROR),
-			{ type: ChannelActionType.ERROR, message: text, cleanup: 'none' }
-		];
+		// Section 11.1: the sender's ff_abort (reason 7) follows and is what
+		// ends the setup; no reason is inferred from the ff_error itself.
+		return [{ type: ChannelActionType.ERROR, message: text, cleanup: 'none' }];
 	}
 
 	/**
@@ -21232,7 +21312,11 @@ export class Channel {
 		if (this._quiescence.isQuiescing()) return [];
 		const actions: ChannelAction[] = [];
 		let remaining = false;
-		for (const entry of this._fforVoucherEntries(f).values()) {
+		const parked = [
+			...this._fforVoucherEntries(f).values(),
+			...this._fforMismatchEntries()
+		];
+		for (const entry of parked) {
 			if (entry.state !== HtlcState.COMMITTED) {
 				if (entry.state === HtlcState.PENDING) remaining = true;
 				continue;
@@ -21627,7 +21711,9 @@ export class Channel {
 		if (f.state !== FforState.ACTIVE) return `epoch is ${FforState[f.state]}`;
 		if (f.activationMismatch) return 'activation hash mismatch at reestablish';
 		if (f.closeProcessed) return 'ff_close processed';
-		if (tipHeight > 0 && tipHeight >= f.params.settlementDeadline) {
+		// Fail closed: with no tip we cannot tell whether D has passed.
+		if (tipHeight <= 0) return 'tip height unknown';
+		if (tipHeight >= f.params.settlementDeadline) {
 			return 'settlement_deadline reached';
 		}
 		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
@@ -21703,8 +21789,13 @@ export class Channel {
 				);
 				break;
 			case FforState.ACTIVATING:
-				if (peerState === FforState.ACTIVE) {
-					// S persisted ACTIVE first and retransmits the ack.
+				if (
+					peerState === FforState.ACTIVE &&
+					f.hAct &&
+					peer!.activationHash.equals(f.hAct)
+				) {
+					// Acknowledgement loss (section 7.5.5): S persisted ACTIVE
+					// before its ack left and retransmits it; its H_act is ours.
 					break;
 				}
 				// S reports anything else: it never persisted ACTIVE, and a

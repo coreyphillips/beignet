@@ -187,17 +187,21 @@ const rSigner = new ChannelSigner(R_FUNDING_PRIV, R_PAYMENT_BASEPOINT_SECRET);
 
 type Funder = 'S' | 'R';
 
-function makeStates(funder: Funder): {
+function makeStates(
+	funder: Funder,
+	rPreMsat: bigint
+): {
 	sState: IChannelState;
 	rState: IChannelState;
 } {
+	const sPreMsat = FUNDING_SAT * 1000n - rPreMsat;
 	let sState: IChannelState;
 	let rState: IChannelState;
 	if (funder === 'S') {
 		sState = createOpenerState({
 			temporaryChannelId: Buffer.alloc(32),
 			fundingSatoshis: FUNDING_SAT,
-			pushMsat: R_BALANCE_MSAT_PRE,
+			pushMsat: rPreMsat,
 			localConfig: { ...CONFIG },
 			localBasepoints: sBasepoints,
 			localPerCommitmentSeed: S_PC_SEED
@@ -207,7 +211,7 @@ function makeStates(funder: Funder): {
 		rState = createAcceptorState({
 			temporaryChannelId: Buffer.alloc(32),
 			fundingSatoshis: FUNDING_SAT,
-			pushMsat: R_BALANCE_MSAT_PRE,
+			pushMsat: rPreMsat,
 			localConfig: { ...CONFIG },
 			localBasepoints: rBasepoints,
 			localPerCommitmentSeed: R_PC_SEED,
@@ -218,7 +222,7 @@ function makeStates(funder: Funder): {
 		rState = createOpenerState({
 			temporaryChannelId: Buffer.alloc(32),
 			fundingSatoshis: FUNDING_SAT,
-			pushMsat: S_BALANCE_MSAT_PRE,
+			pushMsat: sPreMsat,
 			localConfig: { ...CONFIG },
 			localBasepoints: rBasepoints,
 			localPerCommitmentSeed: R_PC_SEED
@@ -228,7 +232,7 @@ function makeStates(funder: Funder): {
 		sState = createAcceptorState({
 			temporaryChannelId: Buffer.alloc(32),
 			fundingSatoshis: FUNDING_SAT,
-			pushMsat: S_BALANCE_MSAT_PRE,
+			pushMsat: sPreMsat,
 			localConfig: { ...CONFIG },
 			localBasepoints: sBasepoints,
 			localPerCommitmentSeed: S_PC_SEED,
@@ -255,6 +259,8 @@ function makeStates(funder: Funder): {
 interface IScenarioExpect {
 	id: string;
 	funder: Funder;
+	/** R's pre-round balance; S holds the rest of the 10,000,000 sat. */
+	rPreMsat?: bigint;
 	amounts: bigint[];
 	sHtlcIdBase: bigint;
 	epochId: string;
@@ -423,6 +429,43 @@ const SCENARIOS: IScenarioExpect[] = [
 			'52754e709395539b366ca52ad8c326baa7c0707a825f37d319ea9b28198bf8a4'
 	},
 	{
+		id: 'D.6',
+		funder: 'S',
+		rPreMsat: 0n,
+		amounts: [1_000_000n],
+		sHtlcIdBase: 0n,
+		epochId: '75ac6c4567bb853d69517b2fe7660700e83262c129fb80c5f3e7b8705d2b2f93',
+		initSig:
+			'e0e99ff77a29e85142624109ed949a2beb6a35de044c32f884e22a67f72308526065b8e983625c675361332e2a10fa506af6b402b069471921b4a366765edf7f',
+		initWireSha256:
+			'5dda21bd776f1b3d6f7cacb898efd95e31a8a04e48dae35484789bad50330da4',
+		tInit: 'd290b308abba2f4346a5fb0e2477d54eada86eb455d298a14570a8c90aae4d7d',
+		acceptSig:
+			'5ff3c9076c82f18847c629529938cb5d03cf3136d8b87be432f9ed0bc81a40e231a83a0146d5c1d0473cc11990623ca31ab3defa22e9c96142fc6340e55aac23',
+		acceptWireSha256:
+			'e468c2f7dd682266f067ded7eb0143ae441ce50d0c7395b822d7ee3234fd1706',
+		tSetup: 'eb4e7e4a56d8612ce7dddd7ed5b8b31d22a9c394560909d5f0a8a7cfc6fb5a71',
+		hBook: 'dc2a6687c21e580e3cacc642c8f877ded7278fc9b87e7b388ecee30142ecebb7',
+		rTxidInternal:
+			'5a294b75a1b592d11670560d0e7976fabaac0779292f2aaa4096e81f73e591c7',
+		sTxidInternal:
+			'd76e272a1353cd34eb8ee2eeefe8783f24b77a0d5424ffb253961af387d7de82',
+		rViewCommitSig:
+			'6b859b54906d5e13c2f9f396ff5ea3b2daff8d65d4ba3c48451e87a791886c7406a951548ec51cac9ad3d800c8401e0916b619977c170218c01bac9d2fd53da2',
+		sViewCommitSig:
+			'1881a361af8ca968e3e7c322525c50a63d7704d6b625bd6d1cfde78c10d2cb125e38a4936f94e72e6ec1075b07ab00b2f59a0ceacf02e395cb73bef7030b8389',
+		hCommit: '8f19b491169952d5c5852cb9c722ec7f9e52b4bf1627f2c80377f0e7bdbe9287',
+		activateSig:
+			'9b032fc561367edc1f08074a67a670db9d5220826d2f5ea2768ea0ae8485bf9367549039a160219ba6393387728aeb66cdf27647fe07d3d201b0c7d2df813051',
+		activateWireSha256:
+			'5531469deefe57bc381f19a5697d55117cfc007e284638baae4f1b0b46d1922d',
+		hAct: '65129deb07cd484e12e9badcbc11dace2e724e9a1ccba6b40ec92d57dbaaf028',
+		ackSig:
+			'1b127837288c4ae30686b772f13791954b42dafb2b318eba7f91545e3a09089543a8e85aedf462ecd5a1338602329a036c49c41473420ac1f2d2b911898baacc',
+		ackWireSha256:
+			'1415f328f391aa3b78ba44fd6b41e6940425d6af44e537baeb61a33de60b67ee'
+	},
+	{
 		id: 'D.5',
 		funder: 'S',
 		amounts: Array.from({ length: 483 }, () => 546_000n),
@@ -582,7 +625,8 @@ function buildScenario(sc: IScenarioExpect): IBuilt {
 	const book = buildVoucherBook(epochId, FforVariant.D, entries);
 	const hBook = computeHBook(book);
 
-	const { sState, rState } = makeStates(sc.funder);
+	const rPre = sc.rPreMsat ?? R_BALANCE_MSAT_PRE;
+	const { sState, rState } = makeStates(sc.funder, rPre);
 	for (let i = 0; i < K; i++) {
 		const base = {
 			id: sc.sHtlcIdBase + BigInt(i),
@@ -691,7 +735,9 @@ describe('FFOR Appendix D: Variant D setup vectors', function () {
 	this.timeout(60_000);
 
 	for (const sc of SCENARIOS) {
-		describe(`${sc.id}: K = ${sc.amounts.length}, funder ${sc.funder}`, () => {
+		describe(`${sc.id}: K = ${sc.amounts.length}, funder ${
+			sc.funder
+		}, R holds ${sc.rPreMsat ?? R_BALANCE_MSAT_PRE} msat`, () => {
 			let b: IBuilt;
 			before(() => {
 				b = buildScenario(sc);
@@ -764,8 +810,9 @@ describe('FFOR Appendix D: Variant D setup vectors', function () {
 							htlcMinimumMsat: HTLC_MINIMUM_MSAT,
 							dustLimitSatoshis: DUST_LIMIT_SAT,
 							feeratePerKw: FEERATE_PER_KW,
-							sLocalBalanceMsat: S_BALANCE_MSAT_PRE,
-							rLocalBalanceMsat: R_BALANCE_MSAT_PRE,
+							sLocalBalanceMsat:
+								FUNDING_SAT * 1000n - (sc.rPreMsat ?? R_BALANCE_MSAT_PRE),
+							rLocalBalanceMsat: sc.rPreMsat ?? R_BALANCE_MSAT_PRE,
 							sChannelReserveSat: CHANNEL_RESERVE_SAT,
 							rChannelReserveSat: CHANNEL_RESERVE_SAT,
 							sIsFunder: sc.funder === 'S',

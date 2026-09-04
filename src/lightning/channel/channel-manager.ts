@@ -181,6 +181,7 @@ import { Feature, FeatureFlags } from '../features/flags';
 import { sign as signWithNodeKey } from '../crypto/ecdh';
 import { decodeFforHeader } from '../ffor/messages';
 import {
+	FF_ACTIVATION_TIMEOUT_MS,
 	FforAbortReason,
 	FforSlotState,
 	FforState,
@@ -828,6 +829,16 @@ export class ChannelManager extends EventEmitter {
 			MessageType.TX_ACK_RBF,
 			MessageType.TX_ABORT,
 			MessageType.ANNOUNCEMENT_SIGNATURES,
+			// FFOR Variant D (specs/ffor-offline-receive.md section 14).
+			MessageType.FF_INIT,
+			MessageType.FF_ACCEPT,
+			MessageType.FF_INVOICES,
+			MessageType.FF_ERROR,
+			MessageType.FF_ACTIVATE,
+			MessageType.FF_ACTIVATE_ACK,
+			MessageType.FF_ABORT,
+			MessageType.FF_CLOSE,
+			MessageType.FF_CLOSE_ACK,
 			// BOLT 1 error/warning: without these registrations a remote error is
 			// silently dropped — the channel never gets marked ERRORED and the node
 			// reconnect-loops against a peer that fails it on every reestablish.
@@ -5490,6 +5501,12 @@ export class ChannelManager extends EventEmitter {
 
 	/** Last FFOR state reported per channel, for the ffor:state event. */
 	private _fforLastState = new Map<string, FforState | null>();
+	/**
+	 * Section 7.5.5 setup timeout: a setup that has not reached ACTIVE within
+	 * the window is aborted (reason 1). Armed while a record is pre-ACTIVE,
+	 * cleared when it leaves that range.
+	 */
+	private _fforSetupTimers = new Map<string, NodeJS.Timeout>();
 
 	/**
 	 * Whether the peer's init features negotiated FFOR: option_ff_receive
@@ -5528,10 +5545,43 @@ export class ChannelManager extends EventEmitter {
 		const hex = channelId.toString('hex');
 		const record = channel.getFforEpoch();
 		const state = record ? record.state : null;
+		this._fforSyncSetupTimer(hex, channelId, state);
 		const last = this._fforLastState.get(hex);
 		if (last === state) return;
 		this._fforLastState.set(hex, state);
 		if (record) this.emit('ffor:state', channelId, state, record);
+	}
+
+	private _fforSyncSetupTimer(
+		hex: string,
+		channelId: Buffer,
+		state: FforState | null
+	): void {
+		const preActive =
+			state === FforState.NEGOTIATING ||
+			state === FforState.VOUCHERS_COMMITTED ||
+			state === FforState.ACTIVATING;
+		const timer = this._fforSetupTimers.get(hex);
+		if (preActive && !timer) {
+			const t = setTimeout(() => {
+				this._fforSetupTimers.delete(hex);
+				this.fforSetupTimeout(channelId);
+			}, FF_ACTIVATION_TIMEOUT_MS);
+			if (typeof t.unref === 'function') t.unref();
+			this._fforSetupTimers.set(hex, t);
+		} else if (!preActive && timer) {
+			clearTimeout(timer);
+			this._fforSetupTimers.delete(hex);
+		}
+	}
+
+	/**
+	 * Section 7.5.5: abort a setup that did not reach ACTIVE in time (reason
+	 * 1). Fired by the setup timer; callable directly by an operator or a
+	 * test. A no-op once the epoch is ACTIVE, ABORTED or gone.
+	 */
+	fforSetupTimeout(channelId: Buffer): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforSetupTimedOut());
 	}
 
 	private handleFforMessage(
@@ -5592,7 +5642,19 @@ export class ChannelManager extends EventEmitter {
 				// it: delegated payments are recognised from the hash set.
 				return;
 		}
-		this.processActions(peerPubkey, channel, actions);
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
+		if (progress.sendsWithheld || progress.sendsHeld) {
+			// The durable write behind this transition did not land (or its
+			// sends are parked): nothing that transition authorizes may
+			// follow it. The reestablish path retries after a reconnect.
+			this.emit(
+				'error',
+				channelId,
+				`FFOR ${type}: durable write failed or sends withheld; transition not acted on`
+			);
+			return;
+		}
 		// The voucher adds (after ff_init), the abort unwind and the drain all
 		// need a commitment round; a no-op when nothing is pending.
 		this.autoSignAndSendCommitment(channelId);
@@ -5614,10 +5676,25 @@ export class ChannelManager extends EventEmitter {
 		}
 		this._fforEnsureContext(peerPubkey, channel);
 		const actions = produce(channel);
-		this.processActions(peerPubkey, channel, actions);
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
+		const err = actions.find((a) => a.type === ChannelActionType.ERROR);
+		if (progress.sendsWithheld || progress.sendsHeld) {
+			// A failed persist (or a parked batch): the state this transition
+			// wrote is not on disk, so nothing may act on it. No auto-sign, no
+			// state event; the caller must not reveal or send anything either.
+			return {
+				ok: false,
+				actions,
+				sendsWithheld: true,
+				error:
+					err && err.type === ChannelActionType.ERROR
+						? err.message
+						: 'durable write failed or sends withheld; transition not acted on'
+			};
+		}
 		this.autoSignAndSendCommitment(channelId);
 		this._fforEmitStateChange(channel);
-		const err = actions.find((a) => a.type === ChannelActionType.ERROR);
 		return {
 			ok: err === undefined,
 			actions,
