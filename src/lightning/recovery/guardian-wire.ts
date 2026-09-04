@@ -114,6 +114,44 @@ export function deriveRecoveryRoot(nodeSecret: Buffer): {
 	return { rootSecret, recoveryId: Buffer.from(pub.subarray(1)) };
 }
 
+/**
+ * The guardian signing key of a node that HOSTS the reference guardian
+ * (wire 2.7, issue #699): a dedicated seed-derived secret, info string
+ * 'beignet-guardian-root-v1' (verified non-colliding with the other seven
+ * in use), built exactly like the recovery root so a rebuilt node keeps its
+ * guardianId and the wire 5.9 maintenance path is seed-only. Never the node
+ * identity key: a guardian's receipts must not be forgeable by anything that
+ * signs channel state, and the guardian id must not reveal the node id.
+ */
+export function deriveGuardianRoot(nodeSecret: Buffer): {
+	guardianSecret: Buffer;
+	guardianId: Buffer;
+} {
+	if (nodeSecret.length !== 32 || !ecc.isPrivate(nodeSecret)) {
+		throw new Error(
+			'nodeSecret must be a valid 32-byte secp256k1 identity secret'
+		);
+	}
+	const okm = Buffer.from(
+		hkdfSync(
+			'sha256',
+			nodeSecret,
+			Buffer.alloc(0),
+			'beignet-guardian-root-v1',
+			32
+		)
+	);
+	let scalar = 0n;
+	for (const byte of okm) scalar = (scalar << 8n) | BigInt(byte);
+	scalar = (scalar % (CURVE_ORDER - 1n)) + 1n;
+	const guardianSecret = Buffer.alloc(32);
+	for (let i = 31; i >= 0; i--) {
+		guardianSecret[i] = Number(scalar & 0xffn);
+		scalar >>= 8n;
+	}
+	return { guardianSecret, guardianId: xOnlyFromSecret(guardianSecret) };
+}
+
 /** x-only public key for a fresh random writer or guardian secret. */
 export function xOnlyFromSecret(secret: Buffer): Buffer {
 	const pub = ecc.pointFromScalar(secret, true);

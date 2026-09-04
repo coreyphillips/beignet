@@ -431,9 +431,15 @@ leaves.
 ### 5.1 REGISTER_NODE
 
 Request: the REGISTER transcript fields plus the recovery root public key
-(which IS recovery_id) and the root signature. Acceptance:
+(which IS recovery_id), the root signature, and `guardian_members`, the
+committed member keys. The member list is REQUIRED: a guardian hosted by a
+node (2.7) serves sets it never saw configured and learns the set from the
+registration, and every guardian, configured or hosted, applies the same
+check so the two cannot accept different registrations. Acceptance:
 
 ```text
+guardian_members lists exactly `total` x-only keys, hashes (section 4)
+to guardian_set_id, and names this guardian
 recovery_id not yet registered for this guardian_set_id
 root signature verifies over the REGISTER transcript under recovery_id
 initial lease.epoch >= 1, writer key well-formed
@@ -768,6 +774,7 @@ message RegisterNodeRequest {
   bytes         guardian_set_id  = 2;
   GuardianState initial_state    = 3;
   bytes         root_signature   = 4;  // 64, over the REGISTER transcript
+  repeated bytes guardian_members = 5; // 32 each; exactly `total`; REQUIRED
 }
 message RegisterNodeResponse {
   uint32        status  = 1;
@@ -908,6 +915,10 @@ codec stays tractable, and signatures never depend on the envelope.
 31  ERR_RATE_LIMITED        semantic rate limit; retry_after in detail
                             AND the Retry-After HTTP header
 32  ERR_TOO_LARGE           object exceeds the guardian's advertised limit
+33  ERR_QUOTA_EXCEEDED      a hosted guardian's storage quota is exhausted
+                            for new namespaces or further records; not a
+                            transport condition and not retryable until the
+                            operator raises the quota (2.7)
 50  ERR_INTERNAL            transient guardian fault; safe to retry
 ```
 

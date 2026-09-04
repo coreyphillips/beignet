@@ -60,15 +60,14 @@ import {
 	IBolt8GuardianTarget,
 	parseBolt8GuardianUrl
 } from './guardian-client';
-import { GUARDIAN_HTTP_BASE_PATH } from './guardian-proto';
+import { GUARDIAN_HTTP_BASE_PATH, encodeInfoResponse } from './guardian-proto';
 import {
 	GUARDIAN_ENVELOPE_ALLOWANCE_BYTES,
 	GuardianVerbName,
 	dispatchGuardianVerb,
-	encodeGuardianInfo,
 	isGuardianVerbName
 } from './guardian-http';
-import { ReferenceGuardian } from './guardian';
+import { IGuardianInfoResponse, ReferenceGuardian } from './guardian';
 
 // ─────────────── verbs ───────────────
 
@@ -540,8 +539,28 @@ export class GuardianBolt8Assembler {
 
 // ─────────────── responder (the guardian side) ───────────────
 
+/**
+ * What answers a session's verbs. A single ReferenceGuardian serves one
+ * set; a GuardianHost (guardian-host.ts) serves many and picks the guardian
+ * per request, or hands back an already-encoded protocol refusal (unknown
+ * set, exhausted quota, undecodable body).
+ */
+export interface IGuardianResolver {
+	info(): IGuardianInfoResponse;
+	forRequest(verb: GuardianVerbName, body: Buffer): ReferenceGuardian | Buffer;
+}
+
+export function singleGuardianResolver(
+	guardian: ReferenceGuardian
+): IGuardianResolver {
+	return {
+		info: (): IGuardianInfoResponse => guardian.info(),
+		forRequest: (): ReferenceGuardian => guardian
+	};
+}
+
 export interface IGuardianBolt8ResponderOptions {
-	guardian: ReferenceGuardian;
+	guardian: ReferenceGuardian | IGuardianResolver;
 	/**
 	 * Transport credential check over the request's auth bytes (wire 9).
 	 * Absent means running open, which BOLT 8 makes acceptable on any
@@ -572,18 +591,21 @@ export function bolt8BearerAuthenticator(
  * violated framing; drop the session.
  */
 export class GuardianBolt8Responder {
-	private readonly guardian: ReferenceGuardian;
+	private readonly resolver: IGuardianResolver;
 	private readonly authenticate?: (auth: Buffer | undefined) => boolean;
 	private readonly assembler: GuardianBolt8Assembler;
 
 	constructor(options: IGuardianBolt8ResponderOptions) {
-		this.guardian = options.guardian;
+		this.resolver =
+			options.guardian instanceof ReferenceGuardian
+				? singleGuardianResolver(options.guardian)
+				: options.guardian;
 		this.authenticate = options.authenticate;
 		this.assembler = new GuardianBolt8Assembler({
 			kind: 'request',
 			maxBodyBytes:
 				options.maxBodyBytes ??
-				options.guardian.info().maxCiphertextBytes +
+				this.resolver.info().maxCiphertextBytes +
 					GUARDIAN_ENVELOPE_ALLOWANCE_BYTES,
 			maxInFlight: options.maxInFlight,
 			clock: options.clock
@@ -617,10 +639,16 @@ export class GuardianBolt8Responder {
 			return answer(GuardianBolt8Status.NOT_FOUND, Buffer.alloc(0));
 		}
 		try {
-			const body =
-				name === 'info'
-					? encodeGuardianInfo(this.guardian)
-					: dispatchGuardianVerb(this.guardian, name, request.body);
+			if (name === 'info') {
+				return answer(
+					GuardianBolt8Status.OK,
+					encodeInfoResponse(this.resolver.info())
+				);
+			}
+			const resolved = this.resolver.forRequest(name, request.body);
+			const body = Buffer.isBuffer(resolved)
+				? resolved
+				: dispatchGuardianVerb(resolved, name, request.body);
 			return answer(GuardianBolt8Status.OK, body);
 		} catch {
 			return answer(GuardianBolt8Status.GUARDIAN_FAILED, Buffer.alloc(0));

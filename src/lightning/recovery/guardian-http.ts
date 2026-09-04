@@ -94,28 +94,33 @@ const VERB_HANDLERS: Record<
 		encodeSyncEpochResponse(guardian.syncEpoch(decodeSyncEpochRequest(body)))
 };
 
-const MALFORMED_FOR: Record<GuardianVerbName, (detail: string) => Buffer> = {
-	register_node: (detail) =>
-		encodeRegisterNodeResponse({
-			status: GuardianStatus.ERR_MALFORMED,
-			detail
-		}),
-	put_state: (detail) =>
-		encodePutStateResponse({ status: GuardianStatus.ERR_MALFORMED, detail }),
-	get_head: (detail) =>
-		encodeGetHeadResponse({ status: GuardianStatus.ERR_MALFORMED, detail }),
-	get_state: (detail) =>
-		encodeGetStateResponse({ status: GuardianStatus.ERR_MALFORMED, detail }),
-	acquire_epoch: (detail) =>
-		encodeAcquireEpochResponse({
-			status: GuardianStatus.ERR_MALFORMED,
-			detail
-		}),
-	sync_record: (detail) =>
-		encodeSyncRecordResponse({ status: GuardianStatus.ERR_MALFORMED, detail }),
-	sync_epoch: (detail) =>
-		encodeSyncEpochResponse({ status: GuardianStatus.ERR_MALFORMED, detail })
+const REFUSAL_FOR: Record<
+	GuardianVerbName,
+	(status: GuardianStatus, detail: string) => Buffer
+> = {
+	register_node: (status, detail) =>
+		encodeRegisterNodeResponse({ status, detail }),
+	put_state: (status, detail) => encodePutStateResponse({ status, detail }),
+	get_head: (status, detail) => encodeGetHeadResponse({ status, detail }),
+	get_state: (status, detail) => encodeGetStateResponse({ status, detail }),
+	acquire_epoch: (status, detail) =>
+		encodeAcquireEpochResponse({ status, detail }),
+	sync_record: (status, detail) => encodeSyncRecordResponse({ status, detail }),
+	sync_epoch: (status, detail) => encodeSyncEpochResponse({ status, detail })
 };
+
+/**
+ * A protocol-level refusal in the verb's own response shape, for the cases
+ * a dispatcher decides BEFORE reaching a guardian: an undecodable body, a
+ * set this host does not serve, an exhausted quota (wire 2.7).
+ */
+export function encodeGuardianVerbRefusal(
+	verb: GuardianVerbName,
+	status: GuardianStatus,
+	detail: string
+): Buffer {
+	return REFUSAL_FOR[verb](status, detail);
+}
 
 /**
  * Run one signed verb against the guardian and encode its protocol answer.
@@ -134,7 +139,10 @@ export function dispatchGuardianVerb(
 	try {
 		return VERB_HANDLERS[verb](guardian, body);
 	} catch {
-		return MALFORMED_FOR[verb]('undecodable request body');
+		return REFUSAL_FOR[verb](
+			GuardianStatus.ERR_MALFORMED,
+			'undecodable request body'
+		);
 	}
 }
 

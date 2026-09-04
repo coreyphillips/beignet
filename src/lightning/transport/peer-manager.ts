@@ -114,12 +114,30 @@ export interface IPeerManagerOptions {
 	socks5TimeoutMs?: number;
 	/** Maximum number of inbound peer connections (default 125) */
 	maxInboundPeers?: number;
+	/**
+	 * Maximum inbound connections admitted into the guardian-only lane while
+	 * the connection gate is closed (default 32). Counted apart from
+	 * maxInboundPeers so lane sessions can never crowd out channel peers.
+	 */
+	maxLanePeers?: number;
 	/** WebSocket constructor for outbound WS peer connections. Defaults to
 	 *  the in-repo RFC-cased Node client under Node (CLN's ws listener
 	 *  rejects the built-in WebSocket's lowercased headers) and to
 	 *  globalThis.WebSocket in browsers. Only consulted when a peer is
 	 *  dialed with transport {type: 'ws'}. */
 	webSocketImpl?: WebSocketConstructor;
+}
+
+/**
+ * The guardian-only lane's policy (issue #699 D6). `admits` says whether an
+ * inbound connection the connection gate refused may be admitted into the
+ * lane right now; `allows` says whether one message may cross the lane, and
+ * is applied in BOTH directions, so a lane peer can neither reach the
+ * channel manager nor be told anything but lane traffic.
+ */
+export interface IPeerLaneGate {
+	admits: () => boolean;
+	allows: (type: number, payload: Buffer) => boolean;
 }
 
 export interface IPeerInfo {
@@ -204,6 +222,18 @@ export class PeerManager extends EventEmitter {
 	private socks5Proxy?: { host: string; port: number };
 	private socks5TimeoutMs: number;
 	private maxInboundPeers: number;
+	private maxLanePeers: number;
+	/**
+	 * Lane peers (recovery 5.6 exception, issue #699 D6): inbound connections
+	 * admitted while the connection gate is closed, restricted to the
+	 * messages the lane gate allows in both directions, invisible to
+	 * listPeers() and getPeer(), never reconnected. A node quarantined on its
+	 * own writer lease still SERVES guardian traffic for other nodes through
+	 * them, which is what keeps nodes that guard each other from deadlocking
+	 * on a simultaneous restart.
+	 */
+	private readonly lanePeers = new Map<string, Peer>();
+	private laneGate: IPeerLaneGate | null = null;
 	private inboundPeerCount = 0;
 	private inboundPeerSet: Set<string> = new Set();
 	private webSocketImpl?: WebSocketConstructor;
@@ -220,6 +250,7 @@ export class PeerManager extends EventEmitter {
 		this.socks5Proxy = options.socks5Proxy;
 		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
+		this.maxLanePeers = options.maxLanePeers ?? 32;
 		this.webSocketImpl = options.webSocketImpl;
 	}
 
@@ -596,6 +627,12 @@ export class PeerManager extends EventEmitter {
 	 * Disconnect from a peer.
 	 */
 	disconnectPeer(pubkey: string): void {
+		const lanePeer = this.lanePeers.get(pubkey);
+		if (lanePeer) {
+			lanePeer.disconnect();
+			this.dropLanePeer(pubkey, lanePeer);
+			return;
+		}
 		this.cancelGenerations.set(
 			pubkey,
 			(this.cancelGenerations.get(pubkey) ?? 0) + 1
@@ -655,6 +692,20 @@ export class PeerManager extends EventEmitter {
 	 */
 	setConnectionGate(gate: (() => boolean) | null): void {
 		this.connectionGate = gate;
+	}
+
+	/** Install the guardian-only lane policy; null closes the lane. */
+	setLaneGate(gate: IPeerLaneGate | null): void {
+		this.laneGate = gate;
+	}
+
+	/** Lane peers connected right now. */
+	lanePeerCount(): number {
+		return this.lanePeers.size;
+	}
+
+	isLanePeer(pubkey: string): boolean {
+		return this.lanePeers.has(pubkey);
 	}
 
 	private connectionGate: (() => boolean) | null = null;
@@ -785,6 +836,12 @@ export class PeerManager extends EventEmitter {
 		for (const pubkey of [...this.peers.keys()]) {
 			this.disconnectPeer(pubkey);
 		}
+		for (const [pubkey, peer] of [...this.lanePeers]) {
+			peer.removeAllListeners();
+			peer.disconnect();
+			this.lanePeers.delete(pubkey);
+			this.emit('lane:disconnect', pubkey);
+		}
 	}
 
 	/**
@@ -804,10 +861,75 @@ export class PeerManager extends EventEmitter {
 	private inboundGate: ((pubkey: string, type: number) => boolean) | null =
 		null;
 
+	private registerLanePeer(pubkey: string, peer: Peer): void {
+		// A key already registered as an ORDINARY peer never gets a lane
+		// twin: lane sessions use fresh keys, so a collision is a peer
+		// speaking out of turn. Newest wins among lane sessions, as for
+		// ordinary inbound (a dropped Tor circuit redials before the ping
+		// timeout notices).
+		if (this.peers.has(pubkey)) {
+			peer.disconnect();
+			return;
+		}
+		const existing = this.lanePeers.get(pubkey);
+		if (existing) {
+			existing.removeAllListeners();
+			existing.disconnect();
+			this.lanePeers.delete(pubkey);
+			this.emit('lane:disconnect', pubkey);
+		}
+		this.lanePeers.set(pubkey, peer);
+		peer.on('message', (type: number, payload: Buffer) => {
+			if (!this.laneGate || !this.laneGate.allows(type, payload)) {
+				// Anything but lane traffic ends the session: the lane is
+				// not a channel connection and never becomes one.
+				peer.disconnect();
+				this.dropLanePeer(pubkey, peer);
+				return;
+			}
+			captureWireMessage('in', pubkey, type, payload);
+			this.emit('lane:message', pubkey, type, payload);
+		});
+		peer.on('error', () => {
+			// The close that follows does the bookkeeping.
+		});
+		peer.on('close', () => {
+			this.dropLanePeer(pubkey, peer);
+		});
+		captureWireEvent('connect', pubkey, 'lane');
+		this.emit('lane:connect', pubkey);
+		// Inbound connections hold post-init frames until bring-up is done
+		// (Peer.holdMessagesUntilRelease); the lane's bring-up is the
+		// listeners above, so release now, exactly as ordinary registration
+		// does.
+		peer.releaseHeldMessages();
+	}
+
+	private dropLanePeer(pubkey: string, peer: Peer): void {
+		if (this.lanePeers.get(pubkey) !== peer) return;
+		this.lanePeers.delete(pubkey);
+		captureWireEvent('close', pubkey);
+		this.emit('lane:disconnect', pubkey);
+	}
+
 	/**
 	 * Send a message to a specific peer.
 	 */
 	sendToPeer(pubkey: string, type: number, payload: Buffer): void {
+		const lanePeer = this.lanePeers.get(pubkey);
+		if (lanePeer) {
+			// Lane traffic answers to the lane gate, not the outbound gate:
+			// serving guardian storage for another node is unrelated to
+			// whether THIS node owns its own channels.
+			if (!this.laneGate || !this.laneGate.allows(type, payload)) {
+				throw new Error(
+					`Lane refused message type ${type} to lane peer ${pubkey}`
+				);
+			}
+			captureWireMessage('out', pubkey, type, payload);
+			lanePeer.sendMessage(type, payload);
+			return;
+		}
 		const peer = this.peers.get(pubkey);
 		if (!peer) {
 			throw new Error(`Not connected to peer ${pubkey}`);
@@ -1086,18 +1208,30 @@ export class PeerManager extends EventEmitter {
 	}
 
 	private handleInboundConnection(socket: IDuplexTransport): void {
-		// Quarantined, fenced or frozen (recovery 5.6): destroy the socket
-		// BEFORE the BOLT 8 handshake, so a node that cannot prove writer
-		// ownership never authenticates or exchanges init with anyone.
-		if (
-			this.connectionsDisabled() ||
-			(this.connectionGate && !this.connectionGate())
-		) {
+		// Frozen or destroyed: nothing is ever established again.
+		if (this.connectionsDisabled()) {
 			socket.destroy();
 			return;
 		}
-		// Reject if at inbound peer limit
-		if (this.inboundPeerCount >= this.maxInboundPeers) {
+		// Quarantined or fenced (recovery 5.6): destroy the socket BEFORE
+		// the BOLT 8 handshake, so a node that cannot prove writer ownership
+		// never exchanges channel state with anyone. The one exception is the
+		// guardian-only lane (issue #699 D6): a connection admitted there
+		// completes the handshake but can only ever carry what the lane gate
+		// allows, and never reaches the channel manager.
+		let lane = false;
+		if (this.connectionGate && !this.connectionGate()) {
+			if (
+				!this.laneGate ||
+				!this.laneGate.admits() ||
+				this.lanePeers.size >= this.maxLanePeers
+			) {
+				socket.destroy();
+				return;
+			}
+			lane = true;
+		} else if (this.inboundPeerCount >= this.maxInboundPeers) {
+			// Reject if at inbound peer limit
 			socket.destroy();
 			return;
 		}
@@ -1131,12 +1265,25 @@ export class PeerManager extends EventEmitter {
 			.acceptInbound(socket)
 			.then(() => {
 				this.pendingPeers.delete(peer);
-				// Recheck AFTER the handshake: a freeze or gate closure that
-				// landed mid-establishment must win over registration.
-				if (
-					this.connectionsDisabled() ||
-					(this.connectionGate && !this.connectionGate())
-				) {
+				// Recheck AFTER the handshake: a freeze that landed
+				// mid-establishment must win over registration.
+				if (this.connectionsDisabled()) {
+					peer.disconnect();
+					return;
+				}
+				if (lane) {
+					// Admitted into the lane; it stays lane-restricted for the
+					// life of the connection whatever the gate does later.
+					if (!this.laneGate || !this.laneGate.admits()) {
+						peer.disconnect();
+						return;
+					}
+					this.registerLanePeer(peer.remotePublicKey.toString('hex'), peer);
+					return;
+				}
+				// A gate closure that landed mid-establishment wins over
+				// registration as an ordinary peer.
+				if (this.connectionGate && !this.connectionGate()) {
 					peer.disconnect();
 					return;
 				}

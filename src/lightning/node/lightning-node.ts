@@ -160,6 +160,7 @@ import {
 	encodeCustomMessage,
 	decodeCustomMessage
 } from '../message/custom';
+import { GuardianHost, IGuardianHostStatus } from '../recovery/guardian-host';
 import {
 	IHeldJitPart,
 	IJitReceiveConfig,
@@ -935,6 +936,12 @@ export class LightningNode extends EventEmitter {
 	private largeChannels: boolean;
 	// SOCKS5 proxy config, kept for connect-by-node-id Tor address gating
 	private socks5Proxy: { host: string; port: number } | null;
+	/**
+	 * The reference guardian this node serves to OTHER nodes over bolt8
+	 * sessions (wire 2.7, issue #699), or null. Unrelated to this node's own
+	 * recovery mode; see INodeConfig.guardianHost.
+	 */
+	private guardianHost: GuardianHost | null = null;
 	// Watchtower client (LND altruist wtwire). Null when no towers configured.
 	private watchtowerClient: WatchtowerClient | null = null;
 	/** Server side: latest blob held per peer (mirrors storage when available). */
@@ -1518,6 +1525,40 @@ export class LightningNode extends EventEmitter {
 			this.registerPeerStorageHandlers();
 			this.registerCustomMessageHandler();
 			this.wirePeerManagerEvents();
+			if (config.guardianHost) {
+				this.guardianHost = new GuardianHost(config.guardianHost);
+				// The guardian-only lane (recovery 5.6 exception, #699 D6):
+				// while this node's own writer lease is unconfirmed the
+				// connection gate refuses every inbound socket, which would
+				// take the guardian service down with it and deadlock nodes
+				// that guard each other. Admit lane sessions that can carry
+				// nothing but guardian frames, in either direction.
+				this.peerManager.setLaneGate({
+					admits: (): boolean => this.guardianHostAdmitsLane(),
+					allows: (type, payload): boolean =>
+						LightningNode.isGuardianLaneMessage(type, payload)
+				});
+				this.peerManager.on(
+					'lane:message',
+					(pubkey: string, type: number, payload: Buffer) => {
+						if (type !== BEIGNET_CUSTOM_MESSAGE_TYPE) return;
+						let envelope: ICustomMessage;
+						try {
+							envelope = decodeCustomMessage(payload);
+						} catch {
+							return;
+						}
+						if (envelope.subtype === BeignetCustomSubtype.GUARDIAN_REQUEST) {
+							this.serveGuardianRequest(pubkey, envelope.payload);
+						}
+					}
+				);
+				this.peerManager.on('lane:disconnect', (pubkey: string) => {
+					this.guardianHost?.sessionClosed(pubkey);
+				});
+			}
+		} else if (config.guardianHost) {
+			throw new Error('guardianHost requires networking to be enabled');
 		}
 
 		// Create chain watcher if backend provided
@@ -4986,6 +5027,76 @@ export class LightningNode extends EventEmitter {
 		return this.recoveryGate ? this.recoveryGate.getState() : 'disabled';
 	}
 
+	// ─────────────── Guardian host (wire 2.7, issue #699) ───────────────
+
+	/** The guardian this node serves to others, or null when not hosting. */
+	getGuardianHostStatus(): IGuardianHostStatus | null {
+		return this.guardianHost ? this.guardianHost.status() : null;
+	}
+
+	/**
+	 * Whether the guardian-only lane admits inbound sessions right now:
+	 * hosting is on and this node is not fenced or frozen. Quarantine and
+	 * restore-pending repair are NOT refusals, which is the lane's purpose.
+	 */
+	private guardianHostAdmitsLane(): boolean {
+		return (
+			this.guardianHost !== null &&
+			!this._destroyed &&
+			!this._barrierFenced &&
+			this.getRecoveryGateState() !== 'fenced'
+		);
+	}
+
+	/** Lane traffic is the beignet custom type carrying a guardian subtype. */
+	static isGuardianLaneMessage(type: number, payload: Buffer): boolean {
+		if (type !== BEIGNET_CUSTOM_MESSAGE_TYPE) return false;
+		try {
+			const subtype = decodeCustomMessage(payload).subtype;
+			return (
+				subtype === BeignetCustomSubtype.GUARDIAN_REQUEST ||
+				subtype === BeignetCustomSubtype.GUARDIAN_RESPONSE
+			);
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Answer one guardian request frame from `pubkey`. A framing violation
+	 * ends that peer's session; a send failure (the peer left) is dropped,
+	 * because the requester's own timeout governs.
+	 */
+	private serveGuardianRequest(pubkey: string, frame: Buffer): void {
+		if (!this.guardianHost || !this.peerManager) return;
+		let responses: Buffer[];
+		try {
+			responses = this.guardianHost.handle(pubkey, frame);
+		} catch (err) {
+			this.emitStructuredLog('peer', 'guardian_session_violation', {
+				pubkey,
+				error: err instanceof Error ? err.message : String(err)
+			});
+			this.peerManager.disconnectPeer(pubkey);
+			return;
+		}
+		for (const response of responses) {
+			try {
+				this.peerManager.sendToPeer(
+					pubkey,
+					BEIGNET_CUSTOM_MESSAGE_TYPE,
+					encodeCustomMessage(BeignetCustomSubtype.GUARDIAN_RESPONSE, response)
+				);
+			} catch (err) {
+				this.emitStructuredLog('peer', 'guardian_response_dropped', {
+					pubkey,
+					error: err instanceof Error ? err.message : String(err)
+				});
+				return;
+			}
+		}
+	}
+
 	/**
 	 * The recovery picture in one call (spec 5.6 and 5.8): the startup gate,
 	 * the durability mode and how far replication has provably got, plus
@@ -5226,6 +5337,7 @@ export class LightningNode extends EventEmitter {
 			this.notifyPeerConnectObservers(pubkey);
 		});
 		this.peerManager.on('peer:disconnect', (pubkey: string) => {
+			this.guardianHost?.sessionClosed(pubkey);
 			this.channelManager.handlePeerDisconnected(pubkey);
 			this.gossipSyncManagers.delete(pubkey);
 			this.rateLimiter.removePeer(pubkey);
@@ -8605,6 +8717,7 @@ export class LightningNode extends EventEmitter {
 
 	destroy(): void {
 		this._destroyed = true;
+		this.guardianHost?.close();
 		// Retires any chain startup sequence still working through its awaits.
 		++this.chainStartupGeneration;
 		// Queued broadcast gossip dies with the node; the drain loop also
@@ -18689,6 +18802,18 @@ export class LightningNode extends EventEmitter {
 				} catch {
 					// A throwing log observer must not disconnect the peer.
 				}
+				return;
+			}
+			// A guardian request addressed to the host this node runs is
+			// answered here, not observed: the host owns the session state
+			// (issue #699). Ordinary peers reach this branch only once the
+			// startup gate permits traffic; lane peers arrive through
+			// 'lane:message' instead.
+			if (
+				this.guardianHost &&
+				msg.subtype === BeignetCustomSubtype.GUARDIAN_REQUEST
+			) {
+				this.serveGuardianRequest(pubkey, msg.payload);
 				return;
 			}
 			try {

@@ -20,6 +20,7 @@ import { SignerFactory } from '../keys/signer';
 import { WebSocketConstructor } from '../transport/websocket';
 import { GuardianStartupGate } from '../recovery/startup-gate';
 import { DurabilityBarrier } from '../recovery/durability-barrier';
+import { IGuardianHostConfig } from '../recovery/guardian-host';
 import { RecoveryDurability } from '../recovery/types';
 import type { GuardianDescriptor } from '../recovery/capsule';
 
@@ -307,6 +308,15 @@ export interface INodeConfig {
 	 * journaled commits at most once per minute. Purely additive; disabling
 	 * it changes nothing else.
 	 */
+	/**
+	 * Serve the reference guardian to other nodes over bolt8 sessions
+	 * (docs/RECOVERY-GUARDIAN-WIRE.md 2.7, issue #699). Requires networking.
+	 * Independent of this node's own `recovery` settings: a node can guard
+	 * strangers while using no guardians itself, and keeps serving them while
+	 * its own writer lease is quarantined (the guardian-only lane), which is
+	 * what lets nodes that guard each other restart together.
+	 */
+	guardianHost?: IGuardianHostConfig;
 	recovery?: {
 		enabled?: boolean;
 		/**

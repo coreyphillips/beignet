@@ -60,7 +60,8 @@ export function buildRegistrationFor(
 	root: { rootSecret: Buffer; recoveryId: Buffer },
 	setId: Buffer,
 	writerPub: Buffer,
-	origin?: { firstSequence: bigint; previousHash: Buffer }
+	origin?: { firstSequence: bigint; previousHash: Buffer },
+	members: Buffer[] = ACCEPT_GUARDIAN_IDS
 ): IGuardianRegisterNodeRequest {
 	const initialState: GuardianState = {
 		recoveryId: root.recoveryId,
@@ -71,6 +72,7 @@ export function buildRegistrationFor(
 	return {
 		protocolVersion: 1,
 		guardianSetId: setId,
+		guardianMembers: members,
 		initialState,
 		rootSignature: signTranscript(
 			registerTranscriptHash(setId, initialState),

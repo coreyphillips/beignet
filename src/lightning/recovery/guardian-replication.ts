@@ -524,6 +524,7 @@ export class GuardianReplicator {
 		const request: IGuardianRegisterNodeRequest = {
 			protocolVersion: 1,
 			guardianSetId: Buffer.from(this.config.context.guardianSetId),
+			guardianMembers: this.config.context.members.map((m) => Buffer.from(m)),
 			initialState,
 			rootSignature: signTranscript(
 				registerTranscriptHash(this.config.context.guardianSetId, initialState),

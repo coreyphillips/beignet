@@ -454,6 +454,9 @@ export function encodeRegisterNodeRequest(
 	writer.bytes(2, request.guardianSetId);
 	writer.message(3, encodeGuardianState(request.initialState));
 	writer.bytes(4, request.rootSignature);
+	for (const member of request.guardianMembers) {
+		writer.bytes(5, member);
+	}
 	return writer.finish();
 }
 
@@ -463,6 +466,7 @@ export function decodeRegisterNodeRequest(
 	const request: IGuardianRegisterNodeRequest = {
 		protocolVersion: 0,
 		guardianSetId: EMPTY(),
+		guardianMembers: [],
 		initialState: decodeGuardianState(EMPTY()),
 		rootSignature: EMPTY()
 	};
@@ -477,6 +481,8 @@ export function decodeRegisterNodeRequest(
 			request.initialState = decodeGuardianState(reader.readBytes());
 		} else if (field === 4 && wireType === WIRE_LEN) {
 			request.rootSignature = reader.readBytes();
+		} else if (field === 5 && wireType === WIRE_LEN) {
+			request.guardianMembers.push(reader.readBytes());
 		} else {
 			reader.skip(wireType);
 		}

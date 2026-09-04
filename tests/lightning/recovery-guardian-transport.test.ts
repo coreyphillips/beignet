@@ -99,6 +99,7 @@ function buildRegistration(): IGuardianRegisterNodeRequest {
 	return {
 		protocolVersion: 1,
 		guardianSetId: SET_ID,
+		guardianMembers: GUARDIAN_IDS,
 		initialState,
 		rootSignature: signTranscript(
 			registerTranscriptHash(SET_ID, initialState),

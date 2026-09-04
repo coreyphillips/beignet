@@ -108,6 +108,7 @@ function buildRegistration(opts?: {
 	return {
 		protocolVersion: 1,
 		guardianSetId: SET_ID,
+		guardianMembers: GUARDIAN_IDS,
 		initialState,
 		rootSignature: signTranscript(
 			registerTranscriptHash(SET_ID, initialState),
@@ -1718,6 +1719,7 @@ describe('Guardian core: structural corruption containment', () => {
 		const registration2: IGuardianRegisterNodeRequest = {
 			protocolVersion: 1,
 			guardianSetId: SET_ID,
+			guardianMembers: GUARDIAN_IDS,
 			initialState: state2,
 			rootSignature: signTranscript(
 				registerTranscriptHash(SET_ID, state2),
@@ -1787,6 +1789,7 @@ describe('Guardian core: structural corruption containment', () => {
 		const registration2: IGuardianRegisterNodeRequest = {
 			protocolVersion: 1,
 			guardianSetId: SET_ID,
+			guardianMembers: GUARDIAN_IDS,
 			initialState: state2,
 			rootSignature: signTranscript(
 				registerTranscriptHash(SET_ID, state2),
@@ -1887,6 +1890,7 @@ describe('Guardian core: structural corruption containment', () => {
 		const registrationH: IGuardianRegisterNodeRequest = {
 			protocolVersion: 1,
 			guardianSetId: SET_ID,
+			guardianMembers: GUARDIAN_IDS,
 			initialState: stateH,
 			rootSignature: signTranscript(
 				registerTranscriptHash(SET_ID, stateH),
