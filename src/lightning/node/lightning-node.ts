@@ -277,6 +277,7 @@ import {
 	RecoveryMutation,
 	GuardianStartupGate,
 	DurabilityBarrier,
+	IBarrierLatency,
 	chainLostBackfill,
 	chainPromisedQuorum,
 	storedTipSequence,
@@ -5178,6 +5179,12 @@ export class LightningNode extends EventEmitter {
 		 * means nobody can advance it, and the remedies differ.
 		 */
 		backfillLost: boolean;
+		/**
+		 * What the quorum barrier has cost so far (issue #702): waits that
+		 * parked a batch, how they ended, and the distribution of the
+		 * released ones over a recent window. Null without a barrier.
+		 */
+		barrierLatency: IBarrierLatency | null;
 		channels: Array<{
 			channelId: string;
 			status: ChannelRecoveryStatus;
@@ -5271,6 +5278,7 @@ export class LightningNode extends EventEmitter {
 			backfillLost:
 				barrier?.backfillLost ??
 				(this.storage ? chainLostBackfill(this.storage) !== null : false),
+			barrierLatency: barrier?.latency ?? null,
 			channels,
 			heldReestablish: this.channelManager.heldUnknownChannelReestablish()
 		};

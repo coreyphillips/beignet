@@ -300,6 +300,23 @@ describe('Recovery phase 6: the barrier holds only what it must', () => {
 		await waitFor(() => outcome !== null);
 		expect((outcome as unknown as BarrierOutcome).released).to.equal(true);
 		expect(barrier.watermark() >= sequence).to.equal(true);
+		// The wait is measured (issue #702): one parked batch, released,
+		// and it took at least as long as the guardians were held.
+		const latency = barrier.snapshot().latency;
+		expect(latency.released).to.equal(1);
+		expect(latency.refused).to.equal(0);
+		expect(latency.sampled).to.equal(1);
+		expect(latency.lastMs).to.be.a('number');
+		expect(latency.lastMs as number).to.be.at.least(150);
+		expect(latency.p50Ms).to.equal(latency.lastMs);
+		expect(latency.p95Ms).to.equal(latency.lastMs);
+		expect(latency.maxMs).to.equal(latency.lastMs);
+		expect(latency.meanMs).to.equal(latency.lastMs);
+		// A frame already durable releases on the synchronous path and is
+		// not a wait at all, so it leaves no sample behind.
+		const again = await barrier.whenReleased(sequence);
+		expect(again.released).to.equal(true);
+		expect(barrier.snapshot().latency.released).to.equal(1);
 		barrier.stop();
 		await shutdown(served);
 		storage.close();
@@ -434,6 +451,12 @@ describe('Recovery phase 6: a timeout freezes, it does not proceed', () => {
 		expect(outcome.released).to.equal(false);
 		expect((outcome as { reason: string }).reason).to.equal('timeout');
 		expect(events.some((e) => e.type === 'barrier:timeout')).to.equal(true);
+		// A refusal is counted, and contributes no latency sample: its
+		// duration is the timeout, not the guardians' distance.
+		expect(barrier.snapshot().latency.refused).to.equal(1);
+		expect(barrier.snapshot().latency.released).to.equal(0);
+		expect(barrier.snapshot().latency.sampled).to.equal(0);
+		expect(barrier.snapshot().latency.p95Ms).to.equal(null);
 		// The watermark never moved, so a later attempt is held too. Silence
 		// does not accumulate into permission.
 		expect(barrier.isReleased(sequence)).to.equal(false);
