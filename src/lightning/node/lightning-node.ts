@@ -356,7 +356,22 @@ import { signRemoteCommitment } from '../channel/commitment-builder';
 import { ChannelSigner, SignerFactory } from '../keys/signer';
 import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
 import { OnionMessageManager } from '../onion-message/manager';
-import { AsyncPaymentManager } from '../async-payments/manager';
+import {
+	AsyncPaymentManager,
+	IHeldForwardDriver
+} from '../async-payments/manager';
+import {
+	HELD_FORWARD_LEDGER_PREFIX,
+	HeldForwardLedger,
+	IHeldForwardRecord,
+	heldForwardCodec
+} from '../async-payments/held-forward-ledger';
+import { deriveHoldRegistrationId } from '../async-payments/release-capability';
+import { IHeldForwardNotice } from '../async-payments/types';
+import {
+	MemoryLedgerStore,
+	MetadataLedgerStore
+} from '../storage/durable-ledger';
 import {
 	IOnionMessagePayload,
 	ISendOnionMessageOptions
@@ -862,11 +877,13 @@ export class LightningNode extends EventEmitter {
 		string,
 		{ hashHex: string; shortfallMsat: bigint }
 	>();
-	// LSP-side: forwards parked for offline receivers, keyed by payment hash hex.
-	private heldForwards: Map<
-		string,
-		{ inChannelId: Buffer; inHtlcId: bigint; incomingCltvExpiry: number }
-	> = new Map();
+	/**
+	 * LSP-side held forwards (issue #708): the durable ledger every parked
+	 * inbound HTLC lives in, keyed by random hold_id, with its lifecycle.
+	 * Owned by the AsyncPaymentManager; the node arms per-hold drivers.
+	 */
+	private heldForwardLedger: HeldForwardLedger;
+	private autoReleaseHeldForwards: boolean;
 	private graphPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
 		null;
@@ -1409,6 +1426,15 @@ export class LightningNode extends EventEmitter {
 		});
 
 		this.onionMessageManager = new OnionMessageManager(config.nodePrivateKey);
+		// Default transport: the node's own outbound boundary, so onion
+		// messages flow over the event transport embedded integrators and
+		// tests use. registerOnionMessageHandler rebinds it to the
+		// PeerManager when networking is enabled.
+		this.onionMessageManager.setSendFunction(
+			(toPeer: string, type: number, payload: Buffer) => {
+				this.emitOutbound(toPeer, type, payload);
+			}
+		);
 		this.wireOnionMessageEvents();
 
 		this.offerManager = new OfferManager(config.nodePrivateKey, {
@@ -1433,15 +1459,91 @@ export class LightningNode extends EventEmitter {
 		});
 		this.wireOfferManagerEvents();
 
-		this.asyncPaymentManager = new AsyncPaymentManager();
+		// Held-forward ledger (issue #708): rehydrated HERE, at construction,
+		// before any transport exists, so no release can be judged against an
+		// empty ledger. The store rides the node's metadata table when storage
+		// is configured; an embedded node without storage keeps it in memory.
+		this.heldForwardLedger = new HeldForwardLedger(
+			this.storage
+				? new MetadataLedgerStore<IHeldForwardRecord>(
+						this.storage,
+						HELD_FORWARD_LEDGER_PREFIX,
+						heldForwardCodec
+				  )
+				: new MemoryLedgerStore<IHeldForwardRecord>()
+		);
+		this.heldForwardLedger.rehydrate();
+		this.autoReleaseHeldForwards = config.autoReleaseHeldForwards ?? true;
+		this.asyncPaymentManager = new AsyncPaymentManager(this.heldForwardLedger, {
+			nodePrivkey: this.nodePrivkey,
+			nodeId: getPublicKey(this.nodePrivkey),
+			chainHash: config.chainHashes?.[0] ?? this.chainHash(),
+			currentHeight: () => this.currentBlockHeight,
+			hasOutgoingLeg: (record) =>
+				this.findOutgoingLeg(
+					Buffer.from(record.inChannelIdHex, 'hex'),
+					BigInt(record.inHtlcId)
+				) !== null,
+			incomingUnresolved: (record) => this.heldForwardIncomingUnresolved(record)
+		});
 		this.asyncPaymentManager.attachOnionMessageManager(
 			this.onionMessageManager
 		);
-		// Receiver: a wake message means a sender is waiting — surface it so the
+		// Receiver: a wake message means a sender is waiting; surface it so the
 		// host can reconnect to its LSP and trigger release of the held HTLC.
 		this.asyncPaymentManager.on('wake', (paymentHash?: Buffer) => {
 			this.emit('payment:async-wake', paymentHash);
 		});
+		this.asyncPaymentManager.on(
+			'held-notice',
+			(info: { lspNodeId: Buffer; notice: IHeldForwardNotice }) => {
+				this.handleHeldForwardNotice(info.lspNodeId, info.notice);
+			}
+		);
+		this.asyncPaymentManager.on('held', (record: IHeldForwardRecord) => {
+			this.emit('htlc:held-forward', {
+				holdId: Buffer.from(record.id, 'hex'),
+				paymentHash: Buffer.from(record.paymentHashHex, 'hex'),
+				amountMsat: BigInt(record.forwardAmountMsat),
+				cutoffHeight: record.cutoffHeight
+			});
+			this.emitStructuredLog('htlc', 'held_forward', {
+				holdId: record.id,
+				paymentHash: record.paymentHashHex,
+				cutoffHeight: record.cutoffHeight
+			});
+			// A receiver that is connected right now (it went offline only
+			// between issuing the invoice and the payment) learns of the hold
+			// at once; otherwise its channel's next reestablish carries the
+			// notice.
+			const outChannel = this.channelManager.getChannel(
+				Buffer.from(record.outChannelIdHex, 'hex')
+			);
+			if (outChannel?.getState() === ChannelState.NORMAL) {
+				this.asyncPaymentManager.sendNotice(record.receiverNodeIdHex);
+			}
+		});
+		this.asyncPaymentManager.on('released', (record: IHeldForwardRecord) => {
+			this.emit('htlc:held-forward-released', record);
+			this.emitStructuredLog('htlc', 'held_forward_released', {
+				holdId: record.id,
+				paymentHash: record.paymentHashHex
+			});
+		});
+		this.asyncPaymentManager.on('failed', (record: IHeldForwardRecord) => {
+			this.emit('htlc:held-forward-failed', record);
+			this.emitStructuredLog('htlc', 'held_forward_failed', {
+				holdId: record.id,
+				paymentHash: record.paymentHashHex,
+				reason: record.failReason
+			});
+		});
+		this.asyncPaymentManager.on(
+			'release-refused',
+			(info: { fromPeer: string; reason: string }) => {
+				this.emitStructuredLog('htlc', 'held_forward_release_refused', info);
+			}
+		);
 
 		if (config.jitReceive?.enabled) {
 			this.wireJitReceive(config.jitReceive);
@@ -1641,6 +1743,9 @@ export class LightningNode extends EventEmitter {
 				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, 'owed');
 			}
 			this.restoreFromStorage();
+			// Channels and forward linkage are loaded: settle every held
+			// forward whose outcome those durable facts already decide.
+			this.asyncPaymentManager.reconcile();
 			// One-time snapshot-content repair: heads compacted by an older
 			// release omitted deleted channels' key-index rows, and a quiet
 			// upgraded node might never write a replacement frame. Forcing a
@@ -3282,6 +3387,13 @@ export class LightningNode extends EventEmitter {
 			// A disconnect-during-quiescence left parked dispatches waiting for
 			// the channel to carry updates again; it can now.
 			this.drainParkedQuiescentHtlcs(channelId.toString('hex'));
+			// Held forwards (issue #708): a release or fail that was deferred
+			// because this channel could not carry it is re-driven from its
+			// durable row, and a receiver whose channel just came back is told
+			// what is parked for it.
+			this.asyncPaymentManager.onChannelUsable(channelId.toString('hex'));
+			const peer = this.channelManager.getPeerForChannel(channelId);
+			if (peer) this.asyncPaymentManager.sendNotice(peer);
 		});
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
 			this.registerChannelScids(channelId);
@@ -12958,7 +13070,15 @@ export class LightningNode extends EventEmitter {
 					feeBaseMsat
 				},
 				paymentConstraints,
-				...(asyncHold ? { holdHtlc: true } : {})
+				...(asyncHold
+					? {
+							holdHtlc: true,
+							holdRegistrationId: deriveHoldRegistrationId(
+								ourNodeId,
+								peerPubkey
+							)
+					  }
+					: {})
 			};
 			// Final hop (us): recipient, no onward forwarding. Our own minimum is
 			// 0; do not inherit the peer's htlc_minimum constraint here. The
@@ -16080,21 +16200,36 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * LSP: release a forward parked for a now-online receiver (also triggered by
-	 * a release_held_htlc onion message). Returns false if nothing is parked.
+	 * LSP: every held-forward record, unresolved and terminal, for operators
+	 * and tests. Release is never a node API: it is authorized only by a
+	 * receiver-signed capability arriving over an onion message.
 	 */
-	releaseHeldForward(paymentHash: Buffer): boolean {
-		return this.asyncPaymentManager.handleRelease(paymentHash);
-	}
-
-	/** Payment hashes of forwards currently parked for offline receivers. */
-	listHeldForwards(): Buffer[] {
+	listHeldForwards(): IHeldForwardRecord[] {
 		return this.asyncPaymentManager.listHeldForwards();
 	}
 
-	/** Receiver: ask the LSP to release the HTLC held for this payment hash. */
-	sendAsyncRelease(lspNodeId: Buffer, paymentHash: Buffer): void {
-		this.asyncPaymentManager.sendRelease(lspNodeId, paymentHash);
+	/** LSP: operator fail of one hold (HELD, or RELEASING with no add placed). */
+	failHeldForward(holdIdHex: string): boolean {
+		return this.asyncPaymentManager.failHeldForward(holdIdHex);
+	}
+
+	/**
+	 * Receiver: sign a release capability over `holdIds` (the complete set
+	 * to release atomically; a single id for an independent part) and send
+	 * it to the LSP. `amountMsat` is the sum of the parts' forward amounts
+	 * as the LSP's notice reported them.
+	 */
+	sendAsyncRelease(
+		lspNodeId: Buffer,
+		holdIds: Buffer[],
+		amountMsat: bigint
+	): void {
+		this.asyncPaymentManager.sendRelease(lspNodeId, holdIds, amountMsat);
+	}
+
+	/** Receiver: ask the LSP for a notice of everything parked for us. */
+	sendAsyncQuery(lspNodeId: Buffer): void {
+		this.asyncPaymentManager.sendQuery(lspNodeId);
 	}
 
 	/** Sender: nudge an offline receiver to come online for this payment hash. */
@@ -16103,19 +16238,95 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Fail LSP-side held forwards approaching their inbound CLTV expiry, so the
-	 * channel isn't force-closed waiting on an offline receiver who never returns.
+	 * Receiver: a notice from an LSP listing holds parked for us. Always
+	 * surfaced as 'payment:held-notice'; with autoReleaseHeldForwards (the
+	 * default) the node also releases what it can vouch for:
+	 *
+	 *  - Atomic payment-set release (default policy): parts sharing a hash
+	 *    are released together once their forward amounts cover the invoice
+	 *    amount, in ONE capability, so the LSP forwards all or nothing and a
+	 *    partial MPP arrival never turns into a half-forwarded payment the
+	 *    receiver then has to fail part by part.
+	 *  - Independent part release: an amount-less invoice has no total to
+	 *    wait for, so each part is released on its own.
+	 *  - Unknown hashes are never released: the receiver could not settle
+	 *    them, so the LSP would only forward an HTLC we would fail.
+	 *
+	 * Only holds parked under the registration derived for this (receiver,
+	 * LSP) pair are considered; the capability binds that registration.
 	 */
-	private scanExpiringHeldForwards(height: number): void {
-		if (height <= 0) return;
-		for (const [hashHex, hf] of this.heldForwards) {
-			if (
-				hf.incomingCltvExpiry > 0 &&
-				hf.incomingCltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
-			) {
-				this.asyncPaymentManager.failHeldForward(Buffer.from(hashHex, 'hex'));
-			}
+	private handleHeldForwardNotice(
+		lspNodeId: Buffer,
+		notice: IHeldForwardNotice
+	): void {
+		this.emit('payment:held-notice', { lspNodeId, notice });
+		if (!this.autoReleaseHeldForwards) return;
+		const ourRegistration = deriveHoldRegistrationId(
+			getPublicKey(this.nodePrivkey),
+			lspNodeId
+		);
+		const byHash = new Map<string, IHeldForwardNotice['entries']>();
+		for (const entry of notice.entries) {
+			if (!entry.registrationId.equals(ourRegistration)) continue;
+			const key = entry.paymentHash.toString('hex');
+			const list = byHash.get(key) ?? [];
+			list.push(entry);
+			byHash.set(key, list);
 		}
+		for (const [hashHex, entries] of byHash) {
+			const invoice = this.invoices.get(hashHex);
+			if (!invoice) continue;
+			if (invoice.amountMsat === undefined) {
+				for (const e of entries) {
+					this.sendAsyncReleaseSafely(
+						lspNodeId,
+						[e.holdId],
+						e.forwardAmountMsat
+					);
+				}
+				continue;
+			}
+			let sum = 0n;
+			for (const e of entries) sum += e.forwardAmountMsat;
+			if (sum < invoice.amountMsat) continue;
+			this.sendAsyncReleaseSafely(
+				lspNodeId,
+				entries.map((e) => e.holdId),
+				sum
+			);
+		}
+	}
+
+	private sendAsyncReleaseSafely(
+		lspNodeId: Buffer,
+		holdIds: Buffer[],
+		amountMsat: bigint
+	): void {
+		try {
+			this.asyncPaymentManager.sendRelease(lspNodeId, holdIds, amountMsat);
+		} catch (err) {
+			this.emitStructuredLog('htlc', 'held_forward_release_send_failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	/**
+	 * Durable fact for the ledger: the parked inbound HTLC still exists and
+	 * is committed. False once it settled, failed, or its channel is gone.
+	 */
+	private heldForwardIncomingUnresolved(record: IHeldForwardRecord): boolean {
+		const channel = this.channelManager.getChannel(
+			Buffer.from(record.inChannelIdHex, 'hex')
+		);
+		if (!channel) return false;
+		const htlc = channel
+			.getFullState()
+			.htlcs.get(`received-${record.inHtlcId}`);
+		if (!htlc) return false;
+		return (
+			htlc.state === HtlcState.COMMITTED || htlc.state === HtlcState.PENDING
+		);
 	}
 
 	// ─────────────── JIT channel receive (LSP role, issue #594) ───────────────
@@ -16971,6 +17182,7 @@ export class LightningNode extends EventEmitter {
 		let outgoingScid = hopPayload.shortChannelId;
 		let nextBlindingPoint: Buffer | undefined;
 		let holdForLsp = false;
+		let holdRegistrationId: Buffer | undefined;
 		let blindedOutAmount: bigint | undefined;
 		let blindedOutCltv: number | undefined;
 		let blindedMaxCltv: number | undefined;
@@ -16986,6 +17198,7 @@ export class LightningNode extends EventEmitter {
 				outgoingScid = hopData.shortChannelId;
 				nextBlindingPoint = nextBlindingKey;
 				holdForLsp = !!hopData.holdHtlc;
+				holdRegistrationId = hopData.holdRegistrationId;
 				if (hopData.paymentRelay) {
 					const relay = hopData.paymentRelay;
 					// BOLT 4 route blinding: invert the sender's fee computation with
@@ -17181,7 +17394,7 @@ export class LightningNode extends EventEmitter {
 		// (on release) with a current HTLC counter. Synchronous loopback may
 		// complete the whole fulfillment chain during addHtlc, so we track the
 		// outgoing→incoming link BEFORE forwarding (same timing as payment storage).
-		const performForward = (): void => {
+		const performForward = (): boolean =>
 			this.forwardHtlcOnto(outChannelId, {
 				inChannelId,
 				inHtlcId,
@@ -17193,39 +17406,120 @@ export class LightningNode extends EventEmitter {
 				nextBlindingPoint,
 				failIncoming
 			});
-		};
 
-		// Async payments (LSP role): the recipient's blinded path marked this hop
-		// hold_htlc, so park the forward and wait for a release_held_htlc onion
-		// message (handled by AsyncPaymentManager) before forwarding to the now-
-		// online receiver. The CLTV sweeper fails it back if release never comes.
+		// Async payments (LSP role, issue #708): the recipient's blinded path
+		// marked this hop hold_htlc, so park the forward in the durable
+		// held-forward ledger and wait for a receiver-signed release
+		// capability before forwarding to the now-online receiver. The row is
+		// written BEFORE anything can act on the hold; a redispatch after a
+		// restart finds the same row (same hold_id) and only re-arms the
+		// driver, driving a RELEASING or FAILING row to its terminal state.
+		// The per-block scan fails the hold at its CLTV cutoff.
 		if (holdForLsp) {
-			const hashHex = paymentHash.toString('hex');
-			this.heldForwards.set(hashHex, {
+			this.parkHeldForward({
 				inChannelId,
 				inHtlcId,
-				incomingCltvExpiry
-			});
-			this.asyncPaymentManager.registerHeldForward({
 				paymentHash,
-				release: () => {
-					this.heldForwards.delete(hashHex);
-					performForward();
-				},
-				fail: () => {
-					this.heldForwards.delete(hashHex);
-					failIncoming(UNKNOWN_NEXT_PEER);
-				}
+				outChannelId,
+				registrationId: holdRegistrationId ?? Buffer.alloc(32),
+				incomingAmountMsat,
+				forwardAmountMsat: forwardAmount,
+				forwardCltv,
+				incomingCltvExpiry,
+				performForward,
+				failIncoming
 			});
-			this.emit('htlc:held-forward', {
-				paymentHash,
-				amountMsat: hopPayload.amountToForwardMsat
-			});
-			this.emitStructuredLog('htlc', 'held_forward', { paymentHash: hashHex });
 			return;
 		}
 
 		performForward();
+	}
+
+	/**
+	 * Park one inbound HTLC for an offline receiver (issue #708).
+	 *
+	 * The CLTV cutoff is fixed here, on the row: the last height at which the
+	 * outgoing HTLC still gives the receiver its advertised final-hop headroom
+	 * (forwardCltv - DEFAULT_MIN_FINAL_CLTV_EXPIRY), or the LSP's own margin
+	 * before its inbound leg goes on-chain, whichever is earlier. Release is
+	 * accepted strictly below it; at it, failure is mandatory. Both are CAS
+	 * transitions from HELD on the same row, so the race has one winner.
+	 */
+	private parkHeldForward(args: {
+		inChannelId: Buffer;
+		inHtlcId: bigint;
+		paymentHash: Buffer;
+		outChannelId: Buffer;
+		registrationId: Buffer;
+		incomingAmountMsat: bigint;
+		forwardAmountMsat: bigint;
+		forwardCltv: number;
+		incomingCltvExpiry: number;
+		/** Place the onward add; true when the outgoing channel accepted it. */
+		performForward: () => boolean;
+		failIncoming: (code: number) => boolean;
+	}): void {
+		const receiverHex = this.channelManager.getPeerForChannel(
+			args.outChannelId
+		);
+		if (!receiverHex) {
+			args.failIncoming(UNKNOWN_NEXT_PEER);
+			return;
+		}
+		const cutoffHeight = Math.min(
+			args.forwardCltv - DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+			args.incomingCltvExpiry -
+				Math.max(HELD_HTLC_EXPIRY_MARGIN, this.htlcSafetyMargin)
+		);
+		const driver: IHeldForwardDriver = {
+			forward: () => {
+				const outChannel = this.channelManager.getChannel(args.outChannelId);
+				if (!outChannel) {
+					// The outgoing channel is gone: nothing can ever place this
+					// add, so the release resolves as a refusal upstream.
+					return args.failIncoming(UNKNOWN_NEXT_PEER) ? 'refused' : 'deferred';
+				}
+				const state = outChannel.getState();
+				if (
+					state === ChannelState.AWAITING_REESTABLISH ||
+					state === ChannelState.SPLICING ||
+					(state === ChannelState.NORMAL && outChannel.isQuiescing())
+				) {
+					return 'deferred';
+				}
+				if (state !== ChannelState.NORMAL) {
+					return args.failIncoming(UNKNOWN_NEXT_PEER) ? 'refused' : 'deferred';
+				}
+				// Judged by the add's acceptance, not by the linkage row: a
+				// synchronous loopback can run the whole fulfill chain inside
+				// the add and consume the row before this returns.
+				return args.performForward() ? 'forwarded' : 'refused';
+			},
+			fail: () => args.failIncoming(UNKNOWN_NEXT_PEER)
+		};
+		const record = this.asyncPaymentManager.registerHold(
+			{
+				inChannelIdHex: args.inChannelId.toString('hex'),
+				inHtlcId: args.inHtlcId.toString(),
+				paymentHashHex: args.paymentHash.toString('hex'),
+				outChannelIdHex: args.outChannelId.toString('hex'),
+				receiverNodeIdHex: receiverHex,
+				registrationIdHex: args.registrationId.toString('hex'),
+				incomingAmountMsat: args.incomingAmountMsat.toString(),
+				forwardAmountMsat: args.forwardAmountMsat.toString(),
+				forwardCltv: args.forwardCltv,
+				incomingCltvExpiry: args.incomingCltvExpiry,
+				cutoffHeight
+			},
+			driver
+		);
+		if (!record) {
+			// The durable row did not land: never hold what a restart would
+			// not remember. Fail back now; the payer retries.
+			args.failIncoming(TEMPORARY_NODE_FAILURE);
+		}
+		// A NEW hold surfaces through the manager's 'held' event (wired in
+		// the constructor); a re-registration after a restart is silent.
 	}
 
 	/**
@@ -17241,7 +17535,7 @@ export class LightningNode extends EventEmitter {
 	 * retries a refused forward is therefore re-entering this method, not
 	 * patching up half a transition from outside it.
 	 */
-	private forwardHtlcOnto(outChannelId: Buffer, part: IHeldJitPart): void {
+	private forwardHtlcOnto(outChannelId: Buffer, part: IHeldJitPart): boolean {
 		const nextOnionBuf = encodeOnionPacket(part.nextPacket);
 		const outChannel = this.channelManager.getChannel(outChannelId);
 		const outHtlcId = outChannel
@@ -17310,7 +17604,7 @@ export class LightningNode extends EventEmitter {
 					}
 				}
 			);
-			return;
+			return false;
 		}
 
 		this.emit(
@@ -17320,6 +17614,7 @@ export class LightningNode extends EventEmitter {
 			part.forwardAmountMsat,
 			part.paymentHash
 		);
+		return true;
 	}
 
 	/**
@@ -19470,7 +19765,7 @@ export class LightningNode extends EventEmitter {
 		}
 		this.scanExpiringOfferedHtlcs(blockHeight);
 		this.scanExpiringHeldHtlcs(blockHeight);
-		this.scanExpiringHeldForwards(blockHeight);
+		this.asyncPaymentManager.scan(blockHeight);
 		this.scanForwardTimeouts(blockHeight);
 		this.scanStuckChannels(blockHeight);
 		this.reviewFundingMissingClocks(blockHeight);

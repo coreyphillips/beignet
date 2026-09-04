@@ -41,7 +41,7 @@ src/lightning/
 ├── onion/           Sphinx crypto, hop payloads, packet construction, route blinding
 ├── onion-message/   Type 513 onion messages, rate limiting
 ├── offer/           BOLT 12 offers, TLV encode/decode, Schnorr, merkle tree
-├── async-payments/  Hold invoices, AsyncPaymentManager (LSP held-forward, wake)
+├── async-payments/  AsyncPaymentManager, held-forward ledger, release capability
 ├── watchtower/      Altruist watchtower client (LND wtwire, justice blobs)
 ├── backup/          Static channel backup (SCB) export/import
 ├── storage/         SQLite persistence, serialization
@@ -659,6 +659,65 @@ node.createInvoice({
 });
 ```
 
+#### Held forwards on the LSP (issue #708)
+
+An LSP that sees `hold_htlc` on its blinded hop parks the inbound HTLC in a
+durable **held-forward ledger** (`async-payments/held-forward-ledger.ts`)
+rather than a memory map:
+
+- **Identity.** Every held HTLC gets a random 32-byte `hold_id` and keeps its
+  canonical `(incoming_channel_id, incoming_htlc_id)`. The payment hash is an
+  index that groups parts; it is never the key, so MPP parts, retries and
+  duplicate adds each get their own row.
+- **Lifecycle.** `HELD -> RELEASING -> RELEASED` and `HELD -> FAILING ->
+  FAILED` (plus `RELEASING -> FAILING` for a release whose add could never be
+  placed). Every arrow is a compare-and-swap on the durable row, so duplicate
+  messages, replayed channel updates and crash re-drives are idempotent. The
+  row is written before anything acts on the hold, and a restart rehydrates
+  the ledger at construction, before any transport exists, so no release is
+  ever judged against an empty ledger.
+- **Authorization.** Release is never by payment hash (every invoice discloses
+  it). The receiver signs a **release capability** with its node key over a
+  tagged digest (`async-payments/release-capability.ts`) binding: chain hash,
+  receiver node id, LSP node id, registration id (the value of the `hold_htlc`
+  marker, derived per (receiver, LSP) pair until issue #709's service
+  registration replaces it), the exact amount, an expiry, a random nonce, and
+  the complete sorted set of `hold_id`s. The LSP checks the onion message's
+  sender is the receiver the capability names AND the receiver the hold
+  recorded (the peer on the outgoing channel), then verifies the signature.
+- **MPP policy.** *Atomic payment-set release* is the default: only the
+  receiver knows `total_msat` (it is inside the blinded final payload), so it
+  signs one capability over the complete set once the parts cover the invoice
+  amount, and the LSP moves the whole set `HELD -> RELEASING` in one
+  transaction or not at all. *Independent part release* is the same call with
+  a set of one, which a receiver uses for amount-less invoices. Set by
+  `autoReleaseHeldForwards` (default true); with it off, the host releases
+  from the `'payment:held-notice'` event via `sendAsyncRelease`.
+- **CLTV cutoff.** Fixed on the row when parked:
+  `min(forwardCltv - DEFAULT_MIN_FINAL_CLTV_EXPIRY, incomingCltvExpiry - max(18, htlcSafetyMargin))`.
+  Release is accepted strictly below it; at it the per-block scan moves the
+  hold to `FAILING` and fails it upstream off-chain. Both are CAS transitions
+  from `HELD` on the same row, so a release racing the cutoff has exactly one
+  durable winner.
+- **Restart.** The restore-time redispatch re-enters the hold path and finds
+  the same row (same `hold_id`), re-arming the driver and driving a
+  `RELEASING`/`FAILING` row to its terminal state; a `RELEASING` row whose
+  forward linkage already exists is reconciled to `RELEASED`, so
+  `channel_reestablish` never places a second add.
+
+Wire (onion-message TLVs, experimental odd range): the LSP sends
+`HELD_HTLC_NOTICE` (1105) listing hold ids, amounts and cutoffs to the receiver
+when a hold is parked and whenever the receiver's channel reestablishes; the
+receiver answers with a `RELEASE_HELD_HTLC` (1101) capability, or asks with
+`HELD_HTLC_QUERY` (1107). `ASYNC_WAKE` (1103) is unchanged.
+
+The store (`storage/durable-ledger.ts`: `IDurableLedgerStore`,
+`MemoryLedgerStore`, `MetadataLedgerStore`), the CAS helper (`DurableLedger`)
+and the rehydrate-before-serve rule are record-type agnostic: the FFOR
+receipt-witness ledger (coreyphillips/ffor#24) is a different record with its
+own state machine that instantiates the same infrastructure under its own
+prefix, not a variant of the held-forward entry.
+
 ### BOLT 12 Offers
 
 Create reusable payment requests and request/pay invoices via onion messages.
@@ -1010,7 +1069,7 @@ faster than anything else in this document. Use `ls src/lightning/<module>` inst
 | `onion` | `constructOnionPacket`, `processOnionPacket`, `failures`, `constructBlindedPath`, `processBlindedHop` | 4 |
 | `onion-message` | `OnionMessageManager`, `constructSimpleOnionMessage`, `processOnionMessage` | 4 |
 | `offer` | `OfferManager`, `encodeOffer`, `decodeOffer`, TLV, Schnorr, merkle | 12 |
-| `async-payments` | `AsyncPaymentManager` (held forward, release_held_htlc, wake) | 4, 11 |
+| `async-payments` | `AsyncPaymentManager`, `HeldForwardLedger`, release capability (held forward, notice, release, wake) | 4, 11 |
 | `watchtower` | `WatchtowerClient`, `wtwire`, justice blob, tower connection | -- |
 | `backup` | Static channel backup (SCB) encode/decode | -- |
 | `node` | `LightningNode`, `INodeConfig`, rate limiter | -- |

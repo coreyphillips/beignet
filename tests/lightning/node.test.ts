@@ -119,8 +119,11 @@ function makeNodeConfig(seedId: number): INodeConfig {
 	};
 }
 
-function createNode(seedId: number): LightningNode {
-	return new LightningNode(makeNodeConfig(seedId));
+function createNode(
+	seedId: number,
+	extra: Partial<INodeConfig> = {}
+): LightningNode {
+	return new LightningNode({ ...makeNodeConfig(seedId), ...extra });
 }
 
 /**
@@ -1664,10 +1667,12 @@ describe('Lightning Node', function () {
 	});
 
 	describe('Async Payments (M2.2)', function () {
-		it('LSP holds the forward until release, then the offline receiver is paid', function () {
+		it('LSP holds the forward until the receiver signs a release, then the receiver is paid', function () {
 			const alice = createNode(1); // sender
 			const lsp = createNode(2); // always-online LSP / introduction node
-			const carol = createNode(3); // offline receiver
+			// Receiver with auto-release OFF, so the hold is observable and the
+			// release is driven explicitly from the notice.
+			const carol = createNode(3, { autoReleaseHeldForwards: false });
 
 			connectNodes(alice, lsp);
 			connectNodes(lsp, carol);
@@ -1703,26 +1708,48 @@ describe('Lightning Node', function () {
 				asyncHold: true
 			});
 
-			let heldForward = false;
-			lsp.on('htlc:held-forward', () => {
-				heldForward = true;
+			let heldForward: { holdId: Buffer } | null = null;
+			lsp.on('htlc:held-forward', (info: { holdId: Buffer }) => {
+				heldForward = info;
 			});
+			const notices: Array<{
+				lspNodeId: Buffer;
+				notice: {
+					entries: Array<{ holdId: Buffer; forwardAmountMsat: bigint }>;
+				};
+			}> = [];
+			carol.on('payment:held-notice', (n) => notices.push(n));
 
 			alice.sendPayment(invoice.bolt11);
 
-			// LSP parked the forward; Carol has NOT been paid yet.
-			expect(heldForward, 'LSP parked the forward').to.be.true;
-			expect(lsp.listHeldForwards()).to.have.length(1);
+			// LSP parked the forward under a random hold id; Carol has NOT been
+			// paid yet, but was told what is parked for her.
+			expect(heldForward, 'LSP parked the forward').to.not.equal(null);
+			const records = lsp.listHeldForwards();
+			expect(records).to.have.length(1);
+			expect(records[0].state).to.equal('HELD');
+			expect(records[0].id).to.equal(heldForward!.holdId.toString('hex'));
+			expect(records[0].paymentHashHex).to.equal(
+				invoice.paymentHash.toString('hex')
+			);
 			expect(carol.getPayment(invoice.paymentHash)!.status).to.equal(
 				PaymentStatus.PENDING
 			);
 			expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
 				PaymentStatus.PENDING
 			);
+			expect(notices, 'Carol received the held notice').to.have.length(1);
+			const entry = notices[0].notice.entries[0];
+			expect(entry.holdId.toString('hex')).to.equal(records[0].id);
 
-			// Carol comes online → LSP releases the held forward → Carol is paid.
-			expect(lsp.releaseHeldForward(invoice.paymentHash)).to.be.true;
-			expect(lsp.listHeldForwards()).to.have.length(0);
+			// Carol signs the release capability over the hold id and sends it;
+			// the LSP forwards and Carol is paid.
+			carol.sendAsyncRelease(
+				notices[0].lspNodeId,
+				[entry.holdId],
+				entry.forwardAmountMsat
+			);
+			expect(lsp.listHeldForwards()[0].state).to.equal('RELEASED');
 			expect(carol.getPayment(invoice.paymentHash)!.status).to.equal(
 				PaymentStatus.COMPLETED
 			);
@@ -1731,7 +1758,7 @@ describe('Lightning Node', function () {
 			);
 		});
 
-		it('release via a release_held_htlc onion message from the receiver', function () {
+		it('a receiver auto-releases from the notice and the payment completes end to end', function () {
 			const alice = createNode(1);
 			const lsp = createNode(2);
 			const carol = createNode(3);
@@ -1759,17 +1786,6 @@ describe('Lightning Node', function () {
 				.getFullState().shortChannelId = scidBC;
 			buildThreeNodeGraph(alice, lsp, carol, scidAB, scidBC);
 
-			// Wire onion-message delivery Carol → LSP (no networking in this harness).
-			carol
-				.getOnionMessageManager()
-				.setSendFunction((toPeer: string, _type: number, payload: Buffer) => {
-					if (toPeer === lsp.getNodeId()) {
-						lsp
-							.getOnionMessageManager()
-							.handleMessage(carol.getNodeId(), payload);
-					}
-				});
-
 			const invoice = carol.createInvoice({
 				amountMsat: 5_000_000n,
 				description: 'async-msg',
@@ -1777,16 +1793,18 @@ describe('Lightning Node', function () {
 				asyncHold: true
 			});
 
+			const lifecycle: string[] = [];
+			lsp.on('htlc:held-forward', () => lifecycle.push('held'));
+			lsp.on('htlc:held-forward-released', () => lifecycle.push('released'));
+
 			alice.sendPayment(invoice.bolt11);
-			expect(lsp.listHeldForwards()).to.have.length(1);
 
-			// Carol sends release_held_htlc as an onion message to the LSP.
-			carol.sendAsyncRelease(
-				Buffer.from(lsp.getNodeId(), 'hex'),
-				invoice.paymentHash
-			);
-
-			expect(lsp.listHeldForwards()).to.have.length(0);
+			// Carol is connected, so the LSP's notice reached her at once and
+			// her signed release came straight back over the onion transport.
+			expect(lifecycle).to.deep.equal(['held', 'released']);
+			const records = lsp.listHeldForwards();
+			expect(records).to.have.length(1);
+			expect(records[0].state).to.equal('RELEASED');
 			expect(carol.getPayment(invoice.paymentHash)!.status).to.equal(
 				PaymentStatus.COMPLETED
 			);
