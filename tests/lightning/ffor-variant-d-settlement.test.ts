@@ -41,6 +41,10 @@ import {
 	IFforEpochRecord
 } from '../../src/lightning/ffor/types';
 import {
+	bitmapGet,
+	decodeFforCloseAckMessage
+} from '../../src/lightning/ffor/messages';
+import {
 	checkDelegatedAmounts,
 	feeS,
 	grossIntoS,
@@ -713,5 +717,209 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		expect(afterClose.status).to.equal(PaymentStatus.FAILED);
 		// R drained inside the close call, so S may already be CLOSED.
 		expect(failures.pop()!.reason).to.match(/ff_close|CLOSED/);
+	});
+});
+
+describe('FFOR Variant D: cooperative return (M8.3)', function () {
+	this.timeout(60_000);
+
+	it('closes with the bitmap and preimages, drains in one round, and resumes', () => {
+		const w = createWorld();
+		const sBefore = w.s
+			.getChannelManager()
+			.getChannel(w.srChannelId)!
+			.getFullState().localBalanceMsat;
+		const rBefore = w.r
+			.getChannelManager()
+			.getChannel(w.srChannelId)!
+			.getFullState().localBalanceMsat;
+		activate(w);
+		const [inv1, inv3] = exposeAndLeave(w, [1, 3]);
+		expect(pay(w, inv1).status).to.equal(PaymentStatus.COMPLETED);
+		expect(pay(w, inv3).status).to.equal(PaymentStatus.COMPLETED);
+		const t1 = record(w.s, w.srHex).preimages[0];
+		const t3 = record(w.s, w.srHex).preimages[2];
+
+		// R returns.
+		w.sr.reconnect();
+		expect(record(w.r, w.srHex).state).to.equal(FforState.ACTIVE);
+		w.sr.log.length = 0;
+		const closed = w.r.closeFforEpoch(w.srHex);
+		expect(closed.ok, closed.error).to.equal(true);
+
+		const types = w.sr.log.map((e) => e.type);
+		// The only FFOR messages after activation are ff_close and ff_close_ack.
+		expect(types.filter((t) => t >= 55000)).to.deep.equal([
+			MessageType.FF_CLOSE,
+			MessageType.FF_CLOSE_ACK
+		]);
+		// Stock BOLT 2 after the ack: R's fulfils and fail, one round each way.
+		const ackIdx = types.indexOf(MessageType.FF_CLOSE_ACK);
+		const after = types.slice(ackIdx + 1);
+		expect(
+			after.filter((t) => t === MessageType.UPDATE_FULFILL_HTLC).length
+		).to.equal(2);
+		expect(
+			after.filter((t) => t === MessageType.UPDATE_FAIL_HTLC).length
+		).to.equal(1);
+		expect(
+			after.filter((t) => t === MessageType.COMMITMENT_SIGNED).length
+		).to.equal(2);
+		expect(
+			after.filter((t) => t === MessageType.REVOKE_AND_ACK).length
+		).to.equal(2);
+		expect(after.length).to.equal(7);
+
+		// The ack's bitmap and preimages.
+		const ack = decodeFforCloseAckMessage(w.sr.log[ackIdx].payload);
+		expect(ack.numSlots).to.equal(3);
+		expect(bitmapGet(ack.settled, 1)).to.be.true;
+		expect(bitmapGet(ack.settled, 2)).to.be.false;
+		expect(bitmapGet(ack.settled, 3)).to.be.true;
+		expect(ack.preimages.map((p) => p.k)).to.deep.equal([1, 3]);
+		expect(ack.preimages[0].preimage.equals(t1)).to.be.true;
+		expect(ack.preimages[1].preimage.equals(t3)).to.be.true;
+
+		// CLOSED on both sides, no voucher left, balances correct.
+		expect(record(w.s, w.srHex).state).to.equal(FforState.CLOSED);
+		expect(record(w.r, w.srHex).state).to.equal(FforState.CLOSED);
+		expect(voucherStates(w.s, w.srChannelId)).to.deep.equal([]);
+		expect(voucherStates(w.r, w.srChannelId)).to.deep.equal([]);
+		const sAfter = w.s
+			.getChannelManager()
+			.getChannel(w.srChannelId)!
+			.getFullState();
+		const rAfter = w.r
+			.getChannelManager()
+			.getChannel(w.srChannelId)!
+			.getFullState();
+		const credited = AMOUNTS[0] + AMOUNTS[2];
+		expect(rAfter.localBalanceMsat).to.equal(rBefore + credited);
+		expect(sAfter.localBalanceMsat).to.equal(sBefore - credited);
+		expect(sAfter.remoteBalanceMsat).to.equal(rAfter.localBalanceMsat);
+		expect(rAfter.remoteBalanceMsat).to.equal(sAfter.localBalanceMsat);
+		expect(sAfter.htlcs.size).to.equal(0);
+		expect(rAfter.htlcs.size).to.equal(0);
+
+		// Ordinary operation resumes: S pays R over the channel.
+		const ordinary = w.r.createInvoice({
+			amountMsat: 50_000n,
+			description: 'after'
+		});
+		w.s.sendPayment(ordinary.bolt11);
+		expect(w.s.getPayment(ordinary.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(w.errors.r).to.deep.equal([]);
+	});
+
+	it('a payment racing ff_close lands on exactly one side of the bitmap', () => {
+		// Committed before S processed ff_close: settled, in the bitmap.
+		const w = createWorld();
+		activate(w);
+		const [inv1, inv2] = exposeAndLeave(w, [1, 2]);
+		expect(pay(w, inv1).status).to.equal(PaymentStatus.COMPLETED);
+		w.sr.reconnect();
+		const closed = w.r.closeFforEpoch(w.srHex);
+		expect(closed.ok).to.equal(true);
+		// After: failed upstream, not in the bitmap, and R failed the slot.
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		const late = pay(w, inv2);
+		expect(late.status).to.equal(PaymentStatus.FAILED);
+		// R's drain completed inside the close call, so S may already be
+		// CLOSED; either way the stopping condition, not the slot, answers.
+		expect(failures.pop()!.reason).to.match(/ff_close|CLOSED/);
+		const bitmap = record(w.s, w.srHex).settledBitmap!;
+		expect(bitmapGet(bitmap, 1)).to.be.true;
+		expect(bitmapGet(bitmap, 2)).to.be.false;
+		expect(record(w.r, w.srHex).state).to.equal(FforState.CLOSED);
+		expect(record(w.s, w.srHex).state).to.equal(FforState.CLOSED);
+		const rAfter = w.r
+			.getChannelManager()
+			.getChannel(w.srChannelId)!
+			.getFullState();
+		expect(rAfter.htlcs.size).to.equal(0);
+	});
+
+	it('S retransmits ff_close_ack to an ACTIVE R, and R retransmits ff_close to an ACTIVE S', () => {
+		// Drop the ack: S is DRAINING, R still ACTIVE with ff_close sent.
+		const w = createWorld();
+		activate(w);
+		const [inv1] = exposeAndLeave(w, [1]);
+		expect(pay(w, inv1).status).to.equal(PaymentStatus.COMPLETED);
+		w.sr.reconnect();
+		w.sr.drop = (_from, type): boolean => type === MessageType.FF_CLOSE_ACK;
+		expect(w.r.closeFforEpoch(w.srHex).ok).to.equal(true);
+		expect(record(w.s, w.srHex).state).to.equal(FforState.DRAINING);
+		expect(record(w.r, w.srHex).state).to.equal(FforState.ACTIVE);
+		w.sr.drop = null;
+		w.sr.disconnect();
+		w.sr.log.length = 0;
+		w.sr.reconnect();
+		const types = w.sr.log.map((e) => e.type);
+		expect(types.filter((t) => t === MessageType.FF_CLOSE_ACK).length).to.equal(
+			1
+		);
+		expect(record(w.r, w.srHex).state).to.equal(FforState.CLOSED);
+		expect(record(w.s, w.srHex).state).to.equal(FforState.CLOSED);
+
+		// Drop ff_close: R has sent it, S is still ACTIVE.
+		const w2 = createWorld();
+		activate(w2);
+		exposeAndLeave(w2, [1]);
+		w2.sr.reconnect();
+		w2.sr.drop = (_from, type): boolean => type === MessageType.FF_CLOSE;
+		expect(w2.r.closeFforEpoch(w2.srHex).ok).to.equal(true);
+		expect(record(w2.s, w2.srHex).state).to.equal(FforState.ACTIVE);
+		expect(record(w2.r, w2.srHex).closeSent).to.equal(true);
+		w2.sr.drop = null;
+		w2.sr.disconnect();
+		w2.sr.log.length = 0;
+		w2.sr.reconnect();
+		const types2 = w2.sr.log.map((e) => e.type);
+		expect(types2.filter((t) => t === MessageType.FF_CLOSE).length).to.equal(1);
+		expect(
+			types2.filter((t) => t === MessageType.FF_CLOSE_ACK).length
+		).to.equal(1);
+		expect(record(w2.r, w2.srHex).state).to.equal(FforState.CLOSED);
+		expect(record(w2.s, w2.srHex).state).to.equal(FforState.CLOSED);
+	});
+
+	it('a preimage from a payer credits a slot the ack marked unsettled (section 7.5.6)', () => {
+		const w = createWorld();
+		activate(w);
+		const [inv1] = exposeAndLeave(w, [1]);
+		const payment = pay(w, inv1);
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		// A withholding S: forget the settlement before R returns.
+		const rec = record(w.s, w.srHex);
+		rec.slotStates[0] = FforSlotState.UNUSED;
+		rec.slotUpstream[0] = null;
+		w.sr.reconnect();
+		// R learned t_1 from the payer's receipt.
+		const credited = w.r.fforAddPreimage(w.srHex, payment.preimage!);
+		expect(credited.ok, credited.error).to.equal(true);
+		const rBefore = w.r
+			.getChannelManager()
+			.getChannel(w.srChannelId)!
+			.getFullState().localBalanceMsat;
+		expect(w.r.closeFforEpoch(w.srHex).ok).to.equal(true);
+		const ackEntry = w.sr.log.find((e) => e.type === MessageType.FF_CLOSE_ACK)!;
+		const ack = decodeFforCloseAckMessage(ackEntry.payload);
+		expect(bitmapGet(ack.settled, 1)).to.be.false;
+		// R never fails a slot it holds a preimage for: slot 1 was fulfilled.
+		expect(record(w.r, w.srHex).state).to.equal(FforState.CLOSED);
+		const rAfter = w.r
+			.getChannelManager()
+			.getChannel(w.srChannelId)!
+			.getFullState();
+		expect(rAfter.localBalanceMsat).to.equal(rBefore + AMOUNTS[0]);
+		const fulfils = w.sr.log.filter(
+			(e) => e.type === MessageType.UPDATE_FULFILL_HTLC
+		);
+		expect(fulfils.length).to.equal(1);
 	});
 });
