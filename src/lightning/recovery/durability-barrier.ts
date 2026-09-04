@@ -134,7 +134,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_RETRY_DELAY_MS = 1_000;
 
 export class DurabilityBarrier {
-	private readonly config: IDurabilityBarrierConfig;
+	private config: IDurabilityBarrierConfig;
 	private readonly timeoutMs: number;
 	private readonly retryDelayMs: number;
 
@@ -154,6 +154,16 @@ export class DurabilityBarrier {
 	private wakeRetry: (() => void) | null = null;
 	private fenceListeners: Array<(superseding?: GuardianState) => void> = [];
 	private durableListeners: Array<(through: bigint) => void> = [];
+
+	/**
+	 * Point the barrier at another replicator (a rotation's incoming set,
+	 * wire 5.9 step 4). The watermark it releases on is the new
+	 * replicator's, which the switch made the journal's own.
+	 */
+	swapReplicator(next: GuardianReplicator): void {
+		this.config = { ...this.config, replicator: next };
+		this.durableThrough = next.replicatedThrough();
+	}
 
 	constructor(config: IDurabilityBarrierConfig) {
 		this.config = config;
@@ -471,7 +481,8 @@ export class DurabilityBarrier {
 		return true;
 	}
 
-	private fence(superseding?: GuardianState): void {
+	/** Fence this writer for good; public so a rotation seen elsewhere (wire 5.9) can apply the same freeze. */
+	fence(superseding?: GuardianState): void {
 		if (this.fenced) return;
 		this.fenced = true;
 		this.supersededBy = superseding;

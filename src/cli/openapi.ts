@@ -1786,6 +1786,34 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/recovery/rotate-guardians': {
+				post: {
+					summary:
+						"Rotate this wallet's guardian set (docs/RECOVERY-GUARDIAN-WIRE.md 5.9): one member or all three, on a confirmed writer, with the channels running throughout. Registers the namespace with the incoming set under the current lease at the next generation, backfills the retained journal until a quorum of the incoming set holds the tip, switches in one transaction, then retires the outgoing set (ROTATE_SET). The env keeps naming the outgoing set until it is updated; the journal's set is in force and GET /recovery/status reports configuredSetStale. confirm must be true: the outgoing set is retired for good, and a previous device still running on it freezes the moment it sees the new generation",
+					tags: ['Node'],
+					requestBody: bodyContent({
+						guardians: 'string[]',
+						confirm: 'boolean'
+					}),
+					responses: {
+						'200': {
+							description:
+								'generation, the new guardians, and how many outgoing guardians accepted the retirement (0 means it is retried in the background)'
+						},
+						'400': {
+							description: 'Missing confirm, not three entries, or the same set'
+						},
+						'409': {
+							description:
+								'ROTATION_IN_PROGRESS or ROTATION_UNAVAILABLE (not a guardian mode, gate not confirmed, fenced, no lease)'
+						},
+						'503': {
+							description:
+								'ROTATION_NO_QUORUM or ROTATION_NOT_CATCHING_UP: the incoming set did not register or did not reach the tip; retry'
+						}
+					}
+				}
+			},
 			'/recovery/resolve-guardian': {
 				post: {
 					summary:
@@ -2250,7 +2278,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
 					tags: ['Node'],
 					responses: {
 						'200': {

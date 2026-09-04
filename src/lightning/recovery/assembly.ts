@@ -34,6 +34,7 @@ import {
 	computeGuardianSetId,
 	deriveRecoveryRoot
 } from './guardian-wire';
+import { IGuardianRotateSetRequest } from './guardian';
 import {
 	GUARDIAN_BOLT8_SCHEME,
 	GuardianClient,
@@ -307,6 +308,18 @@ export type GuardianBootDecision =
 			kind: 'unavailable';
 			outcome: 'no-quorum' | 'inconsistent';
 			detail: string;
+	  }
+	/**
+	 * `rotated`: the configured set retired this namespace in favour of the
+	 * set the rotation names (wire 5.11). Rebuild the assembly with
+	 * `entries` (member id plus the transport the rotation carried) and
+	 * decide again; the incoming set holds the live chain.
+	 */
+	| {
+			kind: 'rotated';
+			rotation: IGuardianRotateSetRequest;
+			generation: bigint;
+			entries: IGuardianConfigEntry[];
 	  };
 
 /**
@@ -316,10 +329,24 @@ export type GuardianBootDecision =
  * refuses, duplicate members) and on corrupt persisted registration or
  * lease state, all of which need an operator, not a retry.
  */
-export async function buildGuardianRecovery(
-	config: IGuardianAssemblyConfig
-): Promise<GuardianBootDecision> {
-	const guardianIds = config.guardians.map((g) => g.guardianId);
+/**
+ * Bind a guardian set: its committed id and member keys, and one client per
+ * member bound to the identity it must prove. Shared by the boot assembly
+ * and by a rotation, which binds the incoming set the same way (issue
+ * #701).
+ */
+export function bindGuardianSet(
+	guardians: IParsedGuardian[],
+	options: Pick<
+		IGuardianAssemblyConfig,
+		'transportFor' | 'allowUnencryptedAuth'
+	>
+): {
+	setId: Buffer;
+	context: IGuardianSetContext;
+	bound: IBoundGuardianClient[];
+} {
+	const guardianIds = guardians.map((g) => g.guardianId);
 	const setId = computeGuardianSetId({
 		...CRASH_V1_PROFILE,
 		guardianIds
@@ -328,8 +355,8 @@ export async function buildGuardianRecovery(
 		guardianSetId: setId,
 		members: guardianIds
 	};
-	const bound: IBoundGuardianClient[] = config.guardians.map((g) => {
-		const transport = config.transportFor?.(g);
+	const bound: IBoundGuardianClient[] = guardians.map((g) => {
+		const transport = options.transportFor?.(g);
 		if (g.auth?.type === 'tor-v3-client-auth' && !transport) {
 			throw new Error(
 				`guardian ${g.guardianId.toString('hex')} carries a ` +
@@ -344,10 +371,17 @@ export async function buildGuardianRecovery(
 				guardianSetId: setId,
 				auth: g.auth,
 				transport,
-				allowUnencryptedAuth: config.allowUnencryptedAuth
+				allowUnencryptedAuth: options.allowUnencryptedAuth
 			})
 		};
 	});
+	return { setId, context, bound };
+}
+
+export async function buildGuardianRecovery(
+	config: IGuardianAssemblyConfig
+): Promise<GuardianBootDecision> {
+	const { context, bound } = bindGuardianSet(config.guardians, config);
 	const root = deriveRecoveryRoot(config.nodeSecret);
 	const replicator = new GuardianReplicator({
 		storage: config.storage,
@@ -399,6 +433,21 @@ export async function buildGuardianRecovery(
 				replicator,
 				barrier,
 				gate
+			};
+		}
+		case 'rotated': {
+			const rotation = decision.rotation;
+			const entries: IGuardianConfigEntry[] = rotation.newMembers.map(
+				(member, i) => ({
+					guardianId: member.toString('hex'),
+					url: rotation.newTransports[i]?.url ?? ''
+				})
+			);
+			return {
+				kind: 'rotated',
+				rotation,
+				generation: rotation.generation,
+				entries
 			};
 		}
 		case 'exists-remotely':

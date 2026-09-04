@@ -2456,6 +2456,28 @@ async function handleRecovery(): Promise<void> {
 			})
 		);
 	}
+	if (sub === 'rotate-guardians') {
+		// Move this wallet to a new guardian set (wire 5.9): the three entries
+		// after the command. Typing the command is the confirmation.
+		const entries = filteredArgs.slice(2);
+		if (entries.length !== 3) {
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message:
+						'Usage: beignet recovery rotate-guardians <entry> <entry> <entry>'
+				}
+			});
+			return;
+		}
+		return outputResult(
+			await httpRequest('POST', '/recovery/rotate-guardians', {
+				guardians: entries,
+				confirm: true
+			})
+		);
+	}
 	if (sub === 'resolve-guardian') {
 		// A beignet node's Lightning URI to a guardian entry (issue #699):
 		// asks the node's guardian for its id over a bolt8 session. Adopts
@@ -2483,7 +2505,8 @@ async function handleRecovery(): Promise<void> {
 			message:
 				'Usage: beignet recovery status | beignet recovery restore | ' +
 				'beignet recovery restore-capsule | beignet recovery capsule-guardians | ' +
-				'beignet recovery resolve-guardian <uri>'
+				'beignet recovery resolve-guardian <uri> | ' +
+				'beignet recovery rotate-guardians <entry> <entry> <entry>'
 		}
 	});
 	process.exitCode = 1;
@@ -2743,6 +2766,12 @@ On-chain:
                                          <guardianId>@bolt8://<node id>@host:port,
                                          by asking its guardian over a bolt8
                                          session. Adopts nothing
+  recovery rotate-guardians <e> <e> <e>  Move this wallet to a new guardian set
+                                         (one member or all three) with the
+                                         channels running: registers with the new
+                                         set under the current lease, backfills,
+                                         switches, retires the old set. The old
+                                         set is retired for good
   guardian status                        The guardian this node serves to others:
                                          sets, sizes, sessions, limits (needs
                                          --guardian-serve)

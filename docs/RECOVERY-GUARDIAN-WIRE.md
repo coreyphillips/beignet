@@ -33,6 +33,7 @@ GET_STATE       fetch stored records, paginated
 ACQUIRE_EPOCH   CAS writer takeover; returns a takeover certificate
 SYNC_RECORD     relay an already-signed record to a lagging guardian
 SYNC_EPOCH      present takeover certificates to a guardian that missed one
+ROTATE_SET      retire a namespace under this set in favour of a new one (5.11)
 INFO            capability discovery (GET; not a signed verb)
 ```
 
@@ -76,7 +77,11 @@ Writer keys are FRESH RANDOM secp256k1 keypairs generated at each
 registration or epoch acquisition, 32-byte x-only in transcripts and on the
 wire. Never the node identity key, never the recovery root, never derived
 from the seed: a superseded device's writer key must die with it, and the
-seed alone must not be able to forge records for old epochs.
+seed alone must not be able to forge records for old epochs. The one
+registration that carries an EXISTING lease is a set rotation (5.9): the
+current writer re-registers its own epoch and key under the new set, so
+the frames it has already stamped with that epoch stay consistent with
+the records it re-signs under the new prefix.
 
 ### 1.3 Guardian identity
 
@@ -361,14 +366,28 @@ STATE   = recovery_id(32) || LEASE || ORIGIN || LOGHEAD
 ```text
 REGISTER   tag 'beignet/recovery/register/v1'
            signed by the recovery root
-  PREFIX || STATE                the initial state: lease.epoch >= 1, a
-                                 fresh writer key, the IMMUTABLE ORIGIN
-                                 (fresh node: 1 and zeros; existing node:
-                                 the retained base position), and a
+  PREFIX || STATE || generation(8)
+                                 the initial state: lease.epoch >= 1, a
+                                 fresh writer key (or the current lease,
+                                 for a rotation, 5.9), the IMMUTABLE
+                                 ORIGIN (fresh node: 1 and zeros; existing
+                                 node: the retained base position), a
                                  GENESIS LOGHEAD, always (registration
                                  never claims records the guardian does
-                                 not hold; set replacement is a v1
-                                 non-feature, 5.9)
+                                 not hold), and the namespace GENERATION:
+                                 1 at the first set a namespace ever has,
+                                 one higher at every rotation
+
+ROTATE     tag 'beignet/recovery/rotate/v1'
+           signed by the recovery root; presented to the OUTGOING set
+  PREFIX                         the OUTGOING set's id
+  || recoveryId(32)
+  || newGuardianSetId(32)
+  || generation(8)               the INCOMING set's generation, which
+                                 MUST exceed the outgoing namespace's
+  || newMember_1(32) .. newMember_3(32)
+                                 ascending, exactly `total`; they hash to
+                                 newGuardianSetId (section 4)
 
 RECORD     tag 'beignet/recovery/record/v1'
            signed by the writer key of lease.epoch
@@ -447,6 +466,7 @@ check so the two cannot accept different registrations. Acceptance:
 ```text
 guardian_members lists exactly `total` x-only keys, hashes (section 4)
 to guardian_set_id, and names this guardian
+generation >= 1; the guardian stores it and echoes it in GET_HEAD
 recovery_id not yet registered for this guardian_set_id
 root signature verifies over the REGISTER transcript under recovery_id
 initial lease.epoch >= 1, writer key well-formed
@@ -611,51 +631,85 @@ OR the guardian to accept registrations, since a host lists a set only once
 REGISTER_NODE has run. Discovery only; nothing in INFO is signed or
 load-bearing for safety.
 
-### 5.9 Guardian-set replacement: UNSUPPORTED in protocol v1, literally
+### 5.9 Guardian-set rotation (ROTATE_SET)
+
+A namespace's guardian set can be replaced, one member or all three,
+while its journaled state is preserved. Every signed object still carries
+its guardian_set_id inside the transcript, so nothing from the outgoing
+set ever validates under the incoming one; rotation does not relax that.
+It adds one ordering above `(writerEpoch, sequence)`, the namespace
+GENERATION, and one root-signed object, ROTATE, and it reuses everything
+else.
+
+The operation, performed by the CURRENT writer (a confirmed lease):
 
 ```text
-Guardian-set replacement while journaled state is preserved is
-UNSUPPORTED in protocol v1.
-
-A node MUST NOT begin a journal for its recovery_id under a second
-guardian set while any journaled state exists under a first. Exactly ONE
-guardian set ever carries a given namespace's journal in v1.
-
-Loss or replacement of the configured set degrades recovery to the
-SCB/DLP path (Tier 1) until a channel-preserving ROTATE_SET exists in a
-future protocol version.
+1. persist the intent durably: the incoming set (ids and how to reach
+   them) and the incoming generation g+1, BEFORE any network contact
+2. REGISTER_NODE with the incoming set, at generation g+1, carrying the
+   CURRENT lease (same epoch, same writer key, 1.2) and the retained
+   chain origin (the journal's retained base, exactly as first-time
+   enablement on an existing node does); the incoming set's log head is
+   genesis
+3. PUT_STATE the retained journal from that origin to the tip, re-signed
+   under the incoming prefix, until a quorum of the incoming set holds
+   the tip; the outgoing set keeps receiving frames meanwhile, so the
+   writer's barrier never waits on the incoming set before it is ready
+4. SWITCH, in one local transaction: the incoming set becomes the
+   configured set, generation becomes g+1, the replication watermark
+   becomes the incoming set's; from here every frame, receipt and
+   capsule is the incoming set's, and the writer's barrier answers to
+   it
+5. ROTATE_SET to every member of the outgoing set (5.11), retried until
+   at least one accepts; the outgoing namespace is RETIRED there
 ```
 
-The structural reasons, so nobody reintroduces a workaround: every
-signed object carries its guardian_set_id inside the signed transcript,
-so nothing from an old set can validate under a new one; writerEpoch and
-sequence order states WITHIN one set and cannot order two independent
-sets; peer_storage explicitly may return stale capsules, so after any
-two-set period the Phase 3 restore selection (highest writerEpoch, then
-sequence) can prefer a stale old-set capsule over a younger new-set one;
-and nothing cryptographically fences the old set, because a stale device
-holds the seed and therefore the recovery root, and could acquire
-further old-set epochs. Only a root-signed monotonic set-generation
-object ordered ABOVE (writerEpoch, sequence) can resolve that, and that
-object is ROTATE_SET (old and new set ids, generations, the
-quorum-certified final state, a migration snapshot anchor, retirement
-semantics), reserved for a future protocol version rather than shipped
-piecemeal.
+Sequence numbering never resets: the incoming set's first record is the
+retained base, and a frame committed in the instant of the switch simply
+replicates to the incoming set as the next record. A crash before step 4
+restarts with the outgoing set still configured and the intent persisted,
+and resumes from step 2 (registration is idempotent); a crash after step
+4 restarts on the incoming set and resumes step 5.
 
-What v1 DOES support, for clarity against the prohibition above:
+One-member replacement is this operation with two members carried over.
+A carried-over guardian serves the outgoing namespace (retired) and the
+incoming one side by side, under their two set ids; they never share a
+store row or a record. The incoming set's REGISTER_NODE is answered by
+the carried-over guardian like any other registration, and its backfill
+comes from the writer, never from the outgoing namespace, because the
+outgoing records carry the wrong prefix.
 
-- First-time enablement of guardians on an existing node is NOT a
-  replacement: no prior set carries the namespace, the root-committed
-  ORIGIN registered for it is the retained journal base with the
-  journal's real sequence numbering (4.1), and Phase 3 capsule ordering
-  stays monotonic across enablement because the node-wide journal
-  numbering never resets.
-- Replacing an individual FAILED guardian machine behind the SAME
-  guardianId and set (restore its store, then repair through
-  SYNC_RECORD and SYNC_EPOCH per 5.10) is operational maintenance, not
-  set replacement.
-- Abandoning guardians entirely (operator decision) is Tier 1
-  degradation, stated in the box above.
+Capsules (spec 5.4) carry the generation, and restore selection orders by
+`(generation, writerEpoch, sequence)`: a capsule from generation g+1 beats
+any capsule from generation g whatever their epochs, so peer storage
+returning a stale outgoing-set capsule can never win over a younger
+incoming-set one.
+
+The four structural reasons this used to be prohibited, and what answers
+each:
+
+- Transcript binding: unchanged and intended. Outgoing records never
+  validate under the incoming set; the writer re-signs.
+- Ordering across sets: the generation, root-signed inside REGISTER and
+  ROTATE, ordered above epoch and sequence everywhere the two are
+  compared.
+- Stale capsules: generation-first selection.
+- Fencing the outgoing set: the party that holds the seed and could keep
+  writing to the outgoing set is the user's own previous device, running
+  the user's own software, and it stops itself. A device that retrieves a
+  capsule whose generation exceeds its own MUST freeze exactly as a
+  proven newer epoch freezes it (spec 5.6); a device whose write reaches
+  a retired outgoing guardian is answered `ERR_SET_RETIRED`, reads the
+  root-signed rotation off GET_HEAD, and MUST freeze the same way. Neither is
+  cryptographic fencing and this document does not call it that. A
+  stranger holding the seed already owns the wallet and is outside every
+  guarantee here.
+
+What is NOT rotation, for clarity: restoring a failed guardian machine
+behind the SAME guardianId and set (5.10) is maintenance; abandoning
+guardians entirely is Tier 1 degradation; a restore device that only
+knows the outgoing set follows the `rotation` object GET_HEAD hands it
+(5.11) to the incoming set, and needs no operator input to do so.
 
 ### 5.10 Uncertain-store repair: rollback, then replay
 
@@ -709,6 +763,37 @@ missing an epoch-7 record is exactly this case: it rolls back to its
 last consistent state within epoch 7 (or earlier), replays the epoch-7
 records, replays the 7 to 8 takeover through SYNC_EPOCH, and replays
 forward.
+
+### 5.11 ROTATE_SET
+
+Presented to each member of the OUTGOING set once the incoming set holds
+the tip (5.9 step 5). Request: the ROTATE transcript fields, the root
+signature, and the incoming set's transports (unsigned: where to reach
+the incoming members, informational, verified by the receipts they sign).
+Acceptance:
+
+```text
+recovery_id is registered under this guardian_set_id
+new_members lists exactly `total` x-only keys and hashes to
+new_guardian_set_id
+generation exceeds the namespace's stored generation
+root signature verifies over the ROTATE transcript under recovery_id
+```
+
+Effect: the namespace is RETIRED under this set. The guardian persists the
+rotation beside the namespace and, from then on, answers PUT_STATE,
+ACQUIRE_EPOCH, SYNC_RECORD and SYNC_EPOCH for the recovery_id with
+`ERR_SET_RETIRED`; GET_HEAD and GET_STATE keep
+answering (a restore device that only knows the outgoing set reads the
+head, finds the rotation, and follows it), with the rotation attached to
+GET_HEAD. Idempotency: the byte-identical rotation returns
+`OK_DUPLICATE`; a different rotation at the same generation is
+`ERR_CONFLICT`; a lower generation is `ERR_EPOCH_REGRESSION`. Response: the
+status and the stored rotation.
+
+A retired namespace is never deleted by this verb; retention rules are
+the operator's, as for any namespace, and the incoming set holds the live
+chain.
 
 ## 6. Protobuf envelope
 
@@ -786,6 +871,28 @@ message RegisterNodeRequest {
   GuardianState initial_state    = 3;
   bytes         root_signature   = 4;  // 64, over the REGISTER transcript
   repeated bytes guardian_members = 5; // 32 each; exactly `total`; REQUIRED
+  uint64        generation       = 6;  // >= 1; inside the REGISTER transcript
+}
+
+message GuardianTransport {
+  string type = 1;                     // onion-http | https | local-http | bolt8
+  string url  = 2;
+}
+
+message RotateSetRequest {
+  uint32        protocol_version     = 1;
+  bytes         guardian_set_id      = 2;  // the OUTGOING set
+  bytes         recovery_id          = 3;  // 32
+  bytes         new_guardian_set_id  = 4;  // 32
+  uint64        generation           = 5;  // the INCOMING generation
+  repeated bytes new_members         = 6;  // 32 each; exactly `total`
+  bytes         root_signature       = 7;  // 64, over the ROTATE transcript
+  repeated GuardianTransport new_transports = 8; // per member, unsigned
+}
+message RotateSetResponse {
+  uint32           status   = 1;
+  string           detail   = 2;
+  RotateSetRequest rotation = 3;           // OK, OK_DUPLICATE, ERR_CONFLICT
 }
 message RegisterNodeResponse {
   uint32        status  = 1;
@@ -815,6 +922,8 @@ message GetHeadResponse {
   repeated TakeoverCertificate certificates = 5;
   bool          possibly_stale = 6;
   RegisterNodeRequest registration = 7; // the stored origin proof (5.1)
+  uint64           generation  = 8;   // the namespace's generation
+  RotateSetRequest rotation    = 9;   // present once RETIRED (5.11)
 }
 
 message GetStateRequest {
@@ -935,11 +1044,14 @@ codec stays tractable, and signatures never depend on the envelope.
                             for new namespaces or further records; not a
                             transport condition and not retryable until the
                             operator raises the quota (2.7)
+34  ERR_SET_RETIRED         the namespace was rotated away from this set
+                            (5.11); the rotation is attached, and a writer
+                            receiving this MUST freeze (5.9)
 50  ERR_INTERNAL            transient guardian fault; safe to retry
 ```
 
-Writers treat 20, 24, and 25 as reconciliation or freeze signals per spec
-5.6, never as retryable transport noise.
+Writers treat 20, 24, 25 and 34 as reconciliation or freeze signals per
+spec 5.6, never as retryable transport noise.
 
 ## 8. Sizes and limits
 

@@ -32,14 +32,20 @@ import {
 	signTranscript,
 	stateBytes,
 	statesEqual,
-	xOnlyFromSecret
+	xOnlyFromSecret,
+	CRASH_V1_PROFILE,
+	computeGuardianSetId,
+	rotateTranscriptHash,
+	verifyTranscript
 } from './guardian-wire';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import {
 	GuardianStatus,
 	IGuardianRecord,
 	IGuardianReceipt,
-	IGuardianRegisterNodeRequest
+	IGuardianRegisterNodeRequest,
+	IGuardianRotateSetRequest,
+	IGuardianGetHeadResponse
 } from './guardian';
 import {
 	IBoundGuardianClient,
@@ -47,7 +53,8 @@ import {
 	boundFanOut,
 	countReceiptQuorum,
 	verifyGuardianBindings,
-	verifyGuardianReceipt
+	verifyGuardianReceipt,
+	IGuardianFanOutResult
 } from './guardian-client';
 import {
 	JOURNAL_META_KEYS,
@@ -67,11 +74,17 @@ import {
 
 /** A registration already sent to at least one guardian (see below). */
 const META_PENDING_REGISTRATION = 'guardian_pending_registration_v1';
+/** The namespace generation (wire 5.9); absent reads as 1. */
+export const META_GENERATION = JOURNAL_META_KEYS.generation;
+/** The configured guardian set as it stands, JSON entries (a rotation moves it). */
+export const META_GUARDIAN_SET = 'guardian_set_v1';
 
 export const REPLICATION_META_KEYS = {
 	replicatedThrough: META_REPLICATED_THROUGH,
 	replicatedThroughHash: META_REPLICATED_THROUGH_HASH,
-	pendingRegistration: META_PENDING_REGISTRATION
+	pendingRegistration: META_PENDING_REGISTRATION,
+	generation: META_GENERATION,
+	guardianSet: META_GUARDIAN_SET
 } as const;
 
 /**
@@ -119,6 +132,8 @@ function sha256(data: Buffer): Buffer {
  * outcome except `registered` is a REFUSAL to invent state locally.
  */
 export type NamespaceDecision =
+	/** The namespace was rotated away from this set (wire 5.11): follow it. */
+	| { outcome: 'rotated'; rotation: IGuardianRotateSetRequest }
 	| { outcome: 'already-held'; lease: IWriterLeaseKeys }
 	| { outcome: 'registered'; lease: IWriterLeaseKeys }
 	| {
@@ -160,6 +175,19 @@ export interface IGuardianReplicationConfig {
 	 * Default 8; 1 makes the stream strictly sequential.
 	 */
 	pipelineWindow?: number;
+	/**
+	 * Prefix for the replication watermark keys, so a SECOND replicator can
+	 * run over the same journal without touching the live one's bookkeeping:
+	 * a rotation (guardian-rotation.ts) backfills the incoming set under a
+	 * prefix and moves the watermark to the main keys at the switch.
+	 */
+	metaKeyPrefix?: string;
+	/**
+	 * The generation this replicator registers and signs under, when it is
+	 * not the journal's current one: a rotation registers the incoming set
+	 * at generation + 1 before the journal records the switch.
+	 */
+	generationOverride?: bigint;
 }
 
 export interface IGuardianReplicationEvent {
@@ -197,6 +225,8 @@ export interface IReplicationResult {
 	replicatedThrough: bigint;
 	/** On `fenced`: the newer state, proven by a verified receipt. */
 	verifiedCurrentState?: GuardianState;
+	/** On `fenced`: this namespace was rotated to another set (wire 5.9). */
+	rotatedTo?: IGuardianRotateSetRequest;
 	/** On `fenced`: the epoch this node believed it held. */
 	localEpoch?: bigint;
 }
@@ -216,6 +246,8 @@ interface IGuardianStreamResult {
 	provenThrough: bigint | null;
 	/** Any epoch rejection seen, which triggers the supersession check. */
 	sawSupersession: boolean;
+	/** A retired-set answer seen, which triggers the rotation check (wire 5.11). */
+	sawRetired: boolean;
 	/** A guardian holding a DIFFERENT record at one of our sequences. */
 	conflictAt: bigint | null;
 	requests: number;
@@ -235,6 +267,20 @@ export class GuardianReplicator {
 	 * a released barrier being forgotten across a restart.
 	 */
 	private inFlight: Promise<IReplicationResult> | null = null;
+
+	/** The bookkeeping keys, prefixed for a rotation's incoming replicator. */
+	private get keys(): {
+		replicatedThrough: string;
+		replicatedThroughHash: string;
+		pendingRegistration: string;
+	} {
+		const prefix = this.config.metaKeyPrefix ?? '';
+		return {
+			replicatedThrough: prefix + META_REPLICATED_THROUGH,
+			replicatedThroughHash: prefix + META_REPLICATED_THROUGH_HASH,
+			pendingRegistration: prefix + META_PENDING_REGISTRATION
+		};
+	}
 
 	constructor(config: IGuardianReplicationConfig) {
 		if (config.guardians.length === 0) {
@@ -281,7 +327,7 @@ export class GuardianReplicator {
 		writer: { secret: Buffer; publicKey: Buffer };
 	} | null {
 		const raw = this.config.storage.getRecoveryMeta?.(
-			META_PENDING_REGISTRATION
+			this.keys.pendingRegistration
 		);
 		if (raw == null) return null;
 		let parsed: IPersistedRegistrationV1;
@@ -352,7 +398,7 @@ export class GuardianReplicator {
 			writerPublicKey: writer.publicKey.toString('hex')
 		};
 		this.config.storage.setRecoveryMeta?.(
-			META_PENDING_REGISTRATION,
+			this.keys.pendingRegistration,
 			JSON.stringify(payload)
 		);
 	}
@@ -363,6 +409,25 @@ export class GuardianReplicator {
 	 * guardians MID-JOURNAL registers its retained base position instead, so
 	 * the node-wide journal numbering carries over without renumbering.
 	 */
+	/**
+	 * The namespace generation this set carries (wire 5.9): 1 until a
+	 * rotation has raised it, read from the journal's metadata so a
+	 * restart and a rotation agree.
+	 */
+	generation(): bigint {
+		if (this.config.generationOverride !== undefined) {
+			return this.config.generationOverride;
+		}
+		const raw = this.config.storage.getRecoveryMeta?.(META_GENERATION);
+		if (raw == null) return 1n;
+		try {
+			const value = BigInt(raw);
+			return value >= 1n ? value : 1n;
+		} catch {
+			return 1n;
+		}
+	}
+
 	private chainOrigin(): { firstSequence: bigint; previousHash: Buffer } {
 		const storage = this.config.storage;
 		const frames = storage.loadRecoveryFrames?.() ?? [];
@@ -374,6 +439,43 @@ export class GuardianReplicator {
 			firstSequence: BigInt(base.sequence),
 			previousHash: Buffer.from(base.previousFrameHash)
 		};
+	}
+
+	/**
+	 * A rotation a guardian attached to its head, IF the recovery root signed
+	 * it over THIS set's prefix (wire 5.11): unsigned attachments are claims,
+	 * and only the root can move a namespace.
+	 */
+	private verifiedRotation(
+		response: { rotation?: IGuardianRotateSetRequest } | undefined
+	): IGuardianRotateSetRequest | null {
+		const rotation = response?.rotation;
+		if (!rotation) return null;
+		if (!rotation.recoveryId.equals(this.config.recoveryRoot.recoveryId))
+			return null;
+		if (!rotation.guardianSetId.equals(this.config.context.guardianSetId))
+			return null;
+		if (rotation.newMembers.length !== CRASH_V1_PROFILE.total) return null;
+		try {
+			const expected = computeGuardianSetId({
+				...CRASH_V1_PROFILE,
+				guardianIds: rotation.newMembers
+			});
+			if (!expected.equals(rotation.newGuardianSetId)) return null;
+			const ok = verifyTranscript(
+				rotateTranscriptHash(this.config.context.guardianSetId, {
+					recoveryId: rotation.recoveryId,
+					newGuardianSetId: rotation.newGuardianSetId,
+					generation: rotation.generation,
+					newMembers: rotation.newMembers
+				}),
+				rotation.rootSignature,
+				rotation.recoveryId
+			);
+			return ok ? rotation : null;
+		} catch {
+			return null;
+		}
 	}
 
 	/**
@@ -392,6 +494,19 @@ export class GuardianReplicator {
 		const heads = await boundFanOut(this.config.guardians, (client) =>
 			client.getHead(recoveryId)
 		);
+		// A rotation on ANY head redirects before anything else is decided:
+		// the live chain is with the incoming set, and registering, restoring
+		// or taking over here would act on a retired namespace (wire 5.9).
+		for (const entry of heads) {
+			const rotation = this.verifiedRotation(entry.result);
+			if (rotation) {
+				this.emit({
+					type: 'namespace:exists',
+					detail: `this namespace was rotated to generation ${rotation.generation}; following it`
+				});
+				return { outcome: 'rotated', rotation };
+			}
+		}
 		// Two DIFFERENT kinds of evidence, and conflating them is dangerous.
 		//
 		// RECENCY (what the current head and owner are) requires a guardian
@@ -521,15 +636,21 @@ export class GuardianReplicator {
 				detail: `resuming the registration of epoch 1 with its original writer key`
 			});
 		}
+		const generation = this.generation();
 		const request: IGuardianRegisterNodeRequest = {
 			protocolVersion: 1,
 			guardianSetId: Buffer.from(this.config.context.guardianSetId),
 			guardianMembers: this.config.context.members.map((m) => Buffer.from(m)),
 			initialState,
 			rootSignature: signTranscript(
-				registerTranscriptHash(this.config.context.guardianSetId, initialState),
+				registerTranscriptHash(
+					this.config.context.guardianSetId,
+					initialState,
+					generation
+				),
 				this.config.recoveryRoot.rootSecret
-			)
+			),
+			generation
 		};
 		const registrations = await boundFanOut(this.config.guardians, (client) =>
 			client.register(request)
@@ -574,7 +695,7 @@ export class GuardianReplicator {
 		});
 		this.config.storage.transaction(() => {
 			writeLease(this.config.storage);
-			this.config.storage.deleteRecoveryMeta?.(META_PENDING_REGISTRATION);
+			this.config.storage.deleteRecoveryMeta?.(this.keys.pendingRegistration);
 		});
 		this.emit({
 			type: 'namespace:registered',
@@ -582,6 +703,64 @@ export class GuardianReplicator {
 			receipts: accepted
 		});
 		return { outcome: 'registered', lease };
+	}
+
+	/**
+	 * Register this namespace with THIS replicator's set under an existing
+	 * lease (wire 5.9 step 2): a rotation re-registers the current writer's
+	 * epoch and key with the incoming set at the incoming generation, with
+	 * the retained chain origin. Never touches the primary lease or the
+	 * primary pending-registration record. Returns the accepting quorum.
+	 */
+	async registerExisting(lease: IWriterLeaseKeys): Promise<{
+		accepted: number;
+		initialState: GuardianState;
+	}> {
+		await this.ensureBindings();
+		const recoveryId = this.config.recoveryRoot.recoveryId;
+		const initialState: GuardianState = {
+			recoveryId: Buffer.from(recoveryId),
+			lease: {
+				epoch: lease.epoch,
+				writerPublicKey: Buffer.from(lease.writerPublicKey)
+			},
+			origin: this.chainOrigin(),
+			logHead: genesisLogHead()
+		};
+		const generation = this.generation();
+		const request: IGuardianRegisterNodeRequest = {
+			protocolVersion: 1,
+			guardianSetId: Buffer.from(this.config.context.guardianSetId),
+			guardianMembers: this.config.context.members.map((m) => Buffer.from(m)),
+			initialState,
+			rootSignature: signTranscript(
+				registerTranscriptHash(
+					this.config.context.guardianSetId,
+					initialState,
+					generation
+				),
+				this.config.recoveryRoot.rootSecret
+			),
+			generation
+		};
+		const registrations = await boundFanOut(this.config.guardians, (client) =>
+			client.register(request)
+		);
+		const accepted = countReceiptQuorum(
+			registrations.map((entry) => ({
+				client: entry.client,
+				result: entry.result,
+				error: entry.error
+			})),
+			this.config.context,
+			(state) => statesEqual(state, initialState)
+		);
+		this.emit({
+			type: 'namespace:registered',
+			detail: `re-registered under generation ${generation} with ${accepted} guardians at origin sequence ${initialState.origin.firstSequence}`,
+			receipts: accepted
+		});
+		return { accepted, initialState };
 	}
 
 	/** Sign one journal frame as a guardian record (wire 4.2 RECORD). */
@@ -625,7 +804,7 @@ export class GuardianReplicator {
 	 */
 	replicatedThrough(): bigint {
 		const storage = this.config.storage;
-		const raw = storage.getRecoveryMeta?.(META_REPLICATED_THROUGH);
+		const raw = storage.getRecoveryMeta?.(this.keys.replicatedThrough);
 		if (raw == null) return 0n;
 		if (!/^\d+$/.test(raw)) return 0n;
 		let value: bigint;
@@ -647,7 +826,9 @@ export class GuardianReplicator {
 		// then refused by the guardians at its occupied sequences), and it
 		// self-heals: the next successful pass re-raises and re-binds.
 		if (value >= 1n) {
-			const boundHash = storage.getRecoveryMeta?.(META_REPLICATED_THROUGH_HASH);
+			const boundHash = storage.getRecoveryMeta?.(
+				this.keys.replicatedThroughHash
+			);
 			if (boundHash == null) return 0n;
 			const anchor = resolveWatermarkAnchor(storage, value);
 			if (anchor == null || anchor.toString('hex') !== boundHash) {
@@ -693,7 +874,9 @@ export class GuardianReplicator {
 	 * is the same trade resolveDurability makes for an unreadable tip.
 	 */
 	watermarkExceedingJournal(): string | null {
-		const raw = this.config.storage.getRecoveryMeta?.(META_REPLICATED_THROUGH);
+		const raw = this.config.storage.getRecoveryMeta?.(
+			this.keys.replicatedThrough
+		);
 		if (raw == null || !/^\d+$/.test(raw)) return null;
 		const watermark = BigInt(raw);
 		if (watermark === 0n) return null;
@@ -744,9 +927,9 @@ export class GuardianReplicator {
 				stored = current;
 				return;
 			}
-			storage.setRecoveryMeta?.(META_REPLICATED_THROUGH, value.toString());
+			storage.setRecoveryMeta?.(this.keys.replicatedThrough, value.toString());
 			storage.setRecoveryMeta?.(
-				META_REPLICATED_THROUGH_HASH,
+				this.keys.replicatedThroughHash,
 				anchor.toString('hex')
 			);
 		});
@@ -842,6 +1025,7 @@ export class GuardianReplicator {
 		const result: IGuardianStreamResult = {
 			provenThrough: null,
 			sawSupersession: false,
+			sawRetired: false,
 			conflictAt: null,
 			requests: 0
 		};
@@ -870,6 +1054,9 @@ export class GuardianReplicator {
 				if (!response) continue;
 				if (response.status === GuardianStatus.ERR_EPOCH_SUPERSEDED) {
 					result.sawSupersession = true;
+				}
+				if (response.status === GuardianStatus.ERR_SET_RETIRED) {
+					result.sawRetired = true;
 				}
 				const proven = this.provenHead(
 					response.receipt,
@@ -991,6 +1178,10 @@ export class GuardianReplicator {
 			}
 		}
 
+		if (streams.some((stream) => stream.sawRetired)) {
+			const rotated = await this.resolveRotation(tip);
+			if (rotated) return rotated;
+		}
 		if (streams.some((stream) => stream.sawSupersession)) {
 			const fenced = await this.resolveSupersession(lease, tip);
 			if (fenced) return fenced;
@@ -1060,6 +1251,42 @@ export class GuardianReplicator {
 	 * continues, which is the difference between one misbehaving endpoint
 	 * costing us a log line and costing us the node.
 	 */
+	/**
+	 * A guardian said this namespace was rotated away. ERR_SET_RETIRED is an
+	 * unsigned status; the fence needs the root-signed rotation from a head
+	 * (wire 5.11). With it, this device is a stale writer and must freeze.
+	 */
+	private async resolveRotation(
+		sequence: bigint
+	): Promise<IReplicationResult | null> {
+		let heads: Array<IGuardianFanOutResult<IGuardianGetHeadResponse>>;
+		try {
+			heads = await boundFanOut(this.config.guardians, (client) =>
+				client.getHead(this.config.recoveryRoot.recoveryId)
+			);
+		} catch {
+			return null;
+		}
+		for (const entry of heads) {
+			const rotation = this.verifiedRotation(entry.result);
+			if (rotation) {
+				this.emit({
+					type: 'writer:fenced',
+					detail: `this namespace was rotated to generation ${rotation.generation} by another device; replication stopped and the writer must freeze`,
+					sequence
+				});
+				return {
+					outcome: 'fenced',
+					attempted: 0,
+					durable: 0,
+					replicatedThrough: this.replicatedThrough(),
+					rotatedTo: rotation
+				};
+			}
+		}
+		return null;
+	}
+
 	private async resolveSupersession(
 		lease: IWriterLeaseKeys,
 		sequence: bigint
@@ -1117,6 +1344,8 @@ export class GuardianReplicator {
 		confirming: number;
 		superseded: boolean;
 		states: GuardianState[];
+		/** The namespace was rotated away from this set: fence (wire 5.9). */
+		rotated?: IGuardianRotateSetRequest;
 	}> {
 		await this.ensureBindings();
 		const heads = await boundFanOut(this.config.guardians, (client) =>
@@ -1125,8 +1354,15 @@ export class GuardianReplicator {
 		const states: GuardianState[] = [];
 		const confirming = new Set<string>();
 		let superseded = false;
+		let rotated: IGuardianRotateSetRequest | undefined;
 		for (const entry of heads) {
 			const response = entry.result;
+			const rotation = this.verifiedRotation(response);
+			if (rotation) {
+				rotated = rotation;
+				superseded = true;
+				continue;
+			}
 			if (!response || response.status !== GuardianStatus.OK) continue;
 			// An uncertain store cannot confirm ownership (wire 5.3).
 			if (response.possiblyStale === true) continue;
@@ -1156,7 +1392,12 @@ export class GuardianReplicator {
 				superseded = true;
 			}
 		}
-		return { confirming: confirming.size, superseded, states };
+		return {
+			confirming: confirming.size,
+			superseded,
+			states,
+			...(rotated ? { rotated } : {})
+		};
 	}
 }
 

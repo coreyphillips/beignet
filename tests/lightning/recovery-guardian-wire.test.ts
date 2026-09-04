@@ -113,8 +113,8 @@ describe('Guardian wire: canonical transcripts', () => {
 	it('STATE is 192 fixed bytes and the register hash matches the vector', () => {
 		const state = vectorState();
 		expect(stateBytes(state).length).to.equal(192);
-		expect(registerTranscriptHash(setId, state).toString('hex')).to.equal(
-			'725f51f409c91d9c7e959d5533d4b43117dcf3bcc59b9bba981bb60245f316c7'
+		expect(registerTranscriptHash(setId, state, 1n).toString('hex')).to.equal(
+			'e46095348464ab35c14d10de7b73f1f3b2fa3677ad5e39ab9facbbde471dc865'
 		);
 		expect(statesEqual(state, vectorState())).to.equal(true);
 		expect(isGenesisLogHead(state.logHead)).to.equal(true);
@@ -146,7 +146,7 @@ describe('Guardian wire: canonical transcripts', () => {
 		const { rootSecret, recoveryId } = deriveRecoveryRoot(NODE_SECRET);
 
 		// REGISTER: root signs; the root key IS the namespace.
-		const regHash = registerTranscriptHash(setId, state);
+		const regHash = registerTranscriptHash(setId, state, 1n);
 		const regSig = signTranscript(regHash, rootSecret);
 		expect(verifyTranscript(regHash, regSig, recoveryId)).to.equal(true);
 

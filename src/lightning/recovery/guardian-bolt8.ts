@@ -80,7 +80,8 @@ export enum GuardianBolt8Verb {
 	GET_STATE = 4,
 	ACQUIRE_EPOCH = 5,
 	SYNC_RECORD = 6,
-	SYNC_EPOCH = 7
+	SYNC_EPOCH = 7,
+	ROTATE_SET = 8
 }
 
 const VERB_CODE_BY_NAME: Record<GuardianVerbName | 'info', GuardianBolt8Verb> =
@@ -92,7 +93,8 @@ const VERB_CODE_BY_NAME: Record<GuardianVerbName | 'info', GuardianBolt8Verb> =
 		get_state: GuardianBolt8Verb.GET_STATE,
 		acquire_epoch: GuardianBolt8Verb.ACQUIRE_EPOCH,
 		sync_record: GuardianBolt8Verb.SYNC_RECORD,
-		sync_epoch: GuardianBolt8Verb.SYNC_EPOCH
+		sync_epoch: GuardianBolt8Verb.SYNC_EPOCH,
+		rotate_set: GuardianBolt8Verb.ROTATE_SET
 	};
 
 const VERB_NAME_BY_CODE = new Map<number, GuardianVerbName | 'info'>(

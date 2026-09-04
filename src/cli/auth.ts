@@ -291,6 +291,8 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /recovery/capsule-guardians': [],
 	// Dials a remote node to resolve its guardian entry (issue #699).
 	'POST /recovery/resolve-guardian': [],
+	// Retires the current guardian set for good.
+	'POST /recovery/rotate-guardians': [],
 	'POST /watchtower/add': [],
 	'DELETE /watchtower/remove': [],
 	'POST /webhooks/register': [],

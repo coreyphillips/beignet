@@ -252,6 +252,12 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// A node-hosted guardian that did not answer a resolve probe (issue
 	// #699): the upstream, not this node, so 502 and retryable.
 	GUARDIAN_UNREACHABLE: 502,
+	// Guardian-set rotation (issue #701): a running or impossible rotation is
+	// a state conflict; a set that will not answer or catch up is retryable.
+	ROTATION_IN_PROGRESS: 409,
+	ROTATION_UNAVAILABLE: 409,
+	ROTATION_NO_QUORUM: 503,
+	ROTATION_NOT_CATCHING_UP: 503,
 	RESTORE_TARGET_UNSUPPORTED: 400,
 	NODE_RESTART_REQUIRED: 503,
 	CAPSULE_RESTORE_UNSUPPORTED: 409,
@@ -462,6 +468,11 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'guardian:set-registered',
 		'guardian:quota-refused',
 		'guardian:session-violation',
+		// Guardian-set rotation (issue #701): progress, the switch, and a boot
+		// that followed a retired set to the live one.
+		'recovery:rotation-progress',
+		'recovery:rotated',
+		'recovery:rotation-followed',
 		// JIT receive, LSP side (issue #669): the progress of a funding this
 		// node fronts for a wallet, from the intent it accepted to the parts it
 		// forwarded. Low volume (one intent, one funding, one forward per
@@ -2498,6 +2509,30 @@ async function bootDaemon(
 		// entry. Resolving adopts nothing: pinning a set is the operator's
 		// explicit action, with the permanence named (#692).
 		'GET /guardian/status': () => success(node.getGuardianHostSurfaceStatus()),
+		// Rotate the guardian set (wire 5.9, issue #701): one member or all
+		// three, on a confirmed writer, with the channels running throughout.
+		// The set is immutable in the sense that only this verb moves it, and
+		// the operator confirms because a stale device still running becomes
+		// a fenced one the moment it sees the new generation.
+		'POST /recovery/rotate-guardians': async (body) => {
+			const { guardians, confirm } = body as {
+				guardians?: Array<string | { guardianId: string; url: string }>;
+				confirm?: boolean;
+			};
+			if (confirm !== true) {
+				return failure(
+					'INVALID_PARAMS',
+					'Rotating the guardian set retires the current one for good; pass {"confirm": true} with the three new entries'
+				);
+			}
+			if (!Array.isArray(guardians) || guardians.length === 0) {
+				return failure(
+					'INVALID_PARAMS',
+					'guardians required: exactly three entries'
+				);
+			}
+			return success(await node.rotateGuardians(guardians));
+		},
 		'POST /recovery/resolve-guardian': async (body) => {
 			const { uri } = body as { uri?: string };
 			if (typeof uri !== 'string' || uri.length === 0) {

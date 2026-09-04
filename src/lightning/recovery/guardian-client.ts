@@ -35,7 +35,9 @@ import {
 	IGuardianRegisterNodeResponse,
 	IGuardianSyncEpochResponse,
 	IGuardianSyncRecordResponse,
-	IGuardianTakeoverCertificate
+	IGuardianTakeoverCertificate,
+	IGuardianRotateSetRequest,
+	IGuardianRotateSetResponse
 } from './guardian';
 import {
 	GUARDIAN_CONTENT_TYPE,
@@ -54,7 +56,9 @@ import {
 	encodePutStateRequest,
 	encodeRegisterNodeRequest,
 	encodeSyncEpochRequest,
-	encodeSyncRecordRequest
+	encodeSyncRecordRequest,
+	encodeRotateSetRequest,
+	decodeRotateSetResponse
 } from './guardian-proto';
 import {
 	GuardianAuth,
@@ -537,6 +541,16 @@ export class GuardianClient {
 		await this.ensureCompatible();
 		return decodeSyncRecordResponse(
 			await this.exchange('sync_record', encodeSyncRecordRequest({ record }))
+		);
+	}
+
+	/** Retire a namespace under this (outgoing) set in favour of a new one (wire 5.11). */
+	async rotateSet(
+		request: IGuardianRotateSetRequest
+	): Promise<IGuardianRotateSetResponse> {
+		await this.ensureCompatible();
+		return decodeRotateSetResponse(
+			await this.exchange('rotate_set', encodeRotateSetRequest(request))
 		);
 	}
 

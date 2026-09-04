@@ -347,9 +347,10 @@ describe('Recovery phase 5: writer lease', () => {
 			protocolVersion: 1,
 			guardianSetId: SET_ID,
 			guardianMembers: GUARDIAN_IDS,
+			generation: 1n,
 			initialState,
 			rootSignature: signTranscript(
-				registerTranscriptHash(SET_ID, initialState),
+				registerTranscriptHash(SET_ID, initialState, 1n),
 				ROOT.rootSecret
 			)
 		});
@@ -413,9 +414,10 @@ describe('Recovery phase 5: writer lease', () => {
 			protocolVersion: 1,
 			guardianSetId: SET_ID,
 			guardianMembers: GUARDIAN_IDS,
+			generation: 1n,
 			initialState,
 			rootSignature: signTranscript(
-				registerTranscriptHash(SET_ID, initialState),
+				registerTranscriptHash(SET_ID, initialState, 1n),
 				ROOT.rootSecret
 			)
 		});

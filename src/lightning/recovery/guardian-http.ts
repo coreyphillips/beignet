@@ -28,6 +28,8 @@ import {
 	decodeRegisterNodeRequest,
 	decodeSyncEpochRequest,
 	decodeSyncRecordRequest,
+	decodeRotateSetRequest,
+	encodeRotateSetResponse,
 	encodeAcquireEpochResponse,
 	encodeGetHeadResponse,
 	encodeGetStateResponse,
@@ -49,7 +51,8 @@ export type GuardianVerbName =
 	| 'get_state'
 	| 'acquire_epoch'
 	| 'sync_record'
-	| 'sync_epoch';
+	| 'sync_epoch'
+	| 'rotate_set';
 
 export const GUARDIAN_VERB_NAMES: readonly GuardianVerbName[] = Object.freeze([
 	'register_node',
@@ -58,7 +61,8 @@ export const GUARDIAN_VERB_NAMES: readonly GuardianVerbName[] = Object.freeze([
 	'get_state',
 	'acquire_epoch',
 	'sync_record',
-	'sync_epoch'
+	'sync_epoch',
+	'rotate_set'
 ]);
 
 export function isGuardianVerbName(verb: string): verb is GuardianVerbName {
@@ -91,7 +95,9 @@ const VERB_HANDLERS: Record<
 			guardian.syncRecord(decodeSyncRecordRequest(body))
 		),
 	sync_epoch: (guardian, body) =>
-		encodeSyncEpochResponse(guardian.syncEpoch(decodeSyncEpochRequest(body)))
+		encodeSyncEpochResponse(guardian.syncEpoch(decodeSyncEpochRequest(body))),
+	rotate_set: (guardian, body) =>
+		encodeRotateSetResponse(guardian.rotateSet(decodeRotateSetRequest(body)))
 };
 
 const REFUSAL_FOR: Record<
@@ -106,7 +112,8 @@ const REFUSAL_FOR: Record<
 	acquire_epoch: (status, detail) =>
 		encodeAcquireEpochResponse({ status, detail }),
 	sync_record: (status, detail) => encodeSyncRecordResponse({ status, detail }),
-	sync_epoch: (status, detail) => encodeSyncEpochResponse({ status, detail })
+	sync_epoch: (status, detail) => encodeSyncEpochResponse({ status, detail }),
+	rotate_set: (status, detail) => encodeRotateSetResponse({ status, detail })
 };
 
 /**

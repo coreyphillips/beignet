@@ -151,6 +151,8 @@ export function isRetryableError(err: BeignetError): boolean {
 		'RECOVERY_UNAVAILABLE',
 		// A node-hosted guardian that did not answer a resolve probe (#699).
 		'GUARDIAN_UNREACHABLE',
+		'ROTATION_NO_QUORUM',
+		'ROTATION_NOT_CATCHING_UP',
 		// Recovery holds that resolve on their own or on a restart.
 		'NODE_RESTORE_PENDING',
 		'NODE_RESTART_REQUIRED',

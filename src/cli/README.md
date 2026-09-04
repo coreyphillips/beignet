@@ -401,6 +401,24 @@ that guard each other can restart together. Quotas
 (`BEIGNET_GUARDIAN_MAX_BYTES`, `_MAX_SETS`) refuse new writes rather than
 delete, because pruning a namespace wedges a stranger's node for good.
 
+#### Rotating guardians
+
+A wallet's guardian set is no longer fixed for life (docs/RECOVERY-GUARDIAN-WIRE.md
+5.9, issue #701). `beignet recovery rotate-guardians <e> <e> <e>` (or
+`POST /recovery/rotate-guardians`) moves the wallet to a new set, one member or
+all three, without closing a channel: the daemon registers the namespace with
+the incoming set under its current lease at the next generation, backfills the
+retained journal until two of the incoming three hold the tip, switches in one
+transaction, and retires the outgoing set with `ROTATE_SET`. A restore device
+still configured with the outgoing set reads the rotation off any outgoing
+guardian and follows it to the live set by itself; `GET /recovery/status`
+reports the `generation`, `configuredSetStale` once the env lags the journal,
+and `rotation.followed` on a boot that followed one. A previous device still
+running on the outgoing set freezes the moment it sees the new generation, in
+a capsule or in a guardian's answer. A rotation interrupted by a crash resumes
+once the gate confirms; a retirement the outgoing set has not accepted yet is
+retried in the background.
+
 #### Guardian recovery (Recovery Protocol)
 
 The Recovery Protocol (docs/RECOVERY-PROTOCOL.md) is configured entirely
@@ -1632,6 +1650,7 @@ beignet recovery restore-capsule  # peer-storage mode: restore from the
                             # old writer (never for quorum journals)
 beignet recovery capsule-guardians  # the best retrieved capsule's guardian set
 beignet recovery resolve-guardian <node id>@host:port  # a beignet node as a guardian entry
+beignet recovery rotate-guardians <e> <e> <e>  # move to a new guardian set, channels running
 beignet guardian status             # the guardian this node serves to others
                             # with credentials, as config entries
 ```
@@ -1972,6 +1991,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/recovery/restore` | `{ confirm: true }` | Restore from guardian replicas and start the node on the restored state (restore-pending daemons only; channels RESUME instead of force-closing; the takeover permanently fences the previous writer). Progress streams over SSE as `recovery:restore-progress` |
 | POST | `/recovery/restore-capsule` | `{ confirm: true, unfenced?: boolean }` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session. Tier 2 installs the exact state into a fresh database and holds the daemon until a restart (503 `NODE_RESTART_REQUIRED` elsewhere); Tier 1 recovers the embedded SCB on the live node. Progress streams over SSE as `recovery:restore-progress` |
 | GET | `/guardian/status` | -- | The guardian this node serves to others: `{ serving }` plus guardian id, token requirement, sessions, served sets (members, namespaces, bytes) and limits |
+| POST | `/recovery/rotate-guardians` | `{ guardians: [3 entries], confirm: true }` | Move this wallet to a new guardian set (one member or all three) with the channels running (wire 5.9): register with the incoming set under the current lease at the next generation, backfill, switch, retire the outgoing set. The env keeps naming the old set until updated; the journal's set is in force and the status route reports `configuredSetStale` |
 | POST | `/recovery/resolve-guardian` | `{ uri }` | A beignet node's `<node id>@host:port` to a guardian entry `<guardianId>@bolt8://<node id>@host:port`, by asking its guardian over a bolt8 session. Adopts nothing |
 | POST | `/recovery/capsule-guardians` | `{ confirm: true }` | The guardian set the best retrieved capsule names, INCLUDING transport credentials, as config-file entries for `recoveryGuardians`. The status route redacts credentials; this admin handoff is how a seed restore whose guardians need authentication gets them back. Nothing is adopted or persisted |
 | POST | `/stop` | `{ drain?, drainTimeoutMs? }` | Stop daemon. `drain: true` waits for in-flight payments before shutting down. |

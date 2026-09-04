@@ -37,6 +37,7 @@ import {
 	decodeGetStateRequest,
 	decodePutStateRequest,
 	decodeRegisterNodeRequest,
+	decodeRotateSetRequest,
 	decodeSyncEpochRequest,
 	decodeSyncRecordRequest
 } from './guardian-proto';
@@ -236,6 +237,10 @@ export class GuardianHost implements IGuardianResolver {
 				case 'sync_record':
 					setId = decodeSyncRecordRequest(body).record.guardianSetId;
 					break;
+				case 'rotate_set':
+					// Addressed to the OUTGOING set, which this host serves.
+					setId = decodeRotateSetRequest(body).guardianSetId;
+					break;
 				case 'sync_epoch': {
 					const certificates = decodeSyncEpochRequest(body).certificates;
 					if (certificates.length === 0) {
@@ -304,7 +309,8 @@ export class GuardianHost implements IGuardianResolver {
 		if (
 			(verb === 'put_state' ||
 				verb === 'sync_record' ||
-				verb === 'register_node') &&
+				verb === 'register_node' ||
+				verb === 'rotate_set') &&
 			this.bytesOf(served) > this.maxBytesPerSet
 		) {
 			this.emit({
