@@ -4198,7 +4198,7 @@ export class BeignetNode extends EventEmitter {
 			`bolt8://${parsed.pubkey}@${parsed.host}:${parsed.port}`
 		).url;
 		const opts = this._bootOpts;
-		if (!opts) throw new BeignetError('NOT_READY', 'node is not started');
+		if (!opts) throw new BeignetError('INTERNAL_ERROR', 'node is not started');
 		const transport = this.guardianTransportFor(
 			{ guardianId: Buffer.alloc(32), url },
 			opts

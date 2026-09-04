@@ -568,7 +568,8 @@ describe('Guardian transport: HTTP server and client', () => {
 					guardianSetIds: [SET_ID],
 					maxCiphertextBytes: 1024,
 					maxRecordsPerGet: 16,
-					rateLimitPerMinute: 0
+					rateLimitPerMinute: 0,
+					acceptsRegistrations: false
 				})
 			})
 		});
@@ -719,7 +720,8 @@ describe('Guardian transport: client hardening', () => {
 						guardianSetIds: [SET_ID],
 						maxCiphertextBytes: 1024,
 						maxRecordsPerGet: 16,
-						rateLimitPerMinute: 0
+						rateLimitPerMinute: 0,
+						acceptsRegistrations: false
 					})
 				};
 			}
@@ -756,7 +758,8 @@ describe('Guardian transport: client hardening', () => {
 							guardianSetIds: [SET_ID],
 							maxCiphertextBytes: 1024,
 							maxRecordsPerGet: 16,
-							rateLimitPerMinute: 0
+							rateLimitPerMinute: 0,
+							acceptsRegistrations: false
 						})
 					};
 				}

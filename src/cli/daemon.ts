@@ -249,6 +249,9 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	RESTORE_UNKNOWN_NAMESPACE: 404,
 	RESTORE_CONFLICT: 409,
 	RESTORE_HEAD_UNVERIFIABLE: 502,
+	// A node-hosted guardian that did not answer a resolve probe (issue
+	// #699): the upstream, not this node, so 502 and retryable.
+	GUARDIAN_UNREACHABLE: 502,
 	RESTORE_TARGET_UNSUPPORTED: 400,
 	NODE_RESTART_REQUIRED: 503,
 	CAPSULE_RESTORE_UNSUPPORTED: 409,

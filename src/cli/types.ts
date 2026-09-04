@@ -1229,6 +1229,17 @@ export interface BeignetNodeEvents {
 		resumed?: boolean;
 	}) => void;
 	/**
+	 * Guardian hosting (issue #699): this node started serving a set; a
+	 * quota refused a registration or a write; a session violated framing
+	 * and was dropped.
+	 */
+	'guardian:set-registered': (data: { detail: string; setId?: string }) => void;
+	'guardian:quota-refused': (data: { detail: string; setId?: string }) => void;
+	'guardian:session-violation': (data: {
+		detail: string;
+		peer?: string;
+	}) => void;
+	/**
 	 * JIT receive, LSP side (issue #669). Relayed JSON-safe: every satoshi and
 	 * millisatoshi figure is a decimal string. `jit:intent` is a wallet's
 	 * accepted request, keyed by the intercept scid the LSP minted for it;
