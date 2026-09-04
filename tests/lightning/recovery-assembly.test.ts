@@ -232,7 +232,10 @@ describe('Recovery assembly: parseGuardianEntry (issue #457)', () => {
 			[{ url: 'https://g.example' }, /object with guardianId and url/],
 			[{ guardianId: VALID_ID }, /object with guardianId and url/],
 			[{ guardianId: 'zz'.repeat(32), url: 'https://g.example' }, /64-hex/],
-			[{ guardianId: VALID_ID, url: 'ftp://g.example' }, /http, https or bolt8/],
+			[
+				{ guardianId: VALID_ID, url: 'ftp://g.example' },
+				/http, https or bolt8/
+			],
 			[
 				{ guardianId: VALID_ID, url: 'https://u:p@g.example' },
 				/credentials in the URL/

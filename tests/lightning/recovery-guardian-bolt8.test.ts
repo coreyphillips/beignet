@@ -598,8 +598,10 @@ describe('bolt8 guardian session end to end', () => {
 
 		const state = await client.getState(ROOT.recoveryId, 0n, 10);
 		expect(state.status).to.equal(GuardianStatus.OK);
-		expect(state.records).to.have.length(1);
-		expect(state.records[0].ciphertext.equals(first.ciphertext)).to.equal(true);
+		expect(state.records!).to.have.length(1);
+		expect(state.records![0].ciphertext.equals(first.ciphertext)).to.equal(
+			true
+		);
 
 		// The whole exchange rode ONE session, as a stranger.
 		expect(host.sessions).to.have.length(1);
@@ -656,7 +658,7 @@ describe('bolt8 guardian session end to end', () => {
 		expect(put.status).to.equal(GuardianStatus.OK);
 		const state = await client.getState(ROOT.recoveryId, 0n, 10);
 		expect(state.status).to.equal(GuardianStatus.OK);
-		expect(state.records[0].ciphertext.equals(ciphertext)).to.equal(true);
+		expect(state.records![0].ciphertext.equals(ciphertext)).to.equal(true);
 	});
 
 	it('overlaps requests on one session', async () => {
