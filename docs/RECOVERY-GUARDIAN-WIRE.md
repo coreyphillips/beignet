@@ -165,6 +165,67 @@ There is no implicit creation: an unknown namespace is never claimable by
 whoever asks first with a self-chosen key, because registration demands
 the recovery root signature.
 
+### 2.7 bolt8
+
+A guardian hosted IN a beignet node, reached over a dedicated BOLT 8
+session to the node's ordinary peer address (issue #699; the "later
+optional adapter" spec 12.1 item 1 reserved). Descriptor transport type
+`bolt8`, URL `bolt8://<66-hex compressed node id>@<host>:<port>`, guardian
+entry `<64-hex guardian id>@bolt8://<node id>@host:port`. The node id is
+the key BOLT 8 authenticates the server by; it is NOT a credential and the
+`auth` member of the descriptor still carries one when the host requires
+it. Nothing signed changes: the same section 4 transcripts and section 6
+protobuf bodies ride this transport unchanged.
+
+Session rules:
+
+- The writer opens the session under a FRESH random static key, never its
+  node identity key. The guardian sees a stranger, which preserves 1.1
+  (recovery_id stays unlinkable to the Lightning node id) and keeps
+  guardian traffic structurally off any channel connection. Sessions are
+  long-lived; several verbs may be in flight at once.
+- Transport security: BOLT 8 supplies encryption and server authentication
+  on every network, so a bolt8 endpoint needs no approval on a LAN or
+  clearnet (the property local-http lacks). An onion host needs a Tor
+  proxy. Endpoint selection ranks bolt8 after onion-http and https and
+  before local-http.
+- Transport authentication (section 9): the request carries the
+  Authorization value verbatim in its `auth` field; a host configured with
+  a bearer token compares it in constant time. Running open is acceptable
+  for this transport because confidentiality does not depend on the
+  credential; it is an allow-list and anti-DoS.
+
+Framing. Every verb rides the beignet custom message (one odd wire type,
+44069; `[u16 version][u16 subtype][payload]`) on subtypes 32
+GUARDIAN_REQUEST and 33 GUARDIAN_RESPONSE. BOLT 8 caps a message at 65535
+bytes, so a request or response is split into ordered chunks that share a
+request id. Each chunk payload, big-endian, fixed width:
+
+```text
+requestId(4) || verb(1) || totalLength(4) || chunkIndex(2) || chunkCount(2)
+then, on chunk 0 only:
+  request:  authLength(2) || auth        (at most 4096 bytes)
+  response: transportStatus(2)
+then this chunk's body bytes
+```
+
+Verb codes: 0 INFO, 1 REGISTER_NODE, 2 PUT_STATE, 3 GET_HEAD, 4 GET_STATE,
+5 ACQUIRE_EPOCH, 6 SYNC_RECORD, 7 SYNC_EPOCH. The body across chunks is the
+exact protobuf bytes of 2.5. Chunks of one request id arrive in order and
+contiguous per id (the session is one ordered stream); chunks of DIFFERENT
+ids may interleave. A receiver drops the session on any framing violation
+(a chunk out of order, a header that changes mid-message, more partial
+messages than it allows), and answers a declared length over its cap with
+transportStatus 413 once while swallowing that id's remaining chunks, so
+the stream stays usable.
+
+`transportStatus` is the 2.5 HTTP-layer status, one to one: 200 for every
+well-formed protocol exchange INCLUDING protocol-level rejections (the
+result lives in the body's `status` field), 401 refused credential, 404
+unknown verb, 413 body over the advertised limit, 500 guardian failure. A
+host SHOULD advertise a `max_ciphertext_bytes` well under the 16 MiB
+protocol cap (4 MiB matches the guardian-mode snapshot cadence).
+
 ## 3. Cryptography
 
 ### 3.1 Primitives

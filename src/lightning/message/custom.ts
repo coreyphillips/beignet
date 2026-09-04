@@ -31,10 +31,10 @@ export const BEIGNET_CUSTOM_MAX_PAYLOAD = 65_535 - 2 - 4;
 /**
  * Subtype registry. The numbers are RESERVED here ahead of the workstreams
  * that implement them (#532 phases 3 and 4) so no later protocol collides:
- * 1, 2, 4 and 5 belong to JIT receive, 16 to 22 to direct funding. 3
- * (LIQUIDITY_POLICY) and 20 (DIRECT_FUNDING_ABORT) are numbers the LFBW
- * fork declared but never used; they stay reserved and deliberately
- * unimplemented.
+ * 1, 2, 4 and 5 belong to JIT receive, 16 to 22 to direct funding, and 32
+ * to 47 to recovery guardian sessions (issue #699). 3 (LIQUIDITY_POLICY)
+ * and 20 (DIRECT_FUNDING_ABORT) are numbers the LFBW fork declared but
+ * never used; they stay reserved and deliberately unimplemented.
  */
 export enum BeignetCustomSubtype {
 	// ── JIT receive (#532 phase 3) ──
@@ -61,7 +61,13 @@ export enum BeignetCustomSubtype {
 	 *  to a connected peer as {from, t, p} with `from` stamped by the LSP
 	 *  itself, so neither party can spoof the other. Payloads are sealed to
 	 *  the request key; the relay reads nothing. */
-	DIRECT_FUNDING_RELAY = 22
+	DIRECT_FUNDING_RELAY = 22,
+	// ── Recovery guardian sessions (issue #699) ──
+	/** One chunk of a guardian verb request over a bolt8 guardian session
+	 *  (docs/RECOVERY-GUARDIAN-WIRE.md 2.7; recovery/guardian-bolt8.ts). */
+	GUARDIAN_REQUEST = 32,
+	/** One chunk of the guardian's response to a GUARDIAN_REQUEST. */
+	GUARDIAN_RESPONSE = 33
 }
 
 export interface ICustomMessage {

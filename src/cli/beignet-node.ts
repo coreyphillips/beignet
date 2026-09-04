@@ -96,7 +96,8 @@ import {
 	GuardianDescriptor,
 	chainPromisedQuorum,
 	deriveRecoveryMasterKey,
-	PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES
+	PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES,
+	GuardianTransportType
 } from '../lightning/recovery';
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import {
@@ -539,7 +540,7 @@ interface ICapsuleRestoreMarker {
 export interface IReportedGuardian {
 	guardianId: string;
 	transports: Array<{
-		type: 'onion-http' | 'https' | 'local-http';
+		type: GuardianTransportType;
 		url: string;
 	}>;
 }

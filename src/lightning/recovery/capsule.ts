@@ -584,11 +584,23 @@ export type GuardianAuth =
  * decision record, onion-HTTP and clearnet HTTPS both first-class, and a
  * Tor-enabled wallet prefers the onion endpoint.
  */
+/**
+ * The transport profiles a guardian can be reached over (wire section 2).
+ * `bolt8` is a dedicated Lightning-transport session to a beignet node that
+ * hosts the guardian in-process (wire 2.7, issue #699); its URL is
+ * `bolt8://<66-hex node id>@host:port`, the node's ordinary peer address.
+ */
+export type GuardianTransportType =
+	| 'onion-http'
+	| 'https'
+	| 'local-http'
+	| 'bolt8';
+
 export interface GuardianDescriptor {
 	/** Guardian identity pubkey, hex. */
 	guardianId: string;
 	transports: Array<{
-		type: 'onion-http' | 'https' | 'local-http';
+		type: GuardianTransportType;
 		url: string;
 	}>;
 	/**
@@ -686,7 +698,12 @@ function encodeCapsule(capsule: RecoveryCapsule): Buffer {
 	return Buffer.from(JSON.stringify(encoded), 'utf8');
 }
 
-const GUARDIAN_TRANSPORT_TYPES = new Set(['onion-http', 'https', 'local-http']);
+const GUARDIAN_TRANSPORT_TYPES = new Set<string>([
+	'onion-http',
+	'https',
+	'local-http',
+	'bolt8'
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -732,7 +749,7 @@ export function assertGuardianDescriptors(
 					throw new Error(`${where} transport ${i} is malformed`);
 				}
 				return {
-					type: transport.type as GuardianDescriptor['transports'][number]['type'],
+					type: transport.type as GuardianTransportType,
 					url: transport.url
 				};
 			})

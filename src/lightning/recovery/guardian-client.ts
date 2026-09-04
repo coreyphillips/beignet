@@ -14,6 +14,7 @@
 
 import { request as httpRequest } from 'http';
 import { request as httpsRequest } from 'https';
+import * as ecc from '@bitcoinerlab/secp256k1';
 import {
 	GUARDIAN_PROTOCOL_VERSION,
 	GuardianState,
@@ -55,7 +56,11 @@ import {
 	encodeSyncEpochRequest,
 	encodeSyncRecordRequest
 } from './guardian-proto';
-import { GuardianAuth, GuardianDescriptor } from './capsule';
+import {
+	GuardianAuth,
+	GuardianDescriptor,
+	GuardianTransportType
+} from './capsule';
 
 export { GuardianAuth } from './capsule';
 
@@ -151,7 +156,7 @@ export function nodeGuardianTransport(): GuardianHttpTransport {
 
 export interface IGuardianEndpointSelection {
 	url: string;
-	transportType: 'onion-http' | 'https' | 'local-http';
+	transportType: GuardianTransportType;
 }
 
 /** A Tor v3 onion service hostname: 56 base32 characters plus .onion. */
@@ -172,6 +177,87 @@ export function isLoopbackHostname(hostname: string): boolean {
 	return hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
 }
 
+// ─────────────── bolt8 guardian addresses (wire 2.7, issue #699) ───────────────
+
+/** URL scheme of a guardian hosted by a beignet node, reached over BOLT 8. */
+export const GUARDIAN_BOLT8_SCHEME = 'bolt8:';
+
+/** Where a bolt8 guardian session dials: the node's ordinary peer address. */
+export interface IBolt8GuardianTarget {
+	/** 33-byte compressed Lightning node id. */
+	nodeId: Buffer;
+	host: string;
+	port: number;
+	/** The canonical form, `bolt8://<66-hex node id>@host:port`. */
+	url: string;
+}
+
+/**
+ * Parse `bolt8://<66-hex compressed node id>@<host>:<port>`, the guardian
+ * address of a beignet node hosting the reference guardian in-process. The
+ * userinfo position carries the NODE id (the key BOLT 8 authenticates the
+ * server by), never a credential; the transport credential rides in the
+ * descriptor's `auth`, as for every other transport. Throws with a precise
+ * message on anything malformed: a guardian silently dropped would change
+ * the quorum arithmetic.
+ */
+export function parseBolt8GuardianUrl(url: string): IBolt8GuardianTarget {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		throw new Error(`guardian URL "${url}" is not a valid URL`);
+	}
+	if (parsed.protocol !== GUARDIAN_BOLT8_SCHEME) {
+		throw new Error(`guardian URL "${url}" is not a bolt8 URL`);
+	}
+	if (!/^[0-9a-fA-F]{66}$/.test(parsed.username) || parsed.password !== '') {
+		throw new Error(
+			`bolt8 guardian URL "${url}" must carry a 66-hex compressed node id ` +
+				'before the @, and nothing else'
+		);
+	}
+	const nodeId = Buffer.from(parsed.username, 'hex');
+	if (!ecc.isPoint(nodeId)) {
+		throw new Error(
+			`bolt8 guardian node id ${parsed.username} is not a valid ` +
+				'compressed secp256k1 point'
+		);
+	}
+	// Non-special schemes keep the host's case; normalize it (DNS and onion
+	// names are case-insensitive) and strip IPv6 brackets so the target
+	// dials what net.connect expects.
+	const hostname = parsed.hostname.toLowerCase();
+	const host = hostname.replace(/^\[(.*)\]$/, '$1');
+	if (!host) {
+		throw new Error(`bolt8 guardian URL "${url}" has no host`);
+	}
+	if (parsed.port === '') {
+		throw new Error(`bolt8 guardian URL "${url}" has no port`);
+	}
+	const port = Number(parsed.port);
+	if (!Number.isInteger(port) || port < 1 || port > 65535) {
+		throw new Error(`bolt8 guardian URL "${url}" has an invalid port`);
+	}
+	if (parsed.pathname !== '' && parsed.pathname !== '/') {
+		throw new Error(
+			`bolt8 guardian URL "${url}" must not carry a path; the guardian ` +
+				'verbs are addressed inside the session'
+		);
+	}
+	if (parsed.search !== '' || parsed.hash !== '') {
+		throw new Error(
+			`bolt8 guardian URL "${url}" must not carry a query or fragment`
+		);
+	}
+	return {
+		nodeId,
+		host,
+		port,
+		url: `bolt8://${parsed.username.toLowerCase()}@${hostname}:${port}`
+	};
+}
+
 export interface IGuardianEndpointOptions {
 	torEnabled: boolean;
 	/** Permits local-http to LOOPBACK hosts only. */
@@ -190,11 +276,13 @@ export interface IGuardianEndpointOptions {
 /**
  * Selection rule: Tor enabled means the first onion-http endpoint (falling
  * back to https when the guardian advertises no onion one); otherwise the
- * first https endpoint; local-http only when explicitly configured, and
- * then only to loopback or individually approved isolated-network hosts
- * (wire 2.3: a general LAN or clearnet address never qualifies). A
- * descriptor with no usable transport is an error surfaced to the operator,
- * never a silent skip.
+ * first https endpoint; then bolt8, which needs no approval because BOLT 8
+ * supplies transport encryption and server authentication on any network
+ * (an onion host still needs Tor); local-http only when explicitly
+ * configured, and then only to loopback or individually approved
+ * isolated-network hosts (wire 2.3: a general LAN or clearnet address never
+ * qualifies). A descriptor with no usable transport is an error surfaced to
+ * the operator, never a silent skip.
  */
 export function selectGuardianEndpoint(
 	descriptor: GuardianDescriptor,
@@ -203,10 +291,20 @@ export function selectGuardianEndpoint(
 	const localEnabled =
 		options.allowLocalHttp === true || options.allowLocalHttpHost !== undefined;
 	const usable = (
-		type: 'onion-http' | 'https' | 'local-http'
+		type: GuardianTransportType
 	): IGuardianEndpointSelection | null => {
 		for (const transport of descriptor.transports) {
 			if (transport.type !== type) continue;
+			if (type === 'bolt8') {
+				let target: IBolt8GuardianTarget;
+				try {
+					target = parseBolt8GuardianUrl(transport.url);
+				} catch {
+					continue;
+				}
+				if (isOnionV3Hostname(target.host) && !options.torEnabled) continue;
+				return { url: target.url, transportType: type };
+			}
 			let parsed: URL;
 			try {
 				parsed = new URL(transport.url);
@@ -232,9 +330,9 @@ export function selectGuardianEndpoint(
 		}
 		return null;
 	};
-	const order: Array<'onion-http' | 'https' | 'local-http'> = options.torEnabled
-		? ['onion-http', 'https']
-		: ['https'];
+	const order: GuardianTransportType[] = options.torEnabled
+		? ['onion-http', 'https', 'bolt8']
+		: ['https', 'bolt8'];
 	if (localEnabled) order.push('local-http');
 	for (const type of order) {
 		const selected = usable(type);

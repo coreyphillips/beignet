@@ -35,15 +35,18 @@ import {
 	deriveRecoveryRoot
 } from './guardian-wire';
 import {
+	GUARDIAN_BOLT8_SCHEME,
 	GuardianClient,
 	GuardianHttpTransport,
 	IBoundGuardianClient,
 	IGuardianSetContext,
-	isOnionV3Hostname
+	isOnionV3Hostname,
+	parseBolt8GuardianUrl
 } from './guardian-client';
 import {
 	GuardianAuth,
 	GuardianDescriptor,
+	GuardianTransportType,
 	assertGuardianAuth
 } from './capsule';
 import {
@@ -127,18 +130,21 @@ export function parseGuardianEntry(
 /**
  * The capsule descriptor for one configured guardian (spec 5.4). The
  * transport type follows from the URL, which parseGuardianUri already
- * restricted to http(s): https is `https`, an http v3 onion host is
- * `onion-http`, any other http host is `local-http`. That last class is
- * wider than what endpoint selection will dial: a non-loopback local-http
- * descriptor reaches a client only through `allowLocalHttpHost`
- * (guardian-client.ts selectGuardianEndpoint), never by default.
+ * restricted to http(s) or bolt8: a bolt8 URL is `bolt8`, https is `https`,
+ * an http v3 onion host is `onion-http`, any other http host is
+ * `local-http`. That last class is wider than what endpoint selection will
+ * dial: a non-loopback local-http descriptor reaches a client only through
+ * `allowLocalHttpHost` (guardian-client.ts selectGuardianEndpoint), never by
+ * default.
  */
 export function guardianDescriptorFor(
 	parsed: IParsedGuardian
 ): GuardianDescriptor {
 	const url = new URL(parsed.url);
-	const type: GuardianDescriptor['transports'][number]['type'] =
-		url.protocol === 'https:'
+	const type: GuardianTransportType =
+		url.protocol === GUARDIAN_BOLT8_SCHEME
+			? 'bolt8'
+			: url.protocol === 'https:'
 			? 'https'
 			: isOnionV3Hostname(url.hostname)
 			? 'onion-http'
@@ -154,7 +160,10 @@ export function guardianDescriptorFor(
 /**
  * Parse one guardian URI of the form `<64-hex-x-only-pubkey>@<url>`,
  * mirroring the watchtower `pubkey@host:port` convention but with a full
- * URL because guardian transports are HTTP. Throws with a precise message
+ * URL because guardian transports are addressed by URL: `http(s)://` for
+ * the HTTP transports, or `bolt8://<node id>@host:port` for a guardian
+ * hosted by a beignet node (wire 2.7). The split is at the FIRST `@`, so a
+ * bolt8 URL's own `@` stays inside the URL. Throws with a precise message
  * on anything malformed: silently dropping a guardian would change the
  * quorum arithmetic, which is exactly what a configuration surface must
  * never do quietly.
@@ -189,6 +198,11 @@ function parseGuardianParts(idHex: string, url: string): IParsedGuardian {
 			`guardian pubkey ${idHex} is not a valid x-only secp256k1 point`
 		);
 	}
+	if (url.toLowerCase().startsWith(GUARDIAN_BOLT8_SCHEME)) {
+		// The userinfo position carries the node id here, by design; the
+		// credential rule below is for the HTTP transports.
+		return { guardianId, url: parseBolt8GuardianUrl(url).url };
+	}
 	let parsed: URL;
 	try {
 		parsed = new URL(url);
@@ -197,7 +211,7 @@ function parseGuardianParts(idHex: string, url: string): IParsedGuardian {
 	}
 	if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
 		throw new Error(
-			`guardian URL "${url}" must use http or https, not ${parsed.protocol}`
+			`guardian URL "${url}" must use http, https or bolt8, not ${parsed.protocol}`
 		);
 	}
 	// A credential belongs in `auth`, which the capsule encrypts and the

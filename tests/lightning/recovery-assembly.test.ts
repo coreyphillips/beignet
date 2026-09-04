@@ -195,8 +195,8 @@ describe('Recovery assembly: parseGuardianUri', () => {
 			[`${'zz'.repeat(32)}@https://g.example`, /64-hex-character/],
 			[`${'00'.repeat(32)}@https://g.example`, /not a valid x-only/],
 			[`${VALID_ID}@not a url`, /not a valid URL/],
-			[`${VALID_ID}@ftp://g.example`, /must use http or https/],
-			[`${VALID_ID}@ws://g.example`, /must use http or https/],
+			[`${VALID_ID}@ftp://g.example`, /must use http, https or bolt8/],
+			[`${VALID_ID}@ws://g.example`, /must use http, https or bolt8/],
 			// A credential in the URL would ride into every status report
 			// and log line naming the endpoint; auth is the only place for it.
 			[`${VALID_ID}@https://alice:secret@g.example`, /credentials in the URL/],
@@ -232,7 +232,7 @@ describe('Recovery assembly: parseGuardianEntry (issue #457)', () => {
 			[{ url: 'https://g.example' }, /object with guardianId and url/],
 			[{ guardianId: VALID_ID }, /object with guardianId and url/],
 			[{ guardianId: 'zz'.repeat(32), url: 'https://g.example' }, /64-hex/],
-			[{ guardianId: VALID_ID, url: 'ftp://g.example' }, /http or https/],
+			[{ guardianId: VALID_ID, url: 'ftp://g.example' }, /http, https or bolt8/],
 			[
 				{ guardianId: VALID_ID, url: 'https://u:p@g.example' },
 				/credentials in the URL/

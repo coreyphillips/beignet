@@ -1736,7 +1736,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_EAGER_GOSSIP_VERIFY` | `true` to verify foreign gossip signatures at intake instead of lazily at serve time (default: lazy; exact `true`/`false`, anything else is ignored) |
 | `BEIGNET_LOG_LEVEL` | Daemon stderr log level: `debug`, `info`, `warn`, `error`, `silent` (default: silent) |
 | `BEIGNET_RECOVERY_MODE` | Recovery Protocol mode: `off`, `peer-storage`, `async-remote`, `quorum` (default: off; unknown values fall back to off) |
-| `BEIGNET_RECOVERY_GUARDIANS` | Guardian set for async-remote/quorum, comma-separated `<64-hex-x-only-pubkey>@<http(s) url>` (crash-v1: exactly three; malformed entries refuse startup) |
+| `BEIGNET_RECOVERY_GUARDIANS` | Guardian set for async-remote/quorum, comma-separated `<64-hex-x-only-pubkey>@<url>` where the URL is `http(s)://...` for an HTTP guardian or `bolt8://<66-hex node id>@host:port` for a guardian hosted by a beignet node (crash-v1: exactly three; malformed entries refuse startup) |
 | `BEIGNET_RECOVERY_PROFILE` | Recovery fault-model profile; `crash-v1` is the only accepted value and the default |
 | `BEIGNET_RECOVERY_LEASE_CHECK_MS` | Guardian modes: idle writer lease re-check cadence in ms, an integer in 0..2147483647 (default: 300000; 0 disables; anything else refuses startup) |
 | `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS` | peer-storage mode: how long an unknown channel's `channel_reestablish` is held before the BOLT 1 error goes out, an integer in 0..2147483647 (default: 600000; 0 answers immediately; anything else refuses startup) |
