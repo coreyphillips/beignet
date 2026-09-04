@@ -128,6 +128,44 @@ interface IWaiter {
 	sequence: bigint;
 	resolve: (outcome: BarrierOutcome) => void;
 	timer: ReturnType<typeof setTimeout>;
+	/** When the wait began, for the latency record. */
+	startedAt: number;
+}
+
+/**
+ * What the barrier has cost so far, for the status surface (issue #702).
+ *
+ * Only waits that actually PARKED a batch are counted: a frame already below
+ * the watermark releases on the synchronous path and costs nothing. The
+ * percentiles are over the most recent `sampled` released waits, so a node
+ * that has run for a week reports the guardians it has now rather than the
+ * ones it had on Monday. A refused wait (timeout, fence, stop) counts under
+ * `refused` and contributes no sample, since its duration says how long the
+ * timeout is, not how far the guardians are.
+ */
+export interface IBarrierLatency {
+	/** Waits that parked a batch and were released by a receipt. */
+	released: number;
+	/** Waits that ended in a refusal. */
+	refused: number;
+	/** Released waits behind the percentiles below. */
+	sampled: number;
+	/** The most recent released wait. */
+	lastMs: number | null;
+	meanMs: number | null;
+	p50Ms: number | null;
+	p95Ms: number | null;
+	maxMs: number | null;
+}
+
+const LATENCY_WINDOW = 256;
+
+function percentile(sorted: number[], fraction: number): number {
+	const index = Math.min(
+		sorted.length - 1,
+		Math.max(0, Math.ceil(sorted.length * fraction) - 1)
+	);
+	return sorted[index];
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -141,6 +179,11 @@ export class DurabilityBarrier {
 	/** Highest sequence a quorum has provably stored. Seeded from disk. */
 	private durableThrough: bigint | null = null;
 	private waiters: IWaiter[] = [];
+	/** Released waits, most recent last, capped at LATENCY_WINDOW. */
+	private samples: number[] = [];
+	private releasedCount = 0;
+	private refusedCount = 0;
+	private lastWaitMs: number | null = null;
 	/** A pass is running; further kicks coalesce into the pass after it. */
 	private pumping = false;
 	private kicked = false;
@@ -311,8 +354,10 @@ export class DurabilityBarrier {
 			const waiter: IWaiter = {
 				sequence,
 				resolve,
+				startedAt: Date.now(),
 				timer: setTimeout(() => {
 					this.waiters = this.waiters.filter((entry) => entry !== waiter);
+					this.refusedCount += 1;
 					this.emit({
 						type: 'barrier:timeout',
 						detail:
@@ -382,12 +427,14 @@ export class DurabilityBarrier {
 		waiting: number;
 		fenced: boolean;
 		backfillLost: boolean;
+		latency: IBarrierLatency;
 	} {
 		return {
 			durability: this.config.durability,
 			durableThrough: this.watermark(),
 			waiting: this.waiters.length,
 			fenced: this.fenced,
+			latency: this.latency(),
 			// Beside `fenced`, never folded into it. They are different facts
 			// with different remedies: a fence means another device owns this
 			// namespace, and this means nobody can advance it again.
@@ -395,7 +442,40 @@ export class DurabilityBarrier {
 		};
 	}
 
+	/**
+	 * What the barrier has cost so far (issue #702): the waits that parked
+	 * a batch, how they ended, and the distribution of the released ones
+	 * over the most recent LATENCY_WINDOW. This is the number the funds-only
+	 * barrier question is to be decided on, measured on the node that would
+	 * pay it rather than guessed.
+	 */
+	latency(): IBarrierLatency {
+		const sorted = [...this.samples].sort((a, b) => a - b);
+		const none = sorted.length === 0;
+		return {
+			released: this.releasedCount,
+			refused: this.refusedCount,
+			sampled: sorted.length,
+			lastMs: this.lastWaitMs,
+			meanMs: none
+				? null
+				: Math.round(sorted.reduce((a, b) => a + b, 0) / sorted.length),
+			p50Ms: none ? null : percentile(sorted, 0.5),
+			p95Ms: none ? null : percentile(sorted, 0.95),
+			maxMs: none ? null : sorted[sorted.length - 1]
+		};
+	}
+
 	// ─────────────── internals ───────────────
+
+	private recordReleased(waitMs: number): void {
+		this.releasedCount += 1;
+		this.lastWaitMs = waitMs;
+		this.samples.push(waitMs);
+		if (this.samples.length > LATENCY_WINDOW) {
+			this.samples.splice(0, this.samples.length - LATENCY_WINDOW);
+		}
+	}
 
 	/** Clear a pending retry AND release the frame awaiting it. */
 	private cancelRetry(): void {
@@ -415,6 +495,7 @@ export class DurabilityBarrier {
 	private settleAll(outcome: BarrierOutcome): void {
 		const waiting = this.waiters;
 		this.waiters = [];
+		if (!outcome.released) this.refusedCount += waiting.length;
 		for (const waiter of waiting) {
 			clearTimeout(waiter.timer);
 			waiter.resolve(outcome);
@@ -437,8 +518,10 @@ export class DurabilityBarrier {
 			(waiter.sequence <= through ? released : held).push(waiter);
 		}
 		this.waiters = held;
+		const now = Date.now();
 		for (const waiter of released) {
 			clearTimeout(waiter.timer);
+			this.recordReleased(Math.max(0, now - waiter.startedAt));
 			waiter.resolve({ released: true, reason: 'durable' });
 		}
 		this.emit({
