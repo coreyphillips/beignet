@@ -127,6 +127,50 @@ function createNode(
 }
 
 /**
+ * Async receive is an opt-in service (issue #709): the receiver registers
+ * with an LSP that advertises it. Without a peer manager the LSP's feature
+ * set reaches the receiver's graph as a verified node_announcement over the
+ * channel they share, then the registration exchange runs over the wire.
+ */
+async function registerAsyncReceive(
+	receiver: LightningNode,
+	lsp: LightningNode,
+	scid: Buffer
+): Promise<void> {
+	const lspId = Buffer.from(lsp.getNodeId(), 'hex');
+	const receiverId = Buffer.from(receiver.getNodeId(), 'hex');
+	const lspIs1 = Buffer.compare(lspId, receiverId) < 0;
+	receiver.getGraph().addChannelAnnouncement({
+		nodeSignature1: Buffer.alloc(64),
+		nodeSignature2: Buffer.alloc(64),
+		bitcoinSignature1: Buffer.alloc(64),
+		bitcoinSignature2: Buffer.alloc(64),
+		features: Buffer.alloc(0),
+		chainHash: REGTEST_CHAIN_HASH,
+		shortChannelId: scid,
+		nodeId1: lspIs1 ? lspId : receiverId,
+		nodeId2: lspIs1 ? receiverId : lspId,
+		bitcoinKey1: Buffer.alloc(33, 2),
+		bitcoinKey2: Buffer.alloc(33, 3)
+	});
+	receiver.getGraph().applyNodeAnnouncement(
+		{
+			signature: Buffer.alloc(64),
+			features: lsp.getLocalFeatures().toBuffer(),
+			timestamp: Math.floor(Date.now() / 1000),
+			nodeId: lspId,
+			rgbColor: Buffer.alloc(3),
+			alias: Buffer.alloc(32),
+			addresses: []
+		},
+		{ verified: true }
+	);
+	await receiver.requestAsyncReceiveGrant(lsp.getNodeId(), {
+		timeoutMs: 5_000
+	});
+}
+
+/**
  * Wire two nodes so outbound messages from one are delivered to the other.
  */
 function connectNodes(nodeA: LightningNode, nodeB: LightningNode): void {
@@ -1667,9 +1711,11 @@ describe('Lightning Node', function () {
 	});
 
 	describe('Async Payments (M2.2)', function () {
-		it('LSP holds the forward until the receiver signs a release, then the receiver is paid', function () {
+		it('LSP holds the forward until the receiver signs a release, then the receiver is paid', async function () {
 			const alice = createNode(1); // sender
-			const lsp = createNode(2); // always-online LSP / introduction node
+			// Always-online LSP / introduction node, running the async receive
+			// service (issue #709).
+			const lsp = createNode(2, { asyncReceiveService: { enabled: true } });
 			// Receiver with auto-release OFF, so the hold is observable and the
 			// release is driven explicitly from the notice.
 			const carol = createNode(3, { autoReleaseHeldForwards: false });
@@ -1698,6 +1744,7 @@ describe('Lightning Node', function () {
 				.getFullState().shortChannelId = scidBC;
 
 			buildThreeNodeGraph(alice, lsp, carol, scidAB, scidBC);
+			await registerAsyncReceive(carol, lsp, scidBC);
 
 			// Carol issues an async invoice: blinded path through the LSP, marked
 			// hold_htlc so the LSP parks the HTLC while she is offline.
@@ -1758,9 +1805,9 @@ describe('Lightning Node', function () {
 			);
 		});
 
-		it('a receiver auto-releases from the notice and the payment completes end to end', function () {
+		it('a receiver auto-releases from the notice and the payment completes end to end', async function () {
 			const alice = createNode(1);
-			const lsp = createNode(2);
+			const lsp = createNode(2, { asyncReceiveService: { enabled: true } });
 			const carol = createNode(3);
 
 			connectNodes(alice, lsp);
@@ -1785,6 +1832,7 @@ describe('Lightning Node', function () {
 				.getChannel(bcChannelId)!
 				.getFullState().shortChannelId = scidBC;
 			buildThreeNodeGraph(alice, lsp, carol, scidAB, scidBC);
+			await registerAsyncReceive(carol, lsp, scidBC);
 
 			const invoice = carol.createInvoice({
 				amountMsat: 5_000_000n,

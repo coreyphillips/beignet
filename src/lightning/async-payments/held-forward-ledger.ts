@@ -74,6 +74,20 @@ export interface IHeldForwardRecord extends ILedgerRecord {
 	incomingCltvExpiry: number;
 	cutoffHeight: number;
 	createdAt: number;
+	/**
+	 * Service admission (issue #709), stamped when the row is written so the
+	 * reservation it represents survives a restart with the row:
+	 * `admittedHeight` is the height the window was judged at, `heldBytes`
+	 * the bytes the hold reserves against the byte limits, and the two fees
+	 * are the price fixed at admission (the admission fee is spent whatever
+	 * happens next; the holding fee is what the sender paid for the window
+	 * and the LSP keeps at release). Absent on a hold parked before the
+	 * service existed.
+	 */
+	admittedHeight?: number;
+	heldBytes?: number;
+	admissionFeeMsat?: string;
+	holdingFeeMsat?: string;
 	/** Nonce of the capability that moved the record to RELEASING. */
 	releaseNonceHex?: string;
 	/** Why the record left HELD/RELEASING for the fail path. */
@@ -120,6 +134,15 @@ export function isUnresolvedHeldForward(state: HeldForwardState): boolean {
 }
 
 export type HeldForwardTransition = ILedgerTransitionResult<IHeldForwardRecord>;
+
+/** Aggregate reservation of a set of unresolved holds. */
+export interface IHeldForwardOccupancy {
+	count: number;
+	valueMsat: bigint;
+	bytes: number;
+	/** createdAt of the oldest unresolved hold, or null when there is none. */
+	oldestAt: number | null;
+}
 
 export class HeldForwardLedger {
 	private readonly ledger: DurableLedger<IHeldForwardRecord>;
@@ -171,6 +194,30 @@ export class HeldForwardLedger {
 				r.receiverNodeIdHex === receiverNodeIdHex &&
 				isUnresolvedHeldForward(r.state)
 		);
+	}
+
+	/** Every record (any state) parked under one registration. */
+	forRegistration(registrationIdHex: string): IHeldForwardRecord[] {
+		return this.ledger.find((r) => r.registrationIdHex === registrationIdHex);
+	}
+
+	/**
+	 * What the unresolved holds in `records` currently reserve: the figures
+	 * every admission limit is judged against (issue #709).
+	 */
+	static occupancy(records: IHeldForwardRecord[]): IHeldForwardOccupancy {
+		let count = 0;
+		let valueMsat = 0n;
+		let bytes = 0;
+		let oldestAt: number | null = null;
+		for (const r of records) {
+			if (!isUnresolvedHeldForward(r.state)) continue;
+			count++;
+			valueMsat += BigInt(r.incomingAmountMsat);
+			bytes += r.heldBytes ?? 0;
+			if (oldestAt === null || r.createdAt < oldestAt) oldestAt = r.createdAt;
+		}
+		return { count, valueMsat, bytes, oldestAt };
 	}
 
 	/**

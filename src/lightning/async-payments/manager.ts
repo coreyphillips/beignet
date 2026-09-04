@@ -68,7 +68,23 @@ export interface IAsyncPaymentManagerDeps {
 	incomingUnresolved: (record: IHeldForwardRecord) => boolean;
 	/** Unix milliseconds; injectable for expiry tests. */
 	now?: () => number;
+	/**
+	 * Receiver role (issue #709): the registration id this node holds a
+	 * grant for at the given LSP, or undefined when it has none. Falls back
+	 * to the derived placeholder id when absent (pre-#709 LSPs).
+	 */
+	registrationIdFor?: (lspNodeIdHex: string) => Buffer | undefined;
 }
+
+/** How registerHold judges a NEW hold before writing its row (issue #709). */
+export type HoldAdmissionJudge = () =>
+	| { ok: true; patch?: Partial<IHeldForwardRecord> }
+	| { ok: false; reason: string };
+
+export type RegisterHoldOutcome =
+	| { record: IHeldForwardRecord; created: boolean }
+	| { refused: string }
+	| { storageFailed: true };
 
 export type ReleaseRefusalReason =
 	| 'not_rehydrated'
@@ -159,25 +175,41 @@ export class AsyncPaymentManager extends EventEmitter {
 	 */
 	registerHold(
 		fields: Parameters<HeldForwardLedger['register']>[0],
-		driver: IHeldForwardDriver
-	): IHeldForwardRecord | null {
-		const result = this.ledger.register(fields);
-		if (!result) return null;
+		driver: IHeldForwardDriver,
+		judge?: HoldAdmissionJudge
+	): RegisterHoldOutcome {
+		// An inbound HTLC that already has a row is a redispatch: its
+		// resources were reserved when the row was written, so admission is
+		// not judged again (a restart must never refuse what it still owes).
+		const existing = this.ledger.byIncoming(
+			fields.inChannelIdHex,
+			BigInt(fields.inHtlcId)
+		);
+		let toRegister = fields;
+		if (!existing && judge) {
+			// Verdict and durable write in one synchronous step: nothing can
+			// interleave a second admission between them.
+			const verdict = judge();
+			if (!verdict.ok) return { refused: verdict.reason };
+			if (verdict.patch) toRegister = { ...fields, ...verdict.patch };
+		}
+		const result = this.ledger.register(toRegister);
+		if (!result) return { storageFailed: true };
 		const { record, created } = result;
 		if (!created && record.state !== 'HELD') {
 			if (record.state === 'RELEASED' || record.state === 'FAILED') {
 				// Terminal already: nothing to arm. The caller decides what a
 				// redispatch of a resolved hold means (it should not happen:
 				// a resolved inbound HTLC is not redispatched).
-				return record;
+				return { record, created };
 			}
 			this.drivers.set(record.id, driver);
 			this.driveHold(record.id);
-			return this.ledger.get(record.id) ?? record;
+			return { record: this.ledger.get(record.id) ?? record, created };
 		}
 		this.drivers.set(record.id, driver);
 		if (created) this.emit('held', record);
-		return record;
+		return { record, created };
 	}
 
 	/**
@@ -461,6 +493,7 @@ export class AsyncPaymentManager extends EventEmitter {
 				lspNodeId,
 				registrationId:
 					options?.registrationId ??
+					this.deps.registrationIdFor?.(lspNodeId.toString('hex')) ??
 					deriveHoldRegistrationId(this.deps.nodeId, lspNodeId),
 				amountMsat,
 				expiresAt: BigInt(
