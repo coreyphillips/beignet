@@ -1410,9 +1410,7 @@ describe('Production Hardening 11', function () {
 				const left = storage.loadAllGossipChannels();
 				expect(left.length).to.equal(1);
 				expect(left[0].shortChannelId.toString('hex')).to.equal(scids[1]);
-				const reported = errors.filter(
-					(e) => e.code === 'PERSISTENCE_ERROR'
-				);
+				const reported = errors.filter((e) => e.code === 'PERSISTENCE_ERROR');
 				expect(reported.length).to.equal(1);
 				expect(reported[0].message).to.contain('pruneStaleGossip');
 				expect(reported[0].message).to.contain('1 of 3');
