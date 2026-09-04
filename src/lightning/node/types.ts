@@ -862,6 +862,15 @@ export interface ICreateInvoiceOptions {
 	 * (offline) node comes back and releases it. Requires `useBlindedPaths`.
 	 */
 	asyncHold?: boolean;
+	/**
+	 * FFOR Variant D voucher invoice (specs/ffor-offline-receive.md sections
+	 * 7.3, 7.6): `paymentHash` is the voucher's H_k whose preimage the
+	 * settlement peer holds, the invoice is not a hold invoice, and only the
+	 * caller's `extraRoutingHints` are emitted (the hint carrying S's fee
+	 * terms), never hints built from our own channels. Set by
+	 * createFforVoucherInvoice.
+	 */
+	fforVoucher?: boolean;
 }
 
 export interface IChannelInfo {
