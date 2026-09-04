@@ -21,8 +21,13 @@ import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
 import { BeignetError } from '../../src/cli/errors';
 import {
 	GuardianClient,
-	bolt8GuardianTransport
+	bolt8GuardianTransport,
+	decodeRecoveryCapsuleBlob
 } from '../../src/lightning/recovery';
+import {
+	LnCoinType,
+	deriveLightningKeysFromMnemonic
+} from '../../src/lightning/keys/wallet-keys';
 
 const MNEMONICS = [
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
@@ -201,9 +206,20 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 	const hosts: Array<IHost | null> = [];
 	let wallet: IStartedDaemon | null = null;
 	let walletDir: string | null = null;
+	let pinned: string[] = [];
+	let restored: IStartedDaemon | null = null;
+	let restoredDir: string | null = null;
 
 	after(async function (): Promise<void> {
 		this.timeout(60_000);
+		if (restored) {
+			try {
+				await restored.stop();
+			} catch {
+				// Already stopped.
+			}
+		}
+		if (restoredDir) fs.rmSync(restoredDir, { recursive: true, force: true });
 		if (wallet) {
 			try {
 				await wallet.stop();
@@ -286,12 +302,14 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 
 		// The wallet pins the three and boots in quorum mode over bolt8.
 		walletDir = tmpDir('wallet');
+		pinned = entries;
 		wallet = await startDaemon({
 			...OFFLINE,
 			mnemonic: MNEMONICS[3],
 			dataDir: walletDir,
 			recoveryMode: 'quorum',
-			recoveryGuardians: entries
+			recoveryGuardians: entries,
+			recoveryLeaseCheckIntervalMs: 200
 		});
 		const walletPort = portOf(wallet);
 		const status = await request(walletPort, 'GET', '/recovery/status');
@@ -372,6 +390,114 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 		const listed =
 			(peersOnA.body.result as Array<{ pubkey: string }> | undefined) ?? [];
 		expect(listed.some((p) => p.pubkey === walletNodeId)).to.equal(false);
+	});
+	it('restores the same seed on a fresh device through the node-hosted guardians and fences the old one', async function (): Promise<void> {
+		this.timeout(180_000);
+		expect(wallet, 'the previous test booted the wallet').to.not.equal(null);
+		const walletPort = portOf(wallet!);
+
+		// The capsule the wallet pushes to storage peers names the three hosts
+		// as bolt8 locators (spec 5.4): a seed restore with no configuration
+		// would read them back from a peer.
+		const nodeSecret = deriveLightningKeysFromMnemonic(
+			MNEMONICS[3],
+			undefined,
+			LnCoinType.REGTEST
+		).nodePrivateKey;
+		const blob = (
+			wallet!.node.getNode() as unknown as { ourPeerStorageBlob: Buffer | null }
+		).ourPeerStorageBlob;
+		expect(blob, 'a guardian-mode node composes a capsule').to.not.equal(null);
+		const capsule = decodeRecoveryCapsuleBlob(blob!, nodeSecret);
+		expect(capsule).to.not.equal(null);
+		expect(capsule!.guardians.map((g) => g.transports[0].type)).to.deep.equal([
+			'bolt8',
+			'bolt8',
+			'bolt8'
+		]);
+		expect(
+			capsule!.guardians
+				.map((g) => `${g.guardianId}@${g.transports[0].url}`)
+				.sort()
+		).to.deep.equal([...pinned].sort());
+
+		// Device B: same seed, empty database, the same three entries. The
+		// hosts hold the namespace, so it boots restore-pending.
+		restoredDir = tmpDir('restored');
+		restored = await startDaemon({
+			...OFFLINE,
+			mnemonic: MNEMONICS[3],
+			dataDir: restoredDir,
+			recoveryMode: 'quorum',
+			recoveryGuardians: pinned
+		});
+		const portB = portOf(restored);
+		const held = await request(portB, 'GET', '/info');
+		expect(held.status).to.equal(503);
+		expect((held.body.error as { code: string }).code).to.equal(
+			'NODE_RESTORE_PENDING'
+		);
+		const pending = await request(portB, 'GET', '/recovery/status');
+		expect((pending.body.result as { state: string }).state).to.equal(
+			'restore-required'
+		);
+
+		const fencedOnA: unknown[] = [];
+		wallet!.node.on('recovery:fenced', (data) => fencedOnA.push(data));
+		const progress: string[] = [];
+		restored.node.on('recovery:restore-progress', (data) =>
+			progress.push((data as { type: string }).type)
+		);
+
+		const outcome = await request(portB, 'POST', '/recovery/restore', {
+			confirm: true
+		});
+		expect(outcome.body.ok, JSON.stringify(outcome.body)).to.equal(true);
+		const report = outcome.body.result as {
+			framesApplied: number;
+			epoch: string;
+		};
+		expect(report.framesApplied).to.be.at.least(1);
+		expect(report.epoch).to.equal('2');
+		expect(progress).to.include('epoch:acquired');
+		expect(progress).to.include('restore:complete');
+		expect((await request(portB, 'GET', '/info')).status).to.equal(200);
+		await waitFor(async () => {
+			const s = await request(portB, 'GET', '/recovery/status');
+			return (
+				(s.body.result as { node: { gate: string } | null }).node?.gate ===
+				'confirmed'
+			);
+		});
+
+		// The takeover fenced the old device through the same hosts.
+		await waitFor(async () => {
+			const s = await request(walletPort, 'GET', '/recovery/status');
+			const result = s.body.result as {
+				state: string;
+				node: { fenced: boolean } | null;
+			};
+			return (
+				result.state === 'fenced' ||
+				result.node?.fenced === true ||
+				fencedOnA.length > 0
+			);
+		}, 60_000);
+
+		// Every host now holds the takeover: the set is still one set, with
+		// one namespace, at epoch 2.
+		for (const host of hosts as IHost[]) {
+			const served = await request(
+				portOf(host.daemon),
+				'GET',
+				'/guardian/status'
+			);
+			const result = served.body.result as {
+				sets: Array<{ namespaces: number }>;
+			};
+			expect(result.sets).to.have.length(1);
+			expect(result.sets[0].namespaces).to.equal(1);
+		}
 	});
 });
 
