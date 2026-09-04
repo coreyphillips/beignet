@@ -268,6 +268,7 @@ import {
 	IForwardingEventFilter,
 	IForwardingSummary
 } from '../storage/types';
+import { withStorageTransaction } from '../storage/transaction';
 import {
 	RecoveryManager,
 	RecoveryCriticality,
@@ -2409,6 +2410,12 @@ export class LightningNode extends EventEmitter {
 		// their endpoints in this set; those node rows are cleaned one boot
 		// later, once their channel rows are gone.
 		const diskChannelEndpoints = new Set<string>();
+		// Every row the two loops below condemn, deleted together at the end.
+		// One at a time is the same fsync storm as the hourly prune (see
+		// batchStorageDeletes), and it runs before the daemon can listen, so
+		// it surfaces as a node that takes minutes to start rather than as a
+		// node that stalls.
+		const staleRowDeletes: Array<() => void> = [];
 		for (const channel of this.storage.loadAllGossipChannels()) {
 			const ts1 =
 				channel.update1 &&
@@ -2423,9 +2430,8 @@ export class LightningNode extends EventEmitter {
 			if (Math.max(ts1, ts2) < gossipRestoreCutoff) {
 				if (typeof this.storage.deleteGossipChannel === 'function') {
 					const scidHex = channel.shortChannelId.toString('hex');
-					this.safeStorage(
-						() => this.storage!.deleteGossipChannel!(scidHex),
-						'deleteGossipChannel'
+					staleRowDeletes.push(() =>
+						this.storage!.deleteGossipChannel!(scidHex)
 					);
 				}
 				continue;
@@ -2451,15 +2457,18 @@ export class LightningNode extends EventEmitter {
 					!diskChannelEndpoints.has(nodeIdHex) &&
 					typeof this.storage.deleteGossipNode === 'function'
 				) {
-					this.safeStorage(
-						() => this.storage!.deleteGossipNode!(nodeIdHex),
-						'deleteGossipNode'
+					staleRowDeletes.push(() =>
+						this.storage!.deleteGossipNode!(nodeIdHex)
 					);
 				}
 				continue;
 			}
 			this.graph.restoreNode(node);
 		}
+		// gossip_nodes carries no foreign key to gossip_channels, so holding
+		// the channel deletes back until here cannot change what the node
+		// loop above saw on disk.
+		this.batchStorageDeletes(staleRowDeletes, 'gossipRestoreCleanup');
 
 		// Prune stale gossip immediately on restore (BOLT 7: >2 weeks = stale)
 		this.pruneStaleGossipWithStorage();
@@ -3106,6 +3115,56 @@ export class LightningNode extends EventEmitter {
 				timestamp: Date.now()
 			} as ILightningError);
 			return false;
+		}
+	}
+
+	/**
+	 * Run a batch of best-effort storage deletes as ONE transaction.
+	 *
+	 * Each delete used to commit on its own, and the SQLite backend opens
+	 * `journal_mode = WAL` with `synchronous = FULL`, so every row cost a
+	 * separate fsync on the daemon's only thread. Deleting a mainnet-sized
+	 * graph's worth of stale rows that way blocks the event loop for as long
+	 * as the disk takes: /health goes silent, and peers pass their BOLT 1
+	 * ping timeout and drop the connection. One transaction is one fsync.
+	 *
+	 * The deletes stay best-effort. A row that throws is counted and skipped
+	 * rather than rolling the batch back, and a backend whose transaction
+	 * will not open falls back to the plain loop. Deleting by primary key is
+	 * idempotent, so that fallback cannot double-delete anything.
+	 */
+	private batchStorageDeletes(
+		deletes: Array<() => void>,
+		operation: string
+	): void {
+		if (!this.storage || deletes.length === 0) return;
+		let failed = 0;
+		let lastError = '';
+		const run = (): void => {
+			failed = 0;
+			for (const del of deletes) {
+				try {
+					del();
+				} catch (err) {
+					failed++;
+					lastError = (err as Error).message;
+				}
+			}
+		};
+		try {
+			withStorageTransaction(this.storage, run);
+		} catch (err) {
+			// The backend refused or failed the transaction itself; the rows
+			// still deserve the best-effort pass they used to get.
+			lastError = (err as Error).message;
+			run();
+		}
+		if (failed > 0) {
+			this.emit('node:error', {
+				code: 'PERSISTENCE_ERROR',
+				message: `${operation}: ${failed} of ${deletes.length} deletes failed (${lastError})`,
+				timestamp: Date.now()
+			} as ILightningError);
 		}
 	}
 
@@ -21699,18 +21758,20 @@ export class LightningNode extends EventEmitter {
 		// Prune from in-memory graph
 		this.graph.pruneStaleChannels(now);
 
-		// Delete from storage
+		// Delete from storage, in one transaction rather than one per row.
+		// This runs hourly against the whole graph, and a bare loop fsyncs
+		// once per channel with the daemon's only thread held (see
+		// batchStorageDeletes).
 		if (
 			this.storage &&
 			typeof this.storage.deleteGossipChannel === 'function'
 		) {
-			for (const scidHex of staleScids) {
-				try {
-					this.storage.deleteGossipChannel!(scidHex);
-				} catch {
-					// best-effort
-				}
-			}
+			this.batchStorageDeletes(
+				staleScids.map(
+					(scidHex) => () => this.storage!.deleteGossipChannel!(scidHex)
+				),
+				'pruneStaleGossip'
+			);
 		}
 	}
 

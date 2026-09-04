@@ -1275,6 +1275,171 @@ describe('Production Hardening 11', function () {
 				node.destroy();
 				fs.rmSync(tmpDir, { recursive: true, force: true });
 			});
+
+			// One stale channel present in BOTH the graph and storage, which
+			// is what the prune needs in order to condemn a row. Seeded after
+			// boot so the restore-time filter cannot have taken it first.
+			const seedStaleChannel = (
+				storage: SqliteStorage,
+				node: LightningNode,
+				scidHex: string,
+				staleTs: number
+			): void => {
+				const scid = Buffer.from(scidHex, 'hex');
+				const nodeKey1 = Buffer.alloc(33, 1);
+				const nodeKey2 = Buffer.alloc(33, 2);
+				storage.saveGossipChannel(scidHex, {
+					shortChannelId: scid,
+					nodeId1: nodeKey1,
+					nodeId2: nodeKey2,
+					features: Buffer.alloc(0),
+					announcement: {} as any,
+					update1: null as any,
+					update2: null as any
+				});
+				(node as any).graph.addChannelAnnouncement({
+					nodeSignature1: Buffer.alloc(64),
+					nodeSignature2: Buffer.alloc(64),
+					bitcoinSignature1: Buffer.alloc(64),
+					bitcoinSignature2: Buffer.alloc(64),
+					features: Buffer.alloc(0),
+					chainHash: REGTEST_CHAIN_HASH,
+					shortChannelId: scid,
+					nodeId1: nodeKey1,
+					nodeId2: nodeKey2,
+					bitcoinKey1: nodeKey1,
+					bitcoinKey2: nodeKey2
+				});
+				(node as any).graph.applyChannelUpdate({
+					signature: Buffer.alloc(64),
+					chainHash: REGTEST_CHAIN_HASH,
+					shortChannelId: scid,
+					timestamp: staleTs,
+					messageFlags: 0,
+					channelFlags: 0,
+					cltvExpiryDelta: 40,
+					htlcMinimumMsat: 0n,
+					feeBaseMsat: 1000,
+					feeProportionalMillionths: 1
+				});
+			};
+
+			const staleGossipFixture = (
+				seedId: number,
+				tag: string,
+				count: number
+			): {
+				storage: SqliteStorage;
+				node: LightningNode;
+				tmpDir: string;
+				scids: string[];
+			} => {
+				const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), tag));
+				const storage = new SqliteStorage(path.join(tmpDir, 'test.db'));
+				storage.open();
+				const config = makeNodeConfig(seedId);
+				config.storage = storage;
+				const node = new LightningNode(config);
+				node.on('error', () => {});
+				const staleTs =
+					Math.floor(Date.now() / 1000) - DEFAULT_PRUNE_MAX_AGE - 100;
+				const scids: string[] = [];
+				for (let i = 0; i < count; i++) {
+					const scidHex = 'aabbccdd' + i.toString(16).padStart(8, '0');
+					seedStaleChannel(storage, node, scidHex, staleTs);
+					scids.push(scidHex);
+				}
+				return { storage, node, tmpDir, scids };
+			};
+
+			// The reason the prune is batched at all: at `synchronous = FULL`
+			// a delete per row is an fsync per row, on the daemon's only
+			// thread, hourly, over the whole graph. That is long enough for
+			// /health to go silent and for peers to drop on their ping
+			// timeout, so the row count must not drive the commit count.
+			it('should prune every stale row in one transaction', () => {
+				const { storage, node, tmpDir } = staleGossipFixture(
+					520,
+					'ph11-gdb-batch-',
+					25
+				);
+				expect(storage.loadAllGossipChannels().length).to.equal(25);
+
+				let transactionCalls = 0;
+				let deleteCalls = 0;
+				const realTransaction = storage.transaction.bind(storage);
+				(storage as any).transaction = <T>(fn: () => T): T => {
+					transactionCalls++;
+					return realTransaction(fn);
+				};
+				const realDelete = storage.deleteGossipChannel.bind(storage);
+				(storage as any).deleteGossipChannel = (scidHex: string): void => {
+					deleteCalls++;
+					realDelete(scidHex);
+				};
+
+				(node as any).pruneStaleGossipWithStorage();
+
+				expect(deleteCalls).to.equal(25);
+				expect(transactionCalls).to.equal(1);
+				expect(storage.loadAllGossipChannels().length).to.equal(0);
+
+				node.destroy();
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			});
+
+			it('should keep pruning past a row whose delete throws', () => {
+				const { storage, node, tmpDir, scids } = staleGossipFixture(
+					521,
+					'ph11-gdb-partial-',
+					3
+				);
+				const errors: any[] = [];
+				node.on('node:error', (err: any) => errors.push(err));
+
+				const realDelete = storage.deleteGossipChannel.bind(storage);
+				(storage as any).deleteGossipChannel = (scidHex: string): void => {
+					if (scidHex === scids[1]) throw new Error('disk full');
+					realDelete(scidHex);
+				};
+
+				(node as any).pruneStaleGossipWithStorage();
+
+				// The batch is best-effort, exactly as the per-row loop was:
+				// one bad row costs its own row, not the other two.
+				const left = storage.loadAllGossipChannels();
+				expect(left.length).to.equal(1);
+				expect(left[0].shortChannelId.toString('hex')).to.equal(scids[1]);
+				const reported = errors.filter(
+					(e) => e.code === 'PERSISTENCE_ERROR'
+				);
+				expect(reported.length).to.equal(1);
+				expect(reported[0].message).to.contain('pruneStaleGossip');
+				expect(reported[0].message).to.contain('1 of 3');
+
+				node.destroy();
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			});
+
+			it('should still delete rows on a backend that refuses a transaction', () => {
+				const { storage, node, tmpDir } = staleGossipFixture(
+					522,
+					'ph11-gdb-notxn-',
+					4
+				);
+				// A conforming backend may reject the wrapper outright; the
+				// rows still deserve the plain best-effort pass.
+				(storage as any).transaction = (): never => {
+					throw new Error('BEGIN refused');
+				};
+
+				(node as any).pruneStaleGossipWithStorage();
+
+				expect(storage.loadAllGossipChannels().length).to.equal(0);
+
+				node.destroy();
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			});
 		});
 
 		describe('2c. Reconnect timer cleanup', () => {
