@@ -149,6 +149,8 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'GET /queue': ['readonly'],
 	// Recovery Protocol status: diagnostics, like /channel/diagnostics.
 	'GET /recovery/status': ['readonly'],
+	// The guardian this node serves to others (issue #699).
+	'GET /guardian/status': ['readonly'],
 
 	// ── Read-only POSTs (pure queries, no state change, no funds) ──
 	'POST /route/estimate': ['readonly'],
@@ -287,6 +289,8 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /recovery/restore-capsule': [],
 	// Hands back a retrieved capsule's guardian credentials.
 	'POST /recovery/capsule-guardians': [],
+	// Dials a remote node to resolve its guardian entry (issue #699).
+	'POST /recovery/resolve-guardian': [],
 	'POST /watchtower/add': [],
 	'DELETE /watchtower/remove': [],
 	'POST /webhooks/register': [],

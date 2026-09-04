@@ -165,6 +165,74 @@ There is no implicit creation: an unknown namespace is never claimable by
 whoever asks first with a self-chosen key, because registration demands
 the recovery root signature.
 
+### 2.7 bolt8
+
+A guardian hosted IN a beignet node, reached over a dedicated BOLT 8
+session to the node's ordinary peer address (issue #699; the "later
+optional adapter" spec 12.1 item 1 reserved). Descriptor transport type
+`bolt8`, URL `bolt8://<66-hex compressed node id>@<host>:<port>`, guardian
+entry `<64-hex guardian id>@bolt8://<node id>@host:port`. The node id is
+the key BOLT 8 authenticates the server by; it is NOT a credential and the
+`auth` member of the descriptor still carries one when the host requires
+it. Nothing signed changes: the same section 4 transcripts and section 6
+protobuf bodies ride this transport unchanged.
+
+Session rules:
+
+- The writer opens the session under a FRESH random static key, never its
+  node identity key. The guardian sees a stranger, which preserves 1.1
+  (recovery_id stays unlinkable to the Lightning node id) and keeps
+  guardian traffic structurally off any channel connection. Sessions are
+  long-lived; several verbs may be in flight at once.
+- Transport security: BOLT 8 supplies encryption and server authentication
+  on every network, so a bolt8 endpoint needs no approval on a LAN or
+  clearnet (the property local-http lacks). An onion host needs a Tor
+  proxy. Endpoint selection ranks bolt8 after onion-http and https and
+  before local-http.
+- Transport authentication (section 9): the request carries the
+  Authorization value verbatim in its `auth` field; a host configured with
+  a bearer token compares it in constant time. Running open is acceptable
+  for this transport because confidentiality does not depend on the
+  credential; it is an allow-list and anti-DoS.
+
+Framing. Every verb rides the beignet custom message (one odd wire type,
+44069; `[u16 version][u16 subtype][payload]`) on subtypes 32
+GUARDIAN_REQUEST and 33 GUARDIAN_RESPONSE. BOLT 8 caps a message at 65535
+bytes, so a request or response is split into ordered chunks that share a
+request id. Each chunk payload, big-endian, fixed width:
+
+```text
+requestId(4) || verb(1) || totalLength(4) || chunkIndex(2) || chunkCount(2)
+then, on chunk 0 only:
+  request:  authLength(2) || auth        (at most 4096 bytes)
+  response: transportStatus(2)
+then this chunk's body bytes
+```
+
+Verb codes: 0 INFO, 1 REGISTER_NODE, 2 PUT_STATE, 3 GET_HEAD, 4 GET_STATE,
+5 ACQUIRE_EPOCH, 6 SYNC_RECORD, 7 SYNC_EPOCH. The body across chunks is the
+exact protobuf bytes of 2.5. Chunks of one request id arrive in order and
+contiguous per id (the session is one ordered stream); chunks of DIFFERENT
+ids may interleave. A receiver drops the session on any framing violation
+(a chunk out of order, a header that changes mid-message, more partial
+messages than it allows), and answers a declared length over its cap with
+transportStatus 413 once while swallowing that id's remaining chunks, so
+the stream stays usable.
+
+A host serves a set only once REGISTER_NODE has run for it (5.1). Before
+that, GET_HEAD and GET_STATE for the set answer `ERR_UNKNOWN_NODE`, which
+is the truthful "no namespace here" a writer's ownership check reads as
+"fresh, register"; every other verb but REGISTER_NODE answers
+`ERR_UNKNOWN_SET`. INFO advertises `accepts_registrations` so a writer
+binding to the host accepts the set being absent from its list.
+
+`transportStatus` is the 2.5 HTTP-layer status, one to one: 200 for every
+well-formed protocol exchange INCLUDING protocol-level rejections (the
+result lives in the body's `status` field), 401 refused credential, 404
+unknown verb, 413 body over the advertised limit, 500 guardian failure. A
+host SHOULD advertise a `max_ciphertext_bytes` well under the 16 MiB
+protocol cap (4 MiB matches the guardian-mode snapshot cadence).
+
 ## 3. Cryptography
 
 ### 3.1 Primitives
@@ -370,9 +438,15 @@ leaves.
 ### 5.1 REGISTER_NODE
 
 Request: the REGISTER transcript fields plus the recovery root public key
-(which IS recovery_id) and the root signature. Acceptance:
+(which IS recovery_id), the root signature, and `guardian_members`, the
+committed member keys. The member list is REQUIRED: a guardian hosted by a
+node (2.7) serves sets it never saw configured and learns the set from the
+registration, and every guardian, configured or hosted, applies the same
+check so the two cannot accept different registrations. Acceptance:
 
 ```text
+guardian_members lists exactly `total` x-only keys, hashes (section 4)
+to guardian_set_id, and names this guardian
 recovery_id not yet registered for this guardian_set_id
 root signature verifies over the REGISTER transcript under recovery_id
 initial lease.epoch >= 1, writer key well-formed
@@ -530,8 +604,12 @@ certificate (issued now if it never issued one) and a fresh RECEIPT.
 
 `GET /beignet-guardian/v1/info` returns the InfoResponse message
 (section 6): guardianId, supported protocol version range as integer
-fields, the guardian_set_ids served, size limits, and rate-limit hints.
-Discovery only; nothing in INFO is signed or load-bearing for safety.
+fields, the guardian_set_ids served, size limits, rate-limit hints, and
+whether the guardian registers sets on demand (`accepts_registrations`, a
+host per 2.7). A writer binding to a guardian requires its set to be listed
+OR the guardian to accept registrations, since a host lists a set only once
+REGISTER_NODE has run. Discovery only; nothing in INFO is signed or
+load-bearing for safety.
 
 ### 5.9 Guardian-set replacement: UNSUPPORTED in protocol v1, literally
 
@@ -707,6 +785,7 @@ message RegisterNodeRequest {
   bytes         guardian_set_id  = 2;
   GuardianState initial_state    = 3;
   bytes         root_signature   = 4;  // 64, over the REGISTER transcript
+  repeated bytes guardian_members = 5; // 32 each; exactly `total`; REQUIRED
 }
 message RegisterNodeResponse {
   uint32        status  = 1;
@@ -796,6 +875,11 @@ message InfoResponse {
   uint64 max_ciphertext_bytes = 5;
   uint32 max_records_per_get  = 6;
   uint32 rate_limit_per_minute = 7; // 0 = unspecified
+  uint32 accepts_registrations = 8; // 1: a host that registers sets on
+                                    // demand (2.7); the set appears in
+                                    // guardian_set_ids only after
+                                    // REGISTER_NODE. A configured guardian
+                                    // omits it and always lists its set
 }
 ```
 
@@ -847,6 +931,10 @@ codec stays tractable, and signatures never depend on the envelope.
 31  ERR_RATE_LIMITED        semantic rate limit; retry_after in detail
                             AND the Retry-After HTTP header
 32  ERR_TOO_LARGE           object exceeds the guardian's advertised limit
+33  ERR_QUOTA_EXCEEDED      a hosted guardian's storage quota is exhausted
+                            for new namespaces or further records; not a
+                            transport condition and not retryable until the
+                            operator raises the quota (2.7)
 50  ERR_INTERNAL            transient guardian fault; safe to retry
 ```
 

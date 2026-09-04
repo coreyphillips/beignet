@@ -347,6 +347,7 @@ describe('Recovery phase 5: namespace establishment', () => {
 				await served[0].client.register({
 					protocolVersion: 1,
 					guardianSetId: SET_ID,
+					guardianMembers: GUARDIAN_IDS,
 					initialState,
 					rootSignature: signTranscript(
 						registerTranscriptHash(SET_ID, initialState),

@@ -1773,6 +1773,38 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/guardian/status': {
+				get: {
+					summary:
+						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off; otherwise the guardian id, whether a bearer token is required, open sessions, every served set (id, members, namespaces, bytes on disk, registeredAt) and the limits (per-record ciphertext, bytes per set, sets). Independent of this node's own recovery mode",
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description:
+								'{ serving } plus the host status when serving. Quotas refuse rather than delete, so a set at its byte limit still answers reads'
+						}
+					}
+				}
+			},
+			'/recovery/resolve-guardian': {
+				post: {
+					summary:
+						"Resolve a beignet node's ordinary Lightning URI (<node id>@host:port) to a guardian entry by opening a bolt8 session and asking INFO: the guardian id, the canonical bolt8 URL, the ready-to-pin entry <guardianId>@bolt8://<node id>@host:port, the sets the host already serves and its ciphertext limit. Adopts and persists nothing: pinning a set is the operator's explicit action, and the set is immutable once a namespace is registered under it (wire 5.9)",
+					tags: ['Node'],
+					requestBody: bodyContent({ uri: 'string' }),
+					responses: {
+						'200': {
+							description:
+								'guardianId, url, entry, guardianSetIds, maxCiphertextBytes'
+						},
+						'400': { description: 'Not a <node id>@host:port URI' },
+						'502': {
+							description:
+								'No guardian answered at that address (GUARDIAN_UNREACHABLE): the node is down, does not serve, or requires a token'
+						}
+					}
+				}
+			},
 			'/send': {
 				post: {
 					summary: 'Send on-chain Bitcoin',
@@ -2218,7 +2250,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
 					tags: ['Node'],
 					responses: {
 						'200': {

@@ -149,6 +149,8 @@ export function isRetryableError(err: BeignetError): boolean {
 		'L402_FETCH_FAILED',
 		'RESTORE_HEAD_UNVERIFIABLE',
 		'RECOVERY_UNAVAILABLE',
+		// A node-hosted guardian that did not answer a resolve probe (#699).
+		'GUARDIAN_UNREACHABLE',
 		// Recovery holds that resolve on their own or on a restart.
 		'NODE_RESTORE_PENDING',
 		'NODE_RESTART_REQUIRED',

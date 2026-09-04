@@ -454,6 +454,9 @@ export function encodeRegisterNodeRequest(
 	writer.bytes(2, request.guardianSetId);
 	writer.message(3, encodeGuardianState(request.initialState));
 	writer.bytes(4, request.rootSignature);
+	for (const member of request.guardianMembers) {
+		writer.bytes(5, member);
+	}
 	return writer.finish();
 }
 
@@ -463,6 +466,7 @@ export function decodeRegisterNodeRequest(
 	const request: IGuardianRegisterNodeRequest = {
 		protocolVersion: 0,
 		guardianSetId: EMPTY(),
+		guardianMembers: [],
 		initialState: decodeGuardianState(EMPTY()),
 		rootSignature: EMPTY()
 	};
@@ -477,6 +481,8 @@ export function decodeRegisterNodeRequest(
 			request.initialState = decodeGuardianState(reader.readBytes());
 		} else if (field === 4 && wireType === WIRE_LEN) {
 			request.rootSignature = reader.readBytes();
+		} else if (field === 5 && wireType === WIRE_LEN) {
+			request.guardianMembers.push(reader.readBytes());
 		} else {
 			reader.skip(wireType);
 		}
@@ -981,6 +987,7 @@ export function encodeInfoResponse(info: IGuardianInfoResponse): Buffer {
 	writer.uint(5, BigInt(info.maxCiphertextBytes));
 	writer.uint(6, info.maxRecordsPerGet);
 	writer.uint(7, info.rateLimitPerMinute);
+	if (info.acceptsRegistrations) writer.uint(8, 1);
 	return writer.finish();
 }
 
@@ -992,7 +999,8 @@ export function decodeInfoResponse(buf: Buffer): IGuardianInfoResponse {
 		guardianSetIds: [],
 		maxCiphertextBytes: 0,
 		maxRecordsPerGet: 0,
-		rateLimitPerMinute: 0
+		rateLimitPerMinute: 0,
+		acceptsRegistrations: false
 	};
 	const reader = new ProtoReader(buf);
 	while (!reader.done) {
@@ -1015,6 +1023,8 @@ export function decodeInfoResponse(buf: Buffer): IGuardianInfoResponse {
 			info.maxRecordsPerGet = reader.readUint32();
 		} else if (field === 7 && wireType === WIRE_VARINT) {
 			info.rateLimitPerMinute = reader.readUint32();
+		} else if (field === 8 && wireType === WIRE_VARINT) {
+			info.acceptsRegistrations = reader.readUint32() !== 0;
 		} else {
 			reader.skip(wireType);
 		}

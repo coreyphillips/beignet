@@ -99,6 +99,7 @@ function buildRegistration(): IGuardianRegisterNodeRequest {
 	return {
 		protocolVersion: 1,
 		guardianSetId: SET_ID,
+		guardianMembers: GUARDIAN_IDS,
 		initialState,
 		rootSignature: signTranscript(
 			registerTranscriptHash(SET_ID, initialState),
@@ -567,7 +568,8 @@ describe('Guardian transport: HTTP server and client', () => {
 					guardianSetIds: [SET_ID],
 					maxCiphertextBytes: 1024,
 					maxRecordsPerGet: 16,
-					rateLimitPerMinute: 0
+					rateLimitPerMinute: 0,
+					acceptsRegistrations: false
 				})
 			})
 		});
@@ -718,7 +720,8 @@ describe('Guardian transport: client hardening', () => {
 						guardianSetIds: [SET_ID],
 						maxCiphertextBytes: 1024,
 						maxRecordsPerGet: 16,
-						rateLimitPerMinute: 0
+						rateLimitPerMinute: 0,
+						acceptsRegistrations: false
 					})
 				};
 			}
@@ -755,7 +758,8 @@ describe('Guardian transport: client hardening', () => {
 							guardianSetIds: [SET_ID],
 							maxCiphertextBytes: 1024,
 							maxRecordsPerGet: 16,
-							rateLimitPerMinute: 0
+							rateLimitPerMinute: 0,
+							acceptsRegistrations: false
 						})
 					};
 				}

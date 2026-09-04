@@ -41,6 +41,116 @@ import {
 /** Request body allowance: the ciphertext cap plus a 4 KiB envelope (wire 8). */
 export const GUARDIAN_ENVELOPE_ALLOWANCE_BYTES = 4096;
 
+/** The signed verbs, by their wire-spec lowercase names (wire 2.5). */
+export type GuardianVerbName =
+	| 'register_node'
+	| 'put_state'
+	| 'get_head'
+	| 'get_state'
+	| 'acquire_epoch'
+	| 'sync_record'
+	| 'sync_epoch';
+
+export const GUARDIAN_VERB_NAMES: readonly GuardianVerbName[] = Object.freeze([
+	'register_node',
+	'put_state',
+	'get_head',
+	'get_state',
+	'acquire_epoch',
+	'sync_record',
+	'sync_epoch'
+]);
+
+export function isGuardianVerbName(verb: string): verb is GuardianVerbName {
+	return (GUARDIAN_VERB_NAMES as readonly string[]).includes(verb);
+}
+
+// Each verb pairs its decoder, its core handler, and its encoder; a body
+// that fails to decode is a protocol-level ERR_MALFORMED inside a successful
+// exchange, exactly like any other protocol rejection (wire 2.5, section 7).
+const VERB_HANDLERS: Record<
+	GuardianVerbName,
+	(guardian: ReferenceGuardian, body: Buffer) => Buffer
+> = {
+	register_node: (guardian, body) =>
+		encodeRegisterNodeResponse(
+			guardian.register(decodeRegisterNodeRequest(body))
+		),
+	put_state: (guardian, body) =>
+		encodePutStateResponse(guardian.putState(decodePutStateRequest(body))),
+	get_head: (guardian, body) =>
+		encodeGetHeadResponse(guardian.getHead(decodeGetHeadRequest(body))),
+	get_state: (guardian, body) =>
+		encodeGetStateResponse(guardian.getState(decodeGetStateRequest(body))),
+	acquire_epoch: (guardian, body) =>
+		encodeAcquireEpochResponse(
+			guardian.acquireEpoch(decodeAcquireEpochRequest(body))
+		),
+	sync_record: (guardian, body) =>
+		encodeSyncRecordResponse(
+			guardian.syncRecord(decodeSyncRecordRequest(body))
+		),
+	sync_epoch: (guardian, body) =>
+		encodeSyncEpochResponse(guardian.syncEpoch(decodeSyncEpochRequest(body)))
+};
+
+const REFUSAL_FOR: Record<
+	GuardianVerbName,
+	(status: GuardianStatus, detail: string) => Buffer
+> = {
+	register_node: (status, detail) =>
+		encodeRegisterNodeResponse({ status, detail }),
+	put_state: (status, detail) => encodePutStateResponse({ status, detail }),
+	get_head: (status, detail) => encodeGetHeadResponse({ status, detail }),
+	get_state: (status, detail) => encodeGetStateResponse({ status, detail }),
+	acquire_epoch: (status, detail) =>
+		encodeAcquireEpochResponse({ status, detail }),
+	sync_record: (status, detail) => encodeSyncRecordResponse({ status, detail }),
+	sync_epoch: (status, detail) => encodeSyncEpochResponse({ status, detail })
+};
+
+/**
+ * A protocol-level refusal in the verb's own response shape, for the cases
+ * a dispatcher decides BEFORE reaching a guardian: an undecodable body, a
+ * set this host does not serve, an exhausted quota (wire 2.7).
+ */
+export function encodeGuardianVerbRefusal(
+	verb: GuardianVerbName,
+	status: GuardianStatus,
+	detail: string
+): Buffer {
+	return REFUSAL_FOR[verb](status, detail);
+}
+
+/**
+ * Run one signed verb against the guardian and encode its protocol answer.
+ * Transport-neutral on purpose: the HTTP listener below and the bolt8
+ * session responder (guardian-bolt8.ts) both call this, so the two
+ * transports cannot drift in what a verb means. The core never throws for
+ * protocol conditions; an exception here means the BODY failed to decode
+ * as protobuf, which is answered as ERR_MALFORMED in the verb's own
+ * response shape.
+ */
+export function dispatchGuardianVerb(
+	guardian: ReferenceGuardian,
+	verb: GuardianVerbName,
+	body: Buffer
+): Buffer {
+	try {
+		return VERB_HANDLERS[verb](guardian, body);
+	} catch {
+		return REFUSAL_FOR[verb](
+			GuardianStatus.ERR_MALFORMED,
+			'undecodable request body'
+		);
+	}
+}
+
+/** The discovery answer (wire 5.8), encoded. */
+export function encodeGuardianInfo(guardian: ReferenceGuardian): Buffer {
+	return encodeInfoResponse(guardian.info());
+}
+
 export interface IGuardianHttpOptions {
 	guardian: ReferenceGuardian;
 	/**
@@ -127,58 +237,6 @@ export function createGuardianRequestListener(
 		options.maxBodyBytes ??
 		guardian.info().maxCiphertextBytes + GUARDIAN_ENVELOPE_ALLOWANCE_BYTES;
 
-	// Each verb pairs its decoder, its core handler, and its encoder; a body
-	// that fails to decode is a protocol-level ERR_MALFORMED inside a 200,
-	// exactly like any other protocol rejection (wire 2.5, section 7).
-	const verbs: Record<string, (body: Buffer) => Buffer> = {
-		register_node: (body) =>
-			encodeRegisterNodeResponse(
-				guardian.register(decodeRegisterNodeRequest(body))
-			),
-		put_state: (body) =>
-			encodePutStateResponse(guardian.putState(decodePutStateRequest(body))),
-		get_head: (body) =>
-			encodeGetHeadResponse(guardian.getHead(decodeGetHeadRequest(body))),
-		get_state: (body) =>
-			encodeGetStateResponse(guardian.getState(decodeGetStateRequest(body))),
-		acquire_epoch: (body) =>
-			encodeAcquireEpochResponse(
-				guardian.acquireEpoch(decodeAcquireEpochRequest(body))
-			),
-		sync_record: (body) =>
-			encodeSyncRecordResponse(
-				guardian.syncRecord(decodeSyncRecordRequest(body))
-			),
-		sync_epoch: (body) =>
-			encodeSyncEpochResponse(guardian.syncEpoch(decodeSyncEpochRequest(body)))
-	};
-
-	const malformedFor: Record<string, (detail: string) => Buffer> = {
-		register_node: (detail) =>
-			encodeRegisterNodeResponse({
-				status: GuardianStatus.ERR_MALFORMED,
-				detail
-			}),
-		put_state: (detail) =>
-			encodePutStateResponse({ status: GuardianStatus.ERR_MALFORMED, detail }),
-		get_head: (detail) =>
-			encodeGetHeadResponse({ status: GuardianStatus.ERR_MALFORMED, detail }),
-		get_state: (detail) =>
-			encodeGetStateResponse({ status: GuardianStatus.ERR_MALFORMED, detail }),
-		acquire_epoch: (detail) =>
-			encodeAcquireEpochResponse({
-				status: GuardianStatus.ERR_MALFORMED,
-				detail
-			}),
-		sync_record: (detail) =>
-			encodeSyncRecordResponse({
-				status: GuardianStatus.ERR_MALFORMED,
-				detail
-			}),
-		sync_epoch: (detail) =>
-			encodeSyncEpochResponse({ status: GuardianStatus.ERR_MALFORMED, detail })
-	};
-
 	return (request, response): void => {
 		void (async (): Promise<void> => {
 			if (options.authenticate && !options.authenticate(request)) {
@@ -192,7 +250,7 @@ export function createGuardianRequestListener(
 			const path = url.split('?')[0];
 			if (request.method === 'GET') {
 				if (path === `${GUARDIAN_HTTP_BASE_PATH}/info`) {
-					respond(response, 200, encodeInfoResponse(guardian.info()));
+					respond(response, 200, encodeGuardianInfo(guardian));
 				} else {
 					respond(response, 404);
 				}
@@ -207,8 +265,7 @@ export function createGuardianRequestListener(
 				return;
 			}
 			const verb = path.slice(GUARDIAN_HTTP_BASE_PATH.length + 1);
-			const handler = verbs[verb];
-			if (!handler) {
+			if (!isGuardianVerbName(verb)) {
 				respond(response, 404);
 				return;
 			}
@@ -220,13 +277,7 @@ export function createGuardianRequestListener(
 				respond(response, 413);
 				return;
 			}
-			try {
-				respond(response, 200, handler(body));
-			} catch {
-				// The core never throws for protocol conditions; reaching here
-				// means the BODY failed to decode as protobuf.
-				respond(response, 200, malformedFor[verb]('undecodable request body'));
-			}
+			respond(response, 200, dispatchGuardianVerb(guardian, verb, body));
 		})().catch(() => {
 			try {
 				respond(response, 500);

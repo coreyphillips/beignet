@@ -346,6 +346,7 @@ describe('Recovery phase 5: writer lease', () => {
 		guardian.register({
 			protocolVersion: 1,
 			guardianSetId: SET_ID,
+			guardianMembers: GUARDIAN_IDS,
 			initialState,
 			rootSignature: signTranscript(
 				registerTranscriptHash(SET_ID, initialState),
@@ -411,6 +412,7 @@ describe('Recovery phase 5: writer lease', () => {
 		guardian.register({
 			protocolVersion: 1,
 			guardianSetId: SET_ID,
+			guardianMembers: GUARDIAN_IDS,
 			initialState,
 			rootSignature: signTranscript(
 				registerTranscriptHash(SET_ID, initialState),

@@ -1090,6 +1090,7 @@ describe('Recovery phase 5: restore driver', () => {
 				await served[0].client.register({
 					protocolVersion: 1,
 					guardianSetId: SET_ID,
+					guardianMembers: GUARDIAN_IDS,
 					initialState,
 					rootSignature: signTranscript(
 						registerTranscriptHash(SET_ID, initialState),

@@ -76,6 +76,8 @@ export enum GuardianStatus {
 	ERR_STORE_UNCERTAIN = 30,
 	ERR_RATE_LIMITED = 31,
 	ERR_TOO_LARGE = 32,
+	/** A host's storage quota for new namespaces or records is exhausted. */
+	ERR_QUOTA_EXCEEDED = 33,
 	ERR_INTERNAL = 50
 }
 
@@ -117,6 +119,15 @@ export interface IGuardianRecord {
 export interface IGuardianRegisterNodeRequest {
 	protocolVersion: number;
 	guardianSetId: Buffer;
+	/**
+	 * The committed member keys (32-byte x-only each, wire 5.1). REQUIRED:
+	 * a guardian that serves sets it never saw configured (a node hosting
+	 * the reference guardian, issue #699) learns the set from here, and
+	 * every guardian checks that the list hashes to guardian_set_id and
+	 * names itself. Nothing signed changes: the set id was already inside
+	 * every transcript prefix.
+	 */
+	guardianMembers: Buffer[];
 	initialState: GuardianState;
 	rootSignature: Buffer;
 }
@@ -221,6 +232,13 @@ export interface IGuardianInfoResponse {
 	maxCiphertextBytes: number;
 	maxRecordsPerGet: number;
 	rateLimitPerMinute: number;
+	/**
+	 * A HOST that registers sets on demand (wire 2.7): a writer binding to it
+	 * accepts the set being absent from guardianSetIds, because it appears
+	 * only once REGISTER_NODE has run. A configured single-set guardian says
+	 * false, and its set is always listed.
+	 */
+	acceptsRegistrations: boolean;
 }
 
 /**
@@ -467,8 +485,16 @@ export class ReferenceGuardian {
 			guardianSetIds: [Buffer.from(this.guardianSetId)],
 			maxCiphertextBytes: this.maxCiphertextBytes,
 			maxRecordsPerGet: this.maxRecordsPerGet,
-			rateLimitPerMinute: 0
+			rateLimitPerMinute: 0,
+			acceptsRegistrations: false
 		};
+	}
+
+	/** The recovery ids this guardian holds a namespace for (status views). */
+	listNamespaceIds(): Buffer[] {
+		return this.store.read(() =>
+			this.store.listNamespaces().map((ns) => Buffer.from(ns.recoveryId))
+		);
 	}
 
 	/** Orphan-archive audit view (never served by GET_STATE). */
@@ -538,6 +564,49 @@ export class ReferenceGuardian {
 			return err(
 				GuardianStatus.ERR_UNKNOWN_SET,
 				'guardian_set_id is not served by this guardian'
+			);
+		}
+		return null;
+	}
+
+	/**
+	 * The member list a registration MUST carry (wire 5.1): exactly the
+	 * committed set, hashing to the request's guardian_set_id and naming this
+	 * guardian. For a single-set guardian the set id check already implies
+	 * this; the rule is uniform so a multi-set host and a configured guardian
+	 * accept exactly the same registrations.
+	 */
+	private memberListProblem(members: Buffer[] | undefined): IErr | null {
+		if (!Array.isArray(members) || members.length !== CRASH_V1_PROFILE.total) {
+			return err(
+				GuardianStatus.ERR_MALFORMED,
+				`guardian_members must list exactly ${CRASH_V1_PROFILE.total} keys`
+			);
+		}
+		let setId: Buffer;
+		try {
+			setId = computeGuardianSetId({
+				...CRASH_V1_PROFILE,
+				guardianIds: members
+			});
+		} catch (error) {
+			return err(
+				GuardianStatus.ERR_MALFORMED,
+				`guardian_members invalid: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
+		}
+		if (!setId.equals(this.guardianSetId)) {
+			return err(
+				GuardianStatus.ERR_MALFORMED,
+				'guardian_members do not hash to guardian_set_id'
+			);
+		}
+		if (!members.some((m) => m.equals(this.guardianId))) {
+			return err(
+				GuardianStatus.ERR_UNKNOWN_SET,
+				'this guardian is not a member of guardian_members'
 			);
 		}
 		return null;
@@ -695,6 +764,8 @@ export class ReferenceGuardian {
 				request.guardianSetId
 			);
 			if (gate) return gate;
+			const members = this.memberListProblem(request.guardianMembers);
+			if (members) return members;
 			const state = request.initialState;
 			const shape = this.stateShapeProblem(state);
 			if (shape) return err(GuardianStatus.ERR_MALFORMED, shape);
@@ -1156,6 +1227,9 @@ export class ReferenceGuardian {
 					registration: {
 						protocolVersion: GUARDIAN_PROTOCOL_VERSION,
 						guardianSetId: Buffer.from(ns.guardianSetId),
+						// This guardian serves exactly one set, and registration
+						// verified the list hashes to it (memberListProblem).
+						guardianMembers: this.members.map((m) => Buffer.from(m)),
 						initialState: parseStateBytes(ns.registrationState),
 						rootSignature: Buffer.from(ns.registrationSignature as Buffer)
 					}

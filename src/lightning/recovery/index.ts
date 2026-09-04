@@ -21,6 +21,8 @@ export * from './guardian';
 export * from './guardian-proto';
 export * from './guardian-http';
 export * from './guardian-client';
+export * from './guardian-bolt8';
+export * from './guardian-host';
 export * from './writer-lease';
 export * from './guardian-replication';
 export * from './restore-driver';
