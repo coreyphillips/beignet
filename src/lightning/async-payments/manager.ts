@@ -50,9 +50,13 @@ export interface IHeldForwardDriver {
 	 * Place the onward add. `forwarded` once the outgoing leg exists,
 	 * `deferred` when the outgoing channel cannot take an add right now
 	 * (reestablishing, quiescing), `refused` when the add was refused and
-	 * the refusal path has already resolved the inbound HTLC.
+	 * the refusal path has already resolved the inbound HTLC (or owes it),
+	 * `held` when the add was refused and the JIT engine took the part for
+	 * a splice: the engine now owns it and forwards or fails it itself, so
+	 * the row is RELEASED with `heldBySplice` and nobody else touches the
+	 * inbound HTLC (issue #722).
 	 */
-	forward: () => 'forwarded' | 'deferred' | 'refused';
+	forward: () => 'forwarded' | 'deferred' | 'refused' | 'held';
 	/** Fail the inbound HTLC upstream; false when it cannot be carried now. */
 	fail: () => boolean;
 }
@@ -353,6 +357,8 @@ export class AsyncPaymentManager extends EventEmitter {
 			const outcome = driver.forward();
 			if (outcome === 'forwarded') {
 				this.finish(this.ledger.markReleased(holdIdHex), 'released');
+			} else if (outcome === 'held') {
+				this.finish(this.ledger.markReleasedToSplice(holdIdHex), 'released');
 			} else if (outcome === 'refused') {
 				this.finish(
 					this.ledger.markReleaseRefused(holdIdHex, 'forward_refused'),

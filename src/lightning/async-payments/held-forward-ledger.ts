@@ -14,7 +14,12 @@
  *   RELEASING -> FAILING               (release won, but the forward could
  *                                       not be placed before the cutoff)
  *   RELEASING -> FAILED                (the forward was refused outright and
- *                                       the refusal already failed upstream)
+ *                                       the refusal already failed upstream,
+ *                                       or owes that failure)
+ *   RELEASING -> RELEASED [heldBySplice] (the forward was refused and the
+ *                                       JIT engine took the part for a
+ *                                       splice; the engine alone forwards
+ *                                       or fails it from here, issue #722)
  *
  * The CLTV cutoff. A hold's `cutoffHeight` is fixed when it is parked:
  *
@@ -93,6 +98,13 @@ export interface IHeldForwardRecord extends ILedgerRecord {
 	/** Why the record left HELD/RELEASING for the fail path. */
 	failReason?: string;
 	resolvedAt?: number;
+	/**
+	 * RELEASED because the outgoing channel refused the add and the JIT
+	 * engine held the part for a splice (issue #722). The engine owns the
+	 * part from here; whether it was finally forwarded or failed upstream is
+	 * the engine's `jit:forwarded` / `jit:failed`, not this row's.
+	 */
+	heldBySplice?: boolean;
 }
 
 export const HELD_FORWARD_LEDGER_PREFIX = 'held_forward';
@@ -260,6 +272,18 @@ export class HeldForwardLedger {
 
 	markReleased(holdIdHex: string): HeldForwardTransition {
 		return this.ledger.transition(holdIdHex, ['RELEASING'], 'RELEASED', {
+			resolvedAt: Date.now()
+		});
+	}
+
+	/**
+	 * A RELEASING hold whose refused add the JIT engine took for a splice:
+	 * placed, from the ledger's point of view, and owned by the engine from
+	 * here (issue #722).
+	 */
+	markReleasedToSplice(holdIdHex: string): HeldForwardTransition {
+		return this.ledger.transition(holdIdHex, ['RELEASING'], 'RELEASED', {
+			heldBySplice: true,
 			resolvedAt: Date.now()
 		});
 	}

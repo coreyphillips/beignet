@@ -242,6 +242,7 @@ import {
 	IKeysendOptions,
 	IChannelPolicy,
 	IChannelPolicyUpdate,
+	ForwardPlacement,
 	clampFeeRateSatPerVbyte,
 	IAutoRebalanceConfig,
 	IAutoTuneFeesConfig,
@@ -17350,7 +17351,7 @@ export class LightningNode extends EventEmitter {
 						timeoutMs
 					),
 				forwardOnto: (outChannelId, part) =>
-					this.forwardHtlcOnto(outChannelId, part),
+					this.forwardHtlcOnto(outChannelId, part) === 'forwarded',
 				failureCodes: {
 					temporaryChannelFailure: TEMPORARY_CHANNEL_FAILURE,
 					expiryTooSoon: EXPIRY_TOO_SOON
@@ -18386,19 +18387,24 @@ export class LightningNode extends EventEmitter {
 		// complete the whole fulfillment chain during addHtlc, so we track the
 		// outgoing→incoming link BEFORE forwarding (same timing as payment storage).
 		const performForward = (
-			fail: (code: number) => boolean = failIncoming
-		): boolean =>
-			this.forwardHtlcOnto(outChannelId, {
-				inChannelId,
-				inHtlcId,
-				paymentHash,
-				forwardAmountMsat: forwardAmount,
-				forwardCltv,
-				incomingCltvExpiry,
-				nextPacket,
-				nextBlindingPoint,
-				failIncoming: fail
-			});
+			fail: (code: number) => boolean = failIncoming,
+			refundOwner: 'engine' | 'caller' = 'engine'
+		): ForwardPlacement =>
+			this.forwardHtlcOnto(
+				outChannelId,
+				{
+					inChannelId,
+					inHtlcId,
+					paymentHash,
+					forwardAmountMsat: forwardAmount,
+					forwardCltv,
+					incomingCltvExpiry,
+					nextPacket,
+					nextBlindingPoint,
+					failIncoming: fail
+				},
+				refundOwner
+			);
 
 		// Async payments (LSP role, issue #708): the recipient's blinded path
 		// marked this hop hold_htlc, so park the forward in the durable
@@ -18481,7 +18487,10 @@ export class LightningNode extends EventEmitter {
 		 * Place the onward add; true when the outgoing channel accepted it.
 		 * The refusal path fails the inbound HTLC through the given closure.
 		 */
-		performForward: (fail?: (code: number) => boolean) => boolean;
+		performForward: (
+			fail?: (code: number) => boolean,
+			refundOwner?: 'engine' | 'caller'
+		) => ForwardPlacement;
 		failIncoming: (code: number) => boolean;
 	}): void {
 		const receiverHex = this.channelManager.getPeerForChannel(
@@ -18554,20 +18563,27 @@ export class LightningNode extends EventEmitter {
 					if (ok) inboundResolved = true;
 					return ok;
 				};
-				if (args.performForward(tracked)) return 'forwarded';
+				// The refund for a refused part is owed HERE (issue #722): the
+				// placement is told so, and the JIT engine registers no owed
+				// failure of its own for it, so exactly one ledger retries it.
+				const placement = args.performForward(tracked, 'caller');
+				if (placement === 'forwarded') return 'forwarded';
+				if (placement === 'held') {
+					// The JIT engine took the part for a splice and owns it from
+					// here: it forwards it once the splice locks or fails it
+					// upstream itself. Failing it here would pay downstream for
+					// an inbound leg already refunded.
+					this.emitStructuredLog('htlc', 'held_forward_to_splice', {
+						inChannelId: args.inChannelId.toString('hex'),
+						inHtlcId: Number(args.inHtlcId)
+					});
+					return 'held';
+				}
 				// The refusal path fails the inbound HTLC; when its channel
 				// could not carry that (reestablishing), the row still goes
-				// terminal and the refund is owed HERE, retried on reestablish
-				// and per block. Unless the JIT engine took the part for a
-				// splice: it will forward it, and failing it would pay
-				// downstream for an inbound leg already refunded.
-				if (
-					!inboundResolved &&
-					!this.jitReceiveManager?.holdsPart(
-						args.inChannelId.toString('hex'),
-						args.inHtlcId
-					)
-				) {
+				// terminal and the refund is owed here, retried on reestablish
+				// and per block.
+				if (!inboundResolved) {
 					this.oweHeldForwardFailure(args.inChannelId, args.inHtlcId, () =>
 						args.failIncoming(TEMPORARY_CHANNEL_FAILURE)
 					);
@@ -18712,8 +18728,20 @@ export class LightningNode extends EventEmitter {
 	 * applied upstream and the forwarded value would be lost. A caller that
 	 * retries a refused forward is therefore re-entering this method, not
 	 * patching up half a transition from outside it.
+	 *
+	 * A refused part has exactly one owner afterwards (issue #722). When the
+	 * JIT engine takes it for a splice the placement is `held` and the
+	 * engine forwards or fails it; nobody else may touch it. Otherwise the
+	 * refusal fails the inbound HTLC, and when that channel cannot carry the
+	 * failure right now the refund is owed by ONE retry ledger: the engine's
+	 * (`refundOwner: 'engine'`, the ordinary and JIT paths) or the caller's
+	 * (`'caller'`, the held-forward driver, which owes it itself).
 	 */
-	private forwardHtlcOnto(outChannelId: Buffer, part: IHeldJitPart): boolean {
+	private forwardHtlcOnto(
+		outChannelId: Buffer,
+		part: IHeldJitPart,
+		refundOwner: 'engine' | 'caller' = 'engine'
+	): ForwardPlacement {
 		const nextOnionBuf = encodeOnionPacket(part.nextPacket);
 		const outChannel = this.channelManager.getChannel(outChannelId);
 		const outHtlcId = outChannel
@@ -18756,6 +18784,7 @@ export class LightningNode extends EventEmitter {
 			// it, so a surviving row maps an id a later unrelated HTLC will take
 			// onto this inbound leg and would settle it against the wrong payment.
 			this.forwardedHtlcs.delete(outKey);
+			let placement: ForwardPlacement = 'refused';
 			this.withStagedMutations(
 				[{ type: 'delete_forwarded_htlc', outKey }],
 				() => {
@@ -18772,17 +18801,22 @@ export class LightningNode extends EventEmitter {
 							paymentHash: part.paymentHash.toString('hex'),
 							amountMsat: Number(part.forwardAmountMsat)
 						});
+						placement = 'held';
 						return;
 					}
 					// A refund the inbound channel cannot carry right now (it is
-					// reestablishing) must not evaporate: the engine owes it and
-					// retries it on every block.
-					if (!part.failIncoming(TEMPORARY_CHANNEL_FAILURE)) {
+					// reestablishing) must not evaporate: its one owner retries
+					// it on every block. The engine owes it unless the caller
+					// said it would (the held-forward driver keeps its own).
+					if (
+						!part.failIncoming(TEMPORARY_CHANNEL_FAILURE) &&
+						refundOwner === 'engine'
+					) {
 						this.jitReceiveManager?.owedUpstreamFailure(part);
 					}
 				}
 			);
-			return false;
+			return placement;
 		}
 
 		this.emit(
@@ -18792,7 +18826,7 @@ export class LightningNode extends EventEmitter {
 			part.forwardAmountMsat,
 			part.paymentHash
 		);
-		return true;
+		return 'forwarded';
 	}
 
 	/**

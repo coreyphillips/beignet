@@ -725,21 +725,25 @@ export class JitReceiveManager extends EventEmitter {
 	 * one of these would forward a payment this queue is about to fail upstream.
 	 */
 	/**
-	 * Is this inbound HTLC held by the engine right now (a refused forward it
-	 * took for a splice)? A caller that owes the HTLC a failure must not
-	 * fail what the engine is about to forward.
+	 * Is this inbound HTLC held by the engine right now, on either queue: a
+	 * part waiting for a zero-conf open, or a refused forward it took for a
+	 * splice? A caller that owes the HTLC a failure must not fail what the
+	 * engine is about to forward. (Before issue #722 only the open queue was
+	 * consulted, so a splice-held part looked unowned to the held-forward
+	 * driver.)
 	 */
 	holdsPart(inChannelIdHex: string, inHtlcId: bigint): boolean {
+		const matches = (parts: IHeldJitPart[]): boolean =>
+			parts.some(
+				(p) =>
+					p.inChannelId.toString('hex') === inChannelIdHex &&
+					p.inHtlcId === inHtlcId
+			);
 		for (const parts of this.heldParts.values()) {
-			if (
-				parts.some(
-					(p) =>
-						p.inChannelId.toString('hex') === inChannelIdHex &&
-						p.inHtlcId === inHtlcId
-				)
-			) {
-				return true;
-			}
+			if (matches(parts)) return true;
+		}
+		for (const parts of this.spliceQueues.values()) {
+			if (matches(parts)) return true;
 		}
 		return false;
 	}

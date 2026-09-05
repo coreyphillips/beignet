@@ -2929,6 +2929,12 @@ export class BeignetNode extends EventEmitter {
 		// updates it. The journal wins, and the status route says so.
 		this._configuredSetStale = false;
 		const persisted = readGuardianSet(this.storage);
+		// The journal names a set only once a rotation put it there (this
+		// device's own, or one it followed), and a rotation's incoming set
+		// already holds the namespace; so a set the journal names is one on
+		// which a fresh genesis is never the right answer (issue #722).
+		let following =
+			persisted !== null && persisted.length === CRASH_V1_PROFILE.total;
 		if (persisted && persisted.length === CRASH_V1_PROFILE.total) {
 			const persistedParsed = persisted.map(parseGuardianEntry);
 			if (
@@ -2949,7 +2955,12 @@ export class BeignetNode extends EventEmitter {
 				guardians = persistedParsed;
 			}
 		}
-		let decision = await this.decideGuardianBoot(guardians, mode, opts);
+		let decision = await this.decideGuardianBoot(
+			guardians,
+			mode,
+			opts,
+			following
+		);
 		// A set that retired this namespace hands over the rotation (wire
 		// 5.11); follow it to the live set, and adopt its generation so this
 		// device's own capsule and registration order correctly.
@@ -2963,7 +2974,13 @@ export class BeignetNode extends EventEmitter {
 				decision.generation,
 				decision.entries
 			);
-			decision = await this.decideGuardianBoot(guardians, mode, opts);
+			following = true;
+			decision = await this.decideGuardianBoot(
+				guardians,
+				mode,
+				opts,
+				following
+			);
 		}
 		if (decision.kind === 'rotated') {
 			throw new BeignetError(
@@ -2980,6 +2997,15 @@ export class BeignetNode extends EventEmitter {
 			this._restoreDecision = decision;
 			this._restorePending = true;
 			return;
+		}
+		if (decision.outcome === 'rotation-target-empty') {
+			throw new BeignetError(
+				'RECOVERY_UNAVAILABLE',
+				`Recovery ${decision.outcome}: ${decision.detail}. Nothing was ` +
+					'registered; the incoming set of the rotation should already ' +
+					'hold this namespace, so check that the rotation reached it ' +
+					'before retrying.'
+			);
 		}
 		throw new BeignetError(
 			'RECOVERY_UNAVAILABLE',
@@ -3049,11 +3075,16 @@ export class BeignetNode extends EventEmitter {
 		return next;
 	}
 
-	/** One boot decision against one guardian set (assembly.ts). */
+	/**
+	 * One boot decision against one guardian set (assembly.ts). `following`
+	 * marks a set reached through a rotation, on which no genesis is ever
+	 * registered (issue #722).
+	 */
 	private async decideGuardianBoot(
 		guardians: IParsedGuardian[],
 		mode: 'async-remote' | 'quorum',
-		opts: BeignetNodeOptions
+		opts: BeignetNodeOptions,
+		following: boolean
 	): Promise<GuardianBootDecision> {
 		this.recoveryGuardianSet = guardians;
 		return buildGuardianRecovery({
@@ -3061,6 +3092,7 @@ export class BeignetNode extends EventEmitter {
 			nodeSecret: this.nodeSecret(),
 			durability: mode,
 			guardians,
+			following,
 			transportFor: (guardian): IBolt8GuardianTransport | undefined =>
 				this.guardianTransportFor(guardian, opts),
 			onBarrierEvent: (event) => {

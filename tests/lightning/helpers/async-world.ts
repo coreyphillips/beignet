@@ -480,13 +480,16 @@ export async function setupWorld(opts: {
 	lspService?: IAsyncReceiveServiceConfig;
 	/** Carol registers with the LSP during setup (default true). */
 	carolRegisters?: boolean;
+	/** Further LSP node config (a JIT receive engine, for instance). */
+	lspExtra?: Partial<INodeConfig>;
 }): Promise<IWorld> {
 	const dead = opts.dead ?? { val: false };
 	const alice = createNode(ALICE_SEED);
 	// The LSP runs the async receive service (issue #709); Carol registers
 	// with it once the channel is up, and her hold paths carry the grant.
 	const lsp = createNode(LSP_SEED, opts.lspStorage, {
-		asyncReceiveService: opts.lspService ?? { enabled: true }
+		asyncReceiveService: opts.lspService ?? { enabled: true },
+		...opts.lspExtra
 	});
 	const carol = createNode(CAROL_SEED, undefined, {
 		autoReleaseHeldForwards: opts.carolAutoRelease ?? true
