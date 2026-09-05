@@ -432,6 +432,37 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 			});
 		}
 
+		it('a zero-fee or sub-relay closing_complete is refused before we sign; the channel stays open and a relayable one still closes it', function () {
+			// Issue #560: the closee cannot bump a simple close, so co-signing a
+			// fee no mempool takes would strand our balance in CLOSED.
+			for (const feeSatoshis of [0n, 1n, 100n]) {
+				const h = negotiatingHarness(5, 6);
+				const errors: string[] = [];
+				h.bob.on('error', (_id, msg: string) => errors.push(msg));
+				h.bob.handleMessage(
+					h.aPub,
+					MessageType.CLOSING_COMPLETE,
+					craftedClosingComplete(h, { feeSatoshis })
+				);
+				expect(h.bobChannel.getState(), `fee ${feeSatoshis}`).to.equal(
+					ChannelState.NEGOTIATING_CLOSING
+				);
+				expect(h.bobTxs.length).to.equal(0);
+				expect(
+					h.bobOut.some((m) => m.type === MessageType.CLOSING_SIG)
+				).to.equal(false);
+				expect(
+					errors.some((e) => /below the \d+ sat relay floor/.test(e)),
+					`fee ${feeSatoshis}: ${errors.join('; ')}`
+				).to.equal(true);
+				// The real closing_complete from alice still closes cleanly.
+				pump(h.aliceOut, h.bob, h.aPub);
+				pump(h.bobOut, h.alice, h.bPub);
+				expect(h.bobChannel.getState()).to.equal(ChannelState.CLOSED);
+				expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+			}
+		});
+
 		it('garbage signature in closing_complete → no CLOSED, no broadcast, no closing_sig', function () {
 			const h = negotiatingHarness(5, 6);
 			const errors: string[] = [];
