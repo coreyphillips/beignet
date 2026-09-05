@@ -61,6 +61,19 @@ export const FF_WITNESS_VERSION = 1;
 export const FF_WITNESS_PROFILE_DR = 1;
 /** Section 9.6.5: propagate within this wall-clock bound in normal operation. */
 export const FF_WITNESS_BARRIER_MS = 30_000;
+
+/**
+ * Appendix F.1 paging. A mailbox with K near 483 holds more records than
+ * one BOLT 8 frame carries, so `ff_witness_fetch` may carry an odd trailing
+ * TLV naming `after_k`, and `ff_witness_fetch_resp` an odd trailing TLV
+ * naming `next_after_k` while records remain. The witness serves records in
+ * ascending k, at least one per page; each page is a fresh fetch under a
+ * fresh nonce.
+ */
+export const FF_WITNESS_FETCH_AFTER_K_TLV = 1n;
+export const FF_WITNESS_FETCH_NEXT_TLV = 1n;
+/** Record bytes one fetch response carries at most (a frame is 65535). */
+export const FF_WITNESS_FETCH_PAGE_BYTES = 60_000;
 /** Section 9.6.4: retention_until MUST be at least T_exp + this. */
 export const FF_WITNESS_RETENTION_MARGIN_BLOCKS = 144;
 /** Appendix F.2: the fixed header, 235 bytes. */
@@ -171,6 +184,10 @@ export interface IFforWitnessFetchMessage {
 	mailboxId: Buffer;
 	nonce: Buffer;
 	signature: Buffer;
+	/** The trailing TLV stream as it came off the wire; the signature covers it. */
+	tlv: Buffer;
+	/** F.1 paging: only records with k > after_k are wanted. */
+	afterK?: number;
 }
 
 export interface IFforWitnessFetchRespMessage {
@@ -178,6 +195,8 @@ export interface IFforWitnessFetchRespMessage {
 	ok: boolean;
 	records: IFforWitnessRecord[];
 	error?: string;
+	/** F.1 paging: present while records with k > next_after_k remain. */
+	nextAfterK?: number;
 }
 
 export interface IFforWitnessCloseMessage {

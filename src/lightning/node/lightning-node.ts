@@ -16198,44 +16198,69 @@ export class LightningNode extends EventEmitter {
 		for (const w of record.witnesses) {
 			const idHex = w.witnessNodeId.toString('hex');
 			if (witnessNodeIdHex && idHex !== witnessNodeIdHex) continue;
-			const requestId = FforWitnessService.freshRequestId();
-			const nonce = crypto.randomBytes(32);
-			let body: Buffer;
-			try {
-				body = await this.sendFforWitnessRequest(
-					idHex,
-					FF_WITNESS_FETCH_TYPE,
-					encodeWitnessFetch(requestId, w.mailboxId, nonce, w.fetchPrivkey),
-					requestId,
-					timeoutMs
-				);
-			} catch (err) {
-				out.push({
-					witnessNodeId: w.witnessNodeId,
-					ok: false,
-					error: (err as Error).message,
-					records: [],
-					credited: 0
-				});
-				continue;
-			}
-			let resp: ReturnType<typeof decodeWitnessFetchResp>;
-			try {
-				resp = decodeWitnessFetchResp(body);
-			} catch (err) {
-				out.push({
-					witnessNodeId: w.witnessNodeId,
-					ok: false,
-					error: `undecodable response: ${(err as Error).message}`,
-					records: [],
-					credited: 0
-				});
-				continue;
+			// Appendix F.1 paging: a page names next_after_k while records
+			// remain, and each page is a fresh fetch under a fresh nonce. A
+			// witness must advance k every page, so a mailbox of K slots takes
+			// at most K pages; one that pages backwards or past that is
+			// stopped, and what it served is still verified and credited.
+			const fetched: ReturnType<typeof decodeWitnessFetchResp>['records'] = [];
+			let ok = true;
+			let error: string | undefined;
+			let afterK: number | undefined;
+			for (let page = 0; ; page++) {
+				if (page > entries.length) {
+					ok = false;
+					error = 'witness paged past the book';
+					break;
+				}
+				const requestId = FforWitnessService.freshRequestId();
+				const nonce = crypto.randomBytes(32);
+				let body: Buffer;
+				try {
+					body = await this.sendFforWitnessRequest(
+						idHex,
+						FF_WITNESS_FETCH_TYPE,
+						encodeWitnessFetch(
+							requestId,
+							w.mailboxId,
+							nonce,
+							w.fetchPrivkey,
+							afterK
+						),
+						requestId,
+						timeoutMs
+					);
+				} catch (err) {
+					ok = false;
+					error = (err as Error).message;
+					break;
+				}
+				let resp: ReturnType<typeof decodeWitnessFetchResp>;
+				try {
+					resp = decodeWitnessFetchResp(body);
+				} catch (err) {
+					ok = false;
+					error = `undecodable response: ${(err as Error).message}`;
+					break;
+				}
+				if (!resp.ok) {
+					ok = false;
+					error = resp.error;
+					break;
+				}
+				fetched.push(...resp.records);
+				if (resp.nextAfterK === undefined) break;
+				if (afterK !== undefined && resp.nextAfterK <= afterK) {
+					ok = false;
+					error = 'witness paged backwards';
+					break;
+				}
+				afterK = resp.nextAfterK;
 			}
 			const summary = {
 				witnessNodeId: w.witnessNodeId,
-				ok: resp.ok,
-				...(resp.error ? { error: resp.error } : {}),
+				ok,
+				...(error ? { error } : {}),
 				records: [] as {
 					k: number;
 					unbarriered: boolean;
@@ -16244,7 +16269,7 @@ export class LightningNode extends EventEmitter {
 				}[],
 				credited: 0
 			};
-			for (const rec of resp.records) {
+			for (const rec of fetched) {
 				const v = verifyWitnessRecord(
 					rec,
 					w,
