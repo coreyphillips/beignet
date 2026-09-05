@@ -1025,6 +1025,15 @@ export interface ICloseStatus {
  * forwardingCltvDelta) and the channel's negotiated htlc_minimum_msat /
  * capacity-capped max_htlc_value_in_flight_msat.
  */
+/**
+ * Where one forward ended up when placed onto an outgoing channel:
+ * `forwarded` (the outgoing add left), `held` (the outgoing channel refused
+ * it and the JIT engine took it for a splice, after which the engine alone
+ * forwards or fails it), `refused` (refused, and the refund is the caller's
+ * or the engine's to carry, as the caller chose).
+ */
+export type ForwardPlacement = 'forwarded' | 'held' | 'refused';
+
 export interface IChannelPolicyUpdate {
 	feeBaseMsat?: number;
 	feeProportionalMillionths?: number;

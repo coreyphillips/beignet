@@ -147,6 +147,16 @@ export type NamespaceDecision =
 			/** Guardians disagree about whether the namespace exists at all. */
 			outcome: 'inconsistent';
 			detail: string;
+	  }
+	| {
+			/**
+			 * A quorum holds nothing under this namespace and the caller forbade
+			 * a genesis: it reached this set by following a rotation, so the
+			 * set MUST already hold the migrated chain, and registering fresh
+			 * here would start an empty history over a live one (issue #722).
+			 */
+			outcome: 'not-held';
+			detail: string;
 	  };
 
 export interface IGuardianReplicationConfig {
@@ -193,6 +203,7 @@ export interface IGuardianReplicationEvent {
 		| 'namespace:exists'
 		| 'namespace:no-quorum'
 		| 'namespace:inconsistent'
+		| 'namespace:not-held'
 		| 'record:replicated'
 		| 'record:under-replicated'
 		| 'record:rejected'
@@ -462,9 +473,14 @@ export class GuardianReplicator {
 	/**
 	 * Establish ownership of the namespace, asking the guardian set rather
 	 * than inferring from local state (spec 5.6, 5.7). Registration happens
-	 * ONLY when a read quorum reports the namespace unknown.
+	 * ONLY when a read quorum reports the namespace unknown, and only when
+	 * the caller permits a genesis: a caller following a rotation passes
+	 * `allowGenesis: false`, because the incoming set must already hold the
+	 * migrated chain and an empty answer there is a fault, not first setup.
 	 */
-	async ensureNamespace(): Promise<NamespaceDecision> {
+	async ensureNamespace(
+		opts: { allowGenesis?: boolean } = {}
+	): Promise<NamespaceDecision> {
 		const held = loadWriterLease(this.config.storage);
 		if (held.state === 'present') {
 			return { outcome: 'already-held', lease: held.lease };
@@ -590,6 +606,21 @@ export class GuardianReplicator {
 					: 'no quorum agrees the namespace is unknown';
 			this.emit({ type: 'namespace:inconsistent', detail });
 			return { outcome: 'inconsistent', detail };
+		}
+
+		// A quorum says the namespace does not exist. Following a rotation
+		// that is a data-loss shape (issue #722): the writer registered the
+		// incoming set before retiring the outgoing one, so an incoming set
+		// that knows nothing either never received that registration or is
+		// not the set the rotation meant. Refuse rather than start over; a
+		// registration this device itself began is still resumed below.
+		if (opts.allowGenesis === false && pendingRegistration === null) {
+			const detail =
+				`${unknown.size} of ${this.config.guardians.length} guardians ` +
+				'answered unknown-namespace on a set reached by following a ' +
+				'rotation; a fresh genesis is refused here';
+			this.emit({ type: 'namespace:not-held', detail });
+			return { outcome: 'not-held', detail };
 		}
 
 		// A quorum says the namespace does not exist: this is first setup.

@@ -263,6 +263,14 @@ export interface IGuardianAssemblyConfig {
 	transportFor?: (
 		guardian: IParsedGuardian
 	) => GuardianHttpTransport | undefined;
+	/**
+	 * This set was reached by following a rotation (the journal names it, or
+	 * the boot loop just followed one). The incoming set of a rotation must
+	 * already hold the namespace, so a quorum answering unknown-namespace is
+	 * refused as `unavailable` / `rotation-target-empty` instead of
+	 * registering a fresh genesis over a live history (issue #722).
+	 */
+	following?: boolean;
 }
 
 /**
@@ -288,7 +296,11 @@ export interface IGuardianAssemblyConfig {
  *
  * `unavailable`: no quorum answered, or the guardians disagree about
  * whether the namespace exists. Nothing can be decided; surface the detail
- * and retry when the set is reachable.
+ * and retry when the set is reachable. `rotation-target-empty` is the
+ * third shape (issue #722): the set was reached by following a rotation
+ * and a quorum holds nothing under the namespace, so registering would
+ * start an empty history over the live one; nothing was registered, and
+ * the operator has to find out why the incoming set never received it.
  */
 export type GuardianBootDecision =
 	| {
@@ -314,7 +326,7 @@ export type GuardianBootDecision =
 	  }
 	| {
 			kind: 'unavailable';
-			outcome: 'no-quorum' | 'inconsistent';
+			outcome: 'no-quorum' | 'inconsistent' | 'rotation-target-empty';
 			detail: string;
 	  }
 	/**
@@ -402,7 +414,9 @@ export async function buildGuardianRecovery(
 		allowUnencryptedSecrets: config.allowUnencryptedSecrets
 	});
 
-	const decision = await replicator.ensureNamespace();
+	const decision = await replicator.ensureNamespace({
+		allowGenesis: !config.following
+	});
 	switch (decision.outcome) {
 		case 'already-held':
 		case 'registered': {
@@ -483,6 +497,12 @@ export async function buildGuardianRecovery(
 			return {
 				kind: 'unavailable',
 				outcome: 'inconsistent',
+				detail: decision.detail
+			};
+		case 'not-held':
+			return {
+				kind: 'unavailable',
+				outcome: 'rotation-target-empty',
 				detail: decision.detail
 			};
 	}
