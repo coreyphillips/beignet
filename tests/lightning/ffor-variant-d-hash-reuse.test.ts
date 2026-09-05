@@ -39,7 +39,9 @@ import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
 
 /** A second payer with its own channel to S, so the same invoice can be paid twice. */
 function addPayer(w: IWorld): { p2: LightningNode; link: NodeLink } {
-	const p2 = new LightningNode(makeNodeConfig(9_000 + Math.floor(Math.random() * 1000)));
+	const p2 = new LightningNode(
+		makeNodeConfig(9_000 + Math.floor(Math.random() * 1000))
+	);
 	p2.on('node:error', () => {});
 	const link = new NodeLink(p2, w.s);
 	const channelId = openReadyChannel(p2, w.s, 1_000_000n);
