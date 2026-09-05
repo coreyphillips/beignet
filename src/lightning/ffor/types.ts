@@ -188,6 +188,13 @@ export interface IFforEpochRecord {
 	 */
 	exposedSlots: boolean[];
 	/**
+	 * R: the receipt witnesses provisioned for this epoch (section 9.6.4),
+	 * with the keys their records are fetched and decrypted under. Persisted
+	 * before the manifest leaves, or a crash after the send would orphan a
+	 * mailbox whose keys R lost.
+	 */
+	witnesses: import('./witness-types').IFforWitnessProvision[];
+	/**
 	 * S: set once ff_close has been processed (section 7.5.6 stopping
 	 * condition), before the drain round completes and DRAINING is
 	 * persisted.

@@ -51,6 +51,21 @@ export function computeTSetup(tInit: Buffer, acceptWire: Buffer): Buffer {
 	return sha256(ascii('ffor/tr/setup'), tInit, acceptWire);
 }
 
+/** One section 7.5.3 entry: `[2: k][32: H_k][8: d_k][4: T_exp][4: D][8: s_htlc_id]`. */
+export function encodeBookEntry(e: IFforBookEntry): Buffer {
+	return Buffer.concat([
+		u16(e.k),
+		e.paymentHash,
+		u64(e.amountMsat),
+		u32(e.voucherExpiry),
+		u32(e.settlementDeadline),
+		u64(e.sHtlcId)
+	]);
+}
+
+export const BOOK_ENTRY_LEN = 2 + 32 + 8 + 4 + 4 + 8;
+export const BOOK_HEADER_LEN = 32 + 1 + 1 + 2;
+
 /** Section 7.5.3: entries in slot order, k 1-based. */
 export function buildVoucherBook(
 	epochId: Buffer,
@@ -63,17 +78,39 @@ export function buildVoucherBook(
 		u8(FF_PROFILE_FIXED_AMOUNT),
 		u16(entries.length)
 	];
-	for (const e of entries) {
-		parts.push(
-			u16(e.k),
-			e.paymentHash,
-			u64(e.amountMsat),
-			u32(e.voucherExpiry),
-			u32(e.settlementDeadline),
-			u64(e.sHtlcId)
-		);
-	}
+	for (const e of entries) parts.push(encodeBookEntry(e));
 	return Buffer.concat(parts);
+}
+
+/** The inverse of buildVoucherBook; throws on a malformed book. */
+export function decodeVoucherBook(book: Buffer): {
+	epochId: Buffer;
+	variant: FforVariant;
+	profile: number;
+	entries: IFforBookEntry[];
+} {
+	if (book.length < BOOK_HEADER_LEN) throw new Error('book too short');
+	const epochId = Buffer.from(book.subarray(0, 32));
+	const variant = book[32] as FforVariant;
+	const profile = book[33];
+	const count = book.readUInt16BE(34);
+	if (book.length !== BOOK_HEADER_LEN + count * BOOK_ENTRY_LEN) {
+		throw new Error('book length does not match its entry count');
+	}
+	const entries: IFforBookEntry[] = [];
+	let at = BOOK_HEADER_LEN;
+	for (let i = 0; i < count; i++) {
+		entries.push({
+			k: book.readUInt16BE(at),
+			paymentHash: Buffer.from(book.subarray(at + 2, at + 34)),
+			amountMsat: book.readBigUInt64BE(at + 34),
+			voucherExpiry: book.readUInt32BE(at + 42),
+			settlementDeadline: book.readUInt32BE(at + 46),
+			sHtlcId: book.readBigUInt64BE(at + 50)
+		});
+		at += BOOK_ENTRY_LEN;
+	}
+	return { epochId, variant, profile, entries };
 }
 
 export function computeHBook(book: Buffer): Buffer {

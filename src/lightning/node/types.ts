@@ -307,6 +307,19 @@ export interface INodeConfig {
 	 * under an active registration are admitted, within the limits.
 	 */
 	asyncReceiveService?: import('../async-payments/types').IAsyncReceiveServiceConfig;
+	/**
+	 * FFOR D-R receipt witness (spec section 9.6): store a receiver-encrypted
+	 * record of every delegated preimage this node relays, before propagating
+	 * the fulfil, and serve it to the receiver on return. Disabled by default.
+	 */
+	fforWitness?: import('../ffor/witness-service').IFforWitnessConfig;
+	/**
+	 * FFOR BOLT 12 issuer (spec section 9.7): answer invoice_requests for
+	 * offers a receiver delegated to this node, one fixed-amount slot per
+	 * invoice. Needs `fforWitness` (the issuer is co-hosted with the first
+	 * witness, whose mailbox holds the book). Disabled by default.
+	 */
+	fforIssuer?: import('../ffor/issuer-service').IFforIssuerConfig;
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
 	/** Resource management config */
