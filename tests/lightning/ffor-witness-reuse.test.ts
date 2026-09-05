@@ -55,7 +55,7 @@ describe('FFOR receipt witness reuse characterization (M9.4, section 13.7.1)', f
 		const r = new LightningNode(makeNodeConfig(seed + 3));
 		for (const n of [p, p2, w, s, r]) n.on('node:error', () => {});
 		const pw = new NodeLink(p, w);
-		const p2w = new NodeLink(p2, w);
+		new NodeLink(p2, w);
 		const ws = new NodeLink(w, s);
 		const sr = new NodeLink(s, r);
 		new NodeLink(r, w);
