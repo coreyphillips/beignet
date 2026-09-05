@@ -941,6 +941,17 @@ export class LightningNode extends EventEmitter {
 			timer: NodeJS.Timeout;
 		}
 	>();
+	/**
+	 * Inbound HTLCs of held forwards whose release was refused while their
+	 * channel could not carry the refund (issue #708 review). The row is
+	 * terminal (FAILED, forward_refused); the refund is owed here and
+	 * retried when the channel reestablishes and on every block, so a live
+	 * reconnect resolves it, not only a restart. Keyed by inbound identity.
+	 */
+	private owedHeldForwardFailures = new Map<
+		string,
+		{ inChannelIdHex: string; fail: () => boolean }
+	>();
 	private graphPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
 		null;
@@ -1587,7 +1598,8 @@ export class LightningNode extends EventEmitter {
 			incomingUnresolved: (record) =>
 				this.heldForwardIncomingUnresolved(record),
 			registrationIdFor: (lspNodeIdHex) =>
-				this.liveAsyncReceiveGrant(lspNodeIdHex)?.registrationId
+				this.liveAsyncReceiveGrant(lspNodeIdHex)?.registrationId,
+			canForwardSet: (records) => this.canForwardHeldSet(records)
 		});
 		this.asyncPaymentManager.attachOnionMessageManager(
 			this.onionMessageManager
@@ -3498,6 +3510,7 @@ export class LightningNode extends EventEmitter {
 			// durable row, and a receiver whose channel just came back is told
 			// what is parked for it.
 			this.asyncPaymentManager.onChannelUsable(channelId.toString('hex'));
+			this.retryOwedHeldForwardFailures(channelId.toString('hex'));
 			const peer = this.channelManager.getPeerForChannel(channelId);
 			if (peer) this.asyncPaymentManager.sendNotice(peer);
 		});
@@ -17869,7 +17882,9 @@ export class LightningNode extends EventEmitter {
 		// (on release) with a current HTLC counter. Synchronous loopback may
 		// complete the whole fulfillment chain during addHtlc, so we track the
 		// outgoing→incoming link BEFORE forwarding (same timing as payment storage).
-		const performForward = (): boolean =>
+		const performForward = (
+			fail: (code: number) => boolean = failIncoming
+		): boolean =>
 			this.forwardHtlcOnto(outChannelId, {
 				inChannelId,
 				inHtlcId,
@@ -17879,7 +17894,7 @@ export class LightningNode extends EventEmitter {
 				incomingCltvExpiry,
 				nextPacket,
 				nextBlindingPoint,
-				failIncoming
+				failIncoming: fail
 			});
 
 		// Async payments (LSP role, issue #708): the recipient's blinded path
@@ -17959,8 +17974,11 @@ export class LightningNode extends EventEmitter {
 		incomingCltvExpiry: number;
 		/** What our forwarding policy earns on this forward. */
 		policyFeeMsat: bigint;
-		/** Place the onward add; true when the outgoing channel accepted it. */
-		performForward: () => boolean;
+		/**
+		 * Place the onward add; true when the outgoing channel accepted it.
+		 * The refusal path fails the inbound HTLC through the given closure.
+		 */
+		performForward: (fail?: (code: number) => boolean) => boolean;
 		failIncoming: (code: number) => boolean;
 	}): void {
 		const receiverHex = this.channelManager.getPeerForChannel(
@@ -18027,7 +18045,31 @@ export class LightningNode extends EventEmitter {
 				// Judged by the add's acceptance, not by the linkage row: a
 				// synchronous loopback can run the whole fulfill chain inside
 				// the add and consume the row before this returns.
-				return args.performForward() ? 'forwarded' : 'refused';
+				let inboundResolved = false;
+				const tracked = (code: number): boolean => {
+					const ok = args.failIncoming(code);
+					if (ok) inboundResolved = true;
+					return ok;
+				};
+				if (args.performForward(tracked)) return 'forwarded';
+				// The refusal path fails the inbound HTLC; when its channel
+				// could not carry that (reestablishing), the row still goes
+				// terminal and the refund is owed HERE, retried on reestablish
+				// and per block. Unless the JIT engine took the part for a
+				// splice: it will forward it, and failing it would pay
+				// downstream for an inbound leg already refunded.
+				if (
+					!inboundResolved &&
+					!this.jitReceiveManager?.holdsPart(
+						args.inChannelId.toString('hex'),
+						args.inHtlcId
+					)
+				) {
+					this.oweHeldForwardFailure(args.inChannelId, args.inHtlcId, () =>
+						args.failIncoming(TEMPORARY_CHANNEL_FAILURE)
+					);
+				}
+				return 'refused';
 			},
 			fail: () => args.failIncoming(UNKNOWN_NEXT_PEER)
 		};
@@ -18065,9 +18107,94 @@ export class LightningNode extends EventEmitter {
 			// The durable row did not land: never hold what a restart would
 			// not remember. Fail back now; the payer retries.
 			args.failIncoming(TEMPORARY_NODE_FAILURE);
+			return;
+		}
+		// A redispatch that finds a FAILED row with the inbound HTLC still
+		// committed (the process died before the refund the row's failure
+		// owed could be carried): the refund is owed again, now.
+		if (
+			outcome.record.state === 'FAILED' &&
+			this.findOutgoingLeg(args.inChannelId, args.inHtlcId) === null
+		) {
+			this.oweHeldForwardFailure(args.inChannelId, args.inHtlcId, () =>
+				args.failIncoming(TEMPORARY_CHANNEL_FAILURE)
+			);
+			this.retryOwedHeldForwardFailures(args.inChannelId.toString('hex'));
 		}
 		// A NEW hold surfaces through the manager's 'held' event (wired in
 		// the constructor); a re-registration after a restart is silent.
+	}
+
+	private oweHeldForwardFailure(
+		inChannelId: Buffer,
+		inHtlcId: bigint,
+		fail: () => boolean
+	): void {
+		const inChannelIdHex = inChannelId.toString('hex');
+		this.owedHeldForwardFailures.set(`${inChannelIdHex}:${inHtlcId}`, {
+			inChannelIdHex,
+			fail
+		});
+		this.emitStructuredLog('htlc', 'held_forward_refund_owed', {
+			inChannelId: inChannelIdHex,
+			inHtlcId: Number(inHtlcId)
+		});
+	}
+
+	/**
+	 * Carry every owed held-forward refund the channel can take now: on the
+	 * channel's reestablish, and on every block for one it can carry at any
+	 * time. A refund whose HTLC is gone (settled, failed, channel closed) is
+	 * dropped: there is nothing left to fail.
+	 */
+	private retryOwedHeldForwardFailures(inChannelIdHex?: string): void {
+		for (const [key, owed] of this.owedHeldForwardFailures) {
+			if (inChannelIdHex && owed.inChannelIdHex !== inChannelIdHex) continue;
+			const [chanHex, htlcId] = key.split(':');
+			const channel = this.channelManager.getChannel(
+				Buffer.from(chanHex, 'hex')
+			);
+			const htlc = channel?.getFullState().htlcs.get(`received-${htlcId}`);
+			const stillCommitted =
+				htlc !== undefined &&
+				(htlc.state === HtlcState.COMMITTED ||
+					htlc.state === HtlcState.PENDING);
+			if (!stillCommitted || owed.fail()) {
+				this.owedHeldForwardFailures.delete(key);
+			}
+		}
+	}
+
+	/**
+	 * All-or-nothing at the channel for a held-forward set release (issue
+	 * #708 review): every unplaced part of the set, grouped by outgoing
+	 * channel, must fit that channel's limits together. A channel that cannot
+	 * take adds at all right now answers true: the driver defers the set and
+	 * the question is asked again when it can.
+	 */
+	private canForwardHeldSet(records: IHeldForwardRecord[]): boolean {
+		const byChannel = new Map<string, bigint[]>();
+		for (const r of records) {
+			const list = byChannel.get(r.outChannelIdHex) ?? [];
+			list.push(BigInt(r.forwardAmountMsat));
+			byChannel.set(r.outChannelIdHex, list);
+		}
+		for (const [channelIdHex, amounts] of byChannel) {
+			const channel = this.channelManager.getChannel(
+				Buffer.from(channelIdHex, 'hex')
+			);
+			if (!channel) return false;
+			const state = channel.getState();
+			if (
+				state === ChannelState.AWAITING_REESTABLISH ||
+				state === ChannelState.SPLICING ||
+				(state === ChannelState.NORMAL && channel.isQuiescing())
+			) {
+				continue;
+			}
+			if (!channel.canOfferHtlcSet(amounts)) return false;
+		}
+		return true;
 	}
 
 	/**
@@ -20269,6 +20396,19 @@ export class LightningNode extends EventEmitter {
 	 * ChannelManager exactly once before calling it.
 	 */
 	private runPerBlockWork(blockHeight: number): void {
+		// The height is durable BEFORE any of the work below is judged at it
+		// (issue #708 review): a process that dies inside a per-block scan
+		// restarts at the height that scan was judged at, so a held forward
+		// its predecessor had already found past the cutoff is never released
+		// by a successor that has not seen a block yet.
+		if (this.storage) {
+			try {
+				this.storage.saveMetadata('blockHeight', String(blockHeight));
+			} catch {
+				// best-effort
+			}
+		}
+		this.retryOwedHeldForwardFailures();
 		// Funding txs we are obligated to broadcast (BOLT 2) but which have
 		// not confirmed yet: retry, so a transient failure at watch:funding
 		// or a mempool eviction never orphans a signed funding.
@@ -20321,13 +20461,6 @@ export class LightningNode extends EventEmitter {
 		this.sweepExpiredIssuedInvoices();
 		if (blockHeight % 10 === 0) {
 			this.scanExpiredPendingPayments();
-		}
-		if (this.storage) {
-			try {
-				this.storage.saveMetadata('blockHeight', String(blockHeight));
-			} catch {
-				// best-effort
-			}
 		}
 		// Keep the fee advisor warm so a (synchronous) force-close can resolve a live
 		// feerate for its commitment CPFP + time-sensitive HTLC txs (H2). Non-blocking.

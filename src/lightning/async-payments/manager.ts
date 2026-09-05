@@ -66,6 +66,13 @@ export interface IAsyncPaymentManagerDeps {
 	hasOutgoingLeg: (record: IHeldForwardRecord) => boolean;
 	/** Durable fact: the inbound HTLC is still committed and unresolved. */
 	incomingUnresolved: (record: IHeldForwardRecord) => boolean;
+	/**
+	 * All-or-nothing at the channel (issue #708 review): can every one of
+	 * these unplaced parts be placed right now, judged together? True when
+	 * the outgoing channel cannot take adds at all yet (the driver defers
+	 * then); false only when the channel can, and the set does not fit.
+	 */
+	canForwardSet?: (records: IHeldForwardRecord[]) => boolean;
 	/** Unix milliseconds; injectable for expiry tests. */
 	now?: () => number;
 	/**
@@ -316,6 +323,28 @@ export class AsyncPaymentManager extends EventEmitter {
 				return;
 			}
 			if (!driver) return;
+			// A set of more than one part is placed whole or not at all: the
+			// ledger transition was atomic, and the channel must be too. Every
+			// unplaced member is judged together before this add leaves; a set
+			// that does not fit is failed back whole, never delivered half.
+			// A single part needs no such check: there is no half of one, and
+			// the add's own verdict is exact.
+			const set = this.unplacedReleaseSet(r);
+			if (
+				set.length > 1 &&
+				this.deps.canForwardSet &&
+				!this.deps.canForwardSet(set)
+			) {
+				for (const member of set) {
+					this.ledger.abandonRelease(member.id, 'set_capacity');
+				}
+				this.emit('release-set-failed', {
+					holdIds: set.map((m) => m.id),
+					reason: 'set_capacity'
+				});
+				for (const member of set) this.driveHold(member.id);
+				return;
+			}
 			const outcome = driver.forward();
 			if (outcome === 'forwarded') {
 				this.finish(this.ledger.markReleased(holdIdHex), 'released');
@@ -339,6 +368,22 @@ export class AsyncPaymentManager extends EventEmitter {
 				this.finish(this.ledger.markFailed(holdIdHex), 'failed');
 			}
 		}
+	}
+
+	/**
+	 * The members of `r`'s release set (the rows that left HELD under the
+	 * same capability) that are still RELEASING with no outgoing leg.
+	 */
+	private unplacedReleaseSet(r: IHeldForwardRecord): IHeldForwardRecord[] {
+		if (!r.releaseNonceHex) return [r];
+		return this.ledger
+			.list()
+			.filter(
+				(x) =>
+					x.state === 'RELEASING' &&
+					x.releaseNonceHex === r.releaseNonceHex &&
+					!this.deps.hasOutgoingLeg(x)
+			);
 	}
 
 	private finish(
