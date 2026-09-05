@@ -135,8 +135,16 @@ import {
 	CHANNEL_DISABLED,
 	MPP_TIMEOUT,
 	TEMPORARY_NODE_FAILURE,
+	IProcessedOnion,
 	EXPIRY_TOO_FAR
 } from '../onion/types';
+import { checkDelegatedAmounts } from '../ffor/amounts';
+import {
+	FforAbortReason,
+	FforSlotState,
+	FforState,
+	IFforEpochRecord
+} from '../ffor/types';
 import { encode as encodeInvoice } from '../invoice/encode';
 import { decode as decodeInvoice } from '../invoice/decode';
 import {
@@ -2840,6 +2848,9 @@ export class LightningNode extends EventEmitter {
 			// Parked against a hold invoice. settle/cancel drives it, not the
 			// forwarding machinery.
 			if (this.isHeldHtlc(channelId, htlc.id)) continue;
+			// An FFOR voucher (section 9.5.1): the epoch's drain or unwind
+			// resolves it, never the onion path. Same for a mismatching add.
+			if (htlc.fforVoucher === true || htlc.fforMismatch === true) continue;
 			// Held by the JIT engine before the restart, and already owed a
 			// refund by the restored-hold queue. Dispatching it again would
 			// forward a payment the sweep is about to fail upstream.
@@ -4175,6 +4186,19 @@ export class LightningNode extends EventEmitter {
 			'message:outbound',
 			(peerPubkey: string, type: number, payload: Buffer) => {
 				this.emitOutbound(peerPubkey, type, payload, true);
+			}
+		);
+
+		this.channelManager.on(
+			'ffor:state',
+			(channelId: Buffer, state: number, record: IFforEpochRecord) => {
+				this.emit('ffor:state', { channelId, state, record });
+			}
+		);
+		this.channelManager.on(
+			'ffor:enforce',
+			(channelId: Buffer, record: IFforEpochRecord) => {
+				this.emit('ffor:enforce', { channelId, record });
 			}
 		);
 
@@ -13941,7 +13965,9 @@ export class LightningNode extends EventEmitter {
 		// the hash, so we never learn the preimage until settle time. Otherwise we
 		// generate the preimage ourselves (and can hold it for a hold invoice).
 		const externalHash =
-			options.hold && options.paymentHash ? options.paymentHash : undefined;
+			(options.hold || options.fforVoucher) && options.paymentHash
+				? options.paymentHash
+				: undefined;
 		if (externalHash && externalHash.length !== 32) {
 			throw new Error('paymentHash must be 32 bytes');
 		}
@@ -13962,7 +13988,10 @@ export class LightningNode extends EventEmitter {
 		// JIT-receive hint (issue #594) names the LSP and an intercept SCID for
 		// a channel that does not exist yet, so it can only come from outside.
 		const routingHints = [
-			...this.getPrivateChannelRoutingHints(),
+			// An FFOR voucher invoice is payable only through S's hop with the
+			// epoch's fee terms (section 7.6); our own channel hints would name
+			// the same channel under S's ordinary policy.
+			...(options.fforVoucher ? [] : this.getPrivateChannelRoutingHints()),
 			...(options.extraRoutingHints ?? [])
 		];
 
@@ -15387,6 +15416,22 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
+		// FFOR Variant D (section 9.5.1 "Settlement"): a hash in a live voucher
+		// book of ours is settled here with the slot's preimage, or failed; it
+		// never takes the forward or final-hop path, and nothing is sent to R.
+		if (
+			this.fforTrySettleDelegated(
+				channelId,
+				htlcId,
+				amountMsat,
+				paymentHash,
+				htlcEntry,
+				processed
+			)
+		) {
+			return;
+		}
+
 		if (finalHop) {
 			// We are the final destination. htlcEntry.blindingPoint is the
 			// update_add_htlc path key a downstream blinded final hop received
@@ -15417,6 +15462,361 @@ export class LightningNode extends EventEmitter {
 				htlcEntry.blindingPoint
 			);
 		}
+	}
+
+	// ─────────────── FFOR Variant D (specs/ffor-offline-receive.md) ───────────────
+
+	/**
+	 * S: settle or fail an upstream HTLC whose hash is in a voucher book of
+	 * ours (sections 7.5.6, 7.6, 8, 9.5.1). Returns false when the hash is in
+	 * no book, so the caller continues on the ordinary path. Everything here
+	 * happens on the UPSTREAM channel; the channel to R is never touched, and
+	 * nothing is sent to R (section 9.5).
+	 */
+	private fforTrySettleDelegated(
+		channelId: Buffer,
+		htlcId: bigint,
+		amountMsat: bigint,
+		paymentHash: Buffer,
+		htlcEntry: IHtlcEntry,
+		processed: IProcessedOnion
+	): boolean {
+		const slot = this.channelManager.fforFindDelegatedSlot(paymentHash);
+		if (!slot) return false;
+		const { record, entry } = slot;
+		const k = entry.k;
+		const htlcSecretKey = `${channelId.toString('hex')}:${htlcId}`;
+		const hopPayload = processed.hopPayload;
+		// Section 7.6 "What S reads": under a blinded path our payload carries
+		// encrypted_recipient_data, not a plaintext amount. TLV 12 marks the
+		// introduction node; a message-level point, a downstream hop.
+		const blindedRole: 'intro' | 'mid' | undefined = hopPayload.blindingPoint
+			? 'intro'
+			: htlcEntry.blindingPoint
+			? 'mid'
+			: undefined;
+		const blinded =
+			blindedRole !== undefined &&
+			hopPayload.encryptedRecipientData !== undefined;
+		const fail = (code: number, why: string, data?: Buffer): true => {
+			this.emitStructuredLog('htlc', 'ffor_delegated_failed', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				slot: k,
+				reason: why
+			});
+			this.emit('ffor:delegated-failed', {
+				channelId: slot.channelId,
+				k,
+				paymentHash,
+				upstreamChannelId: channelId,
+				upstreamHtlcId: htlcId,
+				reason: why
+			});
+			if (blindedRole) {
+				// Section 7.6: every failure under a blinded path is
+				// invalid_onion_blinding, and which check failed never leaks.
+				this.failBlindedIncomingHtlc(
+					channelId,
+					htlcId,
+					blindedRole,
+					processed.sharedSecret
+				);
+				return true;
+			}
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(
+				channelId,
+				htlcId,
+				createFailureMessage(processed.sharedSecret, code, data)
+			);
+			return true;
+		};
+
+		// A slot already SETTLING or SETTLED answers exactly the upstream HTLC
+		// it recorded (section 9.5.1): S committed to reveal t_k, so on a
+		// re-drive after a restart the ONLY safe move is to fulfil it, whatever
+		// the stopping conditions, the deadline or the epoch's state say now;
+		// its preimage is in (or will be in) the ff_close_ack. A second HTLC on
+		// the slot is refused.
+		const slotState = record.slotStates[k - 1];
+		const recordedUpstream = record.slotUpstream[k - 1];
+		const committedRedrive =
+			slotState !== FforSlotState.UNUSED && recordedUpstream === htlcSecretKey;
+		if (slotState !== FforSlotState.UNUSED && !committedRedrive) {
+			return fail(
+				TEMPORARY_NODE_FAILURE,
+				'duplicate delegated payment for consumed hash'
+			);
+		}
+		if (!committedRedrive) {
+			// Section 7.5.6 stopping conditions the channel judges: not ACTIVE,
+			// ff_close processed, tip at or past D, activation mismatch.
+			const refusal = slot.channel.fforSettlementRefusal(
+				k,
+				this.currentBlockHeight
+			);
+			if (refusal) return fail(TEMPORARY_NODE_FAILURE, refusal);
+
+			// Section 8: the upstream HTLC must leave us our safety delta.
+			if (
+				this.currentBlockHeight > 0 &&
+				htlcEntry.cltvExpiry <=
+					this.currentBlockHeight + this.forwardingCltvDelta
+			) {
+				return fail(
+					TEMPORARY_NODE_FAILURE,
+					'upstream cltv_expiry inside the safety delta'
+				);
+			}
+
+			// Section 7.6 checks 1 and 2 on the payee amount d_k.
+			const amountCheck = checkDelegatedAmounts({
+				payeeAmountMsat: entry.amountMsat,
+				amountMsat,
+				amtToForwardMsat: hopPayload.amountToForwardMsat ?? null,
+				hopKind: blinded ? 'blinded' : 'plaintext',
+				feeBaseMsat: record.params.feeBaseMsat,
+				feeProportionalMillionths: record.params.feeProportionalMillionths
+			});
+			if (amountCheck) {
+				if (amountCheck.check === 2) {
+					return fail(
+						FEE_INSUFFICIENT,
+						'fee_insufficient',
+						this.updateFlaggedFailureData(FEE_INSUFFICIENT, {
+							htlcMsat: amountMsat
+						})
+					);
+				}
+				return fail(
+					TEMPORARY_NODE_FAILURE,
+					`amount check failed: ${amountCheck.reason}`
+				);
+			}
+		}
+
+		// Settle: SETTLING is on disk before the preimage leaves (section
+		// 9.5.1), the preimage is recorded for the chain monitors before the
+		// fulfil (a force-close mid-settle can still claim), then SETTLED.
+		const preimage = record.preimages[k - 1];
+		if (!preimage) return fail(TEMPORARY_NODE_FAILURE, 'no preimage for slot');
+		if (slotState === FforSlotState.UNUSED) {
+			const marked = this.channelManager.fforSetSlot(
+				slot.channelId,
+				k,
+				FforSlotState.SETTLING,
+				htlcSecretKey
+			);
+			if (!marked.ok) {
+				// The durable SETTLING did not land. Nothing may be revealed or
+				// sent on a state that is not on disk: memory follows disk
+				// (the slot reverts to UNUSED) and the HTLC stays pending for
+				// the reestablish re-drive, which retries the write.
+				record.slotStates[k - 1] = FforSlotState.UNUSED;
+				record.slotUpstream[k - 1] = null;
+				this.emitStructuredLog('htlc', 'ffor_delegated_settle_deferred', {
+					channelId: channelId.toString('hex'),
+					htlcId: htlcId.toString(),
+					slot: k,
+					reason: marked.error ?? 'durable write failed'
+				});
+				return true;
+			}
+		}
+		const hashHex = paymentHash.toString('hex');
+		this.preimages.set(hashHex, preimage);
+		this.commitMutations(
+			'savePreimage',
+			[{ type: 'payment_preimage', paymentHash: hashHex, preimage }],
+			RecoveryCriticality.SafetyCritical
+		);
+		this.channelManager.recordPreimage(paymentHash, preimage);
+		const fulfilled = this.channelManager.fulfillHtlc(
+			channelId,
+			htlcId,
+			preimage
+		);
+		if (!fulfilled.ok || fulfilled.sendsWithheld) {
+			// Refused, or the fulfil's durable write failed: nothing is on
+			// the wire. Left SETTLING, which ff_close counts as settled; the
+			// upstream channel's own reestablish re-drives the HTLC through
+			// this path with the same key. A fulfil the quorum barrier merely
+			// parked (fulfilled.sendsHeld) is committed and leaves in order,
+			// so it is settled as if sent.
+			this.emitStructuredLog('htlc', 'ffor_delegated_fulfil_deferred', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				slot: k
+			});
+			return true;
+		}
+		this.channelManager.fforSetSlot(
+			slot.channelId,
+			k,
+			FforSlotState.SETTLED,
+			htlcSecretKey
+		);
+		this.cleanupHtlcSharedSecret(htlcSecretKey);
+		this.emitStructuredLog('htlc', 'ffor_delegated_settled', {
+			channelId: channelId.toString('hex'),
+			htlcId: htlcId.toString(),
+			slot: k,
+			amountMsat: amountMsat.toString()
+		});
+		this.emit('ffor:settled', {
+			channelId: slot.channelId,
+			k,
+			paymentHash,
+			upstreamChannelId: channelId,
+			upstreamHtlcId: htlcId
+		});
+		return true;
+	}
+
+	/** The FFOR epoch record of a channel, if any. */
+	getFforEpoch(channelIdHex: string): IFforEpochRecord | null {
+		return this.channelManager.getFforEpoch(Buffer.from(channelIdHex, 'hex'));
+	}
+
+	/**
+	 * R: start a Variant D epoch on a channel (section 9.5.1). The book is
+	 * `voucherAmountsMsat` in slot order. Setup runs to ACTIVE on its own;
+	 * watch 'ffor:state' or poll getFforEpoch.
+	 */
+	startFforEpoch(
+		channelIdHex: string,
+		request: {
+			voucherAmountsMsat: bigint[];
+			minPaymentMsat: bigint;
+			settlementDeadline: number;
+			voucherExpiry: number;
+			feeBaseMsat: number;
+			feeProportionalMillionths: number;
+			epochId?: Buffer;
+		}
+	): ChannelResult {
+		return this.channelManager.initiateFforEpoch(
+			Buffer.from(channelIdHex, 'hex'),
+			request
+		);
+	}
+
+	/** R: close the ACTIVE epoch (ff_close, section 7.5.4). */
+	closeFforEpoch(channelIdHex: string): ChannelResult {
+		return this.channelManager.closeFforEpoch(Buffer.from(channelIdHex, 'hex'));
+	}
+
+	/** Either side: abort a setup before ACTIVE. */
+	abortFforEpoch(
+		channelIdHex: string,
+		reason: FforAbortReason = FforAbortReason.OPERATOR,
+		text = 'operator abort'
+	): ChannelResult {
+		return this.channelManager.abortFforEpoch(
+			Buffer.from(channelIdHex, 'hex'),
+			reason,
+			text
+		);
+	}
+
+	/**
+	 * R: credit a voucher preimage learned from a payer's receipt or a
+	 * witness (section 7.5.6, section 9.5.3). Recorded for the chain
+	 * monitors too, so the voucher is claimable on-chain from either view.
+	 */
+	fforAddPreimage(channelIdHex: string, preimage: Buffer): ChannelResult {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const result = this.channelManager.fforAddPreimage(channelId, preimage);
+		if (result.ok) {
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			const hashHex = paymentHash.toString('hex');
+			this.preimages.set(hashHex, preimage);
+			this.commitMutations(
+				'savePreimage',
+				[{ type: 'payment_preimage', paymentHash: hashHex, preimage }],
+				RecoveryCriticality.SafetyCritical
+			);
+			this.channelManager.recordPreimage(paymentHash, preimage);
+		}
+		return result;
+	}
+
+	/**
+	 * R: the pre-signed fixed-amount BOLT 11 invoice for voucher k (sections
+	 * 7.3, 7.5.6, 7.6): amount exactly d_k, payment hash H_k, a route hint
+	 * naming S with the epoch's fee terms and S's cltv_expiry_delta, and an
+	 * expiry no later than a conservative wall-clock estimate of D. Refused
+	 * until the epoch is ACTIVE.
+	 */
+	createFforVoucherInvoice(
+		channelIdHex: string,
+		k: number,
+		description = 'FFOR voucher'
+	): ICreateInvoiceResult {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const channel = this.channelManager.getChannel(channelId);
+		const record = channel?.getFforEpoch() ?? null;
+		if (!channel || !record || record.role !== 'R') {
+			throw new Error('no FFOR epoch of ours on this channel');
+		}
+		if (record.state !== FforState.ACTIVE) {
+			throw new Error(
+				`FFOR epoch is ${
+					FforState[record.state]
+				}: invoices may be exposed only while ACTIVE`
+			);
+		}
+		if (record.activationMismatch) {
+			// Section 7.5.5: the peer contradicted our ACTIVE epoch at
+			// reestablish; an honest S will not settle these invoices.
+			throw new Error(
+				'FFOR epoch is in dispute after reestablish: no invoice is exposed'
+			);
+		}
+		if (k < 1 || k > record.params.maxPayments) {
+			throw new Error(`voucher ${k} is not in the book`);
+		}
+		// Section 7.5.6, fail closed: an invoice exposed at or past D, or with
+		// no tip to judge D by, is one an honest S will not settle.
+		if (this.currentBlockHeight <= 0) {
+			throw new Error('tip height unknown: cannot bound the invoice by D');
+		}
+		if (this.currentBlockHeight >= record.params.settlementDeadline) {
+			throw new Error(
+				`tip ${this.currentBlockHeight} is at or past settlement_deadline ${record.params.settlementDeadline}`
+			);
+		}
+		const hint = this.buildRoutingHintForChannel(channel);
+		if (!hint) {
+			throw new Error('no usable SCID or alias for the route hint to S');
+		}
+		const d = record.params.voucherAmountsMsat[k - 1];
+		// Section 7.5.6: at most 8 minutes per remaining block, then a margin.
+		const remainingBlocks = Math.max(
+			0,
+			record.params.settlementDeadline - this.currentBlockHeight
+		);
+		const expiry = Math.max(
+			60,
+			Math.floor(remainingBlocks * 8 * 60 * 0.9) - 600
+		);
+		return this.createInvoice({
+			amountMsat: d,
+			description,
+			expiry,
+			paymentHash: record.paymentHashes[k - 1],
+			fforVoucher: true,
+			extraRoutingHints: [
+				[
+					{
+						...hint,
+						feeBaseMsat: record.params.feeBaseMsat,
+						feeProportionalMillionths: record.params.feeProportionalMillionths
+					}
+				]
+			]
+		});
 	}
 
 	private parkQuiescentHtlc(
@@ -21570,6 +21970,9 @@ export class LightningNode extends EventEmitter {
 		// channel backup from us (and vice versa). Gated by peerStorageEnabled;
 		// the constructor clears the bit when that config flag is false.
 		flags.setOptional(Feature.PROVIDE_STORAGE);
+		// FFOR Variant D (specs/ffor-offline-receive.md section 5): both the
+		// recipient and the settlement-peer roles are implemented.
+		flags.setOptional(Feature.OPTION_FF_RECEIVE);
 		// LARGE_CHANNELS (18) is not set here but the constructor sets it by
 		// default (largeChannels defaults to true), so it is advertised unless
 		// opted out; the > 2^24 cap is still only lifted with a wumbo peer.

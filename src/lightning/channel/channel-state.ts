@@ -8,6 +8,7 @@
 
 import { ShaChainStore } from '../keys/shachain';
 import { IChannelBasepoints } from '../keys/derivation';
+import type { IFforEpochRecord } from '../ffor/types';
 import {
 	ChannelState,
 	ChannelRole,
@@ -618,6 +619,20 @@ export interface IChannelState {
 	 * AND restart. Optional for backward compatibility (treated as false).
 	 */
 	spliceAbortOwed?: boolean;
+
+	/**
+	 * FFOR Variant D (specs/ffor-offline-receive.md section 7.5.5): the
+	 * durable epoch record. Everything a restart with the peer offline needs
+	 * to serve every later transition from disk. Optional for backward
+	 * compatibility with states persisted before this field existed
+	 * (treated as null: no epoch).
+	 */
+	ffor?: IFforEpochRecord | null;
+	/**
+	 * FFOR section 7: epoch ids consumed on this channel, aborted setups
+	 * included, hex. Both sides enforce per-channel uniqueness.
+	 */
+	fforUsedEpochIds?: string[];
 
 	/** Dual-funding: v1 or v2 funding protocol */
 	fundingVersion: 1 | 2;

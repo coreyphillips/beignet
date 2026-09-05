@@ -101,7 +101,12 @@ export enum Feature {
 	 * the advertisement; the signed registration grant (issue #709) is the
 	 * actual capability.
 	 */
-	ASYNC_RECEIVE_SERVICE = 260
+	ASYNC_RECEIVE_SERVICE = 260,
+	/**
+	 * FFOR: Fast-Forward Offline Receive (specs/ffor-offline-receive.md
+	 * section 5), bits 560/561, provisional in the experimental range.
+	 */
+	OPTION_FF_RECEIVE = 560
 }
 
 /**
@@ -364,5 +369,6 @@ export function implementedFeatures(): FeatureFlags {
 	flags.setOptional(Feature.SPLICE);
 	flags.setOptional(Feature.SIMPLE_CLOSE);
 	flags.setOptional(Feature.PROVIDE_STORAGE);
+	flags.setOptional(Feature.OPTION_FF_RECEIVE);
 	return flags;
 }

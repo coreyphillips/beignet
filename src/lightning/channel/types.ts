@@ -327,6 +327,21 @@ export interface IHtlcEntry {
 	 */
 	forwardEmitted?: boolean;
 	/**
+	 * FFOR Variant D (section 9.5.1 step 3): this HTLC is a voucher of the
+	 * channel's epoch, recognised from the book by (id, amount, hash, cltv).
+	 * On R it is parked: never dispatched to the node's onion path, never
+	 * fulfilled or failed except by the epoch's own drain or unwind. On S it
+	 * marks the offered voucher for the same bookkeeping. Persisted.
+	 */
+	fforVoucher?: boolean;
+	/**
+	 * FFOR Variant D (section 9.5.1 step 3): a peer add inside the voucher
+	 * round window that did not match the book. Parked like a voucher (never
+	 * dispatched to the onion path) and failed by the round's unwind once the
+	 * channel is synchronized. Persisted.
+	 */
+	fforMismatch?: boolean;
+	/**
 	 * Admission-time classification (issue 410): this received HTLC was dust
 	 * and pushed total dust exposure past MAX_DUST_HTLC_EXPOSURE_MSAT when it
 	 * was admitted, so the node fails it back once committed (BOLT 2: SHOULD
@@ -446,6 +461,14 @@ export interface ChannelResult {
 	 * points whose caller has an obligation riding on the send actually leaving.
 	 */
 	sendsWithheld?: boolean;
+	/**
+	 * Information only: the batch committed its state and the quorum
+	 * durability barrier parked its sends, which leave in order once the
+	 * guardian receipt arrives. Not a refusal, and not sendsWithheld: the
+	 * entry points that keep the two apart (the FFOR drives, fulfillHtlc)
+	 * set this one for a hold and that one for a failed persist.
+	 */
+	sendsHeld?: boolean;
 	/**
 	 * The refusal's condition ends on its own, so the same request can succeed
 	 * later. Carried from the refusing channel arm's ERROR action (issue #633);

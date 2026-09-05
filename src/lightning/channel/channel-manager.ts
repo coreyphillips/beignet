@@ -178,6 +178,16 @@ import {
 } from './liquidity-ads';
 import { decodeAnnouncementSignaturesMessage } from '../gossip/messages';
 import { Feature, FeatureFlags } from '../features/flags';
+import { sign as signWithNodeKey } from '../crypto/ecdh';
+import { decodeFforHeader } from '../ffor/messages';
+import {
+	FF_ACTIVATION_TIMEOUT_MS,
+	FforAbortReason,
+	FforSlotState,
+	FforState,
+	IFforBookEntry,
+	IFforEpochRecord
+} from '../ffor/types';
 
 /**
  * The outpoints a raw transaction spends, txid in display-order hex (the
@@ -819,6 +829,16 @@ export class ChannelManager extends EventEmitter {
 			MessageType.TX_ACK_RBF,
 			MessageType.TX_ABORT,
 			MessageType.ANNOUNCEMENT_SIGNATURES,
+			// FFOR Variant D (specs/ffor-offline-receive.md section 14).
+			MessageType.FF_INIT,
+			MessageType.FF_ACCEPT,
+			MessageType.FF_INVOICES,
+			MessageType.FF_ERROR,
+			MessageType.FF_ACTIVATE,
+			MessageType.FF_ACTIVATE_ACK,
+			MessageType.FF_ABORT,
+			MessageType.FF_CLOSE,
+			MessageType.FF_CLOSE_ACK,
 			// BOLT 1 error/warning: without these registrations a remote error is
 			// silently dropped — the channel never gets marked ERRORED and the node
 			// reconnect-loops against a peer that fails it on every reestablish.
@@ -1370,16 +1390,37 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		const actions = channel.fulfillHtlc(htlcId, preimage);
-		this.processActions(peerPubkey, channel, actions);
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
 
 		// BOLT 2: after sending update_fulfill_htlc, send commitment_signed to
 		// commit the removal. autoSignAndSendCommitment is a no-op unless we owe a
 		// commitment, so when the fulfill is already being driven reactively (via
 		// handleRevokeAndAck) this does not double-commit.
+		//
+		// This runs whatever the dispatch reports. A batch the quorum barrier
+		// parked (progress.sendsHeld) committed its state and owes the wire in
+		// order, and the commitment that removes the HTLC has to queue behind
+		// it or nothing ever signs the removal: the restart re-drive of a
+		// forwarded fulfil is exactly such a proactive settle, with nobody
+		// else to drive the round. A failed persist (sendsWithheld) blocks the
+		// auto-sign's own batch the same way it blocked this one and surfaces
+		// transition:blocked, which is what forces the reconnect that
+		// re-drives both.
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return this.resultFromActions(actions);
+		const result = this.resultFromActions(actions);
+		// Reports, not dispositions, and kept apart because they mean opposite
+		// things: sendsWithheld is a failed persist (nothing durable, the
+		// update_fulfill_htlc is not on the wire and only a reconnect retries
+		// it); sendsHeld is the quorum barrier parking a committed batch whose
+		// sends leave in order once the receipt arrives. The FFOR delegated
+		// settle reads the first to leave its slot SETTLING; every other
+		// caller settles exactly as it always has.
+		if (progress.sendsWithheld) result.sendsWithheld = true;
+		if (progress.sendsHeld) result.sendsHeld = true;
+		return result;
 	}
 
 	/**
@@ -3129,7 +3170,17 @@ export class ChannelManager extends EventEmitter {
 			MessageType.TX_SIGNATURES,
 			MessageType.TX_INIT_RBF,
 			MessageType.TX_ACK_RBF,
-			MessageType.TX_ABORT
+			MessageType.TX_ABORT,
+			// FFOR Variant D: every message begins [32: channel_id][32: epoch_id].
+			MessageType.FF_INIT,
+			MessageType.FF_ACCEPT,
+			MessageType.FF_INVOICES,
+			MessageType.FF_ERROR,
+			MessageType.FF_ACTIVATE,
+			MessageType.FF_ACTIVATE_ACK,
+			MessageType.FF_ABORT,
+			MessageType.FF_CLOSE,
+			MessageType.FF_CLOSE_ACK
 		]);
 
 	/**
@@ -3284,6 +3335,17 @@ export class ChannelManager extends EventEmitter {
 					break;
 				case MessageType.WARNING:
 					this.handleWarningMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_INIT:
+				case MessageType.FF_ACCEPT:
+				case MessageType.FF_INVOICES:
+				case MessageType.FF_ERROR:
+				case MessageType.FF_ACTIVATE:
+				case MessageType.FF_ACTIVATE_ACK:
+				case MessageType.FF_ABORT:
+				case MessageType.FF_CLOSE:
+				case MessageType.FF_CLOSE_ACK:
+					this.handleFforMessage(peerPubkey, type, payload);
 					break;
 				default:
 					break;
@@ -5454,6 +5516,349 @@ export class ChannelManager extends EventEmitter {
 			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),
 			actions
 		};
+	}
+
+	// ─────────────── FFOR Variant D (specs/ffor-offline-receive.md) ───────────────
+
+	/** Last FFOR state reported per channel, for the ffor:state event. */
+	private _fforLastState = new Map<string, FforState | null>();
+	/** FFOR state per channel as of its latest committed persist. */
+	private _fforDurableState = new Map<string, FforState | null>();
+	/**
+	 * Section 7.5.5 setup timeout: a setup that has not reached ACTIVE within
+	 * the window is aborted (reason 1). Armed while a record is pre-ACTIVE,
+	 * cleared when it leaves that range.
+	 */
+	private _fforSetupTimers = new Map<string, NodeJS.Timeout>();
+
+	/**
+	 * Whether the peer's init features negotiated FFOR: option_ff_receive
+	 * (560/561) and option_quiesce (activation runs under quiescence). True
+	 * when the peer's init is unknown, as for splicing.
+	 */
+	private peerSupportsFfor(peerPubkey: string): boolean {
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (!init) return true;
+		return (
+			init.features.hasFeature(Feature.QUIESCE) &&
+			init.features.hasFeature(Feature.OPTION_FF_RECEIVE)
+		);
+	}
+
+	/** Hand the channel its peer's node id and our node-key signer. */
+	private _fforEnsureContext(peerPubkey: string, channel: Channel): void {
+		// Recovery suites drive dispatch with channel-shaped stubs.
+		if (typeof channel.setFforContext !== 'function') return;
+		if (!/^[0-9a-f]{66}$/i.test(peerPubkey)) return;
+		const nodeKey = this.config.nodePrivateKey ?? null;
+		channel.setFforContext({
+			remoteNodeId: Buffer.from(peerPubkey, 'hex'),
+			signFn: nodeKey
+				? (digest: Buffer): Buffer => signWithNodeKey(digest, nodeKey)
+				: null,
+			nodePrivateKey: nodeKey
+		});
+	}
+
+	/** Emit 'ffor:state' (channelId, state, record) when the state moved. */
+	private _fforEmitStateChange(channel: Channel): void {
+		if (typeof channel.getFforEpoch !== 'function') return;
+		const channelId = channel.getChannelId();
+		if (!channelId) return;
+		const hex = channelId.toString('hex');
+		const record = channel.getFforEpoch();
+		this._fforSyncSetupTimer(hex, channelId, record);
+		this._fforEmitEnforce(hex, channelId, record);
+		// Announce the DURABLE state, never the in-memory one: a re-entrant
+		// dispatch can have moved the record past what this batch persisted.
+		if (!this._fforDurableState.has(hex)) return;
+		const state = this._fforDurableState.get(hex) ?? null;
+		const last = this._fforLastState.get(hex);
+		if (last === state) return;
+		this._fforLastState.set(hex, state);
+		if (record && state !== null) {
+			this.emit('ffor:state', channelId, state, record);
+		}
+	}
+
+	private _fforSyncSetupTimer(
+		hex: string,
+		channelId: Buffer,
+		record: IFforEpochRecord | null
+	): void {
+		// Section 7.5.5: the timeout is S's. R never aborts on a timer (an
+		// ACTIVATING R must wait for the reestablish; S may hold ACTIVE).
+		const state = record ? record.state : null;
+		const preActive =
+			record !== null &&
+			record.role === 'S' &&
+			(state === FforState.NEGOTIATING ||
+				state === FforState.VOUCHERS_COMMITTED);
+		const timer = this._fforSetupTimers.get(hex);
+		if (preActive && !timer) {
+			const t = setTimeout(() => {
+				this._fforSetupTimers.delete(hex);
+				this.fforSetupTimeout(channelId);
+			}, FF_ACTIVATION_TIMEOUT_MS);
+			if (typeof t.unref === 'function') t.unref();
+			this._fforSetupTimers.set(hex, t);
+		} else if (!preActive && timer) {
+			clearTimeout(timer);
+			this._fforSetupTimers.delete(hex);
+		}
+	}
+
+	/** Channels whose activation mismatch was already announced. */
+	private _fforEnforceAnnounced = new Set<string>();
+
+	/**
+	 * 'ffor:enforce' (channelId, record): the peer's reestablish contradicted
+	 * our ACTIVE epoch (section 7.5.5). R exposes no further invoices and S
+	 * settles nothing; the host decides whether to enforce on-chain.
+	 */
+	private _fforEmitEnforce(
+		hex: string,
+		channelId: Buffer,
+		record: IFforEpochRecord | null
+	): void {
+		if (!record || !record.activationMismatch) return;
+		if (this._fforEnforceAnnounced.has(hex)) return;
+		this._fforEnforceAnnounced.add(hex);
+		this.emit('ffor:enforce', channelId, record);
+	}
+
+	/**
+	 * Section 7.5.5: abort a setup that did not reach ACTIVE in time (reason
+	 * 1). Fired by the setup timer; callable directly by an operator or a
+	 * test. A no-op once the epoch is ACTIVE, ABORTED or gone.
+	 */
+	fforSetupTimeout(channelId: Buffer): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforSetupTimedOut());
+	}
+
+	private handleFforMessage(
+		peerPubkey: string,
+		type: number,
+		payload: Buffer
+	): void {
+		let channelId: Buffer;
+		try {
+			channelId = decodeFforHeader(payload).channelId;
+		} catch (err) {
+			this.emit(
+				'error',
+				null,
+				`FFOR message ${type} too short: ${(err as Error).message}`
+			);
+			return;
+		}
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+		this._fforEnsureContext(peerPubkey, channel);
+		let actions: ChannelAction[];
+		switch (type) {
+			case MessageType.FF_INIT:
+				if (!this.peerSupportsFfor(peerPubkey)) {
+					this.emit(
+						'error',
+						channelId,
+						'ff_init from a peer without option_ff_receive'
+					);
+					return;
+				}
+				actions = channel.handleFforInit(payload);
+				break;
+			case MessageType.FF_ACCEPT:
+				actions = channel.handleFforAccept(payload);
+				break;
+			case MessageType.FF_ACTIVATE:
+				actions = channel.handleFforActivate(payload);
+				break;
+			case MessageType.FF_ACTIVATE_ACK:
+				actions = channel.handleFforActivateAck(payload);
+				break;
+			case MessageType.FF_ABORT:
+				actions = channel.handleFforAbort(payload);
+				break;
+			case MessageType.FF_CLOSE:
+				actions = channel.handleFforClose(payload);
+				break;
+			case MessageType.FF_CLOSE_ACK:
+				actions = channel.handleFforCloseAck(payload);
+				break;
+			case MessageType.FF_ERROR:
+				actions = channel.handleFforError(payload);
+				break;
+			default:
+				// ff_invoices (section 7.3) is optional and S needs nothing from
+				// it: delegated payments are recognised from the hash set.
+				return;
+		}
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
+		if (progress.sendsWithheld) {
+			// The durable write behind this transition did not land: nothing
+			// that transition authorizes may follow it. The reestablish path
+			// retries after a reconnect.
+			this.emit(
+				'error',
+				channelId,
+				`FFOR ${type}: durable write failed; transition not acted on`
+			);
+			return;
+		}
+		// A batch the quorum barrier parked (progress.sendsHeld) is the
+		// opposite case: its state committed and its sends leave, in order,
+		// once the guardian receipt arrives, so the transition proceeds as if
+		// sent. The round it needs has to queue behind it, or an FFOR epoch on
+		// a quorum-mode node never advances (the S2 forwarder lesson).
+		// The voucher adds (after ff_init), the abort unwind and the drain all
+		// need a commitment round; a no-op when nothing is pending.
+		this.autoSignAndSendCommitment(channelId);
+	}
+
+	/** Run a channel's FFOR action producer and drive the round it needs. */
+	private _fforDrive(
+		channelId: Buffer,
+		produce: (channel: Channel) => ChannelAction[]
+	): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!channel || !peerPubkey) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		this._fforEnsureContext(peerPubkey, channel);
+		const actions = produce(channel);
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
+		const err = actions.find((a) => a.type === ChannelActionType.ERROR);
+		if (progress.sendsWithheld) {
+			// A failed persist: the state this transition wrote is not on
+			// disk, so nothing may act on it. No auto-sign, no state event;
+			// the caller must not reveal or send anything either.
+			return {
+				ok: false,
+				actions,
+				sendsWithheld: true,
+				error:
+					err && err.type === ChannelActionType.ERROR
+						? err.message
+						: 'durable write failed; transition not acted on'
+			};
+		}
+		// A parked batch (progress.sendsHeld) committed its state; the quorum
+		// barrier releases its sends in order, so the transition proceeds as
+		// if sent and the hold is reported for information only.
+		this.autoSignAndSendCommitment(channelId);
+		return {
+			ok: err === undefined,
+			actions,
+			...(progress.sendsHeld ? { sendsHeld: true } : {}),
+			...(err && err.type === ChannelActionType.ERROR
+				? { error: err.message }
+				: {})
+		};
+	}
+
+	/**
+	 * R: start a Variant D epoch on a channel (section 9.5.1 step 2). The
+	 * book is `voucherAmountsMsat` in slot order; the rest are ff_init's
+	 * terms. Refused unless the peer advertised option_ff_receive.
+	 */
+	initiateFforEpoch(
+		channelId: Buffer,
+		request: {
+			voucherAmountsMsat: bigint[];
+			minPaymentMsat: bigint;
+			settlementDeadline: number;
+			voucherExpiry: number;
+			feeBaseMsat: number;
+			feeProportionalMillionths: number;
+			epochId?: Buffer;
+		}
+	): ChannelResult {
+		const peerPubkey = this.channelPeers.get(channelId.toString('hex'));
+		if (peerPubkey && !this.peerSupportsFfor(peerPubkey)) {
+			const error = 'peer does not advertise option_ff_receive';
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		return this._fforDrive(channelId, (c) => c.initiateFforEpoch(request));
+	}
+
+	/** R: ff_close (section 7.5.4). */
+	closeFforEpoch(channelId: Buffer): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.closeFforEpoch());
+	}
+
+	/** Either side: abort a setup before ACTIVE. */
+	abortFforEpoch(
+		channelId: Buffer,
+		reason: FforAbortReason = FforAbortReason.OPERATOR,
+		text = 'operator abort'
+	): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.abortFforEpoch(reason, text));
+	}
+
+	/** R: credit a preimage learned from a payer or witness (section 7.5.6). */
+	fforAddPreimage(channelId: Buffer, preimage: Buffer): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforAddPreimage(preimage));
+	}
+
+	/** S: durable per-slot settlement state (section 9.5.1). */
+	fforSetSlot(
+		channelId: Buffer,
+		k: number,
+		state: FforSlotState,
+		upstream: string | null
+	): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforSetSlot(k, state, upstream));
+	}
+
+	/** The epoch record of a channel, if any. */
+	getFforEpoch(channelId: Buffer): IFforEpochRecord | null {
+		return this.channels.get(channelId.toString('hex'))?.getFforEpoch() ?? null;
+	}
+
+	/**
+	 * S: the voucher slot a payment hash names, across every channel with a
+	 * live epoch of ours (section 9.5.1 "Settlement"). Null when the hash is
+	 * in no book, so the HTLC takes the ordinary path.
+	 */
+	fforFindDelegatedSlot(paymentHash: Buffer): {
+		channelId: Buffer;
+		channel: Channel;
+		record: IFforEpochRecord;
+		entry: IFforBookEntry;
+	} | null {
+		for (const channel of this.channels.values()) {
+			// Every state, ABORTED and CLOSED included: a hash from a book of
+			// ours is single-use (section 7.3) and a payment on it outside
+			// ACTIVE is failed upstream (section 7.5.6), never forwarded to R.
+			const record = channel.getFforEpoch();
+			if (!record || record.role !== 'S') continue;
+			const idx = record.paymentHashes.findIndex((h) => h.equals(paymentHash));
+			if (idx < 0) continue;
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			return {
+				channelId,
+				channel,
+				record,
+				entry: {
+					k: idx + 1,
+					paymentHash: record.paymentHashes[idx],
+					amountMsat: record.params.voucherAmountsMsat[idx],
+					voucherExpiry: record.params.voucherExpiry,
+					settlementDeadline: record.params.settlementDeadline,
+					sHtlcId: (record.sHtlcIdBase ?? 0n) + BigInt(idx)
+				}
+			};
+		}
+		return null;
 	}
 
 	// ─────────────── Splice ───────────────
@@ -7874,6 +8279,9 @@ export class ChannelManager extends EventEmitter {
 		progress?: IActionDispatchProgress
 	): void {
 		this._syncQuiescenceWatchdog(channel);
+		this._fforEnsureContext(peerPubkey, channel);
+		// An empty batch announces nothing: only a dispatch whose durable
+		// write landed may report the epoch's state (see the tail below).
 		if (actions.length === 0) return;
 		const dispatchProgress = progress ?? newDispatchProgress();
 		const errorIndex = actions.findIndex(
@@ -7912,6 +8320,18 @@ export class ChannelManager extends EventEmitter {
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
 					errorAction.message
 				);
+			}
+			// FFOR state is announced only from a batch whose own durable write
+			// landed: a host acting on ACTIVE must find ACTIVE on disk. A batch
+			// without a persist announces nothing, whatever memory says. A batch
+			// the quorum barrier parked ran up to and including its persist
+			// (only the sends wait), and the announced state is the one that
+			// persist captured, so a hold does not silence it.
+			if (
+				!dispatchProgress.sendsWithheld &&
+				actions.some((a) => a.type === ChannelActionType.PERSIST_STATE)
+			) {
+				this._fforEmitStateChange(channel);
 			}
 		}
 	}
@@ -8295,6 +8715,10 @@ export class ChannelManager extends EventEmitter {
 					this.emit('watch:output', action.txid, action.outputIndex);
 					break;
 				case ChannelActionType.PREIMAGE_LEARNED:
+					// A preimage the channel learned off-chain (an FFOR ff_close_ack,
+					// a payer's receipt) is a claim key for every monitor tracking
+					// the HTLC: record it here, then let the node persist it.
+					this.recordPreimage(action.paymentHash, action.preimage);
 					this.emit('preimage:learned', action.paymentHash, action.preimage);
 					break;
 				case ChannelActionType.CHANNEL_FULLY_RESOLVED:
@@ -8370,6 +8794,18 @@ export class ChannelManager extends EventEmitter {
 					if (persistRequest && !persistRequest.committed) {
 						setSendsBlocked(true);
 						break;
+					}
+					// The FFOR state this write made durable, captured HERE: a
+					// nested dispatch may move the in-memory record before this
+					// batch's tail announces anything.
+					if (typeof channel.getFforEpoch === 'function') {
+						const durableId = channel.getChannelId();
+						if (durableId) {
+							this._fforDurableState.set(
+								durableId.toString('hex'),
+								channel.getFforEpoch()?.state ?? null
+							);
+						}
 					}
 					// The frame this transition landed in is only known now, so
 					// the barrier question is asked here and nowhere else. A

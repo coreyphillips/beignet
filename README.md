@@ -553,7 +553,7 @@ LightningNode              High-level API (EventEmitter)
 </details>
 
 <details>
-<summary><b>Module reference (23 modules under <code>src/lightning/</code>)</b></summary>
+<summary><b>Module reference (24 modules under <code>src/lightning/</code>)</b></summary>
 
 | Module | Description |
 |--------|-------------|
@@ -571,6 +571,7 @@ LightningNode              High-level API (EventEmitter)
 | `onion-message/` | Onion message construction/processing (carries BOLT 12 and async-payment messages) |
 | `offer/` | BOLT 12 offers: encode/decode, OfferManager invoice_request/invoice flows |
 | `async-payments/` | Hold invoices and AsyncPaymentManager (LSP held-forward, release_held_htlc, wake) |
+| `ffor/` | FFOR Variant D offline receive: signed epoch lifecycle, voucher book, transcript hashes, delegated settlement arithmetic |
 | `interactive-tx/` | Interactive transaction construction for v2 dual-funded opens and splicing |
 | `watchtower/` | Altruist watchtower client: wtwire protocol, justice blobs, tower sessions |
 | `backup/` | Static channel backup (SCB) export/import |

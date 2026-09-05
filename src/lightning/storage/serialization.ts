@@ -11,6 +11,13 @@ import {
 	IV2InFlight,
 	ChannelCloseReason
 } from '../channel/channel-state';
+import {
+	FforAbortReason,
+	FforRole,
+	FforSlotState,
+	FforState,
+	IFforEpochRecord
+} from '../ffor/types';
 import { ShaChainStore, IShaChainEntry } from '../keys/shachain';
 import { IChannelBasepoints } from '../keys/derivation';
 import {
@@ -142,6 +149,10 @@ export interface ISerializedHtlcEntry {
 	commitCoverPending?: boolean;
 	addLocallyRevoked?: boolean;
 	removalLocallyRevoked?: boolean;
+	/** FFOR Variant D voucher marker (see IHtlcEntry.fforVoucher). */
+	fforVoucher?: boolean;
+	/** FFOR Variant D mismatching-add marker (see IHtlcEntry.fforMismatch). */
+	fforMismatch?: boolean;
 	/** Whether the stored remote signature covers this add (see IHtlcEntry). */
 	addRemoteSigned?: boolean;
 	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
@@ -177,6 +188,8 @@ export function serializeHtlcEntry(
 		onionRoutingPacket: e.onionRoutingPacket.toString('hex'),
 		direction: e.direction,
 		state: e.state,
+		...(e.fforVoucher === true ? { fforVoucher: true } : {}),
+		...(e.fforMismatch === true ? { fforMismatch: true } : {}),
 		...(e.blindingPoint
 			? { blindingPoint: e.blindingPoint.toString('hex') }
 			: {}),
@@ -227,6 +240,8 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 			onionRoutingPacket: Buffer.from(s.onionRoutingPacket, 'hex'),
 			direction: s.direction as HtlcDirection,
 			state: s.state as HtlcState,
+			...(s.fforVoucher === true ? { fforVoucher: true } : {}),
+			...(s.fforMismatch === true ? { fforMismatch: true } : {}),
 			...(s.blindingPoint
 				? { blindingPoint: Buffer.from(s.blindingPoint, 'hex') }
 				: {}),
@@ -503,6 +518,9 @@ export interface ISerializedChannelState {
 	// Why WE closed the channel ('user' or an automatic close code).
 	closeReason?: ChannelCloseReason;
 	dlpRemotePerCommitmentPoint?: string | null;
+	/** FFOR Variant D epoch record (see IChannelState.ffor). */
+	ffor?: ISerializedFforEpoch | null;
+	fforUsedEpochIds?: string[];
 }
 
 export interface ISerializedSpliceInFlight {
@@ -921,7 +939,168 @@ export function serializeChannelState(
 			: undefined,
 		recoveryCloseReason: s.recoveryCloseReason,
 		closeReason: s.closeReason,
-		dlpRemotePerCommitmentPoint: bufToHex(s.dlpRemotePerCommitmentPoint ?? null)
+		dlpRemotePerCommitmentPoint: bufToHex(
+			s.dlpRemotePerCommitmentPoint ?? null
+		),
+		ffor: s.ffor ? serializeFforEpoch(s.ffor) : null,
+		fforUsedEpochIds: s.fforUsedEpochIds?.length
+			? [...s.fforUsedEpochIds]
+			: undefined
+	};
+}
+
+// ─── FFOR Variant D epoch record (specs/ffor-offline-receive.md 7.5.5) ───
+
+export interface ISerializedFforEpoch {
+	role: string;
+	state: number;
+	epochId: string;
+	params: {
+		variant: number;
+		budgetMsat: string;
+		maxPayments: number;
+		minPaymentMsat: string;
+		settlementDeadline: number;
+		voucherExpiry: number;
+		feeBaseMsat: number;
+		feeProportionalMillionths: number;
+		escapeGranularityMsat: string;
+		rPerCommitmentPoints: string[];
+		voucherAmountsMsat: string[];
+	};
+	remoteNodeId: string;
+	initWire: string;
+	acceptWire: string | null;
+	sCommitmentNumber: string | null;
+	sHtlcIdBase: string | null;
+	paymentHashes: string[];
+	preimages: string[];
+	tInit: string;
+	tSetup: string | null;
+	hBook: string | null;
+	hCommit: string | null;
+	hAct: string | null;
+	epochStartHeight: number | null;
+	activateWire: string | null;
+	activateAckWire: string | null;
+	closeWire: string | null;
+	closeAckWire: string | null;
+	slotStates: string[];
+	slotUpstream: (string | null)[];
+	settledBitmap: string | null;
+	knownPreimages: (string | null)[];
+	closeProcessed: boolean;
+	voucherRoundFailed: boolean;
+	unwindOwed: boolean;
+	abortReason: number | null;
+	closeSent: boolean;
+	activationMismatch: boolean;
+}
+
+export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
+	return {
+		role: f.role,
+		state: f.state,
+		epochId: f.epochId.toString('hex'),
+		params: {
+			variant: f.params.variant,
+			budgetMsat: bigintToStr(f.params.budgetMsat),
+			maxPayments: f.params.maxPayments,
+			minPaymentMsat: bigintToStr(f.params.minPaymentMsat),
+			settlementDeadline: f.params.settlementDeadline,
+			voucherExpiry: f.params.voucherExpiry,
+			feeBaseMsat: f.params.feeBaseMsat,
+			feeProportionalMillionths: f.params.feeProportionalMillionths,
+			escapeGranularityMsat: bigintToStr(f.params.escapeGranularityMsat),
+			rPerCommitmentPoints: f.params.rPerCommitmentPoints.map((p) =>
+				p.toString('hex')
+			),
+			voucherAmountsMsat: f.params.voucherAmountsMsat.map(bigintToStr)
+		},
+		remoteNodeId: f.remoteNodeId.toString('hex'),
+		initWire: f.initWire.toString('hex'),
+		acceptWire: bufToHex(f.acceptWire),
+		sCommitmentNumber:
+			f.sCommitmentNumber === null ? null : bigintToStr(f.sCommitmentNumber),
+		sHtlcIdBase: f.sHtlcIdBase === null ? null : bigintToStr(f.sHtlcIdBase),
+		paymentHashes: f.paymentHashes.map((h) => h.toString('hex')),
+		preimages: f.preimages.map((p) => p.toString('hex')),
+		tInit: f.tInit.toString('hex'),
+		tSetup: bufToHex(f.tSetup),
+		hBook: bufToHex(f.hBook),
+		hCommit: bufToHex(f.hCommit),
+		hAct: bufToHex(f.hAct),
+		epochStartHeight: f.epochStartHeight,
+		activateWire: bufToHex(f.activateWire),
+		activateAckWire: bufToHex(f.activateAckWire),
+		closeWire: bufToHex(f.closeWire),
+		closeAckWire: bufToHex(f.closeAckWire),
+		slotStates: [...f.slotStates],
+		slotUpstream: [...f.slotUpstream],
+		settledBitmap: bufToHex(f.settledBitmap),
+		knownPreimages: f.knownPreimages.map((p) => bufToHex(p)),
+		closeProcessed: f.closeProcessed,
+		voucherRoundFailed: f.voucherRoundFailed,
+		unwindOwed: f.unwindOwed,
+		abortReason: f.abortReason,
+		closeSent: f.closeSent,
+		activationMismatch: f.activationMismatch
+	};
+}
+
+export function deserializeFforEpoch(
+	s: ISerializedFforEpoch
+): IFforEpochRecord {
+	return {
+		role: s.role as FforRole,
+		state: s.state as FforState,
+		epochId: Buffer.from(s.epochId, 'hex'),
+		params: {
+			variant: s.params.variant,
+			budgetMsat: strToBigint(s.params.budgetMsat),
+			maxPayments: s.params.maxPayments,
+			minPaymentMsat: strToBigint(s.params.minPaymentMsat),
+			settlementDeadline: s.params.settlementDeadline,
+			voucherExpiry: s.params.voucherExpiry,
+			feeBaseMsat: s.params.feeBaseMsat,
+			feeProportionalMillionths: s.params.feeProportionalMillionths,
+			escapeGranularityMsat: strToBigint(s.params.escapeGranularityMsat),
+			rPerCommitmentPoints: s.params.rPerCommitmentPoints.map((p) =>
+				Buffer.from(p, 'hex')
+			),
+			voucherAmountsMsat: s.params.voucherAmountsMsat.map(strToBigint)
+		},
+		remoteNodeId: Buffer.from(s.remoteNodeId, 'hex'),
+		initWire: Buffer.from(s.initWire, 'hex'),
+		acceptWire: hexToBuf(s.acceptWire),
+		sCommitmentNumber:
+			s.sCommitmentNumber === null ? null : strToBigint(s.sCommitmentNumber),
+		sHtlcIdBase: s.sHtlcIdBase === null ? null : strToBigint(s.sHtlcIdBase),
+		paymentHashes: s.paymentHashes.map((h) => Buffer.from(h, 'hex')),
+		preimages: s.preimages.map((p) => Buffer.from(p, 'hex')),
+		tInit: Buffer.from(s.tInit, 'hex'),
+		tSetup: hexToBuf(s.tSetup),
+		hBook: hexToBuf(s.hBook),
+		hCommit: hexToBuf(s.hCommit),
+		hAct: hexToBuf(s.hAct),
+		epochStartHeight: s.epochStartHeight,
+		activateWire: hexToBuf(s.activateWire),
+		activateAckWire: hexToBuf(s.activateAckWire),
+		closeWire: hexToBuf(s.closeWire),
+		closeAckWire: hexToBuf(s.closeAckWire),
+		slotStates: s.slotStates.map((x) => x as FforSlotState),
+		slotUpstream: [...s.slotUpstream],
+		settledBitmap: hexToBuf(s.settledBitmap),
+		knownPreimages: s.knownPreimages.map((p) => hexToBuf(p)),
+		closeProcessed: s.closeProcessed === true,
+		voucherRoundFailed: s.voucherRoundFailed === true,
+		unwindOwed: s.unwindOwed === true,
+		abortReason:
+			s.abortReason === null || s.abortReason === undefined
+				? null
+				: (s.abortReason as FforAbortReason),
+		closeSent: s.closeSent === true,
+		activationMismatch: s.activationMismatch === true
 	};
 }
 
@@ -1117,7 +1296,11 @@ export function deserializeChannelState(
 		recoveryCloseReason: s.recoveryCloseReason,
 		closeReason: s.closeReason,
 		dlpRemotePerCommitmentPoint:
-			hexToBuf(s.dlpRemotePerCommitmentPoint) ?? undefined
+			hexToBuf(s.dlpRemotePerCommitmentPoint) ?? undefined,
+		ffor: s.ffor ? deserializeFforEpoch(s.ffor) : null,
+		fforUsedEpochIds: s.fforUsedEpochIds?.length
+			? [...s.fforUsedEpochIds]
+			: undefined
 	};
 }
 

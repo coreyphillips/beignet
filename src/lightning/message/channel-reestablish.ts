@@ -17,6 +17,11 @@
  */
 
 import { encodeTlvStream, decodeTlvStream, ITlvRecord } from './tlv';
+import {
+	decodeFforReestablishTlv,
+	encodeFforReestablishTlv
+} from '../ffor/messages';
+import { FF_REESTABLISH_TLV_TYPE, IFforReestablishTlv } from '../ffor/types';
 
 export interface IChannelReestablishMessage {
 	channelId: Buffer;
@@ -39,6 +44,12 @@ export interface IChannelReestablishMessage {
 	 * local_nonce, TLV type 4 — same convention as open/accept/revoke).
 	 */
 	nextLocalNonce?: Buffer;
+	/**
+	 * FFOR (specs/ffor-offline-receive.md section 11.1): TLV 55001, the
+	 * epoch id, lifecycle state, last_seq and H_act of the channel's epoch.
+	 * Odd, so a peer without the feature ignores it.
+	 */
+	ffor?: IFforReestablishTlv;
 }
 
 const CHANNEL_REESTABLISH_LENGTH = 113; // 32 + 8 + 8 + 32 + 33
@@ -100,6 +111,9 @@ export function encodeChannelReestablishMessage(
 			type: TLV_NEXT_LOCAL_NONCE,
 			value: msg.nextLocalNonce
 		});
+	}
+	if (msg.ffor) {
+		tlvRecords.push(encodeFforReestablishTlv(msg.ffor));
 	}
 	if (tlvRecords.length > 0) {
 		parts.push(encodeTlvStream(tlvRecords));
@@ -166,6 +180,14 @@ export function decodeChannelReestablishMessage(
 				record.value.length === 66
 			) {
 				result.nextLocalNonce = Buffer.from(record.value);
+			} else if (record.type === FF_REESTABLISH_TLV_TYPE) {
+				// A malformed epoch TLV is a peer bug in an odd record: drop
+				// the record rather than the whole reestablish.
+				try {
+					result.ffor = decodeFforReestablishTlv(record.value);
+				} catch {
+					/* ignored: see above */
+				}
 			}
 		}
 	}
