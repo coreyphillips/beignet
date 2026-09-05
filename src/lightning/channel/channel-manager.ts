@@ -1411,13 +1411,15 @@ export class ChannelManager extends EventEmitter {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
 		const result = this.resultFromActions(actions);
-		// A report, not a disposition: the update_fulfill_htlc is not on the
-		// wire yet (parked, or withheld by a failed persist). The FFOR
-		// delegated settle reads it to leave its slot SETTLING rather than
-		// SETTLED; every other caller settles exactly as it always has.
-		if (progress.sendsWithheld || progress.sendsHeld) {
-			result.sendsWithheld = true;
-		}
+		// Reports, not dispositions, and kept apart because they mean opposite
+		// things: sendsWithheld is a failed persist (nothing durable, the
+		// update_fulfill_htlc is not on the wire and only a reconnect retries
+		// it); sendsHeld is the quorum barrier parking a committed batch whose
+		// sends leave in order once the receipt arrives. The FFOR delegated
+		// settle reads the first to leave its slot SETTLING; every other
+		// caller settles exactly as it always has.
+		if (progress.sendsWithheld) result.sendsWithheld = true;
+		if (progress.sendsHeld) result.sendsHeld = true;
 		return result;
 	}
 
@@ -5694,17 +5696,22 @@ export class ChannelManager extends EventEmitter {
 		}
 		const progress = newDispatchProgress();
 		this.processActions(peerPubkey, channel, actions, progress);
-		if (progress.sendsWithheld || progress.sendsHeld) {
-			// The durable write behind this transition did not land (or its
-			// sends are parked): nothing that transition authorizes may
-			// follow it. The reestablish path retries after a reconnect.
+		if (progress.sendsWithheld) {
+			// The durable write behind this transition did not land: nothing
+			// that transition authorizes may follow it. The reestablish path
+			// retries after a reconnect.
 			this.emit(
 				'error',
 				channelId,
-				`FFOR ${type}: durable write failed or sends withheld; transition not acted on`
+				`FFOR ${type}: durable write failed; transition not acted on`
 			);
 			return;
 		}
+		// A batch the quorum barrier parked (progress.sendsHeld) is the
+		// opposite case: its state committed and its sends leave, in order,
+		// once the guardian receipt arrives, so the transition proceeds as if
+		// sent. The round it needs has to queue behind it, or an FFOR epoch on
+		// a quorum-mode node never advances (the S2 forwarder lesson).
 		// The voucher adds (after ff_init), the abort unwind and the drain all
 		// need a commitment round; a no-op when nothing is pending.
 		this.autoSignAndSendCommitment(channelId);
@@ -5728,10 +5735,10 @@ export class ChannelManager extends EventEmitter {
 		const progress = newDispatchProgress();
 		this.processActions(peerPubkey, channel, actions, progress);
 		const err = actions.find((a) => a.type === ChannelActionType.ERROR);
-		if (progress.sendsWithheld || progress.sendsHeld) {
-			// A failed persist (or a parked batch): the state this transition
-			// wrote is not on disk, so nothing may act on it. No auto-sign, no
-			// state event; the caller must not reveal or send anything either.
+		if (progress.sendsWithheld) {
+			// A failed persist: the state this transition wrote is not on
+			// disk, so nothing may act on it. No auto-sign, no state event;
+			// the caller must not reveal or send anything either.
 			return {
 				ok: false,
 				actions,
@@ -5739,13 +5746,17 @@ export class ChannelManager extends EventEmitter {
 				error:
 					err && err.type === ChannelActionType.ERROR
 						? err.message
-						: 'durable write failed or sends withheld; transition not acted on'
+						: 'durable write failed; transition not acted on'
 			};
 		}
+		// A parked batch (progress.sendsHeld) committed its state; the quorum
+		// barrier releases its sends in order, so the transition proceeds as
+		// if sent and the hold is reported for information only.
 		this.autoSignAndSendCommitment(channelId);
 		return {
 			ok: err === undefined,
 			actions,
+			...(progress.sendsHeld ? { sendsHeld: true } : {}),
 			...(err && err.type === ChannelActionType.ERROR
 				? { error: err.message }
 				: {})
@@ -8312,10 +8323,12 @@ export class ChannelManager extends EventEmitter {
 			}
 			// FFOR state is announced only from a batch whose own durable write
 			// landed: a host acting on ACTIVE must find ACTIVE on disk. A batch
-			// without a persist announces nothing, whatever memory says.
+			// without a persist announces nothing, whatever memory says. A batch
+			// the quorum barrier parked ran up to and including its persist
+			// (only the sends wait), and the announced state is the one that
+			// persist captured, so a hold does not silence it.
 			if (
 				!dispatchProgress.sendsWithheld &&
-				!dispatchProgress.sendsHeld &&
 				actions.some((a) => a.type === ChannelActionType.PERSIST_STATE)
 			) {
 				this._fforEmitStateChange(channel);

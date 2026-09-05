@@ -141,7 +141,8 @@ export function s1bReceiverFulfills(): IChaosScenario {
 	};
 }
 
-function addGraphChannel(
+/** Publish a direct channel on `node`'s graph (both directions). */
+export function addGraphChannel(
 	node: LightningNode,
 	scid: Buffer,
 	pubA: Buffer,

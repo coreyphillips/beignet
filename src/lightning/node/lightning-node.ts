@@ -15349,11 +15349,12 @@ export class LightningNode extends EventEmitter {
 			preimage
 		);
 		if (!fulfilled.ok || fulfilled.sendsWithheld) {
-			// The update_fulfill_htlc is not on the wire (refused, parked
-			// behind the durability barrier, or withheld by a failed persist).
-			// Left SETTLING, which ff_close counts as settled: the upstream
-			// channel's own reestablish re-drives the HTLC through this path
-			// with the same key if it is still pending then.
+			// Refused, or the fulfil's durable write failed: nothing is on
+			// the wire. Left SETTLING, which ff_close counts as settled; the
+			// upstream channel's own reestablish re-drives the HTLC through
+			// this path with the same key. A fulfil the quorum barrier merely
+			// parked (fulfilled.sendsHeld) is committed and leaves in order,
+			// so it is settled as if sent.
 			this.emitStructuredLog('htlc', 'ffor_delegated_fulfil_deferred', {
 				channelId: channelId.toString('hex'),
 				htlcId: htlcId.toString(),

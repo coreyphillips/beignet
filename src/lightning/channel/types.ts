@@ -462,6 +462,14 @@ export interface ChannelResult {
 	 */
 	sendsWithheld?: boolean;
 	/**
+	 * Information only: the batch committed its state and the quorum
+	 * durability barrier parked its sends, which leave in order once the
+	 * guardian receipt arrives. Not a refusal, and not sendsWithheld: the
+	 * entry points that keep the two apart (the FFOR drives, fulfillHtlc)
+	 * set this one for a hold and that one for a failed persist.
+	 */
+	sendsHeld?: boolean;
+	/**
 	 * The refusal's condition ends on its own, so the same request can succeed
 	 * later. Carried from the refusing channel arm's ERROR action (issue #633);
 	 * absent means permanent.
