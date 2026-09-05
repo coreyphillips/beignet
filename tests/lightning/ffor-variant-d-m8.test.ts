@@ -65,7 +65,10 @@ describe('FFOR Variant D: ff_init TLV 13 witness_peers (section 9.6.3)', functio
 	this.timeout(30_000);
 
 	it('round-trips through the codec and refuses malformed lists', () => {
-		const ids = [getPublicKey(sha256(Buffer.from('a'))), getPublicKey(sha256(Buffer.from('b')))];
+		const ids = [
+			getPublicKey(sha256(Buffer.from('a'))),
+			getPublicKey(sha256(Buffer.from('b')))
+		];
 		const base = {
 			channelId: Buffer.alloc(32, 1),
 			epochId: Buffer.alloc(32, 2),
@@ -113,13 +116,15 @@ describe('FFOR Variant D: ff_init TLV 13 witness_peers (section 9.6.3)', functio
 		const stranger = getPublicKey(sha256(Buffer.from('stranger')));
 		const w = createWorld();
 		activate(w, { witnessPeers: [stranger] });
-		expect(record(w.s, w.srHex).params.witnessPeers![0].equals(stranger)).to
-			.be.true;
+		expect(record(w.s, w.srHex).params.witnessPeers![0].equals(stranger)).to.be
+			.true;
 		const reasons = delegatedFailures(w);
 		const [inv1] = exposeAndLeave(w, [1]);
 		w.sr.log.length = 0;
 		expect(pay(w, inv1).status).to.equal(PaymentStatus.FAILED);
-		expect(reasons).to.include('delegated HTLC did not arrive from a witness peer');
+		expect(reasons).to.include(
+			'delegated HTLC did not arrive from a witness peer'
+		);
 		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
 		expect(w.sr.log, 'nothing went to R').to.have.length(0);
 
