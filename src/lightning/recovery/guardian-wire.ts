@@ -482,6 +482,130 @@ export function takeoverTranscriptHash(
 	);
 }
 
+// ─────────────── rotation evidence (wire 5.11) ───────────────
+
+/**
+ * The root-signed part of a ROTATE_SET object, as every verifier sees it.
+ * IGuardianRotateSetRequest satisfies this structurally; the unsigned
+ * transport hints are deliberately not part of it.
+ */
+export interface IRotationEvidence {
+	/** The OUTGOING set the rotation retires the namespace under. */
+	guardianSetId: Buffer;
+	recoveryId: Buffer;
+	newGuardianSetId: Buffer;
+	/** The INCOMING generation. */
+	generation: bigint;
+	newMembers: Buffer[];
+	rootSignature: Buffer;
+}
+
+/** What a rotation must bind to before it is anyone's evidence. */
+export interface IRotationEvidenceBinding {
+	/** The OUTGOING set: the set the verifier is talking to or serving. */
+	guardianSetId: Buffer;
+	recoveryId: Buffer;
+	/** The generation the rotation must EXCEED. */
+	generation: bigint;
+}
+
+/**
+ * The ONE judgement of root-signed rotation evidence (wire 5.11), shared by
+ * the guardian (its persisted marker, at open and before it rides an
+ * uncertain head), the replication client and the restore driver. A
+ * rotation is evidence only when it decodes to the expected shape, binds
+ * THIS outgoing set and THIS recovery_id inside the signed transcript,
+ * names an incoming set whose members hash to new_guardian_set_id and is
+ * not this set, sits ABOVE the generation the verifier already knows, and
+ * carries a root signature that verifies under recovery_id. Returns the
+ * first problem, or null when the rotation proves itself. Never throws:
+ * the value under judgement may be column rot or a hostile answer, and a
+ * verifier that throws on it can be knocked over by it.
+ *
+ * Three verifiers share this on purpose: a rule enforced in one and not
+ * another is a rotation one side follows and the other refuses, which is
+ * exactly the divergence a rotation exists to prevent.
+ */
+export function rotationEvidenceProblem(
+	rotation: IRotationEvidence,
+	binding: IRotationEvidenceBinding
+): string | null {
+	if (typeof rotation !== 'object' || rotation === null) {
+		return 'rotation is not an object';
+	}
+	if (
+		!is32(rotation.guardianSetId) ||
+		!rotation.guardianSetId.equals(binding.guardianSetId)
+	) {
+		return 'rotation is bound to another guardian set';
+	}
+	if (
+		!is32(rotation.recoveryId) ||
+		!rotation.recoveryId.equals(binding.recoveryId)
+	) {
+		return 'rotation is bound to another recovery_id';
+	}
+	if (
+		!Array.isArray(rotation.newMembers) ||
+		rotation.newMembers.length !== CRASH_V1_TOTAL ||
+		!rotation.newMembers.every((member) => is32(member))
+	) {
+		return 'rotation new_members malformed';
+	}
+	let computed: Buffer;
+	try {
+		computed = computeGuardianSetId({
+			...CRASH_V1_PROFILE,
+			guardianIds: rotation.newMembers
+		});
+	} catch {
+		return 'rotation new_members invalid';
+	}
+	if (
+		!is32(rotation.newGuardianSetId) ||
+		!computed.equals(rotation.newGuardianSetId)
+	) {
+		return 'rotation new_members do not hash to new_guardian_set_id';
+	}
+	if (rotation.newGuardianSetId.equals(binding.guardianSetId)) {
+		return 'rotation names this set as the incoming set';
+	}
+	if (
+		typeof rotation.generation !== 'bigint' ||
+		rotation.generation < 0n ||
+		rotation.generation > 0xffffffffffffffffn ||
+		rotation.generation <= binding.generation
+	) {
+		return 'rotation generation does not exceed the namespace generation';
+	}
+	if (
+		!Buffer.isBuffer(rotation.rootSignature) ||
+		rotation.rootSignature.length !== 64
+	) {
+		return 'rotation root signature failed';
+	}
+	let verified: boolean;
+	try {
+		verified = verifyTranscript(
+			rotateTranscriptHash(binding.guardianSetId, {
+				recoveryId: rotation.recoveryId,
+				newGuardianSetId: rotation.newGuardianSetId,
+				generation: rotation.generation,
+				newMembers: rotation.newMembers
+			}),
+			rotation.rootSignature,
+			binding.recoveryId
+		);
+	} catch {
+		verified = false;
+	}
+	return verified ? null : 'rotation root signature failed';
+}
+
+function is32(value: unknown): value is Buffer {
+	return Buffer.isBuffer(value) && value.length === 32;
+}
+
 // ─────────────── signing wrappers ───────────────
 
 export function signTranscript(hash: Buffer, secret: Buffer): Buffer {

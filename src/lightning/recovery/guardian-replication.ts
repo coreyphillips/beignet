@@ -32,11 +32,7 @@ import {
 	signTranscript,
 	stateBytes,
 	statesEqual,
-	xOnlyFromSecret,
-	CRASH_V1_PROFILE,
-	computeGuardianSetId,
-	rotateTranscriptHash,
-	verifyTranscript
+	xOnlyFromSecret
 } from './guardian-wire';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import {
@@ -54,6 +50,7 @@ import {
 	countReceiptQuorum,
 	verifyGuardianBindings,
 	verifyGuardianReceipt,
+	verifyGuardianRotation,
 	IGuardianFanOutResult
 } from './guardian-client';
 import {
@@ -442,40 +439,24 @@ export class GuardianReplicator {
 	}
 
 	/**
-	 * A rotation a guardian attached to its head, IF the recovery root signed
-	 * it over THIS set's prefix (wire 5.11): unsigned attachments are claims,
-	 * and only the root can move a namespace.
+	 * A rotation a guardian attached to its head, IF it is evidence: root
+	 * signed over THIS set's prefix and above the generation this journal
+	 * carries (wire 5.11). Unsigned attachments are claims, and only the
+	 * root can move a namespace. The judgement is verifyGuardianRotation,
+	 * the same one the restore driver applies, over the same rule the
+	 * guardian applies to its own marker.
 	 */
 	private verifiedRotation(
-		response: { rotation?: IGuardianRotateSetRequest } | undefined
+		response:
+			| { rotation?: IGuardianRotateSetRequest; generation?: bigint }
+			| undefined
 	): IGuardianRotateSetRequest | null {
-		const rotation = response?.rotation;
-		if (!rotation) return null;
-		if (!rotation.recoveryId.equals(this.config.recoveryRoot.recoveryId))
-			return null;
-		if (!rotation.guardianSetId.equals(this.config.context.guardianSetId))
-			return null;
-		if (rotation.newMembers.length !== CRASH_V1_PROFILE.total) return null;
-		try {
-			const expected = computeGuardianSetId({
-				...CRASH_V1_PROFILE,
-				guardianIds: rotation.newMembers
-			});
-			if (!expected.equals(rotation.newGuardianSetId)) return null;
-			const ok = verifyTranscript(
-				rotateTranscriptHash(this.config.context.guardianSetId, {
-					recoveryId: rotation.recoveryId,
-					newGuardianSetId: rotation.newGuardianSetId,
-					generation: rotation.generation,
-					newMembers: rotation.newMembers
-				}),
-				rotation.rootSignature,
-				rotation.recoveryId
-			);
-			return ok ? rotation : null;
-		} catch {
-			return null;
-		}
+		return verifyGuardianRotation(
+			response,
+			this.config.context,
+			this.config.recoveryRoot.recoveryId,
+			this.generation()
+		);
 	}
 
 	/**

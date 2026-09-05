@@ -63,7 +63,11 @@ import {
 	IConfirmationOutcome,
 	IStartupGateEvent
 } from './startup-gate';
-import { IRestoreEvent, RestoreDriver } from './restore-driver';
+import {
+	IRestoreEvent,
+	RestoreDriver,
+	rotationEntries
+} from './restore-driver';
 
 /** One configured guardian: its committed identity and where to reach it. */
 export interface IParsedGuardian {
@@ -276,7 +280,11 @@ export interface IGuardianAssemblyConfig {
  * restore flow, never register a second genesis. Run
  * `buildRestoreDriver().restore()` against the (empty) storage, then
  * construct the node on the restored database via a fresh assembly call,
- * which will find the persisted lease and answer `run`.
+ * which will find the persisted lease and answer `run`. The restore can
+ * itself refuse with `RestoreRotatedError` (reason `rotated`) when the set
+ * retired the namespace after this decision was made: it carries the same
+ * `rotation`, `generation` and `entries` as the `rotated` decision below,
+ * and the caller follows it the same way.
  *
  * `unavailable`: no quorum answered, or the guardians disagree about
  * whether the namespace exists. Nothing can be decided; surface the detail
@@ -437,17 +445,11 @@ export async function buildGuardianRecovery(
 		}
 		case 'rotated': {
 			const rotation = decision.rotation;
-			const entries: IGuardianConfigEntry[] = rotation.newMembers.map(
-				(member, i) => ({
-					guardianId: member.toString('hex'),
-					url: rotation.newTransports[i]?.url ?? ''
-				})
-			);
 			return {
 				kind: 'rotated',
 				rotation,
 				generation: rotation.generation,
-				entries
+				entries: rotationEntries(rotation)
 			};
 		}
 		case 'exists-remotely':

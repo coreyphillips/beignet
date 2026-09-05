@@ -43,7 +43,8 @@ import {
 	takeoverTranscriptHash,
 	verifyTranscript,
 	xOnlyFromSecret,
-	rotateTranscriptHash
+	rotateTranscriptHash,
+	rotationEvidenceProblem
 } from './guardian-wire';
 import {
 	GuardianStore,
@@ -1560,7 +1561,8 @@ export class ReferenceGuardian {
 	 * else is column rot or a foreign write, and the namespace is
 	 * quarantined at open: never silently retired by a non-empty blob,
 	 * never silently reopened by a falsy cell. Non-throwing over persisted
-	 * bytes, like the rest of the open-time walk.
+	 * bytes, like the rest of the open-time walk. The decode is this
+	 * guardian's; the judgement of the decoded object is the shared one.
 	 */
 	private storedRotationProblem(ns: IGuardianNamespaceRow): string | null {
 		const raw: unknown = ns.rotation;
@@ -1576,64 +1578,17 @@ export class ReferenceGuardian {
 				error instanceof Error ? error.message : String(error)
 			})`;
 		}
-		if (
-			!isLen(rotation.guardianSetId, 32) ||
-			!rotation.guardianSetId.equals(this.guardianSetId)
-		) {
-			return 'rotation is bound to another guardian set';
-		}
-		if (
-			!isLen(rotation.recoveryId, 32) ||
-			!rotation.recoveryId.equals(ns.recoveryId)
-		) {
-			return 'rotation is bound to another recovery_id';
-		}
-		if (
-			!Array.isArray(rotation.newMembers) ||
-			rotation.newMembers.length !== CRASH_V1_PROFILE.total
-		) {
-			return 'rotation new_members malformed';
-		}
-		let computed: Buffer;
-		try {
-			computed = computeGuardianSetId({
-				...CRASH_V1_PROFILE,
-				guardianIds: rotation.newMembers
-			});
-		} catch {
-			return 'rotation new_members invalid';
-		}
-		if (
-			!isLen(rotation.newGuardianSetId, 32) ||
-			!computed.equals(rotation.newGuardianSetId)
-		) {
-			return 'rotation new_members do not hash to new_guardian_set_id';
-		}
-		if (rotation.newGuardianSetId.equals(this.guardianSetId)) {
-			return 'rotation names this set as the incoming set';
-		}
-		if (
-			!validU64(rotation.generation) ||
-			rotation.generation <= readGeneration(ns)
-		) {
-			return 'rotation generation does not exceed the namespace generation';
-		}
-		if (
-			!isLen(rotation.rootSignature, 64) ||
-			!this.safeVerify(
-				rotateTranscriptHash(this.guardianSetId, {
-					recoveryId: rotation.recoveryId,
-					newGuardianSetId: rotation.newGuardianSetId,
-					generation: rotation.generation,
-					newMembers: rotation.newMembers
-				}),
-				rotation.rootSignature,
-				ns.recoveryId
-			)
-		) {
-			return 'rotation root signature failed';
-		}
-		return null;
+		// The shared judgement (guardian-wire.ts rotationEvidenceProblem): the
+		// binding, member-hash, generation and root-signature rules are the
+		// SAME ones the replication client and the restore driver apply to a
+		// rotation they read off GET_HEAD, so a marker this guardian serves
+		// is one every client follows, and one it refuses is one no client
+		// would have followed.
+		return rotationEvidenceProblem(rotation, {
+			guardianSetId: this.guardianSetId,
+			recoveryId: ns.recoveryId,
+			generation: readGeneration(ns)
+		});
 	}
 
 	/**

@@ -733,6 +733,32 @@ guardians entirely is Tier 1 degradation; a restore device that only
 knows the outgoing set follows the `rotation` object GET_HEAD hands it
 (5.11) to the incoming set, and needs no operator input to do so.
 
+Restore during rotation (spec 5.7, issue #714). Step 5 stops at ONE
+accepting member, so a restore device reading the outgoing set may find
+the rotation on a single guardian while the other two still serve the
+namespace as live. The device treats that one rotation as authoritative,
+before anything else it would do with the heads:
+
+```text
+1. every GET_HEAD answer, whatever its status, is checked for a
+   rotation that verifies (5.11); a rotation on ANY answer ends the
+   restore with a rotated outcome carrying the incoming set, BEFORE any
+   head is adopted and before any SYNC_RECORD, SYNC_EPOCH or
+   ACQUIRE_EPOCH is sent to the outgoing set
+2. an `ERR_SET_RETIRED` answer to ACQUIRE_EPOCH is not a missing vote to
+   be outnumbered by the members that granted the epoch: the device
+   re-reads every head and verifies the rotation before it counts any
+   certificate quorum, and a rotation found there ends the restore the
+   same way; the status alone, unsigned, is a claim and fences nothing
+3. the device then rebuilds against the incoming set (the members are
+   root-signed, the transports are the unsigned hints) and restores
+   from there; the outgoing set is left exactly as it was found
+```
+
+Advancing the outgoing set instead would acquire an epoch on a retired
+namespace and leave its members disagreeing about which generation is
+live: one retired, two at a new epoch nobody will ever write under.
+
 ### 5.10 Uncertain-store repair: rollback, then replay
 
 The durability rules (spec 5.5) make a guardian that cannot prove its
@@ -853,6 +879,26 @@ quarantined (5.3).
 A retired namespace is never deleted by this verb; retention rules are
 the operator's, as for any namespace, and the incoming set holds the live
 chain.
+
+Client-side judgement. A client that reads a rotation off GET_HEAD (the
+replication client deciding a boot or resolving `ERR_SET_RETIRED`, the
+restore device of 5.9) judges it by exactly the rules the guardian
+applies to its stored marker, with the generation floor being the
+client's own: the rotation must bind the set the client is talking to
+and its recovery_id, name well-formed members that hash to
+new_guardian_set_id and are not this set, exceed the generation the
+client already carries (and the answer's own unsigned `generation`, when
+it reports one, raises that floor: an answer that reports generation g
+beside a rotation at or below g contradicts itself), and verify under
+recovery_id. One judgement is shared by all three (the guardian, the
+replication client and the restore driver), so a rotation one side
+serves is one every client follows and a rotation one client refuses is
+one no other would have followed. A rotation that fails is an answer
+without one: it neither fences nor redirects, and the rest of the answer
+is used on its own terms. The answer's status is not consulted: a
+rotation attached to an `ERR_STORE_UNCERTAIN` answer is followed exactly
+like one on an `OK` head (5.3), because the rotation is root-signed and
+binds the set and recovery_id on its own.
 
 ## 6. Protobuf envelope
 
