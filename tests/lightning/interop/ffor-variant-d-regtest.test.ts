@@ -69,7 +69,7 @@ async function bitcoindUp(): Promise<boolean> {
 	}
 }
 
-async function height(): Promise<number> {
+async function tipHeight(): Promise<number> {
 	return (await bitcoinRpc('getblockcount')) as number;
 }
 
@@ -210,7 +210,7 @@ async function regtestWorld(opts: {
 		Buffer.from(o.script).equals(script.p2wshOutput)
 	);
 	expect(vout, 'funding output').to.be.greaterThan(-1);
-	const tip = await height();
+	const tip = await tipHeight();
 	const w = createWorld({
 		...worldOpts,
 		funding: {
