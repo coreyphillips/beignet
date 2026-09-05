@@ -1392,26 +1392,33 @@ export class ChannelManager extends EventEmitter {
 		const actions = channel.fulfillHtlc(htlcId, preimage);
 		const progress = newDispatchProgress();
 		this.processActions(peerPubkey, channel, actions, progress);
-		if (progress.sendsWithheld || progress.sendsHeld) {
-			// The fulfil's durable write failed (or the batch is parked): the
-			// update_fulfill_htlc did not leave. A caller that records the
-			// settlement as done on ok: true would be wrong, so say so.
-			return {
-				ok: false,
-				actions,
-				sendsWithheld: true,
-				error: 'update_fulfill_htlc withheld: durable write failed'
-			};
-		}
 
 		// BOLT 2: after sending update_fulfill_htlc, send commitment_signed to
 		// commit the removal. autoSignAndSendCommitment is a no-op unless we owe a
 		// commitment, so when the fulfill is already being driven reactively (via
 		// handleRevokeAndAck) this does not double-commit.
+		//
+		// This runs whatever the dispatch reports. A batch the quorum barrier
+		// parked (progress.sendsHeld) committed its state and owes the wire in
+		// order, and the commitment that removes the HTLC has to queue behind
+		// it or nothing ever signs the removal: the restart re-drive of a
+		// forwarded fulfil is exactly such a proactive settle, with nobody
+		// else to drive the round. A failed persist (sendsWithheld) blocks the
+		// auto-sign's own batch the same way it blocked this one and surfaces
+		// transition:blocked, which is what forces the reconnect that
+		// re-drives both.
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return this.resultFromActions(actions);
+		const result = this.resultFromActions(actions);
+		// A report, not a disposition: the update_fulfill_htlc is not on the
+		// wire yet (parked, or withheld by a failed persist). The FFOR
+		// delegated settle reads it to leave its slot SETTLING rather than
+		// SETTLED; every other caller settles exactly as it always has.
+		if (progress.sendsWithheld || progress.sendsHeld) {
+			result.sendsWithheld = true;
+		}
+		return result;
 	}
 
 	/**

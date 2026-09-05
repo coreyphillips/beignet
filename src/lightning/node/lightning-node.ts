@@ -15348,9 +15348,12 @@ export class LightningNode extends EventEmitter {
 			htlcId,
 			preimage
 		);
-		if (!fulfilled.ok) {
-			// Left SETTLING: the upstream channel's own reestablish re-drives
-			// the HTLC through this path with the same key.
+		if (!fulfilled.ok || fulfilled.sendsWithheld) {
+			// The update_fulfill_htlc is not on the wire (refused, parked
+			// behind the durability barrier, or withheld by a failed persist).
+			// Left SETTLING, which ff_close counts as settled: the upstream
+			// channel's own reestablish re-drives the HTLC through this path
+			// with the same key if it is still pending then.
 			this.emitStructuredLog('htlc', 'ffor_delegated_fulfil_deferred', {
 				channelId: channelId.toString('hex'),
 				htlcId: htlcId.toString(),
