@@ -993,6 +993,17 @@ export interface ISerializedFforEpoch {
 	knownPreimages: (string | null)[];
 	/** Absent on records written before the field existed: no slot exposed. */
 	exposedSlots?: boolean[];
+	/** Absent on records written before D-R existed: no witnesses. */
+	witnesses?: {
+		witnessNodeId: string;
+		mailboxId: string;
+		fetchPrivkey: string;
+		encPrivkey: string;
+		retentionUntil: number;
+		minReceipts: number;
+		manifestWire: string;
+		ackedAt: number | null;
+	}[];
 	closeProcessed: boolean;
 	voucherRoundFailed: boolean;
 	unwindOwed: boolean;
@@ -1048,6 +1059,16 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		settledBitmap: bufToHex(f.settledBitmap),
 		knownPreimages: f.knownPreimages.map((p) => bufToHex(p)),
 		exposedSlots: [...f.exposedSlots],
+		witnesses: f.witnesses.map((w) => ({
+			witnessNodeId: w.witnessNodeId.toString('hex'),
+			mailboxId: w.mailboxId.toString('hex'),
+			fetchPrivkey: w.fetchPrivkey.toString('hex'),
+			encPrivkey: w.encPrivkey.toString('hex'),
+			retentionUntil: w.retentionUntil,
+			minReceipts: w.minReceipts,
+			manifestWire: w.manifestWire.toString('hex'),
+			ackedAt: w.ackedAt
+		})),
 		closeProcessed: f.closeProcessed,
 		voucherRoundFailed: f.voucherRoundFailed,
 		unwindOwed: f.unwindOwed,
@@ -1111,6 +1132,16 @@ export function deserializeFforEpoch(
 		knownPreimages: s.knownPreimages.map((p) => hexToBuf(p)),
 		exposedSlots:
 			s.exposedSlots ?? s.knownPreimages.map(() => false),
+		witnesses: (s.witnesses ?? []).map((w) => ({
+			witnessNodeId: Buffer.from(w.witnessNodeId, 'hex'),
+			mailboxId: Buffer.from(w.mailboxId, 'hex'),
+			fetchPrivkey: Buffer.from(w.fetchPrivkey, 'hex'),
+			encPrivkey: Buffer.from(w.encPrivkey, 'hex'),
+			retentionUntil: w.retentionUntil,
+			minReceipts: w.minReceipts,
+			manifestWire: Buffer.from(w.manifestWire, 'hex'),
+			ackedAt: w.ackedAt
+		})),
 		closeProcessed: s.closeProcessed === true,
 		voucherRoundFailed: s.voucherRoundFailed === true,
 		unwindOwed: s.unwindOwed === true,

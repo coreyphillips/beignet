@@ -99,20 +99,20 @@ export function isFforMessageType(type: number): boolean {
 // Small encoders
 // ---------------------------------------------------------------------------
 
-function u8(v: number): Buffer {
+export function u8(v: number): Buffer {
 	return Buffer.from([v & 0xff]);
 }
-function u16(v: number): Buffer {
+export function u16(v: number): Buffer {
 	const b = Buffer.alloc(2);
 	b.writeUInt16BE(v, 0);
 	return b;
 }
-function u32(v: number): Buffer {
+export function u32(v: number): Buffer {
 	const b = Buffer.alloc(4);
 	b.writeUInt32BE(v >>> 0, 0);
 	return b;
 }
-function u64(v: bigint): Buffer {
+export function u64(v: bigint): Buffer {
 	const b = Buffer.alloc(8);
 	b.writeBigUInt64BE(v, 0);
 	return b;
@@ -125,7 +125,7 @@ function assert32(b: Buffer, name: string): void {
 }
 
 /** Reader over a body with bounds checks that throw a descriptive error. */
-class Reader {
+export class Reader {
 	private pos = 0;
 	constructor(
 		private readonly buf: Buffer,
@@ -257,7 +257,7 @@ function tlvList(records: ITlvRecord[], type: bigint): Buffer | undefined {
 	return findTlvRecord(records, type);
 }
 
-function splitFixed(value: Buffer, size: number, what: string): Buffer[] {
+export function splitFixed(value: Buffer, size: number, what: string): Buffer[] {
 	if (value.length % size !== 0) {
 		throw new Error(
 			`${what}: length ${value.length} is not a multiple of ${size}`

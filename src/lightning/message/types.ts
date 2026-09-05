@@ -98,7 +98,21 @@ export enum MessageType {
 	FF_ACTIVATE_ACK = 55047,
 	FF_ABORT = 55049,
 	FF_CLOSE = 55051,
-	FF_CLOSE_ACK = 55053
+	FF_CLOSE_ACK = 55053,
+
+	// FFOR D-R receipt witnesses and the BOLT 12 issuer (Appendix F): odd,
+	// 16-byte request id, authorized under the mailbox's fetch_key, never
+	// by the Noise peer identity.
+	FF_WITNESS_PROVISION = 55055,
+	FF_WITNESS_ACK = 55057,
+	FF_WITNESS_FETCH = 55059,
+	FF_WITNESS_FETCH_RESP = 55061,
+	FF_WITNESS_CLOSE = 55063,
+	FF_WITNESS_CLOSE_ACK = 55065,
+	FF_ISSUER_PROVISION = 55067,
+	FF_ISSUER_ACK = 55069,
+	FF_ISSUER_STATUS = 55071,
+	FF_ISSUER_STATUS_RESP = 55073
 }
 
 /**

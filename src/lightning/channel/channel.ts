@@ -186,6 +186,7 @@ import {
 	IFforInitMessage,
 	IFforReestablishTlv
 } from '../ffor/types';
+import { IFforWitnessProvision } from '../ffor/witness-types';
 import {
 	bitmapGet,
 	bitmapLength,
@@ -20390,6 +20391,7 @@ export class Channel {
 			settledBitmap: null,
 			knownPreimages: Array.from({ length: K }, () => null),
 			exposedSlots: Array.from({ length: K }, () => false),
+			witnesses: [],
 			closeProcessed: false,
 			voucherRoundFailed: false,
 			unwindOwed: false,
@@ -22032,6 +22034,77 @@ export class Channel {
 			}
 		}
 		return null;
+	}
+
+	/** The section 7.5.3 book of the live epoch, or null. */
+	fforBookEntries(): IFforBookEntry[] | null {
+		const f = this._state.ffor;
+		if (!f || !f.acceptWire) return null;
+		return this._fforBook(f);
+	}
+
+	/**
+	 * R: persist a witness provision BEFORE its manifest leaves (section
+	 * 9.6.4): the mailbox id and the fetch and encryption keys are the only
+	 * way the records ever come back. ACTIVE only; a witness that has not
+	 * acknowledged blocks invoice exposure (createFforVoucherInvoice).
+	 */
+	fforRecordWitness(p: IFforWitnessProvision): ChannelAction[] {
+		const f = this._state.ffor;
+		if (!f || f.role !== 'R' || f.state !== FforState.ACTIVE) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: witnesses are provisioned on an ACTIVE epoch of ours',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (f.witnesses.some((w) => w.mailboxId.equals(p.mailboxId))) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: mailbox id already in use',
+					cleanup: 'none'
+				}
+			];
+		}
+		f.witnesses.push({ ...p });
+		return [{ type: ChannelActionType.PERSIST_STATE }];
+	}
+
+	/** R: the witness acknowledged; it counts from here. */
+	fforWitnessAcked(mailboxId: Buffer, retentionUntil: number): ChannelAction[] {
+		const f = this._state.ffor;
+		const w = f?.witnesses.find((x) => x.mailboxId.equals(mailboxId));
+		if (!f || !w) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: no such witness provision',
+					cleanup: 'none'
+				}
+			];
+		}
+		w.ackedAt = Date.now();
+		w.retentionUntil = retentionUntil;
+		return [{ type: ChannelActionType.PERSIST_STATE }];
+	}
+
+	/** R: a refused provisioning does not count (section 9.6.4). */
+	fforDropWitness(mailboxId: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		if (!f) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: no epoch',
+					cleanup: 'none'
+				}
+			];
+		}
+		f.witnesses = f.witnesses.filter((x) => !x.mailboxId.equals(mailboxId));
+		return [{ type: ChannelActionType.PERSIST_STATE }];
 	}
 
 	/** R: record that voucher k's invoice has been exposed (durable). */

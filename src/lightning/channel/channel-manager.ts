@@ -188,6 +188,7 @@ import {
 	IFforBookEntry,
 	IFforEpochRecord
 } from '../ffor/types';
+import { IFforWitnessProvision } from '../ffor/witness-types';
 
 /**
  * The outpoints a raw transaction spends, txid in display-order hex (the
@@ -5811,6 +5812,25 @@ export class ChannelManager extends EventEmitter {
 	/** R: durable "voucher k's invoice is exposed" (section 9.5.4 ordering). */
 	fforMarkExposed(channelId: Buffer, k: number): ChannelResult {
 		return this._fforDrive(channelId, (c) => c.fforMarkExposed(k));
+	}
+
+	/** R: persist a witness provision before its manifest leaves (section 9.6.4). */
+	fforRecordWitness(channelId: Buffer, p: IFforWitnessProvision): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforRecordWitness(p));
+	}
+
+	fforWitnessAcked(
+		channelId: Buffer,
+		mailboxId: Buffer,
+		retentionUntil: number
+	): ChannelResult {
+		return this._fforDrive(channelId, (c) =>
+			c.fforWitnessAcked(mailboxId, retentionUntil)
+		);
+	}
+
+	fforDropWitness(channelId: Buffer, mailboxId: Buffer): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforDropWitness(mailboxId));
 	}
 
 	/** S: durable per-slot settlement state (section 9.5.1). */

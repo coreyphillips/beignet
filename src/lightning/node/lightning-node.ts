@@ -376,6 +376,40 @@ import {
 	IHeldForwardRecord,
 	heldForwardCodec
 } from '../async-payments/held-forward-ledger';
+import {
+	FF_WITNESS_MAILBOX_LEDGER_PREFIX,
+	FF_WITNESS_RECORD_LEDGER_PREFIX,
+	FforWitnessLedger,
+	IFforWitnessMailboxRecord,
+	IFforWitnessRecordRow,
+	fforWitnessMailboxCodec,
+	fforWitnessRecordCodec
+} from '../ffor/witness-ledger';
+import { FforWitnessService } from '../ffor/witness-service';
+import {
+	FF_ISSUER_STATUS_RESP_TYPE,
+	FF_WITNESS_CLOSE_TYPE,
+	FF_WITNESS_FETCH_TYPE,
+	FF_WITNESS_PROFILE_DR,
+	FF_WITNESS_PROVISION_TYPE,
+	FF_WITNESS_RETENTION_MARGIN_BLOCKS,
+	FF_WITNESS_VERSION,
+	IFforWitnessProvision,
+	isFforWitnessMessageType,
+	isFforWitnessResponseType
+} from '../ffor/witness-types';
+import {
+	decodeWitnessAck,
+	decodeWitnessCloseAck,
+	decodeWitnessFetchResp,
+	encodeWitnessClose,
+	encodeWitnessFetch,
+	encodeWitnessProvision,
+	signManifest,
+	verifyWitnessRecord,
+	witnessRequestId
+} from '../ffor/witness-messages';
+import { buildVoucherBook } from '../ffor/transcript';
 import { deriveHoldRegistrationId } from '../async-payments/release-capability';
 import {
 	ASYNC_REGISTRATION_REPLY_TLV_TYPE,
@@ -735,6 +769,13 @@ export class LightningNode extends EventEmitter {
 	 */
 	private _wiredChainWatcher: ChainWatcher | null = null;
 	private currentBlockHeight = 0;
+	/** FFOR D-R receipt witness (section 9.6), when this node serves as one. */
+	private fforWitness: FforWitnessService | null = null;
+	/** R's outstanding witness-lane requests, by request id (Appendix F). */
+	private fforWitnessRequests = new Map<
+		string,
+		{ resolve: (body: Buffer) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
+	>();
 	private htlcSafetyMargin: number;
 	private forwardingEnabled: boolean;
 	private eagerGossipVerify: boolean;
@@ -1604,6 +1645,37 @@ export class LightningNode extends EventEmitter {
 		);
 		this.heldForwardLedger.rehydrate();
 		this.autoReleaseHeldForwards = config.autoReleaseHeldForwards ?? true;
+		// FFOR receipt witness (section 9.6, Appendix F.5): rehydrated here,
+		// before any transport exists, so a record is served from disk with
+		// R offline and nothing is ever judged against an empty ledger.
+		if (config.fforWitness?.enabled) {
+			const ledger = new FforWitnessLedger(
+				this.storage
+					? new MetadataLedgerStore<IFforWitnessMailboxRecord>(
+							this.storage,
+							FF_WITNESS_MAILBOX_LEDGER_PREFIX,
+							fforWitnessMailboxCodec
+					  )
+					: new MemoryLedgerStore<IFforWitnessMailboxRecord>(),
+				this.storage
+					? new MetadataLedgerStore<IFforWitnessRecordRow>(
+							this.storage,
+							FF_WITNESS_RECORD_LEDGER_PREFIX,
+							fforWitnessRecordCodec
+					  )
+					: new MemoryLedgerStore<IFforWitnessRecordRow>()
+			);
+			ledger.rehydrate();
+			this.fforWitness = new FforWitnessService(config.fforWitness, {
+				ledger,
+				nodePrivkey: this.nodePrivkey,
+				nodeId: getPublicKey(this.nodePrivkey),
+				currentHeight: () => this.currentBlockHeight,
+				send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
+				log: (action, data) => this.emitStructuredLog('htlc', action, data),
+				emit: (event, data) => this.emit(event, data)
+			});
+		}
 		// Async receive service (issue #709): registrations live in their own
 		// durable ledger next to the holds; admission judges every new hold
 		// against them. Disabled by default.
@@ -1796,6 +1868,7 @@ export class LightningNode extends EventEmitter {
 			this.registerOnionMessageHandler();
 			this.registerPeerStorageHandlers();
 			this.registerCustomMessageHandler();
+			this.registerFforWitnessHandlers();
 			this.wirePeerManagerEvents();
 			if (config.guardianHost) {
 				this.guardianHost = new GuardianHost(config.guardianHost);
@@ -15891,6 +15964,252 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * R: provision a receipt witness for the ACTIVE epoch on a channel
+	 * (section 9.6.4). Fresh fetch and encryption keys and a fresh mailbox
+	 * id, persisted on the epoch record BEFORE the manifest leaves; the ack
+	 * marks the witness as counting. A refusal drops the provision and
+	 * throws: a refused witness is never counted.
+	 */
+	async provisionFforWitness(
+		channelIdHex: string,
+		witnessNodeIdHex: string,
+		opts: { retentionUntil?: number; minReceipts?: number; timeoutMs?: number } = {}
+	): Promise<{ mailboxId: Buffer; retentionUntil: number }> {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const channel = this.channelManager.getChannel(channelId);
+		const record = channel?.getFforEpoch() ?? null;
+		if (!channel || !record || record.role !== 'R') {
+			throw new Error('no FFOR epoch of ours on this channel');
+		}
+		if (
+			record.state !== FforState.ACTIVE ||
+			!record.tSetup ||
+			!record.hCommit ||
+			!record.hAct ||
+			record.epochStartHeight === null
+		) {
+			throw new Error('witnesses are provisioned on an ACTIVE epoch');
+		}
+		const entries = channel.fforBookEntries();
+		if (!entries) throw new Error('no book to provision');
+		const witnessNodeId = Buffer.from(witnessNodeIdHex, 'hex');
+		const fetchPrivkey = crypto.randomBytes(32);
+		const encPrivkey = crypto.randomBytes(32);
+		const mailboxId = crypto.randomBytes(32);
+		const retentionUntil =
+			opts.retentionUntil ??
+			record.params.voucherExpiry + 2 * FF_WITNESS_RETENTION_MARGIN_BLOCKS;
+		const minReceipts = opts.minReceipts ?? 0;
+		const manifestWire = signManifest(
+			{
+				version: FF_WITNESS_VERSION,
+				profile: FF_WITNESS_PROFILE_DR,
+				mailboxId,
+				tSetup: record.tSetup,
+				hCommit: record.hCommit,
+				epochStartHeight: record.epochStartHeight,
+				hAct: record.hAct,
+				fetchPubkey: getPublicKey(fetchPrivkey),
+				encPubkey: getPublicKey(encPrivkey),
+				retentionUntil,
+				minReceipts,
+				book: buildVoucherBook(record.epochId, record.params.variant, entries)
+			},
+			fetchPrivkey
+		);
+		const provision: IFforWitnessProvision = {
+			witnessNodeId,
+			mailboxId,
+			fetchPrivkey,
+			encPrivkey,
+			retentionUntil,
+			minReceipts,
+			manifestWire,
+			ackedAt: null
+		};
+		const persisted = this.channelManager.fforRecordWitness(channelId, provision);
+		if (!persisted.ok) {
+			throw new Error(`could not persist the witness provision: ${persisted.error}`);
+		}
+		const requestId = FforWitnessService.freshRequestId();
+		let ack: ReturnType<typeof decodeWitnessAck>;
+		try {
+			const body = await this.sendFforWitnessRequest(
+				witnessNodeIdHex,
+				FF_WITNESS_PROVISION_TYPE,
+				encodeWitnessProvision(requestId, manifestWire),
+				requestId,
+				opts.timeoutMs
+			);
+			ack = decodeWitnessAck(body);
+		} catch (err) {
+			this.channelManager.fforDropWitness(channelId, mailboxId);
+			throw err;
+		}
+		if (!ack.ok || !ack.witnessNodeId || !ack.witnessNodeId.equals(witnessNodeId)) {
+			this.channelManager.fforDropWitness(channelId, mailboxId);
+			throw new Error(`witness refused the provision: ${ack.error ?? 'wrong identity'}`);
+		}
+		const acked = this.channelManager.fforWitnessAcked(
+			channelId,
+			mailboxId,
+			ack.retentionUntil!
+		);
+		if (!acked.ok) {
+			throw new Error(`could not persist the witness ack: ${acked.error}`);
+		}
+		this.emitStructuredLog('htlc', 'ffor_witness_provision_acked', {
+			channelId: channelIdHex,
+			witness: witnessNodeIdHex,
+			mailboxId: mailboxId.toString('hex'),
+			retentionUntil: ack.retentionUntil
+		});
+		return { mailboxId, retentionUntil: ack.retentionUntil! };
+	}
+
+	/**
+	 * R: fetch and verify every record each provisioned witness holds
+	 * (section 9.6.6), crediting each verified preimage through
+	 * fforAddPreimage (chain monitors included). A record that fails a check
+	 * is reported, never credited.
+	 */
+	async fetchFforWitnessRecords(
+		channelIdHex: string,
+		witnessNodeIdHex?: string,
+		timeoutMs = 30_000
+	): Promise<
+		{
+			witnessNodeId: Buffer;
+			ok: boolean;
+			error?: string;
+			records: { k: number; unbarriered: boolean; verified: boolean; reason?: string }[];
+			credited: number;
+		}[]
+	> {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const channel = this.channelManager.getChannel(channelId);
+		const record = channel?.getFforEpoch() ?? null;
+		if (!channel || !record || record.role !== 'R' || !record.hAct) {
+			throw new Error('no ACTIVE-or-later FFOR epoch of ours on this channel');
+		}
+		const entries = channel.fforBookEntries();
+		if (!entries) throw new Error('no book');
+		const out: Awaited<ReturnType<LightningNode['fetchFforWitnessRecords']>> = [];
+		for (const w of record.witnesses) {
+			const idHex = w.witnessNodeId.toString('hex');
+			if (witnessNodeIdHex && idHex !== witnessNodeIdHex) continue;
+			const requestId = FforWitnessService.freshRequestId();
+			const nonce = crypto.randomBytes(32);
+			let body: Buffer;
+			try {
+				body = await this.sendFforWitnessRequest(
+					idHex,
+					FF_WITNESS_FETCH_TYPE,
+					encodeWitnessFetch(requestId, w.mailboxId, nonce, w.fetchPrivkey),
+					requestId,
+					timeoutMs
+				);
+			} catch (err) {
+				out.push({
+					witnessNodeId: w.witnessNodeId,
+					ok: false,
+					error: (err as Error).message,
+					records: [],
+					credited: 0
+				});
+				continue;
+			}
+			let resp: ReturnType<typeof decodeWitnessFetchResp>;
+			try {
+				resp = decodeWitnessFetchResp(body);
+			} catch (err) {
+				out.push({
+					witnessNodeId: w.witnessNodeId,
+					ok: false,
+					error: `undecodable response: ${(err as Error).message}`,
+					records: [],
+					credited: 0
+				});
+				continue;
+			}
+			const summary = {
+				witnessNodeId: w.witnessNodeId,
+				ok: resp.ok,
+				...(resp.error ? { error: resp.error } : {}),
+				records: [] as { k: number; unbarriered: boolean; verified: boolean; reason?: string }[],
+				credited: 0
+			};
+			for (const rec of resp.records) {
+				const v = verifyWitnessRecord(rec, w, entries, record.epochId, record.hAct);
+				summary.records.push({
+					k: v.k,
+					unbarriered: v.unbarriered,
+					verified: v.ok,
+					...(v.reason ? { reason: v.reason } : {})
+				});
+				if (!v.ok) {
+					this.emit('ffor:witness-audit', {
+						channelId,
+						witnessNodeId: w.witnessNodeId,
+						k: v.k,
+						reason: v.reason
+					});
+					continue;
+				}
+				const known = this.getFforEpoch(channelIdHex)?.knownPreimages[v.k - 1];
+				if (known) continue;
+				if (this.fforAddPreimage(channelIdHex, v.t!).ok) summary.credited++;
+			}
+			out.push(summary);
+		}
+		return out;
+	}
+
+	/**
+	 * R: tell every acknowledged witness the epoch closed (section 9.6.6),
+	 * with the settled bitmap. Advisory for the witness's bookkeeping.
+	 */
+	async closeFforWitnesses(
+		channelIdHex: string,
+		timeoutMs = 30_000
+	): Promise<{ witnessNodeId: Buffer; ok: boolean; held: number }[]> {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const record = this.channelManager.getChannel(channelId)?.getFforEpoch() ?? null;
+		if (!record || record.role !== 'R' || !record.hAct) {
+			throw new Error('no FFOR epoch of ours on this channel');
+		}
+		const K = record.params.maxPayments;
+		const settled = record.settledBitmap ?? Buffer.alloc(Math.ceil(K / 8));
+		const out: { witnessNodeId: Buffer; ok: boolean; held: number }[] = [];
+		for (const w of record.witnesses) {
+			if (w.ackedAt === null) continue;
+			const requestId = FforWitnessService.freshRequestId();
+			try {
+				const body = await this.sendFforWitnessRequest(
+					w.witnessNodeId.toString('hex'),
+					FF_WITNESS_CLOSE_TYPE,
+					encodeWitnessClose(
+						requestId,
+						w.mailboxId,
+						record.hAct,
+						K,
+						settled,
+						crypto.randomBytes(32),
+						w.fetchPrivkey
+					),
+					requestId,
+					timeoutMs
+				);
+				const ack = decodeWitnessCloseAck(body);
+				out.push({ witnessNodeId: w.witnessNodeId, ok: ack.ok, held: ack.numRecordsHeld });
+			} catch {
+				out.push({ witnessNodeId: w.witnessNodeId, ok: false, held: 0 });
+			}
+		}
+		return out;
+	}
+
+	/**
 	 * R: the pre-signed fixed-amount BOLT 11 invoice for voucher k (sections
 	 * 7.3, 7.5.6, 7.6): amount exactly d_k, payment hash H_k, a route hint
 	 * naming S with the epoch's fee terms and S's cltv_expiry_delta, and an
@@ -15924,6 +16243,14 @@ export class LightningNode extends EventEmitter {
 		}
 		if (k < 1 || k > record.params.maxPayments) {
 			throw new Error(`voucher ${k} is not in the book`);
+		}
+		// Section 9.6.2: no invoice before every witness R relies on has
+		// acknowledged the epoch's H_act.
+		const unacked = record.witnesses.find((w) => w.ackedAt === null);
+		if (unacked) {
+			throw new Error(
+				`witness ${unacked.witnessNodeId.toString('hex')} has not acknowledged the epoch`
+			);
 		}
 		// Section 7.5.6, fail closed: an invoice exposed at or past D, or with
 		// no tip to judge D by, is one an honest S will not settle.
@@ -20526,6 +20853,14 @@ export class LightningNode extends EventEmitter {
 			this.onionMessageManager.handleMessage(pubkey, payload);
 		}
 
+		// FFOR witness and issuer lane (Appendix F): odd types with their own
+		// request ids, authorized by the mailbox's fetch key, never by the
+		// peer identity, so no channel and no epoch is consulted here.
+		if (isFforWitnessMessageType(type)) {
+			this.handleFforWitnessMessage(pubkey, type, payload);
+			return;
+		}
+
 		// Beignet-to-beignet custom traffic (issue #546). Odd type: peers that
 		// do not speak it never send it, so anything arriving is addressed to
 		// this surface and never falls through to the channel manager. Unknown
@@ -21113,6 +21448,8 @@ export class LightningNode extends EventEmitter {
 	 * ChannelManager exactly once before calling it.
 	 */
 	private runPerBlockWork(blockHeight: number): void {
+		// Witness retention (section 9.6.6): mailboxes past retention_until go.
+		this.fforWitness?.onBlock(blockHeight);
 		// The height is durable BEFORE any of the work below is judged at it
 		// (issue #708 review): a process that dies inside a per-block scan
 		// restarts at the height that scan was judged at, so a held forward
@@ -22266,6 +22603,82 @@ export class LightningNode extends EventEmitter {
 				} as ILightningError);
 			}
 		);
+	}
+
+	/**
+	 * The FFOR witness lane (Appendix F): ten odd types, routed through
+	 * handlePeerMessage like the custom type so they sit behind the startup
+	 * gate. The loopback harnesses call handlePeerMessage directly, so one
+	 * branch there serves both transports.
+	 */
+	private registerFforWitnessHandlers(): void {
+		if (!this.peerManager) return;
+		for (let t = FF_WITNESS_PROVISION_TYPE; t <= FF_ISSUER_STATUS_RESP_TYPE; t += 2) {
+			this.peerManager.onMessage(t, (pubkey, msgType, payload) => {
+				this.handlePeerMessage(pubkey, msgType, payload);
+			});
+		}
+	}
+
+	private handleFforWitnessMessage(
+		pubkey: string,
+		type: number,
+		payload: Buffer
+	): void {
+		if (isFforWitnessResponseType(type)) {
+			let id: string;
+			try {
+				id = witnessRequestId(payload).toString('hex');
+			} catch {
+				return;
+			}
+			const pending = this.fforWitnessRequests.get(id);
+			if (!pending) {
+				this.emitStructuredLog('peer', 'ffor_witness_response_unmatched', {
+					pubkey,
+					type
+				});
+				return;
+			}
+			clearTimeout(pending.timer);
+			this.fforWitnessRequests.delete(id);
+			pending.resolve(payload);
+			return;
+		}
+		if (this.fforWitness && this.fforWitness.handleMessage(pubkey, type, payload)) {
+			return;
+		}
+		// A request this node does not serve (no witness role, or an issuer
+		// message): odd type, ignorable, and the peer is told nothing.
+		this.emitStructuredLog('peer', 'ffor_witness_request_ignored', {
+			pubkey,
+			type
+		});
+	}
+
+	/** Send a witness-lane request and await the response with its request id. */
+	private sendFforWitnessRequest(
+		pubkey: string,
+		type: number,
+		payload: Buffer,
+		requestId: Buffer,
+		timeoutMs = 30_000
+	): Promise<Buffer> {
+		const id = requestId.toString('hex');
+		return new Promise<Buffer>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				this.fforWitnessRequests.delete(id);
+				reject(new Error(`witness ${pubkey} did not answer type ${type}`));
+			}, timeoutMs);
+			timer.unref?.();
+			this.fforWitnessRequests.set(id, { resolve, reject, timer });
+			this.emitOutbound(pubkey, type, payload);
+		});
+	}
+
+	/** The witness service this node runs, if any (operators, tests). */
+	getFforWitnessService(): FforWitnessService | null {
+		return this.fforWitness;
 	}
 
 	private registerCustomMessageHandler(): void {

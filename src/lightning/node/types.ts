@@ -307,6 +307,12 @@ export interface INodeConfig {
 	 * under an active registration are admitted, within the limits.
 	 */
 	asyncReceiveService?: import('../async-payments/types').IAsyncReceiveServiceConfig;
+	/**
+	 * FFOR D-R receipt witness (spec section 9.6): store a receiver-encrypted
+	 * record of every delegated preimage this node relays, before propagating
+	 * the fulfil, and serve it to the receiver on return. Disabled by default.
+	 */
+	fforWitness?: import('../ffor/witness-service').IFforWitnessConfig;
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
 	/** Resource management config */
