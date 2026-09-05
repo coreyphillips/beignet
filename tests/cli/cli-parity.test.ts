@@ -29,7 +29,25 @@ const cliSrc = fs.readFileSync(
 const INTENTIONALLY_NO_CLI = new Set([
 	'/events',
 	'/openapi.json',
-	'/channel/update-fee'
+	'/channel/update-fee',
+	// FFOR offline receive (issue #729): an app-driven lifecycle (the umbrel
+	// dashboard, coreyphillips/beignet-umbrel#98) over the HTTP routes; CLI
+	// commands follow with the operator guide.
+	'/ffor/epochs',
+	'/ffor/settlements',
+	'/ffor/epoch',
+	'/ffor/epoch/start',
+	'/ffor/invoice',
+	'/ffor/epoch/close',
+	'/ffor/epoch/abort',
+	'/ffor/preimage',
+	'/ffor/witness/provision',
+	'/ffor/issuer/offer',
+	'/ffor/issuer/provision',
+	'/ffor/recover',
+	'/ffor/enforce',
+	'/ffor/witness/status',
+	'/ffor/issuer/status'
 ]);
 
 /** All route paths declared in the daemon routes map (plus special routes). */

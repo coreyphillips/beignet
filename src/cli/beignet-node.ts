@@ -2669,12 +2669,42 @@ export class BeignetNode extends EventEmitter {
 			'direct-funding:offer:accepted',
 			'direct-funding:offer:declined',
 			'direct-funding:offer:failed',
-			'direct-funding:offer:completed'
+			'direct-funding:offer:completed',
+			'ffor:settled',
+			'ffor:delegated-failed',
+			'ffor:witness-provisioned',
+			'ffor:witness-recorded',
+			'ffor:witness-released',
+			'ffor:issuer-provisioned',
+			'ffor:issuer-issued'
 		] as const) {
 			this.node.on(evt, (data: unknown) => {
 				this.emit(evt, jsonSafeEvent(data) as never);
 			});
 		}
+		// The two FFOR events with several arguments (issue #729): the epoch's
+		// committed state and a peer contradicting an ACTIVE epoch.
+		this.node.on(
+			'ffor:state',
+			(channelId: Buffer, state: number, record: IFforEpochRecord) => {
+				const hex = channelId.toString('hex');
+				this.emit('ffor:state', {
+					channelId: hex,
+					state: FforState[state] ?? String(state),
+					epoch: this.fforEpochView(hex, record)
+				});
+			}
+		);
+		this.node.on(
+			'ffor:enforce',
+			(channelId: Buffer, record: IFforEpochRecord) => {
+				const hex = channelId.toString('hex');
+				this.emit('ffor:enforce', {
+					channelId: hex,
+					epoch: this.fforEpochView(hex, record)
+				});
+			}
+		);
 
 		// Recovery Protocol events (docs/RECOVERY-PROTOCOL.md section 8),
 		// relayed with JSON-safe payloads. recovery:guardian_unreachable and

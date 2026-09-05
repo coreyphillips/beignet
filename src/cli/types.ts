@@ -1280,6 +1280,27 @@ export interface BeignetNodeEvents {
 		to: string[];
 	}) => void;
 	/**
+	 * FFOR offline receive (issue #729). Relayed JSON-safe: buffers as hex,
+	 * amounts as decimal strings. ffor:state carries the epoch's committed
+	 * state changes with the same record view GET /ffor/epoch serves.
+	 */
+	'ffor:state': (data: {
+		channelId: string;
+		state: string;
+		epoch: Record<string, unknown>;
+	}) => void;
+	'ffor:settled': (data: Record<string, unknown>) => void;
+	'ffor:delegated-failed': (data: Record<string, unknown>) => void;
+	'ffor:enforce': (data: {
+		channelId: string;
+		epoch: Record<string, unknown>;
+	}) => void;
+	'ffor:witness-provisioned': (data: Record<string, unknown>) => void;
+	'ffor:witness-recorded': (data: Record<string, unknown>) => void;
+	'ffor:witness-released': (data: Record<string, unknown>) => void;
+	'ffor:issuer-provisioned': (data: Record<string, unknown>) => void;
+	'ffor:issuer-issued': (data: Record<string, unknown>) => void;
+	/**
 	 * JIT receive, LSP side (issue #669). Relayed JSON-safe: every satoshi and
 	 * millisatoshi figure is a decimal string. `jit:intent` is a wallet's
 	 * accepted request, keyed by the intercept scid the LSP minted for it;
