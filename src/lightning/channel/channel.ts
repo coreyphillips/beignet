@@ -7691,6 +7691,30 @@ export class Channel {
 		if (msg.feeSatoshis > this._state.remoteBalanceMsat / 1000n) {
 			return err('closing_complete: fee exceeds closer balance');
 		}
+		// And never less than the tx needs to relay. Co-signing is closing:
+		// the closee cannot bump (only the closer RBFs, sendClosingComplete),
+		// so a zero or sub-relay fee would leave CLOSED on a tx no mempool
+		// takes, with our whole balance waiting on the peer's goodwill. The
+		// legacy and taproot bands got the same floor in #579; the profile
+		// judges the tx as built, dust-dropped outputs and all (issue #560).
+		{
+			const localSat = this._state.localBalanceMsat / 1000n;
+			const remoteSat = this._state.remoteBalanceMsat / 1000n;
+			const { feePaid, weight } = closingTxRelayProfile({
+				fundingAmount: this._state.fundingSatoshis,
+				localScriptPubkey: msg.closeeScriptPubkey,
+				remoteScriptPubkey: msg.closerScriptPubkey,
+				localAmount: localSat,
+				remoteAmount: remoteSat - msg.feeSatoshis,
+				isTaproot: isTaprootChannel(this._state.channelType)
+			});
+			const floor = minRelayFeeForWeight(weight);
+			if (feePaid < floor) {
+				return err(
+					`closing_complete: fee ${msg.feeSatoshis} sat pays ${feePaid} sat on the closing tx, below the ${floor} sat relay floor`
+				);
+			}
+		}
 		// BOLT 2 lets the closer pick any nLockTime, but the RBF-signalling
 		// input sequence makes it consensus-enforced: co-signing a far-future
 		// value and reaching CLOSED on it would strand our whole balance in a
