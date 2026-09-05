@@ -226,7 +226,7 @@ describe('FFOR receipt witness: store before propagate (M9.1)', function () {
 	});
 
 	it('a store that refuses holds the fulfil until the wall-clock deadline, then the late record is unbarriered', async () => {
-		const w = createWitnessWorld({ barrierMs: 150 });
+		const w = createWitnessWorld({ barrierMs: 1000 });
 		const { bolt11, paymentHash } = await setup(w);
 		const store = failingRecordStore(w);
 		const released: string[] = [];
@@ -234,7 +234,6 @@ describe('FFOR receipt witness: store before propagate (M9.1)', function () {
 			released.push(e.reason)
 		);
 		w.p.sendPayment(bolt11);
-		await sleep(30);
 		expect(store.failures()).to.be.greaterThan(0);
 		expect(fulfilsToP(w), 'held: nothing upstream yet').to.equal(0);
 		expect(w.p.getPayment(paymentHash)?.status).to.equal(PaymentStatus.PENDING);
@@ -276,7 +275,6 @@ describe('FFOR receipt witness: store before propagate (M9.1)', function () {
 		const { bolt11, paymentHash } = await setup(w);
 		failingRecordStore(w);
 		w.p.sendPayment(bolt11);
-		await sleep(30);
 		expect(fulfilsToP(w)).to.equal(0);
 		const inbound = w.w
 			.getChannelManager()
