@@ -218,7 +218,11 @@ import {
 	computeTInit,
 	computeTSetup
 } from '../ffor/transcript';
-import { checkVoucherBook, IFforBookCheckContext } from '../ffor/amounts';
+import {
+	checkVoucherBook,
+	IFforBookCheckContext,
+	U64_MAX
+} from '../ffor/amounts';
 import {
 	buildVoucherOnion,
 	matchVoucher,
@@ -20014,8 +20018,16 @@ export class Channel {
 
 	/** The book, rebuilt from the record (section 7.5.3). */
 	private _fforBook(f: IFforEpochRecord): IFforBookEntry[] {
-		const base = f.sHtlcIdBase ?? 0n;
-		return f.paymentHashes.map((h, i) => ({
+		return this._fforBookFrom(f, f.paymentHashes, f.sHtlcIdBase ?? 0n);
+	}
+
+	/** The book an ff_accept would give this record, before adopting it. */
+	private _fforBookFrom(
+		f: IFforEpochRecord,
+		hashes: Buffer[],
+		base: bigint
+	): IFforBookEntry[] {
+		return hashes.map((h, i) => ({
 			k: i + 1,
 			paymentHash: h,
 			amountMsat: f.params.voucherAmountsMsat[i],
@@ -20339,24 +20351,55 @@ export class Channel {
 				...this._fforRefuse(msg.epochId, tInit, reason, text)
 			];
 		};
+		// A violation that names an epoch we already hold or consumed is
+		// answered with ff_error ALONE: no ff_abort, which would be a signed
+		// transition out of a state that has none (section 7.5.1), and no
+		// change to the live record or the used-id set. Only a pre-ACTIVE
+		// live epoch that this message contradicts is aborted, through the
+		// ordinary abort of that epoch.
+		const violation = (text: string): ChannelAction[] => [
+			sendMsg(
+				MessageType.FF_ERROR,
+				encodeFforErrorMessage({
+					channelId: this._state.channelId!,
+					epochId: msg.epochId,
+					data: Buffer.from(text, 'utf8')
+				})
+			),
+			{
+				type: ChannelActionType.ERROR,
+				message: `FFOR: ${text}`,
+				cleanup: 'none'
+			}
+		];
+		const live = this._state.ffor;
+		if (live && live.epochId.equals(msg.epochId)) {
+			// Byte-identical replay of the init we already answered: idempotent.
+			if (live.initWire.equals(initWire)) return [];
+			if (
+				live.state === FforState.ACTIVE ||
+				live.state === FforState.DRAINING ||
+				live.state === FforState.CLOSED ||
+				live.state === FforState.ABORTED
+			) {
+				return violation('ff_init names an epoch that is not negotiable');
+			}
+			return [
+				...violation('ff_init differs from the one processed'),
+				...this._fforAbortLocal(
+					live,
+					FforAbortReason.PROTOCOL_ERROR,
+					'ff_init differs from the one processed'
+				)
+			];
+		}
+		if (this._fforEpochIdUsed(msg.epochId)) {
+			return violation('epoch_id already used on this channel');
+		}
 		if (!ctx || !verifyFforMessage(FF_INIT_TYPE, payload, ctx.remoteNodeId)) {
 			return refuse(
 				FforAbortReason.PROTOCOL_ERROR,
 				'ff_init signature invalid'
-			);
-		}
-		if (this._state.ffor?.epochId.equals(msg.epochId)) {
-			// Byte-identical replay of the init we already answered: idempotent.
-			if (this._state.ffor.initWire.equals(initWire)) return [];
-			return refuse(
-				FforAbortReason.PROTOCOL_ERROR,
-				'ff_init differs from the one processed'
-			);
-		}
-		if (this._fforEpochIdUsed(msg.epochId)) {
-			return refuse(
-				FforAbortReason.PROTOCOL_ERROR,
-				'epoch_id already used on this channel'
 			);
 		}
 		const pre = this._fforSetupPreconditionError();
@@ -20589,18 +20632,44 @@ export class Channel {
 				'ff_accept binds a hash to a revealed per-commitment secret'
 			);
 		}
-		f.acceptWire = acceptWire;
-		f.sCommitmentNumber = msg.sCommitmentNumber;
-		f.sHtlcIdBase = msg.sHtlcIdBase;
-		f.paymentHashes = msg.paymentHashes;
-		f.tSetup = computeTSetup(f.tInit, acceptWire);
-		f.hBook = computeHBook(
-			buildVoucherBook(f.epochId, FforVariant.D, this._fforBook(f))
-		);
+		// Every book field is validated and every derived value computed
+		// BEFORE anything is adopted, so a refused accept leaves the record
+		// exactly as it was (no half-adopted epoch).
+		if (msg.sHtlcIdBase > U64_MAX - BigInt(K - 1)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.BOOK_MISMATCH,
+				's_htlc_id_base + K - 1 does not fit a u64'
+			);
+		}
 		const bookError = checkVoucherBook(f.params, this._fforBookContext('R'));
 		if (bookError) {
 			return this._fforAbortLocal(f, FforAbortReason.BOOK_MISMATCH, bookError);
 		}
+		let tSetup: Buffer;
+		let hBook: Buffer;
+		try {
+			tSetup = computeTSetup(f.tInit, acceptWire);
+			hBook = computeHBook(
+				buildVoucherBook(
+					f.epochId,
+					FforVariant.D,
+					this._fforBookFrom(f, msg.paymentHashes, msg.sHtlcIdBase)
+				)
+			);
+		} catch (err) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.PROTOCOL_ERROR,
+				`ff_accept book cannot be built: ${(err as Error).message}`
+			);
+		}
+		f.acceptWire = acceptWire;
+		f.sCommitmentNumber = msg.sCommitmentNumber;
+		f.sHtlcIdBase = msg.sHtlcIdBase;
+		f.paymentHashes = msg.paymentHashes;
+		f.tSetup = tSetup;
+		f.hBook = hBook;
 		return [{ type: ChannelActionType.PERSIST_STATE }];
 	}
 
@@ -21255,11 +21324,21 @@ export class Channel {
 			!verifyFforMessage(FF_ABORT_TYPE, payload, f.remoteNodeId) ||
 			!msg.transcriptHash.equals(expected)
 		) {
+			// Decision: the message came over the Noise-authenticated link,
+			// so the peer sent it, but it is not a signed transition we could
+			// ever attribute to the peer as section 12.2 evidence. Treat it as
+			// the peer giving up on the setup, the same as a disconnect
+			// (reason 6): the setup is not worth resuming and nothing before
+			// ACTIVE is at stake. The message's own reason is NOT recorded and
+			// nothing of it is kept.
 			actions.push({
 				type: ChannelActionType.ERROR,
-				message: 'FFOR: ff_abort signature or transcript hash invalid',
+				message:
+					"FFOR: ff_abort signature or transcript hash invalid; aborting as a disconnect, not as the peer's signed abort",
 				cleanup: 'none'
 			});
+			actions.push(...this._fforMarkAborted(f, FforAbortReason.DISCONNECT));
+			return actions;
 		}
 		actions.push(...this._fforMarkAborted(f, msg.reason));
 		actions.push({
@@ -21611,11 +21690,29 @@ export class Channel {
 				];
 			}
 		}
-		for (const [k, p] of byK) f.knownPreimages[k - 1] = p;
+		// Sections 9.5.1 and 9.5.3: every preimage the ack delivers is R's
+		// on-chain claim key from either commitment view, so it reaches the
+		// chain monitors (and the durable preimage store) BEFORE DRAINING is
+		// persisted and before any drain message leaves. An S that vanishes
+		// after this ack, or force-closes, can no longer take the slot by
+		// timeout.
+		const learned: ChannelAction[] = [];
+		for (const [k, p] of byK) {
+			f.knownPreimages[k - 1] = p;
+			learned.push({
+				type: ChannelActionType.PREIMAGE_LEARNED,
+				paymentHash: f.paymentHashes[k - 1],
+				preimage: p
+			});
+		}
 		f.settledBitmap = Buffer.from(msg.settled);
 		f.closeAckWire = wire;
 		f.state = FforState.DRAINING;
-		return [{ type: ChannelActionType.PERSIST_STATE }, ...this._fforDrain(f)];
+		return [
+			...learned,
+			{ type: ChannelActionType.PERSIST_STATE },
+			...this._fforDrain(f)
+		];
 	}
 
 	/**
@@ -21674,6 +21771,12 @@ export class Channel {
 		}
 		f.knownPreimages[idx] = Buffer.from(preimage);
 		return [
+			// The chain monitors learn it the same way the ack path's do.
+			{
+				type: ChannelActionType.PREIMAGE_LEARNED,
+				paymentHash: f.paymentHashes[idx],
+				preimage: Buffer.from(preimage)
+			},
 			{ type: ChannelActionType.PERSIST_STATE },
 			...(f.state === FforState.DRAINING ? this._fforDrain(f) : [])
 		];

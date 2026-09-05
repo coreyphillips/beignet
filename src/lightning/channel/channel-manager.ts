@@ -8643,6 +8643,10 @@ export class ChannelManager extends EventEmitter {
 					this.emit('watch:output', action.txid, action.outputIndex);
 					break;
 				case ChannelActionType.PREIMAGE_LEARNED:
+					// A preimage the channel learned off-chain (an FFOR ff_close_ack,
+					// a payer's receipt) is a claim key for every monitor tracking
+					// the HTLC: record it here, then let the node persist it.
+					this.recordPreimage(action.paymentHash, action.preimage);
 					this.emit('preimage:learned', action.paymentHash, action.preimage);
 					break;
 				case ChannelActionType.CHANNEL_FULLY_RESOLVED:
