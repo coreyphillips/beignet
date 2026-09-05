@@ -496,6 +496,15 @@ export interface INodeConfig {
 	forwardingFeeBaseMsat?: number;
 	/** Proportional fee in millionths for forwarding (default 1) */
 	forwardingFeePropMillionths?: number;
+	/**
+	 * How long a forward may still satisfy the PREVIOUS policy after a fee or
+	 * CLTV increase on a channel (default 600000, ten minutes; 0 disables). A
+	 * receiver authors the relay terms of a blinded path from the policy it
+	 * read at build time and a blinded payer cannot retry with new terms, so
+	 * the window lets outstanding invoices survive a bump, the way a
+	 * channel_update's grace does for cleartext forwards.
+	 */
+	forwardingPolicyGraceMs?: number;
 	/** MPP partial payment timeout in ms (default 60000) */
 	mppTimeoutMs?: number;
 	/** Human-readable node alias (max 32 bytes UTF-8, per BOLT 7) */
