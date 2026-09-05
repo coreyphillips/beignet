@@ -1479,6 +1479,176 @@ describe('Async held forwards (issue #708)', () => {
  * Build the raw onion_message a node would send to `to` with this payload,
  * without sending it, so a test can deliver it at a chosen instant.
  */
+describe('Async held forwards, review round 1 (issue #708)', () => {
+	describe('release drive', () => {
+		it('an atomic set release forwards every part or none', async function () {
+			this.timeout(20_000);
+			// "The LSP moves the set in one transaction or not at all": the
+			// ledger transition was atomic, but the adds were placed one by
+			// one and nothing checked the outgoing channel could carry the
+			// whole set (in-flight ceiling, max_accepted_htlcs, balance). When
+			// the second add was refused the first was already at the receiver:
+			// one row RELEASED, one FAILED, half an MPP at the receiver until
+			// its timeout and a refunded part at the payer. Now every unplaced
+			// member is judged together before the first add leaves, and a set
+			// that does not fit is failed back whole.
+			const w = await setupWorld({ carolAutoRelease: true });
+			const { alice, lsp, carol, bcChannelId } = w;
+			const total = 5_000_000n;
+			const invoice = asyncInvoice(carol, total);
+			await disconnect(lsp, carol, w.cutBC);
+			for (let i = 0; i < 2; i++) {
+				payPart(
+					alice,
+					invoice.bolt11,
+					invoice.paymentHash,
+					invoice.paymentSecret,
+					total / 2n,
+					total
+				);
+				await settle();
+			}
+			expect(heldRecords(lsp).map((r) => r.state)).to.deep.equal([
+				'HELD',
+				'HELD'
+			]);
+			// The receiver's in-flight ceiling, as the LSP knows it, admits one
+			// part but not both.
+			lsp
+				.getChannelManager()
+				.getChannel(bcChannelId)!
+				.getFullState().remoteConfig.maxHtlcValueInFlightMsat = 3_000_000n;
+			await reconnect(lsp, carol, w.cutBC, w.gateBC);
+			await settle();
+			const states = heldRecords(lsp).map((r) => r.state);
+			expect(new Set(states).size, `all or nothing, got ${states}`).to.equal(1);
+			expect(states[0]).to.equal('FAILED');
+			expect(w.forwards, 'no half-delivered payment').to.equal(0);
+			expect(receivedHtlcCount(carol, bcChannelId)).to.equal(0);
+			await waitFor(
+				() =>
+					alice.getPayment(invoice.paymentHash)?.status ===
+					PaymentStatus.FAILED,
+				'the payer to be refunded both parts'
+			);
+			destroyAll(alice, lsp, carol);
+		});
+
+		it('a release whose add is refused while the inbound channel is reestablishing still resolves the inbound HTLC', async function () {
+			this.timeout(20_000);
+			// Exactly-once resolution of the incoming HTLC. The refusal path
+			// called failIncoming, which the reestablishing inbound channel
+			// refused; without a JIT engine the owed refund was dropped, yet
+			// the row went FAILED (forward_refused) as if resolved. Nothing
+			// owned the inbound HTLC until the generic expiry scan. Now the
+			// refund is owed by the node and carried on the channel's
+			// reestablish (and per block), and a restart's redispatch of a
+			// FAILED row with a committed inbound HTLC owes it again.
+			const w = await setupWorld({ carolAutoRelease: true });
+			const { alice, lsp, carol, abChannelId, bcChannelId } = w;
+			const invoice = asyncInvoice(carol, 5_000_000n);
+			await disconnect(lsp, carol, w.cutBC);
+			alice.sendPayment(invoice.bolt11);
+			await settle();
+			const [row] = heldRecords(lsp);
+			expect(row.state).to.equal('HELD');
+			lsp
+				.getChannelManager()
+				.getChannel(bcChannelId)!
+				.getFullState().remoteConfig.maxHtlcValueInFlightMsat = 1_000_000n;
+			// The payer's link is down when the receiver comes back and releases.
+			await disconnect(alice, lsp, w.cutAB);
+			await reconnect(lsp, carol, w.cutBC, w.gateBC);
+			await settle();
+			expect(heldRecords(lsp)[0].state).to.equal('FAILED');
+			expect(heldRecords(lsp)[0].failReason).to.equal('forward_refused');
+			await reconnect(alice, lsp, w.cutAB, w.gateAB);
+			await settle(10);
+			const inbound = lsp
+				.getChannelManager()
+				.getChannel(abChannelId)!
+				.getFullState()
+				.htlcs.get(`received-${row.inHtlcId}`);
+			expect(
+				inbound?.state,
+				'the inbound HTLC must be failed once the channel can carry it'
+			).to.not.equal(HtlcState.COMMITTED);
+			await waitFor(
+				() =>
+					alice.getPayment(invoice.paymentHash)?.status ===
+					PaymentStatus.FAILED,
+				'the payer to be refunded',
+				3_000
+			);
+			destroyAll(alice, lsp, carol);
+		});
+	});
+
+	describe('cutoff after a restart', () => {
+		it('a restarted LSP does not release a hold its previous process had already judged past the cutoff', async function () {
+			this.timeout(30_000);
+			// The block height was persisted at the END of the per-block work,
+			// so a process that died inside the cutoff scan (here: the FAILING
+			// write rolled back) restarted at the height it had before that
+			// block, and both handleRelease and scan skip the cutoff until a
+			// block arrives. Carol's reconnect notice was answered with a
+			// release the previous process had refused. The height is now
+			// durable BEFORE the work judged at it.
+			const dbPath = tempDb('held-forward-review-cutoff');
+			const raw = new SqliteStorage(dbPath);
+			raw.open();
+			const dead = { val: false };
+			const w = await setupWorld({
+				lspStorage: crashingStorage(raw, dead, {
+					phase: 'before-commit',
+					when: rowInState('FAILING')
+				}),
+				dead,
+				carolAutoRelease: true
+			});
+			const { alice, lsp, carol } = w;
+			const invoice = asyncInvoice(carol, 5_000_000n);
+			await disconnect(lsp, carol, w.cutBC);
+			alice.sendPayment(invoice.bolt11);
+			await settle();
+			const before = heldRecords(lsp)[0];
+			lsp.handleNewBlock(before.cutoffHeight);
+			await settle();
+			expect(dead.val, 'died at the cutoff scan').to.equal(true);
+
+			const lspId = lsp.getNodeId();
+			lsp.destroy();
+			alice.getChannelManager().handlePeerDisconnected(lspId);
+			carol.getChannelManager().handlePeerDisconnected(lspId);
+			alice.removeAllListeners('message:outbound');
+			carol.removeAllListeners('message:outbound');
+			const disk = new SqliteStorage(dbPath);
+			disk.open();
+			const restored = createNode(LSP_SEED, disk);
+			const w2: IWorld = { ...w, lsp: restored, refusals: [], forwards: 0 };
+			observe(w2, restored, carol);
+			await reconnectRestarted(restored, alice);
+			await reconnectRestarted(restored, carol);
+			await settle(10);
+			expect(
+				heldRecords(restored)[0].state,
+				'a hold at its cutoff is never released'
+			).to.not.equal('RELEASED');
+			expect(w2.refusals).to.deep.equal(['past_cutoff']);
+			expect(w2.forwards, 'no add past the cutoff').to.equal(0);
+			restored.handleNewBlock(before.cutoffHeight);
+			await waitFor(
+				() =>
+					alice.getPayment(invoice.paymentHash)?.status ===
+					PaymentStatus.FAILED,
+				'the payer to be refunded at the cutoff',
+				5_000
+			);
+			destroyAll(alice, restored, carol);
+		});
+	});
+});
+
 function buildOnionFrom(
 	from: LightningNode,
 	to: Buffer,
