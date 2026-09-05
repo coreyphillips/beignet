@@ -527,7 +527,11 @@ for prior epochs of this namespace, and the stored root-signed
 REGISTRATION (the origin proof, 5.1). Returning the bundle always
 settles spec open question 11.7. A guardian whose store is uncertain
 (spec 5.5 durability rules) sets `possibly_stale = true` and MUST still
-refuse writes.
+refuse writes. A namespace that cannot be served at all (no checkpoint,
+or quarantined) answers `ERR_STORE_UNCERTAIN`, and even then the stored
+`rotation` (5.11) is attached whenever it verifies on its own: a restore
+device that only knows a damaged old guardian must still learn where the
+namespace went.
 
 ### 5.4 GET_STATE
 
@@ -781,15 +785,52 @@ root signature verifies over the ROTATE transcript under recovery_id
 ```
 
 Effect: the namespace is RETIRED under this set. The guardian persists the
-rotation beside the namespace and, from then on, answers PUT_STATE,
-ACQUIRE_EPOCH, SYNC_RECORD and SYNC_EPOCH for the recovery_id with
-`ERR_SET_RETIRED`; GET_HEAD and GET_STATE keep
-answering (a restore device that only knows the outgoing set reads the
-head, finds the rotation, and follows it), with the rotation attached to
-GET_HEAD. Idempotency: the byte-identical rotation returns
-`OK_DUPLICATE`; a different rotation at the same generation is
-`ERR_CONFLICT`; a lower generation is `ERR_EPOCH_REGRESSION`. Response: the
-status and the stored rotation.
+rotation beside the namespace and, from then on, answers every mutating
+verb for the recovery_id with `ERR_SET_RETIRED`: REGISTER_NODE (a replay
+of the stored registration is retired, not `OK_DUPLICATE`, and a differing
+one is retired, not `ERR_ALREADY_REGISTERED`; a retired namespace is never
+re-anchored), PUT_STATE, SYNC_RECORD, ACQUIRE_EPOCH, SYNC_EPOCH, and any
+local repair mutation (5.10 step 5). GET_HEAD and GET_STATE keep answering
+(a restore device that only knows the outgoing set reads the head, finds
+the rotation, and follows it), with the rotation attached to GET_HEAD.
+Idempotency: the byte-identical rotation returns `OK_DUPLICATE`; a
+different rotation at the same generation is `ERR_CONFLICT`; a lower
+generation is `ERR_EPOCH_REGRESSION`. Response: the status and the stored
+rotation.
+
+Retirement is final only if it is judged where the mutation commits: a
+mutating verb loads the namespace and inspects the stored rotation INSIDE
+the same serialized write transaction that performs the mutation (a
+check made before that transaction can be overtaken by a ROTATE_SET that
+commits in between, and the stale write would then commit into a retired
+namespace). ROTATE_SET writes the rotation under that same serialization,
+so a write either commits before the retirement and is part of the
+retired snapshot, or serializes behind it and is refused. When retirement
+coincides with another refusal, the precedence is fixed:
+
+```text
+1. quarantine (ERR_STORE_UNCERTAIN): the namespace is not provably this
+   guardian's, so nothing in its row authorizes or refuses a write on
+   its own terms, the rotation included (GET_HEAD still attaches a
+   rotation that verifies on its own, 5.3)
+2. unknown namespace (ERR_UNKNOWN_NODE): no row, nothing was retired
+3. retired (ERR_SET_RETIRED): before every verdict the row's other
+   columns would yield (uncertain store, replay, stale or ahead epoch,
+   lease CAS mismatch, sequence gap, conflict)
+4. the remaining row-specific outcomes, in the verb's own order
+```
+
+The stored rotation is trusted by nothing but its own validation. At
+open, and again before it is attached to an uncertain head, the guardian
+checks that the value decodes, binds this guardian_set_id and this
+recovery_id inside the signed transcript, names members that hash to
+new_guardian_set_id, exceeds the namespace generation, and carries a root
+signature that verifies under recovery_id. A value that fails quarantines
+the namespace (`ERR_STORE_UNCERTAIN`, untouched): a corrupted column
+neither retires a namespace nor reopens one. Presence is judged as "not
+null", never as truthiness. A rotation that verifies on its own is
+attached to GET_HEAD even when the rest of the row is uncertain or
+quarantined (5.3).
 
 A retired namespace is never deleted by this verb; retention rules are
 the operator's, as for any namespace, and the incoming set holds the live
@@ -1036,7 +1077,9 @@ codec stays tractable, and signatures never depend on the envelope.
 29  ERR_HEAD_UNKNOWN        SYNC_EPOCH certified head not in the local
                             log; repair with SYNC_RECORD first
 30  ERR_STORE_UNCERTAIN     durability rules force write refusal until
-                            repaired (spec 5.5)
+                            repaired (spec 5.5); on GET_HEAD a stored
+                            rotation that verifies on its own is still
+                            attached (5.3, 5.11)
 31  ERR_RATE_LIMITED        semantic rate limit; retry_after in detail
                             AND the Retry-After HTTP header
 32  ERR_TOO_LARGE           object exceeds the guardian's advertised limit

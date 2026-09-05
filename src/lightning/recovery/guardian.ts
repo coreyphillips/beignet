@@ -878,8 +878,7 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(state.recoveryId);
 			if (quarantine) return quarantine;
 			const stateBuf = stateBytes(state);
-			const outcome = this.store.write(() => {
-				const ns = this.store.getNamespace(state.recoveryId);
+			const outcome = this.fencedWrite(state.recoveryId, (ns) => {
 				if (ns && ns.registrationState) {
 					if (
 						ns.registrationState.equals(stateBuf) &&
@@ -954,6 +953,7 @@ export class ReferenceGuardian {
 				return { kind: 'ok' as const, receipt };
 			});
 
+			if ('status' in outcome) return outcome;
 			if (outcome.kind === 'duplicate') {
 				const ns = outcome.ns;
 				return {
@@ -1063,11 +1063,8 @@ export class ReferenceGuardian {
 			const ciphertextHash = sha256(record.ciphertext);
 			const quarantine = this.quarantineGate(record.recoveryId);
 			if (quarantine) return quarantine;
-			const retired = this.retiredGate(record.recoveryId);
-			if (retired) return retired;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(record.recoveryId);
+			return this.fencedWrite(record.recoveryId, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -1255,18 +1252,179 @@ export class ReferenceGuardian {
 	}
 
 	/**
-	 * A namespace rotated away from this set refuses every write (wire
-	 * 5.11): the live chain is with the incoming set, and a writer that
-	 * still addresses this one is a stale device that must freeze. Reads
-	 * stay open so a restore device can find the rotation.
+	 * The write transaction every mutating verb runs in, with the retirement
+	 * fence INSIDE it (wire 5.11, issue #711).
+	 *
+	 * A namespace rotated away from this set refuses every write: the live
+	 * chain is with the incoming set, and a writer that still addresses this
+	 * one is a stale device that must freeze. Reads stay open so a restore
+	 * device can find the rotation. The fence is only final if it is judged
+	 * under the same BEGIN IMMEDIATE lock the mutation commits under: a
+	 * check made in a read transaction beforehand can be overtaken by a
+	 * ROTATE_SET that commits between that read and this lock, and the
+	 * stale write would then commit into a retired namespace. So there is
+	 * no preflight: the row is loaded here, under the write lock, and the
+	 * marker it carries is authoritative for the whole transaction. Every
+	 * mutating verb goes through here: REGISTER_NODE (a replay against a
+	 * retired namespace is retired, not a duplicate, and a retired
+	 * tombstone is never re-anchored), PUT_STATE, SYNC_RECORD,
+	 * ACQUIRE_EPOCH, SYNC_EPOCH and repair evidence. A verb that mutates a
+	 * namespace without going through here has a bug.
+	 *
+	 * Presence is judged by `rotation !== null`, never by truthiness: the
+	 * column is an ordinary (non-STRICT) SQLite cell, and an INTEGER 0 in
+	 * it is falsy. The open-time verifier validates every stored rotation
+	 * on its own terms (storedRotationProblem) and quarantines a namespace
+	 * whose marker fails, so by the time a verb runs here a non-null marker
+	 * is a verified one, and a damaged one has already closed the namespace
+	 * as uncertain rather than silently retired or silently open.
+	 *
+	 * Precedence when retirement races another verdict, in this order
+	 * (wire 5.11):
+	 *
+	 *   1. quarantine (ERR_STORE_UNCERTAIN, quarantineGate) comes BEFORE the
+	 *      transaction: the row is not trusted to be ours, so its rotation
+	 *      column is not trusted either; the set is fixed at open, so the
+	 *      order is deterministic;
+	 *   2. an absent row is ERR_UNKNOWN_NODE: nothing was ever retired;
+	 *   3. a row carrying a rotation is ERR_SET_RETIRED, before any verdict
+	 *      the row's other columns would yield: an uncertain store, an
+	 *      idempotent replay (OK_DUPLICATE) or a differing registration
+	 *      (ERR_ALREADY_REGISTERED), a stale or ahead epoch, a lease CAS
+	 *      mismatch, a sequence gap, a conflict. Retirement is the
+	 *      permanent, root-signed answer; every other verdict describes a
+	 *      chain that is no longer live here, and a stale writer must be
+	 *      told to freeze, not told to retry or that it succeeded;
+	 *   4. the remaining row-specific outcomes, in the verb's own order.
+	 *
+	 * ROTATE_SET itself does not use this helper: it is the transaction
+	 * that writes the marker, and it judges an existing marker under its own
+	 * idempotency rules (OK_DUPLICATE, ERR_CONFLICT, ERR_EPOCH_REGRESSION).
+	 * It runs in the same store.write, so the marker is written under the
+	 * same lock this fence reads it under.
 	 */
-	private retiredGate(recoveryId: Buffer): IErr | null {
-		const ns = this.store.read(() => this.store.getNamespace(recoveryId));
-		if (!ns || !ns.rotation) return null;
-		return err(
-			GuardianStatus.ERR_SET_RETIRED,
-			'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
-		);
+	private fencedWrite<T>(
+		recoveryId: Buffer,
+		body: (ns: IGuardianNamespaceRow | null) => T
+	): T | IErr {
+		return this.store.write(() => {
+			const ns = this.store.getNamespace(recoveryId);
+			if (ns && ns.rotation !== null) {
+				return err(
+					GuardianStatus.ERR_SET_RETIRED,
+					'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
+				);
+			}
+			return body(ns);
+		});
+	}
+
+	/**
+	 * Judge a persisted rotation on its own terms: the column is trusted by
+	 * nothing but this check. A ROTATE_SET that was accepted stored exactly
+	 * these bytes, so a stored value must still decode, bind to THIS set and
+	 * THIS recovery_id inside the signed transcript, name an incoming set
+	 * whose members hash to it, sit above the namespace generation, and
+	 * carry a root signature that verifies under the recovery_id. Anything
+	 * else is column rot or a foreign write, and the namespace is
+	 * quarantined at open: never silently retired by a non-empty blob,
+	 * never silently reopened by a falsy cell. Non-throwing over persisted
+	 * bytes, like the rest of the open-time walk.
+	 */
+	private storedRotationProblem(ns: IGuardianNamespaceRow): string | null {
+		const raw: unknown = ns.rotation;
+		if (raw === null || raw === undefined) return null;
+		if (!Buffer.isBuffer(raw) || raw.length === 0) {
+			return 'rotation column has a non-BLOB storage class or is empty';
+		}
+		let rotation: IGuardianRotateSetRequest;
+		try {
+			rotation = decodeRotateSetRequest(raw);
+		} catch (error) {
+			return `rotation does not decode (${
+				error instanceof Error ? error.message : String(error)
+			})`;
+		}
+		if (
+			!isLen(rotation.guardianSetId, 32) ||
+			!rotation.guardianSetId.equals(this.guardianSetId)
+		) {
+			return 'rotation is bound to another guardian set';
+		}
+		if (
+			!isLen(rotation.recoveryId, 32) ||
+			!rotation.recoveryId.equals(ns.recoveryId)
+		) {
+			return 'rotation is bound to another recovery_id';
+		}
+		if (
+			!Array.isArray(rotation.newMembers) ||
+			rotation.newMembers.length !== CRASH_V1_PROFILE.total
+		) {
+			return 'rotation new_members malformed';
+		}
+		let computed: Buffer;
+		try {
+			computed = computeGuardianSetId({
+				...CRASH_V1_PROFILE,
+				guardianIds: rotation.newMembers
+			});
+		} catch {
+			return 'rotation new_members invalid';
+		}
+		if (
+			!isLen(rotation.newGuardianSetId, 32) ||
+			!computed.equals(rotation.newGuardianSetId)
+		) {
+			return 'rotation new_members do not hash to new_guardian_set_id';
+		}
+		if (rotation.newGuardianSetId.equals(this.guardianSetId)) {
+			return 'rotation names this set as the incoming set';
+		}
+		if (
+			!validU64(rotation.generation) ||
+			rotation.generation <= readGeneration(ns)
+		) {
+			return 'rotation generation does not exceed the namespace generation';
+		}
+		if (
+			!isLen(rotation.rootSignature, 64) ||
+			!this.safeVerify(
+				rotateTranscriptHash(this.guardianSetId, {
+					recoveryId: rotation.recoveryId,
+					newGuardianSetId: rotation.newGuardianSetId,
+					generation: rotation.generation,
+					newMembers: rotation.newMembers
+				}),
+				rotation.rootSignature,
+				ns.recoveryId
+			)
+		) {
+			return 'rotation root signature failed';
+		}
+		return null;
+	}
+
+	/**
+	 * The stored rotation, if it proves itself (storedRotationProblem), for
+	 * a head that cannot otherwise be served: a quarantined or tombstoned
+	 * namespace still tells a restore device where the namespace went
+	 * (wire 5.11), because the rotation is root-signed and binds this set
+	 * and this recovery_id on its own. Never throws.
+	 */
+	private rotationDespiteUncertainty(
+		recoveryId: Buffer
+	): IGuardianRotateSetRequest | null {
+		try {
+			return this.store.read(() => {
+				const ns = this.store.getNamespace(recoveryId);
+				if (!ns || ns.rotation === null) return null;
+				if (this.storedRotationProblem(ns) !== null) return null;
+				return decodeRotateSetRequest(ns.rotation);
+			});
+		} catch {
+			return null;
+		}
 	}
 
 	// ─────────────── ROTATE_SET (wire 5.11) ───────────────
@@ -1351,6 +1509,9 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(request.recoveryId);
 			if (quarantine) return quarantine;
 			const encoded = encodeRotateSetRequest(request);
+			// The retirement transaction itself: the same BEGIN IMMEDIATE every
+			// fencedWrite takes, so the marker written here is visible to the
+			// next writer the moment this lock is released, and never before.
 			const outcome = this.store.write(() => {
 				const ns = this.store.getNamespace(request.recoveryId);
 				if (!ns || !ns.registrationState) {
@@ -1360,7 +1521,7 @@ export class ReferenceGuardian {
 					);
 				}
 				const current = readGeneration(ns);
-				if (ns.rotation) {
+				if (ns.rotation !== null) {
 					const stored = decodeRotateSetRequest(ns.rotation);
 					if (ns.rotation.equals(encoded)) {
 						return { status: GuardianStatus.OK_DUPLICATE, rotation: stored };
@@ -1411,7 +1572,13 @@ export class ReferenceGuardian {
 				);
 			}
 			const quarantine = this.quarantineGate(request.recoveryId);
-			if (quarantine) return quarantine;
+			if (quarantine) {
+				// Quarantine hides the row, not a rotation that proves itself:
+				// a restore device that only knows this set must still learn
+				// where the namespace went (wire 5.11).
+				const rotation = this.rotationDespiteUncertainty(request.recoveryId);
+				return rotation ? { ...quarantine, rotation } : quarantine;
+			}
 			return this.store.read(() => {
 				const ns = this.store.getNamespace(request.recoveryId);
 				if (!ns) {
@@ -1421,10 +1588,14 @@ export class ReferenceGuardian {
 					);
 				}
 				if (!ns.registrationState || !ns.state) {
-					return err(
-						GuardianStatus.ERR_STORE_UNCERTAIN,
-						'no internally consistent checkpoint; re-register to re-anchor repair'
-					);
+					const rotation = this.rotationDespiteUncertainty(request.recoveryId);
+					return {
+						...err(
+							GuardianStatus.ERR_STORE_UNCERTAIN,
+							'no internally consistent checkpoint; re-register to re-anchor repair'
+						),
+						...(rotation ? { rotation } : {})
+					};
 				}
 				return {
 					status: GuardianStatus.OK,
@@ -1443,7 +1614,7 @@ export class ReferenceGuardian {
 						generation: readGeneration(ns)
 					},
 					generation: readGeneration(ns),
-					...(ns.rotation
+					...(ns.rotation !== null
 						? { rotation: decodeRotateSetRequest(ns.rotation) }
 						: {})
 				};
@@ -1593,11 +1764,8 @@ export class ReferenceGuardian {
 			}
 			const quarantine = this.quarantineGate(expected.recoveryId);
 			if (quarantine) return quarantine;
-			const retired = this.retiredGate(expected.recoveryId);
-			if (retired) return retired;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(expected.recoveryId);
+			return this.fencedWrite(expected.recoveryId, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -1853,11 +2021,8 @@ export class ReferenceGuardian {
 			const recoveryId = certified.recoveryId;
 			const quarantine = this.quarantineGate(recoveryId);
 			if (quarantine) return quarantine;
-			const retired = this.retiredGate(recoveryId);
-			if (retired) return retired;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(recoveryId);
+			return this.fencedWrite(recoveryId, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -2138,8 +2303,7 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(request.recoveryId);
 			if (quarantine) return quarantine;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(request.recoveryId);
+			return this.fencedWrite(request.recoveryId, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -2234,6 +2398,20 @@ export class ReferenceGuardian {
 				if (outcome !== null) {
 					target = outcome.healed;
 					key = target.recoveryId.toString('hex');
+				}
+				// The retirement marker is judged on its own terms before the
+				// namespace is: a value that fails is column rot or a foreign
+				// write, and the namespace closes as uncertain, untouched,
+				// rather than as silently retired or silently open.
+				const rotationProblem = this.storedRotationProblem(target);
+				if (rotationProblem !== null) {
+					this.quarantined.add(key);
+					this.alarm(
+						target.recoveryId,
+						GuardianStatus.ERR_STORE_UNCERTAIN,
+						`stored rotation is invalid (${rotationProblem}); quarantined untouched`
+					);
+					continue;
 				}
 				this.store.write(() => this.verifyNamespaceAtOpen(target));
 			} catch (error) {
