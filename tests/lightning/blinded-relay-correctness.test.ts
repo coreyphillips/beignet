@@ -94,8 +94,11 @@ function makeNodeConfig(seedId: number): INodeConfig {
 	};
 }
 
-function createNode(seedId: number): LightningNode {
-	const node = new LightningNode(makeNodeConfig(seedId));
+function createNode(
+	seedId: number,
+	extra: Partial<INodeConfig> = {}
+): LightningNode {
+	const node = new LightningNode({ ...makeNodeConfig(seedId), ...extra });
 	node.on('error', () => {});
 	return node;
 }
@@ -162,19 +165,46 @@ function addGraphEdge(
 
 const CONSTRAINTS = { maxCltvExpiry: 10_000_000, htlcMinimumMsat: 0n };
 
+interface IRelayTerms {
+	cltvExpiryDelta: number;
+	feeProportionalMillionths: number;
+	feeBaseMsat: number;
+}
+
 /**
- * Alice → Bob(intro) → Carol(recipient), with a proportional relay fee at
- * Bob authored by Carol into the blinded path.
+ * Alice → Bob(intro) → Carol(recipient), with a relay fee at Bob authored by
+ * Carol into the blinded path. Bob's own policy defaults to what the path
+ * pays (a forwarding node refuses a path that understates its policy since
+ * #721); `bobConfig` overrides it, and `issue()` mints a further invoice with
+ * a fresh path so one world can carry several payments.
  */
-function buildTwoHopBlinded(opts: { registerOutScid: boolean }): {
+function buildTwoHopBlinded(opts: {
+	registerOutScid: boolean;
+	relay?: IRelayTerms;
+	bobConfig?: Partial<INodeConfig>;
+}): {
 	alice: LightningNode;
 	bob: LightningNode;
 	carol: LightningNode;
+	bcChannelId: Buffer;
 	invoiceStr: string;
 	paymentHash: Buffer;
+	issue: (relay?: IRelayTerms) => { invoiceStr: string; paymentHash: Buffer };
 } {
+	// 1000 ppm proportional relay fee: 1_000_000 msat forwards need the
+	// ceiling-inverted formula to come out exact.
+	const defaultRelay: IRelayTerms = {
+		cltvExpiryDelta: 40,
+		feeProportionalMillionths: 1000,
+		feeBaseMsat: 0
+	};
 	const alice = createNode(1);
-	const bob = createNode(2);
+	const bob = createNode(2, {
+		forwardingFeeBaseMsat: (opts.relay ?? defaultRelay).feeBaseMsat,
+		forwardingFeePropMillionths: (opts.relay ?? defaultRelay)
+			.feeProportionalMillionths,
+		...opts.bobConfig
+	});
 	const carol = createNode(3);
 	connectNodes(alice, bob);
 	connectNodes(bob, carol);
@@ -206,53 +236,68 @@ function buildTwoHopBlinded(opts: { registerOutScid: boolean }): {
 
 	// Carol registers the preimage/secret via a normal invoice, then we
 	// re-issue it carrying the blinded path through Bob.
-	const baseInv = carol.createInvoice({
-		amountMsat: 1_000_000n,
-		description: 'blinded-relay'
-	});
-	const decoded = decodeInvoice(baseInv.bolt11);
-
-	// 1000 ppm proportional relay fee: 1_000_000 msat forwards need the
-	// ceiling-inverted formula to come out exact.
-	const relay = {
-		cltvExpiryDelta: 40,
-		feeProportionalMillionths: 1000,
-		feeBaseMsat: 0
+	const issue = (
+		relay: IRelayTerms = opts.relay ?? defaultRelay
+	): { invoiceStr: string; paymentHash: Buffer } => {
+		const baseInv = carol.createInvoice({
+			amountMsat: 1_000_000n,
+			description: 'blinded-relay'
+		});
+		const decoded = decodeInvoice(baseInv.bolt11);
+		const hopData: IBlindedHopData[] = [
+			{
+				nextNodeId: carolPub,
+				shortChannelId: scidBC,
+				paymentRelay: relay,
+				paymentConstraints: CONSTRAINTS
+			},
+			{ paymentConstraints: CONSTRAINTS }
+		];
+		const path = constructBlindedPath(
+			crypto.randomBytes(32),
+			[bobPub, carolPub],
+			hopData
+		);
+		// One relay hop, so the aggregate payinfo is the hop's own terms.
+		const payInfo = {
+			feeBaseMsat: relay.feeBaseMsat,
+			feeProportionalMillionths: relay.feeProportionalMillionths,
+			cltvExpiryDelta: relay.cltvExpiryDelta,
+			htlcMinimumMsat: 0n,
+			htlcMaximumMsat: 1_000_000_000n
+		};
+		const invoiceStr = encodeInvoice({
+			network: Network.REGTEST,
+			amountMsat: 1_000_000n,
+			paymentHash: decoded.paymentHash,
+			paymentSecret: decoded.paymentSecret,
+			description: 'blinded-relay',
+			blindedPaths: [{ path, payInfo }],
+			minFinalCltvExpiry: 40,
+			privateKey: nodePrivkeyFor(3)
+		});
+		return { invoiceStr, paymentHash: decoded.paymentHash };
 	};
-	const hopData: IBlindedHopData[] = [
-		{
-			nextNodeId: carolPub,
-			shortChannelId: scidBC,
-			paymentRelay: relay,
-			paymentConstraints: CONSTRAINTS
-		},
-		{ paymentConstraints: CONSTRAINTS }
-	];
-	const path = constructBlindedPath(
-		crypto.randomBytes(32),
-		[bobPub, carolPub],
-		hopData
-	);
-	const payInfo = {
-		feeBaseMsat: 0,
-		feeProportionalMillionths: 1000,
-		cltvExpiryDelta: 40,
-		htlcMinimumMsat: 0n,
-		htlcMaximumMsat: 1_000_000_000n
+
+	const first = issue();
+	return {
+		alice,
+		bob,
+		carol,
+		bcChannelId,
+		invoiceStr: first.invoiceStr,
+		paymentHash: first.paymentHash,
+		issue
 	};
+}
 
-	const invoiceStr = encodeInvoice({
-		network: Network.REGTEST,
-		amountMsat: 1_000_000n,
-		paymentHash: decoded.paymentHash,
-		paymentSecret: decoded.paymentSecret,
-		description: 'blinded-relay',
-		blindedPaths: [{ path, payInfo }],
-		minFinalCltvExpiry: 40,
-		privateKey: nodePrivkeyFor(3)
-	});
-
-	return { alice, bob, carol, invoiceStr, paymentHash: decoded.paymentHash };
+/** Pay and swallow the retry-exhaustion throw; the failure code is recorded. */
+function tryPay(alice: LightningNode, invoiceStr: string): void {
+	try {
+		alice.sendPayment(invoiceStr);
+	} catch {
+		// retries may exhaust with NO_ROUTE; the failure code is recorded
+	}
 }
 
 describe('Blinded relay correctness (S-4.M1 / S-4.M2)', function () {
@@ -307,8 +352,10 @@ describe('Blinded relay correctness (S-4.M1 / S-4.M2)', function () {
 		// MUST send update_fail_malformed_htlc/invalid_onion_blinding; Bob must
 		// convert it into an encrypted invalid_onion_blinding for Alice.
 		const alice = createNode(1);
-		const bob = createNode(2);
-		const carol = createNode(3);
+		// The hand-built relay below is base fee only; the forwarding nodes
+		// charge exactly that so the #721 fee gate is not what fails here.
+		const bob = createNode(2, { forwardingFeePropMillionths: 0 });
+		const carol = createNode(3, { forwardingFeePropMillionths: 0 });
 		const dave = createNode(4);
 		connectNodes(alice, bob);
 		connectNodes(bob, carol);
@@ -486,5 +533,129 @@ describe('Blinded relay correctness (S-4.M1 / S-4.M2)', function () {
 			),
 			'sha256_of_onion matches the received onion'
 		).to.equal(true);
+	});
+});
+
+describe('Blinded relay fee versus forwarding policy (#721)', function () {
+	const POLICY: IRelayTerms = {
+		cltvExpiryDelta: 40,
+		feeProportionalMillionths: 1,
+		feeBaseMsat: 1000
+	};
+	const sleep = (ms: number): Promise<void> =>
+		new Promise((resolve) => setTimeout(resolve, ms));
+
+	it('refuses a blinded path whose relay fee understates our policy', function () {
+		// Carol authors a free relay at Bob; Bob's policy charges 1000 + 1 ppm.
+		const { alice, bob, carol, invoiceStr, paymentHash } = buildTwoHopBlinded({
+			registerOutScid: true,
+			relay: {
+				cltvExpiryDelta: 40,
+				feeProportionalMillionths: 0,
+				feeBaseMsat: 0
+			},
+			bobConfig: {
+				forwardingFeeBaseMsat: 1000,
+				forwardingFeePropMillionths: 1
+			}
+		});
+		let carolSawAdd = false;
+		bob.on('message:outbound', (pk: string, type: number) => {
+			if (pk === carol.getNodeId() && type === MessageType.UPDATE_ADD_HTLC) {
+				carolSawAdd = true;
+			}
+		});
+
+		tryPay(alice, invoiceStr);
+
+		expect(carolSawAdd, 'Bob must not forward a short relay').to.be.false;
+		expect(alice.getPayment(paymentHash)!.failureCode).to.equal(
+			INVALID_ONION_BLINDING
+		);
+		expect(carol.getPayment(paymentHash)?.status).to.not.equal(
+			PaymentStatus.COMPLETED
+		);
+	});
+
+	it('forwards a blinded path authored from our advertised policy', function () {
+		const { alice, carol, invoiceStr, paymentHash } = buildTwoHopBlinded({
+			registerOutScid: true,
+			relay: POLICY
+		});
+		alice.sendPayment(invoiceStr);
+		expect(alice.getPayment(paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(carol.getPayment(paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+	});
+
+	it('honours the previous policy for the grace window after a fee increase, then refuses', async function () {
+		const { alice, bob, carol, bcChannelId, issue } = buildTwoHopBlinded({
+			registerOutScid: true,
+			relay: POLICY,
+			// Wide enough for the in-window payment's own setup (invoice, path,
+			// route) to land inside it on a loaded box; the test sleeps past it.
+			bobConfig: { forwardingPolicyGraceMs: 1000 }
+		});
+		// Bob raises his base fee after Carol authored her paths at 1000.
+		bob.setChannelPolicy(bcChannelId, { feeBaseMsat: 5000 });
+
+		const inWindow = issue(POLICY);
+		alice.sendPayment(inWindow.invoiceStr);
+		expect(
+			carol.getPayment(inWindow.paymentHash)!.status,
+			'a path from the previous policy forwards inside the window'
+		).to.equal(PaymentStatus.COMPLETED);
+
+		await sleep(1100);
+		const afterWindow = issue(POLICY);
+		tryPay(alice, afterWindow.invoiceStr);
+		expect(
+			alice.getPayment(afterWindow.paymentHash)!.failureCode,
+			'the same terms are refused once the window closes'
+		).to.equal(INVALID_ONION_BLINDING);
+
+		const current = issue({ ...POLICY, feeBaseMsat: 5000 });
+		alice.sendPayment(current.invoiceStr);
+		expect(carol.getPayment(current.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+	});
+
+	it('a fee cut takes effect at once and closes an open window', function () {
+		const { alice, bob, carol, bcChannelId, issue } = buildTwoHopBlinded({
+			registerOutScid: true,
+			relay: POLICY
+		});
+		bob.setChannelPolicy(bcChannelId, { feeBaseMsat: 5000 }); // opens a window
+		bob.setChannelPolicy(bcChannelId, { feeBaseMsat: 2000 }); // a cut closes it
+
+		const stale = issue(POLICY); // 1000: below 2000, and the window is gone
+		tryPay(alice, stale.invoiceStr);
+		expect(alice.getPayment(stale.paymentHash)!.failureCode).to.equal(
+			INVALID_ONION_BLINDING
+		);
+
+		const fresh = issue({ ...POLICY, feeBaseMsat: 2000 });
+		alice.sendPayment(fresh.invoiceStr);
+		expect(carol.getPayment(fresh.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+	});
+
+	it('with the window disabled a fee increase refuses outstanding paths at once', function () {
+		const { alice, bob, bcChannelId, issue } = buildTwoHopBlinded({
+			registerOutScid: true,
+			relay: POLICY,
+			bobConfig: { forwardingPolicyGraceMs: 0 }
+		});
+		bob.setChannelPolicy(bcChannelId, { feeProportionalMillionths: 500 });
+		const stale = issue(POLICY);
+		tryPay(alice, stale.invoiceStr);
+		expect(alice.getPayment(stale.paymentHash)!.failureCode).to.equal(
+			INVALID_ONION_BLINDING
+		);
 	});
 });

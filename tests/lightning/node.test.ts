@@ -1870,8 +1870,11 @@ describe('Lightning Node', function () {
 
 		it('pays a 3-hop blinded path (Alice → Bob(intro) → Carol(mid) → Dave)', function () {
 			const alice = createNode(1);
-			const bob = createNode(2);
-			const carol = createNode(3);
+			// The hand-built relay below charges base fee only, and since #721 a
+			// forwarding node refuses a blinded path that understates its policy,
+			// so the forwarding nodes advertise exactly what the path pays.
+			const bob = createNode(2, { forwardingFeePropMillionths: 0 });
+			const carol = createNode(3, { forwardingFeePropMillionths: 0 });
 			const dave = createNode(4);
 			connectNodes(alice, bob);
 			connectNodes(bob, carol);
@@ -2016,8 +2019,10 @@ describe('Lightning Node', function () {
 
 		it('pays a GENERATED 3-node blinded path (Dave builds [Bob → Carol → Dave] from his graph)', function () {
 			const alice = createNode(1);
-			const bob = createNode(2);
-			const carol = createNode(3);
+			// Dave's graph below advertises Bob and Carol at base fee only; the
+			// nodes must charge what the graph says or #721 refuses the path.
+			const bob = createNode(2, { forwardingFeePropMillionths: 0 });
+			const carol = createNode(3, { forwardingFeePropMillionths: 0 });
 			const dave = createNode(4);
 			connectNodes(alice, bob);
 			connectNodes(bob, carol);
@@ -3157,7 +3162,12 @@ describe('Lightning Node', function () {
 		});
 
 		it('accepts a blinded forward whose CLTV delta meets our minimum', function () {
-			const bob = createNode(2);
+			// A zero-fee node: the recipient-authored relay above pays no fee and
+			// this case isolates the CLTV gate, not the #721 fee gate.
+			const bob = createNode(2, {
+				forwardingFeeBaseMsat: 0,
+				forwardingFeePropMillionths: 0
+			});
 			const { processed, outScid } = makeBlindedForward(40); // delta = our min
 			const cm = bob.getChannelManager();
 			let forwarded = false;

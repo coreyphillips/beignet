@@ -636,6 +636,16 @@ export const DF_POLICY_STORAGE_KEY = 'df:policy';
  * would be a copy of a fact the channel already holds, and the only one of the
  * two that can go stale.
  */
+/** The three terms a forwarding policy enforces on an outgoing HTLC. */
+interface IForwardingPolicyTerms {
+	feeBaseMsat: number;
+	feeProportionalMillionths: number;
+	cltvExpiryDelta: number;
+}
+
+/** Ten minutes: the grace LND gives a superseded channel_update. */
+const DEFAULT_FORWARDING_POLICY_GRACE_MS = 10 * 60 * 1000;
+
 interface IPendingFundingTx {
 	txHex: string;
 	phase: 'candidate' | 'authorized' | 'restored';
@@ -734,6 +744,17 @@ export class LightningNode extends EventEmitter {
 	private readonly leaseRates?: import('../gossip/types').ILeaseRates;
 	/** Per-channel routing-policy overrides (channelId hex -> partial policy). */
 	private channelPolicies: Map<string, IChannelPolicyUpdate> = new Map();
+	/**
+	 * The policy a channel advertised BEFORE its latest fee or CLTV increase,
+	 * honoured for forwards until `until` (issue #721). In memory only: a
+	 * restart drops the window, which costs at most one refused forward per
+	 * outstanding blinded invoice, the same as a bump with no window.
+	 */
+	private policyGrace: Map<
+		string,
+		{ policy: IForwardingPolicyTerms; until: number }
+	> = new Map();
+	private readonly forwardingPolicyGraceMs: number;
 	private gossipSyncManagers: Map<string, GossipSyncManager> = new Map();
 	/**
 	 * Broadcast gossip intake (beignet issue #437). Announcements and updates
@@ -1275,6 +1296,8 @@ export class LightningNode extends EventEmitter {
 		this.forwardingCltvDelta = config.forwardingCltvDelta ?? 40;
 		this.forwardingFeeBaseMsat = config.forwardingFeeBaseMsat ?? 1000;
 		this.forwardingFeePropMillionths = config.forwardingFeePropMillionths ?? 1;
+		this.forwardingPolicyGraceMs =
+			config.forwardingPolicyGraceMs ?? DEFAULT_FORWARDING_POLICY_GRACE_MS;
 		this.mppTimeoutMs = config.mppTimeoutMs ?? 60_000;
 		this.alias = config.alias;
 		// BOLT 7 requires address descriptors in ascending order by type.
@@ -10262,6 +10285,7 @@ export class LightningNode extends EventEmitter {
 
 		for (const target of targets) {
 			const hex = target.toString('hex');
+			const before = this.getForwardingPolicyForChannel(target);
 			const merged: IChannelPolicyUpdate = {
 				...this.channelPolicies.get(hex),
 				...policy
@@ -10278,6 +10302,11 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 			this.channelPolicies.set(hex, merged);
+			this.recordPolicyGrace(
+				hex,
+				before,
+				this.getForwardingPolicyForChannel(target)
+			);
 			this.safeStorage(
 				() =>
 					this.storage!.saveChannelPolicy?.(
@@ -10345,11 +10374,9 @@ export class LightningNode extends EventEmitter {
 	 * Fee/CLTV policy the forwarding checks enforce for HTLCs going OUT over
 	 * the given channel (the direction our channel_update advertises).
 	 */
-	private getForwardingPolicyForChannel(channelId: Buffer | undefined): {
-		feeBaseMsat: number;
-		feeProportionalMillionths: number;
-		cltvExpiryDelta: number;
-	} {
+	private getForwardingPolicyForChannel(
+		channelId: Buffer | undefined
+	): IForwardingPolicyTerms {
 		const override = channelId
 			? this.channelPolicies.get(channelId.toString('hex'))
 			: undefined;
@@ -10359,6 +10386,84 @@ export class LightningNode extends EventEmitter {
 				override?.feeProportionalMillionths ?? this.forwardingFeePropMillionths,
 			cltvExpiryDelta: override?.cltvExpiryDelta ?? this.forwardingCltvDelta
 		});
+	}
+
+	/**
+	 * The policy a BLINDED forward over `channelId` must satisfy right now:
+	 * the advertised policy, loosened field by field to the previous policy
+	 * while a grace window from a recent increase is open (issue #721). A
+	 * receiver that authored a blinded path from either policy passes; one
+	 * that understated both is refused. Cleartext forwards never use this:
+	 * their payer retries with the channel_update the failure carries.
+	 */
+	private getEffectiveForwardingPolicyForChannel(
+		channelId: Buffer | undefined
+	): IForwardingPolicyTerms {
+		const current = this.getForwardingPolicyForChannel(channelId);
+		if (!channelId) return current;
+		const hex = channelId.toString('hex');
+		const grace = this.policyGrace.get(hex);
+		if (!grace) return current;
+		if (Date.now() >= grace.until) {
+			this.policyGrace.delete(hex);
+			return current;
+		}
+		return {
+			feeBaseMsat: Math.min(current.feeBaseMsat, grace.policy.feeBaseMsat),
+			feeProportionalMillionths: Math.min(
+				current.feeProportionalMillionths,
+				grace.policy.feeProportionalMillionths
+			),
+			cltvExpiryDelta: Math.min(
+				current.cltvExpiryDelta,
+				grace.policy.cltvExpiryDelta
+			)
+		};
+	}
+
+	/**
+	 * Open (or keep) a grace window when a policy change made any field
+	 * stricter; close it when the change loosened every field. An open window
+	 * is never extended by a later bump: the policy it protects is the one
+	 * receivers could have read, and its clock started when that policy was
+	 * replaced.
+	 */
+	private recordPolicyGrace(
+		hex: string,
+		before: IForwardingPolicyTerms,
+		after: IForwardingPolicyTerms
+	): void {
+		const stricter =
+			after.feeBaseMsat > before.feeBaseMsat ||
+			after.feeProportionalMillionths > before.feeProportionalMillionths ||
+			after.cltvExpiryDelta > before.cltvExpiryDelta;
+		if (!stricter) {
+			this.policyGrace.delete(hex);
+			return;
+		}
+		if (this.forwardingPolicyGraceMs <= 0) return;
+		const existing = this.policyGrace.get(hex);
+		if (existing && Date.now() < existing.until) return;
+		this.policyGrace.set(hex, {
+			policy: before,
+			until: Date.now() + this.forwardingPolicyGraceMs
+		});
+		this.emitStructuredLog('channel', 'policy_grace_opened', {
+			channelId: hex,
+			graceMs: this.forwardingPolicyGraceMs,
+			...before
+		});
+	}
+
+	/** The fee `policy` charges for forwarding `forwardAmount` (BOLT 7). */
+	private static requiredForwardingFeeMsat(
+		policy: IForwardingPolicyTerms,
+		forwardAmount: bigint
+	): bigint {
+		return (
+			BigInt(policy.feeBaseMsat) +
+			(forwardAmount * BigInt(policy.feeProportionalMillionths)) / 1_000_000n
+		);
 	}
 
 	/**
@@ -18335,11 +18440,28 @@ export class LightningNode extends EventEmitter {
 			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
 		}
-		const outPolicy = this.getForwardingPolicyForChannel(outChannelId);
+		// The policy this forward must satisfy. A cleartext payer that is
+		// refused learns our current channel_update from the failure and
+		// retries, so the advertised terms bind at once. A blinded payer
+		// cannot: the relay terms live in the receiver's encrypted path, so
+		// for blinded forwards the terms are loosened to the previous policy
+		// while a grace window from a recent increase is open (issue #721).
+		const outPolicy = isBlindedForward
+			? this.getEffectiveForwardingPolicyForChannel(outChannelId)
+			: this.getForwardingPolicyForChannel(outChannelId);
+		const requiredFee = LightningNode.requiredForwardingFeeMsat(
+			outPolicy,
+			forwardAmount
+		);
 
 		// For a blinded hop the fee/CLTV are defined by payment_relay (the forward
-		// amount above already subtracts the relay fee); just ensure it's viable.
-		// For a cleartext hop, enforce our own forwarding policy.
+		// amount above already subtracts the relay fee). Those terms were authored
+		// by the receiver, not by us: we never build encrypted_recipient_data for
+		// a path we merely relay (buildBlindedPaymentPaths copies the LSP's
+		// advertised policy into paths for OUR invoices). So the terms we honour
+		// are the ones we advertised, at the time the receiver could have read
+		// them, and a path that pays less is refused with invalid_onion_blinding
+		// as BOLT 4 permits. For a cleartext hop, enforce our policy as before.
 		if (isBlindedForward) {
 			// Enforce OUR own CLTV cushion even on a blinded hop: cltvExpiryDelta comes
 			// from the recipient-authored encrypted_recipient_data, so without this a
@@ -18360,6 +18482,18 @@ export class LightningNode extends EventEmitter {
 				});
 				return;
 			}
+			// Fee enforcement: the relay fee the receiver wrote into the path must
+			// cover the fee our policy charges on the amount we forward.
+			if (incomingAmountMsat < forwardAmount + requiredFee) {
+				this.emitStructuredLog('htlc', 'blinded_relay_fee_short', {
+					outChannelId: outChannelId?.toString('hex'),
+					incomingAmountMsat: incomingAmountMsat.toString(),
+					forwardAmountMsat: forwardAmount.toString(),
+					requiredFeeMsat: requiredFee.toString()
+				});
+				failIncoming(FEE_INSUFFICIENT, { htlcMsat: incomingAmountMsat });
+				return;
+			}
 		} else {
 			// CLTV delta enforcement: incoming CLTV must exceed outgoing by our delta
 			if (incomingCltvExpiry < forwardCltv + outPolicy.cltvExpiryDelta) {
@@ -18371,10 +18505,6 @@ export class LightningNode extends EventEmitter {
 				return;
 			}
 			// Fee enforcement: incoming amount must cover outgoing amount + our fee
-			const requiredFee =
-				BigInt(outPolicy.feeBaseMsat) +
-				(forwardAmount * BigInt(outPolicy.feeProportionalMillionths)) /
-					1_000_000n;
 			if (incomingAmountMsat < forwardAmount + requiredFee) {
 				failIncoming(FEE_INSUFFICIENT, { htlcMsat: incomingAmountMsat });
 				return;
@@ -18435,10 +18565,7 @@ export class LightningNode extends EventEmitter {
 				forwardAmountMsat: forwardAmount,
 				forwardCltv,
 				incomingCltvExpiry,
-				policyFeeMsat:
-					BigInt(outPolicy.feeBaseMsat) +
-					(forwardAmount * BigInt(outPolicy.feeProportionalMillionths)) /
-						1_000_000n,
+				policyFeeMsat: requiredFee,
 				performForward,
 				failIncoming
 			});
