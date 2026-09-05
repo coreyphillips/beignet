@@ -10,7 +10,9 @@
  */
 
 import crypto from 'crypto';
+import { sign } from '../crypto/ecdh';
 import { computeHAct, computeHBook, decodeVoucherBook } from './transcript';
+import { sealRecordBody } from './witness-crypto';
 import {
 	FF_WITNESS_ACK_TYPE,
 	FF_WITNESS_BARRIER_MS,
@@ -18,21 +20,28 @@ import {
 	FF_WITNESS_CLOSE_TYPE,
 	FF_WITNESS_FETCH_RESP_TYPE,
 	FF_WITNESS_FETCH_TYPE,
+	FF_WITNESS_FLAG_UNBARRIERED,
 	FF_WITNESS_PROFILE_DR,
 	FF_WITNESS_PROVISION_TYPE,
 	FF_WITNESS_REQUEST_ID_LEN,
 	FF_WITNESS_RETENTION_MARGIN_BLOCKS,
 	FF_WITNESS_VERSION,
-	IFforWitnessRecord
+	IFforWitnessRecord,
+	IFforWitnessRecordHeader
 } from './witness-types';
 import {
 	decodeRecord,
 	decodeWitnessClose,
 	decodeWitnessFetch,
 	decodeWitnessProvision,
+	encodeRecord,
+	encodeRecordBody,
+	encodeRecordHeader,
 	encodeWitnessAck,
 	encodeWitnessCloseAck,
 	encodeWitnessFetchResp,
+	recordAad,
+	recordDigest,
 	termsHash,
 	verifyManifest,
 	verifyWitnessClose,
@@ -53,9 +62,28 @@ export interface IFforWitnessConfig {
 	maxBytes?: number;
 	/** Section 9.6.5 wall-clock bound on the barrier (default 30 s). */
 	barrierMs?: number;
-	/** Blocks before an incoming HTLC's expiry at which W propagates regardless. */
+	/**
+	 * Blocks before an incoming HTLC's expiry at which W propagates a held
+	 * fulfil regardless. The node defaults it to one block past its own
+	 * claim-and-force-close buffer, so the barrier always releases before
+	 * the node closes the channel to claim the HTLC on-chain itself.
+	 */
 	safetyDelta?: number;
 }
+
+/** One downstream fulfil for an outgoing HTLC, as the node sees it. */
+export interface IFforWitnessFulfil {
+	/** "outChannelIdHex:offered-<id>", the node's forward key. */
+	outKey: string;
+	preimage: Buffer;
+	paymentHash: Buffer;
+	amountInMsat: bigint;
+	amountOutMsat: bigint;
+	outgoingCltv: number;
+	incomingCltvExpiry: number;
+}
+
+export type FforWitnessIntercept = 'none' | 'recorded' | 'held';
 
 export interface IFforWitnessDeps {
 	ledger: FforWitnessLedger;
@@ -65,6 +93,26 @@ export interface IFforWitnessDeps {
 	send: (peer: string, type: number, payload: Buffer) => void;
 	log: (action: string, data: Record<string, unknown>) => void;
 	emit: (event: string, data: unknown) => void;
+	/**
+	 * Propagate a fulfil the service held (section 9.6.5 step 5): the node
+	 * settles the forward upstream now, whatever the record's state.
+	 */
+	release?: (
+		fulfil: IFforWitnessFulfil,
+		reason: 'recorded' | 'deadline'
+	) => void;
+}
+
+interface IPendingBarrier {
+	fulfil: IFforWitnessFulfil;
+	mailboxIdHex: string;
+	k: number;
+	released: boolean;
+	/** Set when the deadline propagated before the record landed. */
+	unbarriered: boolean;
+	wallTimer: NodeJS.Timeout | null;
+	retryTimer: NodeJS.Timeout | null;
+	cltvDeadline: number;
 }
 
 const DEFAULT_MAX_MAILBOXES = 64;
@@ -86,8 +134,215 @@ export class FforWitnessService {
 		this.safetyDelta = cfg.safetyDelta ?? 6;
 	}
 
+	/** Fulfils held behind the barrier, by outKey. */
+	private readonly pending = new Map<string, IPendingBarrier>();
+
 	get ledger(): FforWitnessLedger {
 		return this.deps.ledger;
+	}
+
+	// ── Recording: store before you propagate (section 9.6.5) ─────────
+
+	/**
+	 * A downstream fulfil reached this node for an outgoing HTLC. When the
+	 * hash is in a live mailbox, the record is built, encrypted to R and
+	 * committed durably BEFORE the caller may propagate the fulfil upstream.
+	 *
+	 * `none`: not a delegated fulfil, ordinary forwarding rules apply.
+	 * `recorded`: the record is on disk (or already was); propagate now.
+	 * `held`: the store refused; the node must NOT propagate until `release`
+	 * is called, which happens when the write lands or at the bounded
+	 * deadline (the wall-clock bound, or the incoming HTLC's expiry less the
+	 * safety delta), whichever is first. A record written after a deadline
+	 * release carries the `unbarriered` flag.
+	 */
+	interceptDownstreamFulfil(fulfil: IFforWitnessFulfil): FforWitnessIntercept {
+		const hashHex = fulfil.paymentHash.toString('hex');
+		const hit = this.deps.ledger.byHash(hashHex);
+		if (!hit || hit.mailbox.state === 'CLOSED') return 'none';
+		const t = crypto.createHash('sha256').update(fulfil.preimage).digest();
+		if (!t.equals(fulfil.paymentHash)) return 'none';
+		const already = this.pending.get(fulfil.outKey);
+		if (already && !already.released) return 'held';
+		if (this.deps.ledger.record(hit.mailbox.id, hit.k)) {
+			// Idempotent: a replayed downstream fulfil creates no second record.
+			return 'recorded';
+		}
+		if (this.tryStore(hit.mailbox, hit.k, fulfil, false)) return 'recorded';
+		// The store refused: hold, retry, and bound the hold.
+		const barrier: IPendingBarrier = {
+			fulfil,
+			mailboxIdHex: hit.mailbox.id,
+			k: hit.k,
+			released: false,
+			unbarriered: false,
+			wallTimer: null,
+			retryTimer: null,
+			cltvDeadline: fulfil.incomingCltvExpiry - this.safetyDelta
+		};
+		this.pending.set(fulfil.outKey, barrier);
+		barrier.wallTimer = setTimeout(
+			() => this.releaseBarrier(fulfil.outKey, 'deadline'),
+			this.barrierMs
+		);
+		barrier.wallTimer.unref?.();
+		this.scheduleRetry(barrier);
+		this.deps.log('ffor_witness_record_held', {
+			outKey: fulfil.outKey,
+			mailboxId: hit.mailbox.id,
+			k: hit.k,
+			cltvDeadline: barrier.cltvDeadline
+		});
+		if (this.deps.currentHeight() >= barrier.cltvDeadline) {
+			this.releaseBarrier(fulfil.outKey, 'deadline');
+			return 'recorded';
+		}
+		return 'held';
+	}
+
+	/** Whether a forward is held behind the barrier right now. */
+	isHeld(outKey: string): boolean {
+		const b = this.pending.get(outKey);
+		return b !== undefined && !b.released;
+	}
+
+	private scheduleRetry(barrier: IPendingBarrier): void {
+		barrier.retryTimer = setTimeout(() => {
+			barrier.retryTimer = null;
+			const mailbox = this.deps.ledger.mailbox(barrier.mailboxIdHex);
+			if (!mailbox || mailbox.state === 'EXPIRED') {
+				this.pending.delete(barrier.fulfil.outKey);
+				return;
+			}
+			if (
+				this.tryStore(mailbox, barrier.k, barrier.fulfil, barrier.unbarriered)
+			) {
+				if (!barrier.released) {
+					this.releaseBarrier(barrier.fulfil.outKey, 'recorded');
+				} else {
+					this.pending.delete(barrier.fulfil.outKey);
+				}
+				return;
+			}
+			this.scheduleRetry(barrier);
+		}, 1000);
+		barrier.retryTimer.unref?.();
+	}
+
+	private releaseBarrier(
+		outKey: string,
+		reason: 'recorded' | 'deadline'
+	): void {
+		const barrier = this.pending.get(outKey);
+		if (!barrier || barrier.released) return;
+		barrier.released = true;
+		if (barrier.wallTimer) clearTimeout(barrier.wallTimer);
+		barrier.wallTimer = null;
+		if (reason === 'deadline') {
+			// Section 9.6.5: propagate anyway, keep trying to store, and mark
+			// the record unbarriered when it does land.
+			barrier.unbarriered = true;
+			this.deps.log('ffor_witness_barrier_deadline', {
+				outKey,
+				mailboxId: barrier.mailboxIdHex,
+				k: barrier.k
+			});
+		} else {
+			this.pending.delete(outKey);
+		}
+		this.deps.emit('ffor:witness-released', {
+			outKey,
+			mailboxId: Buffer.from(barrier.mailboxIdHex, 'hex'),
+			k: barrier.k,
+			reason
+		});
+		this.deps.release?.(barrier.fulfil, reason);
+	}
+
+	/** Build, seal, sign and commit the record; false when the store refused. */
+	private tryStore(
+		mailbox: IFforWitnessMailboxRecord,
+		k: number,
+		fulfil: IFforWitnessFulfil,
+		unbarriered: boolean
+	): boolean {
+		const entry = mailbox.entries[k - 1];
+		const body = encodeRecordBody({
+			epochId: Buffer.from(mailbox.epochIdHex, 'hex'),
+			k,
+			t: fulfil.preimage,
+			hK: fulfil.paymentHash,
+			dK: BigInt(entry.amountMsat),
+			tExp: entry.tExp,
+			d: entry.d,
+			amountInMsat: fulfil.amountInMsat,
+			amountOutMsat: fulfil.amountOutMsat,
+			outgoingCltv: fulfil.outgoingCltv,
+			observedUnixTime: BigInt(Date.now())
+		});
+		const header: IFforWitnessRecordHeader = {
+			version: FF_WITNESS_VERSION,
+			profile: FF_WITNESS_PROFILE_DR,
+			mailboxId: Buffer.from(mailbox.id, 'hex'),
+			recordId: crypto.randomBytes(32),
+			k,
+			hAct: Buffer.from(mailbox.hActHex, 'hex'),
+			termsHash: Buffer.from(entry.termsHashHex, 'hex'),
+			witnessNodeId: this.deps.nodeId,
+			encPubkey: Buffer.from(mailbox.encPubkeyHex, 'hex'),
+			recordedHeight: this.deps.currentHeight(),
+			flags: unbarriered ? FF_WITNESS_FLAG_UNBARRIERED : 0,
+			ciphertextHash: Buffer.alloc(32)
+		};
+		const ciphertext = sealRecordBody(
+			header.encPubkey,
+			recordAad(header),
+			body
+		);
+		header.ciphertextHash = crypto
+			.createHash('sha256')
+			.update(ciphertext)
+			.digest();
+		const record: IFforWitnessRecord = {
+			header,
+			witnessSig: sign(
+				recordDigest(encodeRecordHeader(header)),
+				this.deps.nodePrivkey
+			),
+			ciphertext,
+			receipts: []
+		};
+		const result = this.deps.ledger.insertRecord({
+			id: header.recordId.toString('hex'),
+			mailboxIdHex: mailbox.id,
+			k,
+			recordHex: encodeRecord(record).toString('hex'),
+			unbarriered,
+			outKey: fulfil.outKey,
+			recordedHeight: header.recordedHeight,
+			receiptsPending: false
+		});
+		if (result.outcome === 'applied' || result.outcome === 'stale') {
+			this.deps.log('ffor_witness_recorded', {
+				mailboxId: mailbox.id,
+				k,
+				outKey: fulfil.outKey,
+				unbarriered
+			});
+			this.deps.emit('ffor:witness-recorded', {
+				mailboxId: Buffer.from(mailbox.id, 'hex'),
+				k,
+				outKey: fulfil.outKey,
+				unbarriered
+			});
+			return true;
+		}
+		this.deps.log('ffor_witness_record_store_failed', {
+			mailboxId: mailbox.id,
+			k,
+			outcome: result.outcome
+		});
+		return false;
 	}
 
 	/** A request of the witness lane; true when this service consumed it. */
@@ -162,8 +417,10 @@ export class FforWitnessService {
 		let entries: IFforWitnessEntry[];
 		let hBook: Buffer;
 		let tExp: number;
+		let epochIdHex: string;
 		try {
 			const book = decodeVoucherBook(manifest.book);
+			epochIdHex = book.epochId.toString('hex');
 			if (book.entries.length === 0) throw new Error('book has no entries');
 			const seen = new Set<string>();
 			tExp = book.entries[0].voucherExpiry;
@@ -232,6 +489,7 @@ export class FforWitnessService {
 		const result = this.deps.ledger.provision({
 			id: mailboxIdHex,
 			manifestHex: manifestWire.toString('hex'),
+			epochIdHex,
 			hActHex: manifest.hAct.toString('hex'),
 			hBookHex: hBook.toString('hex'),
 			tSetupHex: manifest.tSetup.toString('hex'),
@@ -396,6 +654,13 @@ export class FforWitnessService {
 	// ── Retention (section 9.6.6, 9.6.7) ──────────────────────────────
 
 	onBlock(height: number): void {
+		// The CLTV arm of the barrier (section 9.6.5): never past the incoming
+		// HTLC's expiry less the safety delta.
+		for (const [outKey, b] of this.pending) {
+			if (!b.released && height >= b.cltvDeadline) {
+				this.releaseBarrier(outKey, 'deadline');
+			}
+		}
 		for (const m of this.deps.ledger.listMailboxes()) {
 			if (m.state === 'EXPIRED') continue;
 			if (m.retentionUntil < height) {

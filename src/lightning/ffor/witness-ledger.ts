@@ -44,6 +44,8 @@ export interface IFforWitnessMailboxRecord extends ILedgerRecord {
 	state: FforWitnessMailboxState;
 	/** The manifest bytes as received, signature included (audit). */
 	manifestHex: string;
+	/** The book's epoch id (section 7.5.3): the record body names it. */
+	epochIdHex: string;
 	hActHex: string;
 	hBookHex: string;
 	tSetupHex: string;
@@ -101,6 +103,7 @@ export const fforWitnessMailboxCodec: ILedgerCodec<IFforWitnessMailboxRecord> =
 					typeof p.id !== 'string' ||
 					!MAILBOX_STATES.includes(p.state as FforWitnessMailboxState) ||
 					typeof p.manifestHex !== 'string' ||
+					typeof p.epochIdHex !== 'string' ||
 					typeof p.hActHex !== 'string' ||
 					typeof p.fetchPubkeyHex !== 'string' ||
 					typeof p.encPubkeyHex !== 'string' ||

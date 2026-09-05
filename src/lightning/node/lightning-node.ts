@@ -1670,14 +1670,27 @@ export class LightningNode extends EventEmitter {
 					: new MemoryLedgerStore<IFforWitnessRecordRow>()
 			);
 			ledger.rehydrate();
-			this.fforWitness = new FforWitnessService(config.fforWitness, {
+			// The barrier's CLTV arm must fire before scanExpiringHtlcs would
+			// force-close the inbound channel to claim the HTLC we now hold the
+			// preimage for: one block earlier than that buffer.
+			const witnessConfig = {
+				...config.fforWitness,
+				safetyDelta:
+					config.fforWitness.safetyDelta ??
+					Math.max(
+						LightningNode.INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+						this.htlcSafetyMargin
+					) + 1
+			};
+			this.fforWitness = new FforWitnessService(witnessConfig, {
 				ledger,
 				nodePrivkey: this.nodePrivkey,
 				nodeId: getPublicKey(this.nodePrivkey),
 				currentHeight: () => this.currentBlockHeight,
 				send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
 				log: (action, data) => this.emitStructuredLog('htlc', action, data),
-				emit: (event, data) => this.emit(event, data)
+				emit: (event, data) => this.emit(event, data),
+				release: (fulfil) => this.releaseWitnessHeldForward(fulfil)
 			});
 		}
 		// Async receive service (issue #709): registrations live in their own
@@ -19574,6 +19587,21 @@ export class LightningNode extends EventEmitter {
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		const forward = this.forwardedHtlcs.get(outKey);
 		if (forward) {
+			// FFOR receipt witness (section 9.6.5): a delegated fulfil is
+			// recorded durably BEFORE the upstream update_fulfill_htlc leaves;
+			// a held one is propagated by the service's release.
+			const intercept = this.witnessIntercept(
+				outKey,
+				forward,
+				channelId,
+				htlcId,
+				preimage,
+				preimageHash
+			);
+			if (intercept === 'held') {
+				this.persistChannel(channelId);
+				return;
+			}
 			this.settleForwardUpstream(outKey, forward, preimage, preimageHash);
 			this.persistChannel(channelId);
 			return;
@@ -19650,6 +19678,57 @@ export class LightningNode extends EventEmitter {
 	 * that finds it is not a duplicate but the first effective run, and one
 	 * that does not finds nothing to redo.
 	 */
+	/**
+	 * Section 9.6.5, the witness's one hook on the way back: hand a
+	 * delegated fulfil to the witness service and report whether it is
+	 * recorded (propagate now), held (the service will release it) or not a
+	 * delegated fulfil at all.
+	 */
+	private witnessIntercept(
+		outKey: string,
+		forward: { inChannelId: Buffer; inHtlcId: bigint },
+		outChannelId: Buffer,
+		outHtlcId: bigint,
+		preimage: Buffer,
+		preimageHash: Buffer
+	): 'none' | 'recorded' | 'held' {
+		if (!this.fforWitness) return 'none';
+		const outEntry = this.channelManager
+			.getChannel(outChannelId)
+			?.getFullState()
+			.htlcs.get(`offered-${outHtlcId}`);
+		const inEntry = this.channelManager
+			.getChannel(forward.inChannelId)
+			?.getFullState()
+			.htlcs.get(`received-${forward.inHtlcId}`);
+		return this.fforWitness.interceptDownstreamFulfil({
+			outKey,
+			preimage,
+			paymentHash: preimageHash,
+			amountInMsat: inEntry?.amountMsat ?? 0n,
+			amountOutMsat: outEntry?.amountMsat ?? 0n,
+			outgoingCltv: outEntry?.cltvExpiry ?? 0,
+			incomingCltvExpiry: inEntry?.cltvExpiry ?? 0
+		});
+	}
+
+	/** The witness service released a held fulfil: settle it upstream now. */
+	private releaseWitnessHeldForward(fulfil: {
+		outKey: string;
+		preimage: Buffer;
+		paymentHash: Buffer;
+	}): void {
+		const forward = this.forwardedHtlcs.get(fulfil.outKey);
+		if (!forward) return;
+		this.settleForwardUpstream(
+			fulfil.outKey,
+			forward,
+			fulfil.preimage,
+			fulfil.paymentHash
+		);
+		this.persistChannel(Buffer.from(fulfil.outKey.split(':')[0], 'hex'));
+	}
+
 	private settleForwardUpstream(
 		outKey: string,
 		forward: { inChannelId: Buffer; inHtlcId: bigint },
@@ -19733,6 +19812,20 @@ export class LightningNode extends EventEmitter {
 			if (!entry || entry.state !== HtlcState.COMMITTED) continue;
 			const preimage = this.preimages.get(entry.paymentHash.toString('hex'));
 			if (preimage) {
+				// A forward the witness barrier holds is released only by the
+				// service; one it has not recorded yet (a crash before step
+				// 3 of section 9.6.5) is recorded first, then settled.
+				if (this.fforWitness?.isHeld(outKey)) continue;
+				const [outHex, outPart] = outKey.split(':');
+				const intercept = this.witnessIntercept(
+					outKey,
+					forward,
+					Buffer.from(outHex, 'hex'),
+					BigInt(outPart.replace('offered-', '')),
+					preimage,
+					entry.paymentHash
+				);
+				if (intercept === 'held') continue;
 				this.settleForwardUpstream(
 					outKey,
 					forward,
