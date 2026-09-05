@@ -15,13 +15,19 @@ import { Channel } from '../../src/lightning/channel/channel';
 import { createOpenerState } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Network } from '../../src/lightning/invoice/types';
 import { processBlindedHop } from '../../src/lightning/onion/blinded-path';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
+import { Feature } from '../../src/lightning/features/flags';
+import {
+	encodeReceiverGrant,
+	signReceiverGrant
+} from '../../src/lightning/async-payments/receiver-grant';
 import {
 	encodeOfferTlv,
 	encodeInvoiceRequestTlv,
@@ -50,6 +56,52 @@ function makeBasepoints(): IChannelBasepoints {
 		htlcBasepoint: crypto.randomBytes(33),
 		firstPerCommitmentPoint: crypto.randomBytes(33)
 	};
+}
+
+/** The hold window the synthetic LSP grants (blocks). */
+const HOLD_WINDOW = 144;
+
+/**
+ * Async receive is an opt-in service (issue #709): a hold path is built only
+ * through a peer that granted it. The synthetic LSP signs the grant with the
+ * key the test keeps, exactly what a real registration reply carries.
+ */
+function grantAsyncReceive(
+	node: LightningNode,
+	lspPriv: Buffer,
+	scid: Buffer
+): void {
+	const now = BigInt(Math.floor(Date.now() / 1000));
+	node.importAsyncReceiveGrant(
+		encodeReceiverGrant(
+			signReceiverGrant(
+				{
+					featureBit: Feature.ASYNC_RECEIVE_SERVICE + 1,
+					serviceFlags: 0,
+					chainHash: REGTEST_CHAIN_HASH,
+					receiverNodeId: Buffer.from(node.getNodeId(), 'hex'),
+					lspNodeId: getPublicKey(lspPriv),
+					registrationId: crypto.randomBytes(32),
+					scid,
+					maxPartMsat: 1_000_000_000n,
+					maxPaymentMsat: 1_000_000_000n,
+					maxParts: 10,
+					maxHeldMsat: 1_000_000_000n,
+					maxHoldBlocks: HOLD_WINDOW,
+					minRemainingCltv: 6,
+					admissionFeeMsat: 0n,
+					holdingFeeMsatPerBlock: 0n,
+					feeCollection: 1,
+					creditMsat: 0n,
+					issuedAt: now,
+					expiresAt: now + 3600n,
+					nonce: crypto.randomBytes(32),
+					witnessProfile: Buffer.alloc(32)
+				},
+				lspPriv
+			)
+		)
+	);
 }
 
 describe('BOLT 12 async offer (M2.4)', function () {
@@ -89,6 +141,7 @@ describe('BOLT 12 async offer (M2.4)', function () {
 		const cm = (node as any).channelManager;
 		cm.channels.set(channelId.toString('hex'), new Channel(state));
 		cm.channelPeers.set(channelId.toString('hex'), lspPubkey.toString('hex'));
+		grantAsyncReceive(node, lspPriv, scid);
 
 		const { offer } = node.createOffer({
 			description: 'async coffee',
@@ -172,6 +225,7 @@ describe('BOLT 12 async offer (M2.4)', function () {
 		const cm = (node as any).channelManager;
 		cm.channels.set(channelId.toString('hex'), new Channel(state));
 		cm.channelPeers.set(channelId.toString('hex'), lspPubkey.toString('hex'));
+		grantAsyncReceive(node, lspPriv, scid);
 
 		const { offer } = node.createOffer({
 			description: 'async coffee',
@@ -224,11 +278,13 @@ describe('BOLT 12 async offer (M2.4)', function () {
 		// zeros: the payer sizes fees and CLTV from this. The delta covers
 		// the WHOLE path including our final min_final delta (a blinded path
 		// hides the hops, so the payer cannot add it; issue #544 review):
-		// LSP relay 40 + our DEFAULT_MIN_FINAL_CLTV_EXPIRY 40.
+		// LSP relay 40 + our DEFAULT_MIN_FINAL_CLTV_EXPIRY 40, plus the hold
+		// window the grant reserves (issue #709): the payer's extra headroom
+		// is exactly the time the LSP may keep the HTLC parked.
 		const payInfo = b12.blindedPayInfo![0];
 		expect(payInfo.feeBaseMsat).to.equal(1_000);
 		expect(payInfo.feeProportionalMillionths).to.equal(250);
-		expect(payInfo.cltvExpiryDelta).to.equal(40 + 40);
+		expect(payInfo.cltvExpiryDelta).to.equal(40 + 40 + HOLD_WINDOW);
 
 		// The LSP hop still carries hold_htlc + the forward instructions,
 		// SCID-addressed only: BOLT 4 allows exactly one of short_channel_id

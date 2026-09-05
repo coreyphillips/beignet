@@ -180,6 +180,10 @@ CREATE TABLE IF NOT EXISTS guardian_orphan_records (
 	reason TEXT NOT NULL,
 	PRIMARY KEY (recovery_id, epoch, sequence)
 );
+CREATE TABLE IF NOT EXISTS guardian_usage (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	content_bytes INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS guardian_epochs (
 	recovery_id BLOB NOT NULL,
 	epoch BLOB NOT NULL,
@@ -736,4 +740,125 @@ export class GuardianStore {
 			.prepare('DELETE FROM guardian_epochs WHERE recovery_id = ?')
 			.run(recoveryId);
 	}
+
+	// ─────────────── storage accounting ───────────────
+
+	/**
+	 * The content counter: the encoded bytes the store holds, kept as a row
+	 * of the store itself so every writer, in this process or another,
+	 * reads and advances the same number under the same BEGIN IMMEDIATE it
+	 * writes under. Re-derived from the rows at every open (resetUsage), so
+	 * it is recoverable and can be audited against contentBytes().
+	 */
+	usageBytes(): number {
+		const row = this.db
+			.prepare('SELECT content_bytes FROM guardian_usage WHERE id = 1')
+			.get() as { content_bytes: number | bigint } | undefined;
+		return row ? Number(row.content_bytes) : 0;
+	}
+
+	resetUsage(bytes: number): void {
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO guardian_usage (id, content_bytes) VALUES (1, ?)'
+			)
+			.run(bytes);
+	}
+
+	/** Advance the counter by what a transaction wrote; call inside it. */
+	chargeUsage(delta: number): void {
+		this.db
+			.prepare(
+				'UPDATE guardian_usage SET content_bytes = content_bytes + ? WHERE id = 1'
+			)
+			.run(delta);
+	}
+
+	/**
+	 * The encoded bytes the store holds, measured from the rows: every
+	 * column of every row, summed across the four tables, or across one
+	 * namespace's rows. This is what a hosted guardian's byte quota bounds:
+	 * a record costs exactly its columns, so the cost of a write can be
+	 * known before it happens and the counter re-derived after a restart.
+	 * Pages, indexes and the WAL are SQLite's overhead on top and are
+	 * reported separately as disk.
+	 */
+	contentBytes(recoveryId?: Buffer): number {
+		const where = recoveryId ? ' WHERE recovery_id = ?' : '';
+		const args = recoveryId ? [recoveryId] : [];
+		let total = 0;
+		for (const [table, columns] of CONTENT_COLUMNS) {
+			const sum = columns.map((c) => `COALESCE(length(${c}), 0)`).join(' + ');
+			const row = this.db
+				.prepare(
+					`SELECT COALESCE(SUM(${sum}), 0) AS bytes FROM ${table}${where}`
+				)
+				.get(...args) as { bytes: number | bigint };
+			total += Number(row.bytes);
+		}
+		return total;
+	}
 }
+
+/** The columns contentBytes() sums, per table; integers count their width. */
+const CONTENT_COLUMNS: ReadonlyArray<[string, string[]]> = [
+	[
+		'guardian_namespaces',
+		[
+			'recovery_id',
+			'guardian_set_id',
+			'state',
+			'possibly_stale',
+			'registration_state',
+			'registration_signature',
+			'registration_receipt_issued_at',
+			'registration_receipt_signature',
+			'receipt_issued_at',
+			'receipt_signature',
+			'generation',
+			'rotation'
+		]
+	],
+	[
+		'guardian_records',
+		[
+			'recovery_id',
+			'sequence',
+			'epoch',
+			'previous_hash',
+			'frame_hash',
+			'ciphertext_hash',
+			'ciphertext',
+			'writer_signature'
+		]
+	],
+	[
+		'guardian_orphan_records',
+		[
+			'recovery_id',
+			'epoch',
+			'sequence',
+			'previous_hash',
+			'frame_hash',
+			'ciphertext_hash',
+			'ciphertext',
+			'writer_signature',
+			'archived_at',
+			'reason'
+		]
+	],
+	[
+		'guardian_epochs',
+		[
+			'recovery_id',
+			'epoch',
+			'writer_public_key',
+			'cert_superseded_state',
+			'cert_issued_at',
+			'cert_signature',
+			'receipt_state',
+			'receipt_issued_at',
+			'receipt_signature'
+		]
+	]
+];

@@ -22,22 +22,36 @@ import {
 } from '../../src/lightning/message/custom';
 import {
 	CRASH_V1_PROFILE,
+	GUARDIAN_HOST_RECORD_OVERHEAD_BYTES,
+	GUARDIAN_HOST_REGISTRATION_BYTES,
 	GuardianBolt8FrameError,
+	GuardianBolt8Status,
+	GuardianBolt8Verb,
 	GuardianClient,
 	GuardianHost,
 	GuardianState,
 	GuardianStatus,
 	GuardianTransportError,
+	IGuardianAcquireEpochRequest,
 	IGuardianHostEvent,
 	IGuardianRecord,
 	IGuardianRegisterNodeRequest,
+	IGuardianRotateSetRequest,
+	ReferenceGuardian,
+	acquireTranscriptHash,
 	bolt8GuardianTransport,
 	computeGuardianSetId,
+	decodeGuardianBolt8Frame,
+	decodePutStateResponse,
 	deriveGuardianRoot,
 	deriveRecoveryRoot,
+	encodeGuardianBolt8Request,
+	encodePutStateRequest,
+	encodeRotateSetRequest,
 	genesisLogHead,
 	recordTranscriptHash,
 	registerTranscriptHash,
+	rotateTranscriptHash,
 	signTranscript,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
@@ -58,8 +72,11 @@ const OTHERS_A = [sha('other-a-1'), sha('other-a-2')].map(xOnlyFromSecret);
 const OTHERS_B = [sha('other-b-1'), sha('other-b-2')].map(xOnlyFromSecret);
 const SET_A = [HOST.guardianId, ...OTHERS_A];
 const SET_B = [HOST.guardianId, ...OTHERS_B];
+const OTHERS_C = [sha('other-c-1'), sha('other-c-2')].map(xOnlyFromSecret);
+const SET_C = [HOST.guardianId, ...OTHERS_C];
 const setIdOf = (members: Buffer[]): Buffer =>
 	computeGuardianSetId({ ...CRASH_V1_PROFILE, guardianIds: members });
+const hex = (b: Buffer): string => b.toString('hex');
 
 interface IWriter {
 	root: { rootSecret: Buffer; recoveryId: Buffer };
@@ -132,6 +149,78 @@ function record(
 			who.writer.secret
 		)
 	};
+}
+
+/** A root-signed ROTATE_SET away from `members` to SET_B (wire 5.11). */
+function rotation(
+	who: IWriter,
+	members: Buffer[],
+	generation: bigint,
+	transportUrl = (m: Buffer): string => `https://${hex(m).slice(0, 8)}.example`
+): IGuardianRotateSetRequest {
+	const setId = setIdOf(members);
+	const fields = {
+		recoveryId: who.root.recoveryId,
+		newGuardianSetId: setIdOf(SET_B),
+		generation,
+		newMembers: SET_B
+	};
+	return {
+		protocolVersion: 1,
+		guardianSetId: setId,
+		...fields,
+		rootSignature: signTranscript(
+			rotateTranscriptHash(setId, fields),
+			who.root.rootSecret
+		),
+		newTransports: SET_B.map((m) => ({ type: 'https', url: transportUrl(m) }))
+	};
+}
+
+/** ACQUIRE_EPOCH by a fresh writer key over the registration's state. */
+function acquisition(
+	who: IWriter,
+	members: Buffer[],
+	expectedState: GuardianState
+): IGuardianAcquireEpochRequest {
+	const setId = setIdOf(members);
+	const newWriter = sha(`${hex(who.root.recoveryId).slice(0, 8)}-writer-2`);
+	const newEpoch = expectedState.lease.epoch + 1n;
+	const hash = acquireTranscriptHash(
+		setId,
+		expectedState,
+		newEpoch,
+		xOnlyFromSecret(newWriter)
+	);
+	return {
+		protocolVersion: 1,
+		guardianSetId: setId,
+		expectedState,
+		newEpoch,
+		newWriterPublicKey: xOnlyFromSecret(newWriter),
+		rootSignature: signTranscript(hash, who.root.rootSecret),
+		newWriterSignature: signTranscript(hash, newWriter)
+	};
+}
+
+/** One PUT_STATE fed straight to a host's session, no socket in between. */
+function putThrough(
+	host: GuardianHost,
+	peer: string,
+	requestId: number,
+	rec: IGuardianRecord
+): GuardianStatus {
+	const frames = encodeGuardianBolt8Request({
+		requestId,
+		verb: GuardianBolt8Verb.PUT_STATE,
+		body: encodePutStateRequest({ record: rec })
+	});
+	let answer: Buffer[] = [];
+	for (const frame of frames) answer = answer.concat(host.handle(peer, frame));
+	expect(answer).to.have.length(1);
+	const response = decodeGuardianBolt8Frame(answer[0], 'response');
+	expect(response.status).to.equal(GuardianBolt8Status.OK);
+	return decodePutStateResponse(response.chunk).status;
 }
 
 /** A TCP listener that speaks BOLT 8 as the host node and routes to the host. */
@@ -469,5 +558,573 @@ describe('guardian host', () => {
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
 		expect(served.host.status().sessions).to.equal(0);
+	});
+
+	// ─────────────── admission before allocation (issue #710) ───────────────
+
+	/** The stores and the index on disk: what a registration may allocate. */
+	const allocated = (): string[] =>
+		fs
+			.readdirSync(dir)
+			.filter((f) => f.endsWith('.sqlite') || f === 'sets.json')
+			.sort();
+	const bytesOfSetA = (): number =>
+		served.host.status().sets.find((s) => s.setId === hex(setIdOf(SET_A)))!
+			.bytes;
+
+	it('refuses an invalid registration without a store, an index entry, or a served set', async () => {
+		const alice = makeWriter('alice');
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		const forged = await a.client.register(
+			registration(alice, SET_A, { rootSignature: Buffer.alloc(64, 7) })
+		);
+		expect(forged.status).to.equal(GuardianStatus.ERR_BAD_SIGNATURE);
+		const malformed = await a.client.register(
+			registration(alice, SET_A, { generation: 0n })
+		);
+		expect(malformed.status).to.equal(GuardianStatus.ERR_MALFORMED);
+		expect(allocated()).to.deep.equal([]);
+		expect(served.host.servedSetIds()).to.have.length(0);
+		expect(served.host.status().sets).to.have.length(0);
+		expect((await a.client.info()).guardianSetIds).to.have.length(0);
+		expect(
+			served.events.filter((e) => e.type === 'guardian:set-registered')
+		).to.have.length(0);
+		// The set is not poisoned: the honest registration still opens it.
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK);
+		expect(allocated()).to.deep.equal([
+			`${hex(setIdOf(SET_A))}.sqlite`,
+			'sets.json'
+		]);
+	});
+
+	it('fills maxSets only with valid registrations', async () => {
+		await served.close();
+		served = await serve(dir, { maxSets: 1 });
+		const alice = makeWriter('alice');
+		const bob = makeWriter('bob');
+		const a = clientFor(served, SET_A);
+		const b = clientFor(served, SET_B);
+		closers.push(a.close, b.close);
+		for (let i = 0; i < 3; i++) {
+			const forged = await a.client.register(
+				registration(alice, SET_A, { rootSignature: crypto.randomBytes(64) })
+			);
+			expect(forged.status).to.equal(GuardianStatus.ERR_BAD_SIGNATURE);
+		}
+		expect(served.host.servedSetIds()).to.have.length(0);
+		expect((await b.client.register(registration(bob, SET_B))).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.ERR_QUOTA_EXCEEDED);
+		expect(served.host.servedSetIds().map(hex)).to.deep.equal([
+			hex(setIdOf(SET_B))
+		]);
+		expect(allocated()).to.deep.equal([
+			`${hex(setIdOf(SET_B))}.sqlite`,
+			'sets.json'
+		]);
+	});
+
+	it('serves nothing after a restart that follows a refused first registration', async () => {
+		const alice = makeWriter('alice');
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		expect(
+			(
+				await a.client.register(
+					registration(alice, SET_A, { rootSignature: Buffer.alloc(64, 9) })
+				)
+			).status
+		).to.equal(GuardianStatus.ERR_BAD_SIGNATURE);
+		a.close();
+		await served.close();
+		served = await serve(dir);
+		expect(allocated()).to.deep.equal([]);
+		expect(served.host.servedSetIds()).to.have.length(0);
+		const again = clientFor(served, SET_A);
+		closers.push(again.close);
+		expect(
+			(await again.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK);
+	});
+
+	it('adopts a store created before anything was committed on the next registration', async () => {
+		await served.close();
+		// The crash window between opening the store and the guardian's commit.
+		const file = path.join(dir, `${hex(setIdOf(SET_A))}.sqlite`);
+		new ReferenceGuardian({
+			path: file,
+			guardianSecret: HOST.guardianSecret,
+			members: SET_A
+		}).close();
+		served = await serve(dir);
+		expect(served.host.servedSetIds()).to.have.length(0);
+		const alice = makeWriter('alice');
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		expect((await a.client.getHead(alice.root.recoveryId)).status).to.equal(
+			GuardianStatus.ERR_UNKNOWN_NODE
+		);
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK);
+		expect(served.host.servedSetIds().map(hex)).to.deep.equal([
+			hex(setIdOf(SET_A))
+		]);
+		const index = JSON.parse(
+			fs.readFileSync(path.join(dir, 'sets.json'), 'utf8')
+		) as { sets: Record<string, unknown> };
+		expect(index.sets).to.have.property(hex(setIdOf(SET_A)));
+		expect(bytesOfSetA()).to.equal(GUARDIAN_HOST_REGISTRATION_BYTES);
+	});
+
+	it('adopts a committed store the index never named as the duplicate it is', async () => {
+		const alice = makeWriter('alice');
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK);
+		const before = bytesOfSetA();
+		a.close();
+		await served.close();
+		// The crash window between the guardian's commit and the index save.
+		fs.unlinkSync(path.join(dir, 'sets.json'));
+		served = await serve(dir);
+		expect(served.host.servedSetIds()).to.have.length(0);
+		const again = clientFor(served, SET_A);
+		closers.push(again.close);
+		expect((await again.client.getHead(alice.root.recoveryId)).status).to.equal(
+			GuardianStatus.ERR_UNKNOWN_NODE
+		);
+		expect(
+			(await again.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK_DUPLICATE);
+		expect(served.host.servedSetIds().map(hex)).to.deep.equal([
+			hex(setIdOf(SET_A))
+		]);
+		expect(fs.existsSync(path.join(dir, 'sets.json'))).to.equal(true);
+		expect(bytesOfSetA()).to.equal(before);
+		expect((await again.client.getHead(alice.root.recoveryId)).status).to.equal(
+			GuardianStatus.OK
+		);
+	});
+
+	// ─────────────── the byte quota on the write that crosses it ───────────────
+
+	const QUOTA = 64 * 1024;
+
+	async function quotaSet(): Promise<{
+		alice: IWriter;
+		client: GuardianClient;
+	}> {
+		await served.close();
+		served = await serve(dir, { maxBytesPerSet: QUOTA });
+		const alice = makeWriter('alice');
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK);
+		expect(bytesOfSetA()).to.equal(GUARDIAN_HOST_REGISTRATION_BYTES);
+		return { alice, client: a.client };
+	}
+
+	it('refuses a write that would cross the byte quota without mutating the set', async () => {
+		const { alice, client } = await quotaSet();
+		const first = record(
+			alice,
+			SET_A,
+			1n,
+			Buffer.alloc(32),
+			crypto.randomBytes(8192)
+		);
+		expect((await client.putState(first)).status).to.equal(GuardianStatus.OK);
+		const used = bytesOfSetA();
+		expect(used).to.equal(
+			GUARDIAN_HOST_REGISTRATION_BYTES +
+				GUARDIAN_HOST_RECORD_OVERHEAD_BYTES +
+				8192
+		);
+		// Well under the quota on its own; over it with this write.
+		const tooBig = record(
+			alice,
+			SET_A,
+			2n,
+			first.frameHash,
+			crypto.randomBytes(60 * 1024)
+		);
+		expect((await client.putState(tooBig)).status).to.equal(
+			GuardianStatus.ERR_QUOTA_EXCEEDED
+		);
+		expect(bytesOfSetA()).to.equal(used);
+		const head = await client.getHead(alice.root.recoveryId);
+		expect(head.receipt!.state.logHead.sequence).to.equal(1n);
+		expect(
+			served.events.filter((e) => e.type === 'guardian:quota-refused')
+		).to.have.length(1);
+		// Exactly what is left still fits, and lands on the limit itself.
+		const fill = record(
+			alice,
+			SET_A,
+			2n,
+			first.frameHash,
+			crypto.randomBytes(QUOTA - used - GUARDIAN_HOST_RECORD_OVERHEAD_BYTES)
+		);
+		expect((await client.putState(fill)).status).to.equal(GuardianStatus.OK);
+		expect(bytesOfSetA()).to.equal(QUOTA);
+		const one = record(alice, SET_A, 3n, fill.frameHash, Buffer.from([1]));
+		expect((await client.putState(one)).status).to.equal(
+			GuardianStatus.ERR_QUOTA_EXCEEDED
+		);
+		expect(bytesOfSetA()).to.equal(QUOTA);
+	});
+
+	it('answers a replay at the limit as the duplicate it is, charging nothing', async () => {
+		const { alice, client } = await quotaSet();
+		const fill = record(
+			alice,
+			SET_A,
+			1n,
+			Buffer.alloc(32),
+			crypto.randomBytes(
+				QUOTA -
+					GUARDIAN_HOST_REGISTRATION_BYTES -
+					GUARDIAN_HOST_RECORD_OVERHEAD_BYTES
+			)
+		);
+		expect((await client.putState(fill)).status).to.equal(GuardianStatus.OK);
+		expect(bytesOfSetA()).to.equal(QUOTA);
+		expect((await client.putState(fill)).status).to.equal(
+			GuardianStatus.OK_DUPLICATE
+		);
+		expect(bytesOfSetA()).to.equal(QUOTA);
+		expect((await client.register(registration(alice, SET_A))).status).to.equal(
+			GuardianStatus.OK_DUPLICATE
+		);
+		expect(bytesOfSetA()).to.equal(QUOTA);
+		expect(
+			served.events.filter((e) => e.type === 'guardian:quota-refused')
+		).to.have.length(0);
+		const next = record(alice, SET_A, 2n, fill.frameHash, Buffer.from([1]));
+		expect((await client.putState(next)).status).to.equal(
+			GuardianStatus.ERR_QUOTA_EXCEEDED
+		);
+	});
+
+	it('decides concurrent near-limit writes one after the other, so only one passes', async () => {
+		const alice = makeWriter('alice');
+		const bob = makeWriter('bob');
+		const room = GUARDIAN_HOST_RECORD_OVERHEAD_BYTES + 8192;
+		await served.close();
+		served = await serve(dir, {
+			maxBytesPerSet: 2 * GUARDIAN_HOST_REGISTRATION_BYTES + room + 100
+		});
+		const a = clientFor(served, SET_A);
+		const b = clientFor(served, SET_A);
+		closers.push(a.close, b.close);
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK);
+		expect((await b.client.register(registration(bob, SET_A))).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(served.host.status().sessions).to.equal(2);
+		const [fromAlice, fromBob] = await Promise.all([
+			a.client.putState(
+				record(alice, SET_A, 1n, Buffer.alloc(32), crypto.randomBytes(8192))
+			),
+			b.client.putState(
+				record(bob, SET_A, 1n, Buffer.alloc(32), crypto.randomBytes(8192))
+			)
+		]);
+		expect([fromAlice.status, fromBob.status].sort()).to.deep.equal(
+			[GuardianStatus.OK, GuardianStatus.ERR_QUOTA_EXCEEDED].sort()
+		);
+		expect(bytesOfSetA()).to.equal(2 * GUARDIAN_HOST_REGISTRATION_BYTES + room);
+	});
+
+	it('re-derives the byte counters from the stores after a restart', async () => {
+		const alice = makeWriter('alice');
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		await a.client.register(registration(alice, SET_A));
+		const r1 = record(
+			alice,
+			SET_A,
+			1n,
+			Buffer.alloc(32),
+			crypto.randomBytes(3000)
+		);
+		const r2 = record(alice, SET_A, 2n, r1.frameHash, crypto.randomBytes(5000));
+		expect((await a.client.putState(r1)).status).to.equal(GuardianStatus.OK);
+		expect((await a.client.putState(r2)).status).to.equal(GuardianStatus.OK);
+		const before = served.host.status();
+		expect(before.totalBytes).to.equal(
+			GUARDIAN_HOST_REGISTRATION_BYTES +
+				2 * GUARDIAN_HOST_RECORD_OVERHEAD_BYTES +
+				8000
+		);
+		expect(before.sets[0].diskBytes).to.be.greaterThan(before.sets[0].bytes);
+		a.close();
+		await served.close();
+		served = await serve(dir);
+		const after = served.host.status();
+		expect(after.sets[0].bytes).to.equal(before.sets[0].bytes);
+		expect(after.totalBytes).to.equal(before.totalBytes);
+	});
+
+	// ─────────────── discard state is bounded, aged, and per session ───────────────
+
+	it('retains a refused request id per session, ages it out, and forgets it with the session', async () => {
+		let now = 1_000_000;
+		await served.close();
+		served = await serve(dir, {
+			maxCiphertextBytes: 4096,
+			clock: (): number => now
+		});
+		const oversized = (id: number): Buffer =>
+			encodeGuardianBolt8Request({
+				requestId: id,
+				verb: GuardianBolt8Verb.PUT_STATE,
+				body: crypto.randomBytes(200_000)
+			})[0];
+		const frames = served.host.handle('peer-x', oversized(77));
+		expect(frames).to.have.length(1);
+		expect(decodeGuardianBolt8Frame(frames[0], 'response').status).to.equal(
+			GuardianBolt8Status.TOO_LARGE
+		);
+		expect(served.host.status().inFlight).to.equal(1);
+		expect(served.host.status().sessions).to.equal(1);
+		now += 121_000;
+		expect(served.host.evictStale()).to.equal(1);
+		expect(served.host.status().inFlight).to.equal(0);
+		served.host.handle('peer-x', oversized(78));
+		expect(served.host.status().inFlight).to.equal(1);
+		served.host.sessionClosed('peer-x');
+		expect(served.host.status().inFlight).to.equal(0);
+		expect(served.host.status().sessions).to.equal(0);
+	});
+
+	// ─────────────── review round 1: the quota inside the transaction ───────────────
+
+	it('tells a retired namespace so before it tells it about space', async () => {
+		const alice = makeWriter('alice');
+		const rotate = rotation(alice, SET_A, 2n);
+		await served.close();
+		served = await serve(dir, {
+			maxBytesPerSet:
+				GUARDIAN_HOST_REGISTRATION_BYTES +
+				encodeRotateSetRequest(rotate).length +
+				100
+		});
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK);
+		expect((await a.client.rotateSet(rotate)).status).to.equal(
+			GuardianStatus.OK
+		);
+		// This record would cross the quota too; retirement is the answer.
+		const stale = record(
+			alice,
+			SET_A,
+			1n,
+			Buffer.alloc(32),
+			crypto.randomBytes(8192)
+		);
+		expect((await a.client.putState(stale)).status).to.equal(
+			GuardianStatus.ERR_SET_RETIRED
+		);
+		expect(
+			served.events.filter((e) => e.type === 'guardian:quota-refused')
+		).to.have.length(0);
+	});
+
+	it('admits against one counter when two hosts are open on the same store', async () => {
+		const alice = makeWriter('alice');
+		const bob = makeWriter('bob');
+		const room = GUARDIAN_HOST_RECORD_OVERHEAD_BYTES + 8192;
+		const quota = 2 * GUARDIAN_HOST_REGISTRATION_BYTES + room + 100;
+		await served.close();
+		served = await serve(dir, { maxBytesPerSet: quota });
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK);
+		expect((await a.client.register(registration(bob, SET_A))).status).to.equal(
+			GuardianStatus.OK
+		);
+		// A second host process on the same directory: it reopens the same
+		// store from the index, with its own connection.
+		const twin = new GuardianHost({
+			path: dir,
+			guardianSecret: HOST.guardianSecret,
+			maxBytesPerSet: quota
+		});
+		try {
+			expect(twin.servedSetIds().map(hex)).to.deep.equal([hex(setIdOf(SET_A))]);
+			const first = putThrough(
+				served.host,
+				'peer-one',
+				1,
+				record(alice, SET_A, 1n, Buffer.alloc(32), crypto.randomBytes(8192))
+			);
+			const second = putThrough(
+				twin,
+				'peer-two',
+				1,
+				record(bob, SET_A, 1n, Buffer.alloc(32), crypto.randomBytes(8192))
+			);
+			expect(first).to.equal(GuardianStatus.OK);
+			expect(second).to.equal(GuardianStatus.ERR_QUOTA_EXCEEDED);
+			const expected = 2 * GUARDIAN_HOST_REGISTRATION_BYTES + room;
+			expect(bytesOfSetA()).to.equal(expected);
+			expect(twin.status().sets[0].bytes).to.equal(expected);
+		} finally {
+			twin.close();
+		}
+	});
+
+	it('holds ACQUIRE_EPOCH to the same hard bound as every other write', async () => {
+		const alice = makeWriter('alice');
+		await served.close();
+		served = await serve(dir, {
+			maxBytesPerSet: GUARDIAN_HOST_REGISTRATION_BYTES + 100
+		});
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		const reg = registration(alice, SET_A);
+		expect((await a.client.register(reg)).status).to.equal(GuardianStatus.OK);
+		expect(bytesOfSetA()).to.equal(GUARDIAN_HOST_REGISTRATION_BYTES);
+		const acquired = await a.client.acquireEpoch(
+			acquisition(alice, SET_A, reg.initialState)
+		);
+		expect(acquired.status).to.equal(GuardianStatus.ERR_QUOTA_EXCEEDED);
+		expect(bytesOfSetA()).to.equal(GUARDIAN_HOST_REGISTRATION_BYTES);
+		const head = await a.client.getHead(alice.root.recoveryId);
+		expect(head.state!.lease.epoch).to.equal(1n);
+		expect(
+			served.events.filter((e) => e.type === 'guardian:quota-refused')
+		).to.have.length(1);
+	});
+
+	it('charges a replacement rotation as new minus old, and a replay as nothing', async () => {
+		const alice = makeWriter('alice');
+		const small = rotation(alice, SET_A, 2n);
+		const smallBytes = encodeRotateSetRequest(small).length;
+		await served.close();
+		served = await serve(dir, {
+			maxBytesPerSet: GUARDIAN_HOST_REGISTRATION_BYTES + smallBytes + 100
+		});
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK);
+		expect((await a.client.rotateSet(small)).status).to.equal(
+			GuardianStatus.OK
+		);
+		const used = GUARDIAN_HOST_REGISTRATION_BYTES + smallBytes;
+		expect(bytesOfSetA()).to.equal(used);
+		expect((await a.client.rotateSet(small)).status).to.equal(
+			GuardianStatus.OK_DUPLICATE
+		);
+		expect(bytesOfSetA()).to.equal(used);
+		// A later generation with long transport hints: the marker it would
+		// replace is smaller by far more than the 100 bytes left.
+		const large = rotation(
+			alice,
+			SET_A,
+			3n,
+			(m): string => `https://${'x'.repeat(1500)}${hex(m).slice(0, 8)}.example`
+		);
+		expect(encodeRotateSetRequest(large).length - smallBytes).to.be.greaterThan(
+			100
+		);
+		expect((await a.client.rotateSet(large)).status).to.equal(
+			GuardianStatus.ERR_QUOTA_EXCEEDED
+		);
+		expect(bytesOfSetA()).to.equal(used);
+		const head = await a.client.getHead(alice.root.recoveryId);
+		expect(head.rotation!.generation).to.equal(2n);
+	});
+
+	it('adopts a committed orphan even when every slot has since been taken', async () => {
+		await served.close();
+		served = await serve(dir, { maxSets: 1 });
+		const alice = makeWriter('alice');
+		const bob = makeWriter('bob');
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK);
+		a.close();
+		await served.close();
+		fs.unlinkSync(path.join(dir, 'sets.json'));
+		served = await serve(dir, { maxSets: 1 });
+		const b = clientFor(served, SET_B);
+		const again = clientFor(served, SET_A);
+		const c = clientFor(served, SET_C);
+		closers.push(b.close, again.close, c.close);
+		expect((await b.client.register(registration(bob, SET_B))).status).to.equal(
+			GuardianStatus.OK
+		);
+		// The orphan's slot was earned when its store was committed.
+		expect(
+			(await again.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK_DUPLICATE);
+		expect(served.host.servedSetIds().map(hex).sort()).to.deep.equal(
+			[setIdOf(SET_A), setIdOf(SET_B)].map(hex).sort()
+		);
+		expect(served.host.status().sets).to.have.length(2);
+		// A set with no store behind it still needs a slot, and there is none.
+		expect(
+			(await c.client.register(registration(makeWriter('carol'), SET_C))).status
+		).to.equal(GuardianStatus.ERR_QUOTA_EXCEEDED);
+	});
+
+	it('keeps the counter equal to what the rows measure', async () => {
+		const alice = makeWriter('alice');
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		await a.client.register(registration(alice, SET_A));
+		const r1 = record(
+			alice,
+			SET_A,
+			1n,
+			Buffer.alloc(32),
+			crypto.randomBytes(3000)
+		);
+		const r2 = record(alice, SET_A, 2n, r1.frameHash, crypto.randomBytes(5000));
+		expect((await a.client.putState(r1)).status).to.equal(GuardianStatus.OK);
+		expect((await a.client.putState(r2)).status).to.equal(GuardianStatus.OK);
+		expect((await a.client.putState(r2)).status).to.equal(
+			GuardianStatus.OK_DUPLICATE
+		);
+		expect(
+			(await a.client.rotateSet(rotation(alice, SET_A, 2n))).status
+		).to.equal(GuardianStatus.OK);
+		const counted = bytesOfSetA();
+		const audit = new ReferenceGuardian({
+			path: path.join(dir, `${hex(setIdOf(SET_A))}.sqlite`),
+			guardianSecret: HOST.guardianSecret,
+			members: SET_A
+		});
+		try {
+			expect(audit.auditContentBytes()).to.equal(counted);
+			expect(audit.contentBytes()).to.equal(counted);
+		} finally {
+			audit.close();
+		}
 	});
 });

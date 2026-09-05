@@ -85,8 +85,10 @@ import {
 	GuardianState,
 	IGuardianConfigEntry,
 	IParsedGuardian,
+	IRestoreEvent,
 	IRestoreResult,
 	RestoreRefusedError,
+	RestoreRotatedError,
 	buildGuardianRecovery,
 	parseGuardianEntry,
 	decodeRecoveryCapsuleBlob,
@@ -638,8 +640,12 @@ const RESTORE_ERROR_CODES: Record<RestoreRefusedError['reason'], string> = {
 	conflict: 'RESTORE_CONFLICT',
 	'cas-exhausted': 'RESTORE_CAS_EXHAUSTED',
 	'head-unverifiable': 'RESTORE_HEAD_UNVERIFIABLE',
-	'target-unsupported': 'RESTORE_TARGET_UNSUPPORTED'
+	'target-unsupported': 'RESTORE_TARGET_UNSUPPORTED',
+	rotated: 'RESTORE_ROTATED'
 };
+
+/** Rotations followed in one boot or one restore before refusing to follow further. */
+const MAX_ROTATION_HOPS = 8;
 
 /**
  * Compute the default per-wallet data directory for a mnemonic.
@@ -2947,47 +2953,22 @@ export class BeignetNode extends EventEmitter {
 		// A set that retired this namespace hands over the rotation (wire
 		// 5.11); follow it to the live set, and adopt its generation so this
 		// device's own capsule and registration order correctly.
-		for (let hop = 0; hop < 8 && decision.kind === 'rotated'; hop++) {
-			const from = guardians.map((g) => g.guardianId.toString('hex'));
-			let next: IParsedGuardian[];
-			try {
-				next = decision.entries.map(parseGuardianEntry);
-			} catch (error) {
-				throw new BeignetError(
-					'RECOVERY_UNAVAILABLE',
-					`this namespace was rotated to generation ${
-						decision.generation
-					} but the rotation names a guardian this daemon cannot address: ${
-						error instanceof Error ? error.message : String(error)
-					}`
-				);
-			}
-			this._followedRotation = {
-				generation: decision.generation.toString(),
-				from,
-				to: next.map((g) => g.guardianId.toString('hex'))
-			};
-			this.log(
-				'info',
-				'Following a guardian-set rotation',
-				this._followedRotation
+		for (
+			let hop = 0;
+			hop < MAX_ROTATION_HOPS && decision.kind === 'rotated';
+			hop++
+		) {
+			guardians = this.followRotation(
+				guardians,
+				decision.generation,
+				decision.entries
 			);
-			this.emit('recovery:rotation-followed', this._followedRotation);
-			this.storage.setRecoveryMeta?.(
-				JOURNAL_META_KEYS.generation,
-				decision.generation.toString()
-			);
-			this.storage.setRecoveryMeta?.(
-				REPLICATION_META_KEYS.guardianSet,
-				JSON.stringify(decision.entries)
-			);
-			guardians = next;
 			decision = await this.decideGuardianBoot(guardians, mode, opts);
 		}
 		if (decision.kind === 'rotated') {
 			throw new BeignetError(
 				'RECOVERY_UNAVAILABLE',
-				'this namespace was rotated more than 8 times in a row; refusing to follow further'
+				`this namespace was rotated more than ${MAX_ROTATION_HOPS} times in a row; refusing to follow further`
 			);
 		}
 		if (decision.kind === 'run') {
@@ -3006,6 +2987,66 @@ export class BeignetNode extends EventEmitter {
 				'this namespace cannot be decided without a guardian quorum; ' +
 				'retry when the guardian set is reachable.'
 		);
+	}
+
+	/**
+	 * The set this device is currently pointed at: the journal's configured
+	 * set once a rotation has moved it, the env's until then (the same
+	 * precedence prepareRecovery applies).
+	 */
+	private currentGuardianSet(opts: BeignetNodeOptions): IParsedGuardian[] {
+		const persisted = readGuardianSet(this.storage);
+		const entries: Array<string | IGuardianConfigEntry> =
+			persisted && persisted.length === CRASH_V1_PROFILE.total
+				? persisted
+				: opts.recoveryGuardians ?? [];
+		return entries.map(parseGuardianEntry);
+	}
+
+	/**
+	 * Follow a root-signed rotation (wire 5.11) from the set this device was
+	 * pointed at to the incoming set it names: adopt the generation so this
+	 * device's own capsule and registration order correctly, persist the
+	 * incoming set as the journal's configured set, and return it parsed.
+	 * Shared by the boot decision loop and the restore route, which meet
+	 * the same rotation at different moments (issues #701, #714).
+	 */
+	private followRotation(
+		from: IParsedGuardian[],
+		generation: bigint,
+		entries: IGuardianConfigEntry[]
+	): IParsedGuardian[] {
+		let next: IParsedGuardian[];
+		try {
+			next = entries.map(parseGuardianEntry);
+		} catch (error) {
+			throw new BeignetError(
+				'RECOVERY_UNAVAILABLE',
+				`this namespace was rotated to generation ${generation} but the rotation names a guardian this daemon cannot address: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
+		}
+		this._followedRotation = {
+			generation: generation.toString(),
+			from: from.map((g) => g.guardianId.toString('hex')),
+			to: next.map((g) => g.guardianId.toString('hex'))
+		};
+		this.log(
+			'info',
+			'Following a guardian-set rotation',
+			this._followedRotation
+		);
+		this.emit('recovery:rotation-followed', this._followedRotation);
+		this.storage.setRecoveryMeta?.(
+			JOURNAL_META_KEYS.generation,
+			generation.toString()
+		);
+		this.storage.setRecoveryMeta?.(
+			REPLICATION_META_KEYS.guardianSet,
+			JSON.stringify(entries)
+		);
+		return next;
 	}
 
 	/** One boot decision against one guardian set (assembly.ts). */
@@ -4663,7 +4704,8 @@ export class BeignetNode extends EventEmitter {
 		}
 		this._restoreInFlight = true;
 		try {
-			const driver = this._restoreDecision.buildRestoreDriver((event) => {
+			const opts = this._deferredOpts!;
+			const onEvent = (event: IRestoreEvent): void => {
 				this._lastRestoreEvent = { type: event.type, detail: event.detail };
 				this.log('info', `Recovery restore: ${event.type}`, {
 					detail: event.detail
@@ -4672,20 +4714,46 @@ export class BeignetNode extends EventEmitter {
 					type: event.type,
 					detail: event.detail
 				});
-			});
-			let result: IRestoreResult;
-			try {
-				result = await driver.restore();
-			} catch (err) {
-				if (err instanceof RestoreRefusedError) {
-					throw new BeignetError(RESTORE_ERROR_CODES[err.reason], err.message);
+			};
+			let result: IRestoreResult | undefined;
+			// The set the boot decision found may retire the namespace between
+			// that decision and this restore (wire 5.9 step 5): the driver
+			// then refuses with the verified rotation, having written nothing
+			// to the outgoing set, and the restore follows it exactly as the
+			// boot would have, then decides and restores against the incoming
+			// set. Bounded like the boot loop.
+			for (let hop = 0; result === undefined; hop++) {
+				const driver = this._restoreDecision.buildRestoreDriver(onEvent);
+				try {
+					result = await driver.restore();
+				} catch (err) {
+					if (err instanceof RestoreRotatedError && hop < MAX_ROTATION_HOPS) {
+						const from = this.currentGuardianSet(opts);
+						this.followRotation(from, err.generation, err.entries);
+						this._restoreDecision = undefined;
+						await this.prepareRecovery(opts);
+						if (!this._restoreDecision) {
+							throw new BeignetError(
+								'RESTORE_ROTATED',
+								`this namespace was rotated to generation ${err.generation}; ` +
+									'the incoming set was followed but did not answer restore-required; ' +
+									'restart the daemon to decide against it'
+							);
+						}
+						continue;
+					}
+					if (err instanceof RestoreRefusedError) {
+						throw new BeignetError(
+							RESTORE_ERROR_CODES[err.reason],
+							err.message
+						);
+					}
+					throw err;
 				}
-				throw err;
 			}
 			// The lease is durably installed, so re-running the boot decision
 			// short-circuits on it (already-held, no network) and yields the
 			// runnable assembly for the deferred node construction.
-			const opts = this._deferredOpts!;
 			this._restoreDecision = undefined;
 			await this.prepareRecovery(opts);
 			if (!this._recoveryRun) {

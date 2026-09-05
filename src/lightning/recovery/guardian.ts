@@ -43,7 +43,8 @@ import {
 	takeoverTranscriptHash,
 	verifyTranscript,
 	xOnlyFromSecret,
-	rotateTranscriptHash
+	rotateTranscriptHash,
+	rotationEvidenceProblem
 } from './guardian-wire';
 import {
 	GuardianStore,
@@ -323,6 +324,14 @@ export interface IReferenceGuardianConfig {
 	members: Buffer[];
 	/** Advertised ciphertext limit; the 16 MiB protocol cap bounds it. */
 	maxCiphertextBytes?: number;
+	/**
+	 * Content the store may hold (GuardianStore.contentBytes) before a
+	 * write that would cross it is refused with ERR_QUOTA_EXCEEDED, judged
+	 * inside the write's own transaction. Absent runs unbounded, which is
+	 * what a configured guardian serving one set of its own wants; a host
+	 * sets it per set (guardian-host.ts).
+	 */
+	maxContentBytes?: number;
 	/** Advertised GET_STATE page limit; the protocol caps it at 256. */
 	maxRecordsPerGet?: number;
 	/** Unix milliseconds; injectable so tests pin issuedAt. */
@@ -430,13 +439,257 @@ function tryParseState(buf: Buffer | null): GuardianState | null {
 	}
 }
 
-interface IErr {
+export interface IGuardianRefusal {
 	status: GuardianStatus;
 	detail: string;
 }
 
+type IErr = IGuardianRefusal;
+
 function err(status: GuardianStatus, detail: string): IErr {
 	return { status, detail };
+}
+
+function versionAndSetProblemFor(
+	servedSetId: Buffer,
+	protocolVersion: number,
+	guardianSetId: Buffer
+): IErr | null {
+	if (protocolVersion !== GUARDIAN_PROTOCOL_VERSION) {
+		return err(
+			GuardianStatus.ERR_UNSUPPORTED_VERSION,
+			`protocol_version ${protocolVersion} outside supported range 1..1`
+		);
+	}
+	if (!isLen(guardianSetId, 32) || !guardianSetId.equals(servedSetId)) {
+		return err(
+			GuardianStatus.ERR_UNKNOWN_SET,
+			'guardian_set_id is not served by this guardian'
+		);
+	}
+	return null;
+}
+
+/**
+ * The member list a registration MUST carry (wire 5.1): exactly the
+ * committed set, hashing to the request's guardian_set_id and naming this
+ * guardian. For a single-set guardian the set id check already implies
+ * this; the rule is uniform so a multi-set host and a configured guardian
+ * accept exactly the same registrations.
+ */
+function memberListProblemFor(
+	guardianId: Buffer,
+	guardianSetId: Buffer,
+	members: Buffer[] | undefined
+): IErr | null {
+	if (!Array.isArray(members) || members.length !== CRASH_V1_PROFILE.total) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			`guardian_members must list exactly ${CRASH_V1_PROFILE.total} keys`
+		);
+	}
+	let setId: Buffer;
+	try {
+		setId = computeGuardianSetId({
+			...CRASH_V1_PROFILE,
+			guardianIds: members
+		});
+	} catch (error) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			`guardian_members invalid: ${
+				error instanceof Error ? error.message : String(error)
+			}`
+		);
+	}
+	if (!setId.equals(guardianSetId)) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'guardian_members do not hash to guardian_set_id'
+		);
+	}
+	if (!members.some((m) => m.equals(guardianId))) {
+		return err(
+			GuardianStatus.ERR_UNKNOWN_SET,
+			'this guardian is not a member of guardian_members'
+		);
+	}
+	return null;
+}
+
+function stateShapeProblem(state: GuardianState): string | null {
+	if (!isLen(state.recoveryId, 32)) return 'recovery_id must be 32 bytes';
+	if (!validU64(state.lease.epoch) || state.lease.epoch === 0n) {
+		return 'lease epoch must be a nonzero u64';
+	}
+	if (!isLen(state.lease.writerPublicKey, 32)) {
+		return 'writer public key must be 32 bytes';
+	}
+	if (
+		!validU64(state.origin.firstSequence) ||
+		state.origin.firstSequence === 0n
+	) {
+		return 'origin firstSequence must be a nonzero u64';
+	}
+	if (!isLen(state.origin.previousHash, 32)) {
+		return 'origin previousHash must be 32 bytes';
+	}
+	if (
+		!validU64(state.logHead.sequence) ||
+		!validU64(state.logHead.recordEpoch)
+	) {
+		return 'log head integers must be u64';
+	}
+	if (
+		!isLen(state.logHead.frameHash, 32) ||
+		!isLen(state.logHead.ciphertextHash, 32)
+	) {
+		return 'log head hashes must be 32 bytes';
+	}
+	return null;
+}
+
+/**
+ * Everything REGISTER_NODE (wire 5.1) proves before a store is consulted:
+ * the version, the set and the member list binding, the shape of the
+ * initial state, and the root signature over the REGISTER transcript. The
+ * guardian's register() runs this first, and a host (guardian-host.ts)
+ * runs the SAME function before it opens a store for a set it has never
+ * served, so a registration that would be refused can never allocate one
+ * (issue #710). Pure: no store, no clock, nothing retained.
+ */
+export function registrationAdmissionProblem(
+	guardianId: Buffer,
+	guardianSetId: Buffer,
+	request: IGuardianRegisterNodeRequest
+): IGuardianRefusal | null {
+	const gate = versionAndSetProblemFor(
+		guardianSetId,
+		request.protocolVersion,
+		request.guardianSetId
+	);
+	if (gate) return gate;
+	const members = memberListProblemFor(
+		guardianId,
+		guardianSetId,
+		request.guardianMembers
+	);
+	if (members) return members;
+	const state = request.initialState;
+	const shape = stateShapeProblem(state);
+	if (shape) return err(GuardianStatus.ERR_MALFORMED, shape);
+	if (!ecc.isXOnlyPoint(state.recoveryId)) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'recovery_id is not a valid x-only point'
+		);
+	}
+	if (!ecc.isXOnlyPoint(state.lease.writerPublicKey)) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'writer public key is not a valid x-only point'
+		);
+	}
+	// Registration never claims records the guardian does not hold.
+	if (!isGenesisLogHead(state.logHead)) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'registration log head must be genesis'
+		);
+	}
+	// A fresh chain begins where the journal begins: sequence 1 has no
+	// predecessor, so a nonzero previousHash there is incoherent.
+	if (
+		state.origin.firstSequence === 1n &&
+		!state.origin.previousHash.equals(ZERO32)
+	) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'origin at firstSequence 1 requires a zero previousHash'
+		);
+	}
+	if (!isLen(request.rootSignature, 64)) {
+		return err(GuardianStatus.ERR_MALFORMED, 'root signature must be 64 bytes');
+	}
+	if (!validU64(request.generation) || request.generation === 0n) {
+		return err(
+			GuardianStatus.ERR_MALFORMED,
+			'generation must be a nonzero u64'
+		);
+	}
+	let verified = false;
+	try {
+		verified = verifyTranscript(
+			registerTranscriptHash(guardianSetId, state, request.generation),
+			request.rootSignature,
+			state.recoveryId
+		);
+	} catch {
+		verified = false;
+	}
+	if (!verified) {
+		return err(
+			GuardianStatus.ERR_BAD_SIGNATURE,
+			'root signature over the REGISTER transcript failed'
+		);
+	}
+	return null;
+}
+
+/**
+ * What a record row stores besides its ciphertext: recovery_id, sequence,
+ * epoch, previous_hash, frame_hash, ciphertext_hash, writer_signature
+ * (guardian-store.ts). An accepted append grows the store by exactly this
+ * plus the ciphertext; the namespace row it updates keeps its size.
+ */
+export const GUARDIAN_RECORD_OVERHEAD_BYTES = 32 + 8 + 8 + 32 + 32 + 32 + 64;
+/**
+ * What a fresh registration stores: the namespace row (two 192-byte
+ * states, three signatures, two issue times, the ids, the generation, the
+ * stale flag) and the first epoch row (recovery_id, epoch, writer key).
+ */
+export const GUARDIAN_REGISTRATION_BYTES =
+	32 + 32 + 192 + 1 + 192 + 64 + 8 + 64 + 8 + 64 + 8 + (32 + 8 + 32);
+/**
+ * The most an epoch row holds: the ids and key, a certificate over a
+ * 192-byte state with its issue time and signature, and the receipt over
+ * the state it fixes with its issue time and signature.
+ */
+export const GUARDIAN_EPOCH_ROW_MAX_BYTES =
+	32 + 8 + 32 + (192 + 8 + 64) + (192 + 8 + 64);
+
+/**
+ * What a mutating verb costs the store, judged from the namespace row
+ * under the write lock (fencedWrite).
+ */
+interface IWriteCost {
+	/**
+	 * Bytes the store grows by if the row is accepted as the verb intends;
+	 * 0 for a write the verb answers from the row without writing (a
+	 * replay, a conflict at an occupied slot). Checked against the quota
+	 * BEFORE the verb's own verdicts.
+	 */
+	delta: (ns: IGuardianNamespaceRow | null) => number;
+	/**
+	 * True when the body charges exactly what it wrote; otherwise the
+	 * namespace is measured before and after, which is exact for a row
+	 * replaced (new minus old) at the price of a scan of its rows.
+	 */
+	exact?: boolean;
+}
+
+/** Thrown inside a write transaction to roll it back at the quota. */
+class QuotaRollback extends Error {
+	constructor() {
+		super('write would cross the content quota');
+	}
+}
+
+function quotaRefusal(): IErr {
+	return err(
+		GuardianStatus.ERR_QUOTA_EXCEEDED,
+		"this guardian's content quota for the set is exhausted"
+	);
 }
 
 /** A namespace row's generation; a row with none is at the first generation. */
@@ -455,6 +708,7 @@ export class ReferenceGuardian {
 	private readonly required: number;
 	private readonly maxCiphertextBytes: number;
 	private readonly maxRecordsPerGet: number;
+	private readonly maxContentBytes: number | undefined;
 	private readonly clock: () => bigint;
 	private readonly onAlarm?: (alarm: IGuardianAlarm) => void;
 	/**
@@ -511,11 +765,22 @@ export class ReferenceGuardian {
 			throw new Error('maxRecordsPerGet must be between 1 and 256');
 		}
 		this.maxRecordsPerGet = maxRecords;
+		if (
+			config.maxContentBytes !== undefined &&
+			(!Number.isInteger(config.maxContentBytes) || config.maxContentBytes < 0)
+		) {
+			throw new Error('maxContentBytes must be a non-negative integer');
+		}
+		this.maxContentBytes = config.maxContentBytes;
 		this.clock = config.clock ?? ((): bigint => BigInt(Date.now()));
 		this.onAlarm = config.onAlarm;
 		this.store = new GuardianStore(config.path);
 		try {
 			this.verifyStoreAtOpen();
+			// The content counter is re-derived from the rows at every open,
+			// after the open-time walk has archived what it archives, so a
+			// restart recovers it exactly and never trusts a stale number.
+			this.store.write(() => this.store.resetUsage(this.store.contentBytes()));
 		} catch (error) {
 			this.store.close();
 			throw error;
@@ -545,6 +810,22 @@ export class ReferenceGuardian {
 		return this.store.read(() =>
 			this.store.listNamespaces().map((ns) => Buffer.from(ns.recoveryId))
 		);
+	}
+
+	/**
+	 * The encoded bytes this guardian's store holds: the maintained counter
+	 * for the whole store (what the quota is judged against), or a
+	 * measurement of one namespace's rows.
+	 */
+	contentBytes(recoveryId?: Buffer): number {
+		return this.store.read(() =>
+			recoveryId ? this.store.contentBytes(recoveryId) : this.store.usageBytes()
+		);
+	}
+
+	/** The counter's truth, measured from every row; for audits and tests. */
+	auditContentBytes(): number {
+		return this.store.read(() => this.store.contentBytes());
 	}
 
 	/** Orphan-archive audit view (never served by GET_STATE). */
@@ -601,97 +882,15 @@ export class ReferenceGuardian {
 		protocolVersion: number,
 		guardianSetId: Buffer
 	): IErr | null {
-		if (protocolVersion !== GUARDIAN_PROTOCOL_VERSION) {
-			return err(
-				GuardianStatus.ERR_UNSUPPORTED_VERSION,
-				`protocol_version ${protocolVersion} outside supported range 1..1`
-			);
-		}
-		if (
-			!isLen(guardianSetId, 32) ||
-			!guardianSetId.equals(this.guardianSetId)
-		) {
-			return err(
-				GuardianStatus.ERR_UNKNOWN_SET,
-				'guardian_set_id is not served by this guardian'
-			);
-		}
-		return null;
-	}
-
-	/**
-	 * The member list a registration MUST carry (wire 5.1): exactly the
-	 * committed set, hashing to the request's guardian_set_id and naming this
-	 * guardian. For a single-set guardian the set id check already implies
-	 * this; the rule is uniform so a multi-set host and a configured guardian
-	 * accept exactly the same registrations.
-	 */
-	private memberListProblem(members: Buffer[] | undefined): IErr | null {
-		if (!Array.isArray(members) || members.length !== CRASH_V1_PROFILE.total) {
-			return err(
-				GuardianStatus.ERR_MALFORMED,
-				`guardian_members must list exactly ${CRASH_V1_PROFILE.total} keys`
-			);
-		}
-		let setId: Buffer;
-		try {
-			setId = computeGuardianSetId({
-				...CRASH_V1_PROFILE,
-				guardianIds: members
-			});
-		} catch (error) {
-			return err(
-				GuardianStatus.ERR_MALFORMED,
-				`guardian_members invalid: ${
-					error instanceof Error ? error.message : String(error)
-				}`
-			);
-		}
-		if (!setId.equals(this.guardianSetId)) {
-			return err(
-				GuardianStatus.ERR_MALFORMED,
-				'guardian_members do not hash to guardian_set_id'
-			);
-		}
-		if (!members.some((m) => m.equals(this.guardianId))) {
-			return err(
-				GuardianStatus.ERR_UNKNOWN_SET,
-				'this guardian is not a member of guardian_members'
-			);
-		}
-		return null;
+		return versionAndSetProblemFor(
+			this.guardianSetId,
+			protocolVersion,
+			guardianSetId
+		);
 	}
 
 	private stateShapeProblem(state: GuardianState): string | null {
-		if (!isLen(state.recoveryId, 32)) return 'recovery_id must be 32 bytes';
-		if (!validU64(state.lease.epoch) || state.lease.epoch === 0n) {
-			return 'lease epoch must be a nonzero u64';
-		}
-		if (!isLen(state.lease.writerPublicKey, 32)) {
-			return 'writer public key must be 32 bytes';
-		}
-		if (
-			!validU64(state.origin.firstSequence) ||
-			state.origin.firstSequence === 0n
-		) {
-			return 'origin firstSequence must be a nonzero u64';
-		}
-		if (!isLen(state.origin.previousHash, 32)) {
-			return 'origin previousHash must be 32 bytes';
-		}
-		if (
-			!validU64(state.logHead.sequence) ||
-			!validU64(state.logHead.recordEpoch)
-		) {
-			return 'log head integers must be u64';
-		}
-		if (
-			!isLen(state.logHead.frameHash, 32) ||
-			!isLen(state.logHead.ciphertextHash, 32)
-		) {
-			return 'log head hashes must be 32 bytes';
-		}
-		return null;
+		return stateShapeProblem(state);
 	}
 
 	private cloneState(state: GuardianState): GuardianState {
@@ -809,77 +1008,28 @@ export class ReferenceGuardian {
 		request: IGuardianRegisterNodeRequest
 	): IGuardianRegisterNodeResponse {
 		try {
-			const gate = this.versionAndSetProblem(
-				request.protocolVersion,
-				request.guardianSetId
-			);
-			if (gate) return gate;
-			const members = this.memberListProblem(request.guardianMembers);
-			if (members) return members;
-			const state = request.initialState;
-			const shape = this.stateShapeProblem(state);
-			if (shape) return err(GuardianStatus.ERR_MALFORMED, shape);
-			if (!ecc.isXOnlyPoint(state.recoveryId)) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'recovery_id is not a valid x-only point'
-				);
-			}
-			if (!ecc.isXOnlyPoint(state.lease.writerPublicKey)) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'writer public key is not a valid x-only point'
-				);
-			}
-			// Registration never claims records the guardian does not hold.
-			if (!isGenesisLogHead(state.logHead)) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'registration log head must be genesis'
-				);
-			}
-			// A fresh chain begins where the journal begins: sequence 1 has no
-			// predecessor, so a nonzero previousHash there is incoherent.
-			if (
-				state.origin.firstSequence === 1n &&
-				!state.origin.previousHash.equals(ZERO32)
-			) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'origin at firstSequence 1 requires a zero previousHash'
-				);
-			}
-			if (!isLen(request.rootSignature, 64)) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'root signature must be 64 bytes'
-				);
-			}
-			if (!validU64(request.generation) || request.generation === 0n) {
-				return err(
-					GuardianStatus.ERR_MALFORMED,
-					'generation must be a nonzero u64'
-				);
-			}
-			const transcript = registerTranscriptHash(
+			const admission = registrationAdmissionProblem(
+				this.guardianId,
 				this.guardianSetId,
-				state,
-				request.generation
+				request
 			);
-			if (
-				!this.safeVerify(transcript, request.rootSignature, state.recoveryId)
-			) {
-				return err(
-					GuardianStatus.ERR_BAD_SIGNATURE,
-					'root signature over the REGISTER transcript failed'
-				);
-			}
+			if (admission) return admission;
+			const state = request.initialState;
 
 			const quarantine = this.quarantineGate(state.recoveryId);
 			if (quarantine) return quarantine;
 			const stateBuf = stateBytes(state);
-			const outcome = this.store.write(() => {
-				const ns = this.store.getNamespace(state.recoveryId);
+			const cost: IWriteCost = {
+				// A fresh namespace costs its row and first epoch exactly. A
+				// held registration is answered from the row (duplicate or
+				// differing), writing nothing. Re-anchoring a tombstone
+				// replaces a smaller row and is bounded by the fresh cost: a
+				// conservative early refusal within GUARDIAN_REGISTRATION_BYTES
+				// of the limit, charged exactly from the measurement.
+				delta: (ns): number =>
+					ns && ns.registrationState ? 0 : GUARDIAN_REGISTRATION_BYTES
+			};
+			const outcome = this.fencedWrite(state.recoveryId, cost, (ns) => {
 				if (ns && ns.registrationState) {
 					if (
 						ns.registrationState.equals(stateBuf) &&
@@ -954,6 +1104,7 @@ export class ReferenceGuardian {
 				return { kind: 'ok' as const, receipt };
 			});
 
+			if ('status' in outcome) return outcome;
 			if (outcome.kind === 'duplicate') {
 				const ns = outcome.ns;
 				return {
@@ -1063,11 +1214,26 @@ export class ReferenceGuardian {
 			const ciphertextHash = sha256(record.ciphertext);
 			const quarantine = this.quarantineGate(record.recoveryId);
 			if (quarantine) return quarantine;
-			const retired = this.retiredGate(record.recoveryId);
-			if (retired) return retired;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(record.recoveryId);
+			const rowBytes =
+				GUARDIAN_RECORD_OVERHEAD_BYTES + record.ciphertext.length;
+			const cost: IWriteCost = {
+				// An append inside the stored range is a replay or a conflict,
+				// answered from the stored row; anything else that lands costs
+				// exactly the record's row (the namespace row keeps its size).
+				delta: (ns): number => {
+					if (!ns || !ns.state || !ns.registrationState) return 0;
+					const held = tryParseState(ns.state);
+					if (!held) return 0;
+					const inRange =
+						!isGenesisLogHead(held.logHead) &&
+						record.sequence >= held.origin.firstSequence &&
+						record.sequence <= held.logHead.sequence;
+					return inRange ? 0 : rowBytes;
+				},
+				exact: true
+			};
+			return this.fencedWrite(record.recoveryId, cost, (ns, charge) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -1226,6 +1392,7 @@ export class ReferenceGuardian {
 					ciphertext: Buffer.from(record.ciphertext),
 					writerSignature: Buffer.from(record.writerSignature)
 				});
+				charge(rowBytes);
 				const newState: GuardianState = {
 					recoveryId: state.recoveryId,
 					lease: state.lease,
@@ -1255,18 +1422,195 @@ export class ReferenceGuardian {
 	}
 
 	/**
-	 * A namespace rotated away from this set refuses every write (wire
-	 * 5.11): the live chain is with the incoming set, and a writer that
-	 * still addresses this one is a stale device that must freeze. Reads
-	 * stay open so a restore device can find the rotation.
+	 * The write transaction every mutating verb runs in, with the retirement
+	 * fence INSIDE it (wire 5.11, issue #711).
+	 *
+	 * A namespace rotated away from this set refuses every write: the live
+	 * chain is with the incoming set, and a writer that still addresses this
+	 * one is a stale device that must freeze. Reads stay open so a restore
+	 * device can find the rotation. The fence is only final if it is judged
+	 * under the same BEGIN IMMEDIATE lock the mutation commits under: a
+	 * check made in a read transaction beforehand can be overtaken by a
+	 * ROTATE_SET that commits between that read and this lock, and the
+	 * stale write would then commit into a retired namespace. So there is
+	 * no preflight: the row is loaded here, under the write lock, and the
+	 * marker it carries is authoritative for the whole transaction. Every
+	 * mutating verb goes through here: REGISTER_NODE (a replay against a
+	 * retired namespace is retired, not a duplicate, and a retired
+	 * tombstone is never re-anchored), PUT_STATE, SYNC_RECORD,
+	 * ACQUIRE_EPOCH, SYNC_EPOCH and repair evidence. A verb that mutates a
+	 * namespace without going through here has a bug.
+	 *
+	 * Presence is judged by `rotation !== null`, never by truthiness: the
+	 * column is an ordinary (non-STRICT) SQLite cell, and an INTEGER 0 in
+	 * it is falsy. The open-time verifier validates every stored rotation
+	 * on its own terms (storedRotationProblem) and quarantines a namespace
+	 * whose marker fails, so by the time a verb runs here a non-null marker
+	 * is a verified one, and a damaged one has already closed the namespace
+	 * as uncertain rather than silently retired or silently open.
+	 *
+	 * Precedence when retirement races another verdict, in this order
+	 * (wire 5.11):
+	 *
+	 *   1. quarantine (ERR_STORE_UNCERTAIN, quarantineGate) comes BEFORE the
+	 *      transaction: the row is not trusted to be ours, so its rotation
+	 *      column is not trusted either; the set is fixed at open, so the
+	 *      order is deterministic;
+	 *   2. an absent row is ERR_UNKNOWN_NODE: nothing was ever retired;
+	 *   3. a row carrying a rotation is ERR_SET_RETIRED, before any verdict
+	 *      the row's other columns would yield: an uncertain store, an
+	 *      idempotent replay (OK_DUPLICATE) or a differing registration
+	 *      (ERR_ALREADY_REGISTERED), a stale or ahead epoch, a lease CAS
+	 *      mismatch, a sequence gap, a conflict. Retirement is the
+	 *      permanent, root-signed answer; every other verdict describes a
+	 *      chain that is no longer live here, and a stale writer must be
+	 *      told to freeze, not told to retry or that it succeeded;
+	 *   4. the remaining row-specific outcomes, in the verb's own order.
+	 *
+	 * The content quota (issue #710) is judged here too, in this order:
+	 *
+	 *   3b. after retirement and before any row-specific verdict, the
+	 *       write's cost (IWriteCost.delta, judged from the row under this
+	 *       lock) against the counter read under this lock: a write that
+	 *       would cross maxContentBytes is ERR_QUOTA_EXCEEDED. Two writers,
+	 *       in this process or another, therefore never admit against the
+	 *       same starting total, and a retired namespace is told so before
+	 *       it is told about space.
+	 *   5.  after the body ran, what it actually wrote (charged exactly by
+	 *       the body, or measured on the namespace's rows) is charged to
+	 *       the counter, and if that real growth would still cross the
+	 *       quota the whole transaction is rolled back: the estimate
+	 *       decides precedence, the measurement is the hard bound.
+	 *
+	 * ROTATE_SET itself does not use this helper: it is the transaction
+	 * that writes the marker, and it judges an existing marker under its own
+	 * idempotency rules (OK_DUPLICATE, ERR_CONFLICT, ERR_EPOCH_REGRESSION).
+	 * It runs in the same store.write, so the marker is written under the
+	 * same lock this fence reads it under, and it applies the same quota
+	 * gate and charge.
 	 */
-	private retiredGate(recoveryId: Buffer): IErr | null {
-		const ns = this.store.read(() => this.store.getNamespace(recoveryId));
-		if (!ns || !ns.rotation) return null;
-		return err(
-			GuardianStatus.ERR_SET_RETIRED,
-			'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
-		);
+	private fencedWrite<T>(
+		recoveryId: Buffer,
+		cost: IWriteCost,
+		body: (
+			ns: IGuardianNamespaceRow | null,
+			charge: (bytes: number) => void
+		) => T
+	): T | IErr {
+		try {
+			return this.store.write(() => {
+				const ns = this.store.getNamespace(recoveryId);
+				if (ns && ns.rotation !== null) {
+					return err(
+						GuardianStatus.ERR_SET_RETIRED,
+						'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
+					);
+				}
+				const gate = this.quotaGate(cost.delta(ns));
+				if (gate) return gate;
+				const before = cost.exact ? 0 : this.store.contentBytes(recoveryId);
+				let written = 0;
+				const result = body(ns, (bytes: number): void => {
+					written += bytes;
+				});
+				if (!cost.exact) {
+					written = this.store.contentBytes(recoveryId) - before;
+				}
+				this.chargeOrRollBack(written);
+				return result;
+			});
+		} catch (error) {
+			if (error instanceof QuotaRollback) return quotaRefusal();
+			throw error;
+		}
+	}
+
+	/** Inside a write transaction: refuse a cost the counter cannot absorb. */
+	private quotaGate(delta: number): IErr | null {
+		if (this.maxContentBytes === undefined || delta <= 0) return null;
+		if (this.store.usageBytes() + delta > this.maxContentBytes) {
+			return quotaRefusal();
+		}
+		return null;
+	}
+
+	/**
+	 * Inside a write transaction, after its writes: advance the counter by
+	 * what was written, or roll the transaction back if that growth crosses
+	 * the quota after all (an estimate below the truth never lands a write).
+	 */
+	private chargeOrRollBack(written: number): void {
+		if (written === 0) return;
+		if (
+			written > 0 &&
+			this.maxContentBytes !== undefined &&
+			this.store.usageBytes() + written > this.maxContentBytes
+		) {
+			throw new QuotaRollback();
+		}
+		this.store.chargeUsage(written);
+	}
+
+	/**
+	 * Judge a persisted rotation on its own terms: the column is trusted by
+	 * nothing but this check. A ROTATE_SET that was accepted stored exactly
+	 * these bytes, so a stored value must still decode, bind to THIS set and
+	 * THIS recovery_id inside the signed transcript, name an incoming set
+	 * whose members hash to it, sit above the namespace generation, and
+	 * carry a root signature that verifies under the recovery_id. Anything
+	 * else is column rot or a foreign write, and the namespace is
+	 * quarantined at open: never silently retired by a non-empty blob,
+	 * never silently reopened by a falsy cell. Non-throwing over persisted
+	 * bytes, like the rest of the open-time walk. The decode is this
+	 * guardian's; the judgement of the decoded object is the shared one.
+	 */
+	private storedRotationProblem(ns: IGuardianNamespaceRow): string | null {
+		const raw: unknown = ns.rotation;
+		if (raw === null || raw === undefined) return null;
+		if (!Buffer.isBuffer(raw) || raw.length === 0) {
+			return 'rotation column has a non-BLOB storage class or is empty';
+		}
+		let rotation: IGuardianRotateSetRequest;
+		try {
+			rotation = decodeRotateSetRequest(raw);
+		} catch (error) {
+			return `rotation does not decode (${
+				error instanceof Error ? error.message : String(error)
+			})`;
+		}
+		// The shared judgement (guardian-wire.ts rotationEvidenceProblem): the
+		// binding, member-hash, generation and root-signature rules are the
+		// SAME ones the replication client and the restore driver apply to a
+		// rotation they read off GET_HEAD, so a marker this guardian serves
+		// is one every client follows, and one it refuses is one no client
+		// would have followed.
+		return rotationEvidenceProblem(rotation, {
+			guardianSetId: this.guardianSetId,
+			recoveryId: ns.recoveryId,
+			generation: readGeneration(ns)
+		});
+	}
+
+	/**
+	 * The stored rotation, if it proves itself (storedRotationProblem), for
+	 * a head that cannot otherwise be served: a quarantined or tombstoned
+	 * namespace still tells a restore device where the namespace went
+	 * (wire 5.11), because the rotation is root-signed and binds this set
+	 * and this recovery_id on its own. Never throws.
+	 */
+	private rotationDespiteUncertainty(
+		recoveryId: Buffer
+	): IGuardianRotateSetRequest | null {
+		try {
+			return this.store.read(() => {
+				const ns = this.store.getNamespace(recoveryId);
+				if (!ns || ns.rotation === null) return null;
+				if (this.storedRotationProblem(ns) !== null) return null;
+				return decodeRotateSetRequest(ns.rotation);
+			});
+		} catch {
+			return null;
+		}
 	}
 
 	// ─────────────── ROTATE_SET (wire 5.11) ───────────────
@@ -1351,6 +1695,9 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(request.recoveryId);
 			if (quarantine) return quarantine;
 			const encoded = encodeRotateSetRequest(request);
+			// The retirement transaction itself: the same BEGIN IMMEDIATE every
+			// fencedWrite takes, so the marker written here is visible to the
+			// next writer the moment this lock is released, and never before.
 			const outcome = this.store.write(() => {
 				const ns = this.store.getNamespace(request.recoveryId);
 				if (!ns || !ns.registrationState) {
@@ -1360,7 +1707,17 @@ export class ReferenceGuardian {
 					);
 				}
 				const current = readGeneration(ns);
-				if (ns.rotation) {
+				// The marker replaces the stored one: its cost is the new
+				// encoding minus the old, exactly, and a byte-identical replay
+				// costs nothing. Judged before the marker's own verdicts.
+				const storedBytes = ns.rotation !== null ? ns.rotation.length : 0;
+				const delta =
+					ns.rotation !== null && ns.rotation.equals(encoded)
+						? 0
+						: encoded.length - storedBytes;
+				const quota = this.quotaGate(delta);
+				if (quota) return quota;
+				if (ns.rotation !== null) {
 					const stored = decodeRotateSetRequest(ns.rotation);
 					if (ns.rotation.equals(encoded)) {
 						return { status: GuardianStatus.OK_DUPLICATE, rotation: stored };
@@ -1387,6 +1744,7 @@ export class ReferenceGuardian {
 					);
 				}
 				this.store.setRotation(request.recoveryId, encoded);
+				this.chargeOrRollBack(delta);
 				return { status: GuardianStatus.OK, rotation: request };
 			});
 			return outcome;
@@ -1411,7 +1769,13 @@ export class ReferenceGuardian {
 				);
 			}
 			const quarantine = this.quarantineGate(request.recoveryId);
-			if (quarantine) return quarantine;
+			if (quarantine) {
+				// Quarantine hides the row, not a rotation that proves itself:
+				// a restore device that only knows this set must still learn
+				// where the namespace went (wire 5.11).
+				const rotation = this.rotationDespiteUncertainty(request.recoveryId);
+				return rotation ? { ...quarantine, rotation } : quarantine;
+			}
 			return this.store.read(() => {
 				const ns = this.store.getNamespace(request.recoveryId);
 				if (!ns) {
@@ -1421,10 +1785,14 @@ export class ReferenceGuardian {
 					);
 				}
 				if (!ns.registrationState || !ns.state) {
-					return err(
-						GuardianStatus.ERR_STORE_UNCERTAIN,
-						'no internally consistent checkpoint; re-register to re-anchor repair'
-					);
+					const rotation = this.rotationDespiteUncertainty(request.recoveryId);
+					return {
+						...err(
+							GuardianStatus.ERR_STORE_UNCERTAIN,
+							'no internally consistent checkpoint; re-register to re-anchor repair'
+						),
+						...(rotation ? { rotation } : {})
+					};
 				}
 				return {
 					status: GuardianStatus.OK,
@@ -1443,7 +1811,7 @@ export class ReferenceGuardian {
 						generation: readGeneration(ns)
 					},
 					generation: readGeneration(ns),
-					...(ns.rotation
+					...(ns.rotation !== null
 						? { rotation: decodeRotateSetRequest(ns.rotation) }
 						: {})
 				};
@@ -1593,11 +1961,22 @@ export class ReferenceGuardian {
 			}
 			const quarantine = this.quarantineGate(expected.recoveryId);
 			if (quarantine) return quarantine;
-			const retired = this.retiredGate(expected.recoveryId);
-			if (retired) return retired;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(expected.recoveryId);
+			const cost: IWriteCost = {
+				// A stored acquisition under the same key is answered from its
+				// row; a new one adds one epoch row (the namespace row keeps
+				// its size). Measured exactly after the write.
+				delta: (): number => {
+					const held = this.store.getEpoch(
+						expected.recoveryId,
+						u64be(request.newEpoch)
+					);
+					return held && held.writerPublicKey.equals(request.newWriterPublicKey)
+						? 0
+						: GUARDIAN_EPOCH_ROW_MAX_BYTES;
+				}
+			};
+			return this.fencedWrite(expected.recoveryId, cost, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -1853,11 +2232,17 @@ export class ReferenceGuardian {
 			const recoveryId = certified.recoveryId;
 			const quarantine = this.quarantineGate(recoveryId);
 			if (quarantine) return quarantine;
-			const retired = this.retiredGate(recoveryId);
-			if (retired) return retired;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(recoveryId);
+			const cost: IWriteCost = {
+				// The epoch rows a bundle can add: this guardian's own
+				// certificate and one per quorum certificate. The truncated
+				// tail moves to the orphan archive, which grows each moved
+				// record by its archive columns; the measurement after the
+				// write, not this estimate, is the hard bound.
+				delta: (): number =>
+					GUARDIAN_EPOCH_ROW_MAX_BYTES * (request.certificates.length + 1)
+			};
+			return this.fencedWrite(recoveryId, cost, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -2138,8 +2523,9 @@ export class ReferenceGuardian {
 			const quarantine = this.quarantineGate(request.recoveryId);
 			if (quarantine) return quarantine;
 
-			return this.store.write(() => {
-				const ns = this.store.getNamespace(request.recoveryId);
+			// Lifting the stale flag flips one integer: no content is added.
+			const cost: IWriteCost = { delta: (): number => 0, exact: true };
+			return this.fencedWrite(request.recoveryId, cost, (ns) => {
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -2234,6 +2620,20 @@ export class ReferenceGuardian {
 				if (outcome !== null) {
 					target = outcome.healed;
 					key = target.recoveryId.toString('hex');
+				}
+				// The retirement marker is judged on its own terms before the
+				// namespace is: a value that fails is column rot or a foreign
+				// write, and the namespace closes as uncertain, untouched,
+				// rather than as silently retired or silently open.
+				const rotationProblem = this.storedRotationProblem(target);
+				if (rotationProblem !== null) {
+					this.quarantined.add(key);
+					this.alarm(
+						target.recoveryId,
+						GuardianStatus.ERR_STORE_UNCERTAIN,
+						`stored rotation is invalid (${rotationProblem}); quarantined untouched`
+					);
+					continue;
 				}
 				this.store.write(() => this.verifyNamespaceAtOpen(target));
 			} catch (error) {

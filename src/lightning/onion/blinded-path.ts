@@ -63,6 +63,13 @@ export interface IBlindedHopData {
 	 */
 	holdHtlc?: boolean;
 	/**
+	 * Value of the hold_htlc marker: the 32-byte registration identifier the
+	 * receiver parked the hold under (issue #708). The LSP records it on the
+	 * hold and the receiver's release capability must name the same one.
+	 * Absent on a legacy flag-only marker.
+	 */
+	holdRegistrationId?: Buffer;
+	/**
 	 * path_id (BOLT 4 encrypted_recipient_data type 6): a private, recipient-
 	 * chosen identifier placed in the FINAL hop of a blinded path. The
 	 * recipient checks the decrypted path_id matches one it published, proving
@@ -167,7 +174,13 @@ export function encodeBlindedHopData(data: IBlindedHopData): Buffer {
 		});
 	}
 	if (data.holdHtlc) {
-		records.push({ type: ERD_HOLD_HTLC, value: Buffer.alloc(0) });
+		if (data.holdRegistrationId && data.holdRegistrationId.length !== 32) {
+			throw new Error('hold registration id must be 32 bytes');
+		}
+		records.push({
+			type: ERD_HOLD_HTLC,
+			value: data.holdRegistrationId ?? Buffer.alloc(0)
+		});
 	}
 
 	return encodeTlvStream(records);
@@ -206,6 +219,9 @@ export function decodeBlindedHopData(buf: Buffer): IBlindedHopData {
 			};
 		} else if (r.type === ERD_HOLD_HTLC) {
 			data.holdHtlc = true;
+			if (r.value.length === 32) {
+				data.holdRegistrationId = Buffer.from(r.value);
+			}
 		}
 	}
 

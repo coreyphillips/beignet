@@ -291,6 +291,22 @@ export interface INodeConfig {
 	chainHashes?: Buffer[];
 	/** Enable auto-reconnection (default false) */
 	autoReconnect?: boolean;
+	/**
+	 * Async receive (issue #708): when an LSP reports holds parked for this
+	 * node, sign and send the release capability automatically for holds
+	 * whose payment the node can vouch for (default true). Off, the host
+	 * releases from the 'payment:held-notice' event via sendAsyncRelease.
+	 */
+	autoReleaseHeldForwards?: boolean;
+	/**
+	 * Async receive service, LSP role (issue #709). Absent or `enabled:
+	 * false` (the default): this node parks NO hold_htlc forward, advertises
+	 * no ASYNC_RECEIVE_SERVICE bit and answers no registration; the marker
+	 * is treated as an unknown odd TLV. Enabled: channel peers may register
+	 * (signed grant with the ceilings and fee schedule below) and only holds
+	 * under an active registration are admitted, within the limits.
+	 */
+	asyncReceiveService?: import('../async-payments/types').IAsyncReceiveServiceConfig;
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
 	/** Resource management config */
@@ -1032,6 +1048,8 @@ export interface INodeInfo {
 	peerCount: number;
 	networkingEnabled: boolean;
 	alias?: string;
+	/** Async receive service metrics (issue #709); always present, `enabled: false` when off. */
+	asyncReceiveService: import('../async-payments/types').IAsyncReceiveServiceMetrics;
 }
 
 export interface ILightningError {

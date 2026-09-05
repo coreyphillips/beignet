@@ -222,14 +222,32 @@ ids may interleave. A receiver drops the session on any framing violation
 (a chunk out of order, a header that changes mid-message, more partial
 messages than it allows), and answers a declared length over its cap with
 transportStatus 413 once while swallowing that id's remaining chunks, so
-the stream stays usable.
+the stream stays usable. A host configured with a credential decides it on
+chunk 0, before any of the body is buffered: a refused credential is
+answered 401 once and the id's remaining chunks are swallowed the same way.
+Swallowed chunks are still held to the framing rules above (index, count,
+length and verb must continue the refused request); a mismatch drops the
+session like any other violation. What one session may have retained,
+partial bodies and ids being swallowed together, is bounded, and entries
+that went stale are aged out.
 
 A host serves a set only once REGISTER_NODE has run for it (5.1). Before
 that, GET_HEAD and GET_STATE for the set answer `ERR_UNKNOWN_NODE`, which
 is the truthful "no namespace here" a writer's ownership check reads as
 "fresh, register"; every other verb but REGISTER_NODE answers
 `ERR_UNKNOWN_SET`. INFO advertises `accepts_registrations` so a writer
-binding to the host accepts the set being absent from its list.
+binding to the host accepts the set being absent from its list. A host
+verifies the whole registration, root signature included, before it
+allocates anything for a set it has never served: a refused registration
+leaves no store, no index entry and no served set. Its byte quota is a hard
+bound on the encoded content a set stores, judged inside each write's own
+transaction after the retirement check of 5.11 and before the verb's other
+verdicts: every mutating verb (REGISTER_NODE, PUT_STATE, SYNC_RECORD,
+ACQUIRE_EPOCH, SYNC_EPOCH, ROTATE_SET) is refused `ERR_QUOTA_EXCEEDED` when
+what it would store crosses the limit, a replay the guardian answers from
+what it already holds costs nothing, and a replaced object costs its new
+encoding minus the old. The count is kept in the store and re-derived from
+its rows at every open, so two hosts on one store admit against one total.
 
 `transportStatus` is the 2.5 HTTP-layer status, one to one: 200 for every
 well-formed protocol exchange INCLUDING protocol-level rejections (the
@@ -527,7 +545,11 @@ for prior epochs of this namespace, and the stored root-signed
 REGISTRATION (the origin proof, 5.1). Returning the bundle always
 settles spec open question 11.7. A guardian whose store is uncertain
 (spec 5.5 durability rules) sets `possibly_stale = true` and MUST still
-refuse writes.
+refuse writes. A namespace that cannot be served at all (no checkpoint,
+or quarantined) answers `ERR_STORE_UNCERTAIN`, and even then the stored
+`rotation` (5.11) is attached whenever it verifies on its own: a restore
+device that only knows a damaged old guardian must still learn where the
+namespace went.
 
 ### 5.4 GET_STATE
 
@@ -711,6 +733,32 @@ guardians entirely is Tier 1 degradation; a restore device that only
 knows the outgoing set follows the `rotation` object GET_HEAD hands it
 (5.11) to the incoming set, and needs no operator input to do so.
 
+Restore during rotation (spec 5.7, issue #714). Step 5 stops at ONE
+accepting member, so a restore device reading the outgoing set may find
+the rotation on a single guardian while the other two still serve the
+namespace as live. The device treats that one rotation as authoritative,
+before anything else it would do with the heads:
+
+```text
+1. every GET_HEAD answer, whatever its status, is checked for a
+   rotation that verifies (5.11); a rotation on ANY answer ends the
+   restore with a rotated outcome carrying the incoming set, BEFORE any
+   head is adopted and before any SYNC_RECORD, SYNC_EPOCH or
+   ACQUIRE_EPOCH is sent to the outgoing set
+2. an `ERR_SET_RETIRED` answer to ACQUIRE_EPOCH is not a missing vote to
+   be outnumbered by the members that granted the epoch: the device
+   re-reads every head and verifies the rotation before it counts any
+   certificate quorum, and a rotation found there ends the restore the
+   same way; the status alone, unsigned, is a claim and fences nothing
+3. the device then rebuilds against the incoming set (the members are
+   root-signed, the transports are the unsigned hints) and restores
+   from there; the outgoing set is left exactly as it was found
+```
+
+Advancing the outgoing set instead would acquire an epoch on a retired
+namespace and leave its members disagreeing about which generation is
+live: one retired, two at a new epoch nobody will ever write under.
+
 ### 5.10 Uncertain-store repair: rollback, then replay
 
 The durability rules (spec 5.5) make a guardian that cannot prove its
@@ -781,19 +829,76 @@ root signature verifies over the ROTATE transcript under recovery_id
 ```
 
 Effect: the namespace is RETIRED under this set. The guardian persists the
-rotation beside the namespace and, from then on, answers PUT_STATE,
-ACQUIRE_EPOCH, SYNC_RECORD and SYNC_EPOCH for the recovery_id with
-`ERR_SET_RETIRED`; GET_HEAD and GET_STATE keep
-answering (a restore device that only knows the outgoing set reads the
-head, finds the rotation, and follows it), with the rotation attached to
-GET_HEAD. Idempotency: the byte-identical rotation returns
-`OK_DUPLICATE`; a different rotation at the same generation is
-`ERR_CONFLICT`; a lower generation is `ERR_EPOCH_REGRESSION`. Response: the
-status and the stored rotation.
+rotation beside the namespace and, from then on, answers every mutating
+verb for the recovery_id with `ERR_SET_RETIRED`: REGISTER_NODE (a replay
+of the stored registration is retired, not `OK_DUPLICATE`, and a differing
+one is retired, not `ERR_ALREADY_REGISTERED`; a retired namespace is never
+re-anchored), PUT_STATE, SYNC_RECORD, ACQUIRE_EPOCH, SYNC_EPOCH, and any
+local repair mutation (5.10 step 5). GET_HEAD and GET_STATE keep answering
+(a restore device that only knows the outgoing set reads the head, finds
+the rotation, and follows it), with the rotation attached to GET_HEAD.
+Idempotency: the byte-identical rotation returns `OK_DUPLICATE`; a
+different rotation at the same generation is `ERR_CONFLICT`; a lower
+generation is `ERR_EPOCH_REGRESSION`. Response: the status and the stored
+rotation.
+
+Retirement is final only if it is judged where the mutation commits: a
+mutating verb loads the namespace and inspects the stored rotation INSIDE
+the same serialized write transaction that performs the mutation (a
+check made before that transaction can be overtaken by a ROTATE_SET that
+commits in between, and the stale write would then commit into a retired
+namespace). ROTATE_SET writes the rotation under that same serialization,
+so a write either commits before the retirement and is part of the
+retired snapshot, or serializes behind it and is refused. When retirement
+coincides with another refusal, the precedence is fixed:
+
+```text
+1. quarantine (ERR_STORE_UNCERTAIN): the namespace is not provably this
+   guardian's, so nothing in its row authorizes or refuses a write on
+   its own terms, the rotation included (GET_HEAD still attaches a
+   rotation that verifies on its own, 5.3)
+2. unknown namespace (ERR_UNKNOWN_NODE): no row, nothing was retired
+3. retired (ERR_SET_RETIRED): before every verdict the row's other
+   columns would yield (uncertain store, replay, stale or ahead epoch,
+   lease CAS mismatch, sequence gap, conflict)
+4. the remaining row-specific outcomes, in the verb's own order
+```
+
+The stored rotation is trusted by nothing but its own validation. At
+open, and again before it is attached to an uncertain head, the guardian
+checks that the value decodes, binds this guardian_set_id and this
+recovery_id inside the signed transcript, names members that hash to
+new_guardian_set_id, exceeds the namespace generation, and carries a root
+signature that verifies under recovery_id. A value that fails quarantines
+the namespace (`ERR_STORE_UNCERTAIN`, untouched): a corrupted column
+neither retires a namespace nor reopens one. Presence is judged as "not
+null", never as truthiness. A rotation that verifies on its own is
+attached to GET_HEAD even when the rest of the row is uncertain or
+quarantined (5.3).
 
 A retired namespace is never deleted by this verb; retention rules are
 the operator's, as for any namespace, and the incoming set holds the live
 chain.
+
+Client-side judgement. A client that reads a rotation off GET_HEAD (the
+replication client deciding a boot or resolving `ERR_SET_RETIRED`, the
+restore device of 5.9) judges it by exactly the rules the guardian
+applies to its stored marker, with the generation floor being the
+client's own: the rotation must bind the set the client is talking to
+and its recovery_id, name well-formed members that hash to
+new_guardian_set_id and are not this set, exceed the generation the
+client already carries (and the answer's own unsigned `generation`, when
+it reports one, raises that floor: an answer that reports generation g
+beside a rotation at or below g contradicts itself), and verify under
+recovery_id. One judgement is shared by all three (the guardian, the
+replication client and the restore driver), so a rotation one side
+serves is one every client follows and a rotation one client refuses is
+one no other would have followed. A rotation that fails is an answer
+without one: it neither fences nor redirects, and the rest of the answer
+is used on its own terms. The answer's status is not consulted: a
+rotation attached to an `ERR_STORE_UNCERTAIN` answer is followed exactly
+like one on an `OK` head (5.3), because the rotation is root-signed and
+binds the set and recovery_id on its own.
 
 ## 6. Protobuf envelope
 
@@ -1036,7 +1141,9 @@ codec stays tractable, and signatures never depend on the envelope.
 29  ERR_HEAD_UNKNOWN        SYNC_EPOCH certified head not in the local
                             log; repair with SYNC_RECORD first
 30  ERR_STORE_UNCERTAIN     durability rules force write refusal until
-                            repaired (spec 5.5)
+                            repaired (spec 5.5); on GET_HEAD a stored
+                            rotation that verifies on its own is still
+                            attached (5.3, 5.11)
 31  ERR_RATE_LIMITED        semantic rate limit; retry_after in detail
                             AND the Retry-After HTTP header
 32  ERR_TOO_LARGE           object exceeds the guardian's advertised limit

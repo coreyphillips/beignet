@@ -364,7 +364,46 @@ import { signRemoteCommitment } from '../channel/commitment-builder';
 import { ChannelSigner, SignerFactory } from '../keys/signer';
 import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
 import { OnionMessageManager } from '../onion-message/manager';
-import { AsyncPaymentManager } from '../async-payments/manager';
+import {
+	AsyncPaymentManager,
+	HoldAdmissionJudge,
+	IHeldForwardDriver
+} from '../async-payments/manager';
+import {
+	HELD_FORWARD_LEDGER_PREFIX,
+	HeldForwardLedger,
+	IHeldForwardRecord,
+	heldForwardCodec
+} from '../async-payments/held-forward-ledger';
+import { deriveHoldRegistrationId } from '../async-payments/release-capability';
+import {
+	ASYNC_REGISTRATION_REPLY_TLV_TYPE,
+	ASYNC_REGISTRATION_REQUEST_TLV_TYPE,
+	IAsyncReceiveServiceMetrics,
+	IHeldForwardNotice
+} from '../async-payments/types';
+import {
+	ASYNC_REGISTRATION_LEDGER_PREFIX,
+	AsyncReceiveService,
+	IAsyncRegistrationRecord,
+	asyncRegistrationCodec
+} from '../async-payments/service';
+import {
+	IReceiverGrant,
+	decodeReceiverGrant,
+	decodeRegistrationReply,
+	encodeReceiverGrant,
+	encodeRegistrationReply,
+	encodeRegistrationRequest,
+	holdingFeeForWindowMsat,
+	signRegistrationRequest,
+	verifyReceiverGrant
+} from '../async-payments/receiver-grant';
+import { ONION_PACKET_LENGTH } from '../onion/types';
+import {
+	MemoryLedgerStore,
+	MetadataLedgerStore
+} from '../storage/durable-ledger';
 import {
 	IOnionMessagePayload,
 	ISendOnionMessageOptions
@@ -433,6 +472,25 @@ const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
  * would close the channel). Mirrors the safety margin used for forwarded HTLCs.
  */
 const HELD_HTLC_EXPIRY_MARGIN = 18;
+/**
+ * Bytes a held-forward ledger row reserves against the async receive
+ * service's byte limits (issue #709), on top of the parked onion packet. A
+ * fixed figure rather than the encoded length so the reservation does not
+ * shift with hex formatting.
+ */
+const HELD_FORWARD_ROW_BYTES = 1024;
+/** Metadata key the receiver's async receive grants persist under. */
+const ASYNC_RECEIVE_GRANTS_KEY = 'async_receive_grants';
+/** Default wait for an LSP's answer to a registration request. */
+const ASYNC_GRANT_REQUEST_TIMEOUT_MS = 30_000;
+/** Grants kept per LSP (newest first); older ones are dropped. */
+const ASYNC_GRANTS_PER_LSP = 16;
+/**
+ * How long an expired grant is kept: a hold parked under it in its last
+ * block lives at most its window (144 blocks by default, about a day), so a
+ * week covers any window an operator would configure.
+ */
+const ASYNC_GRANT_RETENTION_SEC = 7 * 24 * 3600;
 
 /**
  * Largest block-height overshoot we will act on from a peer's
@@ -870,11 +928,56 @@ export class LightningNode extends EventEmitter {
 		string,
 		{ hashHex: string; shortfallMsat: bigint }
 	>();
-	// LSP-side: forwards parked for offline receivers, keyed by payment hash hex.
-	private heldForwards: Map<
+	/**
+	 * LSP-side held forwards (issue #708): the durable ledger every parked
+	 * inbound HTLC lives in, keyed by random hold_id, with its lifecycle.
+	 * Owned by the AsyncPaymentManager; the node arms per-hold drivers.
+	 */
+	private heldForwardLedger: HeldForwardLedger;
+	private autoReleaseHeldForwards: boolean;
+	/**
+	 * Async receive service, LSP role (issue #709): registrations, admission,
+	 * pricing and metrics. Constructed for every node (disabled by default)
+	 * so the metrics surface can say the service is off.
+	 */
+	private asyncReceiveService: AsyncReceiveService;
+	/**
+	 * Receiver role (issue #709): every grant this node holds, by LSP node id
+	 * hex, newest first. A blinded payment path is marked hold_htlc only
+	 * through a peer with a LIVE grant here, under that grant's registration
+	 * id; the older grants stay (review round 1) because a hold parked under
+	 * one resolves under it, whether the grant has expired or been
+	 * superseded by a renewal since. Bounded per LSP; a grant expired for
+	 * longer than any hold window outlives is dropped.
+	 */
+	private asyncReceiveGrants = new Map<string, IReceiverGrant[]>();
+	/**
+	 * Receiver role: the registration id the LSP's notice reported for each
+	 * hold, by hold id hex. A release names the registration its hold was
+	 * parked under, which the notice knows and a renewal does not change.
+	 */
+	private noticedHoldRegistrations = new Map<string, Buffer>();
+	private pendingGrantRequests = new Map<
 		string,
-		{ inChannelId: Buffer; inHtlcId: bigint; incomingCltvExpiry: number }
-	> = new Map();
+		{
+			lspNodeIdHex: string;
+			scidHex: string;
+			resolve: (grant: IReceiverGrant) => void;
+			reject: (err: Error) => void;
+			timer: NodeJS.Timeout;
+		}
+	>();
+	/**
+	 * Inbound HTLCs of held forwards whose release was refused while their
+	 * channel could not carry the refund (issue #708 review). The row is
+	 * terminal (FAILED, forward_refused); the refund is owed here and
+	 * retried when the channel reestablishes and on every block, so a live
+	 * reconnect resolves it, not only a restart. Keyed by inbound identity.
+	 */
+	private owedHeldForwardFailures = new Map<
+		string,
+		{ inChannelIdHex: string; fail: () => boolean }
+	>();
 	private graphPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
 		null;
@@ -1262,6 +1365,18 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.DUAL_FUND);
 			localFeatures.clearBit(Feature.DUAL_FUND + 1);
 		}
+		// Async receive service (issue #709): the odd bit is advertised in init
+		// and node_announcement ONLY while the service is enabled. A receiver
+		// reads it before asking for a grant, so it never marks a path
+		// hold_htlc for a peer that would forward the HTLC to it while it is
+		// offline. Cleared explicitly so a caller-supplied feature set cannot
+		// advertise a service this node does not run.
+		if (config.asyncReceiveService?.enabled) {
+			localFeatures.setOptional(Feature.ASYNC_RECEIVE_SERVICE);
+		} else {
+			localFeatures.clearBit(Feature.ASYNC_RECEIVE_SERVICE);
+			localFeatures.clearBit(Feature.ASYNC_RECEIVE_SERVICE + 1);
+		}
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
@@ -1417,6 +1532,15 @@ export class LightningNode extends EventEmitter {
 		});
 
 		this.onionMessageManager = new OnionMessageManager(config.nodePrivateKey);
+		// Default transport: the node's own outbound boundary, so onion
+		// messages flow over the event transport embedded integrators and
+		// tests use. registerOnionMessageHandler rebinds it to the
+		// PeerManager when networking is enabled.
+		this.onionMessageManager.setSendFunction(
+			(toPeer: string, type: number, payload: Buffer) => {
+				this.emitOutbound(toPeer, type, payload);
+			}
+		);
 		this.wireOnionMessageEvents();
 
 		this.offerManager = new OfferManager(config.nodePrivateKey, {
@@ -1441,15 +1565,129 @@ export class LightningNode extends EventEmitter {
 		});
 		this.wireOfferManagerEvents();
 
-		this.asyncPaymentManager = new AsyncPaymentManager();
+		// Held-forward ledger (issue #708): rehydrated HERE, at construction,
+		// before any transport exists, so no release can be judged against an
+		// empty ledger. The store rides the node's metadata table when storage
+		// is configured; an embedded node without storage keeps it in memory.
+		this.heldForwardLedger = new HeldForwardLedger(
+			this.storage
+				? new MetadataLedgerStore<IHeldForwardRecord>(
+						this.storage,
+						HELD_FORWARD_LEDGER_PREFIX,
+						heldForwardCodec
+				  )
+				: new MemoryLedgerStore<IHeldForwardRecord>()
+		);
+		this.heldForwardLedger.rehydrate();
+		this.autoReleaseHeldForwards = config.autoReleaseHeldForwards ?? true;
+		// Async receive service (issue #709): registrations live in their own
+		// durable ledger next to the holds; admission judges every new hold
+		// against them. Disabled by default.
+		this.asyncReceiveService = new AsyncReceiveService(
+			config.asyncReceiveService,
+			this.storage
+				? new MetadataLedgerStore<IAsyncRegistrationRecord>(
+						this.storage,
+						ASYNC_REGISTRATION_LEDGER_PREFIX,
+						asyncRegistrationCodec
+				  )
+				: new MemoryLedgerStore<IAsyncRegistrationRecord>(),
+			this.heldForwardLedger,
+			{
+				nodePrivkey: this.nodePrivkey,
+				nodeId: getPublicKey(this.nodePrivkey),
+				chainHash: config.chainHashes?.[0] ?? this.chainHash(),
+				currentHeight: () => this.currentBlockHeight,
+				channelForScid: (scidHex) => {
+					const channelId = this.scidToChannelId.get(scidHex);
+					if (!channelId) return null;
+					const peer = this.channelManager.getPeerForChannel(channelId);
+					if (!peer) return null;
+					return {
+						channelIdHex: channelId.toString('hex'),
+						peerNodeIdHex: peer
+					};
+				}
+			}
+		);
+		this.loadAsyncReceiveGrants();
+		this.asyncPaymentManager = new AsyncPaymentManager(this.heldForwardLedger, {
+			nodePrivkey: this.nodePrivkey,
+			nodeId: getPublicKey(this.nodePrivkey),
+			chainHash: config.chainHashes?.[0] ?? this.chainHash(),
+			currentHeight: () => this.currentBlockHeight,
+			hasOutgoingLeg: (record) =>
+				this.findOutgoingLeg(
+					Buffer.from(record.inChannelIdHex, 'hex'),
+					BigInt(record.inHtlcId)
+				) !== null,
+			incomingUnresolved: (record) =>
+				this.heldForwardIncomingUnresolved(record),
+			registrationIdFor: (lspNodeIdHex, holdIds) =>
+				this.asyncReleaseRegistrationId(lspNodeIdHex, holdIds),
+			canForwardSet: (records) => this.canForwardHeldSet(records)
+		});
 		this.asyncPaymentManager.attachOnionMessageManager(
 			this.onionMessageManager
 		);
-		// Receiver: a wake message means a sender is waiting — surface it so the
+		this.wireAsyncReceiveService();
+		// Receiver: a wake message means a sender is waiting; surface it so the
 		// host can reconnect to its LSP and trigger release of the held HTLC.
 		this.asyncPaymentManager.on('wake', (paymentHash?: Buffer) => {
 			this.emit('payment:async-wake', paymentHash);
 		});
+		this.asyncPaymentManager.on(
+			'held-notice',
+			(info: { lspNodeId: Buffer; notice: IHeldForwardNotice }) => {
+				this.handleHeldForwardNotice(info.lspNodeId, info.notice);
+			}
+		);
+		this.asyncPaymentManager.on('held', (record: IHeldForwardRecord) => {
+			this.emit('htlc:held-forward', {
+				holdId: Buffer.from(record.id, 'hex'),
+				paymentHash: Buffer.from(record.paymentHashHex, 'hex'),
+				amountMsat: BigInt(record.forwardAmountMsat),
+				cutoffHeight: record.cutoffHeight
+			});
+			this.emitStructuredLog('htlc', 'held_forward', {
+				holdId: record.id,
+				paymentHash: record.paymentHashHex,
+				cutoffHeight: record.cutoffHeight
+			});
+			// A receiver that is connected right now (it went offline only
+			// between issuing the invoice and the payment) learns of the hold
+			// at once; otherwise its channel's next reestablish carries the
+			// notice.
+			const outChannel = this.channelManager.getChannel(
+				Buffer.from(record.outChannelIdHex, 'hex')
+			);
+			if (outChannel?.getState() === ChannelState.NORMAL) {
+				this.asyncPaymentManager.sendNotice(record.receiverNodeIdHex);
+			}
+		});
+		this.asyncPaymentManager.on('released', (record: IHeldForwardRecord) => {
+			this.asyncReceiveService.noteReleased();
+			this.emit('htlc:held-forward-released', record);
+			this.emitStructuredLog('htlc', 'held_forward_released', {
+				holdId: record.id,
+				paymentHash: record.paymentHashHex
+			});
+		});
+		this.asyncPaymentManager.on('failed', (record: IHeldForwardRecord) => {
+			this.asyncReceiveService.noteFailed(record);
+			this.emit('htlc:held-forward-failed', record);
+			this.emitStructuredLog('htlc', 'held_forward_failed', {
+				holdId: record.id,
+				paymentHash: record.paymentHashHex,
+				reason: record.failReason
+			});
+		});
+		this.asyncPaymentManager.on(
+			'release-refused',
+			(info: { fromPeer: string; reason: string }) => {
+				this.emitStructuredLog('htlc', 'held_forward_release_refused', info);
+			}
+		);
 
 		if (config.jitReceive?.enabled) {
 			this.wireJitReceive(config.jitReceive);
@@ -1649,6 +1887,9 @@ export class LightningNode extends EventEmitter {
 				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, 'owed');
 			}
 			this.restoreFromStorage();
+			// Channels and forward linkage are loaded: settle every held
+			// forward whose outcome those durable facts already decide.
+			this.asyncPaymentManager.reconcile();
 			// One-time snapshot-content repair: heads compacted by an older
 			// release omitted deleted channels' key-index rows, and a quiet
 			// upgraded node might never write a replacement frame. Forcing a
@@ -3293,6 +3534,14 @@ export class LightningNode extends EventEmitter {
 			// A disconnect-during-quiescence left parked dispatches waiting for
 			// the channel to carry updates again; it can now.
 			this.drainParkedQuiescentHtlcs(channelId.toString('hex'));
+			// Held forwards (issue #708): a release or fail that was deferred
+			// because this channel could not carry it is re-driven from its
+			// durable row, and a receiver whose channel just came back is told
+			// what is parked for it.
+			this.asyncPaymentManager.onChannelUsable(channelId.toString('hex'));
+			this.retryOwedHeldForwardFailures(channelId.toString('hex'));
+			const peer = this.channelManager.getPeerForChannel(channelId);
+			if (peer) this.asyncPaymentManager.sendNotice(peer);
 		});
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
 			this.registerChannelScids(channelId);
@@ -6529,7 +6778,8 @@ export class LightningNode extends EventEmitter {
 			}).length,
 			peerCount: this.peerManager ? this.peerManager.listPeers().length : 0,
 			networkingEnabled: this.peerManager !== null,
-			alias: this.alias
+			alias: this.alias,
+			asyncReceiveService: this.asyncReceiveService.metrics()
 		};
 	}
 
@@ -8803,6 +9053,11 @@ export class LightningNode extends EventEmitter {
 	destroy(): void {
 		this._destroyed = true;
 		this.guardianHost?.close();
+		for (const [nonce, pending] of this.pendingGrantRequests) {
+			clearTimeout(pending.timer);
+			pending.reject(new Error('node destroyed'));
+			this.pendingGrantRequests.delete(nonce);
+		}
 		// Retires any chain startup sequence still working through its awaits.
 		++this.chainStartupGeneration;
 		// Queued broadcast gossip dies with the node; the drain loop also
@@ -12926,6 +13181,15 @@ export class LightningNode extends EventEmitter {
 			const scid = this.getPeerAddressableScid(state);
 			if (!scid) continue;
 			const peerPubkey = Buffer.from(peerPubkeyHex, 'hex');
+			// Async receive (issue #709): a hold path runs only through a peer
+			// that GRANTED us the service, over the channel the grant names.
+			// Any other peer would treat the marker as an unknown TLV and
+			// forward the HTLC to us while we are offline.
+			let holdGrant: IReceiverGrant | undefined;
+			if (asyncHold) {
+				holdGrant = this.liveAsyncReceiveGrant(peerPubkeyHex);
+				if (!holdGrant || !holdGrant.scid.equals(scid)) continue;
+			}
 
 			// Peer's actual policy for the peer→us hop (same logic as routing
 			// hints): graph update for public channels, the channel_update the
@@ -12962,6 +13226,14 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 
+			// The holding fee (issue #709) rides the LSP hop's payment_relay
+			// base fee, paid by the payer for the whole reserved window and
+			// kept by the LSP at release like any forwarding fee; the LSP
+			// refuses a hold whose incoming amount does not cover it.
+			if (holdGrant) {
+				feeBaseMsat += Number(holdingFeeForWindowMsat(holdGrant));
+			}
+
 			// Advertise the peer's real htlc_minimum_msat in the blinded hop's
 			// payment_constraints so the payer never sends a sub-minimum HTLC the
 			// peer would reject (the same masked-failure class as the fee gap).
@@ -12982,7 +13254,12 @@ export class LightningNode extends EventEmitter {
 					feeBaseMsat
 				},
 				paymentConstraints,
-				...(asyncHold ? { holdHtlc: true } : {})
+				...(holdGrant
+					? {
+							holdHtlc: true,
+							holdRegistrationId: holdGrant.registrationId
+					  }
+					: {})
 			};
 			// Final hop (us): recipient, no onward forwarding. Our own minimum is
 			// 0; do not inherit the peer's htlc_minimum constraint here. The
@@ -13054,12 +13331,17 @@ export class LightningNode extends EventEmitter {
 			// - min/max must reflect the peer's actual policy (bounded by
 			//   capacity) or the payer sends amounts the peer refuses.
 			const capacityMsat = state.fundingSatoshis * 1000n;
+			// A hold path asks the payer for the grant's whole hold window on
+			// top of our final delta: the LSP's cutoff is bounded by the
+			// outgoing CLTV minus our final headroom, so the window a hold
+			// gets is exactly the headroom the payer adds here.
+			const holdWindow = holdGrant ? holdGrant.maxHoldBlocks : 0;
 			paths.push({
 				path,
 				payInfo: {
 					feeBaseMsat: aggBase,
 					feeProportionalMillionths: aggProp,
-					cltvExpiryDelta: aggCltv + DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+					cltvExpiryDelta: aggCltv + DEFAULT_MIN_FINAL_CLTV_EXPIRY + holdWindow,
 					htlcMinimumMsat,
 					htlcMaximumMsat:
 						htlcMaximumMsat !== null && htlcMaximumMsat < capacityMsat
@@ -13740,6 +14022,13 @@ export class LightningNode extends EventEmitter {
 					options.blindedPathNumHops ?? 3
 			  )
 			: [];
+		if (options.asyncHold && blindedPaths.length === 0) {
+			// Falling back to a plain invoice here would hand the payer a path
+			// through a peer that forwards to us while we are offline.
+			throw new Error(
+				'asyncHold requires useBlindedPaths and a live async receive grant from a channel peer (requestAsyncReceiveGrant)'
+			);
+		}
 		const useBlinded = blindedPaths.length > 0;
 
 		// Build invoice feature bits (BOLT 11 requires these when payment_secret is present)
@@ -16480,21 +16769,440 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * LSP: release a forward parked for a now-online receiver (also triggered by
-	 * a release_held_htlc onion message). Returns false if nothing is parked.
+	 * LSP: every held-forward record, unresolved and terminal, for operators
+	 * and tests. Release is never a node API: it is authorized only by a
+	 * receiver-signed capability arriving over an onion message.
 	 */
-	releaseHeldForward(paymentHash: Buffer): boolean {
-		return this.asyncPaymentManager.handleRelease(paymentHash);
-	}
-
-	/** Payment hashes of forwards currently parked for offline receivers. */
-	listHeldForwards(): Buffer[] {
+	listHeldForwards(): IHeldForwardRecord[] {
 		return this.asyncPaymentManager.listHeldForwards();
 	}
 
-	/** Receiver: ask the LSP to release the HTLC held for this payment hash. */
-	sendAsyncRelease(lspNodeId: Buffer, paymentHash: Buffer): void {
-		this.asyncPaymentManager.sendRelease(lspNodeId, paymentHash);
+	/** LSP: operator fail of one hold (HELD, or RELEASING with no add placed). */
+	failHeldForward(holdIdHex: string): boolean {
+		return this.asyncPaymentManager.failHeldForward(holdIdHex);
+	}
+
+	// ─────────────── Async receive service (issue #709) ───────────────
+
+	/** The feature set this node advertises in init and node_announcement. */
+	getLocalFeatures(): FeatureFlags {
+		return this.localFeatures;
+	}
+
+	/** The LSP-side service (registrations, admission, metrics). */
+	getAsyncReceiveService(): AsyncReceiveService {
+		return this.asyncReceiveService;
+	}
+
+	/**
+	 * Service metrics: occupied slots, held value, oldest hold, admission
+	 * refusals, releases, expiries. Also carried by getNodeInfo().
+	 */
+	getAsyncReceiveServiceMetrics(): IAsyncReceiveServiceMetrics {
+		return this.asyncReceiveService.metrics();
+	}
+
+	/** LSP: every registration this node issued, active or revoked. */
+	listAsyncReceiveRegistrations(): IAsyncRegistrationRecord[] {
+		return this.asyncReceiveService.listRegistrations();
+	}
+
+	/** LSP operator: stop admitting holds under a registration. */
+	revokeAsyncReceiveRegistration(registrationIdHex: string): boolean {
+		return this.asyncReceiveService.revokeRegistration(registrationIdHex);
+	}
+
+	/** LSP operator: add prepaid admission credit to a registration. */
+	creditAsyncReceiver(registrationIdHex: string, msat: bigint): boolean {
+		return this.asyncReceiveService.creditRegistration(registrationIdHex, msat);
+	}
+
+	/**
+	 * Wire the registration exchange over onion messages. The REQUEST handler
+	 * exists only while the service is enabled: a disabled node ignores the
+	 * TLV exactly as a node that never heard of it would (the receiver's
+	 * request times out, and its feature check refused earlier anyway). The
+	 * REPLY handler is the receiver role and is always present.
+	 */
+	private wireAsyncReceiveService(): void {
+		const om = this.onionMessageManager;
+		if (this.asyncReceiveService.isEnabled()) {
+			om.registerTlvHandler(
+				ASYNC_REGISTRATION_REQUEST_TLV_TYPE,
+				(fromPeer, _type, data) => {
+					const reply = this.asyncReceiveService.handleRegistrationRequest(
+						fromPeer,
+						data
+					);
+					this.emitStructuredLog('peer', 'async_receive_registration', {
+						pubkey: fromPeer,
+						granted: reply.granted,
+						...(reply.granted
+							? { registrationId: reply.grant.registrationId.toString('hex') }
+							: { reason: reply.reason })
+					});
+					// The grant goes to the receiver that SIGNED the request, who
+					// may have routed it through anyone; a refusal goes back the
+					// way the message came, never to a receiver a stranger named.
+					const replyTo = reply.granted
+						? reply.grant.receiverNodeId
+						: Buffer.from(fromPeer, 'hex');
+					try {
+						om.sendOnionMessage(
+							replyTo,
+							new Map([
+								[
+									ASYNC_REGISTRATION_REPLY_TLV_TYPE,
+									encodeRegistrationReply(reply)
+								]
+							])
+						);
+					} catch (err) {
+						this.emitStructuredLog('peer', 'async_receive_reply_send_failed', {
+							pubkey: fromPeer,
+							error: err instanceof Error ? err.message : String(err)
+						});
+					}
+				}
+			);
+		}
+		om.registerTlvHandler(
+			ASYNC_REGISTRATION_REPLY_TLV_TYPE,
+			(fromPeer, _type, data) => {
+				this.handleAsyncGrantReply(fromPeer, data);
+			}
+		);
+		this.asyncReceiveService.on(
+			'admission-refused',
+			(info: { reason: string; registrationIdHex: string }) => {
+				this.emitStructuredLog('htlc', 'async_receive_admission_refused', info);
+			}
+		);
+	}
+
+	/**
+	 * Does this peer advertise the async receive service? Read from its init
+	 * message when connected through the peer manager, else from its verified
+	 * node_announcement in the graph. False when the peer is unknown: a
+	 * receiver never assumes support.
+	 */
+	peerAdvertisesAsyncReceive(pubkeyHex: string): boolean {
+		const init = this.peerManager?.getPeer(pubkeyHex)?.getRemoteInit();
+		if (init) return init.features.hasFeature(Feature.ASYNC_RECEIVE_SERVICE);
+		const ann = this.graph.getVerifiedNodeAnnouncement(
+			Buffer.from(pubkeyHex, 'hex')
+		);
+		if (!ann) return false;
+		return FeatureFlags.fromBuffer(ann.features).hasFeature(
+			Feature.ASYNC_RECEIVE_SERVICE
+		);
+	}
+
+	/**
+	 * Receiver: ask a channel peer for an async receive registration. Refused
+	 * locally, without sending anything, when the peer does not advertise
+	 * Feature.ASYNC_RECEIVE_SERVICE (a peer without the bit would forward a
+	 * hold_htlc HTLC to us while we are offline). Resolves with the verified
+	 * grant, which the node keeps (and persists) and uses for every hold path
+	 * through that peer from then on; rejects on refusal or timeout.
+	 */
+	async requestAsyncReceiveGrant(
+		lspNodeIdHex: string,
+		options: {
+			/** The LSP -> us channel to register; default: our channel with it. */
+			scid?: Buffer;
+			/** Hold window wanted, in blocks; 0 or absent = the LSP's default. */
+			requestedHoldBlocks?: number;
+			timeoutMs?: number;
+		} = {}
+	): Promise<IReceiverGrant> {
+		if (!this.peerAdvertisesAsyncReceive(lspNodeIdHex)) {
+			throw new Error(
+				`peer ${lspNodeIdHex} does not advertise the async receive service (feature bit ${
+					Feature.ASYNC_RECEIVE_SERVICE + 1
+				}); refusing to assume it parks hold_htlc forwards`
+			);
+		}
+		const scid = options.scid ?? this.asyncReceiveScidFor(lspNodeIdHex);
+		if (!scid) {
+			throw new Error(
+				`no addressable channel with ${lspNodeIdHex} to register`
+			);
+		}
+		const nonce = crypto.randomBytes(32);
+		const request = encodeRegistrationRequest(
+			signRegistrationRequest(
+				{
+					chainHash: this.acceptableChainHashes[0] ?? this.chainHash(),
+					receiverNodeId: getPublicKey(this.nodePrivkey),
+					lspNodeId: Buffer.from(lspNodeIdHex, 'hex'),
+					scid,
+					requestedHoldBlocks: options.requestedHoldBlocks ?? 0,
+					timestamp: BigInt(Math.floor(Date.now() / 1000)),
+					nonce
+				},
+				this.nodePrivkey
+			)
+		);
+		const nonceHex = nonce.toString('hex');
+		return new Promise<IReceiverGrant>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				this.pendingGrantRequests.delete(nonceHex);
+				reject(new Error('async receive registration timed out'));
+			}, options.timeoutMs ?? ASYNC_GRANT_REQUEST_TIMEOUT_MS);
+			this.pendingGrantRequests.set(nonceHex, {
+				lspNodeIdHex,
+				scidHex: scid.toString('hex'),
+				resolve,
+				reject,
+				timer
+			});
+			try {
+				this.onionMessageManager.sendOnionMessage(
+					Buffer.from(lspNodeIdHex, 'hex'),
+					new Map([[ASYNC_REGISTRATION_REQUEST_TLV_TYPE, request]])
+				);
+			} catch (err) {
+				clearTimeout(timer);
+				this.pendingGrantRequests.delete(nonceHex);
+				reject(err instanceof Error ? err : new Error(String(err)));
+			}
+		});
+	}
+
+	/** The SCID (alias first) we would name for our channel with this peer. */
+	private asyncReceiveScidFor(peerHex: string): Buffer | null {
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			if (this.channelManager.getPeerForChannel(channelId) !== peerHex)
+				continue;
+			const scid = this.getPeerAddressableScid(channel.getFullState());
+			if (scid) return scid;
+		}
+		return null;
+	}
+
+	private handleAsyncGrantReply(fromPeer: string, data: Buffer): void {
+		const reply = decodeRegistrationReply(data);
+		if (!reply) return;
+		const nonceHex = (reply.granted ? reply.grant.nonce : reply.nonce).toString(
+			'hex'
+		);
+		const pending = this.pendingGrantRequests.get(nonceHex);
+		// A reply to a request we never made, or one answered already, is
+		// dropped: a grant we did not ask for binds us to nothing.
+		if (!pending || pending.lspNodeIdHex !== fromPeer) return;
+		if (!reply.granted) {
+			clearTimeout(pending.timer);
+			this.pendingGrantRequests.delete(nonceHex);
+			pending.reject(
+				new Error(`async receive registration refused: ${reply.reason}`)
+			);
+			return;
+		}
+		const grant = reply.grant;
+		const problem = this.judgeAsyncReceiveGrant(grant, {
+			lspNodeIdHex: fromPeer,
+			scidHex: pending.scidHex
+		});
+		if (problem) {
+			clearTimeout(pending.timer);
+			this.pendingGrantRequests.delete(nonceHex);
+			pending.reject(new Error(`async receive grant rejected: ${problem}`));
+			return;
+		}
+		clearTimeout(pending.timer);
+		this.pendingGrantRequests.delete(nonceHex);
+		this.rememberAsyncReceiveGrant(grant);
+		this.persistAsyncReceiveGrants();
+		this.emit('async-receive:granted', grant);
+		pending.resolve(grant);
+	}
+
+	/**
+	 * Everything a grant must satisfy before this node relies on it: signed
+	 * by the LSP it names, which is the LSP we dealt with; for us; on our
+	 * chain; over the channel we asked to register; not expired. Returns the
+	 * first problem, or null.
+	 */
+	private judgeAsyncReceiveGrant(
+		grant: IReceiverGrant,
+		expect: { lspNodeIdHex?: string; scidHex?: string; allowExpired?: boolean }
+	): string | null {
+		const lspHex = grant.lspNodeId.toString('hex');
+		if (expect.lspNodeIdHex && lspHex !== expect.lspNodeIdHex) {
+			return 'wrong_lsp';
+		}
+		if (!grant.receiverNodeId.equals(getPublicKey(this.nodePrivkey))) {
+			return 'not_for_us';
+		}
+		const chain = this.acceptableChainHashes[0] ?? this.chainHash();
+		if (!grant.chainHash.equals(chain)) return 'wrong_network';
+		if (expect.scidHex && grant.scid.toString('hex') !== expect.scidHex) {
+			return 'wrong_channel';
+		}
+		if (!verifyReceiverGrant(grant)) return 'bad_signature';
+		if (
+			!expect.allowExpired &&
+			BigInt(Math.floor(Date.now() / 1000)) >= grant.expiresAt
+		) {
+			return 'expired';
+		}
+		return null;
+	}
+
+	/**
+	 * Receiver: adopt a grant obtained out of band (a backup, an operator
+	 * hand-off). Verified exactly like one that arrived over the wire, except
+	 * that the LSP is whichever the grant names; the channel must be one of
+	 * ours with that LSP.
+	 */
+	importAsyncReceiveGrant(wire: Buffer): IReceiverGrant {
+		const grant = decodeReceiverGrant(wire);
+		if (!grant) throw new Error('malformed async receive grant');
+		const lspHex = grant.lspNodeId.toString('hex');
+		const problem = this.judgeAsyncReceiveGrant(grant, {});
+		if (problem) throw new Error(`async receive grant rejected: ${problem}`);
+		const ours = this.asyncReceiveScidFor(lspHex);
+		if (!ours || !ours.equals(grant.scid)) {
+			throw new Error('async receive grant rejected: wrong_channel');
+		}
+		this.rememberAsyncReceiveGrant(grant);
+		this.persistAsyncReceiveGrants();
+		return grant;
+	}
+
+	/**
+	 * Keep a grant, newest first per LSP. A grant already held (same
+	 * registration id) is not duplicated; the list is bounded, and a grant
+	 * expired for longer than a hold could outlive it is dropped.
+	 */
+	private rememberAsyncReceiveGrant(grant: IReceiverGrant): void {
+		const lspHex = grant.lspNodeId.toString('hex');
+		const nowSec = BigInt(Math.floor(Date.now() / 1000));
+		const kept = (this.asyncReceiveGrants.get(lspHex) ?? []).filter(
+			(g) =>
+				!g.registrationId.equals(grant.registrationId) &&
+				g.expiresAt + BigInt(ASYNC_GRANT_RETENTION_SEC) > nowSec
+		);
+		kept.unshift(grant);
+		this.asyncReceiveGrants.set(lspHex, kept.slice(0, ASYNC_GRANTS_PER_LSP));
+	}
+
+	/** Receiver: every grant this node holds, newest first per LSP. */
+	listAsyncReceiveGrants(): IReceiverGrant[] {
+		return [...this.asyncReceiveGrants.values()].flat();
+	}
+
+	/** Receiver: drop every grant held for an LSP. */
+	forgetAsyncReceiveGrant(lspNodeIdHex: string): boolean {
+		const had = this.asyncReceiveGrants.delete(lspNodeIdHex);
+		if (had) this.persistAsyncReceiveGrants();
+		return had;
+	}
+
+	/** The newest grant for this LSP that has not expired. */
+	private liveAsyncReceiveGrant(
+		lspNodeIdHex: string
+	): IReceiverGrant | undefined {
+		const nowSec = BigInt(Math.floor(Date.now() / 1000));
+		return (this.asyncReceiveGrants.get(lspNodeIdHex) ?? []).find(
+			(g) => nowSec < g.expiresAt
+		);
+	}
+
+	private persistAsyncReceiveGrants(): void {
+		if (!this.storage) return;
+		try {
+			this.storage.saveMetadata(
+				ASYNC_RECEIVE_GRANTS_KEY,
+				JSON.stringify(
+					this.listAsyncReceiveGrants().map((g) =>
+						encodeReceiverGrant(g).toString('hex')
+					)
+				)
+			);
+		} catch (err) {
+			this.emitStructuredLog('peer', 'async_receive_grant_persist_failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	private loadAsyncReceiveGrants(): void {
+		if (!this.storage) return;
+		const raw = this.storage.loadMetadata(ASYNC_RECEIVE_GRANTS_KEY);
+		if (!raw) return;
+		try {
+			const list = JSON.parse(raw) as unknown;
+			if (!Array.isArray(list)) return;
+			// Oldest first, so the newest ends up at the head of each list.
+			for (const hex of [...list].reverse()) {
+				if (typeof hex !== 'string') continue;
+				const grant = decodeReceiverGrant(Buffer.from(hex, 'hex'));
+				// Re-verified on load: a tampered store cannot plant a grant.
+				// Expiry is NOT judged here: an expired grant still names the
+				// registration a parked hold must be released under.
+				if (
+					!grant ||
+					this.judgeAsyncReceiveGrant(grant, { allowExpired: true })
+				) {
+					continue;
+				}
+				this.rememberAsyncReceiveGrant(grant);
+			}
+		} catch {
+			// Unreadable list: start with none; the receiver re-registers.
+		}
+	}
+
+	/**
+	 * Receiver: sign a release capability over `holdIds` (the complete set
+	 * to release atomically; a single id for an independent part) and send
+	 * it to the LSP. `amountMsat` is the sum of the parts' forward amounts
+	 * as the LSP's notice reported them.
+	 */
+	sendAsyncRelease(
+		lspNodeId: Buffer,
+		holdIds: Buffer[],
+		amountMsat: bigint,
+		registrationId?: Buffer
+	): void {
+		this.asyncPaymentManager.sendRelease(lspNodeId, holdIds, amountMsat, {
+			registrationId
+		});
+	}
+
+	/**
+	 * The registration a release of these holds must name: the one the LSP's
+	 * notice reported for them (every member must agree), else the live
+	 * grant's. A hold is released under the registration it was parked
+	 * under; the grant behind it may have expired or been renewed since.
+	 */
+	private asyncReleaseRegistrationId(
+		lspNodeIdHex: string,
+		holdIds: Buffer[]
+	): Buffer | undefined {
+		let noticed: Buffer | undefined;
+		for (const id of holdIds) {
+			const reg = this.noticedHoldRegistrations.get(id.toString('hex'));
+			if (!reg) {
+				noticed = undefined;
+				break;
+			}
+			if (noticed && !noticed.equals(reg)) {
+				noticed = undefined;
+				break;
+			}
+			noticed = reg;
+		}
+		return noticed ?? this.liveAsyncReceiveGrant(lspNodeIdHex)?.registrationId;
+	}
+
+	/** Receiver: ask the LSP for a notice of everything parked for us. */
+	sendAsyncQuery(lspNodeId: Buffer): void {
+		this.asyncPaymentManager.sendQuery(lspNodeId);
 	}
 
 	/** Sender: nudge an offline receiver to come online for this payment hash. */
@@ -16503,19 +17211,113 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Fail LSP-side held forwards approaching their inbound CLTV expiry, so the
-	 * channel isn't force-closed waiting on an offline receiver who never returns.
+	 * Receiver: a notice from an LSP listing holds parked for us. Always
+	 * surfaced as 'payment:held-notice'; with autoReleaseHeldForwards (the
+	 * default) the node also releases what it can vouch for:
+	 *
+	 *  - Atomic payment-set release (default policy): parts sharing a hash
+	 *    are released together once their forward amounts cover the invoice
+	 *    amount, in ONE capability, so the LSP forwards all or nothing and a
+	 *    partial MPP arrival never turns into a half-forwarded payment the
+	 *    receiver then has to fail part by part.
+	 *  - Independent part release: an amount-less invoice has no total to
+	 *    wait for, so each part is released on its own.
+	 *  - Unknown hashes are never released: the receiver could not settle
+	 *    them, so the LSP would only forward an HTLC we would fail.
+	 *
+	 * Only holds parked under a registration this node holds a grant for at
+	 * this LSP (any grant, live or since expired or renewed) are considered;
+	 * the capability binds the registration the notice reports for the hold.
 	 */
-	private scanExpiringHeldForwards(height: number): void {
-		if (height <= 0) return;
-		for (const [hashHex, hf] of this.heldForwards) {
-			if (
-				hf.incomingCltvExpiry > 0 &&
-				hf.incomingCltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
-			) {
-				this.asyncPaymentManager.failHeldForward(Buffer.from(hashHex, 'hex'));
-			}
+	private handleHeldForwardNotice(
+		lspNodeId: Buffer,
+		notice: IHeldForwardNotice
+	): void {
+		this.emit('payment:held-notice', { lspNodeId, notice });
+		const lspHex = lspNodeId.toString('hex');
+		const ours = new Set(
+			(this.asyncReceiveGrants.get(lspHex) ?? []).map((g) =>
+				g.registrationId.toString('hex')
+			)
+		);
+		ours.add(
+			deriveHoldRegistrationId(
+				getPublicKey(this.nodePrivkey),
+				lspNodeId
+			).toString('hex')
+		);
+		const byHash = new Map<string, IHeldForwardNotice['entries']>();
+		for (const entry of notice.entries) {
+			if (!ours.has(entry.registrationId.toString('hex'))) continue;
+			this.noticedHoldRegistrations.set(
+				entry.holdId.toString('hex'),
+				entry.registrationId
+			);
+			const key = entry.paymentHash.toString('hex');
+			const list = byHash.get(key) ?? [];
+			list.push(entry);
+			byHash.set(key, list);
 		}
+		if (!this.autoReleaseHeldForwards) return;
+		for (const [hashHex, entries] of byHash) {
+			const invoice = this.invoices.get(hashHex);
+			if (!invoice) continue;
+			if (invoice.amountMsat === undefined) {
+				for (const e of entries) {
+					this.sendAsyncReleaseSafely(
+						lspNodeId,
+						[e.holdId],
+						e.forwardAmountMsat,
+						e.registrationId
+					);
+				}
+				continue;
+			}
+			let sum = 0n;
+			for (const e of entries) sum += e.forwardAmountMsat;
+			if (sum < invoice.amountMsat) continue;
+			this.sendAsyncReleaseSafely(
+				lspNodeId,
+				entries.map((e) => e.holdId),
+				sum,
+				entries[0].registrationId
+			);
+		}
+	}
+
+	private sendAsyncReleaseSafely(
+		lspNodeId: Buffer,
+		holdIds: Buffer[],
+		amountMsat: bigint,
+		registrationId: Buffer
+	): void {
+		try {
+			this.asyncPaymentManager.sendRelease(lspNodeId, holdIds, amountMsat, {
+				registrationId
+			});
+		} catch (err) {
+			this.emitStructuredLog('htlc', 'held_forward_release_send_failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	/**
+	 * Durable fact for the ledger: the parked inbound HTLC still exists and
+	 * is committed. False once it settled, failed, or its channel is gone.
+	 */
+	private heldForwardIncomingUnresolved(record: IHeldForwardRecord): boolean {
+		const channel = this.channelManager.getChannel(
+			Buffer.from(record.inChannelIdHex, 'hex')
+		);
+		if (!channel) return false;
+		const htlc = channel
+			.getFullState()
+			.htlcs.get(`received-${record.inHtlcId}`);
+		if (!htlc) return false;
+		return (
+			htlc.state === HtlcState.COMMITTED || htlc.state === HtlcState.PENDING
+		);
 	}
 
 	// ─────────────── JIT channel receive (LSP role, issue #594) ───────────────
@@ -17371,6 +18173,7 @@ export class LightningNode extends EventEmitter {
 		let outgoingScid = hopPayload.shortChannelId;
 		let nextBlindingPoint: Buffer | undefined;
 		let holdForLsp = false;
+		let holdRegistrationId: Buffer | undefined;
 		let blindedOutAmount: bigint | undefined;
 		let blindedOutCltv: number | undefined;
 		let blindedMaxCltv: number | undefined;
@@ -17386,6 +18189,7 @@ export class LightningNode extends EventEmitter {
 				outgoingScid = hopData.shortChannelId;
 				nextBlindingPoint = nextBlindingKey;
 				holdForLsp = !!hopData.holdHtlc;
+				holdRegistrationId = hopData.holdRegistrationId;
 				if (hopData.paymentRelay) {
 					const relay = hopData.paymentRelay;
 					// BOLT 4 route blinding: invert the sender's fee computation with
@@ -17581,7 +18385,9 @@ export class LightningNode extends EventEmitter {
 		// (on release) with a current HTLC counter. Synchronous loopback may
 		// complete the whole fulfillment chain during addHtlc, so we track the
 		// outgoing→incoming link BEFORE forwarding (same timing as payment storage).
-		const performForward = (): void => {
+		const performForward = (
+			fail: (code: number) => boolean = failIncoming
+		): boolean =>
 			this.forwardHtlcOnto(outChannelId, {
 				inChannelId,
 				inHtlcId,
@@ -17591,41 +18397,307 @@ export class LightningNode extends EventEmitter {
 				incomingCltvExpiry,
 				nextPacket,
 				nextBlindingPoint,
-				failIncoming
+				failIncoming: fail
 			});
-		};
 
-		// Async payments (LSP role): the recipient's blinded path marked this hop
-		// hold_htlc, so park the forward and wait for a release_held_htlc onion
-		// message (handled by AsyncPaymentManager) before forwarding to the now-
-		// online receiver. The CLTV sweeper fails it back if release never comes.
-		if (holdForLsp) {
-			const hashHex = paymentHash.toString('hex');
-			this.heldForwards.set(hashHex, {
+		// Async payments (LSP role, issue #708): the recipient's blinded path
+		// marked this hop hold_htlc, so park the forward in the durable
+		// held-forward ledger and wait for a receiver-signed release
+		// capability before forwarding to the now-online receiver. The row is
+		// written BEFORE anything can act on the hold; a redispatch after a
+		// restart finds the same row (same hold_id) and only re-arms the
+		// driver, driving a RELEASING or FAILING row to its terminal state.
+		// The per-block scan fails the hold at its CLTV cutoff.
+		//
+		// Service gate (issue #709): a node that does not run the async receive
+		// service treats the marker as the unknown odd TLV it is to everyone
+		// else and forwards (or fails) exactly as it would without it. Parking
+		// is a service this node has to have opted into and granted. A row
+		// this node ALREADY owes (a redispatch after a restart with the
+		// service since turned off) is re-armed regardless: what is owed is
+		// driven to its terminal state, never forwarded around its ledger.
+		if (
+			holdForLsp &&
+			(this.asyncReceiveService.isEnabled() ||
+				this.heldForwardLedger.byIncoming(
+					inChannelId.toString('hex'),
+					inHtlcId
+				) !== undefined)
+		) {
+			this.parkHeldForward({
 				inChannelId,
 				inHtlcId,
-				incomingCltvExpiry
-			});
-			this.asyncPaymentManager.registerHeldForward({
 				paymentHash,
-				release: () => {
-					this.heldForwards.delete(hashHex);
-					performForward();
-				},
-				fail: () => {
-					this.heldForwards.delete(hashHex);
-					failIncoming(UNKNOWN_NEXT_PEER);
-				}
+				outChannelId,
+				outgoingScidHex: scidHex,
+				registrationId: holdRegistrationId ?? Buffer.alloc(32),
+				incomingAmountMsat,
+				forwardAmountMsat: forwardAmount,
+				forwardCltv,
+				incomingCltvExpiry,
+				policyFeeMsat:
+					BigInt(outPolicy.feeBaseMsat) +
+					(forwardAmount * BigInt(outPolicy.feeProportionalMillionths)) /
+						1_000_000n,
+				performForward,
+				failIncoming
 			});
-			this.emit('htlc:held-forward', {
-				paymentHash,
-				amountMsat: hopPayload.amountToForwardMsat
-			});
-			this.emitStructuredLog('htlc', 'held_forward', { paymentHash: hashHex });
 			return;
+		}
+		if (holdForLsp) {
+			this.emitStructuredLog('htlc', 'hold_marker_ignored', {
+				paymentHash: paymentHash.toString('hex'),
+				reason: 'async_receive_service_disabled'
+			});
 		}
 
 		performForward();
+	}
+
+	/**
+	 * Park one inbound HTLC for an offline receiver (issue #708).
+	 *
+	 * The CLTV cutoff is fixed here, on the row: the last height at which the
+	 * outgoing HTLC still gives the receiver its advertised final-hop headroom
+	 * (forwardCltv - DEFAULT_MIN_FINAL_CLTV_EXPIRY), or the LSP's own margin
+	 * before its inbound leg goes on-chain, whichever is earlier. Release is
+	 * accepted strictly below it; at it, failure is mandatory. Both are CAS
+	 * transitions from HELD on the same row, so the race has one winner.
+	 */
+	private parkHeldForward(args: {
+		inChannelId: Buffer;
+		inHtlcId: bigint;
+		paymentHash: Buffer;
+		outChannelId: Buffer;
+		outgoingScidHex: string;
+		registrationId: Buffer;
+		incomingAmountMsat: bigint;
+		forwardAmountMsat: bigint;
+		forwardCltv: number;
+		incomingCltvExpiry: number;
+		/** What our forwarding policy earns on this forward. */
+		policyFeeMsat: bigint;
+		/**
+		 * Place the onward add; true when the outgoing channel accepted it.
+		 * The refusal path fails the inbound HTLC through the given closure.
+		 */
+		performForward: (fail?: (code: number) => boolean) => boolean;
+		failIncoming: (code: number) => boolean;
+	}): void {
+		const receiverHex = this.channelManager.getPeerForChannel(
+			args.outChannelId
+		);
+		if (!receiverHex) {
+			args.failIncoming(UNKNOWN_NEXT_PEER);
+			return;
+		}
+		const proposedCutoffHeight = Math.min(
+			args.forwardCltv - DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+			args.incomingCltvExpiry -
+				Math.max(HELD_HTLC_EXPIRY_MARGIN, this.htlcSafetyMargin)
+		);
+		// Admission (issue #709), judged in the same synchronous step as the
+		// durable write below: the registration the marker names, every
+		// per-receiver and global limit, the CLTV window and the price. The
+		// verdict may lower the cutoff to the grant's window and stamps the
+		// fees on the row.
+		const candidate = {
+			registrationIdHex: args.registrationId.toString('hex'),
+			receiverNodeIdHex: receiverHex,
+			outgoingScidHex: args.outgoingScidHex,
+			paymentHashHex: args.paymentHash.toString('hex'),
+			incomingAmountMsat: args.incomingAmountMsat,
+			forwardAmountMsat: args.forwardAmountMsat,
+			policyFeeMsat: args.policyFeeMsat,
+			proposedCutoffHeight,
+			heldBytes: ONION_PACKET_LENGTH + HELD_FORWARD_ROW_BYTES
+		};
+		const judge = (): ReturnType<HoldAdmissionJudge> => {
+			const verdict = this.asyncReceiveService.admit(candidate);
+			if (!verdict.ok) return { ok: false, reason: verdict.reason };
+			return {
+				ok: true,
+				patch: {
+					cutoffHeight: verdict.cutoffHeight,
+					admittedHeight: verdict.admittedHeight,
+					heldBytes: candidate.heldBytes,
+					admissionFeeMsat: verdict.admissionFeeMsat.toString(),
+					holdingFeeMsat: verdict.holdingFeeMsat.toString()
+				}
+			};
+		};
+		const driver: IHeldForwardDriver = {
+			forward: () => {
+				const outChannel = this.channelManager.getChannel(args.outChannelId);
+				if (!outChannel) {
+					// The outgoing channel is gone: nothing can ever place this
+					// add, so the release resolves as a refusal upstream.
+					return args.failIncoming(UNKNOWN_NEXT_PEER) ? 'refused' : 'deferred';
+				}
+				const state = outChannel.getState();
+				if (
+					state === ChannelState.AWAITING_REESTABLISH ||
+					state === ChannelState.SPLICING ||
+					(state === ChannelState.NORMAL && outChannel.isQuiescing())
+				) {
+					return 'deferred';
+				}
+				if (state !== ChannelState.NORMAL) {
+					return args.failIncoming(UNKNOWN_NEXT_PEER) ? 'refused' : 'deferred';
+				}
+				// Judged by the add's acceptance, not by the linkage row: a
+				// synchronous loopback can run the whole fulfill chain inside
+				// the add and consume the row before this returns.
+				let inboundResolved = false;
+				const tracked = (code: number): boolean => {
+					const ok = args.failIncoming(code);
+					if (ok) inboundResolved = true;
+					return ok;
+				};
+				if (args.performForward(tracked)) return 'forwarded';
+				// The refusal path fails the inbound HTLC; when its channel
+				// could not carry that (reestablishing), the row still goes
+				// terminal and the refund is owed HERE, retried on reestablish
+				// and per block. Unless the JIT engine took the part for a
+				// splice: it will forward it, and failing it would pay
+				// downstream for an inbound leg already refunded.
+				if (
+					!inboundResolved &&
+					!this.jitReceiveManager?.holdsPart(
+						args.inChannelId.toString('hex'),
+						args.inHtlcId
+					)
+				) {
+					this.oweHeldForwardFailure(args.inChannelId, args.inHtlcId, () =>
+						args.failIncoming(TEMPORARY_CHANNEL_FAILURE)
+					);
+				}
+				return 'refused';
+			},
+			fail: () => args.failIncoming(UNKNOWN_NEXT_PEER)
+		};
+		const outcome = this.asyncPaymentManager.registerHold(
+			{
+				inChannelIdHex: args.inChannelId.toString('hex'),
+				inHtlcId: args.inHtlcId.toString(),
+				paymentHashHex: args.paymentHash.toString('hex'),
+				outChannelIdHex: args.outChannelId.toString('hex'),
+				receiverNodeIdHex: receiverHex,
+				registrationIdHex: args.registrationId.toString('hex'),
+				incomingAmountMsat: args.incomingAmountMsat.toString(),
+				forwardAmountMsat: args.forwardAmountMsat.toString(),
+				forwardCltv: args.forwardCltv,
+				incomingCltvExpiry: args.incomingCltvExpiry,
+				cutoffHeight: proposedCutoffHeight
+			},
+			driver,
+			judge
+		);
+		if ('refused' in outcome) {
+			// Not admitted: nothing was reserved. The refusal goes upstream as
+			// invalid_onion_blinding (failIncoming, blinded role): the payer
+			// learns nothing about the service, the receiver or the reason.
+			this.emitStructuredLog('htlc', 'held_forward_admission_refused', {
+				paymentHash: args.paymentHash.toString('hex'),
+				registrationId: candidate.registrationIdHex,
+				receiver: receiverHex,
+				reason: outcome.refused
+			});
+			args.failIncoming(TEMPORARY_NODE_FAILURE);
+			return;
+		}
+		if ('storageFailed' in outcome) {
+			// The durable row did not land: never hold what a restart would
+			// not remember. Fail back now; the payer retries.
+			args.failIncoming(TEMPORARY_NODE_FAILURE);
+			return;
+		}
+		// A redispatch that finds a FAILED row with the inbound HTLC still
+		// committed (the process died before the refund the row's failure
+		// owed could be carried): the refund is owed again, now.
+		if (
+			outcome.record.state === 'FAILED' &&
+			this.findOutgoingLeg(args.inChannelId, args.inHtlcId) === null
+		) {
+			this.oweHeldForwardFailure(args.inChannelId, args.inHtlcId, () =>
+				args.failIncoming(TEMPORARY_CHANNEL_FAILURE)
+			);
+			this.retryOwedHeldForwardFailures(args.inChannelId.toString('hex'));
+		}
+		// A NEW hold surfaces through the manager's 'held' event (wired in
+		// the constructor); a re-registration after a restart is silent.
+	}
+
+	private oweHeldForwardFailure(
+		inChannelId: Buffer,
+		inHtlcId: bigint,
+		fail: () => boolean
+	): void {
+		const inChannelIdHex = inChannelId.toString('hex');
+		this.owedHeldForwardFailures.set(`${inChannelIdHex}:${inHtlcId}`, {
+			inChannelIdHex,
+			fail
+		});
+		this.emitStructuredLog('htlc', 'held_forward_refund_owed', {
+			inChannelId: inChannelIdHex,
+			inHtlcId: Number(inHtlcId)
+		});
+	}
+
+	/**
+	 * Carry every owed held-forward refund the channel can take now: on the
+	 * channel's reestablish, and on every block for one it can carry at any
+	 * time. A refund whose HTLC is gone (settled, failed, channel closed) is
+	 * dropped: there is nothing left to fail.
+	 */
+	private retryOwedHeldForwardFailures(inChannelIdHex?: string): void {
+		for (const [key, owed] of this.owedHeldForwardFailures) {
+			if (inChannelIdHex && owed.inChannelIdHex !== inChannelIdHex) continue;
+			const [chanHex, htlcId] = key.split(':');
+			const channel = this.channelManager.getChannel(
+				Buffer.from(chanHex, 'hex')
+			);
+			const htlc = channel?.getFullState().htlcs.get(`received-${htlcId}`);
+			const stillCommitted =
+				htlc !== undefined &&
+				(htlc.state === HtlcState.COMMITTED ||
+					htlc.state === HtlcState.PENDING);
+			if (!stillCommitted || owed.fail()) {
+				this.owedHeldForwardFailures.delete(key);
+			}
+		}
+	}
+
+	/**
+	 * All-or-nothing at the channel for a held-forward set release (issue
+	 * #708 review): every unplaced part of the set, grouped by outgoing
+	 * channel, must fit that channel's limits together. A channel that cannot
+	 * take adds at all right now answers true: the driver defers the set and
+	 * the question is asked again when it can.
+	 */
+	private canForwardHeldSet(records: IHeldForwardRecord[]): boolean {
+		const byChannel = new Map<string, bigint[]>();
+		for (const r of records) {
+			const list = byChannel.get(r.outChannelIdHex) ?? [];
+			list.push(BigInt(r.forwardAmountMsat));
+			byChannel.set(r.outChannelIdHex, list);
+		}
+		for (const [channelIdHex, amounts] of byChannel) {
+			const channel = this.channelManager.getChannel(
+				Buffer.from(channelIdHex, 'hex')
+			);
+			if (!channel) return false;
+			const state = channel.getState();
+			if (
+				state === ChannelState.AWAITING_REESTABLISH ||
+				state === ChannelState.SPLICING ||
+				(state === ChannelState.NORMAL && channel.isQuiescing())
+			) {
+				continue;
+			}
+			if (!channel.canOfferHtlcSet(amounts)) return false;
+		}
+		return true;
 	}
 
 	/**
@@ -17641,7 +18713,7 @@ export class LightningNode extends EventEmitter {
 	 * retries a refused forward is therefore re-entering this method, not
 	 * patching up half a transition from outside it.
 	 */
-	private forwardHtlcOnto(outChannelId: Buffer, part: IHeldJitPart): void {
+	private forwardHtlcOnto(outChannelId: Buffer, part: IHeldJitPart): boolean {
 		const nextOnionBuf = encodeOnionPacket(part.nextPacket);
 		const outChannel = this.channelManager.getChannel(outChannelId);
 		const outHtlcId = outChannel
@@ -17710,7 +18782,7 @@ export class LightningNode extends EventEmitter {
 					}
 				}
 			);
-			return;
+			return false;
 		}
 
 		this.emit(
@@ -17720,6 +18792,7 @@ export class LightningNode extends EventEmitter {
 			part.forwardAmountMsat,
 			part.paymentHash
 		);
+		return true;
 	}
 
 	/**
@@ -19826,6 +20899,19 @@ export class LightningNode extends EventEmitter {
 	 * ChannelManager exactly once before calling it.
 	 */
 	private runPerBlockWork(blockHeight: number): void {
+		// The height is durable BEFORE any of the work below is judged at it
+		// (issue #708 review): a process that dies inside a per-block scan
+		// restarts at the height that scan was judged at, so a held forward
+		// its predecessor had already found past the cutoff is never released
+		// by a successor that has not seen a block yet.
+		if (this.storage) {
+			try {
+				this.storage.saveMetadata('blockHeight', String(blockHeight));
+			} catch {
+				// best-effort
+			}
+		}
+		this.retryOwedHeldForwardFailures();
 		// Funding txs we are obligated to broadcast (BOLT 2) but which have
 		// not confirmed yet: retry, so a transient failure at watch:funding
 		// or a mempool eviction never orphans a signed funding.
@@ -19870,7 +20956,7 @@ export class LightningNode extends EventEmitter {
 		}
 		this.scanExpiringOfferedHtlcs(blockHeight);
 		this.scanExpiringHeldHtlcs(blockHeight);
-		this.scanExpiringHeldForwards(blockHeight);
+		this.asyncPaymentManager.scan(blockHeight);
 		this.scanForwardTimeouts(blockHeight);
 		this.scanStuckChannels(blockHeight);
 		this.reviewFundingMissingClocks(blockHeight);
@@ -19878,13 +20964,6 @@ export class LightningNode extends EventEmitter {
 		this.sweepExpiredIssuedInvoices();
 		if (blockHeight % 10 === 0) {
 			this.scanExpiredPendingPayments();
-		}
-		if (this.storage) {
-			try {
-				this.storage.saveMetadata('blockHeight', String(blockHeight));
-			} catch {
-				// best-effort
-			}
 		}
 		// Keep the fee advisor warm so a (synchronous) force-close can resolve a live
 		// feerate for its commitment CPFP + time-sensitive HTLC txs (H2). Non-blocking.
@@ -21040,6 +22119,16 @@ export class LightningNode extends EventEmitter {
 			if (!ours.equals(BITCOIN_CHAIN_HASH)) {
 				createOpts.chains = [ours];
 			}
+		}
+		if (
+			createOpts.asyncHold &&
+			![...this.asyncReceiveGrants.keys()].some(
+				(lsp) => this.liveAsyncReceiveGrant(lsp) !== undefined
+			)
+		) {
+			throw new Error(
+				'asyncHold requires a live async receive grant from a channel peer (requestAsyncReceiveGrant)'
+			);
 		}
 		if (
 			!createOpts.paths &&

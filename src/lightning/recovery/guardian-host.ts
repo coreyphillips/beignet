@@ -11,19 +11,37 @@
  * every set isolated and leaves the safety core untouched; the host is
  * routing, quotas and bookkeeping around it.
  *
+ * Admission comes before allocation (issue #710). A registration for a set
+ * this host has never served is checked in full, root signature included,
+ * before a store exists for it, and the first registration is one unit
+ * from the host's side: the store is opened, the guardian registers, and
+ * only an accepted registration is served, indexed and announced. A refused
+ * one leaves no file, no index entry and no served set behind.
+ *
  * Quotas refuse, never delete: pruning a namespace wedges a stranger's node
  * permanently (spec 5.8, the compaction retain floor), so an exhausted quota
  * answers ERR_QUOTA_EXCEEDED and the operator raises it or the writer moves
- * on. Both caps are checked against the set's file size, so they bound disk
- * rather than an abstract record count.
+ * on. The byte quota bounds the encoded content a set stores (every column
+ * of every row, GuardianStore.contentBytes) and is the guardian's own
+ * `maxContentBytes`, judged inside each write's BEGIN IMMEDIATE after the
+ * retirement check and before the verb's own verdicts, against a counter
+ * the store itself keeps: every mutating verb is under it, a replay the
+ * guardian answers from what it holds costs nothing, a replaced row costs
+ * new minus old, and two hosts opened on one store admit against the same
+ * total. The counter is re-derived from the rows at every open. Disk is
+ * that content plus SQLite's overhead and is reported alongside it.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import {
+	GUARDIAN_RECORD_OVERHEAD_BYTES,
+	GUARDIAN_REGISTRATION_BYTES,
 	GuardianStatus,
 	IGuardianInfoResponse,
-	ReferenceGuardian
+	IGuardianRegisterNodeRequest,
+	ReferenceGuardian,
+	registrationAdmissionProblem
 } from './guardian';
 import {
 	GUARDIAN_PROTOCOL_VERSION,
@@ -41,7 +59,12 @@ import {
 	decodeSyncEpochRequest,
 	decodeSyncRecordRequest
 } from './guardian-proto';
-import { GuardianVerbName, encodeGuardianVerbRefusal } from './guardian-http';
+import {
+	GuardianVerbName,
+	IGuardianVerbOutcome,
+	encodeGuardianVerbRefusal,
+	runGuardianVerb
+} from './guardian-http';
 import {
 	GuardianBolt8FrameError,
 	GuardianBolt8Responder,
@@ -55,6 +78,11 @@ export const GUARDIAN_HOST_DEFAULT_MAX_SETS = 16;
 const MAX_RECORDS_PER_GET = 256;
 const INDEX_FILE = 'sets.json';
 
+/** What the guardian charges an accepted record and a fresh registration. */
+export const GUARDIAN_HOST_RECORD_OVERHEAD_BYTES =
+	GUARDIAN_RECORD_OVERHEAD_BYTES;
+export const GUARDIAN_HOST_REGISTRATION_BYTES = GUARDIAN_REGISTRATION_BYTES;
+
 export interface IGuardianHostConfig {
 	/** Directory for the per-set stores and the host index. Created if absent. */
 	path: string;
@@ -64,7 +92,7 @@ export interface IGuardianHostConfig {
 	token?: string;
 	/** Advertised per-record ciphertext limit. Default 4 MiB. */
 	maxCiphertextBytes?: number;
-	/** Disk a single set may occupy before writes are refused. Default 256 MiB. */
+	/** Content a single set may store before writes are refused. Default 256 MiB. */
 	maxBytesPerSet?: number;
 	/** Sets this host will register. Default 16. */
 	maxSets?: number;
@@ -87,7 +115,10 @@ export interface IGuardianHostSetStatus {
 	setId: string;
 	members: string[];
 	namespaces: number;
+	/** Encoded content stored: the quota measure. */
 	bytes: number;
+	/** The store's files on disk, SQLite overhead included. */
+	diskBytes: number;
 	registeredAt: number;
 }
 
@@ -95,7 +126,11 @@ export interface IGuardianHostStatus {
 	guardianId: string;
 	authRequired: boolean;
 	sessions: number;
+	/** Partial requests and discarded ids retained across every session. */
+	inFlight: number;
 	sets: IGuardianHostSetStatus[];
+	/** Encoded content stored across every set. */
+	totalBytes: number;
 	limits: {
 		maxCiphertextBytes: number;
 		maxBytesPerSet: number;
@@ -120,6 +155,17 @@ interface IServedSet {
 	file: string;
 	registeredAt: number;
 }
+
+const WRITE_VERBS: ReadonlySet<GuardianVerbName> = new Set<GuardianVerbName>([
+	'register_node',
+	'put_state',
+	'sync_record',
+	'acquire_epoch',
+	'sync_epoch',
+	'rotate_set'
+]);
+
+const STORE_SUFFIXES = ['', '-wal', '-shm'];
 
 export class GuardianHost implements IGuardianResolver {
 	readonly guardianId: Buffer;
@@ -170,9 +216,7 @@ export class GuardianHost implements IGuardianResolver {
 			});
 			this.sessions.set(peer, responder);
 		}
-		if (++this.handled % 64 === 0) {
-			for (const session of this.sessions.values()) session.evictStale();
-		}
+		if (++this.handled % 64 === 0) this.evictStale();
 		try {
 			return responder.handle(payload);
 		} catch (error) {
@@ -188,8 +232,18 @@ export class GuardianHost implements IGuardianResolver {
 		}
 	}
 
+	/** The peer's session is gone: everything retained for it goes with it. */
 	sessionClosed(peer: string): void {
 		this.sessions.delete(peer);
+	}
+
+	/** Drop partial requests and discard entries that went stale; returns how many. */
+	evictStale(): number {
+		let dropped = 0;
+		for (const session of this.sessions.values()) {
+			dropped += session.evictStale();
+		}
+		return dropped;
 	}
 
 	// ─────────────── the resolver (what the responder asks) ───────────────
@@ -213,17 +267,18 @@ export class GuardianHost implements IGuardianResolver {
 		const refuse = (status: GuardianStatus, detail: string): Buffer =>
 			encodeGuardianVerbRefusal(verb, status, detail);
 		let setId: Buffer;
-		let members: Buffer[] | null = null;
+		let registration: IGuardianRegisterNodeRequest | null = null;
 		try {
 			switch (verb) {
-				case 'register_node': {
-					const request = decodeRegisterNodeRequest(body);
-					setId = request.guardianSetId;
-					members = request.guardianMembers;
+				case 'register_node':
+					registration = decodeRegisterNodeRequest(body);
+					setId = registration.guardianSetId;
 					break;
-				}
 				case 'put_state':
 					setId = decodePutStateRequest(body).record.guardianSetId;
+					break;
+				case 'sync_record':
+					setId = decodeSyncRecordRequest(body).record.guardianSetId;
 					break;
 				case 'get_head':
 					setId = decodeGetHeadRequest(body).guardianSetId;
@@ -233,9 +288,6 @@ export class GuardianHost implements IGuardianResolver {
 					break;
 				case 'acquire_epoch':
 					setId = decodeAcquireEpochRequest(body).guardianSetId;
-					break;
-				case 'sync_record':
-					setId = decodeSyncRecordRequest(body).record.guardianSetId;
 					break;
 				case 'rotate_set':
 					// Addressed to the OUTGOING set, which this host serves.
@@ -263,33 +315,16 @@ export class GuardianHost implements IGuardianResolver {
 			);
 		}
 		const key = setId.toString('hex');
-		let served = this.sets.get(key);
+		const served = this.sets.get(key);
 
-		if (verb === 'register_node') {
-			const problem = this.memberListProblem(members, setId);
-			if (problem) return refuse(problem.status, problem.detail);
-			if (!served) {
-				if (this.sets.size >= this.maxSets) {
-					this.emit({
-						type: 'guardian:quota-refused',
-						detail: `refusing a new set: ${this.sets.size} of ${this.maxSets} served`,
-						setId: key
-					});
-					return refuse(
-						GuardianStatus.ERR_QUOTA_EXCEEDED,
-						`this host serves ${this.maxSets} sets and is full`
-					);
-				}
-				served = this.openSet(setId, members as Buffer[], this.clock());
-				this.saveIndex();
-				this.emit({
-					type: 'guardian:set-registered',
-					detail: `now serving set ${key}`,
-					setId: key
-				});
-			}
-		}
 		if (!served) {
+			if (verb === 'register_node') {
+				return this.registerNewSet(
+					setId,
+					registration as IGuardianRegisterNodeRequest,
+					body
+				);
+			}
 			// A read on a set nobody registered is a truthful "no namespace
 			// here" (wire 2.6): the writer's ownership check relies on
 			// ERR_UNKNOWN_NODE meaning "fresh, register", and a host serves a
@@ -306,40 +341,44 @@ export class GuardianHost implements IGuardianResolver {
 				'guardian_set_id is not served by this host; register it first'
 			);
 		}
-		if (
-			(verb === 'put_state' ||
-				verb === 'sync_record' ||
-				verb === 'register_node' ||
-				verb === 'rotate_set') &&
-			this.bytesOf(served) > this.maxBytesPerSet
-		) {
+		if (!WRITE_VERBS.has(verb)) return served.guardian;
+		// The quota is the guardian's, judged inside the write's transaction;
+		// the host runs the verb itself only to report what it refused.
+		const outcome = runGuardianVerb(served.guardian, verb, body);
+		if (outcome.status === GuardianStatus.ERR_QUOTA_EXCEEDED) {
 			this.emit({
 				type: 'guardian:quota-refused',
-				detail: `set ${key} exceeds ${this.maxBytesPerSet} bytes; refusing writes`,
+				detail: `set ${key} holds ${served.guardian.contentBytes()} of ${
+					this.maxBytesPerSet
+				} bytes; a ${verb} was refused`,
 				setId: key
 			});
-			return refuse(
-				GuardianStatus.ERR_QUOTA_EXCEEDED,
-				`this host's storage quota for the set is exhausted`
-			);
 		}
-		return served.guardian;
+		return outcome.body;
 	}
 
 	// ─────────────── status and lifecycle ───────────────
 
 	status(): IGuardianHostStatus {
+		let inFlight = 0;
+		for (const session of this.sessions.values()) {
+			inFlight += session.inFlight + session.discarding;
+		}
+		const sets = [...this.sets.values()].map((set) => ({
+			setId: set.setId.toString('hex'),
+			members: set.members.map((m) => m.toString('hex')),
+			namespaces: set.guardian.listNamespaceIds().length,
+			bytes: set.guardian.contentBytes(),
+			diskBytes: this.diskBytesOf(set),
+			registeredAt: set.registeredAt
+		}));
 		return {
 			guardianId: this.guardianId.toString('hex'),
 			authRequired: this.authenticate !== undefined,
 			sessions: this.sessions.size,
-			sets: [...this.sets.values()].map((set) => ({
-				setId: set.setId.toString('hex'),
-				members: set.members.map((m) => m.toString('hex')),
-				namespaces: set.guardian.listNamespaceIds().length,
-				bytes: this.bytesOf(set),
-				registeredAt: set.registeredAt
-			})),
+			inFlight,
+			sets,
+			totalBytes: sets.reduce((sum, set) => sum + set.bytes, 0),
 			limits: {
 				maxCiphertextBytes: this.maxCiphertextBytes,
 				maxBytesPerSet: this.maxBytesPerSet,
@@ -361,76 +400,137 @@ export class GuardianHost implements IGuardianResolver {
 		this.sessions.clear();
 	}
 
-	// ─────────────── internals ───────────────
+	// ─────────────── registration of a set never served ───────────────
 
-	private memberListProblem(
-		members: Buffer[] | null,
-		setId: Buffer
-	): { status: GuardianStatus; detail: string } | null {
-		if (!members || members.length !== CRASH_V1_PROFILE.total) {
-			return {
-				status: GuardianStatus.ERR_MALFORMED,
-				detail: `guardian_members must list exactly ${CRASH_V1_PROFILE.total} keys`
-			};
-		}
-		let computed: Buffer;
-		try {
-			computed = computeGuardianSetId({
-				...CRASH_V1_PROFILE,
-				guardianIds: members
+	/**
+	 * The first registration of a set, one unit from the host's side: the
+	 * whole admission the guardian would apply runs BEFORE a store exists,
+	 * the set is counted against maxSets, the store is opened and the
+	 * guardian registers into it, and only an accepted registration is
+	 * served, indexed and announced. A refusal closes the store again and
+	 * removes it if this attempt created it. A store already on disk that
+	 * the index does not name is a registration this host committed but
+	 * never answered (the index is saved before the answer leaves), so it
+	 * is reopened rather than replaced and the retry adopts it; that
+	 * adoption takes no new slot against maxSets, which its registration
+	 * already earned when the store was committed.
+	 */
+	private registerNewSet(
+		setId: Buffer,
+		request: IGuardianRegisterNodeRequest,
+		body: Buffer
+	): Buffer {
+		const key = setId.toString('hex');
+		const refuse = (status: GuardianStatus, detail: string): Buffer =>
+			encodeGuardianVerbRefusal('register_node', status, detail);
+		const problem = registrationAdmissionProblem(
+			this.guardianId,
+			setId,
+			request
+		);
+		if (problem) return refuse(problem.status, problem.detail);
+		const file = this.fileFor(setId);
+		const created = !fs.existsSync(file);
+		if (created && this.sets.size >= this.maxSets) {
+			this.emit({
+				type: 'guardian:quota-refused',
+				detail: `refusing a new set: ${this.sets.size} of ${this.maxSets} served`,
+				setId: key
 			});
+			return refuse(
+				GuardianStatus.ERR_QUOTA_EXCEEDED,
+				`this host serves ${this.maxSets} sets and is full`
+			);
+		}
+		const served = this.openSet(setId, request.guardianMembers, this.clock());
+		let outcome: IGuardianVerbOutcome;
+		try {
+			outcome = runGuardianVerb(served.guardian, 'register_node', body);
 		} catch (error) {
-			return {
-				status: GuardianStatus.ERR_MALFORMED,
-				detail: `guardian_members invalid: ${
-					error instanceof Error ? error.message : String(error)
-				}`
-			};
+			this.discardSet(served, created);
+			throw error;
 		}
-		if (!computed.equals(setId)) {
-			return {
-				status: GuardianStatus.ERR_MALFORMED,
-				detail: 'guardian_members do not hash to guardian_set_id'
-			};
+		if (
+			outcome.status !== GuardianStatus.OK &&
+			outcome.status !== GuardianStatus.OK_DUPLICATE
+		) {
+			// Nothing was committed: the guardian's refusals and its internal
+			// errors both leave the transaction rolled back.
+			this.discardSet(served, created);
+			if (outcome.status === GuardianStatus.ERR_QUOTA_EXCEEDED) {
+				this.emit({
+					type: 'guardian:quota-refused',
+					detail: `set ${key} cannot hold a registration within ${this.maxBytesPerSet} bytes`,
+					setId: key
+				});
+			}
+			return outcome.body;
 		}
-		if (!members.some((m) => m.equals(this.guardianId))) {
-			return {
-				status: GuardianStatus.ERR_UNKNOWN_SET,
-				detail: 'this guardian is not a member of guardian_members'
-			};
+		this.sets.set(key, served);
+		try {
+			this.saveIndex();
+		} catch (error) {
+			// The namespace is committed but unanswered; the store stays as
+			// the orphan a retry adopts, and the set is not served until then.
+			this.sets.delete(key);
+			served.guardian.close();
+			throw error;
 		}
-		return null;
+		this.emit({
+			type: 'guardian:set-registered',
+			detail: `now serving set ${key}`,
+			setId: key
+		});
+		return outcome.body;
 	}
 
+	// ─────────────── internals ───────────────
+
+	private fileFor(setId: Buffer): string {
+		return path.join(this.config.path, `${setId.toString('hex')}.sqlite`);
+	}
+
+	/** Open the store for a set; the caller decides whether it is served. */
 	private openSet(
 		setId: Buffer,
 		members: Buffer[],
 		registeredAt: number
 	): IServedSet {
-		const key = setId.toString('hex');
-		const file = path.join(this.config.path, `${key}.sqlite`);
+		const file = this.fileFor(setId);
 		const guardian = new ReferenceGuardian({
 			path: file,
 			guardianSecret: this.config.guardianSecret,
 			members,
 			maxCiphertextBytes: this.maxCiphertextBytes,
 			maxRecordsPerGet: MAX_RECORDS_PER_GET,
+			maxContentBytes: this.maxBytesPerSet,
 			clock: (): bigint => BigInt(this.clock())
 		});
-		const served: IServedSet = {
+		return {
 			setId: Buffer.from(setId),
 			members: members.map((m) => Buffer.from(m)),
 			guardian,
 			file,
 			registeredAt
 		};
-		this.sets.set(key, served);
-		return served;
 	}
 
-	private bytesOf(set: IServedSet): number {
+	/** Close a store that will not be served; remove it if this attempt made it. */
+	private discardSet(served: IServedSet, created: boolean): void {
+		served.guardian.close();
+		if (!created) return;
+		for (const suffix of STORE_SUFFIXES) {
+			try {
+				fs.unlinkSync(served.file + suffix);
+			} catch {
+				// Not every suffix exists; the main file does.
+			}
+		}
+	}
+
+	private diskBytesOf(set: IServedSet): number {
 		let total = 0;
-		for (const suffix of ['', '-wal']) {
+		for (const suffix of STORE_SUFFIXES) {
 			try {
 				total += fs.statSync(set.file + suffix).size;
 			} catch {
@@ -464,8 +564,39 @@ export class GuardianHost implements IGuardianResolver {
 					`guardian host index names set ${key} this guardian cannot serve: ${problem.detail}`
 				);
 			}
-			this.openSet(setId, members, entry.registeredAt);
+			this.sets.set(key, this.openSet(setId, members, entry.registeredAt));
 		}
+	}
+
+	private memberListProblem(
+		members: Buffer[],
+		setId: Buffer
+	): { detail: string } | null {
+		if (members.length !== CRASH_V1_PROFILE.total) {
+			return {
+				detail: `guardian_members must list exactly ${CRASH_V1_PROFILE.total} keys`
+			};
+		}
+		let computed: Buffer;
+		try {
+			computed = computeGuardianSetId({
+				...CRASH_V1_PROFILE,
+				guardianIds: members
+			});
+		} catch (error) {
+			return {
+				detail: `guardian_members invalid: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			};
+		}
+		if (!computed.equals(setId)) {
+			return { detail: 'guardian_members do not hash to guardian_set_id' };
+		}
+		if (!members.some((m) => m.equals(this.guardianId))) {
+			return { detail: 'this guardian is not a member of guardian_members' };
+		}
+		return null;
 	}
 
 	private saveIndex(): void {
