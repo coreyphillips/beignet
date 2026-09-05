@@ -695,7 +695,9 @@ export interface BeignetConfig {
 	 *  (BOLT 8 already encrypts and authenticates the host, so the token is
 	 *  an allow-list, not confidentiality). Env: BEIGNET_GUARDIAN_TOKEN. */
 	guardianToken?: string;
-	/** Disk one guardian set may occupy before its writes are refused with
+	/** Hard bound on the content one guardian set may store (its encoded
+	 *  rows; SQLite's overhead comes on top): every write, epoch rows and
+	 *  rotations included, that would cross it is refused with
 	 *  ERR_QUOTA_EXCEEDED (default 268435456, 256 MiB). Refuses, never
 	 *  deletes. Env: BEIGNET_GUARDIAN_MAX_BYTES. */
 	guardianMaxBytesPerSet?: number;

@@ -347,16 +347,32 @@ export type GuardianBolt8Assembly<T> =
 	 * caller answers (or reports) 413 exactly once.
 	 */
 	| { kind: 'too-large'; requestId: number; verb: number; totalLength: number }
+	/**
+	 * Chunk 0 of a request carried a credential the authenticator refused.
+	 * Decided on chunk 0 so a peer without the credential never has a body
+	 * buffered for it (issue #710); the remaining chunks are swallowed like
+	 * a too-large request's, and the caller answers 401 exactly once.
+	 */
+	| { kind: 'unauthorized'; requestId: number; verb: number }
 	| null;
 
 export interface IGuardianBolt8AssemblerOptions {
 	kind: 'request' | 'response';
 	/** Cap on a reassembled body, fixed or looked up per request. */
 	maxBodyBytes: number | ((requestId: number, verb: number) => number);
-	/** Partial messages allowed at once; more is a framing violation. */
+	/**
+	 * Requests retained at once, partial bodies AND ids being discarded;
+	 * more is a framing violation. This is the whole bound on what one
+	 * session can make the assembler remember.
+	 */
 	maxInFlight?: number;
-	/** A partial message older than this is dropped by evictStale(). */
+	/** A partial or discard entry older than this is dropped by evictStale(). */
 	staleMs?: number;
+	/**
+	 * Request side only: the credential check over chunk 0's auth bytes,
+	 * applied before anything of the request is retained.
+	 */
+	authenticate?: (auth: Buffer | undefined) => boolean;
 	clock?: () => number;
 }
 
@@ -378,12 +394,24 @@ interface IPartial {
  */
 export class GuardianBolt8Assembler {
 	private readonly partials = new Map<number, IPartial>();
-	/** Request ids being swallowed after a too-large chunk 0: chunks left. */
-	private readonly discarding = new Map<number, number>();
+	/**
+	 * Request ids being swallowed after a refused chunk 0 (too large, or
+	 * unauthenticated): the header chunk 0 declared, the chunk expected
+	 * next, and when the swallowing began. An entry is a few numbers, but a
+	 * peer that never sends the rest would otherwise grow this without
+	 * bound, so it shares the in-flight cap and the stale eviction with the
+	 * partials, and its continuation chunks are held to the same framing
+	 * rules as a partial's (issue #710).
+	 */
+	private readonly discards = new Map<
+		number,
+		{ header: IGuardianBolt8FrameHeader; expected: number; startedAt: number }
+	>();
 	private readonly kind: 'request' | 'response';
 	private readonly maxBodyBytes: (requestId: number, verb: number) => number;
 	private readonly maxInFlight: number;
 	private readonly staleMs: number;
+	private readonly authenticate?: (auth: Buffer | undefined) => boolean;
 	private readonly clock: () => number;
 
 	constructor(options: IGuardianBolt8AssemblerOptions) {
@@ -394,11 +422,24 @@ export class GuardianBolt8Assembler {
 				: options.maxBodyBytes;
 		this.maxInFlight = options.maxInFlight ?? 64;
 		this.staleMs = options.staleMs ?? 120_000;
+		this.authenticate =
+			options.kind === 'request' ? options.authenticate : undefined;
 		this.clock = options.clock ?? ((): number => Date.now());
 	}
 
+	/** Partial bodies held. */
 	get inFlight(): number {
 		return this.partials.size;
+	}
+
+	/** Request ids whose remaining chunks are being swallowed. */
+	get discarding(): number {
+		return this.discards.size;
+	}
+
+	/** Everything retained for the session: what maxInFlight bounds. */
+	get retained(): number {
+		return this.partials.size + this.discards.size;
 	}
 
 	push(
@@ -414,14 +455,35 @@ export class GuardianBolt8Assembler {
 			if (this.partials.has(header.requestId)) {
 				fail('guardian frame restarts a request still in flight');
 			}
-			if (this.discarding.has(header.requestId)) {
+			if (this.discards.has(header.requestId)) {
 				fail('guardian frame restarts a request being discarded');
+			}
+			// Whatever this chunk 0 turns out to be, a multi-chunk request
+			// costs one retained entry until its last chunk arrives; the cap
+			// is on entries, not on the kind of entry.
+			const discardRest = (): void => {
+				if (header.chunkCount > 1) {
+					if (this.retained >= this.maxInFlight) {
+						fail('too many guardian requests in flight');
+					}
+					this.discards.set(header.requestId, {
+						header,
+						expected: 1,
+						startedAt: this.clock()
+					});
+				}
+			};
+			if (this.authenticate && !this.authenticate(frame.auth)) {
+				discardRest();
+				return {
+					kind: 'unauthorized',
+					requestId: header.requestId,
+					verb: header.verb
+				};
 			}
 			const cap = this.maxBodyBytes(header.requestId, header.verb);
 			if (header.totalLength > cap) {
-				if (header.chunkCount > 1) {
-					this.discarding.set(header.requestId, header.chunkCount - 1);
-				}
+				discardRest();
 				return {
 					kind: 'too-large',
 					requestId: header.requestId,
@@ -435,7 +497,7 @@ export class GuardianBolt8Assembler {
 				}
 				return { kind: 'complete', message: this.finish(frame, [frame.chunk]) };
 			}
-			if (this.partials.size >= this.maxInFlight) {
+			if (this.retained >= this.maxInFlight) {
 				fail('too many guardian requests in flight');
 			}
 			if (frame.chunk.length >= header.totalLength) {
@@ -452,10 +514,25 @@ export class GuardianBolt8Assembler {
 			return null;
 		}
 
-		const remaining = this.discarding.get(header.requestId);
-		if (remaining !== undefined) {
-			if (remaining <= 1) this.discarding.delete(header.requestId);
-			else this.discarding.set(header.requestId, remaining - 1);
+		const discard = this.discards.get(header.requestId);
+		if (discard !== undefined) {
+			// Swallowed, not trusted: a chunk that does not continue the
+			// refused request exactly is the same violation it would be on a
+			// request being assembled.
+			if (
+				header.chunkIndex !== discard.expected ||
+				header.chunkCount !== discard.header.chunkCount ||
+				header.totalLength !== discard.header.totalLength ||
+				header.verb !== discard.header.verb
+			) {
+				this.discards.delete(header.requestId);
+				fail('guardian frame out of order or inconsistent with its request');
+			}
+			if (header.chunkIndex === header.chunkCount - 1) {
+				this.discards.delete(header.requestId);
+			} else {
+				discard.expected++;
+			}
 			return null;
 		}
 		const partial = this.partials.get(header.requestId);
@@ -498,7 +575,7 @@ export class GuardianBolt8Assembler {
 		return null;
 	}
 
-	/** Drop partial messages older than staleMs; returns how many. */
+	/** Drop partials and discard entries older than staleMs; returns how many. */
 	evictStale(): number {
 		const cutoff = this.clock() - this.staleMs;
 		let dropped = 0;
@@ -508,12 +585,18 @@ export class GuardianBolt8Assembler {
 				dropped++;
 			}
 		}
+		for (const [id, discard] of this.discards) {
+			if (discard.startedAt < cutoff) {
+				this.discards.delete(id);
+				dropped++;
+			}
+		}
 		return dropped;
 	}
 
 	clear(): void {
 		this.partials.clear();
-		this.discarding.clear();
+		this.discards.clear();
 	}
 
 	private finish(
@@ -572,8 +655,17 @@ export interface IGuardianBolt8ResponderOptions {
 	/** Defaults to the guardian's advertised ciphertext limit plus envelope. */
 	maxBodyBytes?: number;
 	maxInFlight?: number;
+	/**
+	 * Consecutive refused credentials at which a session is dropped as a
+	 * violation (default 8): the first N minus 1 are answered 401, the Nth
+	 * drops the session instead. A peer without the credential gets its
+	 * 401s, a peer guessing one gets a reconnect and its backoff.
+	 */
+	maxUnauthorized?: number;
 	clock?: () => number;
 }
+
+export const GUARDIAN_BOLT8_DEFAULT_MAX_UNAUTHORIZED = 8;
 
 /** Constant-time check of the request auth against `Bearer <token>`. */
 export function bolt8BearerAuthenticator(
@@ -594,15 +686,17 @@ export function bolt8BearerAuthenticator(
  */
 export class GuardianBolt8Responder {
 	private readonly resolver: IGuardianResolver;
-	private readonly authenticate?: (auth: Buffer | undefined) => boolean;
 	private readonly assembler: GuardianBolt8Assembler;
+	private readonly maxUnauthorized: number;
+	private unauthorizedRun = 0;
 
 	constructor(options: IGuardianBolt8ResponderOptions) {
 		this.resolver =
 			options.guardian instanceof ReferenceGuardian
 				? singleGuardianResolver(options.guardian)
 				: options.guardian;
-		this.authenticate = options.authenticate;
+		// The credential is checked by the assembler on chunk 0, before a
+		// body is buffered for the request (issue #710).
 		this.assembler = new GuardianBolt8Assembler({
 			kind: 'request',
 			maxBodyBytes:
@@ -610,13 +704,43 @@ export class GuardianBolt8Responder {
 				this.resolver.info().maxCiphertextBytes +
 					GUARDIAN_ENVELOPE_ALLOWANCE_BYTES,
 			maxInFlight: options.maxInFlight,
+			authenticate: options.authenticate,
 			clock: options.clock
 		});
+		this.maxUnauthorized =
+			options.maxUnauthorized ?? GUARDIAN_BOLT8_DEFAULT_MAX_UNAUTHORIZED;
+	}
+
+	/** Partial request bodies held for this session. */
+	get inFlight(): number {
+		return this.assembler.inFlight;
+	}
+
+	/** Refused request ids whose remaining chunks are being swallowed. */
+	get discarding(): number {
+		return this.assembler.discarding;
 	}
 
 	handle(payload: Buffer): Buffer[] {
 		const result = this.assembler.push(payload);
 		if (result === null) return [];
+		if (result.kind === 'unauthorized') {
+			if (++this.unauthorizedRun >= this.maxUnauthorized) {
+				this.assembler.clear();
+				throw new GuardianBolt8FrameError(
+					`${this.unauthorizedRun} consecutive refused credentials`,
+					result.requestId,
+					result.verb
+				);
+			}
+			return encodeGuardianBolt8Response({
+				requestId: result.requestId,
+				verb: result.verb,
+				status: GuardianBolt8Status.UNAUTHORIZED,
+				body: Buffer.alloc(0)
+			});
+		}
+		this.unauthorizedRun = 0;
 		if (result.kind === 'too-large') {
 			return encodeGuardianBolt8Response({
 				requestId: result.requestId,
@@ -633,9 +757,6 @@ export class GuardianBolt8Responder {
 				status,
 				body
 			});
-		if (this.authenticate && !this.authenticate(request.auth)) {
-			return answer(GuardianBolt8Status.UNAUTHORIZED, Buffer.alloc(0));
-		}
 		const name = guardianBolt8VerbName(request.verb);
 		if (name === null) {
 			return answer(GuardianBolt8Status.NOT_FOUND, Buffer.alloc(0));
@@ -942,6 +1063,8 @@ export class Bolt8GuardianSession {
 			);
 			return;
 		}
+		// The response side has no authenticator, so only completion is left.
+		if (result.kind !== 'complete') return;
 		const response = result.message as IGuardianBolt8Response;
 		const entry = this.pending.get(response.requestId);
 		if (!entry) return;

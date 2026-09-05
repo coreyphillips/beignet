@@ -72,32 +72,64 @@ export function isGuardianVerbName(verb: string): verb is GuardianVerbName {
 // Each verb pairs its decoder, its core handler, and its encoder; a body
 // that fails to decode is a protocol-level ERR_MALFORMED inside a successful
 // exchange, exactly like any other protocol rejection (wire 2.5, section 7).
+/** A verb's protocol status alongside its encoded answer. */
+export interface IGuardianVerbOutcome {
+	status: GuardianStatus;
+	body: Buffer;
+}
+
+const outcome = <T extends { status: GuardianStatus }>(
+	response: T,
+	encode: (response: T) => Buffer
+): IGuardianVerbOutcome => ({
+	status: response.status,
+	body: encode(response)
+});
+
 const VERB_HANDLERS: Record<
 	GuardianVerbName,
-	(guardian: ReferenceGuardian, body: Buffer) => Buffer
+	(guardian: ReferenceGuardian, body: Buffer) => IGuardianVerbOutcome
 > = {
 	register_node: (guardian, body) =>
-		encodeRegisterNodeResponse(
-			guardian.register(decodeRegisterNodeRequest(body))
+		outcome(
+			guardian.register(decodeRegisterNodeRequest(body)),
+			encodeRegisterNodeResponse
 		),
 	put_state: (guardian, body) =>
-		encodePutStateResponse(guardian.putState(decodePutStateRequest(body))),
+		outcome(
+			guardian.putState(decodePutStateRequest(body)),
+			encodePutStateResponse
+		),
 	get_head: (guardian, body) =>
-		encodeGetHeadResponse(guardian.getHead(decodeGetHeadRequest(body))),
+		outcome(
+			guardian.getHead(decodeGetHeadRequest(body)),
+			encodeGetHeadResponse
+		),
 	get_state: (guardian, body) =>
-		encodeGetStateResponse(guardian.getState(decodeGetStateRequest(body))),
+		outcome(
+			guardian.getState(decodeGetStateRequest(body)),
+			encodeGetStateResponse
+		),
 	acquire_epoch: (guardian, body) =>
-		encodeAcquireEpochResponse(
-			guardian.acquireEpoch(decodeAcquireEpochRequest(body))
+		outcome(
+			guardian.acquireEpoch(decodeAcquireEpochRequest(body)),
+			encodeAcquireEpochResponse
 		),
 	sync_record: (guardian, body) =>
-		encodeSyncRecordResponse(
-			guardian.syncRecord(decodeSyncRecordRequest(body))
+		outcome(
+			guardian.syncRecord(decodeSyncRecordRequest(body)),
+			encodeSyncRecordResponse
 		),
 	sync_epoch: (guardian, body) =>
-		encodeSyncEpochResponse(guardian.syncEpoch(decodeSyncEpochRequest(body))),
+		outcome(
+			guardian.syncEpoch(decodeSyncEpochRequest(body)),
+			encodeSyncEpochResponse
+		),
 	rotate_set: (guardian, body) =>
-		encodeRotateSetResponse(guardian.rotateSet(decodeRotateSetRequest(body)))
+		outcome(
+			guardian.rotateSet(decodeRotateSetRequest(body)),
+			encodeRotateSetResponse
+		)
 };
 
 const REFUSAL_FOR: Record<
@@ -143,13 +175,27 @@ export function dispatchGuardianVerb(
 	verb: GuardianVerbName,
 	body: Buffer
 ): Buffer {
+	return runGuardianVerb(guardian, verb, body).body;
+}
+
+/**
+ * dispatchGuardianVerb with the protocol status alongside the bytes, for a
+ * dispatcher that accounts for what the verb did (a host charging a byte
+ * quota only when the write was accepted, guardian-host.ts).
+ */
+export function runGuardianVerb(
+	guardian: ReferenceGuardian,
+	verb: GuardianVerbName,
+	body: Buffer
+): IGuardianVerbOutcome {
 	try {
 		return VERB_HANDLERS[verb](guardian, body);
 	} catch {
-		return REFUSAL_FOR[verb](
-			GuardianStatus.ERR_MALFORMED,
-			'undecodable request body'
-		);
+		const status = GuardianStatus.ERR_MALFORMED;
+		return {
+			status,
+			body: REFUSAL_FOR[verb](status, 'undecodable request body')
+		};
 	}
 }
 

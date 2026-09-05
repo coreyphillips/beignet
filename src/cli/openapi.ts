@@ -1776,7 +1776,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/guardian/status': {
 				get: {
 					summary:
-						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off; otherwise the guardian id, whether a bearer token is required, open sessions, every served set (id, members, namespaces, bytes on disk, registeredAt) and the limits (per-record ciphertext, bytes per set, sets). Independent of this node's own recovery mode",
+						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off; otherwise the guardian id, whether a bearer token is required, open sessions, requests retained in flight, every served set (id, members, namespaces, bytes stored and on disk, registeredAt), the bytes stored across sets, and the limits (per-record ciphertext, bytes per set, sets). Independent of this node's own recovery mode",
 					tags: ['Node'],
 					responses: {
 						'200': {
