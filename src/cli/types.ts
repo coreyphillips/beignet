@@ -686,6 +686,25 @@ export interface BeignetConfig {
 	 *  hold, which is the window this automation exists to beat. Env:
 	 *  BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS. */
 	recoveryAutoApplyMaxWaitMs?: number;
+	/** FFOR settlement peer (issue #729): answer ff_init as S. Off by
+	 *  default: being a settlement peer locks liquidity for the whole epoch.
+	 *  Env: BEIGNET_FFOR_SETTLE (exact true/false), with
+	 *  BEIGNET_FFOR_MAX_BUDGET_MSAT, BEIGNET_FFOR_MAX_EPOCH_BLOCKS,
+	 *  BEIGNET_FFOR_FEE_BASE_MSAT and BEIGNET_FFOR_FEE_PPM as the terms floor. */
+	fforSettle?: {
+		enabled: boolean;
+		maxBudgetMsat?: string | number;
+		maxEpochBlocks?: number;
+		feeBaseMsat?: number;
+		feePpm?: number;
+	};
+	/** FFOR receipt witness (spec section 9.6). Env: BEIGNET_FFOR_WITNESS
+	 *  (exact true/false), BEIGNET_FFOR_WITNESS_MAX_MAILBOXES,
+	 *  BEIGNET_FFOR_WITNESS_MAX_BYTES. */
+	fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number };
+	/** FFOR BOLT 12 issuer (spec section 9.7); needs the witness. Env:
+	 *  BEIGNET_FFOR_ISSUER (exact true/false). */
+	fforIssuer?: boolean;
 	/** Serve the reference guardian to other nodes over bolt8 sessions at
 	 *  this node's Lightning address (docs/RECOVERY-GUARDIAN-WIRE.md 2.7,
 	 *  issue #699). Needs listenPort. Independent of this node's own

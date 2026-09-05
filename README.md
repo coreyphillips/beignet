@@ -477,6 +477,26 @@ curl http://localhost:2112/ready                                        # load-b
 - `GET /health`, `/ready`, `/openapi.json` and `/metrics` are auth-exempt; everything else requires the bearer token **when one is configured**. Auth is off unless you set `apiToken` or `apiKeys` (named keys with `readonly`/`invoice`/`admin` scopes), so configure a token before exposing the daemon anywhere. It binds `127.0.0.1` by default.
 - Embed it instead of shelling out: `import { startDaemon } from 'beignet/cli'`.
 
+### FFOR offline receive
+
+Fast-Forward Offline Receive (spec: github.com/coreyphillips/ffor, Variant D) lets a
+wallet receive while offline through a settlement peer that holds a pre-signed
+voucher book. The daemon exposes the receiver's lifecycle under `/ffor/*`
+(`/ffor/epoch/start`, `/ffor/invoice`, `/ffor/epoch/close`, `/ffor/preimage`,
+`/ffor/witness/provision`, `/ffor/issuer/offer`, `/ffor/issuer/provision`,
+`/ffor/recover`, `/ffor/enforce`, `/ffor/epochs`, `/ffor/epoch`) and three roles a
+node can run for others, each an explicit opt-in switched on with an exact
+`true`:
+
+| Env | Role |
+|---|---|
+| `BEIGNET_FFOR_SETTLE` | Answer `ff_init` as a settlement peer. `BEIGNET_FFOR_MAX_BUDGET_MSAT`, `BEIGNET_FFOR_MAX_EPOCH_BLOCKS`, `BEIGNET_FFOR_FEE_BASE_MSAT` and `BEIGNET_FFOR_FEE_PPM` bound what it accepts. Off by default: an epoch locks the whole budget of this node's liquidity. `GET /ffor/settlements` lists them. |
+| `BEIGNET_FFOR_WITNESS` | Store a receiver-encrypted record of every delegated preimage this node relays before propagating the fulfil (a receipt witness). `BEIGNET_FFOR_WITNESS_MAX_MAILBOXES` and `BEIGNET_FFOR_WITNESS_MAX_BYTES` cap it. `GET /ffor/witness/status`. |
+| `BEIGNET_FFOR_ISSUER` | Answer BOLT 12 invoice requests for offers a receiver delegated to this node, one fixed-amount slot per invoice. Needs the witness. `GET /ffor/issuer/status`. |
+
+The SSE stream carries `ffor:state`, `ffor:settled`, `ffor:delegated-failed`,
+`ffor:enforce` and the witness and issuer events.
+
 ## Protocol layer (advanced)
 
 Use this only if you need the BOLT layer directly: bigint msat, Buffer IDs, raw wire messages. `beignet/lightning` exports **namespaces**, not flat symbols.

@@ -1679,6 +1679,220 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/ffor/epochs': {
+				get: {
+					summary:
+						'FFOR offline receive (spec Fast-Forward Offline Receive, Variant D): every epoch this node is part of, as receiver (R) or settlement peer (S), with per-slot state. A 404 means the daemon predates the feature',
+					tags: ['FFOR'],
+					responses: {
+						'200': {
+							description:
+								'Array of epoch records: channelId, role, state (NEGOTIATING, VOUCHERS_COMMITTED, ACTIVATING, ACTIVE, DRAINING, CLOSED, ABORTED), epochId, terms, epochStartHeight, activationHash, slots [{ k, amountMsat, paymentHash, state: unissued | exposed | settled | unsettled | settling | unused }], witnesses, settledBitmap, abortReason, activationMismatch'
+						}
+					}
+				}
+			},
+			'/ffor/settlements': {
+				get: {
+					summary: 'The epochs this node settles for others (role S)',
+					tags: ['FFOR'],
+					responses: { '200': { description: 'Array of S-role epoch records' } }
+				}
+			},
+			'/ffor/epoch': {
+				get: {
+					summary: 'One epoch record by channelId',
+					tags: ['FFOR'],
+					parameters: [
+						{
+							name: 'channelId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': { description: 'The epoch record' },
+						'404': { description: 'No channel, or no epoch on it' }
+					}
+				}
+			},
+			'/ffor/epoch/start': {
+				post: {
+					summary:
+						'R: start a Variant D epoch on a channel whose peer is a settlement peer. The book is voucherAmountsMsat in slot order; settlementDeadline (D) and voucherExpiry (T_exp) are absolute heights; the fee terms are what S may charge per payment; hashChain asks for chained vouchers (uniform amounts); witnessPeers names the receipt witnesses delegated payments must arrive through. Setup runs to ACTIVE on its own; watch ffor:state or poll /ffor/epoch. Locks the whole budget of S liquidity for the epoch',
+					tags: ['FFOR'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						voucherAmountsMsat: 'string[]',
+						settlementDeadline: 'number',
+						voucherExpiry: 'number',
+						feeBaseMsat: 'number',
+						feeProportionalMillionths: 'number',
+						hashChain: 'boolean',
+						witnessPeers: 'string[]'
+					}),
+					responses: {
+						'200': { description: 'The epoch record, NEGOTIATING' },
+						'400': {
+							description:
+								'Invalid parameters, or FFOR_REFUSED with the reason (book bounds, peer without the feature, a live epoch)'
+						},
+						'404': { description: 'Channel not found' }
+					}
+				}
+			},
+			'/ffor/invoice': {
+				post: {
+					summary:
+						"R: the fixed-amount BOLT 11 invoice for slot k, payable while R is offline: amount exactly d_k, payment hash H_k, a route hint naming S with the epoch's fee terms. Only while ACTIVE, before the settlement deadline, once per slot, in ascending order on a chained book, and only after every provisioned witness has acknowledged",
+					tags: ['FFOR'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						k: 'number',
+						description: 'string'
+					}),
+					responses: {
+						'200': { description: 'bolt11, paymentHash, k, amountMsat' },
+						'400': { description: 'FFOR_REFUSED with the reason' }
+					}
+				}
+			},
+			'/ffor/epoch/close': {
+				post: {
+					summary:
+						'R, back online: send ff_close; the ack carries the settled bitmap and preimages and the drain fulfils settled slots and fails the rest. The epoch reads CLOSED once no voucher remains',
+					tags: ['FFOR'],
+					requestBody: bodyContent({ channelId: 'string' }),
+					responses: {
+						'200': { description: 'The epoch record' },
+						'400': { description: 'FFOR_REFUSED' }
+					}
+				}
+			},
+			'/ffor/epoch/abort': {
+				post: {
+					summary:
+						'Either side, before ACTIVE: abort the setup (reason defaults to operator)',
+					tags: ['FFOR'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						reason: 'number',
+						text: 'string'
+					}),
+					responses: {
+						'200': { description: 'The epoch record' },
+						'400': { description: 'FFOR_REFUSED' }
+					}
+				}
+			},
+			'/ffor/preimage': {
+				post: {
+					summary:
+						"R: credit a voucher preimage learned outside the ack (a payer's receipt, a witness record). Recorded for the chain monitors, so the voucher is claimable on-chain from either commitment view",
+					tags: ['FFOR'],
+					requestBody: bodyContent({ channelId: 'string', preimage: 'string' }),
+					responses: {
+						'200': { description: 'The epoch record' },
+						'400': { description: 'Not a preimage of this book' }
+					}
+				}
+			},
+			'/ffor/witness/provision': {
+				post: {
+					summary:
+						'R, while ACTIVE and before exposing any invoice: provision a receipt witness (spec section 9.6). Fresh fetch and encryption keys and a mailbox id are persisted on the epoch before the manifest leaves; a refused witness is never counted. Until the witness acknowledges, /ffor/invoice refuses',
+					tags: ['FFOR'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						witnessNodeId: 'string',
+						retentionUntil: 'number',
+						minReceipts: 'number'
+					}),
+					responses: {
+						'200': { description: 'mailboxId, retentionUntil' },
+						'400': {
+							description: 'FFOR_REFUSED: the witness refused or did not answer'
+						}
+					}
+				}
+			},
+			'/ffor/issuer/offer': {
+				post: {
+					summary:
+						'R: a BOLT 12 offer for unknown payers whose invoices the issuer answers (spec section 9.7): no offer_issuer_id, one message path terminating at the issuer, optionally a unit amount and quantityMax for the slot grid. A stock payer sees an ordinary offer',
+					tags: ['FFOR'],
+					requestBody: bodyContent({
+						issuerNodeId: 'string',
+						description: 'string',
+						amountMsat: 'string',
+						quantityMax: 'number'
+					}),
+					responses: { '200': { description: 'offerId and the encoded offer' } }
+				}
+			},
+			'/ffor/issuer/provision': {
+				post: {
+					summary:
+						"R: hand the issuer its manifest for an ACTIVE epoch it already witnesses: the offer, the payment-path template (the witness hops named here, then S with the epoch's fee terms, then R), issueUntil, and R's attestation. Returns the blinded node ids the issuer confirmed it controls",
+					tags: ['FFOR'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						issuerNodeId: 'string',
+						offer: 'string',
+						witnessHops: 'object[]',
+						issueUntil: 'number'
+					}),
+					responses: {
+						'200': { description: 'mailboxId, blindedNodeIds' },
+						'400': { description: 'FFOR_REFUSED' }
+					}
+				}
+			},
+			'/ffor/recover': {
+				post: {
+					summary:
+						'R, back online: fetch every provisioned witness, credit each record that verifies, then close the epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done',
+					tags: ['FFOR'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						forceCloseIfUnreachable: 'boolean'
+					}),
+					responses: {
+						'200': {
+							description:
+								'action (closed | force-closed | nothing), preimagesKnown, per-witness results, the epoch record'
+						}
+					}
+				}
+			},
+			'/ffor/enforce': {
+				post: {
+					summary:
+						'R: force-close the channel carrying every known preimage; each settled voucher claims through its setup-time HTLC-success signature. The remedy when S will not answer ff_close or contradicted the epoch',
+					tags: ['FFOR'],
+					requestBody: bodyContent({ channelId: 'string' }),
+					responses: {
+						'200': { description: 'ok, commitmentTxid, preimagesKnown' }
+					}
+				}
+			},
+			'/ffor/witness/status': {
+				get: {
+					summary:
+						'The receipt witness this node runs (BEIGNET_FFOR_WITNESS): every mailbox with its state, slots, records and retention',
+					tags: ['FFOR'],
+					responses: { '200': { description: 'enabled and mailboxes' } }
+				}
+			},
+			'/ffor/issuer/status': {
+				get: {
+					summary:
+						'The BOLT 12 issuer this node runs (BEIGNET_FFOR_ISSUER): every manifest with its offer id, state, issued slots and issue_until',
+					tags: ['FFOR'],
+					responses: { '200': { description: 'enabled and manifests' } }
+				}
+			},
 			'/recovery/status': {
 				get: {
 					summary:

@@ -493,7 +493,20 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'direct-funding:offer:accepted',
 		'direct-funding:offer:declined',
 		'direct-funding:offer:failed',
-		'direct-funding:offer:completed'
+		'direct-funding:offer:completed',
+		// FFOR offline receive (issue #729): the epoch's committed state
+		// changes, a delegated settlement or its refusal on the settlement
+		// peer, a peer contradicting an ACTIVE epoch (enforce on-chain), and
+		// the witness and issuer roles' events.
+		'ffor:state',
+		'ffor:settled',
+		'ffor:delegated-failed',
+		'ffor:enforce',
+		'ffor:witness-provisioned',
+		'ffor:witness-recorded',
+		'ffor:witness-released',
+		'ffor:issuer-provisioned',
+		'ffor:issuer-issued'
 	];
 	if (htlcEvents === true) {
 		events.push('htlc:forwarded', 'htlc:fulfilled', 'htlc:failed');
@@ -783,6 +796,26 @@ async function bootDaemon(
 		throw new BeignetError(
 			'INVALID_PARAMS',
 			'guardianServe must be a boolean (BEIGNET_GUARDIAN_SERVE is exactly true or false)'
+		);
+	}
+	// FFOR roles (issue #729): exact booleans, and the issuer needs the
+	// witness it is co-hosted with (spec section 9.7.1).
+	for (const [name, v] of [
+		['fforSettle.enabled', opts.fforSettle?.enabled],
+		['fforWitness.enabled', opts.fforWitness?.enabled],
+		['fforIssuer', opts.fforIssuer]
+	] as const) {
+		if (v !== undefined && typeof v !== 'boolean') {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`${name} must be a boolean (the BEIGNET_FFOR_* switches are exactly true or false)`
+			);
+		}
+	}
+	if (opts.fforIssuer === true && opts.fforWitness?.enabled !== true) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'fforIssuer needs fforWitness: the issuer is co-hosted with the first receipt witness (BEIGNET_FFOR_WITNESS=true)'
 		);
 	}
 	if (opts.guardianServe === true && !opts.listenPort) {
@@ -2508,6 +2541,66 @@ async function bootDaemon(
 		// ── Guardian Recovery (docs/RECOVERY-PROTOCOL.md section 8) ──
 		// Distinct from the SCB flows above: an SCB restore force-closes every
 		// channel; a guardian restore RESUMES them from replicated state.
+		// FFOR offline receive (issue #729): the receiver's epoch lifecycle,
+		// and the settlement, witness and issuer roles this node runs.
+		'GET /ffor/epochs': () => success(node.fforEpochs()),
+		'GET /ffor/settlements': () => success(node.fforEpochs('S')),
+		'GET /ffor/epoch': (body, query) => {
+			const channelId =
+				query.get('channelId') || (body as { channelId?: string }).channelId;
+			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
+			return success(node.fforEpoch(channelId));
+		},
+		'POST /ffor/epoch/start': (body) =>
+			success(
+				node.fforStartEpoch(body as Parameters<typeof node.fforStartEpoch>[0])
+			),
+		'POST /ffor/invoice': (body) =>
+			success(
+				node.fforCreateInvoice(
+					body as Parameters<typeof node.fforCreateInvoice>[0]
+				)
+			),
+		'POST /ffor/epoch/close': (body) => {
+			const { channelId } = body as { channelId?: string };
+			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
+			return success(node.fforCloseEpoch(channelId));
+		},
+		'POST /ffor/epoch/abort': (body) =>
+			success(
+				node.fforAbortEpoch(body as Parameters<typeof node.fforAbortEpoch>[0])
+			),
+		'POST /ffor/preimage': (body) =>
+			success(
+				node.fforAddPreimage(body as Parameters<typeof node.fforAddPreimage>[0])
+			),
+		'POST /ffor/witness/provision': async (body) =>
+			success(
+				await node.fforProvisionWitness(
+					body as Parameters<typeof node.fforProvisionWitness>[0]
+				)
+			),
+		'POST /ffor/issuer/offer': (body) =>
+			success(
+				node.fforIssuerOffer(body as Parameters<typeof node.fforIssuerOffer>[0])
+			),
+		'POST /ffor/issuer/provision': async (body) =>
+			success(
+				await node.fforProvisionIssuer(
+					body as Parameters<typeof node.fforProvisionIssuer>[0]
+				)
+			),
+		'POST /ffor/recover': async (body) =>
+			success(
+				await node.fforRecover(body as Parameters<typeof node.fforRecover>[0])
+			),
+		'POST /ffor/enforce': (body) => {
+			const { channelId } = body as { channelId?: string };
+			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
+			return success(node.fforEnforce(channelId));
+		},
+		'GET /ffor/witness/status': () => success(node.fforWitnessStatus()),
+		'GET /ffor/issuer/status': () => success(node.fforIssuerStatus()),
 		'GET /recovery/status': () => success(node.getRecoverySurfaceStatus()),
 		// The guardian this node serves to OTHER nodes (issue #699), and the
 		// resolver that turns a beignet node's Lightning URI into a guardian

@@ -320,6 +320,12 @@ export interface INodeConfig {
 	 * witness, whose mailbox holds the book). Disabled by default.
 	 */
 	fforIssuer?: import('../ffor/issuer-service').IFforIssuerConfig;
+	/**
+	 * Whether this node answers ff_init as a settlement peer, and on what
+	 * terms (issue #729). Absent answers on any terms (the library default);
+	 * a daemon passes `enabled: false` unless its operator opted in.
+	 */
+	fforSettle?: import('../ffor/types').IFforSettlePolicy;
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
 	/** Resource management config */

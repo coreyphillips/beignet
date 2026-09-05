@@ -457,6 +457,44 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			cliFlags.recoveryAutoApplyMaxWaitMs ??
 			integerEnv(process.env.BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS) ??
 			file.recoveryAutoApplyMaxWaitMs,
+		// FFOR roles (issue #729): exact true/false, like the guardian flag,
+		// because each one changes what this node promises other nodes.
+		fforSettle:
+			cliFlags.fforSettle ??
+			(process.env.BEIGNET_FFOR_SETTLE === 'true' ||
+			process.env.BEIGNET_FFOR_SETTLE === 'false'
+				? {
+						enabled: process.env.BEIGNET_FFOR_SETTLE === 'true',
+						maxBudgetMsat: process.env.BEIGNET_FFOR_MAX_BUDGET_MSAT,
+						maxEpochBlocks: integerEnv(
+							process.env.BEIGNET_FFOR_MAX_EPOCH_BLOCKS
+						),
+						feeBaseMsat: integerEnv(process.env.BEIGNET_FFOR_FEE_BASE_MSAT),
+						feePpm: integerEnv(process.env.BEIGNET_FFOR_FEE_PPM)
+				  }
+				: undefined) ??
+			file.fforSettle,
+		fforWitness:
+			cliFlags.fforWitness ??
+			(process.env.BEIGNET_FFOR_WITNESS === 'true' ||
+			process.env.BEIGNET_FFOR_WITNESS === 'false'
+				? {
+						enabled: process.env.BEIGNET_FFOR_WITNESS === 'true',
+						maxMailboxes: integerEnv(
+							process.env.BEIGNET_FFOR_WITNESS_MAX_MAILBOXES
+						),
+						maxBytes: integerEnv(process.env.BEIGNET_FFOR_WITNESS_MAX_BYTES)
+				  }
+				: undefined) ??
+			file.fforWitness,
+		fforIssuer:
+			cliFlags.fforIssuer ??
+			(process.env.BEIGNET_FFOR_ISSUER === 'true'
+				? true
+				: process.env.BEIGNET_FFOR_ISSUER === 'false'
+				? false
+				: undefined) ??
+			file.fforIssuer,
 		// Guardian hosting (issue #699): exact true/false, like auto-apply.
 		guardianServe:
 			cliFlags.guardianServe ??
