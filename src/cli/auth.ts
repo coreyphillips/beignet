@@ -149,6 +149,25 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'GET /queue': ['readonly'],
 	// Recovery Protocol status: diagnostics, like /channel/diagnostics.
 	'GET /recovery/status': ['readonly'],
+	// FFOR offline receive (issue #729). Reads are read-only; a slot invoice
+	// is an invoice; everything that starts, closes, credits or enforces an
+	// epoch moves this node's liquidity or its on-chain position and takes
+	// the full key, like a force close.
+	'GET /ffor/epochs': ['readonly'],
+	'GET /ffor/settlements': ['readonly'],
+	'GET /ffor/epoch': ['readonly'],
+	'GET /ffor/witness/status': ['readonly'],
+	'GET /ffor/issuer/status': ['readonly'],
+	'POST /ffor/invoice': ['invoice'],
+	'POST /ffor/epoch/start': [],
+	'POST /ffor/epoch/close': [],
+	'POST /ffor/epoch/abort': [],
+	'POST /ffor/preimage': [],
+	'POST /ffor/witness/provision': [],
+	'POST /ffor/issuer/offer': ['invoice'],
+	'POST /ffor/issuer/provision': [],
+	'POST /ffor/recover': [],
+	'POST /ffor/enforce': [],
 	// The guardian this node serves to others (issue #699).
 	'GET /guardian/status': ['readonly'],
 

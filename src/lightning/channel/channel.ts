@@ -20540,6 +20540,48 @@ export class Channel {
 				'ff_init TLV 9 is required in Variant D'
 			);
 		}
+		// The host's settlement policy: whether this node is an S at all, and
+		// the budget, epoch length and fee floors it offers (issue #729).
+		const policy = ctx.settlePolicy;
+		if (policy) {
+			if (!policy.enabled) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					'settlement service not offered by this peer'
+				);
+			}
+			if (
+				policy.maxBudgetMsat !== undefined &&
+				msg.budgetMsat > policy.maxBudgetMsat
+			) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					`budget ${msg.budgetMsat} msat exceeds this peer's maximum ${policy.maxBudgetMsat}`
+				);
+			}
+			if (
+				policy.maxEpochBlocks !== undefined &&
+				msg.voucherExpiry - this._currentBlockHeight > policy.maxEpochBlocks
+			) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					`epoch of ${
+						msg.voucherExpiry - this._currentBlockHeight
+					} blocks exceeds this peer's maximum ${policy.maxEpochBlocks}`
+				);
+			}
+			if (
+				(policy.minFeeBaseMsat !== undefined &&
+					msg.feeBaseMsat < policy.minFeeBaseMsat) ||
+				(policy.minFeeProportionalMillionths !== undefined &&
+					msg.feeProportionalMillionths < policy.minFeeProportionalMillionths)
+			) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					"fee terms are below this peer's floor"
+				);
+			}
+		}
 		const params: IFforEpochParams = {
 			variant: msg.variant,
 			budgetMsat: msg.budgetMsat,

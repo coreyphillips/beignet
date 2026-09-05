@@ -35,6 +35,14 @@ import { createWalletStorage } from './wallet-storage';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
 import {
+	FforAbortReason,
+	FforSlotState,
+	FforState,
+	IFforEpochRecord
+} from '../lightning/ffor/types';
+import { bitmapGet } from '../lightning/ffor/messages';
+import { IOffer } from '../lightning/offer/types';
+import {
 	estimateSpliceTxWeight,
 	spliceFeeSats
 } from '../lightning/channel/splice-weight';
@@ -480,6 +488,16 @@ export interface BeignetNodeOptions {
 	 * writer lease is quarantined (the guardian-only lane).
 	 */
 	guardianServe?: boolean;
+	/** FFOR settlement peer, witness and issuer roles (issue #729). */
+	fforSettle?: {
+		enabled: boolean;
+		maxBudgetMsat?: string | number;
+		maxEpochBlocks?: number;
+		feeBaseMsat?: number;
+		feePpm?: number;
+	};
+	fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number };
+	fforIssuer?: boolean;
 	/** Bearer token every guardian session must present; absent runs open. */
 	guardianToken?: string;
 	/** Disk one served set may occupy before writes are refused (256 MiB). */
@@ -2175,6 +2193,39 @@ export class BeignetNode extends EventEmitter {
 			forwardingFeePropMillionths: opts.routingFeePpm,
 			forwardingCltvDelta: opts.routingCltvDelta,
 			leaseRates: opts.leaseRates,
+			// FFOR roles (issue #729). Settlement is an explicit opt-in: a
+			// daemon that was not told to answers no ff_init, whatever the
+			// feature bit says. The witness and the issuer are services this
+			// node runs for others and are off unless switched on.
+			fforSettle: {
+				enabled: opts.fforSettle?.enabled === true,
+				...(opts.fforSettle?.maxBudgetMsat !== undefined
+					? { maxBudgetMsat: BigInt(opts.fforSettle.maxBudgetMsat) }
+					: {}),
+				...(opts.fforSettle?.maxEpochBlocks !== undefined
+					? { maxEpochBlocks: opts.fforSettle.maxEpochBlocks }
+					: {}),
+				...(opts.fforSettle?.feeBaseMsat !== undefined
+					? { minFeeBaseMsat: opts.fforSettle.feeBaseMsat }
+					: {}),
+				...(opts.fforSettle?.feePpm !== undefined
+					? { minFeeProportionalMillionths: opts.fforSettle.feePpm }
+					: {})
+			},
+			...(opts.fforWitness?.enabled === true
+				? {
+						fforWitness: {
+							enabled: true,
+							...(opts.fforWitness.maxMailboxes !== undefined
+								? { maxMailboxes: opts.fforWitness.maxMailboxes }
+								: {}),
+							...(opts.fforWitness.maxBytes !== undefined
+								? { maxBytes: opts.fforWitness.maxBytes }
+								: {})
+						}
+				  }
+				: {}),
+			...(opts.fforIssuer === true ? { fforIssuer: { enabled: true } } : {}),
 			// The LSP engine only exists when explicitly switched on; the client
 			// ceilings apply either way, because asking an LSP for a JIT receive
 			// is not the same role as being one.
@@ -2618,12 +2669,42 @@ export class BeignetNode extends EventEmitter {
 			'direct-funding:offer:accepted',
 			'direct-funding:offer:declined',
 			'direct-funding:offer:failed',
-			'direct-funding:offer:completed'
+			'direct-funding:offer:completed',
+			'ffor:settled',
+			'ffor:delegated-failed',
+			'ffor:witness-provisioned',
+			'ffor:witness-recorded',
+			'ffor:witness-released',
+			'ffor:issuer-provisioned',
+			'ffor:issuer-issued'
 		] as const) {
 			this.node.on(evt, (data: unknown) => {
 				this.emit(evt, jsonSafeEvent(data) as never);
 			});
 		}
+		// The two FFOR events with several arguments (issue #729): the epoch's
+		// committed state and a peer contradicting an ACTIVE epoch.
+		this.node.on(
+			'ffor:state',
+			(channelId: Buffer, state: number, record: IFforEpochRecord) => {
+				const hex = channelId.toString('hex');
+				this.emit('ffor:state', {
+					channelId: hex,
+					state: FforState[state] ?? String(state),
+					epoch: this.fforEpochView(hex, record)
+				});
+			}
+		);
+		this.node.on(
+			'ffor:enforce',
+			(channelId: Buffer, record: IFforEpochRecord) => {
+				const hex = channelId.toString('hex');
+				this.emit('ffor:enforce', {
+					channelId: hex,
+					epoch: this.fforEpochView(hex, record)
+				});
+			}
+		);
 
 		// Recovery Protocol events (docs/RECOVERY-PROTOCOL.md section 8),
 		// relayed with JSON-safe payloads. recovery:guardian_unreachable and
@@ -6369,6 +6450,483 @@ export class BeignetNode extends EventEmitter {
 			this.resolveCurrentWalletAddressScript().catch(() => undefined),
 			this._closeAddressLookupTimeoutMs
 		);
+	}
+
+	// ─────────────── FFOR: offline receive (issue #729) ───────────────
+
+	private fforChannelId(channelId: unknown): Buffer {
+		if (typeof channelId !== 'string' || !/^[0-9a-fA-F]{64}$/.test(channelId)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'channelId must be 64 hex characters'
+			);
+		}
+		const idBuf = Buffer.from(channelId, 'hex');
+		if (!this.node.getChannel(idBuf)) {
+			throw new BeignetError(
+				BeignetErrorCode.CHANNEL_NOT_FOUND,
+				`Channel not found: ${idBuf.toString('hex')}`
+			);
+		}
+		return idBuf;
+	}
+
+	/** The JSON view of one epoch record, every bigint a string, every buffer hex. */
+	private fforEpochView(
+		channelIdHex: string,
+		f: IFforEpochRecord
+	): Record<string, unknown> {
+		const K = f.params.maxPayments;
+		const settledBit = (k: number): boolean =>
+			f.settledBitmap !== null && bitmapGet(f.settledBitmap, k);
+		const slots = Array.from({ length: K }, (_, i) => {
+			const k = i + 1;
+			let state: string;
+			if (f.role === 'S') {
+				state =
+					f.slotStates[i] === FforSlotState.SETTLED
+						? 'settled'
+						: f.slotStates[i] === FforSlotState.SETTLING
+						? 'settling'
+						: 'unused';
+			} else if (f.knownPreimages[i] || settledBit(k)) {
+				state = 'settled';
+			} else if (f.settledBitmap !== null) {
+				state = 'unsettled';
+			} else if (f.exposedSlots[i]) {
+				state = 'exposed';
+			} else {
+				state = 'unissued';
+			}
+			return {
+				k,
+				amountMsat: f.params.voucherAmountsMsat[i].toString(),
+				paymentHash: f.paymentHashes[i]?.toString('hex') ?? null,
+				state
+			};
+		});
+		return {
+			channelId: channelIdHex,
+			role: f.role,
+			state: FforState[f.state],
+			epochId: f.epochId.toString('hex'),
+			peerNodeId: f.remoteNodeId.toString('hex'),
+			variant: f.params.variant,
+			budgetMsat: f.params.budgetMsat.toString(),
+			numSlots: K,
+			hashChain: f.params.hashChain === true,
+			witnessPeers: (f.params.witnessPeers ?? []).map((p) => p.toString('hex')),
+			settlementDeadline: f.params.settlementDeadline,
+			voucherExpiry: f.params.voucherExpiry,
+			feeBaseMsat: f.params.feeBaseMsat,
+			feeProportionalMillionths: f.params.feeProportionalMillionths,
+			epochStartHeight: f.epochStartHeight,
+			activationHash: f.hAct?.toString('hex') ?? null,
+			slots,
+			witnesses: f.witnesses.map((w) => ({
+				witnessNodeId: w.witnessNodeId.toString('hex'),
+				mailboxId: w.mailboxId.toString('hex'),
+				retentionUntil: w.retentionUntil,
+				acknowledged: w.ackedAt !== null
+			})),
+			settledBitmap: f.settledBitmap?.toString('hex') ?? null,
+			abortReason: f.abortReason,
+			activationMismatch: f.activationMismatch,
+			closeSent: f.closeSent
+		};
+	}
+
+	fforEpochs(role?: 'R' | 'S'): Record<string, unknown>[] {
+		const out: Record<string, unknown>[] = [];
+		for (const ch of this.node.getChannelManager().listChannels()) {
+			const id = ch.getChannelId();
+			if (!id) continue;
+			const f = this.node.getFforEpoch(id.toString('hex'));
+			if (!f || (role && f.role !== role)) continue;
+			out.push(this.fforEpochView(id.toString('hex'), f));
+		}
+		return out;
+	}
+
+	fforEpoch(channelId: string): Record<string, unknown> {
+		const idBuf = this.fforChannelId(channelId);
+		const f = this.node.getFforEpoch(idBuf.toString('hex'));
+		if (!f) {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_FOUND,
+				'no FFOR epoch on this channel'
+			);
+		}
+		return this.fforEpochView(idBuf.toString('hex'), f);
+	}
+
+	fforStartEpoch(body: {
+		channelId?: string;
+		voucherAmountsMsat?: Array<string | number>;
+		settlementDeadline?: number;
+		voucherExpiry?: number;
+		feeBaseMsat?: number;
+		feeProportionalMillionths?: number;
+		hashChain?: boolean;
+		witnessPeers?: string[];
+	}): Record<string, unknown> {
+		const idBuf = this.fforChannelId(body.channelId);
+		if (
+			!Array.isArray(body.voucherAmountsMsat) ||
+			body.voucherAmountsMsat.length === 0
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'voucherAmountsMsat required: one amount per slot'
+			);
+		}
+		const amounts = body.voucherAmountsMsat.map((a) => {
+			try {
+				const v = BigInt(a);
+				if (v <= 0n) throw new Error('non-positive');
+				return v;
+			} catch {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					`voucherAmountsMsat: ${String(a)} is not a positive integer`
+				);
+			}
+		});
+		for (const [name, v] of [
+			['settlementDeadline', body.settlementDeadline],
+			['voucherExpiry', body.voucherExpiry],
+			['feeBaseMsat', body.feeBaseMsat],
+			['feeProportionalMillionths', body.feeProportionalMillionths]
+		] as const) {
+			if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					`${name} must be a non-negative integer`
+				);
+			}
+		}
+		const witnessPeers = (body.witnessPeers ?? []).map((p) => {
+			if (typeof p !== 'string' || !/^0[23][0-9a-fA-F]{64}$/.test(p)) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'witnessPeers must be compressed node ids'
+				);
+			}
+			return Buffer.from(p, 'hex');
+		});
+		const res = this.node.startFforEpoch(idBuf.toString('hex'), {
+			voucherAmountsMsat: amounts,
+			minPaymentMsat: amounts.reduce((m, a) => (a < m ? a : m), amounts[0]),
+			settlementDeadline: body.settlementDeadline!,
+			voucherExpiry: body.voucherExpiry!,
+			feeBaseMsat: body.feeBaseMsat!,
+			feeProportionalMillionths: body.feeProportionalMillionths!,
+			...(body.hashChain === true ? { hashChain: true } : {}),
+			...(witnessPeers.length > 0 ? { witnessPeers } : {})
+		});
+		if (!res.ok) {
+			throw new BeignetError('FFOR_REFUSED', res.error ?? 'epoch refused');
+		}
+		return this.fforEpoch(idBuf.toString('hex'));
+	}
+
+	fforCreateInvoice(body: {
+		channelId?: string;
+		k?: number;
+		description?: string;
+	}): Record<string, unknown> {
+		const idBuf = this.fforChannelId(body.channelId);
+		if (typeof body.k !== 'number' || !Number.isInteger(body.k) || body.k < 1) {
+			throw new BeignetError('INVALID_PARAMS', 'k must be a positive integer');
+		}
+		try {
+			const inv = this.node.createFforVoucherInvoice(
+				idBuf.toString('hex'),
+				body.k,
+				body.description ?? 'FFOR voucher'
+			);
+			const f = this.node.getFforEpoch(idBuf.toString('hex'));
+			return {
+				bolt11: inv.bolt11,
+				paymentHash: inv.paymentHash.toString('hex'),
+				k: body.k,
+				amountMsat: f?.params.voucherAmountsMsat[body.k - 1]?.toString() ?? null
+			};
+		} catch (err) {
+			throw new BeignetError('FFOR_REFUSED', (err as Error).message);
+		}
+	}
+
+	fforCloseEpoch(channelId: string): Record<string, unknown> {
+		const idBuf = this.fforChannelId(channelId);
+		const res = this.node.closeFforEpoch(idBuf.toString('hex'));
+		if (!res.ok)
+			throw new BeignetError('FFOR_REFUSED', res.error ?? 'close refused');
+		return this.fforEpoch(idBuf.toString('hex'));
+	}
+
+	fforAbortEpoch(body: {
+		channelId?: string;
+		reason?: number;
+		text?: string;
+	}): Record<string, unknown> {
+		const idBuf = this.fforChannelId(body.channelId);
+		const res = this.node.abortFforEpoch(
+			idBuf.toString('hex'),
+			typeof body.reason === 'number'
+				? (body.reason as FforAbortReason)
+				: FforAbortReason.OPERATOR,
+			body.text ?? 'operator abort'
+		);
+		if (!res.ok)
+			throw new BeignetError('FFOR_REFUSED', res.error ?? 'abort refused');
+		return this.fforEpoch(idBuf.toString('hex'));
+	}
+
+	fforAddPreimage(body: {
+		channelId?: string;
+		preimage?: string;
+	}): Record<string, unknown> {
+		const idBuf = this.fforChannelId(body.channelId);
+		if (
+			typeof body.preimage !== 'string' ||
+			!/^[0-9a-fA-F]{64}$/.test(body.preimage)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'preimage must be 64 hex characters'
+			);
+		}
+		const res = this.node.fforAddPreimage(
+			idBuf.toString('hex'),
+			Buffer.from(body.preimage, 'hex')
+		);
+		if (!res.ok)
+			throw new BeignetError('FFOR_REFUSED', res.error ?? 'preimage refused');
+		return this.fforEpoch(idBuf.toString('hex'));
+	}
+
+	async fforProvisionWitness(body: {
+		channelId?: string;
+		witnessNodeId?: string;
+		retentionUntil?: number;
+		minReceipts?: number;
+	}): Promise<Record<string, unknown>> {
+		const idBuf = this.fforChannelId(body.channelId);
+		if (
+			typeof body.witnessNodeId !== 'string' ||
+			!/^0[23][0-9a-fA-F]{64}$/.test(body.witnessNodeId)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'witnessNodeId must be a compressed node id'
+			);
+		}
+		try {
+			const r = await this.node.provisionFforWitness(
+				idBuf.toString('hex'),
+				body.witnessNodeId,
+				{
+					...(body.retentionUntil !== undefined
+						? { retentionUntil: body.retentionUntil }
+						: {}),
+					...(body.minReceipts !== undefined
+						? { minReceipts: body.minReceipts }
+						: {})
+				}
+			);
+			return {
+				mailboxId: r.mailboxId.toString('hex'),
+				retentionUntil: r.retentionUntil
+			};
+		} catch (err) {
+			throw new BeignetError('FFOR_REFUSED', (err as Error).message);
+		}
+	}
+
+	fforIssuerOffer(body: {
+		issuerNodeId?: string;
+		description?: string;
+		amountMsat?: string | number;
+		quantityMax?: number;
+	}): Record<string, unknown> {
+		if (
+			typeof body.issuerNodeId !== 'string' ||
+			!/^0[23][0-9a-fA-F]{64}$/.test(body.issuerNodeId)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'issuerNodeId must be a compressed node id'
+			);
+		}
+		if (typeof body.description !== 'string' || body.description.length === 0) {
+			throw new BeignetError('INVALID_PARAMS', 'description required');
+		}
+		const { offer, encoded } = this.node.createFforIssuerOffer(
+			body.issuerNodeId,
+			{
+				description: body.description,
+				...(body.amountMsat !== undefined
+					? { amountMsat: BigInt(body.amountMsat) }
+					: {}),
+				...(body.quantityMax !== undefined
+					? { quantityMax: BigInt(body.quantityMax) }
+					: {})
+			}
+		);
+		return { offerId: offer.offerId.toString('hex'), encoded };
+	}
+
+	async fforProvisionIssuer(body: {
+		channelId?: string;
+		issuerNodeId?: string;
+		offer?: string;
+		witnessHops?: Array<{
+			nodeId: string;
+			shortChannelId: string;
+			feeBaseMsat: number;
+			feeProportionalMillionths: number;
+			cltvExpiryDelta: number;
+			htlcMinimumMsat?: string | number;
+			htlcMaximumMsat?: string | number;
+		}>;
+		issueUntil?: number;
+	}): Promise<Record<string, unknown>> {
+		const idBuf = this.fforChannelId(body.channelId);
+		if (
+			typeof body.issuerNodeId !== 'string' ||
+			!/^0[23][0-9a-fA-F]{64}$/.test(body.issuerNodeId)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'issuerNodeId must be a compressed node id'
+			);
+		}
+		if (typeof body.offer !== 'string') {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'offer required: the encoded offer /ffor/issuer/offer returned'
+			);
+		}
+		let offer: IOffer;
+		try {
+			offer = decodeOffer(body.offer);
+		} catch (err) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`offer: ${(err as Error).message}`
+			);
+		}
+		const witnessHops = (body.witnessHops ?? []).map((h) => ({
+			nodeId: Buffer.from(h.nodeId, 'hex'),
+			shortChannelId: Buffer.from(h.shortChannelId, 'hex'),
+			feeBaseMsat: h.feeBaseMsat,
+			feeProportionalMillionths: h.feeProportionalMillionths,
+			cltvExpiryDelta: h.cltvExpiryDelta,
+			htlcMinimumMsat: BigInt(h.htlcMinimumMsat ?? 1),
+			htlcMaximumMsat: BigInt(h.htlcMaximumMsat ?? 0)
+		}));
+		try {
+			const r = await this.node.provisionFforIssuer(
+				idBuf.toString('hex'),
+				body.issuerNodeId,
+				{
+					offer,
+					witnessHops,
+					...(body.issueUntil !== undefined
+						? { issueUntil: body.issueUntil }
+						: {})
+				}
+			);
+			return {
+				mailboxId: r.mailboxId.toString('hex'),
+				blindedNodeIds: r.blindedNodeIds.map((b) => b.toString('hex'))
+			};
+		} catch (err) {
+			throw new BeignetError('FFOR_REFUSED', (err as Error).message);
+		}
+	}
+
+	async fforRecover(body: {
+		channelId?: string;
+		forceCloseIfUnreachable?: boolean;
+	}): Promise<Record<string, unknown>> {
+		const idBuf = this.fforChannelId(body.channelId);
+		const r = await this.node.rescueFforEpoch(idBuf.toString('hex'), {
+			forceCloseIfUnreachable: body.forceCloseIfUnreachable === true,
+			destinationScript: this.fforDestinationScript()
+		});
+		return {
+			action: r.action,
+			preimagesKnown: r.preimagesKnown,
+			witnesses: r.witnesses.map((w) => ({
+				witnessNodeId: w.witnessNodeId.toString('hex'),
+				ok: w.ok,
+				error: w.error ?? null,
+				credited: w.credited,
+				records: w.records
+			})),
+			epoch: this.fforEpoch(idBuf.toString('hex'))
+		};
+	}
+
+	fforEnforce(channelId: string): Record<string, unknown> {
+		const idBuf = this.fforChannelId(channelId);
+		const f = this.node.getFforEpoch(idBuf.toString('hex'));
+		if (!f || f.role !== 'R') {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_FOUND,
+				'no FFOR epoch of ours on this channel'
+			);
+		}
+		return {
+			...this.forceCloseChannel(idBuf.toString('hex')),
+			preimagesKnown: f.knownPreimages.filter((p) => p !== null).length
+		};
+	}
+
+	private fforDestinationScript(): Buffer {
+		let destinationScript = this.sweepDestinationScript;
+		if (!destinationScript) {
+			const bitcoin = require('bitcoinjs-lib');
+			destinationScript = bitcoin.address.toOutputScript(
+				this.node.getFundingAddress(),
+				this.getBitcoinNetwork()
+			);
+		}
+		return destinationScript!;
+	}
+
+	fforWitnessStatus(): Record<string, unknown> {
+		const service = this.node.getFforWitnessService();
+		if (!service) return { enabled: false, mailboxes: [] };
+		return {
+			enabled: true,
+			mailboxes: service.listMailboxes().map((m) => ({
+				mailboxId: m.id,
+				state: m.state,
+				slots: m.entries.length,
+				records: service.ledger.listRecords(m.id).length,
+				retentionUntil: m.retentionUntil,
+				provisionedAt: m.provisionedAt
+			}))
+		};
+	}
+
+	fforIssuerStatus(): Record<string, unknown> {
+		const service = this.node.getFforIssuerService();
+		if (!service) return { enabled: false, manifests: [] };
+		return {
+			enabled: true,
+			manifests: service.ledger.listManifests().map((m) => ({
+				mailboxId: m.id,
+				offerId: m.offerIdHex,
+				state: m.state,
+				slots: m.numSlots,
+				issued: service.issuedSlots(m.id),
+				issueUntil: m.issueUntil
+			}))
+		};
 	}
 
 	forceCloseChannel(

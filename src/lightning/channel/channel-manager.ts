@@ -181,6 +181,7 @@ import { Feature, FeatureFlags } from '../features/flags';
 import { sign as signWithNodeKey } from '../crypto/ecdh';
 import { decodeFforHeader } from '../ffor/messages';
 import {
+	IFforSettlePolicy,
 	FF_ACTIVATION_TIMEOUT_MS,
 	FforAbortReason,
 	FforSlotState,
@@ -5547,12 +5548,20 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/** Hand the channel its peer's node id and our node-key signer. */
+	/** S's terms for answering ff_init (issue #729); null answers on any. */
+	private fforSettlePolicy: IFforSettlePolicy | null = null;
+
+	setFforSettlePolicy(policy: IFforSettlePolicy | null): void {
+		this.fforSettlePolicy = policy;
+	}
+
 	private _fforEnsureContext(peerPubkey: string, channel: Channel): void {
 		// Recovery suites drive dispatch with channel-shaped stubs.
 		if (typeof channel.setFforContext !== 'function') return;
 		if (!/^[0-9a-f]{66}$/i.test(peerPubkey)) return;
 		const nodeKey = this.config.nodePrivateKey ?? null;
 		channel.setFforContext({
+			...(this.fforSettlePolicy ? { settlePolicy: this.fforSettlePolicy } : {}),
 			remoteNodeId: Buffer.from(peerPubkey, 'hex'),
 			signFn: nodeKey
 				? (digest: Buffer): Buffer => signWithNodeKey(digest, nodeKey)

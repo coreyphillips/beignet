@@ -1674,6 +1674,10 @@ export class LightningNode extends EventEmitter {
 		);
 		this.heldForwardLedger.rehydrate();
 		this.autoReleaseHeldForwards = config.autoReleaseHeldForwards ?? true;
+		// FFOR settlement peer (issue #729): whether ff_init is answered here.
+		if (config.fforSettle) {
+			this.channelManager.setFforSettlePolicy(config.fforSettle);
+		}
 		// FFOR receipt witness (section 9.6, Appendix F.5): rehydrated here,
 		// before any transport exists, so a record is served from disk with
 		// R offline and nothing is ever judged against an empty ledger.
@@ -22652,6 +22656,9 @@ export class LightningNode extends EventEmitter {
 			jitReceive?: INodeConfig['jitReceive'];
 			jitReceiveClient?: INodeConfig['jitReceiveClient'];
 			directFunding?: INodeConfig['directFunding'];
+			fforSettle?: INodeConfig['fforSettle'];
+			fforWitness?: INodeConfig['fforWitness'];
+			fforIssuer?: INodeConfig['fforIssuer'];
 			leaseRates?: import('../gossip/types').ILeaseRates;
 			eagerGossipVerify?: boolean;
 			sweepDestinationScript?: Buffer;
@@ -22716,6 +22723,9 @@ export class LightningNode extends EventEmitter {
 			jitReceive: options?.jitReceive,
 			jitReceiveClient: options?.jitReceiveClient,
 			directFunding: options?.directFunding,
+			fforSettle: options?.fforSettle,
+			fforWitness: options?.fforWitness,
+			fforIssuer: options?.fforIssuer,
 			leaseRates: options?.leaseRates,
 			eagerGossipVerify: options?.eagerGossipVerify,
 			localFeatures: options?.localFeatures,

@@ -227,8 +227,27 @@ export interface IFforEpochRecord {
 	activationMismatch: boolean;
 }
 
+/**
+ * Whether and on what terms this node answers ff_init as S (section 3: an
+ * LSP is a role a peer opts into, never a node class). Absent means the
+ * library default, which answers; a daemon passes `enabled: false` unless
+ * the operator opted in.
+ */
+export interface IFforSettlePolicy {
+	enabled: boolean;
+	/** Refuse a book whose budget exceeds this. */
+	maxBudgetMsat?: bigint;
+	/** Refuse an epoch whose T_exp is more than this many blocks away. */
+	maxEpochBlocks?: number;
+	/** Refuse fee terms below these floors (section 7.6, fee_S). */
+	minFeeBaseMsat?: number;
+	minFeeProportionalMillionths?: number;
+}
+
 /** What the channel needs from its host to run an epoch. */
 export interface IFforChannelContext {
+	/** S's terms for answering ff_init; absent answers on any terms. */
+	settlePolicy?: IFforSettlePolicy;
 	/** The peer's node id; every signed FFOR message verifies against it. */
 	remoteNodeId: Buffer;
 	/** Sign a 32-byte digest with our node key, or absent when we have none. */
