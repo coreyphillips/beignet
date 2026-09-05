@@ -20255,6 +20255,10 @@ export class Channel {
 		feeBaseMsat: number;
 		feeProportionalMillionths: number;
 		epochId?: Buffer;
+		/** TLV 13: the peers delegated HTLCs may reach S from (section 9.6.3). */
+		witnessPeers?: Buffer[];
+		/** TLV 15: hash-chained vouchers (section 9.5.4); uniform amounts only. */
+		hashChain?: boolean;
 	}): ChannelAction[] {
 		const pre = this._fforSetupPreconditionError();
 		if (pre) {
@@ -20262,6 +20266,21 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: `Cannot start FFOR epoch: ${pre}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (
+			request.hashChain &&
+			request.voucherAmountsMsat.some(
+				(a) => a !== request.voucherAmountsMsat[0]
+			)
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot start FFOR epoch: a hash chain needs uniform voucher amounts (section 9.5.4)',
 					cleanup: 'none'
 				}
 			];
@@ -20277,7 +20296,11 @@ export class Channel {
 			feeProportionalMillionths: request.feeProportionalMillionths,
 			escapeGranularityMsat: 0n,
 			rPerCommitmentPoints: [],
-			voucherAmountsMsat: [...request.voucherAmountsMsat]
+			voucherAmountsMsat: [...request.voucherAmountsMsat],
+			...(request.witnessPeers && request.witnessPeers.length > 0
+				? { witnessPeers: request.witnessPeers.map((p) => Buffer.from(p)) }
+				: {}),
+			...(request.hashChain ? { hashChain: true } : {})
 		};
 		const bookError = checkVoucherBook(params, this._fforBookContext('R'));
 		if (bookError) {
@@ -20366,6 +20389,7 @@ export class Channel {
 			slotUpstream: Array.from({ length: K }, () => null),
 			settledBitmap: null,
 			knownPreimages: Array.from({ length: K }, () => null),
+			exposedSlots: Array.from({ length: K }, () => false),
 			closeProcessed: false,
 			voucherRoundFailed: false,
 			unwindOwed: false,
@@ -20525,7 +20549,9 @@ export class Channel {
 			feeProportionalMillionths: msg.feeProportionalMillionths,
 			escapeGranularityMsat: msg.escapeGranularityMsat,
 			rPerCommitmentPoints: msg.rPerCommitmentPoints,
-			voucherAmountsMsat: msg.voucherAmountsMsat
+			voucherAmountsMsat: msg.voucherAmountsMsat,
+			...(msg.witnessPeers ? { witnessPeers: msg.witnessPeers } : {}),
+			...(msg.hashChain ? { hashChain: true } : {})
 		};
 		const bookError = checkVoucherBook(params, this._fforBookContext('S'));
 		if (bookError) return refuse(FforAbortReason.TERMS_REFUSED, bookError);
@@ -20535,9 +20561,30 @@ export class Channel {
 				'settlement_deadline is not in the future'
 			);
 		}
+		if (
+			params.hashChain &&
+			params.voucherAmountsMsat.some((a) => a !== params.voucherAmountsMsat[0])
+		) {
+			return refuse(
+				FforAbortReason.TERMS_REFUSED,
+				'ff_init TLV 15 asks for a hash chain over non-uniform amounts'
+			);
+		}
 
 		const K = params.maxPayments;
-		const preimages = Array.from({ length: K }, () => crypto.randomBytes(32));
+		// Section 9.5.4: chained, t_j = x_j with x_{j-1} = SHA256(x_j), so slot
+		// j's hash H_j = SHA256(t_j) = x_{j-1} = t_{j-1}: revealing x_m reveals
+		// every lower slot's preimage. Otherwise K independent secrets.
+		const preimages: Buffer[] = [];
+		if (params.hashChain) {
+			let x = crypto.randomBytes(32);
+			for (let j = K; j >= 1; j--) {
+				preimages[j - 1] = x;
+				x = crypto.createHash('sha256').update(x).digest();
+			}
+		} else {
+			for (let j = 0; j < K; j++) preimages.push(crypto.randomBytes(32));
+		}
 		const hashes = preimages.map((p) =>
 			crypto.createHash('sha256').update(p).digest()
 		);
@@ -20713,6 +20760,15 @@ export class Channel {
 				f,
 				FforAbortReason.PROTOCOL_ERROR,
 				`ff_accept n0 ${msg.sCommitmentNumber} != ${this._state.remoteCommitmentNumber}`
+			);
+		}
+		// Section 9.5.4: a chain we asked for must be one, SHA256(H_j) == H_{j-1}
+		// for every j > 1, or a preimage would not unlock the slots below it.
+		if (f.params.hashChain && !isHashChain(msg.paymentHashes)) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.BOOK_MISMATCH,
+				'ff_accept hashes are not the requested hash chain'
 			);
 		}
 		// Section 7.2, Variant D: no H_k may be the hash of a secret S has
@@ -21923,17 +21979,75 @@ export class Channel {
 				}
 			];
 		}
-		f.knownPreimages[idx] = Buffer.from(preimage);
-		return [
+		const learned: ChannelAction[] = [];
+		if (!f.knownPreimages[idx]) {
+			f.knownPreimages[idx] = Buffer.from(preimage);
 			// The chain monitors learn it the same way the ack path's do.
-			{
+			learned.push({
 				type: ChannelActionType.PREIMAGE_LEARNED,
 				paymentHash: f.paymentHashes[idx],
 				preimage: Buffer.from(preimage)
-			},
+			});
+		}
+		// Section 9.5.4: on a chained book H_j is slot j-1's preimage, so one
+		// preimage credits every slot below it.
+		if (f.params.hashChain) {
+			for (let j = idx - 1; j >= 0; j--) {
+				if (f.knownPreimages[j]) continue;
+				const derived = f.paymentHashes[j + 1];
+				const h = crypto.createHash('sha256').update(derived).digest();
+				if (!h.equals(f.paymentHashes[j])) break;
+				f.knownPreimages[j] = Buffer.from(derived);
+				learned.push({
+					type: ChannelActionType.PREIMAGE_LEARNED,
+					paymentHash: f.paymentHashes[j],
+					preimage: Buffer.from(derived)
+				});
+			}
+		}
+		return [
+			...learned,
 			{ type: ChannelActionType.PERSIST_STATE },
 			...(f.state === FforState.DRAINING ? this._fforDrain(f) : [])
 		];
+	}
+
+	/**
+	 * R: why voucher k's invoice may not be exposed now, or null. Section
+	 * 9.5.4: a chained book serves levels strictly in ascending order, so
+	 * every lower slot must already be exposed; on any book a slot is
+	 * exposed once (a second invoice on the same hash is section 13.7's
+	 * reuse).
+	 */
+	fforExposureRefusal(k: number): string | null {
+		const f = this._state.ffor;
+		if (!f || f.role !== 'R') return 'no epoch of ours';
+		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
+		if (f.exposedSlots[k - 1]) return `voucher ${k} is already exposed`;
+		if (f.params.hashChain) {
+			for (let j = 1; j < k; j++) {
+				if (!f.exposedSlots[j - 1]) {
+					return `hash chain: voucher ${j} must be exposed before ${k}`;
+				}
+			}
+		}
+		return null;
+	}
+
+	/** R: record that voucher k's invoice has been exposed (durable). */
+	fforMarkExposed(k: number): ChannelAction[] {
+		const refusal = this.fforExposureRefusal(k);
+		if (refusal) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `FFOR: ${refusal}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		this._state.ffor!.exposedSlots[k - 1] = true;
+		return [{ type: ChannelActionType.PERSIST_STATE }];
 	}
 
 	/** S: per-slot settlement state, durable (section 9.5.1 "Settlement"). */
@@ -22226,4 +22340,13 @@ export function createAcceptorChannel(params: {
 		remoteConfig: DEFAULT_CHANNEL_CONFIG
 	});
 	return new Channel(state);
+}
+
+/** Section 9.5.4: SHA256(H_j) == H_{j-1} for every j > 1. */
+function isHashChain(hashes: Buffer[]): boolean {
+	for (let j = 1; j < hashes.length; j++) {
+		const h = crypto.createHash('sha256').update(hashes[j]).digest();
+		if (!h.equals(hashes[j - 1])) return false;
+	}
+	return true;
 }

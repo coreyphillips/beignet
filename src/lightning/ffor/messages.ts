@@ -316,12 +316,47 @@ export function encodeFforInitUnsigned(
 			value: Buffer.concat(msg.voucherAmountsMsat.map((a) => u64(a)))
 		});
 	}
+	if (msg.witnessPeers && msg.witnessPeers.length > 0) {
+		if (msg.witnessPeers.length > 0xffff) {
+			throw new Error('too many witness_peers');
+		}
+		for (const id of msg.witnessPeers) assertNodeId(id, 'witness_peers');
+		records.push({
+			type: 13n,
+			value: Buffer.concat([
+				u16(msg.witnessPeers.length),
+				...msg.witnessPeers
+			])
+		});
+	}
+	if (msg.hashChain) {
+		records.push({ type: 15n, value: u8(1) });
+	}
 	return Buffer.concat([
 		msg.channelId,
 		msg.epochId,
 		fixed,
 		encodeTlvStream(records)
 	]);
+}
+
+function assertNodeId(id: Buffer, what: string): void {
+	if (id.length !== 33 || (id[0] !== 0x02 && id[0] !== 0x03)) {
+		throw new Error(`${what}: not a compressed node id`);
+	}
+}
+
+/** ff_init TLV 13: `[2: count][count * 33: node ids]`. */
+function decodeWitnessPeers(value: Buffer): Buffer[] {
+	if (value.length < 2) throw new Error('ff_init TLV 13 is truncated');
+	const count = value.readUInt16BE(0);
+	if (value.length !== 2 + 33 * count) {
+		throw new Error('ff_init TLV 13 length does not match its count');
+	}
+	if (count === 0) throw new Error('ff_init TLV 13 names no peer');
+	const ids = splitFixed(value.subarray(2), 33, 'ff_init TLV 13');
+	for (const id of ids) assertNodeId(id, 'ff_init TLV 13');
+	return ids;
 }
 
 /** Decode a signed ff_init body. Does not verify the signature. */
@@ -346,8 +381,13 @@ export function decodeFforInitMessage(body: Buffer): IFforInitMessage {
 	const tower = tlvList(tlvs, 3n);
 	const uri = tlvList(tlvs, 5n);
 	const amounts = tlvList(tlvs, 9n);
+	const witnessPeers = tlvList(tlvs, 13n);
+	const hashChain = tlvList(tlvs, 15n);
 	if (tower !== undefined && tower.length !== 33) {
 		throw new Error('ff_init TLV 3 must be 33 bytes');
+	}
+	if (hashChain !== undefined && (hashChain.length !== 1 || hashChain[0] !== 1)) {
+		throw new Error('ff_init TLV 15 must be the single byte 1');
 	}
 	return {
 		channelId,
@@ -373,6 +413,10 @@ export function decodeFforInitMessage(body: Buffer): IFforInitMessage {
 						b.readBigUInt64BE(0)
 				  )
 				: [],
+		...(witnessPeers !== undefined
+			? { witnessPeers: decodeWitnessPeers(witnessPeers) }
+			: {}),
+		...(hashChain !== undefined ? { hashChain: true } : {}),
 		signature
 	};
 }

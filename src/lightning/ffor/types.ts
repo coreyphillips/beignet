@@ -107,6 +107,19 @@ export interface IFforEpochParams {
 	rPerCommitmentPoints: Buffer[];
 	/** TLV 9, REQUIRED in Variant D: d_1..d_K in slot order. */
 	voucherAmountsMsat: bigint[];
+	/**
+	 * TLV 13 (section 9.6.3): the peers a delegated HTLC may arrive from.
+	 * An honest S fails upstream a delegated HTLC over a channel to any
+	 * other peer. Absent or empty: no restriction.
+	 */
+	witnessPeers?: Buffer[];
+	/**
+	 * TLV 15: R asked for hash-chained vouchers (section 9.5.4). S derives
+	 * t_j = x_j with x_{j-1} = SHA256(x_j), so H_j = x_{j-1} and the book
+	 * satisfies SHA256(H_j) == H_{j-1} for every j > 1; one preimage then
+	 * unlocks every lower slot. Requires uniform amounts.
+	 */
+	hashChain?: boolean;
 }
 
 /** One section 7.5.3 book entry. */
@@ -168,6 +181,12 @@ export interface IFforEpochRecord {
 	settledBitmap: Buffer | null;
 	/** R: preimages learned from the ack, a payer or a witness, by slot. */
 	knownPreimages: (Buffer | null)[];
+	/**
+	 * R: which slots' invoices have been exposed (section 9.5.4: a chained
+	 * book serves invoices strictly in ascending level order, and a slot is
+	 * never exposed twice as a different invoice).
+	 */
+	exposedSlots: boolean[];
 	/**
 	 * S: set once ff_close has been processed (section 7.5.6 stopping
 	 * condition), before the drain round completes and DRAINING is

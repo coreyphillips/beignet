@@ -967,6 +967,8 @@ export interface ISerializedFforEpoch {
 		escapeGranularityMsat: string;
 		rPerCommitmentPoints: string[];
 		voucherAmountsMsat: string[];
+		witnessPeers?: string[];
+		hashChain?: boolean;
 	};
 	remoteNodeId: string;
 	initWire: string;
@@ -989,6 +991,8 @@ export interface ISerializedFforEpoch {
 	slotUpstream: (string | null)[];
 	settledBitmap: string | null;
 	knownPreimages: (string | null)[];
+	/** Absent on records written before the field existed: no slot exposed. */
+	exposedSlots?: boolean[];
 	closeProcessed: boolean;
 	voucherRoundFailed: boolean;
 	unwindOwed: boolean;
@@ -1015,7 +1019,11 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 			rPerCommitmentPoints: f.params.rPerCommitmentPoints.map((p) =>
 				p.toString('hex')
 			),
-			voucherAmountsMsat: f.params.voucherAmountsMsat.map(bigintToStr)
+			voucherAmountsMsat: f.params.voucherAmountsMsat.map(bigintToStr),
+			...(f.params.witnessPeers
+				? { witnessPeers: f.params.witnessPeers.map((p) => p.toString('hex')) }
+				: {}),
+			...(f.params.hashChain ? { hashChain: true } : {})
 		},
 		remoteNodeId: f.remoteNodeId.toString('hex'),
 		initWire: f.initWire.toString('hex'),
@@ -1039,6 +1047,7 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		slotUpstream: [...f.slotUpstream],
 		settledBitmap: bufToHex(f.settledBitmap),
 		knownPreimages: f.knownPreimages.map((p) => bufToHex(p)),
+		exposedSlots: [...f.exposedSlots],
 		closeProcessed: f.closeProcessed,
 		voucherRoundFailed: f.voucherRoundFailed,
 		unwindOwed: f.unwindOwed,
@@ -1068,7 +1077,15 @@ export function deserializeFforEpoch(
 			rPerCommitmentPoints: s.params.rPerCommitmentPoints.map((p) =>
 				Buffer.from(p, 'hex')
 			),
-			voucherAmountsMsat: s.params.voucherAmountsMsat.map(strToBigint)
+			voucherAmountsMsat: s.params.voucherAmountsMsat.map(strToBigint),
+			...(s.params.witnessPeers
+				? {
+						witnessPeers: s.params.witnessPeers.map((p) =>
+							Buffer.from(p, 'hex')
+						)
+				  }
+				: {}),
+			...(s.params.hashChain ? { hashChain: true } : {})
 		},
 		remoteNodeId: Buffer.from(s.remoteNodeId, 'hex'),
 		initWire: Buffer.from(s.initWire, 'hex'),
@@ -1092,6 +1109,8 @@ export function deserializeFforEpoch(
 		slotUpstream: [...s.slotUpstream],
 		settledBitmap: hexToBuf(s.settledBitmap),
 		knownPreimages: s.knownPreimages.map((p) => hexToBuf(p)),
+		exposedSlots:
+			s.exposedSlots ?? s.knownPreimages.map(() => false),
 		closeProcessed: s.closeProcessed === true,
 		voucherRoundFailed: s.voucherRoundFailed === true,
 		unwindOwed: s.unwindOwed === true,
