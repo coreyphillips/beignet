@@ -42,7 +42,10 @@ import {
 	OutputStatus,
 	OutputType
 } from '../../../src/lightning/chain/types';
-import { FforSlotState } from '../../../src/lightning/ffor/types';
+import {
+	FF_RECONCILE_MARGIN_BLOCKS,
+	FforSlotState
+} from '../../../src/lightning/ffor/types';
 import {
 	IWorld,
 	IWorldOptions,
@@ -179,10 +182,11 @@ async function regtestWorld(opts: {
 	await sProvider.prefundFeeInputs(opts.feeInputs ?? 4, 100_000);
 	await rProvider.prefundFeeInputs(opts.feeInputs ?? 4, 100_000);
 	seedBase += 10;
+	// The providers are attached AFTER the channel is open (below): a node
+	// built with one auto-funds every accepted channel, and that background
+	// funding would replace the outpoint the fixture funded by hand.
 	const worldOpts: IWorldOptions = {
 		seedBase,
-		sExtra: { fundingProvider: sProvider },
-		rExtra: { fundingProvider: rProvider },
 		rStorage: opts.rStorage,
 		sChannel: { feeratePerKw: FEERATE_PER_KW },
 		rChannel: {
@@ -218,6 +222,15 @@ async function regtestWorld(opts: {
 		},
 		tip
 	});
+	for (const [node, provider] of [
+		[w.s, sProvider],
+		[w.r, rProvider]
+	] as const) {
+		(
+			node as unknown as { fundingProvider: BitcoindFundingProvider }
+		).fundingProvider = provider;
+		node.getChannelManager().setFundingProvider(provider);
+	}
 	const chain = new Chain(tip, [w.p, w.s, w.r]);
 	return {
 		w,
@@ -383,7 +396,7 @@ describe('FFOR Variant D on regtest (spec section 15.2)', function () {
 			amounts: [d],
 			minPaymentMsat: 100_000_000n,
 			settlementDeadline: h + 60,
-			voucherExpiry: h + 120
+			voucherExpiry: h + 60 + FF_RECONCILE_MARGIN_BLOCKS
 		});
 		const [inv] = exposeAndLeave(w, [1]);
 		const payment = pay(w, inv);
@@ -421,7 +434,7 @@ describe('FFOR Variant D on regtest (spec section 15.2)', function () {
 			hashChain: true,
 			minPaymentMsat: G,
 			settlementDeadline: h + 60,
-			voucherExpiry: h + 120
+			voucherExpiry: h + 60 + FF_RECONCILE_MARGIN_BLOCKS
 		});
 		const [inv1, inv2, inv3] = exposeAndLeave(w, [1, 2, 3]);
 		expect(pay(w, inv1).status).to.equal(PaymentStatus.COMPLETED);
@@ -459,12 +472,12 @@ describe('FFOR Variant D on regtest (spec section 15.2)', function () {
 			amounts: [G, G, G],
 			minPaymentMsat: G,
 			settlementDeadline: h + 20,
-			voucherExpiry: h + 30
+			voucherExpiry: h + 20 + FF_RECONCILE_MARGIN_BLOCKS
 		});
 		exposeAndLeave(w, [1, 2, 3]);
 		chain.unwatch(w.r);
 		// Nobody pays. Past T_exp, S takes the vouchers back on its own.
-		await chain.mine(31);
+		await chain.mine(20 + FF_RECONCILE_MARGIN_BLOCKS + 1);
 		const { commitment, confirmedAt } = await forceCloseOnChain(rw, w.s, sDest);
 		const sweeps = await resolveHtlcs(
 			rw,
@@ -541,7 +554,7 @@ describe('FFOR Variant D on regtest (spec section 15.2)', function () {
 			amounts: [200_000_000n],
 			minPaymentMsat: 100_000_000n,
 			settlementDeadline: h + 60,
-			voucherExpiry: h + 120
+			voucherExpiry: h + 60 + FF_RECONCILE_MARGIN_BLOCKS
 		});
 		expect(
 			Number(sChannel.getFullState().localCommitmentNumber)
