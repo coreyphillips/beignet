@@ -291,6 +291,13 @@ export interface INodeConfig {
 	chainHashes?: Buffer[];
 	/** Enable auto-reconnection (default false) */
 	autoReconnect?: boolean;
+	/**
+	 * Async receive (issue #708): when an LSP reports holds parked for this
+	 * node, sign and send the release capability automatically for holds
+	 * whose payment the node can vouch for (default true). Off, the host
+	 * releases from the 'payment:held-notice' event via sendAsyncRelease.
+	 */
+	autoReleaseHeldForwards?: boolean;
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
 	/** Resource management config */

@@ -12001,6 +12001,55 @@ export class Channel {
 	 * that gets dispatched, and an MPP payment that sends a safe part before a
 	 * held part refuses locally leaves the first one locked to its mpp_timeout.
 	 */
+	/**
+	 * Would a SET of outgoing HTLCs of these amounts all be accepted right
+	 * now, judged together against every limit addHtlc applies one at a time
+	 * (state, quiescence, remote minimum, pending count, in-flight value,
+	 * spendable balance, dust exposure)? An atomic held-forward set release
+	 * (issue #708 review) asks this before the first add leaves, so the set
+	 * is placed whole or not at all; a check that changes between this call
+	 * and the adds cannot happen inside one synchronous drive.
+	 */
+	canOfferHtlcSet(amounts: bigint[]): boolean {
+		if (amounts.length === 0) return true;
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			!this.canUpdateHtlcsDuringSplice()
+		) {
+			return false;
+		}
+		if (this._state.fundingUnaccounted === true) return false;
+		if (this._quiescence.isQuiescing()) return false;
+		const remote = this._state.remoteConfig;
+		let sum = 0n;
+		let dust = 0n;
+		for (const amountMsat of amounts) {
+			if (amountMsat < remote.htlcMinimumMsat) return false;
+			sum += amountMsat;
+			if (this._isDustHtlc(amountMsat)) dust += amountMsat;
+		}
+		if (
+			this.countPendingHtlcs(HtlcDirection.OFFERED) + amounts.length >
+			remote.maxAcceptedHtlcs
+		) {
+			return false;
+		}
+		if (
+			this.totalInFlightMsat(HtlcDirection.OFFERED) + sum >
+			remote.maxHtlcValueInFlightMsat
+		) {
+			return false;
+		}
+		if (sum > this.getSpendableOutboundMsat()) return false;
+		if (
+			dust > 0n &&
+			this._dustExposureMsat() + dust > Channel.MAX_DUST_HTLC_EXPOSURE_MSAT
+		) {
+			return false;
+		}
+		return true;
+	}
+
 	acceptsNewHtlcs(lookThroughReestablish = false): boolean {
 		if (this._state.restoreRecencyUnproven === true) return false;
 		if (this._state.fundingUnaccounted === true) return false;

@@ -724,6 +724,26 @@ export class JitReceiveManager extends EventEmitter {
 	 * a refund? The node asks before re-dispatching a restored HTLC: dispatching
 	 * one of these would forward a payment this queue is about to fail upstream.
 	 */
+	/**
+	 * Is this inbound HTLC held by the engine right now (a refused forward it
+	 * took for a splice)? A caller that owes the HTLC a failure must not
+	 * fail what the engine is about to forward.
+	 */
+	holdsPart(inChannelIdHex: string, inHtlcId: bigint): boolean {
+		for (const parts of this.heldParts.values()) {
+			if (
+				parts.some(
+					(p) =>
+						p.inChannelId.toString('hex') === inChannelIdHex &&
+						p.inHtlcId === inHtlcId
+				)
+			) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	hasRestoredHold(inChannelIdHex: string, inHtlcId: bigint): boolean {
 		const id = inHtlcId.toString();
 		return this.restoredToFail.some(
