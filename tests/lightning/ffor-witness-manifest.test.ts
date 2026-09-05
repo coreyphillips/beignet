@@ -19,15 +19,21 @@ import {
 	decodeManifest,
 	decodeRecord,
 	decodeRecordBody,
+	decodeWitnessFetch,
+	decodeWitnessFetchResp,
 	encodeRecord,
 	encodeRecordBody,
 	encodeRecordHeader,
+	encodeWitnessFetch,
+	encodeWitnessFetchResp,
+	fetchDigest,
 	recordAad,
 	recordDigest,
 	signManifest,
 	termsHash,
 	verifyManifest,
 	verifyRecordSignature,
+	verifyWitnessFetch,
 	verifyWitnessRecord
 } from '../../src/lightning/ffor/witness-messages';
 import {
@@ -366,5 +372,72 @@ describe('FFOR witness objects (section 9.6.4, Appendix F)', () => {
 		expect(
 			verifyWitnessRecord(swapped, provision, es, EPOCH, hAct).reason
 		).to.match(/does not open/);
+	});
+
+	it('a fetch without paging is the v0.9.2 layout, and after_k rides a signed trailing TLV', () => {
+		const fetchPriv = crypto.randomBytes(32);
+		const fetchPub = getPublicKey(fetchPriv);
+		const id = crypto.randomBytes(16);
+		const mailbox = crypto.randomBytes(32);
+		const nonce = crypto.randomBytes(32);
+		const first = encodeWitnessFetch(id, mailbox, nonce, fetchPriv);
+		expect(first).to.have.length(16 + 32 + 32 + 64);
+		const decodedFirst = decodeWitnessFetch(first);
+		expect(decodedFirst.afterK).to.equal(undefined);
+		expect(decodedFirst.tlv).to.have.length(0);
+		expect(verifyWitnessFetch(decodedFirst, fetchPub)).to.be.true;
+		// The unpaged digest is the two-part one.
+		expect(
+			fetchDigest(mailbox, nonce).equals(
+				fetchDigest(mailbox, nonce, Buffer.alloc(0))
+			)
+		).to.be.true;
+
+		const paged = encodeWitnessFetch(id, mailbox, nonce, fetchPriv, 7);
+		expect(paged.length).to.be.greaterThan(first.length);
+		const decoded = decodeWitnessFetch(paged);
+		expect(decoded.afterK).to.equal(7);
+		expect(verifyWitnessFetch(decoded, fetchPub)).to.be.true;
+		// The signature covers after_k: a page renumbered in flight fails.
+		const forged = Buffer.from(paged);
+		forged[forged.length - 1] = 8;
+		expect(verifyWitnessFetch(decodeWitnessFetch(forged), fetchPub)).to.be
+			.false;
+		// And the signed stream is what is verified, not a re-encoding of it.
+		expect(decoded.tlv.equals(paged.subarray(16 + 32 + 32 + 64))).to.be.true;
+	});
+
+	it('a fetch response carries next_after_k as a trailing TLV, and none when the page is the last', () => {
+		const id = crypto.randomBytes(16);
+		const last = encodeWitnessFetchResp({
+			requestId: id,
+			ok: true,
+			records: []
+		});
+		expect(last).to.have.length(16 + 1 + 2);
+		expect(decodeWitnessFetchResp(last).nextAfterK).to.equal(undefined);
+		const more = encodeWitnessFetchResp({
+			requestId: id,
+			ok: true,
+			records: [],
+			nextAfterK: 300
+		});
+		expect(more.subarray(0, 19).equals(last)).to.be.true;
+		const decoded = decodeWitnessFetchResp(more);
+		expect(decoded.ok).to.be.true;
+		expect(decoded.records).to.deep.equal([]);
+		expect(decoded.nextAfterK).to.equal(300);
+		// A refusal has no stream.
+		const refused = decodeWitnessFetchResp(
+			encodeWitnessFetchResp({
+				requestId: id,
+				ok: false,
+				records: [],
+				error: 'no'
+			})
+		);
+		expect(refused.ok).to.be.false;
+		expect(refused.error).to.equal('no');
+		expect(refused.nextAfterK).to.equal(undefined);
 	});
 });

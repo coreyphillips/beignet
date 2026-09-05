@@ -27,7 +27,8 @@ import {
 	FF_WITNESS_RETENTION_MARGIN_BLOCKS,
 	FF_WITNESS_VERSION,
 	IFforWitnessRecord,
-	IFforWitnessRecordHeader
+	IFforWitnessRecordHeader,
+	FF_WITNESS_FETCH_PAGE_BYTES
 } from './witness-types';
 import {
 	decodeRecord,
@@ -69,6 +70,11 @@ export interface IFforWitnessConfig {
 	 * the node closes the channel to claim the HTLC on-chain itself.
 	 */
 	safetyDelta?: number;
+	/**
+	 * Record bytes one ff_witness_fetch_resp carries at most (default
+	 * FF_WITNESS_FETCH_PAGE_BYTES); a mailbox holding more answers in pages.
+	 */
+	fetchPageBytes?: number;
 }
 
 /** One downstream fulfil for an outgoing HTLC, as the node sees it. */
@@ -123,6 +129,7 @@ export class FforWitnessService {
 	readonly maxBytes: number;
 	readonly barrierMs: number;
 	readonly safetyDelta: number;
+	readonly fetchPageBytes: number;
 
 	constructor(
 		cfg: IFforWitnessConfig,
@@ -132,6 +139,10 @@ export class FforWitnessService {
 		this.maxBytes = cfg.maxBytes ?? DEFAULT_MAX_BYTES;
 		this.barrierMs = cfg.barrierMs ?? FF_WITNESS_BARRIER_MS;
 		this.safetyDelta = cfg.safetyDelta ?? 6;
+		this.fetchPageBytes = Math.max(
+			1,
+			cfg.fetchPageBytes ?? FF_WITNESS_FETCH_PAGE_BYTES
+		);
 	}
 
 	/** Fulfils held behind the barrier, by outKey. */
@@ -577,25 +588,50 @@ export class FforWitnessService {
 			empty();
 			return;
 		}
+		// F.1 paging: records above after_k in ascending k, as many as fit
+		// the page and never fewer than one, and the last k served as
+		// next_after_k while any remain.
+		const afterK = msg.afterK ?? 0;
 		const records: IFforWitnessRecord[] = [];
+		let bytes = 0;
+		let lastK = afterK;
+		let nextAfterK: number | undefined;
 		for (const row of this.deps.ledger.listRecords(mailboxIdHex)) {
+			if (row.k <= afterK) continue;
+			let rec: IFforWitnessRecord;
 			try {
-				records.push(decodeRecord(Buffer.from(row.recordHex, 'hex')));
+				rec = decodeRecord(Buffer.from(row.recordHex, 'hex'));
 			} catch {
 				this.deps.log('ffor_witness_record_corrupt', {
 					mailboxId: mailboxIdHex,
 					k: row.k
 				});
+				continue;
 			}
+			const len = row.recordHex.length / 2 + 2;
+			if (records.length > 0 && bytes + len > this.fetchPageBytes) {
+				nextAfterK = lastK;
+				break;
+			}
+			records.push(rec);
+			bytes += len;
+			lastK = row.k;
 		}
 		this.deps.log('ffor_witness_fetched', {
 			mailboxId: mailboxIdHex,
-			records: records.length
+			afterK,
+			records: records.length,
+			more: nextAfterK !== undefined
 		});
 		this.deps.send(
 			peer,
 			FF_WITNESS_FETCH_RESP_TYPE,
-			encodeWitnessFetchResp({ requestId, ok: true, records })
+			encodeWitnessFetchResp({
+				requestId,
+				ok: true,
+				records,
+				...(nextAfterK !== undefined ? { nextAfterK } : {})
+			})
 		);
 	}
 

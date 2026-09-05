@@ -9,6 +9,7 @@ import crypto from 'crypto';
 import { sign, verify } from '../crypto/ecdh';
 import { IFforBookEntry } from './types';
 import { Reader, splitFixed, u16, u32, u64, u8 } from './messages';
+import { decodeTlvStream, encodeTlvStream } from '../message/tlv';
 import { encodeBookEntry } from './transcript';
 import {
 	FF_TERMS_TAG,
@@ -28,7 +29,9 @@ import {
 	IFforWitnessManifest,
 	IFforWitnessProvisionMessage,
 	IFforWitnessRecord,
-	IFforWitnessRecordHeader
+	IFforWitnessRecordHeader,
+	FF_WITNESS_FETCH_AFTER_K_TLV,
+	FF_WITNESS_FETCH_NEXT_TLV
 } from './witness-types';
 
 function sha256(...parts: (Buffer | string)[]): Buffer {
@@ -288,8 +291,44 @@ export function decodeRecordBody(bytes: Buffer): IFforWitnessBody {
 // Fetch and close digests (F.1)
 // ---------------------------------------------------------------------------
 
-export function fetchDigest(mailboxId: Buffer, nonce: Buffer): Buffer {
-	return sha256(FF_WITNESS_FETCH_TAG, mailboxId, nonce);
+/**
+ * `SHA256("ffor/witness/fetch" || mailbox_id || nonce || tlv)`, where `tlv` is
+ * the fetch's trailing TLV stream (empty on a first page, so a fetch without
+ * paging digests exactly as before).
+ */
+export function fetchDigest(
+	mailboxId: Buffer,
+	nonce: Buffer,
+	tlv: Buffer = Buffer.alloc(0)
+): Buffer {
+	return sha256(FF_WITNESS_FETCH_TAG, mailboxId, nonce, tlv);
+}
+
+/** F.1 paging: the trailing TLV stream of a fetch, empty without `after_k`. */
+export function fetchTlv(afterK?: number): Buffer {
+	if (afterK === undefined) return Buffer.alloc(0);
+	if (!Number.isInteger(afterK) || afterK < 0 || afterK > 0xffff) {
+		throw new Error('after_k out of range');
+	}
+	return encodeTlvStream([
+		{ type: FF_WITNESS_FETCH_AFTER_K_TLV, value: u16(afterK) }
+	]);
+}
+
+/** One u16 out of a trailing TLV stream; absent when the stream is empty. */
+function readU16Tlv(
+	tlv: Buffer,
+	type: bigint,
+	label: string
+): number | undefined {
+	if (tlv.length === 0) return undefined;
+	const { records } = decodeTlvStream(tlv, 0, new Set([type]));
+	const rec = records.find((x) => x.type === type);
+	if (!rec) return undefined;
+	if (rec.value.length !== 2) {
+		throw new Error(`${label}: TLV ${type} is not a u16`);
+	}
+	return rec.value.readUInt16BE(0);
 }
 
 /** `SHA256("ffor/witness/close" || body without sig)`. */
@@ -359,16 +398,19 @@ export function encodeWitnessFetch(
 	requestId: Buffer,
 	mailboxId: Buffer,
 	nonce: Buffer,
-	fetchPrivkey: Buffer
+	fetchPrivkey: Buffer,
+	afterK?: number
 ): Buffer {
 	needId(requestId);
 	need32(mailboxId, 'mailbox_id');
 	need32(nonce, 'nonce');
+	const tlv = fetchTlv(afterK);
 	return Buffer.concat([
 		requestId,
 		mailboxId,
 		nonce,
-		sign(fetchDigest(mailboxId, nonce), fetchPrivkey)
+		sign(fetchDigest(mailboxId, nonce, tlv), fetchPrivkey),
+		tlv
 	]);
 }
 
@@ -378,9 +420,20 @@ export function decodeWitnessFetch(body: Buffer): IFforWitnessFetchMessage {
 	const mailboxId = r.bytes(32);
 	const nonce = r.bytes(32);
 	const signature = r.bytes(64);
-	if (r.remaining() !== 0)
-		throw new Error('ff_witness_fetch has trailing bytes');
-	return { requestId, mailboxId, nonce, signature };
+	const tlv = r.bytes(r.remaining());
+	const afterK = readU16Tlv(
+		tlv,
+		FF_WITNESS_FETCH_AFTER_K_TLV,
+		'ff_witness_fetch'
+	);
+	return {
+		requestId,
+		mailboxId,
+		nonce,
+		signature,
+		tlv,
+		...(afterK !== undefined ? { afterK } : {})
+	};
 }
 
 export function verifyWitnessFetch(
@@ -388,7 +441,7 @@ export function verifyWitnessFetch(
 	fetchPubkey: Buffer
 ): boolean {
 	return verify(
-		fetchDigest(m.mailboxId, m.nonce),
+		fetchDigest(m.mailboxId, m.nonce, m.tlv),
 		fetchPubkey,
 		m.signature,
 		true
@@ -403,6 +456,19 @@ export function encodeWitnessFetchResp(
 		return Buffer.concat([m.requestId, u8(0), errorBytes(m.error ?? '')]);
 	}
 	if (m.records.length > 0xffff) throw new Error('too many records');
+	let tlv = Buffer.alloc(0);
+	if (m.nextAfterK !== undefined) {
+		if (
+			!Number.isInteger(m.nextAfterK) ||
+			m.nextAfterK < 0 ||
+			m.nextAfterK > 0xffff
+		) {
+			throw new Error('next_after_k out of range');
+		}
+		tlv = encodeTlvStream([
+			{ type: FF_WITNESS_FETCH_NEXT_TLV, value: u16(m.nextAfterK) }
+		]);
+	}
 	return Buffer.concat([
 		m.requestId,
 		u8(1),
@@ -411,7 +477,8 @@ export function encodeWitnessFetchResp(
 			const bytes = encodeRecord(rec);
 			if (bytes.length > 0xffff) throw new Error('record too long');
 			return Buffer.concat([u16(bytes.length), bytes]);
-		})
+		}),
+		tlv
 	]);
 }
 
@@ -432,10 +499,17 @@ export function decodeWitnessFetchResp(
 	const n = r.u16();
 	const records: IFforWitnessRecord[] = [];
 	for (let i = 0; i < n; i++) records.push(decodeRecord(r.bytes(r.u16())));
-	if (r.remaining() !== 0) {
-		throw new Error('ff_witness_fetch_resp has trailing bytes');
-	}
-	return { requestId, ok, records };
+	const nextAfterK = readU16Tlv(
+		r.bytes(r.remaining()),
+		FF_WITNESS_FETCH_NEXT_TLV,
+		'ff_witness_fetch_resp'
+	);
+	return {
+		requestId,
+		ok,
+		records,
+		...(nextAfterK !== undefined ? { nextAfterK } : {})
+	};
 }
 
 /** The bytes the close signature covers: everything after the request id, before the sig. */
