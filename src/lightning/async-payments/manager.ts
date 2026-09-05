@@ -76,11 +76,16 @@ export interface IAsyncPaymentManagerDeps {
 	/** Unix milliseconds; injectable for expiry tests. */
 	now?: () => number;
 	/**
-	 * Receiver role (issue #709): the registration id this node holds a
-	 * grant for at the given LSP, or undefined when it has none. Falls back
-	 * to the derived placeholder id when absent (pre-#709 LSPs).
+	 * Receiver role (issue #709): the registration id a release of these
+	 * holds at this LSP must name: the one the LSP's notice reported for
+	 * them (a hold resolves under the registration it was parked under,
+	 * expired or superseded since or not), else the live grant's. Undefined
+	 * falls back to the derived placeholder id (pre-#709 LSPs).
 	 */
-	registrationIdFor?: (lspNodeIdHex: string) => Buffer | undefined;
+	registrationIdFor?: (
+		lspNodeIdHex: string,
+		holdIds: Buffer[]
+	) => Buffer | undefined;
 }
 
 /** How registerHold judges a NEW hold before writing its row (issue #709). */
@@ -538,7 +543,7 @@ export class AsyncPaymentManager extends EventEmitter {
 				lspNodeId,
 				registrationId:
 					options?.registrationId ??
-					this.deps.registrationIdFor?.(lspNodeId.toString('hex')) ??
+					this.deps.registrationIdFor?.(lspNodeId.toString('hex'), holdIds) ??
 					deriveHoldRegistrationId(this.deps.nodeId, lspNodeId),
 				amountMsat,
 				expiresAt: BigInt(

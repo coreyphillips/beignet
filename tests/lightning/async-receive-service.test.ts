@@ -34,13 +34,15 @@ import {
 import {
 	IReceiverGrant,
 	IUnsignedReceiverGrant,
-	REGISTRATION_REQUEST_VERSION,
+	IUnsignedRegistrationRequest,
 	encodeReceiverGrant,
 	encodeRegistrationRequest,
-	signReceiverGrant
+	signReceiverGrant,
+	signRegistrationRequest
 } from '../../src/lightning/async-payments/receiver-grant';
 import { IAdmissionCandidate } from '../../src/lightning/async-payments/service';
 import {
+	CAROL_SEED,
 	IWorld,
 	LSP_SEED,
 	MALLORY_SEED,
@@ -115,31 +117,58 @@ function unresolvedCount(lsp: LightningNode): number {
 		.length;
 }
 
+/**
+ * A registration request built by `from`, signed with `signer` (its own key
+ * unless a test wants a mis-signed one), optionally routed via other nodes.
+ * Returns the request bytes so a test can replay them.
+ */
 function sendRawRequest(
 	from: LightningNode,
 	lsp: LightningNode,
-	fields: Partial<Parameters<typeof encodeRegistrationRequest>[0]>
+	fields: Partial<Omit<IUnsignedRegistrationRequest, 'version'>>,
+	signer: Buffer,
+	via: LightningNode[] = []
 ): Buffer {
-	const nonce = fields.nonce ?? crypto.randomBytes(32);
-	from.getOnionMessageManager().sendOnionMessage(
-		nodeId(lsp),
-		new Map([
-			[
-				ASYNC_REGISTRATION_REQUEST_TLV_TYPE,
-				encodeRegistrationRequest({
-					version: REGISTRATION_REQUEST_VERSION,
-					chainHash: chainHashOf(lsp),
-					receiverNodeId: nodeId(from),
-					lspNodeId: nodeId(lsp),
-					scid: Buffer.alloc(8, 9),
-					requestedHoldBlocks: 0,
-					nonce,
-					...fields
-				})
-			]
-		])
+	const request = encodeRegistrationRequest(
+		signRegistrationRequest(
+			{
+				chainHash: chainHashOf(lsp),
+				receiverNodeId: nodeId(from),
+				lspNodeId: nodeId(lsp),
+				scid: Buffer.alloc(8, 9),
+				requestedHoldBlocks: 0,
+				timestamp: BigInt(nowSec()),
+				nonce: crypto.randomBytes(32),
+				...fields
+			},
+			signer
+		)
 	);
-	return nonce;
+	from
+		.getOnionMessageManager()
+		.sendMultiHopOnionMessage(
+			via.map(nodeId),
+			nodeId(lsp),
+			new Map([[ASYNC_REGISTRATION_REQUEST_TLV_TYPE, request]])
+		);
+	return request;
+}
+
+/** Capture the raw request TLVs a node sends (before they are wrapped). */
+function tapRequests(from: LightningNode): Buffer[] {
+	const captured: Buffer[] = [];
+	const om = from.getOnionMessageManager();
+	const original = om.sendOnionMessage.bind(om);
+	(om as { sendOnionMessage: typeof om.sendOnionMessage }).sendOnionMessage = (
+		destination,
+		data,
+		options
+	): void => {
+		const req = data.get(ASYNC_REGISTRATION_REQUEST_TLV_TYPE);
+		if (req) captured.push(Buffer.from(req));
+		original(destination, data, options);
+	};
+	return captured;
 }
 
 async function payAndSettle(
@@ -731,7 +760,7 @@ describe('Async receive service (issue #709)', () => {
 			// A request that reaches a disabled node anyway is ignored like any
 			// unknown TLV: no reply, no registration.
 			const replies = tapOnion(lsp, carol);
-			sendRawRequest(carol, lsp, { scid: w.scidBC });
+			sendRawRequest(carol, lsp, { scid: w.scidBC }, nodePrivkey(CAROL_SEED));
 			await settle();
 			expect(replies).to.have.length(0);
 			expect(lsp.listAsyncReceiveRegistrations()).to.have.length(0);
@@ -840,19 +869,34 @@ describe('Async receive service (issue #709)', () => {
 			const mallory = createNode(MALLORY_SEED);
 			wire(mallory, lsp, { val: false });
 			const malloryReplies = tapOnion(lsp, mallory);
+			const malloryKey = nodePrivkey(MALLORY_SEED);
 			// Mallory has no channel with the LSP.
-			sendRawRequest(mallory, lsp, {});
+			sendRawRequest(mallory, lsp, {}, malloryKey);
 			// Mallory names Carol's channel as hers.
-			sendRawRequest(mallory, lsp, { scid: w.scidBC });
-			// Mallory claims to be Carol.
-			sendRawRequest(mallory, lsp, {
-				receiverNodeId: nodeId(carol),
-				scid: w.scidBC
-			});
+			sendRawRequest(mallory, lsp, { scid: w.scidBC }, malloryKey);
+			// Mallory claims to be Carol: she cannot sign as Carol.
+			sendRawRequest(
+				mallory,
+				lsp,
+				{ receiverNodeId: nodeId(carol), scid: w.scidBC },
+				malloryKey
+			);
 			// Mallory asks another LSP through this one.
-			sendRawRequest(mallory, lsp, { lspNodeId: nodeId(mallory) });
+			sendRawRequest(mallory, lsp, { lspNodeId: nodeId(mallory) }, malloryKey);
 			// Mallory on the wrong chain.
-			sendRawRequest(mallory, lsp, { chainHash: BITCOIN_CHAIN_HASH });
+			sendRawRequest(
+				mallory,
+				lsp,
+				{ chainHash: BITCOIN_CHAIN_HASH },
+				malloryKey
+			);
+			// Mallory with yesterday's clock (a captured request replayed late).
+			sendRawRequest(
+				mallory,
+				lsp,
+				{ timestamp: BigInt(nowSec() - 86_400) },
+				malloryKey
+			);
 			// Garbage.
 			mallory
 				.getOnionMessageManager()
@@ -864,19 +908,20 @@ describe('Async receive service (issue #709)', () => {
 			expect(w.registrationRefusals).to.deep.equal([
 				'unknown_channel',
 				'channel_peer_mismatch',
-				'sender_mismatch',
+				'bad_signature',
 				'wrong_lsp',
 				'wrong_network',
+				'stale',
 				'malformed'
 			]);
-			expect(malloryReplies, 'every refusal answered').to.have.length(6);
+			expect(malloryReplies, 'every refusal answered').to.have.length(7);
 			expect(lsp.listAsyncReceiveRegistrations()).to.have.length(0);
 			expect(lsp.getAsyncReceiveServiceMetrics().registrationRefusals).to.equal(
-				6
+				7
 			);
 
 			// Carol registers; Mallory replays Carol's captured request from
-			// her own connection: the sender no longer matches.
+			// her own connection: the signature is Carol's, the nonce is spent.
 			const captured = tapOnion(carol, lsp);
 			await carol.requestAsyncReceiveGrant(lsp.getNodeId(), {
 				timeoutMs: 5_000
@@ -889,7 +934,7 @@ describe('Async receive service (issue #709)', () => {
 			);
 			await settle();
 			expect(w.registrationRefusals.slice(-1)).to.deep.equal([
-				'sender_mismatch'
+				'nonce_replayed'
 			]);
 			// A renewal from Carol supersedes her old registration rather than
 			// adding a second one.
@@ -980,6 +1025,213 @@ describe('Async receive service (issue #709)', () => {
 			expect(failures).to.include(MessageType.UPDATE_FAIL_HTLC);
 			expect(failures).to.not.include(MessageType.UPDATE_FAIL_MALFORMED_HTLC);
 			expect(unresolvedCount(lsp), 'the one admitted hold').to.equal(1);
+			destroyAll(alice, lsp, carol);
+		});
+	});
+
+	describe('review round 1', () => {
+		it('a third party cannot supersede a receiver registration by relaying a request through the receiver', async function () {
+			this.timeout(20_000);
+			// The LSP used to judge the sender by the onion message's TRANSPORT
+			// peer, which is only the last hop: Mallory built a two-hop onion
+			// Mallory -> Carol -> LSP naming Carol, Carol forwarded it, the LSP
+			// minted a new registration for Carol and REVOKED her live one as
+			// superseded, and every invoice she had issued was refused at
+			// admission. The request is now signed by the receiver's node key,
+			// and the signature is what the LSP judges.
+			const w = await setupWorld({ carolAutoRelease: false });
+			const { alice, lsp, carol } = w;
+			const [live] = lsp.listAsyncReceiveRegistrations();
+			expect(live.state).to.equal('ACTIVE');
+			const invoice = asyncInvoice(carol, 5_000_000n);
+
+			// Mallory is a peer of Carol only: no channel, no LSP connection.
+			const mallory = createNode(MALLORY_SEED);
+			wire(mallory, carol, { val: false });
+			// The best Mallory can do is sign the request herself...
+			sendRawRequest(
+				mallory,
+				lsp,
+				{ receiverNodeId: nodeId(carol), scid: w.scidBC },
+				nodePrivkey(MALLORY_SEED),
+				[carol]
+			);
+			await settle();
+			// ...or relay a request Carol genuinely signed, through Carol.
+			const captured = tapRequests(carol);
+			await carol.requestAsyncReceiveGrant(lsp.getNodeId(), {
+				timeoutMs: 5_000
+			});
+			expect(captured).to.have.length(1);
+			const [renewal] = lsp
+				.listAsyncReceiveRegistrations()
+				.filter((r) => r.state === 'ACTIVE');
+			mallory
+				.getOnionMessageManager()
+				.sendMultiHopOnionMessage(
+					[nodeId(carol)],
+					nodeId(lsp),
+					new Map([[ASYNC_REGISTRATION_REQUEST_TLV_TYPE, captured[0]]])
+				);
+			await settle();
+
+			const after = lsp.listAsyncReceiveRegistrations();
+			expect(
+				after.find((r) => r.id === renewal.id)!.state,
+				"Carol's own registration must survive a stranger's requests"
+			).to.equal('ACTIVE');
+			expect(after.filter((r) => r.state === 'ACTIVE')).to.have.length(1);
+			expect(w.registrationRefusals).to.deep.equal([
+				'bad_signature',
+				'nonce_replayed'
+			]);
+			destroyAll(alice, lsp, carol, mallory);
+			void invoice;
+		});
+
+		it('a hold admitted under a grant that then expires is still released by the receiver', async function () {
+			this.timeout(20_000);
+			// The LSP checks the registration at admission only, and honours a
+			// capability naming the hold's own registration id after the grant
+			// expired. The receiver used to sign with its LIVE grant's id (or
+			// the derived placeholder once it had none) and to filter notice
+			// entries by that single id, so the hold sat until its cutoff. The
+			// receiver now keeps every grant and signs with the registration
+			// the notice reports for the hold.
+			const realNow = Date.now;
+			let skewMs = 0;
+			Date.now = (): number => realNow() + skewMs;
+			try {
+				const w = await setupWorld({
+					lspService: { enabled: true, grantTtlSec: 5 },
+					carolAutoRelease: true
+				});
+				const { alice, lsp, carol } = w;
+				const invoice = asyncInvoice(carol, 5_000_000n);
+				await disconnect(lsp, carol, w.cutBC);
+				alice.sendPayment(invoice.bolt11);
+				await settle();
+				const [row] = heldRecords(lsp);
+				expect(row.state).to.equal('HELD');
+
+				// The grant expires while the hold is parked; Carol comes back
+				// and gets the LSP's notice (auto-release), then the host path.
+				skewMs = 10_000;
+				await reconnect(lsp, carol, w.cutBC, w.gateBC);
+				await settle();
+				carol.sendAsyncRelease(
+					nodeId(lsp),
+					[Buffer.from(row.id, 'hex')],
+					BigInt(row.forwardAmountMsat)
+				);
+				await settle();
+				// The auto-release already moved the hold, so the host's own
+				// capability (a fresh nonce for a set that left HELD) is the
+				// documented duplicate no-op; what must never happen is a
+				// refusal on the registration.
+				expect(w.refusals).to.not.include('registration_mismatch');
+				expect(w.refusals).to.not.include('unknown_hold');
+				await waitFor(
+					() =>
+						carol.getPayment(invoice.paymentHash)?.status ===
+						PaymentStatus.COMPLETED,
+					'Carol to be paid for a hold the LSP still honours',
+					3_000
+				);
+				destroyAll(alice, lsp, carol);
+			} finally {
+				Date.now = realNow;
+			}
+		});
+
+		it('a receiver that renews its grant can still release the holds parked under the previous registration', async function () {
+			this.timeout(20_000);
+			// "A renewal supersedes; holds already admitted under it resolve on
+			// their own terms": the receiver used to sign every capability with
+			// the NEW registration id and the LSP refused registration_mismatch.
+			const w = await setupWorld({ carolAutoRelease: false });
+			const { alice, lsp, carol } = w;
+			const invoice = asyncInvoice(carol, 5_000_000n);
+			await disconnect(lsp, carol, w.cutBC);
+			alice.sendPayment(invoice.bolt11);
+			await settle();
+			const [row] = heldRecords(lsp);
+			expect(row.state).to.equal('HELD');
+
+			await reconnect(lsp, carol, w.cutBC, w.gateBC);
+			// The wallet re-registers on connect (a renewal).
+			await carol.requestAsyncReceiveGrant(lsp.getNodeId(), {
+				timeoutMs: 5_000
+			});
+			expect(carol.listAsyncReceiveGrants(), 'both grants kept').to.have.length(
+				2
+			);
+			carol.sendAsyncRelease(
+				nodeId(lsp),
+				[Buffer.from(row.id, 'hex')],
+				BigInt(row.forwardAmountMsat)
+			);
+			await settle();
+			expect(w.refusals, 'no release refused').to.deep.equal([]);
+			await waitFor(
+				() =>
+					carol.getPayment(invoice.paymentHash)?.status ===
+					PaymentStatus.COMPLETED,
+				'Carol to be paid after renewing',
+				3_000
+			);
+			destroyAll(alice, lsp, carol);
+		});
+
+		it('a receiver cannot refill exhausted admission credit by re-registering', async function () {
+			this.timeout(20_000);
+			// Every registration row used to start at initialCreditMsat with
+			// credit judged per registration, so a renewal (any fresh nonce)
+			// reset the abandoned-hold price at will. Credit is now per
+			// receiver: the initial credit lands once, a renewal carries the
+			// balance.
+			const w = await setupWorld({
+				lspService: {
+					enabled: true,
+					admissionFeeMsat: 1_000n,
+					initialCreditMsat: 1_000n
+				},
+				carolAutoRelease: false
+			});
+			const { alice, lsp, carol } = w;
+			const first = asyncInvoice(carol, 5_000_000n);
+			await disconnect(lsp, carol, w.cutBC);
+			alice.sendPayment(first.bolt11);
+			await settle();
+			expect(heldRecords(lsp).map((r) => r.state)).to.deep.equal(['HELD']);
+			const [oldGrant] = carol.listAsyncReceiveGrants();
+			expect(
+				lsp
+					.getAsyncReceiveService()
+					.creditRemainingMsat(oldGrant.registrationId.toString('hex'))
+			).to.equal(0n);
+
+			// Carol renews and issues a new invoice under the new registration.
+			await reconnect(lsp, carol, w.cutBC, w.gateBC);
+			const renewed = await carol.requestAsyncReceiveGrant(lsp.getNodeId(), {
+				timeoutMs: 5_000
+			});
+			expect(
+				renewed.creditMsat,
+				'the grant reports the carried balance'
+			).to.equal(0n);
+			const second = asyncInvoice(carol, 5_000_000n);
+			await disconnect(lsp, carol, w.cutBC);
+			alice.sendPayment(second.bolt11);
+			await settle();
+			expect(
+				w.admissionRefusals,
+				'the second part must be refused for exhausted credit'
+			).to.deep.equal(['credit_exhausted']);
+			expect(
+				heldRecords(lsp).filter((r) => r.state === 'HELD'),
+				'no second reservation'
+			).to.have.length(1);
 			destroyAll(alice, lsp, carol);
 		});
 	});

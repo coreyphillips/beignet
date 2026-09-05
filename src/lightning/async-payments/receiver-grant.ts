@@ -12,17 +12,30 @@
  * the peer on the outgoing channel and whose permitted SCID is the channel
  * the path forwards onto.
  *
- * Request (all integers big-endian):
+ * Request (all integers big-endian), SIGNED by the receiver's node key: an
+ * onion message reaches the LSP from whichever peer forwarded it last, so
+ * the transport peer proves nothing about who wrote it (review round 1: a
+ * stranger could relay a request naming the receiver THROUGH the receiver
+ * and supersede its live registration). The signature is what the LSP
+ * judges; the transport peer is not consulted.
  *
  *   version            u8   (1)
  *   chain_hash         32
- *   receiver_node_id   33   must be the onion message's authenticated sender
+ *   receiver_node_id   33   the signer, and the receiver being registered
  *   lsp_node_id        33   the node being asked
  *   scid               8    the LSP -> receiver channel the receiver will
  *                           name in its paths (its intercept identifier)
  *   requested_blocks   u16  hold window wanted; 0 = the service default
+ *   timestamp          u64  unix seconds; refused when older than
+ *                           REGISTRATION_REQUEST_MAX_AGE_SEC, so a captured
+ *                           request outlives the replay record it would
+ *                           need to be refused by
  *   nonce              32   random; the replay domain of the request AND
  *                           of the grant it produces (see below)
+ *
+ *   digest    = taggedHash("beignet/async-payments/registration-request/v1", body)
+ *   signature = ECDSA(receiver node key, digest), 64-byte compact
+ *   wire      = body || signature
  *
  * Grant body:
  *
@@ -72,11 +85,15 @@ import { sign, verify } from '../crypto/ecdh';
 export const RECEIVER_GRANT_VERSION = 1;
 export const REGISTRATION_REQUEST_VERSION = 1;
 const GRANT_TAG = 'beignet/async-payments/receiver-grant/v1';
+const REQUEST_TAG = 'beignet/async-payments/registration-request/v1';
+
+/** A request older than this (or further in the future) is refused. */
+export const REGISTRATION_REQUEST_MAX_AGE_SEC = 600;
 
 /** The only defined fee-collection scheme (see the module comment). */
 export const FEE_COLLECTION_PREPAID_ADMISSION_SENDER_HOLDING = 1;
 
-const REQUEST_LEN = 1 + 32 + 33 + 33 + 8 + 2 + 32;
+const REQUEST_BODY_LEN = 1 + 32 + 33 + 33 + 8 + 2 + 8 + 32;
 const GRANT_BODY_LEN =
 	1 +
 	2 +
@@ -109,8 +126,16 @@ export interface IRegistrationRequest {
 	lspNodeId: Buffer;
 	scid: Buffer;
 	requestedHoldBlocks: number;
+	/** Unix seconds. */
+	timestamp: bigint;
 	nonce: Buffer;
+	signature: Buffer;
 }
+
+export type IUnsignedRegistrationRequest = Omit<
+	IRegistrationRequest,
+	'signature'
+>;
 
 export interface IReceiverGrant {
 	version: number;
@@ -163,13 +188,13 @@ function expectLen(buf: Buffer, len: number, what: string): void {
 
 // ─────────────── Request ───────────────
 
-export function encodeRegistrationRequest(req: IRegistrationRequest): Buffer {
+function encodeRequestBody(req: IUnsignedRegistrationRequest): Buffer {
 	expectLen(req.chainHash, 32, 'chain hash');
 	expectLen(req.receiverNodeId, 33, 'receiver node id');
 	expectLen(req.lspNodeId, 33, 'lsp node id');
 	expectLen(req.scid, 8, 'scid');
 	expectLen(req.nonce, 32, 'nonce');
-	const buf = Buffer.alloc(REQUEST_LEN);
+	const buf = Buffer.alloc(REQUEST_BODY_LEN);
 	let off = 0;
 	buf.writeUInt8(req.version, off);
 	off += 1;
@@ -183,14 +208,46 @@ export function encodeRegistrationRequest(req: IRegistrationRequest): Buffer {
 	off += 8;
 	buf.writeUInt16BE(req.requestedHoldBlocks, off);
 	off += 2;
+	buf.writeBigUInt64BE(req.timestamp, off);
+	off += 8;
 	req.nonce.copy(buf, off);
 	return buf;
 }
 
+/** The digest the receiver signs. */
+export function registrationRequestDigest(
+	req: IUnsignedRegistrationRequest
+): Buffer {
+	return taggedHash(REQUEST_TAG, encodeRequestBody(req));
+}
+
+/** Build and sign a request with the receiver's node private key. */
+export function signRegistrationRequest(
+	fields: Omit<IUnsignedRegistrationRequest, 'version'>,
+	receiverNodePrivkey: Buffer
+): IRegistrationRequest {
+	const unsigned: IUnsignedRegistrationRequest = {
+		...fields,
+		version: REGISTRATION_REQUEST_VERSION
+	};
+	const signature = sign(
+		registrationRequestDigest(unsigned),
+		receiverNodePrivkey
+	);
+	return { ...unsigned, signature };
+}
+
+/** Serialize for the wire (body || signature). */
+export function encodeRegistrationRequest(req: IRegistrationRequest): Buffer {
+	expectLen(req.signature, SIGNATURE_LEN, 'signature');
+	return Buffer.concat([encodeRequestBody(req), req.signature]);
+}
+
+/** Parse wire bytes; null when malformed. Does NOT verify the signature. */
 export function decodeRegistrationRequest(
 	buf: Buffer
 ): IRegistrationRequest | null {
-	if (buf.length !== REQUEST_LEN) return null;
+	if (buf.length !== REQUEST_BODY_LEN + SIGNATURE_LEN) return null;
 	let off = 0;
 	const version = buf.readUInt8(off);
 	off += 1;
@@ -205,7 +262,11 @@ export function decodeRegistrationRequest(
 	off += 8;
 	const requestedHoldBlocks = buf.readUInt16BE(off);
 	off += 2;
+	const timestamp = buf.readBigUInt64BE(off);
+	off += 8;
 	const nonce = Buffer.from(buf.subarray(off, off + 32));
+	off += 32;
+	const signature = Buffer.from(buf.subarray(off, off + SIGNATURE_LEN));
 	return {
 		version,
 		chainHash,
@@ -213,8 +274,27 @@ export function decodeRegistrationRequest(
 		lspNodeId,
 		scid,
 		requestedHoldBlocks,
-		nonce
+		timestamp,
+		nonce,
+		signature
 	};
+}
+
+/**
+ * Verify the signature against the receiver the request names. That
+ * identity, not the peer the message arrived from, is who asked.
+ */
+export function verifyRegistrationRequest(req: IRegistrationRequest): boolean {
+	if (req.signature.length !== SIGNATURE_LEN) return false;
+	try {
+		return verify(
+			registrationRequestDigest(req),
+			req.receiverNodeId,
+			req.signature
+		);
+	} catch {
+		return false;
+	}
 }
 
 // ─────────────── Grant ───────────────

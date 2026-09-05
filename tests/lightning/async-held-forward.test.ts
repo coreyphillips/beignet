@@ -1093,22 +1093,3 @@ describe('Async held forwards, review round 1 (issue #708)', () => {
 		});
 	});
 });
-
-function buildOnionFrom(
-	from: LightningNode,
-	to: Buffer,
-	payload: Buffer
-): Buffer {
-	let captured: Buffer | null = null;
-	const om = from.getOnionMessageManager();
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const saved = (om as any).sendMessage;
-	om.setSendFunction((_peer: string, _type: number, p: Buffer) => {
-		captured = Buffer.from(p);
-	});
-	om.sendOnionMessage(to, new Map([[RELEASE_HELD_HTLC_TLV_TYPE, payload]]));
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	(om as any).sendMessage = saved;
-	expect(captured, 'onion message built').to.not.equal(null);
-	return captured!;
-}

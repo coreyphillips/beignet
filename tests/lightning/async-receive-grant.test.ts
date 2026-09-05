@@ -19,11 +19,11 @@ import {
 import {
 	AsyncReceiveService,
 	IAdmissionCandidate,
-	IAsyncRegistrationRecord
+	IAsyncRegistrationRecord,
+	MAX_REGISTRATION_ROWS_PER_RECEIVER
 } from '../../src/lightning/async-payments/service';
 import {
 	IReceiverGrant,
-	REGISTRATION_REQUEST_VERSION,
 	decodeReceiverGrant,
 	decodeRegistrationReply,
 	decodeRegistrationRequest,
@@ -32,7 +32,9 @@ import {
 	encodeRegistrationRequest,
 	holdingFeeForWindowMsat,
 	signReceiverGrant,
-	verifyReceiverGrant
+	signRegistrationRequest,
+	verifyReceiverGrant,
+	verifyRegistrationRequest
 } from '../../src/lightning/async-payments/receiver-grant';
 import { IAsyncReceiveServiceConfig } from '../../src/lightning/async-payments/types';
 
@@ -80,22 +82,41 @@ function sampleGrant(
 }
 
 describe('Async receive grant codecs (issue #709)', () => {
-	it('round-trips a registration request and refuses the wrong length', () => {
-		const req = {
-			version: REGISTRATION_REQUEST_VERSION,
-			chainHash: CHAIN,
-			receiverNodeId: CAROL_ID,
-			lspNodeId: LSP_ID,
-			scid: SCID_CAROL,
-			requestedHoldBlocks: 72,
-			nonce: crypto.randomBytes(32)
-		};
+	it('round-trips a signed registration request, verifies the signer, and refuses the wrong length', () => {
+		const req = signRegistrationRequest(
+			{
+				chainHash: CHAIN,
+				receiverNodeId: CAROL_ID,
+				lspNodeId: LSP_ID,
+				scid: SCID_CAROL,
+				requestedHoldBlocks: 72,
+				timestamp: 1_700_000_000n,
+				nonce: crypto.randomBytes(32)
+			},
+			CAROL_KEY
+		);
 		const wire = encodeRegistrationRequest(req);
-		expect(wire).to.have.length(1 + 32 + 33 + 33 + 8 + 2 + 32);
+		expect(wire).to.have.length(1 + 32 + 33 + 33 + 8 + 2 + 8 + 32 + 64);
 		const back = decodeRegistrationRequest(wire)!;
 		expect(back.requestedHoldBlocks).to.equal(72);
+		expect(back.timestamp).to.equal(1_700_000_000n);
 		expect(back.receiverNodeId.equals(CAROL_ID)).to.equal(true);
 		expect(back.nonce.equals(req.nonce)).to.equal(true);
+		expect(verifyRegistrationRequest(back)).to.equal(true);
+		// Every body byte is under the receiver's signature; another key
+		// cannot speak for the receiver it names.
+		for (let i = 1; i < wire.length - 64; i++) {
+			const tampered = Buffer.from(wire);
+			tampered[i] ^= 0x01;
+			expect(
+				verifyRegistrationRequest(decodeRegistrationRequest(tampered)!),
+				`byte ${i}`
+			).to.equal(false);
+		}
+		expect(
+			verifyRegistrationRequest(signRegistrationRequest(req, DAVE_KEY)),
+			'signed by someone else'
+		).to.equal(false);
 		expect(decodeRegistrationRequest(wire.subarray(1))).to.equal(null);
 		expect(
 			decodeRegistrationRequest(Buffer.concat([wire, Buffer.alloc(1)]))
@@ -208,22 +229,33 @@ describe('AsyncReceiveService in isolation (issue #709)', () => {
 		);
 	}
 
+	/** A request signed by `key`, naming its public key, delivered from `via`. */
 	function register(
-		receiver: Buffer,
+		key: Buffer,
 		scid: Buffer,
-		nonce = crypto.randomBytes(32)
+		nonce = crypto.randomBytes(32),
+		over: {
+			requestedHoldBlocks?: number;
+			timestamp?: bigint;
+			via?: string;
+		} = {}
 	): ReturnType<AsyncReceiveService['handleRegistrationRequest']> {
 		return svc.handleRegistrationRequest(
-			receiver.toString('hex'),
-			encodeRegistrationRequest({
-				version: REGISTRATION_REQUEST_VERSION,
-				chainHash: CHAIN,
-				receiverNodeId: receiver,
-				lspNodeId: LSP_ID,
-				scid,
-				requestedHoldBlocks: 0,
-				nonce
-			})
+			over.via ?? getPublicKey(key).toString('hex'),
+			encodeRegistrationRequest(
+				signRegistrationRequest(
+					{
+						chainHash: CHAIN,
+						receiverNodeId: getPublicKey(key),
+						lspNodeId: LSP_ID,
+						scid,
+						requestedHoldBlocks: over.requestedHoldBlocks ?? 0,
+						timestamp: over.timestamp ?? BigInt(Math.floor(clock / 1000)),
+						nonce
+					},
+					key
+				)
+			)
 		);
 	}
 
@@ -286,7 +318,7 @@ describe('AsyncReceiveService in isolation (issue #709)', () => {
 	it('is disabled by default and then grants, admits and answers nothing', () => {
 		build({ enabled: false });
 		expect(svc.isEnabled()).to.equal(false);
-		const reply = register(CAROL_ID, SCID_CAROL);
+		const reply = register(CAROL_KEY, SCID_CAROL);
 		expect(reply).to.deep.include({
 			granted: false,
 			reason: 'service_disabled'
@@ -309,7 +341,7 @@ describe('AsyncReceiveService in isolation (issue #709)', () => {
 			initialCreditMsat: 70n,
 			grantTtlSec: 3600
 		});
-		const grant = grantOf(register(CAROL_ID, SCID_CAROL));
+		const grant = grantOf(register(CAROL_KEY, SCID_CAROL));
 		expect(verifyReceiverGrant(grant)).to.equal(true);
 		expect(grant.lspNodeId.equals(LSP_ID)).to.equal(true);
 		expect(grant.receiverNodeId.equals(CAROL_ID)).to.equal(true);
@@ -323,22 +355,13 @@ describe('AsyncReceiveService in isolation (issue #709)', () => {
 		// A requested window shorter than the service maximum is honoured; a
 		// longer one is capped.
 		const short = grantOf(
-			svc.handleRegistrationRequest(
-				DAVE_ID.toString('hex'),
-				encodeRegistrationRequest({
-					version: REGISTRATION_REQUEST_VERSION,
-					chainHash: CHAIN,
-					receiverNodeId: DAVE_ID,
-					lspNodeId: LSP_ID,
-					scid: SCID_DAVE,
-					requestedHoldBlocks: 40,
-					nonce: crypto.randomBytes(32)
-				})
-			)
+			register(DAVE_KEY, SCID_DAVE, crypto.randomBytes(32), {
+				requestedHoldBlocks: 40
+			})
 		);
 		expect(short.maxHoldBlocks).to.equal(40);
 		// Renewal supersedes: one ACTIVE registration per (receiver, channel).
-		const renewed = grantOf(register(CAROL_ID, SCID_CAROL));
+		const renewed = grantOf(register(CAROL_KEY, SCID_CAROL));
 		expect(renewed.registrationId.equals(grant.registrationId)).to.equal(false);
 		const rows = svc.listRegistrations();
 		expect(rows).to.have.length(3);
@@ -357,18 +380,106 @@ describe('AsyncReceiveService in isolation (issue #709)', () => {
 	it('refuses replayed nonces and a receiver over the receiver ceiling', () => {
 		build({ enabled: true, maxReceivers: 1 });
 		const nonce = crypto.randomBytes(32);
-		expect(register(CAROL_ID, SCID_CAROL, nonce).granted).to.equal(true);
-		expect(register(CAROL_ID, SCID_CAROL, nonce)).to.deep.include({
+		expect(register(CAROL_KEY, SCID_CAROL, nonce).granted).to.equal(true);
+		expect(register(CAROL_KEY, SCID_CAROL, nonce)).to.deep.include({
 			granted: false,
 			reason: 'nonce_replayed'
 		});
 		// Carol renewing (fresh nonce) is not a second receiver; Dave is.
-		expect(register(CAROL_ID, SCID_CAROL).granted).to.equal(true);
-		expect(register(DAVE_ID, SCID_DAVE)).to.deep.include({
+		expect(register(CAROL_KEY, SCID_CAROL).granted).to.equal(true);
+		expect(register(DAVE_KEY, SCID_DAVE)).to.deep.include({
 			granted: false,
 			reason: 'too_many_receivers'
 		});
 		expect(svc.metrics().registrationRefusals).to.equal(2);
+	});
+
+	it('judges the signer, not the transport peer, and refuses stale requests', () => {
+		build({ enabled: true });
+		// Carol's genuine request routed through Dave: granted to Carol.
+		const viaDave = register(CAROL_KEY, SCID_CAROL, crypto.randomBytes(32), {
+			via: DAVE_ID.toString('hex')
+		});
+		expect(viaDave.granted).to.equal(true);
+		expect(grantOf(viaDave).receiverNodeId.equals(CAROL_ID)).to.equal(true);
+		// Dave signing a request that names Carol, delivered from Carol: the
+		// signature does not verify against the receiver named.
+		const forged = svc.handleRegistrationRequest(
+			CAROL_ID.toString('hex'),
+			encodeRegistrationRequest(
+				signRegistrationRequest(
+					{
+						chainHash: CHAIN,
+						receiverNodeId: CAROL_ID,
+						lspNodeId: LSP_ID,
+						scid: SCID_CAROL,
+						requestedHoldBlocks: 0,
+						timestamp: BigInt(Math.floor(clock / 1000)),
+						nonce: crypto.randomBytes(32)
+					},
+					DAVE_KEY
+				)
+			)
+		);
+		expect(forged).to.deep.include({ granted: false, reason: 'bad_signature' });
+		expect(svc.activeRegistrations()).to.have.length(1);
+		// A request from too long ago (a capture) is stale whatever its nonce.
+		expect(
+			register(CAROL_KEY, SCID_CAROL, crypto.randomBytes(32), {
+				timestamp: BigInt(Math.floor(clock / 1000) - 3600)
+			})
+		).to.deep.include({ granted: false, reason: 'stale' });
+		expect(
+			register(CAROL_KEY, SCID_CAROL, crypto.randomBytes(32), {
+				timestamp: BigInt(Math.floor(clock / 1000) + 3600)
+			})
+		).to.deep.include({ granted: false, reason: 'stale' });
+	});
+
+	it("carries credit across renewals and bounds a receiver's rows", () => {
+		build({ enabled: true, admissionFeeMsat: 100n, initialCreditMsat: 250n });
+		const first = grantOf(register(CAROL_KEY, SCID_CAROL));
+		expect(first.creditMsat).to.equal(250n);
+		expect(park(first).ok).to.equal(true);
+		expect(park(first).ok).to.equal(true);
+		const firstId = first.registrationId.toString('hex');
+		expect(svc.creditRemainingMsat(firstId)).to.equal(50n);
+		// A renewal reports the balance carried, not a fresh initial credit,
+		// and admits nothing the old registration could not have.
+		const renewed = grantOf(register(CAROL_KEY, SCID_CAROL));
+		const renewedId = renewed.registrationId.toString('hex');
+		expect(renewed.creditMsat).to.equal(50n);
+		expect(svc.creditRemainingMsat(renewedId)).to.equal(50n);
+		expect(park(renewed)).to.deep.include({
+			ok: false,
+			reason: 'credit_exhausted'
+		});
+		// A top-up lands on the receiver, whichever row it names.
+		expect(svc.creditRegistration(firstId, 50n)).to.equal(true);
+		expect(svc.creditRemainingMsat(renewedId)).to.equal(100n);
+		expect(park(renewed).ok).to.equal(true);
+		expect(svc.creditSpentMsat(renewedId)).to.equal(300n);
+		// Renewing on every connect does not grow the ledger without bound:
+		// the oldest revoked rows are folded into the newest and forgotten,
+		// and the balance survives the fold.
+		let latest = renewed;
+		for (let i = 0; i < MAX_REGISTRATION_ROWS_PER_RECEIVER + 4; i++) {
+			latest = grantOf(register(CAROL_KEY, SCID_CAROL));
+		}
+		expect(svc.listRegistrations()).to.have.length(
+			MAX_REGISTRATION_ROWS_PER_RECEIVER
+		);
+		expect(svc.activeRegistrations()).to.have.length(1);
+		expect(svc.getRegistration(firstId), 'the first row was folded').to.equal(
+			undefined
+		);
+		const latestId = latest.registrationId.toString('hex');
+		expect(svc.creditRemainingMsat(latestId)).to.equal(0n);
+		expect(svc.creditSpentMsat(latestId)).to.equal(300n);
+		expect(park(latest)).to.deep.include({
+			ok: false,
+			reason: 'credit_exhausted'
+		});
 	});
 
 	it('enforces global count, value and bytes across receivers, and per-receiver bytes', () => {
@@ -381,8 +492,8 @@ describe('AsyncReceiveService in isolation (issue #709)', () => {
 			maxPartsPerReceiver: 10,
 			maxHeldMsatPerReceiver: 10_000_000n
 		});
-		const carol = grantOf(register(CAROL_ID, SCID_CAROL));
-		const dave = grantOf(register(DAVE_ID, SCID_DAVE));
+		const carol = grantOf(register(CAROL_KEY, SCID_CAROL));
+		const dave = grantOf(register(DAVE_KEY, SCID_DAVE));
 		expect(park(carol).ok).to.equal(true);
 		expect(park(carol).ok).to.equal(true);
 		// Carol's third hold is over her byte ceiling, whatever else fits.
@@ -432,7 +543,7 @@ describe('AsyncReceiveService in isolation (issue #709)', () => {
 			maxHoldBlocks: 50,
 			initialCreditMsat: 250n
 		});
-		const grant = grantOf(register(CAROL_ID, SCID_CAROL));
+		const grant = grantOf(register(CAROL_KEY, SCID_CAROL));
 		const regId = grant.registrationId.toString('hex');
 		expect(holdingFeeForWindowMsat(grant)).to.equal(100n);
 		// The payer must carry the holding fee on top of the policy fee.
@@ -478,7 +589,7 @@ describe('AsyncReceiveService in isolation (issue #709)', () => {
 			minRemainingCltv: 10,
 			grantTtlSec: 100
 		});
-		const grant = grantOf(register(CAROL_ID, SCID_CAROL));
+		const grant = grantOf(register(CAROL_KEY, SCID_CAROL));
 		const long = svc.admit(
 			candidate(grant, { proposedCutoffHeight: height + 500 })
 		);
@@ -508,7 +619,7 @@ describe('AsyncReceiveService in isolation (issue #709)', () => {
 
 	it('scopes admission to the registered receiver and channel, and reports refusals', () => {
 		build({ enabled: true });
-		const grant = grantOf(register(CAROL_ID, SCID_CAROL));
+		const grant = grantOf(register(CAROL_KEY, SCID_CAROL));
 		expect(
 			svc.admit(
 				candidate(grant, { receiverNodeIdHex: DAVE_ID.toString('hex') })

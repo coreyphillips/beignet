@@ -382,13 +382,13 @@ import {
 } from '../async-payments/service';
 import {
 	IReceiverGrant,
-	REGISTRATION_REQUEST_VERSION,
 	decodeReceiverGrant,
 	decodeRegistrationReply,
 	encodeReceiverGrant,
 	encodeRegistrationReply,
 	encodeRegistrationRequest,
 	holdingFeeForWindowMsat,
+	signRegistrationRequest,
 	verifyReceiverGrant
 } from '../async-payments/receiver-grant';
 import { ONION_PACKET_LENGTH } from '../onion/types';
@@ -475,6 +475,14 @@ const HELD_FORWARD_ROW_BYTES = 1024;
 const ASYNC_RECEIVE_GRANTS_KEY = 'async_receive_grants';
 /** Default wait for an LSP's answer to a registration request. */
 const ASYNC_GRANT_REQUEST_TIMEOUT_MS = 30_000;
+/** Grants kept per LSP (newest first); older ones are dropped. */
+const ASYNC_GRANTS_PER_LSP = 16;
+/**
+ * How long an expired grant is kept: a hold parked under it in its last
+ * block lives at most its window (144 blocks by default, about a day), so a
+ * week covers any window an operator would configure.
+ */
+const ASYNC_GRANT_RETENTION_SEC = 7 * 24 * 3600;
 
 /**
  * Largest block-height overshoot we will act on from a peer's
@@ -926,11 +934,21 @@ export class LightningNode extends EventEmitter {
 	 */
 	private asyncReceiveService: AsyncReceiveService;
 	/**
-	 * Receiver role (issue #709): grants this node holds, by LSP node id hex.
-	 * A blinded payment path is marked hold_htlc only through a peer with a
-	 * live grant here, under that grant's registration id.
+	 * Receiver role (issue #709): every grant this node holds, by LSP node id
+	 * hex, newest first. A blinded payment path is marked hold_htlc only
+	 * through a peer with a LIVE grant here, under that grant's registration
+	 * id; the older grants stay (review round 1) because a hold parked under
+	 * one resolves under it, whether the grant has expired or been
+	 * superseded by a renewal since. Bounded per LSP; a grant expired for
+	 * longer than any hold window outlives is dropped.
 	 */
-	private asyncReceiveGrants = new Map<string, IReceiverGrant>();
+	private asyncReceiveGrants = new Map<string, IReceiverGrant[]>();
+	/**
+	 * Receiver role: the registration id the LSP's notice reported for each
+	 * hold, by hold id hex. A release names the registration its hold was
+	 * parked under, which the notice knows and a renewal does not change.
+	 */
+	private noticedHoldRegistrations = new Map<string, Buffer>();
 	private pendingGrantRequests = new Map<
 		string,
 		{
@@ -1597,8 +1615,8 @@ export class LightningNode extends EventEmitter {
 				) !== null,
 			incomingUnresolved: (record) =>
 				this.heldForwardIncomingUnresolved(record),
-			registrationIdFor: (lspNodeIdHex) =>
-				this.liveAsyncReceiveGrant(lspNodeIdHex)?.registrationId,
+			registrationIdFor: (lspNodeIdHex, holdIds) =>
+				this.asyncReleaseRegistrationId(lspNodeIdHex, holdIds),
 			canForwardSet: (records) => this.canForwardHeldSet(records)
 		});
 		this.asyncPaymentManager.attachOnionMessageManager(
@@ -16423,9 +16441,15 @@ export class LightningNode extends EventEmitter {
 							? { registrationId: reply.grant.registrationId.toString('hex') }
 							: { reason: reply.reason })
 					});
+					// The grant goes to the receiver that SIGNED the request, who
+					// may have routed it through anyone; a refusal goes back the
+					// way the message came, never to a receiver a stranger named.
+					const replyTo = reply.granted
+						? reply.grant.receiverNodeId
+						: Buffer.from(fromPeer, 'hex');
 					try {
 						om.sendOnionMessage(
-							Buffer.from(fromPeer, 'hex'),
+							replyTo,
 							new Map([
 								[
 									ASYNC_REGISTRATION_REPLY_TLV_TYPE,
@@ -16506,15 +16530,20 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 		const nonce = crypto.randomBytes(32);
-		const request = encodeRegistrationRequest({
-			version: REGISTRATION_REQUEST_VERSION,
-			chainHash: this.acceptableChainHashes[0] ?? this.chainHash(),
-			receiverNodeId: getPublicKey(this.nodePrivkey),
-			lspNodeId: Buffer.from(lspNodeIdHex, 'hex'),
-			scid,
-			requestedHoldBlocks: options.requestedHoldBlocks ?? 0,
-			nonce
-		});
+		const request = encodeRegistrationRequest(
+			signRegistrationRequest(
+				{
+					chainHash: this.acceptableChainHashes[0] ?? this.chainHash(),
+					receiverNodeId: getPublicKey(this.nodePrivkey),
+					lspNodeId: Buffer.from(lspNodeIdHex, 'hex'),
+					scid,
+					requestedHoldBlocks: options.requestedHoldBlocks ?? 0,
+					timestamp: BigInt(Math.floor(Date.now() / 1000)),
+					nonce
+				},
+				this.nodePrivkey
+			)
+		);
 		const nonceHex = nonce.toString('hex');
 		return new Promise<IReceiverGrant>((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -16585,7 +16614,7 @@ export class LightningNode extends EventEmitter {
 		}
 		clearTimeout(pending.timer);
 		this.pendingGrantRequests.delete(nonceHex);
-		this.asyncReceiveGrants.set(fromPeer, grant);
+		this.rememberAsyncReceiveGrant(grant);
 		this.persistAsyncReceiveGrants();
 		this.emit('async-receive:granted', grant);
 		pending.resolve(grant);
@@ -16599,7 +16628,7 @@ export class LightningNode extends EventEmitter {
 	 */
 	private judgeAsyncReceiveGrant(
 		grant: IReceiverGrant,
-		expect: { lspNodeIdHex?: string; scidHex?: string }
+		expect: { lspNodeIdHex?: string; scidHex?: string; allowExpired?: boolean }
 	): string | null {
 		const lspHex = grant.lspNodeId.toString('hex');
 		if (expect.lspNodeIdHex && lspHex !== expect.lspNodeIdHex) {
@@ -16614,7 +16643,10 @@ export class LightningNode extends EventEmitter {
 			return 'wrong_channel';
 		}
 		if (!verifyReceiverGrant(grant)) return 'bad_signature';
-		if (BigInt(Math.floor(Date.now() / 1000)) >= grant.expiresAt) {
+		if (
+			!expect.allowExpired &&
+			BigInt(Math.floor(Date.now() / 1000)) >= grant.expiresAt
+		) {
 			return 'expired';
 		}
 		return null;
@@ -16636,33 +16668,48 @@ export class LightningNode extends EventEmitter {
 		if (!ours || !ours.equals(grant.scid)) {
 			throw new Error('async receive grant rejected: wrong_channel');
 		}
-		this.asyncReceiveGrants.set(lspHex, grant);
+		this.rememberAsyncReceiveGrant(grant);
 		this.persistAsyncReceiveGrants();
 		return grant;
 	}
 
-	/** Receiver: the grants this node holds, by LSP. */
-	listAsyncReceiveGrants(): IReceiverGrant[] {
-		return [...this.asyncReceiveGrants.values()];
+	/**
+	 * Keep a grant, newest first per LSP. A grant already held (same
+	 * registration id) is not duplicated; the list is bounded, and a grant
+	 * expired for longer than a hold could outlive it is dropped.
+	 */
+	private rememberAsyncReceiveGrant(grant: IReceiverGrant): void {
+		const lspHex = grant.lspNodeId.toString('hex');
+		const nowSec = BigInt(Math.floor(Date.now() / 1000));
+		const kept = (this.asyncReceiveGrants.get(lspHex) ?? []).filter(
+			(g) =>
+				!g.registrationId.equals(grant.registrationId) &&
+				g.expiresAt + BigInt(ASYNC_GRANT_RETENTION_SEC) > nowSec
+		);
+		kept.unshift(grant);
+		this.asyncReceiveGrants.set(lspHex, kept.slice(0, ASYNC_GRANTS_PER_LSP));
 	}
 
-	/** Receiver: drop the grant held for an LSP. */
+	/** Receiver: every grant this node holds, newest first per LSP. */
+	listAsyncReceiveGrants(): IReceiverGrant[] {
+		return [...this.asyncReceiveGrants.values()].flat();
+	}
+
+	/** Receiver: drop every grant held for an LSP. */
 	forgetAsyncReceiveGrant(lspNodeIdHex: string): boolean {
 		const had = this.asyncReceiveGrants.delete(lspNodeIdHex);
 		if (had) this.persistAsyncReceiveGrants();
 		return had;
 	}
 
-	/** The grant for this LSP if we hold one and it has not expired. */
+	/** The newest grant for this LSP that has not expired. */
 	private liveAsyncReceiveGrant(
 		lspNodeIdHex: string
 	): IReceiverGrant | undefined {
-		const grant = this.asyncReceiveGrants.get(lspNodeIdHex);
-		if (!grant) return undefined;
-		if (BigInt(Math.floor(Date.now() / 1000)) >= grant.expiresAt) {
-			return undefined;
-		}
-		return grant;
+		const nowSec = BigInt(Math.floor(Date.now() / 1000));
+		return (this.asyncReceiveGrants.get(lspNodeIdHex) ?? []).find(
+			(g) => nowSec < g.expiresAt
+		);
 	}
 
 	private persistAsyncReceiveGrants(): void {
@@ -16671,7 +16718,7 @@ export class LightningNode extends EventEmitter {
 			this.storage.saveMetadata(
 				ASYNC_RECEIVE_GRANTS_KEY,
 				JSON.stringify(
-					[...this.asyncReceiveGrants.values()].map((g) =>
+					this.listAsyncReceiveGrants().map((g) =>
 						encodeReceiverGrant(g).toString('hex')
 					)
 				)
@@ -16690,12 +16737,20 @@ export class LightningNode extends EventEmitter {
 		try {
 			const list = JSON.parse(raw) as unknown;
 			if (!Array.isArray(list)) return;
-			for (const hex of list) {
+			// Oldest first, so the newest ends up at the head of each list.
+			for (const hex of [...list].reverse()) {
 				if (typeof hex !== 'string') continue;
 				const grant = decodeReceiverGrant(Buffer.from(hex, 'hex'));
 				// Re-verified on load: a tampered store cannot plant a grant.
-				if (!grant || this.judgeAsyncReceiveGrant(grant, {})) continue;
-				this.asyncReceiveGrants.set(grant.lspNodeId.toString('hex'), grant);
+				// Expiry is NOT judged here: an expired grant still names the
+				// registration a parked hold must be released under.
+				if (
+					!grant ||
+					this.judgeAsyncReceiveGrant(grant, { allowExpired: true })
+				) {
+					continue;
+				}
+				this.rememberAsyncReceiveGrant(grant);
 			}
 		} catch {
 			// Unreadable list: start with none; the receiver re-registers.
@@ -16711,9 +16766,38 @@ export class LightningNode extends EventEmitter {
 	sendAsyncRelease(
 		lspNodeId: Buffer,
 		holdIds: Buffer[],
-		amountMsat: bigint
+		amountMsat: bigint,
+		registrationId?: Buffer
 	): void {
-		this.asyncPaymentManager.sendRelease(lspNodeId, holdIds, amountMsat);
+		this.asyncPaymentManager.sendRelease(lspNodeId, holdIds, amountMsat, {
+			registrationId
+		});
+	}
+
+	/**
+	 * The registration a release of these holds must name: the one the LSP's
+	 * notice reported for them (every member must agree), else the live
+	 * grant's. A hold is released under the registration it was parked
+	 * under; the grant behind it may have expired or been renewed since.
+	 */
+	private asyncReleaseRegistrationId(
+		lspNodeIdHex: string,
+		holdIds: Buffer[]
+	): Buffer | undefined {
+		let noticed: Buffer | undefined;
+		for (const id of holdIds) {
+			const reg = this.noticedHoldRegistrations.get(id.toString('hex'));
+			if (!reg) {
+				noticed = undefined;
+				break;
+			}
+			if (noticed && !noticed.equals(reg)) {
+				noticed = undefined;
+				break;
+			}
+			noticed = reg;
+		}
+		return noticed ?? this.liveAsyncReceiveGrant(lspNodeIdHex)?.registrationId;
 	}
 
 	/** Receiver: ask the LSP for a notice of everything parked for us. */
@@ -16741,26 +16825,40 @@ export class LightningNode extends EventEmitter {
 	 *  - Unknown hashes are never released: the receiver could not settle
 	 *    them, so the LSP would only forward an HTLC we would fail.
 	 *
-	 * Only holds parked under the registration derived for this (receiver,
-	 * LSP) pair are considered; the capability binds that registration.
+	 * Only holds parked under a registration this node holds a grant for at
+	 * this LSP (any grant, live or since expired or renewed) are considered;
+	 * the capability binds the registration the notice reports for the hold.
 	 */
 	private handleHeldForwardNotice(
 		lspNodeId: Buffer,
 		notice: IHeldForwardNotice
 	): void {
 		this.emit('payment:held-notice', { lspNodeId, notice });
-		if (!this.autoReleaseHeldForwards) return;
-		const ourRegistration =
-			this.liveAsyncReceiveGrant(lspNodeId.toString('hex'))?.registrationId ??
-			deriveHoldRegistrationId(getPublicKey(this.nodePrivkey), lspNodeId);
+		const lspHex = lspNodeId.toString('hex');
+		const ours = new Set(
+			(this.asyncReceiveGrants.get(lspHex) ?? []).map((g) =>
+				g.registrationId.toString('hex')
+			)
+		);
+		ours.add(
+			deriveHoldRegistrationId(
+				getPublicKey(this.nodePrivkey),
+				lspNodeId
+			).toString('hex')
+		);
 		const byHash = new Map<string, IHeldForwardNotice['entries']>();
 		for (const entry of notice.entries) {
-			if (!entry.registrationId.equals(ourRegistration)) continue;
+			if (!ours.has(entry.registrationId.toString('hex'))) continue;
+			this.noticedHoldRegistrations.set(
+				entry.holdId.toString('hex'),
+				entry.registrationId
+			);
 			const key = entry.paymentHash.toString('hex');
 			const list = byHash.get(key) ?? [];
 			list.push(entry);
 			byHash.set(key, list);
 		}
+		if (!this.autoReleaseHeldForwards) return;
 		for (const [hashHex, entries] of byHash) {
 			const invoice = this.invoices.get(hashHex);
 			if (!invoice) continue;
@@ -16769,7 +16867,8 @@ export class LightningNode extends EventEmitter {
 					this.sendAsyncReleaseSafely(
 						lspNodeId,
 						[e.holdId],
-						e.forwardAmountMsat
+						e.forwardAmountMsat,
+						e.registrationId
 					);
 				}
 				continue;
@@ -16780,7 +16879,8 @@ export class LightningNode extends EventEmitter {
 			this.sendAsyncReleaseSafely(
 				lspNodeId,
 				entries.map((e) => e.holdId),
-				sum
+				sum,
+				entries[0].registrationId
 			);
 		}
 	}
@@ -16788,10 +16888,13 @@ export class LightningNode extends EventEmitter {
 	private sendAsyncReleaseSafely(
 		lspNodeId: Buffer,
 		holdIds: Buffer[],
-		amountMsat: bigint
+		amountMsat: bigint,
+		registrationId: Buffer
 	): void {
 		try {
-			this.asyncPaymentManager.sendRelease(lspNodeId, holdIds, amountMsat);
+			this.asyncPaymentManager.sendRelease(lspNodeId, holdIds, amountMsat, {
+				registrationId
+			});
 		} catch (err) {
 			this.emitStructuredLog('htlc', 'held_forward_release_send_failed', {
 				error: err instanceof Error ? err.message : String(err)

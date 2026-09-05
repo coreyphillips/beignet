@@ -8,11 +8,14 @@
  *    answers no registration request, and treats the marker as an unknown
  *    odd TLV (the forward proceeds or fails exactly as without it).
  *  - On, it advertises Feature.ASYNC_RECEIVE_SERVICE (odd bit) and answers
- *    ASYNC_REGISTRATION_REQUEST onion messages from channel peers with a
- *    signed grant (receiver-grant.ts) that binds the receiver, this LSP, the
- *    permitted outgoing channel, every per-receiver ceiling, the fee schedule
- *    and an expiry. The registration is a durable ledger row under its own
- *    prefix (the same DurableLedger the held-forward ledger uses).
+ *    ASYNC_REGISTRATION_REQUEST onion messages, SIGNED by the receiver's node
+ *    key (the transport peer of an onion message is only the last hop and
+ *    is never consulted), with a signed grant (receiver-grant.ts) that binds
+ *    the receiver, this LSP, the permitted outgoing channel, every
+ *    per-receiver ceiling, the fee schedule and an expiry. The registration
+ *    is a durable ledger row under its own prefix (the same DurableLedger
+ *    the held-forward ledger uses); a receiver's rows are bounded, the
+ *    oldest revoked ones folded into the newest and forgotten.
  *  - Every hold is ADMITTED before it is parked: the marker's registration
  *    id must name an ACTIVE, unexpired registration whose receiver is the
  *    peer on the outgoing channel and whose SCID is the channel the path
@@ -29,10 +32,14 @@
  *    disconnect, an expiry at the cutoff: none of them refund it. Credit
  *    spent is derived from the hold rows themselves (every row carries the
  *    fee it was admitted with), so the debit is atomic with the reservation
- *    for free and survives a restart with the row. When the credit cannot
- *    cover another part, admission refuses. This is what prices an
- *    abandoned hold: a receiver that lets holds expire pays the admission
- *    fee for each one and, once its credit is gone, can reserve nothing.
+ *    for free and survives a restart with the row. Credit is accounted PER
+ *    RECEIVER across every registration it ever held: the initial credit is
+ *    granted once, when a receiver first registers, a renewal carries the
+ *    balance forward, and a receiver that re-registers refills nothing.
+ *    When the credit cannot cover another part, admission refuses. This is
+ *    what prices an abandoned hold: a receiver that lets holds expire pays
+ *    the admission fee for each one and, once its credit is gone, can
+ *    reserve nothing.
  *  - Holding fee, per block of the reserved window, paid by the SENDER: the
  *    receiver's blinded path adds holdingFeeMsatPerBlock * maxHoldBlocks to
  *    the LSP hop's payment_relay base fee, admission checks the incoming
@@ -64,11 +71,13 @@ import {
 	FEE_COLLECTION_PREPAID_ADMISSION_SENDER_HOLDING,
 	IReceiverGrant,
 	IRegistrationReply,
+	REGISTRATION_REQUEST_MAX_AGE_SEC,
 	decodeReceiverGrant,
 	decodeRegistrationRequest,
 	encodeReceiverGrant,
 	holdingFeeForWindowMsat,
-	signReceiverGrant
+	signReceiverGrant,
+	verifyRegistrationRequest
 } from './receiver-grant';
 import {
 	IAsyncReceiveServiceConfig,
@@ -87,9 +96,14 @@ export interface IAsyncRegistrationRecord extends ILedgerRecord {
 	nonceHex: string;
 	/** The signed grant as sent, hex (audit, and re-serving a query). */
 	grantHex: string;
-	/** Prepaid credit (msat) including operator top-ups. */
+	/**
+	 * Prepaid credit (msat) landed on this row: the initial credit of a
+	 * receiver's first registration, operator top-ups, and the credit of
+	 * rows since folded into it. Credit is judged per receiver, over all of
+	 * its rows.
+	 */
 	creditMsat: string;
-	/** Admission fees of hold rows since forgotten, folded here. */
+	/** Admission fees of hold rows and registration rows since folded here. */
 	spentMsat: string;
 	/** Unix seconds. */
 	issuedAt: number;
@@ -98,6 +112,16 @@ export interface IAsyncRegistrationRecord extends ILedgerRecord {
 }
 
 export const ASYNC_REGISTRATION_LEDGER_PREFIX = 'async_registration';
+
+/**
+ * Registration rows kept per receiver. A renewal on every connect would
+ * otherwise grow the ledger without bound; beyond this the oldest REVOKED
+ * rows are folded (credit, spend, replay nonce lost) into the newest and
+ * forgotten. The request timestamp bound is what makes losing a nonce safe:
+ * a captured request older than REGISTRATION_REQUEST_MAX_AGE_SEC is refused
+ * as stale whether or not its nonce is still on file.
+ */
+export const MAX_REGISTRATION_ROWS_PER_RECEIVER = 8;
 
 export const asyncRegistrationCodec: ILedgerCodec<IAsyncRegistrationRecord> = {
 	encode: (record) => JSON.stringify(record),
@@ -187,7 +211,8 @@ export type RegistrationRefusalReason =
 	| 'malformed'
 	| 'wrong_network'
 	| 'wrong_lsp'
-	| 'sender_mismatch'
+	| 'bad_signature'
+	| 'stale'
 	| 'unknown_channel'
 	| 'channel_peer_mismatch'
 	| 'nonce_replayed'
@@ -300,10 +325,13 @@ export class AsyncReceiveService extends EventEmitter {
 	}
 
 	/**
-	 * Answer a registration request from the authenticated peer `fromPeer`.
-	 * A request from a receiver that already holds an ACTIVE registration on
-	 * the same channel supersedes it (renewal): the old row is REVOKED, and
-	 * holds already admitted under it resolve on their own terms.
+	 * Answer a registration request. The receiver is the SIGNER of the
+	 * request; `fromPeer` (the onion message's last hop) is reported, never
+	 * judged: a stranger can route a request through anyone. A request from
+	 * a receiver that already holds an ACTIVE registration on the same
+	 * channel supersedes it (renewal): the old row is REVOKED, its credit
+	 * balance carries over, and holds already admitted under it resolve on
+	 * their own terms.
 	 */
 	handleRegistrationRequest(
 		fromPeer: string,
@@ -326,8 +354,15 @@ export class AsyncReceiveService extends EventEmitter {
 		if (!req.lspNodeId.equals(this.deps.nodeId)) {
 			return refuse('wrong_lsp', req.nonce);
 		}
+		if (!verifyRegistrationRequest(req)) {
+			return refuse('bad_signature', req.nonce);
+		}
+		const nowSec = this.nowSec();
+		const age = nowSec - Number(req.timestamp);
+		if (Math.abs(age) > REGISTRATION_REQUEST_MAX_AGE_SEC) {
+			return refuse('stale', req.nonce);
+		}
 		const receiverHex = req.receiverNodeId.toString('hex');
-		if (receiverHex !== fromPeer) return refuse('sender_mismatch', req.nonce);
 		const scidHex = req.scid.toString('hex');
 		const channel = this.deps.channelForScid(scidHex);
 		if (!channel) return refuse('unknown_channel', req.nonce);
@@ -362,8 +397,15 @@ export class AsyncReceiveService extends EventEmitter {
 			req.requestedHoldBlocks > 0
 				? Math.min(req.requestedHoldBlocks, L.maxHoldBlocks)
 				: L.maxHoldBlocks;
-		const issuedAt = this.nowSec();
+		const issuedAt = nowSec;
 		const expiresAt = issuedAt + L.grantTtlSec;
+		// Credit is per receiver: the initial credit lands once, on a
+		// receiver's FIRST registration; a renewal starts with nothing of its
+		// own and the receiver's balance (credit less spend over every row it
+		// holds) is what the grant reports.
+		const priorRows = this.rowsOfReceiver(receiverHex);
+		const rowCredit = priorRows.length === 0 ? L.initialCreditMsat : 0n;
+		const balance = this.receiverCreditMsat(receiverHex) + rowCredit;
 		const grant = signReceiverGrant(
 			{
 				featureBit: Feature.ASYNC_RECEIVE_SERVICE + 1,
@@ -382,7 +424,7 @@ export class AsyncReceiveService extends EventEmitter {
 				admissionFeeMsat: L.admissionFeeMsat,
 				holdingFeeMsatPerBlock: L.holdingFeeMsatPerBlock,
 				feeCollection: FEE_COLLECTION_PREPAID_ADMISSION_SENDER_HOLDING,
-				creditMsat: L.initialCreditMsat,
+				creditMsat: balance < 0n ? 0n : balance,
 				issuedAt: BigInt(issuedAt),
 				expiresAt: BigInt(expiresAt),
 				nonce: req.nonce,
@@ -397,7 +439,7 @@ export class AsyncReceiveService extends EventEmitter {
 			scidHex,
 			nonceHex,
 			grantHex: encodeReceiverGrant(grant).toString('hex'),
-			creditMsat: L.initialCreditMsat.toString(),
+			creditMsat: rowCredit.toString(),
 			spentMsat: '0',
 			issuedAt,
 			expiresAt
@@ -411,8 +453,51 @@ export class AsyncReceiveService extends EventEmitter {
 				revokedReason: 'superseded'
 			});
 		}
+		this.pruneReceiverRows(receiverHex, record.id);
 		this.emit('registered', record);
 		return { granted: true, grant };
+	}
+
+	/** Every registration row (any state) of a receiver. */
+	private rowsOfReceiver(receiverHex: string): IAsyncRegistrationRecord[] {
+		return this.registrations.find((r) => r.receiverNodeIdHex === receiverHex);
+	}
+
+	/**
+	 * Keep a receiver's rows bounded: beyond MAX_REGISTRATION_ROWS_PER_RECEIVER
+	 * the oldest REVOKED rows are folded into `intoId` (their credit, their
+	 * spend, and the admission fees of the holds parked under them) and
+	 * forgotten. Fold first, forget second: a crash between the two counts
+	 * a fee twice, never zero times.
+	 */
+	private pruneReceiverRows(receiverHex: string, intoId: string): void {
+		const rows = this.rowsOfReceiver(receiverHex);
+		if (rows.length <= MAX_REGISTRATION_ROWS_PER_RECEIVER) return;
+		const revoked = rows
+			.filter((r) => r.state === 'REVOKED' && r.id !== intoId)
+			.sort((a, b) => a.issuedAt - b.issuedAt);
+		const excess = rows.length - MAX_REGISTRATION_ROWS_PER_RECEIVER;
+		for (const old of revoked.slice(0, excess)) {
+			const into = this.registrations.get(intoId);
+			if (!into) return;
+			let spent = BigInt(old.spentMsat);
+			for (const h of this.holds.forRegistration(old.id)) {
+				if (h.admissionFeeMsat) spent += BigInt(h.admissionFeeMsat);
+			}
+			const folded = this.registrations.transition(
+				intoId,
+				[into.state],
+				into.state,
+				{
+					creditMsat: (
+						BigInt(into.creditMsat) + BigInt(old.creditMsat)
+					).toString(),
+					spentMsat: (BigInt(into.spentMsat) + spent).toString()
+				}
+			);
+			if (folded.outcome !== 'applied') return;
+			this.registrations.remove(old.id);
+		}
 	}
 
 	/** Operator: revoke a registration; new holds under it are refused. */
@@ -443,21 +528,42 @@ export class AsyncReceiveService extends EventEmitter {
 		return result.outcome === 'applied';
 	}
 
-	/** Admission fees ever charged under a registration (msat). */
+	/**
+	 * Admission fees ever charged to the receiver holding this registration
+	 * (msat), over every registration it ever held.
+	 */
 	creditSpentMsat(registrationIdHex: string): bigint {
 		const r = this.registrations.get(registrationIdHex);
-		let spent = r ? BigInt(r.spentMsat) : 0n;
-		for (const h of this.holds.forRegistration(registrationIdHex)) {
-			if (h.admissionFeeMsat) spent += BigInt(h.admissionFeeMsat);
+		return r ? this.receiverSpentMsat(r.receiverNodeIdHex) : 0n;
+	}
+
+	/**
+	 * Prepaid credit still available to the receiver holding this
+	 * registration (msat): a renewal refills nothing.
+	 */
+	creditRemainingMsat(registrationIdHex: string): bigint {
+		const r = this.registrations.get(registrationIdHex);
+		if (!r) return 0n;
+		return this.receiverCreditMsat(r.receiverNodeIdHex);
+	}
+
+	private receiverSpentMsat(receiverHex: string): bigint {
+		let spent = 0n;
+		for (const row of this.rowsOfReceiver(receiverHex)) {
+			spent += BigInt(row.spentMsat);
+			for (const h of this.holds.forRegistration(row.id)) {
+				if (h.admissionFeeMsat) spent += BigInt(h.admissionFeeMsat);
+			}
 		}
 		return spent;
 	}
 
-	/** Prepaid credit still available under a registration (msat). */
-	creditRemainingMsat(registrationIdHex: string): bigint {
-		const r = this.registrations.get(registrationIdHex);
-		if (!r) return 0n;
-		return BigInt(r.creditMsat) - this.creditSpentMsat(registrationIdHex);
+	private receiverCreditMsat(receiverHex: string): bigint {
+		let credit = 0n;
+		for (const row of this.rowsOfReceiver(receiverHex)) {
+			credit += BigInt(row.creditMsat);
+		}
+		return credit - this.receiverSpentMsat(receiverHex);
 	}
 
 	// ─────────────── Admission ───────────────

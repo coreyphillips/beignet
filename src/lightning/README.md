@@ -741,13 +741,22 @@ the `hold_htlc` marker can command:
 - **Registration exchange** (onion-message TLVs, experimental odd range):
   `ASYNC_REGISTRATION_REQUEST` (1109) from the receiver names the chain, both
   node ids, the LSP -> receiver SCID it will put in its paths, the hold window
-  it wants and a random nonce; the LSP answers with
-  `ASYNC_REGISTRATION_REPLY` (1111): a signed grant, or a refusal echoing the
-  nonce. One ACTIVE registration per (receiver, channel): a renewal supersedes
-  the previous one. Registrations are durable ledger rows under their own
-  prefix (`async_registration`), so a restart keeps them; the receiver
-  persists its grants under the `async_receive_grants` metadata key and
-  re-verifies them on load.
+  it wants, a timestamp and a random nonce, and is SIGNED by the receiver's
+  node key (tag `beignet/async-payments/registration-request/v1`): an onion
+  message reaches the LSP from whichever peer forwarded it last, so the
+  transport peer proves nothing and is never consulted; a request older than
+  ten minutes is refused as stale. The LSP answers with
+  `ASYNC_REGISTRATION_REPLY` (1111): a signed grant, sent to the signer, or a
+  refusal echoing the nonce, sent back the way the request came. One ACTIVE
+  registration per (receiver, channel): a renewal supersedes the previous one,
+  and holds already admitted under it still resolve under it. Registrations
+  are durable ledger rows under their own prefix (`async_registration`), so a
+  restart keeps them, bounded per receiver (the oldest revoked rows are
+  folded into the newest and forgotten). The receiver keeps EVERY grant it
+  holds per LSP (newest first, bounded, persisted under the
+  `async_receive_grants` metadata key and re-verified on load): a release
+  names the registration the LSP's notice reports for the hold, which an
+  expired or renewed grant does not change.
 - **The grant** (`async-payments/receiver-grant.ts`) is signed by the LSP's
   node key over a tagged digest (`beignet/async-payments/receiver-grant/v1`)
   and binds: service version and the feature bit negotiated under, receiver
@@ -775,8 +784,11 @@ the `hold_htlc` marker can command:
   - the **admission fee** per part (`admissionFeeMsat`) is NON-REFUNDABLE:
     it is debited from the receiver's prepaid credit when the row is written
     (every row carries it, so spend is derived from the ledger and survives a
-    restart with it), and no outcome returns it. When the credit cannot cover
-    another part, admission refuses. This is what prices an abandoned hold:
+    restart with it), and no outcome returns it. Credit is accounted per
+    RECEIVER over every registration it ever held: the initial credit lands
+    once, on its first registration, a renewal carries the balance, and
+    re-registering refills nothing. When the credit cannot cover another
+    part, admission refuses. This is what prices an abandoned hold:
     a receiver that lets holds expire pays for each, and once its credit is
     gone it can reserve nothing until the operator, paid by whatever means it
     sells credit (an invoice, an L402, a plan), calls `creditAsyncReceiver`;
