@@ -16215,6 +16215,68 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * R, back online (section 9.6.6, section 7.5.6): fetch every witness,
+	 * credit what verifies, then close the epoch cooperatively when S is
+	 * there and ACTIVE, or force-close with every known preimage when asked
+	 * and S is not. Returns what was learned and what was done.
+	 */
+	async rescueFforEpoch(
+		channelIdHex: string,
+		opts: {
+			forceCloseIfUnreachable?: boolean;
+			destinationScript?: Buffer;
+			timeoutMs?: number;
+		} = {}
+	): Promise<{
+		preimagesKnown: number[];
+		witnesses: Awaited<ReturnType<LightningNode['fetchFforWitnessRecords']>>;
+		action: 'closed' | 'force-closed' | 'nothing';
+	}> {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const channel = this.channelManager.getChannel(channelId);
+		const record = channel?.getFforEpoch() ?? null;
+		if (!channel || !record || record.role !== 'R') {
+			throw new Error('no FFOR epoch of ours on this channel');
+		}
+		const witnesses =
+			record.witnesses.length > 0
+				? await this.fetchFforWitnessRecords(
+						channelIdHex,
+						undefined,
+						opts.timeoutMs
+				  )
+				: [];
+		const after = this.getFforEpoch(channelIdHex)!;
+		const preimagesKnown = after.knownPreimages
+			.map((p, i) => (p ? i + 1 : 0))
+			.filter((k) => k > 0);
+		// S is reachable when the channel is back in NORMAL: a loopback world
+		// has no peer manager, and a socket that dropped leaves the channel
+		// AWAITING_REESTABLISH either way.
+		const connected = channel.getState() === ChannelState.NORMAL;
+		if (after.state === FforState.ACTIVE && connected) {
+			const closed = this.closeFforEpoch(channelIdHex);
+			if (closed.ok) return { preimagesKnown, witnesses, action: 'closed' };
+		}
+		if (
+			after.state === FforState.DRAINING ||
+			after.state === FforState.CLOSED
+		) {
+			return { preimagesKnown, witnesses, action: 'nothing' };
+		}
+		if (opts.forceCloseIfUnreachable && opts.destinationScript) {
+			const res = this.channelManager.forceClose(
+				channelId,
+				opts.destinationScript,
+				this.resolveForceCloseFeeRatePerVbyte(),
+				this.getBitcoinNetwork()
+			);
+			if (res.ok) return { preimagesKnown, witnesses, action: 'force-closed' };
+		}
+		return { preimagesKnown, witnesses, action: 'nothing' };
+	}
+
+	/**
 	 * R: tell every acknowledged witness the epoch closed (section 9.6.6),
 	 * with the settled bitmap. Advisory for the witness's bookkeeping.
 	 */
