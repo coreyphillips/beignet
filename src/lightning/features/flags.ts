@@ -88,7 +88,20 @@ export enum Feature {
 	 * leases inbound liquidity (rates carried in node_announcement). Experimental
 	 * bit pending a spec assignment.
 	 */
-	OPTION_WILL_FUND = 112
+	OPTION_WILL_FUND = 112,
+	/**
+	 * Async receive service (beignet, issue #709): this node runs the opt-in
+	 * LSP service that parks `hold_htlc` forwards for registered offline
+	 * receivers. Experimental custom-range bit; the ODD bit (261) is what a
+	 * serving node advertises in init and node_announcement, and it is set
+	 * only while the service is enabled. A receiver never marks a blinded
+	 * path hold_htlc for a peer that does not advertise it: a peer without
+	 * the bit treats the marker as an unknown odd TLV and forwards normally,
+	 * which would deliver the HTLC to a receiver that is offline. The bit is
+	 * the advertisement; the signed registration grant (issue #709) is the
+	 * actual capability.
+	 */
+	ASYNC_RECEIVE_SERVICE = 260
 }
 
 /**

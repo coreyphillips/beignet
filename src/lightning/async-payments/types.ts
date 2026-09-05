@@ -34,6 +34,111 @@ export const HELD_HTLC_NOTICE_TLV_TYPE = 1105;
  */
 export const HELD_HTLC_QUERY_TLV_TYPE = 1107;
 
+/**
+ * Onion-message TLV from a receiver to a prospective holding LSP asking for
+ * an async-receive registration (issue #709). Payload: receiver-grant.ts
+ * `encodeRegistrationRequest`.
+ */
+export const ASYNC_REGISTRATION_REQUEST_TLV_TYPE = 1109;
+
+/**
+ * Onion-message TLV from the LSP answering a registration request: a signed
+ * receiver grant, or a refusal echoing the request nonce. Payload:
+ * receiver-grant.ts `encodeRegistrationReply`.
+ */
+export const ASYNC_REGISTRATION_REPLY_TLV_TYPE = 1111;
+
+/**
+ * LSP-side async receive service configuration (issue #709). The service is
+ * DISABLED unless `enabled` is true: a node without it treats a hold_htlc
+ * marker as an unknown odd TLV (forwards or fails normally), does not
+ * advertise the feature bit, and answers no registration request.
+ *
+ * Every limit is enforced at admission, atomically with the durable hold
+ * row, per receiver and globally. Values a grant carries (the per-receiver
+ * ceilings and the fee schedule) are signed into the grant so a receiver
+ * knows the terms it registered under.
+ */
+export interface IAsyncReceiveServiceConfig {
+	enabled: boolean;
+	/** Registered receivers at once (ACTIVE registrations). Default 1000. */
+	maxReceivers?: number;
+	/** Largest single held part (msat). Default 1,000,000,000 (0.01 BTC). */
+	maxPartMsat?: bigint;
+	/** Largest sum of parts held under one payment hash per receiver (msat). Default 1,000,000,000. */
+	maxPaymentMsat?: bigint;
+	/** Concurrent unresolved holds per receiver. Default 10. */
+	maxPartsPerReceiver?: number;
+	/** Aggregate unresolved held value per receiver (msat). Default 1,000,000,000. */
+	maxHeldMsatPerReceiver?: bigint;
+	/** Aggregate bytes reserved by a receiver's unresolved holds. Default 64 KiB. */
+	maxHeldBytesPerReceiver?: number;
+	/** Concurrent unresolved holds across all receivers. Default 200. */
+	maxHolds?: number;
+	/** Aggregate unresolved held value across all receivers (msat). Default 10,000,000,000 (0.1 BTC). */
+	maxHeldMsat?: bigint;
+	/** Aggregate bytes reserved by every unresolved hold. Default 1 MiB. */
+	maxHeldBytes?: number;
+	/**
+	 * Longest a hold may stay parked, in blocks: the CLTV cutoff is clamped
+	 * to the admission height plus this. Default 144 (about a day).
+	 */
+	maxHoldBlocks?: number;
+	/**
+	 * Fewest blocks a hold must have left before its cutoff to be admitted;
+	 * a hold that could not outlive the receiver's next reconnect only burns
+	 * a slot. Default 6.
+	 */
+	minRemainingCltv?: number;
+	/** Lifetime of a grant from issuance, in seconds. Default 30 days. */
+	grantTtlSec?: number;
+	/**
+	 * Non-refundable fee per admitted part (msat), debited from the
+	 * receiver's prepaid credit at admission whatever the hold's outcome.
+	 * Default 0.
+	 */
+	admissionFeeMsat?: bigint;
+	/**
+	 * Holding fee per block of reserved hold window (msat), paid by the
+	 * SENDER through the LSP hop's payment_relay fee and kept at release,
+	 * like any forwarding fee. Default 0.
+	 */
+	holdingFeeMsatPerBlock?: bigint;
+	/**
+	 * Prepaid credit (msat) every new registration starts with; the pool the
+	 * admission fee is debited from. Default 0, so an admission fee above
+	 * zero admits nothing until the operator credits the receiver
+	 * (`creditAsyncReceiver`).
+	 */
+	initialCreditMsat?: bigint;
+}
+
+/** Service metrics (issue #709), exposed through getAsyncReceiveServiceMetrics(). */
+export interface IAsyncReceiveServiceMetrics {
+	enabled: boolean;
+	/** ACTIVE, unexpired registrations. */
+	registrations: number;
+	/** Unresolved holds (HELD, RELEASING, FAILING). */
+	occupiedSlots: number;
+	/** Sum of the unresolved holds' incoming value (msat, as a string). */
+	heldValueMsat: string;
+	/** Bytes reserved by the unresolved holds. */
+	heldBytes: number;
+	/** Creation time (unix ms) of the oldest unresolved hold, or null. */
+	oldestHoldAt: number | null;
+	/** Admissions refused since this process started, by reason. */
+	admissionRefusals: number;
+	admissionRefusalsByReason: Record<string, number>;
+	/** Holds released (forward placed) since this process started. */
+	releases: number;
+	/** Holds failed at their CLTV cutoff since this process started. */
+	expiries: number;
+	/** Holds failed for any other reason since this process started. */
+	failures: number;
+	/** Registration requests refused since this process started. */
+	registrationRefusals: number;
+}
+
 /** One parked part as the LSP reports it to the receiver. */
 export interface IHeldForwardNoticeEntry {
 	/** Random per-hold identity; the thing a capability names. */
