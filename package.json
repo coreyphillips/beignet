@@ -20,6 +20,7 @@
     "test:sigkill": "npm run build && npx mocha --exit -r ts-node/register --timeout 600000 tests/lightning/recovery-phase7-sigkill.test.ts",
     "test:conformance": "npx mocha --exit -r ts-node/register 'tests/lightning/conformance/**/*.test.ts'",
     "test:interop": "npx mocha --exit --timeout 120000 -r ts-node/register 'tests/lightning/interop/**/*.test.ts'",
+    "test:interop:ffor": "npx mocha --exit --timeout 600000 -r ts-node/register tests/lightning/interop/ffor-variant-d-regtest.test.ts",
     "test:local": "node scripts/run-suites.js",
     "example": "ts-node example",
     "beignet": "ts-node src/cli/cli.ts",
