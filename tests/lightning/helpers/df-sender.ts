@@ -323,8 +323,16 @@ export function mintRequest(
 		requestId?: Buffer;
 		preimage?: Buffer;
 		encryptionPrivateKey?: Buffer;
+		/**
+		 * One clock for the whole mint. The helper reads it for `expiresAt` and
+		 * hands the same value to `mintRequestEnvelope`, which would otherwise
+		 * default to a second `Date.now()` of its own; with a 1 ms TTL a tick
+		 * between the two reads made the envelope refuse to mint (issue #723).
+		 */
+		now?: number;
 	} = {}
 ): ITestRequest {
+	const now = opts.now ?? Date.now();
 	const nodePrivkey = opts.nodePrivkey ?? crypto.randomBytes(32);
 	const nodeId = getPublicKey(nodePrivkey);
 	const preimage = opts.preimage ?? crypto.randomBytes(32);
@@ -344,13 +352,14 @@ export function mintRequest(
 			requestId,
 			chainHash: chainHashForNetwork(opts.network ?? Network.REGTEST),
 			receiverNodeId: nodeId,
-			expiresAt: Date.now() + (opts.ttlMs ?? 3_600_000),
+			expiresAt: now + (opts.ttlMs ?? 3_600_000),
 			...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {}),
 			receiptHash,
 			encryptionKey: encryption.publicKey,
 			transports
 		},
-		(message) => signMessageWithKey(message, nodePrivkey)
+		(message) => signMessageWithKey(message, nodePrivkey),
+		now
 	);
 	return {
 		encoded: encodeRequestEnvelope(env),
