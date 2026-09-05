@@ -14,6 +14,7 @@
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import {
+	IBlindedPayInfo,
 	IOffer,
 	IInvoiceRequest,
 	IBolt12Invoice,
@@ -103,7 +104,56 @@ export interface ICreateOfferOptions {
 	 * with the offer so a restart keeps issuing hold paths.
 	 */
 	asyncHold?: boolean;
+	/**
+	 * BOLT 12 path-terminal offer: no offer_issuer_id; the invoice is signed
+	 * by whoever sits at the end of the path the invoice_request arrived on,
+	 * under that path's final blinded_node_id. Requires `paths`. This is how
+	 * an offer delegates its answering to another node (FFOR issuer, spec
+	 * section 9.7) with no signing authority beyond the offer itself.
+	 */
+	pathTerminal?: boolean;
 }
+
+/** What an issuance policy sees for one invoice_request. */
+export interface IIssuanceContext {
+	offer: IOffer;
+	offerIdHex: string;
+	request: IInvoiceRequest;
+	/** The request's signed records, mirrored into the invoice. */
+	records: ITlvRecord[];
+	pathId?: Buffer;
+	/** The path key the request arrived with; absent when it was not blinded. */
+	blindingPoint?: Buffer;
+}
+
+/** An issuance policy's answer: an invoice to build, a stored one to resend, or a refusal. */
+export interface IIssuanceDecision {
+	paymentHash: Buffer;
+	amountMsat: bigint;
+	paths: IBlindedPath[];
+	payInfo: IBlindedPayInfo[];
+	relativeExpiry: number;
+	/** The key the invoice is signed under; `nodeId` is its public half. */
+	signingPrivkey: Buffer;
+	nodeId: Buffer;
+	features?: Buffer;
+	/** Further signed records (experimental range). */
+	extraRecords?: ITlvRecord[];
+	/** Called with the signed invoice bytes before they are sent. */
+	onIssued?: (invoiceTlv: Buffer) => void;
+}
+
+export type IssuanceAnswer =
+	| { decision: IIssuanceDecision }
+	| { resend: Buffer }
+	| { error: string };
+
+/**
+ * A policy that answers invoice_requests for an offer this node did not
+ * create (an offer it was delegated by a path-terminal offer); it decides
+ * the hash, the amount, the paths and the signing key.
+ */
+export type IssuancePolicy = (ctx: IIssuanceContext) => IssuanceAnswer;
 
 export interface IRequestInvoiceOptions {
 	/** Amount to pay in millisatoshis (required if offer has no amount) */
@@ -127,6 +177,8 @@ export class OfferManager extends EventEmitter {
 			tlvData: Buffer;
 			pathId?: Buffer;
 			asyncHold?: boolean;
+			/** Set for a delegated offer: the policy answers, not this node. */
+			policy?: IssuancePolicy;
 		}
 	> = new Map();
 	private onionMessageManager: OnionMessageManager | null = null;
@@ -360,8 +412,13 @@ export class OfferManager extends EventEmitter {
 		// Register TLV handlers for BOLT 12 message types
 		mgr.registerTlvHandler(
 			TLV_INVOICE_REQUEST,
-			(_fromPeer, _tlvType, data, replyPath, pathId) => {
-				this.handleIncomingInvoiceRequest(data, replyPath, pathId);
+			(_fromPeer, _tlvType, data, replyPath, pathId, blindingPoint) => {
+				this.handleIncomingInvoiceRequest(
+					data,
+					replyPath,
+					pathId,
+					blindingPoint
+				);
 			}
 		);
 
@@ -390,10 +447,16 @@ export class OfferManager extends EventEmitter {
 		offer: IOffer;
 		encoded: string;
 	} {
+		if (
+			options.pathTerminal &&
+			(!options.paths || options.paths.length === 0)
+		) {
+			throw new Error('a path-terminal offer needs at least one path');
+		}
 		const offer: IOffer = {
 			offerId: Buffer.alloc(32), // Placeholder — computed below
 			description: options.description,
-			issuerId: this.nodeId
+			...(options.pathTerminal ? {} : { issuerId: this.nodeId })
 		};
 
 		if (options.amount !== undefined) offer.amount = options.amount;
@@ -447,6 +510,29 @@ export class OfferManager extends EventEmitter {
 
 		this.emit('offer:created', offer, encoded);
 		return { offer, encoded };
+	}
+
+	/**
+	 * Register an offer another node created and delegated to this one (a
+	 * path-terminal offer whose paths end here): invoice_requests for it are
+	 * answered by `policy`. Not persisted here; the delegating service
+	 * re-registers what it rehydrates.
+	 */
+	registerDelegatedOffer(offer: IOffer, policy: IssuancePolicy): string {
+		const tlvData = encodeOfferTlv(offer);
+		const offerIdHex = computeOfferId(getTlvRecords(tlvData)).toString('hex');
+		this.offers.set(offerIdHex, {
+			offer: { ...offer, offerId: Buffer.from(offerIdHex, 'hex') },
+			encoded: encodeOffer(offer),
+			tlvData,
+			policy
+		});
+		return offerIdHex;
+	}
+
+	unregisterDelegatedOffer(offerIdHex: string): void {
+		const entry = this.offers.get(offerIdHex);
+		if (entry?.policy) this.offers.delete(offerIdHex);
 	}
 
 	/**
@@ -536,10 +622,16 @@ export class OfferManager extends EventEmitter {
 		// Build invoice request. invreq_metadata (type 0) is a payer-generated
 		// nonce that BOLT 12 requires and that the signature commits to; it must be
 		// set before we encode + sign.
+		// BOLT 12: invreq_amount is the TOTAL, at least offer_amount times the
+		// quantity when the offer prices a unit; sending the unit price with a
+		// quantity above one is rejected by a spec reader.
+		const quantity = options?.quantity ?? 1n;
 		const request: IInvoiceRequest = {
 			payerKey: payerPubkey,
 			offerId: offer.offerId,
-			amount: options?.amount ?? offer.amount,
+			amount:
+				options?.amount ??
+				(offer.amount !== undefined ? offer.amount * quantity : undefined),
 			metadata: crypto.randomBytes(32)
 		};
 
@@ -642,7 +734,8 @@ export class OfferManager extends EventEmitter {
 	handleInvoiceRequest(
 		requestData: Buffer,
 		replyPath?: IBlindedPath,
-		pathId?: Buffer
+		pathId?: Buffer,
+		blindingPoint?: Buffer
 	): IBolt12Invoice | null {
 		const { request, records } = decodeInvoiceRequestTlv(requestData);
 
@@ -723,6 +816,24 @@ export class OfferManager extends EventEmitter {
 				this.emit('invoice:error', error);
 				return null;
 			}
+		}
+
+		// A delegated offer (spec section 9.7): the policy decides the hash,
+		// the amount, the paths and the key. It never mints a preimage here.
+		const policy = this.offers.get(matchedOfferIdHex!)?.policy;
+		if (policy) {
+			return this.answerByPolicy(
+				policy,
+				{
+					offer: matchedOffer,
+					offerIdHex: matchedOfferIdHex!,
+					request,
+					records,
+					pathId,
+					blindingPoint
+				},
+				replyPath
+			);
 		}
 
 		// Validate amount
@@ -865,6 +976,85 @@ export class OfferManager extends EventEmitter {
 		return invoice;
 	}
 
+	private answerByPolicy(
+		policy: IssuancePolicy,
+		ctx: IIssuanceContext,
+		replyPath?: IBlindedPath
+	): IBolt12Invoice | null {
+		const reply = (tlvType: number, data: Buffer): void => {
+			if (replyPath && this.onionMessageManager) {
+				const messageData = new Map<number, Buffer>();
+				messageData.set(tlvType, data);
+				this.onionMessageManager.sendReply(replyPath, messageData);
+			}
+		};
+		let answer: IssuanceAnswer;
+		try {
+			answer = policy(ctx);
+		} catch (err) {
+			answer = { error: (err as Error).message };
+		}
+		if ('error' in answer) {
+			const error: IInvoiceError = { error: answer.error };
+			reply(TLV_INVOICE_ERROR, encodeInvoiceErrorTlv(error));
+			this.emit('invoice:error', error);
+			return null;
+		}
+		if ('resend' in answer) {
+			reply(TLV_INVOICE, answer.resend);
+			const { invoice } = decodeInvoiceTlv(answer.resend);
+			this.emit('invoice:issued-delegated', invoice, ctx.offerIdHex);
+			return invoice;
+		}
+		const d = answer.decision;
+		const invoice: IBolt12Invoice = {
+			paymentHash: d.paymentHash,
+			amount: d.amountMsat,
+			description: ctx.offer.description,
+			createdAt: BigInt(Math.floor(Date.now() / 1000)),
+			relativeExpiry: d.relativeExpiry,
+			nodeId: d.nodeId,
+			paths: d.paths,
+			blindedPayInfo: d.payInfo,
+			...(d.features ? { features: d.features } : {})
+		};
+		const unsignedTlv = encodeInvoiceTlv(invoice, ctx.records, d.extraRecords);
+		const merkleRoot = computeMerkleRootFromRecords(
+			getTlvRecordsForSigning(unsignedTlv)
+		);
+		invoice.signature = schnorrSign(
+			computeSignatureHash(INVOICE_SIGNATURE_TAG, merkleRoot),
+			d.signingPrivkey
+		);
+		const signedTlv = encodeInvoiceTlv(invoice, ctx.records, d.extraRecords);
+		invoice.records = getTlvRecords(signedTlv);
+		// The policy stores the bytes BEFORE they leave: a crash between the
+		// two re-answers identical metadata with the same invoice.
+		d.onIssued?.(signedTlv);
+		reply(TLV_INVOICE, signedTlv);
+		this.emit('invoice:issued-delegated', invoice, ctx.offerIdHex);
+		return invoice;
+	}
+
+	/**
+	 * BOLT 12 signer rule for the payer: an offer with offer_issuer_id is
+	 * answered under that key; a path-terminal offer (paths, no issuer id)
+	 * is answered under the final blinded_node_id of one of its paths.
+	 */
+	private invoiceSignerMatchesOffer(
+		invoice: IBolt12Invoice,
+		offer: IOffer
+	): boolean {
+		if (offer.issuerId) return invoice.nodeId.equals(offer.issuerId);
+		if (offer.paths && offer.paths.length > 0) {
+			return offer.paths.some((p) => {
+				const last = p.blindedHops[p.blindedHops.length - 1];
+				return last !== undefined && last.blindedNodeId.equals(invoice.nodeId);
+			});
+		}
+		return true;
+	}
+
 	/**
 	 * The payment preimage for a BOLT 12 invoice WE issued, or undefined if this
 	 * payment_hash was not issued by us (e.g. we are the payer). Used by the node
@@ -960,8 +1150,8 @@ export class OfferManager extends EventEmitter {
 			return false;
 		}
 
-		// Node ID should match offer issuer ID
-		if (offer.issuerId && !invoice.nodeId.equals(offer.issuerId)) {
+		// The signer the offer designates: its issuer id, or a path's terminal.
+		if (!this.invoiceSignerMatchesOffer(invoice, offer)) {
 			return false;
 		}
 
@@ -990,9 +1180,10 @@ export class OfferManager extends EventEmitter {
 	private handleIncomingInvoiceRequest(
 		data: Buffer,
 		replyPath?: IBlindedPath,
-		pathId?: Buffer
+		pathId?: Buffer,
+		blindingPoint?: Buffer
 	): void {
-		this.handleInvoiceRequest(data, replyPath, pathId);
+		this.handleInvoiceRequest(data, replyPath, pathId, blindingPoint);
 	}
 
 	private handleIncomingInvoice(data: Buffer, pathId?: Buffer): void {
@@ -1101,9 +1292,10 @@ export class OfferManager extends EventEmitter {
 			if (!offerEntry) continue;
 			// Match by description and issuer
 			const descMatch = offerEntry.offer.description === invoice.description;
-			const issuerMatch =
-				!offerEntry.offer.issuerId ||
-				invoice.nodeId.equals(offerEntry.offer.issuerId);
+			const issuerMatch = this.invoiceSignerMatchesOffer(
+				invoice,
+				offerEntry.offer
+			);
 			if (!descMatch || !issuerMatch) continue;
 			sawCompatibleOffer = true;
 			if (validateAgainstSent(pending.sentRecords) !== null) continue;

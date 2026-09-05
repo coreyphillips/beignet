@@ -27,7 +27,13 @@ type TlvHandler = (
 	tlvType: number,
 	data: Buffer,
 	replyPath?: IBlindedPath,
-	pathId?: Buffer
+	pathId?: Buffer,
+	/**
+	 * The path key (blinding point) the message arrived with, when it was
+	 * blinded: what a path-terminal recipient needs to derive the blinded
+	 * key the path names it by (BOLT 12 offers without offer_issuer_id).
+	 */
+	blindingPoint?: Buffer
 ) => void;
 
 /**
@@ -225,7 +231,12 @@ export class OnionMessageManager extends EventEmitter {
 				// pathId (ERD type 6, decrypted-data only) lets handlers verify
 				// the message arrived over a blinded path WE issued.
 				this.emit('message:received', fromPeer, result.payload);
-				this.invokeTlvHandlers(fromPeer, result.payload, result.pathId);
+				this.invokeTlvHandlers(
+					fromPeer,
+					result.payload,
+					result.pathId,
+					msg.blindingPoint
+				);
 			} else {
 				// Intermediate — forward to next hop
 				const nextNodeHex = result.nextNodeId.toString('hex');
@@ -314,13 +325,21 @@ export class OnionMessageManager extends EventEmitter {
 	private invokeTlvHandlers(
 		fromPeer: string,
 		payload: IOnionMessagePayload,
-		pathId?: Buffer
+		pathId?: Buffer,
+		blindingPoint?: Buffer
 	): void {
 		for (const [tlvType, data] of payload.messageTlvs) {
 			const handlers = this.tlvHandlers.get(tlvType);
 			if (handlers) {
 				for (const handler of handlers) {
-					handler(fromPeer, tlvType, data, payload.replyPath, pathId);
+					handler(
+						fromPeer,
+						tlvType,
+						data,
+						payload.replyPath,
+						pathId,
+						blindingPoint
+					);
 				}
 			}
 		}

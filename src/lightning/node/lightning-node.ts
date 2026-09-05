@@ -386,8 +386,31 @@ import {
 	fforWitnessRecordCodec
 } from '../ffor/witness-ledger';
 import { FforWitnessService } from '../ffor/witness-service';
+import { FforIssuerService } from '../ffor/issuer-service';
+import { encodeOfferTlv } from '../offer/tlv';
 import {
+	FF_ISSUER_MANIFEST_LEDGER_PREFIX,
+	FF_ISSUER_SLOT_LEDGER_PREFIX,
+	FforIssuerLedger,
+	IFforIssuerManifestRecord,
+	IFforIssuerSlotRecord,
+	fforIssuerManifestCodec,
+	fforIssuerSlotCodec
+} from '../ffor/issuer-ledger';
+import {
+	FF_ISSUER_MANIFEST_VERSION,
+	IFforIssuerHop,
+	decodeIssuerAck,
+	decodeIssuerStatusResp,
+	encodeIssuerManifest,
+	encodeIssuerProvision,
+	encodeIssuerStatus,
+	signAttestation
+} from '../ffor/issuer-messages';
+import {
+	FF_ISSUER_PROVISION_TYPE,
 	FF_ISSUER_STATUS_RESP_TYPE,
+	FF_ISSUER_STATUS_TYPE,
 	FF_WITNESS_CLOSE_TYPE,
 	FF_WITNESS_FETCH_TYPE,
 	FF_WITNESS_PROFILE_DR,
@@ -771,6 +794,8 @@ export class LightningNode extends EventEmitter {
 	private currentBlockHeight = 0;
 	/** FFOR D-R receipt witness (section 9.6), when this node serves as one. */
 	private fforWitness: FforWitnessService | null = null;
+	/** FFOR BOLT 12 issuer (section 9.7), co-hosted with the witness. */
+	private fforIssuer: FforIssuerService | null = null;
 	/** R's outstanding witness-lane requests, by request id (Appendix F). */
 	private fforWitnessRequests = new Map<
 		string,
@@ -1692,6 +1717,39 @@ export class LightningNode extends EventEmitter {
 				emit: (event, data) => this.emit(event, data),
 				release: (fulfil) => this.releaseWitnessHeldForward(fulfil)
 			});
+			if (config.fforIssuer?.enabled) {
+				const issuerLedger = new FforIssuerLedger(
+					this.storage
+						? new MetadataLedgerStore<IFforIssuerManifestRecord>(
+								this.storage,
+								FF_ISSUER_MANIFEST_LEDGER_PREFIX,
+								fforIssuerManifestCodec
+						  )
+						: new MemoryLedgerStore<IFforIssuerManifestRecord>(),
+					this.storage
+						? new MetadataLedgerStore<IFforIssuerSlotRecord>(
+								this.storage,
+								FF_ISSUER_SLOT_LEDGER_PREFIX,
+								fforIssuerSlotCodec
+						  )
+						: new MemoryLedgerStore<IFforIssuerSlotRecord>()
+				);
+				issuerLedger.rehydrate();
+				this.fforIssuer = new FforIssuerService(config.fforIssuer, {
+					ledger: issuerLedger,
+					witnessLedger: ledger,
+					nodePrivkey: this.nodePrivkey,
+					nodeId: getPublicKey(this.nodePrivkey),
+					currentHeight: () => this.currentBlockHeight,
+					send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
+					log: (action, data) => this.emitStructuredLog('htlc', action, data),
+					emit: (event, data) => this.emit(event, data),
+					offers: this.offerManager
+				});
+				this.fforIssuer.rehydrate();
+			}
+		} else if (config.fforIssuer?.enabled) {
+			this.emitStructuredLog('htlc', 'ffor_issuer_needs_witness', {});
 		}
 		// Async receive service (issue #709): registrations live in their own
 		// durable ledger next to the holds; admission judges every new hold
@@ -21648,6 +21706,8 @@ export class LightningNode extends EventEmitter {
 	private runPerBlockWork(blockHeight: number): void {
 		// Witness retention (section 9.6.6): mailboxes past retention_until go.
 		this.fforWitness?.onBlock(blockHeight);
+		// Issuer retirement (section 9.7.7): issue_until reached.
+		this.fforIssuer?.onBlock(blockHeight);
 		// The height is durable BEFORE any of the work below is judged at it
 		// (issue #708 review): a process that dies inside a per-block scan
 		// restarts at the height that scan was judged at, so a held forward
@@ -22853,6 +22913,12 @@ export class LightningNode extends EventEmitter {
 		) {
 			return;
 		}
+		if (
+			this.fforIssuer &&
+			this.fforIssuer.handleMessage(pubkey, type, payload)
+		) {
+			return;
+		}
 		// A request this node does not serve (no witness role, or an issuer
 		// message): odd type, ignorable, and the peer is told nothing.
 		this.emitStructuredLog('peer', 'ffor_witness_request_ignored', {
@@ -22884,6 +22950,161 @@ export class LightningNode extends EventEmitter {
 	/** The witness service this node runs, if any (operators, tests). */
 	getFforWitnessService(): FforWitnessService | null {
 		return this.fforWitness;
+	}
+
+	/** The issuer service this node runs, if any (operators, tests). */
+	getFforIssuerService(): FforIssuerService | null {
+		return this.fforIssuer;
+	}
+
+	/**
+	 * R: a BOLT 12 offer whose invoices the issuer I answers (section 9.7.1):
+	 * no offer_issuer_id, one onion-message path terminating at I (I as
+	 * introduction node, so it can confirm the blinded key it is named by),
+	 * and the amount grid the book sells. A stock payer sees an ordinary
+	 * offer.
+	 */
+	createFforIssuerOffer(
+		issuerNodeIdHex: string,
+		opts: {
+			description: string;
+			amountMsat?: bigint;
+			quantityMax?: bigint;
+			absoluteExpiry?: bigint;
+		}
+	): { offer: IOffer; encoded: string } {
+		const issuer = Buffer.from(issuerNodeIdHex, 'hex');
+		const path = constructBlindedPath(crypto.randomBytes(32), [issuer], [{}]);
+		return this.offerManager.createOffer({
+			description: opts.description,
+			...(opts.amountMsat !== undefined ? { amount: opts.amountMsat } : {}),
+			...(opts.quantityMax !== undefined
+				? { quantityMax: opts.quantityMax }
+				: {}),
+			...(opts.absoluteExpiry !== undefined
+				? { absoluteExpiry: opts.absoluteExpiry }
+				: {}),
+			chains: [this.chainHash()],
+			paths: [path],
+			pathTerminal: true
+		});
+	}
+
+	/**
+	 * R: hand the issuer its manifest (section 9.7.2) for an ACTIVE epoch
+	 * whose first witness it already is: the offer, the payment-path
+	 * template (the witness hops the caller names, then S with the epoch's
+	 * fee terms, then R), issue_until, and R's attestation over the offer
+	 * id, H_act and H_book. Returns the blinded node ids I confirmed.
+	 */
+	async provisionFforIssuer(
+		channelIdHex: string,
+		issuerNodeIdHex: string,
+		opts: {
+			offer: IOffer;
+			witnessHops: IFforIssuerHop[];
+			issueUntil?: number;
+			timeoutMs?: number;
+		}
+	): Promise<{ mailboxId: Buffer; blindedNodeIds: Buffer[] }> {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const channel = this.channelManager.getChannel(channelId);
+		const record = channel?.getFforEpoch() ?? null;
+		if (!channel || !record || record.role !== 'R') {
+			throw new Error('no FFOR epoch of ours on this channel');
+		}
+		if (record.state !== FforState.ACTIVE || !record.hAct || !record.hBook) {
+			throw new Error('the issuer is provisioned on an ACTIVE epoch');
+		}
+		const witness = record.witnesses.find(
+			(w) =>
+				w.witnessNodeId.toString('hex') === issuerNodeIdHex &&
+				w.ackedAt !== null
+		);
+		if (!witness) {
+			throw new Error('the issuer must first be provisioned as a witness');
+		}
+		const hint = this.buildRoutingHintForChannel(channel);
+		if (!hint) throw new Error('no usable SCID or alias for the S hop');
+		const hops: IFforIssuerHop[] = [
+			...opts.witnessHops,
+			{
+				nodeId: hint.pubkey,
+				shortChannelId: hint.shortChannelId,
+				feeBaseMsat: record.params.feeBaseMsat,
+				feeProportionalMillionths: record.params.feeProportionalMillionths,
+				cltvExpiryDelta: hint.cltvExpiryDelta,
+				htlcMinimumMsat: 1n,
+				htlcMaximumMsat: record.params.budgetMsat
+			},
+			{
+				nodeId: Buffer.from(this.getNodeId(), 'hex'),
+				shortChannelId: Buffer.alloc(8),
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0,
+				cltvExpiryDelta: 0,
+				htlcMinimumMsat: 0n,
+				htlcMaximumMsat: 0n
+			}
+		];
+		const offerTlv = encodeOfferTlv(opts.offer);
+		const manifest = encodeIssuerManifest({
+			version: FF_ISSUER_MANIFEST_VERSION,
+			mailboxId: witness.mailboxId,
+			offer: offerTlv,
+			hops,
+			issueUntil: opts.issueUntil ?? record.params.settlementDeadline,
+			rAttestation: signAttestation(
+				opts.offer.offerId,
+				record.hAct,
+				record.hBook,
+				this.nodePrivkey
+			)
+		});
+		const requestId = FforWitnessService.freshRequestId();
+		const body = await this.sendFforWitnessRequest(
+			issuerNodeIdHex,
+			FF_ISSUER_PROVISION_TYPE,
+			encodeIssuerProvision(requestId, manifest),
+			requestId,
+			opts.timeoutMs
+		);
+		const ack = decodeIssuerAck(body);
+		if (!ack.ok) throw new Error(`issuer refused the manifest: ${ack.error}`);
+		this.emitStructuredLog('htlc', 'ffor_issuer_provision_acked', {
+			channelId: channelIdHex,
+			issuer: issuerNodeIdHex,
+			offerId: opts.offer.offerId.toString('hex'),
+			paths: ack.blindedNodeIds.length
+		});
+		return { mailboxId: witness.mailboxId, blindedNodeIds: ack.blindedNodeIds };
+	}
+
+	/** R: which slots the issuer issued, and to whom (section 9.7.7). */
+	async fetchFforIssuerStatus(
+		channelIdHex: string,
+		issuerNodeIdHex: string,
+		timeoutMs = 30_000
+	): Promise<ReturnType<typeof decodeIssuerStatusResp>> {
+		const record = this.getFforEpoch(channelIdHex);
+		const witness = record?.witnesses.find(
+			(w) => w.witnessNodeId.toString('hex') === issuerNodeIdHex
+		);
+		if (!record || !witness) throw new Error('no such witness provision');
+		const requestId = FforWitnessService.freshRequestId();
+		const body = await this.sendFforWitnessRequest(
+			issuerNodeIdHex,
+			FF_ISSUER_STATUS_TYPE,
+			encodeIssuerStatus(
+				requestId,
+				witness.mailboxId,
+				crypto.randomBytes(32),
+				witness.fetchPrivkey
+			),
+			requestId,
+			timeoutMs
+		);
+		return decodeIssuerStatusResp(body);
 	}
 
 	private registerCustomMessageHandler(): void {

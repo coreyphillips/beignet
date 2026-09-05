@@ -466,9 +466,12 @@ export function decodeInvoiceRequestTlv(data: Buffer): {
  */
 export function encodeInvoiceTlv(
 	invoice: IBolt12Invoice,
-	mirrorRecords?: ITlvRecord[]
+	mirrorRecords?: ITlvRecord[],
+	/** Further records the signature covers (experimental-range TLVs). */
+	extraRecords?: ITlvRecord[]
 ): Buffer {
 	const records: ITlvRecord[] = [];
+	if (extraRecords) records.push(...extraRecords);
 
 	if (mirrorRecords) {
 		for (const r of mirrorRecords) {
