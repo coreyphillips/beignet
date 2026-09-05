@@ -601,6 +601,7 @@ npm run test:chaos         # recovery kill matrices (parallel), split out of tes
 npm run test:sigkill       # process-level SIGKILL chaos matrix (builds dist first)
 npm run test:integration   # daemon/Electrum integration (needs an Electrum server)
 npm run test:interop       # 190+ cases vs LND/CLN/Eclair (needs Docker)
+npm run test:interop:ffor  # FFOR Variant D chain gates on regtest (needs only the bitcoind container)
 npm run test:all           # Lightning + CLI + interop (needs Docker + Electrum)
 ```
 

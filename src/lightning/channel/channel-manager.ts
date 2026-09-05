@@ -5808,6 +5808,11 @@ export class ChannelManager extends EventEmitter {
 		return this._fforDrive(channelId, (c) => c.fforAddPreimage(preimage));
 	}
 
+	/** R: durable "voucher k's invoice is exposed" (section 9.5.4 ordering). */
+	fforMarkExposed(channelId: Buffer, k: number): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforMarkExposed(k));
+	}
+
 	/** S: durable per-slot settlement state (section 9.5.1). */
 	fforSetSlot(
 		channelId: Buffer,

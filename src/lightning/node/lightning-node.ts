@@ -15656,6 +15656,32 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 		if (!committedRedrive) {
+			// Section 9.5.2, the ordering assertion: t_k leaves only against an
+			// upstream HTLC that is irrevocably committed. An add still PENDING
+			// in either commitment is not yet money S can claim, so revealing
+			// against it would convert a failed payment into free credit for R.
+			if (htlcEntry.state !== HtlcState.COMMITTED) {
+				return fail(
+					TEMPORARY_NODE_FAILURE,
+					'upstream HTLC is not irrevocably committed'
+				);
+			}
+			// Section 9.6.3, TLV 13: an honest S settles a delegated HTLC only
+			// from a peer the book named (a witness), so a conforming payer's
+			// mistaken route cannot settle without a record.
+			const witnessPeers = record.params.witnessPeers;
+			if (witnessPeers && witnessPeers.length > 0) {
+				const upstreamPeer = this.channelManager.getPeerForChannel(channelId);
+				if (
+					!upstreamPeer ||
+					!witnessPeers.some((p) => p.toString('hex') === upstreamPeer)
+				) {
+					return fail(
+						TEMPORARY_NODE_FAILURE,
+						'delegated HTLC did not arrive from a witness peer'
+					);
+				}
+			}
 			// Section 7.5.6 stopping conditions the channel judges: not ACTIVE,
 			// ff_close processed, tip at or past D, activation mismatch.
 			const refusal = slot.channel.fforSettlementRefusal(
@@ -15663,6 +15689,18 @@ export class LightningNode extends EventEmitter {
 				this.currentBlockHeight
 			);
 			if (refusal) return fail(TEMPORARY_NODE_FAILURE, refusal);
+			// Section 9.5.4: on a chained book revealing t_k reveals every lower
+			// slot's preimage, so slot k settles only once slots 1..k-1 have.
+			if (record.params.hashChain) {
+				for (let j = 1; j < k; j++) {
+					if (record.slotStates[j - 1] === FforSlotState.UNUSED) {
+						return fail(
+							TEMPORARY_NODE_FAILURE,
+							`hash chain: slot ${j} is unsettled below slot ${k}`
+						);
+					}
+				}
+			}
 
 			// Section 8: the upstream HTLC must leave us our safety delta.
 			if (
@@ -15800,6 +15838,10 @@ export class LightningNode extends EventEmitter {
 			feeBaseMsat: number;
 			feeProportionalMillionths: number;
 			epochId?: Buffer;
+			/** TLV 13: the peers delegated HTLCs may reach S from (section 9.6.3). */
+			witnessPeers?: Buffer[];
+			/** TLV 15: hash-chained vouchers (section 9.5.4); uniform amounts. */
+			hashChain?: boolean;
 		}
 	): ChannelResult {
 		return this.channelManager.initiateFforEpoch(
@@ -15896,6 +15938,17 @@ export class LightningNode extends EventEmitter {
 		const hint = this.buildRoutingHintForChannel(channel);
 		if (!hint) {
 			throw new Error('no usable SCID or alias for the route hint to S');
+		}
+		// Section 9.5.4: strictly ascending levels on a chained book, and one
+		// invoice per slot on any book. Durable BEFORE the invoice exists, so a
+		// restart cannot hand out a lower level after a higher one.
+		const exposureRefusal = channel.fforExposureRefusal(k);
+		if (exposureRefusal) throw new Error(`FFOR: ${exposureRefusal}`);
+		const marked = this.channelManager.fforMarkExposed(channelId, k);
+		if (!marked.ok) {
+			throw new Error(
+				`FFOR: could not record voucher ${k} as exposed: ${marked.error}`
+			);
 		}
 		const d = record.params.voucherAmountsMsat[k - 1];
 		// Section 7.5.6: at most 8 minutes per remaining block, then a margin.
