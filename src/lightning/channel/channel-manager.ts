@@ -1390,7 +1390,19 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		const actions = channel.fulfillHtlc(htlcId, preimage);
-		this.processActions(peerPubkey, channel, actions);
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
+		if (progress.sendsWithheld || progress.sendsHeld) {
+			// The fulfil's durable write failed (or the batch is parked): the
+			// update_fulfill_htlc did not leave. A caller that records the
+			// settlement as done on ok: true would be wrong, so say so.
+			return {
+				ok: false,
+				actions,
+				sendsWithheld: true,
+				error: 'update_fulfill_htlc withheld: durable write failed'
+			};
+		}
 
 		// BOLT 2: after sending update_fulfill_htlc, send commitment_signed to
 		// commit the removal. autoSignAndSendCommitment is a no-op unless we owe a
@@ -5501,6 +5513,8 @@ export class ChannelManager extends EventEmitter {
 
 	/** Last FFOR state reported per channel, for the ffor:state event. */
 	private _fforLastState = new Map<string, FforState | null>();
+	/** FFOR state per channel as of its latest committed persist. */
+	private _fforDurableState = new Map<string, FforState | null>();
 	/**
 	 * Section 7.5.5 setup timeout: a setup that has not reached ACTIVE within
 	 * the window is aborted (reason 1). Armed while a record is pre-ACTIVE,
@@ -5544,23 +5558,33 @@ export class ChannelManager extends EventEmitter {
 		if (!channelId) return;
 		const hex = channelId.toString('hex');
 		const record = channel.getFforEpoch();
-		const state = record ? record.state : null;
-		this._fforSyncSetupTimer(hex, channelId, state);
+		this._fforSyncSetupTimer(hex, channelId, record);
+		this._fforEmitEnforce(hex, channelId, record);
+		// Announce the DURABLE state, never the in-memory one: a re-entrant
+		// dispatch can have moved the record past what this batch persisted.
+		if (!this._fforDurableState.has(hex)) return;
+		const state = this._fforDurableState.get(hex) ?? null;
 		const last = this._fforLastState.get(hex);
 		if (last === state) return;
 		this._fforLastState.set(hex, state);
-		if (record) this.emit('ffor:state', channelId, state, record);
+		if (record && state !== null) {
+			this.emit('ffor:state', channelId, state, record);
+		}
 	}
 
 	private _fforSyncSetupTimer(
 		hex: string,
 		channelId: Buffer,
-		state: FforState | null
+		record: IFforEpochRecord | null
 	): void {
+		// Section 7.5.5: the timeout is S's. R never aborts on a timer (an
+		// ACTIVATING R must wait for the reestablish; S may hold ACTIVE).
+		const state = record ? record.state : null;
 		const preActive =
-			state === FforState.NEGOTIATING ||
-			state === FforState.VOUCHERS_COMMITTED ||
-			state === FforState.ACTIVATING;
+			record !== null &&
+			record.role === 'S' &&
+			(state === FforState.NEGOTIATING ||
+				state === FforState.VOUCHERS_COMMITTED);
 		const timer = this._fforSetupTimers.get(hex);
 		if (preActive && !timer) {
 			const t = setTimeout(() => {
@@ -5573,6 +5597,25 @@ export class ChannelManager extends EventEmitter {
 			clearTimeout(timer);
 			this._fforSetupTimers.delete(hex);
 		}
+	}
+
+	/** Channels whose activation mismatch was already announced. */
+	private _fforEnforceAnnounced = new Set<string>();
+
+	/**
+	 * 'ffor:enforce' (channelId, record): the peer's reestablish contradicted
+	 * our ACTIVE epoch (section 7.5.5). R exposes no further invoices and S
+	 * settles nothing; the host decides whether to enforce on-chain.
+	 */
+	private _fforEmitEnforce(
+		hex: string,
+		channelId: Buffer,
+		record: IFforEpochRecord | null
+	): void {
+		if (!record || !record.activationMismatch) return;
+		if (this._fforEnforceAnnounced.has(hex)) return;
+		this._fforEnforceAnnounced.add(hex);
+		this.emit('ffor:enforce', channelId, record);
 	}
 
 	/**
@@ -5658,7 +5701,6 @@ export class ChannelManager extends EventEmitter {
 		// The voucher adds (after ff_init), the abort unwind and the drain all
 		// need a commitment round; a no-op when nothing is pending.
 		this.autoSignAndSendCommitment(channelId);
-		this._fforEmitStateChange(channel);
 	}
 
 	/** Run a channel's FFOR action producer and drive the round it needs. */
@@ -5694,7 +5736,6 @@ export class ChannelManager extends EventEmitter {
 			};
 		}
 		this.autoSignAndSendCommitment(channelId);
-		this._fforEmitStateChange(channel);
 		return {
 			ok: err === undefined,
 			actions,
@@ -8221,7 +8262,8 @@ export class ChannelManager extends EventEmitter {
 	): void {
 		this._syncQuiescenceWatchdog(channel);
 		this._fforEnsureContext(peerPubkey, channel);
-		this._fforEmitStateChange(channel);
+		// An empty batch announces nothing: only a dispatch whose durable
+		// write landed may report the epoch's state (see the tail below).
 		if (actions.length === 0) return;
 		const dispatchProgress = progress ?? newDispatchProgress();
 		const errorIndex = actions.findIndex(
@@ -8260,6 +8302,16 @@ export class ChannelManager extends EventEmitter {
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
 					errorAction.message
 				);
+			}
+			// FFOR state is announced only from a batch whose own durable write
+			// landed: a host acting on ACTIVE must find ACTIVE on disk. A batch
+			// without a persist announces nothing, whatever memory says.
+			if (
+				!dispatchProgress.sendsWithheld &&
+				!dispatchProgress.sendsHeld &&
+				actions.some((a) => a.type === ChannelActionType.PERSIST_STATE)
+			) {
+				this._fforEmitStateChange(channel);
 			}
 		}
 	}
@@ -8722,6 +8774,18 @@ export class ChannelManager extends EventEmitter {
 					if (persistRequest && !persistRequest.committed) {
 						setSendsBlocked(true);
 						break;
+					}
+					// The FFOR state this write made durable, captured HERE: a
+					// nested dispatch may move the in-memory record before this
+					// batch's tail announces anything.
+					if (typeof channel.getFforEpoch === 'function') {
+						const durableId = channel.getChannelId();
+						if (durableId) {
+							this._fforDurableState.set(
+								durableId.toString('hex'),
+								channel.getFforEpoch()?.state ?? null
+							);
+						}
 					}
 					// The frame this transition landed in is only known now, so
 					// the barrier question is asked here and nowhere else. A

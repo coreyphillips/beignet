@@ -3941,6 +3941,19 @@ export class LightningNode extends EventEmitter {
 		);
 
 		this.channelManager.on(
+			'ffor:state',
+			(channelId: Buffer, state: number, record: IFforEpochRecord) => {
+				this.emit('ffor:state', { channelId, state, record });
+			}
+		);
+		this.channelManager.on(
+			'ffor:enforce',
+			(channelId: Buffer, record: IFforEpochRecord) => {
+				this.emit('ffor:enforce', { channelId, record });
+			}
+		);
+
+		this.channelManager.on(
 			'htlc:forwarded',
 			(
 				channelId: Buffer,
@@ -15231,62 +15244,67 @@ export class LightningNode extends EventEmitter {
 			return true;
 		};
 
-		// Section 7.5.6 stopping conditions the channel judges: not ACTIVE,
-		// ff_close processed, tip at or past D, activation mismatch.
-		const refusal = slot.channel.fforSettlementRefusal(
-			k,
-			this.currentBlockHeight
-		);
-		if (refusal) return fail(TEMPORARY_NODE_FAILURE, refusal);
-
-		// Single use (section 7.3): a slot already settling or settled answers
-		// exactly the upstream HTLC it recorded, never a second one.
+		// A slot already SETTLING or SETTLED answers exactly the upstream HTLC
+		// it recorded (section 9.5.1): S committed to reveal t_k, so on a
+		// re-drive after a restart the ONLY safe move is to fulfil it, whatever
+		// the stopping conditions, the deadline or the epoch's state say now;
+		// its preimage is in (or will be in) the ff_close_ack. A second HTLC on
+		// the slot is refused.
 		const slotState = record.slotStates[k - 1];
 		const recordedUpstream = record.slotUpstream[k - 1];
-		if (
-			slotState !== FforSlotState.UNUSED &&
-			recordedUpstream !== htlcSecretKey
-		) {
+		const committedRedrive =
+			slotState !== FforSlotState.UNUSED && recordedUpstream === htlcSecretKey;
+		if (slotState !== FforSlotState.UNUSED && !committedRedrive) {
 			return fail(
 				TEMPORARY_NODE_FAILURE,
 				'duplicate delegated payment for consumed hash'
 			);
 		}
-
-		// Section 8: the upstream HTLC must leave us our safety delta.
-		if (
-			this.currentBlockHeight > 0 &&
-			htlcEntry.cltvExpiry <= this.currentBlockHeight + this.forwardingCltvDelta
-		) {
-			return fail(
-				TEMPORARY_NODE_FAILURE,
-				'upstream cltv_expiry inside the safety delta'
+		if (!committedRedrive) {
+			// Section 7.5.6 stopping conditions the channel judges: not ACTIVE,
+			// ff_close processed, tip at or past D, activation mismatch.
+			const refusal = slot.channel.fforSettlementRefusal(
+				k,
+				this.currentBlockHeight
 			);
-		}
+			if (refusal) return fail(TEMPORARY_NODE_FAILURE, refusal);
 
-		// Section 7.6 checks 1 and 2 on the payee amount d_k.
-		const amountCheck = checkDelegatedAmounts({
-			payeeAmountMsat: entry.amountMsat,
-			amountMsat,
-			amtToForwardMsat: hopPayload.amountToForwardMsat ?? null,
-			hopKind: blinded ? 'blinded' : 'plaintext',
-			feeBaseMsat: record.params.feeBaseMsat,
-			feeProportionalMillionths: record.params.feeProportionalMillionths
-		});
-		if (amountCheck) {
-			if (amountCheck.check === 2) {
+			// Section 8: the upstream HTLC must leave us our safety delta.
+			if (
+				this.currentBlockHeight > 0 &&
+				htlcEntry.cltvExpiry <=
+					this.currentBlockHeight + this.forwardingCltvDelta
+			) {
 				return fail(
-					FEE_INSUFFICIENT,
-					'fee_insufficient',
-					this.updateFlaggedFailureData(FEE_INSUFFICIENT, {
-						htlcMsat: amountMsat
-					})
+					TEMPORARY_NODE_FAILURE,
+					'upstream cltv_expiry inside the safety delta'
 				);
 			}
-			return fail(
-				TEMPORARY_NODE_FAILURE,
-				`amount check failed: ${amountCheck.reason}`
-			);
+
+			// Section 7.6 checks 1 and 2 on the payee amount d_k.
+			const amountCheck = checkDelegatedAmounts({
+				payeeAmountMsat: entry.amountMsat,
+				amountMsat,
+				amtToForwardMsat: hopPayload.amountToForwardMsat ?? null,
+				hopKind: blinded ? 'blinded' : 'plaintext',
+				feeBaseMsat: record.params.feeBaseMsat,
+				feeProportionalMillionths: record.params.feeProportionalMillionths
+			});
+			if (amountCheck) {
+				if (amountCheck.check === 2) {
+					return fail(
+						FEE_INSUFFICIENT,
+						'fee_insufficient',
+						this.updateFlaggedFailureData(FEE_INSUFFICIENT, {
+							htlcMsat: amountMsat
+						})
+					);
+				}
+				return fail(
+					TEMPORARY_NODE_FAILURE,
+					`amount check failed: ${amountCheck.reason}`
+				);
+			}
 		}
 
 		// Settle: SETTLING is on disk before the preimage leaves (section
@@ -15454,6 +15472,13 @@ export class LightningNode extends EventEmitter {
 				`FFOR epoch is ${
 					FforState[record.state]
 				}: invoices may be exposed only while ACTIVE`
+			);
+		}
+		if (record.activationMismatch) {
+			// Section 7.5.5: the peer contradicted our ACTIVE epoch at
+			// reestablish; an honest S will not settle these invoices.
+			throw new Error(
+				'FFOR epoch is in dispute after reestablish: no invoice is exposed'
 			);
 		}
 		if (k < 1 || k > record.params.maxPayments) {

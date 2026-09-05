@@ -845,6 +845,17 @@ export class Channel {
 	 * peer's reply is still in flight and is consumed without effect.
 	 */
 	private _fforStfuReplyStale = false;
+	/**
+	 * FFOR: set while the epoch's own drain or unwind settles a parked
+	 * voucher; every other settle of a parked voucher is refused.
+	 */
+	private _fforInternalSettle = false;
+	/**
+	 * FFOR (R, DRAINING): BOLT 2 retransmissions of the drain (the fulfils,
+	 * fails and commitment_signed) held back because the peer reestablished
+	 * reporting ACTIVE; released when its ff_close_ack arrives. Memory-only.
+	 */
+	private _fforHeldReplay: ChannelAction[] = [];
 	private _spliceSession: SpliceSession | null = null;
 	// A splice the caller requested while the channel was not yet quiescent.
 	// Fired automatically once we reach QUIESCENT (we drive quiescence ourselves
@@ -4776,7 +4787,7 @@ export class Channel {
 			// completed the drain.
 			...this._maybeAnswerOwedStfu(),
 			// FFOR: the round boundary at which S's voucher round completes.
-			...this._fforAfterRound()
+			...this._fforAfterRound('cs')
 		];
 	}
 
@@ -5016,7 +5027,7 @@ export class Channel {
 			...this._maybeAnswerOwedStfu(),
 			// FFOR: the round boundary at which R's voucher round completes, an
 			// aborted round unwinds, and a drain reaches CLOSED.
-			...this._fforAfterRound()
+			...this._fforAfterRound('raa')
 		];
 	}
 
@@ -8280,6 +8291,7 @@ export class Channel {
 		this._quiescence.reset();
 		this._stfuReplyOwed = false;
 		this._fforStfuReplyStale = false;
+		this._fforHeldReplay = [];
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
 
@@ -9445,7 +9457,7 @@ export class Channel {
 	 * - Force closes on irrecoverable state gaps
 	 */
 	handleReestablish(msg: IChannelReestablishMessage): ChannelAction[] {
-		const actions: ChannelAction[] = [];
+		let actions: ChannelAction[] = [];
 		// A fresh exchange begins; the previous session's outcome is stale.
 		this._lastReestablishOutcome = null;
 
@@ -9833,6 +9845,21 @@ export class Channel {
 
 		// ── FFOR section 7.5.5 retransmission rules ──
 		actions.push(...this._handleReestablishFfor(msg));
+		if (this._fforShouldHoldDrain(msg)) {
+			// R in DRAINING facing an S that does not hold ff_close: the drain's
+			// fulfils, fails and commitment_signed would land in S's ACTIVE
+			// freeze. Hold them; handleFforCloseAck releases them.
+			const held = actions.filter(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					(a.messageType === MessageType.UPDATE_FULFILL_HTLC ||
+						a.messageType === MessageType.UPDATE_FAIL_HTLC ||
+						a.messageType === MessageType.COMMITMENT_SIGNED ||
+						a.messageType === MessageType.REVOKE_AND_ACK)
+			);
+			this._fforHeldReplay = held;
+			actions = actions.filter((a) => !held.includes(a));
+		}
 
 		// ── Retransmit channel_ready if we sent it previously (BOLT 2 §5) ──
 		// Spec trigger: the peer's next_commitment_number == 1 proves it never
@@ -19995,6 +20022,20 @@ export class Channel {
 			| 'splice',
 		htlcId?: bigint
 	): string | null {
+		const any = this._state.ffor;
+		// Section 9.5.1 step 3: a parked voucher is fulfilled or failed only by
+		// the epoch's own drain or unwind, in every state before CLOSED.
+		if (
+			any &&
+			any.role === 'R' &&
+			any.state !== FforState.CLOSED &&
+			kind === 'settle' &&
+			htlcId !== undefined &&
+			!this._fforInternalSettle &&
+			this._fforVoucherEntry(any, htlcId) !== undefined
+		) {
+			return `FFOR voucher ${htlcId} is parked: only the epoch's drain or unwind settles it`;
+		}
 		const f = this._fforLive();
 		if (!f) return null;
 		if (f.state === FforState.ACTIVATING || f.state === FforState.ACTIVE) {
@@ -20227,6 +20268,8 @@ export class Channel {
 			];
 		}
 		const initWire = fforWireBytes(FF_INIT_TYPE, body);
+		// The record this one replaces stays consumed (section 7 uniqueness).
+		if (this._state.ffor) this._fforBurnEpochId(this._state.ffor.epochId);
 		this._state.ffor = this._fforNewRecord(
 			'R',
 			epochId,
@@ -20482,6 +20525,7 @@ export class Channel {
 		f.hBook = computeHBook(
 			buildVoucherBook(msg.epochId, FforVariant.D, this._fforBook(f))
 		);
+		if (this._state.ffor) this._fforBurnEpochId(this._state.ffor.epochId);
 		this._state.ffor = f;
 
 		const actions: ChannelAction[] = [
@@ -20708,6 +20752,12 @@ export class Channel {
 		});
 		if (match) {
 			entry.fforVoucher = true;
+			if (f.state === FforState.ABORTED) {
+				// BOLT 2 replayed the add after a reconnect: a voucher of an
+				// aborted epoch, owed an update_fail_htlc once committed.
+				f.unwindOwed = true;
+				return;
+			}
 			const nodeKey = this._fforCtx?.nodePrivateKey ?? null;
 			if (nodeKey) {
 				const bad = verifyVoucherOnion(
@@ -20746,17 +20796,20 @@ export class Channel {
 	 * boundaries at which the epoch can advance (VOUCHERS_COMMITTED, the
 	 * abort unwind, CLOSED). The batch these ride already persists.
 	 */
-	private _fforAfterRound(): ChannelAction[] {
+	private _fforAfterRound(boundary: 'cs' | 'raa'): ChannelAction[] {
 		const f = this._state.ffor;
 		if (!f) return [];
 		if (f.state === FforState.NEGOTIATING && f.acceptWire) {
 			return this._fforMaybeVouchersCommitted(f);
 		}
-		if (f.state === FforState.ABORTED && f.unwindOwed) {
+		if (f.state === FforState.ABORTED) {
+			// Recomputed from the committed HTLC set at every round boundary,
+			// never fixed at abort time: adds replayed after a reconnect park
+			// vouchers on an aborted epoch too.
 			return this._fforMaybeUnwind(f);
 		}
 		if (f.state === FforState.DRAINING) {
-			return this._fforMaybeClosed(f);
+			return this._fforMaybeClosed(f, boundary);
 		}
 		return [];
 	}
@@ -21168,7 +21221,8 @@ export class Channel {
 	/** Either side: mark the record ABORTED and unwind what the abort leaves. */
 	private _fforMarkAborted(
 		f: IFforEpochRecord,
-		reason: FforAbortReason
+		reason: FforAbortReason,
+		unwindNow = true
 	): ChannelAction[] {
 		f.state = FforState.ABORTED;
 		f.abortReason = reason;
@@ -21190,7 +21244,7 @@ export class Channel {
 		}
 		if (f.role === 'R') {
 			f.unwindOwed = true;
-			actions.push(...this._fforMaybeUnwind(f));
+			if (unwindNow) actions.push(...this._fforMaybeUnwind(f));
 		}
 		return actions;
 	}
@@ -21252,6 +21306,9 @@ export class Channel {
 		if (!f || f.state === FforState.ACTIVE || f.state === FforState.DRAINING) {
 			return [];
 		}
+		// Section 7.5.5: R keeps its ACTIVATING record until the reestablish
+		// answers; S may already be ACTIVE. The timeout is S's, from stfu.
+		if (f.role === 'R' && f.state === FforState.ACTIVATING) return [];
 		return this._fforAbortLocal(
 			f,
 			FforAbortReason.TIMEOUT,
@@ -21271,6 +21328,16 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'FFOR: no epoch to abort',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (f.role === 'R' && f.state === FforState.ACTIVATING) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'FFOR: cannot abort while ACTIVATING: S may hold ACTIVE and the reestablish answer is owed',
 					cleanup: 'none'
 				}
 			];
@@ -21386,26 +21453,44 @@ export class Channel {
 	 * boundary until no voucher remains.
 	 */
 	private _fforMaybeUnwind(f: IFforEpochRecord): ChannelAction[] {
-		if (f.role !== 'R' || !f.unwindOwed) return [];
+		if (f.role !== 'R') return [];
 		if (this._state.state !== ChannelState.NORMAL) return [];
 		if (this._quiescence.isQuiescing()) return [];
-		const actions: ChannelAction[] = [];
-		let remaining = false;
 		const parked = [
 			...this._fforVoucherEntries(f).values(),
 			...this._fforMismatchEntries()
 		];
-		for (const entry of parked) {
-			if (entry.state !== HtlcState.COMMITTED) {
-				if (entry.state === HtlcState.PENDING) remaining = true;
-				continue;
+		if (parked.length === 0) {
+			f.unwindOwed = false;
+			return [];
+		}
+		f.unwindOwed = true;
+		// "As soon as the channel is synchronized after the abort" (section
+		// 9.5.1): never while a commitment round is open, and never from a
+		// disconnect, where a queued fail would be replayed ahead of the
+		// retransmitted commitment_signed that does not cover it.
+		if (this.hasPendingHtlcs()) return [];
+		const actions: ChannelAction[] = [];
+		let remaining = false;
+		this._fforInternalSettle = true;
+		try {
+			for (const entry of parked) {
+				if (entry.state !== HtlcState.COMMITTED) {
+					if (entry.state === HtlcState.PENDING) remaining = true;
+					continue;
+				}
+				const fail = this.failHtlc(
+					entry.id,
+					this._fforVoucherFailReason(entry)
+				);
+				if (fail.some((a) => a.type === ChannelActionType.ERROR)) {
+					remaining = true;
+					continue;
+				}
+				actions.push(...fail);
 			}
-			const fail = this.failHtlc(entry.id, this._fforVoucherFailReason(entry));
-			if (fail.some((a) => a.type === ChannelActionType.ERROR)) {
-				remaining = true;
-				continue;
-			}
-			actions.push(...fail);
+		} finally {
+			this._fforInternalSettle = false;
 		}
 		f.unwindOwed = remaining;
 		return actions;
@@ -21433,11 +21518,22 @@ export class Channel {
 	}
 
 	/** Section 7.5.1: CLOSED once no voucher remains in either commitment. */
-	private _fforMaybeClosed(f: IFforEpochRecord): ChannelAction[] {
+	private _fforMaybeClosed(
+		f: IFforEpochRecord,
+		boundary: 'cs' | 'raa'
+	): ChannelAction[] {
 		if (f.state !== FforState.DRAINING) return [];
 		if (this._fforVoucherEntries(f).size > 0) return [];
 		if (this.hasPendingHtlcs()) return [];
+		// R's map empties at S's revoke_and_ack for R's removal commitment,
+		// while R's OWN commitment still carries the vouchers until S's next
+		// commitment_signed and R's revoke of the old one. CLOSED is "no
+		// voucher in either commitment": on R, only at that commitment_signed
+		// boundary (the revoke leaves in the same batch).
+		if (f.role === 'R' && boundary !== 'cs') return [];
 		f.state = FforState.CLOSED;
+		// Section 7: unique across all epochs, closed ones included.
+		this._fforBurnEpochId(f.epochId);
 		return [];
 	}
 
@@ -21617,8 +21713,11 @@ export class Channel {
 		const wire = fforWireBytes(FF_CLOSE_ACK_TYPE, payload);
 		if (f.closeAckWire) {
 			if (f.closeAckWire.equals(wire)) {
-				// A retransmission: re-drive whatever the drain still owes.
-				return this._fforDrain(f);
+				// A retransmission: release any drain messages held back while
+				// the peer did not hold ff_close, then re-drive what is owed.
+				const held = this._fforHeldReplay;
+				this._fforHeldReplay = [];
+				return [...held, ...this._fforDrain(f)];
 			}
 			return [
 				{
@@ -21724,21 +21823,27 @@ export class Channel {
 		if (f.state !== FforState.DRAINING || !f.settledBitmap) return [];
 		if (this._state.state !== ChannelState.NORMAL) return [];
 		if (this._quiescence.isQuiescing()) return [];
+		if (this._fforHeldReplay.length > 0) return [];
 		const actions: ChannelAction[] = [];
-		for (const [k, entry] of this._fforVoucherEntries(f)) {
-			if (entry.state !== HtlcState.COMMITTED) continue;
-			const preimage = f.knownPreimages[k - 1];
-			if (preimage) {
-				const r = this.fulfillHtlc(entry.id, preimage);
-				if (!r.some((a) => a.type === ChannelActionType.ERROR))
-					actions.push(...r);
-			} else if (!bitmapGet(f.settledBitmap, k)) {
-				const r = this.failHtlc(entry.id, this._fforVoucherFailReason(entry));
-				if (!r.some((a) => a.type === ChannelActionType.ERROR))
-					actions.push(...r);
+		this._fforInternalSettle = true;
+		try {
+			for (const [k, entry] of this._fforVoucherEntries(f)) {
+				if (entry.state !== HtlcState.COMMITTED) continue;
+				const preimage = f.knownPreimages[k - 1];
+				if (preimage) {
+					const r = this.fulfillHtlc(entry.id, preimage);
+					if (!r.some((a) => a.type === ChannelActionType.ERROR))
+						actions.push(...r);
+				} else if (!bitmapGet(f.settledBitmap, k)) {
+					const r = this.failHtlc(entry.id, this._fforVoucherFailReason(entry));
+					if (!r.some((a) => a.type === ChannelActionType.ERROR))
+						actions.push(...r);
+				}
+				// A slot marked settled whose preimage we lack stays pending
+				// until a payer or witness supplies it, or T_exp resolves it.
 			}
-			// A slot marked settled whose preimage we lack stays pending until
-			// a payer or witness supplies it, or T_exp resolves it on-chain.
+		} finally {
+			this._fforInternalSettle = false;
 		}
 		return actions;
 	}
@@ -21823,6 +21928,14 @@ export class Channel {
 		return null;
 	}
 
+	/** R in DRAINING whose peer reports a state before DRAINING for our epoch. */
+	private _fforShouldHoldDrain(msg: IChannelReestablishMessage): boolean {
+		const f = this._state.ffor;
+		if (!f || f.role !== 'R' || f.state !== FforState.DRAINING) return false;
+		if (!msg.ffor || !msg.ffor.epochId.equals(f.epochId)) return false;
+		return msg.ffor.state < FforState.DRAINING;
+	}
+
 	/** The section 11.1 reestablish TLV for our epoch, if any. */
 	private _fforReestablishTlv(): IFforReestablishTlv | undefined {
 		const f = this._state.ffor;
@@ -21842,12 +21955,13 @@ export class Channel {
 		if (!f) return;
 		switch (f.state) {
 			case FforState.NEGOTIATING:
-				this._fforMarkAborted(f, FforAbortReason.DISCONNECT);
+				// The unwind waits for the reestablish to synchronize the channel.
+				this._fforMarkAborted(f, FforAbortReason.DISCONNECT, false);
 				break;
 			case FforState.VOUCHERS_COMMITTED:
 				// Neither side has persisted ACTIVE (S does so only as it sends the
 				// ack), so nothing before it is worth resuming: abort.
-				this._fforMarkAborted(f, FforAbortReason.DISCONNECT);
+				this._fforMarkAborted(f, FforAbortReason.DISCONNECT, false);
 				break;
 			default:
 				// ACTIVATING (S may have persisted ACTIVE and owe the ack),
@@ -21935,6 +22049,7 @@ export class Channel {
 					peerState < FforState.ACTIVE &&
 					f.activateAckWire
 				) {
+					// Acknowledgement loss: R is still ACTIVATING, the ack again.
 					actions.push({ type: ChannelActionType.PERSIST_STATE });
 					actions.push(
 						replayMsg(
@@ -21942,6 +22057,23 @@ export class Channel {
 							f.activateAckWire.subarray(2)
 						)
 					);
+					break;
+				}
+				if (
+					peerState === FforState.ABORTED ||
+					(f.role === 'R' && peerState < FforState.ACTIVE)
+				) {
+					// Section 11.1: from the moment either side persisted ACTIVE
+					// neither may discard the epoch. A peer reporting anything
+					// before ACTIVE, or ABORTED, has: recorded as the violation it
+					// is. R stops exposing invoices and S stops settling; the
+					// host is told to enforce on-chain.
+					f.activationMismatch = true;
+					actions.push({ type: ChannelActionType.PERSIST_STATE });
+					error(
+						`FFOR: peer reports ${FforState[peerState]} against our ACTIVE epoch`
+					);
+					break;
 				}
 				if (
 					f.role === 'R' &&
@@ -21967,12 +22099,30 @@ export class Channel {
 						replayMsg(MessageType.FF_CLOSE_ACK, f.closeAckWire.subarray(2))
 					);
 				}
+				if (
+					f.role === 'R' &&
+					f.state === FforState.DRAINING &&
+					peerState !== null &&
+					peerState < FforState.DRAINING
+				) {
+					// S does not hold our ff_close (a backup that predates it):
+					// retransmit it, and keep the drain out of S's ACTIVE freeze
+					// until its ff_close_ack arrives (the BOLT 2 retransmissions
+					// are held in _fforHeldReplay by handleReestablish).
+					if (f.closeWire) {
+						actions.push({ type: ChannelActionType.PERSIST_STATE });
+						actions.push(
+							replayMsg(MessageType.FF_CLOSE, f.closeWire.subarray(2))
+						);
+					}
+					break;
+				}
 				if (f.role === 'R' && f.state === FforState.DRAINING) {
 					actions.push(...this._fforDrain(f));
 				}
 				break;
 			case FforState.ABORTED:
-				if (f.unwindOwed) actions.push(...this._fforMaybeUnwind(f));
+				actions.push(...this._fforMaybeUnwind(f));
 				break;
 		}
 		return actions;
