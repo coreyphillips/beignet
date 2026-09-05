@@ -5815,7 +5815,10 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/** R: persist a witness provision before its manifest leaves (section 9.6.4). */
-	fforRecordWitness(channelId: Buffer, p: IFforWitnessProvision): ChannelResult {
+	fforRecordWitness(
+		channelId: Buffer,
+		p: IFforWitnessProvision
+	): ChannelResult {
 		return this._fforDrive(channelId, (c) => c.fforRecordWitness(p));
 	}
 

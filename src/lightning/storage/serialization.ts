@@ -1130,8 +1130,7 @@ export function deserializeFforEpoch(
 		slotUpstream: [...s.slotUpstream],
 		settledBitmap: hexToBuf(s.settledBitmap),
 		knownPreimages: s.knownPreimages.map((p) => hexToBuf(p)),
-		exposedSlots:
-			s.exposedSlots ?? s.knownPreimages.map(() => false),
+		exposedSlots: s.exposedSlots ?? s.knownPreimages.map(() => false),
 		witnesses: (s.witnesses ?? []).map((w) => ({
 			witnessNodeId: Buffer.from(w.witnessNodeId, 'hex'),
 			mailboxId: Buffer.from(w.mailboxId, 'hex'),

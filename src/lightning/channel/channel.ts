@@ -21997,8 +21997,8 @@ export class Channel {
 			for (let j = idx - 1; j >= 0; j--) {
 				if (f.knownPreimages[j]) continue;
 				const derived = f.paymentHashes[j + 1];
-				const h = crypto.createHash('sha256').update(derived).digest();
-				if (!h.equals(f.paymentHashes[j])) break;
+				const below = crypto.createHash('sha256').update(derived).digest();
+				if (!below.equals(f.paymentHashes[j])) break;
 				f.knownPreimages[j] = Buffer.from(derived);
 				learned.push({
 					type: ChannelActionType.PREIMAGE_LEARNED,

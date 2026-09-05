@@ -774,7 +774,11 @@ export class LightningNode extends EventEmitter {
 	/** R's outstanding witness-lane requests, by request id (Appendix F). */
 	private fforWitnessRequests = new Map<
 		string,
-		{ resolve: (body: Buffer) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
+		{
+			resolve: (body: Buffer) => void;
+			reject: (err: Error) => void;
+			timer: NodeJS.Timeout;
+		}
 	>();
 	private htlcSafetyMargin: number;
 	private forwardingEnabled: boolean;
@@ -15973,7 +15977,11 @@ export class LightningNode extends EventEmitter {
 	async provisionFforWitness(
 		channelIdHex: string,
 		witnessNodeIdHex: string,
-		opts: { retentionUntil?: number; minReceipts?: number; timeoutMs?: number } = {}
+		opts: {
+			retentionUntil?: number;
+			minReceipts?: number;
+			timeoutMs?: number;
+		} = {}
 	): Promise<{ mailboxId: Buffer; retentionUntil: number }> {
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const channel = this.channelManager.getChannel(channelId);
@@ -16027,9 +16035,14 @@ export class LightningNode extends EventEmitter {
 			manifestWire,
 			ackedAt: null
 		};
-		const persisted = this.channelManager.fforRecordWitness(channelId, provision);
+		const persisted = this.channelManager.fforRecordWitness(
+			channelId,
+			provision
+		);
 		if (!persisted.ok) {
-			throw new Error(`could not persist the witness provision: ${persisted.error}`);
+			throw new Error(
+				`could not persist the witness provision: ${persisted.error}`
+			);
 		}
 		const requestId = FforWitnessService.freshRequestId();
 		let ack: ReturnType<typeof decodeWitnessAck>;
@@ -16046,9 +16059,15 @@ export class LightningNode extends EventEmitter {
 			this.channelManager.fforDropWitness(channelId, mailboxId);
 			throw err;
 		}
-		if (!ack.ok || !ack.witnessNodeId || !ack.witnessNodeId.equals(witnessNodeId)) {
+		if (
+			!ack.ok ||
+			!ack.witnessNodeId ||
+			!ack.witnessNodeId.equals(witnessNodeId)
+		) {
 			this.channelManager.fforDropWitness(channelId, mailboxId);
-			throw new Error(`witness refused the provision: ${ack.error ?? 'wrong identity'}`);
+			throw new Error(
+				`witness refused the provision: ${ack.error ?? 'wrong identity'}`
+			);
 		}
 		const acked = this.channelManager.fforWitnessAcked(
 			channelId,
@@ -16082,7 +16101,12 @@ export class LightningNode extends EventEmitter {
 			witnessNodeId: Buffer;
 			ok: boolean;
 			error?: string;
-			records: { k: number; unbarriered: boolean; verified: boolean; reason?: string }[];
+			records: {
+				k: number;
+				unbarriered: boolean;
+				verified: boolean;
+				reason?: string;
+			}[];
 			credited: number;
 		}[]
 	> {
@@ -16094,7 +16118,8 @@ export class LightningNode extends EventEmitter {
 		}
 		const entries = channel.fforBookEntries();
 		if (!entries) throw new Error('no book');
-		const out: Awaited<ReturnType<LightningNode['fetchFforWitnessRecords']>> = [];
+		const out: Awaited<ReturnType<LightningNode['fetchFforWitnessRecords']>> =
+			[];
 		for (const w of record.witnesses) {
 			const idHex = w.witnessNodeId.toString('hex');
 			if (witnessNodeIdHex && idHex !== witnessNodeIdHex) continue;
@@ -16136,11 +16161,22 @@ export class LightningNode extends EventEmitter {
 				witnessNodeId: w.witnessNodeId,
 				ok: resp.ok,
 				...(resp.error ? { error: resp.error } : {}),
-				records: [] as { k: number; unbarriered: boolean; verified: boolean; reason?: string }[],
+				records: [] as {
+					k: number;
+					unbarriered: boolean;
+					verified: boolean;
+					reason?: string;
+				}[],
 				credited: 0
 			};
 			for (const rec of resp.records) {
-				const v = verifyWitnessRecord(rec, w, entries, record.epochId, record.hAct);
+				const v = verifyWitnessRecord(
+					rec,
+					w,
+					entries,
+					record.epochId,
+					record.hAct
+				);
 				summary.records.push({
 					k: v.k,
 					unbarriered: v.unbarriered,
@@ -16174,7 +16210,8 @@ export class LightningNode extends EventEmitter {
 		timeoutMs = 30_000
 	): Promise<{ witnessNodeId: Buffer; ok: boolean; held: number }[]> {
 		const channelId = Buffer.from(channelIdHex, 'hex');
-		const record = this.channelManager.getChannel(channelId)?.getFforEpoch() ?? null;
+		const record =
+			this.channelManager.getChannel(channelId)?.getFforEpoch() ?? null;
 		if (!record || record.role !== 'R' || !record.hAct) {
 			throw new Error('no FFOR epoch of ours on this channel');
 		}
@@ -16201,7 +16238,11 @@ export class LightningNode extends EventEmitter {
 					timeoutMs
 				);
 				const ack = decodeWitnessCloseAck(body);
-				out.push({ witnessNodeId: w.witnessNodeId, ok: ack.ok, held: ack.numRecordsHeld });
+				out.push({
+					witnessNodeId: w.witnessNodeId,
+					ok: ack.ok,
+					held: ack.numRecordsHeld
+				});
 			} catch {
 				out.push({ witnessNodeId: w.witnessNodeId, ok: false, held: 0 });
 			}
@@ -16249,7 +16290,9 @@ export class LightningNode extends EventEmitter {
 		const unacked = record.witnesses.find((w) => w.ackedAt === null);
 		if (unacked) {
 			throw new Error(
-				`witness ${unacked.witnessNodeId.toString('hex')} has not acknowledged the epoch`
+				`witness ${unacked.witnessNodeId.toString(
+					'hex'
+				)} has not acknowledged the epoch`
 			);
 		}
 		// Section 7.5.6, fail closed: an invoice exposed at or past D, or with
@@ -22613,7 +22656,11 @@ export class LightningNode extends EventEmitter {
 	 */
 	private registerFforWitnessHandlers(): void {
 		if (!this.peerManager) return;
-		for (let t = FF_WITNESS_PROVISION_TYPE; t <= FF_ISSUER_STATUS_RESP_TYPE; t += 2) {
+		for (
+			let t = FF_WITNESS_PROVISION_TYPE;
+			t <= FF_ISSUER_STATUS_RESP_TYPE;
+			t += 2
+		) {
 			this.peerManager.onMessage(t, (pubkey, msgType, payload) => {
 				this.handlePeerMessage(pubkey, msgType, payload);
 			});
@@ -22645,7 +22692,10 @@ export class LightningNode extends EventEmitter {
 			pending.resolve(payload);
 			return;
 		}
-		if (this.fforWitness && this.fforWitness.handleMessage(pubkey, type, payload)) {
+		if (
+			this.fforWitness &&
+			this.fforWitness.handleMessage(pubkey, type, payload)
+		) {
 			return;
 		}
 		// A request this node does not serve (no witness role, or an issuer

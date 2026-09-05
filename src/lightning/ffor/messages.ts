@@ -257,7 +257,11 @@ function tlvList(records: ITlvRecord[], type: bigint): Buffer | undefined {
 	return findTlvRecord(records, type);
 }
 
-export function splitFixed(value: Buffer, size: number, what: string): Buffer[] {
+export function splitFixed(
+	value: Buffer,
+	size: number,
+	what: string
+): Buffer[] {
 	if (value.length % size !== 0) {
 		throw new Error(
 			`${what}: length ${value.length} is not a multiple of ${size}`
@@ -323,10 +327,7 @@ export function encodeFforInitUnsigned(
 		for (const id of msg.witnessPeers) assertNodeId(id, 'witness_peers');
 		records.push({
 			type: 13n,
-			value: Buffer.concat([
-				u16(msg.witnessPeers.length),
-				...msg.witnessPeers
-			])
+			value: Buffer.concat([u16(msg.witnessPeers.length), ...msg.witnessPeers])
 		});
 	}
 	if (msg.hashChain) {
@@ -386,7 +387,10 @@ export function decodeFforInitMessage(body: Buffer): IFforInitMessage {
 	if (tower !== undefined && tower.length !== 33) {
 		throw new Error('ff_init TLV 3 must be 33 bytes');
 	}
-	if (hashChain !== undefined && (hashChain.length !== 1 || hashChain[0] !== 1)) {
+	if (
+		hashChain !== undefined &&
+		(hashChain.length !== 1 || hashChain[0] !== 1)
+	) {
 		throw new Error('ff_init TLV 15 must be the single byte 1');
 	}
 	return {
