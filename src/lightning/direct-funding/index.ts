@@ -38,7 +38,9 @@ export type {
 } from './frames';
 
 export {
+	DF_MESSAGE_SIGNATURE_BYTES,
 	attestationMessage,
+	bitcoinMessageHash,
 	decodeDfOffer,
 	decodeDfOfferAck,
 	decodeDfReceipt,
@@ -52,7 +54,8 @@ export {
 	encodeDfRelayFrame,
 	encodeDfSignRequest,
 	encodeDfWitness,
-	ownershipDigest
+	ownershipDigest,
+	ownershipMessage
 } from './messages';
 export type {
 	IDfAttestation,

@@ -13,6 +13,11 @@
  * reserved for it in `BeignetCustomSubtype`, sealed by `frames.ts`. Subtype 20
  * (`funding_abort`) stays reserved and unimplemented.
  *
+ * One addition past rev 2: the ownership proof may be carried as a Bitcoin
+ * signed message (odd type 21 on funding_offer) so that a wallet whose
+ * signer will not sign a raw digest, a node's signing RPC or a hardware
+ * wallet, can still prove its coin. See `IDfOwnershipProof.messageProof`.
+ *
  * TLV convention here: even types are the required fields, odd types the
  * optional ones, so a later revision can add an optional field without
  * breaking a decoder and cannot add a required one silently.
@@ -49,9 +54,31 @@ export interface IDfOwnershipProof {
 	 * which scheme to verify under.
 	 */
 	pubkey: Buffer;
-	/** 64 bytes either way. */
+	/**
+	 * 64 bytes either way: the coin key's signature over `ownershipDigest`.
+	 * All zeros when `messageProof` carries the proof instead.
+	 */
 	signature: Buffer;
+	/**
+	 * The same statement signed the way every wallet can sign it: a Bitcoin
+	 * signed-message compact signature (65 bytes, recovery header first) by
+	 * the coin's key over `ownershipMessage`, hashed as Bitcoin Core, LND,
+	 * Electrum and hardware wallets hash a signed message. `pubkey` is the
+	 * 33-byte key that signed: the P2WPKH key, or the P2TR internal key (the
+	 * receiver applies the BIP 86 tweak and compares with the script).
+	 *
+	 * A digest signature needs a signer that will sign a raw 32-byte hash,
+	 * which a node's signing RPC will not do for its wallet keys (LND hashes
+	 * whatever it is handed; CLN has no such call). This form is what those
+	 * wallets produce. Carried in an odd TLV: a receiver that predates it
+	 * verifies the zeroed digest signature, fails, and declines the offer
+	 * before anything is negotiated, which is the correct outcome there.
+	 */
+	messageProof?: { pubkey: Buffer; signature: Buffer };
 }
+
+/** A Bitcoin signed-message compact signature: recovery header, r, s. */
+export const DF_MESSAGE_SIGNATURE_BYTES = 65;
 
 export interface IDfOffer {
 	offerId: Buffer;
@@ -231,8 +258,26 @@ const OFFER_TYPES = {
 	maxTotalFeeSat: 14n,
 	receiptHash: 16n,
 	ownershipPubkey: 18n,
-	ownershipSignature: 20n
+	ownershipSignature: 20n,
+	/** Odd: optional, skipped by a receiver that does not know it. */
+	ownershipMessageProof: 21n
 };
+
+const MESSAGE_PROOF_BYTES = DF_NODE_ID_BYTES + DF_MESSAGE_SIGNATURE_BYTES;
+
+function messageProofBytes(proof: {
+	pubkey: Buffer;
+	signature: Buffer;
+}): Buffer {
+	return Buffer.concat([
+		fixed(proof.pubkey, DF_NODE_ID_BYTES, 'ownership message pubkey'),
+		fixed(
+			proof.signature,
+			DF_MESSAGE_SIGNATURE_BYTES,
+			'ownership message signature'
+		)
+	]);
+}
 
 function ownershipPubkey(value: Buffer): Buffer {
 	if (value.length !== DF_NODE_ID_BYTES && value.length !== 32) {
@@ -277,7 +322,15 @@ export function encodeDfOffer(o: IDfOffer): Buffer {
 				COMPACT_SIG_BYTES,
 				'ownership signature'
 			)
-		}
+		},
+		...(o.ownership.messageProof
+			? [
+					{
+						type: OFFER_TYPES.ownershipMessageProof,
+						value: messageProofBytes(o.ownership.messageProof)
+					}
+			  ]
+			: [])
 	]);
 }
 
@@ -315,7 +368,23 @@ export function decodeDfOffer(data: Buffer): IDfOffer {
 				OFFER_TYPES.ownershipSignature,
 				COMPACT_SIG_BYTES,
 				'ownership signature'
-			)
+			),
+			...decodeMessageProof(f.get(OFFER_TYPES.ownershipMessageProof))
+		}
+	};
+}
+
+function decodeMessageProof(value: Buffer | undefined): {
+	messageProof?: { pubkey: Buffer; signature: Buffer };
+} {
+	if (value === undefined) return {};
+	// Present but malformed is refused, not ignored: a proof this receiver
+	// cannot read must not silently fall back to the (zeroed) digest one.
+	const bytes = fixed(value, MESSAGE_PROOF_BYTES, 'ownership message proof');
+	return {
+		messageProof: {
+			pubkey: Buffer.from(bytes.subarray(0, DF_NODE_ID_BYTES)),
+			signature: Buffer.from(bytes.subarray(DF_NODE_ID_BYTES))
 		}
 	};
 }
@@ -708,26 +777,70 @@ export function deriveOfferId(
 }
 
 /**
- * The digest the UTXO's key signs to prove control of the offered coin
- * (ECDSA for P2WPKH, Schnorr for P2TR key path).
+ * The statement the coin's key signs to prove control of the offered coin.
+ * Signed one of two ways: as `ownershipDigest` (its SHA256, signed raw: ECDSA
+ * for P2WPKH, Schnorr for P2TR key path), or as a Bitcoin signed message
+ * (`bitcoinMessageHash` of it, signed compact ECDSA by the coin's key, the
+ * P2TR internal key included).
  */
+export function ownershipMessage(
+	offerId: Buffer,
+	txid: Buffer,
+	vout: number,
+	amountSat: bigint
+): string {
+	fixed(offerId, DF_OFFER_ID_BYTES, 'offer id');
+	fixed(txid, TXID_BYTES, 'txid');
+	return `lfbw-direct-funding-offer:${offerId.toString('hex')}:${txid.toString(
+		'hex'
+	)}:${vout}:${amountSat}`;
+}
+
+/** The raw digest form of `ownershipMessage`. */
 export function ownershipDigest(
 	offerId: Buffer,
 	txid: Buffer,
 	vout: number,
 	amountSat: bigint
 ): Buffer {
-	fixed(offerId, DF_OFFER_ID_BYTES, 'offer id');
-	fixed(txid, TXID_BYTES, 'txid');
 	return crypto
 		.createHash('sha256')
-		.update(
-			`lfbw-direct-funding-offer:${offerId.toString('hex')}:${txid.toString(
-				'hex'
-			)}:${vout}:${amountSat}`,
-			'utf8'
-		)
+		.update(ownershipMessage(offerId, txid, vout, amountSat), 'utf8')
 		.digest();
+}
+
+const BITCOIN_MESSAGE_PREFIX = Buffer.from('Bitcoin Signed Message:\n', 'utf8');
+
+function compactSize(n: number): Buffer {
+	if (n < 0xfd) return Buffer.from([n]);
+	if (n <= 0xffff) {
+		const b = Buffer.alloc(3);
+		b[0] = 0xfd;
+		b.writeUInt16LE(n, 1);
+		return b;
+	}
+	const b = Buffer.alloc(5);
+	b[0] = 0xfe;
+	b.writeUInt32LE(n, 1);
+	return b;
+}
+
+/**
+ * What a wallet's "sign message" actually signs: SHA256d over the Bitcoin
+ * Core envelope, `varstr("Bitcoin Signed Message:\n") || varstr(message)`.
+ * The one hash Bitcoin Core, btcd/LND, Electrum, Sparrow and hardware
+ * signers agree on for an address's key.
+ */
+export function bitcoinMessageHash(message: string): Buffer {
+	const body = Buffer.from(message, 'utf8');
+	const envelope = Buffer.concat([
+		compactSize(BITCOIN_MESSAGE_PREFIX.length),
+		BITCOIN_MESSAGE_PREFIX,
+		compactSize(body.length),
+		body
+	]);
+	const once = crypto.createHash('sha256').update(envelope).digest();
+	return crypto.createHash('sha256').update(once).digest();
 }
 
 /**

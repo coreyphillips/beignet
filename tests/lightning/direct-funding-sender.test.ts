@@ -11,11 +11,14 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
+import * as ecc from '@bitcoinerlab/secp256k1';
 import {
+	bitcoinMessageHash,
 	decodeDfOffer,
 	encodeDfOfferAck,
 	encodeDfReceipt,
-	IDfOffer
+	IDfOffer,
+	ownershipMessage
 } from '../../src/lightning/direct-funding/messages';
 import {
 	DirectFundingError,
@@ -28,7 +31,10 @@ import {
 	DF_PAYMENTS_STORAGE_KEY
 } from '../../src/lightning/direct-funding/sender/records';
 import { chainHashForNetwork } from '../../src/lightning/direct-funding/types';
-import type { IDfPaymentRecord } from '../../src/lightning/direct-funding/sender/types';
+import type {
+	IDfCoinSigner,
+	IDfPaymentRecord
+} from '../../src/lightning/direct-funding/sender/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	acceptingReceiver,
@@ -229,6 +235,81 @@ describe('Direct funding sender: the happy path', () => {
 		expect(result.attested).to.equal(true);
 		expect(witness).to.have.length(1);
 		expect((witness as unknown as Buffer[])[0]).to.have.length(64);
+	});
+});
+
+describe('Direct funding sender: the ownership proof form', () => {
+	it('a message-signing wallet puts the proof in the odd TLV and zeros the digest field', async () => {
+		const h = harness();
+		h.wallet.signsMessages = true;
+		const coin = h.wallet.coins[0];
+		const result = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.status).to.equal('SIGNED_PENDING');
+		const offerBody = h.lane.sent.find(
+			(m) => m.subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER
+		)!.body;
+		const offer = decodeDfOffer(offerBody);
+		expect(offer.ownership.signature).to.deep.equal(Buffer.alloc(64));
+		expect(offer.ownership.messageProof!.pubkey).to.deep.equal(coin.pubkey);
+		expect(offer.ownership.messageProof!.signature).to.have.length(65);
+		expect(
+			ecc.verify(
+				bitcoinMessageHash(
+					ownershipMessage(
+						offer.offerId,
+						offer.txid,
+						offer.vout,
+						offer.amountSat
+					)
+				),
+				coin.pubkey,
+				offer.ownership.messageProof!.signature.subarray(1)
+			)
+		).to.equal(true);
+	});
+
+	it('a signer that answers asynchronously, like a node RPC, is awaited at both signing sites', async () => {
+		const h = harness();
+		h.wallet.signsMessages = true;
+		h.wallet.signDelayMs = 15;
+		const result = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.attested).to.equal(true);
+		const record = h.payments.list()[0];
+		expect(record.witnessSent).to.equal(true);
+		expect(record.witness).to.have.length(2);
+	});
+
+	it('a signer that refuses asynchronously fails the send with the coin released', async () => {
+		const h = harness();
+		h.wallet.signDelayMs = 5;
+		h.wallet.signRejects = true;
+		let caught: unknown;
+		try {
+			await h.sender.send(h.request.encoded, { amountSat: 100_000n });
+		} catch (err) {
+			caught = err;
+		}
+		expect(String((caught as Error).message)).to.match(/the signer refused/);
+		expect(h.payments.list()[0].witnessSent).to.equal(undefined);
+		// Nothing left the device, so the coin is ours to offer again.
+		expect(h.wallet.listSpendable()).to.have.length(1);
+	});
+
+	it('a digest-signing wallet carries no message proof', async () => {
+		const h = harness();
+		await h.sender.send(h.request.encoded, { amountSat: 100_000n });
+		const offer = decodeDfOffer(
+			h.lane.sent.find(
+				(m) => m.subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER
+			)!.body
+		);
+		expect(offer.ownership.messageProof).to.equal(undefined);
+		expect(offer.ownership.signature.every((b) => b === 0)).to.equal(false);
 	});
 });
 
@@ -1099,7 +1180,7 @@ describe('Direct funding sender: the payment record', () => {
 		expect(store.restore()).to.equal(0);
 	});
 
-	it('never evicts a record whose witness is out', () => {
+	it('keeps records whose witness is out or reservation cleanup is pending', () => {
 		const store = new DirectFundingPaymentStore({ storage: memoryStorage() });
 		const base = {
 			receiptHash: 'cd'.repeat(32),
@@ -1120,11 +1201,18 @@ describe('Direct funding sender: the payment record', () => {
 			requestId: 'aa'.repeat(16),
 			status: 'SIGNED_PENDING'
 		});
+		store.open({
+			...base,
+			requestId: 'cc'.repeat(16),
+			status: 'ABORTED',
+			freezeReleased: false
+		});
 		store.forget('aa'.repeat(16));
 		expect(store.get('aa'.repeat(16))).to.not.equal(null);
 		store.open({ ...base, requestId: 'bb'.repeat(16), status: 'CREATED' });
 		store.forget('bb'.repeat(16));
 		expect(store.get('bb'.repeat(16))).to.equal(null);
+		expect(store.get('cc'.repeat(16))).to.not.equal(null);
 	});
 });
 
@@ -1200,6 +1288,446 @@ describe('Direct funding sender: frames that are not ours', () => {
 		);
 		expect(err.code).to.equal(DirectFundingErrorCode.UNREACHABLE);
 		expect(h.payments.list()[0].status).to.equal('ABORTED');
+	});
+});
+
+describe('Direct funding sender: a pending remote signer', () => {
+	function deferred<T>(): {
+		promise: Promise<T>;
+		resolve(value: T): void;
+		reject(err: Error): void;
+	} {
+		let resolve!: (value: T) => void;
+		let reject!: (err: Error) => void;
+		const promise = new Promise<T>((accept, refuse) => {
+			resolve = accept;
+			reject = refuse;
+		});
+		return { promise, resolve, reject };
+	}
+
+	for (const ending of ['timeout', 'decline'] as const) {
+		for (const lateAnswer of ['success', 'rejection'] as const) {
+			it(`releases on ${ending} before the signer answers and ignores its late ${lateAnswer}`, async () => {
+				const requests = [mintRequest(), mintRequest()];
+				const coin = makeCoin();
+				const storage = memoryStorage();
+				let frozenOnDisk: string[] = [];
+				const freezes = {
+					load: (): string[] => frozenOnDisk,
+					save: (outpoints: string[]): void => {
+						frozenOnDisk = [...outpoints];
+					}
+				};
+				const wallet = new FakeSenderWallet([coin], freezes);
+				const payments = new DirectFundingPaymentStore({ storage });
+				const signature = deferred<Buffer[]>();
+				const signing = deferred<void>();
+				const signerFor = wallet.signerFor.bind(wallet);
+				let signingCalls = 0;
+				let firstWitness: Buffer[] = [];
+				wallet.signerFor = (offered): IDfCoinSigner => {
+					const signer = signerFor(offered)!;
+					return {
+						...signer,
+						signInput: (tx, index, prevouts): Buffer[] | Promise<Buffer[]> => {
+							signingCalls++;
+							const witness = signer.signInput(tx, index, prevouts);
+							if (signingCalls !== 1) return witness;
+							firstWitness = witness as Buffer[];
+							signing.resolve();
+							return signature.promise;
+						}
+					};
+				};
+				let releases = 0;
+				const unfreeze = wallet.unfreezeUtxo.bind(wallet);
+				wallet.unfreezeUtxo = (txid, vout): Promise<boolean> => {
+					releases++;
+					return unfreeze(txid, vout);
+				};
+				const lanes = requests.map(
+					(request) =>
+						new ScriptedReceiverLane(request, acceptingReceiver(request))
+				);
+				const registry = registryRouting(
+					new Map(
+						requests.map((request, index) => [
+							request.requestId.toString('hex'),
+							lanes[index]
+						])
+					)
+				);
+				const config = {
+					offerResendDelaysMs: [],
+					offerTimeoutMs: ending === 'timeout' ? 40 : 1_000,
+					receiptTimeoutMs: 100
+				};
+				const sender = new DirectFundingSender(
+					{ wallet, payments, registry, chainHash: (): Buffer => REGTEST_HASH },
+					config
+				);
+				const failed = refusal(
+					sender.send(requests[0].encoded, { amountSat: 100_000n })
+				);
+				await signing.promise;
+				expect(wallet.listSpendable()).to.have.length(0);
+				if (ending === 'decline') {
+					lanes[0].reply(
+						BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK,
+						encodeDfOfferAck({
+							offerId: Buffer.from(payments.list()[0].offerId, 'hex'),
+							accepted: false,
+							reason: 'no liquidity'
+						})
+					);
+				}
+				const err = await failed;
+				expect(err.code).to.equal(
+					ending === 'timeout'
+						? DirectFundingErrorCode.EXCHANGE_TIMEOUT
+						: DirectFundingErrorCode.OFFER_DECLINED
+				);
+				expect(sender.inFlight()).to.equal(0);
+				expect(wallet.listSpendable()).to.have.length(1);
+				expect(frozenOnDisk).to.have.length(0);
+				expect(releases).to.equal(1);
+				const aborted = payments.get(requests[0].requestId.toString('hex'))!;
+				expect(aborted.status).to.equal('ABORTED');
+				expect(aborted.witnessSent).to.equal(undefined);
+
+				// A new process sees the released coin even if the original signer
+				// never answers. The old refusal remains terminal on replay.
+				const restoredWallet = new FakeSenderWallet([coin], freezes);
+				const restoredPayments = new DirectFundingPaymentStore({ storage });
+				restoredPayments.restore();
+				const restored = new DirectFundingSender(
+					{
+						wallet: restoredWallet,
+						payments: restoredPayments,
+						registry,
+						chainHash: (): Buffer => REGTEST_HASH
+					},
+					config
+				);
+				restored.start();
+				try {
+					await flush();
+					expect(restoredWallet.listSpendable()).to.have.length(1);
+					const replay = await refusal(
+						restored.send(requests[0].encoded, { amountSat: 100_000n })
+					);
+					expect(replay.code).to.equal(err.code);
+				} finally {
+					restored.stop();
+				}
+
+				// Reuse the coin for a different request before the first signer
+				// resolves. Its late completion must not release this new freeze.
+				const paid = await sender.send(requests[1].encoded, {
+					amountSat: 100_000n
+				});
+				expect(paid.status).to.equal('SIGNED_PENDING');
+				expect(wallet.listSpendable()).to.have.length(0);
+				if (lateAnswer === 'success') signature.resolve(firstWitness);
+				else signature.reject(new Error('hardware approval refused'));
+				await flush();
+				expect(releases).to.equal(1);
+				expect(wallet.listSpendable()).to.have.length(0);
+				expect(frozenOnDisk).to.have.length(1);
+				expect(
+					payments.get(requests[0].requestId.toString('hex'))
+				).to.deep.equal(aborted);
+				expect(
+					lanes[0].sent.filter(
+						(frame) =>
+							frame.subtype === BeignetCustomSubtype.DIRECT_FUNDING_WITNESS
+					)
+				).to.have.length(0);
+				expect(signingCalls).to.equal(2);
+			});
+		}
+	}
+
+	it('does not release a competing reservation when freeze is refused', async () => {
+		const h = harness();
+		let releases = 0;
+		h.wallet.freezeUtxo = async (txid, vout): Promise<boolean> => {
+			// Another wallet operation reserved the coin before acquisition.
+			h.wallet.frozen.add(`${txid}:${vout}`);
+			return false;
+		};
+		h.wallet.unfreezeUtxo = async (): Promise<boolean> => {
+			releases++;
+			return true;
+		};
+		expect(
+			(await refusal(h.sender.send(h.request.encoded, { amountSat: 100_000n })))
+				.code
+		).to.equal(DirectFundingErrorCode.SIGN_REQUEST_REFUSED);
+		expect(h.payments.list()[0].freezeReleased).to.equal(true);
+		h.sender.start();
+		await flush();
+		h.sender.stop();
+		expect(releases).to.equal(0);
+		expect(h.wallet.frozen.size).to.equal(1);
+	});
+
+	it('does not acquire or release when the reservation intent cannot persist', async () => {
+		const h = harness();
+		h.storage.failWhen = (value): boolean =>
+			value.includes('"freezeReleased":false');
+		let freezes = 0;
+		let releases = 0;
+		h.wallet.freezeUtxo = async (): Promise<boolean> => {
+			freezes++;
+			return true;
+		};
+		h.wallet.unfreezeUtxo = async (): Promise<boolean> => {
+			releases++;
+			return true;
+		};
+		expect(
+			(await refusal(h.sender.send(h.request.encoded, { amountSat: 100_000n })))
+				.code
+		).to.equal(DirectFundingErrorCode.NOT_PERSISTED);
+		h.sender.start();
+		await flush();
+		h.sender.stop();
+		expect(freezes).to.equal(0);
+		expect(releases).to.equal(0);
+		expect(h.payments.list()[0].freezeReleased).to.equal(true);
+	});
+
+	for (const failure of ['wallet', 'persistence'] as const) {
+		it(`keeps runtime cleanup held after ${failure} failure until durable recovery`, async () => {
+			const h = harness();
+			h.wallet.signDelayMs = 5;
+			h.wallet.signRejects = true;
+			const unfreeze = h.wallet.unfreezeUtxo.bind(h.wallet);
+			let releaseCalls = 0;
+			h.wallet.unfreezeUtxo = async (txid, vout): Promise<boolean> => {
+				releaseCalls++;
+				if (failure === 'wallet') return false;
+				const released = await unfreeze(txid, vout);
+				h.storage.failWhen = (value): boolean =>
+					value.includes('"freezeReleased":true');
+				return released;
+			};
+			let refused = false;
+			try {
+				await h.sender.send(h.request.encoded, { amountSat: 100_000n });
+			} catch {
+				refused = true;
+			}
+			expect(refused).to.equal(true);
+			await flush();
+			const spendable = h.wallet.listSpendable.bind(h.wallet);
+			// Even a stale adapter snapshot cannot override an unresolved release.
+			h.wallet.listSpendable = (): typeof h.wallet.coins => h.wallet.coins;
+			const next = mintRequest();
+			expect(
+				(await refusal(h.sender.send(next.encoded, { amountSat: 100_000n })))
+					.code
+			).to.equal(DirectFundingErrorCode.NO_SUITABLE_UTXO);
+			h.sender.start();
+			try {
+				await flush();
+				expect(
+					(await refusal(h.sender.send(next.encoded, { amountSat: 100_000n })))
+						.code
+				).to.equal(DirectFundingErrorCode.NO_SUITABLE_UTXO);
+			} finally {
+				h.sender.stop();
+			}
+			expect(releaseCalls).to.equal(failure === 'wallet' ? 2 : 1);
+			h.storage.failWhen = null;
+			h.wallet.unfreezeUtxo = unfreeze;
+			h.sender.start();
+			await flush();
+			h.sender.stop();
+			h.payments.restore();
+			expect(h.payments.list()[0].freezeReleased).to.equal(true);
+			h.wallet.listSpendable = spendable;
+			expect(h.wallet.listSpendable()).to.have.length(1);
+		});
+	}
+
+	it('recovers an aborted reservation when the process stops during release', async () => {
+		const h = harness();
+		let frozenOnDisk: string[] = [];
+		const freezes = {
+			load: (): string[] => frozenOnDisk,
+			save: (outpoints: string[]): void => {
+				frozenOnDisk = [...outpoints];
+			}
+		};
+		const wallet = new FakeSenderWallet(h.wallet.coins, freezes);
+		const signerFor = wallet.signerFor.bind(wallet);
+		wallet.signerFor = (coin): IDfCoinSigner => ({
+			...signerFor(coin)!,
+			signInput: (): Promise<Buffer[]> => new Promise(() => {})
+		});
+		wallet.unfreezeUtxo = (): Promise<boolean> => new Promise(() => {});
+		const sender = new DirectFundingSender(
+			{
+				wallet,
+				payments: h.payments,
+				registry: registryWith(h.lane),
+				chainHash: (): Buffer => REGTEST_HASH
+			},
+			{ offerResendDelaysMs: [], offerTimeoutMs: 40 }
+		);
+		expect(
+			(await refusal(sender.send(h.request.encoded, { amountSat: 100_000n })))
+				.code
+		).to.equal(DirectFundingErrorCode.EXCHANGE_TIMEOUT);
+		expect(h.payments.list()[0].status).to.equal('ABORTED');
+		expect(h.payments.list()[0].freezeReleased).to.equal(false);
+		expect(frozenOnDisk).to.have.length(1);
+
+		const restoredWallet = new FakeSenderWallet(h.wallet.coins, freezes);
+		const payments = new DirectFundingPaymentStore({ storage: h.storage });
+		payments.restore();
+		// Duplicate historical refusals must not subtract the same lease twice.
+		payments.open({
+			...payments.list()[0],
+			requestId: crypto.randomBytes(16).toString('hex')
+		});
+		const release = deferred<void>();
+		const unfreeze = restoredWallet.unfreezeUtxo.bind(restoredWallet);
+		let releaseCalls = 0;
+		restoredWallet.unfreezeUtxo = async (txid, vout): Promise<boolean> => {
+			releaseCalls++;
+			await release.promise;
+			return unfreeze(txid, vout);
+		};
+		const restored = new DirectFundingSender({
+			wallet: restoredWallet,
+			payments,
+			registry: registryWith(h.lane),
+			chainHash: (): Buffer => REGTEST_HASH
+		});
+		restored.start();
+		try {
+			await flush();
+			restored.stop();
+			restored.start();
+			await flush();
+			expect(releaseCalls).to.equal(1);
+			h.storage.failWhen = (value): boolean =>
+				value.includes('"freezeReleased":true');
+			release.resolve();
+			await flush();
+			const other = mintRequest();
+			expect(
+				(await refusal(restored.send(other.encoded, { amountSat: 100_000n })))
+					.code
+			).to.equal(DirectFundingErrorCode.NO_SUITABLE_UTXO);
+			h.storage.failWhen = null;
+			restored.stop();
+			restored.start();
+			await flush();
+			expect(releaseCalls).to.equal(1);
+			expect(restoredWallet.listSpendable()).to.have.length(1);
+			expect(frozenOnDisk).to.have.length(0);
+			expect(payments.list().every((record) => record.freezeReleased)).to.equal(
+				true
+			);
+		} finally {
+			restored.stop();
+		}
+		// A later restart sees the completed cleanup and does not release again.
+		payments.restore();
+		restored.start();
+		await flush();
+		restored.stop();
+		expect(releaseCalls).to.equal(1);
+	});
+
+	it('holds the outpoint until a timed-out freeze and its cleanup finish', async () => {
+		const coin = makeCoin();
+		const wallet = new FakeSenderWallet([coin]);
+		const payments = new DirectFundingPaymentStore({
+			storage: memoryStorage()
+		});
+		const requests = [mintRequest(), mintRequest()];
+		const lanes = requests.map(
+			(request) => new ScriptedReceiverLane(request, acceptingReceiver(request))
+		);
+		const sender = new DirectFundingSender(
+			{
+				wallet,
+				payments,
+				registry: registryRouting(
+					new Map(
+						requests.map((request, index) => [
+							request.requestId.toString('hex'),
+							lanes[index]
+						])
+					)
+				),
+				chainHash: (): Buffer => REGTEST_HASH
+			},
+			{ offerResendDelaysMs: [], offerTimeoutMs: 40, receiptTimeoutMs: 100 }
+		);
+		const acquiring = deferred<void>();
+		const acquired = deferred<void>();
+		const releasing = deferred<void>();
+		const released = deferred<void>();
+		const freeze = wallet.freezeUtxo.bind(wallet);
+		wallet.freezeUtxo = async (txid, vout): Promise<boolean> => {
+			acquiring.resolve();
+			await acquired.promise;
+			return freeze(txid, vout);
+		};
+		const unfreeze = wallet.unfreezeUtxo.bind(wallet);
+		let releases = 0;
+		wallet.unfreezeUtxo = async (txid, vout): Promise<boolean> => {
+			releases++;
+			const result = await unfreeze(txid, vout);
+			releasing.resolve();
+			await released.promise;
+			return result;
+		};
+		const failed = refusal(
+			sender.send(requests[0].encoded, { amountSat: 100_000n })
+		);
+		await acquiring.promise;
+		expect((await failed).code).to.equal(
+			DirectFundingErrorCode.EXCHANGE_TIMEOUT
+		);
+		expect(sender.inFlight()).to.equal(0);
+		expect(wallet.listSpendable()).to.have.length(1);
+		expect(releases).to.equal(0);
+		const duringAcquisition = await refusal(
+			sender.send(requests[1].encoded, { amountSat: 100_000n })
+		);
+		expect(duringAcquisition.code).to.equal(
+			DirectFundingErrorCode.NO_SUITABLE_UTXO
+		);
+		acquired.resolve();
+		await releasing.promise;
+		expect(wallet.listSpendable()).to.have.length(1);
+		const duringRelease = await refusal(
+			sender.send(requests[1].encoded, { amountSat: 100_000n })
+		);
+		expect(duringRelease.code).to.equal(
+			DirectFundingErrorCode.NO_SUITABLE_UTXO
+		);
+		released.resolve();
+		await flush();
+		const paid = await sender.send(requests[1].encoded, {
+			amountSat: 100_000n
+		});
+		expect(paid.status).to.equal('SIGNED_PENDING');
+		expect(releases).to.equal(1);
+		expect(wallet.listSpendable()).to.have.length(0);
+		expect(
+			lanes[0].sent.filter(
+				(frame) => frame.subtype === BeignetCustomSubtype.DIRECT_FUNDING_WITNESS
+			)
+		).to.have.length(0);
 	});
 });
 
@@ -1445,6 +1973,7 @@ describe('Direct funding sender: a freeze that outlived its run', () => {
 	function rewindToPrePersist(storage: ReturnType<typeof memoryStorage>): void {
 		const rows = JSON.parse(storage.loadWalletData(DF_PAYMENTS_STORAGE_KEY)!);
 		delete rows[0].witness;
+		delete rows[0].witnessSent;
 		delete rows[0].attestation;
 		delete rows[0].negotiatedTx;
 		delete rows[0].fundingTxid;
@@ -1516,6 +2045,223 @@ describe('Direct funding sender: a freeze that outlived its run', () => {
 		// costs the wallet a coin it can never select again.
 		expect(wallet.frozen.size).to.equal(0);
 	});
+
+	it('waits for startup release before a retry freezes the same coin again', async () => {
+		const storage = memoryStorage();
+		const request = mintRequest();
+		const wallet = new FakeSenderWallet([makeCoin()]);
+		await life(request, wallet, storage).sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		rewindToPrePersist(storage);
+		let finishRelease!: () => void;
+		const releasing = new Promise<void>((resolve) => {
+			finishRelease = resolve;
+		});
+		const unfreeze = wallet.unfreezeUtxo.bind(wallet);
+		wallet.unfreezeUtxo = async (txid, vout): Promise<boolean> => {
+			await releasing;
+			return unfreeze(txid, vout);
+		};
+		const freeze = wallet.freezeUtxo.bind(wallet);
+		let freezeCalls = 0;
+		wallet.freezeUtxo = (txid, vout): Promise<boolean> => {
+			freezeCalls++;
+			return freeze(txid, vout);
+		};
+		const { sender, payments } = life(request, wallet, storage);
+		sender.start();
+		try {
+			const paying = sender.send(request.encoded, { amountSat: 100_000n });
+			await flush();
+			expect(freezeCalls).to.equal(0);
+			finishRelease();
+			expect((await paying).status).to.equal('SIGNED_PENDING');
+			expect(freezeCalls).to.equal(1);
+			expect(wallet.frozen.size).to.equal(1);
+			expect(payments.list()[0].freezeReleased).to.equal(false);
+		} finally {
+			sender.stop();
+		}
+		// Resetting the completion flag before re-acquisition survives a crash.
+		rewindToPrePersist(storage);
+		const restarted = life(request, wallet, storage).sender;
+		restarted.start();
+		await flush();
+		restarted.stop();
+		expect(wallet.frozen.size).to.equal(0);
+	});
+
+	it('keeps failed cleanup pending and refuses a retry until startup can release it', async () => {
+		const storage = memoryStorage();
+		const request = mintRequest();
+		const wallet = new FakeSenderWallet([makeCoin()]);
+		await life(request, wallet, storage).sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		rewindToPrePersist(storage);
+		const unfreeze = wallet.unfreezeUtxo.bind(wallet);
+		wallet.unfreezeUtxo = async (): Promise<boolean> => false;
+		const { sender, payments } = life(request, wallet, storage);
+		sender.start();
+		try {
+			await flush();
+			const err = await refusal(
+				sender.send(request.encoded, { amountSat: 100_000n })
+			);
+			expect(err.code).to.equal(DirectFundingErrorCode.NO_SUITABLE_UTXO);
+			expect(payments.list()[0].status).to.equal('OFFERED');
+			expect(payments.list()[0].freezeReleased).to.equal(false);
+			expect(wallet.frozen.size).to.equal(1);
+		} finally {
+			sender.stop();
+		}
+		wallet.unfreezeUtxo = unfreeze;
+		sender.start();
+		await flush();
+		sender.stop();
+		expect(payments.list()[0].freezeReleased).to.equal(true);
+		expect(wallet.frozen.size).to.equal(0);
+	});
+
+	it('does not release an aborted outpoint held by a signed payment', async () => {
+		const h = harness();
+		await h.sender.send(h.request.encoded, { amountSat: 100_000n });
+		h.payments.open({
+			...h.payments.list()[0],
+			requestId: crypto.randomBytes(16).toString('hex'),
+			status: 'ABORTED',
+			witnessSent: false,
+			freezeReleased: false
+		});
+		let releases = 0;
+		h.wallet.unfreezeUtxo = async (): Promise<boolean> => {
+			releases++;
+			return true;
+		};
+		h.sender.start();
+		await flush();
+		h.sender.stop();
+		expect(releases).to.equal(0);
+		expect(h.wallet.frozen.size).to.equal(1);
+	});
+
+	it('does not release an aborted outpoint while another send is signing it', async () => {
+		const h = harness();
+		let finishSigning!: (witness: Buffer[]) => void;
+		let startedSigning!: () => void;
+		const started = new Promise<void>((resolve) => {
+			startedSigning = resolve;
+		});
+		const signature = new Promise<Buffer[]>((resolve) => {
+			finishSigning = resolve;
+		});
+		const signerFor = h.wallet.signerFor.bind(h.wallet);
+		let witness: Buffer[] = [];
+		h.wallet.signerFor = (coin): IDfCoinSigner => {
+			const signer = signerFor(coin)!;
+			return {
+				...signer,
+				signInput: (tx, index, prevouts): Promise<Buffer[]> => {
+					witness = signer.signInput(tx, index, prevouts) as Buffer[];
+					startedSigning();
+					return signature;
+				}
+			};
+		};
+		const paying = h.sender.send(h.request.encoded, { amountSat: 100_000n });
+		await started;
+		h.payments.open({
+			...h.payments.list()[0],
+			requestId: crypto.randomBytes(16).toString('hex'),
+			status: 'ABORTED',
+			freezeReleased: false
+		});
+		let releases = 0;
+		h.wallet.unfreezeUtxo = async (): Promise<boolean> => {
+			releases++;
+			return true;
+		};
+		h.sender.start();
+		try {
+			await flush();
+			expect(releases).to.equal(0);
+			expect(h.wallet.frozen.size).to.equal(1);
+			finishSigning(witness);
+			expect((await paying).status).to.equal('SIGNED_PENDING');
+		} finally {
+			h.sender.stop();
+		}
+	});
+
+	for (const alreadyReleased of [true, false]) {
+		it(`protects a reused coin after a missing-wallet snapshot with release completed=${alreadyReleased}`, async () => {
+			const storage = memoryStorage();
+			const first = mintRequest();
+			const second = mintRequest();
+			const coin = makeCoin();
+			const wallet = new FakeSenderWallet([coin]);
+			await life(first, wallet, storage).sender.send(first.encoded, {
+				amountSat: 100_000n
+			});
+			rewindToPrePersist(storage);
+			const payments = new DirectFundingPaymentStore({ storage });
+			payments.restore();
+			payments.update(first.requestId.toString('hex'), {
+				freezeReleased: alreadyReleased
+			});
+			const unfreeze = wallet.unfreezeUtxo.bind(wallet);
+			if (alreadyReleased) await unfreeze(coin.txidHex, coin.vout);
+			let finishRelease!: () => void;
+			const releasing = new Promise<void>((resolve) => {
+				finishRelease = resolve;
+			});
+			let releaseCalls = 0;
+			wallet.unfreezeUtxo = async (txid, vout): Promise<boolean> => {
+				releaseCalls++;
+				await releasing;
+				return unfreeze(txid, vout);
+			};
+			const lane = new ScriptedReceiverLane(second, acceptingReceiver(second));
+			const sender = new DirectFundingSender(
+				{
+					wallet,
+					payments,
+					registry: registryWith(lane),
+					chainHash: (): Buffer => REGTEST_HASH
+				},
+				{
+					offerResendDelaysMs: [],
+					offerTimeoutMs: 1_000,
+					receiptTimeoutMs: 100
+				}
+			);
+			wallet.coins = [];
+			expect(
+				(await refusal(sender.send(first.encoded, { amountSat: 100_000n })))
+					.code
+			).to.equal(DirectFundingErrorCode.NO_SUITABLE_UTXO);
+			wallet.coins = [coin];
+			if (!alreadyReleased) {
+				const spendable = wallet.listSpendable.bind(wallet);
+				wallet.listSpendable = (): typeof wallet.coins => wallet.coins;
+				expect(
+					(await refusal(sender.send(second.encoded, { amountSat: 100_000n })))
+						.code
+				).to.equal(DirectFundingErrorCode.NO_SUITABLE_UTXO);
+				finishRelease();
+				await flush();
+				wallet.listSpendable = spendable;
+			}
+			expect(
+				(await sender.send(second.encoded, { amountSat: 100_000n })).status
+			).to.equal('SIGNED_PENDING');
+			finishRelease();
+			await flush();
+			expect(releaseCalls).to.equal(alreadyReleased ? 0 : 1);
+			expect(wallet.frozen.size).to.equal(1);
+		});
+	}
 
 	it('closes the request, and holds no freeze, when the coin really is gone', async () => {
 		const storage = memoryStorage();

@@ -54,7 +54,8 @@ import {
 	IDfOffer,
 	IDfPrevout,
 	IDfSignRequest,
-	ownershipDigest
+	ownershipDigest,
+	ownershipMessage
 } from '../messages';
 import {
 	DirectFundingError,
@@ -151,6 +152,7 @@ interface IDfExchangeControl {
 	committed(): boolean;
 	/** The send has already resolved or rejected; nothing more may be emitted. */
 	settled(): boolean;
+	freeze(): Promise<boolean>;
 	commit(witness: Buffer[]): void;
 	done(caveat?: string): void;
 	fail(err: Error): void;
@@ -174,6 +176,11 @@ export class DirectFundingSender {
 	 * select the same coin and both sign it.
 	 */
 	private readonly reserved = new Map<string, string>();
+	/** Keep an outpoint unavailable until an abandoned freeze has been released. */
+	private readonly freezeHolds = new Map<symbol, string>();
+	private readonly recoveringFreezes = new Map<string, Promise<boolean>>();
+	/** Pending durable cleanup, with whether the wallet has already released. */
+	private readonly pendingReleases = new Map<string, boolean>();
 	private sweepTimer: NodeJS.Timeout | null = null;
 
 	constructor(
@@ -217,20 +224,75 @@ export class DirectFundingSender {
 
 	/**
 	 * Release a freeze left behind by a run that died between reserving a coin
-	 * and recording its witness.
+	 * and recording its witness, or after recording a refusal but before its
+	 * reservation cleanup completed.
 	 *
 	 * Persist-before-emit means a record still short of SIGNED_PENDING has no
 	 * witness on any wire, so its coin was never spent. Nothing else would ever
 	 * lift that freeze: the wallet reports a frozen coin as unspendable, so even
 	 * a retry of the same request could not find the coin it was offered.
 	 */
-	private releaseUnwitnessedFreezes(): void {
-		for (const record of this.deps.payments.list()) {
-			if (record.status !== 'CREATED' && record.status !== 'OFFERED') continue;
-			if (this.inflight.has(record.requestId)) continue;
-			void this.deps.wallet
-				.unfreezeUtxo(record.spentTxid, record.spentVout)
-				.catch(() => undefined);
+	private releaseUnwitnessedFreezes(releasingRequestId?: string): void {
+		const records = this.deps.payments.list();
+		const protectedOutpoints = new Set([
+			...this.reserved.values(),
+			...this.freezeHolds.values()
+		]);
+		for (const record of records) {
+			if (
+				(this.inflight.has(record.requestId) &&
+					record.requestId !== releasingRequestId) ||
+				DF_POST_WITNESS_STATES.has(record.status) ||
+				record.witnessSent
+			) {
+				protectedOutpoints.add(`${record.spentTxid}:${record.spentVout}`);
+			}
+		}
+		const candidates = new Map<string, IDfPaymentRecord[]>();
+		for (const record of records) {
+			const outpoint = `${record.spentTxid}:${record.spentVout}`;
+			if (protectedOutpoints.has(outpoint)) continue;
+			if (record.freezeReleased && !this.pendingReleases.has(outpoint))
+				continue;
+			const group = candidates.get(outpoint) ?? [];
+			group.push(record);
+			candidates.set(outpoint, group);
+		}
+		for (const [outpoint, group] of candidates) {
+			// Several aborted requests can name one coin. One recovery pass must
+			// release it only once, especially for wallets with additive leases.
+			const owner = Symbol();
+			this.freezeHolds.set(owner, outpoint);
+			if (!this.pendingReleases.has(outpoint)) {
+				this.pendingReleases.set(outpoint, false);
+			}
+			const recovering = Promise.resolve()
+				.then(async () => {
+					const { spentTxid, spentVout } = group[0];
+					const released =
+						this.pendingReleases.get(outpoint) ||
+						(await this.deps.wallet.unfreezeUtxo(spentTxid, spentVout));
+					if (!released) return false;
+					this.pendingReleases.set(outpoint, true);
+					let persisted = true;
+					for (const record of group) {
+						persisted =
+							this.deps.payments.update(record.requestId, {
+								freezeReleased: true,
+								frozen: false
+							}) && persisted;
+					}
+					if (persisted) this.pendingReleases.delete(outpoint);
+					return persisted;
+				})
+				.catch(() => false)
+				.finally(() => {
+					this.freezeHolds.delete(owner);
+					if (!this.pendingReleases.has(outpoint)) {
+						this.recoveringFreezes.delete(outpoint);
+					}
+				});
+			this.recoveringFreezes.set(outpoint, recovering);
 		}
 	}
 
@@ -513,14 +575,26 @@ export class DirectFundingSender {
 			changeScript,
 			maxTotalFeeSat,
 			receiptHash: env.receiptHash,
-			ownership: {
-				pubkey: signer.ownershipPubkey,
-				// The proof costs the receiver nothing to check and saves it a whole
-				// channel session on a coin we cannot actually spend.
-				signature: signer.signOwnership(
-					ownershipDigest(offerId, txid, coin.vout, amountSat)
-				)
-			}
+			// The proof costs the receiver nothing to check and saves it a whole
+			// channel session on a coin we cannot actually spend. A signer that
+			// signs messages rather than raw digests (a node's RPC, a hardware
+			// wallet) proves the same statement in the Bitcoin signed-message
+			// form; the digest field then carries zeros for receivers that
+			// predate the message form, which decline rather than negotiate.
+			ownership: signer.signOwnershipMessage
+				? {
+						pubkey: signer.ownershipPubkey,
+						signature: Buffer.alloc(64),
+						messageProof: await signer.signOwnershipMessage(
+							ownershipMessage(offerId, txid, coin.vout, amountSat)
+						)
+				  }
+				: {
+						pubkey: signer.ownershipPubkey,
+						signature: signer.signOwnership(
+							ownershipDigest(offerId, txid, coin.vout, amountSat)
+						)
+				  }
 		};
 		const offerBody = encodeDfOffer(offer);
 		const now = this.now();
@@ -537,6 +611,7 @@ export class DirectFundingSender {
 			spentValueSat: coin.valueSat.toString(),
 			changeScript: changeScript.toString('hex'),
 			status: 'CREATED',
+			freezeReleased: true,
 			createdAt: now,
 			updatedAt: now
 		};
@@ -578,12 +653,30 @@ export class DirectFundingSender {
 	 * what protects it, and all that is lost is the chance to send the witness
 	 * again. That comes back as a caveat on the recorded outcome.
 	 */
-	private resume(
+	private async resume(
 		env: IDfRequestEnvelope,
 		record: IDfPaymentRecord,
 		witnessMayBeOut = false
-	): IDfBeginOutcome {
+	): Promise<IDfBeginOutcome> {
 		const outpoint = `${record.spentTxid}:${record.spentVout}`;
+		// Startup may still be releasing this record's old freeze. A retry must
+		// not acquire a new reservation until that release has finished.
+		const recovering = this.recoveringFreezes.get(outpoint);
+		if (recovering && !(await recovering)) {
+			throw new DirectFundingError(
+				DirectFundingErrorCode.NO_SUITABLE_UTXO,
+				`the previous reservation for ${outpoint} could not be released`
+			);
+		}
+		if (
+			!witnessMayBeOut &&
+			this.heldOutpoints(record.requestId).has(outpoint)
+		) {
+			throw new DirectFundingError(
+				DirectFundingErrorCode.NO_SUITABLE_UTXO,
+				`the coin ${outpoint} is reserved by another direct-funding payment`
+			);
+		}
 		// findCoin, not listSpendable: our own freeze may already be on this coin,
 		// and reading that as a coin that went elsewhere would abandon a payment
 		// over a reservation this request made itself.
@@ -604,11 +697,9 @@ export class DirectFundingSender {
 				status: 'ABORTED',
 				reason: `the offered coin ${outpoint} is no longer spendable`
 			});
-			// Nothing was signed in this state, so a freeze this request took has
-			// nothing left to protect and must not outlive it.
-			void this.deps.wallet
-				.unfreezeUtxo(record.spentTxid, record.spentVout)
-				.catch(() => undefined);
+			// A temporarily missing wallet snapshot must not let late cleanup
+			// release a later attempt's reservation when the coin reappears.
+			this.releaseUnwitnessedFreezes(record.requestId);
 			throw new DirectFundingError(
 				DirectFundingErrorCode.NO_SUITABLE_UTXO,
 				`the coin this request was offered, ${outpoint}, is no longer spendable`
@@ -666,13 +757,21 @@ export class DirectFundingSender {
 	 * spendable and a second request would sign the same input.
 	 */
 	private heldOutpoints(exceptRequestIdHex: string): ReadonlySet<string> {
-		const held = new Set<string>();
+		const held = new Set([
+			...this.freezeHolds.values(),
+			...this.pendingReleases.keys(),
+			...this.recoveringFreezes.keys()
+		]);
 		for (const [requestId, outpoint] of this.reserved) {
 			if (requestId !== exceptRequestIdHex) held.add(outpoint);
 		}
 		for (const record of this.deps.payments.list()) {
 			if (record.requestId === exceptRequestIdHex) continue;
-			if (!DF_COIN_HELD_STATES.has(record.status)) continue;
+			if (
+				!DF_COIN_HELD_STATES.has(record.status) &&
+				!(record.status === 'ABORTED' && record.freezeReleased === false)
+			)
+				continue;
 			held.add(`${record.spentTxid}:${record.spentVout}`);
 		}
 		return held;
@@ -837,6 +936,41 @@ export class DirectFundingSender {
 			let settled = false;
 			const timers: NodeJS.Timeout[] = [];
 			let unsubscribe: (() => void) | null = null;
+			const freezeOwner = Symbol();
+			let freezing: Promise<boolean> | undefined;
+			let releasing: Promise<void> | undefined;
+			const releaseFreeze = (): Promise<void> => {
+				if (releasing) return releasing;
+				if (!freezing || attempt.witnessMayBeOut) return Promise.resolve();
+				const outpoint = `${attempt.coin.txidHex}:${attempt.coin.vout}`;
+				this.pendingReleases.set(outpoint, false);
+				// Cleanup belongs to the exchange, so a signer that never answers
+				// cannot hold the coin. Await acquisition before releasing: its RPC
+				// may still reserve the coin after the exchange has timed out.
+				releasing = freezing
+					.then(async (frozen) => {
+						const released =
+							!frozen ||
+							(await this.deps.wallet.unfreezeUtxo(
+								attempt.coin.txidHex,
+								attempt.coin.vout
+							));
+						if (released) {
+							this.pendingReleases.set(outpoint, true);
+							if (
+								this.deps.payments.update(attempt.record.requestId, {
+									freezeReleased: true,
+									frozen: false
+								})
+							) {
+								this.pendingReleases.delete(outpoint);
+							}
+						}
+					})
+					.catch(() => undefined)
+					.finally(() => this.freezeHolds.delete(freezeOwner));
+				return releasing;
+			};
 
 			const finish = (): void => {
 				for (const timer of timers) clearTimeout(timer);
@@ -849,6 +983,7 @@ export class DirectFundingSender {
 				if (settled) return;
 				settled = true;
 				finish();
+				this.freezeHolds.delete(freezeOwner);
 				if (caveat) {
 					this.log(DF_LOG_SEND_CAVEAT, {
 						requestId: attempt.record.requestId,
@@ -873,6 +1008,7 @@ export class DirectFundingSender {
 				}
 				settled = true;
 				finish();
+				void releaseFreeze();
 				reject(err);
 			};
 			const at = (delayMs: number, fn: () => void): void => {
@@ -909,6 +1045,38 @@ export class DirectFundingSender {
 				},
 				committed: () => committed,
 				settled: () => settled,
+				freeze: () => {
+					const previousRelease = attempt.record.freezeReleased;
+					if (
+						!this.deps.payments.update(attempt.record.requestId, {
+							freezeReleased: false
+						})
+					) {
+						// Acquisition never ran, so preserve the prior cleanup state.
+						this.deps.payments.update(attempt.record.requestId, {
+							freezeReleased: previousRelease
+						});
+						return Promise.reject(
+							new DirectFundingError(
+								DirectFundingErrorCode.NOT_PERSISTED,
+								'the coin reservation could not be persisted'
+							)
+						);
+					}
+					this.freezeHolds.set(
+						freezeOwner,
+						`${attempt.coin.txidHex}:${attempt.coin.vout}`
+					);
+					freezing = Promise.resolve()
+						.then(() =>
+							this.deps.wallet.freezeUtxo(
+								attempt.coin.txidHex,
+								attempt.coin.vout
+							)
+						)
+						.catch(() => false);
+					return freezing;
+				},
 				commit: (witness): void => {
 					const payload = sealed(
 						BeignetCustomSubtype.DIRECT_FUNDING_WITNESS,
@@ -947,9 +1115,6 @@ export class DirectFundingSender {
 						// payment nothing ever made: reconciliation would watch a funding
 						// no one holds, and the freeze would outlive every retry.
 						this.deps.payments.rollbackWitness(attempt.record.requestId);
-						void this.deps.wallet
-							.unfreezeUtxo(attempt.coin.txidHex, attempt.coin.vout)
-							.catch(() => undefined);
 						// Coded as the transport failure it is: the caller reads the code
 						// to decide whether a plain address payment is the right answer,
 						// and here, with nothing spent, it is.
@@ -998,8 +1163,7 @@ export class DirectFundingSender {
 					)
 				);
 			} catch (err) {
-				finish();
-				reject(asError(err));
+				fail(asError(err));
 				return;
 			}
 			if (
@@ -1262,42 +1426,30 @@ export class DirectFundingSender {
 		// The witness may broadcast the moment it lands, so the coin stops being
 		// selectable here rather than afterwards. Freezes are persisted and matched
 		// by outpoint, so a confirmation-height change cannot lift one.
-		const frozen = await this.deps.wallet
-			.freezeUtxo(attempt.coin.txidHex, attempt.coin.vout)
-			.catch(() => false);
+		const frozen = await ctl.freeze();
 		if (!frozen) {
 			refuse(
 				'could not reserve the offered coin against our own coin selection'
 			);
 			return;
 		}
-		const release = async (): Promise<void> => {
-			// A resumed attempt may protect a funding an earlier life delivered.
-			// Only a fresh attempt can release its freeze before this run emits.
-			if (attempt.witnessMayBeOut) return;
-			await this.deps.wallet
-				.unfreezeUtxo(attempt.coin.txidHex, attempt.coin.vout)
-				.catch(() => undefined);
-		};
-		// The last await before the commit, and the last chance to notice. Nothing
-		// below this line yields, so a witness that gets past here is one the send
-		// is still waiting on.
-		if (ctl.settled()) {
-			await release();
-			return;
-		}
+		if (ctl.settled()) return;
 
+		// A remote signer answers asynchronously, so this may yield: the
+		// liveness check is repeated after it. From that check on nothing below
+		// yields, so a witness that gets past it is one the send is still
+		// waiting on.
 		let witness: Buffer[];
 		try {
-			witness = attempt.signer.signInput(tx, inputIndex, {
+			witness = await attempt.signer.signInput(tx, inputIndex, {
 				scripts: request.prevouts.map((p: IDfPrevout) => p.script),
 				values: request.prevouts.map((p: IDfPrevout) => p.valueSat)
 			});
 		} catch (err) {
-			await release();
 			ctl.fail(asError(err));
 			return;
 		}
+		if (ctl.settled()) return;
 
 		const persisted = this.deps.payments.commitWitness(
 			attempt.record.requestId,
@@ -1319,7 +1471,6 @@ export class DirectFundingSender {
 		if (!persisted) {
 			// The last moment a refusal is free. A witness emitted against a record
 			// that never landed is a spend nothing on this device remembers making.
-			await release();
 			ctl.fail(
 				new DirectFundingError(
 					DirectFundingErrorCode.NOT_PERSISTED,
