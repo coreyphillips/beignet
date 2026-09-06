@@ -1625,7 +1625,8 @@ async function bootDaemon(
 				expirySecs,
 				targetRemainingInboundSat,
 				maxFlatFeeSat,
-				maxFeePpm
+				maxFeePpm,
+				feeMode
 			} = body as {
 				lspPubkey?: string;
 				amountSats?: number;
@@ -1634,6 +1635,7 @@ async function bootDaemon(
 				targetRemainingInboundSat?: number;
 				maxFlatFeeSat?: number;
 				maxFeePpm?: number;
+				feeMode?: 'skim' | 'hop';
 			};
 			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
 			return success(
@@ -1644,7 +1646,8 @@ async function bootDaemon(
 					expirySecs,
 					targetRemainingInboundSat,
 					maxFlatFeeSat,
-					maxFeePpm
+					maxFeePpm,
+					feeMode
 				})
 			);
 		},

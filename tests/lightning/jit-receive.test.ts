@@ -151,6 +151,7 @@ function makePart(
 		inHtlcId: BigInt(Math.floor(Math.random() * 1_000_000)),
 		paymentHash: opts.paymentHash ?? crypto.randomBytes(32),
 		forwardAmountMsat: opts.amountMsat ?? 1_000_000n,
+		incomingAmountMsat: opts.amountMsat ?? 1_000_000n,
 		forwardCltv: opts.forwardCltv ?? 800_100,
 		incomingCltvExpiry: opts.incomingCltvExpiry ?? 800_200,
 		nextPacket: {
@@ -254,6 +255,35 @@ describe('JIT receive wire payloads', function () {
 		expect(back.flatFeeSat).to.equal(1_000n);
 		expect(back.feePpm).to.equal(2_500);
 		expect(back.reason).to.equal(ack.reason);
+	});
+
+	it('carries the fee mode as a trailing byte an older decoder ignores', function () {
+		const base = {
+			requestId: crypto.randomBytes(8),
+			interceptScid: crypto.randomBytes(8),
+			accepted: true,
+			flatFeeSat: 100n,
+			feePpm: 1_000,
+			reason: 'served'
+		};
+		const hop = encodeJitAck({ ...base, feeMode: 'hop' });
+		const skim = encodeJitAck({ ...base, feeMode: 'skim' });
+		const legacy = encodeJitAck(base);
+		expect(hop.length).to.equal(legacy.length + 1);
+		expect(decodeJitAck(hop).feeMode).to.equal('hop');
+		expect(decodeJitAck(hop).reason).to.equal('served');
+		expect(decodeJitAck(skim).feeMode).to.equal('skim');
+		// Absent on the wire: an LSP that predates the field, hence a skim.
+		expect(decodeJitAck(legacy).feeMode).to.equal(undefined);
+		// An older decoder reads the reason at its fixed offset and never looks
+		// past it, which is what the byte's placement relies on.
+		expect(decodeJitAck(hop.subarray(0, hop.length - 1)).reason).to.equal(
+			'served'
+		);
+		// A value this build does not know reads as skim, not as a refusal.
+		const unknown = Buffer.from(hop);
+		unknown[unknown.length - 1] = 7;
+		expect(decodeJitAck(unknown).feeMode).to.equal('skim');
 	});
 
 	it('refuses a truncated authorization and an ack whose reason runs past the payload', function () {
@@ -763,22 +793,325 @@ describe('JIT MPP aggregation', function () {
 // ── Opening fee ────────────────────────────────────────────────────
 
 describe('JIT opening fee', function () {
-	it('refuses an intent from a client that will not accept the skim', function () {
+	it('serves a client that will not accept the skim in hop mode', function () {
 		// The fee is deducted from a forward whose onion still names the full
 		// amount, and BOLT 4 has the final hop fail anything short of it. A
-		// client that has not agreed to that gets a refusal, not a channel it
-		// would have paid for and a payment that then fails.
+		// client that has not agreed to that (LND, CLN) is served all the same:
+		// the fee is charged to the SENDER through the invoice hint instead,
+		// and the ack says so, so the client knows what to put in the hint.
 		const h = makeHarness({ flatFeeSat: 100n });
 		const ack = h.manager.registerIntent(CLIENT, auth());
-		expect(ack.accepted).to.equal(false);
-		expect(ack.reason).to.match(/skimmed/);
-		expect(h.manager.listIntents()).to.have.length(0);
-		// Advertised all the same, so the client knows what to agree to.
-		expect(ack.flatFeeSat).to.equal(0n);
+		expect(ack.accepted).to.equal(true);
+		expect(ack.feeMode).to.equal('hop');
+		expect(ack.flatFeeSat).to.equal(100n);
+		const [intent] = h.manager.listIntents();
+		expect(intent.feeMode).to.equal('hop');
+		expect(intent.acceptsSkimmedFee).to.equal(false);
+		// A client that accepts the skim is served the LSPS2 way.
+		const skim = h.manager.registerIntent(
+			OTHER_CLIENT,
+			auth({ acceptsSkimmedFee: true })
+		);
+		expect(skim.accepted).to.equal(true);
+		expect(skim.feeMode).to.equal('skim');
+	});
+
+	it('assigns skim mode when there is no fee to collect either way', function () {
+		const h = makeHarness();
+		expect(h.manager.registerIntent(CLIENT, auth()).feeMode).to.equal('skim');
 		expect(
-			h.manager.registerIntent(CLIENT, auth({ acceptsSkimmedFee: true }))
-				.accepted
+			h.manager.registerIntent(OTHER_CLIENT, auth({ acceptsSkimmedFee: true }))
+				.feeMode
+		).to.equal('skim');
+	});
+
+	it('hop mode: forwards the full amount once the fee arrived on the inbound HTLCs', async function () {
+		// 100 sat flat + 1000 ppm of 3_000_000 msat = 103_000 msat, paid by the
+		// sender as a routing fee: the inbound HTLCs carry it above the onion
+		// amount, and the forwards are the onion amounts untouched.
+		const h = makeHarness({ flatFeeSat: 100n, feePpm: 1_000 });
+		const hash = crypto.randomBytes(32);
+		const ack = h.manager.registerIntent(
+			CLIENT,
+			auth({ paymentHash: hash, expectedTotalMsat: 3_000_000n })
+		);
+		expect(ack.feeMode).to.equal('hop');
+		const scidHex = ack.interceptScid.toString('hex');
+		const first = makePart(h, { amountMsat: 1_000_000n, paymentHash: hash });
+		first.incomingAmountMsat = 1_000_000n + 60_000n;
+		const second = makePart(h, { amountMsat: 2_000_000n, paymentHash: hash });
+		second.incomingAmountMsat = 2_000_000n + 43_000n;
+		h.manager.tryInterceptUnknownScid(scidHex, first);
+		h.manager.tryInterceptUnknownScid(scidHex, second);
+		await waitFor(h.manager, 'jit:forwarded');
+
+		const amounts = h.forwarded
+			.map((f) => f.part.forwardAmountMsat)
+			.sort((a, b) => Number(a - b));
+		expect(amounts).to.deep.equal([1_000_000n, 2_000_000n]);
+		expect(h.opens).to.have.length(1);
+	});
+
+	it('hop mode: fails every part before fronting when the fee did not arrive', async function () {
+		// A payer that ignored the hint's fee (or a wallet that left it out of
+		// the invoice) delivered the bare onion amount. Nothing is funded and
+		// the parts are failed back, which is what the payer would have seen
+		// from any hop whose fee it underpaid.
+		const h = makeHarness({ flatFeeSat: 100n });
+		const hash = crypto.randomBytes(32);
+		const ack = h.manager.registerIntent(
+			CLIENT,
+			auth({ paymentHash: hash, expectedTotalMsat: 2_000_000n })
+		);
+		const scidHex = ack.interceptScid.toString('hex');
+		const first = makePart(h, { amountMsat: 1_000_000n, paymentHash: hash });
+		first.incomingAmountMsat = 1_000_000n + 50_000n;
+		const second = makePart(h, { amountMsat: 1_000_000n, paymentHash: hash });
+		second.incomingAmountMsat = 1_000_000n + 49_000n; // 99_000 < 100_000
+		h.manager.tryInterceptUnknownScid(scidHex, first);
+		const failure = waitFor<{ reason: string }>(h.manager, 'jit:failed');
+		h.manager.tryInterceptUnknownScid(scidHex, second);
+
+		expect((await failure).reason).to.match(/owed as a routing fee/);
+		expect(h.failed).to.have.length(2);
+		expect(
+			h.failed.every((f) => f.code === TEMPORARY_CHANNEL_FAILURE)
 		).to.equal(true);
+		expect(h.forwarded).to.have.length(0);
+		expect(h.opens).to.have.length(0);
+	});
+
+	it('hop mode: a part without a recorded inbound value is refused', function () {
+		const h = makeHarness({ flatFeeSat: 1n });
+		const ack = h.manager.registerIntent(CLIENT, auth());
+		const part = makePart(h);
+		delete part.incomingAmountMsat;
+		expect(
+			h.manager.tryInterceptUnknownScid(ack.interceptScid.toString('hex'), part)
+		).to.equal(false);
+		expect(h.opens).to.have.length(0);
+	});
+
+	it('hop mode: an overpaid routing fee is kept, never refunded into the forward', async function () {
+		// MPP payers pay the hint's base fee on every part, so the LSP may
+		// collect more than the quote; BOLT 7 makes that the sender's choice.
+		// The forward is still exactly the onion amount.
+		const h = makeHarness({ flatFeeSat: 100n });
+		const ack = h.manager.registerIntent(CLIENT, auth());
+		const part = makePart(h, { amountMsat: 1_000_000n });
+		part.incomingAmountMsat = 1_000_000n + 250_000n;
+		h.manager.tryInterceptUnknownScid(ack.interceptScid.toString('hex'), part);
+		await waitFor(h.manager, 'jit:forwarded');
+		expect(h.forwarded[0].part.forwardAmountMsat).to.equal(1_000_000n);
+	});
+
+	for (const mode of ['hop', 'skim', 'free'] as const) {
+		for (const incoming of [undefined, 1_000n]) {
+			it(`${mode}: refuses a part with ${
+				incoming ?? 'missing'
+			} inbound msat even when another part pays the fee`, async function () {
+				const h = makeHarness({ flatFeeSat: mode === 'free' ? 0n : 100n });
+				const hash = crypto.randomBytes(32);
+				const ack = h.manager.registerIntent(
+					CLIENT,
+					auth({
+						paymentHash: hash,
+						expectedTotalMsat: 2_000_000n,
+						acceptsSkimmedFee: mode === 'skim'
+					})
+				);
+				const scidHex = ack.interceptScid.toString('hex');
+				const first = makePart(h, { paymentHash: hash });
+				first.incomingAmountMsat = 1_100_000n;
+				expect(h.manager.tryInterceptUnknownScid(scidHex, first)).to.equal(
+					true
+				);
+				const underfunded = makePart(h, { paymentHash: hash });
+				underfunded.incomingAmountMsat = incoming;
+				expect(
+					h.manager.tryInterceptUnknownScid(scidHex, underfunded)
+				).to.equal(false);
+				expect(h.manager.heldTotalMsat(scidHex)).to.equal(1_000_000n);
+				expect(h.opens).to.have.length(0);
+				expect(h.forwarded).to.have.length(0);
+
+				// Refusing the bad part does not poison the valid payment: a fully
+				// funded replacement can complete the set without another flat fee.
+				const replacement = makePart(h, { paymentHash: hash });
+				expect(
+					h.manager.tryInterceptUnknownScid(scidHex, replacement)
+				).to.equal(true);
+				await waitFor(h.manager, 'jit:forwarded');
+				expect(h.forwarded.map((f) => f.part)).to.deep.equal([
+					first,
+					replacement
+				]);
+			});
+		}
+	}
+
+	for (const flatFeeSat of [0n, 100n]) {
+		it(`hop mode: accepts per-part proportional rounding with ${flatFeeSat} sat charged once`, async function () {
+			const h = makeHarness({ flatFeeSat, feePpm: 500 });
+			const hash = crypto.randomBytes(32);
+			const ack = h.manager.registerIntent(
+				CLIENT,
+				auth({ paymentHash: hash, expectedTotalMsat: 2_000_000n })
+			);
+			const first = makePart(h, { amountMsat: 999_999n, paymentHash: hash });
+			first.incomingAmountMsat = 999_999n + 499n + flatFeeSat * 1_000n;
+			const second = makePart(h, { amountMsat: 1_000_001n, paymentHash: hash });
+			second.incomingAmountMsat = 1_000_001n + 500n;
+			const scidHex = ack.interceptScid.toString('hex');
+			h.manager.tryInterceptUnknownScid(scidHex, first);
+			h.manager.tryInterceptUnknownScid(scidHex, second);
+			await waitFor(h.manager, 'jit:forwarded');
+			expect(h.forwarded.map((f) => f.part.forwardAmountMsat)).to.deep.equal([
+				999_999n,
+				1_000_001n
+			]);
+			expect(h.opens).to.have.length(1);
+			expect(h.failed).to.have.length(0);
+		});
+	}
+
+	for (const acceptsSkimmedFee of [false, true]) {
+		for (const incoming of [undefined, 1_000n]) {
+			it(`splice path: refuses a late part with ${
+				incoming ?? 'missing'
+			} inbound msat in ${
+				acceptsSkimmedFee ? 'skim' : 'hop'
+			} mode`, async function () {
+				const h = makeHarness({ flatFeeSat: 100n });
+				const hash = crypto.randomBytes(32);
+				h.manager.registerIntent(
+					CLIENT,
+					auth({ paymentHash: hash, acceptsSkimmedFee })
+				);
+				const channelId = crypto.randomBytes(32);
+				const first = makePart(h, { paymentHash: hash });
+				first.incomingAmountMsat = 1_100_000n;
+				expect(h.manager.tryHoldForSplice(channelId, first)).to.equal(true);
+				const late = makePart(h, { paymentHash: hash });
+				late.incomingAmountMsat = incoming;
+				expect(h.manager.tryHoldForSplice(channelId, late)).to.equal(false);
+				await waitFor(h.manager, 'jit:forwarded');
+				expect(h.forwarded.map((f) => f.part)).to.deep.equal([first]);
+				expect(h.splices).to.have.length(1);
+				expect(h.failed).to.have.length(0);
+			});
+		}
+	}
+
+	for (const lateFeeMsat of [499n, 500n]) {
+		it(`splice path: validates the rounded fee of a late part paying ${lateFeeMsat} msat`, async function () {
+			const h = makeHarness({ feePpm: 500 });
+			const hash = crypto.randomBytes(32);
+			h.manager.registerIntent(CLIENT, auth({ paymentHash: hash }));
+			const channelId = crypto.randomBytes(32);
+			const first = makePart(h, { amountMsat: 999_999n, paymentHash: hash });
+			first.incomingAmountMsat = 999_999n + 499n;
+			const late = makePart(h, { amountMsat: 1_000_001n, paymentHash: hash });
+			late.incomingAmountMsat = 1_000_001n + lateFeeMsat;
+			expect(h.manager.tryHoldForSplice(channelId, first)).to.equal(true);
+			expect(h.manager.tryHoldForSplice(channelId, late)).to.equal(true);
+			if (lateFeeMsat === 500n) {
+				await waitFor(h.manager, 'jit:forwarded');
+				expect(h.forwarded.map((f) => f.part.forwardAmountMsat)).to.deep.equal([
+					999_999n,
+					1_000_001n
+				]);
+				expect(h.failed).to.have.length(0);
+			} else {
+				const failure = await waitFor<{ reason: string }>(
+					h.manager,
+					'jit:failed'
+				);
+				expect(failure.reason).to.match(
+					/999 msat is owed.*only 998 msat arrived/
+				);
+				expect(h.forwarded).to.have.length(0);
+				expect(h.failed).to.have.length(2);
+			}
+			expect(h.splices).to.have.length(1);
+		});
+	}
+
+	for (const path of ['open', 'splice'] as const) {
+		it(`${path}: rechecks each part's principal immediately before forwarding`, async function () {
+			const h = makeHarness({ flatFeeSat: 100n });
+			const ack = h.manager.registerIntent(CLIENT, auth());
+			const part = makePart(h);
+			part.incomingAmountMsat = 1_100_000n;
+			if (path === 'open') {
+				h.manager.tryInterceptUnknownScid(
+					ack.interceptScid.toString('hex'),
+					part
+				);
+			} else {
+				h.manager.tryHoldForSplice(crypto.randomBytes(32), part);
+			}
+			part.incomingAmountMsat = 1_000n;
+			const failure = await waitFor<{ reason: string }>(
+				h.manager,
+				'jit:failed'
+			);
+			expect(failure.reason).to.match(
+				/forwards 1000000 msat but only 1000 msat arrived/
+			);
+			expect(h.forwarded).to.have.length(0);
+			expect(h.failed).to.have.length(1);
+		});
+	}
+
+	it('splice path: skim and hop parts queued together each settle their own way', async function () {
+		// One wallet may hold a skim intent and a hop intent at once (two
+		// invoices, two modes). Parts from both refused onto the same channel
+		// are spliced together: the skim part is shrunk by ITS fee, the hop
+		// part goes out whole once ITS fee is found on the inbound side.
+		const h = makeHarness({ flatFeeSat: 100n, maxLiveIntentsPerPeer: 2 });
+		const channelId = crypto.randomBytes(32);
+		const hopHash = crypto.randomBytes(32);
+		const skimHash = crypto.randomBytes(32);
+		h.manager.registerIntent(CLIENT, auth({ paymentHash: hopHash }));
+		h.manager.registerIntent(
+			CLIENT,
+			auth({ paymentHash: skimHash, acceptsSkimmedFee: true })
+		);
+		const hopPart = makePart(h, {
+			amountMsat: 1_000_000n,
+			paymentHash: hopHash
+		});
+		hopPart.incomingAmountMsat = 1_000_000n + 100_000n;
+		const skimPart = makePart(h, {
+			amountMsat: 2_000_000n,
+			paymentHash: skimHash
+		});
+		expect(h.manager.tryHoldForSplice(channelId, hopPart)).to.equal(true);
+		expect(h.manager.tryHoldForSplice(channelId, skimPart)).to.equal(true);
+		await waitFor(h.manager, 'jit:forwarded');
+		const byHash = new Map(
+			h.forwarded.map((f) => [f.part.paymentHash.toString('hex'), f.part])
+		);
+		expect(byHash.get(hopHash.toString('hex'))!.forwardAmountMsat).to.equal(
+			1_000_000n
+		);
+		expect(byHash.get(skimHash.toString('hex'))!.forwardAmountMsat).to.equal(
+			2_000_000n - 100_000n
+		);
+	});
+
+	it('splice path: a hop part whose fee did not arrive fails the queue before splicing', async function () {
+		const h = makeHarness({ flatFeeSat: 100n });
+		const channelId = crypto.randomBytes(32);
+		h.manager.registerIntent(CLIENT, auth());
+		const part = makePart(h, { amountMsat: 1_000_000n });
+		part.incomingAmountMsat = 1_000_000n; // the policy fee alone, no opening fee
+		const failure = waitFor<{ reason: string }>(h.manager, 'jit:failed');
+		expect(h.manager.tryHoldForSplice(channelId, part)).to.equal(true);
+		expect((await failure).reason).to.match(/owed as a routing fee/);
+		expect(h.splices).to.have.length(0);
+		expect(h.failed).to.have.length(1);
 	});
 
 	it('skims nothing from a client that never agreed to it', async function () {
@@ -1305,6 +1638,38 @@ describe('JIT persistence across a restart', function () {
 		expect(failedRows[0].amountMsat).to.equal('1000000');
 		expect(failedRows[0].incomingCltvExpiry).to.equal(800_200);
 		expect(second.metadata.get('jit:held')).to.equal('[]');
+	});
+
+	it("restores each intent's fee mode, and reads a record without one as skim", function () {
+		const first = makeHarness({ flatFeeSat: 100n, maxLiveIntentsPerPeer: 2 });
+		const hop = first.manager.registerIntent(CLIENT, auth());
+		const skim = first.manager.registerIntent(
+			CLIENT,
+			auth({ acceptsSkimmedFee: true })
+		);
+		expect(hop.feeMode).to.equal('hop');
+		expect(skim.feeMode).to.equal('skim');
+		// A row written before the field existed carries no feeMode at all.
+		const rows = JSON.parse(first.metadata.get('jit:intents')!) as Array<{
+			interceptScidHex: string;
+			feeMode?: string;
+		}>;
+		const legacy = rows.find(
+			(r) => r.interceptScidHex === skim.interceptScid.toString('hex')
+		)!;
+		delete legacy.feeMode;
+		first.metadata.set('jit:intents', JSON.stringify(rows));
+
+		const second = makeHarness(
+			{ flatFeeSat: 100n, maxLiveIntentsPerPeer: 2 },
+			{ metadata: first.metadata }
+		);
+		second.manager.restore();
+		const modes = new Map(
+			second.manager.listIntents().map((i) => [i.interceptScidHex, i.feeMode])
+		);
+		expect(modes.get(hop.interceptScid.toString('hex'))).to.equal('hop');
+		expect(modes.get(skim.interceptScid.toString('hex'))).to.equal('skim');
 	});
 
 	it('keeps retrying a part whose channel has not reestablished yet', function () {

@@ -25,6 +25,22 @@
  * receives the HTLC. A hold that cannot be funded is a FAILED PAYMENT, never a
  * loss: the preimage is not involved at any point.
  *
+ * The opening fee is collected one of two ways, chosen at registration
+ * (`JitFeeMode`, echoed in the ack so both sides agree):
+ *
+ *  - SKIM (LSPS2's way): the fee is deducted from the forwarded HTLC, which
+ *    therefore arrives SHORT of the onion's amt_to_forward. Only a final node
+ *    that implements the allowance settles that (a beignet wallet does; LND
+ *    and CLN fail it, BOLT 4 final_incorrect_htlc_amount). The wallet opts in
+ *    with `acceptsSkimmedFee`.
+ *  - HOP: the wallet puts the quoted terms into its invoice routing hint as
+ *    an ordinary routing fee (fee_base_msat = flat, fee_proportional =
+ *    ppm), the SENDER pays it on top, and the LSP forwards the full onion
+ *    amount, keeping the difference. The final HTLC equals amt_to_forward,
+ *    so any node settles it. The LSP checks, before fronting anything, that
+ *    the fee actually arrived on the inbound HTLCs; a payer that ignored the
+ *    hint's fee gets a plain temporary failure and nothing is funded.
+ *
  * Two things the engine owes unconditionally, because a held HTLC is somebody
  * else's money sitting on our inbound channel:
  *
@@ -53,6 +69,13 @@ import {
 
 // ─────────────── Wire payloads (custom subtypes 1/2) ───────────────
 
+/**
+ * How the opening fee is collected for one intent. `skim` deducts it from the
+ * forwarded HTLC; `hop` has the sender pay it as a routing fee named in the
+ * invoice hint, so the forward is the full onion amount.
+ */
+export type JitFeeMode = 'skim' | 'hop';
+
 export interface IJitReceiveAuthorization {
 	/** Client-chosen correlation id, echoed in the ack. */
 	requestId: Buffer;
@@ -79,11 +102,18 @@ export interface IJitReceiveAck {
 	/** The SCID the LSP minted for this intent; zeros when refused. */
 	interceptScid: Buffer;
 	accepted: boolean;
-	/** LSPS2-style opening fee the LSP will deduct: flat part (sat). */
+	/** LSPS2-style opening fee the LSP will charge: flat part (sat). */
 	flatFeeSat: bigint;
 	/** Proportional part, in parts-per-million of the received total. */
 	feePpm: number;
 	reason?: string;
+	/**
+	 * How the fee above is collected. Carried as a trailing byte after the
+	 * reason, which an older decoder ignores. Absent on the wire means skim:
+	 * an LSP that predates the field never accepted a non-skimming client
+	 * with a fee, so an ack without it can only be a skim (or a zero fee).
+	 */
+	feeMode?: JitFeeMode;
 }
 
 /** Everything through `expirySeconds`; the skim flag byte follows it. */
@@ -92,6 +122,9 @@ const AUTHORIZATION_WITH_FLAGS_LENGTH = 69;
 const ACK_HEADER_LENGTH = 31;
 /** Refusal reasons are ours; a long one is truncated rather than refused. */
 const MAX_ACK_REASON_BYTES = 200;
+/** The trailing fee-mode byte of an ack. */
+const ACK_FEE_MODE_SKIM = 0;
+const ACK_FEE_MODE_HOP = 1;
 
 export function encodeJitAuthorization(a: IJitReceiveAuthorization): Buffer {
 	if (a.requestId.length !== 8) {
@@ -142,7 +175,8 @@ export function encodeJitAck(a: IJitReceiveAck): Buffer {
 	if (reason.length > MAX_ACK_REASON_BYTES) {
 		reason = reason.subarray(0, MAX_ACK_REASON_BYTES);
 	}
-	const buf = Buffer.alloc(ACK_HEADER_LENGTH + reason.length);
+	const trailer = a.feeMode === undefined ? 0 : 1;
+	const buf = Buffer.alloc(ACK_HEADER_LENGTH + reason.length + trailer);
 	a.requestId.copy(buf, 0);
 	a.interceptScid.copy(buf, 8);
 	buf.writeUInt8(a.accepted ? 1 : 0, 16);
@@ -150,6 +184,12 @@ export function encodeJitAck(a: IJitReceiveAck): Buffer {
 	buf.writeUInt32BE(a.feePpm >>> 0, 25);
 	buf.writeUInt16BE(reason.length, 29);
 	reason.copy(buf, ACK_HEADER_LENGTH);
+	if (a.feeMode !== undefined) {
+		buf.writeUInt8(
+			a.feeMode === 'hop' ? ACK_FEE_MODE_HOP : ACK_FEE_MODE_SKIM,
+			ACK_HEADER_LENGTH + reason.length
+		);
+	}
 	return buf;
 }
 
@@ -173,6 +213,14 @@ export function decodeJitAck(data: Buffer): IJitReceiveAck {
 		result.reason = data
 			.subarray(ACK_HEADER_LENGTH, ACK_HEADER_LENGTH + reasonLen)
 			.toString('utf8');
+	}
+	const modeAt = ACK_HEADER_LENGTH + reasonLen;
+	if (data.length > modeAt) {
+		// An unknown value is read as skim rather than refused: the ack is
+		// otherwise well formed, and skim is the only mode a client that does
+		// not know the value could have registered under.
+		result.feeMode =
+			data.readUInt8(modeAt) === ACK_FEE_MODE_HOP ? 'hop' : 'skim';
 	}
 	return result;
 }
@@ -382,6 +430,12 @@ export interface IJitIntent {
 	expiresAt: number;
 	/** The client will accept the opening fee skimmed off its payment. */
 	acceptsSkimmedFee: boolean;
+	/**
+	 * How this intent's opening fee is collected. `hop` is assigned when a
+	 * fee is configured and the client would not accept a skim: the fee is
+	 * then owed by the SENDER on the inbound HTLCs, and checked there.
+	 */
+	feeMode: JitFeeMode;
 }
 
 /** A forward held by the engine, plus the engine's own bookkeeping. */
@@ -462,6 +516,8 @@ interface IPersistedIntent {
 	targetRemainingInboundSat: string;
 	expiresAt: number;
 	acceptsSkimmedFee?: boolean;
+	/** Absent in records written before hop mode existed: those are skim. */
+	feeMode?: JitFeeMode;
 }
 
 /**
@@ -604,7 +660,8 @@ export class JitReceiveManager extends EventEmitter {
 						maxAmountMsat: BigInt(p.maxAmountMsat),
 						targetRemainingInboundSat: BigInt(p.targetRemainingInboundSat),
 						expiresAt: p.expiresAt,
-						acceptsSkimmedFee: p.acceptsSkimmedFee === true
+						acceptsSkimmedFee: p.acceptsSkimmedFee === true,
+						feeMode: p.feeMode === 'hop' ? 'hop' : 'skim'
 					};
 					if (p.paymentHashHex) intent.paymentHashHex = p.paymentHashHex;
 					if (p.expectedTotalMsat) {
@@ -667,7 +724,8 @@ export class JitReceiveManager extends EventEmitter {
 				maxAmountMsat: i.maxAmountMsat.toString(),
 				targetRemainingInboundSat: i.targetRemainingInboundSat.toString(),
 				expiresAt: i.expiresAt,
-				acceptsSkimmedFee: i.acceptsSkimmedFee
+				acceptsSkimmedFee: i.acceptsSkimmedFee,
+				feeMode: i.feeMode
 			};
 			if (i.paymentHashHex) p.paymentHashHex = i.paymentHashHex;
 			if (i.expectedTotalMsat) {
@@ -911,16 +969,18 @@ export class JitReceiveManager extends EventEmitter {
 				`at most ${this.cfg.maxLiveIntentsPerPeer} live intents per peer`
 			);
 		}
-		// The opening fee is skimmed off a forward whose onion we cannot
-		// rewrite, so a client that will not accept a short HTLC would only
-		// fail the payment at its final hop (BOLT 4 final_incorrect_htlc_amount)
-		// after we had already funded the channel. Refuse instead of charging
-		// into a payment that cannot complete.
-		if (this.chargesAnOpeningFee() && auth.acceptsSkimmedFee !== true) {
-			return refuse(
-				`this LSP deducts an opening fee (${this.cfg.flatFeeSat} sat + ${this.cfg.feePpm} ppm) from the payment; the client must accept a skimmed HTLC`
-			);
-		}
+		// A skimmed fee shrinks a forward whose onion we cannot rewrite, so a
+		// client that will not accept a short HTLC would fail the payment at
+		// its final hop (BOLT 4 final_incorrect_htlc_amount) after we had
+		// already funded the channel. Such a client is served in HOP mode
+		// instead: it puts the quoted terms in its invoice hint, the sender
+		// pays the fee as a routing fee, and the forward is the full amount.
+		// Whether the fee actually arrived is checked on the inbound HTLCs
+		// before anything is fronted (validateFee).
+		const feeMode: JitFeeMode =
+			this.chargesAnOpeningFee() && auth.acceptsSkimmedFee !== true
+				? 'hop'
+				: 'skim';
 
 		// The LSP mints the SCID. A value that collides with a real SCID, an
 		// alias or another client's intent is refused, never overwritten: an
@@ -940,7 +1000,8 @@ export class JitReceiveManager extends EventEmitter {
 			targetRemainingInboundSat: auth.targetRemainingInboundSat,
 			expiresAt:
 				Date.now() + Math.min(auth.expirySeconds * 1000, this.cfg.intentTtlMs),
-			acceptsSkimmedFee: auth.acceptsSkimmedFee === true
+			acceptsSkimmedFee: auth.acceptsSkimmedFee === true,
+			feeMode
 		};
 		if (auth.paymentHash) {
 			intent.paymentHashHex = auth.paymentHash.toString('hex');
@@ -958,7 +1019,8 @@ export class JitReceiveManager extends EventEmitter {
 			interceptScid: scid,
 			accepted: true,
 			flatFeeSat: this.cfg.flatFeeSat,
-			feePpm: this.cfg.feePpm
+			feePpm: this.cfg.feePpm,
+			feeMode
 		};
 	}
 
@@ -1100,6 +1162,7 @@ export class JitReceiveManager extends EventEmitter {
 		if (this.destroyed) return false;
 		const intent = this.intents.get(scidHex);
 		if (!intent) return false;
+		if (JitReceiveManager.principalError(part)) return false;
 		if (Date.now() > intent.expiresAt) {
 			this.intents.delete(scidHex);
 			this.persistIntents();
@@ -1246,7 +1309,7 @@ export class JitReceiveManager extends EventEmitter {
 		// The fee is checked against the parts BEFORE any state is consumed, so
 		// a fee that cannot be taken fails every part upstream instead of
 		// throwing past an already-emptied held map and dropping them.
-		const feeError = this.validateFee(parts, totalMsat, [intent]);
+		const feeError = this.validateFee(parts, [intent]);
 		if (feeError) {
 			this.failFunding(scidHex, feeError);
 			return;
@@ -1289,11 +1352,7 @@ export class JitReceiveManager extends EventEmitter {
 			if (toForward.some((p) => p.revoked || this.pastDeadline(p))) {
 				throw new Error('held part reached its inbound CLTV deadline');
 			}
-			const lateFeeError = this.validateFee(
-				toForward,
-				toForward.reduce((s, p) => s + p.forwardAmountMsat, 0n),
-				[intent]
-			);
+			const lateFeeError = this.validateFee(toForward, [intent]);
 			if (lateFeeError) throw new Error(lateFeeError);
 
 			// From here the held set is CONSUMED, so nothing below may leave a
@@ -1357,6 +1416,7 @@ export class JitReceiveManager extends EventEmitter {
 	 */
 	tryHoldForSplice(outChannelId: Buffer, part: IHeldJitPart): boolean {
 		if (this.destroyed) return false;
+		if (JitReceiveManager.principalError(part)) return false;
 		if (!this.deps.peerForChannel || !this.deps.spliceInAndWait) {
 			return false;
 		}
@@ -1395,7 +1455,7 @@ export class JitReceiveManager extends EventEmitter {
 		const queued = this.spliceQueues.get(key) ?? [];
 		const totalMsat = queued.reduce((s, p) => s + p.forwardAmountMsat, 0n);
 		const intents = this.intentsBehind(queued);
-		const feeError = this.validateFee(queued, totalMsat, intents);
+		const feeError = this.validateFee(queued, intents);
 		if (feeError) {
 			this.failSplice(key, feeError);
 			return;
@@ -1442,11 +1502,7 @@ export class JitReceiveManager extends EventEmitter {
 				throw new Error('held part reached its inbound CLTV deadline');
 			}
 			const forwardIntents = this.intentsBehind(toForward);
-			const lateFeeError = this.validateFee(
-				toForward,
-				toForward.reduce((s, p) => s + p.forwardAmountMsat, 0n),
-				forwardIntents
-			);
+			const lateFeeError = this.validateFee(toForward, forwardIntents);
 			if (lateFeeError) throw new Error(lateFeeError);
 			this.spliceQueues.delete(key);
 			// Same rule as the open path: no forward while a hold row on disk
@@ -1625,50 +1681,138 @@ export class JitReceiveManager extends EventEmitter {
 	}
 
 	/**
-	 * The fee these parts owe. Zero unless every intent behind them accepted a
-	 * skimmed HTLC: the deduction shrinks a forward whose onion still names the
-	 * original amount, and BOLT 4 has the final hop fail anything short of it
-	 * (final_incorrect_htlc_amount), so skimming at a client that did not agree
-	 * would only destroy the payment after we had funded the channel.
+	 * The parts split by how their intent collects the fee. A part whose
+	 * intent is not among the given ones owes nothing, as before: the caller
+	 * names the intents a funding spends, and only those are charged.
 	 */
-	private feeMsatFor(totalMsat: bigint, intents: IJitIntent[]): bigint {
-		if (intents.length === 0 || !intents.every((i) => i.acceptsSkimmedFee)) {
-			return 0n;
+	private feeGroups(
+		parts: IHeldJitPart[],
+		intents: IJitIntent[]
+	): { skim: IHeldJitPart[]; hop: IHeldJitPart[]; skimAgreed: boolean } {
+		const byScid = new Map(intents.map((i) => [i.interceptScidHex, i]));
+		const skim: IHeldJitPart[] = [];
+		const hop: IHeldJitPart[] = [];
+		let skimAgreed = true;
+		for (const part of parts) {
+			const intent = part.intentScidHex
+				? byScid.get(part.intentScidHex)
+				: undefined;
+			if (!intent) continue;
+			if (intent.feeMode === 'hop') {
+				hop.push(part);
+			} else {
+				skim.push(part);
+				if (!intent.acceptsSkimmedFee) skimAgreed = false;
+			}
 		}
+		return { skim, hop, skimAgreed };
+	}
+
+	private openingFeeMsat(totalMsat: bigint): bigint {
 		return jitOpeningFeeMsat(totalMsat, {
 			flatFeeSat: this.cfg.flatFeeSat,
 			feePpm: this.cfg.feePpm
 		});
 	}
 
-	/** Null when the opening fee can be taken out of these parts. */
-	private validateFee(
-		parts: IHeldJitPart[],
-		totalMsat: bigint,
-		intents: IJitIntent[]
-	): string | null {
-		const feeMsat = this.feeMsatFor(totalMsat, intents);
-		if (feeMsat <= 0n) return null;
-		if (parts.length === 0) return 'no held part to take the JIT fee from';
-		const largest = parts.reduce((a, b) =>
-			b.forwardAmountMsat > a.forwardAmountMsat ? b : a
+	/**
+	 * The fee the SKIM parts owe. Zero unless every skim intent behind them
+	 * accepted a skimmed HTLC: the deduction shrinks a forward whose onion
+	 * still names the original amount, and BOLT 4 has the final hop fail
+	 * anything short of it (final_incorrect_htlc_amount), so skimming at a
+	 * client that did not agree would only destroy the payment after we had
+	 * funded the channel.
+	 */
+	private skimFeeMsat(skim: IHeldJitPart[], skimAgreed: boolean): bigint {
+		if (skim.length === 0 || !skimAgreed) return 0n;
+		return this.openingFeeMsat(
+			skim.reduce((s, p) => s + p.forwardAmountMsat, 0n)
 		);
-		if (largest.forwardAmountMsat <= feeMsat) {
-			return `JIT fee ${feeMsat} msat exceeds the largest held part ${largest.forwardAmountMsat} msat`;
+	}
+
+	/**
+	 * Every part must fund its own principal, including skim parts. Checking
+	 * before the skim keeps the opening fee from subsidizing an underfunded
+	 * inbound HTLC. Missing inbound values fail closed in every fee mode.
+	 */
+	private static principalError(part: IHeldJitPart): string | null {
+		if (part.incomingAmountMsat === undefined) {
+			return 'JIT part has no recorded inbound amount';
+		}
+		if (part.incomingAmountMsat < part.forwardAmountMsat) {
+			return `JIT part forwards ${part.forwardAmountMsat} msat but only ${part.incomingAmountMsat} msat arrived`;
 		}
 		return null;
 	}
 
 	/**
-	 * LSPS2 fee deduction: the opening fee comes out of the delivered amount,
-	 * taken ONCE from the largest part so the aggregate shortfall equals the
-	 * fee the wallet agreed to when it registered the intent.
+	 * The flat opening fee is owed once. Routing hints round proportional
+	 * fees on each HTLC, so sum those rounded fees instead of rounding the
+	 * aggregate and refusing correctly paid multipart payments.
+	 */
+	private hopFeeMsat(hop: IHeldJitPart[]): bigint {
+		return hop.reduce(
+			(total, part) =>
+				total +
+				jitOpeningFeeMsat(part.forwardAmountMsat, {
+					flatFeeSat: 0n,
+					feePpm: this.cfg.feePpm
+				}),
+			this.openingFeeMsat(0n)
+		);
+	}
+
+	/**
+	 * Null when every part covers its principal and the opening fee can be
+	 * taken out of these parts (skim) or has arrived on them (hop).
+	 * Checked BEFORE any state is consumed and
+	 * again right before the forward, so a fee that cannot be collected
+	 * fails every part upstream instead of fronting a channel for it.
+	 */
+	private validateFee(
+		parts: IHeldJitPart[],
+		intents: IJitIntent[]
+	): string | null {
+		for (const part of parts) {
+			const principalError = JitReceiveManager.principalError(part);
+			if (principalError) return principalError;
+		}
+		const { skim, hop, skimAgreed } = this.feeGroups(parts, intents);
+		const skimFee = this.skimFeeMsat(skim, skimAgreed);
+		if (skimFee > 0n) {
+			const largest = skim.reduce((a, b) =>
+				b.forwardAmountMsat > a.forwardAmountMsat ? b : a
+			);
+			if (largest.forwardAmountMsat <= skimFee) {
+				return `JIT fee ${skimFee} msat exceeds the largest held part ${largest.forwardAmountMsat} msat`;
+			}
+		}
+		if (hop.length > 0) {
+			const owed = this.hopFeeMsat(hop);
+			const collected = hop.reduce(
+				(total, part) =>
+					total + part.incomingAmountMsat! - part.forwardAmountMsat,
+				0n
+			);
+			if (collected < owed) {
+				return `JIT fee ${owed} msat is owed as a routing fee on the inbound HTLCs but only ${collected} msat arrived`;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * LSPS2 fee deduction for the SKIM parts: the opening fee comes out of the
+	 * delivered amount, taken ONCE from the largest part so the aggregate
+	 * shortfall equals the fee the wallet agreed to when it registered the
+	 * intent. HOP parts are forwarded at their full onion amount: their fee
+	 * already arrived on the inbound side and stays with us there.
 	 */
 	private applyFee(parts: IHeldJitPart[], intents: IJitIntent[]): void {
-		const totalMsat = parts.reduce((s, p) => s + p.forwardAmountMsat, 0n);
-		const feeMsat = this.feeMsatFor(totalMsat, intents);
-		if (feeMsat <= 0n || parts.length === 0) return;
-		const largest = parts.reduce((a, b) =>
+		const { skim, skimAgreed } = this.feeGroups(parts, intents);
+		const feeMsat = this.skimFeeMsat(skim, skimAgreed);
+		if (feeMsat <= 0n) return;
+		const largest = skim.reduce((a, b) =>
 			b.forwardAmountMsat > a.forwardAmountMsat ? b : a
 		);
 		largest.forwardAmountMsat -= feeMsat;

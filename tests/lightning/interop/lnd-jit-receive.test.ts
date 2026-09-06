@@ -284,86 +284,101 @@ describe('Interop: LND pays through a JIT intercept SCID (issue #594)', function
 		expect(alice.getChannelManager().isTrustedPeer(bobId)).to.equal(false);
 	});
 
-	// The 3B wallet half of the same round trip (issue #595): one call
-	// registers the intent, embeds the hint and records the fee allowance,
-	// and the LSP charges an opening fee this time. The skim is what makes
-	// this the interesting case: the HTLC bob receives is SHORT of the
-	// amount its onion declares, so without the allowance BOLT 4 has him
-	// fail a payment LND already considers made.
-	it('createJitInvoice settles a delivery the LSP skimmed its fee from', async function () {
-		alice = makeNode('jit-lsp-903', {
-			fundingProvider: new BitcoindFundingProvider(),
-			jitReceive: {
-				enabled: true,
-				fundingBufferSats: 20_000n,
-				maxClientFundingSats: 500_000n,
-				flatFeeSat: OPENING_FEE_SAT
+	// Exercise both fee contracts through a real LND payment. Skim mode
+	// needs the receiver's shortfall allowance; hop mode must pay the entire
+	// invoice and collect its flat and proportional fees from LND instead.
+	for (const feeMode of ['skim', 'hop'] as const) {
+		it(`createJitInvoice settles a delivery with ${feeMode} fees`, async function () {
+			alice = makeNode(`jit-lsp-${feeMode}-903`, {
+				fundingProvider: new BitcoindFundingProvider(),
+				jitReceive: {
+					enabled: true,
+					fundingBufferSats: 20_000n,
+					maxClientFundingSats: 500_000n,
+					flatFeeSat: OPENING_FEE_SAT,
+					feePpm: feeMode === 'hop' ? 500 : 0
+				}
+			});
+			bob = makeNode(`jit-wallet-${feeMode}-904`);
+			const aliceId = alice.getNodeId();
+			const bobId = bob.getNodeId();
+
+			await fundLndWallet(lnd, 110);
+			await alice.connectPeer(lndPubkey, LND_P2P_HOST, LND_P2P_PORT);
+			await sleep(2_000);
+			await lnd.openChannelSync(aliceId, LND_TO_ALICE_SAT, 0);
+			await mineBlocks(6);
+			await sleep(3_000);
+			const inbound = alice.getChannelManager().listChannels();
+			expect(inbound.length, 'alice has the LND channel').to.be.greaterThan(0);
+			alice.handleFundingConfirmed(inbound[0].getChannelId()!);
+			await waitForLndChannels(lnd, 1, 30_000);
+			setupRoutingForChannel(alice, lndPubkey);
+			const tip = (await bitcoinRpc('getblockcount')) as number;
+			alice.handleNewBlock(tip);
+			bob.handleNewBlock(tip);
+
+			const bobPort = await freePort();
+			await bob.listen(bobPort);
+			bob.addTrustedPeer(aliceId);
+			await alice.connectPeer(bobId, '127.0.0.1', bobPort);
+			await sleep(1_500);
+
+			const invoice = await bob.createJitInvoice({
+				lspPubkeyHex: aliceId,
+				amountMsat: PAYMENT_MSAT,
+				description: 'jit receive with fee',
+				targetRemainingInboundSat: 50_000n,
+				feeMode
+			});
+			expect(invoice.flatFeeSat, 'the quote bob agreed to').to.equal(
+				OPENING_FEE_SAT
+			);
+			expect(invoice.feeMode).to.equal(feeMode);
+			if (feeMode === 'hop') {
+				expect(
+					bob.getInvoice(invoice.paymentHash.toString('hex'))!.jitFee
+				).to.equal(undefined);
+			}
+
+			const opened = new Promise<void>((resolve, reject) => {
+				alice!.once('jit:forwarded', () => resolve());
+				alice!.once('jit:failed', (d: { reason: string }) =>
+					reject(new Error(`JIT funding failed: ${d.reason}`))
+				);
+			});
+
+			const payment = await lnd.sendPaymentSync(invoice.bolt11);
+			expect(payment.payment_error || '').to.equal('');
+			expect(payment.payment_preimage).to.be.a('string');
+			await opened;
+
+			const delivered =
+				feeMode === 'hop'
+					? PAYMENT_MSAT
+					: PAYMENT_MSAT - OPENING_FEE_SAT * 1000n;
+			const settled = Date.now() + 20_000;
+			while (
+				bob.listChannels()[0]?.localBalanceMsat < delivered &&
+				Date.now() < settled
+			) {
+				await sleep(250);
+			}
+			expect(
+				Number(bob.listChannels()[0].localBalanceMsat),
+				'bob was credited the agreed delivery'
+			).to.be.greaterThanOrEqual(Number(delivered));
+			if (feeMode === 'hop') {
+				expect(bob.listChannels()[0].localBalanceMsat).to.equal(PAYMENT_MSAT);
+				expect(BigInt(payment.payment_route.total_fees)).to.equal(
+					OPENING_FEE_SAT + (PAYMENT_MSAT * 500n) / 1_000_000_000n
+				);
+			} else {
+				expect(
+					Number(bob.listChannels()[0].localBalanceMsat),
+					'the skim is exactly the quoted fee'
+				).to.be.lessThan(Number(PAYMENT_MSAT));
 			}
 		});
-		bob = makeNode('jit-wallet-904');
-		const aliceId = alice.getNodeId();
-		const bobId = bob.getNodeId();
-
-		await fundLndWallet(lnd, 110);
-		await alice.connectPeer(lndPubkey, LND_P2P_HOST, LND_P2P_PORT);
-		await sleep(2_000);
-		await lnd.openChannelSync(aliceId, LND_TO_ALICE_SAT, 0);
-		await mineBlocks(6);
-		await sleep(3_000);
-		const inbound = alice.getChannelManager().listChannels();
-		expect(inbound.length, 'alice has the LND channel').to.be.greaterThan(0);
-		alice.handleFundingConfirmed(inbound[0].getChannelId()!);
-		await waitForLndChannels(lnd, 1, 30_000);
-		setupRoutingForChannel(alice, lndPubkey);
-		const tip = (await bitcoinRpc('getblockcount')) as number;
-		alice.handleNewBlock(tip);
-		bob.handleNewBlock(tip);
-
-		const bobPort = await freePort();
-		await bob.listen(bobPort);
-		bob.addTrustedPeer(aliceId);
-		await alice.connectPeer(bobId, '127.0.0.1', bobPort);
-		await sleep(1_500);
-
-		const invoice = await bob.createJitInvoice({
-			lspPubkeyHex: aliceId,
-			amountMsat: PAYMENT_MSAT,
-			description: 'jit receive with fee',
-			targetRemainingInboundSat: 50_000n
-		});
-		expect(invoice.flatFeeSat, 'the quote bob agreed to').to.equal(
-			OPENING_FEE_SAT
-		);
-
-		const opened = new Promise<void>((resolve, reject) => {
-			alice!.once('jit:forwarded', () => resolve());
-			alice!.once('jit:failed', (d: { reason: string }) =>
-				reject(new Error(`JIT funding failed: ${d.reason}`))
-			);
-		});
-
-		const payment = await lnd.sendPaymentSync(invoice.bolt11);
-		expect(payment.payment_error || '').to.equal('');
-		expect(payment.payment_preimage).to.be.a('string');
-		await opened;
-
-		const delivered = PAYMENT_MSAT - OPENING_FEE_SAT * 1000n;
-		const settled = Date.now() + 20_000;
-		while (
-			bob.listChannels()[0]?.localBalanceMsat < delivered &&
-			Date.now() < settled
-		) {
-			await sleep(250);
-		}
-		expect(
-			Number(bob.listChannels()[0].localBalanceMsat),
-			'bob was credited the delivery net of the agreed fee'
-		).to.be.greaterThanOrEqual(Number(delivered));
-		// And no more than that: the skim is bounded by the quote, so a fee
-		// larger than the one bob registered would have failed the HTLC.
-		expect(
-			Number(bob.listChannels()[0].localBalanceMsat),
-			'the skim is exactly the quoted fee'
-		).to.be.lessThan(Number(PAYMENT_MSAT));
-	});
+	}
 });

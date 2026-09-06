@@ -7272,11 +7272,32 @@ export class BeignetNode extends EventEmitter {
 		/** Ceilings on the LSP's quote; default to the node's configured ones. */
 		maxFlatFeeSat?: number;
 		maxFeePpm?: number;
-	}): Promise<InvoiceInfo & { flatFeeSat: number; feePpm: number }> {
+		/**
+		 * Who pays the opening fee: `skim` (default) deducts it from what this
+		 * node receives; `hop` puts it in the invoice hint so the sender pays.
+		 */
+		feeMode?: 'skim' | 'hop';
+	}): Promise<
+		InvoiceInfo & {
+			flatFeeSat: number;
+			feePpm: number;
+			feeMode: 'skim' | 'hop';
+		}
+	> {
 		if (!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)) {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
 				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
+			);
+		}
+		if (
+			opts.feeMode !== undefined &&
+			opts.feeMode !== 'skim' &&
+			opts.feeMode !== 'hop'
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				"feeMode must be 'skim' or 'hop'"
 			);
 		}
 		const amountMsat =
@@ -7314,18 +7335,24 @@ export class BeignetNode extends EventEmitter {
 								'maxFeePpm'
 							)
 					  }
-					: {})
+					: {}),
+				...(opts.feeMode !== undefined ? { feeMode: opts.feeMode } : {})
 			});
 		} catch (err) {
 			throw jitInvoiceError(err);
 		}
-		const info: InvoiceInfo & { flatFeeSat: number; feePpm: number } = {
+		const info: InvoiceInfo & {
+			flatFeeSat: number;
+			feePpm: number;
+			feeMode: 'skim' | 'hop';
+		} = {
 			bolt11: result.bolt11,
 			paymentHash: result.paymentHash.toString('hex'),
 			paymentSecret: result.paymentSecret.toString('hex'),
 			amountSats: opts.amountSats || undefined,
 			flatFeeSat: Number(result.flatFeeSat),
-			feePpm: result.feePpm
+			feePpm: result.feePpm,
+			feeMode: result.feeMode
 		};
 		if (opts.expirySecs !== undefined) info.expiry = opts.expirySecs;
 		return info;
