@@ -144,7 +144,9 @@ export interface IDfSenderWallet {
 	/**
 	 * Exclude the outpoint from every wallet selection path. Reports whether it
 	 * landed, because a payer that cannot reserve its own coin must refuse
-	 * BEFORE the witness rather than race its own wallet afterwards.
+	 * BEFORE the witness rather than race its own wallet afterwards. False means
+	 * this call acquired no reservation and must not release one held elsewhere.
+	 * Remote adapters must reconcile ambiguous RPC outcomes before reporting it.
 	 */
 	freezeUtxo(txidHex: string, vout: number): Promise<boolean>;
 	unfreezeUtxo(txidHex: string, vout: number): Promise<boolean>;
@@ -295,6 +297,11 @@ export interface IDfPaymentRecord {
 	updatedAt: number;
 	/** Set once the coin was excluded from this wallet's coin selection. */
 	frozen?: boolean;
+	/**
+	 * Pre-witness reservation cleanup completed. Reset durably before acquiring
+	 * another freeze, so startup can retry an interrupted release.
+	 */
+	freezeReleased?: boolean;
 	/**
 	 * Set once a lane accepted the witness frame. SIGNED_PENDING cannot carry
 	 * this: the record is written BEFORE the send, so a crash in that window
