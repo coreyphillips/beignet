@@ -10,7 +10,10 @@ import {
 	IDfOffer,
 	ownershipProbeTransaction
 } from '../../src/lightning/direct-funding/messages';
-import { ownershipProblem } from '../../src/lightning/direct-funding/receiver/verify';
+import {
+	offerFieldProblem,
+	ownershipProblem
+} from '../../src/lightning/direct-funding/receiver/verify';
 
 interface IProbeFixture {
 	kind: 'p2wpkh' | 'p2tr';
@@ -108,6 +111,17 @@ describe('Direct funding: captured CLN ownership probe signatures', () => {
 			expect(
 				ownershipProblem(offer, Buffer.from(f.coinScript, 'hex'))
 			).to.equal(null);
+		});
+
+		it(`${f.kind}: rejects a changed amount with either the stale or recomputed offer ID`, () => {
+			const offer = offerFor(f);
+			offer.amountSat++;
+			expect(offerFieldProblem(offer, {})).to.contain('offer id');
+			offer.offerId = deriveOfferId(offer.txid, offer.vout, offer.amountSat);
+			expect(offerFieldProblem(offer, {})).to.equal(null);
+			expect(
+				ownershipProblem(offer, Buffer.from(f.coinScript, 'hex'))
+			).not.to.equal(null);
 		});
 
 		for (const field of [
