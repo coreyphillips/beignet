@@ -12,7 +12,8 @@
 import crypto from 'crypto';
 import * as net from 'net';
 import * as bitcoin from 'bitcoinjs-lib';
-import { bitcoinRpc, TEST_MNEMONIC } from './shared-helpers';
+import { expect } from 'chai';
+import { bitcoinRpc, mineBlocks, TEST_MNEMONIC } from './shared-helpers';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import { REGTEST_CHAIN_HASH } from '../../../src/lightning/channel/types';
 import { FeatureFlags, Feature } from '../../../src/lightning/features/flags';
@@ -29,6 +30,7 @@ import {
 	ISwapChainSource,
 	ISwapCreateAck,
 	SwapWireDirection,
+	buildSwapClaimTx,
 	decodeSwapCreateAck,
 	encodeSwapCreate
 } from '../../../src/lightning/swaps';
@@ -329,7 +331,6 @@ export async function mineAndTick(
 	scene: ISwapScene,
 	blocks: number
 ): Promise<number> {
-	const { mineBlocks } = await import('./shared-helpers');
 	await mineBlocks(blocks);
 	await new Promise((r) => setTimeout(r, 1_000));
 	return tick(scene);
@@ -357,8 +358,6 @@ export async function runReverseSwapHappyPath(
 	scene: ISwapScene,
 	amountSat = 100_000n
 ): Promise<{ claimTxid: string; swapIdHex: string }> {
-	const { expect } = await import('chai');
-	const { buildSwapClaimTx } = await import('../../../src/lightning/swaps');
 	const providerId = scene.provider.getNodeId();
 	const tip = await tick(scene);
 	const keys = clientSwapKeys();
@@ -442,7 +441,6 @@ export async function runReverseSwapRefundPath(
 	scene: ISwapScene,
 	amountSat = 80_000n
 ): Promise<{ swapIdHex: string }> {
-	const { expect } = await import('chai');
 	const providerId = scene.provider.getNodeId();
 	const tip = await tick(scene);
 	const keys = clientSwapKeys();
