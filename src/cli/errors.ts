@@ -38,6 +38,8 @@ export enum BeignetErrorCode {
 	// wallet's ceiling, or answered with no intercept scid. A policy refusal
 	// the caller can act on (ask for less, raise the ceiling), never a fault.
 	JIT_REFUSED = 'JIT_REFUSED',
+	/** A swap past CREATED/HELD cannot be cancelled; it resolves on chain. */
+	SWAP_NOT_CANCELLABLE = 'SWAP_NOT_CANCELLABLE',
 	// The LSP never answered the intent inside the ack window.
 	JIT_TIMEOUT = 'JIT_TIMEOUT',
 	CONNECT_FAILED = 'CONNECT_FAILED',

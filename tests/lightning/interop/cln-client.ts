@@ -470,6 +470,13 @@ export class ClnRestClient {
 		return this.request('POST', '/v1/pay', { bolt11 });
 	}
 
+	/** listpays: the status of an outgoing payment by hash. */
+	async listPays(paymentHash: string): Promise<{
+		pays: Array<{ payment_hash: string; status: string; preimage?: string }>;
+	}> {
+		return this.request('POST', '/v1/listpays', { payment_hash: paymentHash });
+	}
+
 	// ── Wallet ──
 
 	async newAddr(): Promise<IClnNewAddr> {

@@ -207,6 +207,11 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'GET /jit/status': ['readonly'],
 	// A price, asked of a peer: registers nothing, moves nothing.
 	'GET /jit/quote': ['readonly'],
+	// Reverse swap provider (issue #737): reading the ledger is readonly;
+	// cancelling an unpaid swap closes a hold invoice, admin only.
+	'GET /swaps/status': ['readonly'],
+	'GET /swaps': ['readonly'],
+	'POST /swaps/cancel': [],
 	// Mints a receipt secret and hands out a payable artifact. It moves no
 	// money: the same shape as POST /invoice/create and POST /jit/invoice.
 	// Its two siblings are admin by ABSENCE, deliberately: configure sets the

@@ -212,7 +212,13 @@ import {
 	ISwapRecord,
 	ISwapChainSource,
 	SwapKeyRole,
-	deriveSwapKey
+	deriveSwapKey,
+	SwapChainResolver,
+	ReverseSwapProvider,
+	REVERSE_SWAP_EVENTS,
+	REVERSE_SWAP_DEFAULTS,
+	REVERSE_SWAP_DEFAULT_EXPOSURE,
+	IReverseSwapStatus
 } from '../swaps';
 import {
 	INodeConfig,
@@ -241,6 +247,7 @@ import {
 	HoldCancelReason,
 	HoldInvoiceState,
 	ISendPaymentOptions,
+	ISwapNodeConfig,
 	IOutgoingPaymentResolution,
 	IOutgoingHtlcView,
 	OutgoingHtlcState,
@@ -1055,6 +1062,9 @@ export class LightningNode extends EventEmitter {
 	private heldForwardLedger: HeldForwardLedger;
 	/** Swap ledger (issue #737); present only with config.swaps.enabled. */
 	private swapLedger?: SwapLedger;
+	/** Reverse swap provider engine (issue #737), over the ledger above. */
+	private swapProvider?: ReverseSwapProvider;
+	private swapProviderStarted = false;
 	private autoReleaseHeldForwards: boolean;
 	/**
 	 * Async receive service, LSP role (issue #709): registrations, admission,
@@ -1915,6 +1925,9 @@ export class LightningNode extends EventEmitter {
 			// listener attached later would miss an offer sent to a request this
 			// node minted in a previous run.
 			this.wireDirectFunding(config.directFunding);
+		}
+		if (config.swaps?.enabled) {
+			this.wireSwapProvider(config.swaps);
 		}
 		this.jitClientMaxFlatFeeSat =
 			config.jitReceiveClient?.maxFlatFeeSat ?? JIT_CLIENT_MAX_FLAT_FEE_SAT;
@@ -9288,6 +9301,7 @@ export class LightningNode extends EventEmitter {
 		this.recoveryBarrier?.stop();
 		this.jitReceiveManager?.destroy();
 		this.stopDirectFunding();
+		this.stopSwapProvider();
 		this.stopCleanupTimer();
 		if (this.mppCleanupTimer) {
 			clearInterval(this.mppCleanupTimer);
@@ -21640,6 +21654,30 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * A custom message from one of the node's own engines: over the peer
+	 * manager when there is one, otherwise through 'message:outbound' like
+	 * every other wire message in external-transport mode (a loopback
+	 * harness, or a host with its own sockets). The public sendCustomMessage
+	 * keeps refusing without networking so a caller's mistake is loud.
+	 */
+	private emitCustomMessage(
+		peerPubkeyHex: string,
+		subtype: number,
+		payload: Buffer
+	): void {
+		const envelope = encodeCustomMessage(subtype, payload);
+		if (this.peerManager) {
+			this.peerManager.sendToPeer(
+				peerPubkeyHex,
+				BEIGNET_CUSTOM_MESSAGE_TYPE,
+				envelope
+			);
+			return;
+		}
+		this.emitOutbound(peerPubkeyHex, BEIGNET_CUSTOM_MESSAGE_TYPE, envelope);
+	}
+
 	// ─────────────── Third-party direct funding (issue #613) ───────────────
 
 	/** The lane registry, for a payer built on top of this node. */
@@ -22075,6 +22113,195 @@ export class LightningNode extends EventEmitter {
 		return (swapId, role) => deriveSwapKey(this.nodePrivkey, swapId, role);
 	}
 
+	/** The reverse swap provider, when config.swaps.enabled. */
+	getSwapProvider(): ReverseSwapProvider | undefined {
+		return this.swapProvider;
+	}
+
+	listSwaps(): ISwapRecord[] {
+		return this.swapProvider?.list() ?? this.swapLedger?.list() ?? [];
+	}
+
+	getSwapStatus(): IReverseSwapStatus | { enabled: false } {
+		return this.swapProvider?.status() ?? { enabled: false };
+	}
+
+	cancelSwap(swapIdHex: string): { ok: boolean; reason?: string } {
+		if (!this.swapProvider) return { ok: false, reason: 'swaps disabled' };
+		return this.swapProvider.cancel(swapIdHex);
+	}
+
+	/**
+	 * Redo the provider's owed actions from the rehydrated ledger. Separate
+	 * from construction because the first pass observes the chain, and a
+	 * constructor cannot await.
+	 */
+	async startSwapProvider(): Promise<void> {
+		if (!this.swapProvider || this.swapProviderStarted) return;
+		this.swapProviderStarted = true;
+		await this.swapProvider.start();
+	}
+
+	stopSwapProvider(): void {
+		this.swapProvider?.stop();
+	}
+
+	private wireSwapProvider(config: ISwapNodeConfig): void {
+		if (!this.swapLedger) return;
+		const chainSource = config.chainSource;
+		const resolverSource: ISwapChainSource = chainSource ?? {
+			currentHeight: () => this.currentBlockHeight,
+			getTransaction: (txid) => this.swapChain().getTransaction(txid),
+			getScriptHashHistory: (scriptHash) =>
+				this.swapChain().getScriptHashHistory(scriptHash),
+			listUnspent: (scriptHash) =>
+				this.swapChain().listUnspent?.(scriptHash) ?? Promise.resolve([]),
+			broadcastTransaction: (rawTxHex) =>
+				this.swapChain().broadcastTransaction(rawTxHex)
+		};
+		const confirmations = {
+			fundingConfirmations:
+				config.confirmations?.fundingConfirmations ??
+				REVERSE_SWAP_DEFAULTS.fundingConfirmations,
+			resolutionConfirmations:
+				config.confirmations?.resolutionConfirmations ??
+				REVERSE_SWAP_DEFAULTS.resolutionConfirmations
+		};
+		const resolver = new SwapChainResolver(
+			resolverSource,
+			confirmations,
+			this.getBitcoinNetwork()
+		);
+		const networkName: ISwapRecord['network'] =
+			this.network === Network.MAINNET
+				? 'bitcoin'
+				: this.network === Network.REGTEST
+				? 'regtest'
+				: this.network === Network.SIGNET
+				? 'signet'
+				: 'testnet';
+		const provider = new ReverseSwapProvider(
+			{
+				peers: {
+					nodeIdHex: () => this.getNodeId(),
+					sendCustomMessage: (peer, subtype, payload): void =>
+						this.emitCustomMessage(peer, subtype, payload),
+					onCustomMessage: (cb): (() => void) => {
+						const handler = (msg: {
+							peerPubkey: string;
+							version: number;
+							subtype: number;
+							payload: Buffer;
+						}): void => cb(msg);
+						this.on('custom-message', handler);
+						return () => this.removeListener('custom-message', handler);
+					},
+					isPeerConnected: (peerHex) =>
+						this.listPeers().some((p) => p.pubkey === peerHex),
+					connectPeer: (peerHex, host, port) =>
+						this.connectPeer(peerHex, host, port)
+				},
+				ledger: this.swapLedger,
+				resolver,
+				createHoldInvoice: (options) => ({
+					bolt11: this.createInvoice({
+						hold: true,
+						paymentHash: options.paymentHash,
+						amountMsat: options.amountMsat,
+						expiry: options.expirySeconds,
+						minFinalCltvExpiry: options.minFinalCltvExpiry,
+						description: options.description
+					}).bolt11
+				}),
+				heldSnapshot: (paymentHash) => this.getHeldInvoiceSnapshot(paymentHash),
+				settleHeld: (paymentHash, preimage) =>
+					this.settleHeldHtlc(paymentHash, preimage),
+				cancelHold: (paymentHash) => {
+					this.cancelHoldInvoice(paymentHash);
+				},
+				onHeld: (cb): (() => void) => {
+					const handler = (e: { paymentHash: Buffer }): void => cb(e);
+					this.on('htlc:held', handler);
+					return () => this.removeListener('htlc:held', handler);
+				},
+				onHoldCancelled: (cb): (() => void) => {
+					const handler = (e: IHoldCancelledEvent): void =>
+						cb({ paymentHash: e.paymentHash, reason: e.reason });
+					this.on('hold:cancelled', handler);
+					return () => this.removeListener('hold:cancelled', handler);
+				},
+				fundOutput: async (address, amountSat, feeRate) => {
+					const fp = this.fundingProvider;
+					if (!fp) throw new Error('swaps need a funding provider');
+					const built = await fp.buildFundingTransaction(
+						address,
+						amountSat,
+						feeRate
+					);
+					return {
+						txHex: built.txHex,
+						txid: built.txid,
+						vout: built.outputIndex
+					};
+				},
+				broadcast: async (txHex) => {
+					const fp = this.fundingProvider;
+					if (fp) return fp.broadcastTransaction(txHex);
+					return resolverSource.broadcastTransaction(txHex);
+				},
+				pledge: (txHex) =>
+					this.fundingProvider?.pledgeTransactionInputs?.(txHex),
+				releasePledges: (txHex) => {
+					const fp = this.fundingProvider;
+					if (!fp?.releaseInputPledges) return;
+					const tx = bitcoin.Transaction.fromHex(txHex);
+					return fp.releaseInputPledges(
+						tx.ins.map((input) => ({
+							txid: Buffer.from(input.hash).reverse().toString('hex'),
+							vout: input.index
+						}))
+					);
+				},
+				estimateFee: async (targetBlocks) => {
+					if (!this.feeEstimator) return null;
+					const raw = await this.feeEstimator.estimateFee(targetBlocks);
+					return raw > 0 ? this.clampEstimatedFeeRate(raw) : null;
+				},
+				currentHeight: () => this.currentBlockHeight,
+				deriveRefundKey: (swapId) =>
+					deriveSwapKey(this.nodePrivkey, swapId, 'refund'),
+				refundDestinationScript: () => this.getSweepDestinationScript(),
+				network: this.getBitcoinNetwork(),
+				networkName,
+				log: (action, data) => this.emitStructuredLog('chain', action, data)
+			},
+			{
+				...(config.fee?.flatFeeSat !== undefined
+					? { flatFeeSat: config.fee.flatFeeSat }
+					: {}),
+				...(config.fee?.feePpm !== undefined
+					? { feePpm: config.fee.feePpm }
+					: {}),
+				exposure: {
+					...REVERSE_SWAP_DEFAULT_EXPOSURE,
+					...(config.exposure ?? {})
+				},
+				...confirmations,
+				...(config.timeouts ?? {}),
+				// A hold must outlive the node's own expiring-HTLC scan, which
+				// is the same margin the JIT engine is held to.
+				holdCancelSafetyBlocks: Math.max(
+					HELD_HTLC_EXPIRY_MARGIN,
+					this.htlcSafetyMargin
+				)
+			}
+		);
+		for (const evt of REVERSE_SWAP_EVENTS) {
+			provider.on(evt, (data) => this.emit(evt, data));
+		}
+		this.swapProvider = provider;
+	}
+
 	/** A channel with this peer a splice could ride, or null. */
 	private usableChannelWith(peerHex: string): Buffer | null {
 		for (const channel of this.listChannels()) {
@@ -22239,6 +22466,11 @@ export class LightningNode extends EventEmitter {
 			this.settleForwardsOwedUpstream(Buffer.from(inChannelIdHex, 'hex'));
 		}
 		this.scanExpiringOfferedHtlcs(blockHeight);
+		// The swap provider looks before the held sweeper: a claim seen this
+		// block settles its hold before the sweeper could judge it (#737).
+		if (this.swapProvider) {
+			void this.swapProvider.onBlock(blockHeight);
+		}
 		this.scanExpiringHeldHtlcs(blockHeight);
 		this.asyncPaymentManager.scan(blockHeight);
 		this.scanForwardTimeouts(blockHeight);
@@ -23128,6 +23360,7 @@ export class LightningNode extends EventEmitter {
 			jitReceive?: INodeConfig['jitReceive'];
 			jitReceiveClient?: INodeConfig['jitReceiveClient'];
 			directFunding?: INodeConfig['directFunding'];
+			swaps?: INodeConfig['swaps'];
 			fforSettle?: INodeConfig['fforSettle'];
 			fforWitness?: INodeConfig['fforWitness'];
 			fforIssuer?: INodeConfig['fforIssuer'];
@@ -23195,6 +23428,7 @@ export class LightningNode extends EventEmitter {
 			jitReceive: options?.jitReceive,
 			jitReceiveClient: options?.jitReceiveClient,
 			directFunding: options?.directFunding,
+			swaps: options?.swaps,
 			fforSettle: options?.fforSettle,
 			fforWitness: options?.fforWitness,
 			fforIssuer: options?.fforIssuer,

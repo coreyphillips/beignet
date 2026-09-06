@@ -182,20 +182,89 @@ still without running a swap:
 `INodeConfig.swaps.enabled` builds and rehydrates the ledger at construction;
 `swapChain()` and `getSwapKeyDeriver()` are the node's seams for an engine.
 
-## Remaining provider work
+## Reverse swap provider
 
-Issue 737 remains open for the durable provider engines and integrations:
+`ReverseSwapProvider` (`reverse-engine.ts`) serves the Lightning-to-on-chain
+direction. A node runs it with `INodeConfig.swaps.enabled` (daemon:
+`BEIGNET_SWAPS=true`); the engine takes a deps object of closures into the
+node and never touches chain or Lightning code of its own.
 
-- The reverse and submarine engines themselves: quotes, admission on the
-  committed snapshot, funding under the exposure policy, claim and refund
-  handling driven by the resolver, and settlement of the held payment only
-  once a preimage is known.
-- Integrate local-origin JIT channel creation and payment dispatch. Paying the
-  provider's own client's JIT invoice does not currently invoke the forwarded
-  HTLC interception path automatically.
-- Define wire/API schemas, authentication, rate limits and daemon/CLI
-  commands, then run crash, reorg, claim/refund race and full provider settlement
-  tests against real Lightning nodes.
+Wire protocol (custom message 44069, subtypes 48 to 53, TLV in `messages.ts`;
+even types required, odd optional):
+
+| Message | Carries |
+|---|---|
+| `SWAP_QUOTE_REQUEST` / `SWAP_QUOTE` | direction, amount; fee terms, limits, refund delta, confirmations, the fee on this amount and the invoice amount. Stateless. |
+| `SWAP_CREATE` / `SWAP_CREATE_ACK` | the client's payment hash, claim key, on-chain amount and fee ceiling; the swap id, hold invoice, refund key and height, contract script and address, and every amount. A refusal carries a typed reason. |
+| `SWAP_STATUS_REQUEST` / `SWAP_STATUS` | the provider's view of one swap, answered only to the peer that created it: state, funding outpoint and depth, the raw funding transaction, the winning resolution. |
+
+The client receives exactly `onchainAmountSat`; the invoice is that plus
+`totalFeeSat` (flat + ppm + the quoted funding miner fee). The swap id is
+derived from the peer and the hash, so an identical repeated create returns
+the same ack and any other reuse of a hash is refused. `verifyReverseSwapTerms`
+(`client.ts`) is the pure check a client runs before paying: it rebuilds the
+contract from its own hash and claim key plus the ack's refund key and height
+and requires the ack's script, address, invoice and amounts to agree.
+
+Lifecycle, every arrow a compare-and-swap on the ledger row, persisted BEFORE
+the action it licenses:
+
+```text
+CREATED  record inserted, then the hold invoice minted with a final CLTV of
+         refundDelta + resolution margin + the sweeper's margin + 8
+HELD     the COMPLETE committed set admitted through validateReverseSwapAdmission,
+         the sweeper's cancel height checked against the refund height, exposure
+         re-checked; a partial MPP set never funds
+FUNDING  attempt counted, then the funding transaction built by the wallet,
+         verified to pay the contract exactly, then its bytes recorded; a row
+         with bytes never builds a second transaction
+FUNDING_BROADCAST inputs pledged, bytes broadcast (retried per block on failure)
+FUNDED   funding confirmed to fundingConfirmations
+CLAIMED  a claim spend with a verified preimage at ANY depth, mempool included;
+         the preimage is recorded, only then settleHeldHtlc
+SETTLED  the hold released
+REFUND_PENDING at refundHeight + 1 with no claim: refund built to the node's
+         sweep destination, recorded, broadcast; rebuilt at a higher fee every
+         refundBumpIntervalBlocks while unconfirmed, never above the rate cap
+REFUNDED refund confirmed to resolutionConfirmations; ONLY NOW the hold is
+         cancelled
+EXPOSED  the node's own sweeper cancelled the hold while coins were on chain:
+         watching continues, the refund still recovers the coins, a late claim
+         still records its preimage, swap:exposed is emitted at error level
+CANCELLED / FAILED before any funds moved
+```
+
+Rules the engine never breaks: a hold is never cancelled because the refund
+height passed or a refund was broadcast; a claim beats a pending refund; a
+preimage from any source is retained; the funding transaction is never
+fee-bumped. A restart redoes the owed action of every unresolved row exactly
+once (`startSwapProvider`).
+
+Residual risks an operator accepts: a reorg deeper than
+`resolutionConfirmations` after REFUNDED; a funding transaction stuck under
+fee with no replacement; a chain stall long enough that the sweeper's cancel
+height arrives before the refund resolves (bounded by the admission margins,
+never eliminated); no fee estimate fails quotes closed rather than guessing.
+
+Daemon: `GET /swaps/status`, `GET /swaps`, `POST /swaps/cancel` (CREATED or
+HELD only); env `BEIGNET_SWAPS`, `BEIGNET_SWAP_FLAT_FEE_SAT`,
+`BEIGNET_SWAP_FEE_PPM`, `BEIGNET_SWAP_MIN_SAT`, `BEIGNET_SWAP_MAX_SAT`,
+`BEIGNET_SWAP_MAX_EXPOSURE_SAT`, `BEIGNET_SWAP_MAX_CONCURRENT`,
+`BEIGNET_SWAP_REFUND_DELTA_BLOCKS`, `BEIGNET_SWAP_FUNDING_CONFS`,
+`BEIGNET_SWAP_RESOLUTION_CONFS`; events `swap:created`, `swap:held`,
+`swap:funding`, `swap:funded`, `swap:claimed`, `swap:settled`,
+`swap:refund-broadcast`, `swap:refunded`, `swap:hold-cancelled`,
+`swap:exposed`, `swap:failed`.
+
+## Remaining work
+
+Issue 737 remains open for:
+
+- The submarine direction (on-chain to Lightning): the engine over the
+  outgoing expiry ceiling and `awaitPaymentResolution`, funding discovery
+  through the resolver's candidates, and the local-origin JIT dispatch
+  (paying the provider's own client's JIT invoice does not invoke the
+  forwarded HTLC interception path automatically).
 - Design Taproot separately. A key-path witness does not reveal the preimage;
   cooperative claims require a preimage exchange and signing protocol with nonce
   handling and recovery. This P2WSH implementation does not implement that

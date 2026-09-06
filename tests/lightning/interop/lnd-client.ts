@@ -400,6 +400,18 @@ export class LndRestClient {
 
 	// ── Wallet ──
 
+	/** Every payment, in flight ones included (GET /v1/payments). */
+	async listPayments(): Promise<{
+		payments: Array<{
+			payment_hash: string;
+			status: string;
+			payment_preimage?: string;
+			failure_reason?: string;
+		}>;
+	}> {
+		return this.request('GET', '/v1/payments?include_incomplete=true');
+	}
+
 	async walletBalance(): Promise<ILndWalletBalance> {
 		return this.request('GET', '/v1/balance/blockchain');
 	}

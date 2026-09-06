@@ -230,6 +230,7 @@ import {
 	TChannelFundingQuote,
 	DirectFundingConfigInfo,
 	JitStatusInfo,
+	SwapsStatusInfo,
 	JitQuoteInfo
 } from './types';
 
@@ -337,6 +338,22 @@ export interface BeignetNodeOptions {
 		maxClientFundingSats?: number;
 		maxConcurrentFundings?: number;
 		maxTotalFundingSats?: number;
+	};
+	/**
+	 * Reverse swap provider (issue #737): on only with enabled === true. The
+	 * numbers are whole sats/blocks; unset ones keep the library defaults.
+	 */
+	swaps?: {
+		enabled?: boolean;
+		flatFeeSat?: number;
+		feePpm?: number;
+		minSat?: number;
+		maxSat?: number;
+		maxExposureSat?: number;
+		maxConcurrent?: number;
+		refundDeltaBlocks?: number;
+		fundingConfs?: number;
+		resolutionConfs?: number;
 	};
 	/**
 	 * Relay direct-funding frames for OTHER nodes (BEIGNET_DF_RELAY, issue
@@ -2262,6 +2279,57 @@ export class BeignetNode extends EventEmitter {
 								: {})
 					  }
 					: undefined,
+			// Reverse swap provider (issue #737): the role runs only when the
+			// operator says enabled; every other field is optional and the
+			// library's defaults answer for what is left unset.
+			swaps:
+				opts.swaps?.enabled === true
+					? {
+							enabled: true,
+							...(opts.swaps.flatFeeSat !== undefined ||
+							opts.swaps.feePpm !== undefined
+								? {
+										fee: {
+											...(opts.swaps.flatFeeSat !== undefined
+												? { flatFeeSat: BigInt(opts.swaps.flatFeeSat) }
+												: {}),
+											...(opts.swaps.feePpm !== undefined
+												? { feePpm: opts.swaps.feePpm }
+												: {})
+										}
+								  }
+								: {}),
+							exposure: {
+								...(opts.swaps.minSat !== undefined
+									? { minSwapSat: BigInt(opts.swaps.minSat) }
+									: {}),
+								...(opts.swaps.maxSat !== undefined
+									? { maxSwapSat: BigInt(opts.swaps.maxSat) }
+									: {}),
+								...(opts.swaps.maxExposureSat !== undefined
+									? { maxTotalExposureSat: BigInt(opts.swaps.maxExposureSat) }
+									: {}),
+								...(opts.swaps.maxConcurrent !== undefined
+									? { maxConcurrentSwaps: opts.swaps.maxConcurrent }
+									: {})
+							},
+							confirmations: {
+								...(opts.swaps.fundingConfs !== undefined
+									? { fundingConfirmations: opts.swaps.fundingConfs }
+									: {}),
+								...(opts.swaps.resolutionConfs !== undefined
+									? { resolutionConfirmations: opts.swaps.resolutionConfs }
+									: {})
+							},
+							...(opts.swaps.refundDeltaBlocks !== undefined
+								? {
+										timeouts: {
+											refundDeltaBlocks: opts.swaps.refundDeltaBlocks
+										}
+								  }
+								: {})
+					  }
+					: undefined,
 			jitReceiveClient:
 				opts.jitReceive?.maxFlatFeeSat !== undefined ||
 				opts.jitReceive?.maxFeePpm !== undefined
@@ -2843,6 +2911,10 @@ export class BeignetNode extends EventEmitter {
 		// receiver has to be listening before an offer arrives for a request
 		// minted before the last restart.
 		await this.startDirectFunding();
+
+		// 12c. Reverse swap provider (issue #737): redo the owed actions from
+		// the rehydrated ledger; needs the chain source and the node up.
+		await this.node.startSwapProvider();
 
 		// 13. Recover any funds stranded at the funding-key fallback address from
 		// past force-close sweeps (sessions where no wallet address was available).
@@ -7481,6 +7553,46 @@ export class BeignetNode extends EventEmitter {
 	 * committed right now. Satoshi figures are numbers; every cap is bounded
 	 * by the config validation to the safe-integer range.
 	 */
+	// ─────────────── Reverse swap provider (issue #737) ───────────────
+
+	getSwapsStatus(): SwapsStatusInfo {
+		const status = this.node.getSwapStatus();
+		if (!status.enabled) return { enabled: false };
+		return {
+			enabled: true,
+			fee: {
+				flatFeeSat: Number(status.fee.flatFeeSat),
+				feePpm: status.fee.feePpm
+			},
+			limits: {
+				minSwapSat: Number(status.limits.minSwapSat),
+				maxSwapSat: Number(status.limits.maxSwapSat),
+				maxTotalExposureSat: Number(status.limits.maxTotalExposureSat),
+				maxConcurrentSwaps: status.limits.maxConcurrentSwaps
+			},
+			timeouts: status.timeouts,
+			counts: status.counts,
+			exposedSat: Number(status.exposedSat),
+			exposedCount: status.exposedCount
+		};
+	}
+
+	/** The swap ledger, JSON-safe as stored (no private key is ever in it). */
+	listSwaps(id?: string): Record<string, unknown>[] {
+		const rows = this.node.listSwaps();
+		return (id ? rows.filter((r) => r.id === id) : rows).map((r) => ({ ...r }));
+	}
+
+	cancelSwap(id: string): { ok: boolean; reason?: string } {
+		if (typeof id !== 'string' || !/^[0-9a-f]{32}$/.test(id)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'id must be a 16-byte hex swap id'
+			);
+		}
+		return this.node.cancelSwap(id);
+	}
+
 	getJitStatus(): JitStatusInfo {
 		const ceilings = this.node.getJitClientCeilings();
 		const manager = this.node.getJitReceiveManager();
@@ -8231,6 +8343,8 @@ export class BeignetNode extends EventEmitter {
 		// that may already be broadcast. Shutting down under one loses the only
 		// response the caller has, and it falls back to a second payment.
 		if ((this.directFundingSender?.inFlight() ?? 0) > 0) return true;
+		// A swap whose funding or refund is owed to the network must see it out.
+		if ((this.node.getSwapProvider()?.inFlightFundings() ?? 0) > 0) return true;
 		const payments = this.node.listPayments();
 		return payments.some((p) => p.status === 'PENDING');
 	}

@@ -666,6 +666,7 @@ node.on('channel:force-closing', ({ channelId, initiator }) => { ... }); // our 
 node.on('channel:closed', ({ channelId }) => { ... });
 node.on('channel:resolved', ({ channelId }) => { ... }); // terminal: every on-chain output of the close irrevocably swept
 node.on('htlc:forwarded', ({ inChannelId, outChannelId, amountInMsat, amountOutMsat, feeMsat }) => { ... }); // a forward settled (msat values as strings)
+node.on('swap:funded', ({ swapId, paymentHash, state, onchainSat, fundingHeight }) => { ... }); // reverse swap provider (issue #737); also swap:created, swap:held, swap:funding, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed
 node.on('htlc:fulfilled', ({ channelId, htlcId }) => { ... }); // an HTLC we offered was fulfilled
 node.on('htlc:failed', ({ channelId, htlcId }) => { ... });
 node.on('peer:connect', ({ pubkey }) => { ... });
@@ -1122,6 +1123,7 @@ not repeat a 4xx unchanged.
 | `SPLICE_BUSY` | Channels | 503 | The channel would splice but is held off by a state that ends on its own; retry the same request |
 | `PEER_NOT_CONNECTED` | Peers | 409 | Peer is not connected |
 | `JIT_REFUSED` | Invoices | 400 | JIT receive: the LSP declined the intent, quoted above the wallet's ceiling, or answered with no intercept scid; the message carries the reason |
+| `SWAP_NOT_CANCELLABLE` | Swaps | 409 | Reverse swap provider: the swap is past CREATED/HELD, so it resolves on chain by claim or refund and cannot be cancelled |
 | `JIT_TIMEOUT` | Invoices | 504 | JIT receive: the LSP never answered the intent inside the ack window (retryable) |
 | `CONNECT_FAILED` | Peers | 502 | Dialing the peer failed |
 | `CONNECT_TIMEOUT` | Peers | 504 | The peer did not answer the dial in time |
@@ -1799,6 +1801,14 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT` | LSP role: most this node fronts for ONE client, open or splice (default 1000000; a partly numeric value refuses startup) |
 | `BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS` | LSP role: fundings (opens plus splices) allowed in flight at once, an integer in 0..1000 (default 3). With the per-client cap this bounds what is committed at any instant |
 | `BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT` | LSP role: lifetime budget of sats this node may ever front, counted across restarts (default unset, meaning no lifetime budget: exposure at any instant is bounded by the two caps above) |
+| `BEIGNET_SWAPS` | Reverse swap provider role (issue #737): a peer pays this node a hold invoice, this node funds a P2WSH contract the peer claims on chain, and the claim's preimage settles the hold (`true`/`false`, default off: the role locks THIS node's coins in contracts for peers) |
+| `BEIGNET_SWAP_FLAT_FEE_SAT` | Flat part of the swap fee, sats (default 0) |
+| `BEIGNET_SWAP_FEE_PPM` | Proportional part of the swap fee in millionths of the on-chain amount (default 0). The quoted funding miner fee is added to both |
+| `BEIGNET_SWAP_MIN_SAT` / `BEIGNET_SWAP_MAX_SAT` | Smallest and largest on-chain amount served (defaults 10000 / 1000000) |
+| `BEIGNET_SWAP_MAX_EXPOSURE_SAT` | Most principal this node will have at risk on chain across unresolved swaps at once (default 5000000) |
+| `BEIGNET_SWAP_MAX_CONCURRENT` | Unresolved swaps allowed at once, unpaid ones included (default 8) |
+| `BEIGNET_SWAP_REFUND_DELTA_BLOCKS` | Blocks from create to the contract's refund height (default 144). The hold invoice's final CLTV is derived from it so a paid hold always outlives the refund |
+| `BEIGNET_SWAP_FUNDING_CONFS` / `BEIGNET_SWAP_RESOLUTION_CONFS` | Depth the funding needs before it counts, and depth a claim or refund needs before it is the outcome (defaults 1 / 3). A claim settles the hold at any depth, the mempool included; a refund cancels it only at this depth |
 | `BEIGNET_DF_RELAY` | Relay direct-funding frames for OTHER nodes (`true`/`false`, default off). Paying and being paid needs nothing switched on; this is work done for strangers, metered but not free |
 | `BEIGNET_DF_MIN_AMOUNT` | Smallest direct-funding offer this node serves, a whole number of satoshis. Clamps up to the 5000 sat protocol floor; a partly numeric value refuses startup |
 
@@ -1922,6 +1932,9 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/jit/invoice` | `{ lspPubkey, amountSats?, description?, expirySecs?, targetRemainingInboundSat?, maxFlatFeeSat?, maxFeePpm? }` | Create an invoice payable with no channel: registers a receive intent with the LSP, which funds a channel mid-payment and deducts the quoted opening fee. Returns the invoice plus `flatFeeSat` and `feePpm` |
 | GET | `/jit/status` | -- | The JIT receive role as it stands: `enabled`, the client ceilings, and (when on) `lsp` with the opening fee, the exposure caps, sats reserved and fronted, live intents, held HTLCs and fundings in flight. Readonly scope |
 | GET | `/jit/quote` | `?lspPubkey=&amountSats=&targetRemainingInboundSat=` | Price a JIT receive at that LSP without registering an intent: `accepted`, a plain-language `reason` when declined, `flatFeeSat`, `feePpm`, `feeSats` on this amount, `fundingSats` the LSP would front, `maxClientFundingSats`, and `withinCeilings` against this node's own limits. The LSP must be connected (409 `PEER_NOT_CONNECTED`, 504 `JIT_TIMEOUT`). Readonly scope |
+| GET | `/swaps/status` | -- | Reverse swap provider (issue #737): `enabled`, and when on the fee terms, exposure caps, timing, swaps per state and `exposedSat` at risk on chain. Readonly scope |
+| GET | `/swaps` | `?id=<hex>` | The swap ledger (or one swap): state, contract terms, funding, refund and resolution facts; amounts as decimal strings, no private key. Readonly scope |
+| POST | `/swaps/cancel` | `{ id }` | Cancel a swap before any funds moved (CREATED or HELD): closes its hold invoice and answers `{ id, cancelled: true }`. A funded swap resolves on chain by claim or refund (409 `SWAP_NOT_CANCELLABLE`). Admin scope |
 | POST | `/direct-funding/configure` | `{ lspPubkey?, lspHost?, lspPort?, targetInboundSat?, trusted?, allowSplice?, minAmountSat? }` | Set the direct-funding policy. A partial MERGE, never a replace: a field the body does not name keeps its value. `trusted` lets an open go zero-conf; `allowSplice` lets a paired payer grow the existing channel with the liquidity peer instead of opening a second one (anonymous payers always get a new confirmed channel). `minAmountSat` clamps up to the 5000 sat floor and the response reports the clamped value. Returns the full effective config |
 | GET | `/direct-funding/config` | -- | Read the effective policy; `lspPubkey` is null when no liquidity peer is set, in which case no offer is served |
 | POST | `/direct-funding/request` | `{ host?, port?, amountSats? }` | Mint a payment request: returns `{ paymentHash, expiresAt, request }`, where `request` is the base64url envelope a payer pays (BIP 21 parameter `bgnq`). `host`/`port` are the address a payer can reach this node on and are used exactly as given |

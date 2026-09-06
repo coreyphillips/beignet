@@ -240,6 +240,26 @@ export interface InvoiceInfo {
  * null when the role is off (BEIGNET_JIT_RECEIVE unset); the client ceilings
  * apply either way.
  */
+/** GET /swaps/status: the reverse swap provider's terms and live exposure. */
+export interface SwapsStatusInfo {
+	enabled: boolean;
+	fee?: { flatFeeSat: number; feePpm: number };
+	limits?: {
+		minSwapSat: number;
+		maxSwapSat: number;
+		maxTotalExposureSat: number;
+		maxConcurrentSwaps: number;
+	};
+	timeouts?: {
+		refundDeltaBlocks: number;
+		fundingConfirmations: number;
+		resolutionConfirmations: number;
+	};
+	counts?: Record<string, number>;
+	exposedSat?: number;
+	exposedCount?: number;
+}
+
 export interface JitStatusInfo {
 	/** Whether this node runs the LSP role (fronts channel funding for peers). */
 	enabled: boolean;
@@ -765,6 +785,22 @@ export interface BeignetConfig {
 		maxClientFundingSats?: number;
 		maxConcurrentFundings?: number;
 		maxTotalFundingSats?: number;
+	};
+	/** Reverse swap provider (issue #737): BEIGNET_SWAPS exact 'true'/'false'
+	 *  switches the role on; the rest name its fee, its exposure caps and its
+	 *  timing. Whole integers; anything else refuses startup. Off by default:
+	 *  the role locks this node's own coins in on-chain contracts for peers. */
+	swaps?: {
+		enabled?: boolean;
+		flatFeeSat?: number;
+		feePpm?: number;
+		minSat?: number;
+		maxSat?: number;
+		maxExposureSat?: number;
+		maxConcurrent?: number;
+		refundDeltaBlocks?: number;
+		fundingConfs?: number;
+		resolutionConfs?: number;
 	};
 	/** Relay direct-funding frames for OTHER nodes (BEIGNET_DF_RELAY, exact
 	 *  'true'/'false'). Off by default: forwarding opaque frames between
@@ -1300,6 +1336,20 @@ export interface BeignetNodeEvents {
 	'ffor:witness-released': (data: Record<string, unknown>) => void;
 	'ffor:issuer-provisioned': (data: Record<string, unknown>) => void;
 	'ffor:issuer-issued': (data: Record<string, unknown>) => void;
+	// Reverse swap provider (issue #737): swapId, paymentHash (hex), state,
+	// onchainSat and invoiceMsat (decimal strings), refundHeight, plus the
+	// transition's own facts (funding txid, claim txid, refund txid, reason).
+	'swap:created': (data: Record<string, unknown>) => void;
+	'swap:held': (data: Record<string, unknown>) => void;
+	'swap:funding': (data: Record<string, unknown>) => void;
+	'swap:funded': (data: Record<string, unknown>) => void;
+	'swap:claimed': (data: Record<string, unknown>) => void;
+	'swap:settled': (data: Record<string, unknown>) => void;
+	'swap:refund-broadcast': (data: Record<string, unknown>) => void;
+	'swap:refunded': (data: Record<string, unknown>) => void;
+	'swap:hold-cancelled': (data: Record<string, unknown>) => void;
+	'swap:exposed': (data: Record<string, unknown>) => void;
+	'swap:failed': (data: Record<string, unknown>) => void;
 	/**
 	 * JIT receive, LSP side (issue #669). Relayed JSON-safe: every satoshi and
 	 * millisatoshi figure is a decimal string. `jit:intent` is a wallet's

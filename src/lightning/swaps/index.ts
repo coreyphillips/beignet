@@ -5,3 +5,6 @@ export * from './keys';
 export * from './ledger';
 export * from './exposure';
 export * from './chain-resolver';
+export * from './messages';
+export * from './client';
+export * from './reverse-engine';
