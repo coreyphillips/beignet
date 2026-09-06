@@ -13,10 +13,11 @@
  * reserved for it in `BeignetCustomSubtype`, sealed by `frames.ts`. Subtype 20
  * (`funding_abort`) stays reserved and unimplemented.
  *
- * One addition past rev 2: the ownership proof may be carried as a Bitcoin
- * signed message (odd type 21 on funding_offer) so that a wallet whose
- * signer will not sign a raw digest, a node's signing RPC or a hardware
- * wallet, can still prove its coin. See `IDfOwnershipProof.messageProof`.
+ * Two additions past rev 2: the ownership proof may be carried as a Bitcoin
+ * signed message (odd type 21 on funding_offer) for a wallet whose signer
+ * signs messages, or as a signature over an unbroadcastable probe
+ * transaction (odd type 23) for a wallet that can only sign transactions
+ * (Core Lightning). See `IDfOwnershipProof`.
  *
  * TLV convention here: even types are the required fields, odd types the
  * optional ones, so a later revision can add an optional field without
@@ -24,6 +25,7 @@
  */
 
 import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
 import { decodeTlvStream, encodeTlvStream, ITlvRecord } from '../message/tlv';
 import {
 	ByteReader,
@@ -75,6 +77,20 @@ export interface IDfOwnershipProof {
 	 * before anything is negotiated, which is the correct outcome there.
 	 */
 	messageProof?: { pubkey: Buffer; signature: Buffer };
+	/**
+	 * The statement proved a third way, for a wallet that can only sign a
+	 * transaction (Core Lightning's signpsbt, Core's walletprocesspsbt, a
+	 * hardware wallet without message signing): a real signature by the
+	 * coin's key over `ownershipProbeTransaction`, a transaction that spends
+	 * the coin but can never be broadcast because its second input spends an
+	 * outpoint that does not exist (BIP 322's to_spend idea). 64 bytes: r||s
+	 * of an ECDSA SIGHASH_ALL signature for P2WPKH, a Schnorr SIGHASH_DEFAULT
+	 * signature by the output key for P2TR. `pubkey` is the 33-byte P2WPKH
+	 * key (the witness needs it); all zeros for P2TR, whose key is in the
+	 * script. Carried in an odd TLV like the message form, with the same
+	 * older-receiver behaviour.
+	 */
+	probeProof?: { pubkey: Buffer; signature: Buffer };
 }
 
 /** A Bitcoin signed-message compact signature: recovery header, r, s. */
@@ -260,10 +276,20 @@ const OFFER_TYPES = {
 	ownershipPubkey: 18n,
 	ownershipSignature: 20n,
 	/** Odd: optional, skipped by a receiver that does not know it. */
-	ownershipMessageProof: 21n
+	ownershipMessageProof: 21n,
+	/** Odd: the probe-transaction form. */
+	ownershipProbeProof: 23n
 };
 
 const MESSAGE_PROOF_BYTES = DF_NODE_ID_BYTES + DF_MESSAGE_SIGNATURE_BYTES;
+const PROBE_PROOF_BYTES = DF_NODE_ID_BYTES + COMPACT_SIG_BYTES;
+
+function probeProofBytes(proof: { pubkey: Buffer; signature: Buffer }): Buffer {
+	return Buffer.concat([
+		fixed(proof.pubkey, DF_NODE_ID_BYTES, 'ownership probe pubkey'),
+		fixed(proof.signature, COMPACT_SIG_BYTES, 'ownership probe signature')
+	]);
+}
 
 function messageProofBytes(proof: {
 	pubkey: Buffer;
@@ -330,6 +356,14 @@ export function encodeDfOffer(o: IDfOffer): Buffer {
 						value: messageProofBytes(o.ownership.messageProof)
 					}
 			  ]
+			: []),
+		...(o.ownership.probeProof
+			? [
+					{
+						type: OFFER_TYPES.ownershipProbeProof,
+						value: probeProofBytes(o.ownership.probeProof)
+					}
+			  ]
 			: [])
 	]);
 }
@@ -369,7 +403,21 @@ export function decodeDfOffer(data: Buffer): IDfOffer {
 				COMPACT_SIG_BYTES,
 				'ownership signature'
 			),
-			...decodeMessageProof(f.get(OFFER_TYPES.ownershipMessageProof))
+			...decodeMessageProof(f.get(OFFER_TYPES.ownershipMessageProof)),
+			...decodeProbeProof(f.get(OFFER_TYPES.ownershipProbeProof))
+		}
+	};
+}
+
+function decodeProbeProof(value: Buffer | undefined): {
+	probeProof?: { pubkey: Buffer; signature: Buffer };
+} {
+	if (value === undefined) return {};
+	const bytes = fixed(value, PROBE_PROOF_BYTES, 'ownership probe proof');
+	return {
+		probeProof: {
+			pubkey: Buffer.from(bytes.subarray(0, DF_NODE_ID_BYTES)),
+			signature: Buffer.from(bytes.subarray(DF_NODE_ID_BYTES))
 		}
 	};
 }
@@ -808,6 +856,66 @@ export function ownershipDigest(
 		.update(ownershipMessage(offerId, txid, vout, amountSat), 'utf8')
 		.digest();
 }
+
+/**
+ * The transaction a probe proof signs. Deterministic from the offer, so the
+ * receiver rebuilds it byte for byte. Input 0 is the offered coin, exactly
+ * as the funding will spend it (the offer's sequence). Input 1 is the
+ * poison: it spends output 0 of a "transaction" whose id is a hash of the
+ * offer id under a fixed tag, an id with no known preimage, so no such
+ * output exists and a transaction spending it is invalid everywhere and
+ * forever. Both signature schemes commit to every input, so the signature
+ * cannot be lifted into a transaction that omits the poison. The one
+ * output is an OP_RETURN of the offer id, value zero.
+ *
+ * The poison's prevout is defined too (value 0, an OP_RETURN), because a
+ * taproot sighash commits to every prevout's value and script.
+ */
+export function ownershipProbeTransaction(
+	offerId: Buffer,
+	txid: Buffer,
+	vout: number,
+	sequence: number,
+	coinScript: Buffer,
+	coinValueSat: bigint
+): {
+	tx: bitcoin.Transaction;
+	prevouts: { scripts: Buffer[]; values: bigint[] };
+} {
+	fixed(offerId, DF_OFFER_ID_BYTES, 'offer id');
+	fixed(txid, TXID_BYTES, 'txid');
+	const tx = new bitcoin.Transaction();
+	tx.version = 2;
+	tx.locktime = 0;
+	tx.addInput(Buffer.from(txid).reverse(), vout, sequence);
+	tx.addInput(ownershipProbePoisonTxid(offerId), 0, sequence);
+	tx.addOutput(
+		Buffer.concat([Buffer.from([0x6a, DF_OFFER_ID_BYTES]), offerId]),
+		0
+	);
+	return {
+		tx,
+		prevouts: {
+			scripts: [coinScript, DF_PROBE_POISON_SCRIPT],
+			values: [coinValueSat, 0n]
+		}
+	};
+}
+
+/** The poison input's "txid", as the input's hash field carries it. */
+export function ownershipProbePoisonTxid(offerId: Buffer): Buffer {
+	return crypto
+		.createHash('sha256')
+		.update('lfbw-direct-funding-poison', 'utf8')
+		.update(offerId)
+		.digest();
+}
+
+/** OP_RETURN "lfbw-poison": what the poison input is defined to spend. */
+export const DF_PROBE_POISON_SCRIPT = Buffer.concat([
+	Buffer.from([0x6a, 0x0b]),
+	Buffer.from('lfbw-poison', 'utf8')
+]);
 
 const BITCOIN_MESSAGE_PREFIX = Buffer.from('Bitcoin Signed Message:\n', 'utf8');
 

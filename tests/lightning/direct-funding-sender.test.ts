@@ -18,7 +18,8 @@ import {
 	encodeDfOfferAck,
 	encodeDfReceipt,
 	IDfOffer,
-	ownershipMessage
+	ownershipMessage,
+	ownershipProbeTransaction
 } from '../../src/lightning/direct-funding/messages';
 import {
 	DirectFundingError,
@@ -298,6 +299,77 @@ describe('Direct funding sender: the ownership proof form', () => {
 		expect(h.payments.list()[0].witnessSent).to.equal(undefined);
 		// Nothing left the device, so the coin is ours to offer again.
 		expect(h.wallet.listSpendable()).to.have.length(1);
+	});
+
+	it('a PSBT-only wallet proves with the probe transaction, and its key comes from the signature', async () => {
+		const h = harness();
+		h.wallet.signsProbes = true;
+		const coin = h.wallet.coins[0];
+		const result = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.status).to.equal('SIGNED_PENDING');
+		const offer = decodeDfOffer(
+			h.lane.sent.find(
+				(m) => m.subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER
+			)!.body
+		);
+		expect(offer.ownership.signature).to.deep.equal(Buffer.alloc(64));
+		expect(offer.ownership.messageProof).to.equal(undefined);
+		expect(offer.ownership.pubkey).to.deep.equal(coin.pubkey);
+		expect(offer.ownership.probeProof!.pubkey).to.deep.equal(coin.pubkey);
+		const { tx } = ownershipProbeTransaction(
+			offer.offerId,
+			offer.txid,
+			offer.vout,
+			offer.sequence,
+			coin.script,
+			coin.valueSat
+		);
+		const sighash = tx.hashForWitnessV0(
+			0,
+			bitcoin.payments.p2pkh({ pubkey: coin.pubkey }).output!,
+			Number(coin.valueSat),
+			bitcoin.Transaction.SIGHASH_ALL
+		);
+		expect(
+			ecc.verify(sighash, coin.pubkey, offer.ownership.probeProof!.signature)
+		).to.equal(true);
+	});
+
+	it('a taproot PSBT-only wallet proves with a Schnorr probe signature by the output key', async () => {
+		const h = harness({ kind: 'p2tr' });
+		h.wallet.signsProbes = true;
+		const coin = h.wallet.coins[0];
+		await h.sender.send(h.request.encoded, { amountSat: 100_000n });
+		const offer = decodeDfOffer(
+			h.lane.sent.find(
+				(m) => m.subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER
+			)!.body
+		);
+		expect(offer.ownership.probeProof!.pubkey).to.deep.equal(Buffer.alloc(33));
+		expect(offer.ownership.pubkey).to.have.length(32);
+		const { tx, prevouts } = ownershipProbeTransaction(
+			offer.offerId,
+			offer.txid,
+			offer.vout,
+			offer.sequence,
+			coin.script,
+			coin.valueSat
+		);
+		const sighash = tx.hashForWitnessV1(
+			0,
+			prevouts.scripts,
+			prevouts.values.map((v) => Number(v)),
+			bitcoin.Transaction.SIGHASH_DEFAULT
+		);
+		expect(
+			ecc.verifySchnorr(
+				sighash,
+				offer.ownership.pubkey,
+				offer.ownership.probeProof!.signature
+			)
+		).to.equal(true);
 	});
 
 	it('a digest-signing wallet carries no message proof', async () => {

@@ -110,6 +110,23 @@ export interface IDfCoinSigner {
 		| { pubkey: Buffer; signature: Buffer }
 		| Promise<{ pubkey: Buffer; signature: Buffer }>;
 	/**
+	 * The proof as a signature over `ownershipProbeTransaction` instead: a
+	 * transaction spending this coin that can never be broadcast. For a
+	 * wallet that can only sign transactions (Core Lightning's signpsbt, a
+	 * PSBT-only hardware wallet). Returns the 64-byte signature (r||s ECDSA
+	 * SIGHASH_ALL for P2WPKH, Schnorr SIGHASH_DEFAULT for P2TR) and the key
+	 * it is by: the 33-byte P2WPKH key, which such a wallet may only learn
+	 * from the signature it just made, so the engine takes it from here for
+	 * the offer's key field too; for P2TR the x-only output key. Consulted
+	 * only when `signOwnershipMessage` is absent.
+	 */
+	signOwnershipProbe?(
+		tx: bitcoin.Transaction,
+		prevouts: { scripts: Buffer[]; values: bigint[] }
+	):
+		| { pubkey: Buffer; signature: Buffer }
+		| Promise<{ pubkey: Buffer; signature: Buffer }>;
+	/**
 	 * The witness stack for our input. `prevouts` carries every input's script
 	 * and value because BIP 341 commits to all of them; a P2WPKH signer ignores
 	 * it. A remote signer (a node's RPC, a hardware wallet) answers

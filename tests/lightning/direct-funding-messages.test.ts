@@ -29,8 +29,11 @@ import {
 	encodeDfSignRequest,
 	encodeDfWitness,
 	bitcoinMessageHash,
+	DF_PROBE_POISON_SCRIPT,
 	ownershipDigest,
-	ownershipMessage
+	ownershipMessage,
+	ownershipProbePoisonTxid,
+	ownershipProbeTransaction
 } from '../../src/lightning/direct-funding';
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -176,6 +179,96 @@ describe('Direct funding: protocol messages', () => {
 					})
 				)
 			).to.throw(/ownership message signature must be 65 bytes/);
+		});
+
+		it('carries the probe-transaction proof in odd TLV 23, and builds the probe deterministically', () => {
+			const withProof = offer({
+				ownership: {
+					pubkey: OWNER_PUBKEY,
+					signature: Buffer.alloc(64),
+					probeProof: {
+						pubkey: OWNER_PUBKEY,
+						signature: Buffer.alloc(64, 0x07)
+					}
+				}
+			});
+			const bytes = encodeDfOffer(withProof);
+			expect(decodeDfOffer(bytes)).to.deep.equal(withProof);
+			const rev2Known = new Set([
+				0n,
+				2n,
+				4n,
+				6n,
+				8n,
+				10n,
+				12n,
+				14n,
+				16n,
+				18n,
+				20n
+			]);
+			expect(
+				decodeTlvStream(bytes, 0, rev2Known).records.some((r) => r.type === 23n)
+			).to.equal(true);
+			expect(() =>
+				encodeDfOffer(
+					offer({
+						ownership: {
+							pubkey: OWNER_PUBKEY,
+							signature: Buffer.alloc(64),
+							probeProof: { pubkey: OWNER_PUBKEY, signature: Buffer.alloc(65) }
+						}
+					})
+				)
+			).to.throw(/ownership probe signature must be 64 bytes/);
+
+			const script = Buffer.alloc(22, 0x33);
+			const a = ownershipProbeTransaction(
+				OFFER_ID,
+				TXID,
+				1,
+				0xfffffffd,
+				script,
+				400_000n
+			);
+			const b = ownershipProbeTransaction(
+				OFFER_ID,
+				TXID,
+				1,
+				0xfffffffd,
+				script,
+				400_000n
+			);
+			expect(a.tx.toBuffer()).to.deep.equal(b.tx.toBuffer());
+			expect(a.tx.ins).to.have.length(2);
+			expect(a.tx.ins[0].hash).to.deep.equal(Buffer.from(TXID).reverse());
+			expect(a.tx.ins[0].index).to.equal(1);
+			expect(a.tx.ins[0].sequence).to.equal(0xfffffffd);
+			// The poison: a spend of an outpoint with no preimage.
+			expect(a.tx.ins[1].hash).to.deep.equal(
+				ownershipProbePoisonTxid(OFFER_ID)
+			);
+			expect(a.tx.ins[1].index).to.equal(0);
+			expect(a.tx.outs).to.have.length(1);
+			expect(a.tx.outs[0].value).to.equal(0);
+			expect(a.tx.outs[0].script.subarray(0, 2)).to.deep.equal(
+				Buffer.from([0x6a, 16])
+			);
+			expect(a.tx.outs[0].script.subarray(2)).to.deep.equal(OFFER_ID);
+			expect(a.prevouts.scripts[1]).to.deep.equal(DF_PROBE_POISON_SCRIPT);
+			expect(a.prevouts.values).to.deep.equal([400_000n, 0n]);
+			// A different offer id is a different poison, so a probe signature
+			// never carries across offers.
+			expect(
+				ownershipProbeTransaction(
+					Buffer.alloc(16, 9),
+					TXID,
+					1,
+					0xfffffffd,
+					script,
+					400_000n
+				).tx.ins[1].hash
+			).to.not.deep.equal(a.tx.ins[1].hash);
 		});
 
 		it('requires the receipt hash', () => {

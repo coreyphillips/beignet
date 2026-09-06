@@ -144,6 +144,8 @@ export class FakeSenderWallet implements IDfSenderWallet {
 	 * same either way.
 	 */
 	signsMessages = false;
+	/** Prove ownership by signing the probe transaction, like a PSBT-only wallet. */
+	signsProbes = false;
 	/**
 	 * Answer every signing call asynchronously after this many ms, the way a
 	 * remote signer (a node's RPC) does; null keeps the signer synchronous.
@@ -227,9 +229,28 @@ export class FakeSenderWallet implements IDfSenderWallet {
 			: undefined;
 		if (known.kind === 'p2tr') {
 			const tweaked = taprootTweakPrivateKey(known.privkey, known.pubkey);
+			const signOwnershipProbe = this.signsProbes
+				? (
+						tx: bitcoin.Transaction,
+						prevouts: { scripts: Buffer[]; values: bigint[] }
+				  ) =>
+						later(() => ({
+							pubkey: Buffer.alloc(33),
+							signature: schnorrSign(
+								tx.hashForWitnessV1(
+									0,
+									prevouts.scripts,
+									prevouts.values.map((v) => Number(v)),
+									bitcoin.Transaction.SIGHASH_DEFAULT
+								),
+								tweaked
+							)
+						}))
+				: undefined;
 			return {
 				kind: 'p2tr',
 				...(signOwnershipMessage ? { signOwnershipMessage } : {}),
+				...(signOwnershipProbe ? { signOwnershipProbe } : {}),
 				// The x-only OUTPUT key: what the receiver lifts from the scriptPubKey
 				// and verifies the Schnorr proof under.
 				ownershipPubkey: getPublicKey(tweaked).subarray(1, 33),
@@ -249,9 +270,27 @@ export class FakeSenderWallet implements IDfSenderWallet {
 			};
 		}
 		const scriptCode = bitcoin.payments.p2pkh({ pubkey: known.pubkey }).output!;
+		const signOwnershipProbe = this.signsProbes
+			? (tx: bitcoin.Transaction) =>
+					later(() => ({
+						pubkey: known.pubkey,
+						signature: Buffer.from(
+							ecc.sign(
+								tx.hashForWitnessV0(
+									0,
+									scriptCode,
+									Number(known.valueSat),
+									bitcoin.Transaction.SIGHASH_ALL
+								),
+								known.privkey
+							)
+						)
+					}))
+			: undefined;
 		return {
 			kind: 'p2wpkh',
 			...(signOwnershipMessage ? { signOwnershipMessage } : {}),
+			...(signOwnershipProbe ? { signOwnershipProbe } : {}),
 			ownershipPubkey: known.pubkey,
 			signOwnership: (digest): Buffer =>
 				Buffer.from(ecc.sign(digest, known.privkey)),

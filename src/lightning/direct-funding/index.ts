@@ -39,6 +39,7 @@ export type {
 
 export {
 	DF_MESSAGE_SIGNATURE_BYTES,
+	DF_PROBE_POISON_SCRIPT,
 	attestationMessage,
 	bitcoinMessageHash,
 	decodeDfOffer,
@@ -55,7 +56,9 @@ export {
 	encodeDfSignRequest,
 	encodeDfWitness,
 	ownershipDigest,
-	ownershipMessage
+	ownershipMessage,
+	ownershipProbePoisonTxid,
+	ownershipProbeTransaction
 } from './messages';
 export type {
 	IDfAttestation,
