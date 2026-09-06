@@ -96,15 +96,31 @@ export interface IDfCoinSigner {
 	/** The offer's ownership proof: 64 bytes either way. */
 	signOwnership(digest: Buffer): Buffer;
 	/**
+	 * The proof as a Bitcoin signed message instead: a 65-byte compact
+	 * signature (recovery header, r, s) over `bitcoinMessageHash(message)`
+	 * by the coin's key, and that key, 33 bytes compressed (for a P2TR coin
+	 * the INTERNAL key). When present the engine uses it and writes zeros
+	 * into the digest signature, so `signOwnership` is never called: this is
+	 * how a wallet whose signer will not sign a raw digest (a node's signing
+	 * RPC, a hardware wallet) proves the coin.
+	 */
+	signOwnershipMessage?(
+		message: string
+	):
+		| { pubkey: Buffer; signature: Buffer }
+		| Promise<{ pubkey: Buffer; signature: Buffer }>;
+	/**
 	 * The witness stack for our input. `prevouts` carries every input's script
 	 * and value because BIP 341 commits to all of them; a P2WPKH signer ignores
-	 * it.
+	 * it. A remote signer (a node's RPC, a hardware wallet) answers
+	 * asynchronously; the engine re-checks that the exchange is still live
+	 * after the wait and before the witness is committed.
 	 */
 	signInput(
 		tx: bitcoin.Transaction,
 		inputIndex: number,
 		prevouts: { scripts: Buffer[]; values: bigint[] }
-	): Buffer[];
+	): Buffer[] | Promise<Buffer[]>;
 }
 
 export interface IDfSenderWallet {

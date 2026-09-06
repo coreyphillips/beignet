@@ -28,7 +28,9 @@ import {
 	encodeDfRelayFrame,
 	encodeDfSignRequest,
 	encodeDfWitness,
-	ownershipDigest
+	bitcoinMessageHash,
+	ownershipDigest,
+	ownershipMessage
 } from '../../src/lightning/direct-funding';
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -113,6 +115,67 @@ describe('Direct funding: protocol messages', () => {
 			expect(
 				decodeDfOffer(encodeDfOffer(taproot)).ownership.pubkey
 			).to.have.length(32);
+		});
+
+		it('carries the Bitcoin signed-message proof in an odd TLV an older decoder skips', () => {
+			const withProof = offer({
+				ownership: {
+					pubkey: OWNER_PUBKEY,
+					signature: Buffer.alloc(64),
+					messageProof: {
+						pubkey: OWNER_PUBKEY,
+						signature: Buffer.alloc(65, 0x1f)
+					}
+				}
+			});
+			const bytes = encodeDfOffer(withProof);
+			expect(decodeDfOffer(bytes)).to.deep.equal(withProof);
+			expect(
+				decodeDfOffer(encodeDfOffer(offer())).ownership.messageProof
+			).to.equal(undefined);
+			// Type 21 is odd: a decoder that knows only the rev 2 types walks past
+			// it and reads the zeroed digest signature, which it then declines.
+			const rev2Known = new Set([
+				0n,
+				2n,
+				4n,
+				6n,
+				8n,
+				10n,
+				12n,
+				14n,
+				16n,
+				18n,
+				20n
+			]);
+			const asRev2 = decodeTlvStream(bytes, 0, rev2Known).records;
+			expect(asRev2.some((r) => r.type === 21n)).to.equal(true);
+			expect(asRev2.find((r) => r.type === 20n)!.value).to.deep.equal(
+				Buffer.alloc(64)
+			);
+			// Present but the wrong width is refused, not ignored.
+			const truncated = encodeTlvStream(
+				decodeTlvStream(bytes).records.map((r) =>
+					r.type === 21n ? { type: r.type, value: r.value.subarray(0, 97) } : r
+				)
+			);
+			expect(codeOf(() => decodeDfOffer(truncated))).to.equal(
+				DirectFundingErrorCode.MALFORMED
+			);
+			expect(() =>
+				encodeDfOffer(
+					offer({
+						ownership: {
+							pubkey: OWNER_PUBKEY,
+							signature: Buffer.alloc(64),
+							messageProof: {
+								pubkey: OWNER_PUBKEY,
+								signature: Buffer.alloc(64)
+							}
+						}
+					})
+				)
+			).to.throw(/ownership message signature must be 65 bytes/);
 		});
 
 		it('requires the receipt hash', () => {
@@ -346,6 +409,43 @@ describe('Direct funding: protocol messages', () => {
 			expect(
 				deriveOfferId(Buffer.alloc(32, 0xa2), 1, 250_000n)
 			).to.not.deep.equal(OFFER_ID);
+		});
+
+		it('hashes a signed message the way Bitcoin Core does', () => {
+			// bitcoin-cli signmessage / verifymessage envelope: varstr prefix,
+			// varstr message, SHA256d. The same hash LND's SignMessageWithAddr
+			// signs (checked against lnd 0.20 for both address kinds).
+			const message = ownershipMessage(OFFER_ID, TXID, 1, 250_000n);
+			expect(ownershipDigest(OFFER_ID, TXID, 1, 250_000n)).to.deep.equal(
+				crypto.createHash('sha256').update(message, 'utf8').digest()
+			);
+			const prefix = Buffer.from('Bitcoin Signed Message:\n', 'utf8');
+			const body = Buffer.from(message, 'utf8');
+			const envelope = Buffer.concat([
+				Buffer.from([prefix.length]),
+				prefix,
+				Buffer.from([body.length]),
+				body
+			]);
+			const expected = crypto
+				.createHash('sha256')
+				.update(crypto.createHash('sha256').update(envelope).digest())
+				.digest();
+			expect(bitcoinMessageHash(message)).to.deep.equal(expected);
+			// A message past 252 bytes takes the three-byte length form.
+			const long = 'x'.repeat(300);
+			const longEnvelope = Buffer.concat([
+				Buffer.from([prefix.length]),
+				prefix,
+				Buffer.from([0xfd, 300 & 0xff, 300 >> 8]),
+				Buffer.from(long, 'utf8')
+			]);
+			expect(bitcoinMessageHash(long)).to.deep.equal(
+				crypto
+					.createHash('sha256')
+					.update(crypto.createHash('sha256').update(longEnvelope).digest())
+					.digest()
+			);
 		});
 
 		it('matches the draft ownership digest', () => {

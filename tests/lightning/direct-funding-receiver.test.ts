@@ -29,6 +29,7 @@ import {
 	IDfOfferOverrides,
 	IDfTestCoin,
 	LSP_PUBKEY,
+	makeBip86Coin,
 	makeCoin,
 	memoryStorage
 } from './helpers/df-receiver';
@@ -476,6 +477,82 @@ describe('Direct funding receiver: ownership proof (issue #612)', () => {
 			})
 		);
 		expect(h.lastAck()?.reason).to.equal('invalid taproot ownership signature');
+	});
+
+	it('accepts a P2WPKH proof signed as a Bitcoin signed message', async () => {
+		// What LND's SignMessageWithAddr, Core's signmessage and a hardware
+		// wallet produce: the digest field is zeros and the odd TLV carries the
+		// compact signature by the coin's key.
+		const h = harness();
+		await h.sendOffer(
+			buildOffer(h.payer.requestRecord, h.coin, { messageProof: true })
+		);
+		expect(h.acks()[0]).to.deep.equal({ accepted: true });
+	});
+
+	it('accepts a P2TR proof signed as a Bitcoin signed message by the internal key', async () => {
+		const coin = makeBip86Coin();
+		const h = harness();
+		h.node.publish(coin);
+		await h.sendOffer(
+			buildOffer(h.payer.requestRecord, coin, { messageProof: true })
+		);
+		expect(h.acks()[0]).to.deep.equal({ accepted: true });
+	});
+
+	it('applies the BIP 86 tweak itself: a raw-key taproot script is not what an internal key controls', async () => {
+		const h = harness({}, { coinKind: 'p2tr' });
+		await h.sendOffer(
+			buildOffer(h.payer.requestRecord, h.coin, { messageProof: true })
+		);
+		expect(h.lastAck()?.reason).to.equal(
+			'ownership message key does not control the offered coin'
+		);
+	});
+
+	it('ignores the recovery header of a message proof', async () => {
+		const h = harness();
+		await h.sendOffer(
+			buildOffer(h.payer.requestRecord, h.coin, {
+				messageProof: { header: 0x2a }
+			})
+		);
+		expect(h.acks()[0]).to.deep.equal({ accepted: true });
+	});
+
+	it('refuses a message proof by a key that does not control the coin', async () => {
+		const h = harness();
+		await h.sendOffer(
+			buildOffer(h.payer.requestRecord, h.coin, {
+				messageProof: { privkey: makeCoin().privkey }
+			})
+		);
+		expect(h.lastAck()?.reason).to.equal(
+			'ownership message key does not control the offered coin'
+		);
+	});
+
+	it('refuses a message proof whose signature does not verify', async () => {
+		const h = harness();
+		const forged = buildOffer(h.payer.requestRecord, h.coin, {
+			messageProof: true
+		});
+		forged.ownership.messageProof!.signature[20] ^= 0xff;
+		await h.sendOffer(forged);
+		expect(h.lastAck()?.reason).to.equal('invalid ownership message signature');
+	});
+
+	it('a receiver that predates the message form declines on the zeroed digest', async () => {
+		// The odd TLV is invisible to it, so all it sees is a digest signature
+		// of zeros: declined before anything is negotiated, nothing owed.
+		const h = harness();
+		const asRev2 = buildOffer(h.payer.requestRecord, h.coin, {
+			messageProof: true
+		});
+		delete asRev2.ownership.messageProof;
+		await h.sendOffer(asRev2);
+		expect(h.lastAck()?.reason).to.equal('invalid ownership signature');
+		expect(h.node.opens).to.have.length(0);
 	});
 
 	it('refuses a script kind it cannot classify', async () => {

@@ -14,13 +14,21 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
+import * as ecc from '@bitcoinerlab/secp256k1';
 import { computeScriptHash } from '../../chain/chain-watcher';
 import { verify as ecdsaVerify } from '../../crypto/ecdh';
 import { MAX_INTERACTIVE_TX_SEQUENCE } from '../../interactive-tx/validation';
 import { schnorrVerify } from '../../offer/schnorr';
 import { isValidShutdownScript } from '../../channel/validation';
 import { scriptKind } from '../../wallet/wallet-funding-provider';
-import { deriveOfferId, IDfOffer, ownershipDigest } from '../messages';
+import {
+	bitcoinMessageHash,
+	deriveOfferId,
+	DF_MESSAGE_SIGNATURE_BYTES,
+	IDfOffer,
+	ownershipDigest,
+	ownershipMessage
+} from '../messages';
 import {
 	DF_MAX_PREVOUTS,
 	DF_MAX_SCRIPT_BYTES,
@@ -114,6 +122,15 @@ export function offerFieldProblem(
  * bound the work; this bounds the waste, by refusing before a whole channel
  * session is spent on a coin the payer cannot spend.
  *
+ * Two proof forms are admitted over the same statement (`ownershipMessage`):
+ * the raw digest signature rev 2 specifies, and a Bitcoin signed-message
+ * compact signature, which is what a wallet's signing RPC produces for an
+ * address key (LND's SignMessageWithAddr, Core's signmessage, Electrum,
+ * hardware signers). When the offer carries the message form it is the one
+ * verified and the digest field is expected to be zeros; a receiver that
+ * predates the message form never sees it (odd TLV) and declines on the
+ * zeros, before any negotiation.
+ *
  * Rev 2 notes a final specification may adopt BIP 322 wholesale. We do not,
  * and only the two script kinds `scriptKind` classifies are admitted, because
  * they are exactly the two whose witnesses the channel can verify later.
@@ -124,6 +141,9 @@ export function ownershipProblem(
 ): string | null {
 	const kind = scriptKind(prevOutScript);
 	if (!kind) return 'unsupported input script';
+	if (offer.ownership.messageProof) {
+		return messageProofProblem(offer, prevOutScript, kind);
+	}
 	const digest = ownershipDigest(
 		offer.offerId,
 		offer.txid,
@@ -149,6 +169,57 @@ export function ownershipProblem(
 	return ecdsaVerify(digest, offer.ownership.pubkey, offer.ownership.signature)
 		? null
 		: 'invalid ownership signature';
+}
+
+/**
+ * The Bitcoin signed-message form. The proof names the 33-byte key that
+ * signed; the coin's script is what that key must control: by hash160 for a
+ * P2WPKH coin, and by the BIP 86 tweak for a P2TR coin, whose signing key is
+ * the INTERNAL key (the only one a wallet's message signer holds). The
+ * recovery header byte is carried for wallets that verify by recovery; with
+ * the key named, the signature is verified directly and the header is not
+ * consulted.
+ */
+function messageProofProblem(
+	offer: IDfOffer,
+	prevOutScript: Buffer,
+	kind: 'p2wpkh' | 'p2tr'
+): string | null {
+	const proof = offer.ownership.messageProof!;
+	if (proof.pubkey.length !== DF_NODE_ID_BYTES) {
+		return 'ownership message proof must name a 33-byte compressed key';
+	}
+	if (proof.signature.length !== DF_MESSAGE_SIGNATURE_BYTES) {
+		return 'ownership message signature must be 65 bytes';
+	}
+	if (kind === 'p2tr') {
+		const outputKey = prevOutScript.subarray(2, 2 + XONLY_PUBKEY_BYTES);
+		const internal = proof.pubkey.subarray(1, 1 + XONLY_PUBKEY_BYTES);
+		let tweaked: Uint8Array | null = null;
+		try {
+			// BIP 86: outputKey = internalKey + tagged_hash("TapTweak", internalKey) * G
+			tweaked =
+				ecc.xOnlyPointAddTweak(
+					internal,
+					bitcoin.crypto.taggedHash('TapTweak', internal)
+				)?.xOnlyPubkey ?? null;
+		} catch {
+			tweaked = null;
+		}
+		if (!tweaked || !Buffer.from(tweaked).equals(outputKey)) {
+			return 'ownership message key does not control the offered coin';
+		}
+	} else if (
+		!bitcoin.crypto.hash160(proof.pubkey).equals(prevOutScript.subarray(2, 22))
+	) {
+		return 'ownership message key does not control the offered coin';
+	}
+	const hash = bitcoinMessageHash(
+		ownershipMessage(offer.offerId, offer.txid, offer.vout, offer.amountSat)
+	);
+	return ecdsaVerify(hash, proof.pubkey, proof.signature.subarray(1))
+		? null
+		: 'invalid ownership message signature';
 }
 
 // ─────────────── Chain facts about the coin ───────────────

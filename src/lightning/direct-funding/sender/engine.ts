@@ -54,7 +54,8 @@ import {
 	IDfOffer,
 	IDfPrevout,
 	IDfSignRequest,
-	ownershipDigest
+	ownershipDigest,
+	ownershipMessage
 } from '../messages';
 import {
 	DirectFundingError,
@@ -513,14 +514,26 @@ export class DirectFundingSender {
 			changeScript,
 			maxTotalFeeSat,
 			receiptHash: env.receiptHash,
-			ownership: {
-				pubkey: signer.ownershipPubkey,
-				// The proof costs the receiver nothing to check and saves it a whole
-				// channel session on a coin we cannot actually spend.
-				signature: signer.signOwnership(
-					ownershipDigest(offerId, txid, coin.vout, amountSat)
-				)
-			}
+			// The proof costs the receiver nothing to check and saves it a whole
+			// channel session on a coin we cannot actually spend. A signer that
+			// signs messages rather than raw digests (a node's RPC, a hardware
+			// wallet) proves the same statement in the Bitcoin signed-message
+			// form; the digest field then carries zeros for receivers that
+			// predate the message form, which decline rather than negotiate.
+			ownership: signer.signOwnershipMessage
+				? {
+						pubkey: signer.ownershipPubkey,
+						signature: Buffer.alloc(64),
+						messageProof: await signer.signOwnershipMessage(
+							ownershipMessage(offerId, txid, coin.vout, amountSat)
+						)
+				  }
+				: {
+						pubkey: signer.ownershipPubkey,
+						signature: signer.signOwnership(
+							ownershipDigest(offerId, txid, coin.vout, amountSat)
+						)
+				  }
 		};
 		const offerBody = encodeDfOffer(offer);
 		const now = this.now();
@@ -1279,23 +1292,28 @@ export class DirectFundingSender {
 				.unfreezeUtxo(attempt.coin.txidHex, attempt.coin.vout)
 				.catch(() => undefined);
 		};
-		// The last await before the commit, and the last chance to notice. Nothing
-		// below this line yields, so a witness that gets past here is one the send
-		// is still waiting on.
 		if (ctl.settled()) {
 			await release();
 			return;
 		}
 
+		// A remote signer answers asynchronously, so this may yield: the
+		// liveness check is repeated after it. From that check on nothing below
+		// yields, so a witness that gets past it is one the send is still
+		// waiting on.
 		let witness: Buffer[];
 		try {
-			witness = attempt.signer.signInput(tx, inputIndex, {
+			witness = await attempt.signer.signInput(tx, inputIndex, {
 				scripts: request.prevouts.map((p: IDfPrevout) => p.script),
 				values: request.prevouts.map((p: IDfPrevout) => p.valueSat)
 			});
 		} catch (err) {
 			await release();
 			ctl.fail(asError(err));
+			return;
+		}
+		if (ctl.settled()) {
+			await release();
 			return;
 		}
 

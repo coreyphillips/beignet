@@ -28,6 +28,7 @@ import {
 	receiverLaneKeys,
 	sealFrame
 } from '../../../src/lightning/direct-funding/frames';
+import { bitcoinMessageHash } from '../../../src/lightning/direct-funding/messages';
 import {
 	attestationMessage,
 	decodeDfOffer,
@@ -137,6 +138,19 @@ export class FakeSenderWallet implements IDfSenderWallet {
 	tipHeight = 800_000;
 	/** Answer no signer for any coin, whatever the wallet still holds. */
 	signerMissing = false;
+	/**
+	 * Prove ownership as a Bitcoin signed message (the way LND's and Core's
+	 * signers do) rather than over the raw digest. The witness path is the
+	 * same either way.
+	 */
+	signsMessages = false;
+	/**
+	 * Answer every signing call asynchronously after this many ms, the way a
+	 * remote signer (a node's RPC) does; null keeps the signer synchronous.
+	 */
+	signDelayMs: number | null = null;
+	/** Make the asynchronous signer reject instead of answering. */
+	signRejects = false;
 	/** Prevouts a chain lookup will answer with, txid -> raw transaction. */
 	readonly chain = new Map<string, Buffer>();
 	chainFails = false;
@@ -190,50 +204,75 @@ export class FakeSenderWallet implements IDfSenderWallet {
 			(c) => c.txidHex === coin.txidHex && c.vout === coin.vout
 		);
 		if (!known) return null;
+		// A message signer signs with the coin's own key, the P2TR internal key
+		// included: the receiver applies the tweak itself.
+		const later = <T>(value: () => T): T | Promise<T> => {
+			if (this.signDelayMs === null) return value();
+			return new Promise<T>((resolve, reject) =>
+				setTimeout(() => {
+					if (this.signRejects) reject(new Error('the signer refused'));
+					else resolve(value());
+				}, this.signDelayMs!)
+			);
+		};
+		const signOwnershipMessage = this.signsMessages
+			? (message: string) =>
+					later(() => ({
+						pubkey: known.pubkey,
+						signature: Buffer.concat([
+							Buffer.from([0x1f]),
+							Buffer.from(ecc.sign(bitcoinMessageHash(message), known.privkey))
+						])
+					}))
+			: undefined;
 		if (known.kind === 'p2tr') {
 			const tweaked = taprootTweakPrivateKey(known.privkey, known.pubkey);
 			return {
 				kind: 'p2tr',
+				...(signOwnershipMessage ? { signOwnershipMessage } : {}),
 				// The x-only OUTPUT key: what the receiver lifts from the scriptPubKey
 				// and verifies the Schnorr proof under.
 				ownershipPubkey: getPublicKey(tweaked).subarray(1, 33),
 				signOwnership: (digest): Buffer => schnorrSign(digest, tweaked),
-				signInput: (tx, index, prevouts): Buffer[] => [
-					schnorrSign(
-						tx.hashForWitnessV1(
-							index,
-							prevouts.scripts,
-							prevouts.values.map((v) => Number(v)),
-							bitcoin.Transaction.SIGHASH_DEFAULT
-						),
-						tweaked
-					)
-				]
+				signInput: (tx, index, prevouts) =>
+					later(() => [
+						schnorrSign(
+							tx.hashForWitnessV1(
+								index,
+								prevouts.scripts,
+								prevouts.values.map((v) => Number(v)),
+								bitcoin.Transaction.SIGHASH_DEFAULT
+							),
+							tweaked
+						)
+					])
 			};
 		}
 		const scriptCode = bitcoin.payments.p2pkh({ pubkey: known.pubkey }).output!;
 		return {
 			kind: 'p2wpkh',
+			...(signOwnershipMessage ? { signOwnershipMessage } : {}),
 			ownershipPubkey: known.pubkey,
 			signOwnership: (digest): Buffer =>
 				Buffer.from(ecc.sign(digest, known.privkey)),
-			signInput: (tx, index): Buffer[] => [
-				bitcoin.script.signature.encode(
-					Buffer.from(
-						ecc.sign(
-							tx.hashForWitnessV0(
-								index,
-								scriptCode,
-								Number(known.valueSat),
-								bitcoin.Transaction.SIGHASH_ALL
-							),
-							known.privkey
-						)
+			signInput: (tx, index) =>
+				later(() => [
+					bitcoin.script.signature.encode(
+						Buffer.from(
+							ecc.sign(
+								tx.hashForWitnessV0(
+									index,
+									scriptCode,
+									Number(known.valueSat),
+									bitcoin.Transaction.SIGHASH_ALL
+								),
+								known.privkey
+							)
+						),
+						bitcoin.Transaction.SIGHASH_ALL
 					),
-					bitcoin.Transaction.SIGHASH_ALL
-				),
-				known.pubkey
-			]
+					known.pubkey
+				])
 		};
 	}
 

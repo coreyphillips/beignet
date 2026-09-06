@@ -11,11 +11,14 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
+import * as ecc from '@bitcoinerlab/secp256k1';
 import {
+	bitcoinMessageHash,
 	decodeDfOffer,
 	encodeDfOfferAck,
 	encodeDfReceipt,
-	IDfOffer
+	IDfOffer,
+	ownershipMessage
 } from '../../src/lightning/direct-funding/messages';
 import {
 	DirectFundingError,
@@ -229,6 +232,81 @@ describe('Direct funding sender: the happy path', () => {
 		expect(result.attested).to.equal(true);
 		expect(witness).to.have.length(1);
 		expect((witness as unknown as Buffer[])[0]).to.have.length(64);
+	});
+});
+
+describe('Direct funding sender: the ownership proof form', () => {
+	it('a message-signing wallet puts the proof in the odd TLV and zeros the digest field', async () => {
+		const h = harness();
+		h.wallet.signsMessages = true;
+		const coin = h.wallet.coins[0];
+		const result = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.status).to.equal('SIGNED_PENDING');
+		const offerBody = h.lane.sent.find(
+			(m) => m.subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER
+		)!.body;
+		const offer = decodeDfOffer(offerBody);
+		expect(offer.ownership.signature).to.deep.equal(Buffer.alloc(64));
+		expect(offer.ownership.messageProof!.pubkey).to.deep.equal(coin.pubkey);
+		expect(offer.ownership.messageProof!.signature).to.have.length(65);
+		expect(
+			ecc.verify(
+				bitcoinMessageHash(
+					ownershipMessage(
+						offer.offerId,
+						offer.txid,
+						offer.vout,
+						offer.amountSat
+					)
+				),
+				coin.pubkey,
+				offer.ownership.messageProof!.signature.subarray(1)
+			)
+		).to.equal(true);
+	});
+
+	it('a signer that answers asynchronously, like a node RPC, is awaited at both signing sites', async () => {
+		const h = harness();
+		h.wallet.signsMessages = true;
+		h.wallet.signDelayMs = 15;
+		const result = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.attested).to.equal(true);
+		const record = h.payments.list()[0];
+		expect(record.witnessSent).to.equal(true);
+		expect(record.witness).to.have.length(2);
+	});
+
+	it('a signer that refuses asynchronously fails the send with the coin released', async () => {
+		const h = harness();
+		h.wallet.signDelayMs = 5;
+		h.wallet.signRejects = true;
+		let caught: unknown;
+		try {
+			await h.sender.send(h.request.encoded, { amountSat: 100_000n });
+		} catch (err) {
+			caught = err;
+		}
+		expect(String((caught as Error).message)).to.match(/the signer refused/);
+		expect(h.payments.list()[0].witnessSent).to.equal(undefined);
+		// Nothing left the device, so the coin is ours to offer again.
+		expect(h.wallet.listSpendable()).to.have.length(1);
+	});
+
+	it('a digest-signing wallet carries no message proof', async () => {
+		const h = harness();
+		await h.sender.send(h.request.encoded, { amountSat: 100_000n });
+		const offer = decodeDfOffer(
+			h.lane.sent.find(
+				(m) => m.subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER
+			)!.body
+		);
+		expect(offer.ownership.messageProof).to.equal(undefined);
+		expect(offer.ownership.signature.every((b) => b === 0)).to.equal(false);
 	});
 });
 

@@ -26,10 +26,12 @@ import {
 	IDfSenderLane
 } from '../../../src/lightning/direct-funding/frames';
 import {
+	bitcoinMessageHash,
 	deriveOfferId,
 	encodeDfOffer,
 	encodeDfWitness,
 	ownershipDigest,
+	ownershipMessage,
 	IDfOffer
 } from '../../../src/lightning/direct-funding/messages';
 import {
@@ -108,6 +110,55 @@ export function makeCoin(
 	};
 }
 
+/**
+ * A P2TR coin whose script is the BIP 86 tweak of its key, i.e. what a real
+ * wallet's taproot address is. `makeCoin('p2tr')` puts the raw key in the
+ * script (no tweak) because the digest proof signs with the output key
+ * directly; the message proof is by the INTERNAL key and the receiver
+ * applies the tweak, so it needs the real thing.
+ */
+export function makeBip86Coin(valueSat = 100_000): IDfTestCoin {
+	const privkey = crypto.randomBytes(32);
+	const pubkey = getPublicKey(privkey);
+	const script = bitcoin.payments.p2tr({
+		internalPubkey: pubkey.subarray(1, 33)
+	}).output!;
+	const prevTx = new bitcoin.Transaction();
+	prevTx.version = 2;
+	prevTx.addInput(crypto.randomBytes(32), 0);
+	prevTx.addOutput(script, valueSat);
+	return {
+		prevTx,
+		txidHex: prevTx.getId(),
+		vout: 0,
+		valueSat: BigInt(valueSat),
+		script,
+		privkey,
+		pubkey,
+		kind: 'p2tr'
+	};
+}
+
+/**
+ * Sign the ownership statement the way a wallet's message signer does:
+ * compact ECDSA over the Bitcoin signed-message hash, recovery header first.
+ * The header is what Core-style verifiers recover the key from; the receiver
+ * has the key named and does not read it, so any of 27..42 will do.
+ */
+export function signOwnershipMessageLikeAWallet(
+	privkey: Buffer,
+	message: string,
+	header = 0x1f
+): { pubkey: Buffer; signature: Buffer } {
+	return {
+		pubkey: getPublicKey(privkey),
+		signature: Buffer.concat([
+			Buffer.from([header]),
+			sign(bitcoinMessageHash(message), privkey)
+		])
+	};
+}
+
 // ─────────────── Offers ───────────────
 
 export interface IDfOfferOverrides {
@@ -119,6 +170,12 @@ export interface IDfOfferOverrides {
 	offerId?: Buffer;
 	ownershipSignature?: Buffer;
 	ownershipPubkey?: Buffer;
+	/**
+	 * Prove ownership as a Bitcoin signed message by this key (default the
+	 * coin's own), with a zeroed digest signature, as a message-signing
+	 * wallet would.
+	 */
+	messageProof?: boolean | { privkey?: Buffer; header?: number };
 }
 
 export function buildOffer(
@@ -132,9 +189,22 @@ export function buildOffer(
 		overrides.offerId ?? deriveOfferId(txid, coin.vout, amountSat);
 	const digest = ownershipDigest(offerId, txid, coin.vout, amountSat);
 	const isTaproot = coin.kind === 'p2tr';
+	const messageProof = overrides.messageProof
+		? signOwnershipMessageLikeAWallet(
+				(typeof overrides.messageProof === 'object' &&
+					overrides.messageProof.privkey) ||
+					coin.privkey,
+				ownershipMessage(offerId, txid, coin.vout, amountSat),
+				typeof overrides.messageProof === 'object'
+					? overrides.messageProof.header
+					: undefined
+		  )
+		: undefined;
 	const signature =
 		overrides.ownershipSignature ??
-		(isTaproot
+		(messageProof
+			? Buffer.alloc(64)
+			: isTaproot
 			? schnorrSign(digest, coin.privkey)
 			: sign(digest, coin.privkey));
 	return {
@@ -153,8 +223,9 @@ export function buildOffer(
 		ownership: {
 			pubkey:
 				overrides.ownershipPubkey ??
-				(isTaproot ? coin.pubkey.subarray(1, 33) : coin.pubkey),
-			signature
+				(isTaproot ? coin.script.subarray(2, 34) : coin.pubkey),
+			signature,
+			...(messageProof ? { messageProof } : {})
 		}
 	};
 }
