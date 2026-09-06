@@ -573,7 +573,7 @@ LightningNode              High-level API (EventEmitter)
 </details>
 
 <details>
-<summary><b>Module reference (24 modules under <code>src/lightning/</code>)</b></summary>
+<summary><b>Module reference (<code>src/lightning/</code>)</b></summary>
 
 | Module | Description |
 |--------|-------------|
@@ -598,6 +598,7 @@ LightningNode              High-level API (EventEmitter)
 | `recovery/` | Safety transition layer: atomic persistence, the durable outbound-message outbox, the opt-in hash-chained recovery journal, and the peer_storage Recovery Capsule |
 | `liquidity/` | JIT channel receive (LSP role): intercept SCIDs, held HTLCs, zero-conf open or splice, then forward |
 | `direct-funding/` | Third-party direct funding: the signed payment request envelope, sealed frames, protocol messages, outstanding-request store, the transport registry with its direct-peer, onion and blind-relay lanes, the receiver engine that turns a payer's offered UTXO into channel funding, and the payer engine that verifies and signs it |
+| `swaps/` | Submarine swap foundations: P2WSH HTLC scripts, claim/refund transactions, preimage extraction, and timeout and amount policies |
 | `l402/` | L402 (Lightning HTTP 402) client: challenge parsing, macaroon reading, paid credentials |
 | `node/` | LightningNode orchestrator, the main protocol-layer entry point |
 | `wallet/` | WalletFundingProvider, adapts the on-chain Wallet for auto-funded opens |
