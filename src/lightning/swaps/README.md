@@ -1,0 +1,192 @@
+# Swap foundations
+
+`import { swaps } from 'beignet/lightning'` exposes P2WSH contract construction,
+signed claim/refund transactions, verified preimage extraction and pure admission
+checks. These primitives are the first implementation phase of
+[issue 737](https://github.com/coreyphillips/beignet/issues/737). They do not run a
+swap provider, hold invoices, pay invoices, fund outputs, persist a swap or
+broadcast a transaction.
+
+## Contract and transaction invariants
+
+The same contract works for either direction; claim and refund identify the
+on-chain signing roles:
+
+```text
+OP_IF
+    OP_SIZE 32 OP_EQUALVERIFY
+    OP_SHA256 <paymentHash> OP_EQUALVERIFY
+    <claimPublicKey> OP_CHECKSIG
+OP_ELSE
+    <refundHeight> OP_CHECKLOCKTIMEVERIFY OP_DROP
+    <refundPublicKey> OP_CHECKSIG
+OP_ENDIF
+```
+
+`buildSwapHtlc` accepts a 32-byte SHA256 payment hash, valid compressed secp256k1
+public keys and an integer refund height from 1 through 499,999,999. It returns the
+witness script, P2WSH output script and address for the supplied Bitcoin network
+(mainnet by default). The preimage length is enforced by Script, including when
+a shorter or longer secret hashes to the committed payment hash.
+
+The claim witness is `[signature, preimage, 01, witnessScript]`. The refund
+witness is `[signature, empty, witnessScript]`. **The preimage branch has no
+expiry.** Reaching the refund height enables a competing spend; it does not
+disable claims. CLTV and transaction finality are defined in
+[BIP65](https://github.com/bitcoin/bips/blob/master/bip-0065.mediawiki).
+
+`buildSwapClaimTx` and `buildSwapRefundTx` each take the full funding transaction,
+its output index, the contract terms, an absolute fee in satoshis, a destination
+script and the branch's private key. They verify the selected funding script
+against the canonical contract and derive the input value and outpoint from
+that transaction. Funding values and fees must be positive integers within
+Bitcoin's money range; a wrong branch key is refused.
+
+Both builders produce one input, one output, version 2, sequence `0xfffffffd`
+and a low-S ECDSA `SIGHASH_ALL` signature using
+[BIP143](https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki). The claim
+uses locktime zero. The refund uses locktime `refundHeight`, so its first
+eligible block is **refundHeight + 1**. A refund can be prepared before maturity.
+Sequence enables CLTV and fee replacement without introducing a relative lock.
+
+Destinations are limited to native P2WPKH, P2WSH and P2TR scripts. The retained
+output must be at least 294 sat for P2WPKH or 330 sat for P2WSH/P2TR. These are
+conventional dust floors for
+[Bitcoin Core's 3,000 sat/kvB dust relay policy](https://github.com/bitcoin/bitcoin/blob/master/src/policy/policy.cpp), not fee estimates or
+guarantees of relay under every node's settings. Callers must select appropriate
+fees and validate destination ownership themselves. Fee replacement is possible
+by rebuilding and signing, but no fee management service is included.
+
+```ts
+import * as bitcoin from 'bitcoinjs-lib';
+import { swaps } from 'beignet/lightning';
+
+// contract, fundingHex, claimKey, preimage and destinationScript come from
+// authenticated local swap state. Confirm funding with a trusted chain source.
+const funding = {
+    htlc: contract,
+    fundingTransaction: bitcoin.Transaction.fromHex(fundingHex),
+    outputIndex: 0
+};
+const claim = swaps.buildSwapClaimTx({
+    ...funding,
+    destinationScript,
+    feeSatoshis: 1_000n,
+    privateKey: claimKey,
+    preimage
+});
+```
+
+`extractSwapPreimage(transaction, funding)` returns a copy of the preimage only
+for the exact expected output, canonical script and minimal claim selector,
+matching 32-byte hash preimage, and valid low-S claim signature bound to the
+funding value. Extraction supports `SIGHASH_ALL`, `SIGHASH_NONE` and
+`SIGHASH_SINGLE`, each optionally combined with `SIGHASH_ANYONECANPAY`, because
+the claimant can choose any of these independently of the builders' defaults.
+It locates the input even in a multi-input
+transaction and refuses duplicate spends of the expected output. Unrelated,
+malformed, refund or invalidly signed witnesses return `undefined`. Invalid
+expected funding data throws. Undefined sighash values and other script forms
+are outside this API.
+
+Extraction is not a transaction consensus validator or proof of publication,
+inclusion, unspentness or confirmations. Validate chain status separately. Do not
+treat a caller-supplied funding transaction or observed spending transaction as
+trusted merely because these helpers accepted it.
+
+**An `undefined` result does not establish that the preimage was never
+revealed.** A preimage can also become known through an invalid transaction,
+an unsupported witness or an off-chain message. A future provider must retain
+every hash-matching preimage it learns and separately establish the winning
+on-chain resolution; it must never cancel a held payment merely because this
+helper returned `undefined`.
+
+## Direction-specific admission
+
+All time inputs are block heights/counts. There are no default safety margins;
+operators must derive budgets for their chain, fee policy, confirmation/reorg
+policy and Lightning behavior. Equality at the outer deadline is refused to
+leave a full-block boundary.
+
+| Direction | Provider's role | Required order |
+| --- | --- | --- |
+| Submarine | Pays Lightning, claims client's BTC | `refundHeight > latestOutgoingHtlcExpiry + claimSafetyBlocks` |
+| Reverse | Holds Lightning, funds BTC for client | `earliestIncomingExpiry - holdCancelSafetyBlocks > refundHeight + resolutionSafetyBlocks` |
+
+`validateSubmarineSwapAdmission` also requires funding to meet an explicitly
+positive confirmation requirement and the outgoing expiry bound to remain in
+the future. `latestOutgoingHtlcExpiry` must be an **enforced maximum across every
+attempt and MPP part**. A wall-clock `payInvoice` timeout is not that bound, and
+does not prove that outgoing HTLCs failed. The claim margin must include enough
+time to obtain a late preimage and confirm the provider's claim.
+
+`validateReverseSwapAdmission` checks an exact full invoice amount across unique,
+positive committed HTLC parts with the expected payment hash. The parts must be
+irrevocably committed according to authoritative local channel state, with
+channel-id/HTLC-id identifiers; this function cannot establish commitment from
+caller-supplied data. The earliest part expiry controls the budget, including
+the Lightning node's actual early automatic hold cancellation margin. The helper
+also requires `refundHeight > currentHeight + fundingSafetyBlocks`. It returns
+the earliest effective cancellation height only as a planning bound.
+
+`resolutionSafetyBlocks` must cover the first eligible refund block, confirmation
+and reorg policy, and time to settle Lightning after a competing claim reveals
+the preimage. Funding must never be admitted on an individual hold event when
+the invoice has only a partial MPP amount.
+
+**Admission is not permission to cancel a reverse hold.** A refund deadline,
+payment timeout or refund broadcast is insufficient. A future engine must keep
+the hold and chain observer coordinated until it has durably recorded the
+winning on-chain resolution with its configured confirmation/reorg policy. It
+must handle late claims, including claims racing a replacement refund. If the
+node can automatically cancel before that resolution, funding must be refused.
+No finite margin guarantees safety through arbitrary chain stalls or deep
+reorganizations; the engine needs an explicit risk policy and operational limits.
+
+## Remaining provider work
+
+Issue 737 remains open for the durable provider engines and integrations:
+
+- Persist quotes, funding leases, pending Lightning attempts, preimages and
+  claim/refund state before corresponding external actions; recover idempotently
+  after crashes, concurrent events and node restarts.
+- Expose complete committed held-invoice MPP sets and actual per-part absolute
+  expiries; integrate the hold scanner's early cancellation deadline with swap
+  admission and settlement.
+- Enforce outgoing CLTV limits and reconcile unresolved attempts instead of
+  equating a wall-clock payment failure with a terminal HTLC outcome.
+- Validate quoted amounts, fees and confirmed chain funding; watch all spends,
+  persist the winning resolution, renew funding leases, manage replacement fees
+  and handle reorgs and late preimages.
+- Integrate local-origin JIT channel creation and payment dispatch. Paying the
+  provider's own client's JIT invoice does not currently invoke the forwarded
+  HTLC interception path automatically.
+- Define wire/API schemas, authentication, rate limits, storage and daemon/CLI
+  commands, then run crash, reorg, claim/refund race and full provider settlement
+  tests against real Lightning nodes.
+- Design Taproot separately. A key-path witness does not reveal the preimage;
+  cooperative claims require a preimage exchange and signing protocol with nonce
+  handling and recovery. This P2WSH implementation does not implement that
+  protocol or claim compatibility with an existing swap service.
+
+## Verification
+
+`tests/lightning/swaps.test.ts` covers invalid keys, lengths, hashes, amounts,
+fees, heights, witness mutations, exact MPP accounting and timeout boundaries.
+`tests/lightning/fixtures/swaps/p2wsh.json` pins test-only keys, synthetic funding,
+script/address, signatures and signed transactions. BIP143 digest serialization
+is cross-checked independently of bitcoinjs transaction hashing in the test.
+The fixture is a reproducible regression vector, not a live funding transaction.
+
+`tests/lightning/interop/swap-p2wsh-mempool.test.ts` uses Bitcoin Core regtest to
+verify real funded spends with `testmempoolaccept`, the exact refund finality
+boundary, claim validity after expiry, confirmed refund consumption, invalid
+signatures and CLTV bypass attempts, and hash-matching 31/33-byte secrets that
+must still fail Script execution. It also accepts and extracts claims with all
+six defined ECDSA sighash combinations. It skips if Core is absent unless
+`REQUIRE_SWAP_REGTEST=1` is set, which makes missing infrastructure fail the run.
+
+```sh
+npx mocha --exit --timeout 20000 -r ts-node/register tests/lightning/swaps.test.ts
+REQUIRE_SWAP_REGTEST=1 npx mocha --exit --timeout 120000 -r ts-node/register tests/lightning/interop/swap-p2wsh-mempool.test.ts
+```

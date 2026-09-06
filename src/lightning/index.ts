@@ -23,3 +23,4 @@ export * as recovery from './recovery';
 export * as liquidity from './liquidity';
 export * as directFunding from './direct-funding';
 export * as l402 from './l402';
+export * as swaps from './swaps';
