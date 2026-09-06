@@ -257,6 +257,36 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			);
 		});
 
+		it('refuses a hash the node already holds a record for, before anything is written', async function () {
+			const h = await harness();
+			const swap = clientSwap();
+			h.holds.inUse.add(swap.paymentHash.toString('hex'));
+			const ack = await create(h, swap);
+			expect(ack.accepted).to.equal(false);
+			expect(ack.reason).to.equal(SwapRefusalReason.DUPLICATE_HASH);
+			expect(h.ledger.list()).to.have.length(0);
+			expect(h.holds.invoices.size).to.equal(0);
+		});
+
+		it('refuses every quote and create while the refund destination is not native segwit', async function () {
+			const p2sh = Buffer.concat([
+				Buffer.from([0xa9, 0x14]),
+				crypto.randomBytes(20),
+				Buffer.from([0x87])
+			]);
+			const h = await harness({ destination: p2sh });
+			const q = await quote(h, 50_000n);
+			expect(q.accepted).to.equal(false);
+			expect(q.reason).to.equal(SwapRefusalReason.INTERNAL);
+			const ack = await create(h, clientSwap());
+			expect(ack.accepted).to.equal(false);
+			expect(ack.reason).to.equal(SwapRefusalReason.INTERNAL);
+			expect(h.ledger.list()).to.have.length(0);
+			expect(
+				h.logs.some((l) => l.action === 'swap_refund_destination_unusable')
+			).to.equal(true);
+		});
+
 		it('fails closed when the hold invoice cannot be minted, with the row recorded first', async function () {
 			const h = await harness();
 			h.holds.failCreate = true;
@@ -463,6 +493,39 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			]);
 		});
 
+		it('a claim with a non-canonical witness still yields its preimage and settles', async function () {
+			const h = await harness();
+			const { swap } = await fundedSwap(h);
+			const claim = claimTxFor(record(h, swap), swap);
+			// MINIMALIF byte 0x02 and a high-S signature: consensus-valid when
+			// mined by a lenient pool, never relayed by standard nodes.
+			const witness = claim.ins[0].witness;
+			witness[2] = Buffer.from([0x02]);
+			const sig = bitcoin.script.signature.decode(witness[0]);
+			const s = Buffer.from(sig.signature.subarray(32));
+			const n = BigInt(
+				'0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141'
+			);
+			const highS = (n - BigInt('0x' + s.toString('hex')))
+				.toString(16)
+				.padStart(64, '0');
+			witness[0] = bitcoin.script.signature.encode(
+				Buffer.concat([
+					sig.signature.subarray(0, 32),
+					Buffer.from(highS, 'hex')
+				]),
+				sig.hashType
+			);
+			claim.setWitness(0, witness);
+			h.chain.place(claim, 1001);
+			await h.engine.onBlock(1001);
+			const r = record(h, swap);
+			expect(r.state).to.equal('SETTLED');
+			expect(r.preimageHex).to.equal(swap.preimage.toString('hex'));
+			expect(h.holds.settled).to.have.length(1);
+			expect(h.holds.cancelled).to.have.length(0);
+		});
+
 		it('persists the preimage before settling, and a settle that finds nothing parked marks the swap exposed', async function () {
 			const h = await harness();
 			const { swap } = await fundedSwap(h);
@@ -630,7 +693,8 @@ describe('Reverse swap provider engine (issue #737)', function () {
 	});
 
 	describe('exposure by the node', function () {
-		it('a sweeper cancel before broadcast fails the swap and releases the pledge', async function () {
+		it('a sweeper cancel with signed bytes exposes the swap and keeps the pledge; without bytes it fails', async function () {
+			// Bytes exist, the broadcast threw: they may be out all the same.
 			const h = await harness();
 			h.chain.failBroadcasts = 1;
 			const swap = clientSwap();
@@ -645,10 +709,63 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(record(h, swap).state).to.equal('FUNDING');
 			h.holds.sweep(swap.paymentHash);
 			await settle();
-			expect(record(h, swap).state).to.equal('FAILED');
-			expect(h.wallet.released).to.deep.equal([record(h, swap).fundingTxHex]);
+			expect(record(h, swap).state).to.equal('EXPOSED');
+			expect(h.wallet.released).to.have.length(0);
+			expect(h.logs.some((l) => l.action === 'swap_exposed')).to.equal(true);
+			// Still watched: the refund recovers the coins once the bytes show.
+			h.chain.place(
+				bitcoin.Transaction.fromHex(record(h, swap).fundingTxHex!),
+				1001
+			);
+			h.chain.height = record(h, swap).refundHeight + 1;
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).refundTxHex).to.be.a('string');
+
+			// No bytes were ever built: nothing left, the swap fails.
+			const h2 = await harness();
+			h2.wallet.failBuilds = 5;
+			const swap2 = clientSwap();
+			await create(h2, swap2);
+			const r2 = record(h2, swap2);
+			h2.holds.hold(
+				swap2.paymentHash,
+				BigInt(r2.invoiceMsat),
+				r2.refundHeight + 60
+			);
+			await settle();
+			expect(record(h2, swap2).state).to.equal('FUNDING');
+			expect(record(h2, swap2).fundingTxHex).to.equal(undefined);
+			h2.holds.sweep(swap2.paymentHash);
+			await settle();
+			expect(record(h2, swap2).state).to.equal('FAILED');
+			await h2.engine.onBlock(1001);
+			expect(h2.chain.broadcasts).to.have.length(0);
+		});
+
+		it('a broadcast that throws after relaying is judged by the chain, not the error', async function () {
+			const h = await harness();
+			h.chain.relayThenFail = 1;
+			const swap = clientSwap();
+			await create(h, swap);
+			const r = record(h, swap);
+			h.holds.hold(
+				swap.paymentHash,
+				BigInt(r.invoiceMsat),
+				r.refundHeight + 60
+			);
+			await settle();
+			expect(record(h, swap).state).to.equal('FUNDING_BROADCAST');
+			expect(
+				h.logs.some(
+					(l) => l.action === 'swap_funding_seen_after_failed_broadcast'
+				)
+			).to.equal(true);
+			// The claim on that funding is seen and settles the hold.
+			const claim = claimTxFor(record(h, swap), swap);
+			h.chain.place(claim, 0);
 			await h.engine.onBlock(1001);
-			expect(h.chain.broadcasts).to.have.length(0);
+			expect(record(h, swap).state).to.equal('SETTLED');
+			expect(h.holds.settled).to.have.length(1);
 		});
 
 		it('a sweeper cancel while funded exposes the swap; a later claim still records its preimage and the refund still runs', async function () {

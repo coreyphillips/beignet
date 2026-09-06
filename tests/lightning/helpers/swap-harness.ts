@@ -41,6 +41,8 @@ export class FakeSwapChain implements ISwapChainSource {
 	private readonly txs = new Map<string, Buffer>();
 	readonly broadcasts: string[] = [];
 	failBroadcasts = 0;
+	/** Broadcasts that relay the bytes and then throw (a dropped connection). */
+	relayThenFail = 0;
 
 	currentHeight(): number {
 		return this.height;
@@ -59,6 +61,11 @@ export class FakeSwapChain implements ISwapChainSource {
 		if (this.failBroadcasts > 0) {
 			this.failBroadcasts--;
 			throw new Error('broadcast refused');
+		}
+		if (this.relayThenFail > 0) {
+			this.relayThenFail--;
+			this.place(bitcoin.Transaction.fromHex(rawTxHex), 0);
+			throw new Error('connection dropped after relay');
 		}
 		this.broadcasts.push(rawTxHex);
 		const tx = bitcoin.Transaction.fromHex(rawTxHex);
@@ -131,6 +138,8 @@ export class FakeHolds {
 	failCreate = false;
 	settleReturns: boolean | undefined;
 	settleThrows = false;
+	/** Hashes the node already holds a record for (invoice, payment, hold). */
+	readonly inUse = new Set<string>();
 
 	constructor(
 		private readonly privkey: Buffer,
@@ -322,6 +331,8 @@ export async function harness(
 		nodeKey?: Buffer;
 		feeRate?: number | null;
 		start?: boolean;
+		/** The refund destination the engine is handed (default a P2WPKH). */
+		destination?: Buffer;
 	} = {}
 ): Promise<ISwapHarness> {
 	const net = options.net ?? new FakeDfNetwork();
@@ -359,8 +370,9 @@ export async function harness(
 	const state = {
 		feeRate: options.feeRate === undefined ? 2 : options.feeRate
 	};
-	const destination = bitcoin.payments.p2wpkh({ pubkey: getPublicKey(nodeKey) })
-		.output!;
+	const destination =
+		options.destination ??
+		bitcoin.payments.p2wpkh({ pubkey: getPublicKey(nodeKey) }).output!;
 	const deps: IReverseSwapProviderDeps = {
 		peers: provider,
 		ledger,
@@ -374,6 +386,7 @@ export async function harness(
 		),
 		createHoldInvoice: (o) => holds.createHoldInvoice(o),
 		heldSnapshot: (hash) => holds.snapshot(hash),
+		hashInUse: (hash) => holds.inUse.has(hash.toString('hex')),
 		settleHeld: (hash, preimage) => holds.settleHeld(hash, preimage),
 		cancelHold: (hash) => holds.cancelHold(hash),
 		onHeld: (cb) => {

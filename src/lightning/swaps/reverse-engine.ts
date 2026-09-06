@@ -161,6 +161,14 @@ export interface IReverseSwapProviderDeps {
 		description: string;
 	}): { bolt11: string };
 	heldSnapshot(paymentHash: Buffer): IHeldInvoiceSnapshot | null;
+	/**
+	 * True when the node already has ANY record under this hash: an
+	 * invoice, a payment it is sending or has sent, a parked hold. Minting
+	 * a hold invoice on such a hash would overwrite that record (a payment
+	 * we are sending would read as an unpaid incoming one), so a create on
+	 * it is refused as a duplicate before anything is written.
+	 */
+	hashInUse?(paymentHash: Buffer): boolean;
 	/** True when parked parts were released against the preimage. */
 	settleHeld(paymentHash: Buffer, preimage: Buffer): boolean;
 	/** Idempotent; a closed hash is not an error. */
@@ -601,6 +609,10 @@ export class ReverseSwapProvider extends EventEmitter {
 			);
 			return;
 		}
+		const destinationProblem = this.refundDestinationProblem();
+		if (destinationProblem) {
+			return refuse(SwapRefusalReason.INTERNAL, destinationProblem);
+		}
 		const fee = await this.quoteFee(req.amountSat);
 		if (!fee)
 			return refuse(SwapRefusalReason.CHAIN_UNAVAILABLE, 'no fee estimate');
@@ -686,12 +698,17 @@ export class ReverseSwapProvider extends EventEmitter {
 		}
 		if (
 			this.deps.ledger.byPaymentHash(hashHex).length > 0 ||
-			this.deps.heldSnapshot(req.paymentHash)
+			this.deps.heldSnapshot(req.paymentHash) ||
+			this.deps.hashInUse?.(req.paymentHash)
 		) {
 			return refuse(
 				SwapRefusalReason.DUPLICATE_HASH,
 				'this hash is already in use'
 			);
+		}
+		const destinationProblem = this.refundDestinationProblem();
+		if (destinationProblem) {
+			return refuse(SwapRefusalReason.INTERNAL, destinationProblem);
 		}
 		const createdByPeer = this.deps.ledger
 			.list()
@@ -927,14 +944,34 @@ export class ReverseSwapProvider extends EventEmitter {
 					break;
 				}
 				case 'FUNDING': {
-					// Nothing left the wallet: the transaction, if built, is
-					// dropped and its inputs released.
+					if (record.fundingTxHex) {
+						// Signed bytes exist, and a broadcast that threw may
+						// still have propagated: treat them as out. The row
+						// stays watched (a claim records its preimage, the
+						// refund recovers the coins) and its inputs stay
+						// pledged, so the wallet cannot double spend a funding
+						// that may be in the mempool.
+						const moved = this.deps.ledger.move(record.id, 'EXPOSED', patch);
+						if (moved.outcome === 'applied') {
+							this.deps.log('swap_exposed', {
+								swapId: record.id,
+								previousState: record.state,
+								reason,
+								onchainSat: record.onchainSat
+							});
+							this.emitSwap('swap:exposed', moved.record!, {
+								reason,
+								previousState: record.state
+							});
+						}
+						break;
+					}
+					// No bytes were ever built: nothing left the wallet.
 					const moved = this.deps.ledger.move(record.id, 'FAILED', {
 						...patch,
 						failureReason: `hold cancelled before broadcast (${reason})`
 					});
 					if (moved.outcome === 'applied') {
-						if (record.fundingTxHex) void this.release(record.fundingTxHex);
 						this.emitSwap('swap:failed', moved.record!, {
 							reason: moved.record!.failureReason
 						});
@@ -1126,6 +1163,63 @@ export class ReverseSwapProvider extends EventEmitter {
 		return undefined;
 	}
 
+	/**
+	 * The refund is the only way our coins come back when nobody claims,
+	 * and buildSwapRefundTx pays native segwit only. A wallet whose sweep
+	 * destination is anything else would leave every refund unbuildable
+	 * while the held payment is eventually swept back to the client, so no
+	 * swap is quoted or created for it (audit finding, 2026-09-06).
+	 */
+	private refundDestinationProblem(): string | undefined {
+		let script: Buffer;
+		try {
+			script = this.deps.refundDestinationScript();
+		} catch (err) {
+			return `refund destination unavailable: ${
+				err instanceof Error ? err.message : String(err)
+			}`;
+		}
+		const native =
+			Buffer.isBuffer(script) &&
+			((script.length === 22 && script[0] === 0x00 && script[1] === 20) ||
+				(script.length === 34 &&
+					(script[0] === 0x00 || script[0] === 0x51) &&
+					script[1] === 32));
+		if (!native) {
+			this.deps.log('swap_refund_destination_unusable', {
+				script: Buffer.isBuffer(script) ? script.toString('hex') : 'none'
+			});
+			return 'refund destination is not native segwit';
+		}
+		return undefined;
+	}
+
+	/**
+	 * A broadcast that threw may still have propagated: the backend can
+	 * drop the connection after relaying, and once the transaction is mined
+	 * every retry is refused as already known. The chain, not the error,
+	 * says whether the bytes left.
+	 */
+	private async fundingSeenOnChain(record: ISwapRecord): Promise<boolean> {
+		if (!record.fundingTxid || record.fundingVout === undefined) return false;
+		try {
+			const observation = await this.deps.resolver.observe({
+				htlc: htlcOf(record),
+				funding: { txid: record.fundingTxid, vout: record.fundingVout }
+			});
+			return (
+				observation.funding.kind === 'mempool' ||
+				observation.funding.kind === 'confirmed'
+			);
+		} catch (err) {
+			this.deps.log('swap_funding_lookup_failed', {
+				swapId: record.id,
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return false;
+		}
+	}
+
 	private async processFunding(record: ISwapRecord): Promise<void> {
 		let current = record;
 		if (current.state === 'HELD') {
@@ -1215,14 +1309,23 @@ export class ReverseSwapProvider extends EventEmitter {
 		try {
 			await this.deps.broadcast(current.fundingTxHex!);
 		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
 			this.deps.log('swap_funding_broadcast_failed', {
 				swapId: current.id,
-				error: err instanceof Error ? err.message : String(err)
+				error: message
 			});
-			this.deps.ledger.patch(current.id, {
-				lastError: err instanceof Error ? err.message : String(err)
+			// The error is not the verdict: the bytes may be out already
+			// (relayed before the connection dropped, or mined and refused
+			// as known). A funding the chain shows moves on to be watched,
+			// so the claim on it is seen and the hold settled.
+			if (!(await this.fundingSeenOnChain(current))) {
+				this.deps.ledger.patch(current.id, { lastError: message });
+				return;
+			}
+			this.deps.log('swap_funding_seen_after_failed_broadcast', {
+				swapId: current.id,
+				fundingTxid: current.fundingTxid
 			});
-			return;
 		}
 		const moved = this.deps.ledger.move(current.id, 'FUNDING_BROADCAST', {
 			fundingBroadcastAt: this.now(),
@@ -1254,8 +1357,6 @@ export class ReverseSwapProvider extends EventEmitter {
 		if (BigInt(out.value) !== BigInt(record.onchainSat)) {
 			return `funding output pays ${out.value} sat, expected ${record.onchainSat}`;
 		}
-		if (built.txHex.length / 2 > SWAP_MAX_FUNDING_TX_BYTES)
-			return 'funding transaction is too large';
 		return undefined;
 	}
 

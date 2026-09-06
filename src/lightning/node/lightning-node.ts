@@ -565,6 +565,12 @@ const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
  */
 export const HELD_HTLC_EXPIRY_MARGIN = 18;
 /**
+ * How long the held-HTLC sweep waits for the swap provider's per-block
+ * chain look before running anyway (#737 audit): long enough for an
+ * Electrum round trip, short against an 18-block margin.
+ */
+const SWAP_TICK_SWEEP_DEADLINE_MS = 30_000;
+/**
  * Bytes a held-forward ledger row reserves against the async receive
  * service's byte limits (issue #709), on top of the parked onion packet. A
  * fixed figure rather than the encoded length so the reservation does not
@@ -14285,6 +14291,14 @@ export class LightningNode extends EventEmitter {
 		if (externalHash && externalHash.length !== 32) {
 			throw new Error('paymentHash must be 32 bytes');
 		}
+		// An external hash must be new to this node. Writing an invoice under
+		// a hash we already hold a record for would replace that record: a
+		// payment we are sending would read as an unpaid incoming one, its
+		// fulfilment would never complete it, and a later cancel of the new
+		// invoice would mark it failed and lift the duplicate-send guard.
+		if (externalHash && this.paymentHashInUse(externalHash)) {
+			throw new Error('paymentHash is already in use by this node');
+		}
 		const preimage = externalHash ? undefined : crypto.randomBytes(32);
 		const paymentHash =
 			externalHash ?? crypto.createHash('sha256').update(preimage!).digest();
@@ -17262,6 +17276,37 @@ export class LightningNode extends EventEmitter {
 		// cancelHeldHtlc / the CLTV sweeper. Validation above (secret/cltv/amount)
 		// has already run, so a parked HTLC is known-good — it only awaits release.
 		if (isHold) {
+			// A parked set that already covers the invoice takes no further
+			// part. Every parked part shares the hash's fate in the expiry
+			// sweep, so one late part with a short expiry would otherwise
+			// drag a complete, already-acted-on set back to the payer.
+			const parked = this.heldHtlcs.get(hashHex) ?? [];
+			const alreadyParked = parked.some(
+				(h) => h.channelId.equals(channelId) && h.htlcId === htlcId
+			);
+			const parkedMsat = parked.reduce((sum, h) => sum + h.amountMsat, 0n);
+			if (
+				!alreadyParked &&
+				finalInvoice?.amountMsat &&
+				finalInvoice.amountMsat > 0n &&
+				parkedMsat >= finalInvoice.amountMsat
+			) {
+				this.emitStructuredLog('htlc', 'held_set_complete', {
+					paymentHash: hashHex,
+					parkedMsat: parkedMsat.toString(),
+					rejectedMsat: amountMsat.toString()
+				});
+				const reason = sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
 			this.parkHeldHtlc(
 				channelId,
 				htlcId,
@@ -17294,6 +17339,20 @@ export class LightningNode extends EventEmitter {
 			amountMsat: amountMsat.toString()
 		});
 		this.fulfillPayment(channelId, htlcId, paymentHash, preimage!);
+	}
+
+	/**
+	 * True when this node already holds any record under the hash: an
+	 * invoice, a payment record in either direction, or a parked hold.
+	 */
+	paymentHashInUse(paymentHash: Buffer): boolean {
+		const hashHex = paymentHash.toString('hex');
+		return (
+			this.invoices.has(hashHex) ||
+			this.payments.has(hashHex) ||
+			this.heldInvoiceHashes.has(hashHex) ||
+			this.heldHtlcs.has(hashHex)
+		);
 	}
 
 	/**
@@ -22214,6 +22273,7 @@ export class LightningNode extends EventEmitter {
 					}).bolt11
 				}),
 				heldSnapshot: (paymentHash) => this.getHeldInvoiceSnapshot(paymentHash),
+				hashInUse: (paymentHash) => this.paymentHashInUse(paymentHash),
 				settleHeld: (paymentHash, preimage) =>
 					this.settleHeldHtlc(paymentHash, preimage),
 				cancelHold: (paymentHash) => {
@@ -22468,10 +22528,23 @@ export class LightningNode extends EventEmitter {
 		this.scanExpiringOfferedHtlcs(blockHeight);
 		// The swap provider looks before the held sweeper: a claim seen this
 		// block settles its hold before the sweeper could judge it (#737).
+		// The look is asynchronous (it reads the chain), so the sweep waits
+		// for it, bounded so a hung backend cannot hold the channel-safety
+		// sweep hostage.
 		if (this.swapProvider) {
-			void this.swapProvider.onBlock(blockHeight);
+			const provider = this.swapProvider;
+			void Promise.race([
+				provider.onBlock(blockHeight).catch(() => undefined),
+				new Promise<void>((resolve) => {
+					const t = setTimeout(resolve, SWAP_TICK_SWEEP_DEADLINE_MS);
+					t.unref?.();
+				})
+			]).then(() => {
+				if (!this._destroyed) this.scanExpiringHeldHtlcs(blockHeight);
+			});
+		} else {
+			this.scanExpiringHeldHtlcs(blockHeight);
 		}
-		this.scanExpiringHeldHtlcs(blockHeight);
 		this.asyncPaymentManager.scan(blockHeight);
 		this.scanForwardTimeouts(blockHeight);
 		this.scanStuckChannels(blockHeight);

@@ -199,6 +199,149 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 		).to.throw(/complete expected invoice amount/);
 	});
 
+	it('refuses a further part once the parked set covers the invoice', function () {
+		const alice = createNode(TAG, 11);
+		const bob = createNode(TAG, 12);
+		connectNodes(alice, bob);
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const ch1 = openReadyChannel(alice, bob, 100_000n);
+		const ch2 = openReadyChannel(alice, bob, 100_000n);
+		buildGraph(alice, bob, [ch1, ch2], 100_000_000n);
+
+		const { hash } = makeExternalHash();
+		const totalMsat = 90_000_000n;
+		const invoice = bob.createInvoice({
+			amountMsat: totalMsat,
+			description: 'hold-mpp-extra',
+			hold: true,
+			paymentHash: hash
+		});
+		const bobPubkey = Buffer.from(bob.getNodeId(), 'hex');
+		const sendPart = (i: number, amountMsat: bigint, cltv: number): void => {
+			alice.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: bobPubkey,
+							shortChannelId: scidForIndex(i),
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: cltv
+						}
+					]
+				},
+				hash,
+				cltv,
+				invoice.paymentSecret,
+				totalMsat
+			);
+		};
+		sendPart(0, totalMsat / 2n, 200);
+		sendPart(1, totalMsat / 2n, 200);
+		let snap = bob.getHeldInvoiceSnapshot(hash)!;
+		expect(snap.complete).to.equal(true);
+		expect(snap.parts).to.have.length(2);
+		expect(snap.cancelHeight).to.equal(1200 - HELD_HTLC_EXPIRY_MARGIN);
+
+		// A late 1 msat part with a short expiry would drag the whole set
+		// into the sweeper's margin: it is failed back, never parked.
+		sendPart(0, 1n, 40);
+		snap = bob.getHeldInvoiceSnapshot(hash)!;
+		expect(snap.parts).to.have.length(2);
+		expect(snap.committedMsat).to.equal(totalMsat);
+		expect(snap.cancelHeight).to.equal(1200 - HELD_HTLC_EXPIRY_MARGIN);
+		const events = cancelEvents(bob);
+		bob.handleNewBlock(1040 - HELD_HTLC_EXPIRY_MARGIN);
+		expect(events).to.have.length(0);
+		expect(bob.getHeldInvoiceSnapshot(hash)!.state).to.equal('ACCEPTED');
+	});
+
+	it('refuses an external hash the node already has a record for', function () {
+		const alice = createNode(TAG, 13);
+		const bob = createNode(TAG, 14);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		buildGraph(alice, bob, [channelId]);
+
+		// Bob issues a plain invoice; a hold invoice on its hash is refused.
+		const plain = bob.createInvoice({ amountMsat: 1_000n, description: 'p' });
+		expect(() =>
+			bob.createInvoice({
+				amountMsat: 1_000n,
+				description: 'clash',
+				hold: true,
+				paymentHash: plain.paymentHash
+			})
+		).to.throw(/already in use/);
+		expect(bob.paymentHashInUse(plain.paymentHash)).to.equal(true);
+
+		// Alice is paying Bob's hold invoice: a hold invoice on the hash SHE
+		// is sending against is refused on her side (her payment record
+		// must not be overwritten by an incoming placeholder).
+		const { hash } = makeExternalHash();
+		const held = bob.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'hold',
+			hold: true,
+			paymentHash: hash
+		});
+		alice.sendPayment(held.bolt11);
+		expect(alice.getPayment(hash)!.status).to.equal(PaymentStatus.PENDING);
+		expect(() =>
+			alice.createInvoice({
+				amountMsat: 1n,
+				description: 'clobber',
+				hold: true,
+				paymentHash: hash
+			})
+		).to.throw(/already in use/);
+		expect(alice.getPayment(hash)!.status).to.equal(PaymentStatus.PENDING);
+		expect(alice.paymentHashInUse(hash)).to.equal(true);
+		expect(alice.paymentHashInUse(makeExternalHash().hash)).to.equal(false);
+	});
+
+	it('runs the expiry sweep only after the swap provider finished its look at the block', async function () {
+		const alice = createNode(TAG, 15);
+		const bob = createNode(TAG, 16);
+		connectNodes(alice, bob);
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const channelId = openReadyChannel(alice, bob);
+		buildGraph(alice, bob, [channelId]);
+		const events = cancelEvents(bob);
+		const { hash } = makeExternalHash();
+		const invoice = bob.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'hold-order',
+			hold: true,
+			paymentHash: hash
+		});
+		alice.sendPayment(invoice.bolt11);
+		const cancelHeight = parkedCltvExpiry(bob, channelId) - 18;
+
+		// A provider whose chain look is still pending at the block.
+		let finish: () => void = () => undefined;
+		const looked: number[] = [];
+		(bob as unknown as { swapProvider: unknown }).swapProvider = {
+			onBlock: (height: number): Promise<void> => {
+				looked.push(height);
+				return new Promise<void>((resolve) => {
+					finish = resolve;
+				});
+			}
+		};
+		bob.handleNewBlock(cancelHeight);
+		expect(looked).to.deep.equal([cancelHeight]);
+		await new Promise((r) => setImmediate(r));
+		expect(events).to.have.length(0);
+		expect(bob.getHeldInvoiceSnapshot(hash)!.state).to.equal('ACCEPTED');
+		finish();
+		await new Promise((r) => setImmediate(r));
+		await new Promise((r) => setImmediate(r));
+		expect(events).to.have.length(1);
+		expect(events[0].reason).to.equal('expiry-scan');
+	});
+
 	it('emits hold:cancelled with reason api for explicit cancels, paid and unpaid', function () {
 		const alice = createNode(TAG, 7);
 		const bob = createNode(TAG, 8);

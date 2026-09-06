@@ -14,10 +14,13 @@
  *   FUNDING_BROADCAST | REFUND_PENDING -> CLAIMED  (a claim at any depth wins)
  *   CREATED | HELD -> CANCELLED                    (nothing left the wallet)
  *   FUNDING -> FAILED                              (no transaction could be built,
- *                                                  or the hold went before broadcast)
- *   FUNDING_BROADCAST | FUNDED | REFUND_PENDING | CLAIMED -> EXPOSED
+ *                                                  or the hold went before any
+ *                                                  bytes were signed)
+ *   FUNDING | FUNDING_BROADCAST | FUNDED | REFUND_PENDING | CLAIMED -> EXPOSED
  *                                                  (the Lightning side was cancelled
- *                                                  under us; funds are on chain)
+ *                                                  under us; funds are, or may
+ *                                                  be, on chain: signed bytes
+ *                                                  whose broadcast threw count)
  *
  * Submarine swap lifecycle (client funds the chain, provider pays Lightning),
  * reserved here for the later engine:
@@ -204,7 +207,7 @@ const REVERSE_TRANSITIONS: Readonly<
 > = {
 	CREATED: ['HELD', 'CANCELLED', 'FAILED'],
 	HELD: ['FUNDING', 'CANCELLED', 'FAILED'],
-	FUNDING: ['FUNDING_BROADCAST', 'FAILED'],
+	FUNDING: ['FUNDING_BROADCAST', 'FAILED', 'EXPOSED'],
 	FUNDING_BROADCAST: ['FUNDED', 'CLAIMED', 'EXPOSED'],
 	FUNDED: ['CLAIMED', 'REFUND_PENDING', 'EXPOSED'],
 	CLAIMED: ['SETTLED', 'EXPOSED'],

@@ -156,6 +156,15 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			expect(swapSourcesFor('reverse', 'CLAIMED').sort()).to.deep.equal(
 				['FUNDED', 'FUNDING_BROADCAST', 'REFUND_PENDING'].sort()
 			);
+			expect(swapSourcesFor('reverse', 'EXPOSED').sort()).to.deep.equal(
+				[
+					'CLAIMED',
+					'FUNDED',
+					'FUNDING',
+					'FUNDING_BROADCAST',
+					'REFUND_PENDING'
+				].sort()
+			);
 			expect(swapSourcesFor('reverse', 'REFUNDED')).to.deep.equal([
 				'REFUND_PENDING'
 			]);

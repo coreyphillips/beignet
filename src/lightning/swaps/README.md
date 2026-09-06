@@ -228,16 +228,32 @@ REFUND_PENDING at refundHeight + 1 with no claim: refund built to the node's
          refundBumpIntervalBlocks while unconfirmed, never above the rate cap
 REFUNDED refund confirmed to resolutionConfirmations; ONLY NOW the hold is
          cancelled
-EXPOSED  the node's own sweeper cancelled the hold while coins were on chain:
-         watching continues, the refund still recovers the coins, a late claim
-         still records its preimage, swap:exposed is emitted at error level
-CANCELLED / FAILED before any funds moved
+EXPOSED  the node's own sweeper cancelled the hold while coins were, or may
+         be, on chain (signed funding bytes whose broadcast threw count, since
+         a dropped connection can follow a relay): watching continues, the
+         refund still recovers the coins, a late claim still records its
+         preimage, swap:exposed is emitted at error level
+CANCELLED / FAILED before any funds moved (FAILED from FUNDING only while no
+         bytes were ever signed)
 ```
 
 Rules the engine never breaks: a hold is never cancelled because the refund
 height passed or a refund was broadcast; a claim beats a pending refund; a
-preimage from any source is retained; the funding transaction is never
-fee-bumped. A restart redoes the owed action of every unresolved row exactly
+preimage from any source is retained (a spend of the funding outpoint whose
+witness carries a 32-byte element hashing to the payment hash is a claim
+even when its signature or MINIMALIF byte is non-canonical: a mined spend
+is valid by definition); the funding transaction is never fee-bumped; a
+funding broadcast that throws is judged by the chain, not by the error, since
+the bytes may have relayed before the connection dropped or be refused as
+already mined; a create is refused for any hash the node already holds a
+record for (an invoice, a payment it is sending, a parked hold), because
+minting a hold invoice on it would overwrite that record; no swap is quoted
+while the sweep destination is not native segwit, the only kind the refund
+builder pays. On the node side a parked set that already covers the invoice
+takes no further part (a late short-expiry part would drag the whole set
+into the sweeper's margin), and the per-block sweep waits, bounded, for the
+provider's chain look so a claim seen at the block settles before the sweep
+judges its hash. A restart redoes the owed action of every unresolved row exactly
 once (`startSwapProvider`).
 
 Residual risks an operator accepts: a reorg deeper than
