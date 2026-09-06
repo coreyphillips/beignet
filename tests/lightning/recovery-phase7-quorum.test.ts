@@ -212,6 +212,16 @@ describe('Recovery phase 7: quorum kill sweeps (real guardians over HTTP)', () =
 	it('refusal then kill: a barrier timeout freezes, and dying frozen still resumes exactly', async function () {
 		this.timeout(60_000);
 		const options = quorumOptions({ barrierTimeoutMs: 400 });
+		const restoredTimeouts: string[] = [];
+		const afterRestart = options.afterRestart;
+		options.afterRestart = async (resumedEnv, restored): Promise<void> => {
+			restored?.on('node:error', (err: { code?: string }) => {
+				if (err.code === 'DURABILITY_BARRIER_TIMEOUT') {
+					restoredTimeouts.push(err.code);
+				}
+			});
+			await afterRestart?.(resumedEnv, restored);
+		};
 		const scenario = withNamespace(s1aSenderPays)();
 		const env = await makeChaosEnv('quorum', options);
 		try {
@@ -241,11 +251,32 @@ describe('Recovery phase 7: quorum kill sweeps (real guardians over HTTP)', () =
 			env.kill.fire('refusal:frozen');
 			await settle();
 			currentQuorumRun().setBlocked(false);
+			// The short deadline injected the refusal. Recovery uses the normal
+			// quorum fixture budget while valid guardian receipts arrive.
+			currentQuorumRun().barrierTimeoutMs = 20_000;
 			const result = await restartVictim(env, options);
 			try {
-				await scenario.probe(result.env, result.restored);
+				currentQuorumRun().setBlocked(true);
+				await Promise.all([
+					scenario.probe(result.env, result.restored),
+					(async (): Promise<void> => {
+						await waitFor(
+							() =>
+								result.restored.getRecoveryStatus().awaitingDurabilityCount > 0
+						);
+						// A valid but slow quorum must outlive the injected 400ms
+						// deadline without freezing the recovered channel again.
+						await new Promise((resolve) => setTimeout(resolve, 600));
+						currentQuorumRun().setBlocked(false);
+					})()
+				]);
+				expect(
+					restoredTimeouts,
+					'the recovered node must not time out'
+				).to.deep.equal([]);
 				await assertChaosOutcome(result, 'exact-resume');
 			} finally {
+				currentQuorumRun().setBlocked(false);
 				result.destroyAll();
 			}
 		} finally {
