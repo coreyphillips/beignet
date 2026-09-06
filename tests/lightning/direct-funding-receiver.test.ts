@@ -31,6 +31,7 @@ import {
 	LSP_PUBKEY,
 	makeBip86Coin,
 	makeCoin,
+	signOwnershipProbeLikeAWallet,
 	memoryStorage
 } from './helpers/df-receiver';
 import { IDfReceiverConfig } from '../../src/lightning/direct-funding/receiver/types';
@@ -540,6 +541,77 @@ describe('Direct funding receiver: ownership proof (issue #612)', () => {
 		forged.ownership.messageProof!.signature[20] ^= 0xff;
 		await h.sendOffer(forged);
 		expect(h.lastAck()?.reason).to.equal('invalid ownership message signature');
+	});
+
+	it('accepts a P2WPKH probe-transaction proof, the form a PSBT-only wallet makes', async () => {
+		const h = harness();
+		await h.sendOffer(
+			buildOffer(h.payer.requestRecord, h.coin, { probeProof: true })
+		);
+		expect(h.acks()[0]).to.deep.equal({ accepted: true });
+	});
+
+	it('accepts a P2TR probe-transaction proof by the output key of a BIP 86 coin', async () => {
+		const coin = makeBip86Coin();
+		const h = harness();
+		h.node.publish(coin);
+		await h.sendOffer(
+			buildOffer(h.payer.requestRecord, coin, { probeProof: true })
+		);
+		expect(h.acks()[0]).to.deep.equal({ accepted: true });
+	});
+
+	it('a probe proof is bound to the sequence the offer names', async () => {
+		// The funding will spend the coin with the offer's sequence, and the
+		// probe is built with it; a signature made under another sequence
+		// (or for another offer) is not this offer's proof.
+		const h = harness();
+		const forged = buildOffer(h.payer.requestRecord, h.coin, {
+			probeProof: true
+		});
+		forged.ownership.probeProof = signOwnershipProbeLikeAWallet(
+			h.coin,
+			forged.offerId,
+			0xfffffffe
+		);
+		await h.sendOffer(forged);
+		expect(h.lastAck()?.reason).to.equal('invalid ownership probe signature');
+	});
+
+	it('refuses a probe proof by a key that does not control the coin, and a forged one', async () => {
+		const h = harness();
+		const other = makeCoin();
+		const wrongKey = buildOffer(h.payer.requestRecord, h.coin, {
+			probeProof: true
+		});
+		wrongKey.ownership.probeProof = signOwnershipProbeLikeAWallet(
+			{ ...h.coin, privkey: other.privkey, pubkey: other.pubkey },
+			wrongKey.offerId
+		);
+		await h.sendOffer(wrongKey);
+		expect(h.lastAck()?.reason).to.equal(
+			'ownership probe key does not control the offered coin'
+		);
+
+		const second = makeCoin();
+		h.node.publish(second);
+		const forged = buildOffer(h.payer.requestRecord, second, {
+			probeProof: true
+		});
+		forged.ownership.probeProof!.signature[5] ^= 0xff;
+		await h.sendOffer(forged);
+		expect(h.lastAck()?.reason).to.equal('invalid ownership probe signature');
+
+		const taproot = makeBip86Coin();
+		h.node.publish(taproot);
+		const forgedTr = buildOffer(h.payer.requestRecord, taproot, {
+			probeProof: true
+		});
+		forgedTr.ownership.probeProof!.signature[5] ^= 0xff;
+		await h.sendOffer(forgedTr);
+		expect(h.lastAck()?.reason).to.equal(
+			'invalid taproot ownership probe signature'
+		);
 	});
 
 	it('a receiver that predates the message form declines on the zeroed digest', async () => {

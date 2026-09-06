@@ -280,6 +280,31 @@ describe('Direct funding end to end: payer against receiver', () => {
 		}
 	});
 
+	it('a payer that can only sign transactions (probe proof) is served exactly the same', async () => {
+		const e2e = await setup();
+		e2e.wallet.signsProbes = true;
+		try {
+			const send = e2e.sender.send(e2e.request, {
+				amountSat: AMOUNT,
+				maxTotalFeeSat: FEE_CEILING
+			});
+			await flush(8);
+			expect(
+				e2e.node.opens,
+				'the receiver never started an open'
+			).to.have.length(1);
+			e2e.node.completeNegotiation(e2e.coin, e2e.expectedOffer(), {
+				fundingScript: e2e.fundingScript
+			});
+			const result = await send;
+			expect(result.attested).to.equal(true);
+			expect(result.status).to.equal('SIGNED_PENDING');
+			expect(result.receiptPreimageHex).to.equal(e2e.record.preimageHex);
+		} finally {
+			e2e.stop();
+		}
+	});
+
 	it('only a paired payer buys zero-conf, and only with consent', async () => {
 		// The matrix cell that decides who takes the double-spend risk. Pairing
 		// comes off the LANE (the direct-peer connection is the only one that

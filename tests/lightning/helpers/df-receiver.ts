@@ -32,6 +32,7 @@ import {
 	encodeDfWitness,
 	ownershipDigest,
 	ownershipMessage,
+	ownershipProbeTransaction,
 	IDfOffer
 } from '../../../src/lightning/direct-funding/messages';
 import {
@@ -54,6 +55,7 @@ import {
 	IDfLaneSender
 } from '../../../src/lightning/direct-funding/transport/types';
 import { ISpliceWalletInput } from '../../../src/lightning/channel/channel';
+import { taprootTweakPrivateKey } from '../../../src/lightning/wallet/wallet-funding-provider';
 
 export const LSP_PUBKEY = getPublicKey(
 	crypto.createHash('sha256').update('df-lsp').digest()
@@ -159,6 +161,46 @@ export function signOwnershipMessageLikeAWallet(
 	};
 }
 
+/**
+ * Sign the probe transaction the way a PSBT-only wallet does: a real
+ * SIGHASH_ALL ECDSA signature for P2WPKH (r||s), a SIGHASH_DEFAULT Schnorr
+ * signature by the output key for a BIP 86 P2TR coin.
+ */
+export function signOwnershipProbeLikeAWallet(
+	coin: IDfTestCoin,
+	offerId: Buffer,
+	sequence = 0xfffffffd
+): { pubkey: Buffer; signature: Buffer } {
+	const { tx, prevouts } = ownershipProbeTransaction(
+		offerId,
+		Buffer.from(coin.txidHex, 'hex'),
+		coin.vout,
+		sequence,
+		coin.script,
+		coin.valueSat
+	);
+	if (coin.kind === 'p2tr') {
+		const tweaked = taprootTweakPrivateKey(coin.privkey, coin.pubkey);
+		const sighash = tx.hashForWitnessV1(
+			0,
+			prevouts.scripts,
+			prevouts.values.map((v) => Number(v)),
+			bitcoin.Transaction.SIGHASH_DEFAULT
+		);
+		return {
+			pubkey: Buffer.alloc(33),
+			signature: schnorrSign(sighash, tweaked)
+		};
+	}
+	const sighash = tx.hashForWitnessV0(
+		0,
+		bitcoin.payments.p2pkh({ pubkey: coin.pubkey }).output!,
+		Number(coin.valueSat),
+		bitcoin.Transaction.SIGHASH_ALL
+	);
+	return { pubkey: coin.pubkey, signature: sign(sighash, coin.privkey) };
+}
+
 // ─────────────── Offers ───────────────
 
 export interface IDfOfferOverrides {
@@ -176,6 +218,8 @@ export interface IDfOfferOverrides {
 	 * wallet would.
 	 */
 	messageProof?: boolean | { privkey?: Buffer; header?: number };
+	/** Prove ownership with a probe-transaction signature, digest zeroed. */
+	probeProof?: boolean;
 }
 
 export function buildOffer(
@@ -200,9 +244,12 @@ export function buildOffer(
 					: undefined
 		  )
 		: undefined;
+	const probeProof = overrides.probeProof
+		? signOwnershipProbeLikeAWallet(coin, offerId, overrides.sequence)
+		: undefined;
 	const signature =
 		overrides.ownershipSignature ??
-		(messageProof
+		(messageProof || probeProof
 			? Buffer.alloc(64)
 			: isTaproot
 			? schnorrSign(digest, coin.privkey)
@@ -225,7 +272,8 @@ export function buildOffer(
 				overrides.ownershipPubkey ??
 				(isTaproot ? coin.script.subarray(2, 34) : coin.pubkey),
 			signature,
-			...(messageProof ? { messageProof } : {})
+			...(messageProof ? { messageProof } : {}),
+			...(probeProof ? { probeProof } : {})
 		}
 	};
 }

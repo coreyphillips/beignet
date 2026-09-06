@@ -55,7 +55,8 @@ import {
 	IDfPrevout,
 	IDfSignRequest,
 	ownershipDigest,
-	ownershipMessage
+	ownershipMessage,
+	ownershipProbeTransaction
 } from '../messages';
 import {
 	DirectFundingError,
@@ -277,6 +278,56 @@ export class DirectFundingSender {
 			this.inflight.delete(requestIdHex);
 			this.reserved.delete(requestIdHex);
 		}
+	}
+
+	/**
+	 * The offer's ownership proof, in the strongest form the signer offers: a
+	 * message signature, a probe-transaction signature, or the rev 2 digest.
+	 * A wallet that only signs transactions learns its own P2WPKH key from
+	 * the signature it makes, so that form also supplies the key field.
+	 */
+	private async proveOwnership(
+		signer: IDfCoinSigner,
+		offerId: Buffer,
+		txid: Buffer,
+		coin: IDfSenderCoin,
+		amountSat: bigint
+	): Promise<IDfOffer['ownership']> {
+		if (signer.signOwnershipMessage) {
+			return {
+				pubkey: signer.ownershipPubkey,
+				signature: Buffer.alloc(64),
+				messageProof: await signer.signOwnershipMessage(
+					ownershipMessage(offerId, txid, coin.vout, amountSat)
+				)
+			};
+		}
+		if (signer.signOwnershipProbe) {
+			const { tx, prevouts } = ownershipProbeTransaction(
+				offerId,
+				txid,
+				coin.vout,
+				this.cfg.sequence,
+				coin.script,
+				coin.valueSat
+			);
+			const probe = await signer.signOwnershipProbe(tx, prevouts);
+			return {
+				pubkey:
+					signer.kind === 'p2wpkh' ? probe.pubkey : signer.ownershipPubkey,
+				signature: Buffer.alloc(64),
+				probeProof: {
+					pubkey: signer.kind === 'p2wpkh' ? probe.pubkey : Buffer.alloc(33),
+					signature: probe.signature
+				}
+			};
+		}
+		return {
+			pubkey: signer.ownershipPubkey,
+			signature: signer.signOwnership(
+				ownershipDigest(offerId, txid, coin.vout, amountSat)
+			)
+		};
 	}
 
 	/**
@@ -520,20 +571,13 @@ export class DirectFundingSender {
 			// wallet) proves the same statement in the Bitcoin signed-message
 			// form; the digest field then carries zeros for receivers that
 			// predate the message form, which decline rather than negotiate.
-			ownership: signer.signOwnershipMessage
-				? {
-						pubkey: signer.ownershipPubkey,
-						signature: Buffer.alloc(64),
-						messageProof: await signer.signOwnershipMessage(
-							ownershipMessage(offerId, txid, coin.vout, amountSat)
-						)
-				  }
-				: {
-						pubkey: signer.ownershipPubkey,
-						signature: signer.signOwnership(
-							ownershipDigest(offerId, txid, coin.vout, amountSat)
-						)
-				  }
+			ownership: await this.proveOwnership(
+				signer,
+				offerId,
+				txid,
+				coin,
+				amountSat
+			)
 		};
 		const offerBody = encodeDfOffer(offer);
 		const now = this.now();

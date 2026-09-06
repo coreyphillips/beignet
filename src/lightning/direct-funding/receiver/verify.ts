@@ -27,7 +27,8 @@ import {
 	DF_MESSAGE_SIGNATURE_BYTES,
 	IDfOffer,
 	ownershipDigest,
-	ownershipMessage
+	ownershipMessage,
+	ownershipProbeTransaction
 } from '../messages';
 import {
 	DF_MAX_PREVOUTS,
@@ -144,6 +145,9 @@ export function ownershipProblem(
 	if (offer.ownership.messageProof) {
 		return messageProofProblem(offer, prevOutScript, kind);
 	}
+	if (offer.ownership.probeProof) {
+		return probeProofProblem(offer, prevOutScript, kind);
+	}
 	const digest = ownershipDigest(
 		offer.offerId,
 		offer.txid,
@@ -169,6 +173,66 @@ export function ownershipProblem(
 	return ecdsaVerify(digest, offer.ownership.pubkey, offer.ownership.signature)
 		? null
 		: 'invalid ownership signature';
+}
+
+/**
+ * The probe-transaction form: a real signature over a transaction that
+ * spends the coin and can never be broadcast (its second input spends an
+ * outpoint with no preimage). Verified exactly as the funding witness will
+ * be, so it is also the strongest evidence the payer can sign THIS coin
+ * the way the channel needs it signed.
+ */
+function probeProofProblem(
+	offer: IDfOffer,
+	prevOutScript: Buffer,
+	kind: 'p2wpkh' | 'p2tr'
+): string | null {
+	const proof = offer.ownership.probeProof!;
+	if (proof.signature.length !== 64) {
+		return 'ownership probe signature must be 64 bytes';
+	}
+	const { tx, prevouts } = ownershipProbeTransaction(
+		offer.offerId,
+		offer.txid,
+		offer.vout,
+		offer.sequence,
+		prevOutScript,
+		offer.valueSat
+	);
+	if (kind === 'p2tr') {
+		const outputKey = prevOutScript.subarray(2, 2 + XONLY_PUBKEY_BYTES);
+		const sighash = tx.hashForWitnessV1(
+			0,
+			prevouts.scripts,
+			prevouts.values.map((v) => Number(v)),
+			bitcoin.Transaction.SIGHASH_DEFAULT
+		);
+		return schnorrVerify(sighash, outputKey, proof.signature)
+			? null
+			: 'invalid taproot ownership probe signature';
+	}
+	if (proof.pubkey.length !== DF_NODE_ID_BYTES) {
+		return 'ownership probe must name a 33-byte compressed key for a P2WPKH input';
+	}
+	if (
+		!bitcoin.crypto.hash160(proof.pubkey).equals(prevOutScript.subarray(2, 22))
+	) {
+		return 'ownership probe key does not control the offered coin';
+	}
+	let sighash: Buffer;
+	try {
+		sighash = tx.hashForWitnessV0(
+			0,
+			bitcoin.payments.p2pkh({ pubkey: proof.pubkey }).output!,
+			Number(offer.valueSat),
+			bitcoin.Transaction.SIGHASH_ALL
+		);
+	} catch {
+		return 'ownership probe key is not a valid public key';
+	}
+	return ecdsaVerify(sighash, proof.pubkey, proof.signature)
+		? null
+		: 'invalid ownership probe signature';
 }
 
 /**
