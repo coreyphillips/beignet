@@ -1030,7 +1030,8 @@ export function findRouteToBlindedPath(
 	maxHops: number = DEFAULT_MAX_HOPS,
 	excludedChannels?: Set<string>,
 	missionControl?: MissionControl,
-	localChannels?: ILocalChannelEdge[]
+	localChannels?: ILocalChannelEdge[],
+	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY
 ): IRoute | null {
 	const hops = blindedPath.blindedHops;
 	if (hops.length === 0) return null;
@@ -1064,6 +1065,10 @@ export function findRouteToBlindedPath(
 	// If source IS the introduction node, the route is just the blinded tail,
 	// but the intro hop's real pubkey is known (it's us routing onward).
 	if (sourceHex === introHex) {
+		// The blinded tail is the whole route, so the CLTV budget applies to
+		// the introduction hop's delta the same way findRoute applies it to a
+		// routed first hop (issue #737: a caller's absolute expiry ceiling).
+		if (cltvAtIntro > maxCltvExpiry) return null;
 		tail[0].pubkey = introNodeId;
 		return {
 			hops: tail,
@@ -1085,7 +1090,7 @@ export function findRouteToBlindedPath(
 		maxHops - (hops.length - 1),
 		excludedChannels,
 		missionControl,
-		DEFAULT_MAX_CLTV_EXPIRY,
+		maxCltvExpiry,
 		undefined,
 		undefined,
 		// Use our local channel edges so a direct channel to the introduction node

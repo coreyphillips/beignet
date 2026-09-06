@@ -23,6 +23,7 @@ import { DurabilityBarrier } from '../recovery/durability-barrier';
 import { IGuardianHostConfig } from '../recovery/guardian-host';
 import { RecoveryDurability } from '../recovery/types';
 import type { GuardianDescriptor } from '../recovery/capsule';
+import type { ISwapConfirmationPolicy, ISwapExposurePolicy } from '../swaps';
 
 export type { IInvoiceInfo };
 
@@ -509,6 +510,13 @@ export interface INodeConfig {
 	 * nothing until `mintDirectFundingRequest` is called.
 	 */
 	directFunding?: IDirectFundingNodeConfig;
+	/**
+	 * Swap provider foundations (issue #737): the durable swap ledger and the
+	 * operator's exposure and confirmation policies. The provider engines
+	 * arrive separately; with `enabled` the ledger is built and rehydrated at
+	 * construction so no engine ever serves from an empty view.
+	 */
+	swaps?: ISwapNodeConfig;
 	/** CLTV delta for forwarding (default 40) */
 	forwardingCltvDelta?: number;
 	/** Base fee in msat for forwarding (default 1000) */
@@ -834,6 +842,28 @@ export interface IPaymentRetryContext {
 	 * not the chain's height, so it must not steer unrelated payments.
 	 */
 	cltvBaseHeightOverride?: number;
+	/**
+	 * Absolute block height no outgoing HTLC of this payment may expire after
+	 * (issue #737): enforced fail-closed on every attempt, retry and MPP part
+	 * before the HTLC is added. Preserved across retries.
+	 */
+	maxCltvExpiryHeight?: number;
+}
+
+/** Options-object form of sendPayment's positional arguments. */
+export interface ISendPaymentOptions {
+	excludedChannels?: Set<string>;
+	maxFeeMsat?: bigint;
+	/** Amount for an amount-less invoice. */
+	amountMsat?: bigint;
+	/**
+	 * Absolute block height no outgoing HTLC of this payment (any attempt,
+	 * retry or MPP part) may expire after. The route search is bounded by it
+	 * and the dispatch gate refuses, before addHtlc, any HTLC whose wire
+	 * expiry would exceed it. A submarine swap provider derives it from the
+	 * on-chain refund height less its claim margin.
+	 */
+	maxCltvExpiryHeight?: number;
 }
 
 export interface ICreateInvoiceOptions {
@@ -1199,6 +1229,133 @@ export interface IOutboundMppState {
 	dispatchComplete?: boolean;
 }
 
+// ─── Swap provider foundations (issue #737, phase 2) ───
+
+export interface ISwapNodeConfig {
+	enabled?: boolean;
+	exposure?: Partial<ISwapExposurePolicy>;
+	confirmations?: Partial<ISwapConfirmationPolicy>;
+}
+
+// ─── Outgoing payment resolution (issue #737, swap provider phase 2) ───
+
+export type OutgoingHtlcState =
+	| 'offered'
+	| 'fulfilled'
+	| 'failed'
+	| 'onchain-pending'
+	| 'onchain-resolved';
+
+/** One offered HTLC of an outgoing payment, across every attempt and part. */
+export interface IOutgoingHtlcView {
+	channelId: Buffer;
+	htlcId: bigint;
+	amountMsat: bigint;
+	cltvExpiry: number;
+	state: OutgoingHtlcState;
+	/** No further outcome is possible for this HTLC. */
+	terminal: boolean;
+}
+
+/**
+ * What an outgoing payment's HTLCs have actually done, as opposed to what its
+ * record says. A wall-clock failPayment marks the record FAILED while the
+ * HTLCs it sent are still live; `resolved` stays false until every one of
+ * them is terminal, whatever the record's status.
+ */
+export interface IOutgoingPaymentResolution {
+	paymentHash: Buffer;
+	/** The payment record's status, or null when there is no record. */
+	status: PaymentStatus | null;
+	htlcs: IOutgoingHtlcView[];
+	/** status !== PENDING and every HTLC terminal. */
+	resolved: boolean;
+	/**
+	 * Maximum cltvExpiry over the non-terminal HTLCs, null when none: the
+	 * live "latest outgoing HTLC expiry" a submarine admission must respect.
+	 */
+	latestOutstandingExpiry: number | null;
+	/** The preimage, from whichever source revealed it, when known. */
+	preimage?: Buffer;
+}
+
+/** Payload of 'payment:htlc-resolved'. */
+export interface IPaymentHtlcResolvedEvent {
+	paymentHash: Buffer;
+	channelId: Buffer;
+	htlcId: bigint;
+	state: OutgoingHtlcState;
+}
+
+/** Payload of 'payment:preimage'. */
+export interface IPaymentPreimageEvent {
+	paymentHash: Buffer;
+	preimage: Buffer;
+	/** An update_fulfill_htlc from the peer, or an on-chain claim. */
+	source: 'htlc' | 'onchain';
+}
+
+// ─── Hold invoice inspection (issue #737, swap provider phase 2) ───
+
+export type HoldInvoiceState = 'OPEN' | 'ACCEPTED' | 'SETTLED' | 'CANCELLED';
+
+/**
+ * Why a hold invoice was cancelled: the per-block CLTV sweeper
+ * (`expiry-scan`, a parked part came within HELD_HTLC_EXPIRY_MARGIN of its
+ * expiry) or an explicit cancelHeldHtlc / cancelHoldInvoice call (`api`).
+ */
+export type HoldCancelReason = 'expiry-scan' | 'api';
+
+/**
+ * One parked part of a hold invoice, shaped so it satisfies the swap
+ * admission validators' ICommittedSwapHtlc directly. `committed` is
+ * re-derived from the channel's own HTLC entry on every snapshot; the parked
+ * map is an index, not proof.
+ */
+export interface IHeldInvoicePart {
+	/** `${channelIdHex}:${htlcId}`, the unique local identity of the part. */
+	id: string;
+	channelId: Buffer;
+	htlcId: bigint;
+	paymentHash: Buffer;
+	amountMsat: bigint;
+	/** Absolute expiry from the channel's received-HTLC entry, never the parked copy. */
+	cltvExpiry: number;
+	/** The channel holds this HTLC in COMMITTED state right now. */
+	committed: boolean;
+}
+
+/**
+ * Point-in-time view of a hold invoice's committed MPP set. A swap engine
+ * must fund only when `complete` is true; a single 'htlc:held' event never
+ * establishes that the whole amount is committed.
+ */
+export interface IHeldInvoiceSnapshot {
+	paymentHash: Buffer;
+	state: HoldInvoiceState;
+	currentHeight: number;
+	parts: IHeldInvoicePart[];
+	/** Sum over parts with committed === true. */
+	committedMsat: bigint;
+	/** The invoice's declared amount; undefined for an amount-less hold invoice. */
+	expectedAmountMsat?: bigint;
+	/** expectedAmountMsat defined, every part committed, committedMsat === expected. */
+	complete: boolean;
+	/** Minimum cltvExpiry over committed parts; null with no committed part. */
+	earliestExpiry: number | null;
+	/** HELD_HTLC_EXPIRY_MARGIN: the node's actual early-cancel margin in blocks. */
+	cancelMarginBlocks: number;
+	/** earliestExpiry - cancelMarginBlocks: the first height the sweeper cancels at. */
+	cancelHeight: number | null;
+}
+
+/** Payload of the 'hold:cancelled' node event. */
+export interface IHoldCancelledEvent {
+	paymentHash: Buffer;
+	reason: HoldCancelReason;
+	htlcsFailed: number;
+}
+
 // ─── Typed Payment Errors ───
 
 export enum LightningErrorCode {
@@ -1209,7 +1366,9 @@ export enum LightningErrorCode {
 	MISSING_AMOUNT = 'MISSING_AMOUNT',
 	INVALID_INVOICE = 'INVALID_INVOICE',
 	INVOICE_EXPIRED = 'INVOICE_EXPIRED',
-	INVALID_KEYSEND = 'INVALID_KEYSEND'
+	INVALID_KEYSEND = 'INVALID_KEYSEND',
+	/** An HTLC would expire past the payment's maxCltvExpiryHeight. */
+	CLTV_EXCEEDS_MAX = 'CLTV_EXCEEDS_MAX'
 }
 
 export interface IKeysendOptions {

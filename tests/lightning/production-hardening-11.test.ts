@@ -1601,9 +1601,10 @@ describe('Production Hardening 11', function () {
 				expect(err.code).to.equal(LightningErrorCode.NO_ROUTE);
 			});
 
-			it('should all 8 error codes be defined', () => {
+			it('should all 9 error codes be defined', () => {
 				const codes = Object.values(LightningErrorCode);
-				expect(codes).to.have.lengthOf(8);
+				expect(codes).to.have.lengthOf(9);
+				expect(codes).to.include('CLTV_EXCEEDS_MAX');
 				expect(codes).to.include('NO_ROUTE');
 				expect(codes).to.include('DUPLICATE_PAYMENT');
 				expect(codes).to.include('NO_CHANNEL_TO_HOP');

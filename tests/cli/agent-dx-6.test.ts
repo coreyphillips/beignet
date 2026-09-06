@@ -119,9 +119,9 @@ describe('Agent DX 6: CLI-level Production Hardening 11', function () {
 			expect(lErr).to.be.instanceOf(Error);
 		});
 
-		it('should all 8 error codes exist', () => {
+		it('should all 9 error codes exist', () => {
 			const allCodes = Object.values(LightningErrorCode);
-			expect(allCodes).to.have.lengthOf(8);
+			expect(allCodes).to.have.lengthOf(9);
 			expect(allCodes).to.include('NO_ROUTE');
 			expect(allCodes).to.include('DUPLICATE_PAYMENT');
 			expect(allCodes).to.include('NO_CHANNEL_TO_HOP');
