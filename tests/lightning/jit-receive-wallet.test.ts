@@ -211,6 +211,58 @@ describe('JIT receive wallet side (issue #595)', function () {
 		);
 	});
 
+	it('hop mode: puts the fee terms in the hint and records no allowance', async () => {
+		// A wallet that cannot settle a short HTLC asks not to be skimmed. The
+		// LSP serves it in hop mode: the hint carries the quoted fee as an
+		// ordinary routing fee (BOLT 7 base + ppm, the opening fee's own
+		// arithmetic), the sender pays it, and the invoice needs no allowance
+		// because the forward will be the full amount.
+		const pair = nodePair({ flatFeeSat: 3n, feePpm: 500 });
+		open.push(pair);
+		const grant = await pair.bob.requestJitReceive(pair.alice.getNodeId(), {
+			maxAmountMsat: 10_000_000n,
+			targetRemainingInboundSat: 0n,
+			acceptsSkimmedFee: false
+		});
+		expect(grant.feeMode).to.equal('hop');
+		expect(grant.hint.feeBaseMsat).to.equal(3_000);
+		expect(grant.hint.feeProportionalMillionths).to.equal(500);
+		const [intent] = pair.alice.getJitReceiveManager()!.listIntents();
+		expect(intent.feeMode).to.equal('hop');
+		expect(intent.acceptsSkimmedFee).to.equal(false);
+
+		const invoice = await pair.bob.createJitInvoice({
+			lspPubkeyHex: pair.alice.getNodeId(),
+			amountMsat: 5_000_000n,
+			feeMode: 'hop'
+		});
+		expect(invoice.feeMode).to.equal('hop');
+		expect(invoice.flatFeeSat).to.equal(3n);
+		const hint = decode(invoice.bolt11).routingHints![0][0];
+		expect(hint.feeBaseMsat).to.equal(3_000);
+		expect(hint.feeProportionalMillionths).to.equal(500);
+		// No allowance: a short HTLC must fail at our final hop as usual.
+		const record = (pair.bob as any).invoices.get(
+			invoice.paymentHash.toString('hex')
+		);
+		expect(record.jitFee).to.equal(undefined);
+	});
+
+	it('skim mode is the default and keeps the allowance', async () => {
+		const pair = nodePair({ flatFeeSat: 3n, feePpm: 500 });
+		open.push(pair);
+		const invoice = await pair.bob.createJitInvoice({
+			lspPubkeyHex: pair.alice.getNodeId(),
+			amountMsat: 5_000_000n
+		});
+		expect(invoice.feeMode).to.equal('skim');
+		expect(decode(invoice.bolt11).routingHints![0][0].feeBaseMsat).to.equal(0);
+		const record = (pair.bob as any).invoices.get(
+			invoice.paymentHash.toString('hex')
+		);
+		expect(record.jitFee).to.deep.equal({ flatFeeSat: 3, feePpm: 500 });
+	});
+
 	it('refuses a quote above the configured ceiling', async () => {
 		const pair = nodePair(
 			{ flatFeeSat: 0n, feePpm: 40_000 },

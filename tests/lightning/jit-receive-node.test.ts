@@ -218,6 +218,7 @@ function registerIntent(
 		expectedTotalMsat?: bigint;
 		targetRemainingInboundSat?: bigint;
 		paymentHash?: Buffer;
+		acceptsSkimmedFee?: boolean;
 	} = {}
 ): IJitReceiveAck {
 	let ack: IJitReceiveAck | undefined;
@@ -240,7 +241,12 @@ function registerIntent(
 				...(overrides.expectedTotalMsat !== undefined
 					? { expectedTotalMsat: overrides.expectedTotalMsat }
 					: {}),
-				...(overrides.paymentHash ? { paymentHash: overrides.paymentHash } : {})
+				...(overrides.paymentHash
+					? { paymentHash: overrides.paymentHash }
+					: {}),
+				...(overrides.acceptsSkimmedFee !== undefined
+					? { acceptsSkimmedFee: overrides.acceptsSkimmedFee }
+					: {})
 			})
 		)
 	);
@@ -321,6 +327,63 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		expect(bob.listChannels()).to.have.length(1);
 		expect(forwards).to.have.length(1);
 		expect(forwards[0].equals(channels[0].channelId)).to.equal(true);
+	});
+
+	it('hop mode: the forwarding path records the inbound value, and the full amount is forwarded', async function () {
+		// driveForward delivers 100_000 msat above the onion amount, the way a
+		// sender paying the hint's fee would. With a 50 sat opening fee that
+		// covers it; the engine reads the inbound value the node recorded on
+		// the part and forwards the onion amount untouched.
+		const pair = nodePair({
+			jitReceive: {
+				enabled: true,
+				fundingBufferSats: 10_000n,
+				fundingRetryDelayMs: 1,
+				flatFeeSat: 50n
+			}
+		});
+		open.push(pair);
+		const { alice } = pair;
+		const ack = registerIntent(pair, { acceptsSkimmedFee: false });
+		expect(ack.accepted).to.equal(true);
+		expect(ack.feeMode).to.equal('hop');
+
+		const forwards: bigint[] = [];
+		alice.on('htlc:forward', (_in: Buffer, _out: Buffer, amountMsat: bigint) =>
+			forwards.push(amountMsat)
+		);
+		const forwarded = new Promise<void>((resolve, reject) => {
+			alice.once('jit:forwarded', () => resolve());
+			alice.once('jit:failed', (d: { reason: string }) =>
+				reject(new Error(d.reason))
+			);
+		});
+		driveForward(alice, ack.interceptScid, { amountMsat: 2_000_000n });
+		await forwarded;
+		expect(alice.listChannels()).to.have.length(1);
+		expect(forwards).to.have.length(1);
+		expect(forwards[0]).to.equal(2_000_000n);
+	});
+
+	it('hop mode: an inbound HTLC that did not carry the fee is failed, and nothing is funded', async function () {
+		const pair = nodePair({
+			jitReceive: {
+				enabled: true,
+				fundingBufferSats: 10_000n,
+				fundingRetryDelayMs: 1,
+				flatFeeSat: 200n // 200_000 msat, above the 100_000 driveForward pays
+			}
+		});
+		open.push(pair);
+		const { alice } = pair;
+		const ack = registerIntent(pair, { acceptsSkimmedFee: false });
+		expect(ack.feeMode).to.equal('hop');
+		const failed = new Promise<{ reason: string }>((resolve) =>
+			alice.once('jit:failed', resolve)
+		);
+		driveForward(alice, ack.interceptScid, { amountMsat: 2_000_000n });
+		expect((await failed).reason).to.match(/owed as a routing fee/);
+		expect(alice.listChannels()).to.have.length(0);
 	});
 
 	// Issue #687: the price belongs before the decision to create an invoice.

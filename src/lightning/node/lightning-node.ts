@@ -174,6 +174,7 @@ import {
 	IHeldJitPart,
 	IJitReceiveConfig,
 	IJitReceiveQuote,
+	JitFeeMode,
 	IPersistedHeldPart,
 	JitReceiveManager,
 	decodeJitAck,
@@ -18169,7 +18170,8 @@ export class LightningNode extends EventEmitter {
 		this.emitStructuredLog('peer', 'jit_intent', {
 			pubkey: msg.peerPubkey,
 			accepted: ack.accepted,
-			scid: ack.interceptScid.toString('hex')
+			scid: ack.interceptScid.toString('hex'),
+			feeMode: ack.feeMode
 		});
 	}
 
@@ -18298,10 +18300,13 @@ export class LightningNode extends EventEmitter {
 	 *
 	 * The intent is one round trip over the beignet custom message type
 	 * (#546): we send an authorization naming what we will accept, the LSP
-	 * mints an intercept SCID and answers with it plus its opening-fee quote.
-	 * The caller then puts the hint in `createInvoice({ extraRoutingHints })`
-	 * and the quote in `jitFeeAllowance`, which is what lets the skimmed HTLC
-	 * settle at our final hop.
+	 * mints an intercept SCID and answers with it plus its opening-fee quote
+	 * and how that fee is collected (`feeMode`). In skim mode the caller puts
+	 * the hint in `createInvoice({ extraRoutingHints })` and the quote in
+	 * `jitFeeAllowance`, which is what lets the skimmed HTLC settle at our
+	 * final hop. In hop mode the hint returned here already carries the fee
+	 * terms: the sender pays them as a routing fee, the LSP forwards the full
+	 * amount, and no allowance is needed.
 	 *
 	 * A quote above our ceilings is REFUSED here rather than carried into an
 	 * invoice: an ack is the peer's number, and registering an allowance for
@@ -18323,12 +18328,21 @@ export class LightningNode extends EventEmitter {
 			/** Per-request overrides of the configured quote ceilings. */
 			maxFlatFeeSat?: bigint;
 			maxFeePpm?: number;
+			/**
+			 * Whether this node will settle an HTLC short of its onion amount
+			 * by the opening fee (default true: beignet implements the
+			 * allowance). False asks the LSP for HOP mode, where the sender
+			 * pays the fee through the invoice hint instead.
+			 */
+			acceptsSkimmedFee?: boolean;
 		}
 	): Promise<{
 		interceptScid: Buffer;
 		hint: IRoutingHintHop;
 		flatFeeSat: bigint;
 		feePpm: number;
+		/** How the LSP collects the fee; decides what the invoice must carry. */
+		feeMode: JitFeeMode;
 	}> {
 		const pubkeyErr = validateHexPubkey(lspPubkeyHex, 'lspPubkeyHex');
 		if (pubkeyErr) throw new Error(pubkeyErr);
@@ -18360,10 +18374,11 @@ export class LightningNode extends EventEmitter {
 					targetRemainingInboundSat: params.targetRemainingInboundSat,
 					expirySeconds:
 						params.expirySeconds ?? JIT_RECEIVE_DEFAULT_EXPIRY_SECONDS,
-					// The LSP refuses an intent it would charge a fee on unless we
-					// say this, because it cannot rewrite the onion and BOLT 4 would
-					// have us fail the short HTLC after the channel was funded.
-					acceptsSkimmedFee: true
+					// Without this the LSP cannot skim (it cannot rewrite the onion,
+					// and BOLT 4 would have us fail the short HTLC after the channel
+					// was funded), so it serves the intent in hop mode instead and
+					// the fee lands on the sender through the hint.
+					acceptsSkimmedFee: params.acceptsSkimmedFee !== false
 				})
 			);
 		} catch (err) {
@@ -18395,26 +18410,44 @@ export class LightningNode extends EventEmitter {
 					`accepted maximum of ${maxFlatFeeSat} sat + ${maxFeePpm} ppm`
 			);
 		}
+		// An ack without the field comes from an LSP that predates hop mode,
+		// which only ever accepts a skim (or charges nothing).
+		const feeMode: JitFeeMode = ack.feeMode ?? 'skim';
+		// A hop-mode ack to a client that offered to be skimmed would charge
+		// the fee twice over: once on the sender through the hint and again
+		// off the forward. The LSP never answers that way; refuse if one does.
+		if (feeMode === 'hop' && params.acceptsSkimmedFee !== false) {
+			throw new Error(
+				'LSP answered a skim-accepting intent with hop-mode fee terms'
+			);
+		}
+		const hop = feeMode === 'hop';
 		return {
 			interceptScid: ack.interceptScid,
 			hint: {
 				pubkey: Buffer.from(lspPubkeyHex, 'hex'),
 				shortChannelId: ack.interceptScid,
-				// The LSP is paid by the skim, not by a hop fee: a non-zero fee
-				// here would have the sender over-deliver on top of the deduction.
-				feeBaseMsat: 0,
-				feeProportionalMillionths: 0,
+				// Skim: the LSP is paid off the forward, so a hop fee here would
+				// have the sender over-deliver on top of the deduction. Hop: the
+				// hint IS how the fee is charged, and its BOLT 7 arithmetic (base
+				// plus ppm of the forwarded amount) is the opening fee's own.
+				feeBaseMsat: hop ? Number(ack.flatFeeSat * 1000n) : 0,
+				feeProportionalMillionths: hop ? ack.feePpm : 0,
 				cltvExpiryDelta: JIT_RECEIVE_HINT_CLTV_DELTA
 			},
 			flatFeeSat: ack.flatFeeSat,
-			feePpm: ack.feePpm
+			feePpm: ack.feePpm,
+			feeMode
 		};
 	}
 
 	/**
 	 * Wallet side of JIT receive end to end: register the intent, then issue an
 	 * invoice carrying the intercept hint, the extra final-CLTV headroom
-	 * on-the-fly funding needs, and the allowance for the quoted opening fee.
+	 * on-the-fly funding needs, and (skim mode) the allowance for the quoted
+	 * opening fee. In hop mode (`feeMode: 'hop'`) the hint carries the fee
+	 * terms instead, the sender pays them, and the invoice needs no allowance:
+	 * a receiver-pays fee becomes a sender-pays one.
 	 */
 	async createJitInvoice(opts: {
 		lspPubkeyHex: string;
@@ -18428,11 +18461,17 @@ export class LightningNode extends EventEmitter {
 		maxFlatFeeSat?: bigint;
 		maxFeePpm?: number;
 		timeoutMs?: number;
+		/**
+		 * Who pays the opening fee: `skim` (default) deducts it from what this
+		 * node receives; `hop` charges it to the sender through the hint.
+		 */
+		feeMode?: JitFeeMode;
 	}): Promise<
 		ICreateInvoiceResult & {
 			interceptScid: Buffer;
 			flatFeeSat: bigint;
 			feePpm: number;
+			feeMode: JitFeeMode;
 		}
 	> {
 		const expiry = opts.expiry ?? JIT_RECEIVE_DEFAULT_EXPIRY_SECONDS;
@@ -18449,7 +18488,8 @@ export class LightningNode extends EventEmitter {
 				? { maxFlatFeeSat: opts.maxFlatFeeSat }
 				: {}),
 			...(opts.maxFeePpm !== undefined ? { maxFeePpm: opts.maxFeePpm } : {}),
-			...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {})
+			...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+			acceptsSkimmedFee: opts.feeMode !== 'hop'
 		});
 		// Over an existing usable channel with the LSP the invoice routes the
 		// way any private-channel invoice does (the channel's own hint is
@@ -18467,17 +18507,24 @@ export class LightningNode extends EventEmitter {
 			...(existing ? {} : { extraRoutingHints: [[grant.hint]] }),
 			// The quote, never a msat figure: the allowance is sized against the
 			// total the payment declares, so an amount-less invoice authorizes
-			// only the fee owed on what actually arrives.
-			jitFeeAllowance: {
-				flatFeeSat: Number(grant.flatFeeSat),
-				feePpm: grant.feePpm
-			}
+			// only the fee owed on what actually arrives. Hop mode records no
+			// allowance at all: the forward is the full amount, and an allowance
+			// would let a short HTLC settle for a fee nobody is deducting.
+			...(grant.feeMode === 'skim'
+				? {
+						jitFeeAllowance: {
+							flatFeeSat: Number(grant.flatFeeSat),
+							feePpm: grant.feePpm
+						}
+				  }
+				: {})
 		});
 		return {
 			...result,
 			interceptScid: grant.interceptScid,
 			flatFeeSat: grant.flatFeeSat,
-			feePpm: grant.feePpm
+			feePpm: grant.feePpm,
+			feeMode: grant.feeMode
 		};
 	}
 
@@ -19009,6 +19056,7 @@ export class LightningNode extends EventEmitter {
 					inHtlcId,
 					paymentHash,
 					forwardAmountMsat: forwardAmount,
+					incomingAmountMsat,
 					forwardCltv,
 					incomingCltvExpiry,
 					nextPacket,
@@ -19112,6 +19160,7 @@ export class LightningNode extends EventEmitter {
 					inHtlcId,
 					paymentHash,
 					forwardAmountMsat: forwardAmount,
+					incomingAmountMsat,
 					forwardCltv,
 					incomingCltvExpiry,
 					nextPacket,

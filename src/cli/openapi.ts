@@ -304,7 +304,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/jit/invoice': {
 				post: {
 					summary:
-						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards, deducting the quoted opening fee (flatFeeSat + feePpm) from the delivery. Requires the LSP peer to be connected and running the JIT receive engine',
+						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards. The quoted opening fee (flatFeeSat + feePpm) is collected per feeMode: skim (default) deducts it from the delivery, hop puts it in the invoice routing hint so the sender pays it on top and the full amount is delivered. Requires the LSP peer to be connected and running the JIT receive engine',
 					tags: ['Invoices'],
 					requestBody: bodyContent({
 						lspPubkey: 'string',
@@ -313,11 +313,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						expirySecs: 'number?',
 						targetRemainingInboundSat: 'number?',
 						maxFlatFeeSat: 'number?',
-						maxFeePpm: 'number?'
+						maxFeePpm: 'number?',
+						feeMode: 'string?'
 					}),
 					responses: {
 						'200': {
-							description: 'Created invoice plus the agreed opening fee',
+							description:
+								'Created invoice plus the agreed opening fee and how it is collected',
 							content: jsonContent({
 								allOf: [
 									{ $ref: '#/components/schemas/InvoiceInfo' },
@@ -325,7 +327,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 										type: 'object',
 										properties: {
 											flatFeeSat: { type: 'number' },
-											feePpm: { type: 'number' }
+											feePpm: { type: 'number' },
+											feeMode: { type: 'string', enum: ['skim', 'hop'] }
 										}
 									}
 								]

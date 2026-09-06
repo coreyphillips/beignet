@@ -1153,6 +1153,13 @@ export interface IForwardablePart {
 	inHtlcId: bigint;
 	paymentHash: Buffer;
 	forwardAmountMsat: bigint;
+	/**
+	 * The inbound HTLC's value (msat), i.e. `forwardAmountMsat` plus whatever
+	 * routing fee the sender paid this hop. Recorded by the forwarding path
+	 * so a JIT hold in hop-fee mode can check the opening fee arrived; a
+	 * part without it is read as having paid none.
+	 */
+	incomingAmountMsat?: bigint;
 	forwardCltv: number;
 	/** The INBOUND leg's expiry: the deadline every hold is bounded by. */
 	incomingCltvExpiry: number;

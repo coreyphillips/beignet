@@ -1189,7 +1189,8 @@ async function handleInvoice(): Promise<void> {
 						code: 'INVALID_PARAMS',
 						message:
 							'Usage: beignet invoice jit <lspPubkey> [amountSats] [description] ' +
-							'[--expiry secs] [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n]'
+							'[--expiry secs] [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n] ' +
+							'[--fee-mode skim|hop]'
 					}
 				});
 				process.exitCode = 1;
@@ -1209,7 +1210,8 @@ async function handleInvoice(): Promise<void> {
 					expirySecs: numberFlag('--expiry'),
 					targetRemainingInboundSat: numberFlag('--target-inbound'),
 					maxFlatFeeSat: numberFlag('--max-flat-fee-sat'),
-					maxFeePpm: numberFlag('--max-fee-ppm')
+					maxFeePpm: numberFlag('--max-fee-ppm'),
+					feeMode: parseFlag('--fee-mode')
 				})
 			);
 		}
@@ -2848,9 +2850,11 @@ Invoices & Payments:
                                          Create BOLT 11 invoice
   invoice jit <lspPubkey> [sats] [description] [--expiry secs]
              [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n]
-                                         Create an invoice payable with no
+             [--fee-mode skim|hop]       Create an invoice payable with no
                                          channel: the LSP funds one mid-payment
-                                         and skims the agreed opening fee
+                                         and takes the agreed opening fee out
+                                         of the delivery (skim, default) or
+                                         from the sender via the hint (hop)
   jit status                             The JIT receive role as it stands:
                                          fee, exposure caps, sats reserved and
                                          fronted, live intents
