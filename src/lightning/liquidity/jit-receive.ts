@@ -1162,6 +1162,7 @@ export class JitReceiveManager extends EventEmitter {
 		if (this.destroyed) return false;
 		const intent = this.intents.get(scidHex);
 		if (!intent) return false;
+		if (JitReceiveManager.principalError(part)) return false;
 		if (Date.now() > intent.expiresAt) {
 			this.intents.delete(scidHex);
 			this.persistIntents();
@@ -1415,6 +1416,7 @@ export class JitReceiveManager extends EventEmitter {
 	 */
 	tryHoldForSplice(outChannelId: Buffer, part: IHeldJitPart): boolean {
 		if (this.destroyed) return false;
+		if (JitReceiveManager.principalError(part)) return false;
 		if (!this.deps.peerForChannel || !this.deps.spliceInAndWait) {
 			return false;
 		}
@@ -1729,25 +1731,41 @@ export class JitReceiveManager extends EventEmitter {
 	}
 
 	/**
-	 * What the HOP parts' senders paid us above the onion amount: the routing
-	 * fee the wallet's invoice hint asked for. A part whose inbound value the
-	 * caller did not record counts as having paid nothing, so a forward path
-	 * that forgets the field fails closed rather than fronting for free.
+	 * Every part must fund its own principal, including skim parts. Checking
+	 * before the skim keeps the opening fee from subsidizing an underfunded
+	 * inbound HTLC. Missing inbound values fail closed in every fee mode.
 	 */
-	private static hopFeeCollectedMsat(hop: IHeldJitPart[]): bigint {
-		let collected = 0n;
-		for (const part of hop) {
-			const incoming = part.incomingAmountMsat ?? 0n;
-			if (incoming > part.forwardAmountMsat) {
-				collected += incoming - part.forwardAmountMsat;
-			}
+	private static principalError(part: IHeldJitPart): string | null {
+		if (part.incomingAmountMsat === undefined) {
+			return 'JIT part has no recorded inbound amount';
 		}
-		return collected;
+		if (part.incomingAmountMsat < part.forwardAmountMsat) {
+			return `JIT part forwards ${part.forwardAmountMsat} msat but only ${part.incomingAmountMsat} msat arrived`;
+		}
+		return null;
 	}
 
 	/**
-	 * Null when the opening fee can be taken out of these parts (skim) and
-	 * has arrived on them (hop). Checked BEFORE any state is consumed and
+	 * The flat opening fee is owed once. Routing hints round proportional
+	 * fees on each HTLC, so sum those rounded fees instead of rounding the
+	 * aggregate and refusing correctly paid multipart payments.
+	 */
+	private hopFeeMsat(hop: IHeldJitPart[]): bigint {
+		return hop.reduce(
+			(total, part) =>
+				total +
+				jitOpeningFeeMsat(part.forwardAmountMsat, {
+					flatFeeSat: 0n,
+					feePpm: this.cfg.feePpm
+				}),
+			this.openingFeeMsat(0n)
+		);
+	}
+
+	/**
+	 * Null when every part covers its principal and the opening fee can be
+	 * taken out of these parts (skim) or has arrived on them (hop).
+	 * Checked BEFORE any state is consumed and
 	 * again right before the forward, so a fee that cannot be collected
 	 * fails every part upstream instead of fronting a channel for it.
 	 */
@@ -1755,6 +1773,10 @@ export class JitReceiveManager extends EventEmitter {
 		parts: IHeldJitPart[],
 		intents: IJitIntent[]
 	): string | null {
+		for (const part of parts) {
+			const principalError = JitReceiveManager.principalError(part);
+			if (principalError) return principalError;
+		}
 		const { skim, hop, skimAgreed } = this.feeGroups(parts, intents);
 		const skimFee = this.skimFeeMsat(skim, skimAgreed);
 		if (skimFee > 0n) {
@@ -1766,10 +1788,12 @@ export class JitReceiveManager extends EventEmitter {
 			}
 		}
 		if (hop.length > 0) {
-			const owed = this.openingFeeMsat(
-				hop.reduce((s, p) => s + p.forwardAmountMsat, 0n)
+			const owed = this.hopFeeMsat(hop);
+			const collected = hop.reduce(
+				(total, part) =>
+					total + part.incomingAmountMsat! - part.forwardAmountMsat,
+				0n
 			);
-			const collected = JitReceiveManager.hopFeeCollectedMsat(hop);
 			if (collected < owed) {
 				return `JIT fee ${owed} msat is owed as a routing fee on the inbound HTLCs but only ${collected} msat arrived`;
 			}

@@ -151,6 +151,7 @@ function makePart(
 		inHtlcId: BigInt(Math.floor(Math.random() * 1_000_000)),
 		paymentHash: opts.paymentHash ?? crypto.randomBytes(32),
 		forwardAmountMsat: opts.amountMsat ?? 1_000_000n,
+		incomingAmountMsat: opts.amountMsat ?? 1_000_000n,
 		forwardCltv: opts.forwardCltv ?? 800_100,
 		incomingCltvExpiry: opts.incomingCltvExpiry ?? 800_200,
 		nextPacket: {
@@ -880,17 +881,14 @@ describe('JIT opening fee', function () {
 		expect(h.opens).to.have.length(0);
 	});
 
-	it('hop mode: a part without a recorded inbound value counts as having paid nothing', async function () {
-		// The field is the forwarding path's to fill; a caller that forgets it
-		// must fail closed rather than front a channel for an unpaid fee.
+	it('hop mode: a part without a recorded inbound value is refused', function () {
 		const h = makeHarness({ flatFeeSat: 1n });
 		const ack = h.manager.registerIntent(CLIENT, auth());
-		const failure = waitFor<{ reason: string }>(h.manager, 'jit:failed');
-		h.manager.tryInterceptUnknownScid(
-			ack.interceptScid.toString('hex'),
-			makePart(h, { amountMsat: 1_000_000n })
-		);
-		expect((await failure).reason).to.match(/only 0 msat arrived/);
+		const part = makePart(h);
+		delete part.incomingAmountMsat;
+		expect(
+			h.manager.tryInterceptUnknownScid(ack.interceptScid.toString('hex'), part)
+		).to.equal(false);
 		expect(h.opens).to.have.length(0);
 	});
 
@@ -906,6 +904,165 @@ describe('JIT opening fee', function () {
 		await waitFor(h.manager, 'jit:forwarded');
 		expect(h.forwarded[0].part.forwardAmountMsat).to.equal(1_000_000n);
 	});
+
+	for (const mode of ['hop', 'skim', 'free'] as const) {
+		for (const incoming of [undefined, 1_000n]) {
+			it(`${mode}: refuses a part with ${
+				incoming ?? 'missing'
+			} inbound msat even when another part pays the fee`, async function () {
+				const h = makeHarness({ flatFeeSat: mode === 'free' ? 0n : 100n });
+				const hash = crypto.randomBytes(32);
+				const ack = h.manager.registerIntent(
+					CLIENT,
+					auth({
+						paymentHash: hash,
+						expectedTotalMsat: 2_000_000n,
+						acceptsSkimmedFee: mode === 'skim'
+					})
+				);
+				const scidHex = ack.interceptScid.toString('hex');
+				const first = makePart(h, { paymentHash: hash });
+				first.incomingAmountMsat = 1_100_000n;
+				expect(h.manager.tryInterceptUnknownScid(scidHex, first)).to.equal(
+					true
+				);
+				const underfunded = makePart(h, { paymentHash: hash });
+				underfunded.incomingAmountMsat = incoming;
+				expect(
+					h.manager.tryInterceptUnknownScid(scidHex, underfunded)
+				).to.equal(false);
+				expect(h.manager.heldTotalMsat(scidHex)).to.equal(1_000_000n);
+				expect(h.opens).to.have.length(0);
+				expect(h.forwarded).to.have.length(0);
+
+				// Refusing the bad part does not poison the valid payment: a fully
+				// funded replacement can complete the set without another flat fee.
+				const replacement = makePart(h, { paymentHash: hash });
+				expect(
+					h.manager.tryInterceptUnknownScid(scidHex, replacement)
+				).to.equal(true);
+				await waitFor(h.manager, 'jit:forwarded');
+				expect(h.forwarded.map((f) => f.part)).to.deep.equal([
+					first,
+					replacement
+				]);
+			});
+		}
+	}
+
+	for (const flatFeeSat of [0n, 100n]) {
+		it(`hop mode: accepts per-part proportional rounding with ${flatFeeSat} sat charged once`, async function () {
+			const h = makeHarness({ flatFeeSat, feePpm: 500 });
+			const hash = crypto.randomBytes(32);
+			const ack = h.manager.registerIntent(
+				CLIENT,
+				auth({ paymentHash: hash, expectedTotalMsat: 2_000_000n })
+			);
+			const first = makePart(h, { amountMsat: 999_999n, paymentHash: hash });
+			first.incomingAmountMsat = 999_999n + 499n + flatFeeSat * 1_000n;
+			const second = makePart(h, { amountMsat: 1_000_001n, paymentHash: hash });
+			second.incomingAmountMsat = 1_000_001n + 500n;
+			const scidHex = ack.interceptScid.toString('hex');
+			h.manager.tryInterceptUnknownScid(scidHex, first);
+			h.manager.tryInterceptUnknownScid(scidHex, second);
+			await waitFor(h.manager, 'jit:forwarded');
+			expect(h.forwarded.map((f) => f.part.forwardAmountMsat)).to.deep.equal([
+				999_999n,
+				1_000_001n
+			]);
+			expect(h.opens).to.have.length(1);
+			expect(h.failed).to.have.length(0);
+		});
+	}
+
+	for (const acceptsSkimmedFee of [false, true]) {
+		for (const incoming of [undefined, 1_000n]) {
+			it(`splice path: refuses a late part with ${
+				incoming ?? 'missing'
+			} inbound msat in ${
+				acceptsSkimmedFee ? 'skim' : 'hop'
+			} mode`, async function () {
+				const h = makeHarness({ flatFeeSat: 100n });
+				const hash = crypto.randomBytes(32);
+				h.manager.registerIntent(
+					CLIENT,
+					auth({ paymentHash: hash, acceptsSkimmedFee })
+				);
+				const channelId = crypto.randomBytes(32);
+				const first = makePart(h, { paymentHash: hash });
+				first.incomingAmountMsat = 1_100_000n;
+				expect(h.manager.tryHoldForSplice(channelId, first)).to.equal(true);
+				const late = makePart(h, { paymentHash: hash });
+				late.incomingAmountMsat = incoming;
+				expect(h.manager.tryHoldForSplice(channelId, late)).to.equal(false);
+				await waitFor(h.manager, 'jit:forwarded');
+				expect(h.forwarded.map((f) => f.part)).to.deep.equal([first]);
+				expect(h.splices).to.have.length(1);
+				expect(h.failed).to.have.length(0);
+			});
+		}
+	}
+
+	for (const lateFeeMsat of [499n, 500n]) {
+		it(`splice path: validates the rounded fee of a late part paying ${lateFeeMsat} msat`, async function () {
+			const h = makeHarness({ feePpm: 500 });
+			const hash = crypto.randomBytes(32);
+			h.manager.registerIntent(CLIENT, auth({ paymentHash: hash }));
+			const channelId = crypto.randomBytes(32);
+			const first = makePart(h, { amountMsat: 999_999n, paymentHash: hash });
+			first.incomingAmountMsat = 999_999n + 499n;
+			const late = makePart(h, { amountMsat: 1_000_001n, paymentHash: hash });
+			late.incomingAmountMsat = 1_000_001n + lateFeeMsat;
+			expect(h.manager.tryHoldForSplice(channelId, first)).to.equal(true);
+			expect(h.manager.tryHoldForSplice(channelId, late)).to.equal(true);
+			if (lateFeeMsat === 500n) {
+				await waitFor(h.manager, 'jit:forwarded');
+				expect(h.forwarded.map((f) => f.part.forwardAmountMsat)).to.deep.equal([
+					999_999n,
+					1_000_001n
+				]);
+				expect(h.failed).to.have.length(0);
+			} else {
+				const failure = await waitFor<{ reason: string }>(
+					h.manager,
+					'jit:failed'
+				);
+				expect(failure.reason).to.match(
+					/999 msat is owed.*only 998 msat arrived/
+				);
+				expect(h.forwarded).to.have.length(0);
+				expect(h.failed).to.have.length(2);
+			}
+			expect(h.splices).to.have.length(1);
+		});
+	}
+
+	for (const path of ['open', 'splice'] as const) {
+		it(`${path}: rechecks each part's principal immediately before forwarding`, async function () {
+			const h = makeHarness({ flatFeeSat: 100n });
+			const ack = h.manager.registerIntent(CLIENT, auth());
+			const part = makePart(h);
+			part.incomingAmountMsat = 1_100_000n;
+			if (path === 'open') {
+				h.manager.tryInterceptUnknownScid(
+					ack.interceptScid.toString('hex'),
+					part
+				);
+			} else {
+				h.manager.tryHoldForSplice(crypto.randomBytes(32), part);
+			}
+			part.incomingAmountMsat = 1_000n;
+			const failure = await waitFor<{ reason: string }>(
+				h.manager,
+				'jit:failed'
+			);
+			expect(failure.reason).to.match(
+				/forwards 1000000 msat but only 1000 msat arrived/
+			);
+			expect(h.forwarded).to.have.length(0);
+			expect(h.failed).to.have.length(1);
+		});
+	}
 
 	it('splice path: skim and hop parts queued together each settle their own way', async function () {
 		// One wallet may hold a skim intent and a hop intent at once (two

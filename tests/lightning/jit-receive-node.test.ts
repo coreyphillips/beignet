@@ -258,9 +258,14 @@ function registerIntent(
 function driveForward(
 	alice: LightningNode,
 	scid: Buffer,
-	opts: { amountMsat?: bigint; incomingCltvExpiry?: number } = {}
+	opts: {
+		amountMsat?: bigint;
+		incomingAmountMsat?: bigint;
+		incomingCltvExpiry?: number;
+		paymentHash?: Buffer;
+	} = {}
 ): { paymentHash: Buffer } {
-	const paymentHash = crypto.randomBytes(32);
+	const paymentHash = opts.paymentHash ?? crypto.randomBytes(32);
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	(alice as any).handleForwardHtlc(
 		crypto.randomBytes(32),
@@ -282,7 +287,7 @@ function driveForward(
 		},
 		// Generous relay fee, so a forward onto a real channel clears the
 		// outgoing policy check and reaches the add.
-		(opts.amountMsat ?? 2_000_000n) + 100_000n,
+		opts.incomingAmountMsat ?? (opts.amountMsat ?? 2_000_000n) + 100_000n,
 		opts.incomingCltvExpiry ?? 800_200
 	);
 	return { paymentHash };
@@ -384,6 +389,106 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		driveForward(alice, ack.interceptScid, { amountMsat: 2_000_000n });
 		expect((await failed).reason).to.match(/owed as a routing fee/);
 		expect(alice.listChannels()).to.have.length(0);
+	});
+
+	for (const acceptsSkimmedFee of [false, true]) {
+		it(`${
+			acceptsSkimmedFee ? 'skim' : 'hop'
+		} mode: rejects an underfunded part even when its sibling pays the opening fee`, async function () {
+			const pair = nodePair({
+				jitReceive: { enabled: true, flatFeeSat: 100n }
+			});
+			open.push(pair);
+			const { alice } = pair;
+			const paymentHash = crypto.randomBytes(32);
+			const ack = registerIntent(pair, {
+				acceptsSkimmedFee,
+				paymentHash,
+				expectedTotalMsat: 2_000_000n
+			});
+			const forwards: bigint[] = [];
+			alice.on(
+				'htlc:forward',
+				(_in: Buffer, _out: Buffer, amountMsat: bigint) =>
+					forwards.push(amountMsat)
+			);
+			const manager = alice.getChannelManager();
+			const originalFail = manager.failHtlc.bind(manager);
+			let failures = 0;
+			manager.failHtlc = (...args): ReturnType<typeof originalFail> => {
+				failures++;
+				return originalFail(...args);
+			};
+			driveForward(alice, ack.interceptScid, {
+				paymentHash,
+				amountMsat: 1_000_000n,
+				incomingAmountMsat: 1_100_000n
+			});
+			driveForward(alice, ack.interceptScid, {
+				paymentHash,
+				amountMsat: 1_000_000n,
+				incomingAmountMsat: 1_000n
+			});
+			expect(failures).to.equal(1);
+			expect(forwards).to.have.length(0);
+			expect(alice.listChannels()).to.have.length(0);
+			expect(
+				alice
+					.getJitReceiveManager()!
+					.heldTotalMsat(ack.interceptScid.toString('hex'))
+			).to.equal(1_000_000n);
+
+			const forwarded = new Promise<void>((resolve, reject) => {
+				alice.once('jit:forwarded', () => resolve());
+				alice.once('jit:failed', (d: { reason: string }) =>
+					reject(new Error(d.reason))
+				);
+			});
+			driveForward(alice, ack.interceptScid, {
+				paymentHash,
+				amountMsat: 1_000_000n,
+				incomingAmountMsat: 1_000_000n
+			});
+			await forwarded;
+			expect(forwards).to.deep.equal(
+				acceptsSkimmedFee ? [900_000n, 1_000_000n] : [1_000_000n, 1_000_000n]
+			);
+		});
+	}
+
+	it('hop mode: forwards an MPP set paying correctly rounded per-part routing fees', async function () {
+		const pair = nodePair({ jitReceive: { enabled: true, feePpm: 500 } });
+		open.push(pair);
+		const { alice } = pair;
+		const paymentHash = crypto.randomBytes(32);
+		const ack = registerIntent(pair, {
+			acceptsSkimmedFee: false,
+			paymentHash,
+			expectedTotalMsat: 2_000_000n
+		});
+		const forwards: bigint[] = [];
+		alice.on('htlc:forward', (_in: Buffer, _out: Buffer, amountMsat: bigint) =>
+			forwards.push(amountMsat)
+		);
+		const forwarded = new Promise<void>((resolve, reject) => {
+			alice.once('jit:forwarded', () => resolve());
+			alice.once('jit:failed', (d: { reason: string }) =>
+				reject(new Error(d.reason))
+			);
+		});
+		driveForward(alice, ack.interceptScid, {
+			paymentHash,
+			amountMsat: 999_999n,
+			incomingAmountMsat: 999_999n + 499n
+		});
+		driveForward(alice, ack.interceptScid, {
+			paymentHash,
+			amountMsat: 1_000_001n,
+			incomingAmountMsat: 1_000_001n + 500n
+		});
+		await forwarded;
+		expect(forwards).to.deep.equal([999_999n, 1_000_001n]);
+		expect(alice.listChannels()).to.have.length(1);
 	});
 
 	// Issue #687: the price belongs before the decision to create an invoice.
@@ -535,6 +640,7 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 				inHtlcId: 3n,
 				paymentHash: crypto.randomBytes(32),
 				forwardAmountMsat: 1_000_000n,
+				incomingAmountMsat: 1_000_000n,
 				forwardCltv: 800_000,
 				incomingCltvExpiry: 800_100,
 				nextPacket: {

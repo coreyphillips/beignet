@@ -1156,8 +1156,8 @@ export interface IForwardablePart {
 	/**
 	 * The inbound HTLC's value (msat), i.e. `forwardAmountMsat` plus whatever
 	 * routing fee the sender paid this hop. Recorded by the forwarding path
-	 * so a JIT hold in hop-fee mode can check the opening fee arrived; a
-	 * part without it is read as having paid none.
+	 * so a JIT hold can check each part's principal and any hop opening fee.
+	 * JIT refuses parts without a recorded inbound amount in every fee mode.
 	 */
 	incomingAmountMsat?: bigint;
 	forwardCltv: number;
