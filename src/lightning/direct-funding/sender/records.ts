@@ -193,7 +193,7 @@ export class DirectFundingPaymentStore {
 		const settled = (r: IDfPaymentRecord): boolean =>
 			r.status === 'CONFIRMED' ||
 			r.status === 'FAILED' ||
-			r.status === 'ABORTED';
+			(r.status === 'ABORTED' && r.freezeReleased !== false);
 		for (const record of [...this.byRequest.values()]) {
 			if (settled(record) && now - record.updatedAt > DF_PAYMENT_RETENTION_MS) {
 				this.byRequest.delete(record.requestId);
