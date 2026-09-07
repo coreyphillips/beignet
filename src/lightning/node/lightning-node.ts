@@ -570,6 +570,8 @@ export const HELD_HTLC_EXPIRY_MARGIN = 18;
  * Electrum round trip, short against an 18-block margin.
  */
 const SWAP_TICK_SWEEP_DEADLINE_MS = 30_000;
+/** awaitPaymentResolution re-reads the HTLC view on this clock (#737). */
+const PAYMENT_RESOLUTION_POLL_MS = 250;
 /**
  * Bytes a held-forward ledger row reserves against the async receive
  * service's byte limits (issue #709), on top of the parked onion packet. A
@@ -24608,12 +24610,46 @@ export class LightningNode extends EventEmitter {
 		for (const channel of this.channelManager.listChannels()) {
 			const channelId = channel.getChannelId();
 			if (!channelId) continue;
+			// A channel that went to chain keeps its HTLC entries as they
+			// were at the close; the monitor, not the entry, knows how each
+			// offered HTLC resolved on chain.
+			const monitor = this.channelManager.getMonitor(channelId);
+			const channelState = channel.getState();
+			const onChain =
+				monitor !== undefined ||
+				channelState === ChannelState.CLOSED ||
+				channelState === ChannelState.FORCE_CLOSED;
 			for (const [key, htlc] of channel.getFullState().htlcs) {
 				if (!key.startsWith('offered-')) continue;
 				if (!htlc.paymentHash.equals(paymentHash)) continue;
 				let state: OutgoingHtlcState;
 				let terminal: boolean;
-				if (htlc.state === HtlcState.FULFILLED) {
+				const tracked =
+					onChain && htlc.state !== HtlcState.FULFILLED
+						? monitor
+								?.getTrackedOutputs()
+								.find(
+									(o) =>
+										o.outputType === OutputType.OFFERED_HTLC &&
+										(o.htlcId !== undefined
+											? o.htlcId === htlc.id
+											: o.paymentHash?.equals(paymentHash) === true)
+								)
+						: undefined;
+				if (tracked) {
+					terminal = tracked.status === OutputStatus.IRREVOCABLY_RESOLVED;
+					state = terminal ? 'onchain-resolved' : 'onchain-pending';
+				} else if (
+					onChain &&
+					htlc.state !== HtlcState.FULFILLED &&
+					htlc.state !== HtlcState.FAILED
+				) {
+					// On chain with no tracked output for this HTLC: it never
+					// made a signed commitment, or it resolved with the
+					// channel. A CLOSED channel has nothing left to resolve.
+					terminal = channelState === ChannelState.CLOSED;
+					state = terminal ? 'onchain-resolved' : 'onchain-pending';
+				} else if (htlc.state === HtlcState.FULFILLED) {
 					state = 'fulfilled';
 					terminal = true;
 				} else if (htlc.state === HtlcState.FAILED) {
@@ -24747,6 +24783,7 @@ export class LightningNode extends EventEmitter {
 				this.removeListener('payment:htlc-resolved', onHtlc);
 				this.removeListener('payment:preimage', onHtlc);
 				this.removeListener('block:processed', onBlock);
+				clearInterval(poll);
 				this._activeWaitCleanups.delete(destroyCleanup);
 			};
 			const destroyCleanup = (): void => {
@@ -24779,6 +24816,12 @@ export class LightningNode extends EventEmitter {
 				if (event.paymentHash.toString('hex') === hashHex) check();
 			};
 			const onBlock = (): void => check();
+			// The removal becomes irrevocable on the peer's revocation, which
+			// arrives on its own schedule and raises no payment event; with
+			// real message latency the deferred re-check above runs before
+			// it. Look again on a short clock until resolved.
+			const poll = setInterval(evaluate, PAYMENT_RESOLUTION_POLL_MS);
+			poll.unref?.();
 
 			this.on('payment:sent', onPayment);
 			this.on('payment:failed', onPayment);

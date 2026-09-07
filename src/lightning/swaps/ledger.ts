@@ -140,6 +140,13 @@ export interface ISwapRecord extends ILedgerRecord {
 	fundingTxid?: string;
 	fundingVout?: number;
 	fundingValueSat?: string;
+	/**
+	 * Set BEFORE the first broadcast is attempted. Absent on a row with
+	 * bytes, the bytes never left this process: a hold cancel may fail the
+	 * swap and release the inputs. Present, they may be out (a broadcast
+	 * that threw can have relayed), so the row is exposed and watched.
+	 */
+	fundingBroadcastAttemptedAt?: number;
 	fundingBroadcastAt?: number;
 	fundingHeight?: number;
 	/** Refund (reverse: ours) bookkeeping. */
@@ -261,15 +268,21 @@ export function swapSourcesFor(
  * onward (our coins are or will be locked) until a resolution has met
  * policy, submarine rows from PAYING onward (a Lightning payment is out).
  */
-export function isSwapExposure(record: ISwapRecord): boolean {
+export function isSwapExposure(
+	record: ISwapRecord,
+	resolutionConfirmations = 1
+): boolean {
 	if (isTerminalSwapState(record.state)) return false;
 	if (record.direction === 'reverse') {
 		if (record.state === 'CREATED') return false;
 		if (record.state === 'EXPOSED') {
+			// Only a resolution verified in THIS process, at the configured
+			// depth, takes the principal off the books: a reloaded flag is
+			// history, and one confirmation is not policy depth.
 			return !(
 				record.resolution &&
 				record.resolution.verifiedThisSession &&
-				record.resolution.confirmations > 0
+				record.resolution.confirmations >= Math.max(1, resolutionConfirmations)
 			);
 		}
 		return true;
@@ -324,6 +337,15 @@ export const swapCodec: ILedgerCodec<ISwapRecord> = {
 					!HEX64.test(parsed.preimageHex))
 			) {
 				return null;
+			}
+			// A resolution read back from storage was verified by an earlier
+			// process against a chain that may have moved: it counts again
+			// only once this one has observed it.
+			if (parsed.resolution) {
+				parsed.resolution = {
+					...parsed.resolution,
+					verifiedThisSession: false
+				};
 			}
 			return parsed as ISwapRecord;
 		} catch {
@@ -388,14 +410,17 @@ export class SwapLedger {
 		)[0];
 	}
 
-	static exposure(records: readonly ISwapRecord[]): ISwapExposureSummary {
+	static exposure(
+		records: readonly ISwapRecord[],
+		resolutionConfirmations = 1
+	): ISwapExposureSummary {
 		let count = 0;
 		let exposedCount = 0;
 		let exposedSat = 0n;
 		for (const r of records) {
 			if (isTerminalSwapState(r.state)) continue;
 			count++;
-			if (isSwapExposure(r)) {
+			if (isSwapExposure(r, resolutionConfirmations)) {
 				exposedCount++;
 				exposedSat += BigInt(r.onchainSat);
 			}

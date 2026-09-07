@@ -180,6 +180,30 @@ describe('Swap exposure policy (issue #737 phase 2)', function () {
 				})
 			)
 		).to.equal(true);
+		// Policy depth: one confirmation is not three.
+		const shallow = row('EXPOSED', 1n, 'reverse', {
+			resolution: {
+				kind: 'refund',
+				txid: 'aa',
+				confirmations: 1,
+				verifiedThisSession: true
+			}
+		});
+		expect(isSwapExposure(shallow, 3)).to.equal(true);
+		expect(isSwapExposure(shallow, 1)).to.equal(false);
+		expect(
+			isSwapExposure(
+				row('EXPOSED', 1n, 'reverse', {
+					resolution: {
+						kind: 'refund',
+						txid: 'aa',
+						confirmations: 3,
+						verifiedThisSession: true
+					}
+				}),
+				3
+			)
+		).to.equal(false);
 		expect(isSwapExposure(row('CREATED', 1n, 'submarine'))).to.equal(false);
 		expect(isSwapExposure(row('FUNDED', 1n, 'submarine'))).to.equal(false);
 		for (const state of [

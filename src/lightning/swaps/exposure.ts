@@ -32,6 +32,11 @@ export interface ISwapExposureInput {
 	feeRateSatPerVbyte?: number;
 	/** ledger.unresolved() */
 	live: readonly ISwapRecord[];
+	/**
+	 * The provider's resolution depth: an exposed row stops counting only
+	 * once its resolution, verified this session, reached it (default 1).
+	 */
+	resolutionConfirmations?: number;
 	availableBalanceSat?: bigint;
 }
 
@@ -124,7 +129,8 @@ export function evaluateSwapExposure(
 	}
 	let exposedSat = 0n;
 	for (const r of input.live) {
-		if (isSwapExposure(r)) exposedSat += BigInt(r.onchainSat);
+		if (isSwapExposure(r, input.resolutionConfirmations ?? 1))
+			exposedSat += BigInt(r.onchainSat);
 	}
 	if (exposedSat + amountSat > policy.maxTotalExposureSat) {
 		return {
