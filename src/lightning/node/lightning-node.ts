@@ -24642,11 +24642,18 @@ export class LightningNode extends EventEmitter {
 				} else if (
 					onChain &&
 					htlc.state !== HtlcState.FULFILLED &&
-					htlc.state !== HtlcState.FAILED
+					!(
+						htlc.state === HtlcState.FAILED &&
+						LightningNode.isOfferedFailIrrevocable(htlc)
+					)
 				) {
 					// On chain with no tracked output for this HTLC: it never
 					// made a signed commitment, or it resolved with the
-					// channel. A CLOSED channel has nothing left to resolve.
+					// channel. This includes a fail received one revocation
+					// short of removal when the channel closed: that
+					// revocation never comes, and the commitment that went to
+					// chain carries no output for it. A CLOSED channel has
+					// nothing left to resolve.
 					terminal = channelState === ChannelState.CLOSED;
 					state = terminal ? 'onchain-resolved' : 'onchain-pending';
 				} else if (htlc.state === HtlcState.FULFILLED) {
@@ -24767,11 +24774,20 @@ export class LightningNode extends EventEmitter {
 				timeoutMs === undefined
 					? undefined
 					: setTimeout(() => {
+							if (done) return;
+							// The deadline reads the view once more: a removal
+							// that became irrevocable between the last poll and
+							// now is a resolution, not a timeout.
+							const last = this.getOutgoingHtlcs(paymentHash);
 							cleanup();
+							if (last.resolved) {
+								resolve(last);
+								return;
+							}
 							const err = new Error(
 								`awaitPaymentResolution timed out after ${timeoutMs}ms`
 							) as Error & { resolution: IOutgoingPaymentResolution };
-							err.resolution = this.getOutgoingHtlcs(paymentHash);
+							err.resolution = last;
 							reject(err);
 					  }, timeoutMs);
 

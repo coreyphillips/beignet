@@ -18,7 +18,7 @@ import {
 } from '../../src/lightning/node/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { OutputStatus, OutputType } from '../../src/lightning/chain/types';
-import { ChannelState } from '../../src/lightning/channel/types';
+import { ChannelState, HtlcState } from '../../src/lightning/channel/types';
 import {
 	buildGraph,
 	connectNodes,
@@ -200,6 +200,94 @@ describe('Outgoing payment resolution (issue #737 phase 2)', function () {
 		view = alice.getOutgoingHtlcs(hash);
 		expect(view.htlcs[0].state).to.equal('onchain-resolved');
 		expect(view.htlcs[0].terminal).to.equal(true);
+		expect(view.resolved).to.equal(true);
+	});
+
+	it('a fail one revocation short of removal resolves once its channel closed with no output for it', function () {
+		const alice = createNode(TAG, 24);
+		const bob = createNode(TAG, 25);
+		connectNodes(alice, bob);
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const channelId = openReadyChannel(alice, bob);
+		buildGraph(alice, bob, [channelId]);
+		const { hash } = makeExternalHash();
+		const invoice = bob.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'held',
+			hold: true,
+			paymentHash: hash
+		});
+		alice.sendPayment(invoice.bolt11);
+		const channel = alice.getChannelManager().getChannel(channelId)!;
+		const key = [...channel.getFullState().htlcs.keys()].find((k) =>
+			k.startsWith('offered-')
+		)!;
+		const entry = channel.getFullState().htlcs.get(key)! as {
+			state: HtlcState;
+			removalLocallyRevoked?: boolean;
+			removalRemoteCommitted?: boolean;
+		};
+		// The peer failed it, we revoked, the peer's revocation never came:
+		// the channel closed first.
+		entry.state = HtlcState.FAILED;
+		entry.removalLocallyRevoked = true;
+		entry.removalRemoteCommitted = false;
+		let view = alice.getOutgoingHtlcs(hash);
+		expect(view.htlcs[0].state).to.equal('failed');
+		expect(view.htlcs[0].terminal).to.equal(false);
+
+		const manager = alice.getChannelManager() as unknown as {
+			getMonitor(id: Buffer): unknown;
+		};
+		manager.getMonitor = (id: Buffer) =>
+			id.equals(channelId) ? { getTrackedOutputs: () => [] } : undefined;
+		(channel as unknown as { _state: { state: ChannelState } })._state.state =
+			ChannelState.FORCE_CLOSED;
+		view = alice.getOutgoingHtlcs(hash);
+		expect(view.htlcs[0].state).to.equal('onchain-pending');
+		expect(view.htlcs[0].terminal).to.equal(false);
+
+		(channel as unknown as { _state: { state: ChannelState } })._state.state =
+			ChannelState.CLOSED;
+		alice.failPayment(hash, 'closed on chain');
+		view = alice.getOutgoingHtlcs(hash);
+		expect(view.htlcs[0].state).to.equal('onchain-resolved');
+		expect(view.htlcs[0].terminal).to.equal(true);
+		expect(view.resolved).to.equal(true);
+	});
+
+	it('a resolution that lands between the last poll and the deadline resolves, never times out', async function () {
+		const alice = createNode(TAG, 26);
+		const hash = makeExternalHash().hash;
+		let resolved = false;
+		const original = alice.getOutgoingHtlcs.bind(alice);
+		alice.getOutgoingHtlcs = (h: Buffer) => {
+			const view = original(h);
+			return resolved
+				? view
+				: {
+						...view,
+						resolved: false,
+						htlcs: [
+							{
+								channelId: Buffer.alloc(32),
+								htlcId: 0n,
+								amountMsat: 1n,
+								cltvExpiry: 1,
+								state: 'offered',
+								terminal: false
+							}
+						]
+				  };
+		};
+		// The poll runs at 250 ms and sees nothing; the removal completes at
+		// 275 ms; the 300 ms deadline reads the view once more.
+		const waiting = alice.awaitPaymentResolution(hash, 300);
+		setTimeout(() => {
+			resolved = true;
+		}, 275);
+		const view = await waiting;
 		expect(view.resolved).to.equal(true);
 	});
 
