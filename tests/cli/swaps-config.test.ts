@@ -8,7 +8,14 @@
 import { expect } from 'chai';
 import { resolveConfig } from '../../src/cli/config';
 import { getRouteScopes } from '../../src/cli/auth';
-import { getRelayedEvents } from '../../src/cli/daemon';
+import { getRelayedEvents, statusForErrorCode } from '../../src/cli/daemon';
+import * as fs from 'fs';
+import * as path from 'path';
+
+const daemonSrc = fs.readFileSync(
+	path.join(__dirname, '../../src/cli/daemon.ts'),
+	'utf8'
+);
 import { getOpenApiSpec } from '../../src/cli/openapi';
 
 const VARS = [
@@ -102,6 +109,23 @@ describe('swap daemon surface (issue #737)', () => {
 		]) {
 			expect(events, evt).to.include(evt);
 		}
+	});
+
+	it('answers a cancel refusal as SWAP_NOT_CANCELLABLE (409), never as a success', () => {
+		// The engine refuses in band ({ok: false, reason}); the route must
+		// not wrap that in success(), or a funded swap would answer 200 with
+		// cancelled: {ok: false} and the CLI would exit clean.
+		const start = daemonSrc.indexOf("'POST /swaps/cancel': (body)");
+		expect(start).to.be.greaterThan(0);
+		const route = daemonSrc.slice(
+			start,
+			daemonSrc.indexOf("'GET /recovery/status'", start)
+		);
+		expect(route).to.match(/if \(!outcome\.ok\)/);
+		expect(route).to.match(/failure\(\s*'SWAP_NOT_CANCELLABLE'/);
+		expect(route).to.match(/success\(\{ id, cancelled: true \}\)/);
+		expect(route).to.not.match(/cancelled: node\.cancelSwap/);
+		expect(statusForErrorCode('SWAP_NOT_CANCELLABLE')).to.equal(409);
 	});
 
 	it('documents the routes and schemas in the OpenAPI spec', () => {

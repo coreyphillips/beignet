@@ -273,6 +273,8 @@ export class FakeWallet {
 	failBuilds = 0;
 	/** Build a wrong output on purpose. */
 	shortBy = 0n;
+	/** Awaited inside fundOutput: a wallet that signs slowly (tests). */
+	gate: (() => Promise<void>) | null = null;
 
 	async fundOutput(
 		address: string,
@@ -283,6 +285,7 @@ export class FakeWallet {
 			this.failBuilds--;
 			throw new Error('wallet busy');
 		}
+		if (this.gate) await this.gate();
 		const tx = new bitcoin.Transaction();
 		tx.version = 2;
 		tx.addInput(crypto.randomBytes(32), 0, 0xfffffffd);
@@ -317,7 +320,7 @@ export interface ISwapHarness {
 	feeRate: number | null;
 	destination: Buffer;
 	/** Build the engine again over the same store, as after a restart. */
-	restart(): Promise<ISwapHarness>;
+	restart(overrides?: { start?: boolean }): Promise<ISwapHarness>;
 }
 
 export async function harness(
@@ -451,10 +454,11 @@ export async function harness(
 			state.feeRate = v;
 		},
 		destination,
-		restart: async () => {
+		restart: async (overrides = {}) => {
 			engine.stop();
 			return harness({
 				...options,
+				...overrides,
 				store,
 				chain,
 				holds,

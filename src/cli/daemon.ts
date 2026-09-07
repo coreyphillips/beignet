@@ -2633,7 +2633,17 @@ async function bootDaemon(
 		'POST /swaps/cancel': (body) => {
 			const { id } = body as { id?: string };
 			if (!id) return failure('INVALID_PARAMS', 'id required');
-			return success({ id, cancelled: node.cancelSwap(id) });
+			// The engine answers a refusal in band; wrapped in success() it
+			// would be the daemon's only 200 around a failure. A funded swap
+			// is not cancellable: 409, and the CLI exits non-zero.
+			const outcome = node.cancelSwap(id);
+			if (!outcome.ok) {
+				return failure(
+					'SWAP_NOT_CANCELLABLE',
+					outcome.reason ?? 'swap cannot be cancelled'
+				);
+			}
+			return success({ id, cancelled: true });
 		},
 		'GET /recovery/status': () => success(node.getRecoverySurfaceStatus()),
 		// The guardian this node serves to OTHER nodes (issue #699), and the

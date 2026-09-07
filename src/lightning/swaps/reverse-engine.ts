@@ -417,7 +417,10 @@ export class ReverseSwapProvider extends EventEmitter {
 		for (const r of this.deps.ledger.list()) {
 			counts[r.state] = (counts[r.state] ?? 0) + 1;
 		}
-		const summary = SwapLedger.exposure(this.deps.ledger.list());
+		const summary = SwapLedger.exposure(
+			this.deps.ledger.list(),
+			this.config.resolutionConfirmations
+		);
 		return {
 			enabled: true,
 			fee: {
@@ -617,6 +620,7 @@ export class ReverseSwapProvider extends EventEmitter {
 		if (!fee)
 			return refuse(SwapRefusalReason.CHAIN_UNAVAILABLE, 'no fee estimate');
 		const verdict = evaluateSwapExposure(this.config.exposure, {
+			resolutionConfirmations: this.config.resolutionConfirmations,
 			direction: 'reverse',
 			amountSat: req.amountSat,
 			estimatedFundingFeeSat: fee.minerFeeSat,
@@ -726,6 +730,7 @@ export class ReverseSwapProvider extends EventEmitter {
 			);
 		}
 		const verdict = evaluateSwapExposure(this.config.exposure, {
+			resolutionConfirmations: this.config.resolutionConfirmations,
 			direction: 'reverse',
 			amountSat: req.onchainAmountSat,
 			estimatedFundingFeeSat: fee.minerFeeSat,
@@ -944,10 +949,10 @@ export class ReverseSwapProvider extends EventEmitter {
 					break;
 				}
 				case 'FUNDING': {
-					if (record.fundingTxHex) {
-						// Signed bytes exist, and a broadcast that threw may
-						// still have propagated: treat them as out. The row
-						// stays watched (a claim records its preimage, the
+					if (record.fundingTxHex && record.fundingBroadcastAttemptedAt) {
+						// A broadcast was attempted, and one that threw may
+						// still have propagated: treat the bytes as out. The
+						// row stays watched (a claim records its preimage, the
 						// refund recovers the coins) and its inputs stay
 						// pledged, so the wallet cannot double spend a funding
 						// that may be in the mempool.
@@ -966,12 +971,16 @@ export class ReverseSwapProvider extends EventEmitter {
 						}
 						break;
 					}
-					// No bytes were ever built: nothing left the wallet.
+					// No broadcast was ever attempted: nothing left the wallet.
+					// Bytes signed but never sent are dropped with their
+					// pledge; a pass still awaiting the wallet finds the row
+					// FAILED and drops what it built.
 					const moved = this.deps.ledger.move(record.id, 'FAILED', {
 						...patch,
 						failureReason: `hold cancelled before broadcast (${reason})`
 					});
 					if (moved.outcome === 'applied') {
+						if (record.fundingTxHex) void this.release(record.fundingTxHex);
 						this.emitSwap('swap:failed', moved.record!, {
 							reason: moved.record!.failureReason
 						});
@@ -1154,6 +1163,7 @@ export class ReverseSwapProvider extends EventEmitter {
 			return 'the node would cancel the hold before the refund could resolve';
 		}
 		const verdict = evaluateSwapExposure(this.config.exposure, {
+			resolutionConfirmations: this.config.resolutionConfirmations,
 			direction: 'reverse',
 			amountSat: BigInt(record.onchainSat),
 			estimatedFundingFeeSat: BigInt(record.minerFeeSat),
@@ -1287,17 +1297,68 @@ export class ReverseSwapProvider extends EventEmitter {
 			}
 			// The txid comes from the bytes we verified, never from the wallet's
 			// field: providers report it in internal byte order.
-			const recorded = this.deps.ledger.patch(current.id, {
-				fundingTxHex: built.txHex,
-				fundingTxid: bitcoin.Transaction.fromHex(built.txHex).getId(),
-				fundingVout: built.vout,
-				fundingValueSat: current.onchainSat
-			});
-			if (recorded.outcome !== 'applied') return;
+			const recorded =
+				this.deps.ledger.get(current.id)?.state === 'FUNDING'
+					? this.deps.ledger.patch(current.id, {
+							fundingTxHex: built.txHex,
+							fundingTxid: bitcoin.Transaction.fromHex(built.txHex).getId(),
+							fundingVout: built.vout,
+							fundingValueSat: current.onchainSat
+					  })
+					: undefined;
+			if (!recorded || recorded.outcome !== 'applied') {
+				// The row moved while the wallet was signing (a hold cancel
+				// failed it): these bytes never leave.
+				await this.release(built.txHex);
+				return;
+			}
 			current = recorded.record!;
 		}
-		// The bytes are durable: pledge their inputs and put them out. A
-		// failed broadcast is retried every block with the same bytes.
+		// The bytes are durable. Before they leave for the FIRST time the
+		// hold is judged again, live: the wallet signed asynchronously and a
+		// cancel (the sweeper, the operator, the payer's expiry) may have
+		// landed meanwhile, and a restart re-enters here at a later height.
+		// The queue does not fence this, since the cancel is recorded on the
+		// row while this pass is awaiting the wallet; the row and the hold
+		// do. Bytes that never left are dropped and their inputs released.
+		if (!current.fundingBroadcastAttemptedAt) {
+			const live = this.deps.ledger.get(current.id);
+			if (!live || live.state !== 'FUNDING') {
+				await this.release(current.fundingTxHex!);
+				return;
+			}
+			const snapshot = this.deps.heldSnapshot(
+				Buffer.from(current.paymentHashHex, 'hex')
+			);
+			const problem =
+				!snapshot || snapshot.state !== 'ACCEPTED' || !snapshot.complete
+					? `hold is ${snapshot ? snapshot.state : 'gone'} at broadcast time`
+					: this.admissionProblem(current, snapshot, this.deps.currentHeight());
+			if (problem) {
+				const moved = this.deps.ledger.move(current.id, 'FAILED', {
+					failureReason: `broadcast refused: ${problem}`
+				});
+				if (moved.outcome === 'applied') {
+					await this.release(current.fundingTxHex!);
+					this.cancelHoldFor(current.id, 'broadcast_refused');
+					this.deps.log('swap_broadcast_refused', {
+						swapId: current.id,
+						reason: problem
+					});
+					this.emitSwap('swap:failed', moved.record!, {
+						reason: moved.record!.failureReason
+					});
+				}
+				return;
+			}
+			const marked = this.deps.ledger.patch(current.id, {
+				fundingBroadcastAttemptedAt: this.now()
+			});
+			if (marked.outcome !== 'applied') return;
+			current = marked.record!;
+		}
+		// Pledge the inputs and put the bytes out. A failed broadcast is
+		// retried every block with the same bytes.
 		try {
 			await this.deps.pledge?.(current.fundingTxHex!);
 		} catch (err) {
@@ -1382,6 +1443,31 @@ export class ReverseSwapProvider extends EventEmitter {
 			}
 		});
 		const height = observation.height;
+
+		// A recorded resolution the chain no longer shows is history, not
+		// evidence: its depth goes to zero so the principal counts as exposed
+		// again until a spend is seen anew.
+		if (
+			current.resolution &&
+			(current.resolution.confirmations > 0 ||
+				!current.resolution.verifiedThisSession) &&
+			!observation.spends.some((s) => s.txid === current.resolution!.txid)
+		) {
+			this.deps.log('swap_resolution_demoted', {
+				swapId: current.id,
+				txid: current.resolution.txid,
+				previousConfirmations: current.resolution.confirmations
+			});
+			const patched = this.deps.ledger.patch(current.id, {
+				resolution: {
+					...current.resolution,
+					height: undefined,
+					confirmations: 0,
+					verifiedThisSession: true
+				}
+			});
+			if (patched.outcome === 'applied') current = patched.record!;
+		}
 
 		// A claim at any depth wins, in every watched state.
 		const claim = observation.spends.find(

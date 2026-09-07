@@ -253,7 +253,19 @@ builder pays. On the node side a parked set that already covers the invoice
 takes no further part (a late short-expiry part would drag the whole set
 into the sweeper's margin), and the per-block sweep waits, bounded, for the
 provider's chain look so a claim seen at the block settles before the sweep
-judges its hash. A restart redoes the owed action of every unresolved row exactly
+judges its hash.
+
+Before the funding bytes leave for the first time the hold is judged again,
+live (`heldSnapshot` complete and ACCEPTED, the admission margins at the
+current height): the wallet signs asynchronously and a cancel can land
+meanwhile, and a restart re-enters at a later height. The row records
+`fundingBroadcastAttemptedAt` before the first attempt; a hold cancel on a
+FUNDING row without it fails the swap and releases the inputs (nothing
+left), with it exposes the row (a broadcast that threw may have relayed).
+Exposure accounting counts an EXPOSED row until its resolution, verified
+in this process, reached `resolutionConfirmations`; a resolution read back
+from storage is history until observed again, and one the chain no longer
+shows is demoted to zero depth. A restart redoes the owed action of every unresolved row exactly
 once (`startSwapProvider`).
 
 Residual risks an operator accepts: a reorg deeper than
