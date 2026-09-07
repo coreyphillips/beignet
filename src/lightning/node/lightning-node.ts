@@ -564,6 +564,8 @@ const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
  * would close the channel). Mirrors the safety margin used for forwarded HTLCs.
  */
 export const HELD_HTLC_EXPIRY_MARGIN = 18;
+/** awaitPaymentResolution re-reads the HTLC view on this clock (#737). */
+const PAYMENT_RESOLUTION_POLL_MS = 250;
 /**
  * How long the held-HTLC sweep waits for the swap provider's per-block
  * chain look before running anyway (#737 audit): long enough for an
