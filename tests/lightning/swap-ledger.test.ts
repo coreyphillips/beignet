@@ -90,6 +90,21 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			expect(inserted.outcome).to.equal('applied');
 			const record = inserted.record!;
 			expect(swapCodec.decode(swapCodec.encode(record))).to.deep.equal(record);
+			// A resolution read back is history: its session verification is
+			// cleared, the rest round-trips.
+			const resolved = {
+				...record,
+				resolution: {
+					kind: 'refund' as const,
+					txid: 'ab'.repeat(32),
+					confirmations: 3,
+					verifiedThisSession: true
+				}
+			};
+			expect(swapCodec.decode(swapCodec.encode(resolved))).to.deep.equal({
+				...resolved,
+				resolution: { ...resolved.resolution, verifiedThisSession: false }
+			});
 			expect(swapCodec.decode('not json')).to.equal(null);
 			expect(
 				swapCodec.decode(JSON.stringify({ ...record, state: 'NOPE' }))
