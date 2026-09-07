@@ -20,6 +20,22 @@ import * as bitcoin from 'bitcoinjs-lib';
 import { computeScriptHash } from '../chain/chain-watcher';
 import { buildSwapHtlc, ISwapHtlc } from './htlc';
 import { extractSwapPreimage } from './transactions';
+
+/** A copy of the first 32-byte witness element hashing to the payment hash. */
+function preimageInWitness(
+	witness: Buffer[],
+	paymentHash: Buffer
+): Buffer | undefined {
+	for (const element of witness) {
+		if (
+			element.length === 32 &&
+			bitcoin.crypto.sha256(element).equals(paymentHash)
+		) {
+			return Buffer.from(element);
+		}
+	}
+	return undefined;
+}
 import { SwapResolutionKind } from './ledger';
 
 /** The narrow chain view a swap engine needs; IChainBackend satisfies it. */
@@ -226,11 +242,24 @@ export class SwapChainResolver {
 						input.hash.equals(fundingHash) && input.index === outputIndex
 				);
 				if (inputIndex < 0) continue;
-				const preimage = extractSwapPreimage(tx, {
-					htlc: params.htlc,
-					fundingTransaction: fundingTx,
-					outputIndex
-				});
+				// The canonical claim first; failing that, any 32-byte witness
+				// element of the spending input that hashes to the payment
+				// hash. The spend is bound to our outpoint, and a mined or
+				// relayed spend is valid by definition, so a preimage in a
+				// non-canonical witness (high-S signature, a MINIMALIF byte
+				// other than 0x01, an odd sighash type) is a preimage all the
+				// same. Missing it would leave the hold to be swept back to
+				// the client after they took the coins.
+				const preimage =
+					extractSwapPreimage(tx, {
+						htlc: params.htlc,
+						fundingTransaction: fundingTx,
+						outputIndex
+					}) ??
+					preimageInWitness(
+						tx.ins[inputIndex].witness,
+						params.htlc.paymentHash
+					);
 				let kind: SwapResolutionKind = 'unknown';
 				if (preimage) {
 					kind = 'claim';

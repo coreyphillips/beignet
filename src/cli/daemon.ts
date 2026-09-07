@@ -284,6 +284,7 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// policy, answered with the reason so the user can act on it; a silent
 	// LSP is upstream trouble, retryable.
 	JIT_REFUSED: 400,
+	SWAP_NOT_CANCELLABLE: 409,
 	JIT_TIMEOUT: 504,
 	PAYMENT_FAILED: 502,
 	PAYMENT_TIMEOUT: 504,
@@ -509,7 +510,22 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'ffor:witness-recorded',
 		'ffor:witness-released',
 		'ffor:issuer-provisioned',
-		'ffor:issuer-issued'
+		'ffor:issuer-issued',
+		// Reverse swap provider (issue #737): one swap's progress from the
+		// terms it accepted to its settlement, refund, or the exposure a
+		// dashboard must not miss (the Lightning side was cancelled while
+		// this node's coins sat in a contract).
+		'swap:created',
+		'swap:held',
+		'swap:funding',
+		'swap:funded',
+		'swap:claimed',
+		'swap:settled',
+		'swap:refund-broadcast',
+		'swap:refunded',
+		'swap:hold-cancelled',
+		'swap:exposed',
+		'swap:failed'
 	];
 	if (htlcEvents === true) {
 		events.push('htlc:forwarded', 'htlc:fulfilled', 'htlc:failed');
@@ -2607,6 +2623,28 @@ async function bootDaemon(
 		},
 		'GET /ffor/witness/status': () => success(node.fforWitnessStatus()),
 		'GET /ffor/issuer/status': () => success(node.fforIssuerStatus()),
+		// Reverse swap provider (issue #737): terms and exposure, the ledger,
+		// and an operator cancel of a swap nothing has moved for yet.
+		'GET /swaps/status': () => success(node.getSwapsStatus()),
+		'GET /swaps': (body, query) => {
+			const id = query.get('id') || (body as { id?: string }).id;
+			return success(node.listSwaps(id || undefined));
+		},
+		'POST /swaps/cancel': (body) => {
+			const { id } = body as { id?: string };
+			if (!id) return failure('INVALID_PARAMS', 'id required');
+			// The engine answers a refusal in band; wrapped in success() it
+			// would be the daemon's only 200 around a failure. A funded swap
+			// is not cancellable: 409, and the CLI exits non-zero.
+			const outcome = node.cancelSwap(id);
+			if (!outcome.ok) {
+				return failure(
+					'SWAP_NOT_CANCELLABLE',
+					outcome.reason ?? 'swap cannot be cancelled'
+				);
+			}
+			return success({ id, cancelled: true });
+		},
 		'GET /recovery/status': () => success(node.getRecoverySurfaceStatus()),
 		// The guardian this node serves to OTHER nodes (issue #699), and the
 		// resolver that turns a beignet node's Lightning URI into a guardian

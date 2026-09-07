@@ -190,6 +190,62 @@ function jitReceiveEnv(): BeignetConfig['jitReceive'] {
 }
 
 /**
+ * The reverse swap provider's switch and terms (issue #737). Same rule as the
+ * JIT trio: exact 'true'/'false' for the switch, integerEnv for the numbers
+ * so a partly numeric value refuses startup rather than quietly pricing.
+ */
+function swapsEnv(): BeignetConfig['swaps'] {
+	const enabledRaw = process.env.BEIGNET_SWAPS?.trim();
+	const enabled =
+		enabledRaw === 'true' ? true : enabledRaw === 'false' ? false : undefined;
+	const fields = {
+		enabled,
+		flatFeeSat: integerEnv(process.env.BEIGNET_SWAP_FLAT_FEE_SAT),
+		feePpm: integerEnv(process.env.BEIGNET_SWAP_FEE_PPM),
+		minSat: integerEnv(process.env.BEIGNET_SWAP_MIN_SAT),
+		maxSat: integerEnv(process.env.BEIGNET_SWAP_MAX_SAT),
+		maxExposureSat: integerEnv(process.env.BEIGNET_SWAP_MAX_EXPOSURE_SAT),
+		maxConcurrent: integerEnv(process.env.BEIGNET_SWAP_MAX_CONCURRENT),
+		refundDeltaBlocks: integerEnv(process.env.BEIGNET_SWAP_REFUND_DELTA_BLOCKS),
+		fundingConfs: integerEnv(process.env.BEIGNET_SWAP_FUNDING_CONFS),
+		resolutionConfs: integerEnv(process.env.BEIGNET_SWAP_RESOLUTION_CONFS)
+	};
+	if (Object.values(fields).every((v) => v === undefined)) return undefined;
+	return Object.fromEntries(
+		Object.entries(fields).filter(([, v]) => v !== undefined)
+	) as BeignetConfig['swaps'];
+}
+
+/** Merge the swaps block FIELD BY FIELD, cliFlag ?? env ?? file. */
+function mergeSwaps(
+	cli: BeignetConfig['swaps'],
+	env: BeignetConfig['swaps'],
+	file: BeignetConfig['swaps']
+): BeignetConfig['swaps'] {
+	if (!cli && !env && !file) return undefined;
+	const keys = [
+		'enabled',
+		'flatFeeSat',
+		'feePpm',
+		'minSat',
+		'maxSat',
+		'maxExposureSat',
+		'maxConcurrent',
+		'refundDeltaBlocks',
+		'fundingConfs',
+		'resolutionConfs'
+	] as const;
+	const out: NonNullable<BeignetConfig['swaps']> = {};
+	for (const key of keys) {
+		const value = cli?.[key] ?? env?.[key] ?? file?.[key];
+		if (value !== undefined) {
+			(out as Record<string, unknown>)[key] = value;
+		}
+	}
+	return out;
+}
+
+/**
  * Merge the jitReceive block FIELD BY FIELD, cliFlag ?? env ?? file.
  *
  * The fields are two independent policies: enabled/flatFeeSat/feePpm and the
@@ -544,6 +600,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			jitReceiveEnv(),
 			file.jitReceive
 		),
+		swaps: mergeSwaps(cliFlags.swaps, swapsEnv(), file.swaps),
 		// Same exact-string rule as the JIT trio, and the same reasoning: the
 		// safe direction for this switch is OFF, because it decides whether this
 		// node forwards frames on behalf of strangers. `=== 'true'` alone would

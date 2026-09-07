@@ -253,6 +253,8 @@ async function main(): Promise<void> {
 			return handleInvoice();
 		case 'jit':
 			return handleJit();
+		case 'swaps':
+			return handleSwaps();
 		case 'payment':
 			return handlePayment();
 		case 'keysend':
@@ -1336,6 +1338,47 @@ async function handleInvoice(): Promise<void> {
 					code: 'UNKNOWN_COMMAND',
 					message:
 						'Usage: beignet invoice [create|jit|create-hold|settle-hold|cancel-hold|held|decode|validate|get|pay|pay-safe|pay-async|pay-retry|list]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleSwaps(): Promise<void> {
+	// The reverse swap provider role (issue #737): its terms and exposure,
+	// its ledger, and the one operator action that is safe before funds move.
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'status':
+			return outputResult(await httpRequest('GET', '/swaps/status'));
+		case 'list': {
+			const idIndex = filteredArgs.indexOf('--id');
+			const id = idIndex >= 0 ? filteredArgs[idIndex + 1] : undefined;
+			return outputResult(
+				await httpRequest(
+					'GET',
+					id ? `/swaps?id=${encodeURIComponent(id)}` : '/swaps'
+				)
+			);
+		}
+		case 'cancel': {
+			const id = filteredArgs[2];
+			if (!id) {
+				output({
+					ok: false,
+					error: { code: 'INVALID_PARAMS', message: 'usage: swaps cancel <id>' }
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(await httpRequest('POST', '/swaps/cancel', { id }));
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message: 'usage: swaps status | list [--id <hex>] | cancel <id>'
 				}
 			});
 			process.exitCode = 1;
@@ -2862,6 +2905,14 @@ Invoices & Payments:
                                          What a JIT receive would cost at that
                                          LSP and whether it would be served
                                          right now; registers nothing
+
+Reverse swaps (a peer pays us over Lightning, we fund an on-chain contract):
+  swaps status                           The provider role as it stands: fee,
+                                         exposure caps, timing, swaps per
+                                         state, principal at risk on chain
+  swaps list [--id <hex>]                The swap ledger (or one swap)
+  swaps cancel <id>                      Cancel a swap nothing has moved for
+                                         yet (closes its hold invoice)
   invoice create-hold <hash> [sats] [description] [--expiry secs]
                                          Create hold invoice for a payment hash
                                          you supply (keep the preimage; HTLCs

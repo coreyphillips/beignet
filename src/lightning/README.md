@@ -4,7 +4,7 @@ A pure-TypeScript Lightning Network implementation covering BOLTs 1-5 and 7-12, 
 
 This is the protocol layer. For the higher-level, satoshi-denominated API (`BeignetNode`), the HTTP daemon, and the project's current limitations, see the [root README](../../README.md).
 
-The [swap foundations](swaps/README.md) provide P2WSH contracts, signed claim/refund transactions and direction-specific admission checks through `beignet/lightning`'s `swaps` namespace. Provider engines and daemon integration remain tracked in issue 737.
+The [swaps module](swaps/README.md) provides P2WSH contracts, signed claim/refund transactions, direction-specific admission checks, the durable swap ledger and chain resolver, the swap wire protocol, and the reverse swap provider engine (Lightning to on-chain) through `beignet/lightning`'s `swaps` namespace. The submarine direction remains tracked in issue 737.
 
 **Contents:** [Overview](#overview) · [Architecture](#architecture) · [Import paths](#import-paths) · [Quick start](#quick-start) · [Usage guide](#usage-guide) · [Events](#events-reference) · [Errors](#typed-payment-errors) · [Module reference](#module-reference) · [Testing](#testing) · [BOLT coverage](#bolt-specification-coverage)
 
@@ -1095,7 +1095,11 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `htlc:forwarded` | `({ inChannelId, outChannelId, amountInMsat, amountOutMsat, feeMsat })` | HTLC relayed to the next hop |
 | `htlc:fulfilled` | `({ channelId, htlcId })` | Forwarded HTLC fulfilled |
 | `htlc:failed` | `({ channelId, htlcId })` | Forwarded HTLC failed |
-| `htlc:held` | `({ paymentHash, amountMsat })` | HTLC parked by a hold invoice |
+| `htlc:held` | `({ paymentHash, amountMsat })` | HTLC parked by a hold invoice (one part; read `getHeldInvoiceSnapshot` for the committed set) |
+| `hold:cancelled` | `({ paymentHash, reason, htlcsFailed })` | A hold invoice was cancelled by the CLTV sweeper (`expiry-scan`) or the API |
+| `payment:htlc-resolved` | `({ paymentHash, channelId, htlcId, state })` | One offered HTLC of an outgoing payment reached a terminal state |
+| `payment:preimage` | `({ paymentHash, preimage, source })` | An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim |
+| `swap:*` | `({ swapId, paymentHash, state, ... })` | Reverse swap provider progress: created, held, funding, funded, claimed, settled, refund-broadcast, refunded, hold-cancelled, exposed, failed |
 | `sweep:uneconomic` | `(channelId: Buffer, action: ISweepUneconomicChainAction)` | An on-chain claim was declined because it cannot pay its own fee (`reason: 'skipped'`), or a competing spend path opened while it stayed unclaimed (`reason: 'contested'`). Retries continue in both cases, until the outpoint is spent |
 | `peer:connect` | `(pubkey: string)` | Peer connected (networking mode) |
 | `peer:disconnect` | `(pubkey: string)` | Peer disconnected (networking mode) |

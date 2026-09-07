@@ -23,7 +23,11 @@ import { DurabilityBarrier } from '../recovery/durability-barrier';
 import { IGuardianHostConfig } from '../recovery/guardian-host';
 import { RecoveryDurability } from '../recovery/types';
 import type { GuardianDescriptor } from '../recovery/capsule';
-import type { ISwapConfirmationPolicy, ISwapExposurePolicy } from '../swaps';
+import type {
+	ISwapChainSource,
+	ISwapConfirmationPolicy,
+	ISwapExposurePolicy
+} from '../swaps';
 
 export type { IInvoiceInfo };
 
@@ -1235,6 +1239,27 @@ export interface ISwapNodeConfig {
 	enabled?: boolean;
 	exposure?: Partial<ISwapExposurePolicy>;
 	confirmations?: Partial<ISwapConfirmationPolicy>;
+	/** Reverse swap provider fee terms (issue #737). */
+	fee?: { flatFeeSat?: bigint; feePpm?: number };
+	/** Reverse swap provider timing and fee policy. */
+	timeouts?: {
+		refundDeltaBlocks?: number;
+		minRefundDeltaBlocks?: number;
+		maxRefundDeltaBlocks?: number;
+		fundingSafetyBlocks?: number;
+		resolutionSafetyBlocks?: number;
+		invoiceExpirySeconds?: number;
+		maxFeeRateSatPerVbyte?: number;
+		refundBumpIntervalBlocks?: number;
+		maxFundingAttempts?: number;
+		maxCreatedPerPeer?: number;
+	};
+	/**
+	 * A chain view for the provider that wins over the node's chain backend.
+	 * A test seam: interop nodes have no chain watcher, and a test hands the
+	 * engine a Bitcoin Core backed source instead.
+	 */
+	chainSource?: ISwapChainSource;
 }
 
 // ─── Outgoing payment resolution (issue #737, swap provider phase 2) ───

@@ -32,9 +32,10 @@ export const BEIGNET_CUSTOM_MAX_PAYLOAD = 65_535 - 2 - 4;
  * Subtype registry. The numbers are RESERVED here ahead of the workstreams
  * that implement them (#532 phases 3 and 4) so no later protocol collides:
  * 1, 2, 4 and 5 belong to JIT receive, 16 to 22 to direct funding, and 32
- * to 47 to recovery guardian sessions (issue #699). 3 (LIQUIDITY_POLICY)
- * and 20 (DIRECT_FUNDING_ABORT) are numbers the LFBW fork declared but
- * never used; they stay reserved and deliberately unimplemented.
+ * to 47 to recovery guardian sessions (issue #699), and 48 to 55 to the
+ * swap provider (issue #737). 3 (LIQUIDITY_POLICY) and 20
+ * (DIRECT_FUNDING_ABORT) are numbers the LFBW fork declared but never used;
+ * they stay reserved and deliberately unimplemented.
  */
 export enum BeignetCustomSubtype {
 	// ── JIT receive (#532 phase 3) ──
@@ -67,7 +68,23 @@ export enum BeignetCustomSubtype {
 	 *  (docs/RECOVERY-GUARDIAN-WIRE.md 2.7; recovery/guardian-bolt8.ts). */
 	GUARDIAN_REQUEST = 32,
 	/** One chunk of the guardian's response to a GUARDIAN_REQUEST. */
-	GUARDIAN_RESPONSE = 33
+	GUARDIAN_RESPONSE = 33,
+	// ── Swap provider (issue #737) ──
+	/** A client asks what a swap of a given direction and size would cost;
+	 *  registers nothing on the provider. */
+	SWAP_QUOTE_REQUEST = 48,
+	SWAP_QUOTE = 49,
+	/** A client opens a swap: for a reverse swap it names the payment hash
+	 *  it holds the preimage of, its claim key and the on-chain amount. */
+	SWAP_CREATE = 50,
+	/** The provider's terms (hold invoice, refund key and height, contract
+	 *  address) or a typed refusal. */
+	SWAP_CREATE_ACK = 51,
+	SWAP_STATUS_REQUEST = 52,
+	SWAP_STATUS = 53,
+	/** Reserved for the submarine direction; never sent by this build. */
+	SWAP_SUBMARINE_CREATE = 54,
+	SWAP_SUBMARINE_CREATE_ACK = 55
 }
 
 export interface ICustomMessage {

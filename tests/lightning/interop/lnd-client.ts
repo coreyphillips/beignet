@@ -400,6 +400,27 @@ export class LndRestClient {
 
 	// ── Wallet ──
 
+	/**
+	 * The newest payments, in flight ones included (GET /v1/payments). The
+	 * endpoint pages 100 oldest first by default, which on a long-lived
+	 * regtest node hides the payment a test just made; seeking backwards
+	 * from past the end returns the newest page.
+	 */
+	async listPayments(): Promise<{
+		payments: Array<{
+			payment_hash: string;
+			status: string;
+			payment_preimage?: string;
+			failure_reason?: string;
+		}>;
+	}> {
+		return this.request(
+			'GET',
+			'/v1/payments?include_incomplete=true&reversed=true' +
+				'&index_offset=4294967295&max_payments=500'
+		);
+	}
+
 	async walletBalance(): Promise<ILndWalletBalance> {
 		return this.request('GET', '/v1/balance/blockchain');
 	}
