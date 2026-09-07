@@ -143,25 +143,57 @@ node can automatically cancel before that resolution, funding must be refused.
 No finite margin guarantees safety through arbitrary chain stalls or deep
 reorganizations; the engine needs an explicit risk policy and operational limits.
 
+## Phase 2 primitives
+
+The second phase of issue 737 adds the pieces a provider engine builds on,
+still without running a swap:
+
+- **Committed held-invoice snapshot.** `LightningNode.getHeldInvoiceSnapshot`
+  returns every parked part of a hold invoice with its channel/HTLC identity,
+  its absolute expiry read from the channel's own entry, whether the channel
+  still holds it COMMITTED, the invoice's declared total, and `cancelHeight`,
+  the first height at which the node's own CLTV sweeper
+  (`HELD_HTLC_EXPIRY_MARGIN`, exported) would cancel the hash. `complete` is
+  the only admission signal for a reverse swap; the per-part `htlc:held`
+  event is not. Every cancel path emits `hold:cancelled` with its reason.
+- **Absolute outgoing expiry ceiling.** `sendPaymentWithOptions` (and the
+  positional `sendPayment`) take `maxCltvExpiryHeight`. The route search is
+  bounded by it and the dispatch gate refuses, before any HTLC is added, an
+  attempt, retry or MPP part whose wire expiry would exceed it, including
+  after a height-skew retry raised the base height. `getOutgoingHtlcs` and
+  `awaitPaymentResolution` report what the HTLCs actually did: a wall-clock
+  `failPayment` never makes a payment `resolved` while an HTLC is live, and
+  `payment:preimage` announces a preimage from update_fulfill_htlc or from
+  an on-chain claim, which also completes a FAILED outgoing record.
+- **Swap ledger** (`ledger.ts`): a `DurableLedger` of `ISwapRecord` rows with
+  the reverse and submarine lifecycles as compare-and-swap arrows, a
+  write-once preimage no transition removes, and no private key stored
+  (`keys.ts` re-derives per-swap keys from the node key and the swap id).
+- **Chain resolver** (`chain-resolver.ts`): `observe` reports the funding
+  output's status, every spend classified as claim (with the extracted
+  preimage), refund or unknown, confirmations against the operator's policy,
+  and demotions of recorded facts. Every transaction is fetched by txid and
+  checked to hash to it. `verifiedThisSession` is false until the first
+  observation after a restart; recorded depths are not trusted before then.
+- **Exposure policy** (`exposure.ts`): minimum and maximum swap size, total
+  principal at risk, concurrency, fee-rate ceiling and an optional fee
+  reserve check when a balance is supplied.
+
+`INodeConfig.swaps.enabled` builds and rehydrates the ledger at construction;
+`swapChain()` and `getSwapKeyDeriver()` are the node's seams for an engine.
+
 ## Remaining provider work
 
 Issue 737 remains open for the durable provider engines and integrations:
 
-- Persist quotes, funding leases, pending Lightning attempts, preimages and
-  claim/refund state before corresponding external actions; recover idempotently
-  after crashes, concurrent events and node restarts.
-- Expose complete committed held-invoice MPP sets and actual per-part absolute
-  expiries; integrate the hold scanner's early cancellation deadline with swap
-  admission and settlement.
-- Enforce outgoing CLTV limits and reconcile unresolved attempts instead of
-  equating a wall-clock payment failure with a terminal HTLC outcome.
-- Validate quoted amounts, fees and confirmed chain funding; watch all spends,
-  persist the winning resolution, renew funding leases, manage replacement fees
-  and handle reorgs and late preimages.
+- The reverse and submarine engines themselves: quotes, admission on the
+  committed snapshot, funding under the exposure policy, claim and refund
+  handling driven by the resolver, and settlement of the held payment only
+  once a preimage is known.
 - Integrate local-origin JIT channel creation and payment dispatch. Paying the
   provider's own client's JIT invoice does not currently invoke the forwarded
   HTLC interception path automatically.
-- Define wire/API schemas, authentication, rate limits, storage and daemon/CLI
+- Define wire/API schemas, authentication, rate limits and daemon/CLI
   commands, then run crash, reorg, claim/refund race and full provider settlement
   tests against real Lightning nodes.
 - Design Taproot separately. A key-path witness does not reveal the preimage;

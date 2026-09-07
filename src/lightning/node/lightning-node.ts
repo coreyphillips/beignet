@@ -38,6 +38,7 @@ import {
 	ChannelState,
 	ChannelRole,
 	HtlcState,
+	HtlcDirection,
 	IHtlcEntry,
 	DEFAULT_CHANNEL_CONFIG,
 	BITCOIN_CHAIN_HASH,
@@ -205,6 +206,15 @@ import {
 	requestEncryptionPublicKey
 } from '../direct-funding';
 import {
+	SwapLedger,
+	swapCodec,
+	SWAP_LEDGER_PREFIX,
+	ISwapRecord,
+	ISwapChainSource,
+	SwapKeyRole,
+	deriveSwapKey
+} from '../swaps';
+import {
 	INodeConfig,
 	IResourceConfig,
 	IPaymentInfo,
@@ -225,6 +235,17 @@ import {
 	IPendingMppPayment,
 	IPaymentPart,
 	IInvoiceInfo,
+	IHeldInvoiceSnapshot,
+	IHeldInvoicePart,
+	IHoldCancelledEvent,
+	HoldCancelReason,
+	HoldInvoiceState,
+	ISendPaymentOptions,
+	IOutgoingPaymentResolution,
+	IOutgoingHtlcView,
+	OutgoingHtlcState,
+	IPaymentHtlcResolvedEvent,
+	IPaymentPreimageEvent,
 	LightningErrorCode,
 	LightningPaymentError,
 	InvalidChannelOpenError,
@@ -516,6 +537,11 @@ bitcoin.initEccLib(ecc);
  * - 'peer_storage:retrieved' (peerPubkey: string, blob: Buffer)
  * - 'recovery:reestablish-held' (peerPubkey: string, channelIdHex: string, expiresAt: number): a peer's channel_reestablish for a channel this node has no record of was parked instead of failed, because the node may still be an incomplete restore target (issue #462)
  * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction): an on-chain claim was declined because it cannot pay its own fee
+ * - 'htlc:held' ({ paymentHash: Buffer, amountMsat: bigint }): one part of a hold invoice was parked; read getHeldInvoiceSnapshot for the full committed set
+ * - 'hold:cancelled' (event: IHoldCancelledEvent): a hold invoice was cancelled by the CLTV sweeper or by the API; every parked part was failed back
+ * - 'payment:htlc-resolved' (event: IPaymentHtlcResolvedEvent): one offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain)
+ * - 'payment:preimage' (event: IPaymentPreimageEvent): the preimage of an outgoing payment became known, from update_fulfill_htlc or from an on-chain claim, whatever the record's status was
+ * - 'block:processed' (height: number): the per-block work for this height has run
  */
 
 /**
@@ -530,7 +556,9 @@ const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
  * auto-fail it off-chain, rather than letting it force an on-chain timeout (which
  * would close the channel). Mirrors the safety margin used for forwarded HTLCs.
  */
-const HELD_HTLC_EXPIRY_MARGIN = 18;
+export const HELD_HTLC_EXPIRY_MARGIN = 18;
+/** awaitPaymentResolution re-reads the HTLC view on this clock (#737). */
+const PAYMENT_RESOLUTION_POLL_MS = 250;
 /**
  * Bytes a held-forward ledger row reserves against the async receive
  * service's byte limits (issue #709), on top of the parked onion packet. A
@@ -1027,6 +1055,8 @@ export class LightningNode extends EventEmitter {
 	 * Owned by the AsyncPaymentManager; the node arms per-hold drivers.
 	 */
 	private heldForwardLedger: HeldForwardLedger;
+	/** Swap ledger (issue #737); present only with config.swaps.enabled. */
+	private swapLedger?: SwapLedger;
 	private autoReleaseHeldForwards: boolean;
 	/**
 	 * Async receive service, LSP role (issue #709): registrations, admission,
@@ -1674,6 +1704,19 @@ export class LightningNode extends EventEmitter {
 				: new MemoryLedgerStore<IHeldForwardRecord>()
 		);
 		this.heldForwardLedger.rehydrate();
+		// Swap ledger (issue #737): same rule, rehydrated at construction.
+		if (config.swaps?.enabled) {
+			this.swapLedger = new SwapLedger(
+				this.storage
+					? new MetadataLedgerStore<ISwapRecord>(
+							this.storage,
+							SWAP_LEDGER_PREFIX,
+							swapCodec
+					  )
+					: new MemoryLedgerStore<ISwapRecord>()
+			);
+			this.swapLedger.rehydrate();
+		}
 		this.autoReleaseHeldForwards = config.autoReleaseHeldForwards ?? true;
 		// FFOR settlement peer (issue #729): whether ff_init is answered here.
 		if (config.fforSettle) {
@@ -14422,7 +14465,8 @@ export class LightningNode extends EventEmitter {
 		invoiceStr: string,
 		excludedChannels?: Set<string>,
 		maxFeeMsat?: bigint,
-		amountMsat?: bigint
+		amountMsat?: bigint,
+		maxCltvExpiryHeight?: number
 	): IPaymentInfo {
 		const invoice = decodeInvoice(invoiceStr);
 
@@ -14435,6 +14479,14 @@ export class LightningNode extends EventEmitter {
 				'Payment already in flight for this invoice'
 			);
 		}
+
+		// Absolute outgoing expiry ceiling (issue #737). A retry re-enters here
+		// without the argument; the ceiling it was first sent under rides the
+		// retry context so every attempt is judged against the same height.
+		const cltvCeiling =
+			maxCltvExpiryHeight ??
+			this.paymentRetryContexts.get(dedupHashHex)?.maxCltvExpiryHeight;
+		if (cltvCeiling !== undefined) this.validateCltvCeiling(cltvCeiling);
 
 		const destination = invoice.payeeNodeKey || invoice.recoveredPubkey;
 		if (!destination) {
@@ -14500,6 +14552,9 @@ export class LightningNode extends EventEmitter {
 			invoice.minFinalCltvExpiry
 		);
 		const sourceNodeId = getPublicKey(this.nodePrivkey);
+		// The router bound is an optimisation; the dispatch gate in
+		// sendPaymentToRoute / sendPaymentMpp is the guarantee.
+		const cltvBudget = this.cltvBudgetFor(invoice.paymentHash, cltvCeiling);
 
 		// Route blinding: if the invoice advertises blinded paths, route through
 		// one (the sender learns only the introduction node, never the payee).
@@ -14515,7 +14570,8 @@ export class LightningNode extends EventEmitter {
 				undefined,
 				excludedChannels,
 				this.missionControl,
-				this.getLocalChannelEdges()
+				this.getLocalChannelEdges(),
+				cltvBudget
 			);
 			if (!blindedRoute) {
 				throw new LightningPaymentError(
@@ -14545,7 +14601,8 @@ export class LightningNode extends EventEmitter {
 					retryCount: 0,
 					maxRetries: this.maxPaymentRetries,
 					maxFeeMsat,
-					amountMsat
+					amountMsat,
+					maxCltvExpiryHeight: cltvCeiling
 				});
 			}
 			return this.sendPaymentToRoute(
@@ -14567,7 +14624,7 @@ export class LightningNode extends EventEmitter {
 			undefined,
 			excludedChannels,
 			this.missionControl,
-			undefined,
+			cltvBudget,
 			invoice.routingHints,
 			undefined,
 			localChannels
@@ -14612,7 +14669,8 @@ export class LightningNode extends EventEmitter {
 				invoice.routingHints,
 				undefined,
 				localChannels,
-				excludedChannels
+				excludedChannels,
+				cltvBudget
 			);
 			if (multiRoute) {
 				if (maxFeeMsat !== undefined && multiRoute.totalFeeMsat > maxFeeMsat) {
@@ -14626,7 +14684,8 @@ export class LightningNode extends EventEmitter {
 					invoice,
 					multiRoute,
 					finalCltvExpiry,
-					excludedChannels
+					excludedChannels,
+					cltvCeiling
 				);
 			}
 		}
@@ -14654,7 +14713,8 @@ export class LightningNode extends EventEmitter {
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries,
 				maxFeeMsat,
-				amountMsat
+				amountMsat,
+				maxCltvExpiryHeight: cltvCeiling
 			});
 		}
 
@@ -14664,6 +14724,24 @@ export class LightningNode extends EventEmitter {
 			finalCltvExpiry,
 			invoice.paymentSecret,
 			paymentAmountMsat
+		);
+	}
+
+	/**
+	 * sendPayment with an options object (issue #737). Same engine, same
+	 * retry and MPP behaviour; see ISendPaymentOptions for the absolute
+	 * outgoing expiry ceiling.
+	 */
+	sendPaymentWithOptions(
+		invoiceStr: string,
+		options: ISendPaymentOptions = {}
+	): IPaymentInfo {
+		return this.sendPayment(
+			invoiceStr,
+			options.excludedChannels,
+			options.maxFeeMsat,
+			options.amountMsat,
+			options.maxCltvExpiryHeight
 		);
 	}
 
@@ -14794,6 +14872,9 @@ export class LightningNode extends EventEmitter {
 		const cltvExpiry =
 			(selfIntro?.wireCltvRel ?? hops[0].outgoingCltvValue) + baseHeight;
 		const amount = selfIntro?.wireAmountMsat ?? hops[0].amountToForwardMsat;
+		// Fail closed BEFORE any record, mapping or HTLC exists: the router
+		// bound above is advisory, this is the guarantee (issue #737).
+		this.assertWithinCltvCeiling(paymentHash, cltvExpiry);
 
 		// Create payment info BEFORE addHtlc because in synchronous loopback
 		// the entire fulfill chain runs during addHtlc
@@ -14911,6 +14992,78 @@ export class LightningNode extends EventEmitter {
 	private cltvBaseHeight(paymentHash: Buffer): number {
 		const ctx = this.paymentRetryContexts.get(paymentHash.toString('hex'));
 		return Math.max(this.currentBlockHeight, ctx?.cltvBaseHeightOverride ?? 0);
+	}
+
+	/** A ceiling must be a block height strictly above our own. */
+	private validateCltvCeiling(ceiling: number): void {
+		if (
+			!Number.isSafeInteger(ceiling) ||
+			ceiling < 1 ||
+			ceiling >= 500_000_000
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.CLTV_EXCEEDS_MAX,
+				`maxCltvExpiryHeight ${ceiling} is not a block height`
+			);
+		}
+		if (ceiling <= this.currentBlockHeight) {
+			throw new LightningPaymentError(
+				LightningErrorCode.CLTV_EXCEEDS_MAX,
+				`maxCltvExpiryHeight ${ceiling} is not above the current height ${this.currentBlockHeight}`
+			);
+		}
+	}
+
+	/**
+	 * Relative CLTV budget for one route search under an absolute ceiling, or
+	 * undefined when the payment is unbounded. The budget shrinks when a
+	 * height-skew retry raises the base height, so a retry that can no longer
+	 * fit fails here before any route is even searched.
+	 */
+	private cltvBudgetFor(
+		paymentHash: Buffer,
+		ceiling: number | undefined
+	): number | undefined {
+		if (ceiling === undefined) return undefined;
+		const base = this.cltvBaseHeight(paymentHash);
+		const budget = ceiling - base;
+		if (budget < 1) {
+			throw new LightningPaymentError(
+				LightningErrorCode.CLTV_EXCEEDS_MAX,
+				`Outgoing CLTV ceiling ${ceiling} leaves no budget at base height ${base}`
+			);
+		}
+		return budget;
+	}
+
+	/**
+	 * The dispatch gate for the outgoing expiry ceiling: the absolute wire
+	 * expiry of an HTLC about to be added must not exceed the ceiling the
+	 * payment was sent under. Reads the retry context so it binds every
+	 * attempt, retry and MPP part without each call site threading the value.
+	 */
+	private cltvCeilingViolation(
+		paymentHash: Buffer,
+		absoluteCltvExpiry: number
+	): string | undefined {
+		const ceiling = this.paymentRetryContexts.get(paymentHash.toString('hex'))
+			?.maxCltvExpiryHeight;
+		if (ceiling === undefined || absoluteCltvExpiry <= ceiling)
+			return undefined;
+		return `HTLC expiry ${absoluteCltvExpiry} exceeds the payment's ceiling ${ceiling}`;
+	}
+
+	private assertWithinCltvCeiling(
+		paymentHash: Buffer,
+		absoluteCltvExpiry: number
+	): void {
+		const problem = this.cltvCeilingViolation(paymentHash, absoluteCltvExpiry);
+		if (problem) {
+			throw new LightningPaymentError(
+				LightningErrorCode.CLTV_EXCEEDS_MAX,
+				problem
+			);
+		}
 	}
 
 	/**
@@ -15266,7 +15419,8 @@ export class LightningNode extends EventEmitter {
 			totalFeeMsat: bigint;
 		},
 		_finalCltvExpiry: number,
-		excludedChannels?: Set<string>
+		excludedChannels?: Set<string>,
+		maxCltvExpiryHeight?: number
 	): IPaymentInfo {
 		const paymentHash = invoice.paymentHash;
 		const hashHex = paymentHash.toString('hex');
@@ -15290,7 +15444,8 @@ export class LightningNode extends EventEmitter {
 				invoiceStr,
 				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
-				maxRetries: this.maxPaymentRetries
+				maxRetries: this.maxPaymentRetries,
+				maxCltvExpiryHeight
 			});
 		}
 
@@ -15361,18 +15516,24 @@ export class LightningNode extends EventEmitter {
 
 			const htlcId = outChannel.getFullState().localHtlcCounter;
 			const mppHtlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
-			this.htlcPaymentMap.set(mppHtlcKey, hashHex);
-			this.commitMutations(
-				'saveHtlcPaymentMapping',
-				[
-					{
-						type: 'htlc_payment_mapping',
-						htlcKey: mppHtlcKey,
-						paymentHash: hashHex
-					}
-				],
-				RecoveryCriticality.SafetyCritical
-			);
+			// The expiry ceiling gate (issue #737) runs before the mapping is
+			// written so a refused part leaves nothing behind; a refusal takes
+			// the same exit as a channel that declines the add.
+			const ceilingProblem = this.cltvCeilingViolation(paymentHash, cltvExpiry);
+			if (ceilingProblem === undefined) {
+				this.htlcPaymentMap.set(mppHtlcKey, hashHex);
+				this.commitMutations(
+					'saveHtlcPaymentMapping',
+					[
+						{
+							type: 'htlc_payment_mapping',
+							htlcKey: mppHtlcKey,
+							paymentHash: hashHex
+						}
+					],
+					RecoveryCriticality.SafetyCritical
+				);
+			}
 
 			// The first part doubles as the payment-level route/secrets (display
 			// and single-path fallbacks); every part keeps its own for failure
@@ -15391,13 +15552,16 @@ export class LightningNode extends EventEmitter {
 				sharedSecrets
 			});
 
-			const result = this.channelManager.addHtlc(
-				channelId,
-				amount,
-				paymentHash,
-				cltvExpiry,
-				onionBuf
-			);
+			const result =
+				ceilingProblem === undefined
+					? this.channelManager.addHtlc(
+							channelId,
+							amount,
+							paymentHash,
+							cltvExpiry,
+							onionBuf
+					  )
+					: { ok: false as const, error: ceilingProblem };
 			if (!result.ok) {
 				// No rollback of the parts already dispatched: BOLT 2 gives no way to
 				// withdraw an update_add_htlc we have sent. Only the downstream peer
@@ -17234,7 +17398,8 @@ export class LightningNode extends EventEmitter {
 	 */
 	cancelHeldHtlc(
 		paymentHash: Buffer,
-		failureCode: number = INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+		failureCode: number = INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+		cancelReason: HoldCancelReason = 'api'
 	): boolean {
 		const hashHex = paymentHash.toString('hex');
 		const held = this.heldHtlcs.get(hashHex);
@@ -17262,8 +17427,11 @@ export class LightningNode extends EventEmitter {
 		this.heldHtlcs.delete(hashHex);
 		this.heldInvoiceHashes.delete(hashHex);
 		this.persistHeldHtlcs();
-		this.markHoldInvoiceCancelled(hashHex);
-		this.emitStructuredLog('htlc', 'held_cancelled', { paymentHash: hashHex });
+		this.markHoldInvoiceCancelled(hashHex, cancelReason, held.length);
+		this.emitStructuredLog('htlc', 'held_cancelled', {
+			paymentHash: hashHex,
+			reason: cancelReason
+		});
 		return true;
 	}
 
@@ -17272,7 +17440,11 @@ export class LightningNode extends EventEmitter {
 	 * the hash, and drop the preimage/secret so a late HTLC fails with
 	 * incorrect_or_unknown_payment_details instead of settling.
 	 */
-	private markHoldInvoiceCancelled(hashHex: string): void {
+	private markHoldInvoiceCancelled(
+		hashHex: string,
+		reason: HoldCancelReason,
+		htlcsFailed: number
+	): void {
 		this.preimages.delete(hashHex);
 		this.paymentSecrets.delete(hashHex);
 		this.clearJitSkim(hashHex);
@@ -17306,6 +17478,14 @@ export class LightningNode extends EventEmitter {
 			mutations,
 			RecoveryCriticality.SafetyCritical
 		);
+		// After the durable transition: a listener (a swap engine) that acts on
+		// this must never observe a hold the storage still calls open.
+		const event: IHoldCancelledEvent = {
+			paymentHash: Buffer.from(hashHex, 'hex'),
+			reason,
+			htlcsFailed
+		};
+		this.emit('hold:cancelled', event);
 	}
 
 	/**
@@ -17326,7 +17506,7 @@ export class LightningNode extends EventEmitter {
 		}
 		if (!this.heldInvoiceHashes.has(hashHex)) return null;
 		this.heldInvoiceHashes.delete(hashHex);
-		this.markHoldInvoiceCancelled(hashHex);
+		this.markHoldInvoiceCancelled(hashHex, 'api', 0);
 		this.emitStructuredLog('htlc', 'held_cancelled', { paymentHash: hashHex });
 		return { htlcsFailed: 0 };
 	}
@@ -17344,7 +17524,7 @@ export class LightningNode extends EventEmitter {
 		description?: string;
 		expiry: number;
 		createdAt: number;
-		state: 'OPEN' | 'ACCEPTED' | 'SETTLED' | 'CANCELLED';
+		state: HoldInvoiceState;
 		heldAmountMsat: bigint;
 		htlcCount: number;
 	}> {
@@ -17354,20 +17534,7 @@ export class LightningNode extends EventEmitter {
 			const held = this.heldHtlcs.get(hashHex) ?? [];
 			let heldAmountMsat = 0n;
 			for (const h of held) heldAmountMsat += h.amountMsat;
-			const payment = this.payments.get(hashHex);
-			let state: 'OPEN' | 'ACCEPTED' | 'SETTLED' | 'CANCELLED';
-			if (held.length > 0) {
-				state = 'ACCEPTED';
-			} else if (
-				payment?.status === PaymentStatus.COMPLETED &&
-				payment.direction === PaymentDirection.INCOMING
-			) {
-				state = 'SETTLED';
-			} else if (invoice.cancelledAt || !this.heldInvoiceHashes.has(hashHex)) {
-				state = 'CANCELLED';
-			} else {
-				state = 'OPEN';
-			}
+			const state = this.holdInvoiceState(hashHex, invoice);
 			out.push({
 				paymentHash: hashHex,
 				bolt11: invoice.bolt11,
@@ -17396,7 +17563,11 @@ export class LightningNode extends EventEmitter {
 					h.cltvExpiry > 0 && h.cltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
 			);
 			if (soon) {
-				this.cancelHeldHtlc(Buffer.from(hashHex, 'hex'));
+				this.cancelHeldHtlc(
+					Buffer.from(hashHex, 'hex'),
+					INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+					'expiry-scan'
+				);
 			}
 		}
 	}
@@ -17451,6 +17622,99 @@ export class LightningNode extends EventEmitter {
 			});
 		}
 		return out;
+	}
+
+	/**
+	 * Derived lifecycle state of a hold invoice (see listHoldInvoices).
+	 */
+	private holdInvoiceState(
+		hashHex: string,
+		invoice: IInvoiceInfo
+	): HoldInvoiceState {
+		const held = this.heldHtlcs.get(hashHex) ?? [];
+		const payment = this.payments.get(hashHex);
+		if (held.length > 0) return 'ACCEPTED';
+		if (
+			payment?.status === PaymentStatus.COMPLETED &&
+			payment.direction === PaymentDirection.INCOMING
+		) {
+			return 'SETTLED';
+		}
+		if (invoice.cancelledAt || !this.heldInvoiceHashes.has(hashHex)) {
+			return 'CANCELLED';
+		}
+		return 'OPEN';
+	}
+
+	/**
+	 * The committed MPP set of a hold invoice (issue #737): every parked part
+	 * with its channel/HTLC identity and ABSOLUTE expiry, whether the channel
+	 * still holds it COMMITTED, the invoice's declared total, and the height
+	 * at which scanExpiringHeldHtlcs would cancel the whole hash.
+	 *
+	 * `committed` is re-derived from the channel's own received-HTLC entry on
+	 * every call; the parked map is an index, not proof. `parts` satisfy the
+	 * swap admission validators' ICommittedSwapHtlc directly. Returns null for
+	 * a hash that is not a hold invoice of this node.
+	 */
+	getHeldInvoiceSnapshot(paymentHash: Buffer): IHeldInvoiceSnapshot | null {
+		const hashHex = paymentHash.toString('hex');
+		const invoice = this.invoices.get(hashHex);
+		if (!invoice || !invoice.hold) return null;
+		const parts: IHeldInvoicePart[] = [];
+		for (const h of this.heldHtlcs.get(hashHex) ?? []) {
+			const channel = this.channelManager.getChannel(h.channelId);
+			const entry = channel
+				?.getFullState()
+				.htlcs.get(`received-${h.htlcId.toString()}`);
+			const committed =
+				!!entry &&
+				entry.direction === HtlcDirection.RECEIVED &&
+				entry.state === HtlcState.COMMITTED &&
+				entry.paymentHash.equals(paymentHash);
+			parts.push({
+				id: `${h.channelId.toString('hex')}:${h.htlcId.toString()}`,
+				channelId: h.channelId,
+				htlcId: h.htlcId,
+				paymentHash,
+				amountMsat: h.amountMsat,
+				cltvExpiry: entry?.cltvExpiry ?? h.cltvExpiry,
+				committed
+			});
+		}
+		let committedMsat = 0n;
+		let earliestExpiry: number | null = null;
+		for (const part of parts) {
+			if (!part.committed) continue;
+			committedMsat += part.amountMsat;
+			if (part.cltvExpiry > 0) {
+				earliestExpiry =
+					earliestExpiry === null
+						? part.cltvExpiry
+						: Math.min(earliestExpiry, part.cltvExpiry);
+			}
+		}
+		const expectedAmountMsat = invoice.amountMsat;
+		const complete =
+			expectedAmountMsat !== undefined &&
+			parts.length > 0 &&
+			parts.every((p) => p.committed) &&
+			committedMsat === expectedAmountMsat;
+		return {
+			paymentHash,
+			state: this.holdInvoiceState(hashHex, invoice),
+			currentHeight: this.currentBlockHeight,
+			parts,
+			committedMsat,
+			expectedAmountMsat,
+			complete,
+			earliestExpiry,
+			cancelMarginBlocks: HELD_HTLC_EXPIRY_MARGIN,
+			cancelHeight:
+				earliestExpiry === null
+					? null
+					: earliestExpiry - HELD_HTLC_EXPIRY_MARGIN
+		};
 	}
 
 	// ─────────────── Async Payments (LSP-side held forwards) ───────────────
@@ -19618,6 +19882,8 @@ export class LightningNode extends EventEmitter {
 		);
 		// Seed all monitors (on-chain claim path for every inbound HTLC of this hash).
 		this.channelManager.recordPreimage(paymentHash, preimage);
+		// Our own outgoing payment, settled by an on-chain claim downstream.
+		this.reconcileOutgoingPreimage(paymentHash, preimage);
 
 		// Settle the inbound leg off-chain where the channel is still usable.
 		for (const channel of this.channelManager.listChannels()) {
@@ -19688,6 +19954,17 @@ export class LightningNode extends EventEmitter {
 	): void {
 		if (outputType !== OutputType.OFFERED_HTLC) return;
 		if (!channelId || !paymentHash) return;
+		// Our own outgoing payment's HTLC resolved on chain (issue #737): the
+		// resolution watcher learns it here whether the preimage was found or
+		// the timeout path won.
+		if (
+			htlcId !== undefined &&
+			this.htlcPaymentMap.get(
+				`${channelId.toString('hex')}:offered-${htlcId}`
+			) === paymentHash.toString('hex')
+		) {
+			this.emitHtlcResolved(paymentHash, channelId, htlcId, 'onchain-resolved');
+		}
 		// A known preimage means the downstream DID settle; the fulfill path
 		// (handleOnChainPreimageLearned / handleHtlcFulfilled) owns the inbound leg.
 		if (this.preimages.has(paymentHash.toString('hex'))) return;
@@ -19854,6 +20131,88 @@ export class LightningNode extends EventEmitter {
 				status: payment.status
 			});
 		}
+		if (payment && payment.direction === PaymentDirection.OUTGOING) {
+			// Every fulfilled part reports, not only the one that flipped the
+			// record: a resolution watcher counts HTLCs, not records.
+			this.emitHtlcResolved(paymentHash, channelId, htlcId, 'fulfilled');
+			this.emitPaymentPreimage(paymentHash, preimage, 'htlc');
+		}
+	}
+
+	/** 'payment:htlc-resolved' for one offered HTLC of an outgoing payment. */
+	private emitHtlcResolved(
+		paymentHash: Buffer,
+		channelId: Buffer,
+		htlcId: bigint,
+		state: OutgoingHtlcState
+	): void {
+		const event: IPaymentHtlcResolvedEvent = {
+			paymentHash,
+			channelId,
+			htlcId,
+			state
+		};
+		this.emit('payment:htlc-resolved', event);
+	}
+
+	/** 'payment:preimage' for an outgoing payment's hash, whatever its status. */
+	private emitPaymentPreimage(
+		paymentHash: Buffer,
+		preimage: Buffer,
+		source: IPaymentPreimageEvent['source']
+	): void {
+		const event: IPaymentPreimageEvent = { paymentHash, preimage, source };
+		this.emit('payment:preimage', event);
+	}
+
+	/**
+	 * A preimage learned ON CHAIN for one of our own outgoing payments
+	 * (issue #737): the downstream force-closed and claimed with the preimage,
+	 * so the payment DID succeed even though no update_fulfill_htlc ever
+	 * arrived. handleHtlcFulfilled owns the off-chain path; this promotes the
+	 * record the same way and announces the preimage so a watcher that gave
+	 * up on the wall clock still learns it.
+	 */
+	private reconcileOutgoingPreimage(
+		paymentHash: Buffer,
+		preimage: Buffer
+	): void {
+		const hashHex = paymentHash.toString('hex');
+		const payment = this.payments.get(hashHex);
+		if (!payment || payment.direction !== PaymentDirection.OUTGOING) return;
+		if (
+			payment.status === PaymentStatus.PENDING ||
+			payment.status === PaymentStatus.FAILED
+		) {
+			payment.status = PaymentStatus.COMPLETED;
+			payment.preimage = preimage;
+			payment.completedAt = Date.now();
+			const retryCtx = this.paymentRetryContexts.get(hashHex);
+			if (retryCtx?.invoiceStr) {
+				if (!payment.metadata) payment.metadata = {};
+				payment.metadata._invoice = retryCtx.invoiceStr;
+			}
+			this.paymentRetryContexts.delete(hashHex);
+			this.outboundMppPayments.delete(hashHex);
+			if (payment.route) {
+				for (const hop of payment.route.hops) {
+					this.missionControl.recordSuccess(hop.shortChannelId.toString('hex'));
+				}
+			}
+			// No channel transition to ride here: the claim happened on chain.
+			this.safeStorage(
+				() => this.persistPayment(paymentHash),
+				'persistPayment'
+			);
+			this.emit('payment:sent', payment);
+			this.emitStructuredLog('payment', 'sent', {
+				paymentHash: hashHex,
+				amountMsat: Number(payment.amountMsat),
+				status: payment.status,
+				source: 'onchain'
+			});
+		}
+		this.emitPaymentPreimage(paymentHash, preimage, 'onchain');
 	}
 
 	/**
@@ -20654,6 +21013,7 @@ export class LightningNode extends EventEmitter {
 			this.commitMutations('release retried HTLC mapping', [
 				{ type: 'delete_htlc_payment_mapping', htlcKey: key }
 			]);
+			this.emitHtlcResolved(payment.paymentHash, channelId, htlcId, 'failed');
 
 			// sendPayment() rejects a second payment for a hash that is still
 			// registered, so unregister the finished attempt before redispatching.
@@ -20687,7 +21047,8 @@ export class LightningNode extends EventEmitter {
 						retryCtx.invoiceStr!,
 						retryCtx.excludedChannels,
 						retryCtx.maxFeeMsat,
-						retryCtx.amountMsat
+						retryCtx.amountMsat,
+						retryCtx.maxCltvExpiryHeight
 					);
 				}
 				retried.retryCount = retryCtx.retryCount;
@@ -20739,6 +21100,7 @@ export class LightningNode extends EventEmitter {
 			this.persistChannel(channelId);
 		});
 		if (firstFailure) this.emit('payment:failed', payment);
+		this.emitHtlcResolved(payment.paymentHash, channelId, htlcId, 'failed');
 	}
 
 	/**
@@ -21678,6 +22040,43 @@ export class LightningNode extends EventEmitter {
 		return this._chainBackend;
 	}
 
+	// ─────────────── Swap provider foundations (issue #737) ───────────────
+
+	/** The swap ledger, when config.swaps.enabled. */
+	getSwapLedger(): SwapLedger | undefined {
+		return this.swapLedger;
+	}
+
+	/**
+	 * The narrow chain view a swap engine observes through: the configured
+	 * chain backend plus this node's height. Throws without a backend, so an
+	 * engine never watches a contract against nothing.
+	 */
+	swapChain(): ISwapChainSource {
+		const backend = this._chainBackend;
+		if (!backend) {
+			throw new Error('swaps need a chain backend');
+		}
+		return {
+			currentHeight: () => this.currentBlockHeight,
+			getTransaction: (txid) => backend.getTransaction(txid),
+			getScriptHashHistory: (scriptHash) =>
+				backend.getScriptHashHistory(scriptHash),
+			listUnspent: backend.listUnspent
+				? (scriptHash) => backend.listUnspent!(scriptHash)
+				: undefined,
+			broadcastTransaction: (rawTxHex) => backend.broadcastTransaction(rawTxHex)
+		};
+	}
+
+	/**
+	 * Per-swap key derivation over the node's private key (swaps/keys.ts).
+	 * Handed to an engine as a closure so the key itself never leaves here.
+	 */
+	getSwapKeyDeriver(): (swapId: Buffer, role: SwapKeyRole) => Buffer {
+		return (swapId, role) => deriveSwapKey(this.nodePrivkey, swapId, role);
+	}
+
 	/** A channel with this peer a splice could ride, or null. */
 	private usableChannelWith(peerHex: string): Buffer | null {
 		for (const channel of this.listChannels()) {
@@ -21855,6 +22254,7 @@ export class LightningNode extends EventEmitter {
 		// Keep the fee advisor warm so a (synchronous) force-close can resolve a live
 		// feerate for its commitment CPFP + time-sensitive HTLC txs (H2). Non-blocking.
 		this.warmFeeAdvisor();
+		this.emit('block:processed', blockHeight);
 	}
 
 	/**
@@ -23884,6 +24284,263 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * What an outgoing payment's HTLCs have actually done (issue #737): every
+	 * offered HTLC for the hash across attempts and MPP parts, from the
+	 * channels' own state, plus mapped HTLCs whose channel has gone to chain,
+	 * from their monitors. `resolved` is never true while any HTLC is
+	 * non-terminal, whatever the record says: a wall-clock failPayment is not
+	 * an outcome.
+	 */
+	getOutgoingHtlcs(paymentHash: Buffer): IOutgoingPaymentResolution {
+		const hashHex = paymentHash.toString('hex');
+		const payment = this.payments.get(hashHex);
+		const status =
+			payment && payment.direction === PaymentDirection.OUTGOING
+				? payment.status
+				: null;
+		const views = new Map<string, IOutgoingHtlcView>();
+
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			// A channel that went to chain keeps its HTLC entries as they
+			// were at the close; the monitor, not the entry, knows how each
+			// offered HTLC resolved on chain.
+			const monitor = this.channelManager.getMonitor(channelId);
+			const channelState = channel.getState();
+			const onChain =
+				monitor !== undefined ||
+				channelState === ChannelState.CLOSED ||
+				channelState === ChannelState.FORCE_CLOSED;
+			for (const [key, htlc] of channel.getFullState().htlcs) {
+				if (!key.startsWith('offered-')) continue;
+				if (!htlc.paymentHash.equals(paymentHash)) continue;
+				let state: OutgoingHtlcState;
+				let terminal: boolean;
+				const tracked =
+					onChain && htlc.state !== HtlcState.FULFILLED
+						? monitor
+								?.getTrackedOutputs()
+								.find(
+									(o) =>
+										o.outputType === OutputType.OFFERED_HTLC &&
+										(o.htlcId !== undefined
+											? o.htlcId === htlc.id
+											: o.paymentHash?.equals(paymentHash) === true)
+								)
+						: undefined;
+				if (tracked) {
+					terminal = tracked.status === OutputStatus.IRREVOCABLY_RESOLVED;
+					state = terminal ? 'onchain-resolved' : 'onchain-pending';
+				} else if (
+					onChain &&
+					htlc.state !== HtlcState.FULFILLED &&
+					!(
+						htlc.state === HtlcState.FAILED &&
+						LightningNode.isOfferedFailIrrevocable(htlc)
+					)
+				) {
+					// On chain with no tracked output for this HTLC: it never
+					// made a signed commitment, or it resolved with the
+					// channel. This includes a fail received one revocation
+					// short of removal when the channel closed: that
+					// revocation never comes, and the commitment that went to
+					// chain carries no output for it. A CLOSED channel has
+					// nothing left to resolve.
+					terminal = channelState === ChannelState.CLOSED;
+					state = terminal ? 'onchain-resolved' : 'onchain-pending';
+				} else if (htlc.state === HtlcState.FULFILLED) {
+					state = 'fulfilled';
+					terminal = true;
+				} else if (htlc.state === HtlcState.FAILED) {
+					state = 'failed';
+					terminal = LightningNode.isOfferedFailIrrevocable(htlc);
+				} else {
+					state = 'offered';
+					terminal = false;
+				}
+				views.set(`${channelId.toString('hex')}:offered-${htlc.id}`, {
+					channelId,
+					htlcId: htlc.id,
+					amountMsat: htlc.amountMsat,
+					cltvExpiry: htlc.cltvExpiry,
+					state,
+					terminal
+				});
+			}
+		}
+
+		// Mapped HTLCs the channel no longer carries: the channel went to
+		// chain (its monitor answers) or is gone entirely (fully resolved, so
+		// no further outcome is possible).
+		for (const [key, mappedHash] of this.htlcPaymentMap) {
+			if (mappedHash !== hashHex || views.has(key)) continue;
+			const [channelIdHex, rest] = key.split(':offered-');
+			if (!channelIdHex || rest === undefined) continue;
+			let htlcId: bigint;
+			try {
+				htlcId = BigInt(rest);
+			} catch {
+				continue;
+			}
+			const channelId = Buffer.from(channelIdHex, 'hex');
+			const channel = this.channelManager.getChannel(channelId);
+			const monitor = this.channelManager.getMonitor(channelId);
+			const tracked = monitor
+				?.getTrackedOutputs()
+				.find(
+					(o) =>
+						o.outputType === OutputType.OFFERED_HTLC &&
+						(o.htlcId !== undefined
+							? o.htlcId === htlcId
+							: o.paymentHash?.equals(paymentHash) === true)
+				);
+			let state: OutgoingHtlcState;
+			let terminal: boolean;
+			if (tracked) {
+				terminal = tracked.status === OutputStatus.IRREVOCABLY_RESOLVED;
+				state = terminal ? 'onchain-resolved' : 'onchain-pending';
+			} else if (monitor) {
+				// The channel is on chain but this HTLC has no tracked output
+				// on the commitment that confirmed: it never made it into a
+				// signed commitment, or it already resolved with the channel.
+				terminal = !channel;
+				state = terminal ? 'onchain-resolved' : 'onchain-pending';
+			} else if (channel) {
+				// Off-chain channel with the HTLC gone from its state: the add
+				// concluded and its entry was pruned.
+				terminal = true;
+				state = this.preimages.has(hashHex) ? 'fulfilled' : 'failed';
+			} else {
+				terminal = true;
+				state = 'onchain-resolved';
+			}
+			views.set(key, {
+				channelId,
+				htlcId,
+				amountMsat: tracked?.amount !== undefined ? tracked.amount * 1000n : 0n,
+				cltvExpiry: 0,
+				state,
+				terminal
+			});
+		}
+
+		const htlcs = [...views.values()];
+		let latestOutstandingExpiry: number | null = null;
+		for (const view of htlcs) {
+			if (view.terminal) continue;
+			latestOutstandingExpiry = Math.max(
+				latestOutstandingExpiry ?? 0,
+				view.cltvExpiry
+			);
+		}
+		const preimage = status !== null ? this.preimages.get(hashHex) : undefined;
+		return {
+			paymentHash,
+			status,
+			htlcs,
+			resolved:
+				status !== PaymentStatus.PENDING && htlcs.every((h) => h.terminal),
+			latestOutstandingExpiry,
+			preimage
+		};
+	}
+
+	/**
+	 * Resolve once every offered HTLC of an outgoing payment is terminal
+	 * (issue #737). Unlike waitForPayment, a FAILED record with live HTLCs
+	 * keeps waiting; unlike sendPaymentAsync, nothing is failed on timeout.
+	 * With a timeout the rejection carries the partial view as
+	 * `err.resolution`.
+	 */
+	awaitPaymentResolution(
+		paymentHash: Buffer,
+		timeoutMs?: number
+	): Promise<IOutgoingPaymentResolution> {
+		if (this._destroyed) return Promise.reject(new Error('Node destroyed'));
+		const first = this.getOutgoingHtlcs(paymentHash);
+		if (first.resolved) return Promise.resolve(first);
+		const hashHex = paymentHash.toString('hex');
+
+		return new Promise<IOutgoingPaymentResolution>((resolve, reject) => {
+			const timer =
+				timeoutMs === undefined
+					? undefined
+					: setTimeout(() => {
+							if (done) return;
+							// The deadline reads the view once more: a removal
+							// that became irrevocable between the last poll and
+							// now is a resolution, not a timeout.
+							const last = this.getOutgoingHtlcs(paymentHash);
+							cleanup();
+							if (last.resolved) {
+								resolve(last);
+								return;
+							}
+							const err = new Error(
+								`awaitPaymentResolution timed out after ${timeoutMs}ms`
+							) as Error & { resolution: IOutgoingPaymentResolution };
+							err.resolution = last;
+							reject(err);
+					  }, timeoutMs);
+
+			const cleanup = (): void => {
+				done = true;
+				if (timer) clearTimeout(timer);
+				this.removeListener('payment:sent', onPayment);
+				this.removeListener('payment:failed', onPayment);
+				this.removeListener('payment:htlc-resolved', onHtlc);
+				this.removeListener('payment:preimage', onHtlc);
+				this.removeListener('block:processed', onBlock);
+				clearInterval(poll);
+				this._activeWaitCleanups.delete(destroyCleanup);
+			};
+			const destroyCleanup = (): void => {
+				cleanup();
+				reject(new Error('Node destroyed'));
+			};
+			this._activeWaitCleanups.add(destroyCleanup);
+
+			let done = false;
+			const evaluate = (): void => {
+				if (done) return;
+				const now = this.getOutgoingHtlcs(paymentHash);
+				if (now.resolved) {
+					done = true;
+					cleanup();
+					resolve(now);
+				}
+			};
+			// An HTLC event can fire one revocation short of irrevocable (the
+			// round completes synchronously right after it), so look again once
+			// the current dispatch has unwound; blocks re-check the rest.
+			const check = (): void => {
+				evaluate();
+				if (!done) setImmediate(evaluate);
+			};
+			const onPayment = (info: IPaymentInfo): void => {
+				if (info.paymentHash.toString('hex') === hashHex) check();
+			};
+			const onHtlc = (event: { paymentHash: Buffer }): void => {
+				if (event.paymentHash.toString('hex') === hashHex) check();
+			};
+			const onBlock = (): void => check();
+			// The removal becomes irrevocable on the peer's revocation, which
+			// arrives on its own schedule and raises no payment event; with
+			// real message latency the deferred re-check above runs before
+			// it. Look again on a short clock until resolved.
+			const poll = setInterval(evaluate, PAYMENT_RESOLUTION_POLL_MS);
+			poll.unref?.();
+
+			this.on('payment:sent', onPayment);
+			this.on('payment:failed', onPayment);
+			this.on('payment:htlc-resolved', onHtlc);
+			this.on('payment:preimage', onHtlc);
+			this.on('block:processed', onBlock);
+		});
+	}
+
+	/**
 	 * Scan for stuck PENDING outbound payments with no corresponding HTLC.
 	 * Fails payments that have been PENDING for >10 minutes with no active HTLC.
 	 */
@@ -24030,7 +24687,8 @@ export class LightningNode extends EventEmitter {
 		invoiceStr: string,
 		timeoutMs = 60_000,
 		maxFeeMsat?: bigint,
-		amountMsat?: bigint
+		amountMsat?: bigint,
+		maxCltvExpiryHeight?: number
 	): Promise<IPaymentInfo> {
 		const invoice = decodeInvoice(invoiceStr);
 		const paymentHashHex = invoice.paymentHash.toString('hex');
@@ -24076,7 +24734,13 @@ export class LightningNode extends EventEmitter {
 			this.on('payment:failed', onFailed);
 
 			try {
-				this.sendPayment(invoiceStr, undefined, maxFeeMsat, amountMsat);
+				this.sendPayment(
+					invoiceStr,
+					undefined,
+					maxFeeMsat,
+					amountMsat,
+					maxCltvExpiryHeight
+				);
 			} catch (err: unknown) {
 				cleanup();
 				reject(err instanceof Error ? err : new Error(String(err)));
