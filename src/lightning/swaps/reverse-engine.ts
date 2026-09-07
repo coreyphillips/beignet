@@ -868,8 +868,12 @@ export class ReverseSwapProvider extends EventEmitter {
 			currentHeight: height
 		};
 		if (record && record.peerNodeIdHex === peer) {
+			// Bytes travel only once a broadcast was attempted: signed bytes
+			// that never left (a refused first broadcast, a FUNDING row) are
+			// a valid, relayable transaction the payer must never be handed.
 			const fundingTx =
 				record.fundingTxHex &&
+				record.fundingBroadcastAttemptedAt !== undefined &&
 				record.fundingTxHex.length / 2 <= SWAP_MAX_FUNDING_TX_BYTES
 					? Buffer.from(record.fundingTxHex, 'hex')
 					: undefined;
@@ -888,7 +892,7 @@ export class ReverseSwapProvider extends EventEmitter {
 				fundingConfirmations: record.fundingHeight
 					? Math.max(0, height - record.fundingHeight + 1)
 					: undefined,
-				fundingTx: record.state === 'FUNDING' ? undefined : fundingTx,
+				fundingTx,
 				resolutionTxid: record.resolution
 					? Buffer.from(record.resolution.txid, 'hex')
 					: undefined,
@@ -980,7 +984,7 @@ export class ReverseSwapProvider extends EventEmitter {
 						failureReason: `hold cancelled before broadcast (${reason})`
 					});
 					if (moved.outcome === 'applied') {
-						if (record.fundingTxHex) void this.release(record.fundingTxHex);
+						void this.dropUnsentFunding(moved.record!);
 						this.emitSwap('swap:failed', moved.record!, {
 							reason: moved.record!.failureReason
 						});
@@ -1004,6 +1008,24 @@ export class ReverseSwapProvider extends EventEmitter {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Signed funding bytes that never left: release their inputs and erase
+	 * them from the row. Production bytes are a complete, relayable
+	 * transaction; a released pledge only unfreezes the coins, so the bytes
+	 * must not survive where a status answer or an operator could hand
+	 * them to the payer after the hold was cancelled.
+	 */
+	private async dropUnsentFunding(record: ISwapRecord): Promise<void> {
+		if (!record.fundingTxHex) return;
+		await this.release(record.fundingTxHex);
+		this.deps.ledger.patch(record.id, {
+			fundingTxHex: undefined,
+			lastError: `funding bytes dropped unsent (${
+				record.fundingTxid ?? 'no txid'
+			})`
+		});
 	}
 
 	private async release(txHex: string): Promise<void> {
@@ -1314,17 +1336,30 @@ export class ReverseSwapProvider extends EventEmitter {
 			}
 			current = recorded.record!;
 		}
-		// The bytes are durable. Before they leave for the FIRST time the
-		// hold is judged again, live: the wallet signed asynchronously and a
-		// cancel (the sweeper, the operator, the payer's expiry) may have
-		// landed meanwhile, and a restart re-enters here at a later height.
-		// The queue does not fence this, since the cancel is recorded on the
-		// row while this pass is awaiting the wallet; the row and the hold
-		// do. Bytes that never left are dropped and their inputs released.
+		// Input preparation first: the wallet's pledge can wait on its own
+		// locks and storage, and a cancel may land during that wait.
+		try {
+			await this.deps.pledge?.(current.fundingTxHex!);
+		} catch (err) {
+			this.deps.log('swap_pledge_failed', {
+				swapId: current.id,
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+		// Before the bytes leave for the FIRST time the hold is judged
+		// again, live, with nothing awaited between this judgement, the
+		// durable attempt marker and the broadcast call: the wallet signed
+		// and pledged asynchronously and a cancel (the sweeper, the
+		// operator, the payer's expiry) may have landed meanwhile, and a
+		// restart re-enters here at a later height. The queue does not
+		// fence this, since the cancel is recorded on the row while this
+		// pass is awaiting the wallet; the row and the hold do. Bytes that
+		// never left are dropped, their inputs released, and the bytes
+		// themselves erased so no status answer can ever hand them out.
 		if (!current.fundingBroadcastAttemptedAt) {
 			const live = this.deps.ledger.get(current.id);
 			if (!live || live.state !== 'FUNDING') {
-				await this.release(current.fundingTxHex!);
+				await this.dropUnsentFunding(current);
 				return;
 			}
 			const snapshot = this.deps.heldSnapshot(
@@ -1339,7 +1374,7 @@ export class ReverseSwapProvider extends EventEmitter {
 					failureReason: `broadcast refused: ${problem}`
 				});
 				if (moved.outcome === 'applied') {
-					await this.release(current.fundingTxHex!);
+					await this.dropUnsentFunding(moved.record!);
 					this.cancelHoldFor(current.id, 'broadcast_refused');
 					this.deps.log('swap_broadcast_refused', {
 						swapId: current.id,
@@ -1356,16 +1391,6 @@ export class ReverseSwapProvider extends EventEmitter {
 			});
 			if (marked.outcome !== 'applied') return;
 			current = marked.record!;
-		}
-		// Pledge the inputs and put the bytes out. A failed broadcast is
-		// retried every block with the same bytes.
-		try {
-			await this.deps.pledge?.(current.fundingTxHex!);
-		} catch (err) {
-			this.deps.log('swap_pledge_failed', {
-				swapId: current.id,
-				error: err instanceof Error ? err.message : String(err)
-			});
 		}
 		try {
 			await this.deps.broadcast(current.fundingTxHex!);

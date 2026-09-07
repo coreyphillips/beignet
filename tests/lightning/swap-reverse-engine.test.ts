@@ -850,12 +850,72 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h.chain.broadcasts).to.have.length(0);
 			expect(record(h, swap).state).to.equal('FAILED');
 			expect(record(h, swap).failureReason).to.match(/broadcast refused/);
-			// The bytes the wallet handed back were dropped with their pledge.
+			// The bytes the wallet handed back were pledged, judged, dropped:
+			// released and erased from the row.
 			expect(h.wallet.builds).to.have.length(1);
+			expect(h.wallet.pledged).to.deep.equal([h.wallet.builds[0]]);
 			expect(h.wallet.released).to.deep.equal([h.wallet.builds[0]]);
-			expect(h.wallet.pledged).to.have.length(0);
 			await h.engine.onBlock(1001);
 			expect(h.chain.broadcasts).to.have.length(0);
+		});
+
+		it('a hold cancelled while the wallet is pledging never has its bytes broadcast', async function () {
+			const h = await harness();
+			let releasePledge: () => void = () => undefined;
+			h.wallet.pledgeGate = () =>
+				new Promise<void>((resolve) => {
+					releasePledge = resolve;
+				});
+			const swap = clientSwap();
+			await create(h, swap);
+			const r = record(h, swap);
+			h.holds.hold(
+				swap.paymentHash,
+				BigInt(r.invoiceMsat),
+				r.refundHeight + 60
+			);
+			await settle();
+			expect(record(h, swap).state).to.equal('FUNDING');
+			expect(record(h, swap).fundingTxHex).to.be.a('string');
+			expect(record(h, swap).fundingBroadcastAttemptedAt).to.equal(undefined);
+			h.holds.sweep(swap.paymentHash);
+			await settle();
+			releasePledge();
+			await settle();
+			expect(h.chain.broadcasts).to.have.length(0);
+			const failed = record(h, swap);
+			expect(failed.state).to.equal('FAILED');
+			expect(failed.fundingBroadcastAttemptedAt).to.equal(undefined);
+			expect(h.wallet.released).to.have.length(1);
+			// The bytes never left and are gone from the row, so no status
+			// answer can hand the payer a relayable funding.
+			expect(failed.fundingTxHex).to.equal(undefined);
+			const st = await status(h, Buffer.from(failed.id, 'hex'));
+			expect(st.found).to.equal(true);
+			expect(st.fundingTx).to.equal(undefined);
+			await h.engine.onBlock(1001);
+			expect(h.chain.broadcasts).to.have.length(0);
+		});
+
+		it('status carries the funding bytes only once a broadcast was attempted', async function () {
+			const h = await harness();
+			h.chain.failBroadcasts = 1;
+			const swap = clientSwap();
+			await create(h, swap);
+			const r = record(h, swap);
+			h.holds.hold(
+				swap.paymentHash,
+				BigInt(r.invoiceMsat),
+				r.refundHeight + 60
+			);
+			await settle();
+			// Attempted and refused by the backend: the bytes may be out,
+			// the payer may have them.
+			const stuck = record(h, swap);
+			expect(stuck.state).to.equal('FUNDING');
+			expect(stuck.fundingBroadcastAttemptedAt).to.be.a('number');
+			const st = await status(h, Buffer.from(stuck.id, 'hex'));
+			expect(st.fundingTx!.toString('hex')).to.equal(stuck.fundingTxHex);
 		});
 
 		it('a restart judges the hold again before the first broadcast', async function () {

@@ -275,6 +275,8 @@ export class FakeWallet {
 	shortBy = 0n;
 	/** Awaited inside fundOutput: a wallet that signs slowly (tests). */
 	gate: (() => Promise<void>) | null = null;
+	/** Awaited inside pledge: a wallet whose selection lock is busy (tests). */
+	pledgeGate: (() => Promise<void>) | null = null;
 
 	async fundOutput(
 		address: string,
@@ -403,7 +405,8 @@ export async function harness(
 		fundOutput: (address, amount, rate) =>
 			wallet.fundOutput(address, amount, rate),
 		broadcast: (txHex) => chain.broadcastTransaction(txHex),
-		pledge: (txHex) => {
+		pledge: async (txHex) => {
+			if (wallet.pledgeGate) await wallet.pledgeGate();
 			wallet.pledged.push(txHex);
 		},
 		releasePledges: (txHex) => {
