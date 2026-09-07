@@ -152,10 +152,26 @@ export async function bitcoinRpc(
 let _cachedMiningAddress: string | null = null;
 
 /**
+ * Regtest halves the subsidy every 150 blocks, so past this height a
+ * coinbase carries nothing but the fees of the block, and on a quiet test
+ * chain that is a few sats or nothing at all. Mining those to the wallet
+ * left it holding tens of thousands of zero-value outputs, which Core's
+ * coin selection then swept into oversized funding transactions.
+ */
+const REGTEST_SUBSIDY_EXHAUSTED_HEIGHT = 150 * 33;
+
+/** A native segwit output nobody holds the key to: OP_0 <20 zero bytes>. */
+const BURN_ADDRESS = bitcoin.address.toBech32(Buffer.alloc(20), 0, 'bcrt');
+
+/**
  * Get a reusable mining address. Avoids calling getnewaddress repeatedly
- * which depletes the legacy wallet key pool across many test runs.
+ * which depletes the legacy wallet key pool across many test runs. Once
+ * the subsidy is exhausted the reward goes to a burn address: the wallet
+ * gains nothing from it and only collects dust.
  */
 async function getMiningAddress(): Promise<string> {
+	const height = (await bitcoinRpc('getblockcount')) as number;
+	if (height >= REGTEST_SUBSIDY_EXHAUSTED_HEIGHT) return BURN_ADDRESS;
 	if (!_cachedMiningAddress) {
 		try {
 			// Refill key pool first in case it's depleted
