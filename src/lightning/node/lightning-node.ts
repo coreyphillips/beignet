@@ -572,8 +572,6 @@ const PAYMENT_RESOLUTION_POLL_MS = 250;
  * Electrum round trip, short against an 18-block margin.
  */
 const SWAP_TICK_SWEEP_DEADLINE_MS = 30_000;
-/** awaitPaymentResolution re-reads the HTLC view on this clock (#737). */
-const PAYMENT_RESOLUTION_POLL_MS = 250;
 /**
  * Bytes a held-forward ledger row reserves against the async receive
  * service's byte limits (issue #709), on top of the parked onion packet. A
