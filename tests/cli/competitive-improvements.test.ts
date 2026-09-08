@@ -342,6 +342,78 @@ describe('Idempotency Keys', () => {
 			server.close();
 		}
 	});
+
+	// The send itself is stubbed: what is under test is that the daemon serves
+	// the second request from the cache, which is only observable as the wallet
+	// not being asked again.
+	for (const route of ['/send', '/send-max'] as const) {
+		const method = route === '/send' ? 'sendOnchain' : 'sendMaxOnchain';
+		it(`POST ${route} replays a cached response instead of sending again`, async function () {
+			this.timeout(15_000);
+			const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-idem-'));
+			const { server, node } = await startDaemon({
+				network: 'regtest',
+				dataDir: tmpDir,
+				daemonPort: 0,
+				logLevel: 'silent',
+				...OFFLINE_ELECTRUM
+			});
+
+			const port = (server.address() as any).port;
+			try {
+				let sends = 0;
+				(node as any)[method] = async (): Promise<{
+					txid: string;
+					hex: string;
+				}> => {
+					sends += 1;
+					return { txid: 'a'.repeat(64), hex: '0200000000' };
+				};
+
+				const address = 'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080';
+				const key = `onchain-${Date.now()}`;
+				const body = JSON.stringify(
+					route === '/send'
+						? { address, amountSats: 10_000 }
+						: { address, satsPerVbyte: 2 }
+				);
+				const res1 = await httpPost(port, route, body, {
+					'X-Idempotency-Key': key
+				});
+				const res2 = await httpPost(port, route, body, {
+					'X-Idempotency-Key': key
+				});
+
+				expect(JSON.parse(res1).result.txid).to.equal('a'.repeat(64));
+				expect(JSON.parse(res2)).to.deep.equal(JSON.parse(res1));
+				expect(sends, 'the retry was served from the cache').to.equal(1);
+
+				// Same key, different body: a conflict, never a second send.
+				const conflict = await httpPostRaw(
+					port,
+					route,
+					JSON.stringify(
+						route === '/send'
+							? { address, amountSats: 20_000 }
+							: { address, satsPerVbyte: 4 }
+					),
+					{ 'X-Idempotency-Key': key }
+				);
+				expect(conflict.statusCode).to.equal(409);
+				expect(JSON.parse(conflict.body).error.code).to.equal(
+					'IDEMPOTENCY_CONFLICT'
+				);
+				expect(sends, 'the conflicting body did not send').to.equal(1);
+
+				// Without a key nothing is cached, so the send runs again.
+				await httpPost(port, route, body);
+				expect(sends, 'an unkeyed request still sends').to.equal(2);
+			} finally {
+				await node.destroy();
+				server.close();
+			}
+		});
+	}
 });
 
 // ─────────────── TLS ───────────────

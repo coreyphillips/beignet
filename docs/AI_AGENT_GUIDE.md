@@ -710,7 +710,11 @@ curl -X POST http://localhost:2112/invoice/pay-safe \
 # Same key with DIFFERENT body — returns 409 IDEMPOTENCY_CONFLICT
 ```
 
-Supported endpoints: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`.
+Supported endpoints: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`.
+
+The same applies to the on-chain sends: a retried `POST /send` that carries the
+key of a send already broadcast returns that broadcast's txid instead of
+spending again. The cache is in memory, so it is empty after a daemon restart.
 
 ## Graceful Shutdown (Drain Mode)
 
