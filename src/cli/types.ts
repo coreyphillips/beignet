@@ -5,7 +5,10 @@
 
 import { TLogLevel } from '../logger';
 import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
-import type { SpliceRefusalCode } from '../lightning/node/types';
+import type {
+	HoldCancelReason,
+	SpliceRefusalCode
+} from '../lightning/node/types';
 
 export interface NodeInfo {
 	nodeId: string;
@@ -352,6 +355,19 @@ export interface HoldInvoiceInfo {
 	description?: string;
 	expiry: number;
 	createdAt: number;
+}
+
+/**
+ * A hold invoice's transition, relayed over SSE and webhooks (issue #746).
+ * Uses the field names of a `GET /invoices/held` row. `heldAmountMsat` and
+ * `htlcCount` describe the parked set the transition acted on, including
+ * for terminal events whose subsequent GET row has zero parked parts.
+ */
+export interface HoldInvoiceEvent {
+	paymentHash: string;
+	state: HoldInvoiceInfo['state'];
+	heldAmountMsat: string;
+	htlcCount: number;
 }
 
 export interface DecodedInvoice {
@@ -1160,6 +1176,21 @@ export interface BeignetNodeEvents {
 		bolt11: string;
 		amountSats: number;
 	}) => void;
+	/**
+	 * Hold-invoice lifecycle (issue #746). `hold:accepted` fires for each new
+	 * parked part, including partial MPP payments. Before funding a swap,
+	 * compare BigInt(heldAmountMsat) with the full expected amount in msat.
+	 * ACCEPTED alone does not mean the invoice is fully funded. These events
+	 * are always relayed, regardless of htlcEvents.
+	 */
+	'hold:accepted': (data: HoldInvoiceEvent) => void;
+	'hold:settled': (data: HoldInvoiceEvent) => void;
+	'hold:cancelled': (
+		data: HoldInvoiceEvent & {
+			/** The CLTV sweeper (`expiry-scan`) or an explicit cancel (`api`). */
+			reason: HoldCancelReason;
+		}
+	) => void;
 	/**
 	 * On-chain lifecycle, one appearance and at most one confirmation per
 	 * transaction. `transaction:received` fires when an incoming transaction

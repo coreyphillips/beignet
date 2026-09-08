@@ -4,14 +4,20 @@
  * Covers the M4 user API surface semantics at the library level:
  * park on pay (payer stays PENDING), settle-with-preimage, cancel,
  * wrong-preimage rejection, MPP parts parking/settling together,
- * restart persistence of parked HTLCs, and the CLTV-safety auto-cancel
- * (a parked HTLC must never ride into its on-chain timeout).
+ * restart persistence of parked HTLCs, the CLTV-safety auto-cancel
+ * (a parked HTLC must never ride into its on-chain timeout), and the
+ * lifecycle events each transition fires.
  */
 
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
+import {
+	IHoldCancelledEvent,
+	IHoldInvoiceStateEvent,
+	INodeConfig,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	ChannelState,
@@ -512,5 +518,428 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				bob.getChannelManager().getChannel(channelId)!.getState()
 			).to.equal(ChannelState.NORMAL);
 		});
+	});
+
+	// A swap provider commits its own money on the ACCEPTED edge, so it has to
+	// learn about it without polling the hold-invoice list (issue #746).
+	describe('lifecycle events', function () {
+		/** The three hold transitions in order, tagged by event name. */
+		function holdEvents(
+			node: LightningNode
+		): Array<[string, IHoldInvoiceStateEvent | IHoldCancelledEvent]> {
+			const out: Array<[string, IHoldInvoiceStateEvent | IHoldCancelledEvent]> =
+				[];
+			for (const name of ['hold:accepted', 'hold:settled', 'hold:cancelled']) {
+				node.on(name, (e: IHoldInvoiceStateEvent | IHoldCancelledEvent) =>
+					out.push([name, e])
+				);
+			}
+			return out;
+		}
+
+		it('emits hold:accepted on the park and hold:settled on the release', function () {
+			const alice = createNode(17);
+			const bob = createNode(18);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildGraph(alice, bob, [channelId]);
+			const events = holdEvents(bob);
+
+			const { preimage, hash } = makeExternalHash();
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-events',
+				hold: true,
+				paymentHash: hash
+			});
+			// Creating the invoice is not a transition: it is still OPEN.
+			expect(events).to.have.length(0);
+
+			alice.sendPayment(invoice.bolt11);
+			expect(events).to.have.length(1);
+			expect(events[0][0]).to.equal('hold:accepted');
+			expect(events[0][1]).to.deep.equal({
+				paymentHash: hash,
+				state: 'ACCEPTED',
+				heldAmountMsat: 5_000_000n,
+				htlcCount: 1
+			});
+
+			expect(bob.settleHeldHtlc(hash, preimage)).to.be.true;
+			expect(events).to.have.length(2);
+			expect(events[1][0]).to.equal('hold:settled');
+			expect(events[1][1]).to.deep.equal({
+				paymentHash: hash,
+				state: 'SETTLED',
+				heldAmountMsat: 5_000_000n,
+				htlcCount: 1
+			});
+		});
+
+		it('carries the parked total on hold:cancelled, and zero when nothing was parked', function () {
+			const alice = createNode(19);
+			const bob = createNode(20);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildGraph(alice, bob, [channelId]);
+			const events = holdEvents(bob);
+
+			const paid = makeExternalHash();
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-cancel-events',
+				hold: true,
+				paymentHash: paid.hash
+			});
+			alice.sendPayment(invoice.bolt11);
+			bob.cancelHoldInvoice(paid.hash);
+			expect(events.map((e) => e[0])).to.deep.equal([
+				'hold:accepted',
+				'hold:cancelled'
+			]);
+			expect(events[1][1]).to.deep.equal({
+				paymentHash: paid.hash,
+				reason: 'api',
+				htlcsFailed: 1,
+				heldAmountMsat: 5_000_000n
+			});
+
+			const unpaid = makeExternalHash();
+			bob.createInvoice({
+				amountMsat: 1_000n,
+				description: 'hold-cancel-unpaid',
+				hold: true,
+				paymentHash: unpaid.hash
+			});
+			bob.cancelHoldInvoice(unpaid.hash);
+			expect(events).to.have.length(3);
+			expect(events[2][1]).to.deep.equal({
+				paymentHash: unpaid.hash,
+				reason: 'api',
+				htlcsFailed: 0,
+				heldAmountMsat: 0n
+			});
+		});
+
+		// The park also emits 'log' and 'htlc:held', and a listener on either can
+		// settle or cancel from inside the callback. hold:accepted has to be out
+		// before that, or a subscriber's last event reads ACCEPTED for an invoice
+		// that is already resolved.
+		it('emits hold:accepted before a park callback can resolve the invoice', function () {
+			const alice = createNode(23);
+			const bob = createNode(24);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildGraph(alice, bob, [channelId]);
+			const events = holdEvents(bob);
+
+			const cancelled = makeExternalHash();
+			const toCancel = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-cancel-in-callback',
+				hold: true,
+				paymentHash: cancelled.hash
+			});
+			bob.once('htlc:held', () => bob.cancelHoldInvoice(cancelled.hash));
+			alice.sendPayment(toCancel.bolt11);
+			expect(events.map((e) => e[0])).to.deep.equal([
+				'hold:accepted',
+				'hold:cancelled'
+			]);
+
+			const settled = makeExternalHash();
+			const toSettle = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-settle-in-callback',
+				hold: true,
+				paymentHash: settled.hash
+			});
+			bob.once('htlc:held', () =>
+				bob.settleHeldHtlc(settled.hash, settled.preimage)
+			);
+			alice.sendPayment(toSettle.bolt11);
+			expect(events.map((e) => e[0])).to.deep.equal([
+				'hold:accepted',
+				'hold:cancelled',
+				'hold:accepted',
+				'hold:settled'
+			]);
+		});
+
+		// The park persists before it announces, and a failed persist reports
+		// through node:error on the same stack. A listener there that resolves
+		// the hold leaves nothing parked, so there is no ACCEPTED state to
+		// announce behind the terminal event.
+		it('does not emit hold:accepted once a node:error listener has resolved the hold', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const saveMetadata = storage.saveMetadata.bind(storage);
+			storage.saveMetadata = (key: string, value: string): void => {
+				if (key === 'held_htlcs') throw new Error('disk full');
+				saveMetadata(key, value);
+			};
+			const alice = createNode(25);
+			const bob = createNode(26, storage);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildGraph(alice, bob, [channelId]);
+			const events = holdEvents(bob);
+
+			const { hash } = makeExternalHash();
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-persist-failure',
+				hold: true,
+				paymentHash: hash
+			});
+			bob.once('node:error', () => bob.cancelHoldInvoice(hash));
+			alice.sendPayment(invoice.bolt11);
+
+			expect(events.map((e) => e[0])).to.deep.equal(['hold:cancelled']);
+			expect(bob.listHeldHtlcs()).to.have.length(0);
+			storage.close();
+		});
+
+		for (const cancelOnError of [false, true]) {
+			it(`stops settlement after a failed preimage write${
+				cancelOnError
+					? ' when an error listener cancels'
+					: ' and permits a retry'
+			}`, function () {
+				const storage = new SqliteStorage(':memory:');
+				storage.open();
+				try {
+					const alice = createNode(27);
+					const bob = createNode(28, storage);
+					connectNodes(alice, bob);
+					const channelId = openReadyChannel(alice, bob);
+					buildGraph(alice, bob, [channelId]);
+					const events = holdEvents(bob);
+					const { hash, preimage } = makeExternalHash();
+					const invoice = bob.createInvoice({
+						amountMsat: 5_000_000n,
+						description: 'hold-preimage-write-failure',
+						hold: true,
+						paymentHash: hash
+					});
+					alice.sendPayment(invoice.bolt11);
+					const savePreimage = storage.savePreimage.bind(storage);
+					storage.savePreimage = () => {
+						throw new Error('disk full');
+					};
+					if (cancelOnError) {
+						bob.once('node:error', () => bob.cancelHoldInvoice(hash));
+					}
+
+					expect(() => bob.settleHeldHtlc(hash, preimage)).to.throw(
+						'failed to persist preimage'
+					);
+					expect(events.map(([name]) => name)).to.deep.equal(
+						cancelOnError
+							? ['hold:accepted', 'hold:cancelled']
+							: ['hold:accepted']
+					);
+					expect(bob.listHoldInvoices()[0].state).to.equal(
+						cancelOnError ? 'CANCELLED' : 'ACCEPTED'
+					);
+					expect(alice.getPayment(hash)?.status).to.equal(
+						cancelOnError ? PaymentStatus.FAILED : PaymentStatus.PENDING
+					);
+					storage.savePreimage = savePreimage;
+					if (!cancelOnError) {
+						expect(() => bob.settleHeldHtlc(hash)).to.throw(
+							'no preimage available'
+						);
+						expect(bob.settleHeldHtlc(hash, preimage)).to.equal(true);
+						expect(events.map(([name]) => name)).to.deep.equal([
+							'hold:accepted',
+							'hold:settled'
+						]);
+						expect(alice.getPayment(hash)?.status).to.equal(
+							PaymentStatus.COMPLETED
+						);
+					}
+				} finally {
+					storage.close();
+				}
+			});
+		}
+
+		it('fires once per MPP part, each with the parked set running total', function () {
+			// Two explicit parts over two channels, as in the MPP suite above.
+			const alice = createNode(21);
+			const bob = createNode(22);
+			connectNodes(alice, bob);
+			const ch1 = openReadyChannel(alice, bob, 100_000n);
+			const ch2 = openReadyChannel(alice, bob, 100_000n);
+			buildGraph(alice, bob, [ch1, ch2], 100_000_000n);
+			const events = holdEvents(bob);
+
+			const { hash } = makeExternalHash();
+			const totalMsat = 90_000_000n;
+			const invoice = bob.createInvoice({
+				amountMsat: totalMsat,
+				description: 'hold-mpp-events',
+				hold: true,
+				paymentHash: hash
+			});
+			const bobPubkey = Buffer.from(bob.getNodeId(), 'hex');
+			[ch1, ch2].forEach((_channelId, i) => {
+				alice.sendPaymentToRoute(
+					{
+						hops: [
+							{
+								pubkey: bobPubkey,
+								shortChannelId: encodeShortChannelId({
+									block: 500,
+									txIndex: i + 1,
+									outputIndex: 0
+								}),
+								amountToForwardMsat: totalMsat / 2n,
+								outgoingCltvValue: 40
+							}
+						]
+					},
+					hash,
+					40,
+					invoice.paymentSecret,
+					totalMsat
+				);
+			});
+
+			expect(events.map((e) => e[0])).to.deep.equal([
+				'hold:accepted',
+				'hold:accepted'
+			]);
+			expect(events[0][1]).to.deep.equal({
+				paymentHash: hash,
+				state: 'ACCEPTED',
+				heldAmountMsat: totalMsat / 2n,
+				htlcCount: 1
+			});
+			// The second part carries the whole invoice: a consumer holding the
+			// declared amount can tell the set is complete from the event alone.
+			expect(events[1][1]).to.deep.equal({
+				paymentHash: hash,
+				state: 'ACCEPTED',
+				heldAmountMsat: totalMsat,
+				htlcCount: 2
+			});
+		});
+
+		for (const resolution of ['settle', 'cancel'] as const) {
+			it(`preserves lifecycle order when an earlier accepted listener calls ${resolution}`, function () {
+				const alice = createNode(31);
+				const bob = createNode(32);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildGraph(alice, bob, [channelId]);
+				const { hash, preimage } = makeExternalHash();
+				const invoice = bob.createInvoice({
+					amountMsat: 5_000_000n,
+					description: 'hold-resolve-in-accepted',
+					hold: true,
+					paymentHash: hash
+				});
+				bob.once('hold:accepted', () => {
+					if (resolution === 'settle') {
+						bob.settleHeldHtlc(hash, preimage);
+					} else {
+						bob.cancelHoldInvoice(hash);
+					}
+				});
+				const events = holdEvents(bob);
+
+				alice.sendPayment(invoice.bolt11);
+
+				expect(events.map((event) => event[0])).to.deep.equal([
+					'hold:accepted',
+					resolution === 'settle' ? 'hold:settled' : 'hold:cancelled'
+				]);
+				expect(bob.listHoldInvoices()[0].state).to.equal(
+					resolution === 'settle' ? 'SETTLED' : 'CANCELLED'
+				);
+			});
+		}
+
+		it('delivers cancellation when settlement from an accepted listener throws', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const alice = createNode(33);
+				const bob = createNode(34, storage);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildGraph(alice, bob, [channelId]);
+				const { hash, preimage } = makeExternalHash();
+				const invoice = bob.createInvoice({
+					amountMsat: 5_000_000n,
+					description: 'hold-accepted-settle-failure',
+					hold: true,
+					paymentHash: hash
+				});
+				const events = holdEvents(bob);
+				bob.once('hold:accepted', () => bob.settleHeldHtlc(hash, preimage));
+				bob.once('node:error', () => bob.cancelHoldInvoice(hash));
+				storage.savePreimage = () => {
+					throw new Error('disk full');
+				};
+
+				alice.sendPayment(invoice.bolt11);
+
+				expect(events.map(([name]) => name)).to.deep.equal([
+					'hold:accepted',
+					'hold:cancelled'
+				]);
+				expect(bob.listHoldInvoices()[0].state).to.equal('CANCELLED');
+			} finally {
+				storage.close();
+			}
+		});
+
+		for (const firstFailure of [
+			new Error('first listener failure'),
+			undefined
+		]) {
+			it(`drains nested transitions and rethrows the first ${
+				firstFailure === undefined ? 'undefined' : 'Error'
+			} listener failure`, function () {
+				const bob = createNode(35);
+				const first = bob.createInvoice({
+					amountMsat: 1_000n,
+					description: 'first-hold',
+					hold: true
+				});
+				const second = bob.createInvoice({
+					amountMsat: 1_000n,
+					description: 'second-hold',
+					hold: true
+				});
+				const events = holdEvents(bob);
+				bob.on('hold:cancelled', (event: IHoldCancelledEvent) => {
+					if (event.paymentHash.equals(first.paymentHash)) {
+						bob.cancelHoldInvoice(second.paymentHash);
+						throw firstFailure;
+					}
+					throw new Error('later listener failure');
+				});
+				let threw = false;
+				let thrown: unknown;
+
+				try {
+					bob.cancelHoldInvoice(first.paymentHash);
+				} catch (error) {
+					threw = true;
+					thrown = error;
+				}
+
+				expect(threw).to.be.true;
+				expect(thrown).to.equal(firstFailure);
+				expect(events.map(([, event]) => event.paymentHash)).to.deep.equal([
+					first.paymentHash,
+					second.paymentHash
+				]);
+			});
+		}
 	});
 });

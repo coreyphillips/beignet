@@ -440,6 +440,12 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'payment:sent',
 		'payment:failed',
 		'invoice:settled',
+		// Hold invoice lifecycle (issue #746). Always on: per-part acceptance
+		// totals and terminal transitions let consumers follow held payments
+		// without polling. The htlcEvents gate applies to routing volume.
+		'hold:accepted',
+		'hold:settled',
+		'hold:cancelled',
 		// On-chain money movements, sourced from the wallet rather than the
 		// lightning node. Without these an on-chain receive is invisible until
 		// a client polls /transactions for the difference. Appearance events

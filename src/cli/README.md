@@ -194,6 +194,12 @@ Parked HTLCs are restart-safe (they re-park from storage) and are
 forgotten hold can never force an on-chain timeout. Typical uses: escrow-style
 flows, just-in-time inventory checks, atomic swaps.
 
+Hold progress fires events (`hold:accepted`, `hold:settled`, `hold:cancelled`),
+relayed over SSE and webhooks. `hold:accepted` fires for each new parked part,
+including partial MPP payments. Before funding a swap, compare
+`BigInt(heldAmountMsat)` with the full expected amount in millisatoshis.
+The `ACCEPTED` state alone does not mean the invoice is fully funded.
+
 #### Payments
 
 | Method | Returns | Description |
@@ -659,6 +665,7 @@ node.on('payment:received', (info: PaymentInfo) => { ... });
 node.on('payment:sent', (info: PaymentInfo) => { ... });
 node.on('payment:failed', (info: PaymentInfo) => { ... });
 node.on('invoice:settled', ({ paymentHash, bolt11, amountSats }) => { ... }); // an invoice WE issued was paid (keysend fires only payment:received)
+node.on('hold:accepted', ({ paymentHash, state, heldAmountMsat, htlcCount }) => { ... }); // per-part running total: compare with the full expected msat before funding; also hold:settled and hold:cancelled (+ reason)
 node.on('channel:opening', ({ channelId, fundingTxid }) => { ... }); // funding negotiated + broadcast/watched
 node.on('channel:ready', ({ channelId }) => { ... });
 node.on('channel:pending-close', ({ channelId, initiator }) => { ... }); // coop close initiated ('local' | 'remote')
@@ -1014,6 +1021,9 @@ interface BeignetNodeEvents {
   'payment:sent': (info: PaymentInfo) => void;
   'payment:failed': (info: PaymentInfo) => void;
   'invoice:settled': (data: { paymentHash: string; bolt11: string; amountSats: number }) => void;
+  'hold:accepted': (data: HoldInvoiceEvent) => void;
+  'hold:settled': (data: HoldInvoiceEvent) => void;
+  'hold:cancelled': (data: HoldInvoiceEvent & { reason: 'api' | 'expiry-scan' }) => void;
   'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
   'channel:ready': (data: { channelId: string }) => void;
   'channel:pending-close': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
@@ -2030,10 +2040,11 @@ event: channel:ready
 data: {"channelId":"cd34..."}
 ```
 
-Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`, and the Recovery Protocol events `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`, `recovery:reestablish-held`, `recovery:capsule-retrieved`, `recovery:guardian_unreachable`, `recovery:restore-progress`, `recovery:restored` (always on; low volume, and operator dashboards ride them). JIT receive progress on the LSP side (`jit:intent`, `jit:intent-superseded`, `jit:intercepted`, `jit:funding`, `jit:forwarded`, `jit:failed`; satoshi and millisatoshi figures as decimal strings) and direct-funding receiver progress (`direct-funding:offer:accepted` with `paired`, `direct-funding:offer:declined`, `direct-funding:offer:failed`, `direct-funding:offer:completed`) are relayed too (issue #669), so a dashboard follows a funding it fronts or receives without polling.
+Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, the hold-invoice lifecycle (`hold:accepted`, `hold:settled`, `hold:cancelled`), `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`, and the Recovery Protocol events `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`, `recovery:reestablish-held`, `recovery:capsule-retrieved`, `recovery:guardian_unreachable`, `recovery:restore-progress`, `recovery:restored` (always on; low volume, and operator dashboards ride them). JIT receive progress on the LSP side (`jit:intent`, `jit:intent-superseded`, `jit:intercepted`, `jit:funding`, `jit:forwarded`, `jit:failed`; satoshi and millisatoshi figures as decimal strings) and direct-funding receiver progress (`direct-funding:offer:accepted` with `paired`, `direct-funding:offer:declined`, `direct-funding:offer:failed`, `direct-funding:offer:completed`) are relayed too (issue #669), so a dashboard follows a funding it fronts or receives without polling.
 
 - `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
 - `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).
+- The `hold:*` events carry `{paymentHash, state, heldAmountMsat, htlcCount}`, plus `reason` (`api` or `expiry-scan`) on `hold:cancelled`. The amount and count describe the set acted on. Terminal events retain these totals even though a subsequent `GET /invoices/held` row has zero parked parts. `hold:accepted` fires once per new MPP part with the running total. Before funding, require `BigInt(heldAmountMsat)` to cover the full expected amount. For an amountless invoice, use the amount agreed with the payer.
 
 Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed only when the daemon is started with `--htlc-events` (config `htlcEvents: true`, env `BEIGNET_HTLC_EVENTS=true`); routing nodes generate one event per HTLC, so they are off by default.
 
@@ -2063,6 +2074,14 @@ curl -X DELETE http://localhost:2112/webhooks/unregister \
 Webhook deliveries are POST requests with JSON body `{ event, data, timestamp }`. When a `secret` is configured, an `X-Webhook-Signature: sha256=<hmac>` header is included for payload verification. Webhooks are persisted to SQLite and survive daemon restarts. Note: HMAC secrets are stored as hashes — re-register with a secret after restart if HMAC verification is needed.
 
 Registering with `"events": ["*"]` matches every relayed event, including the invoice, channel-lifecycle, and (when `--htlc-events` is enabled) HTLC events, plus any event types added in future versions. The event list matches the SSE list above.
+
+For each registration and payment hash, hold lifecycle deliveries run in order,
+including the one retry after a failed delivery. Other payment hashes can proceed
+independently. Retries retain the original payload and timestamp. Delivery is
+best effort: a request can be received more than once, and an event is dropped
+after both attempts fail. Handle duplicates without repeating funding and treat
+`SETTLED` and `CANCELLED` as terminal. After a disconnect or missed delivery,
+reconcile with `GET /invoices/held` before acting on an old acceptance event.
 
 ### API Versioning
 

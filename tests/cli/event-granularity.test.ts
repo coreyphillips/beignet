@@ -6,11 +6,12 @@
 
 import * as http from 'http';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { expect } from 'chai';
-import { getRelayedEvents } from '../../src/cli/daemon';
+import { formatSseFrame, getRelayedEvents } from '../../src/cli/daemon';
 import { WebhookManager } from '../../src/cli/webhooks';
-import { BeignetNode } from '../../src/cli/beignet-node';
+import { BeignetNode, holdInvoiceEvent } from '../../src/cli/beignet-node';
 import { EPaymentType } from '../../src/types/wallet';
 
 const NEW_EVENTS = [
@@ -21,6 +22,12 @@ const NEW_EVENTS = [
 	'channel:resolved'
 ];
 const HTLC_EVENTS = ['htlc:forwarded', 'htlc:fulfilled', 'htlc:failed'];
+/**
+ * Hold-invoice lifecycle (issue #746). One event per transition, and the
+ * ACCEPTED edge is what a swap provider commits its own money on, so these are
+ * never behind the htlcEvents gate that per-forward volume earned.
+ */
+const HOLD_EVENTS = ['hold:accepted', 'hold:settled', 'hold:cancelled'];
 /** Recovery events LightningNode emits and BeignetNode relays JSON-safe. */
 const RECOVERY_NODE_EVENTS = [
 	'recovery:durable',
@@ -88,6 +95,13 @@ describe('Event granularity (M4 batch 2b)', () => {
 		it('relays node:error, with and without htlc events', () => {
 			expect(getRelayedEvents()).to.include('node:error');
 			expect(getRelayedEvents(true)).to.include('node:error');
+		});
+
+		it('relays the hold-invoice events, with and without htlc events', () => {
+			for (const e of HOLD_EVENTS) {
+				expect(getRelayedEvents(), e).to.include(e);
+				expect(getRelayedEvents(true), e).to.include(e);
+			}
 		});
 
 		// Low volume by construction, and the operator surface (degraded-state
@@ -226,6 +240,116 @@ describe('Event granularity (M4 batch 2b)', () => {
 		});
 	});
 
+	describe('hold invoice event bridge', function () {
+		this.timeout(20_000);
+		let node: BeignetNode | undefined;
+		let dataDir: string;
+
+		before(async () => {
+			dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-hold-events-'));
+			node = await BeignetNode.create({
+				network: 'regtest',
+				dataDir,
+				logLevel: 'info',
+				electrumHost: '127.0.0.1',
+				electrumPort: 65529,
+				electrumTls: false,
+				rapidGossipSync: false,
+				autoGossipSync: false
+			});
+		});
+
+		after(async () => {
+			await node?.destroy();
+			fs.rmSync(dataDir, { recursive: true, force: true });
+		});
+
+		it('relays each engine payload through the installed listeners as valid SSE JSON', () => {
+			const paymentHash = Buffer.alloc(32, 0xab);
+			const received: Array<[string, unknown]> = [];
+			for (const event of HOLD_EVENTS) {
+				node!.once(event, (data: unknown) => {
+					const frame = formatSseFrame(event, data);
+					expect(frame).to.match(new RegExp(`^event: ${event}\\ndata: `));
+					received.push([event, JSON.parse(frame.split('\ndata: ')[1])]);
+				});
+			}
+			node!.lightningNode.emit('hold:accepted', {
+				paymentHash,
+				state: 'ACCEPTED',
+				heldAmountMsat: 5_000_000n,
+				htlcCount: 2
+			});
+			node!.lightningNode.emit('hold:settled', {
+				paymentHash,
+				state: 'SETTLED',
+				heldAmountMsat: 5_000_000n,
+				htlcCount: 2
+			});
+			node!.lightningNode.emit('hold:cancelled', {
+				paymentHash,
+				reason: 'expiry-scan',
+				heldAmountMsat: 5_000_000n,
+				htlcsFailed: 2
+			});
+			const common = {
+				paymentHash: 'ab'.repeat(32),
+				heldAmountMsat: '5000000',
+				htlcCount: 2
+			};
+			expect(received).to.deep.equal([
+				['hold:accepted', { ...common, state: 'ACCEPTED' }],
+				['hold:settled', { ...common, state: 'SETTLED' }],
+				[
+					'hold:cancelled',
+					{ ...common, state: 'CANCELLED', reason: 'expiry-scan' }
+				]
+			]);
+		});
+
+		it('relays acceptance before a log listener synchronously cancels the invoice', () => {
+			const paymentHash = 'cd'.repeat(32);
+			node!.createHoldInvoice({ paymentHash, amountSats: 5_000 });
+			const received: Array<[string, unknown]> = [];
+			node!.once('hold:accepted', (data) =>
+				received.push(['hold:accepted', data])
+			);
+			node!.once('hold:cancelled', (data) =>
+				received.push(['hold:cancelled', data])
+			);
+			node!.once('log', () => node!.cancelHoldInvoice(paymentHash));
+			// Inject the engine notification at the bridge boundary. The log
+			// listener calls the real cancellation API on an open invoice.
+			node!.lightningNode.emit('hold:accepted', {
+				paymentHash: Buffer.from(paymentHash, 'hex'),
+				state: 'ACCEPTED',
+				heldAmountMsat: 5_000_000n,
+				htlcCount: 1
+			});
+			expect(received).to.deep.equal([
+				[
+					'hold:accepted',
+					{
+						paymentHash,
+						state: 'ACCEPTED',
+						heldAmountMsat: '5000000',
+						htlcCount: 1
+					}
+				],
+				[
+					'hold:cancelled',
+					{
+						paymentHash,
+						state: 'CANCELLED',
+						heldAmountMsat: '0',
+						htlcCount: 0,
+						reason: 'api'
+					}
+				]
+			]);
+		});
+	});
+
 	describe('end-to-end relay chain (source wiring)', () => {
 		const beignetNodeSrc = fs.readFileSync(
 			path.join(__dirname, '../../src/cli/beignet-node.ts'),
@@ -259,6 +383,34 @@ describe('Event granularity (M4 batch 2b)', () => {
 				);
 				expect(beignetNodeSrc, `emit for ${e}`).to.include(`this.emit('${e}'`);
 			}
+		});
+
+		it('LightningNode emits, and BeignetNode relays, the hold-invoice events', () => {
+			for (const e of HOLD_EVENTS) {
+				expect(lightningNodeSrc, e).to.include(`'${e}'`);
+				expect(beignetNodeSrc, `relay for ${e}`).to.match(
+					new RegExp(`this\\.node\\.on\\(\\s*'${e}'`)
+				);
+				expect(beignetNodeSrc, `emit for ${e}`).to.include(`this.emit('${e}'`);
+			}
+		});
+
+		// SSE JSON.stringifies the payload, and a consumer swaps this in for a
+		// GET /invoices/held row: same field names, same JSON-safe types.
+		it('relays a hold transition in the GET /invoices/held row shape', () => {
+			const wire = holdInvoiceEvent({
+				paymentHash: Buffer.alloc(32, 0xab),
+				state: 'ACCEPTED',
+				heldAmountMsat: 5_000_000n,
+				htlcCount: 2
+			});
+			expect(() => JSON.stringify(wire)).to.not.throw();
+			expect(wire).to.deep.equal({
+				paymentHash: 'ab'.repeat(32),
+				state: 'ACCEPTED',
+				heldAmountMsat: '5000000',
+				htlcCount: 2
+			});
 		});
 
 		it('BeignetNode originates the daemon-side recovery events', () => {
@@ -304,7 +456,7 @@ describe('Event granularity (M4 batch 2b)', () => {
 
 		it("a '*' registration receives every new event type", async () => {
 			manager.register(`http://127.0.0.1:${serverPort}/hook`, ['*']);
-			const all = [...NEW_EVENTS, ...HTLC_EVENTS];
+			const all = [...NEW_EVENTS, ...HTLC_EVENTS, ...HOLD_EVENTS];
 			for (const e of all) {
 				manager.dispatch(e, { test: e });
 			}

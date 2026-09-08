@@ -244,6 +244,7 @@ import {
 	IHeldInvoiceSnapshot,
 	IHeldInvoicePart,
 	IHoldCancelledEvent,
+	IHoldInvoiceStateEvent,
 	HoldCancelReason,
 	HoldInvoiceState,
 	ISendPaymentOptions,
@@ -545,6 +546,8 @@ bitcoin.initEccLib(ecc);
  * - 'recovery:reestablish-held' (peerPubkey: string, channelIdHex: string, expiresAt: number): a peer's channel_reestablish for a channel this node has no record of was parked instead of failed, because the node may still be an incomplete restore target (issue #462)
  * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction): an on-chain claim was declined because it cannot pay its own fee
  * - 'htlc:held' ({ paymentHash: Buffer, amountMsat: bigint }): one part of a hold invoice was parked; read getHeldInvoiceSnapshot for the full committed set
+ * - 'hold:accepted' (event: IHoldInvoiceStateEvent): a part joined a hold invoice's parked set, carrying the set's running total; a re-park on reestablish is not a transition and does not fire
+ * - 'hold:settled' (event: IHoldInvoiceStateEvent): a hold invoice's preimage was revealed and every parked part fulfilled
  * - 'hold:cancelled' (event: IHoldCancelledEvent): a hold invoice was cancelled by the CLTV sweeper or by the API; every parked part was failed back
  * - 'payment:htlc-resolved' (event: IPaymentHtlcResolvedEvent): one offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain)
  * - 'payment:preimage' (event: IPaymentPreimageEvent): the preimage of an outgoing payment became known, from update_fulfill_htlc or from an on-chain claim, whatever the record's status was
@@ -912,6 +915,11 @@ export class LightningNode extends EventEmitter {
 			cltvExpiry: number;
 		}>
 	> = new Map();
+	private holdInvoiceEventQueue: Array<{
+		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled';
+		event: IHoldInvoiceStateEvent | IHoldCancelledEvent;
+	}> = [];
+	private emittingHoldInvoiceEvent = false;
 	private mppTimeoutMs: number;
 	private alias?: string;
 	private announcedAddresses: INodeAddress[] = [];
@@ -17357,9 +17365,37 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/** Finish notifying every listener before delivering a nested transition. */
+	private emitHoldInvoiceEvent(
+		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled',
+		event: IHoldInvoiceStateEvent | IHoldCancelledEvent
+	): void {
+		this.holdInvoiceEventQueue.push({ name, event });
+		if (this.emittingHoldInvoiceEvent) return;
+		this.emittingHoldInvoiceEvent = true;
+		let failure: { error: unknown } | undefined;
+		try {
+			for (let i = 0; i < this.holdInvoiceEventQueue.length; i++) {
+				const next = this.holdInvoiceEventQueue[i];
+				try {
+					this.emit(next.name, next.event);
+				} catch (error) {
+					// A listener may resolve a hold and then throw. Deliver the
+					// queued transition before propagating the first failure.
+					failure ??= { error };
+				}
+			}
+		} finally {
+			this.holdInvoiceEventQueue.length = 0;
+			this.emittingHoldInvoiceEvent = false;
+		}
+		if (failure) throw failure.error;
+	}
+
 	/**
 	 * Park a validated incoming HTLC for a hold invoice. It awaits release via
-	 * settleHeldHtlc / cancelHeldHtlc (or the CLTV sweeper). Emits 'htlc:held'.
+	 * settleHeldHtlc / cancelHeldHtlc (or the CLTV sweeper). Emits 'htlc:held',
+	 * and 'hold:accepted' when the part actually joined the set.
 	 */
 	private parkHeldHtlc(
 		channelId: Buffer,
@@ -17371,12 +17407,32 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const list = this.heldHtlcs.get(hashHex) ?? [];
 		// Dedup a duplicate park for the same channel+htlc (e.g. on reestablish).
-		if (
-			!list.some((h) => h.channelId.equals(channelId) && h.htlcId === htlcId)
-		) {
+		const joined = !list.some(
+			(h) => h.channelId.equals(channelId) && h.htlcId === htlcId
+		);
+		// Only a part that joined the set moved the invoice's state. A re-park
+		// on reestablish reports the same set twice, which a consumer treating
+		// the event as the OPEN -> ACCEPTED edge would read as a second payment.
+		if (joined) {
 			list.push({ channelId, htlcId, amountMsat, cltvExpiry });
 			this.heldHtlcs.set(hashHex, list);
 			this.persistHeldHtlcs();
+			// Ahead of the log and 'htlc:held' below: a listener on either can
+			// settle or cancel from inside the callback, and an ACCEPTED event
+			// trailing that resolution leaves the subscriber holding a state the
+			// invoice has already left. persistHeldHtlcs reports a storage
+			// failure the same way, through node:error, so the set can already
+			// be gone here, leaving no ACCEPTED state to report.
+			const parked = this.heldHtlcs.get(hashHex);
+			if (parked) {
+				const event: IHoldInvoiceStateEvent = {
+					paymentHash,
+					state: 'ACCEPTED',
+					heldAmountMsat: parked.reduce((sum, h) => sum + h.amountMsat, 0n),
+					htlcCount: parked.length
+				};
+				this.emitHoldInvoiceEvent('hold:accepted', event);
+			}
 		}
 		this.emitStructuredLog('htlc', 'held', {
 			paymentHash: hashHex,
@@ -17391,6 +17447,7 @@ export class LightningNode extends EventEmitter {
 	 * generated at createInvoice; an external preimage (validated against the
 	 * hash) is required for hold invoices created with an external payment hash.
 	 * Returns false when nothing is parked for the hash.
+	 * Throws if the preimage cannot be persisted, before revealing it.
 	 */
 	settleHeldHtlc(paymentHash: Buffer, preimage?: Buffer): boolean {
 		const hashHex = paymentHash.toString('hex');
@@ -17408,12 +17465,19 @@ export class LightningNode extends EventEmitter {
 
 		// Persist the preimage and deliver it to the chain monitors before
 		// fulfilling, so a force-close mid-settle can still claim on-chain.
+		if (
+			!this.commitMutations(
+				'savePreimage',
+				[{ type: 'payment_preimage', paymentHash: hashHex, preimage: pre }],
+				RecoveryCriticality.SafetyCritical
+			)
+		) {
+			throw new Error('settleHeldHtlc: failed to persist preimage');
+		}
+		// Persistence callbacks can resolve the hold on this same stack. Do
+		// not reveal the preimage or report settlement for a set they removed.
+		if (this.heldHtlcs.get(hashHex) !== held) return false;
 		this.preimages.set(hashHex, pre);
-		this.commitMutations(
-			'savePreimage',
-			[{ type: 'payment_preimage', paymentHash: hashHex, preimage: pre }],
-			RecoveryCriticality.SafetyCritical
-		);
 		this.channelManager.recordPreimage(paymentHash, pre);
 
 		for (const h of held) {
@@ -17443,6 +17507,13 @@ export class LightningNode extends EventEmitter {
 			paymentHash: hashHex,
 			held: 'true'
 		});
+		const event: IHoldInvoiceStateEvent = {
+			paymentHash,
+			state: 'SETTLED',
+			heldAmountMsat: held.reduce((sum, h) => sum + h.amountMsat, 0n),
+			htlcCount: held.length
+		};
+		this.emitHoldInvoiceEvent('hold:settled', event);
 		return true;
 	}
 
@@ -17500,7 +17571,12 @@ export class LightningNode extends EventEmitter {
 		this.heldHtlcs.delete(hashHex);
 		this.heldInvoiceHashes.delete(hashHex);
 		this.persistHeldHtlcs();
-		this.markHoldInvoiceCancelled(hashHex, cancelReason, held.length);
+		this.markHoldInvoiceCancelled(
+			hashHex,
+			cancelReason,
+			held.length,
+			held.reduce((sum, h) => sum + h.amountMsat, 0n)
+		);
 		this.emitStructuredLog('htlc', 'held_cancelled', {
 			paymentHash: hashHex,
 			reason: cancelReason
@@ -17516,7 +17592,8 @@ export class LightningNode extends EventEmitter {
 	private markHoldInvoiceCancelled(
 		hashHex: string,
 		reason: HoldCancelReason,
-		htlcsFailed: number
+		htlcsFailed: number,
+		heldAmountMsat: bigint
 	): void {
 		this.preimages.delete(hashHex);
 		this.paymentSecrets.delete(hashHex);
@@ -17556,9 +17633,10 @@ export class LightningNode extends EventEmitter {
 		const event: IHoldCancelledEvent = {
 			paymentHash: Buffer.from(hashHex, 'hex'),
 			reason,
-			htlcsFailed
+			htlcsFailed,
+			heldAmountMsat
 		};
-		this.emit('hold:cancelled', event);
+		this.emitHoldInvoiceEvent('hold:cancelled', event);
 	}
 
 	/**
@@ -17579,7 +17657,7 @@ export class LightningNode extends EventEmitter {
 		}
 		if (!this.heldInvoiceHashes.has(hashHex)) return null;
 		this.heldInvoiceHashes.delete(hashHex);
-		this.markHoldInvoiceCancelled(hashHex, 'api', 0);
+		this.markHoldInvoiceCancelled(hashHex, 'api', 0, 0n);
 		this.emitStructuredLog('htlc', 'held_cancelled', { paymentHash: hashHex });
 		return { htlcsFailed: 0 };
 	}
