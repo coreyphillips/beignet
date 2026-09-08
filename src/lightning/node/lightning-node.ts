@@ -17378,20 +17378,17 @@ export class LightningNode extends EventEmitter {
 		const joined = !list.some(
 			(h) => h.channelId.equals(channelId) && h.htlcId === htlcId
 		);
-		if (joined) {
-			list.push({ channelId, htlcId, amountMsat, cltvExpiry });
-			this.heldHtlcs.set(hashHex, list);
-			this.persistHeldHtlcs();
-		}
-		this.emitStructuredLog('htlc', 'held', {
-			paymentHash: hashHex,
-			amountMsat: amountMsat.toString()
-		});
-		this.emit('htlc:held', { paymentHash, amountMsat });
 		// Only a part that joined the set moved the invoice's state. A re-park
 		// on reestablish reports the same set twice, which a consumer treating
 		// the event as the OPEN -> ACCEPTED edge would read as a second payment.
 		if (joined) {
+			list.push({ channelId, htlcId, amountMsat, cltvExpiry });
+			this.heldHtlcs.set(hashHex, list);
+			this.persistHeldHtlcs();
+			// Ahead of the log and 'htlc:held' below: a listener on either can
+			// settle or cancel from inside the callback, and an ACCEPTED event
+			// trailing that resolution leaves the subscriber holding a state the
+			// invoice has already left.
 			const event: IHoldInvoiceStateEvent = {
 				paymentHash,
 				state: 'ACCEPTED',
@@ -17400,6 +17397,11 @@ export class LightningNode extends EventEmitter {
 			};
 			this.emit('hold:accepted', event);
 		}
+		this.emitStructuredLog('htlc', 'held', {
+			paymentHash: hashHex,
+			amountMsat: amountMsat.toString()
+		});
+		this.emit('htlc:held', { paymentHash, amountMsat });
 	}
 
 	/**

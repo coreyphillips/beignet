@@ -621,6 +621,51 @@ describe('Hold Invoices (M4 batch 1)', function () {
 			});
 		});
 
+		// The park also emits 'log' and 'htlc:held', and a listener on either can
+		// settle or cancel from inside the callback. hold:accepted has to be out
+		// before that, or a subscriber's last event reads ACCEPTED for an invoice
+		// that is already resolved.
+		it('emits hold:accepted before a park callback can resolve the invoice', function () {
+			const alice = createNode(23);
+			const bob = createNode(24);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildGraph(alice, bob, [channelId]);
+			const events = holdEvents(bob);
+
+			const cancelled = makeExternalHash();
+			const toCancel = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-cancel-in-callback',
+				hold: true,
+				paymentHash: cancelled.hash
+			});
+			bob.once('htlc:held', () => bob.cancelHoldInvoice(cancelled.hash));
+			alice.sendPayment(toCancel.bolt11);
+			expect(events.map((e) => e[0])).to.deep.equal([
+				'hold:accepted',
+				'hold:cancelled'
+			]);
+
+			const settled = makeExternalHash();
+			const toSettle = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-settle-in-callback',
+				hold: true,
+				paymentHash: settled.hash
+			});
+			bob.once('htlc:held', () =>
+				bob.settleHeldHtlc(settled.hash, settled.preimage)
+			);
+			alice.sendPayment(toSettle.bolt11);
+			expect(events.map((e) => e[0])).to.deep.equal([
+				'hold:accepted',
+				'hold:cancelled',
+				'hold:accepted',
+				'hold:settled'
+			]);
+		});
+
 		it('fires once per MPP part, each with the parked set running total', function () {
 			// Two explicit parts over two channels, as in the MPP suite above.
 			const alice = createNode(21);
