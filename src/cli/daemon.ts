@@ -95,7 +95,12 @@ const IDEMPOTENT_ROUTES = new Set([
 	// request id whether or not a key is supplied, which is what the app needs
 	// since it sends none; this only lets a client that DOES supply one get the
 	// cached response without the engine re-deriving it.
-	'POST /direct-funding/send'
+	'POST /direct-funding/send',
+	// An on-chain send broadcasts a transaction. A caller that loses the
+	// response cannot tell "not broadcast" from "broadcast, answer lost", and
+	// checking the chain instead races the mempool.
+	'POST /send',
+	'POST /send-max'
 ]);
 
 function success<T>(result: T): ApiResponse<T> {

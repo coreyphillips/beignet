@@ -14,8 +14,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			version: '1.0.0',
 			description:
 				'HTTP API for a self-custodial Bitcoin + Lightning node. Designed for AI agents.\n\n' +
-				'**Idempotency:** Payment endpoints (`/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`) support the `X-Idempotency-Key` header. ' +
-				'When provided, the response is cached for 24 hours — repeated requests with the same key and body return the cached response. ' +
+				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`. ' +
+				'When provided, the response is cached in memory for 24 hours (or until the daemon restarts), and repeated requests with the same key and body return the cached response. ' +
 				'If the same key is reused with a different request body, a `409 IDEMPOTENCY_CONFLICT` error is returned.\n\n' +
 				'**TLS:** The daemon supports HTTPS when started with `--tls-cert` and `--tls-key` flags (or `BEIGNET_TLS_CERT`/`BEIGNET_TLS_KEY` env vars).\n\n' +
 				'**Scoped API keys:** Besides the legacy single `apiToken` (implicit admin scope), the `apiKeys` config defines named keys with `readonly`, `invoice`, and/or `admin` scopes. Each operation lists the scopes it accepts in `x-accepted-scopes`; unclassified routes are admin-only. Requests fail with 401 (bad/absent key) or 403 (valid key, insufficient scope).\n\n' +
