@@ -666,6 +666,40 @@ describe('Hold Invoices (M4 batch 1)', function () {
 			]);
 		});
 
+		// The park persists before it announces, and a failed persist reports
+		// through node:error on the same stack. A listener there that resolves
+		// the hold leaves nothing parked, so there is no ACCEPTED state to
+		// announce behind the terminal event.
+		it('does not emit hold:accepted once a node:error listener has resolved the hold', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const saveMetadata = storage.saveMetadata.bind(storage);
+			storage.saveMetadata = (key: string, value: string): void => {
+				if (key === 'held_htlcs') throw new Error('disk full');
+				saveMetadata(key, value);
+			};
+			const alice = createNode(25);
+			const bob = createNode(26, storage);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildGraph(alice, bob, [channelId]);
+			const events = holdEvents(bob);
+
+			const { hash } = makeExternalHash();
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-persist-failure',
+				hold: true,
+				paymentHash: hash
+			});
+			bob.once('node:error', () => bob.cancelHoldInvoice(hash));
+			alice.sendPayment(invoice.bolt11);
+
+			expect(events.map((e) => e[0])).to.deep.equal(['hold:cancelled']);
+			expect(bob.listHeldHtlcs()).to.have.length(0);
+			storage.close();
+		});
+
 		it('fires once per MPP part, each with the parked set running total', function () {
 			// Two explicit parts over two channels, as in the MPP suite above.
 			const alice = createNode(21);

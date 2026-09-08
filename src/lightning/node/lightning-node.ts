@@ -17388,14 +17388,19 @@ export class LightningNode extends EventEmitter {
 			// Ahead of the log and 'htlc:held' below: a listener on either can
 			// settle or cancel from inside the callback, and an ACCEPTED event
 			// trailing that resolution leaves the subscriber holding a state the
-			// invoice has already left.
-			const event: IHoldInvoiceStateEvent = {
-				paymentHash,
-				state: 'ACCEPTED',
-				heldAmountMsat: list.reduce((sum, h) => sum + h.amountMsat, 0n),
-				htlcCount: list.length
-			};
-			this.emit('hold:accepted', event);
+			// invoice has already left. persistHeldHtlcs reports a storage
+			// failure the same way, through node:error, so the set can already
+			// be gone here, leaving no ACCEPTED state to report.
+			const parked = this.heldHtlcs.get(hashHex);
+			if (parked) {
+				const event: IHoldInvoiceStateEvent = {
+					paymentHash,
+					state: 'ACCEPTED',
+					heldAmountMsat: parked.reduce((sum, h) => sum + h.amountMsat, 0n),
+					htlcCount: parked.length
+				};
+				this.emit('hold:accepted', event);
+			}
 		}
 		this.emitStructuredLog('htlc', 'held', {
 			paymentHash: hashHex,

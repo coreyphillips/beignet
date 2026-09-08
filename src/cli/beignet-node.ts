@@ -2616,12 +2616,15 @@ export class BeignetNode extends EventEmitter {
 		// spends the timelock budget the swap is built on.
 		this.node.on('hold:accepted', (e: IHoldInvoiceStateEvent) => {
 			const info = holdInvoiceEvent(e);
+			// Relayed before the log line, not after: 'log' is a public event, and
+			// a listener there that settles or cancels the hold would otherwise
+			// reach SSE with the terminal event first and ACCEPTED behind it.
+			this.emit('hold:accepted', info);
 			this.log('info', 'Hold invoice accepted', {
 				paymentHash: info.paymentHash,
 				heldAmountMsat: info.heldAmountMsat,
 				htlcCount: info.htlcCount
 			});
-			this.emit('hold:accepted', info);
 		});
 		this.node.on('hold:settled', (e: IHoldInvoiceStateEvent) => {
 			this.emit('hold:settled', holdInvoiceEvent(e));
