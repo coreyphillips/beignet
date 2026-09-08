@@ -3,14 +3,27 @@ import * as crypto from 'crypto';
 import { expect } from 'chai';
 import { WebhookManager } from '../../src/cli/webhooks';
 
+interface ReceivedRequest {
+	body: Record<string, unknown>;
+	payload: string;
+	headers: http.IncomingHttpHeaders;
+	url: string | undefined;
+}
+
 describe('WebhookManager', () => {
 	let manager: WebhookManager;
 	let testServer: http.Server;
-	let receivedRequests: Array<{
-		body: Record<string, unknown>;
-		headers: http.IncomingHttpHeaders;
-	}>;
+	let receivedRequests: ReceivedRequest[];
+	let responseStatus: (request: ReceivedRequest) => number;
 	let serverPort: number;
+
+	async function waitForRequests(count: number): Promise<void> {
+		const deadline = Date.now() + 4000;
+		while (receivedRequests.length < count && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		expect(receivedRequests).to.have.length(count);
+	}
 
 	before((done) => {
 		receivedRequests = [];
@@ -18,11 +31,15 @@ describe('WebhookManager', () => {
 			const chunks: Buffer[] = [];
 			req.on('data', (chunk: Buffer) => chunks.push(chunk));
 			req.on('end', () => {
-				receivedRequests.push({
-					body: JSON.parse(Buffer.concat(chunks).toString()),
-					headers: req.headers
-				});
-				res.statusCode = 200;
+				const payload = Buffer.concat(chunks).toString();
+				const request = {
+					body: JSON.parse(payload),
+					payload,
+					headers: req.headers,
+					url: req.url
+				};
+				receivedRequests.push(request);
+				res.statusCode = responseStatus(request);
 				res.end('OK');
 			});
 		});
@@ -40,6 +57,11 @@ describe('WebhookManager', () => {
 	beforeEach(() => {
 		manager = new WebhookManager();
 		receivedRequests = [];
+		responseStatus = (): number => 200;
+	});
+
+	afterEach(() => {
+		manager.clear();
 	});
 
 	// 1. register() creates a webhook with unique ID
@@ -209,5 +231,143 @@ describe('WebhookManager', () => {
 		manager.clear();
 		expect(manager.size).to.equal(0);
 		expect(manager.list()).to.have.length(0);
+	});
+
+	describe('hold lifecycle delivery ordering', function () {
+		this.timeout(6000);
+
+		for (const terminalEvent of ['hold:cancelled', 'hold:settled']) {
+			it(`finishes the accepted retry before delivering ${terminalEvent}`, async () => {
+				manager.register(
+					`http://127.0.0.1:${serverPort}/hook`,
+					['*'],
+					'secret'
+				);
+				responseStatus = (): number =>
+					receivedRequests.length === 1 ? 500 : 200;
+				const accepted = { paymentHash: 'invoice-a', heldAmountMsat: '1000' };
+				manager.dispatch('hold:accepted', accepted);
+				manager.dispatch(terminalEvent, { paymentHash: 'invoice-a' });
+				accepted.heldAmountMsat = '2000';
+
+				await waitForRequests(3);
+
+				expect(
+					receivedRequests.map((request) => request.body.event)
+				).to.deep.equal(['hold:accepted', 'hold:accepted', terminalEvent]);
+				expect(receivedRequests[1].payload).to.equal(
+					receivedRequests[0].payload
+				);
+				expect(receivedRequests[1].headers['x-webhook-signature']).to.equal(
+					receivedRequests[0].headers['x-webhook-signature']
+				);
+				expect(receivedRequests[1].body.data).to.deep.equal({
+					paymentHash: 'invoice-a',
+					heldAmountMsat: '1000'
+				});
+			});
+		}
+
+		it('continues to the terminal event after the accepted retry also fails', async () => {
+			manager.register(`http://127.0.0.1:${serverPort}/hook`, ['*']);
+			responseStatus = (request): number =>
+				request.body.event === 'hold:accepted' ? 500 : 200;
+			manager.dispatch('hold:accepted', { paymentHash: 'invoice-a' });
+			manager.dispatch('hold:settled', { paymentHash: 'invoice-a' });
+
+			await waitForRequests(3);
+
+			expect(
+				receivedRequests.map((request) => request.body.event)
+			).to.deep.equal(['hold:accepted', 'hold:accepted', 'hold:settled']);
+		});
+
+		it('does not block other invoices or other event types behind a retry', async () => {
+			manager.register(`http://127.0.0.1:${serverPort}/hook`, ['*']);
+			responseStatus = (request): number =>
+				request.body.event === 'hold:accepted' &&
+				(request.body.data as { paymentHash: string }).paymentHash ===
+					'invoice-a'
+					? 500
+					: 200;
+			manager.dispatch('hold:accepted', { paymentHash: 'invoice-a' });
+			manager.dispatch('hold:cancelled', { paymentHash: 'invoice-a' });
+			manager.dispatch('hold:accepted', { paymentHash: 'invoice-b' });
+			manager.dispatch('payment:received', { paymentHash: 'invoice-a' });
+
+			await waitForRequests(3);
+
+			expect(
+				receivedRequests.map((request) => ({
+					event: request.body.event,
+					data: request.body.data
+				}))
+			).to.deep.include.members([
+				{
+					event: 'hold:accepted',
+					data: { paymentHash: 'invoice-b' }
+				},
+				{
+					event: 'payment:received',
+					data: { paymentHash: 'invoice-a' }
+				}
+			]);
+			expect(
+				receivedRequests.some(
+					(request) => request.body.event === 'hold:cancelled'
+				)
+			).to.be.false;
+
+			await waitForRequests(5);
+			expect(receivedRequests[4].body.event).to.equal('hold:cancelled');
+		});
+
+		it('does not block another registration for the same invoice', async () => {
+			manager.register(`http://127.0.0.1:${serverPort}/slow`, ['*']);
+			manager.register(`http://127.0.0.1:${serverPort}/fast`, ['*']);
+			responseStatus = (request): number =>
+				request.url === '/slow' && request.body.event === 'hold:accepted'
+					? 500
+					: 200;
+			manager.dispatch('hold:accepted', { paymentHash: 'invoice-a' });
+			manager.dispatch('hold:settled', { paymentHash: 'invoice-a' });
+
+			await waitForRequests(3);
+
+			expect(
+				receivedRequests
+					.filter((request) => request.url === '/fast')
+					.map((request) => request.body.event)
+			).to.deep.equal(['hold:accepted', 'hold:settled']);
+			expect(
+				receivedRequests.filter((request) => request.url === '/slow')
+			).to.have.length(1);
+
+			await waitForRequests(5);
+			expect(receivedRequests[4].url).to.equal('/slow');
+			expect(receivedRequests[4].body.event).to.equal('hold:settled');
+		});
+
+		for (const remove of ['unregister', 'clear'] as const) {
+			it(`${remove} suppresses retries and queued events`, async () => {
+				const registration = manager.register(
+					`http://127.0.0.1:${serverPort}/hook`,
+					['*']
+				);
+				responseStatus = (): number => 500;
+				manager.dispatch('hold:accepted', { paymentHash: 'invoice-a' });
+				manager.dispatch('hold:cancelled', { paymentHash: 'invoice-a' });
+				await waitForRequests(1);
+
+				if (remove === 'unregister') {
+					manager.unregister(registration.id);
+				} else {
+					manager.clear();
+				}
+				await new Promise((resolve) => setTimeout(resolve, 2200));
+
+				expect(receivedRequests).to.have.length(1);
+			});
+		}
 	});
 });

@@ -46,6 +46,7 @@ const RETRY_DELAY_MS = 2000;
 
 export class WebhookManager {
 	private webhooks: Map<string, WebhookEntry> = new Map();
+	private holdDeliveries = new Map<string, Map<string, Promise<void>>>();
 	private storage: IWebhookStorage | null;
 
 	constructor(storage?: IWebhookStorage) {
@@ -120,6 +121,7 @@ export class WebhookManager {
 	 */
 	unregister(id: string): boolean {
 		const deleted = this.webhooks.delete(id);
+		this.holdDeliveries.delete(id);
 		if (deleted && this.storage) {
 			try {
 				this.storage.deleteWebhook(id);
@@ -140,17 +142,51 @@ export class WebhookManager {
 	/**
 	 * Dispatch an event to all matching webhooks.
 	 * Fire-and-forget with 1 retry after 2s delay.
+	 * Hold lifecycle deliveries, including retries, run in order per webhook
+	 * registration and payment hash.
 	 */
 	dispatch(eventType: string, data: unknown): void {
+		let payload: string;
+		try {
+			// Snapshot once so queued deliveries and retries preserve the event identity.
+			payload = JSON.stringify({
+				event: eventType,
+				data,
+				timestamp: Date.now()
+			});
+		} catch {
+			return;
+		}
+		const paymentHash = this.holdPaymentHash(eventType, data);
+
 		for (const webhook of this.webhooks.values()) {
 			if (webhook.events.includes(eventType) || webhook.events.includes('*')) {
-				this.deliver(webhook, eventType, data).catch(() => {
-					// Retry once after delay
-					setTimeout(() => {
-						this.deliver(webhook, eventType, data).catch(() => {
-							// Silently drop after retry
-						});
-					}, RETRY_DELAY_MS);
+				const deliver = (): Promise<void> =>
+					this.deliverWithRetry(webhook, eventType, payload);
+				if (paymentHash === undefined) {
+					void deliver();
+					continue;
+				}
+
+				let deliveries = this.holdDeliveries.get(webhook.id);
+				if (!deliveries) {
+					deliveries = new Map();
+					this.holdDeliveries.set(webhook.id, deliveries);
+				}
+				const previous = deliveries.get(paymentHash);
+				const delivery = previous ? previous.then(deliver) : deliver();
+				deliveries.set(paymentHash, delivery);
+				const queue = deliveries;
+				void delivery.then(() => {
+					if (queue.get(paymentHash) === delivery) {
+						queue.delete(paymentHash);
+						if (
+							queue.size === 0 &&
+							this.holdDeliveries.get(webhook.id) === queue
+						) {
+							this.holdDeliveries.delete(webhook.id);
+						}
+					}
 				});
 			}
 		}
@@ -168,6 +204,7 @@ export class WebhookManager {
 	 */
 	clear(): void {
 		this.webhooks.clear();
+		this.holdDeliveries.clear();
 		if (this.storage) {
 			try {
 				this.storage.deleteAllWebhooks();
@@ -177,16 +214,46 @@ export class WebhookManager {
 		}
 	}
 
+	private holdPaymentHash(
+		eventType: string,
+		data: unknown
+	): string | undefined {
+		if (
+			['hold:accepted', 'hold:settled', 'hold:cancelled'].includes(eventType) &&
+			typeof data === 'object' &&
+			data !== null &&
+			'paymentHash' in data &&
+			typeof data.paymentHash === 'string'
+		) {
+			return data.paymentHash;
+		}
+		return undefined;
+	}
+
+	private async deliverWithRetry(
+		webhook: WebhookEntry,
+		eventType: string,
+		payload: string
+	): Promise<void> {
+		for (let attempt = 0; attempt < 2; attempt++) {
+			if (this.webhooks.get(webhook.id) !== webhook) return;
+			try {
+				await this.deliver(webhook, eventType, payload);
+				return;
+			} catch {
+				if (attempt === 0 && this.webhooks.get(webhook.id) === webhook) {
+					await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+				}
+				// Silently drop after the retry so the next queued event can proceed.
+			}
+		}
+	}
+
 	private async deliver(
 		webhook: WebhookEntry,
 		eventType: string,
-		data: unknown
+		payload: string
 	): Promise<void> {
-		const payload = JSON.stringify({
-			event: eventType,
-			data,
-			timestamp: Date.now()
-		});
 		const url = new URL(webhook.url);
 		const isHttps = url.protocol === 'https:';
 		const lib = isHttps ? https : http;

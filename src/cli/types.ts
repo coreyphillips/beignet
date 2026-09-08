@@ -359,9 +359,9 @@ export interface HoldInvoiceInfo {
 
 /**
  * A hold invoice's transition, relayed over SSE and webhooks (issue #746).
- * The identifying fields of a `GET /invoices/held` row, as they read at the
- * moment of the transition: `heldAmountMsat` and `htlcCount` describe the
- * parked set the transition acted on.
+ * Uses the field names of a `GET /invoices/held` row. `heldAmountMsat` and
+ * `htlcCount` describe the parked set the transition acted on, including
+ * for terminal events whose subsequent GET row has zero parked parts.
  */
 export interface HoldInvoiceEvent {
 	paymentHash: string;
@@ -1177,11 +1177,11 @@ export interface BeignetNodeEvents {
 		amountSats: number;
 	}) => void;
 	/**
-	 * Hold-invoice lifecycle (issue #746). `hold:accepted` is the OPEN ->
-	 * ACCEPTED edge a swap provider waits on: the counterparty's money is held
-	 * and the provider can commit its own. One event per transition (an MPP
-	 * part each carries the set's running total), so unlike the per-HTLC
-	 * events these are never gated behind htlcEvents.
+	 * Hold-invoice lifecycle (issue #746). `hold:accepted` fires for each new
+	 * parked part, including partial MPP payments. Before funding a swap,
+	 * compare BigInt(heldAmountMsat) with the full expected amount in msat.
+	 * ACCEPTED alone does not mean the invoice is fully funded. These events
+	 * are always relayed, regardless of htlcEvents.
 	 */
 	'hold:accepted': (data: HoldInvoiceEvent) => void;
 	'hold:settled': (data: HoldInvoiceEvent) => void;

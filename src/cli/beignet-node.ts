@@ -2611,9 +2611,8 @@ export class BeignetNode extends EventEmitter {
 			}
 		);
 
-		// Hold invoice lifecycle (issue #746). The ACCEPTED edge is where a swap
-		// provider commits its own money, and polling GET /invoices/held for it
-		// spends the timelock budget the swap is built on.
+		// Hold invoice lifecycle (issue #746). Per-part acceptance totals let
+		// consumers wait for the full expected amount without polling.
 		this.node.on('hold:accepted', (e: IHoldInvoiceStateEvent) => {
 			const info = holdInvoiceEvent(e);
 			// Relayed before the log line, not after: 'log' is a public event, and

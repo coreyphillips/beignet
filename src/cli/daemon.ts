@@ -440,11 +440,9 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'payment:sent',
 		'payment:failed',
 		'invoice:settled',
-		// Hold invoice lifecycle (issue #746). Always on: one event per
-		// transition, and the ACCEPTED edge is what a swap provider commits its
-		// own money on, so polling for it eats the swap's timelock budget. The
-		// htlcEvents gate below exists for routing volume (one event per
-		// forwarded HTLC), which is not this.
+		// Hold invoice lifecycle (issue #746). Always on: per-part acceptance
+		// totals and terminal transitions let consumers follow held payments
+		// without polling. The htlcEvents gate applies to routing volume.
 		'hold:accepted',
 		'hold:settled',
 		'hold:cancelled',

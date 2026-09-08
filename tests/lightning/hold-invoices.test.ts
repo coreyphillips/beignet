@@ -700,6 +700,71 @@ describe('Hold Invoices (M4 batch 1)', function () {
 			storage.close();
 		});
 
+		for (const cancelOnError of [false, true]) {
+			it(`stops settlement after a failed preimage write${
+				cancelOnError
+					? ' when an error listener cancels'
+					: ' and permits a retry'
+			}`, function () {
+				const storage = new SqliteStorage(':memory:');
+				storage.open();
+				try {
+					const alice = createNode(27);
+					const bob = createNode(28, storage);
+					connectNodes(alice, bob);
+					const channelId = openReadyChannel(alice, bob);
+					buildGraph(alice, bob, [channelId]);
+					const events = holdEvents(bob);
+					const { hash, preimage } = makeExternalHash();
+					const invoice = bob.createInvoice({
+						amountMsat: 5_000_000n,
+						description: 'hold-preimage-write-failure',
+						hold: true,
+						paymentHash: hash
+					});
+					alice.sendPayment(invoice.bolt11);
+					const savePreimage = storage.savePreimage.bind(storage);
+					storage.savePreimage = () => {
+						throw new Error('disk full');
+					};
+					if (cancelOnError) {
+						bob.once('node:error', () => bob.cancelHoldInvoice(hash));
+					}
+
+					expect(() => bob.settleHeldHtlc(hash, preimage)).to.throw(
+						'failed to persist preimage'
+					);
+					expect(events.map(([name]) => name)).to.deep.equal(
+						cancelOnError
+							? ['hold:accepted', 'hold:cancelled']
+							: ['hold:accepted']
+					);
+					expect(bob.listHoldInvoices()[0].state).to.equal(
+						cancelOnError ? 'CANCELLED' : 'ACCEPTED'
+					);
+					expect(alice.getPayment(hash)?.status).to.equal(
+						cancelOnError ? PaymentStatus.FAILED : PaymentStatus.PENDING
+					);
+					storage.savePreimage = savePreimage;
+					if (!cancelOnError) {
+						expect(() => bob.settleHeldHtlc(hash)).to.throw(
+							'no preimage available'
+						);
+						expect(bob.settleHeldHtlc(hash, preimage)).to.equal(true);
+						expect(events.map(([name]) => name)).to.deep.equal([
+							'hold:accepted',
+							'hold:settled'
+						]);
+						expect(alice.getPayment(hash)?.status).to.equal(
+							PaymentStatus.COMPLETED
+						);
+					}
+				} finally {
+					storage.close();
+				}
+			});
+		}
+
 		it('fires once per MPP part, each with the parked set running total', function () {
 			// Two explicit parts over two channels, as in the MPP suite above.
 			const alice = createNode(21);
@@ -761,5 +826,40 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				htlcCount: 2
 			});
 		});
+
+		for (const resolution of ['settle', 'cancel'] as const) {
+			it(`preserves lifecycle order when an earlier accepted listener calls ${resolution}`, function () {
+				const alice = createNode(31);
+				const bob = createNode(32);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildGraph(alice, bob, [channelId]);
+				const { hash, preimage } = makeExternalHash();
+				const invoice = bob.createInvoice({
+					amountMsat: 5_000_000n,
+					description: 'hold-resolve-in-accepted',
+					hold: true,
+					paymentHash: hash
+				});
+				bob.once('hold:accepted', () => {
+					if (resolution === 'settle') {
+						bob.settleHeldHtlc(hash, preimage);
+					} else {
+						bob.cancelHoldInvoice(hash);
+					}
+				});
+				const events = holdEvents(bob);
+
+				alice.sendPayment(invoice.bolt11);
+
+				expect(events.map((event) => event[0])).to.deep.equal([
+					'hold:accepted',
+					resolution === 'settle' ? 'hold:settled' : 'hold:cancelled'
+				]);
+				expect(bob.listHoldInvoices()[0].state).to.equal(
+					resolution === 'settle' ? 'SETTLED' : 'CANCELLED'
+				);
+			});
+		}
 	});
 });

@@ -915,6 +915,11 @@ export class LightningNode extends EventEmitter {
 			cltvExpiry: number;
 		}>
 	> = new Map();
+	private holdInvoiceEventQueue: Array<{
+		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled';
+		event: IHoldInvoiceStateEvent | IHoldCancelledEvent;
+	}> = [];
+	private emittingHoldInvoiceEvent = false;
 	private mppTimeoutMs: number;
 	private alias?: string;
 	private announcedAddresses: INodeAddress[] = [];
@@ -17360,6 +17365,25 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/** Finish notifying every listener before delivering a nested transition. */
+	private emitHoldInvoiceEvent(
+		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled',
+		event: IHoldInvoiceStateEvent | IHoldCancelledEvent
+	): void {
+		this.holdInvoiceEventQueue.push({ name, event });
+		if (this.emittingHoldInvoiceEvent) return;
+		this.emittingHoldInvoiceEvent = true;
+		try {
+			for (let i = 0; i < this.holdInvoiceEventQueue.length; i++) {
+				const next = this.holdInvoiceEventQueue[i];
+				this.emit(next.name, next.event);
+			}
+		} finally {
+			this.holdInvoiceEventQueue.length = 0;
+			this.emittingHoldInvoiceEvent = false;
+		}
+	}
+
 	/**
 	 * Park a validated incoming HTLC for a hold invoice. It awaits release via
 	 * settleHeldHtlc / cancelHeldHtlc (or the CLTV sweeper). Emits 'htlc:held',
@@ -17399,7 +17423,7 @@ export class LightningNode extends EventEmitter {
 					heldAmountMsat: parked.reduce((sum, h) => sum + h.amountMsat, 0n),
 					htlcCount: parked.length
 				};
-				this.emit('hold:accepted', event);
+				this.emitHoldInvoiceEvent('hold:accepted', event);
 			}
 		}
 		this.emitStructuredLog('htlc', 'held', {
@@ -17415,6 +17439,7 @@ export class LightningNode extends EventEmitter {
 	 * generated at createInvoice; an external preimage (validated against the
 	 * hash) is required for hold invoices created with an external payment hash.
 	 * Returns false when nothing is parked for the hash.
+	 * Throws if the preimage cannot be persisted, before revealing it.
 	 */
 	settleHeldHtlc(paymentHash: Buffer, preimage?: Buffer): boolean {
 		const hashHex = paymentHash.toString('hex');
@@ -17432,12 +17457,19 @@ export class LightningNode extends EventEmitter {
 
 		// Persist the preimage and deliver it to the chain monitors before
 		// fulfilling, so a force-close mid-settle can still claim on-chain.
+		if (
+			!this.commitMutations(
+				'savePreimage',
+				[{ type: 'payment_preimage', paymentHash: hashHex, preimage: pre }],
+				RecoveryCriticality.SafetyCritical
+			)
+		) {
+			throw new Error('settleHeldHtlc: failed to persist preimage');
+		}
+		// Persistence callbacks can resolve the hold on this same stack. Do
+		// not reveal the preimage or report settlement for a set they removed.
+		if (this.heldHtlcs.get(hashHex) !== held) return false;
 		this.preimages.set(hashHex, pre);
-		this.commitMutations(
-			'savePreimage',
-			[{ type: 'payment_preimage', paymentHash: hashHex, preimage: pre }],
-			RecoveryCriticality.SafetyCritical
-		);
 		this.channelManager.recordPreimage(paymentHash, pre);
 
 		for (const h of held) {
@@ -17473,7 +17505,7 @@ export class LightningNode extends EventEmitter {
 			heldAmountMsat: held.reduce((sum, h) => sum + h.amountMsat, 0n),
 			htlcCount: held.length
 		};
-		this.emit('hold:settled', event);
+		this.emitHoldInvoiceEvent('hold:settled', event);
 		return true;
 	}
 
@@ -17596,7 +17628,7 @@ export class LightningNode extends EventEmitter {
 			htlcsFailed,
 			heldAmountMsat
 		};
-		this.emit('hold:cancelled', event);
+		this.emitHoldInvoiceEvent('hold:cancelled', event);
 	}
 
 	/**

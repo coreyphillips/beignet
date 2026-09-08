@@ -1376,10 +1376,10 @@ export interface IHeldInvoiceSnapshot {
 
 /**
  * Payload of the 'hold:accepted' and 'hold:settled' node events (issue #746):
- * one row of listHoldInvoices() as it reads at the moment of the transition.
- * The amount and count describe the parked set the transition acted on, so a
- * consumer can compare heldAmountMsat against the invoice's declared amount
- * without a second call.
+ * uses the field names of listHoldInvoices(). The amount and count describe
+ * the parked set the transition acted on, even after settlement clears it.
+ * Acceptance can represent a partial MPP payment. Compare heldAmountMsat
+ * against the full expected amount before committing funds.
  */
 export interface IHoldInvoiceStateEvent {
 	paymentHash: Buffer;
