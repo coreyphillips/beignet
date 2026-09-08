@@ -1797,14 +1797,23 @@ async function bootDaemon(
 			);
 		},
 		'POST /invoice/create-hold': (body) => {
-			const { paymentHash, amountMsat, amountSats, description, expiry } =
-				body as {
-					paymentHash?: string;
-					amountMsat?: string | number;
-					amountSats?: number;
-					description?: string;
-					expiry?: number;
-				};
+			const {
+				paymentHash,
+				amountMsat,
+				amountSats,
+				description,
+				expiry,
+				minFinalCltvExpiry
+			} = body as {
+				paymentHash?: string;
+				amountMsat?: string | number;
+				amountSats?: number;
+				description?: string;
+				expiry?: number;
+				/** Final-CLTV delta the swap's Lightning leg needs to outlive
+				 *  its on-chain leg. */
+				minFinalCltvExpiry?: number;
+			};
 			if (!paymentHash)
 				return failure('INVALID_PARAMS', 'paymentHash required');
 			let amountMsatBig: bigint | undefined;
@@ -1821,7 +1830,8 @@ async function bootDaemon(
 					amountMsat: amountMsatBig,
 					amountSats,
 					description,
-					expiry
+					expiry,
+					minFinalCltvExpiry
 				})
 			);
 		},

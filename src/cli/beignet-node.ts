@@ -7893,6 +7893,14 @@ export class BeignetNode extends EventEmitter {
 		description?: string;
 		/** Invoice expiry in seconds. */
 		expiry?: number;
+		/**
+		 * Final-CLTV delta the payer must leave on the last hop. A hold invoice
+		 * is usually one leg of a swap, and the swap is only atomic while this
+		 * leg outlives the other one: on the node default, an on-chain refund
+		 * timing out later than the incoming HTLC lets the payer reclaim its
+		 * sats and still take the contract.
+		 */
+		minFinalCltvExpiry?: number;
 	}): InvoiceInfo {
 		if (!/^[0-9a-fA-F]{64}$/.test(opts.paymentHash)) {
 			throw new BeignetError(
@@ -7911,7 +7919,12 @@ export class BeignetNode extends EventEmitter {
 			description: opts.description || '',
 			expiry: opts.expiry,
 			hold: true,
-			paymentHash: Buffer.from(opts.paymentHash, 'hex')
+			paymentHash: Buffer.from(opts.paymentHash, 'hex'),
+			...(opts.minFinalCltvExpiry !== undefined
+				? {
+						minFinalCltvExpiry: requireFinalCltvExpiry(opts.minFinalCltvExpiry)
+				  }
+				: {})
 		});
 		const info: InvoiceInfo = {
 			bolt11: result.bolt11,
