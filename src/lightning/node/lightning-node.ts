@@ -17373,15 +17373,23 @@ export class LightningNode extends EventEmitter {
 		this.holdInvoiceEventQueue.push({ name, event });
 		if (this.emittingHoldInvoiceEvent) return;
 		this.emittingHoldInvoiceEvent = true;
+		let failure: { error: unknown } | undefined;
 		try {
 			for (let i = 0; i < this.holdInvoiceEventQueue.length; i++) {
 				const next = this.holdInvoiceEventQueue[i];
-				this.emit(next.name, next.event);
+				try {
+					this.emit(next.name, next.event);
+				} catch (error) {
+					// A listener may resolve a hold and then throw. Deliver the
+					// queued transition before propagating the first failure.
+					failure ??= { error };
+				}
 			}
 		} finally {
 			this.holdInvoiceEventQueue.length = 0;
 			this.emittingHoldInvoiceEvent = false;
 		}
+		if (failure) throw failure.error;
 	}
 
 	/**

@@ -861,5 +861,85 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				);
 			});
 		}
+
+		it('delivers cancellation when settlement from an accepted listener throws', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const alice = createNode(33);
+				const bob = createNode(34, storage);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildGraph(alice, bob, [channelId]);
+				const { hash, preimage } = makeExternalHash();
+				const invoice = bob.createInvoice({
+					amountMsat: 5_000_000n,
+					description: 'hold-accepted-settle-failure',
+					hold: true,
+					paymentHash: hash
+				});
+				const events = holdEvents(bob);
+				bob.once('hold:accepted', () => bob.settleHeldHtlc(hash, preimage));
+				bob.once('node:error', () => bob.cancelHoldInvoice(hash));
+				storage.savePreimage = () => {
+					throw new Error('disk full');
+				};
+
+				alice.sendPayment(invoice.bolt11);
+
+				expect(events.map(([name]) => name)).to.deep.equal([
+					'hold:accepted',
+					'hold:cancelled'
+				]);
+				expect(bob.listHoldInvoices()[0].state).to.equal('CANCELLED');
+			} finally {
+				storage.close();
+			}
+		});
+
+		for (const firstFailure of [
+			new Error('first listener failure'),
+			undefined
+		]) {
+			it(`drains nested transitions and rethrows the first ${
+				firstFailure === undefined ? 'undefined' : 'Error'
+			} listener failure`, function () {
+				const bob = createNode(35);
+				const first = bob.createInvoice({
+					amountMsat: 1_000n,
+					description: 'first-hold',
+					hold: true
+				});
+				const second = bob.createInvoice({
+					amountMsat: 1_000n,
+					description: 'second-hold',
+					hold: true
+				});
+				const events = holdEvents(bob);
+				bob.on('hold:cancelled', (event: IHoldCancelledEvent) => {
+					if (event.paymentHash.equals(first.paymentHash)) {
+						bob.cancelHoldInvoice(second.paymentHash);
+						throw firstFailure;
+					}
+					throw new Error('later listener failure');
+				});
+				let threw = false;
+				let thrown: unknown;
+
+				try {
+					bob.cancelHoldInvoice(first.paymentHash);
+				} catch (error) {
+					threw = true;
+					thrown = error;
+				}
+
+				expect(threw).to.be.true;
+				expect(thrown).to.equal(firstFailure);
+				expect(events.map(([, event]) => event.paymentHash)).to.deep.equal([
+					first.paymentHash,
+					second.paymentHash
+				]);
+			});
+		}
 	});
 });
