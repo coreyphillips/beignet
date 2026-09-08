@@ -10,7 +10,7 @@ import * as path from 'path';
 import { expect } from 'chai';
 import { getRelayedEvents } from '../../src/cli/daemon';
 import { WebhookManager } from '../../src/cli/webhooks';
-import { BeignetNode } from '../../src/cli/beignet-node';
+import { BeignetNode, holdInvoiceEvent } from '../../src/cli/beignet-node';
 import { EPaymentType } from '../../src/types/wallet';
 
 const NEW_EVENTS = [
@@ -21,6 +21,12 @@ const NEW_EVENTS = [
 	'channel:resolved'
 ];
 const HTLC_EVENTS = ['htlc:forwarded', 'htlc:fulfilled', 'htlc:failed'];
+/**
+ * Hold-invoice lifecycle (issue #746). One event per transition, and the
+ * ACCEPTED edge is what a swap provider commits its own money on, so these are
+ * never behind the htlcEvents gate that per-forward volume earned.
+ */
+const HOLD_EVENTS = ['hold:accepted', 'hold:settled', 'hold:cancelled'];
 /** Recovery events LightningNode emits and BeignetNode relays JSON-safe. */
 const RECOVERY_NODE_EVENTS = [
 	'recovery:durable',
@@ -88,6 +94,13 @@ describe('Event granularity (M4 batch 2b)', () => {
 		it('relays node:error, with and without htlc events', () => {
 			expect(getRelayedEvents()).to.include('node:error');
 			expect(getRelayedEvents(true)).to.include('node:error');
+		});
+
+		it('relays the hold-invoice events, with and without htlc events', () => {
+			for (const e of HOLD_EVENTS) {
+				expect(getRelayedEvents(), e).to.include(e);
+				expect(getRelayedEvents(true), e).to.include(e);
+			}
 		});
 
 		// Low volume by construction, and the operator surface (degraded-state
@@ -259,6 +272,34 @@ describe('Event granularity (M4 batch 2b)', () => {
 				);
 				expect(beignetNodeSrc, `emit for ${e}`).to.include(`this.emit('${e}'`);
 			}
+		});
+
+		it('LightningNode emits, and BeignetNode relays, the hold-invoice events', () => {
+			for (const e of HOLD_EVENTS) {
+				expect(lightningNodeSrc, e).to.include(`'${e}'`);
+				expect(beignetNodeSrc, `relay for ${e}`).to.match(
+					new RegExp(`this\\.node\\.on\\(\\s*'${e}'`)
+				);
+				expect(beignetNodeSrc, `emit for ${e}`).to.include(`this.emit('${e}'`);
+			}
+		});
+
+		// SSE JSON.stringifies the payload, and a consumer swaps this in for a
+		// GET /invoices/held row: same field names, same JSON-safe types.
+		it('relays a hold transition in the GET /invoices/held row shape', () => {
+			const wire = holdInvoiceEvent({
+				paymentHash: Buffer.alloc(32, 0xab),
+				state: 'ACCEPTED',
+				heldAmountMsat: 5_000_000n,
+				htlcCount: 2
+			});
+			expect(() => JSON.stringify(wire)).to.not.throw();
+			expect(wire).to.deep.equal({
+				paymentHash: 'ab'.repeat(32),
+				state: 'ACCEPTED',
+				heldAmountMsat: '5000000',
+				htlcCount: 2
+			});
 		});
 
 		it('BeignetNode originates the daemon-side recovery events', () => {

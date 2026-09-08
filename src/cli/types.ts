@@ -5,7 +5,10 @@
 
 import { TLogLevel } from '../logger';
 import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
-import type { SpliceRefusalCode } from '../lightning/node/types';
+import type {
+	HoldCancelReason,
+	SpliceRefusalCode
+} from '../lightning/node/types';
 
 export interface NodeInfo {
 	nodeId: string;
@@ -352,6 +355,19 @@ export interface HoldInvoiceInfo {
 	description?: string;
 	expiry: number;
 	createdAt: number;
+}
+
+/**
+ * A hold invoice's transition, relayed over SSE and webhooks (issue #746).
+ * The identifying fields of a `GET /invoices/held` row, as they read at the
+ * moment of the transition: `heldAmountMsat` and `htlcCount` describe the
+ * parked set the transition acted on.
+ */
+export interface HoldInvoiceEvent {
+	paymentHash: string;
+	state: HoldInvoiceInfo['state'];
+	heldAmountMsat: string;
+	htlcCount: number;
 }
 
 export interface DecodedInvoice {
@@ -1160,6 +1176,21 @@ export interface BeignetNodeEvents {
 		bolt11: string;
 		amountSats: number;
 	}) => void;
+	/**
+	 * Hold-invoice lifecycle (issue #746). `hold:accepted` is the OPEN ->
+	 * ACCEPTED edge a swap provider waits on: the counterparty's money is held
+	 * and the provider can commit its own. One event per transition (an MPP
+	 * part each carries the set's running total), so unlike the per-HTLC
+	 * events these are never gated behind htlcEvents.
+	 */
+	'hold:accepted': (data: HoldInvoiceEvent) => void;
+	'hold:settled': (data: HoldInvoiceEvent) => void;
+	'hold:cancelled': (
+		data: HoldInvoiceEvent & {
+			/** The CLTV sweeper (`expiry-scan`) or an explicit cancel (`api`). */
+			reason: HoldCancelReason;
+		}
+	) => void;
 	/**
 	 * On-chain lifecycle, one appearance and at most one confirmation per
 	 * transaction. `transaction:received` fires when an incoming transaction

@@ -440,6 +440,14 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'payment:sent',
 		'payment:failed',
 		'invoice:settled',
+		// Hold invoice lifecycle (issue #746). Always on: one event per
+		// transition, and the ACCEPTED edge is what a swap provider commits its
+		// own money on, so polling for it eats the swap's timelock budget. The
+		// htlcEvents gate below exists for routing volume (one event per
+		// forwarded HTLC), which is not this.
+		'hold:accepted',
+		'hold:settled',
+		'hold:cancelled',
 		// On-chain money movements, sourced from the wallet rather than the
 		// lightning node. Without these an on-chain receive is invisible until
 		// a client polls /transactions for the difference. Appearance events

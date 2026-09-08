@@ -244,6 +244,7 @@ import {
 	IHeldInvoiceSnapshot,
 	IHeldInvoicePart,
 	IHoldCancelledEvent,
+	IHoldInvoiceStateEvent,
 	HoldCancelReason,
 	HoldInvoiceState,
 	ISendPaymentOptions,
@@ -545,6 +546,8 @@ bitcoin.initEccLib(ecc);
  * - 'recovery:reestablish-held' (peerPubkey: string, channelIdHex: string, expiresAt: number): a peer's channel_reestablish for a channel this node has no record of was parked instead of failed, because the node may still be an incomplete restore target (issue #462)
  * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction): an on-chain claim was declined because it cannot pay its own fee
  * - 'htlc:held' ({ paymentHash: Buffer, amountMsat: bigint }): one part of a hold invoice was parked; read getHeldInvoiceSnapshot for the full committed set
+ * - 'hold:accepted' (event: IHoldInvoiceStateEvent): a part joined a hold invoice's parked set, carrying the set's running total; a re-park on reestablish is not a transition and does not fire
+ * - 'hold:settled' (event: IHoldInvoiceStateEvent): a hold invoice's preimage was revealed and every parked part fulfilled
  * - 'hold:cancelled' (event: IHoldCancelledEvent): a hold invoice was cancelled by the CLTV sweeper or by the API; every parked part was failed back
  * - 'payment:htlc-resolved' (event: IPaymentHtlcResolvedEvent): one offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain)
  * - 'payment:preimage' (event: IPaymentPreimageEvent): the preimage of an outgoing payment became known, from update_fulfill_htlc or from an on-chain claim, whatever the record's status was
@@ -17359,7 +17362,8 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Park a validated incoming HTLC for a hold invoice. It awaits release via
-	 * settleHeldHtlc / cancelHeldHtlc (or the CLTV sweeper). Emits 'htlc:held'.
+	 * settleHeldHtlc / cancelHeldHtlc (or the CLTV sweeper). Emits 'htlc:held',
+	 * and 'hold:accepted' when the part actually joined the set.
 	 */
 	private parkHeldHtlc(
 		channelId: Buffer,
@@ -17371,9 +17375,10 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const list = this.heldHtlcs.get(hashHex) ?? [];
 		// Dedup a duplicate park for the same channel+htlc (e.g. on reestablish).
-		if (
-			!list.some((h) => h.channelId.equals(channelId) && h.htlcId === htlcId)
-		) {
+		const joined = !list.some(
+			(h) => h.channelId.equals(channelId) && h.htlcId === htlcId
+		);
+		if (joined) {
 			list.push({ channelId, htlcId, amountMsat, cltvExpiry });
 			this.heldHtlcs.set(hashHex, list);
 			this.persistHeldHtlcs();
@@ -17383,6 +17388,18 @@ export class LightningNode extends EventEmitter {
 			amountMsat: amountMsat.toString()
 		});
 		this.emit('htlc:held', { paymentHash, amountMsat });
+		// Only a part that joined the set moved the invoice's state. A re-park
+		// on reestablish reports the same set twice, which a consumer treating
+		// the event as the OPEN -> ACCEPTED edge would read as a second payment.
+		if (joined) {
+			const event: IHoldInvoiceStateEvent = {
+				paymentHash,
+				state: 'ACCEPTED',
+				heldAmountMsat: list.reduce((sum, h) => sum + h.amountMsat, 0n),
+				htlcCount: list.length
+			};
+			this.emit('hold:accepted', event);
+		}
 	}
 
 	/**
@@ -17443,6 +17460,13 @@ export class LightningNode extends EventEmitter {
 			paymentHash: hashHex,
 			held: 'true'
 		});
+		const event: IHoldInvoiceStateEvent = {
+			paymentHash,
+			state: 'SETTLED',
+			heldAmountMsat: held.reduce((sum, h) => sum + h.amountMsat, 0n),
+			htlcCount: held.length
+		};
+		this.emit('hold:settled', event);
 		return true;
 	}
 
@@ -17500,7 +17524,12 @@ export class LightningNode extends EventEmitter {
 		this.heldHtlcs.delete(hashHex);
 		this.heldInvoiceHashes.delete(hashHex);
 		this.persistHeldHtlcs();
-		this.markHoldInvoiceCancelled(hashHex, cancelReason, held.length);
+		this.markHoldInvoiceCancelled(
+			hashHex,
+			cancelReason,
+			held.length,
+			held.reduce((sum, h) => sum + h.amountMsat, 0n)
+		);
 		this.emitStructuredLog('htlc', 'held_cancelled', {
 			paymentHash: hashHex,
 			reason: cancelReason
@@ -17516,7 +17545,8 @@ export class LightningNode extends EventEmitter {
 	private markHoldInvoiceCancelled(
 		hashHex: string,
 		reason: HoldCancelReason,
-		htlcsFailed: number
+		htlcsFailed: number,
+		heldAmountMsat: bigint
 	): void {
 		this.preimages.delete(hashHex);
 		this.paymentSecrets.delete(hashHex);
@@ -17556,7 +17586,8 @@ export class LightningNode extends EventEmitter {
 		const event: IHoldCancelledEvent = {
 			paymentHash: Buffer.from(hashHex, 'hex'),
 			reason,
-			htlcsFailed
+			htlcsFailed,
+			heldAmountMsat
 		};
 		this.emit('hold:cancelled', event);
 	}
@@ -17579,7 +17610,7 @@ export class LightningNode extends EventEmitter {
 		}
 		if (!this.heldInvoiceHashes.has(hashHex)) return null;
 		this.heldInvoiceHashes.delete(hashHex);
-		this.markHoldInvoiceCancelled(hashHex, 'api', 0);
+		this.markHoldInvoiceCancelled(hashHex, 'api', 0, 0n);
 		this.emitStructuredLog('htlc', 'held_cancelled', { paymentHash: hashHex });
 		return { htlcsFailed: 0 };
 	}

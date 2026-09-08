@@ -4,14 +4,20 @@
  * Covers the M4 user API surface semantics at the library level:
  * park on pay (payer stays PENDING), settle-with-preimage, cancel,
  * wrong-preimage rejection, MPP parts parking/settling together,
- * restart persistence of parked HTLCs, and the CLTV-safety auto-cancel
- * (a parked HTLC must never ride into its on-chain timeout).
+ * restart persistence of parked HTLCs, the CLTV-safety auto-cancel
+ * (a parked HTLC must never ride into its on-chain timeout), and the
+ * lifecycle events each transition fires.
  */
 
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
+import {
+	IHoldCancelledEvent,
+	IHoldInvoiceStateEvent,
+	INodeConfig,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	ChannelState,
@@ -511,6 +517,170 @@ describe('Hold Invoices (M4 batch 1)', function () {
 			expect(
 				bob.getChannelManager().getChannel(channelId)!.getState()
 			).to.equal(ChannelState.NORMAL);
+		});
+	});
+
+	// A swap provider commits its own money on the ACCEPTED edge, so it has to
+	// learn about it without polling the hold-invoice list (issue #746).
+	describe('lifecycle events', function () {
+		/** The three hold transitions in order, tagged by event name. */
+		function holdEvents(
+			node: LightningNode
+		): Array<[string, IHoldInvoiceStateEvent | IHoldCancelledEvent]> {
+			const out: Array<[string, IHoldInvoiceStateEvent | IHoldCancelledEvent]> =
+				[];
+			for (const name of ['hold:accepted', 'hold:settled', 'hold:cancelled']) {
+				node.on(name, (e: IHoldInvoiceStateEvent | IHoldCancelledEvent) =>
+					out.push([name, e])
+				);
+			}
+			return out;
+		}
+
+		it('emits hold:accepted on the park and hold:settled on the release', function () {
+			const alice = createNode(17);
+			const bob = createNode(18);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildGraph(alice, bob, [channelId]);
+			const events = holdEvents(bob);
+
+			const { preimage, hash } = makeExternalHash();
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-events',
+				hold: true,
+				paymentHash: hash
+			});
+			// Creating the invoice is not a transition: it is still OPEN.
+			expect(events).to.have.length(0);
+
+			alice.sendPayment(invoice.bolt11);
+			expect(events).to.have.length(1);
+			expect(events[0][0]).to.equal('hold:accepted');
+			expect(events[0][1]).to.deep.equal({
+				paymentHash: hash,
+				state: 'ACCEPTED',
+				heldAmountMsat: 5_000_000n,
+				htlcCount: 1
+			});
+
+			expect(bob.settleHeldHtlc(hash, preimage)).to.be.true;
+			expect(events).to.have.length(2);
+			expect(events[1][0]).to.equal('hold:settled');
+			expect(events[1][1]).to.deep.equal({
+				paymentHash: hash,
+				state: 'SETTLED',
+				heldAmountMsat: 5_000_000n,
+				htlcCount: 1
+			});
+		});
+
+		it('carries the parked total on hold:cancelled, and zero when nothing was parked', function () {
+			const alice = createNode(19);
+			const bob = createNode(20);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildGraph(alice, bob, [channelId]);
+			const events = holdEvents(bob);
+
+			const paid = makeExternalHash();
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-cancel-events',
+				hold: true,
+				paymentHash: paid.hash
+			});
+			alice.sendPayment(invoice.bolt11);
+			bob.cancelHoldInvoice(paid.hash);
+			expect(events.map((e) => e[0])).to.deep.equal([
+				'hold:accepted',
+				'hold:cancelled'
+			]);
+			expect(events[1][1]).to.deep.equal({
+				paymentHash: paid.hash,
+				reason: 'api',
+				htlcsFailed: 1,
+				heldAmountMsat: 5_000_000n
+			});
+
+			const unpaid = makeExternalHash();
+			bob.createInvoice({
+				amountMsat: 1_000n,
+				description: 'hold-cancel-unpaid',
+				hold: true,
+				paymentHash: unpaid.hash
+			});
+			bob.cancelHoldInvoice(unpaid.hash);
+			expect(events).to.have.length(3);
+			expect(events[2][1]).to.deep.equal({
+				paymentHash: unpaid.hash,
+				reason: 'api',
+				htlcsFailed: 0,
+				heldAmountMsat: 0n
+			});
+		});
+
+		it('fires once per MPP part, each with the parked set running total', function () {
+			// Two explicit parts over two channels, as in the MPP suite above.
+			const alice = createNode(21);
+			const bob = createNode(22);
+			connectNodes(alice, bob);
+			const ch1 = openReadyChannel(alice, bob, 100_000n);
+			const ch2 = openReadyChannel(alice, bob, 100_000n);
+			buildGraph(alice, bob, [ch1, ch2], 100_000_000n);
+			const events = holdEvents(bob);
+
+			const { hash } = makeExternalHash();
+			const totalMsat = 90_000_000n;
+			const invoice = bob.createInvoice({
+				amountMsat: totalMsat,
+				description: 'hold-mpp-events',
+				hold: true,
+				paymentHash: hash
+			});
+			const bobPubkey = Buffer.from(bob.getNodeId(), 'hex');
+			[ch1, ch2].forEach((_channelId, i) => {
+				alice.sendPaymentToRoute(
+					{
+						hops: [
+							{
+								pubkey: bobPubkey,
+								shortChannelId: encodeShortChannelId({
+									block: 500,
+									txIndex: i + 1,
+									outputIndex: 0
+								}),
+								amountToForwardMsat: totalMsat / 2n,
+								outgoingCltvValue: 40
+							}
+						]
+					},
+					hash,
+					40,
+					invoice.paymentSecret,
+					totalMsat
+				);
+			});
+
+			expect(events.map((e) => e[0])).to.deep.equal([
+				'hold:accepted',
+				'hold:accepted'
+			]);
+			expect(events[0][1]).to.deep.equal({
+				paymentHash: hash,
+				state: 'ACCEPTED',
+				heldAmountMsat: totalMsat / 2n,
+				htlcCount: 1
+			});
+			// The second part carries the whole invoice: a consumer holding the
+			// declared amount can tell the set is complete from the event alone.
+			expect(events[1][1]).to.deep.equal({
+				paymentHash: hash,
+				state: 'ACCEPTED',
+				heldAmountMsat: totalMsat,
+				htlcCount: 2
+			});
 		});
 	});
 });

@@ -194,6 +194,10 @@ Parked HTLCs are restart-safe (they re-park from storage) and are
 forgotten hold can never force an on-chain timeout. Typical uses: escrow-style
 flows, just-in-time inventory checks, atomic swaps.
 
+Every transition fires an event (`hold:accepted`, `hold:settled`,
+`hold:cancelled`), relayed over SSE and webhooks, so a swap provider waits on
+the ACCEPTED edge rather than polling `listHoldInvoices()` for it.
+
 #### Payments
 
 | Method | Returns | Description |
@@ -659,6 +663,7 @@ node.on('payment:received', (info: PaymentInfo) => { ... });
 node.on('payment:sent', (info: PaymentInfo) => { ... });
 node.on('payment:failed', (info: PaymentInfo) => { ... });
 node.on('invoice:settled', ({ paymentHash, bolt11, amountSats }) => { ... }); // an invoice WE issued was paid (keysend fires only payment:received)
+node.on('hold:accepted', ({ paymentHash, state, heldAmountMsat, htlcCount }) => { ... }); // a hold invoice's HTLC(s) are parked: the edge a swap provider commits on; also hold:settled and hold:cancelled (+ reason)
 node.on('channel:opening', ({ channelId, fundingTxid }) => { ... }); // funding negotiated + broadcast/watched
 node.on('channel:ready', ({ channelId }) => { ... });
 node.on('channel:pending-close', ({ channelId, initiator }) => { ... }); // coop close initiated ('local' | 'remote')
@@ -1014,6 +1019,9 @@ interface BeignetNodeEvents {
   'payment:sent': (info: PaymentInfo) => void;
   'payment:failed': (info: PaymentInfo) => void;
   'invoice:settled': (data: { paymentHash: string; bolt11: string; amountSats: number }) => void;
+  'hold:accepted': (data: HoldInvoiceEvent) => void;
+  'hold:settled': (data: HoldInvoiceEvent) => void;
+  'hold:cancelled': (data: HoldInvoiceEvent & { reason: 'api' | 'expiry-scan' }) => void;
   'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
   'channel:ready': (data: { channelId: string }) => void;
   'channel:pending-close': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
@@ -2030,10 +2038,11 @@ event: channel:ready
 data: {"channelId":"cd34..."}
 ```
 
-Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`, and the Recovery Protocol events `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`, `recovery:reestablish-held`, `recovery:capsule-retrieved`, `recovery:guardian_unreachable`, `recovery:restore-progress`, `recovery:restored` (always on; low volume, and operator dashboards ride them). JIT receive progress on the LSP side (`jit:intent`, `jit:intent-superseded`, `jit:intercepted`, `jit:funding`, `jit:forwarded`, `jit:failed`; satoshi and millisatoshi figures as decimal strings) and direct-funding receiver progress (`direct-funding:offer:accepted` with `paired`, `direct-funding:offer:declined`, `direct-funding:offer:failed`, `direct-funding:offer:completed`) are relayed too (issue #669), so a dashboard follows a funding it fronts or receives without polling.
+Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, the hold-invoice lifecycle (`hold:accepted`, `hold:settled`, `hold:cancelled`), `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`, and the Recovery Protocol events `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`, `recovery:reestablish-held`, `recovery:capsule-retrieved`, `recovery:guardian_unreachable`, `recovery:restore-progress`, `recovery:restored` (always on; low volume, and operator dashboards ride them). JIT receive progress on the LSP side (`jit:intent`, `jit:intent-superseded`, `jit:intercepted`, `jit:funding`, `jit:forwarded`, `jit:failed`; satoshi and millisatoshi figures as decimal strings) and direct-funding receiver progress (`direct-funding:offer:accepted` with `paired`, `direct-funding:offer:declined`, `direct-funding:offer:failed`, `direct-funding:offer:completed`) are relayed too (issue #669), so a dashboard follows a funding it fronts or receives without polling.
 
 - `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
 - `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).
+- The `hold:*` events carry a `GET /invoices/held` row as it reads at the transition: `{paymentHash, state, heldAmountMsat, htlcCount}`, plus `reason` (`api` or `expiry-scan`) on `hold:cancelled`. `hold:accepted` fires once per MPP part, each carrying the parked set's running total, so a consumer holding the invoice's amount knows when the whole of it is held.
 
 Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed only when the daemon is started with `--htlc-events` (config `htlcEvents: true`, env `BEIGNET_HTLC_EVENTS=true`); routing nodes generate one event per HTLC, so they are off by default.
 

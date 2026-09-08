@@ -1374,11 +1374,27 @@ export interface IHeldInvoiceSnapshot {
 	cancelHeight: number | null;
 }
 
+/**
+ * Payload of the 'hold:accepted' and 'hold:settled' node events (issue #746):
+ * one row of listHoldInvoices() as it reads at the moment of the transition.
+ * The amount and count describe the parked set the transition acted on, so a
+ * consumer can compare heldAmountMsat against the invoice's declared amount
+ * without a second call.
+ */
+export interface IHoldInvoiceStateEvent {
+	paymentHash: Buffer;
+	state: HoldInvoiceState;
+	heldAmountMsat: bigint;
+	htlcCount: number;
+}
+
 /** Payload of the 'hold:cancelled' node event. */
 export interface IHoldCancelledEvent {
 	paymentHash: Buffer;
 	reason: HoldCancelReason;
 	htlcsFailed: number;
+	/** Msat of the parts failed back; 0 when nothing was parked yet. */
+	heldAmountMsat: bigint;
 }
 
 // ─── Typed Payment Errors ───

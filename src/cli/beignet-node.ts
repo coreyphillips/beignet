@@ -151,7 +151,9 @@ import {
 	InvalidRequestError,
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode,
-	SpliceRefusalCode
+	SpliceRefusalCode,
+	IHoldCancelledEvent,
+	IHoldInvoiceStateEvent
 } from '../lightning/node/types';
 import {
 	BITCOIN_CHAIN_HASH,
@@ -215,6 +217,7 @@ import {
 	PaymentValidationStatus,
 	ChannelPolicyInfo,
 	HoldInvoiceInfo,
+	HoldInvoiceEvent,
 	GraphInfo,
 	GraphChannelInfo,
 	GraphChannelPolicy,
@@ -1314,6 +1317,16 @@ export function jsonSafeEvent(value: unknown): unknown {
 		return out;
 	}
 	return value;
+}
+
+/** A hold-invoice transition in the wire shape of a GET /invoices/held row. */
+export function holdInvoiceEvent(e: IHoldInvoiceStateEvent): HoldInvoiceEvent {
+	return {
+		paymentHash: e.paymentHash.toString('hex'),
+		state: e.state,
+		heldAmountMsat: e.heldAmountMsat.toString(),
+		htlcCount: e.htlcCount
+	};
 }
 
 /**
@@ -2597,6 +2610,33 @@ export class BeignetNode extends EventEmitter {
 				this.emit('invoice:settled', info);
 			}
 		);
+
+		// Hold invoice lifecycle (issue #746). The ACCEPTED edge is where a swap
+		// provider commits its own money, and polling GET /invoices/held for it
+		// spends the timelock budget the swap is built on.
+		this.node.on('hold:accepted', (e: IHoldInvoiceStateEvent) => {
+			const info = holdInvoiceEvent(e);
+			this.log('info', 'Hold invoice accepted', {
+				paymentHash: info.paymentHash,
+				heldAmountMsat: info.heldAmountMsat,
+				htlcCount: info.htlcCount
+			});
+			this.emit('hold:accepted', info);
+		});
+		this.node.on('hold:settled', (e: IHoldInvoiceStateEvent) => {
+			this.emit('hold:settled', holdInvoiceEvent(e));
+		});
+		this.node.on('hold:cancelled', (e: IHoldCancelledEvent) => {
+			this.emit('hold:cancelled', {
+				...holdInvoiceEvent({
+					paymentHash: e.paymentHash,
+					state: 'CANCELLED',
+					heldAmountMsat: e.heldAmountMsat,
+					htlcCount: e.htlcsFailed
+				}),
+				reason: e.reason
+			});
+		});
 
 		// HTLC-level events (high volume; the daemon only exposes these over
 		// SSE/webhooks when htlcEvents is enabled). Forwards ALSO get a daemon

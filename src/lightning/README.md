@@ -1096,7 +1096,9 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `htlc:fulfilled` | `({ channelId, htlcId })` | Forwarded HTLC fulfilled |
 | `htlc:failed` | `({ channelId, htlcId })` | Forwarded HTLC failed |
 | `htlc:held` | `({ paymentHash, amountMsat })` | HTLC parked by a hold invoice (one part; read `getHeldInvoiceSnapshot` for the committed set) |
-| `hold:cancelled` | `({ paymentHash, reason, htlcsFailed })` | A hold invoice was cancelled by the CLTV sweeper (`expiry-scan`) or the API |
+| `hold:accepted` | `({ paymentHash, state, heldAmountMsat, htlcCount })` | A part joined a hold invoice's parked set, with the set's running total (a re-park on reestablish does not fire) |
+| `hold:settled` | `({ paymentHash, state, heldAmountMsat, htlcCount })` | A hold invoice's preimage was revealed and every parked part fulfilled |
+| `hold:cancelled` | `({ paymentHash, reason, htlcsFailed, heldAmountMsat })` | A hold invoice was cancelled by the CLTV sweeper (`expiry-scan`) or the API |
 | `payment:htlc-resolved` | `({ paymentHash, channelId, htlcId, state })` | One offered HTLC of an outgoing payment reached a terminal state |
 | `payment:preimage` | `({ paymentHash, preimage, source })` | An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim |
 | `swap:*` | `({ swapId, paymentHash, state, ... })` | Reverse swap provider progress: created, held, funding, funded, claimed, settled, refund-broadcast, refunded, hold-cancelled, exposed, failed |
