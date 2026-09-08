@@ -1596,6 +1596,10 @@ beignet invoice list
 beignet invoice create-hold <sha256(preimage)> 1000 "escrow" --expiry 3600
 # {"ok":true,"result":{"bolt11":"lnbcrt10n1...","paymentHash":"ab12...","amountSats":1000}}
 
+# Swap leg: --min-final-cltv must exceed the on-chain refund timeout, or the
+# payer gets its sats back over Lightning and still claims the contract
+beignet invoice create-hold <sha256(preimage)> 1000 "swap" --min-final-cltv 200
+
 beignet invoice held
 # {"ok":true,"result":[{"paymentHash":"ab12...","state":"ACCEPTED","heldAmountMsat":"1000000","htlcCount":1,...}]}
 
@@ -1941,7 +1945,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/direct-funding/config` | -- | Read the effective policy; `lspPubkey` is null when no liquidity peer is set, in which case no offer is served |
 | POST | `/direct-funding/request` | `{ host?, port?, amountSats? }` | Mint a payment request: returns `{ paymentHash, expiresAt, request }`, where `request` is the base64url envelope a payer pays (BIP 21 parameter `bgnq`). `host`/`port` are the address a payer can reach this node on and are used exactly as given |
 | POST | `/direct-funding/send` | `{ request, amountSats?, maxTotalFeeSat? }` | Pay a request from one of our coins. **Rejects only before our witness leaves the device**; after that it resolves with what is known plus a `caveat`, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Idempotent on the request id, sets no deadline of its own, and accepts `feeHeadroomSats` as an alias for `maxTotalFeeSat`. The money leaves for a stranger's channel, so amount + fee ceiling counts against the combined daily spend limit, and a draining node refuses it (both before the exchange opens, and neither for a request that already has an attempt: a duplicate call spends nothing new, and refusing one would be read as "nothing happened") |
-| POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel) |
+| POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry?, minFinalCltvExpiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel). `minFinalCltvExpiry` is 1..2016 blocks; set it on a swap leg so the held HTLC outlives the on-chain one |
 | POST | `/invoice/settle-hold` | `{ preimage }` | Settle a parked hold invoice (fulfills all MPP parts) |
 | POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |
 | GET | `/invoices/held` | -- | List hold invoices with state + parked totals |

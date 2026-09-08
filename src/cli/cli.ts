@@ -1227,13 +1227,14 @@ async function handleInvoice(): Promise<void> {
 					error: {
 						code: 'INVALID_PARAMS',
 						message:
-							'Usage: beignet invoice create-hold <paymentHash> [amountSats] [description] [--expiry secs]'
+							'Usage: beignet invoice create-hold <paymentHash> [amountSats] [description] [--expiry secs] [--min-final-cltv blocks]'
 					}
 				});
 				process.exitCode = 1;
 				return;
 			}
 			const expiryFlag = parseFlag('--expiry');
+			const minFinalCltv = parseFlag('--min-final-cltv');
 			return outputResult(
 				await httpRequest('POST', '/invoice/create-hold', {
 					paymentHash,
@@ -1241,7 +1242,10 @@ async function handleInvoice(): Promise<void> {
 						? parseInt(filteredArgs[3], 10)
 						: undefined,
 					description: filteredArgs[4] || '',
-					expiry: expiryFlag ? parseInt(expiryFlag, 10) : undefined
+					expiry: expiryFlag ? parseInt(expiryFlag, 10) : undefined,
+					minFinalCltvExpiry: minFinalCltv
+						? parseInt(minFinalCltv, 10)
+						: undefined
 				})
 			);
 		}
@@ -2916,7 +2920,10 @@ Reverse swaps (a peer pays us over Lightning, we fund an on-chain contract):
   invoice create-hold <hash> [sats] [description] [--expiry secs]
                                          Create hold invoice for a payment hash
                                          you supply (keep the preimage; HTLCs
-                                         park until settle-hold/cancel-hold)
+                                         park until settle-hold/cancel-hold).
+                                         --min-final-cltv <blocks> sets the
+                                         final CLTV a swap leg needs to outlive
+                                         its on-chain leg
   invoice settle-hold <preimage>         Settle a parked hold invoice
   invoice cancel-hold <hash>             Cancel a hold invoice (fails HTLCs back)
   invoice held                           List hold invoices + their state

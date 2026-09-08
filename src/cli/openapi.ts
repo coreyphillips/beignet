@@ -425,14 +425,15 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoice/create-hold': {
 				post: {
 					summary:
-						'Create a hold invoice for a caller-supplied payment hash (preimage stays with the caller; the incoming HTLC parks until settle/cancel)',
+						'Create a hold invoice for a caller-supplied payment hash (preimage stays with the caller; the incoming HTLC parks until settle/cancel). minFinalCltvExpiry sets the final-CLTV delta in the BOLT 11 c tag, between 1 and 2016 blocks; a swap provider must set it so the held HTLC outlives the on-chain leg it is paired with, since on the node default a later on-chain refund lets the payer take both legs',
 					tags: ['Invoices'],
 					requestBody: bodyContent({
 						paymentHash: 'string',
 						amountMsat: 'string?',
 						amountSats: 'number?',
 						description: 'string?',
-						expiry: 'number?'
+						expiry: 'number?',
+						minFinalCltvExpiry: 'number?'
 					}),
 					responses: {
 						'200': {
