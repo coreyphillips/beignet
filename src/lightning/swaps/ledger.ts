@@ -172,6 +172,8 @@ export interface ISwapRecord extends ILedgerRecord {
 	 */
 	paymentDispatchedAt?: number;
 	paymentDispatchedHeight?: number;
+	/** Dispatch calls made for this row, counting the one before a crash. */
+	paymentDispatchAttempts?: number;
 	/** The absolute expiry ceiling every HTLC of the payment was bound by. */
 	paymentMaxCltvExpiryHeight?: number;
 	paymentMaxFeeMsat?: string;

@@ -497,23 +497,35 @@ node can run for others, each an explicit opt-in switched on with an exact
 The SSE stream carries `ffor:state`, `ffor:settled`, `ffor:delegated-failed`,
 `ffor:enforce` and the witness and issuer events.
 
-### Reverse swaps (Lightning to on-chain)
+### Swaps (Lightning to on-chain, and on-chain to Lightning)
 
-A beignet node can serve reverse swaps to any Lightning peer (issue #737): the
-peer pays a hold invoice, this node funds a P2WSH contract the peer claims on
-chain with its preimage, and the claim settles the hold. The role is an
-explicit opt-in switched on with an exact `true`, because it locks this node's
-own coins in contracts for peers:
+A beignet node can serve swaps to any Lightning peer in both directions.
+Reverse (issue #737): the peer pays a hold invoice, this node funds a P2WSH
+contract the peer claims on chain with its preimage, and the claim settles
+the hold. Submarine (issue #743): the peer locks coins in a P2WSH contract,
+this node pays the peer's own invoice under an absolute HTLC expiry ceiling,
+and the preimage that payment reveals claims the coins. Each direction is an
+explicit opt-in switched on with an exact `true`, because it puts this node's
+own funds at risk for peers:
 
 | Env | Role |
 |---|---|
 | `BEIGNET_SWAPS` | Serve reverse swaps. `BEIGNET_SWAP_FLAT_FEE_SAT` and `BEIGNET_SWAP_FEE_PPM` price them; `BEIGNET_SWAP_MIN_SAT`, `BEIGNET_SWAP_MAX_SAT`, `BEIGNET_SWAP_MAX_EXPOSURE_SAT` and `BEIGNET_SWAP_MAX_CONCURRENT` cap what is at risk; `BEIGNET_SWAP_REFUND_DELTA_BLOCKS`, `BEIGNET_SWAP_FUNDING_CONFS` and `BEIGNET_SWAP_RESOLUTION_CONFS` set the timing. `GET /swaps/status`, `GET /swaps`, `POST /swaps/cancel`. |
+| `BEIGNET_SWAP_SUBMARINE` | With `BEIGNET_SWAPS`, also serve submarine swaps (on-chain to Lightning): a peer locks coins in a contract, this node pays the peer's invoice under an absolute HTLC expiry ceiling and claims the coins with the preimage. `BEIGNET_SWAP_CLAIM_SAFETY_BLOCKS`, `BEIGNET_SWAP_PAYMENT_MAX_FEE_PPM`, `BEIGNET_SWAP_CLAIM_BUMP_INTERVAL_BLOCKS` and `BEIGNET_SWAP_SUBMARINE_REFUND_DELTA_BLOCKS` set the direction's margins; the fee and exposure caps above apply to both. |
 
-The provider funds only against the complete committed MPP set of the hold
-invoice, settles the hold the moment a claim reveals the preimage (mempool
-included), and cancels the hold only after its own refund has confirmed to
-policy depth; never because the refund height passed. The SSE stream carries
-`swap:created` through `swap:settled`, `swap:refunded` and `swap:exposed`.
+The reverse provider funds only against the complete committed MPP set of
+the hold invoice, settles the hold the moment a claim reveals the preimage
+(mempool included), and cancels the hold only after its own refund has
+confirmed to policy depth; never because the refund height passed. The
+submarine provider pays only once the peer's funding has confirmed to policy
+depth and been re-verified unspent immediately before the dispatch, binds
+every HTLC of the payment to `refundHeight` minus its claim margins, judges
+the payment by the node's own HTLC view (never by a wall clock or a failed
+record while an HTLC is out), and persists its claim before broadcasting it.
+The SSE stream carries `swap:created` through `swap:settled`, `swap:refunded`
+and `swap:exposed` for the reverse direction and `swap:funding-seen`,
+`swap:paying`, `swap:preimage`, `swap:claim-broadcast`,
+`swap:claim-confirmed` and `swap:payment-failed` for the submarine one.
 
 ## Protocol layer (advanced)
 
@@ -616,7 +628,7 @@ LightningNode              High-level API (EventEmitter)
 | `recovery/` | Safety transition layer: atomic persistence, the durable outbound-message outbox, the opt-in hash-chained recovery journal, and the peer_storage Recovery Capsule |
 | `liquidity/` | JIT channel receive (LSP role): intercept SCIDs, held HTLCs, zero-conf open or splice, then forward; the opening fee is skimmed off the delivery for wallets that accept it, or charged to the sender through the invoice hint (hop mode) for wallets that cannot settle a short HTLC |
 | `direct-funding/` | Third-party direct funding: the signed payment request envelope, sealed frames, protocol messages, outstanding-request store, the transport registry with its direct-peer, onion and blind-relay lanes, the receiver engine that turns a payer's offered UTXO into channel funding, and the payer engine that verifies and signs it |
-| `swaps/` | Swaps: the P2WSH HTLC contract, claim/refund transactions, preimage extraction, admission policies, the durable swap ledger, the chain resolver, the wire protocol, and the reverse swap provider engine (Lightning to on-chain) |
+| `swaps/` | Swaps: the P2WSH HTLC contract, claim/refund transactions, preimage extraction, admission policies, the durable swap ledger, the chain resolver, the wire protocol, and the swap provider engines (reverse: Lightning to on-chain; submarine: on-chain to Lightning) |
 | `l402/` | L402 (Lightning HTTP 402) client: challenge parsing, macaroon reading, paid credentials |
 | `node/` | LightningNode orchestrator, the main protocol-layer entry point |
 | `wallet/` | WalletFundingProvider, adapts the on-chain Wallet for auto-funded opens |

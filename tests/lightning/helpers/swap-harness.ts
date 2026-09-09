@@ -12,19 +12,29 @@ import { encode as encodeInvoice } from '../../../src/lightning/invoice/encode';
 import { Network } from '../../../src/lightning/invoice/types';
 import { computeScriptHash } from '../../../src/lightning/chain/chain-watcher';
 import { MemoryLedgerStore } from '../../../src/lightning/storage/durable-ledger';
+import { decode as decodeInvoice } from '../../../src/lightning/invoice/decode';
 import {
 	IHeldInvoicePart,
-	IHeldInvoiceSnapshot
+	IHeldInvoiceSnapshot,
+	IOutgoingPaymentResolution,
+	IPaymentInfo,
+	PaymentDirection,
+	PaymentStatus
 } from '../../../src/lightning/node/types';
 import {
 	IReverseSwapProviderConfig,
 	IReverseSwapProviderDeps,
+	ISubmarineSwapProviderConfig,
+	ISubmarineSwapProviderDeps,
 	ISwapChainSource,
 	ISwapRecord,
 	ReverseSwapProvider,
+	SUBMARINE_SWAP_EVENTS,
+	SubmarineSwapProvider,
 	SwapChainResolver,
 	SwapLedger,
 	buildSwapClaimTx,
+	buildSwapRefundTx,
 	deriveSwapKey
 } from '../../../src/lightning/swaps';
 import { FakeDfNetwork, FakeDfPeer } from './df-transport';
@@ -520,4 +530,517 @@ export function claimTxFor(
 		privateKey: swap.claimKey,
 		preimage: swap.preimage
 	});
+}
+
+// ─────────────── Submarine direction (issue #743) ───────────────
+
+/**
+ * The node's outgoing payment surface as the submarine engine sees it: a
+ * scripted `payInvoice` (what the call does), the honest HTLC view the
+ * engine reads afterwards, and the payment events. Records the ledger state
+ * at the moment of each call so a test can prove persist-before-pay.
+ */
+export class FakeOutgoing {
+	readonly calls: Array<{
+		bolt11: string;
+		paymentHashHex: string;
+		maxCltvExpiryHeight: number;
+		maxFeeMsat: bigint;
+		ledgerStateAtCall: string | undefined;
+	}> = [];
+	readonly listeners = new Set<(paymentHash: Buffer) => void>();
+	private readonly views = new Map<string, IOutgoingPaymentResolution>();
+	/**
+	 * What the next payInvoice does:
+	 *  - 'pending': one HTLC offered, record PENDING (the ordinary case)
+	 *  - 'complete': the loopback case, fulfilled synchronously
+	 *  - 'throw-no-record': throws before any record (NO_ROUTE, CLTV_EXCEEDS_MAX)
+	 *  - 'throw-with-htlc': throws after one HTLC left (a later MPP part refused)
+	 *  - 'failed-live-htlc': record FAILED, one HTLC still offered
+	 *  - 'failed': record FAILED, no HTLC
+	 */
+	script:
+		| 'pending'
+		| 'complete'
+		| 'throw-no-record'
+		| 'throw-with-htlc'
+		| 'failed-live-htlc'
+		| 'failed' = 'pending';
+	/** The preimage a 'complete' script reveals; set per hash by the test. */
+	readonly preimages = new Map<string, Buffer>();
+
+	constructor(
+		private readonly ledgerStateOf: (
+			paymentHashHex: string
+		) => string | undefined
+	) {}
+
+	private view(
+		hashHex: string,
+		patch: Partial<IOutgoingPaymentResolution>
+	): void {
+		const base: IOutgoingPaymentResolution = this.views.get(hashHex) ?? {
+			paymentHash: Buffer.from(hashHex, 'hex'),
+			status: null,
+			htlcs: [],
+			resolved: true,
+			latestOutstandingExpiry: null
+		};
+		this.views.set(hashHex, { ...base, ...patch });
+	}
+
+	private htlc(
+		state: 'offered' | 'fulfilled' | 'failed',
+		cltvExpiry: number
+	): IOutgoingPaymentResolution['htlcs'][number] {
+		return {
+			channelId: Buffer.alloc(32, 1),
+			htlcId: 0n,
+			amountMsat: 1_000n,
+			cltvExpiry,
+			state,
+			terminal: state !== 'offered'
+		};
+	}
+
+	payInvoice(
+		bolt11: string,
+		options: { maxCltvExpiryHeight: number; maxFeeMsat: bigint }
+	): IPaymentInfo {
+		const invoice = decodeInvoice(bolt11);
+		const hashHex = invoice.paymentHash.toString('hex');
+		this.calls.push({
+			bolt11,
+			paymentHashHex: hashHex,
+			maxCltvExpiryHeight: options.maxCltvExpiryHeight,
+			maxFeeMsat: options.maxFeeMsat,
+			ledgerStateAtCall: this.ledgerStateOf(hashHex)
+		});
+		const expiry = options.maxCltvExpiryHeight - 10;
+		const info = (status: PaymentStatus): IPaymentInfo => ({
+			paymentHash: invoice.paymentHash,
+			amountMsat: invoice.amountMsat ?? 0n,
+			status,
+			direction: PaymentDirection.OUTGOING,
+			createdAt: Date.now()
+		});
+		switch (this.script) {
+			case 'throw-no-record':
+				throw new Error('NO_ROUTE: no route found');
+			case 'throw-with-htlc':
+				this.view(hashHex, {
+					status: PaymentStatus.PENDING,
+					htlcs: [this.htlc('offered', expiry)],
+					resolved: false,
+					latestOutstandingExpiry: expiry
+				});
+				throw new Error('a later part was refused');
+			case 'complete': {
+				const preimage = this.preimages.get(hashHex);
+				if (!preimage) throw new Error('test: no preimage for complete');
+				this.view(hashHex, {
+					status: PaymentStatus.COMPLETED,
+					htlcs: [this.htlc('fulfilled', expiry)],
+					resolved: true,
+					latestOutstandingExpiry: null,
+					preimage
+				});
+				return { ...info(PaymentStatus.COMPLETED), preimage };
+			}
+			case 'failed-live-htlc':
+				this.view(hashHex, {
+					status: PaymentStatus.FAILED,
+					htlcs: [this.htlc('offered', expiry)],
+					resolved: false,
+					latestOutstandingExpiry: expiry
+				});
+				return info(PaymentStatus.FAILED);
+			case 'failed':
+				this.view(hashHex, {
+					status: PaymentStatus.FAILED,
+					htlcs: [],
+					resolved: true,
+					latestOutstandingExpiry: null
+				});
+				return info(PaymentStatus.FAILED);
+			default:
+				this.view(hashHex, {
+					status: PaymentStatus.PENDING,
+					htlcs: [this.htlc('offered', expiry)],
+					resolved: false,
+					latestOutstandingExpiry: expiry
+				});
+				return info(PaymentStatus.PENDING);
+		}
+	}
+
+	outgoingHtlcs(paymentHash: Buffer): IOutgoingPaymentResolution {
+		const hashHex = paymentHash.toString('hex');
+		return (
+			this.views.get(hashHex) ?? {
+				paymentHash,
+				status: null,
+				htlcs: [],
+				resolved: true,
+				latestOutstandingExpiry: null
+			}
+		);
+	}
+
+	/** The peer fulfilled: every HTLC terminal, preimage known. */
+	fulfil(paymentHash: Buffer, preimage: Buffer, notify = true): void {
+		const hashHex = paymentHash.toString('hex');
+		const current = this.outgoingHtlcs(paymentHash);
+		this.view(hashHex, {
+			status: PaymentStatus.COMPLETED,
+			htlcs: current.htlcs.map((h) => ({
+				...h,
+				state: 'fulfilled',
+				terminal: true
+			})),
+			resolved: true,
+			latestOutstandingExpiry: null,
+			preimage
+		});
+		if (notify) this.notify(paymentHash);
+	}
+
+	/** A preimage learned on chain, whatever the record says (a late success). */
+	preimageOnChain(paymentHash: Buffer, preimage: Buffer): void {
+		const hashHex = paymentHash.toString('hex');
+		const current = this.outgoingHtlcs(paymentHash);
+		this.view(hashHex, {
+			status: PaymentStatus.COMPLETED,
+			htlcs: current.htlcs.map((h) => ({
+				...h,
+				state: 'onchain-resolved',
+				terminal: true
+			})),
+			resolved: true,
+			latestOutstandingExpiry: null,
+			preimage
+		});
+		this.notify(paymentHash);
+	}
+
+	/** Every HTLC failed back; the record is FAILED. */
+	fail(paymentHash: Buffer, notify = true): void {
+		const hashHex = paymentHash.toString('hex');
+		const current = this.outgoingHtlcs(paymentHash);
+		this.view(hashHex, {
+			status: PaymentStatus.FAILED,
+			htlcs: current.htlcs.map((h) => ({
+				...h,
+				state: 'failed',
+				terminal: true
+			})),
+			resolved: true,
+			latestOutstandingExpiry: null
+		});
+		if (notify) this.notify(paymentHash);
+	}
+
+	/** The record was failed by a wall clock while the HTLC is still out. */
+	failRecordOnly(paymentHash: Buffer): void {
+		const hashHex = paymentHash.toString('hex');
+		this.view(hashHex, { status: PaymentStatus.FAILED, resolved: false });
+		this.notify(paymentHash);
+	}
+
+	notify(paymentHash: Buffer): void {
+		for (const cb of this.listeners) cb(paymentHash);
+	}
+}
+
+export interface ISubmarineClient {
+	preimage: Buffer;
+	paymentHash: Buffer;
+	refundKey: Buffer;
+	refundPubkey: Buffer;
+	/** The client's node key, which signs its invoice. */
+	nodeKey: Buffer;
+}
+
+export function submarineClient(): ISubmarineClient {
+	const preimage = crypto.randomBytes(32);
+	const refundKey = crypto.randomBytes(32);
+	return {
+		preimage,
+		paymentHash: crypto.createHash('sha256').update(preimage).digest(),
+		refundKey,
+		refundPubkey: getPublicKey(refundKey),
+		nodeKey: crypto.randomBytes(32)
+	};
+}
+
+/** The client's own invoice for a submarine swap. */
+export function submarineInvoice(
+	client: ISubmarineClient,
+	amountMsat: bigint,
+	options: {
+		minFinalCltvExpiry?: number;
+		expiry?: number;
+		timestamp?: number;
+		network?: Network;
+		routingHints?: Array<{ pubkey: Buffer }>;
+		privateKey?: Buffer;
+		paymentSecret?: Buffer | null;
+	} = {}
+): string {
+	return encodeInvoice({
+		network: options.network ?? Network.REGTEST,
+		amountMsat,
+		timestamp: options.timestamp ?? Math.floor(Date.now() / 1000),
+		paymentHash: client.paymentHash,
+		...(options.paymentSecret === null
+			? {}
+			: { paymentSecret: options.paymentSecret ?? crypto.randomBytes(32) }),
+		description: 'submarine swap',
+		expiry: options.expiry ?? 7200,
+		minFinalCltvExpiry: options.minFinalCltvExpiry ?? 40,
+		privateKey: options.privateKey ?? client.nodeKey,
+		...(options.routingHints
+			? {
+					routingHints: [
+						options.routingHints.map((hop) => ({
+							pubkey: hop.pubkey,
+							shortChannelId: Buffer.alloc(8, 1),
+							feeBaseMsat: 1000,
+							feeProportionalMillionths: 1,
+							cltvExpiryDelta: 80
+						}))
+					]
+			  }
+			: {})
+	});
+}
+
+/** A transaction paying `valueSat` to the contract, placed on the fake chain. */
+export function fundContract(
+	chain: FakeSwapChain,
+	outputScript: Buffer,
+	valueSat: bigint,
+	height: number
+): bitcoin.Transaction {
+	const tx = new bitcoin.Transaction();
+	tx.version = 2;
+	tx.addInput(crypto.randomBytes(32), 0, 0xfffffffd);
+	tx.addOutput(outputScript, Number(valueSat));
+	// A change output so the funding is never confused with a 1-in-1-out spend.
+	tx.addOutput(
+		bitcoin.payments.p2wpkh({ pubkey: getPublicKey(crypto.randomBytes(32)) })
+			.output!,
+		5_000
+	);
+	chain.place(tx, height);
+	return tx;
+}
+
+/** The client's refund of its funding after the refund height. */
+export function refundTxFor(
+	record: ISwapRecord,
+	client: ISubmarineClient,
+	fundingTx: bitcoin.Transaction,
+	feeSatoshis = 500n
+): bitcoin.Transaction {
+	return buildSwapRefundTx({
+		htlc: {
+			paymentHash: client.paymentHash,
+			claimPublicKey: Buffer.from(record.claimPubkeyHex, 'hex'),
+			refundPublicKey: client.refundPubkey,
+			refundHeight: record.refundHeight
+		},
+		fundingTransaction: fundingTx,
+		outputIndex: record.fundingVout!,
+		destinationScript: bitcoin.payments.p2wpkh({
+			pubkey: getPublicKey(crypto.randomBytes(32))
+		}).output!,
+		feeSatoshis,
+		privateKey: client.refundKey
+	});
+}
+
+export interface ISubmarineHarness {
+	net: FakeDfNetwork;
+	provider: FakeDfPeer;
+	client: FakeDfPeer;
+	chain: FakeSwapChain;
+	outgoing: FakeOutgoing;
+	ledger: SwapLedger;
+	store: MemoryLedgerStore<ISwapRecord>;
+	engine: SubmarineSwapProvider;
+	nodeKey: Buffer;
+	ownNodeId: Buffer;
+	events: Array<{ name: string; data: Record<string, unknown> }>;
+	logs: Array<{ action: string; data: Record<string, unknown> }>;
+	feeRate: number | null;
+	spendableMsat: bigint;
+	/** Hashes the node already holds a record for. */
+	inUse: Set<string>;
+	/** Node ids this provider has a usable channel with (hex). */
+	channelPeers: Set<string>;
+	destination: Buffer;
+	/** The engine's wall clock, ms; settable to expire invoices. */
+	clock: number | undefined;
+	restart(overrides?: {
+		start?: boolean;
+		outgoing?: FakeOutgoing;
+	}): Promise<ISubmarineHarness>;
+}
+
+export async function submarineHarness(
+	options: {
+		config?: Partial<ISubmarineSwapProviderConfig>;
+		store?: MemoryLedgerStore<ISwapRecord>;
+		chain?: FakeSwapChain;
+		outgoing?: FakeOutgoing;
+		net?: FakeDfNetwork;
+		nodeKey?: Buffer;
+		feeRate?: number | null;
+		spendableMsat?: bigint;
+		inUse?: Set<string>;
+		start?: boolean;
+		destination?: Buffer;
+		clock?: number;
+		/** Share the provider peer with another engine (the reverse harness). */
+		provider?: FakeDfPeer;
+		/** Share the ledger instance too, as the node does. */
+		ledger?: SwapLedger;
+		/** Node ids this provider has a usable channel with (hex). */
+		channelPeers?: Set<string>;
+	} = {}
+): Promise<ISubmarineHarness> {
+	const net = options.net ?? new FakeDfNetwork();
+	const provider = options.provider ?? net.add('provider');
+	const client = net.add(`client-${crypto.randomBytes(4).toString('hex')}`);
+	net.connect(provider, client);
+	const chain = options.chain ?? new FakeSwapChain();
+	const nodeKey =
+		options.nodeKey ??
+		crypto.createHash('sha256').update('submarine-provider-node').digest();
+	const store = options.store ?? new MemoryLedgerStore<ISwapRecord>();
+	const ledger = options.ledger ?? new SwapLedger(store);
+	if (!options.ledger) ledger.rehydrate();
+	const outgoing =
+		options.outgoing ??
+		new FakeOutgoing((hashHex) => ledger.byPaymentHash(hashHex)[0]?.state);
+	const config: Partial<ISubmarineSwapProviderConfig> = {
+		refundDeltaBlocks: 200,
+		minRefundDeltaBlocks: 100,
+		maxRefundDeltaBlocks: 400,
+		claimSafetyBlocks: 12,
+		resolutionSafetyBlocks: 6,
+		routeCltvBudgetBlocks: 20,
+		fundingConfirmations: 1,
+		resolutionConfirmations: 2,
+		claimBumpIntervalBlocks: 2,
+		unresolvedAfterBlocks: 3,
+		minInvoiceExpirySeconds: 60,
+		flatFeeSat: 100n,
+		feePpm: 1_000,
+		...options.config
+	};
+	const events: ISubmarineHarness['events'] = [];
+	const logs: ISubmarineHarness['logs'] = [];
+	const state = {
+		feeRate: options.feeRate === undefined ? 2 : options.feeRate,
+		spendableMsat: options.spendableMsat ?? 10_000_000_000n,
+		clock: options.clock
+	};
+	const inUse = options.inUse ?? new Set<string>();
+	const channelPeers = options.channelPeers ?? new Set<string>();
+	const destination =
+		options.destination ??
+		bitcoin.payments.p2wpkh({ pubkey: getPublicKey(nodeKey) }).output!;
+	const ownNodeId = getPublicKey(nodeKey);
+	const deps: ISubmarineSwapProviderDeps = {
+		peers: provider,
+		ledger,
+		resolver: new SwapChainResolver(
+			chain,
+			{
+				fundingConfirmations: config.fundingConfirmations!,
+				resolutionConfirmations: config.resolutionConfirmations!
+			},
+			bitcoin.networks.regtest
+		),
+		payInvoice: (bolt11, o) => outgoing.payInvoice(bolt11, o),
+		outgoingHtlcs: (hash) => outgoing.outgoingHtlcs(hash),
+		onPaymentEvent: (cb) => {
+			outgoing.listeners.add(cb);
+			return () => outgoing.listeners.delete(cb);
+		},
+		hashInUse: (hash) => inUse.has(hash.toString('hex')),
+		spendableOutboundMsat: () => state.spendableMsat,
+		ownNodeId,
+		hasUsableChannelWith: (nodeId) => channelPeers.has(nodeId.toString('hex')),
+		broadcast: (txHex) => chain.broadcastTransaction(txHex),
+		estimateFee: async () => state.feeRate,
+		currentHeight: () => chain.height,
+		deriveClaimKey: (swapId) => deriveSwapKey(nodeKey, swapId, 'claim'),
+		claimDestinationScript: () => destination,
+		network: bitcoin.networks.regtest,
+		networkName: 'regtest',
+		now: () => state.clock ?? Date.now(),
+		log: (action, data) => logs.push({ action, data })
+	};
+	const engine = new SubmarineSwapProvider(deps, config);
+	for (const evt of SUBMARINE_SWAP_EVENTS) {
+		engine.on(evt, (data) => events.push({ name: evt, data }));
+	}
+	if (options.start !== false) await engine.start();
+	const h: ISubmarineHarness = {
+		net,
+		provider,
+		client,
+		chain,
+		outgoing,
+		ledger,
+		store,
+		engine,
+		nodeKey,
+		ownNodeId,
+		events,
+		logs,
+		get feeRate() {
+			return state.feeRate;
+		},
+		set feeRate(v: number | null) {
+			state.feeRate = v;
+		},
+		get spendableMsat() {
+			return state.spendableMsat;
+		},
+		set spendableMsat(v: bigint) {
+			state.spendableMsat = v;
+		},
+		inUse,
+		channelPeers,
+		destination,
+		get clock() {
+			return state.clock;
+		},
+		set clock(v: number | undefined) {
+			state.clock = v;
+		},
+		restart: async (overrides = {}) => {
+			engine.stop();
+			return submarineHarness({
+				...options,
+				...overrides,
+				store,
+				chain,
+				outgoing: overrides.outgoing ?? outgoing,
+				net,
+				provider,
+				nodeKey,
+				feeRate: state.feeRate,
+				spendableMsat: state.spendableMsat,
+				inUse,
+				channelPeers,
+				clock: state.clock
+			});
+		}
+	};
+	return h;
 }

@@ -261,6 +261,27 @@ export interface SwapsStatusInfo {
 	counts?: Record<string, number>;
 	exposedSat?: number;
 	exposedCount?: number;
+	/** The submarine direction (issue #743), present whenever the role is on. */
+	submarine?: {
+		enabled: boolean;
+		fee?: { flatFeeSat: number; feePpm: number };
+		limits?: {
+			minSwapSat: number;
+			maxSwapSat: number;
+			maxTotalExposureSat: number;
+			maxConcurrentSwaps: number;
+		};
+		timeouts?: {
+			refundDeltaBlocks: number;
+			fundingConfirmations: number;
+			resolutionConfirmations: number;
+			claimSafetyBlocks: number;
+			paymentMaxFeePpm: number;
+		};
+		counts?: Record<string, number>;
+		exposedSat?: number;
+		exposedCount?: number;
+	};
 }
 
 export interface JitStatusInfo {
@@ -817,6 +838,12 @@ export interface BeignetConfig {
 		refundDeltaBlocks?: number;
 		fundingConfs?: number;
 		resolutionConfs?: number;
+		/** The submarine direction (issue #743); see BeignetConfig in beignet-node. */
+		submarine?: boolean;
+		claimSafetyBlocks?: number;
+		paymentMaxFeePpm?: number;
+		claimBumpIntervalBlocks?: number;
+		submarineRefundDeltaBlocks?: number;
 	};
 	/** Relay direct-funding frames for OTHER nodes (BEIGNET_DF_RELAY, exact
 	 *  'true'/'false'). Off by default: forwarding opaque frames between
@@ -1381,6 +1408,17 @@ export interface BeignetNodeEvents {
 	'swap:hold-cancelled': (data: Record<string, unknown>) => void;
 	'swap:exposed': (data: Record<string, unknown>) => void;
 	'swap:failed': (data: Record<string, unknown>) => void;
+	// Submarine swap provider (issue #743): the same envelope with
+	// direction 'submarine', plus the payment ceiling, claim txid and fee.
+	'swap:funding-seen': (data: Record<string, unknown>) => void;
+	'swap:funding-lost': (data: Record<string, unknown>) => void;
+	'swap:paying': (data: Record<string, unknown>) => void;
+	'swap:payment-unresolved': (data: Record<string, unknown>) => void;
+	'swap:preimage': (data: Record<string, unknown>) => void;
+	'swap:claim-broadcast': (data: Record<string, unknown>) => void;
+	'swap:claim-confirmed': (data: Record<string, unknown>) => void;
+	'swap:payment-failed': (data: Record<string, unknown>) => void;
+	'swap:cancelled': (data: Record<string, unknown>) => void;
 	/**
 	 * JIT receive, LSP side (issue #669). Relayed JSON-safe: every satoshi and
 	 * millisatoshi figure is a decimal string. `jit:intent` is a wallet's

@@ -198,6 +198,7 @@ function swapsEnv(): BeignetConfig['swaps'] {
 	const enabledRaw = process.env.BEIGNET_SWAPS?.trim();
 	const enabled =
 		enabledRaw === 'true' ? true : enabledRaw === 'false' ? false : undefined;
+	const submarineRaw = process.env.BEIGNET_SWAP_SUBMARINE?.trim();
 	const fields = {
 		enabled,
 		flatFeeSat: integerEnv(process.env.BEIGNET_SWAP_FLAT_FEE_SAT),
@@ -208,7 +209,22 @@ function swapsEnv(): BeignetConfig['swaps'] {
 		maxConcurrent: integerEnv(process.env.BEIGNET_SWAP_MAX_CONCURRENT),
 		refundDeltaBlocks: integerEnv(process.env.BEIGNET_SWAP_REFUND_DELTA_BLOCKS),
 		fundingConfs: integerEnv(process.env.BEIGNET_SWAP_FUNDING_CONFS),
-		resolutionConfs: integerEnv(process.env.BEIGNET_SWAP_RESOLUTION_CONFS)
+		resolutionConfs: integerEnv(process.env.BEIGNET_SWAP_RESOLUTION_CONFS),
+		// The submarine direction (issue #743), off unless exactly 'true'.
+		submarine:
+			submarineRaw === 'true'
+				? true
+				: submarineRaw === 'false'
+				? false
+				: undefined,
+		claimSafetyBlocks: integerEnv(process.env.BEIGNET_SWAP_CLAIM_SAFETY_BLOCKS),
+		paymentMaxFeePpm: integerEnv(process.env.BEIGNET_SWAP_PAYMENT_MAX_FEE_PPM),
+		claimBumpIntervalBlocks: integerEnv(
+			process.env.BEIGNET_SWAP_CLAIM_BUMP_INTERVAL_BLOCKS
+		),
+		submarineRefundDeltaBlocks: integerEnv(
+			process.env.BEIGNET_SWAP_SUBMARINE_REFUND_DELTA_BLOCKS
+		)
 	};
 	if (Object.values(fields).every((v) => v === undefined)) return undefined;
 	return Object.fromEntries(
@@ -233,7 +249,12 @@ function mergeSwaps(
 		'maxConcurrent',
 		'refundDeltaBlocks',
 		'fundingConfs',
-		'resolutionConfs'
+		'resolutionConfs',
+		'submarine',
+		'claimSafetyBlocks',
+		'paymentMaxFeePpm',
+		'claimBumpIntervalBlocks',
+		'submarineRefundDeltaBlocks'
 	] as const;
 	const out: NonNullable<BeignetConfig['swaps']> = {};
 	for (const key of keys) {

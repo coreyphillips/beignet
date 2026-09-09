@@ -7,4 +7,6 @@ export * from './exposure';
 export * from './chain-resolver';
 export * from './messages';
 export * from './client';
+export * from './engine-common';
 export * from './reverse-engine';
+export * from './submarine-engine';

@@ -2496,7 +2496,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/swaps/status': {
 				get: {
 					summary:
-						'Reverse swap provider (issue #737): whether the role is on, its fee terms, exposure caps, timing policy, a count of swaps per state and the principal currently at risk on chain. Readonly scope',
+						'Swap provider (issues #737 and #743): whether the role is on, its fee terms, exposure caps, timing policy, a count of reverse swaps per state and the principal currently at risk on chain; `submarine` reports the on-chain to Lightning direction the same way (enabled false when that direction is off). Readonly scope',
 					tags: ['Swaps'],
 					responses: {
 						'200': {
@@ -2509,7 +2509,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/swaps': {
 				get: {
 					summary:
-						'The swap ledger: every reverse swap this node has been asked for, with its state, contract terms, funding, refund and resolution facts (buffers as hex, amounts as decimal strings; no private key is ever stored). Readonly scope',
+						'The swap ledger: every swap this node has been asked for in either direction (`direction` is reverse or submarine), with its state, contract terms, funding, payment, claim, refund and resolution facts (buffers as hex, amounts as decimal strings; no private key is ever stored). Readonly scope',
 					tags: ['Swaps'],
 					parameters: [
 						{
@@ -2533,7 +2533,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/swaps/cancel': {
 				post: {
 					summary:
-						'Cancel a swap before any funds moved (CREATED or HELD): closes its hold invoice and fails the payer. A funded swap cannot be cancelled; it resolves on chain by claim or refund. Admin scope',
+						'Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice and fails the payer), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Past that a swap resolves on chain by claim or refund. Admin scope',
 					tags: ['Swaps'],
 					requestBody: {
 						required: true,
@@ -2558,7 +2558,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'SWAP_NOT_CANCELLABLE: the swap is past CREATED/HELD and resolves on chain'
+								'SWAP_NOT_CANCELLABLE: the swap is past CREATED/HELD (reverse) or PAYING (submarine) and resolves on chain'
 						}
 					}
 				}
@@ -2566,7 +2566,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string and htlcCount, hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce, ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:issuer-provisioned, ffor:issuer-issued (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string and htlcCount, hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce, ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:issuer-provisioned, ffor:issuer-issued (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -3877,13 +3877,57 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'integer',
 							description: 'Principal at risk on chain right now'
 						},
-						exposedCount: { type: 'integer' }
+						exposedCount: { type: 'integer' },
+						submarine: {
+							type: 'object',
+							description:
+								'The on-chain to Lightning direction (issue #743): the same shape, with claimSafetyBlocks and paymentMaxFeePpm among the timeouts; enabled false when that direction is off',
+							properties: {
+								enabled: { type: 'boolean' },
+								fee: {
+									type: 'object',
+									properties: {
+										flatFeeSat: { type: 'integer' },
+										feePpm: { type: 'integer' }
+									}
+								},
+								limits: {
+									type: 'object',
+									properties: {
+										minSwapSat: { type: 'integer' },
+										maxSwapSat: { type: 'integer' },
+										maxTotalExposureSat: { type: 'integer' },
+										maxConcurrentSwaps: { type: 'integer' }
+									}
+								},
+								timeouts: {
+									type: 'object',
+									properties: {
+										refundDeltaBlocks: { type: 'integer' },
+										fundingConfirmations: { type: 'integer' },
+										resolutionConfirmations: { type: 'integer' },
+										claimSafetyBlocks: { type: 'integer' },
+										paymentMaxFeePpm: { type: 'integer' }
+									}
+								},
+								counts: {
+									type: 'object',
+									additionalProperties: { type: 'integer' }
+								},
+								exposedSat: {
+									type: 'integer',
+									description:
+										'Lightning principal paid out and not yet claimed on chain'
+								},
+								exposedCount: { type: 'integer' }
+							}
+						}
 					}
 				},
 				SwapRecord: {
 					type: 'object',
 					description:
-						'One swap ledger row. Amounts are decimal strings, hashes and keys hex. States: CREATED, HELD, FUNDING, FUNDING_BROADCAST, FUNDED, CLAIMED, SETTLED, REFUND_PENDING, REFUNDED, EXPOSED, CANCELLED, FAILED',
+						'One swap ledger row. Amounts are decimal strings, hashes and keys hex. Reverse states: CREATED, HELD, FUNDING, FUNDING_BROADCAST, FUNDED, CLAIMED, SETTLED, REFUND_PENDING, REFUNDED, EXPOSED, CANCELLED, FAILED. Submarine states: CREATED, FUNDING_SEEN, FUNDED, FUNDING_LOST, PAYING, PAYMENT_UNRESOLVED, PREIMAGE_KNOWN, CLAIM_BROADCAST, CLAIM_CONFIRMED, PAYMENT_FAILED, EXPOSED, CANCELLED, FAILED',
 					properties: {
 						id: { type: 'string' },
 						state: { type: 'string' },
@@ -3899,6 +3943,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						fundingVout: { type: 'integer' },
 						fundingHeight: { type: 'integer' },
 						refundTxid: { type: 'string' },
+						claimTxid: { type: 'string' },
+						paymentMaxCltvExpiryHeight: { type: 'integer' },
 						preimageHex: { type: 'string' },
 						holdCancelReason: { type: 'string' },
 						failureReason: { type: 'string' }

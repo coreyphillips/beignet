@@ -1349,8 +1349,9 @@ async function handleInvoice(): Promise<void> {
 }
 
 async function handleSwaps(): Promise<void> {
-	// The reverse swap provider role (issue #737): its terms and exposure,
-	// its ledger, and the one operator action that is safe before funds move.
+	// The swap provider role (issues #737 and #743): its terms and exposure
+	// in both directions, its ledger, and the one operator action that is
+	// safe before funds move.
 	const sub = filteredArgs[1];
 	switch (sub) {
 		case 'status':
@@ -2910,13 +2911,16 @@ Invoices & Payments:
                                          LSP and whether it would be served
                                          right now; registers nothing
 
-Reverse swaps (a peer pays us over Lightning, we fund an on-chain contract):
+Swaps (reverse: a peer pays us over Lightning, we fund an on-chain contract;
+       submarine: a peer funds a contract, we pay its invoice and claim):
   swaps status                           The provider role as it stands: fee,
                                          exposure caps, timing, swaps per
-                                         state, principal at risk on chain
+                                         state, principal at risk, and the
+                                         submarine direction under "submarine"
   swaps list [--id <hex>]                The swap ledger (or one swap)
   swaps cancel <id>                      Cancel a swap nothing has moved for
-                                         yet (closes its hold invoice)
+                                         yet (reverse: closes its hold invoice;
+                                         submarine: before this node pays)
   invoice create-hold <hash> [sats] [description] [--expiry secs]
                                          Create hold invoice for a payment hash
                                          you supply (keep the preimage; HTLCs

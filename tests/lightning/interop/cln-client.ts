@@ -459,6 +459,11 @@ export class ClnRestClient {
 		});
 	}
 
+	/** Delete an invoice by label (status must match: 'unpaid', 'paid', 'expired'). */
+	async delInvoice(label: string, status: string): Promise<unknown> {
+		return this.request('POST', '/v1/delinvoice', { label, status });
+	}
+
 	async listInvoices(label?: string): Promise<{ invoices: IClnInvoice[] }> {
 		const body = label ? { label } : undefined;
 		return this.request('POST', '/v1/listinvoices', body);
