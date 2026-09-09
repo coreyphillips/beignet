@@ -851,7 +851,12 @@ export async function runSubmarineSwapRefundPath(
 	);
 	await scene.invoicer.failUnpaid(invoice.handle, invoice.paymentHashHex);
 	try {
-		await waitForSwapState(scene.provider, swapIdHex, ['PAYMENT_FAILED'], 90_000);
+		await waitForSwapState(
+			scene.provider,
+			swapIdHex,
+			['PAYMENT_FAILED'],
+			90_000
+		);
 	} catch (err) {
 		const view = scene.provider.getOutgoingHtlcs(paymentHash);
 		const payment = scene.provider.getPayment(paymentHash);
