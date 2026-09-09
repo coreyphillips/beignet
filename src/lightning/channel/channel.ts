@@ -10926,17 +10926,21 @@ export class Channel {
 			this._spliceLockAtDepth !== null &&
 			msg.lockDepth !== this._spliceLockAtDepth
 		) {
+			// Read before the abort: abortSplice resets the splice driver, which
+			// clears _spliceLockAtDepth, and the error below must name the depth
+			// that was asked for, not null (issue #760).
+			const requested = this._spliceLockAtDepth;
 			const actions: ChannelAction[] = [
 				this._txAbort(this._state.channelId!, 'lock_depth not honoured')
 			];
 			actions.push(
 				...this.abortSplice(
-					`peer did not honour the requested splice lock depth ${this._spliceLockAtDepth}`
+					`peer did not honour the requested splice lock depth ${requested}`
 				)
 			);
 			actions.push({
 				type: ChannelActionType.ERROR,
-				message: `splice aborted: peer did not honour the requested lock depth ${this._spliceLockAtDepth}`
+				message: `splice aborted: peer did not honour the requested lock depth ${requested}`
 			});
 			return actions;
 		}

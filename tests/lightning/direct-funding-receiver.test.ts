@@ -34,7 +34,10 @@ import {
 	signOwnershipProbeLikeAWallet,
 	memoryStorage
 } from './helpers/df-receiver';
-import { IDfReceiverConfig } from '../../src/lightning/direct-funding/receiver/types';
+import {
+	DF_DEFAULT_UNPAIRED_SPLICE_DEPTH,
+	IDfReceiverConfig
+} from '../../src/lightning/direct-funding/receiver/types';
 
 const ACK = BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK;
 const SIGN_REQUEST = BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST;
@@ -2813,7 +2816,10 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 		expect(node.opens[0].params.trusted).to.equal(undefined);
 	});
 
-	it('keeps an anonymous payer on the new-channel path even with a channel to splice', async () => {
+	// allowSplice alone is the pre-#760 rule: only a paired payer's coin goes
+	// under the existing channel. A stranger stays on the confirm-first open
+	// until the operator switches allowUnpairedSplice on as well.
+	it('keeps an anonymous payer on the new-channel path while allowUnpairedSplice is off', async () => {
 		const h = harness({ allowSplice: true, negotiationTimeoutMs: 5_000 });
 		h.node.spliceChannel = crypto.randomBytes(32);
 		await h.sendOffer();
@@ -2874,6 +2880,188 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 		expect(h.payer.bodiesOf(SIGN_REQUEST)).to.have.length(0);
 		expect(h.lastAck()?.reason).to.contain('below the offered');
 		expect(h.node.aborts.map((a) => a.kind)).to.deep.equal(['splice']);
+	});
+
+	// Issue #760. A stranger's coin can go under the home channel because the
+	// splice it rides locks at depth rather than at broadcast: the engine hands
+	// the node the depth, and the node holds splice_locked until the chain has
+	// the transaction that many blocks deep, zero-conf channel or not.
+	it('splices for an anonymous payer with a confirmed coin when allowUnpairedSplice is on, locking at the configured depth', async () => {
+		const h = harness({
+			allowSplice: true,
+			allowUnpairedSplice: true,
+			unpairedSpliceDepth: 6,
+			negotiationTimeoutMs: 5_000
+		});
+		h.node.spliceChannel = crypto.randomBytes(32);
+		await h.sendOffer();
+		expect(h.node.opens).to.have.length(0);
+		expect(h.node.splices).to.have.length(1);
+		expect(h.node.splices[0].inputs[0].external).to.equal(true);
+		expect(h.node.splices[0].inputs[0].confirmed).to.equal(true);
+		expect(h.node.splices[0].options).to.deep.equal({ lockAtDepth: 6 });
+		h.node.completeSpliceNegotiation(h.coin, h.offer, 200_000n);
+		await flush();
+		expect(h.payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+	});
+
+	it("locks an anonymous payer's splice at the default depth when none is configured", async () => {
+		const h = harness({
+			allowSplice: true,
+			allowUnpairedSplice: true,
+			negotiationTimeoutMs: 5_000
+		});
+		h.node.spliceChannel = crypto.randomBytes(32);
+		await h.sendOffer();
+		expect(h.node.splices).to.have.length(1);
+		expect(h.node.splices[0].options?.lockAtDepth).to.equal(
+			DF_DEFAULT_UNPAIRED_SPLICE_DEPTH
+		);
+	});
+
+	// The depth lock protects the channel once the coin is on chain; a coin
+	// still in the mempool can vanish before it ever gets there, and a splice
+	// waiting on a transaction that will never confirm pins the channel. That
+	// coin takes the open path, where a double spend costs nothing but a
+	// forgotten funding.
+	it('keeps an anonymous payer with an unconfirmed coin on the new-channel path', async () => {
+		const h = harness({
+			allowSplice: true,
+			allowUnpairedSplice: true,
+			negotiationTimeoutMs: 5_000
+		});
+		h.node.publish(h.coin, 0);
+		h.node.spliceChannel = crypto.randomBytes(32);
+		await h.sendOffer();
+		expect(h.node.splices).to.have.length(0);
+		expect(h.node.opens).to.have.length(1);
+		expect(h.node.opens[0].params.contribution.inputs[0].confirmed).to.equal(
+			false
+		);
+	});
+
+	it('keeps an anonymous payer on the new-channel path when the chain cannot say whether the coin is confirmed', async () => {
+		const h = harness({
+			allowSplice: true,
+			allowUnpairedSplice: true,
+			negotiationTimeoutMs: 5_000
+		});
+		// The transaction resolves, but the unspent index knows nothing of it.
+		h.node.unspent.clear();
+		h.node.history.clear();
+		h.node.spliceChannel = crypto.randomBytes(32);
+		await h.sendOffer();
+		expect(h.node.splices).to.have.length(0);
+		expect(h.node.opens).to.have.length(1);
+	});
+
+	it('splices a paired payer with no depth lock, allowUnpairedSplice or not', async () => {
+		for (const allowUnpairedSplice of [false, true]) {
+			const h = harness(
+				{
+					allowSplice: true,
+					allowUnpairedSplice,
+					unpairedSpliceDepth: 6,
+					negotiationTimeoutMs: 5_000
+				},
+				{ authenticatedPeer: 'payer-node-id' }
+			);
+			h.node.spliceChannel = crypto.randomBytes(32);
+			h.node.trustedPayers.add('payer-node-id');
+			await h.sendOffer();
+			expect(
+				h.node.splices,
+				`allowUnpairedSplice=${allowUnpairedSplice}`
+			).to.have.length(1);
+			expect(h.node.splices[0].options).to.deep.equal({
+				lockAtDepth: undefined
+			});
+		}
+	});
+
+	// One funding into the liquidity peer at a time. A channel mid-negotiation
+	// is not usable for a second splice and an open beside it is the second
+	// channel the splice path exists to avoid; a signed splice waiting on
+	// depth leaves the channel usable again, and a second splice on top of it
+	// is what the one-input bound forbids. Both windows decline before the
+	// payer's witness leaves, so the payer falls back to a plain send.
+	it('declines every payer while a splice with the liquidity peer is still confirming, and starts nothing', async () => {
+		for (const paired of [false, true]) {
+			for (const usable of [false, true]) {
+				const h = harness(
+					{
+						allowSplice: true,
+						allowUnpairedSplice: true,
+						negotiationTimeoutMs: 5_000
+					},
+					{ authenticatedPeer: paired ? 'payer-node-id' : undefined }
+				);
+				if (paired) h.node.trustedPayers.add('payer-node-id');
+				h.node.spliceChannel = usable ? crypto.randomBytes(32) : null;
+				h.node.spliceInFlight = true;
+				await h.sendOffer();
+				const label = `paired=${paired} usable=${usable}`;
+				expect(h.lastAck()?.accepted, label).to.equal(false);
+				expect(h.lastAck()?.reason, label).to.contain('still confirming');
+				expect(h.node.opens, label).to.have.length(0);
+				expect(h.node.splices, label).to.have.length(0);
+				expect(h.payer.bodiesOf(SIGN_REQUEST), label).to.have.length(0);
+				expect(h.engine.inflightCount(), label).to.equal(0);
+				expect(
+					h.node.requests.attemptsFor(h.offer.receiptHash.toString('hex'))
+						.attempts,
+					label
+				).to.equal(0);
+			}
+		}
+	});
+
+	it('lets the pending splice stand aside when splicing is off: the open path is all there is', async () => {
+		const h = harness({ negotiationTimeoutMs: 5_000 });
+		h.node.spliceInFlight = true;
+		await h.sendOffer();
+		expect(h.lastAck()?.accepted).to.equal(true);
+		expect(h.node.opens).to.have.length(1);
+	});
+
+	it('validates unpairedSpliceDepth in the constructor and in setConfig', () => {
+		const node = new FakeDfNode();
+		for (const bad of [0, 2017, 1.5, Number.NaN]) {
+			expect(
+				() => new DirectFundingReceiver(node, { unpairedSpliceDepth: bad }),
+				`constructor ${bad}`
+			).to.throw('unpairedSpliceDepth');
+		}
+		const engine = new DirectFundingReceiver(node, {});
+		expect(engine.splicePolicy()).to.deep.equal({
+			allowSplice: false,
+			allowUnpairedSplice: false,
+			unpairedSpliceDepth: DF_DEFAULT_UNPAIRED_SPLICE_DEPTH
+		});
+		for (const bad of [0, 2017, 1.5]) {
+			expect(
+				() =>
+					engine.setConfig({
+						allowUnpairedSplice: true,
+						unpairedSpliceDepth: bad
+					}),
+				`setConfig ${bad}`
+			).to.throw('unpairedSpliceDepth');
+		}
+		// A refused update applies none of its fields.
+		expect(engine.splicePolicy().allowUnpairedSplice).to.equal(false);
+		engine.setConfig({
+			allowSplice: true,
+			allowUnpairedSplice: true,
+			unpairedSpliceDepth: 2016
+		});
+		expect(engine.splicePolicy()).to.deep.equal({
+			allowSplice: true,
+			allowUnpairedSplice: true,
+			unpairedSpliceDepth: 2016
+		});
+		engine.setConfig({ allowUnpairedSplice: false });
+		expect(engine.splicePolicy().unpairedSpliceDepth).to.equal(2016);
 	});
 });
 

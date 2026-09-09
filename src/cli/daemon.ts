@@ -1728,6 +1728,8 @@ async function bootDaemon(
 				targetInboundSat,
 				trusted,
 				allowSplice,
+				allowUnpairedSplice,
+				unpairedSpliceDepth,
 				minAmountSat
 			} = body as {
 				lspPubkey?: string;
@@ -1736,12 +1738,14 @@ async function bootDaemon(
 				targetInboundSat?: number;
 				trusted?: boolean;
 				allowSplice?: boolean;
+				allowUnpairedSplice?: boolean;
+				unpairedSpliceDepth?: number;
 				minAmountSat?: number;
 			};
 			// A partial MERGE, not a replace. The dashboard posts {minAmountSat}
 			// alone and then requires lspPubkey in the readback; the app's manager
-			// posts the other six without minAmountSat. A field the caller did not
-			// name keeps its value.
+			// posts the other fields without minAmountSat. A field the caller did
+			// not name keeps its value.
 			return success(
 				node.configureDirectFunding({
 					...(lspPubkey !== undefined ? { lspPubkey } : {}),
@@ -1750,6 +1754,8 @@ async function bootDaemon(
 					...(targetInboundSat !== undefined ? { targetInboundSat } : {}),
 					...(trusted !== undefined ? { trusted } : {}),
 					...(allowSplice !== undefined ? { allowSplice } : {}),
+					...(allowUnpairedSplice !== undefined ? { allowUnpairedSplice } : {}),
+					...(unpairedSpliceDepth !== undefined ? { unpairedSpliceDepth } : {}),
 					...(minAmountSat !== undefined ? { minAmountSat } : {})
 				})
 			);

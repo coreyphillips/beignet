@@ -21968,6 +21968,19 @@ export class LightningNode extends EventEmitter {
 		if (!this.directFunding) {
 			throw new Error('direct funding is not configured on this node');
 		}
+		// Judged before the merge, so a refused depth leaves neither the policy
+		// nor the persisted copy carrying a value the splice engine would reject
+		// at splice time (issue #760).
+		if (
+			update.unpairedSpliceDepth !== undefined &&
+			(!Number.isInteger(update.unpairedSpliceDepth) ||
+				update.unpairedSpliceDepth < 1 ||
+				update.unpairedSpliceDepth > SPLICE_LOCK_DEPTH_MAX)
+		) {
+			throw new Error(
+				`unpairedSpliceDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_MAX}`
+			);
+		}
 		const policy = this.directFunding.policy;
 		for (const [key, value] of Object.entries(update)) {
 			if (value === undefined) continue;
@@ -21981,7 +21994,11 @@ export class LightningNode extends EventEmitter {
 				? { maxAmountSat: BigInt(policy.maxAmountSat) }
 				: {}),
 			allowZeroConf: policy.allowZeroConf === true,
-			allowSplice: policy.allowSplice === true
+			allowSplice: policy.allowSplice === true,
+			allowUnpairedSplice: policy.allowUnpairedSplice === true,
+			...(policy.unpairedSpliceDepth !== undefined
+				? { unpairedSpliceDepth: policy.unpairedSpliceDepth }
+				: {})
 		});
 		this.persistDirectFundingPolicy();
 		return { ...policy };
@@ -22187,6 +22204,7 @@ export class LightningNode extends EventEmitter {
 				},
 				liquidityPeer: () => policy.liquidityPeer ?? null,
 				usableChannelWith: (peerHex) => this.usableChannelWith(peerHex),
+				spliceInFlightWith: (peerHex) => this.spliceInFlightWith(peerHex),
 				fundingPubkeys: (channelId) =>
 					this.getRawChannel(channelId)?.getFundingPubkeys() ?? null,
 				canOpenZeroConfTo: (peerHex) =>
@@ -22209,14 +22227,16 @@ export class LightningNode extends EventEmitter {
 					amountSats,
 					inputs,
 					changeScript,
-					feeratePerKw
+					feeratePerKw,
+					options
 				) =>
 					this.spliceInWithInputs(
 						channelId,
 						amountSats,
 						inputs,
 						changeScript,
-						feeratePerKw
+						feeratePerKw,
+						options ?? {}
 					),
 				abortSplice: (channelId, reason) =>
 					this.channelManager.abortSplice(channelId, reason),
@@ -22269,7 +22289,11 @@ export class LightningNode extends EventEmitter {
 					? { maxAmountSat: BigInt(policy.maxAmountSat) }
 					: {}),
 				allowZeroConf: policy.allowZeroConf === true,
-				allowSplice: policy.allowSplice === true
+				allowSplice: policy.allowSplice === true,
+				allowUnpairedSplice: policy.allowUnpairedSplice === true,
+				...(policy.unpairedSpliceDepth !== undefined
+					? { unpairedSpliceDepth: policy.unpairedSpliceDepth }
+					: {})
 			}
 		);
 		for (const evt of [
@@ -22686,6 +22710,26 @@ export class LightningNode extends EventEmitter {
 			return channel.channelId;
 		}
 		return null;
+	}
+
+	/**
+	 * Is any channel with this peer mid-splice (issue #760)? SPLICING covers
+	 * the negotiation; a non-null `spliceInFlight` covers a signed splice that
+	 * is waiting on depth, during which the channel reads NORMAL again. The
+	 * direct-funding receiver declines a second funding into the peer while
+	 * either holds, rather than opening a channel beside the pending splice.
+	 */
+	private spliceInFlightWith(peerHex: string): boolean {
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			if (this.channelManager.getPeerForChannel(channelId) !== peerHex) {
+				continue;
+			}
+			if (channel.getState() === ChannelState.SPLICING) return true;
+			if (channel.getFullState().spliceInFlight) return true;
+		}
+		return false;
 	}
 
 	/** The wallet-data slice of the backend, when it has one. */

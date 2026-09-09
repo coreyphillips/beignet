@@ -355,11 +355,23 @@ export interface DirectFundingConfigInfo {
 	/** Whether a direct-funded open may go zero-conf. */
 	trusted: boolean;
 	/**
-	 * Whether a paired (trusted) payer's offer may be served by splicing the
-	 * existing channel with the liquidity peer instead of opening a second
-	 * one. Anonymous payers always get a new confirmed channel regardless.
+	 * Whether an offer may be served by splicing the existing channel with the
+	 * liquidity peer instead of opening a second one. On its own this covers
+	 * paired (trusted) payers; `allowUnpairedSplice` extends it.
 	 */
 	allowSplice: boolean;
+	/**
+	 * Whether an unpaired (anonymous) payer's offer may be served as a splice
+	 * too, when its coin is confirmed (issue #760). Such a splice locks at
+	 * `unpairedSpliceDepth` confirmations rather than at broadcast; a stranger
+	 * whose coin is unconfirmed still gets a new confirmed channel.
+	 */
+	allowUnpairedSplice: boolean;
+	/**
+	 * Confirmations an unpaired payer's splice waits for before it locks,
+	 * 1..2016. Defaults to 3, the ordinary channel's confirmation depth.
+	 */
+	unpairedSpliceDepth: number;
 	/** Smallest offer served, never below the 5000 sat protocol floor. */
 	minAmountSat: number;
 }

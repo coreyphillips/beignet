@@ -340,7 +340,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/direct-funding/configure': {
 				post: {
 					summary:
-						'Set the direct-funding policy: the liquidity peer every direct-funded channel is negotiated with, where it is reachable, whether such an open may go zero-conf, whether a paired payer may splice the existing channel instead of opening a second one, and the minimum offer served. A partial MERGE, never a replace: a field the body does not name keeps its value. minAmountSat clamps up to the 5000 sat protocol floor and the response reports the clamped value. targetInboundSat is recorded and reported but not yet consumed. Admin scope',
+						'Set the direct-funding policy: the liquidity peer every direct-funded channel is negotiated with, where it is reachable, whether such an open may go zero-conf, whether a paired payer may splice the existing channel instead of opening a second one (allowSplice), whether an unpaired payer with a confirmed coin may do the same with a splice that locks at unpairedSpliceDepth confirmations (allowUnpairedSplice, unpairedSpliceDepth 1..2016), and the minimum offer served. A partial MERGE, never a replace: a field the body does not name keeps its value. The three switches must be booleans. minAmountSat clamps up to the 5000 sat protocol floor and the response reports the clamped value. targetInboundSat is recorded and reported but not yet consumed. Admin scope',
 					tags: ['DirectFunding'],
 					requestBody: bodyContent({
 						lspPubkey: 'string?',
@@ -349,6 +349,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						targetInboundSat: 'number?',
 						trusted: 'boolean?',
 						allowSplice: 'boolean?',
+						allowUnpairedSplice: 'boolean?',
+						unpairedSpliceDepth: 'number?',
 						minAmountSat: 'number?'
 					}),
 					responses: {
@@ -4030,7 +4032,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						allowSplice: {
 							type: 'boolean',
 							description:
-								'Whether a paired (trusted) payer is served by splicing the existing channel with the liquidity peer instead of opening a second one. Anonymous payers always get a new confirmed channel'
+								'Whether a paired (trusted) payer is served by splicing the existing channel with the liquidity peer instead of opening a second one. On its own it leaves anonymous payers on the new confirmed channel path; allowUnpairedSplice extends it'
+						},
+						allowUnpairedSplice: {
+							type: 'boolean',
+							description:
+								'Whether an anonymous (unpaired) payer whose coin is confirmed is served by splicing the existing channel too. That splice locks at unpairedSpliceDepth confirmations rather than at broadcast, whatever the channel type; an anonymous payer with an unconfirmed coin still gets a new confirmed channel'
+						},
+						unpairedSpliceDepth: {
+							type: 'integer',
+							description:
+								"Confirmations an anonymous payer's splice waits for before it locks, 1..2016. Default 3, the ordinary channel's confirmation depth"
 						},
 						minAmountSat: {
 							type: 'integer',

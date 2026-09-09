@@ -247,8 +247,10 @@ describe('LFBW app surface (issue #614)', () => {
 		// spreads it only when the caller named it. allowSplice is the seventh:
 		// the app's home-channel design needs a paired payer to grow the one
 		// channel with the primary rather than open a second, and the receiver
-		// engine's splice path is unreachable without it.
-		it('POST /direct-funding/configure takes the seven fields and merges them', () => {
+		// engine's splice path is unreachable without it. allowUnpairedSplice
+		// and unpairedSpliceDepth (issue #760) extend that to a stranger with a
+		// confirmed coin, through a splice that locks at depth.
+		it('POST /direct-funding/configure takes the nine fields and merges them', () => {
 			const fields = [
 				'lspPubkey',
 				'lspHost',
@@ -256,12 +258,14 @@ describe('LFBW app surface (issue #614)', () => {
 				'targetInboundSat',
 				'trusted',
 				'allowSplice',
+				'allowUnpairedSplice',
+				'unpairedSpliceDepth',
 				'minAmountSat'
 			];
 			expect(requestParams('/direct-funding/configure')).to.include.members(
 				fields
 			);
-			const handler = handlerSource('POST /direct-funding/configure', 1400);
+			const handler = handlerSource('POST /direct-funding/configure', 1800);
 			for (const field of fields) {
 				expect(handler, `${field} is spread only when named`).to.include(
 					`...(${field} !== undefined ? { ${field} } : {})`
@@ -279,6 +283,8 @@ describe('LFBW app surface (issue #614)', () => {
 				'targetInboundSat',
 				'trusted',
 				'allowSplice',
+				'allowUnpairedSplice',
+				'unpairedSpliceDepth',
 				'minAmountSat'
 			];
 			expect(responseFields('/direct-funding/config', 'get')).to.have.members(

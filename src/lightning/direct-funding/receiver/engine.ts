@@ -5,7 +5,11 @@
  * A payer offers to spend one of its UTXOs into a funding transaction we
  * negotiate with our liquidity peer, and we come back with a transaction for
  * it to sign. The payer's on-chain payment IS our channel funding, either a
- * new v2 dual-funded channel or a splice into the one we already have.
+ * new v2 dual-funded channel or a splice into the one we already have. Which
+ * one is the operator's call (`allowSplice`, `allowUnpairedSplice`), and a
+ * payer we have not paired with splices only with a confirmed coin and only
+ * into a splice that locks at `unpairedSpliceDepth` confirmations (issue
+ * #760), so a stranger's input is held to the bar a new channel's funding is.
  *
  * What this engine does not do matters as much as what it does. It never holds
  * the payer's coin and never signs for it. It decides whether to spend a
@@ -38,6 +42,7 @@ import { EventEmitter } from 'events';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { ISpliceWalletInput } from '../../channel/channel';
 import { BeignetCustomSubtype } from '../../message/custom';
+import { SPLICE_LOCK_DEPTH_MAX } from '../../message/splice';
 import { zbase32Decode } from '../../crypto/message-signing';
 import {
 	decodeSealedFrame,
@@ -80,6 +85,7 @@ import {
 } from './verify';
 import {
 	DF_DEFAULT_SPLICE_FEERATE_PERKW,
+	DF_DEFAULT_UNPAIRED_SPLICE_DEPTH,
 	DF_LOG_OFFER_ACCEPTED,
 	DF_LOG_OFFER_COMPLETED,
 	DF_LOG_OFFER_DECLINED,
@@ -104,6 +110,21 @@ import {
 
 /** What a funding given up with its request is aborted with (issue #644). */
 const DF_LAPSED_ABORT_REASON = 'the direct funding request expired';
+
+/**
+ * The depth an unpaired payer's splice locks at, or a throw (issue #760). The
+ * bounds are the splice engine's own, so a value accepted here is one the
+ * node will take at splice time rather than refuse after the offer was
+ * acknowledged.
+ */
+function checkedUnpairedSpliceDepth(depth: number): number {
+	if (!Number.isInteger(depth) || depth < 1 || depth > SPLICE_LOCK_DEPTH_MAX) {
+		throw new Error(
+			`unpairedSpliceDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_MAX}`
+		);
+	}
+	return depth;
+}
 
 /**
  * What a funding a previous life negotiated can still be answered with.
@@ -211,6 +232,12 @@ interface IDfSessionContext {
 	prevTxid: Buffer;
 	/** Authenticated on the lane AND in the operator's trusted set. */
 	paired: boolean;
+	/**
+	 * What the chain said about the offered coin at admission: true when it is
+	 * confirmed, false when it sits in the mempool, absent when the source
+	 * could not say. A resumed funding never carries it, and never needs to.
+	 */
+	coinConfirmed?: boolean;
 }
 
 /** A funding under way, however it got there. */
@@ -256,6 +283,10 @@ export class DirectFundingReceiver extends EventEmitter {
 			spliceFeeratePerKw:
 				config.spliceFeeratePerKw ?? DF_DEFAULT_SPLICE_FEERATE_PERKW,
 			allowSplice: config.allowSplice ?? false,
+			allowUnpairedSplice: config.allowUnpairedSplice ?? false,
+			unpairedSpliceDepth: checkedUnpairedSpliceDepth(
+				config.unpairedSpliceDepth ?? DF_DEFAULT_UNPAIRED_SPLICE_DEPTH
+			),
 			allowZeroConf: config.allowZeroConf ?? false
 		};
 		this.state = new DfOfferSessions(this.cfg.maxSessions);
@@ -430,16 +461,26 @@ export class DirectFundingReceiver extends EventEmitter {
 
 	/**
 	 * Apply an operator policy change to the fields that carry one. Only the
-	 * keys present are touched, and only the four an operator can actually set:
+	 * keys present are touched, and only the six an operator can actually set:
 	 * the caps, timeouts and sweep interval are engine constants, and a live
 	 * session that already passed a check is not re-judged against a new value.
+	 *
+	 * An out-of-range `unpairedSpliceDepth` throws before anything is applied:
+	 * the node would refuse the same value at splice time, after the offer was
+	 * accepted and the payer told so.
 	 */
 	setConfig(update: {
 		minAmountSat?: bigint;
 		maxAmountSat?: bigint;
 		allowZeroConf?: boolean;
 		allowSplice?: boolean;
+		allowUnpairedSplice?: boolean;
+		unpairedSpliceDepth?: number;
 	}): void {
+		const depth =
+			update.unpairedSpliceDepth !== undefined
+				? checkedUnpairedSpliceDepth(update.unpairedSpliceDepth)
+				: undefined;
 		if ('minAmountSat' in update) this.cfg.minAmountSat = update.minAmountSat;
 		if ('maxAmountSat' in update) this.cfg.maxAmountSat = update.maxAmountSat;
 		if (update.allowZeroConf !== undefined) {
@@ -448,6 +489,23 @@ export class DirectFundingReceiver extends EventEmitter {
 		if (update.allowSplice !== undefined) {
 			this.cfg.allowSplice = update.allowSplice;
 		}
+		if (update.allowUnpairedSplice !== undefined) {
+			this.cfg.allowUnpairedSplice = update.allowUnpairedSplice;
+		}
+		if (depth !== undefined) this.cfg.unpairedSpliceDepth = depth;
+	}
+
+	/** The splice policy as it stands, for tests and diagnostics (issue #760). */
+	splicePolicy(): {
+		allowSplice: boolean;
+		allowUnpairedSplice: boolean;
+		unpairedSpliceDepth: number;
+	} {
+		return {
+			allowSplice: this.cfg.allowSplice,
+			allowUnpairedSplice: this.cfg.allowUnpairedSplice,
+			unpairedSpliceDepth: this.cfg.unpairedSpliceDepth
+		};
 	}
 
 	/** Live and tombstoned offer records, for tests and diagnostics. */
@@ -1060,6 +1118,25 @@ export class DirectFundingReceiver extends EventEmitter {
 		// second request at the same amount carries the same id, and a hold
 		// re-taken at startup (issue #635) has no session record behind it to
 		// refuse that on.
+		// 11b. One funding into the liquidity peer at a time (issue #760). From
+		// splice_init until splice_locked the channel is SPLICING, whether the
+		// splice is still being negotiated or is signed and waiting on depth
+		// (a window that lasts blocks for a stranger's splice). Not NORMAL means
+		// `usableChannelWith` finds nothing, and this offer would fall through
+		// to a dual-funded open: exactly the second channel the splice path
+		// exists to avoid. So it declines, paired and unpaired alike, before the
+		// payer's witness leaves: the payer falls back to a plain on-chain send,
+		// which lands as a deposit and is channelized once it confirms. Keyed on
+		// the in-flight splice rather than on usability so the reason is the
+		// real one, and read here, in the synchronous block, so the answer is
+		// current when `serve` starts the funding a few lines down.
+		if (this.cfg.allowSplice && this.deps.spliceInFlightWith(lsp)) {
+			decline(
+				'a funding into the channel with the liquidity peer is still confirming; pay again once it has'
+			);
+			return;
+		}
+
 		const outpoint = outpointKey(txidHex, offer.vout);
 		const reserved = this.state.reservationFor(outpoint);
 		if (
@@ -1137,7 +1214,8 @@ export class DirectFundingReceiver extends EventEmitter {
 			session,
 			record,
 			prevTxid: prevTx.getHash(),
-			paired
+			paired,
+			...(coin.confirmed !== undefined ? { coinConfirmed: coin.confirmed } : {})
 		};
 		await this.serve(ctx, () =>
 			this.startFunding(ctx, lsp, prevTx, coin.confirmed)
@@ -1679,17 +1757,33 @@ export class DirectFundingReceiver extends EventEmitter {
 	/**
 	 * Splice the channel we already have, or open a new one.
 	 *
-	 * The splice path needs an authenticated AND paired payer: it puts a
-	 * third party's unconfirmed coin under an existing channel's funding, where
-	 * a double spend takes the whole channel with it rather than just this
-	 * payment. Rev 2 classes splice-in as an extension, so it is additionally
-	 * off unless the operator asked for it.
+	 * Rev 2 classes splice-in as an extension, so it is off unless the operator
+	 * asked for it. A paired payer then splices outright. An unpaired one
+	 * splices only when the operator allowed that too AND its coin is confirmed
+	 * (issue #760); an unconfirmed or unknown stranger coin keeps the
+	 * confirm-first open path.
+	 *
+	 * The old rule kept every stranger off the splice because its coin went
+	 * under the live funding at once: on a zero-conf channel the splice locked
+	 * at broadcast, and a double spend then took the whole channel with it.
+	 * That no longer holds. A stranger's splice locks at `unpairedSpliceDepth`
+	 * confirmations whatever the channel type, so until the chain has the
+	 * transaction nothing of ours or the peer's rides on it. What remains is
+	 * the pending-splice window: a double spent input leaves the channel
+	 * mid-splice until it is renegotiated. The conflict watch bounds that in
+	 * time and the one-funding-at-a-time rule in `admitGuarded` bounds it to
+	 * one input.
 	 */
 	private spliceTarget(
 		ctx: IDfSessionContext,
 		liquidityPeer: string
 	): Buffer | null {
-		if (!this.cfg.allowSplice || !ctx.paired) return null;
+		if (!this.cfg.allowSplice) return null;
+		if (!ctx.paired) {
+			if (!this.cfg.allowUnpairedSplice || ctx.coinConfirmed !== true) {
+				return null;
+			}
+		}
 		return this.deps.usableChannelWith(liquidityPeer);
 	}
 
@@ -1754,12 +1848,18 @@ export class DirectFundingReceiver extends EventEmitter {
 		try {
 			// Synchronous, and it pre-refuses an external input whose output type
 			// no witness we could later verify would spend. Let it do that work.
+			// A paired payer's splice locks as the channel type says; a stranger's
+			// waits for depth, so its coin is not channel state until the chain
+			// has it (issue #760).
 			result = this.deps.spliceInWithInputs(
 				channelId,
 				ctx.offer.amountSat,
 				[input],
 				ctx.offer.changeScript,
-				this.cfg.spliceFeeratePerKw
+				this.cfg.spliceFeeratePerKw,
+				{
+					lockAtDepth: ctx.paired ? undefined : this.cfg.unpairedSpliceDepth
+				}
 			);
 		} catch (err) {
 			void waiter.final.catch(() => undefined);

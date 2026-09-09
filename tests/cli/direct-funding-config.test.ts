@@ -198,6 +198,8 @@ describe('direct funding daemon surface', function () {
 			targetInboundSat: 0,
 			trusted: false,
 			allowSplice: false,
+			allowUnpairedSplice: false,
+			unpairedSpliceDepth: 3,
 			minAmountSat: 20_000
 		});
 	});
@@ -223,6 +225,8 @@ describe('direct funding daemon surface', function () {
 			targetInboundSat: 500_000,
 			trusted: true,
 			allowSplice: false,
+			allowUnpairedSplice: false,
+			unpairedSpliceDepth: 3,
 			minAmountSat: 30_000
 		});
 		const readback = await call('GET', '/direct-funding/config');
@@ -249,6 +253,73 @@ describe('direct funding daemon surface', function () {
 		expect(resultOf(off.json)).to.include({
 			lspPubkey: LSP,
 			allowSplice: false
+		});
+	});
+
+	// Issue #760: a stranger's confirmed coin may grow the home channel too,
+	// through a splice that locks at depth. The switch and the depth ride the
+	// same merge, and the restart test below checks they survive one.
+	it('configure takes allowUnpairedSplice and unpairedSpliceDepth and reads them back', async () => {
+		const on = await call('POST', '/direct-funding/configure', {
+			allowUnpairedSplice: true,
+			unpairedSpliceDepth: 6
+		});
+		expect(resultOf(on.json)).to.include({
+			lspPubkey: LSP,
+			allowSplice: false,
+			allowUnpairedSplice: true,
+			unpairedSpliceDepth: 6
+		});
+		const readback = await call('GET', '/direct-funding/config');
+		expect(resultOf(readback.json)).to.include({
+			allowUnpairedSplice: true,
+			unpairedSpliceDepth: 6
+		});
+		const depthAlone = await call('POST', '/direct-funding/configure', {
+			unpairedSpliceDepth: 2016
+		});
+		expect(resultOf(depthAlone.json)).to.include({
+			allowUnpairedSplice: true,
+			unpairedSpliceDepth: 2016
+		});
+	});
+
+	it('refuses an unpairedSpliceDepth outside 1..2016 and keeps the old one', async () => {
+		for (const bad of [0, 2017, 1.5, '6']) {
+			const { json, status } = await call('POST', '/direct-funding/configure', {
+				unpairedSpliceDepth: bad
+			});
+			expect((json.error as { code: string }).code, String(bad)).to.equal(
+				'INVALID_PARAMS'
+			);
+			expect(status, String(bad)).to.equal(400);
+		}
+		const readback = await call('GET', '/direct-funding/config');
+		expect(resultOf(readback.json).unpairedSpliceDepth).to.equal(2016);
+	});
+
+	// Any truthy JSON value used to be stored and read back through === true,
+	// so "false" switched a flag on with no way to see it in the readback.
+	it('refuses a switch that is not a boolean', async () => {
+		for (const flag of ['trusted', 'allowSplice', 'allowUnpairedSplice']) {
+			for (const bad of ['false', 1, null]) {
+				const { json, status } = await call(
+					'POST',
+					'/direct-funding/configure',
+					{ [flag]: bad }
+				);
+				const label = `${flag}=${JSON.stringify(bad)}`;
+				expect((json.error as { code: string }).code, label).to.equal(
+					'INVALID_PARAMS'
+				);
+				expect(status, label).to.equal(400);
+			}
+		}
+		const readback = await call('GET', '/direct-funding/config');
+		expect(resultOf(readback.json)).to.include({
+			trusted: true,
+			allowSplice: false,
+			allowUnpairedSplice: true
 		});
 	});
 
@@ -407,6 +478,8 @@ describe('direct funding daemon surface', function () {
 		expect(resultOf(json).lspPubkey).to.equal(LSP);
 		expect(resultOf(json).minAmountSat).to.equal(30_000);
 		expect(resultOf(json).trusted).to.equal(true);
+		expect(resultOf(json).allowUnpairedSplice).to.equal(true);
+		expect(resultOf(json).unpairedSpliceDepth).to.equal(2016);
 	});
 });
 

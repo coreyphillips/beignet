@@ -402,6 +402,8 @@ export interface IDfSpliceCall {
 	inputs: ISpliceWalletInput[];
 	changeScript: Buffer;
 	feeratePerKw: number;
+	/** The sixth argument as the engine passed it (issue #760). */
+	options?: { lockAtDepth?: number };
 }
 
 /**
@@ -478,6 +480,8 @@ export class FakeDfNode implements IDfReceiverDeps {
 	openThrows: Error | null = null;
 	lspPubkey: string | null = LSP_PUBKEY;
 	spliceChannel: Buffer | null = null;
+	/** Set to make a splice with the liquidity peer read as still in flight. */
+	spliceInFlight = false;
 	trustedPayers = new Set<string>();
 	zeroConfPeers = new Set<string>();
 	pubkeysAvailable = true;
@@ -583,6 +587,10 @@ export class FakeDfNode implements IDfReceiverDeps {
 		return this.spliceChannel;
 	}
 
+	spliceInFlightWith(): boolean {
+		return this.spliceInFlight;
+	}
+
 	fundingPubkeys(): { local: Buffer; remote: Buffer } | null {
 		if (!this.pubkeysAvailable) return null;
 		return {
@@ -625,14 +633,16 @@ export class FakeDfNode implements IDfReceiverDeps {
 		amountSats: bigint,
 		inputs: ISpliceWalletInput[],
 		changeScript: Buffer,
-		feeratePerKw: number
+		feeratePerKw: number,
+		options?: { lockAtDepth?: number }
 	): { ok: boolean; error?: string } {
 		this.splices.push({
 			channelId,
 			amountSats,
 			inputs,
 			changeScript,
-			feeratePerKw
+			feeratePerKw,
+			...(options !== undefined ? { options } : {})
 		});
 		return this.spliceError
 			? { ok: false, error: this.spliceError }
