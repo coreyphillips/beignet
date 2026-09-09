@@ -1162,6 +1162,11 @@ export interface RetryPaymentOptions {
 	maxFeeSats?: number;
 	amountSats?: number;
 	metadata?: Record<string, string>;
+	/**
+	 * Blocks above the current tip that no HTLC of the payment may expire
+	 * after (#751). Absent: no bound beyond the engine's own.
+	 */
+	cltvLimit?: number;
 }
 
 export interface RetryPaymentResult extends PaymentInfo {

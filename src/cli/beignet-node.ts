@@ -8717,12 +8717,39 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Payments ───────────────
 
+	/**
+	 * The absolute HTLC expiry ceiling a caller's `cltvLimit` means right now
+	 * (#751): the current tip plus the limit. A swap provider paying the
+	 * counterparty's invoice needs every HTLC of the payment to expire before
+	 * the on-chain refund opens, and only the engine knows the route's total
+	 * delta, so the bound has to reach it rather than be judged on the
+	 * decoded invoice. Undefined when no limit was asked for.
+	 */
+	private _cltvCeiling(cltvLimit: number | undefined): number | undefined {
+		if (cltvLimit === undefined) return undefined;
+		if (!Number.isSafeInteger(cltvLimit) || cltvLimit < 1) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'cltvLimit must be a positive integer number of blocks'
+			);
+		}
+		const height = this.node.getCurrentBlockHeight();
+		if (!(height > 0)) {
+			throw new BeignetError(
+				'CHAIN_NOT_SYNCED',
+				'cltvLimit needs the current block height, which is not known yet'
+			);
+		}
+		return height + cltvLimit;
+	}
+
 	async payInvoice(
 		bolt11: string,
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
 		amountSats?: number,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		cltvLimit?: number
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		// Decode to get paymentHash for event matching
@@ -8748,6 +8775,9 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		// Judged here, before any reservation, for the same reason as the
+		// conversions above: a refused bound must leave nothing raised.
+		const maxCltvExpiryHeight = this._cltvCeiling(cltvLimit);
 
 		if (spendAmountSats > 0) {
 			this._checkMaxPayment(spendAmountSats);
@@ -8855,7 +8885,13 @@ export class BeignetNode extends EventEmitter {
 			this.node.on('payment:failed', onFailed);
 
 			try {
-				this.node.sendPayment(bolt11, undefined, maxFeeMsat, amountMsat);
+				this.node.sendPayment(
+					bolt11,
+					undefined,
+					maxFeeMsat,
+					amountMsat,
+					maxCltvExpiryHeight
+				);
 			} catch (err: unknown) {
 				cleanup();
 				// A payment that never started holds no capacity. Without this
@@ -8873,6 +8909,10 @@ export class BeignetNode extends EventEmitter {
 						DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
 						NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
 						FEE_EXCEEDS_MAX: 'PAYMENT_FAILED',
+						// The caller's own bound (#751): its code, not a generic
+						// failure, so a swap provider can tell "no route under the
+						// refund height" from "no route at all".
+						CLTV_EXCEEDS_MAX: 'CLTV_EXCEEDS_MAX',
 						MISSING_AMOUNT: 'INVALID_PARAMS',
 						INVALID_INVOICE: 'INVALID_PARAMS',
 						INVOICE_EXPIRED: 'INVOICE_EXPIRED'
@@ -8898,7 +8938,8 @@ export class BeignetNode extends EventEmitter {
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
 		amountSats?: number,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		cltvLimit?: number
 	): Promise<PaymentInfo> {
 		try {
 			return await this.payInvoice(
@@ -8906,7 +8947,8 @@ export class BeignetNode extends EventEmitter {
 				timeoutMs,
 				maxFeeSats,
 				amountSats,
-				metadata
+				metadata,
+				cltvLimit
 			);
 		} catch (err: unknown) {
 			// Extract payment hash if possible (bolt11 itself may be invalid)
@@ -8959,7 +9001,8 @@ export class BeignetNode extends EventEmitter {
 					60_000,
 					opts.maxFeeSats,
 					opts.amountSats,
-					opts.metadata
+					opts.metadata,
+					opts.cltvLimit
 				);
 				return { ...result, attempts: attempt };
 			} catch (err: unknown) {
@@ -9065,7 +9108,8 @@ export class BeignetNode extends EventEmitter {
 		bolt11: string,
 		maxFeeSats?: number,
 		amountSats?: number,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		cltvLimit?: number
 	): { paymentHash: string; status: 'PENDING' | 'FAILED' } {
 		// Returning before the payment settles is the point of this method, not
 		// a licence to skip admission: drain mode, the per-payment limit and the
@@ -9090,6 +9134,7 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		const maxCltvExpiryHeight = this._cltvCeiling(cltvLimit);
 
 		// This attempt's own claim, opened BEFORE the send both because a later
 		// submission must not pass the daily limit on capacity this one already
@@ -9110,12 +9155,24 @@ export class BeignetNode extends EventEmitter {
 			if (metadata) {
 				this.node.setPaymentMetadata(decoded.paymentHash, metadata);
 			}
-			result = this.node.sendPayment(bolt11, undefined, maxFeeMsat, amountMsat);
+			result = this.node.sendPayment(
+				bolt11,
+				undefined,
+				maxFeeMsat,
+				amountMsat,
+				maxCltvExpiryHeight
+			);
 		} catch (err: unknown) {
 			// A payment that never started holds no capacity. Matched by
 			// identity, so a refused duplicate frees only this submission's
 			// claim and leaves the in-flight attempt's alone.
 			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
+			if (
+				err instanceof Error &&
+				(err as { code?: string }).code === 'CLTV_EXCEEDS_MAX'
+			) {
+				throw new BeignetError('CLTV_EXCEEDS_MAX', err.message);
+			}
 			throw err;
 		}
 		// Not every refusal throws. An expired invoice, a locally refused

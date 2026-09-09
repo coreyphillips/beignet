@@ -567,7 +567,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						timeoutMs: 'number?',
 						maxFeeSats: 'number?',
 						amountSats: 'number?',
-						metadata: 'Record<string,string>?'
+						metadata: 'Record<string,string>?',
+						cltvLimit: 'number?'
 					}),
 					responses: {
 						'200': {
@@ -585,7 +586,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						bolt11: 'string',
 						maxFeeSats: 'number?',
 						amountSats: 'number?',
-						metadata: 'Record<string,string>?'
+						metadata: 'Record<string,string>?',
+						cltvLimit: 'number?'
 					}),
 					responses: {
 						'200': {
@@ -612,7 +614,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						timeoutMs: 'number?',
 						maxFeeSats: 'number?',
 						amountSats: 'number?',
-						metadata: 'Record<string,string>?'
+						metadata: 'Record<string,string>?',
+						cltvLimit: 'number?'
 					}),
 					responses: {
 						'200': {
@@ -1155,7 +1158,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						backoffMs: 'number?',
 						maxFeeSats: 'number?',
 						amountSats: 'number?',
-						metadata: 'Record<string,string>?'
+						metadata: 'Record<string,string>?',
+						cltvLimit: 'number?'
 					}),
 					responses: {
 						'200': {

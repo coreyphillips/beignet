@@ -416,6 +416,8 @@ const result = await node.payInvoiceWithRetry(bolt11, {
   maxRetries: 5,
   backoffMs: 1000,     // 1s base delay
   maxFeeSats: 100,     // cap routing fees
+  cltvLimit: 144,      // optional: no HTLC may expire more than 144 blocks
+                       // above the current tip; CLTV_EXCEEDS_MAX if no route fits
 });
 
 // Monitor retries via events

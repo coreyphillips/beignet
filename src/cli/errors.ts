@@ -20,6 +20,10 @@ export enum BeignetErrorCode {
 	PAYMENT_TIMEOUT = 'PAYMENT_TIMEOUT',
 	INVOICE_EXPIRED = 'INVOICE_EXPIRED',
 	NO_ROUTE = 'NO_ROUTE',
+	/** No route fits under the caller's cltvLimit; nothing was sent (#751). */
+	CLTV_EXCEEDS_MAX = 'CLTV_EXCEEDS_MAX',
+	/** The node has no chain tip yet, so a height-relative bound cannot be set. */
+	CHAIN_NOT_SYNCED = 'CHAIN_NOT_SYNCED',
 	/** User-supplied BOLT 11 string failed to parse. */
 	INVALID_INVOICE = 'INVALID_INVOICE',
 	/** User-supplied BOLT 12 offer string failed to parse. */
@@ -120,7 +124,10 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.SPENDING_LIMIT_EXCEEDED,
 		BeignetErrorCode.SERVICE_DRAINING,
 		// A node with no funding provider will not grow one on a retry.
-		BeignetErrorCode.FUNDING_PROVIDER_REQUIRED
+		BeignetErrorCode.FUNDING_PROVIDER_REQUIRED,
+		// The caller's own CLTV bound refused every route; the same request
+		// meets the same bound.
+		BeignetErrorCode.CLTV_EXCEEDS_MAX
 	]);
 	if (permanentCodes.has(err.code)) return false;
 
@@ -137,6 +144,8 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.NO_ROUTE,
 		// The estimator's seed lands within milliseconds of construction.
 		BeignetErrorCode.FEE_ESTIMATE_NOT_READY,
+		// The tip arrives with the first header.
+		BeignetErrorCode.CHAIN_NOT_SYNCED,
 		// A splice held off by an unacknowledged abort, a peer-owned quiescence
 		// session or settling HTLCs: the same request works once that ends.
 		BeignetErrorCode.SPLICE_BUSY,
