@@ -536,7 +536,19 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'swap:refunded',
 		'swap:hold-cancelled',
 		'swap:exposed',
-		'swap:failed'
+		'swap:failed',
+		// Submarine swap provider (issue #743): the client's funding seen and
+		// confirmed, this node's payment out, the preimage learned, the claim
+		// broadcast and confirmed, or the payment failed.
+		'swap:funding-seen',
+		'swap:funding-lost',
+		'swap:paying',
+		'swap:payment-unresolved',
+		'swap:preimage',
+		'swap:claim-broadcast',
+		'swap:claim-confirmed',
+		'swap:payment-failed',
+		'swap:cancelled'
 	];
 	if (htlcEvents === true) {
 		events.push('htlc:forwarded', 'htlc:fulfilled', 'htlc:failed');

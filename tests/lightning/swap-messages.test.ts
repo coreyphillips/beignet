@@ -699,12 +699,26 @@ describe('Submarine swap messages (issue #743)', function () {
 		expect(req.direction).to.equal(SwapWireDirection.SUBMARINE);
 	});
 
-	it('computes the submarine fee like the reverse fee', function () {
+	it('computes the submarine fee like the reverse fee, plus the routing budget on the net amount', function () {
 		const terms = { flatFeeSat: 100n, feePpm: 1_000, minerFeeSat: 300n };
 		expect(submarineSwapFee(100_000n, terms)).to.equal(
 			reverseSwapFee(100_000n, terms)
 		);
 		expect(submarineSwapFee(100_000n, terms)).to.equal(500n);
+		// 5000 ppm of the 99_500 sat left: 497.5, rounded up.
+		expect(
+			submarineSwapFee(100_000n, { ...terms, routingFeePpm: 5_000 })
+		).to.equal(998n);
+		expect(submarineSwapFee(100_000n, { ...terms, routingFeePpm: 0 })).to.equal(
+			500n
+		);
+		// Nothing left after the base fee (100 + 1 + 300): no budget on top.
+		expect(submarineSwapFee(400n, { ...terms, routingFeePpm: 5_000 })).to.equal(
+			401n
+		);
+		expect(() =>
+			submarineSwapFee(100_000n, { ...terms, routingFeePpm: -1 })
+		).to.throw(/routingFeePpm/);
 	});
 
 	describe('verifySubmarineSwapTerms', function () {

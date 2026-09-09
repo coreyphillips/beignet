@@ -216,6 +216,9 @@ import {
 	SwapChainResolver,
 	ReverseSwapProvider,
 	REVERSE_SWAP_EVENTS,
+	SubmarineSwapProvider,
+	SUBMARINE_SWAP_EVENTS,
+	ISubmarineSwapStatus,
 	REVERSE_SWAP_DEFAULTS,
 	REVERSE_SWAP_DEFAULT_EXPOSURE,
 	IReverseSwapStatus
@@ -552,6 +555,7 @@ bitcoin.initEccLib(ecc);
  * - 'payment:htlc-resolved' (event: IPaymentHtlcResolvedEvent): one offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain)
  * - 'payment:preimage' (event: IPaymentPreimageEvent): the preimage of an outgoing payment became known, from update_fulfill_htlc or from an on-chain claim, whatever the record's status was
  * - 'block:processed' (height: number): the per-block work for this height has run
+ * - 'swap:*': the swap provider engines' progress (see REVERSE_SWAP_EVENTS and SUBMARINE_SWAP_EVENTS); payloads are JSON-safe
  */
 
 /**
@@ -1080,6 +1084,7 @@ export class LightningNode extends EventEmitter {
 	private swapLedger?: SwapLedger;
 	/** Reverse swap provider engine (issue #737), over the ledger above. */
 	private swapProvider?: ReverseSwapProvider;
+	private submarineSwapProvider?: SubmarineSwapProvider;
 	private swapProviderStarted = false;
 	private autoReleaseHeldForwards: boolean;
 	/**
@@ -9513,6 +9518,14 @@ export class LightningNode extends EventEmitter {
 		const max = this.resourceConfig.maxCompletedPayments;
 		let pruned = 0;
 
+		// A COMPLETED or FAILED outgoing record whose HTLC is still
+		// non-terminal (failed by a wall clock while the peer holds it) is
+		// not history yet: its outcome, and the preimage a late fulfil
+		// reveals, still belong to it (#743 audit).
+		const stillLive = (hash: string, payment: IPaymentInfo): boolean =>
+			payment.direction === PaymentDirection.OUTGOING &&
+			!this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved;
+
 		// Phase 1: Remove expired entries
 		for (const [hash, payment] of this.payments) {
 			if (
@@ -9520,7 +9533,7 @@ export class LightningNode extends EventEmitter {
 				payment.status === PaymentStatus.FAILED
 			) {
 				const age = now - (payment.completedAt || payment.createdAt);
-				if (age > ttl) {
+				if (age > ttl && !stillLive(hash, payment)) {
 					this.payments.delete(hash);
 					this.preimages.delete(hash);
 					pruned++;
@@ -9532,8 +9545,9 @@ export class LightningNode extends EventEmitter {
 		const completed: [string, IPaymentInfo][] = [];
 		for (const entry of this.payments) {
 			if (
-				entry[1].status === PaymentStatus.COMPLETED ||
-				entry[1].status === PaymentStatus.FAILED
+				(entry[1].status === PaymentStatus.COMPLETED ||
+					entry[1].status === PaymentStatus.FAILED) &&
+				!stillLive(entry[0], entry[1])
 			) {
 				completed.push(entry);
 			}
@@ -15462,7 +15476,10 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const totalMsat = invoice.amountMsat!;
 
-		// Create a single payment record
+		// Create a single payment record, journaled BEFORE any part leaves,
+		// as the single-path send does: a restart mid-flight must find the
+		// record, or the parts' outcome (and the preimage) has no owner
+		// (#743 audit).
 		const payment: IPaymentInfo = {
 			paymentHash,
 			amountMsat: totalMsat,
@@ -15471,6 +15488,16 @@ export class LightningNode extends EventEmitter {
 			createdAt: Date.now()
 		};
 		this.payments.set(hashHex, payment);
+		{
+			const paymentMutation = this.paymentMutation(paymentHash);
+			if (paymentMutation) {
+				this.commitMutations(
+					'persist mpp payment',
+					[paymentMutation],
+					RecoveryCriticality.SafetyCritical
+				);
+			}
+		}
 
 		// Store retry context. Seed it with the exclusions this attempt was
 		// routed under so a retry keeps avoiding those SCIDs and the failure
@@ -16994,6 +17021,31 @@ export class LightningNode extends EventEmitter {
 				.update(keysendPreimage)
 				.digest();
 			if (!expectedHash.equals(paymentHash)) {
+				const reason = sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
+			// A keysend on a hash this node is PAYING (an outgoing record, a
+			// retry context, or an offered HTLC for it) would overwrite the
+			// outgoing record and hide our own payment's outcome: the payee
+			// of a submarine swap could then be paid twice while the swap is
+			// recorded failed (#743 audit). Refuse it like an unknown hash.
+			const outgoing = this.payments.get(hashHex);
+			if (
+				(outgoing && outgoing.direction === PaymentDirection.OUTGOING) ||
+				this.paymentRetryContexts.has(hashHex) ||
+				this.getOutgoingHtlcs(paymentHash).htlcs.length > 0
+			) {
+				this.emitStructuredLog('payment', 'keysend_hash_in_use', {
+					paymentHash: hashHex
+				});
 				const reason = sharedSecret
 					? createFailureMessage(
 							sharedSecret,
@@ -20282,12 +20334,21 @@ export class LightningNode extends EventEmitter {
 				status: payment.status
 			});
 		}
-		if (payment && payment.direction === PaymentDirection.OUTGOING) {
-			// Every fulfilled part reports, not only the one that flipped the
-			// record: a resolution watcher counts HTLCs, not records.
-			this.emitHtlcResolved(paymentHash, channelId, htlcId, 'fulfilled');
-			this.emitPaymentPreimage(paymentHash, preimage, 'htlc');
+		// Every fulfilled part reports, not only the one that flipped the
+		// record, and whether or not a record exists: past the forward check
+		// above this is an HTLC this node offered, and a resolution watcher
+		// counts HTLCs, not records. A missing or overwritten record (not
+		// journaled before a restart, pruned, replaced by an incoming
+		// keysend on the same hash) must not silence the preimage (#743
+		// audit).
+		if (!payment || payment.direction !== PaymentDirection.OUTGOING) {
+			this.emitStructuredLog('payment', 'fulfilled_without_record', {
+				paymentHash: hashHex,
+				recordDirection: payment?.direction ?? null
+			});
 		}
+		this.emitHtlcResolved(paymentHash, channelId, htlcId, 'fulfilled');
+		this.emitPaymentPreimage(paymentHash, preimage, 'htlc');
 	}
 
 	/** 'payment:htlc-resolved' for one offered HTLC of an outgoing payment. */
@@ -22257,16 +22318,36 @@ export class LightningNode extends EventEmitter {
 		return this.swapProvider;
 	}
 
-	listSwaps(): ISwapRecord[] {
-		return this.swapProvider?.list() ?? this.swapLedger?.list() ?? [];
+	/** The submarine (on-chain to Lightning) engine, when enabled (#743). */
+	getSubmarineSwapProvider(): SubmarineSwapProvider | undefined {
+		return this.submarineSwapProvider;
 	}
 
-	getSwapStatus(): IReverseSwapStatus | { enabled: false } {
-		return this.swapProvider?.status() ?? { enabled: false };
+	listSwaps(): ISwapRecord[] {
+		return this.swapLedger?.list() ?? [];
+	}
+
+	getSwapStatus():
+		| (IReverseSwapStatus & {
+				submarine: ISubmarineSwapStatus | { enabled: false };
+		  })
+		| { enabled: false } {
+		if (!this.swapProvider) return { enabled: false };
+		return {
+			...this.swapProvider.status(),
+			submarine: this.submarineSwapProvider?.status() ?? { enabled: false }
+		};
 	}
 
 	cancelSwap(swapIdHex: string): { ok: boolean; reason?: string } {
 		if (!this.swapProvider) return { ok: false, reason: 'swaps disabled' };
+		const record = this.swapLedger?.get(swapIdHex);
+		if (record?.direction === 'submarine') {
+			if (!this.submarineSwapProvider) {
+				return { ok: false, reason: 'submarine swaps disabled' };
+			}
+			return this.submarineSwapProvider.cancel(swapIdHex);
+		}
 		return this.swapProvider.cancel(swapIdHex);
 	}
 
@@ -22279,10 +22360,12 @@ export class LightningNode extends EventEmitter {
 		if (!this.swapProvider || this.swapProviderStarted) return;
 		this.swapProviderStarted = true;
 		await this.swapProvider.start();
+		await this.submarineSwapProvider?.start();
 	}
 
 	stopSwapProvider(): void {
 		this.swapProvider?.stop();
+		this.submarineSwapProvider?.stop();
 	}
 
 	private wireSwapProvider(config: ISwapNodeConfig): void {
@@ -22319,27 +22402,51 @@ export class LightningNode extends EventEmitter {
 				: this.network === Network.SIGNET
 				? 'signet'
 				: 'testnet';
+		const peers = {
+			nodeIdHex: () => this.getNodeId(),
+			sendCustomMessage: (
+				peer: string,
+				subtype: number,
+				payload: Buffer
+			): void => this.emitCustomMessage(peer, subtype, payload),
+			onCustomMessage: (
+				cb: (msg: {
+					peerPubkey: string;
+					version: number;
+					subtype: number;
+					payload: Buffer;
+				}) => void
+			): (() => void) => {
+				const handler = (msg: {
+					peerPubkey: string;
+					version: number;
+					subtype: number;
+					payload: Buffer;
+				}): void => cb(msg);
+				this.on('custom-message', handler);
+				return () => this.removeListener('custom-message', handler);
+			},
+			isPeerConnected: (peerHex: string) =>
+				this.listPeers().some((p) => p.pubkey === peerHex),
+			connectPeer: (peerHex: string, host: string, port: number) =>
+				this.connectPeer(peerHex, host, port)
+		};
+		const estimateFee = async (
+			targetBlocks: number
+		): Promise<number | null> => {
+			if (!this.feeEstimator) return null;
+			const raw = await this.feeEstimator.estimateFee(targetBlocks);
+			return raw > 0 ? this.clampEstimatedFeeRate(raw) : null;
+		};
+		const broadcast = async (txHex: string): Promise<string> => {
+			const fp = this.fundingProvider;
+			if (fp) return fp.broadcastTransaction(txHex);
+			return resolverSource.broadcastTransaction(txHex);
+		};
+		const submarineEnabled = config.submarine?.enabled === true;
 		const provider = new ReverseSwapProvider(
 			{
-				peers: {
-					nodeIdHex: () => this.getNodeId(),
-					sendCustomMessage: (peer, subtype, payload): void =>
-						this.emitCustomMessage(peer, subtype, payload),
-					onCustomMessage: (cb): (() => void) => {
-						const handler = (msg: {
-							peerPubkey: string;
-							version: number;
-							subtype: number;
-							payload: Buffer;
-						}): void => cb(msg);
-						this.on('custom-message', handler);
-						return () => this.removeListener('custom-message', handler);
-					},
-					isPeerConnected: (peerHex) =>
-						this.listPeers().some((p) => p.pubkey === peerHex),
-					connectPeer: (peerHex, host, port) =>
-						this.connectPeer(peerHex, host, port)
-				},
+				peers,
 				ledger: this.swapLedger,
 				resolver,
 				createHoldInvoice: (options) => ({
@@ -22384,11 +22491,7 @@ export class LightningNode extends EventEmitter {
 						vout: built.outputIndex
 					};
 				},
-				broadcast: async (txHex) => {
-					const fp = this.fundingProvider;
-					if (fp) return fp.broadcastTransaction(txHex);
-					return resolverSource.broadcastTransaction(txHex);
-				},
+				broadcast,
 				pledge: (txHex) =>
 					this.fundingProvider?.pledgeTransactionInputs?.(txHex),
 				releasePledges: (txHex) => {
@@ -22402,11 +22505,7 @@ export class LightningNode extends EventEmitter {
 						}))
 					);
 				},
-				estimateFee: async (targetBlocks) => {
-					if (!this.feeEstimator) return null;
-					const raw = await this.feeEstimator.estimateFee(targetBlocks);
-					return raw > 0 ? this.clampEstimatedFeeRate(raw) : null;
-				},
+				estimateFee,
 				currentHeight: () => this.currentBlockHeight,
 				deriveRefundKey: (swapId) =>
 					deriveSwapKey(this.nodePrivkey, swapId, 'refund'),
@@ -22433,13 +22532,94 @@ export class LightningNode extends EventEmitter {
 				holdCancelSafetyBlocks: Math.max(
 					HELD_HTLC_EXPIRY_MARGIN,
 					this.htlcSafetyMargin
-				)
+				),
+				// With a submarine engine on the same peer seam, direction 2
+				// requests are its to answer.
+				answerSubmarineRequests: !submarineEnabled
 			}
 		);
 		for (const evt of REVERSE_SWAP_EVENTS) {
 			provider.on(evt, (data) => this.emit(evt, data));
 		}
 		this.swapProvider = provider;
+		if (!submarineEnabled) return;
+
+		// The submarine direction (issue #743): the client funds, this node
+		// pays its invoice under the absolute expiry ceiling the payment
+		// engine enforces, and claims the coins with the preimage.
+		const { enabled: _enabled, ...submarineConfig } = config.submarine ?? {};
+		const submarine = new SubmarineSwapProvider(
+			{
+				peers,
+				ledger: this.swapLedger,
+				resolver,
+				payInvoice: (bolt11, options) =>
+					this.sendPaymentWithOptions(bolt11, {
+						maxCltvExpiryHeight: options.maxCltvExpiryHeight,
+						maxFeeMsat: options.maxFeeMsat
+					}),
+				outgoingHtlcs: (paymentHash) => this.getOutgoingHtlcs(paymentHash),
+				onPaymentEvent: (cb): (() => void) => {
+					const byHash = (e: { paymentHash: Buffer }): void => {
+						if (Buffer.isBuffer(e?.paymentHash)) cb(e.paymentHash);
+					};
+					const names = [
+						'payment:preimage',
+						'payment:sent',
+						'payment:failed',
+						'payment:htlc-resolved'
+					] as const;
+					for (const name of names) this.on(name, byHash);
+					return () => {
+						for (const name of names) this.removeListener(name, byHash);
+					};
+				},
+				hashInUse: (paymentHash) => this.paymentHashInUse(paymentHash),
+				spendableOutboundMsat: () =>
+					this.channelManager
+						.listChannels()
+						.filter((ch) => ch.acceptsNewHtlcs())
+						.reduce((sum, ch) => sum + ch.getSpendableOutboundMsat(), 0n),
+				ownNodeId: Buffer.from(this.getNodeId(), 'hex'),
+				hasUsableChannelWith: (nodeId) =>
+					this.channelManager
+						.getChannelsByPeer(nodeId.toString('hex'))
+						.some((ch) => ch.acceptsNewHtlcs()),
+				broadcast,
+				estimateFee,
+				currentHeight: () => this.currentBlockHeight,
+				deriveClaimKey: (swapId) =>
+					deriveSwapKey(this.nodePrivkey, swapId, 'claim'),
+				claimDestinationScript: () => this.getSweepDestinationScript(),
+				network: this.getBitcoinNetwork(),
+				networkName,
+				log: (action, data) => this.emitStructuredLog('chain', action, data)
+			},
+			{
+				...(config.fee?.flatFeeSat !== undefined
+					? { flatFeeSat: config.fee.flatFeeSat }
+					: {}),
+				...(config.fee?.feePpm !== undefined
+					? { feePpm: config.fee.feePpm }
+					: {}),
+				exposure: {
+					...REVERSE_SWAP_DEFAULT_EXPOSURE,
+					...(config.exposure ?? {})
+				},
+				...confirmations,
+				...(config.timeouts?.maxFeeRateSatPerVbyte !== undefined
+					? { maxFeeRateSatPerVbyte: config.timeouts.maxFeeRateSatPerVbyte }
+					: {}),
+				...(config.timeouts?.maxCreatedPerPeer !== undefined
+					? { maxCreatedPerPeer: config.timeouts.maxCreatedPerPeer }
+					: {}),
+				...submarineConfig
+			}
+		);
+		for (const evt of SUBMARINE_SWAP_EVENTS) {
+			submarine.on(evt, (data) => this.emit(evt, data));
+		}
+		this.submarineSwapProvider = submarine;
 	}
 
 	/** A channel with this peer a splice could ride, or null. */
@@ -22613,8 +22793,12 @@ export class LightningNode extends EventEmitter {
 		// sweep hostage.
 		if (this.swapProvider) {
 			const provider = this.swapProvider;
+			const submarine = this.submarineSwapProvider;
 			void Promise.race([
-				provider.onBlock(blockHeight).catch(() => undefined),
+				Promise.all([
+					provider.onBlock(blockHeight).catch(() => undefined),
+					submarine?.onBlock(blockHeight).catch(() => undefined)
+				]),
 				new Promise<void>((resolve) => {
 					const t = setTimeout(resolve, SWAP_TICK_SWEEP_DEADLINE_MS);
 					t.unref?.();
@@ -24819,7 +25003,15 @@ export class LightningNode extends EventEmitter {
 				view.cltvExpiry
 			);
 		}
-		const preimage = status !== null ? this.preimages.get(hashHex) : undefined;
+		// The preimage belongs in the view whenever this node offered an HTLC
+		// for the hash, record or no record: a record can be missing (not
+		// journaled before a restart, pruned) or overwritten by an incoming
+		// keysend on the same hash, and a watcher that judges by the view
+		// would otherwise call a paid payment failed (#743 audit).
+		const preimage =
+			status !== null || htlcs.length > 0
+				? this.preimages.get(hashHex)
+				: undefined;
 		return {
 			paymentHash,
 			status,

@@ -23,16 +23,23 @@ import {
 	LnCoinType
 } from '../../../src/lightning/keys/wallet-keys';
 import { BeignetCustomSubtype } from '../../../src/lightning/message/custom';
-import { INodeConfig } from '../../../src/lightning/node/types';
+import { INodeConfig, PaymentStatus } from '../../../src/lightning/node/types';
 import { computeScriptHash } from '../../../src/lightning/chain/chain-watcher';
 import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
 import {
 	ISwapChainSource,
 	ISwapCreateAck,
+	ISwapSubmarineCreateAck,
 	SwapWireDirection,
 	buildSwapClaimTx,
+	buildSwapRefundTx,
 	decodeSwapCreateAck,
-	encodeSwapCreate
+	decodeSwapSubmarineCreateAck,
+	encodeSwapCreate,
+	encodeSwapSubmarineCreate,
+	submarineSwapFee,
+	SUBMARINE_SWAP_DEFAULTS,
+	verifySubmarineSwapTerms
 } from '../../../src/lightning/swaps';
 
 interface ICoreTx {
@@ -518,4 +525,426 @@ export async function runReverseSwapRefundPath(
 		scene.provider.getSweepDestinationScript().toString('hex')
 	);
 	return { swapIdHex };
+}
+
+// ─────────────── Submarine direction (issue #743) ───────────────
+
+/**
+ * Margins sized for LND's 80-block final CLTV: the fit needs
+ * fundingConfirmations + route budget + 80 + 3 + claim + resolution margins
+ * under the refund delta.
+ */
+export const SUBMARINE_TIMEOUTS = {
+	refundDeltaBlocks: 160,
+	minRefundDeltaBlocks: 100,
+	maxRefundDeltaBlocks: 300,
+	claimSafetyBlocks: 6,
+	resolutionSafetyBlocks: 6,
+	routeCltvBudgetBlocks: 6,
+	claimBumpIntervalBlocks: 2,
+	minInvoiceExpirySeconds: 30
+};
+
+export const SUBMARINE_PROVIDER_CONFIG: INodeConfig['swaps'] = {
+	...SWAP_PROVIDER_CONFIG,
+	submarine: { enabled: true, ...SUBMARINE_TIMEOUTS }
+};
+
+/**
+ * Open a channel FROM a beignet node TO a peer through the node's bitcoind
+ * funding provider, so the node has outbound liquidity (the submarine
+ * provider pays). `peerSeesChannel` waits until the remote lists it usable.
+ */
+export async function openBeignetFundedChannelTo(
+	node: LightningNode,
+	peerPubkey: string,
+	host: string,
+	port: number,
+	amountSat: bigint,
+	peerSeesChannel: () => Promise<unknown>
+): Promise<Buffer> {
+	await node.connectPeer(peerPubkey, host, port);
+	await new Promise((r) => setTimeout(r, 2_000));
+	node.openChannel(peerPubkey, amountSat);
+	const manager = node.getChannelManager();
+	const deadline = Date.now() + 30_000;
+	let funded = manager.listChannels().find((c) => c.getChannelId() !== null);
+	while (!funded && Date.now() < deadline) {
+		await new Promise((r) => setTimeout(r, 500));
+		funded = manager.listChannels().find((c) => c.getChannelId() !== null);
+	}
+	if (!funded)
+		throw new Error('no funded channel after the beignet-funded open');
+	const channelId = funded.getChannelId()!;
+	await mineBlocks(6);
+	await new Promise((r) => setTimeout(r, 3_000));
+	node.handleFundingConfirmed(channelId);
+	await peerSeesChannel();
+	const normalDeadline = Date.now() + 30_000;
+	while (Date.now() < normalDeadline) {
+		const ch = manager.getChannel(channelId);
+		if (ch && ch.getState() === 'NORMAL') break;
+		await new Promise((r) => setTimeout(r, 500));
+	}
+	return channelId;
+}
+
+/** What the invoicing (client) Lightning node must offer the scenarios. */
+export interface ISubmarineInvoicer {
+	/**
+	 * Mint an invoice for the amount. A `failable` one can later be failed
+	 * while unpaid (LND: a hold invoice on a hash the test knows; CLN: a
+	 * regular invoice deleted by label), so the provider's payment fails
+	 * back with no preimage.
+	 */
+	createInvoice(
+		amountMsat: bigint,
+		options?: { failable?: boolean }
+	): Promise<{ bolt11: string; paymentHashHex: string; handle: string }>;
+	failUnpaid(handle: string, paymentHashHex: string): Promise<void>;
+	/** 'open' | 'accepted' | 'settled' | 'cancelled' | 'unknown' */
+	invoiceState(paymentHashHex: string): Promise<string>;
+	newAddress(): Promise<string>;
+}
+
+export interface ISubmarineScene {
+	provider: LightningNode;
+	client: LightningNode;
+	chain: CoreSwapChainSource;
+	invoicer: ISubmarineInvoicer;
+}
+
+async function subTick(scene: ISubmarineScene): Promise<number> {
+	const tip = await scene.chain.refresh();
+	scene.provider.handleNewBlock(tip);
+	scene.client.handleNewBlock(tip);
+	await scene.provider.getSubmarineSwapProvider()!.onBlock(tip);
+	return tip;
+}
+
+export async function mineAndTickSubmarine(
+	scene: ISubmarineScene,
+	blocks: number
+): Promise<number> {
+	await mineBlocks(blocks);
+	await new Promise((r) => setTimeout(r, 1_000));
+	return subTick(scene);
+}
+
+/** Send SWAP_SUBMARINE_CREATE from the client node and await the provider's ack. */
+export async function createSubmarineSwapOverTcp(
+	client: LightningNode,
+	providerId: string,
+	params: {
+		paymentHash: Buffer;
+		refundPubkey: Buffer;
+		bolt11: string;
+		onchainAmountSat: bigint;
+		maxTotalFeeSat?: bigint;
+	}
+): Promise<ISwapSubmarineCreateAck> {
+	const requestId = crypto.randomBytes(8);
+	const ack = new Promise<ISwapSubmarineCreateAck>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error('no swap ack')), 15_000);
+		const handler = (m: {
+			peerPubkey: string;
+			subtype: number;
+			payload: Buffer;
+		}): void => {
+			if (
+				m.peerPubkey !== providerId ||
+				m.subtype !== BeignetCustomSubtype.SWAP_SUBMARINE_CREATE_ACK
+			)
+				return;
+			const decoded = decodeSwapSubmarineCreateAck(m.payload);
+			if (!decoded.requestId.equals(requestId)) return;
+			clearTimeout(timer);
+			client.removeListener('custom-message', handler);
+			resolve(decoded);
+		};
+		client.on('custom-message', handler);
+	});
+	client.sendCustomMessage(
+		providerId,
+		BeignetCustomSubtype.SWAP_SUBMARINE_CREATE,
+		encodeSwapSubmarineCreate({
+			requestId,
+			direction: SwapWireDirection.SUBMARINE,
+			paymentHash: params.paymentHash,
+			refundPubkey: params.refundPubkey,
+			bolt11: params.bolt11,
+			onchainAmountSat: params.onchainAmountSat,
+			maxTotalFeeSat: params.maxTotalFeeSat ?? 20_000n
+		})
+	);
+	return ack;
+}
+
+/** Pay the contract address from Core's wallet; the txid in display order. */
+export async function fundContractFromCore(
+	address: string,
+	amountSat: bigint
+): Promise<string> {
+	const btc = (Number(amountSat) / 1e8).toFixed(8);
+	return (await bitcoinRpc('sendtoaddress', [address, btc])) as string;
+}
+
+/**
+ * The provider's fee for the scenarios' config at 2 sat/vB (150 vB claim),
+ * with the default routing budget (5000 ppm) charged on the net amount.
+ */
+export function submarineFeeFor(amountSat: bigint): bigint {
+	return submarineSwapFee(amountSat, {
+		flatFeeSat: 100n,
+		feePpm: 1_000,
+		minerFeeSat: 300n,
+		routingFeePpm: SUBMARINE_SWAP_DEFAULTS.paymentMaxFeePpm
+	});
+}
+
+/**
+ * The client mints an invoice and funds the contract, the provider pays the
+ * invoice over its channel to the client's node, learns the preimage from
+ * the settle, claims to its sweep destination and confirms the claim.
+ */
+export async function runSubmarineSwapHappyPath(
+	scene: ISubmarineScene,
+	amountSat = 100_000n
+): Promise<{ claimTxid: string; swapIdHex: string }> {
+	const providerId = scene.provider.getNodeId();
+	const tip = await subTick(scene);
+	// Leave a little more than the floor so a fee estimate wobble cannot refuse.
+	const feeSat = submarineFeeFor(amountSat) + 100n;
+	const invoice = await scene.invoicer.createInvoice(
+		(amountSat - feeSat) * 1000n
+	);
+	const paymentHash = Buffer.from(invoice.paymentHashHex, 'hex');
+	const refundKey = crypto.randomBytes(32);
+	const ack = await createSubmarineSwapOverTcp(scene.client, providerId, {
+		paymentHash,
+		refundPubkey: getPublicKey(refundKey),
+		bolt11: invoice.bolt11,
+		onchainAmountSat: amountSat
+	});
+	expect(ack.accepted, ack.reasonText).to.equal(true);
+	const terms = ack.terms!;
+	const swapIdHex = terms.swapId.toString('hex');
+	expect(terms.refundHeight).to.equal(
+		tip + SUBMARINE_TIMEOUTS.refundDeltaBlocks
+	);
+	expect(terms.totalFeeSat).to.equal(feeSat);
+	const verdict = verifySubmarineSwapTerms({
+		create: {
+			requestId: ack.requestId,
+			direction: SwapWireDirection.SUBMARINE,
+			paymentHash,
+			refundPubkey: getPublicKey(refundKey),
+			bolt11: invoice.bolt11,
+			onchainAmountSat: amountSat,
+			maxTotalFeeSat: 20_000n
+		},
+		ack,
+		currentHeight: tip,
+		network: Network.REGTEST,
+		minRefundDelta: 50,
+		maxRefundDelta: 400,
+		maxTotalFeeSat: 20_000n
+	});
+	expect(verdict.ok, verdict.ok ? '' : verdict.reason).to.equal(true);
+	scene.chain.watch(terms.outputScript, tip);
+
+	const fundingTxid = await fundContractFromCore(terms.address, amountSat);
+	await subTick(scene);
+	await waitForSwapState(scene.provider, swapIdHex, ['FUNDING_SEEN'], 30_000);
+	expect(
+		scene.provider.listSwaps().find((r) => r.id === swapIdHex)!.fundingTxid
+	).to.equal(fundingTxid);
+	expect(await scene.invoicer.invoiceState(invoice.paymentHashHex)).to.equal(
+		'open'
+	);
+
+	// Confirmed: the provider pays, the client's node settles at once, the
+	// preimage arrives through payment:preimage, the claim goes out.
+	await mineAndTickSubmarine(scene, 1);
+	await waitForSwapState(
+		scene.provider,
+		swapIdHex,
+		['CLAIM_BROADCAST', 'CLAIM_CONFIRMED'],
+		90_000
+	);
+	const claimed = scene.provider.listSwaps().find((r) => r.id === swapIdHex)!;
+	expect(claimed.preimageHex).to.be.a('string');
+	expect(claimed.paymentMaxCltvExpiryHeight).to.equal(
+		terms.refundHeight -
+			SUBMARINE_TIMEOUTS.claimSafetyBlocks -
+			SUBMARINE_TIMEOUTS.resolutionSafetyBlocks
+	);
+	await until(
+		'invoice settled',
+		async () =>
+			(await scene.invoicer.invoiceState(invoice.paymentHashHex)) === 'settled'
+	);
+	const payment = scene.provider.getPayment(paymentHash)!;
+	expect(payment.preimage!.toString('hex')).to.equal(claimed.preimageHex);
+	const claimTxid = claimed.claimTxid!;
+	const inMempool = (await bitcoinRpc('getrawtransaction', [
+		claimTxid,
+		true
+	])) as { vout: Array<{ scriptPubKey: { hex: string } }> };
+	expect(inMempool.vout[0].scriptPubKey.hex).to.equal(
+		scene.provider.getSweepDestinationScript().toString('hex')
+	);
+
+	await mineAndTickSubmarine(scene, 1);
+	await mineAndTickSubmarine(scene, 1);
+	await waitForSwapState(
+		scene.provider,
+		swapIdHex,
+		['CLAIM_CONFIRMED'],
+		30_000
+	);
+	const confirmed = (await bitcoinRpc('getrawtransaction', [
+		claimTxid,
+		true
+	])) as { confirmations?: number };
+	expect(confirmed.confirmations ?? 0).to.be.at.least(2);
+	return { claimTxid, swapIdHex };
+}
+
+/**
+ * The client's node fails the payment back (a hold invoice cancelled, or an
+ * invoice deleted): every HTLC terminal, no preimage, the swap ends
+ * PAYMENT_FAILED with no claim; after the refund height the client refunds
+ * itself and the provider never pays again.
+ */
+export async function runSubmarineSwapRefundPath(
+	scene: ISubmarineScene,
+	amountSat = 80_000n
+): Promise<{ swapIdHex: string; refundTxid: string }> {
+	const providerId = scene.provider.getNodeId();
+	const tip = await subTick(scene);
+	const feeSat = submarineFeeFor(amountSat) + 100n;
+	const invoice = await scene.invoicer.createInvoice(
+		(amountSat - feeSat) * 1000n,
+		{ failable: true }
+	);
+	const paymentHash = Buffer.from(invoice.paymentHashHex, 'hex');
+	const refundKey = crypto.randomBytes(32);
+	const ack = await createSubmarineSwapOverTcp(scene.client, providerId, {
+		paymentHash,
+		refundPubkey: getPublicKey(refundKey),
+		bolt11: invoice.bolt11,
+		onchainAmountSat: amountSat
+	});
+	expect(ack.accepted, ack.reasonText).to.equal(true);
+	const terms = ack.terms!;
+	const swapIdHex = terms.swapId.toString('hex');
+	scene.chain.watch(terms.outputScript, tip);
+	const fundingTxid = await fundContractFromCore(terms.address, amountSat);
+	await subTick(scene);
+	await waitForSwapState(scene.provider, swapIdHex, ['FUNDING_SEEN'], 30_000);
+
+	// The payee will not settle: fail it while unpaid, before or as the
+	// provider pays. A hold invoice parks first, so the failure may land
+	// after PAYING; a deleted invoice fails the HTLC on arrival.
+	await mineAndTickSubmarine(scene, 1);
+	await waitForSwapState(
+		scene.provider,
+		swapIdHex,
+		['PAYING', 'PAYMENT_UNRESOLVED', 'PAYMENT_FAILED'],
+		60_000
+	);
+	await scene.invoicer.failUnpaid(invoice.handle, invoice.paymentHashHex);
+	try {
+		await waitForSwapState(
+			scene.provider,
+			swapIdHex,
+			['PAYMENT_FAILED'],
+			90_000
+		);
+	} catch (err) {
+		const view = scene.provider.getOutgoingHtlcs(paymentHash);
+		const payment = scene.provider.getPayment(paymentHash);
+		// eslint-disable-next-line no-console
+		console.log(
+			'    [diag] outgoing view',
+			JSON.stringify({
+				status: view.status,
+				resolved: view.resolved,
+				latest: view.latestOutstandingExpiry,
+				htlcs: view.htlcs.map((h) => ({
+					id: h.htlcId.toString(),
+					state: h.state,
+					terminal: h.terminal,
+					expiry: h.cltvExpiry
+				})),
+				payment: payment
+					? {
+							status: payment.status,
+							failureReason: payment.failureReason,
+							retryCount: payment.retryCount
+					  }
+					: null,
+				invoice: await scene.invoicer.invoiceState(invoice.paymentHashHex),
+				row: scene.provider.listSwaps().find((r) => r.id === swapIdHex)?.state
+			})
+		);
+		throw err;
+	}
+	const failed = scene.provider.listSwaps().find((r) => r.id === swapIdHex)!;
+	expect(failed.claimTxHex).to.equal(undefined);
+	expect(failed.preimageHex).to.equal(undefined);
+	const view = scene.provider.getOutgoingHtlcs(paymentHash);
+	expect(view.resolved).to.equal(true);
+	expect(view.preimage).to.equal(undefined);
+
+	// To the refund height, in steps: the row stays terminal, nothing claims.
+	let height = await scene.chain.refresh();
+	while (height < terms.refundHeight) {
+		height = await mineAndTickSubmarine(
+			scene,
+			Math.min(20, terms.refundHeight - height)
+		);
+		expect(
+			scene.provider.listSwaps().find((r) => r.id === swapIdHex)!.state
+		).to.equal('PAYMENT_FAILED');
+	}
+	const raw = (await bitcoinRpc('getrawtransaction', [fundingTxid])) as string;
+	const fundingTx = bitcoin.Transaction.fromHex(raw);
+	const vout = fundingTx.outs.findIndex((o) =>
+		o.script.equals(terms.outputScript)
+	);
+	expect(vout).to.be.at.least(0);
+	const refund = buildSwapRefundTx({
+		htlc: {
+			paymentHash,
+			claimPublicKey: terms.claimPubkey,
+			refundPublicKey: getPublicKey(refundKey),
+			refundHeight: terms.refundHeight
+		},
+		fundingTransaction: fundingTx,
+		outputIndex: vout,
+		destinationScript: p2wpkhScript(await scene.invoicer.newAddress()),
+		feeSatoshis: 500n,
+		privateKey: refundKey
+	});
+	// nLockTime = refundHeight: valid in the block after it.
+	await mineAndTickSubmarine(scene, 1);
+	const refundTxid = (await bitcoinRpc('sendrawtransaction', [
+		refund.toHex()
+	])) as string;
+	expect(refundTxid).to.equal(refund.getId());
+	await mineAndTickSubmarine(scene, 1);
+	const confirmed = (await bitcoinRpc('getrawtransaction', [
+		refundTxid,
+		true
+	])) as { confirmations?: number };
+	expect(confirmed.confirmations ?? 0).to.be.at.least(1);
+	expect(
+		scene.provider.listSwaps().find((r) => r.id === swapIdHex)!.state
+	).to.equal('PAYMENT_FAILED');
+	expect(scene.provider.getPayment(paymentHash)!.status).to.not.equal(
+		PaymentStatus.COMPLETED
+	);
+	return { swapIdHex, refundTxid };
 }

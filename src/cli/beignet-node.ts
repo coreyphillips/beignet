@@ -357,6 +357,17 @@ export interface BeignetNodeOptions {
 		refundDeltaBlocks?: number;
 		fundingConfs?: number;
 		resolutionConfs?: number;
+		/**
+		 * The submarine direction (issue #743): a peer locks coins in a
+		 * contract, this node pays the peer's invoice and claims them. On
+		 * only with submarine === true (and the role enabled); the fee terms
+		 * and caps above apply to both directions.
+		 */
+		submarine?: boolean;
+		claimSafetyBlocks?: number;
+		paymentMaxFeePpm?: number;
+		claimBumpIntervalBlocks?: number;
+		submarineRefundDeltaBlocks?: number;
 	};
 	/**
 	 * Relay direct-funding frames for OTHER nodes (BEIGNET_DF_RELAY, issue
@@ -2340,6 +2351,31 @@ export class BeignetNode extends EventEmitter {
 											refundDeltaBlocks: opts.swaps.refundDeltaBlocks
 										}
 								  }
+								: {}),
+							...(opts.swaps.submarine === true
+								? {
+										submarine: {
+											enabled: true,
+											...(opts.swaps.claimSafetyBlocks !== undefined
+												? { claimSafetyBlocks: opts.swaps.claimSafetyBlocks }
+												: {}),
+											...(opts.swaps.paymentMaxFeePpm !== undefined
+												? { paymentMaxFeePpm: opts.swaps.paymentMaxFeePpm }
+												: {}),
+											...(opts.swaps.claimBumpIntervalBlocks !== undefined
+												? {
+														claimBumpIntervalBlocks:
+															opts.swaps.claimBumpIntervalBlocks
+												  }
+												: {}),
+											...(opts.swaps.submarineRefundDeltaBlocks !== undefined
+												? {
+														refundDeltaBlocks:
+															opts.swaps.submarineRefundDeltaBlocks
+												  }
+												: {})
+										}
+								  }
 								: {})
 					  }
 					: undefined,
@@ -2787,9 +2823,9 @@ export class BeignetNode extends EventEmitter {
 			'ffor:witness-released',
 			'ffor:issuer-provisioned',
 			'ffor:issuer-issued',
-			// Reverse swap provider (issue #737). LightningNode re-emits the
-			// engine's events; without this relay the daemon's SSE and webhook
-			// lists promised them and never delivered one.
+			// Swap provider engines (issues #737 and #743). LightningNode
+			// re-emits both engines' events; without this relay the daemon's
+			// SSE and webhook lists promise them and never deliver one.
 			'swap:created',
 			'swap:held',
 			'swap:funding',
@@ -2800,7 +2836,16 @@ export class BeignetNode extends EventEmitter {
 			'swap:refunded',
 			'swap:hold-cancelled',
 			'swap:exposed',
-			'swap:failed'
+			'swap:failed',
+			'swap:funding-seen',
+			'swap:funding-lost',
+			'swap:paying',
+			'swap:payment-unresolved',
+			'swap:preimage',
+			'swap:claim-broadcast',
+			'swap:claim-confirmed',
+			'swap:payment-failed',
+			'swap:cancelled'
 		] as const) {
 			this.node.on(evt, (data: unknown) => {
 				this.emit(evt, jsonSafeEvent(data) as never);
@@ -7629,7 +7674,28 @@ export class BeignetNode extends EventEmitter {
 			timeouts: status.timeouts,
 			counts: status.counts,
 			exposedSat: Number(status.exposedSat),
-			exposedCount: status.exposedCount
+			exposedCount: status.exposedCount,
+			submarine: status.submarine.enabled
+				? {
+						enabled: true,
+						fee: {
+							flatFeeSat: Number(status.submarine.fee.flatFeeSat),
+							feePpm: status.submarine.fee.feePpm
+						},
+						limits: {
+							minSwapSat: Number(status.submarine.limits.minSwapSat),
+							maxSwapSat: Number(status.submarine.limits.maxSwapSat),
+							maxTotalExposureSat: Number(
+								status.submarine.limits.maxTotalExposureSat
+							),
+							maxConcurrentSwaps: status.submarine.limits.maxConcurrentSwaps
+						},
+						timeouts: status.submarine.timeouts,
+						counts: status.submarine.counts,
+						exposedSat: Number(status.submarine.exposedSat),
+						exposedCount: status.submarine.exposedCount
+				  }
+				: { enabled: false }
 		};
 	}
 

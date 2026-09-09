@@ -43,19 +43,34 @@ export function reverseSwapFee(
 	return terms.flatFeeSat + proportional + terms.minerFeeSat;
 }
 
-export type ISubmarineSwapFeeTerms = IReverseSwapFeeTerms;
+export interface ISubmarineSwapFeeTerms extends IReverseSwapFeeTerms {
+	/**
+	 * The routing fee the provider may spend paying the invoice, per
+	 * million of the amount it pays. It is charged on the net amount and
+	 * added to the fee, so a payee cannot author route-hint fees that turn
+	 * the swap into a loss for the provider (#743 audit).
+	 */
+	routingFeePpm?: number;
+}
 
 /**
  * The provider's total fee for a submarine swap of `amountSat` locked on
- * chain (issue #743): the same arithmetic as the reverse direction, with the
- * miner fee paying for the provider's claim instead of its funding. The
- * client is paid `amountSat - fee` over Lightning.
+ * chain (issue #743): flat + ppm + the claim miner fee, plus the routing
+ * budget on what is left. The client is paid `amountSat - fee` over
+ * Lightning.
  */
 export function submarineSwapFee(
 	amountSat: bigint,
 	terms: ISubmarineSwapFeeTerms
 ): bigint {
-	return reverseSwapFee(amountSat, terms);
+	const base = reverseSwapFee(amountSat, terms);
+	const ppm = terms.routingFeePpm ?? 0;
+	if (!Number.isSafeInteger(ppm) || ppm < 0) {
+		throw new Error('routingFeePpm must be a non-negative integer');
+	}
+	if (ppm === 0 || amountSat <= base) return base;
+	const routing = ((amountSat - base) * BigInt(ppm) + 999_999n) / 1_000_000n;
+	return base + routing;
 }
 
 export interface IReverseSwapTermsCheck {

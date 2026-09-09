@@ -285,15 +285,137 @@ HELD only); env `BEIGNET_SWAPS`, `BEIGNET_SWAP_FLAT_FEE_SAT`,
 `swap:refund-broadcast`, `swap:refunded`, `swap:hold-cancelled`,
 `swap:exposed`, `swap:failed`.
 
+## Submarine swap provider (on-chain to Lightning, issue #743)
+
+`SubmarineSwapProvider` (`submarine-engine.ts`) serves the other direction:
+the client locks coins in a contract whose preimage branch is this node's,
+this node pays the client's own invoice under an absolute expiry ceiling, and
+the preimage that payment reveals claims the coins. It runs beside the
+reverse engine on the same peer seam and the same ledger when
+`INodeConfig.swaps.submarine.enabled` is set (daemon:
+`BEIGNET_SWAP_SUBMARINE=true`, which needs `BEIGNET_SWAPS=true`); the fee
+terms, exposure caps and confirmation policy are shared, the margins are the
+direction's own. The reverse engine stops answering direction 2 quotes and
+submarine rows the moment the submarine engine exists, so one request gets
+one answer.
+
+Wire: a quote (48/49) with `direction` 2, `SWAP_SUBMARINE_CREATE` (54) and
+`SWAP_SUBMARINE_CREATE_ACK` (55), status (52/53) with the submarine states.
+The client mints its invoice for `onchainAmountSat - fee` BEFORE the create,
+so the provider derives the fee from the invoice (a whole number of sats)
+and accepts it when it covers `submarineSwapFee` at the current claim fee
+rate, with the routing budget (`paymentMaxFeePpm` of the net amount) charged
+on top so a payee cannot author route-hint fees that make the swap a loss,
+and stays under the client's `maxTotalFeeSat`; the ack echoes what was
+accepted. `verifySubmarineSwapTerms` (`client.ts`) is the client's pure check:
+the contract rebuilt from its refund key and the provider's claim key must
+match the ack's script and address, its invoice must carry the hash, network
+and acked amount, and the fee and refund window must be within policy.
+
+Admission, at create and again at dispatch: the invoice decodes for this
+network with the request's hash, an amount and a payment secret; it is not
+payable to this node (payee, a route hint through this node with no channel
+to the payee, or a blinded path this node introduces: the local-origin
+payment path does not enter the JIT interception, so that composition is
+refused as `SELF_PAYMENT`); it stays valid for `minInvoiceExpirySeconds`;
+the hash is new to the node; outbound capacity covers the invoice; the
+exposure caps admit the amount. The ceiling is `C = refundHeight -
+claimSafetyBlocks - resolutionSafetyBlocks` and the fit is `height +
+fundingConfirmations + routeCltvBudgetBlocks + min_final_cltv_expiry + 3 <=
+C` (`CLTV_UNFITTABLE` otherwise, FAILED when it stops holding before the
+payment goes out); `validateSubmarineSwapAdmission` is run on the same
+numbers.
+
+Lifecycle, every arrow a compare-and-swap on the ledger row, persisted BEFORE
+the action it licenses:
+
+```text
+CREATED       terms verified, row inserted with the invoice and the ceiling
+FUNDING_SEEN  an output paying the contract, of at least the amount, seen at
+              any depth (underpaid outputs are logged and ignored, overpayment
+              is swept by the claim); re-pointed while unconfirmed if a
+              replacement appears, FUNDING_LOST when none is left
+FUNDED        confirmed to fundingConfirmations and unspent
+PAYING        the row moved, with the ceiling, the fee cap and the attempt
+              count, THEN sendPaymentWithOptions(maxCltvExpiryHeight: C);
+              the observation is the last await before the CAS, so a cancel
+              or a spend landing meanwhile fails the CAS instead of racing it
+PAYMENT_UNRESOLVED  HTLCs out past unresolvedAfterBlocks; informational
+PREIMAGE_KNOWN the node's HTLC view carries the preimage (a fulfil, or a claim
+              seen on chain downstream), recorded write-once
+CLAIM_BROADCAST claim built to the sweep destination, its bytes and the attempt
+              marker persisted, then broadcast; rebuilt at a higher fee every
+              claimBumpIntervalBlocks while unconfirmed (BIP 125 floor against
+              our own previous claim, and against a client refund seen in the
+              mempool, on both the absolute-fee and the fee-rate rule; a
+              refund with other inputs has an unknown fee and is outbid with
+              the whole output), capped at maxFeeRateSatPerVbyte until the
+              deadline window, where the clamp lifts, every rebuild at least
+              doubles the previous bid, and the last block before the refund
+              height bids the whole output above dust
+CLAIM_CONFIRMED the claim at resolutionConfirmations
+PAYMENT_FAILED every HTLC terminal without a preimage (the node's view, never
+              a wall clock, a FAILED record or a thrown call); a preimage
+              learned later still promotes the row and the claim is pursued
+EXPOSED       a payment is out while the contract is not claimable: the funding
+              vanished, or a foreign spend confirmed; the payment keeps being
+              read (a failure with nothing paid ends in PAYMENT_FAILED, a
+              returned funding is claimed) and a confirmed refund with the
+              preimage known is logged as a realised loss and stops counting
+              as exposure once verified at policy depth
+CANCELLED / FAILED before anything was paid: the invoice expired, the ceiling
+              stopped fitting, the client spent the funding, or the operator
+              cancelled (allowed until PAYING)
+```
+
+What the payment call proves: after `sendPaymentWithOptions` returns or
+throws, the engine reads `getOutgoingHtlcs`. A preimage promotes the row;
+no record and no HTLC means the dispatch left nothing behind and the attempt
+is final; a resolved view without a preimage is a failed payment; anything
+else is a payment in flight, whatever the record's status. On restart a
+PAYING row whose node holds no record and no HTLC is dispatched again after
+the same checks, bounded by `maxPaymentDispatchAttempts`; a row with a record
+is left to the view.
+
+Status answers name the claim only once a broadcast was attempted, and
+only to the peer that created the swap; the reverse engine answers unknown
+ids and its own rows, the submarine engine its own.
+
+Residual risks an operator accepts: a fee spike inside the deadline window
+that the whole output cannot outbid; a reorg deeper than
+`resolutionConfirmations` after CLAIM_CONFIRMED; a client that holds the
+payment until the ceiling, settles, and refunds at once leaves exactly
+`claimSafetyBlocks + resolutionSafetyBlocks` blocks for the claim; a hash
+the node already holds (a failed earlier payment among them) cannot be swapped
+again, the client needs a new invoice.
+
+Daemon: `GET /swaps/status` reports the direction under `submarine`,
+`GET /swaps` rows carry `direction`, `POST /swaps/cancel` cancels a submarine
+row before PAYING; env `BEIGNET_SWAP_SUBMARINE`,
+`BEIGNET_SWAP_CLAIM_SAFETY_BLOCKS`, `BEIGNET_SWAP_PAYMENT_MAX_FEE_PPM`,
+`BEIGNET_SWAP_CLAIM_BUMP_INTERVAL_BLOCKS`,
+`BEIGNET_SWAP_SUBMARINE_REFUND_DELTA_BLOCKS`; events `swap:created`,
+`swap:funding-seen`, `swap:funded`, `swap:funding-lost`, `swap:paying`,
+`swap:payment-unresolved`, `swap:preimage`, `swap:claim-broadcast`,
+`swap:claim-confirmed`, `swap:payment-failed`, `swap:exposed`,
+`swap:cancelled`, `swap:failed`, every payload carrying `direction`.
+
+Tests: `tests/lightning/swap-submarine-engine.test.ts` (the engine over
+fakes, including the restart matrix and the shared peer seam),
+`tests/lightning/swap-submarine-node.test.ts` (two real nodes, the real
+payment engine under the real ceiling, hold invoices for the parked and
+failed cases), and the regtest suites
+`tests/lightning/interop/swap-submarine-{lnd,cln}.test.ts`
+(`REQUIRE_SWAP_REGTEST=1`).
+
 ## Remaining work
 
 Issue 737 remains open for:
 
-- The submarine direction (on-chain to Lightning): the engine over the
-  outgoing expiry ceiling and `awaitPaymentResolution`, funding discovery
-  through the resolver's candidates, and the local-origin JIT dispatch
-  (paying the provider's own client's JIT invoice does not invoke the
-  forwarded HTLC interception path automatically).
+- Same-node JIT composition: paying the provider's own JIT client's invoice
+  does not invoke the forwarded HTLC interception path, so a submarine
+  create whose invoice routes through this node with no channel to the
+  payee is refused rather than served.
 - Design Taproot separately. A key-path witness does not reveal the preimage;
   cooperative claims require a preimage exchange and signing protocol with nonce
   handling and recovery. This P2WSH implementation does not implement that

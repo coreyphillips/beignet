@@ -4,7 +4,7 @@ A pure-TypeScript Lightning Network implementation covering BOLTs 1-5 and 7-12, 
 
 This is the protocol layer. For the higher-level, satoshi-denominated API (`BeignetNode`), the HTTP daemon, and the project's current limitations, see the [root README](../../README.md).
 
-The [swaps module](swaps/README.md) provides P2WSH contracts, signed claim/refund transactions, direction-specific admission checks, the durable swap ledger and chain resolver, the swap wire protocol, and the reverse swap provider engine (Lightning to on-chain) through `beignet/lightning`'s `swaps` namespace. The submarine direction remains tracked in issue 737.
+The [swaps module](swaps/README.md) provides P2WSH contracts, signed claim/refund transactions, direction-specific admission checks, the durable swap ledger and chain resolver, the swap wire protocol, and the reverse swap provider engine (Lightning to on-chain) through `beignet/lightning`'s `swaps` namespace. Both swap directions are served: the reverse provider (Lightning to on-chain) and the submarine provider (on-chain to Lightning, issue 743), each opt-in.
 
 **Contents:** [Overview](#overview) · [Architecture](#architecture) · [Import paths](#import-paths) · [Quick start](#quick-start) · [Usage guide](#usage-guide) · [Events](#events-reference) · [Errors](#typed-payment-errors) · [Module reference](#module-reference) · [Testing](#testing) · [BOLT coverage](#bolt-specification-coverage)
 

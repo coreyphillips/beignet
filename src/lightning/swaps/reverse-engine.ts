@@ -62,10 +62,17 @@ import {
 } from './chain-resolver';
 import {
 	ISwapExposurePolicy,
-	SwapExposureRefusal,
 	evaluateSwapExposure,
 	validateSwapExposurePolicy
 } from './exposure';
+import {
+	SWAP_DUST_FLOOR_SAT,
+	exposureRefusal,
+	htlcOfRecord as htlcOf,
+	nativeSegwitProblem,
+	swapWireResolution as wireResolution,
+	swapWireState as wireState
+} from './engine-common';
 import {
 	ISwapCreate,
 	ISwapCreateAck,
@@ -77,7 +84,6 @@ import {
 	SwapMessageError,
 	SwapRefusalReason,
 	SwapWireDirection,
-	SwapWireResolutionKind,
 	SwapWireState,
 	decodeSwapCreate,
 	decodeSwapQuoteRequest,
@@ -89,6 +95,13 @@ import {
 import { reverseSwapFee } from './client';
 
 export interface IReverseSwapProviderConfig {
+	/**
+	 * Answer submarine (direction 2) quotes and creates with
+	 * UNSUPPORTED_DIRECTION. The node sets this false when a submarine
+	 * engine shares the peer seam (issue #743), so the two never answer the
+	 * same request.
+	 */
+	answerSubmarineRequests: boolean;
 	flatFeeSat: bigint;
 	feePpm: number;
 	exposure: ISwapExposurePolicy;
@@ -120,6 +133,7 @@ export const REVERSE_SWAP_DEFAULTS: Omit<
 	IReverseSwapProviderConfig,
 	'exposure' | 'holdCancelSafetyBlocks'
 > = {
+	answerSubmarineRequests: true,
 	flatFeeSat: 0n,
 	feePpm: 0,
 	refundDeltaBlocks: 144,
@@ -255,77 +269,9 @@ const WATCHED_STATES: readonly SwapState[] = [
 	'CLAIMED',
 	'EXPOSED'
 ];
-const DUST_FLOOR_SAT = 330n;
+const DUST_FLOOR_SAT = SWAP_DUST_FLOOR_SAT;
 /** Padding past the admission inequality so any pay height satisfies it. */
 const HOLD_CLTV_PADDING = 8;
-
-function exposureRefusal(reason: SwapExposureRefusal): SwapRefusalReason {
-	switch (reason) {
-		case 'below-min':
-			return SwapRefusalReason.AMOUNT_BELOW_MIN;
-		case 'above-max':
-			return SwapRefusalReason.AMOUNT_ABOVE_MAX;
-		case 'exposure':
-		case 'concurrency':
-			return SwapRefusalReason.EXPOSURE_EXCEEDED;
-		case 'fee-rate':
-			return SwapRefusalReason.CHAIN_UNAVAILABLE;
-		case 'insufficient-balance':
-			return SwapRefusalReason.INSUFFICIENT_FUNDS;
-	}
-}
-
-function wireState(state: SwapState): SwapWireState {
-	switch (state) {
-		case 'CREATED':
-			return SwapWireState.CREATED;
-		case 'HELD':
-			return SwapWireState.HELD;
-		case 'FUNDING':
-		case 'FUNDING_BROADCAST':
-			return SwapWireState.FUNDING;
-		case 'FUNDED':
-			return SwapWireState.FUNDED;
-		case 'CLAIMED':
-			return SwapWireState.CLAIMED;
-		case 'SETTLED':
-			return SwapWireState.SETTLED;
-		case 'REFUND_PENDING':
-			return SwapWireState.REFUND_PENDING;
-		case 'REFUNDED':
-			return SwapWireState.REFUNDED;
-		case 'EXPOSED':
-			return SwapWireState.EXPOSED;
-		case 'CANCELLED':
-			return SwapWireState.CANCELLED;
-		case 'FAILED':
-			return SwapWireState.FAILED;
-		default:
-			return SwapWireState.UNKNOWN;
-	}
-}
-
-function wireResolution(
-	kind: ISwapResolutionRecord['kind']
-): SwapWireResolutionKind {
-	switch (kind) {
-		case 'claim':
-			return SwapWireResolutionKind.CLAIM;
-		case 'refund':
-			return SwapWireResolutionKind.REFUND;
-		default:
-			return SwapWireResolutionKind.UNKNOWN;
-	}
-}
-
-function htlcOf(record: ISwapRecord): ISwapHtlc {
-	return {
-		paymentHash: Buffer.from(record.paymentHashHex, 'hex'),
-		claimPublicKey: Buffer.from(record.claimPubkeyHex, 'hex'),
-		refundPublicKey: Buffer.from(record.refundPubkeyHex, 'hex'),
-		refundHeight: record.refundHeight
-	};
-}
 
 export class ReverseSwapProvider extends EventEmitter {
 	readonly config: IReverseSwapProviderConfig;
@@ -414,11 +360,14 @@ export class ReverseSwapProvider extends EventEmitter {
 
 	status(): IReverseSwapStatus {
 		const counts: Record<string, number> = {};
-		for (const r of this.deps.ledger.list()) {
+		const rows = this.deps.ledger
+			.list()
+			.filter((r) => r.direction === 'reverse');
+		for (const r of rows) {
 			counts[r.state] = (counts[r.state] ?? 0) + 1;
 		}
 		const summary = SwapLedger.exposure(
-			this.deps.ledger.list(),
+			rows,
 			this.config.resolutionConfirmations
 		);
 		return {
@@ -597,6 +546,8 @@ export class ReverseSwapProvider extends EventEmitter {
 			);
 		};
 		if (req.direction !== SwapWireDirection.REVERSE) {
+			// Another engine answers this direction when configured so.
+			if (!this.config.answerSubmarineRequests) return;
 			return refuse(
 				SwapRefusalReason.UNSUPPORTED_DIRECTION,
 				'only reverse swaps'
@@ -661,14 +612,18 @@ export class ReverseSwapProvider extends EventEmitter {
 				})
 			);
 		};
-		if (this.stopped)
-			return refuse(SwapRefusalReason.DISABLED, 'provider stopped');
 		if (req.direction !== SwapWireDirection.REVERSE) {
+			// SWAP_CREATE (50) is the reverse create; a submarine client uses
+			// SWAP_SUBMARINE_CREATE (54). Refused here whichever engine runs,
+			// unless the submarine engine owns the direction entirely.
+			if (!this.config.answerSubmarineRequests) return;
 			return refuse(
 				SwapRefusalReason.UNSUPPORTED_DIRECTION,
 				'only reverse swaps'
 			);
 		}
+		if (this.stopped)
+			return refuse(SwapRefusalReason.DISABLED, 'provider stopped');
 		const height = this.deps.currentHeight();
 		if (!(height > 0))
 			return refuse(SwapRefusalReason.CHAIN_UNAVAILABLE, 'height unknown');
@@ -867,6 +822,11 @@ export class ReverseSwapProvider extends EventEmitter {
 			state: SwapWireState.UNKNOWN,
 			currentHeight: height
 		};
+		if (record && record.direction !== 'reverse') {
+			// The submarine engine answers its own rows (issue #743); two
+			// answers to one request would be a malformed conversation.
+			return;
+		}
 		if (record && record.peerNodeIdHex === peer) {
 			// Bytes travel only once a broadcast was attempted: signed bytes
 			// that never left (a refused first broadcast, a FUNDING row) are
@@ -1211,13 +1171,7 @@ export class ReverseSwapProvider extends EventEmitter {
 				err instanceof Error ? err.message : String(err)
 			}`;
 		}
-		const native =
-			Buffer.isBuffer(script) &&
-			((script.length === 22 && script[0] === 0x00 && script[1] === 20) ||
-				(script.length === 34 &&
-					(script[0] === 0x00 || script[0] === 0x51) &&
-					script[1] === 32));
-		if (!native) {
+		if (nativeSegwitProblem(script)) {
 			this.deps.log('swap_refund_destination_unusable', {
 				script: Buffer.isBuffer(script) ? script.toString('hex') : 'none'
 			});

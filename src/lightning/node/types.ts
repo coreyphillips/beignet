@@ -1255,6 +1255,26 @@ export interface ISwapNodeConfig {
 		maxCreatedPerPeer?: number;
 	};
 	/**
+	 * The submarine direction (on-chain to Lightning, issue #743): off by
+	 * default. The fee terms, exposure caps and confirmation policy above
+	 * apply to both directions; these are the direction's own margins.
+	 */
+	submarine?: {
+		enabled?: boolean;
+		refundDeltaBlocks?: number;
+		minRefundDeltaBlocks?: number;
+		maxRefundDeltaBlocks?: number;
+		/** Blocks between the last outgoing HTLC expiry and the refund height. */
+		claimSafetyBlocks?: number;
+		resolutionSafetyBlocks?: number;
+		/** Route headroom reserved at admission above the invoice's final CLTV. */
+		routeCltvBudgetBlocks?: number;
+		/** Routing fee this node spends, per million of the invoice. */
+		paymentMaxFeePpm?: number;
+		claimBumpIntervalBlocks?: number;
+		minInvoiceExpirySeconds?: number;
+	};
+	/**
 	 * A chain view for the provider that wins over the node's chain backend.
 	 * A test seam: interop nodes have no chain watcher, and a test hands the
 	 * engine a Bitcoin Core backed source instead.

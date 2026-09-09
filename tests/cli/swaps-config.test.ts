@@ -28,7 +28,12 @@ const VARS = [
 	'BEIGNET_SWAP_MAX_CONCURRENT',
 	'BEIGNET_SWAP_REFUND_DELTA_BLOCKS',
 	'BEIGNET_SWAP_FUNDING_CONFS',
-	'BEIGNET_SWAP_RESOLUTION_CONFS'
+	'BEIGNET_SWAP_RESOLUTION_CONFS',
+	'BEIGNET_SWAP_SUBMARINE',
+	'BEIGNET_SWAP_CLAIM_SAFETY_BLOCKS',
+	'BEIGNET_SWAP_PAYMENT_MAX_FEE_PPM',
+	'BEIGNET_SWAP_CLAIM_BUMP_INTERVAL_BLOCKS',
+	'BEIGNET_SWAP_SUBMARINE_REFUND_DELTA_BLOCKS'
 ];
 
 describe('resolveConfig swaps (issue #737)', () => {
@@ -63,6 +68,30 @@ describe('resolveConfig swaps (issue #737)', () => {
 			fundingConfs: 2,
 			resolutionConfs: 6
 		});
+	});
+
+	it('resolves the submarine direction and its margins from the environment (issue #743)', () => {
+		process.env.BEIGNET_SWAPS = 'true';
+		process.env.BEIGNET_SWAP_SUBMARINE = 'true';
+		process.env.BEIGNET_SWAP_CLAIM_SAFETY_BLOCKS = '36';
+		process.env.BEIGNET_SWAP_PAYMENT_MAX_FEE_PPM = '2500';
+		process.env.BEIGNET_SWAP_CLAIM_BUMP_INTERVAL_BLOCKS = '3';
+		process.env.BEIGNET_SWAP_SUBMARINE_REFUND_DELTA_BLOCKS = '320';
+		expect(resolveConfig({}).swaps).to.deep.equal({
+			enabled: true,
+			submarine: true,
+			claimSafetyBlocks: 36,
+			paymentMaxFeePpm: 2500,
+			claimBumpIntervalBlocks: 3,
+			submarineRefundDeltaBlocks: 320
+		});
+		// Only an exact true; the flag merges over the env like the rest.
+		process.env.BEIGNET_SWAP_SUBMARINE = 'yes';
+		expect(resolveConfig({}).swaps!.submarine).to.equal(undefined);
+		process.env.BEIGNET_SWAP_SUBMARINE = 'true';
+		expect(
+			resolveConfig({ swaps: { submarine: false } }).swaps!.submarine
+		).to.equal(false);
 	});
 
 	it('only an exact true switches the role on; anything else is not on', () => {
@@ -106,6 +135,23 @@ describe('swap daemon surface (issue #737)', () => {
 			'swap:hold-cancelled',
 			'swap:exposed',
 			'swap:failed'
+		]) {
+			expect(events, evt).to.include(evt);
+		}
+	});
+
+	it('relays every submarine swap event too (issue #743)', () => {
+		const events = getRelayedEvents();
+		for (const evt of [
+			'swap:funding-seen',
+			'swap:funding-lost',
+			'swap:paying',
+			'swap:payment-unresolved',
+			'swap:preimage',
+			'swap:claim-broadcast',
+			'swap:claim-confirmed',
+			'swap:payment-failed',
+			'swap:cancelled'
 		]) {
 			expect(events, evt).to.include(evt);
 		}
@@ -155,5 +201,37 @@ describe('swap daemon surface (issue #737)', () => {
 		expect(spec.paths['/swaps/cancel'].post.tags).to.deep.equal(['Swaps']);
 		expect(spec.components.schemas.SwapsStatus).to.be.an('object');
 		expect(spec.components.schemas.SwapRecord).to.be.an('object');
+		const swapsStatus = spec.components.schemas.SwapsStatus as {
+			properties: Record<string, { properties?: Record<string, unknown> }>;
+		};
+		expect(swapsStatus.properties.submarine).to.be.an('object');
+		expect(swapsStatus.properties.submarine.properties).to.have.property(
+			'timeouts'
+		);
+		const events = spec.paths['/events'].get as unknown as { summary: string };
+		for (const evt of [
+			'swap:paying',
+			'swap:claim-confirmed',
+			'swap:cancelled'
+		]) {
+			expect(events.summary, evt).to.include(evt);
+		}
+	});
+
+	it('translates the submarine flag into the node config only when the role is on (issue #743)', () => {
+		const src = fs.readFileSync(
+			path.join(__dirname, '../../src/cli/beignet-node.ts'),
+			'utf8'
+		);
+		// The submarine block rides inside the swaps block, which exists
+		// only for enabled === true, and is itself gated on submarine === true.
+		const start = src.indexOf('opts.swaps?.enabled === true');
+		const block = src.slice(start, src.indexOf('jitReceiveClient:', start));
+		expect(block).to.match(/opts\.swaps\.submarine === true/);
+		expect(block).to.match(/submarine: \{\s*enabled: true/);
+		expect(block).to.include('claimSafetyBlocks');
+		expect(block).to.include('paymentMaxFeePpm');
+		expect(block).to.include('claimBumpIntervalBlocks');
+		expect(block).to.include('submarineRefundDeltaBlocks');
 	});
 });
