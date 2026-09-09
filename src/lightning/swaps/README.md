@@ -197,6 +197,7 @@ even types required, odd optional):
 | `SWAP_QUOTE_REQUEST` / `SWAP_QUOTE` | direction, amount; fee terms, limits, refund delta, confirmations, the fee on this amount and the invoice amount. Stateless. |
 | `SWAP_CREATE` / `SWAP_CREATE_ACK` | the client's payment hash, claim key, on-chain amount and fee ceiling; the swap id, hold invoice, refund key and height, contract script and address, and every amount. A refusal carries a typed reason. |
 | `SWAP_STATUS_REQUEST` / `SWAP_STATUS` | the provider's view of one swap, answered only to the peer that created it: state, funding outpoint and depth, the raw funding transaction, the winning resolution. |
+| `SWAP_SUBMARINE_CREATE` (54) / `SWAP_SUBMARINE_CREATE_ACK` (55) | the submarine direction (issue #743): the client's payment hash, refund key, its own invoice for the on-chain amount minus the fee, the on-chain amount and fee ceiling; the swap id, the provider's claim key, refund height, contract script and address, every amount, the depth the funding must reach before the provider pays, the deadline for funding and, informationally, the absolute expiry ceiling the provider's payment is bound by. Quote and status carry `direction`; `SwapWireState` gained the submarine states 12 to 19. |
 
 The client receives exactly `onchainAmountSat`; the invoice is that plus
 `totalFeeSat` (flat + ppm + the quoted funding miner fee). The swap id is

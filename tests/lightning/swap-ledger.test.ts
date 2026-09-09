@@ -186,7 +186,9 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			expect(swapSourcesFor('reverse', 'CREATED')).to.deep.equal([]);
 			expect(
 				swapSourcesFor('submarine', 'PREIMAGE_KNOWN').sort()
-			).to.deep.equal(['PAYING', 'PAYMENT_UNRESOLVED'].sort());
+			).to.deep.equal(
+				['PAYING', 'PAYMENT_UNRESOLVED', 'PAYMENT_FAILED'].sort()
+			);
 		});
 
 		it('follows the submarine lifecycle including a funding reorg', function () {
@@ -206,6 +208,91 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 				expect(ledger.move(id, to).outcome, to).to.equal('applied');
 			}
 			expect(ledger.move(id, 'PAYMENT_FAILED').outcome).to.equal('stale');
+		});
+
+		it('follows the submarine arrows added for the engine (issue #743)', function () {
+			// Cancel and fail before anything is paid.
+			for (const [path, end] of [
+				[['FUNDING_SEEN', 'FUNDED', 'CANCELLED'], 'CANCELLED'],
+				[['FUNDING_SEEN', 'FAILED'], 'FAILED'],
+				[['FUNDING_SEEN', 'FUNDED', 'FAILED'], 'FAILED'],
+				[['FUNDING_SEEN', 'FUNDING_LOST', 'CANCELLED'], 'CANCELLED']
+			] as const) {
+				const ledger = ledgerOn();
+				const id = ledger.insert(input({ direction: 'submarine' })).record!.id;
+				for (const to of path) {
+					expect(
+						ledger.move(id, to).outcome,
+						`${path.join('>')} at ${to}`
+					).to.equal('applied');
+				}
+				expect(ledger.get(id)!.state).to.equal(end);
+			}
+			// A payment out while the contract is gone: EXPOSED from every
+			// paying state, and out of it once the funding returns or the
+			// payment fails.
+			for (const from of [
+				'PAYING',
+				'PAYMENT_UNRESOLVED',
+				'PREIMAGE_KNOWN',
+				'CLAIM_BROADCAST'
+			] as const) {
+				expect(swapSourcesFor('submarine', 'EXPOSED'), from).to.include(from);
+			}
+			expect(
+				swapSourcesFor('submarine', 'CLAIM_BROADCAST').sort()
+			).to.deep.equal(['EXPOSED', 'PREIMAGE_KNOWN'].sort());
+			const ledger = ledgerOn();
+			const id = ledger.insert(input({ direction: 'submarine' })).record!.id;
+			for (const to of [
+				'FUNDING_SEEN',
+				'FUNDED',
+				'PAYING',
+				'EXPOSED',
+				'PAYMENT_FAILED'
+			] as const) {
+				expect(ledger.move(id, to).outcome, to).to.equal('applied');
+			}
+			// EXPOSED is never terminal.
+			expect(isTerminalSwapState('EXPOSED')).to.equal(false);
+			// FUNDED may not jump to EXPOSED or CLAIM_BROADCAST.
+			const other = ledger.insert(input({ direction: 'submarine' })).record!.id;
+			ledger.move(other, 'FUNDING_SEEN');
+			ledger.move(other, 'FUNDED');
+			expect(ledger.move(other, 'EXPOSED').outcome).to.equal('stale');
+			expect(ledger.move(other, 'CLAIM_BROADCAST').outcome).to.equal('stale');
+		});
+
+		it('promotes a PAYMENT_FAILED row on a late preimage, the preimage riding the move', function () {
+			const ledger = ledgerOn();
+			const id = ledger.insert(input({ direction: 'submarine' })).record!.id;
+			for (const to of [
+				'FUNDING_SEEN',
+				'FUNDED',
+				'PAYING',
+				'PAYMENT_FAILED'
+			] as const) {
+				ledger.move(id, to);
+			}
+			expect(isTerminalSwapState(ledger.get(id)!.state)).to.equal(true);
+			expect(ledger.unresolved().map((r) => r.id)).to.not.include(id);
+			// recordPreimage refuses a terminal row; the move carries it.
+			const pre = 'cc'.repeat(32);
+			expect(ledger.recordPreimage(id, pre, 'lightning').outcome).to.equal(
+				'stale'
+			);
+			const moved = ledger.move(id, 'PREIMAGE_KNOWN', {
+				preimageHex: pre,
+				preimageSource: 'onchain-claim'
+			});
+			expect(moved.outcome).to.equal('applied');
+			expect(moved.record!.preimageHex).to.equal(pre);
+			expect(moved.record!.preimageSource).to.equal('onchain-claim');
+			expect(ledger.unresolved().map((r) => r.id)).to.include(id);
+			expect(ledger.move(id, 'CLAIM_BROADCAST').outcome).to.equal('applied');
+			// Still write once afterwards.
+			ledger.patch(id, { preimageHex: 'dd'.repeat(32) });
+			expect(ledger.get(id)!.preimageHex).to.equal(pre);
 		});
 
 		it('inserting an existing id is stale, never an overwrite', function () {
