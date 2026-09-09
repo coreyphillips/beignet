@@ -327,6 +327,8 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// The caller's own fee ceiling, a recovery answer that needs a reachable
 	// quorum, and a resource with nothing recorded yet: none is a node fault.
 	FEE_EXCEEDS_MAX: 409,
+	CLTV_EXCEEDS_MAX: 409,
+	CHAIN_NOT_SYNCED: 503,
 	RECOVERY_UNAVAILABLE: 503,
 	NO_DATA: 404,
 	// Direct funding (issue #613). The dashboard's decoder validates nothing
@@ -1871,13 +1873,15 @@ async function bootDaemon(
 			return success(node.decodeInvoice(bolt11));
 		},
 		'POST /invoice/pay': async (body) => {
-			const { bolt11, timeoutMs, maxFeeSats, amountSats, metadata } = body as {
-				bolt11: string;
-				timeoutMs?: number;
-				maxFeeSats?: number;
-				amountSats?: number;
-				metadata?: Record<string, string>;
-			};
+			const { bolt11, timeoutMs, maxFeeSats, amountSats, metadata, cltvLimit } =
+				body as {
+					bolt11: string;
+					timeoutMs?: number;
+					maxFeeSats?: number;
+					amountSats?: number;
+					metadata?: Record<string, string>;
+					cltvLimit?: number;
+				};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(
 				await node.payInvoice(
@@ -1885,21 +1889,29 @@ async function bootDaemon(
 					timeoutMs,
 					maxFeeSats,
 					amountSats,
-					metadata
+					metadata,
+					cltvLimit
 				)
 			);
 		},
 		'POST /invoice/pay-async': (body) => {
-			const { bolt11, maxFeeSats, amountSats, metadata } = body as {
+			const { bolt11, maxFeeSats, amountSats, metadata, cltvLimit } = body as {
 				bolt11: string;
 				maxFeeSats?: number;
 				amountSats?: number;
 				metadata?: Record<string, string>;
+				cltvLimit?: number;
 			};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			try {
 				return success(
-					node.sendPaymentAsync(bolt11, maxFeeSats, amountSats, metadata)
+					node.sendPaymentAsync(
+						bolt11,
+						maxFeeSats,
+						amountSats,
+						metadata,
+						cltvLimit
+					)
 				);
 			} catch (err: unknown) {
 				const msg = err instanceof Error ? err.message : String(err);
@@ -1912,13 +1924,15 @@ async function bootDaemon(
 			}
 		},
 		'POST /invoice/pay-safe': async (body) => {
-			const { bolt11, timeoutMs, maxFeeSats, amountSats, metadata } = body as {
-				bolt11: string;
-				timeoutMs?: number;
-				maxFeeSats?: number;
-				amountSats?: number;
-				metadata?: Record<string, string>;
-			};
+			const { bolt11, timeoutMs, maxFeeSats, amountSats, metadata, cltvLimit } =
+				body as {
+					bolt11: string;
+					timeoutMs?: number;
+					maxFeeSats?: number;
+					amountSats?: number;
+					metadata?: Record<string, string>;
+					cltvLimit?: number;
+				};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(
 				await node.payInvoiceSafe(
@@ -1926,7 +1940,8 @@ async function bootDaemon(
 					timeoutMs,
 					maxFeeSats,
 					amountSats,
-					metadata
+					metadata,
+					cltvLimit
 				)
 			);
 		},
@@ -1937,7 +1952,8 @@ async function bootDaemon(
 				backoffMs,
 				maxFeeSats,
 				amountSats,
-				metadata
+				metadata,
+				cltvLimit
 			} = body as {
 				bolt11: string;
 				maxRetries?: number;
@@ -1945,6 +1961,7 @@ async function bootDaemon(
 				maxFeeSats?: number;
 				amountSats?: number;
 				metadata?: Record<string, string>;
+				cltvLimit?: number;
 			};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(
@@ -1953,7 +1970,8 @@ async function bootDaemon(
 					backoffMs,
 					maxFeeSats,
 					amountSats,
-					metadata
+					metadata,
+					cltvLimit
 				})
 			);
 		},
