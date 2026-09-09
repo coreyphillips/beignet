@@ -1,6 +1,6 @@
 /**
  * Swap protocol messages (issue #737), as canonical Lightning TLV streams
- * riding the 44069 custom message under subtypes 48 to 53.
+ * riding the 44069 custom message under subtypes 48 to 55.
  *
  * Convention shared with direct funding: even types are required, odd types
  * optional, so a later revision can add an optional field without breaking a
@@ -16,6 +16,18 @@
  * client can see the breakdown. A client caps what it will pay with
  * `maxTotalFeeSat` on create, so a provider that reprices between quote and
  * create fails closed with FEE_CEILING.
+ *
+ * Amount semantics for a submarine swap (issue #743): the client locks
+ * exactly `onchainAmountSat` in the contract and is paid its own invoice for
+ * `invoiceAmountMsat`, which is (onchainAmountSat - totalFeeSat) * 1000. The
+ * client mints that invoice BEFORE the create, so the provider derives the
+ * fee from the invoice amount and accepts it when it covers the provider's
+ * floor and stays under the client's `maxTotalFeeSat`; the ack echoes what
+ * was accepted. `minerFeeSat` is the part that pays for the provider's claim
+ * transaction. A quote (48/49) with direction 2 uses the same fields; there
+ * `fundingConfirmations` is the depth the client's funding must reach before
+ * the provider pays and `invoiceExpirySeconds` the minimum validity the
+ * provider requires of the client's invoice at create time.
  */
 
 import { decodeTlvStream, encodeTlvStream, ITlvRecord } from '../message/tlv';
@@ -48,7 +60,7 @@ function malformed(what: string): SwapMessageError {
 
 export enum SwapWireDirection {
 	REVERSE = 1,
-	/** Reserved: never accepted by this build. */
+	/** On-chain to Lightning: the client funds, the provider pays (issue #743). */
 	SUBMARINE = 2
 }
 
@@ -67,7 +79,15 @@ export enum SwapRefusalReason {
 	INSUFFICIENT_FUNDS = 11,
 	CHAIN_UNAVAILABLE = 12,
 	MALFORMED = 13,
-	INTERNAL = 14
+	INTERNAL = 14,
+	/** Submarine: the invoice does not match the hash, amount or network. */
+	INVOICE_MISMATCH = 15,
+	/** Submarine: the invoice's final CLTV cannot fit under the refund height. */
+	CLTV_UNFITTABLE = 16,
+	/** Submarine: the invoice is payable only by this node itself. */
+	SELF_PAYMENT = 17,
+	/** Submarine: no channel can carry the payment right now. */
+	NO_OUTBOUND_LIQUIDITY = 18
 }
 
 /** The provider's view of a swap, as reported to its client. */
@@ -83,8 +103,22 @@ export enum SwapWireState {
 	REFUNDED = 8,
 	FAILED = 9,
 	CANCELLED = 10,
-	/** The Lightning side was cancelled under the provider; funds are on chain. */
-	EXPOSED = 11
+	/**
+	 * Reverse: the Lightning side was cancelled under the provider; funds are
+	 * on chain. Submarine: a payment is out while the contract is not
+	 * claimable.
+	 */
+	EXPOSED = 11,
+	// Submarine states (issue #743), appended so older decoders reject them
+	// as out of range rather than misread them.
+	FUNDING_SEEN = 12,
+	FUNDING_LOST = 13,
+	PAYING = 14,
+	PAYMENT_UNRESOLVED = 15,
+	PREIMAGE_KNOWN = 16,
+	CLAIM_BROADCAST = 17,
+	CLAIM_CONFIRMED = 18,
+	PAYMENT_FAILED = 19
 }
 
 export enum SwapWireResolutionKind {
@@ -163,6 +197,54 @@ export interface ISwapCreateAck {
 	reasonText?: string;
 	/** Present exactly when accepted. */
 	terms?: ISwapTerms;
+}
+
+/** SWAP_SUBMARINE_CREATE (54): the client asks to lock coins for an invoice. */
+export interface ISwapSubmarineCreate {
+	requestId: Buffer;
+	direction: SwapWireDirection;
+	paymentHash: Buffer;
+	/** The client's key for the contract's timeout branch. */
+	refundPubkey: Buffer;
+	/** The client's own invoice for onchainAmountSat minus the fee. */
+	bolt11: string;
+	onchainAmountSat: bigint;
+	maxTotalFeeSat: bigint;
+	preferredRefundDelta?: number;
+}
+
+export interface ISwapSubmarineTerms {
+	swapId: Buffer;
+	/** The provider's key for the contract's preimage branch. */
+	claimPubkey: Buffer;
+	refundHeight: number;
+	outputScript: Buffer;
+	address: string;
+	invoiceAmountMsat: bigint;
+	onchainAmountSat: bigint;
+	totalFeeSat: bigint;
+	minerFeeSat: bigint;
+	/** Depth the funding must reach before the provider pays. */
+	fundingConfirmations: number;
+	/** Unix seconds; the provider stops watching for funding after this. */
+	expiresAt: number;
+	currentHeight: number;
+	/**
+	 * Informational: the absolute height no outgoing HTLC of the provider's
+	 * payment may expire after. A client can compare it with how long its own
+	 * node would hold an incoming HTLC.
+	 */
+	paymentCeilingHeight?: number;
+}
+
+export interface ISwapSubmarineCreateAck {
+	requestId: Buffer;
+	accepted: boolean;
+	paymentHash: Buffer;
+	reason: SwapRefusalReason;
+	reasonText?: string;
+	/** Present exactly when accepted. */
+	terms?: ISwapSubmarineTerms;
 }
 
 export interface ISwapStatusRequest {
@@ -341,7 +423,11 @@ function direction(n: number, what: string): SwapWireDirection {
 }
 
 function reasonCode(n: number): SwapRefusalReason {
-	if (!Number.isInteger(n) || n < 0 || n > SwapRefusalReason.INTERNAL) {
+	if (
+		!Number.isInteger(n) ||
+		n < 0 ||
+		n > SwapRefusalReason.NO_OUTBOUND_LIQUIDITY
+	) {
 		throw malformed(`refusal reason ${n} is out of range`);
 	}
 	return n;
@@ -831,6 +917,252 @@ export function decodeSwapCreateAck(data: Buffer): ISwapCreateAck {
 	return ack;
 }
 
+// ─────────────── SWAP_SUBMARINE_CREATE (54) ───────────────
+
+const SUBMARINE_CREATE_TYPES = {
+	requestId: 0n,
+	direction: 2n,
+	paymentHash: 4n,
+	refundPubkey: 6n,
+	bolt11: 8n,
+	onchainAmountSat: 10n,
+	maxTotalFeeSat: 12n,
+	preferredRefundDelta: 13n
+};
+
+export function encodeSwapSubmarineCreate(c: ISwapSubmarineCreate): Buffer {
+	const records: ITlvRecord[] = [
+		record(
+			SUBMARINE_CREATE_TYPES.requestId,
+			fixed(c.requestId, SWAP_REQUEST_ID_BYTES, 'requestId')
+		),
+		record(
+			SUBMARINE_CREATE_TYPES.direction,
+			u8Buf(direction(c.direction, 'direction'), 'direction')
+		),
+		record(
+			SUBMARINE_CREATE_TYPES.paymentHash,
+			fixed(c.paymentHash, HASH_BYTES, 'paymentHash')
+		),
+		record(
+			SUBMARINE_CREATE_TYPES.refundPubkey,
+			pubkey(c.refundPubkey, 'refundPubkey')
+		),
+		record(
+			SUBMARINE_CREATE_TYPES.bolt11,
+			text(c.bolt11, SWAP_MAX_INVOICE_BYTES, 'bolt11')
+		),
+		record(
+			SUBMARINE_CREATE_TYPES.onchainAmountSat,
+			u64Buf(c.onchainAmountSat, 'onchainAmountSat')
+		),
+		record(
+			SUBMARINE_CREATE_TYPES.maxTotalFeeSat,
+			u64Buf(c.maxTotalFeeSat, 'maxTotalFeeSat')
+		)
+	];
+	if (c.preferredRefundDelta !== undefined) {
+		records.push(
+			record(
+				SUBMARINE_CREATE_TYPES.preferredRefundDelta,
+				u32Buf(c.preferredRefundDelta, 'preferredRefundDelta')
+			)
+		);
+	}
+	return encodeTlvStream(records);
+}
+
+export function decodeSwapSubmarineCreate(data: Buffer): ISwapSubmarineCreate {
+	const f = decodeFields(
+		data,
+		Object.values(SUBMARINE_CREATE_TYPES),
+		'swap_submarine_create'
+	);
+	const onchainAmountSat = needU64(
+		f,
+		SUBMARINE_CREATE_TYPES.onchainAmountSat,
+		'onchainAmountSat'
+	);
+	if (onchainAmountSat === 0n)
+		throw malformed('onchainAmountSat must be positive');
+	const bolt11 = need(f, SUBMARINE_CREATE_TYPES.bolt11, 'bolt11');
+	if (bolt11.length > SWAP_MAX_INVOICE_BYTES)
+		throw malformed('bolt11 is too long');
+	if (bolt11.length === 0) throw malformed('bolt11 is empty');
+	return {
+		requestId: needFixed(
+			f,
+			SUBMARINE_CREATE_TYPES.requestId,
+			SWAP_REQUEST_ID_BYTES,
+			'requestId'
+		),
+		direction: direction(
+			needU8(f, SUBMARINE_CREATE_TYPES.direction, 'direction'),
+			'direction'
+		),
+		paymentHash: needFixed(
+			f,
+			SUBMARINE_CREATE_TYPES.paymentHash,
+			HASH_BYTES,
+			'paymentHash'
+		),
+		refundPubkey: pubkey(
+			needFixed(
+				f,
+				SUBMARINE_CREATE_TYPES.refundPubkey,
+				PUBKEY_BYTES,
+				'refundPubkey'
+			),
+			'refundPubkey'
+		),
+		bolt11: bolt11.toString('utf8'),
+		onchainAmountSat,
+		maxTotalFeeSat: needU64(
+			f,
+			SUBMARINE_CREATE_TYPES.maxTotalFeeSat,
+			'maxTotalFeeSat'
+		),
+		preferredRefundDelta: optU32(
+			f,
+			SUBMARINE_CREATE_TYPES.preferredRefundDelta,
+			'preferredRefundDelta'
+		)
+	};
+}
+
+// ─────────────── SWAP_SUBMARINE_CREATE_ACK (55) ───────────────
+
+const SUBMARINE_CREATE_ACK_TYPES = {
+	requestId: 0n,
+	accepted: 2n,
+	paymentHash: 4n,
+	reason: 6n,
+	reasonText: 7n,
+	swapId: 9n,
+	claimPubkey: 11n,
+	refundHeight: 13n,
+	outputScript: 15n,
+	address: 17n,
+	invoiceAmountMsat: 19n,
+	onchainAmountSat: 21n,
+	totalFeeSat: 23n,
+	minerFeeSat: 25n,
+	fundingConfirmations: 27n,
+	expiresAt: 29n,
+	currentHeight: 31n,
+	paymentCeilingHeight: 33n
+};
+
+export function encodeSwapSubmarineCreateAck(
+	a: ISwapSubmarineCreateAck
+): Buffer {
+	const T = SUBMARINE_CREATE_ACK_TYPES;
+	const records: ITlvRecord[] = [
+		record(T.requestId, fixed(a.requestId, SWAP_REQUEST_ID_BYTES, 'requestId')),
+		record(T.accepted, u8Buf(a.accepted ? 1 : 0, 'accepted')),
+		record(T.paymentHash, fixed(a.paymentHash, HASH_BYTES, 'paymentHash')),
+		record(T.reason, u8Buf(reasonCode(a.reason), 'reason'))
+	];
+	if (a.reasonText !== undefined) {
+		records.push(
+			record(
+				T.reasonText,
+				text(a.reasonText, SWAP_MAX_REASON_BYTES, 'reasonText')
+			)
+		);
+	}
+	if (a.accepted) {
+		const t = a.terms;
+		if (!t) throw malformed('an accepted ack needs terms');
+		records.push(
+			record(T.swapId, fixed(t.swapId, SWAP_ID_BYTES, 'swapId')),
+			record(T.claimPubkey, pubkey(t.claimPubkey, 'claimPubkey')),
+			record(T.refundHeight, u32Buf(t.refundHeight, 'refundHeight')),
+			record(T.outputScript, p2wshScript(t.outputScript, 'outputScript')),
+			record(T.address, text(t.address, SWAP_MAX_ADDRESS_BYTES, 'address')),
+			record(
+				T.invoiceAmountMsat,
+				u64Buf(t.invoiceAmountMsat, 'invoiceAmountMsat')
+			),
+			record(
+				T.onchainAmountSat,
+				u64Buf(t.onchainAmountSat, 'onchainAmountSat')
+			),
+			record(T.totalFeeSat, u64Buf(t.totalFeeSat, 'totalFeeSat')),
+			record(T.minerFeeSat, u64Buf(t.minerFeeSat, 'minerFeeSat')),
+			record(
+				T.fundingConfirmations,
+				u16Buf(t.fundingConfirmations, 'fundingConfirmations')
+			),
+			record(T.expiresAt, u64Buf(BigInt(t.expiresAt), 'expiresAt')),
+			record(T.currentHeight, u32Buf(t.currentHeight, 'currentHeight'))
+		);
+		if (t.paymentCeilingHeight !== undefined) {
+			records.push(
+				record(
+					T.paymentCeilingHeight,
+					u32Buf(t.paymentCeilingHeight, 'paymentCeilingHeight')
+				)
+			);
+		}
+	} else if (a.terms) {
+		throw malformed('a refusal must not carry terms');
+	}
+	return encodeTlvStream(records);
+}
+
+export function decodeSwapSubmarineCreateAck(
+	data: Buffer
+): ISwapSubmarineCreateAck {
+	const T = SUBMARINE_CREATE_ACK_TYPES;
+	const f = decodeFields(data, Object.values(T), 'swap_submarine_create_ack');
+	const accepted = flag(needU8(f, T.accepted, 'accepted'), 'accepted');
+	const ack: ISwapSubmarineCreateAck = {
+		requestId: needFixed(f, T.requestId, SWAP_REQUEST_ID_BYTES, 'requestId'),
+		accepted,
+		paymentHash: needFixed(f, T.paymentHash, HASH_BYTES, 'paymentHash'),
+		reason: reasonCode(needU8(f, T.reason, 'reason')),
+		reasonText: optText(f, T.reasonText, SWAP_MAX_REASON_BYTES, 'reasonText')
+	};
+	if (!accepted) return ack;
+	const address = need(f, T.address, 'address');
+	if (address.length > SWAP_MAX_ADDRESS_BYTES)
+		throw malformed('address is too long');
+	const expiresAt = needU64(f, T.expiresAt, 'expiresAt');
+	if (expiresAt > BigInt(Number.MAX_SAFE_INTEGER))
+		throw malformed('expiresAt is out of range');
+	ack.terms = {
+		swapId: needFixed(f, T.swapId, SWAP_ID_BYTES, 'swapId'),
+		claimPubkey: pubkey(
+			needFixed(f, T.claimPubkey, PUBKEY_BYTES, 'claimPubkey'),
+			'claimPubkey'
+		),
+		refundHeight: needU32(f, T.refundHeight, 'refundHeight'),
+		outputScript: p2wshScript(
+			needFixed(f, T.outputScript, P2WSH_SCRIPT_BYTES, 'outputScript'),
+			'outputScript'
+		),
+		address: address.toString('utf8'),
+		invoiceAmountMsat: needU64(f, T.invoiceAmountMsat, 'invoiceAmountMsat'),
+		onchainAmountSat: needU64(f, T.onchainAmountSat, 'onchainAmountSat'),
+		totalFeeSat: needU64(f, T.totalFeeSat, 'totalFeeSat'),
+		minerFeeSat: needU64(f, T.minerFeeSat, 'minerFeeSat'),
+		fundingConfirmations: needU16(
+			f,
+			T.fundingConfirmations,
+			'fundingConfirmations'
+		),
+		expiresAt: Number(expiresAt),
+		currentHeight: needU32(f, T.currentHeight, 'currentHeight'),
+		paymentCeilingHeight: optU32(
+			f,
+			T.paymentCeilingHeight,
+			'paymentCeilingHeight'
+		)
+	};
+	return ack;
+}
+
 // ─────────────── SWAP_STATUS_REQUEST (52) ───────────────
 
 const STATUS_REQUEST_TYPES = { requestId: 0n, swapId: 2n };
@@ -886,7 +1218,7 @@ const STATUS_TYPES = {
 };
 
 function wireState(n: number): SwapWireState {
-	if (!Number.isInteger(n) || n < 0 || n > SwapWireState.EXPOSED) {
+	if (!Number.isInteger(n) || n < 0 || n > SwapWireState.PAYMENT_FAILED) {
 		throw malformed(`swap state ${n} is out of range`);
 	}
 	return n;

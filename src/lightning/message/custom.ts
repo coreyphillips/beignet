@@ -82,7 +82,7 @@ export enum BeignetCustomSubtype {
 	SWAP_CREATE_ACK = 51,
 	SWAP_STATUS_REQUEST = 52,
 	SWAP_STATUS = 53,
-	/** Reserved for the submarine direction; never sent by this build. */
+	/** Submarine direction (issue #743): the client funds, the provider pays. */
 	SWAP_SUBMARINE_CREATE = 54,
 	SWAP_SUBMARINE_CREATE_ACK = 55
 }

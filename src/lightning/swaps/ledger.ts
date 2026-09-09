@@ -22,15 +22,29 @@
  *                                                  be, on chain: signed bytes
  *                                                  whose broadcast threw count)
  *
- * Submarine swap lifecycle (client funds the chain, provider pays Lightning),
- * reserved here for the later engine:
+ * Submarine swap lifecycle (client funds the chain, provider pays Lightning,
+ * issue #743):
  *
  *   CREATED -> FUNDING_SEEN -> FUNDED -> PAYING -> PREIMAGE_KNOWN
  *           -> CLAIM_BROADCAST -> CLAIM_CONFIRMED
  *   PAYING -> PAYMENT_UNRESOLVED -> PREIMAGE_KNOWN | PAYMENT_FAILED
  *   PAYING -> PAYMENT_FAILED
+ *   PAYMENT_FAILED -> PREIMAGE_KNOWN            (a late success is a success:
+ *                                                  the preimage rides the move)
  *   FUNDING_SEEN | FUNDED -> FUNDING_LOST -> FUNDING_SEEN
- *   CREATED -> CANCELLED | FAILED
+ *   CREATED | FUNDING_SEEN | FUNDED | FUNDING_LOST -> CANCELLED
+ *                                                  (nothing was paid)
+ *   CREATED | FUNDING_SEEN | FUNDED -> FAILED       (the invoice expired or the
+ *                                                  ceiling no longer fits
+ *                                                  before anything was paid)
+ *   PAYING | PAYMENT_UNRESOLVED | PREIMAGE_KNOWN | CLAIM_BROADCAST -> EXPOSED
+ *                                                  (a payment is out while the
+ *                                                  contract is not claimable:
+ *                                                  the funding vanished or a
+ *                                                  foreign spend confirmed)
+ *   EXPOSED -> CLAIM_BROADCAST | PAYMENT_FAILED    (the funding came back, or
+ *                                                  every HTLC failed and
+ *                                                  nothing was lost)
  *
  * Rules inherited from the held-forward ledger: durable write before memory,
  * every arrow a CAS, rehydrate before serve. Two rules of this ledger's own:
@@ -73,6 +87,7 @@ export type SubmarineSwapState =
 	| 'CLAIM_BROADCAST'
 	| 'CLAIM_CONFIRMED'
 	| 'PAYMENT_FAILED'
+	| 'EXPOSED'
 	| 'CANCELLED'
 	| 'FAILED';
 
@@ -149,6 +164,29 @@ export interface ISwapRecord extends ILedgerRecord {
 	fundingBroadcastAttemptedAt?: number;
 	fundingBroadcastAt?: number;
 	fundingHeight?: number;
+	/**
+	 * Submarine: the outgoing payment. `paymentDispatchedAt` is written in
+	 * the same CAS that moves the row to PAYING, BEFORE the payment call: a
+	 * PAYING row whose node has no payment record and no HTLC never
+	 * dispatched, and may be re-dispatched once after the checks are redone.
+	 */
+	paymentDispatchedAt?: number;
+	paymentDispatchedHeight?: number;
+	/** The absolute expiry ceiling every HTLC of the payment was bound by. */
+	paymentMaxCltvExpiryHeight?: number;
+	paymentMaxFeeMsat?: string;
+	/** Height the row moved to PAYMENT_UNRESOLVED at. */
+	paymentUnresolvedSince?: number;
+	/** Submarine: our claim. Persisted before the first broadcast attempt. */
+	claimTxHex?: string;
+	claimTxid?: string;
+	claimFeeSat?: string;
+	/** Set BEFORE the first broadcast; status hands out the claim only after. */
+	claimBroadcastAttemptedAt?: number;
+	claimBroadcastHeight?: number;
+	claimBumps?: number;
+	/** Submarine: when the funding was last seen gone. */
+	fundingLostAt?: number;
 	/** Refund (reverse: ours) bookkeeping. */
 	refundTxHex?: string;
 	refundTxid?: string;
@@ -195,6 +233,7 @@ const SUBMARINE_STATES: readonly SubmarineSwapState[] = [
 	'CLAIM_BROADCAST',
 	'CLAIM_CONFIRMED',
 	'PAYMENT_FAILED',
+	'EXPOSED',
 	'CANCELLED',
 	'FAILED'
 ];
@@ -230,15 +269,20 @@ const SUBMARINE_TRANSITIONS: Readonly<
 	Record<SubmarineSwapState, readonly SubmarineSwapState[]>
 > = {
 	CREATED: ['FUNDING_SEEN', 'CANCELLED', 'FAILED'],
-	FUNDING_SEEN: ['FUNDED', 'FUNDING_LOST', 'CANCELLED'],
-	FUNDED: ['PAYING', 'FUNDING_LOST'],
+	FUNDING_SEEN: ['FUNDED', 'FUNDING_LOST', 'CANCELLED', 'FAILED'],
+	FUNDED: ['PAYING', 'FUNDING_LOST', 'CANCELLED', 'FAILED'],
 	FUNDING_LOST: ['FUNDING_SEEN', 'CANCELLED'],
-	PAYING: ['PREIMAGE_KNOWN', 'PAYMENT_UNRESOLVED', 'PAYMENT_FAILED'],
-	PAYMENT_UNRESOLVED: ['PREIMAGE_KNOWN', 'PAYMENT_FAILED'],
-	PREIMAGE_KNOWN: ['CLAIM_BROADCAST'],
-	CLAIM_BROADCAST: ['CLAIM_CONFIRMED'],
+	PAYING: ['PREIMAGE_KNOWN', 'PAYMENT_UNRESOLVED', 'PAYMENT_FAILED', 'EXPOSED'],
+	PAYMENT_UNRESOLVED: ['PREIMAGE_KNOWN', 'PAYMENT_FAILED', 'EXPOSED'],
+	PREIMAGE_KNOWN: ['CLAIM_BROADCAST', 'EXPOSED'],
+	CLAIM_BROADCAST: ['CLAIM_CONFIRMED', 'EXPOSED'],
+	EXPOSED: ['CLAIM_BROADCAST', 'PAYMENT_FAILED'],
 	CLAIM_CONFIRMED: [],
-	PAYMENT_FAILED: [],
+	// Terminal for the block loop, yet a preimage learned late (an on-chain
+	// claim downstream, a fulfil after the record was failed) still promotes
+	// the row: the move carries the preimage, since recordPreimage refuses
+	// terminal rows.
+	PAYMENT_FAILED: ['PREIMAGE_KNOWN'],
 	CANCELLED: [],
 	FAILED: []
 };
@@ -267,25 +311,28 @@ export function swapSourcesFor(
  * Whether a swap's principal is at risk right now: reverse rows from HELD
  * onward (our coins are or will be locked) until a resolution has met
  * policy, submarine rows from PAYING onward (a Lightning payment is out).
+ * EXPOSED, in either direction, stays on the books until a resolution
+ * verified in THIS process has reached policy depth.
  */
 export function isSwapExposure(
 	record: ISwapRecord,
 	resolutionConfirmations = 1
 ): boolean {
 	if (isTerminalSwapState(record.state)) return false;
+	if (record.state === 'EXPOSED') {
+		// Only a resolution verified in THIS process, at the configured
+		// depth, takes the principal off the books: a reloaded flag is
+		// history, and one confirmation is not policy depth. For a submarine
+		// row that verified resolution is a realised loss or a refund that
+		// beat us, no longer principal at risk.
+		return !(
+			record.resolution &&
+			record.resolution.verifiedThisSession &&
+			record.resolution.confirmations >= Math.max(1, resolutionConfirmations)
+		);
+	}
 	if (record.direction === 'reverse') {
-		if (record.state === 'CREATED') return false;
-		if (record.state === 'EXPOSED') {
-			// Only a resolution verified in THIS process, at the configured
-			// depth, takes the principal off the books: a reloaded flag is
-			// history, and one confirmation is not policy depth.
-			return !(
-				record.resolution &&
-				record.resolution.verifiedThisSession &&
-				record.resolution.confirmations >= Math.max(1, resolutionConfirmations)
-			);
-		}
-		return true;
+		return record.state !== 'CREATED';
 	}
 	return (
 		record.state === 'PAYING' ||

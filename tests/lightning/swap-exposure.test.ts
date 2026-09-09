@@ -214,6 +214,44 @@ describe('Swap exposure policy (issue #737 phase 2)', function () {
 		] as const) {
 			expect(isSwapExposure(row(state, 1n, 'submarine')), state).to.equal(true);
 		}
+		// Submarine EXPOSED (issue #743) follows the reverse rule: on the
+		// books until a resolution verified this session reaches depth.
+		expect(isSwapExposure(row('EXPOSED', 1n, 'submarine'))).to.equal(true);
+		expect(
+			isSwapExposure(
+				row('EXPOSED', 1n, 'submarine', {
+					resolution: {
+						kind: 'refund',
+						txid: 'aa',
+						confirmations: 3,
+						verifiedThisSession: false
+					}
+				}),
+				3
+			)
+		).to.equal(true);
+		expect(
+			isSwapExposure(
+				row('EXPOSED', 1n, 'submarine', {
+					resolution: {
+						kind: 'refund',
+						txid: 'aa',
+						confirmations: 3,
+						verifiedThisSession: true
+					}
+				}),
+				3
+			)
+		).to.equal(false);
+		for (const state of [
+			'CLAIM_CONFIRMED',
+			'PAYMENT_FAILED',
+			'FAILED'
+		] as const) {
+			expect(isSwapExposure(row(state, 1n, 'submarine')), state).to.equal(
+				false
+			);
+		}
 	});
 
 	it('refuses when the exposed total plus the candidate exceeds the cap', function () {
