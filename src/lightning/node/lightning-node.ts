@@ -6,7 +6,22 @@
  * into a unified Lightning node API.
  */
 
-import { SPLICE_LOCK_DEPTH_MAX } from '../message/splice';
+import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../message/splice';
+
+/**
+ * How long a conflicted-splice revert request waits for the peer's ack
+ * before the request is abandoned and the peer disconnected (issue #760):
+ * the BOLT 2 quiescence window. Tests shorten it per node.
+ */
+export const SPLICE_CONFLICT_REQUEST_TIMEOUT_MS = 60_000;
+/** How long a channel is left alone after a request timed out. */
+export const SPLICE_CONFLICT_REQUEST_BACKOFF_MS = 10 * 60_000;
+/**
+ * How long a refuted conflict claim is answered from memory. Bounded in time
+ * as well as by height: a chain server can catch up without a new block, and
+ * the peer's next session is a round trip away in any case.
+ */
+export const SPLICE_CONFLICT_REFUTATION_TTL_MS = 30_000;
 import {
 	decodeSpliceConflict,
 	decodeSpliceConflictAck,
@@ -4067,6 +4082,14 @@ export class LightningNode extends EventEmitter {
 			'splice:reverted',
 			(channelId: Buffer, spliceTxid: string, conflictTxid: string) => {
 				this.onSpliceReverted(channelId, spliceTxid, conflictTxid);
+			}
+		);
+		// The quiescence handshake behind a conflict revert request completed
+		// with us as initiator (issue #760): SPLICE_CONFLICT may leave now.
+		this.channelManager.on(
+			'splice:conflict-request-ready',
+			(channelId: Buffer) => {
+				this.transmitSpliceConflict(channelId);
 			}
 		);
 
@@ -9441,6 +9464,8 @@ export class LightningNode extends EventEmitter {
 			clearInterval(this.mppCleanupTimer);
 			this.mppCleanupTimer = null;
 		}
+		for (const timer of this.spliceConflictTimers.values()) clearTimeout(timer);
+		this.spliceConflictTimers.clear();
 		if (this.feeUpdateTimer) {
 			clearInterval(this.feeUpdateTimer);
 			this.feeUpdateTimer = null;
@@ -11688,10 +11713,10 @@ export class LightningNode extends EventEmitter {
 			options.lockAtDepth !== undefined &&
 			(!Number.isInteger(options.lockAtDepth) ||
 				options.lockAtDepth < 1 ||
-				options.lockAtDepth > SPLICE_LOCK_DEPTH_MAX)
+				options.lockAtDepth > SPLICE_LOCK_DEPTH_ACCEPT_MAX)
 		) {
 			throw new InvalidSpliceError(
-				`lockAtDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_MAX}`
+				`lockAtDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_ACCEPT_MAX}`
 			);
 		}
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
@@ -22050,7 +22075,7 @@ export class LightningNode extends EventEmitter {
 	private armSpliceInputWatches(channelId: Buffer, state: IChannelState): void {
 		const inflight = state.spliceInFlight;
 		if (!this.chainWatcher || !inflight) return;
-		if (!inflight.lockAtDepth || !inflight.externalInputIndices?.length) return;
+		if (!inflight.lockAtDepth) return;
 		if (inflight.sentTxSignatures !== true) return;
 		if (inflight.confirmed || inflight.localSpliceLocked) return;
 		let tx: bitcoin.Transaction;
@@ -22062,23 +22087,31 @@ export class LightningNode extends EventEmitter {
 		const spliceTxid = Buffer.from(inflight.spliceTxid)
 			.reverse()
 			.toString('hex');
-		for (const index of inflight.externalInputIndices) {
+		// Every input this node does not vouch for: neither the shared 2-of-2
+		// funding input nor one of its own wallet inputs. On BOTH sides, so
+		// the acceptor watches the initiator's inputs too and a wallet that
+		// double spends and goes silent cannot pin the LSP mid-splice; the
+		// acceptor's own input set is empty, so it watches everything else.
+		// A third party's input the initiator contributed on the owner's
+		// behalf rides ourWalletInputIndices as a placeholder slot (issue
+		// #592) and is exactly what this node does not vouch for.
+		const shared = this.channelManager
+			.getChannel(channelId)
+			?.getSpliceSharedInputIndex();
+		const external = new Set(inflight.externalInputIndices ?? []);
+		const ours = new Set(
+			inflight.ourWalletInputIndices.filter((i) => !external.has(i))
+		);
+		for (let index = 0; index < tx.ins.length; index++) {
+			if (index === shared || ours.has(index)) continue;
 			const input = tx.ins[index];
 			const prevout = inflight.inputPrevouts[index];
-			if (!input || !prevout) {
-				// A record persisted before inputPrevouts existed cannot name
-				// the script to watch; say so rather than watch nothing quietly.
-				this.emitStructuredLog('splice', 'input_watch_unarmed', {
-					channelId: channelId.toString('hex'),
-					spliceTxid,
-					inputIndex: index
-				});
-				continue;
-			}
+			// A record persisted before inputPrevouts existed cannot name the
+			// script; the watcher reads it off the parent transaction instead.
 			this.chainWatcher.watchSpliceInput(channelId, spliceTxid, {
 				txid: Buffer.from(input.hash).reverse().toString('hex'),
 				vout: input.index,
-				script: Buffer.from(prevout.script),
+				script: prevout ? Buffer.from(prevout.script) : undefined,
 				inputIndex: index
 			});
 		}
@@ -22119,7 +22152,7 @@ export class LightningNode extends EventEmitter {
 			inputIndex,
 			height
 		);
-		this.sendSpliceConflict(channelId);
+		this.requestSpliceConflict(channelId);
 	}
 
 	/** The log line, the error and the event a newly conflicted splice earns. */
@@ -22160,20 +22193,80 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Put a conflict verdict to the peer. Returns whether a frame left. Not
-	 * attempted at a peer that is not connected: the reconnect re-asks.
+	 * Timers bounding the wait for a peer's SPLICE_CONFLICT_ACK, per channel
+	 * (issue #760). The request rides our own quiescence session, and
+	 * quiescence has no un-stfu: a peer that never answers (one that does not
+	 * speak the extension, or whose handshake never completed) would leave
+	 * the channel frozen, so the wait is bounded and ends in the one reset the
+	 * spec gives quiescence, a disconnect.
 	 */
-	private sendSpliceConflict(channelId: Buffer): boolean {
+	private spliceConflictTimers: Map<string, ReturnType<typeof setTimeout>> =
+		new Map();
+	/** The wait per request; the constant unless a test shortens it. */
+	private spliceConflictRequestTimeoutMs = SPLICE_CONFLICT_REQUEST_TIMEOUT_MS;
+	/** Channels not to re-ask before this time, after a request timed out. */
+	private spliceConflictBackoffUntil: Map<string, number> = new Map();
+	/** Channels with a SPLICE_CONFLICT verification in flight (issue #760). */
+	private spliceConflictChecks: Map<string, string> = new Map();
+	/**
+	 * Claims refuted at a given height, keyed by channel, splice and conflict
+	 * txid. A peer re-sending the same frame within a block is answered from
+	 * here rather than by fetching transactions again.
+	 */
+	private spliceConflictRefutations: Map<
+		string,
+		{ height: number; at: number; reason: string }
+	> = new Map();
+
+	/**
+	 * Ask the peer to revert the conflicted splice (issue #760). Opens our
+	 * quiescence handshake through the channel; the frame itself leaves from
+	 * transmitSpliceConflict once the channel is QUIESCENT as our session.
+	 * Not attempted at a disconnected peer (the reconnect re-asks), while a
+	 * request is already pending, or inside the backoff a timed-out request
+	 * left. Returns whether a request is now pending.
+	 */
+	private requestSpliceConflict(channelId: Buffer): boolean {
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return false;
 		const inflight = channel.getFullState().spliceInFlight;
-		const conflict = inflight?.conflict;
-		if (!inflight || !conflict || inflight.confirmed) return false;
+		if (!inflight?.conflict || inflight.confirmed) return false;
 		const peer = this.channelManager.getPeerForChannel(channelId);
 		if (!peer) return false;
 		if (this.peerManager && !this.listPeers().some((p) => p.pubkey === peer)) {
 			return false;
 		}
+		const idHex = channelId.toString('hex');
+		if (channel.hasPendingSpliceConflictRequest()) return true;
+		if ((this.spliceConflictBackoffUntil.get(idHex) ?? 0) > Date.now()) {
+			return false;
+		}
+		const result = this.channelManager.requestSpliceConflictRevert(channelId);
+		if (!result.ok) {
+			if (!result.transient) {
+				this.emitStructuredLog('splice', 'conflict_request_refused', {
+					channelId: idHex,
+					error: result.error ?? 'refused'
+				});
+			}
+			return false;
+		}
+		this.armSpliceConflictTimer(channelId);
+		return true;
+	}
+
+	/**
+	 * The channel is QUIESCENT as our session and a conflict request is
+	 * parked on it: put SPLICE_CONFLICT on the wire.
+	 */
+	private transmitSpliceConflict(channelId: Buffer): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const inflight = channel.getFullState().spliceInFlight;
+		const conflict = inflight?.conflict;
+		if (!inflight || !conflict || inflight.confirmed) return;
+		const peer = this.channelManager.getPeerForChannel(channelId);
+		if (!peer) return;
 		const msg: ISpliceConflictMessage = {
 			channelId,
 			spliceTxid: Buffer.from(inflight.spliceTxid),
@@ -22187,7 +22280,52 @@ export class LightningNode extends EventEmitter {
 		);
 		channel.noteSpliceConflictRequest(Date.now());
 		this.persistChannel(channelId);
-		return true;
+		this.armSpliceConflictTimer(channelId);
+	}
+
+	private armSpliceConflictTimer(channelId: Buffer): void {
+		const idHex = channelId.toString('hex');
+		if (this.spliceConflictTimers.has(idHex)) return;
+		const timer = setTimeout(() => {
+			this.spliceConflictTimers.delete(idHex);
+			this.onSpliceConflictRequestTimeout(channelId);
+		}, this.spliceConflictRequestTimeoutMs);
+		timer.unref?.();
+		this.spliceConflictTimers.set(idHex, timer);
+	}
+
+	private clearSpliceConflictTimer(idHex: string): void {
+		const timer = this.spliceConflictTimers.get(idHex);
+		if (!timer) return;
+		clearTimeout(timer);
+		this.spliceConflictTimers.delete(idHex);
+	}
+
+	/**
+	 * No ack within the window (issue #760). The request is abandoned, the
+	 * peer disconnected so both quiescence sessions reset, and the channel is
+	 * not re-asked before the backoff passes. A request the channel no longer
+	 * holds (a reconnect already dropped it) costs nothing here.
+	 */
+	private onSpliceConflictRequestTimeout(channelId: Buffer): void {
+		const idHex = channelId.toString('hex');
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		if (!channel.hasPendingSpliceConflictRequest() && !channel.isQuiescing()) {
+			return;
+		}
+		if (!channel.getFullState().spliceInFlight?.conflict) return;
+		const peer = this.channelManager.getPeerForChannel(channelId);
+		this.emitStructuredLog('splice', 'conflict_request_timeout', {
+			channelId: idHex,
+			pubkey: peer
+		});
+		this.spliceConflictBackoffUntil.set(
+			idHex,
+			Date.now() + SPLICE_CONFLICT_REQUEST_BACKOFF_MS
+		);
+		this.channelManager.abandonSpliceConflictRequest(channelId);
+		if (peer) this.requestPeerDisconnect(peer);
 	}
 
 	/**
@@ -22203,7 +22341,7 @@ export class LightningNode extends EventEmitter {
 				continue;
 			}
 			if (!state.spliceInFlight?.conflict) continue;
-			this.sendSpliceConflict(id);
+			this.requestSpliceConflict(id);
 		}
 	}
 
@@ -22272,20 +22410,54 @@ export class LightningNode extends EventEmitter {
 		const conflictTxidDisplay = Buffer.from(req.conflictTxid)
 			.reverse()
 			.toString('hex');
-		const refuse = (reason: string): void =>
+		const idHex = req.channelId.toString('hex');
+		const claimKey = `${idHex}:${spliceTxidDisplay}:${conflictTxidDisplay}`;
+		const height = this.chainWatcher?.getCurrentBlockHeight() ?? 0;
+		// The ack ends the quiescence session the request rode, whatever it
+		// says (issue #760): the peer leaves on receiving it, we leave here. A
+		// revert exits quiescence by itself; a refusal must do it explicitly,
+		// and only for a session that IS the peer's completed one. A refusal
+		// for "not quiescent" has nothing to end, and a peer stfu we still owe
+		// a reply to is not ours to reset.
+		const endSession = (): void => {
+			const ch = this.channelManager.getChannel(req.channelId);
+			if (ch?.isQuiescent() && !ch.isQuiescenceInitiator()) {
+				this.channelManager.abandonSpliceConflictRequest(req.channelId);
+			}
+		};
+		const refuse = (reason: string, remember = false): void => {
+			if (remember) {
+				this.spliceConflictRefutations.set(claimKey, {
+					height,
+					at: Date.now(),
+					reason
+				});
+			}
 			this.sendSpliceConflictAck(peerPubkey, {
 				channelId: req.channelId,
 				spliceTxid: req.spliceTxid,
 				agreed: false,
 				reason
 			});
-		const agree = (): void =>
+			endSession();
+		};
+		// agreed=1 leaves only once the revert is on disk: an ack the peer
+		// acts on must describe a state a restart would find (issue #760).
+		const agreeIfDurable = (): void => {
+			if (!this.persistChannelCommitted(req.channelId)) {
+				refuse('the revert could not be committed to disk; ask again');
+				return;
+			}
 			this.sendSpliceConflictAck(peerPubkey, {
 				channelId: req.channelId,
 				spliceTxid: req.spliceTxid,
 				agreed: true,
 				reason: ''
 			});
+			endSession();
+		};
+		const notQuiescent =
+			"not quiescent: the request must ride the sender's stfu session";
 		const inflight = channel.getFullState().spliceInFlight;
 		if (!inflight || !inflight.spliceTxid.equals(req.spliceTxid)) {
 			// We already reverted it, on the peer's earlier request or our own
@@ -22295,12 +22467,21 @@ export class LightningNode extends EventEmitter {
 			// revert, so agree, and it stops asking. The memory is on the
 			// channel state, so it survives our restart (issue #760). Anything
 			// else we simply do not have.
-			if (channel.hasRevertedSplice(spliceTxidDisplay)) agree();
+			if (channel.hasRevertedSplice(spliceTxidDisplay)) agreeIfDurable();
 			else refuse('no such splice in flight');
 			return;
 		}
 		if (inflight.confirmed || inflight.localSpliceLocked) {
 			refuse('the splice is confirmed on our chain view');
+			return;
+		}
+		// The revert is a fundamental channel change and runs under the
+		// peer's quiescence session: without it, an update of ours could be in
+		// flight while the peer drops the splice candidate and we still hold
+		// it, and the next commitment round would be signed against one
+		// funding on one side and two on the other (issue #760).
+		if (!channel.isQuiescent() || channel.isQuiescenceInitiator()) {
+			refuse(notQuiescent);
 			return;
 		}
 		if (!this.chainWatcher) {
@@ -22316,6 +22497,20 @@ export class LightningNode extends EventEmitter {
 			refuse('the named input is the shared funding input');
 			return;
 		}
+		// A claim refuted at this height is answered from memory, and one
+		// verification runs per channel at a time: a peer cannot make this
+		// node fetch transactions on every frame it sends (issue #760).
+		const refuted = this.spliceConflictRefutations.get(claimKey);
+		if (
+			refuted &&
+			refuted.height === height &&
+			Date.now() - refuted.at < SPLICE_CONFLICT_REFUTATION_TTL_MS
+		) {
+			refuse(refuted.reason);
+			return;
+		}
+		if (this.spliceConflictChecks.has(idHex)) return;
+		this.spliceConflictChecks.set(idHex, claimKey);
 		let verdict: { inputIndex: number; height: number; depth: number } | null;
 		try {
 			verdict = await this.chainWatcher.verifySpliceInputConflict(
@@ -22330,25 +22525,31 @@ export class LightningNode extends EventEmitter {
 				}`
 			);
 			return;
+		} finally {
+			this.spliceConflictChecks.delete(idHex);
 		}
 		if (!verdict) {
-			refuse('the conflict is not confirmed at depth on our chain view');
+			refuse('the conflict is not confirmed at depth on our chain view', true);
 			return;
 		}
 		if (verdict.inputIndex !== req.inputIndex) {
-			refuse('the named input does not match the chain');
+			refuse('the named input does not match the chain', true);
 			return;
 		}
 		// Re-read after the await: the channel may have moved meanwhile.
 		const again = this.channelManager.getChannel(req.channelId);
 		const current = again?.getFullState().spliceInFlight;
 		if (!again || !current || !current.spliceTxid.equals(req.spliceTxid)) {
-			if (again?.hasRevertedSplice(spliceTxidDisplay)) agree();
+			if (again?.hasRevertedSplice(spliceTxidDisplay)) agreeIfDurable();
 			else refuse('no such splice in flight');
 			return;
 		}
 		if (current.confirmed || current.localSpliceLocked) {
 			refuse('the splice is confirmed on our chain view');
+			return;
+		}
+		if (!again.isQuiescent() || again.isQuiescenceInitiator()) {
+			refuse(notQuiescent);
 			return;
 		}
 		if (
@@ -22368,7 +22569,7 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 		const result = this.channelManager.revertConflictedSplice(req.channelId);
-		if (result.ok) agree();
+		if (result.ok) agreeIfDurable();
 		else refuse(result.error ?? 'revert refused');
 	}
 
@@ -22387,23 +22588,39 @@ export class LightningNode extends EventEmitter {
 		if (this.channelManager.getPeerForChannel(ack.channelId) !== peerPubkey) {
 			return;
 		}
+		const idHex = ack.channelId.toString('hex');
 		const inflight = channel.getFullState().spliceInFlight;
 		if (!inflight || !inflight.spliceTxid.equals(ack.spliceTxid)) return;
 		if (!inflight.conflict) return;
+		if (!channel.hasPendingSpliceConflictRequest()) return;
+		this.clearSpliceConflictTimer(idHex);
 		if (!ack.agreed) {
 			this.emitStructuredLog('splice', 'conflict_refused', {
 				pubkey: peerPubkey,
-				channelId: ack.channelId.toString('hex'),
+				channelId: idHex,
 				spliceTxid: Buffer.from(ack.spliceTxid).reverse().toString('hex'),
 				reason: ack.reason
 			});
+			// The ack ended the session on the peer's side; end ours, so
+			// HTLCs flow again until the next block re-asks (issue #760).
+			this.channelManager.abandonSpliceConflictRequest(ack.channelId);
 			return;
 		}
 		const result = this.channelManager.revertConflictedSplice(ack.channelId);
 		if (!result.ok) {
 			this.emitStructuredLog('splice', 'revert_refused', {
-				channelId: ack.channelId.toString('hex'),
+				channelId: idHex,
 				error: result.error ?? 'revert refused'
+			});
+			this.channelManager.abandonSpliceConflictRequest(ack.channelId);
+			return;
+		}
+		if (!this.persistChannelCommitted(ack.channelId)) {
+			// The revert stands in memory and the per-block persist retries
+			// carry it; the peer has already reverted, so there is nothing
+			// to unwind, only to report.
+			this.emitStructuredLog('splice', 'revert_persist_failed', {
+				channelId: idHex
 			});
 		}
 	}
@@ -22415,6 +22632,8 @@ export class LightningNode extends EventEmitter {
 		conflictTxid: string
 	): void {
 		const idHex = channelId.toString('hex');
+		this.clearSpliceConflictTimer(idHex);
+		this.spliceConflictBackoffUntil.delete(idHex);
 		this.emitStructuredLog('splice', 'reverted', {
 			channelId: idHex,
 			spliceTxid,
@@ -22491,10 +22710,10 @@ export class LightningNode extends EventEmitter {
 			update.unpairedSpliceDepth !== undefined &&
 			(!Number.isInteger(update.unpairedSpliceDepth) ||
 				update.unpairedSpliceDepth < 1 ||
-				update.unpairedSpliceDepth > SPLICE_LOCK_DEPTH_MAX)
+				update.unpairedSpliceDepth > SPLICE_LOCK_DEPTH_ACCEPT_MAX)
 		) {
 			throw new Error(
-				`unpairedSpliceDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_MAX}`
+				`unpairedSpliceDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_ACCEPT_MAX}`
 			);
 		}
 		const policy = this.directFunding.policy;

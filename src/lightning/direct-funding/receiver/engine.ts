@@ -42,7 +42,7 @@ import { EventEmitter } from 'events';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { ISpliceWalletInput } from '../../channel/channel';
 import { BeignetCustomSubtype } from '../../message/custom';
-import { SPLICE_LOCK_DEPTH_MAX } from '../../message/splice';
+import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../../message/splice';
 import { zbase32Decode } from '../../crypto/message-signing';
 import {
 	decodeSealedFrame,
@@ -118,9 +118,13 @@ const DF_LAPSED_ABORT_REASON = 'the direct funding request expired';
  * acknowledged.
  */
 function checkedUnpairedSpliceDepth(depth: number): number {
-	if (!Number.isInteger(depth) || depth < 1 || depth > SPLICE_LOCK_DEPTH_MAX) {
+	if (
+		!Number.isInteger(depth) ||
+		depth < 1 ||
+		depth > SPLICE_LOCK_DEPTH_ACCEPT_MAX
+	) {
 		throw new Error(
-			`unpairedSpliceDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_MAX}`
+			`unpairedSpliceDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_ACCEPT_MAX}`
 		);
 	}
 	return depth;
@@ -1261,7 +1265,15 @@ export class DirectFundingReceiver extends EventEmitter {
 			record,
 			prevTxid: prevTx.getHash(),
 			paired,
-			...(coin.confirmed !== undefined ? { coinConfirmed: coin.confirmed } : {})
+			// A coinbase output cannot be spent before it matures and this
+			// source does not report maturity, so it never reads as a confirmed
+			// coin for the splice decision (issue #760): it takes the open path,
+			// where a funding that cannot relay is forgotten on its own.
+			...(prevTx.isCoinbase()
+				? { coinConfirmed: false }
+				: coin.confirmed !== undefined
+				? { coinConfirmed: coin.confirmed }
+				: {})
 		};
 		await this.serve(ctx, () =>
 			this.startFunding(ctx, lsp, prevTx, coin.confirmed)

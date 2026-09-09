@@ -450,6 +450,7 @@ export interface ISerializedChannelState {
 		spliceTxid: string;
 		conflictTxid: string;
 		revertedAt: number;
+		commitmentNumber: string;
 		spliceTxHex: string;
 		newFundingOutputIndex: number;
 		remoteFundingPubkey: string;

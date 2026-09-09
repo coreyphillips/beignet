@@ -3026,7 +3026,7 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 
 	it('validates unpairedSpliceDepth in the constructor and in setConfig', () => {
 		const node = new FakeDfNode();
-		for (const bad of [0, 2017, 1.5, Number.NaN]) {
+		for (const bad of [0, 7, 1.5, Number.NaN]) {
 			expect(
 				() => new DirectFundingReceiver(node, { unpairedSpliceDepth: bad }),
 				`constructor ${bad}`
@@ -3038,7 +3038,7 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 			allowUnpairedSplice: false,
 			unpairedSpliceDepth: DF_DEFAULT_UNPAIRED_SPLICE_DEPTH
 		});
-		for (const bad of [0, 2017, 1.5]) {
+		for (const bad of [0, 7, 1.5]) {
 			expect(
 				() =>
 					engine.setConfig({
@@ -3053,15 +3053,15 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 		engine.setConfig({
 			allowSplice: true,
 			allowUnpairedSplice: true,
-			unpairedSpliceDepth: 2016
+			unpairedSpliceDepth: 6
 		});
 		expect(engine.splicePolicy()).to.deep.equal({
 			allowSplice: true,
 			allowUnpairedSplice: true,
-			unpairedSpliceDepth: 2016
+			unpairedSpliceDepth: 6
 		});
 		engine.setConfig({ allowUnpairedSplice: false });
-		expect(engine.splicePolicy().unpairedSpliceDepth).to.equal(2016);
+		expect(engine.splicePolicy().unpairedSpliceDepth).to.equal(6);
 	});
 });
 

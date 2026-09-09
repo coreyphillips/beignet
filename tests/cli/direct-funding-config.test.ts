@@ -276,16 +276,16 @@ describe('direct funding daemon surface', function () {
 			unpairedSpliceDepth: 6
 		});
 		const depthAlone = await call('POST', '/direct-funding/configure', {
-			unpairedSpliceDepth: 2016
+			unpairedSpliceDepth: 6
 		});
 		expect(resultOf(depthAlone.json)).to.include({
 			allowUnpairedSplice: true,
-			unpairedSpliceDepth: 2016
+			unpairedSpliceDepth: 6
 		});
 	});
 
-	it('refuses an unpairedSpliceDepth outside 1..2016 and keeps the old one', async () => {
-		for (const bad of [0, 2017, 1.5, '6']) {
+	it('refuses an unpairedSpliceDepth outside 1..6 and keeps the old one', async () => {
+		for (const bad of [0, 7, 1.5, '6']) {
 			const { json, status } = await call('POST', '/direct-funding/configure', {
 				unpairedSpliceDepth: bad
 			});
@@ -295,7 +295,7 @@ describe('direct funding daemon surface', function () {
 			expect(status, String(bad)).to.equal(400);
 		}
 		const readback = await call('GET', '/direct-funding/config');
-		expect(resultOf(readback.json).unpairedSpliceDepth).to.equal(2016);
+		expect(resultOf(readback.json).unpairedSpliceDepth).to.equal(6);
 	});
 
 	// Any truthy JSON value used to be stored and read back through === true,
@@ -479,7 +479,7 @@ describe('direct funding daemon surface', function () {
 		expect(resultOf(json).minAmountSat).to.equal(30_000);
 		expect(resultOf(json).trusted).to.equal(true);
 		expect(resultOf(json).allowUnpairedSplice).to.equal(true);
-		expect(resultOf(json).unpairedSpliceDepth).to.equal(2016);
+		expect(resultOf(json).unpairedSpliceDepth).to.equal(6);
 	});
 });
 

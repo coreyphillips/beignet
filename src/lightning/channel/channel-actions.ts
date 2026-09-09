@@ -33,6 +33,7 @@ export enum ChannelActionType {
 	SPLICE_COMPLETE = 'SPLICE_COMPLETE',
 	SPLICE_ABORTED = 'SPLICE_ABORTED',
 	SPLICE_REVERTED = 'SPLICE_REVERTED',
+	SPLICE_CONFLICT_REQUEST_READY = 'SPLICE_CONFLICT_REQUEST_READY',
 	TX_SIGNATURES_NEEDED = 'TX_SIGNATURES_NEEDED',
 	SPLICE_TX_SIGNATURES_NEEDED = 'SPLICE_TX_SIGNATURES_NEEDED'
 }
@@ -276,6 +277,18 @@ export interface ISpliceRevertedAction {
 	channelId: Buffer;
 	spliceTxid: string;
 	conflictTxid: string;
+}
+
+/**
+ * The quiescence handshake a conflict revert request was parked behind has
+ * completed with us as initiator (issue #760): the node may now put
+ * SPLICE_CONFLICT to the peer. Emitted once per request, by the arm that
+ * completes the handshake or by the request itself when the channel was
+ * already quiescent as our session.
+ */
+export interface ISpliceConflictRequestReadyAction {
+	type: ChannelActionType.SPLICE_CONFLICT_REQUEST_READY;
+	channelId: Buffer;
 }
 
 /**
@@ -556,5 +569,6 @@ export type ChannelAction =
 	| ISpliceCompleteAction
 	| ISpliceAbortedAction
 	| ISpliceRevertedAction
+	| ISpliceConflictRequestReadyAction
 	| ITxSignaturesNeededAction
 	| ISpliceTxSignaturesNeededAction;

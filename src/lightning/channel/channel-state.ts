@@ -660,18 +660,23 @@ export interface IChannelState {
 	 * Residual: the signature material of the dropped in-flight record is
 	 * kept, because a reorg deeper than SPLICE_CONFLICT_DEPTH that let the
 	 * splice confirm after both sides reverted would put the channel's funds
-	 * under the NEW 2-of-2, and only this material (the peer's signature on
-	 * our spliced commitment, its HTLC signatures, the feerate they were made
-	 * at, the peer's funding key and the transaction itself) could close that
-	 * funding at all. Such a reorg is the risk an operator accepts by running
-	 * a depth-6 verdict; the record makes the recovery possible rather than
-	 * automatic. Optional for rows written before the field existed (treated
-	 * as empty).
+	 * under the NEW 2-of-2. That funding is then closeable cooperatively, or
+	 * with the retained signatures ONLY if no update followed the revert: the
+	 * peer's signature covers our spliced commitment at `commitmentNumber`,
+	 * and the channel keeps advancing (and revoking) on the old funding with
+	 * the shared commitment number, so after the first post-revert update the
+	 * retained commitment is a revoked state on the new funding and
+	 * broadcasting it would hand the peer a penalty. Such a reorg is the risk
+	 * an operator accepts by running a depth-6 verdict; the record states it,
+	 * it does not recover from it. Optional for rows written before the field
+	 * existed (treated as empty).
 	 */
 	revertedSplices?: Array<{
 		spliceTxid: string;
 		conflictTxid: string;
 		revertedAt: number;
+		/** Our commitment number the retained remoteCommitmentSig covers. */
+		commitmentNumber: string;
 		spliceTxHex: string;
 		newFundingOutputIndex: number;
 		remoteFundingPubkey: string;

@@ -36,6 +36,12 @@ the depth exists to protect against.
 
 Requirements:
 
+- An acceptor MUST NOT honour a `lock_depth` larger than it is prepared to
+  wait: until the lock the channel cannot cooperatively close and a force
+  close cannot adopt the splice, so the depth is how long the initiator alone
+  could close the channel. Beignet honours at most 6
+  (`SPLICE_LOCK_DEPTH_ACCEPT_MAX`), asks for at most 6, and answers a larger
+  request with `tx_abort` before any input is added.
 - A node that sent or echoed `lock_depth` MUST NOT send `splice_locked` for
   that splice before the splice transaction has `lock_depth` confirmations,
   even if `option_zeroconf` was negotiated. (The splicing draft already says a
@@ -69,11 +75,13 @@ So the recovery is to drop the splice candidate on both sides and continue on
 the old funding, once BOTH have verified the conflict on their own chain view.
 Neither side ever reverts on the other's word.
 
-Detection: while a depth-locked splice with external inputs is pending, the
-chain watcher watches each external input's outpoint. A confirmed spend of it
-by a transaction other than the splice, at `SPLICE_CONFLICT_DEPTH` (6)
-confirmations, while the splice itself has no confirmed entry, is a conflict.
-A mempool-only conflict is not.
+Detection: while a depth-locked splice is pending, BOTH sides watch every
+splice input that is neither the shared 2-of-2 funding input nor one of their
+own wallet inputs (the acceptor therefore watches the initiator's inputs too,
+so a wallet that double spends and goes silent cannot pin the LSP). A
+confirmed spend of such an outpoint by a transaction other than the splice,
+at `SPLICE_CONFLICT_DEPTH` (6) confirmations, while the splice itself has no
+confirmed entry, is a conflict. A mempool-only conflict is not.
 
 Messages, on beignet's custom message type (44069):
 
@@ -82,23 +90,47 @@ Messages, on beignet's custom message type (44069):
 | 64      | `splice_conflict`    | `[32 channel_id][32 splice_txid][32 conflict_txid][u16 input_index]` (98 bytes; txids in internal byte order) |
 | 65      | `splice_conflict_ack`| `[32 channel_id][32 splice_txid][u8 agreed][u16 reason_len][reason utf8]` (`agreed` 0 or 1; reason at most 256 bytes) |
 
-Flow:
+Flow. The exchange runs under quiescence, as every fundamental channel
+change does: between one side's revert and the other's, no update may be in
+flight, or a commitment round crossing that window would be signed against
+one funding on one side and two on the other.
 
 1. A node that observes the conflict records it durably on its in-flight
-   record, sends `splice_conflict` naming the splice, the conflicting
-   transaction and the splice input it spends, and re-sends it on reconnect
-   and on every block until the splice is reverted.
-2. The receiver verifies independently: the splice must be its own pending,
-   unlocked, unconfirmed one; the named input must not be the shared 2-of-2
-   funding input; the conflicting transaction must spend that input and sit
+   record and opens a quiescence handshake (`stfu`, initiator) on the
+   channel. Only once the channel is QUIESCENT with it as initiator does it
+   send `splice_conflict`, naming the splice, the conflicting transaction and
+   the splice input it spends. A handshake the peer owns is not contested:
+   the peer is asking the same thing, and the node answers instead. The
+   request is re-made on reconnect and on every block until the splice is
+   reverted, with a backoff after a request that timed out.
+2. The receiver requires the channel to be quiescent with the peer as
+   initiator (else `agreed = 0`, "not quiescent", nothing changes), then
+   verifies independently: the splice must be its own pending, unlocked,
+   unconfirmed one; the named input must not be the shared 2-of-2 funding
+   input; the conflicting transaction must spend that input and sit
    `SPLICE_CONFLICT_DEPTH` deep in the input's script history while the splice
-   does not. If all of that holds it reverts and answers `agreed = 1`;
-   otherwise `agreed = 0` with a reason and changes nothing.
-3. A node whose request is answered `agreed = 1` reverts. `agreed = 0` keeps
-   the record (the peer may be behind on the chain) and the next block
-   re-asks. Both sides may detect and ask at once; each verifies, reverts and
-   acks, and an ack for a splice already reverted is ignored.
-4. A node that has already reverted a splice answers `agreed = 1` to a late
+   does not. If all of that holds it reverts, commits the revert to disk, and
+   answers `agreed = 1`; a revert whose commit failed answers `agreed = 0` so
+   the peer re-asks. Otherwise `agreed = 0` with a reason and nothing changes.
+   One verification runs per channel at a time and a refuted claim is not
+   re-fetched until the next block.
+3. `splice_conflict_ack` ends the quiescence session on both sides, whatever
+   it says: the receiver leaves it as it acks (the revert itself exits
+   quiescence), the requester as it acts on the ack. A node whose request is
+   answered `agreed = 1` reverts. `agreed = 0` keeps the record (the peer may
+   be behind on the chain), leaves quiescence, and the next block re-asks.
+   Ordered delivery makes the remaining window safe: the receiver's updates
+   after its ack arrive after the ack, by which time the requester has
+   reverted, and neither side sends an update before its own revert because
+   both are quiescent. Both sides may detect and ask at once; the funder
+   tie-break decides whose session it is, the other side answers, and an ack
+   for a splice already reverted is ignored.
+4. A requester that hears nothing within 60 seconds (a peer that does not
+   speak the extension, or one whose handshake never completed) abandons the
+   request and disconnects the peer: quiescence has no un-stfu, and a
+   disconnect is the one reset the spec gives it. The reconnect re-asks
+   after a backoff.
+5. A node that has already reverted a splice answers `agreed = 1` to a late
    request about it, from a durable list, so a restart on one side cannot
    leave the other mid-splice.
 
@@ -108,11 +140,23 @@ re-arm the funding watch on the old outpoint (a splice watch replaces it),
 persist, and emit `splice:reverted`. Signature material for the abandoned
 splice is retained on the channel for the residual below.
 
-Residual: a reorg deeper than `SPLICE_CONFLICT_DEPTH` that un-mines the
+Residuals. A depth-locked splice that never confirms and never sees a
+confirmed conflict either (the payer's parent transaction reorged out and
+replaced, an input the network will not relay, a mempool-only double spend
+kept alive) leaves the channel SPLICING: HTLCs still flow and a force close on
+the old funding still works, but no further splice can start until the
+transaction confirms or a conflict does. The per-block rebroadcast covers
+eviction only. A reorg deeper than `SPLICE_CONFLICT_DEPTH` that un-mines the
 double spend and lets the splice confirm after both sides reverted would put
-the channel's funds in the new 2-of-2, closeable only with the retained
-signatures or the peer's cooperation. The same depth class the rest of the
-node treats as final.
+the channel's funds in the new 2-of-2. That funding is closeable
+cooperatively, or with the retained signatures only if no update followed the
+revert: the retained signature covers our spliced commitment at the
+`commitmentNumber` recorded with it, and the channel keeps advancing (and
+revoking) on the old funding with the shared commitment number, so after the
+first post-revert update the retained commitment is a revoked state on the
+new funding and broadcasting it would hand the peer a penalty. Beignet builds
+no recovery path for this; it records the material and states the residual.
+The same depth class the rest of the node treats as final.
 
 ## Interaction with the rest of the node
 

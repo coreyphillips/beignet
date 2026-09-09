@@ -15,6 +15,11 @@
  *    funding watch reports at the lock depth, and the lock at depth completes
  *    the splice without owing a rebroadcast,
  *  - an acceptor that drops the echo gets tx_abort before any tx_add_input,
+ *  - a parked request fires with the depth it was made with, whatever
+ *    request was refused while it waited, and a plain request that follows a
+ *    refused or aborted depth-locked one carries no depth,
+ *  - an acceptor honours at most SPLICE_LOCK_DEPTH_ACCEPT_MAX and refuses
+ *    more with tx_abort before any session exists,
  *  - the depth survives the durable record and a restart re-arms the funding
  *    watch with it.
  */
@@ -58,12 +63,17 @@ import {
 	ISpliceAckMessage,
 	SPLICE_LOCK_DEPTH_TLV,
 	SPLICE_LOCK_DEPTH_MAX,
+	SPLICE_LOCK_DEPTH_ACCEPT_MAX,
 	encodeSpliceMessage,
 	decodeSpliceMessage,
 	encodeSpliceAckMessage,
 	decodeSpliceAckMessage,
 	decodeSpliceLockedMessage
 } from '../../src/lightning/message/splice';
+import {
+	estimateSpliceTxWeight,
+	spliceFeeSats
+} from '../../src/lightning/channel/splice-weight';
 import { decodeStfuMessage } from '../../src/lightning/message/stfu';
 import {
 	decodeTxAddInputMessage,
@@ -900,6 +910,303 @@ describe('Splice lock depth on a zero-conf channel (issue #760)', function () {
 			JSON.stringify(serializeChannelState(pair.opener.getFullState()))
 		).to.equal(preState);
 	});
+
+	/** A fresh P2WPKH destination for a splice-out. */
+	const destScript = (): Buffer =>
+		Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]);
+
+	/**
+	 * node.spliceOut's arithmetic: the destination receives the withdrawal,
+	 * the on-chain fee rides in the declared relative.
+	 */
+	const spliceOutRelative = (dest: Buffer, withdraw: bigint): bigint =>
+		-(
+			withdraw +
+			spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 0,
+					destinationScriptLen: dest.length
+				}),
+				253
+			)
+		);
+
+	/** Park a depth-locked splice-in: stfu leaves, the request waits. */
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const parkDepthLocked = (pair: IWirePair, wallet: IOwnWallet): any[] => {
+		pair.opener.setSpliceInInputs(wallet.inputs, wallet.changeScript, {
+			lockAtDepth: LOCK_DEPTH
+		});
+		const first = pair.opener.initiateSplice(SPLICE_AMOUNT, 253);
+		expect(
+			findSendAction(first, MessageType.STFU),
+			'stfu left, the splice is parked'
+		).to.not.equal(undefined);
+		expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+		return first;
+	};
+
+	const assertDepthLockedSplice = (pair: IWirePair): void => {
+		expect(pair.errors).to.deep.equal([]);
+		const inits = sentBy(pair, pair.opener, MessageType.SPLICE);
+		expect(inits, 'exactly one splice_init').to.have.length(1);
+		const init = decodeSpliceMessage(inits[0]);
+		expect(init.lockDepth, 'splice_init carries the depth').to.equal(
+			LOCK_DEPTH
+		);
+		expect(init.relativeSatoshis, 'the parked splice-in fired').to.equal(
+			SPLICE_AMOUNT
+		);
+		const acks = sentBy(pair, pair.acceptor, MessageType.SPLICE_ACK);
+		expect(acks).to.have.length(1);
+		expect(decodeSpliceAckMessage(acks[0]).lockDepth).to.equal(LOCK_DEPTH);
+		for (const ch of [pair.opener, pair.acceptor]) {
+			expect(sentBy(pair, ch, MessageType.SPLICE_LOCKED)).to.have.length(0);
+			expect(ch.getState()).to.equal(ChannelState.SPLICING);
+			const record = ch.getFullState().spliceInFlight!;
+			expect(record.fullySigned).to.equal(true);
+			expect(record.lockAtDepth).to.equal(LOCK_DEPTH);
+		}
+		for (const w of actionsOfType(pair, ChannelActionType.WATCH_FUNDING)) {
+			expect(w.action.minimumDepth).to.equal(LOCK_DEPTH);
+		}
+	};
+
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const isTransientRefusal = (actions: any[]): boolean =>
+		actions.some(
+			(a) => a.type === ChannelActionType.ERROR && a.transient === true
+		);
+
+	/** The three shapes a request can take while another one is parked. */
+	const interferences: Array<[string, (pair: IWirePair) => void]> = [
+		[
+			'a bare second initiateSplice',
+			(pair): void => {
+				expect(
+					isTransientRefusal(pair.opener.initiateSplice(100_000n, 253))
+				).to.equal(true);
+			}
+		],
+		[
+			'a JIT splice-in: setSpliceInInputs without options, then initiateSplice',
+			(pair): void => {
+				const jit = makeOwnSpliceWallet();
+				pair.opener.setSpliceInInputs(jit.inputs, jit.changeScript);
+				expect(
+					isTransientRefusal(pair.opener.initiateSplice(100_000n, 253))
+				).to.equal(true);
+			}
+		],
+		[
+			'a splice-out: setSpliceOutDestination, then initiateSplice',
+			(pair): void => {
+				const dest = destScript();
+				pair.opener.setSpliceOutDestination(dest, 100_000n);
+				expect(
+					isTransientRefusal(
+						pair.opener.initiateSplice(spliceOutRelative(dest, 100_000n), 253)
+					)
+				).to.equal(true);
+			}
+		]
+	];
+
+	for (const [label, interfere] of interferences) {
+		it(`a parked depth-locked request keeps its depth across ${label}`, function () {
+			const pair = makeZeroConfWirePair();
+			const wallet = makeOwnSpliceWallet();
+			const first = parkDepthLocked(pair, wallet);
+			// The interfering request lands before the peer answers the stfu
+			// and is refused as busy; it must not strip the parked request.
+			interfere(pair);
+			// Now the peer's stfu answer arrives and the parked splice fires.
+			pair.enqueue(pair.acceptor, pair.opener, first);
+			pair.pump();
+			assertDepthLockedSplice(pair);
+		});
+	}
+
+	it('control: a parked depth-locked request fires with its depth when nothing interferes', function () {
+		const pair = makeZeroConfWirePair();
+		const first = parkDepthLocked(pair, makeOwnSpliceWallet());
+		pair.enqueue(pair.acceptor, pair.opener, first);
+		pair.pump();
+		assertDepthLockedSplice(pair);
+	});
+
+	it('the reverse leak is closed: a plain splice-out after an aborted depth-locked request carries no lockDepth', function () {
+		const pair = makeZeroConfWirePair();
+		// The stripped-echo abort from above: a depth-locked request that died
+		// at splice_ack.
+		pair.intercept(MessageType.SPLICE_ACK, (payload) => {
+			const ack = decodeSpliceAckMessage(payload);
+			delete ack.lockDepth;
+			return encodeSpliceAckMessage(ack);
+		});
+		startSpliceIn(pair, makeOwnSpliceWallet(), { lockAtDepth: LOCK_DEPTH });
+		expect(sentBy(pair, pair.opener, MessageType.TX_ABORT)).to.have.length(1);
+		expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+		pair.errors.length = 0;
+
+		// A plain splice-out follows on the same channel.
+		const dest = destScript();
+		const withdraw = 100_000n;
+		pair.opener.setSpliceOutDestination(dest, withdraw);
+		pair.enqueue(
+			pair.acceptor,
+			pair.opener,
+			pair.opener.initiateSplice(spliceOutRelative(dest, withdraw), 253)
+		);
+		pair.pump();
+		expect(pair.errors).to.deep.equal([]);
+
+		const inits = sentBy(pair, pair.opener, MessageType.SPLICE);
+		expect(inits, 'the aborted attempt and the splice-out').to.have.length(2);
+		const init = decodeSpliceMessage(inits[1]);
+		expect(init.lockDepth, 'no depth leaks into the splice-out').to.be
+			.undefined;
+		expect(init.relativeSatoshis < 0n).to.equal(true);
+		const acks = sentBy(pair, pair.acceptor, MessageType.SPLICE_ACK);
+		expect(acks).to.have.length(2);
+		expect(decodeSpliceAckMessage(acks[1]).lockDepth).to.be.undefined;
+		// And it behaves as a plain zero-conf splice: locked at tx_signatures.
+		expect(sentBy(pair, pair.opener, MessageType.SPLICE_LOCKED)).to.have.length(
+			1
+		);
+		expect(
+			sentBy(pair, pair.acceptor, MessageType.SPLICE_LOCKED)
+		).to.have.length(1);
+		for (const ch of [pair.opener, pair.acceptor]) {
+			expect(ch.getState()).to.equal(ChannelState.NORMAL);
+			expect(ch.getFullState().spliceInFlight).to.equal(null);
+		}
+	});
+
+	it('the reverse leak is closed: a refused depth-locked request leaves no depth on a parked splice-out', function () {
+		const pair = makeZeroConfWirePair();
+		// A plain splice-out is parked first.
+		const dest = destScript();
+		const withdraw = 100_000n;
+		pair.opener.setSpliceOutDestination(dest, withdraw);
+		const first = pair.opener.initiateSplice(
+			spliceOutRelative(dest, withdraw),
+			253
+		);
+		expect(findSendAction(first, MessageType.STFU)).to.not.equal(undefined);
+		// A depth-locked splice-in is refused as busy while it waits.
+		const wallet = makeOwnSpliceWallet();
+		pair.opener.setSpliceInInputs(wallet.inputs, wallet.changeScript, {
+			lockAtDepth: LOCK_DEPTH
+		});
+		expect(
+			isTransientRefusal(pair.opener.initiateSplice(SPLICE_AMOUNT, 253))
+		).to.equal(true);
+		// The peer answers the stfu: the parked splice-out fires, as itself.
+		pair.enqueue(pair.acceptor, pair.opener, first);
+		pair.pump();
+		expect(pair.errors).to.deep.equal([]);
+
+		const inits = sentBy(pair, pair.opener, MessageType.SPLICE);
+		expect(inits).to.have.length(1);
+		const init = decodeSpliceMessage(inits[0]);
+		expect(init.lockDepth).to.be.undefined;
+		expect(init.relativeSatoshis < 0n, 'the splice-out fired').to.equal(true);
+		expect(
+			decodeSpliceAckMessage(
+				sentBy(pair, pair.acceptor, MessageType.SPLICE_ACK)[0]
+			).lockDepth
+		).to.be.undefined;
+		for (const w of actionsOfType(pair, ChannelActionType.WATCH_FUNDING)) {
+			expect(w.action.minimumDepth).to.equal(0);
+		}
+		for (const ch of [pair.opener, pair.acceptor]) {
+			expect(sentBy(pair, ch, MessageType.SPLICE_LOCKED)).to.have.length(1);
+			expect(ch.getState()).to.equal(ChannelState.NORMAL);
+		}
+	});
+
+	it('the acceptor refuses a lock depth above the cap with tx_abort, before any session exists', function () {
+		expect(SPLICE_LOCK_DEPTH_ACCEPT_MAX).to.equal(6);
+		const pair = makeZeroConfWirePair();
+		// The initiator asks for more than this node honours: rewrite the
+		// splice_init on the wire so our own initiator bound does not stop it.
+		pair.intercept(MessageType.SPLICE, (payload) => {
+			const init = decodeSpliceMessage(payload);
+			init.lockDepth = SPLICE_LOCK_DEPTH_ACCEPT_MAX + 1;
+			return encodeSpliceMessage(init);
+		});
+		const acceptorBefore = JSON.stringify(
+			serializeChannelState(pair.acceptor.getFullState())
+		);
+		startSpliceIn(pair, makeOwnSpliceWallet(), { lockAtDepth: LOCK_DEPTH });
+
+		expect(
+			decodeSpliceMessage(sentBy(pair, pair.opener, MessageType.SPLICE)[0])
+				.lockDepth
+		).to.equal(7);
+		// The acceptor answered on the wire, never opened a session.
+		expect(sentBy(pair, pair.acceptor, MessageType.TX_ABORT)).to.have.length(1);
+		expect(sentBy(pair, pair.acceptor, MessageType.SPLICE_ACK)).to.have.length(
+			0
+		);
+		expect(
+			pair.errorsFrom.some(
+				(e) =>
+					e.from === pair.acceptor &&
+					/lock_depth 7 exceeds the 6 this node honours/.test(e.message)
+			)
+		).to.equal(true);
+		expect(pair.acceptor.getSpliceSession()).to.equal(null);
+		expect(pair.acceptor.getFullState().spliceInFlight).to.equal(null);
+		expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+		expect(pair.acceptor.isQuiescent()).to.equal(false);
+		expect(
+			JSON.stringify(serializeChannelState(pair.acceptor.getFullState())),
+			'the acceptor state is what it was before the request'
+		).to.equal(acceptorBefore);
+		// The initiator unwound on the peer's tx_abort.
+		expect(sentBy(pair, pair.opener, MessageType.TX_ADD_INPUT)).to.have.length(
+			0
+		);
+		expect(pair.broadcasts).to.have.length(0);
+		expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+		expect(pair.opener.getFullState().spliceInFlight).to.equal(null);
+		expect(pair.opener.getSpliceSession()).to.equal(null);
+		expect(pair.opener.isQuiescent()).to.equal(false);
+		expect(
+			actionsOfType(pair, ChannelActionType.SPLICE_ABORTED).some(
+				(a) => a.from === pair.opener
+			)
+		).to.equal(true);
+	});
+
+	it('the acceptor honours a lock depth at the cap', function () {
+		const pair = makeZeroConfWirePair();
+		startSpliceIn(pair, makeOwnSpliceWallet(), {
+			lockAtDepth: SPLICE_LOCK_DEPTH_ACCEPT_MAX
+		});
+		expect(pair.errors).to.deep.equal([]);
+		expect(
+			decodeSpliceMessage(sentBy(pair, pair.opener, MessageType.SPLICE)[0])
+				.lockDepth
+		).to.equal(SPLICE_LOCK_DEPTH_ACCEPT_MAX);
+		expect(
+			decodeSpliceAckMessage(
+				sentBy(pair, pair.acceptor, MessageType.SPLICE_ACK)[0]
+			).lockDepth
+		).to.equal(SPLICE_LOCK_DEPTH_ACCEPT_MAX);
+		for (const ch of [pair.opener, pair.acceptor]) {
+			expect(sentBy(pair, ch, MessageType.SPLICE_LOCKED)).to.have.length(0);
+			expect(ch.getState()).to.equal(ChannelState.SPLICING);
+			expect(ch.getFullState().spliceInFlight!.lockAtDepth).to.equal(
+				SPLICE_LOCK_DEPTH_ACCEPT_MAX
+			);
+		}
+		for (const w of actionsOfType(pair, ChannelActionType.WATCH_FUNDING)) {
+			expect(w.action.minimumDepth).to.equal(SPLICE_LOCK_DEPTH_ACCEPT_MAX);
+		}
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -1171,7 +1478,14 @@ describe('Splice lock depth on the node (issue #760)', function () {
 		const before = JSON.stringify(
 			serializeChannelState(channel.getFullState())
 		);
-		for (const bad of [0, 1.5, SPLICE_LOCK_DEPTH_MAX + 1]) {
+		// 7 is one past the depth this node itself honours as an acceptor
+		// (SPLICE_LOCK_DEPTH_ACCEPT_MAX); 2017 is past what the TLV carries.
+		for (const bad of [
+			0,
+			1.5,
+			SPLICE_LOCK_DEPTH_ACCEPT_MAX + 1,
+			SPLICE_LOCK_DEPTH_MAX + 1
+		]) {
 			expect(
 				() =>
 					fx.alice.spliceInWithInputs(
@@ -1185,7 +1499,7 @@ describe('Splice lock depth on the node (issue #760)', function () {
 				`lockAtDepth ${bad}`
 			).to.throw(
 				InvalidSpliceError,
-				/lockAtDepth must be an integer between 1 and 2016/
+				/lockAtDepth must be an integer between 1 and 6/
 			);
 		}
 		// Nothing reached the channel: no stfu left, no inputs were parked, no
@@ -1203,6 +1517,24 @@ describe('Splice lock depth on the node (issue #760)', function () {
 		expect(
 			JSON.stringify(serializeChannelState(channel.getFullState()))
 		).to.equal(before);
+
+		// The cap itself is admitted: whatever the request goes on to do with
+		// the peer, the depth argument is not what stops it.
+		let depthRefusal: string | null = null;
+		try {
+			fx.alice.spliceInWithInputs(
+				fx.channelId,
+				100_000n,
+				[makeNodeInput(200_000)],
+				p2wpkhScript(),
+				253,
+				{ lockAtDepth: SPLICE_LOCK_DEPTH_ACCEPT_MAX }
+			);
+		} catch (err: unknown) {
+			if (err instanceof InvalidSpliceError && /lockAtDepth/.test(err.message))
+				depthRefusal = err.message;
+		}
+		expect(depthRefusal, 'lockAtDepth 6 is accepted').to.equal(null);
 		fx.destroy();
 	});
 

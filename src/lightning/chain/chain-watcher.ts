@@ -266,8 +266,12 @@ interface IWatchedSpliceInput {
 	/** The spent outpoint, txid in display byte order. */
 	txid: string;
 	vout: number;
-	scriptHash: string;
-	script: Buffer;
+	/**
+	 * The outpoint's script hash. Absent when the record that armed the watch
+	 * predates inputPrevouts and could not name the script; the first sweep
+	 * reads it off the outpoint's own parent transaction, verified by hash.
+	 */
+	scriptHash?: string;
 	/**
 	 * The conflicting txid last reported for this input. The verdict fires
 	 * once; it fires again only if the chain names a different spender.
@@ -1046,7 +1050,7 @@ export class ChainWatcher extends EventEmitter {
 	watchSpliceInput(
 		channelId: Buffer,
 		spliceTxidDisplayHex: string,
-		input: { txid: string; vout: number; script: Buffer; inputIndex: number }
+		input: { txid: string; vout: number; script?: Buffer; inputIndex: number }
 	): void {
 		if (!this.acceptingWork) return;
 		const key = spliceInputWatchKey(
@@ -1068,8 +1072,7 @@ export class ChainWatcher extends EventEmitter {
 			inputIndex: input.inputIndex,
 			txid: input.txid,
 			vout: input.vout,
-			scriptHash: computeScriptHash(input.script),
-			script: input.script,
+			scriptHash: input.script ? computeScriptHash(input.script) : undefined,
 			spendsOutpoint: new Map()
 		});
 	}
@@ -1151,6 +1154,17 @@ export class ChainWatcher extends EventEmitter {
 	): Promise<void> {
 		// No height, no depth: the first header has not arrived.
 		if (this.currentBlockHeight <= 0) return;
+		if (watched.scriptHash === undefined) {
+			// The record could not name the script: the parent transaction can,
+			// and it answers for itself by hash.
+			const parentRaw = await this.backend.getTransaction(watched.txid);
+			if (!this.isCurrentGeneration(generation)) return;
+			if (this.watchedSpliceInputs.get(key) !== watched) return;
+			const parent = bitcoin.Transaction.fromBuffer(parentRaw);
+			const prevout = parent.outs[watched.vout];
+			if (parent.getId() !== watched.txid || !prevout) return;
+			watched.scriptHash = computeScriptHash(Buffer.from(prevout.script));
+		}
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
 		if (!this.isCurrentGeneration(generation)) return;
 		if (this.watchedSpliceInputs.get(key) !== watched) return;

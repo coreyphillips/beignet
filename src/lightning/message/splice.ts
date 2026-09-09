@@ -67,8 +67,17 @@ export interface ISpliceAckMessage {
  * so it cannot collide with a type the splicing spec assigns later.
  */
 export const SPLICE_LOCK_DEPTH_TLV = 65537;
-/** The largest lock depth a splice_init may ask for (two weeks of blocks). */
+/** The largest lock depth the TLV can carry (two weeks of blocks). */
 export const SPLICE_LOCK_DEPTH_MAX = 2016;
+/**
+ * The largest lock depth beignet will ask for or honour (issue #760). While
+ * a splice waits for its lock the channel cannot cooperatively close and a
+ * force close cannot adopt the splice, so a peer choosing the depth chooses
+ * how long it alone can close the channel; six blocks is the depth the rest
+ * of the node treats as final, and an initiator asking for more is refused
+ * with tx_abort before any input is added.
+ */
+export const SPLICE_LOCK_DEPTH_ACCEPT_MAX = 6;
 
 function writeBigSize(n: number): Buffer {
 	if (n < 0xfd) return Buffer.from([n]);

@@ -242,6 +242,7 @@ import {
 	IStartBatchMessage,
 	encodeSpliceMessage,
 	encodeSpliceAckMessage,
+	SPLICE_LOCK_DEPTH_ACCEPT_MAX,
 	encodeSpliceLockedMessage,
 	encodeStartBatchMessage
 } from '../message/splice';
@@ -882,6 +883,18 @@ export class Channel {
 	// request is parked here: a second is refused rather than replacing it,
 	// since only one can be fired (issue #655). Memory-only: quiescence never
 	// survives a disconnect.
+	/**
+	 * A conflicted-splice revert request parked behind our own quiescence
+	 * handshake (issue #760). The revert is a fundamental channel change and
+	 * runs under quiescence like every other one: SPLICE_CONFLICT leaves only
+	 * once the channel is QUIESCENT with us as initiator, so neither side has
+	 * an update in flight when one of them drops the splice candidate. The
+	 * peer's SPLICE_CONFLICT_ACK ends the session on both sides (agreed or
+	 * not): the peer exits as it acks, we exit as we act on it. Memory-only,
+	 * like the quiescence it rides: a disconnect drops both and the reconnect
+	 * re-asks.
+	 */
+	private _pendingConflictRequest: { requestedAt: number } | null = null;
 	private _pendingSplice: {
 		relativeSatoshis: bigint;
 		fundingFeeratePerkw: number;
@@ -1055,6 +1068,14 @@ export class Channel {
 	private _spliceInInputs: {
 		inputs: ISpliceWalletInput[];
 		changeScript: Buffer;
+		/**
+		 * Issue #760: the lock depth this request asked for, kept WITH the
+		 * request so a parked splice fires with the depth it was made with
+		 * even after a later request or a reset touched the channel's own
+		 * fields (a second offer, a JIT splice, a splice-out while the peer's
+		 * stfu answer was pending). Absent: the channel type decides.
+		 */
+		lockAtDepth?: number;
 	} | null = null;
 	/**
 	 * Issue #760: the depth the CURRENT splice negotiation locks at, on both
@@ -8028,6 +8049,7 @@ export class Channel {
 		this._spliceSession = null;
 		this._resetSpliceDriver();
 		this._pendingSplice = null;
+		this._pendingConflictRequest = null;
 		this._quiescence.reset();
 		this._stfuReplyOwed = false;
 		this._state.quiescenceState = QuiescenceState.NORMAL;
@@ -8255,8 +8277,10 @@ export class Channel {
 		}
 
 		// A disconnect aborts any quiescence handshake, so a splice we were waiting
-		// to start can never fire. Drop it rather than leave it dangling.
+		// to start can never fire. Drop it rather than leave it dangling. The
+		// same for a conflict revert request (issue #760): the reconnect re-asks.
 		this._pendingSplice = null;
+		this._pendingConflictRequest = null;
 
 		// FFOR section 7.5.5: before ACTIVE a disconnect aborts the setup.
 		this._fforOnDisconnect();
@@ -10078,6 +10102,149 @@ export class Channel {
 	}
 
 	/**
+	 * Issue #760: the one non-NORMAL state that admits a quiescence handshake.
+	 * A depth-locked splice in its pending-lock window carries update traffic
+	 * (both commitments advance in lockstep), and the conflict revert that
+	 * may end that window is a fundamental channel change, so it runs under
+	 * quiescence like a splice does. Admitted only for a splice that locks at
+	 * depth, the sole kind that can be conflicted; an ordinary pending-lock
+	 * splice keeps refusing stfu as before.
+	 */
+	private _inConflictRevertWindow(): boolean {
+		const inflight = this._state.spliceInFlight;
+		return (
+			this.isSplicePendingLock() &&
+			!!inflight?.lockAtDepth &&
+			!inflight.confirmed &&
+			!inflight.localSpliceLocked
+		);
+	}
+
+	/** NORMAL, or the conflict revert window (issue #760). */
+	private _quiescenceAdmitsState(): boolean {
+		return (
+			this._state.state === ChannelState.NORMAL ||
+			this._inConflictRevertWindow()
+		);
+	}
+
+	/** Whether this side opened the quiescence session that is live. */
+	isQuiescenceInitiator(): boolean {
+		return this._quiescence.isInitiator();
+	}
+
+	/** A conflict revert request is parked or in flight (issue #760). */
+	hasPendingSpliceConflictRequest(): boolean {
+		return this._pendingConflictRequest !== null;
+	}
+
+	/**
+	 * Ask the peer to revert the conflicted splice, under quiescence (issue
+	 * #760). Parks the request and opens our own handshake; the
+	 * SPLICE_CONFLICT_REQUEST_READY action follows once the channel is
+	 * QUIESCENT with us as initiator (at once if it already is), and the node
+	 * puts SPLICE_CONFLICT on the wire then and only then. A handshake the
+	 * peer owns refuses transiently: the peer is most likely asking us the
+	 * same thing, and we answer that instead. Pending HTLCs refuse
+	 * transiently too; the next block re-asks.
+	 */
+	requestSpliceConflictRevert(): ChannelAction[] {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight?.conflict || !this._inConflictRevertWindow()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot request a splice revert: no conflicted splice pending lock'
+				}
+			];
+		}
+		if (this._pendingConflictRequest) return [];
+		if (this._quiescence.isQuiescent()) {
+			if (!this._quiescence.isInitiator()) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: SPLICE_BUSY_PEER_QUIESCENCE,
+						transient: true
+					}
+				];
+			}
+			this._pendingConflictRequest = { requestedAt: Date.now() };
+			return [this._conflictRequestReadyAction()];
+		}
+		if (this._quiescence.peerHasSentStfu()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: SPLICE_BUSY_PEER_QUIESCENCE,
+					transient: true
+				}
+			];
+		}
+		if (this._quiescence.getState() === QuiescenceState.SENT_STFU) {
+			// Our stfu is already out (a request from a moment ago whose reply
+			// has not landed): this request rides it.
+			this._pendingConflictRequest = { requestedAt: Date.now() };
+			return [];
+		}
+		if (this.hasPendingHtlcs()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: QUIESCE_BUSY_PENDING_HTLCS,
+					transient: true
+				}
+			];
+		}
+		if (!this._quiescence.initiate()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot quiesce: already quiescing',
+					transient: true
+				}
+			];
+		}
+		this._pendingConflictRequest = { requestedAt: Date.now() };
+		this._state.quiescenceState = QuiescenceState.SENT_STFU;
+		this._state.quiescenceInitiator = true;
+		const msg: IStfuMessage = {
+			channelId: this._state.channelId!,
+			initiator: true
+		};
+		return [sendMsg(MessageType.STFU, encodeStfuMessage(msg))];
+	}
+
+	private _conflictRequestReadyAction(): ChannelAction {
+		return {
+			type: ChannelActionType.SPLICE_CONFLICT_REQUEST_READY,
+			channelId: this._state.channelId!
+		};
+	}
+
+	/**
+	 * End the quiescence session a conflict revert exchange opened without a
+	 * revert (issue #760): the peer answered agreed=0, or never answered and
+	 * the node is disconnecting it. Both sides leave the session on the ack
+	 * by protocol; a session the peer never completed is simply reset, and
+	 * the caller's disconnect resets the peer's copy. No update leaves here,
+	 * so the pre-splice commitments stay in step.
+	 */
+	abandonSpliceConflictRequest(): ChannelAction[] {
+		this._pendingConflictRequest = null;
+		if (this._quiescence.isQuiescent()) {
+			this._quiescence.exitQuiescence();
+		} else {
+			this._quiescence.reset();
+			this._stfuReplyOwed = false;
+		}
+		this._state.quiescenceState = QuiescenceState.NORMAL;
+		this._state.quiescenceInitiator = false;
+		return [];
+	}
+
+	/**
 	 * Initiate quiescence by sending STFU.
 	 * Cannot quiesce with pending HTLCs.
 	 */
@@ -10146,7 +10313,7 @@ export class Channel {
 	 */
 	private _maybeAnswerOwedStfu(): ChannelAction[] {
 		if (!this._stfuReplyOwed) return [];
-		if (this._state.state !== ChannelState.NORMAL) return [];
+		if (!this._quiescenceAdmitsState()) return [];
 		if (this.hasPendingHtlcs()) return [];
 		this._stfuReplyOwed = false;
 		const responseMsg: IStfuMessage = {
@@ -10168,7 +10335,7 @@ export class Channel {
 			this._fforStfuReplyStale = false;
 			return [];
 		}
-		if (this._state.state !== ChannelState.NORMAL) {
+		if (!this._quiescenceAdmitsState()) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -10249,6 +10416,19 @@ export class Channel {
 		if (this._fforPendingActivate && this._quiescence.isQuiescent()) {
 			this._fforPendingActivate = false;
 			actions.push(...this._fforSendActivate());
+		}
+
+		// A conflict revert request parked on our stfu (issue #760): the
+		// handshake is complete, SPLICE_CONFLICT may leave. If the peer opened
+		// the same handshake concurrently and won the funder tie-break, the
+		// session is the peer's: it is asking us, and we answer that request
+		// rather than send our own.
+		if (this._pendingConflictRequest && this._quiescence.isQuiescent()) {
+			if (this._quiescence.isInitiator()) {
+				actions.push(this._conflictRequestReadyAction());
+			} else {
+				this._pendingConflictRequest = null;
+			}
 		}
 
 		// If we drove quiescence in order to splice, fire the deferred splice now
@@ -10691,6 +10871,10 @@ export class Channel {
 		fundingFeeratePerkw: number,
 		locktime: number
 	): ChannelAction[] {
+		// The depth comes from the request that is starting now, never from a
+		// field a later request may have overwritten while this one was
+		// parked on the stfu (issue #760).
+		this._spliceLockAtDepth = this._spliceInInputs?.lockAtDepth ?? null;
 		const params: ISpliceSessionParams = {
 			channelId: this._state.channelId!,
 			localFundingPubkey: this._state.localBasepoints.fundingPubkey,
@@ -10851,6 +11035,20 @@ export class Channel {
 
 		// Fresh negotiation, fresh tx_abort conversation (see _startSplice).
 		this._txAbortSent = false;
+		// A lock depth we would have to honour for longer than the node
+		// treats anything as final is refused before a session exists
+		// (issue #760): until the lock we can neither cooperatively close nor
+		// force close onto the splice, so the depth is how long the peer
+		// alone could close the channel.
+		if (
+			msg.lockDepth !== undefined &&
+			msg.lockDepth > SPLICE_LOCK_DEPTH_ACCEPT_MAX
+		) {
+			return this.refuseSpliceInit(
+				`lock_depth ${msg.lockDepth} exceeds ${SPLICE_LOCK_DEPTH_ACCEPT_MAX}`,
+				`Cannot accept splice: lock_depth ${msg.lockDepth} exceeds the ${SPLICE_LOCK_DEPTH_ACCEPT_MAX} this node honours`
+			);
+		}
 		this._spliceSession = new SpliceSession(params);
 		const result = this._spliceSession.handleSplice(msg);
 		// The peer asked this splice to lock at depth (issue #760): it binds
@@ -11040,6 +11238,8 @@ export class Channel {
 	setSpliceOutDestination(script: Buffer, sats: bigint): void {
 		if (this._state.state !== ChannelState.NORMAL) return;
 		this._spliceInInputs = null;
+		// A splice-out never carries a lock depth (issue #760).
+		this._spliceLockAtDepth = null;
 		this._spliceOutDestination = { script, sats };
 	}
 
@@ -11056,11 +11256,20 @@ export class Channel {
 	): void {
 		if (this._state.state !== ChannelState.NORMAL) return;
 		this._spliceOutDestination = null;
-		this._spliceInInputs = { inputs, changeScript };
 		// A splice that must confirm before it locks, whatever the channel
 		// type (issue #760): a stranger's coin never becomes the live funding
-		// of a zero-conf channel at broadcast.
-		this._spliceLockAtDepth = options.lockAtDepth ?? null;
+		// of a zero-conf channel at broadcast. The depth belongs to THIS
+		// request; _startSplice copies it onto the channel when the session
+		// opens, so nothing that happens to the channel while the request
+		// is parked can strip it.
+		this._spliceInInputs = {
+			inputs,
+			changeScript,
+			...(options.lockAtDepth !== undefined
+				? { lockAtDepth: options.lockAtDepth }
+				: {})
+		};
+		this._spliceLockAtDepth = null;
 	}
 
 	/**
@@ -12057,6 +12266,7 @@ export class Channel {
 				spliceTxid,
 				conflictTxid,
 				revertedAt: Date.now(),
+				commitmentNumber: this._state.localCommitmentNumber.toString(),
 				spliceTxHex: inflight.spliceTxHex,
 				newFundingOutputIndex: inflight.newFundingOutputIndex,
 				remoteFundingPubkey: inflight.remoteFundingPubkey.toString('hex'),
@@ -12073,6 +12283,7 @@ export class Channel {
 
 		this._state.spliceInFlight = null;
 		this._spliceSession = null;
+		this._pendingConflictRequest = null;
 		this._resetSpliceDriver();
 		const target = this._state.preSpliceState ?? ChannelState.NORMAL;
 		this._state.preSpliceState = null;

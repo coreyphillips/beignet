@@ -54,7 +54,12 @@ import {
 	serializeChannelState
 } from '../../src/lightning/storage/serialization';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
-import { LightningNode } from '../../src/lightning/node/lightning-node';
+import {
+	LightningNode,
+	SPLICE_CONFLICT_REQUEST_BACKOFF_MS
+} from '../../src/lightning/node/lightning-node';
+import { MessageType } from '../../src/lightning/message/types';
+import { QuiescenceState } from '../../src/lightning/channel/quiescence';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -64,7 +69,11 @@ import {
 	BeignetCustomSubtype,
 	decodeCustomMessage
 } from '../../src/lightning/message/custom';
-import { decodeSpliceConflictAck } from '../../src/lightning/message/splice-conflict';
+import {
+	decodeSpliceConflictAck,
+	encodeSpliceConflict
+} from '../../src/lightning/message/splice-conflict';
+import { encodeCustomMessage } from '../../src/lightning/message/custom';
 import { DirectFundingReceiver } from '../../src/lightning/direct-funding/receiver/engine';
 import {
 	buildOffer,
@@ -1007,6 +1016,347 @@ describe('HTLC traffic through a splice revert on a manager pair (issue #760)', 
 	});
 });
 
+// ─────────────── The adversarial races, under quiescence ───────────────
+
+interface IRacePair {
+	openerManager: ChannelManager;
+	acceptorManager: ChannelManager;
+	channelId: Buffer;
+	openerChannel: Channel;
+	acceptorChannel: Channel;
+	fundingTxid: Buffer;
+	errors: Array<{ node: string; msg: string }>;
+	wireErrors: number;
+	/** Hold acceptor-to-opener delivery (the ordered wire, paused). */
+	holdAcceptorToOpener: (on: boolean) => void;
+	flush: () => void;
+	ready: Buffer[];
+}
+
+/**
+ * A manager pair mid depth-locked splice (pending lock, both sides
+ * conflicted), the shape the adversarial repro started from, with the
+ * acceptor holding a balance so it can add HTLCs too.
+ */
+function racePair(seed: number): IRacePair {
+	const openerConfig = makeConfig(seed);
+	const acceptorConfig = makeConfig(seed + 1);
+	const openerPubkey =
+		openerConfig.localBasepoints.fundingPubkey.toString('hex');
+	const acceptorPubkey =
+		acceptorConfig.localBasepoints.fundingPubkey.toString('hex');
+	const openerManager = new ChannelManager(openerConfig);
+	const acceptorManager = new ChannelManager(acceptorConfig);
+	const errors: Array<{ node: string; msg: string }> = [];
+	const pair = {
+		wireErrors: 0,
+		ready: [] as Buffer[]
+	};
+	openerManager.on('error', (_id: Buffer, msg: string) =>
+		errors.push({ node: 'opener', msg })
+	);
+	acceptorManager.on('error', (_id: Buffer, msg: string) =>
+		errors.push({ node: 'acceptor', msg })
+	);
+	let holding = false;
+	const held: Array<() => void> = [];
+	openerManager.on(
+		'message:outbound',
+		(peer: string, type: number, payload: Buffer) => {
+			if (type === MessageType.ERROR) pair.wireErrors++;
+			if (peer === acceptorPubkey)
+				acceptorManager.handleMessage(openerPubkey, type, payload);
+		}
+	);
+	acceptorManager.on(
+		'message:outbound',
+		(peer: string, type: number, payload: Buffer) => {
+			if (type === MessageType.ERROR) pair.wireErrors++;
+			if (peer !== openerPubkey) return;
+			const deliver = (): void =>
+				openerManager.handleMessage(acceptorPubkey, type, payload);
+			if (holding) held.push(deliver);
+			else deliver();
+		}
+	);
+	openerManager.on('splice:conflict-request-ready', (id: Buffer) =>
+		pair.ready.push(id)
+	);
+	acceptorManager.on('splice:conflict-request-ready', (id: Buffer) =>
+		pair.ready.push(id)
+	);
+	const openerChannel = openerManager.openChannel(acceptorPubkey, 1_000_000n);
+	const fundingTxid = crypto.randomBytes(32);
+	openerManager.createFunding(
+		openerChannel,
+		fundingTxid,
+		0,
+		crypto.randomBytes(64)
+	);
+	const channelId = openerChannel.getChannelId()!;
+	openerManager.handleFundingConfirmed(channelId);
+	acceptorManager.handleFundingConfirmed(channelId);
+	const acceptorChannel = acceptorManager.getChannelsByPeer(openerPubkey)[0];
+	openerManager.initiateQuiescence(channelId);
+	const wallet = makeSpliceInWallet(100_000n);
+	openerChannel.setSpliceInInputs([wallet.walletInput], wallet.changeScript, {
+		lockAtDepth: 2
+	});
+	expect(openerManager.initiateSplice(channelId, 100_000n, 253).ok).to.equal(
+		true
+	);
+	expect(openerChannel.isSplicePendingLock()).to.equal(true);
+	expect(acceptorChannel.isSplicePendingLock()).to.equal(true);
+	for (let i = 0; i < 2; i++) {
+		const preimage = crypto.randomBytes(32);
+		const hash = crypto.createHash('sha256').update(preimage).digest();
+		expect(
+			openerManager.addHtlc(
+				channelId,
+				150_000_000n,
+				hash,
+				500_000,
+				crypto.randomBytes(1366)
+			).ok
+		).to.equal(true);
+		acceptorManager.fulfillHtlc(channelId, BigInt(i), preimage);
+	}
+	expect(acceptorChannel.getFullState().htlcs.size).to.equal(0);
+	const conflict = { txid: 'cd'.repeat(32), height: 150, inputIndex: 1 };
+	expect(openerChannel.markSpliceConflicted(conflict)).to.equal(true);
+	expect(acceptorChannel.markSpliceConflicted(conflict)).to.equal(true);
+	errors.length = 0;
+	return {
+		openerManager,
+		acceptorManager,
+		channelId,
+		openerChannel,
+		acceptorChannel,
+		fundingTxid,
+		errors,
+		get wireErrors(): number {
+			return pair.wireErrors;
+		},
+		holdAcceptorToOpener: (on): void => {
+			holding = on;
+		},
+		flush: (): void => {
+			while (held.length) held.shift()!();
+		},
+		ready: pair.ready
+	};
+}
+
+function addAndSettle(
+	from: ChannelManager,
+	to: ChannelManager,
+	channelId: Buffer,
+	htlcId: bigint
+): void {
+	const preimage = crypto.randomBytes(32);
+	const hash = crypto.createHash('sha256').update(preimage).digest();
+	expect(
+		from.addHtlc(
+			channelId,
+			15_000_000n,
+			hash,
+			500_000,
+			crypto.randomBytes(1366)
+		).ok,
+		'add after the revert'
+	).to.equal(true);
+	to.fulfillHtlc(channelId, htlcId, preimage);
+}
+
+function expectBothNormalOnOldFunding(p: IRacePair): void {
+	for (const ch of [p.openerChannel, p.acceptorChannel]) {
+		const st = ch.getFullState();
+		expect(st.state).to.equal(ChannelState.NORMAL);
+		expect(st.spliceInFlight).to.equal(null);
+		expect(st.fundingTxid!.equals(p.fundingTxid)).to.equal(true);
+		expect(st.htlcs.size).to.equal(0);
+		expect(ch.isQuiescing()).to.equal(false);
+	}
+	expect(p.wireErrors, 'no wire error').to.equal(0);
+	expect(p.openerChannel.getBalances().localMsat).to.equal(
+		p.acceptorChannel.getBalances().remoteMsat
+	);
+}
+
+/**
+ * The exchange the node runs, at the manager level: the requester opens its
+ * quiescence handshake; once QUIESCENT as initiator the request is ready
+ * (the node would send SPLICE_CONFLICT here); the responder verifies (a
+ * given here) and reverts, which exits its quiescence, and acks; the
+ * requester reverts on the ack, which exits its own. `between` runs at the
+ * point the ack is on the wire but not yet processed.
+ */
+function runExchange(
+	p: IRacePair,
+	requester: 'opener' | 'acceptor',
+	between?: () => void
+): void {
+	const req = requester === 'opener' ? p.openerManager : p.acceptorManager;
+	const res = requester === 'opener' ? p.acceptorManager : p.openerManager;
+	const reqCh = requester === 'opener' ? p.openerChannel : p.acceptorChannel;
+	const resCh = requester === 'opener' ? p.acceptorChannel : p.openerChannel;
+	expect(req.requestSpliceConflictRevert(p.channelId).ok).to.equal(true);
+	expect(p.ready).to.have.length(1);
+	expect(reqCh.isQuiescent() && reqCh.isQuiescenceInitiator()).to.equal(true);
+	expect(resCh.isQuiescent() && !resCh.isQuiescenceInitiator()).to.equal(true);
+	// While both are quiescent neither side can put an update in flight.
+	for (const m of [req, res]) {
+		expect(
+			m.addHtlc(
+				p.channelId,
+				1_000_000n,
+				crypto.randomBytes(32),
+				500_000,
+				crypto.randomBytes(1366)
+			).ok
+		).to.equal(false);
+	}
+	// The two refusals above are the point; they are not defects.
+	p.errors.length = 0;
+	expect(res.revertConflictedSplice(p.channelId).ok).to.equal(true);
+	expect(
+		resCh.isQuiescing(),
+		"the revert exits the responder's quiescence"
+	).to.equal(false);
+	if (between) between();
+	expect(req.revertConflictedSplice(p.channelId).ok).to.equal(true);
+	expect(reqCh.isQuiescing()).to.equal(false);
+}
+
+describe('Commitment rounds across a splice revert, under quiescence (issue #760)', function () {
+	it('A: the acceptor reverts first; the opener cannot put a batch in flight until it has reverted too', () => {
+		const p = racePair(500);
+		runExchange(p, 'opener');
+		expectBothNormalOnOldFunding(p);
+		addAndSettle(p.openerManager, p.acceptorManager, p.channelId, 2n);
+		addAndSettle(p.acceptorManager, p.openerManager, p.channelId, 0n);
+		expectBothNormalOnOldFunding(p);
+	});
+
+	it('B: the opener reverts first (the acceptor asked); the acceptor cannot send a batch until it has reverted too', () => {
+		const p = racePair(510);
+		runExchange(p, 'acceptor');
+		expectBothNormalOnOldFunding(p);
+		addAndSettle(p.acceptorManager, p.openerManager, p.channelId, 0n);
+		addAndSettle(p.openerManager, p.acceptorManager, p.channelId, 2n);
+		expectBothNormalOnOldFunding(p);
+	});
+
+	it('C: an HTLC the reverted acceptor sends right after its ack lands after the opener has reverted, and settles', () => {
+		const p = racePair(520);
+		const preimage = crypto.randomBytes(32);
+		const hash = crypto.createHash('sha256').update(preimage).digest();
+		runExchange(p, 'opener', () => {
+			// The acceptor's quiescence ended with its revert, so it may add at
+			// once. On the ordered wire the add follows its ack, so the opener
+			// processes the ack (and reverts) before the add arrives; the held
+			// delivery stands in for that ordering.
+			p.holdAcceptorToOpener(true);
+			expect(
+				p.acceptorManager.addHtlc(
+					p.channelId,
+					15_000_000n,
+					hash,
+					500_000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.equal(true);
+		});
+		p.holdAcceptorToOpener(false);
+		p.flush();
+		expect(p.errors, 'no refused update').to.deep.equal([]);
+		expect(p.openerChannel.getFullState().htlcs.size).to.equal(1);
+		p.openerManager.fulfillHtlc(p.channelId, 0n, preimage);
+		expectBothNormalOnOldFunding(p);
+		addAndSettle(p.openerManager, p.acceptorManager, p.channelId, 2n);
+		expectBothNormalOnOldFunding(p);
+	});
+
+	it('the responder refusing (agreed=0) ends the session on both sides and HTLCs flow again', () => {
+		const p = racePair(530);
+		expect(
+			p.openerManager.requestSpliceConflictRevert(p.channelId).ok
+		).to.equal(true);
+		expect(p.openerChannel.isQuiescent()).to.equal(true);
+		expect(p.acceptorChannel.isQuiescent()).to.equal(true);
+		// The responder answers agreed=0: it leaves the session as it acks,
+		// the requester as it acts on the ack.
+		expect(
+			p.acceptorManager.abandonSpliceConflictRequest(p.channelId).ok
+		).to.equal(true);
+		expect(
+			p.openerManager.abandonSpliceConflictRequest(p.channelId).ok
+		).to.equal(true);
+		for (const ch of [p.openerChannel, p.acceptorChannel]) {
+			expect(ch.isQuiescing()).to.equal(false);
+			expect(ch.getState()).to.equal(ChannelState.SPLICING);
+			expect(ch.hasPendingSpliceConflictRequest()).to.equal(false);
+		}
+		const preimage = crypto.randomBytes(32);
+		const hash = crypto.createHash('sha256').update(preimage).digest();
+		expect(
+			p.openerManager.addHtlc(
+				p.channelId,
+				15_000_000n,
+				hash,
+				500_000,
+				crypto.randomBytes(1366)
+			).ok
+		).to.equal(true);
+		p.acceptorManager.fulfillHtlc(p.channelId, 2n, preimage);
+		expect(p.openerChannel.getFullState().htlcs.size).to.equal(0);
+		expect(p.wireErrors).to.equal(0);
+		// And the request can be made again.
+		p.ready.length = 0;
+		expect(
+			p.openerManager.requestSpliceConflictRevert(p.channelId).ok
+		).to.equal(true);
+		expect(p.ready).to.have.length(1);
+	});
+
+	it('a request while the peer owns the session, or with an HTLC in flight, is refused transiently', () => {
+		const p = racePair(540);
+		expect(
+			p.acceptorManager.requestSpliceConflictRevert(p.channelId).ok
+		).to.equal(true);
+		const refused = p.openerManager.requestSpliceConflictRevert(p.channelId);
+		expect(refused.ok).to.equal(false);
+		expect(refused.transient).to.equal(true);
+		expect(p.openerChannel.hasPendingSpliceConflictRequest()).to.equal(false);
+		p.acceptorManager.abandonSpliceConflictRequest(p.channelId);
+		p.openerManager.abandonSpliceConflictRequest(p.channelId);
+		// A COMMITTED HTLC does not block the handshake (BOLT 2 stfu waits
+		// only for un-acked updates): the request goes out with one in place
+		// and the HTLC settles once the session is over.
+		const preimage = crypto.randomBytes(32);
+		const hash = crypto.createHash('sha256').update(preimage).digest();
+		expect(
+			p.openerManager.addHtlc(
+				p.channelId,
+				15_000_000n,
+				hash,
+				500_000,
+				crypto.randomBytes(1366)
+			).ok
+		).to.equal(true);
+		p.ready.length = 0;
+		expect(
+			p.openerManager.requestSpliceConflictRevert(p.channelId).ok
+		).to.equal(true);
+		expect(p.ready).to.have.length(1);
+		p.acceptorManager.abandonSpliceConflictRequest(p.channelId);
+		p.openerManager.abandonSpliceConflictRequest(p.channelId);
+		p.acceptorManager.fulfillHtlc(p.channelId, 2n, preimage);
+		expect(p.openerChannel.getFullState().htlcs.size).to.equal(0);
+		expect(p.wireErrors).to.equal(0);
+	});
+});
+
 // ─────────────── Node level over loopback ───────────────
 
 function makeNodeConfig(seedId: number): INodeConfig {
@@ -1043,10 +1393,52 @@ interface INodeFixture {
 	frames: Array<{ from: string; subtype: number; payload: Buffer }>;
 	/** Senders whose custom frames are recorded but not delivered. */
 	muted: Set<string>;
+	/** While set, deliveries queue here instead of landing (a reconnect). */
+	hold: boolean;
+	queue: Array<() => void>;
 	reverted: Array<{ node: string; spliceTxid: string; conflictTxid: string }>;
 	conflicted: string[];
 	errors: Array<{ node: string; code: string }>;
 	destroy: () => void;
+}
+
+/** Route one direction of the loopback wire, through the fixture's gate. */
+function route(
+	from: LightningNode,
+	fromName: string,
+	to: LightningNode,
+	fx: INodeFixture
+): void {
+	from.on(
+		'message:outbound',
+		(pubkey: string, type: number, payload: Buffer) => {
+			if (pubkey !== to.getNodeId()) return;
+			if (type === BEIGNET_CUSTOM_MESSAGE_TYPE) {
+				const env = decodeCustomMessage(payload);
+				fx.frames.push({
+					from: fromName,
+					subtype: env.subtype,
+					payload: env.payload
+				});
+				if (fx.muted.has(fromName)) return;
+			}
+			const deliver = (): void =>
+				to.handlePeerMessage(from.getNodeId(), type, payload);
+			if (fx.hold) fx.queue.push(deliver);
+			else deliver();
+		}
+	);
+}
+
+function observe(name: string, n: LightningNode, fx: INodeFixture): void {
+	n.on('error', () => {});
+	n.on('node:error', (e: { code: string }) =>
+		fx.errors.push({ node: name, code: e.code })
+	);
+	n.on('splice:reverted', (e: { spliceTxid: string; conflictTxid: string }) =>
+		fx.reverted.push({ node: name, ...e })
+	);
+	n.on('splice:conflicted', () => fx.conflicted.push(name));
 }
 
 function wire(
@@ -1054,42 +1446,10 @@ function wire(
 	bob: LightningNode,
 	fx: INodeFixture
 ): void {
-	const tap = (from: string, type: number, payload: Buffer): void => {
-		if (type !== BEIGNET_CUSTOM_MESSAGE_TYPE) return;
-		const env = decodeCustomMessage(payload);
-		fx.frames.push({ from, subtype: env.subtype, payload: env.payload });
-	};
-	alice.on(
-		'message:outbound',
-		(pubkey: string, type: number, payload: Buffer) => {
-			if (pubkey !== bob.getNodeId()) return;
-			tap('alice', type, payload);
-			if (type === BEIGNET_CUSTOM_MESSAGE_TYPE && fx.muted.has('alice')) return;
-			bob.handlePeerMessage(alice.getNodeId(), type, payload);
-		}
-	);
-	bob.on(
-		'message:outbound',
-		(pubkey: string, type: number, payload: Buffer) => {
-			if (pubkey !== alice.getNodeId()) return;
-			tap('bob', type, payload);
-			if (type === BEIGNET_CUSTOM_MESSAGE_TYPE && fx.muted.has('bob')) return;
-			alice.handlePeerMessage(bob.getNodeId(), type, payload);
-		}
-	);
-	for (const [name, n] of [
-		['alice', alice],
-		['bob', bob]
-	] as const) {
-		n.on('error', () => {});
-		n.on('node:error', (e: { code: string }) =>
-			fx.errors.push({ node: name, code: e.code })
-		);
-		n.on('splice:reverted', (e: { spliceTxid: string; conflictTxid: string }) =>
-			fx.reverted.push({ node: name, ...e })
-		);
-		n.on('splice:conflicted', () => fx.conflicted.push(name));
-	}
+	route(alice, 'alice', bob, fx);
+	route(bob, 'bob', alice, fx);
+	observe('alice', alice, fx);
+	observe('bob', bob, fx);
 }
 
 /** Graft the depth-locked splice at its point of no return on one node. */
@@ -1097,13 +1457,24 @@ function graft(
 	node: LightningNode,
 	channelId: Buffer,
 	spliceTx: bitcoin.Transaction,
-	coinScript: Buffer
+	coinScript: Buffer,
+	role: 'initiator' | 'acceptor' = 'initiator'
 ): void {
 	const ch = node.getChannelManager().getChannel(channelId)!;
 	const raw = ch.getFullState();
 	raw.state = ChannelState.SPLICING;
 	raw.preSpliceState = ChannelState.NORMAL;
 	raw.spliceInFlight = inflightFor(spliceTx, coinScript);
+	if (role === 'acceptor') {
+		// The other side of the same splice: no contribution of its own, so
+		// every input but the shared one is somebody else's.
+		raw.spliceInFlight.isInitiator = false;
+		raw.spliceInFlight.ourWalletInputIndices = [];
+		raw.spliceInFlight.ourWalletWitnesses = [];
+		raw.spliceInFlight.externalInputIndices = undefined;
+		raw.spliceInFlight.localRelativeSatoshis = 0n;
+		raw.spliceInFlight.remoteRelativeSatoshis = 40_000n;
+	}
 	raw.spliceFundingTxid = Buffer.from(spliceTx.getHash());
 	raw.spliceFundingOutputIndex = 0;
 }
@@ -1119,9 +1490,14 @@ async function armSpliceWatch(
 
 async function setupNodes(
 	seedBase: number,
-	options: { sharedBackend: boolean; storageA?: SqliteStorage } = {
-		sharedBackend: true
-	}
+	options: {
+		sharedBackend: boolean;
+		storageA?: SqliteStorage;
+		storageB?: SqliteStorage;
+		bobRole?: 'initiator' | 'acceptor';
+		armAlice?: boolean;
+		armBob?: boolean;
+	} = { sharedBackend: true }
 ): Promise<INodeFixture> {
 	const backendA = new MockBackend();
 	const backendB = options.sharedBackend ? backendA : new MockBackend();
@@ -1130,6 +1506,7 @@ async function setupNodes(
 	if (options.storageA) configA.storage = options.storageA;
 	const configB = makeNodeConfig(seedBase + 1);
 	configB.chainBackend = backendB;
+	if (options.storageB) configB.storage = options.storageB;
 	const alice = new LightningNode(configA);
 	const bob = new LightningNode(configB);
 	const fx: INodeFixture = {
@@ -1145,6 +1522,8 @@ async function setupNodes(
 		backendB,
 		frames: [],
 		muted: new Set(),
+		hold: false,
+		queue: [],
 		reverted: [],
 		conflicted: [],
 		errors: [],
@@ -1178,9 +1557,9 @@ async function setupNodes(
 		b.setTx(conflict);
 	}
 	graft(alice, channelId, spliceTx, coinScript);
-	graft(bob, channelId, spliceTx, coinScript);
-	await armSpliceWatch(alice, spliceTx);
-	await armSpliceWatch(bob, spliceTx);
+	graft(bob, channelId, spliceTx, coinScript, options.bobRole ?? 'initiator');
+	if (options.armAlice !== false) await armSpliceWatch(alice, spliceTx);
+	if (options.armBob !== false) await armSpliceWatch(bob, spliceTx);
 	Object.assign(fx, {
 		channelId,
 		oldFundingTxid,
@@ -1218,10 +1597,73 @@ function watchedFundingTxid(
 	return map.get(channelId.toString('hex'))?.txid;
 }
 
+/** Shorten a node's wait for the peer's ack (the constant is 60 s). */
+function shortenConflictTimeout(node: LightningNode, ms: number): void {
+	(
+		node as unknown as { spliceConflictRequestTimeoutMs: number }
+	).spliceConflictRequestTimeoutMs = ms;
+}
+
+function clearConflictBackoff(node: LightningNode): void {
+	(
+		node as unknown as { spliceConflictBackoffUntil: Map<string, number> }
+	).spliceConflictBackoffUntil.clear();
+}
+
+/**
+ * Drive a loopback reconnect the way a socket pair delivers it: both sides
+ * disconnected, then both channel_reestablish messages cross before any
+ * reply lands.
+ */
+async function reconnect(
+	a: LightningNode,
+	b: LightningNode,
+	fx: INodeFixture
+): Promise<void> {
+	for (const [x, y] of [
+		[a, b],
+		[b, a]
+	] as const) {
+		const ch = x.getChannelManager().getChannel(fx.channelId);
+		if (ch && ch.getState() !== ChannelState.AWAITING_REESTABLISH) {
+			x.getChannelManager().handlePeerDisconnected(y.getNodeId());
+		}
+	}
+	await tick(20);
+	fx.hold = true;
+	a.getChannelManager().handlePeerReconnected(b.getNodeId());
+	b.getChannelManager().handlePeerReconnected(a.getNodeId());
+	while (fx.queue.length > 0) fx.queue.shift()!();
+	fx.hold = false;
+	await tick(20);
+}
+
+function acksFrom(
+	fx: INodeFixture,
+	from: string
+): Array<{ agreed: boolean; reason: string }> {
+	return fx.frames
+		.filter(
+			(f) =>
+				f.from === from &&
+				f.subtype === BeignetCustomSubtype.SPLICE_CONFLICT_ACK
+		)
+		.map((f) => {
+			const ack = decodeSpliceConflictAck(f.payload);
+			return { agreed: ack.agreed, reason: ack.reason };
+		});
+}
+
+function requestsFrom(fx: INodeFixture, from: string): number {
+	return fx.frames.filter(
+		(f) => f.from === from && f.subtype === BeignetCustomSubtype.SPLICE_CONFLICT
+	).length;
+}
+
 describe('Splice conflict recovery between two nodes (issue #760)', function () {
 	this.timeout(15_000);
 
-	it('arms one watch per external input from the live path, and none for an ordinary splice', async () => {
+	it('arms one watch per input this node does not vouch for, from the live path, and none for an ordinary splice', async () => {
 		const fx = await setupNodes(7601);
 		for (const n of [fx.alice, fx.bob]) {
 			expect(
@@ -1237,9 +1679,9 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 			// The splice's own funding watch replaced the old one, as always.
 			expect(watchedFundingTxid(n, fx.channelId)).to.equal(fx.spliceTx.getId());
 		}
-		// A splice with no external input, or no lock depth, arms nothing.
+		// A splice with no lock depth arms nothing, whatever it carries.
 		const plain = channelOf(fx.alice, fx.channelId).getFullState();
-		plain.spliceInFlight!.externalInputIndices = undefined;
+		plain.spliceInFlight!.lockAtDepth = undefined;
 		fx.alice.getChainWatcher()!.unwatchSpliceInputs(fx.channelId);
 		await armSpliceWatch(fx.alice, fx.spliceTx);
 		expect(
@@ -1248,7 +1690,7 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 		fx.destroy();
 	});
 
-	it('both nodes detect the conflict at depth, agree it over the wire and revert to the old funding', async () => {
+	it('both nodes detect the conflict at depth, agree it under one quiescence session and revert to the old funding', async () => {
 		const fx = await setupNodes(7603);
 		fx.backendA.setHistory(fx.coinScriptHash, conflictHistory(fx));
 		for (let h = 150; h < 155; h++) fx.backendA.block(h);
@@ -1261,9 +1703,11 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 		fx.backendA.block(155);
 		await tick(150);
 
-		// Both sides saw it, both asked, both verified the other's request
-		// against their own chain view, both reverted, and the late acks for a
-		// splice already gone were ignored.
+		// Both sides saw it and both opened a quiescence handshake; the funder
+		// (alice) won the concurrent-stfu tie-break, so hers is the session:
+		// only she asks, bob answers it after verifying on his own chain view,
+		// and both revert. Nobody sends an update in between: both were
+		// quiescent until their own revert.
 		expect(fx.conflicted.sort()).to.deep.equal(['alice', 'bob']);
 		expect(
 			fx.errors
@@ -1271,14 +1715,9 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 				.map((e) => e.node)
 				.sort()
 		).to.deep.equal(['alice', 'bob']);
-		const requests = fx.frames.filter(
-			(f) => f.subtype === BeignetCustomSubtype.SPLICE_CONFLICT
-		);
-		expect(requests.map((f) => f.from).sort()).to.deep.equal(['alice', 'bob']);
-		const acks = fx.frames
-			.filter((f) => f.subtype === BeignetCustomSubtype.SPLICE_CONFLICT_ACK)
-			.map((f) => ({ from: f.from, ...decodeSpliceConflictAck(f.payload) }));
-		expect(acks.map((a) => a.agreed)).to.deep.equal([true, true]);
+		expect(requestsFrom(fx, 'alice')).to.equal(1);
+		expect(requestsFrom(fx, 'bob')).to.equal(0);
+		expect(acksFrom(fx, 'bob')).to.deep.equal([{ agreed: true, reason: '' }]);
 		expect(fx.reverted.map((r) => r.node).sort()).to.deep.equal([
 			'alice',
 			'bob'
@@ -1288,10 +1727,12 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 			expect(r.conflictTxid).to.equal(fx.conflict.getId());
 		}
 		for (const n of [fx.alice, fx.bob]) {
-			const st = channelOf(n, fx.channelId).getFullState();
+			const ch = channelOf(n, fx.channelId);
+			const st = ch.getFullState();
 			expect(st.state).to.equal(ChannelState.NORMAL);
 			expect(st.spliceInFlight).to.equal(null);
 			expect(st.fundingTxid!.equals(fx.oldFundingTxid)).to.equal(true);
+			expect(ch.isQuiescing(), 'session over').to.equal(false);
 			// The old funding is watched again, and the dead splice's input
 			// watches are gone.
 			expect(watchedFundingTxid(n, fx.channelId)).to.equal(
@@ -1309,7 +1750,7 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 		fx.destroy();
 	});
 
-	it('a peer that cannot verify refuses and changes nothing; the request is retried each block until it can', async () => {
+	it('a peer that cannot verify refuses (agreed=0), both leave quiescence, and the request is retried each block until it can', async () => {
 		const fx = await setupNodes(7605, { sharedBackend: false });
 		// Bob's server has not seen the conflict: only the coin's own history.
 		fx.backendB.setHistory(fx.coinScriptHash, [
@@ -1322,9 +1763,7 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 		}
 		await tick(150);
 		expect(fx.conflicted).to.deep.equal(['alice']);
-		const refusals = fx.frames
-			.filter((f) => f.subtype === BeignetCustomSubtype.SPLICE_CONFLICT_ACK)
-			.map((f) => decodeSpliceConflictAck(f.payload));
+		const refusals = acksFrom(fx, 'bob');
 		expect(refusals).to.have.length(1);
 		expect(refusals[0].agreed).to.equal(false);
 		expect(refusals[0].reason).to.match(/not confirmed at depth/);
@@ -1340,24 +1779,30 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 		expect(aliceState.spliceInFlight!.conflict!.revertRequestedAt).to.be.a(
 			'number'
 		);
+		// agreed=0 ended the quiescence session on both sides: HTLCs flow
+		// again until the next block re-asks.
+		for (const n of [fx.alice, fx.bob]) {
+			const ch = channelOf(n, fx.channelId);
+			expect(ch.isQuiescing(), 'quiescence unwound').to.equal(false);
+			expect(ch.getQuiescenceState()).to.equal(QuiescenceState.NORMAL);
+			expect(ch.hasPendingSpliceConflictRequest()).to.equal(false);
+		}
 
-		// Next block: alice asks again, bob still cannot verify.
+		// Next block: alice asks again (a fresh stfu handshake), bob still
+		// cannot verify, and the session ends again.
 		fx.backendA.block(156);
 		await tick(100);
-		expect(
-			fx.frames.filter(
-				(f) =>
-					f.from === 'alice' &&
-					f.subtype === BeignetCustomSubtype.SPLICE_CONFLICT
-			)
-		).to.have.length(2);
+		expect(requestsFrom(fx, 'alice')).to.equal(2);
+		expect(acksFrom(fx, 'bob')).to.have.length(2);
 		expect(fx.reverted).to.deep.equal([]);
+		expect(channelOf(fx.alice, fx.channelId).isQuiescing()).to.equal(false);
 
-		// Bob's server catches up: the re-ask verifies, both revert.
+		// Bob's server catches up: whichever side asks next is answered, both
+		// revert.
 		fx.backendB.setHistory(fx.coinScriptHash, conflictHistory(fx));
 		fx.backendB.block(156);
 		fx.backendA.block(157);
-		await tick(150);
+		await tick(200);
 		expect(fx.reverted.map((r) => r.node).sort()).to.deep.equal([
 			'alice',
 			'bob'
@@ -1370,19 +1815,12 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 		fx.destroy();
 	});
 
-	it('a request naming the shared funding input, or a splice we do not hold, is refused without moving the channel', async () => {
+	it("a request outside the sender's session, one naming the shared funding input, or one for a splice we do not hold is refused without moving the channel", async () => {
 		const fx = await setupNodes(7607);
 		fx.backendA.setHistory(fx.coinScriptHash, conflictHistory(fx));
 		// One short of the verdict: the honest exchange has not started.
 		for (let h = 150; h <= 154; h++) fx.backendA.block(h);
 		await tick(20);
-		// Hand-built requests from bob to alice, ahead of the honest flow.
-		const { encodeSpliceConflict } = await import(
-			'../../src/lightning/message/splice-conflict'
-		);
-		const { encodeCustomMessage } = await import(
-			'../../src/lightning/message/custom'
-		);
 		const send = (spliceTxid: Buffer, inputIndex: number): void =>
 			fx.alice.handlePeerMessage(
 				fx.bob.getNodeId(),
@@ -1397,23 +1835,294 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 					})
 				)
 			);
+		// Outside any quiescence session: refused before anything is checked.
+		send(Buffer.from(fx.spliceTx.getHash()), 1);
+		await tick(40);
+		let acks = acksFrom(fx, 'alice');
+		expect(acks).to.have.length(1);
+		expect(acks[0].reason).to.match(/not quiescent/);
+		expect(channelOf(fx.alice, fx.channelId).isQuiescing()).to.equal(false);
+
+		// Bob opens his session the honest way (he holds a verdict of his
+		// own); alice answers the stfu and is quiescent under it. A hand-built
+		// request naming the shared input is refused, and the refusal ends
+		// the session.
+		fx.muted.add('bob');
+		channelOf(fx.bob, fx.channelId).markSpliceConflicted({
+			txid: fx.conflict.getId(),
+			height: 150,
+			inputIndex: 1
+		});
+		expect(
+			fx.bob.getChannelManager().requestSpliceConflictRevert(fx.channelId).ok
+		).to.equal(true);
+		await tick(40);
+		const alice = channelOf(fx.alice, fx.channelId);
+		expect(alice.isQuiescent()).to.equal(true);
+		expect(alice.isQuiescenceInitiator()).to.equal(false);
 		send(Buffer.from(fx.spliceTx.getHash()), 0);
+		await tick(60);
+		acks = acksFrom(fx, 'alice');
+		expect(acks).to.have.length(2);
+		expect(acks[1].reason).to.match(/shared funding input/);
+		expect(alice.isQuiescing(), 'the refusal ended the session').to.equal(
+			false
+		);
+		// A splice we do not hold is refused whatever the session state.
 		send(crypto.randomBytes(32), 1);
-		await tick(80);
-		const acks = fx.frames
-			.filter(
-				(f) =>
-					f.from === 'alice' &&
-					f.subtype === BeignetCustomSubtype.SPLICE_CONFLICT_ACK
-			)
-			.map((f) => decodeSpliceConflictAck(f.payload));
-		expect(acks.map((a) => a.agreed)).to.deep.equal([false, false]);
-		expect(acks[0].reason).to.match(/shared funding input/);
-		expect(acks[1].reason).to.match(/no such splice/);
+		await tick(40);
+		acks = acksFrom(fx, 'alice');
+		expect(acks).to.have.length(3);
+		expect(acks[2].reason).to.match(/no such splice/);
+		expect(acks.map((a) => a.agreed)).to.deep.equal([false, false, false]);
+		expect(alice.getState()).to.equal(ChannelState.SPLICING);
+		expect(alice.getFullState().spliceInFlight).to.not.equal(null);
 		fx.destroy();
 	});
 
-	it('a restart mid-conflict keeps the verdict, re-arms the watches and resumes the request', async () => {
+	it('the requester that hears nothing within the window abandons the request, disconnects the peer and backs off', async () => {
+		const fx = await setupNodes(7613, { sharedBackend: false });
+		// Bob's server never sees the conflict, and his answers are lost.
+		fx.backendB.setHistory(fx.coinScriptHash, [
+			{ txid: fx.coin.getId(), height: 100 }
+		]);
+		fx.backendA.setHistory(fx.coinScriptHash, conflictHistory(fx));
+		fx.muted.add('bob');
+		shortenConflictTimeout(fx.alice, 150);
+		const disconnects: string[] = [];
+		fx.alice.on('peer:disconnect-requested', (pubkey: string) =>
+			disconnects.push(pubkey)
+		);
+		for (let h = 150; h <= 155; h++) {
+			fx.backendA.block(h);
+			fx.backendB.block(h);
+		}
+		await tick(60);
+		const alice = channelOf(fx.alice, fx.channelId);
+		expect(requestsFrom(fx, 'alice')).to.equal(1);
+		expect(alice.hasPendingSpliceConflictRequest()).to.equal(true);
+		expect(alice.isQuiescent()).to.equal(true);
+		await tick(250);
+		// The window passed: the request is abandoned, quiescence unwound on
+		// our side, the peer disconnected (the one reset quiescence has), and
+		// the channel is left alone until the backoff passes.
+		expect(alice.hasPendingSpliceConflictRequest()).to.equal(false);
+		expect(alice.getQuiescenceState()).to.equal(QuiescenceState.NORMAL);
+		expect(disconnects).to.deep.equal([fx.bob.getNodeId()]);
+		expect(alice.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+		expect(alice.getFullState().spliceInFlight?.conflict?.txid).to.equal(
+			fx.conflict.getId()
+		);
+		const backoff = (
+			fx.alice as unknown as { spliceConflictBackoffUntil: Map<string, number> }
+		).spliceConflictBackoffUntil.get(fx.channelId.toString('hex'))!;
+		expect(backoff).to.be.greaterThan(
+			Date.now() + SPLICE_CONFLICT_REQUEST_BACKOFF_MS - 5_000
+		);
+		// The reconnect re-asks only once the backoff has passed.
+		await reconnect(fx.alice, fx.bob, fx);
+		await tick(60);
+		expect(requestsFrom(fx, 'alice'), 'inside the backoff').to.equal(1);
+		clearConflictBackoff(fx.alice);
+		fx.backendB.setHistory(fx.coinScriptHash, conflictHistory(fx));
+		fx.muted.delete('bob');
+		fx.backendA.block(156);
+		fx.backendB.block(156);
+		await tick(200);
+		expect(requestsFrom(fx, 'alice')).to.be.greaterThan(1);
+		expect(fx.reverted.map((r) => r.node).sort()).to.deep.equal([
+			'alice',
+			'bob'
+		]);
+		fx.destroy();
+	});
+
+	it('a conflict detected by the acceptor alone drives the revert', async () => {
+		const fx = await setupNodes(7615, {
+			sharedBackend: true,
+			bobRole: 'acceptor',
+			armAlice: false
+		});
+		// The acceptor contributed nothing, so it vouches for no input but the
+		// shared one: it watches the initiator's coin.
+		expect(
+			fx.bob.getChainWatcher()!.spliceInputWatchesFor(fx.channelId)
+		).to.deep.equal([
+			{
+				spliceTxid: fx.spliceTx.getId(),
+				inputIndex: 1,
+				txid: fx.coin.getId(),
+				vout: 0
+			}
+		]);
+		expect(
+			fx.alice.getChainWatcher()!.spliceInputWatchesFor(fx.channelId)
+		).to.have.length(0);
+		fx.backendA.setHistory(fx.coinScriptHash, conflictHistory(fx));
+		for (let h = 150; h <= 155; h++) fx.backendA.block(h);
+		await tick(150);
+		expect(fx.conflicted[0]).to.equal('bob');
+		expect(requestsFrom(fx, 'bob')).to.equal(1);
+		expect(requestsFrom(fx, 'alice')).to.equal(0);
+		expect(acksFrom(fx, 'alice')).to.deep.equal([{ agreed: true, reason: '' }]);
+		expect(fx.reverted.map((r) => r.node).sort()).to.deep.equal([
+			'alice',
+			'bob'
+		]);
+		for (const n of [fx.alice, fx.bob]) {
+			const st = channelOf(n, fx.channelId).getFullState();
+			expect(st.state).to.equal(ChannelState.NORMAL);
+			expect(st.fundingTxid!.equals(fx.oldFundingTxid)).to.equal(true);
+		}
+		fx.destroy();
+	});
+
+	it('a record without prevout scripts still gets its watch, from the parent transaction', async () => {
+		const fx = await setupNodes(7617, {
+			sharedBackend: true,
+			armAlice: false,
+			armBob: false
+		});
+		const bob = channelOf(fx.bob, fx.channelId).getFullState();
+		bob.spliceInFlight!.inputPrevouts = [];
+		await armSpliceWatch(fx.bob, fx.spliceTx);
+		expect(
+			fx.bob.getChainWatcher()!.spliceInputWatchesFor(fx.channelId)
+		).to.have.length(1);
+		fx.backendA.setHistory(fx.coinScriptHash, conflictHistory(fx));
+		for (let h = 150; h <= 155; h++) fx.backendA.block(h);
+		await tick(150);
+		expect(fx.conflicted).to.include('bob');
+		expect(fx.reverted.map((r) => r.node).sort()).to.deep.equal([
+			'alice',
+			'bob'
+		]);
+		fx.destroy();
+	});
+
+	it('agreed=1 leaves only once the revert is on disk: a failed commit answers agreed=0 and the re-ask succeeds later', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'splice-commit-'));
+		const real = new SqliteStorage(path.join(dir, 'bob.sqlite'));
+		real.open();
+		const failing = { value: false };
+		const storageB = new Proxy(real, {
+			get(target, prop, receiver) {
+				if (prop === 'saveChannel' && failing.value) {
+					return (): never => {
+						throw new Error('disk full');
+					};
+				}
+				const v = Reflect.get(target, prop, receiver);
+				return typeof v === 'function' ? v.bind(target) : v;
+			}
+		});
+		const fx = await setupNodes(7619, {
+			sharedBackend: true,
+			storageB,
+			armBob: false
+		});
+		fx.backendA.setHistory(fx.coinScriptHash, conflictHistory(fx));
+		failing.value = true;
+		for (let h = 150; h <= 155; h++) fx.backendA.block(h);
+		await tick(150);
+		expect(acksFrom(fx, 'bob')).to.deep.equal([
+			{
+				agreed: false,
+				reason: 'the revert could not be committed to disk; ask again'
+			}
+		]);
+		// Alice kept her record and left the session; bob's revert stands in
+		// memory until it can be written.
+		const alice = channelOf(fx.alice, fx.channelId);
+		expect(alice.getState()).to.equal(ChannelState.SPLICING);
+		expect(alice.getFullState().spliceInFlight?.conflict).to.not.equal(
+			undefined
+		);
+		expect(alice.isQuiescing()).to.equal(false);
+		expect(fx.reverted.map((r) => r.node)).to.deep.equal(['bob']);
+		// A failed persist severs the peer (the manager's fail-closed rule);
+		// once the disk is back the reconnect's reestablish re-asks, and bob
+		// answers from his durable memory, now written.
+		failing.value = false;
+		expect(channelOf(fx.bob, fx.channelId).getState()).to.equal(
+			ChannelState.AWAITING_REESTABLISH
+		);
+		await reconnect(fx.alice, fx.bob, fx);
+		await tick(150);
+		expect(acksFrom(fx, 'bob').map((a) => a.agreed)).to.deep.equal([
+			false,
+			true
+		]);
+		expect(fx.reverted.map((r) => r.node)).to.deep.equal(['bob', 'alice']);
+		expect(alice.getState()).to.equal(ChannelState.NORMAL);
+		fx.destroy();
+		real.close();
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('verifies one claim per channel at a time and answers a repeated refuted claim from memory', async () => {
+		const fx = await setupNodes(7621, { sharedBackend: false });
+		fx.backendA.setHistory(fx.coinScriptHash, conflictHistory(fx));
+		fx.backendB.setHistory(fx.coinScriptHash, [
+			{ txid: fx.coin.getId(), height: 100 }
+		]);
+		// Alice's chain is one block short of the verdict: a claim naming the
+		// real conflict fetches, then is refuted.
+		for (let h = 150; h <= 154; h++) fx.backendA.block(h);
+		await tick(20);
+		fx.muted.add('bob');
+		channelOf(fx.bob, fx.channelId).markSpliceConflicted({
+			txid: fx.conflict.getId(),
+			height: 150,
+			inputIndex: 1
+		});
+		const frame = encodeCustomMessage(
+			BeignetCustomSubtype.SPLICE_CONFLICT,
+			encodeSpliceConflict({
+				channelId: fx.channelId,
+				spliceTxid: Buffer.from(fx.spliceTx.getHash()),
+				conflictTxid: Buffer.from(fx.conflict.getHash()),
+				inputIndex: 1
+			})
+		);
+		const ask = (): void =>
+			fx.alice.handlePeerMessage(
+				fx.bob.getNodeId(),
+				BEIGNET_CUSTOM_MESSAGE_TYPE,
+				frame
+			);
+		const fetchesOfConflict = (): number =>
+			fx.backendA.fetched.filter((t) => t === fx.conflict.getId()).length;
+		// Under bob's session, three identical frames in a burst.
+		expect(
+			fx.bob.getChannelManager().requestSpliceConflictRevert(fx.channelId).ok
+		).to.equal(true);
+		await tick(30);
+		const before = fetchesOfConflict();
+		ask();
+		ask();
+		ask();
+		await tick(80);
+		expect(
+			fetchesOfConflict() - before,
+			'one verification for the burst'
+		).to.equal(1);
+		expect(acksFrom(fx, 'alice')).to.deep.equal([
+			{
+				agreed: false,
+				reason: 'the conflict is not confirmed at depth on our chain view'
+			}
+		]);
+		// The same claim again at the same height fetches nothing (the
+		// session is over, so the refusal is the quiescence one).
+		ask();
+		await tick(40);
+		expect(fetchesOfConflict() - before).to.equal(1);
+		expect(acksFrom(fx, 'alice')).to.have.length(2);
+		fx.destroy();
+	});
+
+	it('a restart mid-conflict keeps the verdict, re-arms the watches and resumes the request after the reestablish', async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'splice-conflict-'));
 		const dbPath = path.join(dir, 'alice.sqlite');
 		const storage1 = new SqliteStorage(dbPath);
@@ -1442,9 +2151,9 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 
 		// Alice comes back. The record on disk carries the conflict; the
 		// restore re-arms the splice input watch; bob's server now has the
-		// conflict, so the first re-ask after restart is agreed and both
-		// revert. Alice is still awaiting reestablish, so her revert lands
-		// through the wrapped state.
+		// conflict. The request rides quiescence, which needs a live channel,
+		// so the reconnect's reestablish is what re-asks: bob verifies and
+		// agrees, both revert.
 		const storage2 = new SqliteStorage(dbPath);
 		storage2.open();
 		const backendA2 = new MockBackend();
@@ -1456,28 +2165,10 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 		configA2.chainBackend = backendA2;
 		configA2.storage = storage2;
 		const alice2 = new LightningNode(configA2);
-		const frames2: number[] = [];
-		const reverted2: string[] = [];
-		alice2.on('error', () => {});
-		alice2.on('node:error', () => {});
-		alice2.on('splice:reverted', () => reverted2.push('alice2'));
-		alice2.on(
-			'message:outbound',
-			(pubkey: string, type: number, payload: Buffer) => {
-				if (pubkey !== fx.bob.getNodeId()) return;
-				if (type === BEIGNET_CUSTOM_MESSAGE_TYPE)
-					frames2.push(decodeCustomMessage(payload).subtype);
-				fx.bob.handlePeerMessage(alice2.getNodeId(), type, payload);
-			}
-		);
 		fx.bob.removeAllListeners('message:outbound');
-		fx.bob.on(
-			'message:outbound',
-			(pubkey: string, type: number, payload: Buffer) => {
-				if (pubkey !== alice2.getNodeId()) return;
-				alice2.handlePeerMessage(fx.bob.getNodeId(), type, payload);
-			}
-		);
+		route(alice2, 'alice2', fx.bob, fx);
+		route(fx.bob, 'bob', alice2, fx);
+		observe('alice2', alice2, fx);
 		await tick(150);
 		const restored = channelOf(alice2, fx.channelId).getFullState();
 		expect(
@@ -1488,13 +2179,17 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 			alice2.getChainWatcher()!.spliceInputWatchesFor(fx.channelId)
 		).to.have.length(1);
 
+		// Bob's server catches up, a block on: his earlier refutation of this
+		// very claim was made at the old height and is not reused.
 		fx.backendB.setHistory(fx.coinScriptHash, conflictHistory(fx));
 		fx.backendB.block(156);
-		backendA2.block(156);
-		await tick(200);
-		expect(frames2).to.include(BeignetCustomSubtype.SPLICE_CONFLICT);
-		expect(reverted2).to.deep.equal(['alice2']);
-		expect(fx.reverted.map((r) => r.node)).to.deep.equal(['bob']);
+		await reconnect(alice2, fx.bob, fx);
+		await tick(250);
+		expect(requestsFrom(fx, 'alice2')).to.equal(1);
+		expect(fx.reverted.map((r) => r.node).sort()).to.deep.equal([
+			'alice2',
+			'bob'
+		]);
 		const after = channelOf(alice2, fx.channelId).getFullState();
 		expect(after.spliceInFlight).to.equal(null);
 		expect(after.fundingTxid!.equals(fx.oldFundingTxid)).to.equal(true);
@@ -1518,13 +2213,15 @@ describe('A reverted splice is remembered across a restart (issue #760)', functi
 		storage1.open();
 		const fx = await setupNodes(7611, {
 			sharedBackend: true,
-			storageA: storage1
+			storageA: storage1,
+			armAlice: false
 		});
 		fx.backendA.setHistory(fx.coinScriptHash, conflictHistory(fx));
-		// Everything alice sends is lost: her own request, and the ack she
-		// gives bob's. Bob's request still reaches her, so she verifies it,
-		// reverts and answers into the void.
+		// Only bob watches, so his is the session. The ack alice gives his
+		// request is lost: she verifies it, reverts and answers into the
+		// void; bob's wait runs out, he abandons the request and disconnects.
 		fx.muted.add('alice');
+		shortenConflictTimeout(fx.bob, 150);
 		for (let h = 150; h <= 155; h++) fx.backendA.block(h);
 		await tick(150);
 		expect(fx.reverted.map((r) => r.node)).to.deep.equal(['alice']);
@@ -1533,16 +2230,19 @@ describe('A reverted splice is remembered across a restart (issue #760)', functi
 		expect(aliceBefore.revertedSplices!.map((r) => r.spliceTxid)).to.deep.equal(
 			[fx.spliceTx.getId()]
 		);
-		const bobBefore = channelOf(fx.bob, fx.channelId).getFullState();
-		expect(bobBefore.state).to.equal(ChannelState.SPLICING);
-		expect(bobBefore.spliceInFlight!.conflict!.txid).to.equal(
+		await tick(250);
+		const bobBefore = channelOf(fx.bob, fx.channelId);
+		expect(bobBefore.hasPendingSpliceConflictRequest()).to.equal(false);
+		expect(bobBefore.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+		expect(bobBefore.getFullState().spliceInFlight!.conflict!.txid).to.equal(
 			fx.conflict.getId()
 		);
 		fx.alice.destroy();
 		storage1.close();
 
 		// Alice comes back from disk with the revert remembered and no splice
-		// in flight. Bob is still asking once a block.
+		// in flight. Past his backoff, bob's reconnect re-asks on a fresh stfu
+		// that alice2 answers as an ordinary NORMAL channel would.
 		const storage2 = new SqliteStorage(dbPath);
 		storage2.open();
 		const backendA2 = new MockBackend();
@@ -1550,31 +2250,10 @@ describe('A reverted splice is remembered across a restart (issue #760)', functi
 		configA2.chainBackend = backendA2;
 		configA2.storage = storage2;
 		const alice2 = new LightningNode(configA2);
-		alice2.on('error', () => {});
-		alice2.on('node:error', () => {});
-		const acks: Array<{ agreed: boolean; reason: string }> = [];
-		alice2.on(
-			'message:outbound',
-			(pubkey: string, type: number, payload: Buffer) => {
-				if (pubkey !== fx.bob.getNodeId()) return;
-				if (type === BEIGNET_CUSTOM_MESSAGE_TYPE) {
-					const env = decodeCustomMessage(payload);
-					if (env.subtype === BeignetCustomSubtype.SPLICE_CONFLICT_ACK) {
-						const ack = decodeSpliceConflictAck(env.payload);
-						acks.push({ agreed: ack.agreed, reason: ack.reason });
-					}
-				}
-				fx.bob.handlePeerMessage(alice2.getNodeId(), type, payload);
-			}
-		);
 		fx.bob.removeAllListeners('message:outbound');
-		fx.bob.on(
-			'message:outbound',
-			(pubkey: string, type: number, payload: Buffer) => {
-				if (pubkey !== alice2.getNodeId()) return;
-				alice2.handlePeerMessage(fx.bob.getNodeId(), type, payload);
-			}
-		);
+		route(alice2, 'alice2', fx.bob, fx);
+		route(fx.bob, 'bob', alice2, fx);
+		observe('alice2', alice2, fx);
 		await tick(150);
 		const restored = channelOf(alice2, fx.channelId).getFullState();
 		expect(restored.spliceInFlight).to.equal(null);
@@ -1585,9 +2264,12 @@ describe('A reverted splice is remembered across a restart (issue #760)', functi
 			alice2.getChainWatcher()!.spliceInputWatchesFor(fx.channelId)
 		).to.have.length(0);
 
-		fx.backendA.block(156);
-		await tick(150);
-		expect(acks).to.deep.equal([{ agreed: true, reason: '' }]);
+		clearConflictBackoff(fx.bob);
+		await reconnect(alice2, fx.bob, fx);
+		await tick(250);
+		expect(acksFrom(fx, 'alice2')).to.deep.equal([
+			{ agreed: true, reason: '' }
+		]);
 		expect(fx.reverted.map((r) => r.node)).to.deep.equal(['alice', 'bob']);
 		const bobAfter = channelOf(fx.bob, fx.channelId).getFullState();
 		expect(bobAfter.state).to.equal(ChannelState.NORMAL);
