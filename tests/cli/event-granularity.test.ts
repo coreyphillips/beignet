@@ -19,7 +19,12 @@ const NEW_EVENTS = [
 	'channel:opening',
 	'channel:pending-close',
 	'channel:force-closing',
-	'channel:resolved'
+	'channel:resolved',
+	// The splice lifecycle (issue #760).
+	'splice:complete',
+	'splice:aborted',
+	'splice:conflicted',
+	'splice:reverted'
 ];
 const HTLC_EVENTS = ['htlc:forwarded', 'htlc:fulfilled', 'htlc:failed'];
 /**

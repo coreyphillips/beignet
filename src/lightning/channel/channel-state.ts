@@ -646,6 +646,40 @@ export interface IChannelState {
 	 */
 	unconfirmedSpliceTxs?: Array<{ txid: Buffer; txHex: string }>;
 	/**
+	 * Splices this channel reverted because an input was spent elsewhere and
+	 * the spend confirmed SPLICE_CONFLICT_DEPTH deep (issue #760), newest
+	 * last, bounded to the last 8. Txids in display byte order.
+	 *
+	 * Two reasons it is durable. Liveness: a peer whose SPLICE_CONFLICT or
+	 * our SPLICE_CONFLICT_ACK was lost asks again after our restart, and a
+	 * node that had forgotten the revert would answer "no such splice" once a
+	 * block forever, leaving the peer mid-splice for good; a splice named
+	 * here is answered agreed=1, since the peer verified the conflict on its
+	 * own chain view before asking and we have nothing left to revert.
+	 *
+	 * Residual: the signature material of the dropped in-flight record is
+	 * kept, because a reorg deeper than SPLICE_CONFLICT_DEPTH that let the
+	 * splice confirm after both sides reverted would put the channel's funds
+	 * under the NEW 2-of-2, and only this material (the peer's signature on
+	 * our spliced commitment, its HTLC signatures, the feerate they were made
+	 * at, the peer's funding key and the transaction itself) could close that
+	 * funding at all. Such a reorg is the risk an operator accepts by running
+	 * a depth-6 verdict; the record makes the recovery possible rather than
+	 * automatic. Optional for rows written before the field existed (treated
+	 * as empty).
+	 */
+	revertedSplices?: Array<{
+		spliceTxid: string;
+		conflictTxid: string;
+		revertedAt: number;
+		spliceTxHex: string;
+		newFundingOutputIndex: number;
+		remoteFundingPubkey: string;
+		remoteCommitmentSig: string | null;
+		remoteHtlcSignatures?: string[];
+		remoteCommitmentSigFeeratePerKw?: number;
+	}>;
+	/**
 	 * Splice: we durably forgot a splice the peer may still hold, and owe it a
 	 * tx_abort (sent BEFORE our channel_reestablish, the ordering CLN needs)
 	 * until the peer's echo acknowledges the forget. Must survive disconnect

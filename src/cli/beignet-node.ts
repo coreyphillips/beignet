@@ -2583,9 +2583,81 @@ export class BeignetNode extends EventEmitter {
 		// Refresh the SCB when a splice LOCKS, not when it is initiated: only now
 		// does fundingTxid hold the new post-splice outpoint, so the backup encodes
 		// the outpoint a restore must actually watch (FS-7).
-		this.node.on('splice:complete', () => {
-			this.refreshStaticChannelBackup();
-		});
+		this.node.on(
+			'splice:complete',
+			(data: { channelId: Buffer; fundingTxid?: Buffer | null }) => {
+				this.refreshStaticChannelBackup();
+				const channelId = data.channelId.toString('hex');
+				const fundingTxid = data.fundingTxid
+					? Buffer.from(data.fundingTxid).reverse().toString('hex')
+					: undefined;
+				this.log('info', 'Splice complete', { channelId, fundingTxid });
+				this.emit('splice:complete', { channelId, fundingTxid });
+			}
+		);
+		// The rest of the splice lifecycle (issue #760): an abort, a conflict
+		// verdict on an input the splice carried, and the revert that settles
+		// it. Without these a daemon client watching a splice it started sees
+		// the pending state simply disappear, with nothing to say why.
+		this.node.on(
+			'splice:aborted',
+			(data: { channelId: Buffer; reason: string }) => {
+				const channelId = data.channelId.toString('hex');
+				this.log('info', 'Splice aborted', { channelId, reason: data.reason });
+				this.emit('splice:aborted', { channelId, reason: data.reason });
+			}
+		);
+		this.node.on(
+			'splice:conflicted',
+			(data: {
+				channelId: Buffer;
+				spliceTxid: string;
+				conflictTxid: string;
+				inputIndex: number;
+				height: number;
+			}) => {
+				const channelId = data.channelId.toString('hex');
+				this.log(
+					'warn',
+					'Splice cannot confirm: an input was spent elsewhere; asking the peer to revert',
+					{
+						channelId,
+						spliceTxid: data.spliceTxid,
+						conflictTxid: data.conflictTxid,
+						inputIndex: data.inputIndex,
+						height: data.height
+					}
+				);
+				this.emit('splice:conflicted', {
+					channelId,
+					spliceTxid: data.spliceTxid,
+					conflictTxid: data.conflictTxid,
+					inputIndex: data.inputIndex,
+					height: data.height
+				});
+			}
+		);
+		this.node.on(
+			'splice:reverted',
+			(data: {
+				channelId: Buffer;
+				spliceTxid: string;
+				conflictTxid: string;
+			}) => {
+				const channelId = data.channelId.toString('hex');
+				this.log('info', 'Splice reverted to the pre-splice funding', {
+					channelId,
+					spliceTxid: data.spliceTxid,
+					conflictTxid: data.conflictTxid
+				});
+				this.refreshStaticChannelBackup();
+				this.emit('splice:reverted', {
+					channelId,
+					spliceTxid: data.spliceTxid,
+					conflictTxid: data.conflictTxid
+				});
+			}
+		);
 		this.node.on(
 			'channel:opening',
 			(data: { channelId: Buffer; fundingTxid: Buffer }) => {
@@ -7317,6 +7389,11 @@ export class BeignetNode extends EventEmitter {
 		restoreRecencyUnproven?: boolean;
 		fundingUnaccounted?: boolean;
 		payThroughSplice?: boolean;
+		revertedSplices?: Array<{
+			spliceTxid: string;
+			conflictTxid: string;
+			revertedAt: number;
+		}>;
 		localReserveMsat?: bigint;
 		remoteReserveMsat?: bigint;
 		isPrivate?: boolean;
@@ -7374,6 +7451,10 @@ export class BeignetNode extends EventEmitter {
 		if (ch.fundingUnaccounted) info.fundingUnaccounted = ch.fundingUnaccounted;
 		if (ch.payThroughSplice !== undefined)
 			info.payThroughSplice = ch.payThroughSplice;
+		// Splices reverted on a confirmed input conflict (issue #760).
+		if (ch.revertedSplices?.length) {
+			info.revertedSplices = ch.revertedSplices.map((r) => ({ ...r }));
+		}
 		if (ch.isPrivate !== undefined) info.isPrivate = ch.isPrivate;
 		if (ch.feeBaseMsat !== undefined) info.feeBaseMsat = ch.feeBaseMsat;
 		if (ch.feeProportionalMillionths !== undefined)

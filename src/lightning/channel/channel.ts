@@ -823,6 +823,13 @@ export interface ITaprootClosingCache {
 /**
  * Lightning channel state machine.
  */
+/**
+ * Reverted splices a channel remembers (issue #760): enough for a peer's late
+ * question after a restart and for the deep-reorg residual, bounded so a
+ * channel cannot accrue a record per splice for its whole life.
+ */
+export const REVERTED_SPLICES_KEPT = 8;
+
 export class Channel {
 	private _state: IChannelState;
 	private _signer: ISigner | null = null;
@@ -11928,6 +11935,17 @@ export class Channel {
 	}
 
 	/**
+	 * Whether this channel reverted the named splice (display txid) on a
+	 * confirmed input conflict (issue #760): the durable answer to a peer
+	 * asking after a restart.
+	 */
+	hasRevertedSplice(spliceTxidDisplayHex: string): boolean {
+		return (this._state.revertedSplices ?? []).some(
+			(r) => r.spliceTxid === spliceTxidDisplayHex
+		);
+	}
+
+	/**
 	 * Record that an input of the in-flight splice was spent elsewhere and the
 	 * spend confirmed (issue #760). Only while the splice is in flight and the
 	 * chain has not taken it: a confirmed splice cannot have a confirmed
@@ -12028,6 +12046,30 @@ export class Channel {
 			.reverse()
 			.toString('hex');
 		const conflictTxid = inflight.conflict.txid;
+
+		// Remembered before the record is dropped (issue #760): the peer may
+		// ask about this splice after a restart, and the material that could
+		// close the new funding after a too-deep reorg lives nowhere else.
+		// Newest last, bounded so a channel cannot accrue one per splice.
+		this._state.revertedSplices = [
+			...(this._state.revertedSplices ?? []),
+			{
+				spliceTxid,
+				conflictTxid,
+				revertedAt: Date.now(),
+				spliceTxHex: inflight.spliceTxHex,
+				newFundingOutputIndex: inflight.newFundingOutputIndex,
+				remoteFundingPubkey: inflight.remoteFundingPubkey.toString('hex'),
+				remoteCommitmentSig: inflight.remoteCommitmentSig
+					? inflight.remoteCommitmentSig.toString('hex')
+					: null,
+				remoteHtlcSignatures: inflight.remoteHtlcSignatures?.length
+					? inflight.remoteHtlcSignatures.map((s) => s.toString('hex'))
+					: undefined,
+				remoteCommitmentSigFeeratePerKw:
+					inflight.remoteCommitmentSigFeeratePerKw
+			}
+		].slice(-REVERTED_SPLICES_KEPT);
 
 		this._state.spliceInFlight = null;
 		this._spliceSession = null;

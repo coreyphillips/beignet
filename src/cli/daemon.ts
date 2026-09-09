@@ -465,6 +465,15 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		// commitment spend was classified; consumers tracking close resolution
 		// need this one.
 		'channel:resolved',
+		// The splice lifecycle (issue #760): the lock that adopts the new
+		// funding, an abort, a confirmed double spend of an input the splice
+		// carried, and the revert that returns the channel to the old funding.
+		// A client that started a splice otherwise sees its pending state
+		// vanish with nothing to say which way it went.
+		'splice:complete',
+		'splice:aborted',
+		'splice:conflicted',
+		'splice:reverted',
 		'peer:connect',
 		'peer:disconnect',
 		// Every channel failure reason (peer rejection, funding build/broadcast

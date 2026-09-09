@@ -1030,6 +1030,15 @@ export interface IChannelInfo {
 	 * settle-to balance lives entirely in the splicing bucket).
 	 */
 	payThroughSplice?: boolean;
+	/**
+	 * Splices this channel reverted because an input was spent elsewhere and
+	 * the spend confirmed (issue #760), newest last; txids in display order.
+	 */
+	revertedSplices?: Array<{
+		spliceTxid: string;
+		conflictTxid: string;
+		revertedAt: number;
+	}>;
 	/** Reserve we must maintain (set by remote peer), in msat */
 	localReserveMsat?: bigint;
 	/** Reserve remote must maintain (set by us), in msat */

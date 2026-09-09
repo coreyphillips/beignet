@@ -13054,6 +13054,15 @@ export class LightningNode extends EventEmitter {
 		if (effInfoState === ChannelState.SPLICING) {
 			info.payThroughSplice = channel.isHtlcUsable(true);
 		}
+		// Splices this channel reverted on a confirmed input conflict (issue
+		// #760): what an operator sees when asking why a splice is gone.
+		if (state.revertedSplices?.length) {
+			info.revertedSplices = state.revertedSplices.map((r) => ({
+				spliceTxid: r.spliceTxid,
+				conflictTxid: r.conflictTxid,
+				revertedAt: r.revertedAt
+			}));
+		}
 		if (state.shortChannelId)
 			info.shortChannelId = state.shortChannelId.toString('hex');
 		info.feeratePerKw = state.localConfig.feeratePerKw;
@@ -22033,15 +22042,6 @@ export class LightningNode extends EventEmitter {
 	// ─────────────── Splice conflict recovery (issue #760) ───────────────
 
 	/**
-	 * Splices this node reverted in this process, per channel, so a peer that
-	 * detected the same conflict and asks after our revert is told agreed=1
-	 * instead of "no such splice", and stops re-asking. In memory only: after
-	 * a restart the peer gets the honest "no such splice" and keeps asking
-	 * once a block, which is bounded and harmless.
-	 */
-	private revertedSplices = new Map<string, Set<string>>();
-
-	/**
 	 * Arm a watch on every input of an in-flight splice that this node does
 	 * not vouch for (issue #760): a depth-locked splice carrying external
 	 * inputs, past the point of no return. Idempotent; the watcher keys per
@@ -22266,7 +22266,6 @@ export class LightningNode extends EventEmitter {
 		if (this.channelManager.getPeerForChannel(req.channelId) !== peerPubkey) {
 			return;
 		}
-		const idHex = req.channelId.toString('hex');
 		const spliceTxidDisplay = Buffer.from(req.spliceTxid)
 			.reverse()
 			.toString('hex');
@@ -22289,10 +22288,14 @@ export class LightningNode extends EventEmitter {
 			});
 		const inflight = channel.getFullState().spliceInFlight;
 		if (!inflight || !inflight.spliceTxid.equals(req.spliceTxid)) {
-			// Both sides detected it at once and we already reverted on the
-			// peer's earlier request or our own verdict: say so, so it stops
-			// asking. Anything else we simply do not have.
-			if (this.revertedSplices.get(idHex)?.has(spliceTxidDisplay)) agree();
+			// We already reverted it, on the peer's earlier request or our own
+			// verdict, and the peer's copy of that exchange was lost (a dropped
+			// ack, a restart on either side): the peer verified the conflict on
+			// its own chain view before asking and we have nothing left to
+			// revert, so agree, and it stops asking. The memory is on the
+			// channel state, so it survives our restart (issue #760). Anything
+			// else we simply do not have.
+			if (channel.hasRevertedSplice(spliceTxidDisplay)) agree();
 			else refuse('no such splice in flight');
 			return;
 		}
@@ -22340,7 +22343,7 @@ export class LightningNode extends EventEmitter {
 		const again = this.channelManager.getChannel(req.channelId);
 		const current = again?.getFullState().spliceInFlight;
 		if (!again || !current || !current.spliceTxid.equals(req.spliceTxid)) {
-			if (this.revertedSplices.get(idHex)?.has(spliceTxidDisplay)) agree();
+			if (again?.hasRevertedSplice(spliceTxidDisplay)) agree();
 			else refuse('no such splice in flight');
 			return;
 		}
@@ -22412,9 +22415,6 @@ export class LightningNode extends EventEmitter {
 		conflictTxid: string
 	): void {
 		const idHex = channelId.toString('hex');
-		const set = this.revertedSplices.get(idHex) ?? new Set<string>();
-		set.add(spliceTxid);
-		this.revertedSplices.set(idHex, set);
 		this.emitStructuredLog('splice', 'reverted', {
 			channelId: idHex,
 			spliceTxid,
