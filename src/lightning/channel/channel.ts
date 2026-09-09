@@ -11928,6 +11928,157 @@ export class Channel {
 	}
 
 	/**
+	 * Record that an input of the in-flight splice was spent elsewhere and the
+	 * spend confirmed (issue #760). Only while the splice is in flight and the
+	 * chain has not taken it: a confirmed splice cannot have a confirmed
+	 * conflict, and a claim that it does is a claim about the chain that the
+	 * chain refutes. True when the record changed (newly conflicted, or a
+	 * different competing spend named), so the caller knows to persist.
+	 */
+	markSpliceConflicted(conflict: {
+		txid: string;
+		height: number;
+		inputIndex: number;
+	}): boolean {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight || inflight.confirmed || inflight.localSpliceLocked) {
+			return false;
+		}
+		if (inflight.conflict?.txid === conflict.txid) return false;
+		inflight.conflict = {
+			txid: conflict.txid,
+			height: conflict.height,
+			inputIndex: conflict.inputIndex
+		};
+		return true;
+	}
+
+	/** Stamp when SPLICE_CONFLICT last left for the peer (issue #760). */
+	noteSpliceConflictRequest(at: number): void {
+		const conflict = this._state.spliceInFlight?.conflict;
+		if (conflict) conflict.revertRequestedAt = at;
+	}
+
+	/**
+	 * The position of the shared 2-of-2 funding input in the in-flight splice
+	 * transaction, or null without a record. The one input a conflict claim
+	 * may never name (issue #760).
+	 */
+	getSpliceSharedInputIndex(): number | null {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight || !this._state.fundingTxid) return null;
+		const idx = findInputIndex(
+			bitcoin.Transaction.fromHex(inflight.spliceTxHex),
+			this._state.fundingTxid,
+			this._state.fundingOutputIndex
+		);
+		return idx < 0 ? null : idx;
+	}
+
+	/**
+	 * Unwind a splice that can never confirm (issue #760): one of its inputs
+	 * was spent elsewhere and that spend is SPLICE_CONFLICT_DEPTH deep. BOLT 2
+	 * offers no abort past tx_signatures and this implementation has no
+	 * splice RBF, so without this the channel would sit mid-splice forever.
+	 *
+	 * Both sides still hold valid commitments on the pre-splice funding: the
+	 * pending-lock window mirrors every update onto both fundings and the
+	 * live state never left the old one (completeSplice is what adopts the
+	 * new outpoint, and it has not run). So the revert is the pre-signature
+	 * abort's restoration, applied to a record past the point of no return:
+	 * drop the record and the driver, return to the pre-splice state, and
+	 * forget the transaction's watches. Allowed only while the record is
+	 * marked conflicted, the chain has not taken the splice, we have not sent
+	 * splice_locked, and the channel has not adopted it. The caller (the
+	 * node) agrees the revert with the peer first; both sides revert against
+	 * their own chain view, never on the other's word.
+	 *
+	 * The WATCH_FUNDING returned matters: the watcher keys funding watches by
+	 * channel, so the splice's watch replaced the old funding's, and after the
+	 * revert the old outpoint must be watched again for depth and spends.
+	 */
+	revertConflictedSplice(): ChannelAction[] {
+		const refuse = (message: string): ChannelAction[] => [
+			{
+				type: ChannelActionType.ERROR,
+				message: `Cannot revert splice: ${message}`
+			}
+		];
+		const inflight = this._state.spliceInFlight;
+		if (!inflight) return refuse('no splice in flight');
+		if (!inflight.conflict) return refuse('the splice is not conflicted');
+		if (inflight.confirmed) return refuse('the splice tx confirmed');
+		if (inflight.localSpliceLocked) {
+			return refuse('splice_locked already sent');
+		}
+		const wrapped =
+			this._state.state === ChannelState.AWAITING_REESTABLISH
+				? this._state.preReestablishState
+				: null;
+		if (
+			this._state.state !== ChannelState.SPLICING &&
+			wrapped !== ChannelState.SPLICING
+		) {
+			return refuse(`channel is ${this._state.state}, not SPLICING`);
+		}
+		if (!this._state.fundingTxid || !this._state.channelId) {
+			return refuse('no funding to return to');
+		}
+		const spliceTxid = Buffer.from(inflight.spliceTxid)
+			.reverse()
+			.toString('hex');
+		const conflictTxid = inflight.conflict.txid;
+
+		this._state.spliceInFlight = null;
+		this._spliceSession = null;
+		this._resetSpliceDriver();
+		const target = this._state.preSpliceState ?? ChannelState.NORMAL;
+		this._state.preSpliceState = null;
+		if (wrapped !== null) {
+			// Disconnected: the live slot is preReestablishState, exactly as
+			// initiateSpliceAbort handles it, and the reestablish that follows
+			// unwraps it.
+			this._state.preReestablishState =
+				target === ChannelState.SPLICING ? ChannelState.NORMAL : target;
+		} else {
+			this._state.state = target;
+		}
+		this._state.spliceFundingTxid = null;
+		this._state.spliceFundingOutputIndex = 0;
+		this._quiescence.exitQuiescence();
+		this._state.quiescenceState = QuiescenceState.NORMAL;
+		this._state.quiescenceInitiator = false;
+		// The leg vouching for the splice as the expected spender of the old
+		// funding, and the broadcast obligation for a transaction that will
+		// never confirm, both go with it.
+		const legs = (this._state.preSpliceSpendWatches ?? []).filter(
+			(w) => w.spliceTxid !== spliceTxid
+		);
+		this._state.preSpliceSpendWatches = legs.length ? legs : undefined;
+		const owed = (this._state.unconfirmedSpliceTxs ?? []).filter(
+			(e) => !e.txid.equals(inflight.spliceTxid)
+		);
+		this._state.unconfirmedSpliceTxs = owed;
+
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.WATCH_FUNDING,
+				fundingTxid: this._state.fundingTxid,
+				fundingOutputIndex: this._state.fundingOutputIndex,
+				minimumDepth: this._state.minimumDepth,
+				rearm: true
+			},
+			{
+				type: ChannelActionType.SPLICE_REVERTED,
+				channelId: this._state.channelId,
+				spliceTxid,
+				conflictTxid
+			}
+		];
+	}
+
+	/**
 	 * Clear the interactive-tx driving state for a splice.
 	 */
 	/** Issue #760: does the current splice wait for the chain before locking? */

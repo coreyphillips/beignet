@@ -305,6 +305,19 @@ export interface IDfReceiverDeps {
 	onTxSigsNeeded(cb: (e: IDfTxSigsNeeded) => void): () => void;
 	/** Subscribe to `channel:splice-txsigs-needed`. */
 	onSpliceTxSigsNeeded(cb: (e: IDfSpliceTxSigsNeeded) => void): () => void;
+	/**
+	 * Subscribe to `splice:reverted` (issue #760): a splice this receiver
+	 * put a payer's coin under was unwound because the payer spent that coin
+	 * elsewhere. Optional; without it a reverted funding is retired by the
+	 * lapse sweep instead of at once.
+	 */
+	onSpliceReverted?(
+		cb: (e: {
+			channelId: Buffer;
+			spliceTxid: string;
+			conflictTxid: string;
+		}) => void
+	): () => void;
 	now?(): number;
 	/** Structured-log sink, the same one 4B's lanes take. */
 	log?: DfTransportLog;

@@ -553,6 +553,13 @@ export interface ISerializedSpliceInFlight {
 	confirmed: boolean;
 	/** Issue #760: per-splice lock depth; absent on older rows. */
 	lockAtDepth?: number;
+	/** Issue #760: the confirmed competing spend of one of its inputs. */
+	conflict?: {
+		txid: string;
+		height: number;
+		inputIndex: number;
+		revertRequestedAt?: number;
+	};
 }
 
 export function serializeSpliceInFlight(
@@ -589,7 +596,8 @@ export function serializeSpliceInFlight(
 		localSpliceLocked: f.localSpliceLocked,
 		remoteSpliceLocked: f.remoteSpliceLocked,
 		confirmed: f.confirmed,
-		lockAtDepth: f.lockAtDepth
+		lockAtDepth: f.lockAtDepth,
+		conflict: f.conflict ? { ...f.conflict } : undefined
 	};
 }
 
@@ -629,7 +637,8 @@ export function deserializeSpliceInFlight(
 		localSpliceLocked: s.localSpliceLocked,
 		remoteSpliceLocked: s.remoteSpliceLocked,
 		confirmed: s.confirmed,
-		lockAtDepth: s.lockAtDepth
+		lockAtDepth: s.lockAtDepth,
+		conflict: s.conflict ? { ...s.conflict } : undefined
 	};
 }
 

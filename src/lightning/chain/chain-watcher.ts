@@ -241,6 +241,55 @@ function preSpliceWatchKey(
 	)}${PRE_SPLICE_KEY_MARKER}${txid}:${outputIndex}`;
 }
 
+/**
+ * Confirmations a competing spend of a splice input must reach before the
+ * splice is declared unconfirmable (issue #760). Six, like IRREVOCABLE_DEPTH:
+ * the revert this verdict drives puts the channel back on the funding the
+ * splice was meant to replace, and a reorg deep enough to undo six blocks
+ * and confirm the splice after all would leave both sides on a spent
+ * funding. A mempool-only conflict is never a verdict: the splice may still
+ * win.
+ */
+export const SPLICE_CONFLICT_DEPTH = 6;
+
+/**
+ * One input of an in-flight splice this node does not vouch for (a
+ * stranger's coin under a depth-locked splice, issue #760), watched for a
+ * confirmed spend by anything other than the splice itself.
+ */
+interface IWatchedSpliceInput {
+	channelId: Buffer;
+	/** The splice's txid, display byte order. */
+	spliceTxid: string;
+	/** The input's position in the splice transaction. */
+	inputIndex: number;
+	/** The spent outpoint, txid in display byte order. */
+	txid: string;
+	vout: number;
+	scriptHash: string;
+	script: Buffer;
+	/**
+	 * The conflicting txid last reported for this input. The verdict fires
+	 * once; it fires again only if the chain names a different spender.
+	 */
+	reportedConflictTxid?: string;
+	/**
+	 * Per-txid answer to "does this transaction spend the watched outpoint",
+	 * so each history entry is fetched once rather than on every block.
+	 * Transactions are immutable, so the answer keeps.
+	 */
+	spendsOutpoint: Map<string, boolean>;
+}
+
+/** Registry key for one watched splice input. */
+function spliceInputWatchKey(
+	channelId: Buffer,
+	spliceTxid: string,
+	inputIndex: number
+): string {
+	return `${channelId.toString('hex')}:${spliceTxid}:${inputIndex}`;
+}
+
 export interface IChainWatcherConfig {
 	backend: IChainBackend;
 	channelManager: ChannelManager;
@@ -351,6 +400,13 @@ export async function classifyRemoteFundingInput(
  * - 'funding:presplice-retired' (channelId: Buffer, txid: string,
  *   outputIndex: number): a superseded pre-splice outpoint was seen spent by
  *   the splice, so its extra watch and the durable record behind it retire
+ * - 'splice:input-conflict' (channelId: Buffer, spliceTxid: string,
+ *   conflictTxid: string, inputIndex: number, height: number): an input of
+ *   an in-flight splice that this node does not vouch for was spent by
+ *   another transaction, confirmed SPLICE_CONFLICT_DEPTH deep while the
+ *   splice itself is unconfirmed, so the splice can never confirm (issue
+ *   #760). Once per watched input; again only if the spender changes. A
+ *   mempool-only conflict is not reported
  * - 'announcement:depth' (channelId: Buffer, height: number, txIndex: number)
  * - 'output:spent' (txid: string, outputIndex: number)
  * - 'output:unspent' (txid: string, outputIndex: number)
@@ -471,6 +527,14 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	private channelSpendScans: Map<string, IChannelSpendScan> = new Map();
 	private watchedOutputs: Map<string, IWatchedOutput> = new Map(); // "txid:vout" → output
+	/**
+	 * Inputs of in-flight splices watched for a confirmed competing spend
+	 * (issue #760), keyed by channel, splice txid and input index. Swept per
+	 * block and by the recheck timer; a script hash subscription would buy
+	 * nothing, since the verdict needs SPLICE_CONFLICT_DEPTH blocks anyway.
+	 */
+	private watchedSpliceInputs: Map<string, IWatchedSpliceInput> = new Map();
+
 	/**
 	 * Dispenser for output spend scans, watcher-wide rather than per outpoint. A
 	 * batched spend (a penalty, an aggregated HTLC claim) is one transaction over
@@ -693,6 +757,7 @@ export class ChainWatcher extends EventEmitter {
 		for (const key of this.watchedOutputs.keys()) {
 			this.checkOutputSpend(key).catch((err) => this.emitError(err));
 		}
+		this.checkSpliceInputConflicts(this.lifecycleGeneration);
 	}
 
 	/**
@@ -711,6 +776,7 @@ export class ChainWatcher extends EventEmitter {
 		// scan still in flight is retired by the map-identity guard, which no
 		// longer finds its watch, whatever the ticket state says.
 		this.channelSpendScans.delete(channelId.toString('hex'));
+		this.unwatchSpliceInputs(channelId);
 		return this.watchedFundings.delete(channelId.toString('hex'));
 	}
 
@@ -734,6 +800,7 @@ export class ChainWatcher extends EventEmitter {
 		this.channelSpendScans.clear();
 		this.watchedOutputs.clear();
 		this.outputSpendVerdicts.clear();
+		this.watchedSpliceInputs.clear();
 		this.failedFundingWatches.length = 0;
 		this.failedOutputWatches.length = 0;
 		this.failedBroadcasts.length = 0;
@@ -961,6 +1028,238 @@ export class ChainWatcher extends EventEmitter {
 		) {
 			this.watchedFundings.delete(key);
 		}
+	}
+
+	/**
+	 * Watch one input of an in-flight splice for a competing spend (issue
+	 * #760). The splice carries a coin this node does not vouch for: if its
+	 * owner spends it elsewhere and that spend confirms, the splice can never
+	 * confirm, BOLT 2 offers no abort after tx_signatures, and the channel
+	 * would sit mid-splice forever. The per-block sweep reads the outpoint's
+	 * script history, fetches every confirmed spender other than the splice,
+	 * and reports 'splice:input-conflict' once the winner is
+	 * SPLICE_CONFLICT_DEPTH deep while the splice is not on chain at all.
+	 *
+	 * Idempotent per (channel, splice, input). Nothing is subscribed: the
+	 * verdict needs six blocks, and every block already sweeps the registry.
+	 */
+	watchSpliceInput(
+		channelId: Buffer,
+		spliceTxidDisplayHex: string,
+		input: { txid: string; vout: number; script: Buffer; inputIndex: number }
+	): void {
+		if (!this.acceptingWork) return;
+		const key = spliceInputWatchKey(
+			channelId,
+			spliceTxidDisplayHex,
+			input.inputIndex
+		);
+		const existing = this.watchedSpliceInputs.get(key);
+		if (
+			existing &&
+			existing.txid === input.txid &&
+			existing.vout === input.vout
+		) {
+			return;
+		}
+		this.watchedSpliceInputs.set(key, {
+			channelId,
+			spliceTxid: spliceTxidDisplayHex,
+			inputIndex: input.inputIndex,
+			txid: input.txid,
+			vout: input.vout,
+			scriptHash: computeScriptHash(input.script),
+			script: input.script,
+			spendsOutpoint: new Map()
+		});
+	}
+
+	/**
+	 * Drop the splice input watches of a channel: those of one splice when a
+	 * txid is given, all of them otherwise. Called when the splice locks, is
+	 * adopted, aborted or reverted, and when the channel goes (issue #760).
+	 */
+	unwatchSpliceInputs(channelId: Buffer, spliceTxidDisplayHex?: string): void {
+		const prefix = `${channelId.toString('hex')}:${
+			spliceTxidDisplayHex !== undefined ? `${spliceTxidDisplayHex}:` : ''
+		}`;
+		for (const key of [...this.watchedSpliceInputs.keys()]) {
+			if (key.startsWith(prefix)) this.watchedSpliceInputs.delete(key);
+		}
+	}
+
+	/**
+	 * Drop the pre-splice spend leg of one outpoint (issue #760). A reverted
+	 * splice is a transaction that will never confirm, so its leg would keep
+	 * vouching for it as the expected spender of the funding the channel is
+	 * back on. After the revert any spend of that outpoint is unexpected, and
+	 * the channel's own re-armed watch reports it as such.
+	 */
+	unwatchPreSpliceSpend(
+		channelId: Buffer,
+		txid: string,
+		outputIndex: number
+	): boolean {
+		return this.watchedFundings.delete(
+			preSpliceWatchKey(channelId, txid, outputIndex)
+		);
+	}
+
+	/** The splice input watches held for a channel, for tests and status. */
+	spliceInputWatchesFor(channelId: Buffer): Array<{
+		spliceTxid: string;
+		inputIndex: number;
+		txid: string;
+		vout: number;
+	}> {
+		const idHex = channelId.toString('hex');
+		const out: Array<{
+			spliceTxid: string;
+			inputIndex: number;
+			txid: string;
+			vout: number;
+		}> = [];
+		for (const w of this.watchedSpliceInputs.values()) {
+			if (w.channelId.toString('hex') !== idHex) continue;
+			out.push({
+				spliceTxid: w.spliceTxid,
+				inputIndex: w.inputIndex,
+				txid: w.txid,
+				vout: w.vout
+			});
+		}
+		return out;
+	}
+
+	/**
+	 * Sweep every watched splice input for a confirmed competing spend (issue
+	 * #760). One scan per watch, each isolated: a failing fetch on one input
+	 * costs nothing else, and the next block asks again.
+	 */
+	private checkSpliceInputConflicts(generation: number): void {
+		for (const [key, watched] of this.watchedSpliceInputs) {
+			this.checkSpliceInputConflict(key, watched, generation).catch((err) =>
+				this.emitError(err)
+			);
+		}
+	}
+
+	private async checkSpliceInputConflict(
+		key: string,
+		watched: IWatchedSpliceInput,
+		generation: number
+	): Promise<void> {
+		// No height, no depth: the first header has not arrived.
+		if (this.currentBlockHeight <= 0) return;
+		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
+		if (!this.isCurrentGeneration(generation)) return;
+		if (this.watchedSpliceInputs.get(key) !== watched) return;
+		// The splice on chain settles the question the other way: nothing
+		// competing can have confirmed, whatever else the history holds.
+		const spliceEntry = history.find((h) => h.txid === watched.spliceTxid);
+		if (spliceEntry && spliceEntry.height > 0) return;
+		for (const entry of history) {
+			// The outpoint's own parent shares this script, as does the splice
+			// (unconfirmed, or it would have returned above). A mempool spender
+			// is a warning and not a verdict: the splice may still win.
+			if (entry.txid === watched.txid || entry.txid === watched.spliceTxid) {
+				continue;
+			}
+			if (entry.height <= 0) continue;
+			let spends = watched.spendsOutpoint.get(entry.txid);
+			if (spends === undefined) {
+				const raw = await this.backend.getTransaction(entry.txid);
+				if (!this.isCurrentGeneration(generation)) return;
+				if (this.watchedSpliceInputs.get(key) !== watched) return;
+				const tx = bitcoin.Transaction.fromBuffer(raw);
+				// Never trust the name the server gave the bytes.
+				spends =
+					tx.getId() === entry.txid &&
+					tx.ins.some(
+						(input) =>
+							Buffer.from(input.hash).reverse().toString('hex') ===
+								watched.txid && input.index === watched.vout
+					);
+				watched.spendsOutpoint.set(entry.txid, spends);
+			}
+			if (!spends) continue;
+			const depth = this.currentBlockHeight - entry.height + 1;
+			if (depth < SPLICE_CONFLICT_DEPTH) continue;
+			if (watched.reportedConflictTxid === entry.txid) return;
+			watched.reportedConflictTxid = entry.txid;
+			this.emit(
+				'splice:input-conflict',
+				watched.channelId,
+				watched.spliceTxid,
+				entry.txid,
+				watched.inputIndex,
+				entry.height
+			);
+			return;
+		}
+	}
+
+	/**
+	 * Independent chain check of a peer's claim that a splice input was spent
+	 * elsewhere (issue #760): the receiving side of SPLICE_CONFLICT never
+	 * reverts on the peer's word. Fetches the named transaction, requires it
+	 * to spend one of the splice's inputs other than the shared 2-of-2 funding
+	 * input (which the peer co-signs and could spend in a commitment, a
+	 * different matter entirely), reads the spent outpoint's script from its
+	 * own parent transaction, and requires the spender to sit
+	 * SPLICE_CONFLICT_DEPTH deep in that script's history while the splice
+	 * itself has no confirmed entry there. Null on any shortfall; never throws
+	 * for a chain answer (a transport failure still rejects, so the caller
+	 * can tell "refuted" from "could not check").
+	 */
+	async verifySpliceInputConflict(
+		spliceTxHex: string,
+		conflictTxidDisplayHex: string,
+		sharedInputIndex: number
+	): Promise<{ inputIndex: number; height: number; depth: number } | null> {
+		if (this.currentBlockHeight <= 0) return null;
+		const splice = bitcoin.Transaction.fromHex(spliceTxHex);
+		const spliceTxid = splice.getId();
+		if (conflictTxidDisplayHex === spliceTxid) return null;
+		const raw = await this.backend.getTransaction(conflictTxidDisplayHex);
+		const conflict = bitcoin.Transaction.fromBuffer(raw);
+		if (conflict.getId() !== conflictTxidDisplayHex) return null;
+		const spent = new Set(
+			conflict.ins.map(
+				(i) => `${Buffer.from(i.hash).reverse().toString('hex')}:${i.index}`
+			)
+		);
+		let inputIndex = -1;
+		for (let i = 0; i < splice.ins.length; i++) {
+			if (i === sharedInputIndex) continue;
+			const outpoint = `${Buffer.from(splice.ins[i].hash)
+				.reverse()
+				.toString('hex')}:${splice.ins[i].index}`;
+			if (spent.has(outpoint)) {
+				inputIndex = i;
+				break;
+			}
+		}
+		if (inputIndex < 0) return null;
+		const prevTxid = Buffer.from(splice.ins[inputIndex].hash)
+			.reverse()
+			.toString('hex');
+		const prevVout = splice.ins[inputIndex].index;
+		const parentRaw = await this.backend.getTransaction(prevTxid);
+		const parent = bitcoin.Transaction.fromBuffer(parentRaw);
+		if (parent.getId() !== prevTxid) return null;
+		const prevout = parent.outs[prevVout];
+		if (!prevout) return null;
+		const history = await this.backend.getScriptHashHistory(
+			computeScriptHash(Buffer.from(prevout.script))
+		);
+		const spliceEntry = history.find((h) => h.txid === spliceTxid);
+		if (spliceEntry && spliceEntry.height > 0) return null;
+		const entry = history.find((h) => h.txid === conflictTxidDisplayHex);
+		if (!entry || entry.height <= 0) return null;
+		const depth = this.currentBlockHeight - entry.height + 1;
+		if (depth < SPLICE_CONFLICT_DEPTH) return null;
+		return { inputIndex, height: entry.height, depth };
 	}
 
 	/**
@@ -1352,6 +1651,10 @@ export class ChainWatcher extends EventEmitter {
 				this.emitError(err);
 			});
 		}
+
+		// Inputs of in-flight splices this node does not vouch for (issue
+		// #760): a block is what turns a competing spend into a verdict.
+		this.checkSpliceInputConflicts(generation);
 
 		this.emit('block', height);
 	}

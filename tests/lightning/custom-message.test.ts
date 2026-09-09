@@ -23,6 +23,14 @@ import {
 	encodeCustomMessage,
 	decodeCustomMessage
 } from '../../src/lightning/message/custom';
+import {
+	SPLICE_CONFLICT_LENGTH,
+	SPLICE_CONFLICT_REASON_MAX,
+	decodeSpliceConflict,
+	decodeSpliceConflictAck,
+	encodeSpliceConflict,
+	encodeSpliceConflictAck
+} from '../../src/lightning/message/splice-conflict';
 
 const PEER = '02' + 'ab'.repeat(32);
 
@@ -269,5 +277,131 @@ describe('LightningNode custom message surface (issue #546)', () => {
 			(node as unknown as { peerManager: unknown }).peerManager = undefined;
 			node.destroy();
 		}
+	});
+});
+
+describe('Splice conflict codecs (issue #760, subtypes 64/65)', () => {
+	const channelId = crypto.randomBytes(32);
+	const spliceTxid = crypto.randomBytes(32);
+	const conflictTxid = crypto.randomBytes(32);
+
+	it('round-trips SPLICE_CONFLICT at its fixed length', () => {
+		const encoded = encodeSpliceConflict({
+			channelId,
+			spliceTxid,
+			conflictTxid,
+			inputIndex: 3
+		});
+		expect(encoded.length).to.equal(SPLICE_CONFLICT_LENGTH);
+		expect(encoded.subarray(0, 32).equals(channelId)).to.equal(true);
+		expect(encoded.subarray(32, 64).equals(spliceTxid)).to.equal(true);
+		expect(encoded.subarray(64, 96).equals(conflictTxid)).to.equal(true);
+		expect(encoded.readUInt16BE(96)).to.equal(3);
+		const decoded = decodeSpliceConflict(encoded);
+		expect(decoded.channelId.equals(channelId)).to.equal(true);
+		expect(decoded.spliceTxid.equals(spliceTxid)).to.equal(true);
+		expect(decoded.conflictTxid.equals(conflictTxid)).to.equal(true);
+		expect(decoded.inputIndex).to.equal(3);
+		expect(BeignetCustomSubtype.SPLICE_CONFLICT).to.equal(64);
+		expect(BeignetCustomSubtype.SPLICE_CONFLICT_ACK).to.equal(65);
+	});
+
+	it('refuses a SPLICE_CONFLICT of the wrong length or a non-u16 index', () => {
+		const good = encodeSpliceConflict({
+			channelId,
+			spliceTxid,
+			conflictTxid,
+			inputIndex: 0
+		});
+		expect(() => decodeSpliceConflict(good.subarray(0, 97))).to.throw(
+			/98 bytes/
+		);
+		expect(() =>
+			decodeSpliceConflict(Buffer.concat([good, Buffer.from([0])]))
+		).to.throw(/98 bytes/);
+		expect(() =>
+			encodeSpliceConflict({
+				channelId,
+				spliceTxid,
+				conflictTxid,
+				inputIndex: 65536
+			})
+		).to.throw(/u16/);
+		expect(() =>
+			encodeSpliceConflict({
+				channelId: Buffer.alloc(31),
+				spliceTxid,
+				conflictTxid,
+				inputIndex: 0
+			})
+		).to.throw(/channelId must be 32 bytes/);
+	});
+
+	it('round-trips SPLICE_CONFLICT_ACK, agreed and refused, with a utf8 reason', () => {
+		const agreed = decodeSpliceConflictAck(
+			encodeSpliceConflictAck({
+				channelId,
+				spliceTxid,
+				agreed: true,
+				reason: ''
+			})
+		);
+		expect(agreed.agreed).to.equal(true);
+		expect(agreed.reason).to.equal('');
+		expect(agreed.channelId.equals(channelId)).to.equal(true);
+		expect(agreed.spliceTxid.equals(spliceTxid)).to.equal(true);
+		const reason = 'not confirmed at depth on our chain view: caf\u00e9';
+		const encoded = encodeSpliceConflictAck({
+			channelId,
+			spliceTxid,
+			agreed: false,
+			reason
+		});
+		expect(encoded.readUInt8(64)).to.equal(0);
+		expect(encoded.readUInt16BE(65)).to.equal(
+			Buffer.byteLength(reason, 'utf8')
+		);
+		const refused = decodeSpliceConflictAck(encoded);
+		expect(refused.agreed).to.equal(false);
+		expect(refused.reason).to.equal(reason);
+	});
+
+	it('bounds the ack reason and refuses a malformed ack', () => {
+		const long = 'x'.repeat(SPLICE_CONFLICT_REASON_MAX + 1);
+		expect(() =>
+			encodeSpliceConflictAck({
+				channelId,
+				spliceTxid,
+				agreed: false,
+				reason: long
+			})
+		).to.throw(/exceeds/);
+		const good = encodeSpliceConflictAck({
+			channelId,
+			spliceTxid,
+			agreed: false,
+			reason: 'behind'
+		});
+		// Truncated reason.
+		expect(() =>
+			decodeSpliceConflictAck(good.subarray(0, good.length - 1))
+		).to.throw(/does not match its reason length/);
+		// Trailing bytes.
+		expect(() =>
+			decodeSpliceConflictAck(Buffer.concat([good, Buffer.from([1])]))
+		).to.throw(/does not match/);
+		// agreed outside {0, 1}.
+		const bad = Buffer.from(good);
+		bad.writeUInt8(2, 64);
+		expect(() => decodeSpliceConflictAck(bad)).to.throw(
+			/agreed must be 0 or 1/
+		);
+		// A declared reason longer than the cap.
+		const capped = Buffer.from(good);
+		capped.writeUInt16BE(SPLICE_CONFLICT_REASON_MAX + 1, 65);
+		expect(() => decodeSpliceConflictAck(capped)).to.throw(/exceeds/);
+		expect(() => decodeSpliceConflictAck(good.subarray(0, 66))).to.throw(
+			/at least 67 bytes/
+		);
 	});
 });

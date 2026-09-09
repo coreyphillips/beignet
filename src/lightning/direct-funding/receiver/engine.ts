@@ -327,6 +327,11 @@ export class DirectFundingReceiver extends EventEmitter {
 				);
 			})
 		);
+		if (this.deps.onSpliceReverted) {
+			this.detachers.push(
+				this.deps.onSpliceReverted((e) => this.failRevertedSpliceFunding(e))
+			);
+		}
 		this.sweepTimer = setInterval(() => {
 			this.state.sweep(this.now());
 			this.retireLapsedFundings();
@@ -434,6 +439,47 @@ export class DirectFundingReceiver extends EventEmitter {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: held.offerIdHex,
 				channelId: held.funding.channelId,
+				error: reason
+			});
+			this.emit('offer:failed', { offerId: held.offerIdHex, reason });
+		}
+	}
+
+	/**
+	 * A splice this receiver put a payer's coin under was reverted (issue
+	 * #760): the payer spent the coin elsewhere, the spend confirmed, and the
+	 * channel is back on its pre-splice funding. The request's attempt is
+	 * failed the way the lapse sweep fails one, only now rather than at the
+	 * request's expiry: the busy mark comes off, the coin's reservation is
+	 * released, and the failure is reported. The payer was not paid, and the
+	 * request stays payable by a fresh offer.
+	 */
+	private failRevertedSpliceFunding(e: {
+		channelId: Buffer;
+		spliceTxid: string;
+	}): void {
+		const channelIdHex = e.channelId.toString('hex');
+		for (const held of this.deps.requests.activeFundings()) {
+			const { funding } = held;
+			if (
+				!funding.splice ||
+				funding.channelId !== channelIdHex ||
+				funding.fundingTxid !== e.spliceTxid
+			) {
+				continue;
+			}
+			this.state.release(funding.outpoint, held.offerIdHex);
+			this.deps.requests.endAttempt(held.receiptHash, held.offerIdHex);
+			const live = this.state.get(held.offerIdHex);
+			if (live) {
+				live.inflight = false;
+				live.terminal = true;
+				live.onWitness = undefined;
+			}
+			const reason = 'the payer spent the offered coin elsewhere';
+			this.log(DF_LOG_OFFER_FAILED, {
+				offerId: held.offerIdHex,
+				channelId: funding.channelId,
 				error: reason
 			});
 			this.emit('offer:failed', { offerId: held.offerIdHex, reason });
