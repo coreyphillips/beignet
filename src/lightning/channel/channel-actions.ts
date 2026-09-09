@@ -32,6 +32,7 @@ export enum ChannelActionType {
 	PERSIST_STATE = 'PERSIST_STATE',
 	SPLICE_COMPLETE = 'SPLICE_COMPLETE',
 	SPLICE_ABORTED = 'SPLICE_ABORTED',
+	SPLICE_REVERTED = 'SPLICE_REVERTED',
 	TX_SIGNATURES_NEEDED = 'TX_SIGNATURES_NEEDED',
 	SPLICE_TX_SIGNATURES_NEEDED = 'SPLICE_TX_SIGNATURES_NEEDED'
 }
@@ -105,6 +106,12 @@ export interface IWatchFundingAction {
 	fundingTxid: Buffer;
 	fundingOutputIndex: number;
 	minimumDepth: number;
+	/**
+	 * The outpoint is one the channel already ran on and is returning to (a
+	 * reverted splice, issue #760), not a funding flow starting: the manager
+	 * arms the watch and does not announce 'channel:opening' for it.
+	 */
+	rearm?: boolean;
 }
 
 /**
@@ -254,6 +261,21 @@ export interface ISpliceAbortedAction {
 	type: ChannelActionType.SPLICE_ABORTED;
 	channelId: Buffer;
 	reason: string;
+}
+
+/**
+ * A splice past tx_signatures was unwound because one of its inputs was
+ * spent elsewhere and that spend confirmed (issue #760): the splice can
+ * never confirm, and both sides return to the pre-splice funding they still
+ * hold valid commitments for. Appended exactly once by revertConflictedSplice,
+ * so the manager's splice:reverted event has one source of truth, like
+ * SPLICE_ABORTED. Txids in display byte order.
+ */
+export interface ISpliceRevertedAction {
+	type: ChannelActionType.SPLICE_REVERTED;
+	channelId: Buffer;
+	spliceTxid: string;
+	conflictTxid: string;
 }
 
 /**
@@ -533,5 +555,6 @@ export type ChannelAction =
 	| IPersistStateAction
 	| ISpliceCompleteAction
 	| ISpliceAbortedAction
+	| ISpliceRevertedAction
 	| ITxSignaturesNeededAction
 	| ISpliceTxSignaturesNeededAction;

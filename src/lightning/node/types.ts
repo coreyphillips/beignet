@@ -1624,6 +1624,8 @@ export interface IStructuredLog {
 		| 'peer'
 		| 'chain'
 		| 'watchtower'
+		// Splice conflict recovery (issue #760).
+		| 'splice'
 		// Node-level errors (ILightningError). The action is the error code, e.g.
 		// CHANNEL_ERROR or AUTO_FUNDING_FAILED.
 		| 'error';

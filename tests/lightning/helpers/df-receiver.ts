@@ -486,6 +486,9 @@ export class FakeDfNode implements IDfReceiverDeps {
 
 	private txSigsListeners: Array<(e: IDfTxSigsNeeded) => void> = [];
 	private spliceListeners: Array<(e: IDfSpliceTxSigsNeeded) => void> = [];
+	private spliceRevertedListeners: Array<
+		(e: { channelId: Buffer; spliceTxid: string; conflictTxid: string }) => void
+	> = [];
 	private pendingV2 = new Map<string, IDfPendingV2FundingTx>();
 	private pendingSplice = new Map<string, IDfPendingSpliceTx>();
 
@@ -695,6 +698,30 @@ export class FakeDfNode implements IDfReceiverDeps {
 		return () => {
 			this.spliceListeners = this.spliceListeners.filter((l) => l !== cb);
 		};
+	}
+
+	onSpliceReverted(
+		cb: (e: {
+			channelId: Buffer;
+			spliceTxid: string;
+			conflictTxid: string;
+		}) => void
+	): () => void {
+		this.spliceRevertedListeners.push(cb);
+		return () => {
+			this.spliceRevertedListeners = this.spliceRevertedListeners.filter(
+				(l) => l !== cb
+			);
+		};
+	}
+
+	/** The node reverted a splice this receiver funded (issue #760). */
+	fireSpliceReverted(e: {
+		channelId: Buffer;
+		spliceTxid: string;
+		conflictTxid: string;
+	}): void {
+		for (const cb of [...this.spliceRevertedListeners]) cb(e);
 	}
 
 	// ─── driving the negotiation ───

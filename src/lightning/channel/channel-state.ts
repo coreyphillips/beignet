@@ -97,6 +97,22 @@ export interface ISpliceInFlight {
 	 * zero-conf channel); absent means the channel type decides, as before.
 	 */
 	lockAtDepth?: number;
+	/**
+	 * Issue #760: an input of this splice was spent by another transaction,
+	 * confirmed SPLICE_CONFLICT_DEPTH deep while the splice is not on chain,
+	 * so the splice can never confirm. `txid` is the competing spend (display
+	 * byte order), `inputIndex` the splice input it took, `height` where it
+	 * confirmed. `revertRequestedAt` is when SPLICE_CONFLICT last left for
+	 * the peer; the request is re-sent until the peer agrees and both sides
+	 * revert to the pre-splice funding. Durable: the verdict must survive a
+	 * restart, since the chain will not un-say it.
+	 */
+	conflict?: {
+		txid: string;
+		height: number;
+		inputIndex: number;
+		revertRequestedAt?: number;
+	};
 }
 
 /**

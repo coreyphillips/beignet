@@ -486,6 +486,15 @@ export interface IJitManagerDeps {
 		timeoutMs: number
 	): Promise<void>;
 	/**
+	 * Whether a splice is already pending confirmation on this channel
+	 * (issue #760). A depth-locked splice takes a block or more, a held part
+	 * has an inbound CLTV deadline, and no second splice can start behind it,
+	 * so a hold that would queue on it is refused up front and a funding
+	 * attempt that meets it fails at once: nothing fronted, the part fails
+	 * upstream while its refund is still clean.
+	 */
+	splicePendingLock?(outChannelId: Buffer): boolean;
+	/**
 	 * Most the node could front from its on-chain funds right now, priced at
 	 * the current feerate (sat), or null when no figure is available (no
 	 * funding provider, or a fee estimator that has not delivered a sample
@@ -573,8 +582,23 @@ type ResolvedConfig = Omit<
  * fork matched error-message substrings, which both misses a rename and
  * retries something permanent.
  */
+/**
+ * The channel a splice-in was to ride already has a splice awaiting the
+ * chain (issue #760). Permanent for a held part: the wait is measured in
+ * blocks, the part's deadline is not.
+ */
+class SplicePendingLockError extends Error {
+	constructor(channelIdHex: string) {
+		super(
+			`channel ${channelIdHex.slice(0, 12)} has a splice pending confirmation`
+		);
+		this.name = 'SplicePendingLockError';
+	}
+}
+
 function isPermanentFundingRefusal(err: unknown): boolean {
 	if (err instanceof InvalidRequestError) return true;
+	if (err instanceof SplicePendingLockError) return true;
 	if (err instanceof ChannelFundingUnavailableError) {
 		return (
 			err.code === ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED ||
@@ -1430,6 +1454,17 @@ export class JitReceiveManager extends EventEmitter {
 
 		const key = outChannelId.toString('hex');
 		if (!this.spliceInFlight.has(key) && !this.fundingSlotsFree()) return false;
+		// A splice not ours is already awaiting the chain on this channel
+		// (issue #760): a part queued behind it would wait blocks against a
+		// deadline measured in blocks. Refused before anything is held, so the
+		// caller fails it upstream with nothing fronted. Our own splice in
+		// flight is different: parts join its queue and forward when it locks.
+		if (
+			!this.spliceInFlight.has(key) &&
+			this.deps.splicePendingLock?.(outChannelId) === true
+		) {
+			return false;
+		}
 
 		part.intentScidHex = intent.interceptScidHex;
 		const queue = this.spliceQueues.get(key) ?? [];
@@ -1488,8 +1523,19 @@ export class JitReceiveManager extends EventEmitter {
 				fundingSats: amountSats
 			});
 			await this.attempt(
-				(timeoutMs) =>
-					this.deps.spliceInAndWait!(outChannelId, amountSats, timeoutMs),
+				(timeoutMs) => {
+					// The channel went mid-splice between the hold and this
+					// attempt (issue #760): a retry loop would run out the hold
+					// budget against a splice that locks in blocks, so fail now.
+					if (this.deps.splicePendingLock?.(outChannelId) === true) {
+						throw new SplicePendingLockError(key);
+					}
+					return this.deps.spliceInAndWait!(
+						outChannelId,
+						amountSats,
+						timeoutMs
+					);
+				},
 				() => this.spliceQueues.get(key) ?? []
 			);
 			fronted = true;

@@ -6230,6 +6230,39 @@ export class ChannelManager extends EventEmitter {
 	/**
 	 * Abort a splice operation.
 	 */
+	/**
+	 * Unwind a splice whose input was spent elsewhere (issue #760), after the
+	 * node has verified the conflict on chain and agreed it with the peer.
+	 * The channel arm refuses unless the record is marked conflicted and the
+	 * splice is neither confirmed, locked nor adopted.
+	 */
+	revertConflictedSplice(channelId: Buffer): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const actions = channel.revertConflictedSplice();
+		this.processActions(peerPubkey, channel, actions);
+		const errorAction = actions.find(
+			(a): a is Extract<ChannelAction, { type: ChannelActionType.ERROR }> =>
+				a.type === ChannelActionType.ERROR
+		);
+		return {
+			ok: !errorAction,
+			actions,
+			...(errorAction ? { error: errorAction.message } : {})
+		};
+	}
+
 	abortSplice(channelId: Buffer, reason?: string): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
@@ -8702,6 +8735,7 @@ export class ChannelManager extends EventEmitter {
 					// batch that moved the channel to ERRORED, and no first-time
 					// funding watch is ever emitted by an ERRORED channel.
 					if (
+						!action.rearm &&
 						channel.getState() !== ChannelState.SPLICING &&
 						channel.getState() !== ChannelState.ERRORED
 					) {
@@ -8863,6 +8897,17 @@ export class ChannelManager extends EventEmitter {
 					// disconnected aborts that never pass through NORMAL, and
 					// reestablish unwinds, exactly once per attempt.
 					this.emitContained('splice:aborted', action.channelId, action.reason);
+					break;
+				case ChannelActionType.SPLICE_REVERTED:
+					// Same shape as SPLICE_ABORTED (issue #760): the channel arm
+					// that unwound the conflicted splice is the one source of the
+					// splice:reverted event.
+					this.emitContained(
+						'splice:reverted',
+						action.channelId,
+						action.spliceTxid,
+						action.conflictTxid
+					);
 					break;
 			}
 			if (progress) progress.completedIndex = index;

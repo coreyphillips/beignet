@@ -1090,6 +1090,8 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `channel:aborted` | `(temporaryChannelId: Buffer, reason: string)` | Open aborted before funding |
 | `channel:voided` | `({ channelId })` | Unfunded/abandoned channel discarded |
 | `splice:complete` | `({ channelId, fundingTxid })` | splice_locked exchanged both ways |
+| `splice:conflicted` | `({ channelId, spliceTxid, conflictTxid, inputIndex, height })` | An input of an in-flight splice that this node does not vouch for (a depth-locked splice carrying a stranger's coin, issue #760) was spent by another transaction, confirmed six deep while the splice is not on chain: the splice can never confirm. The node records it durably, raises `node:error` code `SPLICE_INPUT_CONFLICT`, and asks the peer to verify and revert; the request is re-sent every block and on reconnect until agreed |
+| `splice:reverted` | `({ channelId, spliceTxid, conflictTxid })` | A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere") |
 | `announcement:ready` | `(channelId: Buffer)` | Channel eligible for announcement |
 | `message:outbound` | `(peerPubkey: string, type: number, payload: Buffer)` | Message to send to peer |
 | `htlc:forwarded` | `({ inChannelId, outChannelId, amountInMsat, amountOutMsat, feeMsat })` | HTLC relayed to the next hop |
@@ -1116,9 +1118,13 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `node:error` | `(error: ILightningError)` | Operational error (non-fatal) |
 | `node:ready` | `()` | Node fully operational (peers reconnected, channels restored) |
 
+### Beignet custom messages (type 44069)
+
+Beignet-to-beignet extensions ride one odd BOLT 1 message type, `44069`, as `[u16 version][u16 subtype][payload]`; other implementations ignore it (`message/custom.ts`, `BeignetCustomSubtype`). Reserved subtypes: 1 to 5 JIT receive, 16 to 22 direct funding, 32 to 33 recovery guardian sessions, 48 to 55 the swap provider (`swaps/README.md`), and 64 to 65 splice conflict recovery (issue #760): `SPLICE_CONFLICT` (64) `[32 channel_id][32 splice_txid][32 conflict_txid][u16 input_index]` asks the peer to verify on its own chain that the named splice input was spent elsewhere at depth and to revert to the pre-splice funding; `SPLICE_CONFLICT_ACK` (65) `[32 channel_id][32 splice_txid][u8 agreed][u16 reason_len][reason]` reports the outcome. Txids are in `tx.getHash()` byte order. A receiver never reverts on the peer's word: it fetches the spender, checks it takes an input other than the shared funding input, reads the depth from the outpoint's own history, and refuses (`agreed=0`, with a reason) on any shortfall; the requester re-asks on every block and on reconnect (`message/splice-conflict.ts`).
+
 Channel-scoped events carry an **object**, not a bare id: `node.on('channel:ready', ({ channelId }) => ...)`, where `channelId` is a 32-byte Buffer. `announcement:ready` is the exception and passes the Buffer directly. `BeignetNode` normalizes all of these to hex strings.
 
-`LightningNode` reports operational problems through `node:error` and never emits the bare `'error'` event. `ChannelManager` does emit `'error'` as `(channelId: Buffer | null, error: string)`, so code that drives a `ChannelManager` directly (most unit tests) should attach a listener, even a noop, to avoid unhandled-error throws.
+`LightningNode` reports operational problems through `node:error` and never emits the bare `'error'` event. Splice conflict recovery (issue #760) adds the code `SPLICE_INPUT_CONFLICT`, raised once per conflicted splice alongside `splice:conflicted`. `ChannelManager` does emit `'error'` as `(channelId: Buffer | null, error: string)`, so code that drives a `ChannelManager` directly (most unit tests) should attach a listener, even a noop, to avoid unhandled-error throws.
 
 ## Typed Payment Errors
 
