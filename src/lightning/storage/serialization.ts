@@ -443,6 +443,8 @@ export interface ISerializedChannelState {
 	spliceFundingOutputIndex?: number;
 	preSpliceState?: string | null;
 	spliceInFlight?: ISerializedSpliceInFlight | null;
+	/** Issue #756: fully signed splice txs not yet seen confirmed (txid internal hex). */
+	unconfirmedSpliceTxs?: Array<{ txid: string; txHex: string }>;
 	spliceAbortOwed?: boolean;
 	remoteForwardingPolicy?: {
 		feeBaseMsat: number;
@@ -902,6 +904,12 @@ export function serializeChannelState(
 		spliceInFlight: s.spliceInFlight
 			? serializeSpliceInFlight(s.spliceInFlight)
 			: null,
+		unconfirmedSpliceTxs: s.unconfirmedSpliceTxs?.length
+			? s.unconfirmedSpliceTxs.map((e) => ({
+					txid: e.txid.toString('hex'),
+					txHex: e.txHex
+			  }))
+			: undefined,
 		spliceAbortOwed: s.spliceAbortOwed === true ? true : undefined,
 		remoteForwardingPolicy: s.remoteForwardingPolicy
 			? {
@@ -1306,6 +1314,12 @@ export function deserializeChannelState(
 		spliceInFlight: s.spliceInFlight
 			? deserializeSpliceInFlight(s.spliceInFlight)
 			: null,
+		unconfirmedSpliceTxs: s.unconfirmedSpliceTxs?.length
+			? s.unconfirmedSpliceTxs.map((e) => ({
+					txid: Buffer.from(e.txid, 'hex'),
+					txHex: e.txHex
+			  }))
+			: [],
 		spliceAbortOwed: s.spliceAbortOwed ?? false,
 		remoteForwardingPolicy: s.remoteForwardingPolicy
 			? {

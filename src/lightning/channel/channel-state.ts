@@ -613,6 +613,16 @@ export interface IChannelState {
 	 */
 	spliceInFlight?: ISpliceInFlight | null;
 	/**
+	 * Splice txs this node fully signed that the chain has not been seen to
+	 * take (issue #756). A zero-conf channel locks, and so adopts, a splice
+	 * right after tx_signatures, and `spliceInFlight` dies with the adoption;
+	 * the BOLT 2 obligation to (re)broadcast the transaction does not. The
+	 * adoption appends here and the funding watch's confirmation removes.
+	 * `txid` is internal byte order. Optional for rows written before the
+	 * field existed (treated as empty).
+	 */
+	unconfirmedSpliceTxs?: Array<{ txid: Buffer; txHex: string }>;
+	/**
 	 * Splice: we durably forgot a splice the peer may still hold, and owe it a
 	 * tx_abort (sent BEFORE our channel_reestablish, the ordering CLN needs)
 	 * until the peer's echo acknowledges the forget. Must survive disconnect
@@ -1015,6 +1025,7 @@ export function createOpenerState(params: {
 		spliceFundingOutputIndex: 0,
 		preSpliceState: null,
 		spliceInFlight: null,
+		unconfirmedSpliceTxs: [],
 
 		fundingVersion: 1,
 		dualFundingSession: null,
@@ -1126,6 +1137,7 @@ export function createAcceptorState(params: {
 		spliceFundingOutputIndex: 0,
 		preSpliceState: null,
 		spliceInFlight: null,
+		unconfirmedSpliceTxs: [],
 
 		fundingVersion: 1,
 		dualFundingSession: null,

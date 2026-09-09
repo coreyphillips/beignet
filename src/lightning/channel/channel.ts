@@ -5911,15 +5911,53 @@ export class Channel {
 	 */
 	buildSpliceRebroadcastActions(): ChannelAction[] {
 		const inflight = this._state.spliceInFlight;
-		if (!inflight?.fullySigned || !inflight.spliceTxHex) return [];
+		const owed: string[] = [];
+		if (inflight?.fullySigned && inflight.spliceTxHex) {
+			owed.push(inflight.spliceTxHex);
+		}
+		// A zero-conf splice adopted before the chain took it (issue #756):
+		// the record is gone, the obligation is not.
+		for (const entry of this._state.unconfirmedSpliceTxs ?? []) {
+			if (entry.txHex && !owed.includes(entry.txHex)) owed.push(entry.txHex);
+		}
+		if (owed.length === 0) return [];
 		return [
 			{ type: ChannelActionType.PERSIST_STATE },
-			{
-				type: ChannelActionType.BROADCAST_TX,
-				tx: Buffer.from(inflight.spliceTxHex, 'hex'),
-				fundingCritical: true
-			}
+			...owed.map(
+				(hex): ChannelAction => ({
+					type: ChannelActionType.BROADCAST_TX,
+					tx: Buffer.from(hex, 'hex'),
+					fundingCritical: true
+				})
+			)
 		];
+	}
+
+	/**
+	 * The chain has a funding of this channel (issue #756): retire the splice
+	 * broadcast obligations that confirmation settles. The current funding
+	 * confirming confirms every splice that led to it, so a match on it (or a
+	 * confirmation with no txid, which the watch only reports for the current
+	 * funding) clears them all; a match on an older entry, an intermediate
+	 * splice of a chain, clears that one. True when anything was removed.
+	 */
+	clearConfirmedSpliceBroadcasts(confirmedTxidDisplayHex?: string): boolean {
+		const owed = this._state.unconfirmedSpliceTxs;
+		if (!owed?.length) return false;
+		const display = (b: Buffer): string =>
+			Buffer.from(b).reverse().toString('hex');
+		const current = this._state.fundingTxid
+			? display(this._state.fundingTxid)
+			: undefined;
+		const all =
+			confirmedTxidDisplayHex === undefined ||
+			confirmedTxidDisplayHex === current;
+		const kept = all
+			? []
+			: owed.filter((e) => display(e.txid) !== confirmedTxidDisplayHex);
+		if (kept.length === owed.length) return false;
+		this._state.unconfirmedSpliceTxs = kept;
+		return true;
 	}
 
 	/**
@@ -13372,6 +13410,30 @@ export class Channel {
 		fields.quiescenceInitiator = false;
 		fields.state = ChannelState.NORMAL;
 		fields.preSpliceState = null;
+		// The BOLT 2 broadcast obligation outlives the record it rode on
+		// (issue #756). A zero-conf channel locks, and so adopts, right after
+		// tx_signatures, when the network may well have refused the splice (a
+		// splice-out of a funding that is itself not relayed yet, for one).
+		// The transaction is kept until the funding watch sees it confirmed;
+		// an ordinary channel locks at depth and owes nothing here.
+		const record = this._state.spliceInFlight;
+		if (
+			record?.fullySigned &&
+			record.spliceTxHex &&
+			!record.confirmed &&
+			this._isZeroConfChannelType()
+		) {
+			const owed = this._state.unconfirmedSpliceTxs ?? [];
+			if (!owed.some((e) => e.txid.equals(record.spliceTxid))) {
+				fields.unconfirmedSpliceTxs = [
+					...owed,
+					{
+						txid: Buffer.from(record.spliceTxid),
+						txHex: record.spliceTxHex
+					}
+				];
+			}
+		}
 		fields.spliceInFlight = null;
 		return fields;
 	}
