@@ -111,6 +111,23 @@ describe('swap daemon surface (issue #737)', () => {
 		}
 	});
 
+	it('BeignetNode relays every swap event the daemon lists (SSE and webhooks are dead otherwise)', () => {
+		// The daemon subscribes on BeignetNode, not on LightningNode, so a
+		// name in getRelayedEvents() that BeignetNode never re-emits is a
+		// promise with no frame behind it.
+		const beignetNodeSrc = fs.readFileSync(
+			path.join(__dirname, '../../src/cli/beignet-node.ts'),
+			'utf8'
+		);
+		const swapEvents = getRelayedEvents().filter((e) => e.startsWith('swap:'));
+		expect(swapEvents.length).to.be.greaterThan(0);
+		for (const evt of swapEvents) {
+			expect(beignetNodeSrc, `BeignetNode relay for ${evt}`).to.include(
+				`'${evt}'`
+			);
+		}
+	});
+
 	it('answers a cancel refusal as SWAP_NOT_CANCELLABLE (409), never as a success', () => {
 		// The engine refuses in band ({ok: false, reason}); the route must
 		// not wrap that in success(), or a funded swap would answer 200 with

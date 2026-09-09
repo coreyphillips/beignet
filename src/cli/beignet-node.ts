@@ -2786,7 +2786,21 @@ export class BeignetNode extends EventEmitter {
 			'ffor:witness-recorded',
 			'ffor:witness-released',
 			'ffor:issuer-provisioned',
-			'ffor:issuer-issued'
+			'ffor:issuer-issued',
+			// Reverse swap provider (issue #737). LightningNode re-emits the
+			// engine's events; without this relay the daemon's SSE and webhook
+			// lists promised them and never delivered one.
+			'swap:created',
+			'swap:held',
+			'swap:funding',
+			'swap:funded',
+			'swap:claimed',
+			'swap:settled',
+			'swap:refund-broadcast',
+			'swap:refunded',
+			'swap:hold-cancelled',
+			'swap:exposed',
+			'swap:failed'
 		] as const) {
 			this.node.on(evt, (data: unknown) => {
 				this.emit(evt, jsonSafeEvent(data) as never);
