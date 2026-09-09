@@ -6634,23 +6634,36 @@ export class LightningNode extends EventEmitter {
 	 * until the next restart. A splice creates a funding output, so its
 	 * rebroadcast is an obligation on exactly the same footing as a v1
 	 * funding one and gets the same block-driven retry.
+	 *
+	 * Two sources (issue #756): the in-flight record while the splice awaits
+	 * its lock, and the channel's list of adopted-but-unconfirmed splice txs,
+	 * which is what a zero-conf channel leaves behind when splice_locked
+	 * retires the record with zero confirmations. Both are retired by the
+	 * funding watch reporting the transaction confirmed, never by the peer.
 	 */
 	private retryPendingSpliceBroadcasts(): void {
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			const inflight = state.spliceInFlight;
-			if (!inflight?.fullySigned) continue;
+			const owed: string[] = [];
+			if (inflight?.fullySigned && inflight.spliceTxHex) {
+				owed.push(inflight.spliceTxHex);
+			}
+			for (const entry of state.unconfirmedSpliceTxs ?? []) {
+				if (entry.txHex && !owed.includes(entry.txHex)) owed.push(entry.txHex);
+			}
+			if (owed.length === 0) continue;
 			const id = state.channelId ?? state.temporaryChannelId;
 			if (!id) continue;
 			const idHex = id.toString('hex');
 			// Splice inputs are pledged by the same wallet bookkeeping and the
 			// splice tx is retained on the same terms, so its reservation needs
 			// the same renewal as a funding one.
-			this.renewTransactionPledges(inflight.spliceTxHex);
+			for (const hex of owed) this.renewTransactionPledges(hex);
 			// Already authorized in this process: rebroadcast without minting
 			// another frame. The barrier has answered for this splice.
 			if (this.authorizedSpliceBroadcasts.has(idHex)) {
-				this.rebroadcastAuthorizedSplice(idHex, inflight.spliceTxHex);
+				for (const hex of owed) this.rebroadcastAuthorizedSplice(idHex, hex);
 				continue;
 			}
 			if (!this.mayAskForReauthorization(idHex, idHex)) continue;
@@ -7983,6 +7996,20 @@ export class LightningNode extends EventEmitter {
 				timestamp: Date.now()
 			} as ILightningError);
 		});
+		// The watcher's own retries ran out and it drops the transaction from
+		// its list (issue #756). The block-driven obligations (pending fundings,
+		// pending splices) keep re-asking regardless; anything else ends here,
+		// so the end is reported instead of vanishing.
+		this.chainWatcher.on('broadcast:permanent_failure', (err: Error) => {
+			this.emitStructuredLog('chain', 'broadcast_permanent_failure', {
+				error: err.message
+			});
+			this.emit('node:error', {
+				code: 'BROADCAST_PERMANENT_FAILURE',
+				message: err.message,
+				timestamp: Date.now()
+			} as ILightningError);
+		});
 		// Wire watch:output:requested — handle sweep output watching after force-close
 		this.chainWatcher.on(
 			'watch:output:requested',
@@ -8392,6 +8419,9 @@ export class LightningNode extends EventEmitter {
 		// and confirmation is the strongest answer the chain has (issue #593).
 		let retired = channel.clearFundingUnaccounted();
 		retired = channel.clearFundingMissingClock() || retired;
+		// A splice this node adopted before the chain took it (zero-conf,
+		// issue #756) is on the chain now: its broadcast obligation is met.
+		retired = channel.clearConfirmedSpliceBroadcasts(confirmedTxid) || retired;
 		if (state.fundingTxid) {
 			retired = channel.clearRetainedFundingPayload() || retired;
 			this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
