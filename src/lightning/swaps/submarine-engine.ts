@@ -141,6 +141,13 @@ export interface ISubmarineSwapProviderConfig {
 	unresolvedAfterBlocks: number;
 	/** How many times a dispatch that left no record may be redone. */
 	maxPaymentDispatchAttempts: number;
+	/**
+	 * After a payment event leaves a row unresolved (the record failed but
+	 * an HTLC's removal still awaits the peer's revocation, which raises no
+	 * event), the view is read again this often, this many times.
+	 */
+	resolutionRecheckMs: number;
+	resolutionRecheckCount: number;
 	/** Remaining invoice validity a create must carry. */
 	minInvoiceExpirySeconds: number;
 	/** Blocks an unconfirmed claim waits before a rebuild at a higher fee. */
@@ -169,6 +176,8 @@ export const SUBMARINE_SWAP_DEFAULTS: Omit<
 	paymentMinFeeMsat: 1_000n,
 	unresolvedAfterBlocks: 6,
 	maxPaymentDispatchAttempts: 3,
+	resolutionRecheckMs: 500,
+	resolutionRecheckCount: 40,
 	minInvoiceExpirySeconds: 600,
 	claimBumpIntervalBlocks: 2,
 	claimFeeTargetBlocks: 6,
@@ -320,6 +329,11 @@ export class SubmarineSwapProvider extends EventEmitter {
 	private readonly unsubscribe: Array<() => void> = [];
 	private queue: Promise<void> = Promise.resolve();
 	private stopped = false;
+	/** Rows being re-read after an event left them unresolved (see rechecks). */
+	private readonly rechecks = new Map<
+		string,
+		{ left: number; timer: NodeJS.Timeout }
+	>();
 
 	constructor(
 		private readonly deps: ISubmarineSwapProviderDeps,
@@ -394,6 +408,8 @@ export class SubmarineSwapProvider extends EventEmitter {
 		this.stopped = true;
 		for (const off of this.unsubscribe) off();
 		this.unsubscribe.length = 0;
+		for (const r of this.rechecks.values()) clearTimeout(r.timer);
+		this.rechecks.clear();
 	}
 
 	/** Per-block work; ticks are serialized and never overlap. */
@@ -1118,7 +1134,10 @@ export class SubmarineSwapProvider extends EventEmitter {
 		return undefined;
 	}
 
-	private async onPaymentEvent(paymentHash: Buffer): Promise<void> {
+	private async onPaymentEvent(
+		paymentHash: Buffer,
+		trigger = 'payment event'
+	): Promise<void> {
 		for (const record of this.deps.ledger.byPaymentHash(
 			paymentHash.toString('hex')
 		)) {
@@ -1129,9 +1148,42 @@ export class SubmarineSwapProvider extends EventEmitter {
 				record.state === 'EXPOSED' ||
 				record.state === 'PAYMENT_FAILED'
 			) {
-				await this.settlePaymentView(record, 'payment event');
+				const after = await this.settlePaymentView(record, trigger);
+				if (
+					after &&
+					(after.state === 'PAYING' || after.state === 'PAYMENT_UNRESOLVED')
+				) {
+					// The record has a verdict but an HTLC is not terminal yet:
+					// its removal completes on the peer's revocation, which
+					// raises no event. Read again shortly, a bounded number
+					// of times; a block also re-reads.
+					const view = this.deps.outgoingHtlcs(paymentHash);
+					if (view.status !== null && view.status !== 'PENDING') {
+						this.scheduleRecheck(paymentHash);
+					}
+				}
 			}
 		}
+	}
+
+	private scheduleRecheck(paymentHash: Buffer): void {
+		if (this.stopped) return;
+		const key = paymentHash.toString('hex');
+		const existing = this.rechecks.get(key);
+		const left = existing
+			? existing.left - 1
+			: this.config.resolutionRecheckCount;
+		if (existing) clearTimeout(existing.timer);
+		if (left <= 0) {
+			this.rechecks.delete(key);
+			return;
+		}
+		const timer = setTimeout(() => {
+			this.rechecks.delete(key);
+			void this.enqueue(() => this.onPaymentEvent(paymentHash, 'recheck'));
+		}, this.config.resolutionRecheckMs);
+		timer.unref?.();
+		this.rechecks.set(key, { left, timer });
 	}
 
 	/** One pass over one record: whatever its state owes, done once. */

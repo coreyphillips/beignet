@@ -765,6 +765,28 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			expect(record(h2, second.client).state).to.equal('CLAIM_BROADCAST');
 		});
 
+		it('re-reads a failed record whose HTLC removal completes without an event', async function () {
+			// The node fails the record and emits payment:failed while the
+			// HTLC still awaits the peer's revocation; the revocation raises
+			// nothing. The engine reads again on a short timer.
+			const h = await submarineHarness({
+				config: { resolutionRecheckMs: 20, resolutionRecheckCount: 10 }
+			});
+			h.outgoing.script = 'failed-live-htlc';
+			const { client } = await paidSwap(h);
+			expect(record(h, client).state).to.equal('PAYING');
+			// The event arrives with the HTLC still live...
+			h.outgoing.notify(client.paymentHash);
+			await settle();
+			expect(record(h, client).state).to.equal('PAYING');
+			// ...and the removal completes silently.
+			h.outgoing.fail(client.paymentHash, false);
+			await new Promise((r) => setTimeout(r, 120));
+			await settle();
+			expect(record(h, client).state).to.equal('PAYMENT_FAILED');
+			expect(h.outgoing.calls).to.have.length(1);
+		});
+
 		it('a synchronous fulfil (loopback) reaches the claim in the same pass', async function () {
 			const h = await submarineHarness();
 			h.outgoing.script = 'complete';

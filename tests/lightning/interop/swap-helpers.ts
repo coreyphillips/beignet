@@ -850,7 +850,37 @@ export async function runSubmarineSwapRefundPath(
 		60_000
 	);
 	await scene.invoicer.failUnpaid(invoice.handle, invoice.paymentHashHex);
-	await waitForSwapState(scene.provider, swapIdHex, ['PAYMENT_FAILED'], 90_000);
+	try {
+		await waitForSwapState(scene.provider, swapIdHex, ['PAYMENT_FAILED'], 90_000);
+	} catch (err) {
+		const view = scene.provider.getOutgoingHtlcs(paymentHash);
+		const payment = scene.provider.getPayment(paymentHash);
+		// eslint-disable-next-line no-console
+		console.log(
+			'    [diag] outgoing view',
+			JSON.stringify({
+				status: view.status,
+				resolved: view.resolved,
+				latest: view.latestOutstandingExpiry,
+				htlcs: view.htlcs.map((h) => ({
+					id: h.htlcId.toString(),
+					state: h.state,
+					terminal: h.terminal,
+					expiry: h.cltvExpiry
+				})),
+				payment: payment
+					? {
+							status: payment.status,
+							failureReason: payment.failureReason,
+							retryCount: payment.retryCount
+					  }
+					: null,
+				invoice: await scene.invoicer.invoiceState(invoice.paymentHashHex),
+				row: scene.provider.listSwaps().find((r) => r.id === swapIdHex)?.state
+			})
+		);
+		throw err;
+	}
 	const failed = scene.provider.listSwaps().find((r) => r.id === swapIdHex)!;
 	expect(failed.claimTxHex).to.equal(undefined);
 	expect(failed.preimageHex).to.equal(undefined);
