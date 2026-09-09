@@ -402,6 +402,8 @@ export interface IDfSpliceCall {
 	inputs: ISpliceWalletInput[];
 	changeScript: Buffer;
 	feeratePerKw: number;
+	/** The sixth argument as the engine passed it (issue #760). */
+	options?: { lockAtDepth?: number };
 }
 
 /**
@@ -478,6 +480,8 @@ export class FakeDfNode implements IDfReceiverDeps {
 	openThrows: Error | null = null;
 	lspPubkey: string | null = LSP_PUBKEY;
 	spliceChannel: Buffer | null = null;
+	/** Set to make a splice with the liquidity peer read as still in flight. */
+	spliceInFlight = false;
 	trustedPayers = new Set<string>();
 	zeroConfPeers = new Set<string>();
 	pubkeysAvailable = true;
@@ -486,6 +490,9 @@ export class FakeDfNode implements IDfReceiverDeps {
 
 	private txSigsListeners: Array<(e: IDfTxSigsNeeded) => void> = [];
 	private spliceListeners: Array<(e: IDfSpliceTxSigsNeeded) => void> = [];
+	private spliceRevertedListeners: Array<
+		(e: { channelId: Buffer; spliceTxid: string; conflictTxid: string }) => void
+	> = [];
 	private pendingV2 = new Map<string, IDfPendingV2FundingTx>();
 	private pendingSplice = new Map<string, IDfPendingSpliceTx>();
 
@@ -583,6 +590,10 @@ export class FakeDfNode implements IDfReceiverDeps {
 		return this.spliceChannel;
 	}
 
+	spliceInFlightWith(): boolean {
+		return this.spliceInFlight;
+	}
+
 	fundingPubkeys(): { local: Buffer; remote: Buffer } | null {
 		if (!this.pubkeysAvailable) return null;
 		return {
@@ -625,14 +636,16 @@ export class FakeDfNode implements IDfReceiverDeps {
 		amountSats: bigint,
 		inputs: ISpliceWalletInput[],
 		changeScript: Buffer,
-		feeratePerKw: number
+		feeratePerKw: number,
+		options?: { lockAtDepth?: number }
 	): { ok: boolean; error?: string } {
 		this.splices.push({
 			channelId,
 			amountSats,
 			inputs,
 			changeScript,
-			feeratePerKw
+			feeratePerKw,
+			...(options !== undefined ? { options } : {})
 		});
 		return this.spliceError
 			? { ok: false, error: this.spliceError }
@@ -695,6 +708,30 @@ export class FakeDfNode implements IDfReceiverDeps {
 		return () => {
 			this.spliceListeners = this.spliceListeners.filter((l) => l !== cb);
 		};
+	}
+
+	onSpliceReverted(
+		cb: (e: {
+			channelId: Buffer;
+			spliceTxid: string;
+			conflictTxid: string;
+		}) => void
+	): () => void {
+		this.spliceRevertedListeners.push(cb);
+		return () => {
+			this.spliceRevertedListeners = this.spliceRevertedListeners.filter(
+				(l) => l !== cb
+			);
+		};
+	}
+
+	/** The node reverted a splice this receiver funded (issue #760). */
+	fireSpliceReverted(e: {
+		channelId: Buffer;
+		spliceTxid: string;
+		conflictTxid: string;
+	}): void {
+		for (const cb of [...this.spliceRevertedListeners]) cb(e);
 	}
 
 	// ─── driving the negotiation ───

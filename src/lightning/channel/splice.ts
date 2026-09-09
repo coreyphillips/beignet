@@ -57,6 +57,11 @@ export interface ISpliceSessionParams {
 	fundingFeeratePerkw: number;
 	/** Locktime for the splice transaction */
 	locktime: number;
+	/**
+	 * Issue #760: confirmations this splice must reach before splice_locked,
+	 * sent to the peer as the lock_depth TLV and required back in splice_ack.
+	 */
+	lockDepth?: number;
 }
 
 export interface ISpliceResult {
@@ -84,6 +89,8 @@ export class SpliceSession {
 	private _localSpliceLocked = false;
 	private _remoteSpliceLocked = false;
 	private _requireConfirmedInputs = false;
+	/** Issue #760: the lock depth this splice was opened with, either side. */
+	private _lockDepth: number | undefined;
 
 	constructor(params: ISpliceSessionParams) {
 		this._channelId = params.channelId;
@@ -92,6 +99,7 @@ export class SpliceSession {
 		this._localRelativeSatoshis = params.localRelativeSatoshis;
 		this._fundingFeeratePerkw = params.fundingFeeratePerkw;
 		this._locktime = params.locktime;
+		this._lockDepth = params.lockDepth;
 	}
 
 	/**
@@ -108,6 +116,8 @@ export class SpliceSession {
 		localRelativeSatoshis: bigint;
 		remoteRelativeSatoshis: bigint;
 		fundingFeeratePerkw: number;
+		/** Issue #760: the initiator's requested lock depth (see ISpliceMessage). */
+		lockDepth?: number;
 		spliceTxid: Buffer;
 		spliceFundingOutputIndex: number;
 		receivedTxSignatures: boolean;
@@ -134,6 +144,7 @@ export class SpliceSession {
 				: params.receivedTxSignatures
 				? SpliceState.AWAITING_SPLICE_LOCKED
 				: SpliceState.AWAITING_TX_SIGNATURES;
+		if (params.lockDepth !== undefined) session._lockDepth = params.lockDepth;
 		return session;
 	}
 
@@ -194,6 +205,11 @@ export class SpliceSession {
 		return this._state === SpliceState.ABORTED;
 	}
 
+	/** The depth both sides agreed to lock this splice at, if any (#760). */
+	getLockDepth(): number | undefined {
+		return this._lockDepth;
+	}
+
 	getRequireConfirmedInputs(): boolean {
 		return this._requireConfirmedInputs;
 	}
@@ -229,7 +245,8 @@ export class SpliceSession {
 			relativeSatoshis: this._localRelativeSatoshis,
 			fundingFeeratePerkw: this._fundingFeeratePerkw,
 			locktime: this._locktime,
-			requireConfirmedInputs: this._requireConfirmedInputs || undefined
+			requireConfirmedInputs: this._requireConfirmedInputs || undefined,
+			lockDepth: this._lockDepth
 		};
 
 		return { ok: true, message, messageType: 'splice' };
@@ -288,6 +305,11 @@ export class SpliceSession {
 		if (msg.requireConfirmedInputs) {
 			this._requireConfirmedInputs = true;
 		}
+		// The initiator's lock depth binds us too: echoed so it knows we will
+		// wait, and applied to our own splice_locked (issue #760).
+		if (msg.lockDepth !== undefined) {
+			this._lockDepth = msg.lockDepth;
+		}
 
 		// Create the interactive TX builder
 		this._txBuilder = new InteractiveTxBuilder(
@@ -301,7 +323,8 @@ export class SpliceSession {
 			channelId: this._channelId,
 			fundingPubkey: this._localFundingPubkey,
 			relativeSatoshis: this._localRelativeSatoshis,
-			requireConfirmedInputs: this._requireConfirmedInputs || undefined
+			requireConfirmedInputs: this._requireConfirmedInputs || undefined,
+			lockDepth: this._lockDepth
 		};
 
 		return { ok: true, message: ackMessage, messageType: 'splice_ack' };

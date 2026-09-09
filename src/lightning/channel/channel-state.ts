@@ -90,6 +90,29 @@ export interface ISpliceInFlight {
 	remoteSpliceLocked: boolean;
 	/** Splice tx reached depth while we could not send splice_locked (disconnected). */
 	confirmed: boolean;
+	/**
+	 * Issue #760: confirmations this splice must reach before we send
+	 * splice_locked, whatever the channel type. Set when the splice carries an
+	 * input this node does not vouch for (a stranger's direct funding into a
+	 * zero-conf channel); absent means the channel type decides, as before.
+	 */
+	lockAtDepth?: number;
+	/**
+	 * Issue #760: an input of this splice was spent by another transaction,
+	 * confirmed SPLICE_CONFLICT_DEPTH deep while the splice is not on chain,
+	 * so the splice can never confirm. `txid` is the competing spend (display
+	 * byte order), `inputIndex` the splice input it took, `height` where it
+	 * confirmed. `revertRequestedAt` is when SPLICE_CONFLICT last left for
+	 * the peer; the request is re-sent until the peer agrees and both sides
+	 * revert to the pre-splice funding. Durable: the verdict must survive a
+	 * restart, since the chain will not un-say it.
+	 */
+	conflict?: {
+		txid: string;
+		height: number;
+		inputIndex: number;
+		revertRequestedAt?: number;
+	};
 }
 
 /**
@@ -622,6 +645,45 @@ export interface IChannelState {
 	 * field existed (treated as empty).
 	 */
 	unconfirmedSpliceTxs?: Array<{ txid: Buffer; txHex: string }>;
+	/**
+	 * Splices this channel reverted because an input was spent elsewhere and
+	 * the spend confirmed SPLICE_CONFLICT_DEPTH deep (issue #760), newest
+	 * last, bounded to the last 8. Txids in display byte order.
+	 *
+	 * Two reasons it is durable. Liveness: a peer whose SPLICE_CONFLICT or
+	 * our SPLICE_CONFLICT_ACK was lost asks again after our restart, and a
+	 * node that had forgotten the revert would answer "no such splice" once a
+	 * block forever, leaving the peer mid-splice for good; a splice named
+	 * here is answered agreed=1, since the peer verified the conflict on its
+	 * own chain view before asking and we have nothing left to revert.
+	 *
+	 * Residual: the signature material of the dropped in-flight record is
+	 * kept, because a reorg deeper than SPLICE_CONFLICT_DEPTH that let the
+	 * splice confirm after both sides reverted would put the channel's funds
+	 * under the NEW 2-of-2. That funding is then closeable cooperatively, or
+	 * with the retained signatures ONLY if no update followed the revert: the
+	 * peer's signature covers our spliced commitment at `commitmentNumber`,
+	 * and the channel keeps advancing (and revoking) on the old funding with
+	 * the shared commitment number, so after the first post-revert update the
+	 * retained commitment is a revoked state on the new funding and
+	 * broadcasting it would hand the peer a penalty. Such a reorg is the risk
+	 * an operator accepts by running a depth-6 verdict; the record states it,
+	 * it does not recover from it. Optional for rows written before the field
+	 * existed (treated as empty).
+	 */
+	revertedSplices?: Array<{
+		spliceTxid: string;
+		conflictTxid: string;
+		revertedAt: number;
+		/** Our commitment number the retained remoteCommitmentSig covers. */
+		commitmentNumber: string;
+		spliceTxHex: string;
+		newFundingOutputIndex: number;
+		remoteFundingPubkey: string;
+		remoteCommitmentSig: string | null;
+		remoteHtlcSignatures?: string[];
+		remoteCommitmentSigFeeratePerKw?: number;
+	}>;
 	/**
 	 * Splice: we durably forgot a splice the peer may still hold, and owe it a
 	 * tx_abort (sent BEFORE our channel_reestablish, the ordering CLN needs)

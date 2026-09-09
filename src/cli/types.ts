@@ -149,6 +149,16 @@ export interface ChannelInfo {
 	 */
 	payThroughSplice?: boolean;
 	/**
+	 * Splices this channel reverted because an input was spent elsewhere and
+	 * the spend confirmed (issue #760), newest last, at most the last 8.
+	 * Txids in display order; revertedAt in ms since the epoch.
+	 */
+	revertedSplices?: Array<{
+		spliceTxid: string;
+		conflictTxid: string;
+		revertedAt: number;
+	}>;
+	/**
 	 * Whether the connected peer negotiated option_splice + option_quiesce.
 	 * Absent when the peer is disconnected or its init has not arrived, so
 	 * absence means "unknown", never "unsupported".
@@ -355,11 +365,23 @@ export interface DirectFundingConfigInfo {
 	/** Whether a direct-funded open may go zero-conf. */
 	trusted: boolean;
 	/**
-	 * Whether a paired (trusted) payer's offer may be served by splicing the
-	 * existing channel with the liquidity peer instead of opening a second
-	 * one. Anonymous payers always get a new confirmed channel regardless.
+	 * Whether an offer may be served by splicing the existing channel with the
+	 * liquidity peer instead of opening a second one. On its own this covers
+	 * paired (trusted) payers; `allowUnpairedSplice` extends it.
 	 */
 	allowSplice: boolean;
+	/**
+	 * Whether an unpaired (anonymous) payer's offer may be served as a splice
+	 * too, when its coin is confirmed (issue #760). Such a splice locks at
+	 * `unpairedSpliceDepth` confirmations rather than at broadcast; a stranger
+	 * whose coin is unconfirmed still gets a new confirmed channel.
+	 */
+	allowUnpairedSplice: boolean;
+	/**
+	 * Confirmations an unpaired payer's splice waits for before it locks,
+	 * 1..2016. Defaults to 3, the ordinary channel's confirmation depth.
+	 */
+	unpairedSpliceDepth: number;
 	/** Smallest offer served, never below the 5000 sat protocol floor. */
 	minAmountSat: number;
 }
@@ -1255,6 +1277,27 @@ export interface BeignetNodeEvents {
 	'channel:resolved': (data: { channelId: string }) => void;
 	/** The channel was removed with nothing to close on chain, and its persisted state was durably deleted: its unconfirmed funding tx vanished from mempool and chain, or the open was aborted or abandoned before any funding existed. */
 	'channel:voided': (data: { channelId: string }) => void;
+	/** splice_locked exchanged both ways: the channel runs on the new funding (fundingTxid, display order). */
+	'splice:complete': (data: {
+		channelId: string;
+		fundingTxid?: string;
+	}) => void;
+	/** A splice negotiation was unwound by tx_abort before its point of no return. */
+	'splice:aborted': (data: { channelId: string; reason: string }) => void;
+	/** An input of an in-flight splice that this node does not vouch for was spent by conflictTxid, confirmed six deep while the splice is not on chain: the splice can never confirm, and the peer is being asked to revert (issue #760). */
+	'splice:conflicted': (data: {
+		channelId: string;
+		spliceTxid: string;
+		conflictTxid: string;
+		inputIndex: number;
+		height: number;
+	}) => void;
+	/** Both sides verified the conflict on their own chain view and returned to the pre-splice funding; the channel is NORMAL on the old outpoint (issue #760). */
+	'splice:reverted': (data: {
+		channelId: string;
+		spliceTxid: string;
+		conflictTxid: string;
+	}) => void;
 	'htlc:forwarded': (data: {
 		inChannelId: string;
 		outChannelId: string;

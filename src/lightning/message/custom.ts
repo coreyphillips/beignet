@@ -32,8 +32,9 @@ export const BEIGNET_CUSTOM_MAX_PAYLOAD = 65_535 - 2 - 4;
  * Subtype registry. The numbers are RESERVED here ahead of the workstreams
  * that implement them (#532 phases 3 and 4) so no later protocol collides:
  * 1, 2, 4 and 5 belong to JIT receive, 16 to 22 to direct funding, and 32
- * to 47 to recovery guardian sessions (issue #699), and 48 to 55 to the
- * swap provider (issue #737). 3 (LIQUIDITY_POLICY) and 20
+ * to 47 to recovery guardian sessions (issue #699), 48 to 55 to the
+ * swap provider (issue #737), and 64 to 65 to splice conflict recovery
+ * (issue #760). 3 (LIQUIDITY_POLICY) and 20
  * (DIRECT_FUNDING_ABORT) are numbers the LFBW fork declared but never used;
  * they stay reserved and deliberately unimplemented.
  */
@@ -84,7 +85,15 @@ export enum BeignetCustomSubtype {
 	SWAP_STATUS = 53,
 	/** Submarine direction (issue #743): the client funds, the provider pays. */
 	SWAP_SUBMARINE_CREATE = 54,
-	SWAP_SUBMARINE_CREATE_ACK = 55
+	SWAP_SUBMARINE_CREATE_ACK = 55,
+	// ── Splice conflict recovery (issue #760) ──
+	/** An input of an in-flight splice was spent elsewhere and the spend
+	 *  confirmed: the sender asks the peer to verify on its own chain view
+	 *  and revert to the pre-splice funding (message/splice-conflict.ts). */
+	SPLICE_CONFLICT = 64,
+	/** The peer's answer: agreed (it verified and reverted) or not, with a
+	 *  reason. */
+	SPLICE_CONFLICT_ACK = 65
 }
 
 export interface ICustomMessage {

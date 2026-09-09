@@ -242,6 +242,7 @@ import {
 	IStartBatchMessage,
 	encodeSpliceMessage,
 	encodeSpliceAckMessage,
+	SPLICE_LOCK_DEPTH_ACCEPT_MAX,
 	encodeSpliceLockedMessage,
 	encodeStartBatchMessage
 } from '../message/splice';
@@ -823,6 +824,13 @@ export interface ITaprootClosingCache {
 /**
  * Lightning channel state machine.
  */
+/**
+ * Reverted splices a channel remembers (issue #760): enough for a peer's late
+ * question after a restart and for the deep-reorg residual, bounded so a
+ * channel cannot accrue a record per splice for its whole life.
+ */
+export const REVERTED_SPLICES_KEPT = 8;
+
 export class Channel {
 	private _state: IChannelState;
 	private _signer: ISigner | null = null;
@@ -875,6 +883,18 @@ export class Channel {
 	// request is parked here: a second is refused rather than replacing it,
 	// since only one can be fired (issue #655). Memory-only: quiescence never
 	// survives a disconnect.
+	/**
+	 * A conflicted-splice revert request parked behind our own quiescence
+	 * handshake (issue #760). The revert is a fundamental channel change and
+	 * runs under quiescence like every other one: SPLICE_CONFLICT leaves only
+	 * once the channel is QUIESCENT with us as initiator, so neither side has
+	 * an update in flight when one of them drops the splice candidate. The
+	 * peer's SPLICE_CONFLICT_ACK ends the session on both sides (agreed or
+	 * not): the peer exits as it acks, we exit as we act on it. Memory-only,
+	 * like the quiescence it rides: a disconnect drops both and the reconnect
+	 * re-asks.
+	 */
+	private _pendingConflictRequest: { requestedAt: number } | null = null;
 	private _pendingSplice: {
 		relativeSatoshis: bigint;
 		fundingFeeratePerkw: number;
@@ -1048,7 +1068,23 @@ export class Channel {
 	private _spliceInInputs: {
 		inputs: ISpliceWalletInput[];
 		changeScript: Buffer;
+		/**
+		 * Issue #760: the lock depth this request asked for, kept WITH the
+		 * request so a parked splice fires with the depth it was made with
+		 * even after a later request or a reset touched the channel's own
+		 * fields (a second offer, a JIT splice, a splice-out while the peer's
+		 * stfu answer was pending). Absent: the channel type decides.
+		 */
+		lockAtDepth?: number;
 	} | null = null;
+	/**
+	 * Issue #760: the depth the CURRENT splice negotiation locks at, on both
+	 * sides. The initiator sets it from setSpliceInInputs before splice_init
+	 * leaves, the acceptor takes it from the peer's splice_init. Copied onto
+	 * the in-flight record at the point of no return; null means the channel
+	 * type decides, as it always did.
+	 */
+	private _spliceLockAtDepth: number | null = null;
 	// Dual-funding ACCEPTOR contribution (v2 open, e.g. a bLIP-0051 lease we
 	// sell): wallet inputs funding our fundingSatoshis share, the change
 	// script, and the contribution amount. Same wallet-closure model as
@@ -8013,6 +8049,7 @@ export class Channel {
 		this._spliceSession = null;
 		this._resetSpliceDriver();
 		this._pendingSplice = null;
+		this._pendingConflictRequest = null;
 		this._quiescence.reset();
 		this._stfuReplyOwed = false;
 		this._state.quiescenceState = QuiescenceState.NORMAL;
@@ -8240,8 +8277,10 @@ export class Channel {
 		}
 
 		// A disconnect aborts any quiescence handshake, so a splice we were waiting
-		// to start can never fire. Drop it rather than leave it dangling.
+		// to start can never fire. Drop it rather than leave it dangling. The
+		// same for a conflict revert request (issue #760): the reconnect re-asks.
 		this._pendingSplice = null;
+		this._pendingConflictRequest = null;
 
 		// FFOR section 7.5.5: before ACTIVE a disconnect aborts the setup.
 		this._fforOnDisconnect();
@@ -9212,6 +9251,7 @@ export class Channel {
 			localRelativeSatoshis: inflight.localRelativeSatoshis,
 			remoteRelativeSatoshis: inflight.remoteRelativeSatoshis,
 			fundingFeeratePerkw: this._state.commitmentFeeratePerkw || 253,
+			lockDepth: inflight.lockAtDepth,
 			spliceTxid: inflight.spliceTxid,
 			spliceFundingOutputIndex: inflight.newFundingOutputIndex,
 			receivedTxSignatures: inflight.receivedTxSignatures,
@@ -10062,6 +10102,149 @@ export class Channel {
 	}
 
 	/**
+	 * Issue #760: the one non-NORMAL state that admits a quiescence handshake.
+	 * A depth-locked splice in its pending-lock window carries update traffic
+	 * (both commitments advance in lockstep), and the conflict revert that
+	 * may end that window is a fundamental channel change, so it runs under
+	 * quiescence like a splice does. Admitted only for a splice that locks at
+	 * depth, the sole kind that can be conflicted; an ordinary pending-lock
+	 * splice keeps refusing stfu as before.
+	 */
+	private _inConflictRevertWindow(): boolean {
+		const inflight = this._state.spliceInFlight;
+		return (
+			this.isSplicePendingLock() &&
+			!!inflight?.lockAtDepth &&
+			!inflight.confirmed &&
+			!inflight.localSpliceLocked
+		);
+	}
+
+	/** NORMAL, or the conflict revert window (issue #760). */
+	private _quiescenceAdmitsState(): boolean {
+		return (
+			this._state.state === ChannelState.NORMAL ||
+			this._inConflictRevertWindow()
+		);
+	}
+
+	/** Whether this side opened the quiescence session that is live. */
+	isQuiescenceInitiator(): boolean {
+		return this._quiescence.isInitiator();
+	}
+
+	/** A conflict revert request is parked or in flight (issue #760). */
+	hasPendingSpliceConflictRequest(): boolean {
+		return this._pendingConflictRequest !== null;
+	}
+
+	/**
+	 * Ask the peer to revert the conflicted splice, under quiescence (issue
+	 * #760). Parks the request and opens our own handshake; the
+	 * SPLICE_CONFLICT_REQUEST_READY action follows once the channel is
+	 * QUIESCENT with us as initiator (at once if it already is), and the node
+	 * puts SPLICE_CONFLICT on the wire then and only then. A handshake the
+	 * peer owns refuses transiently: the peer is most likely asking us the
+	 * same thing, and we answer that instead. Pending HTLCs refuse
+	 * transiently too; the next block re-asks.
+	 */
+	requestSpliceConflictRevert(): ChannelAction[] {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight?.conflict || !this._inConflictRevertWindow()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot request a splice revert: no conflicted splice pending lock'
+				}
+			];
+		}
+		if (this._pendingConflictRequest) return [];
+		if (this._quiescence.isQuiescent()) {
+			if (!this._quiescence.isInitiator()) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: SPLICE_BUSY_PEER_QUIESCENCE,
+						transient: true
+					}
+				];
+			}
+			this._pendingConflictRequest = { requestedAt: Date.now() };
+			return [this._conflictRequestReadyAction()];
+		}
+		if (this._quiescence.peerHasSentStfu()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: SPLICE_BUSY_PEER_QUIESCENCE,
+					transient: true
+				}
+			];
+		}
+		if (this._quiescence.getState() === QuiescenceState.SENT_STFU) {
+			// Our stfu is already out (a request from a moment ago whose reply
+			// has not landed): this request rides it.
+			this._pendingConflictRequest = { requestedAt: Date.now() };
+			return [];
+		}
+		if (this.hasPendingHtlcs()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: QUIESCE_BUSY_PENDING_HTLCS,
+					transient: true
+				}
+			];
+		}
+		if (!this._quiescence.initiate()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot quiesce: already quiescing',
+					transient: true
+				}
+			];
+		}
+		this._pendingConflictRequest = { requestedAt: Date.now() };
+		this._state.quiescenceState = QuiescenceState.SENT_STFU;
+		this._state.quiescenceInitiator = true;
+		const msg: IStfuMessage = {
+			channelId: this._state.channelId!,
+			initiator: true
+		};
+		return [sendMsg(MessageType.STFU, encodeStfuMessage(msg))];
+	}
+
+	private _conflictRequestReadyAction(): ChannelAction {
+		return {
+			type: ChannelActionType.SPLICE_CONFLICT_REQUEST_READY,
+			channelId: this._state.channelId!
+		};
+	}
+
+	/**
+	 * End the quiescence session a conflict revert exchange opened without a
+	 * revert (issue #760): the peer answered agreed=0, or never answered and
+	 * the node is disconnecting it. Both sides leave the session on the ack
+	 * by protocol; a session the peer never completed is simply reset, and
+	 * the caller's disconnect resets the peer's copy. No update leaves here,
+	 * so the pre-splice commitments stay in step.
+	 */
+	abandonSpliceConflictRequest(): ChannelAction[] {
+		this._pendingConflictRequest = null;
+		if (this._quiescence.isQuiescent()) {
+			this._quiescence.exitQuiescence();
+		} else {
+			this._quiescence.reset();
+			this._stfuReplyOwed = false;
+		}
+		this._state.quiescenceState = QuiescenceState.NORMAL;
+		this._state.quiescenceInitiator = false;
+		return [];
+	}
+
+	/**
 	 * Initiate quiescence by sending STFU.
 	 * Cannot quiesce with pending HTLCs.
 	 */
@@ -10130,7 +10313,7 @@ export class Channel {
 	 */
 	private _maybeAnswerOwedStfu(): ChannelAction[] {
 		if (!this._stfuReplyOwed) return [];
-		if (this._state.state !== ChannelState.NORMAL) return [];
+		if (!this._quiescenceAdmitsState()) return [];
 		if (this.hasPendingHtlcs()) return [];
 		this._stfuReplyOwed = false;
 		const responseMsg: IStfuMessage = {
@@ -10152,7 +10335,7 @@ export class Channel {
 			this._fforStfuReplyStale = false;
 			return [];
 		}
-		if (this._state.state !== ChannelState.NORMAL) {
+		if (!this._quiescenceAdmitsState()) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -10233,6 +10416,19 @@ export class Channel {
 		if (this._fforPendingActivate && this._quiescence.isQuiescent()) {
 			this._fforPendingActivate = false;
 			actions.push(...this._fforSendActivate());
+		}
+
+		// A conflict revert request parked on our stfu (issue #760): the
+		// handshake is complete, SPLICE_CONFLICT may leave. If the peer opened
+		// the same handshake concurrently and won the funder tie-break, the
+		// session is the peer's: it is asking us, and we answer that request
+		// rather than send our own.
+		if (this._pendingConflictRequest && this._quiescence.isQuiescent()) {
+			if (this._quiescence.isInitiator()) {
+				actions.push(this._conflictRequestReadyAction());
+			} else {
+				this._pendingConflictRequest = null;
+			}
 		}
 
 		// If we drove quiescence in order to splice, fire the deferred splice now
@@ -10675,13 +10871,18 @@ export class Channel {
 		fundingFeeratePerkw: number,
 		locktime: number
 	): ChannelAction[] {
+		// The depth comes from the request that is starting now, never from a
+		// field a later request may have overwritten while this one was
+		// parked on the stfu (issue #760).
+		this._spliceLockAtDepth = this._spliceInInputs?.lockAtDepth ?? null;
 		const params: ISpliceSessionParams = {
 			channelId: this._state.channelId!,
 			localFundingPubkey: this._state.localBasepoints.fundingPubkey,
 			isInitiator: true,
 			localRelativeSatoshis: relativeSatoshis,
 			fundingFeeratePerkw,
-			locktime
+			locktime,
+			lockDepth: this._spliceLockAtDepth ?? undefined
 		};
 
 		// A prior splice abort is still awaiting its echo. tx_abort carries no
@@ -10834,8 +11035,27 @@ export class Channel {
 
 		// Fresh negotiation, fresh tx_abort conversation (see _startSplice).
 		this._txAbortSent = false;
+		// A lock depth we would have to honour for longer than the node
+		// treats anything as final is refused before a session exists
+		// (issue #760): until the lock we can neither cooperatively close nor
+		// force close onto the splice, so the depth is how long the peer
+		// alone could close the channel.
+		if (
+			msg.lockDepth !== undefined &&
+			msg.lockDepth > SPLICE_LOCK_DEPTH_ACCEPT_MAX
+		) {
+			return this.refuseSpliceInit(
+				`lock_depth ${msg.lockDepth} exceeds ${SPLICE_LOCK_DEPTH_ACCEPT_MAX}`,
+				`Cannot accept splice: lock_depth ${msg.lockDepth} exceeds the ${SPLICE_LOCK_DEPTH_ACCEPT_MAX} this node honours`
+			);
+		}
 		this._spliceSession = new SpliceSession(params);
 		const result = this._spliceSession.handleSplice(msg);
+		// The peer asked this splice to lock at depth (issue #760): it binds
+		// our splice_locked too, echoed in the ack the session just built.
+		if (result.ok) {
+			this._spliceLockAtDepth = this._spliceSession.getLockDepth() ?? null;
+		}
 
 		if (!result.ok) {
 			this._spliceSession = null;
@@ -10901,6 +11121,33 @@ export class Channel {
 		const result = this._spliceSession.handleSpliceAck(msg);
 		if (!result.ok) {
 			return [{ type: ChannelActionType.ERROR, message: result.error! }];
+		}
+
+		// A lock depth we asked for must come back (issue #760): a peer that
+		// does not know the TLV would lock a zero-conf channel at broadcast,
+		// putting the stranger's coin under the live funding. Unwind before a
+		// single tx_add_input leaves, like the capacity failure below.
+		if (
+			this._spliceLockAtDepth !== null &&
+			msg.lockDepth !== this._spliceLockAtDepth
+		) {
+			// Read before the abort: abortSplice resets the splice driver, which
+			// clears _spliceLockAtDepth, and the error below must name the depth
+			// that was asked for, not null (issue #760).
+			const requested = this._spliceLockAtDepth;
+			const actions: ChannelAction[] = [
+				this._txAbort(this._state.channelId!, 'lock_depth not honoured')
+			];
+			actions.push(
+				...this.abortSplice(
+					`peer did not honour the requested splice lock depth ${requested}`
+				)
+			);
+			actions.push({
+				type: ChannelActionType.ERROR,
+				message: `splice aborted: peer did not honour the requested lock depth ${requested}`
+			});
+			return actions;
 		}
 
 		// The peer's splice_ack contribution counts toward capacity too: the
@@ -10991,6 +11238,8 @@ export class Channel {
 	setSpliceOutDestination(script: Buffer, sats: bigint): void {
 		if (this._state.state !== ChannelState.NORMAL) return;
 		this._spliceInInputs = null;
+		// A splice-out never carries a lock depth (issue #760).
+		this._spliceLockAtDepth = null;
 		this._spliceOutDestination = { script, sats };
 	}
 
@@ -11000,10 +11249,27 @@ export class Channel {
 	 * Clears the other direction, and defers to a running splice, for the same
 	 * reasons as setSpliceOutDestination.
 	 */
-	setSpliceInInputs(inputs: ISpliceWalletInput[], changeScript: Buffer): void {
+	setSpliceInInputs(
+		inputs: ISpliceWalletInput[],
+		changeScript: Buffer,
+		options: { lockAtDepth?: number } = {}
+	): void {
 		if (this._state.state !== ChannelState.NORMAL) return;
 		this._spliceOutDestination = null;
-		this._spliceInInputs = { inputs, changeScript };
+		// A splice that must confirm before it locks, whatever the channel
+		// type (issue #760): a stranger's coin never becomes the live funding
+		// of a zero-conf channel at broadcast. The depth belongs to THIS
+		// request; _startSplice copies it onto the channel when the session
+		// opens, so nothing that happens to the channel while the request
+		// is parked can strip it.
+		this._spliceInInputs = {
+			inputs,
+			changeScript,
+			...(options.lockAtDepth !== undefined
+				? { lockAtDepth: options.lockAtDepth }
+				: {})
+		};
+		this._spliceLockAtDepth = null;
 	}
 
 	/**
@@ -11878,9 +12144,218 @@ export class Channel {
 	}
 
 	/**
+	 * Whether this channel reverted the named splice (display txid) on a
+	 * confirmed input conflict (issue #760): the durable answer to a peer
+	 * asking after a restart.
+	 */
+	hasRevertedSplice(spliceTxidDisplayHex: string): boolean {
+		return (this._state.revertedSplices ?? []).some(
+			(r) => r.spliceTxid === spliceTxidDisplayHex
+		);
+	}
+
+	/**
+	 * Record that an input of the in-flight splice was spent elsewhere and the
+	 * spend confirmed (issue #760). Only while the splice is in flight and the
+	 * chain has not taken it: a confirmed splice cannot have a confirmed
+	 * conflict, and a claim that it does is a claim about the chain that the
+	 * chain refutes. True when the record changed (newly conflicted, or a
+	 * different competing spend named), so the caller knows to persist.
+	 */
+	markSpliceConflicted(conflict: {
+		txid: string;
+		height: number;
+		inputIndex: number;
+	}): boolean {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight || inflight.confirmed || inflight.localSpliceLocked) {
+			return false;
+		}
+		if (inflight.conflict?.txid === conflict.txid) return false;
+		inflight.conflict = {
+			txid: conflict.txid,
+			height: conflict.height,
+			inputIndex: conflict.inputIndex
+		};
+		return true;
+	}
+
+	/** Stamp when SPLICE_CONFLICT last left for the peer (issue #760). */
+	noteSpliceConflictRequest(at: number): void {
+		const conflict = this._state.spliceInFlight?.conflict;
+		if (conflict) conflict.revertRequestedAt = at;
+	}
+
+	/**
+	 * The position of the shared 2-of-2 funding input in the in-flight splice
+	 * transaction, or null without a record. The one input a conflict claim
+	 * may never name (issue #760).
+	 */
+	getSpliceSharedInputIndex(): number | null {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight || !this._state.fundingTxid) return null;
+		const idx = findInputIndex(
+			bitcoin.Transaction.fromHex(inflight.spliceTxHex),
+			this._state.fundingTxid,
+			this._state.fundingOutputIndex
+		);
+		return idx < 0 ? null : idx;
+	}
+
+	/**
+	 * Unwind a splice that can never confirm (issue #760): one of its inputs
+	 * was spent elsewhere and that spend is SPLICE_CONFLICT_DEPTH deep. BOLT 2
+	 * offers no abort past tx_signatures and this implementation has no
+	 * splice RBF, so without this the channel would sit mid-splice forever.
+	 *
+	 * Both sides still hold valid commitments on the pre-splice funding: the
+	 * pending-lock window mirrors every update onto both fundings and the
+	 * live state never left the old one (completeSplice is what adopts the
+	 * new outpoint, and it has not run). So the revert is the pre-signature
+	 * abort's restoration, applied to a record past the point of no return:
+	 * drop the record and the driver, return to the pre-splice state, and
+	 * forget the transaction's watches. Allowed only while the record is
+	 * marked conflicted, the chain has not taken the splice, we have not sent
+	 * splice_locked, and the channel has not adopted it. The caller (the
+	 * node) agrees the revert with the peer first; both sides revert against
+	 * their own chain view, never on the other's word.
+	 *
+	 * The WATCH_FUNDING returned matters: the watcher keys funding watches by
+	 * channel, so the splice's watch replaced the old funding's, and after the
+	 * revert the old outpoint must be watched again for depth and spends.
+	 */
+	revertConflictedSplice(): ChannelAction[] {
+		const refuse = (message: string): ChannelAction[] => [
+			{
+				type: ChannelActionType.ERROR,
+				message: `Cannot revert splice: ${message}`
+			}
+		];
+		const inflight = this._state.spliceInFlight;
+		if (!inflight) return refuse('no splice in flight');
+		if (!inflight.conflict) return refuse('the splice is not conflicted');
+		if (inflight.confirmed) return refuse('the splice tx confirmed');
+		if (inflight.localSpliceLocked) {
+			return refuse('splice_locked already sent');
+		}
+		const wrapped =
+			this._state.state === ChannelState.AWAITING_REESTABLISH
+				? this._state.preReestablishState
+				: null;
+		if (
+			this._state.state !== ChannelState.SPLICING &&
+			wrapped !== ChannelState.SPLICING
+		) {
+			return refuse(`channel is ${this._state.state}, not SPLICING`);
+		}
+		if (!this._state.fundingTxid || !this._state.channelId) {
+			return refuse('no funding to return to');
+		}
+		const spliceTxid = Buffer.from(inflight.spliceTxid)
+			.reverse()
+			.toString('hex');
+		const conflictTxid = inflight.conflict.txid;
+
+		// Remembered before the record is dropped (issue #760): the peer may
+		// ask about this splice after a restart, and the material that could
+		// close the new funding after a too-deep reorg lives nowhere else.
+		// Newest last, bounded so a channel cannot accrue one per splice.
+		this._state.revertedSplices = [
+			...(this._state.revertedSplices ?? []),
+			{
+				spliceTxid,
+				conflictTxid,
+				revertedAt: Date.now(),
+				commitmentNumber: this._state.localCommitmentNumber.toString(),
+				spliceTxHex: inflight.spliceTxHex,
+				newFundingOutputIndex: inflight.newFundingOutputIndex,
+				remoteFundingPubkey: inflight.remoteFundingPubkey.toString('hex'),
+				remoteCommitmentSig: inflight.remoteCommitmentSig
+					? inflight.remoteCommitmentSig.toString('hex')
+					: null,
+				remoteHtlcSignatures: inflight.remoteHtlcSignatures?.length
+					? inflight.remoteHtlcSignatures.map((s) => s.toString('hex'))
+					: undefined,
+				remoteCommitmentSigFeeratePerKw:
+					inflight.remoteCommitmentSigFeeratePerKw
+			}
+		].slice(-REVERTED_SPLICES_KEPT);
+
+		this._state.spliceInFlight = null;
+		this._spliceSession = null;
+		this._pendingConflictRequest = null;
+		this._resetSpliceDriver();
+		const target = this._state.preSpliceState ?? ChannelState.NORMAL;
+		this._state.preSpliceState = null;
+		if (wrapped !== null) {
+			// Disconnected: the live slot is preReestablishState, exactly as
+			// initiateSpliceAbort handles it, and the reestablish that follows
+			// unwraps it.
+			this._state.preReestablishState =
+				target === ChannelState.SPLICING ? ChannelState.NORMAL : target;
+		} else {
+			this._state.state = target;
+		}
+		this._state.spliceFundingTxid = null;
+		this._state.spliceFundingOutputIndex = 0;
+		this._quiescence.exitQuiescence();
+		this._state.quiescenceState = QuiescenceState.NORMAL;
+		this._state.quiescenceInitiator = false;
+		// The leg vouching for the splice as the expected spender of the old
+		// funding, and the broadcast obligation for a transaction that will
+		// never confirm, both go with it.
+		const legs = (this._state.preSpliceSpendWatches ?? []).filter(
+			(w) => w.spliceTxid !== spliceTxid
+		);
+		this._state.preSpliceSpendWatches = legs.length ? legs : undefined;
+		const owed = (this._state.unconfirmedSpliceTxs ?? []).filter(
+			(e) => !e.txid.equals(inflight.spliceTxid)
+		);
+		this._state.unconfirmedSpliceTxs = owed;
+
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.WATCH_FUNDING,
+				fundingTxid: this._state.fundingTxid,
+				fundingOutputIndex: this._state.fundingOutputIndex,
+				minimumDepth: this._state.minimumDepth,
+				rearm: true
+			},
+			{
+				type: ChannelActionType.SPLICE_REVERTED,
+				channelId: this._state.channelId,
+				spliceTxid,
+				conflictTxid
+			}
+		];
+	}
+
+	/**
 	 * Clear the interactive-tx driving state for a splice.
 	 */
+	/** Issue #760: does the current splice wait for the chain before locking? */
+	private _spliceLocksAtDepth(): boolean {
+		return (
+			(this._spliceLockAtDepth ??
+				this._state.spliceInFlight?.lockAtDepth ??
+				0) > 0
+		);
+	}
+
+	/**
+	 * The depth the splice's funding watch reports at: the channel's own
+	 * minimum, raised to the splice's lock depth when it has one (#760).
+	 */
+	private _spliceWatchDepth(): number {
+		return Math.max(
+			this._state.minimumDepth,
+			this._spliceLockAtDepth ?? this._state.spliceInFlight?.lockAtDepth ?? 0
+		);
+	}
+
 	private _resetSpliceDriver(): void {
+		this._spliceLockAtDepth = null;
 		this._spliceContributions = null;
 		this._spliceContribIndex = 0;
 		this._spliceSentTxComplete = false;
@@ -11948,7 +12423,8 @@ export class Channel {
 				receivedTxSignatures: false,
 				localSpliceLocked: false,
 				remoteSpliceLocked: false,
-				confirmed: false
+				confirmed: false,
+				lockAtDepth: this._spliceLockAtDepth ?? session.getLockDepth()
 			};
 		}
 		Object.assign(this._state.spliceInFlight, changes);
@@ -13066,7 +13542,7 @@ export class Channel {
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: signed.spliceTxid,
 				fundingOutputIndex: signed.newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
+				minimumDepth: this._spliceWatchDepth()
 			},
 			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg))
 		];
@@ -13077,6 +13553,7 @@ export class Channel {
 		// handleTxSignatures.
 		if (
 			this._isZeroConfChannelType() &&
+			!this._spliceLocksAtDepth() &&
 			this._state.spliceInFlight?.receivedTxSignatures
 		) {
 			actions.push(...this.sendSpliceLocked());
@@ -13122,7 +13599,7 @@ export class Channel {
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: spliceTxid,
 				fundingOutputIndex: newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
+				minimumDepth: this._spliceWatchDepth()
 			}
 		];
 		// Zero-conf channels lock the splice immediately after tx_signatures
@@ -13131,8 +13608,11 @@ export class Channel {
 		// confirmed check covers a confirmation that arrived while we were
 		// missing the peer's signatures (e.g. it completed and broadcast
 		// during a disconnect).
+		// A splice with a lock depth waits for the chain whatever the channel
+		// type (issue #760); the funding watch reports it at depth and the
+		// node sends splice_locked then.
 		if (
-			this._isZeroConfChannelType() ||
+			(this._isZeroConfChannelType() && !this._spliceLocksAtDepth()) ||
 			this._state.spliceInFlight?.confirmed
 		) {
 			actions.push(...this.sendSpliceLocked());
@@ -13421,6 +13901,7 @@ export class Channel {
 			record?.fullySigned &&
 			record.spliceTxHex &&
 			!record.confirmed &&
+			!record.lockAtDepth &&
 			this._isZeroConfChannelType()
 		) {
 			const owed = this._state.unconfirmedSpliceTxs ?? [];
@@ -16448,7 +16929,7 @@ export class Channel {
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: record.spliceTxid,
 				fundingOutputIndex: record.newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
+				minimumDepth: this._spliceWatchDepth()
 			});
 		}
 		refusal.push({ type: ChannelActionType.ERROR, message });
@@ -16473,7 +16954,7 @@ export class Channel {
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: record.spliceTxid,
 				fundingOutputIndex: record.newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
+				minimumDepth: this._spliceWatchDepth()
 			});
 		}
 		actions.push(...this._failChannelWithWireError(message));
@@ -17517,7 +17998,7 @@ export class Channel {
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: spliceTxid,
 				fundingOutputIndex: record.newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
+				minimumDepth: this._spliceWatchDepth()
 			},
 			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg)),
 			...this._spliceCompletionTail(tx, record.newFundingOutputIndex)

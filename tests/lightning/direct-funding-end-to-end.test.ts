@@ -94,6 +94,8 @@ async function setup(
 	opts: {
 		paired?: boolean;
 		allowSplice?: boolean;
+		allowUnpairedSplice?: boolean;
+		unpairedSpliceDepth?: number;
 		allowZeroConf?: boolean;
 		amountSat?: bigint;
 	} = {}
@@ -140,6 +142,10 @@ async function setup(
 
 	const receiver = new DirectFundingReceiver(node, {
 		allowSplice: opts.allowSplice === true,
+		allowUnpairedSplice: opts.allowUnpairedSplice === true,
+		...(opts.unpairedSpliceDepth !== undefined
+			? { unpairedSpliceDepth: opts.unpairedSpliceDepth }
+			: {}),
 		allowZeroConf: opts.allowZeroConf === true
 	});
 	receiver.start();
@@ -351,6 +357,50 @@ describe('Direct funding end to end: payer against receiver', () => {
 			expect(e2e.node.opens).to.have.length(0);
 			// The new funding output carries the pre-splice capacity as well, which
 			// is the arm the payer checks the shared input for.
+			e2e.node.completeSpliceNegotiation(
+				e2e.coin,
+				e2e.expectedOffer(),
+				500_000n,
+				{ fundingScript: e2e.fundingScript }
+			);
+			const result = await send;
+			expect(result.attested).to.equal(true);
+			expect(e2e.node.witnesses[0].kind).to.equal('splice');
+			expect(result.receiptPreimageHex).to.equal(e2e.record.preimageHex);
+			// A paired payer's splice locks as the channel type says.
+			expect(e2e.node.splices[0].options).to.deep.equal({
+				lockAtDepth: undefined
+			});
+		} finally {
+			e2e.stop();
+		}
+	});
+
+	// Issue #760: the same exchange for a payer the receiver never paired with.
+	// The payer side is untouched; what changes is the funding the receiver
+	// negotiates behind it, a splice that locks at depth rather than a second
+	// channel. The payer signs whatever funding it is handed and verifies the
+	// shared-input arm exactly as it does for a paired splice.
+	it('splices an existing channel for an unpaired payer with a confirmed coin when allowUnpairedSplice is on, locking at depth', async () => {
+		const e2e = await setup({
+			allowSplice: true,
+			allowUnpairedSplice: true,
+			unpairedSpliceDepth: 6
+		});
+		e2e.node.spliceChannel = Buffer.alloc(32, 9);
+		try {
+			const send = e2e.sender.send(e2e.request, {
+				amountSat: AMOUNT,
+				maxTotalFeeSat: FEE_CEILING
+			});
+			await flush(8);
+			expect(
+				e2e.node.splices,
+				'the receiver opened instead of splicing'
+			).to.have.length(1);
+			expect(e2e.node.opens).to.have.length(0);
+			expect(e2e.node.splices[0].options).to.deep.equal({ lockAtDepth: 6 });
+			expect(e2e.node.splices[0].inputs[0].confirmed).to.equal(true);
 			e2e.node.completeSpliceNegotiation(
 				e2e.coin,
 				e2e.expectedOffer(),

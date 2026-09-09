@@ -6,6 +6,30 @@
  * into a unified Lightning node API.
  */
 
+import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../message/splice';
+
+/**
+ * How long a conflicted-splice revert request waits for the peer's ack
+ * before the request is abandoned and the peer disconnected (issue #760):
+ * the BOLT 2 quiescence window. Tests shorten it per node.
+ */
+export const SPLICE_CONFLICT_REQUEST_TIMEOUT_MS = 60_000;
+/** How long a channel is left alone after a request timed out. */
+export const SPLICE_CONFLICT_REQUEST_BACKOFF_MS = 10 * 60_000;
+/**
+ * How long a refuted conflict claim is answered from memory. Bounded in time
+ * as well as by height: a chain server can catch up without a new block, and
+ * the peer's next session is a round trip away in any case.
+ */
+export const SPLICE_CONFLICT_REFUTATION_TTL_MS = 30_000;
+import {
+	decodeSpliceConflict,
+	decodeSpliceConflictAck,
+	encodeSpliceConflict,
+	encodeSpliceConflictAck,
+	ISpliceConflictAckMessage,
+	ISpliceConflictMessage
+} from '../message/splice-conflict';
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import { ILogger, noopLogger } from '../../logger';
@@ -3783,6 +3807,9 @@ export class LightningNode extends EventEmitter {
 		// event where the restore repair above is not.
 		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
 			this.settleForwardsOwedUpstream(channelId);
+			// A conflict verdict the peer has not yet agreed is re-asked on
+			// every reconnect (issue #760).
+			this.resendSpliceConflicts(channelId.toString('hex'));
 			// A disconnect-during-quiescence left parked dispatches waiting for
 			// the channel to carry updates again; it can now.
 			this.drainParkedQuiescentHtlcs(channelId.toString('hex'));
@@ -4006,6 +4033,9 @@ export class LightningNode extends EventEmitter {
 			if (this.chainWatcher && fundingTxid) {
 				const displayTxid = Buffer.from(fundingTxid).reverse().toString('hex');
 				this.chainWatcher.rearmAnnouncementTracking(channelId, displayTxid);
+				// The splice is the live funding now: its input watches (issue
+				// #760) have nothing left to protect.
+				this.chainWatcher.unwatchSpliceInputs(channelId, displayTxid);
 			}
 			// Re-emit outward so the embedder can refresh a static channel backup
 			// NOW, while fundingTxid holds the NEW (post-splice) outpoint. A backup
@@ -4039,6 +4069,45 @@ export class LightningNode extends EventEmitter {
 					// Diagnostics are public too and cannot gate the terminal signal.
 				}
 				this.notifySpliceAbortedObservers(channelId, reason);
+				this.chainWatcher?.unwatchSpliceInputs(channelId);
+			}
+		);
+
+		// A splice past tx_signatures was unwound because an input of it was
+		// spent elsewhere and that spend confirmed (issue #760). The channel is
+		// back on its pre-splice funding, already re-watched by the batch's
+		// WATCH_FUNDING; what remains is to drop the watches that belonged to
+		// the dead transaction and tell the world.
+		this.channelManager.on(
+			'splice:reverted',
+			(channelId: Buffer, spliceTxid: string, conflictTxid: string) => {
+				this.onSpliceReverted(channelId, spliceTxid, conflictTxid);
+			}
+		);
+		// The quiescence handshake behind a conflict revert request completed
+		// with us as initiator (issue #760): SPLICE_CONFLICT may leave now.
+		this.channelManager.on(
+			'splice:conflict-request-ready',
+			(channelId: Buffer) => {
+				this.transmitSpliceConflict(channelId);
+			}
+		);
+
+		// Splice conflict recovery rides the custom message type (issue #760).
+		// Isolated like every other custom handler: a malformed frame costs the
+		// peer nothing but a log line.
+		this.on(
+			'custom-message',
+			(msg: { peerPubkey: string; subtype: number; payload: Buffer }) => {
+				try {
+					this.handleSpliceConflictMessage(msg);
+				} catch (err) {
+					this.emitStructuredLog('splice', 'conflict_message_failed', {
+						pubkey: msg.peerPubkey,
+						subtype: msg.subtype,
+						error: err instanceof Error ? err.message : String(err)
+					});
+				}
 			}
 		);
 
@@ -8107,6 +8176,27 @@ export class LightningNode extends EventEmitter {
 				this.retirePreSpliceSpendWatch(channelId, txid, outputIndex);
 			}
 		);
+		// An input of a depth-locked splice was spent elsewhere, six deep, while
+		// the splice is not on chain (issue #760): the splice is dead, and the
+		// channel must be talked back onto its old funding.
+		this.chainWatcher.on(
+			'splice:input-conflict',
+			(
+				channelId: Buffer,
+				spliceTxid: string,
+				conflictTxid: string,
+				inputIndex: number,
+				height: number
+			) => {
+				this.onSpliceInputConflict(
+					channelId,
+					spliceTxid,
+					conflictTxid,
+					inputIndex,
+					height
+				);
+			}
+		);
 	}
 
 	/**
@@ -8474,6 +8564,14 @@ export class LightningNode extends EventEmitter {
 			if (retired) this.persistChannel(channelId);
 			return;
 		}
+		// The chain has the splice: stamp it before the lock, so an adoption
+		// that follows knows the transaction confirmed and owes no rebroadcast
+		// (issue #760: a depth-locked splice on a zero-conf channel reaches
+		// adoption only this way). Its input watches are moot from here.
+		channel.markSpliceConfirmed();
+		if (confirmedTxid !== undefined) {
+			this.chainWatcher?.unwatchSpliceInputs(channelId, confirmedTxid);
+		}
 		// sendSpliceLocked self-validates the splice state; ignore if not ready.
 		if (channel.getSpliceSession()) {
 			const result = this.channelManager.sendSpliceLocked(channelId);
@@ -8796,7 +8894,7 @@ export class LightningNode extends EventEmitter {
 					state.channelId || state.temporaryChannelId,
 					spliceTxidHex,
 					inflight.newFundingOutputIndex,
-					state.minimumDepth ?? 3,
+					Math.max(state.minimumDepth ?? 3, inflight.lockAtDepth ?? 0),
 					spliceFunding.p2wshOutput
 				);
 				// The new-outpoint watch above only arms spend detection once the
@@ -8820,6 +8918,12 @@ export class LightningNode extends EventEmitter {
 						state.channelId || state.temporaryChannelId
 					);
 				}
+				// The inputs this node does not vouch for (issue #760), re-armed
+				// from the durable record like the watch above.
+				this.armSpliceInputWatches(
+					state.channelId || state.temporaryChannelId,
+					state
+				);
 				continue;
 			}
 
@@ -9009,7 +9113,7 @@ export class LightningNode extends EventEmitter {
 					channelId,
 					txidHex,
 					inflight.newFundingOutputIndex,
-					state.minimumDepth ?? 3,
+					Math.max(state.minimumDepth ?? 3, inflight.lockAtDepth ?? 0),
 					spliceFunding.p2wshOutput
 				);
 				// Spend detection on the superseded outpoint comes from the
@@ -9021,6 +9125,8 @@ export class LightningNode extends EventEmitter {
 				// funding, and both the outpoint and the funding keys read
 				// post-splice.
 				await this.armPreSpliceSpendWatches(channelId, state);
+				// The inputs this node does not vouch for (issue #760).
+				this.armSpliceInputWatches(channelId, state);
 				return;
 			}
 
@@ -9358,6 +9464,8 @@ export class LightningNode extends EventEmitter {
 			clearInterval(this.mppCleanupTimer);
 			this.mppCleanupTimer = null;
 		}
+		for (const timer of this.spliceConflictTimers.values()) clearTimeout(timer);
+		this.spliceConflictTimers.clear();
 		if (this.feeUpdateTimer) {
 			clearInterval(this.feeUpdateTimer);
 			this.feeUpdateTimer = null;
@@ -11589,10 +11697,28 @@ export class LightningNode extends EventEmitter {
 		amountSats: bigint,
 		inputs: ISpliceWalletInput[],
 		changeScript: Buffer,
-		fundingFeeratePerkw = 253
+		fundingFeeratePerkw = 253,
+		options: {
+			/**
+			 * Issue #760: confirmations the splice must reach before either side
+			 * locks it, whatever the channel type. For an input this node does
+			 * not vouch for; the peer must echo it or the splice is aborted.
+			 */
+			lockAtDepth?: number;
+		} = {}
 	): ISpliceRequestResult {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new InvalidSpliceError(cidErr);
+		if (
+			options.lockAtDepth !== undefined &&
+			(!Number.isInteger(options.lockAtDepth) ||
+				options.lockAtDepth < 1 ||
+				options.lockAtDepth > SPLICE_LOCK_DEPTH_ACCEPT_MAX)
+		) {
+			throw new InvalidSpliceError(
+				`lockAtDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_ACCEPT_MAX}`
+			);
+		}
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
 		if (satsErr) throw new InvalidSpliceError(satsErr);
 		// Same reason as spliceIn: splice_init encodes the feerate as a u32
@@ -11692,7 +11818,9 @@ export class LightningNode extends EventEmitter {
 		const selectionBusy = this._spliceSelectionBusy(channelId);
 		if (selectionBusy) return selectionBusy;
 
-		channel.setSpliceInInputs(inputs, changeScript);
+		channel.setSpliceInInputs(inputs, changeScript, {
+			lockAtDepth: options.lockAtDepth
+		});
 		const result = this.channelManager.initiateSplice(
 			channelId,
 			amountSats,
@@ -11744,6 +11872,7 @@ export class LightningNode extends EventEmitter {
 				clearTimeout(timer);
 				this.removeListener('splice:complete', onComplete);
 				this.removeListener('splice:aborted', onSpliceAborted);
+				this.removeListener('splice:reverted', onSpliceReverted);
 				this.removeListener('node:error', onError);
 				this._activeWaitCleanups.delete(destroyCleanup);
 			};
@@ -11774,6 +11903,20 @@ export class LightningNode extends EventEmitter {
 				cleanup();
 				reject(new Error(data.reason));
 			};
+			// A conflicted splice reverted to the old funding is over too
+			// (issue #760): the wait must not burn its timeout on it.
+			const onSpliceReverted = (data: {
+				channelId: Buffer;
+				conflictTxid: string;
+			}): void => {
+				if (data.channelId.toString('hex') !== cidHex) return;
+				cleanup();
+				reject(
+					new Error(
+						`splice reverted: an input was spent elsewhere by ${data.conflictTxid}`
+					)
+				);
+			};
 			const onError = (err: ILightningError): void => {
 				if (err.code !== 'SPLICE_IN_FAILED') return;
 				if (err.channelId?.toString('hex') !== cidHex) return;
@@ -11783,6 +11926,7 @@ export class LightningNode extends EventEmitter {
 
 			this.on('splice:complete', onComplete);
 			this.on('splice:aborted', onSpliceAborted);
+			this.on('splice:reverted', onSpliceReverted);
 			this.on('node:error', onError);
 		});
 		// Absorb the rejection when an emitted SPLICE_IN_FAILED settles the
@@ -12934,6 +13078,15 @@ export class LightningNode extends EventEmitter {
 				: state.state;
 		if (effInfoState === ChannelState.SPLICING) {
 			info.payThroughSplice = channel.isHtlcUsable(true);
+		}
+		// Splices this channel reverted on a confirmed input conflict (issue
+		// #760): what an operator sees when asking why a splice is gone.
+		if (state.revertedSplices?.length) {
+			info.revertedSplices = state.revertedSplices.map((r) => ({
+				spliceTxid: r.spliceTxid,
+				conflictTxid: r.conflictTxid,
+				revertedAt: r.revertedAt
+			}));
 		}
 		if (state.shortChannelId)
 			info.shortChannelId = state.shortChannelId.toString('hex');
@@ -18550,6 +18703,9 @@ export class LightningNode extends EventEmitter {
 					this.channelManager.getPeerForChannel(outChannelId) ?? null,
 				spliceInAndWait: (channelId, amountSats, timeoutMs) =>
 					this.spliceInAndWait(channelId, amountSats, timeoutMs),
+				splicePendingLock: (channelId): boolean =>
+					this.channelManager.getChannel(channelId)?.isSplicePendingLock() ===
+					true,
 				maxFundableSats: () => this.jitMaxFundableSats(),
 				storage: this.storage ?? undefined,
 				failRestoredHtlc: (part) => this.failRestoredHeldHtlc(part)
@@ -21908,6 +22064,611 @@ export class LightningNode extends EventEmitter {
 		this.emitOutbound(peerPubkeyHex, BEIGNET_CUSTOM_MESSAGE_TYPE, envelope);
 	}
 
+	// ─────────────── Splice conflict recovery (issue #760) ───────────────
+
+	/**
+	 * Arm a watch on every input of an in-flight splice that this node does
+	 * not vouch for (issue #760): a depth-locked splice carrying external
+	 * inputs, past the point of no return. Idempotent; the watcher keys per
+	 * (channel, splice, input). Nothing to arm for an ordinary splice.
+	 */
+	private armSpliceInputWatches(channelId: Buffer, state: IChannelState): void {
+		const inflight = state.spliceInFlight;
+		if (!this.chainWatcher || !inflight) return;
+		if (!inflight.lockAtDepth) return;
+		if (inflight.sentTxSignatures !== true) return;
+		if (inflight.confirmed || inflight.localSpliceLocked) return;
+		let tx: bitcoin.Transaction;
+		try {
+			tx = bitcoin.Transaction.fromHex(inflight.spliceTxHex);
+		} catch {
+			return;
+		}
+		const spliceTxid = Buffer.from(inflight.spliceTxid)
+			.reverse()
+			.toString('hex');
+		// Every input this node does not vouch for: neither the shared 2-of-2
+		// funding input nor one of its own wallet inputs. On BOTH sides, so
+		// the acceptor watches the initiator's inputs too and a wallet that
+		// double spends and goes silent cannot pin the LSP mid-splice; the
+		// acceptor's own input set is empty, so it watches everything else.
+		// A third party's input the initiator contributed on the owner's
+		// behalf rides ourWalletInputIndices as a placeholder slot (issue
+		// #592) and is exactly what this node does not vouch for.
+		const shared = this.channelManager
+			.getChannel(channelId)
+			?.getSpliceSharedInputIndex();
+		const external = new Set(inflight.externalInputIndices ?? []);
+		const ours = new Set(
+			inflight.ourWalletInputIndices.filter((i) => !external.has(i))
+		);
+		for (let index = 0; index < tx.ins.length; index++) {
+			if (index === shared || ours.has(index)) continue;
+			const input = tx.ins[index];
+			const prevout = inflight.inputPrevouts[index];
+			// A record persisted before inputPrevouts existed cannot name the
+			// script; the watcher reads it off the parent transaction instead.
+			this.chainWatcher.watchSpliceInput(channelId, spliceTxid, {
+				txid: Buffer.from(input.hash).reverse().toString('hex'),
+				vout: input.index,
+				script: prevout ? Buffer.from(prevout.script) : undefined,
+				inputIndex: index
+			});
+		}
+	}
+
+	/**
+	 * The chain watcher's verdict: an input of our in-flight splice was spent
+	 * elsewhere, SPLICE_CONFLICT_DEPTH deep, while the splice is unconfirmed.
+	 * Recorded durably first, then reported, then put to the peer.
+	 */
+	private onSpliceInputConflict(
+		channelId: Buffer,
+		spliceTxid: string,
+		conflictTxid: string,
+		inputIndex: number,
+		height: number
+	): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const inflight = channel.getFullState().spliceInFlight;
+		if (
+			!inflight ||
+			Buffer.from(inflight.spliceTxid).reverse().toString('hex') !== spliceTxid
+		) {
+			return;
+		}
+		const changed = channel.markSpliceConflicted({
+			txid: conflictTxid,
+			height,
+			inputIndex
+		});
+		if (!changed) return;
+		this.persistChannel(channelId);
+		this.reportSpliceConflict(
+			channelId,
+			spliceTxid,
+			conflictTxid,
+			inputIndex,
+			height
+		);
+		this.requestSpliceConflict(channelId);
+	}
+
+	/** The log line, the error and the event a newly conflicted splice earns. */
+	private reportSpliceConflict(
+		channelId: Buffer,
+		spliceTxid: string,
+		conflictTxid: string,
+		inputIndex: number,
+		height: number
+	): void {
+		this.emitStructuredLog('splice', 'input_conflict', {
+			channelId: channelId.toString('hex'),
+			spliceTxid,
+			conflictTxid,
+			inputIndex,
+			height
+		});
+		this.emit('node:error', {
+			code: 'SPLICE_INPUT_CONFLICT',
+			channelId,
+			message: `splice ${spliceTxid} cannot confirm: input ${inputIndex} was spent by ${conflictTxid} at height ${height}; reverting to the pre-splice funding`,
+			timestamp: Date.now()
+		} as ILightningError);
+		try {
+			this.emit('splice:conflicted', {
+				channelId,
+				spliceTxid,
+				conflictTxid,
+				inputIndex,
+				height
+			});
+		} catch (err) {
+			this.emitStructuredLog('splice', 'conflict_observer_failed', {
+				channelId: channelId.toString('hex'),
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	/**
+	 * Timers bounding the wait for a peer's SPLICE_CONFLICT_ACK, per channel
+	 * (issue #760). The request rides our own quiescence session, and
+	 * quiescence has no un-stfu: a peer that never answers (one that does not
+	 * speak the extension, or whose handshake never completed) would leave
+	 * the channel frozen, so the wait is bounded and ends in the one reset the
+	 * spec gives quiescence, a disconnect.
+	 */
+	private spliceConflictTimers: Map<string, ReturnType<typeof setTimeout>> =
+		new Map();
+	/** The wait per request; the constant unless a test shortens it. */
+	private spliceConflictRequestTimeoutMs = SPLICE_CONFLICT_REQUEST_TIMEOUT_MS;
+	/** Channels not to re-ask before this time, after a request timed out. */
+	private spliceConflictBackoffUntil: Map<string, number> = new Map();
+	/** Channels with a SPLICE_CONFLICT verification in flight (issue #760). */
+	private spliceConflictChecks: Map<string, string> = new Map();
+	/**
+	 * Claims refuted at a given height, keyed by channel, splice and conflict
+	 * txid. A peer re-sending the same frame within a block is answered from
+	 * here rather than by fetching transactions again.
+	 */
+	private spliceConflictRefutations: Map<
+		string,
+		{ height: number; at: number; reason: string }
+	> = new Map();
+
+	/**
+	 * Ask the peer to revert the conflicted splice (issue #760). Opens our
+	 * quiescence handshake through the channel; the frame itself leaves from
+	 * transmitSpliceConflict once the channel is QUIESCENT as our session.
+	 * Not attempted at a disconnected peer (the reconnect re-asks), while a
+	 * request is already pending, or inside the backoff a timed-out request
+	 * left. Returns whether a request is now pending.
+	 */
+	private requestSpliceConflict(channelId: Buffer): boolean {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return false;
+		const inflight = channel.getFullState().spliceInFlight;
+		if (!inflight?.conflict || inflight.confirmed) return false;
+		const peer = this.channelManager.getPeerForChannel(channelId);
+		if (!peer) return false;
+		if (this.peerManager && !this.listPeers().some((p) => p.pubkey === peer)) {
+			return false;
+		}
+		const idHex = channelId.toString('hex');
+		if (channel.hasPendingSpliceConflictRequest()) return true;
+		if ((this.spliceConflictBackoffUntil.get(idHex) ?? 0) > Date.now()) {
+			return false;
+		}
+		const result = this.channelManager.requestSpliceConflictRevert(channelId);
+		if (!result.ok) {
+			if (!result.transient) {
+				this.emitStructuredLog('splice', 'conflict_request_refused', {
+					channelId: idHex,
+					error: result.error ?? 'refused'
+				});
+			}
+			return false;
+		}
+		this.armSpliceConflictTimer(channelId);
+		return true;
+	}
+
+	/**
+	 * The channel is QUIESCENT as our session and a conflict request is
+	 * parked on it: put SPLICE_CONFLICT on the wire.
+	 */
+	private transmitSpliceConflict(channelId: Buffer): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const inflight = channel.getFullState().spliceInFlight;
+		const conflict = inflight?.conflict;
+		if (!inflight || !conflict || inflight.confirmed) return;
+		const peer = this.channelManager.getPeerForChannel(channelId);
+		if (!peer) return;
+		const msg: ISpliceConflictMessage = {
+			channelId,
+			spliceTxid: Buffer.from(inflight.spliceTxid),
+			conflictTxid: Buffer.from(conflict.txid, 'hex').reverse(),
+			inputIndex: conflict.inputIndex
+		};
+		this.emitCustomMessage(
+			peer,
+			BeignetCustomSubtype.SPLICE_CONFLICT,
+			encodeSpliceConflict(msg)
+		);
+		channel.noteSpliceConflictRequest(Date.now());
+		this.persistChannel(channelId);
+		this.armSpliceConflictTimer(channelId);
+	}
+
+	private armSpliceConflictTimer(channelId: Buffer): void {
+		const idHex = channelId.toString('hex');
+		if (this.spliceConflictTimers.has(idHex)) return;
+		const timer = setTimeout(() => {
+			this.spliceConflictTimers.delete(idHex);
+			this.onSpliceConflictRequestTimeout(channelId);
+		}, this.spliceConflictRequestTimeoutMs);
+		timer.unref?.();
+		this.spliceConflictTimers.set(idHex, timer);
+	}
+
+	private clearSpliceConflictTimer(idHex: string): void {
+		const timer = this.spliceConflictTimers.get(idHex);
+		if (!timer) return;
+		clearTimeout(timer);
+		this.spliceConflictTimers.delete(idHex);
+	}
+
+	/**
+	 * No ack within the window (issue #760). The request is abandoned, the
+	 * peer disconnected so both quiescence sessions reset, and the channel is
+	 * not re-asked before the backoff passes. A request the channel no longer
+	 * holds (a reconnect already dropped it) costs nothing here.
+	 */
+	private onSpliceConflictRequestTimeout(channelId: Buffer): void {
+		const idHex = channelId.toString('hex');
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		if (!channel.hasPendingSpliceConflictRequest() && !channel.isQuiescing()) {
+			return;
+		}
+		if (!channel.getFullState().spliceInFlight?.conflict) return;
+		const peer = this.channelManager.getPeerForChannel(channelId);
+		this.emitStructuredLog('splice', 'conflict_request_timeout', {
+			channelId: idHex,
+			pubkey: peer
+		});
+		this.spliceConflictBackoffUntil.set(
+			idHex,
+			Date.now() + SPLICE_CONFLICT_REQUEST_BACKOFF_MS
+		);
+		this.channelManager.abandonSpliceConflictRequest(channelId);
+		if (peer) this.requestPeerDisconnect(peer);
+	}
+
+	/**
+	 * Re-ask every peer that has not yet agreed a conflict (issue #760), on
+	 * each block and on reconnect. One channel when named, all otherwise.
+	 */
+	private resendSpliceConflicts(channelIdHex?: string): void {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			const id = state.channelId;
+			if (!id) continue;
+			if (channelIdHex !== undefined && id.toString('hex') !== channelIdHex) {
+				continue;
+			}
+			if (!state.spliceInFlight?.conflict) continue;
+			this.requestSpliceConflict(id);
+		}
+	}
+
+	private handleSpliceConflictMessage(msg: {
+		peerPubkey: string;
+		subtype: number;
+		payload: Buffer;
+	}): void {
+		if (msg.subtype === BeignetCustomSubtype.SPLICE_CONFLICT) {
+			const req = decodeSpliceConflict(msg.payload);
+			this.handleSpliceConflict(msg.peerPubkey, req).catch((err) => {
+				this.emitStructuredLog('splice', 'conflict_check_failed', {
+					pubkey: msg.peerPubkey,
+					channelId: req.channelId.toString('hex'),
+					error: err instanceof Error ? err.message : String(err)
+				});
+			});
+			return;
+		}
+		if (msg.subtype === BeignetCustomSubtype.SPLICE_CONFLICT_ACK) {
+			this.handleSpliceConflictAck(
+				msg.peerPubkey,
+				decodeSpliceConflictAck(msg.payload)
+			);
+		}
+	}
+
+	private sendSpliceConflictAck(
+		peer: string,
+		ack: ISpliceConflictAckMessage
+	): void {
+		this.emitCustomMessage(
+			peer,
+			BeignetCustomSubtype.SPLICE_CONFLICT_ACK,
+			encodeSpliceConflictAck(ack)
+		);
+		this.emitStructuredLog('splice', 'conflict_ack_sent', {
+			pubkey: peer,
+			channelId: ack.channelId.toString('hex'),
+			spliceTxid: Buffer.from(ack.spliceTxid).reverse().toString('hex'),
+			agreed: ack.agreed,
+			reason: ack.reason
+		});
+	}
+
+	/**
+	 * The peer says an input of our shared in-flight splice was spent
+	 * elsewhere. Its word counts for nothing: the claim is checked against
+	 * OUR record and OUR chain view, and only a claim the chain confirms at
+	 * depth, naming an input other than the shared funding input, moves the
+	 * channel. Anything else is answered agreed=0 with the reason and changes
+	 * nothing; the peer may be ahead of our chain view and will ask again.
+	 */
+	private async handleSpliceConflict(
+		peerPubkey: string,
+		req: ISpliceConflictMessage
+	): Promise<void> {
+		const channel = this.channelManager.getChannel(req.channelId);
+		if (!channel) return;
+		if (this.channelManager.getPeerForChannel(req.channelId) !== peerPubkey) {
+			return;
+		}
+		const spliceTxidDisplay = Buffer.from(req.spliceTxid)
+			.reverse()
+			.toString('hex');
+		const conflictTxidDisplay = Buffer.from(req.conflictTxid)
+			.reverse()
+			.toString('hex');
+		const idHex = req.channelId.toString('hex');
+		const claimKey = `${idHex}:${spliceTxidDisplay}:${conflictTxidDisplay}`;
+		const height = this.chainWatcher?.getCurrentBlockHeight() ?? 0;
+		// The ack ends the quiescence session the request rode, whatever it
+		// says (issue #760): the peer leaves on receiving it, we leave here. A
+		// revert exits quiescence by itself; a refusal must do it explicitly,
+		// and only for a session that IS the peer's completed one. A refusal
+		// for "not quiescent" has nothing to end, and a peer stfu we still owe
+		// a reply to is not ours to reset.
+		const endSession = (): void => {
+			const ch = this.channelManager.getChannel(req.channelId);
+			if (ch?.isQuiescent() && !ch.isQuiescenceInitiator()) {
+				this.channelManager.abandonSpliceConflictRequest(req.channelId);
+			}
+		};
+		const refuse = (reason: string, remember = false): void => {
+			if (remember) {
+				this.spliceConflictRefutations.set(claimKey, {
+					height,
+					at: Date.now(),
+					reason
+				});
+			}
+			this.sendSpliceConflictAck(peerPubkey, {
+				channelId: req.channelId,
+				spliceTxid: req.spliceTxid,
+				agreed: false,
+				reason
+			});
+			endSession();
+		};
+		// agreed=1 leaves only once the revert is on disk: an ack the peer
+		// acts on must describe a state a restart would find (issue #760).
+		const agreeIfDurable = (): void => {
+			if (!this.persistChannelCommitted(req.channelId)) {
+				refuse('the revert could not be committed to disk; ask again');
+				return;
+			}
+			this.sendSpliceConflictAck(peerPubkey, {
+				channelId: req.channelId,
+				spliceTxid: req.spliceTxid,
+				agreed: true,
+				reason: ''
+			});
+			endSession();
+		};
+		const notQuiescent =
+			"not quiescent: the request must ride the sender's stfu session";
+		const inflight = channel.getFullState().spliceInFlight;
+		if (!inflight || !inflight.spliceTxid.equals(req.spliceTxid)) {
+			// We already reverted it, on the peer's earlier request or our own
+			// verdict, and the peer's copy of that exchange was lost (a dropped
+			// ack, a restart on either side): the peer verified the conflict on
+			// its own chain view before asking and we have nothing left to
+			// revert, so agree, and it stops asking. The memory is on the
+			// channel state, so it survives our restart (issue #760). Anything
+			// else we simply do not have.
+			if (channel.hasRevertedSplice(spliceTxidDisplay)) agreeIfDurable();
+			else refuse('no such splice in flight');
+			return;
+		}
+		if (inflight.confirmed || inflight.localSpliceLocked) {
+			refuse('the splice is confirmed on our chain view');
+			return;
+		}
+		// The revert is a fundamental channel change and runs under the
+		// peer's quiescence session: without it, an update of ours could be in
+		// flight while the peer drops the splice candidate and we still hold
+		// it, and the next commitment round would be signed against one
+		// funding on one side and two on the other (issue #760).
+		if (!channel.isQuiescent() || channel.isQuiescenceInitiator()) {
+			refuse(notQuiescent);
+			return;
+		}
+		if (!this.chainWatcher) {
+			refuse('no chain backend to verify against');
+			return;
+		}
+		const shared = channel.getSpliceSharedInputIndex();
+		if (shared === null) {
+			refuse('cannot locate the shared funding input');
+			return;
+		}
+		if (req.inputIndex === shared) {
+			refuse('the named input is the shared funding input');
+			return;
+		}
+		// A claim refuted at this height is answered from memory, and one
+		// verification runs per channel at a time: a peer cannot make this
+		// node fetch transactions on every frame it sends (issue #760).
+		const refuted = this.spliceConflictRefutations.get(claimKey);
+		if (
+			refuted &&
+			refuted.height === height &&
+			Date.now() - refuted.at < SPLICE_CONFLICT_REFUTATION_TTL_MS
+		) {
+			refuse(refuted.reason);
+			return;
+		}
+		if (this.spliceConflictChecks.has(idHex)) return;
+		this.spliceConflictChecks.set(idHex, claimKey);
+		let verdict: { inputIndex: number; height: number; depth: number } | null;
+		try {
+			verdict = await this.chainWatcher.verifySpliceInputConflict(
+				inflight.spliceTxHex,
+				conflictTxidDisplay,
+				shared
+			);
+		} catch (err) {
+			refuse(
+				`chain check failed: ${
+					err instanceof Error ? err.message : String(err)
+				}`
+			);
+			return;
+		} finally {
+			this.spliceConflictChecks.delete(idHex);
+		}
+		if (!verdict) {
+			refuse('the conflict is not confirmed at depth on our chain view', true);
+			return;
+		}
+		if (verdict.inputIndex !== req.inputIndex) {
+			refuse('the named input does not match the chain', true);
+			return;
+		}
+		// Re-read after the await: the channel may have moved meanwhile.
+		const again = this.channelManager.getChannel(req.channelId);
+		const current = again?.getFullState().spliceInFlight;
+		if (!again || !current || !current.spliceTxid.equals(req.spliceTxid)) {
+			if (again?.hasRevertedSplice(spliceTxidDisplay)) agreeIfDurable();
+			else refuse('no such splice in flight');
+			return;
+		}
+		if (current.confirmed || current.localSpliceLocked) {
+			refuse('the splice is confirmed on our chain view');
+			return;
+		}
+		if (!again.isQuiescent() || again.isQuiescenceInitiator()) {
+			refuse(notQuiescent);
+			return;
+		}
+		if (
+			again.markSpliceConflicted({
+				txid: conflictTxidDisplay,
+				height: verdict.height,
+				inputIndex: verdict.inputIndex
+			})
+		) {
+			this.persistChannel(req.channelId);
+			this.reportSpliceConflict(
+				req.channelId,
+				spliceTxidDisplay,
+				conflictTxidDisplay,
+				verdict.inputIndex,
+				verdict.height
+			);
+		}
+		const result = this.channelManager.revertConflictedSplice(req.channelId);
+		if (result.ok) agreeIfDurable();
+		else refuse(result.error ?? 'revert refused');
+	}
+
+	/**
+	 * The peer's answer to our conflict request. agreed=1 for a splice we
+	 * marked conflicted reverts it here; agreed=0 is logged and the record
+	 * kept, since the peer may only be behind on the chain and the next block
+	 * re-asks. An ack for a splice we no longer hold is ignored.
+	 */
+	private handleSpliceConflictAck(
+		peerPubkey: string,
+		ack: ISpliceConflictAckMessage
+	): void {
+		const channel = this.channelManager.getChannel(ack.channelId);
+		if (!channel) return;
+		if (this.channelManager.getPeerForChannel(ack.channelId) !== peerPubkey) {
+			return;
+		}
+		const idHex = ack.channelId.toString('hex');
+		const inflight = channel.getFullState().spliceInFlight;
+		if (!inflight || !inflight.spliceTxid.equals(ack.spliceTxid)) return;
+		if (!inflight.conflict) return;
+		if (!channel.hasPendingSpliceConflictRequest()) return;
+		this.clearSpliceConflictTimer(idHex);
+		if (!ack.agreed) {
+			this.emitStructuredLog('splice', 'conflict_refused', {
+				pubkey: peerPubkey,
+				channelId: idHex,
+				spliceTxid: Buffer.from(ack.spliceTxid).reverse().toString('hex'),
+				reason: ack.reason
+			});
+			// The ack ended the session on the peer's side; end ours, so
+			// HTLCs flow again until the next block re-asks (issue #760).
+			this.channelManager.abandonSpliceConflictRequest(ack.channelId);
+			return;
+		}
+		const result = this.channelManager.revertConflictedSplice(ack.channelId);
+		if (!result.ok) {
+			this.emitStructuredLog('splice', 'revert_refused', {
+				channelId: idHex,
+				error: result.error ?? 'revert refused'
+			});
+			this.channelManager.abandonSpliceConflictRequest(ack.channelId);
+			return;
+		}
+		if (!this.persistChannelCommitted(ack.channelId)) {
+			// The revert stands in memory and the per-block persist retries
+			// carry it; the peer has already reverted, so there is nothing
+			// to unwind, only to report.
+			this.emitStructuredLog('splice', 'revert_persist_failed', {
+				channelId: idHex
+			});
+		}
+	}
+
+	/** The channel is back on its pre-splice funding (issue #760). */
+	private onSpliceReverted(
+		channelId: Buffer,
+		spliceTxid: string,
+		conflictTxid: string
+	): void {
+		const idHex = channelId.toString('hex');
+		this.clearSpliceConflictTimer(idHex);
+		this.spliceConflictBackoffUntil.delete(idHex);
+		this.emitStructuredLog('splice', 'reverted', {
+			channelId: idHex,
+			spliceTxid,
+			conflictTxid
+		});
+		// The negotiation rows can never be retransmitted again, exactly as
+		// after splice:complete.
+		this.recovery?.supersedeChannelOutbox(idHex, [
+			MessageType.SPLICE,
+			MessageType.SPLICE_ACK
+		]);
+		if (this.chainWatcher) {
+			this.chainWatcher.unwatchSpliceInputs(channelId, spliceTxid);
+			// The pre-splice leg vouched for a transaction that will never
+			// confirm; the channel's own watch, re-armed by the revert's
+			// WATCH_FUNDING, covers the outpoint from here.
+			const state = this.channelManager.getChannel(channelId)?.getFullState();
+			if (state?.fundingTxid) {
+				this.chainWatcher.unwatchPreSpliceSpend(
+					channelId,
+					Buffer.from(state.fundingTxid).reverse().toString('hex'),
+					state.fundingOutputIndex
+				);
+			}
+		}
+		try {
+			this.emit('splice:reverted', { channelId, spliceTxid, conflictTxid });
+		} catch (err) {
+			this.emitStructuredLog('splice', 'revert_observer_failed', {
+				channelId: idHex,
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
 	// ─────────────── Third-party direct funding (issue #613) ───────────────
 
 	/** The lane registry, for a payer built on top of this node. */
@@ -21942,6 +22703,19 @@ export class LightningNode extends EventEmitter {
 		if (!this.directFunding) {
 			throw new Error('direct funding is not configured on this node');
 		}
+		// Judged before the merge, so a refused depth leaves neither the policy
+		// nor the persisted copy carrying a value the splice engine would reject
+		// at splice time (issue #760).
+		if (
+			update.unpairedSpliceDepth !== undefined &&
+			(!Number.isInteger(update.unpairedSpliceDepth) ||
+				update.unpairedSpliceDepth < 1 ||
+				update.unpairedSpliceDepth > SPLICE_LOCK_DEPTH_ACCEPT_MAX)
+		) {
+			throw new Error(
+				`unpairedSpliceDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_ACCEPT_MAX}`
+			);
+		}
 		const policy = this.directFunding.policy;
 		for (const [key, value] of Object.entries(update)) {
 			if (value === undefined) continue;
@@ -21955,7 +22729,11 @@ export class LightningNode extends EventEmitter {
 				? { maxAmountSat: BigInt(policy.maxAmountSat) }
 				: {}),
 			allowZeroConf: policy.allowZeroConf === true,
-			allowSplice: policy.allowSplice === true
+			allowSplice: policy.allowSplice === true,
+			allowUnpairedSplice: policy.allowUnpairedSplice === true,
+			...(policy.unpairedSpliceDepth !== undefined
+				? { unpairedSpliceDepth: policy.unpairedSpliceDepth }
+				: {})
 		});
 		this.persistDirectFundingPolicy();
 		return { ...policy };
@@ -22161,6 +22939,7 @@ export class LightningNode extends EventEmitter {
 				},
 				liquidityPeer: () => policy.liquidityPeer ?? null,
 				usableChannelWith: (peerHex) => this.usableChannelWith(peerHex),
+				spliceInFlightWith: (peerHex) => this.spliceInFlightWith(peerHex),
 				fundingPubkeys: (channelId) =>
 					this.getRawChannel(channelId)?.getFundingPubkeys() ?? null,
 				canOpenZeroConfTo: (peerHex) =>
@@ -22183,14 +22962,16 @@ export class LightningNode extends EventEmitter {
 					amountSats,
 					inputs,
 					changeScript,
-					feeratePerKw
+					feeratePerKw,
+					options
 				) =>
 					this.spliceInWithInputs(
 						channelId,
 						amountSats,
 						inputs,
 						changeScript,
-						feeratePerKw
+						feeratePerKw,
+						options ?? {}
 					),
 				abortSplice: (channelId, reason) =>
 					this.channelManager.abortSplice(channelId, reason),
@@ -22233,6 +23014,12 @@ export class LightningNode extends EventEmitter {
 						this.removeListener('channel:splice-txsigs-needed', cb);
 					};
 				},
+				onSpliceReverted: (cb): (() => void) => {
+					this.on('splice:reverted', cb);
+					return () => {
+						this.removeListener('splice:reverted', cb);
+					};
+				},
 				log
 			},
 			{
@@ -22243,7 +23030,11 @@ export class LightningNode extends EventEmitter {
 					? { maxAmountSat: BigInt(policy.maxAmountSat) }
 					: {}),
 				allowZeroConf: policy.allowZeroConf === true,
-				allowSplice: policy.allowSplice === true
+				allowSplice: policy.allowSplice === true,
+				allowUnpairedSplice: policy.allowUnpairedSplice === true,
+				...(policy.unpairedSpliceDepth !== undefined
+					? { unpairedSpliceDepth: policy.unpairedSpliceDepth }
+					: {})
 			}
 		);
 		for (const evt of [
@@ -22662,6 +23453,26 @@ export class LightningNode extends EventEmitter {
 		return null;
 	}
 
+	/**
+	 * Is any channel with this peer mid-splice (issue #760)? SPLICING covers
+	 * the negotiation; a non-null `spliceInFlight` covers a signed splice that
+	 * is waiting on depth, during which the channel reads NORMAL again. The
+	 * direct-funding receiver declines a second funding into the peer while
+	 * either holds, rather than opening a channel beside the pending splice.
+	 */
+	private spliceInFlightWith(peerHex: string): boolean {
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			if (this.channelManager.getPeerForChannel(channelId) !== peerHex) {
+				continue;
+			}
+			if (channel.getState() === ChannelState.SPLICING) return true;
+			if (channel.getFullState().spliceInFlight) return true;
+		}
+		return false;
+	}
+
 	/** The wallet-data slice of the backend, when it has one. */
 	private walletDataStore(): {
 		saveWalletData(key: string, value: string): void;
@@ -22778,6 +23589,9 @@ export class LightningNode extends EventEmitter {
 		// or a mempool eviction never orphans a signed funding.
 		this.retryPendingFundingBroadcasts();
 		this.retryPendingSpliceBroadcasts();
+		// A splice conflict the peer has not yet agreed is re-asked every
+		// block (issue #760): the peer may simply have been behind the chain.
+		this.resendSpliceConflicts();
 		this.retryFailedTerminalPersists();
 		this.retrySpliceCloseRedrives();
 		this.retryPendingOutputWatches();

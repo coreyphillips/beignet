@@ -65,6 +65,14 @@ export const DF_RECEIVER_SWEEP_INTERVAL_MS = 30_000;
 /** Feerate a direct-funded splice negotiates at, when none is configured. */
 export const DF_DEFAULT_SPLICE_FEERATE_PERKW = 500;
 
+/**
+ * Confirmations an UNPAIRED payer's splice must reach before it locks, when
+ * the operator set none (issue #760). The ordinary channel's confirmation
+ * depth: a stranger's coin under the home channel is held to the same bar a
+ * stranger's coin under a new channel already is.
+ */
+export const DF_DEFAULT_UNPAIRED_SPLICE_DEPTH = 3;
+
 // ─────────────── Config ───────────────
 
 export interface IDfReceiverConfig {
@@ -90,9 +98,24 @@ export interface IDfReceiverConfig {
 	/**
 	 * Serve offers by splicing an existing channel with the liquidity peer
 	 * rather than opening a new one. Rev 2 classes splice-in as an extension;
-	 * off leaves every offer on the simpler new-channel path.
+	 * off leaves every offer on the simpler new-channel path. On its own it
+	 * admits paired payers only; `allowUnpairedSplice` extends it.
 	 */
 	allowSplice?: boolean;
+	/**
+	 * Let a payer that is NOT paired splice the existing channel too (issue
+	 * #760), provided its coin is confirmed. The splice then locks at
+	 * `unpairedSpliceDepth` confirmations whatever the channel type, so the
+	 * stranger's input becomes channel state on the same terms a new channel's
+	 * funding does. An unconfirmed stranger coin stays on the open path.
+	 */
+	allowUnpairedSplice?: boolean;
+	/**
+	 * Confirmations an unpaired payer's splice must reach before it locks;
+	 * 1..2016, default `DF_DEFAULT_UNPAIRED_SPLICE_DEPTH`. A paired payer's
+	 * splice carries no depth and locks as the channel type says.
+	 */
+	unpairedSpliceDepth?: number;
 	/**
 	 * Let a direct-funded open go zero-conf.
 	 *
@@ -210,6 +233,12 @@ export interface IDfReceiverDeps {
 	liquidityPeer(): string | null;
 	/** A channel with this peer a splice could ride, or null. */
 	usableChannelWith(peerHex: string): Buffer | null;
+	/**
+	 * Is a splice with this peer still in flight (negotiating, or signed and
+	 * waiting on depth)? Issue #760: while one is, no second funding into that
+	 * peer is started, splice or open.
+	 */
+	spliceInFlightWith(peerHex: string): boolean;
 	/** Funding pubkeys of a channel, for the attestation. */
 	fundingPubkeys(channelId: Buffer): { local: Buffer; remote: Buffer } | null;
 	/** Upstream's own zero-conf gate (zero-conf.ts canOpenZeroConfTo). */
@@ -238,7 +267,15 @@ export interface IDfReceiverDeps {
 		amountSats: bigint,
 		inputs: ISpliceWalletInput[],
 		changeScript: Buffer,
-		feeratePerKw: number
+		feeratePerKw: number,
+		options?: {
+			/**
+			 * Confirmations this splice must reach before it locks, whatever the
+			 * channel type (issue #760). Set for an unpaired payer's coin; the
+			 * peer must echo it or the splice is aborted.
+			 */
+			lockAtDepth?: number;
+		}
 	): { ok: boolean; error?: string };
 	abortSplice(
 		channelId: Buffer,
@@ -268,6 +305,19 @@ export interface IDfReceiverDeps {
 	onTxSigsNeeded(cb: (e: IDfTxSigsNeeded) => void): () => void;
 	/** Subscribe to `channel:splice-txsigs-needed`. */
 	onSpliceTxSigsNeeded(cb: (e: IDfSpliceTxSigsNeeded) => void): () => void;
+	/**
+	 * Subscribe to `splice:reverted` (issue #760): a splice this receiver
+	 * put a payer's coin under was unwound because the payer spent that coin
+	 * elsewhere. Optional; without it a reverted funding is retired by the
+	 * lapse sweep instead of at once.
+	 */
+	onSpliceReverted?(
+		cb: (e: {
+			channelId: Buffer;
+			spliceTxid: string;
+			conflictTxid: string;
+		}) => void
+	): () => void;
 	now?(): number;
 	/** Structured-log sink, the same one 4B's lanes take. */
 	log?: DfTransportLog;

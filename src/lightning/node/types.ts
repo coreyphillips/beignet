@@ -681,8 +681,23 @@ export interface IDirectFundingPolicy {
 	maxAmountSat?: number;
 	/** Let a direct-funded open go zero-conf (the app calls this `trusted`). */
 	allowZeroConf?: boolean;
-	/** Serve offers by splicing an existing channel rather than opening one. */
+	/**
+	 * Serve offers by splicing an existing channel rather than opening one.
+	 * On its own this admits paired payers; `allowUnpairedSplice` widens it.
+	 */
 	allowSplice?: boolean;
+	/**
+	 * Let an unpaired payer splice the existing channel too, when its coin is
+	 * confirmed (issue #760). Its splice locks at `unpairedSpliceDepth`
+	 * confirmations whatever the channel type; an unconfirmed stranger coin
+	 * still gets a new confirmed channel.
+	 */
+	allowUnpairedSplice?: boolean;
+	/**
+	 * Confirmations an unpaired payer's splice waits for before it locks,
+	 * 1..2016; default 3, the ordinary channel's confirmation depth.
+	 */
+	unpairedSpliceDepth?: number;
 	/**
 	 * Inbound liquidity the operator would like bought alongside. Recorded and
 	 * reported so the operator surface can round-trip it; nothing consumes it
@@ -1015,6 +1030,15 @@ export interface IChannelInfo {
 	 * settle-to balance lives entirely in the splicing bucket).
 	 */
 	payThroughSplice?: boolean;
+	/**
+	 * Splices this channel reverted because an input was spent elsewhere and
+	 * the spend confirmed (issue #760), newest last; txids in display order.
+	 */
+	revertedSplices?: Array<{
+		spliceTxid: string;
+		conflictTxid: string;
+		revertedAt: number;
+	}>;
 	/** Reserve we must maintain (set by remote peer), in msat */
 	localReserveMsat?: bigint;
 	/** Reserve remote must maintain (set by us), in msat */
@@ -1624,6 +1648,8 @@ export interface IStructuredLog {
 		| 'peer'
 		| 'chain'
 		| 'watchtower'
+		// Splice conflict recovery (issue #760).
+		| 'splice'
 		// Node-level errors (ILightningError). The action is the error code, e.g.
 		// CHANNEL_ERROR or AUTO_FUNDING_FAILED.
 		| 'error';

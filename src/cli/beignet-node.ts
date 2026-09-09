@@ -34,6 +34,8 @@ import {
 import { createWalletStorage } from './wallet-storage';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
+import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
+import { SPLICE_LOCK_DEPTH_ACCEPT_MAX as DF_UNPAIRED_SPLICE_DEPTH_MAX } from '../lightning/message/splice';
 import {
 	FforAbortReason,
 	FforSlotState,
@@ -2581,9 +2583,81 @@ export class BeignetNode extends EventEmitter {
 		// Refresh the SCB when a splice LOCKS, not when it is initiated: only now
 		// does fundingTxid hold the new post-splice outpoint, so the backup encodes
 		// the outpoint a restore must actually watch (FS-7).
-		this.node.on('splice:complete', () => {
-			this.refreshStaticChannelBackup();
-		});
+		this.node.on(
+			'splice:complete',
+			(data: { channelId: Buffer; fundingTxid?: Buffer | null }) => {
+				this.refreshStaticChannelBackup();
+				const channelId = data.channelId.toString('hex');
+				const fundingTxid = data.fundingTxid
+					? Buffer.from(data.fundingTxid).reverse().toString('hex')
+					: undefined;
+				this.log('info', 'Splice complete', { channelId, fundingTxid });
+				this.emit('splice:complete', { channelId, fundingTxid });
+			}
+		);
+		// The rest of the splice lifecycle (issue #760): an abort, a conflict
+		// verdict on an input the splice carried, and the revert that settles
+		// it. Without these a daemon client watching a splice it started sees
+		// the pending state simply disappear, with nothing to say why.
+		this.node.on(
+			'splice:aborted',
+			(data: { channelId: Buffer; reason: string }) => {
+				const channelId = data.channelId.toString('hex');
+				this.log('info', 'Splice aborted', { channelId, reason: data.reason });
+				this.emit('splice:aborted', { channelId, reason: data.reason });
+			}
+		);
+		this.node.on(
+			'splice:conflicted',
+			(data: {
+				channelId: Buffer;
+				spliceTxid: string;
+				conflictTxid: string;
+				inputIndex: number;
+				height: number;
+			}) => {
+				const channelId = data.channelId.toString('hex');
+				this.log(
+					'warn',
+					'Splice cannot confirm: an input was spent elsewhere; asking the peer to revert',
+					{
+						channelId,
+						spliceTxid: data.spliceTxid,
+						conflictTxid: data.conflictTxid,
+						inputIndex: data.inputIndex,
+						height: data.height
+					}
+				);
+				this.emit('splice:conflicted', {
+					channelId,
+					spliceTxid: data.spliceTxid,
+					conflictTxid: data.conflictTxid,
+					inputIndex: data.inputIndex,
+					height: data.height
+				});
+			}
+		);
+		this.node.on(
+			'splice:reverted',
+			(data: {
+				channelId: Buffer;
+				spliceTxid: string;
+				conflictTxid: string;
+			}) => {
+				const channelId = data.channelId.toString('hex');
+				this.log('info', 'Splice reverted to the pre-splice funding', {
+					channelId,
+					spliceTxid: data.spliceTxid,
+					conflictTxid: data.conflictTxid
+				});
+				this.refreshStaticChannelBackup();
+				this.emit('splice:reverted', {
+					channelId,
+					spliceTxid: data.spliceTxid,
+					conflictTxid: data.conflictTxid
+				});
+			}
+		);
 		this.node.on(
 			'channel:opening',
 			(data: { channelId: Buffer; fundingTxid: Buffer }) => {
@@ -7315,6 +7389,11 @@ export class BeignetNode extends EventEmitter {
 		restoreRecencyUnproven?: boolean;
 		fundingUnaccounted?: boolean;
 		payThroughSplice?: boolean;
+		revertedSplices?: Array<{
+			spliceTxid: string;
+			conflictTxid: string;
+			revertedAt: number;
+		}>;
 		localReserveMsat?: bigint;
 		remoteReserveMsat?: bigint;
 		isPrivate?: boolean;
@@ -7372,6 +7451,10 @@ export class BeignetNode extends EventEmitter {
 		if (ch.fundingUnaccounted) info.fundingUnaccounted = ch.fundingUnaccounted;
 		if (ch.payThroughSplice !== undefined)
 			info.payThroughSplice = ch.payThroughSplice;
+		// Splices reverted on a confirmed input conflict (issue #760).
+		if (ch.revertedSplices?.length) {
+			info.revertedSplices = ch.revertedSplices.map((r) => ({ ...r }));
+		}
 		if (ch.isPrivate !== undefined) info.isPrivate = ch.isPrivate;
 		if (ch.feeBaseMsat !== undefined) info.feeBaseMsat = ch.feeBaseMsat;
 		if (ch.feeProportionalMillionths !== undefined)
@@ -7570,7 +7653,7 @@ export class BeignetNode extends EventEmitter {
 	 *
 	 * A MERGE, never a replace: the LFBW dashboard posts `{minAmountSat}` alone
 	 * and then requires `lspPubkey` to still be present in the readback, and the
-	 * app's manager posts the other six without `minAmountSat`.
+	 * app's manager posts the other fields without `minAmountSat`.
 	 */
 	configureDirectFunding(update: {
 		lspPubkey?: string;
@@ -7579,8 +7662,36 @@ export class BeignetNode extends EventEmitter {
 		targetInboundSat?: number;
 		trusted?: boolean;
 		allowSplice?: boolean;
+		allowUnpairedSplice?: boolean;
+		unpairedSpliceDepth?: number;
 		minAmountSat?: number;
 	}): DirectFundingConfigInfo {
+		// The switches must be booleans. JSON `"false"` or `1` used to be stored
+		// as given and read back through `=== true`, so a caller could set a flag
+		// it could never read back as set (issue #760).
+		for (const flag of [
+			'trusted',
+			'allowSplice',
+			'allowUnpairedSplice'
+		] as const) {
+			if (update[flag] !== undefined && typeof update[flag] !== 'boolean') {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					`${flag} must be a boolean`
+				);
+			}
+		}
+		if (
+			update.unpairedSpliceDepth !== undefined &&
+			(!Number.isInteger(update.unpairedSpliceDepth) ||
+				update.unpairedSpliceDepth < 1 ||
+				update.unpairedSpliceDepth > DF_UNPAIRED_SPLICE_DEPTH_MAX)
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				`unpairedSpliceDepth must be an integer between 1 and ${DF_UNPAIRED_SPLICE_DEPTH_MAX}`
+			);
+		}
 		if (
 			update.lspPubkey !== undefined &&
 			!/^0[23][0-9a-fA-F]{64}$/.test(update.lspPubkey)
@@ -7621,12 +7732,21 @@ export class BeignetNode extends EventEmitter {
 			...(update.trusted !== undefined
 				? { allowZeroConf: update.trusted }
 				: {}),
-			// The home-channel design of the LFBW app: a paired sender's payment
-			// grows the one channel with the liquidity peer rather than opening
-			// a second. The receiver engine still requires the payer to be
-			// paired; anonymous payers get a confirmed open whatever this says.
+			// The home-channel design of the LFBW app: a payer's payment grows
+			// the one channel with the liquidity peer rather than opening a
+			// second. allowSplice alone serves paired payers that way;
+			// allowUnpairedSplice extends it to a stranger whose coin is
+			// confirmed, and that splice locks at unpairedSpliceDepth
+			// confirmations rather than at broadcast (issue #760). A stranger
+			// with an unconfirmed coin still gets a confirmed open.
 			...(update.allowSplice !== undefined
 				? { allowSplice: update.allowSplice }
+				: {}),
+			...(update.allowUnpairedSplice !== undefined
+				? { allowUnpairedSplice: update.allowUnpairedSplice }
+				: {}),
+			...(update.unpairedSpliceDepth !== undefined
+				? { unpairedSpliceDepth: update.unpairedSpliceDepth }
 				: {}),
 			...(update.targetInboundSat !== undefined
 				? {
@@ -7813,6 +7933,9 @@ export class BeignetNode extends EventEmitter {
 			targetInboundSat: policy.targetInboundSat ?? 0,
 			trusted: policy.allowZeroConf === true,
 			allowSplice: policy.allowSplice === true,
+			allowUnpairedSplice: policy.allowUnpairedSplice === true,
+			unpairedSpliceDepth:
+				policy.unpairedSpliceDepth ?? DF_DEFAULT_UNPAIRED_SPLICE_DEPTH,
 			minAmountSat: clampDirectFundingMinimum(policy.minAmountSat ?? 0)
 		};
 	}

@@ -445,6 +445,19 @@ export interface ISerializedChannelState {
 	spliceInFlight?: ISerializedSpliceInFlight | null;
 	/** Issue #756: fully signed splice txs not yet seen confirmed (txid internal hex). */
 	unconfirmedSpliceTxs?: Array<{ txid: string; txHex: string }>;
+	/** Issue #760: splices reverted on a confirmed input conflict (display hex). */
+	revertedSplices?: Array<{
+		spliceTxid: string;
+		conflictTxid: string;
+		revertedAt: number;
+		commitmentNumber: string;
+		spliceTxHex: string;
+		newFundingOutputIndex: number;
+		remoteFundingPubkey: string;
+		remoteCommitmentSig: string | null;
+		remoteHtlcSignatures?: string[];
+		remoteCommitmentSigFeeratePerKw?: number;
+	}>;
 	spliceAbortOwed?: boolean;
 	remoteForwardingPolicy?: {
 		feeBaseMsat: number;
@@ -551,6 +564,15 @@ export interface ISerializedSpliceInFlight {
 	localSpliceLocked: boolean;
 	remoteSpliceLocked: boolean;
 	confirmed: boolean;
+	/** Issue #760: per-splice lock depth; absent on older rows. */
+	lockAtDepth?: number;
+	/** Issue #760: the confirmed competing spend of one of its inputs. */
+	conflict?: {
+		txid: string;
+		height: number;
+		inputIndex: number;
+		revertRequestedAt?: number;
+	};
 }
 
 export function serializeSpliceInFlight(
@@ -586,7 +608,9 @@ export function serializeSpliceInFlight(
 		receivedTxSignatures: f.receivedTxSignatures,
 		localSpliceLocked: f.localSpliceLocked,
 		remoteSpliceLocked: f.remoteSpliceLocked,
-		confirmed: f.confirmed
+		confirmed: f.confirmed,
+		lockAtDepth: f.lockAtDepth,
+		conflict: f.conflict ? { ...f.conflict } : undefined
 	};
 }
 
@@ -625,7 +649,9 @@ export function deserializeSpliceInFlight(
 		receivedTxSignatures: s.receivedTxSignatures,
 		localSpliceLocked: s.localSpliceLocked,
 		remoteSpliceLocked: s.remoteSpliceLocked,
-		confirmed: s.confirmed
+		confirmed: s.confirmed,
+		lockAtDepth: s.lockAtDepth,
+		conflict: s.conflict ? { ...s.conflict } : undefined
 	};
 }
 
@@ -908,6 +934,14 @@ export function serializeChannelState(
 			? s.unconfirmedSpliceTxs.map((e) => ({
 					txid: e.txid.toString('hex'),
 					txHex: e.txHex
+			  }))
+			: undefined,
+		revertedSplices: s.revertedSplices?.length
+			? s.revertedSplices.map((r) => ({
+					...r,
+					remoteHtlcSignatures: r.remoteHtlcSignatures
+						? [...r.remoteHtlcSignatures]
+						: undefined
 			  }))
 			: undefined,
 		spliceAbortOwed: s.spliceAbortOwed === true ? true : undefined,
@@ -1318,6 +1352,14 @@ export function deserializeChannelState(
 			? s.unconfirmedSpliceTxs.map((e) => ({
 					txid: Buffer.from(e.txid, 'hex'),
 					txHex: e.txHex
+			  }))
+			: [],
+		revertedSplices: s.revertedSplices?.length
+			? s.revertedSplices.map((r) => ({
+					...r,
+					remoteHtlcSignatures: r.remoteHtlcSignatures
+						? [...r.remoteHtlcSignatures]
+						: undefined
 			  }))
 			: [],
 		spliceAbortOwed: s.spliceAbortOwed ?? false,

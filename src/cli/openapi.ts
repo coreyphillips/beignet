@@ -340,7 +340,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/direct-funding/configure': {
 				post: {
 					summary:
-						'Set the direct-funding policy: the liquidity peer every direct-funded channel is negotiated with, where it is reachable, whether such an open may go zero-conf, whether a paired payer may splice the existing channel instead of opening a second one, and the minimum offer served. A partial MERGE, never a replace: a field the body does not name keeps its value. minAmountSat clamps up to the 5000 sat protocol floor and the response reports the clamped value. targetInboundSat is recorded and reported but not yet consumed. Admin scope',
+						'Set the direct-funding policy: the liquidity peer every direct-funded channel is negotiated with, where it is reachable, whether such an open may go zero-conf, whether a paired payer may splice the existing channel instead of opening a second one (allowSplice), whether an unpaired payer with a confirmed coin may do the same with a splice that locks at unpairedSpliceDepth confirmations (allowUnpairedSplice, unpairedSpliceDepth 1..2016), and the minimum offer served. A partial MERGE, never a replace: a field the body does not name keeps its value. The three switches must be booleans. minAmountSat clamps up to the 5000 sat protocol floor and the response reports the clamped value. targetInboundSat is recorded and reported but not yet consumed. Admin scope',
 					tags: ['DirectFunding'],
 					requestBody: bodyContent({
 						lspPubkey: 'string?',
@@ -349,6 +349,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						targetInboundSat: 'number?',
 						trusted: 'boolean?',
 						allowSplice: 'boolean?',
+						allowUnpairedSplice: 'boolean?',
+						unpairedSpliceDepth: 'number?',
 						minAmountSat: 'number?'
 					}),
 					responses: {
@@ -2570,7 +2572,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string and htlcCount, hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce, ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:issuer-provisioned, ffor:issuer-issued (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string and htlcCount, hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce, ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:issuer-provisioned, ffor:issuer-issued (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -3694,6 +3696,22 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'Present exactly when mid-splice by effective state: true = paying through the splice, false = parked'
 						},
+						revertedSplices: {
+							type: 'array',
+							description:
+								'Splices this channel reverted because an input was spent elsewhere and the spend confirmed (issue #760), newest last, at most the last 8. Txids in display order',
+							items: {
+								type: 'object',
+								properties: {
+									spliceTxid: { type: 'string' },
+									conflictTxid: { type: 'string' },
+									revertedAt: {
+										type: 'integer',
+										description: 'ms since the epoch'
+									}
+								}
+							}
+						},
 						feeBaseMsat: { type: 'integer' },
 						feeProportionalMillionths: { type: 'integer' },
 						cltvExpiryDelta: { type: 'integer' },
@@ -4030,7 +4048,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						allowSplice: {
 							type: 'boolean',
 							description:
-								'Whether a paired (trusted) payer is served by splicing the existing channel with the liquidity peer instead of opening a second one. Anonymous payers always get a new confirmed channel'
+								'Whether a paired (trusted) payer is served by splicing the existing channel with the liquidity peer instead of opening a second one. On its own it leaves anonymous payers on the new confirmed channel path; allowUnpairedSplice extends it'
+						},
+						allowUnpairedSplice: {
+							type: 'boolean',
+							description:
+								'Whether an anonymous (unpaired) payer whose coin is confirmed is served by splicing the existing channel too. That splice locks at unpairedSpliceDepth confirmations rather than at broadcast, whatever the channel type; an anonymous payer with an unconfirmed coin still gets a new confirmed channel'
+						},
+						unpairedSpliceDepth: {
+							type: 'integer',
+							description:
+								"Confirmations an anonymous payer's splice waits for before it locks, 1..2016. Default 3, the ordinary channel's confirmation depth"
 						},
 						minAmountSat: {
 							type: 'integer',

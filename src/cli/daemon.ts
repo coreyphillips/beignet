@@ -465,6 +465,15 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		// commitment spend was classified; consumers tracking close resolution
 		// need this one.
 		'channel:resolved',
+		// The splice lifecycle (issue #760): the lock that adopts the new
+		// funding, an abort, a confirmed double spend of an input the splice
+		// carried, and the revert that returns the channel to the old funding.
+		// A client that started a splice otherwise sees its pending state
+		// vanish with nothing to say which way it went.
+		'splice:complete',
+		'splice:aborted',
+		'splice:conflicted',
+		'splice:reverted',
 		'peer:connect',
 		'peer:disconnect',
 		// Every channel failure reason (peer rejection, funding build/broadcast
@@ -1728,6 +1737,8 @@ async function bootDaemon(
 				targetInboundSat,
 				trusted,
 				allowSplice,
+				allowUnpairedSplice,
+				unpairedSpliceDepth,
 				minAmountSat
 			} = body as {
 				lspPubkey?: string;
@@ -1736,12 +1747,14 @@ async function bootDaemon(
 				targetInboundSat?: number;
 				trusted?: boolean;
 				allowSplice?: boolean;
+				allowUnpairedSplice?: boolean;
+				unpairedSpliceDepth?: number;
 				minAmountSat?: number;
 			};
 			// A partial MERGE, not a replace. The dashboard posts {minAmountSat}
 			// alone and then requires lspPubkey in the readback; the app's manager
-			// posts the other six without minAmountSat. A field the caller did not
-			// name keeps its value.
+			// posts the other fields without minAmountSat. A field the caller did
+			// not name keeps its value.
 			return success(
 				node.configureDirectFunding({
 					...(lspPubkey !== undefined ? { lspPubkey } : {}),
@@ -1750,6 +1763,8 @@ async function bootDaemon(
 					...(targetInboundSat !== undefined ? { targetInboundSat } : {}),
 					...(trusted !== undefined ? { trusted } : {}),
 					...(allowSplice !== undefined ? { allowSplice } : {}),
+					...(allowUnpairedSplice !== undefined ? { allowUnpairedSplice } : {}),
+					...(unpairedSpliceDepth !== undefined ? { unpairedSpliceDepth } : {}),
 					...(minAmountSat !== undefined ? { minAmountSat } : {})
 				})
 			);

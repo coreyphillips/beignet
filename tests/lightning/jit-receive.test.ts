@@ -65,6 +65,8 @@ interface IHarness {
 	storageWrites: { failKeys: Set<string> };
 	/** What the node could front on-chain right now; null = no figure. */
 	fundable: { value: bigint | null };
+	/** Whether a splice is already awaiting the chain on the channel (#760). */
+	splicePending: { fn: (channelId: Buffer) => boolean };
 }
 
 function makeHarness(
@@ -89,7 +91,8 @@ function makeHarness(
 		channelPeer: { fn: (): string | null => CLIENT },
 		failsDeliver: { value: true },
 		storageWrites: { failKeys: new Set<string>() },
-		fundable: { value: null }
+		fundable: { value: null },
+		splicePending: { fn: (): boolean => false }
 	};
 
 	const deps: IJitManagerDeps = {
@@ -115,6 +118,7 @@ function makeHarness(
 			return h.spliceResult.fn(amountSats);
 		},
 		maxFundableSats: () => h.fundable.value,
+		splicePendingLock: (channelId) => h.splicePending.fn(channelId),
 		storage: {
 			saveMetadata: (k, v) => {
 				if (h.storageWrites.failKeys.has(k)) {
@@ -1781,5 +1785,44 @@ describe('JIT persistence across a restart', function () {
 		const h = makeHarness({}, { metadata });
 		expect(() => h.manager.restore()).to.not.throw();
 		expect(h.manager.listIntents()).to.have.length(0);
+	});
+});
+
+describe('JIT hold behind a depth-locked splice (issue #760)', () => {
+	it('refuses to hold a part when the channel already has a splice awaiting the chain: nothing fronted', async () => {
+		const h = makeHarness();
+		h.manager.registerIntent(CLIENT, auth());
+		h.splicePending.fn = (): boolean => true;
+		const channelId = crypto.randomBytes(32);
+		const part = makePart(h);
+		expect(h.manager.tryHoldForSplice(channelId, part)).to.equal(false);
+		await new Promise((r) => setTimeout(r, 20));
+		expect(h.splices, 'no splice started').to.have.length(0);
+		expect(h.forwarded).to.have.length(0);
+		// The caller fails the part upstream itself on a false answer; the
+		// engine held nothing, so it has nothing to fail or fund later.
+		expect(h.failed).to.have.length(0);
+	});
+
+	it('a splice that becomes pending between the hold and the attempt fails the part at once, without retrying into the hold budget', async () => {
+		const h = makeHarness({ fundingAttempts: 5, fundingRetryDelayMs: 1 });
+		h.manager.registerIntent(CLIENT, auth());
+		const channelId = crypto.randomBytes(32);
+		const part = makePart(h);
+		// The first attempt fails retryably, and by the time the retry runs
+		// the channel has gone mid-splice on someone else's depth-locked
+		// splice: the retry must not run the remaining four attempts against
+		// a lock measured in blocks.
+		h.spliceResult.fn = async (): Promise<void> => {
+			h.splicePending.fn = (): boolean => true;
+			throw new Error('peer busy');
+		};
+		expect(h.manager.tryHoldForSplice(channelId, part)).to.equal(true);
+		await waitFor(h.manager, 'jit:failed');
+		expect(h.splices, 'one attempt, no retries').to.have.length(1);
+		expect(h.failed.map((f) => f.code)).to.deep.equal([
+			TEMPORARY_CHANNEL_FAILURE
+		]);
+		expect(h.forwarded).to.have.length(0);
 	});
 });
