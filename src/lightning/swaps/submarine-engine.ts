@@ -153,7 +153,10 @@ export interface ISubmarineSwapProviderConfig {
 	/** Blocks an unconfirmed claim waits before a rebuild at a higher fee. */
 	claimBumpIntervalBlocks: number;
 	claimFeeTargetBlocks: number;
+	/** The claim's rate cap outside the deadline window. */
 	maxFeeRateSatPerVbyte: number;
+	/** The rate used when no estimate is available. */
+	fallbackFeeRateSatPerVbyte: number;
 	claimVbytesEstimate: number;
 	maxCreatedPerPeer: number;
 }
@@ -182,6 +185,7 @@ export const SUBMARINE_SWAP_DEFAULTS: Omit<
 	claimBumpIntervalBlocks: 2,
 	claimFeeTargetBlocks: 6,
 	maxFeeRateSatPerVbyte: 200,
+	fallbackFeeRateSatPerVbyte: 10,
 	claimVbytesEstimate: 150,
 	maxCreatedPerPeer: 4
 };
@@ -556,19 +560,26 @@ export class SubmarineSwapProvider extends EventEmitter {
 		const minerFeeSat = BigInt(
 			Math.ceil(feeRate * this.config.claimVbytesEstimate)
 		);
+		// The routing budget the dispatch may spend is part of the floor:
+		// otherwise a payee authoring its route hint's fees turns every swap
+		// into a loss of up to paymentMaxFeePpm.
 		const totalFeeSat = submarineSwapFee(amountSat, {
 			flatFeeSat: this.config.flatFeeSat,
 			feePpm: this.config.feePpm,
-			minerFeeSat
+			minerFeeSat,
+			routingFeePpm: this.config.paymentMaxFeePpm
 		});
 		return { feeRate, minerFeeSat, totalFeeSat };
 	}
 
-	private async safeEstimate(targetBlocks: number): Promise<number | null> {
+	private async safeEstimate(
+		targetBlocks: number,
+		clamp = true
+	): Promise<number | null> {
 		try {
 			const rate = await this.deps.estimateFee(targetBlocks);
 			if (rate === null || !(rate > 0)) return null;
-			return Math.min(rate, this.config.maxFeeRateSatPerVbyte);
+			return clamp ? Math.min(rate, this.config.maxFeeRateSatPerVbyte) : rate;
 		} catch {
 			return null;
 		}
@@ -1911,37 +1922,63 @@ export class SubmarineSwapProvider extends EventEmitter {
 			if (!ours) await this.rebroadcastClaim(current);
 			return;
 		}
-		const rate =
-			(await this.safeEstimate(this.config.claimFeeTargetBlocks)) ?? 1;
+		// The bid. Outside the deadline window the market rate, clamped to
+		// the configured cap. Inside it the clamp is lifted and every rebuild
+		// at least doubles the previous bid, so the whole output above dust
+		// is reached within a few blocks whatever the estimate says; at the
+		// last block before the client's refund is eligible the bid IS the
+		// whole output: losing fees beats losing the principal the preimage
+		// already paid for (#743 audit).
 		const vbytes = this.config.claimVbytesEstimate;
 		const previous = current.claimFeeSat ? BigInt(current.claimFeeSat) : 0n;
+		const rate =
+			(await this.safeEstimate(
+				this.config.claimFeeTargetBlocks,
+				!deadlineNear
+			)) ?? this.config.fallbackFeeRateSatPerVbyte;
+		const allIn = valueSat - SWAP_DUST_FLOOR_SAT;
+		const lastCall = height >= current.refundHeight - 1;
 		let feeSat = BigInt(Math.ceil(rate * vbytes));
+		let unknownRefundFee = false;
 		if (!needsBuild) {
-			// BIP 125 rule 4 against our own previous claim.
-			const floor = previous + BigInt(vbytes);
+			// BIP 125 rule 4 against our own previous claim, and the
+			// escalation inside the window.
+			const floor = deadlineNear ? previous * 2n : previous + BigInt(vbytes);
 			if (feeSat < floor) feeSat = floor;
 		}
 		if (refundInMempool) {
-			// Outbid the client's refund: its fee is the funding value less
-			// what it pays out, plus the relay increment for our size.
-			const paid = refundInMempool.tx.outs.reduce(
-				(sum, o) => sum + BigInt(o.value),
-				0n
-			);
-			const refundFee = valueSat > paid ? valueSat - paid : 0n;
-			const floor = refundFee + BigInt(vbytes);
-			if (feeSat < floor) feeSat = floor;
+			// Outbid the client's refund on BOTH replacement rules: the
+			// absolute fee plus our size (BIP 125 rule 4) and the fee rate
+			// (Core rejects a replacement whose rate is not above the
+			// replaced transaction's). The refund's fee is known only when
+			// the contract output is its sole input; with more inputs its
+			// fee is unknown and the bid goes all in.
+			if (refundInMempool.tx.ins.length === 1) {
+				const paid = refundInMempool.tx.outs.reduce(
+					(sum, o) => sum + BigInt(o.value),
+					0n
+				);
+				const refundFee = valueSat > paid ? valueSat - paid : 0n;
+				const refundVsize = Math.max(1, refundInMempool.tx.virtualSize());
+				const byFee = refundFee + BigInt(vbytes);
+				const byRate =
+					BigInt(Math.ceil((Number(refundFee) * vbytes) / refundVsize)) +
+					BigInt(vbytes);
+				const floor = byFee > byRate ? byFee : byRate;
+				if (feeSat < floor) feeSat = floor;
+			} else {
+				unknownRefundFee = true;
+			}
 		}
-		// The cap: the configured rate ordinarily; inside the deadline window
-		// the whole output above dust, since losing fees beats losing the
-		// principal to a refund that the preimage already paid for.
 		const cap = deadlineNear
-			? valueSat - SWAP_DUST_FLOOR_SAT
+			? allIn
 			: BigInt(Math.ceil(this.config.maxFeeRateSatPerVbyte * vbytes));
 		if (feeSat > cap) feeSat = cap;
-		if (valueSat - feeSat < SWAP_DUST_FLOOR_SAT) {
-			feeSat = valueSat - SWAP_DUST_FLOOR_SAT;
-		}
+		// All in, above any cap: at the last block before the refund is
+		// eligible, and against a refund whose fee cannot be read (a refund
+		// is only valid past the refund height, so this is the window).
+		if (lastCall || unknownRefundFee) feeSat = allIn;
+		if (valueSat - feeSat < SWAP_DUST_FLOOR_SAT) feeSat = allIn;
 		if (!needsBuild && feeSat <= previous) {
 			// At the cap already: put the same bytes out again.
 			await this.rebroadcastClaim(current);
@@ -2051,8 +2088,14 @@ export class SubmarineSwapProvider extends EventEmitter {
 		if (!live || live.state !== 'EXPOSED') return;
 		current = live;
 		if (observation) {
+			// Only a CONFIRMED foreign spend is a resolution to record; one in
+			// the mempool is a refund to outbid, which the claim path does
+			// once the row is back in CLAIM_BROADCAST (#743 audit).
 			const foreign = observation.spends
-				.filter((s) => s.kind !== 'claim' && s.txid !== current.claimTxid)
+				.filter(
+					(s) =>
+						s.kind !== 'claim' && s.txid !== current.claimTxid && s.height > 0
+				)
 				.sort((a, b) => b.confirmations - a.confirmations)[0];
 			if (foreign) {
 				const resolution: ISwapResolutionRecord = {

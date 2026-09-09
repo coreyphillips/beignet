@@ -938,6 +938,7 @@ export async function submarineHarness(
 		minInvoiceExpirySeconds: 60,
 		flatFeeSat: 100n,
 		feePpm: 1_000,
+		paymentMaxFeePpm: 1_000,
 		...options.config
 	};
 	const events: ISubmarineHarness['events'] = [];

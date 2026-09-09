@@ -97,6 +97,8 @@ function scene(seed: number): IScene {
 				claimSafetyBlocks: 12,
 				resolutionSafetyBlocks: 6,
 				routeCltvBudgetBlocks: 20,
+				// 1000 ppm on the 99_500 sat net: 100, so the floor is a whole 600.
+				paymentMaxFeePpm: 1_000,
 				claimBumpIntervalBlocks: 2,
 				minInvoiceExpirySeconds: 60
 			}

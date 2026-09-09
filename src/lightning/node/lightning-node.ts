@@ -9518,6 +9518,14 @@ export class LightningNode extends EventEmitter {
 		const max = this.resourceConfig.maxCompletedPayments;
 		let pruned = 0;
 
+		// A COMPLETED or FAILED outgoing record whose HTLC is still
+		// non-terminal (failed by a wall clock while the peer holds it) is
+		// not history yet: its outcome, and the preimage a late fulfil
+		// reveals, still belong to it (#743 audit).
+		const stillLive = (hash: string, payment: IPaymentInfo): boolean =>
+			payment.direction === PaymentDirection.OUTGOING &&
+			!this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved;
+
 		// Phase 1: Remove expired entries
 		for (const [hash, payment] of this.payments) {
 			if (
@@ -9525,7 +9533,7 @@ export class LightningNode extends EventEmitter {
 				payment.status === PaymentStatus.FAILED
 			) {
 				const age = now - (payment.completedAt || payment.createdAt);
-				if (age > ttl) {
+				if (age > ttl && !stillLive(hash, payment)) {
 					this.payments.delete(hash);
 					this.preimages.delete(hash);
 					pruned++;
@@ -9537,8 +9545,9 @@ export class LightningNode extends EventEmitter {
 		const completed: [string, IPaymentInfo][] = [];
 		for (const entry of this.payments) {
 			if (
-				entry[1].status === PaymentStatus.COMPLETED ||
-				entry[1].status === PaymentStatus.FAILED
+				(entry[1].status === PaymentStatus.COMPLETED ||
+					entry[1].status === PaymentStatus.FAILED) &&
+				!stillLive(entry[0], entry[1])
 			) {
 				completed.push(entry);
 			}
@@ -15467,7 +15476,10 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const totalMsat = invoice.amountMsat!;
 
-		// Create a single payment record
+		// Create a single payment record, journaled BEFORE any part leaves,
+		// as the single-path send does: a restart mid-flight must find the
+		// record, or the parts' outcome (and the preimage) has no owner
+		// (#743 audit).
 		const payment: IPaymentInfo = {
 			paymentHash,
 			amountMsat: totalMsat,
@@ -15476,6 +15488,16 @@ export class LightningNode extends EventEmitter {
 			createdAt: Date.now()
 		};
 		this.payments.set(hashHex, payment);
+		{
+			const paymentMutation = this.paymentMutation(paymentHash);
+			if (paymentMutation) {
+				this.commitMutations(
+					'persist mpp payment',
+					[paymentMutation],
+					RecoveryCriticality.SafetyCritical
+				);
+			}
+		}
 
 		// Store retry context. Seed it with the exclusions this attempt was
 		// routed under so a retry keeps avoiding those SCIDs and the failure
@@ -16999,6 +17021,31 @@ export class LightningNode extends EventEmitter {
 				.update(keysendPreimage)
 				.digest();
 			if (!expectedHash.equals(paymentHash)) {
+				const reason = sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
+			// A keysend on a hash this node is PAYING (an outgoing record, a
+			// retry context, or an offered HTLC for it) would overwrite the
+			// outgoing record and hide our own payment's outcome: the payee
+			// of a submarine swap could then be paid twice while the swap is
+			// recorded failed (#743 audit). Refuse it like an unknown hash.
+			const outgoing = this.payments.get(hashHex);
+			if (
+				(outgoing && outgoing.direction === PaymentDirection.OUTGOING) ||
+				this.paymentRetryContexts.has(hashHex) ||
+				this.getOutgoingHtlcs(paymentHash).htlcs.length > 0
+			) {
+				this.emitStructuredLog('payment', 'keysend_hash_in_use', {
+					paymentHash: hashHex
+				});
 				const reason = sharedSecret
 					? createFailureMessage(
 							sharedSecret,
@@ -20287,12 +20334,21 @@ export class LightningNode extends EventEmitter {
 				status: payment.status
 			});
 		}
-		if (payment && payment.direction === PaymentDirection.OUTGOING) {
-			// Every fulfilled part reports, not only the one that flipped the
-			// record: a resolution watcher counts HTLCs, not records.
-			this.emitHtlcResolved(paymentHash, channelId, htlcId, 'fulfilled');
-			this.emitPaymentPreimage(paymentHash, preimage, 'htlc');
+		// Every fulfilled part reports, not only the one that flipped the
+		// record, and whether or not a record exists: past the forward check
+		// above this is an HTLC this node offered, and a resolution watcher
+		// counts HTLCs, not records. A missing or overwritten record (not
+		// journaled before a restart, pruned, replaced by an incoming
+		// keysend on the same hash) must not silence the preimage (#743
+		// audit).
+		if (!payment || payment.direction !== PaymentDirection.OUTGOING) {
+			this.emitStructuredLog('payment', 'fulfilled_without_record', {
+				paymentHash: hashHex,
+				recordDirection: payment?.direction ?? null
+			});
 		}
+		this.emitHtlcResolved(paymentHash, channelId, htlcId, 'fulfilled');
+		this.emitPaymentPreimage(paymentHash, preimage, 'htlc');
 	}
 
 	/** 'payment:htlc-resolved' for one offered HTLC of an outgoing payment. */
@@ -24947,7 +25003,15 @@ export class LightningNode extends EventEmitter {
 				view.cltvExpiry
 			);
 		}
-		const preimage = status !== null ? this.preimages.get(hashHex) : undefined;
+		// The preimage belongs in the view whenever this node offered an HTLC
+		// for the hash, record or no record: a record can be missing (not
+		// journaled before a restart, pruned) or overwritten by an incoming
+		// keysend on the same hash, and a watcher that judges by the view
+		// would otherwise call a paid payment failed (#743 audit).
+		const preimage =
+			status !== null || htlcs.length > 0
+				? this.preimages.get(hashHex)
+				: undefined;
 		return {
 			paymentHash,
 			status,

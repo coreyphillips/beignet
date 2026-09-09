@@ -304,7 +304,9 @@ Wire: a quote (48/49) with `direction` 2, `SWAP_SUBMARINE_CREATE` (54) and
 The client mints its invoice for `onchainAmountSat - fee` BEFORE the create,
 so the provider derives the fee from the invoice (a whole number of sats)
 and accepts it when it covers `submarineSwapFee` at the current claim fee
-rate and stays under the client's `maxTotalFeeSat`; the ack echoes what was
+rate, with the routing budget (`paymentMaxFeePpm` of the net amount) charged
+on top so a payee cannot author route-hint fees that make the swap a loss,
+and stays under the client's `maxTotalFeeSat`; the ack echoes what was
 accepted. `verifySubmarineSwapTerms` (`client.ts`) is the client's pure check:
 the contract rebuilt from its refund key and the provider's claim key must
 match the ack's script and address, its invoice must carry the hash, network
@@ -345,8 +347,12 @@ CLAIM_BROADCAST claim built to the sweep destination, its bytes and the attempt
               marker persisted, then broadcast; rebuilt at a higher fee every
               claimBumpIntervalBlocks while unconfirmed (BIP 125 floor against
               our own previous claim, and against a client refund seen in the
-              mempool), capped at maxFeeRateSatPerVbyte until the deadline
-              window, where the whole output above dust may go to fees
+              mempool, on both the absolute-fee and the fee-rate rule; a
+              refund with other inputs has an unknown fee and is outbid with
+              the whole output), capped at maxFeeRateSatPerVbyte until the
+              deadline window, where the clamp lifts, every rebuild at least
+              doubles the previous bid, and the last block before the refund
+              height bids the whole output above dust
 CLAIM_CONFIRMED the claim at resolutionConfirmations
 PAYMENT_FAILED every HTLC terminal without a preimage (the node's view, never
               a wall clock, a FAILED record or a thrown call); a preimage

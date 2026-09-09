@@ -50,9 +50,12 @@ import {
 } from './helpers/swap-harness';
 
 const AMOUNT = 100_000n;
-/** flat 100 + 1000 ppm of 100k (100) + miner 2 sat/vB x 150 vB (300). */
-const FEE_FLOOR = 500n;
-const FEE = 600n;
+/**
+ * flat 100 + 1000 ppm of 100k (100) + miner 2 sat/vB x 150 vB (300), plus
+ * the routing budget of 1000 ppm on the 99_500 sat left (100).
+ */
+const FEE_FLOOR = 600n;
+const FEE = 700n;
 const INVOICE_MSAT = (AMOUNT - FEE) * 1000n;
 
 function lastFrom(peer: FakeDfPeer, subtype: number): Buffer {
@@ -211,7 +214,8 @@ describe('Submarine swap provider engine (issue #743)', function () {
 				submarineSwapFee(AMOUNT, {
 					flatFeeSat: 100n,
 					feePpm: 1_000,
-					minerFeeSat: 300n
+					minerFeeSat: 300n,
+					routingFeePpm: 1_000
 				})
 			);
 			expect(q.totalFeeSat).to.equal(FEE_FLOOR);
@@ -225,6 +229,40 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			expect(limits.accepted).to.equal(true);
 			expect(limits.totalFeeSat).to.equal(0n);
 			expect(limits.invoiceAmountMsat).to.equal(0n);
+		});
+
+		it('charges the routing budget in the floor, so a payee cannot author a losing route hint', async function () {
+			// 5000 ppm on the 99_500 sat left after flat, ppm and miner: 498.
+			const h = await submarineHarness({
+				config: { paymentMaxFeePpm: 5_000 }
+			});
+			const q = await quote(h);
+			expect(q.totalFeeSat).to.equal(500n + 498n);
+			expect(
+				submarineSwapFee(AMOUNT, {
+					flatFeeSat: 100n,
+					feePpm: 1_000,
+					minerFeeSat: 300n,
+					routingFeePpm: 5_000
+				})
+			).to.equal(998n);
+			// A create leaving exactly the old floor (500 sat) is refused; one
+			// leaving the routing budget as well is accepted.
+			const short = submarineClient();
+			const refused = await create(h, short, {
+				bolt11: submarineInvoice(short, (AMOUNT - 997n) * 1000n)
+			});
+			expect(refused.ack.accepted).to.equal(false);
+			expect(refused.ack.reason).to.equal(SwapRefusalReason.FEE_CEILING);
+			const enough = submarineClient();
+			const ok = await create(h, enough, {
+				bolt11: submarineInvoice(enough, (AMOUNT - 998n) * 1000n)
+			});
+			expect(ok.ack.accepted, ok.ack.reasonText).to.equal(true);
+			expect(ok.ack.terms!.totalFeeSat).to.equal(998n);
+			// Zero budget: the floor is the old arithmetic.
+			const h0 = await submarineHarness({ config: { paymentMaxFeePpm: 0 } });
+			expect((await quote(h0)).totalFeeSat).to.equal(500n);
 		});
 
 		it('refuses without a fee estimate, without outbound liquidity, and outside the caps', async function () {
@@ -562,7 +600,7 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			const call = h.outgoing.calls[0];
 			expect(call.ledgerStateAtCall).to.equal('PAYING');
 			expect(call.maxCltvExpiryHeight).to.equal(1182);
-			expect(call.maxFeeMsat).to.equal((INVOICE_MSAT * 5_000n) / 1_000_000n);
+			expect(call.maxFeeMsat).to.equal((INVOICE_MSAT * 1_000n) / 1_000_000n);
 			expect(now.paymentDispatchedHeight).to.equal(h.chain.height);
 			expect(now.paymentMaxCltvExpiryHeight).to.equal(1182);
 			expect(now.paymentDispatchAttempts).to.equal(1);
@@ -945,7 +983,13 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			await tick(h);
 			let r = record(h, client);
 			expect(r.claimBumps).to.equal(1);
-			expect(BigInt(r.claimFeeSat!)).to.equal(2_000n + 150n);
+			// Both replacement rules: above the refund's absolute fee by our
+			// size, AND above its fee RATE (2000 sat over ~126 vB is ~16
+			// sat/vB; 150 vB at that rate is ~2381 sat) plus our size.
+			const byRate =
+				BigInt(Math.ceil((2_000 * 150) / refund.virtualSize())) + 150n;
+			expect(Number(byRate)).to.be.greaterThan(2_150);
+			expect(BigInt(r.claimFeeSat!)).to.equal(byRate);
 			// Inside the deadline window every block bumps, the cap lifts to
 			// the output above dust, and the error is logged.
 			h.chain.height = before.refundHeight - 12 - 1;
@@ -965,6 +1009,73 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			).to.equal(true);
 			const value = fundingTx.outs[0].value;
 			expect(Number(record(h, client).claimFeeSat)).to.be.at.most(value - 330);
+		});
+
+		it('a refund with more inputs than the contract has an unknown fee: the bid goes all in', async function () {
+			const h = await submarineHarness();
+			const { client, fundingTx } = await claimedSwap(h);
+			const before = record(h, client);
+			const refund = refundTxFor(before, client, fundingTx, 500n);
+			// A second input the fake chain knows nothing about: the fee
+			// cannot be read off the outputs.
+			refund.addInput(crypto.randomBytes(32), 0);
+			h.chain.place(refund, 0);
+			await tick(h);
+			const r = record(h, client);
+			expect(r.claimBumps).to.equal(1);
+			expect(Number(r.claimFeeSat)).to.equal(fundingTx.outs[0].value - 330);
+		});
+
+		it('escalates inside the deadline window whatever the estimate says, and goes all in at the last block', async function () {
+			// The estimate never moves (2 sat/vB, 300 sat) and the cap outside
+			// the window is 200 sat/vB. The audit found the bid pinned to the
+			// estimate inside the window, so the "whole output" cap was never
+			// reached before the client's refund became eligible.
+			const h = await submarineHarness();
+			const { client, fundingTx } = await claimedSwap(h);
+			const value = fundingTx.outs[0].value;
+			const before = record(h, client);
+			expect(BigInt(before.claimFeeSat!)).to.equal(300n);
+			h.chain.height = before.refundHeight - 12;
+			const fees: number[] = [];
+			for (let i = 0; i < 8; i++) {
+				await tick(h);
+				fees.push(Number(record(h, client).claimFeeSat));
+			}
+			// Doubling every block: 600, 1200, 2400, 4800, 9600, 19200, 38400,
+			// 76800, and never past the output above dust.
+			expect(fees).to.deep.equal([
+				600, 1200, 2400, 4800, 9600, 19200, 38400, 76800
+			]);
+			expect(record(h, client).claimBumps).to.equal(8);
+			await tick(h);
+			expect(Number(record(h, client).claimFeeSat)).to.equal(value - 330);
+			// The market spikes after the first claim: outside the window the
+			// estimate is clamped to the 200 sat/vB cap; at the last block
+			// before the refund is eligible the bid is the whole output.
+			const h2 = await submarineHarness();
+			const second = await claimedSwap(h2);
+			h2.feeRate = 500;
+			await tick(h2, 2);
+			const r2 = record(h2, second.client);
+			expect(r2.claimBumps).to.equal(1);
+			expect(Number(r2.claimFeeSat)).to.equal(200 * 150);
+			h2.chain.height = r2.refundHeight - 1;
+			await tick(h2);
+			expect(Number(record(h2, second.client).claimFeeSat)).to.equal(
+				second.fundingTx.outs[0].value - 330
+			);
+			// No estimate when the claim is built: the fallback rate, never
+			// 1 sat/vB.
+			const h3 = await submarineHarness();
+			const third = await paidSwap(h3);
+			expect(record(h3, third.client).state).to.equal('PAYING');
+			h3.feeRate = null;
+			h3.outgoing.fulfil(third.client.paymentHash, third.client.preimage);
+			await settle();
+			const r3 = record(h3, third.client);
+			expect(r3.state).to.equal('CLAIM_BROADCAST');
+			expect(Number(r3.claimFeeSat)).to.equal(10 * 150);
 		});
 
 		it('never spends the claim to anything but native segwit and never claims without a preimage', async function () {
@@ -1029,6 +1140,33 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			h2.outgoing.fulfil(second.client.paymentHash, second.client.preimage);
 			await settle();
 			expect(record(h2, second.client).state).to.equal('EXPOSED');
+		});
+
+		it('a refund in the mempool does not park an exposed row: the funding is back, the claim outbids it', async function () {
+			const h = await submarineHarness();
+			const { client, fundingTx } = await paidSwap(h);
+			h.chain.evict(fundingTx.getId());
+			h.outgoing.fulfil(client.paymentHash, client.preimage);
+			await settle();
+			const exposed = record(h, client);
+			expect(exposed.state).to.equal('EXPOSED');
+			// The funding reappears together with the client's refund of it,
+			// unconfirmed. The audit found the row recorded the refund as its
+			// resolution and sat in EXPOSED while the refund confirmed.
+			h.chain.place(fundingTx, h.chain.height);
+			const refund = refundTxFor(exposed, client, fundingTx, 2_000n);
+			h.chain.place(refund, 0);
+			await tick(h);
+			const r = record(h, client);
+			expect(r.state).to.equal('CLAIM_BROADCAST');
+			expect(r.resolution).to.equal(undefined);
+			expect(Number(r.claimFeeSat)).to.be.greaterThan(2_150);
+			expect(h.chain.broadcasts.at(-1)).to.equal(r.claimTxHex);
+			// Our claim confirms: the swap ends claimed.
+			h.chain.evict(refund.getId());
+			h.chain.confirm(r.claimTxid!, h.chain.height + 1);
+			await tick(h, 2);
+			expect(record(h, client).state).to.equal('CLAIM_CONFIRMED');
 		});
 
 		it('a confirmed refund with the preimage known is a realised loss, counted until verified at depth', async function () {

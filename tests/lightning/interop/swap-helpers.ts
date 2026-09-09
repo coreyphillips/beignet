@@ -38,6 +38,7 @@ import {
 	encodeSwapCreate,
 	encodeSwapSubmarineCreate,
 	submarineSwapFee,
+	SUBMARINE_SWAP_DEFAULTS,
 	verifySubmarineSwapTerms
 } from '../../../src/lightning/swaps';
 
@@ -688,12 +689,16 @@ export async function fundContractFromCore(
 	return (await bitcoinRpc('sendtoaddress', [address, btc])) as string;
 }
 
-/** The provider's fee for the scenarios' config at 2 sat/vB (150 vB claim). */
+/**
+ * The provider's fee for the scenarios' config at 2 sat/vB (150 vB claim),
+ * with the default routing budget (5000 ppm) charged on the net amount.
+ */
 export function submarineFeeFor(amountSat: bigint): bigint {
 	return submarineSwapFee(amountSat, {
 		flatFeeSat: 100n,
 		feePpm: 1_000,
-		minerFeeSat: 300n
+		minerFeeSat: 300n,
+		routingFeePpm: SUBMARINE_SWAP_DEFAULTS.paymentMaxFeePpm
 	});
 }
 
