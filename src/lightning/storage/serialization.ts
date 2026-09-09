@@ -551,6 +551,8 @@ export interface ISerializedSpliceInFlight {
 	localSpliceLocked: boolean;
 	remoteSpliceLocked: boolean;
 	confirmed: boolean;
+	/** Issue #760: per-splice lock depth; absent on older rows. */
+	lockAtDepth?: number;
 }
 
 export function serializeSpliceInFlight(
@@ -586,7 +588,8 @@ export function serializeSpliceInFlight(
 		receivedTxSignatures: f.receivedTxSignatures,
 		localSpliceLocked: f.localSpliceLocked,
 		remoteSpliceLocked: f.remoteSpliceLocked,
-		confirmed: f.confirmed
+		confirmed: f.confirmed,
+		lockAtDepth: f.lockAtDepth
 	};
 }
 
@@ -625,7 +628,8 @@ export function deserializeSpliceInFlight(
 		receivedTxSignatures: s.receivedTxSignatures,
 		localSpliceLocked: s.localSpliceLocked,
 		remoteSpliceLocked: s.remoteSpliceLocked,
-		confirmed: s.confirmed
+		confirmed: s.confirmed,
+		lockAtDepth: s.lockAtDepth
 	};
 }
 

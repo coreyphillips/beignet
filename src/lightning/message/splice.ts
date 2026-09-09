@@ -39,6 +39,17 @@ export interface ISpliceMessage {
 	fundingFeeratePerkw: number;
 	locktime: number;
 	requireConfirmedInputs?: boolean;
+	/**
+	 * Confirmations this splice must reach before either side sends
+	 * splice_locked, whatever the channel type (beignet extension, TLV
+	 * `SPLICE_LOCK_DEPTH_TLV`, issue #760). The initiator sets it when the
+	 * splice carries an input it does not vouch for (a stranger's direct
+	 * funding), and expects the acceptor to echo it in splice_ack; an
+	 * acceptor that does not understand the TLV echoes nothing, and the
+	 * initiator aborts rather than let a zero-conf channel lock the stranger's
+	 * coin at broadcast.
+	 */
+	lockDepth?: number;
 }
 
 export interface ISpliceAckMessage {
@@ -46,6 +57,110 @@ export interface ISpliceAckMessage {
 	fundingPubkey: Buffer;
 	relativeSatoshis: bigint; // signed: positive = splice-in, negative = splice-out
 	requireConfirmedInputs?: boolean;
+	/** The splice_init lock depth, echoed by an acceptor that will honour it. */
+	lockDepth?: number;
+}
+
+/**
+ * TLV type of the per-splice lock depth (u16 value). Odd, so a peer that
+ * does not know it ignores it, and in the experimental range (>= 65536)
+ * so it cannot collide with a type the splicing spec assigns later.
+ */
+export const SPLICE_LOCK_DEPTH_TLV = 65537;
+/** The largest lock depth a splice_init may ask for (two weeks of blocks). */
+export const SPLICE_LOCK_DEPTH_MAX = 2016;
+
+function writeBigSize(n: number): Buffer {
+	if (n < 0xfd) return Buffer.from([n]);
+	if (n < 0x10000) {
+		const b = Buffer.alloc(3);
+		b[0] = 0xfd;
+		b.writeUInt16BE(n, 1);
+		return b;
+	}
+	const b = Buffer.alloc(5);
+	b[0] = 0xfe;
+	b.writeUInt32BE(n, 1);
+	return b;
+}
+
+function readBigSize(
+	buf: Buffer,
+	offset: number
+): { value: number; size: number } {
+	const first = buf[offset];
+	if (first < 0xfd) return { value: first, size: 1 };
+	if (first === 0xfd) {
+		if (offset + 3 > buf.length) throw new Error('truncated bigsize');
+		return { value: buf.readUInt16BE(offset + 1), size: 3 };
+	}
+	if (first === 0xfe) {
+		if (offset + 5 > buf.length) throw new Error('truncated bigsize');
+		return { value: buf.readUInt32BE(offset + 1), size: 5 };
+	}
+	throw new Error('bigsize too large for a TLV type or length');
+}
+
+/**
+ * The TLV stream shared by splice_init and splice_ack: type 2
+ * require_confirmed_inputs (empty) and the lock depth extension. Unknown odd
+ * types are skipped, an unknown even type is a malformed message (BOLT 1).
+ */
+function encodeSpliceTlvs(msg: {
+	requireConfirmedInputs?: boolean;
+	lockDepth?: number;
+}): Buffer[] {
+	const parts: Buffer[] = [];
+	if (msg.requireConfirmedInputs) parts.push(Buffer.from([2, 0]));
+	if (msg.lockDepth !== undefined) {
+		if (
+			!Number.isInteger(msg.lockDepth) ||
+			msg.lockDepth < 1 ||
+			msg.lockDepth > SPLICE_LOCK_DEPTH_MAX
+		) {
+			throw new Error(
+				`lockDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_MAX}`
+			);
+		}
+		const value = Buffer.alloc(2);
+		value.writeUInt16BE(msg.lockDepth, 0);
+		parts.push(writeBigSize(SPLICE_LOCK_DEPTH_TLV), writeBigSize(2), value);
+	}
+	return parts;
+}
+
+function decodeSpliceTlvs(
+	payload: Buffer,
+	offset: number
+): { requireConfirmedInputs?: boolean; lockDepth?: number } {
+	const out: { requireConfirmedInputs?: boolean; lockDepth?: number } = {};
+	let lastType = -1;
+	while (offset < payload.length) {
+		const t = readBigSize(payload, offset);
+		offset += t.size;
+		const l = readBigSize(payload, offset);
+		offset += l.size;
+		if (offset + l.value > payload.length) throw new Error('truncated TLV');
+		const value = payload.subarray(offset, offset + l.value);
+		offset += l.value;
+		if (t.value <= lastType) throw new Error('TLV types out of order');
+		lastType = t.value;
+		if (t.value === 2) {
+			if (l.value !== 0)
+				throw new Error('require_confirmed_inputs must be empty');
+			out.requireConfirmedInputs = true;
+		} else if (t.value === SPLICE_LOCK_DEPTH_TLV) {
+			if (l.value !== 2) throw new Error('lock_depth must be a u16');
+			const depth = value.readUInt16BE(0);
+			if (depth < 1 || depth > SPLICE_LOCK_DEPTH_MAX) {
+				throw new Error(`lock_depth ${depth} out of range`);
+			}
+			out.lockDepth = depth;
+		} else if (t.value % 2 === 0) {
+			throw new Error(`unknown even TLV type ${t.value} in splice message`);
+		}
+	}
+	return out;
 }
 
 export interface ISpliceLockedMessage {
@@ -89,13 +204,7 @@ export function encodeSpliceMessage(msg: ISpliceMessage): Buffer {
 	msg.fundingPubkey.copy(fixed, offset);
 	parts.push(fixed);
 
-	// TLV: require_confirmed_inputs (type 2, length 0)
-	if (msg.requireConfirmedInputs) {
-		const tlv = Buffer.alloc(2);
-		tlv[0] = 2; // type
-		tlv[1] = 0; // length
-		parts.push(tlv);
-	}
+	parts.push(...encodeSpliceTlvs(msg));
 
 	return Buffer.concat(parts);
 }
@@ -122,19 +231,7 @@ export function decodeSpliceMessage(payload: Buffer): ISpliceMessage {
 	const fundingPubkey = Buffer.from(payload.subarray(offset, offset + 33));
 	offset += 33;
 
-	// Parse optional TLV
-	let requireConfirmedInputs: boolean | undefined;
-	if (offset < payload.length) {
-		const tlvType = payload[offset];
-		offset += 1;
-		if (tlvType === 2) {
-			const tlvLen = payload[offset];
-			offset += 1;
-			if (tlvLen === 0) {
-				requireConfirmedInputs = true;
-			}
-		}
-	}
+	const tlvs = decodeSpliceTlvs(payload, offset);
 
 	return {
 		channelId,
@@ -142,7 +239,8 @@ export function decodeSpliceMessage(payload: Buffer): ISpliceMessage {
 		relativeSatoshis,
 		fundingFeeratePerkw,
 		locktime,
-		requireConfirmedInputs
+		requireConfirmedInputs: tlvs.requireConfirmedInputs,
+		lockDepth: tlvs.lockDepth
 	};
 }
 
@@ -173,13 +271,7 @@ export function encodeSpliceAckMessage(msg: ISpliceAckMessage): Buffer {
 	msg.fundingPubkey.copy(fixed, offset);
 	parts.push(fixed);
 
-	// TLV: require_confirmed_inputs (type 2, length 0)
-	if (msg.requireConfirmedInputs) {
-		const tlv = Buffer.alloc(2);
-		tlv[0] = 2; // type
-		tlv[1] = 0; // length
-		parts.push(tlv);
-	}
+	parts.push(...encodeSpliceTlvs(msg));
 
 	return Buffer.concat(parts);
 }
@@ -202,25 +294,14 @@ export function decodeSpliceAckMessage(payload: Buffer): ISpliceAckMessage {
 	const fundingPubkey = Buffer.from(payload.subarray(offset, offset + 33));
 	offset += 33;
 
-	// Parse optional TLV
-	let requireConfirmedInputs: boolean | undefined;
-	if (offset < payload.length) {
-		const tlvType = payload[offset];
-		offset += 1;
-		if (tlvType === 2) {
-			const tlvLen = payload[offset];
-			offset += 1;
-			if (tlvLen === 0) {
-				requireConfirmedInputs = true;
-			}
-		}
-	}
+	const tlvs = decodeSpliceTlvs(payload, offset);
 
 	return {
 		channelId,
 		fundingPubkey,
 		relativeSatoshis,
-		requireConfirmedInputs
+		requireConfirmedInputs: tlvs.requireConfirmedInputs,
+		lockDepth: tlvs.lockDepth
 	};
 }
 

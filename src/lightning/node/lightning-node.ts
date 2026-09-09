@@ -6,6 +6,7 @@
  * into a unified Lightning node API.
  */
 
+import { SPLICE_LOCK_DEPTH_MAX } from '../message/splice';
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import { ILogger, noopLogger } from '../../logger';
@@ -8474,6 +8475,11 @@ export class LightningNode extends EventEmitter {
 			if (retired) this.persistChannel(channelId);
 			return;
 		}
+		// The chain has the splice: stamp it before the lock, so an adoption
+		// that follows knows the transaction confirmed and owes no rebroadcast
+		// (issue #760: a depth-locked splice on a zero-conf channel reaches
+		// adoption only this way).
+		channel.markSpliceConfirmed();
 		// sendSpliceLocked self-validates the splice state; ignore if not ready.
 		if (channel.getSpliceSession()) {
 			const result = this.channelManager.sendSpliceLocked(channelId);
@@ -8796,7 +8802,7 @@ export class LightningNode extends EventEmitter {
 					state.channelId || state.temporaryChannelId,
 					spliceTxidHex,
 					inflight.newFundingOutputIndex,
-					state.minimumDepth ?? 3,
+					Math.max(state.minimumDepth ?? 3, inflight.lockAtDepth ?? 0),
 					spliceFunding.p2wshOutput
 				);
 				// The new-outpoint watch above only arms spend detection once the
@@ -9009,7 +9015,7 @@ export class LightningNode extends EventEmitter {
 					channelId,
 					txidHex,
 					inflight.newFundingOutputIndex,
-					state.minimumDepth ?? 3,
+					Math.max(state.minimumDepth ?? 3, inflight.lockAtDepth ?? 0),
 					spliceFunding.p2wshOutput
 				);
 				// Spend detection on the superseded outpoint comes from the
@@ -11589,10 +11595,28 @@ export class LightningNode extends EventEmitter {
 		amountSats: bigint,
 		inputs: ISpliceWalletInput[],
 		changeScript: Buffer,
-		fundingFeeratePerkw = 253
+		fundingFeeratePerkw = 253,
+		options: {
+			/**
+			 * Issue #760: confirmations the splice must reach before either side
+			 * locks it, whatever the channel type. For an input this node does
+			 * not vouch for; the peer must echo it or the splice is aborted.
+			 */
+			lockAtDepth?: number;
+		} = {}
 	): ISpliceRequestResult {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new InvalidSpliceError(cidErr);
+		if (
+			options.lockAtDepth !== undefined &&
+			(!Number.isInteger(options.lockAtDepth) ||
+				options.lockAtDepth < 1 ||
+				options.lockAtDepth > SPLICE_LOCK_DEPTH_MAX)
+		) {
+			throw new InvalidSpliceError(
+				`lockAtDepth must be an integer between 1 and ${SPLICE_LOCK_DEPTH_MAX}`
+			);
+		}
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
 		if (satsErr) throw new InvalidSpliceError(satsErr);
 		// Same reason as spliceIn: splice_init encodes the feerate as a u32
@@ -11692,7 +11716,9 @@ export class LightningNode extends EventEmitter {
 		const selectionBusy = this._spliceSelectionBusy(channelId);
 		if (selectionBusy) return selectionBusy;
 
-		channel.setSpliceInInputs(inputs, changeScript);
+		channel.setSpliceInInputs(inputs, changeScript, {
+			lockAtDepth: options.lockAtDepth
+		});
 		const result = this.channelManager.initiateSplice(
 			channelId,
 			amountSats,

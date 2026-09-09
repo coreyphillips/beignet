@@ -1049,6 +1049,14 @@ export class Channel {
 		inputs: ISpliceWalletInput[];
 		changeScript: Buffer;
 	} | null = null;
+	/**
+	 * Issue #760: the depth the CURRENT splice negotiation locks at, on both
+	 * sides. The initiator sets it from setSpliceInInputs before splice_init
+	 * leaves, the acceptor takes it from the peer's splice_init. Copied onto
+	 * the in-flight record at the point of no return; null means the channel
+	 * type decides, as it always did.
+	 */
+	private _spliceLockAtDepth: number | null = null;
 	// Dual-funding ACCEPTOR contribution (v2 open, e.g. a bLIP-0051 lease we
 	// sell): wallet inputs funding our fundingSatoshis share, the change
 	// script, and the contribution amount. Same wallet-closure model as
@@ -9212,6 +9220,7 @@ export class Channel {
 			localRelativeSatoshis: inflight.localRelativeSatoshis,
 			remoteRelativeSatoshis: inflight.remoteRelativeSatoshis,
 			fundingFeeratePerkw: this._state.commitmentFeeratePerkw || 253,
+			lockDepth: inflight.lockAtDepth,
 			spliceTxid: inflight.spliceTxid,
 			spliceFundingOutputIndex: inflight.newFundingOutputIndex,
 			receivedTxSignatures: inflight.receivedTxSignatures,
@@ -10681,7 +10690,8 @@ export class Channel {
 			isInitiator: true,
 			localRelativeSatoshis: relativeSatoshis,
 			fundingFeeratePerkw,
-			locktime
+			locktime,
+			lockDepth: this._spliceLockAtDepth ?? undefined
 		};
 
 		// A prior splice abort is still awaiting its echo. tx_abort carries no
@@ -10836,6 +10846,11 @@ export class Channel {
 		this._txAbortSent = false;
 		this._spliceSession = new SpliceSession(params);
 		const result = this._spliceSession.handleSplice(msg);
+		// The peer asked this splice to lock at depth (issue #760): it binds
+		// our splice_locked too, echoed in the ack the session just built.
+		if (result.ok) {
+			this._spliceLockAtDepth = this._spliceSession.getLockDepth() ?? null;
+		}
 
 		if (!result.ok) {
 			this._spliceSession = null;
@@ -10901,6 +10916,29 @@ export class Channel {
 		const result = this._spliceSession.handleSpliceAck(msg);
 		if (!result.ok) {
 			return [{ type: ChannelActionType.ERROR, message: result.error! }];
+		}
+
+		// A lock depth we asked for must come back (issue #760): a peer that
+		// does not know the TLV would lock a zero-conf channel at broadcast,
+		// putting the stranger's coin under the live funding. Unwind before a
+		// single tx_add_input leaves, like the capacity failure below.
+		if (
+			this._spliceLockAtDepth !== null &&
+			msg.lockDepth !== this._spliceLockAtDepth
+		) {
+			const actions: ChannelAction[] = [
+				this._txAbort(this._state.channelId!, 'lock_depth not honoured')
+			];
+			actions.push(
+				...this.abortSplice(
+					`peer did not honour the requested splice lock depth ${this._spliceLockAtDepth}`
+				)
+			);
+			actions.push({
+				type: ChannelActionType.ERROR,
+				message: `splice aborted: peer did not honour the requested lock depth ${this._spliceLockAtDepth}`
+			});
+			return actions;
 		}
 
 		// The peer's splice_ack contribution counts toward capacity too: the
@@ -11000,10 +11038,18 @@ export class Channel {
 	 * Clears the other direction, and defers to a running splice, for the same
 	 * reasons as setSpliceOutDestination.
 	 */
-	setSpliceInInputs(inputs: ISpliceWalletInput[], changeScript: Buffer): void {
+	setSpliceInInputs(
+		inputs: ISpliceWalletInput[],
+		changeScript: Buffer,
+		options: { lockAtDepth?: number } = {}
+	): void {
 		if (this._state.state !== ChannelState.NORMAL) return;
 		this._spliceOutDestination = null;
 		this._spliceInInputs = { inputs, changeScript };
+		// A splice that must confirm before it locks, whatever the channel
+		// type (issue #760): a stranger's coin never becomes the live funding
+		// of a zero-conf channel at broadcast.
+		this._spliceLockAtDepth = options.lockAtDepth ?? null;
 	}
 
 	/**
@@ -11880,7 +11926,28 @@ export class Channel {
 	/**
 	 * Clear the interactive-tx driving state for a splice.
 	 */
+	/** Issue #760: does the current splice wait for the chain before locking? */
+	private _spliceLocksAtDepth(): boolean {
+		return (
+			(this._spliceLockAtDepth ??
+				this._state.spliceInFlight?.lockAtDepth ??
+				0) > 0
+		);
+	}
+
+	/**
+	 * The depth the splice's funding watch reports at: the channel's own
+	 * minimum, raised to the splice's lock depth when it has one (#760).
+	 */
+	private _spliceWatchDepth(): number {
+		return Math.max(
+			this._state.minimumDepth,
+			this._spliceLockAtDepth ?? this._state.spliceInFlight?.lockAtDepth ?? 0
+		);
+	}
+
 	private _resetSpliceDriver(): void {
+		this._spliceLockAtDepth = null;
 		this._spliceContributions = null;
 		this._spliceContribIndex = 0;
 		this._spliceSentTxComplete = false;
@@ -11948,7 +12015,8 @@ export class Channel {
 				receivedTxSignatures: false,
 				localSpliceLocked: false,
 				remoteSpliceLocked: false,
-				confirmed: false
+				confirmed: false,
+				lockAtDepth: this._spliceLockAtDepth ?? session.getLockDepth()
 			};
 		}
 		Object.assign(this._state.spliceInFlight, changes);
@@ -13066,7 +13134,7 @@ export class Channel {
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: signed.spliceTxid,
 				fundingOutputIndex: signed.newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
+				minimumDepth: this._spliceWatchDepth()
 			},
 			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg))
 		];
@@ -13077,6 +13145,7 @@ export class Channel {
 		// handleTxSignatures.
 		if (
 			this._isZeroConfChannelType() &&
+			!this._spliceLocksAtDepth() &&
 			this._state.spliceInFlight?.receivedTxSignatures
 		) {
 			actions.push(...this.sendSpliceLocked());
@@ -13122,7 +13191,7 @@ export class Channel {
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: spliceTxid,
 				fundingOutputIndex: newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
+				minimumDepth: this._spliceWatchDepth()
 			}
 		];
 		// Zero-conf channels lock the splice immediately after tx_signatures
@@ -13131,8 +13200,11 @@ export class Channel {
 		// confirmed check covers a confirmation that arrived while we were
 		// missing the peer's signatures (e.g. it completed and broadcast
 		// during a disconnect).
+		// A splice with a lock depth waits for the chain whatever the channel
+		// type (issue #760); the funding watch reports it at depth and the
+		// node sends splice_locked then.
 		if (
-			this._isZeroConfChannelType() ||
+			(this._isZeroConfChannelType() && !this._spliceLocksAtDepth()) ||
 			this._state.spliceInFlight?.confirmed
 		) {
 			actions.push(...this.sendSpliceLocked());
@@ -13421,6 +13493,7 @@ export class Channel {
 			record?.fullySigned &&
 			record.spliceTxHex &&
 			!record.confirmed &&
+			!record.lockAtDepth &&
 			this._isZeroConfChannelType()
 		) {
 			const owed = this._state.unconfirmedSpliceTxs ?? [];
@@ -16448,7 +16521,7 @@ export class Channel {
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: record.spliceTxid,
 				fundingOutputIndex: record.newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
+				minimumDepth: this._spliceWatchDepth()
 			});
 		}
 		refusal.push({ type: ChannelActionType.ERROR, message });
@@ -16473,7 +16546,7 @@ export class Channel {
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: record.spliceTxid,
 				fundingOutputIndex: record.newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
+				minimumDepth: this._spliceWatchDepth()
 			});
 		}
 		actions.push(...this._failChannelWithWireError(message));
@@ -17517,7 +17590,7 @@ export class Channel {
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: spliceTxid,
 				fundingOutputIndex: record.newFundingOutputIndex,
-				minimumDepth: this._state.minimumDepth
+				minimumDepth: this._spliceWatchDepth()
 			},
 			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg)),
 			...this._spliceCompletionTail(tx, record.newFundingOutputIndex)

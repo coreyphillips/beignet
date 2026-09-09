@@ -90,6 +90,13 @@ export interface ISpliceInFlight {
 	remoteSpliceLocked: boolean;
 	/** Splice tx reached depth while we could not send splice_locked (disconnected). */
 	confirmed: boolean;
+	/**
+	 * Issue #760: confirmations this splice must reach before we send
+	 * splice_locked, whatever the channel type. Set when the splice carries an
+	 * input this node does not vouch for (a stranger's direct funding into a
+	 * zero-conf channel); absent means the channel type decides, as before.
+	 */
+	lockAtDepth?: number;
 }
 
 /**
