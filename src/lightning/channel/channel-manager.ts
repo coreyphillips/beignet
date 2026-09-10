@@ -10210,9 +10210,17 @@ export class ChannelManager extends EventEmitter {
 				this.emit('broadcast:tx', action.tx);
 			}
 		}
+		// The view the rebuild was built from, which after a restart inside the
+		// lock window is the splice's again (issue #764). The CPFP child prices
+		// the parent fee off the capacity and the monitor resolves this
+		// commitment's outputs, so both have to read the funding the
+		// transaction we just re-broadcast spends.
+		const rebuiltView =
+			channel.getForceCloseBroadcastView() ?? channel.getFullState();
+		monitor.setChannelState(rebuiltView);
 		this._maybeCpfpAnchorCommitment(
 			channelId,
-			channel.getFullState(),
+			rebuiltView,
 			actions,
 			feeRatePerVbyte
 		);

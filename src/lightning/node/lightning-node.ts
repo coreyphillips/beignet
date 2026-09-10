@@ -2879,6 +2879,14 @@ export class LightningNode extends EventEmitter {
 						this.fundingPrivkey,
 					perCh?.htlcBasepointSecret || this.htlcBasepointSecret
 				);
+				// A close broadcast against a splice the channel never moved onto
+				// (issue #764) is watching a commitment that live state does not
+				// describe: the peer's second-level HTLC signatures are
+				// per-funding, so claims built from the pre-splice view are
+				// invalid. Null unless the durable record says this close spends
+				// the splice.
+				const broadcastView = channel.getForceCloseBroadcastView();
+				if (broadcastView) monitor.setChannelState(broadcastView);
 				this.channelManager.restoreMonitor(channelId, monitor);
 
 				// Older monitor state could mark a revoked close fully resolved
@@ -8990,7 +8998,14 @@ export class LightningNode extends EventEmitter {
 					spliceTxidHex,
 					inflight.newFundingOutputIndex,
 					Math.max(state.minimumDepth ?? 3, inflight.lockAtDepth ?? 0),
-					spliceFunding.p2wshOutput
+					spliceFunding.p2wshOutput,
+					undefined,
+					undefined,
+					undefined,
+					// The sighting this record already holds, so a reorg that
+					// dropped the splice while we were offline is still reported
+					// as a retraction (issue #764).
+					inflight.confirmedHeight
 				);
 				// The new-outpoint watch above only arms spend detection once the
 				// splice tx confirms, so the OLD (still-confirmed) funding output

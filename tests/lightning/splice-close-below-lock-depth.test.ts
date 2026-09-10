@@ -237,6 +237,34 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 			await recheck();
 			expect(unseen).to.deep.equal([spliceTxid]);
 		});
+
+		it('retracts a sighting only the restored record knows about', async () => {
+			// The reorg landed while the node was down, so this watch never saw
+			// the confirmation itself: without the record's height seeded into
+			// it there is nothing for the edge-triggered retraction to fire on.
+			backend.headerCallback!(100);
+			backend.history = [{ txid: spliceTxid, height: 100 }];
+			await watcher.watchFundingOutput(
+				channelId,
+				spliceTxid,
+				0,
+				3,
+				fundingScript,
+				undefined,
+				undefined,
+				undefined,
+				100
+			);
+			await tick();
+			expect(
+				seen,
+				'the chain agrees with the record: nothing new'
+			).to.deep.equal([]);
+
+			backend.history = [{ txid: spliceTxid, height: 0 }];
+			await recheck();
+			expect(unseen).to.deep.equal([spliceTxid]);
+		});
 	});
 
 	describe('the close a node can build in the window', () => {
@@ -516,6 +544,38 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 				state.closeSpendsSpliceTxid,
 				'the close no longer spends a splice'
 			).to.equal(null);
+			fx.destroy();
+		});
+
+		it('rebuilds the broadcast view a restart drops, from the record', async () => {
+			const fx = await setup(7691);
+			const spliceTxid = graftDepthLockedSplice(fx.alice, fx.channelId);
+			fx.alice
+				.getChainWatcher()!
+				.emit('funding:seen', fx.channelId, display(spliceTxid), 500);
+			await tick();
+			expect(
+				fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice)).ok
+			).to.equal(true);
+
+			const channel = fx.alice
+				.getChannelManager()
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				.getChannel(fx.channelId)! as any;
+			const sig = channel.getFullState().spliceInFlight.remoteCommitmentSig;
+			// What a restart leaves behind: the durable marker, none of the
+			// in-memory view the plan carried.
+			channel._forceCloseBroadcastView = null;
+
+			const view = channel.getForceCloseBroadcastView();
+			expect(
+				view.fundingTxid.equals(spliceTxid),
+				'the view describes the funding the close on the network spends'
+			).to.equal(true);
+			expect(
+				view.remoteCommitmentSignature.equals(sig),
+				"and carries that funding's signatures, which HTLC claims need"
+			).to.equal(true);
 			fx.destroy();
 		});
 

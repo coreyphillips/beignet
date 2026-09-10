@@ -6025,7 +6025,21 @@ export class Channel {
 	 * rather than the channel. Null whenever live state is the answer.
 	 */
 	getForceCloseBroadcastView(): IChannelState | null {
-		return this._forceCloseBroadcastView;
+		if (this._forceCloseBroadcastView) return this._forceCloseBroadcastView;
+		// The in-memory view dies with the process, and a restart inside the
+		// window restores everything else from live (pre-splice) state. Rebuild
+		// it from the durable record of which funding the broadcast close
+		// spends, which is what that record is for: without it a restored
+		// monitor claims HTLCs with the other funding's signatures and the CPFP
+		// child prices the parent fee off the wrong capacity.
+		const spends = this._state.closeSpendsSpliceTxid;
+		const inflight = this._state.spliceInFlight;
+		if (!spends || !inflight || !spends.equals(inflight.spliceTxid)) {
+			return null;
+		}
+		const adoption = this._computeSpliceAdoption();
+		if (!adoption?.fundingTxid?.equals(spends)) return null;
+		return { ...this._state, ...adoption } as IChannelState;
 	}
 
 	/**

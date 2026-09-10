@@ -751,7 +751,12 @@ export class ChainWatcher extends EventEmitter {
 					w.scriptPubkey,
 					undefined,
 					w.candidates,
-					w.discoverAttemptInputs
+					w.discoverAttemptInputs,
+					// Carried through for the same reason the candidate set is:
+					// the retry must not re-arm a watch that knows less than the
+					// one that failed, and a lost sighting is one it can never
+					// retract (issue #764).
+					w.watched.seenHeight
 				).catch(() => {
 					/* re-queued inside watchFundingOutput */
 				});
@@ -863,7 +868,13 @@ export class ChainWatcher extends EventEmitter {
 		// Restored records only: the input lineage of every attempt the record
 		// knows, to recognize a replacement it does not name (see
 		// discoverAttemptInputs).
-		discoverAttemptInputs?: string[][]
+		discoverAttemptInputs?: string[][],
+		// The sighting the caller's own durable record already holds (issue
+		// #764). 'funding:seen' / 'funding:unseen' are edge-triggered off the
+		// watch, so a watch re-armed with no prior sighting cannot retract one:
+		// a splice reorged out while the node was offline would leave the record
+		// naming a height the chain no longer has.
+		seenHeight?: number
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		const scriptHash = computeScriptHash(scriptPubkey);
@@ -878,6 +889,8 @@ export class ChainWatcher extends EventEmitter {
 			confirmed: false,
 			confirmationHeight: 0,
 			announcementTriggered: false,
+			seenHeight,
+			seenTxid: seenHeight !== undefined ? txid : undefined,
 			candidates: candidates?.length ? candidates : undefined,
 			script: scriptPubkey,
 			discoverAttemptInputs: discoverAttemptInputs?.length
