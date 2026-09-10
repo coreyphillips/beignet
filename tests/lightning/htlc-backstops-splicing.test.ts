@@ -23,9 +23,9 @@ import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
 	HtlcDirection,
-	HtlcState
+	HtlcState,
+	IHtlcEntry
 } from '../../src/lightning/channel/types';
-import { IHtlcEntry } from '../../src/lightning/channel/channel-state';
 import { ChannelSigner } from '../../src/lightning/keys/signer';
 import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
