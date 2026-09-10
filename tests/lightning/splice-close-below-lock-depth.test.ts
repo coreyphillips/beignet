@@ -27,7 +27,10 @@ import { INodeConfig } from '../../src/lightning/node/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Network } from '../../src/lightning/invoice/types';
-import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import {
+	ChannelState,
+	DEFAULT_CHANNEL_CONFIG
+} from '../../src/lightning/channel/types';
 import {
 	IChannelState,
 	ISpliceInFlight
@@ -919,6 +922,117 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 				'a splice in a block cannot also have a winning conflict'
 			).to.equal(false);
 			expect(record(fx.alice, fx.channelId)!.conflict).to.equal(undefined);
+			fx.destroy();
+		});
+
+		/** The script hash of the splice's own funding output, as the watcher keys it. */
+		function spliceFundingHash(node: LightningNode, channelId: Buffer): string {
+			const st = node.getChannelManager().getChannel(channelId)!.getFullState();
+			return computeScriptHash(
+				createFundingScript(
+					st.localBasepoints.fundingPubkey,
+					st.spliceInFlight!.remoteFundingPubkey,
+					bitcoin.networks.regtest
+				).p2wshOutput
+			);
+		}
+
+		it('sees our provisional close confirmed below the lock depth, not at it (issue #775)', async () => {
+			const fx = await setup(7721);
+			const spliceTxid = graftDepthLockedSplice(fx.alice, fx.channelId);
+			fx.alice
+				.getChainWatcher()!
+				.emit('funding:seen', fx.channelId, display(spliceTxid), 500);
+			await tick();
+			expect(
+				fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice)).ok
+			).to.equal(true);
+			const close = bitcoin.Transaction.fromHex(
+				fx.backend.broadcasts[fx.backend.broadcasts.length - 1]
+			);
+			expect(Buffer.from(close.ins[0].hash).equals(spliceTxid)).to.equal(true);
+
+			// The chain: the splice at 500, our close right behind it at 501,
+			// and the tip at 501, two blocks short of the lock depth.
+			fx.backend.history = [];
+			fx.backend.histories.set(spliceFundingHash(fx.alice, fx.channelId), [
+				{ txid: display(spliceTxid), height: 500 },
+				{ txid: close.getId(), height: 501 }
+			]);
+			fx.backend.txs.set(close.getId(), close.toBuffer());
+			fx.backend.headerCallback!(501);
+			await fx.alice.restoreChainWatches();
+			await tick(60);
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const monitor = (fx.alice.getChannelManager() as any).monitors.get(
+				fx.channelId.toString('hex')
+			);
+			expect(
+				monitor.isCommitmentConfirmed(),
+				'the close is known confirmed before the lock depth'
+			).to.equal(true);
+			expect(
+				record(fx.alice, fx.channelId)!.confirmed,
+				'while the lock is still owed'
+			).to.equal(false);
+			expect(monitor._channelState.fundingTxid.equals(spliceTxid)).to.equal(
+				true
+			);
+			fx.destroy();
+		});
+
+		it('classifies a close on the splice output against the spliced view before the lock depth (issue #775)', async () => {
+			const fx = await setup(7731);
+			const spliceTxid = graftDepthLockedSplice(fx.alice, fx.channelId);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const channel = fx.alice
+				.getChannelManager()
+				.getChannel(fx.channelId)! as any;
+			// A commitment on the new funding turns up at splice+1, with no
+			// monitor yet: our own post-splice commitment stands in for the
+			// one the peer would broadcast, built from the spliced view.
+			const view = {
+				...channel.getFullState(),
+				...channel._computeSpliceAdoption()
+			};
+			const close = buildLocalCommitment(
+				view,
+				perCommitmentPointFromSecret(
+					generateFromSeed(
+						view.localPerCommitmentSeed,
+						MAX_INDEX - view.localCommitmentNumber
+					)
+				),
+				undefined,
+				true
+			).result.tx;
+			fx.backend.history = [];
+			fx.backend.histories.set(spliceFundingHash(fx.alice, fx.channelId), [
+				{ txid: display(spliceTxid), height: 500 },
+				{ txid: close.getId(), height: 501 }
+			]);
+			fx.backend.txs.set(close.getId(), close.toBuffer());
+			fx.backend.headerCallback!(501);
+			await fx.alice.restoreChainWatches();
+			await tick(60);
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const monitor = (fx.alice.getChannelManager() as any).monitors.get(
+				fx.channelId.toString('hex')
+			);
+			expect(monitor, 'a monitor exists before the lock depth').to.not.equal(
+				undefined
+			);
+			expect(
+				monitor._channelState.fundingTxid.equals(spliceTxid),
+				'built from the spliced view'
+			).to.equal(true);
+			expect(
+				channel.getFullState().closeSpendsSpliceTxid!.equals(spliceTxid),
+				'and the record says which funding the close spends'
+			).to.equal(true);
+			expect(channel.getState()).to.equal(ChannelState.FORCE_CLOSED);
 			fx.destroy();
 		});
 
