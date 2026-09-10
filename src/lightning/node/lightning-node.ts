@@ -24226,7 +24226,18 @@ export class LightningNode extends EventEmitter {
 			const errored =
 				state.state === ChannelState.ERRORED &&
 				!mustNotBroadcastCommitment(state);
-			if (effectiveState !== ChannelState.NORMAL && !errored) continue;
+			// SPLICING is admitted for the same backstop (issue #774): a splice
+			// takes blocks, from quiescence through to splice_locked, and an
+			// inbound HTLC we hold the preimage for does not wait for it. The
+			// planner builds against whichever funding the chain has (issue
+			// #764), so the close is as sound here as on NORMAL. The off-chain
+			// fail further down needs update traffic, which only the
+			// pending-lock window of an ECDSA splice carries (canSettleHtlcs).
+			const splicing =
+				effectiveState === ChannelState.SPLICING &&
+				!mustNotBroadcastCommitment(state);
+			if (effectiveState !== ChannelState.NORMAL && !errored && !splicing)
+				continue;
 
 			for (const [key, htlc] of state.htlcs) {
 				if (!key.startsWith('received-')) continue;
@@ -24305,6 +24316,10 @@ export class LightningNode extends EventEmitter {
 				// HTLC we cannot claim costs us nothing to leave: the upstream
 				// refunds itself via its HTLC-timeout once the commitment confirms.
 				if (errored) continue;
+				// A splice carries updates only once both tx_signatures are in and
+				// the channel is ECDSA; before that the fail cannot leave, and the
+				// upstream's own timeout path covers the HTLC as above.
+				if (splicing && !channel.canSettleHtlcs()) continue;
 
 				// BOLT 2 quiescence: no update messages after stfu. The ChannelState
 				// stays NORMAL through a quiescence handshake, so it must be asked
@@ -24419,7 +24434,13 @@ export class LightningNode extends EventEmitter {
 			const errored =
 				state.state === ChannelState.ERRORED &&
 				!mustNotBroadcastCommitment(state);
-			if (state.state !== ChannelState.NORMAL && !errored) continue;
+			// SPLICING is admitted for the same reason as in scanExpiringHtlcs
+			// (issue #774): the inbound deadline does not wait for the splice.
+			const splicing =
+				state.state === ChannelState.SPLICING &&
+				!mustNotBroadcastCommitment(state);
+			if (state.state !== ChannelState.NORMAL && !errored && !splicing)
+				continue;
 			const channelId = state.channelId || state.temporaryChannelId;
 
 			for (const [key, htlc] of state.htlcs) {
@@ -24443,6 +24464,13 @@ export class LightningNode extends EventEmitter {
 					outKey,
 					htlc.paymentHash
 				);
+
+				// A splicing inbound channel that cannot carry updates yet is left
+				// for a later block rather than closed at this double margin: the
+				// refund is owed, only its transport is not up, and
+				// scanExpiringHtlcs force closes at the single margin if the leg
+				// is still unresolved by then.
+				if (outgoingFailed && splicing && !channel.canSettleHtlcs()) continue;
 
 				// An errored inbound channel cannot carry the update_fail_htlc even
 				// when the outbound leg failed cleanly, so it always takes the
@@ -25713,7 +25741,18 @@ export class LightningNode extends EventEmitter {
 			const shuttingDown =
 				effectiveState === ChannelState.SHUTTING_DOWN &&
 				!mustNotBroadcastCommitment(state);
-			if (effectiveState !== ChannelState.NORMAL && !errored && !shuttingDown)
+			// SPLICING too (issue #774): an offered HTLC the peer sits on past
+			// its expiry is claimable downstream whatever the channel is doing,
+			// and the planner closes against whichever funding the chain has.
+			const splicing =
+				effectiveState === ChannelState.SPLICING &&
+				!mustNotBroadcastCommitment(state);
+			if (
+				effectiveState !== ChannelState.NORMAL &&
+				!errored &&
+				!shuttingDown &&
+				!splicing
+			)
 				continue;
 			const channelId = state.channelId || state.temporaryChannelId;
 
