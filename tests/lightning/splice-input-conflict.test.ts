@@ -24,6 +24,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import * as bitcoin from 'bitcoinjs-lib';
+import { createFundingScript } from '../../src/lightning/script/funding';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import {
 	ChainWatcher,
@@ -436,6 +437,53 @@ describe('Splice input conflict watch (issue #760)', function () {
 		backend.block(157);
 		await tick();
 		expect(f.events).to.have.length(2);
+	});
+
+	it('re-emits a verdict once the sighting that refused it is retracted (issue #776)', async () => {
+		const f = fixture();
+		// The splice is also the channel's funding watch, seen in a block
+		// with its lock depth still ahead.
+		const spliceFundingScript = Buffer.from('0020' + 'ab'.repeat(32), 'hex');
+		const fundingHash = computeScriptHash(spliceFundingScript);
+		backend.setHistory(fundingHash, [
+			{ txid: f.spliceTx.getId(), height: 100 }
+		]);
+		const unseen: string[] = [];
+		watcher.on('funding:unseen', (_id: Buffer, txid: string) =>
+			unseen.push(txid)
+		);
+		await watcher.watchFundingOutput(
+			channelId,
+			f.spliceTx.getId(),
+			0,
+			100,
+			spliceFundingScript
+		);
+		backend.setHistory(f.scriptHash, [
+			{ txid: f.coin.getId(), height: 100 },
+			{ txid: f.conflict.getId(), height: 150 }
+		]);
+		backend.block(155);
+		await tick();
+		expect(f.events).to.have.length(1);
+		backend.block(156);
+		await tick();
+		expect(f.events, 'the same spender is not repeated').to.have.length(1);
+
+		// A reorg takes the splice back to the mempool. The sighting that let
+		// the listener refuse the verdict is retracted, and the verdict must
+		// come again for it.
+		backend.setHistory(fundingHash, [{ txid: f.spliceTx.getId(), height: 0 }]);
+		backend.block(157);
+		await tick();
+		expect(unseen).to.deep.equal([f.spliceTx.getId()]);
+		backend.block(158);
+		await tick();
+		expect(f.events, 're-emitted after the retraction').to.have.length(2);
+		expect(f.events[1].conflictTxid).to.equal(f.conflict.getId());
+		backend.block(159);
+		await tick();
+		expect(f.events, 'and latched again').to.have.length(2);
 	});
 
 	it('verifySpliceInputConflict checks the spender, the depth, the splice and never the shared input', async () => {
@@ -1687,6 +1735,53 @@ describe('Splice conflict recovery between two nodes (issue #760)', function () 
 		expect(
 			fx.alice.getChainWatcher()!.spliceInputWatchesFor(fx.channelId)
 		).to.have.length(0);
+		fx.destroy();
+	});
+
+	it('takes a verdict refused under a stale sighting once the sighting is retracted (issue #776)', async () => {
+		// Alice's chain view alone: bob's backend never shows the conflict,
+		// so only alice's verdict is under test.
+		const fx = await setupNodes(7699, { sharedBackend: false });
+		const st = channelOf(fx.alice, fx.channelId).getFullState();
+		const spliceFundingHash = computeScriptHash(
+			createFundingScript(
+				st.localBasepoints.fundingPubkey,
+				st.spliceInFlight!.remoteFundingPubkey,
+				bitcoin.networks.regtest
+			).p2wshOutput
+		);
+		// The splice is seen at 154, two blocks short of its lock depth, and
+		// the conflict is six deep at 155: the verdict lands while the record
+		// says the chain has the splice, so the channel refuses it.
+		fx.backendA.setHistory(spliceFundingHash, [
+			{ txid: fx.spliceTx.getId(), height: 154 }
+		]);
+		fx.backendA.setHistory(fx.coinScriptHash, conflictHistory(fx));
+		for (let h = 150; h <= 155; h++) fx.backendA.block(h);
+		await tick(150);
+		expect(
+			channelOf(fx.alice, fx.channelId).getFullState().spliceInFlight!
+				.confirmedHeight,
+			'the sighting is stamped'
+		).to.equal(154);
+		expect(fx.conflicted, 'the verdict was refused').to.deep.equal([]);
+
+		// The reorg takes the splice back. The next verdict is taken.
+		fx.backendA.setHistory(spliceFundingHash, [
+			{ txid: fx.spliceTx.getId(), height: 0 }
+		]);
+		fx.backendA.block(156);
+		await tick(150);
+		expect(
+			channelOf(fx.alice, fx.channelId).getFullState().spliceInFlight
+				?.confirmedHeight,
+			'the sighting is retracted'
+		).to.equal(undefined);
+		fx.backendA.block(157);
+		await tick(300);
+		expect(fx.conflicted, 'the re-emitted verdict is taken').to.include(
+			'alice'
+		);
 		fx.destroy();
 	});
 

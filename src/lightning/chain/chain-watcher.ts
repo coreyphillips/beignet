@@ -1831,7 +1831,31 @@ export class ChainWatcher extends EventEmitter {
 		const txid = watched.seenTxid ?? watched.txid;
 		watched.seenTxid = undefined;
 		watched.seenHeight = undefined;
+		this.releaseSpliceConflictLatch(watched.channelId, txid);
 		this.emit('funding:unseen', watched.channelId, txid);
+	}
+
+	/**
+	 * Re-arm the conflict verdict on a splice whose sighting was just
+	 * retracted (issue #776). A verdict is emitted once per competing
+	 * spender, and the listener refuses one for a splice the chain has
+	 * (markSpliceConflicted, issue #764). The refusal can rest on a sighting
+	 * that a reorg has since taken back, and a latch with no re-arm would
+	 * then keep the verdict from ever reaching the channel again: a splice
+	 * that can never confirm, and can never be reverted either, until a
+	 * restart re-arms the watch. A verdict the channel did take is unaffected:
+	 * it records the conflict durably and answers a repeat with "unchanged".
+	 */
+	private releaseSpliceConflictLatch(
+		channelId: Buffer,
+		spliceTxid: string
+	): void {
+		const idHex = channelId.toString('hex');
+		for (const watched of this.watchedSpliceInputs.values()) {
+			if (watched.spliceTxid !== spliceTxid) continue;
+			if (watched.channelId.toString('hex') !== idHex) continue;
+			watched.reportedConflictTxid = undefined;
+		}
 	}
 
 	private async checkFundingConfirmation(
