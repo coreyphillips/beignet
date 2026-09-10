@@ -408,6 +408,7 @@ import {
 	createAcceptorState,
 	IAbandonedLocalAdd,
 	IChannelState,
+	ISpliceInFlight,
 	IV2InFlight,
 	mustNotBroadcastCommitment,
 	ChannelCloseReason
@@ -2856,9 +2857,20 @@ export class LightningNode extends EventEmitter {
 				const perCh = this.channelManager.getMonitorSigningKeys(
 					Buffer.from(channelId, 'hex')
 				);
+				// A close against a splice the channel never moved onto (issue
+				// #764) is watching a commitment that live state does not
+				// describe: the peer's second-level HTLC signatures are
+				// per-funding, so claims built from the pre-splice view are
+				// invalid. Live state unless the durable record says the close
+				// spends the splice. Handed to restore itself, not swapped in
+				// afterwards: restore rebuilds the held sweeps and repairs the
+				// revoked snapshot from the state it is given, and a swap after
+				// the fact re-derives nothing.
+				const monitorView =
+					channel.getForceCloseBroadcastView() ?? channelState;
 				const monitor = ChainMonitor.restore(
 					monitorState,
-					channelState,
+					monitorView,
 					destinationScript,
 					10, // safe default fee rate (sat/vbyte), updated when fee estimator resolves
 					// Mirror the create path (channel-manager) EXACTLY so a restored
@@ -8170,6 +8182,21 @@ export class LightningNode extends EventEmitter {
 				this.onFundingWatchConfirmed(channelId, txid);
 			}
 		);
+		// The chain has an in-flight splice, below the depth its lock waits for
+		// (issue #764): the old funding output is spent from here, so a close
+		// has to be planned against the new one.
+		this.chainWatcher.on(
+			'funding:seen',
+			(channelId: Buffer, txid: string, height: number) => {
+				this.onFundingWatchSeen(channelId, txid, height);
+			}
+		);
+		this.chainWatcher.on(
+			'funding:unseen',
+			(channelId: Buffer, txid: string) => {
+				this.onFundingWatchUnseen(channelId, txid);
+			}
+		);
 		this.chainWatcher.on(
 			'funding:presplice-retired',
 			(channelId: Buffer, txid: string, outputIndex: number) => {
@@ -8481,6 +8508,85 @@ export class LightningNode extends EventEmitter {
 				channelId: idHex
 			});
 		}
+	}
+
+	/**
+	 * The in-flight splice this channelId's funding watch covers, when the
+	 * watcher's display-order txid is that splice's (issue #764). Null for the
+	 * original funding's own watch, and for a report about anything else.
+	 */
+	private spliceInFlightForWatchedTxid(
+		channel: Channel,
+		txidDisplayHex: string
+	): ISpliceInFlight | null {
+		const inflight = channel.getFullState().spliceInFlight;
+		if (!inflight) return null;
+		const display = Buffer.from(inflight.spliceTxid).reverse().toString('hex');
+		return display === txidDisplayHex ? inflight : null;
+	}
+
+	/**
+	 * A watched splice transaction is in a block, at whatever depth (issue
+	 * #764). The lock still waits for `lockAtDepth`, but the chain has already
+	 * spent the pre-splice funding output, so from here every commitment this
+	 * node could broadcast against the old outpoint is unconfirmable, and the
+	 * force-close planner has to build against the new one.
+	 *
+	 * Nothing is adopted: a splice at one confirmation can still be reorged
+	 * out, and leaving the channel where it is keeps the pre-splice commitment
+	 * buildable for the re-drive that a retraction owes.
+	 */
+	private onFundingWatchSeen(
+		channelId: Buffer,
+		txid: string,
+		height: number
+	): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const inflight = this.spliceInFlightForWatchedTxid(channel, txid);
+		if (!inflight || inflight.confirmed) return;
+		if (channel.markSpliceSeenOnChain(height)) {
+			this.persistChannel(channelId);
+			this.emitStructuredLog('chain', 'splice_seen_on_chain', {
+				channelId: channelId.toString('hex'),
+				txid,
+				height
+			});
+		}
+		// A close already broadcast against the old funding can never confirm
+		// now. Re-drive it, unless the close on the network is already this
+		// splice's (a repeated sighting, or a restart re-reporting one).
+		if (channel.getState() !== ChannelState.FORCE_CLOSED) return;
+		const spends = channel.getFullState().closeSpendsSpliceTxid;
+		if (spends?.equals(inflight.spliceTxid)) return;
+		void this.redriveSpliceAdoptedClose(channelId);
+	}
+
+	/**
+	 * A splice this watch reported in a block is not in one any more (issue
+	 * #764): a reorg took the confirmation back, and the pre-splice funding
+	 * output is unspent again.
+	 *
+	 * Only a close we planned against that splice needs anything: it spends an
+	 * outpoint that no longer exists, so re-drive it, which now rebuilds the
+	 * pre-splice commitment the channel never left.
+	 */
+	private onFundingWatchUnseen(channelId: Buffer, txid: string): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const inflight = this.spliceInFlightForWatchedTxid(channel, txid);
+		if (!inflight || inflight.confirmed) return;
+		if (channel.clearSpliceSeenOnChain()) {
+			this.persistChannel(channelId);
+			this.emitStructuredLog('chain', 'splice_unseen_on_chain', {
+				channelId: channelId.toString('hex'),
+				txid
+			});
+		}
+		if (channel.getState() !== ChannelState.FORCE_CLOSED) return;
+		const spends = channel.getFullState().closeSpendsSpliceTxid;
+		if (!spends?.equals(inflight.spliceTxid)) return;
+		void this.redriveSpliceAdoptedClose(channelId);
 	}
 
 	/**
@@ -8853,17 +8959,6 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 
-			// Superseded funding outpoints whose expected splice spend is not yet
-			// irrevocable. Re-armed for EVERY channel, not just one with a live
-			// spliceInFlight: completeSplice clears that record at
-			// splice_locked, which on a zero-conf channel precedes the splice
-			// transaction confirming, so this list is the only thing that can
-			// bring the watch back (issue #479).
-			await this.armPreSpliceSpendWatches(
-				state.channelId || state.temporaryChannelId,
-				state
-			);
-
 			const inflight = state.spliceInFlight;
 			// ONLY past the point of no return. The shared input is the 2-of-2
 			// funding, so until OUR tx_signatures have left nobody can broadcast
@@ -8877,7 +8972,7 @@ export class LightningNode extends EventEmitter {
 			if (inflight && inflight.sentTxSignatures === true) {
 				// In-flight splice: watch the splice tx's new funding output IN
 				// ADDITION to the old one, which keeps its own spend coverage
-				// from the pre-splice leg armed above (the old output is
+				// from the pre-splice leg armed below (the old output is
 				// expected to be spent by the splice tx, and a stale
 				// confirmation re-fire would trigger a premature splice_locked).
 				// Also rebroadcast the fully-signed splice tx — the network may never
@@ -8895,13 +8990,33 @@ export class LightningNode extends EventEmitter {
 					spliceTxidHex,
 					inflight.newFundingOutputIndex,
 					Math.max(state.minimumDepth ?? 3, inflight.lockAtDepth ?? 0),
-					spliceFunding.p2wshOutput
+					spliceFunding.p2wshOutput,
+					undefined,
+					undefined,
+					undefined,
+					// The sighting this record already holds, so a reorg that
+					// dropped the splice while we were offline is still reported
+					// as a retraction (issue #764).
+					inflight.confirmedHeight
+				);
+				// AFTER that call, never before it: its own immediate check is
+				// what reconciles the seeded sighting against the chain, and a
+				// splice reorged out while we were offline has to retract there -
+				// moving the close back onto the pre-splice funding - before a
+				// spend scan of that funding reaches the monitor. A commitment
+				// classified while the monitor still holds the splice's view
+				// claims its HTLCs with the peer's second-level signatures for
+				// the other funding, which are invalid (issue #764).
+				await this.armPreSpliceSpendWatches(
+					state.channelId || state.temporaryChannelId,
+					state
 				);
 				// The new-outpoint watch above only arms spend detection once the
 				// splice tx confirms, so the OLD (still-confirmed) funding output
-				// has no spend subscription of its own. That watch is armed by
-				// the loop ABOVE, from the durable record, which the block ahead
-				// of it derives and persists for a row that predates the field.
+				// has no spend subscription of its own. That watch is the leg
+				// armed just above, from the durable record, which the block
+				// ahead of it derives and persists for a row that predates the
+				// field.
 				// Arming it here as well, without recording it, is what made a
 				// second restart come back blind once completeSplice had cleared
 				// spliceInFlight (issue #479).
@@ -8926,6 +9041,18 @@ export class LightningNode extends EventEmitter {
 				);
 				continue;
 			}
+
+			// Superseded funding outpoints whose expected splice spend is not yet
+			// irrevocable. Re-armed for EVERY channel, not just one with a live
+			// spliceInFlight: completeSplice clears that record at splice_locked,
+			// which on a zero-conf channel precedes the splice transaction
+			// confirming, so this list is the only thing that can bring the watch
+			// back (issue #479). The in-flight branch above arms them too, after
+			// its own watch.
+			await this.armPreSpliceSpendWatches(
+				state.channelId || state.temporaryChannelId,
+				state
+			);
 
 			const txidHex = Buffer.from(state.fundingTxid).reverse().toString('hex');
 
@@ -11332,6 +11459,12 @@ export class LightningNode extends EventEmitter {
 	 * time), except a bare confirmed-close refusal while a confirmed record
 	 * still awaits adoption: that monitor state can be a stale pre-reorg
 	 * record the funding-spend reconcile has yet to demote, so it retries.
+	 *
+	 * Issue #764 drives it from two more points, on the same terms: a splice
+	 * merely SEEN in a block (the close must spend it, though nothing is
+	 * adopted), and a sighting a reorg took back (the close must go back to
+	 * the pre-splice funding). Which commitment gets rebuilt is the planner's
+	 * decision, read fresh from the record on every call.
 	 */
 	private async redriveSpliceAdoptedClose(channelId: Buffer): Promise<void> {
 		const idHex = channelId.toString('hex');
@@ -11352,6 +11485,12 @@ export class LightningNode extends EventEmitter {
 				const chState = ch?.getFullState();
 				const confirmedAdoption =
 					chState?.spliceInFlight?.confirmed === true ||
+					// A splice the chain has but that has not reached its lock
+					// depth is the same case (issue #764), and so is the close
+					// against one that a reorg has since retracted, which owes a
+					// re-drive back onto the pre-splice funding.
+					chState?.spliceInFlight?.confirmedHeight !== undefined ||
+					chState?.closeSpendsSpliceTxid != null ||
 					// A v2 RBF candidate adoption (issue #360) re-drives on the
 					// same machinery and retries the same way.
 					(chState?.fundingVersion === 2 &&
@@ -22230,7 +22369,9 @@ export class LightningNode extends EventEmitter {
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return false;
 		const inflight = channel.getFullState().spliceInFlight;
-		if (!inflight?.conflict || inflight.confirmed) return false;
+		// Seen in a block, not just locked (issue #764): a splice the chain has
+		// taken is not one to ask the peer to abandon.
+		if (!inflight?.conflict || channel.spliceSeenOnChain()) return false;
 		const peer = this.channelManager.getPeerForChannel(channelId);
 		if (!peer) return false;
 		if (this.peerManager && !this.listPeers().some((p) => p.pubkey === peer)) {
@@ -22264,7 +22405,7 @@ export class LightningNode extends EventEmitter {
 		if (!channel) return;
 		const inflight = channel.getFullState().spliceInFlight;
 		const conflict = inflight?.conflict;
-		if (!inflight || !conflict || inflight.confirmed) return;
+		if (!inflight || !conflict || channel.spliceSeenOnChain()) return;
 		const peer = this.channelManager.getPeerForChannel(channelId);
 		if (!peer) return;
 		const msg: ISpliceConflictMessage = {
@@ -22471,7 +22612,8 @@ export class LightningNode extends EventEmitter {
 			else refuse('no such splice in flight');
 			return;
 		}
-		if (inflight.confirmed || inflight.localSpliceLocked) {
+		// In a block counts, whatever its depth (issue #764).
+		if (channel.spliceSeenOnChain() || inflight.localSpliceLocked) {
 			refuse('the splice is confirmed on our chain view');
 			return;
 		}
@@ -22544,7 +22686,7 @@ export class LightningNode extends EventEmitter {
 			else refuse('no such splice in flight');
 			return;
 		}
-		if (current.confirmed || current.localSpliceLocked) {
+		if (again.spliceSeenOnChain() || current.localSpliceLocked) {
 			refuse('the splice is confirmed on our chain view');
 			return;
 		}

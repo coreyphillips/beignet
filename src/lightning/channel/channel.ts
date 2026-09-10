@@ -726,6 +726,22 @@ export interface IForceClosePlanReady {
 	 */
 	spliceAdoption: Partial<IChannelState> | null;
 	/**
+	 * Set when the commitment spends a splice the chain has but that has not
+	 * reached its lock depth (issue #764). The channel is deliberately NOT
+	 * moved onto that funding: a splice at one confirmation can still be
+	 * reorged out, and leaving the channel where it is keeps the pre-splice
+	 * commitment buildable for a close re-driven on the old funding.
+	 *
+	 * `view` is the state the broadcast commitment was built from, which the
+	 * monitor needs to classify it - live channel state describes the other
+	 * funding. `spliceTxid` is recorded durably, as the only answer to which
+	 * of the two fundings the close on the network belongs to.
+	 */
+	provisionalSpliceClose: {
+		spliceTxid: Buffer;
+		view: IChannelState;
+	} | null;
+	/**
 	 * The state a CONFIRMED superseded v2 RBF attempt contributes to that
 	 * view, or null when there is none to adopt. Applied as one assignment,
 	 * like the splice adoption above.
@@ -957,6 +973,10 @@ export class Channel {
 		witnesses: Buffer[][];
 	} | null = null;
 	private _spliceRemoteCommitmentSig: Buffer | null = null;
+	// The view the last applied force-close plan built its commitment from,
+	// when the channel deliberately did not move onto it (issue #764). In
+	// memory only: a re-drive re-plans, and its plan carries the view again.
+	private _forceCloseBroadcastView: IChannelState | null = null;
 	// Peer's second-level HTLC sigs paired with _spliceRemoteCommitmentSig:
 	// committed HTLCs riding through the splice (S-2.M8) put HTLC outputs on
 	// the spliced commitment, and a force-close on the new funding needs
@@ -5997,6 +6017,101 @@ export class Channel {
 	}
 
 	/**
+	 * The view the close on the network was built from, when that is NOT live
+	 * state (issue #764): a close against a splice the chain has but that has
+	 * not reached its lock depth leaves the channel on the pre-splice funding.
+	 * Ours, planned provisionally, or the peer's, seen spending the splice
+	 * output (closeViewForSpentOutpoint). Whatever has to recognise that
+	 * transaction - the anchor CPFP child, the monitor's classification and
+	 * sweeps - reads this rather than the channel. Null whenever live state is
+	 * the answer.
+	 */
+	getForceCloseBroadcastView(): IChannelState | null {
+		if (this._forceCloseBroadcastView) return this._forceCloseBroadcastView;
+		// The in-memory view dies with the process, and a restart inside the
+		// window restores everything else from live (pre-splice) state. Rebuild
+		// it from the durable record of which funding the close on the network
+		// spends, which is what that record is for: without it a restored
+		// monitor claims HTLCs with the other funding's signatures and the CPFP
+		// child prices the parent fee off the wrong capacity.
+		const spends = this._state.closeSpendsSpliceTxid;
+		const inflight = this._state.spliceInFlight;
+		if (!spends || !inflight || !spends.equals(inflight.spliceTxid)) {
+			return null;
+		}
+		const adoption = this._computeSpliceAdoption();
+		if (!adoption?.fundingTxid?.equals(spends)) return null;
+		return { ...this._state, ...adoption } as IChannelState;
+	}
+
+	/**
+	 * The view describing the funding a reported spend consumed, with the
+	 * durable record made to agree (issue #764). The monitor classifies the
+	 * spend and builds every claim from the view it holds, and the peer's
+	 * second-level HTLC signatures are per-funding, so the view has to name
+	 * the funding the transaction actually spent, whatever the channel
+	 * believed a moment earlier:
+	 *
+	 * - A spend of the in-flight splice's own output is a close on the
+	 *   post-splice commitment: ours, planned provisionally, or the peer's.
+	 *   The spliced view describes it, and `closeSpendsSpliceTxid` is stamped
+	 *   so a restart rebuilds the same view (getForceCloseBroadcastView).
+	 * - A CONFIRMED spend of the pre-splice funding by anything but the
+	 *   splice is the chain saying the splice is not in it: the outpoint the
+	 *   splice would consume went to something else. A sighting of the splice,
+	 *   and a close planned against it, are retracted here, ahead of the
+	 *   watcher's absence debounce, because this evidence is direct. Live
+	 *   state is the view. A mempool sighting is left alone: it is re-reported
+	 *   on confirmation, and the monitor builds nothing from it before then.
+	 *
+	 * Null leaves the monitor's view as it is. `changed` says the durable
+	 * record moved, so the caller persists.
+	 */
+	closeViewForSpentOutpoint(
+		outpoint: { txid: string; outputIndex: number },
+		confirmed: boolean
+	): { view: IChannelState | null; changed: boolean } {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight) return { view: null, changed: false };
+		const spliceTxidHex = Buffer.from(inflight.spliceTxid)
+			.reverse()
+			.toString('hex');
+		if (
+			outpoint.txid === spliceTxidHex &&
+			outpoint.outputIndex === inflight.newFundingOutputIndex
+		) {
+			const adoption = this.spliceAdoptedRemoteSignature()
+				? this._computeSpliceAdoption()
+				: null;
+			if (!adoption?.fundingTxid?.equals(inflight.spliceTxid)) {
+				// Nothing to build the spliced view from. Live state it is,
+				// and the classification is as right as it can be.
+				return { view: null, changed: false };
+			}
+			const view = { ...this._state, ...adoption } as IChannelState;
+			const changed = !this._state.closeSpendsSpliceTxid?.equals(
+				inflight.spliceTxid
+			);
+			this._state.closeSpendsSpliceTxid = Buffer.from(inflight.spliceTxid);
+			this._forceCloseBroadcastView = view;
+			return { view, changed };
+		}
+		const funding = this._state.fundingTxid;
+		const preSplice =
+			funding !== null &&
+			outpoint.txid === Buffer.from(funding).reverse().toString('hex') &&
+			outpoint.outputIndex === this._state.fundingOutputIndex;
+		if (!preSplice || !confirmed) return { view: null, changed: false };
+		const retracted =
+			this.clearSpliceSeenOnChain() ||
+			this._state.closeSpendsSpliceTxid != null ||
+			this._forceCloseBroadcastView !== null;
+		this._state.closeSpendsSpliceTxid = null;
+		this._forceCloseBroadcastView = null;
+		return { view: this._state, changed: retracted };
+	}
+
+	/**
 	 * Force close, in one call: plan, then apply.
 	 *
 	 * Kept for callers with nothing to sequence between the two. The operator
@@ -6176,7 +6291,7 @@ export class Channel {
 			};
 		}
 
-		// A splice tx that CONFIRMED makes the old funding output unspendable —
+		// A splice tx that is ON CHAIN makes the old funding output unspendable —
 		// a live-state commitment would spend a spent outpoint and can never
 		// confirm, leaving no unilateral exit. The only valid exit is the
 		// commitment on the NEW funding, whose peer signatures the
@@ -6185,16 +6300,27 @@ export class Channel {
 		// material a splice_locked exchange makes — the peer's signatures are
 		// over commitment N regardless of whether splice_locked ever crossed).
 		//
-		// Judged by the CONFIRMED record alone, never by channel state: the
+		// Judged by the record alone, never by channel state: the
 		// production shapes are a disconnect wrapping SPLICING in
 		// AWAITING_REESTABLISH (where the chain watcher records the confirmation
 		// it could not announce), and a BOLT 1 error landing mid-splice, where
 		// markErrored has already replaced SPLICING with ERRORED by the time the
 		// close is driven. A state-based gate would skip adoption in the latter
 		// and broadcast against the spent pre-splice funding.
+		//
+		// Two facts, two answers (issue #764). `confirmed` means the splice
+		// reached its lock depth, and adopting on it MOVES the channel, exactly
+		// as splice_locked would. `confirmedHeight` alone means the chain has
+		// the splice but the lock is still owed: the old funding is just as
+		// spent, so the same view is what we must broadcast, but a one-
+		// confirmation splice can still be reorged out, so the channel is left
+		// where it is and the plan carries the view instead. That keeps the
+		// pre-splice commitment buildable, which is the only thing that can
+		// close the channel if the splice never comes back.
 		let spliceAdoption: Partial<IChannelState> | null = null;
+		let provisionalSplice: Partial<IChannelState> | null = null;
 		const inflight = this._state.spliceInFlight;
-		if (inflight?.confirmed === true) {
+		if (this.spliceSeenOnChain()) {
 			// Without the peer's signature over the POST-splice commitment,
 			// adopting would leave remoteCommitmentSignature holding the
 			// PRE-splice one: non-null, so the check further down passes, and
@@ -6208,14 +6334,14 @@ export class Channel {
 						'Cannot force close: confirmed splice has no remote commitment signature to adopt'
 				};
 			}
-			spliceAdoption = this._computeSpliceAdoption();
+			const adoption = this._computeSpliceAdoption();
 			// Never knowingly broadcast a commitment against the spent
 			// pre-splice funding: if the adoption would not actually swap the
 			// outpoint, refuse rather than produce an unconfirmable exit.
-			const expectedTxid = Buffer.from(inflight.spliceTxid);
+			const expectedTxid = Buffer.from(inflight!.spliceTxid);
 			if (
-				!spliceAdoption?.fundingTxid?.equals(expectedTxid) ||
-				spliceAdoption.fundingOutputIndex !== inflight.newFundingOutputIndex
+				!adoption?.fundingTxid?.equals(expectedTxid) ||
+				adoption.fundingOutputIndex !== inflight!.newFundingOutputIndex
 			) {
 				return {
 					ok: false,
@@ -6223,15 +6349,23 @@ export class Channel {
 						'Cannot force close: confirmed splice funding could not be adopted'
 				};
 			}
-			if (this._state.state === ChannelState.ERRORED) {
-				// The adoption restores NORMAL exactly as a splice_locked
-				// exchange would; a channel failed by a BOLT 1 error stays failed.
-				spliceAdoption.state = ChannelState.ERRORED;
-				spliceAdoption.preReestablishState = null;
-			} else if (spliceAdoption.state === ChannelState.NORMAL) {
-				// Adoption succeeded from inside the reestablish wrapper: the
-				// wrapper's return-to state no longer exists.
-				spliceAdoption.preReestablishState = null;
+			if (inflight!.confirmed === true) {
+				spliceAdoption = adoption;
+				if (this._state.state === ChannelState.ERRORED) {
+					// The adoption restores NORMAL exactly as a splice_locked
+					// exchange would; a channel failed by a BOLT 1 error stays failed.
+					spliceAdoption.state = ChannelState.ERRORED;
+					spliceAdoption.preReestablishState = null;
+				} else if (spliceAdoption.state === ChannelState.NORMAL) {
+					// Adoption succeeded from inside the reestablish wrapper: the
+					// wrapper's return-to state no longer exists.
+					spliceAdoption.preReestablishState = null;
+				}
+			} else {
+				// Below the lock depth: the view builds the commitment and, on
+				// the plan, tells the monitor which one we broadcast. The
+				// channel stays where it is.
+				provisionalSplice = adoption;
 			}
 		}
 
@@ -6257,7 +6391,7 @@ export class Channel {
 		// way, so that nothing below can reach the live channel by accident.
 		const closing = {
 			...this._state,
-			...(spliceAdoption ?? {}),
+			...(spliceAdoption ?? provisionalSplice ?? {}),
 			...(v2Adoption ?? {})
 		} as IChannelState;
 
@@ -6318,6 +6452,9 @@ export class Channel {
 					perCommitmentPoint,
 					localNonce
 			  );
+		// The view the surviving rebuild was built from, which is the one that
+		// describes the transaction we broadcast (issue #764).
+		let witnessedView = closing;
 
 		if (!witnessed) {
 			// The rebuild reconstructs what the peer signed from flags on our own
@@ -6344,7 +6481,10 @@ export class Channel {
 					perCommitmentPoint,
 					localNonce
 				);
-				if (witnessed) break;
+				if (witnessed) {
+					witnessedView = candidate;
+					break;
+				}
 			}
 		}
 
@@ -6365,6 +6505,12 @@ export class Channel {
 			ok: true,
 			commitmentTx: witnessed.toBuffer(),
 			spliceAdoption,
+			provisionalSpliceClose: provisionalSplice
+				? {
+						spliceTxid: Buffer.from(inflight!.spliceTxid),
+						view: witnessedView
+				  }
+				: null,
 			v2Adoption,
 			localNonce,
 			channelId: closing.channelId!
@@ -6551,6 +6697,15 @@ export class Channel {
 			Object.assign(this._state, plan.spliceAdoption);
 			this._finishSpliceRuntime();
 		}
+		// Which funding the transaction we are about to broadcast spends, when
+		// that is a splice the channel has not moved onto (issue #764).
+		// Rewritten by every plan, so a re-drive that goes back to the
+		// pre-splice funding (the splice was reorged out) or forward to a real
+		// adoption clears it.
+		this._state.closeSpendsSpliceTxid = plan.provisionalSpliceClose
+			? Buffer.from(plan.provisionalSpliceClose.spliceTxid)
+			: null;
+		this._forceCloseBroadcastView = plan.provisionalSpliceClose?.view ?? null;
 		if (plan.v2Adoption) {
 			Object.assign(this._state, plan.v2Adoption);
 			// Durable proof of which attempt this close was planned against:
@@ -6655,6 +6810,14 @@ export class Channel {
 			this._state.simpleClose === true &&
 			(this._state.state === ChannelState.SHUTTING_DOWN ||
 				this._state.state === ChannelState.NEGOTIATING_CLOSING);
+		// SPLICING is deliberately not admitted, for the whole pending-lock
+		// window (issue #764). A negotiation started there would have to name a
+		// funding output, and which of the two is the right one changes under
+		// it: the splice can confirm, or be reorged out, mid-negotiation, and
+		// the reestablish next_funding_txid rules would then have to reconcile
+		// a closing session against a funding neither side agreed to close on.
+		// The unilateral exit is what the window needs and it is available: the
+		// force-close planner builds against whichever funding the chain has.
 		if (this._state.state !== ChannelState.NORMAL && !simpleCloseResend) {
 			return [
 				{
@@ -9550,6 +9713,47 @@ export class Channel {
 	}
 
 	/**
+	 * Record that the splice transaction is in a block, whatever its depth
+	 * (issue #764). Reported separately from `confirmed`, which means the lock
+	 * depth: the pre-splice funding output is spent from the moment the splice
+	 * is mined, so a force close from here has to be planned against the new
+	 * funding, while splice_locked still waits for the depth.
+	 *
+	 * Returns whether anything changed, so the caller knows to persist.
+	 */
+	markSpliceSeenOnChain(height: number): boolean {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight || inflight.confirmedHeight === height) return false;
+		inflight.confirmedHeight = height;
+		return true;
+	}
+
+	/**
+	 * A reorg took the splice's confirmation back: the chain no longer has it
+	 * (issue #764). Nothing was adopted on the strength of that sighting - the
+	 * force close it enabled was a broadcast decision - so the whole retraction
+	 * is forgetting the height.
+	 */
+	clearSpliceSeenOnChain(): boolean {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight || inflight.confirmedHeight === undefined) return false;
+		inflight.confirmedHeight = undefined;
+		return true;
+	}
+
+	/**
+	 * The chain has the splice, at any depth: either it reached its lock depth
+	 * or it was merely seen in a block (issue #764). What every question of the
+	 * form "can this splice still be abandoned" has to ask, as opposed to
+	 * `confirmed`, which asks whether it may be locked.
+	 */
+	spliceSeenOnChain(): boolean {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight) return false;
+		return inflight.confirmed || inflight.confirmedHeight !== undefined;
+	}
+
+	/**
 	 * Handle channel_reestablish from remote (BOLT 2 §5).
 	 *
 	 * Full logic:
@@ -12168,7 +12372,10 @@ export class Channel {
 		inputIndex: number;
 	}): boolean {
 		const inflight = this._state.spliceInFlight;
-		if (!inflight || inflight.confirmed || inflight.localSpliceLocked) {
+		// Seen in a block counts, not just locked (issue #764): a splice the
+		// chain has taken is one a force close may already have broadcast
+		// against, and every revert path runs off this verdict.
+		if (!inflight || this.spliceSeenOnChain() || inflight.localSpliceLocked) {
 			return false;
 		}
 		if (inflight.conflict?.txid === conflict.txid) return false;
@@ -12234,7 +12441,11 @@ export class Channel {
 		const inflight = this._state.spliceInFlight;
 		if (!inflight) return refuse('no splice in flight');
 		if (!inflight.conflict) return refuse('the splice is not conflicted');
-		if (inflight.confirmed) return refuse('the splice tx confirmed');
+		// A conflict stamped before the chain took the splice does not survive
+		// it (issue #764): reverting a splice that is in a block would abandon
+		// the only funding output the channel has left, and a force close may
+		// already have broadcast against it.
+		if (this.spliceSeenOnChain()) return refuse('the splice tx confirmed');
 		if (inflight.localSpliceLocked) {
 			return refuse('splice_locked already sent');
 		}

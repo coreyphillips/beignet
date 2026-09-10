@@ -88,6 +88,15 @@ interface IWatchedFunding {
 	/** When the current run of absent answers began (ms since epoch). */
 	missingSince?: number;
 	/**
+	 * The block height a candidate of this watch was last seen confirmed at,
+	 * whatever the depth, and the candidate it was (issue #764). Drives the
+	 * edge-triggered 'funding:seen' / 'funding:unseen' pair, which report the
+	 * chain having the transaction at all, as opposed to 'funding:confirmed',
+	 * which reports it reaching `minimumDepth`.
+	 */
+	seenHeight?: number;
+	seenTxid?: string;
+	/**
 	 * Every funding tx this open may still confirm as (post-signatures RBF,
 	 * issue #360): the current attempt plus every superseded broadcastable
 	 * attempt. All attempts pay the same funding script (the funding pubkeys
@@ -389,6 +398,14 @@ export async function classifyRemoteFundingInput(
  * - 'funding:confirmed' (channelId: Buffer, txid: string): the watched txid
  *   (display byte order) that reached depth, so listeners can tell a splice
  *   confirmation from the original funding without trusting channel state
+ * - 'funding:seen' (channelId: Buffer, txid: string, height: number): the
+ *   watched txid (display byte order) is in a block, at whatever depth. The
+ *   fact 'funding:confirmed' does not carry: a splice spends the old funding
+ *   output the moment it is mined, while its lock waits for the depth (issue
+ *   #764). Edge-triggered, and re-fired at a new height
+ * - 'funding:unseen' (channelId: Buffer, txid: string): a transaction reported
+ *   by 'funding:seen' is not in a block any more (reorged back to the mempool,
+ *   or absent past the missing debounce)
  * - 'funding:spent' (channelId: Buffer, spendingTx: Transaction)
  * - 'funding:missing' (channelId: Buffer, txid: string): the watched funding
  *   tx disappeared from mempool AND chain before confirming (evicted/replaced).
@@ -430,39 +447,23 @@ export async function classifyRemoteFundingInput(
  * registers one (surfaced as node:error with code CHAIN_WATCHER_ERROR); a
  * consumer driving ChainWatcher directly must do the same.
  */
-/** A failed funding watch queued for retry */
+/**
+ * A failed funding watch queued for retry: the registration itself, which the
+ * retry re-subscribes in place. The watch is never rebuilt from its
+ * parameters, so nothing it knows is lost to a retry: the candidate set and
+ * the attempt lineage (a narrower re-arm would silently disable RBF
+ * discovery, issues #360 and #463), the sighting a restored record seeded
+ * (issue #764), and the absence debounce a watch that keeps failing to
+ * subscribe is still counting through the per-block scans.
+ *
+ * A queued failure must not be replayed once a NEWER registration for the
+ * same channel has taken its place: an RBF that re-armed the watch with the
+ * replacement's candidate set would otherwise be clobbered back to the stale
+ * set, and the attempt that actually confirmed would go unseen. Identity, not
+ * equality: the entry is replayable only while it is still the watch the
+ * registry holds.
+ */
 interface IFailedFundingWatch {
-	channelId: Buffer;
-	txid: string;
-	outputIndex: number;
-	minimumDepth: number;
-	scriptPubkey: Buffer;
-	/**
-	 * The full candidate set of the failed watch (post-signatures RBF): the
-	 * retry must re-arm ALL of it, or one transient subscription failure
-	 * would silently narrow the watch to the current attempt and a mined
-	 * older candidate would go unseen (and feed the funding-missing
-	 * watchdog instead).
-	 */
-	candidates?: Array<{ txid: string; outputIndex: number }>;
-	/**
-	 * Restored watches only: the attempt lineage discovery recognizes an
-	 * unnamed replacement by. Carried through the retry for the same reason
-	 * the candidate set is: a transient subscription failure must not
-	 * silently re-arm a narrower watch than the one that failed, which here
-	 * would disable discovery outright and leave the funding-missing watchdog
-	 * as the only outcome (issue #463).
-	 */
-	discoverAttemptInputs?: string[][];
-	/**
-	 * The registration this failure belongs to. A retry re-registers by map
-	 * overwrite, so a queued failure must not be replayed once a NEWER
-	 * registration for the same channel has taken its place: an RBF that
-	 * re-armed the watch with the replacement's candidate set would be
-	 * clobbered back to the stale set, and the attempt that actually
-	 * confirmed would go unseen. Identity, not equality: the entry is
-	 * replayable only while it is still the watch the map holds.
-	 */
 	watched: IWatchedFunding;
 }
 
@@ -708,7 +709,7 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	private isSupersededFundingWatch(entry: IFailedFundingWatch): boolean {
 		return (
-			this.watchedFundings.get(entry.channelId.toString('hex')) !==
+			this.watchedFundings.get(entry.watched.channelId.toString('hex')) !==
 			entry.watched
 		);
 	}
@@ -726,17 +727,8 @@ export class ChainWatcher extends EventEmitter {
 			this.failedFundingWatches = [];
 			for (const w of pending) {
 				if (this.isSupersededFundingWatch(w)) continue;
-				this.watchFundingOutput(
-					w.channelId,
-					w.txid,
-					w.outputIndex,
-					w.minimumDepth,
-					w.scriptPubkey,
-					undefined,
-					w.candidates,
-					w.discoverAttemptInputs
-				).catch(() => {
-					/* re-queued inside watchFundingOutput */
+				this.resubscribeFundingWatch(w, this.lifecycleGeneration).catch(() => {
+					/* re-queued inside resubscribeFundingWatch */
 				});
 			}
 		}
@@ -846,7 +838,13 @@ export class ChainWatcher extends EventEmitter {
 		// Restored records only: the input lineage of every attempt the record
 		// knows, to recognize a replacement it does not name (see
 		// discoverAttemptInputs).
-		discoverAttemptInputs?: string[][]
+		discoverAttemptInputs?: string[][],
+		// The sighting the caller's own durable record already holds (issue
+		// #764). 'funding:seen' / 'funding:unseen' are edge-triggered off the
+		// watch, so a watch re-armed with no prior sighting cannot retract one:
+		// a splice reorged out while the node was offline would leave the record
+		// naming a height the chain no longer has.
+		seenHeight?: number
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		const scriptHash = computeScriptHash(scriptPubkey);
@@ -861,6 +859,8 @@ export class ChainWatcher extends EventEmitter {
 			confirmed: false,
 			confirmationHeight: 0,
 			announcementTriggered: false,
+			seenHeight,
+			seenTxid: seenHeight !== undefined ? txid : undefined,
 			candidates: candidates?.length ? candidates : undefined,
 			script: scriptPubkey,
 			discoverAttemptInputs: discoverAttemptInputs?.length
@@ -887,20 +887,7 @@ export class ChainWatcher extends EventEmitter {
 				this.isCurrentGeneration(generation) &&
 				this.watchedFundings.get(key) === watched
 			) {
-				this.failedFundingWatches.push({
-					channelId,
-					txid,
-					outputIndex,
-					minimumDepth,
-					scriptPubkey,
-					// Defensive copy: the retry must re-arm the full candidate
-					// set, and the caller's array must not mutate under it.
-					candidates: candidates?.length
-						? candidates.map((c) => ({ ...c }))
-						: undefined,
-					discoverAttemptInputs,
-					watched
-				});
+				this.failedFundingWatches.push({ watched });
 			}
 			return;
 		}
@@ -920,6 +907,51 @@ export class ChainWatcher extends EventEmitter {
 		// (and possibly close) was confirmed while we were offline would otherwise
 		// not be reconciled until the next new block arrives. This mirrors the
 		// immediate checkFundingSpent() in watchFundingSpend().
+		try {
+			await this.checkFundingConfirmation(key, generation);
+		} catch (err) {
+			this.emitError(err);
+		}
+	}
+
+	/**
+	 * Re-arm the subscription of a funding watch whose attempt failed. The
+	 * watch is re-subscribed in place, never replaced: it is still the object
+	 * the registry holds, and everything it has learned stays with it.
+	 *
+	 * That matters because the per-block scan of an unconfirmed watch runs
+	 * whether or not its subscription is up, so a watch that keeps failing to
+	 * subscribe is still counting absent answers. Rebuilding it on every retry
+	 * reset that count: the three-check absence debounce never completed, a
+	 * splice reorged out while the node was down kept its sighting for good,
+	 * and a force close kept spending a funding the chain no longer had
+	 * (issue #764). The same retry used to drop the candidate set and the
+	 * attempt lineage unless each was carried by hand.
+	 */
+	private async resubscribeFundingWatch(
+		entry: IFailedFundingWatch,
+		generation: number
+	): Promise<void> {
+		const watched = entry.watched;
+		const key = watched.channelId.toString('hex');
+		const live = (): boolean =>
+			this.isCurrentGeneration(generation) &&
+			this.watchedFundings.get(key) === watched;
+		if (!live()) return;
+		try {
+			await this.backend.subscribeToScriptHash(watched.scriptHash, () => {
+				if (!this.isCurrentGeneration(generation)) return;
+				this.onFundingScriptHashChange(key, generation);
+			});
+		} catch {
+			// The same guard the first attempt applies: a watch retired while
+			// the subscription was in flight must not be revived on the next
+			// start.
+			if (live()) this.failedFundingWatches.push(entry);
+			return;
+		}
+		if (!live()) return;
+		// The immediate check the first attempt never got to.
 		try {
 			await this.checkFundingConfirmation(key, generation);
 		} catch (err) {
@@ -1582,17 +1614,8 @@ export class ChainWatcher extends EventEmitter {
 			this.failedFundingWatches = [];
 			for (const watch of pending) {
 				if (this.isSupersededFundingWatch(watch)) continue;
-				this.watchFundingOutput(
-					watch.channelId,
-					watch.txid,
-					watch.outputIndex,
-					watch.minimumDepth,
-					watch.scriptPubkey,
-					undefined,
-					watch.candidates,
-					watch.discoverAttemptInputs
-				).catch(() => {
-					// Still failing — already re-queued inside watchFundingOutput
+				this.resubscribeFundingWatch(watch, generation).catch(() => {
+					/* still failing: re-queued inside resubscribeFundingWatch */
 				});
 			}
 		}
@@ -1776,6 +1799,41 @@ export class ChainWatcher extends EventEmitter {
 		this.emit('funding:recovered', watched.channelId, watched.txid);
 	}
 
+	/**
+	 * A watched funding transaction is in a block, at whatever depth (issue
+	 * #764).
+	 *
+	 * Reported independently of `minimumDepth`, because for a splice the two
+	 * facts differ and both matter: the pre-splice funding output is spent the
+	 * moment the splice is mined, so a force close from then on has to spend
+	 * the new one, while splice_locked waits for the depth. Edge-triggered, and
+	 * re-fired if the transaction turns up at a different height (a reorg
+	 * re-mining it), so a consumer holding the height stays right.
+	 */
+	private reportFundingSeen(
+		watched: IWatchedFunding,
+		txid: string,
+		height: number
+	): void {
+		if (watched.seenTxid === txid && watched.seenHeight === height) return;
+		watched.seenTxid = txid;
+		watched.seenHeight = height;
+		this.emit('funding:seen', watched.channelId, txid, height);
+	}
+
+	/**
+	 * The counterpart: a transaction this watch reported in a block is not in
+	 * one any more. Edge-triggered, so a watch that never reported a sighting
+	 * emits nothing.
+	 */
+	private reportFundingUnseen(watched: IWatchedFunding): void {
+		if (watched.seenHeight === undefined) return;
+		const txid = watched.seenTxid ?? watched.txid;
+		watched.seenTxid = undefined;
+		watched.seenHeight = undefined;
+		this.emit('funding:unseen', watched.channelId, txid);
+	}
+
 	private async checkFundingConfirmation(
 		key: string,
 		// Defaults to the current generation for callers that ARE the start of
@@ -1896,6 +1954,9 @@ export class ChainWatcher extends EventEmitter {
 				!watched.missingReported
 			) {
 				watched.missingReported = true;
+				// Behind the same debounce as the alarm: a sighting is retracted
+				// only on an absence the watcher is prepared to call real.
+				this.reportFundingUnseen(watched);
 				this.emit('funding:missing', watched.channelId, watched.txid);
 			}
 			return;
@@ -1904,7 +1965,14 @@ export class ChainWatcher extends EventEmitter {
 		watched.appliedScanTicket = ticket;
 		this.clearMissingReport(watched);
 		const entry = entries.find((h) => h.height > 0);
-		if (!entry) return; // in the mempool, not yet confirmed
+		if (!entry) {
+			// In the mempool, not yet confirmed. For a watch that HAD reported a
+			// sighting this is a reorg taking the confirmation back, and it is
+			// the chain saying so directly rather than an absence (issue #764).
+			this.reportFundingUnseen(watched);
+			return;
+		}
+		this.reportFundingSeen(watched, entry.txid, entry.height);
 
 		// Calculate confirmations
 		const confirmations = this.currentBlockHeight - entry.height + 1;

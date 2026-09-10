@@ -91,6 +91,15 @@ export interface ISpliceInFlight {
 	/** Splice tx reached depth while we could not send splice_locked (disconnected). */
 	confirmed: boolean;
 	/**
+	 * Issue #764: the block height the splice transaction was first seen in,
+	 * whatever its depth. A separate fact from `confirmed`, which means the
+	 * lock depth: from the moment the splice is mined the pre-splice funding
+	 * output is spent, so a force close must be planned against the new one,
+	 * while `splice_locked` still waits for the depth. Cleared if a reorg
+	 * takes the confirmation back.
+	 */
+	confirmedHeight?: number;
+	/**
 	 * Issue #760: confirmations this splice must reach before we send
 	 * splice_locked, whatever the channel type. Set when the splice carries an
 	 * input this node does not vouch for (a stranger's direct funding into a
@@ -636,6 +645,19 @@ export interface IChannelState {
 	 */
 	spliceInFlight?: ISpliceInFlight | null;
 	/**
+	 * Issue #764: the splice (txid in internal byte order) that the commitment
+	 * this FORCE_CLOSED channel broadcast spends, when the chain had that
+	 * splice but it had not reached its lock depth. The channel itself was NOT
+	 * moved onto that funding - a one-confirmation splice can still be reorged
+	 * out - so this is the only record of which of the two fundings the close
+	 * on the network belongs to, and it is what tells a retraction that a
+	 * re-drive on the pre-splice funding is owed.
+	 *
+	 * Written by every force-close plan the channel applies, so a re-drive that
+	 * goes back to the old funding or forward to a real adoption clears it.
+	 */
+	closeSpendsSpliceTxid?: Buffer | null;
+	/**
 	 * Splice txs this node fully signed that the chain has not been seen to
 	 * take (issue #756). A zero-conf channel locks, and so adopts, a splice
 	 * right after tx_signatures, and `spliceInFlight` dies with the adoption;
@@ -1087,6 +1109,7 @@ export function createOpenerState(params: {
 		spliceFundingOutputIndex: 0,
 		preSpliceState: null,
 		spliceInFlight: null,
+		closeSpendsSpliceTxid: null,
 		unconfirmedSpliceTxs: [],
 
 		fundingVersion: 1,
@@ -1199,6 +1222,7 @@ export function createAcceptorState(params: {
 		spliceFundingOutputIndex: 0,
 		preSpliceState: null,
 		spliceInFlight: null,
+		closeSpendsSpliceTxid: null,
 		unconfirmedSpliceTxs: [],
 
 		fundingVersion: 1,

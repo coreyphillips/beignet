@@ -443,6 +443,8 @@ export interface ISerializedChannelState {
 	spliceFundingOutputIndex?: number;
 	preSpliceState?: string | null;
 	spliceInFlight?: ISerializedSpliceInFlight | null;
+	/** Issue #764: splice (internal hex) the broadcast force close spends. */
+	closeSpendsSpliceTxid?: string | null;
 	/** Issue #756: fully signed splice txs not yet seen confirmed (txid internal hex). */
 	unconfirmedSpliceTxs?: Array<{ txid: string; txHex: string }>;
 	/** Issue #760: splices reverted on a confirmed input conflict (display hex). */
@@ -564,6 +566,8 @@ export interface ISerializedSpliceInFlight {
 	localSpliceLocked: boolean;
 	remoteSpliceLocked: boolean;
 	confirmed: boolean;
+	/** Issue #764: height the splice was first seen in, below its lock depth. */
+	confirmedHeight?: number;
 	/** Issue #760: per-splice lock depth; absent on older rows. */
 	lockAtDepth?: number;
 	/** Issue #760: the confirmed competing spend of one of its inputs. */
@@ -609,6 +613,7 @@ export function serializeSpliceInFlight(
 		localSpliceLocked: f.localSpliceLocked,
 		remoteSpliceLocked: f.remoteSpliceLocked,
 		confirmed: f.confirmed,
+		confirmedHeight: f.confirmedHeight,
 		lockAtDepth: f.lockAtDepth,
 		conflict: f.conflict ? { ...f.conflict } : undefined
 	};
@@ -650,6 +655,7 @@ export function deserializeSpliceInFlight(
 		localSpliceLocked: s.localSpliceLocked,
 		remoteSpliceLocked: s.remoteSpliceLocked,
 		confirmed: s.confirmed,
+		confirmedHeight: s.confirmedHeight,
 		lockAtDepth: s.lockAtDepth,
 		conflict: s.conflict ? { ...s.conflict } : undefined
 	};
@@ -930,6 +936,7 @@ export function serializeChannelState(
 		spliceInFlight: s.spliceInFlight
 			? serializeSpliceInFlight(s.spliceInFlight)
 			: null,
+		closeSpendsSpliceTxid: bufToHex(s.closeSpendsSpliceTxid),
 		unconfirmedSpliceTxs: s.unconfirmedSpliceTxs?.length
 			? s.unconfirmedSpliceTxs.map((e) => ({
 					txid: e.txid.toString('hex'),
@@ -1347,6 +1354,9 @@ export function deserializeChannelState(
 		preSpliceState: (s.preSpliceState as ChannelState) || null,
 		spliceInFlight: s.spliceInFlight
 			? deserializeSpliceInFlight(s.spliceInFlight)
+			: null,
+		closeSpendsSpliceTxid: s.closeSpendsSpliceTxid
+			? hexToBuf(s.closeSpendsSpliceTxid)
 			: null,
 		unconfirmedSpliceTxs: s.unconfirmedSpliceTxs?.length
 			? s.unconfirmedSpliceTxs.map((e) => ({
