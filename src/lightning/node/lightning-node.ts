@@ -8956,17 +8956,6 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 
-			// Superseded funding outpoints whose expected splice spend is not yet
-			// irrevocable. Re-armed for EVERY channel, not just one with a live
-			// spliceInFlight: completeSplice clears that record at
-			// splice_locked, which on a zero-conf channel precedes the splice
-			// transaction confirming, so this list is the only thing that can
-			// bring the watch back (issue #479).
-			await this.armPreSpliceSpendWatches(
-				state.channelId || state.temporaryChannelId,
-				state
-			);
-
 			const inflight = state.spliceInFlight;
 			// ONLY past the point of no return. The shared input is the 2-of-2
 			// funding, so until OUR tx_signatures have left nobody can broadcast
@@ -8980,7 +8969,7 @@ export class LightningNode extends EventEmitter {
 			if (inflight && inflight.sentTxSignatures === true) {
 				// In-flight splice: watch the splice tx's new funding output IN
 				// ADDITION to the old one, which keeps its own spend coverage
-				// from the pre-splice leg armed above (the old output is
+				// from the pre-splice leg armed below (the old output is
 				// expected to be spent by the splice tx, and a stale
 				// confirmation re-fire would trigger a premature splice_locked).
 				// Also rebroadcast the fully-signed splice tx — the network may never
@@ -9007,11 +8996,24 @@ export class LightningNode extends EventEmitter {
 					// as a retraction (issue #764).
 					inflight.confirmedHeight
 				);
+				// AFTER that call, never before it: its own immediate check is
+				// what reconciles the seeded sighting against the chain, and a
+				// splice reorged out while we were offline has to retract there -
+				// moving the close back onto the pre-splice funding - before a
+				// spend scan of that funding reaches the monitor. A commitment
+				// classified while the monitor still holds the splice's view
+				// claims its HTLCs with the peer's second-level signatures for
+				// the other funding, which are invalid (issue #764).
+				await this.armPreSpliceSpendWatches(
+					state.channelId || state.temporaryChannelId,
+					state
+				);
 				// The new-outpoint watch above only arms spend detection once the
 				// splice tx confirms, so the OLD (still-confirmed) funding output
-				// has no spend subscription of its own. That watch is armed by
-				// the loop ABOVE, from the durable record, which the block ahead
-				// of it derives and persists for a row that predates the field.
+				// has no spend subscription of its own. That watch is the leg
+				// armed just above, from the durable record, which the block
+				// ahead of it derives and persists for a row that predates the
+				// field.
 				// Arming it here as well, without recording it, is what made a
 				// second restart come back blind once completeSplice had cleared
 				// spliceInFlight (issue #479).
@@ -9036,6 +9038,18 @@ export class LightningNode extends EventEmitter {
 				);
 				continue;
 			}
+
+			// Superseded funding outpoints whose expected splice spend is not yet
+			// irrevocable. Re-armed for EVERY channel, not just one with a live
+			// spliceInFlight: completeSplice clears that record at splice_locked,
+			// which on a zero-conf channel precedes the splice transaction
+			// confirming, so this list is the only thing that can bring the watch
+			// back (issue #479). The in-flight branch above arms them too, after
+			// its own watch.
+			await this.armPreSpliceSpendWatches(
+				state.channelId || state.temporaryChannelId,
+				state
+			);
 
 			const txidHex = Buffer.from(state.fundingTxid).reverse().toString('hex');
 

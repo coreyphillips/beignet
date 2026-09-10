@@ -1620,7 +1620,12 @@ export class ChainWatcher extends EventEmitter {
 					watch.scriptPubkey,
 					undefined,
 					watch.candidates,
-					watch.discoverAttemptInputs
+					watch.discoverAttemptInputs,
+					// Carried for the same reason recheckAllWatches carries it: a
+					// re-armed watch that knows of no sighting can never retract
+					// one, so a splice that leaves the chain stays marked as on it
+					// (issue #764).
+					watch.watched.seenHeight
 				).catch(() => {
 					// Still failing — already re-queued inside watchFundingOutput
 				});

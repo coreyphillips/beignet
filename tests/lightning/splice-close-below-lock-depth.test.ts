@@ -83,10 +83,17 @@ class ControlledBackend implements IChainBackend {
 	broadcasts: string[] = [];
 	history: Array<{ txid: string; height: number }> = [];
 	headerCallback: ((height: number) => void) | null = null;
+	/** Subscriptions to reject before serving them, one per call. */
+	failNextSubscribes = 0;
 	async subscribeToHeaders(cb: (height: number) => void): Promise<void> {
 		this.headerCallback = cb;
 	}
-	async subscribeToScriptHash(): Promise<void> {}
+	async subscribeToScriptHash(): Promise<void> {
+		if (this.failNextSubscribes > 0) {
+			this.failNextSubscribes--;
+			throw new Error('subscription refused');
+		}
+	}
 	async getScriptHashHistory(): Promise<
 		Array<{ txid: string; height: number }>
 	> {
@@ -263,6 +270,32 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 
 			backend.history = [{ txid: spliceTxid, height: 0 }];
 			await recheck();
+			expect(unseen).to.deep.equal([spliceTxid]);
+		});
+
+		it('keeps a restored sighting through a subscription retried on a block', async () => {
+			// The block retry re-arms the watch from the queued entry, so it has
+			// to carry the sighting exactly as the recheck retry does: a watch
+			// that knows of none can never retract one.
+			backend.headerCallback!(100);
+			backend.history = [{ txid: spliceTxid, height: 100 }];
+			backend.failNextSubscribes = 1;
+			await watcher.watchFundingOutput(
+				channelId,
+				spliceTxid,
+				0,
+				3,
+				fundingScript,
+				undefined,
+				undefined,
+				undefined,
+				100
+			);
+			await tick();
+
+			backend.history = [{ txid: spliceTxid, height: 0 }];
+			backend.headerCallback!(101);
+			await tick();
 			expect(unseen).to.deep.equal([spliceTxid]);
 		});
 	});
@@ -576,6 +609,49 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 				view.remoteCommitmentSignature.equals(sig),
 				"and carries that funding's signatures, which HTLC claims need"
 			).to.equal(true);
+			fx.destroy();
+		});
+
+		it('retracts a splice the chain lost before scanning the old funding', async () => {
+			const fx = await setup(7681);
+			const spliceTxid = graftDepthLockedSplice(fx.alice, fx.channelId);
+			fx.alice
+				.getChainWatcher()!
+				.emit('funding:seen', fx.channelId, display(spliceTxid), 500);
+			await tick();
+			expect(
+				fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice)).ok
+			).to.equal(true);
+
+			// The restart finds the splice back in the mempool: a reorg took it
+			// while the node was down. What the pre-splice funding's spend scan
+			// then reports is a commitment on the OLD funding, and the monitor
+			// classifies it against whatever view the close still names.
+			fx.backend.history = [{ txid: display(spliceTxid), height: 0 }];
+			let atLegArm: { height?: number; spends?: Buffer | null } | null = null;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const watcher = fx.alice.getChainWatcher()! as any;
+			watcher.watchFundingSpendDuringSplice = async (): Promise<void> => {
+				const state = fx.alice
+					.getChannelManager()
+					.getChannel(fx.channelId)!
+					.getFullState();
+				atLegArm = {
+					height: state.spliceInFlight?.confirmedHeight,
+					spends: state.closeSpendsSpliceTxid
+				};
+			};
+			await fx.alice.restoreChainWatches();
+
+			expect(atLegArm, 'the pre-splice leg was armed').to.not.equal(null);
+			expect(
+				atLegArm!.height,
+				'and by then the sighting is already retracted'
+			).to.equal(undefined);
+			expect(
+				atLegArm!.spends,
+				'with the close back on the funding that is unspent again'
+			).to.equal(null);
 			fx.destroy();
 		});
 
