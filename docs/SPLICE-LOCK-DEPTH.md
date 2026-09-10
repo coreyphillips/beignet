@@ -193,3 +193,11 @@ The same depth class the rest of the node treats as final.
   second channel. A reverted splice fails the request behind it.
 - Just-in-time receives: a held payment never rides a depth-locked splice; a
   hold arriving while any splice is pending fails fast with nothing fronted.
+- HTLC deadlines: the per-block backstops that force close to claim an inbound
+  HTLC whose preimage we hold, to time out an offered HTLC the peer sits on
+  past its expiry, or to move an unresolved forward on chain all run on a
+  SPLICING channel exactly as on NORMAL, in every phase of the splice (issue
+  #774). The close is planned against whichever funding the chain has. The
+  off-chain fail those scans prefer needs update traffic, which only the
+  pending-lock window of an ECDSA splice carries; before that the scans wait
+  for it rather than close, and the on-chain backstops stand behind them.
