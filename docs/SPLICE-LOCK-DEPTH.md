@@ -37,9 +37,8 @@ the depth exists to protect against.
 Requirements:
 
 - An acceptor MUST NOT honour a `lock_depth` larger than it is prepared to
-  wait: until the lock the channel cannot cooperatively close and a force
-  close cannot adopt the splice, so the depth is how long the initiator alone
-  could close the channel. Beignet honours at most 6
+  wait: until the lock the channel cannot cooperatively close, so the depth is
+  how long it has only a unilateral exit. Beignet honours at most 6
   (`SPLICE_LOCK_DEPTH_ACCEPT_MAX`), asks for at most 6, and answers a larger
   request with `tx_abort` before any input is added.
 - A node that sent or echoed `lock_depth` MUST NOT send `splice_locked` for
@@ -56,6 +55,32 @@ Requirements:
 Beignet: `ISpliceInFlight.lockAtDepth`, set through
 `LightningNode.spliceInWithInputs(..., { lockAtDepth })`; the direct-funding
 receiver sets it for an unpaired payer (`unpairedSpliceDepth`, default 3).
+
+### Closing inside the window (issue #764)
+
+Being on chain and being locked are two facts, and the close paths need the
+first one on its own. The moment the splice is mined the pre-splice funding
+output is spent, so every commitment built against it is unconfirmable, while
+`splice_locked` still owes the chain another `lock_depth - 1` blocks. An
+ordinary splice has the same window, between its first confirmation and
+`minimum_depth`.
+
+- The funding watch reports both: `funding:seen` (in a block, at any depth,
+  stamped on the record as `confirmedHeight`) and `funding:confirmed`
+  (`max(minimum_depth, lock_depth)` reached, which is what sends the lock).
+- A force close planned in the window is built against the SPLICE: the peer's
+  signature over the post-splice commitment is on the in-flight record, so the
+  commitment exists whether or not the lock was ever sent.
+- It is a broadcast decision, not an adoption. The channel stays on the
+  pre-splice funding, because a splice at one confirmation can still be reorged
+  out, and only an unmoved channel can still build the pre-splice commitment.
+  `closeSpendsSpliceTxid` records which of the two fundings the transaction on
+  the network spends; `funding:unseen` retracts the sighting and re-drives the
+  close on the old funding. The adoption proper still happens at the lock
+  depth, and re-drives the same close onto identical bytes.
+- Cooperative close still waits for the lock: `shutdown` is refused for the
+  whole SPLICING window rather than negotiating against a funding that can
+  change under the negotiation.
 
 ## 2. Conflicted-splice revert
 

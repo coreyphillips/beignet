@@ -103,6 +103,24 @@ export class ChainMonitor {
 	}
 
 	/**
+	 * Point the monitor at the channel view the close it is watching was built
+	 * from (issue #764).
+	 *
+	 * Normally the live channel object, so an adoption applied to it is seen
+	 * here for free. A close against a splice that is on chain but below its
+	 * lock depth is the exception: the channel deliberately stays on the
+	 * pre-splice funding, so the monitor is handed the plan's view instead, and
+	 * a re-drive that moves the close back (the splice was reorged out) or
+	 * forward (it locked, and the channel really adopted) has to hand back the
+	 * one that now describes the transaction on the network. The peer's
+	 * second-level HTLC signatures are what make the difference: they are
+	 * per-funding, and an HTLC claim built with the other funding's is invalid.
+	 */
+	setChannelState(channelState: IChannelState): void {
+		this._channelState = channelState;
+	}
+
+	/**
 	 * Update the destination script that sweeps pay into. Used when a
 	 * wallet-owned address becomes available after construction (e.g. once
 	 * Electrum connects), so recovered funds land in the tracked wallet rather

@@ -2584,7 +2584,13 @@ export class ChannelManager extends EventEmitter {
 		this._settleDetachedQueueAfterTerminalClose(idHex, detached);
 		this.emit('channel:force-closing', channelId, 'local');
 
-		const state = channel.getFullState();
+		// The view the broadcast commitment was built from. Live state, except
+		// for a close against a splice that is on chain but below its lock
+		// depth (issue #764): the channel deliberately stays on the pre-splice
+		// funding there, so anything that has to recognise the transaction we
+		// are broadcasting - the anchor CPFP child, the monitor's
+		// classification and sweeps - has to read the plan's view instead.
+		const state = plan.provisionalSpliceClose?.view ?? channel.getFullState();
 
 		// Anchor channels: the commitment is broadcast at a low feerate, so attach
 		// a wallet-funded CPFP child spending our local anchor to speed confirmation.
@@ -2601,7 +2607,9 @@ export class ChannelManager extends EventEmitter {
 		// An adoption is the exception: the plan moved the close onto a NEW
 		// funding outpoint, so the confirmed spend the monitor recorded belongs to
 		// the outpoint the channel just left and a monitor of the new one is
-		// exactly what is needed.
+		// exactly what is needed. A close against a splice below its lock depth
+		// is the same case (issue #764): the channel did not move, but the
+		// transaction we broadcast spends the new outpoint all the same.
 		//
 		// A confirmation this session has yet to re-prove keeps the monitor for
 		// the same reason: the record it holds is the only copy, and discarding
@@ -2613,6 +2621,7 @@ export class ChannelManager extends EventEmitter {
 			(existingMonitor.isCommitmentConfirmed() ||
 				existingMonitor.isCommitmentReverifyPending()) &&
 			plan.spliceAdoption === null &&
+			plan.provisionalSpliceClose === null &&
 			plan.v2Adoption === null
 		) {
 			monitor = existingMonitor;
@@ -10287,10 +10296,18 @@ export class ChannelManager extends EventEmitter {
 		if (existingCpfp && existingCpfp.action.commitmentTxid !== rebuiltTxid) {
 			this._pendingCommitmentCpfp.delete(idHex);
 		}
+		// The view the rebuild actually used: live state, or the plan's when
+		// the close spends a splice the channel has not moved onto (issue
+		// #764). Both the anchor child (priced from the capacity, keyed to the
+		// funding pubkey) and the monitor (which resolves this commitment's
+		// outputs) have to read the one that describes the transaction.
+		const rebuiltView =
+			channel.getForceCloseBroadcastView() ?? channel.getFullState();
+		monitor?.setChannelState(rebuiltView);
 		if (!this._pendingCommitmentCpfp.has(idHex)) {
 			this._maybeCpfpAnchorCommitment(
 				channelId,
-				channel.getFullState(),
+				rebuiltView,
 				actions,
 				feeRatePerVbyte
 			);

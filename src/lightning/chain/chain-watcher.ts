@@ -88,6 +88,15 @@ interface IWatchedFunding {
 	/** When the current run of absent answers began (ms since epoch). */
 	missingSince?: number;
 	/**
+	 * The block height a candidate of this watch was last seen confirmed at,
+	 * whatever the depth, and the candidate it was (issue #764). Drives the
+	 * edge-triggered 'funding:seen' / 'funding:unseen' pair, which report the
+	 * chain having the transaction at all, as opposed to 'funding:confirmed',
+	 * which reports it reaching `minimumDepth`.
+	 */
+	seenHeight?: number;
+	seenTxid?: string;
+	/**
 	 * Every funding tx this open may still confirm as (post-signatures RBF,
 	 * issue #360): the current attempt plus every superseded broadcastable
 	 * attempt. All attempts pay the same funding script (the funding pubkeys
@@ -389,6 +398,14 @@ export async function classifyRemoteFundingInput(
  * - 'funding:confirmed' (channelId: Buffer, txid: string): the watched txid
  *   (display byte order) that reached depth, so listeners can tell a splice
  *   confirmation from the original funding without trusting channel state
+ * - 'funding:seen' (channelId: Buffer, txid: string, height: number): the
+ *   watched txid (display byte order) is in a block, at whatever depth. The
+ *   fact 'funding:confirmed' does not carry: a splice spends the old funding
+ *   output the moment it is mined, while its lock waits for the depth (issue
+ *   #764). Edge-triggered, and re-fired at a new height
+ * - 'funding:unseen' (channelId: Buffer, txid: string): a transaction reported
+ *   by 'funding:seen' is not in a block any more (reorged back to the mempool,
+ *   or absent past the missing debounce)
  * - 'funding:spent' (channelId: Buffer, spendingTx: Transaction)
  * - 'funding:missing' (channelId: Buffer, txid: string): the watched funding
  *   tx disappeared from mempool AND chain before confirming (evicted/replaced).
@@ -1776,6 +1793,41 @@ export class ChainWatcher extends EventEmitter {
 		this.emit('funding:recovered', watched.channelId, watched.txid);
 	}
 
+	/**
+	 * A watched funding transaction is in a block, at whatever depth (issue
+	 * #764).
+	 *
+	 * Reported independently of `minimumDepth`, because for a splice the two
+	 * facts differ and both matter: the pre-splice funding output is spent the
+	 * moment the splice is mined, so a force close from then on has to spend
+	 * the new one, while splice_locked waits for the depth. Edge-triggered, and
+	 * re-fired if the transaction turns up at a different height (a reorg
+	 * re-mining it), so a consumer holding the height stays right.
+	 */
+	private reportFundingSeen(
+		watched: IWatchedFunding,
+		txid: string,
+		height: number
+	): void {
+		if (watched.seenTxid === txid && watched.seenHeight === height) return;
+		watched.seenTxid = txid;
+		watched.seenHeight = height;
+		this.emit('funding:seen', watched.channelId, txid, height);
+	}
+
+	/**
+	 * The counterpart: a transaction this watch reported in a block is not in
+	 * one any more. Edge-triggered, so a watch that never reported a sighting
+	 * emits nothing.
+	 */
+	private reportFundingUnseen(watched: IWatchedFunding): void {
+		if (watched.seenHeight === undefined) return;
+		const txid = watched.seenTxid ?? watched.txid;
+		watched.seenTxid = undefined;
+		watched.seenHeight = undefined;
+		this.emit('funding:unseen', watched.channelId, txid);
+	}
+
 	private async checkFundingConfirmation(
 		key: string,
 		// Defaults to the current generation for callers that ARE the start of
@@ -1896,6 +1948,9 @@ export class ChainWatcher extends EventEmitter {
 				!watched.missingReported
 			) {
 				watched.missingReported = true;
+				// Behind the same debounce as the alarm: a sighting is retracted
+				// only on an absence the watcher is prepared to call real.
+				this.reportFundingUnseen(watched);
 				this.emit('funding:missing', watched.channelId, watched.txid);
 			}
 			return;
@@ -1904,7 +1959,14 @@ export class ChainWatcher extends EventEmitter {
 		watched.appliedScanTicket = ticket;
 		this.clearMissingReport(watched);
 		const entry = entries.find((h) => h.height > 0);
-		if (!entry) return; // in the mempool, not yet confirmed
+		if (!entry) {
+			// In the mempool, not yet confirmed. For a watch that HAD reported a
+			// sighting this is a reorg taking the confirmation back, and it is
+			// the chain saying so directly rather than an absence (issue #764).
+			this.reportFundingUnseen(watched);
+			return;
+		}
+		this.reportFundingSeen(watched, entry.txid, entry.height);
 
 		// Calculate confirmations
 		const confirmations = this.currentBlockHeight - entry.height + 1;
