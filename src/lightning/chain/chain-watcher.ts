@@ -92,7 +92,8 @@ interface IWatchedFunding {
 	 * whatever the depth, and the candidate it was (issue #764). Drives the
 	 * edge-triggered 'funding:seen' / 'funding:unseen' pair, which report the
 	 * chain having the transaction at all, as opposed to 'funding:confirmed',
-	 * which reports it reaching `minimumDepth`.
+	 * which reports it reaching `minimumDepth`. A sighting is also what turns
+	 * the spend scan on below that depth (issue #775).
 	 */
 	seenHeight?: number;
 	seenTxid?: string;
@@ -497,6 +498,19 @@ const MAX_BROADCAST_RETRIES = 12;
  * while we were disconnected self-heals to NORMAL within this window.
  */
 const RECHECK_INTERVAL_MS = 60_000;
+
+/**
+ * What a confirmation scan hands the spend scan it starts (issue #775): the
+ * outpoint it actually saw in a block, since a watch below `minimumDepth`
+ * may still name another RBF attempt, and the history it already holds, so
+ * both verdicts come from one round trip. The history is safe to reuse only
+ * because the caller starts the spend scan synchronously after applying its
+ * own verdict: the spend ticket is then taken in verdict order.
+ */
+interface IFundingSpendScanInput {
+	outpoint?: { txid: string; outputIndex: number };
+	history?: Array<{ txid: string; height: number }>;
+}
 
 /** Spend-scan arbitration state for one channel. */
 interface IChannelSpendScan {
@@ -962,8 +976,8 @@ export class ChainWatcher extends EventEmitter {
 	/**
 	 * Watch an ALREADY-CONFIRMED funding output for a hostile spend, ignoring one
 	 * expected txid. Used for the pre-splice funding output during an in-flight
-	 * splice: the new-outpoint watch (watchFundingOutput, keyed by channelId) only
-	 * arms spend detection once the SPLICE tx confirms, so the old output would
+	 * splice: the new-outpoint watch (watchFundingOutput, keyed by channelId)
+	 * scans only the NEW outpoint for spends, so the old output would
 	 * otherwise have no spend subscription. A peer that evicts our low-feerate
 	 * splice from the mempool and broadcasts a revoked pre-splice commitment
 	 * spends the old outpoint with a different txid, which this detects and routes
@@ -1753,8 +1767,9 @@ export class ChainWatcher extends EventEmitter {
 
 	/**
 	 * Route a funding script hash notification to whichever check the watch is
-	 * still waiting on: the confirmation before minimumDepth, and after it the
-	 * spend that closes the channel.
+	 * still waiting on: the confirmation before minimumDepth (which, from the
+	 * first sighting in a block, also scans the same history for the spend,
+	 * issue #775), and after it the spend that closes the channel.
 	 *
 	 * One callback covers both phases so each watch subscribes its script hash
 	 * exactly once. It first existed because the Electrum client answered a
@@ -1998,23 +2013,25 @@ export class ChainWatcher extends EventEmitter {
 		}
 		this.reportFundingSeen(watched, entry.txid, entry.height);
 
+		// The candidate the chain has. Re-read the candidate set from the
+		// watch: discovery above can have bound an outpoint the set computed
+		// at the top of this method never held, and indexing that stale array
+		// threw rather than adopting.
+		const active = watched.candidates?.length
+			? watched.candidates
+			: [{ txid: watched.txid, outputIndex: watched.outputIndex }];
+		const seen = active.find((c) => c.txid === entry.txid);
+		if (!seen) return;
+
 		// Calculate confirmations
 		const confirmations = this.currentBlockHeight - entry.height + 1;
 		if (confirmations >= watched.minimumDepth) {
 			// Adopt the winning candidate into the watch itself, so spend
 			// detection and the announcement proof key off the tx that is
-			// actually on chain. Re-read the candidate set from the watch:
-			// discovery above can have bound an outpoint the set computed at
-			// the top of this method never held, and indexing that stale array
-			// threw rather than adopting.
-			const active = watched.candidates?.length
-				? watched.candidates
-				: [{ txid: watched.txid, outputIndex: watched.outputIndex }];
-			const winner = active.find((c) => c.txid === entry.txid);
-			if (!winner) return;
+			// actually on chain.
 			watched.appliedScanTicket = ticket;
-			watched.txid = winner.txid;
-			watched.outputIndex = winner.outputIndex;
+			watched.txid = seen.txid;
+			watched.outputIndex = seen.outputIndex;
 			watched.candidates = undefined;
 			watched.confirmed = true;
 			watched.confirmationHeight = entry.height;
@@ -2024,12 +2041,25 @@ export class ChainWatcher extends EventEmitter {
 				watched.txid
 			);
 			this.emit('funding:confirmed', watched.channelId, watched.txid);
-
-			// Now watch for the funding output being spent (force close detection)
-			this.watchFundingSpend(watched, generation, key).catch((err) => {
-				this.emitError(err);
-			});
 		}
+
+		// Watch for the funding output being spent (force close detection)
+		// from the first sighting, not from minimumDepth (issue #775): a
+		// commitment mined in the blocks between the two used to go
+		// unreported until the depth branch ran its first scan, up to five
+		// blocks for a depth-locked splice. Every check that finds the funding
+		// in a block scans, against the candidate it saw, on the history it
+		// already holds. Started synchronously here, with no await between
+		// the verdict applied above and the ticket the scan takes, which is
+		// what makes reusing that history sound. A mempool or absent answer
+		// returned above, so a sighting a reorg took back scans nothing until
+		// the transaction is mined again.
+		this.watchFundingSpend(watched, generation, key, {
+			outpoint: seen,
+			history
+		}).catch((err) => {
+			this.emitError(err);
+		});
 	}
 
 	/**
@@ -2181,13 +2211,17 @@ export class ChainWatcher extends EventEmitter {
 		// held in watchedFundings, the pre-splice legs included since issue
 		// #479, and the map-identity guard the key enables is what retires a
 		// scan whose watch was replaced or whose channel is gone.
-		key: string
+		key: string,
+		// From a confirmation scan: the outpoint it saw and the history it
+		// holds (issue #775). Absent for the legs, which scan for themselves.
+		input?: IFundingSpendScanInput
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		// No subscription of its own. Every watch reaching this method already
 		// holds one whose callback dispatches by phase
 		// (onFundingScriptHashChange): the channel watches from
-		// watchFundingOutput, the pre-splice legs from
+		// watchFundingOutput, which reaches here from the first sighting of
+		// the funding in a block (issue #775), the pre-splice legs from
 		// watchFundingSpendDuringSplice. The backend delivers a notification
 		// to EVERY callback registered for a script hash (issue #478), so a
 		// second subscription here made each notification start two identical
@@ -2204,7 +2238,7 @@ export class ChainWatcher extends EventEmitter {
 		// pending-broadcast retries and the reconnect monitor with it. The scan
 		// itself keeps throwing for its other launch sites, which catch.
 		try {
-			await this.checkFundingSpent(watched, generation, key);
+			await this.checkFundingSpent(watched, generation, key, input);
 		} catch (err) {
 			this.emitError(err as Error);
 		}
@@ -2219,7 +2253,8 @@ export class ChainWatcher extends EventEmitter {
 		// Registry key of this watch. Required: a pre-splice leg is held in
 		// watchedFundings under its own per-outpoint key since issue #479, so
 		// there is no longer a watch this cannot be compared against.
-		key: string
+		key: string,
+		input?: IFundingSpendScanInput
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		// Whatever this scan concludes is only safe to apply while it is still
@@ -2234,7 +2269,15 @@ export class ChainWatcher extends EventEmitter {
 		// The ticket is taken here, before the first await, because it records
 		// when this scan's evidence was gathered.
 		const idHex = watched.channelId.toString('hex');
-		const outKey = `${watched.txid}:${watched.outputIndex}`;
+		// The outpoint this scan is evidence about: the one the confirmation
+		// scan saw in a block, when it started this scan below minimumDepth
+		// (the watch may still name another RBF attempt there), else the
+		// watch's own (issue #775).
+		const outpoint = input?.outpoint ?? {
+			txid: watched.txid,
+			outputIndex: watched.outputIndex
+		};
+		const outKey = `${outpoint.txid}:${outpoint.outputIndex}`;
 		const ticket = this.beginSpendScan(idHex);
 		const superseded = (): boolean =>
 			!this.isCurrentGeneration(generation) ||
@@ -2242,7 +2285,9 @@ export class ChainWatcher extends EventEmitter {
 			this.spendScanOvertaken(idHex, ticket) ||
 			this.outpointScanOvertaken(idHex, outKey, ticket);
 
-		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
+		const history =
+			input?.history ??
+			(await this.backend.getScriptHashHistory(watched.scriptHash));
 		if (superseded()) return;
 
 		// Look for the transaction that spends our funding output. The script's
@@ -2268,7 +2313,7 @@ export class ChainWatcher extends EventEmitter {
 		const expectedSpender = this.expectedSpenderFor(watched);
 
 		for (const entry of history) {
-			if (entry.txid === watched.txid) continue;
+			if (entry.txid === outpoint.txid) continue;
 			// A legitimate splice spends the pre-splice funding output; only a
 			// DIFFERENT spender (a revoked/force-close commitment) is a breach.
 			if (expectedSpender !== undefined && entry.txid === expectedSpender) {
@@ -2285,10 +2330,10 @@ export class ChainWatcher extends EventEmitter {
 			const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
 
 			// Verify this tx actually spends our funding output
-			const spendsOurs = spendingTx.ins.some((input) => {
-				const inputTxid = Buffer.from(input.hash).reverse().toString('hex');
+			const spendsOurs = spendingTx.ins.some((txIn) => {
+				const inputTxid = Buffer.from(txIn.hash).reverse().toString('hex');
 				return (
-					inputTxid === watched.txid && input.index === watched.outputIndex
+					inputTxid === outpoint.txid && txIn.index === outpoint.outputIndex
 				);
 			});
 			if (!spendsOurs) continue;
@@ -2311,7 +2356,7 @@ export class ChainWatcher extends EventEmitter {
 				// only thing that lets a retraction be scoped correctly after a
 				// restart (issue #479). Last in the list because the arguments
 				// before it are a published API this must not renumber.
-				{ txid: watched.txid, outputIndex: watched.outputIndex }
+				{ txid: outpoint.txid, outputIndex: outpoint.outputIndex }
 			);
 			this.emit('funding:spent', watched.channelId, spendingTx);
 			return;
@@ -2347,10 +2392,10 @@ export class ChainWatcher extends EventEmitter {
 			const rawIgnored = await this.backend.getTransaction(ignoredSpend.txid);
 			if (superseded()) return;
 			const ignoredTx = bitcoin.Transaction.fromBuffer(rawIgnored);
-			const spendsOurs = ignoredTx.ins.some((input) => {
-				const inputTxid = Buffer.from(input.hash).reverse().toString('hex');
+			const spendsOurs = ignoredTx.ins.some((txIn) => {
+				const inputTxid = Buffer.from(txIn.hash).reverse().toString('hex');
 				return (
-					inputTxid === watched.txid && input.index === watched.outputIndex
+					inputTxid === outpoint.txid && txIn.index === outpoint.outputIndex
 				);
 			});
 			if (spendsOurs && this.watchedFundings.get(key) === watched) {
@@ -2391,8 +2436,8 @@ export class ChainWatcher extends EventEmitter {
 			this.channelManager.handleFundingSpendAbsent?.(
 				watched.channelId,
 				{
-					txid: watched.txid,
-					outputIndex: watched.outputIndex,
+					txid: outpoint.txid,
+					outputIndex: outpoint.outputIndex,
 					// The channel-scoped answer, not this watch's own field: during
 					// the splice window the channel's own watch shares the leg's
 					// expected spender, and without it here that watch would offer
