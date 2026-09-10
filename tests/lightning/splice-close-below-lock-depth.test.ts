@@ -17,13 +17,21 @@ import {
 	IChainBackend
 } from '../../src/lightning/chain/chain-watcher';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
+import { CommitmentType } from '../../src/lightning/chain/types';
+import { computeScriptHash } from '../../src/lightning/chain/chain-watcher';
+import { createFundingScript } from '../../src/lightning/script/funding';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
-import { ISpliceInFlight } from '../../src/lightning/channel/channel-state';
+import {
+	IChannelState,
+	ISpliceInFlight
+} from '../../src/lightning/channel/channel-state';
 import { ChannelSigner } from '../../src/lightning/keys/signer';
 import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
@@ -82,6 +90,10 @@ function makeNodeConfig(seedId: number): INodeConfig {
 class ControlledBackend implements IChainBackend {
 	broadcasts: string[] = [];
 	history: Array<{ txid: string; height: number }> = [];
+	/** Histories by script hash, consulted before the shared one above. */
+	histories = new Map<string, Array<{ txid: string; height: number }>>();
+	/** Raw transactions served by display-order txid. */
+	txs = new Map<string, Buffer>();
 	headerCallback: ((height: number) => void) | null = null;
 	/** Subscriptions to reject before serving them, one per call. */
 	failNextSubscribes = 0;
@@ -94,13 +106,15 @@ class ControlledBackend implements IChainBackend {
 			throw new Error('subscription refused');
 		}
 	}
-	async getScriptHashHistory(): Promise<
-		Array<{ txid: string; height: number }>
-	> {
-		return this.history;
+	async getScriptHashHistory(
+		scriptHash: string
+	): Promise<Array<{ txid: string; height: number }>> {
+		return this.histories.get(scriptHash) ?? this.history;
 	}
-	async getTransaction(): Promise<Buffer> {
-		throw new Error('not needed');
+	async getTransaction(txid: string): Promise<Buffer> {
+		const raw = this.txs.get(txid);
+		if (!raw) throw new Error('not needed');
+		return raw;
 	}
 	async broadcastTransaction(hex: string): Promise<string> {
 		this.broadcasts.push(hex);
@@ -298,6 +312,40 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 			await tick();
 			expect(unseen).to.deep.equal([spliceTxid]);
 		});
+
+		it('retracts a restored sighting through retries that never subscribe', async () => {
+			// A watch whose subscription keeps failing is still scanned every
+			// block, and the absences it keeps finding have to accumulate on the
+			// SAME watch. A retry that rebuilt the watch reset the debounce each
+			// time, so the retraction never came and a close kept spending a
+			// funding the chain no longer had.
+			backend.headerCallback!(100);
+			backend.history = [];
+			backend.failNextSubscribes = Number.MAX_SAFE_INTEGER;
+			await watcher.watchFundingOutput(
+				channelId,
+				spliceTxid,
+				0,
+				3,
+				fundingScript,
+				undefined,
+				undefined,
+				undefined,
+				100
+			);
+			await tick();
+			const missing: string[] = [];
+			watcher.on('funding:missing', (_id: Buffer, txid: string) =>
+				missing.push(txid)
+			);
+
+			for (const height of [101, 102, 103]) {
+				backend.headerCallback!(height);
+				await tick();
+			}
+			expect(unseen, 'the sighting is retracted').to.deep.equal([spliceTxid]);
+			expect(missing, 'and the absence is alarmed').to.deep.equal([spliceTxid]);
+		});
 	});
 
 	describe('the close a node can build in the window', () => {
@@ -316,10 +364,14 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 			destroy: () => void;
 		}
 
-		async function setup(seedBase: number): Promise<IFixture> {
+		async function setup(
+			seedBase: number,
+			storage?: SqliteStorage
+		): Promise<IFixture> {
 			const backend = new ControlledBackend();
 			const configA = makeNodeConfig(seedBase);
 			configA.chainBackend = backend;
+			if (storage) configA.storage = storage;
 			const alice = new LightningNode(configA);
 			const bob = new LightningNode(makeNodeConfig(seedBase + 1));
 			for (const node of [alice, bob]) {
@@ -406,15 +458,28 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 			channelId: Buffer
 		): Buffer {
 			const channel = node.getChannelManager().getChannel(channelId)!;
-			const spliceTxid = crypto.randomBytes(32);
 			const peer = new ChannelSigner(PEER_FUNDING_PRIV);
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			const raw = channel.getFullState() as any;
+			// A real transaction, spending the old funding into the new one: a
+			// restart parses the hex back into the splice session.
+			const spliceTx = new bitcoin.Transaction();
+			spliceTx.version = 2;
+			spliceTx.addInput(Buffer.from(raw.fundingTxid), raw.fundingOutputIndex);
+			spliceTx.addOutput(
+				createFundingScript(
+					raw.localBasepoints.fundingPubkey,
+					peer.fundingPubkey,
+					bitcoin.networks.regtest
+				).p2wshOutput,
+				1_000_000
+			);
+			const spliceTxid = Buffer.from(spliceTx.getHash());
 			raw.spliceInFlight = {
 				spliceTxid,
 				newFundingOutputIndex: 0,
 				newFundingSatoshis: 1_000_000n,
-				spliceTxHex: '',
+				spliceTxHex: spliceTx.toHex(),
 				fullySigned: true,
 				isInitiator: true,
 				localRelativeSatoshis: 0n,
@@ -652,6 +717,149 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 				atLegArm!.spends,
 				'with the close back on the funding that is unspent again'
 			).to.equal(null);
+			fx.destroy();
+		});
+
+		it('retracts the splice when the old funding is confirmed spent by something else', async () => {
+			const fx = await setup(7701);
+			const forced = fx.alice.forceCloseChannel(
+				fx.channelId,
+				destScript(fx.alice)
+			);
+			expect(forced.ok, forced.error).to.equal(true);
+			const oldClose = bitcoin.Transaction.fromHex(
+				fx.backend.broadcasts[fx.backend.broadcasts.length - 1]
+			);
+			expect(Buffer.from(oldClose.ins[0].hash).equals(fx.fundingTxid)).to.equal(
+				true
+			);
+			const spliceTxid = graftDepthLockedSplice(fx.alice, fx.channelId);
+			fx.alice
+				.getChainWatcher()!
+				.emit('funding:seen', fx.channelId, display(spliceTxid), 500);
+			await tick();
+			const channel = fx.alice.getChannelManager().getChannel(fx.channelId)!;
+			expect(
+				channel.getFullState().closeSpendsSpliceTxid?.equals(spliceTxid),
+				'the close on the network now spends the splice'
+			).to.equal(true);
+
+			// The restart finds the splice gone and OUR first close confirmed
+			// on the pre-splice funding: a reorg dropped the splice and let the
+			// old commitment in. The splice watch's first scan cannot retract
+			// a full absence (that takes three, behind a debounce), so the
+			// old funding's own spend report is what carries the news, and it
+			// must be classified against the funding it actually spent.
+			const state = channel.getFullState();
+			const oldFundingHash = computeScriptHash(
+				createFundingScript(
+					state.localBasepoints.fundingPubkey,
+					state.remoteBasepoints!.fundingPubkey,
+					bitcoin.networks.regtest
+				).p2wshOutput
+			);
+			fx.backend.history = [];
+			fx.backend.histories.set(oldFundingHash, [
+				{ txid: oldClose.getId(), height: 105 }
+			]);
+			fx.backend.txs.set(oldClose.getId(), oldClose.toBuffer());
+			await fx.alice.restoreChainWatches();
+			await tick(60);
+
+			const after = channel.getFullState();
+			expect(
+				after.closeSpendsSpliceTxid,
+				'the close is back on the pre-splice funding'
+			).to.equal(null);
+			expect(
+				after.spliceInFlight!.confirmedHeight,
+				'and the sighting is retracted'
+			).to.equal(undefined);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const monitor = (fx.alice.getChannelManager() as any).monitors.get(
+				fx.channelId.toString('hex')
+			);
+			expect(
+				monitor._channelState.fundingTxid.equals(fx.fundingTxid),
+				'the monitor reads the view of the funding the confirmed close spends'
+			).to.equal(true);
+			expect(
+				monitor.getFullState().commitmentBroadcast?.commitmentType
+			).to.equal(CommitmentType.OUR_COMMITMENT);
+			expect(monitor.isCommitmentConfirmed()).to.equal(true);
+			fx.destroy();
+		});
+
+		it('restores the monitor from the view the close spends, before deriving anything', async () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const fx = await setup(7711, storage);
+			const spliceTxid = graftDepthLockedSplice(fx.alice, fx.channelId);
+			fx.alice
+				.getChainWatcher()!
+				.emit('funding:seen', fx.channelId, display(spliceTxid), 500);
+			await tick();
+			expect(
+				fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice)).ok
+			).to.equal(true);
+			await tick();
+			const idHex = fx.channelId.toString('hex');
+			const channel = fx.alice.getChannelManager().getChannel(fx.channelId)!;
+			const sig = channel.getFullState().spliceInFlight!.remoteCommitmentSig!;
+			// What the crash leaves behind: the channel row with the durable
+			// marker, and the monitor watching the provisional close.
+			storage.saveChannel(idHex, channel.getFullState(), fx.bob.getNodeId());
+			storage.saveChainMonitor(
+				idHex,
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(fx.alice.getChannelManager() as any).monitors.get(idHex).getFullState()
+			);
+
+			// restore() rebuilds held sweeps and repairs the revoked snapshot
+			// from the state it is handed, so the view has to be that state,
+			// not one swapped in afterwards.
+			const seenByRestore: IChannelState[] = [];
+			const restore = ChainMonitor.restore;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(ChainMonitor as any).restore = (
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				saved: any,
+				state: IChannelState,
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				...rest: any[]
+			): ChainMonitor => {
+				seenByRestore.push(state);
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				return (restore as any).call(ChainMonitor, saved, state, ...rest);
+			};
+			let alice2: LightningNode;
+			try {
+				const config = makeNodeConfig(7711);
+				config.storage = storage;
+				alice2 = new LightningNode(config);
+			} finally {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(ChainMonitor as any).restore = restore;
+			}
+			alice2.on('error', () => {});
+			alice2.on('node:error', () => {});
+
+			expect(seenByRestore.length, 'one monitor restored').to.equal(1);
+			expect(
+				seenByRestore[0].fundingTxid!.equals(spliceTxid),
+				'restore derives from the funding the close on the network spends'
+			).to.equal(true);
+			expect(
+				seenByRestore[0].remoteCommitmentSignature!.equals(sig),
+				"and carries that funding's signatures"
+			).to.equal(true);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const monitor2 = (alice2.getChannelManager() as any).monitors.get(idHex);
+			expect(
+				monitor2._channelState.fundingTxid.equals(spliceTxid),
+				'which is the view the restored monitor holds'
+			).to.equal(true);
+			alice2.destroy();
 			fx.destroy();
 		});
 

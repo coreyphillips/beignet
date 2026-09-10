@@ -2682,12 +2682,45 @@ export class ChannelManager extends EventEmitter {
 	): ChainAction[] {
 		const channelIdHex = channelId.toString('hex');
 		let monitor = this.monitors.get(channelIdHex);
+		const owner = this.channels.get(channelIdHex);
+
+		// Which funding the spend consumed decides the view the monitor
+		// classifies it against (issue #764): the peer's second-level HTLC
+		// signatures are per-funding, so a commitment on the splice output is
+		// only readable from the spliced view, and a confirmed commitment on
+		// the pre-splice output is the chain saying the splice is not in it,
+		// whatever sighting the channel still holds. Done before the monitor
+		// exists or classifies, so nothing is derived from the wrong view.
+		const reconciled =
+			owner && spentOutpoint
+				? owner.closeViewForSpentOutpoint(spentOutpoint, blockHeight > 0)
+				: null;
+		if (reconciled?.changed && owner) {
+			// The durable record moved (a sighting retracted, or the splice
+			// named as what the close spends), and the state machine below
+			// may not flip, so the persist cannot ride 'channel:closed'.
+			const peerPubkey = this.findPeerForChannel(owner);
+			if (peerPubkey) {
+				this.emit('channel:persist', {
+					channel: owner,
+					peerPubkey,
+					channelId
+				} as IChannelPersistEvent);
+			}
+		}
 
 		if (!monitor) {
-			const channel = this.channels.get(channelIdHex);
+			const channel = owner;
 			if (!channel) return [];
 
-			const state = channel.getFullState();
+			// The view the close on the network answers to: the reconciled
+			// one, else whatever the durable record says the close spends
+			// (a restart restoring a FORCE_CLOSED channel with no monitor
+			// yet), else live state.
+			const state =
+				reconciled?.view ??
+				channel.getForceCloseBroadcastView() ??
+				channel.getFullState();
 			// Prefer explicitly-passed secrets, then the channel's per-channel keys,
 			// then node-level base secrets. Per-channel keys are essential here: on a
 			// remote force-close our balance sits in the to_remote output, which is
@@ -2713,6 +2746,8 @@ export class ChannelManager extends EventEmitter {
 			);
 			this.monitors.set(channelIdHex, monitor);
 			this._seedMonitorPreimages(channelIdHex, monitor);
+		} else if (reconciled?.view) {
+			monitor.setChannelState(reconciled.view);
 		}
 
 		// Captured BEFORE the report so a DEMOTION (a confirmed spend pushed back

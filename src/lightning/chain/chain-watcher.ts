@@ -447,39 +447,23 @@ export async function classifyRemoteFundingInput(
  * registers one (surfaced as node:error with code CHAIN_WATCHER_ERROR); a
  * consumer driving ChainWatcher directly must do the same.
  */
-/** A failed funding watch queued for retry */
+/**
+ * A failed funding watch queued for retry: the registration itself, which the
+ * retry re-subscribes in place. The watch is never rebuilt from its
+ * parameters, so nothing it knows is lost to a retry: the candidate set and
+ * the attempt lineage (a narrower re-arm would silently disable RBF
+ * discovery, issues #360 and #463), the sighting a restored record seeded
+ * (issue #764), and the absence debounce a watch that keeps failing to
+ * subscribe is still counting through the per-block scans.
+ *
+ * A queued failure must not be replayed once a NEWER registration for the
+ * same channel has taken its place: an RBF that re-armed the watch with the
+ * replacement's candidate set would otherwise be clobbered back to the stale
+ * set, and the attempt that actually confirmed would go unseen. Identity, not
+ * equality: the entry is replayable only while it is still the watch the
+ * registry holds.
+ */
 interface IFailedFundingWatch {
-	channelId: Buffer;
-	txid: string;
-	outputIndex: number;
-	minimumDepth: number;
-	scriptPubkey: Buffer;
-	/**
-	 * The full candidate set of the failed watch (post-signatures RBF): the
-	 * retry must re-arm ALL of it, or one transient subscription failure
-	 * would silently narrow the watch to the current attempt and a mined
-	 * older candidate would go unseen (and feed the funding-missing
-	 * watchdog instead).
-	 */
-	candidates?: Array<{ txid: string; outputIndex: number }>;
-	/**
-	 * Restored watches only: the attempt lineage discovery recognizes an
-	 * unnamed replacement by. Carried through the retry for the same reason
-	 * the candidate set is: a transient subscription failure must not
-	 * silently re-arm a narrower watch than the one that failed, which here
-	 * would disable discovery outright and leave the funding-missing watchdog
-	 * as the only outcome (issue #463).
-	 */
-	discoverAttemptInputs?: string[][];
-	/**
-	 * The registration this failure belongs to. A retry re-registers by map
-	 * overwrite, so a queued failure must not be replayed once a NEWER
-	 * registration for the same channel has taken its place: an RBF that
-	 * re-armed the watch with the replacement's candidate set would be
-	 * clobbered back to the stale set, and the attempt that actually
-	 * confirmed would go unseen. Identity, not equality: the entry is
-	 * replayable only while it is still the watch the map holds.
-	 */
 	watched: IWatchedFunding;
 }
 
@@ -725,7 +709,7 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	private isSupersededFundingWatch(entry: IFailedFundingWatch): boolean {
 		return (
-			this.watchedFundings.get(entry.channelId.toString('hex')) !==
+			this.watchedFundings.get(entry.watched.channelId.toString('hex')) !==
 			entry.watched
 		);
 	}
@@ -743,22 +727,8 @@ export class ChainWatcher extends EventEmitter {
 			this.failedFundingWatches = [];
 			for (const w of pending) {
 				if (this.isSupersededFundingWatch(w)) continue;
-				this.watchFundingOutput(
-					w.channelId,
-					w.txid,
-					w.outputIndex,
-					w.minimumDepth,
-					w.scriptPubkey,
-					undefined,
-					w.candidates,
-					w.discoverAttemptInputs,
-					// Carried through for the same reason the candidate set is:
-					// the retry must not re-arm a watch that knows less than the
-					// one that failed, and a lost sighting is one it can never
-					// retract (issue #764).
-					w.watched.seenHeight
-				).catch(() => {
-					/* re-queued inside watchFundingOutput */
+				this.resubscribeFundingWatch(w, this.lifecycleGeneration).catch(() => {
+					/* re-queued inside resubscribeFundingWatch */
 				});
 			}
 		}
@@ -917,20 +887,7 @@ export class ChainWatcher extends EventEmitter {
 				this.isCurrentGeneration(generation) &&
 				this.watchedFundings.get(key) === watched
 			) {
-				this.failedFundingWatches.push({
-					channelId,
-					txid,
-					outputIndex,
-					minimumDepth,
-					scriptPubkey,
-					// Defensive copy: the retry must re-arm the full candidate
-					// set, and the caller's array must not mutate under it.
-					candidates: candidates?.length
-						? candidates.map((c) => ({ ...c }))
-						: undefined,
-					discoverAttemptInputs,
-					watched
-				});
+				this.failedFundingWatches.push({ watched });
 			}
 			return;
 		}
@@ -950,6 +907,51 @@ export class ChainWatcher extends EventEmitter {
 		// (and possibly close) was confirmed while we were offline would otherwise
 		// not be reconciled until the next new block arrives. This mirrors the
 		// immediate checkFundingSpent() in watchFundingSpend().
+		try {
+			await this.checkFundingConfirmation(key, generation);
+		} catch (err) {
+			this.emitError(err);
+		}
+	}
+
+	/**
+	 * Re-arm the subscription of a funding watch whose attempt failed. The
+	 * watch is re-subscribed in place, never replaced: it is still the object
+	 * the registry holds, and everything it has learned stays with it.
+	 *
+	 * That matters because the per-block scan of an unconfirmed watch runs
+	 * whether or not its subscription is up, so a watch that keeps failing to
+	 * subscribe is still counting absent answers. Rebuilding it on every retry
+	 * reset that count: the three-check absence debounce never completed, a
+	 * splice reorged out while the node was down kept its sighting for good,
+	 * and a force close kept spending a funding the chain no longer had
+	 * (issue #764). The same retry used to drop the candidate set and the
+	 * attempt lineage unless each was carried by hand.
+	 */
+	private async resubscribeFundingWatch(
+		entry: IFailedFundingWatch,
+		generation: number
+	): Promise<void> {
+		const watched = entry.watched;
+		const key = watched.channelId.toString('hex');
+		const live = (): boolean =>
+			this.isCurrentGeneration(generation) &&
+			this.watchedFundings.get(key) === watched;
+		if (!live()) return;
+		try {
+			await this.backend.subscribeToScriptHash(watched.scriptHash, () => {
+				if (!this.isCurrentGeneration(generation)) return;
+				this.onFundingScriptHashChange(key, generation);
+			});
+		} catch {
+			// The same guard the first attempt applies: a watch retired while
+			// the subscription was in flight must not be revived on the next
+			// start.
+			if (live()) this.failedFundingWatches.push(entry);
+			return;
+		}
+		if (!live()) return;
+		// The immediate check the first attempt never got to.
 		try {
 			await this.checkFundingConfirmation(key, generation);
 		} catch (err) {
@@ -1612,22 +1614,8 @@ export class ChainWatcher extends EventEmitter {
 			this.failedFundingWatches = [];
 			for (const watch of pending) {
 				if (this.isSupersededFundingWatch(watch)) continue;
-				this.watchFundingOutput(
-					watch.channelId,
-					watch.txid,
-					watch.outputIndex,
-					watch.minimumDepth,
-					watch.scriptPubkey,
-					undefined,
-					watch.candidates,
-					watch.discoverAttemptInputs,
-					// Carried for the same reason recheckAllWatches carries it: a
-					// re-armed watch that knows of no sighting can never retract
-					// one, so a splice that leaves the chain stays marked as on it
-					// (issue #764).
-					watch.watched.seenHeight
-				).catch(() => {
-					// Still failing — already re-queued inside watchFundingOutput
+				this.resubscribeFundingWatch(watch, generation).catch(() => {
+					/* still failing: re-queued inside resubscribeFundingWatch */
 				});
 			}
 		}

@@ -2857,9 +2857,20 @@ export class LightningNode extends EventEmitter {
 				const perCh = this.channelManager.getMonitorSigningKeys(
 					Buffer.from(channelId, 'hex')
 				);
+				// A close against a splice the channel never moved onto (issue
+				// #764) is watching a commitment that live state does not
+				// describe: the peer's second-level HTLC signatures are
+				// per-funding, so claims built from the pre-splice view are
+				// invalid. Live state unless the durable record says the close
+				// spends the splice. Handed to restore itself, not swapped in
+				// afterwards: restore rebuilds the held sweeps and repairs the
+				// revoked snapshot from the state it is given, and a swap after
+				// the fact re-derives nothing.
+				const monitorView =
+					channel.getForceCloseBroadcastView() ?? channelState;
 				const monitor = ChainMonitor.restore(
 					monitorState,
-					channelState,
+					monitorView,
 					destinationScript,
 					10, // safe default fee rate (sat/vbyte), updated when fee estimator resolves
 					// Mirror the create path (channel-manager) EXACTLY so a restored
@@ -2879,14 +2890,6 @@ export class LightningNode extends EventEmitter {
 						this.fundingPrivkey,
 					perCh?.htlcBasepointSecret || this.htlcBasepointSecret
 				);
-				// A close broadcast against a splice the channel never moved onto
-				// (issue #764) is watching a commitment that live state does not
-				// describe: the peer's second-level HTLC signatures are
-				// per-funding, so claims built from the pre-splice view are
-				// invalid. Null unless the durable record says this close spends
-				// the splice.
-				const broadcastView = channel.getForceCloseBroadcastView();
-				if (broadcastView) monitor.setChannelState(broadcastView);
 				this.channelManager.restoreMonitor(channelId, monitor);
 
 				// Older monitor state could mark a revoked close fully resolved

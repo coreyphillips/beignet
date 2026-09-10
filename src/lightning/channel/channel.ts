@@ -6017,18 +6017,20 @@ export class Channel {
 	}
 
 	/**
-	 * The view the commitment this channel last broadcast as a force close was
-	 * built from, when that is NOT live state (issue #764): a close against a
-	 * splice the chain has but that has not reached its lock depth leaves the
-	 * channel on the pre-splice funding. Whatever has to recognise the
-	 * broadcast transaction - the anchor CPFP child above all - reads this
-	 * rather than the channel. Null whenever live state is the answer.
+	 * The view the close on the network was built from, when that is NOT live
+	 * state (issue #764): a close against a splice the chain has but that has
+	 * not reached its lock depth leaves the channel on the pre-splice funding.
+	 * Ours, planned provisionally, or the peer's, seen spending the splice
+	 * output (closeViewForSpentOutpoint). Whatever has to recognise that
+	 * transaction - the anchor CPFP child, the monitor's classification and
+	 * sweeps - reads this rather than the channel. Null whenever live state is
+	 * the answer.
 	 */
 	getForceCloseBroadcastView(): IChannelState | null {
 		if (this._forceCloseBroadcastView) return this._forceCloseBroadcastView;
 		// The in-memory view dies with the process, and a restart inside the
 		// window restores everything else from live (pre-splice) state. Rebuild
-		// it from the durable record of which funding the broadcast close
+		// it from the durable record of which funding the close on the network
 		// spends, which is what that record is for: without it a restored
 		// monitor claims HTLCs with the other funding's signatures and the CPFP
 		// child prices the parent fee off the wrong capacity.
@@ -6040,6 +6042,73 @@ export class Channel {
 		const adoption = this._computeSpliceAdoption();
 		if (!adoption?.fundingTxid?.equals(spends)) return null;
 		return { ...this._state, ...adoption } as IChannelState;
+	}
+
+	/**
+	 * The view describing the funding a reported spend consumed, with the
+	 * durable record made to agree (issue #764). The monitor classifies the
+	 * spend and builds every claim from the view it holds, and the peer's
+	 * second-level HTLC signatures are per-funding, so the view has to name
+	 * the funding the transaction actually spent, whatever the channel
+	 * believed a moment earlier:
+	 *
+	 * - A spend of the in-flight splice's own output is a close on the
+	 *   post-splice commitment: ours, planned provisionally, or the peer's.
+	 *   The spliced view describes it, and `closeSpendsSpliceTxid` is stamped
+	 *   so a restart rebuilds the same view (getForceCloseBroadcastView).
+	 * - A CONFIRMED spend of the pre-splice funding by anything but the
+	 *   splice is the chain saying the splice is not in it: the outpoint the
+	 *   splice would consume went to something else. A sighting of the splice,
+	 *   and a close planned against it, are retracted here, ahead of the
+	 *   watcher's absence debounce, because this evidence is direct. Live
+	 *   state is the view. A mempool sighting is left alone: it is re-reported
+	 *   on confirmation, and the monitor builds nothing from it before then.
+	 *
+	 * Null leaves the monitor's view as it is. `changed` says the durable
+	 * record moved, so the caller persists.
+	 */
+	closeViewForSpentOutpoint(
+		outpoint: { txid: string; outputIndex: number },
+		confirmed: boolean
+	): { view: IChannelState | null; changed: boolean } {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight) return { view: null, changed: false };
+		const spliceTxidHex = Buffer.from(inflight.spliceTxid)
+			.reverse()
+			.toString('hex');
+		if (
+			outpoint.txid === spliceTxidHex &&
+			outpoint.outputIndex === inflight.newFundingOutputIndex
+		) {
+			const adoption = this.spliceAdoptedRemoteSignature()
+				? this._computeSpliceAdoption()
+				: null;
+			if (!adoption?.fundingTxid?.equals(inflight.spliceTxid)) {
+				// Nothing to build the spliced view from. Live state it is,
+				// and the classification is as right as it can be.
+				return { view: null, changed: false };
+			}
+			const view = { ...this._state, ...adoption } as IChannelState;
+			const changed = !this._state.closeSpendsSpliceTxid?.equals(
+				inflight.spliceTxid
+			);
+			this._state.closeSpendsSpliceTxid = Buffer.from(inflight.spliceTxid);
+			this._forceCloseBroadcastView = view;
+			return { view, changed };
+		}
+		const funding = this._state.fundingTxid;
+		const preSplice =
+			funding !== null &&
+			outpoint.txid === Buffer.from(funding).reverse().toString('hex') &&
+			outpoint.outputIndex === this._state.fundingOutputIndex;
+		if (!preSplice || !confirmed) return { view: null, changed: false };
+		const retracted =
+			this.clearSpliceSeenOnChain() ||
+			this._state.closeSpendsSpliceTxid != null ||
+			this._forceCloseBroadcastView !== null;
+		this._state.closeSpendsSpliceTxid = null;
+		this._forceCloseBroadcastView = null;
+		return { view: this._state, changed: retracted };
 	}
 
 	/**
