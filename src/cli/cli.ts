@@ -21,6 +21,7 @@ import {
 	getDaemonPort
 } from './config';
 import { startDaemon } from './daemon';
+import { daemonOptions } from './daemon-options';
 import { defaultDataDirForMnemonic } from './beignet-node';
 import { performDbRestore } from './restore';
 import { InstanceLockError } from './instance-lock';
@@ -486,55 +487,7 @@ async function handleStart(): Promise<void> {
 	const isDaemon = hasFlag('--daemon');
 
 	try {
-		const { stop } = await startDaemon({
-			mnemonic: config.mnemonic,
-			network: config.network,
-			alias: config.alias,
-			dataDir: config.dataDir,
-			electrumHost: config.electrumHost,
-			electrumPort: config.electrumPort,
-			electrumTls: config.electrumTls,
-			electrumServers: config.electrumServers,
-			feeEstimationSource: config.feeEstimationSource,
-			listenPort: config.listenPort,
-			websocketPort: config.websocketPort,
-			daemonPort,
-			daemonHost: config.daemonHost,
-			preferAnchors: config.preferAnchors,
-			largeChannels: config.largeChannels,
-			apiToken: config.apiToken,
-			apiKeys: config.apiKeys,
-			backupPath: config.backupPath,
-			backupIntervalMs: config.backupIntervalMs,
-			dailySpendLimitSats: config.dailySpendLimitSats,
-			tlsCert: config.tlsCert,
-			tlsKey: config.tlsKey,
-			torProxy: config.torProxy,
-			announceAddresses: config.announceAddresses,
-			watchtowers: config.watchtowers,
-			htlcEvents: config.htlcEvents,
-			metricsPublic: config.metricsPublic,
-			insecure: config.insecure,
-			forwardingEnabled: config.forwardingEnabled,
-			eagerGossipVerify: config.eagerGossipVerify,
-			autoReconnect: config.autoReconnect,
-			logLevel: config.logLevel,
-			recoveryMode: config.recoveryMode,
-			recoveryGuardians: config.recoveryGuardians,
-			recoveryProfile: config.recoveryProfile,
-			recoveryLeaseCheckIntervalMs: config.recoveryLeaseCheckIntervalMs,
-			recoveryReestablishHoldMs: config.recoveryReestablishHoldMs,
-			recoveryAutoApply: config.recoveryAutoApply,
-			recoveryAutoApplySettleMs: config.recoveryAutoApplySettleMs,
-			recoveryAutoApplyMaxWaitMs: config.recoveryAutoApplyMaxWaitMs,
-			routingFeeBaseMsat: config.routingFeeBaseMsat,
-			routingFeePpm: config.routingFeePpm,
-			routingCltvDelta: config.routingCltvDelta,
-			leaseRates: config.leaseRates,
-			jitReceive: config.jitReceive,
-			dfRelay: config.dfRelay,
-			dfMinAmountSat: config.dfMinAmountSat
-		});
+		const { stop } = await startDaemon(daemonOptions(config, daemonPort));
 
 		writePidFile(process.pid, daemonPort);
 		output({

@@ -12,10 +12,15 @@ const daemonSrc = fs.readFileSync(
 	path.join(__dirname, '../../src/cli/daemon.ts'),
 	'utf8'
 );
-const cliSrc = fs.readFileSync(
-	path.join(__dirname, '../../src/cli/cli.ts'),
-	'utf8'
-);
+// The start command's config-to-options mapping lives in its own module (so a
+// test can reach it without cli.ts running main()), and the wiring assertions
+// below read it as part of the CLI's source.
+const cliSrc =
+	fs.readFileSync(path.join(__dirname, '../../src/cli/cli.ts'), 'utf8') +
+	fs.readFileSync(
+		path.join(__dirname, '../../src/cli/daemon-options.ts'),
+		'utf8'
+	);
 
 /**
  * Routes that intentionally have no CLI command (documented in
