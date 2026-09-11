@@ -133,7 +133,12 @@ import {
 } from '../shapes';
 import { Electrum } from '../electrum';
 import { Transaction } from '../transaction';
-import { GAP_LIMIT, GAP_LIMIT_CHANGE, TRANSACTION_DEFAULTS } from './constants';
+import {
+	GAP_LIMIT,
+	GAP_LIMIT_CHANGE,
+	STOP_REFRESH_WAIT_MS,
+	TRANSACTION_DEFAULTS
+} from './constants';
 import { btcToSats } from '../utils/conversion';
 import { ILogger, createConsoleLogger } from '../logger';
 
@@ -695,23 +700,68 @@ export class Wallet {
 
 	/**
 	 * Stops the wallet. Use this method to prepare the wallet to be de
+	 * @param {number} [refreshTimeout] How long to wait for an in-flight refresh, in ms.
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async stop(): Promise<Result<string>> {
+	public async stop({
+		refreshTimeout = STOP_REFRESH_WAIT_MS
+	}: { refreshTimeout?: number } = {}): Promise<Result<string>> {
+		let abandonedRefresh = false;
 		try {
-			// if we are refreshing, we need to wait for it to finish
-			if (this.isRefreshing) {
-				await this.refreshWallet();
+			try {
+				// if we are refreshing, we need to wait for it to finish
+				if (this.isRefreshing) {
+					abandonedRefresh = !(await this._waitForRefresh(refreshTimeout));
+				}
+			} finally {
+				// However the wait above ended, the teardown runs: a shutdown that
+				// leaves the socket and the message callback live is worse than one
+				// that abandons a read.
+				//
+				// disable onMessage callback
+				this.disableMessages = true;
+				// disable saving to storage
+				this._setData = undefined;
+				// disconnect from Electrum
+				await this.electrum.disconnect();
 			}
-			// disable onMessage callback
-			this.disableMessages = true;
-			// disable saving to storage
-			this._setData = undefined;
-			// disconnect from Electrum
-			await this.electrum.disconnect();
+			if (abandonedRefresh) {
+				const message = `Wallet stopped, abandoning a refresh that did not finish within ${refreshTimeout}ms.`;
+				this.logger.warn(message);
+				return ok(message);
+			}
 			return ok('Wallet stopped.');
 		} catch (e) {
 			return err(e);
+		}
+	}
+
+	/**
+	 * Waits for the refresh in flight, for at most `timeout` ms. Resolves true
+	 * when the refresh settled first, false when the deadline did.
+	 *
+	 * Never rejects, and never cancels: the refresh keeps running, its writes
+	 * dropped by the cleared _setData, and the resolver queued here stays on
+	 * _pendingRefreshPromises to be collected with the wallet. See
+	 * STOP_REFRESH_WAIT_MS for why the wait has to be bounded at all.
+	 * @private
+	 */
+	private async _waitForRefresh(timeout: number): Promise<boolean> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<boolean>((resolve) => {
+			timer = setTimeout(() => resolve(false), timeout);
+		});
+		try {
+			return await Promise.race([
+				this.refreshWallet().then(
+					() => true,
+					// A refresh that threw is a refresh that is over.
+					() => true
+				),
+				deadline
+			]);
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 
