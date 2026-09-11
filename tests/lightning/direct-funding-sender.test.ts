@@ -42,6 +42,7 @@ import {
 	flush,
 	FakeSenderWallet,
 	ISignRequestOptions,
+	ITestCoin,
 	ITestRequest,
 	makeCoin,
 	memoryStorage,
@@ -493,6 +494,70 @@ describe('Direct funding sender: coin selection', () => {
 		);
 		const result = await sender.send(request.encoded, { amountSat: 100_000n });
 		expect(result.spentTxid).to.equal(large.txidHex);
+	});
+
+	/** A sender over `coins`, with `spent` already gone from the chain's view. */
+	function senderOver(
+		coins: ITestCoin[],
+		spent: ITestCoin[] = []
+	): {
+		wallet: FakeSenderWallet;
+		sender: DirectFundingSender;
+		request: ITestRequest;
+	} {
+		const wallet = new FakeSenderWallet(coins);
+		for (const coin of spent)
+			wallet.spentOutpoints.add(`${coin.txidHex}:${coin.vout}`);
+		const request = mintRequest();
+		const lane = new ScriptedReceiverLane(request, acceptingReceiver(request));
+		const sender = new DirectFundingSender(
+			{
+				wallet,
+				registry: registryWith(lane),
+				payments: new DirectFundingPaymentStore({ storage: memoryStorage() }),
+				chainHash: (): Buffer => REGTEST_HASH
+			},
+			{ offerResendDelaysMs: [], receiptTimeoutMs: 100 }
+		);
+		return { wallet, sender, request };
+	}
+
+	it('skips the coin it already spent and offers the one it still has', async () => {
+		// The shape of the real failure: this wallet paid on chain moments ago,
+		// its own list has not caught up, and the coin it calls largest is the
+		// one that payment spent. Offering it burns a session and one of the
+		// request's capped attempts for a coin the receiver declines on sight.
+		const spentLargest = makeCoin(300_000);
+		const change = makeCoin(200_000);
+		const h = senderOver([spentLargest, change], [spentLargest]);
+		const result = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.spentTxid).to.equal(change.txidHex);
+	});
+
+	it('refuses locally, and says so, when every large enough coin is spent', async () => {
+		const gone = makeCoin(300_000);
+		const h = senderOver([gone], [gone]);
+		const err = await refusal(
+			h.sender.send(h.request.encoded, { amountSat: 100_000n })
+		);
+		expect(err.code).to.equal(DirectFundingErrorCode.NO_SUITABLE_UTXO);
+		// Named, because "no suitable coin" for a wallet that visibly holds one
+		// is the confusing half of this failure.
+		expect(err.message).to.contain('already been spent on chain');
+	});
+
+	it('still offers when the chain cannot answer, and lets the receiver decide', async () => {
+		// Refusing to pay because our own view is incomplete is the worse
+		// failure: a lagging or unreachable server must not ground the payer.
+		const coin = makeCoin(300_000);
+		const h = senderOver([coin]);
+		h.wallet.spentCheckFails = true;
+		const result = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.spentTxid).to.equal(coin.txidHex);
 	});
 });
 

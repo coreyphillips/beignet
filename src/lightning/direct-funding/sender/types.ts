@@ -144,6 +144,22 @@ export interface IDfSenderWallet {
 	/** Coins this wallet can spend right now: unfrozen, of a supported kind. */
 	listSpendable(): IDfSenderCoin[];
 	/**
+	 * Whether the chain says this coin is already spent.
+	 *
+	 * `listSpendable` answers from the wallet's own view of its coins, which
+	 * trails the chain: a coin this wallet spent moments ago can still be in it.
+	 * Offering one costs a whole session and a capped request attempt, and the
+	 * receiver declines it from chain truth, so the same question is worth
+	 * asking here first.
+	 *
+	 * Answer true only on positive evidence of a spend. An unreachable or
+	 * lagging chain source must answer false: refusing to pay because our own
+	 * view is incomplete is the worse failure, and the receiver checks again.
+	 *
+	 * Optional, so a wallet with no chain source behaves as it did before.
+	 */
+	spentOnChain?(coin: IDfSenderCoin): Promise<boolean>;
+	/**
 	 * One coin by outpoint, FROZEN ONES INCLUDED. Resuming needs it: a run that
 	 * died between reserving a coin and recording its witness leaves the payer's
 	 * own freeze behind, and a spendable-only lookup would read that as a coin
@@ -357,6 +373,8 @@ export interface IDfPaymentRecord {
 export const DF_LOG_SEND_STARTED = 'df_send_started';
 export const DF_LOG_SEND_REPLAYED = 'df_send_replayed';
 export const DF_LOG_SEND_REFUSED = 'df_send_refused';
+/** A coin this wallet still lists that the chain has already seen spent. */
+export const DF_LOG_SEND_COIN_SPENT = 'df_send_coin_spent';
 export const DF_LOG_SEND_COMMITTED = 'df_send_committed';
 export const DF_LOG_SEND_COMPLETED = 'df_send_completed';
 export const DF_LOG_SEND_CAVEAT = 'df_send_caveat';

@@ -171,8 +171,22 @@ export class FakeSenderWallet implements IDfSenderWallet {
 		for (const outpoint of freezes?.load() ?? []) this.frozen.add(outpoint);
 	}
 
+	/**
+	 * Outpoints the chain has seen spent, whatever `coins` still lists. A real
+	 * wallet's coin list trails the chain, which is how a coin it spent moments
+	 * ago can still be offered.
+	 */
+	readonly spentOutpoints = new Set<string>();
+	/** Make the chain check unavailable, the way a dropped Electrum socket is. */
+	spentCheckFails = false;
+
 	listSpendable(): IDfSenderCoin[] {
 		return this.coins.filter((c) => !this.frozen.has(`${c.txidHex}:${c.vout}`));
+	}
+
+	async spentOnChain(coin: IDfSenderCoin): Promise<boolean> {
+		if (this.spentCheckFails) throw new Error('chain source unavailable');
+		return this.spentOutpoints.has(`${coin.txidHex}:${coin.vout}`);
 	}
 
 	findCoin(txidHex: string, vout: number): IDfSenderCoin | null {

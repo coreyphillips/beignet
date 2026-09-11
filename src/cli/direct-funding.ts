@@ -24,6 +24,7 @@ import {
 	scriptKind,
 	taprootTweakPrivateKey
 } from '../lightning/wallet/wallet-funding-provider';
+import { computeScriptHash } from '../lightning/chain/chain-watcher';
 import { schnorrSign } from '../lightning/offer/schnorr';
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import {
@@ -117,6 +118,52 @@ export function directFundingWallet(
 				});
 			}
 			return coins;
+		},
+
+		/**
+		 * Whether the chain has already seen this coin spent.
+		 *
+		 * Deliberately the same shape as the receiver's own check, and
+		 * deliberately conservative in the same direction: absent from the
+		 * unspent set is not evidence on its own, because a server that has not
+		 * indexed the script yet answers exactly that. Only an absent coin whose
+		 * parent transaction is CONFIRMED in that script's history is a spend we
+		 * will act on. Anything else, including an unreachable server, answers
+		 * false and lets the offer go: the receiver checks again, and refusing to
+		 * pay because our own view is incomplete is the worse failure.
+		 */
+		async spentOnChain(coin: IDfSenderCoin): Promise<boolean> {
+			const scriptHash = computeScriptHash(coin.script);
+			const unspent = await wallet.electrum
+				.listUnspentAddressScriptHashes({
+					addresses: {
+						[scriptHash]: {
+							index: 0,
+							path: '',
+							address: '',
+							scriptHash,
+							publicKey: ''
+						}
+					}
+				})
+				.catch(() => null);
+			if (!unspent || unspent.isErr()) return false;
+			const utxos = unspent.value.utxos ?? [];
+			if (
+				utxos.some((u) => u.tx_hash === coin.txidHex && u.tx_pos === coin.vout)
+			) {
+				return false;
+			}
+			const history = await wallet.electrum
+				.getAddressScriptHashesHistory([scriptHash])
+				.catch(() => null);
+			if (!history || history.isErr()) return false;
+			for (const entry of history.value.data ?? []) {
+				for (const tx of entry.result ?? []) {
+					if (tx.tx_hash === coin.txidHex) return (tx.height ?? 0) > 0;
+				}
+			}
+			return false;
 		},
 
 		findCoin(txidHex: string, vout: number): IDfSenderCoin | null {
