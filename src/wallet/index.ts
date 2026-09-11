@@ -703,7 +703,8 @@ export class Wallet {
 
 	/**
 	 * Stops the wallet. Use this method to prepare the wallet to be de
-	 * @param {number} [refreshTimeout] How long to wait for an in-flight refresh, in ms.
+	 * @param {Object} [options]
+	 * @param {number} [options.refreshTimeout] How long to wait for an in-flight refresh, in ms.
 	 * @returns {Promise<Result<string>>}
 	 */
 	public async stop({
@@ -919,11 +920,20 @@ export class Wallet {
 		scanAllAddresses: boolean;
 		additionalAddresses: string[];
 	}): Promise<Result<IWalletData>> {
+		// stop() abandons the refresh it timed out on rather than cancelling it,
+		// so every step boundary below is a point that refresh can wake up on the
+		// far side of the teardown. Each remaining step reaches Electrum, and
+		// those calls dial whenever connectedToElectrum is false, which clears
+		// Electrum's own _disconnected flag and leaves a socket running behind a
+		// wallet that has shut down.
+		const stopped = 'Wallet stopped.';
 		await this.setZeroIndexAddresses();
+		if (this._stopped) return err(stopped);
 		const r1 = await this.updateAddressIndexes();
 		if (r1.isErr()) {
 			return err(r1.error.message);
 		}
+		if (this._stopped) return err(stopped);
 		const r2 = await this.getUtxos({
 			scanningStrategy: scanAllAddresses ? EScanningStrategy.all : undefined,
 			additionalAddresses
@@ -931,10 +941,12 @@ export class Wallet {
 		if (r2.isErr()) {
 			return err(r2.error.message);
 		}
+		if (this._stopped) return err(stopped);
 		const r3 = await this.updateTransactions({ scanAllAddresses });
 		if (r3.isErr()) {
 			return err(r3.error.message);
 		}
+		if (this._stopped) return err(stopped);
 		await this.electrum.subscribeToAddresses();
 		return ok(this.data);
 	}

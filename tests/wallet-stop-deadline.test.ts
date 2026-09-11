@@ -93,6 +93,8 @@ describe('stop() refresh deadline', function () {
 	let getUtxosStub: sinon.SinonStub;
 	let setZeroIndexStub: sinon.SinonStub;
 	let updateAddressIndexesStub: sinon.SinonStub;
+	let updateTransactionsStub: sinon.SinonStub;
+	let subscribeStub: sinon.SinonStub;
 	let disconnectStub: sinon.SinonStub;
 	/** Releases whatever refresh is parked in getUtxos. */
 	let releaseRefresh: () => void = () => undefined;
@@ -127,10 +129,12 @@ describe('stop() refresh deadline', function () {
 			.stub(wallet as unknown as TWalletInternals, 'updateAddressIndexes')
 			.resolves(ok('stubbed'));
 		getUtxosStub = sinon.stub(wallet, 'getUtxos');
-		sinon
+		updateTransactionsStub = sinon
 			.stub(wallet, 'updateTransactions')
 			.resolves(ok<string | undefined>(undefined));
-		sinon.stub(wallet.electrum, 'subscribeToAddresses').resolves(ok('stubbed'));
+		subscribeStub = sinon
+			.stub(wallet.electrum, 'subscribeToAddresses')
+			.resolves(ok('stubbed'));
 		// Fired unawaited by every refresh; keep it off the network.
 		sinon.stub(wallet, 'updateFeeEstimates').resolves(ok(wallet.feeEstimates));
 		// Asserted on directly, and stubbed so the real socket teardown belongs to
@@ -253,6 +257,33 @@ describe('stop() refresh deadline', function () {
 			wallet.disableMessages,
 			'the abandoned refresh did not re-enable messages'
 		).to.equal(true);
+	});
+
+	it('ends a refresh abandoned past its connection check', async function () {
+		// The park here is in getUtxos, downstream of the connection check the
+		// refresh already passed, so the guard on that check cannot catch it. The
+		// steps after it go to Electrum, which dials again when it finds itself
+		// disconnected.
+		await parkARefresh();
+
+		const stopped = await withDeadline(
+			wallet.stop({ refreshTimeout: 50 }),
+			5000,
+			'stop() behind a refresh parked in getUtxos'
+		);
+		expect(stopped.isOk(), 'the wallet stopped').to.equal(true);
+
+		releaseRefresh();
+		await withDeadline(parkedRefresh!, 5000, 'the abandoned refresh');
+
+		expect(
+			updateTransactionsStub.callCount,
+			'the abandoned refresh did not go on to Electrum'
+		).to.equal(0);
+		expect(
+			subscribeStub.callCount,
+			'the abandoned refresh did not re-subscribe'
+		).to.equal(0);
 	});
 
 	it('still waits for a refresh that settles inside the deadline', async function () {
