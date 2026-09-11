@@ -2767,11 +2767,20 @@ export class LightningNode extends EventEmitter {
 			// Rebuild the hold-invoice set so incoming HTLCs are parked, not settled.
 			// A cancelled hold invoice must NOT re-arm parking: drop its preimage
 			// and secret from memory so a late HTLC fails with unknown-details.
+			// A SETTLED one must not re-arm either (issue #772): settleHeldHtlc
+			// disarms the hash, so re-adding it here would park a later payment
+			// for a hash we already completed and hand a swap engine a second
+			// hold:accepted. Payments are restored above, so the completed
+			// incoming record is already in place.
 			if (invoice.hold) {
+				const restored = this.payments.get(paymentHashHex);
+				const settled =
+					restored?.status === PaymentStatus.COMPLETED &&
+					restored.direction === PaymentDirection.INCOMING;
 				if (invoice.cancelledAt) {
 					this.preimages.delete(paymentHashHex);
 					this.paymentSecrets.delete(paymentHashHex);
-				} else {
+				} else if (!settled) {
 					this.heldInvoiceHashes.add(paymentHashHex);
 				}
 			}

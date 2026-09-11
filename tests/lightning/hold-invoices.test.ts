@@ -445,6 +445,49 @@ describe('Hold Invoices (M4 batch 1)', function () {
 			expect(bob2.cancelHoldInvoice(hash)).to.equal(null);
 			storage.close();
 		});
+
+		// A settled hold invoice must not re-arm parking either (issue #772): a
+		// swap engine that acted on the first acceptance would otherwise get a
+		// second one for a hash it has already completed.
+		it('a settled hold invoice stays settled after reload and parks nothing', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createNode(40);
+			const bob = createNode(41, storage);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildGraph(alice, bob, [channelId]);
+
+			const { preimage, hash } = makeExternalHash();
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-settle-restart',
+				hold: true,
+				paymentHash: hash
+			});
+			alice.sendPayment(invoice.bolt11);
+			expect(bob.settleHeldHtlc(hash, preimage)).to.be.true;
+			expect(bob.listHoldInvoices()[0].state).to.equal('SETTLED');
+
+			const bob2 = createNode(41, storage);
+			expect(bob2.listHoldInvoices()[0].state).to.equal('SETTLED');
+			expect(bob2.listHeldHtlcs()).to.have.length(0);
+
+			// Replay the same invoice from a second payer.
+			const carol = createNode(42);
+			connectNodes(carol, bob2);
+			const carolChannelId = openReadyChannel(carol, bob2);
+			buildGraph(carol, bob2, [carolChannelId]);
+			const accepted: IHoldInvoiceStateEvent[] = [];
+			bob2.on('hold:accepted', (e: IHoldInvoiceStateEvent) => accepted.push(e));
+
+			carol.sendPayment(invoice.bolt11);
+
+			expect(accepted).to.have.length(0);
+			expect(bob2.listHeldHtlcs()).to.have.length(0);
+			expect(bob2.listHoldInvoices()[0].state).to.equal('SETTLED');
+			storage.close();
+		});
 	});
 
 	describe('CLTV-safety auto-cancel', function () {
