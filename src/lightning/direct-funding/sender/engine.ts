@@ -71,6 +71,7 @@ import {
 	DF_LOG_FORGED_RECEIPT,
 	DF_LOG_PAYMENT_RECONCILED,
 	DF_LOG_SEND_CAVEAT,
+	DF_LOG_SEND_COIN_SPENT,
 	DF_LOG_SEND_COMMITTED,
 	DF_LOG_SEND_COMPLETED,
 	DF_LOG_SEND_REFUSED,
@@ -604,10 +605,24 @@ export class DirectFundingSender {
 				'maxTotalFeeSat must not be negative'
 			);
 		}
-		const coin = this.selectCoin(
+		// Asked before the selection below, never between it and the reservation:
+		// the wallet's own coin list trails the chain, so the coin it calls
+		// largest can be one this wallet spent moments ago. Offering that costs a
+		// whole session and one of this request's capped attempts, and the
+		// receiver declines it from chain truth anyway.
+		const spent = await this.spentCandidates(
 			amountSat,
 			maxTotalFeeSat,
 			this.heldOutpoints(requestIdHex)
+		);
+		// Read again, after that await: another request may have reserved a coin
+		// while the chain was answering, and selecting against the older set is
+		// how one coin gets offered to two requests at once.
+		const coin = this.selectCoin(
+			amountSat,
+			maxTotalFeeSat,
+			this.heldOutpoints(requestIdHex),
+			spent
 		);
 		// Before the first await, and before the record exists: a send for
 		// another request arriving in that window must not select this coin.
@@ -831,18 +846,64 @@ export class DirectFundingSender {
 	 * failure; those two want opposite things from the caller, so they carry
 	 * different codes.
 	 */
-	private selectCoin(
+	/**
+	 * The coins this selection would reach for that the chain says are gone.
+	 *
+	 * Walks the candidates largest first and stops at the first one the chain
+	 * still has, so the ordinary case costs a single query and a wallet whose
+	 * view is current costs nothing extra. A wallet with no chain source, or one
+	 * whose source cannot answer, reports nothing spent: see `spentOnChain`.
+	 */
+	private async spentCandidates(
 		amountSat: bigint,
 		maxTotalFeeSat: bigint,
 		held: ReadonlySet<string>
+	): Promise<ReadonlySet<string>> {
+		const spentOnChain = this.deps.wallet.spentOnChain;
+		const spent = new Set<string>();
+		if (!spentOnChain) return spent;
+		const need = amountSat + maxTotalFeeSat;
+		const candidates = this.deps.wallet
+			.listSpendable()
+			.filter(
+				(coin) =>
+					coin.valueSat >= need && !held.has(`${coin.txidHex}:${coin.vout}`)
+			)
+			.sort((a, b) => (b.valueSat > a.valueSat ? 1 : -1));
+		for (const coin of candidates) {
+			const gone = await spentOnChain
+				.call(this.deps.wallet, coin)
+				.catch(() => false);
+			if (!gone) break;
+			spent.add(`${coin.txidHex}:${coin.vout}`);
+			this.log(DF_LOG_SEND_COIN_SPENT, {
+				txid: coin.txidHex,
+				vout: coin.vout
+			});
+		}
+		return spent;
+	}
+
+	private selectCoin(
+		amountSat: bigint,
+		maxTotalFeeSat: bigint,
+		held: ReadonlySet<string>,
+		spent: ReadonlySet<string> = new Set()
 	): IDfSenderCoin {
 		const need = amountSat + maxTotalFeeSat;
 		let best: IDfSenderCoin | null = null;
 		let heldCandidates = 0;
+		let spentCandidates = 0;
 		for (const coin of this.deps.wallet.listSpendable()) {
 			if (coin.valueSat < need) continue;
-			if (held.has(`${coin.txidHex}:${coin.vout}`)) {
+			const outpoint = `${coin.txidHex}:${coin.vout}`;
+			if (held.has(outpoint)) {
 				heldCandidates++;
+				continue;
+			}
+			// Already gone, whatever this wallet's own list still says.
+			if (spent.has(outpoint)) {
+				spentCandidates++;
 				continue;
 			}
 			if (!best || coin.valueSat > best.valueSat) best = coin;
@@ -854,6 +915,9 @@ export class DirectFundingSender {
 					`(${amountSat} sat plus the ${maxTotalFeeSat} sat fee allowance)` +
 					(heldCandidates > 0
 						? `; ${heldCandidates} large enough coin(s) are already offered to another direct-funding payment`
+						: '') +
+					(spentCandidates > 0
+						? `; ${spentCandidates} large enough coin(s) this wallet still lists have already been spent on chain`
 						: '')
 			);
 		}
