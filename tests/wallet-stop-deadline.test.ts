@@ -44,10 +44,11 @@ const electrumOptions = {
 	}
 };
 
-/** The private steps refreshWallet runs, stubbed through a cast. */
-type TRefreshInternals = {
+/** The private members the cases below reach through a cast. */
+type TWalletInternals = {
 	setZeroIndexAddresses: () => Promise<Result<string>>;
 	updateAddressIndexes: () => Promise<Result<string>>;
+	_disableMessagesOnCreate: boolean;
 };
 
 /** Rejects loudly rather than leaving the suite to hit mocha's own timeout. */
@@ -90,6 +91,8 @@ describe('stop() refresh deadline', function () {
 
 	let wallet: Wallet;
 	let getUtxosStub: sinon.SinonStub;
+	let setZeroIndexStub: sinon.SinonStub;
+	let updateAddressIndexesStub: sinon.SinonStub;
 	let disconnectStub: sinon.SinonStub;
 	/** Releases whatever refresh is parked in getUtxos. */
 	let releaseRefresh: () => void = () => undefined;
@@ -117,11 +120,11 @@ describe('stop() refresh deadline', function () {
 
 		// Every step of the refresh succeeds: the shutdown path, not the sync, is
 		// the subject.
-		sinon
-			.stub(wallet as unknown as TRefreshInternals, 'setZeroIndexAddresses')
+		setZeroIndexStub = sinon
+			.stub(wallet as unknown as TWalletInternals, 'setZeroIndexAddresses')
 			.resolves(ok('stubbed'));
-		sinon
-			.stub(wallet as unknown as TRefreshInternals, 'updateAddressIndexes')
+		updateAddressIndexesStub = sinon
+			.stub(wallet as unknown as TWalletInternals, 'updateAddressIndexes')
 			.resolves(ok('stubbed'));
 		getUtxosStub = sinon.stub(wallet, 'getUtxos');
 		sinon
@@ -194,6 +197,62 @@ describe('stop() refresh deadline', function () {
 			disconnectStub.callCount,
 			'the socket did not outlive the wallet'
 		).to.equal(1);
+	});
+
+	it('does not let the abandoned refresh revive the wallet', async function () {
+		// The deadline hands the refresh a life after stop(): it resumes with the
+		// socket down and messages disabled, and must leave both that way.
+		let releaseFirstStep: () => void = () => undefined;
+		const parkedStep = new Promise<void>((resolve) => {
+			releaseFirstStep = resolve;
+		});
+		setZeroIndexStub.callsFake(async () => {
+			await parkedStep;
+			return ok('stubbed');
+		});
+		// Stands in for the real updateAddressIndexes, which opens with exactly
+		// this call: it is the refresh's first connection check after the park.
+		updateAddressIndexesStub.callsFake(() => wallet.checkElectrumConnection());
+		const connectStub = sinon
+			.stub(wallet, 'connectToElectrum')
+			.resolves(ok('connected'));
+		// The daemon creates its wallet this way, so the refresh ends by putting
+		// messages back.
+		(wallet as unknown as TWalletInternals)._disableMessagesOnCreate = true;
+		wallet.disableMessages = false;
+
+		parkedRefresh = wallet.refreshWallet();
+		await waitFor(
+			() => setZeroIndexStub.callCount === 1,
+			5000,
+			'the refresh to park before its first connection check'
+		);
+
+		const stopped = await withDeadline(
+			wallet.stop({ refreshTimeout: 50 }),
+			5000,
+			'stop() behind a parked refresh'
+		);
+		expect(stopped.isOk(), 'the wallet stopped').to.equal(true);
+
+		releaseFirstStep();
+		// The refused connection check ends the refresh there. A refresh that
+		// reconnects instead carries on to the park in getUtxos, which only
+		// afterEach releases.
+		await withDeadline(
+			parkedRefresh,
+			5000,
+			'the abandoned refresh at its connection check'
+		);
+
+		expect(
+			connectStub.callCount,
+			'the abandoned refresh did not dial a peer'
+		).to.equal(0);
+		expect(
+			wallet.disableMessages,
+			'the abandoned refresh did not re-enable messages'
+		).to.equal(true);
 	});
 
 	it('still waits for a refresh that settles inside the deadline', async function () {

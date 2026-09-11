@@ -184,6 +184,9 @@ export class Wallet {
 	private _activeRefreshes = 0;
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
+	// Raised by stop(). Work that outlived the shutdown, above all the refresh
+	// its deadline walked away from, must not undo the teardown.
+	private _stopped = false;
 	// BIP32 account index as a path segment string ('0' by default).
 	private readonly _account: string;
 	// Requested at create time; merged with the stored value in setWalletData.
@@ -716,8 +719,10 @@ export class Wallet {
 			} finally {
 				// However the wait above ended, the teardown runs: a shutdown that
 				// leaves the socket and the message callback live is worse than one
-				// that abandons a read.
-				//
+				// that abandons a read. The flag is what makes the rest of it
+				// stick: an abandoned refresh resumes after this point, and would
+				// otherwise reconnect and re-enable messages on its way out.
+				this._stopped = true;
 				// disable onMessage callback
 				this.disableMessages = true;
 				// disable saving to storage
@@ -889,7 +894,11 @@ export class Wallet {
 			result = err(e);
 		} finally {
 			this._activeRefreshes -= 1;
-			if (this._disableMessagesOnCreate) this.disableMessages = false;
+			// Not for a refresh that outlived stop(): the teardown disabled
+			// messages on purpose, and a wallet that has shut down must not send
+			// its consumer anything more.
+			if (this._disableMessagesOnCreate && !this._stopped)
+				this.disableMessages = false;
 		}
 		if (this._activeRefreshes === 0) {
 			this._resolveAllPendingRefreshPromises(result);
@@ -1604,6 +1613,11 @@ export class Wallet {
 	 * @returns {Promise<Result<string>>}
 	 */
 	public async checkElectrumConnection(): Promise<Result<string>> {
+		// stop() disconnected on purpose, so this is not a connection to repair.
+		// The refresh its deadline abandoned resumes through here, and dialling
+		// again would clear Electrum's own _disconnected flag and leave a socket
+		// running behind a wallet that has shut down.
+		if (this._stopped) return err('Wallet stopped.');
 		const isConnected = this.electrum.connectedToElectrum;
 		if (!isConnected) {
 			return await this.connectToElectrum();
