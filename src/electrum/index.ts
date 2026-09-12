@@ -403,6 +403,9 @@ export class Electrum {
 	/** Set by disconnect(): this instance withdrew from the shared routers, so
 	 *  work still in flight must not register it back into them. Cleared when a
 	 *  new connect is explicitly requested. */
+	// Read requests also check this before calling rn-electrum-client: its
+	// helpers silently dial a peer when disconnect() has cleared the client.
+	// Check again between batches, which yield while a wallet can stop.
 	private _disconnected = false;
 	/** A drop in this wallet's stored height that has not been reconciled yet.
 	 *  The header write that revealed the rollback also replaced the only
@@ -535,6 +538,7 @@ export class Electrum {
 		/** Whether any candidate was refused because the peer would not stop. */
 		let refusedAny = false;
 		for (const candidate of this.orderCandidates(candidates)) {
+			if (this._disconnected) return err(DISCONNECTED_ERROR);
 			const startResponse = await this.attemptConnect(
 				candidate,
 				electrumNetwork
@@ -650,6 +654,9 @@ export class Electrum {
 		);
 		if (teardown.error) {
 			return { error: teardown.error, teardownRefused: true };
+		}
+		if (this._disconnected) {
+			return { error: DISCONNECTED_ERROR, teardownRefused: true };
 		}
 		const startResponse = await electrum.start({
 			clientName: 'beignet',
@@ -1040,11 +1047,15 @@ export class Electrum {
 	async getAddressBalance(
 		scriptHash: string
 	): Promise<IElectrumGetAddressBalanceRes> {
+		if (this._disconnected)
+			return { error: true, confirmed: 0, unconfirmed: 0 };
 		if (!this.connectedToElectrum)
 			await this.connectToElectrum({
 				network: this.network,
 				servers: this.servers
 			});
+		if (this._disconnected)
+			return { error: true, confirmed: 0, unconfirmed: 0 };
 		const network = this.electrumNetwork;
 		const response = await electrum.getAddressScriptHashBalance({
 			scriptHash,
@@ -1074,6 +1085,7 @@ export class Electrum {
 	 * @returns {Promise<Result<number>>}
 	 */
 	async getFeeEstimate(blocksWillingToWait: number): Promise<Result<number>> {
+		if (this._disconnected) return err(DISCONNECTED_ERROR);
 		const response = await electrum.getFeeEstimate({
 			blocksWillingToWait,
 			network: this.electrumNetwork
@@ -1115,6 +1127,7 @@ export class Electrum {
 			let balance = 0;
 			const utxos: IUtxo[] = [];
 			for (const batch of addressBatches) {
+				if (this._disconnected) return err(DISCONNECTED_ERROR);
 				const unspentAddressResult: TUnspentAddressScriptHashResponse =
 					await electrum.listUnspentAddressScriptHashes({
 						scriptHashes: {
@@ -1164,6 +1177,7 @@ export class Electrum {
 		scanAllAddresses?: boolean;
 	}): Promise<Result<IGetAddressHistoryResponse[]>> {
 		try {
+			if (this._disconnected) return err(DISCONNECTED_ERROR);
 			if (!this.connectedToElectrum)
 				await this.connectToElectrum({
 					network: this.network,
@@ -1231,6 +1245,7 @@ export class Electrum {
 
 			// split payload in chunks of 10 addresses per-request
 			for (let i = 0; i < scriptHashes.length; i += this.batchLimit) {
+				if (this._disconnected) return err(DISCONNECTED_ERROR);
 				const chunk = scriptHashes.slice(i, i + this.batchLimit);
 				const payload = {
 					key: 'scriptHash',
@@ -1243,6 +1258,7 @@ export class Electrum {
 					})
 				);
 				await sleep(this.batchDelay);
+				if (this._disconnected) return err(DISCONNECTED_ERROR);
 				promises.push(
 					electrum.getAddressScriptHashesMempool({
 						scriptHashes: payload,
@@ -1325,6 +1341,7 @@ export class Electrum {
 	async getAddressScriptHashesHistory(
 		scriptHashes: string[] = []
 	): Promise<Result<IGetAddressTxResponse>> {
+		if (this._disconnected) return err(DISCONNECTED_ERROR);
 		const response = await electrum.getAddressScriptHashesHistory({
 			scriptHashes,
 			network: this.electrumNetwork
@@ -1360,6 +1377,7 @@ export class Electrum {
 		additionalAddresses?: string[];
 	}): Promise<Result<IGetUtxosResponse>> {
 		try {
+			if (this._disconnected) return err(DISCONNECTED_ERROR);
 			if (!this.connectedToElectrum)
 				await this.connectToElectrum({
 					network: this.network,
@@ -1532,6 +1550,7 @@ export class Electrum {
 
 			// split payload in chunks of 10 transactions per-request
 			for (let i = 0; i < txHashes.length; i += this.batchLimit) {
+				if (this._disconnected) return err(DISCONNECTED_ERROR);
 				const chunk = txHashes.slice(i, i + this.batchLimit);
 
 				const data = {
@@ -1596,6 +1615,7 @@ export class Electrum {
 	}: {
 		height?: number;
 	}): Promise<Result<string>> {
+		if (this._disconnected) return err(DISCONNECTED_ERROR);
 		const response: IGetHeaderResponse = await electrum.getHeader({
 			height,
 			network: this.electrumNetwork
@@ -1679,6 +1699,7 @@ export class Electrum {
 		txHashes: ITxHash[];
 	}): Promise<Result<IGetTransactionsFromInputs>> {
 		try {
+			if (this._disconnected) return err(DISCONNECTED_ERROR);
 			const data = {
 				key: 'tx_hash',
 				data: txHashes
@@ -2480,7 +2501,13 @@ export class Electrum {
 		// instance in this process: a bare stop() tears down a sibling's socket
 		// on another network, along with every subscription that network holds,
 		// and leaves this instance's own client running with nothing polling it.
-		await electrum.stop({ network: this.electrumNetwork });
+		const response = await electrum.stop({ network: this.electrumNetwork });
+		if (response.error) {
+			throw new Error(
+				`Unable to disconnect from Electrum: ${String(response.data)}`
+			);
+		}
+		this.connectedToElectrum = false;
 	}
 
 	public startConnectionPolling(): void {

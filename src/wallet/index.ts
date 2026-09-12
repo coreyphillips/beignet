@@ -133,7 +133,12 @@ import {
 } from '../shapes';
 import { Electrum } from '../electrum';
 import { Transaction } from '../transaction';
-import { GAP_LIMIT, GAP_LIMIT_CHANGE, TRANSACTION_DEFAULTS } from './constants';
+import {
+	GAP_LIMIT,
+	GAP_LIMIT_CHANGE,
+	STOP_REFRESH_WAIT_MS,
+	TRANSACTION_DEFAULTS
+} from './constants';
 import { btcToSats } from '../utils/conversion';
 import { ILogger, createConsoleLogger } from '../logger';
 
@@ -191,6 +196,9 @@ export class Wallet {
 	private readonly _scanMarks: number[] = [];
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
+	// Raised by stop(). Work that outlived the shutdown, above all the refresh
+	// its deadline walked away from, must not undo the teardown.
+	private _stopped = false;
 	// BIP32 account index as a path segment string ('0' by default).
 	private readonly _account: string;
 	// Requested at create time; merged with the stored value in setWalletData.
@@ -706,24 +714,72 @@ export class Wallet {
 	}
 
 	/**
-	 * Stops the wallet. Use this method to prepare the wallet to be de
+	 * Stops the wallet permanently, waiting up to refreshTimeout for active refreshes.
+	 * @param {Object} [options]
+	 * @param {number} [options.refreshTimeout] How long to wait for an in-flight refresh, in ms.
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async stop(): Promise<Result<string>> {
+	public async stop({
+		refreshTimeout = STOP_REFRESH_WAIT_MS
+	}: { refreshTimeout?: number } = {}): Promise<Result<string>> {
+		let abandonedRefresh = false;
 		try {
-			// if we are refreshing, we need to wait for it to finish
-			if (this.isRefreshing) {
-				await this.refreshWallet();
+			try {
+				// if we are refreshing, we need to wait for it to finish
+				if (this.isRefreshing) {
+					abandonedRefresh = !(await this._waitForRefresh(refreshTimeout));
+				}
+			} finally {
+				// However the wait above ended, the teardown runs: a shutdown that
+				// leaves the socket and the message callback live is worse than one
+				// that abandons a read. The flag is what makes the rest of it
+				// stick: an abandoned refresh resumes after this point, and would
+				// otherwise reconnect and re-enable messages on its way out.
+				this._stopped = true;
+				// disable onMessage callback
+				this.disableMessages = true;
+				// disable saving to storage
+				this._setData = undefined;
+				// disconnect from Electrum
+				await this.electrum.disconnect();
 			}
-			// disable onMessage callback
-			this.disableMessages = true;
-			// disable saving to storage
-			this._setData = undefined;
-			// disconnect from Electrum
-			await this.electrum.disconnect();
+			if (abandonedRefresh) {
+				const message = `Wallet stopped, abandoning a refresh that did not finish within ${refreshTimeout}ms.`;
+				this.logger.warn(message);
+				return ok(message);
+			}
 			return ok('Wallet stopped.');
 		} catch (e) {
 			return err(e);
+		}
+	}
+
+	/**
+	 * Waits for the refresh in flight, for at most `timeout` ms. Resolves true
+	 * when the refresh settled first, false when the deadline did.
+	 *
+	 * Never rejects, and never cancels: the refresh keeps running, its writes
+	 * dropped by the cleared _setData, and the resolver queued here stays on
+	 * _pendingRefreshPromises to be collected with the wallet. See
+	 * STOP_REFRESH_WAIT_MS for why the wait has to be bounded at all.
+	 * @private
+	 */
+	private async _waitForRefresh(timeout: number): Promise<boolean> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<boolean>((resolve) => {
+			timer = setTimeout(() => resolve(false), timeout);
+		});
+		try {
+			return await Promise.race([
+				this.refreshWallet().then(
+					() => true,
+					// A refresh that threw is a refresh that is over.
+					() => true
+				),
+				deadline
+			]);
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 
@@ -822,6 +878,7 @@ export class Wallet {
 		additionalAddresses?: string[];
 		force?: boolean;
 	} = {}): Promise<Result<IWalletData>> {
+		if (this._stopped) return err('Wallet stopped.');
 		if (this.isRefreshing && !force) {
 			return new Promise((resolve) => {
 				this._pendingRefreshPromises.push(resolve);
@@ -851,7 +908,11 @@ export class Wallet {
 			result = err(e);
 		} finally {
 			this._activeRefreshes -= 1;
-			if (this._disableMessagesOnCreate) this.disableMessages = false;
+			// Not for a refresh that outlived stop(): the teardown disabled
+			// messages on purpose, and a wallet that has shut down must not send
+			// its consumer anything more.
+			if (this._disableMessagesOnCreate && !this._stopped)
+				this.disableMessages = false;
 		}
 		if (this._activeRefreshes === 0) {
 			this._resolveAllPendingRefreshPromises(result);
@@ -872,11 +933,20 @@ export class Wallet {
 		scanAllAddresses: boolean;
 		additionalAddresses: string[];
 	}): Promise<Result<IWalletData>> {
+		// stop() abandons the refresh it timed out on rather than cancelling it,
+		// so every step boundary below is a point that refresh can wake up on the
+		// far side of the teardown. Each remaining step reaches Electrum, and
+		// those calls dial whenever connectedToElectrum is false, which clears
+		// Electrum's own _disconnected flag and leaves a socket running behind a
+		// wallet that has shut down.
+		const stopped = 'Wallet stopped.';
 		await this.setZeroIndexAddresses();
+		if (this._stopped) return err(stopped);
 		const r1 = await this.updateAddressIndexes();
 		if (r1.isErr()) {
 			return err(r1.error.message);
 		}
+		if (this._stopped) return err(stopped);
 		const r2 = await this.getUtxos({
 			scanningStrategy: scanAllAddresses ? EScanningStrategy.all : undefined,
 			additionalAddresses
@@ -884,10 +954,12 @@ export class Wallet {
 		if (r2.isErr()) {
 			return err(r2.error.message);
 		}
+		if (this._stopped) return err(stopped);
 		const r3 = await this.updateTransactions({ scanAllAddresses });
 		if (r3.isErr()) {
 			return err(r3.error.message);
 		}
+		if (this._stopped) return err(stopped);
 		await this.electrum.subscribeToAddresses();
 		return ok(this.data);
 	}
@@ -1566,6 +1638,11 @@ export class Wallet {
 	 * @returns {Promise<Result<string>>}
 	 */
 	public async checkElectrumConnection(): Promise<Result<string>> {
+		// stop() disconnected on purpose, so this is not a connection to repair.
+		// The refresh its deadline abandoned resumes through here, and dialling
+		// again would clear Electrum's own _disconnected flag and leave a socket
+		// running behind a wallet that has shut down.
+		if (this._stopped) return err('Wallet stopped.');
 		const isConnected = this.electrum.connectedToElectrum;
 		if (!isConnected) {
 			return await this.connectToElectrum();
