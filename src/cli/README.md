@@ -1256,7 +1256,7 @@ A splice starts asynchronously, so a refusal is **returned**, not thrown: `splic
 
 A 2xx means the splice **started**. Its outcome arrives on the `splice:complete`, `splice:aborted`, `splice:reverted` and `node:error` events (a depth-locked splice whose external input was spent elsewhere is reverted to the old funding by agreement with the peer, issue #760; `splice:conflicted` and `node:error` code `SPLICE_INPUT_CONFLICT` precede it).
 
-`SPLICE_BUSY` is the one refusal to retry unchanged: the channel would splice but is held off by a state that ends on its own (a previous abort still awaiting the peer's echo, a quiescence session the peer owns, HTLCs still settling, the peer reconnecting). `isRetryableError` agrees; every other refusal code is permanent for the request as sent.
+`SPLICE_BUSY` is the one refusal to retry unchanged: the channel would splice but is held off by a state that ends on its own (a splice already in progress, a previous abort still awaiting the peer's echo, a quiescence session the peer owns, HTLCs still settling, the peer reconnecting). `isRetryableError` agrees; every other refusal code is permanent for the request as sent.
 
 ---
 

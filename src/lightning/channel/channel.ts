@@ -498,6 +498,8 @@ const SPLICE_BUSY_PEER_QUIESCENCE =
 	'Cannot splice: peer initiated the quiescence session; retry after it ends';
 const SPLICE_BUSY_REQUEST_PENDING =
 	'Cannot splice: another splice request is already awaiting quiescence; retry after it completes';
+const SPLICE_BUSY_SPLICE_ACTIVE =
+	'Cannot splice: a splice is already in progress on this channel; retry after it completes';
 const QUIESCE_BUSY_PENDING_HTLCS = 'Cannot quiesce: pending HTLCs exist';
 
 function bigIntMax(a: bigint, b: bigint): bigint {
@@ -10761,8 +10763,13 @@ export class Channel {
 		if (fforSpliceBusy) return fforSpliceBusy;
 		if (this._state.state !== ChannelState.NORMAL) {
 			// A disconnect wraps a NORMAL channel in AWAITING_REESTABLISH and
-			// handleReestablish unwraps it; any other state is a refusal that
-			// does not clear on its own (issue #639).
+			// handleReestablish unwraps it (issue #639), and a running splice
+			// returns the channel to NORMAL once its transaction is negotiated
+			// or aborted (issue #766); any other state is a refusal that does
+			// not clear on its own.
+			if (this._state.state === ChannelState.SPLICING) {
+				return SPLICE_BUSY_SPLICE_ACTIVE;
+			}
 			return this._state.state === ChannelState.AWAITING_REESTABLISH &&
 				this._state.preReestablishState === ChannelState.NORMAL
 				? SPLICE_BUSY_RECONNECTING
@@ -10829,6 +10836,18 @@ export class Channel {
 					{
 						type: ChannelActionType.ERROR,
 						message: SPLICE_BUSY_RECONNECTING,
+						transient: true
+					}
+				];
+			}
+			// A splice already running ends on its own, so the identical request
+			// starts the next one afterwards: transient, unlike a channel that is
+			// closing (issue #766).
+			if (this._state.state === ChannelState.SPLICING) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: SPLICE_BUSY_SPLICE_ACTIVE,
 						transient: true
 					}
 				];

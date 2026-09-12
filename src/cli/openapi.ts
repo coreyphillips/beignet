@@ -3093,7 +3093,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'503': {
 							description:
-								'SPLICE_BUSY: the channel is momentarily unable to splice (a previous abort awaiting its echo, a peer-owned quiescence session, another splice request already awaiting quiescence or still selecting its inputs, HTLCs still settling, the peer reconnecting). Retry the same request.'
+								'SPLICE_BUSY: the channel is momentarily unable to splice (a splice already in progress, a previous abort awaiting its echo, a peer-owned quiescence session, another splice request already awaiting quiescence or still selecting its inputs, HTLCs still settling, the peer reconnecting). Retry the same request.'
 						}
 					}
 				}
@@ -3133,7 +3133,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'503': {
 							description:
-								'SPLICE_BUSY: the channel is momentarily unable to splice (a previous abort awaiting its echo, a peer-owned quiescence session, another splice request already awaiting quiescence, HTLCs still settling, the peer reconnecting). Retry the same request.'
+								'SPLICE_BUSY: the channel is momentarily unable to splice (a splice already in progress, a previous abort awaiting its echo, a peer-owned quiescence session, another splice request already awaiting quiescence, HTLCs still settling, the peer reconnecting). Retry the same request.'
 						}
 					}
 				}

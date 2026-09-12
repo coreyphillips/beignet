@@ -758,6 +758,52 @@ describe('LightningNode transient splice refusals', function () {
 	});
 
 	/**
+	 * Issue #766: a second splice-in while a splice is already running. The
+	 * channel's SPLICING state answered spliceBusyReason with null, so spliceIn
+	 * selected wallet inputs and returned ok, and the "not in NORMAL state"
+	 * refusal from initiateSplice arrived later as a node:error. The caller had
+	 * a 200 for a splice that never started and coins pledged for nothing.
+	 */
+	it('codes a splice-in during an active splice as busy before selecting inputs', async function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const channel = channelOf(node, channelId);
+		const provider = withSpliceProvider(node);
+		const errors: string[] = [];
+		node.on('node:error', (e: { message: string }) => errors.push(e.message));
+		channel._state.state = ChannelState.SPLICING;
+
+		const result = node.spliceIn(channelId, 100_000n, 253);
+		expect(result.ok).to.be.false;
+		expect(result.code).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+		expect(result.error).to.include('already in progress');
+		await new Promise((r) => setTimeout(r, 10));
+		expect(
+			provider.selections,
+			'no wallet selection for a refused splice'
+		).to.equal(0);
+		expect(errors).to.be.empty;
+		// The active splice is untouched.
+		expect(channel.getState()).to.equal(ChannelState.SPLICING);
+		node.destroy();
+	});
+
+	it('codes an active splice as busy on both synchronous paths', function () {
+		for (const [name, request] of REQUESTS) {
+			const node = createTestNode();
+			const channelId = injectNormalChannel(node);
+			const channel = channelOf(node, channelId);
+			channel._state.state = ChannelState.SPLICING;
+			const result = request(node, channelId);
+			expect(result.ok, name).to.be.false;
+			expect(result.code, name).to.equal(SpliceRefusalCode.SPLICE_BUSY);
+			expect(result.error, name).to.include('already in progress');
+			expect(channel.getState(), name).to.equal(ChannelState.SPLICING);
+			node.destroy();
+		}
+	});
+
+	/**
 	 * Issue #656: the same latched handshake on the two synchronous paths. The
 	 * request used to park on it, but the reply that completes a peer-initiated
 	 * stfu goes out from _maybeAnswerOwedStfu, which has no deferred-splice
