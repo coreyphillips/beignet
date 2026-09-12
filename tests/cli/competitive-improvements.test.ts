@@ -219,6 +219,31 @@ describe('Idempotency Keys', () => {
 		expect(typeof startDaemon).to.equal('function');
 	});
 
+	it('CORS allows the X-Idempotency-Key header at both header sites (#769)', () => {
+		// The daemon sets Access-Control-Allow-Headers in two places: the
+		// general request handler and the SSE writeHead. A browser preflights a
+		// keyed POST with the header name, so both lists must name it.
+		const daemonSrc = fs.readFileSync(
+			path.join(__dirname, '../../src/cli/daemon.ts'),
+			'utf8'
+		);
+		const sites = [
+			...daemonSrc.matchAll(
+				/Access-Control-Allow-Headers'[^;]*?(CORS_ALLOW_HEADERS|'[^']*')/g
+			)
+		];
+		expect(sites.length, 'expected the general and SSE sites').to.equal(2);
+		const constant = daemonSrc.match(/const CORS_ALLOW_HEADERS = '([^']*)'/);
+		for (const site of sites) {
+			const value =
+				site[1] === 'CORS_ALLOW_HEADERS' ? constant?.[1] : site[1].slice(1, -1);
+			const names = (value ?? '').split(',').map((h) => h.trim().toLowerCase());
+			expect(names, site[0]).to.include('x-idempotency-key');
+			expect(names, site[0]).to.include('content-type');
+			expect(names, site[0]).to.include('authorization');
+		}
+	});
+
 	it('idempotency cache hit returns same response', async function () {
 		this.timeout(15_000);
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-idem-'));

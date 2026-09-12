@@ -657,6 +657,36 @@ describe('Daemon auth middleware', () => {
 				req.end();
 			});
 			expect(allowMethods).to.include('DELETE');
+
+			// #769: a keyed POST from a browser is preflighted with the header
+			// name; the daemon must list it or the browser never sends the POST.
+			const allowHeaders = await new Promise<string>((resolve, reject) => {
+				const req = http.request(
+					{
+						hostname: '127.0.0.1',
+						port: addr.port,
+						path: '/send',
+						method: 'OPTIONS',
+						headers: {
+							Origin: 'https://app.example',
+							'Access-Control-Request-Method': 'POST',
+							'Access-Control-Request-Headers': 'X-Idempotency-Key'
+						}
+					},
+					(res) => {
+						res.resume();
+						resolve(String(res.headers['access-control-allow-headers'] ?? ''));
+					}
+				);
+				req.on('error', reject);
+				req.end();
+			});
+			const allowed = allowHeaders
+				.split(',')
+				.map((h) => h.trim().toLowerCase());
+			expect(allowed, allowHeaders).to.include('x-idempotency-key');
+			expect(allowed, allowHeaders).to.include('content-type');
+			expect(allowed, allowHeaders).to.include('authorization');
 		} finally {
 			await node.destroy();
 			server.close();

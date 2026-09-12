@@ -78,6 +78,12 @@ interface CachedResponse {
 	expiresAt: number;
 }
 
+// Every request header a browser client may send. A preflight is answered
+// from this list, so a header missing here (X-Idempotency-Key was, #769)
+// makes the browser refuse to send the request at all; the two CORS sites
+// below (the general handler and the SSE writeHead) must agree.
+const CORS_ALLOW_HEADERS = 'Content-Type, Authorization, X-Idempotency-Key';
+
 const IDEMPOTENT_ROUTES = new Set([
 	'POST /invoice/pay',
 	'POST /invoice/pay-safe',
@@ -2915,10 +2921,7 @@ async function bootDaemon(
 				'Access-Control-Allow-Methods',
 				'GET, POST, DELETE, OPTIONS'
 			);
-			res.setHeader(
-				'Access-Control-Allow-Headers',
-				'Content-Type, Authorization'
-			);
+			res.setHeader('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS);
 		}
 
 		// ── OPTIONS preflight ──
@@ -2986,8 +2989,7 @@ async function bootDaemon(
 				sseHeaders['Access-Control-Allow-Origin'] = corsOrigin;
 				sseHeaders['Access-Control-Allow-Methods'] =
 					'GET, POST, DELETE, OPTIONS';
-				sseHeaders['Access-Control-Allow-Headers'] =
-					'Content-Type, Authorization';
+				sseHeaders['Access-Control-Allow-Headers'] = CORS_ALLOW_HEADERS;
 			}
 			res.writeHead(200, sseHeaders);
 			// SSE comment line: parsers ignore it; flushes headers to the client
