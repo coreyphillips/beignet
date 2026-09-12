@@ -24,7 +24,12 @@
     "noImplicitReturns": true,
     "noFallthroughCasesInSwitch": true,
     "skipLibCheck": true,
-    "useUnknownInCatchVariables": false
+    "useUnknownInCatchVariables": false,
+    // Explicit so the compiler never picks the target default for us. "dom"
+    // is what src/wallet/index.ts (fetch) and src/lightning/l402/client.ts
+    // (globalThis.fetch) currently type against; dropping it needs a
+    // @types/node new enough to declare fetch itself.
+    "lib": ["es2020", "dom"]
   },
   // ts-node compiles per file through its LanguageService, which cost ~11 s of
   // every mocha run and would be paid again by each parallel worker. Types are
@@ -34,7 +39,6 @@
   "ts-node": {
     "transpileOnly": true
   },
-  "lib": ["es2020"],
   "include": [
     "src/**/*.ts"
   ],
