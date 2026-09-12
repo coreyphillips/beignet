@@ -25271,16 +25271,20 @@ export class LightningNode extends EventEmitter {
 	private registerOnionMessageHandler(): void {
 		if (!this.peerManager) return;
 
-		// Wire the send function to PeerManager
+		// Wire the send function to PeerManager. A definite local refusal
+		// (not connected, not ready, an outbound or lane gate) PROPAGATES:
+		// this hook used to swallow it, so the direct-funding onion lane
+		// counted a frame that never left the process and the transport
+		// registry was denied the relay fall-through it is owed (issue #790).
+		// Every other sender is safe with a throw: the manager isolates its
+		// own forwarding, TLV handlers run inside that same guard, and each
+		// node-side caller either catches or wants the rejection.
 		this.onionMessageManager.setSendFunction(
 			(toPeer: string, type: number, payload: Buffer) => {
-				if (this.peerManager) {
-					try {
-						this.peerManager.sendToPeer(toPeer, type, payload);
-					} catch {
-						// Peer may not be connected — silently ignore
-					}
+				if (!this.peerManager) {
+					throw new Error('Networking is not enabled on this node');
 				}
+				this.peerManager.sendToPeer(toPeer, type, payload);
 			}
 		);
 

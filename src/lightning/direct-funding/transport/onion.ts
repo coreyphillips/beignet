@@ -365,10 +365,9 @@ class DfOnionSender implements IDfLaneSender {
 				`direct-funding frame is ${payload.length} bytes, max ${DF_MAX_FRAME_BYTES}`
 			);
 		}
-		// The node's onion send hook swallows a `sendToPeer` failure, so nothing
-		// downstream can tell a delivered frame from one that never left. Refuse
-		// here instead: a lane that counted an undelivered frame as exchanged
-		// would also deny the registry the fall-through it is owed.
+		// A cheap refusal before any sphinx packet is built. It is not the
+		// send boundary: the peer view lists a link that is no longer ready
+		// for messaging, or one an outbound gate refuses, as connected.
 		const introHex = this.sendPath.introductionNodeId.toString('hex');
 		if (!this.peers.isPeerConnected(introHex)) {
 			throw new DirectFundingError(
@@ -380,11 +379,26 @@ class DfOnionSender implements IDfLaneSender {
 		// of routing info), the HMAC covers the whole routing info, and there are
 		// exactly two on-wire sizes, so the length leaks at most one bit. A frame
 		// past the large form is refused there, by name.
-		this.manager.sendReply(
-			this.sendPath,
-			new Map([[DF_ONION_TLV, encodeDfOnionBody(subtype, payload)]]),
-			this.replyPath ? { replyPath: this.replyPath } : undefined
-		);
+		//
+		// The send boundary is the node's peer link, which throws on a definite
+		// local refusal (issue #790). A frame it refused never left the process,
+		// so it is not counted: a lane that counted it as exchanged would deny
+		// the registry the fall-through it is owed, and the payer would sit out
+		// the offer timeout blaming the receiver. The local reason rides the
+		// refusal so the payer's record says what actually happened.
+		try {
+			this.manager.sendReply(
+				this.sendPath,
+				new Map([[DF_ONION_TLV, encodeDfOnionBody(subtype, payload)]]),
+				this.replyPath ? { replyPath: this.replyPath } : undefined
+			);
+		} catch (err) {
+			if (err instanceof DirectFundingError) throw err;
+			throw new DirectFundingError(
+				DirectFundingErrorCode.UNREACHABLE,
+				`the introduction node link refused the frame: ${errorText(err)}`
+			);
+		}
 		this.onSent();
 	}
 
