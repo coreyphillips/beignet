@@ -5402,12 +5402,15 @@ describe('Splice', function () {
 						crypto.randomBytes(20)
 					]);
 					pair.opener.setSpliceOutDestination(destScript, 50_000n);
-					expect(
-						findAction(
-							pair.opener.initiateSplice(-(50_000n + SPLICE_OUT_TEST_FEE), 253),
-							ChannelActionType.ERROR
-						).message
-					).to.include('not in NORMAL state');
+					// Issue #766: the running splice ends on its own, so the refusal
+					// is transient (SPLICE_BUSY) rather than the permanent
+					// "not in NORMAL state" it used to share with a closing channel.
+					const refusal = findAction(
+						pair.opener.initiateSplice(-(50_000n + SPLICE_OUT_TEST_FEE), 253),
+						ChannelActionType.ERROR
+					);
+					expect(refusal.message).to.include('already in progress');
+					expect(refusal.transient).to.be.true;
 
 					// splice_ack and the rest of the negotiation follow the refusal.
 					pair.enqueue(pair.acceptor, pair.opener, init);
