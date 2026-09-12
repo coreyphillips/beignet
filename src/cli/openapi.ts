@@ -406,13 +406,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/direct-funding/send': {
 				post: {
 					summary:
-						'Pay a direct-funding request by funding the receiver channel from one of our coins. THIS CALL REJECTS ONLY BEFORE OUR WITNESS LEAVES THE DEVICE: after that it resolves, with whatever is known and a `caveat` saying what was lost. That is a protocol MUST, and it is load bearing, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Anyone adding an error path here must keep it on the pre-witness side. The call sets no deadline of its own and may block for the whole offer to receipt exchange. Idempotent on the request id: a second send against a request that already has an attempt returns that attempt rather than starting a new one, so a retry can never commit a second coin. feeHeadroomSats is a documented alias for maxTotalFeeSat, the ceiling on our own cost above the amount. Admin scope',
+						'Pay a direct-funding request by funding the receiver channel from one of our coins. THIS CALL REJECTS ONLY BEFORE OUR WITNESS LEAVES THE DEVICE: after that it resolves, with whatever is known and a `caveat` saying what was lost. That is a protocol MUST, and it is load bearing, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Anyone adding an error path here must keep it on the pre-witness side. The call sets no deadline of its own and may block for the whole offer to receipt exchange. Idempotent on the request id: a second send against a request that already has an attempt returns that attempt rather than starting a new one, so a retry can never commit a second coin. feeHeadroomSats is a documented alias for maxTotalFeeSat, the ceiling on our own cost above the amount. Set recoverReceipt to ask the receiver to replay a receipt that never arrived: it acts only on a post-witness payment that has no receipt yet, re-sends the recorded offer without a second coin, signature or freeze, and like every post-witness call it never rejects. Admin scope',
 					tags: ['DirectFunding'],
 					requestBody: bodyContent({
 						request: 'string',
 						amountSats: 'number?',
 						maxTotalFeeSat: 'number?',
-						feeHeadroomSats: 'number?'
+						feeHeadroomSats: 'number?',
+						recoverReceipt: 'boolean?'
 					}),
 					responses: {
 						'200': {

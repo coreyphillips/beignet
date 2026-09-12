@@ -8004,6 +8004,13 @@ export class BeignetNode extends EventEmitter {
 		maxTotalFeeSat?: number;
 		/** Documented alias for maxTotalFeeSat: what the LFBW app posts today. */
 		feeHeadroomSats?: number;
+		/**
+		 * Ask the receiver to replay a receipt that never arrived (issue #767).
+		 * Only acts on a post-witness payment with no receipt yet, re-sending
+		 * the recorded offer without a second coin, signature or freeze; a plain
+		 * retry (the default) still replays the record with no frame.
+		 */
+		recoverReceipt?: boolean;
 	}): Promise<IDfSendResult> {
 		const sender = this.directFundingSender;
 		if (!sender) {
@@ -8033,7 +8040,8 @@ export class BeignetNode extends EventEmitter {
 							requireNonNegativeSafeInteger(ceiling, 'maxTotalFeeSat')
 						)
 				  }
-				: {})
+				: {}),
+			...(opts.recoverReceipt === true ? { recoverReceipt: true } : {})
 		};
 		// A request this device has already attempted spends nothing new: the send
 		// joins the run that is already going or replays what that run recorded.

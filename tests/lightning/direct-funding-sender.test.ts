@@ -2695,6 +2695,125 @@ describe('Direct funding sender: a commit the wire may never have taken', () => 
 		).to.have.length(0);
 		expect(wallet.frozen.size, 'the coin came free').to.equal(1);
 	});
+
+	// Issue #767: a payer that lost the receipt any way other than the narrow
+	// witnessMayBeOut window (a receiver crash before markReceiptRevealed, a
+	// lane death after the witness) kept a payment with no proof of delivery,
+	// permanently, because the sender only ever re-sent on that one path.
+	// recoverReceipt re-sends the recorded offer so the receiver's idempotent
+	// replay answers with the receipt, with no second coin, signature or freeze.
+
+	/** The disk a receipt lost after the witness provably left leaves. */
+	function rewindToReceiptLoss(
+		storage: ReturnType<typeof memoryStorage>
+	): void {
+		const rows = JSON.parse(storage.loadWalletData(DF_PAYMENTS_STORAGE_KEY)!);
+		// witnessSent stays true: the witness left, only the receipt did not
+		// arrive. This is rewindToPreEmit minus the witnessSent deletion.
+		delete rows[0].receiptPreimage;
+		delete rows[0].broadcastTx;
+		storage.saveWalletData(DF_PAYMENTS_STORAGE_KEY, JSON.stringify(rows));
+	}
+
+	it('re-sends one offer to recover a receipt lost after the witness left', async () => {
+		const { request, wallet, storage } = await firstLife();
+		const committed = committedRow(storage);
+		expect(
+			committed.witnessSent,
+			'the witness left in the first life'
+		).to.equal(true);
+		expect(committed.receiptPreimage, 'and the receipt arrived').to.be.a(
+			'string'
+		);
+		const frozenBefore = wallet.frozen.size;
+		rewindToReceiptLoss(storage);
+		expect(
+			committedRow(storage).receiptPreimage,
+			'the receipt is gone from the record'
+		).to.equal(undefined);
+
+		const second = life(request, wallet, storage);
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n,
+			recoverReceipt: true
+		});
+		expect(second.offers, 'exactly one offer was re-sent').to.equal(1);
+		// The stored witness is re-emitted, byte for byte: recovery re-sends, it
+		// does not re-sign. A fresh signature would be a second one over the coin.
+		expect(
+			second.witnesses,
+			'the recorded witness was re-emitted'
+		).to.have.length(1);
+		expect(
+			second.witnesses[0].map((item) => item.toString('hex')),
+			'and it is the recorded witness, not a new signature'
+		).to.deep.equal(committed.witness);
+		const record = second.payments.get(request.requestId.toString('hex'))!;
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.receiptPreimageHex, 'the receipt was recovered').to.equal(
+			committed.receiptPreimage
+		);
+		expect(record.receiptPreimage, 'and persisted to the record').to.equal(
+			committed.receiptPreimage
+		);
+		expect(result.caveat, 'no caveat: the receipt arrived').to.equal(undefined);
+		expect(wallet.frozen.size, 'no second freeze').to.equal(frozenBefore);
+	});
+
+	it('recovers the receipt even after the funding spent the coin', async () => {
+		const { request, wallet, storage } = await firstLife();
+		const committed = committedRow(storage);
+		rewindToReceiptLoss(storage);
+		// The funding spent the coin: it is gone from the wallet. resume() gives
+		// up here, but recovery does not need it.
+		wallet.coins = [];
+
+		const second = life(request, wallet, storage);
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n,
+			recoverReceipt: true
+		});
+		expect(
+			second.offers,
+			'the offer was re-sent with no coin present'
+		).to.equal(1);
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.receiptPreimageHex).to.equal(committed.receiptPreimage);
+		expect(result.caveat).to.equal(undefined);
+	});
+
+	it('never rejects when the receiver cannot be reached, and keeps the outcome', async () => {
+		const { request, wallet, storage } = await firstLife();
+		rewindToReceiptLoss(storage);
+
+		const result = await life(request, wallet, storage, {
+			unreachable: true
+		}).sender.send(request.encoded, {
+			amountSat: 100_000n,
+			recoverReceipt: true
+		});
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.receiptPreimageHex, 'still no receipt').to.equal(null);
+		expect(result.caveat, 'a caveat rather than a rejection').to.be.a('string');
+	});
+
+	it('returns from the record with no frame when a receipt already exists', async () => {
+		const { request, wallet, storage } = await firstLife();
+		const committed = committedRow(storage);
+		expect(committed.receiptPreimage).to.be.a('string');
+
+		const second = life(request, wallet, storage);
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n,
+			recoverReceipt: true
+		});
+		expect(second.offers, 'no offer for a payment already receipted').to.equal(
+			0
+		);
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.receiptPreimageHex).to.equal(committed.receiptPreimage);
+		expect(result.caveat).to.equal(undefined);
+	});
 });
 
 describe('Direct funding sender: a duplicate call that arrives late', () => {

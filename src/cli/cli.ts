@@ -1940,7 +1940,7 @@ async function handleDirectFunding(): Promise<void> {
 						code: 'INVALID_PARAMS',
 						message:
 							'Usage: beignet direct-funding send <request> [sats] ' +
-							'[--max-total-fee sats]'
+							'[--max-total-fee sats] [--recover-receipt]'
 					}
 				});
 				process.exitCode = 1;
@@ -1950,7 +1950,10 @@ async function handleDirectFunding(): Promise<void> {
 				await httpRequest('POST', '/direct-funding/send', {
 					request,
 					amountSats: pos[3] ? parseInt(pos[3], 10) : undefined,
-					maxTotalFeeSat: numberFlag('--max-total-fee')
+					maxTotalFeeSat: numberFlag('--max-total-fee'),
+					// Fish out a receipt a delivered payment never returned, without a
+					// second coin, signature or freeze (issue #767).
+					...(hasFlag('--recover-receipt') ? { recoverReceipt: true } : {})
 				})
 			);
 		}
