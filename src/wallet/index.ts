@@ -177,6 +177,18 @@ export class Wallet {
 	// guard, so more than one can be in flight and the flag belongs to all of
 	// them until the last one finishes.
 	private _activeRefreshes = 0;
+	// Outpoints our own broadcasts have spent, keyed 'txid:vout', each holding
+	// the value _spendSeq had when the broadcast landed. The UTXO set is only
+	// ever replaced wholesale by a scan, so a scan already in flight at that
+	// moment answers from a server that has not seen the spend yet and would
+	// put the coin back; the marks are what tell the two apart. Memory only:
+	// a wallet that restarts scans against a server that knows the spend.
+	private readonly _spentOutpoints: Map<string, number> = new Map();
+	private _spendSeq = 0;
+	// The mark every getUtxos query still in flight was issued at. A record can
+	// only be dropped once the oldest of them has landed: drop it sooner and the
+	// older scan's stale answer has nothing left to filter against.
+	private readonly _scanMarks: number[] = [];
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
 	// BIP32 account index as a path segment string ('0' by default).
@@ -2417,18 +2429,32 @@ export class Wallet {
 	}): Promise<Result<IGetUtxosResponse>> {
 		const checkRes = await this.checkElectrumConnection();
 		if (checkRes.isErr()) return err(checkRes.error.message);
-		const getUtxosRes = await this.electrum.getUtxos({
-			scanningStrategy,
-			addressIndex,
-			changeAddressIndex,
-			addressTypesToCheck,
-			additionalAddresses
-		});
+		// Read before the query so a broadcast landing while it is in flight is
+		// known to be newer than the answer it returns.
+		const spendMark = this._spendSeq;
+		this._scanMarks.push(spendMark);
+		let getUtxosRes: Result<IGetUtxosResponse>;
+		try {
+			getUtxosRes = await this.electrum.getUtxos({
+				scanningStrategy,
+				addressIndex,
+				changeAddressIndex,
+				addressTypesToCheck,
+				additionalAddresses
+			});
+		} finally {
+			const at = this._scanMarks.indexOf(spendMark);
+			if (at !== -1) this._scanMarks.splice(at, 1);
+		}
 		if (getUtxosRes.isErr()) {
 			return err(getUtxosRes.error.message);
 		}
-		const utxos = removeDustUtxos(getUtxosRes.value?.utxos ?? []);
-		const balance = getUtxosRes.value?.balance ?? 0;
+		const scanned = this.settleSpentOutpoints(
+			getUtxosRes.value?.utxos ?? [],
+			spendMark
+		);
+		const utxos = removeDustUtxos(scanned.utxos);
+		const balance = (getUtxosRes.value?.balance ?? 0) - scanned.spentValue;
 		this._data.utxos = utxos;
 		this._data.balance = balance;
 		await Promise.all([
@@ -2444,6 +2470,83 @@ export class Wallet {
 	 */
 	listUtxos(): IUtxo[] {
 		return this.data.utxos;
+	}
+
+	/**
+	 * Drops the coins a just-broadcast transaction spends from the local UTXO
+	 * set and records their outpoints, so a scan that predates the broadcast
+	 * cannot put them back. Called for every broadcast: inputs that are not
+	 * this wallet's coins match nothing.
+	 * @param {string} rawTx The transaction that was broadcast, as hex.
+	 * @returns {Promise<Result<IUtxo[]>>} The coins removed from the set.
+	 */
+	public async removeSpentUtxos(rawTx: string): Promise<Result<IUtxo[]>> {
+		let outpoints: string[];
+		try {
+			outpoints = bitcoin.Transaction.fromHex(rawTx).ins.map((input) => {
+				// An input carries the txid in internal byte order; tx_hash is the
+				// display order listUtxos reports.
+				const txid = Buffer.from(input.hash).reverse().toString('hex');
+				return `${txid}:${input.index}`;
+			});
+		} catch (e) {
+			return err(e);
+		}
+		const mark = ++this._spendSeq;
+		const spent = new Set(outpoints);
+		spent.forEach((outpoint) => this._spentOutpoints.set(outpoint, mark));
+		const removed = this._data.utxos.filter((utxo) =>
+			spent.has(`${utxo.tx_hash}:${utxo.tx_pos}`)
+		);
+		if (!removed.length) return ok([]);
+		this._data.utxos = this._data.utxos.filter(
+			(utxo) => !spent.has(`${utxo.tx_hash}:${utxo.tx_pos}`)
+		);
+		this._data.balance = Math.max(
+			0,
+			this._data.balance - removed.reduce((sum, utxo) => sum + utxo.value, 0)
+		);
+		await Promise.all([
+			this.saveWalletData('utxos', this._data.utxos),
+			this.saveWalletData('balance', this._data.balance)
+		]);
+		return ok(removed);
+	}
+
+	/**
+	 * Filters a scan's coins against the outpoints removeSpentUtxos recorded.
+	 * @param {IUtxo[]} scanned
+	 * @param {number} spendMark The spend counter as it stood when the scan
+	 * was issued.
+	 * @returns {{ utxos: IUtxo[]; spentValue: number }} The coins to keep, and
+	 * the value of those the scan was too old to know about.
+	 */
+	private settleSpentOutpoints(
+		scanned: IUtxo[],
+		spendMark: number
+	): { utxos: IUtxo[]; spentValue: number } {
+		let spentValue = 0;
+		const utxos = this._spentOutpoints.size
+			? scanned.filter((utxo) => {
+					const mark = this._spentOutpoints.get(
+						`${utxo.tx_hash}:${utxo.tx_pos}`
+					);
+					if (mark === undefined || mark <= spendMark) return true;
+					spentValue += utxo.value;
+					return false;
+			  })
+			: scanned;
+		// Whatever this scan is newer than, it has settled: the coin is gone
+		// from the server's view, or the scan reports it and is believed. The
+		// second half matters, because a broadcast that never propagated must
+		// not hide a live coin for the life of the wallet. A scan still in
+		// flight that predates this one holds the record open, since it is the
+		// one whose stale answer would otherwise bring the coin back.
+		const settled = Math.min(spendMark, ...this._scanMarks);
+		for (const [outpoint, mark] of this._spentOutpoints) {
+			if (mark <= settled) this._spentOutpoints.delete(outpoint);
+		}
+		return { utxos, spentValue };
 	}
 
 	/**
