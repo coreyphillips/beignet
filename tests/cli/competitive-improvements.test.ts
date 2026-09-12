@@ -414,6 +414,162 @@ describe('Idempotency Keys', () => {
 			}
 		});
 	}
+
+	// #768: the cache is written only after the handler returns, so two
+	// requests with one key that overlap both miss it. The stubbed send parks
+	// until the test releases it, which holds the first request inside the
+	// handler while the second one arrives.
+	describe('overlapping keyed requests (#768)', () => {
+		const address = 'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080';
+
+		async function startOffline(): Promise<{
+			server: http.Server;
+			node: any;
+			port: number;
+		}> {
+			const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-idem-'));
+			const { server, node } = await startDaemon({
+				network: 'regtest',
+				dataDir: tmpDir,
+				daemonPort: 0,
+				logLevel: 'silent',
+				...OFFLINE_ELECTRUM
+			});
+			return { server, node, port: (server.address() as any).port };
+		}
+
+		it('POST /send with the same key and body waits for the first send and shares its result', async function () {
+			this.timeout(15_000);
+			const { server, node, port } = await startOffline();
+			try {
+				let sends = 0;
+				const gate = deferred<{ txid: string; hex: string }>();
+				const entered = deferred<void>();
+				node.sendOnchain = (): Promise<{ txid: string; hex: string }> => {
+					sends += 1;
+					entered.resolve();
+					return gate.promise;
+				};
+				const body = JSON.stringify({ address, amountSats: 10_000 });
+				const headers = { 'X-Idempotency-Key': `inflight-${Date.now()}` };
+
+				const first = httpPostRaw(port, '/send', body, headers);
+				await entered.promise;
+				const second = httpPostRaw(port, '/send', body, headers);
+				// Let the second request reach the handler while the first is parked.
+				await new Promise((r) => setTimeout(r, 300));
+				expect(sends, 'the overlapping request sent again').to.equal(1);
+
+				gate.resolve({ txid: 'b'.repeat(64), hex: '0200000000' });
+				const [res1, res2] = await Promise.all([first, second]);
+				expect(res1.statusCode).to.equal(200);
+				expect(res2.statusCode).to.equal(200);
+				expect(JSON.parse(res1.body).result.txid).to.equal('b'.repeat(64));
+				expect(res2.body).to.equal(res1.body);
+				expect(sends, 'exactly one send for one key').to.equal(1);
+			} finally {
+				await node.destroy();
+				server.close();
+			}
+		});
+
+		it('POST /send-max with the same key and a different body is refused while the first is in flight', async function () {
+			this.timeout(15_000);
+			const { server, node, port } = await startOffline();
+			try {
+				let sends = 0;
+				const gate = deferred<{ txid: string; hex: string }>();
+				const entered = deferred<void>();
+				node.sendMaxOnchain = (): Promise<{ txid: string; hex: string }> => {
+					sends += 1;
+					entered.resolve();
+					return gate.promise;
+				};
+				const headers = { 'X-Idempotency-Key': `inflight-${Date.now()}` };
+
+				const first = httpPostRaw(
+					port,
+					'/send-max',
+					JSON.stringify({ address, satsPerVbyte: 2 }),
+					headers
+				);
+				await entered.promise;
+				const conflicting = httpPostRaw(
+					port,
+					'/send-max',
+					JSON.stringify({ address, satsPerVbyte: 4 }),
+					headers
+				);
+				await new Promise((r) => setTimeout(r, 300));
+				expect(sends, 'the conflicting body sent').to.equal(1);
+				// Answered before the first send settles: the conflict needs no
+				// result to be decided.
+				const conflict = await conflicting;
+				expect(conflict.statusCode).to.equal(409);
+				expect(JSON.parse(conflict.body).error.code).to.equal(
+					'IDEMPOTENCY_CONFLICT'
+				);
+				expect(sends, 'the conflicting body sent').to.equal(1);
+
+				gate.resolve({ txid: 'c'.repeat(64), hex: '0200000000' });
+				const res1 = await first;
+				expect(res1.statusCode).to.equal(200);
+				expect(JSON.parse(res1.body).result.txid).to.equal('c'.repeat(64));
+				expect(sends).to.equal(1);
+			} finally {
+				await node.destroy();
+				server.close();
+			}
+		});
+
+		it('a send that throws fails every waiter the same way and caches nothing', async function () {
+			this.timeout(15_000);
+			const { server, node, port } = await startOffline();
+			try {
+				let sends = 0;
+				const gate = deferred<{ txid: string; hex: string }>();
+				const entered = deferred<void>();
+				node.sendOnchain = (): Promise<{ txid: string; hex: string }> => {
+					sends += 1;
+					entered.resolve();
+					// Only the parked first call fails; a later call succeeds so
+					// a re-run after the failure is observable as a 200.
+					return sends === 1
+						? gate.promise
+						: Promise.resolve({ txid: 'd'.repeat(64), hex: '0200000000' });
+				};
+				const body = JSON.stringify({ address, amountSats: 10_000 });
+				const headers = { 'X-Idempotency-Key': `inflight-${Date.now()}` };
+
+				const first = httpPostRaw(port, '/send', body, headers);
+				await entered.promise;
+				const second = httpPostRaw(port, '/send', body, headers);
+				await new Promise((r) => setTimeout(r, 300));
+				expect(sends, 'the overlapping request sent again').to.equal(1);
+
+				gate.reject(
+					new BeignetError(BeignetErrorCode.SPENDING_LIMIT_EXCEEDED, 'stubbed')
+				);
+				const [res1, res2] = await Promise.all([first, second]);
+				expect(res1.statusCode).to.be.at.least(400);
+				expect(res2.statusCode).to.equal(res1.statusCode);
+				expect(res2.body).to.equal(res1.body);
+				expect(JSON.parse(res1.body).error.code).to.equal(
+					'SPENDING_LIMIT_EXCEEDED'
+				);
+
+				// A throw caches nothing, so the next request with the key runs
+				// the handler again.
+				const third = await httpPostRaw(port, '/send', body, headers);
+				expect(third.statusCode).to.equal(200);
+				expect(JSON.parse(third.body).result.txid).to.equal('d'.repeat(64));
+				expect(sends, 'the retry after a failure ran the handler').to.equal(2);
+			} finally {
+				await node.destroy();
+				server.close();
+			}
+		});
+	});
 });
 
 // ─────────────── TLS ───────────────
@@ -991,6 +1147,20 @@ function httpPost(
 		req.write(body);
 		req.end();
 	});
+}
+
+function deferred<T>(): {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+	reject: (reason: unknown) => void;
+} {
+	let resolve!: (value: T) => void;
+	let reject!: (reason: unknown) => void;
+	const promise = new Promise<T>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	return { promise, resolve, reject };
 }
 
 function httpPostRaw(

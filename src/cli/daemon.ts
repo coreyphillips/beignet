@@ -391,6 +391,19 @@ export function statusForFailure(code: string, failureCode?: number): number {
 	return status;
 }
 
+/** Same key, different body: refuse without touching the handler. */
+function endIdempotencyConflict(res: http.ServerResponse): void {
+	res.statusCode = 409;
+	res.end(
+		JSON.stringify(
+			failure(
+				'IDEMPOTENCY_CONFLICT',
+				'Idempotency key already used with a different request body'
+			)
+		)
+	);
+}
+
 /** End the response, mapping a failure envelope to its HTTP status. */
 function endWithResult(res: http.ServerResponse, result: unknown): void {
 	const failureLike = result as {
@@ -1045,6 +1058,18 @@ async function bootDaemon(
 
 	// Idempotency cache
 	const idempotencyCache = new Map<string, CachedResponse>();
+	// #768: a key only reaches the cache once its handler has RETURNED, so two
+	// requests carrying the same key that overlap both miss the cache and both
+	// run the handler (two broadcasts on /send). This map reserves the key
+	// BEFORE the handler is awaited: a same-body overlap waits on the first
+	// handler's promise and answers with its result, a different-body overlap
+	// gets the 409 without running anything. The entry is dropped when the
+	// handler settles, after which the cache takes over as before (a returned
+	// envelope is cached, a throw caches nothing).
+	const idempotencyInFlight = new Map<
+		string,
+		{ bodyHash: string; promise: Promise<unknown> }
+	>();
 	const idempotencyCleanupTimer = setInterval(() => {
 		const now = Date.now();
 		for (const [key, entry] of idempotencyCache) {
@@ -3139,21 +3164,33 @@ async function bootDaemon(
 				const cached = idempotencyCache.get(cacheKey);
 				if (cached) {
 					if (cached.bodyHash !== bodyHash) {
-						res.statusCode = 409;
-						res.end(
-							JSON.stringify(
-								failure(
-									'IDEMPOTENCY_CONFLICT',
-									'Idempotency key already used with a different request body'
-								)
-							)
-						);
+						endIdempotencyConflict(res);
 						return;
 					}
 					endWithResult(res, cached.response);
 					return;
 				}
-				const result = await handler(body, query);
+				const inFlight = idempotencyInFlight.get(cacheKey);
+				if (inFlight) {
+					if (inFlight.bodyHash !== bodyHash) {
+						endIdempotencyConflict(res);
+						return;
+					}
+					// Every waiter answers with the one result; a rejection
+					// reaches this caller's catch below exactly as the owner's.
+					endWithResult(res, await inFlight.promise);
+					return;
+				}
+				// Wrapped so a synchronous throw rejects the shared promise
+				// instead of escaping before the reservation is released.
+				const pending = (async (): Promise<unknown> => handler(body, query))();
+				idempotencyInFlight.set(cacheKey, { bodyHash, promise: pending });
+				let result: unknown;
+				try {
+					result = await pending;
+				} finally {
+					idempotencyInFlight.delete(cacheKey);
+				}
 				idempotencyCache.set(cacheKey, {
 					response: result,
 					bodyHash: bodyHash,
