@@ -2114,7 +2114,7 @@ startDaemon({ cors: true, apiToken: '...' });  // Access-Control-Allow-Origin: *
 startDaemon({ cors: 'https://myapp.com' });    // specific origin
 ```
 
-Handles `OPTIONS` preflight requests automatically (`GET, POST, DELETE, OPTIONS`).
+Handles `OPTIONS` preflight requests automatically (`GET, POST, DELETE, OPTIONS`). The allowed request headers are `Content-Type`, `Authorization` and `X-Idempotency-Key`, so a browser client can send keyed `POST` requests (the `X-Idempotency-Key` header is documented under [HTTP API](#http-api)).
 
 ---
 
