@@ -364,17 +364,27 @@ export async function setupClnChannel(
 
 // ── Strict Payment Helpers ──────────────────────────────────────
 
-/** Poll until `check` returns truthy or the timeout elapses; null on timeout. */
+/**
+ * Poll until `check` returns truthy, or throw a labelled timeout error once
+ * `timeoutMs` elapses. It used to return null on timeout (issue #603), which
+ * every caller then had to remember to assert on; a wait that silently gave
+ * up now fails the test by itself, naming what it was waiting for.
+ */
 export async function waitFor<T>(
 	check: () => T | null | Promise<T | null>,
 	timeoutMs: number,
+	label = 'condition',
 	intervalMs = 500
-): Promise<T | null> {
+): Promise<T> {
 	const start = Date.now();
 	for (;;) {
 		const v = await check();
 		if (v) return v;
-		if (Date.now() - start >= timeoutMs) return null;
+		if (Date.now() - start >= timeoutMs) {
+			throw new Error(
+				`waitFor: timed out after ${timeoutMs}ms waiting for ${label}`
+			);
+		}
 		await sleep(intervalMs);
 	}
 }
@@ -412,14 +422,15 @@ export async function payClnInvoiceStrict(
 		throw new Error(`sendPayment returned no paymentHash (${tag})`);
 	}
 
-	const paid = await waitFor(async () => {
-		const { invoices } = await cln.listInvoices(label);
-		const inv = (invoices || [])[0];
-		return inv && inv.status === 'paid' ? inv : null;
-	}, 30_000);
-	if (!paid) {
-		throw new Error(`CLN invoice did not settle within 30s (${tag})`);
-	}
+	const paid = await waitFor(
+		async () => {
+			const { invoices } = await cln.listInvoices(label);
+			const inv = (invoices || [])[0];
+			return inv && inv.status === 'paid' ? inv : null;
+		},
+		30_000,
+		`CLN invoice to settle (${tag})`
+	);
 	const received = Number(parseClnMsat(paid.amount_received_msat));
 	if (received !== amountMsat) {
 		throw new Error(
@@ -427,18 +438,20 @@ export async function payClnInvoiceStrict(
 		);
 	}
 
-	const done = await waitFor(() => {
-		const p = node
-			.listPayments()
-			.find(
-				(x) =>
-					x.paymentHash.toString('hex') === payment.paymentHash.toString('hex')
-			);
-		return p && p.status === PaymentStatus.COMPLETED ? p : null;
-	}, 15_000);
-	if (!done) {
-		throw new Error(`beignet payment did not reach COMPLETED (${tag})`);
-	}
+	await waitFor(
+		() => {
+			const p = node
+				.listPayments()
+				.find(
+					(x) =>
+						x.paymentHash.toString('hex') ===
+						payment.paymentHash.toString('hex')
+				);
+			return p && p.status === PaymentStatus.COMPLETED ? p : null;
+		},
+		15_000,
+		`beignet payment to reach COMPLETED (${tag})`
+	);
 }
 
 /**
@@ -461,19 +474,21 @@ export async function payBeignetInvoiceStrict(
 		throw new Error(`CLN pay returned no preimage (${tag})`);
 	}
 
-	const incoming = await waitFor(() => {
-		const p = node
-			.listPayments()
-			.find(
-				(x) =>
-					x.direction === PaymentDirection.INCOMING &&
-					x.paymentHash.toString('hex') === invoice.paymentHash.toString('hex')
-			);
-		return p && p.status === PaymentStatus.COMPLETED ? p : null;
-	}, 15_000);
-	if (!incoming) {
-		throw new Error(`incoming payment did not complete (${tag})`);
-	}
+	const incoming = await waitFor(
+		() => {
+			const p = node
+				.listPayments()
+				.find(
+					(x) =>
+						x.direction === PaymentDirection.INCOMING &&
+						x.paymentHash.toString('hex') ===
+							invoice.paymentHash.toString('hex')
+				);
+			return p && p.status === PaymentStatus.COMPLETED ? p : null;
+		},
+		15_000,
+		`incoming payment to complete (${tag})`
+	);
 	if (Number(incoming.amountMsat) !== amountMsat) {
 		throw new Error(
 			`beignet received ${incoming.amountMsat} msat, expected ${amountMsat} (${tag})`

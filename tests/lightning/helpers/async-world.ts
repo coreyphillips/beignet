@@ -44,6 +44,7 @@ import {
 	IHeldForwardNotice,
 	RELEASE_HELD_HTLC_TLV_TYPE
 } from '../../../src/lightning/async-payments/types';
+import { settle as waitUntil } from './settle';
 
 export const ALICE_SEED = 91;
 export const LSP_SEED = 92;
@@ -337,12 +338,14 @@ export async function waitFor(
 	what: string,
 	timeoutMs = 10_000
 ): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
-		if (Date.now() > deadline) {
-			throw new Error(`timed out waiting for ${what}`);
-		}
-		await new Promise<void>((resolve) => setImmediate(resolve));
+	// A thin wrapper over settle (issue #603): the loop this replaced polled on
+	// bare setImmediate for the whole deadline, so a slow or never-true
+	// predicate held a core at 100% until it expired. settle spins for 25 ms
+	// and then parks on real sleeps; the deadline is unchanged.
+	try {
+		await waitUntil(predicate, timeoutMs);
+	} catch {
+		throw new Error(`timed out waiting for ${what} (${timeoutMs}ms)`);
 	}
 }
 
