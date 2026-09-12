@@ -185,6 +185,10 @@ export class Wallet {
 	// a wallet that restarts scans against a server that knows the spend.
 	private readonly _spentOutpoints: Map<string, number> = new Map();
 	private _spendSeq = 0;
+	// The mark every getUtxos query still in flight was issued at. A record can
+	// only be dropped once the oldest of them has landed: drop it sooner and the
+	// older scan's stale answer has nothing left to filter against.
+	private readonly _scanMarks: number[] = [];
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
 	// BIP32 account index as a path segment string ('0' by default).
@@ -2428,13 +2432,20 @@ export class Wallet {
 		// Read before the query so a broadcast landing while it is in flight is
 		// known to be newer than the answer it returns.
 		const spendMark = this._spendSeq;
-		const getUtxosRes = await this.electrum.getUtxos({
-			scanningStrategy,
-			addressIndex,
-			changeAddressIndex,
-			addressTypesToCheck,
-			additionalAddresses
-		});
+		this._scanMarks.push(spendMark);
+		let getUtxosRes: Result<IGetUtxosResponse>;
+		try {
+			getUtxosRes = await this.electrum.getUtxos({
+				scanningStrategy,
+				addressIndex,
+				changeAddressIndex,
+				addressTypesToCheck,
+				additionalAddresses
+			});
+		} finally {
+			const at = this._scanMarks.indexOf(spendMark);
+			if (at !== -1) this._scanMarks.splice(at, 1);
+		}
 		if (getUtxosRes.isErr()) {
 			return err(getUtxosRes.error.message);
 		}
@@ -2528,9 +2539,12 @@ export class Wallet {
 		// Whatever this scan is newer than, it has settled: the coin is gone
 		// from the server's view, or the scan reports it and is believed. The
 		// second half matters, because a broadcast that never propagated must
-		// not hide a live coin for the life of the wallet.
+		// not hide a live coin for the life of the wallet. A scan still in
+		// flight that predates this one holds the record open, since it is the
+		// one whose stale answer would otherwise bring the coin back.
+		const settled = Math.min(spendMark, ...this._scanMarks);
 		for (const [outpoint, mark] of this._spentOutpoints) {
-			if (mark <= spendMark) this._spentOutpoints.delete(outpoint);
+			if (mark <= settled) this._spentOutpoints.delete(outpoint);
 		}
 		return { utxos, spentValue };
 	}

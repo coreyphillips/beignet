@@ -125,6 +125,14 @@ const txSpending = (outpoints: IUtxo[]): string => {
 const outpoints = (utxos: IUtxo[]): string[] =>
 	utxos.map((utxo) => `${utxo.tx_hash}:${utxo.tx_pos}`);
 
+/** Yields to the event loop until the condition holds. */
+const waitFor = async (condition: () => boolean): Promise<void> => {
+	for (let i = 0; i < 200 && !condition(); i++) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	if (!condition()) throw new Error('Condition never held.');
+};
+
 describe('Broadcast drops the coins it spends', function () {
 	this.timeout(testTimeout);
 
@@ -235,6 +243,38 @@ describe('Broadcast drops the coins it spends', function () {
 		if (scanRes.isErr()) throw scanRes.error;
 		expect(outpoints(scanRes.value.utxos)).to.deep.equal(outpoints([utxoB]));
 		expect(scanRes.value.balance).to.equal(40000);
+		expect(outpoints(wallet.listUtxos())).to.deep.equal(outpoints([utxoB]));
+		expect(wallet.getBalance()).to.equal(40000);
+	});
+
+	it('does not let a later scan clear the record an older scan still needs', async () => {
+		sinon.stub(wallet, 'checkElectrumConnection').resolves(ok('connected'));
+		const answers: ((result: Result<IGetUtxosResponse>) => void)[] = [];
+		sinon.stub(wallet.electrum, 'getUtxos').callsFake(
+			() =>
+				new Promise((resolve) => {
+					answers.push(resolve);
+				})
+		);
+
+		const stale = wallet.getUtxos({});
+		await waitFor(() => answers.length === 1);
+
+		const res = await wallet.broadcastTransaction(txSpending([utxoA]));
+		if (res.isErr()) throw res.error;
+
+		const fresh = wallet.getUtxos({});
+		await waitFor(() => answers.length === 2);
+
+		// The second scan asked after the broadcast and the server knows.
+		answers[1](ok({ utxos: [utxoB], balance: 40000 }));
+		const freshRes = await fresh;
+		if (freshRes.isErr()) throw freshRes.error;
+
+		// The first asked before it and does not, so it must still be filtered.
+		answers[0](ok({ utxos: [utxoA, utxoB], balance: 100000 }));
+		const staleRes = await stale;
+		if (staleRes.isErr()) throw staleRes.error;
 		expect(outpoints(wallet.listUtxos())).to.deep.equal(outpoints([utxoB]));
 		expect(wallet.getBalance()).to.equal(40000);
 	});
