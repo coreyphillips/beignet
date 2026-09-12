@@ -92,10 +92,14 @@ describe('Interop: Beignet pays a CLN BOLT 12 offer (regtest)', function () {
 		// The payment leg needs the channel USABLE, not just opened: wait for
 		// NORMAL on both sides before wiring routing (the scid lands then too).
 		await waitForClnPeerChannelNormal(cln, node.getNodeId(), 90_000);
-		const normal = await waitFor(() => {
-			const ch = node!.getChannelManager().getChannel(setup.channelId);
-			return ch && ch.getState() === ChannelState.NORMAL ? ch : null;
-		}, 60_000);
+		const normal = await waitFor(
+			() => {
+				const ch = node!.getChannelManager().getChannel(setup.channelId);
+				return ch && ch.getState() === ChannelState.NORMAL ? ch : null;
+			},
+			60_000,
+			'beignet channel NORMAL'
+		);
 		expect(normal, 'beignet channel NORMAL').to.not.equal(null);
 		// Sync beignet's block height so the payment's absolute CLTV is relative
 		// to the real tip (defaults to 0 with no chain backend in-test, which the
@@ -136,22 +140,30 @@ describe('Interop: Beignet pays a CLN BOLT 12 offer (regtest)', function () {
 		expect(payment.paymentHash).to.exist;
 
 		const hashHex = invoice.paymentHash!.toString('hex');
-		const paidInvoice = await waitFor(async () => {
-			const { invoices } = await cln.listInvoices();
-			const inv = invoices.find((i) => i.payment_hash === hashHex);
-			return inv && inv.status === 'paid' ? inv : null;
-		}, 90_000);
+		const paidInvoice = await waitFor(
+			async () => {
+				const { invoices } = await cln.listInvoices();
+				const inv = invoices.find((i) => i.payment_hash === hashHex);
+				return inv && inv.status === 'paid' ? inv : null;
+			},
+			90_000,
+			'CLN invoice for the offer marked paid'
+		);
 		expect(paidInvoice, 'CLN invoice for the offer marked paid').to.not.equal(
 			null
 		);
 
 		// Our own payment record settled too.
-		const settled = await waitFor(() => {
-			const p = node!
-				.listPayments()
-				.find((x) => x.paymentHash.toString('hex') === hashHex);
-			return p && p.status === PaymentStatus.COMPLETED ? p : null;
-		}, 30_000);
+		const settled = await waitFor(
+			() => {
+				const p = node!
+					.listPayments()
+					.find((x) => x.paymentHash.toString('hex') === hashHex);
+				return p && p.status === PaymentStatus.COMPLETED ? p : null;
+			},
+			30_000,
+			'beignet payment record COMPLETED'
+		);
 		expect(settled, 'beignet payment record SUCCEEDED').to.not.equal(null);
 
 		await sleep(500);

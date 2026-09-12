@@ -114,6 +114,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { settle } from './helpers/settle';
 
 bitcoin.initEccLib(ecc);
 
@@ -896,24 +897,20 @@ class FakeTowerConn extends EventEmitter implements ITowerTransport {
 }
 
 /**
- * Wait until pred() holds, or give up after `ms` and let the assertion that
- * follows report the real failure.
+ * Predicate waits go through settle() from helpers/settle, which THROWS when
+ * its deadline passes. The local waitFor it replaced ran the deadline out and
+ * returned, so a predicate that never came true read as a pass and every
+ * assertion behind it was decorative (issue #603).
  *
- * This file used to sleep a fixed 10 to 40 ms instead. Those budgets were sized
- * on an idle machine, but per-blob-type session negotiation opens a second real
- * connection, so under mocha --parallel a loaded box missed them and these
- * cases failed intermittently while passing in isolation.
+ * The 5000 ms budget at each site is not overhead. This file used to sleep a
+ * fixed 10 to 40 ms instead. Those budgets were sized on an idle machine, but
+ * per-blob-type session negotiation opens a second real connection, so under
+ * mocha --parallel a loaded box missed them and these cases failed
+ * intermittently while passing in isolation. Do not shrink it.
  */
-async function waitFor(pred: () => boolean, ms = 5000): Promise<void> {
-	const deadline = Date.now() + ms;
-	while (Date.now() < deadline) {
-		if (pred()) return;
-		await new Promise((r) => setTimeout(r, 1));
-	}
-}
 
 describe('watchtower client per-blob-type sessions', function () {
-	// Explicit rather than inherited: waitFor() below allows up to 5 s for a
+	// Explicit rather than inherited: settle() below allows up to 5 s for a
 	// condition, which only elapses when something is genuinely broken, and
 	// mocha's 2000 ms default would cut that short and report an opaque
 	// timeout instead of the assertion that actually failed. 20_000 matches
@@ -968,19 +965,23 @@ describe('watchtower client per-blob-type sessions', function () {
 		const net = new FakeTowerNet();
 		const client = makeClient(net);
 		await client.start();
-		await waitFor(() => net.sessionFor(BlobType.ALTRUIST_COMMIT) !== undefined);
+		await settle(
+			() => net.sessionFor(BlobType.ALTRUIST_COMMIT) !== undefined,
+			5000
+		);
 		// Eager default: the legacy session.
 		expect(net.sessionFor(BlobType.ALTRUIST_COMMIT), 'legacy session').to.exist;
 
 		client.backupRevokedState(taprootCtx);
 		client.backupRevokedState(legacyPairCtx);
-		await waitFor(
+		await settle(
 			() =>
 				(net.sessionFor(BlobType.ALTRUIST_TAPROOT_COMMIT)?.updates.length ??
 					0) > 0 &&
 				(net.sessionFor(BlobType.ALTRUIST_COMMIT)?.updates.length ?? 0) > 0 &&
 				net.connections.length === 2 &&
-				client.getHealth()[0].pendingBacklog === 0
+				client.getHealth()[0].pendingBacklog === 0,
+			5000
 		);
 
 		const taprootSession = net.sessionFor(BlobType.ALTRUIST_TAPROOT_COMMIT);
@@ -1012,15 +1013,19 @@ describe('watchtower client per-blob-type sessions', function () {
 		const events: any[] = [];
 		client.on('log', (e) => events.push(e));
 		await client.start();
-		await waitFor(() => net.sessionFor(BlobType.ALTRUIST_COMMIT) !== undefined);
+		await settle(
+			() => net.sessionFor(BlobType.ALTRUIST_COMMIT) !== undefined,
+			5000
+		);
 
 		client.backupRevokedState(taprootCtx);
 		client.backupRevokedState(legacyPairCtx);
-		await waitFor(
+		await settle(
 			() =>
 				(net.sessionFor(BlobType.ALTRUIST_COMMIT)?.updates.length ?? 0) > 0 &&
 				events.some((e) => e.event === 'session_rejected') &&
-				client.getHealth()[0].pendingBacklog === 1
+				client.getHealth()[0].pendingBacklog === 1,
+			5000
 		);
 
 		// Legacy flows; taproot stays queued (never dropped, never shipped).
@@ -1038,7 +1043,7 @@ describe('watchtower client per-blob-type sessions', function () {
 
 		// A second taproot backup also queues quietly.
 		client.backupRevokedState(taprootCtx);
-		await waitFor(() => client.getHealth()[0].pendingBacklog === 2);
+		await settle(() => client.getHealth()[0].pendingBacklog === 2, 5000);
 		expect(client.getHealth()[0].pendingBacklog).to.equal(2);
 		client.stop();
 	});

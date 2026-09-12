@@ -264,10 +264,14 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 		console.log(`    leased funding tx ${fundRes.txid}`);
 
 		// The lease channel exists on our side with the lessor bookkeeping.
-		const channel = (await waitFor(() => {
-			const chans = node!.getChannelManager().listChannels();
-			return chans.length > 0 ? chans[0] : null;
-		}, 30_000))!;
+		const channel = await waitFor(
+			() => {
+				const chans = node!.getChannelManager().listChannels();
+				return chans.length > 0 ? chans[0] : null;
+			},
+			30_000,
+			'the lease channel on our side'
+		);
 		expect(channel, 'lease channel created').to.exist;
 		const state = channel.getFullState();
 		expect(state.isLessor, 'we are the lessor').to.equal(true);
@@ -287,7 +291,8 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 		await waitForClnPeerChannelNormal(cln, node.getNodeId(), 60_000);
 		await waitFor(
 			() => (channel.getState() === ChannelState.NORMAL ? true : null),
-			30_000
+			30_000,
+			'the lease channel to reach NORMAL'
 		);
 		console.log(
 			`    LEASED CHANNEL OPEN (beignet lessor): CLN ${CLN_FUNDING} + ` +
@@ -301,10 +306,14 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 		await mineBlocks(3);
 		const tip3 = (await bitcoinRpc('getblockcount', [])) as number;
 		node.handleNewBlock(tip3);
-		const advanced = (await waitFor(() => {
-			const h = channel.getFullState().leaseCommitBlockheight;
-			return h !== undefined && h > openHeight ? h : null;
-		}, 90_000))!;
+		const advanced = await waitFor(
+			() => {
+				const h = channel.getFullState().leaseCommitBlockheight;
+				return h !== undefined && h > openHeight ? h : null;
+			},
+			90_000,
+			'the first update_blockheight round'
+		);
 		console.log(
 			`    update_blockheight LIVE: agreed height ${openHeight} -> ${advanced}`
 		);
@@ -318,10 +327,14 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 		await mineBlocks(3);
 		const tip4 = (await bitcoinRpc('getblockcount', [])) as number;
 		node.handleNewBlock(tip4);
-		const advanced2 = (await waitFor(() => {
-			const h = channel.getFullState().leaseCommitBlockheight;
-			return h !== undefined && h > advanced ? h : null;
-		}, 90_000))!;
+		const advanced2 = await waitFor(
+			() => {
+				const h = channel.getFullState().leaseCommitBlockheight;
+				return h !== undefined && h > advanced ? h : null;
+			},
+			90_000,
+			'the second update_blockheight round'
+		);
 		expect(advanced2).to.be.greaterThan(advanced);
 		expect(channel.getState()).to.equal(ChannelState.NORMAL);
 
@@ -375,23 +388,27 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 			unilateraltimeout: 1,
 			destination: clnDest
 		});
-		const closingHex = (await waitFor(async () => {
-			const mem = (await bitcoinRpc('getrawmempool', [])) as string[];
-			for (const txid of mem) {
-				const hex = (await bitcoinRpc('getrawtransaction', [txid])) as string;
-				const t = bitcoin.Transaction.fromHex(hex);
-				if (
-					t.ins.some(
-						(i) =>
-							Buffer.from(i.hash).equals(fundingTxidInternal) &&
-							i.index === fundingVout
-					)
-				) {
-					return hex;
+		const closingHex = await waitFor(
+			async () => {
+				const mem = (await bitcoinRpc('getrawmempool', [])) as string[];
+				for (const txid of mem) {
+					const hex = (await bitcoinRpc('getrawtransaction', [txid])) as string;
+					const t = bitcoin.Transaction.fromHex(hex);
+					if (
+						t.ins.some(
+							(i) =>
+								Buffer.from(i.hash).equals(fundingTxidInternal) &&
+								i.index === fundingVout
+						)
+					) {
+						return hex;
+					}
 				}
-			}
-			return null;
-		}, 60_000))!;
+				return null;
+			},
+			60_000,
+			'the closing tx in the mempool'
+		);
 		const closingTx = bitcoin.Transaction.fromHex(closingHex);
 		await mineBlocks(1);
 		const confHeight = (await bitcoinRpc('getblockcount', [])) as number;
