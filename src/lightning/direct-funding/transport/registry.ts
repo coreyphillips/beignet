@@ -124,6 +124,10 @@ export class DfTransportRegistry {
 		exchange: (lane: IDfTransport) => Promise<T>
 	): Promise<T> {
 		let attempted = 0;
+		// Why each lane that was tried refused, for the UNREACHABLE raised when
+		// none carried a frame: a payer whose onion send was refused locally
+		// should read that reason, not a bare "every transport failed".
+		const refusals: string[] = [];
 		const self = this.peerView.nodeId?.();
 		for (const descriptor of this.withExistingConnection(
 			withSynthesizedRelay(transports),
@@ -163,10 +167,12 @@ export class DfTransportRegistry {
 				this.skip(descriptor.type, DfLaneSkipReason.NOT_ESTABLISHED, {
 					error: errorText(err)
 				});
+				refusals.push(`${laneName(descriptor.type)}: ${errorText(err)}`);
 				continue;
 			}
 			if (!lane) {
 				this.skip(descriptor.type, DfLaneSkipReason.NOT_ESTABLISHED);
+				refusals.push(`${laneName(descriptor.type)}: not established`);
 				continue;
 			}
 			attempted++;
@@ -177,6 +183,7 @@ export class DfTransportRegistry {
 				this.skip(descriptor.type, DfLaneSkipReason.NO_FRAME_EXCHANGED, {
 					error: errorText(err)
 				});
+				refusals.push(`${laneName(descriptor.type)}: ${errorText(err)}`);
 			} finally {
 				lane.close();
 			}
@@ -185,7 +192,8 @@ export class DfTransportRegistry {
 			DirectFundingErrorCode.UNREACHABLE,
 			attempted === 0
 				? 'no usable transport in the payment request'
-				: 'every transport in the payment request failed to carry a frame'
+				: 'every transport in the payment request failed to carry a frame' +
+				  (refusals.length > 0 ? ` (${refusals.join('; ')})` : '')
 		);
 	}
 
@@ -257,6 +265,11 @@ export class DfTransportRegistry {
 
 function errorText(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
+}
+
+/** The enum's name for a transport type, or its number for one it lacks. */
+function laneName(type: number): string {
+	return DfTransportType[type] ?? String(type);
 }
 
 /**

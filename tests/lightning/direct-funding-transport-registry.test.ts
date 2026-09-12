@@ -449,6 +449,41 @@ describe('Direct-funding transport registry', () => {
 			);
 		});
 
+		it('names every lane refusal in the UNREACHABLE it raises', async () => {
+			const first = new StubFactory(DfTransportType.ONION_MESSAGE);
+			const second = new StubFactory(DfTransportType.DIRECT_PEER, 'throw');
+			const registry = new DfTransportRegistry();
+			registry.register({
+				type: DfTransportType.ONION_MESSAGE,
+				enabled: true,
+				load: () => first
+			});
+			registry.register({
+				type: DfTransportType.DIRECT_PEER,
+				enabled: true,
+				load: () => second
+			});
+
+			let err: unknown;
+			try {
+				await registry.run([onion(), directPeer()], CTX, async () => {
+					throw new Error('link refused the frame');
+				});
+			} catch (e) {
+				err = e;
+			}
+
+			// A payer whose own link refused the offer reads that reason here,
+			// not a bare "every transport failed" (issue #790).
+			expect((err as DirectFundingError).code).to.equal(
+				DirectFundingErrorCode.UNREACHABLE
+			);
+			expect((err as DirectFundingError).message).to.equal(
+				'every transport in the payment request failed to carry a frame ' +
+					'(ONION_MESSAGE: link refused the frame; DIRECT_PEER: dial refused)'
+			);
+		});
+
 		it('NEVER falls through once a frame has been exchanged', async () => {
 			const first = new StubFactory(DfTransportType.ONION_MESSAGE);
 			const second = new StubFactory(DfTransportType.DIRECT_PEER);

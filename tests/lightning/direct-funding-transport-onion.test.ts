@@ -306,15 +306,47 @@ describe('Direct-funding lane 2: onion messages', () => {
 			}
 		)) as IDfTransport;
 
-		// The node's onion send hook swallows a `sendToPeer` failure, so a lane
-		// that trusted it would count a frame that never left the process and
-		// deny the registry the fall-through it is owed.
+		// A cheap refusal ahead of the send boundary: no sphinx packet is built
+		// for a link the peer view no longer lists.
 		h.payer.connections.delete(h.intro.id);
 
 		expect(() => lane.send(OFFER, cont())).to.throw(/introduction node/);
 		expect(lane.trySend(OFFER, cont())).to.equal(false);
 		expect(lane.framesExchanged()).to.equal(0);
 		expect(recorder.reasons()).to.deep.equal([DfDropReason.SEND_FAILED]);
+		lane.close();
+	});
+
+	it('refuses a send the peer link rejects while the intro node is still listed, and counts nothing', async () => {
+		const store = new DirectFundingRequestStore({});
+		const record = store.mint();
+		const recorder = recordingLog();
+		const lane = (await payerFactory(h, recorder.log).open(
+			descriptorFor(receiverPath(h, record)),
+			{
+				requestId: Buffer.from(record.requestId, 'hex'),
+				receiverNodeId: h.receiver.pubkey
+			}
+		)) as IDfTransport;
+
+		// The peer view still says connected; the write itself is what the
+		// node's link refuses (a peer no longer ready, an outbound gate). The
+		// hook used to swallow that, and the lane counted a frame that never
+		// left the process (issue #790).
+		h.managers.get(h.payer.id)!.setSendFunction(() => {
+			throw new Error('Peer is not ready for messaging');
+		});
+
+		expect(() => lane.send(OFFER, cont())).to.throw(
+			/refused the frame: Peer is not ready for messaging/
+		);
+		expect(lane.trySend(OFFER, cont())).to.equal(false);
+		expect(lane.framesExchanged()).to.equal(0);
+		expect(recorder.reasons()).to.deep.equal([DfDropReason.SEND_FAILED]);
+		expect(String(recorder.lines[0].data.error)).to.match(
+			/Peer is not ready for messaging/
+		);
+		expect(h.wireSizes).to.have.length(0);
 		lane.close();
 	});
 
