@@ -944,6 +944,13 @@ export class LightningNode extends EventEmitter {
 			cltvExpiry: number;
 		}>
 	> = new Map();
+	// Payment hashes whose parked set is mid-dispatch in settleHeldHtlc or
+	// cancelHeldHtlc. Both fulfill and fail reach the wire synchronously, and
+	// that dispatch can reenter the node through a transport or application
+	// callback, so the hash is claimed for the duration: a nested settle/cancel
+	// refuses instead of resolving the same set a second time and reporting a
+	// second terminal state for it.
+	private resolvingHeldHtlcs: Set<string> = new Set();
 	private holdInvoiceEventQueue: Array<{
 		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled';
 		event: IHoldInvoiceStateEvent | IHoldCancelledEvent;
@@ -17820,13 +17827,19 @@ export class LightningNode extends EventEmitter {
 	 * for the payment hash. With no preimage argument the node uses the one it
 	 * generated at createInvoice; an external preimage (validated against the
 	 * hash) is required for hold invoices created with an external payment hash.
-	 * Returns false when nothing is parked for the hash.
+	 * Returns false when nothing is parked for the hash, when another
+	 * settle/cancel is already dispatching for it, or when the channel refused
+	 * every parked part.
 	 * Throws if the preimage cannot be persisted, before revealing it.
 	 */
 	settleHeldHtlc(paymentHash: Buffer, preimage?: Buffer): boolean {
 		const hashHex = paymentHash.toString('hex');
 		const held = this.heldHtlcs.get(hashHex);
 		if (!held || held.length === 0) return false;
+		// A settle or cancel already dispatching owns this set (see
+		// resolvingHeldHtlcs): the caller is a reentrant one, not a second
+		// resolution.
+		if (this.resolvingHeldHtlcs.has(hashHex)) return false;
 
 		const pre = preimage ?? this.preimages.get(hashHex);
 		if (!pre) {
@@ -17854,11 +17867,34 @@ export class LightningNode extends EventEmitter {
 		this.preimages.set(hashHex, pre);
 		this.channelManager.recordPreimage(paymentHash, pre);
 
-		for (const h of held) {
-			this.cleanupHtlcSharedSecret(
-				`${h.channelId.toString('hex')}:${h.htlcId}`
-			);
-			this.channelManager.fulfillHtlc(h.channelId, h.htlcId, pre);
+		this.resolvingHeldHtlcs.add(hashHex);
+		let fulfilled = 0;
+		try {
+			for (const h of held) {
+				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
+				if (!this.channelManager.fulfillHtlc(h.channelId, h.htlcId, pre).ok) {
+					continue;
+				}
+				fulfilled++;
+				// Only once the fulfil is on its way: a refused part stays parked
+				// for a retry, and a cancel of that part still needs the secret to
+				// build a failure message the payer can decrypt.
+				this.cleanupHtlcSharedSecret(key);
+			}
+		} finally {
+			this.resolvingHeldHtlcs.delete(hashHex);
+		}
+		// Nothing reached the payer (a channel awaiting reestablish refuses every
+		// fulfil, for one). Report the refusal and leave the set parked rather
+		// than closing the invoice SETTLED over HTLCs the payer still holds. The
+		// preimage stays recorded: the monitors need it to claim on-chain if the
+		// channel closes before a retry lands.
+		if (fulfilled === 0) {
+			this.emitStructuredLog('htlc', 'held_settle_refused', {
+				paymentHash: hashHex,
+				htlcCount: held.length
+			});
+			return false;
 		}
 
 		this.heldHtlcs.delete(hashHex);
@@ -17912,7 +17948,9 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Cancel a hold invoice: fail every parked HTLC back to the payer.
-	 * Returns false when nothing is parked for the hash.
+	 * Returns false when nothing is parked for the hash, when another
+	 * settle/cancel is already dispatching for it, or when the channel refused
+	 * every parked part.
 	 */
 	cancelHeldHtlc(
 		paymentHash: Buffer,
@@ -17922,24 +17960,52 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const held = this.heldHtlcs.get(hashHex);
 		if (!held || held.length === 0) return false;
+		// A settle or cancel already dispatching owns this set (see
+		// resolvingHeldHtlcs): the caller is a reentrant one, not a second
+		// resolution.
+		if (this.resolvingHeldHtlcs.has(hashHex)) return false;
 
-		for (const h of held) {
-			const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
-			const ss = this.receivedHtlcSharedSecrets.get(key);
-			// This path defaults to incorrect_or_unknown_payment_details, and the
-			// CLTV sweeper cancels through it with that default, so it needs the
-			// same [htlc_msat][height] payload as every other PERM|15 we send.
-			const reason = ss
-				? createFailureMessage(
-						ss,
-						failureCode,
-						failureCode === INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
-							? this.incorrectPaymentDetailsData(h.amountMsat)
-							: undefined
-				  )
-				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-			this.cleanupHtlcSharedSecret(key);
-			this.channelManager.failHtlc(h.channelId, h.htlcId, reason);
+		this.resolvingHeldHtlcs.add(hashHex);
+		let failed = 0;
+		try {
+			for (const h of held) {
+				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
+				const ss = this.receivedHtlcSharedSecrets.get(key);
+				// This path defaults to incorrect_or_unknown_payment_details, and the
+				// CLTV sweeper cancels through it with that default, so it needs the
+				// same [htlc_msat][height] payload as every other PERM|15 we send.
+				const reason = ss
+					? createFailureMessage(
+							ss,
+							failureCode,
+							failureCode === INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+								? this.incorrectPaymentDetailsData(h.amountMsat)
+								: undefined
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				if (!this.channelManager.failHtlc(h.channelId, h.htlcId, reason).ok) {
+					continue;
+				}
+				failed++;
+				// The shared secret goes only once the failure is on its way: a
+				// refused part stays parked and is retried, and a retry that lost
+				// the secret can only send a zeroed packet the payer cannot decrypt.
+				this.cleanupHtlcSharedSecret(key);
+			}
+		} finally {
+			this.resolvingHeldHtlcs.delete(hashHex);
+		}
+		// Nothing reached the payer (a channel awaiting reestablish refuses every
+		// fail, for one). Report the refusal and leave the set parked rather than
+		// closing the invoice CANCELLED over HTLCs the payer still holds; the
+		// expiry sweeper retries this same call on every block.
+		if (failed === 0) {
+			this.emitStructuredLog('htlc', 'held_cancel_refused', {
+				paymentHash: hashHex,
+				reason: cancelReason,
+				htlcCount: held.length
+			});
+			return false;
 		}
 
 		this.heldHtlcs.delete(hashHex);
@@ -18018,15 +18084,19 @@ export class LightningNode extends EventEmitter {
 	 * payer (incorrect_or_unknown_payment_details) and closes the invoice so
 	 * future HTLCs are rejected. Works before an HTLC arrives (unlike
 	 * cancelHeldHtlc). Returns the number of HTLCs failed, or null when the
-	 * hash is not a known open hold invoice.
+	 * hash is not a known open hold invoice or its parked set could not be
+	 * failed back.
 	 */
 	cancelHoldInvoice(paymentHash: Buffer): { htlcsFailed: number } | null {
 		const hashHex = paymentHash.toString('hex');
 		const held = this.heldHtlcs.get(hashHex);
 		if (held && held.length > 0) {
 			const count = held.length;
-			// cancelHeldHtlc also marks the invoice cancelled.
-			this.cancelHeldHtlc(paymentHash);
+			// cancelHeldHtlc also marks the invoice cancelled. A refusal (a settle
+			// already dispatching for this hash, or a channel that failed nothing
+			// back) leaves the invoice open, so it must not be reported as a
+			// cancellation.
+			if (!this.cancelHeldHtlc(paymentHash)) return null;
 			return { htlcsFailed: count };
 		}
 		if (!this.heldInvoiceHashes.has(hashHex)) return null;

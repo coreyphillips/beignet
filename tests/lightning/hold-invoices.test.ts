@@ -941,5 +941,90 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				]);
 			});
 		}
+
+		// Settle and cancel both reach the wire synchronously, so a transport or
+		// application callback on message:outbound can call the opposite
+		// operation from inside the dispatch. Only the one that claimed the
+		// parked set may resolve it (issue #771).
+		for (const outer of ['settle', 'cancel'] as const) {
+			it(`refuses a nested ${
+				outer === 'settle' ? 'cancel' : 'settle'
+			} raised from the ${outer} dispatch`, function () {
+				const alice = createNode(outer === 'settle' ? 37 : 39);
+				const bob = createNode(outer === 'settle' ? 38 : 40);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildGraph(alice, bob, [channelId]);
+				const { hash, preimage } = makeExternalHash();
+				const invoice = bob.createInvoice({
+					amountMsat: 5_000_000n,
+					description: 'hold-reentrant-resolution',
+					hold: true,
+					paymentHash: hash
+				});
+				alice.sendPayment(invoice.bolt11);
+				expect(bob.listHeldHtlcs()).to.have.length(1);
+				const events = holdEvents(bob);
+
+				let nested: unknown;
+				bob.once('message:outbound', () => {
+					nested =
+						outer === 'settle'
+							? bob.cancelHoldInvoice(hash)
+							: bob.settleHeldHtlc(hash, preimage);
+				});
+				const resolved =
+					outer === 'settle'
+						? bob.settleHeldHtlc(hash, preimage)
+						: bob.cancelHoldInvoice(hash);
+
+				expect(nested, 'the nested call refused').to.equal(
+					outer === 'settle' ? null : false
+				);
+				expect(resolved, 'the claiming call resolved the hold').to.deep.equal(
+					outer === 'settle' ? true : { htlcsFailed: 1 }
+				);
+				expect(events.map(([name]) => name)).to.deep.equal([
+					outer === 'settle' ? 'hold:settled' : 'hold:cancelled'
+				]);
+				expect(bob.listHoldInvoices()[0].state).to.equal(
+					outer === 'settle' ? 'SETTLED' : 'CANCELLED'
+				);
+				expect(alice.getPayment(hash)?.status).to.equal(
+					outer === 'settle' ? PaymentStatus.COMPLETED : PaymentStatus.FAILED
+				);
+			});
+		}
+
+		it('refuses settle and cancel when the channel sends neither', function () {
+			const alice = createNode(41);
+			const bob = createNode(42);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildGraph(alice, bob, [channelId]);
+			const { hash, preimage } = makeExternalHash();
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-refused-dispatch',
+				hold: true,
+				paymentHash: hash
+			});
+			alice.sendPayment(invoice.bolt11);
+			expect(bob.listHeldHtlcs()).to.have.length(1);
+			const events = holdEvents(bob);
+
+			// A disconnected channel is AWAITING_REESTABLISH, which refuses both
+			// the fulfil and the fail: nothing reaches the payer either way.
+			bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+
+			expect(bob.settleHeldHtlc(hash, preimage)).to.equal(false);
+			expect(bob.cancelHoldInvoice(hash)).to.equal(null);
+			// No terminal event, and the set stays parked for a retry once the
+			// channel can send again.
+			expect(events).to.have.length(0);
+			expect(bob.listHeldHtlcs()).to.have.length(1);
+			expect(bob.listHoldInvoices()[0].state).to.equal('ACCEPTED');
+			expect(alice.getPayment(hash)?.status).to.equal(PaymentStatus.PENDING);
+		});
 	});
 });

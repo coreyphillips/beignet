@@ -1675,9 +1675,19 @@ export class ReverseSwapProvider extends EventEmitter {
 				this.emitSwap('swap:settled', moved.record!);
 			return;
 		}
+		// The set is still parked, so the node refused the settle for now (a
+		// channel awaiting reestablish fulfils nothing). Stay CLAIMED, which
+		// every pass retries; EXPOSED would never settle this hold again.
+		const snapshot = this.deps.heldSnapshot(paymentHash);
+		if (snapshot?.state === 'ACCEPTED') {
+			this.deps.log('swap_settle_refused', {
+				swapId: record.id,
+				paymentHash: record.paymentHashHex
+			});
+			return;
+		}
 		// Nothing was parked: the hold went away under us (or was settled
 		// already by an earlier pass that crashed before recording it).
-		const snapshot = this.deps.heldSnapshot(paymentHash);
 		if (snapshot?.state === 'SETTLED') {
 			const moved = this.deps.ledger.move(record.id, 'SETTLED', {
 				settledAt: this.now()
