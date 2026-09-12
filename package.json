@@ -1,6 +1,6 @@
 {
   "name": "beignet",
-  "version": "0.19.4",
+  "version": "0.19.5",
   "description": "A self-custodial, JS Bitcoin wallet + Lightning Network management library.",
   "main": "dist/index.js",
   "bin": {
@@ -34,6 +34,7 @@
     "tsc:check": "tsc -p tsconfig.json --noEmit",
     "tsc:check:tests": "tsc -p tsconfig.test.json --noEmit",
     "build": "tsc",
+    "prepublishOnly": "npm run build",
     "docs:markdown": "npx typedoc --plugin typedoc-plugin-markdown --out docs/markdown src/index.ts",
     "docs:html": "npx typedoc --out docs/html",
     "docs": "npm run build && npm run docs:markdown && npm run docs:html"
