@@ -717,6 +717,10 @@ Supported endpoints: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, 
 The same applies to the on-chain sends: a retried `POST /send` that carries the
 key of a send already broadcast returns that broadcast's txid instead of
 spending again. The cache is in memory, so it is empty after a daemon restart.
+Concurrent requests are covered too: a keyed request that arrives while the
+first one with that key is still running waits for it and receives the same
+response (or the same error), and one with a different body gets the 409 at
+once, so the handler never runs twice for one key.
 
 ## Graceful Shutdown (Drain Mode)
 
