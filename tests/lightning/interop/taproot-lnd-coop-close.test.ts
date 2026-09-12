@@ -15,7 +15,7 @@
 import { expect } from 'chai';
 import * as bitcoin from 'bitcoinjs-lib';
 import {
-	createLndTaprootClient,
+	requireLndTaproot,
 	setupTaprootLndChannel,
 	LND_TAPROOT_P2P_HOST,
 	LND_TAPROOT_P2P_PORT
@@ -57,12 +57,7 @@ describe('Taproot coop close vs live LND', function () {
 	let node: LightningNode | null = null;
 
 	before(async function () {
-		lnd = await createLndTaprootClient();
-		if (!lnd) {
-			console.log('    [skip] lnd-taproot not reachable (REST 8082)');
-			this.skip();
-			return;
-		}
+		lnd = await requireLndTaproot(this, 'taproot-lnd-coop-close');
 		const info = await lnd.getInfo();
 		lndPubkey = info.identity_pubkey;
 		console.log(

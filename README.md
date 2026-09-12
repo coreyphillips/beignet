@@ -711,6 +711,10 @@ Services in `docker/docker-compose.yml`:
 | eclair | 0.14.1, built locally from the release zip (`docker/eclair/Dockerfile`) | HTTP API 8082 |
 | electrs | `getumbrel/electrs:v0.10.10` | Electrum 60001 |
 
+The LND helpers read `LND_REST_HOST` / `LND_REST_PORT` (default `127.0.0.1:8081`) and `LND_P2P_HOST` / `LND_P2P_PORT` (default `127.0.0.1:9735`); the dedicated taproot container reads `LND_TAPROOT_REST_HOST` / `LND_TAPROOT_REST_PORT` (default `127.0.0.1:8082`) and `LND_TAPROOT_P2P_HOST` / `LND_TAPROOT_P2P_PORT` (default `127.0.0.1:9736`). Point them at whatever your `docker/docker-compose.override.yml` publishes, for example `LND_REST_PORT=8091 npm run test:interop`.
+
+An LND suite that has no usable counterparty skips itself and prints one line naming the suite, the endpoint it probed and the variables that move it (`[skip] lnd-jit-receive: LND REST not reachable at 127.0.0.1:8081 (set LND_REST_PORT / LND_REST_HOST)`, or `... LND reachable but macaroon read failed (docker exec lnd ...)`). A skip is invisible in a passing summary, so for a pre-release gate set `INTEROP_REQUIRE_LND=1` (and `INTEROP_REQUIRE_LND_TAPROOT=1` for the taproot suites): the same condition then fails the suite with that reason instead of skipping it.
+
 Covered per implementation: BOLT 8 handshake and BOLT 1 init/feature negotiation, disconnect/reconnect and ping/pong survival, channel open in both directions, bidirectional payments and payment_secret validation, MPP, SCID aliases, cooperative close, reestablish, gossip sync, inbound connections, anchor channels, anchor force-close with wallet-funded CPFP and HTLC-timeout fee-attach, and crash recovery. Beyond the shared matrix: taproot channel lifecycle vs LND (open, pay both directions, reestablish, coop and force close, penalty, SCB recovery), splice matrix and lease/liquidity-ads flows vs CLN, `simple_close` vs Eclair, blinded-path payments, and the watchtower client vs an LND tower.
 
 Interop tests are excluded from `npm run test:lightning`.

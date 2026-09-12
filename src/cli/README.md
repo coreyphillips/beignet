@@ -2175,4 +2175,11 @@ npm run test:lightning
 
 # Run everything
 npm run test:all
+
+# Interop suites against the Docker nodes. LND_REST_PORT / LND_REST_HOST (and
+# LND_TAPROOT_REST_PORT / LND_TAPROOT_REST_HOST) move the endpoints; a suite
+# whose LND is unreachable skips with a line naming the port, and
+# INTEROP_REQUIRE_LND=1 / INTEROP_REQUIRE_LND_TAPROOT=1 fail instead of
+# skipping. See "Interop testing" in the top-level README.
+npm run test:interop
 ```

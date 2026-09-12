@@ -16,7 +16,7 @@
 import { expect } from 'chai';
 import * as bitcoin from 'bitcoinjs-lib';
 import {
-	createLndTaprootClient,
+	requireLndTaproot,
 	setupTaprootLndChannel
 } from './lnd-taproot-helpers';
 import { sleep, mineBlocks, bitcoinRpc } from './shared-helpers';
@@ -32,12 +32,7 @@ describe('Stage E — taproot force-close on-chain vs live LND', function () {
 	let node: LightningNode | null = null;
 
 	before(async function () {
-		lnd = await createLndTaprootClient();
-		if (!lnd) {
-			console.log('    [skip] lnd-taproot not reachable (REST 8082)');
-			this.skip();
-			return;
-		}
+		lnd = await requireLndTaproot(this, 'taproot-lnd-force-close');
 		lndPubkey = (await lnd.getInfo()).identity_pubkey;
 	});
 

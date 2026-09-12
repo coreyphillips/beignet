@@ -6,8 +6,8 @@
  * on the SAME shared regtest bitcoind. It advertises feature bit 181
  * (simple-taproot-chans-x, the LND staging assignment).
  *
- *   REST  127.0.0.1:8082
- *   p2p   127.0.0.1:9736
+ *   REST  127.0.0.1:8082 (LND_TAPROOT_REST_HOST / LND_TAPROOT_REST_PORT)
+ *   p2p   127.0.0.1:9736 (LND_TAPROOT_P2P_HOST / LND_TAPROOT_P2P_PORT)
  *   macaroon: docker exec lnd-taproot cat .../regtest/admin.macaroon
  *
  * See memory taproot-channels-m4 "Stage E".
@@ -25,12 +25,24 @@ import {
 	bitcoinRpc,
 	BitcoindFundingProvider
 } from './shared-helpers';
-import { waitForLndChannels } from './lnd-helpers';
+import {
+	ILndTarget,
+	requireLndTarget,
+	waitForLndChannels
+} from './lnd-helpers';
 
-export const LND_TAPROOT_REST_HOST = '127.0.0.1';
-export const LND_TAPROOT_REST_PORT = 8082;
-export const LND_TAPROOT_P2P_HOST = '127.0.0.1';
-export const LND_TAPROOT_P2P_PORT = 9736;
+// Overridable like the shared lnd's ports (issue #666): point these at
+// whatever docker/docker-compose.override.yml publishes for lnd-taproot.
+export const LND_TAPROOT_REST_HOST =
+	process.env.LND_TAPROOT_REST_HOST ?? '127.0.0.1';
+export const LND_TAPROOT_REST_PORT = Number(
+	process.env.LND_TAPROOT_REST_PORT ?? 8082
+);
+export const LND_TAPROOT_P2P_HOST =
+	process.env.LND_TAPROOT_P2P_HOST ?? '127.0.0.1';
+export const LND_TAPROOT_P2P_PORT = Number(
+	process.env.LND_TAPROOT_P2P_PORT ?? 9736
+);
 export const LND_TAPROOT_CONTAINER = 'lnd-taproot';
 
 /** Check if the taproot LND REST API is reachable. */
@@ -68,20 +80,48 @@ export function loadTaprootMacaroon(): string {
 	return raw.toString('hex');
 }
 
-/** Create a REST client for the taproot LND, or null if unavailable. */
-export async function createLndTaprootClient(): Promise<LndRestClient | null> {
-	const available = await isLndTaprootAvailable();
-	if (!available) return null;
+/** A client over the macaroon read from the container, or null if that read failed. */
+function taprootClientFromMacaroon(): LndRestClient | null {
 	try {
-		const macaroon = loadTaprootMacaroon();
 		return new LndRestClient(
 			LND_TAPROOT_REST_HOST,
 			LND_TAPROOT_REST_PORT,
-			macaroon
+			loadTaprootMacaroon()
 		);
 	} catch {
 		return null;
 	}
+}
+
+/** Create a REST client for the taproot LND, or null if unavailable. */
+export async function createLndTaprootClient(): Promise<LndRestClient | null> {
+	const available = await isLndTaprootAvailable();
+	if (!available) return null;
+	return taprootClientFromMacaroon();
+}
+
+export const LND_TAPROOT_TARGET: ILndTarget = {
+	name: 'lnd-taproot',
+	container: LND_TAPROOT_CONTAINER,
+	restHost: LND_TAPROOT_REST_HOST,
+	restPort: LND_TAPROOT_REST_PORT,
+	hostVar: 'LND_TAPROOT_REST_HOST',
+	portVar: 'LND_TAPROOT_REST_PORT',
+	requireVar: 'INTEROP_REQUIRE_LND_TAPROOT',
+	isAvailable: isLndTaprootAvailable,
+	createClient: taprootClientFromMacaroon
+};
+
+/**
+ * Probe the taproot LND and return its client, or skip the suite with one
+ * consistent line naming the reason; INTEROP_REQUIRE_LND_TAPROOT=1 fails
+ * instead of skipping (issue #666).
+ */
+export function requireLndTaproot(
+	ctx: Mocha.Context,
+	suite: string
+): Promise<LndRestClient> {
+	return requireLndTarget(ctx, suite, LND_TAPROOT_TARGET);
 }
 
 // ── Taproot beignet node + channel setup ───────────────────────

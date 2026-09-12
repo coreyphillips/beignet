@@ -12,7 +12,7 @@
 
 import { expect } from 'chai';
 import {
-	createLndTaprootClient,
+	requireLndTaproot,
 	setupTaprootLndChannel
 } from './lnd-taproot-helpers';
 import { setupRoutingForChannel, sleep } from './shared-helpers';
@@ -27,12 +27,7 @@ describe('Stage E — LND→beignet simple-taproot payment (inbound HTLC)', func
 	let node: LightningNode | null = null;
 
 	before(async function () {
-		lnd = await createLndTaprootClient();
-		if (!lnd) {
-			console.log('    [skip] lnd-taproot not reachable (REST 8082)');
-			this.skip();
-			return;
-		}
+		lnd = await requireLndTaproot(this, 'taproot-lnd-payment-inbound');
 		lndPubkey = (await lnd.getInfo()).identity_pubkey;
 	});
 

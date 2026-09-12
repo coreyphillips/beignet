@@ -19,7 +19,7 @@
 
 import { expect } from 'chai';
 import {
-	createLndTaprootClient,
+	requireLndTaproot,
 	LND_TAPROOT_P2P_HOST,
 	LND_TAPROOT_P2P_PORT
 } from './lnd-taproot-helpers';
@@ -129,12 +129,7 @@ describe('Stage E — beignet→LND simple-taproot-channels capture', function (
 	let node: LightningNode | null = null;
 
 	before(async function () {
-		lnd = await createLndTaprootClient();
-		if (!lnd) {
-			console.log('    [skip] lnd-taproot not reachable (REST 8082)');
-			this.skip();
-			return;
-		}
+		lnd = await requireLndTaproot(this, 'taproot-lnd-capture');
 		const info = await lnd.getInfo();
 		lndPubkey = info.identity_pubkey;
 		console.log(
