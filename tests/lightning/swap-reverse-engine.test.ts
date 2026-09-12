@@ -530,12 +530,28 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			const h = await harness();
 			const { swap } = await fundedSwap(h);
 			h.holds.settleReturns = false;
+			// Nothing parked, not a refused settle: a refusal over a set still
+			// ACCEPTED stays CLAIMED for the next pass.
+			h.holds.parts.delete(swap.paymentHash.toString('hex'));
 			h.chain.place(claimTxFor(record(h, swap), swap), 0);
 			await h.engine.onBlock(1000);
 			const r = record(h, swap);
 			expect(r.state).to.equal('EXPOSED');
 			expect(r.preimageHex).to.equal(swap.preimage.toString('hex'));
 			expect(r.holdCancelReason).to.equal('settle_no_held_htlcs');
+		});
+
+		it('a refused settle over a still-parked hold stays claimed and settles on the next pass', async function () {
+			const h = await harness();
+			const { swap } = await fundedSwap(h);
+			h.holds.settleReturns = false;
+			h.chain.place(claimTxFor(record(h, swap), swap), 0);
+			await h.engine.onBlock(1000);
+			expect(record(h, swap).state).to.equal('CLAIMED');
+			h.holds.settleReturns = undefined;
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).state).to.equal('SETTLED');
+			expect(h.holds.settled).to.have.length(1);
 		});
 
 		it('a claim after the refund was broadcast still wins and the hold is never cancelled', async function () {
