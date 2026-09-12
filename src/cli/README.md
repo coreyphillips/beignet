@@ -199,7 +199,11 @@ Hold progress fires events (`hold:accepted`, `hold:settled`, `hold:cancelled`),
 relayed over SSE and webhooks. `hold:accepted` fires for each new parked part,
 including partial MPP payments. Before funding a swap, compare
 `BigInt(heldAmountMsat)` with the full expected amount in millisatoshis.
-The `ACCEPTED` state alone does not mean the invoice is fully funded.
+The `ACCEPTED` state alone does not mean the invoice is fully funded. The
+final hop enforces the invoice's `minFinalCltvExpiry` on every arriving HTLC,
+and each event and `GET /invoices/held` row reports the realised
+`earliestExpiry` and `cancelHeight` of the parked set, so a swap provider can
+verify the Lightning leg outlives its on-chain refund before funding.
 
 #### Payments
 
@@ -1972,7 +1976,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry?, minFinalCltvExpiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel). `minFinalCltvExpiry` is 1..2016 blocks; on a swap leg it has to clear the on-chain refund timeout plus the 18-block hold cancellation margin and the refund's own resolution time |
 | POST | `/invoice/settle-hold` | `{ preimage }` | Settle a parked hold invoice (fulfills all MPP parts) |
 | POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |
-| GET | `/invoices/held` | -- | List hold invoices with state + parked totals |
+| GET | `/invoices/held` | -- | List hold invoices with state + parked totals. Each row also carries `minFinalCltvExpiry` (the delta the invoice advertised and the final hop enforces on every arriving HTLC) and the realised expiry of the parked set: `earliestExpiry`, `cancelMarginBlocks` and `cancelHeight` (null before any part is committed). A swap provider checks `earliestExpiry` against its on-chain refund timeout before funding instead of trusting the advertised delta |
 | POST | `/invoice/decode` | `{ bolt11 }` | Decode invoice |
 | POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels). `cltvLimit` bounds the payment's total CLTV expiry in blocks above the current tip; no route under it answers `409 CLTV_EXCEEDS_MAX` with nothing sent, and a node without a tip yet answers `503 CHAIN_NOT_SYNCED`. |
 | POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. |
@@ -2055,7 +2059,7 @@ Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, 
 
 - `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
 - `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).
-- The `hold:*` events carry `{paymentHash, state, heldAmountMsat, htlcCount}`, plus `reason` (`api` or `expiry-scan`) on `hold:cancelled`. The amount and count describe the set acted on. Terminal events retain these totals even though a subsequent `GET /invoices/held` row has zero parked parts. `hold:accepted` fires once per new MPP part with the running total. Before funding, require `BigInt(heldAmountMsat)` to cover the full expected amount. For an amountless invoice, use the amount agreed with the payer.
+- The `hold:*` events carry `{paymentHash, state, heldAmountMsat, htlcCount, minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks, cancelHeight}`, plus `reason` (`api` or `expiry-scan`) on `hold:cancelled`. The amount, count and expiry fields describe the set acted on. Terminal events retain these totals even though a subsequent `GET /invoices/held` row has zero parked parts. `hold:accepted` fires once per new MPP part with the running total. Before funding, require `BigInt(heldAmountMsat)` to cover the full expected amount. For an amountless invoice, use the amount agreed with the payer.
 
 Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed only when the daemon is started with `--htlc-events` (config `htlcEvents: true`, env `BEIGNET_HTLC_EVENTS=true`); routing nodes generate one event per HTLC, so they are off by default.
 

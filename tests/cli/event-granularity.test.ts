@@ -279,28 +279,38 @@ describe('Event granularity (M4 batch 2b)', () => {
 					received.push([event, JSON.parse(frame.split('\ndata: ')[1])]);
 				});
 			}
+			const expiry = {
+				minFinalCltvExpiry: 200,
+				earliestExpiry: 1_240,
+				cancelMarginBlocks: 18,
+				cancelHeight: 1_222
+			};
 			node!.lightningNode.emit('hold:accepted', {
 				paymentHash,
 				state: 'ACCEPTED',
 				heldAmountMsat: 5_000_000n,
-				htlcCount: 2
+				htlcCount: 2,
+				...expiry
 			});
 			node!.lightningNode.emit('hold:settled', {
 				paymentHash,
 				state: 'SETTLED',
 				heldAmountMsat: 5_000_000n,
-				htlcCount: 2
+				htlcCount: 2,
+				...expiry
 			});
 			node!.lightningNode.emit('hold:cancelled', {
 				paymentHash,
 				reason: 'expiry-scan',
 				heldAmountMsat: 5_000_000n,
-				htlcsFailed: 2
+				htlcsFailed: 2,
+				...expiry
 			});
 			const common = {
 				paymentHash: 'ab'.repeat(32),
 				heldAmountMsat: '5000000',
-				htlcCount: 2
+				htlcCount: 2,
+				...expiry
 			};
 			expect(received).to.deep.equal([
 				['hold:accepted', { ...common, state: 'ACCEPTED' }],
@@ -329,7 +339,11 @@ describe('Event granularity (M4 batch 2b)', () => {
 				paymentHash: Buffer.from(paymentHash, 'hex'),
 				state: 'ACCEPTED',
 				heldAmountMsat: 5_000_000n,
-				htlcCount: 1
+				htlcCount: 1,
+				minFinalCltvExpiry: 40,
+				earliestExpiry: 1_040,
+				cancelMarginBlocks: 18,
+				cancelHeight: 1_022
 			});
 			expect(received).to.deep.equal([
 				[
@@ -338,7 +352,11 @@ describe('Event granularity (M4 batch 2b)', () => {
 						paymentHash,
 						state: 'ACCEPTED',
 						heldAmountMsat: '5000000',
-						htlcCount: 1
+						htlcCount: 1,
+						minFinalCltvExpiry: 40,
+						earliestExpiry: 1_040,
+						cancelMarginBlocks: 18,
+						cancelHeight: 1_022
 					}
 				],
 				[
@@ -348,6 +366,10 @@ describe('Event granularity (M4 batch 2b)', () => {
 						state: 'CANCELLED',
 						heldAmountMsat: '0',
 						htlcCount: 0,
+						minFinalCltvExpiry: 40,
+						earliestExpiry: null,
+						cancelMarginBlocks: 18,
+						cancelHeight: null,
 						reason: 'api'
 					}
 				]
@@ -407,14 +429,22 @@ describe('Event granularity (M4 batch 2b)', () => {
 				paymentHash: Buffer.alloc(32, 0xab),
 				state: 'ACCEPTED',
 				heldAmountMsat: 5_000_000n,
-				htlcCount: 2
+				htlcCount: 2,
+				minFinalCltvExpiry: 200,
+				earliestExpiry: 1_240,
+				cancelMarginBlocks: 18,
+				cancelHeight: 1_222
 			});
 			expect(() => JSON.stringify(wire)).to.not.throw();
 			expect(wire).to.deep.equal({
 				paymentHash: 'ab'.repeat(32),
 				state: 'ACCEPTED',
 				heldAmountMsat: '5000000',
-				htlcCount: 2
+				htlcCount: 2,
+				minFinalCltvExpiry: 200,
+				earliestExpiry: 1_240,
+				cancelMarginBlocks: 18,
+				cancelHeight: 1_222
 			});
 		});
 

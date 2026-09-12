@@ -25,6 +25,8 @@ import {
 	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 } from '../../src/lightning/onion/types';
 import { decryptFailureMessage } from '../../src/lightning/onion/failures';
+import { IInvoiceInfo } from '../../src/lightning/storage/types';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const k = (i: number): Buffer =>
@@ -45,9 +47,10 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	};
 }
 
-function makeNode(): LightningNode {
+function makeNode(storage?: SqliteStorage): LightningNode {
 	const seed = crypto.randomBytes(32);
 	const node = new LightningNode({
+		...(storage ? { storage } : {}),
 		nodePrivateKey: crypto.randomBytes(32),
 		network: Network.REGTEST,
 		channelConfig: { ...DEFAULT_CHANNEL_CONFIG },
@@ -397,5 +400,255 @@ describe('Block-height skew is handled by the sender, not by relaxing the check'
 				.be.false;
 			node.destroy();
 		});
+	});
+});
+
+/**
+ * Issue #770: the invoice's own min_final_cltv_expiry, signed into the BOLT
+ * 11 c tag, was never compared against the arriving HTLC; the final hop
+ * enforced the 40-block node default for every invoice. A swap leg that
+ * advertised 200 blocks so it would outlive an on-chain refund then parked
+ * an HTLC that cleared only 40, and the payer could reclaim over Lightning
+ * while still claiming the contract.
+ */
+describe("the invoice's advertised min_final_cltv_expiry is enforced (issue #770)", () => {
+	const HEIGHT = 800_000;
+
+	/* eslint-disable @typescript-eslint/no-explicit-any */
+	function seedInvoice(
+		node: LightningNode,
+		hashHex: string,
+		extra: Partial<IInvoiceInfo>
+	): void {
+		(node as any).invoices.set(hashHex, {
+			paymentHash: hashHex,
+			bolt11: 'lnbcrt1seeded',
+			expiry: 3600,
+			createdAt: 0,
+			...extra
+		} as IInvoiceInfo);
+	}
+
+	/** Drive one final-hop HTLC through handleFinalHopHtlc with stubbed channel calls. */
+	function deliver(
+		node: LightningNode,
+		paymentHash: Buffer,
+		cltvExpiry: number,
+		hopPayload: Record<string, unknown>
+	): { failed: Buffer[]; fulfilled: bigint[] } {
+		const failed: Buffer[] = [];
+		const fulfilled: bigint[] = [];
+		const cm = node.getChannelManager() as any;
+		cm.failHtlc = (_c: Buffer, _id: bigint, reason: Buffer): void => {
+			failed.push(reason);
+		};
+		cm.fulfillHtlc = (_c: Buffer, id: bigint): void => {
+			fulfilled.push(id);
+		};
+		const channelId = crypto.randomBytes(32);
+		const htlcId = 9n;
+		const sharedSecret = crypto.randomBytes(32);
+		(node as any).receivedHtlcSharedSecrets.set(
+			`${channelId.toString('hex')}:${htlcId}`,
+			sharedSecret
+		);
+		(node as any).handleFinalHopHtlc(
+			channelId,
+			htlcId,
+			1000n,
+			paymentHash,
+			hopPayload,
+			cltvExpiry
+		);
+		// Decode in place so a caller can assert on the failure without the secret.
+		for (let i = 0; i < failed.length; i++) {
+			const decoded = decryptFailureMessage([sharedSecret], failed[i]);
+			expect(decoded, 'the failure decrypts for the payer').to.not.be.null;
+			failed[i] = Buffer.concat([
+				Buffer.from([
+					decoded!.failure.failureCode >> 8,
+					decoded!.failure.failureCode & 0xff
+				]),
+				decoded!.failure.failureData
+			]);
+		}
+		return { failed, fulfilled };
+	}
+	/* eslint-enable @typescript-eslint/no-explicit-any */
+
+	function safety(
+		node: LightningNode,
+		hashHex: string,
+		cltv: number
+	): Buffer | null {
+		return (
+			node as unknown as {
+				finalHopSafetyFailure: (...a: unknown[]) => Buffer | null;
+			}
+		).finalHopSafetyFailure(
+			undefined,
+			{ amountToForwardMsat: 1000n, outgoingCltvValue: 0 },
+			cltv,
+			1000n,
+			hashHex,
+			'stub:1'
+		);
+	}
+
+	it('refuses an HTLC that clears only the default when the invoice advertised 200', () => {
+		const node = makeNode();
+		node.handleNewBlock(HEIGHT);
+		const paymentHash = crypto.randomBytes(32);
+		const hashHex = paymentHash.toString('hex');
+		seedInvoice(node, hashHex, { minFinalCltvExpiry: 200 });
+
+		const { failed, fulfilled } = deliver(
+			node,
+			paymentHash,
+			HEIGHT + DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+			{ amountToForwardMsat: 1000n, outgoingCltvValue: HEIGHT + 40 }
+		);
+		expect(failed, 'the HTLC was failed').to.have.length(1);
+		expect(fulfilled, 'no preimage was revealed').to.have.length(0);
+		// incorrect_or_unknown_payment_details with [htlc_msat][height], as
+		// before: the payer treats a reported height as transient and retries
+		// with the delta the invoice asked for.
+		expect(failed[0].readUInt16BE(0)).to.equal(
+			INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+		);
+		expect(failed[0].length, 'code(2) + htlc_msat(8) + height(4)').to.equal(14);
+		expect(failed[0].readBigUInt64BE(2)).to.equal(1000n);
+		expect(failed[0].readUInt32BE(10), 'our height').to.equal(HEIGHT);
+		// One block short of the advertised delta is still refused; the delta
+		// itself is accepted.
+		expect(safety(node, hashHex, HEIGHT + 199), 'one short').to.not.be.null;
+		expect(safety(node, hashHex, HEIGHT + 200), 'at the boundary').to.be.null;
+		node.destroy();
+	});
+
+	it('accepts an HTLC that clears the advertised delta and settles a real invoice on it', () => {
+		const node = makeNode();
+		node.handleNewBlock(HEIGHT);
+		const invoice = node.createInvoice({
+			amountMsat: 1000n,
+			description: 'swap leg',
+			minFinalCltvExpiry: 200
+		});
+		const hashHex = invoice.paymentHash.toString('hex');
+		// createInvoice recorded the delta it signed into the c tag.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const record = (node as any).invoices.get(hashHex) as IInvoiceInfo;
+		expect(record.minFinalCltvExpiry).to.equal(200);
+
+		const short = deliver(node, invoice.paymentHash, HEIGHT + 40, {
+			amountToForwardMsat: 1000n,
+			outgoingCltvValue: HEIGHT + 40,
+			paymentSecret: invoice.paymentSecret,
+			totalMsat: 1000n
+		});
+		expect(short.fulfilled, 'a 40-block HTLC is not settled').to.have.length(0);
+		expect(short.failed).to.have.length(1);
+
+		const ok = deliver(node, invoice.paymentHash, HEIGHT + 200, {
+			amountToForwardMsat: 1000n,
+			outgoingCltvValue: HEIGHT + 200,
+			paymentSecret: invoice.paymentSecret,
+			totalMsat: 1000n
+		});
+		expect(ok.failed, 'a 200-block HTLC is not failed').to.have.length(0);
+		expect(ok.fulfilled, 'and is settled').to.have.length(1);
+		node.destroy();
+	});
+
+	it('keeps the default for a hash with no invoice and for an invoice without a delta', () => {
+		const node = makeNode();
+		node.handleNewBlock(HEIGHT);
+		const unknown = 'ab'.repeat(32);
+		expect(safety(node, unknown, HEIGHT + 40), 'unknown hash, default').to.be
+			.null;
+		expect(safety(node, unknown, HEIGHT + 39), 'unknown hash, one short').to.not
+			.be.null;
+		const recorded = 'cd'.repeat(32);
+		seedInvoice(node, recorded, {});
+		expect(safety(node, recorded, HEIGHT + 40), 'no delta recorded').to.be.null;
+		// An invoice cannot lower the bound below the node's own claim window.
+		const low = 'ef'.repeat(32);
+		seedInvoice(node, low, { minFinalCltvExpiry: 18 });
+		expect(safety(node, low, HEIGHT + 39), 'advertised 18, still 40').to.not.be
+			.null;
+		expect(safety(node, low, HEIGHT + 40)).to.be.null;
+		node.destroy();
+	});
+
+	it('leaves keysend on the default even when an invoice for another hash asks for more', () => {
+		const node = makeNode();
+		node.handleNewBlock(HEIGHT);
+		seedInvoice(node, 'ab'.repeat(32), { minFinalCltvExpiry: 200 });
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const { failed, fulfilled } = deliver(node, paymentHash, HEIGHT + 40, {
+			amountToForwardMsat: 1000n,
+			outgoingCltvValue: HEIGHT + 40,
+			customRecords: new Map<number, Buffer>([[KEYSEND_TLV_TYPE, preimage]])
+		});
+		expect(failed, 'a 40-block keysend is not failed').to.have.length(0);
+		expect(fulfilled, 'and is settled').to.have.length(1);
+		node.destroy();
+	});
+
+	it('carries the delta through storage, and a row without one loads as the default', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const node = makeNode(storage);
+		try {
+			const swapLeg = node.createInvoice({
+				amountMsat: 1000n,
+				description: 'swap leg',
+				minFinalCltvExpiry: 200
+			});
+			const plain = node.createInvoice({ amountMsat: 1000n, description: 'p' });
+			const rowFor = (hash: Buffer): IInvoiceInfo =>
+				storage
+					.loadAllInvoices()
+					.find((r) => r.paymentHashHex === hash.toString('hex'))!.invoice;
+			expect(rowFor(swapLeg.paymentHash).minFinalCltvExpiry).to.equal(200);
+			expect(
+				rowFor(plain.paymentHash).minFinalCltvExpiry,
+				'an invoice on the default records nothing'
+			).to.equal(undefined);
+			expect(
+				'minFinalCltvExpiry' in rowFor(plain.paymentHash),
+				'and the loaded row carries no key for it'
+			).to.equal(true);
+
+			// A row written before the field existed.
+			const legacyHex = '11'.repeat(32);
+			storage.saveInvoice(legacyHex, {
+				paymentHash: legacyHex,
+				bolt11: 'lnbcrt1legacy',
+				expiry: 3600,
+				createdAt: 1
+			});
+			expect(rowFor(Buffer.from(legacyHex, 'hex')).minFinalCltvExpiry).to.equal(
+				undefined
+			);
+
+			// A restarted node enforces the persisted delta.
+			const restarted = makeNode(storage);
+			try {
+				restarted.handleNewBlock(HEIGHT);
+				const hex = swapLeg.paymentHash.toString('hex');
+				expect(safety(restarted, hex, HEIGHT + 199), 'after restart').to.not.be
+					.null;
+				expect(safety(restarted, hex, HEIGHT + 200)).to.be.null;
+				expect(safety(restarted, legacyHex, HEIGHT + 40), 'legacy row').to.be
+					.null;
+			} finally {
+				restarted.destroy();
+			}
+		} finally {
+			node.destroy();
+			storage.close();
+		}
 	});
 });

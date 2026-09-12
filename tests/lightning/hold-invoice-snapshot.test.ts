@@ -14,7 +14,10 @@ import {
 	HELD_HTLC_EXPIRY_MARGIN,
 	LightningNode
 } from '../../src/lightning/node/lightning-node';
-import { IHoldCancelledEvent } from '../../src/lightning/node/types';
+import {
+	IHoldCancelledEvent,
+	IHoldInvoiceStateEvent
+} from '../../src/lightning/node/types';
 import { validateReverseSwapAdmission } from '../../src/lightning/swaps';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
@@ -340,6 +343,90 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 		await new Promise((r) => setImmediate(r));
 		expect(events).to.have.length(1);
 		expect(events[0].reason).to.equal('expiry-scan');
+	});
+
+	// Issue #770: the delta the hold invoice signed into its c tag was never
+	// enforced, so a swap leg asking for 200 blocks parked an HTLC that
+	// cleared only the 40-block default and reported ACCEPTED on it.
+	it('does not park an HTLC that clears less than the delta the hold invoice advertised', function () {
+		const alice = createNode(TAG, 21);
+		const bob = createNode(TAG, 22);
+		connectNodes(alice, bob);
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const ch1 = openReadyChannel(alice, bob, 100_000n);
+		const ch2 = openReadyChannel(alice, bob, 100_000n);
+		buildGraph(alice, bob, [ch1, ch2], 100_000_000n);
+
+		const { hash } = makeExternalHash();
+		const totalMsat = 5_000_000n;
+		const invoice = bob.createInvoice({
+			amountMsat: totalMsat,
+			description: 'swap-leg',
+			hold: true,
+			paymentHash: hash,
+			minFinalCltvExpiry: 200
+		});
+		const bobPubkey = Buffer.from(bob.getNodeId(), 'hex');
+		const sendPart = (i: number, cltv: number): void => {
+			alice.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: bobPubkey,
+							shortChannelId: scidForIndex(i),
+							amountToForwardMsat: totalMsat,
+							outgoingCltvValue: cltv
+						}
+					]
+				},
+				hash,
+				cltv,
+				invoice.paymentSecret,
+				totalMsat
+			);
+		};
+
+		const before = bob
+			.listHoldInvoices()
+			.find((h) => h.paymentHash === hash.toString('hex'))!;
+		expect(before.state).to.equal('OPEN');
+		expect(before.minFinalCltvExpiry).to.equal(200);
+		expect(before.earliestExpiry).to.equal(null);
+		expect(before.cancelHeight).to.equal(null);
+		expect(before.cancelMarginBlocks).to.equal(HELD_HTLC_EXPIRY_MARGIN);
+
+		const accepted: IHoldInvoiceStateEvent[] = [];
+		bob.on('hold:accepted', (e: IHoldInvoiceStateEvent) => accepted.push(e));
+
+		// Clears the node default only: failed back, never parked.
+		sendPart(0, 40);
+		let snap = bob.getHeldInvoiceSnapshot(hash)!;
+		expect(snap.state, 'a 40-block HTLC is not accepted').to.equal('OPEN');
+		expect(snap.parts).to.have.length(0);
+		expect(accepted).to.have.length(0);
+		expect(alice.getPayment(hash)!.status).to.equal(PaymentStatus.FAILED);
+
+		// Clears the advertised delta: parked, and the row and the event report
+		// the realised expiry a swap provider verifies before funding.
+		sendPart(1, 200);
+		snap = bob.getHeldInvoiceSnapshot(hash)!;
+		expect(snap.state).to.equal('ACCEPTED');
+		expect(snap.parts).to.have.length(1);
+		expect(snap.earliestExpiry).to.equal(1200);
+		const row = bob
+			.listHoldInvoices()
+			.find((h) => h.paymentHash === hash.toString('hex'))!;
+		expect(row.state).to.equal('ACCEPTED');
+		expect(row.minFinalCltvExpiry).to.equal(200);
+		expect(row.earliestExpiry).to.equal(1200);
+		expect(row.cancelMarginBlocks).to.equal(HELD_HTLC_EXPIRY_MARGIN);
+		expect(row.cancelHeight).to.equal(1200 - HELD_HTLC_EXPIRY_MARGIN);
+		expect(accepted).to.have.length(1);
+		expect(accepted[0].minFinalCltvExpiry).to.equal(200);
+		expect(accepted[0].earliestExpiry).to.equal(1200);
+		expect(accepted[0].cancelMarginBlocks).to.equal(HELD_HTLC_EXPIRY_MARGIN);
+		expect(accepted[0].cancelHeight).to.equal(1200 - HELD_HTLC_EXPIRY_MARGIN);
 	});
 
 	it('emits hold:cancelled with reason api for explicit cancels, paid and unpaid', function () {
