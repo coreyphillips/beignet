@@ -34,8 +34,7 @@
 import { expect } from 'chai';
 import { LndRestClient } from './lnd-client';
 import {
-	isLndAvailable,
-	createLndClient,
+	requireLnd,
 	waitForLndSync,
 	waitForLndChannels,
 	mineBlocks,
@@ -63,27 +62,19 @@ describe('Interop: LND as introduction node (blinded payment)', function () {
 
 	let lnd: LndRestClient;
 	let lndPubkey: string;
-	let skipAll = false;
 
 	before(async function () {
 		this.timeout(60_000);
-		if (!(await isLndAvailable())) {
-			skipAll = true;
-			return;
-		}
-		const client = await createLndClient();
-		if (!client) {
-			skipAll = true;
-			return;
-		}
-		lnd = client;
+		// this.skip() from the hook marks every test in the suite pending, so
+		// the skipAll flag this used to set (silently, with no line printed) is
+		// no longer needed.
+		lnd = await requireLnd(this, 'blinded-interop');
 		await waitForLndSync(lnd);
 		lndPubkey = (await lnd.getInfo()).identity_pubkey;
 		await cleanupLndState(lnd);
 	});
 
 	it('LND forwards a beignet blinded HTLC to the recipient', async function () {
-		if (skipAll) this.skip();
 		this.timeout(180_000);
 
 		// Recipient: LND opens a channel to beignet2 (LND holds the balance → it has
@@ -181,7 +172,6 @@ describe('Interop: LND as introduction node (blinded payment)', function () {
 	});
 
 	it('adopts LND direct channel_update and settles a FRACTIONAL-msat blinded payment (prop fee)', async function () {
-		if (skipAll) this.skip();
 		this.timeout(180_000);
 
 		const recipientSetup = await setupLndChannel(

@@ -30,7 +30,7 @@ import crypto from 'crypto';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import { LndRestClient } from './lnd-client';
 import {
-	createLndClient,
+	requireLnd,
 	setupBeignetFundedChannel,
 	waitForInvoiceSettled,
 	waitForLndSync
@@ -214,14 +214,7 @@ describe('Interop — beignet forwards an HTLC addressed by the real SCID', func
 	let bob: LightningNode | null = null;
 
 	before(async function () {
-		lnd = await createLndClient();
-		if (!lnd) {
-			console.log(
-				'    [skip] lnd not reachable (REST 8081, override with LND_REST_PORT)'
-			);
-			this.skip();
-			return;
-		}
+		lnd = await requireLnd(this, 'lnd-forward-real-scid');
 		lndPubkey = (await lnd.getInfo()).identity_pubkey;
 
 		// LND refuses to fund a channel while it considers itself out of sync, and

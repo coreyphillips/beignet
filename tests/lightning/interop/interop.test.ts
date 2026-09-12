@@ -21,8 +21,7 @@
 import { expect } from 'chai';
 import { LndRestClient } from './lnd-client';
 import {
-	isLndAvailable,
-	createLndClient,
+	requireLnd,
 	waitForLndSync,
 	waitForLndChannels,
 	mineBlocks,
@@ -61,23 +60,7 @@ describe('Interop: Beignet ↔ LND (regtest)', function () {
 	let skipAll = false;
 
 	before(async function () {
-		const available = await isLndAvailable();
-		if (!available) {
-			skipAll = true;
-			console.log(
-				'    ⚠ LND not available — skipping interop tests. Start Docker: docker compose -f docker/docker-compose.yml up -d'
-			);
-			this.skip();
-			return;
-		}
-
-		const client = await createLndClient();
-		if (!client) {
-			skipAll = true;
-			this.skip();
-			return;
-		}
-		lnd = client;
+		lnd = await requireLnd(this, 'interop');
 
 		// Wait for LND to sync
 		try {

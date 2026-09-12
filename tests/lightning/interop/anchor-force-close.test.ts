@@ -20,8 +20,7 @@ import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { LndRestClient } from './lnd-client';
 import {
-	isLndAvailable,
-	createLndClient,
+	requireLnd,
 	waitForLndSync,
 	cleanupLndState,
 	setupBeignetFundedChannel,
@@ -47,21 +46,7 @@ describe('Interop: Beignet anchor force-close + CPFP (regtest)', function () {
 	let skipAll = false;
 
 	before(async function () {
-		if (!(await isLndAvailable())) {
-			skipAll = true;
-			console.log(
-				'    ⚠ LND not available — skipping anchor force-close interop.'
-			);
-			this.skip();
-			return;
-		}
-		const client = await createLndClient();
-		if (!client) {
-			skipAll = true;
-			this.skip();
-			return;
-		}
-		lnd = client;
+		lnd = await requireLnd(this, 'anchor-force-close');
 		try {
 			await waitForLndSync(lnd);
 		} catch {

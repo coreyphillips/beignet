@@ -18,7 +18,7 @@
 
 import { expect } from 'chai';
 import {
-	createLndTaprootClient,
+	requireLndTaproot,
 	setupTaprootLndChannel,
 	LND_TAPROOT_P2P_HOST,
 	LND_TAPROOT_P2P_PORT
@@ -37,12 +37,7 @@ describe('Stage E — beignet→LND simple-taproot reestablish (nonce re-exchang
 	let node: LightningNode | null = null;
 
 	before(async function () {
-		lnd = await createLndTaprootClient();
-		if (!lnd) {
-			console.log('    [skip] lnd-taproot not reachable (REST 8082)');
-			this.skip();
-			return;
-		}
+		lnd = await requireLndTaproot(this, 'taproot-lnd-reestablish');
 		lndPubkey = (await lnd.getInfo()).identity_pubkey;
 	});
 

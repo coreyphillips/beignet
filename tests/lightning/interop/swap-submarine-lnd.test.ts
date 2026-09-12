@@ -16,8 +16,7 @@ import crypto from 'crypto';
 import { expect } from 'chai';
 import { LndRestClient } from './lnd-client';
 import {
-	isLndAvailable,
-	createLndClient,
+	requireLnd,
 	cleanupLndState,
 	fundLndWallet,
 	waitForLndChannels,
@@ -109,21 +108,9 @@ describe('Interop: submarine swap with LND (issue #743)', function () {
 			return;
 		}
 		expect(chain).to.equal('regtest');
-		if (!(await isLndAvailable())) {
-			if (required) throw new Error('Required LND is unavailable');
-			skipAll = true;
-			console.log('    [skip] LND container not reachable');
-			this.skip();
-			return;
-		}
-		const client = await createLndClient();
-		if (!client) {
-			if (required) throw new Error('Required LND is unavailable');
-			skipAll = true;
-			this.skip();
-			return;
-		}
-		lnd = client;
+		// REQUIRE_SWAP_REGTEST keeps its old meaning for this suite's LND leg;
+		// INTEROP_REQUIRE_LND is read by the helper.
+		lnd = await requireLnd(this, 'swap-submarine-lnd', { required });
 		await ensureBitcoindFunds(3);
 		await waitForLndSync(lnd);
 		await cleanupLndState(lnd);

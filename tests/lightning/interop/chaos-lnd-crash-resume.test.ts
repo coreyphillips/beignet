@@ -24,8 +24,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { LndRestClient } from './lnd-client';
 import {
-	isLndAvailable,
-	createLndClient,
+	requireLnd,
 	waitForLndSync,
 	waitForLndChannels,
 	cleanupLndState,
@@ -72,32 +71,15 @@ describe('Interop chaos: LND crash-resume (regtest)', function () {
 
 	let lnd: LndRestClient;
 	let lndPubkey: string;
-	let skipAll = false;
 	let node: LightningNode | null = null;
 	let storage: SqliteStorage | null = null;
 
 	before(async function () {
 		this.timeout(60_000);
-		if (!(await isLndAvailable())) {
-			skipAll = true;
-			console.log('    [skip] LND container not reachable');
-			this.skip();
-			return;
-		}
-		const client = await createLndClient();
-		if (!client) {
-			skipAll = true;
-			this.skip();
-			return;
-		}
-		lnd = client;
+		lnd = await requireLnd(this, 'chaos-lnd-crash-resume');
 		await waitForLndSync(lnd);
 		await cleanupLndState(lnd);
 		lndPubkey = (await lnd.getInfo()).identity_pubkey;
-	});
-
-	beforeEach(function () {
-		if (skipAll) this.skip();
 	});
 
 	afterEach(() => {

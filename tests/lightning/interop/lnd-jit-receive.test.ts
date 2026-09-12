@@ -25,8 +25,7 @@ import * as net from 'net';
 import crypto from 'crypto';
 import { LndRestClient } from './lnd-client';
 import {
-	isLndAvailable,
-	createLndClient,
+	requireLnd,
 	cleanupLndState,
 	fundLndWallet,
 	waitForLndChannels,
@@ -131,32 +130,15 @@ describe('Interop: LND pays through a JIT intercept SCID (issue #594)', function
 
 	let lnd: LndRestClient;
 	let lndPubkey: string;
-	let skipAll = false;
 	let alice: LightningNode | null = null;
 	let bob: LightningNode | null = null;
 
 	before(async function () {
 		this.timeout(60_000);
-		if (!(await isLndAvailable())) {
-			skipAll = true;
-			console.log('    [skip] LND container not reachable');
-			this.skip();
-			return;
-		}
-		const client = await createLndClient();
-		if (!client) {
-			skipAll = true;
-			this.skip();
-			return;
-		}
-		lnd = client;
+		lnd = await requireLnd(this, 'lnd-jit-receive');
 		await waitForLndSync(lnd);
 		await cleanupLndState(lnd);
 		lndPubkey = (await lnd.getInfo()).identity_pubkey;
-	});
-
-	beforeEach(function () {
-		if (skipAll) this.skip();
 	});
 
 	afterEach(function () {

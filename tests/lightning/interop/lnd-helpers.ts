@@ -98,6 +98,15 @@ export function loadMacaroon(): string {
 
 // ── Client Factory ─────────────────────────────────────────────
 
+/** A client over the macaroon read from the container, or null if that read failed. */
+function lndClientFromMacaroon(): LndRestClient | null {
+	try {
+		return new LndRestClient(LND_REST_HOST, LND_REST_PORT, loadMacaroon());
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Create an LND REST client if Docker is available.
  * Returns null if LND is not running.
@@ -105,13 +114,105 @@ export function loadMacaroon(): string {
 export async function createLndClient(): Promise<LndRestClient | null> {
 	const available = await isLndAvailable();
 	if (!available) return null;
+	return lndClientFromMacaroon();
+}
 
-	try {
-		const macaroon = loadMacaroon();
-		return new LndRestClient(LND_REST_HOST, LND_REST_PORT, macaroon);
-	} catch {
-		return null;
+// ── Skip or require ────────────────────────────────────────────
+
+/**
+ * One LND-shaped counterparty as the skip logic sees it: what it is called,
+ * where it is probed, which variables move it, and which one forbids skipping.
+ */
+export interface ILndTarget {
+	/** Name used in the skip line, e.g. "LND" or "lnd-taproot". */
+	name: string;
+	/** Docker container the admin macaroon is read from. */
+	container: string;
+	restHost: string;
+	restPort: number;
+	/** The env vars that move the REST endpoint, named in the skip line. */
+	hostVar: string;
+	portVar: string;
+	/** The env var that, set to "1", turns the skip into a failure. */
+	requireVar: string;
+	isAvailable: () => Promise<boolean>;
+	/** Build the client once the probe answered; null if the macaroon read failed. */
+	createClient: () => LndRestClient | null;
+}
+
+export const LND_TARGET: ILndTarget = {
+	name: 'LND',
+	container: 'lnd',
+	restHost: LND_REST_HOST,
+	restPort: LND_REST_PORT,
+	hostVar: 'LND_REST_HOST',
+	portVar: 'LND_REST_PORT',
+	requireVar: 'INTEROP_REQUIRE_LND',
+	isAvailable: isLndAvailable,
+	createClient: lndClientFromMacaroon
+};
+
+/**
+ * Why a suite has no usable client for `target`, or null when it has one.
+ * Both halves are named: an unreachable REST port and a reachable node whose
+ * macaroon could not be read used to skip with different messages or none at
+ * all, and the port in the message was hardcoded (issue #666).
+ */
+export function lndSkipReason(
+	target: ILndTarget,
+	client: LndRestClient | null,
+	reachable: boolean
+): string | null {
+	if (!reachable) {
+		return (
+			`${target.name} REST not reachable at ${target.restHost}:${target.restPort} ` +
+			`(set ${target.portVar} / ${target.hostVar})`
+		);
 	}
+	if (!client) {
+		return (
+			`${target.name} reachable but macaroon read failed ` +
+			`(docker exec ${target.container} cat /root/.lnd/data/chain/bitcoin/regtest/admin.macaroon)`
+		);
+	}
+	return null;
+}
+
+/**
+ * Probe `target`, build its client and return it, or skip the suite from its
+ * before() hook with one consistent line naming the reason. With the target's
+ * require variable set to "1" (or `opts.required`), the skip is a failure
+ * instead: a skip is invisible in a passing summary, and a pre-release gate
+ * needs "LND was not reachable" to be a red result (issue #666).
+ */
+export async function requireLndTarget(
+	ctx: Mocha.Context,
+	suite: string,
+	target: ILndTarget,
+	opts: { required?: boolean } = {}
+): Promise<LndRestClient> {
+	const reachable = await target.isAvailable();
+	const client = reachable ? target.createClient() : null;
+	const reason = lndSkipReason(target, client, reachable);
+	if (client && reason === null) return client;
+	const required =
+		opts.required === true || process.env[target.requireVar] === '1';
+	if (required) {
+		throw new Error(
+			`${suite}: ${reason}; ${target.requireVar}=1 forbids skipping`
+		);
+	}
+	console.log(`    [skip] ${suite}: ${reason}`);
+	return ctx.skip();
+}
+
+/** requireLndTarget for the shared (non-taproot) `lnd` container. */
+export function requireLnd(
+	ctx: Mocha.Context,
+	suite: string,
+	opts: { required?: boolean } = {}
+): Promise<LndRestClient> {
+	return requireLndTarget(ctx, suite, LND_TARGET, opts);
 }
 
 // ── Cleanup ────────────────────────────────────────────────────
