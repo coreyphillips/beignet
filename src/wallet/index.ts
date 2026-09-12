@@ -702,7 +702,7 @@ export class Wallet {
 	}
 
 	/**
-	 * Stops the wallet. Use this method to prepare the wallet to be de
+	 * Stops the wallet permanently, waiting up to refreshTimeout for active refreshes.
 	 * @param {Object} [options]
 	 * @param {number} [options.refreshTimeout] How long to wait for an in-flight refresh, in ms.
 	 * @returns {Promise<Result<string>>}
@@ -866,6 +866,7 @@ export class Wallet {
 		additionalAddresses?: string[];
 		force?: boolean;
 	} = {}): Promise<Result<IWalletData>> {
+		if (this._stopped) return err('Wallet stopped.');
 		if (this.isRefreshing && !force) {
 			return new Promise((resolve) => {
 				this._pendingRefreshPromises.push(resolve);

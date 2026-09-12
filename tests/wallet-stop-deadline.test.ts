@@ -49,6 +49,8 @@ type TWalletInternals = {
 	setZeroIndexAddresses: () => Promise<Result<string>>;
 	updateAddressIndexes: () => Promise<Result<string>>;
 	_disableMessagesOnCreate: boolean;
+	_setData?: (key: string, data: unknown) => Promise<Result<string>>;
+	processUnconfirmedTransactions: () => Promise<Result<unknown>>;
 };
 
 /** Rejects loudly rather than leaving the suite to hit mocha's own timeout. */
@@ -284,6 +286,91 @@ describe('stop() refresh deadline', function () {
 			subscribeStub.callCount,
 			'the abandoned refresh did not re-subscribe'
 		).to.equal(0);
+	});
+
+	it('does not reconnect when a transaction refresh resumes from storage', async function () {
+		updateTransactionsStub.restore();
+		getUtxosStub.resolves(ok<IGetUtxosResponse>({ utxos: [], balance: 0 }));
+		// Keep the real transaction refresh and unconfirmed-transaction storage
+		// path, but remove transaction lookups and network I/O from this case.
+		sinon
+			.stub(
+				wallet as unknown as TWalletInternals,
+				'processUnconfirmedTransactions'
+			)
+			.resolves(ok({ unconfirmedTxs: {}, outdatedTxs: [], ghostTxs: [] }));
+		wallet.addressTypesToMonitor = [];
+		const dialStub = sinon
+			.stub(
+				wallet.electrum as unknown as {
+					_doConnect: () => Promise<Result<string>>;
+				},
+				'_doConnect'
+			)
+			.resolves(ok('connected'));
+		disconnectStub.resetBehavior();
+		disconnectStub.callThrough();
+		let storageEntered = false;
+		const parkedStorage = new Promise<void>((resolve) => {
+			releaseRefresh = resolve;
+		});
+		(wallet as unknown as TWalletInternals)._setData = async (): Promise<
+			Result<string>
+		> => {
+			storageEntered = true;
+			await parkedStorage;
+			return ok('stored');
+		};
+		parkedRefresh = wallet.refreshWallet();
+		await waitFor(() => storageEntered, 5000, 'the transaction storage write');
+
+		expect((await wallet.stop({ refreshTimeout: 50 })).isOk()).to.equal(true);
+		expect(wallet.electrum.isDisconnected).to.equal(true);
+		releaseRefresh();
+		await withDeadline(parkedRefresh, 5000, 'the resumed transaction refresh');
+
+		expect(dialStub.callCount, 'no connection attempt after stop').to.equal(0);
+		expect(wallet.electrum.isDisconnected).to.equal(true);
+	});
+
+	it('rejects a new refresh promptly while an abandoned refresh is pending', async function () {
+		await parkARefresh();
+		expect((await wallet.stop({ refreshTimeout: 50 })).isOk()).to.equal(true);
+
+		for (const force of [false, true]) {
+			const result = await withDeadline(
+				wallet.refreshWallet({ force }),
+				500,
+				`a refresh after stop (force=${force})`
+			);
+			expect(result.isErr()).to.equal(true);
+			if (result.isErr())
+				expect(result.error.message).to.equal('Wallet stopped.');
+		}
+		expect(getUtxosStub.callCount, 'no additional refresh body ran').to.equal(
+			1
+		);
+	});
+
+	it('reports disconnect failure after disabling messages and storage', async function () {
+		const saveStub = sinon.stub().resolves(ok('stored'));
+		(wallet as unknown as TWalletInternals)._setData = saveStub;
+		disconnectStub.rejects(new Error('disconnect failed'));
+
+		const stopped = await withDeadline(
+			wallet.stop(),
+			1000,
+			'a failed disconnect'
+		);
+
+		expect(stopped.isErr()).to.equal(true);
+		if (stopped.isErr())
+			expect(stopped.error.message).to.equal('disconnect failed');
+		expect(wallet.disableMessages).to.equal(true);
+		await wallet.saveWalletData('balance', 0);
+		expect(saveStub.callCount, 'storage stays disabled after failure').to.equal(
+			0
+		);
 	});
 
 	it('still waits for a refresh that settles inside the deadline', async function () {

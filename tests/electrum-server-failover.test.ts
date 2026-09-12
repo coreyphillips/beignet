@@ -231,11 +231,15 @@ const stubbedBalance = { confirmed: 4321, unconfirmed: 0 };
  * resolves for the default export does not declare them, and the test type
  * check is run over the whole tests tree.
  */
-type TFakeClock = { tick: (ms: number) => void; restore: () => void };
-const useFakeClock = (toFake: string[]): TFakeClock =>
+type TFakeClock = {
+	tick: (ms: number) => void;
+	tickAsync: (ms: number) => Promise<void>;
+	restore: () => void;
+};
+const useFakeClock = (toFake?: string[]): TFakeClock =>
 	(
 		sinon as unknown as {
-			useFakeTimers: (opts: { now: number; toFake: string[] }) => TFakeClock;
+			useFakeTimers: (opts: { now: number; toFake?: string[] }) => TFakeClock;
 		}
 	).useFakeTimers({ now: Date.now(), toFake });
 
@@ -2342,6 +2346,137 @@ describe('Electrum reconcile debt is not a subscribe failure (issue #514)', () =
 describe('Electrum lifecycle and disconnect races', () => {
 	beforeEach(startTest);
 	afterEach(endTest);
+
+	it('reports a failed socket teardown to the caller', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		disconnectFails = true;
+
+		let failure: unknown;
+		try {
+			await electrum.disconnect();
+		} catch (error) {
+			failure = error;
+		}
+
+		expect(failure).to.be.instanceOf(Error);
+		expect((failure as Error).message).to.contain('socket hang up');
+		expect(client.peer?.host).to.equal(serverA.host);
+	});
+
+	it('does not start a candidate after disconnect interrupts its teardown', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		const teardown = createGate();
+		let stopCalls = 0;
+		(electrumHelpers.stop as sinon.SinonStub).callsFake(async () => {
+			stopCalls += 1;
+			if (stopCalls === 1) await teardown.promise;
+			resetClient();
+			return { error: false, data: 'Disconnected...' };
+		});
+		const start = electrumHelpers.start as sinon.SinonStub;
+		start.resetHistory();
+
+		const connecting = electrum.connectToElectrum({ servers: serverB });
+		try {
+			await flush();
+			expect(stopCalls, 'the candidate is parked in teardown').to.equal(1);
+			await electrum.disconnect();
+		} finally {
+			teardown.release();
+		}
+		const result = await connecting;
+
+		expect(result.isErr()).to.equal(true);
+		expect(start.callCount, 'no candidate may dial after shutdown').to.equal(0);
+	});
+
+	it('stops a UTXO scan before the next batch after disconnect', async () => {
+		const read = sinon
+			.stub(electrumHelpers, 'listUnspentAddressScriptHashes')
+			.resolves({ error: false, data: [] });
+		electrum.batchLimit = 1;
+		const addresses = Object.fromEntries(
+			['aaaa', 'bbbb'].map((scriptHash, index) => [
+				scriptHash,
+				{ scriptHash, index, path: `${index}`, address: '', publicKey: '' }
+			])
+		);
+		const clock = useFakeClock();
+		try {
+			const scan = electrum.listUnspentAddressScriptHashes({ addresses });
+			await clock.tickAsync(0);
+			expect(read.callCount).to.equal(1);
+			await electrum.disconnect();
+			await clock.tickAsync(electrum.batchDelay * 2);
+
+			expect((await scan).isErr()).to.equal(true);
+			expect(
+				read.callCount,
+				'a later helper call can reopen the socket'
+			).to.equal(1);
+		} finally {
+			clock.restore();
+		}
+	});
+
+	it('stops a transaction scan before the next batch after disconnect', async () => {
+		const read = sinon
+			.stub(electrumHelpers, 'getTransactions')
+			.resolves({ error: false, data: [] });
+		electrum.batchLimit = 1;
+		const clock = useFakeClock();
+		try {
+			const scan = electrum.getTransactions({
+				txHashes: [{ tx_hash: 'aaaa' }, { tx_hash: 'bbbb' }]
+			});
+			await clock.tickAsync(0);
+			expect(read.callCount).to.equal(1);
+			await electrum.disconnect();
+			await clock.tickAsync(electrum.batchDelay * 2);
+
+			expect((await scan).isErr()).to.equal(true);
+			expect(read.callCount).to.equal(1);
+		} finally {
+			clock.restore();
+		}
+	});
+
+	it('does not query the mempool after disconnect during the history batch delay', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		const history = sinon
+			.stub(electrumHelpers, 'getAddressScriptHashesHistory')
+			.resolves({ error: false, data: [] });
+		const mempool = sinon
+			.stub(electrumHelpers, 'getAddressScriptHashesMempool')
+			.resolves({ error: false, data: [] });
+		const clock = useFakeClock();
+		try {
+			const scan = electrum.getAddressHistory({
+				scriptHashes: [
+					{
+						scriptHash: 'aaaa',
+						index: 0,
+						path: '0',
+						address: '',
+						publicKey: ''
+					}
+				]
+			});
+			await clock.tickAsync(0);
+			expect(history.callCount).to.equal(1);
+			await electrum.disconnect();
+			await clock.tickAsync(electrum.batchDelay * 2);
+
+			expect((await scan).isErr()).to.equal(true);
+			expect(mempool.callCount).to.equal(0);
+			expect(electrum.connectedToElectrum).to.equal(false);
+		} finally {
+			clock.restore();
+		}
+	});
 
 	it('stops the client for its OWN network, not the last one connected', async () => {
 		await electrum.connectToElectrum({ servers: serverA });
