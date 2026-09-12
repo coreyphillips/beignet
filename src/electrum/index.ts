@@ -2318,6 +2318,12 @@ export class Electrum {
 		if (broadcastResponse.error || broadcastResponse.data.includes(' ')) {
 			return err(broadcastResponse.data);
 		}
+		// The mirror of the output subscription above. Nothing else removes the
+		// coins this transaction spends, and the UTXO set is only ever replaced
+		// by a whole scan, which arrives on a notification at best and never on
+		// a timer: until one lands, every caller of listUtxos can still select a
+		// coin that is already gone.
+		await this._wallet.removeSpentUtxos(rawTx);
 		return ok(broadcastResponse.data);
 	}
 
