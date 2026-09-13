@@ -28,6 +28,8 @@ export enum BeignetErrorCode {
 	INVALID_INVOICE = 'INVALID_INVOICE',
 	/** User-supplied BOLT 12 offer string failed to parse. */
 	INVALID_OFFER = 'INVALID_OFFER',
+	/** A hold settle or cancel left parts parked (refused by a channel, or already under way). */
+	HOLD_RESOLUTION_PENDING = 'HOLD_RESOLUTION_PENDING',
 
 	// Channels
 	CHANNEL_NOT_FOUND = 'CHANNEL_NOT_FOUND',
@@ -149,6 +151,9 @@ export function isRetryableError(err: BeignetError): boolean {
 		// A splice held off by an unacknowledged abort, a peer-owned quiescence
 		// session or settling HTLCs: the same request works once that ends.
 		BeignetErrorCode.SPLICE_BUSY,
+		// Parked parts a disconnected channel refused go through once it
+		// reestablishes, and a set already settling reaches its end state.
+		BeignetErrorCode.HOLD_RESOLUTION_PENDING,
 		// A peer that is down or slow now can be up on the next attempt. These
 		// only read as permanent before because they fell through the default.
 		BeignetErrorCode.CONNECT_FAILED,

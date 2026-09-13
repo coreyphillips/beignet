@@ -1142,6 +1142,7 @@ not repeat a 4xx unchanged.
 | `SPLICE_REFUSED` | Channels | 409 | The channel exists but would not start the splice (state, peer, size) |
 | `SPLICE_BUSY` | Channels | 503 | The channel would splice but is held off by a state that ends on its own; retry the same request |
 | `PEER_NOT_CONNECTED` | Peers | 409 | Peer is not connected |
+| `HOLD_RESOLUTION_PENDING` | Invoices | 503 | `settleHoldInvoice`/`cancelHoldInvoice` left HTLCs parked for the hash: a channel refused them, or a settle or cancel is already under way. The hold is live; do not switch to the other action |
 | `JIT_REFUSED` | Invoices | 400 | JIT receive: the LSP declined the intent, quoted above the wallet's ceiling, or answered with no intercept scid; the message carries the reason |
 | `SWAP_NOT_CANCELLABLE` | Swaps | 409 | Reverse swap provider: the swap is past CREATED/HELD, so it resolves on chain by claim or refund and cannot be cancelled |
 | `JIT_TIMEOUT` | Invoices | 504 | JIT receive: the LSP never answered the intent inside the ack window (retryable) |

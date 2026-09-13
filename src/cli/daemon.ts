@@ -321,6 +321,10 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// that ends on its own, so waiting genuinely changes the answer.
 	SPLICE_BUSY: 503,
 	CHANNEL_NOT_FOUND: 404,
+	// A hold settle or cancel that left parts parked (issue #823): the hold is
+	// live, not absent, and a reestablish or the settle already under way
+	// changes the answer.
+	HOLD_RESOLUTION_PENDING: 503,
 	// FFOR (issue #729): a refused epoch, invoice, credit or provisioning is
 	// the caller's request against the engine's rules, never a server fault.
 	FFOR_REFUSED: 400,
