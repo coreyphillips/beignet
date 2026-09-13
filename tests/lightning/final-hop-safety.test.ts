@@ -651,4 +651,51 @@ describe("the invoice's advertised min_final_cltv_expiry is enforced (issue #770
 			storage.close();
 		}
 	});
+
+	/**
+	 * The JIT tradeoff, accepted deliberately (PR #799 review). A JIT invoice
+	 * advertises 72 blocks so the LSP has room to fund a channel while it holds
+	 * the payer's part, and before #770 that tag was enforced at the 40-block
+	 * default: a payer that sent exactly 72 had 32 blocks of slack for blocks
+	 * mined during the funding. Enforced as written, BOLT 4 style, the same
+	 * payer is refused once a single block lands during the hold, with our
+	 * height in the failure so it retries against the new tip. beignet's own
+	 * payInvoice pads the delta and is unaffected. Lowering the enforced bound
+	 * under the advertised tag is not an option: the tag is what the payer was
+	 * promised, and the slack it bought would be silent.
+	 */
+	it('refuses a JIT HTLC sent at exactly the advertised 72 once a block lands during the funding', () => {
+		const node = makeNode();
+		node.handleNewBlock(HEIGHT);
+		const paymentHash = crypto.randomBytes(32);
+		const hashHex = paymentHash.toString('hex');
+		// What a JIT invoice records: the 72-block c tag and its skim allowance.
+		seedInvoice(node, hashHex, {
+			minFinalCltvExpiry: 72,
+			jitFee: { flatFeeSat: 0, feePpm: 0 }
+		});
+		// Delivered at the tip it was sent against, the bare delta is accepted.
+		expect(safety(node, hashHex, HEIGHT + 72), 'at the tip').to.be.null;
+
+		// The LSP funds, one block lands, then the part is forwarded: 71 blocks
+		// left is under the tag. Before #770 this settled (71 clears 40).
+		node.handleNewBlock(HEIGHT + 1);
+		const { failed, fulfilled } = deliver(node, paymentHash, HEIGHT + 72, {
+			amountToForwardMsat: 1000n,
+			outgoingCltvValue: HEIGHT + 72
+		});
+		expect(failed, 'refused under the advertised tag').to.have.length(1);
+		expect(fulfilled, 'no preimage was revealed').to.have.length(0);
+		expect(failed[0].readUInt16BE(0)).to.equal(
+			INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+		);
+		expect(
+			failed[0].readUInt32BE(10),
+			'our height, so the payer retries'
+		).to.equal(HEIGHT + 1);
+		// A payer that padded the delta by even one block is unaffected.
+		expect(safety(node, hashHex, HEIGHT + 73), 'one block of padding').to.be
+			.null;
+		node.destroy();
+	});
 });

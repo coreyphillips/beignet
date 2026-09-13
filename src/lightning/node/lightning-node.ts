@@ -731,6 +731,11 @@ const JIT_RECEIVE_HINT_CLTV_DELTA = 80;
 /**
  * Final-CLTV headroom a JIT invoice asks payers for. Blocks mined while the
  * LSP is funding must not push the delivered HTLC under our own minimum.
+ * Enforced as written since issue #770: a part that arrives with fewer than
+ * 72 blocks left is refused with our height, so a payer that sent exactly the
+ * tag and lost a block to the funding retries against the new tip rather than
+ * being admitted under what it was promised (an accepted tradeoff, pinned in
+ * tests/lightning/final-hop-safety.test.ts).
  */
 const JIT_RECEIVE_MIN_FINAL_CLTV_EXPIRY = 72;
 
