@@ -16,8 +16,11 @@ import {
 } from '../../src/lightning/node/lightning-node';
 import {
 	IHoldCancelledEvent,
-	IHoldInvoiceStateEvent
+	IHoldInvoiceStateEvent,
+	IStructuredLog
 } from '../../src/lightning/node/types';
+import { HtlcState } from '../../src/lightning/channel/types';
+import { INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS } from '../../src/lightning/onion/types';
 import { validateReverseSwapAdmission } from '../../src/lightning/swaps';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
@@ -31,6 +34,45 @@ import {
 } from './helpers/loopback-nodes';
 
 const TAG = 'hold-snapshot';
+
+/**
+ * Loopback wire with a disconnect switch. A reconnect delivers both
+ * channel_reestablish messages before any response, as a real socket does.
+ */
+function connectWithCut(
+	alice: LightningNode,
+	bob: LightningNode
+): { disconnect: () => void; reconnect: () => void } {
+	let cut = false;
+	let hold = false;
+	const queue: Array<() => void> = [];
+	const route = (from: LightningNode, to: LightningNode): void => {
+		from.on('message:outbound', (pk: string, type: number, payload: Buffer) => {
+			if (cut || pk !== to.getNodeId()) return;
+			const deliver = (): void =>
+				to.handlePeerMessage(from.getNodeId(), type, payload);
+			if (hold) queue.push(deliver);
+			else deliver();
+		});
+	};
+	route(alice, bob);
+	route(bob, alice);
+	return {
+		disconnect: (): void => {
+			cut = true;
+			alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+			bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		},
+		reconnect: (): void => {
+			cut = false;
+			hold = true;
+			alice.getChannelManager().handlePeerReconnected(bob.getNodeId());
+			bob.getChannelManager().handlePeerReconnected(alice.getNodeId());
+			while (queue.length > 0) queue.shift()!();
+			hold = false;
+		}
+	};
+}
 
 function cancelEvents(node: LightningNode): IHoldCancelledEvent[] {
 	const out: IHoldCancelledEvent[] = [];
@@ -257,6 +299,80 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 		bob.handleNewBlock(1040 - HELD_HTLC_EXPIRY_MARGIN);
 		expect(events).to.have.length(0);
 		expect(bob.getHeldInvoiceSnapshot(hash)!.state).to.equal('ACCEPTED');
+	});
+
+	it('retries a refused fail of a late part once its channel reconnects (issue #822)', function () {
+		const alice = createNode(TAG, 23);
+		const bob = createNode(TAG, 24);
+		const carol = createNode(TAG, 25);
+		connectNodes(alice, bob);
+		const link = connectWithCut(carol, bob);
+		for (const node of [alice, bob, carol]) node.handleNewBlock(1000);
+		const aliceChannel = openReadyChannel(alice, bob, 100_000n);
+		const carolChannel = openReadyChannel(carol, bob, 100_000n);
+		buildGraph(alice, bob, [aliceChannel], 100_000_000n);
+		buildGraph(carol, bob, [carolChannel], 100_000_000n);
+
+		const { preimage, hash } = makeExternalHash();
+		const totalMsat = 90_000_000n;
+		const invoice = bob.createInvoice({
+			amountMsat: totalMsat,
+			description: 'hold-late-refused',
+			hold: true,
+			paymentHash: hash
+		});
+		const bobPubkey = Buffer.from(bob.getNodeId(), 'hex');
+		const pay = (payer: LightningNode, amountMsat: bigint): void => {
+			payer.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: bobPubkey,
+							shortChannelId: scidForIndex(0),
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: 200
+						}
+					]
+				},
+				hash,
+				200,
+				invoice.paymentSecret,
+				totalMsat
+			);
+		};
+		pay(alice, totalMsat);
+		expect(bob.getHeldInvoiceSnapshot(hash)!.complete).to.equal(true);
+
+		// The late payer drops while its part is being turned away, so the
+		// channel refuses the fail.
+		const cutOnReject = (log: IStructuredLog): void => {
+			if (log.action === 'held_set_complete') link.disconnect();
+		};
+		bob.on('log', cutOnReject);
+		pay(carol, 1_000_000n);
+		bob.off('log', cutOnReject);
+		const lateHtlcs = (): HtlcState[] =>
+			[
+				...bob
+					.getChannelManager()
+					.getChannel(carolChannel)!
+					.getFullState()
+					.htlcs.entries()
+			]
+				.filter(([key]) => key.startsWith('received-'))
+				.map(([, htlc]) => htlc.state);
+		expect(lateHtlcs()).to.deep.equal([HtlcState.COMMITTED]);
+
+		expect(bob.settleHeldHtlc(hash, preimage)).to.equal(true);
+		expect(bob.getHeldInvoiceSnapshot(hash)!.state).to.equal('SETTLED');
+		bob.handleNewBlock(1001);
+		expect(lateHtlcs()).to.deep.equal([HtlcState.COMMITTED]);
+
+		link.reconnect();
+		expect(lateHtlcs()).to.deep.equal([]);
+		const late = carol.getPayment(hash)!;
+		expect(late.status).to.equal(PaymentStatus.FAILED);
+		expect(late.failureCode).to.equal(INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
 	});
 
 	it('refuses an external hash the node already has a record for', function () {
