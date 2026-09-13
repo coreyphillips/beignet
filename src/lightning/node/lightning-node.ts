@@ -20483,11 +20483,14 @@ export class LightningNode extends EventEmitter {
 				Buffer.from(chanHex, 'hex')
 			);
 			// A closed channel keeps its HTLC entries as they were at the close,
-			// but it will never carry the fail: the HTLC resolves on chain.
+			// but it will never carry the fail: the HTLC resolves on chain. An
+			// ERRORED channel is the same, and it can sit there indefinitely when
+			// recovery safety leaves the close to the peer.
 			const state = channel?.getState();
 			if (
 				state === ChannelState.CLOSED ||
-				state === ChannelState.FORCE_CLOSED
+				state === ChannelState.FORCE_CLOSED ||
+				state === ChannelState.ERRORED
 			) {
 				this.owedHeldForwardFailures.delete(key);
 				this.cleanupHtlcSharedSecret(key);
