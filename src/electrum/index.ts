@@ -82,7 +82,25 @@ type TScriptHashSubscription = {
 	 *  when a sibling held the hash meanwhile: the router's status may already
 	 *  reflect a change only the sibling was refreshed for. */
 	savedStatus?: string | null;
+	/** Set while deliveries to this instance have not yet started its refresh:
+	 *  the status it heard before them, and how many are still on their way. A
+	 *  status only counts as heard once its refresh starts, so this is what
+	 *  disconnect() saves while a delivery is parked in a scan. */
+	pendingRefresh?: { heard: string | null; deliveries: number };
 };
+
+/** Records a delivery to `sub` that has not started its refresh yet. The
+ *  oldest status heard is kept when one is already on its way. */
+function notePendingRefresh(
+	sub: TScriptHashSubscription,
+	heard: string | null
+): void {
+	if (sub.pendingRefresh) {
+		sub.pendingRefresh.deliveries++;
+	} else {
+		sub.pendingRefresh = { heard, deliveries: 1 };
+	}
+}
 
 type TScriptHashRouter = {
 	/** Every instance that subscribed on this network, for the fallback refresh. */
@@ -321,11 +339,13 @@ function getHeaderRouter(network: EElectrumNetworks): THeaderRouter {
 function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 	let router = scriptHashRouters.get(network);
 	if (!router) {
-		/** Hands one notification to one instance registered for its hash. */
+		/** Hands one notification to one instance registered for its hash.
+		 *  `pending` is the record notePendingRefresh was called on for it. */
 		const deliver = async (
 			instance: Electrum,
 			subs: Map<Electrum, TScriptHashSubscription>,
-			data: TSubscribedReceive
+			data: TSubscribedReceive,
+			pending: TScriptHashSubscription
 		): Promise<void> => {
 			// Re-read rather than taken from a snapshot, as the header dispatch
 			// does: the entry ahead of this one parks for as long as a single
@@ -354,6 +374,13 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 				// wallet that has shut down.
 				if (!subs.has(instance)) return;
 			}
+			// The record marked for this delivery, not a re-read one: an instance
+			// that withdrew and registered again holds a new record, whose own
+			// pending deliveries this one is not.
+			const owed = pending.pendingRefresh;
+			if (owed && --owed.deliveries === 0) {
+				delete pending.pendingRefresh;
+			}
 			void instance.wallet.refreshWallet({});
 		};
 		const created: TScriptHashRouter = {
@@ -373,13 +400,15 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					const status = typeof data === 'string' ? data : null;
 					const known = created.statuses.has(scriptHash);
 					const previous = created.statuses.get(scriptHash);
-					created.statuses.set(scriptHash, status);
 					// A server only notifies a live subscription, so a change that
-					// landed while the socket was down is only ever seen here.
+					// landed while the socket was down is only ever seen here. The
+					// dispatch records the status itself, because it reads the one
+					// before it as what each instance last heard.
 					if (known && previous !== status) {
 						void created.dispatch([scriptHash, status as string]);
 						return;
 					}
+					created.statuses.set(scriptHash, status);
 				}
 				// A returning instance whose sibling kept the hash has no status
 				// of its own in the router to compare, so it is compared here.
@@ -390,7 +419,8 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					const saved = sub.savedStatus;
 					delete sub.savedStatus;
 					if (saved !== current) {
-						void deliver(instance, subs, [scriptHash, current as string]);
+						notePendingRefresh(sub, saved);
+						void deliver(instance, subs, [scriptHash, current as string], sub);
 					}
 				}
 			},
@@ -399,8 +429,14 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 				const subs = scriptHash
 					? created.subscriptions.get(scriptHash)
 					: undefined;
+				// With no status before this one, there is nothing older to save.
+				let previous: string | null = null;
 				if (scriptHash && subs) {
-					created.statuses.set(scriptHash, data[1] ?? null);
+					const status = data[1] ?? null;
+					previous = created.statuses.has(scriptHash)
+						? created.statuses.get(scriptHash) ?? null
+						: status;
+					created.statuses.set(scriptHash, status);
 				}
 				if (!subs || subs.size === 0) {
 					// Nothing registered for this hash (a race with removal, or a
@@ -413,11 +449,17 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 				}
 				// Every instance registered now is refreshed below, so none is
 				// still owed a comparison of what it heard before withdrawing.
-				for (const sub of subs.values()) {
+				// Marked up front, because an instance queued behind another's
+				// scan has not heard this status until its own refresh starts.
+				const queued = [...subs];
+				for (const [, sub] of queued) {
+					const heard =
+						sub.savedStatus !== undefined ? sub.savedStatus : previous;
 					delete sub.savedStatus;
+					notePendingRefresh(sub, heard);
 				}
-				for (const instance of [...subs.keys()]) {
-					await deliver(instance, subs, data);
+				for (const [instance, sub] of queued) {
+					await deliver(instance, subs, data, sub);
 				}
 			}
 		};
@@ -2611,10 +2653,13 @@ export class Electrum {
 			for (const [scriptHash, subs] of router.subscriptions) {
 				const sub = subs.get(this);
 				if (!sub || !router.statuses.has(scriptHash)) continue;
-				// One still owed a comparison is what this wallet last heard.
+				// A status still on its way to a refresh, or still owed a
+				// comparison, is not what this wallet last heard.
 				statuses.set(
 					scriptHash,
-					sub.savedStatus !== undefined
+					sub.pendingRefresh
+						? sub.pendingRefresh.heard
+						: sub.savedStatus !== undefined
 						? sub.savedStatus
 						: router.statuses.get(scriptHash) ?? null
 				);
