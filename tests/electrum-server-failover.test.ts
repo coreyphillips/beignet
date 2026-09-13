@@ -3014,3 +3014,57 @@ describe('Electrum reconnect after changes the socket missed (issue #808)', () =
 		).to.deep.equal([]);
 	});
 });
+
+/**
+ * Issue #814: disconnect() withdrew the last subscriber for each wallet hash,
+ * deleting the only status heard for it, so the restore after an explicit
+ * reconnect took whatever the server answered as a first sighting and never
+ * delivered a deposit that landed while the instance was offline.
+ */
+describe('Electrum explicit reconnect after changes it missed (issue #814)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	it('refreshes for a wallet hash whose status changed while disconnected', async () => {
+		subscribeStatuses.set(walletScriptHash, 'before-deposit');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		refreshSpy.resetHistory();
+		await electrum.disconnect();
+		await flush();
+		expect(refreshSpy.callCount, 'disconnecting schedules no scan').to.equal(0);
+
+		// A mempool deposit, with no block to go with it.
+		subscribeStatuses.set(walletScriptHash, 'after-deposit');
+		protocolSubscribes = [];
+		const reconnected = await electrum.connectToElectrum({ servers: serverA });
+		expect(reconnected.isOk()).to.equal(true);
+		await flush();
+
+		expect(protocolSubscribes, 'the restore re-subscribed it').to.include(
+			walletScriptHash
+		);
+		expect(walletHeader.stored.height, 'the header is unchanged').to.equal(100);
+		expect(
+			refreshSpy.callCount,
+			'one refresh for the change the restore revealed'
+		).to.equal(1);
+	});
+
+	it('does not refresh when no status changed while disconnected', async () => {
+		subscribeStatuses.set(walletScriptHash, 'unchanged');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.disconnect();
+		refreshSpy.resetHistory();
+
+		protocolSubscribes = [];
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(protocolSubscribes, 'the restore re-subscribed it').to.include(
+			walletScriptHash
+		);
+		expect(refreshSpy.callCount).to.equal(0);
+	});
+});
