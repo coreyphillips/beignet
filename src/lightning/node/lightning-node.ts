@@ -17441,9 +17441,13 @@ export class LightningNode extends EventEmitter {
 			// outgoing record and hide our own payment's outcome: the payee
 			// of a submarine swap could then be paid twice while the swap is
 			// recorded failed (#743 audit). Refuse it like an unknown hash.
+			// A hash owned by an invoice we issued is refused too: its settled
+			// payment can be pruned from memory while the invoice stays, and a
+			// keysend with the revealed preimage would then settle it again.
 			const outgoing = this.payments.get(hashHex);
 			if (
 				(outgoing && outgoing.direction === PaymentDirection.OUTGOING) ||
+				this.invoices.has(hashHex) ||
 				this.paymentRetryContexts.has(hashHex) ||
 				this.getOutgoingHtlcs(paymentHash).htlcs.length > 0
 			) {
