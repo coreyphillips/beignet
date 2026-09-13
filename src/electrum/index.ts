@@ -435,6 +435,14 @@ export class Electrum {
 	// helpers silently dial a peer when disconnect() has cleared the client.
 	// Check again between batches, which yield while a wallet can stop.
 	private _disconnected = false;
+	/** The last status of each script hash disconnect() withdrew this instance
+	 *  from. Withdrawing the last subscriber deletes the router's own record,
+	 *  so without this an explicit reconnect reads every answer as a first
+	 *  sighting and misses a deposit that landed while it was offline. */
+	private _withdrawnStatuses: {
+		network: EElectrumNetworks;
+		statuses: Map<string, string | null>;
+	} | null = null;
 	/** A drop in this wallet's stored height that has not been reconciled yet.
 	 *  The header write that revealed the rollback also replaced the only
 	 *  evidence of it, so a reconciliation that fails is owed here and every
@@ -2188,6 +2196,19 @@ export class Electrum {
 	private _scriptHashRecord(scriptHash: string): TScriptHashSubscription {
 		const router = getScriptHashRouter(this.electrumNetwork);
 		router.instances.add(this);
+		const withdrawn = this._withdrawnStatuses;
+		if (
+			withdrawn?.network === this.electrumNetwork &&
+			withdrawn.statuses.has(scriptHash)
+		) {
+			if (!router.statuses.has(scriptHash)) {
+				router.statuses.set(
+					scriptHash,
+					withdrawn.statuses.get(scriptHash) ?? null
+				);
+			}
+			withdrawn.statuses.delete(scriptHash);
+		}
 		let subs = router.subscriptions.get(scriptHash);
 		if (!subs) {
 			subs = new Map();
@@ -2540,6 +2561,23 @@ export class Electrum {
 		// hashes it names belong to the shared router, so whichever instance is
 		// still polling this network is the one that discharges them.
 		this._restoreOwed = null;
+		// Merged rather than replaced, so a second disconnect before the
+		// reconnect re-subscribed everything keeps what the first one saved.
+		const router = scriptHashRouters.get(this.electrumNetwork);
+		if (router) {
+			if (this._withdrawnStatuses?.network !== this.electrumNetwork) {
+				this._withdrawnStatuses = {
+					network: this.electrumNetwork,
+					statuses: new Map()
+				};
+			}
+			const { statuses } = this._withdrawnStatuses;
+			for (const [scriptHash, subs] of router.subscriptions) {
+				if (subs.has(this) && router.statuses.has(scriptHash)) {
+					statuses.set(scriptHash, router.statuses.get(scriptHash) ?? null);
+				}
+			}
+		}
 		this.withdrawFromRouters();
 		// Named, because the client resolves a missing network from
 		// clients.network, which is whatever network connected LAST by any
