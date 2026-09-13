@@ -20,7 +20,24 @@ import {
 	TWaitForElectrum
 } from './utils';
 
+// The raw module.exports object, so the drop below reaches the client src uses.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const electrumHelpers = require('rn-electrum-client/helpers');
+
 const testTimeout = 60000;
+
+/** Polls until `predicate` holds, without refreshing anything itself. */
+const waitUntil = async (
+	predicate: () => boolean,
+	ms: number,
+	what: string
+): Promise<void> => {
+	const deadline = Date.now() + ms;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+		await sleep(100);
+	}
+};
 let wallet: Wallet;
 let waitForElectrum: TWaitForElectrum;
 const rpc = new BitcoinJsonRpc(bitcoinURL);
@@ -212,5 +229,79 @@ describe('Receive', function () {
 		await waitForElectrum();
 		const txConfirmedMessage = await confirmedPromise;
 		expect(txConfirmedMessage.transaction.height).to.be.greaterThan(0);
+	});
+
+	// Issue #808: the notifications for a deposit that land while a refresh is
+	// running were answered with that refresh's result.
+	it('Should show a deposit mined during a refresh without a manual refresh', async () => {
+		const r = await wallet.getNextAvailableAddress();
+		if (r.isErr()) throw r.error;
+		const address = r.value.addressIndex.address;
+		expect(wallet.isRefreshing).to.equal(false);
+
+		// Hold a refresh after it has read the UTXOs, which is the batch the
+		// balance comes from.
+		let entered = false;
+		let release = (): void => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const updateTransactions = wallet.updateTransactions.bind(wallet);
+		wallet.updateTransactions = async (
+			...args: Parameters<Wallet['updateTransactions']>
+		): ReturnType<Wallet['updateTransactions']> => {
+			if (!entered) {
+				entered = true;
+				await gate;
+			}
+			return updateTransactions(...args);
+		};
+		const running = wallet.refreshWallet({});
+		await waitUntil(() => entered, 20000, 'the refresh to read its UTXOs');
+
+		await rpc.sendToAddress(address, '0.1');
+		await rpc.generateToAddress(1, await rpc.getNewAddress());
+		await waitForElectrum();
+		const minedHeight = await rpc.getBlockCount();
+		// The block notification has reached the wallet once its header is
+		// stored, and the deposit notification came ahead of it.
+		await waitUntil(
+			() => wallet.data.header.height >= minedHeight,
+			20000,
+			'the block notification'
+		);
+		await sleep(500);
+		release();
+		await running;
+
+		await waitUntil(
+			() => wallet.getBalance() === 0.1 * 10e7,
+			20000,
+			'the deposit in the balance'
+		);
+	});
+
+	// Issue #808: a server only notifies a live subscription, and nothing
+	// refreshed the wallet after the socket came back.
+	it('Should show a deposit mined while disconnected after the reconnect', async () => {
+		const r = await wallet.getNextAvailableAddress();
+		if (r.isErr()) throw r.error;
+		const address = r.value.addressIndex.address;
+
+		// The socket drops under the wallet, as it does when a phone goes to the
+		// background: the client and every subscription on it are gone.
+		await electrumHelpers.stop({ network: 'bitcoinRegtest' });
+
+		await rpc.sendToAddress(address, '0.1');
+		await rpc.generateToAddress(1, await rpc.getNewAddress());
+		await waitForElectrum();
+
+		const reconnected = await wallet.connectToElectrum();
+		expect(reconnected.isOk()).to.equal(true);
+		await waitUntil(
+			() => wallet.getBalance() === 0.1 * 10e7,
+			20000,
+			'the deposit in the balance'
+		);
 	});
 });

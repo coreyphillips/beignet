@@ -25,11 +25,14 @@ import sinon from 'sinon';
 const electrumHelpers = require('rn-electrum-client/helpers');
 
 import {
+	EAddressType,
 	EAvailableNetworks,
 	Electrum,
 	EProtocol,
 	EScanningStrategy,
+	IGetUtxosResponse,
 	ok,
+	Result,
 	TServer,
 	Wallet
 } from '../src';
@@ -565,5 +568,164 @@ describe('Electrum dispatch and monitor against a stopped instance', () => {
 		// The positive control: without this, the test above passes on a
 		// monitor that simply never ran.
 		expect(pinged.called, 'the monitor must actually tick').to.equal(true);
+	});
+});
+
+/**
+ * Issue #808: a notification that reached a wallet while a refresh was running
+ * was answered with that refresh's result, so a deposit announced after the
+ * refresh had read its batch stayed invisible until something else scanned.
+ * Both notification paths go through refreshWallet's queue, so both must lead
+ * to a scan that starts after the running one.
+ */
+describe('Electrum notifications during a running refresh (issue #808)', function () {
+	this.timeout(60000);
+
+	let wallet: Wallet;
+	let getUtxosStub: sinon.SinonStub;
+	/** One gate per getUtxos call, so each refresh body can be held and counted. */
+	let gates: Array<() => void>;
+	let headerHandler: ((data: unknown[]) => Promise<void>) | null;
+
+	const waitFor = async (
+		predicate: () => boolean,
+		what: string
+	): Promise<void> => {
+		const deadline = Date.now() + 5000;
+		while (!predicate()) {
+			if (Date.now() > deadline)
+				throw new Error(`timed out waiting for ${what}`);
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+	};
+
+	beforeEach(async function () {
+		gates = [];
+		globalHandler = null;
+		subscribedHashes = [];
+		headerHandler = null;
+		sinon.stub(electrumHelpers, 'subscribeAddress').callsFake(
+			async ({
+				scriptHash = '',
+				onReceive = undefined
+			}: {
+				scriptHash?: string;
+				onReceive?: (data: TNotification) => void;
+			} = {}) => {
+				if (onReceive && !globalHandler) globalHandler = onReceive;
+				if (subscribedHashes.includes(scriptHash)) {
+					return { error: false, data: 'Already Subscribed.' };
+				}
+				subscribedHashes.push(scriptHash);
+				return { error: false, data: { id: 1, jsonrpc: '2.0', result: null } };
+			}
+		);
+		sinon
+			.stub(electrumHelpers, 'subscribeHeader')
+			.callsFake(
+				async ({
+					onReceive
+				}: { onReceive?: (data: unknown[]) => Promise<void> } = {}) => {
+					if (headerHandler)
+						return { error: false, data: 'Already Subscribed.' };
+					headerHandler = onReceive ?? null;
+					return {
+						error: false,
+						data: { height: 1, hex: Buffer.alloc(80, 1).toString('hex') }
+					};
+				}
+			);
+
+		const res = await Wallet.create({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: EAvailableNetworks.regtest,
+			addressType: EAddressType.p2wpkh,
+			// Unreachable on purpose: this test must work offline.
+			electrumOptions: {
+				net,
+				tls,
+				servers: {
+					host: '127.0.0.1',
+					ssl: 65527,
+					tcp: 65527,
+					protocol: EProtocol.tcp
+				}
+			}
+		});
+		if (res.isErr()) throw res.error;
+		wallet = res.value;
+		// The refresh Wallet.create starts fails fast against the unreachable
+		// port; the cases below own the flag from an idle start.
+		const deadline = Date.now() + 20000;
+		while (wallet.isRefreshing && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		expect(wallet.isRefreshing).to.equal(false);
+
+		const internals = wallet as unknown as {
+			setZeroIndexAddresses: () => Promise<Result<string>>;
+			updateAddressIndexes: () => Promise<Result<string>>;
+		};
+		sinon.stub(internals, 'setZeroIndexAddresses').resolves(ok('stubbed'));
+		sinon.stub(internals, 'updateAddressIndexes').resolves(ok('stubbed'));
+		sinon
+			.stub(wallet, 'updateTransactions')
+			.resolves(ok<string | undefined>(undefined));
+		sinon.stub(wallet, 'updateFeeEstimates').resolves(ok(wallet.feeEstimates));
+		getUtxosStub = sinon.stub(wallet, 'getUtxos').callsFake(async () => {
+			await new Promise<void>((resolve) => gates.push(resolve));
+			return ok<IGetUtxosResponse>({ utxos: [], balance: 0 });
+		});
+	});
+
+	afterEach(async function () {
+		for (const release of gates) release();
+		sinon.restore();
+		wallet.isRefreshing = false;
+		await wallet.stop();
+	});
+
+	/** Starts a refresh and holds it inside getUtxos. Wrapped, because an
+	 *  async function returning the refresh would wait for it. */
+	const holdARefresh = async (): Promise<{ running: Promise<unknown> }> => {
+		const running = wallet.refreshWallet({});
+		await waitFor(() => gates.length === 1, 'the refresh to reach getUtxos');
+		return { running };
+	};
+
+	/** Releases the held refresh and expects exactly one scan after it. */
+	const expectOneScanAfter = async (
+		running: Promise<unknown>
+	): Promise<void> => {
+		gates[0]();
+		await waitFor(() => gates.length === 2, 'a scan after the held refresh');
+		gates[1]();
+		await running;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(getUtxosStub.callCount, 'one scan after the held refresh').to.equal(
+			2
+		);
+	};
+
+	it('scans after a script hash notification that lands mid-refresh', async function () {
+		await wallet.electrum.subscribeToAddresses({ scriptHashes: ['8080'] });
+		const { running } = await holdARefresh();
+
+		const dispatched = fireNotification(['8080', 'deposit']);
+		await expectOneScanAfter(running);
+		await dispatched;
+	});
+
+	it('scans after a block notification that lands mid-refresh', async function () {
+		expect((await wallet.electrum.subscribeToHeader()).isOk()).to.equal(true);
+		expect(headerHandler, 'the header handler was wired').to.not.equal(null);
+		const { running } = await holdARefresh();
+
+		const dispatched = headerHandler!([
+			{ height: 2, hex: Buffer.alloc(80, 2).toString('hex') }
+		]);
+		await expectOneScanAfter(running);
+		await dispatched;
 	});
 });
