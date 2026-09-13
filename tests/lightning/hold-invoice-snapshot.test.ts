@@ -19,7 +19,7 @@ import {
 	IHoldInvoiceStateEvent,
 	IStructuredLog
 } from '../../src/lightning/node/types';
-import { HtlcState } from '../../src/lightning/channel/types';
+import { ChannelState, HtlcState } from '../../src/lightning/channel/types';
 import { INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS } from '../../src/lightning/onion/types';
 import { validateReverseSwapAdmission } from '../../src/lightning/swaps';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -417,6 +417,28 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 		bob.handleNewBlock(1001);
 		bob.handleNewBlock(1002);
 		// The closed channel still lists the HTLC, but nothing is owed on it.
+		expect(lateHtlcs()).to.deep.equal([HtlcState.COMMITTED]);
+		expect(owedFails(bob)).to.equal(0);
+		expect(secretKeys(bob, carolChannel)).to.deep.equal([]);
+		expect(refusedFails).to.equal(0);
+	});
+
+	it('drops an owed late-part fail and its secret on an errored channel left for the peer to close (issue #837)', function () {
+		const { bob, carolChannel, lateHtlcs } = oweLatePartFail(29);
+		expect(owedFails(bob)).to.equal(1);
+
+		// Data loss forbids broadcasting our commitment, so the channel stays
+		// ERRORED until the peer closes it.
+		const channel = bob.getChannelManager().getChannel(carolChannel)!;
+		channel.getFullState().dataLossDetected = true;
+		channel.getFullState().state = ChannelState.ERRORED;
+		(bob as any).handleChannelErrored(carolChannel, 'test'); // eslint-disable-line @typescript-eslint/no-explicit-any
+		let refusedFails = 0;
+		bob.getChannelManager().on('error', () => refusedFails++);
+
+		bob.handleNewBlock(1001);
+		bob.handleNewBlock(1002);
+		expect(channel.getState()).to.equal(ChannelState.ERRORED);
 		expect(lateHtlcs()).to.deep.equal([HtlcState.COMMITTED]);
 		expect(owedFails(bob)).to.equal(0);
 		expect(secretKeys(bob, carolChannel)).to.deep.equal([]);
