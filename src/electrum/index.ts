@@ -117,6 +117,19 @@ type TScriptHashRouter = {
 	noteSubscribed: (scriptHash: string, response: ISubscribeToAddress) => void;
 };
 
+/** The status the instance behind `sub` last heard for a hash the router holds
+ *  a status for. A status still on its way to a refresh, or still owed a
+ *  comparison, is not what that wallet last heard. */
+function lastHeardStatus(
+	router: TScriptHashRouter,
+	scriptHash: string,
+	sub: TScriptHashSubscription
+): string | null {
+	if (sub.pendingRefresh) return sub.pendingRefresh.heard;
+	if (sub.savedStatus !== undefined) return sub.savedStatus;
+	return router.statuses.get(scriptHash) ?? null;
+}
+
 /**
  * Script hash routing state, shared per network across every Electrum
  * instance in the process. rn-electrum-client keeps ONE
@@ -512,10 +525,11 @@ export class Electrum {
 	// helpers silently dial a peer when disconnect() has cleared the client.
 	// Check again between batches, which yield while a wallet can stop.
 	private _disconnected = false;
-	/** The last status of each script hash disconnect() withdrew this instance
-	 *  from. Withdrawing the last subscriber deletes the router's own record,
-	 *  so without this an explicit reconnect reads every answer as a first
-	 *  sighting and misses a deposit that landed while it was offline. */
+	/** The last status of each script hash disconnect(), or the rollback of a
+	 *  failed subscribe, withdrew this instance from. Withdrawing the last
+	 *  subscriber deletes the router's own record, so without this an explicit
+	 *  reconnect reads every answer as a first sighting and misses a deposit
+	 *  that landed while it was offline. */
 	private _withdrawnStatuses: {
 		network: EElectrumNetworks;
 		statuses: Map<string, string | null>;
@@ -2333,6 +2347,34 @@ export class Electrum {
 	}
 
 	/**
+	 * Takes back the callback a failed subscribe added. When that empties this
+	 * instance's record, the status it last heard goes back to
+	 * _withdrawnStatuses, where _scriptHashRecord may have just taken it from,
+	 * so the retry still has something to compare the server's answer with.
+	 */
+	private rollBackScriptHashCallback(
+		scriptHash: string,
+		onReceive: (data: TSubscribedReceive) => void
+	): void {
+		const router = scriptHashRouters.get(this.electrumNetwork);
+		const sub = router?.subscriptions.get(scriptHash)?.get(this);
+		if (!router || !sub) return;
+		const heard = router.statuses.has(scriptHash)
+			? lastHeardStatus(router, scriptHash, sub)
+			: undefined;
+		this.removeScriptHashCallback({ scriptHash, onReceive });
+		if (heard === undefined) return;
+		if (router.subscriptions.get(scriptHash)?.get(this) === sub) return;
+		if (this._withdrawnStatuses?.network !== this.electrumNetwork) {
+			this._withdrawnStatuses = {
+				network: this.electrumNetwork,
+				statuses: new Map()
+			};
+		}
+		this._withdrawnStatuses.statuses.set(scriptHash, heard);
+	}
+
+	/**
 	 * Subscribes to a number of address script hashes for receiving.
 	 * @param {string[]} scriptHashes
 	 * @param onReceive
@@ -2406,7 +2448,7 @@ export class Electrum {
 			});
 			if (response.error) {
 				if (added && onReceive) {
-					this.removeScriptHashCallback({ scriptHash, onReceive });
+					this.rollBackScriptHashCallback(scriptHash, onReceive);
 				}
 				throw Error('Unable to subscribe to receiving addresses.');
 			}
@@ -2427,10 +2469,7 @@ export class Electrum {
 			});
 			if (response.error) {
 				if (added && onReceive) {
-					this.removeScriptHashCallback({
-						scriptHash: utxo.scriptHash,
-						onReceive
-					});
+					this.rollBackScriptHashCallback(utxo.scriptHash, onReceive);
 				}
 				throw Error('Unable to subscribe to receiving addresses.');
 			}
@@ -2656,16 +2695,7 @@ export class Electrum {
 			for (const [scriptHash, subs] of router.subscriptions) {
 				const sub = subs.get(this);
 				if (!sub || !router.statuses.has(scriptHash)) continue;
-				// A status still on its way to a refresh, or still owed a
-				// comparison, is not what this wallet last heard.
-				statuses.set(
-					scriptHash,
-					sub.pendingRefresh
-						? sub.pendingRefresh.heard
-						: sub.savedStatus !== undefined
-						? sub.savedStatus
-						: router.statuses.get(scriptHash) ?? null
-				);
+				statuses.set(scriptHash, lastHeardStatus(router, scriptHash, sub));
 			}
 		}
 		this.withdrawFromRouters();
