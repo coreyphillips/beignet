@@ -186,6 +186,8 @@ export class Wallet {
 	// have read past whatever prompted the call (a deposit notification, the
 	// block confirming it), so the last body to finish scans once more.
 	private _refreshOwed = false;
+	// onStart callbacks of refresh calls whose body has not started yet.
+	private _refreshStartCallbacks: Array<() => void> = [];
 	// Outpoints our own broadcasts have spent, keyed 'txid:vout', each holding
 	// the value _spendSeq had when the broadcast landed. The UTXO set is only
 	// ever replaced wholesale by a scan, so a scan already in flight at that
@@ -880,18 +882,24 @@ export class Wallet {
 	 * @param {boolean} [scanAllAddresses]
 	 * @param {string[]} [additionalAddresses]
 	 * @param {boolean} [force] Runs even while another refresh is in flight.
+	 * @param {() => void} [onStart] Called when a refresh body that starts after
+	 * this call begins: at once when nothing is refreshing, later when the call
+	 * queues behind a refresh in flight, never when the wallet stops first.
 	 * @returns {Promise<Result<IWalletData>>}
 	 */
 	public async refreshWallet({
 		scanAllAddresses = false,
 		additionalAddresses = [],
-		force = false
+		force = false,
+		onStart
 	}: {
 		scanAllAddresses?: boolean;
 		additionalAddresses?: string[];
 		force?: boolean;
+		onStart?: () => void;
 	} = {}): Promise<Result<IWalletData>> {
 		if (this._stopped) return err('Wallet stopped.');
+		if (onStart) this._refreshStartCallbacks.push(onStart);
 		if (this.isRefreshing && !force) {
 			this._refreshOwed = true;
 			return new Promise((resolve) => {
@@ -916,6 +924,13 @@ export class Wallet {
 		let scan = { scanAllAddresses, additionalAddresses };
 		try {
 			for (;;) {
+				for (const started of this._refreshStartCallbacks.splice(0)) {
+					try {
+						started();
+					} catch {
+						// A caller's hook must not cost the refresh.
+					}
+				}
 				try {
 					result = await this._runRefresh(scan);
 				} catch (e) {
