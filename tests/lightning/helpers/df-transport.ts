@@ -31,12 +31,21 @@ export class FakeDfNetwork {
 	connect(a: FakeDfPeer, b: FakeDfPeer): void {
 		a.connections.add(b.id);
 		b.connections.add(a.id);
+		// Registered first, announced after, as the node does.
+		a.announceConnect(b.id);
+		b.announceConnect(a.id);
+	}
+
+	disconnect(a: FakeDfPeer, b: FakeDfPeer): void {
+		a.connections.delete(b.id);
+		b.connections.delete(a.id);
 	}
 }
 
 export class FakeDfPeer implements IDfPeerMessaging {
 	readonly connections = new Set<string>();
 	readonly listeners = new Set<(msg: IDfCustomMessage) => void>();
+	readonly connectListeners = new Set<(peerPubkeyHex: string) => void>();
 	/** Errors a listener let escape, i.e. what would cost a real peer its link. */
 	readonly escapedErrors: unknown[] = [];
 	readonly sent: Array<{ to: string; subtype: number; payload: Buffer }> = [];
@@ -89,6 +98,17 @@ export class FakeDfPeer implements IDfPeerMessaging {
 		return () => {
 			this.listeners.delete(cb);
 		};
+	}
+
+	onPeerConnect(cb: (peerPubkeyHex: string) => void): () => void {
+		this.connectListeners.add(cb);
+		return () => {
+			this.connectListeners.delete(cb);
+		};
+	}
+
+	announceConnect(peerPubkeyHex: string): void {
+		for (const listener of [...this.connectListeners]) listener(peerPubkeyHex);
 	}
 
 	/**

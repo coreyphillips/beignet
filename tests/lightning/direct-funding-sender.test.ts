@@ -28,6 +28,10 @@ import {
 } from '../../src/lightning/direct-funding/types';
 import { DirectFundingSender } from '../../src/lightning/direct-funding/sender/engine';
 import {
+	DF_OFFER_RESEND_DELAYS_MS,
+	DF_OFFER_TIMEOUT_MS
+} from '../../src/lightning/direct-funding/sender/types';
+import {
 	DirectFundingPaymentStore,
 	DF_PAYMENTS_STORAGE_KEY
 } from '../../src/lightning/direct-funding/sender/records';
@@ -1083,6 +1087,23 @@ describe('Direct funding sender: the never-reject contract', () => {
 		);
 		expect(err.code).to.equal(DirectFundingErrorCode.SIGN_REQUEST_REFUSED);
 		expect(sawWitness).to.equal(false);
+	});
+});
+
+describe('Direct funding sender: the offer schedule', () => {
+	// Issue #806: re-sends stopped at 30 s while the exchange waited 120 s, so a
+	// receiver that came back after that received nothing for the rest of the
+	// window. Offers are idempotent at the receiver, so the schedule runs on.
+	it('keeps re-sending the offer until the offer window is nearly over', () => {
+		const delays = [...DF_OFFER_RESEND_DELAYS_MS];
+		expect(delays).to.deep.equal([...delays].sort((a, b) => a - b));
+		let previous = 0;
+		for (const delay of delays) {
+			expect(delay - previous, 'a gap in the schedule').to.be.at.most(30_000);
+			previous = delay;
+		}
+		expect(delays[delays.length - 1]).to.be.below(DF_OFFER_TIMEOUT_MS);
+		expect(DF_OFFER_TIMEOUT_MS - previous).to.be.at.most(30_000);
 	});
 });
 

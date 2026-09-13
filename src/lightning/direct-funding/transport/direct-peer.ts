@@ -60,6 +60,10 @@ export class DfDirectPeerLaneFactory implements IDfLaneFactory {
 	 * Dial the receiver at the address it published and hand back a lane. A
 	 * connection failure returns null so the registry can try the next
 	 * descriptor; nothing has reached the wire at that point.
+	 *
+	 * A lane opened with `awaitReceiverConnection` does not dial: this node is
+	 * the receiver's introduction node, the receiver connects to it, and the
+	 * lane holds the offer until it does (see DfDirectPeerLane.send).
 	 */
 	async open(
 		descriptor: DfTransportDescriptor,
@@ -68,7 +72,8 @@ export class DfDirectPeerLaneFactory implements IDfLaneFactory {
 		if (descriptor.type !== DfTransportType.DIRECT_PEER) return null;
 		const { host, port } = descriptor as IDfDirectPeerTransport;
 		const peerHex = ctx.receiverNodeId.toString('hex');
-		if (!this.peers.isPeerConnected(peerHex)) {
+		const awaiting = ctx.awaitReceiverConnection === true;
+		if (!awaiting && !this.peers.isPeerConnected(peerHex)) {
 			try {
 				await this.peers.connectPeer(peerHex, host, port);
 			} catch {
@@ -82,7 +87,8 @@ export class DfDirectPeerLaneFactory implements IDfLaneFactory {
 			this.table,
 			peerHex,
 			ctx.requestId.toString('hex'),
-			this.log
+			this.log,
+			awaiting
 		);
 	}
 
@@ -232,7 +238,16 @@ class DfDirectPeerSender {
 class DfDirectPeerLane extends DfDirectPeerSender implements IDfTransport {
 	private readonly handlers = new Set<DfFrameHandler>();
 	private readonly release: () => void;
+	private readonly unsubscribeConnect: () => void;
 	private exchanged = 0;
+	private answered = false;
+	/**
+	 * The latest offer frame, kept until the receiver answers anything. Offers
+	 * are idempotent at the receiver, so re-sending one when the receiver
+	 * (re)connects is always safe, and it is what gets the offer to a receiver
+	 * that was away when the payer's scheduled re-sends fired.
+	 */
+	private offer: Buffer | null = null;
 	private closed = false;
 
 	constructor(
@@ -240,11 +255,15 @@ class DfDirectPeerLane extends DfDirectPeerSender implements IDfTransport {
 		table: DfLaneTable,
 		peerHex: string,
 		requestIdHex: string,
-		log: DfTransportLog
+		log: DfTransportLog,
+		/** Opened for a receiver this node introduces; see the factory's open. */
+		private readonly awaitingReceiver = false
 	) {
 		super(peers, peerHex, log);
 		this.release = table.claim(peerHex, requestIdHex, (frame) => {
 			this.exchanged++;
+			this.answered = true;
+			this.offer = null;
 			deliverIsolated([...this.handlers], frame, (err) =>
 				logDrop(this.log, DfDropReason.HANDLER_FAILED, {
 					pubkey: this.peerHex,
@@ -252,6 +271,48 @@ class DfDirectPeerLane extends DfDirectPeerSender implements IDfTransport {
 				})
 			);
 		});
+		this.unsubscribeConnect =
+			peers.onPeerConnect?.((peerPubkeyHex) => {
+				if (peerPubkeyHex !== this.peerHex || this.closed) return;
+				if (this.answered || !this.offer) return;
+				this.trySend(BeignetCustomSubtype.DIRECT_FUNDING_OFFER, this.offer);
+			}) ?? ((): void => undefined);
+	}
+
+	/**
+	 * While a lane that awaits its receiver has put nothing on the wire, an
+	 * offer the link cannot carry yet is HELD rather than refused: it goes out
+	 * when the receiver connects, and until then it is not counted, so a
+	 * receiver that never connects leaves the exchange with no frame exchanged
+	 * and the registry's refusal is still pre-witness. Only the offer is ever
+	 * held. Every other frame, and every frame once one has left, throws as
+	 * it always has: a witness must never be reported sent when it was not.
+	 */
+	send(subtype: number, payload: Buffer): void {
+		if (payload.length > DF_MAX_FRAME_BYTES) {
+			throw malformed(
+				`direct-funding frame is ${payload.length} bytes, max ${DF_MAX_FRAME_BYTES}`
+			);
+		}
+		const isOffer = subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER;
+		if (isOffer && !this.answered) this.offer = payload;
+		if (!(isOffer && this.awaitingReceiver && this.exchanged === 0)) {
+			super.send(subtype, payload);
+			return;
+		}
+		if (!this.peers.isPeerConnected(this.peerHex)) return;
+		try {
+			super.send(subtype, payload);
+		} catch (err) {
+			// Listed as connected but not ready to carry it. Still held: the next
+			// connect or scheduled re-send tries again.
+			logDrop(this.log, DfDropReason.SEND_FAILED, {
+				pubkey: this.peerHex,
+				subtype,
+				held: true,
+				error: errorText(err)
+			});
+		}
 	}
 
 	onMessage(cb: DfFrameHandler): () => void {
@@ -269,7 +330,9 @@ class DfDirectPeerLane extends DfDirectPeerSender implements IDfTransport {
 		if (this.closed) return;
 		this.closed = true;
 		this.release();
+		this.unsubscribeConnect();
 		this.handlers.clear();
+		this.offer = null;
 	}
 
 	protected onSent(): void {

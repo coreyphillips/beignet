@@ -70,6 +70,7 @@ class StubFactory implements IDfLaneFactory {
 	opens = 0;
 	attaches = 0;
 	lastLane: StubLane | null = null;
+	contexts: IDfOpenContext[] = [];
 
 	constructor(
 		readonly type: number,
@@ -78,9 +79,10 @@ class StubFactory implements IDfLaneFactory {
 
 	async open(
 		_descriptor: DfTransportDescriptor,
-		_ctx: IDfOpenContext
+		ctx: IDfOpenContext
 	): Promise<IDfTransport | null> {
 		this.opens++;
+		this.contexts.push(ctx);
 		if (this.behaviour === 'null') return null;
 		if (this.behaviour === 'throw') throw new Error('dial refused');
 		this.lastLane = new StubLane(this.type);
@@ -303,6 +305,143 @@ describe('Direct-funding transport registry', () => {
 			);
 			expect(relayLane.opens).to.equal(0);
 			expect(log.reasons()).to.include(DfLaneSkipReason.SELF_RELAY);
+		});
+
+		// Issue #806: a primary paying its own lightning-first wallet while the
+		// wallet is away. The request carries only an onion descriptor whose
+		// introduction node is the payer, so the onion lane used to dial the
+		// payer's own node id and sit out the offer window.
+		describe('when this node is the receiver introduction node', () => {
+			function selfIntroduced(): IDfOnionTransport {
+				return { ...onion(), introNodeId: NODE_B };
+			}
+
+			function registryAsIntroduction(
+				connected: boolean,
+				directEnabled = true
+			): {
+				registry: DfTransportRegistry;
+				peerLane: StubFactory;
+				onionLane: StubFactory;
+				relayLane: StubFactory;
+				log: ReturnType<typeof recordingLog>;
+			} {
+				const peerLane = new StubFactory(DfTransportType.DIRECT_PEER);
+				const onionLane = new StubFactory(DfTransportType.ONION_MESSAGE);
+				const relayLane = new StubFactory(DfTransportType.LSP_RELAY);
+				const log = recordingLog();
+				const registry = new DfTransportRegistry(log.log, {
+					isPeerConnected: () => connected,
+					nodeId: () => NODE_B
+				});
+				registry.register({
+					type: DfTransportType.DIRECT_PEER,
+					enabled: directEnabled,
+					load: () => peerLane
+				});
+				registry.register({
+					type: DfTransportType.ONION_MESSAGE,
+					enabled: true,
+					load: () => onionLane
+				});
+				registry.register({
+					type: DfTransportType.LSP_RELAY,
+					enabled: true,
+					load: () => relayLane
+				});
+				return { registry, peerLane, onionLane, relayLane, log };
+			}
+
+			it('never opens the onion or relay lane, and waits on the direct lane instead', async () => {
+				const { registry, peerLane, onionLane, relayLane } =
+					registryAsIntroduction(false);
+				const used = await registry.run(
+					[selfIntroduced()],
+					CTX,
+					async (lane) => lane.type
+				);
+				expect(used).to.equal(DfTransportType.DIRECT_PEER);
+				expect(onionLane.opens).to.equal(0);
+				expect(relayLane.opens).to.equal(0);
+				expect(peerLane.opens).to.equal(1);
+				expect(peerLane.contexts[0].awaitReceiverConnection).to.equal(true);
+				expect(peerLane.contexts[0].receiverNodeId).to.equal(NODE_A);
+			});
+
+			it('refuses UNREACHABLE at once, without the onion lane, when the wait carried no frame', async () => {
+				const { registry, onionLane, relayLane, log } =
+					registryAsIntroduction(false);
+				let refused: unknown;
+				try {
+					await registry.run([selfIntroduced()], CTX, async () => {
+						throw new Error('the receiver did not connect');
+					});
+				} catch (err) {
+					refused = err;
+				}
+				expect((refused as DirectFundingError).code).to.equal(
+					DirectFundingErrorCode.UNREACHABLE
+				);
+				expect((refused as Error).message).to.include(
+					'the receiver did not connect'
+				);
+				expect(onionLane.opens).to.equal(0);
+				expect(relayLane.opens).to.equal(0);
+				expect(log.reasons()).to.include.members([
+					DfLaneSkipReason.SELF_INTRODUCTION,
+					DfLaneSkipReason.SELF_RELAY
+				]);
+			});
+
+			it('refuses UNREACHABLE without dialing anything when the direct lane is off', async () => {
+				const { registry, peerLane, onionLane, relayLane } =
+					registryAsIntroduction(false, false);
+				let refused: unknown;
+				try {
+					await registry.run([selfIntroduced()], CTX, async (l) => l.type);
+				} catch (err) {
+					refused = err;
+				}
+				expect((refused as DirectFundingError).code).to.equal(
+					DirectFundingErrorCode.UNREACHABLE
+				);
+				expect(peerLane.opens + onionLane.opens + relayLane.opens).to.equal(0);
+			});
+
+			it("tries the receiver's own address first, then waits, and uses one direct lane when already connected", async () => {
+				const away = registryAsIntroduction(false);
+				away.peerLane.contexts.length = 0;
+				await away.registry
+					.run([directPeer(), selfIntroduced()], CTX, async () => {
+						throw new Error('nothing carried');
+					})
+					.catch(() => undefined);
+				expect(
+					away.peerLane.contexts.map((c) => c.awaitReceiverConnection === true)
+				).to.deep.equal([false, true]);
+
+				const here = registryAsIntroduction(true);
+				await here.registry.run(
+					[selfIntroduced()],
+					CTX,
+					async (lane) => lane.type
+				);
+				expect(here.peerLane.opens).to.equal(1);
+			});
+
+			it('leaves a stranger payer on the onion lane', async () => {
+				const { registry, peerLane, onionLane } = registryAsIntroduction(false);
+				const used = await registry.run(
+					[onion()].map((t) => ({ ...t, introNodeId: NODE_A })),
+					{ ...CTX, receiverNodeId: getPublicKey(Buffer.alloc(32, 9)) },
+					async (lane) => lane.type
+				);
+				expect(used).to.equal(DfTransportType.ONION_MESSAGE);
+				expect(peerLane.opens).to.equal(0);
+				expect(onionLane.contexts[0].awaitReceiverConnection).to.equal(
+					undefined
+				);
+			});
 		});
 	});
 

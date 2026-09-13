@@ -177,6 +177,10 @@ export class DfOnionLaneFactory implements IDfLaneFactory {
 		const onion = descriptor as IDfOnionTransport;
 		const sendPath = blindedPathFromDescriptor(onion);
 		if (!sendPath) return null;
+		// This node as the introduction node is not a lane: it would dial itself
+		// and count an offer sent into its own socket as exchanged. The registry
+		// skips such a descriptor and waits on the direct connection instead.
+		if (onion.introNodeId.equals(this.deps.nodeId())) return null;
 		const introHex = onion.introNodeId.toString('hex');
 		if (!this.deps.peers.isPeerConnected(introHex)) {
 			try {

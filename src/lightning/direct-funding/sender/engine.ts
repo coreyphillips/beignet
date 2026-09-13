@@ -1370,7 +1370,12 @@ export class DirectFundingSender {
 				fail(
 					new DirectFundingError(
 						DirectFundingErrorCode.EXCHANGE_TIMEOUT,
-						'the receiver did not complete the funding exchange in time'
+						// Nothing on the wire is only possible on a lane that held the
+						// offer for a receiver that never connected, and saying so
+						// beats blaming a receiver that never saw the offer.
+						lane.framesExchanged() === 0
+							? 'the receiver did not connect before the offer window closed'
+							: 'the receiver did not complete the funding exchange in time'
 					)
 				)
 			);
