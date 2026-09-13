@@ -1327,6 +1327,45 @@ describe('Hold Invoices (M4 batch 1)', function () {
 			}
 		});
 
+		// A block handled from inside the settle dispatch must find the set
+		// bound to settle, so the unfulfilled part is claimed rather than failed.
+		it('binds a settle to its outcome before the first fulfil leaves', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createNode(53);
+			const bob = createNode(54, storage);
+			connectWithCut(alice, bob);
+			const ch1 = openReadyChannel(alice, bob, 100_000n);
+			const ch2 = openReadyChannel(alice, bob, 100_000n);
+			buildGraph(alice, bob, [ch1, ch2], 100_000_000n);
+			const { hash, preimage } = makeExternalHash();
+			parkTwoParts(alice, bob, [ch1, ch2], hash, 90_000_000n);
+			const expiry = parkedCltvExpiry(bob, ch2);
+			const cm = bob.getChannelManager();
+			const fails: bigint[] = [];
+			const failHtlc = cm.failHtlc.bind(cm);
+			cm.failHtlc = (channelId, htlcId, reason) => {
+				fails.push(htlcId);
+				return failHtlc(channelId, htlcId, reason);
+			};
+
+			let saved: string | null = null;
+			bob.once('message:outbound', () => {
+				saved = storage.loadMetadata('held_htlcs');
+				bob.handleNewBlock(expiry - 1);
+			});
+			expect(bob.settleHeldHtlc(hash, preimage)).to.equal(false);
+
+			expect(JSON.parse(saved!)[0].resolution.outcome).to.equal('settle');
+			expect(fails).to.have.length(0);
+			const st = cm.getChannel(ch2)!.getFullState();
+			expect([...st.htlcs.values()].map((h) => h.state)).to.deep.equal([
+				'COMMITTED'
+			]);
+			expect(bob.cancelHoldInvoice(hash)).to.equal(null);
+			storage.close();
+		});
+
 		it('keeps a partially refused cancel bound to its outcome across a reload', function () {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();
