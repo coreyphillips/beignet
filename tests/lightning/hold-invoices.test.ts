@@ -32,6 +32,35 @@ import {
 	encodeShortChannelId
 } from '../../src/lightning/gossip/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { HELD_HTLC_EXPIRY_MARGIN } from '../../src/lightning/node/lightning-node';
+
+/** The GET /invoices/held expiry fields a hold event carries (issue #770). */
+function expiryFields(
+	bob: LightningNode,
+	channelId: Buffer
+): {
+	minFinalCltvExpiry: number;
+	earliestExpiry: number;
+	cancelMarginBlocks: number;
+	cancelHeight: number;
+} {
+	const state = bob.getChannelManager().getChannel(channelId)!.getFullState();
+	let earliestExpiry: number | undefined;
+	for (const [key, htlc] of state.htlcs) {
+		if (!key.startsWith('received-')) continue;
+		earliestExpiry =
+			earliestExpiry === undefined
+				? htlc.cltvExpiry
+				: Math.min(earliestExpiry, htlc.cltvExpiry);
+	}
+	if (earliestExpiry === undefined) throw new Error('no received HTLC');
+	return {
+		minFinalCltvExpiry: 40,
+		earliestExpiry,
+		cancelMarginBlocks: HELD_HTLC_EXPIRY_MARGIN,
+		cancelHeight: earliestExpiry - HELD_HTLC_EXPIRY_MARGIN
+	};
+}
 
 // ─────────────── Harness (mirrors node.test.ts) ───────────────
 
@@ -601,11 +630,13 @@ describe('Hold Invoices (M4 batch 1)', function () {
 			alice.sendPayment(invoice.bolt11);
 			expect(events).to.have.length(1);
 			expect(events[0][0]).to.equal('hold:accepted');
+			const expiry = expiryFields(bob, channelId);
 			expect(events[0][1]).to.deep.equal({
 				paymentHash: hash,
 				state: 'ACCEPTED',
 				heldAmountMsat: 5_000_000n,
-				htlcCount: 1
+				htlcCount: 1,
+				...expiry
 			});
 
 			expect(bob.settleHeldHtlc(hash, preimage)).to.be.true;
@@ -615,7 +646,8 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				paymentHash: hash,
 				state: 'SETTLED',
 				heldAmountMsat: 5_000_000n,
-				htlcCount: 1
+				htlcCount: 1,
+				...expiry
 			});
 		});
 
@@ -635,6 +667,7 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				paymentHash: paid.hash
 			});
 			alice.sendPayment(invoice.bolt11);
+			const expiry = expiryFields(bob, channelId);
 			bob.cancelHoldInvoice(paid.hash);
 			expect(events.map((e) => e[0])).to.deep.equal([
 				'hold:accepted',
@@ -644,7 +677,8 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				paymentHash: paid.hash,
 				reason: 'api',
 				htlcsFailed: 1,
-				heldAmountMsat: 5_000_000n
+				heldAmountMsat: 5_000_000n,
+				...expiry
 			});
 
 			const unpaid = makeExternalHash();
@@ -660,7 +694,11 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				paymentHash: unpaid.hash,
 				reason: 'api',
 				htlcsFailed: 0,
-				heldAmountMsat: 0n
+				heldAmountMsat: 0n,
+				minFinalCltvExpiry: 40,
+				earliestExpiry: null,
+				cancelMarginBlocks: HELD_HTLC_EXPIRY_MARGIN,
+				cancelHeight: null
 			});
 		});
 
@@ -854,11 +892,18 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				'hold:accepted',
 				'hold:accepted'
 			]);
+			const expiry = {
+				minFinalCltvExpiry: 40,
+				earliestExpiry: 40,
+				cancelMarginBlocks: HELD_HTLC_EXPIRY_MARGIN,
+				cancelHeight: 40 - HELD_HTLC_EXPIRY_MARGIN
+			};
 			expect(events[0][1]).to.deep.equal({
 				paymentHash: hash,
 				state: 'ACCEPTED',
 				heldAmountMsat: totalMsat / 2n,
-				htlcCount: 1
+				htlcCount: 1,
+				...expiry
 			});
 			// The second part carries the whole invoice: a consumer holding the
 			// declared amount can tell the set is complete from the event alone.
@@ -866,7 +911,8 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				paymentHash: hash,
 				state: 'ACCEPTED',
 				heldAmountMsat: totalMsat,
-				htlcCount: 2
+				htlcCount: 2,
+				...expiry
 			});
 		});
 

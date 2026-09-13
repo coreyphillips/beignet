@@ -398,19 +398,36 @@ export interface HoldInvoiceInfo {
 	description?: string;
 	expiry: number;
 	createdAt: number;
+	/** The final-CLTV delta the invoice advertised and the final hop enforces. */
+	minFinalCltvExpiry: number;
+	/**
+	 * The realised expiry of the parked set (issue #770): the earliest
+	 * cltv_expiry over the committed parts, the node's early-cancel margin in
+	 * blocks and the first height its sweeper cancels at. Null before any part
+	 * is committed. A swap provider verifies these before funding on-chain
+	 * instead of trusting the delta it advertised.
+	 */
+	earliestExpiry: number | null;
+	cancelMarginBlocks: number;
+	cancelHeight: number | null;
 }
 
 /**
  * A hold invoice's transition, relayed over SSE and webhooks (issue #746).
- * Uses the field names of a `GET /invoices/held` row. `heldAmountMsat` and
- * `htlcCount` describe the parked set the transition acted on, including
- * for terminal events whose subsequent GET row has zero parked parts.
+ * Uses the field names of a `GET /invoices/held` row. `heldAmountMsat`,
+ * `htlcCount` and the expiry fields describe the parked set the transition
+ * acted on, including for terminal events whose subsequent GET row has zero
+ * parked parts.
  */
 export interface HoldInvoiceEvent {
 	paymentHash: string;
 	state: HoldInvoiceInfo['state'];
 	heldAmountMsat: string;
 	htlcCount: number;
+	minFinalCltvExpiry: number;
+	earliestExpiry: number | null;
+	cancelMarginBlocks: number;
+	cancelHeight: number | null;
 }
 
 export interface DecodedInvoice {

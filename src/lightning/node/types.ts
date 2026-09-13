@@ -1430,6 +1430,16 @@ export interface IHoldInvoiceStateEvent {
 	state: HoldInvoiceState;
 	heldAmountMsat: bigint;
 	htlcCount: number;
+	/** The final-CLTV delta the invoice advertised and the final hop enforces. */
+	minFinalCltvExpiry: number;
+	/**
+	 * The realised expiry of the set the transition acted on (issue #770):
+	 * the earliest cltv_expiry over its parts, the sweeper's cancel margin and
+	 * the first height it cancels at. Null with no part in the set.
+	 */
+	earliestExpiry: number | null;
+	cancelMarginBlocks: number;
+	cancelHeight: number | null;
 }
 
 /** Payload of the 'hold:cancelled' node event. */
@@ -1439,6 +1449,11 @@ export interface IHoldCancelledEvent {
 	htlcsFailed: number;
 	/** Msat of the parts failed back; 0 when nothing was parked yet. */
 	heldAmountMsat: bigint;
+	minFinalCltvExpiry: number;
+	/** The realised expiry of the set failed back; null when nothing was parked. */
+	earliestExpiry: number | null;
+	cancelMarginBlocks: number;
+	cancelHeight: number | null;
 }
 
 // ─── Typed Payment Errors ───

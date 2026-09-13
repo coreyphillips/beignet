@@ -532,4 +532,12 @@ export interface IInvoiceInfo {
 	 * Numbers, not bigints: this record is persisted as JSON.
 	 */
 	jitFee?: { flatFeeSat: number; feePpm: number };
+	/**
+	 * The final-CLTV delta this invoice advertised in its BOLT 11 `c` tag
+	 * (issue #770). The final hop enforces it against the arriving HTLC's
+	 * expiry, so it has to survive a restart between issuing and payment.
+	 * Absent on a row written before it was recorded, and on an invoice that
+	 * took the node default: both enforce DEFAULT_MIN_FINAL_CLTV_EXPIRY.
+	 */
+	minFinalCltvExpiry?: number;
 }

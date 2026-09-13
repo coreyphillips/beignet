@@ -124,6 +124,66 @@ describe('POST /invoice/create-hold final CLTV', function () {
 		}
 	});
 
+	// Issue #770: the delta was advertised and never enforced, and the listing
+	// dropped the realised expiry, so a provider could verify neither.
+	it('lists the enforced delta and the realised expiry on GET /invoices/held', async () => {
+		const hash = '12'.repeat(32);
+		await bolt11Of({
+			paymentHash: hash,
+			amountSats: 1_000,
+			description: 'swap leg',
+			minFinalCltvExpiry: 200
+		});
+		const rows = await new Promise<Array<Record<string, unknown>>>(
+			(resolve, reject) => {
+				http
+					.get({ host: '127.0.0.1', port, path: '/invoices/held' }, (res) => {
+						let raw = '';
+						res.on('data', (c) => (raw += c));
+						res.on('end', () =>
+							resolve(
+								(JSON.parse(raw) as { result: Array<Record<string, unknown>> })
+									.result
+							)
+						);
+					})
+					.on('error', reject);
+			}
+		);
+		const row = rows.find((r) => r.paymentHash === hash);
+		expect(row, 'the hold invoice is listed').to.not.equal(undefined);
+		expect(row!.state).to.equal('OPEN');
+		expect(row!.minFinalCltvExpiry).to.equal(200);
+		// Nothing parked yet: the realised expiry is null, not absent.
+		expect(row!.earliestExpiry).to.equal(null);
+		expect(row!.cancelHeight).to.equal(null);
+		expect(row!.cancelMarginBlocks).to.equal(18);
+		for (const key of [
+			'minFinalCltvExpiry',
+			'earliestExpiry',
+			'cancelMarginBlocks',
+			'cancelHeight'
+		]) {
+			expect(Object.keys(row!), key).to.include(key);
+		}
+		const defaulted = rows.find((r) => r.paymentHash === 'cd'.repeat(32));
+		expect(defaulted!.minFinalCltvExpiry, 'the node default').to.equal(40);
+
+		const spec = getOpenApiSpec() as unknown as {
+			components: {
+				schemas: Record<string, { properties?: Record<string, unknown> }>;
+			};
+		};
+		expect(
+			Object.keys(spec.components.schemas.HoldInvoiceInfo.properties ?? {})
+		).to.include.members([
+			'minFinalCltvExpiry',
+			'earliestExpiry',
+			'cancelMarginBlocks',
+			'cancelHeight'
+		]);
+	});
+
 	it('documents the field so a caller can probe for it', () => {
 		// pubky-swap reads GET /openapi.json at startup and stops advertising
 		// reverse swaps when the field is missing, so an undocumented but

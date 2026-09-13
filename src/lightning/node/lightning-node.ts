@@ -731,6 +731,11 @@ const JIT_RECEIVE_HINT_CLTV_DELTA = 80;
 /**
  * Final-CLTV headroom a JIT invoice asks payers for. Blocks mined while the
  * LSP is funding must not push the delivered HTLC under our own minimum.
+ * Enforced as written since issue #770: a part that arrives with fewer than
+ * 72 blocks left is refused with our height, so a payer that sent exactly the
+ * tag and lost a block to the funding retries against the new tip rather than
+ * being admitted under what it was promised (an accepted tradeoff, pinned in
+ * tests/lightning/final-hop-safety.test.ts).
  */
 const JIT_RECEIVE_MIN_FINAL_CLTV_EXPIRY = 72;
 
@@ -14780,6 +14785,14 @@ export class LightningNode extends EventEmitter {
 		// issuing and payment: held apart it would be gone by the time the
 		// skimmed HTLC arrived, and a legitimate JIT receive would fail.
 		if (jitFee) record.jitFee = { ...jitFee };
+		// The advertised final-CLTV delta rides the record too (issue #770): the
+		// final hop enforces the c tag this invoice signed, and an invoice that
+		// asked for more than the node default is usually a swap leg that has
+		// to outlive an on-chain refund. Left in memory, a restart would fall
+		// back to the default and admit an HTLC the invoice promised to refuse.
+		if (options.minFinalCltvExpiry !== undefined) {
+			record.minFinalCltvExpiry = options.minFinalCltvExpiry;
+		}
 
 		this.persistInvoiceRecords(paymentHash, record, preimage, paymentSecret);
 
@@ -17209,6 +17222,21 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * The final-CLTV delta the final hop enforces for a payment hash: the
+	 * delta the matching invoice advertised, never below the node default.
+	 * A hash with no invoice (keysend, an unknown payment) and an invoice
+	 * recorded before the delta was persisted both get the default.
+	 */
+	private minFinalCltvExpiryFor(hashHex: string): number {
+		const advertised = this.invoices.get(hashHex)?.minFinalCltvExpiry;
+		return advertised !== undefined &&
+			Number.isInteger(advertised) &&
+			advertised > DEFAULT_MIN_FINAL_CLTV_EXPIRY
+			? advertised
+			: DEFAULT_MIN_FINAL_CLTV_EXPIRY;
+	}
+
 	private finalHopSafetyFailure(
 		sharedSecret: Buffer | undefined,
 		hopPayload: IHopPayload | undefined,
@@ -17247,23 +17275,30 @@ export class LightningNode extends EventEmitter {
 			}
 			// expiry-too-soon. BOLT 4 is explicit here: "if incoming cltv_expiry <
 			// current_block_height + min_final_cltv_expiry_delta: MUST fail the
-			// HTLC". We advertise DEFAULT_MIN_FINAL_CLTV_EXPIRY, so that is what we
-			// enforce, and relaxing it would both break conformance and leave us
-			// short of the headroom we need to win an on-chain claim race.
+			// HTLC". The delta is the one the matching invoice advertised in its
+			// c tag (issue #770): a swap leg asks for far more than the node
+			// default so it outlives the on-chain refund, and admitting an HTLC
+			// that clears only the default lets the payer reclaim over Lightning
+			// while still claiming the contract. Keysend and an unknown hash have
+			// no invoice and keep DEFAULT_MIN_FINAL_CLTV_EXPIRY, and an invoice
+			// can only raise the bound: the default is the headroom we need to
+			// win an on-chain claim race, and relaxing it would also break
+			// conformance.
 			//
 			// This condition is transient when it is simply block-height skew, so
 			// the failure carries our height (see incorrectPaymentDetailsData) and
 			// the SENDER is responsible for noticing and retrying. Do not "fix" a
 			// skew-induced failure by lowering this bound.
+			const minFinalCltvExpiry = this.minFinalCltvExpiryFor(hashHex);
 			if (
 				this.currentBlockHeight > 0 &&
-				incomingCltvExpiry <
-					this.currentBlockHeight + DEFAULT_MIN_FINAL_CLTV_EXPIRY
+				incomingCltvExpiry < this.currentBlockHeight + minFinalCltvExpiry
 			) {
 				this.emitStructuredLog('htlc', 'final_expiry_too_soon', {
 					paymentHash: hashHex,
 					htlcCltv: incomingCltvExpiry,
-					height: this.currentBlockHeight
+					height: this.currentBlockHeight,
+					minFinalCltvExpiry
 				});
 				return fail(INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
 			}
@@ -17755,6 +17790,40 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * The realised expiry of a parked set for a hold event: the earliest
+	 * cltv_expiry over its parts and the height the sweeper cancels at, both
+	 * null when nothing is parked. Mirrors the GET /invoices/held row.
+	 */
+	private heldSetExpiry(
+		hashHex: string,
+		held: ReadonlyArray<{ cltvExpiry: number }>
+	): Pick<
+		IHoldInvoiceStateEvent,
+		| 'minFinalCltvExpiry'
+		| 'earliestExpiry'
+		| 'cancelMarginBlocks'
+		| 'cancelHeight'
+	> {
+		let earliestExpiry: number | null = null;
+		for (const h of held) {
+			if (h.cltvExpiry <= 0) continue;
+			earliestExpiry =
+				earliestExpiry === null
+					? h.cltvExpiry
+					: Math.min(earliestExpiry, h.cltvExpiry);
+		}
+		return {
+			minFinalCltvExpiry: this.minFinalCltvExpiryFor(hashHex),
+			earliestExpiry,
+			cancelMarginBlocks: HELD_HTLC_EXPIRY_MARGIN,
+			cancelHeight:
+				earliestExpiry === null
+					? null
+					: earliestExpiry - HELD_HTLC_EXPIRY_MARGIN
+		};
+	}
+
 	/** Finish notifying every listener before delivering a nested transition. */
 	private emitHoldInvoiceEvent(
 		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled',
@@ -17819,7 +17888,8 @@ export class LightningNode extends EventEmitter {
 					paymentHash,
 					state: 'ACCEPTED',
 					heldAmountMsat: parked.reduce((sum, h) => sum + h.amountMsat, 0n),
-					htlcCount: parked.length
+					htlcCount: parked.length,
+					...this.heldSetExpiry(hashHex, parked)
 				};
 				this.emitHoldInvoiceEvent('hold:accepted', event);
 			}
@@ -17930,7 +18000,8 @@ export class LightningNode extends EventEmitter {
 			paymentHash,
 			state: 'SETTLED',
 			heldAmountMsat: held.reduce((sum, h) => sum + h.amountMsat, 0n),
-			htlcCount: held.length
+			htlcCount: held.length,
+			...this.heldSetExpiry(hashHex, held)
 		};
 		this.emitHoldInvoiceEvent('hold:settled', event);
 		return true;
@@ -18024,7 +18095,8 @@ export class LightningNode extends EventEmitter {
 			hashHex,
 			cancelReason,
 			held.length,
-			held.reduce((sum, h) => sum + h.amountMsat, 0n)
+			held.reduce((sum, h) => sum + h.amountMsat, 0n),
+			held
 		);
 		this.emitStructuredLog('htlc', 'held_cancelled', {
 			paymentHash: hashHex,
@@ -18042,8 +18114,12 @@ export class LightningNode extends EventEmitter {
 		hashHex: string,
 		reason: HoldCancelReason,
 		htlcsFailed: number,
-		heldAmountMsat: bigint
+		heldAmountMsat: bigint,
+		failedSet: ReadonlyArray<{ cltvExpiry: number }> = []
 	): void {
+		// Read before the invoice's delta record is touched: the event names
+		// the set the cancel acted on, expiry included.
+		const expiry = this.heldSetExpiry(hashHex, failedSet);
 		this.preimages.delete(hashHex);
 		this.paymentSecrets.delete(hashHex);
 		this.clearJitSkim(hashHex);
@@ -18083,7 +18159,8 @@ export class LightningNode extends EventEmitter {
 			paymentHash: Buffer.from(hashHex, 'hex'),
 			reason,
 			htlcsFailed,
-			heldAmountMsat
+			heldAmountMsat,
+			...expiry
 		};
 		this.emitHoldInvoiceEvent('hold:cancelled', event);
 	}
@@ -18131,6 +18208,18 @@ export class LightningNode extends EventEmitter {
 		state: HoldInvoiceState;
 		heldAmountMsat: bigint;
 		htlcCount: number;
+		/** The final-CLTV delta the invoice advertised and the final hop enforces. */
+		minFinalCltvExpiry: number;
+		/**
+		 * The realised expiry of the parked set (issue #770), as
+		 * getHeldInvoiceSnapshot reports it: the earliest cltv_expiry over the
+		 * committed parts, the sweeper's cancel margin and the first height it
+		 * cancels at. Null with no committed part. A swap provider verifies
+		 * these before funding on-chain instead of trusting the advertised delta.
+		 */
+		earliestExpiry: number | null;
+		cancelMarginBlocks: number;
+		cancelHeight: number | null;
 	}> {
 		const out: ReturnType<LightningNode['listHoldInvoices']> = [];
 		for (const [hashHex, invoice] of this.invoices) {
@@ -18139,6 +18228,7 @@ export class LightningNode extends EventEmitter {
 			let heldAmountMsat = 0n;
 			for (const h of held) heldAmountMsat += h.amountMsat;
 			const state = this.holdInvoiceState(hashHex, invoice);
+			const snapshot = this.getHeldInvoiceSnapshot(Buffer.from(hashHex, 'hex'));
 			out.push({
 				paymentHash: hashHex,
 				bolt11: invoice.bolt11,
@@ -18148,7 +18238,11 @@ export class LightningNode extends EventEmitter {
 				createdAt: invoice.createdAt,
 				state,
 				heldAmountMsat,
-				htlcCount: held.length
+				htlcCount: held.length,
+				minFinalCltvExpiry: this.minFinalCltvExpiryFor(hashHex),
+				earliestExpiry: snapshot?.earliestExpiry ?? null,
+				cancelMarginBlocks: HELD_HTLC_EXPIRY_MARGIN,
+				cancelHeight: snapshot?.cancelHeight ?? null
 			});
 		}
 		return out;

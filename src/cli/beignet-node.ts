@@ -1338,7 +1338,11 @@ export function holdInvoiceEvent(e: IHoldInvoiceStateEvent): HoldInvoiceEvent {
 		paymentHash: e.paymentHash.toString('hex'),
 		state: e.state,
 		heldAmountMsat: e.heldAmountMsat.toString(),
-		htlcCount: e.htlcCount
+		htlcCount: e.htlcCount,
+		minFinalCltvExpiry: e.minFinalCltvExpiry,
+		earliestExpiry: e.earliestExpiry,
+		cancelMarginBlocks: e.cancelMarginBlocks,
+		cancelHeight: e.cancelHeight
 	};
 }
 
@@ -2744,7 +2748,11 @@ export class BeignetNode extends EventEmitter {
 					paymentHash: e.paymentHash,
 					state: 'CANCELLED',
 					heldAmountMsat: e.heldAmountMsat,
-					htlcCount: e.htlcsFailed
+					htlcCount: e.htlcsFailed,
+					minFinalCltvExpiry: e.minFinalCltvExpiry,
+					earliestExpiry: e.earliestExpiry,
+					cancelMarginBlocks: e.cancelMarginBlocks,
+					cancelHeight: e.cancelHeight
 				}),
 				reason: e.reason
 			});
@@ -8251,7 +8259,11 @@ export class BeignetNode extends EventEmitter {
 				heldAmountMsat: inv.heldAmountMsat.toString(),
 				htlcCount: inv.htlcCount,
 				expiry: inv.expiry,
-				createdAt: inv.createdAt
+				createdAt: inv.createdAt,
+				minFinalCltvExpiry: inv.minFinalCltvExpiry,
+				earliestExpiry: inv.earliestExpiry,
+				cancelMarginBlocks: inv.cancelMarginBlocks,
+				cancelHeight: inv.cancelHeight
 			};
 			if (inv.amountMsat !== undefined) {
 				info.amountSats = Number(inv.amountMsat / 1000n);
