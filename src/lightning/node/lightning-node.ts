@@ -17854,13 +17854,15 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * True when this node already holds any record under the hash: an
-	 * invoice, a payment record in either direction, or a parked hold.
+	 * invoice, a payment record in either direction, a parked hold, or a
+	 * settled keysend pruned from memory (its durable row still exists).
 	 */
 	paymentHashInUse(paymentHash: Buffer): boolean {
 		const hashHex = paymentHash.toString('hex');
 		return (
 			this.invoices.has(hashHex) ||
 			this.payments.has(hashHex) ||
+			this.prunedKeysendHashes.has(hashHex) ||
 			this.heldInvoiceHashes.has(hashHex) ||
 			this.heldHtlcs.has(hashHex)
 		);
