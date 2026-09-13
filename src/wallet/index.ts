@@ -198,6 +198,11 @@ export class Wallet {
 	// only be dropped once the oldest of them has landed: drop it sooner and the
 	// older scan's stale answer has nothing left to filter against.
 	private readonly _scanMarks: number[] = [];
+	// Every getUtxos query is numbered when issued, and the number of the newest
+	// one whose answer was written is kept. Each answer replaces the whole set,
+	// so without this an older query landing last would undo a newer one.
+	private _scanSeq = 0;
+	private _appliedScanSeq = 0;
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
@@ -2530,6 +2535,7 @@ export class Wallet {
 		// known to be newer than the answer it returns.
 		const spendMark = this._spendSeq;
 		this._scanMarks.push(spendMark);
+		const scanSeq = ++this._scanSeq;
 		let getUtxosRes: Result<IGetUtxosResponse>;
 		try {
 			getUtxosRes = await this.electrum.getUtxos({
@@ -2546,6 +2552,10 @@ export class Wallet {
 		if (getUtxosRes.isErr()) {
 			return err(getUtxosRes.error.message);
 		}
+		if (scanSeq < this._appliedScanSeq) {
+			return ok({ utxos: this._data.utxos, balance: this._data.balance });
+		}
+		this._appliedScanSeq = scanSeq;
 		const scanned = this.settleSpentOutpoints(
 			getUtxosRes.value?.utxos ?? [],
 			spendMark

@@ -279,6 +279,68 @@ describe('Broadcast drops the coins it spends', function () {
 		expect(wallet.getBalance()).to.equal(40000);
 	});
 
+	it('does not let an older scan hide a coin a newer scan restored', async () => {
+		sinon.stub(wallet, 'checkElectrumConnection').resolves(ok('connected'));
+		const answers: ((result: Result<IGetUtxosResponse>) => void)[] = [];
+		sinon.stub(wallet.electrum, 'getUtxos').callsFake(
+			() =>
+				new Promise((resolve) => {
+					answers.push(resolve);
+				})
+		);
+
+		const stale = wallet.getUtxos({});
+		await waitFor(() => answers.length === 1);
+
+		const res = await wallet.broadcastTransaction(txSpending([utxoA]));
+		if (res.isErr()) throw res.error;
+
+		const fresh = wallet.getUtxos({});
+		await waitFor(() => answers.length === 2);
+
+		// The broadcast was evicted, and the scan asked after it says so.
+		answers[1](ok({ utxos: [utxoA, utxoB], balance: 100000 }));
+		const freshRes = await fresh;
+		if (freshRes.isErr()) throw freshRes.error;
+		expect(wallet.getBalance()).to.equal(100000);
+
+		answers[0](ok({ utxos: [utxoA, utxoB], balance: 100000 }));
+		const staleRes = await stale;
+		if (staleRes.isErr()) throw staleRes.error;
+		expect(outpoints(wallet.listUtxos())).to.deep.equal(
+			outpoints([utxoA, utxoB])
+		);
+		expect(wallet.getBalance()).to.equal(100000);
+	});
+
+	it('does not let an older scan overwrite a newer one', async () => {
+		sinon.stub(wallet, 'checkElectrumConnection').resolves(ok('connected'));
+		const answers: ((result: Result<IGetUtxosResponse>) => void)[] = [];
+		sinon.stub(wallet.electrum, 'getUtxos').callsFake(
+			() =>
+				new Promise((resolve) => {
+					answers.push(resolve);
+				})
+		);
+
+		const older = wallet.getUtxos({});
+		await waitFor(() => answers.length === 1);
+		const newer = wallet.getUtxos({});
+		await waitFor(() => answers.length === 2);
+
+		// The coin was spent elsewhere between the two queries.
+		answers[1](ok({ utxos: [utxoB], balance: 40000 }));
+		const newerRes = await newer;
+		if (newerRes.isErr()) throw newerRes.error;
+
+		answers[0](ok({ utxos: [utxoA, utxoB], balance: 100000 }));
+		const olderRes = await older;
+		if (olderRes.isErr()) throw olderRes.error;
+		expect(outpoints(olderRes.value.utxos)).to.deep.equal(outpoints([utxoB]));
+		expect(outpoints(wallet.listUtxos())).to.deep.equal(outpoints([utxoB]));
+		expect(wallet.getBalance()).to.equal(40000);
+	});
+
 	it('believes a scan issued after the broadcast that still reports the coin', async () => {
 		const res = await wallet.broadcastTransaction(txSpending([utxoA]));
 		if (res.isErr()) throw res.error;
