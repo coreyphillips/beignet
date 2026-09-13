@@ -811,6 +811,9 @@ export class LightningNode extends EventEmitter {
 	// from memory. Without an invoice, nothing else keeps the hash closed to a
 	// sender replaying the preimage.
 	private prunedKeysendHashes: Set<string> = new Set();
+	// Hashes of settled outgoing payments pruned from memory. The payee and
+	// every hop know the preimage, and could keysend it back over our row.
+	private prunedOutgoingHashes: Set<string> = new Set();
 	private scidToChannelId: Map<string, Buffer> = new Map();
 	private htlcPaymentMap: Map<string, string> = new Map(); // "channelId:htlcId" → paymentHash hex
 	// For forwarded HTLCs: maps "outChannelId:outHtlcId" → { inChannelId, inHtlcId }
@@ -9711,6 +9714,7 @@ export class LightningNode extends EventEmitter {
 		this.payments.clear();
 		this.preimages.clear();
 		this.prunedKeysendHashes.clear();
+		this.prunedOutgoingHashes.clear();
 		this.paymentSecrets.clear();
 		this.invoices.clear();
 		this.scidToChannelId.clear();
@@ -9829,6 +9833,12 @@ export class LightningNode extends EventEmitter {
 				payment.metadata?._keysend === 'true'
 			) {
 				this.prunedKeysendHashes.add(hash);
+			}
+			if (
+				payment.direction === PaymentDirection.OUTGOING &&
+				payment.status === PaymentStatus.COMPLETED
+			) {
+				this.prunedOutgoingHashes.add(hash);
 			}
 			pruned++;
 		};
@@ -17469,12 +17479,14 @@ export class LightningNode extends EventEmitter {
 			// A hash owned by an invoice we issued is refused too: its settled
 			// payment can be pruned from memory while the invoice stays, and a
 			// keysend with the revealed preimage would then settle it again.
-			// A pruned settled keysend is refused for the same reason.
+			// A pruned settled keysend or settled outgoing payment is refused
+			// for the same reason.
 			const outgoing = this.payments.get(hashHex);
 			if (
 				(outgoing && outgoing.direction === PaymentDirection.OUTGOING) ||
 				this.invoices.has(hashHex) ||
 				this.prunedKeysendHashes.has(hashHex) ||
+				this.prunedOutgoingHashes.has(hashHex) ||
 				this.paymentRetryContexts.has(hashHex) ||
 				this.getOutgoingHtlcs(paymentHash).htlcs.length > 0
 			) {
