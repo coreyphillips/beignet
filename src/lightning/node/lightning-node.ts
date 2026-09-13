@@ -20466,6 +20466,17 @@ export class LightningNode extends EventEmitter {
 			const channel = this.channelManager.getChannel(
 				Buffer.from(chanHex, 'hex')
 			);
+			// A closed channel keeps its HTLC entries as they were at the close,
+			// but it will never carry the fail: the HTLC resolves on chain.
+			const state = channel?.getState();
+			if (
+				state === ChannelState.CLOSED ||
+				state === ChannelState.FORCE_CLOSED
+			) {
+				this.owedHeldForwardFailures.delete(key);
+				this.cleanupHtlcSharedSecret(key);
+				continue;
+			}
 			const htlc = channel?.getFullState().htlcs.get(`received-${htlcId}`);
 			const stillCommitted =
 				htlc !== undefined &&
