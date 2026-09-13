@@ -301,10 +301,22 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 		expect(bob.getHeldInvoiceSnapshot(hash)!.state).to.equal('ACCEPTED');
 	});
 
-	it('retries a refused fail of a late part once its channel reconnects (issue #822)', function () {
-		const alice = createNode(TAG, 23);
-		const bob = createNode(TAG, 24);
-		const carol = createNode(TAG, 25);
+	/**
+	 * Bob parks alice's full hold set, then carol's late part is turned away
+	 * while carol's link drops, so bob owes its fail.
+	 */
+	function oweLatePartFail(seed: number): {
+		bob: LightningNode;
+		carol: LightningNode;
+		carolChannel: Buffer;
+		link: { disconnect: () => void; reconnect: () => void };
+		hash: Buffer;
+		preimage: Buffer;
+		lateHtlcs: () => HtlcState[];
+	} {
+		const alice = createNode(TAG, seed);
+		const bob = createNode(TAG, seed + 1);
+		const carol = createNode(TAG, seed + 2);
 		connectNodes(alice, bob);
 		const link = connectWithCut(carol, bob);
 		for (const node of [alice, bob, carol]) node.handleNewBlock(1000);
@@ -362,6 +374,20 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 				.filter(([key]) => key.startsWith('received-'))
 				.map(([, htlc]) => htlc.state);
 		expect(lateHtlcs()).to.deep.equal([HtlcState.COMMITTED]);
+		return { bob, carol, carolChannel, link, hash, preimage, lateHtlcs };
+	}
+
+	/* eslint-disable @typescript-eslint/no-explicit-any */
+	const owedFails = (node: LightningNode): number =>
+		(node as any).owedHeldForwardFailures.size;
+	const secretKeys = (node: LightningNode, channelId: Buffer): string[] =>
+		[...(node as any).receivedHtlcSharedSecrets.keys()].filter((k: string) =>
+			k.startsWith(channelId.toString('hex'))
+		);
+	/* eslint-enable @typescript-eslint/no-explicit-any */
+
+	it('retries a refused fail of a late part once its channel reconnects (issue #822)', function () {
+		const { bob, carol, link, hash, preimage, lateHtlcs } = oweLatePartFail(23);
 
 		expect(bob.settleHeldHtlc(hash, preimage)).to.equal(true);
 		expect(bob.getHeldInvoiceSnapshot(hash)!.state).to.equal('SETTLED');
@@ -373,6 +399,28 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 		const late = carol.getPayment(hash)!;
 		expect(late.status).to.equal(PaymentStatus.FAILED);
 		expect(late.failureCode).to.equal(INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
+	});
+
+	it('drops an owed late-part fail and its secret once the channel force closes (issue #832)', function () {
+		const { bob, carolChannel, lateHtlcs } = oweLatePartFail(26);
+		expect(owedFails(bob)).to.equal(1);
+		expect(secretKeys(bob, carolChannel)).to.have.length(1);
+
+		const forced = bob.forceCloseChannel(
+			carolChannel,
+			Buffer.from('0014' + '11'.repeat(20), 'hex')
+		);
+		expect(forced.ok, forced.error).to.equal(true);
+		let refusedFails = 0;
+		bob.getChannelManager().on('error', () => refusedFails++);
+
+		bob.handleNewBlock(1001);
+		bob.handleNewBlock(1002);
+		// The closed channel still lists the HTLC, but nothing is owed on it.
+		expect(lateHtlcs()).to.deep.equal([HtlcState.COMMITTED]);
+		expect(owedFails(bob)).to.equal(0);
+		expect(secretKeys(bob, carolChannel)).to.deep.equal([]);
+		expect(refusedFails).to.equal(0);
 	});
 
 	it('refuses an external hash the node already has a record for', function () {
