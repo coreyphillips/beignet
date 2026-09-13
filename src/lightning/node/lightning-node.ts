@@ -17374,6 +17374,31 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
+		// A completed incoming payment takes no further HTLC for its hash:
+		// fulfilling one debits a second payer and fires the settlement events
+		// again. The HTLCs that completed it never return here, because their
+		// fulfills reach disk no later than the completed record and
+		// reestablish retransmits them at the channel layer.
+		const completed = this.payments.get(hashHex);
+		if (
+			completed?.direction === PaymentDirection.INCOMING &&
+			completed.status === PaymentStatus.COMPLETED
+		) {
+			this.emitStructuredLog('htlc', 'payment_already_completed', {
+				paymentHash: hashHex
+			});
+			const reason = sharedSecret
+				? createFailureMessage(
+						sharedSecret,
+						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+						this.incorrectPaymentDetailsData(amountMsat)
+				  )
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
+		}
+
 		// Keysend: extract preimage from custom TLV records (bLIP-0003)
 		const keysendPreimage = hopPayload?.customRecords?.get(KEYSEND_TLV_TYPE);
 		if (keysendPreimage) {

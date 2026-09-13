@@ -509,12 +509,18 @@ describe('Hold Invoices (M4 batch 1)', function () {
 			buildGraph(carol, bob2, [carolChannelId]);
 			const accepted: IHoldInvoiceStateEvent[] = [];
 			bob2.on('hold:accepted', (e: IHoldInvoiceStateEvent) => accepted.push(e));
+			let settledEvents = 0;
+			bob2.on('payment:received', () => settledEvents++);
+			bob2.on('invoice:settled', () => settledEvents++);
 
 			carol.sendPayment(invoice.bolt11);
 
 			expect(accepted).to.have.length(0);
 			expect(bob2.listHeldHtlcs()).to.have.length(0);
 			expect(bob2.listHoldInvoices()[0].state).to.equal('SETTLED');
+			// Nor is the replay fulfilled (issue #811).
+			expect(carol.getPayment(hash)!.status).to.equal(PaymentStatus.FAILED);
+			expect(settledEvents).to.equal(0);
 			storage.close();
 		});
 	});
