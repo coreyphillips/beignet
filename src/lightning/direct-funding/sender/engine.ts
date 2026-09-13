@@ -101,6 +101,16 @@ export interface IDfSendOptions {
 	maxTotalFeeSat?: bigint;
 	/** Clock override for the envelope's expiry check. */
 	now?: number;
+	/**
+	 * Ask the receiver to replay a receipt that never arrived (issue #767).
+	 * Only acts on a post-witness record with no receipt yet: it re-sends the
+	 * recorded offer so the receiver's idempotent replay answers with the
+	 * receipt, and re-runs none of the coin, signature or freeze steps that
+	 * only make sense before the witness left. Off by default, so a plain
+	 * retry of a delivered payment still returns from the record without a
+	 * frame.
+	 */
+	recoverReceipt?: boolean;
 }
 
 type ResolvedConfig = Required<IDfSenderConfig>;
@@ -118,8 +128,14 @@ interface IDfAttempt {
 	 * different content and be refused (4C's admission, step 2).
 	 */
 	offerBody: Buffer;
-	coin: IDfSenderCoin;
-	signer: IDfCoinSigner;
+	/**
+	 * Absent only on a receipt-recovery attempt (issue #767), which re-sends
+	 * the recorded offer and never selects, freezes or signs a coin: the coin
+	 * may already be spent by the funding, and re-signing is exactly what
+	 * recovery must not do. Every other attempt pins both.
+	 */
+	coin?: IDfSenderCoin;
+	signer?: IDfCoinSigner;
 	/** Prev txid in INTERNAL byte order, as transaction inputs carry it. */
 	prevTxid: Buffer;
 	/**
@@ -136,6 +152,14 @@ interface IDfAttempt {
 	 * second run of a payment already made, it may no longer reject.
 	 */
 	witnessMayBeOut?: boolean;
+	/**
+	 * A receipt-recovery attempt (issue #767). It re-sends the recorded offer
+	 * so the receiver replays its receipt, holds no coin and no signer, and
+	 * re-emits the stored witness (never a fresh signature) if the receiver
+	 * answers with a sign request. It carries witnessMayBeOut semantics, so it
+	 * starts committed and can only resolve, never reject.
+	 */
+	recoverReceipt?: boolean;
 }
 
 /**
@@ -577,6 +601,23 @@ export class DirectFundingSender {
 				// be out, and rev 2's caller answers a throw by paying the same money
 				// again over a plain address, so a retry that names a different amount
 				// gets the amount that was actually paid rather than a refusal.
+				// Receipt recovery (issue #767): opt in, and only for a payment whose
+				// witness provably left (so there is a delivery to get a receipt
+				// for) that has no receipt yet. It re-sends the recorded offer to
+				// fish out the receiver's idempotent replay, without re-running the
+				// coin, signature or freeze steps. FAILED is excluded: a conflicting
+				// spend won, so there is no delivery of ours to attest, and writing a
+				// receiptPreimage onto it would assert one. A record that already has
+				// a receipt falls through to the replay below and puts no frame out.
+				if (
+					opts.recoverReceipt &&
+					existing.status !== 'FAILED' &&
+					existing.receiptPreimage === undefined &&
+					(existing.status !== 'SIGNED_PENDING' ||
+						existing.witnessSent === true)
+				) {
+					return this.beginReceiptRecovery(env, existing);
+				}
 				return existing.status === 'SIGNED_PENDING' &&
 					existing.witnessSent !== true
 					? this.resume(env, existing, true)
@@ -697,6 +738,40 @@ export class DirectFundingSender {
 				coin,
 				signer,
 				prevTxid: Buffer.from(txid).reverse()
+			}
+		};
+	}
+
+	/**
+	 * A receipt-recovery attempt (issue #767): re-send the recorded offer so the
+	 * receiver replays the receipt a delivered payment never returned, and run
+	 * none of the coin, signer or freeze steps. Unlike resume(), it needs
+	 * neither the coin (the funding may have spent it) nor a signer (nothing is
+	 * signed again): the offer bytes and the committed witness are both on the
+	 * record. It carries witnessMayBeOut semantics, so the exchange starts
+	 * committed and can only resolve, never reject.
+	 */
+	private beginReceiptRecovery(
+		env: IDfRequestEnvelope,
+		record: IDfPaymentRecord
+	): IDfBeginOutcome {
+		const offerBody = Buffer.from(record.offerBody, 'hex');
+		this.log(DF_LOG_SEND_STARTED, {
+			requestId: record.requestId,
+			offerId: record.offerId,
+			amountSat: record.amountSat,
+			resumed: true,
+			recoverReceipt: true
+		});
+		return {
+			attempt: {
+				env,
+				record,
+				offer: decodeDfOffer(offerBody),
+				offerBody,
+				prevTxid: Buffer.from(record.spentTxid, 'hex').reverse(),
+				witnessMayBeOut: true,
+				recoverReceipt: true
 			}
 		};
 	}
@@ -1049,8 +1124,13 @@ export class DirectFundingSender {
 			let releasing: Promise<void> | undefined;
 			const releaseFreeze = (): Promise<void> => {
 				if (releasing) return releasing;
-				if (!freezing || attempt.witnessMayBeOut) return Promise.resolve();
-				const outpoint = `${attempt.coin.txidHex}:${attempt.coin.vout}`;
+				// A recovery attempt (and any witnessMayBeOut resume) holds no freeze
+				// of its own to release: the freeze that protects the committed
+				// payment must outlive it. `coin` is absent on a recovery attempt.
+				if (!freezing || attempt.witnessMayBeOut || !attempt.coin)
+					return Promise.resolve();
+				const coin = attempt.coin;
+				const outpoint = `${coin.txidHex}:${coin.vout}`;
 				this.pendingReleases.set(outpoint, false);
 				// Cleanup belongs to the exchange, so a signer that never answers
 				// cannot hold the coin. Await acquisition before releasing: its RPC
@@ -1059,10 +1139,7 @@ export class DirectFundingSender {
 					.then(async (frozen) => {
 						const released =
 							!frozen ||
-							(await this.deps.wallet.unfreezeUtxo(
-								attempt.coin.txidHex,
-								attempt.coin.vout
-							));
+							(await this.deps.wallet.unfreezeUtxo(coin.txidHex, coin.vout));
 						if (released) {
 							this.pendingReleases.set(outpoint, true);
 							if (
@@ -1154,6 +1231,17 @@ export class DirectFundingSender {
 				committed: () => committed,
 				settled: () => settled,
 				freeze: () => {
+					// Only reached from honor after a fresh sign request, which a
+					// recovery attempt never signs: it has no coin to reserve.
+					const coin = attempt.coin;
+					if (!coin) {
+						return Promise.reject(
+							new DirectFundingError(
+								DirectFundingErrorCode.NO_SUITABLE_UTXO,
+								'a receipt-recovery attempt holds no coin to reserve'
+							)
+						);
+					}
 					const previousRelease = attempt.record.freezeReleased;
 					if (
 						!this.deps.payments.update(attempt.record.requestId, {
@@ -1171,17 +1259,9 @@ export class DirectFundingSender {
 							)
 						);
 					}
-					this.freezeHolds.set(
-						freezeOwner,
-						`${attempt.coin.txidHex}:${attempt.coin.vout}`
-					);
+					this.freezeHolds.set(freezeOwner, `${coin.txidHex}:${coin.vout}`);
 					freezing = Promise.resolve()
-						.then(() =>
-							this.deps.wallet.freezeUtxo(
-								attempt.coin.txidHex,
-								attempt.coin.vout
-							)
-						)
+						.then(() => this.deps.wallet.freezeUtxo(coin.txidHex, coin.vout))
 						.catch(() => false);
 					return freezing;
 				},
@@ -1483,6 +1563,22 @@ export class DirectFundingSender {
 				ctl.commit(held.witness.map((item) => Buffer.from(item, 'hex')));
 				return;
 			}
+			// A recovery attempt has no coin and no signer to build a fresh witness
+			// with, and recovery must never sign a second time. With no stored
+			// witness left to re-emit, the receipt cannot be recovered by
+			// re-sending, so this becomes a caveat rather than a signing attempt.
+			if (attempt.recoverReceipt) {
+				refuse(
+					'this device no longer holds the witness to re-send, so the receipt could not be recovered'
+				);
+				return;
+			}
+		}
+		const { coin, signer } = attempt;
+		if (!coin || !signer) {
+			// Only a recovery attempt lacks these, and it returned above.
+			refuse('a signing attempt is missing its coin or signer');
+			return;
 		}
 		let tx: bitcoin.Transaction;
 		try {
@@ -1515,9 +1611,9 @@ export class DirectFundingSender {
 			tx,
 			request.prevouts,
 			inputIndex,
-			attempt.coin.script,
+			coin.script,
 			attempt.offer.valueSat,
-			attempt.signer.kind === 'p2tr',
+			signer.kind === 'p2tr',
 			(txidHex) => this.deps.wallet.getTransaction(txidHex)
 		);
 		if (prevoutIssue) {
@@ -1549,7 +1645,7 @@ export class DirectFundingSender {
 		// waiting on.
 		let witness: Buffer[];
 		try {
-			witness = await attempt.signer.signInput(tx, inputIndex, {
+			witness = await signer.signInput(tx, inputIndex, {
 				scripts: request.prevouts.map((p: IDfPrevout) => p.script),
 				values: request.prevouts.map((p: IDfPrevout) => p.valueSat)
 			});

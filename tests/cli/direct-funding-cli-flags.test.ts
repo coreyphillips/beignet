@@ -130,6 +130,58 @@ describe('CLI direct funding with trailing local flags', function () {
 		expect(parsed.error?.code).to.equal('AMOUNT_REQUIRED');
 	});
 
+	it('sends a receipt recovery with no amount when only the flag follows the request', async () => {
+		// Issue #767 review: --recover-receipt is a boolean flag, so with the
+		// optional amount omitted it became pos[3], went out as amountSats: null,
+		// and the daemon refused INVALID_PARAMS before any recovery ran. The
+		// node is stubbed so the test reads exactly what the CLI sent.
+		const calls: Array<Record<string, unknown>> = [];
+		const original = daemon.node.sendDirectFunding;
+		daemon.node.sendDirectFunding = async (
+			opts: Record<string, unknown>
+		): Promise<Awaited<ReturnType<typeof original>>> => {
+			calls.push(opts);
+			return {
+				requestId: 'stub',
+				status: 'CONFIRMED',
+				attested: false,
+				receiptPreimageHex: 'ab'.repeat(32)
+			} as unknown as Awaited<ReturnType<typeof original>>;
+		};
+		try {
+			const parsed = await runCli(home, [
+				'direct-funding',
+				'send',
+				request,
+				'--recover-receipt'
+			]);
+			expect(parsed.ok).to.equal(true);
+			expect(calls).to.have.length(1);
+			expect(calls[0].recoverReceipt).to.equal(true);
+			expect(calls[0]).to.not.have.property('amountSats');
+			expect(calls[0].request).to.equal(request);
+
+			// With the amount present the flag still reaches the daemon and the
+			// amount is the number, not the flag.
+			const withAmount = await runCli(home, [
+				'direct-funding',
+				'send',
+				request,
+				'50000',
+				'--recover-receipt',
+				'--max-total-fee',
+				'1000'
+			]);
+			expect(withAmount.ok).to.equal(true);
+			expect(calls).to.have.length(2);
+			expect(calls[1].recoverReceipt).to.equal(true);
+			expect(calls[1].amountSats).to.equal(50000);
+			expect(calls[1].maxTotalFeeSat).to.equal(1000);
+		} finally {
+			daemon.node.sendDirectFunding = original;
+		}
+	});
+
 	it('still forwards an amount that precedes the fee ceiling', async () => {
 		const parsed = await runCli(home, [
 			'direct-funding',

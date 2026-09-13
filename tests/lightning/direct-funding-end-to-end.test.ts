@@ -32,7 +32,10 @@ import {
 import { IDfOffer } from '../../src/lightning/direct-funding/messages';
 import { DirectFundingReceiver } from '../../src/lightning/direct-funding/receiver/engine';
 import { DirectFundingSender } from '../../src/lightning/direct-funding/sender/engine';
-import { DirectFundingPaymentStore } from '../../src/lightning/direct-funding/sender/records';
+import {
+	DF_PAYMENTS_STORAGE_KEY,
+	DirectFundingPaymentStore
+} from '../../src/lightning/direct-funding/sender/records';
 import { DfTransportRegistry } from '../../src/lightning/direct-funding/transport/registry';
 import { DfDirectPeerLaneFactory } from '../../src/lightning/direct-funding/transport/direct-peer';
 import { Network } from '../../src/lightning/invoice/types';
@@ -83,6 +86,8 @@ interface IEndToEnd {
 	coin: ITestCoin;
 	wallet: FakeSenderWallet;
 	payments: DirectFundingPaymentStore;
+	/** The payer's durable store, so a test can model a receipt lost on its side. */
+	senderStorage: ReturnType<typeof memoryStorage>;
 	payerId: string;
 	fundingScript: Buffer;
 	/** The offer the payer will make, rebuilt from what it was given. */
@@ -166,7 +171,8 @@ async function setup(
 		load: () => payerFactory
 	});
 	const wallet = new FakeSenderWallet([coin]);
-	const payments = new DirectFundingPaymentStore({ storage: memoryStorage() });
+	const senderStorage = memoryStorage();
+	const payments = new DirectFundingPaymentStore({ storage: senderStorage });
 	const sender = new DirectFundingSender(
 		{
 			wallet,
@@ -187,6 +193,7 @@ async function setup(
 		coin,
 		wallet,
 		payments,
+		senderStorage,
 		payerId: payerPeer.id,
 		fundingScript: createFundingScript(pubkeys.local, pubkeys.remote)
 			.p2wshOutput,
@@ -485,6 +492,68 @@ describe('Direct funding end to end: payer against receiver', () => {
 			expect(e2e.node.opens).to.have.length(1);
 			expect(e2e.node.witnesses).to.have.length(1);
 			expect(retry.status).to.equal('SIGNED_PENDING');
+		} finally {
+			e2e.stop();
+		}
+	});
+
+	// Issue #767: a payer that lost the receipt after the witness left asks the
+	// receiver, still holding its session, to replay it. No second channel, no
+	// second witness, and the payer recovers its proof of delivery.
+	it('recovers a receipt the payer lost, from the real receiver, with no second open', async () => {
+		const e2e = await setup();
+		try {
+			const send = e2e.sender.send(e2e.request, {
+				amountSat: AMOUNT,
+				maxTotalFeeSat: FEE_CEILING
+			});
+			await flush(8);
+			e2e.node.completeNegotiation(e2e.coin, e2e.expectedOffer(), {
+				fundingScript: e2e.fundingScript
+			});
+			const first = await send;
+			expect(first.receiptPreimageHex).to.equal(e2e.record.preimageHex);
+
+			// The payer loses the receipt (a crash before it was recorded), while
+			// the witness had provably left: drop it from the payer's store and
+			// reload, leaving the receiver's own session untouched.
+			const requestIdHex = Buffer.from(e2e.record.requestId, 'hex').toString(
+				'hex'
+			);
+			const rows = JSON.parse(
+				e2e.senderStorage.loadWalletData(DF_PAYMENTS_STORAGE_KEY)!
+			);
+			expect(rows[0].witnessSent).to.equal(true);
+			delete rows[0].receiptPreimage;
+			delete rows[0].broadcastTx;
+			e2e.senderStorage.saveWalletData(
+				DF_PAYMENTS_STORAGE_KEY,
+				JSON.stringify(rows)
+			);
+			e2e.payments.restore();
+			expect(
+				e2e.payments.get(requestIdHex)!.receiptPreimage,
+				'the receipt is gone from the payer'
+			).to.equal(undefined);
+
+			const recovered = await e2e.sender.send(e2e.request, {
+				amountSat: AMOUNT,
+				maxTotalFeeSat: FEE_CEILING,
+				recoverReceipt: true
+			});
+			await flush(4);
+			// The receiver replayed its recorded receipt; it never opened a second
+			// channel, and no new witness was signed.
+			expect(e2e.node.opens, 'no second open').to.have.length(1);
+			expect(recovered.status).to.equal('SIGNED_PENDING');
+			expect(recovered.receiptPreimageHex, 'the receipt came back').to.equal(
+				e2e.record.preimageHex
+			);
+			expect(
+				e2e.payments.get(requestIdHex)!.receiptPreimage,
+				'and was persisted again'
+			).to.equal(e2e.record.preimageHex);
+			expect(recovered.caveat).to.equal(undefined);
 		} finally {
 			e2e.stop();
 		}

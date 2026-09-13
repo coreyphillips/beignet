@@ -1846,19 +1846,27 @@ async function bootDaemon(
 		// does, both of them ahead of the exchange: a draining node refuses it,
 		// and its amount plus fee ceiling counts against the daily spend limit.
 		'POST /direct-funding/send': async (body) => {
-			const { request, amountSats, maxTotalFeeSat, feeHeadroomSats } = body as {
+			const {
+				request,
+				amountSats,
+				maxTotalFeeSat,
+				feeHeadroomSats,
+				recoverReceipt
+			} = body as {
 				request?: string;
 				amountSats?: number;
 				maxTotalFeeSat?: number;
 				/** Documented alias for maxTotalFeeSat: what the app posts today. */
 				feeHeadroomSats?: number;
+				recoverReceipt?: boolean;
 			};
 			return success(
 				await node.sendDirectFunding({
 					...(request !== undefined ? { request } : {}),
 					...(amountSats !== undefined ? { amountSats } : {}),
 					...(maxTotalFeeSat !== undefined ? { maxTotalFeeSat } : {}),
-					...(feeHeadroomSats !== undefined ? { feeHeadroomSats } : {})
+					...(feeHeadroomSats !== undefined ? { feeHeadroomSats } : {}),
+					...(recoverReceipt !== undefined ? { recoverReceipt } : {})
 				})
 			);
 		},
