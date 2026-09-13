@@ -228,6 +228,84 @@ function makeExternalHash(): { preimage: Buffer; hash: Buffer } {
 	return { preimage, hash };
 }
 
+/**
+ * Loopback wire with a disconnect switch. A reconnect delivers both
+ * channel_reestablish messages before any response, as a real socket does.
+ */
+function connectWithCut(
+	alice: LightningNode,
+	bob: LightningNode
+): { disconnect: () => void; reconnect: () => void } {
+	let cut = false;
+	let hold = false;
+	const queue: Array<() => void> = [];
+	const route = (from: LightningNode, to: LightningNode): void => {
+		from.on('message:outbound', (pk: string, type: number, payload: Buffer) => {
+			if (cut || pk !== to.getNodeId()) return;
+			const deliver = (): void =>
+				to.handlePeerMessage(from.getNodeId(), type, payload);
+			if (hold) queue.push(deliver);
+			else deliver();
+		});
+	};
+	route(alice, bob);
+	route(bob, alice);
+	return {
+		disconnect: (): void => {
+			cut = true;
+			alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+			bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		},
+		reconnect: (): void => {
+			cut = false;
+			hold = true;
+			alice.getChannelManager().handlePeerReconnected(bob.getNodeId());
+			bob.getChannelManager().handlePeerReconnected(alice.getNodeId());
+			while (queue.length > 0) queue.shift()!();
+			hold = false;
+		}
+	};
+}
+
+/** Park two equal MPP parts for one hold invoice, one per channel. */
+function parkTwoParts(
+	alice: LightningNode,
+	bob: LightningNode,
+	channelIds: [Buffer, Buffer],
+	hash: Buffer,
+	totalMsat: bigint
+): void {
+	const invoice = bob.createInvoice({
+		amountMsat: totalMsat,
+		description: 'hold-mpp-partial',
+		hold: true,
+		paymentHash: hash
+	});
+	channelIds.forEach((_channelId, i) => {
+		const scid = encodeShortChannelId({
+			block: 500,
+			txIndex: i + 1,
+			outputIndex: 0
+		});
+		alice.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+						shortChannelId: scid,
+						amountToForwardMsat: totalMsat / 2n,
+						outgoingCltvValue: 40
+					}
+				]
+			},
+			hash,
+			40,
+			invoice.paymentSecret,
+			totalMsat
+		);
+	});
+}
+
 /** cltv_expiry of the (single) received HTLC parked on the receiver. */
 function parkedCltvExpiry(bob: LightningNode, channelId: Buffer): number {
 	const state = bob.getChannelManager().getChannel(channelId)!.getFullState();
@@ -1120,6 +1198,95 @@ describe('Hold Invoices (M4 batch 1)', function () {
 			expect(bob.listHeldHtlcs()).to.have.length(1);
 			expect(bob.listHoldInvoices()[0].state).to.equal('ACCEPTED');
 			expect(alice.getPayment(hash)?.status).to.equal(PaymentStatus.PENDING);
+		});
+
+		// A disconnect during the first part's dispatch refuses the second part
+		// only. The refused part must stay parked under the chosen outcome, and
+		// the terminal event waits until a retry lands it (issue #810).
+		for (const outcome of ['settle', 'cancel'] as const) {
+			it(`finishes a partially refused MPP ${outcome} after reconnect`, function () {
+				const alice = createNode(outcome === 'settle' ? 43 : 45);
+				const bob = createNode(outcome === 'settle' ? 44 : 46);
+				const link = connectWithCut(alice, bob);
+				const ch1 = openReadyChannel(alice, bob, 100_000n);
+				const ch2 = openReadyChannel(alice, bob, 100_000n);
+				buildGraph(alice, bob, [ch1, ch2], 100_000_000n);
+				const { hash, preimage } = makeExternalHash();
+				const totalMsat = 90_000_000n;
+				parkTwoParts(alice, bob, [ch1, ch2], hash, totalMsat);
+				expect(bob.listHeldHtlcs()[0].htlcCount).to.equal(2);
+				const events = holdEvents(bob);
+
+				bob.once('message:outbound', () => link.disconnect());
+				const first =
+					outcome === 'settle'
+						? bob.settleHeldHtlc(hash, preimage)
+						: bob.cancelHoldInvoice(hash);
+
+				expect(first, 'a partial resolution is not reported done').to.equal(
+					outcome === 'settle' ? false : null
+				);
+				expect(events).to.have.length(0);
+				expect(bob.listHeldHtlcs()[0].htlcCount).to.equal(1);
+				expect(bob.listHoldInvoices()[0].state).to.equal('ACCEPTED');
+				// The other outcome is refused for the remainder.
+				if (outcome === 'settle') {
+					expect(bob.cancelHoldInvoice(hash)).to.equal(null);
+				} else {
+					expect(bob.settleHeldHtlc(hash, preimage)).to.equal(false);
+				}
+				expect(bob.listHeldHtlcs()[0].htlcCount).to.equal(1);
+
+				link.reconnect();
+
+				expect(events.map(([name]) => name)).to.deep.equal([
+					outcome === 'settle' ? 'hold:settled' : 'hold:cancelled'
+				]);
+				const event = events[0][1];
+				expect(event.heldAmountMsat).to.equal(totalMsat);
+				if (outcome === 'settle') {
+					expect((event as IHoldInvoiceStateEvent).htlcCount).to.equal(2);
+				} else {
+					expect((event as IHoldCancelledEvent).htlcsFailed).to.equal(2);
+				}
+				expect(bob.listHeldHtlcs()).to.have.length(0);
+				expect(bob.listHoldInvoices()[0].state).to.equal(
+					outcome === 'settle' ? 'SETTLED' : 'CANCELLED'
+				);
+				expect(bob.getPayment(hash)!.status).to.equal(
+					outcome === 'settle' ? PaymentStatus.COMPLETED : PaymentStatus.FAILED
+				);
+				for (const ch of [ch1, ch2]) {
+					const st = bob.getChannelManager().getChannel(ch)!.getFullState();
+					for (const [key, htlc] of st.htlcs) {
+						if (key.startsWith('received-')) {
+							expect(htlc.state).to.not.equal('COMMITTED');
+						}
+					}
+				}
+			});
+		}
+
+		it('keeps a partially refused cancel bound to its outcome across a reload', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createNode(47);
+			const bob = createNode(48, storage);
+			const link = connectWithCut(alice, bob);
+			const ch1 = openReadyChannel(alice, bob, 100_000n);
+			const ch2 = openReadyChannel(alice, bob, 100_000n);
+			buildGraph(alice, bob, [ch1, ch2], 100_000_000n);
+			const { hash, preimage } = makeExternalHash();
+			parkTwoParts(alice, bob, [ch1, ch2], hash, 90_000_000n);
+
+			bob.once('message:outbound', () => link.disconnect());
+			expect(bob.cancelHoldInvoice(hash)).to.equal(null);
+
+			const bob2 = createNode(48, storage);
+			expect(bob2.listHeldHtlcs()[0].htlcCount).to.equal(1);
+			expect(bob2.listHoldInvoices()[0].state).to.equal('ACCEPTED');
+			expect(bob2.settleHeldHtlc(hash, preimage)).to.equal(false);
+			storage.close();
 		});
 	});
 });
