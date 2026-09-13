@@ -8198,9 +8198,32 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
+	 * The error for a settle or cancel the engine did not complete. The engine
+	 * answers the same way for a hash with nothing parked and for a set whose
+	 * parts a channel refused, so only what is still parked tells them apart.
+	 * NOT_FOUND on a live set would invite the caller to try the other action
+	 * or give up on a payment that may already be settling.
+	 */
+	private holdResolutionRefusal(
+		paymentHash: Buffer,
+		action: 'settle' | 'cancel',
+		notFound: string
+	): BeignetError {
+		const parked = this.node
+			.listHeldHtlcs()
+			.find((h) => h.paymentHash.equals(paymentHash));
+		if (!parked) return new BeignetError(BeignetErrorCode.NOT_FOUND, notFound);
+		return new BeignetError(
+			BeignetErrorCode.HOLD_RESOLUTION_PENDING,
+			`${parked.htlcCount} parked HTLC(s) remain for this payment hash: a channel refused the ${action} for them, or a settle or cancel is already under way`
+		);
+	}
+
+	/**
 	 * Settle a hold invoice with its preimage. Validates sha256(preimage)
 	 * against the parked HTLCs' payment hash and fulfills all of them (every
-	 * MPP part). Throws when nothing is parked for the hash.
+	 * MPP part). Throws NOT_FOUND when nothing is parked for the hash, and
+	 * HOLD_RESOLUTION_PENDING when parts stay parked after the call.
 	 */
 	settleHoldInvoice(preimage: string): { paymentHash: string } {
 		if (!/^[0-9a-fA-F]{64}$/.test(preimage)) {
@@ -8216,8 +8239,9 @@ export class BeignetNode extends EventEmitter {
 			.digest();
 		const settled = this.node.settleHeldHtlc(paymentHash, preimageBuf);
 		if (!settled) {
-			throw new BeignetError(
-				BeignetErrorCode.NOT_FOUND,
+			throw this.holdResolutionRefusal(
+				paymentHash,
+				'settle',
 				'No parked HTLCs for this preimage (invoice unknown, not yet paid, or already resolved)'
 			);
 		}
@@ -8227,7 +8251,8 @@ export class BeignetNode extends EventEmitter {
 	/**
 	 * Cancel a hold invoice: fails any parked HTLC back to the payer with
 	 * incorrect_or_unknown_payment_details and closes the invoice to future
-	 * HTLCs. Throws when the hash is not a known open hold invoice.
+	 * HTLCs. Throws NOT_FOUND when the hash is not a known open hold invoice,
+	 * and HOLD_RESOLUTION_PENDING when parts stay parked after the call.
 	 */
 	cancelHoldInvoice(paymentHash: string): {
 		paymentHash: string;
@@ -8239,10 +8264,12 @@ export class BeignetNode extends EventEmitter {
 				'paymentHash must be 32 bytes hex (64 hex chars)'
 			);
 		}
-		const result = this.node.cancelHoldInvoice(Buffer.from(paymentHash, 'hex'));
+		const hash = Buffer.from(paymentHash, 'hex');
+		const result = this.node.cancelHoldInvoice(hash);
 		if (!result) {
-			throw new BeignetError(
-				BeignetErrorCode.NOT_FOUND,
+			throw this.holdResolutionRefusal(
+				hash,
+				'cancel',
 				'No open hold invoice for this payment hash'
 			);
 		}
