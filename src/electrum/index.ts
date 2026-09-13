@@ -389,15 +389,20 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 				// wallet that has shut down.
 				if (subs.get(instance) !== pending) return;
 			}
-			const owed = pending.pendingRefresh;
-			if (owed && --owed.deliveries === 0) {
-				delete pending.pendingRefresh;
-			} else if (owed) {
-				// This refresh reads the server as of the newest status, so only
-				// a status that arrives after it is still unheard.
-				owed.heard = created.statuses.get(data[0]) ?? null;
-			}
-			void instance.wallet.refreshWallet({});
+			// Spent when the refresh body starts rather than here: a wallet
+			// already refreshing only queues this call, and the refresh in flight
+			// may have scanned before this status arrived.
+			const started = (): void => {
+				const owed = pending.pendingRefresh;
+				if (owed && --owed.deliveries === 0) {
+					delete pending.pendingRefresh;
+				} else if (owed) {
+					// This refresh reads the server as of the newest status, so
+					// only a status that arrives after it is still unheard.
+					owed.heard = created.statuses.get(data[0]) ?? null;
+				}
+			};
+			void instance.wallet.refreshWallet({ onStart: started });
 		};
 		const created: TScriptHashRouter = {
 			instances: new Set(),

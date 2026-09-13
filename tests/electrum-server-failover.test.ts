@@ -482,7 +482,11 @@ const createFakeWallet = (
 	return {
 		sendMessage: messageSpy,
 		isSwitchingNetworks: false,
-		refreshWallet: refreshSpy,
+		// An idle wallet starts the refresh body inside the call.
+		refreshWallet: (options?: { onStart?: () => void }): unknown => {
+			options?.onStart?.();
+			return refreshSpy(options);
+		},
 		// The connection poll logs on both branches; without this a test that
 		// takes the reconnect branch fails on the logger, not on the behaviour.
 		logger: {

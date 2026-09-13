@@ -29,6 +29,7 @@ import {
 	EAvailableNetworks,
 	Electrum,
 	EProtocol,
+	err,
 	EScanningStrategy,
 	IGetUtxosResponse,
 	ok,
@@ -71,7 +72,11 @@ const createFakeWallet = (refreshSpy: sinon.SinonStub): Wallet => {
 	return {
 		sendMessage: (): void => {},
 		isSwitchingNetworks: false,
-		refreshWallet: refreshSpy,
+		// An idle wallet starts the refresh body inside the call.
+		refreshWallet: (options?: { onStart?: () => void }): unknown => {
+			options?.onStart?.();
+			return refreshSpy(options);
+		},
 		addressTypesToMonitor: [],
 		data: { utxos: [] }
 	} as unknown as Wallet;
@@ -583,9 +588,12 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 
 	let wallet: Wallet;
 	let getUtxosStub: sinon.SinonStub;
+	let updateAddressIndexesStub: sinon.SinonStub;
 	/** One gate per getUtxos call, so each refresh body can be held and counted. */
 	let gates: Array<() => void>;
 	let headerHandler: ((data: unknown[]) => Promise<void>) | null;
+	/** The status a fresh subscription answers with, per script hash. */
+	let subscribeStatuses: Map<string, string>;
 
 	const waitFor = async (
 		predicate: () => boolean,
@@ -604,6 +612,7 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 		globalHandler = null;
 		subscribedHashes = [];
 		headerHandler = null;
+		subscribeStatuses = new Map();
 		sinon.stub(electrumHelpers, 'subscribeAddress').callsFake(
 			async ({
 				scriptHash = '',
@@ -617,7 +626,14 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 					return { error: false, data: 'Already Subscribed.' };
 				}
 				subscribedHashes.push(scriptHash);
-				return { error: false, data: { id: 1, jsonrpc: '2.0', result: null } };
+				return {
+					error: false,
+					data: subscribeStatuses.get(scriptHash) ?? {
+						id: 1,
+						jsonrpc: '2.0',
+						result: null
+					}
+				};
 			}
 		);
 		sinon
@@ -668,7 +684,9 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 			updateAddressIndexes: () => Promise<Result<string>>;
 		};
 		sinon.stub(internals, 'setZeroIndexAddresses').resolves(ok('stubbed'));
-		sinon.stub(internals, 'updateAddressIndexes').resolves(ok('stubbed'));
+		updateAddressIndexesStub = sinon
+			.stub(internals, 'updateAddressIndexes')
+			.resolves(ok('stubbed'));
 		sinon
 			.stub(wallet, 'updateTransactions')
 			.resolves(ok<string | undefined>(undefined));
@@ -727,5 +745,70 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 		]);
 		await expectOneScanAfter(running);
 		await dispatched;
+	});
+
+	/** Lets the wallet disconnect and reconnect against a stubbed client, and
+	 *  subscribes '8080' at status S0 while S1 is what a reconnect will read. */
+	const subscribeForReconnect = async (): Promise<void> => {
+		sinon
+			.stub(electrumHelpers, 'start')
+			.resolves({ error: false, data: { host: '127.0.0.1' } });
+		sinon.stub(electrumHelpers, 'getConnectedPeer').returns('');
+		// A stopped client forgets what it had subscribed.
+		sinon.stub(electrumHelpers, 'stop').callsFake(async () => {
+			subscribedHashes = [];
+			return { error: false, data: 'Disconnected...' };
+		});
+		// The steps of a refresh that reach Electrum fail on a stopped instance.
+		updateAddressIndexesStub.callsFake(async () =>
+			wallet.electrum.isDisconnected
+				? err('Electrum instance is disconnected.')
+				: ok('stubbed')
+		);
+		subscribeStatuses.set('8080', 'S0');
+		await wallet.electrum.subscribeToAddresses({ scriptHashes: ['8080'] });
+		subscribeStatuses.set('8080', 'S1');
+	};
+
+	const reconnect = async (): Promise<void> => {
+		expect((await wallet.electrum.connectToElectrum({})).isOk()).to.equal(true);
+		await wallet.electrum.subscribeToAddresses({ scriptHashes: ['8080'] });
+	};
+
+	it('scans after a reconnect when disconnect beat the queued refresh (issue #838)', async function () {
+		await subscribeForReconnect();
+		const { running } = await holdARefresh();
+
+		await fireNotification(['8080', 'S1']);
+		await wallet.electrum.disconnect();
+		gates[0]();
+		await running;
+		expect(getUtxosStub.callCount, 'the queued rerun failed to scan').to.equal(
+			1
+		);
+
+		await reconnect();
+		await waitFor(() => gates.length === 2, 'a scan after the reconnect');
+		gates[1]();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		expect(getUtxosStub.callCount).to.equal(2);
+	});
+
+	it('does not scan again after a reconnect when the queued refresh had started (issue #838)', async function () {
+		await subscribeForReconnect();
+		const { running } = await holdARefresh();
+
+		await fireNotification(['8080', 'S1']);
+		gates[0]();
+		await waitFor(() => gates.length === 2, 'the queued rerun to scan');
+		await wallet.electrum.disconnect();
+		gates[1]();
+		await running;
+
+		await reconnect();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		expect(getUtxosStub.callCount).to.equal(2);
 	});
 });
