@@ -901,6 +901,43 @@ describe('PeerManager: simultaneous cross-dial handling', function () {
 		}
 	});
 
+	it('two overlapping dials to the same address share one socket, so both sides keep the same connection', async function () {
+		this.timeout(20_000);
+		// A mobile wallet met this at every cold start: the node's start-up
+		// reconnect and the app's own connect dialled the primary within a
+		// second of each other. The remote keeps the newest inbound, this
+		// side kept the first of its dials to complete and quietly dropped
+		// the other, and each side then held a socket the other had torn
+		// down until the first ping failed thirty seconds later. A second
+		// dial to the same address now joins the one in flight.
+		const { lowKey, lowPub, highKey } = orderedKeyPair();
+		const pmA = new PeerManager({ localPrivateKey: highKey });
+		const pmB = new PeerManager({ localPrivateKey: lowKey });
+		try {
+			await pmB.listen(0);
+			const bPort = pmPort(pmB);
+			const bConnects: string[] = [];
+			const bDisconnects: string[] = [];
+			pmB.on('peer:connect', (pubkey: string) => bConnects.push(pubkey));
+			pmB.on('peer:disconnect', (pubkey: string) => bDisconnects.push(pubkey));
+			await Promise.all([
+				pmA.connectPeer(lowPub, '127.0.0.1', bPort),
+				pmA.connectPeer(lowPub, '127.0.0.1', bPort)
+			]);
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(pmA.listPeers().length).to.equal(1);
+			expect(
+				bConnects.length,
+				'B accepted one connection, not a newest-wins replacement'
+			).to.equal(1);
+			expect(bDisconnects, 'B tore nothing down').to.deep.equal([]);
+			expect(pmB.listPeers().length).to.equal(1);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+		}
+	});
+
 	it('rollbacks compose across three overlapping dials', async function () {
 		this.timeout(20_000);
 		// Regression for the #318 review finding: with known-good A0 and
