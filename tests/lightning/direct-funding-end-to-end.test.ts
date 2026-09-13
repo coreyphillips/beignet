@@ -89,6 +89,10 @@ interface IEndToEnd {
 	/** The payer's durable store, so a test can model a receipt lost on its side. */
 	senderStorage: ReturnType<typeof memoryStorage>;
 	payerId: string;
+	/** Dials made by the payer, which must never include its own id. */
+	payerDials(): number;
+	/** Bring the receiver's connection to the payer up, as a returning phone does. */
+	connectReceiver(): void;
 	fundingScript: Buffer;
 	/** The offer the payer will make, rebuilt from what it was given. */
 	expectedOffer(): IDfOffer;
@@ -103,12 +107,20 @@ async function setup(
 		unpairedSpliceDepth?: number;
 		allowZeroConf?: boolean;
 		amountSat?: bigint;
+		/**
+		 * The payer is the receiver's introduction node (a primary paying its
+		 * own lightning-first wallet), and the receiver is not connected when
+		 * the send starts. The request then carries only the onion descriptor
+		 * a minted request carries, naming the payer.
+		 */
+		payerIntroduces?: boolean;
+		offerTimeoutMs?: number;
 	} = {}
 ): Promise<IEndToEnd> {
 	const net = new FakeDfNetwork();
 	const payerPeer: FakeDfPeer = net.add('df-e2e-payer');
 	const receiverPeer: FakeDfPeer = net.add('df-e2e-receiver');
-	net.connect(payerPeer, receiverPeer);
+	if (!opts.payerIntroduces) net.connect(payerPeer, receiverPeer);
 
 	const node = new SigningDfNode(receiverStorage(), receiverPeer.privkey);
 	const record = node.mintRequest(
@@ -125,13 +137,29 @@ async function setup(
 				...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {}),
 				receiptHash: Buffer.from(record.receiptHash, 'hex'),
 				encryptionKey: requestEncryptionPublicKey(record),
-				transports: [
-					{
-						type: DfTransportType.DIRECT_PEER,
-						host: '127.0.0.1',
-						port: 9735
-					}
-				]
+				transports: opts.payerIntroduces
+					? [
+							{
+								type: DfTransportType.ONION_MESSAGE,
+								host: 'primary.example',
+								port: 9735,
+								introNodeId: payerPeer.pubkey,
+								pathKey: receiverPeer.pubkey,
+								hops: [
+									{
+										blindedNodeId: receiverPeer.pubkey,
+										encryptedData: Buffer.alloc(16, 1)
+									}
+								]
+							}
+					  ]
+					: [
+							{
+								type: DfTransportType.DIRECT_PEER,
+								host: '127.0.0.1',
+								port: 9735
+							}
+					  ]
 			},
 			(message) => node.signMessage(message)
 		)
@@ -163,7 +191,10 @@ async function setup(
 	});
 	await receiver.attach(receiverRegistry);
 
-	const payerRegistry = new DfTransportRegistry();
+	const payerRegistry = new DfTransportRegistry(undefined, {
+		isPeerConnected: (hex) => payerPeer.isPeerConnected(hex),
+		nodeId: () => payerPeer.pubkey
+	});
 	const payerFactory = new DfDirectPeerLaneFactory(payerPeer);
 	payerRegistry.register({
 		type: DfTransportType.DIRECT_PEER,
@@ -180,7 +211,11 @@ async function setup(
 			payments,
 			chainHash: (): Buffer => chainHashForNetwork(Network.REGTEST)
 		},
-		{ offerResendDelaysMs: [], offerTimeoutMs: 4_000, receiptTimeoutMs: 500 }
+		{
+			offerResendDelaysMs: [],
+			offerTimeoutMs: opts.offerTimeoutMs ?? 4_000,
+			receiptTimeoutMs: 500
+		}
 	);
 
 	const pubkeys = node.fundingPubkeys()!;
@@ -195,6 +230,8 @@ async function setup(
 		payments,
 		senderStorage,
 		payerId: payerPeer.id,
+		payerDials: (): number => payerPeer.dialAttempts,
+		connectReceiver: (): void => net.connect(receiverPeer, payerPeer),
 		fundingScript: createFundingScript(pubkeys.local, pubkeys.remote)
 			.p2wshOutput,
 		expectedOffer: (): IDfOffer => ({
@@ -554,6 +591,62 @@ describe('Direct funding end to end: payer against receiver', () => {
 				'and was persisted again'
 			).to.equal(e2e.record.preimageHex);
 			expect(recovered.caveat).to.equal(undefined);
+		} finally {
+			e2e.stop();
+		}
+	});
+
+	// Issue #806: a primary paying its own lightning-first wallet, which is in
+	// the background (disconnected) when the send starts and comes back a
+	// moment later. The payer used to dial its own node id for the whole offer
+	// window and answer EXCHANGE_TIMEOUT.
+	it('the introduction node pays a receiver that connects after the send starts', async () => {
+		const e2e = await setup({ payerIntroduces: true });
+		try {
+			const send = e2e.sender.send(e2e.request, {
+				amountSat: AMOUNT,
+				maxTotalFeeSat: FEE_CEILING
+			});
+			await flush(8);
+			expect(
+				e2e.node.opens,
+				'nothing can reach an absent receiver'
+			).to.have.length(0);
+			e2e.connectReceiver();
+			await flush(8);
+			expect(e2e.node.opens, 'the held offer never arrived').to.have.length(1);
+			e2e.node.completeNegotiation(e2e.coin, e2e.expectedOffer(), {
+				fundingScript: e2e.fundingScript
+			});
+			const result = await send;
+			expect(result.status).to.equal('SIGNED_PENDING');
+			expect(result.attested).to.equal(true);
+			expect(e2e.payerDials(), 'the payer dialed').to.equal(0);
+		} finally {
+			e2e.stop();
+		}
+	});
+
+	it('the introduction node refuses pre-witness when the receiver never connects', async () => {
+		const e2e = await setup({ payerIntroduces: true, offerTimeoutMs: 60 });
+		try {
+			let error: unknown = null;
+			try {
+				await e2e.sender.send(e2e.request, {
+					amountSat: AMOUNT,
+					maxTotalFeeSat: FEE_CEILING
+				});
+			} catch (err) {
+				error = err;
+			}
+			expect((error as { code?: string })?.code).to.equal('UNREACHABLE');
+			expect((error as Error).message).to.contain(
+				'the receiver did not connect before the offer window closed'
+			);
+			expect(e2e.payerDials(), 'the payer dialed').to.equal(0);
+			expect(e2e.node.opens).to.have.length(0);
+			expect(e2e.wallet.frozen.size).to.equal(0);
+			expect(e2e.payments.list()[0].status).to.equal('ABORTED');
 		} finally {
 			e2e.stop();
 		}

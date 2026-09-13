@@ -591,6 +591,26 @@ describe('Direct-funding lane 2: onion messages', () => {
 		expect(lane).to.equal(null);
 	});
 
+	// Issue #806: a primary paying its own wallet is that wallet's introduction
+	// node. Dialing it meant dialing itself and counting an offer sent into its
+	// own socket as exchanged.
+	it('never dials when the introduction node is this node', async () => {
+		const store = new DirectFundingRequestStore({});
+		const record = store.mint();
+		const path = mintDfBlindedPath(
+			h.payer.pubkey,
+			h.receiver.pubkey,
+			Buffer.from(record.onionPathSecretHex, 'hex')
+		);
+		const dials = h.payer.dialAttempts;
+		const lane = await payerFactory(h).open(descriptorFor(path), {
+			requestId: Buffer.from(record.requestId, 'hex'),
+			receiverNodeId: h.receiver.pubkey
+		});
+		expect(lane).to.equal(null);
+		expect(h.payer.dialAttempts).to.equal(dials);
+	});
+
 	it('falls through on a descriptor carrying no blinded hops', async () => {
 		const lane = await payerFactory(h).open(
 			{

@@ -39,8 +39,14 @@ export const DF_DEFAULT_MAX_TOTAL_FEE_SAT = 1_000n;
  * When a lost offer is re-sent. Offers are idempotent at the receiver (4C
  * replays the recorded responses verbatim), so at-least-once delivery of the
  * offer is what makes a fire-and-forget lane usable.
+ *
+ * The schedule runs to the end of the offer window rather than stopping at
+ * 30 s: a receiver that comes back later than that (a phone wallet returning
+ * from the background) still gets an offer it can answer in time (#806).
  */
-export const DF_OFFER_RESEND_DELAYS_MS = [4_000, 12_000, 30_000];
+export const DF_OFFER_RESEND_DELAYS_MS = [
+	4_000, 12_000, 30_000, 60_000, 90_000
+];
 
 /** Time from the first offer to a verified sign request. */
 export const DF_OFFER_TIMEOUT_MS = 120_000;

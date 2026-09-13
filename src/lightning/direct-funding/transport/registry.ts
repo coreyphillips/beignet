@@ -129,20 +129,21 @@ export class DfTransportRegistry {
 		// should read that reason, not a bare "every transport failed".
 		const refusals: string[] = [];
 		const self = this.peerView.nodeId?.();
+		const awaiting = new Set<DfTransportDescriptor>();
 		for (const descriptor of this.withExistingConnection(
-			withSynthesizedRelay(transports),
+			withAwaitedReceiver(withSynthesizedRelay(transports), self, awaiting),
 			ctx
 		)) {
-			// A relay descriptor naming the payer's own node is the ordinary case
-			// for a home node paying its own lightning-first wallets (it IS their
-			// relay). Dialing it meant two minutes of the node resetting its own
-			// connection before EXCHANGE_TIMEOUT; there is nothing to relay through.
-			if (
-				descriptor.type === DfTransportType.LSP_RELAY &&
-				self &&
-				(descriptor as IDfRelayTransport).relayNodeId.equals(self)
-			) {
-				this.skip(descriptor.type, DfLaneSkipReason.SELF_RELAY);
+			// A relay or onion descriptor naming the payer's own node is the
+			// ordinary case for a home node paying its own lightning-first wallets
+			// (it IS their liquidity peer). Dialing it meant two minutes of the
+			// node resetting its own connection before EXCHANGE_TIMEOUT. The
+			// receiver's way in is its own connection to this node, and
+			// withAwaitedReceiver has already put a direct lane that waits for
+			// that connection ahead of these.
+			const selfReason = self ? namesSelf(descriptor, self) : null;
+			if (selfReason) {
+				this.skip(descriptor.type, selfReason);
 				continue;
 			}
 			const registration = this.lanes.get(descriptor.type);
@@ -159,7 +160,12 @@ export class DfTransportRegistry {
 
 			let lane: IDfTransport | null = null;
 			try {
-				lane = await factory.open(descriptor, ctx);
+				lane = await factory.open(
+					descriptor,
+					awaiting.has(descriptor)
+						? { ...ctx, awaitReceiverConnection: true }
+						: ctx
+				);
 			} catch (err) {
 				// A throw out of open() and a null return mean the same thing:
 				// nothing reached the wire, so trying the next descriptor cannot
@@ -270,6 +276,60 @@ function errorText(err: unknown): string {
 /** The enum's name for a transport type, or its number for one it lacks. */
 function laneName(type: number): string {
 	return DfTransportType[type] ?? String(type);
+}
+
+/**
+ * The skip reason for a descriptor that routes through this node itself, or
+ * null for one that does not.
+ */
+function namesSelf(
+	descriptor: DfTransportDescriptor,
+	self: Buffer
+): DfLaneSkipReason | null {
+	if (
+		descriptor.type === DfTransportType.LSP_RELAY &&
+		(descriptor as IDfRelayTransport).relayNodeId.equals(self)
+	) {
+		return DfLaneSkipReason.SELF_RELAY;
+	}
+	if (
+		descriptor.type === DfTransportType.ONION_MESSAGE &&
+		(descriptor as IDfOnionTransport).introNodeId.equals(self)
+	) {
+		return DfLaneSkipReason.SELF_INTRODUCTION;
+	}
+	return null;
+}
+
+/**
+ * The descriptors with a direct lane that WAITS for the receiver placed just
+ * ahead of the first one naming this node as its introduction node or relay.
+ *
+ * Such a receiver reaches the world through this node, so the connection
+ * between them is the only carrier there is, and when the payer starts the
+ * receiver may simply not be connected yet: a phone wallet drops its
+ * connection in the background, which is exactly where it sits while its
+ * owner pays it from another app. The waiting lane holds the offer inside the
+ * offer window and sends it the moment the receiver connects; if the receiver
+ * never does, no frame was exchanged and the refusal is still pre-witness.
+ * The placeholders are recorded in `awaiting`, which is how `run` tells this
+ * lane from the existing-connection one, which dials or falls through.
+ */
+function withAwaitedReceiver(
+	ordered: DfTransportDescriptor[],
+	self: Buffer | undefined,
+	awaiting: Set<DfTransportDescriptor>
+): DfTransportDescriptor[] {
+	if (!self) return ordered;
+	const at = ordered.findIndex((t) => namesSelf(t, self) !== null);
+	if (at < 0) return ordered;
+	const placeholder: DfTransportDescriptor = {
+		type: DfTransportType.DIRECT_PEER,
+		host: '',
+		port: 0
+	};
+	awaiting.add(placeholder);
+	return [...ordered.slice(0, at), placeholder, ...ordered.slice(at)];
 }
 
 /**

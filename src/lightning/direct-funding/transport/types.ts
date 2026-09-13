@@ -128,7 +128,14 @@ export enum DfLaneSkipReason {
 	/** The exchange failed before either side had put a frame on the lane. */
 	NO_FRAME_EXCHANGED = 'no_frame_exchanged',
 	/** The relay descriptor names this node: a payer cannot relay through itself. */
-	SELF_RELAY = 'relay_is_self'
+	SELF_RELAY = 'relay_is_self',
+	/**
+	 * The onion descriptor's introduction node is this node: the payer is
+	 * already the receiver's last hop, so the path adds nothing to the
+	 * connection between them, and dialing the introduction node would mean
+	 * dialing itself.
+	 */
+	SELF_INTRODUCTION = 'introduction_node_is_self'
 }
 
 /** Structured-log sink. 4D maps this onto the node's `emitStructuredLog`. */
@@ -254,6 +261,12 @@ export interface IDfPeerMessaging {
 	onCustomMessage(cb: (msg: IDfCustomMessage) => void): () => void;
 	isPeerConnected(peerPubkeyHex: string): boolean;
 	connectPeer(peerPubkeyHex: string, host: string, port: number): Promise<void>;
+	/**
+	 * Subscribe to peers connecting; the return value unsubscribes. Optional:
+	 * without it a lane waiting for its receiver learns of the connection only
+	 * when the payer next re-sends its offer.
+	 */
+	onPeerConnect?(cb: (peerPubkeyHex: string) => void): () => void;
 }
 
 // ─────────────── The registry seam ───────────────
@@ -264,6 +277,13 @@ export interface IDfOpenContext {
 	requestId: Buffer;
 	/** The receiver named by the envelope. */
 	receiverNodeId: Buffer;
+	/**
+	 * Set by the registry on the direct lane it puts in place of a descriptor
+	 * naming this node as the receiver's introduction node or relay. This node
+	 * is then the receiver's own way in, so the lane does not dial (there is
+	 * no address to dial): it holds the offer until the receiver connects.
+	 */
+	awaitReceiverConnection?: boolean;
 }
 
 /**

@@ -174,6 +174,91 @@ describe('Direct-funding lane 1: direct peer', () => {
 		expect(payer.dialAttempts).to.equal(1);
 	});
 
+	// Issue #806: this node is the receiver's introduction node, and the
+	// receiver (a phone wallet in the background) is not connected yet.
+	describe('awaiting a receiver this node introduces', () => {
+		const awaitCtx = (): {
+			requestId: Buffer;
+			receiverNodeId: Buffer;
+			awaitReceiverConnection: true;
+		} => ({
+			requestId: Buffer.alloc(16, 1),
+			receiverNodeId: Buffer.from(receiver.id, 'hex'),
+			awaitReceiverConnection: true
+		});
+		const placeholder = {
+			type: DfTransportType.DIRECT_PEER as const,
+			host: '',
+			port: 0
+		};
+
+		it('opens without dialing, holds the offer uncounted, and sends it when the receiver connects', async () => {
+			const inbound: IDfInboundFrame[] = [];
+			new DfDirectPeerLaneFactory(receiver).attachInbound((f) =>
+				inbound.push(f)
+			);
+			const factory = new DfDirectPeerLaneFactory(payer);
+			const lane = await factory.open(placeholder, awaitCtx());
+			expect(lane).to.not.equal(null);
+			expect(payer.dialAttempts).to.equal(0);
+
+			const offer = openingFrame(Buffer.alloc(16, 1));
+			lane!.send(OFFER, offer);
+			expect(lane!.framesExchanged()).to.equal(0);
+			expect(payer.sent).to.deep.equal([]);
+
+			net.connect(receiver, payer);
+			expect(payer.sent.map((m) => m.subtype)).to.deep.equal([OFFER]);
+			expect(inbound).to.have.length(1);
+			expect(inbound[0].payload.equals(offer)).to.equal(true);
+			expect(lane!.framesExchanged()).to.equal(1);
+			lane!.close();
+		});
+
+		it('never holds anything but a first offer: other frames still refuse', async () => {
+			const factory = new DfDirectPeerLaneFactory(payer);
+			const lane = await factory.open(placeholder, awaitCtx());
+			expect(() => lane!.send(RECEIPT, continuationFrame())).to.throw(
+				/Not connected/
+			);
+			expect(lane!.framesExchanged()).to.equal(0);
+			lane!.close();
+		});
+
+		it('delivers nothing after close', async () => {
+			const factory = new DfDirectPeerLaneFactory(payer);
+			const lane = await factory.open(placeholder, awaitCtx());
+			lane!.send(OFFER, openingFrame(Buffer.alloc(16, 1)));
+			lane!.close();
+			net.connect(receiver, payer);
+			expect(payer.sent).to.deep.equal([]);
+		});
+	});
+
+	it('re-sends an unanswered offer when the receiver reconnects, and stops once it answers', async () => {
+		const requestId = Buffer.alloc(16, 1);
+		const inbound: IDfInboundFrame[] = [];
+		new DfDirectPeerLaneFactory(receiver).attachInbound((f) => inbound.push(f));
+		net.connect(payer, receiver);
+		const factory = new DfDirectPeerLaneFactory(payer);
+		const lane = await factory.open(descriptor, {
+			requestId,
+			receiverNodeId: Buffer.from(receiver.id, 'hex')
+		});
+		lane!.send(OFFER, openingFrame(requestId));
+		expect(inbound).to.have.length(1);
+
+		net.disconnect(payer, receiver);
+		net.connect(payer, receiver);
+		expect(inbound).to.have.length(2);
+
+		inbound[1].reply.send(RECEIPT, continuationFrame());
+		net.disconnect(payer, receiver);
+		net.connect(payer, receiver);
+		expect(inbound).to.have.length(2);
+		lane!.close();
+	});
+
 	it('routes an offer for another request to the receiver sink, not the payer lane', async () => {
 		// Both roles at once on one connection: the discriminator is the request
 		// the opening frame names, not the peer.
