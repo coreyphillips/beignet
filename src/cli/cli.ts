@@ -67,9 +67,15 @@ const GLOBAL_VALUE_FLAGS = new Set(['--api-key', '--api-token']);
  * <id> <sats> <feerate> --api-key k` sent the literal string --api-key as the
  * address). A command that takes its own value flags passes them in
  * localValueFlags so they are stripped the same way, or the flag token
- * re-creates the identical bug one column over.
+ * re-creates the identical bug one column over. A boolean flag of the
+ * command's own (no value follows it) goes in localBooleanFlags for the same
+ * reason: `direct-funding send <request> --recover-receipt` with the optional
+ * amount omitted read the flag as the amount (issue #767 review).
  */
-function positionalArgs(localValueFlags?: ReadonlySet<string>): string[] {
+function positionalArgs(
+	localValueFlags?: ReadonlySet<string>,
+	localBooleanFlags?: ReadonlySet<string>
+): string[] {
 	const out: string[] = [];
 	for (let i = 0; i < filteredArgs.length; i++) {
 		if (
@@ -79,6 +85,7 @@ function positionalArgs(localValueFlags?: ReadonlySet<string>): string[] {
 			i++; // skip the flag's value too
 			continue;
 		}
+		if (localBooleanFlags?.has(filteredArgs[i])) continue;
 		out.push(filteredArgs[i]);
 	}
 	return out;
@@ -1900,7 +1907,10 @@ async function handleDirectFunding(): Promise<void> {
 			'--host',
 			'--port',
 			'--max-total-fee'
-		])
+		]),
+		// Boolean, so it is dropped rather than skipped with a value: left in,
+		// `send <request> --recover-receipt` made the flag the amount.
+		new Set(['--recover-receipt'])
 	);
 	switch (sub) {
 		case 'configure': {
