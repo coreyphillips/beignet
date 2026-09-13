@@ -3176,7 +3176,8 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				htlc.id,
 				htlc.amountMsat,
-				htlc.paymentHash
+				htlc.paymentHash,
+				true
 			);
 		}
 	}
@@ -16027,7 +16028,8 @@ export class LightningNode extends EventEmitter {
 		channelId: Buffer,
 		htlcId: bigint,
 		amountMsat: bigint,
-		paymentHash: Buffer
+		paymentHash: Buffer,
+		redispatched = false
 	): void {
 		this.emitStructuredLog('htlc', 'received', {
 			channelId: channelId.toString('hex'),
@@ -16282,7 +16284,8 @@ export class LightningNode extends EventEmitter {
 				paymentHash,
 				processed.hopPayload,
 				htlcEntry.cltvExpiry,
-				htlcEntry.blindingPoint
+				htlcEntry.blindingPoint,
+				redispatched
 			);
 		} else {
 			// Forward to next hop — pass incoming HTLC details for CLTV/fee enforcement.
@@ -17349,7 +17352,8 @@ export class LightningNode extends EventEmitter {
 		paymentHash: Buffer,
 		hopPayload?: IHopPayload,
 		incomingCltvExpiry?: number,
-		incomingBlindingPoint?: Buffer
+		incomingBlindingPoint?: Buffer,
+		redispatched = false
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const htlcSecretKey = `${channelId.toString('hex')}:${htlcId}`;
@@ -17371,6 +17375,33 @@ export class LightningNode extends EventEmitter {
 		if (safetyReason) {
 			this.cleanupHtlcSharedSecret(htlcSecretKey);
 			this.channelManager.failHtlc(channelId, htlcId, safetyReason);
+			return;
+		}
+
+		// A completed incoming payment takes no further HTLC for its hash:
+		// fulfilling one debits a second payer and fires the settlement events
+		// again. The restart redispatch is exempt. A fulfill deferred by
+		// quiescence reports success without reaching disk, so the HTLC that
+		// completed the payment can come back through it, and failing that one
+		// would refund a settled payment.
+		const completed = this.payments.get(hashHex);
+		if (
+			!redispatched &&
+			completed?.direction === PaymentDirection.INCOMING &&
+			completed.status === PaymentStatus.COMPLETED
+		) {
+			this.emitStructuredLog('htlc', 'payment_already_completed', {
+				paymentHash: hashHex
+			});
+			const reason = sharedSecret
+				? createFailureMessage(
+						sharedSecret,
+						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+						this.incorrectPaymentDetailsData(amountMsat)
+				  )
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
 			return;
 		}
 

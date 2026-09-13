@@ -10,7 +10,11 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig, IPaymentInfo } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	IPaymentInfo,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
@@ -271,6 +275,51 @@ describe('invoice:settled event (M4 batch 2b)', () => {
 		expect(bob.settleHeldHtlc(hash, preimage)).to.equal(true);
 		expect(settled).to.have.length(1);
 		expect(settled[0].paymentHash.equals(hash)).to.equal(true);
+	});
+
+	// Issue #811: a stale or leaked invoice must not debit a second payer.
+	function replaySettledInvoice(hold: boolean, seedId: number): void {
+		const { alice, bob } = setupPair(seedId, seedId + 1);
+		const preimage = crypto.randomBytes(32);
+		const hash = crypto.createHash('sha256').update(preimage).digest();
+		const invoice = bob.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'settled-replay',
+			...(hold ? { hold: true, paymentHash: hash } : {})
+		});
+		alice.sendPayment(invoice.bolt11);
+		if (hold) expect(bob.settleHeldHtlc(hash, preimage)).to.equal(true);
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+
+		const carol = createNode(seedId + 2);
+		connectNodes(carol, bob);
+		openReadyChannel(carol, bob);
+		buildDirectGraph(carol, bob, seedId + 2, seedId + 1);
+		let received = 0;
+		let settled = 0;
+		bob.on('payment:received', () => received++);
+		bob.on('invoice:settled', () => settled++);
+
+		carol.sendPayment(invoice.bolt11);
+
+		expect(carol.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(received, 'no second payment:received').to.equal(0);
+		expect(settled, 'no second invoice:settled').to.equal(0);
+		expect(bob.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+	}
+
+	it('refuses a second payer on a settled invoice and does not fire again', () => {
+		replaySettledInvoice(false, 20);
+	});
+
+	it('refuses a second payer on a settled hold invoice and does not fire again', () => {
+		replaySettledInvoice(true, 30);
 	});
 });
 
