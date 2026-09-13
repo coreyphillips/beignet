@@ -78,6 +78,10 @@ type TScriptHashSubscription = {
 	/** Address index of a UTXO tracked beyond the gap limit; that index is
 	 *  rescanned before the wallet refresh on notification. */
 	utxoIndex?: number;
+	/** The status this instance heard before disconnect() withdrew it, kept
+	 *  when a sibling held the hash meanwhile: the router's status may already
+	 *  reflect a change only the sibling was refreshed for. */
+	savedStatus?: string | null;
 };
 
 type TScriptHashRouter = {
@@ -317,26 +321,77 @@ function getHeaderRouter(network: EElectrumNetworks): THeaderRouter {
 function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 	let router = scriptHashRouters.get(network);
 	if (!router) {
+		/** Hands one notification to one instance registered for its hash. */
+		const deliver = async (
+			instance: Electrum,
+			subs: Map<Electrum, TScriptHashSubscription>,
+			data: TSubscribedReceive
+		): Promise<void> => {
+			// Re-read rather than taken from a snapshot, as the header dispatch
+			// does: the entry ahead of this one parks for as long as a single
+			// index scan takes, and an instance that withdrew in the meantime
+			// (disconnect() deletes it from exactly this map) must not be called
+			// back or refreshed by a notification it is merely still queued for.
+			const sub = subs.get(instance);
+			if (!sub) return;
+			// Snapshots: a callback may unregister itself or a sibling
+			// mid-dispatch.
+			for (const callback of [...sub.callbacks]) {
+				try {
+					callback(data);
+				} catch {
+					// One subscriber must not starve the rest or the refresh.
+				}
+			}
+			if (sub.utxoIndex !== undefined) {
+				await instance.getUtxos({
+					scanningStrategy: EScanningStrategy.singleIndex,
+					addressIndex: sub.utxoIndex,
+					changeAddressIndex: sub.utxoIndex
+				});
+				// Checked again: the withdrawal can land while this instance's
+				// own scan is in flight, and the refresh below would restart a
+				// wallet that has shut down.
+				if (!subs.has(instance)) return;
+			}
+			void instance.wallet.refreshWallet({});
+		};
 		const created: TScriptHashRouter = {
 			instances: new Set(),
 			subscriptions: new Map(),
 			statuses: new Map(),
 			noteSubscribed: (scriptHash, response): void => {
+				const data: unknown = response.data;
+				if (response.error) return;
+				// Withdrawn while the subscribe was in flight.
+				const subs = created.subscriptions.get(scriptHash);
+				if (!subs) return;
 				// "Already Subscribed." carries no status: the subscription was
 				// never lost, so neither was a notification. A hash with no history
 				// answers null, which the client hands back as the whole message.
-				const data: unknown = response.data;
-				if (response.error || data === 'Already Subscribed.') return;
-				// Withdrawn while the subscribe was in flight.
-				if (!created.subscriptions.has(scriptHash)) return;
-				const status = typeof data === 'string' ? data : null;
-				const known = created.statuses.has(scriptHash);
-				const previous = created.statuses.get(scriptHash);
-				created.statuses.set(scriptHash, status);
-				// A server only notifies a live subscription, so a change that
-				// landed while the socket was down is only ever seen here.
-				if (known && previous !== status) {
-					void created.dispatch([scriptHash, status as string]);
+				if (data !== 'Already Subscribed.') {
+					const status = typeof data === 'string' ? data : null;
+					const known = created.statuses.has(scriptHash);
+					const previous = created.statuses.get(scriptHash);
+					created.statuses.set(scriptHash, status);
+					// A server only notifies a live subscription, so a change that
+					// landed while the socket was down is only ever seen here.
+					if (known && previous !== status) {
+						void created.dispatch([scriptHash, status as string]);
+						return;
+					}
+				}
+				// A returning instance whose sibling kept the hash has no status
+				// of its own in the router to compare, so it is compared here.
+				if (!created.statuses.has(scriptHash)) return;
+				const current = created.statuses.get(scriptHash) ?? null;
+				for (const [instance, sub] of subs) {
+					if (sub.savedStatus === undefined) continue;
+					const saved = sub.savedStatus;
+					delete sub.savedStatus;
+					if (saved !== current) {
+						void deliver(instance, subs, [scriptHash, current as string]);
+					}
 				}
 			},
 			dispatch: async (data: TSubscribedReceive): Promise<void> => {
@@ -356,36 +411,13 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					}
 					return;
 				}
+				// Every instance registered now is refreshed below, so none is
+				// still owed a comparison of what it heard before withdrawing.
+				for (const sub of subs.values()) {
+					delete sub.savedStatus;
+				}
 				for (const instance of [...subs.keys()]) {
-					// Re-read rather than taken from the snapshot, as the header
-					// dispatch does: the entry ahead of this one parks for as
-					// long as a single index scan takes, and an instance that
-					// withdrew in the meantime (disconnect() deletes it from
-					// exactly this map) must not be called back or refreshed by
-					// a notification it is merely still queued for.
-					const sub = subs.get(instance);
-					if (!sub) continue;
-					// Snapshots: a callback may unregister itself or a sibling
-					// mid-dispatch.
-					for (const callback of [...sub.callbacks]) {
-						try {
-							callback(data);
-						} catch {
-							// One subscriber must not starve the rest or the refresh.
-						}
-					}
-					if (sub.utxoIndex !== undefined) {
-						await instance.getUtxos({
-							scanningStrategy: EScanningStrategy.singleIndex,
-							addressIndex: sub.utxoIndex,
-							changeAddressIndex: sub.utxoIndex
-						});
-						// Checked again: the withdrawal can land while this
-						// instance's own scan is in flight, and the refresh
-						// below would restart a wallet that has shut down.
-						if (!subs.has(instance)) continue;
-					}
-					void instance.wallet.refreshWallet({});
+					await deliver(instance, subs, data);
 				}
 			}
 		};
@@ -2197,15 +2229,16 @@ export class Electrum {
 		const router = getScriptHashRouter(this.electrumNetwork);
 		router.instances.add(this);
 		const withdrawn = this._withdrawnStatuses;
+		let savedStatus: string | null | undefined;
 		if (
 			withdrawn?.network === this.electrumNetwork &&
 			withdrawn.statuses.has(scriptHash)
 		) {
-			if (!router.statuses.has(scriptHash)) {
-				router.statuses.set(
-					scriptHash,
-					withdrawn.statuses.get(scriptHash) ?? null
-				);
+			const saved = withdrawn.statuses.get(scriptHash) ?? null;
+			if (router.statuses.has(scriptHash)) {
+				savedStatus = saved;
+			} else {
+				router.statuses.set(scriptHash, saved);
 			}
 			withdrawn.statuses.delete(scriptHash);
 		}
@@ -2218,6 +2251,9 @@ export class Electrum {
 		if (!sub) {
 			sub = { callbacks: new Set() };
 			subs.set(this, sub);
+		}
+		if (savedStatus !== undefined) {
+			sub.savedStatus = savedStatus;
 		}
 		return sub;
 	}
@@ -2573,9 +2609,15 @@ export class Electrum {
 			}
 			const { statuses } = this._withdrawnStatuses;
 			for (const [scriptHash, subs] of router.subscriptions) {
-				if (subs.has(this) && router.statuses.has(scriptHash)) {
-					statuses.set(scriptHash, router.statuses.get(scriptHash) ?? null);
-				}
+				const sub = subs.get(this);
+				if (!sub || !router.statuses.has(scriptHash)) continue;
+				// One still owed a comparison is what this wallet last heard.
+				statuses.set(
+					scriptHash,
+					sub.savedStatus !== undefined
+						? sub.savedStatus
+						: router.statuses.get(scriptHash) ?? null
+				);
 			}
 		}
 		this.withdrawFromRouters();
