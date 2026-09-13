@@ -1267,6 +1267,66 @@ describe('Hold Invoices (M4 batch 1)', function () {
 			});
 		}
 
+		// The generic expiring-HTLC scan runs before the retry on every block.
+		// It must not time out a part whose sibling was fulfilled, nor spend
+		// the shared secret a cancel retry still needs.
+		it('keeps the expiry scan to the recorded outcome of a partial resolution', function () {
+			for (const outcome of ['settle', 'cancel'] as const) {
+				const alice = createNode(outcome === 'settle' ? 49 : 51);
+				const bob = createNode(outcome === 'settle' ? 50 : 52);
+				const link = connectWithCut(alice, bob);
+				const ch1 = openReadyChannel(alice, bob, 100_000n);
+				const ch2 = openReadyChannel(alice, bob, 100_000n);
+				buildGraph(alice, bob, [ch1, ch2], 100_000_000n);
+				const { hash, preimage } = makeExternalHash();
+				parkTwoParts(alice, bob, [ch1, ch2], hash, 90_000_000n);
+				const cltvExpiry = parkedCltvExpiry(bob, ch2);
+				// Claim backstops taken for the refused part's channel only: the
+				// fulfilled part on ch1 takes one of its own.
+				const claims: string[] = [];
+				bob.on('node:error', (e: { code: string; channelId?: Buffer }) => {
+					if (e.channelId?.equals(ch2)) claims.push(e.code);
+				});
+				bob.on(
+					'log',
+					(l: {
+						action: string;
+						data: { context?: string; channelId?: string };
+					}) => {
+						if (
+							l.action === 'close_skipped_funding_not_on_chain' &&
+							l.data.channelId === ch2.toString('hex')
+						) {
+							claims.push(l.data.context ?? '');
+						}
+					}
+				);
+				const reasons: Buffer[] = [];
+				const cm = bob.getChannelManager();
+				const failHtlc = cm.failHtlc.bind(cm);
+				cm.failHtlc = (channelId, htlcId, reason) => {
+					reasons.push(reason);
+					return failHtlc(channelId, htlcId, reason);
+				};
+
+				bob.once('message:outbound', () => link.disconnect());
+				if (outcome === 'settle') {
+					expect(bob.settleHeldHtlc(hash, preimage)).to.equal(false);
+					bob.handleNewBlock(cltvExpiry - 18);
+					expect(claims).to.include('HTLC_CLAIM_FORCE_CLOSE');
+				} else {
+					expect(bob.cancelHoldInvoice(hash)).to.equal(null);
+					bob.handleNewBlock(cltvExpiry - 1);
+					link.reconnect();
+					expect(bob.listHoldInvoices()[0].state).to.equal('CANCELLED');
+					expect(reasons.length).to.be.greaterThan(0);
+					for (const reason of reasons) {
+						expect(reason.equals(Buffer.alloc(reason.length))).to.equal(false);
+					}
+				}
+			}
+		});
+
 		it('keeps a partially refused cancel bound to its outcome across a reload', function () {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();
