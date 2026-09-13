@@ -352,8 +352,10 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 			// index scan takes, and an instance that withdrew in the meantime
 			// (disconnect() deletes it from exactly this map) must not be called
 			// back or refreshed by a notification it is merely still queued for.
+			// An instance that withdrew and registered again holds a new record,
+			// which its reconnect compares and refreshes on its own.
 			const sub = subs.get(instance);
-			if (!sub) return;
+			if (sub !== pending) return;
 			// Snapshots: a callback may unregister itself or a sibling
 			// mid-dispatch.
 			for (const callback of [...sub.callbacks]) {
@@ -372,14 +374,15 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 				// Checked again: the withdrawal can land while this instance's
 				// own scan is in flight, and the refresh below would restart a
 				// wallet that has shut down.
-				if (!subs.has(instance)) return;
+				if (subs.get(instance) !== pending) return;
 			}
-			// The record marked for this delivery, not a re-read one: an instance
-			// that withdrew and registered again holds a new record, whose own
-			// pending deliveries this one is not.
 			const owed = pending.pendingRefresh;
 			if (owed && --owed.deliveries === 0) {
 				delete pending.pendingRefresh;
+			} else if (owed) {
+				// This refresh reads the server as of the newest status, so only
+				// a status that arrives after it is still unheard.
+				owed.heard = created.statuses.get(data[0]) ?? null;
 			}
 			void instance.wallet.refreshWallet({});
 		};

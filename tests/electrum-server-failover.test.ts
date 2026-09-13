@@ -3334,4 +3334,76 @@ describe('Electrum disconnect while a delivery is parked in a scan (issue #830)'
 		expect(refresh.callCount, 'the wallet that stayed').to.equal(0);
 		expect(siblingRefresh.callCount, 'the returning sibling').to.equal(1);
 	});
+
+	it('refreshes a wallet whose status reverted after an earlier refresh started', async () => {
+		const refresh = sinon.spy() as unknown as sinon.SinonStub;
+		const wallet = createScanningElectrum(refresh);
+		subscribeStatuses.set(utxoScriptHash, 'S0');
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		refresh.resetHistory();
+
+		// Each scan parks on the gate set when it starts.
+		const gates = [createGate(), createGate(), createGate()];
+		const notify = (status: string): void | Promise<void> | undefined =>
+			client.addressHandler?.([utxoScriptHash, status]);
+		scanGate = gates[0];
+		const first = notify('S1');
+		await flush();
+		scanGate = gates[1];
+		const second = notify('S2');
+		await flush();
+		gates[0].release();
+		await flush();
+		expect(refresh.callCount, 'the refresh that reads S2').to.equal(1);
+
+		scanGate = gates[2];
+		const reverted = notify('S0');
+		await flush();
+		expect(scans, 'every delivery started its scan').to.equal(3);
+		await wallet.disconnect();
+		scanGate = null;
+		gates[1].release();
+		gates[2].release();
+		await Promise.all([first, second, reverted]);
+		await flush();
+		refresh.resetHistory();
+
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(refresh.callCount).to.equal(1);
+	});
+
+	it('does not refresh twice when the old delivery releases after a reconnect', async () => {
+		const refresh = sinon.spy() as unknown as sinon.SinonStub;
+		const siblingRefresh = sinon.spy() as unknown as sinon.SinonStub;
+		const wallet = createScanningElectrum(refresh);
+		const sibling = createSibling(siblingRefresh);
+		subscribeStatuses.set(utxoScriptHash, 'before-deposit');
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		await sibling.connectToElectrum({ servers: serverA });
+		await flush();
+
+		subscribeStatuses.set(utxoScriptHash, 'after-deposit');
+		const oldGate = createGate();
+		scanGate = oldGate;
+		refresh.resetHistory();
+		const notified = client.addressHandler?.([utxoScriptHash, 'after-deposit']);
+		await flush();
+		expect(scans, 'the old delivery is parked').to.equal(1);
+		await wallet.disconnect();
+
+		scanGate = null;
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(refresh.callCount, 'the reconnect delivery').to.equal(1);
+
+		oldGate.release();
+		await notified;
+		await flush();
+
+		expect(refresh.callCount).to.equal(1);
+	});
 });
