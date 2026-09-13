@@ -24622,11 +24622,17 @@ export class LightningNode extends EventEmitter {
 				// A parked hold-invoice HTLC whose preimage was never revealed must
 				// be failed off-chain by the held-HTLC sweeper (same margin), not
 				// force-closed to claim: claiming would settle a payment the
-				// operator has not released.
+				// operator has not released. A set with a settle partway through
+				// has released it, so its remaining parts take the claim.
+				const resolution =
+					paymentHashHex !== undefined
+						? this.heldResolutions.get(paymentHashHex)
+						: undefined;
 				const parkedHold =
 					htlc.state !== HtlcState.FULFILLED &&
 					paymentHashHex !== undefined &&
-					this.heldInvoiceHashes.has(paymentHashHex);
+					this.heldInvoiceHashes.has(paymentHashHex) &&
+					resolution?.outcome !== 'settle';
 				const haveClaim =
 					!parkedHold &&
 					(htlc.state === HtlcState.FULFILLED ||
@@ -24755,6 +24761,18 @@ export class LightningNode extends EventEmitter {
 						break; // channel is closing; stop scanning it
 					}
 
+					// A part owed a recorded cancel is failed by retryHeldResolutions,
+					// which keeps the shared secret until the channel accepts the fail.
+					if (
+						resolution?.outcome === 'cancel' &&
+						this.heldHtlcs
+							.get(paymentHashHex!)
+							?.some(
+								(h) => h.channelId.equals(channelId) && h.htlcId === htlc.id
+							)
+					) {
+						continue;
+					}
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
 					const blindedRole = this.blindedRoleFor(channelId, htlc.id);
 					if (blindedRole) {
