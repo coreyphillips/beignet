@@ -2352,24 +2352,36 @@ export class Electrum {
 	}
 
 	/**
-	 * Takes back the callback a failed subscribe added. When that empties this
-	 * instance's record, the status it last heard goes back to
-	 * _withdrawnStatuses, where _scriptHashRecord may have just taken it from,
-	 * so the retry still has something to compare the server's answer with.
+	 * Takes back the callback a failed subscribe added to `sub`. Nothing is
+	 * touched once `sub` is no longer this instance's record: a disconnect
+	 * withdrew it, and whatever stands in its place belongs to a later
+	 * subscribe. The record itself goes only if this attempt created it, and
+	 * then the status it last heard goes back to _withdrawnStatuses, where
+	 * _scriptHashRecord may have just taken it from, so the retry still has
+	 * something to compare the server's answer with.
 	 */
 	private rollBackScriptHashCallback(
 		scriptHash: string,
-		onReceive: (data: TSubscribedReceive) => void
+		sub: TScriptHashSubscription,
+		onReceive: (data: TSubscribedReceive) => void,
+		created: boolean
 	): void {
 		const router = scriptHashRouters.get(this.electrumNetwork);
-		const sub = router?.subscriptions.get(scriptHash)?.get(this);
-		if (!router || !sub) return;
+		const subs = router?.subscriptions.get(scriptHash);
+		if (!router || !subs || subs.get(this) !== sub) return;
+		sub.callbacks.delete(onReceive);
+		if (!created || sub.callbacks.size > 0 || sub.utxoIndex !== undefined) {
+			return;
+		}
 		const heard = router.statuses.has(scriptHash)
 			? lastHeardStatus(router, scriptHash, sub)
 			: undefined;
-		this.removeScriptHashCallback({ scriptHash, onReceive });
+		subs.delete(this);
+		if (subs.size === 0) {
+			router.subscriptions.delete(scriptHash);
+			router.statuses.delete(scriptHash);
+		}
 		if (heard === undefined) return;
-		if (router.subscriptions.get(scriptHash)?.get(this) === sub) return;
 		if (this._withdrawnStatuses?.network !== this.electrumNetwork) {
 			this._withdrawnStatuses = {
 				network: this.electrumNetwork,
@@ -2441,6 +2453,7 @@ export class Electrum {
 		// concurrent subscription for the same hash keeps its own.
 		const router = getScriptHashRouter(this.electrumNetwork);
 		const allScriptHashesPromises = scriptHashes.map(async (scriptHash) => {
+			const created = !router.subscriptions.get(scriptHash)?.has(this);
 			const sub = this._scriptHashRecord(scriptHash);
 			const added = onReceive ? !sub.callbacks.has(onReceive) : false;
 			if (onReceive) {
@@ -2453,7 +2466,7 @@ export class Electrum {
 			});
 			if (response.error) {
 				if (added && onReceive) {
-					this.rollBackScriptHashCallback(scriptHash, onReceive);
+					this.rollBackScriptHashCallback(scriptHash, sub, onReceive, created);
 				}
 				throw Error('Unable to subscribe to receiving addresses.');
 			}
@@ -2461,6 +2474,7 @@ export class Electrum {
 		});
 
 		const allUtxosPromises = allUtxos.map(async (utxo) => {
+			const created = !router.subscriptions.get(utxo.scriptHash)?.has(this);
 			const sub = this._scriptHashRecord(utxo.scriptHash);
 			const added = onReceive ? !sub.callbacks.has(onReceive) : false;
 			if (onReceive) {
@@ -2474,7 +2488,12 @@ export class Electrum {
 			});
 			if (response.error) {
 				if (added && onReceive) {
-					this.rollBackScriptHashCallback(utxo.scriptHash, onReceive);
+					this.rollBackScriptHashCallback(
+						utxo.scriptHash,
+						sub,
+						onReceive,
+						created
+					);
 				}
 				throw Error('Unable to subscribe to receiving addresses.');
 			}

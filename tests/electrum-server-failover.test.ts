@@ -3511,3 +3511,73 @@ describe('Electrum failed callback subscribe after a reconnect (issue #831)', ()
 		expect(siblingRefreshSpy.callCount, 'the sibling').to.equal(1);
 	});
 });
+
+describe('Electrum failed callback subscribe rollback ownership (issue #839)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	it('keeps the wallet subscription that existed before the failed attempt', async () => {
+		const siblingRefreshSpy = sinon.spy() as unknown as sinon.SinonStub;
+		const sibling = createElectrum(
+			siblingRefreshSpy,
+			sinon.spy() as unknown as sinon.SinonStub,
+			walletScriptHash,
+			createWalletHeader()
+		);
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await sibling.connectToElectrum({ servers: serverA });
+		await flush();
+
+		subscriptionFailures.add(walletScriptHash);
+		const failed = await electrum.subscribeToAddresses({
+			scriptHashes: [walletScriptHash],
+			onReceive: sinon.spy()
+		});
+		expect(failed.isErr()).to.equal(true);
+		refreshSpy.resetHistory();
+		siblingRefreshSpy.resetHistory();
+
+		await client.addressHandler?.([walletScriptHash, 'after-deposit']);
+		await flush();
+
+		expect(refreshSpy.callCount, 'the wallet').to.equal(1);
+		expect(siblingRefreshSpy.callCount, 'the sibling').to.equal(1);
+	});
+
+	it('keeps the callback a reconnect retry installed when a parked attempt fails', async () => {
+		// Not a wallet address, so the reconnect restore leaves the retry to
+		// create the record on its own.
+		const scriptHash = 'cccc';
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		const onReceive = sinon.spy();
+		const gate = createGate();
+		subscriptionGate = gate;
+		const parked = electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive
+		});
+		await flush();
+		await electrum.disconnect();
+		subscriptionGate = null;
+
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		const retried = await electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive
+		});
+		expect(retried.isOk()).to.equal(true);
+
+		subscriptionFailures.add(scriptHash);
+		gate.release();
+		expect((await parked).isErr()).to.equal(true);
+
+		await client.addressHandler?.([scriptHash, 'after-deposit']);
+		await flush();
+
+		expect(onReceive.callCount, 'the retry callback').to.equal(1);
+	});
+});
