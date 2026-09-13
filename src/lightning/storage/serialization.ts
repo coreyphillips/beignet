@@ -1434,6 +1434,7 @@ export interface ISerializedPaymentInfo {
 	failureReason?: string;
 	createdAt: number;
 	completedAt?: number;
+	settledHtlcs?: string[];
 	metadata?: Record<string, string>;
 }
 
@@ -1463,6 +1464,7 @@ export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 		failureReason: p.failureReason,
 		createdAt: p.createdAt,
 		completedAt: p.completedAt,
+		settledHtlcs: p.settledHtlcs,
 		metadata: p.metadata
 	};
 }
@@ -1493,6 +1495,7 @@ export function deserializePaymentInfo(
 		failureReason: s.failureReason,
 		createdAt: s.createdAt,
 		completedAt: s.completedAt,
+		settledHtlcs: s.settledHtlcs,
 		metadata: s.metadata
 	};
 }

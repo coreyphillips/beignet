@@ -818,6 +818,12 @@ export interface IPaymentInfo {
 	cltvBaseHeight?: number;
 	createdAt: number;
 	completedAt?: number;
+	/**
+	 * The received HTLCs (`channelIdHex:htlcId`) that completed an incoming
+	 * payment. A restart redispatch fulfills only these for a completed hash;
+	 * any other HTLC for it is a replay.
+	 */
+	settledHtlcs?: string[];
 	metadata?: Record<string, string>;
 }
 

@@ -17382,16 +17382,25 @@ export class LightningNode extends EventEmitter {
 
 		// A completed incoming payment takes no further HTLC for its hash:
 		// fulfilling one debits a second payer and fires the settlement events
-		// again. The restart redispatch is exempt. A fulfill deferred by
-		// quiescence reports success without reaching disk, so the HTLC that
-		// completed the payment can come back through it, and failing that one
-		// would refund a settled payment.
+		// again. A fulfill deferred by quiescence reports success without
+		// reaching disk, so an HTLC that completed the payment can come back
+		// through the restart redispatch. Only those are fulfilled, and without
+		// settling the payment a second time.
 		const completed = this.payments.get(hashHex);
 		if (
-			!redispatched &&
 			completed?.direction === PaymentDirection.INCOMING &&
 			completed.status === PaymentStatus.COMPLETED
 		) {
+			const settledPreimage = this.preimages.get(hashHex) ?? completed.preimage;
+			if (
+				redispatched &&
+				settledPreimage &&
+				completed.settledHtlcs?.includes(htlcSecretKey)
+			) {
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.fulfillHtlc(channelId, htlcId, settledPreimage);
+				return;
+			}
 			this.emitStructuredLog('htlc', 'payment_already_completed', {
 				paymentHash: hashHex
 			});
@@ -18036,6 +18045,9 @@ export class LightningNode extends EventEmitter {
 			payment.status = PaymentStatus.COMPLETED;
 			payment.preimage = pre;
 			payment.completedAt = Date.now();
+			payment.settledHtlcs = held.map(
+				(h) => `${h.channelId.toString('hex')}:${h.htlcId}`
+			);
 			this.safeStorage(
 				() => this.persistPayment(paymentHash),
 				'persistPayment'
@@ -19787,6 +19799,9 @@ export class LightningNode extends EventEmitter {
 			if (payment) {
 				payment.status = PaymentStatus.COMPLETED;
 				payment.completedAt = Date.now();
+				payment.settledHtlcs = pending.receivedParts.map(
+					(p) => `${p.channelId.toString('hex')}:${p.htlcId}`
+				);
 				this.persistPayment(paymentHash);
 				this.emit('payment:received', payment);
 				this.emitInvoiceSettled(paymentHash, payment);
@@ -19847,6 +19862,7 @@ export class LightningNode extends EventEmitter {
 		if (payment) {
 			payment.status = PaymentStatus.COMPLETED;
 			payment.completedAt = Date.now();
+			payment.settledHtlcs = [`${channelId.toString('hex')}:${htlcId}`];
 		}
 
 		// Persist BEFORE sending fulfill message: on crash, reestablish

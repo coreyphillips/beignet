@@ -623,9 +623,15 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 
 		const inspect = new SqliteStorage(dbPath);
 		inspect.open();
+		const completedAt = inspect.loadPayment(
+			invoice.paymentHash.toString('hex')
+		)!.completedAt;
 		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
 		alice.removeAllListeners('message:outbound');
 		const restarted = createNode(BOB_SEED, inspect);
+		let settledEvents = 0;
+		restarted.on('payment:received', () => settledEvents++);
+		restarted.on('invoice:settled', () => settledEvents++);
 		await reconnect(restarted, alice);
 
 		expect(payment.status, 'payer settled after the restart').to.equal(
@@ -635,8 +641,119 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			restarted.getChannelManager().listChannels()[0].getFullState().htlcs.size,
 			'no HTLC left pending'
 		).to.equal(0);
+		// The original HTLC settles the payment it already completed (#820).
+		expect(settledEvents, 'no second settlement event').to.equal(0);
+		expect(restarted.getPayment(invoice.paymentHash)!.completedAt).to.equal(
+			completedAt
+		);
 
 		restarted.destroy();
+		alice.destroy();
+	});
+
+	it('a replay whose rejection died in a receiver crash is failed after restart', async function () {
+		// Redispatch used to exempt every HTLC from the completed-payment
+		// guard, so a second payer whose refusal never reached disk was
+		// fulfilled by the restart (issue #820).
+		this.timeout(20_000);
+		const CAROL_SEED = 43;
+		const dbPath = tempDb('redispatch-replay');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const dead = { val: false };
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, sealableStorage(storage1, dead));
+		wire(alice, bob, dead);
+		openReadyChannel(alice, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'replayed after settle'
+		});
+		const first = alice.sendPayment(invoice.bolt11);
+		await settle();
+		expect(first.status, 'first payer settled').to.equal(
+			PaymentStatus.COMPLETED
+		);
+		const completedAt = bob.getPayment(invoice.paymentHash)!.completedAt;
+
+		const carol = createNode(CAROL_SEED);
+		wire(carol, bob, dead);
+		openReadyChannel(carol, bob);
+		buildDirectGraph(carol, CAROL_SEED, BOB_SEED);
+
+		// Same crash point as the first test: the commit that processes the
+		// replay's revoke_and_ack lands, so its dispatch marker is durable,
+		// and the refusal that follows is not.
+		const holder = bob as unknown as {
+			recovery: {
+				commit: (transition: SafetyTransition) => IRecoveryCommitResult;
+			};
+		};
+		const realCommit = holder.recovery.commit.bind(holder.recovery);
+		let commits = 0;
+		holder.recovery.commit = (
+			transition: SafetyTransition
+		): IRecoveryCommitResult => {
+			if (dead.val) {
+				return {
+					committed: false,
+					released: [],
+					frameSequence: null,
+					error: new Error('crashed')
+				};
+			}
+			const result = realCommit(transition);
+			if (++commits === 3) dead.val = true;
+			return result;
+		};
+
+		const replay = carol.sendPayment(invoice.bolt11);
+		expect(replay.status, 'replay interrupted by the crash').to.equal(
+			PaymentStatus.PENDING
+		);
+		await settle();
+		bob.destroy();
+
+		const carolChannelId = carol
+			.getChannelManager()
+			.listChannels()[0]
+			.getChannelId()!
+			.toString('hex');
+		const inspect = new SqliteStorage(dbPath);
+		inspect.open();
+		const row = inspect
+			.loadAllChannels()
+			.find((c) => c.channelId === carolChannelId)!;
+		const committed = [...row.state.htlcs.entries()].filter(
+			([key, entry]) =>
+				key.startsWith('received-') && entry.state === HtlcState.COMMITTED
+		);
+		expect(committed.length, 'one committed replay HTLC').to.equal(1);
+		expect(
+			committed[0][1].forwardEmitted,
+			'dispatch marker persisted before the crash'
+		).to.equal(true);
+
+		carol.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		carol.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, inspect);
+		let settledEvents = 0;
+		restarted.on('payment:received', () => settledEvents++);
+		restarted.on('invoice:settled', () => settledEvents++);
+		await reconnect(restarted, carol);
+
+		expect(replay.status, 'replay refused after the restart').to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(settledEvents, 'no second settlement event').to.equal(0);
+		const payment = restarted.getPayment(invoice.paymentHash)!;
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(payment.completedAt).to.equal(completedAt);
+
+		restarted.destroy();
+		carol.destroy();
 		alice.destroy();
 	});
 
