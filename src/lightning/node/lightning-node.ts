@@ -807,6 +807,10 @@ export class LightningNode extends EventEmitter {
 	private peerManager: PeerManager | null = null;
 	private payments: Map<string, IPaymentInfo> = new Map();
 	private preimages: Map<string, Buffer> = new Map();
+	// Hashes of settled incoming keysends that pruneCompletedPayments dropped
+	// from memory. Without an invoice, nothing else keeps the hash closed to a
+	// sender replaying the preimage.
+	private prunedKeysendHashes: Set<string> = new Set();
 	private scidToChannelId: Map<string, Buffer> = new Map();
 	private htlcPaymentMap: Map<string, string> = new Map(); // "channelId:htlcId" → paymentHash hex
 	// For forwarded HTLCs: maps "outChannelId:outHtlcId" → { inChannelId, inHtlcId }
@@ -9706,6 +9710,7 @@ export class LightningNode extends EventEmitter {
 		}
 		this.payments.clear();
 		this.preimages.clear();
+		this.prunedKeysendHashes.clear();
 		this.paymentSecrets.clear();
 		this.invoices.clear();
 		this.scidToChannelId.clear();
@@ -9815,6 +9820,19 @@ export class LightningNode extends EventEmitter {
 			payment.direction === PaymentDirection.OUTGOING &&
 			!this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved;
 
+		const forget = (hash: string, payment: IPaymentInfo): void => {
+			this.payments.delete(hash);
+			this.preimages.delete(hash);
+			if (
+				payment.direction === PaymentDirection.INCOMING &&
+				payment.status === PaymentStatus.COMPLETED &&
+				payment.metadata?._keysend === 'true'
+			) {
+				this.prunedKeysendHashes.add(hash);
+			}
+			pruned++;
+		};
+
 		// Phase 1: Remove expired entries
 		for (const [hash, payment] of this.payments) {
 			if (
@@ -9823,9 +9841,7 @@ export class LightningNode extends EventEmitter {
 			) {
 				const age = now - (payment.completedAt || payment.createdAt);
 				if (age > ttl && !stillLive(hash, payment)) {
-					this.payments.delete(hash);
-					this.preimages.delete(hash);
-					pruned++;
+					forget(hash, payment);
 				}
 			}
 		}
@@ -9849,9 +9865,7 @@ export class LightningNode extends EventEmitter {
 			);
 			const toRemove = completed.length - max;
 			for (let i = 0; i < toRemove; i++) {
-				this.payments.delete(completed[i][0]);
-				this.preimages.delete(completed[i][0]);
-				pruned++;
+				forget(completed[i][0], completed[i][1]);
 			}
 		}
 
@@ -17455,10 +17469,12 @@ export class LightningNode extends EventEmitter {
 			// A hash owned by an invoice we issued is refused too: its settled
 			// payment can be pruned from memory while the invoice stays, and a
 			// keysend with the revealed preimage would then settle it again.
+			// A pruned settled keysend is refused for the same reason.
 			const outgoing = this.payments.get(hashHex);
 			if (
 				(outgoing && outgoing.direction === PaymentDirection.OUTGOING) ||
 				this.invoices.has(hashHex) ||
+				this.prunedKeysendHashes.has(hashHex) ||
 				this.paymentRetryContexts.has(hashHex) ||
 				this.getOutgoingHtlcs(paymentHash).htlcs.length > 0
 			) {
