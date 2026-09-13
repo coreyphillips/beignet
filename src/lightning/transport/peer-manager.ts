@@ -208,6 +208,8 @@ export class PeerManager extends EventEmitter {
 		Array<{ host: string; port: number }>
 	> = new Map();
 	private messageHandlers: Map<number, MessageHandler[]> = new Map();
+	/** In-flight dials keyed by peer and address; see dialPeer. */
+	private inflightDials: Map<string, Promise<void>> = new Map();
 	private reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
 		new Map();
 	private reconnectDelays: Map<string, number> = new Map();
@@ -310,11 +312,47 @@ export class PeerManager extends EventEmitter {
 	}
 
 	/**
+	 * One dial per (peer, address) at a time. A second caller for the same
+	 * address while a dial is in flight joins it and shares its outcome
+	 * instead of opening a second socket. Two overlapping sockets to one
+	 * peer split the two sides: the remote keeps the newest inbound (its
+	 * replacement path), while this side keeps the first of its own dials to
+	 * complete and quietly drops the other, so each side can end up holding
+	 * a socket the other has already torn down, and nothing notices until
+	 * the first ping fails. A mobile wallet met exactly this at every cold
+	 * start: the node's own start-up reconnect and the app's connect both
+	 * dialled the same primary within a second of each other.
+	 * Dials to different addresses still overlap; their rollback rules are
+	 * unchanged.
+	 */
+	private dialPeer(
+		pubkey: string,
+		host: string,
+		port: number,
+		transport?: IPeerTransportOptions
+	): Promise<void> {
+		const key = `${pubkey}|${host}|${port}|${
+			transport ? JSON.stringify(transport) : ''
+		}`;
+		const joined = this.inflightDials.get(key);
+		if (joined) return joined;
+		const attempt = this.dialPeerOnce(pubkey, host, port, transport);
+		this.inflightDials.set(key, attempt);
+		void attempt
+			.catch(() => undefined)
+			.then(() => {
+				if (this.inflightDials.get(key) === attempt)
+					this.inflightDials.delete(key);
+			});
+		return attempt;
+	}
+
+	/**
 	 * Single dial attempt. Unlike connectPeer, a failure does NOT schedule a
 	 * reconnect — the reconnect loop tries several candidate addresses per round
 	 * and must control when the next round starts.
 	 */
-	private async dialPeer(
+	private async dialPeerOnce(
 		pubkey: string,
 		host: string,
 		port: number,
