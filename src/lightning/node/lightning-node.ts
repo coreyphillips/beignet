@@ -18090,8 +18090,16 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.recordPreimage(paymentHash, pre);
 
 		this.resolvingHeldHtlcs.add(hashHex);
+		const prior = this.heldResolutions.get(hashHex);
 		const refused: typeof held = [];
 		try {
+			// Bound before the first fulfil leaves: a block handled on this stack,
+			// or a restart after it, must not fail back a part still to come.
+			this.heldResolutions.set(hashHex, {
+				outcome: 'settle',
+				resolved: prior?.resolved ?? []
+			});
+			this.persistHeldHtlcs();
 			for (const h of held) {
 				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
 				if (!this.channelManager.fulfillHtlc(h.channelId, h.htlcId, pre).ok) {
@@ -18112,6 +18120,10 @@ export class LightningNode extends EventEmitter {
 		// preimage stays recorded: the monitors need it to claim on-chain if the
 		// channel closes before a retry lands.
 		if (refused.length === held.length) {
+			if (!prior) {
+				this.heldResolutions.delete(hashHex);
+				this.persistHeldHtlcs();
+			}
 			this.emitStructuredLog('htlc', 'held_settle_refused', {
 				paymentHash: hashHex,
 				htlcCount: held.length
@@ -18273,6 +18285,14 @@ export class LightningNode extends EventEmitter {
 		this.resolvingHeldHtlcs.add(hashHex);
 		const refused: typeof held = [];
 		try {
+			// Bound before the first fail leaves, as in settleHeldHtlc.
+			this.heldResolutions.set(hashHex, {
+				outcome: 'cancel',
+				failureCode,
+				reason: cancelReason,
+				resolved: chosen?.resolved ?? []
+			});
+			this.persistHeldHtlcs();
 			for (const h of held) {
 				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
 				const ss = this.receivedHtlcSharedSecrets.get(key);
@@ -18305,6 +18325,10 @@ export class LightningNode extends EventEmitter {
 		// closing the invoice CANCELLED over HTLCs the payer still holds; the
 		// expiry sweeper retries this same call on every block.
 		if (refused.length === held.length) {
+			if (!chosen) {
+				this.heldResolutions.delete(hashHex);
+				this.persistHeldHtlcs();
+			}
 			this.emitStructuredLog('htlc', 'held_cancel_refused', {
 				paymentHash: hashHex,
 				reason: cancelReason,
