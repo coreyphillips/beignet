@@ -476,7 +476,8 @@ const createFakeWallet = (
 	refreshSpy: sinon.SinonStub,
 	messageSpy: sinon.SinonStub,
 	scriptHash: string = walletScriptHash,
-	header: TWalletHeader = walletHeader
+	header: TWalletHeader = walletHeader,
+	utxos: Array<{ scriptHash: string; index: number }> = []
 ): Wallet => {
 	return {
 		sendMessage: messageSpy,
@@ -516,7 +517,7 @@ const createFakeWallet = (
 		},
 		get data() {
 			return {
-				utxos: [],
+				utxos,
 				header: header.stored,
 				addresses: {
 					[EAddressType.p2wpkh]: {
@@ -537,10 +538,11 @@ const createElectrum = (
 	refreshSpy: sinon.SinonStub,
 	messageSpy: sinon.SinonStub,
 	scriptHash: string = walletScriptHash,
-	header: TWalletHeader = walletHeader
+	header: TWalletHeader = walletHeader,
+	utxos: Array<{ scriptHash: string; index: number }> = []
 ): Electrum => {
 	const electrum = new Electrum({
-		wallet: createFakeWallet(refreshSpy, messageSpy, scriptHash, header),
+		wallet: createFakeWallet(refreshSpy, messageSpy, scriptHash, header, utxos),
 		network: EAvailableNetworks.testnet,
 		net,
 		tls,
@@ -3168,5 +3170,240 @@ describe('Electrum explicit reconnect beside a sibling on the same hash (issue #
 
 		expect(siblingRefreshSpy.callCount).to.equal(0);
 		expect(refreshSpy.callCount).to.equal(0);
+	});
+});
+
+/**
+ * Issue #830: the router recorded a new status before the delivery for it had
+ * refreshed anyone. A disconnect that landed while that delivery was parked in
+ * the scan of a UTXO beyond the gap limit saved the new status as heard, the
+ * delivery then skipped the withdrawn wallet, and the reconnect found nothing
+ * changed.
+ */
+describe('Electrum disconnect while a delivery is parked in a scan (issue #830)', () => {
+	beforeEach(startTest);
+	afterEach(async () => {
+		scanGate?.release();
+		scanGate = null;
+		await endTest();
+	});
+
+	/** Script hash of a UTXO tracked beyond the gap limit. */
+	const utxoScriptHash = 'eeee';
+	/** Held open to park every delivery inside its UTXO scan. */
+	let scanGate: { promise: Promise<void>; release: () => void } | null = null;
+	let scans: number;
+
+	/** An instance whose wallet holds a UTXO on utxoScriptHash, with a scan
+	 *  that waits on scanGate. */
+	const createScanningElectrum = (refresh: sinon.SinonStub): Electrum => {
+		scans = 0;
+		const instance = createElectrum(
+			refresh,
+			sinon.spy() as unknown as sinon.SinonStub,
+			walletScriptHash,
+			createWalletHeader(),
+			[{ scriptHash: utxoScriptHash, index: 7 }]
+		);
+		sinon.stub(instance, 'getUtxos').callsFake(async () => {
+			scans++;
+			if (scanGate) await scanGate.promise;
+			return ok({}) as never;
+		});
+		return instance;
+	};
+
+	/** A sibling instance whose receiving address is utxoScriptHash. */
+	const createSibling = (refresh: sinon.SinonStub): Electrum =>
+		createElectrum(
+			refresh,
+			sinon.spy() as unknown as sinon.SinonStub,
+			utxoScriptHash,
+			createWalletHeader()
+		);
+
+	it('refreshes a wallet that disconnected while the restore delivery was parked', async () => {
+		const refresh = sinon.spy() as unknown as sinon.SinonStub;
+		const wallet = createScanningElectrum(refresh);
+		subscribeStatuses.set(utxoScriptHash, 'before-deposit');
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		await wallet.disconnect();
+		await flush();
+
+		subscribeStatuses.set(utxoScriptHash, 'after-deposit');
+		scanGate = createGate();
+		refresh.resetHistory();
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(scans, 'the delivery is parked in its scan').to.equal(1);
+		await wallet.disconnect();
+		scanGate.release();
+		await flush();
+		expect(refresh.callCount, 'the withdrawn wallet is skipped').to.equal(0);
+
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(refresh.callCount).to.equal(1);
+	});
+
+	it('does not refresh again for a change whose refresh already started', async () => {
+		const refresh = sinon.spy() as unknown as sinon.SinonStub;
+		const wallet = createScanningElectrum(refresh);
+		subscribeStatuses.set(utxoScriptHash, 'before-deposit');
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		await wallet.disconnect();
+		await flush();
+
+		subscribeStatuses.set(utxoScriptHash, 'after-deposit');
+		refresh.resetHistory();
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(refresh.callCount, 'refreshed for the change').to.equal(1);
+		await wallet.disconnect();
+		await flush();
+
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(refresh.callCount).to.equal(1);
+	});
+
+	it('refreshes a returning wallet whose own comparison was parked beside a sibling', async () => {
+		const refresh = sinon.spy() as unknown as sinon.SinonStub;
+		const siblingRefresh = sinon.spy() as unknown as sinon.SinonStub;
+		const wallet = createScanningElectrum(refresh);
+		const sibling = createSibling(siblingRefresh);
+		subscribeStatuses.set(utxoScriptHash, 'before-deposit');
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		await sibling.connectToElectrum({ servers: serverA });
+		await flush();
+		await wallet.disconnect();
+		await flush();
+
+		subscribeStatuses.set(utxoScriptHash, 'after-deposit');
+		scanGate = createGate();
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(scans, 'the comparison delivery is parked').to.equal(1);
+		await wallet.disconnect();
+		scanGate.release();
+		await flush();
+		refresh.resetHistory();
+		siblingRefresh.resetHistory();
+
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(siblingRefresh.callCount, 'the sibling').to.equal(0);
+		expect(refresh.callCount, 'the returning wallet').to.equal(1);
+	});
+
+	it('refreshes a wallet that disconnected while queued behind another scan', async () => {
+		const refresh = sinon.spy() as unknown as sinon.SinonStub;
+		const siblingRefresh = sinon.spy() as unknown as sinon.SinonStub;
+		const wallet = createScanningElectrum(refresh);
+		const sibling = createSibling(siblingRefresh);
+		subscribeStatuses.set(utxoScriptHash, 'before-deposit');
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		await sibling.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// Delivered to the scanning wallet first, which parks the sibling
+		// behind it.
+		subscribeStatuses.set(utxoScriptHash, 'after-deposit');
+		scanGate = createGate();
+		expect(client.addressHandler).to.not.equal(null);
+		const notified = client.addressHandler?.([utxoScriptHash, 'after-deposit']);
+		await flush();
+		expect(scans, 'the first delivery is parked').to.equal(1);
+		await sibling.disconnect();
+		scanGate.release();
+		await notified;
+		await flush();
+		expect(siblingRefresh.callCount, 'the withdrawn sibling').to.equal(0);
+		refresh.resetHistory();
+
+		await sibling.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(refresh.callCount, 'the wallet that stayed').to.equal(0);
+		expect(siblingRefresh.callCount, 'the returning sibling').to.equal(1);
+	});
+
+	it('refreshes a wallet whose status reverted after an earlier refresh started', async () => {
+		const refresh = sinon.spy() as unknown as sinon.SinonStub;
+		const wallet = createScanningElectrum(refresh);
+		subscribeStatuses.set(utxoScriptHash, 'S0');
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		refresh.resetHistory();
+
+		// Each scan parks on the gate set when it starts.
+		const gates = [createGate(), createGate(), createGate()];
+		const notify = (status: string): void | Promise<void> | undefined =>
+			client.addressHandler?.([utxoScriptHash, status]);
+		scanGate = gates[0];
+		const first = notify('S1');
+		await flush();
+		scanGate = gates[1];
+		const second = notify('S2');
+		await flush();
+		gates[0].release();
+		await flush();
+		expect(refresh.callCount, 'the refresh that reads S2').to.equal(1);
+
+		scanGate = gates[2];
+		const reverted = notify('S0');
+		await flush();
+		expect(scans, 'every delivery started its scan').to.equal(3);
+		await wallet.disconnect();
+		scanGate = null;
+		gates[1].release();
+		gates[2].release();
+		await Promise.all([first, second, reverted]);
+		await flush();
+		refresh.resetHistory();
+
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(refresh.callCount).to.equal(1);
+	});
+
+	it('does not refresh twice when the old delivery releases after a reconnect', async () => {
+		const refresh = sinon.spy() as unknown as sinon.SinonStub;
+		const siblingRefresh = sinon.spy() as unknown as sinon.SinonStub;
+		const wallet = createScanningElectrum(refresh);
+		const sibling = createSibling(siblingRefresh);
+		subscribeStatuses.set(utxoScriptHash, 'before-deposit');
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		await sibling.connectToElectrum({ servers: serverA });
+		await flush();
+
+		subscribeStatuses.set(utxoScriptHash, 'after-deposit');
+		const oldGate = createGate();
+		scanGate = oldGate;
+		refresh.resetHistory();
+		const notified = client.addressHandler?.([utxoScriptHash, 'after-deposit']);
+		await flush();
+		expect(scans, 'the old delivery is parked').to.equal(1);
+		await wallet.disconnect();
+
+		scanGate = null;
+		await wallet.connectToElectrum({ servers: serverA });
+		await flush();
+		expect(refresh.callCount, 'the reconnect delivery').to.equal(1);
+
+		oldGate.release();
+		await notified;
+		await flush();
+
+		expect(refresh.callCount).to.equal(1);
 	});
 });
