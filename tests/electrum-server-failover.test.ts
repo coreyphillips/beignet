@@ -3407,3 +3407,103 @@ describe('Electrum disconnect while a delivery is parked in a scan (issue #830)'
 		expect(refresh.callCount).to.equal(1);
 	});
 });
+
+/**
+ * Issue #831: a subscribe that failed after adding a callback rolled it back by
+ * deleting the record it left empty, and with it the status disconnect() had
+ * saved for the hash. The retry then had nothing to compare and never refreshed
+ * for a change that landed while the instance was offline.
+ */
+describe('Electrum failed callback subscribe after a reconnect (issue #831)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	it('refreshes on the retry when the restore and the first attempt failed', async () => {
+		subscribeStatuses.set(walletScriptHash, 'before-deposit');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.disconnect();
+		await flush();
+
+		subscribeStatuses.set(walletScriptHash, 'after-deposit');
+		subscriptionFailures.add(walletScriptHash);
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		refreshSpy.resetHistory();
+
+		const failedCallback = sinon.spy();
+		subscriptionFailures.add(walletScriptHash);
+		const failed = await electrum.subscribeToAddresses({
+			scriptHashes: [walletScriptHash],
+			onReceive: failedCallback
+		});
+		expect(failed.isErr()).to.equal(true);
+
+		const onReceive = sinon.spy();
+		const retried = await electrum.subscribeToAddresses({
+			scriptHashes: [walletScriptHash],
+			onReceive
+		});
+		expect(retried.isOk()).to.equal(true);
+		await flush();
+
+		expect(refreshSpy.callCount, 'the retry revealed the change').to.equal(1);
+		expect(onReceive.callCount).to.equal(1);
+		expect(
+			failedCallback.callCount,
+			'the failed attempt left no callback'
+		).to.equal(0);
+	});
+
+	it('refreshes on the retry beside a sibling that kept the hash', async () => {
+		const siblingRefreshSpy = sinon.spy() as unknown as sinon.SinonStub;
+		const sibling = createElectrum(
+			siblingRefreshSpy,
+			sinon.spy() as unknown as sinon.SinonStub,
+			walletScriptHash,
+			createWalletHeader()
+		);
+		subscribeStatuses.set(walletScriptHash, 'before-deposit');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await sibling.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.disconnect();
+		await flush();
+
+		subscribeStatuses.set(walletScriptHash, 'after-deposit');
+		subscriptionFailures.add(walletScriptHash);
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		// The sibling hears the change on its own, so the retry below answers
+		// "Already Subscribed." and only the saved status can reveal it.
+		await sibling.subscribeToAddresses({});
+		await flush();
+		expect(siblingRefreshSpy.callCount, 'the sibling').to.equal(1);
+		refreshSpy.resetHistory();
+
+		const failedCallback = sinon.spy();
+		subscriptionFailures.add(walletScriptHash);
+		const failed = await electrum.subscribeToAddresses({
+			scriptHashes: [walletScriptHash],
+			onReceive: failedCallback
+		});
+		expect(failed.isErr()).to.equal(true);
+
+		const onReceive = sinon.spy();
+		const retried = await electrum.subscribeToAddresses({
+			scriptHashes: [walletScriptHash],
+			onReceive
+		});
+		expect(retried.isOk()).to.equal(true);
+		await flush();
+
+		expect(refreshSpy.callCount, 'the returning wallet').to.equal(1);
+		expect(onReceive.callCount).to.equal(1);
+		expect(
+			failedCallback.callCount,
+			'the failed attempt left no callback'
+		).to.equal(0);
+		expect(siblingRefreshSpy.callCount, 'the sibling').to.equal(1);
+	});
+});
