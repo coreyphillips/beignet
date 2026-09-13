@@ -3068,3 +3068,105 @@ describe('Electrum explicit reconnect after changes it missed (issue #814)', () 
 		expect(refreshSpy.callCount).to.equal(0);
 	});
 });
+
+/**
+ * Issue #821: when a sibling instance kept the hash, the router kept its status,
+ * so the restore dispatched the change to the sibling before the returning
+ * instance re-registered, and that instance's own subscribe then answered
+ * "Already Subscribed." with nothing left to compare.
+ */
+describe('Electrum explicit reconnect beside a sibling on the same hash (issue #821)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	let siblingRefreshSpy: sinon.SinonStub;
+
+	/** Connects the default instance and a sibling watching the same hash, then
+	 *  disconnects the default one. */
+	const connectBothAndDisconnectOne = async (): Promise<Electrum> => {
+		siblingRefreshSpy = sinon.spy() as unknown as sinon.SinonStub;
+		const sibling = createElectrum(
+			siblingRefreshSpy,
+			sinon.spy() as unknown as sinon.SinonStub,
+			walletScriptHash,
+			createWalletHeader()
+		);
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await sibling.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.disconnect();
+		await flush();
+		refreshSpy.resetHistory();
+		siblingRefreshSpy.resetHistory();
+		return sibling;
+	};
+
+	it('refreshes the returning wallet after the restore refreshed its sibling', async () => {
+		subscribeStatuses.set(walletScriptHash, 'before-deposit');
+		await connectBothAndDisconnectOne();
+
+		subscribeStatuses.set(walletScriptHash, 'after-deposit');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(siblingRefreshSpy.callCount, 'the sibling').to.equal(1);
+		expect(refreshSpy.callCount, 'the returning wallet').to.equal(1);
+	});
+
+	it('refreshes once when the change is revealed after it re-registered', async () => {
+		subscribeStatuses.set(walletScriptHash, 'before-deposit');
+		await connectBothAndDisconnectOne();
+
+		subscribeStatuses.set(walletScriptHash, 'after-deposit');
+		subscriptionGate = createGate();
+		await electrum.connectToElectrum({ servers: serverA });
+		// Registered while the restore's subscribe for the hash is still out, so
+		// the dispatch that answer triggers reaches this instance as well.
+		const subscribed = electrum.subscribeToAddresses();
+		subscriptionGate.release();
+		subscriptionGate = null;
+		await subscribed;
+		await flush();
+
+		expect(siblingRefreshSpy.callCount, 'the sibling').to.equal(1);
+		expect(refreshSpy.callCount, 'the returning wallet').to.equal(1);
+	});
+
+	it('keeps a comparison still owed across a second disconnect', async () => {
+		subscribeStatuses.set(walletScriptHash, 'before-deposit');
+		const sibling = await connectBothAndDisconnectOne();
+		subscribeStatuses.set(walletScriptHash, 'after-deposit');
+		await sibling.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// Re-registered, then disconnected again before any answer compared it.
+		subscriptionGate = createGate();
+		await electrum.connectToElectrum({ servers: serverA });
+		const subscribed = electrum.subscribeToAddresses();
+		await electrum.disconnect();
+		subscriptionGate.release();
+		subscriptionGate = null;
+		await subscribed;
+		await flush();
+		refreshSpy.resetHistory();
+		siblingRefreshSpy.resetHistory();
+
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(siblingRefreshSpy.callCount, 'the sibling').to.equal(0);
+		expect(refreshSpy.callCount, 'the returning wallet').to.equal(1);
+	});
+
+	it('refreshes neither when nothing changed while disconnected', async () => {
+		subscribeStatuses.set(walletScriptHash, 'unchanged');
+		await connectBothAndDisconnectOne();
+
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(siblingRefreshSpy.callCount).to.equal(0);
+		expect(refreshSpy.callCount).to.equal(0);
+	});
+});
