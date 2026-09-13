@@ -87,6 +87,12 @@ type TScriptHashRouter = {
 	subscriptions: Map<string, Map<Electrum, TScriptHashSubscription>>;
 	/** The one handler every subscribeAddress call for this network is given. */
 	dispatch: (data: TSubscribedReceive) => Promise<void>;
+	/** The last status heard for each subscribed hash, from a subscribe answer
+	 *  or a notification. */
+	statuses: Map<string, string | null>;
+	/** Records the status a subscribe answered with, and dispatches one that
+	 *  differs from the last heard as the notification it stands for. */
+	noteSubscribed: (scriptHash: string, response: ISubscribeToAddress) => void;
 };
 
 /**
@@ -314,11 +320,33 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 		const created: TScriptHashRouter = {
 			instances: new Set(),
 			subscriptions: new Map(),
+			statuses: new Map(),
+			noteSubscribed: (scriptHash, response): void => {
+				// "Already Subscribed." carries no status: the subscription was
+				// never lost, so neither was a notification. A hash with no history
+				// answers null, which the client hands back as the whole message.
+				const data: unknown = response.data;
+				if (response.error || data === 'Already Subscribed.') return;
+				// Withdrawn while the subscribe was in flight.
+				if (!created.subscriptions.has(scriptHash)) return;
+				const status = typeof data === 'string' ? data : null;
+				const known = created.statuses.has(scriptHash);
+				const previous = created.statuses.get(scriptHash);
+				created.statuses.set(scriptHash, status);
+				// A server only notifies a live subscription, so a change that
+				// landed while the socket was down is only ever seen here.
+				if (known && previous !== status) {
+					void created.dispatch([scriptHash, status as string]);
+				}
+			},
 			dispatch: async (data: TSubscribedReceive): Promise<void> => {
 				const scriptHash = Array.isArray(data) ? data[0] : undefined;
 				const subs = scriptHash
 					? created.subscriptions.get(scriptHash)
 					: undefined;
+				if (scriptHash && subs) {
+					created.statuses.set(scriptHash, data[1] ?? null);
+				}
 				if (!subs || subs.size === 0) {
 					// Nothing registered for this hash (a race with removal, or a
 					// subscription that predates the registry): fall back to the
@@ -801,6 +829,7 @@ export class Electrum {
 					if (response.error) {
 						throw new Error('Unable to restore address subscriptions.');
 					}
+					router.noteSubscribed(scriptHash, response);
 				})
 			);
 		}
@@ -2131,7 +2160,19 @@ export class Electrum {
 			// own reconciliation through _reorgOwed.
 			return { result: ok(this.getBlockHeader()), reconcileOwed: false };
 		}
+		const lastHeard = router.last;
 		const applied = await this.applyReportedHeader(header, electrumNetwork);
+		// A tip above the last one heard was found while the socket was down, and
+		// no notification will ever come for it: without one, no wallet here
+		// refreshes and nothing listening for blocks learns the height. Not
+		// replayed once a notification has replaced it, which did all of that.
+		if (
+			lastHeard &&
+			header.height > lastHeard.height &&
+			router.last === header
+		) {
+			void router.dispatch([{ height: header.height, hex }]);
+		}
 		// The restore reads this: a wallet left holding an unreconciled
 		// rollback has not been restored, whatever the subscription itself did.
 		// The header is stored either way, because applyHeader writes before it
@@ -2183,6 +2224,7 @@ export class Electrum {
 			subs.delete(this);
 			if (subs.size === 0) {
 				router.subscriptions.delete(scriptHash);
+				router.statuses.delete(scriptHash);
 			}
 		}
 		return removed;
@@ -2248,7 +2290,7 @@ export class Electrum {
 		// failure, only what this attempt added is rolled back, so a caller
 		// retrying with a fresh closure cannot accumulate dead callbacks and a
 		// concurrent subscription for the same hash keeps its own.
-		const dispatch = getScriptHashRouter(this.electrumNetwork).dispatch;
+		const router = getScriptHashRouter(this.electrumNetwork);
 		const allScriptHashesPromises = scriptHashes.map(async (scriptHash) => {
 			const sub = this._scriptHashRecord(scriptHash);
 			const added = onReceive ? !sub.callbacks.has(onReceive) : false;
@@ -2258,7 +2300,7 @@ export class Electrum {
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash,
 				network: this.electrumNetwork,
-				onReceive: dispatch
+				onReceive: router.dispatch
 			});
 			if (response.error) {
 				if (added && onReceive) {
@@ -2266,6 +2308,7 @@ export class Electrum {
 				}
 				throw Error('Unable to subscribe to receiving addresses.');
 			}
+			router.noteSubscribed(scriptHash, response);
 		});
 
 		const allUtxosPromises = allUtxos.map(async (utxo) => {
@@ -2278,7 +2321,7 @@ export class Electrum {
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash: utxo.scriptHash,
 				network: this.electrumNetwork,
-				onReceive: dispatch
+				onReceive: router.dispatch
 			});
 			if (response.error) {
 				if (added && onReceive) {
@@ -2289,6 +2332,7 @@ export class Electrum {
 				}
 				throw Error('Unable to subscribe to receiving addresses.');
 			}
+			router.noteSubscribed(utxo.scriptHash, response);
 		});
 
 		try {
@@ -2474,6 +2518,7 @@ export class Electrum {
 				subs.delete(this);
 				if (subs.size === 0) {
 					router.subscriptions.delete(scriptHash);
+					router.statuses.delete(scriptHash);
 				}
 			}
 		}

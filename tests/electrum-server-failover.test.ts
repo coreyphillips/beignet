@@ -173,6 +173,9 @@ let connectionEvents: string[];
 let nextHeaderHeight: number;
 /** Script hashes whose next subscription request should fail. */
 let subscriptionFailures: Set<string>;
+/** The status a fresh subscription answers with, per script hash. A hash with
+ *  none answers null, which the client hands back as the whole message. */
+let subscribeStatuses: Map<string, string>;
 /** Per-call control over blockchain.headers.subscribe, keyed by call index, so
  *  a test can decide the order two concurrent subscribes resolve in, which of
  *  them fails, and whether a notification overtakes the response. */
@@ -395,7 +398,14 @@ const stubHelpers = (): void => {
 			}
 			client.subscribedHashes.push(scriptHash);
 			protocolSubscribes.push(scriptHash);
-			return { error: false, data: { id: 1, jsonrpc: '2.0', result: null } };
+			return {
+				error: false,
+				data: subscribeStatuses.get(scriptHash) ?? {
+					id: 1,
+					jsonrpc: '2.0',
+					result: null
+				}
+			};
 		}
 	);
 
@@ -567,6 +577,7 @@ const startTest = (): void => {
 	connectionEvents = [];
 	nextHeaderHeight = 100;
 	subscriptionFailures = new Set();
+	subscribeStatuses = new Map();
 	subscriptionGate = null;
 	headerHandlerGate = null;
 	headerSubscribeControls = new Map();
@@ -2872,6 +2883,134 @@ describe('Electrum peer ownership across instances (issue #498)', () => {
 		expect(
 			connectionEvents.filter((event) => event.startsWith('connect:')),
 			'the instance still on that server keeps it'
+		).to.deep.equal([]);
+	});
+});
+
+/**
+ * Issue #808: a server only notifies a live subscription, so a deposit, or the
+ * block confirming it, that landed while the socket was down reached nobody.
+ * The restore re-issued every subscription and ignored what each answered, and
+ * nothing refreshed the wallet until an unrelated notification did.
+ */
+describe('Electrum reconnect after changes the socket missed (issue #808)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	/** newBlock messages the default wallet received, by height. */
+	const newBlockHeights = (): number[] =>
+		messageSpy
+			.getCalls()
+			.filter(
+				(call: { args: [string, { height: number }] }) =>
+					call.args[0] === 'newBlock'
+			)
+			.map(
+				(call: { args: [string, { height: number }] }) => call.args[1].height
+			);
+
+	it('refreshes for a script hash whose status changed while disconnected', async () => {
+		const onReceive = sinon.spy();
+		subscribeStatuses.set('aaaa', 'before-deposit');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.subscribeToAddresses({ scriptHashes: ['aaaa'], onReceive });
+		await flush();
+		refreshSpy.resetHistory();
+
+		socketIsDead = true;
+		subscribeStatuses.set('aaaa', 'after-deposit');
+		protocolSubscribes = [];
+		const reconnected = await electrum.connectToElectrum({ servers: serverA });
+		expect(reconnected.isOk()).to.equal(true);
+		await flush();
+
+		expect(protocolSubscribes, 'the restore re-subscribed it').to.include(
+			'aaaa'
+		);
+		expect(
+			refreshSpy.callCount,
+			'one refresh for the change the restore revealed'
+		).to.equal(1);
+		expect(
+			onReceive.calledOnceWith(['aaaa', 'after-deposit']),
+			'delivered as the notification it stands for'
+		).to.equal(true);
+	});
+
+	it('does not refresh when no status changed while disconnected', async () => {
+		const onReceive = sinon.spy();
+		subscribeStatuses.set('aaaa', 'unchanged');
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await electrum.subscribeToAddresses({ scriptHashes: ['aaaa'], onReceive });
+		await flush();
+		refreshSpy.resetHistory();
+
+		socketIsDead = true;
+		protocolSubscribes = [];
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(protocolSubscribes, 'the restore re-subscribed it').to.include(
+			'aaaa'
+		);
+		expect(refreshSpy.callCount).to.equal(0);
+		expect(onReceive.called).to.equal(false);
+	});
+
+	it('delivers a block found while disconnected to every header listener', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		const heights: number[] = [];
+		// What ElectrumBackend installs to keep the node's height.
+		electrum.onReceive = (data): void => {
+			heights.push((data as Array<{ height: number }>)[0].height);
+		};
+		refreshSpy.resetHistory();
+		messageSpy.resetHistory();
+		walletHeader.reorgChecks = [];
+
+		socketIsDead = true;
+		nextHeaderHeight = 101;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		expect(walletHeader.stored.height).to.equal(101);
+		expect(heights, 'the listener learns the height').to.deep.equal([101]);
+		expect(newBlockHeights()).to.deep.equal([101]);
+		expect(refreshSpy.callCount, 'the wallet refreshes for it').to.equal(1);
+		expect(walletHeader.reorgChecks, 'growth is not a rollback').to.deep.equal(
+			[]
+		);
+	});
+
+	it('does not deliver a reported tip again once a notification replaced it', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		messageSpy.resetHistory();
+		walletHeader.reorgChecks = [];
+
+		// The reported tip is still being written when the next block arrives.
+		walletHeader.writeGate = createGate();
+		socketIsDead = true;
+		nextHeaderHeight = 101;
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		const notified = fireHeader(102);
+		await flush();
+		walletHeader.writeGate.release();
+		await notified;
+		await flush();
+
+		expect(walletHeader.stored.height).to.equal(102);
+		expect(
+			newBlockHeights(),
+			'only the notification is delivered'
+		).to.deep.equal([102]);
+		expect(
+			walletHeader.reorgChecks,
+			'and the older tip is not read as a rollback'
 		).to.deep.equal([]);
 	});
 });

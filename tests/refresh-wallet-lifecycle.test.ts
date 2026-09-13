@@ -263,6 +263,13 @@ describe('refreshWallet flag lifecycle', function () {
 		).to.equal(false);
 
 		gates[1]();
+		// The last body in flight scans once more for the queued caller.
+		await waitFor(
+			() => gates.length === 3,
+			5000,
+			'the re-run owed to the queued caller'
+		);
+		gates[2]();
 		const siblingRes = await withDeadline(sibling, 5000, 'the forced refresh');
 		expect(siblingRes.isOk()).to.equal(true);
 		const queuedRes = await withDeadline(queued, 5000, 'the queued refresh');
@@ -271,6 +278,95 @@ describe('refreshWallet flag lifecycle', function () {
 			wallet.isRefreshing,
 			'the last refresh to finish released the flag'
 		).to.equal(false);
+	});
+
+	describe('a call queued behind a running refresh (issue #808)', function () {
+		/** One gate per getUtxos call, so each body can be held and counted. */
+		let gates: Array<() => void>;
+
+		beforeEach(function () {
+			gates = [];
+			getUtxosStub.callsFake(async () => {
+				await new Promise<void>((resolve) => gates.push(resolve));
+				return ok<IGetUtxosResponse>({ utxos: [], balance: 0 });
+			});
+		});
+
+		it('scans once more after the refresh it queued behind', async function () {
+			const running = wallet.refreshWallet({});
+			await waitFor(() => gates.length === 1, 5000, 'the first body');
+
+			// The running body has read past getUtxos, so it cannot see whatever
+			// prompted this call.
+			let queuedSettled = false;
+			const queued = wallet.refreshWallet({});
+			void queued.then(() => {
+				queuedSettled = true;
+			});
+
+			gates[0]();
+			await waitFor(() => gates.length === 2, 5000, 'the re-run');
+			expect(
+				queuedSettled,
+				'the queued caller waits for the scan that started after it'
+			).to.equal(false);
+			expect(wallet.isRefreshing, 'the re-run keeps the flag').to.equal(true);
+
+			gates[1]();
+			const [runningRes, queuedRes] = await withDeadline(
+				Promise.all([running, queued]),
+				5000,
+				'the refresh and its re-run'
+			);
+			expect(runningRes.isOk()).to.equal(true);
+			expect(queuedRes.isOk()).to.equal(true);
+			expect(getUtxosStub.callCount, 'the body ran twice').to.equal(2);
+			expect(wallet.isRefreshing).to.equal(false);
+		});
+
+		it('scans only once more however many calls queued', async function () {
+			const running = wallet.refreshWallet({});
+			await waitFor(() => gates.length === 1, 5000, 'the first body');
+			const queued = Array.from({ length: 5 }, () => wallet.refreshWallet({}));
+
+			gates[0]();
+			await waitFor(() => gates.length === 2, 5000, 'the re-run');
+			gates[1]();
+			const results = await withDeadline(
+				Promise.all([running, ...queued]),
+				5000,
+				'the refresh and every queued call'
+			);
+			expect(results.every((r) => r.isOk())).to.equal(true);
+			// Long enough for a third body to have reached getUtxos.
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(getUtxosStub.callCount, 'the body ran exactly twice').to.equal(2);
+		});
+
+		it('does not re-run for stop(), and stop() still settles', async function () {
+			const running = wallet.refreshWallet({});
+			await waitFor(() => gates.length === 1, 5000, 'the first body');
+			// Queued before stop(), so the scan was owed before the wallet began
+			// shutting down.
+			const queued = wallet.refreshWallet({});
+
+			const stopping = wallet.stop({ refreshTimeout: 5000 });
+			gates[0]();
+			const stopped = await withDeadline(stopping, 5000, 'stop()');
+			expect(stopped.isOk()).to.equal(true);
+			if (stopped.isOk()) {
+				expect(stopped.value, 'nothing was abandoned').to.equal(
+					'Wallet stopped.'
+				);
+			}
+			await withDeadline(
+				Promise.all([running, queued]),
+				5000,
+				'the refresh and the call queued behind it'
+			);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(getUtxosStub.callCount, 'no re-run was started').to.equal(1);
+		});
 	});
 
 	it('keeps the flag while a nested forced refresh runs inside another', async function () {

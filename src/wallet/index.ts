@@ -182,6 +182,10 @@ export class Wallet {
 	// guard, so more than one can be in flight and the flag belongs to all of
 	// them until the last one finishes.
 	private _activeRefreshes = 0;
+	// Set by a call queued behind a running refresh. That refresh may already
+	// have read past whatever prompted the call (a deposit notification, the
+	// block confirming it), so the last body to finish scans once more.
+	private _refreshOwed = false;
 	// Outpoints our own broadcasts have spent, keyed 'txid:vout', each holding
 	// the value _spendSeq had when the broadcast landed. The UTXO set is only
 	// ever replaced wholesale by a scan, so a scan already in flight at that
@@ -199,6 +203,9 @@ export class Wallet {
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
 	// its deadline walked away from, must not undo the teardown.
 	private _stopped = false;
+	// Raised by stop() before it waits for the refresh in flight. A wallet
+	// shutting down owes no further scan, and one would only hold stop() up.
+	private _stopping = false;
 	// BIP32 account index as a path segment string ('0' by default).
 	private readonly _account: string;
 	// Requested at create time; merged with the stored value in setWalletData.
@@ -723,6 +730,7 @@ export class Wallet {
 		refreshTimeout = STOP_REFRESH_WAIT_MS
 	}: { refreshTimeout?: number } = {}): Promise<Result<string>> {
 		let abandonedRefresh = false;
+		this._stopping = true;
 		try {
 			try {
 				// if we are refreshing, we need to wait for it to finish
@@ -880,6 +888,7 @@ export class Wallet {
 	} = {}): Promise<Result<IWalletData>> {
 		if (this._stopped) return err('Wallet stopped.');
 		if (this.isRefreshing && !force) {
+			this._refreshOwed = true;
 			return new Promise((resolve) => {
 				this._pendingRefreshPromises.push(resolve);
 			});
@@ -899,13 +908,23 @@ export class Wallet {
 		this.isRefreshing = true;
 		void this.updateFeeEstimates();
 		let result: Result<IWalletData>;
+		let scan = { scanAllAddresses, additionalAddresses };
 		try {
-			result = await this._runRefresh({
-				scanAllAddresses,
-				additionalAddresses
-			});
-		} catch (e) {
-			result = err(e);
+			for (;;) {
+				try {
+					result = await this._runRefresh(scan);
+				} catch (e) {
+					result = err(e);
+				}
+				// A call queued while this body ran is answered with a scan that
+				// starts after it, however many were queued. Only the last body in
+				// flight answers the queue, so a nested or sibling forced refresh
+				// finishing first leaves the re-run to the one still running.
+				if (!this._refreshOwed || this._activeRefreshes > 1 || this._stopping)
+					break;
+				this._refreshOwed = false;
+				scan = { scanAllAddresses: false, additionalAddresses: [] };
+			}
 		} finally {
 			this._activeRefreshes -= 1;
 			// Not for a refresh that outlived stop(): the teardown disabled
@@ -967,6 +986,7 @@ export class Wallet {
 	/** Releases the refresh flag and hands `result` to every queued caller. */
 	private _resolveAllPendingRefreshPromises(result: Result<IWalletData>): void {
 		this.isRefreshing = false;
+		this._refreshOwed = false;
 		while (this._pendingRefreshPromises.length > 0) {
 			const resolve = this._pendingRefreshPromises.shift();
 			if (resolve) {
