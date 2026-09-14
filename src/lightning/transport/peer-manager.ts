@@ -708,6 +708,11 @@ export class PeerManager extends EventEmitter {
 		for (const pending of this.pendingDialsByPubkey.get(pubkey) ?? []) {
 			pending.disconnect();
 		}
+		// Drop joinable handles for this peer so a connectPeer issued in the
+		// same tick does not inherit a dial this call just cancelled.
+		for (const key of this.inflightDials.keys()) {
+			if (key.startsWith(`${pubkey}|`)) this.inflightDials.delete(key);
+		}
 		const timer = this.reconnectTimers.get(pubkey);
 		if (timer) {
 			clearTimeout(timer);

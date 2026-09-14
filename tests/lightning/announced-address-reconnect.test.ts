@@ -901,6 +901,96 @@ describe('PeerManager: simultaneous cross-dial handling', function () {
 		}
 	});
 
+	it('disconnectPeer then connectPeer starts a fresh dial instead of joining the cancelled one', async function () {
+		this.timeout(20_000);
+		let accepts = 0;
+		const blackhole = net.createServer(() => {
+			accepts++;
+		});
+		await new Promise<void>((resolve) =>
+			blackhole.listen(0, '127.0.0.1', resolve)
+		);
+		const port = (blackhole.address() as net.AddressInfo).port;
+		const remote = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const pm = new PeerManager({ localPrivateKey: crypto.randomBytes(32) });
+		try {
+			const first = pm
+				.connectPeer(remote, '127.0.0.1', port)
+				.catch((err) => err);
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			pm.disconnectPeer(remote);
+			const secondStarted = Date.now();
+			const second = pm.connectPeer(remote, '127.0.0.1', port);
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			expect(accepts, 'the redial opened its own socket').to.equal(2);
+			expect(await first).to.be.instanceOf(PeerDialCancelledError);
+			let secondRejected = false;
+			void second.catch(() => {
+				secondRejected = true;
+			});
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(
+				secondRejected,
+				'the redial did not inherit the cancelled attempt'
+			).to.equal(false);
+			expect(Date.now() - secondStarted).to.be.greaterThan(40);
+			pm.disconnectPeer(remote);
+			await second.catch(() => undefined);
+		} finally {
+			pm.destroy();
+			blackhole.close();
+		}
+	});
+
+	it('a connectPeer after disconnectPeer during auto-reconnect leaves a dial in flight', async function () {
+		this.timeout(20_000);
+		const hang = await hangingServer();
+		const remote = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const pm = new PeerManager({
+			localPrivateKey: crypto.randomBytes(32),
+			autoReconnect: true
+		});
+		const internal = pm as unknown as {
+			pendingDialsByPubkey: Map<string, Set<unknown>>;
+			reconnectTimers: Map<string, unknown>;
+		};
+		try {
+			const first = pm
+				.connectPeer(remote, '127.0.0.1', hang.port)
+				.catch((err) => err);
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			expect(
+				internal.pendingDialsByPubkey.get(remote)?.size,
+				'the stalled dial is indexed'
+			).to.equal(1);
+			pm.disconnectPeer(remote);
+			expect(
+				internal.reconnectTimers.has(remote),
+				'disconnect cleared any pending reconnect timer'
+			).to.equal(false);
+			const redial = pm.connectPeer(remote, '127.0.0.1', hang.port);
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			expect(
+				internal.pendingDialsByPubkey.get(remote)?.size,
+				'the redial replaced the cancelled attempt'
+			).to.equal(1);
+			let redialRejected = false;
+			void redial.catch(() => {
+				redialRejected = true;
+			});
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(redialRejected, 'the redial did not fail instantly').to.equal(
+				false
+			);
+			expect(await first).to.be.instanceOf(PeerDialCancelledError);
+			pm.disconnectPeer(remote);
+			await redial.catch(() => undefined);
+		} finally {
+			pm.destroy();
+			hang.close();
+		}
+	});
+
 	it('two overlapping dials to the same address share one socket, so both sides keep the same connection', async function () {
 		this.timeout(20_000);
 		// A mobile wallet met this at every cold start: the node's start-up
