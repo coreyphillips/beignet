@@ -19,6 +19,18 @@ import { IRREVOCABLE_DEPTH } from './types';
 bitcoin.initEccLib(ecc);
 
 /**
+ * A backend call that got no answer (not connected, timed out), as opposed to
+ * one the server answered without the thing asked for. A caller deciding on
+ * the result should ask again rather than read it as absence (issue #855).
+ */
+export class ChainBackendUnavailableError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'ChainBackendUnavailableError';
+	}
+}
+
+/**
  * Abstract chain backend interface. Can be backed by Electrum, Esplora, etc.
  */
 export interface IChainBackend {

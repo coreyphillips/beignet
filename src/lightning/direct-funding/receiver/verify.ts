@@ -301,16 +301,17 @@ function messageProofProblem(
  * `require_confirmed_inputs` over a coin still in the mempool.
  *
  * `confirmed` is left undefined when nothing conclusive came back, which the
- * channel treats as unknown rather than as a claim.
+ * channel treats as unknown rather than as a claim. `unanswered` says the
+ * unspent lookup itself failed, so the source never got to say (issue #855).
  */
 export async function classifyOfferedCoin(
 	chain: IDfChainSource,
 	outpoint: { txidDisplayHex: string; vout: number; script: Buffer }
-): Promise<{ spent: boolean; confirmed?: boolean }> {
+): Promise<{ spent: boolean; confirmed?: boolean; unanswered?: boolean }> {
 	if (!chain.listUnspent) return { spent: false };
 	const scriptHash = computeScriptHash(outpoint.script);
 	const unspent = await chain.listUnspent(scriptHash).catch(() => null);
-	if (!unspent) return { spent: false };
+	if (!unspent) return { spent: false, unanswered: true };
 	const entry = unspent.find(
 		(u) => u.txid === outpoint.txidDisplayHex && u.outputIndex === outpoint.vout
 	);

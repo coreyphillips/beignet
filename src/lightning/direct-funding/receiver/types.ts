@@ -59,6 +59,16 @@ export const DF_NEGOTIATION_TIMEOUT_MS = 120_000;
 /** Time from the sign request to the payer's witness. */
 export const DF_WITNESS_TIMEOUT_MS = 120_000;
 
+/**
+ * How long admission keeps asking a chain source that cannot answer (issue
+ * #855). Well inside the payer's 120 s offer window, which re-sends the offer
+ * meanwhile.
+ */
+export const DF_CHAIN_WAIT_MS = 20_000;
+
+/** How often admission asks again inside that wait. */
+export const DF_CHAIN_RETRY_INTERVAL_MS = 1_000;
+
 /** How often expired sessions, reservations and attempt records are swept. */
 export const DF_RECEIVER_SWEEP_INTERVAL_MS = 30_000;
 
@@ -93,6 +103,8 @@ export interface IDfReceiverConfig {
 	outpointCooldownMs?: number;
 	negotiationTimeoutMs?: number;
 	witnessTimeoutMs?: number;
+	/** Default `DF_CHAIN_WAIT_MS`. */
+	chainWaitMs?: number;
 	sweepIntervalMs?: number;
 	spliceFeeratePerKw?: number;
 	/**
@@ -344,5 +356,10 @@ export enum DfOfferDropReason {
 	/** A witness frame no live session could open or claim. */
 	NO_SESSION = 'no_session',
 	/** An offer id already being admitted on another frame. */
-	ADMISSION_IN_PROGRESS = 'admission_in_progress'
+	ADMISSION_IN_PROGRESS = 'admission_in_progress',
+	/**
+	 * The chain source never answered inside the wait. Left unanswered rather
+	 * than declined, so the payer's re-send is judged afresh (issue #855).
+	 */
+	CHAIN_SOURCE_UNAVAILABLE = 'chain_source_unavailable'
 }

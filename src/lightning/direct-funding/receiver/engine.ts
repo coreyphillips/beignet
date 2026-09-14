@@ -41,6 +41,7 @@
 import { EventEmitter } from 'events';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { ISpliceWalletInput } from '../../channel/channel';
+import { ChainBackendUnavailableError } from '../../chain/chain-watcher';
 import { BeignetCustomSubtype } from '../../message/custom';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../../message/splice';
 import { zbase32Decode } from '../../crypto/message-signing';
@@ -84,6 +85,8 @@ import {
 	ownershipProblem
 } from './verify';
 import {
+	DF_CHAIN_RETRY_INTERVAL_MS,
+	DF_CHAIN_WAIT_MS,
 	DF_DEFAULT_SPLICE_FEERATE_PERKW,
 	DF_DEFAULT_UNPAIRED_SPLICE_DEPTH,
 	DF_LOG_OFFER_ACCEPTED,
@@ -283,6 +286,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			negotiationTimeoutMs:
 				config.negotiationTimeoutMs ?? DF_NEGOTIATION_TIMEOUT_MS,
 			witnessTimeoutMs: config.witnessTimeoutMs ?? DF_WITNESS_TIMEOUT_MS,
+			chainWaitMs: config.chainWaitMs ?? DF_CHAIN_WAIT_MS,
 			sweepIntervalMs: config.sweepIntervalMs ?? DF_RECEIVER_SWEEP_INTERVAL_MS,
 			spliceFeeratePerKw:
 				config.spliceFeeratePerKw ?? DF_DEFAULT_SPLICE_FEERATE_PERKW,
@@ -1083,12 +1087,28 @@ export class DirectFundingReceiver extends EventEmitter {
 
 		// 9. The offer names an outpoint; the transaction comes from OUR chain
 		// source, so everything below is chain truth rather than a payer claim.
+		//
+		// A source that could not answer has not said no (issue #855). Its
+		// lookups are asked again for a while, and an offer they never answer is
+		// left unanswered: the payer re-sends it, where a decline would send the
+		// payer to a plain payment.
 		const txidHex = offer.txid.toString('hex');
+		const chainDeadline = Date.now() + this.cfg.chainWaitMs;
+		const raw = await this.untilChainAnswers(chainDeadline, () =>
+			this.deps.chain.getTransaction(txidHex).then(
+				(bytes): Buffer | null => bytes,
+				(err): null | undefined =>
+					err instanceof ChainBackendUnavailableError ? undefined : null
+			)
+		);
+		if (raw === undefined) {
+			this.drop(DfOfferDropReason.CHAIN_SOURCE_UNAVAILABLE, frame);
+			return;
+		}
 		let prevTx: bitcoin.Transaction;
 		try {
-			prevTx = bitcoin.Transaction.fromBuffer(
-				await this.deps.chain.getTransaction(txidHex)
-			);
+			if (!raw) throw new Error('no such transaction');
+			prevTx = bitcoin.Transaction.fromBuffer(raw);
 		} catch {
 			decline('offered transaction not found on chain');
 			return;
@@ -1107,11 +1127,20 @@ export class DirectFundingReceiver extends EventEmitter {
 			return;
 		}
 		const script = Buffer.from(out.script);
-		const coin = await classifyOfferedCoin(this.deps.chain, {
-			txidDisplayHex: txidHex,
-			vout: offer.vout,
-			script
+		// An unanswered lookup leaves `confirmed` unknown, and an unpaired payer
+		// with an unknown coin is routed to a new channel instead of the splice.
+		const coin = await this.untilChainAnswers(chainDeadline, async () => {
+			const classified = await classifyOfferedCoin(this.deps.chain, {
+				txidDisplayHex: txidHex,
+				vout: offer.vout,
+				script
+			});
+			return classified.unanswered ? undefined : classified;
 		});
+		if (!coin) {
+			this.drop(DfOfferDropReason.CHAIN_SOURCE_UNAVAILABLE, frame);
+			return;
+		}
 		if (coin.spent) {
 			// Cheap, and without it a spent coin burns a capped slot until its
 			// session times out (defect D12).
@@ -2645,6 +2674,29 @@ export class DirectFundingReceiver extends EventEmitter {
 
 	private now(): number {
 		return this.deps.now ? this.deps.now() : Date.now();
+	}
+
+	/**
+	 * Run a chain lookup until it answers or the wall clock reaches `deadline`
+	 * (issue #855). `undefined` from `lookup` means no answer. The lookup always
+	 * runs once, and a stopped engine stops asking.
+	 */
+	private async untilChainAnswers<T>(
+		deadline: number,
+		lookup: () => Promise<T | undefined>
+	): Promise<T | undefined> {
+		for (;;) {
+			const answer = await lookup();
+			const left = deadline - Date.now();
+			if (answer !== undefined || left <= 0 || !this.started) return answer;
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(
+					resolve,
+					Math.min(DF_CHAIN_RETRY_INTERVAL_MS, left)
+				);
+				timer.unref?.();
+			});
+		}
 	}
 
 	private drop(reason: DfOfferDropReason, frame: IDfInboundFrame): void {

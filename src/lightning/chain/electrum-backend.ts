@@ -3,7 +3,7 @@
  * to implement the IChainBackend interface for Lightning chain monitoring.
  */
 
-import { IChainBackend } from './chain-watcher';
+import { ChainBackendUnavailableError, IChainBackend } from './chain-watcher';
 import { IFeeEstimator } from '../node/types';
 import { Electrum } from '../../electrum';
 
@@ -484,19 +484,33 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 	}
 
 	async getTransaction(txid: string): Promise<Buffer> {
-		const result = await this.withTimeout(
-			this.electrum.getTransactions({
-				txHashes: [{ tx_hash: txid }]
-			}),
-			`getTransaction(${txid.slice(0, 8)}...)`
-		);
+		let result: Awaited<ReturnType<Electrum['getTransactions']>>;
+		try {
+			result = await this.withTimeout(
+				this.electrum.getTransactions({
+					txHashes: [{ tx_hash: txid }]
+				}),
+				`getTransaction(${txid.slice(0, 8)}...)`
+			);
+		} catch (e) {
+			throw new ChainBackendUnavailableError(
+				e instanceof Error ? e.message : String(e)
+			);
+		}
 		if (result.isErr()) {
-			throw new Error(`Failed to get transaction ${txid}: ${result.error}`);
+			throw new ChainBackendUnavailableError(
+				`Failed to get transaction ${txid}: ${result.error}`
+			);
 		}
 
+		// The client drops a request that timed out or lost its socket and hands
+		// back no entry for it. A server that answered always leaves one, without
+		// hex when it has no such transaction.
 		const response = result.value;
 		if (!response.data || response.data.length === 0) {
-			throw new Error(`Transaction ${txid} not found`);
+			throw new ChainBackendUnavailableError(
+				`No answer for transaction ${txid}`
+			);
 		}
 
 		const txData = response.data[0];

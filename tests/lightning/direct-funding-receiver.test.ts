@@ -36,8 +36,12 @@ import {
 } from './helpers/df-receiver';
 import {
 	DF_DEFAULT_UNPAIRED_SPLICE_DEPTH,
-	IDfReceiverConfig
+	DF_LOG_OFFER_DROPPED,
+	DfOfferDropReason,
+	IDfReceiverConfig,
+	IDfReceiverDeps
 } from '../../src/lightning/direct-funding/receiver/types';
+import { ChainBackendUnavailableError } from '../../src/lightning/chain/chain-watcher';
 
 const ACK = BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK;
 const SIGN_REQUEST = BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST;
@@ -441,6 +445,104 @@ describe('Direct funding receiver: admission (issue #612)', () => {
 		expect(h.node.opens[0].params.contribution.inputs[0].confirmed).to.equal(
 			undefined
 		);
+	});
+});
+
+// Issue #855. A phone back from the background has lost its Electrum socket
+// and takes seconds to get it back; a lookup that failed for that is no
+// answer, and the offer waits for one rather than being decided on nothing.
+describe('Direct funding receiver: a chain source that cannot answer (issue #855)', () => {
+	async function until(condition: () => boolean): Promise<void> {
+		const end = Date.now() + 5_000;
+		while (!condition() && Date.now() < end) await sleep(20);
+	}
+
+	function captureDrops(h: IHarness): unknown[] {
+		const drops: unknown[] = [];
+		(h.node as IDfReceiverDeps).log = (action, data): void => {
+			if (action === DF_LOG_OFFER_DROPPED) drops.push(data.reason);
+		};
+		return drops;
+	}
+
+	it('serves the offer once the transaction lookup answers, without declining it first', async () => {
+		const h = harness();
+		const getTransaction = h.node.chain.getTransaction;
+		let calls = 0;
+		h.node.chain.getTransaction = async (txid): Promise<Buffer> => {
+			calls++;
+			if (calls < 3) {
+				throw new ChainBackendUnavailableError('Electrum not connected');
+			}
+			return getTransaction(txid);
+		};
+		await h.sendOffer();
+		expect(h.acks()).to.have.length(0);
+		await until(() => h.acks().length > 0);
+		expect(calls).to.equal(3);
+		expect(h.acks()).to.deep.equal([{ accepted: true }]);
+		expect(h.node.opens).to.have.length(1);
+	});
+
+	it("splices an unpaired payer's confirmed coin when the unspent lookup failed once", async () => {
+		const h = harness({
+			allowSplice: true,
+			allowUnpairedSplice: true,
+			negotiationTimeoutMs: 5_000
+		});
+		h.node.spliceChannel = crypto.randomBytes(32);
+		const listUnspent = h.node.chain.listUnspent;
+		let calls = 0;
+		h.node.chain.listUnspent = async (
+			scriptHash
+		): ReturnType<typeof listUnspent> => {
+			calls++;
+			if (calls === 1) throw new Error('Electrum not connected');
+			return listUnspent(scriptHash);
+		};
+		await h.sendOffer();
+		await until(() => h.node.splices.length + h.node.opens.length > 0);
+		expect(h.node.opens).to.have.length(0);
+		expect(h.node.splices).to.have.length(1);
+		expect(h.node.splices[0].inputs[0].confirmed).to.equal(true);
+	});
+
+	it('leaves the offer unanswered when the transaction lookup never answers, and serves the re-send', async () => {
+		const h = harness({ chainWaitMs: 150 });
+		const drops = captureDrops(h);
+		const getTransaction = h.node.chain.getTransaction;
+		h.node.chain.getTransaction = async (): Promise<Buffer> => {
+			throw new ChainBackendUnavailableError('Electrum not connected');
+		};
+		await h.sendOffer();
+		await sleep(300);
+		expect(h.acks()).to.have.length(0);
+		expect(h.node.opens).to.have.length(0);
+		expect(drops).to.deep.equal([DfOfferDropReason.CHAIN_SOURCE_UNAVAILABLE]);
+
+		h.node.chain.getTransaction = getTransaction;
+		await h.sendOffer();
+		expect(h.acks()).to.deep.equal([{ accepted: true }]);
+		expect(h.node.opens).to.have.length(1);
+	});
+
+	it('leaves the offer unanswered when the unspent lookup never answers', async () => {
+		const h = harness({
+			chainWaitMs: 150,
+			allowSplice: true,
+			allowUnpairedSplice: true
+		});
+		h.node.spliceChannel = crypto.randomBytes(32);
+		const drops = captureDrops(h);
+		h.node.chain.listUnspent = async (): Promise<never> => {
+			throw new Error('Electrum not connected');
+		};
+		await h.sendOffer();
+		await sleep(300);
+		expect(h.acks()).to.have.length(0);
+		expect(h.node.opens).to.have.length(0);
+		expect(h.node.splices).to.have.length(0);
+		expect(drops).to.deep.equal([DfOfferDropReason.CHAIN_SOURCE_UNAVAILABLE]);
 	});
 });
 
