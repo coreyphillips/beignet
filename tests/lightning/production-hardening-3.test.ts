@@ -11,6 +11,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
+import net from 'net';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import {
 	INodeConfig,
@@ -1269,6 +1270,34 @@ describe('Production Hardening 3: Integration', function () {
 			port: 1
 		});
 		pm.destroy();
+	});
+
+	it('a connectPeer timeoutMs replaces the default handshake bound', async () => {
+		const {
+			PeerManager
+		} = require('../../src/lightning/transport/peer-manager');
+		// Accepts the socket and never answers the Noise act one.
+		const silent = net.createServer(() => undefined);
+		await new Promise<void>((resolve) =>
+			silent.listen(0, '127.0.0.1', resolve)
+		);
+		const port = (silent.address() as net.AddressInfo).port;
+		const pm = new PeerManager({ localPrivateKey: crypto.randomBytes(32) });
+		const pubkey = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const started = Date.now();
+		try {
+			await pm.connectPeer(pubkey, '127.0.0.1', port, undefined, {
+				timeoutMs: 200
+			});
+			expect.fail('a silent peer should not complete the handshake');
+		} catch (err) {
+			expect((err as Error).message).to.include('Handshake timeout');
+		} finally {
+			pm.destroy();
+			silent.close();
+		}
+		// The default is 30 s.
+		expect(Date.now() - started).to.be.below(5_000);
 	});
 
 	it('ChannelManager nextChannelIndex getter/setter', () => {

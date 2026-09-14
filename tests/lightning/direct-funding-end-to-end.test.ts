@@ -91,6 +91,8 @@ interface IEndToEnd {
 	payerId: string;
 	/** Dials made by the payer, which must never include its own id. */
 	payerDials(): number;
+	/** The timeout each of the payer's dials was given. */
+	payerDialTimeouts(): Array<number | undefined>;
 	/** Bring the receiver's connection to the payer up, as a returning phone does. */
 	connectReceiver(): void;
 	fundingScript: Buffer;
@@ -115,12 +117,21 @@ async function setup(
 		 */
 		payerIntroduces?: boolean;
 		offerTimeoutMs?: number;
+		/**
+		 * The payer is not connected when the send starts, and its dial to the
+		 * receiver's address takes this long to land.
+		 */
+		payerDialMs?: number | 'never';
 	} = {}
 ): Promise<IEndToEnd> {
 	const net = new FakeDfNetwork();
 	const payerPeer: FakeDfPeer = net.add('df-e2e-payer');
 	const receiverPeer: FakeDfPeer = net.add('df-e2e-receiver');
-	if (!opts.payerIntroduces) net.connect(payerPeer, receiverPeer);
+	if (opts.payerDialMs !== undefined) {
+		payerPeer.dialDelayMs = opts.payerDialMs;
+	} else if (!opts.payerIntroduces) {
+		net.connect(payerPeer, receiverPeer);
+	}
 
 	const node = new SigningDfNode(receiverStorage(), receiverPeer.privkey);
 	const record = node.mintRequest(
@@ -231,6 +242,7 @@ async function setup(
 		senderStorage,
 		payerId: payerPeer.id,
 		payerDials: (): number => payerPeer.dialAttempts,
+		payerDialTimeouts: (): Array<number | undefined> => payerPeer.dialTimeouts,
 		connectReceiver: (): void => net.connect(receiverPeer, payerPeer),
 		fundingScript: createFundingScript(pubkeys.local, pubkeys.remote)
 			.p2wshOutput,
@@ -650,6 +662,88 @@ describe('Direct funding end to end: payer against receiver', () => {
 		} finally {
 			e2e.stop();
 		}
+	});
+
+	// Issue #853: dial time used to sit in front of the offer window, and the
+	// node bounded each dial at its own 30 s handshake default. Scaled down here:
+	// the window stands in for 120 s and the dials for 45 s and forever.
+	describe('a stranger payer that has to dial', () => {
+		async function sendTimed(
+			e2e: IEndToEnd,
+			whileRunning: () => Promise<void> = async () => undefined
+		): Promise<{ elapsed: number; error: unknown; status?: string }> {
+			const started = Date.now();
+			const send = e2e.sender.send(e2e.request, {
+				amountSat: AMOUNT,
+				maxTotalFeeSat: FEE_CEILING
+			});
+			send.catch(() => undefined);
+			await whileRunning();
+			try {
+				const result = await send;
+				return {
+					elapsed: Date.now() - started,
+					error: null,
+					status: result.status
+				};
+			} catch (err) {
+				return { elapsed: Date.now() - started, error: err };
+			}
+		}
+
+		async function waitFor(condition: () => boolean): Promise<void> {
+			for (let i = 0; i < 200 && !condition(); i++) {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			expect(condition(), 'the condition never held').to.equal(true);
+		}
+
+		it('pays over a slow dial, handing the dial the whole offer window', async () => {
+			const e2e = await setup({ payerDialMs: 300, offerTimeoutMs: 1_500 });
+			try {
+				const { elapsed, error, status } = await sendTimed(e2e, async () => {
+					await waitFor(() => e2e.node.opens.length === 1);
+					e2e.node.completeNegotiation(e2e.coin, e2e.expectedOffer(), {
+						fundingScript: e2e.fundingScript
+					});
+				});
+				expect(error).to.equal(null);
+				expect(status).to.equal('SIGNED_PENDING');
+				expect(elapsed).to.be.below(1_500);
+				expect(e2e.payerDials()).to.equal(1);
+				expect(e2e.payerDialTimeouts()[0]).to.be.within(1_300, 1_500);
+			} finally {
+				e2e.stop();
+			}
+		});
+
+		it('spends the dial from the offer window rather than adding it on', async () => {
+			const e2e = await setup({ payerDialMs: 400, offerTimeoutMs: 600 });
+			try {
+				const { elapsed, error } = await sendTimed(e2e);
+				expect((error as { code?: string })?.code).to.equal('EXCHANGE_TIMEOUT');
+				expect(e2e.node.opens, 'the offer never arrived').to.have.length(1);
+				expect(elapsed).to.be.within(550, 900);
+				expect(e2e.wallet.frozen.size).to.equal(0);
+			} finally {
+				e2e.stop();
+			}
+		});
+
+		it('refuses UNREACHABLE when the window closes on a dial that never lands', async () => {
+			const e2e = await setup({ payerDialMs: 'never', offerTimeoutMs: 200 });
+			try {
+				const { elapsed, error } = await sendTimed(e2e);
+				expect((error as { code?: string })?.code).to.equal('UNREACHABLE');
+				expect(elapsed).to.be.within(180, 500);
+				expect(e2e.payerDials()).to.equal(1);
+				expect(e2e.node.opens).to.have.length(0);
+				expect(e2e.wallet.frozen.size).to.equal(0);
+				expect(e2e.payments.list()[0].status).to.equal('ABORTED');
+			} finally {
+				e2e.stop();
+			}
+		});
 	});
 
 	it('the LSP the receiver negotiates with is the one it was configured for', async () => {

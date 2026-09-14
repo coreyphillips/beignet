@@ -16,7 +16,10 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import {
+	DF_LOG_LANE_SKIPPED,
 	DfLaneSkipReason,
+	DfOnionLaneFactory,
+	DfRelayLaneFactory,
 	DfTransportRegistry,
 	IDfInboundFrame,
 	IDfLaneFactory,
@@ -33,7 +36,12 @@ import {
 	IDfRelayTransport
 } from '../../src/lightning/direct-funding/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
-import { recordingLog } from './helpers/df-transport';
+import { OnionMessageManager } from '../../src/lightning/onion-message/manager';
+import {
+	FakeDfNetwork,
+	FakeDfPeer,
+	recordingLog
+} from './helpers/df-transport';
 
 const NODE_A = getPublicKey(crypto.createHash('sha256').update('a').digest());
 const NODE_B = getPublicKey(crypto.createHash('sha256').update('b').digest());
@@ -836,6 +844,148 @@ describe('Direct-funding transport registry', () => {
 
 			const used = await registry.run([onion()], CTX, async (l) => l.type);
 			expect(used).to.equal(DfTransportType.LSP_RELAY);
+		});
+	});
+
+	// Issue #853: the relay synthesized from an onion descriptor names the same
+	// introduction node and address, so a failed onion dial used to be repeated
+	// in full, each one up to the peer's 30 s handshake bound.
+	describe('an introduction node address that failed to dial', () => {
+		function stranger(log?: (a: string, d: Record<string, unknown>) => void): {
+			net: FakeDfNetwork;
+			payer: FakeDfPeer;
+			intro: FakeDfPeer;
+			registry: DfTransportRegistry;
+			ctx: IDfOpenContext;
+			descriptor: IDfOnionTransport;
+			destroy: () => void;
+		} {
+			const net = new FakeDfNetwork();
+			const payer = net.add('registry-payer');
+			const intro = net.add('registry-intro');
+			const receiver = net.add('registry-receiver');
+			const manager = new OnionMessageManager(payer.privkey);
+			const onionLane = new DfOnionLaneFactory({
+				manager,
+				peers: payer,
+				nodeId: () => payer.pubkey,
+				resolvePathSecret: () => null
+			});
+			const relayLane = new DfRelayLaneFactory(payer);
+			const registry = new DfTransportRegistry(log, {
+				isPeerConnected: (hex) => payer.isPeerConnected(hex),
+				nodeId: () => payer.pubkey
+			});
+			registry.register({
+				type: DfTransportType.ONION_MESSAGE,
+				enabled: true,
+				load: () => onionLane
+			});
+			registry.register({
+				type: DfTransportType.LSP_RELAY,
+				enabled: true,
+				load: () => relayLane
+			});
+			return {
+				net,
+				payer,
+				intro,
+				registry,
+				ctx: {
+					requestId: Buffer.alloc(16, 9),
+					receiverNodeId: receiver.pubkey
+				},
+				descriptor: {
+					type: DfTransportType.ONION_MESSAGE,
+					host: 'primary.onion',
+					port: 9103,
+					introNodeId: intro.pubkey,
+					pathKey: receiver.pubkey,
+					hops: [
+						{ blindedNodeId: receiver.pubkey, encryptedData: Buffer.alloc(4) }
+					]
+				},
+				destroy: (): void => {
+					onionLane.destroy();
+					relayLane.destroy();
+					manager.destroy();
+				}
+			};
+		}
+
+		it('never dials it again for the synthesized relay', async () => {
+			const s = stranger();
+			try {
+				s.net.undialable.add(s.intro.id);
+				let exchanged = false;
+				let error: unknown = null;
+				try {
+					await s.registry.run([s.descriptor], s.ctx, async () => {
+						exchanged = true;
+					});
+				} catch (err) {
+					error = err;
+				}
+				expect((error as DirectFundingError).code).to.equal(
+					DirectFundingErrorCode.UNREACHABLE
+				);
+				expect(exchanged).to.equal(false);
+				expect(s.payer.dialAttempts).to.equal(1);
+			} finally {
+				s.destroy();
+			}
+		});
+
+		it('still lets the synthesized relay use a connection that exists by then', async () => {
+			const s = stranger((action, data) => {
+				// The onion lane gave up on its dial; the connection lands before the
+				// relay is tried, as an inbound connection or another dial would.
+				if (
+					action === DF_LOG_LANE_SKIPPED &&
+					data.transportType === DfTransportType.ONION_MESSAGE
+				) {
+					s.net.connect(s.payer, s.intro);
+				}
+			});
+			try {
+				s.net.undialable.add(s.intro.id);
+				const used = await s.registry.run(
+					[s.descriptor],
+					s.ctx,
+					async (l) => l.type
+				);
+				expect(used).to.equal(DfTransportType.LSP_RELAY);
+				expect(s.payer.dialAttempts).to.equal(1);
+			} finally {
+				s.destroy();
+			}
+		});
+
+		it('hands the dial what is left of the offer window, and stops waiting when it closes', async () => {
+			const s = stranger();
+			try {
+				s.payer.dialDelayMs = 'never';
+				const started = Date.now();
+				let error: unknown = null;
+				try {
+					await s.registry.run(
+						[s.descriptor],
+						{ ...s.ctx, deadline: started + 150 },
+						async () => undefined
+					);
+				} catch (err) {
+					error = err;
+				}
+				const elapsed = Date.now() - started;
+				expect((error as DirectFundingError).code).to.equal(
+					DirectFundingErrorCode.UNREACHABLE
+				);
+				expect(elapsed).to.be.within(140, 400);
+				expect(s.payer.dialAttempts).to.equal(1);
+				expect(s.payer.dialTimeouts[0]).to.be.within(100, 150);
+			} finally {
+				s.destroy();
+			}
 		});
 	});
 });

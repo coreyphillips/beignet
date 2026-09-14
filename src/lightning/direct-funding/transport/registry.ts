@@ -130,6 +130,7 @@ export class DfTransportRegistry {
 		const refusals: string[] = [];
 		const self = this.peerView.nodeId?.();
 		const awaiting = new Set<DfTransportDescriptor>();
+		const runCtx: IDfOpenContext = { ...ctx, failedDials: new Set<string>() };
 		for (const descriptor of this.withExistingConnection(
 			withAwaitedReceiver(withSynthesizedRelay(transports), self, awaiting),
 			ctx
@@ -157,14 +158,23 @@ export class DfTransportRegistry {
 			}
 			const factory = await this.resolve(registration);
 			if (!factory) continue;
+			// Establishment spends the offer window. A lane opened after it closed
+			// would put an offer on the wire only to time it out at once.
+			if (ctx.deadline !== undefined && Date.now() >= ctx.deadline) {
+				throw new DirectFundingError(
+					DirectFundingErrorCode.UNREACHABLE,
+					'the offer window closed before any transport carried the offer' +
+						(refusals.length > 0 ? ` (${refusals.join('; ')})` : '')
+				);
+			}
 
 			let lane: IDfTransport | null = null;
 			try {
 				lane = await factory.open(
 					descriptor,
 					awaiting.has(descriptor)
-						? { ...ctx, awaitReceiverConnection: true }
-						: ctx
+						? { ...runCtx, awaitReceiverConnection: true }
+						: runCtx
 				);
 			} catch (err) {
 				// A throw out of open() and a null return mean the same thing:

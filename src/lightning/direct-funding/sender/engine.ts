@@ -1033,14 +1033,18 @@ export class DirectFundingSender {
 	// ─────────────── The exchange ───────────────
 
 	private async run(attempt: IDfAttempt): Promise<IDfSendResult> {
+		// One offer window for the whole send. Dialing a lane spends from it, so
+		// slow establishment cannot stretch the time a payer waits past it.
+		const deadline = Date.now() + this.cfg.offerTimeoutMs;
 		try {
 			return await this.deps.registry.run(
 				attempt.env.transports,
 				{
 					requestId: attempt.env.requestId,
-					receiverNodeId: attempt.env.receiverNodeId
+					receiverNodeId: attempt.env.receiverNodeId,
+					deadline
 				},
-				(lane) => this.exchange(attempt, lane)
+				(lane) => this.exchange(attempt, lane, deadline)
 			);
 		} catch (err) {
 			if (attempt.witnessEmitted || attempt.witnessMayBeOut) {
@@ -1102,7 +1106,8 @@ export class DirectFundingSender {
 	 */
 	private exchange(
 		attempt: IDfAttempt,
-		lane: IDfTransport
+		lane: IDfTransport,
+		deadline: number
 	): Promise<IDfSendResult> {
 		const keys = senderLaneKeysForEnvelope(attempt.env);
 		const offerIdHex = attempt.offer.offerId.toString('hex');
@@ -1366,7 +1371,7 @@ export class DirectFundingSender {
 			// inside that send, so nothing below may assume it is still open.
 			if (settled) return;
 
-			at(this.cfg.offerTimeoutMs, () =>
+			at(Math.max(0, deadline - Date.now()), () =>
 				fail(
 					new DirectFundingError(
 						DirectFundingErrorCode.EXCHANGE_TIMEOUT,

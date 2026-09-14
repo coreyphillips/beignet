@@ -61,6 +61,7 @@ import {
 	DfDropReason,
 	DfFrameHandler,
 	DfTransportLog,
+	establishPeer,
 	IDfInboundFrame,
 	IDfLaneFactory,
 	IDfLaneSender,
@@ -182,12 +183,16 @@ export class DfOnionLaneFactory implements IDfLaneFactory {
 		// skips such a descriptor and waits on the direct connection instead.
 		if (onion.introNodeId.equals(this.deps.nodeId())) return null;
 		const introHex = onion.introNodeId.toString('hex');
-		if (!this.deps.peers.isPeerConnected(introHex)) {
-			try {
-				await this.deps.peers.connectPeer(introHex, onion.host, onion.port);
-			} catch {
-				if (!this.deps.peers.isPeerConnected(introHex)) return null;
-			}
+		if (
+			!(await establishPeer(
+				this.deps.peers,
+				ctx,
+				introHex,
+				onion.host,
+				onion.port
+			))
+		) {
+			return null;
 		}
 		// Minted per lane, never derived from anything the receiver holds: this
 		// is the id the RECEIVER's answers come back on, and it is ours alone.

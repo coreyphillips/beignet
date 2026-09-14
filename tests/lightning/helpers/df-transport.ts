@@ -50,6 +50,10 @@ export class FakeDfPeer implements IDfPeerMessaging {
 	readonly escapedErrors: unknown[] = [];
 	readonly sent: Array<{ to: string; subtype: number; payload: Buffer }> = [];
 	dialAttempts = 0;
+	/** The `timeoutMs` each dial was given, in order. */
+	readonly dialTimeouts: Array<number | undefined> = [];
+	/** How long a dial takes to land; 'never' leaves it pending for good. */
+	dialDelayMs: number | 'never' = 0;
 	readonly pubkey: Buffer;
 	readonly id: string;
 
@@ -70,8 +74,20 @@ export class FakeDfPeer implements IDfPeerMessaging {
 		return this.connections.has(peerPubkeyHex);
 	}
 
-	async connectPeer(peerPubkeyHex: string): Promise<void> {
+	async connectPeer(
+		peerPubkeyHex: string,
+		_host?: string,
+		_port?: number,
+		timeoutMs?: number
+	): Promise<void> {
 		this.dialAttempts++;
+		this.dialTimeouts.push(timeoutMs);
+		if (this.dialDelayMs === 'never') {
+			await new Promise<never>(() => undefined);
+		} else if (this.dialDelayMs > 0) {
+			const delayMs = this.dialDelayMs;
+			await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+		}
 		const target = this.net.peers.get(peerPubkeyHex);
 		if (!target || this.net.undialable.has(peerPubkeyHex)) {
 			throw new Error(`Failed to connect to peer ${peerPubkeyHex}`);
