@@ -72,6 +72,7 @@ import {
 } from '../channel/types';
 import {
 	PeerManager,
+	IPeerDialOptions,
 	IPeerInfo,
 	PeerDialCancelledError
 } from '../transport/peer-manager';
@@ -7811,12 +7812,16 @@ export class LightningNode extends EventEmitter {
 	 * behavior); pass {type: 'ws'} to dial over WebSocket at ws://host:port,
 	 * or {type: 'ws', url} for an explicit ws:// or wss:// URL (host/port may
 	 * then be omitted — they are derived from the URL).
+	 *
+	 * `options.timeoutMs` bounds a dial to the given address (see
+	 * IPeerDialOptions). A dial resolved by node id keeps the defaults.
 	 */
 	async connectPeer(
 		pubkey: string,
 		host?: string,
 		port?: number,
-		transport?: IPeerTransportOptions
+		transport?: IPeerTransportOptions,
+		options: IPeerDialOptions = {}
 	): Promise<void> {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
@@ -7857,7 +7862,7 @@ export class LightningNode extends EventEmitter {
 		if (hostErr) throw new InvalidPeerConnectError(hostErr);
 		const portErr = validatePort(port);
 		if (portErr) throw new InvalidPeerConnectError(portErr);
-		await this.peerManager.connectPeer(pubkey, host, port, transport);
+		await this.peerManager.connectPeer(pubkey, host, port, transport, options);
 	}
 
 	/**
@@ -23315,14 +23320,20 @@ export class LightningNode extends EventEmitter {
 					},
 					isPeerConnected: (peer): boolean =>
 						this.listPeers().some((p) => p.pubkey === peer),
-					connectPeer: async (peer, host, port): Promise<void> => {
+					connectPeer: async (peer, host, port, timeoutMs): Promise<void> => {
 						// Every lane dials through here, so this is the one place a
 						// descriptor naming this node cannot turn into a connection to
 						// itself (issue #806).
 						if (peer === this.getNodeId()) {
 							throw new Error('refusing to dial this node itself');
 						}
-						await this.connectPeer(peer, host, port);
+						await this.connectPeer(
+							peer,
+							host,
+							port,
+							undefined,
+							timeoutMs !== undefined ? { timeoutMs } : {}
+						);
 					},
 					onPeerConnect: (cb): (() => void) => {
 						const handler = (pubkey: string): void => cb(pubkey);

@@ -51,6 +51,7 @@ import {
 	DfDropReason,
 	DfFrameHandler,
 	DfTransportLog,
+	establishPeer,
 	IDfCustomMessage,
 	IDfInboundFrame,
 	IDfLaneFactory,
@@ -107,12 +108,10 @@ export class DfRelayLaneFactory implements IDfLaneFactory {
 		// A relay that is also the counterparty is not a relay; it would stamp a
 		// frame it sent to itself.
 		if (relayHex === targetHex) return null;
-		if (!this.peers.isPeerConnected(relayHex)) {
-			try {
-				await this.peers.connectPeer(relayHex, relay.host, relay.port);
-			} catch {
-				if (!this.peers.isPeerConnected(relayHex)) return null;
-			}
+		if (
+			!(await establishPeer(this.peers, ctx, relayHex, relay.host, relay.port))
+		) {
+			return null;
 		}
 		this.ensureSubscribed();
 		return new DfRelayLane(

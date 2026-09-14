@@ -34,6 +34,7 @@ import {
 	DfDropReason,
 	DfFrameHandler,
 	DfTransportLog,
+	establishPeer,
 	IDfCustomMessage,
 	IDfInboundFrame,
 	IDfLaneFactory,
@@ -73,13 +74,11 @@ export class DfDirectPeerLaneFactory implements IDfLaneFactory {
 		const { host, port } = descriptor as IDfDirectPeerTransport;
 		const peerHex = ctx.receiverNodeId.toString('hex');
 		const awaiting = ctx.awaitReceiverConnection === true;
-		if (!awaiting && !this.peers.isPeerConnected(peerHex)) {
-			try {
-				await this.peers.connectPeer(peerHex, host, port);
-			} catch {
-				// A concurrent dial may have landed while ours failed.
-				if (!this.peers.isPeerConnected(peerHex)) return null;
-			}
+		if (
+			!awaiting &&
+			!(await establishPeer(this.peers, ctx, peerHex, host, port))
+		) {
+			return null;
 		}
 		this.ensureSubscribed();
 		return new DfDirectPeerLane(

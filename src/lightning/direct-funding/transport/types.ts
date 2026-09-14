@@ -260,7 +260,13 @@ export interface IDfPeerMessaging {
 	/** Subscribe to inbound custom messages; the return value unsubscribes. */
 	onCustomMessage(cb: (msg: IDfCustomMessage) => void): () => void;
 	isPeerConnected(peerPubkeyHex: string): boolean;
-	connectPeer(peerPubkeyHex: string, host: string, port: number): Promise<void>;
+	/** `timeoutMs`, when given, replaces the dial's default establishment bounds. */
+	connectPeer(
+		peerPubkeyHex: string,
+		host: string,
+		port: number,
+		timeoutMs?: number
+	): Promise<void>;
 	/**
 	 * Subscribe to peers connecting; the return value unsubscribes. Optional:
 	 * without it a lane waiting for its receiver learns of the connection only
@@ -284,6 +290,66 @@ export interface IDfOpenContext {
 	 * no address to dial): it holds the offer until the receiver connects.
 	 */
 	awaitReceiverConnection?: boolean;
+	/**
+	 * Epoch ms at which the offer window closes. Establishing a lane spends
+	 * from the same window, so a dial is bounded by what is left of it.
+	 */
+	deadline?: number;
+	/**
+	 * Addresses (`nodeId|host|port`) whose dial already failed in this run,
+	 * kept by the registry. The synthesized relay names the onion introduction
+	 * node's address, and dialing it a second time only spends the window again.
+	 */
+	failedDials?: Set<string>;
+}
+
+/**
+ * Make sure the payer holds a connection to `peerHex`, dialing `host:port`
+ * when it does not. Resolves false when there is no connection to use: the
+ * address already failed in this run, the window is spent, or the dial failed
+ * or outlived the window. A dial still running at the deadline is left to
+ * finish on its own; only this lane stops waiting for it.
+ */
+export async function establishPeer(
+	peers: IDfPeerMessaging,
+	ctx: IDfOpenContext,
+	peerHex: string,
+	host: string,
+	port: number
+): Promise<boolean> {
+	if (peers.isPeerConnected(peerHex)) return true;
+	const address = `${peerHex}|${host}|${port}`;
+	if (ctx.failedDials?.has(address)) return false;
+	const remainingMs =
+		ctx.deadline === undefined ? undefined : ctx.deadline - Date.now();
+	if (remainingMs !== undefined && remainingMs <= 0) return false;
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		const dial = peers.connectPeer(peerHex, host, port, remainingMs);
+		if (remainingMs === undefined) {
+			await dial;
+		} else {
+			dial.catch(() => undefined);
+			await Promise.race([
+				dial,
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new Error('offer window closed while dialing')),
+						remainingMs
+					);
+					timer.unref?.();
+				})
+			]);
+		}
+		return true;
+	} catch {
+		// A concurrent dial may have landed while ours failed.
+		if (peers.isPeerConnected(peerHex)) return true;
+		ctx.failedDials?.add(address);
+		return false;
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
 }
 
 /**

@@ -172,6 +172,17 @@ export interface IPeerInfo {
 	transport?: 'tcp' | 'ws';
 }
 
+export interface IPeerDialOptions {
+	/**
+	 * Replaces the default bound on each establishment step (socket connect,
+	 * SOCKS5 negotiation, Noise handshake). A caller with a deadline of its own
+	 * passes what is left of it, so a slow Tor dial is not cut off at the
+	 * handshake default. The steps run in sequence, so the whole dial can take
+	 * longer than this; a caller that needs a hard bound races the dial.
+	 */
+	timeoutMs?: number;
+}
+
 type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
 
 /**
@@ -286,16 +297,18 @@ export class PeerManager extends EventEmitter {
 	 * @param transport - Optional transport selection; omit for TCP (default,
 	 *                    unchanged behavior). {type: 'ws', url?} dials over
 	 *                    WebSocket (url defaults to ws://host:port).
+	 * @param options - Optional dial bounds; see IPeerDialOptions.
 	 */
 	async connectPeer(
 		pubkey: string,
 		host: string,
 		port: number,
-		transport?: IPeerTransportOptions
+		transport?: IPeerTransportOptions,
+		options: IPeerDialOptions = {}
 	): Promise<void> {
 		const cancelGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 		try {
-			await this.dialPeer(pubkey, host, port, transport);
+			await this.dialPeer(pubkey, host, port, transport, options.timeoutMs);
 		} catch (err) {
 			// An explicit disconnectPeer() during the dial (a peer:error
 			// observer's cleanup, an operator decision) already cancelled
@@ -323,20 +336,41 @@ export class PeerManager extends EventEmitter {
 	 * start: the node's own start-up reconnect and the app's connect both
 	 * dialled the same primary within a second of each other.
 	 * Dials to different addresses still overlap; their rollback rules are
-	 * unchanged.
+	 * unchanged. The dial a caller joins keeps its own limits, which can be
+	 * shorter than a joining caller's `timeoutMs`. When it fails with some of
+	 * that time left and no disconnectPeer in between, the caller dials again
+	 * under what remains.
 	 */
 	private dialPeer(
 		pubkey: string,
 		host: string,
 		port: number,
-		transport?: IPeerTransportOptions
+		transport?: IPeerTransportOptions,
+		timeoutMs?: number
 	): Promise<void> {
 		const key = `${pubkey}|${host}|${port}|${
 			transport ? JSON.stringify(transport) : ''
 		}`;
 		const joined = this.inflightDials.get(key);
-		if (joined) return joined;
-		const attempt = this.dialPeerOnce(pubkey, host, port, transport);
+		if (joined) {
+			if (timeoutMs === undefined) return joined;
+			const deadline = Date.now() + timeoutMs;
+			const generation = this.cancelGenerations.get(pubkey) ?? 0;
+			return joined.catch((err) => {
+				const remainingMs = deadline - Date.now();
+				if (
+					remainingMs <= 0 ||
+					(this.cancelGenerations.get(pubkey) ?? 0) !== generation
+				) {
+					throw err;
+				}
+				// The failed dial's own cleanup may not have run yet.
+				if (this.inflightDials.get(key) === joined)
+					this.inflightDials.delete(key);
+				return this.dialPeer(pubkey, host, port, transport, remainingMs);
+			});
+		}
+		const attempt = this.dialPeerOnce(pubkey, host, port, transport, timeoutMs);
 		this.inflightDials.set(key, attempt);
 		void attempt
 			.catch(() => undefined)
@@ -356,7 +390,8 @@ export class PeerManager extends EventEmitter {
 		pubkey: string,
 		host: string,
 		port: number,
-		transport?: IPeerTransportOptions
+		transport?: IPeerTransportOptions,
+		timeoutMs?: number
 	): Promise<void> {
 		const dialGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 		if (this.connectionsDisabled()) {
@@ -408,7 +443,9 @@ export class PeerManager extends EventEmitter {
 				: isPrivateOrLoopbackHost(host)
 				? undefined
 				: this.socks5Proxy;
-			createSocket = proxy ? this.buildSocks5Factory(proxy) : undefined;
+			createSocket = proxy
+				? this.buildSocks5Factory(proxy, timeoutMs)
+				: undefined;
 		}
 
 		const peer = new Peer({
@@ -419,6 +456,9 @@ export class PeerManager extends EventEmitter {
 			localFeatures: this.localFeatures,
 			networks: this.networks,
 			createSocket,
+			...(timeoutMs !== undefined
+				? { connectTimeout: timeoutMs, handshakeTimeout: timeoutMs }
+				: {}),
 			// Held until bring-up completes: the post-handshake drain must
 			// not race registration or the peer:connect handlers (a queued
 			// channel_reestablish processed before our own reconnect hook
@@ -1522,11 +1562,14 @@ export class PeerManager extends EventEmitter {
 		});
 	}
 
-	private buildSocks5Factory(proxy: {
-		host: string;
-		port: number;
-	}): (host: string, port: number) => Promise<net.Socket> {
-		return socks5SocketFactory(proxy, this.socks5TimeoutMs);
+	private buildSocks5Factory(
+		proxy: {
+			host: string;
+			port: number;
+		},
+		timeoutMs = this.socks5TimeoutMs
+	): (host: string, port: number) => Promise<net.Socket> {
+		return socks5SocketFactory(proxy, timeoutMs);
 	}
 
 	private scheduleReconnect(pubkey: string): void {
