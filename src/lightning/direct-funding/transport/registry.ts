@@ -22,6 +22,7 @@ import {
 	DfTransportType,
 	DirectFundingError,
 	DirectFundingErrorCode,
+	IDfDirectPeerTransport,
 	IDfOnionTransport,
 	IDfRelayTransport
 } from '../types';
@@ -33,7 +34,8 @@ import {
 	IDfLaneFactory,
 	IDfLaneRegistration,
 	IDfOpenContext,
-	IDfTransport
+	IDfTransport,
+	IDfWarmResult
 } from './types';
 
 /** A registration plus whatever its loader has produced so far. */
@@ -58,6 +60,16 @@ export interface IDfRegistryPeerView {
 	isPeerConnected?(peerPubkeyHex: string): boolean;
 	/** This node's own id, to recognise a relay descriptor naming itself. */
 	nodeId?(): Buffer;
+	/**
+	 * Dial a peer without making it an auto-reconnect target. Without it `warm`
+	 * starts nothing.
+	 */
+	connectPeer?(
+		peerPubkeyHex: string,
+		host: string,
+		port: number,
+		timeoutMs?: number
+	): Promise<void>;
 }
 
 export class DfTransportRegistry {
@@ -133,7 +145,7 @@ export class DfTransportRegistry {
 		const runCtx: IDfOpenContext = { ...ctx, failedDials: new Set<string>() };
 		for (const descriptor of this.withExistingConnection(
 			withAwaitedReceiver(withSynthesizedRelay(transports), self, awaiting),
-			ctx
+			ctx.receiverNodeId
 		)) {
 			// A relay or onion descriptor naming the payer's own node is the
 			// ordinary case for a home node paying its own lightning-first wallets
@@ -213,6 +225,55 @@ export class DfTransportRegistry {
 		);
 	}
 
+	/**
+	 * Start the connection the first lane `run` would open for these
+	 * descriptors, and return without waiting for it. Opens no lane and sends
+	 * nothing. A send made while the dial is running asks the peer layer for
+	 * the same address and joins it there, so dialing early costs it nothing.
+	 *
+	 * The walk skips what `run` skips before opening anything. A lane that
+	 * later refuses to open is not foreseen, so this can warm a connection the
+	 * send ends up not using.
+	 */
+	warm(
+		transports: readonly DfTransportDescriptor[],
+		receiverNodeId: Buffer,
+		timeoutMs?: number
+	): IDfWarmResult {
+		const self = this.peerView.nodeId?.();
+		const awaiting = new Set<DfTransportDescriptor>();
+		const receiverHex = receiverNodeId.toString('hex');
+		for (const descriptor of this.withExistingConnection(
+			withAwaitedReceiver(withSynthesizedRelay(transports), self, awaiting),
+			receiverNodeId
+		)) {
+			if (self && namesSelf(descriptor, self)) continue;
+			const registration = this.lanes.get(descriptor.type);
+			if (!registration?.enabled || registration.unavailable) continue;
+			if (awaiting.has(descriptor)) {
+				return { connection: 'awaiting_receiver', peerNodeId: receiverHex };
+			}
+			const target = dialTarget(descriptor, receiverHex);
+			if (!target) return { connection: 'none' };
+			if (this.peerView.isPeerConnected?.(target.peer)) {
+				return { connection: 'connected', peerNodeId: target.peer };
+			}
+			const connectPeer = this.peerView.connectPeer;
+			if (!connectPeer) return { connection: 'none' };
+			// Nobody awaits this dial. A failure is the send's to meet, and it dials
+			// again on its own.
+			try {
+				connectPeer(target.peer, target.host, target.port, timeoutMs).catch(
+					() => undefined
+				);
+			} catch {
+				return { connection: 'none' };
+			}
+			return { connection: 'connecting', peerNodeId: target.peer };
+		}
+		return { connection: 'none' };
+	}
+
 	// ─────────────── Internals ───────────────
 
 	/** Load a lane at most once, and at most once more after a failure never. */
@@ -249,7 +310,7 @@ export class DfTransportRegistry {
 	 */
 	private withExistingConnection(
 		ordered: DfTransportDescriptor[],
-		ctx: IDfOpenContext
+		receiverNodeId: Buffer
 	): DfTransportDescriptor[] {
 		if (ordered.some((t) => t.type === DfTransportType.DIRECT_PEER)) {
 			return ordered;
@@ -257,7 +318,7 @@ export class DfTransportRegistry {
 		const direct = this.lanes.get(DfTransportType.DIRECT_PEER);
 		if (!direct?.enabled) return ordered;
 		const connected = this.peerView.isPeerConnected?.(
-			ctx.receiverNodeId.toString('hex')
+			receiverNodeId.toString('hex')
 		);
 		if (!connected) return ordered;
 		return [
@@ -286,6 +347,37 @@ function errorText(err: unknown): string {
 /** The enum's name for a transport type, or its number for one it lacks. */
 function laneName(type: number): string {
 	return DfTransportType[type] ?? String(type);
+}
+
+/** The node and address a lane for this descriptor dials; null for a type it cannot name. */
+function dialTarget(
+	descriptor: DfTransportDescriptor,
+	receiverHex: string
+): { peer: string; host: string; port: number } | null {
+	switch (descriptor.type) {
+		case DfTransportType.DIRECT_PEER: {
+			const { host, port } = descriptor as IDfDirectPeerTransport;
+			return { peer: receiverHex, host, port };
+		}
+		case DfTransportType.ONION_MESSAGE: {
+			const onion = descriptor as IDfOnionTransport;
+			return {
+				peer: onion.introNodeId.toString('hex'),
+				host: onion.host,
+				port: onion.port
+			};
+		}
+		case DfTransportType.LSP_RELAY: {
+			const relay = descriptor as IDfRelayTransport;
+			return {
+				peer: relay.relayNodeId.toString('hex'),
+				host: relay.host,
+				port: relay.port
+			};
+		}
+		default:
+			return null;
+	}
 }
 
 /**

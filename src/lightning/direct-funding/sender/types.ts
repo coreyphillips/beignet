@@ -15,7 +15,7 @@
 
 import type * as bitcoin from 'bitcoinjs-lib';
 import type { DfTransportRegistry } from '../transport/registry';
-import type { DfTransportLog } from '../transport/types';
+import type { DfTransportLog, DfWarmConnection } from '../transport/types';
 import type { DirectFundingErrorCode } from '../types';
 import type { DirectFundingPaymentStore } from './records';
 
@@ -223,6 +223,19 @@ export interface IDfSenderDeps {
 
 // ─────────────── Result ───────────────
 
+/** What `prepare` read off a request, and the connection a send of it would use. */
+export interface IDfPrepareResult {
+	requestId: string;
+	receiverNodeId: string;
+	/** Null when the request leaves the amount to the payer. */
+	amountSat: number | null;
+	/** Milliseconds since epoch. */
+	expiresAt: number;
+	connection: DfWarmConnection;
+	/** The node that connection is to, hex. Absent when there is none. */
+	peerNodeId?: string;
+}
+
 export interface IDfSendResult {
 	offerId: string;
 	/** The coin we offered, display byte order. */
@@ -376,6 +389,8 @@ export interface IDfPaymentRecord {
 
 // ─────────────── Logging ───────────────
 
+/** A request read ahead of a send, and the connection that was started for it. */
+export const DF_LOG_SEND_PREPARED = 'df_send_prepared';
 export const DF_LOG_SEND_STARTED = 'df_send_started';
 export const DF_LOG_SEND_REPLAYED = 'df_send_replayed';
 export const DF_LOG_SEND_REFUSED = 'df_send_refused';

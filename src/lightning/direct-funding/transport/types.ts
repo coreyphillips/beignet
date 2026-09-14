@@ -260,13 +260,24 @@ export interface IDfPeerMessaging {
 	/** Subscribe to inbound custom messages; the return value unsubscribes. */
 	onCustomMessage(cb: (msg: IDfCustomMessage) => void): () => void;
 	isPeerConnected(peerPubkeyHex: string): boolean;
-	/** `timeoutMs`, when given, replaces the dial's default establishment bounds. */
+	/**
+	 * `timeoutMs`, when given, replaces the dial's default establishment bounds.
+	 * `reconnect: false` keeps the dial from making the peer an auto-reconnect
+	 * target.
+	 */
 	connectPeer(
 		peerPubkeyHex: string,
 		host: string,
 		port: number,
-		timeoutMs?: number
+		timeoutMs?: number,
+		options?: { reconnect?: boolean }
 	): Promise<void>;
+	/**
+	 * A lane is using an existing connection to this peer, so a
+	 * `reconnect: false` dial that opened it must stop keeping it from
+	 * auto-reconnecting.
+	 */
+	keepReconnecting?(peerPubkeyHex: string): void;
 	/**
 	 * Subscribe to peers connecting; the return value unsubscribes. Optional:
 	 * without it a lane waiting for its receiver learns of the connection only
@@ -304,6 +315,23 @@ export interface IDfOpenContext {
 }
 
 /**
+ * The connection the first lane a send would open talks over, as `warm` left
+ * it: already up, being dialed, one this node waits for because it is the
+ * receiver's way in, or none this node knows how to start.
+ */
+export type DfWarmConnection =
+	| 'connected'
+	| 'connecting'
+	| 'awaiting_receiver'
+	| 'none';
+
+export interface IDfWarmResult {
+	connection: DfWarmConnection;
+	/** The node that connection is to, hex. Absent for 'none'. */
+	peerNodeId?: string;
+}
+
+/**
  * Make sure the payer holds a connection to `peerHex`, dialing `host:port`
  * when it does not. Resolves false when there is no connection to use: the
  * address already failed in this run, the window is spent, or the dial failed
@@ -317,7 +345,12 @@ export async function establishPeer(
 	host: string,
 	port: number
 ): Promise<boolean> {
-	if (peers.isPeerConnected(peerHex)) return true;
+	if (peers.isPeerConnected(peerHex)) {
+		// A dial without `reconnect: false` would clear a warm dial's mark, and
+		// this path makes none.
+		peers.keepReconnecting?.(peerHex);
+		return true;
+	}
 	const address = `${peerHex}|${host}|${port}`;
 	if (ctx.failedDials?.has(address)) return false;
 	const remainingMs =

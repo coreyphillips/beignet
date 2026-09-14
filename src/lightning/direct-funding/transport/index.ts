@@ -52,6 +52,7 @@ export {
 export type {
 	DfFrameHandler,
 	DfTransportLog,
+	DfWarmConnection,
 	IDfCustomMessage,
 	IDfInboundFrame,
 	IDfLaneFactory,
@@ -61,7 +62,8 @@ export type {
 	IDfPeerMessaging,
 	IDfRelayServerConfig,
 	IDfTransport,
-	IDfTransportConfig
+	IDfTransportConfig,
+	IDfWarmResult
 } from './types';
 
 export interface IDfTransportDeps {
@@ -94,7 +96,12 @@ export function createDirectFundingTransports(
 ): IDfTransportStack {
 	const registry = new DfTransportRegistry(log, {
 		isPeerConnected: (hex) => deps.peers.isPeerConnected(hex),
-		nodeId: () => deps.nodeId()
+		nodeId: () => deps.nodeId(),
+		// A warm dial may never be followed by a send, so neither its failure
+		// nor its connection closing may leave the node retrying a stranger's
+		// address for good.
+		connectPeer: (hex, host, port, timeoutMs) =>
+			deps.peers.connectPeer(hex, host, port, timeoutMs, { reconnect: false })
 	});
 
 	registry.register({

@@ -1336,6 +1336,69 @@ describe('Production Hardening 3: Integration', function () {
 		}
 	});
 
+	it('a failed connectPeer with reconnect false arms no reconnect', async () => {
+		const {
+			PeerManager
+		} = require('../../src/lightning/transport/peer-manager');
+		const pm = new PeerManager({
+			localPrivateKey: crypto.randomBytes(32),
+			autoReconnect: true
+		});
+		const oneShot = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const ordinary = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		try {
+			await pm
+				.connectPeer(oneShot, '127.0.0.1', 1, undefined, { reconnect: false })
+				.catch(() => undefined);
+			await pm.connectPeer(ordinary, '127.0.0.1', 1).catch(() => undefined);
+			expect(pm.reconnectTimers.has(oneShot)).to.equal(false);
+			expect(pm.reconnectTimers.has(ordinary)).to.equal(true);
+		} finally {
+			pm.destroy();
+		}
+	});
+
+	it('a connection opened with reconnect false arms no reconnect when it closes', async () => {
+		const {
+			PeerManager
+		} = require('../../src/lightning/transport/peer-manager');
+		const serverKey = crypto.randomBytes(32);
+		const serverPub = getPublicKey(serverKey).toString('hex');
+		const closeAfterDial = async (
+			options?: { reconnect: boolean },
+			keepReconnecting = false
+		): Promise<boolean> => {
+			const server = new PeerManager({ localPrivateKey: serverKey });
+			const pm = new PeerManager({
+				localPrivateKey: crypto.randomBytes(32),
+				autoReconnect: true
+			});
+			try {
+				await server.listen(0, '127.0.0.1');
+				const port = server.server.address().port;
+				await pm.connectPeer(serverPub, '127.0.0.1', port, undefined, options);
+				if (keepReconnecting) pm.keepReconnecting(serverPub);
+				const clientPub = pm.localPubkeyHex;
+				const deadline = Date.now() + 5000;
+				while (server.listPeers().length === 0 && Date.now() < deadline) {
+					await new Promise((r) => setTimeout(r, 10));
+				}
+				server.disconnectPeer(clientPub);
+				while (pm.listPeers().length > 0 && Date.now() < deadline) {
+					await new Promise((r) => setTimeout(r, 10));
+				}
+				expect(pm.listPeers()).to.have.length(0);
+				return pm.reconnectTimers.has(serverPub);
+			} finally {
+				pm.destroy();
+				server.destroy();
+			}
+		};
+		expect(await closeAfterDial({ reconnect: false })).to.equal(false);
+		expect(await closeAfterDial({ reconnect: false }, true)).to.equal(true);
+		expect(await closeAfterDial()).to.equal(true);
+	});
+
 	it('ChannelManager nextChannelIndex getter/setter', () => {
 		const config = makeCMConfig(makeSeed(80));
 		const manager = new ChannelManager(config);

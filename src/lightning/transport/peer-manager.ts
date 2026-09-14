@@ -181,6 +181,13 @@ export interface IPeerDialOptions {
 	 * longer than this; a caller that needs a hard bound races the dial.
 	 */
 	timeoutMs?: number;
+	/**
+	 * false: the dial does not make the peer an auto-reconnect target, neither
+	 * when it fails nor when its connection later closes. For a speculative
+	 * dial that nothing may ever follow up, which auto-reconnect would
+	 * otherwise retry for good. A peer that was already a target stays one.
+	 */
+	reconnect?: boolean;
 }
 
 type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
@@ -224,6 +231,12 @@ export class PeerManager extends EventEmitter {
 	private reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
 		new Map();
 	private reconnectDelays: Map<string, number> = new Map();
+	/**
+	 * Peers whose only reconnect address came from a `reconnect: false` dial.
+	 * Their connection closing arms nothing; a dial without that option, or
+	 * keepReconnecting, clears the mark.
+	 */
+	private noReconnectPeers: Set<string> = new Set();
 	/**
 	 * Bumped by every explicit disconnectPeer(). A dial snapshots it before
 	 * starting; a failure only schedules auto-reconnect when the generation
@@ -307,6 +320,11 @@ export class PeerManager extends EventEmitter {
 		options: IPeerDialOptions = {}
 	): Promise<void> {
 		const cancelGeneration = this.cancelGenerations.get(pubkey) ?? 0;
+		if (options.reconnect !== false) {
+			this.noReconnectPeers.delete(pubkey);
+		} else if (this.reconnectCandidates(pubkey).length === 0) {
+			this.noReconnectPeers.add(pubkey);
+		}
 		try {
 			await this.dialPeer(pubkey, host, port, transport, options.timeoutMs);
 		} catch (err) {
@@ -316,12 +334,21 @@ export class PeerManager extends EventEmitter {
 			// that. The rejection itself still propagates.
 			if (
 				this.autoReconnect &&
+				options.reconnect !== false &&
 				(this.cancelGenerations.get(pubkey) ?? 0) === cancelGeneration
 			) {
 				this.scheduleReconnect(pubkey);
 			}
 			throw err;
 		}
+	}
+
+	/**
+	 * Undo a `reconnect: false` dial's mark, for a caller that has started to
+	 * rely on the connection it opened without dialing again.
+	 */
+	keepReconnecting(pubkey: string): void {
+		this.noReconnectPeers.delete(pubkey);
 	}
 
 	/**
@@ -1554,6 +1581,7 @@ export class PeerManager extends EventEmitter {
 
 			if (
 				this.autoReconnect &&
+				!this.noReconnectPeers.has(pubkey) &&
 				(this.cancelGenerations.get(pubkey) ?? 0) === closeGeneration &&
 				this.reconnectCandidates(pubkey).length > 0
 			) {

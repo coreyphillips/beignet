@@ -1830,6 +1830,17 @@ async function bootDaemon(
 				})
 			);
 		},
+		// Read a request and start dialing the node a send of it talks to first,
+		// so a dial over Tor is not waiting in front of the exchange once the
+		// user presses Send. Returns at once; spends and records nothing.
+		'POST /direct-funding/prepare': (body) => {
+			const { request } = body as { request?: string };
+			return success(
+				node.prepareDirectFunding({
+					...(request !== undefined ? { request } : {})
+				})
+			);
+		},
 		// Pay a request by funding the receiver's channel from one of our coins.
 		//
 		// This call REJECTS ONLY BEFORE OUR WITNESS LEAVES THE DEVICE. After that
