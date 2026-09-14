@@ -3,6 +3,7 @@
  * payee (who knows the preimage) keysend it back over the outgoing row.
  */
 
+import crypto from 'crypto';
 import { expect } from 'chai';
 import {
 	INodeConfig,
@@ -96,6 +97,100 @@ describe('Pruned outgoing keysend collision (#840)', function () {
 				cleanupIntervalMs: 0
 			},
 			10
+		);
+	});
+
+	// Issue #847: nor may an invoice be created on the hash of any pruned
+	// terminal outgoing payment.
+	async function invoiceAfterPrune(
+		resourceConfig: INodeConfig['resourceConfig'],
+		seedId: number,
+		outcome: PaymentStatus.COMPLETED | PaymentStatus.FAILED
+	): Promise<void> {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const alice = createNode(TAG, seedId, storage, { resourceConfig });
+		const bob = createNode(TAG, seedId + 1);
+		connectNodes(alice, bob);
+		for (const node of [alice, bob]) node.handleNewBlock(1000);
+		buildGraph(alice, bob, [openReadyChannel(alice, bob)]);
+
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		if (outcome === PaymentStatus.FAILED) {
+			// Bob refuses a keysend on a hash his own invoice owns.
+			bob.createInvoice({
+				amountMsat: 1_000n,
+				description: 'owned',
+				hold: true,
+				paymentHash
+			});
+		}
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(alice as any).dispatchKeysend(
+			{
+				destination: Buffer.from(bob.getNodeId(), 'hex'),
+				amountMsat: 5_000_000n
+			},
+			preimage
+		);
+		await new Promise((r) => setTimeout(r, 20));
+		expect(alice.getPayment(paymentHash)!.status).to.equal(outcome);
+
+		await new Promise((r) => setTimeout(r, 5));
+		expect(alice.pruneCompletedPayments()).to.be.greaterThan(0);
+		expect(alice.getPayment(paymentHash)).to.equal(undefined);
+		expect(alice.paymentHashInUse(paymentHash)).to.equal(true);
+
+		expect(() =>
+			alice.createInvoice({
+				amountMsat: 1_000n,
+				description: 'reuse',
+				hold: true,
+				paymentHash
+			})
+		).to.throw('paymentHash is already in use by this node');
+		const row = storage.loadPayment(paymentHash.toString('hex'))!;
+		expect(row.direction, 'durable outgoing row kept').to.equal(
+			PaymentDirection.OUTGOING
+		);
+		expect(row.status).to.equal(outcome);
+		expect(row.amountMsat).to.equal(5_000_000n);
+	}
+
+	it('refuses an invoice after the TTL prunes the settled outgoing payment (#847)', async function () {
+		await invoiceAfterPrune(
+			{
+				completedPaymentTtlMs: 1,
+				maxCompletedPayments: 10_000,
+				cleanupIntervalMs: 0
+			},
+			20,
+			PaymentStatus.COMPLETED
+		);
+	});
+
+	it('refuses an invoice after the size cap prunes the settled outgoing payment (#847)', async function () {
+		await invoiceAfterPrune(
+			{
+				completedPaymentTtlMs: 86_400_000,
+				maxCompletedPayments: 0,
+				cleanupIntervalMs: 0
+			},
+			30,
+			PaymentStatus.COMPLETED
+		);
+	});
+
+	it('refuses an invoice after the TTL prunes the failed outgoing payment (#847)', async function () {
+		await invoiceAfterPrune(
+			{
+				completedPaymentTtlMs: 1,
+				maxCompletedPayments: 10_000,
+				cleanupIntervalMs: 0
+			},
+			40,
+			PaymentStatus.FAILED
 		);
 	});
 });
