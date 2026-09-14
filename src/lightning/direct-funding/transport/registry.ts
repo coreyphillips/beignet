@@ -61,7 +61,7 @@ export interface IDfRegistryPeerView {
 	/** This node's own id, to recognise a relay descriptor naming itself. */
 	nodeId?(): Buffer;
 	/**
-	 * Dial a peer without arming auto-reconnect on failure. Without it `warm`
+	 * Dial a peer without making it an auto-reconnect target. Without it `warm`
 	 * starts nothing.
 	 */
 	connectPeer?(

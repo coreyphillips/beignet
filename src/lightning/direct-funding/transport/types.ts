@@ -262,7 +262,8 @@ export interface IDfPeerMessaging {
 	isPeerConnected(peerPubkeyHex: string): boolean;
 	/**
 	 * `timeoutMs`, when given, replaces the dial's default establishment bounds.
-	 * `reconnect: false` keeps a failed dial from arming auto-reconnect.
+	 * `reconnect: false` keeps the dial from making the peer an auto-reconnect
+	 * target.
 	 */
 	connectPeer(
 		peerPubkeyHex: string,

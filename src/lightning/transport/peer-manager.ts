@@ -182,9 +182,10 @@ export interface IPeerDialOptions {
 	 */
 	timeoutMs?: number;
 	/**
-	 * false: a failed dial does not arm auto-reconnect. For a speculative dial
-	 * that nothing may ever follow up, which auto-reconnect would otherwise
-	 * retry for good.
+	 * false: the dial does not make the peer an auto-reconnect target, neither
+	 * when it fails nor when its connection later closes. For a speculative
+	 * dial that nothing may ever follow up, which auto-reconnect would
+	 * otherwise retry for good. A peer that was already a target stays one.
 	 */
 	reconnect?: boolean;
 }
@@ -230,6 +231,12 @@ export class PeerManager extends EventEmitter {
 	private reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
 		new Map();
 	private reconnectDelays: Map<string, number> = new Map();
+	/**
+	 * Peers whose only reconnect address came from a `reconnect: false` dial.
+	 * Their connection closing arms nothing; a dial without that option
+	 * clears the mark.
+	 */
+	private noReconnectPeers: Set<string> = new Set();
 	/**
 	 * Bumped by every explicit disconnectPeer(). A dial snapshots it before
 	 * starting; a failure only schedules auto-reconnect when the generation
@@ -313,6 +320,11 @@ export class PeerManager extends EventEmitter {
 		options: IPeerDialOptions = {}
 	): Promise<void> {
 		const cancelGeneration = this.cancelGenerations.get(pubkey) ?? 0;
+		if (options.reconnect !== false) {
+			this.noReconnectPeers.delete(pubkey);
+		} else if (this.reconnectCandidates(pubkey).length === 0) {
+			this.noReconnectPeers.add(pubkey);
+		}
 		try {
 			await this.dialPeer(pubkey, host, port, transport, options.timeoutMs);
 		} catch (err) {
@@ -1561,6 +1573,7 @@ export class PeerManager extends EventEmitter {
 
 			if (
 				this.autoReconnect &&
+				!this.noReconnectPeers.has(pubkey) &&
 				(this.cancelGenerations.get(pubkey) ?? 0) === closeGeneration &&
 				this.reconnectCandidates(pubkey).length > 0
 			) {
