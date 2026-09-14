@@ -562,6 +562,46 @@ describe('Direct funding receiver: a chain source that cannot answer (issue #855
 		expect(h.node.splices).to.have.length(0);
 		expect(drops).to.deep.equal([DfOfferDropReason.CHAIN_SOURCE_UNAVAILABLE]);
 	});
+
+	// Issue #859.
+	it('leaves the offer unanswered when the history lookup never answers', async () => {
+		const h = harness({
+			chainWaitMs: 150,
+			allowSplice: true,
+			allowUnpairedSplice: true
+		});
+		h.node.spliceChannel = crypto.randomBytes(32);
+		h.node.markSpent(h.coin);
+		const drops = captureDrops(h);
+		h.node.chain.getScriptHashHistory = async (): Promise<never> => {
+			throw new Error('Electrum not connected');
+		};
+		await h.sendOffer();
+		await sleep(300);
+		expect(h.acks()).to.have.length(0);
+		expect(h.node.opens).to.have.length(0);
+		expect(h.node.splices).to.have.length(0);
+		expect(drops).to.deep.equal([DfOfferDropReason.CHAIN_SOURCE_UNAVAILABLE]);
+	});
+
+	it('declines a spent coin once the history lookup answers after failing', async () => {
+		const h = harness();
+		h.node.markSpent(h.coin);
+		const getScriptHashHistory = h.node.chain.getScriptHashHistory;
+		let calls = 0;
+		h.node.chain.getScriptHashHistory = async (
+			scriptHash
+		): ReturnType<typeof getScriptHashHistory> => {
+			calls++;
+			if (calls === 1) throw new Error('Electrum not connected');
+			return getScriptHashHistory(scriptHash);
+		};
+		await h.sendOffer();
+		await until(() => h.acks().length > 0);
+		expect(calls).to.equal(2);
+		expect(h.lastAck()?.reason).to.equal('offered coin is already spent');
+		expect(h.node.opens).to.have.length(0);
+	});
 });
 
 describe('Direct funding receiver: ownership proof (issue #612)', () => {

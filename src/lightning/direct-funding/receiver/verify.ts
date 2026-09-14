@@ -301,8 +301,9 @@ function messageProofProblem(
  * `require_confirmed_inputs` over a coin still in the mempool.
  *
  * `confirmed` is left undefined when nothing conclusive came back, which the
- * channel treats as unknown rather than as a claim. `unanswered` says the
- * unspent lookup itself failed, so the source never got to say (issue #855).
+ * channel treats as unknown rather than as a claim. `unanswered` says a
+ * lookup the answer needed failed, so the source never got to say (issues
+ * #855, #859).
  */
 export async function classifyOfferedCoin(
 	chain: IDfChainSource,
@@ -322,7 +323,8 @@ export async function classifyOfferedCoin(
 	const history = await chain
 		.getScriptHashHistory(scriptHash)
 		.catch(() => null);
-	const seen = history?.find((h) => h.txid === outpoint.txidDisplayHex);
+	if (!history) return { spent: false, unanswered: true };
+	const seen = history.find((h) => h.txid === outpoint.txidDisplayHex);
 	if (!seen || seen.height <= 0) return { spent: false };
 	return { spent: true, confirmed: true };
 }
