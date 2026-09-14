@@ -484,6 +484,24 @@ describe('Direct funding receiver: a chain source that cannot answer (issue #855
 		expect(h.node.opens).to.have.length(1);
 	});
 
+	it('opens nothing when the receiver stops while waiting for the chain source', async () => {
+		const h = harness();
+		const getTransaction = h.node.chain.getTransaction;
+		let calls = 0;
+		h.node.chain.getTransaction = async (txid): Promise<Buffer> => {
+			calls++;
+			if (calls === 1) {
+				throw new ChainBackendUnavailableError('Electrum not connected');
+			}
+			return getTransaction(txid);
+		};
+		await h.sendOffer();
+		h.engine.stop();
+		await sleep(1_500);
+		expect(h.acks()).to.have.length(0);
+		expect(h.node.opens).to.have.length(0);
+	});
+
 	it("splices an unpaired payer's confirmed coin when the unspent lookup failed once", async () => {
 		const h = harness({
 			allowSplice: true,

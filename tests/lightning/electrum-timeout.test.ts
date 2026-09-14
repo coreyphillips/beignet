@@ -8,6 +8,7 @@
 import { expect } from 'chai';
 import { ElectrumBackend } from '../../src/lightning/chain/electrum-backend';
 import { ChainBackendUnavailableError } from '../../src/lightning/chain/chain-watcher';
+import { Electrum } from '../../src/electrum';
 
 // ─────────────── Mock Electrum ───────────────
 
@@ -273,7 +274,11 @@ describe('ElectrumBackend — Call Timeouts', () => {
 			timeoutMs = 5_000
 		): Promise<Error> {
 			const backend = new ElectrumBackend(
-				{ ...makeInstantElectrum(), getTransactions } as never,
+				{
+					...makeInstantElectrum(),
+					getTransactions,
+					transactionExists: Electrum.prototype.transactionExists
+				} as never,
 				timeoutMs
 			);
 			try {
@@ -310,12 +315,31 @@ describe('ElectrumBackend — Call Timeouts', () => {
 				Promise.resolve({
 					isErr: () => false,
 					value: {
-						data: [{ error: { message: 'No such mempool transaction' } }]
+						data: [
+							{
+								error: {
+									code: -5,
+									message: 'No such mempool or blockchain transaction'
+								}
+							}
+						]
 					}
 				})
 			);
 			expect(err).not.to.be.instanceOf(ChainBackendUnavailableError);
 			expect(err.message).to.include('No hex data');
+		});
+
+		it('is unavailable when the server answered with some other error', async () => {
+			const err = await failure(() =>
+				Promise.resolve({
+					isErr: () => false,
+					value: {
+						data: [{ error: { code: -32603, message: 'server overloaded' } }]
+					}
+				})
+			);
+			expect(err).to.be.instanceOf(ChainBackendUnavailableError);
 		});
 	});
 });

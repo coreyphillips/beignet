@@ -515,11 +515,15 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 
 		const txData = response.data[0];
 		const hex = txData.result?.hex;
-		if (!hex) {
+		if (hex) return Buffer.from(hex, 'hex');
+		// Only a server saying it has no such transaction is a miss. Any other
+		// error in the entry, such as an overloaded server, has not said no.
+		if (!this.electrum.transactionExists(txData)) {
 			throw new Error(`No hex data for transaction ${txid}`);
 		}
-
-		return Buffer.from(hex, 'hex');
+		throw new ChainBackendUnavailableError(
+			`No hex data for transaction ${txid}`
+		);
 	}
 
 	async getTransactionMerkleProof(

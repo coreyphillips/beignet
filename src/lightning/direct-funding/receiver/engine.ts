@@ -2679,7 +2679,8 @@ export class DirectFundingReceiver extends EventEmitter {
 	/**
 	 * Run a chain lookup until it answers or the wall clock reaches `deadline`
 	 * (issue #855). `undefined` from `lookup` means no answer. The lookup always
-	 * runs once, and a stopped engine stops asking.
+	 * runs once. A stopped engine gets no answer, since the listeners that would
+	 * finish or unwind a channel opened on it are gone.
 	 */
 	private async untilChainAnswers<T>(
 		deadline: number,
@@ -2687,8 +2688,9 @@ export class DirectFundingReceiver extends EventEmitter {
 	): Promise<T | undefined> {
 		for (;;) {
 			const answer = await lookup();
+			if (!this.started) return undefined;
 			const left = deadline - Date.now();
-			if (answer !== undefined || left <= 0 || !this.started) return answer;
+			if (answer !== undefined || left <= 0) return answer;
 			await new Promise<void>((resolve) => {
 				const timer = setTimeout(
 					resolve,
