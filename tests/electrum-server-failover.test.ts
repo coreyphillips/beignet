@@ -3581,3 +3581,121 @@ describe('Electrum failed callback subscribe rollback ownership (issue #839)', (
 		expect(onReceive.callCount, 'the retry callback').to.equal(1);
 	});
 });
+
+describe('Electrum late failure beside a same-record successful subscribe (issue #848)', () => {
+	beforeEach(startTest);
+	afterEach(endTest);
+
+	it('keeps the callback when the later subscribe succeeds first', async () => {
+		const scriptHash = 'cccc';
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		const onReceive = sinon.spy();
+		const gate = createGate();
+		subscriptionGate = gate;
+		const parked = electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive
+		});
+		await flush();
+		subscriptionGate = null;
+
+		const later = await electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive
+		});
+		expect(later.isOk()).to.equal(true);
+
+		subscriptionFailures.add(scriptHash);
+		gate.release();
+		expect((await parked).isErr()).to.equal(true);
+
+		await client.addressHandler?.([scriptHash, 'after-deposit']);
+		await flush();
+
+		expect(onReceive.callCount).to.equal(1);
+	});
+
+	it('keeps the callback when the later subscribe succeeds after the failure', async () => {
+		const scriptHash = 'cccc';
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		const onReceive = sinon.spy();
+		const earlierGate = createGate();
+		subscriptionGate = earlierGate;
+		const earlier = electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive
+		});
+		await flush();
+		const laterGate = createGate();
+		subscriptionGate = laterGate;
+		const later = electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive
+		});
+		await flush();
+		subscriptionGate = null;
+
+		subscriptionFailures.add(scriptHash);
+		earlierGate.release();
+		expect((await earlier).isErr()).to.equal(true);
+		laterGate.release();
+		expect((await later).isOk()).to.equal(true);
+
+		await client.addressHandler?.([scriptHash, 'after-deposit']);
+		await flush();
+
+		expect(onReceive.callCount).to.equal(1);
+	});
+
+	it('still removes the record when every attempt fails', async () => {
+		const scriptHash = 'cccc';
+		const siblingRefreshSpy = sinon.spy() as unknown as sinon.SinonStub;
+		const sibling = createElectrum(
+			siblingRefreshSpy,
+			sinon.spy() as unknown as sinon.SinonStub,
+			walletScriptHash,
+			createWalletHeader()
+		);
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		await sibling.connectToElectrum({ servers: serverA });
+		await flush();
+
+		const onReceive = sinon.spy();
+		const firstGate = createGate();
+		subscriptionGate = firstGate;
+		const first = electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive
+		});
+		await flush();
+		const secondGate = createGate();
+		subscriptionGate = secondGate;
+		const second = electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive
+		});
+		await flush();
+		subscriptionGate = null;
+
+		subscriptionFailures.add(scriptHash);
+		firstGate.release();
+		expect((await first).isErr()).to.equal(true);
+		subscriptionFailures.add(scriptHash);
+		secondGate.release();
+		expect((await second).isErr()).to.equal(true);
+		siblingRefreshSpy.resetHistory();
+
+		// With no record left for the hash, the notification falls back to
+		// refreshing every wallet on the network, the sibling included.
+		await client.addressHandler?.([scriptHash, 'after-deposit']);
+		await flush();
+
+		expect(onReceive.callCount, 'the callback').to.equal(0);
+		expect(siblingRefreshSpy.callCount, 'the sibling').to.equal(1);
+	});
+});

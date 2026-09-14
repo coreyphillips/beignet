@@ -87,6 +87,14 @@ type TScriptHashSubscription = {
 	 *  status only counts as heard once its refresh starts, so this is what
 	 *  disconnect() saves while a delivery is parked in a scan. */
 	pendingRefresh?: { heard: string | null; deliveries: number };
+	/** Callbacks no subscribe has succeeded with yet: how many attempts still
+	 *  wait on each, and whether the first of them created this record. A
+	 *  failure takes the callback back only once it is the last of them, and
+	 *  never after one succeeded. */
+	unconfirmedCallbacks?: Map<
+		(data: TSubscribedReceive) => void,
+		{ attempts: number; created: boolean }
+	>;
 };
 
 /** Records a delivery to `sub` that has not started its refresh yet. The
@@ -2352,10 +2360,34 @@ export class Electrum {
 	}
 
 	/**
-	 * Takes back the callback a failed subscribe added to `sub`. Nothing is
+	 * Adds a subscribe attempt's callback to `sub`. Returns whether the attempt
+	 * waits on it as unconfirmed, and so must either confirm it or roll it back.
+	 */
+	private addScriptHashCallback(
+		sub: TScriptHashSubscription,
+		onReceive: (data: TSubscribedReceive) => void,
+		created: boolean
+	): boolean {
+		const unconfirmed = sub.unconfirmedCallbacks?.get(onReceive);
+		const waits = !!unconfirmed || !sub.callbacks.has(onReceive);
+		sub.callbacks.add(onReceive);
+		if (unconfirmed) {
+			unconfirmed.attempts++;
+		} else if (waits) {
+			(sub.unconfirmedCallbacks ??= new Map()).set(onReceive, {
+				attempts: 1,
+				created
+			});
+		}
+		return waits;
+	}
+
+	/**
+	 * Takes back the callback a failed subscribe added to `sub`, once no other
+	 * attempt with it on `sub` is still waiting or has succeeded. Nothing is
 	 * touched once `sub` is no longer this instance's record: a disconnect
 	 * withdrew it, and whatever stands in its place belongs to a later
-	 * subscribe. The record itself goes only if this attempt created it, and
+	 * subscribe. The record itself goes only if an attempt created it, and
 	 * then the status it last heard goes back to _withdrawnStatuses, where
 	 * _scriptHashRecord may have just taken it from, so the retry still has
 	 * something to compare the server's answer with.
@@ -2363,14 +2395,21 @@ export class Electrum {
 	private rollBackScriptHashCallback(
 		scriptHash: string,
 		sub: TScriptHashSubscription,
-		onReceive: (data: TSubscribedReceive) => void,
-		created: boolean
+		onReceive: (data: TSubscribedReceive) => void
 	): void {
+		const unconfirmed = sub.unconfirmedCallbacks?.get(onReceive);
+		// No entry once an attempt with this callback succeeded on the record.
+		if (!unconfirmed || --unconfirmed.attempts > 0) return;
+		sub.unconfirmedCallbacks?.delete(onReceive);
 		const router = scriptHashRouters.get(this.electrumNetwork);
 		const subs = router?.subscriptions.get(scriptHash);
 		if (!router || !subs || subs.get(this) !== sub) return;
 		sub.callbacks.delete(onReceive);
-		if (!created || sub.callbacks.size > 0 || sub.utxoIndex !== undefined) {
+		if (
+			!unconfirmed.created ||
+			sub.callbacks.size > 0 ||
+			sub.utxoIndex !== undefined
+		) {
 			return;
 		}
 		const heard = router.statuses.has(scriptHash)
@@ -2455,31 +2494,30 @@ export class Electrum {
 		const allScriptHashesPromises = scriptHashes.map(async (scriptHash) => {
 			const created = !router.subscriptions.get(scriptHash)?.has(this);
 			const sub = this._scriptHashRecord(scriptHash);
-			const added = onReceive ? !sub.callbacks.has(onReceive) : false;
-			if (onReceive) {
-				sub.callbacks.add(onReceive);
-			}
+			const waits = onReceive
+				? this.addScriptHashCallback(sub, onReceive, created)
+				: false;
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash,
 				network: this.electrumNetwork,
 				onReceive: router.dispatch
 			});
 			if (response.error) {
-				if (added && onReceive) {
-					this.rollBackScriptHashCallback(scriptHash, sub, onReceive, created);
+				if (waits && onReceive) {
+					this.rollBackScriptHashCallback(scriptHash, sub, onReceive);
 				}
 				throw Error('Unable to subscribe to receiving addresses.');
 			}
+			if (waits && onReceive) sub.unconfirmedCallbacks?.delete(onReceive);
 			router.noteSubscribed(scriptHash, response);
 		});
 
 		const allUtxosPromises = allUtxos.map(async (utxo) => {
 			const created = !router.subscriptions.get(utxo.scriptHash)?.has(this);
 			const sub = this._scriptHashRecord(utxo.scriptHash);
-			const added = onReceive ? !sub.callbacks.has(onReceive) : false;
-			if (onReceive) {
-				sub.callbacks.add(onReceive);
-			}
+			const waits = onReceive
+				? this.addScriptHashCallback(sub, onReceive, created)
+				: false;
 			sub.utxoIndex = utxo.index;
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash: utxo.scriptHash,
@@ -2487,16 +2525,12 @@ export class Electrum {
 				onReceive: router.dispatch
 			});
 			if (response.error) {
-				if (added && onReceive) {
-					this.rollBackScriptHashCallback(
-						utxo.scriptHash,
-						sub,
-						onReceive,
-						created
-					);
+				if (waits && onReceive) {
+					this.rollBackScriptHashCallback(utxo.scriptHash, sub, onReceive);
 				}
 				throw Error('Unable to subscribe to receiving addresses.');
 			}
+			if (waits && onReceive) sub.unconfirmedCallbacks?.delete(onReceive);
 			router.noteSubscribed(utxo.scriptHash, response);
 		});
 
