@@ -23320,6 +23320,8 @@ export class LightningNode extends EventEmitter {
 					},
 					isPeerConnected: (peer): boolean =>
 						this.listPeers().some((p) => p.pubkey === peer),
+					keepReconnecting: (peer): void =>
+						this.peerManager?.keepReconnecting(peer),
 					connectPeer: async (
 						peer,
 						host,

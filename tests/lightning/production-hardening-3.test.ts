@@ -1364,9 +1364,10 @@ describe('Production Hardening 3: Integration', function () {
 		} = require('../../src/lightning/transport/peer-manager');
 		const serverKey = crypto.randomBytes(32);
 		const serverPub = getPublicKey(serverKey).toString('hex');
-		const closeAfterDial = async (options?: {
-			reconnect: boolean;
-		}): Promise<boolean> => {
+		const closeAfterDial = async (
+			options?: { reconnect: boolean },
+			keepReconnecting = false
+		): Promise<boolean> => {
 			const server = new PeerManager({ localPrivateKey: serverKey });
 			const pm = new PeerManager({
 				localPrivateKey: crypto.randomBytes(32),
@@ -1376,6 +1377,7 @@ describe('Production Hardening 3: Integration', function () {
 				await server.listen(0, '127.0.0.1');
 				const port = server.server.address().port;
 				await pm.connectPeer(serverPub, '127.0.0.1', port, undefined, options);
+				if (keepReconnecting) pm.keepReconnecting(serverPub);
 				const clientPub = pm.localPubkeyHex;
 				const deadline = Date.now() + 5000;
 				while (server.listPeers().length === 0 && Date.now() < deadline) {
@@ -1393,6 +1395,7 @@ describe('Production Hardening 3: Integration', function () {
 			}
 		};
 		expect(await closeAfterDial({ reconnect: false })).to.equal(false);
+		expect(await closeAfterDial({ reconnect: false }, true)).to.equal(true);
 		expect(await closeAfterDial()).to.equal(true);
 	});
 

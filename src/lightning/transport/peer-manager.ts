@@ -233,8 +233,8 @@ export class PeerManager extends EventEmitter {
 	private reconnectDelays: Map<string, number> = new Map();
 	/**
 	 * Peers whose only reconnect address came from a `reconnect: false` dial.
-	 * Their connection closing arms nothing; a dial without that option
-	 * clears the mark.
+	 * Their connection closing arms nothing; a dial without that option, or
+	 * keepReconnecting, clears the mark.
 	 */
 	private noReconnectPeers: Set<string> = new Set();
 	/**
@@ -341,6 +341,14 @@ export class PeerManager extends EventEmitter {
 			}
 			throw err;
 		}
+	}
+
+	/**
+	 * Undo a `reconnect: false` dial's mark, for a caller that has started to
+	 * rely on the connection it opened without dialing again.
+	 */
+	keepReconnecting(pubkey: string): void {
+		this.noReconnectPeers.delete(pubkey);
 	}
 
 	/**

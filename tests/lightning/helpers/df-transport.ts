@@ -50,6 +50,8 @@ export class FakeDfPeer implements IDfPeerMessaging {
 	readonly escapedErrors: unknown[] = [];
 	readonly sent: Array<{ to: string; subtype: number; payload: Buffer }> = [];
 	dialAttempts = 0;
+	/** Peers a lane asked to keep reconnecting to, in order. */
+	readonly keptReconnecting: string[] = [];
 	/** The `timeoutMs` each dial was given, in order. */
 	readonly dialTimeouts: Array<number | undefined> = [];
 	/** How long a dial takes to land; 'never' leaves it pending for good. */
@@ -73,6 +75,10 @@ export class FakeDfPeer implements IDfPeerMessaging {
 
 	isPeerConnected(peerPubkeyHex: string): boolean {
 		return this.connections.has(peerPubkeyHex);
+	}
+
+	keepReconnecting(peerPubkeyHex: string): void {
+		this.keptReconnecting.push(peerPubkeyHex);
 	}
 
 	/**

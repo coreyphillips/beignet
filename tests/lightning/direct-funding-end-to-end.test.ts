@@ -93,6 +93,8 @@ interface IEndToEnd {
 	payerDials(): number;
 	/** The timeout each of the payer's dials was given. */
 	payerDialTimeouts(): Array<number | undefined>;
+	/** Peers a payer's lane asked to keep reconnecting to. */
+	payerKeptReconnecting(): string[];
 	/** Bring the receiver's connection to the payer up, as a returning phone does. */
 	connectReceiver(): void;
 	fundingScript: Buffer;
@@ -245,6 +247,7 @@ async function setup(
 		payerId: payerPeer.id,
 		payerDials: (): number => payerPeer.dialAttempts,
 		payerDialTimeouts: (): Array<number | undefined> => payerPeer.dialTimeouts,
+		payerKeptReconnecting: (): string[] => payerPeer.keptReconnecting,
 		connectReceiver: (): void => net.connect(receiverPeer, payerPeer),
 		fundingScript: createFundingScript(pubkeys.local, pubkeys.remote)
 			.p2wshOutput,
@@ -776,6 +779,28 @@ describe('Direct funding end to end: payer against receiver', () => {
 				expect(e2e.payerDials(), 'one socket').to.equal(1);
 				// What was left of the prepared dial, not a dial of its own.
 				expect(offeredAfterMs).to.be.below(350);
+			} finally {
+				e2e.stop();
+			}
+		});
+
+		// A prepared dial arms no reconnect, and this send dials nothing to lift that.
+		it('a send over the connection prepare opened keeps reconnecting to it', async () => {
+			const e2e = await setup({ payerDialMs: 20 });
+			try {
+				e2e.sender.prepare(e2e.request);
+				await new Promise((resolve) => setTimeout(resolve, 80));
+				const { error } = await sendTimed(e2e, async () => {
+					await waitFor(() => e2e.node.opens.length === 1);
+					e2e.node.completeNegotiation(e2e.coin, e2e.expectedOffer(), {
+						fundingScript: e2e.fundingScript
+					});
+				});
+				expect(error).to.equal(null);
+				expect(e2e.payerDials()).to.equal(1);
+				expect(e2e.payerKeptReconnecting()).to.include(
+					e2e.node.nodeId.toString('hex')
+				);
 			} finally {
 				e2e.stop();
 			}

@@ -273,6 +273,12 @@ export interface IDfPeerMessaging {
 		options?: { reconnect?: boolean }
 	): Promise<void>;
 	/**
+	 * A lane is using an existing connection to this peer, so a
+	 * `reconnect: false` dial that opened it must stop keeping it from
+	 * auto-reconnecting.
+	 */
+	keepReconnecting?(peerPubkeyHex: string): void;
+	/**
 	 * Subscribe to peers connecting; the return value unsubscribes. Optional:
 	 * without it a lane waiting for its receiver learns of the connection only
 	 * when the payer next re-sends its offer.
@@ -339,7 +345,12 @@ export async function establishPeer(
 	host: string,
 	port: number
 ): Promise<boolean> {
-	if (peers.isPeerConnected(peerHex)) return true;
+	if (peers.isPeerConnected(peerHex)) {
+		// A dial without `reconnect: false` would clear a warm dial's mark, and
+		// this path makes none.
+		peers.keepReconnecting?.(peerHex);
+		return true;
+	}
 	const address = `${peerHex}|${host}|${port}`;
 	if (ctx.failedDials?.has(address)) return false;
 	const remainingMs =
