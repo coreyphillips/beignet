@@ -3698,4 +3698,48 @@ describe('Electrum late failure beside a same-record successful subscribe (issue
 		expect(onReceive.callCount, 'the callback').to.equal(0);
 		expect(siblingRefreshSpy.callCount, 'the sibling').to.equal(1);
 	});
+
+	it('still removes the callback when a retry after its removal fails', async () => {
+		const scriptHash = 'cccc';
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+
+		// Keeps the record alive across the removal.
+		const siblingCallback = sinon.spy();
+		const subscribed = await electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive: siblingCallback
+		});
+		expect(subscribed.isOk()).to.equal(true);
+
+		const onReceive = sinon.spy();
+		const earlierGate = createGate();
+		subscriptionGate = earlierGate;
+		const earlier = electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive
+		});
+		await flush();
+		electrum.removeScriptHashCallback({ scriptHash, onReceive });
+		const retryGate = createGate();
+		subscriptionGate = retryGate;
+		const retry = electrum.subscribeToAddresses({
+			scriptHashes: [scriptHash],
+			onReceive
+		});
+		await flush();
+		subscriptionGate = null;
+
+		earlierGate.release();
+		expect((await earlier).isOk()).to.equal(true);
+		subscriptionFailures.add(scriptHash);
+		retryGate.release();
+		expect((await retry).isErr()).to.equal(true);
+
+		await client.addressHandler?.([scriptHash, 'after-deposit']);
+		await flush();
+
+		expect(onReceive.callCount, 'the removed callback').to.equal(0);
+		expect(siblingCallback.callCount, 'the sibling callback').to.equal(1);
+	});
 });
