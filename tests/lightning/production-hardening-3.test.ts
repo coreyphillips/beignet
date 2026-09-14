@@ -1300,6 +1300,42 @@ describe('Production Hardening 3: Integration', function () {
 		expect(Date.now() - started).to.be.below(5_000);
 	});
 
+	it('a connectPeer with timeoutMs dials again when the dial it joined fails first', async () => {
+		const {
+			PeerManager
+		} = require('../../src/lightning/transport/peer-manager');
+		const pm = new PeerManager({ localPrivateKey: crypto.randomBytes(32) });
+		const pubkey = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const timeouts: (number | undefined)[] = [];
+		// The first dial stands in for a reconnect cut off at its default
+		// handshake limit; the second lands.
+		pm.dialPeerOnce = async (
+			_pubkey: string,
+			_host: string,
+			_port: number,
+			_transport: unknown,
+			timeoutMs?: number
+		): Promise<void> => {
+			timeouts.push(timeoutMs);
+			if (timeouts.length === 1) {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				throw new Error('Handshake timeout');
+			}
+		};
+		try {
+			const background = pm.connectPeer(pubkey, '127.0.0.1', 9735);
+			background.catch(() => undefined);
+			await pm.connectPeer(pubkey, '127.0.0.1', 9735, undefined, {
+				timeoutMs: 5_000
+			});
+			expect(timeouts).to.have.length(2);
+			expect(timeouts[0]).to.equal(undefined);
+			expect(timeouts[1]).to.be.within(1, 5_000);
+		} finally {
+			pm.destroy();
+		}
+	});
+
 	it('ChannelManager nextChannelIndex getter/setter', () => {
 		const config = makeCMConfig(makeSeed(80));
 		const manager = new ChannelManager(config);

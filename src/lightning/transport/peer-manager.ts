@@ -336,8 +336,10 @@ export class PeerManager extends EventEmitter {
 	 * start: the node's own start-up reconnect and the app's connect both
 	 * dialled the same primary within a second of each other.
 	 * Dials to different addresses still overlap; their rollback rules are
-	 * unchanged. A joining caller's timeout is ignored: the dial it joins
-	 * keeps its own.
+	 * unchanged. The dial a caller joins keeps its own limits, which can be
+	 * shorter than a joining caller's `timeoutMs`. When it fails with some of
+	 * that time left and no disconnectPeer in between, the caller dials again
+	 * under what remains.
 	 */
 	private dialPeer(
 		pubkey: string,
@@ -350,7 +352,24 @@ export class PeerManager extends EventEmitter {
 			transport ? JSON.stringify(transport) : ''
 		}`;
 		const joined = this.inflightDials.get(key);
-		if (joined) return joined;
+		if (joined) {
+			if (timeoutMs === undefined) return joined;
+			const deadline = Date.now() + timeoutMs;
+			const generation = this.cancelGenerations.get(pubkey) ?? 0;
+			return joined.catch((err) => {
+				const remainingMs = deadline - Date.now();
+				if (
+					remainingMs <= 0 ||
+					(this.cancelGenerations.get(pubkey) ?? 0) !== generation
+				) {
+					throw err;
+				}
+				// The failed dial's own cleanup may not have run yet.
+				if (this.inflightDials.get(key) === joined)
+					this.inflightDials.delete(key);
+				return this.dialPeer(pubkey, host, port, transport, remainingMs);
+			});
+		}
 		const attempt = this.dialPeerOnce(pubkey, host, port, transport, timeoutMs);
 		this.inflightDials.set(key, attempt);
 		void attempt
