@@ -54,6 +54,7 @@ export class FakeDfPeer implements IDfPeerMessaging {
 	readonly dialTimeouts: Array<number | undefined> = [];
 	/** How long a dial takes to land; 'never' leaves it pending for good. */
 	dialDelayMs: number | 'never' = 0;
+	private readonly dialing = new Map<string, Promise<void>>();
 	readonly pubkey: Buffer;
 	readonly id: string;
 
@@ -74,12 +75,30 @@ export class FakeDfPeer implements IDfPeerMessaging {
 		return this.connections.has(peerPubkeyHex);
 	}
 
-	async connectPeer(
+	/**
+	 * A dial to an address that is already being dialed joins that dial and
+	 * opens no socket of its own, as PeerManager does.
+	 */
+	connectPeer(
 		peerPubkeyHex: string,
-		_host?: string,
-		_port?: number,
+		host?: string,
+		port?: number,
 		timeoutMs?: number
 	): Promise<void> {
+		const key = `${peerPubkeyHex}|${host}|${port}`;
+		const joined = this.dialing.get(key);
+		if (joined) return joined;
+		const dial = this.dial(peerPubkeyHex, timeoutMs);
+		this.dialing.set(key, dial);
+		void dial
+			.catch(() => undefined)
+			.then(() => {
+				if (this.dialing.get(key) === dial) this.dialing.delete(key);
+			});
+		return dial;
+	}
+
+	private async dial(peerPubkeyHex: string, timeoutMs?: number): Promise<void> {
 		this.dialAttempts++;
 		this.dialTimeouts.push(timeoutMs);
 		if (this.dialDelayMs === 'never') {

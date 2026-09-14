@@ -1941,6 +1941,23 @@ async function handleDirectFunding(): Promise<void> {
 				})
 			);
 		}
+		case 'prepare': {
+			const request = pos[2];
+			if (!request) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet direct-funding prepare <request>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/direct-funding/prepare', { request })
+			);
+		}
 		case 'send': {
 			const request = pos[2];
 			if (!request) {
@@ -1973,7 +1990,7 @@ async function handleDirectFunding(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet direct-funding [configure|config|request|send]'
+						'Usage: beignet direct-funding [configure|config|request|prepare|send]'
 				}
 			});
 			process.exitCode = 1;
@@ -2980,6 +2997,9 @@ Direct funding (a payer's on-chain payment IS this node's channel funding):
                                          Mint a payment request; the receipt
                                          preimage stays here. --host/--port are
                                          where a payer can reach this node
+  direct-funding prepare <request>       Decode a request and start connecting
+                                         to the node a send would use, without
+                                         spending anything
   direct-funding send <request> [sats] [--max-total-fee sats]
                                          Pay a request from one of our coins.
                                          Refuses only before our witness leaves

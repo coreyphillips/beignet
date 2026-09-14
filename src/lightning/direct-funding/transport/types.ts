@@ -304,6 +304,23 @@ export interface IDfOpenContext {
 }
 
 /**
+ * The connection the first lane a send would open talks over, as `warm` left
+ * it: already up, being dialed, one this node waits for because it is the
+ * receiver's way in, or none this node knows how to start.
+ */
+export type DfWarmConnection =
+	| 'connected'
+	| 'connecting'
+	| 'awaiting_receiver'
+	| 'none';
+
+export interface IDfWarmResult {
+	connection: DfWarmConnection;
+	/** The node that connection is to, hex. Absent for 'none'. */
+	peerNodeId?: string;
+}
+
+/**
  * Make sure the payer holds a connection to `peerHex`, dialing `host:port`
  * when it does not. Resolves false when there is no connection to use: the
  * address already failed in this run, the window is spent, or the dial failed

@@ -328,6 +328,24 @@ describe('LFBW app surface (issue #614)', () => {
 			expect(handler).to.include('maxTotalFeeSat');
 		});
 
+		// Issue #854: the dashboard calls this the moment it recognises a request,
+		// long before Send, and reads whether a connection is on its way.
+		it('POST /direct-funding/prepare takes the request and answers the connection', () => {
+			expect(requestParams('/direct-funding/prepare')).to.have.members([
+				'request'
+			]);
+			expect(responseFields('/direct-funding/prepare')).to.include.members([
+				'requestId',
+				'amountSat',
+				'expiresAt',
+				'connection',
+				'peerNodeId'
+			]);
+			expect(handlerSource('POST /direct-funding/prepare', 500)).to.include(
+				'node.prepareDirectFunding('
+			);
+		});
+
 		// Deliberate, and recorded in src/lightning/README.md: third-party
 		// witness injection is library-only. Over HTTP the same calls would let
 		// anything holding an API token choose the inputs of this node's

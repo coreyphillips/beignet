@@ -989,3 +989,129 @@ describe('Direct-funding transport registry', () => {
 		});
 	});
 });
+
+// Issue #854: a payer that has read a request dials before anyone presses Send.
+describe('Direct-funding transport registry: warm', () => {
+	function payer(enabled: Partial<Record<DfTransportType, boolean>>): {
+		net: FakeDfNetwork;
+		payer: FakeDfPeer;
+		intro: FakeDfPeer;
+		receiver: FakeDfPeer;
+		registry: DfTransportRegistry;
+		loads: number[];
+	} {
+		const net = new FakeDfNetwork();
+		const payerPeer = net.add('warm-payer');
+		const registry = new DfTransportRegistry(undefined, {
+			isPeerConnected: (hex) => payerPeer.isPeerConnected(hex),
+			nodeId: () => payerPeer.pubkey,
+			connectPeer: (hex, host, port, timeoutMs) =>
+				payerPeer.connectPeer(hex, host, port, timeoutMs)
+		});
+		const loads: number[] = [];
+		for (const [type, on] of Object.entries(enabled)) {
+			registry.register({
+				type: Number(type),
+				enabled: on === true,
+				load: () => {
+					loads.push(Number(type));
+					throw new Error('warm must not load a lane');
+				}
+			});
+		}
+		return {
+			net,
+			payer: payerPeer,
+			intro: net.add('warm-intro'),
+			receiver: net.add('warm-receiver'),
+			registry,
+			loads
+		};
+	}
+
+	function onionVia(intro: Buffer, receiver: Buffer): IDfOnionTransport {
+		return {
+			type: DfTransportType.ONION_MESSAGE,
+			host: 'primary.onion',
+			port: 9735,
+			introNodeId: intro,
+			pathKey: receiver,
+			hops: [{ blindedNodeId: receiver, encryptedData: Buffer.alloc(4) }]
+		};
+	}
+
+	it('starts one dial to the introduction node and returns before it lands', async () => {
+		const s = payer({ [DfTransportType.ONION_MESSAGE]: true });
+		s.payer.dialDelayMs = 100;
+		const descriptors = [onionVia(s.intro.pubkey, s.receiver.pubkey)];
+
+		const warmed = s.registry.warm(descriptors, s.receiver.pubkey, 5_000);
+		expect(warmed).to.deep.equal({
+			connection: 'connecting',
+			peerNodeId: s.intro.id
+		});
+		expect(s.payer.dialAttempts).to.equal(1);
+		expect(s.payer.dialTimeouts).to.deep.equal([5_000]);
+		expect(s.payer.isPeerConnected(s.intro.id)).to.equal(false);
+		// Asked again while the dial runs, it joins rather than dials twice.
+		expect(
+			s.registry.warm(descriptors, s.receiver.pubkey, 5_000).connection
+		).to.equal('connecting');
+		expect(s.payer.dialAttempts).to.equal(1);
+
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		expect(s.payer.isPeerConnected(s.intro.id)).to.equal(true);
+		expect(s.loads, 'no lane was opened').to.deep.equal([]);
+	});
+
+	it('reports a connection that already exists and dials nothing', () => {
+		const s = payer({ [DfTransportType.ONION_MESSAGE]: true });
+		s.net.connect(s.payer, s.intro);
+		expect(
+			s.registry.warm(
+				[onionVia(s.intro.pubkey, s.receiver.pubkey)],
+				s.receiver.pubkey
+			)
+		).to.deep.equal({ connection: 'connected', peerNodeId: s.intro.id });
+		expect(s.payer.dialAttempts).to.equal(0);
+	});
+
+	it('passes over a disabled lane, as a send would', () => {
+		const s = payer({
+			[DfTransportType.DIRECT_PEER]: false,
+			[DfTransportType.ONION_MESSAGE]: false,
+			[DfTransportType.LSP_RELAY]: true
+		});
+		s.payer.dialDelayMs = 'never';
+		const warmed = s.registry.warm(
+			[
+				{ type: DfTransportType.DIRECT_PEER, host: '10.0.0.9', port: 9735 },
+				onionVia(s.intro.pubkey, s.receiver.pubkey)
+			],
+			s.receiver.pubkey
+		);
+		// The relay synthesized from the onion descriptor names the same node.
+		expect(warmed).to.deep.equal({
+			connection: 'connecting',
+			peerNodeId: s.intro.id
+		});
+		expect(s.payer.dialAttempts).to.equal(1);
+	});
+
+	it('waits rather than dials when this node introduces the receiver', () => {
+		const s = payer({
+			[DfTransportType.DIRECT_PEER]: true,
+			[DfTransportType.ONION_MESSAGE]: true
+		});
+		expect(
+			s.registry.warm(
+				[onionVia(s.payer.pubkey, s.receiver.pubkey)],
+				s.receiver.pubkey
+			)
+		).to.deep.equal({
+			connection: 'awaiting_receiver',
+			peerNodeId: s.receiver.id
+		});
+		expect(s.payer.dialAttempts).to.equal(0);
+	});
+});

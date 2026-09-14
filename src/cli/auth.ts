@@ -273,6 +273,8 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	// ── Admin-only: channel and peer management ──
 	'POST /peer/connect': [],
 	'POST /peer/disconnect': [],
+	// Dials the peer a stranger's request names, as POST /peer/connect would.
+	'POST /direct-funding/prepare': [],
 	'POST /peers/bootstrap': [],
 	'POST /peers/connect-seeds': [],
 	'POST /trusted-peer/add': [],

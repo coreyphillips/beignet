@@ -403,6 +403,23 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/direct-funding/prepare': {
+				post: {
+					summary:
+						'Read a direct-funding request and start connecting to the node a send of it would talk to first (the receiver, or its introduction node or relay), without waiting for the dial. Spends nothing: no coin is selected or reserved and no payment record is written. A later /direct-funding/send joins a dial still in progress. Call it as soon as a request is recognised, so a slow dial (Tor) is not waiting in front of the exchange. connection is connected, connecting, awaiting_receiver (this node is the introduction node for the receiver, so there is nothing to dial) or none. Refuses an envelope that does not decode or verify with the same codes send uses. Admin scope',
+					tags: ['DirectFunding'],
+					requestBody: bodyContent({ request: 'string' }),
+					responses: {
+						'200': {
+							description:
+								'What the request says, and the connection a send would use',
+							content: jsonContent({
+								$ref: '#/components/schemas/DirectFundingPrepareResult'
+							})
+						}
+					}
+				}
+			},
 			'/direct-funding/send': {
 				post: {
 					summary:
@@ -4087,6 +4104,32 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'integer',
 							description:
 								'Smallest offer served, never below the 5000 sat protocol floor'
+						}
+					}
+				},
+				DirectFundingPrepareResult: {
+					type: 'object',
+					properties: {
+						requestId: { type: 'string' },
+						receiverNodeId: { type: 'string' },
+						amountSat: {
+							type: 'integer',
+							nullable: true,
+							description:
+								'Null when the request leaves the amount to the payer'
+						},
+						expiresAt: {
+							type: 'integer',
+							description: 'Milliseconds since epoch'
+						},
+						connection: {
+							type: 'string',
+							enum: ['connected', 'connecting', 'awaiting_receiver', 'none']
+						},
+						peerNodeId: {
+							type: 'string',
+							description:
+								'The node the connection is to. Absent when connection is none'
 						}
 					}
 				},

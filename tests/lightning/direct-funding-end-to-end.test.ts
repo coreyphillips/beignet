@@ -204,7 +204,9 @@ async function setup(
 
 	const payerRegistry = new DfTransportRegistry(undefined, {
 		isPeerConnected: (hex) => payerPeer.isPeerConnected(hex),
-		nodeId: () => payerPeer.pubkey
+		nodeId: () => payerPeer.pubkey,
+		connectPeer: (hex, host, port, timeoutMs) =>
+			payerPeer.connectPeer(hex, host, port, timeoutMs)
 	});
 	const payerFactory = new DfDirectPeerLaneFactory(payerPeer);
 	payerRegistry.register({
@@ -725,6 +727,55 @@ describe('Direct funding end to end: payer against receiver', () => {
 				expect(e2e.node.opens, 'the offer never arrived').to.have.length(1);
 				expect(elapsed).to.be.within(550, 900);
 				expect(e2e.wallet.frozen.size).to.equal(0);
+			} finally {
+				e2e.stop();
+			}
+		});
+
+		// Issue #854: the payer reads the request before anyone presses Send.
+		it('prepare starts one dial, returns before it lands, and records nothing', async () => {
+			const e2e = await setup({ payerDialMs: 300 });
+			try {
+				const prepared = e2e.sender.prepare(e2e.request);
+				expect(prepared).to.deep.include({
+					requestId: e2e.record.requestId,
+					receiverNodeId: e2e.node.nodeId.toString('hex'),
+					amountSat: null,
+					expiresAt: e2e.record.expiresAt,
+					connection: 'connecting',
+					peerNodeId: e2e.node.nodeId.toString('hex')
+				});
+				expect(e2e.payerDials()).to.equal(1);
+				expect(e2e.payerDialTimeouts()).to.deep.equal([4_000]);
+				expect(e2e.payments.list()).to.deep.equal([]);
+				expect(e2e.wallet.frozen.size).to.equal(0);
+				expect(e2e.wallet.listSpendable()).to.have.length(1);
+				await flush(8);
+				expect(e2e.node.opens).to.have.length(0);
+			} finally {
+				e2e.stop();
+			}
+		});
+
+		it('a send made while the prepared dial runs joins it and offers when it lands', async () => {
+			const e2e = await setup({ payerDialMs: 400, offerTimeoutMs: 1_500 });
+			try {
+				e2e.sender.prepare(e2e.request);
+				await new Promise((resolve) => setTimeout(resolve, 250));
+				let offeredAfterMs = 0;
+				const { error, status } = await sendTimed(e2e, async () => {
+					const sendStarted = Date.now();
+					await waitFor(() => e2e.node.opens.length === 1);
+					offeredAfterMs = Date.now() - sendStarted;
+					e2e.node.completeNegotiation(e2e.coin, e2e.expectedOffer(), {
+						fundingScript: e2e.fundingScript
+					});
+				});
+				expect(error).to.equal(null);
+				expect(status).to.equal('SIGNED_PENDING');
+				expect(e2e.payerDials(), 'one socket').to.equal(1);
+				// What was left of the prepared dial, not a dial of its own.
+				expect(offeredAfterMs).to.be.below(350);
 			} finally {
 				e2e.stop();
 			}

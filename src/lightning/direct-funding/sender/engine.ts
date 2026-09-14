@@ -74,6 +74,7 @@ import {
 	DF_LOG_SEND_COIN_SPENT,
 	DF_LOG_SEND_COMMITTED,
 	DF_LOG_SEND_COMPLETED,
+	DF_LOG_SEND_PREPARED,
 	DF_LOG_SEND_REFUSED,
 	DF_LOG_SEND_REPLAYED,
 	DF_LOG_SEND_STARTED,
@@ -85,6 +86,7 @@ import {
 	DF_SENDER_SWEEP_INTERVAL_MS,
 	IDfCoinSigner,
 	IDfPaymentRecord,
+	IDfPrepareResult,
 	IDfSenderCoin,
 	IDfSenderConfig,
 	IDfSenderDeps,
@@ -413,6 +415,43 @@ export class DirectFundingSender {
 			signature: signer.signOwnership(
 				ownershipDigest(offerId, txid, coin.vout, amountSat)
 			)
+		};
+	}
+
+	/**
+	 * Read a request and start connecting to the node a send of it would talk to
+	 * first, before anyone has asked to pay it. Returns without waiting for the
+	 * dial, and spends nothing: no coin is selected or reserved, and no payment
+	 * record is written. A send made later joins a dial that is still running.
+	 *
+	 * Throws what `send` would throw for an envelope that does not decode or
+	 * verify, so a request that cannot be paid is refused while it is still on
+	 * the screen.
+	 */
+	prepare(
+		encodedRequest: string,
+		opts: Pick<IDfSendOptions, 'now'> = {}
+	): IDfPrepareResult {
+		const env = this.decode(encodedRequest, opts.now);
+		// The send's own offer window, so a slow dial is not cut short of what the
+		// send would have allowed it.
+		const warm = this.deps.registry.warm(
+			env.transports,
+			env.receiverNodeId,
+			this.cfg.offerTimeoutMs
+		);
+		const requestId = env.requestId.toString('hex');
+		this.log(DF_LOG_SEND_PREPARED, {
+			requestId,
+			connection: warm.connection,
+			...(warm.peerNodeId ? { peerNodeId: warm.peerNodeId } : {})
+		});
+		return {
+			requestId,
+			receiverNodeId: env.receiverNodeId.toString('hex'),
+			amountSat: env.amountSat === undefined ? null : Number(env.amountSat),
+			expiresAt: env.expiresAt,
+			...warm
 		};
 	}
 

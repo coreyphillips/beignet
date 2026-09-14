@@ -143,6 +143,7 @@ import {
 	DirectFundingPaymentStore,
 	DirectFundingSender,
 	IDfPaymentRecord,
+	IDfPrepareResult,
 	IDfSendResult,
 	chainHashForNetwork
 } from '../lightning/direct-funding';
@@ -7991,6 +7992,33 @@ export class BeignetNode extends EventEmitter {
 			this.log('warn', 'direct funding request mint failed', {
 				error: err instanceof Error ? err.message : String(err)
 			});
+			throw this.directFundingFailure(err);
+		}
+	}
+
+	/**
+	 * Read a direct-funding request and start connecting to the node a send of it
+	 * would talk to first, so the dial is under way before the user presses
+	 * Send. Spends nothing and records nothing, so neither the drain nor the
+	 * spend limit applies.
+	 */
+	prepareDirectFunding(opts: { request?: string }): IDfPrepareResult {
+		const sender = this.directFundingSender;
+		if (!sender) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'direct funding is not available on this node'
+			);
+		}
+		if (!opts.request || typeof opts.request !== 'string') {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'request (the payment request from the BIP 21 URI) is required'
+			);
+		}
+		try {
+			return sender.prepare(opts.request);
+		} catch (err) {
 			throw this.directFundingFailure(err);
 		}
 	}

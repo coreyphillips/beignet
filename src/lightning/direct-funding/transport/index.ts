@@ -52,6 +52,7 @@ export {
 export type {
 	DfFrameHandler,
 	DfTransportLog,
+	DfWarmConnection,
 	IDfCustomMessage,
 	IDfInboundFrame,
 	IDfLaneFactory,
@@ -61,7 +62,8 @@ export type {
 	IDfPeerMessaging,
 	IDfRelayServerConfig,
 	IDfTransport,
-	IDfTransportConfig
+	IDfTransportConfig,
+	IDfWarmResult
 } from './types';
 
 export interface IDfTransportDeps {
@@ -94,7 +96,9 @@ export function createDirectFundingTransports(
 ): IDfTransportStack {
 	const registry = new DfTransportRegistry(log, {
 		isPeerConnected: (hex) => deps.peers.isPeerConnected(hex),
-		nodeId: () => deps.nodeId()
+		nodeId: () => deps.nodeId(),
+		connectPeer: (hex, host, port, timeoutMs) =>
+			deps.peers.connectPeer(hex, host, port, timeoutMs)
 	});
 
 	registry.register({
