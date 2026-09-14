@@ -811,8 +811,9 @@ export class LightningNode extends EventEmitter {
 	// from memory. Without an invoice, nothing else keeps the hash closed to a
 	// sender replaying the preimage.
 	private prunedKeysendHashes: Set<string> = new Set();
-	// Hashes of settled outgoing payments pruned from memory. The payee and
-	// every hop know the preimage, and could keysend it back over our row.
+	// Hashes of terminal outgoing payments pruned from memory. Their durable
+	// rows remain, and the payee and every hop can know the preimage, so a
+	// keysend or an invoice on the hash would write over the row.
 	private prunedOutgoingHashes: Set<string> = new Set();
 	private scidToChannelId: Map<string, Buffer> = new Map();
 	private htlcPaymentMap: Map<string, string> = new Map(); // "channelId:htlcId" → paymentHash hex
@@ -9834,10 +9835,7 @@ export class LightningNode extends EventEmitter {
 			) {
 				this.prunedKeysendHashes.add(hash);
 			}
-			if (
-				payment.direction === PaymentDirection.OUTGOING &&
-				payment.status === PaymentStatus.COMPLETED
-			) {
+			if (payment.direction === PaymentDirection.OUTGOING) {
 				this.prunedOutgoingHashes.add(hash);
 			}
 			pruned++;
@@ -17479,7 +17477,7 @@ export class LightningNode extends EventEmitter {
 			// A hash owned by an invoice we issued is refused too: its settled
 			// payment can be pruned from memory while the invoice stays, and a
 			// keysend with the revealed preimage would then settle it again.
-			// A pruned settled keysend or settled outgoing payment is refused
+			// A pruned settled keysend or pruned outgoing payment is refused
 			// for the same reason.
 			const outgoing = this.payments.get(hashHex);
 			if (
@@ -17867,7 +17865,8 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * True when this node already holds any record under the hash: an
 	 * invoice, a payment record in either direction, a parked hold, or a
-	 * settled keysend pruned from memory (its durable row still exists).
+	 * settled keysend or outgoing payment pruned from memory (its durable row
+	 * still exists).
 	 */
 	paymentHashInUse(paymentHash: Buffer): boolean {
 		const hashHex = paymentHash.toString('hex');
@@ -17875,6 +17874,7 @@ export class LightningNode extends EventEmitter {
 			this.invoices.has(hashHex) ||
 			this.payments.has(hashHex) ||
 			this.prunedKeysendHashes.has(hashHex) ||
+			this.prunedOutgoingHashes.has(hashHex) ||
 			this.heldInvoiceHashes.has(hashHex) ||
 			this.heldHtlcs.has(hashHex)
 		);
