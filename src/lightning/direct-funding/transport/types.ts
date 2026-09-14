@@ -260,12 +260,16 @@ export interface IDfPeerMessaging {
 	/** Subscribe to inbound custom messages; the return value unsubscribes. */
 	onCustomMessage(cb: (msg: IDfCustomMessage) => void): () => void;
 	isPeerConnected(peerPubkeyHex: string): boolean;
-	/** `timeoutMs`, when given, replaces the dial's default establishment bounds. */
+	/**
+	 * `timeoutMs`, when given, replaces the dial's default establishment bounds.
+	 * `reconnect: false` keeps a failed dial from arming auto-reconnect.
+	 */
 	connectPeer(
 		peerPubkeyHex: string,
 		host: string,
 		port: number,
-		timeoutMs?: number
+		timeoutMs?: number,
+		options?: { reconnect?: boolean }
 	): Promise<void>;
 	/**
 	 * Subscribe to peers connecting; the return value unsubscribes. Optional:

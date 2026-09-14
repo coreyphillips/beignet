@@ -60,7 +60,10 @@ export interface IDfRegistryPeerView {
 	isPeerConnected?(peerPubkeyHex: string): boolean;
 	/** This node's own id, to recognise a relay descriptor naming itself. */
 	nodeId?(): Buffer;
-	/** Dial a peer, as the lanes do. Without it `warm` starts nothing. */
+	/**
+	 * Dial a peer without arming auto-reconnect on failure. Without it `warm`
+	 * starts nothing.
+	 */
 	connectPeer?(
 		peerPubkeyHex: string,
 		host: string,

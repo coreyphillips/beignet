@@ -1336,6 +1336,28 @@ describe('Production Hardening 3: Integration', function () {
 		}
 	});
 
+	it('a failed connectPeer with reconnect false arms no reconnect', async () => {
+		const {
+			PeerManager
+		} = require('../../src/lightning/transport/peer-manager');
+		const pm = new PeerManager({
+			localPrivateKey: crypto.randomBytes(32),
+			autoReconnect: true
+		});
+		const oneShot = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const ordinary = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		try {
+			await pm
+				.connectPeer(oneShot, '127.0.0.1', 1, undefined, { reconnect: false })
+				.catch(() => undefined);
+			await pm.connectPeer(ordinary, '127.0.0.1', 1).catch(() => undefined);
+			expect(pm.reconnectTimers.has(oneShot)).to.equal(false);
+			expect(pm.reconnectTimers.has(ordinary)).to.equal(true);
+		} finally {
+			pm.destroy();
+		}
+	});
+
 	it('ChannelManager nextChannelIndex getter/setter', () => {
 		const config = makeCMConfig(makeSeed(80));
 		const manager = new ChannelManager(config);

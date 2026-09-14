@@ -181,6 +181,12 @@ export interface IPeerDialOptions {
 	 * longer than this; a caller that needs a hard bound races the dial.
 	 */
 	timeoutMs?: number;
+	/**
+	 * false: a failed dial does not arm auto-reconnect. For a speculative dial
+	 * that nothing may ever follow up, which auto-reconnect would otherwise
+	 * retry for good.
+	 */
+	reconnect?: boolean;
 }
 
 type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
@@ -316,6 +322,7 @@ export class PeerManager extends EventEmitter {
 			// that. The rejection itself still propagates.
 			if (
 				this.autoReconnect &&
+				options.reconnect !== false &&
 				(this.cancelGenerations.get(pubkey) ?? 0) === cancelGeneration
 			) {
 				this.scheduleReconnect(pubkey);

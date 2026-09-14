@@ -23320,20 +23320,23 @@ export class LightningNode extends EventEmitter {
 					},
 					isPeerConnected: (peer): boolean =>
 						this.listPeers().some((p) => p.pubkey === peer),
-					connectPeer: async (peer, host, port, timeoutMs): Promise<void> => {
+					connectPeer: async (
+						peer,
+						host,
+						port,
+						timeoutMs,
+						options
+					): Promise<void> => {
 						// Every lane dials through here, so this is the one place a
 						// descriptor naming this node cannot turn into a connection to
 						// itself (issue #806).
 						if (peer === this.getNodeId()) {
 							throw new Error('refusing to dial this node itself');
 						}
-						await this.connectPeer(
-							peer,
-							host,
-							port,
-							undefined,
-							timeoutMs !== undefined ? { timeoutMs } : {}
-						);
+						await this.connectPeer(peer, host, port, undefined, {
+							...options,
+							...(timeoutMs !== undefined ? { timeoutMs } : {})
+						});
 					},
 					onPeerConnect: (cb): (() => void) => {
 						const handler = (pubkey: string): void => cb(pubkey);
