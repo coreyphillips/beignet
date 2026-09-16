@@ -965,6 +965,23 @@ export class LightningNode extends EventEmitter {
 	// refuses instead of resolving the same set a second time and reporting a
 	// second terminal state for it.
 	private resolvingHeldHtlcs: Set<string> = new Set();
+	// Settles and cancels the channel accepted for only part of a parked set,
+	// keyed by payment hash. The parts still in heldHtlcs owe this outcome
+	// and no other: failing back the rest of a set whose preimage is out
+	// loses the receiver funds, and settling the rest of a set already failed
+	// back reveals the preimage for a partial payment. `resolved` holds the
+	// parts already accepted, so the terminal event describes the whole set.
+	private heldResolutions: Map<
+		string,
+		(
+			| { outcome: 'settle' }
+			| {
+					outcome: 'cancel';
+					failureCode: number;
+					reason: HoldCancelReason;
+			  }
+		) & { resolved: Array<{ amountMsat: bigint; cltvExpiry: number }> }
+	> = new Map();
 	private holdInvoiceEventQueue: Array<{
 		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled';
 		event: IHoldInvoiceStateEvent | IHoldCancelledEvent;
@@ -2829,6 +2846,12 @@ export class LightningNode extends EventEmitter {
 						amountMsat: string;
 						cltvExpiry: number;
 					}>;
+					resolution?: {
+						outcome: 'settle' | 'cancel';
+						failureCode?: number;
+						reason?: HoldCancelReason;
+						resolved: Array<{ amountMsat: string; cltvExpiry: number }>;
+					};
 				}>;
 				for (const entry of parsed) {
 					this.heldHtlcs.set(
@@ -2839,6 +2862,24 @@ export class LightningNode extends EventEmitter {
 							amountMsat: BigInt(h.amountMsat),
 							cltvExpiry: h.cltvExpiry
 						}))
+					);
+					const r = entry.resolution;
+					if (!r) continue;
+					const resolved = r.resolved.map((h) => ({
+						amountMsat: BigInt(h.amountMsat),
+						cltvExpiry: h.cltvExpiry
+					}));
+					this.heldResolutions.set(
+						entry.hashHex,
+						r.outcome === 'settle'
+							? { outcome: 'settle', resolved }
+							: {
+									outcome: 'cancel',
+									failureCode:
+										r.failureCode ?? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+									reason: r.reason ?? 'api',
+									resolved
+							  }
 					);
 				}
 			} catch {
@@ -3864,6 +3905,7 @@ export class LightningNode extends EventEmitter {
 			// what is parked for it.
 			this.asyncPaymentManager.onChannelUsable(channelId.toString('hex'));
 			this.retryOwedHeldForwardFailures(channelId.toString('hex'));
+			this.retryHeldResolutions(channelId);
 			const peer = this.channelManager.getPeerForChannel(channelId);
 			if (peer) this.asyncPaymentManager.sendNotice(peer);
 		});
@@ -17799,9 +17841,12 @@ export class LightningNode extends EventEmitter {
 			const parkedMsat = parked.reduce((sum, h) => sum + h.amountMsat, 0n);
 			if (
 				!alreadyParked &&
-				finalInvoice?.amountMsat &&
-				finalInvoice.amountMsat > 0n &&
-				parkedMsat >= finalInvoice.amountMsat
+				// A set with a settle or cancel partway through was acted on
+				// already, whatever its parked remainder still adds up to.
+				(this.heldResolutions.has(hashHex) ||
+					(finalInvoice?.amountMsat &&
+						finalInvoice.amountMsat > 0n &&
+						parkedMsat >= finalInvoice.amountMsat))
 			) {
 				this.emitStructuredLog('htlc', 'held_set_complete', {
 					paymentHash: hashHex,
@@ -18002,8 +18047,10 @@ export class LightningNode extends EventEmitter {
 	 * generated at createInvoice; an external preimage (validated against the
 	 * hash) is required for hold invoices created with an external payment hash.
 	 * Returns false when nothing is parked for the hash, when another
-	 * settle/cancel is already dispatching for it, or when the channel refused
-	 * every parked part.
+	 * settle/cancel is already dispatching for it, when a cancel already
+	 * failed part of the set back, or when the channel refused any parked
+	 * part. Refused parts stay parked and the settle is retried on reestablish
+	 * and on every block; true only once every part was fulfilled.
 	 * Throws if the preimage cannot be persisted, before revealing it.
 	 */
 	settleHeldHtlc(paymentHash: Buffer, preimage?: Buffer): boolean {
@@ -18014,6 +18061,7 @@ export class LightningNode extends EventEmitter {
 		// resolvingHeldHtlcs): the caller is a reentrant one, not a second
 		// resolution.
 		if (this.resolvingHeldHtlcs.has(hashHex)) return false;
+		if (this.heldResolutions.get(hashHex)?.outcome === 'cancel') return false;
 
 		const pre = preimage ?? this.preimages.get(hashHex);
 		if (!pre) {
@@ -18042,14 +18090,22 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.recordPreimage(paymentHash, pre);
 
 		this.resolvingHeldHtlcs.add(hashHex);
-		let fulfilled = 0;
+		const prior = this.heldResolutions.get(hashHex);
+		const refused: typeof held = [];
 		try {
+			// Bound before the first fulfil leaves: a block handled on this stack,
+			// or a restart after it, must not fail back a part still to come.
+			this.heldResolutions.set(hashHex, {
+				outcome: 'settle',
+				resolved: prior?.resolved ?? []
+			});
+			this.persistHeldHtlcs();
 			for (const h of held) {
 				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
 				if (!this.channelManager.fulfillHtlc(h.channelId, h.htlcId, pre).ok) {
+					refused.push(h);
 					continue;
 				}
-				fulfilled++;
 				// Only once the fulfil is on its way: a refused part stays parked
 				// for a retry, and a cancel of that part still needs the secret to
 				// build a failure message the payer can decrypt.
@@ -18063,17 +18119,21 @@ export class LightningNode extends EventEmitter {
 		// than closing the invoice SETTLED over HTLCs the payer still holds. The
 		// preimage stays recorded: the monitors need it to claim on-chain if the
 		// channel closes before a retry lands.
-		if (fulfilled === 0) {
+		if (refused.length === held.length) {
+			if (!prior) {
+				this.heldResolutions.delete(hashHex);
+				this.persistHeldHtlcs();
+			}
 			this.emitStructuredLog('htlc', 'held_settle_refused', {
 				paymentHash: hashHex,
 				htlcCount: held.length
 			});
 			return false;
 		}
-
-		this.heldHtlcs.delete(hashHex);
-		this.heldInvoiceHashes.delete(hashHex);
-		this.persistHeldHtlcs();
+		const settledSet = this.advanceHeldResolution(hashHex, held, refused, {
+			outcome: 'settle'
+		});
+		if (!settledSet) return false;
 
 		const payment = this.payments.get(hashHex);
 		if (payment) {
@@ -18097,12 +18157,82 @@ export class LightningNode extends EventEmitter {
 		const event: IHoldInvoiceStateEvent = {
 			paymentHash,
 			state: 'SETTLED',
-			heldAmountMsat: held.reduce((sum, h) => sum + h.amountMsat, 0n),
-			htlcCount: held.length,
-			...this.heldSetExpiry(hashHex, held)
+			heldAmountMsat: settledSet.reduce((sum, h) => sum + h.amountMsat, 0n),
+			htlcCount: settledSet.length,
+			...this.heldSetExpiry(hashHex, settledSet)
 		};
 		this.emitHoldInvoiceEvent('hold:settled', event);
 		return true;
+	}
+
+	/**
+	 * Record a settle or cancel dispatch that the channel accepted for at
+	 * least one part. With every part accepted the set leaves the parked map
+	 * and the whole resolved set is returned for the terminal event. Otherwise
+	 * only the refused parts stay parked, bound to this outcome for
+	 * retryHeldResolutions, and null is returned.
+	 */
+	private advanceHeldResolution(
+		hashHex: string,
+		held: Array<{
+			channelId: Buffer;
+			htlcId: bigint;
+			amountMsat: bigint;
+			cltvExpiry: number;
+		}>,
+		refused: typeof held,
+		chosen:
+			| { outcome: 'settle' }
+			| { outcome: 'cancel'; failureCode: number; reason: HoldCancelReason }
+	): Array<{ amountMsat: bigint; cltvExpiry: number }> | null {
+		const resolved = [
+			...(this.heldResolutions.get(hashHex)?.resolved ?? []),
+			...held
+				.filter((h) => !refused.includes(h))
+				.map((h) => ({ amountMsat: h.amountMsat, cltvExpiry: h.cltvExpiry }))
+		];
+		if (refused.length === 0) {
+			this.heldHtlcs.delete(hashHex);
+			this.heldResolutions.delete(hashHex);
+			this.heldInvoiceHashes.delete(hashHex);
+			this.persistHeldHtlcs();
+			return resolved;
+		}
+		this.heldHtlcs.set(hashHex, refused);
+		this.heldResolutions.set(hashHex, { ...chosen, resolved });
+		this.persistHeldHtlcs();
+		this.emitStructuredLog('htlc', `held_${chosen.outcome}_partial`, {
+			paymentHash: hashHex,
+			resolvedCount: resolved.length,
+			refusedCount: refused.length
+		});
+		return null;
+	}
+
+	/**
+	 * Re-drive the settles and cancels a channel accepted for only part of a
+	 * parked set, limited to sets with a part on `channelId` when given.
+	 */
+	private retryHeldResolutions(channelId?: Buffer): void {
+		for (const [hashHex, resolution] of [...this.heldResolutions]) {
+			const held = this.heldHtlcs.get(hashHex) ?? [];
+			if (channelId && !held.some((h) => h.channelId.equals(channelId))) {
+				continue;
+			}
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			// Contained: on reestablish a throw would skip the commitment that
+			// carries this retry's own fulfil or fail.
+			try {
+				if (resolution.outcome === 'cancel') this.cancelHeldHtlc(paymentHash);
+				else this.settleHeldHtlc(paymentHash);
+			} catch (error) {
+				this.emitStructuredLog('htlc', 'held_resolution_retry_failed', {
+					paymentHash: hashHex,
+					outcome: resolution.outcome,
+					error: error instanceof Error ? error.message : String(error)
+				});
+			}
+		}
 	}
 
 	/**
@@ -18127,8 +18257,11 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Cancel a hold invoice: fail every parked HTLC back to the payer.
 	 * Returns false when nothing is parked for the hash, when another
-	 * settle/cancel is already dispatching for it, or when the channel refused
-	 * every parked part.
+	 * settle/cancel is already dispatching for it, when a settle already
+	 * fulfilled part of the set, or when the channel refused any parked part.
+	 * Refused parts stay parked and the cancel is retried, with its original
+	 * failure code and reason, on reestablish and on every block; true only
+	 * once every part was failed back.
 	 */
 	cancelHeldHtlc(
 		paymentHash: Buffer,
@@ -18142,10 +18275,24 @@ export class LightningNode extends EventEmitter {
 		// resolvingHeldHtlcs): the caller is a reentrant one, not a second
 		// resolution.
 		if (this.resolvingHeldHtlcs.has(hashHex)) return false;
+		const chosen = this.heldResolutions.get(hashHex);
+		if (chosen?.outcome === 'settle') return false;
+		if (chosen) {
+			failureCode = chosen.failureCode;
+			cancelReason = chosen.reason;
+		}
 
 		this.resolvingHeldHtlcs.add(hashHex);
-		let failed = 0;
+		const refused: typeof held = [];
 		try {
+			// Bound before the first fail leaves, as in settleHeldHtlc.
+			this.heldResolutions.set(hashHex, {
+				outcome: 'cancel',
+				failureCode,
+				reason: cancelReason,
+				resolved: chosen?.resolved ?? []
+			});
+			this.persistHeldHtlcs();
 			for (const h of held) {
 				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
 				const ss = this.receivedHtlcSharedSecrets.get(key);
@@ -18162,9 +18309,9 @@ export class LightningNode extends EventEmitter {
 					  )
 					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				if (!this.channelManager.failHtlc(h.channelId, h.htlcId, reason).ok) {
+					refused.push(h);
 					continue;
 				}
-				failed++;
 				// The shared secret goes only once the failure is on its way: a
 				// refused part stays parked and is retried, and a retry that lost
 				// the secret can only send a zeroed packet the payer cannot decrypt.
@@ -18177,7 +18324,11 @@ export class LightningNode extends EventEmitter {
 		// fail, for one). Report the refusal and leave the set parked rather than
 		// closing the invoice CANCELLED over HTLCs the payer still holds; the
 		// expiry sweeper retries this same call on every block.
-		if (failed === 0) {
+		if (refused.length === held.length) {
+			if (!chosen) {
+				this.heldResolutions.delete(hashHex);
+				this.persistHeldHtlcs();
+			}
 			this.emitStructuredLog('htlc', 'held_cancel_refused', {
 				paymentHash: hashHex,
 				reason: cancelReason,
@@ -18185,16 +18336,19 @@ export class LightningNode extends EventEmitter {
 			});
 			return false;
 		}
+		const failedSet = this.advanceHeldResolution(hashHex, held, refused, {
+			outcome: 'cancel',
+			failureCode,
+			reason: cancelReason
+		});
+		if (!failedSet) return false;
 
-		this.heldHtlcs.delete(hashHex);
-		this.heldInvoiceHashes.delete(hashHex);
-		this.persistHeldHtlcs();
 		this.markHoldInvoiceCancelled(
 			hashHex,
 			cancelReason,
-			held.length,
-			held.reduce((sum, h) => sum + h.amountMsat, 0n),
-			held
+			failedSet.length,
+			failedSet.reduce((sum, h) => sum + h.amountMsat, 0n),
+			failedSet
 		);
 		this.emitStructuredLog('htlc', 'held_cancelled', {
 			paymentHash: hashHex,
@@ -18275,11 +18429,12 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const held = this.heldHtlcs.get(hashHex);
 		if (held && held.length > 0) {
-			const count = held.length;
+			const count =
+				held.length + (this.heldResolutions.get(hashHex)?.resolved.length ?? 0);
 			// cancelHeldHtlc also marks the invoice cancelled. A refusal (a settle
-			// already dispatching for this hash, or a channel that failed nothing
-			// back) leaves the invoice open, so it must not be reported as a
-			// cancellation.
+			// already dispatching or partly done for this hash, or a channel that
+			// refused a part) leaves the invoice open, so it must not be reported
+			// as a cancellation.
 			if (!this.cancelHeldHtlc(paymentHash)) return null;
 			return { htlcsFailed: count };
 		}
@@ -18353,7 +18508,11 @@ export class LightningNode extends EventEmitter {
 	 */
 	private scanExpiringHeldHtlcs(height: number): void {
 		if (height <= 0) return;
+		// A set with an outcome already chosen retries that outcome instead:
+		// the expiry cancel would fail back parts whose preimage is out.
+		this.retryHeldResolutions();
 		for (const [hashHex, held] of this.heldHtlcs) {
+			if (this.heldResolutions.has(hashHex)) continue;
 			const soon = held.some(
 				(h) =>
 					h.cltvExpiry > 0 && h.cltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
@@ -18379,8 +18538,15 @@ export class LightningNode extends EventEmitter {
 				amountMsat: string;
 				cltvExpiry: number;
 			}>;
+			resolution?: {
+				outcome: 'settle' | 'cancel';
+				failureCode?: number;
+				reason?: HoldCancelReason;
+				resolved: Array<{ amountMsat: string; cltvExpiry: number }>;
+			};
 		}> = [];
 		for (const [hashHex, held] of this.heldHtlcs) {
+			const r = this.heldResolutions.get(hashHex);
 			serial.push({
 				hashHex,
 				htlcs: held.map((h) => ({
@@ -18388,7 +18554,16 @@ export class LightningNode extends EventEmitter {
 					htlcId: h.htlcId.toString(),
 					amountMsat: h.amountMsat.toString(),
 					cltvExpiry: h.cltvExpiry
-				}))
+				})),
+				...(r && {
+					resolution: {
+						...r,
+						resolved: r.resolved.map((h) => ({
+							amountMsat: h.amountMsat.toString(),
+							cltvExpiry: h.cltvExpiry
+						}))
+					}
+				})
 			});
 		}
 		this.safeStorage(
@@ -24567,11 +24742,17 @@ export class LightningNode extends EventEmitter {
 				// A parked hold-invoice HTLC whose preimage was never revealed must
 				// be failed off-chain by the held-HTLC sweeper (same margin), not
 				// force-closed to claim: claiming would settle a payment the
-				// operator has not released.
+				// operator has not released. A set with a settle partway through
+				// has released it, so its remaining parts take the claim.
+				const resolution =
+					paymentHashHex !== undefined
+						? this.heldResolutions.get(paymentHashHex)
+						: undefined;
 				const parkedHold =
 					htlc.state !== HtlcState.FULFILLED &&
 					paymentHashHex !== undefined &&
-					this.heldInvoiceHashes.has(paymentHashHex);
+					this.heldInvoiceHashes.has(paymentHashHex) &&
+					resolution?.outcome !== 'settle';
 				const haveClaim =
 					!parkedHold &&
 					(htlc.state === HtlcState.FULFILLED ||
@@ -24700,6 +24881,18 @@ export class LightningNode extends EventEmitter {
 						break; // channel is closing; stop scanning it
 					}
 
+					// A part owed a recorded cancel is failed by retryHeldResolutions,
+					// which keeps the shared secret until the channel accepts the fail.
+					if (
+						resolution?.outcome === 'cancel' &&
+						this.heldHtlcs
+							.get(paymentHashHex!)
+							?.some(
+								(h) => h.channelId.equals(channelId) && h.htlcId === htlc.id
+							)
+					) {
+						continue;
+					}
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
 					const blindedRole = this.blindedRoleFor(channelId, htlc.id);
 					if (blindedRole) {
