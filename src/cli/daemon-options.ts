@@ -74,6 +74,13 @@ export function daemonOptions(
 		guardianMaxBytesPerSet: config.guardianMaxBytesPerSet,
 		guardianMaxSets: config.guardianMaxSets,
 		guardianMaxCiphertextBytes: config.guardianMaxCiphertextBytes,
+		// FFOR offline receive (issue #729). Each role is its own opt-in and
+		// the daemon validates the pair it cares about: fforIssuer without
+		// fforWitness refuses startup by name, which it could not do while
+		// these were parsed here and dropped.
+		fforSettle: config.fforSettle,
+		fforWitness: config.fforWitness,
+		fforIssuer: config.fforIssuer,
 		autoBootstrap: config.autoBootstrap,
 		connectTimeoutMs: config.connectTimeoutMs
 	};
