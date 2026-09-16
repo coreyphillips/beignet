@@ -37,7 +37,12 @@ const SWAP_VARS = [
 	'BEIGNET_SWAP_MAX_CONCURRENT',
 	'BEIGNET_SWAP_SUBMARINE',
 	'BEIGNET_GUARDIAN_SERVE',
-	'BEIGNET_GUARDIAN_MAX_SETS'
+	'BEIGNET_GUARDIAN_MAX_SETS',
+	'BEIGNET_FFOR_SETTLE',
+	'BEIGNET_FFOR_MAX_BUDGET_MSAT',
+	'BEIGNET_FFOR_WITNESS',
+	'BEIGNET_FFOR_WITNESS_MAX_MAILBOXES',
+	'BEIGNET_FFOR_ISSUER'
 ];
 
 /** An offline config literal: no Electrum, no gossip, nothing to reach. */
@@ -113,6 +118,48 @@ describe('daemon options from config', () => {
 		const opts = daemonOptions(offlineConfig(), 0);
 		expect(opts.swaps).to.equal(undefined);
 		expect(opts.guardianServe).to.equal(undefined);
+		expect(opts.fforSettle).to.equal(undefined);
+		expect(opts.fforWitness).to.equal(undefined);
+		expect(opts.fforIssuer).to.equal(undefined);
+	});
+
+	it('forwards the FFOR roles and their limits', () => {
+		const opts = daemonOptions(
+			offlineConfig({
+				fforSettle: {
+					enabled: true,
+					maxBudgetMsat: '5000000000',
+					maxEpochBlocks: 2016,
+					feeBaseMsat: 1000,
+					feePpm: 5000
+				},
+				fforWitness: { enabled: true, maxMailboxes: 8 },
+				fforIssuer: true
+			}),
+			0
+		);
+		expect(opts.fforSettle?.enabled).to.equal(true);
+		expect(opts.fforSettle?.maxBudgetMsat).to.equal('5000000000');
+		expect(opts.fforSettle?.maxEpochBlocks).to.equal(2016);
+		expect(opts.fforWitness?.enabled).to.equal(true);
+		expect(opts.fforWitness?.maxMailboxes).to.equal(8);
+		expect(opts.fforIssuer).to.equal(true);
+	});
+
+	it('carries the FFOR environment through resolveConfig and into the options', () => {
+		process.env.BEIGNET_FFOR_SETTLE = 'true';
+		process.env.BEIGNET_FFOR_MAX_BUDGET_MSAT = '5000000000';
+		process.env.BEIGNET_FFOR_WITNESS = 'true';
+		process.env.BEIGNET_FFOR_WITNESS_MAX_MAILBOXES = '8';
+		process.env.BEIGNET_FFOR_ISSUER = 'true';
+		const config = resolveConfig({});
+		expect(config.fforSettle?.enabled, 'config').to.equal(true);
+		const opts = daemonOptions(config, 0);
+		expect(opts.fforSettle?.enabled, 'options').to.equal(true);
+		expect(opts.fforSettle?.maxBudgetMsat).to.equal('5000000000');
+		expect(opts.fforWitness?.enabled).to.equal(true);
+		expect(opts.fforWitness?.maxMailboxes).to.equal(8);
+		expect(opts.fforIssuer).to.equal(true);
 	});
 
 	it('forwards every config field the daemon accepts as an option', () => {
@@ -149,13 +196,7 @@ describe('daemon options from config', () => {
 		]);
 		const forwarded = new Set(Object.keys(daemonOptions(offlineConfig(), 0)));
 		// Deliberately held back, with the reason:
-		const held = new Set([
-			// The FFOR issuer, witness and settlement roles (their env vars are
-			// not documented for the CLI yet); wire them with that surface.
-			'fforIssuer',
-			'fforWitness',
-			'fforSettle'
-		]);
+		const held = new Set<string>([]);
 
 		const missing = [...config].filter(
 			(k) => accepted.has(k) && !forwarded.has(k) && !held.has(k)
@@ -165,6 +206,82 @@ describe('daemon options from config', () => {
 			missing,
 			`not forwarded to the daemon: ${missing.join(', ')}`
 		).to.deep.equal([]);
+	});
+});
+
+describe('a daemon started from those options runs the FFOR roles', function () {
+	this.timeout(60_000);
+	let dataDir: string;
+	let daemon: Awaited<ReturnType<typeof startDaemon>> | null = null;
+
+	beforeEach(() => {
+		dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ffor-opts-'));
+	});
+
+	afterEach(async () => {
+		if (daemon) await daemon.stop();
+		daemon = null;
+		fs.rmSync(dataDir, { recursive: true, force: true });
+	});
+
+	const get = (port: number, route: string): Promise<Record<string, never>> =>
+		new Promise((resolve, reject) => {
+			http
+				.get({ host: '127.0.0.1', port, path: route }, (res) => {
+					let raw = '';
+					res.on('data', (c) => (raw += c));
+					res.on('end', () => resolve(JSON.parse(raw)));
+				})
+				.on('error', reject);
+		});
+
+	it('reports the configured roles on the witness and issuer status routes', async () => {
+		const config = offlineConfig({
+			dataDir,
+			listenPort: 0,
+			fforWitness: { enabled: true, maxMailboxes: 4 },
+			fforIssuer: true
+		});
+		daemon = await startDaemon({
+			...daemonOptions(config, 0),
+			rapidGossipSync: false,
+			autoGossipSync: false
+		});
+		const port = (daemon.server.address() as AddressInfo).port;
+
+		const witness = await get(port, '/ffor/witness/status');
+		const issuer = await get(port, '/ffor/issuer/status');
+		expect(
+			(witness as { result?: { enabled?: boolean } }).result?.enabled,
+			JSON.stringify(witness)
+		).to.equal(true);
+		expect(
+			(issuer as { result?: { enabled?: boolean } }).result?.enabled,
+			JSON.stringify(issuer)
+		).to.equal(true);
+	});
+
+	it('refuses the issuer without the witness, through the config the CLI builds', async () => {
+		// daemon.ts guards this pair, but the guard could not fire while
+		// daemonOptions dropped the fields: a CLI start with
+		// BEIGNET_FFOR_ISSUER=true and no witness came up with the role off
+		// and said nothing.
+		const config = offlineConfig({ dataDir, listenPort: 0, fforIssuer: true });
+		let error: unknown = null;
+		try {
+			daemon = await startDaemon({
+				...daemonOptions(config, 0),
+				rapidGossipSync: false,
+				autoGossipSync: false
+			});
+		} catch (e) {
+			error = e;
+			daemon = null;
+		}
+		expect(error, 'the issuer without a witness has to refuse').to.not.equal(
+			null
+		);
+		expect(String((error as Error).message)).to.match(/needs fforWitness/);
 	});
 });
 
