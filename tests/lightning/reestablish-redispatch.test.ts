@@ -757,6 +757,65 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		alice.destroy();
 	});
 
+	it('a hold cancelled during quiescence still fails back after restart', async function () {
+		// The cancel side of the case above: the deferred fail lives only in
+		// memory while the invoice is already CANCELLED on disk and the parked
+		// set is gone, so the redispatch must fail the original HTLC back from
+		// its onion rather than leave it committed (issue #810 review).
+		this.timeout(20_000);
+		const dbPath = tempDb('redispatch-quiescent-cancel');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const dead = { val: false };
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, sealableStorage(storage1, dead));
+		wire(alice, bob, dead);
+		openReadyChannel(alice, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 60_000n,
+			description: 'quiescent cancel',
+			hold: true
+		});
+		const payment = alice.sendPayment(invoice.bolt11);
+		await settle();
+		expect(bob.listHeldHtlcs()).to.have.length(1);
+
+		const channel = bob.getChannelManager().listChannels()[0] as unknown as {
+			isQuiescing: () => boolean;
+		};
+		channel.isQuiescing = (): boolean => true;
+		expect(bob.cancelHoldInvoice(invoice.paymentHash)).to.deep.equal({
+			htlcsFailed: 1
+		});
+		expect(bob.listHoldInvoices()[0].state).to.equal('CANCELLED');
+		expect(payment.status, 'nothing reached the payer').to.equal(
+			PaymentStatus.PENDING
+		);
+		dead.val = true;
+		bob.destroy();
+
+		const inspect = new SqliteStorage(dbPath);
+		inspect.open();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		alice.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, inspect);
+		await reconnect(restarted, alice);
+
+		expect(payment.status, 'payer failed after the restart').to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(
+			restarted.getChannelManager().listChannels()[0].getFullState().htlcs.size,
+			'no HTLC left pending'
+		).to.equal(0);
+		expect(restarted.listHeldHtlcs()).to.have.length(0);
+
+		restarted.destroy();
+		alice.destroy();
+	});
+
 	it('a restored SHUTTING_DOWN channel still gets the restore repair', async function () {
 		// The repair gate was NORMAL-only, and a restored SHUTTING_DOWN channel
 		// returns to SHUTTING_DOWN after reestablish, so it never fired. An
