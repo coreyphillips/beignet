@@ -118,13 +118,23 @@ export async function skipWithoutElectrum(
  * Run the wallet's first refresh under a deadline, and skip the suite if it
  * does not finish.
  *
- * Reachability alone is not enough. The public server can answer
+ * Reachability alone is not enough. The public server answers
  * `server.version`, `blockchain.headers.subscribe` and a scripthash balance
- * on a fresh socket while a full wallet refresh against it still does not
- * complete inside the hook's budget: the refresh is many round trips, and
- * CI saw it die with "Connection to server lost, please retry" partway
- * through. Either way the suite has learned nothing about this code, so a
- * skip says more than a red X.
+ * on a fresh socket and still takes wildly different times to serve a whole
+ * refresh. Seven consecutive runs of this wallet, same code, same machine,
+ * same server: 17.6s, 24.7s, 43.8s, 43.9s, 47.7s, 81.7s, 89.1s. Every one
+ * completed. The refresh is roughly 200 requests, each individually bounded
+ * by rn-electrum-client's own timeouts, and the spread is the server's
+ * throughput on the day rather than anything this code does.
+ *
+ * So the budget has to sit above the slow tail, not in the middle of it: a
+ * 60s hook against a distribution whose median is in the forties is a coin
+ * flip, which is what made the old failures come and go between identical
+ * runs. 120s clears every run observed, with headroom.
+ *
+ * The deadline exists for the case where the server genuinely cannot serve
+ * the suite at all. Then a skip says more than a red X: it reports that the
+ * behaviour was not checked, rather than that it was checked and is broken.
  *
  * The refresh is left running rather than cancelled; the suite's `after`
  * hook disconnects, and nothing downstream reads its result.
@@ -132,8 +142,11 @@ export async function skipWithoutElectrum(
 export async function refreshOrSkip(
 	ctx: Mocha.Context,
 	wallet: { refreshWallet: (arg?: object) => Promise<unknown> },
-	budgetMs = 45_000
+	budgetMs = 120_000
 ): Promise<void> {
+	// Mocha's own timeout has to outlast the budget, or the hook fails at 60s
+	// before this can decide anything.
+	ctx.timeout(budgetMs + 30_000);
 	let timer: NodeJS.Timeout | undefined;
 	const deadline = new Promise<'timeout'>((resolve) => {
 		timer = setTimeout(() => resolve('timeout'), budgetMs);
