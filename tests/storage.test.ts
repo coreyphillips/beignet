@@ -32,7 +32,11 @@ describe('Storage Test', function () {
 	before(async function () {
 		this.timeout(testTimeout);
 		// A public server being down is not a failure of this code.
-		await skipWithoutElectrum(this, servers[EAvailableNetworks.testnet], 'testnet Electrum');
+		await skipWithoutElectrum(
+			this,
+			servers[EAvailableNetworks.testnet],
+			'testnet Electrum'
+		);
 		await deleteDirectory('example/walletData'); // Start test with clean slate.
 		const res = await Wallet.create({
 			mnemonic: TEST_MNEMONIC,

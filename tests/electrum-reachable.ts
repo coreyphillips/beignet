@@ -66,7 +66,9 @@ function probe(server: IProbeServer, timeoutMs: number): Promise<boolean> {
 
 		let buffer = '';
 		socket.setTimeout(timeoutMs);
-		socket.on(useTls ? 'secureConnect' : 'connect', () => socket.write(REQUEST));
+		socket.on(useTls ? 'secureConnect' : 'connect', () =>
+			socket.write(REQUEST)
+		);
 		socket.on('data', (chunk: Buffer) => {
 			buffer += chunk.toString('utf8');
 			if (!buffer.includes('\n')) return;

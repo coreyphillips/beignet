@@ -28,7 +28,11 @@ describe('Transaction Test', function () {
 	before(async function () {
 		this.timeout(testTimeout);
 		// A public server being down is not a failure of this code.
-		await skipWithoutElectrum(this, servers[EAvailableNetworks.testnet], 'testnet Electrum');
+		await skipWithoutElectrum(
+			this,
+			servers[EAvailableNetworks.testnet],
+			'testnet Electrum'
+		);
 		const res = await Wallet.create({
 			mnemonic: TRANSACTION_TEST_MNEMONIC,
 			network: EAvailableNetworks.testnet,
@@ -285,7 +289,11 @@ describe('Transaction CoinSelect Test', function (): void {
 	before(async function () {
 		this.timeout(testTimeout);
 		// A public server being down is not a failure of this code.
-		await skipWithoutElectrum(this, servers[EAvailableNetworks.testnet], 'testnet Electrum');
+		await skipWithoutElectrum(
+			this,
+			servers[EAvailableNetworks.testnet],
+			'testnet Electrum'
+		);
 		const res = await Wallet.create({
 			mnemonic: TRANSACTION_TEST_MNEMONIC,
 			network: EAvailableNetworks.testnet,
