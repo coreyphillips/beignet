@@ -13,6 +13,7 @@ import {
 	Transaction
 } from '../';
 import { servers } from '../example/helpers';
+import { refreshOrSkip, skipWithoutElectrum } from './electrum-reachable';
 import { EAvailableNetworks, Result } from '../src';
 import { TRANSACTION_TEST_MNEMONIC } from './constants';
 import { EXPECTED_TRANSACTION_RESULTS } from './expected-results';
@@ -26,6 +27,12 @@ describe('Transaction Test', function () {
 
 	before(async function () {
 		this.timeout(testTimeout);
+		// A public server being down is not a failure of this code.
+		await skipWithoutElectrum(
+			this,
+			servers[EAvailableNetworks.testnet],
+			'testnet Electrum'
+		);
 		const res = await Wallet.create({
 			mnemonic: TRANSACTION_TEST_MNEMONIC,
 			network: EAvailableNetworks.testnet,
@@ -37,7 +44,7 @@ describe('Transaction Test', function () {
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
-		await wallet.refreshWallet({});
+		await refreshOrSkip(this, wallet);
 	});
 
 	after(async function () {
@@ -281,6 +288,12 @@ describe('Transaction CoinSelect Test', function (): void {
 
 	before(async function () {
 		this.timeout(testTimeout);
+		// A public server being down is not a failure of this code.
+		await skipWithoutElectrum(
+			this,
+			servers[EAvailableNetworks.testnet],
+			'testnet Electrum'
+		);
 		const res = await Wallet.create({
 			mnemonic: TRANSACTION_TEST_MNEMONIC,
 			network: EAvailableNetworks.testnet,
@@ -292,7 +305,7 @@ describe('Transaction CoinSelect Test', function (): void {
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
-		await wallet.refreshWallet({});
+		await refreshOrSkip(this, wallet);
 	});
 
 	const transaction = new Transaction({ wallet });

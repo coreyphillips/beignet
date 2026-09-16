@@ -4,6 +4,7 @@ import tls from 'tls';
 
 import { Wallet } from '../';
 import { servers } from '../example/helpers';
+import { refreshOrSkip, skipWithoutElectrum } from './electrum-reachable';
 import {
 	EAddressType,
 	EAvailableNetworks,
@@ -22,6 +23,12 @@ describe('Electrum Methods', function () {
 
 	before(async function () {
 		this.timeout(testTimeout);
+		// A public server being down is not a failure of this code.
+		await skipWithoutElectrum(
+			this,
+			servers[EAvailableNetworks.testnet],
+			'testnet Electrum'
+		);
 		const res = await Wallet.create({
 			mnemonic: TEST_MNEMONIC,
 			network: EAvailableNetworks.testnet,
@@ -34,7 +41,7 @@ describe('Electrum Methods', function () {
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
-		await wallet.refreshWallet({});
+		await refreshOrSkip(this, wallet);
 	});
 
 	after(async function () {
