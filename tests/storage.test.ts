@@ -6,6 +6,7 @@ import sinon from 'sinon';
 
 import { Wallet } from '../';
 import { deleteDirectory, getData, servers, setData } from '../example/helpers';
+import { refreshOrSkip, skipWithoutElectrum } from './electrum-reachable';
 import {
 	EAddressType,
 	EAvailableNetworks,
@@ -30,6 +31,8 @@ describe('Storage Test', function () {
 
 	before(async function () {
 		this.timeout(testTimeout);
+		// A public server being down is not a failure of this code.
+		await skipWithoutElectrum(this, servers[EAvailableNetworks.testnet], 'testnet Electrum');
 		await deleteDirectory('example/walletData'); // Start test with clean slate.
 		const res = await Wallet.create({
 			mnemonic: TEST_MNEMONIC,
@@ -46,7 +49,7 @@ describe('Storage Test', function () {
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
-		await wallet.refreshWallet({});
+		await refreshOrSkip(this, wallet);
 	});
 
 	after(async function () {
