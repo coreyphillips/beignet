@@ -183,7 +183,10 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		expect(stored.blockhash, 'the block it named is gone with it').to.equal(
 			undefined
 		);
-		expect(stored.confirmTimestamp).to.equal(0);
+		expect(
+			stored.confirmTimestamp,
+			'and so is the time it was confirmed at'
+		).to.equal(undefined);
 		expect(
 			messages.filter((m) => m.key === 'reorg'),
 			'the reorg is reported once'
@@ -228,10 +231,36 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			'so neither does the height it was found at'
 		).to.equal(0);
 		expect(stored.blockhash).to.equal(undefined);
+		expect(stored.confirmTimestamp).to.equal(undefined);
 		expect(
 			messages.filter((m) => m.key === 'rbf'),
 			'the removal is reported once'
 		).to.have.length(1);
+	});
+
+	it('leaves the record alone when the server errors on the lookup', async function () {
+		// Not a "no such transaction": the server is simply unable to answer, so
+		// it has told us nothing about where the transaction is.
+		answerWith(
+			txAnswer(undefined, { code: -32603, message: 'server overloaded' })
+		);
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the check ran').to.equal(true);
+
+		const stored = wallet.transactions[TXID];
+		expect(stored.height, 'still confirmed where it was').to.equal(
+			REORGED_HEIGHT
+		);
+		expect(stored.blockhash).to.equal(BLOCK_HASH);
+		expect(
+			wallet.getUnconfirmedTransactions()[TXID]?.height,
+			'and still under observation'
+		).to.equal(REORGED_HEIGHT);
+		expect(
+			messages.filter((m) => m.key === 'reorg' || m.key === 'rbf'),
+			'an unanswered lookup is not a reorg'
+		).to.have.length(0);
 	});
 
 	it('leaves a transaction the chain still holds alone', async function () {

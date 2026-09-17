@@ -3394,7 +3394,17 @@ export class Wallet {
 					return;
 				}
 
-				if (!txData.result?.confirmations) {
+				if (!txData.result) {
+					// An entry error that is not a "no such transaction" (a busy or
+					// overloaded server, say) says nothing about where the transaction
+					// is, so it must not be read as zero confirmations. Keep what is
+					// already stored and ask again next refresh.
+					unconfirmedTxs[txData.data.tx_hash] =
+						oldUnconfirmedTxs[txData.data.tx_hash];
+					return;
+				}
+
+				if (!txData.result.confirmations) {
 					// No confirmations is no block, which this wallet stores as height
 					// zero, so a height it already holds is one a reorg undid. Not
 					// confirmationsToBlockHeight, which answers the current TIP for
@@ -3499,7 +3509,7 @@ export class Wallet {
 					// gone with it (issue #863).
 					transactions[txId].height = 0;
 					delete transactions[txId].blockhash;
-					transactions[txId].confirmTimestamp = 0;
+					delete transactions[txId].confirmTimestamp;
 				}
 				if (txId in unconfirmedTransactions) {
 					delete unconfirmedTransactions[txId];
@@ -3648,7 +3658,7 @@ export class Wallet {
 				// longer has (issue #863).
 				transactions[txId].height = 0;
 				delete transactions[txId].blockhash;
-				transactions[txId].confirmTimestamp = 0;
+				delete transactions[txId].confirmTimestamp;
 				needsSave = true;
 			}
 		});
