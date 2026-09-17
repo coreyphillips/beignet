@@ -3386,7 +3386,9 @@ export class Wallet {
 			const unconfirmedTxs: IFormattedTransactions = {};
 			const outdatedTxs: IUtxo[] = []; //Transactions that have been pushed back into the mempool due to a reorg. We need to update the height.
 			const ghostTxs: string[] = []; //Transactions that have been removed from the mempool and are no longer in the blockchain.
+			const answered = new Set<string>();
 			txs.value.data.forEach((txData: ITransaction<IUtxo>) => {
+				answered.add(txData.data.tx_hash);
 				// Check if the transaction has been removed from the mempool/still exists.
 				if (!this.electrum.transactionExists(txData)) {
 					//Transaction may have been removed/bumped from the mempool or potentially reorg'd out.
@@ -3432,6 +3434,18 @@ export class Wallet {
 					};
 				}
 			});
+
+			// getTransactions batches its lookups and answers ok even when a whole
+			// chunk failed, dropping that chunk's entries from the response. A hash
+			// nothing answered for keeps the record it already has: rebuilding the
+			// map from returned entries alone drops it from monitoring for good, so
+			// a later reorg leaves it confirmed in the history with nothing left to
+			// notice (issue #872).
+			for (const [txid, transaction] of Object.entries(oldUnconfirmedTxs)) {
+				if (answered.has(txid)) continue;
+				unconfirmedTxs[txid] = transaction;
+			}
+
 			return ok({
 				unconfirmedTxs,
 				outdatedTxs,
