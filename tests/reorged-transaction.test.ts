@@ -14,12 +14,21 @@
  * Fully OFFLINE: the wallet points at an unreachable port and the two Electrum
  * calls the check makes are stubbed, so this asserts on what the wallet does
  * with each answer a server can give for a reorg'd out transaction.
+ *
+ * The last case covers issue #872: a batched lookup that fails is not an
+ * answer either, and dropping it stopped the monitoring that finds a reorg.
  */
 
 import { expect } from 'chai';
 import net from 'net';
 import tls from 'tls';
 import sinon from 'sinon';
+
+// The raw module.exports object: the compiled namespace import in src/electrum
+// reads it live through getter bindings, while this file's own namespace copy
+// would be non-writable and invisible to src.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const electrumHelpers = require('rn-electrum-client/helpers');
 
 import {
 	EAddressType,
@@ -161,6 +170,13 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			IFormattedTransaction
 		>;
 
+	/** The transactions still under observation, as last written to storage. */
+	const savedUnconfirmed = (): Record<string, IFormattedTransaction> =>
+		saved[wallet.getWalletDataKey('unconfirmedTransactions')] as Record<
+			string,
+			IFormattedTransaction
+		>;
+
 	const answerWith = (tx: ITransaction<IUtxo>): sinon.SinonStub =>
 		sinon.stub(wallet.electrum, 'getTransactions').resolves(
 			ok<IGetTransactions>({
@@ -289,6 +305,36 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		expect(
 			messages.filter((m) => m.key === 'reorg'),
 			'a transaction that was never confirmed cannot be reorged out'
+		).to.have.length(0);
+	});
+
+	it('keeps a transaction whose batched lookup failed under observation (issue #872)', async function () {
+		// Lookups go out in batches and a batch that fails is dropped from the
+		// response, which still reports success. Nothing comes back for this
+		// hash, so the reconciliation has to notice the silence for itself.
+		const batch = sinon.stub(electrumHelpers, 'getTransactions').resolves({
+			error: true,
+			id: 0,
+			method: 'getTransactions',
+			network: 'bitcoinRegtest',
+			data: []
+		});
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the check ran').to.equal(true);
+		expect(batch.callCount, 'the lookup was attempted').to.equal(1);
+
+		expect(
+			wallet.getUnconfirmedTransactions()[TXID]?.height,
+			'a failed batch says nothing, so the transaction stays observed'
+		).to.equal(REORGED_HEIGHT);
+		expect(
+			savedUnconfirmed()[TXID]?.height,
+			'and a restart reads it back, so the next refresh asks again'
+		).to.equal(REORGED_HEIGHT);
+		expect(
+			messages.filter((m) => m.key === 'reorg' || m.key === 'rbf'),
+			'a failed batch is not a reorg'
 		).to.have.length(0);
 	});
 });
