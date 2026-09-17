@@ -3394,28 +3394,41 @@ export class Wallet {
 					return;
 				}
 
-				const newHeight = this.confirmationsToBlockHeight({
-					confirmations: txData.result?.confirmations ?? 0
-				});
+				if (!txData.result) {
+					// An entry error that is not a "no such transaction" (a busy or
+					// overloaded server, say) says nothing about where the transaction
+					// is, so it must not be read as zero confirmations. Keep what is
+					// already stored and ask again next refresh.
+					unconfirmedTxs[txData.data.tx_hash] =
+						oldUnconfirmedTxs[txData.data.tx_hash];
+					return;
+				}
 
-				if (!txData.result?.confirmations) {
+				if (!txData.result.confirmations) {
+					// No confirmations is no block, which this wallet stores as height
+					// zero, so a height it already holds is one a reorg undid. Not
+					// confirmationsToBlockHeight, which answers the current TIP for
+					// zero confirmations: that is above every stored height, so the
+					// comparison never fired and the reorg went unseen (issue #863).
 					const oldHeight = oldUnconfirmedTxs[txData.data.tx_hash]?.height ?? 0;
-					if (oldHeight > newHeight) {
+					if (oldHeight > 0) {
 						//Transaction was reorg'd back to zero confirmations. Add it to the outdatedTxs array.
 						outdatedTxs.push(txData.data);
 					}
 					unconfirmedTxs[txData.data.tx_hash] = {
 						...oldUnconfirmedTxs[txData.data.tx_hash],
-						height: newHeight
+						height: 0
 					};
 					return;
 				}
 
 				//Check if the transaction has been confirmed.
-				if (txData.result?.confirmations < 6) {
+				if (txData.result.confirmations < 6) {
 					unconfirmedTxs[txData.data.tx_hash] = {
 						...oldUnconfirmedTxs[txData.data.tx_hash],
-						height: newHeight
+						height: this.confirmationsToBlockHeight({
+							confirmations: txData.result.confirmations
+						})
 					};
 				}
 			});
@@ -3490,6 +3503,13 @@ export class Wallet {
 			txIds.forEach((txId) => {
 				if (txId in transactions) {
 					transactions[txId]['exists'] = false;
+					// A server without a txindex answers "no such transaction" for a
+					// reorg'd out transaction instead of one with no confirmations, so
+					// this is where that reorg lands. The block it was found in is
+					// gone with it (issue #863).
+					transactions[txId].height = 0;
+					delete transactions[txId].blockhash;
+					delete transactions[txId].confirmTimestamp;
 				}
 				if (txId in unconfirmedTransactions) {
 					delete unconfirmedTransactions[txId];
@@ -3632,7 +3652,13 @@ export class Wallet {
 		txs.forEach((tx) => {
 			const txId = tx.tx_hash;
 			if (txId in transactions) {
-				transactions[txId].confirmTimestamp = 0;
+				// The height, not the timestamp, is what every consumer reads a
+				// transaction as confirmed from, so clearing the timestamp alone
+				// left the history reporting a confirmation at a block the chain no
+				// longer has (issue #863).
+				transactions[txId].height = 0;
+				delete transactions[txId].blockhash;
+				delete transactions[txId].confirmTimestamp;
 				needsSave = true;
 			}
 		});
