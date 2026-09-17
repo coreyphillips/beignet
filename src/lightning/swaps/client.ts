@@ -1,6 +1,6 @@
 /**
  * Client-side helpers for the swap protocol (issue #737): pure functions a
- * wallet or the chicory client runs before it pays. Nothing here talks to a
+ * wallet or the roux client runs before it pays. Nothing here talks to a
  * node; the caller supplies what it sent, what came back, its own height and
  * its own policy, and gets a verdict it can act on.
  */
