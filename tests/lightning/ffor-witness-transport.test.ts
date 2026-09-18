@@ -20,6 +20,7 @@ import { Feature } from '../../src/lightning/features/flags';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { FforState } from '../../src/lightning/ffor/types';
 import {
+	FF_WITNESS_CLOSE_TYPE,
 	FF_WITNESS_FETCH_RESP_TYPE,
 	FF_WITNESS_FETCH_TYPE
 } from '../../src/lightning/ffor/witness-types';
@@ -215,6 +216,42 @@ describe('FFOR receipt witness transport (M9.0)', function () {
 		}
 		expect(timedOut?.message).to.match(/did not answer/);
 		expect(record(w.r, w.srHex).witnesses).to.have.length(0);
+	});
+
+	it('silent witnesses cost one close timeout between them, and each gets its own result', async () => {
+		const w = createWorld();
+		activate(w);
+		const witnesses: LightningNode[] = [];
+		const links: NodeLink[] = [];
+		for (const seed of [780, 781, 782]) {
+			const node = new LightningNode(
+				makeNodeConfig(seed, undefined, { fforWitness: { enabled: true } })
+			);
+			node.on('node:error', () => {});
+			node.handleNewBlock(TIP);
+			links.push(new NodeLink(w.r, node));
+			await w.r.provisionFforWitness(w.srHex, node.getNodeId());
+			witnesses.push(node);
+		}
+		// The first and last ignore the close; the middle one answers.
+		for (const i of [0, 2]) {
+			links[i].drop = (_from, type): boolean => type === FF_WITNESS_CLOSE_TYPE;
+		}
+		const timeoutMs = 1_000;
+		const started = Date.now();
+		const closed = await w.r.closeFforWitnesses(w.srHex, timeoutMs);
+		const elapsed = Date.now() - started;
+		expect(elapsed).to.be.at.least(timeoutMs - 50);
+		expect(elapsed, 'not one timeout per silent witness').to.be.below(
+			timeoutMs * 2
+		);
+		expect(
+			closed.map((c) => [c.witnessNodeId.toString('hex'), c.ok])
+		).to.deep.equal([
+			[witnesses[0].getNodeId(), false],
+			[witnesses[1].getNodeId(), true],
+			[witnesses[2].getNodeId(), false]
+		]);
 	});
 
 	it('over a real BOLT 8 socket: provision and fetch between two PeerManagers', async () => {
