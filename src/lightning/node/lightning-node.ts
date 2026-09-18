@@ -16531,8 +16531,8 @@ export class LightningNode extends EventEmitter {
 			// from the peer set them. The peer can also move a stored SCID onto
 			// another announced channel, and our funding key can repeat across
 			// channels. So the signed node ids must be us and R, and the SCID
-			// must resolve to a public channel of ours to R whose funding key
-			// the announcement carries.
+			// must resolve to a public channel of ours to R whose two funding
+			// keys the announcement carries, each beside its own node id.
 			const outScid = hopPayload.shortChannelId;
 			const published = outScid ? this.graph.getChannel(outScid) : undefined;
 			const ann =
@@ -16542,6 +16542,8 @@ export class LightningNode extends EventEmitter {
 			const signedNodes = ann
 				? [ann.nodeId1, ann.nodeId2].map((id) => id.toString('hex'))
 				: [];
+			const signedKeys = ann ? [ann.bitcoinKey1, ann.bitcoinKey2] : [];
+			const ours = signedNodes.indexOf(this.nodeId);
 			const rPeer = this.channelManager.getPeerForChannel(slot.channelId);
 			const outgoing =
 				outScid &&
@@ -16554,9 +16556,10 @@ export class LightningNode extends EventEmitter {
 							return (
 								st.announceChannel &&
 								st.shortChannelId?.equals(outScid) === true &&
-								[ann.bitcoinKey1, ann.bitcoinKey2].some((key) =>
-									key.equals(st.localBasepoints.fundingPubkey)
-								)
+								signedKeys[ours].equals(st.localBasepoints.fundingPubkey) &&
+								st.remoteBasepoints?.fundingPubkey.equals(
+									signedKeys[1 - ours]
+								) === true
 							);
 					  })
 					: undefined;

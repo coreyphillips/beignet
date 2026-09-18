@@ -776,6 +776,45 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
 	});
 
+	it('holds an S-R channel moved onto the SCID of its sibling S-R channel to the book terms', () => {
+		// Both S-R channels carry S's one funding key, but R funded the moved
+		// one under a key the sibling's announcement does not carry.
+		const w = createWorld();
+		const moved = openReadyChannel(w.s, w.r);
+		const movedState = w.s
+			.getChannelManager()
+			.getChannel(moved)!
+			.getFullState();
+		movedState.remoteBasepoints!.fundingPubkey = getPublicKey(sha('other-key'));
+		w.s.setChannelPolicy(moved, {
+			feeBaseMsat: 0,
+			feeProportionalMillionths: 0
+		});
+		activate(w);
+		const [inv] = exposeAndLeave(w, [1]);
+		const scid = decodeInvoice(inv).routingHints![0][0].shortChannelId;
+		publishChannel(w.p, w.s, w.r, w.srChannelId, scid, 0, 0);
+		announceSR(w, scid, true);
+		w.s
+			.getChannelManager()
+			.getChannel(w.srChannelId)!
+			.getFullState().shortChannelId = encodeShortChannelId({
+			block: 500,
+			txIndex: 4,
+			outputIndex: 0
+		});
+		movedState.shortChannelId = scid;
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		const payment = pay(w, inv);
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
+		expect(failures.pop()!.reason).to.equal('fee_insufficient');
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+	});
+
 	it('under a blinded path derives amt_to_forward by the inverse formula within rounding_slack', () => {
 		const d = 1_000_000n;
 		const gross = grossIntoS(d, FEE_BASE, FEE_PPM);
