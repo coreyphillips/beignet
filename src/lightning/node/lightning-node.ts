@@ -16529,7 +16529,8 @@ export class LightningNode extends EventEmitter {
 				amtToForwardMsat: hopPayload.amountToForwardMsat ?? null,
 				hopKind: blinded ? 'blinded' : 'plaintext',
 				feeBaseMsat: record.params.feeBaseMsat,
-				feeProportionalMillionths: record.params.feeProportionalMillionths
+				feeProportionalMillionths: record.params.feeProportionalMillionths,
+				advertisedFee: this.getForwardingPolicyForChannel(slot.channelId)
 			});
 			if (amountCheck) {
 				if (amountCheck.check === 2) {

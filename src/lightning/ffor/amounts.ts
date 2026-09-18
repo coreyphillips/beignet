@@ -82,6 +82,13 @@ export interface IFforAmountCheckInput {
 	hopKind: FforHopKind;
 	feeBaseMsat: number;
 	feeProportionalMillionths: number;
+	/**
+	 * Plaintext only: the fee terms S advertises on its channel to R. A payer
+	 * that knows the channel from gossip prices the hop from these rather
+	 * than the hint's epoch terms, and S chose both, so either covers check 2.
+	 * A blinded path's payinfo carries the epoch terms, so it is ignored there.
+	 */
+	advertisedFee?: { feeBaseMsat: number; feeProportionalMillionths: number };
 }
 
 /**
@@ -116,11 +123,20 @@ export function checkDelegatedAmounts(
 		if (forward < d) return { check: 1, reason: 'underpay' };
 		if (forward > d) return { check: 1, reason: 'overpay' };
 	}
-	const fee = feeS(d, input.feeBaseMsat, input.feeProportionalMillionths);
-	if (input.amountMsat - forward < fee) {
-		return { check: 2, reason: 'fee_insufficient' };
+	const paid = input.amountMsat - forward;
+	if (paid >= feeS(d, input.feeBaseMsat, input.feeProportionalMillionths)) {
+		return null;
 	}
-	return null;
+	const advertised =
+		input.hopKind === 'plaintext' ? input.advertisedFee : undefined;
+	if (
+		advertised &&
+		paid >=
+			feeS(d, advertised.feeBaseMsat, advertised.feeProportionalMillionths)
+	) {
+		return null;
+	}
+	return { check: 2, reason: 'fee_insufficient' };
 }
 
 /** What the book checks need to know about the channel. */

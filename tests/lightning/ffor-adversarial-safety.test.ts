@@ -1822,16 +1822,23 @@ describe('FFOR adversarial: payer-side probes', function () {
 	});
 
 	/**
-	 * Section 7.6 check 2: "amount_msat - amt_to_forward >= fee_S(d_k)".
-	 * One millisatoshi short must fail, and nothing may be revealed.
+	 * Section 7.6 check 2: "amount_msat - amt_to_forward >= fee_S(d_k)", where
+	 * S also accepts the fee its advertised S-R policy asks (issue #881). One
+	 * millisatoshi short of the lower of the two must fail, and nothing may be
+	 * revealed.
 	 */
 	it('S fails a delegated HTLC whose fee is one msat short', () => {
 		const w = createWorld();
 		activateWorld(w);
 		const [inv] = exposeAndLeave(w, [1]);
-		// fee_S(d) = 1000 + floor(d * 5000 / 1e6); a hint with base 999 and the
-		// same ppm delivers exactly one msat less than fee_S.
-		const short = craftInvoice(w, inv, { feeBaseMsat: FEE_BASE - 1 });
+		// S's default policy (1000 msat + 1 ppm) is below the book's 1000 msat
+		// + 5000 ppm, so a hint one base msat under it is short of both.
+		const policy = w.s.getChannelPolicy(w.srChannelId)!;
+		expect(policy.feeProportionalMillionths).to.be.below(FEE_PPM);
+		const short = craftInvoice(w, inv, {
+			feeBaseMsat: policy.feeBaseMsat - 1,
+			feeProportionalMillionths: policy.feeProportionalMillionths
+		});
 		const payment = pay(w, short);
 		expect(payment.status).to.equal(PaymentStatus.FAILED);
 		expect(payment.preimage).to.be.undefined;

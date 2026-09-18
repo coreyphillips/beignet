@@ -570,6 +570,28 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		}
 	});
 
+	it('settles a payer that priced a public S-R hop from S policy instead of the book terms', () => {
+		const w = createWorld();
+		activate(w);
+		const [inv] = exposeAndLeave(w, [1]);
+		// P now knows S-R from gossip at S's default policy (1000 msat + 1 ppm),
+		// so it prices S's hop from that channel_update, not the hint's book
+		// terms (1000 msat + 5000 ppm).
+		const hint = decodeInvoice(inv).routingHints![0][0];
+		publishChannel(w.p, w.s, w.r, w.srChannelId, hint.shortChannelId, 1000, 1);
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		const d = AMOUNTS[0];
+		const payment = pay(w, inv);
+		expect(failures).to.deep.equal([]);
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(payment.route!.totalFeeMsat).to.equal(feeS(d, 1000, 1));
+		expect(payment.route!.totalFeeMsat < feeS(d, FEE_BASE, FEE_PPM)).to.be.true;
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.SETTLED);
+	});
+
 	it('under a blinded path derives amt_to_forward by the inverse formula within rounding_slack', () => {
 		const d = 1_000_000n;
 		const gross = grossIntoS(d, FEE_BASE, FEE_PPM);
@@ -624,6 +646,26 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		expect(plain(d + 1n, gross + 1n)!.check).to.equal(1);
 		expect(plain(d - 1n, gross)!.check).to.equal(1);
 		expect(plain(d, d + feeS(d, FEE_BASE, FEE_PPM) - 1n)!.check).to.equal(2);
+		// A fee covering S's advertised policy settles a plaintext hop; one
+		// below both terms does not, and a blinded hop reads the book alone.
+		const advertisedFee = { feeBaseMsat: 1000, feeProportionalMillionths: 1 };
+		const policyFee = d + feeS(d, 1000, 1);
+		const withPolicy = (
+			hopKind: 'plaintext' | 'blinded',
+			amount: bigint
+		): ReturnType<typeof checkDelegatedAmounts> =>
+			checkDelegatedAmounts({
+				payeeAmountMsat: d,
+				amountMsat: amount,
+				amtToForwardMsat: d,
+				hopKind,
+				feeBaseMsat: FEE_BASE,
+				feeProportionalMillionths: FEE_PPM,
+				advertisedFee
+			});
+		expect(withPolicy('plaintext', policyFee)).to.equal(null);
+		expect(withPolicy('plaintext', policyFee - 1n)!.check).to.equal(2);
+		expect(withPolicy('blinded', policyFee)).to.not.equal(null);
 	});
 
 	it('fails a payment that arrives before ACTIVE, at or past D, or after ff_close', () => {
