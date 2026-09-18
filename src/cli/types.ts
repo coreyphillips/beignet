@@ -1457,8 +1457,13 @@ export interface BeignetNodeEvents {
 	'ffor:witness-provisioned': (data: Record<string, unknown>) => void;
 	'ffor:witness-recorded': (data: Record<string, unknown>) => void;
 	'ffor:witness-released': (data: Record<string, unknown>) => void;
+	'ffor:witness-refused': (data: Record<string, unknown>) => void;
+	'ffor:witness-closed': (data: Record<string, unknown>) => void;
+	'ffor:witness-expired': (data: Record<string, unknown>) => void;
+	'ffor:witness-audit': (data: Record<string, unknown>) => void;
 	'ffor:issuer-provisioned': (data: Record<string, unknown>) => void;
 	'ffor:issuer-issued': (data: Record<string, unknown>) => void;
+	'ffor:issuer-retired': (data: Record<string, unknown>) => void;
 	// Reverse swap provider (issue #737): swapId, paymentHash (hex), state,
 	// onchainSat and invoiceMsat (decimal strings), refundHeight, plus the
 	// transition's own facts (funding txid, claim txid, refund txid, reason).

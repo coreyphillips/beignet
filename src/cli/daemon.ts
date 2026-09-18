@@ -554,8 +554,15 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'ffor:witness-provisioned',
 		'ffor:witness-recorded',
 		'ffor:witness-released',
+		'ffor:witness-refused',
+		'ffor:witness-closed',
+		'ffor:witness-expired',
+		// A fetched witness record that failed verification on the receiver:
+		// the one signal that a witness misbehaved.
+		'ffor:witness-audit',
 		'ffor:issuer-provisioned',
 		'ffor:issuer-issued',
+		'ffor:issuer-retired',
 		// Reverse swap provider (issue #737): one swap's progress from the
 		// terms it accepted to its settlement, refund, or the exposure a
 		// dashboard must not miss (the Lightning side was cancelled while
