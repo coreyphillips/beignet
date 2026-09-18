@@ -4866,6 +4866,22 @@ export class LightningNode extends EventEmitter {
 						updateValid = false;
 					}
 					this.graph.applyChannelUpdate(updateMsg, { verified: updateValid });
+					// Persist the verified row: FFOR settlement reads it after a
+					// restart (fforTrySettleDelegated), and otherwise only a later
+					// peer update for this channel would save it.
+					const row = announcementValid
+						? this.graph.getChannel(annMsg.shortChannelId)
+						: undefined;
+					if (row?.announcementVerified === true) {
+						this.safeStorage(
+							() =>
+								this.storage!.saveGossipChannel(
+									annMsg.shortChannelId.toString('hex'),
+									row
+								),
+							'saveGossipChannel'
+						);
+					}
 				} catch {
 					// Ignore decode errors for self-generated announcements
 				}
@@ -16605,11 +16621,11 @@ export class LightningNode extends EventEmitter {
 			// must resolve to a public channel of ours to R whose two funding
 			// keys the announcement carries, each beside its own node id.
 			const outScid = hopPayload.shortChannelId;
-			const published = outScid ? this.graph.getChannel(outScid) : undefined;
-			const ann =
-				published?.announcementVerified === true
-					? published.announcement
-					: undefined;
+			// A deferred row (learned lazily, or restored without settled
+			// flags) is verified here: nothing else on this path would.
+			const ann = outScid
+				? this.graph.getVerifiedChannelAnnouncement(outScid)
+				: undefined;
 			const signedNodes = ann
 				? [ann.nodeId1, ann.nodeId2].map((id) => id.toString('hex'))
 				: [];
