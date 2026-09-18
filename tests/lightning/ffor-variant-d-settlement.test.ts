@@ -230,6 +230,38 @@ function publishChannel(
 	y.registerChannelScid(channelId, scid);
 }
 
+/**
+ * Put the S-R channel_announcement on S's own graph under `scid`, carrying
+ * both funding keys, as the announcement exchange leaves it: verified only
+ * when every signature checked out.
+ */
+function announceSR(w: IWorld, scid: Buffer, verified: boolean): void {
+	const st = w.s.getChannelManager().getChannel(w.srChannelId)!.getFullState();
+	st.shortChannelId = scid;
+	const sk = Buffer.from(w.s.getNodeId(), 'hex');
+	const rk = Buffer.from(w.r.getNodeId(), 'hex');
+	const sFirst = Buffer.compare(sk, rk) < 0;
+	const sKey = st.localBasepoints.fundingPubkey;
+	const rKey = st.remoteBasepoints!.fundingPubkey;
+	const added = w.s.getGraph().addChannelAnnouncement(
+		{
+			nodeSignature1: crypto.randomBytes(64),
+			nodeSignature2: crypto.randomBytes(64),
+			bitcoinSignature1: crypto.randomBytes(64),
+			bitcoinSignature2: crypto.randomBytes(64),
+			features: Buffer.alloc(0),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId: scid,
+			nodeId1: sFirst ? sk : rk,
+			nodeId2: sFirst ? rk : sk,
+			bitcoinKey1: sFirst ? sKey : rKey,
+			bitcoinKey2: sFirst ? rKey : sKey
+		},
+		{ verified }
+	);
+	expect(added).to.equal(true);
+}
+
 const TIP = 790_000;
 const T_EXP = 800_000;
 const D_DEADLINE = 798_992;
@@ -579,6 +611,7 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		// terms (1000 msat + 5000 ppm).
 		const hint = decodeInvoice(inv).routingHints![0][0];
 		publishChannel(w.p, w.s, w.r, w.srChannelId, hint.shortChannelId, 1000, 1);
+		announceSR(w, hint.shortChannelId, true);
 		const failures: { reason: string }[] = [];
 		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
 			failures.push(e)
@@ -592,14 +625,13 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.SETTLED);
 	});
 
-	it('holds an unannounced S-R hop to the book terms', () => {
+	it('holds an S-R hop whose announcement did not verify to the book terms', () => {
 		const w = createWorld();
 		activate(w);
 		const [inv] = exposeAndLeave(w, [1]);
-		w.s
-			.getChannelManager()
-			.getChannel(w.srChannelId)!
-			.getFullState().announceChannel = false;
+		// announcement_signatures went both ways (the world pins the flags),
+		// but R's signatures were garbage, so nothing was published.
+		announceSR(w, decodeInvoice(inv).routingHints![0][0].shortChannelId, false);
 		const failures: { reason: string }[] = [];
 		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
 			failures.push(e)
@@ -688,7 +720,10 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 			});
 		expect(withPolicy('plaintext', policyFee)).to.equal(null);
 		expect(withPolicy('plaintext', policyFee - 1n)!.check).to.equal(2);
-		expect(withPolicy('blinded', policyFee)).to.not.equal(null);
+		// One msat under the book still derives d, so only check 2 can refuse it.
+		expect(inverseAmtToForward(gross - 1n, FEE_BASE, FEE_PPM)).to.equal(d);
+		expect(withPolicy('plaintext', gross - 1n)).to.equal(null);
+		expect(withPolicy('blinded', gross - 1n)!.check).to.equal(2);
 	});
 
 	it('fails a payment that arrives before ACTIVE, at or past D, or after ff_close', () => {

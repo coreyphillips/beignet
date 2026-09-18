@@ -16523,13 +16523,22 @@ export class LightningNode extends EventEmitter {
 			}
 
 			// Section 7.6 checks 1 and 2 on the payee amount d_k. S's own policy
-			// counts only on an announced S-R channel, the one case where a
-			// payer can have priced the hop from gossip instead of the book.
+			// counts only once the S-R channel_announcement is in our graph with
+			// every signature valid, the one case where a payer can have priced
+			// the hop from gossip instead of the book. The signature-exchange
+			// flags are no proof, since any bytes from the peer set them. The
+			// peer can also move the stored SCID, so our funding key in the
+			// signed announcement is what ties it to this channel.
 			const srState = slot.channel.getFullState();
+			const published = srState.shortChannelId
+				? this.graph.getChannel(srState.shortChannelId)
+				: undefined;
 			const announced =
-				srState.announceChannel === true &&
-				srState.announcementSigsSent &&
-				srState.announcementSigsReceived;
+				published?.announcementVerified === true &&
+				[
+					published.announcement.bitcoinKey1,
+					published.announcement.bitcoinKey2
+				].some((key) => key.equals(srState.localBasepoints.fundingPubkey));
 			const amountCheck = checkDelegatedAmounts({
 				payeeAmountMsat: entry.amountMsat,
 				amountMsat,
