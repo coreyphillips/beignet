@@ -16523,22 +16523,37 @@ export class LightningNode extends EventEmitter {
 			}
 
 			// Section 7.6 checks 1 and 2 on the payee amount d_k. S's own policy
-			// counts only once the S-R channel_announcement is in our graph with
-			// every signature valid, the one case where a payer can have priced
-			// the hop from gossip instead of the book. The signature-exchange
-			// flags are no proof, since any bytes from the peer set them. The
-			// peer can also move the stored SCID, so our funding key in the
-			// signed announcement is what ties it to this channel.
-			const srState = slot.channel.getFullState();
-			const published = srState.shortChannelId
-				? this.graph.getChannel(srState.shortChannelId)
-				: undefined;
-			const announced =
-				published?.announcementVerified === true &&
-				[
-					published.announcement.bitcoinKey1,
-					published.announcement.bitcoinKey2
-				].some((key) => key.equals(srState.localBasepoints.fundingPubkey));
+			// counts only once the channel_announcement for the payload's
+			// short_channel_id is in our graph with every signature valid, the
+			// one case where a payer can have priced the hop from gossip instead
+			// of the book. With several S-R channels that need not be the epoch
+			// channel. The signature-exchange flags are no proof, since any bytes
+			// from the peer set them. The peer can also move a stored SCID, so
+			// our funding key in the signed announcement is what ties the SCID
+			// to one of our channels to R.
+			const outScid = hopPayload.shortChannelId;
+			const published = outScid ? this.graph.getChannel(outScid) : undefined;
+			const signedKeys =
+				published?.announcementVerified === true
+					? [
+							published.announcement.bitcoinKey1,
+							published.announcement.bitcoinKey2
+					  ]
+					: [];
+			const rPeer = this.channelManager.getPeerForChannel(slot.channelId);
+			const outgoing =
+				outScid && rPeer && signedKeys.length > 0
+					? this.channelManager.getChannelsByPeer(rPeer).find((ch) => {
+							const st = ch.getFullState();
+							return (
+								st.shortChannelId?.equals(outScid) === true &&
+								signedKeys.some((key) =>
+									key.equals(st.localBasepoints.fundingPubkey)
+								)
+							);
+					  })
+					: undefined;
+			const outgoingId = outgoing?.getChannelId();
 			const amountCheck = checkDelegatedAmounts({
 				payeeAmountMsat: entry.amountMsat,
 				amountMsat,
@@ -16546,8 +16561,8 @@ export class LightningNode extends EventEmitter {
 				hopKind: blinded ? 'blinded' : 'plaintext',
 				feeBaseMsat: record.params.feeBaseMsat,
 				feeProportionalMillionths: record.params.feeProportionalMillionths,
-				advertisedFee: announced
-					? this.getForwardingPolicyForChannel(slot.channelId)
+				advertisedFee: outgoingId
+					? this.getForwardingPolicyForChannel(outgoingId)
 					: undefined
 			});
 			if (amountCheck) {

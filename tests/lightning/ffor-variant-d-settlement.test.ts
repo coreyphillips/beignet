@@ -231,15 +231,22 @@ function publishChannel(
 }
 
 /**
- * Put the S-R channel_announcement on S's own graph under `scid`, carrying
- * both funding keys, as the announcement exchange leaves it: verified only
- * when every signature checked out.
+ * Put the channel_announcement of one of S's channels (the epoch channel by
+ * default) on S's own graph under `scid`, carrying both funding keys, as the
+ * announcement exchange leaves it: verified only when every signature
+ * checked out.
  */
-function announceSR(w: IWorld, scid: Buffer, verified: boolean): void {
-	const st = w.s.getChannelManager().getChannel(w.srChannelId)!.getFullState();
+function announceSR(
+	w: IWorld,
+	scid: Buffer,
+	verified: boolean,
+	channelId = w.srChannelId,
+	peer = w.r
+): void {
+	const st = w.s.getChannelManager().getChannel(channelId)!.getFullState();
 	st.shortChannelId = scid;
 	const sk = Buffer.from(w.s.getNodeId(), 'hex');
-	const rk = Buffer.from(w.r.getNodeId(), 'hex');
+	const rk = Buffer.from(peer.getNodeId(), 'hex');
 	const sFirst = Buffer.compare(sk, rk) < 0;
 	const sKey = st.localBasepoints.fundingPubkey;
 	const rKey = st.remoteBasepoints!.fundingPubkey;
@@ -260,6 +267,55 @@ function announceSR(w: IWorld, scid: Buffer, verified: boolean): void {
 		{ verified }
 	);
 	expect(added).to.equal(true);
+}
+
+/** Disable `from`'s direction of a channel already on `viewer`'s graph. */
+function disableChannel(
+	viewer: LightningNode,
+	from: LightningNode,
+	to: LightningNode,
+	scid: Buffer
+): void {
+	const fromFirst =
+		Buffer.compare(
+			Buffer.from(from.getNodeId(), 'hex'),
+			Buffer.from(to.getNodeId(), 'hex')
+		) < 0;
+	const current = viewer.getGraph().getChannel(scid)!;
+	const update = fromFirst ? current.update1! : current.update2!;
+	const applied = viewer.getGraph().applyChannelUpdate({
+		...update,
+		timestamp: update.timestamp + 1,
+		channelFlags: update.channelFlags | 2
+	});
+	expect(applied).to.equal(true);
+}
+
+/**
+ * R exposes voucher 1 and leaves. P then knows the epoch channel from gossip
+ * but disabled, and a second S-R edge under a fresh SCID at 0 msat + 0 ppm.
+ * S backs that SCID with `channelId`, its channel to `peer`, at the same
+ * policy.
+ */
+function exposeOverSecondEdge(
+	w: IWorld,
+	channelId: Buffer,
+	peer: LightningNode,
+	verified: boolean
+): { inv: string; scid: Buffer } {
+	w.s.setChannelPolicy(channelId, {
+		feeBaseMsat: 0,
+		feeProportionalMillionths: 0
+	});
+	const [inv] = exposeAndLeave(w, [1]);
+	const epochScid = decodeInvoice(inv).routingHints![0][0].shortChannelId;
+	publishChannel(w.p, w.s, w.r, w.srChannelId, epochScid, 1000, 1);
+	disableChannel(w.p, w.s, w.r, epochScid);
+	announceSR(w, epochScid, true);
+	const scid = encodeShortChannelId({ block: 500, txIndex: 3, outputIndex: 0 });
+	publishChannel(w.p, w.s, w.r, channelId, scid, 0, 0);
+	announceSR(w, scid, verified, channelId, peer);
+	return { inv, scid };
 }
 
 const TIP = 790_000;
@@ -645,6 +701,44 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
 		expect(failures.pop()!.reason).to.equal('fee_insufficient');
 		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+	});
+
+	it('settles a payer that routed over a parallel public S-R channel at that channel policy', () => {
+		const w = createWorld();
+		const second = openReadyChannel(w.s, w.r);
+		activate(w);
+		const { inv, scid } = exposeOverSecondEdge(w, second, w.r, true);
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		const payment = pay(w, inv);
+		expect(failures).to.deep.equal([]);
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		const hops = payment.route!.hops;
+		expect(hops[hops.length - 1].shortChannelId.equals(scid)).to.be.true;
+		expect(payment.route!.totalFeeMsat).to.equal(0n);
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.SETTLED);
+	});
+
+	it('holds a named channel that is not a public channel to R to the book terms', () => {
+		// A second S-R channel whose announcement did not verify, then S's
+		// public channel to P, which P's graph places between S and R.
+		for (const toR of [true, false]) {
+			const w = createWorld();
+			const named = toR ? openReadyChannel(w.s, w.r) : w.psChannelId;
+			activate(w);
+			const { inv } = exposeOverSecondEdge(w, named, toR ? w.r : w.p, !toR);
+			const failures: { reason: string }[] = [];
+			w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+				failures.push(e)
+			);
+			const payment = pay(w, inv);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
+			expect(failures.pop()!.reason).to.equal('fee_insufficient');
+			expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+		}
 	});
 
 	it('under a blinded path derives amt_to_forward by the inverse formula within rounding_slack', () => {
