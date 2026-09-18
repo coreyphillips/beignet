@@ -722,13 +722,24 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 	});
 
 	it('holds a named channel that is not a public channel to R to the book terms', () => {
-		// A second S-R channel whose announcement did not verify, then S's
-		// public channel to P, which P's graph places between S and R.
-		for (const toR of [true, false]) {
+		// A second S-R channel whose announcement did not verify, a private
+		// S-R channel under a verified S-R announcement carrying its keys, then
+		// S's public channel to P, which P's graph places between S and R.
+		for (const kind of ['unverified', 'private', 'toP'] as const) {
 			const w = createWorld();
+			const toR = kind !== 'toP';
 			const named = toR ? openReadyChannel(w.s, w.r) : w.psChannelId;
+			w.s
+				.getChannelManager()
+				.getChannel(named)!
+				.getFullState().announceChannel = kind !== 'private';
 			activate(w);
-			const { inv } = exposeOverSecondEdge(w, named, toR ? w.r : w.p, !toR);
+			const { inv } = exposeOverSecondEdge(
+				w,
+				named,
+				toR ? w.r : w.p,
+				kind !== 'unverified'
+			);
 			const failures: { reason: string }[] = [];
 			w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
 				failures.push(e)
@@ -739,6 +750,30 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 			expect(failures.pop()!.reason).to.equal('fee_insufficient');
 			expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
 		}
+	});
+
+	it('holds an S-R channel moved onto the SCID of S public channel to P to the book terms', () => {
+		// S uses one funding key for every channel here, so the S-P
+		// announcement carries the key of the S-R channel R moved onto it.
+		const w = createWorld();
+		const moved = openReadyChannel(w.s, w.r);
+		w.s.setChannelPolicy(moved, {
+			feeBaseMsat: 0,
+			feeProportionalMillionths: 0
+		});
+		activate(w);
+		const { inv, scid } = exposeOverSecondEdge(w, w.psChannelId, w.p, true);
+		w.s.getChannelManager().getChannel(moved)!.getFullState().shortChannelId =
+			scid;
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		const payment = pay(w, inv);
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
+		expect(failures.pop()!.reason).to.equal('fee_insufficient');
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
 	});
 
 	it('under a blinded path derives amt_to_forward by the inverse formula within rounding_slack', () => {

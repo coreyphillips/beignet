@@ -16528,26 +16528,33 @@ export class LightningNode extends EventEmitter {
 			// one case where a payer can have priced the hop from gossip instead
 			// of the book. With several S-R channels that need not be the epoch
 			// channel. The signature-exchange flags are no proof, since any bytes
-			// from the peer set them. The peer can also move a stored SCID, so
-			// our funding key in the signed announcement is what ties the SCID
-			// to one of our channels to R.
+			// from the peer set them. The peer can also move a stored SCID onto
+			// another announced channel, and our funding key can repeat across
+			// channels. So the signed node ids must be us and R, and the SCID
+			// must resolve to a public channel of ours to R whose funding key
+			// the announcement carries.
 			const outScid = hopPayload.shortChannelId;
 			const published = outScid ? this.graph.getChannel(outScid) : undefined;
-			const signedKeys =
+			const ann =
 				published?.announcementVerified === true
-					? [
-							published.announcement.bitcoinKey1,
-							published.announcement.bitcoinKey2
-					  ]
-					: [];
+					? published.announcement
+					: undefined;
+			const signedNodes = ann
+				? [ann.nodeId1, ann.nodeId2].map((id) => id.toString('hex'))
+				: [];
 			const rPeer = this.channelManager.getPeerForChannel(slot.channelId);
 			const outgoing =
-				outScid && rPeer && signedKeys.length > 0
+				outScid &&
+				ann &&
+				rPeer &&
+				signedNodes.includes(this.nodeId) &&
+				signedNodes.includes(rPeer)
 					? this.channelManager.getChannelsByPeer(rPeer).find((ch) => {
 							const st = ch.getFullState();
 							return (
+								st.announceChannel &&
 								st.shortChannelId?.equals(outScid) === true &&
-								signedKeys.some((key) =>
+								[ann.bitcoinKey1, ann.bitcoinKey2].some((key) =>
 									key.equals(st.localBasepoints.fundingPubkey)
 								)
 							);
