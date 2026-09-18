@@ -1715,7 +1715,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Array of epoch records: channelId, role, state (NEGOTIATING, VOUCHERS_COMMITTED, ACTIVATING, ACTIVE, DRAINING, CLOSED, ABORTED), epochId, terms, epochStartHeight, activationHash, slots [{ k, amountMsat, paymentHash, state: unissued | exposed | settled | unsettled | settling | unused }], witnesses, settledBitmap, abortReason, activationMismatch'
+								'Array of epoch records: channelId, role, state (NEGOTIATING, VOUCHERS_COMMITTED, ACTIVATING, ACTIVE, DRAINING, CLOSED, ABORTED), epochId, terms, epochStartHeight, activationHash, slots [{ k, amountMsat, paymentHash, state: unissued | exposed | settled | unsettled | settling | unused, bolt11 (R, once the slot was exposed: the invoice /ffor/invoice minted, read back from the invoice store) }], witnesses, settledBitmap, abortReason, activationMismatch'
 						}
 					}
 				}

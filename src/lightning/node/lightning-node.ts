@@ -17163,6 +17163,26 @@ export class LightningNode extends EventEmitter {
 		});
 	}
 
+	/**
+	 * R: the invoice string exposed for each slot of an epoch, by slot (null
+	 * for a slot no invoice was minted for). createFforVoucherInvoice hands
+	 * an invoice out once and refuses the slot afterwards, and the epoch
+	 * record only says the slot is exposed; the invoice itself is in the
+	 * invoice store under the slot's payment hash, which is what a host that
+	 * lost the string (a reload, a second browser, a restart) reads it back
+	 * from (issue #875).
+	 */
+	fforSlotInvoices(channelIdHex: string): (string | null)[] {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const record =
+			this.channelManager.getChannel(channelId)?.getFforEpoch() ?? null;
+		if (!record || record.role !== 'R') return [];
+		return record.paymentHashes.map((hash, i) => {
+			if (!record.exposedSlots[i] || !hash) return null;
+			return this.invoices.get(hash.toString('hex'))?.bolt11 ?? null;
+		});
+	}
+
 	private parkQuiescentHtlc(
 		channelId: Buffer,
 		htlcId: bigint,
