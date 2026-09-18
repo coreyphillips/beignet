@@ -749,12 +749,42 @@ describe('FFOR Variant D: cooperative return (M8.3)', function () {
 		expect(w.r.fforSlotInvoices(w.srHex)).to.deep.equal([inv1, null, inv3]);
 		expect(w.s.fforSlotInvoices(w.srHex)).to.deep.equal([]);
 
+		// Nothing on the onion path completed the voucher invoices: R never
+		// saw the payer's HTLCs.
+		const hash1 = decodeInvoice(inv1).paymentHash;
+		const hash3 = decodeInvoice(inv3).paymentHash;
+		expect(w.r.getPayment(hash1)!.status).to.equal(PaymentStatus.PENDING);
+		const received: IPaymentInfo[] = [];
+		const settled: { paymentHash: Buffer; bolt11: string }[] = [];
+		w.r.on('payment:received', (p: IPaymentInfo) => received.push(p));
+		w.r.on('invoice:settled', (e: { paymentHash: Buffer; bolt11: string }) =>
+			settled.push(e)
+		);
+
 		// R returns.
 		w.sr.reconnect();
 		expect(record(w.r, w.srHex).state).to.equal(FforState.ACTIVE);
 		w.sr.log.length = 0;
 		const closed = w.r.closeFforEpoch(w.srHex);
 		expect(closed.ok, closed.error).to.equal(true);
+
+		// The paid vouchers' invoices read paid once the close credited them
+		// (issue #876), announced the way any receive is; the unpaid slot's
+		// invoice stays pending.
+		const paid1 = w.r.getPayment(hash1)!;
+		expect(paid1.status).to.equal(PaymentStatus.COMPLETED);
+		expect(paid1.preimage!.equals(t1)).to.be.true;
+		expect(paid1.amountMsat).to.equal(AMOUNTS[0]);
+		expect(w.r.getPayment(hash3)!.status).to.equal(PaymentStatus.COMPLETED);
+		expect(received.map((p) => p.amountMsat)).to.deep.equal([
+			AMOUNTS[0],
+			AMOUNTS[2]
+		]);
+		expect(settled.map((e) => e.bolt11)).to.deep.equal([inv1, inv3]);
+		const hash2 = record(w.r, w.srHex).paymentHashes[1];
+		expect(w.r.getPayment(hash2)?.status ?? PaymentStatus.PENDING).to.equal(
+			PaymentStatus.PENDING
+		);
 
 		const types = w.sr.log.map((e) => e.type);
 		// The only FFOR messages after activation are ff_close and ff_close_ack.

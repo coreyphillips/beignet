@@ -4600,6 +4600,9 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on(
 			'ffor:state',
 			(channelId: Buffer, state: number, record: IFforEpochRecord) => {
+				if (state === FforState.CLOSED && record.role === 'R') {
+					this.fforSettleVoucherInvoices(channelId, record);
+				}
 				this.emit('ffor:state', { channelId, state, record });
 			}
 		);
@@ -17160,6 +17163,57 @@ export class LightningNode extends EventEmitter {
 					}
 				]
 			]
+		});
+	}
+
+	/**
+	 * R, once the epoch closed: complete the incoming payment record of every
+	 * voucher whose preimage the drain fulfilled with, and announce it. A
+	 * voucher invoice is an ordinary invoice with an external hash, so it has
+	 * a PENDING incoming payment from the mint; the receiver never handles
+	 * the payer's HTLC (S settled it upstream), so nothing on the onion path
+	 * ever completed it, and the invoice list said PENDING for a voucher the
+	 * channel balance already carried (issue #876). The credit is the drain
+	 * round's fulfil, which is what CLOSED follows, so this is where the
+	 * receive is announced: payment:received and invoice:settled, the same
+	 * two a wallet's notifications listen for.
+	 */
+	private fforSettleVoucherInvoices(
+		channelId: Buffer,
+		record: IFforEpochRecord
+	): void {
+		const channelHex = channelId.toString('hex');
+		record.paymentHashes.forEach((hash, i) => {
+			const preimage = record.knownPreimages[i];
+			if (!hash || !preimage) return;
+			const hashHex = hash.toString('hex');
+			const payment = this.payments.get(hashHex);
+			if (
+				!payment ||
+				payment.direction !== PaymentDirection.INCOMING ||
+				payment.status === PaymentStatus.COMPLETED
+			) {
+				return;
+			}
+			payment.status = PaymentStatus.COMPLETED;
+			payment.preimage = Buffer.from(preimage);
+			payment.completedAt = Date.now();
+			payment.amountMsat = record.params.voucherAmountsMsat[i];
+			// The voucher HTLC on our side, so a restart redispatch knows the
+			// completed hash was settled by exactly it.
+			if (record.sHtlcIdBase !== null) {
+				payment.settledHtlcs = [
+					`${channelHex}:${record.sHtlcIdBase + BigInt(i)}`
+				];
+			}
+			this.safeStorage(() => this.persistPayment(hash), 'persistPayment');
+			this.emit('payment:received', payment);
+			this.emitInvoiceSettled(hash, payment);
+			this.emitStructuredLog('payment', 'received', {
+				paymentHash: hashHex,
+				fforVoucher: 'true',
+				slot: String(i + 1)
+			});
 		});
 	}
 
