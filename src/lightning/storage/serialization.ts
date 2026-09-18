@@ -1042,6 +1042,8 @@ export interface ISerializedFforEpoch {
 	knownPreimages: (string | null)[];
 	/** Absent on records written before the field existed: no slot exposed. */
 	exposedSlots?: boolean[];
+	/** Absent on records written before the field existed: no issuer. */
+	issuerProvisioned?: boolean;
 	/** Absent on records written before D-R existed: no witnesses. */
 	witnesses?: {
 		witnessNodeId: string;
@@ -1108,6 +1110,7 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		settledBitmap: bufToHex(f.settledBitmap),
 		knownPreimages: f.knownPreimages.map((p) => bufToHex(p)),
 		exposedSlots: [...f.exposedSlots],
+		issuerProvisioned: f.issuerProvisioned,
 		witnesses: f.witnesses.map((w) => ({
 			witnessNodeId: w.witnessNodeId.toString('hex'),
 			mailboxId: w.mailboxId.toString('hex'),
@@ -1180,6 +1183,7 @@ export function deserializeFforEpoch(
 		settledBitmap: hexToBuf(s.settledBitmap),
 		knownPreimages: s.knownPreimages.map((p) => hexToBuf(p)),
 		exposedSlots: s.exposedSlots ?? s.knownPreimages.map(() => false),
+		issuerProvisioned: s.issuerProvisioned === true,
 		witnesses: (s.witnesses ?? []).map((w) => ({
 			witnessNodeId: Buffer.from(w.witnessNodeId, 'hex'),
 			mailboxId: Buffer.from(w.mailboxId, 'hex'),

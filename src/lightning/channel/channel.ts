@@ -21194,6 +21194,7 @@ export class Channel {
 			settledBitmap: null,
 			knownPreimages: Array.from({ length: K }, () => null),
 			exposedSlots: Array.from({ length: K }, () => false),
+			issuerProvisioned: false,
 			witnesses: [],
 			closeProcessed: false,
 			voucherRoundFailed: false,
@@ -22870,6 +22871,9 @@ export class Channel {
 		const f = this._state.ffor;
 		if (!f || f.role !== 'R') return 'no epoch of ours';
 		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
+		if (f.issuerProvisioned) {
+			return `the issuer sells this book: voucher ${k} gets no invoice from R`;
+		}
 		if (f.exposedSlots[k - 1]) return `voucher ${k} is already exposed`;
 		if (f.params.hashChain) {
 			for (let j = 1; j < k; j++) {
@@ -22965,6 +22969,29 @@ export class Channel {
 			];
 		}
 		this._state.ffor!.exposedSlots[k - 1] = true;
+		return [{ type: ChannelActionType.PERSIST_STATE }];
+	}
+
+	/**
+	 * R: record, before the manifest leaves, that an issuer sells this book
+	 * (section 9.7.2). Refused once any slot is exposed: the issuer picks the
+	 * lowest unissued slot of an amount and would sell that one again.
+	 */
+	fforMarkIssuerProvisioned(): ChannelAction[] {
+		const f = this._state.ffor;
+		const refuse = (message: string): ChannelAction[] => [
+			{ type: ChannelActionType.ERROR, message, cleanup: 'none' }
+		];
+		if (!f || f.role !== 'R') return refuse('FFOR: no epoch of ours');
+		const exposed = f.exposedSlots.indexOf(true);
+		if (exposed >= 0) {
+			return refuse(
+				`FFOR: voucher ${
+					exposed + 1
+				} is already exposed: the issuer would sell it again`
+			);
+		}
+		f.issuerProvisioned = true;
 		return [{ type: ChannelActionType.PERSIST_STATE }];
 	}
 

@@ -5867,6 +5867,11 @@ export class ChannelManager extends EventEmitter {
 		return this._fforDrive(channelId, (c) => c.fforMarkExposed(k));
 	}
 
+	/** R: durable "an issuer sells this book" (section 9.7.2). */
+	fforMarkIssuerProvisioned(channelId: Buffer): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforMarkIssuerProvisioned());
+	}
+
 	/** R: persist a witness provision before its manifest leaves (section 9.6.4). */
 	fforRecordWitness(
 		channelId: Buffer,

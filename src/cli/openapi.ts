@@ -1773,7 +1773,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/invoice': {
 				post: {
 					summary:
-						"R: the fixed-amount BOLT 11 invoice for slot k, payable while R is offline: amount exactly d_k, payment hash H_k, a route hint naming S with the epoch's fee terms. Only while ACTIVE, before the settlement deadline, once per slot, in ascending order on a chained book, and only after every provisioned witness has acknowledged",
+						"R: the fixed-amount BOLT 11 invoice for slot k, payable while R is offline: amount exactly d_k, payment hash H_k, a route hint naming S with the epoch's fee terms. Only while ACTIVE, before the settlement deadline, once per slot, in ascending order on a chained book, only after every provisioned witness has acknowledged, and never once an issuer has been provisioned on the epoch (the issuer sells the whole book)",
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -1862,7 +1862,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/issuer/provision': {
 				post: {
 					summary:
-						"R: hand the issuer its manifest for an ACTIVE epoch it already witnesses: the offer, the payment-path template (the witness hops named here, then S with the epoch's fee terms, then R), issueUntil, and R's attestation. Returns the blinded node ids the issuer confirmed it controls",
+						"R: hand the issuer its manifest for an ACTIVE epoch it already witnesses: the offer, the payment-path template (the witness hops named here, then S with the epoch's fee terms, then R), issueUntil, and R's attestation. Returns the blinded node ids the issuer confirmed it controls. Refused once R has minted a voucher invoice on the epoch. Once a manifest has been sent, accepted or not, /ffor/invoice refuses every slot",
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
