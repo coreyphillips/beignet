@@ -9,6 +9,7 @@ import { expect } from 'chai';
 import { BeignetNode } from '../../src/cli/beignet-node';
 import { BeignetError } from '../../src/cli/errors';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { fforIssuerSlotCodec } from '../../src/lightning/ffor/issuer-ledger';
 import {
 	IWorld,
 	NodeLink,
@@ -177,5 +178,57 @@ describe('FFOR witness close and issued slots (issue #882)', function () {
 		);
 		expect(stranger.code).to.equal('FFOR_REFUSED');
 		expect(stranger.message).to.match(/no such witness provision/);
+	});
+});
+
+describe('issued slot times are Unix seconds (issue #894)', function () {
+	this.timeout(30_000);
+
+	it('the ledger, ff_issuer_status_resp and the issued route all carry seconds', async () => {
+		const { w, witness, mailboxIdHex } = await witnessedEpoch();
+		const { offer } = w.r.createFforIssuerOffer(witness.getNodeId(), {
+			description: 'ffor slots'
+		});
+		await w.r.provisionFforIssuer(w.srHex, witness.getNodeId(), {
+			offer,
+			witnessHops: []
+		});
+		const ledger = witness.getFforIssuerService()!.ledger;
+		const slot1 = ledger.slotsOf(mailboxIdHex)[0];
+		const before = Math.floor(Date.now() / 1000);
+		expect(
+			ledger.issue(slot1.id, '02' + 'aa'.repeat(32), 'bb'.repeat(32)).outcome
+		).to.equal('applied');
+		const after = Math.floor(Date.now() / 1000);
+
+		const stored = ledger.slotsOf(mailboxIdHex)[0].issuedUnixTime!;
+		expect(stored).to.be.within(before, after);
+		const wire = await w.r.fetchFforIssuerStatus(w.srHex, witness.getNodeId());
+		expect(wire.slots.map((s) => s.issuedUnixTime)).to.deep.equal([
+			BigInt(stored)
+		]);
+		const route = await cliOver(w.r).fforIssuedSlots(
+			w.srHex,
+			witness.getNodeId()
+		);
+		expect(
+			(route.slots as { issuedUnixTime: number }[]).map((s) => s.issuedUnixTime)
+		).to.deep.equal([stored]);
+	});
+
+	it('a slot stored in milliseconds reads back in seconds', () => {
+		const row = {
+			id: 'aa:1',
+			state: 'ISSUED',
+			mailboxIdHex: 'aa',
+			k: 1,
+			amountMsat: '1000',
+			hashHex: 'cc'
+		};
+		const decoded = (issuedUnixTime: number): number | undefined =>
+			fforIssuerSlotCodec.decode(JSON.stringify({ ...row, issuedUnixTime }))!
+				.issuedUnixTime;
+		expect(decoded(1_789_000_000_999)).to.equal(1_789_000_000);
+		expect(decoded(1_789_000_000)).to.equal(1_789_000_000);
 	});
 });

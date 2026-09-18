@@ -65,6 +65,13 @@ export interface IFforIssuerSlotRecord extends ILedgerRecord {
 const MANIFEST_STATES: FforIssuerManifestState[] = ['ISSUING', 'RETIRED'];
 const SLOT_STATES: FforIssuerSlotState[] = ['UNISSUED', 'ISSUED'];
 
+/**
+ * Slot rows written by older versions hold the issuance time in
+ * milliseconds. No seconds value reaches this bound before the year 5138,
+ * and no millisecond value after 1973 falls below it.
+ */
+const MS_ISSUED_TIME_FLOOR = 1e11;
+
 export const fforIssuerManifestCodec: ILedgerCodec<IFforIssuerManifestRecord> =
 	{
 		encode: (r) => JSON.stringify(r),
@@ -102,6 +109,12 @@ export const fforIssuerSlotCodec: ILedgerCodec<IFforIssuerSlotRecord> = {
 				typeof p.hashHex !== 'string'
 			) {
 				return null;
+			}
+			if (
+				typeof p.issuedUnixTime === 'number' &&
+				p.issuedUnixTime >= MS_ISSUED_TIME_FLOOR
+			) {
+				p.issuedUnixTime = Math.floor(p.issuedUnixTime / 1000);
 			}
 			return p as IFforIssuerSlotRecord;
 		} catch {
@@ -210,7 +223,7 @@ export class FforIssuerLedger {
 		return this.slots.transition(id, ['UNISSUED'], 'ISSUED', {
 			payerIdHex,
 			metadataHashHex,
-			issuedUnixTime: Date.now()
+			issuedUnixTime: Math.floor(Date.now() / 1000)
 		});
 	}
 
