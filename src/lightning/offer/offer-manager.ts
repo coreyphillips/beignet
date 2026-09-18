@@ -267,6 +267,14 @@ export class OfferManager extends EventEmitter {
 	private buildPrivatePaymentPaths:
 		| ((pathId: Buffer) => IBlindedPaymentPath[])
 		| null = null;
+	/**
+	 * Node-injected: connect to the node an invoice_request is handed to (the
+	 * offer path's introduction node, or the issuer), which need not be a
+	 * peer yet. Rejects when no connection comes up within `timeoutMs`.
+	 */
+	private connectFirstHop:
+		| ((nodeId: Buffer, timeoutMs: number) => Promise<void>)
+		| null = null;
 	/** Persistent backend for offers; null keeps the manager memory-only. */
 	private storage: IStorageBackend | null = null;
 	private storageAttached = false;
@@ -279,6 +287,7 @@ export class OfferManager extends EventEmitter {
 			allowUnboundInvoiceFallback?: boolean;
 			buildHoldPaymentPaths?: (pathId: Buffer) => IBlindedPaymentPath[];
 			buildPrivatePaymentPaths?: (pathId: Buffer) => IBlindedPaymentPath[];
+			connectFirstHop?: (nodeId: Buffer, timeoutMs: number) => Promise<void>;
 		}
 	) {
 		super();
@@ -289,6 +298,7 @@ export class OfferManager extends EventEmitter {
 			options?.allowUnboundInvoiceFallback ?? false;
 		this.buildHoldPaymentPaths = options?.buildHoldPaymentPaths ?? null;
 		this.buildPrivatePaymentPaths = options?.buildPrivatePaymentPaths ?? null;
+		this.connectFirstHop = options?.connectFirstHop ?? null;
 
 		if (options?.onionMessageManager) {
 			this.attachOnionMessageManager(options.onionMessageManager);
@@ -661,6 +671,9 @@ export class OfferManager extends EventEmitter {
 		const signedRequestTlv = encodeInvoiceRequestTlv(request, offerTlvData);
 		const sentRecords = getTlvRecords(signedRequestTlv);
 
+		// Connecting to the first hop spends from the same window as the reply.
+		const deadline = Date.now() + this.invoiceRequestTimeoutMs;
+
 		// If we have an onion message manager and the offer has paths or issuer_id, send via onion
 		let replyPathId: Buffer | undefined;
 		if (this.onionMessageManager && (offer.paths || offer.issuerId)) {
@@ -686,17 +699,21 @@ export class OfferManager extends EventEmitter {
 			// onion messages are ALWAYS blinded (every hop payload carries
 			// encrypted_data and the sphinx layer is addressed to blinded node
 			// ids), so a raw unblinded send is silently dropped by CLN/LND.
-			if (offer.paths && offer.paths.length > 0) {
-				this.onionMessageManager.sendReply(offer.paths[0], messageData, {
-					replyPath
-				});
-			} else if (offer.issuerId) {
-				const issuerPath = constructBlindedPath(
-					crypto.randomBytes(32),
-					[offer.issuerId],
-					[{}]
-				);
-				this.onionMessageManager.sendReply(issuerPath, messageData, {
+			const sendPath =
+				offer.paths && offer.paths.length > 0
+					? offer.paths[0]
+					: offer.issuerId
+					? constructBlindedPath(crypto.randomBytes(32), [offer.issuerId], [{}])
+					: null;
+			if (sendPath) {
+				// The request is handed straight to the introduction node.
+				if (this.connectFirstHop) {
+					await this.connectFirstHop(
+						sendPath.introductionNodeId,
+						this.invoiceRequestTimeoutMs
+					);
+				}
+				this.onionMessageManager.sendReply(sendPath, messageData, {
 					replyPath
 				});
 			}
@@ -711,10 +728,13 @@ export class OfferManager extends EventEmitter {
 			const requestIdHex = (replyPathId ?? crypto.randomBytes(32)).toString(
 				'hex'
 			);
-			const timer = setTimeout(() => {
-				this.pendingInvoiceRequests.delete(requestIdHex);
-				reject(new Error('Invoice request timed out'));
-			}, this.invoiceRequestTimeoutMs);
+			const timer = setTimeout(
+				() => {
+					this.pendingInvoiceRequests.delete(requestIdHex);
+					reject(new Error('Invoice request timed out'));
+				},
+				Math.max(0, deadline - Date.now())
+			);
 
 			this.pendingInvoiceRequests.set(requestIdHex, {
 				resolve,

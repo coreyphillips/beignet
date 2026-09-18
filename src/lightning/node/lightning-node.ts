@@ -1780,7 +1780,9 @@ export class LightningNode extends EventEmitter {
 			buildPrivatePaymentPaths: (pathId: Buffer): IBlindedPaymentPath[] => {
 				if (this.hasPublishedPublicChannel()) return [];
 				return this.buildBlindedPaymentPaths(false, 2, pathId);
-			}
+			},
+			connectFirstHop: (nodeId: Buffer, timeoutMs: number): Promise<void> =>
+				this.connectForRequest(nodeId.toString('hex'), timeoutMs)
 		});
 		this.wireOfferManagerEvents();
 
@@ -7914,8 +7916,12 @@ export class LightningNode extends EventEmitter {
 	 * Connect to a peer by node id alone, resolving its address from the
 	 * gossip graph, then DNS bootstrap. Throws an error describing every
 	 * address tried (and every Tor address skipped) when nothing connects.
+	 * `options` applies to every dial.
 	 */
-	private async connectPeerById(pubkey: string): Promise<void> {
+	private async connectPeerById(
+		pubkey: string,
+		options: IPeerDialOptions = {}
+	): Promise<void> {
 		const attempts: string[] = [];
 		// ONE cancellation token for the whole node-id operation: a dial
 		// rejects typed on its own, but disconnectPeer() can also land in
@@ -7951,7 +7957,13 @@ export class LightningNode extends EventEmitter {
 		for (const { host, port } of candidates) {
 			assertNotCancelled();
 			try {
-				await this.peerManager!.connectPeer(pubkey, host, port);
+				await this.peerManager!.connectPeer(
+					pubkey,
+					host,
+					port,
+					undefined,
+					options
+				);
 				return;
 			} catch (err) {
 				// An explicit disconnectPeer() cancelled the whole node-id
@@ -7995,7 +8007,13 @@ export class LightningNode extends EventEmitter {
 				// before the FIRST dns dial too.
 				assertNotCancelled();
 				try {
-					await this.peerManager!.connectPeer(pubkey, peer.host, peer.port);
+					await this.peerManager!.connectPeer(
+						pubkey,
+						peer.host,
+						peer.port,
+						undefined,
+						options
+					);
 					return;
 				} catch (err) {
 					// See the graph loop: cancellation stops the operation.
@@ -8012,6 +8030,43 @@ export class LightningNode extends EventEmitter {
 		throw new Error(
 			`Unable to resolve a connection to ${pubkey}: ${attempts.join('; ')}`
 		);
+	}
+
+	/**
+	 * Connect to a node a request goes to directly but that need not be a
+	 * channel peer (an FFOR witness or issuer, an offer's introduction node),
+	 * dialing by node id when it is not a ready peer. Rejects with the dial's
+	 * failure, or once `timeoutMs` passes; a dial still running then is left
+	 * to finish on its own. Without a peer transport, or while the recovery
+	 * gate holds peer traffic, it dials nothing and the send decides.
+	 */
+	private async connectForRequest(
+		pubkey: string,
+		timeoutMs: number
+	): Promise<void> {
+		const pm = this.peerManager;
+		if (!pm || pubkey === this.getNodeId()) return;
+		if (pm.getPeer(pubkey)?.getState() === 'ready') return;
+		if (!this.recoveryPermitsPeerTraffic()) return;
+		// Nothing follows the request up, so the dial must not leave the node
+		// redialing a stranger for good once it fails or its connection closes.
+		const dial = this.connectPeerById(pubkey, { reconnect: false });
+		dial.catch(() => undefined);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				dial,
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new Error(`dial to ${pubkey} timed out`)),
+						timeoutMs
+					);
+					timer.unref?.();
+				})
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	disconnectPeer(pubkey: string): void {
@@ -25574,20 +25629,36 @@ export class LightningNode extends EventEmitter {
 		});
 	}
 
-	/** Send a witness-lane request and await the response with its request id. */
-	private sendFforWitnessRequest(
+	/**
+	 * Send a witness-lane request and await the response with its request id.
+	 * A witness or issuer need not be a channel peer, so one that is not
+	 * connected is dialed first; `timeoutMs` bounds the dial and the answer
+	 * together.
+	 */
+	private async sendFforWitnessRequest(
 		pubkey: string,
 		type: number,
 		payload: Buffer,
 		requestId: Buffer,
 		timeoutMs = 30_000
 	): Promise<Buffer> {
+		const deadline = Date.now() + timeoutMs;
+		let unanswered = `witness ${pubkey} did not answer type ${type}`;
+		try {
+			await this.connectForRequest(pubkey, timeoutMs);
+		} catch (err) {
+			// Still sent: the event transport may carry it. The dial's failure
+			// is what explains the silence if nothing does.
+			unanswered += ` (${err instanceof Error ? err.message : String(err)})`;
+		}
+		const remainingMs = deadline - Date.now();
+		if (remainingMs <= 0) throw new Error(unanswered);
 		const id = requestId.toString('hex');
 		return new Promise<Buffer>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.fforWitnessRequests.delete(id);
-				reject(new Error(`witness ${pubkey} did not answer type ${type}`));
-			}, timeoutMs);
+				reject(new Error(unanswered));
+			}, remainingMs);
 			timer.unref?.();
 			this.fforWitnessRequests.set(id, { resolve, reject, timer });
 			this.emitOutbound(pubkey, type, payload);
