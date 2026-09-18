@@ -3128,6 +3128,23 @@ export class LightningNode extends EventEmitter {
 		// Prune stale gossip immediately on restore (BOLT 7: >2 weeks = stale)
 		this.pruneStaleGossipWithStorage();
 
+		// A public channel with no graph row (announced before announcement:ready
+		// saved one, or its save failed) is rebuilt from its stored signatures:
+		// FFOR settlement needs it while R may be offline. A row that is present
+		// is left for settlement to verify.
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			const scid = channel.getShortChannelId();
+			if (
+				channelId &&
+				scid &&
+				channel.isHtlcUsable(true) &&
+				!this.graph.getChannel(scid)
+			) {
+				this.channelManager.reannounceChannel(channelId);
+			}
+		}
+
 		// JIT receive: bring back the live intents (so invoices already out
 		// there stay payable) and queue every pre-restart held HTLC to be
 		// failed upstream. Runs after the channels and their onion shared

@@ -1586,28 +1586,66 @@ describe('FFOR Variant D: public S-R fee across an S restart (issue #899)', func
 		}
 	});
 
-	it('a failed save of the published row leaves the restarted S at the book terms', () => {
+	it('rebuilds a published row missing from storage when S restarts with R offline', () => {
+		// 'never saved' is a channel announced before announcement:ready
+		// saved its row, as on the restart that upgrades to this version.
+		for (const missing of ['failed save', 'never saved'] as const) {
+			const w = worldWithStorage();
+			const save = w.storage.saveGossipChannel.bind(w.storage);
+			if (missing === 'failed save') {
+				w.storage.saveGossipChannel = (): void => {
+					throw new Error('disk full');
+				};
+			}
+			const { invs, scid, fee } = publishAndExpose(w);
+			w.storage.saveGossipChannel = save;
+			if (missing === 'failed save') {
+				expect(w.errors.s).to.include('saveGossipChannel: disk full');
+			}
+			// The verified row in memory still counts for this session.
+			expect(pay(w, invs[0]).status).to.equal(PaymentStatus.COMPLETED);
+			w.storage.deleteGossipChannel(scid.toString('hex'));
+
+			restartS(w);
+			expect(w.s.getGraph().getChannel(scid)?.announcementVerified).to.equal(
+				true
+			);
+			const stored = w.storage.loadAllGossipChannels();
+			expect(stored.some((c) => c.shortChannelId.equals(scid))).to.be.true;
+			const payment = pay(w, invs[1]);
+			expect(payment.status, missing).to.equal(PaymentStatus.COMPLETED);
+			expect(payment.route!.totalFeeMsat).to.equal(fee(AMOUNTS[1]));
+		}
+	});
+
+	it('holds a row rebuilt with a bad counterparty signature to the book terms', () => {
 		const w = worldWithStorage();
-		const save = w.storage.saveGossipChannel.bind(w.storage);
-		w.storage.saveGossipChannel = (): void => {
-			throw new Error('disk full');
-		};
 		const { invs, scid } = publishAndExpose(w);
-		w.storage.saveGossipChannel = save;
-		expect(w.errors.s).to.include('saveGossipChannel: disk full');
-		// The verified row in memory still counts for this session.
-		expect(pay(w, invs[0]).status).to.equal(PaymentStatus.COMPLETED);
+		w.storage.deleteGossipChannel(scid.toString('hex'));
+		const id = w.srChannelId.toString('hex');
+		const { state, peerPubkey } = w.storage.loadChannel(id)!;
+		const sig = Buffer.from(state.remoteAnnouncementBitcoinSig!);
+		sig[40] ^= 1;
+		w.storage.saveChannel(
+			id,
+			{ ...state, remoteAnnouncementBitcoinSig: sig },
+			peerPubkey
+		);
 
 		restartS(w);
-		expect(w.s.getGraph().getChannel(scid)).to.equal(undefined);
+		expect(w.s.getGraph().getChannel(scid)?.announcementVerified).to.equal(
+			false
+		);
+		const stored = w.storage.loadAllGossipChannels();
+		expect(stored.some((c) => c.shortChannelId.equals(scid))).to.be.false;
 		const failures: { reason: string }[] = [];
 		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
 			failures.push(e)
 		);
-		const payment = pay(w, invs[1]);
+		const payment = pay(w, invs[0]);
 		expect(payment.status).to.equal(PaymentStatus.FAILED);
 		expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
 		expect(failures.pop()!.reason).to.equal('fee_insufficient');
-		expect(record(w.s, w.srHex).slotStates[1]).to.equal(FforSlotState.UNUSED);
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
 	});
 });
