@@ -2692,6 +2692,17 @@ async function bootDaemon(
 		// channel; a guardian restore RESUMES them from replicated state.
 		// FFOR offline receive (issue #729): the receiver's epoch lifecycle,
 		// and the settlement, witness and issuer roles this node runs.
+		'GET /receive/status': () => success(node.getOfflineReceive().status()),
+		'GET /receive/quote': async (_body, query) =>
+			success(
+				await node
+					.getOfflineReceive()
+					.quote(query.get('peer') || '', Number(query.get('amountSats')))
+			),
+		'POST /receive/invoice': async (body) => {
+			const b = body as { peer: string };
+			return success(await node.getOfflineReceive().create(body, b.peer));
+		},
 		'GET /ffor/epochs': () => success(node.fforEpochs()),
 		'GET /ffor/settlements': () => success(node.fforEpochs('S')),
 		'GET /ffor/epoch': (body, query) => {

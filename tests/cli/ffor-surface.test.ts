@@ -75,6 +75,40 @@ function request(
 	});
 }
 
+describe('Automatic receive funding environment', () => {
+	it('requires explicit valid funding policy and preserves disabled defaults', () => {
+		const saved = process.env.BEIGNET_FFOR_RECEIVE_FUNDING;
+		try {
+			delete process.env.BEIGNET_FFOR_RECEIVE_FUNDING;
+			expect(resolveConfig({}).fforReceiveFunding).to.equal(undefined);
+			for (const bad of [
+				'{',
+				'null',
+				'[]',
+				'{"enabled":"true"}',
+				'{"enabled":true,"maxChannels":0}'
+			]) {
+				process.env.BEIGNET_FFOR_RECEIVE_FUNDING = bad;
+				expect(() => resolveConfig({})).to.throw(
+					/BEIGNET_FFOR_RECEIVE_FUNDING/
+				);
+			}
+			const funding = {
+				enabled: true,
+				maxChannels: 2,
+				maxChannelsPerPeer: 1,
+				maxChannelSats: 100000,
+				maxTotalSats: 200000
+			};
+			process.env.BEIGNET_FFOR_RECEIVE_FUNDING = JSON.stringify(funding);
+			expect(resolveConfig({}).fforReceiveFunding).to.deep.equal(funding);
+		} finally {
+			if (saved === undefined) delete process.env.BEIGNET_FFOR_RECEIVE_FUNDING;
+			else process.env.BEIGNET_FFOR_RECEIVE_FUNDING = saved;
+		}
+	});
+});
+
 describe('FFOR surface: configuration (issue #729)', () => {
 	it('parses the BEIGNET_FFOR_* switches exactly, with their limits', () => {
 		const saved = { ...process.env };
@@ -164,6 +198,28 @@ describe('FFOR surface: routes on a node with no epoch (issue #729)', () => {
 		}
 	});
 
+	it('serves automatic receive status and validates creation before allocating', async () => {
+		const status = await request(portOf(daemon), 'GET', '/receive/status');
+		expect(status.status).to.equal(200);
+		expect(status.body.result).to.deep.equal({
+			available: true,
+			reservedChannelIds: [],
+			requests: []
+		});
+		const quote = await request(
+			portOf(daemon),
+			'GET',
+			'/receive/quote?peer=invalid&amountSats=20000'
+		);
+		expect(quote.status).not.to.equal(200);
+		const created = await request(
+			portOf(daemon),
+			'POST',
+			'/receive/invoice',
+			{}
+		);
+		expect(created.status).not.to.equal(200);
+	});
 	it('reports the witness and issuer roles it runs', async () => {
 		const witness = await request(
 			portOf(daemon),
