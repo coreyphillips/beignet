@@ -16522,7 +16522,14 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 
-			// Section 7.6 checks 1 and 2 on the payee amount d_k.
+			// Section 7.6 checks 1 and 2 on the payee amount d_k. S's own policy
+			// counts only on an announced S-R channel, the one case where a
+			// payer can have priced the hop from gossip instead of the book.
+			const srState = slot.channel.getFullState();
+			const announced =
+				srState.announceChannel === true &&
+				srState.announcementSigsSent &&
+				srState.announcementSigsReceived;
 			const amountCheck = checkDelegatedAmounts({
 				payeeAmountMsat: entry.amountMsat,
 				amountMsat,
@@ -16530,7 +16537,9 @@ export class LightningNode extends EventEmitter {
 				hopKind: blinded ? 'blinded' : 'plaintext',
 				feeBaseMsat: record.params.feeBaseMsat,
 				feeProportionalMillionths: record.params.feeProportionalMillionths,
-				advertisedFee: this.getForwardingPolicyForChannel(slot.channelId)
+				advertisedFee: announced
+					? this.getForwardingPolicyForChannel(slot.channelId)
+					: undefined
 			});
 			if (amountCheck) {
 				if (amountCheck.check === 2) {

@@ -592,6 +592,29 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.SETTLED);
 	});
 
+	it('holds an unannounced S-R hop to the book terms', () => {
+		const w = createWorld();
+		activate(w);
+		const [inv] = exposeAndLeave(w, [1]);
+		w.s
+			.getChannelManager()
+			.getChannel(w.srChannelId)!
+			.getFullState().announceChannel = false;
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		// Covers S's default policy (1000 msat + 1 ppm) but not the book.
+		const payment = pay(
+			w,
+			craftInvoice(w, inv, { feeBaseMsat: 1000, feeProportionalMillionths: 1 })
+		);
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
+		expect(failures.pop()!.reason).to.equal('fee_insufficient');
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+	});
+
 	it('under a blinded path derives amt_to_forward by the inverse formula within rounding_slack', () => {
 		const d = 1_000_000n;
 		const gross = grossIntoS(d, FEE_BASE, FEE_PPM);
