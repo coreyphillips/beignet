@@ -17183,8 +17183,9 @@ export class LightningNode extends EventEmitter {
 			throw new Error('no usable SCID or alias for the route hint to S');
 		}
 		// Section 9.5.4: strictly ascending levels on a chained book, and one
-		// invoice per slot on any book. Durable BEFORE the invoice exists, so a
-		// restart cannot hand out a lower level after a higher one.
+		// invoice per slot on any book; none once an issuer sells the book.
+		// Durable BEFORE the invoice exists, so a restart cannot hand out a
+		// lower level after a higher one.
 		const exposureRefusal = channel.fforExposureRefusal(k);
 		if (exposureRefusal) throw new Error(`FFOR: ${exposureRefusal}`);
 		const marked = this.channelManager.fforMarkExposed(channelId, k);
@@ -25779,6 +25780,13 @@ export class LightningNode extends EventEmitter {
 				this.nodePrivkey
 			)
 		});
+		// Durable before the manifest leaves, and never cleared: after a lost
+		// ack, or a refusal from an issuer that already holds a manifest for
+		// this mailbox, the issuer may still be selling the book.
+		const marked = this.channelManager.fforMarkIssuerProvisioned(channelId);
+		if (!marked.ok) {
+			throw new Error(marked.error ?? 'FFOR: issuer not recorded');
+		}
 		const requestId = FforWitnessService.freshRequestId();
 		const body = await this.sendFforWitnessRequest(
 			issuerNodeIdHex,

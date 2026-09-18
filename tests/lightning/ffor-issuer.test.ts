@@ -24,6 +24,10 @@ import {
 import { IBlindedPath } from '../../src/lightning/onion/blinded-path';
 import { FforSlotState } from '../../src/lightning/ffor/types';
 import {
+	deserializeFforEpoch,
+	serializeFforEpoch
+} from '../../src/lightning/storage/serialization';
+import {
 	FF_ISSUER_ATTESTATION_TLV,
 	FF_ISSUER_REFUSAL,
 	IFforIssuerHop,
@@ -431,6 +435,92 @@ describe('FFOR BOLT 12 issuer (M9.5, section 9.7)', function () {
 		}
 		expect(refused?.message).to.include(FF_ISSUER_REFUSAL);
 		w.wStorage.close();
+	});
+
+	describe('R and the issuer never both hand out a slot (issue #884)', () => {
+		async function witnessed(w: IIssuerWorld): Promise<void> {
+			activate(w, {
+				amounts: [G, G],
+				witnessPeers: [Buffer.from(w.w.getNodeId(), 'hex')]
+			});
+			await w.r.provisionFforWitness(w.srHex, w.w.getNodeId());
+		}
+
+		it('R exposes no invoice once an issuer manifest was sent, refused or not, and the mark is persisted', async () => {
+			const w = createIssuerWorld();
+			await witnessed(w);
+			// Paths that terminate at P: the issuer refuses the manifest.
+			const { offer: wrong } = w.r.createFforIssuerOffer(w.p.getNodeId(), {
+				description: 'ffor slots'
+			});
+			let refused: Error | null = null;
+			try {
+				await w.r.provisionFforIssuer(w.srHex, w.w.getNodeId(), {
+					offer: wrong,
+					witnessHops: [witnessHop(w)]
+				});
+			} catch (err) {
+				refused = err as Error;
+			}
+			expect(refused?.message).to.match(/issuer refused the manifest/);
+			expect(() => w.r.createFforVoucherInvoice(w.srHex, 1)).to.throw(
+				/the issuer sells this book/
+			);
+			// A retry with a good offer is still accepted.
+			const { offer } = w.r.createFforIssuerOffer(w.w.getNodeId(), {
+				description: 'ffor slots',
+				amountMsat: G
+			});
+			await w.r.provisionFforIssuer(w.srHex, w.w.getNodeId(), {
+				offer,
+				witnessHops: [witnessHop(w)]
+			});
+			for (const k of [1, 2]) {
+				expect(() => w.r.createFforVoucherInvoice(w.srHex, k)).to.throw(
+					/the issuer sells this book/
+				);
+			}
+			const rec = record(w.r, w.srHex);
+			expect(rec.exposedSlots).to.deep.equal([false, false]);
+			const stored = serializeFforEpoch(rec);
+			expect(deserializeFforEpoch(stored).issuerProvisioned).to.equal(true);
+			delete stored.issuerProvisioned;
+			expect(
+				deserializeFforEpoch(stored).issuerProvisioned,
+				'a record from before the field'
+			).to.equal(false);
+			w.wStorage.close();
+		});
+
+		it('no issuer is provisioned over a book R already exposed an invoice from', async () => {
+			const w = createIssuerWorld();
+			await witnessed(w);
+			w.r.createFforVoucherInvoice(w.srHex, 1);
+			const { offer } = w.r.createFforIssuerOffer(w.w.getNodeId(), {
+				description: 'ffor slots',
+				amountMsat: G
+			});
+			let refused: Error | null = null;
+			try {
+				await w.r.provisionFforIssuer(w.srHex, w.w.getNodeId(), {
+					offer,
+					witnessHops: [witnessHop(w)]
+				});
+			} catch (err) {
+				refused = err as Error;
+			}
+			expect(refused?.message).to.match(
+				/voucher 1 is already exposed: the issuer would sell it again/
+			);
+			expect(
+				w.w.getFforIssuerService()!.ledger.listManifests(),
+				'nothing reached the issuer'
+			).to.have.length(0);
+			expect(record(w.r, w.srHex).issuerProvisioned).to.equal(false);
+			// R keeps the rest of the book.
+			w.r.createFforVoucherInvoice(w.srHex, 2);
+			w.wStorage.close();
+		});
 	});
 });
 

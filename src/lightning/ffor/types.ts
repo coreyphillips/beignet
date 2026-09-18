@@ -188,6 +188,13 @@ export interface IFforEpochRecord {
 	 */
 	exposedSlots: boolean[];
 	/**
+	 * R: an issuer manifest was sent for this epoch (section 9.7.2). The
+	 * issuer sells any unissued slot of the book and cannot be told which
+	 * ones R exposed itself, so once this is set R exposes no invoice, and
+	 * it is never set once R has exposed one.
+	 */
+	issuerProvisioned: boolean;
+	/**
 	 * R: the receipt witnesses provisioned for this epoch (section 9.6.4),
 	 * with the keys their records are fetched and decrypted under. Persisted
 	 * before the manifest leaves, or a crash after the send would orphan a
