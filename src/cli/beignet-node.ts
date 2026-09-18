@@ -2905,8 +2905,13 @@ export class BeignetNode extends EventEmitter {
 			'ffor:witness-provisioned',
 			'ffor:witness-recorded',
 			'ffor:witness-released',
+			'ffor:witness-refused',
+			'ffor:witness-closed',
+			'ffor:witness-expired',
+			'ffor:witness-audit',
 			'ffor:issuer-provisioned',
 			'ffor:issuer-issued',
+			'ffor:issuer-retired',
 			// Swap provider engines (issues #737 and #743). LightningNode
 			// re-emits both engines' events; without this relay the daemon's
 			// SSE and webhook lists promise them and never deliver one.

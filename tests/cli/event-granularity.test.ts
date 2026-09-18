@@ -51,6 +51,18 @@ const RECOVERY_DAEMON_EVENTS = [
 	'recovery:restore-progress',
 	'recovery:restored'
 ];
+/**
+ * FFOR witness and issuer events a host shows its operator (issue #883): a
+ * refused provision, an advisory close, a retention expiry, a record that
+ * failed verification on the receiver, and an offer that stopped issuing.
+ */
+const FFOR_ROLE_EVENTS = [
+	'ffor:witness-refused',
+	'ffor:witness-closed',
+	'ffor:witness-expired',
+	'ffor:witness-audit',
+	'ffor:issuer-retired'
+];
 const BASE_EVENTS = [
 	'payment:received',
 	'payment:sent',
@@ -113,6 +125,13 @@ describe('Event granularity (M4 batch 2b)', () => {
 		// badges, restore progress) rides them, so they are never gated.
 		it('relays the recovery events, with and without htlc events', () => {
 			for (const e of [...RECOVERY_NODE_EVENTS, ...RECOVERY_DAEMON_EVENTS]) {
+				expect(getRelayedEvents(), e).to.include(e);
+				expect(getRelayedEvents(true), e).to.include(e);
+			}
+		});
+
+		it('relays the FFOR witness and issuer events, with and without htlc events', () => {
+			for (const e of FFOR_ROLE_EVENTS) {
 				expect(getRelayedEvents(), e).to.include(e);
 				expect(getRelayedEvents(true), e).to.include(e);
 			}
@@ -245,7 +264,7 @@ describe('Event granularity (M4 batch 2b)', () => {
 		});
 	});
 
-	describe('hold invoice event bridge', function () {
+	describe('hold invoice and FFOR event bridge', function () {
 		this.timeout(20_000);
 		let node: BeignetNode | undefined;
 		let dataDir: string;
@@ -372,6 +391,54 @@ describe('Event granularity (M4 batch 2b)', () => {
 						cancelHeight: null,
 						reason: 'api'
 					}
+				]
+			]);
+		});
+
+		it('relays the FFOR witness and issuer events as valid SSE JSON, buffers as hex', () => {
+			const received: Array<[string, unknown]> = [];
+			for (const event of FFOR_ROLE_EVENTS) {
+				node!.once(event, (data: unknown) => {
+					const frame = formatSseFrame(event, data);
+					received.push([event, JSON.parse(frame.split('\ndata: ')[1])]);
+				});
+			}
+			// The payloads the witness service, the issuer service and
+			// fetchFforWitnessRecords emit.
+			const peer = '02' + 'aa'.repeat(32);
+			const ln = node!.lightningNode;
+			ln.emit('ffor:witness-refused', { peer, reason: 'witness quota' });
+			ln.emit('ffor:witness-closed', {
+				mailboxId: Buffer.alloc(32, 0x01),
+				held: 3
+			});
+			ln.emit('ffor:witness-expired', { mailboxId: Buffer.alloc(32, 0x02) });
+			ln.emit('ffor:witness-audit', {
+				channelId: Buffer.alloc(32, 0x03),
+				witnessNodeId: Buffer.alloc(33, 0x04),
+				k: 2,
+				reason: 'bad signature'
+			});
+			ln.emit('ffor:issuer-retired', {
+				mailboxId: Buffer.alloc(32, 0x05),
+				reason: 'issue_until'
+			});
+			expect(received).to.deep.equal([
+				['ffor:witness-refused', { peer, reason: 'witness quota' }],
+				['ffor:witness-closed', { mailboxId: '01'.repeat(32), held: 3 }],
+				['ffor:witness-expired', { mailboxId: '02'.repeat(32) }],
+				[
+					'ffor:witness-audit',
+					{
+						channelId: '03'.repeat(32),
+						witnessNodeId: '04'.repeat(33),
+						k: 2,
+						reason: 'bad signature'
+					}
+				],
+				[
+					'ffor:issuer-retired',
+					{ mailboxId: '05'.repeat(32), reason: 'issue_until' }
 				]
 			]);
 		});
