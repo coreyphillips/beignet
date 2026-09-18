@@ -743,6 +743,12 @@ describe('FFOR Variant D: cooperative return (M8.3)', function () {
 		const t1 = record(w.s, w.srHex).preimages[0];
 		const t3 = record(w.s, w.srHex).preimages[2];
 
+		// The invoices minted are readable back by slot (issue #875): a host
+		// that lost the string reads it from the epoch, not from a second
+		// mint the book refuses.
+		expect(w.r.fforSlotInvoices(w.srHex)).to.deep.equal([inv1, null, inv3]);
+		expect(w.s.fforSlotInvoices(w.srHex)).to.deep.equal([]);
+
 		// R returns.
 		w.sr.reconnect();
 		expect(record(w.r, w.srHex).state).to.equal(FforState.ACTIVE);
@@ -803,6 +809,8 @@ describe('FFOR Variant D: cooperative return (M8.3)', function () {
 		expect(rAfter.remoteBalanceMsat).to.equal(sAfter.localBalanceMsat);
 		expect(sAfter.htlcs.size).to.equal(0);
 		expect(rAfter.htlcs.size).to.equal(0);
+		// The invoices stay readable after the close.
+		expect(w.r.fforSlotInvoices(w.srHex)).to.deep.equal([inv1, null, inv3]);
 
 		// Ordinary operation resumes: S pays R over the channel.
 		const ordinary = w.r.createInvoice({

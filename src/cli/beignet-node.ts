@@ -6754,6 +6754,11 @@ export class BeignetNode extends EventEmitter {
 		const K = f.params.maxPayments;
 		const settledBit = (k: number): boolean =>
 			f.settledBitmap !== null && bitmapGet(f.settledBitmap, k);
+		// R: the invoice minted for each exposed slot, read back from the
+		// invoice store so a host that lost the string can share it again
+		// (issue #875). S never holds one.
+		const invoices =
+			f.role === 'R' ? this.node.fforSlotInvoices(channelIdHex) : [];
 		const slots = Array.from({ length: K }, (_, i) => {
 			const k = i + 1;
 			let state: string;
@@ -6773,11 +6778,13 @@ export class BeignetNode extends EventEmitter {
 			} else {
 				state = 'unissued';
 			}
+			const bolt11 = invoices[i] ?? null;
 			return {
 				k,
 				amountMsat: f.params.voucherAmountsMsat[i].toString(),
 				paymentHash: f.paymentHashes[i]?.toString('hex') ?? null,
-				state
+				state,
+				...(bolt11 ? { bolt11 } : {})
 			};
 		});
 		return {
