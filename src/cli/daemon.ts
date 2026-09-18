@@ -328,6 +328,17 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// FFOR (issue #729): a refused epoch, invoice, credit or provisioning is
 	// the caller's request against the engine's rules, never a server fault.
 	FFOR_REFUSED: 400,
+	// Automatic receive refuses invalid input or a reservation whose state
+	// needs review. Preserve these messages for the invoice form.
+	AMOUNT_TOO_SMALL: 400,
+	INVALID_REVIEW: 400,
+	QUOTE_EXPIRED: 409,
+	FEE_CHANGED: 409,
+	RECEIVE_UNAVAILABLE: 409,
+	RECEIVE_PENDING: 409,
+	RECEIVE_BUSY: 409,
+	// A failed durable invoice write is a server fault, not a caller refusal.
+	DURABILITY_FAILED: 500,
 	INVOICE_EXPIRED: 410,
 	SPENDING_LIMIT_EXCEEDED: 403,
 	// Draining is an operator decision, not a wait: isPermanentFailure agrees,
@@ -2692,6 +2703,17 @@ async function bootDaemon(
 		// channel; a guardian restore RESUMES them from replicated state.
 		// FFOR offline receive (issue #729): the receiver's epoch lifecycle,
 		// and the settlement, witness and issuer roles this node runs.
+		'GET /receive/status': () => success(node.getOfflineReceive().status()),
+		'GET /receive/quote': async (_body, query) =>
+			success(
+				await node
+					.getOfflineReceive()
+					.quote(query.get('peer') || '', Number(query.get('amountSats')))
+			),
+		'POST /receive/invoice': async (body) => {
+			const b = body as { peer: string };
+			return success(await node.getOfflineReceive().create(body, b.peer));
+		},
 		'GET /ffor/epochs': () => success(node.fforEpochs()),
 		'GET /ffor/settlements': () => success(node.fforEpochs('S')),
 		'GET /ffor/epoch': (body, query) => {

@@ -89,6 +89,37 @@ function integerEnv(raw: string | undefined): number | undefined {
 	return /^[+-]?\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
 }
 
+// Refuse malformed funding policy before starting a provider.
+function receiveFundingEnv(): BeignetConfig['fforReceiveFunding'] {
+	const raw = process.env.BEIGNET_FFOR_RECEIVE_FUNDING;
+	if (!raw) return undefined;
+	let value;
+	try {
+		value = JSON.parse(raw);
+	} catch {
+		throw new Error('BEIGNET_FFOR_RECEIVE_FUNDING must be valid JSON');
+	}
+	if (
+		!value ||
+		typeof value !== 'object' ||
+		Array.isArray(value) ||
+		typeof value.enabled !== 'boolean'
+	)
+		throw new Error(
+			'BEIGNET_FFOR_RECEIVE_FUNDING must contain an enabled boolean'
+		);
+	for (const key of [
+		'maxChannels',
+		'maxChannelsPerPeer',
+		'maxChannelSats',
+		'maxTotalSats'
+	]) {
+		if (value.enabled && (!Number.isSafeInteger(value[key]) || value[key] <= 0))
+			throw new Error(`BEIGNET_FFOR_RECEIVE_FUNDING.${key} must be positive`);
+	}
+	return value;
+}
+
 /**
  * BEIGNET_LEASE_RATES: a JSON object with the five option_will_fund
  * lease_rates fields (issue #532 workstream 1B). Same fail-closed contract as
@@ -536,7 +567,10 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			file.recoveryAutoApplyMaxWaitMs,
 		// FFOR roles (issue #729): exact true/false, like the guardian flag,
 		// because each one changes what this node promises other nodes.
-		fforReceiveFunding: cliFlags.fforReceiveFunding ?? file.fforReceiveFunding,
+		fforReceiveFunding:
+			cliFlags.fforReceiveFunding ??
+			receiveFundingEnv() ??
+			file.fforReceiveFunding,
 		fforSettle:
 			cliFlags.fforSettle ??
 			(process.env.BEIGNET_FFOR_SETTLE === 'true' ||

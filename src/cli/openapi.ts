@@ -1745,6 +1745,59 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/receive/status': {
+				get: {
+					summary: 'Durable automatic receive requests and reserved channels',
+					tags: ['FFOR'],
+					responses: {
+						'200': { description: 'available, requests and reservedChannelIds' }
+					}
+				}
+			},
+			'/receive/quote': {
+				get: {
+					summary:
+						'Quote automatic offline receiving at a connected primary without reserving funds',
+					tags: ['FFOR'],
+					parameters: [
+						{
+							name: 'peer',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						},
+						{
+							name: 'amountSats',
+							in: 'query',
+							required: true,
+							schema: { type: 'integer' }
+						}
+					],
+					responses: {
+						'200': { description: 'Amount, sender fee terms and quote expiry' }
+					}
+				}
+			},
+			'/receive/invoice': {
+				post: {
+					summary:
+						'Prepare and durably save an offline invoice. Retry the same requestId after interrupted creation. Admin scope: may allocate a channel and reserve liquidity. Paid or expired reservations reconcile automatically after restart.',
+					tags: ['FFOR'],
+					requestBody: bodyContent({
+						peer: 'string',
+						requestId: 'string',
+						amountSats: 'number',
+						description: 'string',
+						quote: 'object'
+					}),
+					responses: {
+						'200': {
+							description:
+								'Saved invoice, paymentHash, amountSats, expiresAt and offlineReceive=true'
+						}
+					}
+				}
+			},
 			'/ffor/epoch/start': {
 				post: {
 					summary:

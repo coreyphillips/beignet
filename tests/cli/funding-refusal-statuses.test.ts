@@ -213,6 +213,11 @@ function emittedErrorCodes(): string[] {
 	const codes = new Set<string>(Object.values(BeignetErrorCode));
 	for (const file of files) {
 		const src = fs.readFileSync(file, 'utf8');
+		// The receive coordinator's fail helper throws BeignetError too.
+		if (file.endsWith(path.join('cli', 'offline-receive.ts'))) {
+			for (const match of src.matchAll(/\bfail\(\s*'([A-Z0-9_]+)'/g))
+				codes.add(match[1]);
+		}
 		for (const pattern of patterns) {
 			for (const match of src.matchAll(pattern)) codes.add(match[1]);
 		}
@@ -255,7 +260,9 @@ describe('Issue #471: every error code the daemon emits has a decided status', (
 		'PSBT_IMPORT_FAILED',
 		'INSTANCE_ALREADY_RUNNING',
 		'INTERNAL_ERROR',
-		'CAPSULE_RESTORE_INSTALL_FAILED'
+		'CAPSULE_RESTORE_INSTALL_FAILED',
+		// The receive invoice could not be durably written to wallet storage.
+		'DURABILITY_FAILED'
 	]);
 
 	const CODES = emittedErrorCodes();
@@ -265,6 +272,8 @@ describe('Issue #471: every error code the daemon emits has a decided status', (
 		// below passes vacuously.
 		expect(CODES.length).to.be.greaterThan(50);
 		expect(CODES).to.include('FEE_EXCEEDS_MAX');
+		expect(CODES).to.include('INVALID_REVIEW');
+		expect(CODES).to.include('DURABILITY_FAILED');
 		expect(CODES).to.include(BeignetErrorCode.CONNECT_FAILED);
 	});
 

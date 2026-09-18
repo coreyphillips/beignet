@@ -5,6 +5,7 @@
  * and ElectrumBackend behind a single class with plain JSON return types.
  */
 
+import { OfflineReceive } from './offline-receive';
 import { FforReceiveService, FforReceiveFunding } from './ffor-receive';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -1407,6 +1408,21 @@ function isHeldRestore(ch: { restoreRecencyUnproven?: boolean }): boolean {
 
 export class BeignetNode extends EventEmitter {
 	private fforReceiveService?: FforReceiveService;
+	private offlineReceive?: OfflineReceive;
+	private offlineReceiveTimer?: ReturnType<typeof setInterval>;
+	getOfflineReceive(): OfflineReceive {
+		if (!this.offlineReceive)
+			throw new BeignetError(
+				'RECEIVE_UNAVAILABLE',
+				'Automatic receiving is unavailable.'
+			);
+		return this.offlineReceive;
+	}
+	private stopOfflineReceive(): void {
+		this.offlineReceive?.stop();
+		if (this.offlineReceiveTimer) clearInterval(this.offlineReceiveTimer);
+		this.offlineReceiveTimer = undefined;
+	}
 	getFforReceiveService(): FforReceiveService {
 		if (!this.fforReceiveService) throw new Error('Wallet is not running');
 		return this.fforReceiveService;
@@ -2467,6 +2483,23 @@ export class BeignetNode extends EventEmitter {
 			opts.fforSettle,
 			opts.fforReceiveFunding
 		);
+		const receiveKey = 'automatic_receive_jobs_v1';
+		const receiveJobs = this.storage.loadWalletData(receiveKey);
+		this.offlineReceive = new OfflineReceive(
+			this,
+			(jobs) => {
+				this.storage.saveWalletData(receiveKey, JSON.stringify(jobs));
+			},
+			receiveJobs ? JSON.parse(receiveJobs) : []
+		);
+		this.offlineReceiveTimer = setInterval(() => {
+			void this.offlineReceive?.sync().catch((error) => {
+				this.log('warn', 'Automatic receive reconciliation failed', {
+					error: String(error)
+				});
+			});
+		}, 2000);
+		this.offlineReceiveTimer.unref?.();
 
 		// If the wallet sweep address couldn't be resolved yet (e.g. Electrum was
 		// down at startup), keep retrying and redirect sweeps to the wallet as
@@ -12136,6 +12169,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Lifecycle ───────────────
 
 	async gracefulShutdown(timeoutMs = 30_000): Promise<void> {
+		this.stopOfflineReceive();
 		this.fforReceiveService?.stop();
 		if (this.destroyed) return;
 		this.destroyed = true;
@@ -12178,6 +12212,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async destroy(): Promise<void> {
+		this.stopOfflineReceive();
 		this.fforReceiveService?.stop();
 		this._bolt8Transport?.close();
 		this._bolt8Transport = null;

@@ -38,3 +38,41 @@ Direct receipt discovery requires the settlement peer to return. It does not rep
 ## Verification
 
 The funded portable regression exercises ordinary app Receive, restart before payment, shutdown during payment, automatic reconciliation, a second cold reopen without duplicate Activity, and allocation of another channel while prior funds remain usable. The service tests cover reply authentication, hash verification, epoch changes, withholding unsettled preimages, durable funding caps, and cancellation. The coordinator tests cover unpaid retention, expiry grace, interrupted invoice creation, replacement epochs, and shutdown.
+
+## Daemon API
+
+The daemon now owns the same automatic receive lifecycle for HTTP clients. This
+surface ships in 0.21.9 and uses the provider protocol shipped in 0.21.8.
+App images can depend on it once 0.21.9 is published to npm.
+
+- `GET /receive/quote?peer=<compressed-pubkey>&amountSats=<integer>` returns
+  sender fee terms with a 60-second expiry. The minimum is 354 sats.
+- `POST /receive/invoice` takes `peer`, `amountSats`, `description`, `quote`,
+  and a stable `requestId` (16 to 160 letters, digits, underscores or hyphens).
+  Use the same id on retries, including after a lost response. Success returns
+  `bolt11`, `paymentHash`, `amountSats`, `expiresAt` and `offlineReceive: true`.
+  The invoice expires after ten minutes. Display it only after success.
+- `GET /receive/status` returns `available`, `reservedChannelIds` and durable
+  `requests`. Hosts must exclude these reservations from automatic channel
+  changes and leave their reconciliation to the daemon.
+
+The GET routes accept readonly credentials. Creation requires admin access
+because it can allocate a channel and reserve liquidity. There are no CLI
+wrappers for these app-oriented routes.
+
+Jobs live in the wallet's encrypted SQLite `wallet_data` table. Allocation
+identity is saved before requesting funding, and the invoice and expiry are
+saved before returning it. The coordinator polls receipts every two seconds,
+resumes after restart and stops with the node. A journal write failure disables
+further preparation and reconciliation until restart. An unpaid, unexpired
+invoice is never cancelled just because the wallet reopened.
+
+Providers can set `BEIGNET_FFOR_RECEIVE_FUNDING` to the JSON funding policy
+shown above (the inner object). Malformed policy refuses startup. The settlement
+role must also be enabled. An existing suitable empty channel can be reused
+without opting into additional funding.
+
+The Umbrel regression in `scripts/lfbw-regtest/11-automatic-receive.mjs`
+exercises this API through its manager with separate funded daemons: idempotent
+creation, unpaid restart, payment while stopped, automatic balance credit and
+another restart with exactly one paid invoice.

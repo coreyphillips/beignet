@@ -38,6 +38,10 @@ const INTENTIONALLY_NO_CLI = new Set([
 	// FFOR offline receive (issue #729): an app-driven lifecycle (the umbrel
 	// dashboard, coreyphillips/beignet-umbrel#98) over the HTTP routes; CLI
 	// commands follow with the operator guide.
+	// Automatic receive is the app-driven lifecycle over the same HTTP surface.
+	'/receive/status',
+	'/receive/quote',
+	'/receive/invoice',
 	'/ffor/epochs',
 	'/ffor/settlements',
 	'/ffor/epoch',

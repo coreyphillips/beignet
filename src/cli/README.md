@@ -1712,11 +1712,13 @@ beignet webhooks list
 beignet webhooks unregister <id>
 ```
 
-Every daemon endpoint has a CLI command except two that only make sense over
-HTTP: `GET /events` (SSE stream for long-lived consumers; use `webhooks` from
+Most daemon endpoints have a CLI command. HTTP-only exceptions include `GET /events` (SSE stream for long-lived consumers; use `webhooks` from
 the CLI instead) and `GET /openapi.json` (machine-readable API discovery). The
 deprecated `POST /channel/update-fee` alias is covered by
-`channel update-commitment-feerate`.
+`channel update-commitment-feerate`. The app-driven FFOR lifecycle uses
+`/ffor/*` and `/receive/*` directly over HTTP. See
+[automatic receiving](../../docs/AUTOMATIC-OFFLINE-RECEIVE.md#daemon-api) for
+the durable invoice preparation and reconciliation API.
 
 ### JSON Envelope
 

@@ -153,6 +153,9 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	// is an invoice; everything that starts, closes, credits or enforces an
 	// epoch moves this node's liquidity or its on-chain position and takes
 	// the full key, like a force close.
+	'GET /receive/status': ['readonly'],
+	'GET /receive/quote': ['readonly'],
+	'POST /receive/invoice': [],
 	'GET /ffor/epochs': ['readonly'],
 	'GET /ffor/settlements': ['readonly'],
 	'GET /ffor/epoch': ['readonly'],
