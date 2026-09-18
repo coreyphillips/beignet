@@ -21,6 +21,7 @@ import {
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
+	ChannelState,
 	HtlcState,
 	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
@@ -29,7 +30,10 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
-import { encodeChannelAnnouncementMessage } from '../../src/lightning/gossip/messages';
+import {
+	decodeChannelUpdateMessage,
+	encodeChannelAnnouncementMessage
+} from '../../src/lightning/gossip/messages';
 import { signChannelAnnouncement } from '../../src/lightning/gossip/validation';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IChannelState } from '../../src/lightning/channel/channel-state';
@@ -1560,6 +1564,15 @@ describe('FFOR Variant D: public S-R fee across an S restart (issue #899)', func
 			const w = worldWithStorage();
 			const { invs, scid, fee } = publishAndExpose(w);
 			storeDeferred(w, scid, variant);
+			// Without stored local signatures, startup cannot rebuild this row.
+			// Settlement must still resolve its deferred gossip provenance.
+			const id = w.srChannelId.toString('hex');
+			const stored = w.storage.loadChannel(id)!;
+			w.storage.saveChannel(
+				id,
+				{ ...stored.state, localAnnouncementNodeSig: null },
+				stored.peerPubkey
+			);
 			restartS(w);
 			const row = w.s.getGraph().getChannel(scid)!;
 			expect(row.announcementVerifyDeferred).to.equal(true);
@@ -1616,6 +1629,150 @@ describe('FFOR Variant D: public S-R fee across an S restart (issue #899)', func
 			expect(payment.status, missing).to.equal(PaymentStatus.COMPLETED);
 			expect(payment.route!.totalFeeMsat).to.equal(fee(AMOUNTS[1]));
 		}
+	});
+
+	it('rebuilds its cache over an existing row and keeps graph and disk fresh while R is offline', () => {
+		const w = worldWithStorage();
+		const { invs, scid, fee } = publishAndExpose(w);
+		const row = w.storage
+			.loadAllGossipChannels()
+			.find((c) => c.shortChannelId.equals(scid))!;
+		const now = Date.now;
+		const base = now();
+		// Still fresh at startup, but eligible for the next hourly prune.
+		const oldTimestamp = Math.floor(base / 1000) - 14 * 86400 + 60;
+		for (const update of [row.update1, row.update2]) {
+			if (update) update.timestamp = oldTimestamp;
+		}
+		w.storage.saveGossipChannel(scid.toString('hex'), row);
+		restartS(w);
+		const internals = w.s as unknown as {
+			_ownChannelGossip: Map<string, { update: Buffer }>;
+			_gossipRefreshTimer: { _onTimeout(): void } | null;
+			pruneStaleGossipWithStorage(): void;
+		};
+		expect(internals._ownChannelGossip.has(w.srHex)).to.equal(true);
+		expect(internals._gossipRefreshTimer).to.not.equal(null);
+		expect(pay(w, invs[0]).status).to.equal(PaymentStatus.COMPLETED);
+		try {
+			Date.now = (): number => base + 120_000;
+			// A same-second policy change may already have moved the timestamp
+			// ahead of the wall clock. Refresh must preserve monotonicity.
+			w.s.setChannelPolicy(w.srChannelId, { feeBaseMsat: 1000 });
+			w.s.setChannelPolicy(w.srChannelId, { feeBaseMsat: 1000 });
+			const previous = decodeChannelUpdateMessage(
+				internals._ownChannelGossip.get(w.srHex)!.update
+			).timestamp;
+			internals._gossipRefreshTimer!._onTimeout();
+			const refreshed = decodeChannelUpdateMessage(
+				internals._ownChannelGossip.get(w.srHex)!.update
+			);
+			expect(refreshed.timestamp).to.be.greaterThan(previous);
+			const direction = refreshed.channelFlags & 1;
+			const graph = w.s.getGraph().getChannel(scid)!;
+			const disk = w.storage
+				.loadAllGossipChannels()
+				.find((c) => c.shortChannelId.equals(scid))!;
+			for (const current of [graph, disk]) {
+				const update = direction === 0 ? current.update1 : current.update2;
+				expect(update!.timestamp).to.equal(refreshed.timestamp);
+			}
+			internals.pruneStaleGossipWithStorage();
+			expect(w.s.getGraph().getChannel(scid)).to.exist;
+		} finally {
+			Date.now = now;
+		}
+		const payment = pay(w, invs[1]);
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(payment.route!.totalFeeMsat).to.equal(fee(AMOUNTS[1]));
+	});
+
+	it('preserves a policy update timestamp across a same-second restart', () => {
+		const w = worldWithStorage();
+		const { scid } = publishAndExpose(w);
+		const now = Date.now;
+		const fixed = now();
+		try {
+			Date.now = (): number => fixed;
+			w.s.setChannelPolicy(w.srChannelId, { feeBaseMsat: 2000 });
+			w.s.setChannelPolicy(w.srChannelId, { feeBaseMsat: 3000 });
+			const cached = (node: LightningNode): Buffer =>
+				(
+					node as unknown as {
+						_ownChannelGossip: Map<string, { update: Buffer }>;
+					}
+				)._ownChannelGossip.get(w.srHex)!.update;
+			const previous = decodeChannelUpdateMessage(cached(w.s));
+			const disk = w.storage
+				.loadAllGossipChannels()
+				.find((c) => c.shortChannelId.equals(scid))!;
+			const persisted = previous.channelFlags & 1 ? disk.update2 : disk.update1;
+			expect(persisted!.timestamp).to.equal(previous.timestamp);
+			expect(persisted!.feeBaseMsat).to.equal(3000);
+			restartS(w);
+			const restored = decodeChannelUpdateMessage(cached(w.s));
+			expect(restored.timestamp).to.be.greaterThan(previous.timestamp);
+			expect(restored.feeBaseMsat).to.equal(3000);
+		} finally {
+			Date.now = now;
+		}
+	});
+
+	it('recovers public fee proof before pruning after a delayed refresh', () => {
+		const w = worldWithStorage();
+		const { invs, scid } = publishAndExpose(w);
+		restartS(w);
+		const now = Date.now;
+		const future = now() + 15 * 86400 * 1000;
+		try {
+			Date.now = (): number => future;
+			(
+				w.s as unknown as { pruneStaleGossipWithStorage(): void }
+			).pruneStaleGossipWithStorage();
+			expect(w.s.getGraph().getChannel(scid)?.announcementVerified).to.equal(
+				true
+			);
+			expect(
+				w.storage
+					.loadAllGossipChannels()
+					.some((c) => c.shortChannelId.equals(scid))
+			).to.equal(true);
+		} finally {
+			Date.now = now;
+		}
+		expect(pay(w, invs[0]).status).to.equal(PaymentStatus.COMPLETED);
+	});
+
+	it('recovers valid channel proof over a deferred invalid graph row', () => {
+		for (const variant of ['tampered', 'swapped'] as const) {
+			const w = worldWithStorage();
+			const { invs, scid } = publishAndExpose(w);
+			storeDeferred(w, scid, variant);
+			restartS(w);
+			expect(w.s.getGraph().getChannel(scid)?.announcementVerified).to.equal(
+				true
+			);
+			expect(pay(w, invs[0]).status, variant).to.equal(PaymentStatus.COMPLETED);
+		}
+	});
+
+	it('does not rebuild a closed channel or keep refreshing its gossip', () => {
+		const w = worldWithStorage();
+		const { scid } = publishAndExpose(w);
+		w.s.getChannelManager().emit('channel:closed', w.srChannelId);
+		const cache = (
+			w.s as unknown as { _ownChannelGossip: Map<string, unknown> }
+		)._ownChannelGossip;
+		expect(cache.has(w.srHex)).to.equal(false);
+		const stored = w.storage.loadChannel(w.srHex)!;
+		w.storage.saveChannel(
+			w.srHex,
+			{ ...stored.state, state: ChannelState.CLOSED },
+			stored.peerPubkey
+		);
+		w.storage.deleteGossipChannel(scid.toString('hex'));
+		restartS(w);
+		expect(w.s.getGraph().getChannel(scid)).to.equal(undefined);
 	});
 
 	it('holds a row rebuilt with a bad counterparty signature to the book terms', () => {

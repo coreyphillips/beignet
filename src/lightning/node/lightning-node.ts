@@ -3128,19 +3128,14 @@ export class LightningNode extends EventEmitter {
 		// Prune stale gossip immediately on restore (BOLT 7: >2 weeks = stale)
 		this.pruneStaleGossipWithStorage();
 
-		// A public channel with no graph row (announced before announcement:ready
-		// saved one, or its save failed) is rebuilt from its stored signatures:
-		// FFOR settlement needs it while R may be offline. A row that is present
-		// is left for settlement to verify.
+		// Rebuild every usable public channel from its stored signatures, even
+		// when the graph row survived. The announcement handler also restores
+		// our broadcast cache and refresh timer, so its public policy remains
+		// available while the counterparty is offline.
 		for (const channel of this.channelManager.listChannels()) {
 			const channelId = channel.getChannelId();
 			const scid = channel.getShortChannelId();
-			if (
-				channelId &&
-				scid &&
-				channel.isHtlcUsable(true) &&
-				!this.graph.getChannel(scid)
-			) {
+			if (channelId && scid && channel.isHtlcUsable(true)) {
 				this.channelManager.reannounceChannel(channelId);
 			}
 		}
@@ -4046,6 +4041,7 @@ export class LightningNode extends EventEmitter {
 		);
 
 		this.channelManager.on('channel:closed', (channelId: Buffer) => {
+			this._ownChannelGossip.delete(channelId.toString('hex'));
 			this.persistChannel(channelId);
 			// A cooperative close records its signed tx just before the manager
 			// emits broadcast:tx; register the txid so the watcher's
@@ -11316,17 +11312,7 @@ export class LightningNode extends EventEmitter {
 		const hex = channelId.toString('hex');
 		const gossip = this._ownChannelGossip.get(hex);
 		if (gossip) {
-			// Strictly increasing timestamp: peers dedupe an unchanged one, so a
-			// same-second policy change would never propagate.
-			let timestamp = Math.floor(Date.now() / 1000);
-			try {
-				timestamp = Math.max(
-					timestamp,
-					decodeChannelUpdateMessage(gossip.update).timestamp + 1
-				);
-			} catch {
-				// Unreadable cached update; fall through with the wall-clock time.
-			}
+			const timestamp = Math.floor(Date.now() / 1000);
 			const refreshed = this.refreshChannelUpdate(
 				gossip.update,
 				timestamp,
@@ -11337,13 +11323,7 @@ export class LightningNode extends EventEmitter {
 				announcement: gossip.announcement,
 				update: refreshed
 			});
-			try {
-				this.graph.applyChannelUpdate(decodeChannelUpdateMessage(refreshed), {
-					verified: true
-				});
-			} catch {
-				// Own-update decode failure only affects our local graph view.
-			}
+			this.storeOwnChannelUpdate(refreshed);
 			this.broadcastOwnGossip();
 			return;
 		}
@@ -13765,7 +13745,18 @@ export class LightningNode extends EventEmitter {
 	): Buffer | null {
 		try {
 			const msg = decodeChannelUpdateMessage(cachedUpdate);
-			msg.timestamp = timestamp;
+			// Policy changes can advance the cached timestamp within one second.
+			// A refresh must not roll it back or be deduplicated by peers.
+			const row = this.graph.getChannel(msg.shortChannelId);
+			const direction = msg.channelFlags & 1;
+			const prior = direction === 0 ? row?.update1 : row?.update2;
+			const priorVerified =
+				direction === 0 ? row?.update1Verified : row?.update2Verified;
+			msg.timestamp = Math.max(
+				timestamp,
+				msg.timestamp + 1,
+				priorVerified === true && prior ? prior.timestamp + 1 : 0
+			);
 			// Reflect the current forwarding policy in the BOLT 7 disable bit
 			// (0x02), preserving the direction bit and any others. A node that
 			// declines to forward must not keep advertising its direction as
@@ -13798,6 +13789,27 @@ export class LightningNode extends EventEmitter {
 			return payload;
 		} catch {
 			return null;
+		}
+	}
+
+	/** Keep our graph and disk as fresh as the signed update we advertise. */
+	private storeOwnChannelUpdate(payload: Buffer): void {
+		try {
+			const update = decodeChannelUpdateMessage(payload);
+			this.graph.applyChannelUpdate(update, { verified: true });
+			const row = this.graph.getChannel(update.shortChannelId);
+			if (row?.announcementVerified === true) {
+				this.safeStorage(
+					() =>
+						this.storage!.saveGossipChannel(
+							update.shortChannelId.toString('hex'),
+							row
+						),
+					'saveGossipChannel'
+				);
+			}
+		} catch {
+			// A malformed cached update cannot refresh the local graph.
 		}
 	}
 
@@ -13857,6 +13869,10 @@ export class LightningNode extends EventEmitter {
 			// Likewise refresh each channel_update so the CHANNELS aren't pruned as
 			// stale either. Same policy, fresh timestamp — pure gossip, no force-close risk.
 			for (const [channelIdHex, gossip] of this._ownChannelGossip) {
+				const channel = this.channelManager.getChannel(
+					Buffer.from(channelIdHex, 'hex')
+				);
+				if (!channel?.isHtlcUsable(true)) continue;
 				const refreshedUpdate = this.refreshChannelUpdate(
 					gossip.update,
 					now,
@@ -13867,6 +13883,7 @@ export class LightningNode extends EventEmitter {
 						announcement: gossip.announcement,
 						update: refreshedUpdate
 					});
+					this.storeOwnChannelUpdate(refreshedUpdate);
 				}
 			}
 			this.broadcastOwnGossip();
@@ -27616,6 +27633,23 @@ export class LightningNode extends EventEmitter {
 	 */
 	private pruneStaleGossipWithStorage(): void {
 		const now = Math.floor(Date.now() / 1000);
+
+		// A process suspended beyond the gossip age limit can run its prune
+		// before its refresh timer. Recover our live public proof first, so
+		// the timer ordering cannot temporarily revoke its fee policy.
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			const scid = channel.getShortChannelId();
+			if (!channelId || !scid || !channel.isHtlcUsable(true)) continue;
+			const row = this.graph.getChannel(scid);
+			const latest = Math.max(
+				row?.update1?.timestamp ?? 0,
+				row?.update2?.timestamp ?? 0
+			);
+			if (latest < now - DEFAULT_PRUNE_MAX_AGE) {
+				this.channelManager.reannounceChannel(channelId);
+			}
+		}
 
 		// Collect stale SCIDs before pruning from graph
 		const staleScids: string[] = [];
