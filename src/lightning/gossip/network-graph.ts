@@ -561,6 +561,15 @@ export class NetworkGraph {
 		const scidHex = shortChannelId.toString('hex');
 		const channel = this._channels.get(scidHex);
 		if (!channel) return undefined;
+		// Restored rows carry their lookup SCID separately from the signed
+		// announcement. Even a cached signature verdict cannot bind that row
+		// to another SCID or to this graph's chain.
+		if (
+			!channel.announcement.shortChannelId.equals(shortChannelId) ||
+			!channel.announcement.chainHash.equals(this._chainHash)
+		) {
+			return undefined;
+		}
 		if (channel.announcementVerifyDeferred === true) {
 			channel.announcementVerified = verifyChannelAnnouncementMessage(
 				channel.announcement

@@ -1012,13 +1012,23 @@ while preserving the never-serve-unverified rule. Trust-consuming reads stay
 verified everywhere: updates naming our own channels and node announcements
 that feed peer address capture are verified at intake, and every dial-address
 consumer goes through `NetworkGraph.getVerifiedNodeAnnouncement`, which
-resolves a deferred announcement before handing out addresses. Set
+resolves a deferred announcement before handing out addresses. FFOR public-fee
+eligibility uses `NetworkGraph.getVerifiedChannelAnnouncement`, which resolves
+deferred signatures and requires the signed SCID and chain to match the lookup.
+Settlement separately binds both node identities and funding keys to the selected
+local public channel. Set
 `eagerGossipVerify: true` on relay-class nodes to verify everything at intake
 as before; eager mode also re-requests signatureless RGS-primed entries from
 peers so their signed copies become servable. Stored rows that predate the
 provenance flags are resolved at restore: eager mode verifies the canonical
 re-encoding (failing safe to unverified), lazy mode marks them deferred and
 lets the point of consumption decide.
+
+Local public-channel gossip is rebuilt from stored channel signatures on restart,
+including when a graph row already exists. Periodic refresh updates the local graph
+and stored row as well as the broadcast cache, so gossip pruning does not remove the
+public-fee evidence during a long FFOR epoch while the receiver is offline. Closed
+or otherwise unusable channels are not revived by this refresh.
 
 ### HTLC Forwarding
 
