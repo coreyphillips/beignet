@@ -484,7 +484,8 @@ wallet receive while offline through a settlement peer that holds a pre-signed
 voucher book. The daemon exposes the receiver's lifecycle under `/ffor/*`
 (`/ffor/epoch/start`, `/ffor/invoice`, `/ffor/epoch/close`, `/ffor/preimage`,
 `/ffor/witness/provision`, `/ffor/issuer/offer`, `/ffor/issuer/provision`,
-`/ffor/recover`, `/ffor/enforce`, `/ffor/epochs`, `/ffor/epoch`) and three roles a
+`/ffor/recover`, `/ffor/enforce`, `/ffor/epochs`, `/ffor/epoch`,
+`/ffor/witness/close`, `/ffor/issuer/issued`) and three roles a
 node can run for others, each an explicit opt-in switched on with an exact
 `true`:
 

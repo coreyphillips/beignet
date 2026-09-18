@@ -52,7 +52,9 @@ const INTENTIONALLY_NO_CLI = new Set([
 	'/ffor/recover',
 	'/ffor/enforce',
 	'/ffor/witness/status',
-	'/ffor/issuer/status'
+	'/ffor/issuer/status',
+	'/ffor/witness/close',
+	'/ffor/issuer/issued'
 ]);
 
 /** All route paths declared in the daemon routes map (plus special routes). */

@@ -81,6 +81,8 @@ describe('OpenAPI Spec Completeness', () => {
 		'/ffor/enforce',
 		'/ffor/witness/status',
 		'/ffor/issuer/status',
+		'/ffor/witness/close',
+		'/ffor/issuer/issued',
 		'/recovery/status',
 		'/recovery/restore',
 		'/recovery/restore-capsule',

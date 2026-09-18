@@ -210,6 +210,28 @@ describe('FFOR surface: routes on a node with no epoch (issue #729)', () => {
 		expect(offer.status).to.equal(400);
 		const enforce = await request(port, 'POST', '/ffor/enforce', {});
 		expect(enforce.status).to.equal(400);
+		const close = await request(port, 'POST', '/ffor/witness/close', {});
+		expect(close.status).to.equal(400);
+		const closeUnknown = await request(port, 'POST', '/ffor/witness/close', {
+			channelId: 'ab'.repeat(32)
+		});
+		expect(closeUnknown.status).to.equal(404);
+		const issued = await request(
+			port,
+			'GET',
+			'/ffor/issuer/issued?issuerNodeId=' + '02' + 'ab'.repeat(32)
+		);
+		expect(issued.status).to.equal(400);
+		const issuedUnknown = await request(
+			port,
+			'GET',
+			'/ffor/issuer/issued?channelId=' +
+				'ab'.repeat(32) +
+				'&issuerNodeId=' +
+				'02' +
+				'ab'.repeat(32)
+		);
+		expect(issuedUnknown.status).to.equal(404);
 	});
 
 	it('creates a path-terminal issuer offer for a stock payer', async () => {
@@ -239,7 +261,9 @@ describe('FFOR surface: routes on a node with no epoch (issue #729)', () => {
 			'/ffor/recover',
 			'/ffor/enforce',
 			'/ffor/witness/status',
-			'/ffor/issuer/status'
+			'/ffor/issuer/status',
+			'/ffor/witness/close',
+			'/ffor/issuer/issued'
 		]) {
 			expect(paths, route).to.include(route);
 		}
