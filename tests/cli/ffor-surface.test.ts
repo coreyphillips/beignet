@@ -211,14 +211,29 @@ describe('FFOR surface: routes on a node with no epoch (issue #729)', () => {
 			'GET',
 			'/receive/quote?peer=invalid&amountSats=20000'
 		);
-		expect(quote.status).not.to.equal(200);
+		expect(quote.status).to.equal(400);
+		expect(quote.body.error).to.deep.include({
+			code: 'INVALID_PARAMS',
+			message: 'A primary node public key is required.'
+		});
 		const created = await request(
 			portOf(daemon),
 			'POST',
 			'/receive/invoice',
 			{}
 		);
-		expect(created.status).not.to.equal(200);
+		expect(created.status).to.equal(400);
+		expect(created.body.error).to.deep.include({
+			code: 'INVALID_REVIEW',
+			message: 'Review this payment request again.'
+		});
+		const small = await request(
+			portOf(daemon),
+			'GET',
+			`/receive/quote?peer=${'02' + '33'.repeat(32)}&amountSats=1`
+		);
+		expect(small.status).to.equal(400);
+		expect(small.body.error).to.deep.include({ code: 'AMOUNT_TOO_SMALL' });
 	});
 	it('reports the witness and issuer roles it runs', async () => {
 		const witness = await request(

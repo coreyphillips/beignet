@@ -42,8 +42,8 @@ The funded portable regression exercises ordinary app Receive, restart before pa
 ## Daemon API
 
 The daemon now owns the same automatic receive lifecycle for HTTP clients. This
-surface is new after 0.21.8 and requires a new npm release before an app image
-can depend on it. It uses the provider protocol shipped in 0.21.8.
+surface ships in 0.21.9 and uses the provider protocol shipped in 0.21.8.
+App images can depend on it once 0.21.9 is published to npm.
 
 - `GET /receive/quote?peer=<compressed-pubkey>&amountSats=<integer>` returns
   sender fee terms with a 60-second expiry. The minimum is 354 sats.

@@ -1,6 +1,7 @@
 import { Buffer } from 'buffer';
 import { randomBytes } from 'crypto';
 import type { BeignetNode } from './beignet-node';
+import { BeignetError } from './errors';
 import { DEFAULT_CHANNEL_CONFIG } from '../lightning/channel/types';
 
 export type OfflineReceiveJob = {
@@ -17,7 +18,7 @@ export type OfflineReceiveJob = {
 };
 const live = (e: any) => e && !['CLOSED', 'ABORTED'].includes(e.state);
 const fail = (code: string, message: string): never => {
-	throw Object.assign(new Error(message), { code, status: 409 });
+	throw new BeignetError(code, message);
 };
 export class OfflineReceive {
 	private jobs: OfflineReceiveJob[];
