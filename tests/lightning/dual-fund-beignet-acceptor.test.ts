@@ -236,7 +236,8 @@ describe('beignet-to-beignet v2 open (plain acceptor, auto-funded opener)', func
 		// field's default, so the opener announced at depth and the acceptor
 		// never answered with its own announcement_signatures.
 		expect(chA.getFullState().announceChannel, 'opener announces').to.be.true;
-		expect(chB!.getFullState().announceChannel, 'acceptor reads the flag').to.be.true;
+		expect(chB!.getFullState().announceChannel, 'acceptor reads the flag').to.be
+			.true;
 
 		// The negotiated funding tx exists and pays the committed capacity, with
 		// the opener's change output alongside it (fixed-amount open).
