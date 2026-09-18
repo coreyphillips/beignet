@@ -10,13 +10,16 @@
  *  - M8.6: R cannot fabricate credit, and S's section 9.5.2 ordering
  *    assertion refuses to reveal t_k against an upstream HTLC that is not
  *    irrevocably committed;
- *  - the exposure rule: a slot is exposed once on any book.
+ *  - the exposure rule: a slot is exposed once on any book;
+ *  - an enforced epoch's voucher invoice completes when its on-chain claim
+ *    confirms (issue #886).
  */
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { PaymentStatus } from '../../src/lightning/node/types';
+import { IPaymentInfo, PaymentStatus } from '../../src/lightning/node/types';
 import { HtlcDirection, HtlcState } from '../../src/lightning/channel/types';
 import {
 	CommitmentType,
@@ -30,6 +33,7 @@ import {
 } from '../../src/lightning/ffor/messages';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
+	AMOUNTS,
 	IWorld,
 	T_EXP,
 	TIP,
@@ -362,5 +366,71 @@ describe('FFOR Variant D: M8.6, R cannot fabricate credit and S reveals only aga
 		expect(recorded, 'no preimage reached the chain monitors').to.equal(0);
 		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
 		expect(w.sr.log, 'nothing went to R').to.have.length(0);
+	});
+});
+
+describe('FFOR Variant D: an enforced epoch credits its vouchers on-chain', function () {
+	this.timeout(30_000);
+
+	it('a voucher invoice reads paid once its HTLC-success claim confirms (issue #886)', () => {
+		const w = createWorld();
+		activate(w);
+		const [inv1, inv3] = exposeAndLeave(w, [1, 3]);
+		const paid1 = pay(w, inv1);
+		expect(paid1.status).to.equal(PaymentStatus.COMPLETED);
+		expect(pay(w, inv3).status).to.equal(PaymentStatus.COMPLETED);
+		const hashes = record(w.r, w.srHex).paymentHashes;
+		// R returns holding only the first payer's receipt, and enforces.
+		w.sr.reconnect();
+		expect(w.r.fforAddPreimage(w.srHex, paid1.preimage!).ok).to.equal(true);
+		const received: IPaymentInfo[] = [];
+		const settled: { bolt11: string }[] = [];
+		w.r.on('payment:received', (p: IPaymentInfo) => received.push(p));
+		w.r.on('invoice:settled', (e: { bolt11: string }) => settled.push(e));
+		w.sr.disconnect();
+		const view = forceCloseAndObserve(
+			w,
+			w.r,
+			w.rConfig.fundingPrivkey!,
+			w.r,
+			w.rConfig.fundingPrivkey!
+		);
+		const voucher1 = view.outputs.find(
+			(o) =>
+				o.outputType === OutputType.RECEIVED_HTLC &&
+				o.paymentHash!.equals(hashes[0])
+		)!;
+		expect(voucher1.status).to.equal(OutputStatus.SPEND_BROADCAST);
+		expect(
+			w.r.getPayment(hashes[0])!.status,
+			'a broadcast claim is not yet a receive'
+		).to.equal(PaymentStatus.PENDING);
+
+		const claim = bitcoin.Transaction.fromHex(voucher1.sweepTxHex!);
+		const report = (): void => {
+			w.r
+				.getChannelManager()
+				.handleOutputSpent(
+					view.tx.getId(),
+					voucher1.outputIndex,
+					claim,
+					TIP + 3
+				);
+		};
+		report();
+		const payment = w.r.getPayment(hashes[0])!;
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(payment.preimage!.equals(paid1.preimage!)).to.be.true;
+		expect(payment.amountMsat).to.equal(AMOUNTS[0]);
+		expect(payment.metadata?.claimTxid).to.equal(claim.getId());
+		expect(received.map((p) => p.paymentHash)).to.deep.equal([hashes[0]]);
+		expect(settled.map((e) => e.bolt11)).to.deep.equal([inv1]);
+		// Paid, but R holds no preimage for it, so nothing claimed it.
+		expect(w.r.getPayment(hashes[2])!.status).to.equal(PaymentStatus.PENDING);
+
+		// Each restart re-reports the recorded spend: announced once only.
+		report();
+		expect(received).to.have.length(1);
+		expect(settled).to.have.length(1);
 	});
 });

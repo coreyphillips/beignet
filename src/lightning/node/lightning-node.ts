@@ -4614,6 +4614,22 @@ export class LightningNode extends EventEmitter {
 				this.emit('ffor:enforce', { channelId, record });
 			}
 		);
+		this.channelManager.on(
+			'htlc:claimed-onchain',
+			(
+				channelId: Buffer,
+				paymentHash: Buffer,
+				preimage: Buffer,
+				claimTxid: string
+			) => {
+				this.fforSettleClaimedVoucher(
+					channelId,
+					paymentHash,
+					preimage,
+					claimTxid
+				);
+			}
+		);
 
 		this.channelManager.on(
 			'htlc:forwarded',
@@ -17238,38 +17254,75 @@ export class LightningNode extends EventEmitter {
 		channelId: Buffer,
 		record: IFforEpochRecord
 	): void {
-		const channelHex = channelId.toString('hex');
 		record.paymentHashes.forEach((hash, i) => {
 			const preimage = record.knownPreimages[i];
 			if (!hash || !preimage) return;
-			const hashHex = hash.toString('hex');
-			const payment = this.payments.get(hashHex);
-			if (
-				!payment ||
-				payment.direction !== PaymentDirection.INCOMING ||
-				payment.status === PaymentStatus.COMPLETED
-			) {
-				return;
-			}
-			payment.status = PaymentStatus.COMPLETED;
-			payment.preimage = Buffer.from(preimage);
-			payment.completedAt = Date.now();
-			payment.amountMsat = record.params.voucherAmountsMsat[i];
-			// The voucher HTLC on our side, so a restart redispatch knows the
-			// completed hash was settled by exactly it.
-			if (record.sHtlcIdBase !== null) {
-				payment.settledHtlcs = [
-					`${channelHex}:${record.sHtlcIdBase + BigInt(i)}`
-				];
-			}
-			this.safeStorage(() => this.persistPayment(hash), 'persistPayment');
-			this.emit('payment:received', payment);
-			this.emitInvoiceSettled(hash, payment);
-			this.emitStructuredLog('payment', 'received', {
-				paymentHash: hashHex,
-				fforVoucher: 'true',
-				slot: String(i + 1)
-			});
+			this.fforCompleteVoucherPayment(channelId, record, i, preimage);
+		});
+	}
+
+	/**
+	 * R: a voucher HTLC our claim took on-chain (issue #886). An enforced
+	 * epoch stays ACTIVE, so no CLOSED ever runs fforSettleVoucherInvoices
+	 * for it: the confirmed HTLC-success claim is the credit.
+	 */
+	private fforSettleClaimedVoucher(
+		channelId: Buffer,
+		paymentHash: Buffer,
+		preimage: Buffer,
+		claimTxid: string
+	): void {
+		const record = this.channelManager.getFforEpoch(channelId);
+		if (!record || record.role !== 'R') return;
+		const i = record.paymentHashes.findIndex((h) => h.equals(paymentHash));
+		if (i < 0) return;
+		this.fforCompleteVoucherPayment(channelId, record, i, preimage, claimTxid);
+	}
+
+	/**
+	 * Complete voucher slot `i`'s incoming payment and announce it, once.
+	 * `claimTxid` is the on-chain claim that credited it, noted on the
+	 * payment's metadata.
+	 */
+	private fforCompleteVoucherPayment(
+		channelId: Buffer,
+		record: IFforEpochRecord,
+		i: number,
+		preimage: Buffer,
+		claimTxid?: string
+	): void {
+		const hash = record.paymentHashes[i];
+		const hashHex = hash.toString('hex');
+		const payment = this.payments.get(hashHex);
+		if (
+			!payment ||
+			payment.direction !== PaymentDirection.INCOMING ||
+			payment.status === PaymentStatus.COMPLETED
+		) {
+			return;
+		}
+		payment.status = PaymentStatus.COMPLETED;
+		payment.preimage = Buffer.from(preimage);
+		payment.completedAt = Date.now();
+		payment.amountMsat = record.params.voucherAmountsMsat[i];
+		// The voucher HTLC on our side, so a restart redispatch knows the
+		// completed hash was settled by exactly it.
+		if (record.sHtlcIdBase !== null) {
+			payment.settledHtlcs = [
+				`${channelId.toString('hex')}:${record.sHtlcIdBase + BigInt(i)}`
+			];
+		}
+		if (claimTxid) {
+			payment.metadata = { ...payment.metadata, claimTxid };
+		}
+		this.safeStorage(() => this.persistPayment(hash), 'persistPayment');
+		this.emit('payment:received', payment);
+		this.emitInvoiceSettled(hash, payment);
+		this.emitStructuredLog('payment', 'received', {
+			paymentHash: hashHex,
+			fforVoucher: 'true',
+			slot: String(i + 1),
+			...(claimTxid ? { claimTxid } : {})
 		});
 	}
 

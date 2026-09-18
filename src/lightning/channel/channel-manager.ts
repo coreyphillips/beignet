@@ -74,6 +74,7 @@ import {
 	IFeeBumpAndBroadcastChainAction,
 	IFundingSpendScan,
 	IRREVOCABLE_DEPTH,
+	OutputType,
 	satPerVbyteToSatPerKw
 } from '../chain/types';
 import {
@@ -437,6 +438,9 @@ export interface IChannelManagerConfig {
  * - 'htlc:forwarded' (channelId: Buffer, htlcId: bigint, amountMsat: bigint, paymentHash: Buffer)
  * - 'htlc:fulfilled' (channelId: Buffer, htlcId: bigint, preimage: Buffer)
  * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer)
+ * - 'htlc:claimed-onchain' (channelId: Buffer, paymentHash: Buffer, preimage: Buffer,
+ *   claimTxid: string): a confirmed spend of a received HTLC output revealed
+ *   its preimage; repeats when the spend is re-reported
  * - 'quiescence:ended' (channelIdHex: string) — the channel left quiescence;
  *   parked HTLC dispositions may resume
  * - 'quiescence:timeout' (channelIdHex: string, peerPubkey: string) — BOLT 2's
@@ -2973,11 +2977,52 @@ export class ChannelManager extends EventEmitter {
 				if (actions.length > 0) {
 					this.emit('monitor:updated', channelIdHex, monitor);
 				}
+				this._emitReceivedHtlcClaims(channelId, monitor, spendingTx);
 				return actions;
 			}
 		}
 
 		return [];
+	}
+
+	/**
+	 * 'htlc:claimed-onchain' for each received HTLC output `spendingTx` spends
+	 * with the preimage in its witness. Only our own success path reveals it,
+	 * so this is our claim, confirmed. A preimage we already knew teaches the
+	 * monitor nothing, so no preimage:learned marks it. Runs on every report,
+	 * including the re-report each restart makes of a recorded spend, so a
+	 * listener must be idempotent and gets a second chance after a crash.
+	 */
+	private _emitReceivedHtlcClaims(
+		channelId: Buffer,
+		monitor: ChainMonitor,
+		spendingTx: import('bitcoinjs-lib').Transaction
+	): void {
+		const tracked = monitor.getTrackedOutputs();
+		for (const input of spendingTx.ins) {
+			const txid = Buffer.from(input.hash).reverse().toString('hex');
+			const output = tracked.find(
+				(o) =>
+					o.txid === txid &&
+					o.outputIndex === input.index &&
+					o.outputType === OutputType.RECEIVED_HTLC
+			);
+			const paymentHash = output?.paymentHash;
+			if (!paymentHash) continue;
+			const preimage = (input.witness ?? []).find(
+				(el) =>
+					el.length === 32 &&
+					crypto.createHash('sha256').update(el).digest().equals(paymentHash)
+			);
+			if (!preimage) continue;
+			this.emit(
+				'htlc:claimed-onchain',
+				channelId,
+				paymentHash,
+				Buffer.from(preimage),
+				spendingTx.getId()
+			);
+		}
 	}
 
 	/**
