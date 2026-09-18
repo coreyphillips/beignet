@@ -12,9 +12,11 @@ import { LightningNode } from '../../src/lightning/node/lightning-node';
 import {
 	IWorld,
 	NodeLink,
+	REGTEST,
 	TIP,
 	activate,
 	createWorld,
+	destScriptFor,
 	makeNodeConfig,
 	record
 } from '../lightning/helpers/ffor-world';
@@ -88,6 +90,26 @@ describe('FFOR witness close and issued slots (issue #882)', function () {
 		expect(w.r.closeFforEpoch(w.srHex).ok).to.equal(true);
 		expect(record(w.r, w.srHex).settledBitmap).to.not.equal(null);
 		const closed = await cli.fforCloseWitnesses(w.srHex);
+		expect(closed).to.deep.equal([
+			{ witnessNodeId: witness.getNodeId(), ok: true, held: 0 }
+		]);
+		expect(mailboxState(witness)).to.equal('CLOSED');
+	});
+
+	it('closes every witness after a force-close, which gets no ff_close_ack', async () => {
+		const { w, witness } = await witnessedEpoch();
+		const forced = w.r
+			.getChannelManager()
+			.forceClose(
+				w.srChannelId,
+				destScriptFor(Buffer.alloc(32, 0x11)),
+				1,
+				REGTEST
+			);
+		expect(forced.ok, forced.error).to.equal(true);
+		expect(record(w.r, w.srHex).settledBitmap).to.equal(null);
+
+		const closed = await cliOver(w.r).fforCloseWitnesses(w.srHex);
 		expect(closed).to.deep.equal([
 			{ witnessNodeId: witness.getNodeId(), ok: true, held: 0 }
 		]);

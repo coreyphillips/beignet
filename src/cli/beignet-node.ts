@@ -7166,8 +7166,13 @@ export class BeignetNode extends EventEmitter {
 		}
 		// Section 9.6.6 sends this at ff_close_ack. A witness closed earlier
 		// stops recording the book's later payments and its issuer stops
-		// issuing, so an ACTIVE epoch would lose its receipts.
-		if (f.settledBitmap === null) {
+		// issuing, so an ACTIVE epoch would lose its receipts. A channel
+		// closed on-chain takes no more payments and will never get the ack.
+		const channelState = this.node.getChannel(idBuf)?.state;
+		const closedOnChain =
+			channelState === ChannelState.FORCE_CLOSED ||
+			channelState === ChannelState.CLOSED;
+		if (f.settledBitmap === null && !closedOnChain) {
 			throw new BeignetError(
 				'FFOR_REFUSED',
 				'no ff_close_ack yet: close the epoch first'

@@ -1916,13 +1916,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/witness/close': {
 				post: {
 					summary:
-						'R, once ff_close_ack is in: send ff_witness_close (spec section 9.6.6) with the settled bitmap to every acknowledged witness. The witness stops recording and its issuer stops issuing; records stay fetchable until retention_until, and the reservation is held until then too. Advisory: a witness that does not answer reads ok false',
+						'R, once ff_close_ack is in or the channel is closed on-chain: send ff_witness_close (spec section 9.6.6) with the settled bitmap to every acknowledged witness. The witness stops recording and its issuer stops issuing; records stay fetchable until retention_until, and the reservation is held until then too. Advisory: a witness that does not answer reads ok false',
 					tags: ['FFOR'],
 					requestBody: bodyContent({ channelId: 'string' }),
 					responses: {
 						'200': { description: 'Array of { witnessNodeId, ok, held }' },
 						'400': {
-							description: 'FFOR_REFUSED: the epoch has no ff_close_ack yet'
+							description:
+								'INVALID_PARAMS: channelId missing or malformed. FFOR_REFUSED: no ff_close_ack yet on a channel still open'
 						},
 						'404': { description: 'No channel, or no epoch of ours on it' }
 					}
@@ -1962,8 +1963,9 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'400': {
 							description:
-								'FFOR_REFUSED: no provision for that issuer, or it did not answer'
-						}
+								'INVALID_PARAMS: channelId or issuerNodeId missing or malformed. FFOR_REFUSED: no provision for that issuer, or it did not answer'
+						},
+						'404': { description: 'CHANNEL_NOT_FOUND' }
 					}
 				}
 			},
