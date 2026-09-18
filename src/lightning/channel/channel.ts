@@ -14973,6 +14973,12 @@ export class Channel {
 		if (aliasAnnounceErr) {
 			return refuse(`open_channel2 refused: ${aliasAnnounceErr}`);
 		}
+		// BOLT 2: channel_flags bit 0 = announce_channel, exactly as the v1
+		// acceptor reads it. Left unset, the acceptor kept the field's
+		// default (false) while the opener announced: the opener sent its
+		// announcement_signatures at depth, the acceptor never answered, and
+		// a beignet-to-beignet dual-funded channel was never in any graph.
+		this._state.announceChannel = (msg.channelFlags & 0x01) !== 0;
 
 		this._state.fundingVersion = 2;
 		this._state.commitmentFeeratePerkw = msg.commitmentFeeratePerkw;
