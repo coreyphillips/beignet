@@ -17092,7 +17092,9 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * R: tell every acknowledged witness the epoch closed (section 9.6.6),
-	 * with the settled bitmap. Advisory for the witness's bookkeeping.
+	 * with the settled bitmap. Advisory for the witness's bookkeeping. The
+	 * requests go out together, so silent witnesses cost one `timeoutMs`
+	 * between them rather than one each.
 	 */
 	async closeFforWitnesses(
 		channelIdHex: string,
@@ -17106,37 +17108,39 @@ export class LightningNode extends EventEmitter {
 		}
 		const K = record.params.maxPayments;
 		const settled = record.settledBitmap ?? Buffer.alloc(Math.ceil(K / 8));
-		const out: { witnessNodeId: Buffer; ok: boolean; held: number }[] = [];
-		for (const w of record.witnesses) {
-			if (w.ackedAt === null) continue;
-			const requestId = FforWitnessService.freshRequestId();
-			try {
-				const body = await this.sendFforWitnessRequest(
-					w.witnessNodeId.toString('hex'),
-					FF_WITNESS_CLOSE_TYPE,
-					encodeWitnessClose(
-						requestId,
-						w.mailboxId,
-						record.hAct,
-						K,
-						settled,
-						crypto.randomBytes(32),
-						w.fetchPrivkey
-					),
-					requestId,
-					timeoutMs
-				);
-				const ack = decodeWitnessCloseAck(body);
-				out.push({
-					witnessNodeId: w.witnessNodeId,
-					ok: ack.ok,
-					held: ack.numRecordsHeld
-				});
-			} catch {
-				out.push({ witnessNodeId: w.witnessNodeId, ok: false, held: 0 });
-			}
-		}
-		return out;
+		const hAct = record.hAct;
+		return Promise.all(
+			record.witnesses
+				.filter((w) => w.ackedAt !== null)
+				.map(async (w) => {
+					const requestId = FforWitnessService.freshRequestId();
+					try {
+						const body = await this.sendFforWitnessRequest(
+							w.witnessNodeId.toString('hex'),
+							FF_WITNESS_CLOSE_TYPE,
+							encodeWitnessClose(
+								requestId,
+								w.mailboxId,
+								hAct,
+								K,
+								settled,
+								crypto.randomBytes(32),
+								w.fetchPrivkey
+							),
+							requestId,
+							timeoutMs
+						);
+						const ack = decodeWitnessCloseAck(body);
+						return {
+							witnessNodeId: w.witnessNodeId,
+							ok: ack.ok,
+							held: ack.numRecordsHeld
+						};
+					} catch {
+						return { witnessNodeId: w.witnessNodeId, ok: false, held: 0 };
+					}
+				})
+		);
 	}
 
 	/**
