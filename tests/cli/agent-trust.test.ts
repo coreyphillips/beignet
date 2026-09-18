@@ -8,6 +8,7 @@
 import { expect } from 'chai';
 import { IChannelHealth, IStructuredLog } from '../../src/lightning/node/types';
 import { IStorageBackend } from '../../src/lightning/storage/types';
+import { startDaemon } from '../../src/cli/daemon';
 
 describe('Agent Trust: CLI Production Hardening 12', function () {
 	this.timeout(5_000);
@@ -165,9 +166,9 @@ describe('Agent Trust: CLI Production Hardening 12', function () {
 	// ─── Daemon route type ───
 
 	describe('Daemon GET /channel/health route', () => {
-		it('should export daemon routes that include channel/health', async () => {
+		it('should export daemon routes that include channel/health', () => {
 			// Verify the route is wired (type-level check)
-			const { startDaemon } = await import('../../src/cli/daemon');
+			// Module transpilation happens at suite load, outside the assertion timeout.
 			expect(typeof startDaemon).to.equal('function');
 		});
 	});
