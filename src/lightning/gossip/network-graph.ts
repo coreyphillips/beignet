@@ -549,6 +549,31 @@ export class NetworkGraph {
 	}
 
 	/**
+	 * The channel's announcement resolved to signature-verified provenance,
+	 * or undefined. Same trust boundary as getVerifiedNodeAnnouncement, for
+	 * consumers that act on a channel being public: a deferred announcement
+	 * (lazy intake, or a restored row without settled flags) is verified here
+	 * on first read rather than waiting for a gossip query to resolve it.
+	 */
+	getVerifiedChannelAnnouncement(
+		shortChannelId: Buffer
+	): IChannelAnnouncementMessage | undefined {
+		const scidHex = shortChannelId.toString('hex');
+		const channel = this._channels.get(scidHex);
+		if (!channel) return undefined;
+		if (channel.announcementVerifyDeferred === true) {
+			channel.announcementVerified = verifyChannelAnnouncementMessage(
+				channel.announcement
+			);
+			channel.announcementVerifyDeferred = undefined;
+			this._syncUnverifiedIndex(scidHex, channel);
+		}
+		return channel.announcementVerified === true
+			? channel.announcement
+			: undefined;
+	}
+
+	/**
 	 * Get all channels that a node is part of.
 	 */
 	getNodeChannels(nodeId: Buffer): IGraphChannel[] {

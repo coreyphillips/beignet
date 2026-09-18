@@ -29,6 +29,8 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
+import { encodeChannelAnnouncementMessage } from '../../src/lightning/gossip/messages';
+import { signChannelAnnouncement } from '../../src/lightning/gossip/validation';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IChannelState } from '../../src/lightning/channel/channel-state';
 import { MessageType } from '../../src/lightning/message/types';
@@ -330,6 +332,7 @@ interface IWorld {
 	s: LightningNode;
 	r: LightningNode;
 	pConfig: INodeConfig;
+	sConfig: INodeConfig;
 	rConfig: INodeConfig;
 	ps: NodeLink;
 	sr: NodeLink;
@@ -378,6 +381,7 @@ function createWorld(opts: { sStorage?: SqliteStorage } = {}): IWorld {
 		s,
 		r,
 		pConfig,
+		sConfig,
 		rConfig,
 		ps,
 		sr,
@@ -1388,5 +1392,260 @@ describe('FFOR Variant D: review round 1 (settlement)', function () {
 		expect(late.status).to.equal(PaymentStatus.FAILED);
 		expect(failures.pop()!.reason).to.include('tip height unknown');
 		expect(record(w2.s, w2.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+	});
+});
+
+// ─────────────── Public S-R fee across an S restart (issue #899) ───────────────
+
+/**
+ * Run the real announcement_signatures exchange for S's channel to R at
+ * SCID 500x`txIndex`x0, so S assembles, verifies and publishes the signed
+ * channel_announcement itself. Returns the SCID.
+ */
+function exchangeAnnouncement(
+	w: IWorld,
+	channelId: Buffer,
+	txIndex: number
+): Buffer {
+	for (const n of [w.s, w.r]) {
+		const st = n.getChannelManager().getChannel(channelId)!.getFullState();
+		st.announcementSigsSent = false;
+		st.announcementSigsReceived = false;
+	}
+	const scid = encodeShortChannelId({ block: 500, txIndex, outputIndex: 0 });
+	w.s.getChannelManager().emit('announcement:needs-signing', channelId, scid);
+	expect(w.s.getGraph().getChannel(scid)?.announcementVerified).to.equal(true);
+	return scid;
+}
+
+/**
+ * S publishes its S-R channel for real, R exposes vouchers 1 and 2 and
+ * leaves, and P learns S's policy for the edge it will route over: the
+ * epoch channel at S's default 1000 msat + 1 ppm or, with `parallel`, a
+ * second S-R channel at 0 + 0 with the epoch edge disabled.
+ */
+function publishAndExpose(
+	w: IWorld,
+	parallel = false
+): { invs: string[]; scid: Buffer; fee: (d: bigint) => bigint } {
+	const second = parallel ? openReadyChannel(w.s, w.r) : null;
+	if (second) {
+		w.s.setChannelPolicy(second, {
+			feeBaseMsat: 0,
+			feeProportionalMillionths: 0
+		});
+	}
+	const epochScid = exchangeAnnouncement(w, w.srChannelId, 2);
+	const scid = second ? exchangeAnnouncement(w, second, 3) : epochScid;
+	activate(w);
+	const invs = exposeAndLeave(w, [1, 2]);
+	publishChannel(w.p, w.s, w.r, w.srChannelId, epochScid, 1000, 1);
+	if (second) {
+		disableChannel(w.p, w.s, w.r, epochScid);
+		publishChannel(w.p, w.s, w.r, second, scid, 0, 0);
+	}
+	return { invs, scid, fee: (d) => (second ? 0n : feeS(d, 1000, 1)) };
+}
+
+/**
+ * Restart S from its SQLite store. R stays offline and no gossip reaches the
+ * new instance; only the upstream link to P comes back.
+ */
+function restartS(w: IWorld): void {
+	w.ps.connected = false;
+	w.p.getChannelManager().handlePeerDisconnected(w.s.getNodeId());
+	const s = new LightningNode(w.sConfig);
+	s.on('node:error', (e: { message: string }) => w.errors.s.push(e.message));
+	s.handleNewBlock(TIP);
+	w.s = s;
+	w.sr = new NodeLink(s, w.r);
+	w.sr.connected = false;
+	w.ps = new NodeLink(w.p, s);
+	w.ps.reconnect();
+}
+
+/**
+ * Rewrite S's stored row for `scid` the way lazy intake leaves one, with
+ * its provenance unsettled: as published, with one signature broken, or
+ * with the two funding keys validly re-signed in each other's positions.
+ */
+function storeDeferred(
+	w: IWorld & { storage: SqliteStorage },
+	scid: Buffer,
+	variant: 'valid' | 'tampered' | 'swapped'
+): void {
+	const row = w.storage
+		.loadAllGossipChannels()
+		.find((c) => c.shortChannelId.equals(scid))!;
+	let ann = row.announcement;
+	if (variant === 'tampered') {
+		const sig = Buffer.from(ann.bitcoinSignature2);
+		sig[40] ^= 1;
+		ann = { ...ann, bitcoinSignature2: sig };
+	} else if (variant === 'swapped') {
+		ann = {
+			...ann,
+			bitcoinKey1: ann.bitcoinKey2,
+			bitcoinKey2: ann.bitcoinKey1
+		};
+		const privkeys = new Map<string, Buffer>();
+		for (const c of [w.sConfig, w.rConfig]) {
+			for (const k of [c.nodePrivateKey, c.fundingPrivkey]) {
+				privkeys.set(getPublicKey(k).toString('hex'), k);
+			}
+		}
+		const priv = (pub: Buffer): Buffer => privkeys.get(pub.toString('hex'))!;
+		const payload = encodeChannelAnnouncementMessage(ann);
+		const one = signChannelAnnouncement(
+			payload,
+			priv(ann.nodeId1),
+			priv(ann.bitcoinKey1)
+		);
+		const two = signChannelAnnouncement(
+			payload,
+			priv(ann.nodeId2),
+			priv(ann.bitcoinKey2)
+		);
+		ann = {
+			...ann,
+			nodeSignature1: one.nodeSignature,
+			bitcoinSignature1: one.bitcoinSignature,
+			nodeSignature2: two.nodeSignature,
+			bitcoinSignature2: two.bitcoinSignature
+		};
+	}
+	w.storage.saveGossipChannel(scid.toString('hex'), {
+		...row,
+		announcement: ann,
+		announcementVerified: undefined,
+		announcementVerifyDeferred: true
+	});
+}
+
+describe('FFOR Variant D: public S-R fee across an S restart (issue #899)', function () {
+	this.timeout(60_000);
+
+	for (const parallel of [false, true]) {
+		const edge = parallel ? 'a parallel S-R channel' : 'the epoch channel';
+		it(`settles at the public policy of ${edge} before and after S restarts with R offline`, () => {
+			const w = worldWithStorage();
+			const { invs, scid, fee } = publishAndExpose(w, parallel);
+			const first = pay(w, invs[0]);
+			expect(first.status, JSON.stringify(w.errors.s)).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(first.route!.totalFeeMsat).to.equal(fee(AMOUNTS[0]));
+
+			restartS(w);
+			const failures: { reason: string }[] = [];
+			w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+				failures.push(e)
+			);
+			const second = pay(w, invs[1]);
+			expect(failures).to.deep.equal([]);
+			expect(second.status).to.equal(PaymentStatus.COMPLETED);
+			const hops = second.route!.hops;
+			expect(hops[hops.length - 1].shortChannelId.equals(scid)).to.be.true;
+			expect(second.route!.totalFeeMsat).to.equal(fee(AMOUNTS[1]));
+			expect(fee(AMOUNTS[1]) < feeS(AMOUNTS[1], FEE_BASE, FEE_PPM)).to.be.true;
+			expect(record(w.s, w.srHex).slotStates.slice(0, 2)).to.deep.equal([
+				FforSlotState.SETTLED,
+				FforSlotState.SETTLED
+			]);
+		});
+	}
+
+	it('verifies a restored deferred S-R announcement at settlement and holds an invalid or mismatched one to the book terms', () => {
+		for (const variant of ['valid', 'tampered', 'swapped'] as const) {
+			const w = worldWithStorage();
+			const { invs, scid, fee } = publishAndExpose(w);
+			storeDeferred(w, scid, variant);
+			restartS(w);
+			const row = w.s.getGraph().getChannel(scid)!;
+			expect(row.announcementVerifyDeferred).to.equal(true);
+			const failures: { reason: string }[] = [];
+			w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+				failures.push(e)
+			);
+			const payment = pay(w, invs[0]);
+			// Settlement resolved the row: the swapped keys are validly signed,
+			// so only the position binding refuses them.
+			expect(row.announcementVerified, variant).to.equal(
+				variant !== 'tampered'
+			);
+			if (variant === 'valid') {
+				expect(failures).to.deep.equal([]);
+				expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+				expect(payment.route!.totalFeeMsat).to.equal(fee(AMOUNTS[0]));
+				continue;
+			}
+			expect(payment.status, variant).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
+			expect(failures.pop()!.reason).to.equal('fee_insufficient');
+			expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+		}
+	});
+
+	it('rebuilds a published row missing from storage when S restarts with R offline', () => {
+		// 'never saved' is a channel announced before announcement:ready
+		// saved its row, as on the restart that upgrades to this version.
+		for (const missing of ['failed save', 'never saved'] as const) {
+			const w = worldWithStorage();
+			const save = w.storage.saveGossipChannel.bind(w.storage);
+			if (missing === 'failed save') {
+				w.storage.saveGossipChannel = (): void => {
+					throw new Error('disk full');
+				};
+			}
+			const { invs, scid, fee } = publishAndExpose(w);
+			w.storage.saveGossipChannel = save;
+			if (missing === 'failed save') {
+				expect(w.errors.s).to.include('saveGossipChannel: disk full');
+			}
+			// The verified row in memory still counts for this session.
+			expect(pay(w, invs[0]).status).to.equal(PaymentStatus.COMPLETED);
+			w.storage.deleteGossipChannel(scid.toString('hex'));
+
+			restartS(w);
+			expect(w.s.getGraph().getChannel(scid)?.announcementVerified).to.equal(
+				true
+			);
+			const stored = w.storage.loadAllGossipChannels();
+			expect(stored.some((c) => c.shortChannelId.equals(scid))).to.be.true;
+			const payment = pay(w, invs[1]);
+			expect(payment.status, missing).to.equal(PaymentStatus.COMPLETED);
+			expect(payment.route!.totalFeeMsat).to.equal(fee(AMOUNTS[1]));
+		}
+	});
+
+	it('holds a row rebuilt with a bad counterparty signature to the book terms', () => {
+		const w = worldWithStorage();
+		const { invs, scid } = publishAndExpose(w);
+		w.storage.deleteGossipChannel(scid.toString('hex'));
+		const id = w.srChannelId.toString('hex');
+		const { state, peerPubkey } = w.storage.loadChannel(id)!;
+		const sig = Buffer.from(state.remoteAnnouncementBitcoinSig!);
+		sig[40] ^= 1;
+		w.storage.saveChannel(
+			id,
+			{ ...state, remoteAnnouncementBitcoinSig: sig },
+			peerPubkey
+		);
+
+		restartS(w);
+		expect(w.s.getGraph().getChannel(scid)?.announcementVerified).to.equal(
+			false
+		);
+		const stored = w.storage.loadAllGossipChannels();
+		expect(stored.some((c) => c.shortChannelId.equals(scid))).to.be.false;
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		const payment = pay(w, invs[0]);
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
+		expect(failures.pop()!.reason).to.equal('fee_insufficient');
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
 	});
 });

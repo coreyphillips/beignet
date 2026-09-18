@@ -3128,6 +3128,23 @@ export class LightningNode extends EventEmitter {
 		// Prune stale gossip immediately on restore (BOLT 7: >2 weeks = stale)
 		this.pruneStaleGossipWithStorage();
 
+		// A public channel with no graph row (announced before announcement:ready
+		// saved one, or its save failed) is rebuilt from its stored signatures:
+		// FFOR settlement needs it while R may be offline. A row that is present
+		// is left for settlement to verify.
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			const scid = channel.getShortChannelId();
+			if (
+				channelId &&
+				scid &&
+				channel.isHtlcUsable(true) &&
+				!this.graph.getChannel(scid)
+			) {
+				this.channelManager.reannounceChannel(channelId);
+			}
+		}
+
 		// JIT receive: bring back the live intents (so invoices already out
 		// there stay payable) and queue every pre-restart held HTLC to be
 		// failed upstream. Runs after the channels and their onion shared
@@ -4866,6 +4883,22 @@ export class LightningNode extends EventEmitter {
 						updateValid = false;
 					}
 					this.graph.applyChannelUpdate(updateMsg, { verified: updateValid });
+					// Persist the verified row: FFOR settlement reads it after a
+					// restart (fforTrySettleDelegated), and otherwise only a later
+					// peer update for this channel would save it.
+					const row = announcementValid
+						? this.graph.getChannel(annMsg.shortChannelId)
+						: undefined;
+					if (row?.announcementVerified === true) {
+						this.safeStorage(
+							() =>
+								this.storage!.saveGossipChannel(
+									annMsg.shortChannelId.toString('hex'),
+									row
+								),
+							'saveGossipChannel'
+						);
+					}
 				} catch {
 					// Ignore decode errors for self-generated announcements
 				}
@@ -16605,11 +16638,11 @@ export class LightningNode extends EventEmitter {
 			// must resolve to a public channel of ours to R whose two funding
 			// keys the announcement carries, each beside its own node id.
 			const outScid = hopPayload.shortChannelId;
-			const published = outScid ? this.graph.getChannel(outScid) : undefined;
-			const ann =
-				published?.announcementVerified === true
-					? published.announcement
-					: undefined;
+			// A deferred row (learned lazily, or restored without settled
+			// flags) is verified here: nothing else on this path would.
+			const ann = outScid
+				? this.graph.getVerifiedChannelAnnouncement(outScid)
+				: undefined;
 			const signedNodes = ann
 				? [ann.nodeId1, ann.nodeId2].map((id) => id.toString('hex'))
 				: [];

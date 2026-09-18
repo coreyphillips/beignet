@@ -7947,6 +7947,30 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Emit announcement:ready again for a channel both sides already signed,
+	 * rebuilt from the stored signatures, so the peer need not be online.
+	 */
+	reannounceChannel(channelId: Buffer): void {
+		const channel = this.findChannelByChannelId(channelId);
+		const peerPubkey = this.channelPeers.get(channelId.toString('hex'));
+		if (!channel || !peerPubkey) return;
+		const localNodeId = this.config.nodePrivateKey
+			? getPublicKey(this.config.nodePrivateKey)
+			: this.config.localBasepoints.fundingPubkey;
+		const ready = channel.rebuildAnnouncement(
+			localNodeId,
+			Buffer.from(peerPubkey, 'hex')
+		);
+		if (ready?.type !== ChannelActionType.ANNOUNCEMENT_READY) return;
+		this.emit(
+			'announcement:ready',
+			ready.channelId,
+			ready.channelAnnouncement,
+			ready.channelUpdate
+		);
+	}
+
+	/**
 	 * Void a channel whose funding tx vanished from mempool AND chain before
 	 * confirming (evicted or an input double-spent): the channel never existed
 	 * on the network, so there is nothing to close and it is simply dropped.

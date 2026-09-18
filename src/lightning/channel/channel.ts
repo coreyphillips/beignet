@@ -14709,6 +14709,32 @@ export class Channel {
 		return Buffer.concat(parts);
 	}
 
+	/**
+	 * The ANNOUNCEMENT_READY the exchange produced, rebuilt from both sides'
+	 * stored signatures. Null until both sides have signed.
+	 */
+	rebuildAnnouncement(
+		localNodeId: Buffer,
+		remoteNodeId: Buffer
+	): ChannelAction | null {
+		const nodeSig = this._state.localAnnouncementNodeSig;
+		const bitcoinSig = this._state.localAnnouncementBitcoinSig;
+		if (
+			!this._state.announceChannel ||
+			!this._state.shortChannelId ||
+			!nodeSig ||
+			!bitcoinSig
+		) {
+			return null;
+		}
+		return this.buildFullAnnouncement(
+			localNodeId,
+			remoteNodeId,
+			nodeSig,
+			bitcoinSig
+		);
+	}
+
 	private buildFullAnnouncement(
 		localNodeId: Buffer,
 		remoteNodeId: Buffer,
