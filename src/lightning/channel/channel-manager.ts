@@ -897,6 +897,11 @@ export class ChannelManager extends EventEmitter {
 		return this.zeroConfManager.listTrustedPeers();
 	}
 
+	/** Authorize only our own outbound funding for an allocated receive channel. */
+	setFforFundingClient(peer: string, enabled: boolean): void {
+		this.zeroConfManager.setFforFundingClient(peer, enabled);
+	}
+
 	/**
 	 * Replace the set of peers whose JIT receive intent authorizes an OUTBOUND
 	 * zero-conf open from us (issue #594). Separate from the trusted set, which
@@ -973,6 +978,7 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
 		}
@@ -1042,6 +1048,7 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
 		}
@@ -3513,6 +3520,7 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
 		}
@@ -6596,6 +6604,7 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
 		}
@@ -6910,6 +6919,7 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
 		}

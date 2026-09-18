@@ -11,6 +11,11 @@
 
 export class ZeroConfManager {
 	private trustedPeers: Set<string> = new Set();
+	private fforClients: Set<string> = new Set();
+	setFforFundingClient(peer: string, enabled: boolean): void {
+		if (enabled) this.fforClients.add(peer);
+		else this.fforClients.delete(peer);
+	}
 	private jitClients: Set<string> = new Set();
 
 	/**
@@ -68,7 +73,11 @@ export class ZeroConfManager {
 
 	/** May WE open a zero-conf channel to this peer? */
 	canOpenZeroConfTo(pubkeyHex: string): boolean {
-		return this.trustedPeers.has(pubkeyHex) || this.jitClients.has(pubkeyHex);
+		return (
+			this.trustedPeers.has(pubkeyHex) ||
+			this.jitClients.has(pubkeyHex) ||
+			this.fforClients.has(pubkeyHex)
+		);
 	}
 
 	/**

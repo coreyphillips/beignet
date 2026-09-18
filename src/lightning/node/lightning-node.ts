@@ -13799,12 +13799,15 @@ export class LightningNode extends EventEmitter {
 	 * circular rebalance -- uses to land the final hop on this channel), or null
 	 * when the channel is unusable or lacks an SCID/alias.
 	 */
-	private buildRoutingHintForChannel(channel: Channel): IRoutingHintHop | null {
+	private buildRoutingHintForChannel(
+		channel: Channel,
+		reservationHint = false
+	): IRoutingHintHop | null {
 		const state = channel.getFullState();
 		// Look through a reconnect (SCID and peer info stay valid for hints),
 		// and admit a usable mid-splice channel: it receives fine, still under
 		// its pre-splice scid until the lock.
-		if (!channel.acceptsNewHtlcs(true)) return null;
+		if (!channel.acceptsNewHtlcs(true, reservationHint)) return null;
 
 		const channelId = channel.getChannelId();
 		if (!channelId) return null;
@@ -17078,8 +17081,16 @@ export class LightningNode extends EventEmitter {
 	createFforVoucherInvoice(
 		channelIdHex: string,
 		k: number,
-		description = 'FFOR voucher'
+		description = 'FFOR voucher',
+		expirySecs?: number
 	): ICreateInvoiceResult {
+		if (
+			expirySecs !== undefined &&
+			(!Number.isSafeInteger(expirySecs) ||
+				expirySecs < 60 ||
+				expirySecs > 86400)
+		)
+			throw new Error('expirySecs must be between 60 and 86400');
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const channel = this.channelManager.getChannel(channelId);
 		const record = channel?.getFforEpoch() ?? null;
@@ -17123,7 +17134,7 @@ export class LightningNode extends EventEmitter {
 				`tip ${this.currentBlockHeight} is at or past settlement_deadline ${record.params.settlementDeadline}`
 			);
 		}
-		const hint = this.buildRoutingHintForChannel(channel);
+		const hint = this.buildRoutingHintForChannel(channel, true);
 		if (!hint) {
 			throw new Error('no usable SCID or alias for the route hint to S');
 		}
@@ -17151,7 +17162,7 @@ export class LightningNode extends EventEmitter {
 		return this.createInvoice({
 			amountMsat: d,
 			description,
-			expiry,
+			expiry: Math.min(expiry, expirySecs ?? expiry),
 			paymentHash: record.paymentHashes[k - 1],
 			fforVoucher: true,
 			extraRoutingHints: [
@@ -25671,7 +25682,7 @@ export class LightningNode extends EventEmitter {
 		if (!witness) {
 			throw new Error('the issuer must first be provisioned as a witness');
 		}
-		const hint = this.buildRoutingHintForChannel(channel);
+		const hint = this.buildRoutingHintForChannel(channel, true);
 		if (!hint) throw new Error('no usable SCID or alias for the S hop');
 		const hops: IFforIssuerHop[] = [
 			...opts.witnessHops,
