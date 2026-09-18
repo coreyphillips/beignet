@@ -16593,14 +16593,58 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 
-			// Section 7.6 checks 1 and 2 on the payee amount d_k.
+			// Section 7.6 checks 1 and 2 on the payee amount d_k. S's own policy
+			// counts only once the channel_announcement for the payload's
+			// short_channel_id is in our graph with every signature valid, the
+			// one case where a payer can have priced the hop from gossip instead
+			// of the book. With several S-R channels that need not be the epoch
+			// channel. The signature-exchange flags are no proof, since any bytes
+			// from the peer set them. The peer can also move a stored SCID onto
+			// another announced channel, and our funding key can repeat across
+			// channels. So the signed node ids must be us and R, and the SCID
+			// must resolve to a public channel of ours to R whose two funding
+			// keys the announcement carries, each beside its own node id.
+			const outScid = hopPayload.shortChannelId;
+			const published = outScid ? this.graph.getChannel(outScid) : undefined;
+			const ann =
+				published?.announcementVerified === true
+					? published.announcement
+					: undefined;
+			const signedNodes = ann
+				? [ann.nodeId1, ann.nodeId2].map((id) => id.toString('hex'))
+				: [];
+			const signedKeys = ann ? [ann.bitcoinKey1, ann.bitcoinKey2] : [];
+			const ours = signedNodes.indexOf(this.nodeId);
+			const rPeer = this.channelManager.getPeerForChannel(slot.channelId);
+			const outgoing =
+				outScid &&
+				ann &&
+				rPeer &&
+				signedNodes.includes(this.nodeId) &&
+				signedNodes.includes(rPeer)
+					? this.channelManager.getChannelsByPeer(rPeer).find((ch) => {
+							const st = ch.getFullState();
+							return (
+								st.announceChannel &&
+								st.shortChannelId?.equals(outScid) === true &&
+								signedKeys[ours].equals(st.localBasepoints.fundingPubkey) &&
+								st.remoteBasepoints?.fundingPubkey.equals(
+									signedKeys[1 - ours]
+								) === true
+							);
+					  })
+					: undefined;
+			const outgoingId = outgoing?.getChannelId();
 			const amountCheck = checkDelegatedAmounts({
 				payeeAmountMsat: entry.amountMsat,
 				amountMsat,
 				amtToForwardMsat: hopPayload.amountToForwardMsat ?? null,
 				hopKind: blinded ? 'blinded' : 'plaintext',
 				feeBaseMsat: record.params.feeBaseMsat,
-				feeProportionalMillionths: record.params.feeProportionalMillionths
+				feeProportionalMillionths: record.params.feeProportionalMillionths,
+				advertisedFee: outgoingId
+					? this.getForwardingPolicyForChannel(outgoingId)
+					: undefined
 			});
 			if (amountCheck) {
 				if (amountCheck.check === 2) {

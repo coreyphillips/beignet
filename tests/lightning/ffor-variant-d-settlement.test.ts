@@ -230,6 +230,94 @@ function publishChannel(
 	y.registerChannelScid(channelId, scid);
 }
 
+/**
+ * Put the channel_announcement of one of S's channels (the epoch channel by
+ * default) on S's own graph under `scid`, carrying both funding keys, as the
+ * announcement exchange leaves it: verified only when every signature
+ * checked out.
+ */
+function announceSR(
+	w: IWorld,
+	scid: Buffer,
+	verified: boolean,
+	channelId = w.srChannelId,
+	peer = w.r
+): void {
+	const st = w.s.getChannelManager().getChannel(channelId)!.getFullState();
+	st.shortChannelId = scid;
+	const sk = Buffer.from(w.s.getNodeId(), 'hex');
+	const rk = Buffer.from(peer.getNodeId(), 'hex');
+	const sFirst = Buffer.compare(sk, rk) < 0;
+	const sKey = st.localBasepoints.fundingPubkey;
+	const rKey = st.remoteBasepoints!.fundingPubkey;
+	const added = w.s.getGraph().addChannelAnnouncement(
+		{
+			nodeSignature1: crypto.randomBytes(64),
+			nodeSignature2: crypto.randomBytes(64),
+			bitcoinSignature1: crypto.randomBytes(64),
+			bitcoinSignature2: crypto.randomBytes(64),
+			features: Buffer.alloc(0),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId: scid,
+			nodeId1: sFirst ? sk : rk,
+			nodeId2: sFirst ? rk : sk,
+			bitcoinKey1: sFirst ? sKey : rKey,
+			bitcoinKey2: sFirst ? rKey : sKey
+		},
+		{ verified }
+	);
+	expect(added).to.equal(true);
+}
+
+/** Disable `from`'s direction of a channel already on `viewer`'s graph. */
+function disableChannel(
+	viewer: LightningNode,
+	from: LightningNode,
+	to: LightningNode,
+	scid: Buffer
+): void {
+	const fromFirst =
+		Buffer.compare(
+			Buffer.from(from.getNodeId(), 'hex'),
+			Buffer.from(to.getNodeId(), 'hex')
+		) < 0;
+	const current = viewer.getGraph().getChannel(scid)!;
+	const update = fromFirst ? current.update1! : current.update2!;
+	const applied = viewer.getGraph().applyChannelUpdate({
+		...update,
+		timestamp: update.timestamp + 1,
+		channelFlags: update.channelFlags | 2
+	});
+	expect(applied).to.equal(true);
+}
+
+/**
+ * R exposes voucher 1 and leaves. P then knows the epoch channel from gossip
+ * but disabled, and a second S-R edge under a fresh SCID at 0 msat + 0 ppm.
+ * S backs that SCID with `channelId`, its channel to `peer`, at the same
+ * policy.
+ */
+function exposeOverSecondEdge(
+	w: IWorld,
+	channelId: Buffer,
+	peer: LightningNode,
+	verified: boolean
+): { inv: string; scid: Buffer } {
+	w.s.setChannelPolicy(channelId, {
+		feeBaseMsat: 0,
+		feeProportionalMillionths: 0
+	});
+	const [inv] = exposeAndLeave(w, [1]);
+	const epochScid = decodeInvoice(inv).routingHints![0][0].shortChannelId;
+	publishChannel(w.p, w.s, w.r, w.srChannelId, epochScid, 1000, 1);
+	disableChannel(w.p, w.s, w.r, epochScid);
+	announceSR(w, epochScid, true);
+	const scid = encodeShortChannelId({ block: 500, txIndex: 3, outputIndex: 0 });
+	publishChannel(w.p, w.s, w.r, channelId, scid, 0, 0);
+	announceSR(w, scid, verified, channelId, peer);
+	return { inv, scid };
+}
+
 const TIP = 790_000;
 const T_EXP = 800_000;
 const D_DEADLINE = 798_992;
@@ -570,6 +658,163 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		}
 	});
 
+	it('settles a payer that priced a public S-R hop from S policy instead of the book terms', () => {
+		const w = createWorld();
+		activate(w);
+		const [inv] = exposeAndLeave(w, [1]);
+		// P now knows S-R from gossip at S's default policy (1000 msat + 1 ppm),
+		// so it prices S's hop from that channel_update, not the hint's book
+		// terms (1000 msat + 5000 ppm).
+		const hint = decodeInvoice(inv).routingHints![0][0];
+		publishChannel(w.p, w.s, w.r, w.srChannelId, hint.shortChannelId, 1000, 1);
+		announceSR(w, hint.shortChannelId, true);
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		const d = AMOUNTS[0];
+		const payment = pay(w, inv);
+		expect(failures).to.deep.equal([]);
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(payment.route!.totalFeeMsat).to.equal(feeS(d, 1000, 1));
+		expect(payment.route!.totalFeeMsat < feeS(d, FEE_BASE, FEE_PPM)).to.be.true;
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.SETTLED);
+	});
+
+	it('holds an S-R hop whose announcement did not verify to the book terms', () => {
+		const w = createWorld();
+		activate(w);
+		const [inv] = exposeAndLeave(w, [1]);
+		// announcement_signatures went both ways (the world pins the flags),
+		// but R's signatures were garbage, so nothing was published.
+		announceSR(w, decodeInvoice(inv).routingHints![0][0].shortChannelId, false);
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		// Covers S's default policy (1000 msat + 1 ppm) but not the book.
+		const payment = pay(
+			w,
+			craftInvoice(w, inv, { feeBaseMsat: 1000, feeProportionalMillionths: 1 })
+		);
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
+		expect(failures.pop()!.reason).to.equal('fee_insufficient');
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+	});
+
+	it('settles a payer that routed over a parallel public S-R channel at that channel policy', () => {
+		const w = createWorld();
+		const second = openReadyChannel(w.s, w.r);
+		activate(w);
+		const { inv, scid } = exposeOverSecondEdge(w, second, w.r, true);
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		const payment = pay(w, inv);
+		expect(failures).to.deep.equal([]);
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		const hops = payment.route!.hops;
+		expect(hops[hops.length - 1].shortChannelId.equals(scid)).to.be.true;
+		expect(payment.route!.totalFeeMsat).to.equal(0n);
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.SETTLED);
+	});
+
+	it('holds a named channel that is not a public channel to R to the book terms', () => {
+		// A second S-R channel whose announcement did not verify, a private
+		// S-R channel under a verified S-R announcement carrying its keys, then
+		// S's public channel to P, which P's graph places between S and R.
+		for (const kind of ['unverified', 'private', 'toP'] as const) {
+			const w = createWorld();
+			const toR = kind !== 'toP';
+			const named = toR ? openReadyChannel(w.s, w.r) : w.psChannelId;
+			w.s
+				.getChannelManager()
+				.getChannel(named)!
+				.getFullState().announceChannel = kind !== 'private';
+			activate(w);
+			const { inv } = exposeOverSecondEdge(
+				w,
+				named,
+				toR ? w.r : w.p,
+				kind !== 'unverified'
+			);
+			const failures: { reason: string }[] = [];
+			w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+				failures.push(e)
+			);
+			const payment = pay(w, inv);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
+			expect(failures.pop()!.reason).to.equal('fee_insufficient');
+			expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+		}
+	});
+
+	it('holds an S-R channel moved onto the SCID of S public channel to P to the book terms', () => {
+		// S uses one funding key for every channel here, so the S-P
+		// announcement carries the key of the S-R channel R moved onto it.
+		const w = createWorld();
+		const moved = openReadyChannel(w.s, w.r);
+		w.s.setChannelPolicy(moved, {
+			feeBaseMsat: 0,
+			feeProportionalMillionths: 0
+		});
+		activate(w);
+		const { inv, scid } = exposeOverSecondEdge(w, w.psChannelId, w.p, true);
+		w.s.getChannelManager().getChannel(moved)!.getFullState().shortChannelId =
+			scid;
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		const payment = pay(w, inv);
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
+		expect(failures.pop()!.reason).to.equal('fee_insufficient');
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+	});
+
+	it('holds an S-R channel moved onto the SCID of its sibling S-R channel to the book terms', () => {
+		// Both S-R channels carry S's one funding key, but R funded the moved
+		// one under a key the sibling's announcement does not carry.
+		const w = createWorld();
+		const moved = openReadyChannel(w.s, w.r);
+		const movedState = w.s
+			.getChannelManager()
+			.getChannel(moved)!
+			.getFullState();
+		movedState.remoteBasepoints!.fundingPubkey = getPublicKey(sha('other-key'));
+		w.s.setChannelPolicy(moved, {
+			feeBaseMsat: 0,
+			feeProportionalMillionths: 0
+		});
+		activate(w);
+		const [inv] = exposeAndLeave(w, [1]);
+		const scid = decodeInvoice(inv).routingHints![0][0].shortChannelId;
+		publishChannel(w.p, w.s, w.r, w.srChannelId, scid, 0, 0);
+		announceSR(w, scid, true);
+		w.s
+			.getChannelManager()
+			.getChannel(w.srChannelId)!
+			.getFullState().shortChannelId = encodeShortChannelId({
+			block: 500,
+			txIndex: 4,
+			outputIndex: 0
+		});
+		movedState.shortChannelId = scid;
+		const failures: { reason: string }[] = [];
+		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
+			failures.push(e)
+		);
+		const payment = pay(w, inv);
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureCode).to.equal(FEE_INSUFFICIENT);
+		expect(failures.pop()!.reason).to.equal('fee_insufficient');
+		expect(record(w.s, w.srHex).slotStates[0]).to.equal(FforSlotState.UNUSED);
+	});
+
 	it('under a blinded path derives amt_to_forward by the inverse formula within rounding_slack', () => {
 		const d = 1_000_000n;
 		const gross = grossIntoS(d, FEE_BASE, FEE_PPM);
@@ -624,6 +869,29 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		expect(plain(d + 1n, gross + 1n)!.check).to.equal(1);
 		expect(plain(d - 1n, gross)!.check).to.equal(1);
 		expect(plain(d, d + feeS(d, FEE_BASE, FEE_PPM) - 1n)!.check).to.equal(2);
+		// A fee covering S's advertised policy settles a plaintext hop; one
+		// below both terms does not, and a blinded hop reads the book alone.
+		const advertisedFee = { feeBaseMsat: 1000, feeProportionalMillionths: 1 };
+		const policyFee = d + feeS(d, 1000, 1);
+		const withPolicy = (
+			hopKind: 'plaintext' | 'blinded',
+			amount: bigint
+		): ReturnType<typeof checkDelegatedAmounts> =>
+			checkDelegatedAmounts({
+				payeeAmountMsat: d,
+				amountMsat: amount,
+				amtToForwardMsat: d,
+				hopKind,
+				feeBaseMsat: FEE_BASE,
+				feeProportionalMillionths: FEE_PPM,
+				advertisedFee
+			});
+		expect(withPolicy('plaintext', policyFee)).to.equal(null);
+		expect(withPolicy('plaintext', policyFee - 1n)!.check).to.equal(2);
+		// One msat under the book still derives d, so only check 2 can refuse it.
+		expect(inverseAmtToForward(gross - 1n, FEE_BASE, FEE_PPM)).to.equal(d);
+		expect(withPolicy('plaintext', gross - 1n)).to.equal(null);
+		expect(withPolicy('blinded', gross - 1n)!.check).to.equal(2);
 	});
 
 	it('fails a payment that arrives before ACTIVE, at or past D, or after ff_close', () => {
