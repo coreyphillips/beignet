@@ -231,6 +231,12 @@ describe('beignet-to-beignet v2 open (plain acceptor, auto-funded opener)', func
 		expect(chB!.getState(), 'acceptor past negotiation').to.equal(
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
+		// BOLT 2 channel_flags bit 0: the acceptor reads the opener's announce
+		// intent the way the v1 acceptor does. Before the fix it kept the
+		// field's default, so the opener announced at depth and the acceptor
+		// never answered with its own announcement_signatures.
+		expect(chA.getFullState().announceChannel, 'opener announces').to.be.true;
+		expect(chB!.getFullState().announceChannel, 'acceptor reads the flag').to.be.true;
 
 		// The negotiated funding tx exists and pays the committed capacity, with
 		// the opener's change output alongside it (fixed-amount open).
@@ -239,6 +245,20 @@ describe('beignet-to-beignet v2 open (plain acceptor, auto-funded opener)', func
 		const values = fundingTx.outs.map((o) => o.value).sort((a, b) => a - b);
 		expect(values).to.include(150_000);
 		expect(fundingTx.outs.length, 'funding output + change').to.equal(2);
+	});
+
+	it('an opener that asks for a private channel gets one on both sides', async function () {
+		const h = makeHarness(makeWalletInput(WALLET_UTXO_SATS));
+		const chA = h.mgrA.createDualFundedChannel(h.sideB.pubkey, {
+			...openerParams(h.sideA),
+			channelFlags: 0x00
+		});
+		await settle(
+			() => chA.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.errors, 'no negotiation errors').to.deep.equal([]);
+		expect(chA.getFullState().announceChannel).to.be.false;
+		expect(acceptorChannel(h)!.getFullState().announceChannel).to.be.false;
 	});
 
 	it('a max open commits the v2 quote and funds with zero change', async function () {

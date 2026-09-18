@@ -6610,6 +6610,12 @@ export class ChannelManager extends EventEmitter {
 		if (hasScidAliasChannelType(channelType)) {
 			state.announceChannel = false;
 		}
+		// The opener's own record follows the flag it puts on the wire, so a
+		// private open never has this side signing announcement_signatures
+		// for a channel it told the peer not to announce.
+		if (((channelFlags ?? 0x01) & 0x01) === 0) {
+			state.announceChannel = false;
+		}
 
 		const alignedParams: IDualFundingParams = {
 			...params,
