@@ -43,6 +43,7 @@ import {
 	IFforEpochRecord
 } from '../lightning/ffor/types';
 import { bitmapGet } from '../lightning/ffor/messages';
+import { IFforIssuerStatusResp } from '../lightning/ffor/issuer-messages';
 import { IOffer } from '../lightning/offer/types';
 import {
 	estimateSpliceTxWeight,
@@ -7149,6 +7150,76 @@ export class BeignetNode extends EventEmitter {
 				records: w.records
 			})),
 			epoch: this.fforEpoch(idBuf.toString('hex'))
+		};
+	}
+
+	async fforCloseWitnesses(
+		channelId: string
+	): Promise<Record<string, unknown>[]> {
+		const idBuf = this.fforChannelId(channelId);
+		const f = this.node.getFforEpoch(idBuf.toString('hex'));
+		if (!f || f.role !== 'R') {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_FOUND,
+				'no FFOR epoch of ours on this channel'
+			);
+		}
+		// Section 9.6.6 sends this at ff_close_ack. A witness closed earlier
+		// stops recording the book's later payments and its issuer stops
+		// issuing, so an ACTIVE epoch would lose its receipts. A channel
+		// closed on-chain takes no more payments and will never get the ack.
+		const channelState = this.node.getChannel(idBuf)?.state;
+		const closedOnChain =
+			channelState === ChannelState.FORCE_CLOSED ||
+			channelState === ChannelState.CLOSED;
+		if (f.settledBitmap === null && !closedOnChain) {
+			throw new BeignetError(
+				'FFOR_REFUSED',
+				'no ff_close_ack yet: close the epoch first'
+			);
+		}
+		const closed = await this.node.closeFforWitnesses(idBuf.toString('hex'));
+		return closed.map((w) => ({
+			witnessNodeId: w.witnessNodeId.toString('hex'),
+			ok: w.ok,
+			held: w.held
+		}));
+	}
+
+	async fforIssuedSlots(
+		channelId: string | undefined,
+		issuerNodeId: string | undefined
+	): Promise<Record<string, unknown>> {
+		const idBuf = this.fforChannelId(channelId);
+		if (
+			typeof issuerNodeId !== 'string' ||
+			!/^0[23][0-9a-fA-F]{64}$/.test(issuerNodeId)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'issuerNodeId must be a compressed node id'
+			);
+		}
+		let status: IFforIssuerStatusResp;
+		try {
+			status = await this.node.fetchFforIssuerStatus(
+				idBuf.toString('hex'),
+				issuerNodeId.toLowerCase()
+			);
+		} catch (err) {
+			throw new BeignetError('FFOR_REFUSED', (err as Error).message);
+		}
+		return {
+			ok: status.ok,
+			numSlots: status.numSlots,
+			issued: status.issued.toString('hex'),
+			slots: status.slots.map((s) => ({
+				k: s.k,
+				payerId: s.payerId.toString('hex'),
+				metadataHash: s.metadataHash.toString('hex'),
+				issuedUnixTime: Number(s.issuedUnixTime)
+			})),
+			error: status.error ?? null
 		};
 	}
 

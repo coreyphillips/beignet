@@ -1913,12 +1913,60 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: { '200': { description: 'enabled and mailboxes' } }
 				}
 			},
+			'/ffor/witness/close': {
+				post: {
+					summary:
+						'R, once ff_close_ack is in or the channel is closed on-chain: send ff_witness_close (spec section 9.6.6) with the settled bitmap to every acknowledged witness. The witness stops recording and its issuer stops issuing; records stay fetchable until retention_until, and the reservation is held until then too. Advisory: a witness that does not answer reads ok false',
+					tags: ['FFOR'],
+					requestBody: bodyContent({ channelId: 'string' }),
+					responses: {
+						'200': { description: 'Array of { witnessNodeId, ok, held }' },
+						'400': {
+							description:
+								'INVALID_PARAMS: channelId missing or malformed. FFOR_REFUSED: no ff_close_ack yet on a channel still open'
+						},
+						'404': { description: 'No channel, or no epoch of ours on it' }
+					}
+				}
+			},
 			'/ffor/issuer/status': {
 				get: {
 					summary:
 						'The BOLT 12 issuer this node runs (BEIGNET_FFOR_ISSUER): every manifest with its offer id, state, issued slots and issue_until',
 					tags: ['FFOR'],
 					responses: { '200': { description: 'enabled and manifests' } }
+				}
+			},
+			'/ffor/issuer/issued': {
+				get: {
+					summary:
+						"R: ask the issuer this node provisioned for the epoch which slots it issued, to whom and when (ff_issuer_status, spec section 9.7.7), so an issued-but-unpaid slot reads apart from a never-issued one. /ffor/issuer/status is this node's own issuer",
+					tags: ['FFOR'],
+					parameters: [
+						{
+							name: 'channelId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						},
+						{
+							name: 'issuerNodeId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description:
+								'ok, numSlots, issued (the issued bitmap, hex), slots [{ k, payerId, metadataHash, issuedUnixTime }], error (the issuer refusal when ok is false)'
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: channelId or issuerNodeId missing or malformed. FFOR_REFUSED: no provision for that issuer, or it did not answer'
+						},
+						'404': { description: 'CHANNEL_NOT_FOUND' }
+					}
 				}
 			},
 			'/recovery/status': {

@@ -2741,8 +2741,22 @@ async function bootDaemon(
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
 			return success(node.fforEnforce(channelId));
 		},
+		'POST /ffor/witness/close': async (body) => {
+			const { channelId } = body as { channelId?: string };
+			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
+			return success(await node.fforCloseWitnesses(channelId));
+		},
 		'GET /ffor/witness/status': () => success(node.fforWitnessStatus()),
 		'GET /ffor/issuer/status': () => success(node.fforIssuerStatus()),
+		'GET /ffor/issuer/issued': async (body, query) => {
+			const b = body as { channelId?: string; issuerNodeId?: string };
+			return success(
+				await node.fforIssuedSlots(
+					query.get('channelId') || b.channelId,
+					query.get('issuerNodeId') || b.issuerNodeId
+				)
+			);
+		},
 		// Reverse swap provider (issue #737): terms and exposure, the ledger,
 		// and an operator cancel of a swap nothing has moved for yet.
 		'GET /swaps/status': () => success(node.getSwapsStatus()),
