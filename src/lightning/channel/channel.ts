@@ -13080,6 +13080,7 @@ export class Channel {
 	 * and the adds cannot happen inside one synchronous drive.
 	 */
 	canOfferHtlcSet(amounts: bigint[]): boolean {
+		if (amounts.length > 0 && this._fforUpdateRefusal('add')) return false;
 		if (amounts.length === 0) return true;
 		if (
 			this._state.state !== ChannelState.NORMAL &&
@@ -13119,7 +13120,11 @@ export class Channel {
 		return true;
 	}
 
-	acceptsNewHtlcs(lookThroughReestablish = false): boolean {
+	acceptsNewHtlcs(
+		lookThroughReestablish = false,
+		reservationHint = false
+	): boolean {
+		if (!reservationHint && this._fforUpdateRefusal('add')) return false;
 		if (this._state.restoreRecencyUnproven === true) return false;
 		if (this._state.fundingUnaccounted === true) return false;
 		return this.isHtlcUsable(lookThroughReestablish);

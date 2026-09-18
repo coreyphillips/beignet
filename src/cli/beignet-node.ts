@@ -5,6 +5,7 @@
  * and ElectrumBackend behind a single class with plain JSON return types.
  */
 
+import { FforReceiveService, FforReceiveFunding } from './ffor-receive';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as net from 'net';
@@ -533,6 +534,7 @@ export interface BeignetNodeOptions {
 	};
 	fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number };
 	fforIssuer?: boolean;
+	fforReceiveFunding?: FforReceiveFunding;
 	/** Bearer token every guardian session must present; absent runs open. */
 	guardianToken?: string;
 	/** Disk one served set may occupy before writes are refused (256 MiB). */
@@ -1404,6 +1406,11 @@ function isHeldRestore(ch: { restoreRecencyUnproven?: boolean }): boolean {
 }
 
 export class BeignetNode extends EventEmitter {
+	private fforReceiveService?: FforReceiveService;
+	getFforReceiveService(): FforReceiveService {
+		if (!this.fforReceiveService) throw new Error('Wallet is not running');
+		return this.fforReceiveService;
+	}
 	// ─── Typed event overloads ───
 	on<K extends keyof BeignetNodeEvents>(
 		event: K,
@@ -2454,6 +2461,12 @@ export class BeignetNode extends EventEmitter {
 			watchtowers: opts.watchtowers,
 			recovery: this.recoveryNodeConfig
 		});
+
+		this.fforReceiveService = new FforReceiveService(
+			this,
+			opts.fforSettle,
+			opts.fforReceiveFunding
+		);
 
 		// If the wallet sweep address couldn't be resolved yet (e.g. Electrum was
 		// down at startup), keep retrying and redirect sweeps to the wallet as
@@ -6919,6 +6932,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	fforCreateInvoice(body: {
+		expirySecs?: number;
 		channelId?: string;
 		k?: number;
 		description?: string;
@@ -6931,7 +6945,8 @@ export class BeignetNode extends EventEmitter {
 			const inv = this.node.createFforVoucherInvoice(
 				idBuf.toString('hex'),
 				body.k,
-				body.description ?? 'FFOR voucher'
+				body.description ?? 'FFOR voucher',
+				body.expirySecs
 			);
 			const f = this.node.getFforEpoch(idBuf.toString('hex'));
 			return {
@@ -12121,6 +12136,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Lifecycle ───────────────
 
 	async gracefulShutdown(timeoutMs = 30_000): Promise<void> {
+		this.fforReceiveService?.stop();
 		if (this.destroyed) return;
 		this.destroyed = true;
 		if (this.backupTimer) {
@@ -12162,6 +12178,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async destroy(): Promise<void> {
+		this.fforReceiveService?.stop();
 		this._bolt8Transport?.close();
 		this._bolt8Transport = null;
 		if (this._retireTimer) {

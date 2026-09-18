@@ -34,7 +34,7 @@ export const BEIGNET_CUSTOM_MAX_PAYLOAD = 65_535 - 2 - 4;
  * 1, 2, 4 and 5 belong to JIT receive, 16 to 22 to direct funding, and 32
  * to 47 to recovery guardian sessions (issue #699), 48 to 55 to the
  * swap provider (issue #737), and 64 to 65 to splice conflict recovery
- * (issue #760). 3 (LIQUIDITY_POLICY) and 20
+ * (issue #760), and 80 to 81 to automatic offline receiving. 3 (LIQUIDITY_POLICY) and 20
  * (DIRECT_FUNDING_ABORT) are numbers the LFBW fork declared but never used;
  * they stay reserved and deliberately unimplemented.
  */
@@ -93,7 +93,9 @@ export enum BeignetCustomSubtype {
 	SPLICE_CONFLICT = 64,
 	/** The peer's answer: agreed (it verified and reverted) or not, with a
 	 *  reason. */
-	SPLICE_CONFLICT_ACK = 65
+	SPLICE_CONFLICT_ACK = 65,
+	FFOR_RECEIVE_REQUEST = 80,
+	FFOR_RECEIVE_RESPONSE = 81
 }
 
 export interface ICustomMessage {

@@ -801,6 +801,7 @@ export interface BeignetConfig {
 	/** FFOR BOLT 12 issuer (spec section 9.7); needs the witness. Env:
 	 *  BEIGNET_FFOR_ISSUER (exact true/false). */
 	fforIssuer?: boolean;
+	fforReceiveFunding?: import('./ffor-receive').FforReceiveFunding;
 	/** Serve the reference guardian to other nodes over bolt8 sessions at
 	 *  this node's Lightning address (docs/RECOVERY-GUARDIAN-WIRE.md 2.7,
 	 *  issue #699). Needs listenPort. Independent of this node's own

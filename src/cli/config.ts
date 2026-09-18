@@ -536,6 +536,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			file.recoveryAutoApplyMaxWaitMs,
 		// FFOR roles (issue #729): exact true/false, like the guardian flag,
 		// because each one changes what this node promises other nodes.
+		fforReceiveFunding: cliFlags.fforReceiveFunding ?? file.fforReceiveFunding,
 		fforSettle:
 			cliFlags.fforSettle ??
 			(process.env.BEIGNET_FFOR_SETTLE === 'true' ||
