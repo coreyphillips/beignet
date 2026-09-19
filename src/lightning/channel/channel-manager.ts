@@ -659,18 +659,21 @@ export class ChannelManager extends EventEmitter {
 	private zeroConfManager: ZeroConfManager = new ZeroConfManager();
 	private _nextChannelIndex = 1;
 	/**
-	 * Issue #906: armed when the boot found NO key-index row (no high-water
-	 * mark to seed the counter from), or when the database carries the
-	 * durable row such a boot wrote (the node persists every raise, see
-	 * LightningNode.persistChannelIndexFloor). While armed, the next index
-	 * is floored at the chain tip whenever a height is learned: block height
-	 * is monotone across any number of device losses. The guarantee is
-	 * BOUNDED, not absolute: the floor is the tip itself, and every further
-	 * open on that boot runs ahead of it, so a device that opened k channels
-	 * at tip H consumed H..H+k-1, and a bare-seed restore fewer than k
-	 * blocks later, or a second restore of the same seed at the same tip,
-	 * lands inside that range. The issue accepts the bound (a wallet never
-	 * opens more channels than blocks elapse between two device losses).
+	 * Issue #906: armed on a boot whose database has no record of the next
+	 * channel key index yet (no key-index row and no persisted floor, see
+	 * LightningNode.restoreFromStorage). While armed, the FIRST real height
+	 * learned, a header or a height the node already knew, floors the next
+	 * index at it (max(current, tip)) and disarms: the floor fires once per
+	 * database, the node persists the value it reached, and every later
+	 * boot seeds the counter from that row beside the table's own high-water
+	 * mark, with no header moving it again. Block height is monotone across
+	 * any number of device losses, so a bare-seed boot at tip H starts at H,
+	 * above every index any device burned at a lower tip, and the distance
+	 * between the indices this device burns and the floor a future restore
+	 * picks grows with the blocks elapsed in between. The guarantee is
+	 * BOUNDED, not absolute: two restores of one seed inside the same block
+	 * both start at H, which is split brain, and the fence, not the floor,
+	 * is the answer there.
 	 */
 	private _channelIndexTipFloor = false;
 	/** Wallet-owned destination for cooperative-close payouts, if configured. */
@@ -751,27 +754,36 @@ export class ChannelManager extends EventEmitter {
 
 	/**
 	 * Arm the chain-tip floor on the next channel index (issue #906). The
-	 * node calls this when its key-index table is EMPTY, or when the
-	 * database carries the floor row an earlier such boot wrote: with no row
-	 * to seed from, the counter would start at 1 and the next channel,
-	 * opened OR accepted, would derive byte for byte the funding key,
-	 * basepoints and per-commitment seed of whichever channel a previous
-	 * device held at index 1. The floor is max(current, tip), applied now
-	 * from any height already known and again on every block, and it only
-	 * ever raises the counter. A table that was populated on every boot of
-	 * its life never arms it: its own high-water mark already implies every
-	 * index that was ever handed out. The floor's reach is bounded, see
-	 * _channelIndexTipFloor: indices may sit up to k-1 blocks above the tip
-	 * after k opens in one block, and two restores at one tip collide.
+	 * node calls this on a birth boot: no key-index row and no persisted
+	 * floor, so nothing records what a previous device holding this seed
+	 * handed out, and a counter left at 1 would give the next channel,
+	 * opened OR accepted, byte for byte the funding key, basepoints and
+	 * per-commitment seed of whichever channel that device held at index 1.
+	 * The floor is max(current, tip), taken ONCE from the first real height
+	 * (the one passed here when the node already knows it, else the first
+	 * header), after which it disarms; it only ever raises the counter. A
+	 * table that was populated on every boot of its life never arms it: its
+	 * own high-water mark already implies every index ever handed out.
 	 */
 	armChannelIndexTipFloor(knownTipHeight = 0): void {
 		this._channelIndexTipFloor = true;
 		this._applyChannelIndexTipFloor(knownTipHeight);
 	}
 
+	/**
+	 * True while the chain-tip floor is armed and no real height has fired
+	 * it yet (issue #906): the node persists the floor the moment this turns
+	 * false, and a restart before then is a birth boot again.
+	 */
+	get channelIndexTipFloorArmed(): boolean {
+		return this._channelIndexTipFloor;
+	}
+
 	private _applyChannelIndexTipFloor(height: number): void {
 		if (!this._channelIndexTipFloor) return;
 		const floor = Math.max(height, this._currentBlockHeight);
+		if (floor <= 0) return;
+		this._channelIndexTipFloor = false;
 		if (floor > this._nextChannelIndex) this._nextChannelIndex = floor;
 	}
 
