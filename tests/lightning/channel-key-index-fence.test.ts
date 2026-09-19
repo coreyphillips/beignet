@@ -10,7 +10,9 @@
  *  - the fence (newChannelsRefused): while the predicate answers a reason,
  *    every entry point refuses with it and no index is consumed;
  *  - the floor: a boot with NO key-index row floors the next index at the
- *    chain tip once a height is known and never lowers it.
+ *    chain tip once a height is known and never lowers it; the counter it
+ *    reaches is persisted, so a partial restore on that boot (rows below
+ *    the floor) cannot hand the NEXT boot a burned index either.
  */
 
 import { expect } from 'chai';
@@ -21,6 +23,8 @@ import * as path from 'path';
 import * as bip32 from 'bip32';
 import * as bip39 from 'bip39';
 import * as ecc from '@bitcoinerlab/secp256k1';
+import { IScbChannelEntry } from '../../src/lightning/backup/scb';
+import { Channel } from '../../src/lightning/channel/channel';
 import {
 	ChannelManager,
 	IChannelManagerConfig,
@@ -59,6 +63,8 @@ const TIP = 850_000;
 const REASON = 'new channels refused: the restore outcome is not known (test)';
 const LSP_PUBKEY = '02' + 'ab'.repeat(32);
 const WALLET_PUBKEY = '03' + 'cd'.repeat(32);
+/** Where LightningNode keeps the floor's durable row (issue #906 review). */
+const FLOOR_KEY = 'channel_key_index_floor';
 const noop = (): void => {};
 
 // ─── Helpers ───
@@ -266,6 +272,94 @@ function hiding(storage: SqliteStorage, hidden: string[]): IStorageBackend {
 			return typeof value === 'function' ? value.bind(target) : value;
 		}
 	}) as IStorageBackend;
+}
+
+/** The keys this seed derives at `index`: what a previous device used. */
+function keysAt(index: number): ReturnType<typeof deriveChannelKeys> {
+	const root = BIP32Factory.fromSeed(bip39.mnemonicToSeedSync(MNEMONIC));
+	return deriveChannelKeys(root, LnCoinType.REGTEST, index);
+}
+
+/** The funding pubkey, revocation basepoint and seed of `channel` differ from the keys at `index`. */
+function expectKeysDiffer(channel: Channel, index: number): void {
+	const state = channel.getFullState();
+	const other = keysAt(index);
+	expect(
+		state.localBasepoints.fundingPubkey.equals(
+			other.channelBasepoints.fundingPubkey
+		),
+		`funding pubkey at index ${index}`
+	).to.equal(false);
+	expect(
+		state.localBasepoints.revocationBasepoint.equals(
+			other.channelBasepoints.revocationBasepoint
+		),
+		`revocation basepoint at index ${index}`
+	).to.equal(false);
+	expect(
+		state.localPerCommitmentSeed.equals(other.perCommitmentSeed),
+		`per-commitment seed at index ${index}`
+	).to.equal(false);
+}
+
+/**
+ * The liquidity peer opens inbound (automatic offline receive): no operator
+ * action, and the acceptor derives the channel's keys. Returns the channel
+ * the node registered for it.
+ */
+function acceptLspOpen(node: LightningNode, tag: string): Channel {
+	const manager = node.getChannelManager();
+	const lsp = makeManager(tag);
+	const open = offerOpen(lsp, WALLET_PUBKEY);
+	const result = inbound(
+		manager,
+		LSP_PUBKEY,
+		MessageType.OPEN_CHANNEL,
+		open.payload
+	);
+	expect(result.wireErrors).to.deep.equal([]);
+	const channel = manager.getTempChannel(open.tempId);
+	expect(channel, 'the open was accepted').to.not.equal(undefined);
+	return channel!;
+}
+
+/** A peer node id validateScbEntry accepts (it checks the curve). */
+const SCB_PEER = getPublicKey(derivePrivkey(makeSeed('scb-peer'), 0)).toString(
+	'hex'
+);
+
+/** The previous device's channel at `index`, as its static backup recorded it. */
+function scbEntry(index: number): IScbChannelEntry {
+	return {
+		channelId: crypto
+			.createHash('sha256')
+			.update(`ckif-scb-channel-${index}`)
+			.digest('hex'),
+		peerNodeId: SCB_PEER,
+		peerAddresses: [],
+		fundingTxid: crypto
+			.createHash('sha256')
+			.update(`ckif-scb-funding-${index}`)
+			.digest('hex'),
+		fundingOutputIndex: 0,
+		fundingSatoshis: '100000',
+		channelKeyIndex: index,
+		channelType: '',
+		role: 'ACCEPTOR',
+		isTaproot: false,
+		isAnchor: false
+	};
+}
+
+/** The MuSig2 verification nonce `channel` derives for `height`. */
+function verificationNonce(channel: Channel, height: bigint): Buffer {
+	return Buffer.from(
+		(
+			channel as unknown as {
+				_deriveVerificationNonce(h: bigint): Uint8Array;
+			}
+		)._deriveVerificationNonce(height)
+	);
 }
 
 // ─── The fence ───
@@ -505,8 +599,14 @@ describe('Channel key index floor (issue #906)', () => {
 				state.localPerCommitmentSeed.equals(fresh.perCommitmentSeed)
 			).to.equal(true);
 
+			// The floor is durable: its row holds the counter the header
+			// raised it to.
+			expect(storage.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+
 			// Once the channel is journaled, a second boot continues from
-			// storage alone: no floor is armed, and headers no longer move it.
+			// storage alone (H + 1 before any header); and a database born
+			// from a bare-seed boot keeps the floor armed for its life, so
+			// later headers keep the counter at the tip and in the row.
 			storage.saveChannelKeyIndex(open.tempId.toString('hex'), TIP);
 			node.destroy();
 			const reopened = new SqliteStorage(dbPath);
@@ -514,7 +614,8 @@ describe('Channel key index floor (issue #906)', () => {
 			second = bootNode(reopened);
 			expect(second.getChannelManager().nextChannelIndex).to.equal(TIP + 1);
 			second.handleNewBlock(TIP + 500);
-			expect(second.getChannelManager().nextChannelIndex).to.equal(TIP + 1);
+			expect(second.getChannelManager().nextChannelIndex).to.equal(TIP + 500);
+			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(TIP + 500));
 		} finally {
 			if (second) second.destroy();
 			else node.destroy();
@@ -533,6 +634,8 @@ describe('Channel key index floor (issue #906)', () => {
 				expect(node.getChannelManager().nextChannelIndex).to.equal(expected);
 				node.handleNewBlock(TIP);
 				expect(node.getChannelManager().nextChannelIndex).to.equal(expected);
+				// And no floor row is written: the table is its own record.
+				expect(storage.loadMetadata(FLOOR_KEY)).to.equal(null);
 			} finally {
 				node.destroy();
 				storage.close();
@@ -569,5 +672,160 @@ describe('Channel key index floor (issue #906)', () => {
 				populated.close();
 			}
 		}
+	});
+
+	it('a partial SCB restore that drops the highest-index entry never reaches it, on that boot or the next', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ckif-'));
+		const dbPath = path.join(dir, 'wallet.db');
+		const storage = new SqliteStorage(dbPath);
+		storage.open();
+		const node = bootNode(storage);
+		let second: LightningNode | null = null;
+		try {
+			const manager = node.getChannelManager();
+			node.handleNewBlock(TIP);
+			expect(manager.nextChannelIndex).to.equal(TIP);
+
+			// The previous device held indices 1..4 and its backup lost the
+			// entry at 4 (the issue's second UNSAFE scenario): 1..3 come back,
+			// so the table's own high-water mark now reads 4, the very index
+			// the dropped channel burned. Restore only ever raises the
+			// counter, so the floor stands.
+			const result = await node.recoverFromStaticChannelBackup(
+				[1, 2, 3].map(scbEntry)
+			);
+			expect(result.skipped).to.deep.equal([]);
+			expect(result.recovering).to.have.length(3);
+			expect(storage.loadNextChannelIndex()).to.equal(4);
+			expect(manager.nextChannelIndex).to.equal(TIP);
+
+			// The next open derives above the dropped index.
+			const first = acceptLspOpen(node, 'lsp-partial-1');
+			expect(first.channelKeyIndex).to.equal(TIP);
+			for (const idx of [1, 2, 3, 4]) expectKeysDiffer(first, idx);
+			expect(manager.nextChannelIndex).to.equal(TIP + 1);
+
+			// The row records the counter, consumed index included, at the
+			// next header; that channel's own row never lands (a temporary
+			// channel has none). Then the process restarts.
+			node.handleNewBlock(TIP + 1);
+			expect(storage.loadMetadata(FLOOR_KEY)).to.equal(String(TIP + 1));
+			node.destroy();
+
+			// Boot 2 reads a POPULATED table whose top index is the dropped
+			// channel's predecessor: without the row the floor would not arm
+			// and the counter would be 4. From the row alone, before any
+			// header, it is TIP + 1, and the LSP's open lands there.
+			const reopened = new SqliteStorage(dbPath);
+			reopened.open();
+			expect(reopened.loadNextChannelIndex()).to.equal(4);
+			second = bootNode(reopened);
+			const again = second.getChannelManager();
+			expect(again.nextChannelIndex).to.equal(TIP + 1);
+			const opened = acceptLspOpen(second, 'lsp-partial-2');
+			expect(opened.channelKeyIndex).to.equal(TIP + 1);
+			for (const idx of [1, 2, 3, 4, TIP]) expectKeysDiffer(opened, idx);
+			// No two channels share a per-commitment seed across the restart.
+			expect(
+				opened
+					.getFullState()
+					.localPerCommitmentSeed.equals(
+						first.getFullState().localPerCommitmentSeed
+					)
+			).to.equal(false);
+			// The reopened database keeps the floor armed.
+			second.handleNewBlock(TIP + 9);
+			expect(again.nextChannelIndex).to.equal(TIP + 9);
+			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(TIP + 9));
+		} finally {
+			if (second) second.destroy();
+			else node.destroy();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('a bare-seed boot that restores before its first header still floors the next boot', async () => {
+		// The birth boot never learns a tip (the daemon fences opens until
+		// it does), a partial SCB restore lands rows 1..3, and the process
+		// restarts. The table is populated on boot 2, so only the row this
+		// boot wrote at arm time can re-arm the floor there.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ckif-'));
+		const dbPath = path.join(dir, 'wallet.db');
+		const storage = new SqliteStorage(dbPath);
+		storage.open();
+		const node = bootNode(storage);
+		let second: LightningNode | null = null;
+		try {
+			expect(storage.loadMetadata(FLOOR_KEY)).to.equal('1');
+			const result = await node.recoverFromStaticChannelBackup(
+				[1, 2, 3].map(scbEntry)
+			);
+			expect(result.skipped).to.deep.equal([]);
+			expect(node.getChannelManager().nextChannelIndex).to.equal(4);
+			node.destroy();
+
+			const reopened = new SqliteStorage(dbPath);
+			reopened.open();
+			second = bootNode(reopened);
+			const manager = second.getChannelManager();
+			// Nothing better is known yet: the table's 4 stands until the
+			// first header, which floors it at the tip.
+			expect(manager.nextChannelIndex).to.equal(4);
+			second.handleNewBlock(TIP);
+			expect(manager.nextChannelIndex).to.equal(TIP);
+			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			const opened = acceptLspOpen(second, 'lsp-blind');
+			expect(opened.channelKeyIndex).to.equal(TIP);
+			for (const idx of [1, 2, 3, 4]) expectKeysDiffer(opened, idx);
+		} finally {
+			if (second) second.destroy();
+			else node.destroy();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+// ─── The verification nonce ───
+
+describe('Channel key index and the taproot verification nonce (issue #906)', () => {
+	it('two channels at one key index share every verification nonce; distinct indices never do', () => {
+		// The nonce is HMAC(localPerCommitmentSeed, tag || height), and the
+		// seed is a pure function of the key index: two channels at one
+		// index sign two sighashes under one secnonce at any shared height,
+		// which is the collision the floor removes.
+		const peer = '02' + 'dd'.repeat(32);
+		const first = makeManager('nonce-first');
+		const a = first.openChannel(peer, 100_000n);
+		const b = first.openChannel('02' + 'de'.repeat(32), 100_000n);
+		expect(a.channelKeyIndex).to.equal(1);
+		expect(b.channelKeyIndex).to.equal(2);
+		// A second node from the same seed, counting from 1 again.
+		const second = makeManager('nonce-second');
+		const c = second.openChannel(peer, 100_000n);
+		expect(c.channelKeyIndex).to.equal(1);
+		// A floored one: its first channel sits at the tip.
+		const floored = makeManager('nonce-floored');
+		floored.armChannelIndexTipFloor(TIP);
+		const d = floored.openChannel(peer, 100_000n);
+		expect(d.channelKeyIndex).to.equal(TIP);
+
+		for (const height of [0n, 1n, 42n]) {
+			const nonceA = verificationNonce(a, height);
+			// Same index, same seed: the same nonce at the same height.
+			expect(nonceA.equals(verificationNonce(c, height))).to.equal(true);
+			// Distinct indices: distinct nonces at the same height.
+			expect(nonceA.equals(verificationNonce(b, height))).to.equal(false);
+			expect(nonceA.equals(verificationNonce(d, height))).to.equal(false);
+			expect(
+				verificationNonce(b, height).equals(verificationNonce(d, height))
+			).to.equal(false);
+		}
+		// Reproducible, and distinct across heights within one channel.
+		expect(verificationNonce(a, 7n).equals(verificationNonce(a, 7n))).to.equal(
+			true
+		);
+		expect(verificationNonce(a, 7n).equals(verificationNonce(a, 8n))).to.equal(
+			false
+		);
 	});
 });
