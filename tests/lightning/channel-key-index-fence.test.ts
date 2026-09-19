@@ -6,18 +6,20 @@
  * A node booted from the mnemonic alone would hand its first channel index
  * 1 and derive the funding key, basepoints and per-commitment seed of
  * whatever channel a previous device held there, live or closed. Two guards
- * close that:
+ * reduce that risk:
  *  - the fence (newChannelsRefused): while the predicate answers a reason,
  *    every entry point refuses with it and no index is consumed;
  *  - the floor: a birth boot (no key-index row, no persisted floor) floors
  *    the next index at the first real chain tip it learns times
  *    CHANNEL_INDEX_FLOOR_STRIDE (128 indices per block, since indices are
- *    consumed per channel while the floor advances per block; the product
+ *    consumed per open attempt reaching derivation, including later rejected
+ *    attempts, while the floor advances per block; the product
  *    clamped at CHANNEL_INDEX_FLOOR_MAX, below the hardened derivation
  *    limit), ONCE, and never lowers it; the value is persisted, every later
  *    boot seeds the counter from max(table, floor) with no header moving
  *    it, and a partial restore on the birth boot (rows below the floor)
- *    cannot hand the NEXT boot a burned index either.
+ *    cannot lower the NEXT boot below that floor. This spacing is bounded:
+ *    same-block restores and attempts beyond the stride budget can collide.
  */
 
 import { expect } from 'chai';
@@ -53,6 +55,10 @@ import {
 	LnCoinType
 } from '../../src/lightning/keys/wallet-keys';
 import {
+	decodeOpenChannelMessage,
+	encodeOpenChannelMessage
+} from '../../src/lightning/message/channel-open';
+import {
 	encodeOpenChannel2Message,
 	IOpenChannel2Message
 } from '../../src/lightning/message/dual-funding';
@@ -65,7 +71,7 @@ import { IStorageBackend } from '../../src/lightning/storage/types';
 const BIP32Factory = bip32.BIP32Factory(ecc);
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
-/** A mainnet-scale tip: far above any index a wallet reaches by counting. */
+/** A mainnet-scale height used by these fixtures. */
 const TIP = 850_000;
 /** Where the floor lands for a birth boot at TIP: the stride's worth per block. */
 const FLOOR = TIP * CHANNEL_INDEX_FLOOR_STRIDE;
@@ -552,7 +558,8 @@ describe('Channel key index floor (issue #906)', () => {
 		known.handleNewBlock(TIP + 10);
 		expect(known.nextChannelIndex).to.equal(FLOOR);
 
-		// Why the stride: indices are consumed per channel, the floor moves
+		// Why the stride: indices are consumed per attempt reaching derivation,
+		// even if validation later rejects it, while the floor moves
 		// per block. A device born at TIP whose LSP opens three channels
 		// across two blocks burns three indices; a second device restored
 		// from the same seed two blocks later starts above all of them,
@@ -573,8 +580,8 @@ describe('Channel key index floor (issue #906)', () => {
 		expect(later.nextChannelIndex).to.be.above(FLOOR + 2);
 		expect(TIP + 2).to.be.below(FLOOR + 2);
 		// The residual the floor does not cover: a second device restored
-		// within the SAME block starts where the first did. That is split
-		// brain, for the fence and the confirmed-empty marker (#909 D9).
+		// within the SAME block starts where the first did. The active-restore
+		// fence does not prevent two idle devices from opening there.
 		const sameBlock = makeManager('same-block-device');
 		sameBlock.armChannelIndexTipFloor(TIP);
 		expect(sameBlock.nextChannelIndex).to.equal(burned[0]);
@@ -589,6 +596,60 @@ describe('Channel key index floor (issue #906)', () => {
 		plain.handleNewBlock(TIP);
 		expect(plain.nextChannelIndex).to.equal(1);
 		expect(plain.channelIndexTipFloorArmed).to.equal(false);
+	});
+
+	it('later rejected open attempts consume the stride budget and can overlap the next-height floor', () => {
+		const earlier = makeManager('rejected-attempts-earlier');
+		earlier.armChannelIndexTipFloor(TIP);
+		const lsp = makeManager('rejected-attempts-lsp');
+		const offered = offerOpen(lsp, WALLET_PUBKEY);
+		const rejected = decodeOpenChannelMessage(offered.payload);
+		// This is a decodable open on the correct chain. The manager derives
+		// keys before Channel rejects the zero funding amount.
+		rejected.fundingSatoshis = 0n;
+		for (let i = 0; i < CHANNEL_INDEX_FLOOR_STRIDE; i++) {
+			rejected.temporaryChannelId = Buffer.alloc(32);
+			rejected.temporaryChannelId.writeUInt32BE(i + 1, 28);
+			const result = inbound(
+				earlier,
+				LSP_PUBKEY,
+				MessageType.OPEN_CHANNEL,
+				encodeOpenChannelMessage(rejected)
+			);
+			expect(result.wireTypes).to.deep.equal([MessageType.ERROR]);
+			expect(result.wireErrors).to.have.length(1);
+			expect(result.wireErrors[0].data).to.match(
+				/funding_satoshis.*greater than 0/
+			);
+			expect(
+				result.wireErrors[0].channelId.equals(rejected.temporaryChannelId)
+			).to.equal(true);
+			expect(earlier.getTempChannel(rejected.temporaryChannelId)).to.equal(
+				undefined
+			);
+			expect(earlier.nextChannelIndex).to.equal(FLOOR + i + 1);
+		}
+
+		// No rejected attempt funded a channel, but all 128 consumed an index.
+		// The next attempt uses the next block's floor, so a fresh device with
+		// the same deterministic deriver can allocate the identical keys.
+		const later = makeManager('rejected-attempts-later');
+		later.armChannelIndexTipFloor(TIP + 1);
+		expect(later.nextChannelIndex).to.equal(earlier.nextChannelIndex);
+		const a = earlier.openChannel(LSP_PUBKEY, 100_000n);
+		const b = later.openChannel(LSP_PUBKEY, 100_000n);
+		expect(a.channelKeyIndex).to.equal(FLOOR + CHANNEL_INDEX_FLOOR_STRIDE);
+		expect(b.channelKeyIndex).to.equal(a.channelKeyIndex);
+		const aState = a.getFullState();
+		const bState = b.getFullState();
+		expect(
+			aState.localBasepoints.fundingPubkey.equals(
+				bState.localBasepoints.fundingPubkey
+			)
+		).to.equal(true);
+		expect(
+			aState.localPerCommitmentSeed.equals(bState.localPerCommitmentSeed)
+		).to.equal(true);
 	});
 
 	it('clamps the floor from an implausible height below the hardened derivation limit', () => {
@@ -660,7 +721,7 @@ describe('Channel key index floor (issue #906)', () => {
 		expect(higher.nextChannelIndex).to.equal(CHANNEL_INDEX_FLOOR_MAX + 5);
 	});
 
-	it('a bare-seed boot starts at the tip times the stride and derives keys no earlier device could have used', () => {
+	it('a bare-seed boot starts at the tip times the stride and avoids previously used low indices', () => {
 		// File-backed: the second boot reopens what the first one journaled
 		// (destroy() closes the storage a node was given).
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ckif-'));
@@ -836,7 +897,7 @@ describe('Channel key index floor (issue #906)', () => {
 		}
 	});
 
-	it('a partial SCB restore that drops the highest-index entry never reaches it, on that boot or the next', async () => {
+	it('a partial SCB restore cannot reuse an omitted index below the persisted floor on either boot', async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ckif-'));
 		const dbPath = path.join(dir, 'wallet.db');
 		const storage = new SqliteStorage(dbPath);
@@ -1028,7 +1089,7 @@ describe('Channel key index and the taproot verification nonce (issue #906)', ()
 		// The nonce is HMAC(localPerCommitmentSeed, tag || height), and the
 		// seed is a pure function of the key index: two channels at one
 		// index sign two sighashes under one secnonce at any shared height,
-		// which is the collision the floor removes.
+		// which distinct indices avoid. The floor provides bounded separation.
 		const peer = '02' + 'dd'.repeat(32);
 		const first = makeManager('nonce-first');
 		const a = first.openChannel(peer, 100_000n);

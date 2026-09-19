@@ -333,10 +333,10 @@ export interface IChannelManagerConfig {
 	 * included, and read anew each time. A non-null answer is the reason the
 	 * open is refused with: on the wire as a BOLT 1 error for an inbound
 	 * open_channel or open_channel2, as a throw for an outbound open; no
-	 * index is consumed either way. The daemon supplies it while the boot's
-	 * restore outcome or the chain tip is still unknown, when a fresh index
-	 * could collide with one a previous device burned. Unset, every open is
-	 * allowed exactly as before.
+	 * index is consumed either way. The daemon supplies it during active
+	 * capsule auto-apply or a rebuild, and while its block height is zero.
+	 * Idle or refused auto-apply permits opens at a nonzero height. Unset,
+	 * every open is allowed exactly as before.
 	 */
 	newChannelsRefused?: () => string | null;
 	/**
@@ -508,15 +508,15 @@ const MAX_UNKNOWN_REESTABLISH_HOLD_MS = 2_147_483_647;
 const MAX_WIRE_ERROR_DATA_BYTES = 0xffff;
 
 /**
- * Issue #906: how many channel key indices the chain-tip floor reserves per
+ * Issue #906: how many channel key indices the chain-tip floor spaces per
  * block. A birth boot (no key-index row, no persisted floor) starts the next
  * index at tip * CHANNEL_INDEX_FLOOR_STRIDE rather than at the tip itself,
- * because index consumption is per CHANNEL while the floor advances per
- * BLOCK: a floor of one index per block only clears what an earlier device
- * burned if that device opened fewer channels than blocks elapsed since its
- * own birth tip, and three opens across two blocks already break that. At
- * 128 indices per block an earlier device would have to open more than 128
- * channels per elapsed block to be caught up with. The index is a hardened
+ * because every open attempt that reaches key derivation consumes an index,
+ * including attempts that validation later rejects, while the floor advances
+ * per block. The spacing budget is 128 consumed indices per elapsed block,
+ * not 128 successfully funded channels, and no allocation rate limit enforces
+ * it. Same-block restores and allocations beyond that budget can still
+ * collide (see _channelIndexTipFloor). The index is a hardened
  * BIP32 child in the default deriver, so it must stay under 0x7fffffff
  * (2^31 - 1, MAX_BIP32_DERIVATION_INDEX in backup/scb.ts): 0x7fffffff / 128
  * is 16,777,215 blocks, over 300 years of mainnet at ten minutes a block and
@@ -700,17 +700,16 @@ export class ChannelManager extends EventEmitter {
 	 * the floor fires once per database, the node persists the value it
 	 * reached, and every later boot seeds the counter from that row beside
 	 * the table's own high-water mark, with no header moving it again.
-	 * Block height is monotone across any number of device losses, so a
-	 * bare-seed boot at tip H starts at H * 128, which is above every index
-	 * an earlier device burned PROVIDED that device opened fewer than 128
-	 * channels per block elapsed since its own birth tip (indices are
-	 * consumed per channel, the floor advances per block, and the stride is
-	 * the margin between the two). The guarantee is BOUNDED, not absolute:
-	 * the residual is any restore that violates that bound, and in
-	 * particular two devices restored from one seed within the same block
-	 * that both open channels, which both start at H * 128. That is split
-	 * brain, answered by the auto-apply fence and the future confirmed-empty
-	 * marker (#909 D9), not by the floor.
+	 * For unclamped heights H > H0, sequential allocation from H0 * 128
+	 * leaves every consumed index below a fresh boot's H * 128 while at
+	 * most 128 * (H - H0) indices have been consumed. Count every attempt
+	 * reaching derivation, including later rejected attempts, not just funded
+	 * channels.
+	 * This is bounded spacing, not a uniqueness guarantee or an enforced rate
+	 * limit. Same-block restores start at the same index, and stale heights
+	 * or allocations beyond the budget can also collide. The auto-apply
+	 * fence protects its active restore window; it does not fence another
+	 * running device or resolve these remaining collisions.
 	 */
 	private _channelIndexTipFloor = false;
 	/** Wallet-owned destination for cooperative-close payouts, if configured. */
@@ -801,8 +800,7 @@ export class ChannelManager extends EventEmitter {
 	 * real height (the one passed here when the node already knows it, else
 	 * the first header), after which it disarms; it only ever raises the
 	 * counter. A table that was populated on every boot of its life never
-	 * arms it: its own high-water mark already implies every index ever
-	 * handed out.
+	 * arms it: allocation continues from its stored high-water mark instead.
 	 */
 	armChannelIndexTipFloor(knownTipHeight = 0): void {
 		this._channelIndexTipFloor = true;

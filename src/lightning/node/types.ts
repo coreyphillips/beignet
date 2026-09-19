@@ -627,9 +627,9 @@ export interface INodeConfig {
 	 * Fence on brand-new channels (issue #906), passed through to the
 	 * channel manager: while it answers a reason, every open, outbound or
 	 * inbound, is refused with it and no channel key index is consumed. The
-	 * daemon supplies it for the window in which a fresh index could still
-	 * collide with one a previous device burned (restore outcome or chain
-	 * tip unknown). Unset, opens are never fenced.
+	 * daemon supplies it during active capsule auto-apply or a rebuild, and
+	 * while its block height is zero. Idle or refused auto-apply permits
+	 * opens at a nonzero height. Unset, opens are never fenced.
 	 */
 	newChannelsRefused?: () => string | null;
 	/** Per-peer rate limit config */
