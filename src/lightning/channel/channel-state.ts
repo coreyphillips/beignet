@@ -256,7 +256,8 @@ export interface IAbandonedLocalAdd {
 export type RecoveryCloseReason =
 	| 'local-data-loss'
 	| 'state-uncertain'
-	| 'restore-unproven';
+	| 'restore-unproven'
+	| 'reestablish-unproven';
 
 /**
  * Why WE closed (or are closing) the channel. 'user' means an API-initiated
@@ -953,6 +954,32 @@ export interface IChannelState {
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**
+	 * The peer's `channel_reestablish` claimed this row is behind and showed
+	 * no proof (issue #907): its next_revocation_number counted a
+	 * revoke_and_ack this row never sent (above localCommitmentNumber) while
+	 * its your_last_per_commitment_secret was not the secret at that index,
+	 * all zeroes included. A real secret there proves the gap and sets
+	 * dataLossDetected; a wrong one proves nothing in either direction. A peer
+	 * that holds our newer state but withholds the secret looks exactly like
+	 * one inventing the gap, and in the first case our latest commitment is
+	 * revoked in its view, so the channel fails (ERRORED, the validator's wire
+	 * error) and is then HELD exactly as a capsule restore is: no automatic
+	 * broadcast of our commitment (the errored close, the reestablish and
+	 * errored timeout backstops, the HTLC deadline backstops), no new HTLCs,
+	 * and a derived `reestablish-unproven` disposition that asks the peer to
+	 * close with ITS commitment on every reconnect.
+	 *
+	 * Deliberately not `stateUncertain`, which closes the operator's force
+	 * close as well. The claim is unverified, not proven, and a hostile peer
+	 * can make it at zero cost against a healthy channel, so the labelled
+	 * operator exit (acceptStaleStateRisk on the daemon's force close) stays
+	 * open here as it does for the restore hold: mustNotBroadcastCommitment
+	 * does not read this flag. Always set beside the ERRORED transition, so
+	 * the row never resumes; the peer's close or the operator's acknowledged
+	 * force close are the exits. MUST persist: a restart must not forget it.
+	 */
+	reestablishRecencyUnproven?: boolean;
+	/**
 	 * The operator's labelled acknowledgement (RECOVERY-PROTOCOL 5.6) that a
 	 * mutual close of this capsule-restored channel may sign away balances the
 	 * row cannot prove current (issue #469). Stamped only by initiateShutdown
@@ -1246,4 +1273,26 @@ export function mustNotBroadcastCommitment(state: {
 	stateUncertain?: boolean;
 }): boolean {
 	return state.dataLossDetected === true || state.stateUncertain === true;
+}
+
+/**
+ * The recency HOLD (issues #469 and #907): the row's recency cannot be
+ * proven, either because it came from a Recovery Capsule
+ * (restoreRecencyUnproven) or because the peer claimed at channel_reestablish
+ * that it is behind without showing the secret that would prove it
+ * (reestablishRecencyUnproven). Narrower than mustNotBroadcastCommitment: the
+ * node will not broadcast its commitment ON ITS OWN INITIATIVE (every
+ * automatic close is refused and the peer is asked to close instead), takes
+ * no new HTLCs and refuses a mutual close, but the operator's labelled force
+ * close stays open. Every hold site consults this ONE predicate so the two
+ * flags carry exactly the same semantics.
+ */
+export function isRecencyUnproven(state: {
+	restoreRecencyUnproven?: boolean;
+	reestablishRecencyUnproven?: boolean;
+}): boolean {
+	return (
+		state.restoreRecencyUnproven === true ||
+		state.reestablishRecencyUnproven === true
+	);
 }

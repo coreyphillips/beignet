@@ -532,6 +532,90 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 		).channels.delete(channelId);
 	});
 
+	it('POST /channel/forceclose refuses a reestablish-held channel without acceptStaleStateRisk, in its own words (issue #907)', async () => {
+		const node = daemon.node.getNode();
+		const {
+			createOpenerState
+		} = require('../../src/lightning/channel/channel-state');
+		const { Channel } = require('../../src/lightning/channel/channel');
+		const {
+			ChannelState,
+			DEFAULT_CHANNEL_CONFIG
+		} = require('../../src/lightning/channel/types');
+		const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+		const point = getPublicKey(crypto.randomBytes(32));
+		const bp = {
+			fundingPubkey: point,
+			revocationBasepoint: point,
+			paymentBasepoint: point,
+			delayedPaymentBasepoint: point,
+			htlcBasepoint: point,
+			firstPerCommitmentPoint: point
+		};
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 100_000n,
+			pushMsat: 0n,
+			localConfig: DEFAULT_CHANNEL_CONFIG,
+			localBasepoints: bp,
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		// The shape handleReestablish leaves behind: failed with the
+		// validator's wire error, and the hold stamped beside it. Nothing was
+		// restored here, so the refusal must not say so.
+		state.state = ChannelState.ERRORED;
+		state.channelId = crypto.randomBytes(32);
+		state.fundingTxid = crypto.randomBytes(32);
+		state.remoteBasepoints = bp;
+		state.reestablishRecencyUnproven = true;
+		node
+			.getChannelManager()
+			.restoreChannel(
+				new Channel(state),
+				crypto.randomBytes(33).toString('hex')
+			);
+		const channelId = state.channelId.toString('hex');
+
+		const refused = await request(
+			portOf(daemon),
+			'POST',
+			'/channel/forceclose',
+			{ channelId }
+		);
+		expect(refused.status).to.equal(400);
+		expect((refused.body.error as { code: string }).code).to.equal(
+			'INVALID_PARAMS'
+		);
+		const message = (refused.body.error as { message: string }).message;
+		expect(message).to.match(/acceptStaleStateRisk/);
+		// This case, not the capsule's.
+		expect(message).to.match(/claimed at channel_reestablish/);
+		expect(message).to.match(/showed no proof/);
+		expect(message).to.not.match(/Recovery Capsule/);
+		expect(message).to.not.match(/restored/);
+
+		// With the acknowledgement it reaches the engine: the hold is never a
+		// refusal to the operator, which is the whole point of not making
+		// this StateUncertain.
+		const accepted = await request(
+			portOf(daemon),
+			'POST',
+			'/channel/forceclose',
+			{ channelId, acceptStaleStateRisk: true }
+		);
+		expect(
+			(accepted.body.error as { message?: string } | undefined)?.message ?? '',
+			'the acknowledgement is not what stops it'
+		).to.not.match(/acceptStaleStateRisk/);
+
+		// Shared daemon: take the fixture channel back out.
+		(
+			node.getChannelManager() as unknown as {
+				channels: Map<string, unknown>;
+			}
+		).channels.delete(channelId);
+	});
+
 	it('POST /channel/close refuses a capsule-restored channel without acceptStaleStateRisk (issue #469)', async () => {
 		const node = daemon.node.getNode();
 		const {

@@ -39,6 +39,17 @@ export enum ChannelRecoveryStatus {
 	 * close or the operator's acknowledged close (either kind) resolves it.
 	 */
 	RestoreRecencyUnproven = 'restore_recency_unproven',
+	/**
+	 * Failed because the peer's channel_reestablish claimed this node is
+	 * behind and showed no proof: a next_revocation_number above what this
+	 * row ever released with a your_last_per_commitment_secret that is not
+	 * the secret at that index, zeroes included (issue #907). The same hold
+	 * as RestoreRecencyUnproven, from a different origin: no AUTOMATIC close
+	 * will broadcast its commitment, it takes no new HTLCs, and the peer is
+	 * asked to close on every reconnect. The peer's close or the operator's
+	 * acknowledged force close (acceptStaleStateRisk) resolves it.
+	 */
+	ReestablishRecencyUnproven = 'reestablish_recency_unproven',
 	Active = 'active',
 	ForceClosing = 'force_closing'
 }
