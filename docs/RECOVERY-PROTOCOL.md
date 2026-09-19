@@ -646,6 +646,8 @@ export enum ChannelRecoveryStatus {
 
 `RestoreRecencyUnproven` (issue #469) is the same never-broadcast invariant applied to a channel that is otherwise HEALTHY, and it is the one case where the escape hatch above is no longer out of scope. A Tier 2 capsule restore cannot prove its recency and never will, so its automatic closes are refused permanently, but unlike the two states above it resumes and transacts. Two rules follow from that combination. The channel takes no NEW HTLCs: its HTLC deadline backstops can never fire, and accepting an obligation whose only enforcement this node has disarmed is how a bounded risk becomes an unbounded one. And the operator's force close is admitted, through the labelled acknowledgement 5.6 asks for: `acceptStaleStateRisk` on the daemon's force-close route, refused without it and explaining that the peer may already hold a revocation for the commitment being published.
 
+A valid secret at `next_revocation_number = localCommitmentNumber + 1` proves that the peer holds the revocation for the local commitment this row would broadcast, even when its commitment counter is otherwise compatible (issues #905 and #915). This proof applies to every channel, not only capsule restores. The persisted `restoreRevokedRisk` field retains its name for compatibility but has no restore prerequisite. It reports `LocalDataLoss`, refuses every local commitment broadcast including an operator force close with `acceptStaleStateRisk`, and admits no new HTLCs while existing ones may still settle through the resumed exchange. Invalid or all-zero secrets cannot set this proof flag. The daemon reports `FORCE_CLOSE_REVOKED` (409) and advises waiting for the peer to force close.
+
 ### 5.8 Durability policies and barriers (Phase 6)
 
 ```ts

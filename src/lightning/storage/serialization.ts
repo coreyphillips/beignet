@@ -519,8 +519,9 @@ export interface ISerializedChannelState {
 	// can prove. MUST persist - a restart must not forget that an AUTOMATIC
 	// commitment broadcast is forbidden.
 	restoreRecencyUnproven?: boolean;
-	// Issue #905: the peer has shown it holds the revocation for the row
-	// above's current commitment. MUST persist - a restart must not reopen
+	// Issues #905 and #915: the peer has shown it holds the revocation for
+	// this row's current commitment, with or without a capsule restore.
+	// MUST persist - a restart must not reopen
 	// the operator's force close on a commitment the peer can punish.
 	restoreRevokedRisk?: boolean;
 	// Issue #469: the operator acknowledged the stale-close risk when

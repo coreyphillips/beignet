@@ -5949,11 +5949,12 @@ export class LightningNode extends EventEmitter {
 			 */
 			restoreRecencyUnproven?: boolean;
 			/**
-			 * The held channel's peer has shown, in its channel_reestablish,
+			 * The channel's peer has shown, in its channel_reestablish,
 			 * that it already holds the revocation for the channel's current
 			 * commitment (issue #905). The hold above describes a risk; this
 			 * is a certainty, so the operator's force close is refused too,
-			 * acceptStaleStateRisk or not. The peer's close is the one exit.
+			 * acceptStaleStateRisk or not. This includes ordinary rows, even
+			 * without a capsule restore (issue #915).
 			 */
 			restoreRevokedRisk?: boolean;
 		}>;
@@ -11501,7 +11502,7 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * The refusal every force close of a capsule-restored channel meets once
+	 * The refusal every force close of a channel meets once
 	 * its peer has shown it holds the revocation for the channel's current
 	 * commitment (restoreRevokedRisk, issue #905), or null when it does not.
 	 * Unlike the recency hold, which the operator's own close may override
@@ -11515,12 +11516,11 @@ export class LightningNode extends EventEmitter {
 		const state = this.channelManager.getChannel(channelId)?.getFullState();
 		if (state?.restoreRevokedRisk !== true) return null;
 		return (
-			'force close refused: this channel was restored from a Recovery ' +
-			'Capsule and its peer has shown, in channel_reestablish, that it ' +
-			'already holds the revocation for the stored commitment; ' +
-			'broadcasting it would hand the whole balance to the justice ' +
-			'path. There is no risk to accept: only the peer can close this ' +
-			'channel'
+			"force close refused: this channel's peer has shown, in " +
+			'channel_reestablish, that it already holds the revocation for the ' +
+			'stored commitment; broadcasting it would hand the whole balance to ' +
+			'the justice path. There is no risk to accept: wait for the peer to ' +
+			'force close'
 		);
 	}
 
@@ -16410,12 +16410,13 @@ export class LightningNode extends EventEmitter {
 		const finalHop = isFinalHop(processed.nextPacket);
 		let policyCode: number | null = null;
 		if (
-			channel.getFullState().restoreRecencyUnproven === true &&
+			(channel.getFullState().restoreRecencyUnproven === true ||
+				channel.getFullState().restoreRevokedRisk === true) &&
 			htlcEntry.addedWhileRestoreUnproven === true
 		) {
-			// A capsule-restored channel whose recency cannot be proven takes
-			// no NEW HTLCs (issue #469). Settling this would reveal a preimage
-			// against a peer we could never escalate against, because every
+			// A channel with unproven recency or a proven revocation takes
+			// no NEW HTLCs (issues #469 and #915). Settling this would reveal a
+			// preimage against a peer we could never escalate against, because every
 			// automatic close is refused while the hold stands, so the on-chain
 			// claim the deadline backstops exist to make can never happen;
 			// forwarding is the same bet with an extra leg.

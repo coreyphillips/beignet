@@ -248,8 +248,8 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// Unknown channel / wrong state / nothing recorded to rebroadcast are all
 	// problems with the caller's request, not node faults: never a 5xx.
 	REBROADCAST_FAILED: 400,
-	// A capsule-restored channel whose peer has shown it holds the revocation
-	// for the stored commitment (issue #905): the node's state conflicts with
+	// A channel whose peer has shown it holds the revocation for the stored
+	// commitment (issues #905 and #915): the node's state conflicts with
 	// the request and no parameter changes the answer, so 409, not 400.
 	FORCE_CLOSE_REVOKED: 409,
 	// Recovery Protocol surface (docs/RECOVERY-PROTOCOL.md section 8).

@@ -1,5 +1,5 @@
 /**
- * Issue #905: a capsule-restored channel whose peer reports
+ * Issues #905 and #915: a channel whose peer reports
  * next_revocation_number at exactly localCommitmentNumber + 1 has had its
  * CURRENT local commitment revoked in the peer's view. localCommitmentNumber
  * advances when WE send revoke_and_ack, so the peer counting one more than
@@ -63,6 +63,7 @@ import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { Network } from '../../src/lightning/invoice/types';
 import { ILightningError } from '../../src/lightning/node/types';
+import { ChannelRecoveryStatus } from '../../src/lightning/recovery/channel-status';
 import {
 	signerFromSeed,
 	realInitialCommitmentSig,
@@ -72,7 +73,7 @@ import {
 bitcoin.initEccLib(ecc);
 
 const REVOKED_REFUSAL =
-	'Refusing to broadcast: the peer already holds the revocation for this restored commitment';
+	'Refusing to broadcast: the peer already holds the revocation for this commitment';
 
 // ── Channel-pair harness (pattern shared with recovery-phase5-status.test.ts) ──
 
@@ -288,7 +289,7 @@ function hasAction(
 	return actions.some((a) => a.type === type);
 }
 
-describe('Restore revoked risk (issue #905)', function () {
+describe('Proven revoked commitment (issues #905 and #915)', function () {
 	describe('the capsule at head (L0, R0) meets the peer', function () {
 		it('(L0, R0), nothing lost: resumes, the flag stays off, the operator force close stands', function () {
 			const { opener, seed, L0, R0 } = heldOpener();
@@ -430,20 +431,68 @@ describe('Restore revoked risk (issue #905)', function () {
 		expect((plan as { error?: string }).error).to.not.equal(REVOKED_REFUSAL);
 	});
 
-	it('a row without the hold handed the + 1 value does not set it', function () {
+	it('protects an ordinary row with the same valid proof and refuses new HTLCs (issue #915)', function () {
 		const { opener, seed, L0, R0 } = heldOpener(false);
-
 		const actions = opener.handleReestablish(
 			peerReestablish(opener, seed, L0 + 1n, R0)
 		);
 
-		// The sig-in-flight reading a live node's handler gives it (out of
-		// scope for #905): resumes with every automatic close armed.
 		expect(opener.getState()).to.equal(ChannelState.NORMAL);
 		expect(hasAction(actions, ChannelActionType.ERROR)).to.equal(false);
-		expect(opener.getFullState().restoreRevokedRisk).to.equal(undefined);
-		expect(mustNotBroadcastCommitment(opener.getFullState())).to.equal(false);
+		expect(hasAction(actions, ChannelActionType.PERSIST_STATE)).to.equal(true);
+		expect(opener.getFullState().restoreRecencyUnproven).to.equal(undefined);
+		expect(opener.getFullState().restoreRevokedRisk).to.equal(true);
+		expect(opener.getRecoveryStatus()).to.equal(
+			ChannelRecoveryStatus.LocalDataLoss
+		);
+		expect(mustNotBroadcastCommitment(opener.getFullState())).to.equal(true);
+		const plan = opener.prepareForceClose(opener.getSigner()!);
+		expect(plan.ok).to.equal(false);
+		expect((plan as { error: string }).error).to.equal(REVOKED_REFUSAL);
+
+		expect(opener.acceptsNewHtlcs()).to.equal(false);
+		expect(opener.canOfferHtlcSet([1_000_000n])).to.equal(false);
+		const added = opener.addHtlc(
+			1_000_000n,
+			Buffer.alloc(32, 0x31),
+			500,
+			Buffer.alloc(1366)
+		);
+		expect(hasAction(added, ChannelActionType.ERROR)).to.equal(true);
+		expect(hasAction(added, ChannelActionType.SEND_MESSAGE)).to.equal(false);
+
+		// Inbound adds follow the existing fail-back path once committed.
+		// Their admission stamp keeps pre-existing obligations settleable.
+		const received = opener.handleUpdateAddHtlc({
+			channelId: opener.getChannelId()!,
+			id: 0n,
+			amountMsat: 1_000_000n,
+			paymentHash: Buffer.alloc(32, 0x32),
+			cltvExpiry: 500,
+			onionRoutingPacket: Buffer.alloc(1366)
+		});
+		expect(hasAction(received, ChannelActionType.ERROR)).to.equal(false);
+		expect(
+			opener.getFullState().htlcs.get('received-0')?.addedWhileRestoreUnproven
+		).to.equal(true);
 	});
+
+	for (const hold of [false, true]) {
+		for (const secret of [Buffer.alloc(32), Buffer.alloc(32, 0x81)]) {
+			it(`does not hard-latch a forged proof (capsule=${hold}, zero=${secret.equals(
+				Buffer.alloc(32)
+			)})`, function () {
+				const { opener, seed, L0, R0 } = heldOpener(hold);
+				opener.handleReestablish(
+					peerReestablish(opener, seed, L0 + 1n, R0, secret)
+				);
+				expect(opener.getFullState().restoreRevokedRisk).to.equal(undefined);
+				expect(mustNotBroadcastCommitment(opener.getFullState())).to.equal(
+					false
+				);
+			});
+		}
+	}
 
 	it('the flag survives a serialization round trip and a rebuilt Channel still refuses', function () {
 		const { opener, seed, L0, R0 } = heldOpener();
@@ -475,79 +524,102 @@ describe('Restore revoked risk (issue #905)', function () {
 		).to.equal(undefined);
 	});
 
-	it('the operator force close on the node is refused under FORCE_CLOSE_REVOKED and the status reports the flag', function () {
-		const { opener, seed, L0, R0 } = heldOpener();
-		opener.handleReestablish(peerReestablish(opener, seed, L0 + 1n, R0));
-		const state = deserializeChannelState(
-			serializeChannelState(opener.getFullState())
-		);
-		expect(state.restoreRevokedRisk).to.equal(true);
-
-		const storage = new SqliteStorage(':memory:');
-		storage.open();
-		const peer = getPublicKey(Buffer.alloc(32, 0x75)).toString('hex');
-		const idHex = state.channelId!.toString('hex');
-		storage.saveChannel(idHex, state, peer);
-
-		const node = new LightningNode({
-			nodePrivateKey: crypto
-				.createHash('sha256')
-				.update(Buffer.from('revoked-risk-node'))
-				.digest(),
-			network: Network.REGTEST as Network,
-			channelBasepoints: makeBasepoints(Buffer.alloc(32, 0x76)),
-			perCommitmentSeed: crypto
-				.createHash('sha256')
-				.update(Buffer.from('revoked-risk-pcs'))
-				.digest(),
-			fundingPrivkey: crypto
-				.createHash('sha256')
-				.update(Buffer.from('revoked-risk-funding'))
-				.digest(),
-			htlcBasepointSecret: crypto
-				.createHash('sha256')
-				.update(Buffer.from('revoked-risk-htlc'))
-				.digest(),
-			storage,
-			enableNetworking: false
-		});
-		node.on('error', () => {});
-		const errors: ILightningError[] = [];
-		node.on('node:error', (e: ILightningError) => errors.push(e));
-		try {
-			const row = node
-				.getRecoveryStatus()
-				.channels.find((c) => c.channelId === idHex);
-			expect(row, 'the channel is on the recovery status').to.not.equal(
-				undefined
+	for (const hold of [false, true]) {
+		it(`refuses operator and timeout closes after restart (capsule=${hold})`, function () {
+			const { opener, seed, L0, R0 } = heldOpener(hold);
+			opener.handleReestablish(peerReestablish(opener, seed, L0 + 1n, R0));
+			const state = deserializeChannelState(
+				serializeChannelState(opener.getFullState())
 			);
-			expect(row!.restoreRecencyUnproven).to.equal(true);
-			expect(row!.restoreRevokedRisk, 'reported beside the hold').to.equal(
-				true
-			);
+			expect(state.restoreRevokedRisk).to.equal(true);
 
-			// Reason 'user', the hatch revision 13 left open: refused, under
-			// its own code, before the engine is even asked.
-			const script = Buffer.concat([
-				Buffer.from([0x00, 0x14]),
-				crypto
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const peer = getPublicKey(Buffer.alloc(32, 0x75)).toString('hex');
+			const idHex = state.channelId!.toString('hex');
+			storage.saveChannel(idHex, state, peer);
+
+			const node = new LightningNode({
+				nodePrivateKey: crypto
 					.createHash('sha256')
-					.update(Buffer.from('sweep'))
-					.digest()
-					.subarray(0, 20)
-			]);
-			const result = node.forceCloseChannel(state.channelId!, script);
-			expect(result.ok).to.equal(false);
-			expect(result.error).to.match(/already holds the revocation/);
-			expect(result.error).to.match(/no risk to accept/);
-			expect(errors.map((e) => e.code)).to.deep.equal(['FORCE_CLOSE_REVOKED']);
-			expect(
-				node.getChannelManager().getChannel(state.channelId!)!.getState(),
-				'nothing moved'
-			).to.not.equal(ChannelState.FORCE_CLOSED);
-		} finally {
-			node.destroy();
-			storage.close();
-		}
-	});
+					.update(Buffer.from('revoked-risk-node'))
+					.digest(),
+				network: Network.REGTEST as Network,
+				channelBasepoints: makeBasepoints(Buffer.alloc(32, 0x76)),
+				perCommitmentSeed: crypto
+					.createHash('sha256')
+					.update(Buffer.from('revoked-risk-pcs'))
+					.digest(),
+				fundingPrivkey: crypto
+					.createHash('sha256')
+					.update(Buffer.from('revoked-risk-funding'))
+					.digest(),
+				htlcBasepointSecret: crypto
+					.createHash('sha256')
+					.update(Buffer.from('revoked-risk-htlc'))
+					.digest(),
+				storage,
+				enableNetworking: false
+			});
+			node.on('error', () => {});
+			const errors: ILightningError[] = [];
+			node.on('node:error', (e: ILightningError) => errors.push(e));
+			try {
+				const row = node
+					.getRecoveryStatus()
+					.channels.find((c) => c.channelId === idHex);
+				expect(row, 'the channel is on the recovery status').to.not.equal(
+					undefined
+				);
+				expect(row!.restoreRecencyUnproven).to.equal(hold ? true : undefined);
+				expect(row!.status).to.equal(ChannelRecoveryStatus.LocalDataLoss);
+				expect(row!.restoreRevokedRisk, 'reported beside the hold').to.equal(
+					true
+				);
+
+				const channel = node.getChannelManager().getChannel(state.channelId!)!;
+				channel.markForReestablish();
+				expect(channel.isFundingKnownOnChain()).to.equal(true);
+				const scanner = node as unknown as {
+					scanStuckChannels(height: number): void;
+					reestablishTimeoutBlocks: number;
+				};
+				scanner.scanStuckChannels(100);
+				scanner.scanStuckChannels(101 + scanner.reestablishTimeoutBlocks);
+				expect(channel.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+				expect(errors).to.have.length(0);
+				channel.markErrored();
+				expect(channel.getRecoveryCloseReason()).to.equal('local-data-loss');
+				scanner.scanStuckChannels(200);
+				scanner.scanStuckChannels(201 + scanner.reestablishTimeoutBlocks);
+				expect(channel.getState()).to.equal(ChannelState.ERRORED);
+				expect(errors).to.have.length(0);
+
+				// Reason 'user', the hatch revision 13 left open: refused, under
+				// its own code, before the engine is even asked.
+				const script = Buffer.concat([
+					Buffer.from([0x00, 0x14]),
+					crypto
+						.createHash('sha256')
+						.update(Buffer.from('sweep'))
+						.digest()
+						.subarray(0, 20)
+				]);
+				const result = node.forceCloseChannel(state.channelId!, script);
+				expect(result.ok).to.equal(false);
+				expect(result.error).to.match(/already holds the revocation/);
+				expect(result.error).to.match(/no risk to accept/);
+				expect(errors.map((e) => e.code)).to.deep.equal([
+					'FORCE_CLOSE_REVOKED'
+				]);
+				expect(
+					node.getChannelManager().getChannel(state.channelId!)!.getState(),
+					'nothing moved'
+				).to.not.equal(ChannelState.FORCE_CLOSED);
+			} finally {
+				node.destroy();
+				storage.close();
+			}
+		});
+	}
 });

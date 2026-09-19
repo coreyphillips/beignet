@@ -953,14 +953,14 @@ export interface IChannelState {
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**
-	 * The peer has shown it holds the revocation for this restored row's
-	 * CURRENT local commitment (issue #905). Set by handleReestablish on a
-	 * restoreRecencyUnproven row whose peer reports next_revocation_number
-	 * at exactly localCommitmentNumber + 1 beside our real per-commitment
-	 * secret at that index: the counter counts a revoke_and_ack this row
-	 * never recorded sending, and the secret, which only a peer we revoked
-	 * that commitment to can hold, proves the commitment it revoked is the
-	 * one this row would broadcast. The counter alone is never enough (an
+	 * The peer has shown it holds the revocation for this row's CURRENT
+	 * local commitment (issues #905 and #915). Despite the historical field
+	 * name, no capsule restore is required. Set by handleReestablish when
+	 * next_revocation_number is exactly localCommitmentNumber + 1 beside
+	 * our real per-commitment secret at localCommitmentNumber. The peer
+	 * counts a revoke_and_ack this row never recorded sending. Its knowledge
+	 * of that secret proves the revoked commitment is the one this row would
+	 * broadcast. The counter alone is never enough (an
 	 * all-zero secret is forgeable, issue #907). The hold above describes
 	 * a RISK the operator may accept; this is a certainty, so it joins
 	 * mustNotBroadcastCommitment and the operator's force close is refused

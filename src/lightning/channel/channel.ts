@@ -3037,6 +3037,19 @@ export class Channel {
 			];
 		}
 
+		// A proven revoked commitment cannot enforce any new HTLC either.
+		// Existing obligations still settle through the resumed exchange.
+		if (this._state.restoreRevokedRisk === true) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot add HTLC: the peer holds the revocation for this ' +
+						'commitment, so its on-chain HTLC backstops are disabled'
+				}
+			];
+		}
+
 		// A capsule-restored channel whose recency cannot be proven takes no NEW
 		// HTLCs (issue #469). Its HTLC deadline backstops can never fire, since
 		// every automatic close is refused for as long as the hold stands, and
@@ -3443,10 +3456,11 @@ export class Channel {
 			state: HtlcState.PENDING,
 			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {}),
 			...(dustExposureFailback ? { dustExposureFailback: true } : {}),
-			// Provenance for the capsule-restore hold (issue #469): only an add
-			// admitted while the hold already stood is refused by the node; one
+			// Provenance for the restore hold or proven revocation: only an add
+			// admitted while the restriction stood is refused by the node; one
 			// already committed in the capsule predates it and still settles.
-			...(this._state.restoreRecencyUnproven === true
+			...(this._state.restoreRecencyUnproven === true ||
+			this._state.restoreRevokedRisk === true
 				? { addedWhileRestoreUnproven: true }
 				: {}),
 			// Same provenance for the funding-missing quarantine (issue #593).
@@ -5623,7 +5637,8 @@ export class Channel {
 	 */
 	getRecoveryStatus(): ChannelRecoveryStatus {
 		const s = this._state;
-		if (s.dataLossDetected) return ChannelRecoveryStatus.LocalDataLoss;
+		if (s.dataLossDetected || s.restoreRevokedRisk)
+			return ChannelRecoveryStatus.LocalDataLoss;
 		if (s.stateUncertain) return ChannelRecoveryStatus.StateUncertain;
 		if (
 			s.state === ChannelState.FORCE_CLOSED ||
@@ -5673,7 +5688,8 @@ export class Channel {
 		if (this._state.recoveryCloseReason) {
 			return this._state.recoveryCloseReason;
 		}
-		if (this._state.dataLossDetected) return 'local-data-loss';
+		if (this._state.dataLossDetected || this._state.restoreRevokedRisk)
+			return 'local-data-loss';
 		if (this._state.stateUncertain) return 'state-uncertain';
 		// A capsule-restored row the peer has not confirmed yet (issue #469).
 		// DERIVED and never stamped by _ensureRecoveryCloseDisposition, unlike
@@ -6203,9 +6219,9 @@ export class Channel {
 		chain?: IForceCloseChainFacts
 	): ForceClosePlan {
 		// The recovery never-broadcast invariant (5.6): proven stale
-		// (dataLossDetected), unprovable (stateUncertain), or restored with
+		// (dataLossDetected), unprovable (stateUncertain), or with
 		// the peer having shown it holds the revocation (restoreRevokedRisk,
-		// issue #905), our latest local commitment may be revoked in the
+		// issues #905 and #915), our latest local commitment may be revoked in the
 		// peer's view - broadcasting it hands our entire balance to the
 		// justice path. Recovery is passive: StateUncertain is permanent
 		// absent independently verified storage provenance, so the only exit
@@ -6217,7 +6233,7 @@ export class Channel {
 				error: this._state.dataLossDetected
 					? 'Refusing to broadcast stale commitment after data loss'
 					: this._state.restoreRevokedRisk
-					? 'Refusing to broadcast: the peer already holds the revocation for this restored commitment'
+					? 'Refusing to broadcast: the peer already holds the revocation for this commitment'
 					: 'Refusing to broadcast: restored state is not proven current'
 			};
 		}
@@ -9900,27 +9916,25 @@ export class Channel {
 			];
 		}
 
-		// ── Restored row whose current commitment the peer has revoked ──
-		// (issue #905). localCommitmentNumber advances when WE send
+		// A valid secret proves the current commitment was revoked, whatever
+		// the row's origin (issues #905 and #915). The local number advances on
 		// revoke_and_ack, so next_revocation_number at exactly
 		// localCommitmentNumber + 1 means the peer received one more
 		// revoke_and_ack than this row recorded sending, and the commitment it
 		// revoked is commitment localCommitmentNumber: the one this row would
 		// broadcast. The DLP arm above needs a larger gap, and the revocation
-		// arm below calls exactly + 1 the sig-in-flight case, which it is for
-		// a live node, whose next_revocation_number then EQUALS
-		// localCommitmentNumber. On a capsule-restored row the value can only
-		// come from a round the capsule missed, so the hold's "the peer MAY
-		// hold a newer state" has become "the peer holds the revocation":
-		// not a risk the operator can accept, a certain loss. The proof is
+		// arm below previously treated exactly + 1 as a signature in flight.
+		// A signature in flight alone cannot give the peer our secret at this
+		// index. Its knowledge proves a revocation this row missed, including
+		// when no capsule restore marked the row. The proof is
 		// the secret, not the counter: the validator above pinned a non-zero
 		// your_last_per_commitment_secret to index localCommitmentNumber,
 		// which only a peer we revoked that commitment to can hold (the
 		// released secrets 0..localCommitmentNumber-1 never derive it). The
 		// counter alone is read off our own channel_reestablish, and while an
 		// all-zero secret passes validation (issue #907) any peer could pair
-		// it with zeroes; a forged flag would remove the held row's only
-		// exit, so zeroes leave the flag off and the row resumes as before.
+		// it with zeroes; a forged flag would remove the operator's force-close
+		// exit, so zeroes leave the flag off.
 		// With the secret required, a commitment gap beside this value is
 		// the DLP arm's above, so the gap arms below never see a flagged
 		// row. The row still resumes, because the peer's retransmission of
@@ -9929,7 +9943,6 @@ export class Channel {
 		// retransmits nothing, so without it a crash after reestablish would
 		// forget the flag and reopen the operator's force close.
 		if (
-			this._state.restoreRecencyUnproven === true &&
 			msg.nextRevocationNumber === this._state.localCommitmentNumber + 1n &&
 			!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32)) &&
 			this._state.restoreRevokedRisk !== true
@@ -9951,12 +9964,10 @@ export class Channel {
 		// ── Revocation retransmission logic ──
 		// msg.nextRevocationNumber is the next revocation the peer expects from us.
 		// We can only have revoked up to localCommitmentNumber commitments.
-		// A value of EXACTLY localCommitmentNumber + 1 is the sig-in-flight
-		// case, not a gap: the peer signed a commitment we never received (the
-		// connection died between its updates/signature and us). Its own
-		// retransmission (updates + commitment_signed, triggered by our
-		// next_commitment_number) brings us level, after which we revoke
-		// normally. Only a larger gap is irrecoverable.
+		// Exactly localCommitmentNumber + 1 can resume for the peer's
+		// retransmission. A valid secret there has already set the permanent
+		// never-broadcast flag above: a missing signature alone cannot explain
+		// the peer knowing the secret for our current commitment.
 		if (msg.nextRevocationNumber > this._state.localCommitmentNumber + 1n) {
 			// Peer expects a revocation we've never created — irrecoverable
 			return this._heldReestablishGapFailure(
@@ -13124,6 +13135,7 @@ export class Channel {
 	canOfferHtlcSet(amounts: bigint[]): boolean {
 		if (amounts.length > 0 && this._fforUpdateRefusal('add')) return false;
 		if (amounts.length === 0) return true;
+		if (this._state.restoreRevokedRisk === true) return false;
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			!this.canUpdateHtlcsDuringSplice()
@@ -13167,6 +13179,7 @@ export class Channel {
 		reservationHint = false
 	): boolean {
 		if (!reservationHint && this._fforUpdateRefusal('add')) return false;
+		if (this._state.restoreRevokedRisk === true) return false;
 		if (this._state.restoreRecencyUnproven === true) return false;
 		if (this._state.fundingUnaccounted === true) return false;
 		return this.isHtlcUsable(lookThroughReestablish);

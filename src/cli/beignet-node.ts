@@ -7386,13 +7386,12 @@ export class BeignetNode extends EventEmitter {
 		if (row?.restoreRevokedRisk === true) {
 			throw new BeignetError(
 				'FORCE_CLOSE_REVOKED',
-				'This channel was restored from a Recovery Capsule and its peer ' +
-					'has shown, in channel_reestablish, that it already holds the ' +
-					'revocation for the stored commitment. Force closing would ' +
-					'publish a revoked commitment and the whole channel balance ' +
-					'would be lost to the justice path. There is no risk to ' +
-					'accept, so acceptStaleStateRisk does not apply: only the peer ' +
-					'can close this channel.'
+				"This channel's peer has shown, in channel_reestablish, that it " +
+					'already holds the revocation for the stored commitment. Force ' +
+					'closing would publish a revoked commitment and the whole channel ' +
+					'balance would be lost to the justice path. There is no risk to ' +
+					'accept, so acceptStaleStateRisk does not apply: wait for the ' +
+					'peer to force close.'
 			);
 		}
 		const held = row?.restoreRecencyUnproven;
