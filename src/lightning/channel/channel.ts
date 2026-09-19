@@ -3023,21 +3023,6 @@ export class Channel {
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer
 	): ChannelAction[] {
-		// Pending-lock (tx_signatures crossed both ways, splice_locked not yet):
-		// update traffic has resumed per the splicing extension, and every add
-		// is mirrored onto both fundings by the start_batch commitment round.
-		if (
-			this._state.state !== ChannelState.NORMAL &&
-			!this.canUpdateHtlcsDuringSplice()
-		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `Cannot add HTLC: channel in ${this._state.state} state`
-				}
-			];
-		}
-
 		// A channel whose recency cannot be proven takes no NEW HTLCs, whether
 		// it was restored from a capsule (issue #469) or its peer claimed at
 		// reestablish that it is behind without proof (issue #907). Its HTLC
@@ -3047,7 +3032,10 @@ export class Channel {
 		// into an unbounded one: the peer can simply stall and we have nothing
 		// to escalate to. Existing HTLCs still settle and fail off chain, and
 		// the channel can still be closed with the operator's acknowledged
-		// close or by the peer.
+		// close or by the peer. Answered ahead of the lifecycle check below:
+		// a reestablish-held row is ERRORED from the moment the flag is set,
+		// and the hold, with its exit, is the answer the caller can act on,
+		// not the bare state name.
 		if (isRecencyUnproven(this._state)) {
 			return [
 				{
@@ -3061,6 +3049,21 @@ export class Channel {
 							  'this channel state is behind and showed no proof, so its ' +
 							  'state cannot be proven current and its on-chain HTLC ' +
 							  'backstops are disabled'
+				}
+			];
+		}
+
+		// Pending-lock (tx_signatures crossed both ways, splice_locked not yet):
+		// update traffic has resumed per the splicing extension, and every add
+		// is mirrored onto both fundings by the start_batch commitment round.
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			!this.canUpdateHtlcsDuringSplice()
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot add HTLC: channel in ${this._state.state} state`
 				}
 			];
 		}
@@ -5789,6 +5792,22 @@ export class Channel {
 	}
 
 	/**
+	 * Why this row's balances cannot be proven current, for the held-close
+	 * refusals: the capsule restore (issue #469) or the peer's unproven
+	 * behind claim at channel_reestablish (issue #907). Named per origin so
+	 * an operator reading the refusal is told what actually happened; the
+	 * restore origin is reported first when both stand, as the status and
+	 * the daemon's force-close refusal do.
+	 */
+	private _heldCloseOrigin(): string {
+		return this._state.restoreRecencyUnproven === true
+			? 'this channel was restored from a Recovery Capsule and its balances ' +
+					'cannot be proven current'
+			: 'the peer claimed at channel_reestablish that this channel state is ' +
+					'behind and showed no proof, which leaves its balances unproven';
+	}
+
+	/**
 	 * The manager's entry to the held-close refusal, for a channel restored
 	 * MID-close surfacing at reestablish: resuming the negotiation is exactly
 	 * what must not run, but doing nothing leaves the row in SHUTTING_DOWN or
@@ -5797,8 +5816,7 @@ export class Channel {
 	 */
 	refuseHeldMutualClose(): ChannelAction[] {
 		return this._heldCooperativeCloseRefusal(
-			'Cannot resume cooperative close: this channel was restored from a ' +
-				'Recovery Capsule and its balances cannot be proven current; ' +
+			`Cannot resume cooperative close: ${this._heldCloseOrigin()}; ` +
 				'awaiting your force close instead'
 		);
 	}
@@ -6789,10 +6807,11 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message:
-						'Cannot close cooperatively: channel was restored from a ' +
-						'Recovery Capsule and its balances cannot be proven current, ' +
-						'so a mutual close may sign away funds received after the ' +
-						'capsule was written',
+						`Cannot close cooperatively: ${this._heldCloseOrigin()}, so a ` +
+						'mutual close may sign away ' +
+						(this._state.restoreRecencyUnproven === true
+							? 'funds received after the capsule was written'
+							: 'funds a newer state would credit us'),
 					cleanup: 'none'
 				}
 			];
@@ -6958,8 +6977,7 @@ export class Channel {
 		// authorized close into ERRORED at its first response.
 		if (this.isMutualCloseHeld()) {
 			return this._heldCooperativeCloseRefusal(
-				'Cannot close cooperatively: this channel was restored from a ' +
-					'Recovery Capsule and its balances cannot be proven current; ' +
+				`Cannot close cooperatively: ${this._heldCloseOrigin()}; ` +
 					'please force close instead'
 			);
 		}

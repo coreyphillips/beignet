@@ -34,6 +34,7 @@ import {
 	HtlcState
 } from '../../src/lightning/channel/types';
 import {
+	ChannelCloseReason,
 	IChannelState,
 	isRecencyUnproven,
 	mustNotBroadcastCommitment
@@ -67,6 +68,16 @@ interface IScanAccess {
 	scanExpiringOfferedHtlcs(blockHeight: number): void;
 }
 
+/** The central force-close guard every automatic arm ends in, private on the node. */
+interface IGuardAccess {
+	_forceCloseWithReason(
+		channelId: Buffer,
+		destinationScript: Buffer,
+		feeRatePerVbyte: number,
+		reason: ChannelCloseReason
+	): { ok: boolean; error?: string; actions: Array<{ type: string }> };
+}
+
 interface IFixture {
 	alice: LightningNode;
 	bob: LightningNode;
@@ -75,6 +86,8 @@ interface IFixture {
 	events: string[];
 	/** category:action of every structured log Alice emitted. */
 	logs: string[];
+	/** The same logs, whole, for the cells that read their data. */
+	records: IStructuredLog[];
 	/** The text of every wire error Alice sent Bob. */
 	errorsSent: string[];
 	state: () => IChannelState;
@@ -102,11 +115,13 @@ function setup(seedBase: number): IFixture {
 		);
 	const events: string[] = [];
 	const logs: string[] = [];
+	const records: IStructuredLog[] = [];
 	const errorsSent: string[] = [];
 	alice.on('node:error', (err: { code: string }) => events.push(err.code));
-	alice.on('log', (log: IStructuredLog) =>
-		logs.push(`${log.category}:${log.action}`)
-	);
+	alice.on('log', (log: IStructuredLog) => {
+		logs.push(`${log.category}:${log.action}`);
+		records.push(log);
+	});
 	alice.on(
 		'message:outbound',
 		(pubkey: string, type: number, payload: Buffer) => {
@@ -121,6 +136,7 @@ function setup(seedBase: number): IFixture {
 		channelId,
 		events,
 		logs,
+		records,
 		errorsSent,
 		state: (): IChannelState =>
 			alice.getChannelManager().getChannel(channelId)!.getFullState(),
@@ -320,6 +336,65 @@ describe('Issue #907: a wrong secret at an unreleased index is held, never close
 		fx.destroy();
 	});
 
+	it('the central force-close guard refuses an automatic reason by itself', () => {
+		// Every automatic arm asks skipAutoCloseRestoreUnproven before it
+		// announces a close, so none of the cells above shows whether the
+		// guard inside _forceCloseWithReason would hold on its own. Reach it
+		// directly with an automatic reason, as a path that forgot its
+		// per-arm skip would: the guard decides, no commitment is built, no
+		// close reason is stamped, and the hold's log names this origin.
+		const fx = setup(27);
+		zeroSecretGap(fx);
+		expectHeldNotClosed(fx, 'close_skipped_restore_unproven');
+		const guard = fx.alice as unknown as IGuardAccess;
+		const skipsBefore = fx.records.filter(
+			(r) => r.action === 'close_skipped_restore_unproven'
+		).length;
+		const eventsBefore = fx.events.length;
+
+		const refused = guard._forceCloseWithReason(
+			fx.channelId,
+			SWEEP_SCRIPT,
+			10,
+			'STUCK_CHANNEL_FORCE_CLOSED'
+		);
+
+		expect(refused.ok).to.equal(false);
+		expect(refused.error).to.contain('recency hold');
+		expect(refused.actions.some((a) => a.type === 'BROADCAST_TX')).to.equal(
+			false
+		);
+		const skips = fx.records.filter(
+			(r) => r.action === 'close_skipped_restore_unproven'
+		);
+		expect(skips.length, 'the guard itself declined').to.equal(skipsBefore + 1);
+		const skip = skips[skips.length - 1];
+		expect(skip.category).to.equal('channel');
+		expect(skip.data.context).to.equal('STUCK_CHANNEL_FORCE_CLOSED');
+		expect(skip.data.hold).to.equal('reestablish');
+		expect(skip.data.channelId).to.equal(fx.channelId.toString('hex'));
+		expect(fx.events.length, 'no node:error from the guard').to.equal(
+			eventsBefore
+		);
+		expect(fx.state().state).to.equal(ChannelState.ERRORED);
+		expect(fx.state().closeReason).to.not.exist;
+		expectReestablishHold(fx);
+
+		// The same guard admits the operator: reason 'user' is the exit.
+		const admitted = guard._forceCloseWithReason(
+			fx.channelId,
+			SWEEP_SCRIPT,
+			10,
+			'user'
+		);
+		expect(admitted.ok, admitted.error).to.equal(true);
+		expect(admitted.actions.some((a) => a.type === 'BROADCAST_TX')).to.equal(
+			true
+		);
+		expect(fx.state().state).to.equal(ChannelState.FORCE_CLOSED);
+		fx.destroy();
+	});
+
 	it('the grief case: 32 random bytes at L + 1 against a healthy channel', () => {
 		// The cost to a hostile peer is one message. What it buys is this
 		// hold, never a commitment of ours on chain and never StateUncertain:
@@ -404,7 +479,10 @@ describe('Issue #907: a wrong secret at an unreleased index is held, never close
 		// index localCommitmentNumber - 1, which this row released, so a wrong
 		// value there makes no claim on our state. The ordinary wire-error
 		// failure stands, and the node closes on chain as it does for any
-		// other protocol violation, exactly as master did.
+		// other protocol violation. For a wrong NON-ZERO secret that is what
+		// master did; for zeroes at this index master skipped the validator
+		// and resumed, so the on-chain failure here is new (BOLT 2: SHOULD
+		// send an error and fail the channel).
 		const fx = setup(25);
 		const pre = fx.state();
 		expect(Number(pre.localCommitmentNumber)).to.be.at.least(1);

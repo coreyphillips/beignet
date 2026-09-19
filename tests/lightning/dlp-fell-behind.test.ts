@@ -461,6 +461,73 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 			expectHeldForPeerClose(opener, openerPrivkeys[0]);
 		});
 
+		it('refuses new HTLCs and a cooperative close with wording for this origin', function () {
+			// The hold's refusals are shared with the capsule restore through
+			// isRecencyUnproven, but whoever reads them has to be told what
+			// happened, and nothing here was restored. The add refusal is
+			// answered ahead of the lifecycle check, because a reestablish-held
+			// row is ERRORED and the bare state name would hide the hold and
+			// its exit. The cooperative-close refusals (the operator's own
+			// initiation, and the shared helper that the peer's shutdown, every
+			// closing stage and the manager's post-reestablish resume reach)
+			// name the reestablish claim, not the capsule.
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const pre = opener.getFullState();
+			opener.markForReestablish();
+			const actions = opener.handleReestablish({
+				channelId: opener.getChannelId()!,
+				nextCommitmentNumber: pre.remoteCommitmentNumber + 50n,
+				nextRevocationNumber: pre.localCommitmentNumber + 3n,
+				yourLastPerCommitmentSecret: Buffer.alloc(32),
+				myCurrentPerCommitmentPoint: makeForeignPoint('wording')
+			});
+			expectWrongSecretRefusal(opener, actions);
+			const htlcsBefore = opener.getFullState().htlcs.size;
+
+			const add = opener.addHtlc(
+				1_000_000n,
+				crypto.randomBytes(32),
+				500,
+				Buffer.alloc(1366)
+			);
+			expect(add).to.have.length(1);
+			expect(add[0].type).to.equal(ChannelActionType.ERROR);
+			const addMessage = (add[0] as { message: string }).message;
+			expect(addMessage).to.contain('Cannot add HTLC');
+			expect(addMessage).to.contain('claimed at channel_reestablish');
+			expect(addMessage).to.contain('showed no proof');
+			expect(addMessage).to.not.contain('Recovery Capsule');
+			expect(addMessage).to.not.contain('ERRORED state');
+			expect(opener.getFullState().htlcs.size).to.equal(htlcsBefore);
+
+			const shutdownScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const shutdown = opener.initiateShutdown(shutdownScript);
+			expect(shutdown).to.have.length(1);
+			expect(shutdown[0].type).to.equal(ChannelActionType.ERROR);
+			const shutdownMessage = (shutdown[0] as { message: string }).message;
+			expect(shutdownMessage).to.contain('Cannot close cooperatively');
+			expect(shutdownMessage).to.contain('claimed at channel_reestablish');
+			expect(shutdownMessage).to.not.contain('Recovery Capsule');
+			expect(shutdownMessage).to.not.contain('capsule');
+
+			const resume = opener.refuseHeldMutualClose();
+			const resumeError = resume.find(
+				(a) => a.type === ChannelActionType.ERROR
+			);
+			expect(resumeError, 'the shared held-close refusal').to.exist;
+			const resumeMessage = (resumeError as { message: string }).message;
+			expect(resumeMessage).to.contain('Cannot resume cooperative close');
+			expect(resumeMessage).to.contain('claimed at channel_reestablish');
+			expect(resumeMessage).to.not.contain('Recovery Capsule');
+
+			expectHeldForPeerClose(opener, openerPrivkeys[0]);
+		});
+
 		it('refuses an all-zero secret at a compatible non-zero revocation number', function () {
 			// Compatible counters do not excuse it either: above 0 the peer MUST
 			// send the last secret it received from us, and the validator, not
