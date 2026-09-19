@@ -1460,6 +1460,8 @@ export interface BeignetNodeEvents {
 		 * #908). Absent otherwise.
 		 */
 		restoreRecencyUnproven?: true;
+		/** The peer claimed newer state without proof; the same acknowledgement is required. */
+		reestablishRecencyUnproven?: true;
 	}) => void;
 	'ffor:witness-provisioned': (data: Record<string, unknown>) => void;
 	'ffor:witness-recorded': (data: Record<string, unknown>) => void;

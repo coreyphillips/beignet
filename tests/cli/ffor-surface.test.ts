@@ -4,7 +4,7 @@
  * (and the issuer refuses to start without the witness), the receiver
  * routes validate their parameters, and every route is in the OpenAPI
  * spec (the umbrel manager probes it). The enforcement routes take the
- * acceptStaleStateRisk acknowledgement on a capsule-restored channel, the
+ * acceptStaleStateRisk acknowledgement on either recency hold, the
  * same way /channel/forceclose does, and ffor:enforce names the hold
  * (issue #908).
  */
@@ -19,6 +19,8 @@ import { AddressInfo } from 'net';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
 import { BeignetError } from '../../src/cli/errors';
 import { resolveConfig } from '../../src/cli/config';
+import { InvalidRequestError } from '../../src/lightning/node/types';
+const sinon = require('sinon');
 import {
 	FforState,
 	FforVariant,
@@ -350,7 +352,7 @@ describe('FFOR surface: routes on a node with no epoch (issue #729)', () => {
 	});
 });
 
-describe('FFOR surface: enforcement on a capsule-restored channel (issue #908)', () => {
+describe('FFOR surface: enforcement on recency-held channels (issues #908 and #907)', () => {
 	let daemon: IStartedDaemon;
 	let dir: string;
 
@@ -425,11 +427,11 @@ describe('FFOR surface: enforcement on a capsule-restored channel (issue #908)',
 
 	/**
 	 * The recovery-surface fixture (issue #469) with a role-R epoch on it: a
-	 * NORMAL channel installed straight into the manager, carrying the
-	 * restoreRecencyUnproven row /channel/forceclose consults when `held`.
+	 * channel installed straight into the manager with the requested hold.
+	 * A reestablish hold uses ERRORED, as the invalid-secret handler does.
 	 * Shared daemon, so every cell takes its channel back out.
 	 */
-	function installChannel(held: boolean): {
+	function installChannel(held: boolean | 'reestablish' | 'both'): {
 		channelId: string;
 		idBuf: Buffer;
 		record: IFforEpochRecord;
@@ -466,7 +468,11 @@ describe('FFOR surface: enforcement on a capsule-restored channel (issue #908)',
 		state.channelId = crypto.randomBytes(32);
 		state.fundingTxid = crypto.randomBytes(32);
 		state.remoteBasepoints = bp;
-		if (held) state.restoreRecencyUnproven = true;
+		if (held === true || held === 'both') state.restoreRecencyUnproven = true;
+		if (held === 'reestablish' || held === 'both') {
+			state.reestablishRecencyUnproven = true;
+			state.state = ChannelState.ERRORED;
+		}
 		const peer = getPublicKey(crypto.randomBytes(32));
 		const record = epochRecord(peer);
 		state.ffor = record;
@@ -613,13 +619,205 @@ describe('FFOR surface: enforcement on a capsule-restored channel (issue #908)',
 		}
 	});
 
-	it('ffor:enforce carries restoreRecencyUnproven: true for a held channel only', async () => {
+	it('all force-close routes require exact acknowledgement for a reestablish hold', async () => {
+		const inner = daemon.node.getNode();
+		const forceClose = sinon.spy(inner.getChannelManager(), 'forceClose');
+		const recover = sinon.spy(inner, 'rescueFforEpoch');
+		try {
+			for (const hold of ['reestablish', 'both'] as const) {
+				const fx = installChannel(hold);
+				try {
+					for (const route of [
+						'/ffor/recover',
+						'/ffor/enforce',
+						'/channel/forceclose'
+					]) {
+						const body = {
+							channelId: fx.channelId.toUpperCase(),
+							...(route === '/ffor/recover'
+								? { forceCloseIfUnreachable: true }
+								: {})
+						};
+						for (const flag of [undefined, false, 'true', 1]) {
+							forceClose.resetHistory();
+							recover.resetHistory();
+							const res = await request(portOf(daemon), 'POST', route, {
+								...body,
+								...(flag === undefined ? {} : { acceptStaleStateRisk: flag })
+							});
+							expect(res.status, route).to.equal(400);
+							expect(errorOf(res).code).to.equal('INVALID_PARAMS');
+							expect(errorOf(res).message).to.match(/acceptStaleStateRisk/);
+							if (hold === 'reestablish') {
+								expect(errorOf(res).message).to.match(
+									/claimed at channel_reestablish/
+								);
+								expect(errorOf(res).message).to.not.match(/Recovery Capsule/);
+							}
+							expect(
+								forceClose.called,
+								`${route}: no commitment construction`
+							).to.equal(false);
+							expect(
+								recover.called,
+								`${route}: no recovery before acknowledgement`
+							).to.equal(false);
+						}
+						const accepted = await request(portOf(daemon), 'POST', route, {
+							...body,
+							acceptStaleStateRisk: true
+						});
+						// This fixture has no remote commitment signature. The channel
+						// route surfaces that engine refusal as 500; FFOR returns its result.
+						expect(accepted.status, route).to.equal(
+							route === '/channel/forceclose' ? 500 : 200
+						);
+						expect(errorOf(accepted).message ?? '').to.not.match(
+							/acceptStaleStateRisk/
+						);
+						expect(
+							forceClose.calledOnce,
+							`${route}: acknowledged engine exit`
+						).to.equal(true);
+					}
+					forceClose.resetHistory();
+					const passive = await request(
+						portOf(daemon),
+						'POST',
+						'/ffor/recover',
+						{
+							channelId: fx.channelId
+						}
+					);
+					expect(passive.status).to.equal(200);
+					expect(forceClose.called, 'passive recovery never closes').to.equal(
+						false
+					);
+				} finally {
+					fx.remove();
+				}
+			}
+		} finally {
+			recover.restore();
+			forceClose.restore();
+		}
+	});
+
+	it('rechecks a hold that arrives during witness retrieval before force closing', async () => {
+		const inner = daemon.node.getNode();
+		for (const flag of [undefined, 'true', 1, true]) {
+			const fx = installChannel(false);
+			fx.record.witnesses = [
+				{
+					witnessNodeId: fx.record.remoteNodeId,
+					mailboxId: crypto.randomBytes(32),
+					fetchPrivkey: crypto.randomBytes(32),
+					encPrivkey: crypto.randomBytes(32),
+					retentionUntil: 802_000,
+					minReceipts: 1,
+					manifestWire: Buffer.alloc(0),
+					ackedAt: 1
+				}
+			];
+			let release!: () => void;
+			let entered!: () => void;
+			const waiting = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const started = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const fetch = sinon
+				.stub(inner, 'fetchFforWitnessRecords')
+				.callsFake(async () => {
+					entered();
+					await waiting;
+					return [];
+				});
+			const forceClose = sinon.spy(inner.getChannelManager(), 'forceClose');
+			try {
+				const pending = request(portOf(daemon), 'POST', '/ffor/recover', {
+					channelId: fx.channelId,
+					forceCloseIfUnreachable: true,
+					...(flag === undefined ? {} : { acceptStaleStateRisk: flag })
+				});
+				await started;
+				const { ChannelState } = require('../../src/lightning/channel/types');
+				Object.assign(
+					inner.getChannelManager().getChannel(fx.idBuf)!.getFullState(),
+					{
+						reestablishRecencyUnproven: true,
+						state: ChannelState.ERRORED
+					}
+				);
+				release();
+				const result = await pending;
+				if (flag === true) {
+					expect(result.status).to.equal(200);
+					expect(forceClose.calledOnce).to.equal(true);
+				} else {
+					expect(result.status).to.equal(400);
+					expect(errorOf(result).code).to.equal('INVALID_PARAMS');
+					expect(errorOf(result).message).to.match(
+						/claimed at channel_reestablish/
+					);
+					expect(errorOf(result).message).to.match(/acceptStaleStateRisk/);
+					expect(forceClose.called).to.equal(false);
+				}
+			} finally {
+				release();
+				fetch.restore();
+				forceClose.restore();
+				fx.remove();
+			}
+		}
+	});
+
+	it('direct FFOR recovery also requires exact acknowledgement for either hold', async () => {
+		const inner = daemon.node.getNode();
+		const forceClose = sinon.spy(inner.getChannelManager(), 'forceClose');
+		try {
+			for (const hold of [true, 'reestablish'] as const) {
+				const fx = installChannel(hold);
+				try {
+					const { ChannelState } = require('../../src/lightning/channel/types');
+					inner.getChannelManager().getChannel(fx.idBuf)!.getFullState().state =
+						ChannelState.ERRORED;
+					for (const flag of [undefined, false, 'true', 1]) {
+						forceClose.resetHistory();
+						let refusal: unknown;
+						try {
+							await inner.rescueFforEpoch(fx.channelId, {
+								forceCloseIfUnreachable: true,
+								acceptStaleStateRisk: flag as boolean | undefined,
+								destinationScript: Buffer.from('0014' + '22'.repeat(20), 'hex')
+							});
+						} catch (err) {
+							refusal = err;
+						}
+						expect(refusal).to.be.instanceOf(InvalidRequestError);
+						expect((refusal as Error).message).to.match(/acceptStaleStateRisk/);
+						expect(forceClose.called).to.equal(false);
+					}
+				} finally {
+					fx.remove();
+				}
+			}
+		} finally {
+			forceClose.restore();
+		}
+	});
+
+	it('ffor:enforce reports both hold origins independently', async () => {
 		const held = installChannel(true);
+		const reestablish = installChannel('reestablish');
+		const both = installChannel('both');
 		const plain = installChannel(false);
 		const events: Array<{
 			channelId: string;
 			epoch: Record<string, unknown>;
 			restoreRecencyUnproven?: true;
+			reestablishRecencyUnproven?: true;
 		}> = [];
 		const listener = (e: (typeof events)[number]): void => {
 			events.push(e);
@@ -629,24 +827,28 @@ describe('FFOR surface: enforcement on a capsule-restored channel (issue #908)',
 			// The manager's escalation (section 7.5.5) arrives at BeignetNode
 			// through LightningNode's relay; drive that relay directly.
 			const inner = daemon.node.getNode();
-			inner.emit('ffor:enforce', {
-				channelId: held.idBuf,
-				record: held.record
-			});
-			inner.emit('ffor:enforce', {
-				channelId: plain.idBuf,
-				record: plain.record
-			});
-			expect(events).to.have.length(2);
+			for (const fx of [held, reestablish, both, plain]) {
+				inner.emit('ffor:enforce', { channelId: fx.idBuf, record: fx.record });
+			}
+			expect(events).to.have.length(4);
 			expect(events[0].channelId).to.equal(held.channelId);
 			expect(events[0].restoreRecencyUnproven).to.equal(true);
+			expect(events[0]).to.not.have.property('reestablishRecencyUnproven');
 			expect(events[0].epoch.state).to.equal('ACTIVE');
-			expect(events[1].channelId).to.equal(plain.channelId);
+			expect(events[1].channelId).to.equal(reestablish.channelId);
 			expect(events[1]).to.not.have.property('restoreRecencyUnproven');
-			expect(events[1].epoch.activationMismatch).to.equal(true);
+			expect(events[1].reestablishRecencyUnproven).to.equal(true);
+			expect(events[2].restoreRecencyUnproven).to.equal(true);
+			expect(events[2].reestablishRecencyUnproven).to.equal(true);
+			expect(events[3].channelId).to.equal(plain.channelId);
+			expect(events[3]).to.not.have.property('restoreRecencyUnproven');
+			expect(events[3]).to.not.have.property('reestablishRecencyUnproven');
+			expect(events[3].epoch.activationMismatch).to.equal(true);
 		} finally {
 			daemon.node.off('ffor:enforce', listener);
 			held.remove();
+			reestablish.remove();
+			both.remove();
 			plain.remove();
 		}
 	});

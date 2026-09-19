@@ -1422,6 +1422,20 @@ const STALE_STATE_FORCE_CLOSE_REFUSAL =
 	'the peer to close is the safe outcome. Set ' +
 	'acceptStaleStateRisk: true to force close anyway.';
 
+const REESTABLISH_FORCE_CLOSE_REFUSAL =
+	'The peer claimed at channel_reestablish that this channel state is ' +
+	'behind and showed no proof. Its recency cannot be proven, so the node ' +
+	'will not broadcast its commitment on its own initiative. If the claim ' +
+	'is true, force closing publishes a revoked commitment and the whole ' +
+	'channel balance is lost to the justice path; if the peer is lying, ' +
+	'the close is safe. Waiting for the peer to close is the safe outcome. ' +
+	'Set acceptStaleStateRisk: true to force close anyway.';
+
+interface IRecencyHold {
+	restoreRecencyUnproven?: true;
+	reestablishRecencyUnproven?: true;
+}
+
 export class BeignetNode extends EventEmitter {
 	private fforReceiveService?: FforReceiveService;
 	private offlineReceive?: OfflineReceive;
@@ -3046,7 +3060,7 @@ export class BeignetNode extends EventEmitter {
 				this.emit('ffor:enforce', {
 					channelId: hex,
 					epoch: this.fforEpochView(hex, record),
-					...(this.restoreHeld(hex) ? { restoreRecencyUnproven: true } : {})
+					...this.recencyHold(channelId)
 				});
 			}
 		);
@@ -7212,7 +7226,7 @@ export class BeignetNode extends EventEmitter {
 	}): Promise<Record<string, unknown>> {
 		const idBuf = this.fforChannelId(body.channelId);
 		// forceCloseIfUnreachable reaches the engine's force close directly,
-		// so on a capsule-restored channel it needs the acknowledgement
+		// so a channel held for either recency reason needs the acknowledgement
 		// /channel/forceclose and /ffor/enforce demand (issue #908). Strict
 		// boolean, the same rule those routes use. Refused before the witness
 		// fetch: the operator asked for a close this node will not make
@@ -7220,16 +7234,31 @@ export class BeignetNode extends EventEmitter {
 		// ours exists, so a channel without one keeps its own refusal.
 		if (
 			body.forceCloseIfUnreachable === true &&
-			body.acceptStaleStateRisk !== true &&
-			this.node.getFforEpoch(idBuf.toString('hex'))?.role === 'R' &&
-			this.restoreHeld(idBuf.toString('hex'))
+			this.node.getFforEpoch(idBuf.toString('hex'))?.role === 'R'
 		) {
-			throw new BeignetError('INVALID_PARAMS', STALE_STATE_FORCE_CLOSE_REFUSAL);
+			this.requireForceCloseAcknowledgement(
+				idBuf,
+				body.acceptStaleStateRisk === true
+			);
 		}
-		const r = await this.node.rescueFforEpoch(idBuf.toString('hex'), {
-			forceCloseIfUnreachable: body.forceCloseIfUnreachable === true,
-			destinationScript: this.fforDestinationScript()
-		});
+		const r = await this.node
+			.rescueFforEpoch(idBuf.toString('hex'), {
+				forceCloseIfUnreachable: body.forceCloseIfUnreachable === true,
+				acceptStaleStateRisk: body.acceptStaleStateRisk === true,
+				destinationScript: this.fforDestinationScript()
+			})
+			.catch((err: unknown) => {
+				if (err instanceof InvalidRequestError) {
+					// The hold may have arrived during witness retrieval. Preserve
+					// the same origin-specific refusal as the preflight check.
+					this.requireForceCloseAcknowledgement(
+						idBuf,
+						body.acceptStaleStateRisk === true
+					);
+					throw new BeignetError('INVALID_PARAMS', err.message);
+				}
+				throw err;
+			});
 		return {
 			action: r.action,
 			preimagesKnown: r.preimagesKnown,
@@ -7384,8 +7413,7 @@ export class BeignetNode extends EventEmitter {
 	forceCloseChannel(
 		channelId: string,
 		// The labelled risk acknowledgement RECOVERY-PROTOCOL 5.6 asks for
-		// (issue #469). Required only for a channel restored from a Recovery
-		// Capsule, whose recency nothing can prove: this node refuses to
+		// (issues #469 and #907). Required for either recency hold: this node refuses to
 		// broadcast such a commitment on its own initiative because the peer
 		// may already hold a revocation for it, and an operator command is the
 		// documented exit. It should be a decision, not a default, so the
@@ -7419,12 +7447,7 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		// Compare on the DECODED bytes, which is what the engine resolves.
-		if (
-			this.restoreHeld(idBuf.toString('hex')) &&
-			acceptStaleStateRisk !== true
-		) {
-			throw new BeignetError('INVALID_PARAMS', STALE_STATE_FORCE_CLOSE_REFUSAL);
-		}
+		this.requireForceCloseAcknowledgement(idBuf, acceptStaleStateRisk);
 		// Sweep recovered funds into the wallet-owned address (tracked + spendable)
 		// when available; fall back to the LN funding address otherwise.
 		let destinationScript = this.sweepDestinationScript;
@@ -7439,18 +7462,44 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Whether a channel is a capsule restore whose recency nothing has
-	 * proven (issue #469), read off the recovery status row on the canonical
-	 * (decoded) id. The one fact every operator force close and the
-	 * ffor:enforce event consult, so they cannot disagree (issue #908).
+	 * Read both recency holds from the channel that the engine will close.
+	 * The force-close routes and enforcement event share this snapshot so
+	 * a reestablish hold gets the same acknowledgement as a capsule hold.
 	 */
-	private restoreHeld(canonicalId: string): boolean {
-		return (
-			this.node
-				.getRecoveryStatus()
-				.channels.find((c) => c.channelId === canonicalId)
-				?.restoreRecencyUnproven === true
-		);
+	private recencyHold(channelId: Buffer): IRecencyHold {
+		const state:
+			| {
+					restoreRecencyUnproven?: boolean;
+					reestablishRecencyUnproven?: boolean;
+			  }
+			| undefined = this.node
+			.getChannelManager()
+			.getChannel(channelId)
+			?.getFullState();
+		return {
+			...(state?.restoreRecencyUnproven === true
+				? { restoreRecencyUnproven: true as const }
+				: {}),
+			...(state?.reestablishRecencyUnproven === true
+				? { reestablishRecencyUnproven: true as const }
+				: {})
+		};
+	}
+
+	private requireForceCloseAcknowledgement(
+		channelId: Buffer,
+		acceptStaleStateRisk: boolean
+	): void {
+		if (acceptStaleStateRisk === true) return;
+		const hold = this.recencyHold(channelId);
+		if (hold.restoreRecencyUnproven || hold.reestablishRecencyUnproven) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				hold.restoreRecencyUnproven
+					? STALE_STATE_FORCE_CLOSE_REFUSAL
+					: REESTABLISH_FORCE_CLOSE_REFUSAL
+			);
+		}
 	}
 
 	/**

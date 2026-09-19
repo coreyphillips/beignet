@@ -499,9 +499,11 @@ BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS=120000   # never wait longer than this; 
   enforcement routes publish the same commitment and take the same flag:
   `POST /ffor/enforce`, and `POST /ffor/recover` with
   `forceCloseIfUnreachable: true`, are refused on such a channel without
-  `acceptStaleStateRisk: true` (issue #908), and the `ffor:enforce` event
-  carries `restoreRecencyUnproven: true` for it so the embedder knows to
-  ask.
+  `acceptStaleStateRisk: true` (issue #908). The same acknowledgement is
+  required when the peer claimed newer state at reestablish without a
+  valid secret (`reestablishRecencyUnproven`, issue #907). The
+  `ffor:enforce` event carries `restoreRecencyUnproven: true`,
+  `reestablishRecencyUnproven: true`, or both, matching the channel's holds.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.

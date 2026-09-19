@@ -1247,3 +1247,25 @@ export function mustNotBroadcastCommitment(state: {
 }): boolean {
 	return state.dataLossDetected === true || state.stateUncertain === true;
 }
+
+/**
+ * The recency HOLD (issues #469 and #907): the row's recency cannot be
+ * proven, either because it came from a Recovery Capsule
+ * (restoreRecencyUnproven) or because the peer claimed at channel_reestablish
+ * that it is behind without showing the secret that would prove it
+ * (reestablishRecencyUnproven). Narrower than mustNotBroadcastCommitment: the
+ * node will not broadcast its commitment ON ITS OWN INITIATIVE (every
+ * automatic close is refused and the peer is asked to close instead), takes
+ * no new HTLCs and refuses a mutual close, but the operator's labelled force
+ * close stays open. Every hold site consults this ONE predicate so the two
+ * flags carry exactly the same semantics.
+ */
+export function isRecencyUnproven(state: {
+	restoreRecencyUnproven?: boolean;
+	reestablishRecencyUnproven?: boolean;
+}): boolean {
+	return (
+		state.restoreRecencyUnproven === true ||
+		state.reestablishRecencyUnproven === true
+	);
+}
