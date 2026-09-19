@@ -16,8 +16,10 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	createOpenerState,
-	createAcceptorState
+	createAcceptorState,
+	mustNotBroadcastCommitment
 } from '../../src/lightning/channel/channel-state';
+import { ChannelRecoveryStatus } from '../../src/lightning/recovery/channel-status';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG
@@ -256,11 +258,16 @@ function makeForeignPoint(tag: string): Buffer {
 }
 
 /**
- * The refusal an all-zero yourLastPerCommitmentSecret draws above
+ * The refusal a wrong yourLastPerCommitmentSecret draws above
  * next_revocation_number 0 (issue #907): the channel fails with the
- * validator's wire error, persisted first, and no DLP flag or broadcast.
+ * validator's wire error, persisted first, and records no proof of data
+ * loss. What the failure may then broadcast is NOT answered here:
+ * handleReestablish returns no BROADCAST_TX on any path, the close is driven
+ * by the node from the ERRORED-plus-wire-error pair, so each cell asserts the
+ * never-broadcast predicate and forceClose itself, and
+ * reestablish-secret-hold.test.ts drives the same messages through a node.
  */
-function expectZeroSecretRefusal(
+function expectWrongSecretRefusal(
 	channel: Channel,
 	actions: ReturnType<Channel['handleReestablish']>
 ): void {
@@ -277,8 +284,35 @@ function expectZeroSecretRefusal(
 	const state = channel.getFullState();
 	expect(state.dataLossDetected).to.not.equal(true);
 	expect(state.dlpRemotePerCommitmentPoint).to.not.exist;
-	expect(actions.find((a) => a.type === ChannelActionType.BROADCAST_TX)).to.not
-		.exist;
+}
+
+/**
+ * The never-broadcast terminal an unverifiable gap claim lands in: the row
+ * is StateUncertain with its 5.6 disposition stamped, the predicate every
+ * automatic close consults refuses, forceClose refuses on the same predicate
+ * (the operator's route runs through it too), and the disposition
+ * regenerates the peer-close request for every reconnect.
+ */
+function expectHeldForPeerClose(channel: Channel, signerPrivkey: Buffer): void {
+	const state = channel.getFullState();
+	expect(state.stateUncertain).to.equal(true);
+	expect(state.recoveryCloseReason).to.equal('state-uncertain');
+	expect(mustNotBroadcastCommitment(state)).to.equal(true);
+	expect(channel.getRecoveryStatus()).to.equal(
+		ChannelRecoveryStatus.StateUncertain
+	);
+	const closeActions = channel.forceClose(new ChannelSigner(signerPrivkey));
+	expect(closeActions.find((a) => a.type === ChannelActionType.BROADCAST_TX)).to
+		.not.exist;
+	expect(closeActions).to.have.length(1);
+	expect(closeActions[0].type).to.equal(ChannelActionType.ERROR);
+	expect((closeActions[0] as { message: string }).message).to.contain(
+		'not proven current'
+	);
+	expect(channel.getState()).to.equal(ChannelState.ERRORED);
+	const regenerated = channel.buildRecoveryCloseActions();
+	expect(regenerated[0].type).to.equal(ChannelActionType.PERSIST_STATE);
+	expect(findSendAction(regenerated, MessageType.ERROR)).to.exist;
 }
 
 describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
@@ -340,12 +374,17 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 			expect(broadcast).to.not.exist;
 		});
 
-		it('refuses an all-zero secret on a counter gap instead of the plain gap arm', function () {
+		it('refuses an all-zero secret on a counter gap and holds the channel for the peer', function () {
 			// The bug (issue #907): with zeroes, the same gap that a real secret
 			// turns into the fell-behind proof used to reach the plain gap arm,
 			// which sets no broadcast ban. BOLT 2 allows zeroes only at
 			// next_revocation_number 0, so above it they are a wrong secret.
-			const { opener, acceptor } = setupNormalChannels();
+			// And a wrong secret at an index this row never released is a claim
+			// it can check in neither direction, so the refusal must not put
+			// OUR commitment on chain either: the node fails every
+			// ERRORED-plus-wire-error pair on chain unless the never-broadcast
+			// predicate says otherwise, which is what StateUncertain does here.
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
 			exchangeCommitments(opener, acceptor);
 
 			const pre = opener.getFullState();
@@ -359,7 +398,7 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 			};
 			const actions = opener.handleReestablish(msg);
 
-			expectZeroSecretRefusal(opener, actions);
+			expectWrongSecretRefusal(opener, actions);
 			expect(
 				actions.find(
 					(a) =>
@@ -368,12 +407,43 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 				),
 				'the plain gap arms never see it'
 			).to.not.exist;
+			expectHeldForPeerClose(opener, openerPrivkeys[0]);
+		});
+
+		it('holds on any wrong secret at the smallest unreleased index', function () {
+			// The class is "a secret we cannot check at an index we never
+			// released", not zeroes in particular: next_revocation_number at
+			// localCommitmentNumber + 1 names index localCommitmentNumber, the
+			// first one this row has not revoked, and a random value there is
+			// as unverifiable as zeroes. The fell-behind arm would not have
+			// claimed this shape even with the real secret (the sig-in-flight
+			// case), so without the hold the refusal alone reached the chain.
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const pre = opener.getFullState();
+			opener.markForReestablish();
+			const msg: IChannelReestablishMessage = {
+				channelId: opener.getChannelId()!,
+				nextCommitmentNumber: pre.remoteCommitmentNumber + 1n,
+				nextRevocationNumber: pre.localCommitmentNumber + 1n,
+				yourLastPerCommitmentSecret: crypto.randomBytes(32),
+				myCurrentPerCommitmentPoint: makeForeignPoint('garbage-plus-one')
+			};
+			const actions = opener.handleReestablish(msg);
+
+			expectWrongSecretRefusal(opener, actions);
+			expectHeldForPeerClose(opener, openerPrivkeys[0]);
 		});
 
 		it('refuses an all-zero secret at a compatible non-zero revocation number', function () {
 			// Compatible counters do not excuse it either: above 0 the peer MUST
 			// send the last secret it received from us, and the validator, not
-			// the retransmission logic, answers a wrong one.
+			// the retransmission logic, answers a wrong one. The index named
+			// here (localCommitmentNumber - 1) is one this row DID release, so
+			// the wrong value is a plain violation with no claim on our state:
+			// no hold, and the node fails the channel on chain as it does for
+			// any other wire error.
 			const { opener, acceptor } = setupNormalChannels();
 			exchangeCommitments(opener, acceptor);
 
@@ -389,7 +459,11 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 			};
 			const actions = opener.handleReestablish(msg);
 
-			expectZeroSecretRefusal(opener, actions);
+			expectWrongSecretRefusal(opener, actions);
+			const state = opener.getFullState();
+			expect(state.stateUncertain).to.not.equal(true);
+			expect(state.recoveryCloseReason).to.not.exist;
+			expect(mustNotBroadcastCommitment(state)).to.equal(false);
 		});
 	});
 

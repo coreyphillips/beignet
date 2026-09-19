@@ -899,6 +899,12 @@ export interface IChannelState {
 	 * flag off. While set, reestablish routes the channel to the DLP path
 	 * (error out, the peer closes with its commitment); a peer positively
 	 * proving us stale upgrades to dataLossDetected.
+	 *
+	 * Also set by handleReestablish, beside the ERRORED transition, when the
+	 * peer's channel_reestablish counts a revoke_and_ack this row never sent
+	 * without the secret that would prove it (issue #907): the claim can be
+	 * checked in neither direction, and a commitment the peer may already
+	 * hold the revocation for is never broadcast on an unverified word.
 	 */
 	stateUncertain?: boolean;
 	/**

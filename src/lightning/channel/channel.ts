@@ -9808,6 +9808,29 @@ export class Channel {
 			if (!msg.yourLastPerCommitmentSecret.equals(expectedSecret)) {
 				// BOLT 2: MUST fail the channel — the peer is lying about (or has
 				// corrupted) our revocation chain. Wire error like the DLP path.
+				//
+				// Whether the failure may broadcast OUR commitment depends on
+				// the index the peer named. Released indices run
+				// 0..localCommitmentNumber-1, so above localCommitmentNumber the
+				// peer counts a revoke_and_ack this row never sent, without the
+				// secret that would prove it (the fell-behind arm below). A
+				// peer that holds our newer state but cannot, or will not, show
+				// that secret looks exactly like one inventing the gap, and in
+				// the first case our latest commitment is revoked in its view.
+				// The ordinary refusal alone leaves the node to fail the channel
+				// on chain (handleChannelErrored), which would hand such a peer
+				// the very broadcast the fell-behind arm denies it. So the row
+				// is marked StateUncertain first: mustNotBroadcastCommitment
+				// then refuses every broadcast of this commitment, the errored
+				// close, the timeout backstops and the operator's alike, and the
+				// 5.6 disposition asks the peer to close with ITS commitment on
+				// every reconnect, from which we sweep our to_remote. At or
+				// below localCommitmentNumber the index is one we released, so a
+				// wrong value there is a plain violation with no claim on our
+				// state, and the channel fails the ordinary way.
+				if (msg.nextRevocationNumber > this._state.localCommitmentNumber) {
+					this._state.stateUncertain = true;
+				}
 				return this._failChannelWithWireError(
 					'Invalid per-commitment secret in channel_reestablish'
 				);
