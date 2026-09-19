@@ -1600,6 +1600,10 @@ export class Channel {
 	 * normal operation only its PUBLIC part is shared (partialVerify is a public
 	 * op). The per-signature SIGNING nonce used when WE co-sign the peer's
 	 * commitment is a SEPARATE, fresh-random nonce — never derived here.
+	 * PRECONDITION: all of this assumes ONE per-commitment seed per channel,
+	 * which only a never-reused channel key index guarantees (issue #906):
+	 * two channels sharing a seed share every verification nonce, and their
+	 * force closes at one height sign two sighashes under one secnonce.
 	 */
 	private _deriveVerificationNonce(height: bigint): Uint8Array {
 		const heightBuf = Buffer.alloc(8);
