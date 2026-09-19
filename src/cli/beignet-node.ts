@@ -4618,8 +4618,8 @@ export class BeignetNode extends EventEmitter {
 		if (this.node.getCurrentBlockHeight() === 0) {
 			return (
 				'New channels are refused until the chain tip is known: the next ' +
-				'channel key index is floored at the tip so no previous device ' +
-				"channel's keys are reused"
+				'channel key index is floored at the tip times the stride (128 ' +
+				"per block) so no previous device channel's keys are reused"
 			);
 		}
 		return null;
