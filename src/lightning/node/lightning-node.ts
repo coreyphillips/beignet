@@ -614,6 +614,15 @@ const SWAP_TICK_SWEEP_DEADLINE_MS = 30_000;
 const HELD_FORWARD_ROW_BYTES = 1024;
 /** Metadata key the receiver's async receive grants persist under. */
 const ASYNC_RECEIVE_GRANTS_KEY = 'async_receive_grants';
+/**
+ * Metadata key the chain-tip floor on the next channel key index persists
+ * under (issue #906). Absent on a database that was populated on every boot
+ * of its life; '0' on one born from a bare seed that has not learned a real
+ * chain tip yet (the birth window, re-armed by a restart); a positive value
+ * once the birth boot's first real tip floored the counter (at the tip times
+ * CHANNEL_INDEX_FLOOR_STRIDE), written once.
+ */
+const CHANNEL_KEY_INDEX_FLOOR_KEY = 'channel_key_index_floor';
 /** Default wait for an LSP's answer to a registration request. */
 const ASYNC_GRANT_REQUEST_TIMEOUT_MS = 30_000;
 /** Grants kept per LSP (newest first); older ones are dropped. */
@@ -880,6 +889,13 @@ export class LightningNode extends EventEmitter {
 	 */
 	private _wiredChainWatcher: ChainWatcher | null = null;
 	private currentBlockHeight = 0;
+	/**
+	 * Issue #906: true from a birth boot (decided in restoreFromStorage)
+	 * until the chain-tip floor on the next channel key index has fired and
+	 * its value is in the durable row; the per-header check is a no-op after
+	 * that, and on every later boot.
+	 */
+	private channelIndexFloorPending = false;
 	/** FFOR D-R receipt witness (section 9.6), when this node serves as one. */
 	private fforWitness: FforWitnessService | null = null;
 	/** FFOR BOLT 12 issuer (section 9.7), co-hosted with the witness. */
@@ -1619,6 +1635,7 @@ export class LightningNode extends EventEmitter {
 			chainHash: config.chainHashes?.[0] ?? this.chainHash(),
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
+			newChannelsRefused: config.newChannelsRefused,
 			signerFactory: config.signerFactory,
 			// Recovery 5.8: in quorum mode this holds a batch's remaining
 			// actions until the frame behind them is replicated. In every
@@ -2618,6 +2635,40 @@ export class LightningNode extends EventEmitter {
 		if (nextChannelIndex > this.channelManager.nextChannelIndex) {
 			this.channelManager.nextChannelIndex = nextChannelIndex;
 		}
+		// Issue #906: with NO key-index row at all there is no high-water mark
+		// to seed from, and a counter left at 1 would hand the next channel,
+		// opened or accepted, the keys of whichever channel a previous device
+		// held at index 1. Such a birth boot floors the counter at the chain
+		// tip times CHANNEL_INDEX_FLOOR_STRIDE instead (128 indices per
+		// block, a bounded margin for consumed indices, including open attempts
+		// that validation later rejects), ONCE: from the height persisted
+		// below when there is one, else from the first header, and the value
+		// it reaches goes to the floor row (persistChannelIndexFloor). Every
+		// later boot seeds the counter from max(table high-water mark, row)
+		// and no header moves it again. An empty table is told apart from
+		// one whose top index is 0 (both answer 1 above) by the existence
+		// query, with the enumerator and then the answer itself standing in
+		// for backends that lack it.
+		const keyIndexTableEmpty = this.storage.hasChannelKeyIndices
+			? !this.storage.hasChannelKeyIndices()
+			: this.storage.loadAllChannelKeyIndices
+			? this.storage.loadAllChannelKeyIndices().length === 0
+			: nextChannelIndex <= 1;
+		// The floor row (issue #906 review). The key-index table cannot stand
+		// in for it: the floor raises the counter without writing any row,
+		// and a partial restore on the birth boot (an SCB missing its
+		// highest-index entry) lands rows BELOW the floor, so the next boot
+		// would read a populated table and seed the counter from a high-water
+		// mark a previous device had already passed. A '0' is the birth
+		// marker: the floor has not fired yet, so this boot is still a birth
+		// boot whatever that restore landed in the table meanwhile.
+		const floorRow = this.storage.loadMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY);
+		const persistedFloor = floorRow === null ? NaN : parseInt(floorRow, 10);
+		const floorPersisted =
+			Number.isFinite(persistedFloor) && persistedFloor > 0;
+		if (floorPersisted) this.channelManager.nextChannelIndex = persistedFloor;
+		const birthBoot =
+			!floorPersisted && (keyIndexTableEmpty || persistedFloor === 0);
 
 		// Restore channels — look up per-channel key index for each
 		for (const {
@@ -2895,6 +2946,22 @@ export class LightningNode extends EventEmitter {
 			const height = parseInt(savedHeight, 10);
 			if (!isNaN(height) && height > 0) {
 				this.currentBlockHeight = height;
+			}
+		}
+		// Issue #906: a birth boot arms the chain-tip floor on the next channel
+		// index. It fires now from the persisted height when there is one
+		// (without checking its freshness), else from the first
+		// header; either way the value is written once it has fired. Until
+		// then the row holds the birth marker, so a restart before any header
+		// is a birth boot again.
+		if (birthBoot) {
+			this.channelIndexFloorPending = true;
+			this.channelManager.armChannelIndexTipFloor(this.currentBlockHeight);
+			if (!this.persistChannelIndexFloor() && floorRow === null) {
+				this.safeStorage(
+					() => this.storage!.saveMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY, '0'),
+					'saveChannelKeyIndexFloor'
+				);
 			}
 		}
 
@@ -24477,6 +24544,36 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Issue #906: make the chain-tip floor on the next channel key index
+	 * outlive the process. The floor raises the manager's counter without
+	 * writing any key-index row, so on its own it lasts one boot: a partial
+	 * restore on that boot (an SCB missing its highest-index entry) leaves
+	 * rows below the floor, and the next boot, seeing a populated table,
+	 * would seed the counter from those rows and hand the next channel an
+	 * index the previous device already used. Called at arm time and after
+	 * every header while the floor is pending; writes ONCE, the moment the
+	 * floor has fired, and is a no-op after that and on every later boot.
+	 * The value is the counter the floor raised (the tip times
+	 * CHANNEL_INDEX_FLOOR_STRIDE, or above it when something already stood
+	 * higher), and restoreFromStorage seeds every later boot's counter from
+	 * it beside the table's own high-water mark.
+	 * Returns true once the row holds the floor.
+	 */
+	private persistChannelIndexFloor(): boolean {
+		if (!this.storage) return false;
+		if (!this.channelIndexFloorPending) return true;
+		if (this.channelManager.channelIndexTipFloorArmed) return false;
+		const floor = this.channelManager.nextChannelIndex;
+		const written = this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY, String(floor)),
+			'saveChannelKeyIndexFloor'
+		);
+		if (written) this.channelIndexFloorPending = false;
+		return written;
+	}
+
+	/**
 	 * Every per-block obligation the NODE owns, for one header.
 	 *
 	 * Split out of handleNewBlock because a node with a configured chain
@@ -24505,6 +24602,8 @@ export class LightningNode extends EventEmitter {
 				// best-effort
 			}
 		}
+		// Issue #906: a birth boot's first header fires the floor; write it.
+		this.persistChannelIndexFloor();
 		this.retryOwedHeldForwardFailures();
 		// Funding txs we are obligated to broadcast (BOLT 2) but which have
 		// not confirmed yet: retry, so a transient failure at watch:funding
@@ -25525,6 +25624,7 @@ export class LightningNode extends EventEmitter {
 			channelKeyDeriver?: (
 				channelIndex: number
 			) => import('../channel/channel-manager').IPerChannelKeys;
+			newChannelsRefused?: INodeConfig['newChannelsRefused'];
 		}
 	): LightningNode {
 		const coinType = options?.coinType ?? LnCoinType.REGTEST;
@@ -25602,7 +25702,8 @@ export class LightningNode extends EventEmitter {
 			watchtowers: options?.watchtowers,
 			recovery: options?.recovery,
 			guardianHost: options?.guardianHost,
-			channelKeyDeriver
+			channelKeyDeriver,
+			newChannelsRefused: options?.newChannelsRefused
 		});
 	}
 

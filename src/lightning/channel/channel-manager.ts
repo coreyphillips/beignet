@@ -328,6 +328,18 @@ export interface IChannelManagerConfig {
 	 */
 	channelKeyDeriver?: (channelIndex: number) => IPerChannelKeys;
 	/**
+	 * Fence on brand-new channels (issue #906). Consulted by every path that
+	 * would consume a fresh channel key index, the inbound acceptors
+	 * included, and read anew each time. A non-null answer is the reason the
+	 * open is refused with: on the wire as a BOLT 1 error for an inbound
+	 * open_channel or open_channel2, as a throw for an outbound open; no
+	 * index is consumed either way. The daemon supplies it during active
+	 * capsule auto-apply or a rebuild, and while its block height is zero.
+	 * Idle or refused auto-apply permits opens at a nonzero height. Unset,
+	 * every open is allowed exactly as before.
+	 */
+	newChannelsRefused?: () => string | null;
+	/**
 	 * Custom {@link ISigner} factory (e.g. a remote/external signer). When
 	 * set, it replaces the internal ChannelSigner construction for every
 	 * channel signer, keyed by the channel's key index (0 for node-level
@@ -496,6 +508,39 @@ const MAX_UNKNOWN_REESTABLISH_HOLD_MS = 2_147_483_647;
 const MAX_WIRE_ERROR_DATA_BYTES = 0xffff;
 
 /**
+ * Issue #906: how many channel key indices the chain-tip floor spaces per
+ * block. A birth boot (no key-index row, no persisted floor) starts the next
+ * index at tip * CHANNEL_INDEX_FLOOR_STRIDE rather than at the tip itself,
+ * because every open attempt that reaches key derivation consumes an index,
+ * including attempts that validation later rejects, while the floor advances
+ * per block. The spacing budget is 128 consumed indices per elapsed block,
+ * not 128 successfully funded channels, and no allocation rate limit enforces
+ * it. Same-block restores and allocations beyond that budget can still
+ * collide (see _channelIndexTipFloor). The index is a hardened
+ * BIP32 child in the default deriver, so it must stay under 0x7fffffff
+ * (2^31 - 1, MAX_BIP32_DERIVATION_INDEX in backup/scb.ts): 0x7fffffff / 128
+ * is 16,777,215 blocks, over 300 years of mainnet at ten minutes a block and
+ * several times testnet3's storm-inflated height, so 128 times any plausible
+ * tip stays under the limit; CHANNEL_INDEX_FLOOR_MAX clamps the product for
+ * a height that is not plausible.
+ */
+export const CHANNEL_INDEX_FLOOR_STRIDE = 128;
+
+/**
+ * Issue #906: the ceiling on the floored value. The height the floor
+ * multiplies is the chain backend's word, unvalidated, and the product must
+ * stay a derivable hardened index: 0x7fffffff (2^31 - 1) is the last one,
+ * and a height above 16,777,215 (0x7fffffff / 128, rounded down) would
+ * carry the counter past it in one step, after which every derivation
+ * throws. The ceiling stops 2^20 short of the limit, 0x7fffffff - 0x100000
+ * = 0x7fefffff = 2,146,435,071, so a database clamped here still has
+ * 1,048,576 indices to hand out before the deriver refuses. Heights up to
+ * 16,769,023 (0x7fefffff / 128, rounded down) floor unclamped; no real
+ * chain reaches that.
+ */
+export const CHANNEL_INDEX_FLOOR_MAX = 0x7fffffff - 2 ** 20;
+
+/**
  * `reason` as wire bytes, clamped to what the length prefix can carry.
  *
  * Not every reason is ours: abortPendingOpen quotes an IFundingProvider error
@@ -646,6 +691,27 @@ export class ChannelManager extends EventEmitter {
 	private _knownPreimages: Map<string, Buffer> = new Map();
 	private zeroConfManager: ZeroConfManager = new ZeroConfManager();
 	private _nextChannelIndex = 1;
+	/**
+	 * Issue #906: armed on a boot whose database has no record of the next
+	 * channel key index yet (no key-index row and no persisted floor, see
+	 * LightningNode.restoreFromStorage). While armed, the FIRST real height
+	 * learned, a header or a height the node already knew, floors the next
+	 * index at max(current, tip * CHANNEL_INDEX_FLOOR_STRIDE) and disarms:
+	 * the floor fires once per database, the node persists the value it
+	 * reached, and every later boot seeds the counter from that row beside
+	 * the table's own high-water mark, with no header moving it again.
+	 * For unclamped heights H > H0, sequential allocation from H0 * 128
+	 * leaves every consumed index below a fresh boot's H * 128 while at
+	 * most 128 * (H - H0) indices have been consumed. Count every attempt
+	 * reaching derivation, including later rejected attempts, not just funded
+	 * channels.
+	 * This is bounded spacing, not a uniqueness guarantee or an enforced rate
+	 * limit. Same-block restores start at the same index, and stale heights
+	 * or allocations beyond the budget can also collide. The auto-apply
+	 * fence protects its active restore window; it does not fence another
+	 * running device or resolve these remaining collisions.
+	 */
+	private _channelIndexTipFloor = false;
 	/** Wallet-owned destination for cooperative-close payouts, if configured. */
 	private _walletDestinationScript: Buffer | null = null;
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
@@ -714,10 +780,63 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
-	 * Set the next channel index (e.g. after restoring from storage).
+	 * Raise the next channel index (e.g. after restoring from storage). The
+	 * counter never moves down (issue #906): a lower value is ignored, since
+	 * every index below the current one may already be burned.
 	 */
 	set nextChannelIndex(value: number) {
-		this._nextChannelIndex = value;
+		if (value > this._nextChannelIndex) this._nextChannelIndex = value;
+	}
+
+	/**
+	 * Arm the chain-tip floor on the next channel index (issue #906). The
+	 * node calls this on a birth boot: no key-index row and no persisted
+	 * floor, so nothing records what a previous device holding this seed
+	 * handed out, and a counter left at 1 would give the next channel,
+	 * opened OR accepted, byte for byte the funding key, basepoints and
+	 * per-commitment seed of whichever channel that device held at index 1.
+	 * The floor is max(current, tip * CHANNEL_INDEX_FLOOR_STRIDE), the
+	 * product clamped at CHANNEL_INDEX_FLOOR_MAX, taken ONCE from the first
+	 * real height (the one passed here when the node already knows it, else
+	 * the first header), after which it disarms; it only ever raises the
+	 * counter. A table that was populated on every boot of its life never
+	 * arms it: allocation continues from its stored high-water mark instead.
+	 */
+	armChannelIndexTipFloor(knownTipHeight = 0): void {
+		this._channelIndexTipFloor = true;
+		this._applyChannelIndexTipFloor(knownTipHeight);
+	}
+
+	/**
+	 * True while the chain-tip floor is armed and no real height has fired
+	 * it yet (issue #906): the node persists the floor the moment this turns
+	 * false, and a restart before then is a birth boot again.
+	 */
+	get channelIndexTipFloorArmed(): boolean {
+		return this._channelIndexTipFloor;
+	}
+
+	private _applyChannelIndexTipFloor(height: number): void {
+		if (!this._channelIndexTipFloor) return;
+		const tip = Math.max(height, this._currentBlockHeight);
+		if (tip <= 0) return;
+		this._channelIndexTipFloor = false;
+		// Clamped: an implausible height must not carry the counter past the
+		// hardened derivation limit (see CHANNEL_INDEX_FLOOR_MAX).
+		const floor = Math.min(
+			tip * CHANNEL_INDEX_FLOOR_STRIDE,
+			CHANNEL_INDEX_FLOOR_MAX
+		);
+		if (floor > this._nextChannelIndex) this._nextChannelIndex = floor;
+	}
+
+	/**
+	 * The configured fence on brand-new channels (issue #906), or null. Read
+	 * on every consultation rather than latched: the daemon's answer changes
+	 * as its restore lane settles and the chain tip arrives.
+	 */
+	private _newChannelRefusal(): string | null {
+		return this.config.newChannelsRefused?.() ?? null;
 	}
 
 	/**
@@ -740,6 +859,12 @@ export class ChannelManager extends EventEmitter {
 		// getRecoveryChannelMaterial), so recovering an old channel is never
 		// refused.
 		this._assertNamespaceCanRecordANewChannel();
+		// Issue #906: the configured fence, in the same backstop role. The
+		// acceptors answer the wire from their own pre-check and the openers
+		// surface this throw; either way it sits ahead of the consumption
+		// below, so a refusal never burns an index.
+		const refusal = this._newChannelRefusal();
+		if (refusal) throw new Error(refusal);
 		if (this.config.channelKeyDeriver) {
 			const idx = this._nextChannelIndex++;
 			const keys = this.config.channelKeyDeriver(idx);
@@ -2920,6 +3045,7 @@ export class ChannelManager extends EventEmitter {
 	 */
 	handleNewBlock(blockHeight: number): ChainAction[] {
 		this._currentBlockHeight = blockHeight;
+		this._applyChannelIndexTipFloor(blockHeight);
 		// Update block height on all channels for CLTV validation
 		for (const channel of this.channels.values()) {
 			channel.setBlockHeight(blockHeight);
@@ -3521,6 +3647,15 @@ export class ChannelManager extends EventEmitter {
 				msg.temporaryChannelId,
 				NAMESPACE_LOST_REFUSAL
 			);
+			return;
+		}
+		// Issue #906: the new-channel fence answers the wire here, before any
+		// key is derived or any temporary channel retained, exactly like the
+		// namespace refusal above; the throw inside deriveKeysForNewChannel is
+		// only the backstop.
+		const fence = this._newChannelRefusal();
+		if (fence) {
+			this.refuseInboundOpen(peerPubkey, msg.temporaryChannelId, fence);
 			return;
 		}
 		const tempId = msg.temporaryChannelId.toString('hex');
@@ -6900,6 +7035,13 @@ export class ChannelManager extends EventEmitter {
 		}
 		if (this._namespaceCannotRecordANewChannel()) {
 			this.refuseInboundOpen(peerPubkey, msg.channelId, NAMESPACE_LOST_REFUSAL);
+			return;
+		}
+		// Issue #906: the new-channel fence, on the wire before any derivation
+		// or temporary-channel retention (the v1 acceptor does the same).
+		const fence = this._newChannelRefusal();
+		if (fence) {
+			this.refuseInboundOpen(peerPubkey, msg.channelId, fence);
 			return;
 		}
 

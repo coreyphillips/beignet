@@ -34,6 +34,13 @@ import {
 	deriveLightningKeysFromMnemonic
 } from '../../src/lightning/keys/wallet-keys';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import {
+	CHANNEL_INDEX_FLOOR_STRIDE,
+	ChannelManager
+} from '../../src/lightning/channel/channel-manager';
+import { REGTEST_CHAIN_HASH } from '../../src/lightning/channel/types';
+import { decodeErrorMessage } from '../../src/lightning/message/error';
+import { MessageType } from '../../src/lightning/message/types';
 import * as bip39 from 'bip39';
 
 const MNEMONIC =
@@ -2564,6 +2571,142 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 			fs.rmSync(dirA, { recursive: true, force: true });
 			fs.rmSync(dirB, { recursive: true, force: true });
 			fs.rmSync(dirC, { recursive: true, force: true });
+		}
+	});
+
+	it('fences new channels while the lane is unresolved or the tip is unknown (issue #906)', async function (): Promise<void> {
+		this.timeout(120_000);
+		const dirA = tmpDir('fence-a');
+		const dirB = tmpDir('fence-b');
+		const TIP = 850_000;
+		/** Where the floor lands for a birth boot at TIP (issue #906). */
+		const FLOOR = TIP * CHANNEL_INDEX_FLOOR_STRIDE;
+		const WALLET = '02' + 'b1'.repeat(32);
+		// The liquidity peer that opens inbound for automatic offline receive:
+		// no operator action stands between its open_channel and a key index.
+		const lspKeys = deriveLightningKeysFromMnemonic(
+			bip39.generateMnemonic(),
+			undefined,
+			LnCoinType.REGTEST
+		);
+		const LSP = lspKeys.nodePublicKey.toString('hex');
+		const lsp = new ChannelManager({
+			localBasepoints: lspKeys.channelBasepoints,
+			localPerCommitmentSeed: lspKeys.perCommitmentSeed,
+			localFundingPrivkey: lspKeys.fundingPrivkey,
+			htlcBasepointSecret: lspKeys.htlcBasepointSecret,
+			chainHash: REGTEST_CHAIN_HASH
+		});
+		lsp.on('error', () => {});
+		const offers: Buffer[] = [];
+		lsp.on(
+			'message:outbound',
+			(_peer: string, type: number, payload: Buffer) => {
+				if (type === MessageType.OPEN_CHANNEL) offers.push(payload);
+			}
+		);
+		/** One inbound open_channel against the daemon's CURRENT node. */
+		function offer(daemon: IStartedDaemon): {
+			refusal: string | null;
+			tempId: Buffer;
+			accepted: boolean;
+			index: number;
+		} {
+			const tempId = lsp.openChannel(WALLET, 100_000n).getTemporaryChannelId();
+			const manager = daemon.node.getNode().getChannelManager();
+			const wire: Array<{ type: number; payload: Buffer }> = [];
+			const onWire = (_peer: string, type: number, payload: Buffer): void => {
+				wire.push({ type, payload });
+			};
+			manager.on('error', () => {});
+			manager.on('message:outbound', onWire);
+			manager.handleMessage(
+				LSP,
+				MessageType.OPEN_CHANNEL,
+				offers[offers.length - 1]
+			);
+			manager.off('message:outbound', onWire);
+			const errors = wire
+				.filter((m) => m.type === MessageType.ERROR)
+				.map((m) => decodeErrorMessage(m.payload));
+			expect(errors.length, 'at most one refusal').to.be.at.most(1);
+			if (errors.length === 1) {
+				expect(errors[0].channelId.equals(tempId)).to.equal(true);
+			}
+			return {
+				refusal: errors.length === 1 ? errors[0].data.toString('utf8') : null,
+				tempId,
+				accepted: manager.getTempChannel(tempId) !== undefined,
+				index: manager.nextChannelIndex
+			};
+		}
+		const predicateOf = (daemon: IStartedDaemon): (() => string | null) =>
+			(
+				daemon.node.getNode().getChannelManager() as unknown as {
+					config: { newChannelsRefused: () => string | null };
+				}
+			).config.newChannelsRefused;
+		try {
+			const { inline } = await composeSource(dirA, 'fence probe');
+			const deviceB = await startDaemon({ ...OFFLINE, dataDir: dirB, ...AUTO });
+			const portB = portOf(deviceB);
+			try {
+				// (b) The tip is unknown: refused on the wire, naming it, with
+				// no temporary channel and no index consumed.
+				const unknownTip = offer(deviceB);
+				expect(unknownTip.refusal).to.match(/until the chain tip is known/);
+				expect(unknownTip.accepted).to.equal(false);
+				expect(unknownTip.index).to.equal(1);
+
+				// An idle lane with the tip known does NOT fence: the floor
+				// supplies bounded spacing, and a brand-new wallet has to be
+				// able to open its first channel (the deliberate narrowing).
+				deviceB.node.getNode().handleNewBlock(TIP);
+				expect(predicateOf(deviceB)()).to.equal(null);
+				expect(
+					deviceB.node.getNode().getChannelManager().nextChannelIndex
+				).to.equal(FLOOR);
+
+				// (a') A capsule arrives and the lane settles: an open in that
+				// window is refused naming the lane, nothing retained.
+				const arrived = waitForEvent(deviceB, 'recovery:capsule-retrieved');
+				const restored = waitForEvent<{ resumed: boolean }>(
+					deviceB,
+					'recovery:restored',
+					60_000
+				);
+				retrieved(deviceB, PEER_A, inline);
+				await arrived;
+				expect((await statusOf(portB)).autoApply.phase).to.equal('settling');
+				const settling = offer(deviceB);
+				expect(settling.refusal).to.match(/auto-apply settling/);
+				expect(settling.accepted).to.equal(false);
+				expect(settling.index).to.equal(FLOOR);
+
+				// Resolved: the rebuilt node serves opens again once it too
+				// knows the tip, and the floor carries into its empty table.
+				expect((await restored).resumed).to.equal(true);
+				expect((await statusOf(portB)).autoApply.phase).to.equal('applied');
+				const rebuiltBlind = offer(deviceB);
+				expect(rebuiltBlind.refusal).to.match(/until the chain tip is known/);
+				expect(rebuiltBlind.accepted).to.equal(false);
+				deviceB.node.getNode().handleNewBlock(TIP);
+				const served = offer(deviceB);
+				expect(served.refusal).to.equal(null);
+				expect(served.accepted).to.equal(true);
+				expect(
+					deviceB.node
+						.getNode()
+						.getChannelManager()
+						.getTempChannel(served.tempId)!.channelKeyIndex
+				).to.equal(FLOOR);
+				expect(served.index).to.equal(FLOOR + 1);
+			} finally {
+				await deviceB.stop();
+			}
+		} finally {
+			fs.rmSync(dirA, { recursive: true, force: true });
+			fs.rmSync(dirB, { recursive: true, force: true });
 		}
 	});
 });

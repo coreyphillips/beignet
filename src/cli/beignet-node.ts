@@ -1999,15 +1999,20 @@ export class BeignetNode extends EventEmitter {
 				'recoveryAutoApply applies to peer-storage mode only'
 			);
 		}
-		// Automatic capsule application only ever targets the boot that
-		// opened an empty database (issue #690): decided once, here, so state
-		// this node creates later never turns a running node into a target.
-		if (this._recoveryAutoApply) {
-			try {
-				assertEmptyTarget(this.storage);
-				this._bootTargetEmpty = true;
-			} catch {
-				this._bootTargetEmpty = false;
+		// Whether this boot opened a database with no channel or payment
+		// state: decided once, here, on EVERY boot. Automatic capsule
+		// application only ever targets such a boot (issue #690), so state
+		// this node creates later never turns a running node into a target;
+		// and the new-channel fence (issue #906) needs the same fact on the
+		// boots auto-apply is not armed for, since a bare-seed boot without
+		// it is exactly the boot that fence exists for. One read pass that
+		// stops at the first populated table, latched as a boolean.
+		try {
+			assertEmptyTarget(this.storage);
+			this._bootTargetEmpty = true;
+		} catch {
+			this._bootTargetEmpty = false;
+			if (this._recoveryAutoApply) {
 				this.log(
 					'info',
 					'Recovery auto-apply is armed but this database already holds ' +
@@ -2253,6 +2258,9 @@ export class BeignetNode extends EventEmitter {
 			coinType,
 			network: lnNetwork,
 			storage: this.storage,
+			// Issue #906: fence fresh indices during active auto-apply or a
+			// rebuild, and while the node's block height is zero.
+			newChannelsRefused: (): string | null => this.newChannelRefusal(),
 			enableNetworking: true,
 			autoReconnect: opts.autoReconnect ?? true,
 			autoUpdateChannelFees: opts.autoUpdateChannelFees ?? false,
@@ -4568,6 +4576,47 @@ export class BeignetNode extends EventEmitter {
 			settleUntil: a.settleUntil ?? null,
 			lastReason: a.lastReason ?? null
 		};
+	}
+
+	/**
+	 * The fence on brand-new channels (issue #906), consulted by the channel
+	 * manager ahead of every fresh key derivation, inbound accepts included.
+	 * Two conditions refuse, each naming itself:
+	 *  - the capsule auto-apply lane is unresolved (settling, applying, or
+	 *    the in-process rebuild is running): the capsule may still install
+	 *    the key-index table this node has to continue from, so no index is
+	 *    handed out until that is decided;
+	 *  - the chain tip is unknown: the next index is floored at the tip times
+	 *    CHANNEL_INDEX_FLOOR_STRIDE on a boot with no key-index row, and
+	 *    until a height is known that floor cannot be set, so the next
+	 *    channel would take index 1.
+	 * An idle lane with nothing retrieved does NOT refuse, so a brand-new
+	 * wallet can open its first channel. The floor provides bounded spacing:
+	 * for unclamped heights H > H0, sequential allocation from H0 * 128
+	 * leaves every consumed index below H * 128 while at most
+	 * 128 * (H - H0) indices have been consumed. Every attempt reaching
+	 * derivation counts, including one validation later rejects. Same-block
+	 * restores and allocations beyond that budget can still reuse keys. This
+	 * fence does not stop another running device or establish that recovery
+	 * found all previous state.
+	 */
+	private newChannelRefusal(): string | null {
+		const phase = this._autoApply.phase;
+		if (phase === 'settling' || phase === 'applying' || this._resuming) {
+			const stage = this._resuming ? 'rebuilding' : phase;
+			return (
+				'New channels are refused while a Recovery Capsule restore is ' +
+				`unresolved (auto-apply ${stage}): the restored key-index table ` +
+				'decides the next channel key index'
+			);
+		}
+		if (this.node.getCurrentBlockHeight() === 0) {
+			return (
+				'New channels are refused until the chain tip is known so ' +
+				'recovery can initialize channel keys'
+			);
+		}
+		return null;
 	}
 
 	/** True while a capsule restore rebuilds the node in-process. */

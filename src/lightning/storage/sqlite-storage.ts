@@ -1212,6 +1212,15 @@ export class SqliteStorage implements IStorageBackend {
 		return maxIdx !== null ? maxIdx + 1 : 1;
 	}
 
+	hasChannelKeyIndices(): boolean {
+		// Existence only: no cell is decoded, so an encrypted row counts the
+		// same as a plain one and a row at index 0 is told apart from none.
+		const row = this.db
+			.prepare('SELECT 1 AS present FROM channel_key_indices LIMIT 1')
+			.get() as { present: number } | undefined;
+		return row !== undefined;
+	}
+
 	// ─── HTLC Shared Secrets ───
 
 	saveHtlcSharedSecret(key: string, secret: Buffer): void {
