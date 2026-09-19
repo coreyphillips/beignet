@@ -659,11 +659,18 @@ export class ChannelManager extends EventEmitter {
 	private zeroConfManager: ZeroConfManager = new ZeroConfManager();
 	private _nextChannelIndex = 1;
 	/**
-	 * Issue #906: armed when the boot found NO key-index row, the one case
-	 * with no high-water mark to seed the counter from. While armed, the next
-	 * index is floored at the chain tip whenever a height is learned: block
-	 * height is monotone across any number of device losses, so a bare-seed
-	 * boot can never hand out an index a previous device already used.
+	 * Issue #906: armed when the boot found NO key-index row (no high-water
+	 * mark to seed the counter from), or when the database carries the
+	 * durable row such a boot wrote (the node persists every raise, see
+	 * LightningNode.persistChannelIndexFloor). While armed, the next index
+	 * is floored at the chain tip whenever a height is learned: block height
+	 * is monotone across any number of device losses. The guarantee is
+	 * BOUNDED, not absolute: the floor is the tip itself, and every further
+	 * open on that boot runs ahead of it, so a device that opened k channels
+	 * at tip H consumed H..H+k-1, and a bare-seed restore fewer than k
+	 * blocks later, or a second restore of the same seed at the same tip,
+	 * lands inside that range. The issue accepts the bound (a wallet never
+	 * opens more channels than blocks elapse between two device losses).
 	 */
 	private _channelIndexTipFloor = false;
 	/** Wallet-owned destination for cooperative-close payouts, if configured. */
@@ -744,14 +751,18 @@ export class ChannelManager extends EventEmitter {
 
 	/**
 	 * Arm the chain-tip floor on the next channel index (issue #906). The
-	 * node calls this when its key-index table is EMPTY: with no row to seed
-	 * from, the counter would start at 1 and the next channel, opened OR
-	 * accepted, would derive byte for byte the funding key, basepoints and
-	 * per-commitment seed of whichever channel a previous device held at
-	 * index 1. The floor is max(current, tip), applied now from any height
-	 * already known and again on every block, and it only ever raises the
-	 * counter. A non-empty table never arms it: its own high-water mark
-	 * already implies every floor that was ever applied.
+	 * node calls this when its key-index table is EMPTY, or when the
+	 * database carries the floor row an earlier such boot wrote: with no row
+	 * to seed from, the counter would start at 1 and the next channel,
+	 * opened OR accepted, would derive byte for byte the funding key,
+	 * basepoints and per-commitment seed of whichever channel a previous
+	 * device held at index 1. The floor is max(current, tip), applied now
+	 * from any height already known and again on every block, and it only
+	 * ever raises the counter. A table that was populated on every boot of
+	 * its life never arms it: its own high-water mark already implies every
+	 * index that was ever handed out. The floor's reach is bounded, see
+	 * _channelIndexTipFloor: indices may sit up to k-1 blocks above the tip
+	 * after k opens in one block, and two restores at one tip collide.
 	 */
 	armChannelIndexTipFloor(knownTipHeight = 0): void {
 		this._channelIndexTipFloor = true;
