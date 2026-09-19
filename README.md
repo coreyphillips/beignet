@@ -770,6 +770,7 @@ Recommended safeguards in production:
 | [src/lightning/README.md](src/lightning/README.md) | Protocol-layer reference and usage guide |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Feature roadmap and progress |
 | [docs/RECOVERY-PROTOCOL.md](docs/RECOVERY-PROTOCOL.md) | Proposed replicated state-continuity design |
+| [docs/SEED-ONLY-RESTORE.md](docs/SEED-ONLY-RESTORE.md) | Seed-only channel restore design: homing, peer-ordered durability, the two-stage restore-hold lift |
 | [API reference](docs/markdown/classes/Wallet.md) | Generated typedoc ([HTML](docs/html/classes/Wallet.html)) |
 
 ## Support
