@@ -2644,12 +2644,11 @@ export class LightningNode extends EventEmitter {
 		// per-block advance of the floor), ONCE: from the height persisted
 		// below when there is one, else from the first header, and the value
 		// it reaches goes to the floor row (persistChannelIndexFloor). Every
-		// later boot seeds
-		// the counter from max(table high-water mark, row) and no header
-		// moves it again. An empty table is told apart from one whose top
-		// index is 0 (both answer 1 above) by the existence query, with the
-		// enumerator and then the answer itself standing in for backends
-		// that lack it.
+		// later boot seeds the counter from max(table high-water mark, row)
+		// and no header moves it again. An empty table is told apart from
+		// one whose top index is 0 (both answer 1 above) by the existence
+		// query, with the enumerator and then the answer itself standing in
+		// for backends that lack it.
 		const keyIndexTableEmpty = this.storage.hasChannelKeyIndices
 			? !this.storage.hasChannelKeyIndices()
 			: this.storage.loadAllChannelKeyIndices

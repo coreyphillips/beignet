@@ -521,9 +521,24 @@ const MAX_WIRE_ERROR_DATA_BYTES = 0xffff;
  * (2^31 - 1, MAX_BIP32_DERIVATION_INDEX in backup/scb.ts): 0x7fffffff / 128
  * is 16,777,215 blocks, over 300 years of mainnet at ten minutes a block and
  * several times testnet3's storm-inflated height, so 128 times any plausible
- * tip stays under the limit.
+ * tip stays under the limit; CHANNEL_INDEX_FLOOR_MAX clamps the product for
+ * a height that is not plausible.
  */
 export const CHANNEL_INDEX_FLOOR_STRIDE = 128;
+
+/**
+ * Issue #906: the ceiling on the floored value. The height the floor
+ * multiplies is the chain backend's word, unvalidated, and the product must
+ * stay a derivable hardened index: 0x7fffffff (2^31 - 1) is the last one,
+ * and a height above 16,777,215 (0x7fffffff / 128, rounded down) would
+ * carry the counter past it in one step, after which every derivation
+ * throws. The ceiling stops 2^20 short of the limit, 0x7fffffff - 0x100000
+ * = 0x7fefffff = 2,146,435,071, so a database clamped here still has
+ * 1,048,576 indices to hand out before the deriver refuses. Heights up to
+ * 16,769,023 (0x7fefffff / 128, rounded down) floor unclamped; no real
+ * chain reaches that.
+ */
+export const CHANNEL_INDEX_FLOOR_MAX = 0x7fffffff - 2 ** 20;
 
 /**
  * `reason` as wire bytes, clamped to what the length prefix can carry.
@@ -781,12 +796,13 @@ export class ChannelManager extends EventEmitter {
 	 * handed out, and a counter left at 1 would give the next channel,
 	 * opened OR accepted, byte for byte the funding key, basepoints and
 	 * per-commitment seed of whichever channel that device held at index 1.
-	 * The floor is max(current, tip * CHANNEL_INDEX_FLOOR_STRIDE), taken
-	 * ONCE from the first real height (the one passed here when the node
-	 * already knows it, else the first header), after which it disarms; it
-	 * only ever raises the counter. A table that was populated on every boot
-	 * of its life never arms it: its own high-water mark already implies
-	 * every index ever handed out.
+	 * The floor is max(current, tip * CHANNEL_INDEX_FLOOR_STRIDE), the
+	 * product clamped at CHANNEL_INDEX_FLOOR_MAX, taken ONCE from the first
+	 * real height (the one passed here when the node already knows it, else
+	 * the first header), after which it disarms; it only ever raises the
+	 * counter. A table that was populated on every boot of its life never
+	 * arms it: its own high-water mark already implies every index ever
+	 * handed out.
 	 */
 	armChannelIndexTipFloor(knownTipHeight = 0): void {
 		this._channelIndexTipFloor = true;
@@ -807,7 +823,12 @@ export class ChannelManager extends EventEmitter {
 		const tip = Math.max(height, this._currentBlockHeight);
 		if (tip <= 0) return;
 		this._channelIndexTipFloor = false;
-		const floor = tip * CHANNEL_INDEX_FLOOR_STRIDE;
+		// Clamped: an implausible height must not carry the counter past the
+		// hardened derivation limit (see CHANNEL_INDEX_FLOOR_MAX).
+		const floor = Math.min(
+			tip * CHANNEL_INDEX_FLOOR_STRIDE,
+			CHANNEL_INDEX_FLOOR_MAX
+		);
 		if (floor > this._nextChannelIndex) this._nextChannelIndex = floor;
 	}
 

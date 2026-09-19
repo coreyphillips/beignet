@@ -12,11 +12,12 @@
  *  - the floor: a birth boot (no key-index row, no persisted floor) floors
  *    the next index at the first real chain tip it learns times
  *    CHANNEL_INDEX_FLOOR_STRIDE (128 indices per block, since indices are
- *    consumed per channel while the floor advances per block), ONCE, and
- *    never lowers it; the value is persisted, every later boot seeds the
- *    counter from max(table, floor) with no header moving it, and a partial
- *    restore on the birth boot (rows below the floor) cannot hand the NEXT
- *    boot a burned index either.
+ *    consumed per channel while the floor advances per block; the product
+ *    clamped at CHANNEL_INDEX_FLOOR_MAX, below the hardened derivation
+ *    limit), ONCE, and never lowers it; the value is persisted, every later
+ *    boot seeds the counter from max(table, floor) with no header moving
+ *    it, and a partial restore on the birth boot (rows below the floor)
+ *    cannot hand the NEXT boot a burned index either.
  */
 
 import { expect } from 'chai';
@@ -30,6 +31,7 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import { IScbChannelEntry } from '../../src/lightning/backup/scb';
 import { Channel } from '../../src/lightning/channel/channel';
 import {
+	CHANNEL_INDEX_FLOOR_MAX,
 	CHANNEL_INDEX_FLOOR_STRIDE,
 	ChannelManager,
 	IChannelManagerConfig,
@@ -587,6 +589,75 @@ describe('Channel key index floor (issue #906)', () => {
 		plain.handleNewBlock(TIP);
 		expect(plain.nextChannelIndex).to.equal(1);
 		expect(plain.channelIndexTipFloorArmed).to.equal(false);
+	});
+
+	it('clamps the floor from an implausible height below the hardened derivation limit', () => {
+		// The height the floor multiplies is the chain backend's word. No
+		// real tip nears 16,777,216, the first height whose product with
+		// the stride is 2^31 and past the last derivable hardened child,
+		// but a backend that reports one must not carry the counter past
+		// the limit in one step: the product is clamped 2^20 short of it,
+		// leaving that many indices to hand out before the deriver refuses.
+		expect(CHANNEL_INDEX_FLOOR_MAX).to.equal(0x7fffffff - 2 ** 20);
+		expect(CHANNEL_INDEX_FLOOR_MAX).to.equal(0x7fefffff);
+		expect(CHANNEL_INDEX_FLOOR_MAX + 2 ** 20).to.equal(0x7fffffff);
+		// The limit is the deriver's own: the ceiling and the limit itself
+		// derive, the index one past the limit (where 16,777,216 * 128
+		// would have put the counter) does not.
+		expect(() => keysAt(CHANNEL_INDEX_FLOOR_MAX)).to.not.throw();
+		expect(() => keysAt(0x7fffffff)).to.not.throw();
+		expect(16_777_216 * CHANNEL_INDEX_FLOOR_STRIDE).to.equal(0x7fffffff + 1);
+		expect(() => keysAt(0x7fffffff + 1)).to.throw();
+
+		// A huge height known at arm time or arriving as a header, up to
+		// the largest integers: every one clamps to the ceiling, disarms,
+		// and the channel opened there is derivable with room to move on.
+		const peer = '02' + 'c1'.repeat(32);
+		for (const height of [
+			16_777_216,
+			100_000_000,
+			2 ** 31,
+			Number.MAX_SAFE_INTEGER
+		]) {
+			const known = makeManager(`huge-known-${height}`);
+			known.armChannelIndexTipFloor(height);
+			expect(known.nextChannelIndex, `armed at ${height}`).to.equal(
+				CHANNEL_INDEX_FLOOR_MAX
+			);
+			expect(known.channelIndexTipFloorArmed).to.equal(false);
+			const header = makeManager(`huge-header-${height}`);
+			header.armChannelIndexTipFloor();
+			header.handleNewBlock(height);
+			expect(header.nextChannelIndex, `header at ${height}`).to.equal(
+				CHANNEL_INDEX_FLOOR_MAX
+			);
+			expect(header.channelIndexTipFloorArmed).to.equal(false);
+			const channel = header.openChannel(peer, 100_000n);
+			expect(channel.channelKeyIndex).to.equal(CHANNEL_INDEX_FLOOR_MAX);
+			expect(header.nextChannelIndex).to.equal(CHANNEL_INDEX_FLOOR_MAX + 1);
+			expect(header.nextChannelIndex).to.be.below(0x7fffffff);
+		}
+
+		// The edge: the last height whose product fits floors unclamped, the
+		// next one clamps, and the clamp never lowers a counter already
+		// standing above the ceiling.
+		const lastFit = Math.floor(
+			CHANNEL_INDEX_FLOOR_MAX / CHANNEL_INDEX_FLOOR_STRIDE
+		);
+		expect(lastFit).to.equal(16_769_023);
+		const fits = makeManager('last-fit');
+		fits.armChannelIndexTipFloor(lastFit);
+		expect(fits.nextChannelIndex).to.equal(
+			lastFit * CHANNEL_INDEX_FLOOR_STRIDE
+		);
+		expect(fits.nextChannelIndex).to.be.at.most(CHANNEL_INDEX_FLOOR_MAX);
+		const clamped = makeManager('first-clamped');
+		clamped.armChannelIndexTipFloor(lastFit + 1);
+		expect(clamped.nextChannelIndex).to.equal(CHANNEL_INDEX_FLOOR_MAX);
+		const higher = makeManager('already-higher');
+		higher.nextChannelIndex = CHANNEL_INDEX_FLOOR_MAX + 5;
+		higher.armChannelIndexTipFloor(Number.MAX_SAFE_INTEGER);
+		expect(higher.nextChannelIndex).to.equal(CHANNEL_INDEX_FLOOR_MAX + 5);
 	});
 
 	it('a bare-seed boot starts at the tip times the stride and derives keys no earlier device could have used', () => {
