@@ -616,8 +616,10 @@ const HELD_FORWARD_ROW_BYTES = 1024;
 const ASYNC_RECEIVE_GRANTS_KEY = 'async_receive_grants';
 /**
  * Metadata key the chain-tip floor on the next channel key index persists
- * under (issue #906). Its PRESENCE marks a database opened by a boot with
- * no key-index row; its value is the counter that floor last reached.
+ * under (issue #906). Absent on a database that was populated on every boot
+ * of its life; '0' on one born from a bare seed that has not learned a real
+ * chain tip yet (the birth window, re-armed by a restart); a positive value
+ * once the birth boot's first real tip floored the counter, written once.
  */
 const CHANNEL_KEY_INDEX_FLOOR_KEY = 'channel_key_index_floor';
 /** Default wait for an LSP's answer to a registration request. */
@@ -887,13 +889,12 @@ export class LightningNode extends EventEmitter {
 	private _wiredChainWatcher: ChainWatcher | null = null;
 	private currentBlockHeight = 0;
 	/**
-	 * Issue #906: whether the chain-tip floor on the next channel key index
-	 * is armed for this database (decided in restoreFromStorage), and the
-	 * counter its durable row last recorded, so a header only writes the
-	 * row when the counter rose past it.
+	 * Issue #906: true from a birth boot (decided in restoreFromStorage)
+	 * until the chain-tip floor on the next channel key index has fired and
+	 * its value is in the durable row; the per-header check is a no-op after
+	 * that, and on every later boot.
 	 */
-	private channelIndexFloorArmed = false;
-	private persistedChannelIndexFloor = 0;
+	private channelIndexFloorPending = false;
 	/** FFOR D-R receipt witness (section 9.6), when this node serves as one. */
 	private fforWitness: FforWitnessService | null = null;
 	/** FFOR BOLT 12 issuer (section 9.7), co-hosted with the witness. */
@@ -2636,37 +2637,35 @@ export class LightningNode extends EventEmitter {
 		// Issue #906: with NO key-index row at all there is no high-water mark
 		// to seed from, and a counter left at 1 would hand the next channel,
 		// opened or accepted, the keys of whichever channel a previous device
-		// held at index 1. Such a boot floors the counter at the chain tip
-		// instead: from the height persisted below when there is one, and
-		// from every block after that (armed once the height is restored).
-		// An empty table is told apart from one whose top index is 0 (both
-		// answer 1 above) by the existence query, with the enumerator and
-		// then the answer itself standing in for backends that lack it.
+		// held at index 1. Such a birth boot floors the counter at the chain
+		// tip instead, ONCE: from the height persisted below when there is
+		// one, else from the first header, and the value it reaches goes to
+		// the floor row (persistChannelIndexFloor). Every later boot seeds
+		// the counter from max(table high-water mark, row) and no header
+		// moves it again. An empty table is told apart from one whose top
+		// index is 0 (both answer 1 above) by the existence query, with the
+		// enumerator and then the answer itself standing in for backends
+		// that lack it.
 		const keyIndexTableEmpty = this.storage.hasChannelKeyIndices
 			? !this.storage.hasChannelKeyIndices()
 			: this.storage.loadAllChannelKeyIndices
 			? this.storage.loadAllChannelKeyIndices().length === 0
 			: nextChannelIndex <= 1;
-		// The floor's durable row (issue #906 review): the counter a floored
-		// boot reached, kept by persistChannelIndexFloor. The key-index table
-		// cannot stand in for it: the floor raises the counter without
-		// writing any row, and a partial restore on that boot (an SCB
-		// missing its highest-index entry) lands rows BELOW the floor, so
-		// the next boot would read a populated table, never arm, and seed
-		// the counter from a high-water mark a previous device had already
-		// passed. The counter is seeded from the row as well, and a database
-		// carrying the row keeps the floor armed for its life: written on
-		// the boot that found no row, the row also covers the case where
-		// that boot never learned a tip before its restore and restart.
+		// The floor row (issue #906 review). The key-index table cannot stand
+		// in for it: the floor raises the counter without writing any row,
+		// and a partial restore on the birth boot (an SCB missing its
+		// highest-index entry) lands rows BELOW the floor, so the next boot
+		// would read a populated table and seed the counter from a high-water
+		// mark a previous device had already passed. A '0' is the birth
+		// marker: the floor has not fired yet, so this boot is still a birth
+		// boot whatever that restore landed in the table meanwhile.
 		const floorRow = this.storage.loadMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY);
 		const persistedFloor = floorRow === null ? NaN : parseInt(floorRow, 10);
 		const floorPersisted =
 			Number.isFinite(persistedFloor) && persistedFloor > 0;
-		if (floorPersisted) {
-			this.persistedChannelIndexFloor = persistedFloor;
-			this.channelManager.nextChannelIndex = persistedFloor;
-		}
-		const armChannelIndexFloor = keyIndexTableEmpty || floorPersisted;
+		if (floorPersisted) this.channelManager.nextChannelIndex = persistedFloor;
+		const birthBoot =
+			!floorPersisted && (keyIndexTableEmpty || persistedFloor === 0);
 
 		// Restore channels — look up per-channel key index for each
 		for (const {
@@ -2946,15 +2945,21 @@ export class LightningNode extends EventEmitter {
 				this.currentBlockHeight = height;
 			}
 		}
-		// Issue #906: the chain-tip floor on the next channel index, from the
-		// persisted height now (a past tip is still a monotone lower bound)
-		// and from every header the manager sees after this. Armed, the
-		// floor's row is written right away (its presence is what re-arms
-		// the next boot) and again after every header that raises it.
-		if (armChannelIndexFloor) {
+		// Issue #906: a birth boot arms the chain-tip floor on the next channel
+		// index. It fires now from the persisted height when there is one (a
+		// past tip is still a monotone lower bound), else from the first
+		// header; either way the value is written once it has fired. Until
+		// then the row holds the birth marker, so a restart before any header
+		// is a birth boot again.
+		if (birthBoot) {
+			this.channelIndexFloorPending = true;
 			this.channelManager.armChannelIndexTipFloor(this.currentBlockHeight);
-			this.channelIndexFloorArmed = true;
-			this.persistChannelIndexFloor();
+			if (!this.persistChannelIndexFloor() && floorRow === null) {
+				this.safeStorage(
+					() => this.storage!.saveMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY, '0'),
+					'saveChannelKeyIndexFloor'
+				);
+			}
 		}
 
 		// Restore mission control
@@ -24542,23 +24547,26 @@ export class LightningNode extends EventEmitter {
 	 * restore on that boot (an SCB missing its highest-index entry) leaves
 	 * rows below the floor, and the next boot, seeing a populated table,
 	 * would seed the counter from those rows and hand the next channel an
-	 * index the previous device already used. Called once the floor is
-	 * armed and after every header; writes only when the counter rose past
-	 * the row, so a quiet header costs one comparison. The value is the
-	 * counter itself (a high-water mark that includes every index this
-	 * boot consumed), never the tip, and restoreFromStorage seeds the next
-	 * boot's counter from it beside the table's own high-water mark.
+	 * index the previous device already used. Called at arm time and after
+	 * every header while the floor is pending; writes ONCE, the moment the
+	 * floor has fired, and is a no-op after that and on every later boot.
+	 * The value is the counter the floor raised (the tip, or above it when
+	 * something already stood higher), and restoreFromStorage seeds every
+	 * later boot's counter from it beside the table's own high-water mark.
+	 * Returns true once the row holds the floor.
 	 */
-	private persistChannelIndexFloor(): void {
-		if (!this.storage || !this.channelIndexFloorArmed) return;
-		const next = this.channelManager.nextChannelIndex;
-		if (next <= this.persistedChannelIndexFloor) return;
+	private persistChannelIndexFloor(): boolean {
+		if (!this.storage) return false;
+		if (!this.channelIndexFloorPending) return true;
+		if (this.channelManager.channelIndexTipFloorArmed) return false;
+		const floor = this.channelManager.nextChannelIndex;
 		const written = this.safeStorage(
 			() =>
-				this.storage!.saveMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY, String(next)),
+				this.storage!.saveMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY, String(floor)),
 			'saveChannelKeyIndexFloor'
 		);
-		if (written) this.persistedChannelIndexFloor = next;
+		if (written) this.channelIndexFloorPending = false;
+		return written;
 	}
 
 	/**
@@ -24590,7 +24598,7 @@ export class LightningNode extends EventEmitter {
 				// best-effort
 			}
 		}
-		// Issue #906: the floor this header may have raised is durable too.
+		// Issue #906: a birth boot's first header fires the floor; write it.
 		this.persistChannelIndexFloor();
 		this.retryOwedHeldForwardFailures();
 		// Funding txs we are obligated to broadcast (BOLT 2) but which have
