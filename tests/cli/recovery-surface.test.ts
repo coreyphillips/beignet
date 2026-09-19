@@ -34,7 +34,10 @@ import {
 	deriveLightningKeysFromMnemonic
 } from '../../src/lightning/keys/wallet-keys';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
-import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import {
+	CHANNEL_INDEX_FLOOR_STRIDE,
+	ChannelManager
+} from '../../src/lightning/channel/channel-manager';
 import { REGTEST_CHAIN_HASH } from '../../src/lightning/channel/types';
 import { decodeErrorMessage } from '../../src/lightning/message/error';
 import { MessageType } from '../../src/lightning/message/types';
@@ -2660,6 +2663,8 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 		const dirA = tmpDir('fence-a');
 		const dirB = tmpDir('fence-b');
 		const TIP = 850_000;
+		/** Where the floor lands for a birth boot at TIP (issue #906). */
+		const FLOOR = TIP * CHANNEL_INDEX_FLOOR_STRIDE;
 		const WALLET = '02' + 'b1'.repeat(32);
 		// The liquidity peer that opens inbound for automatic offline receive:
 		// no operator action stands between its open_channel and a key index.
@@ -2744,7 +2749,7 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 				expect(predicateOf(deviceB)()).to.equal(null);
 				expect(
 					deviceB.node.getNode().getChannelManager().nextChannelIndex
-				).to.equal(TIP);
+				).to.equal(FLOOR);
 
 				// (a') A capsule arrives and the lane settles: an open in that
 				// window is refused naming the lane, nothing retained.
@@ -2760,7 +2765,7 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 				const settling = offer(deviceB);
 				expect(settling.refusal).to.match(/auto-apply settling/);
 				expect(settling.accepted).to.equal(false);
-				expect(settling.index).to.equal(TIP);
+				expect(settling.index).to.equal(FLOOR);
 
 				// Resolved: the rebuilt node serves opens again once it too
 				// knows the tip, and the floor carries into its empty table.
@@ -2778,8 +2783,8 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 						.getNode()
 						.getChannelManager()
 						.getTempChannel(served.tempId)!.channelKeyIndex
-				).to.equal(TIP);
-				expect(served.index).to.equal(TIP + 1);
+				).to.equal(FLOOR);
+				expect(served.index).to.equal(FLOOR + 1);
 			} finally {
 				await deviceB.stop();
 			}

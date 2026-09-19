@@ -620,7 +620,8 @@ const ASYNC_RECEIVE_GRANTS_KEY = 'async_receive_grants';
  * under (issue #906). Absent on a database that was populated on every boot
  * of its life; '0' on one born from a bare seed that has not learned a real
  * chain tip yet (the birth window, re-armed by a restart); a positive value
- * once the birth boot's first real tip floored the counter, written once.
+ * once the birth boot's first real tip floored the counter (at the tip times
+ * CHANNEL_INDEX_FLOOR_STRIDE), written once.
  */
 const CHANNEL_KEY_INDEX_FLOOR_KEY = 'channel_key_index_floor';
 /** Default wait for an LSP's answer to a registration request. */
@@ -2639,9 +2640,12 @@ export class LightningNode extends EventEmitter {
 		// to seed from, and a counter left at 1 would hand the next channel,
 		// opened or accepted, the keys of whichever channel a previous device
 		// held at index 1. Such a birth boot floors the counter at the chain
-		// tip instead, ONCE: from the height persisted below when there is
-		// one, else from the first header, and the value it reaches goes to
-		// the floor row (persistChannelIndexFloor). Every later boot seeds
+		// tip times CHANNEL_INDEX_FLOOR_STRIDE instead (128 indices per
+		// block, the margin between per-channel index consumption and the
+		// per-block advance of the floor), ONCE: from the height persisted
+		// below when there is one, else from the first header, and the value
+		// it reaches goes to the floor row (persistChannelIndexFloor). Every
+		// later boot seeds
 		// the counter from max(table high-water mark, row) and no header
 		// moves it again. An empty table is told apart from one whose top
 		// index is 0 (both answer 1 above) by the existence query, with the
@@ -24595,9 +24599,10 @@ export class LightningNode extends EventEmitter {
 	 * index the previous device already used. Called at arm time and after
 	 * every header while the floor is pending; writes ONCE, the moment the
 	 * floor has fired, and is a no-op after that and on every later boot.
-	 * The value is the counter the floor raised (the tip, or above it when
-	 * something already stood higher), and restoreFromStorage seeds every
-	 * later boot's counter from it beside the table's own high-water mark.
+	 * The value is the counter the floor raised (the tip times
+	 * CHANNEL_INDEX_FLOOR_STRIDE, or above it when something already stood
+	 * higher), and restoreFromStorage seeds every later boot's counter from
+	 * it beside the table's own high-water mark.
 	 * Returns true once the row holds the floor.
 	 */
 	private persistChannelIndexFloor(): boolean {

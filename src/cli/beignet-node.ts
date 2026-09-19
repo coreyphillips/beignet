@@ -4593,13 +4593,17 @@ export class BeignetNode extends EventEmitter {
 	 *    the in-process rebuild is running): the capsule may still install
 	 *    the key-index table this node has to continue from, so no index is
 	 *    handed out until that is decided;
-	 *  - the chain tip is unknown: the next index is floored at the tip on a
-	 *    boot with no key-index row, and until a height is known that floor
-	 *    cannot be set, so the next channel would take index 1.
+	 *  - the chain tip is unknown: the next index is floored at the tip times
+	 *    CHANNEL_INDEX_FLOOR_STRIDE on a boot with no key-index row, and
+	 *    until a height is known that floor cannot be set, so the next
+	 *    channel would take index 1.
 	 * An idle lane with nothing retrieved does NOT refuse: the floor already
-	 * keeps a fresh index above anything a previous device burned, and a
-	 * brand-new wallet has to be able to open its first channel. The
-	 * confirmed-empty marker (#909 D9) narrows this further once it exists.
+	 * keeps a fresh index above anything a previous device burned (provided
+	 * it opened fewer than 128 channels per block elapsed since its own
+	 * birth tip), and a brand-new wallet has to be able to open its first
+	 * channel. The confirmed-empty marker (#909 D9) narrows this further
+	 * once it exists, and is the answer to the residual the floor cannot
+	 * cover: two devices restored from one seed within the same block.
 	 */
 	private newChannelRefusal(): string | null {
 		const phase = this._autoApply.phase;

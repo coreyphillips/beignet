@@ -508,6 +508,24 @@ const MAX_UNKNOWN_REESTABLISH_HOLD_MS = 2_147_483_647;
 const MAX_WIRE_ERROR_DATA_BYTES = 0xffff;
 
 /**
+ * Issue #906: how many channel key indices the chain-tip floor reserves per
+ * block. A birth boot (no key-index row, no persisted floor) starts the next
+ * index at tip * CHANNEL_INDEX_FLOOR_STRIDE rather than at the tip itself,
+ * because index consumption is per CHANNEL while the floor advances per
+ * BLOCK: a floor of one index per block only clears what an earlier device
+ * burned if that device opened fewer channels than blocks elapsed since its
+ * own birth tip, and three opens across two blocks already break that. At
+ * 128 indices per block an earlier device would have to open more than 128
+ * channels per elapsed block to be caught up with. The index is a hardened
+ * BIP32 child in the default deriver, so it must stay under 0x7fffffff
+ * (2^31 - 1, MAX_BIP32_DERIVATION_INDEX in backup/scb.ts): 0x7fffffff / 128
+ * is 16,777,215 blocks, over 300 years of mainnet at ten minutes a block and
+ * several times testnet3's storm-inflated height, so 128 times any plausible
+ * tip stays under the limit.
+ */
+export const CHANNEL_INDEX_FLOOR_STRIDE = 128;
+
+/**
  * `reason` as wire bytes, clamped to what the length prefix can carry.
  *
  * Not every reason is ours: abortPendingOpen quotes an IFundingProvider error
@@ -663,17 +681,21 @@ export class ChannelManager extends EventEmitter {
 	 * channel key index yet (no key-index row and no persisted floor, see
 	 * LightningNode.restoreFromStorage). While armed, the FIRST real height
 	 * learned, a header or a height the node already knew, floors the next
-	 * index at it (max(current, tip)) and disarms: the floor fires once per
-	 * database, the node persists the value it reached, and every later
-	 * boot seeds the counter from that row beside the table's own high-water
-	 * mark, with no header moving it again. Block height is monotone across
-	 * any number of device losses, so a bare-seed boot at tip H starts at H,
-	 * above every index any device burned at a lower tip, and the distance
-	 * between the indices this device burns and the floor a future restore
-	 * picks grows with the blocks elapsed in between. The guarantee is
-	 * BOUNDED, not absolute: two restores of one seed inside the same block
-	 * both start at H, which is split brain, and the fence, not the floor,
-	 * is the answer there.
+	 * index at max(current, tip * CHANNEL_INDEX_FLOOR_STRIDE) and disarms:
+	 * the floor fires once per database, the node persists the value it
+	 * reached, and every later boot seeds the counter from that row beside
+	 * the table's own high-water mark, with no header moving it again.
+	 * Block height is monotone across any number of device losses, so a
+	 * bare-seed boot at tip H starts at H * 128, which is above every index
+	 * an earlier device burned PROVIDED that device opened fewer than 128
+	 * channels per block elapsed since its own birth tip (indices are
+	 * consumed per channel, the floor advances per block, and the stride is
+	 * the margin between the two). The guarantee is BOUNDED, not absolute:
+	 * the residual is any restore that violates that bound, and in
+	 * particular two devices restored from one seed within the same block
+	 * that both open channels, which both start at H * 128. That is split
+	 * brain, answered by the auto-apply fence and the future confirmed-empty
+	 * marker (#909 D9), not by the floor.
 	 */
 	private _channelIndexTipFloor = false;
 	/** Wallet-owned destination for cooperative-close payouts, if configured. */
@@ -759,11 +781,12 @@ export class ChannelManager extends EventEmitter {
 	 * handed out, and a counter left at 1 would give the next channel,
 	 * opened OR accepted, byte for byte the funding key, basepoints and
 	 * per-commitment seed of whichever channel that device held at index 1.
-	 * The floor is max(current, tip), taken ONCE from the first real height
-	 * (the one passed here when the node already knows it, else the first
-	 * header), after which it disarms; it only ever raises the counter. A
-	 * table that was populated on every boot of its life never arms it: its
-	 * own high-water mark already implies every index ever handed out.
+	 * The floor is max(current, tip * CHANNEL_INDEX_FLOOR_STRIDE), taken
+	 * ONCE from the first real height (the one passed here when the node
+	 * already knows it, else the first header), after which it disarms; it
+	 * only ever raises the counter. A table that was populated on every boot
+	 * of its life never arms it: its own high-water mark already implies
+	 * every index ever handed out.
 	 */
 	armChannelIndexTipFloor(knownTipHeight = 0): void {
 		this._channelIndexTipFloor = true;
@@ -781,9 +804,10 @@ export class ChannelManager extends EventEmitter {
 
 	private _applyChannelIndexTipFloor(height: number): void {
 		if (!this._channelIndexTipFloor) return;
-		const floor = Math.max(height, this._currentBlockHeight);
-		if (floor <= 0) return;
+		const tip = Math.max(height, this._currentBlockHeight);
+		if (tip <= 0) return;
 		this._channelIndexTipFloor = false;
+		const floor = tip * CHANNEL_INDEX_FLOOR_STRIDE;
 		if (floor > this._nextChannelIndex) this._nextChannelIndex = floor;
 	}
 
