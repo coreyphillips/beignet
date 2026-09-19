@@ -1454,6 +1454,14 @@ export interface BeignetNodeEvents {
 	'ffor:enforce': (data: {
 		channelId: string;
 		epoch: Record<string, unknown>;
+		/**
+		 * The channel is a capsule restore whose recency nothing has proven,
+		 * so POST /ffor/enforce needs acceptStaleStateRisk: true (issue
+		 * #908). Absent otherwise.
+		 */
+		restoreRecencyUnproven?: true;
+		/** The peer claimed newer state without proof; the same acknowledgement is required. */
+		reestablishRecencyUnproven?: true;
 	}) => void;
 	'ffor:witness-provisioned': (data: Record<string, unknown>) => void;
 	'ffor:witness-recorded': (data: Record<string, unknown>) => void;
