@@ -5948,6 +5948,14 @@ export class LightningNode extends EventEmitter {
 			 * acknowledged close (cooperative or force) are the exits.
 			 */
 			restoreRecencyUnproven?: boolean;
+			/**
+			 * The held channel's peer has shown, in its channel_reestablish,
+			 * that it already holds the revocation for the channel's current
+			 * commitment (issue #905). The hold above describes a risk; this
+			 * is a certainty, so the operator's force close is refused too,
+			 * acceptStaleStateRisk or not. The peer's close is the one exit.
+			 */
+			restoreRevokedRisk?: boolean;
 		}>;
 		/**
 		 * Peers whose channel_reestablish is parked because it names a channel
@@ -5972,6 +5980,7 @@ export class LightningNode extends EventEmitter {
 			awaitingDurability: boolean;
 			fundingUnidentified?: boolean;
 			restoreRecencyUnproven?: boolean;
+			restoreRevokedRisk?: boolean;
 		}> = [];
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
@@ -5989,6 +5998,9 @@ export class LightningNode extends EventEmitter {
 				...(fundingUnidentified ? { fundingUnidentified: true } : {}),
 				...(state.restoreRecencyUnproven
 					? { restoreRecencyUnproven: true }
+					: {}),
+				...(state.restoreRevokedRisk === true
+					? { restoreRevokedRisk: true }
 					: {})
 			});
 		}
@@ -11424,6 +11436,13 @@ export class LightningNode extends EventEmitter {
 		feeRatePerVbyte: number,
 		reason: ChannelCloseReason
 	): ChannelResult {
+		// Every reason, the operator's included (issue #905): the peer has
+		// shown it holds the revocation for this commitment, so there is no
+		// risk left for an acknowledgement to accept, only the justice path.
+		const revoked = this.forceCloseRevokedRefusal(channelId);
+		if (revoked !== null) {
+			return { ok: false, actions: [], error: revoked };
+		}
 		if (
 			reason !== 'user' &&
 			this.skipAutoCloseRecoveryGated(channelId, reason)
@@ -11481,10 +11500,47 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * The refusal every force close of a capsule-restored channel meets once
+	 * its peer has shown it holds the revocation for the channel's current
+	 * commitment (restoreRevokedRisk, issue #905), or null when it does not.
+	 * Unlike the recency hold, which the operator's own close may override
+	 * (5.6's labelled escape hatch), this one has no override: the hatch
+	 * exists for a risk, and a revocation in the peer's hands is not a risk
+	 * but a certain loss to the justice path. Stated here so the operator
+	 * path can name it (FORCE_CLOSE_REVOKED) and _forceCloseWithReason can
+	 * enforce it for every reason at once.
+	 */
+	private forceCloseRevokedRefusal(channelId: Buffer): string | null {
+		const state = this.channelManager.getChannel(channelId)?.getFullState();
+		if (state?.restoreRevokedRisk !== true) return null;
+		return (
+			'force close refused: this channel was restored from a Recovery ' +
+			'Capsule and its peer has shown, in channel_reestablish, that it ' +
+			'already holds the revocation for the stored commitment; ' +
+			'broadcasting it would hand the whole balance to the justice ' +
+			'path. There is no risk to accept: only the peer can close this ' +
+			'channel'
+		);
+	}
+
 	forceCloseChannel(
 		channelId: Buffer,
 		destinationScript: Buffer
 	): { ok: boolean; error?: string; commitmentTxid?: string } {
+		// Named ahead of the engine's own refusal (issue #905): the operator
+		// is told the exit is closed for a reason no acknowledgement reopens,
+		// under a code a client can tell from an ordinary failed close.
+		const revoked = this.forceCloseRevokedRefusal(channelId);
+		if (revoked !== null) {
+			this.emit('node:error', {
+				code: 'FORCE_CLOSE_REVOKED',
+				channelId,
+				message: revoked,
+				timestamp: Date.now()
+			} as ILightningError);
+			return { ok: false, error: revoked };
+		}
 		const result = this._forceCloseWithReason(
 			channelId,
 			destinationScript,
@@ -24838,7 +24894,9 @@ export class LightningNode extends EventEmitter {
 	 * funding confirms, this one waits for the peer or for an operator.
 	 * While it holds, the channel asks the peer to close instead
 	 * (Channel.buildRecoveryCloseActions, regenerated on every reconnect), and
-	 * forceCloseChannel stays ungated, which is 5.6's labelled escape hatch.
+	 * forceCloseChannel stays ungated, which is 5.6's labelled escape hatch,
+	 * unless the peer has shown it holds the revocation (restoreRevokedRisk,
+	 * issue #905), which closes the hatch too.
 	 */
 	private skipAutoCloseRestoreUnproven(
 		state: IChannelState,
@@ -24868,7 +24926,9 @@ export class LightningNode extends EventEmitter {
 	 * that will not happen, or clear the tracker holding its retry.
 	 *
 	 * The operator's own force close (reason 'user') stays admitted: it is
-	 * 5.6's labelled escape hatch, and the only exit a fenced node has.
+	 * 5.6's labelled escape hatch, and the only exit a fenced node has. The
+	 * one refusal that covers 'user' as well is forceCloseRevokedRefusal
+	 * (issue #905), which names a certainty rather than a risk.
 	 */
 	private skipAutoCloseRecoveryGated(
 		channelId: Buffer,

@@ -519,6 +519,10 @@ export interface ISerializedChannelState {
 	// can prove. MUST persist - a restart must not forget that an AUTOMATIC
 	// commitment broadcast is forbidden.
 	restoreRecencyUnproven?: boolean;
+	// Issue #905: the peer has shown it holds the revocation for the row
+	// above's current commitment. MUST persist - a restart must not reopen
+	// the operator's force close on a commitment the peer can punish.
+	restoreRevokedRisk?: boolean;
 	// Issue #469: the operator acknowledged the stale-close risk when
 	// initiating a mutual close of the row above. MUST persist - a restart
 	// inside the negotiation must not turn the authorized close into a
@@ -982,6 +986,7 @@ export function serializeChannelState(
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
 		restoreRecencyUnproven: s.restoreRecencyUnproven,
+		restoreRevokedRisk: s.restoreRevokedRisk,
 		staleCloseRiskAccepted: s.staleCloseRiskAccepted,
 		preSpliceSpendWatches: s.preSpliceSpendWatches?.length
 			? s.preSpliceSpendWatches.map((w) => ({ ...w }))
@@ -1408,6 +1413,7 @@ export function deserializeChannelState(
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
 		restoreRecencyUnproven: s.restoreRecencyUnproven,
+		restoreRevokedRisk: s.restoreRevokedRisk,
 		staleCloseRiskAccepted: s.staleCloseRiskAccepted,
 		preSpliceSpendWatches: s.preSpliceSpendWatches?.length
 			? s.preSpliceSpendWatches.map((w) => ({ ...w }))

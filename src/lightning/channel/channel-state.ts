@@ -953,6 +953,19 @@ export interface IChannelState {
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**
+	 * The peer has shown it holds the revocation for this restored row's
+	 * CURRENT local commitment (issue #905). Set by handleReestablish on a
+	 * restoreRecencyUnproven row whose peer reports next_revocation_number
+	 * at exactly localCommitmentNumber + 1: that counts a revoke_and_ack
+	 * this row never recorded sending, and the commitment it revoked is the
+	 * one this row would broadcast. The hold above describes a RISK the
+	 * operator may accept; this is a certainty, so it joins
+	 * mustNotBroadcastCommitment and the operator's force close is refused
+	 * too. The row still resumes, since the peer's retransmission is what
+	 * brings it level. MUST persist: a restart must not forget it.
+	 */
+	restoreRevokedRisk?: boolean;
+	/**
 	 * The operator's labelled acknowledgement (RECOVERY-PROTOCOL 5.6) that a
 	 * mutual close of this capsule-restored channel may sign away balances the
 	 * row cannot prove current (issue #469). Stamped only by initiateShutdown
@@ -1235,15 +1248,21 @@ export function createAcceptorState(params: {
 
 /**
  * The recovery never-broadcast invariant (docs/RECOVERY-PROTOCOL.md 5.6):
- * a channel whose state is proven stale (dataLossDetected) or cannot be
- * proven current (stateUncertain) must never broadcast its stored local
- * commitment, even if the peer stays unreachable indefinitely. Every
- * force-close, rebroadcast and fee-bump decision consults this ONE
- * predicate so the two flags can never drift apart.
+ * a channel whose state is proven stale (dataLossDetected), cannot be
+ * proven current (stateUncertain), or whose current commitment the peer
+ * has shown it holds the revocation for (restoreRevokedRisk, issue #905)
+ * must never broadcast its stored local commitment, even if the peer stays
+ * unreachable indefinitely. Every force-close, rebroadcast and fee-bump
+ * decision consults this ONE predicate so the flags can never drift apart.
  */
 export function mustNotBroadcastCommitment(state: {
 	dataLossDetected?: boolean;
 	stateUncertain?: boolean;
+	restoreRevokedRisk?: boolean;
 }): boolean {
-	return state.dataLossDetected === true || state.stateUncertain === true;
+	return (
+		state.dataLossDetected === true ||
+		state.stateUncertain === true ||
+		state.restoreRevokedRisk === true
+	);
 }

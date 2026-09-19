@@ -6203,17 +6203,21 @@ export class Channel {
 		chain?: IForceCloseChainFacts
 	): ForceClosePlan {
 		// The recovery never-broadcast invariant (5.6): proven stale
-		// (dataLossDetected) or unprovable (stateUncertain), our latest local
-		// commitment may be revoked in the peer's view - broadcasting it hands
-		// our entire balance to the justice path. Recovery is passive:
-		// StateUncertain is permanent absent independently verified storage
-		// provenance, so the only exit is the peer force-closing with ITS
-		// commitment; we sweep our to_remote from that.
+		// (dataLossDetected), unprovable (stateUncertain), or restored with
+		// the peer having shown it holds the revocation (restoreRevokedRisk,
+		// issue #905), our latest local commitment may be revoked in the
+		// peer's view - broadcasting it hands our entire balance to the
+		// justice path. Recovery is passive: StateUncertain is permanent
+		// absent independently verified storage provenance, so the only exit
+		// is the peer force-closing with ITS commitment; we sweep our
+		// to_remote from that.
 		if (mustNotBroadcastCommitment(this._state)) {
 			return {
 				ok: false,
 				error: this._state.dataLossDetected
 					? 'Refusing to broadcast stale commitment after data loss'
+					: this._state.restoreRevokedRisk
+					? 'Refusing to broadcast: the peer already holds the revocation for this restored commitment'
 					: 'Refusing to broadcast: restored state is not proven current'
 			};
 		}
@@ -9894,6 +9898,36 @@ export class Channel {
 						'Restored state is unprovable (StateUncertain): refusing to resume or broadcast, awaiting peer force close'
 				}
 			];
+		}
+
+		// ── Restored row whose current commitment the peer has revoked ──
+		// (issue #905). localCommitmentNumber advances when WE send
+		// revoke_and_ack, so next_revocation_number at exactly
+		// localCommitmentNumber + 1 means the peer received one more
+		// revoke_and_ack than this row recorded sending, and the commitment it
+		// revoked is commitment localCommitmentNumber: the one this row would
+		// broadcast. The DLP arm above needs a larger gap, and the revocation
+		// arm below calls exactly + 1 the sig-in-flight case, which it is for
+		// a live node, whose next_revocation_number then EQUALS
+		// localCommitmentNumber. On a capsule-restored row the value can only
+		// come from a round the capsule missed, so the hold's "the peer MAY
+		// hold a newer state" has become "the peer holds the revocation":
+		// not a risk the operator can accept, a certain loss. Set on the
+		// counter alone; the validated secret above is corroboration, not a
+		// requirement, since refusal is the safe direction. The row still
+		// resumes, because the peer's retransmission of its commitment_signed
+		// is what brings it level. Placed ahead of the gap arms so a row that
+		// also errors on a commitment gap carries it. Its own persist: the
+		// trailing persist fires only beside a SEND_MESSAGE, and this shape
+		// retransmits nothing, so without it a crash after reestablish would
+		// forget the flag and reopen the operator's force close.
+		if (
+			this._state.restoreRecencyUnproven === true &&
+			msg.nextRevocationNumber === this._state.localCommitmentNumber + 1n &&
+			this._state.restoreRevokedRisk !== true
+		) {
+			this._state.restoreRevokedRisk = true;
+			actions.push({ type: ChannelActionType.PERSIST_STATE });
 		}
 
 		// ── Commitment retransmission logic ──
