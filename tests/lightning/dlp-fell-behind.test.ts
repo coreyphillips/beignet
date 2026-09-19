@@ -255,6 +255,32 @@ function makeForeignPoint(tag: string): Buffer {
 	);
 }
 
+/**
+ * The refusal an all-zero yourLastPerCommitmentSecret draws above
+ * next_revocation_number 0 (issue #907): the channel fails with the
+ * validator's wire error, persisted first, and no DLP flag or broadcast.
+ */
+function expectZeroSecretRefusal(
+	channel: Channel,
+	actions: ReturnType<Channel['handleReestablish']>
+): void {
+	expect(channel.getState()).to.equal(ChannelState.ERRORED);
+	// Persist FIRST: the ERRORED row must outlive a crash before the send.
+	expect(actions[0].type).to.equal(ChannelActionType.PERSIST_STATE);
+	const errSend = findSendAction(actions, MessageType.ERROR);
+	expect(errSend, 'a wire error goes to the peer').to.exist;
+	const decoded = decodeErrorMessage(errSend.payload);
+	expect(decoded.channelId.equals(channel.getChannelId()!)).to.equal(true);
+	expect(decoded.data.toString('ascii')).to.contain(
+		'Invalid per-commitment secret in channel_reestablish'
+	);
+	const state = channel.getFullState();
+	expect(state.dataLossDetected).to.not.equal(true);
+	expect(state.dlpRemotePerCommitmentPoint).to.not.exist;
+	expect(actions.find((a) => a.type === ChannelActionType.BROADCAST_TX)).to.not
+		.exist;
+}
+
 describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 	describe('handleReestablish - fell behind detection', function () {
 		it('detects data loss when the peer proves a future state with a valid secret', function () {
@@ -314,7 +340,11 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 			expect(broadcast).to.not.exist;
 		});
 
-		it('keeps the plain error when the gap has no DLP proof (all-zero secret)', function () {
+		it('refuses an all-zero secret on a counter gap instead of the plain gap arm', function () {
+			// The bug (issue #907): with zeroes, the same gap that a real secret
+			// turns into the fell-behind proof used to reach the plain gap arm,
+			// which sets no broadcast ban. BOLT 2 allows zeroes only at
+			// next_revocation_number 0, so above it they are a wrong secret.
 			const { opener, acceptor } = setupNormalChannels();
 			exchangeCommitments(opener, acceptor);
 
@@ -329,17 +359,37 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 			};
 			const actions = opener.handleReestablish(msg);
 
-			const state = opener.getFullState();
-			expect(state.dataLossDetected).to.not.equal(true);
-			expect(state.dlpRemotePerCommitmentPoint).to.not.exist;
-			expect(opener.getState()).to.not.equal(ChannelState.ERRORED);
+			expectZeroSecretRefusal(opener, actions);
+			expect(
+				actions.find(
+					(a) =>
+						a.type === ChannelActionType.ERROR &&
+						(a as { message: string }).message.includes('Remote expects future')
+				),
+				'the plain gap arms never see it'
+			).to.not.exist;
+		});
 
-			expect(actions).to.have.length(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect((actions[0] as { message: string }).message).to.contain(
-				'Remote expects future commitment'
-			);
-			expect(findSendAction(actions, MessageType.ERROR)).to.not.exist;
+		it('refuses an all-zero secret at a compatible non-zero revocation number', function () {
+			// Compatible counters do not excuse it either: above 0 the peer MUST
+			// send the last secret it received from us, and the validator, not
+			// the retransmission logic, answers a wrong one.
+			const { opener, acceptor } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const pre = opener.getFullState();
+			expect(Number(pre.localCommitmentNumber)).to.be.greaterThan(0);
+			opener.markForReestablish();
+			const msg: IChannelReestablishMessage = {
+				channelId: opener.getChannelId()!,
+				nextCommitmentNumber: pre.remoteCommitmentNumber + 1n,
+				nextRevocationNumber: pre.localCommitmentNumber,
+				yourLastPerCommitmentSecret: Buffer.alloc(32),
+				myCurrentPerCommitmentPoint: makeForeignPoint('zeros-level')
+			};
+			const actions = opener.handleReestablish(msg);
+
+			expectZeroSecretRefusal(opener, actions);
 		});
 	});
 

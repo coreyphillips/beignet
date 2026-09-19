@@ -527,20 +527,26 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			expect(findErrorAction(result)).to.contain('future commitment');
 		});
 
-		it('should error on future revocation gap', function () {
-			const { opener } = setupNormalChannels();
+		it('treats a future revocation gap with our real secret as the fell-behind proof', function () {
+			const { opener, openerSeed } = setupNormalChannels();
 			opener.markForReestablish();
 
+			// Above revocation 0 the secret must be the real one (zeroes are
+			// refused, issue #907), and our real secret at an index we never
+			// reached proves the peer holds a newer state: the fell-behind arm
+			// claims the gap before the plain gap error can.
 			const badReestablish: IChannelReestablishMessage = {
 				channelId: opener.getChannelId()!,
 				nextCommitmentNumber: 1n,
 				nextRevocationNumber: 100n,
-				yourLastPerCommitmentSecret: Buffer.alloc(32),
+				yourLastPerCommitmentSecret: getPerCommitmentSecret(openerSeed, 99n),
 				myCurrentPerCommitmentPoint: crypto.randomBytes(33)
 			};
 
 			const result = opener.handleReestablish(badReestablish);
-			expect(findErrorAction(result)).to.contain('future revocation');
+			expect(findErrorAction(result)).to.contain('fell behind');
+			expect(opener.getFullState().dataLossDetected).to.equal(true);
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
 		});
 	});
 

@@ -9794,15 +9794,18 @@ export class Channel {
 		}
 
 		// ── Data loss protection: validate yourLastPerCommitmentSecret ──
+		// BOLT 2: at next_revocation_number 0 the secret MUST be all zeroes;
+		// above 0 it MUST be the last per_commitment_secret the peer received
+		// from us, so all zeroes there is as wrong as any other value. An
+		// exemption for zeroes let a peer holding a newer state choose the
+		// plain gap arms below over the fell-behind arm, the only arm that
+		// forbids our broadcast (issue #907).
 		if (msg.nextRevocationNumber > 0n) {
 			const expectedSecret = getPerCommitmentSecret(
 				this._state.localPerCommitmentSeed,
 				msg.nextRevocationNumber - 1n
 			);
-			if (
-				!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32)) &&
-				!msg.yourLastPerCommitmentSecret.equals(expectedSecret)
-			) {
+			if (!msg.yourLastPerCommitmentSecret.equals(expectedSecret)) {
 				// BOLT 2: MUST fail the channel — the peer is lying about (or has
 				// corrupted) our revocation chain. Wire error like the DLP path.
 				return this._failChannelWithWireError(
@@ -9814,7 +9817,8 @@ export class Channel {
 		// ── Data loss protection: WE fell behind (BOLT 2) ──
 		// The peer expects a commitment/revocation beyond anything our restored
 		// state ever produced AND its yourLastPerCommitmentSecret passed the
-		// validation above while being non-zero: that secret is only derivable
+		// validation above, which at a non-zero next_revocation_number admits
+		// only the real secret (never zeroes): that secret is only derivable
 		// from OUR seed at an index we have not reached, so the peer provably
 		// holds a newer channel state than we do (we lost data). We MUST NOT
 		// broadcast our commitment - it is revoked in the peer's view and would
@@ -9914,7 +9918,11 @@ export class Channel {
 		// connection died between its updates/signature and us). Its own
 		// retransmission (updates + commitment_signed, triggered by our
 		// next_commitment_number) brings us level, after which we revoke
-		// normally. Only a larger gap is irrecoverable.
+		// normally. Only a larger gap is irrecoverable. Backstop: the secret
+		// validator admits only our real secret at that index, and the
+		// fell-behind arm above then claims every such gap first, so this arm
+		// is normally unreachable; it stays so a gap can never fall through to
+		// the retransmission logic.
 		if (msg.nextRevocationNumber > this._state.localCommitmentNumber + 1n) {
 			// Peer expects a revocation we've never created — irrecoverable
 			return this._heldReestablishGapFailure(

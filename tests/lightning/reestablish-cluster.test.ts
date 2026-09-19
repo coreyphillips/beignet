@@ -41,6 +41,7 @@ import {
 	serializeChannelState,
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 
 const sha256 = (b: Buffer): Buffer =>
 	crypto.createHash('sha256').update(b).digest();
@@ -415,11 +416,21 @@ describe('S-2.M1: retransmission preserves the original send order', function ()
 		// The peer claims it missed our last commitment_signed AND our last
 		// revoke_and_ack: nextCommitmentNumber <= remoteCommitmentNumber and
 		// nextRevocationNumber + 1 == localCommitmentNumber.
+		// The secret is our real one at index nextRevocationNumber - 1: above
+		// revocation 0 zeroes are refused outright (issue #907), and that wire
+		// error would replace the replay these cells measure.
+		const nextRevocationNumber = st.localCommitmentNumber - 1n;
 		const actions = aC.handleReestablish({
 			channelId: t.channelId,
 			nextCommitmentNumber: st.remoteCommitmentNumber,
-			nextRevocationNumber: st.localCommitmentNumber - 1n,
-			yourLastPerCommitmentSecret: Buffer.alloc(32),
+			nextRevocationNumber,
+			yourLastPerCommitmentSecret:
+				nextRevocationNumber > 0n
+					? generateFromSeed(
+							st.localPerCommitmentSeed,
+							MAX_INDEX - (nextRevocationNumber - 1n)
+					  )
+					: Buffer.alloc(32),
 			myCurrentPerCommitmentPoint: Buffer.alloc(33)
 		});
 		return actions
