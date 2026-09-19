@@ -2265,8 +2265,8 @@ export class BeignetNode extends EventEmitter {
 			coinType,
 			network: lnNetwork,
 			storage: this.storage,
-			// Issue #906: no channel key index is handed out while the boot's
-			// restore outcome or the chain tip is still unknown.
+			// Issue #906: fence fresh indices during active auto-apply or a
+			// rebuild, and while the node's block height is zero.
 			newChannelsRefused: (): string | null => this.newChannelRefusal(),
 			enableNetworking: true,
 			autoReconnect: opts.autoReconnect ?? true,
@@ -4597,13 +4597,15 @@ export class BeignetNode extends EventEmitter {
 	 *    CHANNEL_INDEX_FLOOR_STRIDE on a boot with no key-index row, and
 	 *    until a height is known that floor cannot be set, so the next
 	 *    channel would take index 1.
-	 * An idle lane with nothing retrieved does NOT refuse: the floor already
-	 * keeps a fresh index above anything a previous device burned (provided
-	 * it opened fewer than 128 channels per block elapsed since its own
-	 * birth tip), and a brand-new wallet has to be able to open its first
-	 * channel. The confirmed-empty marker (#909 D9) narrows this further
-	 * once it exists, and is the answer to the residual the floor cannot
-	 * cover: two devices restored from one seed within the same block.
+	 * An idle lane with nothing retrieved does NOT refuse, so a brand-new
+	 * wallet can open its first channel. The floor provides bounded spacing:
+	 * for unclamped heights H > H0, sequential allocation from H0 * 128
+	 * leaves every consumed index below H * 128 while at most
+	 * 128 * (H - H0) indices have been consumed. Every attempt reaching
+	 * derivation counts, including one validation later rejects. Same-block
+	 * restores and allocations beyond that budget can still reuse keys. This
+	 * fence does not stop another running device or establish that recovery
+	 * found all previous state.
 	 */
 	private newChannelRefusal(): string | null {
 		const phase = this._autoApply.phase;
@@ -4617,9 +4619,8 @@ export class BeignetNode extends EventEmitter {
 		}
 		if (this.node.getCurrentBlockHeight() === 0) {
 			return (
-				'New channels are refused until the chain tip is known: the next ' +
-				'channel key index is floored at the tip times the stride (128 ' +
-				"per block) so no previous device channel's keys are reused"
+				'New channels are refused until the chain tip is known so ' +
+				'recovery can initialize channel keys'
 			);
 		}
 		return null;

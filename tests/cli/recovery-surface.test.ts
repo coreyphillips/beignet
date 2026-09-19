@@ -2743,8 +2743,8 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 				expect(unknownTip.index).to.equal(1);
 
 				// An idle lane with the tip known does NOT fence: the floor
-				// already keeps the index clear, and a brand-new wallet has to
-				// be able to open its first channel (the deliberate narrowing).
+				// supplies bounded spacing, and a brand-new wallet has to be
+				// able to open its first channel (the deliberate narrowing).
 				deviceB.node.getNode().handleNewBlock(TIP);
 				expect(predicateOf(deviceB)()).to.equal(null);
 				expect(

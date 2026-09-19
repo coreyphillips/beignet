@@ -2641,8 +2641,8 @@ export class LightningNode extends EventEmitter {
 		// opened or accepted, the keys of whichever channel a previous device
 		// held at index 1. Such a birth boot floors the counter at the chain
 		// tip times CHANNEL_INDEX_FLOOR_STRIDE instead (128 indices per
-		// block, the margin between per-channel index consumption and the
-		// per-block advance of the floor), ONCE: from the height persisted
+		// block, a bounded margin for consumed indices, including open attempts
+		// that validation later rejects), ONCE: from the height persisted
 		// below when there is one, else from the first header, and the value
 		// it reaches goes to the floor row (persistChannelIndexFloor). Every
 		// later boot seeds the counter from max(table high-water mark, row)
@@ -2950,8 +2950,8 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 		// Issue #906: a birth boot arms the chain-tip floor on the next channel
-		// index. It fires now from the persisted height when there is one (a
-		// past tip is still a monotone lower bound), else from the first
+		// index. It fires now from the persisted height when there is one
+		// (without checking its freshness), else from the first
 		// header; either way the value is written once it has fired. Until
 		// then the row holds the birth marker, so a restart before any header
 		// is a birth boot again.
