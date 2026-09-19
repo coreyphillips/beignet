@@ -1619,6 +1619,7 @@ export class LightningNode extends EventEmitter {
 			chainHash: config.chainHashes?.[0] ?? this.chainHash(),
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
+			newChannelsRefused: config.newChannelsRefused,
 			signerFactory: config.signerFactory,
 			// Recovery 5.8: in quorum mode this holds a batch's remaining
 			// actions until the frame behind them is replicated. In every
@@ -2618,6 +2619,20 @@ export class LightningNode extends EventEmitter {
 		if (nextChannelIndex > this.channelManager.nextChannelIndex) {
 			this.channelManager.nextChannelIndex = nextChannelIndex;
 		}
+		// Issue #906: with NO key-index row at all there is no high-water mark
+		// to seed from, and a counter left at 1 would hand the next channel,
+		// opened or accepted, the keys of whichever channel a previous device
+		// held at index 1. Such a boot floors the counter at the chain tip
+		// instead: from the height persisted below when there is one, and
+		// from every block after that (armed once the height is restored).
+		// An empty table is told apart from one whose top index is 0 (both
+		// answer 1 above) by the existence query, with the enumerator and
+		// then the answer itself standing in for backends that lack it.
+		const keyIndexTableEmpty = this.storage.hasChannelKeyIndices
+			? !this.storage.hasChannelKeyIndices()
+			: this.storage.loadAllChannelKeyIndices
+			? this.storage.loadAllChannelKeyIndices().length === 0
+			: nextChannelIndex <= 1;
 
 		// Restore channels — look up per-channel key index for each
 		for (const {
@@ -2896,6 +2911,12 @@ export class LightningNode extends EventEmitter {
 			if (!isNaN(height) && height > 0) {
 				this.currentBlockHeight = height;
 			}
+		}
+		// Issue #906: the chain-tip floor on the next channel index, from the
+		// persisted height now (a past tip is still a monotone lower bound)
+		// and from every header the manager sees after this.
+		if (keyIndexTableEmpty) {
+			this.channelManager.armChannelIndexTipFloor(this.currentBlockHeight);
 		}
 
 		// Restore mission control
@@ -25525,6 +25546,7 @@ export class LightningNode extends EventEmitter {
 			channelKeyDeriver?: (
 				channelIndex: number
 			) => import('../channel/channel-manager').IPerChannelKeys;
+			newChannelsRefused?: INodeConfig['newChannelsRefused'];
 		}
 	): LightningNode {
 		const coinType = options?.coinType ?? LnCoinType.REGTEST;
@@ -25602,7 +25624,8 @@ export class LightningNode extends EventEmitter {
 			watchtowers: options?.watchtowers,
 			recovery: options?.recovery,
 			guardianHost: options?.guardianHost,
-			channelKeyDeriver
+			channelKeyDeriver,
+			newChannelsRefused: options?.newChannelsRefused
 		});
 	}
 

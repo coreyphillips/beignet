@@ -328,6 +328,18 @@ export interface IChannelManagerConfig {
 	 */
 	channelKeyDeriver?: (channelIndex: number) => IPerChannelKeys;
 	/**
+	 * Fence on brand-new channels (issue #906). Consulted by every path that
+	 * would consume a fresh channel key index, the inbound acceptors
+	 * included, and read anew each time. A non-null answer is the reason the
+	 * open is refused with: on the wire as a BOLT 1 error for an inbound
+	 * open_channel or open_channel2, as a throw for an outbound open; no
+	 * index is consumed either way. The daemon supplies it while the boot's
+	 * restore outcome or the chain tip is still unknown, when a fresh index
+	 * could collide with one a previous device burned. Unset, every open is
+	 * allowed exactly as before.
+	 */
+	newChannelsRefused?: () => string | null;
+	/**
 	 * Custom {@link ISigner} factory (e.g. a remote/external signer). When
 	 * set, it replaces the internal ChannelSigner construction for every
 	 * channel signer, keyed by the channel's key index (0 for node-level
@@ -646,6 +658,14 @@ export class ChannelManager extends EventEmitter {
 	private _knownPreimages: Map<string, Buffer> = new Map();
 	private zeroConfManager: ZeroConfManager = new ZeroConfManager();
 	private _nextChannelIndex = 1;
+	/**
+	 * Issue #906: armed when the boot found NO key-index row, the one case
+	 * with no high-water mark to seed the counter from. While armed, the next
+	 * index is floored at the chain tip whenever a height is learned: block
+	 * height is monotone across any number of device losses, so a bare-seed
+	 * boot can never hand out an index a previous device already used.
+	 */
+	private _channelIndexTipFloor = false;
 	/** Wallet-owned destination for cooperative-close payouts, if configured. */
 	private _walletDestinationScript: Buffer | null = null;
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
@@ -714,10 +734,43 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
-	 * Set the next channel index (e.g. after restoring from storage).
+	 * Raise the next channel index (e.g. after restoring from storage). The
+	 * counter never moves down (issue #906): a lower value is ignored, since
+	 * every index below the current one may already be burned.
 	 */
 	set nextChannelIndex(value: number) {
-		this._nextChannelIndex = value;
+		if (value > this._nextChannelIndex) this._nextChannelIndex = value;
+	}
+
+	/**
+	 * Arm the chain-tip floor on the next channel index (issue #906). The
+	 * node calls this when its key-index table is EMPTY: with no row to seed
+	 * from, the counter would start at 1 and the next channel, opened OR
+	 * accepted, would derive byte for byte the funding key, basepoints and
+	 * per-commitment seed of whichever channel a previous device held at
+	 * index 1. The floor is max(current, tip), applied now from any height
+	 * already known and again on every block, and it only ever raises the
+	 * counter. A non-empty table never arms it: its own high-water mark
+	 * already implies every floor that was ever applied.
+	 */
+	armChannelIndexTipFloor(knownTipHeight = 0): void {
+		this._channelIndexTipFloor = true;
+		this._applyChannelIndexTipFloor(knownTipHeight);
+	}
+
+	private _applyChannelIndexTipFloor(height: number): void {
+		if (!this._channelIndexTipFloor) return;
+		const floor = Math.max(height, this._currentBlockHeight);
+		if (floor > this._nextChannelIndex) this._nextChannelIndex = floor;
+	}
+
+	/**
+	 * The configured fence on brand-new channels (issue #906), or null. Read
+	 * on every consultation rather than latched: the daemon's answer changes
+	 * as its restore lane settles and the chain tip arrives.
+	 */
+	private _newChannelRefusal(): string | null {
+		return this.config.newChannelsRefused?.() ?? null;
 	}
 
 	/**
@@ -740,6 +793,12 @@ export class ChannelManager extends EventEmitter {
 		// getRecoveryChannelMaterial), so recovering an old channel is never
 		// refused.
 		this._assertNamespaceCanRecordANewChannel();
+		// Issue #906: the configured fence, in the same backstop role. The
+		// acceptors answer the wire from their own pre-check and the openers
+		// surface this throw; either way it sits ahead of the consumption
+		// below, so a refusal never burns an index.
+		const refusal = this._newChannelRefusal();
+		if (refusal) throw new Error(refusal);
 		if (this.config.channelKeyDeriver) {
 			const idx = this._nextChannelIndex++;
 			const keys = this.config.channelKeyDeriver(idx);
@@ -2920,6 +2979,7 @@ export class ChannelManager extends EventEmitter {
 	 */
 	handleNewBlock(blockHeight: number): ChainAction[] {
 		this._currentBlockHeight = blockHeight;
+		this._applyChannelIndexTipFloor(blockHeight);
 		// Update block height on all channels for CLTV validation
 		for (const channel of this.channels.values()) {
 			channel.setBlockHeight(blockHeight);
@@ -3521,6 +3581,15 @@ export class ChannelManager extends EventEmitter {
 				msg.temporaryChannelId,
 				NAMESPACE_LOST_REFUSAL
 			);
+			return;
+		}
+		// Issue #906: the new-channel fence answers the wire here, before any
+		// key is derived or any temporary channel retained, exactly like the
+		// namespace refusal above; the throw inside deriveKeysForNewChannel is
+		// only the backstop.
+		const fence = this._newChannelRefusal();
+		if (fence) {
+			this.refuseInboundOpen(peerPubkey, msg.temporaryChannelId, fence);
 			return;
 		}
 		const tempId = msg.temporaryChannelId.toString('hex');
@@ -6900,6 +6969,13 @@ export class ChannelManager extends EventEmitter {
 		}
 		if (this._namespaceCannotRecordANewChannel()) {
 			this.refuseInboundOpen(peerPubkey, msg.channelId, NAMESPACE_LOST_REFUSAL);
+			return;
+		}
+		// Issue #906: the new-channel fence, on the wire before any derivation
+		// or temporary-channel retention (the v1 acceptor does the same).
+		const fence = this._newChannelRefusal();
+		if (fence) {
+			this.refuseInboundOpen(peerPubkey, msg.channelId, fence);
 			return;
 		}
 
