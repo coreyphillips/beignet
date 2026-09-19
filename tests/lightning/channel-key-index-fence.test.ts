@@ -10,11 +10,13 @@
  *  - the fence (newChannelsRefused): while the predicate answers a reason,
  *    every entry point refuses with it and no index is consumed;
  *  - the floor: a birth boot (no key-index row, no persisted floor) floors
- *    the next index at the first real chain tip it learns, ONCE, and never
- *    lowers it; the value is persisted, every later boot seeds the counter
- *    from max(table, floor) with no header moving it, and a partial restore
- *    on the birth boot (rows below the floor) cannot hand the NEXT boot a
- *    burned index either.
+ *    the next index at the first real chain tip it learns times
+ *    CHANNEL_INDEX_FLOOR_STRIDE (128 indices per block, since indices are
+ *    consumed per channel while the floor advances per block), ONCE, and
+ *    never lowers it; the value is persisted, every later boot seeds the
+ *    counter from max(table, floor) with no header moving it, and a partial
+ *    restore on the birth boot (rows below the floor) cannot hand the NEXT
+ *    boot a burned index either.
  */
 
 import { expect } from 'chai';
@@ -28,6 +30,7 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import { IScbChannelEntry } from '../../src/lightning/backup/scb';
 import { Channel } from '../../src/lightning/channel/channel';
 import {
+	CHANNEL_INDEX_FLOOR_STRIDE,
 	ChannelManager,
 	IChannelManagerConfig,
 	IPerChannelKeys
@@ -62,6 +65,8 @@ const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 /** A mainnet-scale tip: far above any index a wallet reaches by counting. */
 const TIP = 850_000;
+/** Where the floor lands for a birth boot at TIP: the stride's worth per block. */
+const FLOOR = TIP * CHANNEL_INDEX_FLOOR_STRIDE;
 const REASON = 'new channels refused: the restore outcome is not known (test)';
 const LSP_PUBKEY = '02' + 'ab'.repeat(32);
 const WALLET_PUBKEY = '03' + 'cd'.repeat(32);
@@ -504,7 +509,7 @@ describe('Channel key index floor (issue #906)', () => {
 		}
 	});
 
-	it('floors the next index at the first real height once armed, then leaves it to the counter', () => {
+	it('floors the next index at the first real height times the stride once armed, then leaves it to the counter', () => {
 		const manager = makeManager('floor');
 		const peer = '02' + 'f1'.repeat(32);
 		manager.armChannelIndexTipFloor();
@@ -514,35 +519,68 @@ describe('Channel key index floor (issue #906)', () => {
 		manager.handleNewBlock(0);
 		expect(manager.nextChannelIndex).to.equal(1);
 		expect(manager.channelIndexTipFloorArmed).to.equal(true);
-		// The first real height fires it, once.
+		// The first real height fires it, once, at the stride's worth of
+		// indices per block.
 		manager.handleNewBlock(TIP);
-		expect(manager.nextChannelIndex).to.equal(TIP);
+		expect(manager.nextChannelIndex).to.equal(FLOOR);
 		expect(manager.channelIndexTipFloorArmed).to.equal(false);
 		// Nothing lowers it: not an older header, not the setter.
 		manager.handleNewBlock(TIP - 10);
-		expect(manager.nextChannelIndex).to.equal(TIP);
+		expect(manager.nextChannelIndex).to.equal(FLOOR);
 		manager.nextChannelIndex = 5;
-		expect(manager.nextChannelIndex).to.equal(TIP);
+		expect(manager.nextChannelIndex).to.equal(FLOOR);
 		// A higher answer (a capsule, a peer) still raises it.
-		manager.nextChannelIndex = TIP + 3;
-		expect(manager.nextChannelIndex).to.equal(TIP + 3);
+		manager.nextChannelIndex = FLOOR + 3;
+		expect(manager.nextChannelIndex).to.equal(FLOOR + 3);
 		const channel = manager.openChannel(peer, 100_000n);
-		expect(channel.channelKeyIndex).to.equal(TIP + 3);
-		expect(manager.nextChannelIndex).to.equal(TIP + 4);
+		expect(channel.channelKeyIndex).to.equal(FLOOR + 3);
+		expect(manager.nextChannelIndex).to.equal(FLOOR + 4);
 		// Later headers, below or above the counter, do not move it: the
 		// floor fired once, and the counter is the table's business now.
 		manager.handleNewBlock(TIP + 1);
-		expect(manager.nextChannelIndex).to.equal(TIP + 4);
+		expect(manager.nextChannelIndex).to.equal(FLOOR + 4);
 		manager.handleNewBlock(TIP + 10);
-		expect(manager.nextChannelIndex).to.equal(TIP + 4);
+		expect(manager.nextChannelIndex).to.equal(FLOOR + 4);
 
 		// Armed with a height already known, it fires at once.
 		const known = makeManager('known');
 		known.armChannelIndexTipFloor(TIP);
-		expect(known.nextChannelIndex).to.equal(TIP);
+		expect(known.nextChannelIndex).to.equal(FLOOR);
 		expect(known.channelIndexTipFloorArmed).to.equal(false);
 		known.handleNewBlock(TIP + 10);
-		expect(known.nextChannelIndex).to.equal(TIP);
+		expect(known.nextChannelIndex).to.equal(FLOOR);
+
+		// Why the stride: indices are consumed per channel, the floor moves
+		// per block. A device born at TIP whose LSP opens three channels
+		// across two blocks burns three indices; a second device restored
+		// from the same seed two blocks later starts above all of them,
+		// which a floor of one index per block (TIP + 2) would not have.
+		expect(CHANNEL_INDEX_FLOOR_STRIDE).to.equal(128);
+		const earlier = makeManager('earlier-device');
+		earlier.armChannelIndexTipFloor(TIP);
+		const burned = ['e1', 'e2', 'e3'].map(
+			(tag) =>
+				earlier.openChannel('02' + tag.repeat(32), 100_000n).channelKeyIndex
+		);
+		expect(burned).to.deep.equal([FLOOR, FLOOR + 1, FLOOR + 2]);
+		const later = makeManager('later-device');
+		later.armChannelIndexTipFloor(TIP + 2);
+		expect(later.nextChannelIndex).to.equal(
+			(TIP + 2) * CHANNEL_INDEX_FLOOR_STRIDE
+		);
+		expect(later.nextChannelIndex).to.be.above(FLOOR + 2);
+		expect(TIP + 2).to.be.below(FLOOR + 2);
+		// The residual the floor does not cover: a second device restored
+		// within the SAME block starts where the first did. That is split
+		// brain, for the fence and the confirmed-empty marker (#909 D9).
+		const sameBlock = makeManager('same-block-device');
+		sameBlock.armChannelIndexTipFloor(TIP);
+		expect(sameBlock.nextChannelIndex).to.equal(burned[0]);
+		// And the stride keeps every plausible tip's floor a derivable
+		// hardened index (under 2^31 - 1, see backup/scb.ts).
+		expect(FLOOR).to.be.below(0x7fffffff);
+		expect(16_777_215 * CHANNEL_INDEX_FLOOR_STRIDE).to.be.below(0x7fffffff);
+		expect(16_777_216 * CHANNEL_INDEX_FLOOR_STRIDE).to.be.above(0x7fffffff);
 
 		// An unarmed manager is untouched by headers.
 		const plain = makeManager('plain');
@@ -551,7 +589,7 @@ describe('Channel key index floor (issue #906)', () => {
 		expect(plain.channelIndexTipFloorArmed).to.equal(false);
 	});
 
-	it('a bare-seed boot starts at the tip and derives keys no earlier device could have used', () => {
+	it('a bare-seed boot starts at the tip times the stride and derives keys no earlier device could have used', () => {
 		// File-backed: the second boot reopens what the first one journaled
 		// (destroy() closes the storage a node was given).
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ckif-'));
@@ -568,10 +606,10 @@ describe('Channel key index floor (issue #906)', () => {
 			expect(manager.channelIndexTipFloorArmed).to.equal(true);
 			expect(storage.loadMetadata(FLOOR_KEY)).to.equal('0');
 			node.handleNewBlock(TIP);
-			expect(manager.nextChannelIndex).to.equal(TIP);
+			expect(manager.nextChannelIndex).to.equal(FLOOR);
 			// The floor fired: its value is the row, written once.
 			expect(manager.channelIndexTipFloorArmed).to.equal(false);
-			expect(storage.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(storage.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 
 			// The previous device's channel: the keys this seed derives at 1.
 			const root = BIP32Factory.fromSeed(bip39.mnemonicToSeedSync(MNEMONIC));
@@ -590,7 +628,7 @@ describe('Channel key index floor (issue #906)', () => {
 			expect(result.wireErrors).to.deep.equal([]);
 			const channel = manager.getTempChannel(open.tempId);
 			expect(channel, 'the open was accepted').to.not.equal(undefined);
-			expect(channel!.channelKeyIndex).to.equal(TIP);
+			expect(channel!.channelKeyIndex).to.equal(FLOOR);
 			const state = channel!.getFullState();
 			expect(
 				state.localBasepoints.fundingPubkey.equals(
@@ -606,7 +644,7 @@ describe('Channel key index floor (issue #906)', () => {
 				state.localPerCommitmentSeed.equals(old.perCommitmentSeed)
 			).to.equal(false);
 			// And they are exactly the keys at the floored index.
-			const fresh = deriveChannelKeys(root, LnCoinType.REGTEST, TIP);
+			const fresh = deriveChannelKeys(root, LnCoinType.REGTEST, FLOOR);
 			expect(
 				state.localBasepoints.fundingPubkey.equals(
 					fresh.channelBasepoints.fundingPubkey
@@ -620,28 +658,29 @@ describe('Channel key index floor (issue #906)', () => {
 			expect(
 				state.localPerCommitmentSeed.equals(fresh.perCommitmentSeed)
 			).to.equal(true);
-			expect(manager.nextChannelIndex).to.equal(TIP + 1);
+			expect(manager.nextChannelIndex).to.equal(FLOOR + 1);
 
 			// A later header on the same boot moves neither the counter nor
-			// the row: the floor is a one-time snapshot of the birth tip.
+			// the row: the floor is a one-time snapshot of the birth tip
+			// (times the stride).
 			node.handleNewBlock(TIP + 5);
-			expect(manager.nextChannelIndex).to.equal(TIP + 1);
-			expect(storage.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(manager.nextChannelIndex).to.equal(FLOOR + 1);
+			expect(storage.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 
 			// Once the channel is journaled, a second boot continues from
-			// max(table, row) = TIP + 1 before any header, and headers do not
-			// move it.
-			storage.saveChannelKeyIndex(open.tempId.toString('hex'), TIP);
+			// max(table, row) = FLOOR + 1 before any header, and headers do
+			// not move it.
+			storage.saveChannelKeyIndex(open.tempId.toString('hex'), FLOOR);
 			node.destroy();
 			const reopened = new SqliteStorage(dbPath);
 			reopened.open();
 			second = bootNode(reopened);
 			const again = second.getChannelManager();
 			expect(again.channelIndexTipFloorArmed).to.equal(false);
-			expect(again.nextChannelIndex).to.equal(TIP + 1);
+			expect(again.nextChannelIndex).to.equal(FLOOR + 1);
 			second.handleNewBlock(TIP + 500);
-			expect(again.nextChannelIndex).to.equal(TIP + 1);
-			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(again.nextChannelIndex).to.equal(FLOOR + 1);
+			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 		} finally {
 			if (second) second.destroy();
 			else node.destroy();
@@ -653,8 +692,8 @@ describe('Channel key index floor (issue #906)', () => {
 		// The floor above the table (rows a partial restore landed below
 		// it), then the table above the floor (channels opened since).
 		for (const [rows, floor, expected] of [
-			[[3, 7], TIP, TIP],
-			[[3, TIP + 20], TIP, TIP + 21]
+			[[3, 7], FLOOR, FLOOR],
+			[[3, FLOOR + 20], FLOOR, FLOOR + 21]
 		] as Array<[number[], number, number]>) {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();
@@ -706,7 +745,7 @@ describe('Channel key index floor (issue #906)', () => {
 			const armed = bootNode(hiding(empty, hidden));
 			try {
 				armed.handleNewBlock(TIP);
-				expect(armed.getChannelManager().nextChannelIndex).to.equal(TIP);
+				expect(armed.getChannelManager().nextChannelIndex).to.equal(FLOOR);
 			} finally {
 				armed.destroy();
 				empty.close();
@@ -737,8 +776,8 @@ describe('Channel key index floor (issue #906)', () => {
 		try {
 			const manager = node.getChannelManager();
 			node.handleNewBlock(TIP);
-			expect(manager.nextChannelIndex).to.equal(TIP);
-			expect(storage.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(manager.nextChannelIndex).to.equal(FLOOR);
+			expect(storage.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 
 			// The previous device held indices 1..4 and its backup lost the
 			// entry at 4 (the issue's second UNSAFE scenario): 1..3 come back,
@@ -751,47 +790,47 @@ describe('Channel key index floor (issue #906)', () => {
 			expect(result.skipped).to.deep.equal([]);
 			expect(result.recovering).to.have.length(3);
 			expect(storage.loadNextChannelIndex()).to.equal(4);
-			expect(manager.nextChannelIndex).to.equal(TIP);
+			expect(manager.nextChannelIndex).to.equal(FLOOR);
 			node.destroy();
 
 			// Boot 2 reads a POPULATED table whose top index is the dropped
 			// channel's predecessor: without the row the floor would not arm
 			// and the counter would be 4. From the row alone, before any
-			// header, it is TIP, and the LSP's open lands there.
+			// header, it is FLOOR, and the LSP's open lands there.
 			const reopened = new SqliteStorage(dbPath);
 			reopened.open();
 			expect(reopened.loadNextChannelIndex()).to.equal(4);
 			second = bootNode(reopened);
 			const again = second.getChannelManager();
 			expect(again.channelIndexTipFloorArmed).to.equal(false);
-			expect(again.nextChannelIndex).to.equal(TIP);
+			expect(again.nextChannelIndex).to.equal(FLOOR);
 			const first = acceptLspOpen(second, 'lsp-partial-1');
-			expect(first.channelKeyIndex).to.equal(TIP);
+			expect(first.channelKeyIndex).to.equal(FLOOR);
 			for (const idx of [1, 2, 3, 4]) expectKeysDiffer(first, idx);
-			expect(again.nextChannelIndex).to.equal(TIP + 1);
+			expect(again.nextChannelIndex).to.equal(FLOOR + 1);
 			// Headers move neither the counter nor the row: the row is the
 			// birth tip, written once, and the consumed index is the table's
 			// to record once the channel persists.
 			second.handleNewBlock(TIP + 9);
-			expect(again.nextChannelIndex).to.equal(TIP + 1);
-			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(again.nextChannelIndex).to.equal(FLOOR + 1);
+			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 			reopened.saveChannelKeyIndex(
 				first.getTemporaryChannelId().toString('hex'),
-				TIP
+				FLOOR
 			);
 			second.destroy();
 
-			// Boot 3: max(table, row) = TIP + 1. The next open lands there,
+			// Boot 3: max(table, row) = FLOOR + 1. The next open lands there,
 			// unlike every earlier key, and shares no per-commitment seed
 			// with the first; headers still move nothing.
 			const third_ = new SqliteStorage(dbPath);
 			third_.open();
 			third = bootNode(third_);
 			const more = third.getChannelManager();
-			expect(more.nextChannelIndex).to.equal(TIP + 1);
+			expect(more.nextChannelIndex).to.equal(FLOOR + 1);
 			const opened = acceptLspOpen(third, 'lsp-partial-2');
-			expect(opened.channelKeyIndex).to.equal(TIP + 1);
-			for (const idx of [1, 2, 3, 4, TIP]) expectKeysDiffer(opened, idx);
+			expect(opened.channelKeyIndex).to.equal(FLOOR + 1);
+			for (const idx of [1, 2, 3, 4, FLOOR]) expectKeysDiffer(opened, idx);
 			expect(
 				opened
 					.getFullState()
@@ -800,8 +839,8 @@ describe('Channel key index floor (issue #906)', () => {
 					)
 			).to.equal(false);
 			third.handleNewBlock(TIP + 20);
-			expect(more.nextChannelIndex).to.equal(TIP + 2);
-			expect(third_.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(more.nextChannelIndex).to.equal(FLOOR + 2);
+			expect(third_.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 		} finally {
 			if (third) third.destroy();
 			else if (second) second.destroy();
@@ -836,12 +875,12 @@ describe('Channel key index floor (issue #906)', () => {
 			expect(manager.nextChannelIndex).to.equal(1);
 			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal('0');
 			second.handleNewBlock(TIP);
-			expect(manager.nextChannelIndex).to.equal(TIP);
+			expect(manager.nextChannelIndex).to.equal(FLOOR);
 			expect(manager.channelIndexTipFloorArmed).to.equal(false);
-			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 			second.handleNewBlock(TIP + 3);
-			expect(manager.nextChannelIndex).to.equal(TIP);
-			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(manager.nextChannelIndex).to.equal(FLOOR);
+			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 			second.destroy();
 
 			// Boot 3 seeds from the row, unarmed, and no header moves it.
@@ -850,10 +889,10 @@ describe('Channel key index floor (issue #906)', () => {
 			third = bootNode(again);
 			const later = third.getChannelManager();
 			expect(later.channelIndexTipFloorArmed).to.equal(false);
-			expect(later.nextChannelIndex).to.equal(TIP);
+			expect(later.nextChannelIndex).to.equal(FLOOR);
 			third.handleNewBlock(TIP + 100);
-			expect(later.nextChannelIndex).to.equal(TIP);
-			expect(again.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(later.nextChannelIndex).to.equal(FLOOR);
+			expect(again.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 		} finally {
 			if (third) third.destroy();
 			else if (second) second.destroy();
@@ -894,15 +933,15 @@ describe('Channel key index floor (issue #906)', () => {
 			expect(manager.channelIndexTipFloorArmed).to.equal(true);
 			expect(manager.nextChannelIndex).to.equal(4);
 			second.handleNewBlock(TIP);
-			expect(manager.nextChannelIndex).to.equal(TIP);
+			expect(manager.nextChannelIndex).to.equal(FLOOR);
 			expect(manager.channelIndexTipFloorArmed).to.equal(false);
-			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 			const opened = acceptLspOpen(second, 'lsp-blind');
-			expect(opened.channelKeyIndex).to.equal(TIP);
+			expect(opened.channelKeyIndex).to.equal(FLOOR);
 			for (const idx of [1, 2, 3, 4]) expectKeysDiffer(opened, idx);
 			second.handleNewBlock(TIP + 5);
-			expect(manager.nextChannelIndex).to.equal(TIP + 1);
-			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(TIP));
+			expect(manager.nextChannelIndex).to.equal(FLOOR + 1);
+			expect(reopened.loadMetadata(FLOOR_KEY)).to.equal(String(FLOOR));
 		} finally {
 			if (second) second.destroy();
 			else node.destroy();
@@ -929,11 +968,11 @@ describe('Channel key index and the taproot verification nonce (issue #906)', ()
 		const second = makeManager('nonce-second');
 		const c = second.openChannel(peer, 100_000n);
 		expect(c.channelKeyIndex).to.equal(1);
-		// A floored one: its first channel sits at the tip.
+		// A floored one: its first channel sits at the tip times the stride.
 		const floored = makeManager('nonce-floored');
 		floored.armChannelIndexTipFloor(TIP);
 		const d = floored.openChannel(peer, 100_000n);
-		expect(d.channelKeyIndex).to.equal(TIP);
+		expect(d.channelKeyIndex).to.equal(FLOOR);
 
 		for (const height of [0n, 1n, 42n]) {
 			const nonceA = verificationNonce(a, height);
