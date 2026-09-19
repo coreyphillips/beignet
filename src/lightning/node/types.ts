@@ -1017,6 +1017,15 @@ export interface IChannelInfo {
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**
+	 * The peer's channel_reestablish claimed this channel's state is behind
+	 * and showed no proof (issue #907): the channel is ERRORED under the same
+	 * hold as restoreRecencyUnproven. No automatic close will broadcast its
+	 * commitment, it takes no new HTLCs and is offered to no router or
+	 * planner, and the peer is asked to close on every reconnect. The exits
+	 * are the peer's close or the operator's acknowledged force close.
+	 */
+	reestablishRecencyUnproven?: boolean;
+	/**
 	 * Neither mempool nor chain can account for this channel's funding and this
 	 * node has no broadcast left to answer with, so the channel is quarantined:
 	 * it takes no NEW HTLCs and is offered to no router or planner (issue #593).

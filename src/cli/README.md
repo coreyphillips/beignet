@@ -496,6 +496,18 @@ BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS=120000   # never wait longer than this; 
   (`POST /channel/forceclose` with `acceptStaleStateRisk: true`) accepts
   that publishing a commitment the peer may already have revoked forfeits
   the whole channel balance. Both are refused without the flag.
+
+  The same hold has a second origin (issue #907): a peer whose
+  `channel_reestablish` claims this node is behind (a `next_revocation_number`
+  above anything this node released) without showing the per-commitment
+  secret that would prove it, all zeroes included. The channel fails with a
+  wire error, is ERRORED, and carries `reestablishRecencyUnproven` on
+  `GET /recovery/status` with `status: "reestablish_recency_unproven"`: no
+  automatic close, no new HTLCs, the peer asked to close on every reconnect.
+  A hostile peer can put a healthy channel here at no cost, so the exit is
+  the same labelled acknowledgement,
+  `beignet channel forceclose <id> --accept-stale-state-risk`, refused
+  without it with wording for this case.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.

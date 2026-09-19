@@ -412,6 +412,7 @@ import {
 	ISpliceInFlight,
 	IV2InFlight,
 	mustNotBroadcastCommitment,
+	isRecencyUnproven,
 	ChannelCloseReason
 } from '../channel/channel-state';
 import {
@@ -5948,6 +5949,19 @@ export class LightningNode extends EventEmitter {
 			 * acknowledged close (cooperative or force) are the exits.
 			 */
 			restoreRecencyUnproven?: boolean;
+			/**
+			 * The peer's channel_reestablish claimed this channel's state is
+			 * behind and showed no proof (issue #907): its counters named a
+			 * revocation this node never released while its secret was not
+			 * the one at that index. The channel is ERRORED under the same
+			 * hold as restoreRecencyUnproven, from a different origin: the
+			 * automatic close paths are held, it takes no new HTLCs and it
+			 * asks the peer to close on every reconnect. A hostile peer can
+			 * put a healthy channel here at no cost, so the exits are the
+			 * peer's close or the operator's acknowledged force close
+			 * (acceptStaleStateRisk), never an automatic broadcast.
+			 */
+			reestablishRecencyUnproven?: boolean;
 		}>;
 		/**
 		 * Peers whose channel_reestablish is parked because it names a channel
@@ -5972,6 +5986,7 @@ export class LightningNode extends EventEmitter {
 			awaitingDurability: boolean;
 			fundingUnidentified?: boolean;
 			restoreRecencyUnproven?: boolean;
+			reestablishRecencyUnproven?: boolean;
 		}> = [];
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
@@ -5989,6 +6004,9 @@ export class LightningNode extends EventEmitter {
 				...(fundingUnidentified ? { fundingUnidentified: true } : {}),
 				...(state.restoreRecencyUnproven
 					? { restoreRecencyUnproven: true }
+					: {}),
+				...(state.reestablishRecencyUnproven
+					? { reestablishRecencyUnproven: true }
 					: {})
 			});
 		}
@@ -11435,6 +11453,23 @@ export class LightningNode extends EventEmitter {
 			};
 		}
 		const channel = this.channelManager.getChannel(channelId);
+		// The recency hold (issues #469 and #907), enforced centrally for the
+		// same reason the recovery gate is: every automatic arm consults
+		// skipAutoCloseRestoreUnproven before announcing a close, and a path
+		// that forgets still cannot broadcast. The operator's own force close
+		// (reason 'user') stays admitted: it is the hold's labelled exit.
+		if (
+			reason !== 'user' &&
+			channel !== undefined &&
+			this.skipAutoCloseRestoreUnproven(channel.getFullState(), reason)
+		) {
+			return {
+				ok: false,
+				actions: [],
+				error:
+					'automatic force close refused: channel state cannot be proven current (recency hold)'
+			};
+		}
 		const prevReason = channel?.getFullState().closeReason;
 		const stamped = channel?.recordCloseReason(reason) ?? false;
 		const result = this.channelManager.forceClose(
@@ -12839,9 +12874,13 @@ export class LightningNode extends EventEmitter {
 				// splice instead of zeroing the liquidity for the splice window.
 				htlcUsable: ch.htlcUsable,
 				// Keeps the advisor from recommending a force close of a channel
-				// whose local broadcast the restore hold forbids (issue #469).
+				// whose local broadcast the recency hold forbids (issues #469,
+				// #907).
 				...(ch.restoreRecencyUnproven === true
 					? { restoreRecencyUnproven: true }
+					: {}),
+				...(ch.reestablishRecencyUnproven === true
+					? { reestablishRecencyUnproven: true }
 					: {})
 			};
 		});
@@ -12869,6 +12908,9 @@ export class LightningNode extends EventEmitter {
 			htlcUsable: ch.htlcUsable,
 			...(ch.restoreRecencyUnproven === true
 				? { restoreRecencyUnproven: true }
+				: {}),
+			...(ch.reestablishRecencyUnproven === true
+				? { reestablishRecencyUnproven: true }
 				: {})
 		}));
 		const plans = planRebalances(snapshots, {
@@ -13383,6 +13425,9 @@ export class LightningNode extends EventEmitter {
 		// from "funding unaccounted for" (issue #593).
 		if (state.restoreRecencyUnproven === true) {
 			info.restoreRecencyUnproven = true;
+		}
+		if (state.reestablishRecencyUnproven === true) {
+			info.reestablishRecencyUnproven = true;
 		}
 		if (state.fundingUnaccounted === true) {
 			info.fundingUnaccounted = true;
@@ -16354,7 +16399,7 @@ export class LightningNode extends EventEmitter {
 		const finalHop = isFinalHop(processed.nextPacket);
 		let policyCode: number | null = null;
 		if (
-			channel.getFullState().restoreRecencyUnproven === true &&
+			isRecencyUnproven(channel.getFullState()) &&
 			htlcEntry.addedWhileRestoreUnproven === true
 		) {
 			// A capsule-restored channel whose recency cannot be proven takes
@@ -24839,15 +24884,24 @@ export class LightningNode extends EventEmitter {
 	 * While it holds, the channel asks the peer to close instead
 	 * (Channel.buildRecoveryCloseActions, regenerated on every reconnect), and
 	 * forceCloseChannel stays ungated, which is 5.6's labelled escape hatch.
+	 *
+	 * The same hold has a second origin (issue #907, reestablishRecencyUnproven):
+	 * the peer's channel_reestablish claimed we are behind, naming a
+	 * revocation this row never released, and showed no proof. A peer that
+	 * holds our newer state but withholds the secret is indistinguishable
+	 * from one inventing the gap, so the row is held exactly as a restore
+	 * is, and the same labelled operator exit stays open. One predicate,
+	 * isRecencyUnproven, answers for both so they can never drift apart.
 	 */
 	private skipAutoCloseRestoreUnproven(
 		state: IChannelState,
 		context: string
 	): boolean {
-		if (state.restoreRecencyUnproven !== true) return false;
+		if (!isRecencyUnproven(state)) return false;
 		this.emitStructuredLog('channel', 'close_skipped_restore_unproven', {
 			channelId: (state.channelId ?? state.temporaryChannelId).toString('hex'),
-			context
+			context,
+			hold: state.restoreRecencyUnproven === true ? 'restore' : 'reestablish'
 		});
 		return true;
 	}

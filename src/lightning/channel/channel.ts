@@ -106,6 +106,7 @@ import {
 	createOpenerState,
 	createAcceptorState,
 	mustNotBroadcastCommitment,
+	isRecencyUnproven,
 	RecoveryCloseReason,
 	ChannelCloseReason
 } from './channel-state';
@@ -3037,22 +3038,29 @@ export class Channel {
 			];
 		}
 
-		// A capsule-restored channel whose recency cannot be proven takes no NEW
-		// HTLCs (issue #469). Its HTLC deadline backstops can never fire, since
-		// every automatic close is refused for as long as the hold stands, and
-		// an HTLC whose only on-chain enforcement this node has disarmed is a
-		// bounded risk turning into an unbounded one: the peer can simply stall
-		// and we have nothing to escalate to. Existing HTLCs still settle and
-		// fail off chain, and the channel can still be closed with the
-		// operator's acknowledged cooperative close or by the peer.
-		if (this._state.restoreRecencyUnproven === true) {
+		// A channel whose recency cannot be proven takes no NEW HTLCs, whether
+		// it was restored from a capsule (issue #469) or its peer claimed at
+		// reestablish that it is behind without proof (issue #907). Its HTLC
+		// deadline backstops can never fire, since every automatic close is
+		// refused for as long as the hold stands, and an HTLC whose only
+		// on-chain enforcement this node has disarmed is a bounded risk turning
+		// into an unbounded one: the peer can simply stall and we have nothing
+		// to escalate to. Existing HTLCs still settle and fail off chain, and
+		// the channel can still be closed with the operator's acknowledged
+		// close or by the peer.
+		if (isRecencyUnproven(this._state)) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
 					message:
-						'Cannot add HTLC: channel was restored from a Recovery Capsule ' +
-						'and its state cannot be proven current, so its on-chain HTLC ' +
-						'backstops are disabled'
+						this._state.restoreRecencyUnproven === true
+							? 'Cannot add HTLC: channel was restored from a Recovery Capsule ' +
+							  'and its state cannot be proven current, so its on-chain HTLC ' +
+							  'backstops are disabled'
+							: 'Cannot add HTLC: the peer claimed at channel_reestablish that ' +
+							  'this channel state is behind and showed no proof, so its ' +
+							  'state cannot be proven current and its on-chain HTLC ' +
+							  'backstops are disabled'
 				}
 			];
 		}
@@ -3443,10 +3451,10 @@ export class Channel {
 			state: HtlcState.PENDING,
 			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {}),
 			...(dustExposureFailback ? { dustExposureFailback: true } : {}),
-			// Provenance for the capsule-restore hold (issue #469): only an add
-			// admitted while the hold already stood is refused by the node; one
-			// already committed in the capsule predates it and still settles.
-			...(this._state.restoreRecencyUnproven === true
+			// Provenance for the recency hold (issues #469 and #907): only an
+			// add admitted while the hold already stood is refused by the node;
+			// one already committed in the capsule predates it and still settles.
+			...(isRecencyUnproven(this._state)
 				? { addedWhileRestoreUnproven: true }
 				: {}),
 			// Same provenance for the funding-missing quarantine (issue #593).
@@ -5639,6 +5647,15 @@ export class Channel {
 			) {
 				return ChannelRecoveryStatus.RestoreRecencyUnproven;
 			}
+			// Same hold, other origin (issue #907): the peer claimed we are
+			// behind and showed no proof. No close of ours is under way here
+			// either; the peer or the operator resolves it.
+			if (
+				s.state === ChannelState.ERRORED &&
+				s.reestablishRecencyUnproven === true
+			) {
+				return ChannelRecoveryStatus.ReestablishRecencyUnproven;
+			}
 			// ERRORED without a stale flag is recovered by broadcasting our
 			// latest commitment (the BOLT 1 prescription for a received
 			// error), so it is on the force-close path.
@@ -5685,6 +5702,10 @@ export class Channel {
 		// without a peer-close request such a channel would wait forever with
 		// nothing driving it anywhere.
 		if (this._state.restoreRecencyUnproven) return 'restore-unproven';
+		// The reestablish hold (issue #907), derived for the same reason: the
+		// row is ERRORED from the moment the flag is set, so the peer-close
+		// request is the only thing that ever moves it.
+		if (this._state.reestablishRecencyUnproven) return 'reestablish-unproven';
 		return undefined;
 	}
 
@@ -5762,7 +5783,7 @@ export class Channel {
 	 */
 	isMutualCloseHeld(): boolean {
 		return (
-			this._state.restoreRecencyUnproven === true &&
+			isRecencyUnproven(this._state) &&
 			this._state.staleCloseRiskAccepted !== true
 		);
 	}
@@ -5813,6 +5834,8 @@ export class Channel {
 				? 'peer proved our channel state is stale (data loss); awaiting your force close'
 				: reason === 'restore-unproven'
 				? 'restored channel state has not been confirmed by channel_reestablish (recovery); awaiting your force close'
+				: reason === 'reestablish-unproven'
+				? 'your channel_reestablish claimed our state is behind without the per-commitment secret proving it; awaiting your force close'
 				: 'restored channel state cannot be proven current (recovery); awaiting your force close';
 		return [
 			// The persist leads, exactly as it does at the two sites that first
@@ -6788,7 +6811,7 @@ export class Channel {
 		const actions = this._initiateShutdown(scriptPubkey);
 		if (
 			acknowledged &&
-			this._state.restoreRecencyUnproven === true &&
+			isRecencyUnproven(this._state) &&
 			!actions.some((a) => a.type === ChannelActionType.ERROR)
 		) {
 			// The acknowledgement covers the whole negotiation, not just this
@@ -9809,8 +9832,8 @@ export class Channel {
 				// BOLT 2: MUST fail the channel — the peer is lying about (or has
 				// corrupted) our revocation chain. Wire error like the DLP path.
 				//
-				// Whether the failure may broadcast OUR commitment depends on
-				// the index the peer named. Released indices run
+				// Whether the failure may broadcast OUR commitment on its own
+				// depends on the index the peer named. Released indices run
 				// 0..localCommitmentNumber-1, so above localCommitmentNumber the
 				// peer counts a revoke_and_ack this row never sent, without the
 				// secret that would prove it (the fell-behind arm below). A
@@ -9820,16 +9843,21 @@ export class Channel {
 				// The ordinary refusal alone leaves the node to fail the channel
 				// on chain (handleChannelErrored), which would hand such a peer
 				// the very broadcast the fell-behind arm denies it. So the row
-				// is marked StateUncertain first: mustNotBroadcastCommitment
-				// then refuses every broadcast of this commitment, the errored
-				// close, the timeout backstops and the operator's alike, and the
-				// 5.6 disposition asks the peer to close with ITS commitment on
-				// every reconnect, from which we sweep our to_remote. At or
-				// below localCommitmentNumber the index is one we released, so a
+				// takes the recency HOLD first, the same one a capsule restore
+				// carries (isRecencyUnproven): no automatic close of ours, the
+				// errored close and every timeout and HTLC deadline backstop
+				// included, no new HTLCs, and the derived reestablish-unproven
+				// disposition asks the peer to close with ITS commitment on
+				// every reconnect, from which we sweep our to_remote. Not
+				// StateUncertain: the claim is unverified, not proven, and a
+				// hostile peer can make it for free against a healthy channel,
+				// so the operator's labelled force close (acceptStaleStateRisk
+				// on the daemon) stays open as the exit. At or below
+				// localCommitmentNumber the index is one we released, so a
 				// wrong value there is a plain violation with no claim on our
 				// state, and the channel fails the ordinary way.
 				if (msg.nextRevocationNumber > this._state.localCommitmentNumber) {
-					this._state.stateUncertain = true;
+					this._state.reestablishRecencyUnproven = true;
 				}
 				return this._failChannelWithWireError(
 					'Invalid per-commitment secret in channel_reestablish'
@@ -13156,7 +13184,7 @@ export class Channel {
 		reservationHint = false
 	): boolean {
 		if (!reservationHint && this._fforUpdateRefusal('add')) return false;
-		if (this._state.restoreRecencyUnproven === true) return false;
+		if (isRecencyUnproven(this._state)) return false;
 		if (this._state.fundingUnaccounted === true) return false;
 		return this.isHtlcUsable(lookThroughReestablish);
 	}

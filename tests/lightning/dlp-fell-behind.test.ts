@@ -17,7 +17,8 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	createOpenerState,
 	createAcceptorState,
-	mustNotBroadcastCommitment
+	mustNotBroadcastCommitment,
+	isRecencyUnproven
 } from '../../src/lightning/channel/channel-state';
 import { ChannelRecoveryStatus } from '../../src/lightning/recovery/channel-status';
 import {
@@ -287,32 +288,55 @@ function expectWrongSecretRefusal(
 }
 
 /**
- * The never-broadcast terminal an unverifiable gap claim lands in: the row
- * is StateUncertain with its 5.6 disposition stamped, the predicate every
- * automatic close consults refuses, forceClose refuses on the same predicate
- * (the operator's route runs through it too), and the disposition
- * regenerates the peer-close request for every reconnect.
+ * The HOLD an unverifiable gap claim lands in (issue #907): the row carries
+ * reestablishRecencyUnproven and NOT stateUncertain, so the never-broadcast
+ * predicate stays false and the operator's labelled force close remains the
+ * exit; the hold predicate every automatic close and new-HTLC admission
+ * consults is true; the derived reestablish-unproven disposition regenerates
+ * the peer-close request for every reconnect; the status names the hold; the
+ * flag survives a serialization round trip; and the channel-level forceClose,
+ * which is the operator's route (the daemon gates it behind
+ * acceptStaleStateRisk), still builds our commitment.
  */
 function expectHeldForPeerClose(channel: Channel, signerPrivkey: Buffer): void {
 	const state = channel.getFullState();
-	expect(state.stateUncertain).to.equal(true);
-	expect(state.recoveryCloseReason).to.equal('state-uncertain');
-	expect(mustNotBroadcastCommitment(state)).to.equal(true);
+	expect(state.reestablishRecencyUnproven).to.equal(true);
+	expect(state.stateUncertain).to.not.equal(true);
+	expect(state.dataLossDetected).to.not.equal(true);
+	expect(state.restoreRecencyUnproven).to.not.equal(true);
+	// Derived from the flag, never stamped, exactly as restore-unproven is.
+	expect(state.recoveryCloseReason).to.not.exist;
+	expect(channel.getRecoveryCloseReason()).to.equal('reestablish-unproven');
+	expect(channel.hasRecoveryCloseDisposition()).to.equal(true);
+	expect(mustNotBroadcastCommitment(state)).to.equal(false);
+	expect(isRecencyUnproven(state)).to.equal(true);
+	expect(channel.acceptsNewHtlcs()).to.equal(false);
+	expect(channel.isMutualCloseHeld()).to.equal(true);
 	expect(channel.getRecoveryStatus()).to.equal(
-		ChannelRecoveryStatus.StateUncertain
+		ChannelRecoveryStatus.ReestablishRecencyUnproven
 	);
-	const closeActions = channel.forceClose(new ChannelSigner(signerPrivkey));
-	expect(closeActions.find((a) => a.type === ChannelActionType.BROADCAST_TX)).to
-		.not.exist;
-	expect(closeActions).to.have.length(1);
-	expect(closeActions[0].type).to.equal(ChannelActionType.ERROR);
-	expect((closeActions[0] as { message: string }).message).to.contain(
-		'not proven current'
-	);
-	expect(channel.getState()).to.equal(ChannelState.ERRORED);
 	const regenerated = channel.buildRecoveryCloseActions();
 	expect(regenerated[0].type).to.equal(ChannelActionType.PERSIST_STATE);
-	expect(findSendAction(regenerated, MessageType.ERROR)).to.exist;
+	const request = findSendAction(regenerated, MessageType.ERROR);
+	expect(request, 'the peer-close request regenerates').to.exist;
+	expect(decodeErrorMessage(request.payload).data.toString('ascii')).to.contain(
+		'without the per-commitment secret proving it'
+	);
+	// A restart must not forget the hold.
+	const restored = deserializeChannelState(serializeChannelState(state));
+	expect(restored.reestablishRecencyUnproven).to.equal(true);
+	expect(restored.stateUncertain).to.not.equal(true);
+	expect(restored.state).to.equal(ChannelState.ERRORED);
+	expect(isRecencyUnproven(restored)).to.equal(true);
+	// The operator's exit: the hold never refuses a force close at this
+	// level, so the commitment is built; the daemon is what asks for the
+	// acknowledgement first.
+	const closeActions = channel.forceClose(new ChannelSigner(signerPrivkey));
+	expect(
+		closeActions.find((a) => a.type === ChannelActionType.BROADCAST_TX),
+		'the labelled operator exit still builds our commitment'
+	).to.exist;
+	expect(channel.getState()).to.equal(ChannelState.FORCE_CLOSED);
 }
 
 describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
@@ -381,9 +405,10 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 			// next_revocation_number 0, so above it they are a wrong secret.
 			// And a wrong secret at an index this row never released is a claim
 			// it can check in neither direction, so the refusal must not put
-			// OUR commitment on chain either: the node fails every
-			// ERRORED-plus-wire-error pair on chain unless the never-broadcast
-			// predicate says otherwise, which is what StateUncertain does here.
+			// OUR commitment on chain by itself either: the node fails every
+			// ERRORED-plus-wire-error pair on chain unless a hold says
+			// otherwise, and the hold here is the capsule restore's, not
+			// StateUncertain, so the operator's labelled exit stays open.
 			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
 			exchangeCommitments(opener, acceptor);
 
@@ -462,8 +487,14 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 			expectWrongSecretRefusal(opener, actions);
 			const state = opener.getFullState();
 			expect(state.stateUncertain).to.not.equal(true);
+			expect(state.reestablishRecencyUnproven).to.not.equal(true);
+			expect(isRecencyUnproven(state)).to.equal(false);
 			expect(state.recoveryCloseReason).to.not.exist;
+			expect(opener.getRecoveryCloseReason()).to.not.exist;
 			expect(mustNotBroadcastCommitment(state)).to.equal(false);
+			expect(opener.getRecoveryStatus()).to.equal(
+				ChannelRecoveryStatus.ForceClosing
+			);
 		});
 	});
 
