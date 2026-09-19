@@ -401,16 +401,33 @@ describe('Restore revoked risk (issue #905)', function () {
 		});
 	});
 
-	it('sets the flag on the counter alone: an all-zero secret does not spare the row', function () {
+	it('an all-zero secret at + 1 does not set the flag: the proof is the secret, not the counter', function () {
 		const { opener, seed, L0, R0 } = heldOpener();
 
 		const actions = opener.handleReestablish(
 			peerReestablish(opener, seed, L0 + 1n, R0, Buffer.alloc(32))
 		);
 
-		expect(opener.getState()).to.equal(ChannelState.NORMAL);
-		expect(hasAction(actions, ChannelActionType.PERSIST_STATE)).to.equal(true);
-		expect(opener.getFullState().restoreRevokedRisk).to.equal(true);
+		// Any peer can send this shape: the counter is read off our own
+		// channel_reestablish, and only the secret at index L0 proves the
+		// revocation. While zeroes pass validation the row resumes with the
+		// hatch open, as before this fix; once an all-zero secret above
+		// revocation 0 fails the channel (issue #907) the same message ends
+		// ERRORED on the invalid secret. Neither world may set the flag, or a
+		// peer without the secret could remove the held row's only exit.
+		const state = opener.getFullState();
+		expect(state.restoreRevokedRisk).to.equal(undefined);
+		expect(
+			state.state === ChannelState.NORMAL ||
+				state.state === ChannelState.ERRORED,
+			'resumed (zeroes exempt) or failed on the invalid secret (#907)'
+		).to.equal(true);
+		if (state.state === ChannelState.NORMAL) {
+			expect(hasAction(actions, ChannelActionType.ERROR)).to.equal(false);
+			expect(mustNotBroadcastCommitment(state)).to.equal(false);
+		}
+		const plan = opener.prepareForceClose(opener.getSigner()!);
+		expect((plan as { error?: string }).error).to.not.equal(REVOKED_REFUSAL);
 	});
 
 	it('a row without the hold handed the + 1 value does not set it', function () {

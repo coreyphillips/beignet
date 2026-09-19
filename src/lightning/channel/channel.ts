@@ -9912,18 +9912,26 @@ export class Channel {
 		// localCommitmentNumber. On a capsule-restored row the value can only
 		// come from a round the capsule missed, so the hold's "the peer MAY
 		// hold a newer state" has become "the peer holds the revocation":
-		// not a risk the operator can accept, a certain loss. Set on the
-		// counter alone; the validated secret above is corroboration, not a
-		// requirement, since refusal is the safe direction. The row still
-		// resumes, because the peer's retransmission of its commitment_signed
-		// is what brings it level. Placed ahead of the gap arms so a row that
-		// also errors on a commitment gap carries it. Its own persist: the
+		// not a risk the operator can accept, a certain loss. The proof is
+		// the secret, not the counter: the validator above pinned a non-zero
+		// your_last_per_commitment_secret to index localCommitmentNumber,
+		// which only a peer we revoked that commitment to can hold (the
+		// released secrets 0..localCommitmentNumber-1 never derive it). The
+		// counter alone is read off our own channel_reestablish, and while an
+		// all-zero secret passes validation (issue #907) any peer could pair
+		// it with zeroes; a forged flag would remove the held row's only
+		// exit, so zeroes leave the flag off and the row resumes as before.
+		// With the secret required, a commitment gap beside this value is
+		// the DLP arm's above, so the gap arms below never see a flagged
+		// row. The row still resumes, because the peer's retransmission of
+		// its commitment_signed is what brings it level. Its own persist: the
 		// trailing persist fires only beside a SEND_MESSAGE, and this shape
 		// retransmits nothing, so without it a crash after reestablish would
 		// forget the flag and reopen the operator's force close.
 		if (
 			this._state.restoreRecencyUnproven === true &&
 			msg.nextRevocationNumber === this._state.localCommitmentNumber + 1n &&
+			!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32)) &&
 			this._state.restoreRevokedRisk !== true
 		) {
 			this._state.restoreRevokedRisk = true;
