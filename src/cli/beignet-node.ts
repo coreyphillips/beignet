@@ -7374,10 +7374,27 @@ export class BeignetNode extends EventEmitter {
 		}
 		// Compare on the DECODED bytes, which is what the engine resolves.
 		const canonicalId = idBuf.toString('hex');
-		const held = this.node
+		const row = this.node
 			.getRecoveryStatus()
-			.channels.find((c) => c.channelId === canonicalId)
-			?.restoreRecencyUnproven;
+			.channels.find((c) => c.channelId === canonicalId);
+		// Before the acknowledgement, and regardless of it (issue #905): the
+		// hold below describes a risk the operator may accept, but this row's
+		// peer has shown it holds the revocation for the stored commitment, so
+		// the risk is a certainty and there is nothing left to accept. The
+		// engine refuses too; this names the reason under its own code so a
+		// client does not read it as a missing flag.
+		if (row?.restoreRevokedRisk === true) {
+			throw new BeignetError(
+				'FORCE_CLOSE_REVOKED',
+				"This channel's peer has shown, in channel_reestablish, that it " +
+					'already holds the revocation for the stored commitment. Force ' +
+					'closing would publish a revoked commitment and the whole channel ' +
+					'balance would be lost to the justice path. There is no risk to ' +
+					'accept, so acceptStaleStateRisk does not apply: wait for the ' +
+					'peer to force close.'
+			);
+		}
+		const held = row?.restoreRecencyUnproven;
 		if (held === true && acceptStaleStateRisk !== true) {
 			throw new BeignetError(
 				'INVALID_PARAMS',
