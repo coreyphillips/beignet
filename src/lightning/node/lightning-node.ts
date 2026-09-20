@@ -412,6 +412,7 @@ import {
 	ISpliceInFlight,
 	IV2InFlight,
 	mustNotBroadcastCommitment,
+	isRecencyUnproven,
 	ChannelCloseReason
 } from '../channel/channel-state';
 import {
@@ -5948,6 +5949,19 @@ export class LightningNode extends EventEmitter {
 			 * acknowledged close (cooperative or force) are the exits.
 			 */
 			restoreRecencyUnproven?: boolean;
+			/**
+			 * The peer's channel_reestablish claimed this channel's state is
+			 * behind and showed no proof (issue #907): its counters named a
+			 * revocation this node never released while its secret was not
+			 * the one at that index. The channel is ERRORED under the same
+			 * hold as restoreRecencyUnproven, from a different origin: the
+			 * automatic close paths are held, it takes no new HTLCs and it
+			 * asks the peer to close on every reconnect. A hostile peer can
+			 * put a healthy channel here at no cost, so the exits are the
+			 * peer's close or the operator's acknowledged force close
+			 * (acceptStaleStateRisk), never an automatic broadcast.
+			 */
+			reestablishRecencyUnproven?: boolean;
 		}>;
 		/**
 		 * Peers whose channel_reestablish is parked because it names a channel
@@ -5972,6 +5986,7 @@ export class LightningNode extends EventEmitter {
 			awaitingDurability: boolean;
 			fundingUnidentified?: boolean;
 			restoreRecencyUnproven?: boolean;
+			reestablishRecencyUnproven?: boolean;
 		}> = [];
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
@@ -5989,6 +6004,9 @@ export class LightningNode extends EventEmitter {
 				...(fundingUnidentified ? { fundingUnidentified: true } : {}),
 				...(state.restoreRecencyUnproven
 					? { restoreRecencyUnproven: true }
+					: {}),
+				...(state.reestablishRecencyUnproven
+					? { reestablishRecencyUnproven: true }
 					: {})
 			});
 		}
@@ -11435,6 +11453,23 @@ export class LightningNode extends EventEmitter {
 			};
 		}
 		const channel = this.channelManager.getChannel(channelId);
+		// The recency hold (issues #469 and #907), enforced centrally for the
+		// same reason the recovery gate is: every automatic arm consults
+		// skipAutoCloseRestoreUnproven before announcing a close, and a path
+		// that forgets still cannot broadcast. The operator's own force close
+		// (reason 'user') stays admitted: it is the hold's labelled exit.
+		if (
+			reason !== 'user' &&
+			channel !== undefined &&
+			this.skipAutoCloseRestoreUnproven(channel.getFullState(), reason)
+		) {
+			return {
+				ok: false,
+				actions: [],
+				error:
+					'automatic force close refused: channel state cannot be proven current (recency hold)'
+			};
+		}
 		const prevReason = channel?.getFullState().closeReason;
 		const stamped = channel?.recordCloseReason(reason) ?? false;
 		const result = this.channelManager.forceClose(
@@ -12839,9 +12874,13 @@ export class LightningNode extends EventEmitter {
 				// splice instead of zeroing the liquidity for the splice window.
 				htlcUsable: ch.htlcUsable,
 				// Keeps the advisor from recommending a force close of a channel
-				// whose local broadcast the restore hold forbids (issue #469).
+				// whose local broadcast the recency hold forbids (issues #469,
+				// #907).
 				...(ch.restoreRecencyUnproven === true
 					? { restoreRecencyUnproven: true }
+					: {}),
+				...(ch.reestablishRecencyUnproven === true
+					? { reestablishRecencyUnproven: true }
 					: {})
 			};
 		});
@@ -12869,6 +12908,9 @@ export class LightningNode extends EventEmitter {
 			htlcUsable: ch.htlcUsable,
 			...(ch.restoreRecencyUnproven === true
 				? { restoreRecencyUnproven: true }
+				: {}),
+			...(ch.reestablishRecencyUnproven === true
+				? { reestablishRecencyUnproven: true }
 				: {})
 		}));
 		const plans = planRebalances(snapshots, {
@@ -13383,6 +13425,9 @@ export class LightningNode extends EventEmitter {
 		// from "funding unaccounted for" (issue #593).
 		if (state.restoreRecencyUnproven === true) {
 			info.restoreRecencyUnproven = true;
+		}
+		if (state.reestablishRecencyUnproven === true) {
+			info.reestablishRecencyUnproven = true;
 		}
 		if (state.fundingUnaccounted === true) {
 			info.fundingUnaccounted = true;
@@ -16354,7 +16399,7 @@ export class LightningNode extends EventEmitter {
 		const finalHop = isFinalHop(processed.nextPacket);
 		let policyCode: number | null = null;
 		if (
-			channel.getFullState().restoreRecencyUnproven === true &&
+			isRecencyUnproven(channel.getFullState()) &&
 			htlcEntry.addedWhileRestoreUnproven === true
 		) {
 			// A capsule-restored channel whose recency cannot be proven takes
@@ -24839,17 +24884,108 @@ export class LightningNode extends EventEmitter {
 	 * While it holds, the channel asks the peer to close instead
 	 * (Channel.buildRecoveryCloseActions, regenerated on every reconnect), and
 	 * forceCloseChannel stays ungated, which is 5.6's labelled escape hatch.
+	 *
+	 * The same hold has a second origin (issue #907, reestablishRecencyUnproven):
+	 * the peer's channel_reestablish claimed we are behind, naming a
+	 * revocation this row never released, and showed no proof. A peer that
+	 * holds our newer state but withholds the secret is indistinguishable
+	 * from one inventing the gap, so the row is held exactly as a restore
+	 * is, and the same labelled operator exit stays open. One predicate,
+	 * isRecencyUnproven, answers for both so they can never drift apart.
 	 */
 	private skipAutoCloseRestoreUnproven(
 		state: IChannelState,
 		context: string
 	): boolean {
-		if (state.restoreRecencyUnproven !== true) return false;
+		if (!isRecencyUnproven(state)) return false;
 		this.emitStructuredLog('channel', 'close_skipped_restore_unproven', {
 			channelId: (state.channelId ?? state.temporaryChannelId).toString('hex'),
-			context
+			context,
+			hold: state.restoreRecencyUnproven === true ? 'restore' : 'reestablish'
 		});
 		return true;
+	}
+
+	/**
+	 * Blocks between two HTLC_DEADLINE_HELD notices for the same HTLC and the
+	 * same backstop. The per-block scans would otherwise re-announce every
+	 * held HTLC on every block; roughly hourly is often enough for an operator
+	 * watching a CLTV deadline and quiet enough not to drown the event stream.
+	 */
+	private static readonly HELD_HTLC_DEADLINE_NOTICE_INTERVAL_BLOCKS = 6;
+
+	/**
+	 * Block height of the last HTLC_DEADLINE_HELD notice, keyed by
+	 * channel:htlcKey:backstop. Entries for HTLCs the scans no longer reach
+	 * are pruned on the next emit, so the map tracks live held HTLCs only.
+	 */
+	private readonly heldHtlcDeadlineNotices = new Map<string, number>();
+
+	/**
+	 * Announce an HTLC deadline the recency hold has disarmed (issue #907).
+	 *
+	 * The three HTLC deadline backstops skip a held row before they emit
+	 * their own node:error, so under issue #469 the only trace was the
+	 * close_skipped_restore_unproven structured log: acceptable while the
+	 * hold could only be entered by this node's own capsule restore, since
+	 * the operator who restored knows the row is held and the restore also
+	 * refuses new HTLCs. Under issue #907 a PEER can put a healthy channel
+	 * into the same hold at no cost, with HTLCs already on the row, and the
+	 * only exit is a human running the acknowledged force close BEFORE a
+	 * CLTV deadline passes. Silence there loses the HTLC's value with no
+	 * event ever raised, so the skip speaks on the same channel the
+	 * backstops use, with the height, the deadline and the labelled exit.
+	 *
+	 * Throttled per (channel, HTLC, backstop) rather than left to fire on
+	 * every block, since the scans run once per block for as long as the hold
+	 * stands.
+	 */
+	private emitHeldHtlcDeadline(
+		state: IChannelState,
+		channelId: Buffer,
+		htlcKey: string,
+		htlc: IHtlcEntry,
+		context: string,
+		blockHeight: number
+	): void {
+		const channelIdHex = channelId.toString('hex');
+		const noticeKey = `${channelIdHex}:${htlcKey}:${context}`;
+		const last = this.heldHtlcDeadlineNotices.get(noticeKey);
+		const interval = LightningNode.HELD_HTLC_DEADLINE_NOTICE_INTERVAL_BLOCKS;
+		// Absolute distance, so a reorg that lowers the height does not park
+		// the notice until the chain climbs back past it.
+		if (last !== undefined && Math.abs(blockHeight - last) < interval) return;
+		this.heldHtlcDeadlineNotices.set(noticeKey, blockHeight);
+		// A key the scans still reach is refreshed every `interval` blocks, so
+		// anything staler belongs to an HTLC that resolved or a channel that
+		// closed and can go.
+		for (const [key, height] of this.heldHtlcDeadlineNotices) {
+			if (Math.abs(blockHeight - height) > interval * 4) {
+				this.heldHtlcDeadlineNotices.delete(key);
+			}
+		}
+		const restore = state.restoreRecencyUnproven === true;
+		const origin = restore
+			? 'this channel was restored from a Recovery Capsule and no channel_reestablish has proven its state current'
+			: 'the peer claimed at channel_reestablish that this channel state is behind and showed no proof';
+		this.emit('node:error', {
+			code: 'HTLC_DEADLINE_HELD',
+			channelId,
+			message:
+				`channel ${channelIdHex} HTLC ${htlc.id} (payment hash ` +
+				`${htlc.paymentHash.toString('hex')}) expires at height ` +
+				`${htlc.cltvExpiry} and the chain is at ${blockHeight}, but the ` +
+				`${context} backstop is held: ${origin}, so this node will not ` +
+				`broadcast a commitment for it (${
+					restore ? 'restore' : 'reestablish'
+				} ` +
+				`recency hold). The HTLC's value is lost if nothing resolves it ` +
+				`before the deadline. The labelled exit is an acknowledged force ` +
+				`close, POST /channel/forceclose with acceptStaleStateRisk: true ` +
+				`(CLI: channel forceclose --accept-stale-state-risk), which ` +
+				`publishes a commitment the peer may already hold a revocation for`,
+			timestamp: Date.now()
+		} as ILightningError);
 	}
 
 	/**
@@ -25060,14 +25196,28 @@ export class LightningNode extends EventEmitter {
 					// balance. The same arithmetic covers a fenced or
 					// quarantined node (issue #588).
 					if (
-						this.skipAutoCloseRecoveryGated(
-							channelId,
-							'HTLC_CLAIM_FORCE_CLOSE'
-						) ||
-						this.skipAutoCloseRestoreUnproven(
+						this.skipAutoCloseRecoveryGated(channelId, 'HTLC_CLAIM_FORCE_CLOSE')
+					) {
+						continue;
+					}
+					// The recency hold gets its own arm so the skip can say so on
+					// the same event stream the close would have used (issue #907):
+					// a peer can park this row here with HTLCs already on it, and
+					// only an operator can take it out before the deadline.
+					if (
+						this.skipAutoCloseRestoreUnproven(state, 'HTLC_CLAIM_FORCE_CLOSE')
+					) {
+						this.emitHeldHtlcDeadline(
 							state,
-							'HTLC_CLAIM_FORCE_CLOSE'
-						) ||
+							channelId,
+							key,
+							htlc,
+							'HTLC_CLAIM_FORCE_CLOSE',
+							blockHeight
+						);
+						continue;
+					}
+					if (
 						this.skipAutoCloseFundingNotOnChain(
 							channel,
 							state,
@@ -25145,11 +25295,29 @@ export class LightningNode extends EventEmitter {
 							this.skipAutoCloseRecoveryGated(
 								channelId,
 								'FORWARD_TIMEOUT_FORCE_CLOSE'
-							) ||
+							)
+						) {
+							continue;
+						}
+						// The recency hold announces the disarmed deadline (issue
+						// #907), as the claim arm above does.
+						if (
 							this.skipAutoCloseRestoreUnproven(
 								state,
 								'FORWARD_TIMEOUT_FORCE_CLOSE'
-							) ||
+							)
+						) {
+							this.emitHeldHtlcDeadline(
+								state,
+								channelId,
+								key,
+								htlc,
+								'FORWARD_TIMEOUT_FORCE_CLOSE',
+								blockHeight
+							);
+							continue;
+						}
+						if (
 							this.skipAutoCloseFundingNotOnChain(
 								channel,
 								state,
@@ -25308,11 +25476,29 @@ export class LightningNode extends EventEmitter {
 					this.skipAutoCloseRecoveryGated(
 						channelId,
 						'FORWARD_TIMEOUT_FORCE_CLOSE'
-					) ||
+					)
+				) {
+					continue;
+				}
+				// The recency hold announces the disarmed deadline (issue #907),
+				// as the arms in scanExpiringHtlcs do.
+				if (
 					this.skipAutoCloseRestoreUnproven(
 						state,
 						'FORWARD_TIMEOUT_FORCE_CLOSE'
-					) ||
+					)
+				) {
+					this.emitHeldHtlcDeadline(
+						state,
+						channelId,
+						key,
+						htlc,
+						'FORWARD_TIMEOUT_FORCE_CLOSE',
+						blockHeight
+					);
+					continue;
+				}
+				if (
 					this.skipAutoCloseFundingNotOnChain(
 						channel,
 						state,
@@ -26639,11 +26825,28 @@ export class LightningNode extends EventEmitter {
 						this.skipAutoCloseRecoveryGated(
 							channelId,
 							'HTLC_EXPIRY_FORCE_CLOSE'
-						) ||
-						this.skipAutoCloseRestoreUnproven(
+						)
+					) {
+						continue;
+					}
+					// The recency hold announces the disarmed deadline (issue
+					// #907): this value is ours, and past the expiry the
+					// downstream claims it with the preimage while this node
+					// holds nothing.
+					if (
+						this.skipAutoCloseRestoreUnproven(state, 'HTLC_EXPIRY_FORCE_CLOSE')
+					) {
+						this.emitHeldHtlcDeadline(
 							state,
-							'HTLC_EXPIRY_FORCE_CLOSE'
-						) ||
+							channelId,
+							key,
+							htlc,
+							'HTLC_EXPIRY_FORCE_CLOSE',
+							blockHeight
+						);
+						continue;
+					}
+					if (
 						this.skipAutoCloseFundingNotOnChain(
 							channel,
 							state,

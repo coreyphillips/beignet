@@ -16,8 +16,11 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	createOpenerState,
-	createAcceptorState
+	createAcceptorState,
+	mustNotBroadcastCommitment,
+	isRecencyUnproven
 } from '../../src/lightning/channel/channel-state';
+import { ChannelRecoveryStatus } from '../../src/lightning/recovery/channel-status';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG
@@ -255,6 +258,87 @@ function makeForeignPoint(tag: string): Buffer {
 	);
 }
 
+/**
+ * The refusal a wrong yourLastPerCommitmentSecret draws above
+ * next_revocation_number 0 (issue #907): the channel fails with the
+ * validator's wire error, persisted first, and records no proof of data
+ * loss. What the failure may then broadcast is NOT answered here:
+ * handleReestablish returns no BROADCAST_TX on any path, the close is driven
+ * by the node from the ERRORED-plus-wire-error pair, so each cell asserts the
+ * never-broadcast predicate and forceClose itself, and
+ * reestablish-secret-hold.test.ts drives the same messages through a node.
+ */
+function expectWrongSecretRefusal(
+	channel: Channel,
+	actions: ReturnType<Channel['handleReestablish']>
+): void {
+	expect(channel.getState()).to.equal(ChannelState.ERRORED);
+	// Persist FIRST: the ERRORED row must outlive a crash before the send.
+	expect(actions[0].type).to.equal(ChannelActionType.PERSIST_STATE);
+	const errSend = findSendAction(actions, MessageType.ERROR);
+	expect(errSend, 'a wire error goes to the peer').to.exist;
+	const decoded = decodeErrorMessage(errSend.payload);
+	expect(decoded.channelId.equals(channel.getChannelId()!)).to.equal(true);
+	expect(decoded.data.toString('ascii')).to.contain(
+		'Invalid per-commitment secret in channel_reestablish'
+	);
+	const state = channel.getFullState();
+	expect(state.dataLossDetected).to.not.equal(true);
+	expect(state.dlpRemotePerCommitmentPoint).to.not.exist;
+}
+
+/**
+ * The HOLD an unverifiable gap claim lands in (issue #907): the row carries
+ * reestablishRecencyUnproven and NOT stateUncertain, so the never-broadcast
+ * predicate stays false and the operator's labelled force close remains the
+ * exit; the hold predicate every automatic close and new-HTLC admission
+ * consults is true; the derived reestablish-unproven disposition regenerates
+ * the peer-close request for every reconnect; the status names the hold; the
+ * flag survives a serialization round trip; and the channel-level forceClose,
+ * which is the operator's route (the daemon gates it behind
+ * acceptStaleStateRisk), still builds our commitment.
+ */
+function expectHeldForPeerClose(channel: Channel, signerPrivkey: Buffer): void {
+	const state = channel.getFullState();
+	expect(state.reestablishRecencyUnproven).to.equal(true);
+	expect(state.stateUncertain).to.not.equal(true);
+	expect(state.dataLossDetected).to.not.equal(true);
+	expect(state.restoreRecencyUnproven).to.not.equal(true);
+	// Derived from the flag, never stamped, exactly as restore-unproven is.
+	expect(state.recoveryCloseReason).to.not.exist;
+	expect(channel.getRecoveryCloseReason()).to.equal('reestablish-unproven');
+	expect(channel.hasRecoveryCloseDisposition()).to.equal(true);
+	expect(mustNotBroadcastCommitment(state)).to.equal(false);
+	expect(isRecencyUnproven(state)).to.equal(true);
+	expect(channel.acceptsNewHtlcs()).to.equal(false);
+	expect(channel.isMutualCloseHeld()).to.equal(true);
+	expect(channel.getRecoveryStatus()).to.equal(
+		ChannelRecoveryStatus.ReestablishRecencyUnproven
+	);
+	const regenerated = channel.buildRecoveryCloseActions();
+	expect(regenerated[0].type).to.equal(ChannelActionType.PERSIST_STATE);
+	const request = findSendAction(regenerated, MessageType.ERROR);
+	expect(request, 'the peer-close request regenerates').to.exist;
+	expect(decodeErrorMessage(request.payload).data.toString('ascii')).to.contain(
+		'without the per-commitment secret proving it'
+	);
+	// A restart must not forget the hold.
+	const restored = deserializeChannelState(serializeChannelState(state));
+	expect(restored.reestablishRecencyUnproven).to.equal(true);
+	expect(restored.stateUncertain).to.not.equal(true);
+	expect(restored.state).to.equal(ChannelState.ERRORED);
+	expect(isRecencyUnproven(restored)).to.equal(true);
+	// The operator's exit: the hold never refuses a force close at this
+	// level, so the commitment is built; the daemon is what asks for the
+	// acknowledgement first.
+	const closeActions = channel.forceClose(new ChannelSigner(signerPrivkey));
+	expect(
+		closeActions.find((a) => a.type === ChannelActionType.BROADCAST_TX),
+		'the labelled operator exit still builds our commitment'
+	).to.exist;
+	expect(channel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+}
+
 describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 	describe('handleReestablish - fell behind detection', function () {
 		it('detects data loss when the peer proves a future state with a valid secret', function () {
@@ -314,8 +398,18 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 			expect(broadcast).to.not.exist;
 		});
 
-		it('keeps the plain error when the gap has no DLP proof (all-zero secret)', function () {
-			const { opener, acceptor } = setupNormalChannels();
+		it('refuses an all-zero secret on a counter gap and holds the channel for the peer', function () {
+			// The bug (issue #907): with zeroes, the same gap that a real secret
+			// turns into the fell-behind proof used to reach the plain gap arm,
+			// which sets no broadcast ban. BOLT 2 allows zeroes only at
+			// next_revocation_number 0, so above it they are a wrong secret.
+			// And a wrong secret at an index this row never released is a claim
+			// it can check in neither direction, so the refusal must not put
+			// OUR commitment on chain by itself either: the node fails every
+			// ERRORED-plus-wire-error pair on chain unless a hold says
+			// otherwise, and the hold here is the capsule restore's, not
+			// StateUncertain, so the operator's labelled exit stays open.
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
 			exchangeCommitments(opener, acceptor);
 
 			const pre = opener.getFullState();
@@ -329,17 +423,145 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 			};
 			const actions = opener.handleReestablish(msg);
 
-			const state = opener.getFullState();
-			expect(state.dataLossDetected).to.not.equal(true);
-			expect(state.dlpRemotePerCommitmentPoint).to.not.exist;
-			expect(opener.getState()).to.not.equal(ChannelState.ERRORED);
+			expectWrongSecretRefusal(opener, actions);
+			expect(
+				actions.find(
+					(a) =>
+						a.type === ChannelActionType.ERROR &&
+						(a as { message: string }).message.includes('Remote expects future')
+				),
+				'the plain gap arms never see it'
+			).to.not.exist;
+			expectHeldForPeerClose(opener, openerPrivkeys[0]);
+		});
 
-			expect(actions).to.have.length(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			expect((actions[0] as { message: string }).message).to.contain(
-				'Remote expects future commitment'
+		it('holds on any wrong secret at the smallest unreleased index', function () {
+			// The class is "a secret we cannot check at an index we never
+			// released", not zeroes in particular: next_revocation_number at
+			// localCommitmentNumber + 1 names index localCommitmentNumber, the
+			// first one this row has not revoked, and a random value there is
+			// as unverifiable as zeroes. The fell-behind arm would not have
+			// claimed this shape even with the real secret (the sig-in-flight
+			// case), so without the hold the refusal alone reached the chain.
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const pre = opener.getFullState();
+			opener.markForReestablish();
+			const msg: IChannelReestablishMessage = {
+				channelId: opener.getChannelId()!,
+				nextCommitmentNumber: pre.remoteCommitmentNumber + 1n,
+				nextRevocationNumber: pre.localCommitmentNumber + 1n,
+				yourLastPerCommitmentSecret: crypto.randomBytes(32),
+				myCurrentPerCommitmentPoint: makeForeignPoint('garbage-plus-one')
+			};
+			const actions = opener.handleReestablish(msg);
+
+			expectWrongSecretRefusal(opener, actions);
+			expectHeldForPeerClose(opener, openerPrivkeys[0]);
+		});
+
+		it('refuses new HTLCs and a cooperative close with wording for this origin', function () {
+			// The hold's refusals are shared with the capsule restore through
+			// isRecencyUnproven, but whoever reads them has to be told what
+			// happened, and nothing here was restored. The add refusal is
+			// answered ahead of the lifecycle check, because a reestablish-held
+			// row is ERRORED and the bare state name would hide the hold and
+			// its exit. The cooperative-close refusals (the operator's own
+			// initiation, and the shared helper that the peer's shutdown, every
+			// closing stage and the manager's post-reestablish resume reach)
+			// name the reestablish claim, not the capsule.
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const pre = opener.getFullState();
+			opener.markForReestablish();
+			const actions = opener.handleReestablish({
+				channelId: opener.getChannelId()!,
+				nextCommitmentNumber: pre.remoteCommitmentNumber + 50n,
+				nextRevocationNumber: pre.localCommitmentNumber + 3n,
+				yourLastPerCommitmentSecret: Buffer.alloc(32),
+				myCurrentPerCommitmentPoint: makeForeignPoint('wording')
+			});
+			expectWrongSecretRefusal(opener, actions);
+			const htlcsBefore = opener.getFullState().htlcs.size;
+
+			const add = opener.addHtlc(
+				1_000_000n,
+				crypto.randomBytes(32),
+				500,
+				Buffer.alloc(1366)
 			);
-			expect(findSendAction(actions, MessageType.ERROR)).to.not.exist;
+			expect(add).to.have.length(1);
+			expect(add[0].type).to.equal(ChannelActionType.ERROR);
+			const addMessage = (add[0] as { message: string }).message;
+			expect(addMessage).to.contain('Cannot add HTLC');
+			expect(addMessage).to.contain('claimed at channel_reestablish');
+			expect(addMessage).to.contain('showed no proof');
+			expect(addMessage).to.not.contain('Recovery Capsule');
+			expect(addMessage).to.not.contain('ERRORED state');
+			expect(opener.getFullState().htlcs.size).to.equal(htlcsBefore);
+
+			const shutdownScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const shutdown = opener.initiateShutdown(shutdownScript);
+			expect(shutdown).to.have.length(1);
+			expect(shutdown[0].type).to.equal(ChannelActionType.ERROR);
+			const shutdownMessage = (shutdown[0] as { message: string }).message;
+			expect(shutdownMessage).to.contain('Cannot close cooperatively');
+			expect(shutdownMessage).to.contain('claimed at channel_reestablish');
+			expect(shutdownMessage).to.not.contain('Recovery Capsule');
+			expect(shutdownMessage).to.not.contain('capsule');
+
+			const resume = opener.refuseHeldMutualClose();
+			const resumeError = resume.find(
+				(a) => a.type === ChannelActionType.ERROR
+			);
+			expect(resumeError, 'the shared held-close refusal').to.exist;
+			const resumeMessage = (resumeError as { message: string }).message;
+			expect(resumeMessage).to.contain('Cannot resume cooperative close');
+			expect(resumeMessage).to.contain('claimed at channel_reestablish');
+			expect(resumeMessage).to.not.contain('Recovery Capsule');
+
+			expectHeldForPeerClose(opener, openerPrivkeys[0]);
+		});
+
+		it('refuses an all-zero secret at a compatible non-zero revocation number', function () {
+			// Compatible counters do not excuse it either: above 0 the peer MUST
+			// send the last secret it received from us, and the validator, not
+			// the retransmission logic, answers a wrong one. The index named
+			// here (localCommitmentNumber - 1) is one this row DID release, so
+			// the wrong value is a plain violation with no claim on our state:
+			// no hold, and the node fails the channel on chain as it does for
+			// any other wire error.
+			const { opener, acceptor } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const pre = opener.getFullState();
+			expect(Number(pre.localCommitmentNumber)).to.be.greaterThan(0);
+			opener.markForReestablish();
+			const msg: IChannelReestablishMessage = {
+				channelId: opener.getChannelId()!,
+				nextCommitmentNumber: pre.remoteCommitmentNumber + 1n,
+				nextRevocationNumber: pre.localCommitmentNumber,
+				yourLastPerCommitmentSecret: Buffer.alloc(32),
+				myCurrentPerCommitmentPoint: makeForeignPoint('zeros-level')
+			};
+			const actions = opener.handleReestablish(msg);
+
+			expectWrongSecretRefusal(opener, actions);
+			const state = opener.getFullState();
+			expect(state.stateUncertain).to.not.equal(true);
+			expect(state.reestablishRecencyUnproven).to.not.equal(true);
+			expect(isRecencyUnproven(state)).to.equal(false);
+			expect(state.recoveryCloseReason).to.not.exist;
+			expect(opener.getRecoveryCloseReason()).to.not.exist;
+			expect(mustNotBroadcastCommitment(state)).to.equal(false);
+			expect(opener.getRecoveryStatus()).to.equal(
+				ChannelRecoveryStatus.ForceClosing
+			);
 		});
 	});
 

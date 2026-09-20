@@ -608,7 +608,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 	});
 
 	it('an irrecoverable counter gap on a held channel ends in a peer-close request, not limbo (issue #469)', function () {
-		const { opener, acceptor } = setupNormalChannels();
+		const { opener, acceptor, openerCommitmentSeed } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
 		const state = opener.getFullState();
 		state.restoreRecencyUnproven = true;
@@ -624,7 +624,12 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 			channelId: opener.getChannelId()!,
 			nextCommitmentNumber: state.remoteCommitmentNumber + 50n,
 			nextRevocationNumber: state.localCommitmentNumber,
-			yourLastPerCommitmentSecret: Buffer.alloc(32),
+			// The real secret at index L - 1: zeroes above revocation 0 are
+			// refused by the validator (issue #907) and never reach this arm.
+			yourLastPerCommitmentSecret: generateFromSeed(
+				openerCommitmentSeed,
+				MAX_INDEX - (state.localCommitmentNumber - 1n)
+			),
 			myCurrentPerCommitmentPoint: perCommitmentPointFromSecret(
 				crypto.createHash('sha256').update(Buffer.from('gap')).digest()
 			)
@@ -652,7 +657,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 	});
 
 	it('leaves an unheld counter gap on its existing path', function () {
-		const { opener, acceptor } = setupNormalChannels();
+		const { opener, acceptor, openerCommitmentSeed } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
 		const state = opener.getFullState();
 		opener.markForReestablish();
@@ -663,7 +668,12 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 			channelId: opener.getChannelId()!,
 			nextCommitmentNumber: state.remoteCommitmentNumber + 50n,
 			nextRevocationNumber: state.localCommitmentNumber,
-			yourLastPerCommitmentSecret: Buffer.alloc(32),
+			// The real secret at index L - 1: zeroes above revocation 0 are
+			// refused by the validator (issue #907) and never reach this arm.
+			yourLastPerCommitmentSecret: generateFromSeed(
+				openerCommitmentSeed,
+				MAX_INDEX - (state.localCommitmentNumber - 1n)
+			),
 			myCurrentPerCommitmentPoint: perCommitmentPointFromSecret(
 				crypto.createHash('sha256').update(Buffer.from('gap2')).digest()
 			)

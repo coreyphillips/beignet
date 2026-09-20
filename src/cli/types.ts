@@ -138,6 +138,13 @@ export interface ChannelInfo {
 	 */
 	restoreRecencyUnproven?: boolean;
 	/**
+	 * The peer claimed at channel_reestablish that this channel's state is
+	 * behind and showed no proof, so the channel is ERRORED under the same
+	 * hold: no automatic close, no new HTLCs, no router edge, and the peer is
+	 * asked to close. The operator's force close needs acceptStaleStateRisk.
+	 */
+	reestablishRecencyUnproven?: boolean;
+	/**
 	 * Neither mempool nor chain can account for the funding, so the channel is
 	 * quarantined: no new HTLCs, no router edge, no routing hint. Reversible
 	 * and not a close; it clears by itself when the funding is seen again.
