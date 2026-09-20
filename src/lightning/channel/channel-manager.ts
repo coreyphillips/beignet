@@ -5755,6 +5755,13 @@ export class ChannelManager extends EventEmitter {
 		// process theirs.
 		if (channel.shouldRetransmitReestablish()) {
 			this.sendReestablish(peerPubkey, channel);
+			// ...unless building ours failed the channel, because the shachain
+			// store could not produce the secret it owes (issue #919). The peer
+			// has our error and is asked to close; driving the now-ERRORED row
+			// through the reestablish handler would resume the very channel the
+			// hold just parked. The guard above answers every LATER reestablish
+			// for it the same way.
+			if (channel.getState() === ChannelState.ERRORED) return;
 		}
 
 		const actions = channel.handleReestablish(msg);
