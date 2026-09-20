@@ -8895,7 +8895,7 @@ export class Channel {
 		// localCommitmentNumber, under the recency hold above it). A missing
 		// secret is a local storage fault, so announcing it locally is
 		// probably better than sending a value that reads as a protocol
-		// violation; see the follow-up issue filed with PR #912.
+		// violation; see issue #919.
 		const lastSecret =
 			revocationCount > 0n
 				? this._state.shaChainStore.getSecret(
