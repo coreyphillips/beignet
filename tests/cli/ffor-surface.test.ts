@@ -923,7 +923,7 @@ describe('automatic receive falls back to direct funding', function () {
 		port = portOf(daemon);
 		// The route only needs to know the peer is there and where it is: it never
 		// talks to the peer in this mode, which is the point of the fallback.
-		peers = [{ pubkey: lsp, host: '10.0.0.7', port: 9736, state: 'connected' }];
+		peers = [{ pubkey: lsp, host: '10.0.0.7', port: 9736, state: 'ready' }];
 		sinon.stub(daemon.node, 'listPeers').callsFake(() => peers);
 	});
 

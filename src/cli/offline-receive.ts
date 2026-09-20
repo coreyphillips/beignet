@@ -195,7 +195,14 @@ export class OfflineReceive {
 		if (
 			!this.node
 				.listPeers()
-				.some((p) => p.pubkey === peer && p.state === 'connected')
+				.some(
+					(p) =>
+						p.pubkey === peer &&
+						// 'ready' is the state a peer reaches once init is exchanged,
+						// which is what the custom messages below need; 'connected'
+						// is the transport-up state the connect route reports first.
+						(p.state === 'ready' || p.state === 'connected')
+				)
 		)
 			fail(
 				'RECEIVE_UNAVAILABLE',

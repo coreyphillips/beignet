@@ -115,7 +115,7 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 		listChannels: () => channels,
 		listPeers: () =>
 			opts.peers ?? [
-				{ pubkey: peer, host: 'lsp.example', port: 9735, state: 'connected' }
+				{ pubkey: peer, host: 'lsp.example', port: 9735, state: 'ready' }
 			],
 		getInfo: () => ({ blockHeight: 800000 }),
 		fforEpochs: () => epochs,
@@ -177,7 +177,11 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 	const coordinator = new OfflineReceive(
 		node as unknown as BeignetNode,
 		(jobs) => saved.push(jobs),
-		opts.jobs ?? [job],
+		// Pre-split journals are hand-built JSON on purpose (the kind-less
+		// cell); the coordinator validates them at construction.
+		(opts.jobs ?? [job]) as unknown as ConstructorParameters<
+			typeof OfflineReceive
+		>[2],
 		() => now
 	);
 	return {

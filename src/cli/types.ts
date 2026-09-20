@@ -53,7 +53,7 @@ export interface NodeInfo {
 	websocketPort?: number;
 }
 
-export type PeerState = 'connected' | 'connecting' | 'disconnected';
+export type PeerState = 'ready' | 'connected' | 'connecting' | 'disconnected';
 
 export interface PeerInfo {
 	pubkey: string;
