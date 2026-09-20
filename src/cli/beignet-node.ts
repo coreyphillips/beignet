@@ -1555,6 +1555,15 @@ export class BeignetNode extends EventEmitter {
 	 *  state: the only boot that is a restore target. Cleared once a node
 	 *  was rebuilt on restored state. */
 	private _bootTargetEmpty = false;
+	/**
+	 * When the emptiness above was latched (issue #906). The new-channel
+	 * fence holds an empty boot only while an armed auto-apply lane has yet
+	 * to decide, and that hold expires _autoApplyMaxWaitMs after THIS
+	 * moment: the lane's own ceiling timer starts at the first capsule
+	 * arrival, so a wallet no storage peer ever answers for needs a bound
+	 * that does not wait on one.
+	 */
+	private _bootTargetEmptyAt = 0;
 	/** The boot options, kept so the automatic path can rebuild the node
 	 *  in-process on the installed database (the guardian restore keeps the
 	 *  same options under _deferredOpts for its deferred construction). */
@@ -2017,6 +2026,7 @@ export class BeignetNode extends EventEmitter {
 		try {
 			assertEmptyTarget(this.storage);
 			this._bootTargetEmpty = true;
+			this._bootTargetEmptyAt = Date.now();
 		} catch {
 			this._bootTargetEmpty = false;
 			if (this._recoveryAutoApply) {
@@ -4586,28 +4596,74 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
+	 * Whether this boot's EMPTINESS still fences new channels (issue #906,
+	 * F1(a)). An empty database is the state a capsule is meant to fill, and
+	 * the capsule carries the key-index table that says where allocation has
+	 * to continue from, so handing out an index before that arrives can burn
+	 * one a previous device already used.
+	 *
+	 * The rule is deliberately narrow: emptiness fences ONLY while the
+	 * automatic capsule lane is armed and its outcome is still open. An
+	 * emptiness that nothing is waiting on is just a new wallet, and a new
+	 * wallet has to be able to open its first channel, so a daemon without
+	 * the lane is never fenced on emptiness alone. The window is bounded
+	 * three ways, none of which needs a capsule to exist:
+	 *  - the lane reaches a terminal phase (applied or refused);
+	 *  - the restore clears _bootTargetEmpty (the database is no longer the
+	 *    thing a capsule would fill);
+	 *  - the lane's own ceiling, recoveryAutoApplyMaxWaitMs, elapses since
+	 *    the boot latched the emptiness. The lane's ceiling timer only
+	 *    starts at the FIRST capsule arrival, so a wallet no peer ever
+	 *    answers for would otherwise sit fenced forever.
+	 * #909 D9's operator marker ("this wallet really is new") is not
+	 * implemented yet; when it lands it belongs here as a fourth lift.
+	 */
+	private emptyBootRestoreUndecided(): boolean {
+		if (!this._bootTargetEmpty) return false;
+		if (!this._recoveryAutoApply || this.recoveryMode !== 'peer-storage') {
+			return false;
+		}
+		const phase = this._autoApply.phase;
+		if (phase === 'applied' || phase === 'refused') return false;
+		return Date.now() - this._bootTargetEmptyAt < this._autoApplyMaxWaitMs;
+	}
+
+	/**
 	 * The fence on brand-new channels (issue #906), consulted by the channel
 	 * manager ahead of every fresh key derivation, inbound accepts included.
-	 * Two conditions refuse, each naming itself:
+	 * Each condition names itself; the reason is local (the peer is told
+	 * only that new channels are refused for now):
 	 *  - the capsule auto-apply lane is unresolved (settling, applying, or
 	 *    the in-process rebuild is running): the capsule may still install
 	 *    the key-index table this node has to continue from, so no index is
 	 *    handed out until that is decided;
-	 *  - the chain tip is unknown: the next index is floored at the tip times
-	 *    CHANNEL_INDEX_FLOOR_STRIDE on a boot with no key-index row, and
+	 *  - this boot opened an EMPTY database and an armed auto-apply lane has
+	 *    not decided yet (see emptyBootRestoreUndecided, which bounds it);
+	 *  - the chain tip is unknown AND this is a birth boot, the one whose
+	 *    next index is floored at the tip times CHANNEL_INDEX_FLOOR_STRIDE:
 	 *    until a height is known that floor cannot be set, so the next
-	 *    channel would take index 1.
-	 * An idle lane with nothing retrieved does NOT refuse, so a brand-new
-	 * wallet can open its first channel. The floor provides bounded spacing:
-	 * for unclamped heights H > H0, sequential allocation from H0 * 128
-	 * leaves every consumed index below H * 128 while at most
-	 * 128 * (H - H0) indices have been consumed. Every attempt reaching
-	 * derivation counts, including one validation later rejects. Same-block
-	 * restores and allocations beyond that budget can still reuse keys. This
-	 * fence does not stop another running device or establish that recovery
-	 * found all previous state.
+	 *    channel would take index 1. A boot that already knows where
+	 *    allocation stands (a key-index table, a persisted floor) is NOT
+	 *    fenced for a missing tip, or a daemon with no chain backend could
+	 *    never open or accept a channel at all. The channel manager refuses
+	 *    that same window on its own, for embedders that supply no
+	 *    predicate; this clause states it on the daemon's side too.
+	 * An idle lane on a populated database does NOT refuse. The floor
+	 * provides bounded spacing: for unclamped heights H > H0, sequential
+	 * allocation from H0 * 128 leaves every consumed index below H * 128
+	 * while at most 128 * (H - H0) indices have been consumed. Rejected
+	 * opens hand their index back, so only accepted ones count against that
+	 * budget. Same-block restores and allocations beyond the budget can
+	 * still reuse keys. This fence does not stop another running device or
+	 * establish that recovery found all previous state.
 	 */
 	private newChannelRefusal(): string | null {
+		// Mid-construction (the node config carries this predicate, so it can
+		// be consulted before the field is assigned): nothing is known yet.
+		const node = this.node as LightningNode | undefined;
+		if (!node) {
+			return 'New channels are refused until this node has finished booting';
+		}
 		const phase = this._autoApply.phase;
 		if (phase === 'settling' || phase === 'applying' || this._resuming) {
 			const stage = this._resuming ? 'rebuilding' : phase;
@@ -4617,7 +4673,18 @@ export class BeignetNode extends EventEmitter {
 				'decides the next channel key index'
 			);
 		}
-		if (this.node.getCurrentBlockHeight() === 0) {
+		if (this.emptyBootRestoreUndecided()) {
+			return (
+				'New channels are refused while this empty boot waits for a ' +
+				'Recovery Capsule (auto-apply is armed and has not decided): the ' +
+				'capsule carries the key-index table the next channel key index ' +
+				'continues from'
+			);
+		}
+		if (
+			node.getCurrentBlockHeight() === 0 &&
+			node.getChannelManager().channelIndexTipFloorArmed
+		) {
 			return (
 				'New channels are refused until the chain tip is known so ' +
 				'recovery can initialize channel keys'
