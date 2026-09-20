@@ -145,6 +145,15 @@ export interface ChannelInfo {
 	 */
 	reestablishRecencyUnproven?: boolean;
 	/**
+	 * This node could not produce the per-commitment secret its own
+	 * channel_reestablish owes the peer (issue #919), so local storage is
+	 * damaged or incomplete: the channel is ERRORED under the same hold, no
+	 * automatic close, no new HTLCs, no router edge, and the peer is asked to
+	 * close. The operator's force close needs acceptStaleStateRisk, and the
+	 * hold is permanent, since the store cannot recover the secret.
+	 */
+	reestablishSecretMissing?: boolean;
+	/**
 	 * The peer has proven at channel_reestablish that it already holds the
 	 * revocation for this channel's stored commitment, so no force close of
 	 * it is permitted, the operator's acknowledged one included
@@ -1478,6 +1487,12 @@ export interface BeignetNodeEvents {
 		restoreRecencyUnproven?: true;
 		/** The peer claimed newer state without proof; the same acknowledgement is required. */
 		reestablishRecencyUnproven?: true;
+		/**
+		 * This node could not produce the per-commitment secret its own
+		 * channel_reestablish owes (issue #919); the same acknowledgement is
+		 * required.
+		 */
+		reestablishSecretMissing?: true;
 	}) => void;
 	'ffor:witness-provisioned': (data: Record<string, unknown>) => void;
 	'ffor:witness-recorded': (data: Record<string, unknown>) => void;

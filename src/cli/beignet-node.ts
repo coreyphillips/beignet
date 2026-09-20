@@ -1398,23 +1398,26 @@ function requireChannelIdHex(value: unknown, field = 'channelId'): Buffer {
  * A channel no readiness or capacity surface may count: restored from a
  * Recovery Capsule with no channel_reestablish proving its state current
  * (issue #469), failed because its peer claimed at channel_reestablish that
- * it is behind without proof (issue #907), or shown by its peer to be one
- * revocation behind, which the peer proved with the secret (issues #905 and
- * #915). The first and the last stay NORMAL and keep their balance and
- * settle the HTLCs they already have; all three take no new ones and are
- * offered to no router, so counting any of them advertises a channel whose
- * acceptsNewHtlcs refuses every add. Read off the wire fields rather than
+ * it is behind without proof (issue #907), failed because this node could not
+ * produce the per-commitment secret its own channel_reestablish owes (issue
+ * #919), or shown by its peer to be one revocation behind, which the peer
+ * proved with the secret (issues #905 and #915). The first and the last stay
+ * NORMAL and keep their balance and settle the HTLCs they already have; all
+ * four take no new ones and are offered to no router, so counting any of them
+ * advertises a channel whose acceptsNewHtlcs refuses every add. Read off the wire fields rather than
  * recomputed: these surfaces hold serialized channel info, not Channel
  * objects.
  */
 function isHeldRestore(ch: {
 	restoreRecencyUnproven?: boolean;
 	reestablishRecencyUnproven?: boolean;
+	reestablishSecretMissing?: boolean;
 	restoreRevokedRisk?: boolean;
 }): boolean {
 	return (
 		ch.restoreRecencyUnproven === true ||
 		ch.reestablishRecencyUnproven === true ||
+		ch.reestablishSecretMissing === true ||
 		ch.restoreRevokedRisk === true
 	);
 }
@@ -1444,9 +1447,20 @@ const REESTABLISH_FORCE_CLOSE_REFUSAL =
 	'the close is safe. Waiting for the peer to close is the safe outcome. ' +
 	'Set acceptStaleStateRisk: true to force close anyway.';
 
+const SECRET_MISSING_FORCE_CLOSE_REFUSAL =
+	'This node could not produce the per-commitment secret its own ' +
+	'channel_reestablish owes this peer, so local storage is damaged or ' +
+	'incomplete and the recency of this channel cannot be proven. The node ' +
+	'will not broadcast its commitment on its own initiative. If the stored ' +
+	'state is the stale one, force closing publishes a revoked commitment ' +
+	'and the whole channel balance is lost to the justice path. Waiting for ' +
+	'the peer to close is the safe outcome. Set acceptStaleStateRisk: true ' +
+	'to force close anyway.';
+
 interface IRecencyHold {
 	restoreRecencyUnproven?: true;
 	reestablishRecencyUnproven?: true;
+	reestablishSecretMissing?: true;
 }
 
 export class BeignetNode extends EventEmitter {
@@ -7622,6 +7636,7 @@ export class BeignetNode extends EventEmitter {
 			| {
 					restoreRecencyUnproven?: boolean;
 					reestablishRecencyUnproven?: boolean;
+					reestablishSecretMissing?: boolean;
 			  }
 			| undefined = this.node
 			.getChannelManager()
@@ -7633,6 +7648,9 @@ export class BeignetNode extends EventEmitter {
 				: {}),
 			...(state?.reestablishRecencyUnproven === true
 				? { reestablishRecencyUnproven: true as const }
+				: {}),
+			...(state?.reestablishSecretMissing === true
+				? { reestablishSecretMissing: true as const }
 				: {})
 		};
 	}
@@ -7643,6 +7661,16 @@ export class BeignetNode extends EventEmitter {
 	): void {
 		if (acceptStaleStateRisk === true) return;
 		const hold = this.recencyHold(channelId);
+		// One refusal per origin, in the engine's own precedence
+		// (recencyHoldOrigin): the local fault first, because it is the only
+		// one of the three that says this node's storage is damaged and a row
+		// can carry it beside the capsule hold.
+		if (hold.reestablishSecretMissing) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				SECRET_MISSING_FORCE_CLOSE_REFUSAL
+			);
+		}
 		if (hold.restoreRecencyUnproven || hold.reestablishRecencyUnproven) {
 			throw new BeignetError(
 				'INVALID_PARAMS',
@@ -7728,6 +7756,10 @@ export class BeignetNode extends EventEmitter {
 			issues.push(
 				'HELD_REESTABLISH: The peer claimed at channel_reestablish that this channel state is behind and showed no proof, so the channel is held and takes no new HTLCs. Routing hints will be skipped.'
 			);
+		if (state.reestablishSecretMissing === true)
+			issues.push(
+				'HELD_SECRET_MISSING: This node could not produce the per-commitment secret its own channel_reestablish owes this peer, so local storage is damaged or incomplete and the channel is held and takes no new HTLCs. Routing hints will be skipped. The store cannot recover the secret, so the exits are the peer closing or an acknowledged force close.'
+			);
 		if (state.restoreRevokedRisk === true)
 			issues.push(
 				'HELD_REVOKED: The peer proved at channel_reestablish that it already holds the revocation for this commitment, so the channel takes no new HTLCs and no force close of it is permitted, the acknowledged one included. Routing hints will be skipped. It clears when the peer retransmits and this channel levels.'
@@ -7805,6 +7837,7 @@ export class BeignetNode extends EventEmitter {
 		htlcUsable?: boolean;
 		restoreRecencyUnproven?: boolean;
 		reestablishRecencyUnproven?: boolean;
+		reestablishSecretMissing?: boolean;
 		restoreRevokedRisk?: boolean;
 		fundingUnaccounted?: boolean;
 		payThroughSplice?: boolean;
@@ -7869,6 +7902,8 @@ export class BeignetNode extends EventEmitter {
 			info.restoreRecencyUnproven = ch.restoreRecencyUnproven;
 		if (ch.reestablishRecencyUnproven)
 			info.reestablishRecencyUnproven = ch.reestablishRecencyUnproven;
+		if (ch.reestablishSecretMissing)
+			info.reestablishSecretMissing = ch.reestablishSecretMissing;
 		if (ch.restoreRevokedRisk) info.restoreRevokedRisk = ch.restoreRevokedRisk;
 		if (ch.fundingUnaccounted) info.fundingUnaccounted = ch.fundingUnaccounted;
 		if (ch.payThroughSplice !== undefined)

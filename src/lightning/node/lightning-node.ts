@@ -414,6 +414,7 @@ import {
 	IV2InFlight,
 	mustNotBroadcastCommitment,
 	isRecencyUnproven,
+	recencyHoldOrigin,
 	ChannelCloseReason
 } from '../channel/channel-state';
 import {
@@ -4640,6 +4641,49 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// This node could not build its OWN channel_reestablish: the shachain
+		// store had no secret at the index our revocation counter names, and
+		// BOLT 2 has no honest value to put there above revocation 0 (issue
+		// #919). The channel has already failed itself and taken the recency
+		// hold; what is raised here is the LOCAL fault, which the peer is
+		// deliberately not told the detail of, because a peer that knows which
+		// received secret we lost knows where its own revoked commitments may
+		// go unpunished. An operator sees it before the peer acts on the wire
+		// error, and the channel is named so the labelled force close can be
+		// aimed at it.
+		this.channelManager.on(
+			'reestablish:secret-missing',
+			(channelId: Buffer, revocationIndex: bigint, secretIndex: bigint) => {
+				const channelIdHex = channelId.toString('hex');
+				this.emitStructuredLog('channel', 'reestablish_secret_missing', {
+					channelId: channelIdHex,
+					revocationIndex: revocationIndex.toString(),
+					secretIndex: secretIndex.toString()
+				});
+				this.emit('node:error', {
+					code: 'REESTABLISH_SECRET_MISSING',
+					channelId,
+					message:
+						`channel ${channelIdHex} cannot send channel_reestablish: the ` +
+						`shachain store holds no per-commitment secret at revocation ` +
+						`index ${revocationIndex} (shachain index ${secretIndex}), a ` +
+						'secret this node already received and acknowledged, so there ' +
+						'is no honest value for your_last_per_commitment_secret and ' +
+						'all zeroes would be a protocol violation the peer fails the ' +
+						'channel on. Local storage is damaged or incomplete and ' +
+						'cannot recover it. The channel is failed and held: no ' +
+						'automatic close will broadcast its commitment, it takes no ' +
+						'new HTLCs, and the peer is asked to close instead. The exits ' +
+						'are the peer closing or an acknowledged force close, POST ' +
+						'/channel/forceclose with acceptStaleStateRisk: true (CLI: ' +
+						'channel forceclose --accept-stale-state-risk), which ' +
+						'publishes a commitment the peer may already hold a ' +
+						'revocation for',
+					timestamp: Date.now()
+				} as ILightningError);
+			}
+		);
+
 		// A quorum barrier is holding a batch's messages (Recovery 5.8). Purely
 		// informational: the channel is waiting, not broken, and the release
 		// happens on its own once the guardians answer.
@@ -6082,6 +6126,18 @@ export class LightningNode extends EventEmitter {
 			 */
 			reestablishRecencyUnproven?: boolean;
 			/**
+			 * This node could not produce the `your_last_per_commitment_secret`
+			 * its OWN channel_reestablish owes the peer (issue #919): the
+			 * shachain store held no secret at the index its revocation
+			 * counter names, and BOLT 2 permits all zeroes only at
+			 * next_revocation_number 0. The message was not sent; the channel
+			 * is ERRORED under the same hold as the two flags above, from a
+			 * LOCAL storage fault rather than a peer claim, and the store
+			 * cannot recover the secret, so the hold is permanent. The exits
+			 * are the peer's close or the operator's acknowledged force close.
+			 */
+			reestablishSecretMissing?: boolean;
+			/**
 			 * The channel's peer has PROVEN, in its channel_reestablish, that
 			 * it already holds the revocation for the channel's current
 			 * commitment (issues #905 and #915): next_revocation_number one
@@ -6118,6 +6174,7 @@ export class LightningNode extends EventEmitter {
 			fundingUnidentified?: boolean;
 			restoreRecencyUnproven?: boolean;
 			reestablishRecencyUnproven?: boolean;
+			reestablishSecretMissing?: boolean;
 			restoreRevokedRisk?: boolean;
 		}> = [];
 		for (const channel of this.channelManager.listChannels()) {
@@ -6139,6 +6196,9 @@ export class LightningNode extends EventEmitter {
 					: {}),
 				...(state.reestablishRecencyUnproven
 					? { reestablishRecencyUnproven: true }
+					: {}),
+				...(state.reestablishSecretMissing
+					? { reestablishSecretMissing: true }
 					: {}),
 				...(state.restoreRevokedRisk === true
 					? { restoreRevokedRisk: true }
@@ -13060,6 +13120,9 @@ export class LightningNode extends EventEmitter {
 				...(ch.reestablishRecencyUnproven === true
 					? { reestablishRecencyUnproven: true }
 					: {}),
+				...(ch.reestablishSecretMissing === true
+					? { reestablishSecretMissing: true }
+					: {}),
 				...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
 			};
 		});
@@ -13090,6 +13153,9 @@ export class LightningNode extends EventEmitter {
 				: {}),
 			...(ch.reestablishRecencyUnproven === true
 				? { reestablishRecencyUnproven: true }
+				: {}),
+			...(ch.reestablishSecretMissing === true
+				? { reestablishSecretMissing: true }
 				: {}),
 			...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
 		}));
@@ -13608,6 +13674,10 @@ export class LightningNode extends EventEmitter {
 		}
 		if (state.reestablishRecencyUnproven === true) {
 			info.reestablishRecencyUnproven = true;
+		}
+		// The same hold from a local fault (issue #919).
+		if (state.reestablishSecretMissing === true) {
+			info.reestablishSecretMissing = true;
 		}
 		// And the proven revocation (issues #905 and #915), which every
 		// readiness surface built on this info must exclude as well: the
@@ -25195,7 +25265,7 @@ export class LightningNode extends EventEmitter {
 		this.emitStructuredLog('channel', 'close_skipped_restore_unproven', {
 			channelId: (state.channelId ?? state.temporaryChannelId).toString('hex'),
 			context,
-			hold: state.restoreRecencyUnproven === true ? 'restore' : 'reestablish'
+			hold: recencyHoldOrigin(state)
 		});
 		return true;
 	}
@@ -25258,10 +25328,13 @@ export class LightningNode extends EventEmitter {
 				this.heldHtlcDeadlineNotices.delete(key);
 			}
 		}
-		const restore = state.restoreRecencyUnproven === true;
-		const origin = restore
-			? 'this channel was restored from a Recovery Capsule and no channel_reestablish has proven its state current'
-			: 'the peer claimed at channel_reestablish that this channel state is behind and showed no proof';
+		const hold = recencyHoldOrigin(state) ?? 'reestablish';
+		const origin =
+			hold === 'restore'
+				? 'this channel was restored from a Recovery Capsule and no channel_reestablish has proven its state current'
+				: hold === 'secret-missing'
+				? 'this node could not produce the per-commitment secret its own channel_reestablish owes the peer'
+				: 'the peer claimed at channel_reestablish that this channel state is behind and showed no proof';
 		this.emit('node:error', {
 			code: 'HTLC_DEADLINE_HELD',
 			channelId,
@@ -25270,9 +25343,7 @@ export class LightningNode extends EventEmitter {
 				`${htlc.paymentHash.toString('hex')}) expires at height ` +
 				`${htlc.cltvExpiry} and the chain is at ${blockHeight}, but the ` +
 				`${context} backstop is held: ${origin}, so this node will not ` +
-				`broadcast a commitment for it (${
-					restore ? 'restore' : 'reestablish'
-				} ` +
+				`broadcast a commitment for it (${hold} ` +
 				`recency hold). The HTLC's value is lost if nothing resolves it ` +
 				`before the deadline. The labelled exit is an acknowledged force ` +
 				`close, POST /channel/forceclose with acceptStaleStateRisk: true ` +

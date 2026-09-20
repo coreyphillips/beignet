@@ -2398,8 +2398,7 @@ export class ChannelManager extends EventEmitter {
 	handlePeerReconnected(peerPubkey: string): void {
 		for (const channel of this.getChannelsByPeer(peerPubkey)) {
 			if (channel.getState() === ChannelState.AWAITING_REESTABLISH) {
-				const actions = channel.createReestablish();
-				this.processActions(peerPubkey, channel, actions);
+				this.sendReestablish(peerPubkey, channel);
 			} else if (channel.getState() === ChannelState.ERRORED) {
 				// Recovery 5.6 liveness: the peer-close request survives
 				// crashes as a persisted disposition, not as a wire message.
@@ -2411,6 +2410,30 @@ export class ChannelManager extends EventEmitter {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Build and dispatch this channel's `channel_reestablish`, and announce a
+	 * reestablish this node could NOT build (issue #919).
+	 *
+	 * Every caller goes through here so the announcement can never be
+	 * forgotten at one site. The notice is taken and emitted BEFORE the
+	 * dispatch: it describes a LOCAL storage fault, which is true whatever
+	 * the batch then does, and dispatching first would risk losing it to a
+	 * re-entrant handler throwing out of the action loop.
+	 */
+	private sendReestablish(peerPubkey: string, channel: Channel): void {
+		const actions = channel.createReestablish();
+		const missing = channel.takeReestablishSecretMissingNotice();
+		if (missing) {
+			this.emit(
+				'reestablish:secret-missing',
+				channel.getChannelId() ?? channel.getTemporaryChannelId(),
+				missing.revocationIndex,
+				missing.secretIndex
+			);
+		}
+		this.processActions(peerPubkey, channel, actions);
 	}
 
 	/**
@@ -5573,7 +5596,7 @@ export class ChannelManager extends EventEmitter {
 			// below still runs, because the peer is owed an answer either way
 			// (handleMessage has the same containment for the same reason).
 			try {
-				this.processActions(peerPubkey, channel, channel.createReestablish());
+				this.sendReestablish(peerPubkey, channel);
 			} catch (err) {
 				this.emit(
 					'error',
@@ -5731,7 +5754,14 @@ export class ChannelManager extends EventEmitter {
 		// a new channel_reestablish. Retransmit ours (once per connection), then
 		// process theirs.
 		if (channel.shouldRetransmitReestablish()) {
-			this.processActions(peerPubkey, channel, channel.createReestablish());
+			this.sendReestablish(peerPubkey, channel);
+			// ...unless building ours failed the channel, because the shachain
+			// store could not produce the secret it owes (issue #919). The peer
+			// has our error and is asked to close; driving the now-ERRORED row
+			// through the reestablish handler would resume the very channel the
+			// hold just parked. The guard above answers every LATER reestablish
+			// for it the same way.
+			if (channel.getState() === ChannelState.ERRORED) return;
 		}
 
 		const actions = channel.handleReestablish(msg);

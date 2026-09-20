@@ -1035,6 +1035,15 @@ export interface IChannelInfo {
 	 */
 	reestablishRecencyUnproven?: boolean;
 	/**
+	 * This node could not produce the `your_last_per_commitment_secret` its
+	 * own channel_reestablish owes the peer (issue #919): a local storage
+	 * fault, and the same hold as the two flags above. The channel is ERRORED,
+	 * no automatic close will broadcast its commitment, it takes no new HTLCs
+	 * and is offered to no router or planner, and the peer is asked to close
+	 * on every reconnect. Permanent: the store cannot recover the secret.
+	 */
+	reestablishSecretMissing?: boolean;
+	/**
 	 * The peer has proven at channel_reestablish that it holds the revocation
 	 * for this channel's current commitment (issues #905 and #915), so no
 	 * broadcast of it is permitted, the operator's own force close included.
