@@ -908,6 +908,19 @@ export class ChannelManager extends EventEmitter {
 	 * gap (#906's "Node built without channelKeyDeriver"), not something a
 	 * chain tip could fix.
 	 */
+	/**
+	 * The reason a brand-new channel would be refused right now, or null.
+	 *
+	 * The same answer the acceptors and openers act on, read-only, for
+	 * callers that need to know BEFORE they promise a counterparty a channel
+	 * this node would then refuse on the wire. A JIT receive invoice is the
+	 * case that matters: it is a promise that an LSP may open a channel to
+	 * us, minted long before the open arrives.
+	 */
+	newChannelRefusal(): string | null {
+		return this._newChannelRefusal();
+	}
+
 	private _newChannelRefusal(): string | null {
 		if (this._channelIndexTipFloor && this.config.channelKeyDeriver) {
 			return (

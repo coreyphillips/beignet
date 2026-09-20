@@ -304,7 +304,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/jit/invoice': {
 				post: {
 					summary:
-						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards. The quoted opening fee (flatFeeSat + feePpm) is collected per feeMode: skim (default) deducts it from the delivery, hop puts it in the invoice routing hint so the sender pays it on top and the full amount is delivered. Requires the LSP peer to be connected and running the JIT receive engine',
+						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards. The quoted opening fee (flatFeeSat + feePpm) is collected per feeMode: skim (default) deducts it from the delivery, hop puts it in the invoice routing hint so the sender pays it on top and the full amount is delivered. Requires the LSP peer to be connected and running the JIT receive engine. With no usable channel to that LSP the invoice is a promise that it may open one, so it is refused with NEW_CHANNELS_REFUSED (503) while this node would refuse a brand-new channel: a bare-seed boot that has not learned a chain tip yet, or an unresolved Recovery Capsule restore. Both lift on their own, and an invoice that routes over an existing usable channel is never refused for it',
 					tags: ['Invoices'],
 					requestBody: bodyContent({
 						lspPubkey: 'string',

@@ -20,7 +20,7 @@ import * as path from 'path';
 import { AddressInfo } from 'net';
 import { startDaemon, statusForErrorCode } from '../../src/cli/daemon';
 import { jitInvoiceError } from '../../src/cli/beignet-node';
-import { BeignetError } from '../../src/cli/errors';
+import { BeignetError, isRetryableError } from '../../src/cli/errors';
 import { decode } from '../../src/lightning/invoice/decode';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 
@@ -235,6 +235,13 @@ describe('JIT receive daemon surface', function () {
 	});
 
 	it('fails a JIT invoice for a peer that is not connected', async () => {
+		// A height first. This daemon's Electrum is deliberately unreachable,
+		// so its tip stands at zero and issue #906's new-channel fence refuses
+		// the mint before any transport is tried: an invoice for a channel
+		// that does not exist yet is a promise the LSP may open one, and a
+		// node that would refuse that open must not make it. Here the
+		// unreachable LSP is the case under test, so lift the fence.
+		(daemon.node as unknown as { node: LightningNode }).node.handleNewBlock(1);
 		let error: unknown = null;
 		try {
 			await daemon.node.createJitInvoice({
@@ -289,6 +296,25 @@ describe('JIT receive daemon surface', function () {
 		expect(jitInvoiceError(fault)).to.equal(fault);
 		expect(statusForErrorCode('JIT_REFUSED')).to.equal(400);
 		expect(statusForErrorCode('JIT_TIMEOUT')).to.equal(504);
+	});
+
+	// The wallet's OWN refusal, not the LSP's: an invoice for a channel that
+	// does not exist yet is a promise the LSP may open one, and issue #906's
+	// fence is this node saying it would refuse that open. Retryable, because
+	// every condition the fence names lifts on its own.
+	it('types the new-channel fence as a retryable 503', () => {
+		const typed = jitInvoiceError(
+			new Error(
+				'JIT receive needs a new channel from the LSP, which this node ' +
+					'cannot accept right now: new channels are refused until the ' +
+					'chain tip is known: the channel key index floor is armed'
+			)
+		) as BeignetError;
+		expect(typed.code).to.equal('NEW_CHANNELS_REFUSED');
+		// The reason travels: the caller is told which condition holds.
+		expect(typed.message).to.contain('chain tip');
+		expect(statusForErrorCode('NEW_CHANNELS_REFUSED')).to.equal(503);
+		expect(isRetryableError(typed)).to.equal(true);
 	});
 
 	it('GET /jit/status answers lsp null when the role is off', async () => {

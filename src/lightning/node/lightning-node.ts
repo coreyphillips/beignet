@@ -20326,6 +20326,28 @@ export class LightningNode extends EventEmitter {
 		const expiry = opts.expiry ?? JIT_RECEIVE_DEFAULT_EXPIRY_SECONDS;
 		const maxAmountMsat =
 			opts.amountMsat ?? opts.maxAmountMsat ?? JIT_RECEIVE_DEFAULT_MAX_MSAT;
+		// A JIT receive with no usable channel to the LSP is a promise that
+		// the LSP may open one to us: its engine serves the intercepted HTLC
+		// by opening a channel and forwarding onto it, and has no confirmed
+		// fallback. So an invoice minted while this node would REFUSE a
+		// brand-new channel (the issue #906 fence: a bare-seed boot before
+		// its first header, an unresolved capsule restore) is a promise it
+		// cannot keep, and the payer finds that out only when its payment
+		// fails back at the LSP. The fence lifts on its own, so this refuses
+		// here rather than minting, and says which condition holds.
+		//
+		// Asked of the SAME predicate the hint decision below uses: over an
+		// existing usable channel the payment needs no new channel at all and
+		// nothing here applies.
+		if (!this.usableChannelWith(opts.lspPubkeyHex)) {
+			const refusal = this.channelManager.newChannelRefusal();
+			if (refusal) {
+				throw new Error(
+					'JIT receive needs a new channel from the LSP, which this node ' +
+						`cannot accept right now: ${refusal}`
+				);
+			}
+		}
 		const grant = await this.requestJitReceive(opts.lspPubkeyHex, {
 			maxAmountMsat,
 			...(opts.amountMsat !== undefined
