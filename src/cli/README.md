@@ -1523,6 +1523,14 @@ beignet trusted-peer list
 # {"ok":true,"result":[{"pubkey":"02ab...","trusted":true}]}
 ```
 
+The set is durable: it is written to the wallet database on every add and
+remove, and reloaded at startup before any peer can reconnect. Membership is
+symmetric and says this node will treat that peer's UNCONFIRMED funding as a
+usable channel, so it is also what makes an inbound zero-conf open acceptable.
+An acceptor that does not carry the opener refuses a zero_conf open outright
+rather than downgrading it to a confirmed one, which is why a wallet receiving
+through a JIT LSP has to carry that LSP here.
+
 ### Channels
 
 ```bash

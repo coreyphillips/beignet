@@ -637,6 +637,20 @@ const CHANNEL_KEY_INDEX_FLOOR_KEY = 'channel_key_index_floor';
  * because it records what MAY have been used, not what was.
  */
 const CHANNEL_KEY_INDEX_ALLOCATED_KEY = 'channel_key_index_allocated';
+/**
+ * Metadata key the zero-conf trusted set persists under.
+ *
+ * The set is an operator declaration ("I will accept this peer's unconfirmed
+ * funding"), not session state, but it lived only in memory: every restart
+ * dropped it. A wallet that had trusted its LSP therefore stopped accepting
+ * the zero_conf channel type from that LSP the moment its process restarted,
+ * and an inbound zero-conf open is REFUSED outright rather than downgraded to
+ * a confirmed one (Channel: "Proposed zero_conf channel type requires a
+ * trusted peer"), so a JIT receive into that wallet failed its held HTLCs
+ * back instead of opening slower. Stored as a JSON array of compressed
+ * pubkeys, rewritten whole on every change.
+ */
+const ZERO_CONF_TRUSTED_PEERS_KEY = 'zero_conf_trusted_peers';
 /** Default wait for an LSP's answer to a registration request. */
 const ASYNC_GRANT_REQUEST_TIMEOUT_MS = 30_000;
 /** Grants kept per LSP (newest first); older ones are dropped. */
@@ -3016,6 +3030,31 @@ export class LightningNode extends EventEmitter {
 					() => this.storage!.saveMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY, '0'),
 					'saveChannelKeyIndexFloor'
 				);
+			}
+		}
+
+		// The zero-conf trusted set the operator declared on an earlier run.
+		// Restored before any peer can connect, because the first thing an LSP
+		// does on reconnect is retry the open this node refused while the set
+		// was empty. A row that will not parse is read as no trust at all: the
+		// cost of that is a confirmed open, and the cost of guessing at a
+		// half-read row is accepting a stranger's unconfirmed funding.
+		const trustedRow = this.storage.loadMetadata(ZERO_CONF_TRUSTED_PEERS_KEY);
+		if (trustedRow) {
+			try {
+				const stored: unknown = JSON.parse(trustedRow);
+				if (Array.isArray(stored)) {
+					for (const pubkey of stored) {
+						if (
+							typeof pubkey === 'string' &&
+							validateHexPubkey(pubkey, 'pubkeyHex') === null
+						) {
+							this.channelManager.addTrustedPeer(pubkey);
+						}
+					}
+				}
+			} catch {
+				// A corrupted row is no trust, never a failed boot.
 			}
 		}
 
@@ -9762,11 +9801,17 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Add a peer as trusted for zero-conf channels.
+	 *
+	 * Durable from here on: the set is written back to storage on every
+	 * change, so the declaration outlives the process that made it. A write
+	 * that fails raises PERSISTENCE_ERROR and leaves the peer trusted for
+	 * this run, which is the direction that keeps the running node working.
 	 */
 	addTrustedPeer(pubkeyHex: string): void {
 		const pubkeyErr = validateHexPubkey(pubkeyHex, 'pubkeyHex');
 		if (pubkeyErr) throw new Error(pubkeyErr);
 		this.channelManager.addTrustedPeer(pubkeyHex);
+		this.persistTrustedPeers();
 	}
 
 	/**
@@ -9774,6 +9819,25 @@ export class LightningNode extends EventEmitter {
 	 */
 	removeTrustedPeer(pubkeyHex: string): void {
 		this.channelManager.removeTrustedPeer(pubkeyHex);
+		this.persistTrustedPeers();
+	}
+
+	/**
+	 * Write the whole trusted set back to storage.
+	 *
+	 * Whole rather than incremental: the set is small, bounded by what an
+	 * operator types, and a rewrite cannot drift from the live set the way a
+	 * per-peer append and delete pair can.
+	 */
+	private persistTrustedPeers(): void {
+		this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(
+					ZERO_CONF_TRUSTED_PEERS_KEY,
+					JSON.stringify(this.channelManager.listTrustedPeers())
+				),
+			'saveZeroConfTrustedPeers'
+		);
 	}
 
 	/**
