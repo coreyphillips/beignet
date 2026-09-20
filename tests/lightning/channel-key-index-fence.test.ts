@@ -7,13 +7,14 @@
  * 1 and derive the funding key, basepoints and per-commitment seed of
  * whatever channel a previous device held there, live or closed. Two guards
  * reduce that risk:
- *  - the fence (newChannelsRefused): while the predicate answers a reason,
- *    every entry point refuses with it and no index is consumed;
+ *  - the fence: while the configured predicate (newChannelsRefused) answers
+ *    a reason, or while the floor below is armed and unfired, every entry
+ *    point refuses and no index is consumed;
  *  - the floor: a birth boot (no key-index row, no persisted floor) floors
  *    the next index at the first real chain tip it learns times
- *    CHANNEL_INDEX_FLOOR_STRIDE (128 indices per block, since indices are
- *    consumed per open attempt reaching derivation, including later rejected
- *    attempts, while the floor advances per block; the product
+ *    CHANNEL_INDEX_FLOOR_STRIDE (128 indices per block, a margin for the
+ *    opens a device can answer between two blocks; an open it REFUSED hands
+ *    its index straight back, so junk opens cost nothing; the product
  *    clamped at CHANNEL_INDEX_FLOOR_MAX, below the hardened derivation
  *    limit), ONCE, and never lowers it; the value is persisted, every later
  *    boot seeds the counter from max(table, floor) with no header moving
@@ -76,6 +77,12 @@ const TIP = 850_000;
 /** Where the floor lands for a birth boot at TIP: the stride's worth per block. */
 const FLOOR = TIP * CHANNEL_INDEX_FLOOR_STRIDE;
 const REASON = 'new channels refused: the restore outcome is not known (test)';
+/**
+ * What the OPENER is told: the fence's own reason names our recovery state,
+ * which the counterparty has no business learning (issue #906 review), so
+ * the wire carries this and the reason stays on the local 'error' event.
+ */
+const WIRE_REASON = 'new channels are temporarily refused';
 const LSP_PUBKEY = '02' + 'ab'.repeat(32);
 const WALLET_PUBKEY = '03' + 'cd'.repeat(32);
 /** Where LightningNode keeps the floor's durable row (issue #906 review). */
@@ -410,7 +417,10 @@ describe('Channel key index fence (issue #906)', () => {
 		);
 		expect(v1.wireTypes).to.deep.equal([MessageType.ERROR]);
 		expect(v1.wireErrors[0].channelId.equals(open.tempId)).to.equal(true);
-		expect(v1.wireErrors[0].data).to.equal(REASON);
+		// Generic on the wire, detailed locally: the opener learns only that
+		// new channels are refused for now, never that we are mid-recovery.
+		expect(v1.wireErrors[0].data).to.equal(WIRE_REASON);
+		expect(v1.wireErrors[0].data).to.not.contain('restore outcome');
 		expect(v1.errors).to.deep.equal([REASON]);
 		expect(bob.getTempChannel(open.tempId)).to.equal(undefined);
 		expect(peersOf(bob).has(open.tempId.toString('hex'))).to.equal(false);
@@ -425,7 +435,7 @@ describe('Channel key index fence (issue #906)', () => {
 		);
 		expect(v2.wireTypes).to.deep.equal([MessageType.ERROR]);
 		expect(v2.wireErrors[0].channelId.equals(open2.channelId)).to.equal(true);
-		expect(v2.wireErrors[0].data).to.equal(REASON);
+		expect(v2.wireErrors[0].data).to.equal(WIRE_REASON);
 		expect(v2.errors).to.deep.equal([REASON]);
 		expect(bob.getTempChannel(open2.channelId)).to.equal(undefined);
 		expect(peersOf(bob).has(open2.channelId.toString('hex'))).to.equal(false);
@@ -485,7 +495,10 @@ describe('Channel key index fence (issue #906)', () => {
 				open.payload
 			);
 			expect(result.wireTypes).to.deep.equal([MessageType.ERROR]);
-			expect(result.wireErrors[0].data).to.equal(REASON);
+			expect(result.wireErrors[0].data).to.equal(WIRE_REASON);
+			// The detail is ours, on the local event and in the throw an
+			// outbound open surfaces to its own caller.
+			expect(result.errors).to.deep.equal([REASON]);
 			expect(manager.getTempChannel(open.tempId)).to.equal(undefined);
 			expect(() => node.openChannel(LSP_PUBKEY, 100_000n)).to.throw(REASON);
 			expect(manager.nextChannelIndex).to.equal(before);
@@ -558,8 +571,8 @@ describe('Channel key index floor (issue #906)', () => {
 		known.handleNewBlock(TIP + 10);
 		expect(known.nextChannelIndex).to.equal(FLOOR);
 
-		// Why the stride: indices are consumed per attempt reaching derivation,
-		// even if validation later rejects it, while the floor moves
+		// Why the stride: a device answers as many opens between two blocks
+		// as its peer asks for, while the floor moves once
 		// per block. A device born at TIP whose LSP opens three channels
 		// across two blocks burns three indices; a second device restored
 		// from the same seed two blocks later starts above all of them,
@@ -598,58 +611,232 @@ describe('Channel key index floor (issue #906)', () => {
 		expect(plain.channelIndexTipFloorArmed).to.equal(false);
 	});
 
-	it('later rejected open attempts consume the stride budget and can overlap the next-height floor', () => {
-		const earlier = makeManager('rejected-attempts-earlier');
-		earlier.armChannelIndexTipFloor(TIP);
-		const lsp = makeManager('rejected-attempts-lsp');
+	it('a rejected inbound open hands its key index back, v1 and v2', () => {
+		// Issue #906 review, H1: both acceptors derive keys BEFORE the channel
+		// validates the open (amount, reserve, dust, feerate, channel_type), so
+		// an open that never becomes a channel would otherwise consume an
+		// index. At 128 a block that is the whole spacing budget the floor
+		// gives one block, and a peer offering junk could walk this device's
+		// counter into the range the NEXT block's floor hands a freshly
+		// restored one: the collision the floor exists to prevent, reinstated
+		// for free. No accept_channel was sent, so nothing carrying those keys
+		// ever left the node and the index is provably unused.
+		const victim = makeManager('rejected-opens-victim');
+		victim.armChannelIndexTipFloor(TIP);
+		expect(victim.nextChannelIndex).to.equal(FLOOR);
+		const lsp = makeManager('rejected-opens-lsp');
 		const offered = offerOpen(lsp, WALLET_PUBKEY);
-		const rejected = decodeOpenChannelMessage(offered.payload);
-		// This is a decodable open on the correct chain. The manager derives
-		// keys before Channel rejects the zero funding amount.
-		rejected.fundingSatoshis = 0n;
+		const junk = decodeOpenChannelMessage(offered.payload);
+		// Decodable, on the right chain, past every manager pre-check: only
+		// the channel's own parameter validation refuses it.
+		junk.fundingSatoshis = 0n;
 		for (let i = 0; i < CHANNEL_INDEX_FLOOR_STRIDE; i++) {
-			rejected.temporaryChannelId = Buffer.alloc(32);
-			rejected.temporaryChannelId.writeUInt32BE(i + 1, 28);
+			junk.temporaryChannelId = Buffer.alloc(32);
+			junk.temporaryChannelId.writeUInt32BE(i + 1, 28);
 			const result = inbound(
-				earlier,
+				victim,
 				LSP_PUBKEY,
 				MessageType.OPEN_CHANNEL,
-				encodeOpenChannelMessage(rejected)
+				encodeOpenChannelMessage(junk)
 			);
 			expect(result.wireTypes).to.deep.equal([MessageType.ERROR]);
-			expect(result.wireErrors).to.have.length(1);
 			expect(result.wireErrors[0].data).to.match(
 				/funding_satoshis.*greater than 0/
 			);
 			expect(
-				result.wireErrors[0].channelId.equals(rejected.temporaryChannelId)
+				result.wireErrors[0].channelId.equals(junk.temporaryChannelId)
 			).to.equal(true);
-			expect(earlier.getTempChannel(rejected.temporaryChannelId)).to.equal(
+			expect(victim.getTempChannel(junk.temporaryChannelId)).to.equal(
 				undefined
 			);
-			expect(earlier.nextChannelIndex).to.equal(FLOOR + i + 1);
+			// The whole point: a full block's budget of refusals, zero indices.
+			expect(
+				victim.nextChannelIndex,
+				`after ${i + 1} refused open_channel`
+			).to.equal(FLOOR);
 		}
 
-		// No rejected attempt funded a channel, but all 128 consumed an index.
-		// The next attempt uses the next block's floor, so a fresh device with
-		// the same deterministic deriver can allocate the identical keys.
-		const later = makeManager('rejected-attempts-later');
+		// v2 the same way: a dust limit under the protocol floor is refused by
+		// the channel, after the acceptor derived its keys.
+		for (let i = 0; i < 4; i++) {
+			const open2 = makeOpenChannel2(`rejected-opens-v2-${i}`);
+			open2.dustLimitSatoshis = 100n;
+			const result = inbound(
+				victim,
+				LSP_PUBKEY,
+				MessageType.OPEN_CHANNEL2,
+				encodeOpenChannel2Message(open2)
+			);
+			expect(result.wireTypes).to.deep.equal([MessageType.ERROR]);
+			expect(result.wireErrors[0].data).to.match(
+				/dust_limit_satoshis .* below minimum/
+			);
+			expect(victim.getTempChannel(open2.channelId)).to.equal(undefined);
+			expect(
+				victim.nextChannelIndex,
+				`after ${i + 1} refused open_channel2`
+			).to.equal(FLOOR);
+		}
+		// Nothing retained for any of them either.
+		expect(peersOf(victim).size).to.equal(0);
+
+		// So a device restored one block later still starts above everything
+		// this one could have allocated, and the two next channels share no
+		// key material, which is what the spacing is for.
+		const later = makeManager('rejected-opens-later');
 		later.armChannelIndexTipFloor(TIP + 1);
-		expect(later.nextChannelIndex).to.equal(earlier.nextChannelIndex);
-		const a = earlier.openChannel(LSP_PUBKEY, 100_000n);
+		expect(later.nextChannelIndex).to.equal(
+			(TIP + 1) * CHANNEL_INDEX_FLOOR_STRIDE
+		);
+		expect(later.nextChannelIndex).to.be.above(victim.nextChannelIndex);
+		const a = victim.openChannel(LSP_PUBKEY, 100_000n);
 		const b = later.openChannel(LSP_PUBKEY, 100_000n);
-		expect(a.channelKeyIndex).to.equal(FLOOR + CHANNEL_INDEX_FLOOR_STRIDE);
-		expect(b.channelKeyIndex).to.equal(a.channelKeyIndex);
+		expect(a.channelKeyIndex).to.equal(FLOOR);
+		expect(b.channelKeyIndex).to.equal((TIP + 1) * CHANNEL_INDEX_FLOOR_STRIDE);
 		const aState = a.getFullState();
 		const bState = b.getFullState();
 		expect(
 			aState.localBasepoints.fundingPubkey.equals(
 				bState.localBasepoints.fundingPubkey
 			)
-		).to.equal(true);
+		).to.equal(false);
 		expect(
 			aState.localPerCommitmentSeed.equals(bState.localPerCommitmentSeed)
-		).to.equal(true);
+		).to.equal(false);
+	});
+
+	it('an ACCEPTED open consumes its index, and the next open gets the next', () => {
+		// The other half of the release rule: only a refusal gives an index
+		// back. Anything that answered accept_channel / accept_channel2 put
+		// our basepoints on the wire, so its index is spent for good.
+		const node = makeManager('accepted-consumes');
+		node.armChannelIndexTipFloor(TIP);
+		const lsp = makeManager('accepted-consumes-lsp');
+		const first = offerOpen(lsp, WALLET_PUBKEY);
+		const v1 = inbound(
+			node,
+			LSP_PUBKEY,
+			MessageType.OPEN_CHANNEL,
+			first.payload
+		);
+		expect(v1.wireTypes).to.deep.equal([MessageType.ACCEPT_CHANNEL]);
+		expect(node.getTempChannel(first.tempId)!.channelKeyIndex).to.equal(FLOOR);
+		expect(node.nextChannelIndex).to.equal(FLOOR + 1);
+
+		const open2 = makeOpenChannel2('accepted-consumes-v2');
+		const v2 = inbound(
+			node,
+			LSP_PUBKEY,
+			MessageType.OPEN_CHANNEL2,
+			encodeOpenChannel2Message(open2)
+		);
+		expect(v2.wireErrors).to.have.length(0);
+		expect(node.getTempChannel(open2.channelId)!.channelKeyIndex).to.equal(
+			FLOOR + 1
+		);
+		expect(node.nextChannelIndex).to.equal(FLOOR + 2);
+
+		const outbound = node.openChannel('02' + 'aa'.repeat(32), 100_000n);
+		expect(outbound.channelKeyIndex).to.equal(FLOOR + 2);
+		expect(node.nextChannelIndex).to.equal(FLOOR + 3);
+	});
+
+	it('refuses every new channel while the floor is armed but unfired, with no predicate configured', () => {
+		// Issue #906 review, H2: newChannelsRefused is the daemon's, and a
+		// plain LightningNode embedder supplies none. An armed, unfired floor
+		// is precisely the window in which this database has no record of the
+		// next index AND no tip to floor it at, so the counter still stands at
+		// 1 and the liquidity peer's automatic open would take it. The library
+		// fences that window itself, and lifts on the first block.
+		const manager = makeManager('self-fenced');
+		manager.armChannelIndexTipFloor();
+		expect(manager.channelIndexTipFloorArmed).to.equal(true);
+		expect(manager.nextChannelIndex).to.equal(1);
+		const lsp = makeManager('self-fenced-lsp');
+		const open = offerOpen(lsp, WALLET_PUBKEY);
+		const refused = inbound(
+			manager,
+			LSP_PUBKEY,
+			MessageType.OPEN_CHANNEL,
+			open.payload
+		);
+		expect(refused.wireTypes).to.deep.equal([MessageType.ERROR]);
+		expect(refused.wireErrors[0].data).to.equal(WIRE_REASON);
+		expect(refused.errors[0]).to.match(/until the chain tip is known/);
+		expect(manager.getTempChannel(open.tempId)).to.equal(undefined);
+		expect(peersOf(manager).size).to.equal(0);
+		expect(manager.nextChannelIndex).to.equal(1);
+		// Outbound opens surface the same reason, and burn nothing either.
+		expect(() => manager.openChannel(LSP_PUBKEY, 100_000n)).to.throw(
+			/until the chain tip is known/
+		);
+		expect(manager.nextChannelIndex).to.equal(1);
+
+		// The first block lifts it: no operator, no predicate, no restart.
+		manager.handleNewBlock(TIP);
+		expect(manager.channelIndexTipFloorArmed).to.equal(false);
+		const second = offerOpen(lsp, WALLET_PUBKEY);
+		const accepted = inbound(
+			manager,
+			LSP_PUBKEY,
+			MessageType.OPEN_CHANNEL,
+			second.payload
+		);
+		expect(accepted.wireTypes).to.deep.equal([MessageType.ACCEPT_CHANNEL]);
+		const channel = manager.getTempChannel(second.tempId);
+		expect(channel, 'the open was accepted').to.not.equal(undefined);
+		expect(channel!.channelKeyIndex).to.be.at.least(
+			TIP * CHANNEL_INDEX_FLOOR_STRIDE
+		);
+		expect(channel!.channelKeyIndex).to.equal(FLOOR);
+
+		// The self-fence needs an index to protect. Without a
+		// channelKeyDeriver every channel takes the node-level shared keys at
+		// index 0 and the counter is never consumed, so an armed floor
+		// refuses nothing: that configuration's key reuse is the separate gap
+		// #906 leaves out of scope, and no chain tip would fix it.
+		const shared = makeManager('self-fenced-shared', {
+			channelKeyDeriver: undefined
+		});
+		shared.armChannelIndexTipFloor();
+		expect(shared.channelIndexTipFloorArmed).to.equal(true);
+		const sharedOpen = offerOpen(lsp, WALLET_PUBKEY);
+		const admitted = inbound(
+			shared,
+			LSP_PUBKEY,
+			MessageType.OPEN_CHANNEL,
+			sharedOpen.payload
+		);
+		expect(admitted.wireTypes).to.deep.equal([MessageType.ACCEPT_CHANNEL]);
+		expect(shared.getTempChannel(sharedOpen.tempId)!.channelKeyIndex).to.equal(
+			0
+		);
+		expect(shared.nextChannelIndex).to.equal(1);
+	});
+
+	it('does not fire the floor on a height that is not a finite number', () => {
+		// NaN fails every comparison, so a bare `tip <= 0` guard would disarm
+		// the floor without applying it and leave the counter at 1 for the
+		// node to persist as this database's floor forever (issue #906
+		// review). Infinity is no more a tip than NaN is.
+		for (const height of [NaN, Infinity, -Infinity]) {
+			const armed = makeManager(`nonfinite-armed-${String(height)}`);
+			armed.armChannelIndexTipFloor(height);
+			expect(armed.channelIndexTipFloorArmed, `armed at ${height}`).to.equal(
+				true
+			);
+			expect(armed.nextChannelIndex).to.equal(1);
+			const header = makeManager(`nonfinite-header-${String(height)}`);
+			header.armChannelIndexTipFloor();
+			header.handleNewBlock(height);
+			expect(header.channelIndexTipFloorArmed).to.equal(true);
+			expect(header.nextChannelIndex).to.equal(1);
+			// And the next real header still floors, however poisoned the
+			// remembered height is.
+			header.handleNewBlock(TIP);
+			expect(header.channelIndexTipFloorArmed).to.equal(false);
+			expect(header.nextChannelIndex).to.equal(FLOOR);
+		}
 	});
 
 	it('clamps the floor from an implausible height below the hardened derivation limit', () => {

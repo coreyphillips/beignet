@@ -2641,8 +2641,9 @@ export class LightningNode extends EventEmitter {
 		// opened or accepted, the keys of whichever channel a previous device
 		// held at index 1. Such a birth boot floors the counter at the chain
 		// tip times CHANNEL_INDEX_FLOOR_STRIDE instead (128 indices per
-		// block, a bounded margin for consumed indices, including open attempts
-		// that validation later rejects), ONCE: from the height persisted
+		// block, a bounded margin for the opens a device can answer between
+		// two blocks; a refused open hands its index back), ONCE: from the
+		// height persisted
 		// below when there is one, else from the first header, and the value
 		// it reaches goes to the floor row (persistChannelIndexFloor). Every
 		// later boot seeds the counter from max(table high-water mark, row)
