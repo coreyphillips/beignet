@@ -61,6 +61,12 @@ export interface IChannelSnapshot {
 	 */
 	reestablishRecencyUnproven?: boolean;
 	/**
+	 * This node could not produce the per-commitment secret its own
+	 * channel_reestablish owes the peer (issue #919): the same hold again,
+	 * from a local storage fault.
+	 */
+	reestablishSecretMissing?: boolean;
+	/**
 	 * The peer proved at channel_reestablish that it holds the revocation for
 	 * this channel's current commitment (issues #905 and #915). Broadcasting
 	 * it is refused under every reason, the operator's included, so close
@@ -197,6 +203,7 @@ export class LiquidityAdvisor {
 				// forbids; the exit is the peer's own close (issues #469, #907).
 				ch.restoreRecencyUnproven !== true &&
 				ch.reestablishRecencyUnproven !== true &&
+				ch.reestablishSecretMissing !== true &&
 				ch.restoreRevokedRisk !== true
 			) {
 				recommendations.push({

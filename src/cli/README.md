@@ -513,6 +513,26 @@ BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS=120000   # never wait longer than this; 
   `beignet channel forceclose <id> --accept-stale-state-risk`, refused
   without it with wording for this case.
 
+  A third origin is a LOCAL fault (issue #919): this node's own
+  `channel_reestablish` could not be built, because its shachain store holds
+  no per-commitment secret at the index its revocation counter names. BOLT 2
+  permits an all-zero `your_last_per_commitment_secret` only at
+  `next_revocation_number` 0, so there is no honest value to send above it and
+  nothing is sent: the peer gets a BOLT 1 error saying only that this node
+  cannot produce the message (naming the missing secret would tell a peer
+  where its own revoked commitments may go unpunished), and the operator gets
+  a `node:error` with code `REESTABLISH_SECRET_MISSING` naming the channel,
+  the revocation index and the exit, plus a `reestablish_secret_missing`
+  structured log. The channel carries `reestablishSecretMissing` on
+  `GET /recovery/status` with `status: "reestablish_secret_missing"` and the
+  same hold: no automatic close, no new HTLCs, the peer asked to close on
+  every reconnect, and
+  `beignet channel forceclose <id> --accept-stale-state-risk` as the operator
+  exit, refused without the flag with wording for this case. The hold is
+  PERMANENT: a shachain store cannot regrow a secret it never wrote, so the
+  peer's close and the acknowledged force close are the only two exits.
+  `GET /channel/<id>/diagnostics` reports it as `HELD_SECRET_MISSING`.
+
   Either hold disarms the on-chain HTLC deadline backstops, so each one
   that declines to close announces it: a `node:error` with code
   `HTLC_DEADLINE_HELD` (on the SSE stream and the `onError` callback),
@@ -525,9 +545,10 @@ BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS=120000   # never wait longer than this; 
   alert on.
 
   The same acknowledgement is required on those FFOR routes for the
-  reestablish origin. The `ffor:enforce` event carries
-  `restoreRecencyUnproven: true`, `reestablishRecencyUnproven: true`, or
-  both, matching the channel's holds, so the embedder knows to ask.
+  reestablish and secret-missing origins. The `ffor:enforce` event carries
+  `restoreRecencyUnproven: true`, `reestablishRecencyUnproven: true`,
+  `reestablishSecretMissing: true`, or several of them, matching the
+  channel's holds, so the embedder knows to ask.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.

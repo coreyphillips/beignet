@@ -257,7 +257,8 @@ export type RecoveryCloseReason =
 	| 'local-data-loss'
 	| 'state-uncertain'
 	| 'restore-unproven'
-	| 'reestablish-unproven';
+	| 'reestablish-unproven'
+	| 'reestablish-secret-missing';
 
 /**
  * Why WE closed (or are closing) the channel. 'user' means an API-initiated
@@ -980,6 +981,40 @@ export interface IChannelState {
 	 */
 	reestablishRecencyUnproven?: boolean;
 	/**
+	 * This node could not produce the `your_last_per_commitment_secret` its
+	 * OWN `channel_reestablish` owes the peer (issue #919): the shachain
+	 * store held no secret at `remoteRevocationNumber - 1` while that counter
+	 * stood above zero. BOLT 2 permits all zeroes only at
+	 * `next_revocation_number` 0, so the old fallback put a value on the wire
+	 * that a conforming peer treats as a protocol violation (CLN fails the
+	 * connection; this implementation since issue #907 fails the channel).
+	 * The message is not built at all now, and the fault is recorded here.
+	 *
+	 * A LOCAL fault, unlike the two holds above, and a proven one: the store
+	 * cannot reproduce a secret this row has already received and
+	 * acknowledged, so either a write was lost, the row was restored in
+	 * pieces, or the counter and the store disagree. Whatever the cause, the
+	 * row cannot prove it is current either, and it may be the rolled-back
+	 * copy, so it takes exactly the hold the two flags above carry
+	 * (isRecencyUnproven): no automatic close of ours, no new HTLCs, no
+	 * cooperative close without the acknowledgement, a derived
+	 * `reestablish-secret-missing` disposition asking the peer to close, and
+	 * the operator's labelled force close still open as the exit. Not
+	 * `stateUncertain`, which would close that exit too and leave a channel
+	 * with a damaged store no way out at all.
+	 *
+	 * PERMANENT. A shachain store cannot regrow a secret it never wrote: the
+	 * entries are derived forwards from what was received, so nothing this
+	 * node does later can produce the missing index, and a store that
+	 * disagreed with its counter once has not earned the assumption that it
+	 * was wrong only there. The channel has also already been failed to the
+	 * peer with a wire error, so clearing the flag would resume a channel the
+	 * peer has been asked to close. The two exits are the peer's close and
+	 * the operator's acknowledged force close. MUST persist: a restart must
+	 * not forget it.
+	 */
+	reestablishSecretMissing?: boolean;
+	/**
 	 * The peer has PROVEN it holds the revocation for this row's CURRENT
 	 * local commitment (issues #905 and #915). Despite the historical field
 	 * name, no capsule restore is required. Set by handleReestablish when
@@ -1308,23 +1343,52 @@ export function mustNotBroadcastCommitment(state: {
 }
 
 /**
- * The recency HOLD (issues #469 and #907): the row's recency cannot be
- * proven, either because it came from a Recovery Capsule
- * (restoreRecencyUnproven) or because the peer claimed at channel_reestablish
- * that it is behind without showing the secret that would prove it
- * (reestablishRecencyUnproven). Narrower than mustNotBroadcastCommitment: the
- * node will not broadcast its commitment ON ITS OWN INITIATIVE (every
- * automatic close is refused and the peer is asked to close instead), takes
- * no new HTLCs and refuses a mutual close, but the operator's labelled force
- * close stays open. Every hold site consults this ONE predicate so the two
- * flags carry exactly the same semantics.
+ * The recency HOLD (issues #469, #907 and #919): the row's recency cannot be
+ * proven, because it came from a Recovery Capsule (restoreRecencyUnproven),
+ * because the peer claimed at channel_reestablish that it is behind without
+ * showing the secret that would prove it (reestablishRecencyUnproven), or
+ * because this node's own shachain store could not produce the secret its
+ * channel_reestablish owes the peer (reestablishSecretMissing). Narrower than
+ * mustNotBroadcastCommitment: the node will not broadcast its commitment ON
+ * ITS OWN INITIATIVE (every automatic close is refused and the peer is asked
+ * to close instead), takes no new HTLCs and refuses a mutual close, but the
+ * operator's labelled force close stays open. Every hold site consults this
+ * ONE predicate so the flags carry exactly the same semantics.
  */
 export function isRecencyUnproven(state: {
 	restoreRecencyUnproven?: boolean;
 	reestablishRecencyUnproven?: boolean;
+	reestablishSecretMissing?: boolean;
 }): boolean {
 	return (
 		state.restoreRecencyUnproven === true ||
-		state.reestablishRecencyUnproven === true
+		state.reestablishRecencyUnproven === true ||
+		state.reestablishSecretMissing === true
 	);
+}
+
+/** Which origin put a row under the recency hold, or null for no hold. */
+export type RecencyHoldOrigin = 'secret-missing' | 'restore' | 'reestablish';
+
+/**
+ * The hold's origin, for the surfaces that have to NAME it: the structured
+ * skip log, the held-deadline notice, the refusal texts and the daemon.
+ *
+ * Precedence, when more than one stands. `secret-missing` (issue #919) comes
+ * first because it is the only one of the three that is a proven LOCAL fault
+ * rather than an unproven risk: a capsule restore that lost shachain entries
+ * carries both flags, and telling the operator only that the row was restored
+ * would hide the fact that this node's storage is actually damaged and needs
+ * attention. The capsule origin (issue #469) comes next, ahead of the peer's
+ * claim (issue #907), which is the order those two have always reported in.
+ */
+export function recencyHoldOrigin(state: {
+	restoreRecencyUnproven?: boolean;
+	reestablishRecencyUnproven?: boolean;
+	reestablishSecretMissing?: boolean;
+}): RecencyHoldOrigin | null {
+	if (state.reestablishSecretMissing === true) return 'secret-missing';
+	if (state.restoreRecencyUnproven === true) return 'restore';
+	if (state.reestablishRecencyUnproven === true) return 'reestablish';
+	return null;
 }

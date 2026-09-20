@@ -622,6 +622,100 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 			}
 		).channels.delete(channelId);
 	});
+
+	it('POST /channel/forceclose refuses a secret-missing channel without acceptStaleStateRisk, in its own words (issue #919)', async () => {
+		const node = daemon.node.getNode();
+		const {
+			createOpenerState
+		} = require('../../src/lightning/channel/channel-state');
+		const { Channel } = require('../../src/lightning/channel/channel');
+		const {
+			ChannelState,
+			DEFAULT_CHANNEL_CONFIG
+		} = require('../../src/lightning/channel/types');
+		const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+		const point = getPublicKey(crypto.randomBytes(32));
+		const bp = {
+			fundingPubkey: point,
+			revocationBasepoint: point,
+			paymentBasepoint: point,
+			delayedPaymentBasepoint: point,
+			htlcBasepoint: point,
+			firstPerCommitmentPoint: point
+		};
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 100_000n,
+			pushMsat: 0n,
+			localConfig: DEFAULT_CHANNEL_CONFIG,
+			localBasepoints: bp,
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		// The shape createReestablish leaves behind when the shachain store
+		// cannot produce the secret it owes: failed with the bare wire error,
+		// and the local fault stamped beside it. Nothing was restored here and
+		// no peer claimed anything, so the refusal must say neither.
+		state.state = ChannelState.ERRORED;
+		state.channelId = crypto.randomBytes(32);
+		state.fundingTxid = crypto.randomBytes(32);
+		state.remoteBasepoints = bp;
+		state.reestablishSecretMissing = true;
+		node
+			.getChannelManager()
+			.restoreChannel(
+				new Channel(state),
+				crypto.randomBytes(33).toString('hex')
+			);
+		const channelId = state.channelId.toString('hex');
+
+		// The recovery status the route serves as `node` reports this origin,
+		// and only this one.
+		const row = node
+			.getRecoveryStatus()
+			.channels.find((c: { channelId: string }) => c.channelId === channelId);
+		expect(row?.status).to.equal('reestablish_secret_missing');
+		expect(row?.reestablishSecretMissing).to.equal(true);
+		expect(row?.restoreRecencyUnproven).to.equal(undefined);
+		expect(row?.reestablishRecencyUnproven).to.equal(undefined);
+
+		const refused = await request(
+			portOf(daemon),
+			'POST',
+			'/channel/forceclose',
+			{ channelId }
+		);
+		expect(refused.status).to.equal(400);
+		expect((refused.body.error as { code: string }).code).to.equal(
+			'INVALID_PARAMS'
+		);
+		const message = (refused.body.error as { message: string }).message;
+		expect(message).to.match(/acceptStaleStateRisk/);
+		// This case, neither of the other two.
+		expect(message).to.match(/could not produce the per-commitment secret/);
+		expect(message).to.match(/local storage is damaged or incomplete/i);
+		expect(message).to.not.match(/Recovery Capsule/);
+		expect(message).to.not.match(/claimed at channel_reestablish/);
+
+		// With the acknowledgement it reaches the engine: a damaged store must
+		// not leave the operator with no exit at all.
+		const accepted = await request(
+			portOf(daemon),
+			'POST',
+			'/channel/forceclose',
+			{ channelId, acceptStaleStateRisk: true }
+		);
+		expect(
+			(accepted.body.error as { message?: string } | undefined)?.message ?? '',
+			'the acknowledgement is not what stops it'
+		).to.not.match(/acceptStaleStateRisk/);
+
+		// Shared daemon: take the fixture channel back out.
+		(
+			node.getChannelManager() as unknown as {
+				channels: Map<string, unknown>;
+			}
+		).channels.delete(channelId);
+	});
 	// The three origins a proven-revocation row can carry: none (issue #915),
 	// the capsule hold (issue #469) and the reestablish hold (issue #907).
 	// The last two have a labelled acknowledgement; this proof has none, and

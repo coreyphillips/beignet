@@ -524,6 +524,12 @@ export interface ISerializedChannelState {
 	// restart must not forget that an AUTOMATIC commitment broadcast is
 	// forbidden.
 	reestablishRecencyUnproven?: boolean;
+	// Issue #919: this node's own shachain store could not produce the
+	// per-commitment secret its channel_reestablish owes the peer. Same hold
+	// as the two flags above, from a local fault. MUST persist - a restart
+	// must not forget that an AUTOMATIC commitment broadcast is forbidden,
+	// and the store cannot recover the secret, so the flag never clears.
+	reestablishSecretMissing?: boolean;
 	// Issues #905 and #915: the peer has shown it holds the revocation for
 	// this row's current commitment, with or without a capsule restore.
 	// MUST persist - a restart must not reopen
@@ -535,15 +541,16 @@ export interface ISerializedChannelState {
 	// refusal.
 	staleCloseRiskAccepted?: boolean;
 	// Recovery 5.6 liveness: the persisted peer-close disposition; the wire
-	// error is regenerated from this on every reconnect. 'restore-unproven'
-	// and 'reestablish-unproven' are DERIVED from the flags above rather than
-	// stamped, so they are never written here; the union carries them so the
-	// two types stay one shape.
+	// error is regenerated from this on every reconnect. 'restore-unproven',
+	// 'reestablish-unproven' and 'reestablish-secret-missing' are DERIVED from
+	// the flags above rather than stamped, so they are never written here; the
+	// union carries them so the two types stay one shape.
 	recoveryCloseReason?:
 		| 'local-data-loss'
 		| 'state-uncertain'
 		| 'restore-unproven'
-		| 'reestablish-unproven';
+		| 'reestablish-unproven'
+		| 'reestablish-secret-missing';
 	// Why WE closed the channel ('user' or an automatic close code).
 	closeReason?: ChannelCloseReason;
 	dlpRemotePerCommitmentPoint?: string | null;
@@ -995,6 +1002,7 @@ export function serializeChannelState(
 		stateUncertain: s.stateUncertain,
 		restoreRecencyUnproven: s.restoreRecencyUnproven,
 		reestablishRecencyUnproven: s.reestablishRecencyUnproven,
+		reestablishSecretMissing: s.reestablishSecretMissing,
 		restoreRevokedRisk: s.restoreRevokedRisk,
 		staleCloseRiskAccepted: s.staleCloseRiskAccepted,
 		preSpliceSpendWatches: s.preSpliceSpendWatches?.length
@@ -1423,6 +1431,7 @@ export function deserializeChannelState(
 		stateUncertain: s.stateUncertain,
 		restoreRecencyUnproven: s.restoreRecencyUnproven,
 		reestablishRecencyUnproven: s.reestablishRecencyUnproven,
+		reestablishSecretMissing: s.reestablishSecretMissing,
 		restoreRevokedRisk: s.restoreRevokedRisk,
 		staleCloseRiskAccepted: s.staleCloseRiskAccepted,
 		preSpliceSpendWatches: s.preSpliceSpendWatches?.length
