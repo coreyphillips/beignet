@@ -281,10 +281,20 @@ export class FforReceiveService {
 			this.host
 				.getStorage()
 				.saveWalletData(KEY, JSON.stringify(this.allocations));
-			// The grant only authorizes OUR outbound funding. It never trusts a
-			// client's unconfirmed funding and never changes inbound trust policy.
-			this.host.getNode().getChannelManager().setFforFundingClient(peer, true);
-			const opened = this.host.openChannel(peer, amount, 0, 2, false, true);
+			// Zero-conf only where the OPERATOR said so. This used to pass a
+			// hardcoded trusted=true and grant itself the authorization to match,
+			// so enabling receive funding silently proposed a zero_conf channel
+			// type to every client, past the operator's trusted-peer set and past
+			// the daemon's own trusted=false default for opens. A plain daemon on
+			// the far side then refuses the open outright ("Proposed zero_conf
+			// channel type requires a trusted peer"), so the bypass was not even
+			// buying the availability it cost. An untrusted client gets an
+			// ordinary confirmed open instead.
+			const trusted = this.host
+				.getNode()
+				.getChannelManager()
+				.isTrustedPeer(peer);
+			const opened = this.host.openChannel(peer, amount, 0, 2, false, trusted);
 			allocation.channelId = opened.channelId;
 			allocation.temporaryId = opened.channelId;
 			this.host
@@ -313,7 +323,6 @@ export class FforReceiveService {
 			throw Error('The receive channel is still being prepared.');
 		} finally {
 			this.opening = false;
-			this.host.getNode().getChannelManager().setFforFundingClient(peer, false);
 		}
 	}
 	async receipts(channelId: string): Promise<void> {

@@ -35,8 +35,10 @@ function fixture(role = 'R') {
 		added.push(p);
 		return { ok: true };
 	};
+	/** The operator's zero-conf trusted set, empty unless a cell grants it. */
+	const trustedPeers = new Set<string>();
 	node.getChannelManager = () => ({
-		setFforFundingClient() {},
+		isTrustedPeer: (p: string) => trustedPeers.has(p),
 		getChannelsByPeer: () => []
 	});
 	const storage = {
@@ -46,10 +48,13 @@ function fixture(role = 'R') {
 		},
 		loadChannel: () => ({ state: { ffor: durable } })
 	};
+	/** Every argument list the allocate path handed to openChannel. */
+	const opened: unknown[][] = [];
 	const host: any = {
 		getNode: () => node,
 		getStorage: () => storage,
-		openChannel: () => {
+		openChannel: (...args: unknown[]) => {
+			opened.push(args);
 			throw Error('funding failed');
 		}
 	};
@@ -82,6 +87,8 @@ function fixture(role = 'R') {
 		response,
 		host,
 		storage,
+		opened,
+		trust: (p: string): Set<string> => trustedPeers.add(p),
 		get durable() {
 			return durable;
 		},
@@ -195,6 +202,39 @@ describe('automatic receive service', () => {
 			}
 		} finally {
 			f.service.stop();
+		}
+	});
+	// The allocate open used to pass a hardcoded trusted=true and grant itself
+	// the matching authorization, so a provider with receive funding enabled
+	// proposed a zero_conf channel type to every client, past the operator's
+	// trusted set. A plain daemon on the far side refuses that outright.
+	it('proposes zero-conf on an allocate open only for a peer the operator trusts', async () => {
+		const request = {
+			op: 'allocate',
+			allocationId: 'cc'.repeat(16),
+			amountSats: 10000
+		};
+		type Allocator = { serve(peer: string, body: unknown): Promise<unknown> };
+		const untrusted = fixture('S');
+		try {
+			await assert.rejects(
+				(untrusted.service as unknown as Allocator).serve(peer, request),
+				/funding failed/
+			);
+			assert.deepEqual(untrusted.opened, [[peer, 60000, 0, 2, false, false]]);
+		} finally {
+			untrusted.service.stop();
+		}
+		const trusted = fixture('S');
+		trusted.trust(peer);
+		try {
+			await assert.rejects(
+				(trusted.service as unknown as Allocator).serve(peer, request),
+				/funding failed/
+			);
+			assert.deepEqual(trusted.opened, [[peer, 60000, 0, 2, false, true]]);
+		} finally {
+			trusted.service.stop();
 		}
 	});
 	it('stopping cancels pending queries', async () => {

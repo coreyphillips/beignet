@@ -1769,7 +1769,12 @@ Most daemon endpoints have a CLI command. HTTP-only exceptions include `GET /eve
 the CLI instead) and `GET /openapi.json` (machine-readable API discovery). The
 deprecated `POST /channel/update-fee` alias is covered by
 `channel update-commitment-feerate`. The app-driven FFOR lifecycle uses
-`/ffor/*` and `/receive/*` directly over HTTP. See
+`/ffor/*` and `/receive/*` directly over HTTP. `GET /receive/quote` answers with
+a `mode` and `POST /receive/invoice` with a matching `kind`: `bolt11` when a
+channel that already exists with that peer can carry the payment offline, and
+`direct-funding` otherwise, which returns a direct-funding `request` instead of
+an invoice. Automatic receiving never opens a channel to obtain inbound
+liquidity. See
 [automatic receiving](../../docs/AUTOMATIC-OFFLINE-RECEIVE.md#daemon-api) for
 the durable invoice preparation and reconciliation API.
 

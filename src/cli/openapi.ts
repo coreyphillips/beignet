@@ -1750,14 +1750,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					summary: 'Durable automatic receive requests and reserved channels',
 					tags: ['FFOR'],
 					responses: {
-						'200': { description: 'available, requests and reservedChannelIds' }
+						'200': {
+							description:
+								"available, reservedChannelIds and requests; each request carries its kind ('bolt11' or 'direct-funding'), and a direct-funding request reserves no channel"
+						}
 					}
 				}
 			},
 			'/receive/quote': {
 				get: {
 					summary:
-						'Quote automatic offline receiving at a connected primary without reserving funds',
+						"Quote automatic offline receiving at a connected primary without reserving funds. Answers mode='bolt11' when a channel that ALREADY exists with this peer can carry the amount offline (NORMAL, usable, no spendable local balance, unreserved, no live epoch, inbound >= amountSats + 50000), otherwise mode='direct-funding', the fallback where a payer's on-chain payment becomes this node's channel funding. This route never opens a channel. The peer must be connected either way",
 					tags: ['FFOR'],
 					parameters: [
 						{
@@ -1774,14 +1777,24 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						}
 					],
 					responses: {
-						'200': { description: 'Amount, sender fee terms and quote expiry' }
+						'200': {
+							description:
+								'available, mode, peer, amountSats, feeSats and expiresAt (60s). bolt11 mode adds the sender fee terms and its minimum is the 354 sat dust limit; direct-funding mode contacts no peer and adds minAmountSat, the configured direct-funding minimum (5000 by default)'
+						},
+						'400': {
+							description:
+								'AMOUNT_TOO_SMALL naming the minimum of the applicable mode, or INVALID_PARAMS'
+						},
+						'409': {
+							description: 'RECEIVE_UNAVAILABLE: the peer is not connected'
+						}
 					}
 				}
 			},
 			'/receive/invoice': {
 				post: {
 					summary:
-						'Prepare and durably save an offline invoice. Retry the same requestId after interrupted creation. Admin scope: may allocate a channel and reserve liquidity. Paid or expired reservations reconcile automatically after restart.',
+						'Prepare and durably save an offline payment request. Retry the same requestId after interrupted creation. With a suitable existing channel this reserves liquidity on it and returns a bolt11 invoice; with none it falls back to direct funding, configuring direct funding for this peer when nothing is configured (an existing config for the same peer is reused untouched, one for a different peer refuses) and minting a direct-funding request. It never opens a channel. Admin scope. Paid or expired reservations reconcile automatically after restart; a direct-funding request reserves nothing and simply expires.',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						peer: 'string',
@@ -1793,7 +1806,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Saved invoice, paymentHash, amountSats, expiresAt and offlineReceive=true'
+								"kind='bolt11' with the saved invoice, paymentHash, amountSats, expiresAt and offlineReceive=true; or kind='direct-funding' with request (the base64url envelope a payer pays), paymentHash (the receipt hash), expiresAt, amountSats, peer and offlineReceive=false. A direct-funding request is idempotent on requestId while unexpired and is replaced under the same id once it expires"
+						},
+						'409': {
+							description:
+								'RECEIVE_UNAVAILABLE: the peer is not connected, or direct funding is configured for a different peer'
 						}
 					}
 				}

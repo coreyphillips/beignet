@@ -26,6 +26,7 @@ import {
 	FforVariant,
 	IFforEpochRecord
 } from '../../src/lightning/ffor/types';
+import { decodeRequestEnvelope } from '../../src/lightning/direct-funding/envelope';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -209,7 +210,7 @@ describe('FFOR surface: routes on a node with no epoch (issue #729)', () => {
 		}
 	});
 
-	it('serves automatic receive status and validates creation before allocating', async () => {
+	it('serves automatic receive status and validates creation before preparing anything', async () => {
 		const status = await request(portOf(daemon), 'GET', '/receive/status');
 		expect(status.status).to.equal(200);
 		expect(status.body.result).to.deep.equal({
@@ -238,6 +239,8 @@ describe('FFOR surface: routes on a node with no epoch (issue #729)', () => {
 			code: 'INVALID_REVIEW',
 			message: 'Review this payment request again.'
 		});
+		// No channel with this peer, so the amount is measured against the
+		// direct-funding minimum and the refusal names it.
 		const small = await request(
 			portOf(daemon),
 			'GET',
@@ -245,6 +248,17 @@ describe('FFOR surface: routes on a node with no epoch (issue #729)', () => {
 		);
 		expect(small.status).to.equal(400);
 		expect(small.body.error).to.deep.include({ code: 'AMOUNT_TOO_SMALL' });
+		expect((small.body.error as { message: string }).message).to.contain(
+			'5000'
+		);
+		// And a peer nobody is connected to refuses in either mode.
+		const away = await request(
+			portOf(daemon),
+			'GET',
+			`/receive/quote?peer=${'02' + '33'.repeat(32)}&amountSats=20000`
+		);
+		expect(away.status).to.equal(409);
+		expect(away.body.error).to.deep.include({ code: 'RECEIVE_UNAVAILABLE' });
 	});
 	it('reports the witness and issuer roles it runs', async () => {
 		const witness = await request(
@@ -880,5 +894,164 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 			expect(post.responses, route).to.have.property('400');
 			expect(post.summary, route).to.match(/acceptStaleStateRisk/);
 		}
+	});
+});
+
+/**
+ * The 2026-09-20 rule: automatic offline receive is only for a channel that
+ * already exists with the peer. With none, the route hands back a direct-funding
+ * request rather than asking the peer to open one, so a wallet can still be paid
+ * without this flow ever opening a channel.
+ */
+describe('automatic receive falls back to direct funding', function () {
+	this.timeout(30_000);
+	let daemon: IStartedDaemon;
+	let dir: string;
+	let port: number;
+	// Real curve points: the request envelope builds a blinded path through the
+	// configured liquidity peer, so a made-up pubkey cannot be minted against.
+	const lsp =
+		'02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5';
+	const stranger =
+		'02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9';
+	let peers: { pubkey: string; host: string; port: number; state: string }[];
+
+	before(async function () {
+		this.timeout(30_000);
+		dir = tmpDir('receive-df');
+		daemon = await startDaemon({ ...OFFLINE, dataDir: dir });
+		port = portOf(daemon);
+		// The route only needs to know the peer is there and where it is: it never
+		// talks to the peer in this mode, which is the point of the fallback.
+		peers = [{ pubkey: lsp, host: '10.0.0.7', port: 9736, state: 'connected' }];
+		sinon.stub(daemon.node, 'listPeers').callsFake(() => peers);
+	});
+
+	after(async function () {
+		this.timeout(30_000);
+		sinon.restore();
+		await daemon.stop();
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('quotes direct funding without contacting the peer', async () => {
+		const res = await request(
+			port,
+			'GET',
+			`/receive/quote?peer=${lsp}&amountSats=120000`
+		);
+		expect(res.status).to.equal(200);
+		const quote = res.body.result as Record<string, unknown>;
+		expect(quote).to.include({
+			available: true,
+			mode: 'direct-funding',
+			peer: lsp,
+			amountSats: 120_000,
+			feeSats: 0,
+			minAmountSat: 5_000
+		});
+		expect(quote).to.not.have.property('terms');
+		expect(quote.expiresAt).to.be.a('number');
+	});
+
+	it('mints a payable request, configures the peer and reserves nothing', async () => {
+		const quoted = await request(
+			port,
+			'GET',
+			`/receive/quote?peer=${lsp}&amountSats=120000`
+		);
+		const body = {
+			peer: lsp,
+			amountSats: 120_000,
+			description: 'coffee',
+			requestId: 'daemon-receive-0001',
+			quote: quoted.body.result
+		};
+		const created = await request(port, 'POST', '/receive/invoice', body);
+		expect(created.status).to.equal(200);
+		const result = created.body.result as Record<string, unknown>;
+		expect(result).to.include({
+			kind: 'direct-funding',
+			peer: lsp,
+			amountSats: 120_000,
+			offlineReceive: false
+		});
+		// What a payer actually gets: an envelope this node signed, for this
+		// amount, carrying the receipt hash the route reported.
+		const env = decodeRequestEnvelope(result.request as string);
+		expect(env.receiverNodeId.toString('hex')).to.equal(
+			daemon.node.getInfo().nodeId
+		);
+		expect(env.amountSat).to.equal(120_000n);
+		expect(env.receiptHash.toString('hex')).to.equal(result.paymentHash);
+
+		// Direct funding now points at this peer, on the address it is connected
+		// on, with every other setting left at its default.
+		const config = await request(port, 'GET', '/direct-funding/config');
+		expect(config.body.result).to.deep.equal({
+			lspPubkey: lsp,
+			lspHost: '10.0.0.7',
+			lspPort: 9736,
+			targetInboundSat: 0,
+			trusted: false,
+			allowSplice: false,
+			allowUnpairedSplice: false,
+			unpairedSpliceDepth: 3,
+			minAmountSat: 5_000
+		});
+
+		// No epoch and no reservation: the job is durable but holds nothing.
+		const status = await request(port, 'GET', '/receive/status');
+		const listed = status.body.result as {
+			reservedChannelIds: string[];
+			requests: Record<string, unknown>[];
+		};
+		expect(listed.reservedChannelIds).to.deep.equal([]);
+		expect(listed.requests).to.have.length(1);
+		expect(listed.requests[0]).to.include({
+			id: 'daemon-receive-0001',
+			kind: 'direct-funding',
+			peer: lsp,
+			amountSats: 120_000
+		});
+		expect(listed.requests[0].channelId).to.equal(undefined);
+		expect(
+			(await request(port, 'GET', '/ffor/epochs')).body.result
+		).to.deep.equal([]);
+
+		// Retrying the same id hands back the same envelope rather than a second.
+		const retry = await request(port, 'POST', '/receive/invoice', body);
+		expect(retry.status).to.equal(200);
+		expect(retry.body.result).to.deep.equal(result);
+	});
+
+	it('refuses a second peer rather than retargeting the configured one', async () => {
+		peers = [
+			...peers,
+			{ pubkey: stranger, host: '10.0.0.8', port: 9737, state: 'connected' }
+		];
+		const quoted = await request(
+			port,
+			'GET',
+			`/receive/quote?peer=${stranger}&amountSats=120000`
+		);
+		expect(quoted.status).to.equal(200);
+		const created = await request(port, 'POST', '/receive/invoice', {
+			peer: stranger,
+			amountSats: 120_000,
+			requestId: 'daemon-receive-0002',
+			quote: quoted.body.result
+		});
+		expect(created.status).to.equal(409);
+		expect(created.body.error).to.deep.include({
+			code: 'RECEIVE_UNAVAILABLE'
+		});
+		expect((created.body.error as { message: string }).message).to.contain(
+			'another peer'
+		);
+		const config = await request(port, 'GET', '/direct-funding/config');
+		expect((config.body.result as { lspPubkey: string }).lspPubkey).to.equal(
+			lsp
+		);
 	});
 });
