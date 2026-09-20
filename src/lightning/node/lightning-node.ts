@@ -625,6 +625,17 @@ const ASYNC_RECEIVE_GRANTS_KEY = 'async_receive_grants';
  * CHANNEL_INDEX_FLOOR_STRIDE), written once.
  */
 const CHANNEL_KEY_INDEX_FLOOR_KEY = 'channel_key_index_floor';
+/**
+ * Metadata key the allocation high-water mark on the channel key index
+ * persists under (issue #917): the highest index deriveKeysForNewChannel
+ * has ever handed out on this database, written at the moment it is handed
+ * out rather than when the channel row lands. Absent on a database that
+ * never allocated one (and on every database written before this key
+ * existed, which simply keeps the pre-#917 behaviour). Monotone: a released
+ * index (see ChannelManager._releaseUnusedChannelIndex) never lowers it,
+ * because it records what MAY have been used, not what was.
+ */
+const CHANNEL_KEY_INDEX_ALLOCATED_KEY = 'channel_key_index_allocated';
 /** Default wait for an LSP's answer to a registration request. */
 const ASYNC_GRANT_REQUEST_TIMEOUT_MS = 30_000;
 /** Grants kept per LSP (newest first); older ones are dropped. */
@@ -898,6 +909,13 @@ export class LightningNode extends EventEmitter {
 	 * that, and on every later boot.
 	 */
 	private channelIndexFloorPending = false;
+	/**
+	 * Issue #917: the highest channel key index this node has recorded as
+	 * handed out, seeded from CHANNEL_KEY_INDEX_ALLOCATED_KEY at boot and
+	 * raised by every derivation. Keeps the durable row monotone and saves
+	 * the write when an index that was handed back is handed out again.
+	 */
+	private channelIndexAllocationMark = 0;
 	/** FFOR D-R receipt witness (section 9.6), when this node serves as one. */
 	private fforWitness: FforWitnessService | null = null;
 	/** FFOR BOLT 12 issuer (section 9.7), co-hosted with the witness. */
@@ -1637,6 +1655,12 @@ export class LightningNode extends EventEmitter {
 			chainHash: config.chainHashes?.[0] ?? this.chainHash(),
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
+			// Issue #917: every index the manager hands out is durable before
+			// anything derived from it can reach the wire. Throws when the
+			// write fails, which refuses that open rather than letting a
+			// crash hand the index out a second time.
+			onChannelIndexAllocated: (channelIndex: number): void =>
+				this.recordChannelIndexAllocation(channelIndex),
 			newChannelsRefused: config.newChannelsRefused,
 			signerFactory: config.signerFactory,
 			// Recovery 5.8: in quorum mode this holds a batch's remaining
@@ -2637,6 +2661,26 @@ export class LightningNode extends EventEmitter {
 		if (nextChannelIndex > this.channelManager.nextChannelIndex) {
 			this.channelManager.nextChannelIndex = nextChannelIndex;
 		}
+		// Issue #917: the allocation high-water mark, beside the table's own.
+		// The table records an index when the CHANNEL ROW lands; this row
+		// records it when the index is handed out, which is the only record
+		// an open that reached the wire and then died leaves behind. Seeding
+		// from max(table, mark + 1) is what keeps the next boot above every
+		// index this database ever handed out, used or abandoned. Validated
+		// like the floor below: a row that is not a positive number is no
+		// record at all and leaves the counter to the other sources. The
+		// setter only ever raises, so nothing here can lower the counter.
+		const allocationRow = this.storage.loadMetadata(
+			CHANNEL_KEY_INDEX_ALLOCATED_KEY
+		);
+		const parsedMark =
+			allocationRow === null ? NaN : parseInt(allocationRow, 10);
+		this.channelIndexAllocationMark =
+			Number.isFinite(parsedMark) && parsedMark > 0 ? parsedMark : 0;
+		if (this.channelIndexAllocationMark > 0) {
+			this.channelManager.nextChannelIndex =
+				this.channelIndexAllocationMark + 1;
+		}
 		// Issue #906: with NO key-index row at all there is no high-water mark
 		// to seed from, and a counter left at 1 would hand the next channel,
 		// opened or accepted, the keys of whichever channel a previous device
@@ -2652,6 +2696,12 @@ export class LightningNode extends EventEmitter {
 		// one whose top index is 0 (both answer 1 above) by the existence
 		// query, with the enumerator and then the answer itself standing in
 		// for backends that lack it.
+		// An allocation mark (#917) does not suppress the floor and must
+		// not: the floor only ever RAISES the counter, so it cannot floor
+		// below the mark seeded above, and an empty table with no floor row
+		// still means this database has no record of what a previous DEVICE
+		// handed out, which is what the floor answers. The mark answers the
+		// narrower question of what THIS database handed out.
 		const keyIndexTableEmpty = this.storage.hasChannelKeyIndices
 			? !this.storage.hasChannelKeyIndices()
 			: this.storage.loadAllChannelKeyIndices
@@ -24703,6 +24753,58 @@ export class LightningNode extends EventEmitter {
 		);
 		if (written) this.channelIndexFloorPending = false;
 		return written;
+	}
+
+	/**
+	 * Issue #917: record that the channel manager is handing out
+	 * `channelIndex`, BEFORE anything derived from it can leave this node.
+	 *
+	 * The key-index table only learns an index when the channel ROW
+	 * persists, which is well after accept_channel (or our own open_channel,
+	 * funding_created, funding_signed) put that index's basepoints in front
+	 * of the peer, and for an open the process does not survive it never
+	 * learns it at all. The next boot then re-handed the same index out, and
+	 * the next channel carried the funding key, the four basepoints and the
+	 * per-commitment seed of the one the peer had already seen: issue #906's
+	 * reuse with a crash as its cause rather than a restore. The chain-tip
+	 * floor does not cover it, because it fires once per database and a
+	 * crash does not make the database new.
+	 *
+	 * Monotone by construction: a lower index (one handed back by
+	 * _releaseUnusedChannelIndex and handed out again) writes nothing, so a
+	 * rejected inbound open leaves the mark at the value it consumed. The
+	 * cost is a one-index hole in the sequence across a restart, which is
+	 * nothing; the alternative, lowering the mark, is the reuse itself.
+	 *
+	 * THROWS when the row cannot be written. Returning normally is the
+	 * promise the manager acts on, so a failed write must refuse the open
+	 * instead: the throw lands with the counter untouched, an outbound
+	 * caller sees it and an inbound one is contained by handleMessage, and
+	 * no index is burned either way. A node with no storage keeps today's
+	 * behaviour, since it has no durable record of anything to contradict.
+	 *
+	 * @param channelIndex - The index about to be handed out
+	 */
+	private recordChannelIndexAllocation(channelIndex: number): void {
+		if (!this.storage) return;
+		if (!Number.isFinite(channelIndex) || channelIndex < 1) return;
+		if (channelIndex <= this.channelIndexAllocationMark) return;
+		const written = this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(
+					CHANNEL_KEY_INDEX_ALLOCATED_KEY,
+					String(channelIndex)
+				),
+			'saveChannelKeyIndexAllocation'
+		);
+		if (!written) {
+			throw new Error(
+				`cannot record channel key index ${channelIndex} durably: a new ` +
+					`channel is refused rather than risk handing this index out ` +
+					`again after a restart`
+			);
+		}
+		this.channelIndexAllocationMark = channelIndex;
 	}
 
 	/**

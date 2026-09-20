@@ -341,6 +341,31 @@ export interface IChannelManagerConfig {
 	 */
 	channelKeyDeriver?: (channelIndex: number) => IPerChannelKeys;
 	/**
+	 * Record that `channelIndex` has been handed out (issue #917), called
+	 * inside deriveKeysForNewChannel BEFORE the counter advances and before
+	 * any key is derived from it, so the allocation is durable before
+	 * anything carrying those keys (accept_channel, open_channel,
+	 * funding_created, funding_signed) can leave the node.
+	 *
+	 * Until this existed, an index was recorded durably only when the
+	 * channel ROW persisted, and an open killed between the wire and that
+	 * row handed the same index to the next channel: the same funding key,
+	 * the same basepoints and the same per-commitment seed the peer had
+	 * already seen, which is the reuse #906 describes with the crash as its
+	 * cause instead of a restore.
+	 *
+	 * MUST be synchronous and MUST throw if the allocation could not be made
+	 * durable. A throw refuses the derivation with the counter untouched, so
+	 * nothing is burned and nothing reaches the wire; returning normally is
+	 * the promise that a restart will not hand this index out again. The
+	 * implementation must be monotone: an index handed back by
+	 * _releaseUnusedChannelIndex is NOT un-recorded, and a later, lower
+	 * index must never lower the record. Unset, nothing is recorded and the
+	 * pre-#917 behaviour stands (a node with no storage has no durability
+	 * to add).
+	 */
+	onChannelIndexAllocated?: (channelIndex: number) => void;
+	/**
 	 * Fence on brand-new channels (issue #906). Consulted by every path that
 	 * would consume a fresh channel key index, the inbound acceptors
 	 * included, and read anew each time. A non-null answer is the reason the
@@ -910,6 +935,15 @@ export class ChannelManager extends EventEmitter {
 	 * wire, which for an acceptor means no accept_channel/accept_channel2
 	 * was emitted (our basepoints leave the node in nothing else), and the
 	 * shared-keys fallback (index 0, no counter moved) never qualifies.
+	 *
+	 * IN MEMORY ONLY (issue #917). The durable allocation record
+	 * (onChannelIndexAllocated) is monotone and is never lowered here: it
+	 * says which indices may have been handed out, and a release is the
+	 * weaker claim that this one was not used. So a rejected open costs
+	 * nothing while the process lives (the floor's per-block budget is
+	 * intact, which is what this release is for) and costs one index in the
+	 * sequence across a restart, which is harmless: a gap in the indices is
+	 * only a gap, while a repeat is key reuse.
 	 */
 	private _releaseUnusedChannelIndex(index: number): void {
 		if (index < 1) return;
@@ -976,7 +1010,18 @@ export class ChannelManager extends EventEmitter {
 		const refusal = this._newChannelRefusal();
 		if (refusal) throw new Error(refusal);
 		if (this.config.channelKeyDeriver) {
-			const idx = this._nextChannelIndex++;
+			const idx = this._nextChannelIndex;
+			// Issue #917: the allocation is made durable HERE, before the
+			// counter moves and before a single key is derived from the
+			// index, because everything downstream of this line can put our
+			// basepoints on the wire (accept_channel, open_channel,
+			// funding_created, funding_signed) while the channel ROW that
+			// used to be the only durable record of the index lands later,
+			// or never. A hook that throws refuses the derivation with the
+			// counter still standing where it was, which burns nothing: the
+			// same contract the fence above relies on.
+			this.config.onChannelIndexAllocated?.(idx);
+			this._nextChannelIndex = idx + 1;
 			const keys = this.config.channelKeyDeriver(idx);
 			return {
 				basepoints: keys.basepoints,
