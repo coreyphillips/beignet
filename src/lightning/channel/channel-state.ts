@@ -980,6 +980,32 @@ export interface IChannelState {
 	 */
 	reestablishRecencyUnproven?: boolean;
 	/**
+	 * The peer has PROVEN it holds the revocation for this row's CURRENT
+	 * local commitment (issues #905 and #915). Despite the historical field
+	 * name, no capsule restore is required. Set by handleReestablish when
+	 * next_revocation_number is exactly localCommitmentNumber + 1 and the
+	 * validator above it has already pinned your_last_per_commitment_secret
+	 * to our real secret at index localCommitmentNumber: the peer counts a
+	 * revoke_and_ack this row never recorded sending, and only a peer we
+	 * revoked THAT commitment to can hold that secret. A wrong or all-zero
+	 * secret never reaches the setter, because issue #907's validator fails
+	 * the channel on it first. The holds above describe a RISK the operator
+	 * may accept; this is a certainty, so it joins
+	 * mustNotBroadcastCommitment, which no acknowledgement overrides, and it
+	 * holds the cooperative close too: the row's balances are one round
+	 * stale, and an ahead peer can propose a split that favours it.
+	 *
+	 * Not permanent, and it must not be: the row still RESUMES, because the
+	 * peer's retransmitted commitment_signed is what levels it. When we then
+	 * send the revoke_and_ack for the flagged commitment, the secret we
+	 * reveal is the one the peer already holds, localCommitmentNumber moves
+	 * to an index whose secret is unreleased, and the flag is cleared in the
+	 * same persisted batch. Leaving it set would disarm a healthy channel's
+	 * HTLC deadline backstops for the rest of its life. MUST persist: a
+	 * restart must not forget it.
+	 */
+	restoreRevokedRisk?: boolean;
+	/**
 	 * The operator's labelled acknowledgement (RECOVERY-PROTOCOL 5.6) that a
 	 * mutual close of this capsule-restored channel may sign away balances the
 	 * row cannot prove current (issue #469). Stamped only by initiateShutdown
@@ -1262,17 +1288,23 @@ export function createAcceptorState(params: {
 
 /**
  * The recovery never-broadcast invariant (docs/RECOVERY-PROTOCOL.md 5.6):
- * a channel whose state is proven stale (dataLossDetected) or cannot be
- * proven current (stateUncertain) must never broadcast its stored local
- * commitment, even if the peer stays unreachable indefinitely. Every
- * force-close, rebroadcast and fee-bump decision consults this ONE
- * predicate so the two flags can never drift apart.
+ * a channel whose state is proven stale (dataLossDetected), cannot be
+ * proven current (stateUncertain), or whose current commitment the peer
+ * has shown it holds the revocation for (restoreRevokedRisk, issue #905)
+ * must never broadcast its stored local commitment, even if the peer stays
+ * unreachable indefinitely. Every force-close, rebroadcast and fee-bump
+ * decision consults this ONE predicate so the flags can never drift apart.
  */
 export function mustNotBroadcastCommitment(state: {
 	dataLossDetected?: boolean;
 	stateUncertain?: boolean;
+	restoreRevokedRisk?: boolean;
 }): boolean {
-	return state.dataLossDetected === true || state.stateUncertain === true;
+	return (
+		state.dataLossDetected === true ||
+		state.stateUncertain === true ||
+		state.restoreRevokedRisk === true
+	);
 }
 
 /**

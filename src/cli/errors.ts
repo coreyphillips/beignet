@@ -35,6 +35,15 @@ export enum BeignetErrorCode {
 	CHANNEL_NOT_FOUND = 'CHANNEL_NOT_FOUND',
 	CLOSE_FAILED = 'CLOSE_FAILED',
 	FORCE_CLOSE_FAILED = 'FORCE_CLOSE_FAILED',
+	/**
+	 * The peer has proven, in channel_reestablish, that it holds the
+	 * revocation for this channel's stored commitment (issues #905 and #915),
+	 * so no force close of it may be broadcast: not an automatic one, and not
+	 * the operator's acknowledged one either, because acceptStaleStateRisk
+	 * accepts a risk and this is a certainty. 409, not 400: nothing in the
+	 * request changes the answer.
+	 */
+	FORCE_CLOSE_REVOKED = 'FORCE_CLOSE_REVOKED',
 	ZERO_CONF_FAILED = 'ZERO_CONF_FAILED',
 
 	// Peers
