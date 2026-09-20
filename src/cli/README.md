@@ -495,7 +495,11 @@ BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS=120000   # never wait longer than this; 
   `beignet channel forceclose <id> --accept-stale-state-risk`
   (`POST /channel/forceclose` with `acceptStaleStateRisk: true`) accepts
   that publishing a commitment the peer may already have revoked forfeits
-  the whole channel balance. Both are refused without the flag.
+  the whole channel balance. Both are refused without the flag. The FFOR
+  enforcement routes publish the same commitment and take the same flag:
+  `POST /ffor/enforce`, and `POST /ffor/recover` with
+  `forceCloseIfUnreachable: true`, are refused on such a channel without
+  `acceptStaleStateRisk: true` (issue #908).
 
   The same hold has a second origin (issue #907): a peer whose
   `channel_reestablish` claims this node is behind (a `next_revocation_number`
@@ -519,6 +523,11 @@ BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS=120000   # never wait longer than this; 
   channel into the reestablish hold at no cost, and only an operator can
   take it out before a CLTV deadline passes, so these are the events to
   alert on.
+
+  The same acknowledgement is required on those FFOR routes for the
+  reestablish origin. The `ffor:enforce` event carries
+  `restoreRecencyUnproven: true`, `reestablishRecencyUnproven: true`, or
+  both, matching the channel's holds, so the embedder knows to ask.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.

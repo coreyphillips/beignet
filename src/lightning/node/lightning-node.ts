@@ -250,6 +250,7 @@ import {
 } from '../swaps';
 import {
 	INodeConfig,
+	InvalidRequestError,
 	IResourceConfig,
 	IPaymentInfo,
 	ICreateInvoiceOptions,
@@ -17317,6 +17318,8 @@ export class LightningNode extends EventEmitter {
 		channelIdHex: string,
 		opts: {
 			forceCloseIfUnreachable?: boolean;
+			/** Required to force-close a channel with either recency hold. */
+			acceptStaleStateRisk?: boolean;
 			destinationScript?: Buffer;
 			timeoutMs?: number;
 		} = {}
@@ -17358,6 +17361,20 @@ export class LightningNode extends EventEmitter {
 			return { preimagesKnown, witnesses, action: 'nothing' };
 		}
 		if (opts.forceCloseIfUnreachable && opts.destinationScript) {
+			// A reestablish hold can arrive during the witness fetch above.
+			// Check the current state immediately before building a commitment,
+			// including direct library calls that have no daemon preflight.
+			const current = this.channelManager.getChannel(channelId);
+			if (
+				current &&
+				isRecencyUnproven(current.getFullState()) &&
+				opts.acceptStaleStateRisk !== true
+			) {
+				throw new InvalidRequestError(
+					'Force closing a channel with unproven recency requires ' +
+						'acceptStaleStateRisk: true'
+				);
+			}
 			const res = this.channelManager.forceClose(
 				channelId,
 				opts.destinationScript,

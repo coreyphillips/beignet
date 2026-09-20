@@ -2770,9 +2770,17 @@ async function bootDaemon(
 				await node.fforRecover(body as Parameters<typeof node.fforRecover>[0])
 			),
 		'POST /ffor/enforce': (body) => {
-			const { channelId } = body as { channelId?: string };
+			const { channelId, acceptStaleStateRisk } = body as {
+				channelId?: string;
+				acceptStaleStateRisk?: boolean;
+			};
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
-			return success(node.fforEnforce(channelId));
+			// Strict boolean, the rule /channel/forceclose uses: this route
+			// publishes the same commitment, so a capsule-restored channel
+			// needs the same acknowledgement (issue #908).
+			return success(
+				node.fforEnforce(channelId, acceptStaleStateRisk === true)
+			);
 		},
 		'POST /ffor/witness/close': async (body) => {
 			const { channelId } = body as { channelId?: string };
