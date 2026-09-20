@@ -60,6 +60,13 @@ const SWEEP_SCRIPT = Buffer.concat([
 const VALIDATOR_ERROR = 'Invalid per-commitment secret in channel_reestablish';
 const PEER_CLOSE_REQUEST = 'without the per-commitment secret proving it';
 
+/** A node:error as the cells here read it. */
+interface IHeldDeadlineError {
+	code: string;
+	message: string;
+	channelId?: Buffer;
+}
+
 /** The per-block scans and the timeout, private on the node. */
 interface IScanAccess {
 	reestablishTimeoutBlocks: number;
@@ -84,6 +91,8 @@ interface IFixture {
 	channelId: Buffer;
 	/** node:error codes Alice emitted. */
 	events: string[];
+	/** The same node:error events, whole, for the cells that read them. */
+	errorEvents: IHeldDeadlineError[];
 	/** category:action of every structured log Alice emitted. */
 	logs: string[];
 	/** The same logs, whole, for the cells that read their data. */
@@ -114,10 +123,14 @@ function setup(seedBase: number): IFixture {
 			Buffer.alloc(1366)
 		);
 	const events: string[] = [];
+	const errorEvents: IHeldDeadlineError[] = [];
 	const logs: string[] = [];
 	const records: IStructuredLog[] = [];
 	const errorsSent: string[] = [];
-	alice.on('node:error', (err: { code: string }) => events.push(err.code));
+	alice.on('node:error', (err: IHeldDeadlineError) => {
+		events.push(err.code);
+		errorEvents.push(err);
+	});
 	alice.on('log', (log: IStructuredLog) => {
 		logs.push(`${log.category}:${log.action}`);
 		records.push(log);
@@ -135,6 +148,7 @@ function setup(seedBase: number): IFixture {
 		bob,
 		channelId,
 		events,
+		errorEvents,
 		logs,
 		records,
 		errorsSent,
@@ -317,6 +331,60 @@ describe('Issue #907: a wrong secret at an unreleased index is held, never close
 				.length,
 			'each backstop declined through the hold, not by accident'
 		).to.be.at.least(skipsBefore + 2);
+		expect(fx.state().state).to.equal(ChannelState.ERRORED);
+
+		// ...and each skip SAYS so on the event stream. A peer put this row in
+		// the hold, the HTLCs were already on it, and the only exit is an
+		// operator acting before the expiry, so the structured log alone
+		// (enough under issue #469, where only our own restore could enter the
+		// hold) would let the value go with no event ever raised.
+		const held = fx.errorEvents.filter((e) => e.code === 'HTLC_DEADLINE_HELD');
+		expect(held.length, 'one notice per held backstop').to.equal(2);
+		const idHex = fx.channelId.toString('hex');
+		for (const notice of held) {
+			expect(notice.channelId?.equals(fx.channelId)).to.equal(true);
+			expect(notice.message).to.include(idHex);
+			// The expiry, the height, which hold, and the labelled exit.
+			expect(notice.message).to.include('500');
+			expect(notice.message).to.include('600');
+			expect(notice.message).to.include('reestablish recency hold');
+			expect(notice.message).to.include('channel_reestablish');
+			expect(notice.message).to.include('acceptStaleStateRisk: true');
+			expect(notice.message).to.not.include('Recovery Capsule');
+		}
+		expect(
+			held.some((e) => e.message.includes('HTLC_EXPIRY_FORCE_CLOSE')),
+			'the offered-expiry backstop named itself'
+		).to.equal(true);
+		expect(
+			held.some((e) => e.message.includes('HTLC_CLAIM_FORCE_CLOSE')),
+			'the inbound-claim backstop named itself'
+		).to.equal(true);
+		const offered = held.find((e) =>
+			e.message.includes('HTLC_EXPIRY_FORCE_CLOSE')
+		)!;
+		expect(offered.message).to.include(
+			(fx.state().htlcs.get('offered-7')!.paymentHash as Buffer).toString('hex')
+		);
+
+		// Throttled: the scans run once per block for as long as the hold
+		// stands, so the next block adds nothing...
+		scan.scanExpiringOfferedHtlcs(601);
+		scan.scanExpiringHtlcs(601);
+		expect(
+			fx.errorEvents.filter((e) => e.code === 'HTLC_DEADLINE_HELD').length,
+			'the same HTLC and backstop do not re-announce on every block'
+		).to.equal(2);
+		// ...but the notice returns once the interval has passed, so a hold
+		// standing for weeks keeps reminding the operator.
+		scan.scanExpiringOfferedHtlcs(610);
+		scan.scanExpiringHtlcs(610);
+		expect(
+			fx.errorEvents.filter((e) => e.code === 'HTLC_DEADLINE_HELD').length,
+			'the reminder returns after the throttle interval'
+		).to.equal(4);
+		expect(fx.events).to.not.include('HTLC_EXPIRY_FORCE_CLOSE');
+		expect(fx.events).to.not.include('HTLC_CLAIM_FORCE_CLOSE');
 		expect(fx.state().state).to.equal(ChannelState.ERRORED);
 		fx.destroy();
 	});

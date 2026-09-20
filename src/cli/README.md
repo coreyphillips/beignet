@@ -508,6 +508,17 @@ BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS=120000   # never wait longer than this; 
   the same labelled acknowledgement,
   `beignet channel forceclose <id> --accept-stale-state-risk`, refused
   without it with wording for this case.
+
+  Either hold disarms the on-chain HTLC deadline backstops, so each one
+  that declines to close announces it: a `node:error` with code
+  `HTLC_DEADLINE_HELD` (on the SSE stream and the `onError` callback),
+  carrying the channel, the HTLC id and payment hash, its `cltv_expiry`,
+  the current height, which hold it is and the acknowledged force close
+  that is the exit. Throttled per HTLC per backstop, roughly hourly, so a
+  hold standing for weeks does not flood the stream. A peer can put a
+  channel into the reestablish hold at no cost, and only an operator can
+  take it out before a CLTV deadline passes, so these are the events to
+  alert on.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.

@@ -8887,6 +8887,15 @@ export class Channel {
 		// the connection with "bad future last_local_per_commit_secret: N vs
 		// N-1" and force-closes.
 		const revocationCount = this._remoteRevocationCount();
+		// The Buffer.alloc(32) fallback below puts 32 zero bytes on the wire
+		// when the shachain store has no secret at revocationCount - 1, which
+		// BOLT 2 permits only at next_revocation_number 0. A peer that
+		// enforces that fails the channel on it: CLN on the connection, and
+		// this implementation since issue #907 (on chain at or below its own
+		// localCommitmentNumber, under the recency hold above it). A missing
+		// secret is a local storage fault, so announcing it locally is
+		// probably better than sending a value that reads as a protocol
+		// violation; see the follow-up issue filed with PR #912.
 		const lastSecret =
 			revocationCount > 0n
 				? this._state.shaChainStore.getSecret(
