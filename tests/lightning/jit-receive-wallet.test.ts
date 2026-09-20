@@ -143,7 +143,11 @@ function isMintedScid(scid: Buffer): boolean {
 }
 
 /** A NORMAL channel with inbound, so a blinded path can be built from it. */
-function injectNormalChannel(node: LightningNode, peerHex?: string): void {
+function injectNormalChannel(
+	node: LightningNode,
+	peerHex?: string,
+	channelState: ChannelState = ChannelState.NORMAL
+): void {
 	const channelId = crypto.randomBytes(32);
 	const peerPubkey = peerHex
 		? Buffer.from(peerHex, 'hex')
@@ -158,7 +162,7 @@ function injectNormalChannel(node: LightningNode, peerHex?: string): void {
 		localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 		localPerCommitmentSeed: crypto.randomBytes(32)
 	});
-	state.state = ChannelState.NORMAL;
+	state.state = channelState;
 	state.channelId = channelId;
 	// The SCID a peer resolves is the alias the PEER sent us (BOLT 2).
 	state.remoteScidAlias = encodeShortChannelId({
@@ -489,6 +493,35 @@ describe('JIT receive wallet side (issue #595)', function () {
 			result.paymentHash.toString('hex')
 		) as IInvoiceInfo;
 		expect(record.jitFee, 'and the fee allowance').to.not.equal(undefined);
+	});
+
+	// A home channel mid-splice is still the home channel. The intercept hint
+	// minted beside it is the same second channel by another door: a payer
+	// that picks it has the LSP open a new channel to a wallet whose existing
+	// one is only waiting for its splice to lock.
+	it('carries no intercept hint while the home channel is mid-splice', async () => {
+		const pair = nodePair();
+		open.push(pair);
+		injectNormalChannel(
+			pair.bob,
+			pair.alice.getNodeId(),
+			ChannelState.SPLICING
+		);
+		const result = await pair.bob.createJitInvoice({
+			lspPubkeyHex: pair.alice.getNodeId(),
+			amountMsat: 5_000_000n,
+			description: 'while the home channel splices'
+		});
+		const decoded = decode(result.bolt11);
+		const hops = (decoded.routingHints ?? []).flat();
+		expect(
+			hops.some((hop) => hop.shortChannelId.equals(result.interceptScid)),
+			'no intercept hint'
+		).to.equal(false);
+		expect(
+			isMintedScid(result.interceptScid),
+			'the intent was registered all the same'
+		).to.equal(true);
 	});
 
 	it('keeps the intercept hint out of a blinded invoice', async () => {

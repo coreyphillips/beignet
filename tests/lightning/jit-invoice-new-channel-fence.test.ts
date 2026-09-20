@@ -48,13 +48,13 @@ function fixture(): { dir: string; node: LightningNode } {
 	return { dir, node };
 }
 
-/** Stand in for a usable channel with the LSP, the invoice's own predicate. */
+/** Stand in for a live channel with the LSP, the invoice's own predicate. */
 function pretendChannelWith(node: LightningNode, pubkey: string): void {
 	(
 		node as unknown as {
-			usableChannelWith(peer: string): unknown;
+			liveChannelWith(peer: string): unknown;
 		}
-	).usableChannelWith = (peer: string): unknown =>
+	).liveChannelWith = (peer: string): unknown =>
 		peer === pubkey ? { id: 'stand-in' } : null;
 }
 

@@ -20339,7 +20339,7 @@ export class LightningNode extends EventEmitter {
 		// Asked of the SAME predicate the hint decision below uses: over an
 		// existing usable channel the payment needs no new channel at all and
 		// nothing here applies.
-		if (!this.usableChannelWith(opts.lspPubkeyHex)) {
+		if (!this.liveChannelWith(opts.lspPubkeyHex)) {
 			const refusal = this.channelManager.newChannelRefusal();
 			if (refusal) {
 				throw new Error(
@@ -20362,14 +20362,18 @@ export class LightningNode extends EventEmitter {
 			...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
 			acceptsSkimmedFee: opts.feeMode !== 'hop'
 		});
-		// Over an existing usable channel with the LSP the invoice routes the
-		// way any private-channel invoice does (the channel's own hint is
-		// already built below): the intent still stands, and a payment that
-		// outgrows the channel is refused at the LSP's addHtlc and held while
-		// it splices the channel bigger (tryHoldForSplice). Carrying the
+		// Over an existing channel with the LSP the invoice routes the way
+		// any private-channel invoice does (the channel's own hint is already
+		// built below): the intent still stands, and a payment that outgrows
+		// the channel is refused at the LSP's addHtlc and held while it
+		// splices the channel bigger (tryHoldForSplice). Carrying the
 		// intercept hint alongside had payers pick it and the LSP open a
 		// SECOND channel to a wallet that already had one.
-		const existing = this.usableChannelWith(opts.lspPubkeyHex);
+		//
+		// A channel mid-splice counts: it is still the home channel, it still
+		// receives under its pre-splice scid, and an intercept hint minted
+		// while it splices is the same second channel by another door.
+		const existing = this.liveChannelWith(opts.lspPubkeyHex);
 		const result = this.createInvoice({
 			amountMsat: opts.amountMsat,
 			description: opts.description ?? '',
@@ -24711,6 +24715,28 @@ export class LightningNode extends EventEmitter {
 		for (const channel of this.listChannels()) {
 			if (channel.peerPubkey !== peerHex) continue;
 			if (channel.state !== ChannelState.NORMAL) continue;
+			return channel.channelId;
+		}
+		return null;
+	}
+
+	/**
+	 * A channel with this peer that exists and will go on existing: NORMAL,
+	 * or NORMAL underneath a splice. The JIT receive decisions ask this, not
+	 * `usableChannelWith`: a wallet whose home channel is mid-splice needs no
+	 * second one, so its invoice must not carry the intercept hint and the
+	 * new-channel fence does not apply to it. A splice-in needs the channel
+	 * NORMAL, which is why the direct-funding receiver keeps the other.
+	 */
+	private liveChannelWith(peerHex: string): Buffer | null {
+		for (const channel of this.listChannels()) {
+			if (channel.peerPubkey !== peerHex) continue;
+			if (
+				channel.state !== ChannelState.NORMAL &&
+				channel.state !== ChannelState.SPLICING
+			) {
+				continue;
+			}
 			return channel.channelId;
 		}
 		return null;
