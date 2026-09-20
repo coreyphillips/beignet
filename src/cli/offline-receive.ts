@@ -1,25 +1,59 @@
-import { Buffer } from 'buffer';
-import { randomBytes } from 'crypto';
 import type { BeignetNode } from './beignet-node';
 import { BeignetError } from './errors';
 import { DEFAULT_CHANNEL_CONFIG } from '../lightning/channel/types';
+
+/**
+ * Which route a receive request took.
+ *
+ * 'bolt11' is the FFOR offline-receive lane: a channel that ALREADY exists with
+ * the peer carries the payment while this wallet is closed. 'direct-funding' is
+ * the fallback for when no such channel exists: the payer's on-chain payment
+ * becomes this node's channel funding and the liquidity peer opens the channel
+ * to us. Automatic offline receive never opens a channel of its own.
+ */
+export type OfflineReceiveKind = 'bolt11' | 'direct-funding';
 
 export type OfflineReceiveJob = {
 	id: string;
 	peer: string;
 	amountSats: number;
-	allocationId: string;
+	/** Absent on jobs written before the two routes existed: those are bolt11. */
+	kind?: OfflineReceiveKind;
+	/**
+	 * Dead field kept only so a job persisted by an older build still loads. The
+	 * receiver no longer asks a peer to fund a channel for it.
+	 */
+	allocationId?: string;
 	channelId?: string;
 	epochId?: string;
 	previousEpochId?: string;
 	expiresAt?: number;
 	invoice?: any;
+	/** direct-funding only: the envelope a payer pays, and its receipt hash. */
+	request?: string;
+	paymentHash?: string;
 	done?: boolean;
 };
 const live = (e: any) => e && !['CLOSED', 'ABORTED'].includes(e.state);
 const fail = (code: string, message: string): never => {
 	throw new BeignetError(code, message);
 };
+/**
+ * What a direct-funded request answers with. `offlineReceive` is false because
+ * nothing is held open on our side while the payer decides: the envelope simply
+ * expires.
+ */
+export type OfflineReceiveResult = {
+	kind: 'direct-funding';
+	request?: string;
+	paymentHash?: string;
+	expiresAt?: number;
+	amountSats: number;
+	peer: string;
+	offlineReceive: false;
+};
+/** A job with no kind predates the split and is a bolt11 job. */
+const kindOf = (j: OfflineReceiveJob): OfflineReceiveKind => j.kind ?? 'bolt11';
 export class OfflineReceive {
 	private jobs: OfflineReceiveJob[];
 	private creating = false;
@@ -38,11 +72,19 @@ export class OfflineReceive {
 					!j ||
 					typeof j.id !== 'string' ||
 					!/^[a-f0-9]{66}$/.test(j.peer) ||
-					!/^[a-f0-9]{32}$/.test(j.allocationId) ||
+					(j.kind !== undefined &&
+						j.kind !== 'bolt11' &&
+						j.kind !== 'direct-funding') ||
+					// Optional now: a request that never asked a peer to fund a channel
+					// has no allocation, but a journal written before that is still read.
+					(j.allocationId !== undefined &&
+						!/^[a-f0-9]{32}$/.test(j.allocationId)) ||
 					!Number.isSafeInteger(j.amountSats) ||
 					j.amountSats <= 0 ||
 					(j.channelId !== undefined && !/^[a-f0-9]{64}$/.test(j.channelId)) ||
-					(j.epochId !== undefined && !/^[a-f0-9]{64}$/.test(j.epochId))
+					(j.epochId !== undefined && !/^[a-f0-9]{64}$/.test(j.epochId)) ||
+					(j.request !== undefined && typeof j.request !== 'string') ||
+					(j.paymentHash !== undefined && !/^[a-f0-9]{64}$/.test(j.paymentHash))
 			)
 		)
 			throw Error('Invalid receive journal');
@@ -58,7 +100,9 @@ export class OfflineReceive {
 		return {
 			available: !this.stopped,
 			reservedChannelIds: [...this.reservedIds()],
-			requests: this.jobs.map((j) => ({ ...j }))
+			// kind is filled in on read so a host never has to know that an older
+			// journal left it out.
+			requests: this.jobs.map((j) => ({ ...j, kind: kindOf(j) }))
 		};
 	}
 	private persist() {
@@ -71,10 +115,61 @@ export class OfflineReceive {
 	}
 	reservedIds(): Set<string> {
 		return new Set(
-			this.jobs.filter((j) => !j.done && j.channelId).map((j) => j.channelId!)
+			this.jobs
+				.filter((j) => kindOf(j) === 'bolt11' && !j.done && j.channelId)
+				.map((j) => j.channelId!)
 		);
 	}
-	async quote(peer: string, amountSats: number): Promise<any> {
+	/**
+	 * The one channel this peer could carry the payment on while we are closed.
+	 *
+	 * Never a channel holding spendable local money: that money stays available
+	 * to the ordinary send and channelize paths. Never one another request has
+	 * already reserved, and never one with a live epoch on it. The same search
+	 * decides the quote's mode and the invoice's route, so the two agree.
+	 */
+	private suitableChannel(
+		peer: string,
+		amountSats: number
+	): string | undefined {
+		const reserved = this.reservedIds();
+		return this.node
+			.listChannels()
+			.find(
+				(c) =>
+					c.peerPubkey === peer &&
+					c.state === 'NORMAL' &&
+					c.htlcUsable &&
+					c.localBalanceSats === 0 &&
+					c.remoteBalanceSats >= amountSats + 50000 &&
+					!reserved.has(c.channelId) &&
+					!live(
+						this.node.fforEpochs('R').find((e) => e.channelId === c.channelId)
+					)
+			)?.channelId;
+	}
+	/** The smallest direct-funded amount this node serves, never below 5000. */
+	private directFundingMinimum(): number {
+		return this.node.getDirectFundingConfig().minAmountSat;
+	}
+	/**
+	 * Validate a request and decide which route it takes.
+	 *
+	 * The amount is measured against the minimum of the route it would actually
+	 * take, and that check comes before the connectivity one: a malformed amount
+	 * is the caller's to fix either way, and naming the minimum first is more use
+	 * than telling them to reconnect a peer that would refuse the amount anyway.
+	 *
+	 * `reuse` is the channel a half-finished bolt11 request already reserved.
+	 * Naming it keeps that request on the bolt11 route, because its own
+	 * reservation hides that channel from a fresh search and the request would
+	 * otherwise flip routes on retry and strand the reservation.
+	 */
+	private route(
+		peer: string,
+		amountSats: number,
+		reuse?: string
+	): OfflineReceiveKind {
 		if (this.stopped)
 			fail(
 				'RECEIVE_UNAVAILABLE',
@@ -84,12 +179,39 @@ export class OfflineReceive {
 			fail('INVALID_PARAMS', 'A primary node public key is required.');
 		if (!Number.isSafeInteger(amountSats) || amountSats <= 0)
 			fail('AMOUNT_REQUIRED', 'Enter an amount for this payment request.');
-		const minimum = Number(DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis);
+		const mode: OfflineReceiveKind =
+			reuse !== undefined || this.suitableChannel(peer, amountSats)
+				? 'bolt11'
+				: 'direct-funding';
+		const minimum =
+			mode === 'bolt11'
+				? Number(DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis)
+				: this.directFundingMinimum();
 		if (amountSats < minimum)
 			fail(
 				'AMOUNT_TOO_SMALL',
 				`Enter at least ${minimum} sats for this payment request.`
 			);
+		if (
+			!this.node.listPeers().some(
+				(p) =>
+					p.pubkey === peer &&
+					// 'ready' is the state a peer reaches once init is exchanged,
+					// which is what the custom messages below need; 'connected'
+					// is the transport-up state the connect route reports first.
+					(p.state === 'ready' || p.state === 'connected')
+			)
+		)
+			fail(
+				'RECEIVE_UNAVAILABLE',
+				'Connect to your node before creating this payment request.'
+			);
+		return mode;
+	}
+	/** The sender fee terms this peer charges, checked into range. */
+	private async terms(
+		peer: string
+	): Promise<{ feeBaseMsat: number; feePpm: number }> {
 		const terms = await this.node
 			.getFforReceiveService()
 			.request(peer, { op: 'quote' }, 15000);
@@ -106,13 +228,31 @@ export class OfflineReceive {
 				'RECEIVE_UNAVAILABLE',
 				'Your node returned unsupported receive terms.'
 			);
+		return { feeBaseMsat: terms.feeBaseMsat, feePpm: terms.feePpm };
+	}
+	async quote(peer: string, amountSats: number): Promise<any> {
+		const mode = this.route(peer, amountSats);
+		const expiresAt = this.now() + 60000;
+		// A direct-funded request is paid on chain and carries no FFOR sender fee,
+		// so there is nothing to ask the peer for and no round trip to wait on.
+		if (mode === 'direct-funding')
+			return {
+				available: true,
+				mode,
+				peer,
+				amountSats,
+				feeSats: 0,
+				minAmountSat: this.directFundingMinimum(),
+				expiresAt
+			};
 		return {
 			available: true,
+			mode,
 			peer,
 			amountSats,
 			feeSats: 0,
-			terms: { feeBaseMsat: terms.feeBaseMsat, feePpm: terms.feePpm },
-			expiresAt: this.now() + 60000
+			terms: await this.terms(peer),
+			expiresAt
 		};
 	}
 	private async wait(check: () => any, timeout = 60000): Promise<any> {
@@ -126,6 +266,70 @@ export class OfflineReceive {
 			'RECEIVE_PENDING',
 			'Your payment request is still being prepared. Check Activity before trying again.'
 		);
+	}
+	/**
+	 * The direct-funding fallback: point the node at this peer and mint a request.
+	 *
+	 * No epoch, no reservation and no channel of our own. An existing config for
+	 * the SAME peer is left exactly as the operator set it, because retargeting
+	 * inbound target, zero-conf trust or the splice switches behind their back is
+	 * a policy change nobody asked for. A config naming a DIFFERENT peer refuses
+	 * rather than silently moving the node's liquidity relationship.
+	 */
+	private directFunding(
+		body: { requestId: string; amountSats: number },
+		peer: string,
+		existing?: OfflineReceiveJob
+	): OfflineReceiveResult {
+		const config = this.node.getDirectFundingConfig();
+		const configured = config.lspPubkey?.toLowerCase();
+		if (configured && configured !== peer)
+			fail(
+				'RECEIVE_UNAVAILABLE',
+				'Direct funding is configured for another peer. Change that setting before receiving from this one.'
+			);
+		if (!configured) {
+			const entry = this.node.listPeers().find((p) => p.pubkey === peer);
+			if (!entry?.host || !entry.port)
+				fail(
+					'RECEIVE_UNAVAILABLE',
+					'Connect to your node before creating this payment request.'
+				);
+			this.node.configureDirectFunding({
+				lspPubkey: peer,
+				lspHost: entry!.host,
+				lspPort: entry!.port
+			});
+		}
+		const minted = this.node.createDirectFundingRequest({
+			amountSats: body.amountSats
+		});
+		const job: OfflineReceiveJob =
+			existing ??
+			({
+				id: body.requestId,
+				peer,
+				amountSats: body.amountSats
+			} as OfflineReceiveJob);
+		job.kind = 'direct-funding';
+		job.request = minted.request;
+		job.paymentHash = minted.paymentHash;
+		job.expiresAt = minted.expiresAt;
+		if (!existing) this.jobs.push(job);
+		this.persist();
+		return this.directFundingResult(job);
+	}
+	/** What a direct-funding request answers with, minted now or replayed. */
+	private directFundingResult(job: OfflineReceiveJob): OfflineReceiveResult {
+		return {
+			kind: 'direct-funding',
+			request: job.request,
+			paymentHash: job.paymentHash,
+			expiresAt: job.expiresAt,
+			amountSats: job.amountSats,
+			peer: job.peer,
+			offlineReceive: false
+		};
 	}
 	async create(body: any, peer: string): Promise<any> {
 		if (this.creating)
@@ -146,17 +350,29 @@ export class OfflineReceive {
 			let job = this.jobs.find((j) => j.id === body.requestId);
 			if (job && (job.peer !== peer || job.amountSats !== body.amountSats))
 				fail('INVALID_REVIEW', 'This payment request changed.');
-			if (job?.invoice) return job.invoice;
+			if (job?.invoice) return { kind: 'bolt11', ...job.invoice };
+			// A retry inside the request's lifetime gets the same envelope back. An
+			// expired one is worthless to a payer, so it is replaced under the same
+			// id rather than handed out again.
+			if (
+				job &&
+				kindOf(job) === 'direct-funding' &&
+				job.request &&
+				(job.expiresAt ?? 0) > this.now()
+			)
+				return this.directFundingResult(job);
 			if (job?.done) {
 				job.done = false;
 				this.persist();
 			}
 			if (body.quote.expiresAt <= this.now())
 				fail('QUOTE_EXPIRED', 'Review this payment request again.');
+			const mode = this.route(peer, body.amountSats, job?.channelId);
+			if (mode === 'direct-funding') return this.directFunding(body, peer, job);
 			// Recheck terms before changing a channel. A peer cannot increase the
-			// authorized sender fee by returning a more expensive allocation reply.
-			const fresh = await this.quote(peer, body.amountSats);
-			if (JSON.stringify(fresh.terms) !== JSON.stringify(body.quote.terms))
+			// authorized sender fee between the review and the reservation.
+			const fresh = await this.terms(peer);
+			if (JSON.stringify(fresh) !== JSON.stringify(body.quote.terms))
 				fail(
 					'FEE_CHANGED',
 					'Receive terms changed. Review the payment request again.'
@@ -166,50 +382,22 @@ export class OfflineReceive {
 					id: body.requestId,
 					peer,
 					amountSats: body.amountSats,
-					allocationId: Buffer.from(randomBytes(16)).toString('hex')
+					kind: 'bolt11'
 				};
 				this.jobs.push(job);
 				this.persist();
 			}
 			await this.wait(() => this.node.getInfo().blockHeight > 0);
 			if (!job.channelId) {
-				const reserved = this.reservedIds();
-				// Never park spendable money on a receive lane. A channel with earned
-				// funds remains available to the normal send and channelize paths.
-				const channel = this.node
-					.listChannels()
-					.find(
-						(c) =>
-							c.peerPubkey === peer &&
-							c.state === 'NORMAL' &&
-							c.htlcUsable &&
-							c.localBalanceSats === 0 &&
-							c.remoteBalanceSats >= job!.amountSats + 50000 &&
-							!reserved.has(c.channelId) &&
-							!live(
-								this.node
-									.fforEpochs('R')
-									.find((e) => e.channelId === c.channelId)
-							)
+				// Already established by `route`: reaching here without a channel
+				// would mean opening one, which this flow never does.
+				const channelId = this.suitableChannel(peer, job.amountSats);
+				if (!channelId)
+					fail(
+						'RECEIVE_UNAVAILABLE',
+						'The receive channel is no longer available.'
 					);
-				if (channel) job.channelId = channel.channelId;
-				else {
-					const allocation = await this.node.getFforReceiveService().request(
-						peer,
-						{
-							op: 'allocate',
-							allocationId: job.allocationId,
-							amountSats: job.amountSats
-						},
-						75000
-					);
-					if (!/^[a-f0-9]{64}$/.test(allocation?.channelId))
-						fail(
-							'RECEIVE_UNAVAILABLE',
-							'Your receive channel could not be verified.'
-						);
-					job.channelId = allocation.channelId;
-				}
+				job.channelId = channelId;
 				this.persist();
 			}
 			const channelId = job.channelId!;
@@ -293,6 +481,7 @@ export class OfflineReceive {
 			job.expiresAt =
 				(Number(decoded.timestamp) + Number(decoded.expiry)) * 1000;
 			job.invoice = {
+				kind: 'bolt11',
 				...invoice,
 				amountSats: job.amountSats,
 				expiresAt: job.expiresAt,
@@ -310,6 +499,9 @@ export class OfflineReceive {
 		try {
 			for (const job of this.jobs) {
 				if (this.stopped) return;
+				// A direct-funded request has no epoch and no reservation: there is
+				// nothing here to reconcile or release.
+				if (kindOf(job) === 'direct-funding') continue;
 				if (job.done || !job.channelId) continue;
 				const channel = this.node
 					.listChannels()
