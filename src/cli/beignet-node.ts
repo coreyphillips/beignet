@@ -1395,21 +1395,27 @@ function requireChannelIdHex(value: unknown, field = 'channelId'): Buffer {
 }
 
 /**
- * A channel under the recency hold: restored from a Recovery Capsule with no
- * channel_reestablish proving its state current (issue #469), or failed
- * because its peer claimed at channel_reestablish that it is behind without
- * proof (issue #907). The first stays NORMAL, keeps its balance and settles
- * the HTLCs it already has; both take no new ones and are offered to no
- * router, so no readiness or capacity surface may count them. Read off the
- * wire fields rather than recomputed: these surfaces hold serialized channel
- * info, not Channel objects.
+ * A channel no readiness or capacity surface may count: restored from a
+ * Recovery Capsule with no channel_reestablish proving its state current
+ * (issue #469), failed because its peer claimed at channel_reestablish that
+ * it is behind without proof (issue #907), or shown by its peer to be one
+ * revocation behind, which the peer proved with the secret (issues #905 and
+ * #915). The first and the last stay NORMAL and keep their balance and
+ * settle the HTLCs they already have; all three take no new ones and are
+ * offered to no router, so counting any of them advertises a channel whose
+ * acceptsNewHtlcs refuses every add. Read off the wire fields rather than
+ * recomputed: these surfaces hold serialized channel info, not Channel
+ * objects.
  */
 function isHeldRestore(ch: {
 	restoreRecencyUnproven?: boolean;
 	reestablishRecencyUnproven?: boolean;
+	restoreRevokedRisk?: boolean;
 }): boolean {
 	return (
-		ch.restoreRecencyUnproven === true || ch.reestablishRecencyUnproven === true
+		ch.restoreRecencyUnproven === true ||
+		ch.reestablishRecencyUnproven === true ||
+		ch.restoreRevokedRisk === true
 	);
 }
 
@@ -7500,6 +7506,24 @@ export class BeignetNode extends EventEmitter {
 		const row = this.node
 			.getRecoveryStatus()
 			.channels.find((c) => c.channelId === canonicalId);
+		// Before the acknowledgement, and regardless of it (issues #905 and
+		// #915): the holds below describe a risk the operator may accept, but
+		// this row's peer has PROVEN it holds the revocation for the stored
+		// commitment, so the risk is a certainty and there is nothing left to
+		// accept. The engine refuses too; this names the reason under its own
+		// code so a client does not read it as a missing flag.
+		if (row?.restoreRevokedRisk === true) {
+			throw new BeignetError(
+				BeignetErrorCode.FORCE_CLOSE_REVOKED,
+				"This channel's peer has shown, in channel_reestablish, that it " +
+					'already holds the revocation for the stored commitment. Force ' +
+					'closing would publish a revoked commitment and the whole channel ' +
+					'balance would be lost to the justice path. There is no risk to ' +
+					'accept, so acceptStaleStateRisk does not apply: wait for the ' +
+					'peer to force close, or for its retransmission to bring this ' +
+					'channel level again.'
+			);
+		}
 		if (row?.restoreRecencyUnproven === true && acceptStaleStateRisk !== true) {
 			throw new BeignetError(
 				'INVALID_PARAMS',
@@ -7618,6 +7642,10 @@ export class BeignetNode extends EventEmitter {
 			issues.push(
 				'HELD_REESTABLISH: The peer claimed at channel_reestablish that this channel state is behind and showed no proof, so the channel is held and takes no new HTLCs. Routing hints will be skipped.'
 			);
+		if (state.restoreRevokedRisk === true)
+			issues.push(
+				'HELD_REVOKED: The peer proved at channel_reestablish that it already holds the revocation for this commitment, so the channel takes no new HTLCs and no force close of it is permitted, the acknowledged one included. Routing hints will be skipped. It clears when the peer retransmits and this channel levels.'
+			);
 		if (state.fundingUnaccounted === true)
 			issues.push(
 				'FUNDING_UNACCOUNTED: Neither mempool nor chain can account for the funding transaction, so the channel takes no new HTLCs. Routing hints will be skipped. Existing HTLCs still settle, and the quarantine lifts by itself if the funding reappears.'
@@ -7691,6 +7719,7 @@ export class BeignetNode extends EventEmitter {
 		htlcUsable?: boolean;
 		restoreRecencyUnproven?: boolean;
 		reestablishRecencyUnproven?: boolean;
+		restoreRevokedRisk?: boolean;
 		fundingUnaccounted?: boolean;
 		payThroughSplice?: boolean;
 		revertedSplices?: Array<{
@@ -7754,6 +7783,7 @@ export class BeignetNode extends EventEmitter {
 			info.restoreRecencyUnproven = ch.restoreRecencyUnproven;
 		if (ch.reestablishRecencyUnproven)
 			info.reestablishRecencyUnproven = ch.reestablishRecencyUnproven;
+		if (ch.restoreRevokedRisk) info.restoreRevokedRisk = ch.restoreRevokedRisk;
 		if (ch.fundingUnaccounted) info.fundingUnaccounted = ch.fundingUnaccounted;
 		if (ch.payThroughSplice !== undefined)
 			info.payThroughSplice = ch.payThroughSplice;

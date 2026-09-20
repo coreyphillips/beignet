@@ -6030,6 +6030,18 @@ export class LightningNode extends EventEmitter {
 			 * (acceptStaleStateRisk), never an automatic broadcast.
 			 */
 			reestablishRecencyUnproven?: boolean;
+			/**
+			 * The channel's peer has PROVEN, in its channel_reestablish, that
+			 * it already holds the revocation for the channel's current
+			 * commitment (issues #905 and #915): next_revocation_number one
+			 * above what this row recorded revoking, beside the real secret
+			 * at that index. The holds above describe a risk; this is a
+			 * certainty, so every broadcast is refused, the operator's force
+			 * close included, acceptStaleStateRisk or not, and so is a
+			 * cooperative close. No capsule restore is required. It clears
+			 * itself when the peer's retransmission levels the row.
+			 */
+			restoreRevokedRisk?: boolean;
 		}>;
 		/**
 		 * Peers whose channel_reestablish is parked because it names a channel
@@ -6055,6 +6067,7 @@ export class LightningNode extends EventEmitter {
 			fundingUnidentified?: boolean;
 			restoreRecencyUnproven?: boolean;
 			reestablishRecencyUnproven?: boolean;
+			restoreRevokedRisk?: boolean;
 		}> = [];
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
@@ -6075,6 +6088,9 @@ export class LightningNode extends EventEmitter {
 					: {}),
 				...(state.reestablishRecencyUnproven
 					? { reestablishRecencyUnproven: true }
+					: {}),
+				...(state.restoreRevokedRisk === true
+					? { restoreRevokedRisk: true }
 					: {})
 			});
 		}
@@ -11510,6 +11526,13 @@ export class LightningNode extends EventEmitter {
 		feeRatePerVbyte: number,
 		reason: ChannelCloseReason
 	): ChannelResult {
+		// Every reason, the operator's included (issue #905): the peer has
+		// shown it holds the revocation for this commitment, so there is no
+		// risk left for an acknowledgement to accept, only the justice path.
+		const revoked = this.forceCloseRevokedRefusal(channelId);
+		if (revoked !== null) {
+			return { ok: false, actions: [], error: revoked };
+		}
 		if (
 			reason !== 'user' &&
 			this.skipAutoCloseRecoveryGated(channelId, reason)
@@ -11584,10 +11607,46 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * The refusal every force close of a channel meets once
+	 * its peer has shown it holds the revocation for the channel's current
+	 * commitment (restoreRevokedRisk, issue #905), or null when it does not.
+	 * Unlike the recency hold, which the operator's own close may override
+	 * (5.6's labelled escape hatch), this one has no override: the hatch
+	 * exists for a risk, and a revocation in the peer's hands is not a risk
+	 * but a certain loss to the justice path. Stated here so the operator
+	 * path can name it (FORCE_CLOSE_REVOKED) and _forceCloseWithReason can
+	 * enforce it for every reason at once.
+	 */
+	private forceCloseRevokedRefusal(channelId: Buffer): string | null {
+		const state = this.channelManager.getChannel(channelId)?.getFullState();
+		if (state?.restoreRevokedRisk !== true) return null;
+		return (
+			"force close refused: this channel's peer has shown, in " +
+			'channel_reestablish, that it already holds the revocation for the ' +
+			'stored commitment; broadcasting it would hand the whole balance to ' +
+			'the justice path. There is no risk to accept: wait for the peer to ' +
+			'force close'
+		);
+	}
+
 	forceCloseChannel(
 		channelId: Buffer,
 		destinationScript: Buffer
 	): { ok: boolean; error?: string; commitmentTxid?: string } {
+		// Named ahead of the engine's own refusal (issue #905): the operator
+		// is told the exit is closed for a reason no acknowledgement reopens,
+		// under a code a client can tell from an ordinary failed close.
+		const revoked = this.forceCloseRevokedRefusal(channelId);
+		if (revoked !== null) {
+			this.emit('node:error', {
+				code: 'FORCE_CLOSE_REVOKED',
+				channelId,
+				message: revoked,
+				timestamp: Date.now()
+			} as ILightningError);
+			return { ok: false, error: revoked };
+		}
 		const result = this._forceCloseWithReason(
 			channelId,
 			destinationScript,
@@ -12949,7 +13008,8 @@ export class LightningNode extends EventEmitter {
 					: {}),
 				...(ch.reestablishRecencyUnproven === true
 					? { reestablishRecencyUnproven: true }
-					: {})
+					: {}),
+				...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
 			};
 		});
 		return this.liquidityAdvisor.analyze(snapshots);
@@ -12979,7 +13039,8 @@ export class LightningNode extends EventEmitter {
 				: {}),
 			...(ch.reestablishRecencyUnproven === true
 				? { reestablishRecencyUnproven: true }
-				: {})
+				: {}),
+			...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
 		}));
 		const plans = planRebalances(snapshots, {
 			minImbalancePct:
@@ -13496,6 +13557,13 @@ export class LightningNode extends EventEmitter {
 		}
 		if (state.reestablishRecencyUnproven === true) {
 			info.reestablishRecencyUnproven = true;
+		}
+		// And the proven revocation (issues #905 and #915), which every
+		// readiness surface built on this info must exclude as well: the
+		// channel refuses every add, so advertising it as ready would route
+		// payments into a refusal and hand out routing hints no one can use.
+		if (state.restoreRevokedRisk === true) {
+			info.restoreRevokedRisk = true;
 		}
 		if (state.fundingUnaccounted === true) {
 			info.fundingUnaccounted = true;
@@ -16467,12 +16535,13 @@ export class LightningNode extends EventEmitter {
 		const finalHop = isFinalHop(processed.nextPacket);
 		let policyCode: number | null = null;
 		if (
-			isRecencyUnproven(channel.getFullState()) &&
+			(isRecencyUnproven(channel.getFullState()) ||
+				channel.getFullState().restoreRevokedRisk === true) &&
 			htlcEntry.addedWhileRestoreUnproven === true
 		) {
-			// A capsule-restored channel whose recency cannot be proven takes
-			// no NEW HTLCs (issue #469). Settling this would reveal a preimage
-			// against a peer we could never escalate against, because every
+			// A channel with unproven recency or a proven revocation takes
+			// no NEW HTLCs (issues #469 and #915). Settling this would reveal a
+			// preimage against a peer we could never escalate against, because every
 			// automatic close is refused while the hold stands, so the on-chain
 			// claim the deadline backstops exist to make can never happen;
 			// forwarding is the same bet with an extra leg.
@@ -24992,6 +25061,12 @@ export class LightningNode extends EventEmitter {
 	 * from one inventing the gap, so the row is held exactly as a restore
 	 * is, and the same labelled operator exit stays open. One predicate,
 	 * isRecencyUnproven, answers for both so they can never drift apart.
+	 *
+	 * One case closes the hatch as well, and is not this predicate's: a peer
+	 * that has PROVEN it holds the revocation for the row's current
+	 * commitment (restoreRevokedRisk, issues #905 and #915) leaves no risk
+	 * for an acknowledgement to accept, so forceCloseRevokedRefusal refuses
+	 * every reason, 'user' included.
 	 */
 	private skipAutoCloseRestoreUnproven(
 		state: IChannelState,
@@ -25104,7 +25179,9 @@ export class LightningNode extends EventEmitter {
 	 * that will not happen, or clear the tracker holding its retry.
 	 *
 	 * The operator's own force close (reason 'user') stays admitted: it is
-	 * 5.6's labelled escape hatch, and the only exit a fenced node has.
+	 * 5.6's labelled escape hatch, and the only exit a fenced node has. The
+	 * one refusal that covers 'user' as well is forceCloseRevokedRefusal
+	 * (issue #905), which names a certainty rather than a risk.
 	 */
 	private skipAutoCloseRecoveryGated(
 		channelId: Buffer,

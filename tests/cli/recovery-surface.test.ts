@@ -622,6 +622,126 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 			}
 		).channels.delete(channelId);
 	});
+	// The three origins a proven-revocation row can carry: none (issue #915),
+	// the capsule hold (issue #469) and the reestablish hold (issue #907).
+	// The last two have a labelled acknowledgement; this proof has none, and
+	// it is answered first, so all three end in the same 409.
+	for (const origin of ['none', 'capsule', 'reestablish'] as const) {
+		it(`POST /channel/forceclose refuses a proven revocation regardless of acknowledgement (origin=${origin})`, async () => {
+			const node = daemon.node.getNode();
+			const {
+				createOpenerState
+			} = require('../../src/lightning/channel/channel-state');
+			const { Channel } = require('../../src/lightning/channel/channel');
+			const {
+				ChannelState,
+				DEFAULT_CHANNEL_CONFIG
+			} = require('../../src/lightning/channel/types');
+			const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+			const point = getPublicKey(crypto.randomBytes(32));
+			const bp = {
+				fundingPubkey: point,
+				revocationBasepoint: point,
+				paymentBasepoint: point,
+				delayedPaymentBasepoint: point,
+				htlcBasepoint: point,
+				firstPerCommitmentPoint: point
+			};
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100_000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: bp,
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			// The reestablish hold only ever stands on an ERRORED row; the
+			// other two resume.
+			state.state =
+				origin === 'reestablish' ? ChannelState.ERRORED : ChannelState.NORMAL;
+			state.channelId = crypto.randomBytes(32);
+			state.fundingTxid = crypto.randomBytes(32);
+			state.remoteBasepoints = bp;
+			state.restoreRecencyUnproven = origin === 'capsule' || undefined;
+			state.reestablishRecencyUnproven = origin === 'reestablish' || undefined;
+			// What handleReestablish stamps when the peer's next_revocation_number
+			// is exactly localCommitmentNumber + 1: the peer has shown it holds the
+			// revocation for the stored commitment.
+			state.restoreRevokedRisk = true;
+			node
+				.getChannelManager()
+				.restoreChannel(
+					new Channel(state),
+					crypto.randomBytes(33).toString('hex')
+				);
+			const channelId = state.channelId.toString('hex');
+
+			try {
+				// The recovery status the route serves as `node` reports the flag
+				// beside the hold.
+				const row = node
+					.getRecoveryStatus()
+					.channels.find(
+						(c: { channelId: string }) => c.channelId === channelId
+					);
+				expect(row?.restoreRecencyUnproven).to.equal(
+					origin === 'capsule' ? true : undefined
+				);
+				expect(row?.reestablishRecencyUnproven).to.equal(
+					origin === 'reestablish' ? true : undefined
+				);
+				expect(row?.restoreRevokedRisk, 'the status says why').to.equal(true);
+
+				// The issue #469 and #907 cells' accepting call, on THIS row:
+				// the acknowledgement accepts a risk, and there is none left to
+				// accept, so it is refused under its own code and the message
+				// says so rather than asking for a flag already given. On a row
+				// carrying a hold as well, this 409 beats that 400.
+				const accepted = await request(
+					portOf(daemon),
+					'POST',
+					'/channel/forceclose',
+					{ channelId, acceptStaleStateRisk: true }
+				);
+				expect(accepted.status).to.equal(409);
+				expect((accepted.body.error as { code: string }).code).to.equal(
+					'FORCE_CLOSE_REVOKED'
+				);
+				const message = (accepted.body.error as { message: string }).message;
+				expect(message).to.match(/holds the revocation/);
+				expect(message).to.match(/no risk to accept/);
+				expect(message).to.not.match(/was restored from a Recovery Capsule/);
+				expect(message).to.not.match(/Set acceptStaleStateRisk: true/);
+
+				// And without it, the same refusal: this check comes BEFORE the
+				// acknowledgement, not instead of it.
+				const refused = await request(
+					portOf(daemon),
+					'POST',
+					'/channel/forceclose',
+					{ channelId }
+				);
+				expect(refused.status).to.equal(409);
+				expect((refused.body.error as { code: string }).code).to.equal(
+					'FORCE_CLOSE_REVOKED'
+				);
+				expect(
+					node
+						.getChannelManager()
+						.getChannel(Buffer.from(channelId, 'hex'))!
+						.getState(),
+					'nothing was broadcast'
+				).to.not.equal(ChannelState.FORCE_CLOSED);
+			} finally {
+				// Shared daemon: take the fixture channel back out.
+				(
+					node.getChannelManager() as unknown as {
+						channels: Map<string, unknown>;
+					}
+				).channels.delete(channelId);
+			}
+		});
+	}
 
 	it('POST /channel/close refuses a capsule-restored channel without acceptStaleStateRisk (issue #469)', async () => {
 		const node = daemon.node.getNode();
@@ -943,6 +1063,109 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 		}
 	});
 
+	it('keeps a channel whose peer holds the revocation off every readiness surface (issues #905 and #915)', async () => {
+		// The proven-revocation row RESUMES, so it is NORMAL and holds a real
+		// balance, exactly like the capsule-restored row above: every surface
+		// that answers "ready" or "you can receive this much" from state alone
+		// would advertise a channel whose acceptsNewHtlcs refuses every add.
+		const node = daemon.node.getNode();
+		const {
+			createOpenerState
+		} = require('../../src/lightning/channel/channel-state');
+		const { Channel } = require('../../src/lightning/channel/channel');
+		const {
+			ChannelState,
+			DEFAULT_CHANNEL_CONFIG
+		} = require('../../src/lightning/channel/types');
+		const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+		const point = getPublicKey(crypto.randomBytes(32));
+		const bp = {
+			fundingPubkey: point,
+			revocationBasepoint: point,
+			paymentBasepoint: point,
+			delayedPaymentBasepoint: point,
+			htlcBasepoint: point,
+			firstPerCommitmentPoint: point
+		};
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: DEFAULT_CHANNEL_CONFIG,
+			localBasepoints: bp,
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		state.state = ChannelState.NORMAL;
+		state.channelId = crypto.randomBytes(32);
+		state.fundingTxid = crypto.randomBytes(32);
+		state.remoteBasepoints = bp;
+		state.localBalanceMsat = 500_000_000n;
+		state.remoteBalanceMsat = 500_000_000n;
+		state.announceChannel = false;
+		// No capsule restore here (issue #915): the proof alone holds the row.
+		state.restoreRevokedRisk = true;
+		node
+			.getChannelManager()
+			.restoreChannel(
+				new Channel(state),
+				crypto.randomBytes(33).toString('hex')
+			);
+		state.state = ChannelState.NORMAL;
+		state.remoteScidAlias = crypto.randomBytes(8);
+		const channelId = state.channelId.toString('hex');
+		const cli = daemon.node;
+
+		try {
+			const listed = cli
+				.listChannels()
+				.find((c: { channelId: string }) => c.channelId === channelId);
+			expect(listed, 'the channel is still listed').to.not.equal(undefined);
+			expect(listed!.restoreRevokedRisk, 'and it says why').to.equal(true);
+			expect(listed!.htlcUsable, 'it takes no new HTLC').to.equal(false);
+
+			expect(
+				cli.getReadyChannels().map((c: { channelId: string }) => c.channelId),
+				'not counted ready'
+			).to.not.include(channelId);
+			expect(
+				cli.canReceive(100_000).bestChannelId,
+				'its inbound liquidity is not offered'
+			).to.not.equal(channelId);
+			expect(
+				cli.canSend(100_000).bestChannelId,
+				'nor its outbound'
+			).to.not.equal(channelId);
+
+			const diagnostic = cli.getChannelDiagnostics(channelId) as unknown as {
+				willGenerateRoutingHint: boolean;
+				issues: string[];
+			};
+			expect(
+				diagnostic.issues.some((i: string) => i.startsWith('HELD_REVOKED')),
+				'the diagnostics name the proof'
+			).to.equal(true);
+			expect(
+				diagnostic.willGenerateRoutingHint,
+				'and no routing hint is promised'
+			).to.equal(false);
+
+			// (The status ROUTE is asserted by the peer-storage cell below; this
+			// daemon runs with recovery off, where it serves node: null.)
+			const row = node
+				.getRecoveryStatus()
+				.channels.find((c: { channelId: string }) => c.channelId === channelId);
+			expect(row?.restoreRevokedRisk, 'and the status reports it').to.equal(
+				true
+			);
+		} finally {
+			(
+				node.getChannelManager() as unknown as {
+					channels: Map<string, unknown>;
+				}
+			).channels.delete(channelId);
+		}
+	});
+
 	it('POST /recovery/restore on a running node answers RESTORE_NOT_PENDING', async () => {
 		const res = await request(portOf(daemon), 'POST', '/recovery/restore', {
 			confirm: true
@@ -990,6 +1213,92 @@ describe('Recovery surface: peer-storage mode', () => {
 			const check = readinessCheck(readiness.body, 'CHANNEL_BACKUP');
 			expect(check.status).to.equal('WARN');
 			expect(check.message).to.match(/storage peers/);
+		} finally {
+			await daemon.stop();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('GET /recovery/status reports restoreRevokedRisk beside the hold (issue #905)', async function (): Promise<void> {
+		this.timeout(30_000);
+		const dir = tmpDir('peer-storage-revoked');
+		const daemon = await startDaemon({
+			...OFFLINE,
+			dataDir: dir,
+			recoveryMode: 'peer-storage'
+		});
+		try {
+			const node = daemon.node.getNode();
+			const {
+				createOpenerState
+			} = require('../../src/lightning/channel/channel-state');
+			const { Channel } = require('../../src/lightning/channel/channel');
+			const {
+				ChannelState,
+				DEFAULT_CHANNEL_CONFIG
+			} = require('../../src/lightning/channel/types');
+			const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+			const point = getPublicKey(crypto.randomBytes(32));
+			const bp = {
+				fundingPubkey: point,
+				revocationBasepoint: point,
+				paymentBasepoint: point,
+				delayedPaymentBasepoint: point,
+				htlcBasepoint: point,
+				firstPerCommitmentPoint: point
+			};
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100_000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: bp,
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			state.state = ChannelState.NORMAL;
+			state.channelId = crypto.randomBytes(32);
+			state.fundingTxid = crypto.randomBytes(32);
+			state.remoteBasepoints = bp;
+			state.restoreRecencyUnproven = true;
+			state.restoreRevokedRisk = true;
+			node
+				.getChannelManager()
+				.restoreChannel(
+					new Channel(state),
+					crypto.randomBytes(33).toString('hex')
+				);
+			const channelId = state.channelId.toString('hex');
+
+			const res = await request(portOf(daemon), 'GET', '/recovery/status');
+			expect(res.status).to.equal(200);
+			const result = res.body.result as {
+				node: {
+					channels: Array<{
+						channelId: string;
+						restoreRecencyUnproven?: boolean;
+						restoreRevokedRisk?: boolean;
+					}>;
+				} | null;
+			};
+			const row = result.node?.channels.find((c) => c.channelId === channelId);
+			expect(row, 'the channel is on the status route').to.not.equal(undefined);
+			expect(row!.restoreRecencyUnproven).to.equal(true);
+			expect(
+				row!.restoreRevokedRisk,
+				'and it says the peer holds the revocation'
+			).to.equal(true);
+
+			// The same daemon, with recovery on: the hatch stays shut here too.
+			const closed = await request(
+				portOf(daemon),
+				'POST',
+				'/channel/forceclose',
+				{ channelId, acceptStaleStateRisk: true }
+			);
+			expect(closed.status).to.equal(409);
+			expect((closed.body.error as { code: string }).code).to.equal(
+				'FORCE_CLOSE_REVOKED'
+			);
 		} finally {
 			await daemon.stop();
 			fs.rmSync(dir, { recursive: true, force: true });

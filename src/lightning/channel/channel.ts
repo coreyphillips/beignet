@@ -3027,6 +3027,24 @@ export class Channel {
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer
 	): ChannelAction[] {
+		// A commitment the peer has PROVEN it can punish (issues #905 and
+		// #915) enforces nothing at all: this node will not broadcast it under
+		// any reason, so every on-chain route for a new HTLC is already shut.
+		// Answered first and separately from the recency holds below, because
+		// this one has no operator exit to point the caller at. Obligations
+		// that predate the proof still settle through the resumed exchange,
+		// and the refusal lifts when the peer's retransmission levels the row.
+		if (this._state.restoreRevokedRisk === true) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot add HTLC: the peer holds the revocation for this ' +
+						'commitment, so its on-chain HTLC backstops are disabled'
+				}
+			];
+		}
+
 		// A channel whose recency cannot be proven takes no NEW HTLCs, whether
 		// it was restored from a capsule (issue #469) or its peer claimed at
 		// reestablish that it is behind without proof (issue #907). Its HTLC
@@ -3458,10 +3476,12 @@ export class Channel {
 			state: HtlcState.PENDING,
 			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {}),
 			...(dustExposureFailback ? { dustExposureFailback: true } : {}),
-			// Provenance for the recency hold (issues #469 and #907): only an
-			// add admitted while the hold already stood is refused by the node;
-			// one already committed in the capsule predates it and still settles.
-			...(isRecencyUnproven(this._state)
+			// Provenance for the recency holds (issues #469 and #907) and for a
+			// proven revocation (issues #905 and #915): only an add admitted
+			// while the restriction already stood is refused by the node; one
+			// already committed in the capsule predates it and still settles.
+			...(isRecencyUnproven(this._state) ||
+			this._state.restoreRevokedRisk === true
 				? { addedWhileRestoreUnproven: true }
 				: {}),
 			// Same provenance for the funding-missing quarantine (issue #593).
@@ -4801,6 +4821,21 @@ export class Channel {
 
 		this._state.localCommitmentNumber++;
 
+		// The levelling revoke clears the proven-revocation flag (issues #905
+		// and #915). The flag says the peer already holds the secret for
+		// commitment localCommitmentNumber, which is precisely the secret
+		// revealed one line above, so this revoke tells the peer nothing it
+		// did not already have, and afterwards the row's current commitment
+		// is localCommitmentNumber + 1, whose secret has never left this
+		// node. Broadcasting is safe again. The ONLY way past the flagged
+		// index is this revoke - the counter advances nowhere else - so
+		// clearing here cannot outrun the proof. Leaving it set would keep
+		// mustNotBroadcastCommitment true for the life of a channel that has
+		// levelled, disarming its HTLC deadline backstops and closing its
+		// unilateral exit forever, which is a fund-loss path of its own. The
+		// PERSIST_STATE this path already leads with carries the clear.
+		this._state.restoreRevokedRisk = undefined;
+
 		// BOLT 2 (revoke_and_ack): next_per_commitment_point is the point for the
 		// NEXT commitment transaction — the one after the commitment we just
 		// adopted. With commitment M using getPerCommitmentPoint(seed, M) (per
@@ -5638,7 +5673,8 @@ export class Channel {
 	 */
 	getRecoveryStatus(): ChannelRecoveryStatus {
 		const s = this._state;
-		if (s.dataLossDetected) return ChannelRecoveryStatus.LocalDataLoss;
+		if (s.dataLossDetected || s.restoreRevokedRisk)
+			return ChannelRecoveryStatus.LocalDataLoss;
 		if (s.stateUncertain) return ChannelRecoveryStatus.StateUncertain;
 		if (
 			s.state === ChannelState.FORCE_CLOSED ||
@@ -5697,7 +5733,8 @@ export class Channel {
 		if (this._state.recoveryCloseReason) {
 			return this._state.recoveryCloseReason;
 		}
-		if (this._state.dataLossDetected) return 'local-data-loss';
+		if (this._state.dataLossDetected || this._state.restoreRevokedRisk)
+			return 'local-data-loss';
 		if (this._state.stateUncertain) return 'state-uncertain';
 		// A capsule-restored row the peer has not confirmed yet (issue #469).
 		// DERIVED and never stamped by _ensureRecoveryCloseDisposition, unlike
@@ -5789,6 +5826,15 @@ export class Channel {
 	 * same stale split the initiation was warned about.
 	 */
 	isMutualCloseHeld(): boolean {
+		// The proven revocation holds the close outright (issues #905 and
+		// #915), with no acknowledgement to lift it. The row's balances are
+		// one round stale by proof, not by supposition: the peer has a
+		// revoke_and_ack this row never recorded, so it has a commitment this
+		// row never built, and a mutual close lets it propose the split of
+		// the older one and take our signature over it. Unlike the holds
+		// above, this one is temporary: the peer's retransmission levels the
+		// row, the levelling revoke clears the flag, and the close proceeds.
+		if (this._state.restoreRevokedRisk === true) return true;
 		return (
 			isRecencyUnproven(this._state) &&
 			this._state.staleCloseRiskAccepted !== true
@@ -5804,6 +5850,17 @@ export class Channel {
 	 * the daemon's force-close refusal do.
 	 */
 	private _heldCloseOrigin(): string {
+		// The proven revocation first: it is the only one of the three that no
+		// acknowledgement lifts, so an operator reading the refusal must be
+		// told that, and told what does lift it (issues #905 and #915).
+		if (this._state.restoreRevokedRisk === true) {
+			return (
+				'the peer has shown at channel_reestablish that it already holds ' +
+				'the revocation for this commitment, so these balances are one ' +
+				'round stale and this channel is waiting for the retransmission ' +
+				'from that peer to bring it level'
+			);
+		}
 		return this._state.restoreRecencyUnproven === true
 			? 'this channel was restored from a Recovery Capsule and its balances ' +
 					'cannot be proven current'
@@ -6248,17 +6305,21 @@ export class Channel {
 		chain?: IForceCloseChainFacts
 	): ForceClosePlan {
 		// The recovery never-broadcast invariant (5.6): proven stale
-		// (dataLossDetected) or unprovable (stateUncertain), our latest local
-		// commitment may be revoked in the peer's view - broadcasting it hands
-		// our entire balance to the justice path. Recovery is passive:
-		// StateUncertain is permanent absent independently verified storage
-		// provenance, so the only exit is the peer force-closing with ITS
-		// commitment; we sweep our to_remote from that.
+		// (dataLossDetected), unprovable (stateUncertain), or with
+		// the peer having shown it holds the revocation (restoreRevokedRisk,
+		// issues #905 and #915), our latest local commitment may be revoked in the
+		// peer's view - broadcasting it hands our entire balance to the
+		// justice path. Recovery is passive: StateUncertain is permanent
+		// absent independently verified storage provenance, so the only exit
+		// is the peer force-closing with ITS commitment; we sweep our
+		// to_remote from that.
 		if (mustNotBroadcastCommitment(this._state)) {
 			return {
 				ok: false,
 				error: this._state.dataLossDetected
 					? 'Refusing to broadcast stale commitment after data loss'
+					: this._state.restoreRevokedRisk
+					? 'Refusing to broadcast: the peer already holds the revocation for this commitment'
 					: 'Refusing to broadcast: restored state is not proven current'
 			};
 		}
@@ -6806,6 +6867,21 @@ export class Channel {
 		// Exact true only: the acknowledgement is authorization, and a JS
 		// caller passing a truthy non-boolean ('false', 1) must not spend it.
 		const acknowledged = acceptStaleStateRisk === true;
+		// The proven revocation (issues #905 and #915) is checked ahead of the
+		// acknowledgement and regardless of it, exactly as the force close is:
+		// acceptStaleStateRisk accepts a RISK, and here the peer has shown the
+		// stale round is a fact. Nothing durable changes, so the row stays
+		// resumable and the close can be retried once the peer's
+		// retransmission has levelled it.
+		if (this._state.restoreRevokedRisk === true) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot close cooperatively: ${this._heldCloseOrigin()}`,
+					cleanup: 'none'
+				}
+			];
+		}
 		if (this.isMutualCloseHeld() && !acknowledged) {
 			return [
 				{
@@ -9982,6 +10058,55 @@ export class Channel {
 			];
 		}
 
+		// A valid secret proves the current commitment was revoked, whatever
+		// the row's origin (issues #905 and #915). localCommitmentNumber
+		// advances when WE send revoke_and_ack, so next_revocation_number at
+		// exactly localCommitmentNumber + 1 means the peer received one more
+		// revoke_and_ack than this row recorded sending, and the commitment it
+		// revoked is commitment localCommitmentNumber: the one this row would
+		// broadcast. The DLP arm above needs a larger gap, and the revocation
+		// arm below treats exactly + 1 as a signature in flight. A signature
+		// in flight alone cannot give the peer our SECRET at this index.
+		//
+		// The proof is that secret, not the counter, which the peer simply
+		// reads off our own channel_reestablish. Issue #907's validator above
+		// has already pinned your_last_per_commitment_secret to
+		// getPerCommitmentSecret(seed, nextRevocationNumber - 1), that is our
+		// real secret at index localCommitmentNumber, and failed the channel
+		// otherwise, all-zero bytes included: the value reaching this line can
+		// only be the real secret, which none of the released secrets
+		// 0..localCommitmentNumber-1 derives and only a peer we revoked that
+		// commitment to can hold. The all-zero conjunct below is therefore
+		// redundant today and kept as a guard: it costs a comparison and
+		// keeps a forged flag off if that rule is ever loosened again, and a
+		// forged flag would close the operator's force-close exit for good.
+		// No capsule restore is required for any of this (issue #915).
+		//
+		// With the secret required, a commitment gap beside this value is the
+		// DLP arm's above, so the gap arms below never see a flagged row. The
+		// row still RESUMES, because the peer's retransmitted commitment_signed
+		// is what levels it, and the revoke_and_ack we send in answer reveals
+		// the secret the peer already holds and clears the flag
+		// (sendRevokeAndAck). Its own persist: the trailing persist fires only
+		// beside a SEND_MESSAGE, and this shape retransmits nothing, so
+		// without it a crash after reestablish would forget the flag and
+		// reopen the operator's force close.
+		if (
+			msg.nextRevocationNumber === this._state.localCommitmentNumber + 1n &&
+			!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32)) &&
+			this._state.restoreRevokedRisk !== true
+		) {
+			this._state.restoreRevokedRisk = true;
+			// Deliberately NOT recording dlpRemotePerCommitmentPoint the way
+			// the DLP arm above does. That arm stamps an ERRORED row that
+			// never advances again, while this one resumes and keeps tracking
+			// the peer's point in remoteCurrentPerCommitmentPoint; the chain
+			// monitor prefers the DLP point over the live one when it sweeps
+			// to_remote from the peer's commitment, so stamping it here would
+			// pin a point that goes stale with the next round.
+			actions.push({ type: ChannelActionType.PERSIST_STATE });
+		}
+
 		// ── Commitment retransmission logic ──
 		// msg.nextCommitmentNumber is the next commitment the peer expects to RECEIVE from us.
 		// We've created up to remoteCommitmentNumber commitments for them.
@@ -9996,15 +10121,19 @@ export class Channel {
 		// msg.nextRevocationNumber is the next revocation the peer expects from us.
 		// We can only have revoked up to localCommitmentNumber commitments.
 		// A value of EXACTLY localCommitmentNumber + 1 is the sig-in-flight
-		// case, not a gap: the peer signed a commitment we never received (the
-		// connection died between its updates/signature and us). Its own
-		// retransmission (updates + commitment_signed, triggered by our
-		// next_commitment_number) brings us level, after which we revoke
-		// normally. Only a larger gap is irrecoverable. Backstop: the secret
-		// validator admits only our real secret at that index, and the
-		// fell-behind arm above then claims every such gap first, so this arm
-		// is normally unreachable; it stays so a gap can never fall through to
-		// the retransmission logic.
+		// case as far as the COUNTER goes: the peer signed a commitment we
+		// never received (the connection died between its updates/signature
+		// and us), and its own retransmission (updates + commitment_signed,
+		// triggered by our next_commitment_number) brings us level, after
+		// which we revoke normally. That is why this arm lets exactly + 1
+		// resume. What a signature in flight cannot explain is the peer
+		// knowing our secret at that index, so a VALID secret there has
+		// already set the never-broadcast flag above (issues #905 and #915)
+		// and the row resumes held. Only a larger gap is irrecoverable, and
+		// it is a backstop: the secret validator admits only our real secret
+		// at that index, and the fell-behind arm above then claims every such
+		// gap first, so this arm is normally unreachable; it stays so a gap
+		// can never fall through to the retransmission logic.
 		if (msg.nextRevocationNumber > this._state.localCommitmentNumber + 1n) {
 			// Peer expects a revocation we've never created — irrecoverable
 			return this._heldReestablishGapFailure(
@@ -13172,6 +13301,7 @@ export class Channel {
 	canOfferHtlcSet(amounts: bigint[]): boolean {
 		if (amounts.length > 0 && this._fforUpdateRefusal('add')) return false;
 		if (amounts.length === 0) return true;
+		if (this._state.restoreRevokedRisk === true) return false;
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			!this.canUpdateHtlcsDuringSplice()
@@ -13215,6 +13345,7 @@ export class Channel {
 		reservationHint = false
 	): boolean {
 		if (!reservationHint && this._fforUpdateRefusal('add')) return false;
+		if (this._state.restoreRevokedRisk === true) return false;
 		if (isRecencyUnproven(this._state)) return false;
 		if (this._state.fundingUnaccounted === true) return false;
 		return this.isHtlcUsable(lookThroughReestablish);

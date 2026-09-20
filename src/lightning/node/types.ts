@@ -1035,6 +1035,17 @@ export interface IChannelInfo {
 	 */
 	reestablishRecencyUnproven?: boolean;
 	/**
+	 * The peer has proven at channel_reestablish that it holds the revocation
+	 * for this channel's current commitment (issues #905 and #915), so no
+	 * broadcast of it is permitted, the operator's own force close included.
+	 * The channel takes no new HTLCs and is offered to no router, planner or
+	 * routing hint; existing HTLCs still settle. Present on restored and
+	 * ordinary channels alike, and only until the peer's retransmission
+	 * levels the row; it is, alongside the two holds above, a reason a NORMAL
+	 * channel can report htlcUsable false.
+	 */
+	restoreRevokedRisk?: boolean;
+	/**
 	 * Neither mempool nor chain can account for this channel's funding and this
 	 * node has no broadcast left to answer with, so the channel is quarantined:
 	 * it takes no NEW HTLCs and is offered to no router or planner (issue #593).
