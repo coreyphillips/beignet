@@ -279,6 +279,19 @@ const NAMESPACE_LOST_REFUSAL =
 	'could never be proven durable; close the existing channels and provision ' +
 	'a new namespace';
 
+/**
+ * What a fenced inbound open is told on the wire (issue #906 review).
+ *
+ * The fence's own reason names our recovery state: a capsule restore that
+ * has not resolved, a chain tip we do not know yet. Put verbatim in a BOLT 1
+ * error it tells the counterparty exactly when our channel state is least
+ * certain, which is an invitation nobody needs to send. The peer only has to
+ * learn that this open was refused and that retrying later is worth its
+ * while; the reason stays local, on the 'error' event every refusal already
+ * emits, where the operator and the daemon's log can read it.
+ */
+const NEW_CHANNEL_FENCE_WIRE_REASON = 'new channels are temporarily refused';
+
 /** One channel's held batches, released strictly in order. */
 interface IBarrierQueue {
 	peerPubkey: string;
@@ -327,6 +340,20 @@ export interface IChannelManagerConfig {
 	 * chain while signing secrets are re-derived at restart and recovery.
 	 */
 	channelKeyDeriver?: (channelIndex: number) => IPerChannelKeys;
+	/**
+	 * Fence on brand-new channels (issue #906). Consulted by every path that
+	 * would consume a fresh channel key index, the inbound acceptors
+	 * included, and read anew each time. A non-null answer is the reason the
+	 * open is refused with: as a throw for an outbound open, and locally on
+	 * the 'error' event for an inbound one, whose peer gets a BOLT 1 error
+	 * that says only that new channels are refused for now (the reason can
+	 * name our recovery state, which is not the counterparty's business);
+	 * no index is consumed either way. The daemon supplies it during active
+	 * capsule auto-apply or a rebuild, and while its block height is zero.
+	 * Idle or refused auto-apply permits opens at a nonzero height. Unset,
+	 * every open is allowed exactly as before.
+	 */
+	newChannelsRefused?: () => string | null;
 	/**
 	 * Custom {@link ISigner} factory (e.g. a remote/external signer). When
 	 * set, it replaces the internal ChannelSigner construction for every
@@ -496,6 +523,41 @@ const MAX_UNKNOWN_REESTABLISH_HOLD_MS = 2_147_483_647;
 const MAX_WIRE_ERROR_DATA_BYTES = 0xffff;
 
 /**
+ * Issue #906: how many channel key indices the chain-tip floor spaces per
+ * block. A birth boot (no key-index row, no persisted floor) starts the next
+ * index at tip * CHANNEL_INDEX_FLOOR_STRIDE rather than at the tip itself,
+ * because a device can consume several indices between two blocks while the
+ * floor advances only once. A refused open hands its index straight back
+ * (see _releaseUnusedChannelIndex), so what counts against the budget is
+ * opens this node ANSWERED: accepted ones, funded or abandoned, and its own
+ * outbound attempts. The spacing budget is 128 of those per elapsed block,
+ * and no allocation rate limit enforces it. Same-block restores and
+ * allocations beyond that budget can still collide (see
+ * _channelIndexTipFloor). The index is a hardened
+ * BIP32 child in the default deriver, so it must stay under 0x7fffffff
+ * (2^31 - 1, MAX_BIP32_DERIVATION_INDEX in backup/scb.ts): 0x7fffffff / 128
+ * is 16,777,215 blocks, over 300 years of mainnet at ten minutes a block and
+ * several times testnet3's storm-inflated height, so 128 times any plausible
+ * tip stays under the limit; CHANNEL_INDEX_FLOOR_MAX clamps the product for
+ * a height that is not plausible.
+ */
+export const CHANNEL_INDEX_FLOOR_STRIDE = 128;
+
+/**
+ * Issue #906: the ceiling on the floored value. The height the floor
+ * multiplies is the chain backend's word, unvalidated, and the product must
+ * stay a derivable hardened index: 0x7fffffff (2^31 - 1) is the last one,
+ * and a height above 16,777,215 (0x7fffffff / 128, rounded down) would
+ * carry the counter past it in one step, after which every derivation
+ * throws. The ceiling stops 2^20 short of the limit, 0x7fffffff - 0x100000
+ * = 0x7fefffff = 2,146,435,071, so a database clamped here still has
+ * 1,048,576 indices to hand out before the deriver refuses. Heights up to
+ * 16,769,023 (0x7fefffff / 128, rounded down) floor unclamped; no real
+ * chain reaches that.
+ */
+export const CHANNEL_INDEX_FLOOR_MAX = 0x7fffffff - 2 ** 20;
+
+/**
  * `reason` as wire bytes, clamped to what the length prefix can carry.
  *
  * Not every reason is ours: abortPendingOpen quotes an IFundingProvider error
@@ -646,6 +708,27 @@ export class ChannelManager extends EventEmitter {
 	private _knownPreimages: Map<string, Buffer> = new Map();
 	private zeroConfManager: ZeroConfManager = new ZeroConfManager();
 	private _nextChannelIndex = 1;
+	/**
+	 * Issue #906: armed on a boot whose database has no record of the next
+	 * channel key index yet (no key-index row and no persisted floor, see
+	 * LightningNode.restoreFromStorage). While armed, the FIRST real height
+	 * learned, a header or a height the node already knew, floors the next
+	 * index at max(current, tip * CHANNEL_INDEX_FLOOR_STRIDE) and disarms:
+	 * the floor fires once per database, the node persists the value it
+	 * reached, and every later boot seeds the counter from that row beside
+	 * the table's own high-water mark, with no header moving it again.
+	 * For unclamped heights H > H0, sequential allocation from H0 * 128
+	 * leaves every consumed index below a fresh boot's H * 128 while at
+	 * most 128 * (H - H0) indices have been consumed. Count every open this
+	 * node ANSWERED, accepted but abandoned ones included, not just funded
+	 * channels; an open it refused gave its index back.
+	 * This is bounded spacing, not a uniqueness guarantee or an enforced rate
+	 * limit. Same-block restores start at the same index, and stale heights
+	 * or allocations beyond the budget can also collide. The auto-apply
+	 * fence protects its active restore window; it does not fence another
+	 * running device or resolve these remaining collisions.
+	 */
+	private _channelIndexTipFloor = false;
 	/** Wallet-owned destination for cooperative-close payouts, if configured. */
 	private _walletDestinationScript: Buffer | null = null;
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
@@ -714,10 +797,156 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
-	 * Set the next channel index (e.g. after restoring from storage).
+	 * Raise the next channel index (e.g. after restoring from storage). The
+	 * counter never moves down (issue #906): a lower value is ignored, since
+	 * every index below the current one may already be burned.
 	 */
 	set nextChannelIndex(value: number) {
-		this._nextChannelIndex = value;
+		if (value > this._nextChannelIndex) this._nextChannelIndex = value;
+	}
+
+	/**
+	 * Arm the chain-tip floor on the next channel index (issue #906). The
+	 * node calls this on a birth boot: no key-index row and no persisted
+	 * floor, so nothing records what a previous device holding this seed
+	 * handed out, and a counter left at 1 would give the next channel,
+	 * opened OR accepted, byte for byte the funding key, basepoints and
+	 * per-commitment seed of whichever channel that device held at index 1.
+	 * The floor is max(current, tip * CHANNEL_INDEX_FLOOR_STRIDE), the
+	 * product clamped at CHANNEL_INDEX_FLOOR_MAX, taken ONCE from the first
+	 * real height (the one passed here when the node already knows it, else
+	 * the first header), after which it disarms; it only ever raises the
+	 * counter. A table that was populated on every boot of its life never
+	 * arms it: allocation continues from its stored high-water mark instead.
+	 */
+	armChannelIndexTipFloor(knownTipHeight = 0): void {
+		this._channelIndexTipFloor = true;
+		this._applyChannelIndexTipFloor(knownTipHeight);
+	}
+
+	/**
+	 * True while the chain-tip floor is armed and no real height has fired
+	 * it yet (issue #906): the node persists the floor the moment this turns
+	 * false, and a restart before then is a birth boot again.
+	 */
+	get channelIndexTipFloorArmed(): boolean {
+		return this._channelIndexTipFloor;
+	}
+
+	private _applyChannelIndexTipFloor(height: number): void {
+		if (!this._channelIndexTipFloor) return;
+		// A height that is not a finite number is not a tip. NaN fails every
+		// comparison, so a bare `tip <= 0` would let it through, disarm the
+		// floor and leave the counter where it was, after which the node
+		// persists that unfloored value as the floor and every later boot
+		// reads it (issue #906 review): the birth window would close with
+		// the counter still at 1. Each side is dropped on its own, so a
+		// height already poisoned by such a call cannot hold a real header
+		// hostage through Math.max either.
+		const given = Number.isFinite(height) ? height : 0;
+		const known = Number.isFinite(this._currentBlockHeight)
+			? this._currentBlockHeight
+			: 0;
+		const tip = Math.max(given, known);
+		if (tip <= 0) return;
+		this._channelIndexTipFloor = false;
+		// Clamped: an implausible height must not carry the counter past the
+		// hardened derivation limit (see CHANNEL_INDEX_FLOOR_MAX).
+		const floor = Math.min(
+			tip * CHANNEL_INDEX_FLOOR_STRIDE,
+			CHANNEL_INDEX_FLOOR_MAX
+		);
+		if (floor > this._nextChannelIndex) this._nextChannelIndex = floor;
+	}
+
+	/**
+	 * The fence on brand-new channels (issue #906), or null. Read on every
+	 * consultation rather than latched: both answers below change as the
+	 * node learns its chain tip and the daemon's restore lane settles.
+	 *
+	 * The library fences itself first. An armed-but-unfired floor means this
+	 * database has no record of the next channel key index AND no tip to
+	 * floor it at, so the counter still stands at 1: the very state in which
+	 * an inbound open (the liquidity peer's automatic one included) would
+	 * derive the funding key, basepoints and per-commitment seed of whatever
+	 * channel a previous device held at index 1. The configured predicate
+	 * cannot be relied on for that window, since only the daemon supplies
+	 * one and a plain embedder leaves it unset (issue #906 review). It lifts
+	 * by itself the moment a real height fires the floor, which is the first
+	 * header any chain-connected node sees.
+	 *
+	 * Only with a channelKeyDeriver, because only then is there an index to
+	 * protect: without one every channel takes the node-level shared keys at
+	 * index 0 and the counter is never consumed, so refusing that open would
+	 * buy nothing. Such a node reuses key material between ALL its channels
+	 * by construction, which is a separate and deliberately out of scope
+	 * gap (#906's "Node built without channelKeyDeriver"), not something a
+	 * chain tip could fix.
+	 */
+	private _newChannelRefusal(): string | null {
+		if (this._channelIndexTipFloor && this.config.channelKeyDeriver) {
+			return (
+				'new channels are refused until the chain tip is known: the ' +
+				'channel key index floor is armed'
+			);
+		}
+		return this.config.newChannelsRefused?.() ?? null;
+	}
+
+	/**
+	 * Hand back a channel key index that no channel ever used (issue #906).
+	 *
+	 * The inbound acceptors derive keys BEFORE the channel validates the
+	 * open's parameters, so an open the channel then rejects (amount,
+	 * reserve, dust, feerate, channel_type) consumes an index. Left
+	 * consumed, a peer offering junk opens burns the chain-tip floor's whole
+	 * per-block budget for free and walks the counter into the range a
+	 * freshly restored device would floor itself at, reinstating the very
+	 * collision the floor exists to prevent.
+	 *
+	 * Releasing is provably safe only for the index handed out LAST: nothing
+	 * else can have been derived in between, so no live channel carries it.
+	 * Callers use it only where nothing carrying those keys reached the
+	 * wire, which for an acceptor means no accept_channel/accept_channel2
+	 * was emitted (our basepoints leave the node in nothing else), and the
+	 * shared-keys fallback (index 0, no counter moved) never qualifies.
+	 */
+	private _releaseUnusedChannelIndex(index: number): void {
+		if (index < 1) return;
+		if (index !== this._nextChannelIndex - 1) return;
+		this._nextChannelIndex = index;
+	}
+
+	/**
+	 * Dispatch an inbound open's answer, releasing the key index it consumed
+	 * when that answer was a refusal (issue #906).
+	 *
+	 * `acceptType` is the only message that carries our basepoints and our
+	 * first per-commitment point to the opener. When the batch holds an
+	 * ERROR and no accept, nothing derived for this channel ever reached the
+	 * wire and the open is over (the ERROR action drops the temporary
+	 * channel), so its index is unused and goes back.
+	 *
+	 * Released BEFORE the batch is dispatched: an observer reached from
+	 * processActions (an 'error' listener, a disconnect handler) can open a
+	 * channel of its own reentrantly, and the release is only provable while
+	 * this index is still the last one handed out.
+	 */
+	private dispatchInboundOpenActions(
+		peerPubkey: string,
+		channel: Channel,
+		actions: ChannelAction[],
+		channelIndex: number,
+		acceptType: MessageType.ACCEPT_CHANNEL | MessageType.ACCEPT_CHANNEL2
+	): void {
+		const accepted = actions.some(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				a.messageType === acceptType
+		);
+		const refused = actions.some((a) => a.type === ChannelActionType.ERROR);
+		if (refused && !accepted) this._releaseUnusedChannelIndex(channelIndex);
+		this.processActions(peerPubkey, channel, actions);
 	}
 
 	/**
@@ -740,6 +969,12 @@ export class ChannelManager extends EventEmitter {
 		// getRecoveryChannelMaterial), so recovering an old channel is never
 		// refused.
 		this._assertNamespaceCanRecordANewChannel();
+		// Issue #906: the configured fence, in the same backstop role. The
+		// acceptors answer the wire from their own pre-check and the openers
+		// surface this throw; either way it sits ahead of the consumption
+		// below, so a refusal never burns an index.
+		const refusal = this._newChannelRefusal();
+		if (refusal) throw new Error(refusal);
 		if (this.config.channelKeyDeriver) {
 			const idx = this._nextChannelIndex++;
 			const keys = this.config.channelKeyDeriver(idx);
@@ -2920,6 +3155,7 @@ export class ChannelManager extends EventEmitter {
 	 */
 	handleNewBlock(blockHeight: number): ChainAction[] {
 		this._currentBlockHeight = blockHeight;
+		this._applyChannelIndexTipFloor(blockHeight);
 		// Update block height on all channels for CLTV validation
 		for (const channel of this.channels.values()) {
 			channel.setBlockHeight(blockHeight);
@@ -3523,6 +3759,21 @@ export class ChannelManager extends EventEmitter {
 			);
 			return;
 		}
+		// Issue #906: the new-channel fence answers the wire here, before any
+		// key is derived or any temporary channel retained, exactly like the
+		// namespace refusal above; the throw inside deriveKeysForNewChannel is
+		// only the backstop. The peer is told nothing beyond "refused for
+		// now" (NEW_CHANNEL_FENCE_WIRE_REASON); the reason is local.
+		const fence = this._newChannelRefusal();
+		if (fence) {
+			this.refuseInboundOpen(
+				peerPubkey,
+				msg.temporaryChannelId,
+				fence,
+				NEW_CHANNEL_FENCE_WIRE_REASON
+			);
+			return;
+		}
 		const tempId = msg.temporaryChannelId.toString('hex');
 		if (this.channelIdInUse(tempId)) {
 			this.refuseInboundOpen(
@@ -3532,58 +3783,85 @@ export class ChannelManager extends EventEmitter {
 			);
 			return;
 		}
+		// Issue #906: the index is consumed HERE, ahead of the parameter
+		// validation the channel does below (amount, reserve, dust, feerate,
+		// channel_type), so an open that never becomes a channel must give
+		// it back. Everything from here to the answer runs under the release:
+		// a throw on the way (an external signer factory, the temporary
+		// channel registration) unwinds the same way a refusal does.
 		const chKeys = this.deriveKeysForNewChannel();
-		const state = createAcceptorState({
-			temporaryChannelId: msg.temporaryChannelId,
-			fundingSatoshis: msg.fundingSatoshis,
-			pushMsat: msg.pushMsat,
-			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
-			localBasepoints: chKeys.basepoints,
-			localPerCommitmentSeed: chKeys.perCommitmentSeed,
-			remoteBasepoints: {
-				fundingPubkey: msg.fundingPubkey,
-				revocationBasepoint: msg.revocationBasepoint,
-				paymentBasepoint: msg.paymentBasepoint,
-				delayedPaymentBasepoint: msg.delayedPaymentBasepoint,
-				htlcBasepoint: msg.htlcBasepoint,
-				firstPerCommitmentPoint: msg.firstPerCommitmentPoint
-			},
-			remoteConfig: {
-				dustLimitSatoshis: msg.dustLimitSatoshis,
-				maxHtlcValueInFlightMsat: msg.maxHtlcValueInFlightMsat,
-				channelReserveSatoshis: msg.channelReserveSatoshis,
-				htlcMinimumMsat: msg.htlcMinimumMsat,
-				toSelfDelay: msg.toSelfDelay,
-				maxAcceptedHtlcs: msg.maxAcceptedHtlcs,
-				feeratePerKw: msg.feeratePerKw
+		let channel: Channel;
+		let actions: ChannelAction[];
+		/** Set once the open is in tempChannels, so a throw can undo it. */
+		let registered: Channel | null = null;
+		try {
+			const state = createAcceptorState({
+				temporaryChannelId: msg.temporaryChannelId,
+				fundingSatoshis: msg.fundingSatoshis,
+				pushMsat: msg.pushMsat,
+				localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: chKeys.basepoints,
+				localPerCommitmentSeed: chKeys.perCommitmentSeed,
+				remoteBasepoints: {
+					fundingPubkey: msg.fundingPubkey,
+					revocationBasepoint: msg.revocationBasepoint,
+					paymentBasepoint: msg.paymentBasepoint,
+					delayedPaymentBasepoint: msg.delayedPaymentBasepoint,
+					htlcBasepoint: msg.htlcBasepoint,
+					firstPerCommitmentPoint: msg.firstPerCommitmentPoint
+				},
+				remoteConfig: {
+					dustLimitSatoshis: msg.dustLimitSatoshis,
+					maxHtlcValueInFlightMsat: msg.maxHtlcValueInFlightMsat,
+					channelReserveSatoshis: msg.channelReserveSatoshis,
+					htlcMinimumMsat: msg.htlcMinimumMsat,
+					toSelfDelay: msg.toSelfDelay,
+					maxAcceptedHtlcs: msg.maxAcceptedHtlcs,
+					feeratePerKw: msg.feeratePerKw
+				}
+			});
+
+			const signer = this.makeSigner(
+				chKeys.channelIndex,
+				chKeys.fundingPrivkey,
+				chKeys.htlcBasepointSecret
+			);
+			channel = new Channel(state, signer);
+			channel.setBlockHeight(this._currentBlockHeight);
+			if (this.config.chainHash) {
+				channel.announcementChainHash = this.config.chainHash;
 			}
-		});
+			channel.channelKeyIndex = chKeys.channelIndex;
+			channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
+			this.tempChannels.set(tempId, channel);
+			this.channelPeers.set(tempId, peerPubkey);
+			registered = channel;
 
-		const signer = this.makeSigner(
+			// Record trust-set membership only. Zero-conf semantics (minimum_depth 0,
+			// fast-tracked channel_ready) are flipped by handleOpenChannel itself and
+			// ONLY when the opener explicitly proposed the zero_conf channel type:
+			// membership alone must not change how ordinary opens validate.
+			if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+				channel.getFullState().trustedPeer = true;
+			}
+
+			actions = channel.handleOpenChannel(msg);
+		} catch (err) {
+			// Nothing was answered, so nothing carrying these keys is on the
+			// wire. Drop the half-built open's registration first: releasing
+			// the index while a temporary channel still held it would let the
+			// next open derive the same keys twice over.
+			if (registered) this.removeCurrentTempChannel(peerPubkey, registered);
+			this._releaseUnusedChannelIndex(chKeys.channelIndex);
+			throw err;
+		}
+		this.dispatchInboundOpenActions(
+			peerPubkey,
+			channel,
+			actions,
 			chKeys.channelIndex,
-			chKeys.fundingPrivkey,
-			chKeys.htlcBasepointSecret
+			MessageType.ACCEPT_CHANNEL
 		);
-		const channel = new Channel(state, signer);
-		channel.setBlockHeight(this._currentBlockHeight);
-		if (this.config.chainHash) {
-			channel.announcementChainHash = this.config.chainHash;
-		}
-		channel.channelKeyIndex = chKeys.channelIndex;
-		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
-		this.tempChannels.set(tempId, channel);
-		this.channelPeers.set(tempId, peerPubkey);
-
-		// Record trust-set membership only. Zero-conf semantics (minimum_depth 0,
-		// fast-tracked channel_ready) are flipped by handleOpenChannel itself and
-		// ONLY when the opener explicitly proposed the zero_conf channel type:
-		// membership alone must not change how ordinary opens validate.
-		if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
-			channel.getFullState().trustedPeer = true;
-		}
-
-		const actions = channel.handleOpenChannel(msg);
-		this.processActions(peerPubkey, channel, actions);
 	}
 
 	private handleAcceptChannel(peerPubkey: string, payload: Buffer): void {
@@ -6758,11 +7036,18 @@ export class ChannelManager extends EventEmitter {
 		];
 	}
 
-	/** Refuse an inbound open before any channel state is retained. */
+	/**
+	 * Refuse an inbound open before any channel state is retained.
+	 *
+	 * `reason` is the local diagnostic: it goes on the 'error' event, where
+	 * the operator reads it. `wireReason` is what the peer is told, the same
+	 * text unless the caller has something to keep to itself (issue #906).
+	 */
 	private refuseInboundOpen(
 		peerPubkey: string,
 		channelId: Buffer,
-		reason: string
+		reason: string,
+		wireReason: string = reason
 	): void {
 		// The open is still refused when the id cannot carry the wire half
 		// (wireErrorPayloadFor says which ids those are), just silently: there
@@ -6770,7 +7055,7 @@ export class ChannelManager extends EventEmitter {
 		// inside the guard with the send, so no failure on the way to the wire
 		// can cost the local refusal diagnostic the finally owes.
 		try {
-			const payload = wireErrorPayloadFor(channelId, reason);
+			const payload = wireErrorPayloadFor(channelId, wireReason);
 			if (payload) {
 				this.sendMessage(peerPubkey, MessageType.ERROR, payload);
 			}
@@ -6902,6 +7187,19 @@ export class ChannelManager extends EventEmitter {
 			this.refuseInboundOpen(peerPubkey, msg.channelId, NAMESPACE_LOST_REFUSAL);
 			return;
 		}
+		// Issue #906: the new-channel fence, on the wire before any derivation
+		// or temporary-channel retention, and generic on the wire (the v1
+		// acceptor does the same).
+		const fence = this._newChannelRefusal();
+		if (fence) {
+			this.refuseInboundOpen(
+				peerPubkey,
+				msg.channelId,
+				fence,
+				NEW_CHANNEL_FENCE_WIRE_REASON
+			);
+			return;
+		}
 
 		// Liquidity ads: when this open would make us SIGN a will_fund (the
 		// buyer requested funds and we sell), the buyer-supplied blockheight
@@ -6937,214 +7235,271 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		const chKeys = this.deriveKeysForNewChannel();
-		const state = createAcceptorState({
-			temporaryChannelId: msg.channelId,
-			fundingSatoshis: 0n,
-			pushMsat: 0n,
-			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
-			localBasepoints: chKeys.basepoints,
-			localPerCommitmentSeed: chKeys.perCommitmentSeed,
-			remoteBasepoints: {
-				fundingPubkey: msg.fundingPubkey,
-				revocationBasepoint: msg.revocationBasepoint,
-				paymentBasepoint: msg.paymentBasepoint,
-				delayedPaymentBasepoint: msg.delayedPaymentBasepoint,
-				htlcBasepoint: msg.htlcBasepoint,
-				firstPerCommitmentPoint: msg.firstPerCommitmentPoint
-			},
-			remoteConfig: {
-				dustLimitSatoshis: msg.dustLimitSatoshis,
-				maxHtlcValueInFlightMsat: msg.maxHtlcValueInFlightMsat,
-				channelReserveSatoshis: 10_000n,
-				htlcMinimumMsat: msg.htlcMinimumMsat,
-				toSelfDelay: msg.toSelfDelay,
-				maxAcceptedHtlcs: msg.maxAcceptedHtlcs,
-				feeratePerKw: msg.commitmentFeeratePerkw
-			}
-		});
-
-		const signer = this.makeSigner(
-			chKeys.channelIndex,
-			chKeys.fundingPrivkey,
-			chKeys.htlcBasepointSecret
-		);
-		const channel = new Channel(state, signer);
-		channel.setBlockHeight(this._currentBlockHeight);
-		if (this.config.chainHash) {
-			channel.announcementChainHash = this.config.chainHash;
-		}
-		channel.channelKeyIndex = chKeys.channelIndex;
-		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
-		const tempId = msg.channelId.toString('hex');
-		this.tempChannels.set(tempId, channel);
-		this.channelPeers.set(tempId, peerPubkey);
-
-		// Trust-set membership only; handleOpenChannel2 flips zero-conf
-		// semantics when (and only when) the opener proposed the zero_conf
-		// channel type. Mirrors the v1 acceptor path.
-		if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
-			state.trustedPeer = true;
-		}
-
-		// Generate per-commitment points for local params
-		const localParams: IDualFundingParams = {
-			fundingSatoshis: 0n, // acceptor can contribute 0 or more
-			fundingFeeratePerkw: msg.fundingFeeratePerkw,
-			commitmentFeeratePerkw: msg.commitmentFeeratePerkw,
-			dustLimitSatoshis: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
-				.dustLimitSatoshis,
-			maxHtlcValueInFlightMsat: (
-				this.config.localConfig || DEFAULT_CHANNEL_CONFIG
-			).maxHtlcValueInFlightMsat,
-			htlcMinimumMsat: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
-				.htlcMinimumMsat,
-			toSelfDelay: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
-				.toSelfDelay,
-			maxAcceptedHtlcs: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
-				.maxAcceptedHtlcs,
-			locktime: msg.locktime,
-			localBasepoints: chKeys.basepoints,
-			localPerCommitmentSeed: chKeys.perCommitmentSeed,
-			secondPerCommitmentPoint: perCommitmentPointFromSecret(
-				generateFromSeed(chKeys.perCommitmentSeed, 0xffffffffffffn - 1n)
-			)
-		};
-
-		// Liquidity ads (bLIP-0051): if the buyer requested funds and we sell
-		// liquidity, contribute the requested amount and sign a will_fund over our
-		// funding pubkey + the buyer's blockheight + channel_type + our rates.
-		//
-		// Script-enforced lease and simple taproot channels are MUTUALLY-EXCLUSIVE
-		// commitment types (LND's taproot script builders have no lease/CLTV lock —
-		// there is no interoperable "leased taproot" commitment). Never offer a lease
-		// on a taproot channel; open it as a normal (unleased) taproot channel instead.
-		if (
-			msg.requestFunds &&
-			// A 0-sat request is a degenerate lease: nothing to contribute and
-			// nothing to charge for. Accept as a plain (unleased) open instead
-			// of signing a will_fund and then failing to fund zero.
-			msg.requestFunds.requestedSats > 0n &&
-			this.config.leaseRates &&
-			this.config.nodePrivateKey &&
-			!isTaprootChannel(msg.channelType ?? null)
-		) {
-			const signature = signWillFund(
-				chKeys.basepoints.fundingPubkey,
-				msg.requestFunds.blockheight,
-				this.config.leaseRates,
-				this.config.nodePrivateKey
-			);
-			localParams.willFund = { signature, leaseRates: this.config.leaseRates };
-			localParams.fundingSatoshis = msg.requestFunds.requestedSats;
-		}
-
-		if (localParams.willFund && msg.requestFunds) {
-			// The lease contribution must actually be FUNDED: source wallet
-			// inputs + change for it, register them on the channel (the
-			// interactive-tx drive contributes and later signs them), and only
-			// then answer with will_fund. No wallet coverage: withdraw the
-			// offer and accept as a plain zero-contribution acceptor rather
-			// than negotiating a funding tx we cannot fund.
-			const requested = msg.requestFunds.requestedSats;
-			const fp = this.fundingProvider;
-			if (canSelectDualFundingInputs(fp)) {
-				const isCurrentOpen = (): boolean =>
-					this.tempChannels.get(tempId) === channel &&
-					this.channelPeers.get(tempId) === peerPubkey;
-				let selection: Promise<IDualFundingSelection>;
-				try {
-					// We are the ACCEPTOR here (answering open_channel2), so our fee
-					// share excludes the common fields and the shared funding output.
-					// The session does not exist until handleOpenChannel2 runs below,
-					// hence the literal rather than session.isInitiator().
-					selection = selectDualFundingContribution(
-						fp,
-						requested,
-						msg.fundingFeeratePerkw,
-						false
-					);
-				} catch (err) {
-					selection = Promise.reject(err);
+		// Issue #906: the index is consumed HERE, ahead of the parameter
+		// validation the channel does below, so every exit from here on that
+		// is not an accept_channel2 gives it back: the refusals through
+		// dispatchInboundOpenActions, the stale-selection returns in the lease
+		// continuation, and a throw on the way through this catch.
+		/** Set once the open is in tempChannels, so a throw can undo it. */
+		let registered: Channel | null = null;
+		/**
+		 * Set once the answer is being dispatched: past that point a throw is
+		 * an observer's, not this open's, and the index is the dispatcher's
+		 * business (the lease continuations dispatch after this frame ends,
+		 * and carry the release themselves).
+		 */
+		let answered = false;
+		try {
+			const state = createAcceptorState({
+				temporaryChannelId: msg.channelId,
+				fundingSatoshis: 0n,
+				pushMsat: 0n,
+				localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: chKeys.basepoints,
+				localPerCommitmentSeed: chKeys.perCommitmentSeed,
+				remoteBasepoints: {
+					fundingPubkey: msg.fundingPubkey,
+					revocationBasepoint: msg.revocationBasepoint,
+					paymentBasepoint: msg.paymentBasepoint,
+					delayedPaymentBasepoint: msg.delayedPaymentBasepoint,
+					htlcBasepoint: msg.htlcBasepoint,
+					firstPerCommitmentPoint: msg.firstPerCommitmentPoint
+				},
+				remoteConfig: {
+					dustLimitSatoshis: msg.dustLimitSatoshis,
+					maxHtlcValueInFlightMsat: msg.maxHtlcValueInFlightMsat,
+					channelReserveSatoshis: 10_000n,
+					htlcMinimumMsat: msg.htlcMinimumMsat,
+					toSelfDelay: msg.toSelfDelay,
+					maxAcceptedHtlcs: msg.maxAcceptedHtlcs,
+					feeratePerKw: msg.commitmentFeeratePerkw
 				}
-				void selection
-					.then(
-						({ inputs, changeScript }) => {
-							// Wallet selection can outlive a disconnect and same-id retry.
-							// A stale completion must not mutate or dispatch for its old
-							// channel; its just-pledged inputs were never registered
-							// anywhere, so their pledges release at once (issue #311).
-							if (!isCurrentOpen()) {
-								this.releaseStaleSelectionPledges(inputs);
-								return;
+			});
+
+			const signer = this.makeSigner(
+				chKeys.channelIndex,
+				chKeys.fundingPrivkey,
+				chKeys.htlcBasepointSecret
+			);
+			const channel = new Channel(state, signer);
+			channel.setBlockHeight(this._currentBlockHeight);
+			if (this.config.chainHash) {
+				channel.announcementChainHash = this.config.chainHash;
+			}
+			channel.channelKeyIndex = chKeys.channelIndex;
+			channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
+			const tempId = msg.channelId.toString('hex');
+			this.tempChannels.set(tempId, channel);
+			this.channelPeers.set(tempId, peerPubkey);
+			registered = channel;
+
+			// Trust-set membership only; handleOpenChannel2 flips zero-conf
+			// semantics when (and only when) the opener proposed the zero_conf
+			// channel type. Mirrors the v1 acceptor path.
+			if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+				state.trustedPeer = true;
+			}
+
+			// Generate per-commitment points for local params
+			const localParams: IDualFundingParams = {
+				fundingSatoshis: 0n, // acceptor can contribute 0 or more
+				fundingFeeratePerkw: msg.fundingFeeratePerkw,
+				commitmentFeeratePerkw: msg.commitmentFeeratePerkw,
+				dustLimitSatoshis: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
+					.dustLimitSatoshis,
+				maxHtlcValueInFlightMsat: (
+					this.config.localConfig || DEFAULT_CHANNEL_CONFIG
+				).maxHtlcValueInFlightMsat,
+				htlcMinimumMsat: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
+					.htlcMinimumMsat,
+				toSelfDelay: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
+					.toSelfDelay,
+				maxAcceptedHtlcs: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
+					.maxAcceptedHtlcs,
+				locktime: msg.locktime,
+				localBasepoints: chKeys.basepoints,
+				localPerCommitmentSeed: chKeys.perCommitmentSeed,
+				secondPerCommitmentPoint: perCommitmentPointFromSecret(
+					generateFromSeed(chKeys.perCommitmentSeed, 0xffffffffffffn - 1n)
+				)
+			};
+
+			// Liquidity ads (bLIP-0051): if the buyer requested funds and we sell
+			// liquidity, contribute the requested amount and sign a will_fund over our
+			// funding pubkey + the buyer's blockheight + channel_type + our rates.
+			//
+			// Script-enforced lease and simple taproot channels are MUTUALLY-EXCLUSIVE
+			// commitment types (LND's taproot script builders have no lease/CLTV lock —
+			// there is no interoperable "leased taproot" commitment). Never offer a lease
+			// on a taproot channel; open it as a normal (unleased) taproot channel instead.
+			if (
+				msg.requestFunds &&
+				// A 0-sat request is a degenerate lease: nothing to contribute and
+				// nothing to charge for. Accept as a plain (unleased) open instead
+				// of signing a will_fund and then failing to fund zero.
+				msg.requestFunds.requestedSats > 0n &&
+				this.config.leaseRates &&
+				this.config.nodePrivateKey &&
+				!isTaprootChannel(msg.channelType ?? null)
+			) {
+				const signature = signWillFund(
+					chKeys.basepoints.fundingPubkey,
+					msg.requestFunds.blockheight,
+					this.config.leaseRates,
+					this.config.nodePrivateKey
+				);
+				localParams.willFund = {
+					signature,
+					leaseRates: this.config.leaseRates
+				};
+				localParams.fundingSatoshis = msg.requestFunds.requestedSats;
+			}
+
+			if (localParams.willFund && msg.requestFunds) {
+				// The lease contribution must actually be FUNDED: source wallet
+				// inputs + change for it, register them on the channel (the
+				// interactive-tx drive contributes and later signs them), and only
+				// then answer with will_fund. No wallet coverage: withdraw the
+				// offer and accept as a plain zero-contribution acceptor rather
+				// than negotiating a funding tx we cannot fund.
+				const requested = msg.requestFunds.requestedSats;
+				const fp = this.fundingProvider;
+				if (canSelectDualFundingInputs(fp)) {
+					const isCurrentOpen = (): boolean =>
+						this.tempChannels.get(tempId) === channel &&
+						this.channelPeers.get(tempId) === peerPubkey;
+					let selection: Promise<IDualFundingSelection>;
+					try {
+						// We are the ACCEPTOR here (answering open_channel2), so our fee
+						// share excludes the common fields and the shared funding output.
+						// The session does not exist until handleOpenChannel2 runs below,
+						// hence the literal rather than session.isInitiator().
+						selection = selectDualFundingContribution(
+							fp,
+							requested,
+							msg.fundingFeeratePerkw,
+							false
+						);
+					} catch (err) {
+						selection = Promise.reject(err);
+					}
+					void selection
+						.then(
+							({ inputs, changeScript }) => {
+								// Wallet selection can outlive a disconnect and same-id retry.
+								// A stale completion must not mutate or dispatch for its old
+								// channel; its just-pledged inputs were never registered
+								// anywhere, so their pledges release at once (issue #311).
+								if (!isCurrentOpen()) {
+									this.releaseStaleSelectionPledges(inputs);
+									// Issue #906: this open is over without an answer, so its
+									// key index is unused too (the release is a no-op unless
+									// it is still the last one handed out).
+									this._releaseUnusedChannelIndex(chKeys.channelIndex);
+									return;
+								}
+								channel.setDualFundingContribution(
+									inputs,
+									changeScript,
+									requested,
+									msg.fundingFeeratePerkw
+								);
+								this.dispatchInboundOpenActions(
+									peerPubkey,
+									channel,
+									channel.handleOpenChannel2(msg, localParams),
+									chKeys.channelIndex,
+									MessageType.ACCEPT_CHANNEL2
+								);
+							},
+							(err) => {
+								if (!isCurrentOpen()) {
+									this._releaseUnusedChannelIndex(chKeys.channelIndex);
+									return;
+								}
+								this.emitContained(
+									'error',
+									msg.channelId,
+									`Lease contribution not funded (${
+										(err as Error)?.message ?? err
+									}); accepting without will_fund`
+								);
+								// The diagnostic observer can synchronously disconnect and replace
+								// this open, so ownership must be checked again after it returns.
+								if (!isCurrentOpen()) {
+									this._releaseUnusedChannelIndex(chKeys.channelIndex);
+									return;
+								}
+								delete localParams.willFund;
+								localParams.fundingSatoshis = 0n;
+								// Withdrawn lease → plain zero-contribution accept; register
+								// the empty contribution so the drive still answers the
+								// opener's turns (see below).
+								channel.setDualFundingContribution(
+									[],
+									Buffer.alloc(0),
+									0n,
+									msg.fundingFeeratePerkw
+								);
+								this.dispatchInboundOpenActions(
+									peerPubkey,
+									channel,
+									channel.handleOpenChannel2(msg, localParams),
+									chKeys.channelIndex,
+									MessageType.ACCEPT_CHANNEL2
+								);
 							}
-							channel.setDualFundingContribution(
-								inputs,
-								changeScript,
-								requested,
-								msg.fundingFeeratePerkw
-							);
-							const actions = channel.handleOpenChannel2(msg, localParams);
-							this.processActions(peerPubkey, channel, actions);
-						},
-						(err) => {
-							if (!isCurrentOpen()) return;
+						)
+						.catch((err) => {
+							// Dispatch failures are not wallet-selection failures and must not
+							// run the fallback a second time.
 							this.emitContained(
 								'error',
 								msg.channelId,
-								`Lease contribution not funded (${
-									(err as Error)?.message ?? err
-								}); accepting without will_fund`
+								`Lease open dispatch failed: ${(err as Error)?.message ?? err}`
 							);
-							// The diagnostic observer can synchronously disconnect and replace
-							// this open, so ownership must be checked again after it returns.
-							if (!isCurrentOpen()) return;
-							delete localParams.willFund;
-							localParams.fundingSatoshis = 0n;
-							// Withdrawn lease → plain zero-contribution accept; register
-							// the empty contribution so the drive still answers the
-							// opener's turns (see below).
-							channel.setDualFundingContribution(
-								[],
-								Buffer.alloc(0),
-								0n,
-								msg.fundingFeeratePerkw
-							);
-							const actions = channel.handleOpenChannel2(msg, localParams);
-							this.processActions(peerPubkey, channel, actions);
-						}
-					)
-					.catch((err) => {
-						// Dispatch failures are not wallet-selection failures and must not
-						// run the fallback a second time.
-						this.emitContained(
-							'error',
-							msg.channelId,
-							`Lease open dispatch failed: ${(err as Error)?.message ?? err}`
-						);
-					});
-				return;
+						});
+					return;
+				}
+				// No funding provider: keep the legacy behavior (the embedder — or a
+				// test harness — drives the contribution itself via addTxInput).
+			} else {
+				// Plain zero-contribution accept. Register the EMPTY contribution so
+				// the interactive-tx drive takes our turns: with nothing to add it
+				// answers each opener message with tx_complete. Without a registered
+				// contribution the drive is a no-op (reserved for the legacy
+				// embedder-driven flow), the acceptor never completes, and the
+				// negotiation deadlocks with both sides parked in DUAL_FUNDING_V2 —
+				// which is exactly how every beignet-to-beignet v2 open hung (CLN
+				// acceptors reply on their own, so interop tests never caught it).
+				channel.setDualFundingContribution(
+					[],
+					Buffer.alloc(0),
+					0n,
+					msg.fundingFeeratePerkw
+				);
 			}
-			// No funding provider: keep the legacy behavior (the embedder — or a
-			// test harness — drives the contribution itself via addTxInput).
-		} else {
-			// Plain zero-contribution accept. Register the EMPTY contribution so
-			// the interactive-tx drive takes our turns: with nothing to add it
-			// answers each opener message with tx_complete. Without a registered
-			// contribution the drive is a no-op (reserved for the legacy
-			// embedder-driven flow), the acceptor never completes, and the
-			// negotiation deadlocks with both sides parked in DUAL_FUNDING_V2 —
-			// which is exactly how every beignet-to-beignet v2 open hung (CLN
-			// acceptors reply on their own, so interop tests never caught it).
-			channel.setDualFundingContribution(
-				[],
-				Buffer.alloc(0),
-				0n,
-				msg.fundingFeeratePerkw
-			);
-		}
 
-		const actions = channel.handleOpenChannel2(msg, localParams);
-		this.processActions(peerPubkey, channel, actions);
+			const answer = channel.handleOpenChannel2(msg, localParams);
+			answered = true;
+			this.dispatchInboundOpenActions(
+				peerPubkey,
+				channel,
+				answer,
+				chKeys.channelIndex,
+				MessageType.ACCEPT_CHANNEL2
+			);
+		} catch (err) {
+			// Nothing was answered, so nothing carrying these keys is on the
+			// wire. Drop the half-built open's registration before releasing the
+			// index: a temporary channel still holding it would let the next
+			// open derive the same keys a second time.
+			if (!answered) {
+				if (registered) this.removeCurrentTempChannel(peerPubkey, registered);
+				this._releaseUnusedChannelIndex(chKeys.channelIndex);
+			}
+			throw err;
+		}
 	}
 
 	private handleAcceptChannel2Msg(peerPubkey: string, payload: Buffer): void {

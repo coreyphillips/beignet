@@ -34,6 +34,13 @@ import {
 	deriveLightningKeysFromMnemonic
 } from '../../src/lightning/keys/wallet-keys';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import {
+	CHANNEL_INDEX_FLOOR_STRIDE,
+	ChannelManager
+} from '../../src/lightning/channel/channel-manager';
+import { REGTEST_CHAIN_HASH } from '../../src/lightning/channel/types';
+import { decodeErrorMessage } from '../../src/lightning/message/error';
+import { MessageType } from '../../src/lightning/message/types';
 import * as bip39 from 'bip39';
 
 const MNEMONIC =
@@ -2648,6 +2655,318 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 			fs.rmSync(dirA, { recursive: true, force: true });
 			fs.rmSync(dirB, { recursive: true, force: true });
 			fs.rmSync(dirC, { recursive: true, force: true });
+		}
+	});
+
+	// ─── The new-channel fence (issue #906) ───
+
+	/** A mainnet-scale height these fixtures floor the key index at. */
+	const FENCE_TIP = 850_000;
+	/** Where the floor lands for a birth boot at FENCE_TIP (issue #906). */
+	const FENCE_FLOOR = FENCE_TIP * CHANNEL_INDEX_FLOOR_STRIDE;
+	/**
+	 * What a fenced open tells the OPENER. The reason names this node's
+	 * recovery state, which the counterparty has no business learning, so it
+	 * stays local (issue #906 review).
+	 */
+	const FENCE_WIRE_REASON = 'new channels are temporarily refused';
+	const FENCE_WALLET = '02' + 'b1'.repeat(32);
+	// The liquidity peer that opens inbound for automatic offline receive: no
+	// operator action stands between its open_channel and a key index.
+	const fenceLspKeys = deriveLightningKeysFromMnemonic(
+		bip39.generateMnemonic(),
+		undefined,
+		LnCoinType.REGTEST
+	);
+	const FENCE_LSP = fenceLspKeys.nodePublicKey.toString('hex');
+	const fenceLsp = new ChannelManager({
+		localBasepoints: fenceLspKeys.channelBasepoints,
+		localPerCommitmentSeed: fenceLspKeys.perCommitmentSeed,
+		localFundingPrivkey: fenceLspKeys.fundingPrivkey,
+		htlcBasepointSecret: fenceLspKeys.htlcBasepointSecret,
+		chainHash: REGTEST_CHAIN_HASH
+	});
+	fenceLsp.on('error', () => {});
+	const fenceOffers: Buffer[] = [];
+	fenceLsp.on(
+		'message:outbound',
+		(_peer: string, type: number, payload: Buffer) => {
+			if (type === MessageType.OPEN_CHANNEL) fenceOffers.push(payload);
+		}
+	);
+	/**
+	 * One inbound open_channel against the daemon's CURRENT node. `wire` is
+	 * what the opener was told, `local` the reason the node kept to itself
+	 * (the 'error' event the refusal emits).
+	 */
+	function offer(daemon: IStartedDaemon): {
+		wire: string | null;
+		local: string | null;
+		tempId: Buffer;
+		accepted: boolean;
+		index: number;
+	} {
+		const tempId = fenceLsp
+			.openChannel(FENCE_WALLET, 100_000n)
+			.getTemporaryChannelId();
+		const manager = daemon.node.getNode().getChannelManager();
+		const wire: Array<{ type: number; payload: Buffer }> = [];
+		const local: string[] = [];
+		const onWire = (_peer: string, type: number, payload: Buffer): void => {
+			wire.push({ type, payload });
+		};
+		const onError = (_id: Buffer | null, message: string): void => {
+			local.push(message);
+		};
+		manager.on('error', onError);
+		manager.on('message:outbound', onWire);
+		manager.handleMessage(
+			FENCE_LSP,
+			MessageType.OPEN_CHANNEL,
+			fenceOffers[fenceOffers.length - 1]
+		);
+		manager.off('message:outbound', onWire);
+		manager.off('error', onError);
+		const errors = wire
+			.filter((m) => m.type === MessageType.ERROR)
+			.map((m) => decodeErrorMessage(m.payload));
+		expect(errors.length, 'at most one refusal').to.be.at.most(1);
+		if (errors.length === 1) {
+			expect(errors[0].channelId.equals(tempId)).to.equal(true);
+		}
+		return {
+			wire: errors.length === 1 ? errors[0].data.toString('utf8') : null,
+			local: local.length > 0 ? local[local.length - 1] : null,
+			tempId,
+			accepted: manager.getTempChannel(tempId) !== undefined,
+			index: manager.nextChannelIndex
+		};
+	}
+	const predicateOf = (daemon: IStartedDaemon): (() => string | null) =>
+		(
+			daemon.node.getNode().getChannelManager() as unknown as {
+				config: { newChannelsRefused: () => string | null };
+			}
+		).config.newChannelsRefused;
+
+	it('fences new channels while the lane is unresolved or the tip is unknown (issue #906)', async function (): Promise<void> {
+		this.timeout(120_000);
+		const dirA = tmpDir('fence-a');
+		const dirB = tmpDir('fence-b');
+		try {
+			const { inline } = await composeSource(dirA, 'fence probe');
+			const deviceB = await startDaemon({ ...OFFLINE, dataDir: dirB, ...AUTO });
+			const portB = portOf(deviceB);
+			try {
+				// (b) The tip is unknown on a birth boot: refused on the wire,
+				// generically, with the reason kept local, no temporary channel
+				// and no index consumed. The channel manager answers this one
+				// itself (the floor is armed and unfired), so an embedder with
+				// no predicate is fenced here too.
+				const unknownTip = offer(deviceB);
+				expect(unknownTip.wire).to.equal(FENCE_WIRE_REASON);
+				expect(unknownTip.local).to.match(/until the chain tip is known/);
+				expect(unknownTip.accepted).to.equal(false);
+				expect(unknownTip.index).to.equal(1);
+
+				// The tip arrives and the floor fires. The lane is still armed
+				// and undecided on an EMPTY boot, so the fence holds, now for
+				// the capsule rather than the tip.
+				deviceB.node.getNode().handleNewBlock(FENCE_TIP);
+				expect(
+					deviceB.node.getNode().getChannelManager().nextChannelIndex
+				).to.equal(FENCE_FLOOR);
+				expect(predicateOf(deviceB)()).to.match(
+					/empty boot waits for a Recovery Capsule/
+				);
+				const waiting = offer(deviceB);
+				expect(waiting.wire).to.equal(FENCE_WIRE_REASON);
+				expect(waiting.accepted).to.equal(false);
+				expect(waiting.index).to.equal(FENCE_FLOOR);
+
+				// (a') A capsule arrives and the lane settles: an open in that
+				// window is refused naming the lane, nothing retained.
+				const arrived = waitForEvent(deviceB, 'recovery:capsule-retrieved');
+				const restored = waitForEvent<{ resumed: boolean }>(
+					deviceB,
+					'recovery:restored',
+					60_000
+				);
+				retrieved(deviceB, PEER_A, inline);
+				await arrived;
+				expect((await statusOf(portB)).autoApply.phase).to.equal('settling');
+				const settling = offer(deviceB);
+				expect(settling.local).to.match(/auto-apply settling/);
+				expect(settling.wire).to.equal(FENCE_WIRE_REASON);
+				expect(settling.accepted).to.equal(false);
+				expect(settling.index).to.equal(FENCE_FLOOR);
+
+				// Resolved: the rebuilt node serves opens again once it too
+				// knows the tip, and the floor carries into its empty table.
+				expect((await restored).resumed).to.equal(true);
+				expect((await statusOf(portB)).autoApply.phase).to.equal('applied');
+				const rebuiltBlind = offer(deviceB);
+				expect(rebuiltBlind.local).to.match(/until the chain tip is known/);
+				expect(rebuiltBlind.wire).to.equal(FENCE_WIRE_REASON);
+				expect(rebuiltBlind.accepted).to.equal(false);
+				deviceB.node.getNode().handleNewBlock(FENCE_TIP);
+				const served = offer(deviceB);
+				expect(served.wire).to.equal(null);
+				expect(served.accepted).to.equal(true);
+				expect(
+					deviceB.node
+						.getNode()
+						.getChannelManager()
+						.getTempChannel(served.tempId)!.channelKeyIndex
+				).to.equal(FENCE_FLOOR);
+				expect(served.index).to.equal(FENCE_FLOOR + 1);
+			} finally {
+				await deviceB.stop();
+			}
+		} finally {
+			fs.rmSync(dirA, { recursive: true, force: true });
+			fs.rmSync(dirB, { recursive: true, force: true });
+		}
+	});
+
+	it('holds an empty boot until the armed auto-apply lane decides, then admits (issue #906)', async function (): Promise<void> {
+		this.timeout(120_000);
+		const dirSrc = tmpDir('fence-empty-src');
+		const dir = tmpDir('fence-empty');
+		try {
+			const { inline } = await composeSource(dirSrc, 'fence empty boot');
+			// A long ceiling: this cell is about the lane's OUTCOME lifting the
+			// hold, not about the elapsed-time bound the next cell covers.
+			const daemon = await startDaemon({
+				...OFFLINE,
+				dataDir: dir,
+				...AUTO,
+				recoveryAutoApplyMaxWaitMs: 60_000
+			});
+			const port = portOf(daemon);
+			try {
+				// The tip clause is out of the way: the floor fires and disarms.
+				daemon.node.getNode().handleNewBlock(FENCE_TIP);
+				const manager = daemon.node.getNode().getChannelManager();
+				expect(manager.channelIndexTipFloorArmed).to.equal(false);
+				expect(manager.nextChannelIndex).to.equal(FENCE_FLOOR);
+
+				// Emptiness alone still fences, because an armed lane may yet
+				// install the key-index table this node has to continue from.
+				expect((await statusOf(port)).autoApply.phase).to.equal('idle');
+				const held = offer(daemon);
+				expect(held.local).to.match(/empty boot waits for a Recovery Capsule/);
+				expect(held.wire).to.equal(FENCE_WIRE_REASON);
+				expect(held.accepted).to.equal(false);
+				expect(held.index).to.equal(FENCE_FLOOR);
+
+				// The node makes state of its own, then the capsule arrives: the
+				// apply is refused (a dirty target), which is a TERMINAL phase.
+				const own = await request(
+					port,
+					'POST',
+					'/invoice/create',
+					{ amountSats: 1, description: 'local state' },
+					ADMIN_KEY
+				);
+				expect(own.body.ok, JSON.stringify(own.body)).to.equal(true);
+				const refused = waitForProgress(daemon, 'capsule:auto-refused');
+				retrieved(daemon, PEER_A, inline);
+				await refused;
+				expect((await statusOf(port)).autoApply.phase).to.equal('refused');
+
+				// Decided: nothing is waiting on the emptiness any more, so the
+				// same open is served, at the floored index.
+				expect(predicateOf(daemon)()).to.equal(null);
+				const served = offer(daemon);
+				expect(served.wire).to.equal(null);
+				expect(served.accepted).to.equal(true);
+				expect(manager.getTempChannel(served.tempId)!.channelKeyIndex).to.equal(
+					FENCE_FLOOR
+				);
+				expect(served.index).to.equal(FENCE_FLOOR + 1);
+			} finally {
+				await daemon.stop();
+			}
+		} finally {
+			fs.rmSync(dirSrc, { recursive: true, force: true });
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('lifts the empty-boot hold once the lane ceiling elapses, with no capsule ever (issue #906)', async function (): Promise<void> {
+		this.timeout(120_000);
+		const dir = tmpDir('fence-unanswered');
+		try {
+			// A genuinely new wallet: auto-apply armed, but no storage peer
+			// will ever answer for it. The lane's own ceiling timer only starts
+			// at the first capsule arrival, so the hold carries its own bound
+			// from the boot, or this wallet could never open its first channel.
+			const daemon = await startDaemon({ ...OFFLINE, dataDir: dir, ...AUTO });
+			const port = portOf(daemon);
+			try {
+				daemon.node.getNode().handleNewBlock(FENCE_TIP);
+				await sleep(AUTO.recoveryAutoApplyMaxWaitMs + 1_000);
+				// Nothing decided the lane: it is still idle, and the boot is
+				// still the empty one. The hold lifted on time alone.
+				expect((await statusOf(port)).autoApply.phase).to.equal('idle');
+				expect(predicateOf(daemon)()).to.equal(null);
+				const served = offer(daemon);
+				expect(served.wire).to.equal(null);
+				expect(served.accepted).to.equal(true);
+				expect(served.index).to.equal(FENCE_FLOOR + 1);
+			} finally {
+				await daemon.stop();
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('does not fence a boot that already knows where allocation stands, tip or no tip (issue #906)', async function (): Promise<void> {
+		this.timeout(120_000);
+		const dir = tmpDir('fence-restart');
+		try {
+			// Boot 1 never learns a tip, so nothing persists a chain height.
+			// Its floor row is written by hand to stand for the databases that
+			// DO know where allocation stands without one: a capsule-restored
+			// wallet, or one whose birth boot floored itself and stopped.
+			const first = await startDaemon({ ...OFFLINE, dataDir: dir });
+			try {
+				const storage = (first.node as unknown as { storage: SqliteStorage })
+					.storage;
+				expect(storage.loadMetadata('channel_key_index_floor')).to.equal('0');
+				storage.saveMetadata('channel_key_index_floor', String(FENCE_FLOOR));
+			} finally {
+				await first.stop();
+			}
+
+			// Boot 2 has no chain backend at all (height 0) and is not a birth
+			// boot: the floor row says where allocation stands, so the counter
+			// starts there and the tip clause must NOT fence, or a daemon that
+			// never reaches its Electrum server could neither open nor accept a
+			// channel. The library's own fence is silent too: nothing is armed.
+			const second = await startDaemon({ ...OFFLINE, dataDir: dir });
+			try {
+				const node = second.node.getNode();
+				expect(node.getCurrentBlockHeight()).to.equal(0);
+				expect(node.getChannelManager().channelIndexTipFloorArmed).to.equal(
+					false
+				);
+				expect(node.getChannelManager().nextChannelIndex).to.equal(FENCE_FLOOR);
+				expect(predicateOf(second)()).to.equal(null);
+				const served = offer(second);
+				expect(served.wire).to.equal(null);
+				expect(served.accepted).to.equal(true);
+				expect(
+					node.getChannelManager().getTempChannel(served.tempId)!
+						.channelKeyIndex
+				).to.equal(FENCE_FLOOR);
+			} finally {
+				await second.stop();
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 });

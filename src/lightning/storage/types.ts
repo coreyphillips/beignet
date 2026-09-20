@@ -149,6 +149,16 @@ export interface IStorageBackend {
 	loadChannelKeyIndex(channelId: string): number | null;
 	loadNextChannelIndex(): number;
 	/**
+	 * Whether the key-index table holds ANY row, deleted channels included.
+	 * loadNextChannelIndex answers 1 both for an empty table and for one
+	 * whose highest index is 0, and only the empty one has no high-water
+	 * mark at all: that is the boot whose next index is floored at the
+	 * chain tip (issue #906). Optional so partial backends keep compiling;
+	 * without it the node falls back to loadAllChannelKeyIndices, then to
+	 * the next index itself.
+	 */
+	hasChannelKeyIndices?(): boolean;
+	/**
 	 * Every stored key-index row, INCLUDING entries whose channel was
 	 * deleted (deletion keeps them: they are the high-water mark that
 	 * prevents key reuse). Optional in the TYPE so partial test backends
