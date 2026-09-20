@@ -119,7 +119,10 @@ export interface IDfReceiverConfig {
 	 * #760), provided its coin is confirmed. The splice then locks at
 	 * `unpairedSpliceDepth` confirmations whatever the channel type, so the
 	 * stranger's input becomes channel state on the same terms a new channel's
-	 * funding does. An unconfirmed stranger coin stays on the open path.
+	 * funding does. An unconfirmed stranger coin cannot be spliced, and it is
+	 * not opened beside the existing channel either: with a channel to grow
+	 * the offer is declined and the payer falls back to a plain send, which is
+	 * spliced in once confirmed. With no channel it takes the open path.
 	 */
 	allowUnpairedSplice?: boolean;
 	/**

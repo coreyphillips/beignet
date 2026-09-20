@@ -1128,7 +1128,8 @@ export class DirectFundingReceiver extends EventEmitter {
 		}
 		const script = Buffer.from(out.script);
 		// An unanswered lookup leaves `confirmed` unknown, and an unpaired payer
-		// with an unknown coin is routed to a new channel instead of the splice.
+		// with an unknown coin is never spliced: opened when there is no channel
+		// yet, declined beside one (11c below).
 		const coin = await this.untilChainAnswers(chainDeadline, async () => {
 			const classified = await classifyOfferedCoin(this.deps.chain, {
 				txidDisplayHex: txidHex,
@@ -1215,6 +1216,34 @@ export class DirectFundingReceiver extends EventEmitter {
 			);
 			return;
 		}
+		// 11c. One channel with the liquidity peer, full stop. A payer whose
+		// coin cannot go under the channel we already have (a stranger's
+		// unconfirmed or unknown coin, or any stranger while unpaired splices
+		// are off) used to be routed to a brand-new channel beside it. That is
+		// the second channel the splice path exists to avoid, so it declines
+		// instead, before the payer's witness leaves: the payer falls back to
+		// a plain on-chain send, which lands as a deposit and is spliced into
+		// the home channel once it has confirmed. With no channel to grow the
+		// open path is unchanged, and so is a coin that can be spliced now.
+		const paired =
+			frame.authenticatedPeer !== undefined &&
+			this.deps.isTrustedPayer(frame.authenticatedPeer);
+		// A coinbase output cannot be spent before it matures and this source
+		// does not report maturity, so it never reads as a confirmed coin for
+		// the splice decision (issue #760).
+		const coinConfirmed = prevTx.isCoinbase() ? false : coin.confirmed;
+		if (
+			this.cfg.allowSplice &&
+			!this.spliceAllowed(paired, coinConfirmed) &&
+			this.deps.usableChannelWith(lsp)
+		) {
+			decline(
+				paired || this.cfg.allowUnpairedSplice
+					? 'the coin is not confirmed and a channel with the liquidity peer already exists; pay again once it has confirmed, or pay the address'
+					: 'a channel with the liquidity peer already exists and it does not take unpaired fundings; pay the address'
+			);
+			return;
+		}
 
 		const outpoint = outpointKey(txidHex, offer.vout);
 		const reserved = this.state.reservationFor(outpoint);
@@ -1278,9 +1307,6 @@ export class DirectFundingReceiver extends EventEmitter {
 		// over rather than counting a second time for the whole exchange.
 		this.state.endAdmission(offerIdHex);
 
-		const paired =
-			frame.authenticatedPeer !== undefined &&
-			this.deps.isTrustedPayer(frame.authenticatedPeer);
 		this.log(DF_LOG_OFFER_ACCEPTED, {
 			offerId: offerIdHex,
 			amountSat: offer.amountSat.toString(),
@@ -1294,15 +1320,8 @@ export class DirectFundingReceiver extends EventEmitter {
 			record,
 			prevTxid: prevTx.getHash(),
 			paired,
-			// A coinbase output cannot be spent before it matures and this
-			// source does not report maturity, so it never reads as a confirmed
-			// coin for the splice decision (issue #760): it takes the open path,
-			// where a funding that cannot relay is forgotten on its own.
-			...(prevTx.isCoinbase()
-				? { coinConfirmed: false }
-				: coin.confirmed !== undefined
-				? { coinConfirmed: coin.confirmed }
-				: {})
+			// Unknown stays unknown: an unanswered index is not a confirmation.
+			...(coinConfirmed !== undefined ? { coinConfirmed } : {})
 		};
 		await this.serve(ctx, () =>
 			this.startFunding(ctx, lsp, prevTx, coin.confirmed)
@@ -1847,8 +1866,10 @@ export class DirectFundingReceiver extends EventEmitter {
 	 * Rev 2 classes splice-in as an extension, so it is off unless the operator
 	 * asked for it. A paired payer then splices outright. An unpaired one
 	 * splices only when the operator allowed that too AND its coin is confirmed
-	 * (issue #760); an unconfirmed or unknown stranger coin keeps the
-	 * confirm-first open path.
+	 * (issue #760); an unconfirmed or unknown stranger coin is never spliced,
+	 * and by the time this runs the admission block has already declined it
+	 * beside an existing channel (11c), so the open path here is the first
+	 * channel's.
 	 *
 	 * The old rule kept every stranger off the splice because its coin went
 	 * under the live funding at once: on a zero-conf channel the splice locked
@@ -1865,13 +1886,19 @@ export class DirectFundingReceiver extends EventEmitter {
 		ctx: IDfSessionContext,
 		liquidityPeer: string
 	): Buffer | null {
-		if (!this.cfg.allowSplice) return null;
-		if (!ctx.paired) {
-			if (!this.cfg.allowUnpairedSplice || ctx.coinConfirmed !== true) {
-				return null;
-			}
-		}
+		if (!this.spliceAllowed(ctx.paired, ctx.coinConfirmed)) return null;
 		return this.deps.usableChannelWith(liquidityPeer);
+	}
+
+	/**
+	 * Whether this payer's coin may go under the channel we already have. The
+	 * one rule behind both the funding choice and the admission decline that
+	 * keeps a second channel from being opened beside that one.
+	 */
+	private spliceAllowed(paired: boolean, coinConfirmed?: boolean): boolean {
+		if (!this.cfg.allowSplice) return false;
+		if (paired) return true;
+		return this.cfg.allowUnpairedSplice && coinConfirmed === true;
 	}
 
 	private startOpen(

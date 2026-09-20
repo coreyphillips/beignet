@@ -2977,11 +2977,26 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 	});
 
 	// allowSplice alone is the pre-#760 rule: only a paired payer's coin goes
-	// under the existing channel. A stranger stays on the confirm-first open
-	// until the operator switches allowUnpairedSplice on as well.
-	it('keeps an anonymous payer on the new-channel path while allowUnpairedSplice is off', async () => {
+	// under the existing channel. A stranger's coin cannot, and a second
+	// channel beside the one we have is exactly what the splice path exists
+	// to avoid, so the offer is declined before the payer's witness leaves:
+	// the payer falls back to a plain send, which is spliced in once confirmed.
+	it('declines an anonymous payer beside an existing channel while allowUnpairedSplice is off', async () => {
 		const h = harness({ allowSplice: true, negotiationTimeoutMs: 5_000 });
 		h.node.spliceChannel = crypto.randomBytes(32);
+		await h.sendOffer();
+		expect(h.lastAck()?.accepted).to.equal(false);
+		expect(h.lastAck()?.reason).to.contain('already exists');
+		expect(h.node.splices).to.have.length(0);
+		expect(h.node.opens).to.have.length(0);
+		expect(h.payer.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		expect(h.engine.inflightCount()).to.equal(0);
+	});
+
+	// With no channel to grow there is nothing to protect: the same stranger
+	// gets the confirm-first open, as before.
+	it('opens for an anonymous payer with no channel while allowUnpairedSplice is off', async () => {
+		const h = harness({ allowSplice: true, negotiationTimeoutMs: 5_000 });
 		await h.sendOffer();
 		expect(h.node.splices).to.have.length(0);
 		expect(h.node.opens).to.have.length(1);
@@ -3082,9 +3097,11 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 	// The depth lock protects the channel once the coin is on chain; a coin
 	// still in the mempool can vanish before it ever gets there, and a splice
 	// waiting on a transaction that will never confirm pins the channel. That
-	// coin takes the open path, where a double spend costs nothing but a
-	// forgotten funding.
-	it('keeps an anonymous payer with an unconfirmed coin on the new-channel path', async () => {
+	// coin cannot be spliced, and it is not opened beside the channel we have
+	// either: one channel with the liquidity peer, full stop. The offer is
+	// declined before the payer's witness leaves, and the payer's fallback (a
+	// plain send) is spliced in by channelize once it has confirmed.
+	it('declines an anonymous payer with an unconfirmed coin beside an existing channel', async () => {
 		const h = harness({
 			allowSplice: true,
 			allowUnpairedSplice: true,
@@ -3093,6 +3110,25 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 		h.node.publish(h.coin, 0);
 		h.node.spliceChannel = crypto.randomBytes(32);
 		await h.sendOffer();
+		expect(h.lastAck()?.accepted).to.equal(false);
+		expect(h.lastAck()?.reason).to.contain('not confirmed');
+		expect(h.node.splices).to.have.length(0);
+		expect(h.node.opens).to.have.length(0);
+		expect(h.payer.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		expect(h.engine.inflightCount()).to.equal(0);
+		expect(
+			h.node.requests.attemptsFor(h.offer.receiptHash.toString('hex')).attempts
+		).to.equal(0);
+	});
+
+	it('opens for an anonymous payer with an unconfirmed coin when there is no channel yet', async () => {
+		const h = harness({
+			allowSplice: true,
+			allowUnpairedSplice: true,
+			negotiationTimeoutMs: 5_000
+		});
+		h.node.publish(h.coin, 0);
+		await h.sendOffer();
 		expect(h.node.splices).to.have.length(0);
 		expect(h.node.opens).to.have.length(1);
 		expect(h.node.opens[0].params.contribution.inputs[0].confirmed).to.equal(
@@ -3100,7 +3136,7 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 		);
 	});
 
-	it('keeps an anonymous payer on the new-channel path when the chain cannot say whether the coin is confirmed', async () => {
+	it('declines an anonymous payer beside an existing channel when the chain cannot say whether the coin is confirmed', async () => {
 		const h = harness({
 			allowSplice: true,
 			allowUnpairedSplice: true,
@@ -3111,8 +3147,9 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 		h.node.history.clear();
 		h.node.spliceChannel = crypto.randomBytes(32);
 		await h.sendOffer();
+		expect(h.lastAck()?.accepted).to.equal(false);
 		expect(h.node.splices).to.have.length(0);
-		expect(h.node.opens).to.have.length(1);
+		expect(h.node.opens).to.have.length(0);
 	});
 
 	it('splices a paired payer with no depth lock, allowUnpairedSplice or not', async () => {
