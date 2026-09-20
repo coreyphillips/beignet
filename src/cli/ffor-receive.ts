@@ -11,6 +11,23 @@ export interface FforReceiveFunding {
 	maxChannelsPerPeer: number;
 	maxChannelSats: number;
 	maxTotalSats: number;
+	/**
+	 * Open the allocated receive channel zero-conf, so the client can be paid
+	 * over it before the funding confirms. Default false.
+	 *
+	 * A ONE-DIRECTIONAL grant, the shape JIT receive already uses for its own
+	 * clients: it authorizes an OUTBOUND zero-conf open from us, funded by our
+	 * own confirmed coins, and never makes this node accept a client's
+	 * unconfirmed funding. That is why it is not the zero-conf trusted set,
+	 * whose membership is symmetric and would do exactly that.
+	 *
+	 * The risk it does carry is the client's. An acceptor that has not trusted
+	 * this node back refuses a zero_conf open OUTRIGHT rather than downgrading
+	 * it to a confirmed one, so turning this on for clients that are not yours
+	 * turns a slow receive into a failed one. Off, each client is served
+	 * zero-conf only if the operator put it in the trusted set by hand.
+	 */
+	zeroConf?: boolean;
 }
 const REQUEST = BeignetCustomSubtype.FFOR_RECEIVE_REQUEST;
 const RESPONSE = BeignetCustomSubtype.FFOR_RECEIVE_RESPONSE;
@@ -67,6 +84,11 @@ export class FforReceiveService {
 			] as const)
 				if (!Number.isSafeInteger(funding[k]) || funding[k] <= 0)
 					throw Error(`fforReceiveFunding.${k} must be positive`);
+		if (
+			funding?.zeroConf !== undefined &&
+			typeof funding.zeroConf !== 'boolean'
+		)
+			throw Error('fforReceiveFunding.zeroConf must be a boolean');
 		const raw = host.getStorage().loadWalletData(KEY);
 		this.allocations = raw ? JSON.parse(raw) : [];
 		if (
@@ -281,19 +303,26 @@ export class FforReceiveService {
 			this.host
 				.getStorage()
 				.saveWalletData(KEY, JSON.stringify(this.allocations));
-			// Zero-conf only where the OPERATOR said so. This used to pass a
-			// hardcoded trusted=true and grant itself the authorization to match,
-			// so enabling receive funding silently proposed a zero_conf channel
-			// type to every client, past the operator's trusted-peer set and past
-			// the daemon's own trusted=false default for opens. A plain daemon on
-			// the far side then refuses the open outright ("Proposed zero_conf
-			// channel type requires a trusted peer"), so the bypass was not even
-			// buying the availability it cost. An untrusted client gets an
-			// ordinary confirmed open instead.
-			const trusted = this.host
-				.getNode()
-				.getChannelManager()
-				.isTrustedPeer(peer);
+			// Zero-conf only where the OPERATOR said so, by one of two
+			// declarations. `zeroConf` on the funding policy grants this client
+			// the ONE-DIRECTIONAL authorization JIT receive already uses for
+			// its own clients: we may open a zero-conf channel to it with our
+			// own confirmed coins, and nothing about it makes us accept the
+			// client's unconfirmed funding. Failing that, a client the operator
+			// put in the symmetric trusted set by hand still gets one.
+			//
+			// What is gone is the hardcoded trusted=true this used to pass,
+			// with a grant it handed itself to match: that proposed a zero_conf
+			// channel type to EVERY client, past the operator's trusted-peer
+			// set and past the daemon's own trusted=false default for opens,
+			// and a client that had not trusted this node back refused the open
+			// outright rather than taking a confirmed one. That refusal is why
+			// the switch defaults to off: on, it is a statement that the
+			// clients are the operator's own.
+			const manager = this.host.getNode().getChannelManager();
+			const granted = this.funding?.zeroConf === true;
+			if (granted) manager.setFforFundingClient(peer, true);
+			const trusted = granted || manager.isTrustedPeer(peer);
 			const opened = this.host.openChannel(peer, amount, 0, 2, false, trusted);
 			allocation.channelId = opened.channelId;
 			allocation.temporaryId = opened.channelId;
@@ -323,6 +352,11 @@ export class FforReceiveService {
 			throw Error('The receive channel is still being prepared.');
 		} finally {
 			this.opening = false;
+			// The grant is per open, never a standing one: a client that asked
+			// once must not carry an authorization into an open it did not ask
+			// for. Unconditional, because a grant made on an earlier allocate
+			// and left behind is the same standing grant.
+			this.host.getNode().getChannelManager().setFforFundingClient(peer, false);
 		}
 	}
 	async receipts(channelId: string): Promise<void> {

@@ -16,12 +16,15 @@ Settlement remains opt-in. Funding new receive channels requires a separate expl
     "maxChannels": 100,
     "maxChannelsPerPeer": 5,
     "maxChannelSats": 500000,
-    "maxTotalSats": 5000000
+    "maxTotalSats": 5000000,
+    "zeroConf": false
   }
 }
 ```
 
-These are cumulative allocation limits, persisted before initiating funding. A failed or interrupted opening retains its allocation rather than risking a second spend on retry. Operators must budget for the funding transactions and channel liquidity. New channels contain the invoice amount plus 50,000 sats of headroom and use a 2 sat/vbyte funding rate. The open is zero-confirmation only when the operator has already put that client in the zero-conf trusted set (`POST /trusted-peer/add`); every other client gets an ordinary confirmed open. Earlier builds proposed the zero-conf channel type to every client regardless, which a peer that had not trusted this node back refuses outright. Allocation never adds a receiving peer to the inbound trust list.
+These are cumulative allocation limits, persisted before initiating funding. A failed or interrupted opening retains its allocation rather than risking a second spend on retry. Operators must budget for the funding transactions and channel liquidity. New channels contain the invoice amount plus 50,000 sats of headroom and use a 2 sat/vbyte funding rate. The open is zero-confirmation only where the operator said so, by one of two declarations. `zeroConf: true` on the funding policy is the one that scales: it grants each allocate client the same one-directional authorization JIT receive uses for its own clients, so this node may open a zero-conf channel to it with this node's own confirmed coins. Failing that, a client the operator put in the zero-conf trusted set by hand (`POST /trusted-peer/add`) also gets one, and that membership is symmetric. Every other client gets an ordinary confirmed open. Neither declaration ever makes this node accept a client's unconfirmed funding, and allocation never adds a receiving peer to the inbound trust list.
+
+Leave `zeroConf` off unless the clients are the operator's own. An acceptor that has not trusted this node back refuses a zero_conf open outright rather than downgrading it to a confirmed one, so the switch turns a slow receive into a failed one for a client that does not trust this LSP. Earlier builds proposed the zero-conf channel type to every client regardless, which is that same failure with no way to turn it off.
 
 Automatic offline receiving is only for a channel that ALREADY exists with the peer and whose inbound capacity covers the amount. The wallet reuses suitable empty inbound channels and never reserves a channel containing spendable local money. After receipt reconciliation, that channel becomes available for ordinary payments. This flow never opens a channel to obtain inbound liquidity: when no suitable channel exists, the request falls back to direct funding, where the payer's on-chain payment becomes this node's channel funding and the liquidity peer opens the channel to us. The receiver therefore never sends the `allocate` message described below; the provider side still answers it for other clients.
 

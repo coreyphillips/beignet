@@ -9,7 +9,7 @@ const other = '03' + '22'.repeat(32);
 const channelId = '33'.repeat(32);
 const epochId = '44'.repeat(32);
 const preimage = Buffer.alloc(32, 5);
-function fixture(role = 'R') {
+function fixture(role = 'R', funding: Record<string, unknown> = {}) {
 	const node: any = new EventEmitter();
 	const sent: any[] = [];
 	const added: any[] = [];
@@ -37,9 +37,12 @@ function fixture(role = 'R') {
 	};
 	/** The operator's zero-conf trusted set, empty unless a cell grants it. */
 	const trustedPeers = new Set<string>();
+	/** Every one-directional zero-conf grant the allocate path made. */
+	const grants: Array<[string, boolean]> = [];
 	node.getChannelManager = () => ({
 		isTrustedPeer: (p: string) => trustedPeers.has(p),
-		getChannelsByPeer: () => []
+		getChannelsByPeer: () => [],
+		setFforFundingClient: (p: string, on: boolean) => grants.push([p, on])
 	});
 	const storage = {
 		loadWalletData: () => disk,
@@ -66,7 +69,8 @@ function fixture(role = 'R') {
 			maxChannels: 1,
 			maxChannelsPerPeer: 1,
 			maxChannelSats: 100000,
-			maxTotalSats: 100000
+			maxTotalSats: 100000,
+			...funding
 		}
 	);
 	const response = (result: any, sender = peer) =>
@@ -88,6 +92,7 @@ function fixture(role = 'R') {
 		host,
 		storage,
 		opened,
+		grants,
 		trust: (p: string): Set<string> => trustedPeers.add(p),
 		get durable() {
 			return durable;
@@ -236,6 +241,62 @@ describe('automatic receive service', () => {
 		} finally {
 			trusted.service.stop();
 		}
+	});
+	// The operator switch that puts zero-conf back on the allocate open, and
+	// does it through the one-directional grant (we may open zero-conf to this
+	// client) rather than the symmetric trusted set (we would also accept the
+	// client's unconfirmed funding).
+	it('proposes zero-conf for any client once the operator sets zeroConf', async () => {
+		const request = {
+			op: 'allocate',
+			allocationId: 'dd'.repeat(16),
+			amountSats: 10000
+		};
+		type Allocator = { serve(peer: string, body: unknown): Promise<unknown> };
+		const f = fixture('S', { zeroConf: true });
+		try {
+			await assert.rejects(
+				(f.service as unknown as Allocator).serve(peer, request),
+				/funding failed/
+			);
+			// Not in the trusted set, and served zero-conf all the same.
+			assert.deepEqual(f.opened, [[peer, 60000, 0, 2, false, true]]);
+			// Granted before the open, and never left standing after it: a
+			// client that asked once must not carry an authorization into an
+			// open it did not ask for.
+			assert.deepEqual(f.grants, [
+				[peer, true],
+				[peer, false]
+			]);
+		} finally {
+			f.service.stop();
+		}
+	});
+	// Off, the open is confirmed and no grant is ever made.
+	it('makes no zero-conf grant with the switch left alone', async () => {
+		const request = {
+			op: 'allocate',
+			allocationId: 'ee'.repeat(16),
+			amountSats: 10000
+		};
+		type Allocator = { serve(peer: string, body: unknown): Promise<unknown> };
+		const f = fixture('S');
+		try {
+			await assert.rejects(
+				(f.service as unknown as Allocator).serve(peer, request),
+				/funding failed/
+			);
+			assert.deepEqual(f.opened, [[peer, 60000, 0, 2, false, false]]);
+			assert.deepEqual(f.grants, [[peer, false]]);
+		} finally {
+			f.service.stop();
+		}
+	});
+	it('refuses a zeroConf that is not a boolean', () => {
+		assert.throws(
+			() => fixture('S', { zeroConf: 'yes' }),
+			/fforReceiveFunding.zeroConf must be a boolean/
+		);
 	});
 	it('stopping cancels pending queries', async () => {
 		const f = fixture();

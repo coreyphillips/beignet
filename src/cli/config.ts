@@ -117,6 +117,8 @@ function receiveFundingEnv(): BeignetConfig['fforReceiveFunding'] {
 		if (value.enabled && (!Number.isSafeInteger(value[key]) || value[key] <= 0))
 			throw new Error(`BEIGNET_FFOR_RECEIVE_FUNDING.${key} must be positive`);
 	}
+	if (value.zeroConf !== undefined && typeof value.zeroConf !== 'boolean')
+		throw new Error('BEIGNET_FFOR_RECEIVE_FUNDING.zeroConf must be a boolean');
 	return value;
 }
 
