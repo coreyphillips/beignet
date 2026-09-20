@@ -29,7 +29,8 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	createOpenerState,
 	createAcceptorState,
-	mustNotBroadcastCommitment
+	mustNotBroadcastCommitment,
+	IChannelState
 } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
@@ -53,6 +54,7 @@ import {
 	decodeRevokeAndAckMessage
 } from '../../src/lightning/message/channel-commitment';
 import { IChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
+import { decodeErrorMessage } from '../../src/lightning/message/error';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
 import {
@@ -243,6 +245,7 @@ function peerPoint(): Buffer {
  */
 function heldOpener(hold = true): {
 	opener: Channel;
+	acceptor: Channel;
 	seed: Buffer;
 	L0: bigint;
 	R0: bigint;
@@ -254,6 +257,7 @@ function heldOpener(hold = true): {
 	opener.markForReestablish();
 	return {
 		opener,
+		acceptor,
 		seed: openerCommitmentSeed,
 		L0: state.localCommitmentNumber,
 		R0: state.remoteCommitmentNumber
@@ -287,6 +291,61 @@ function hasAction(
 	type: ChannelActionType
 ): boolean {
 	return actions.some((a) => a.type === type);
+}
+
+/** A P2WPKH sweep destination, the shape forceCloseChannel expects. */
+const SWEEP_SCRIPT = Buffer.concat([
+	Buffer.from([0x00, 0x14]),
+	crypto
+		.createHash('sha256')
+		.update(Buffer.from('sweep'))
+		.digest()
+		.subarray(0, 20)
+]);
+
+/**
+ * A LightningNode holding exactly this stored row, as a restart would: the
+ * refusals under test are the node's, not the Channel's, and they have to be
+ * reachable from a row that was only ever read back from storage.
+ */
+function nodeForState(state: IChannelState): {
+	node: LightningNode;
+	storage: SqliteStorage;
+	idHex: string;
+	errors: ILightningError[];
+} {
+	const storage = new SqliteStorage(':memory:');
+	storage.open();
+	const peer = getPublicKey(Buffer.alloc(32, 0x75)).toString('hex');
+	const idHex = state.channelId!.toString('hex');
+	storage.saveChannel(idHex, state, peer);
+
+	const node = new LightningNode({
+		nodePrivateKey: crypto
+			.createHash('sha256')
+			.update(Buffer.from('revoked-risk-node'))
+			.digest(),
+		network: Network.REGTEST as Network,
+		channelBasepoints: makeBasepoints(Buffer.alloc(32, 0x76)),
+		perCommitmentSeed: crypto
+			.createHash('sha256')
+			.update(Buffer.from('revoked-risk-pcs'))
+			.digest(),
+		fundingPrivkey: crypto
+			.createHash('sha256')
+			.update(Buffer.from('revoked-risk-funding'))
+			.digest(),
+		htlcBasepointSecret: crypto
+			.createHash('sha256')
+			.update(Buffer.from('revoked-risk-htlc'))
+			.digest(),
+		storage,
+		enableNetworking: false
+	});
+	node.on('error', () => {});
+	const errors: ILightningError[] = [];
+	node.on('node:error', (e: ILightningError) => errors.push(e));
+	return { node, storage, idHex, errors };
 }
 
 describe('Proven revoked commitment (issues #905 and #915)', function () {
@@ -411,22 +470,27 @@ describe('Proven revoked commitment (issues #905 and #915)', function () {
 
 		// Any peer can send this shape: the counter is read off our own
 		// channel_reestablish, and only the secret at index L0 proves the
-		// revocation. While zeroes pass validation the row resumes with the
-		// hatch open, as before this fix; once an all-zero secret above
-		// revocation 0 fails the channel (issue #907) the same message ends
-		// ERRORED on the invalid secret. Neither world may set the flag, or a
-		// peer without the secret could remove the held row's only exit.
+		// revocation, so a forged flag would close the held row's operator
+		// exit for nothing. Since issue #907 the outcome is not merely
+		// "flag off": all zeroes above next_revocation_number 0 is as wrong as
+		// any other value, and at an index above localCommitmentNumber the
+		// validator fails the channel and stamps ITS hold, whose labelled
+		// operator exit stays open.
 		const state = opener.getFullState();
 		expect(state.restoreRevokedRisk).to.equal(undefined);
-		expect(
-			state.state === ChannelState.NORMAL ||
-				state.state === ChannelState.ERRORED,
-			'resumed (zeroes exempt) or failed on the invalid secret (#907)'
-		).to.equal(true);
-		if (state.state === ChannelState.NORMAL) {
-			expect(hasAction(actions, ChannelActionType.ERROR)).to.equal(false);
-			expect(mustNotBroadcastCommitment(state)).to.equal(false);
-		}
+		expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		expect(state.reestablishRecencyUnproven, "issue #907's hold").to.equal(
+			true
+		);
+		expect(hasAction(actions, ChannelActionType.ERROR)).to.equal(true);
+		const wire = findSendAction(actions, MessageType.ERROR);
+		expect(wire, 'the validator answers on the wire').to.not.equal(undefined);
+		expect(decodeErrorMessage(wire!.payload).data.toString('ascii')).to.contain(
+			'Invalid per-commitment secret in channel_reestablish'
+		);
+		// #907's hold is not a broadcast ban, so the refusal below is never
+		// this fix's.
+		expect(mustNotBroadcastCommitment(state)).to.equal(false);
 		const plan = opener.prepareForceClose(opener.getSigner()!);
 		expect((plan as { error?: string }).error).to.not.equal(REVOKED_REFUSAL);
 	});
@@ -533,37 +597,7 @@ describe('Proven revoked commitment (issues #905 and #915)', function () {
 			);
 			expect(state.restoreRevokedRisk).to.equal(true);
 
-			const storage = new SqliteStorage(':memory:');
-			storage.open();
-			const peer = getPublicKey(Buffer.alloc(32, 0x75)).toString('hex');
-			const idHex = state.channelId!.toString('hex');
-			storage.saveChannel(idHex, state, peer);
-
-			const node = new LightningNode({
-				nodePrivateKey: crypto
-					.createHash('sha256')
-					.update(Buffer.from('revoked-risk-node'))
-					.digest(),
-				network: Network.REGTEST as Network,
-				channelBasepoints: makeBasepoints(Buffer.alloc(32, 0x76)),
-				perCommitmentSeed: crypto
-					.createHash('sha256')
-					.update(Buffer.from('revoked-risk-pcs'))
-					.digest(),
-				fundingPrivkey: crypto
-					.createHash('sha256')
-					.update(Buffer.from('revoked-risk-funding'))
-					.digest(),
-				htlcBasepointSecret: crypto
-					.createHash('sha256')
-					.update(Buffer.from('revoked-risk-htlc'))
-					.digest(),
-				storage,
-				enableNetworking: false
-			});
-			node.on('error', () => {});
-			const errors: ILightningError[] = [];
-			node.on('node:error', (e: ILightningError) => errors.push(e));
+			const { node, storage, idHex, errors } = nodeForState(state);
 			try {
 				const row = node
 					.getRecoveryStatus()
@@ -597,15 +631,7 @@ describe('Proven revoked commitment (issues #905 and #915)', function () {
 
 				// Reason 'user', the hatch revision 13 left open: refused, under
 				// its own code, before the engine is even asked.
-				const script = Buffer.concat([
-					Buffer.from([0x00, 0x14]),
-					crypto
-						.createHash('sha256')
-						.update(Buffer.from('sweep'))
-						.digest()
-						.subarray(0, 20)
-				]);
-				const result = node.forceCloseChannel(state.channelId!, script);
+				const result = node.forceCloseChannel(state.channelId!, SWEEP_SCRIPT);
 				expect(result.ok).to.equal(false);
 				expect(result.error).to.match(/already holds the revocation/);
 				expect(result.error).to.match(/no risk to accept/);
@@ -616,10 +642,160 @@ describe('Proven revoked commitment (issues #905 and #915)', function () {
 					node.getChannelManager().getChannel(state.channelId!)!.getState(),
 					'nothing moved'
 				).to.not.equal(ChannelState.FORCE_CLOSED);
+
+				// The readiness surfaces the CLI reads: a channel that refuses
+				// every add must not be advertised as one that takes payments
+				// (issue #905 round 2). listChannels carries the flag and
+				// htlcUsable answers false through it.
+				const info = node
+					.listChannels()
+					.find((c) => c.channelId.toString('hex') === idHex);
+				expect(info?.restoreRevokedRisk, 'listChannels says why').to.equal(
+					true
+				);
+				expect(info?.htlcUsable, 'and the channel takes no adds').to.equal(
+					false
+				);
 			} finally {
 				node.destroy();
 				storage.close();
 			}
 		});
 	}
+
+	it('the levelling round clears the flag and gives the channel its exit back', function () {
+		const { opener, acceptor, seed, L0, R0 } = heldOpener();
+		opener.handleReestablish(peerReestablish(opener, seed, L0 + 1n, R0));
+		expect(opener.getFullState().restoreRevokedRisk).to.equal(true);
+		expect(opener.prepareForceClose(opener.getSigner()!).ok).to.equal(false);
+
+		// What the design RESUMES for: the peer retransmits the
+		// commitment_signed this row never recorded receiving, and our answer
+		// is the revoke_and_ack for commitment L0, whose secret the peer
+		// already holds. Nothing is given away, and the row's current
+		// commitment becomes L0 + 1, whose secret has never left this node.
+		const retransmit = findSendAction(
+			signRealCommitment(acceptor),
+			MessageType.COMMITMENT_SIGNED
+		)!;
+		const answered = opener.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(retransmit.payload)
+		);
+		const raa = findSendAction(answered, MessageType.REVOKE_AND_ACK)!;
+		expect(
+			decodeRevokeAndAckMessage(raa.payload).perCommitmentSecret.equals(
+				secretAt(seed, L0)
+			),
+			'the revealed secret is the one the peer already had'
+		).to.equal(true);
+		expect(
+			hasAction(answered, ChannelActionType.PERSIST_STATE),
+			'the clear is persisted with the revoke'
+		).to.equal(true);
+
+		const state = opener.getFullState();
+		expect(state.localCommitmentNumber).to.equal(L0 + 1n);
+		expect(
+			state.restoreRevokedRisk,
+			'cleared by the levelling revoke'
+		).to.equal(undefined);
+		expect(mustNotBroadcastCommitment(state)).to.equal(false);
+		const plan = opener.prepareForceClose(opener.getSigner()!);
+		expect(plan.ok, plan.ok ? '' : plan.error).to.equal(true);
+		// A restart must read back the CLEARED row, not the flagged one.
+		expect(
+			deserializeChannelState(serializeChannelState(state)).restoreRevokedRisk
+		).to.equal(undefined);
+		// And the same peer, reconnecting after the levelling, sends the very
+		// message that set the flag: it is the CLEAN shape now, because our
+		// own number moved to match its next_revocation_number, so nothing
+		// re-arms.
+		opener.markForReestablish();
+		opener.handleReestablish(peerReestablish(opener, seed, L0 + 1n, R0));
+		expect(opener.getFullState().restoreRevokedRisk).to.equal(undefined);
+		expect(opener.getState()).to.equal(ChannelState.NORMAL);
+	});
+
+	it('holds the cooperative close while the proof stands, acknowledgement or not', function () {
+		const { opener, acceptor, seed, L0, R0 } = heldOpener(false);
+		opener.handleReestablish(peerReestablish(opener, seed, L0 + 1n, R0));
+		expect(opener.getFullState().restoreRevokedRisk).to.equal(true);
+		expect(opener.isMutualCloseHeld()).to.equal(true);
+
+		// A mutual close needs no revocation, but it does need the balances:
+		// the peer holds a commitment this row never built, so it can sign the
+		// older split and we would sign it back. The acknowledgement is not an
+		// exit here, exactly as it is not for the force close.
+		for (const acknowledged of [false, true]) {
+			const refused = opener.initiateShutdown(SWEEP_SCRIPT, acknowledged);
+			const err = refused.find((a) => a.type === ChannelActionType.ERROR) as
+				| { message: string }
+				| undefined;
+			expect(err, `refused (acknowledged=${acknowledged})`).to.not.equal(
+				undefined
+			);
+			expect(err!.message).to.match(/holds\s+the revocation/);
+			expect(err!.message).to.match(/waiting for the retransmission/);
+			expect(findSendAction(refused, MessageType.SHUTDOWN)).to.equal(undefined);
+			expect(opener.getState(), 'nothing durable changed').to.equal(
+				ChannelState.NORMAL
+			);
+			expect(
+				opener.getFullState().staleCloseRiskAccepted,
+				'and no acknowledgement was spent'
+			).to.not.equal(true);
+		}
+
+		// Once the peer's retransmission levels the row, the close proceeds.
+		const retransmit = findSendAction(
+			signRealCommitment(acceptor),
+			MessageType.COMMITMENT_SIGNED
+		)!;
+		opener.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(retransmit.payload)
+		);
+		expect(opener.isMutualCloseHeld()).to.equal(false);
+		const closing = opener.initiateShutdown(SWEEP_SCRIPT);
+		expect(
+			findSendAction(closing, MessageType.SHUTDOWN),
+			'the close goes out once the row is level'
+		).to.not.equal(undefined);
+	});
+
+	it('the revoked refusal beats the reestablish hold on a row carrying both', function () {
+		const { opener, seed, L0, R0 } = heldOpener(false);
+		// The proof first, on a resumed row.
+		opener.handleReestablish(peerReestablish(opener, seed, L0 + 1n, R0));
+		expect(opener.getFullState().restoreRevokedRisk).to.equal(true);
+		// Then the peer reconnects and claims the same gap with a WRONG
+		// secret: issue #907's validator fails the channel and stamps its own
+		// hold, whose operator exit is open. Both flags now stand.
+		opener.markForReestablish();
+		opener.handleReestablish(
+			peerReestablish(opener, seed, L0 + 1n, R0, Buffer.alloc(32, 0x81))
+		);
+		const state = opener.getFullState();
+		expect(state.reestablishRecencyUnproven).to.equal(true);
+		expect(state.restoreRevokedRisk, 'and the proof is not forgotten').to.equal(
+			true
+		);
+
+		// mustNotBroadcastCommitment reads only the proof, and it wins: the
+		// answer is the hard refusal, not the one an acknowledgement lifts.
+		const plan = opener.prepareForceClose(opener.getSigner()!);
+		expect(plan.ok).to.equal(false);
+		expect((plan as { error: string }).error).to.equal(REVOKED_REFUSAL);
+
+		const stored = deserializeChannelState(serializeChannelState(state));
+		const { node, storage, errors } = nodeForState(stored);
+		try {
+			const result = node.forceCloseChannel(stored.channelId!, SWEEP_SCRIPT);
+			expect(result.ok).to.equal(false);
+			expect(result.error).to.match(/already holds the revocation/);
+			expect(errors.map((e) => e.code)).to.deep.equal(['FORCE_CLOSE_REVOKED']);
+		} finally {
+			node.destroy();
+			storage.close();
+		}
+	});
 });

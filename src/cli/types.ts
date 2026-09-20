@@ -145,6 +145,15 @@ export interface ChannelInfo {
 	 */
 	reestablishRecencyUnproven?: boolean;
 	/**
+	 * The peer has proven at channel_reestablish that it already holds the
+	 * revocation for this channel's stored commitment, so no force close of
+	 * it is permitted, the operator's acknowledged one included
+	 * (FORCE_CLOSE_REVOKED), and neither is a cooperative close. No new
+	 * HTLCs, no router edge, no routing hint. Clears when the peer's
+	 * retransmission levels the channel.
+	 */
+	restoreRevokedRisk?: boolean;
+	/**
 	 * Neither mempool nor chain can account for the funding, so the channel is
 	 * quarantined: no new HTLCs, no router edge, no routing hint. Reversible
 	 * and not a close; it clears by itself when the funding is seen again.

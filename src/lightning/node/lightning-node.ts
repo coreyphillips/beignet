@@ -13008,7 +13008,8 @@ export class LightningNode extends EventEmitter {
 					: {}),
 				...(ch.reestablishRecencyUnproven === true
 					? { reestablishRecencyUnproven: true }
-					: {})
+					: {}),
+				...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
 			};
 		});
 		return this.liquidityAdvisor.analyze(snapshots);
@@ -13038,7 +13039,8 @@ export class LightningNode extends EventEmitter {
 				: {}),
 			...(ch.reestablishRecencyUnproven === true
 				? { reestablishRecencyUnproven: true }
-				: {})
+				: {}),
+			...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
 		}));
 		const plans = planRebalances(snapshots, {
 			minImbalancePct:
@@ -13555,6 +13557,13 @@ export class LightningNode extends EventEmitter {
 		}
 		if (state.reestablishRecencyUnproven === true) {
 			info.reestablishRecencyUnproven = true;
+		}
+		// And the proven revocation (issues #905 and #915), which every
+		// readiness surface built on this info must exclude as well: the
+		// channel refuses every add, so advertising it as ready would route
+		// payments into a refusal and hand out routing hints no one can use.
+		if (state.restoreRevokedRisk === true) {
+			info.restoreRevokedRisk = true;
 		}
 		if (state.fundingUnaccounted === true) {
 			info.fundingUnaccounted = true;

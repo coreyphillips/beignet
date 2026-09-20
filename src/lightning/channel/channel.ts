@@ -4821,6 +4821,21 @@ export class Channel {
 
 		this._state.localCommitmentNumber++;
 
+		// The levelling revoke clears the proven-revocation flag (issues #905
+		// and #915). The flag says the peer already holds the secret for
+		// commitment localCommitmentNumber, which is precisely the secret
+		// revealed one line above, so this revoke tells the peer nothing it
+		// did not already have, and afterwards the row's current commitment
+		// is localCommitmentNumber + 1, whose secret has never left this
+		// node. Broadcasting is safe again. The ONLY way past the flagged
+		// index is this revoke - the counter advances nowhere else - so
+		// clearing here cannot outrun the proof. Leaving it set would keep
+		// mustNotBroadcastCommitment true for the life of a channel that has
+		// levelled, disarming its HTLC deadline backstops and closing its
+		// unilateral exit forever, which is a fund-loss path of its own. The
+		// PERSIST_STATE this path already leads with carries the clear.
+		this._state.restoreRevokedRisk = undefined;
+
 		// BOLT 2 (revoke_and_ack): next_per_commitment_point is the point for the
 		// NEXT commitment transaction — the one after the commitment we just
 		// adopted. With commitment M using getPerCommitmentPoint(seed, M) (per
@@ -5811,6 +5826,15 @@ export class Channel {
 	 * same stale split the initiation was warned about.
 	 */
 	isMutualCloseHeld(): boolean {
+		// The proven revocation holds the close outright (issues #905 and
+		// #915), with no acknowledgement to lift it. The row's balances are
+		// one round stale by proof, not by supposition: the peer has a
+		// revoke_and_ack this row never recorded, so it has a commitment this
+		// row never built, and a mutual close lets it propose the split of
+		// the older one and take our signature over it. Unlike the holds
+		// above, this one is temporary: the peer's retransmission levels the
+		// row, the levelling revoke clears the flag, and the close proceeds.
+		if (this._state.restoreRevokedRisk === true) return true;
 		return (
 			isRecencyUnproven(this._state) &&
 			this._state.staleCloseRiskAccepted !== true
@@ -5826,6 +5850,17 @@ export class Channel {
 	 * the daemon's force-close refusal do.
 	 */
 	private _heldCloseOrigin(): string {
+		// The proven revocation first: it is the only one of the three that no
+		// acknowledgement lifts, so an operator reading the refusal must be
+		// told that, and told what does lift it (issues #905 and #915).
+		if (this._state.restoreRevokedRisk === true) {
+			return (
+				'the peer has shown at channel_reestablish that it already holds ' +
+				'the revocation for this commitment, so these balances are one ' +
+				'round stale and this channel is waiting for the retransmission ' +
+				'from that peer to bring it level'
+			);
+		}
 		return this._state.restoreRecencyUnproven === true
 			? 'this channel was restored from a Recovery Capsule and its balances ' +
 					'cannot be proven current'
@@ -6832,6 +6867,21 @@ export class Channel {
 		// Exact true only: the acknowledgement is authorization, and a JS
 		// caller passing a truthy non-boolean ('false', 1) must not spend it.
 		const acknowledged = acceptStaleStateRisk === true;
+		// The proven revocation (issues #905 and #915) is checked ahead of the
+		// acknowledgement and regardless of it, exactly as the force close is:
+		// acceptStaleStateRisk accepts a RISK, and here the peer has shown the
+		// stale round is a fact. Nothing durable changes, so the row stays
+		// resumable and the close can be retried once the peer's
+		// retransmission has levelled it.
+		if (this._state.restoreRevokedRisk === true) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot close cooperatively: ${this._heldCloseOrigin()}`,
+					cleanup: 'none'
+				}
+			];
+		}
 		if (this.isMutualCloseHeld() && !acknowledged) {
 			return [
 				{

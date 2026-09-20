@@ -60,6 +60,13 @@ export interface IChannelSnapshot {
 	 * so the same rule, advice to force-close it is withheld.
 	 */
 	reestablishRecencyUnproven?: boolean;
+	/**
+	 * The peer proved at channel_reestablish that it holds the revocation for
+	 * this channel's current commitment (issues #905 and #915). Broadcasting
+	 * it is refused under every reason, the operator's included, so close
+	 * advice is withheld for the same reason as the two holds above.
+	 */
+	restoreRevokedRisk?: boolean;
 }
 
 export interface ILiquiditySnapshot {
@@ -189,7 +196,8 @@ export class LiquidityAdvisor {
 				// connects, and a local force close is exactly what its hold
 				// forbids; the exit is the peer's own close (issues #469, #907).
 				ch.restoreRecencyUnproven !== true &&
-				ch.reestablishRecencyUnproven !== true
+				ch.reestablishRecencyUnproven !== true &&
+				ch.restoreRevokedRisk !== true
 			) {
 				recommendations.push({
 					type: RecommendationType.CLOSE_CHANNEL,
