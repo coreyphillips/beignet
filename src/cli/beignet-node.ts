@@ -1370,6 +1370,9 @@ export function jitInvoiceError(err: unknown): unknown {
 	) {
 		return new BeignetError(BeignetErrorCode.JIT_REFUSED, message);
 	}
+	if (/^JIT receive needs a new channel from the LSP/.test(message)) {
+		return new BeignetError(BeignetErrorCode.NEW_CHANNELS_REFUSED, message);
+	}
 	if (/timed out waiting for the LSP/.test(message)) {
 		return new BeignetError(BeignetErrorCode.JIT_TIMEOUT, message);
 	}

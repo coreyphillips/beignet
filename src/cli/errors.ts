@@ -66,6 +66,13 @@ export enum BeignetErrorCode {
 	OPEN_FAILED = 'OPEN_FAILED',
 	/** The node has no funding provider able to serve this open or splice. */
 	FUNDING_PROVIDER_REQUIRED = 'FUNDING_PROVIDER_REQUIRED',
+	/**
+	 * This node would refuse a brand-new channel right now (issue #906's
+	 * fence), so it will not promise one to a counterparty. Transient: the
+	 * fence lifts with the first chain tip, or when a capsule restore
+	 * settles.
+	 */
+	NEW_CHANNELS_REFUSED = 'NEW_CHANNELS_REFUSED',
 	/** The fee estimator has not delivered its first sample; retry shortly. */
 	FEE_ESTIMATE_NOT_READY = 'FEE_ESTIMATE_NOT_READY',
 	/** option_splice/option_quiesce is missing on one side of the pair. */
@@ -157,6 +164,9 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.FEE_ESTIMATE_NOT_READY,
 		// The tip arrives with the first header.
 		BeignetErrorCode.CHAIN_NOT_SYNCED,
+		// The new-channel fence lifts with the first header too, or when the
+		// capsule restore it is holding for settles.
+		BeignetErrorCode.NEW_CHANNELS_REFUSED,
 		// A splice held off by an unacknowledged abort, a peer-owned quiescence
 		// session or settling HTLCs: the same request works once that ends.
 		BeignetErrorCode.SPLICE_BUSY,

@@ -299,6 +299,8 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// policy, answered with the reason so the user can act on it; a silent
 	// LSP is upstream trouble, retryable.
 	JIT_REFUSED: 400,
+	// Our own fence, not the LSP's policy: waiting genuinely changes it.
+	NEW_CHANNELS_REFUSED: 503,
 	SWAP_NOT_CANCELLABLE: 409,
 	JIT_TIMEOUT: 504,
 	PAYMENT_FAILED: 502,
