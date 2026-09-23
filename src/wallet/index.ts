@@ -3799,7 +3799,6 @@ export class Wallet {
 
 		let addresses = {} as IAddresses;
 		let changeAddresses = {} as IAddresses;
-		let rbf = false;
 
 		addressTypeKeys.map((addressType) => {
 			// Check if addresses of this type have been generated. If not, skip.
@@ -3827,8 +3826,10 @@ export class Wallet {
 		);
 
 		const formattedTransactions: IFormattedTransactions = {};
-		transactions.map(async ({ data, result }) => {
-			if (!result.txid) {
+		transactions.forEach(({ data, result }) => {
+			// An entry the server answered with an error carries no result
+			// (issue #934). Skip it and format the rest of the batch.
+			if (!result?.txid) {
 				return;
 			}
 
@@ -3840,6 +3841,9 @@ export class Wallet {
 
 			//Iterate over each input
 			let isCoinbase = false;
+			// Per transaction: a flag shared by the batch marked every transaction
+			// after a signalling one as rbf too (issue #941).
+			let rbf = false;
 			result.vin.map((vin) => {
 				//Push any OP_RETURN messages to messages array
 				try {
