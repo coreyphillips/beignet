@@ -1349,8 +1349,9 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 	});
 
 	it('keeps a transaction a refresh adds while the header path repairs a reorg (issue #944)', async function () {
-		// Added during the repair's own write, the last await before the map
-		// is replaced, so what is kept must be read after it.
+		// Added while the check still awaits the repair, after its write lands
+		// and before the map is replaced, so what is kept must be read after
+		// that await.
 		type TRepairInternals = TWalletInternals & {
 			updateTransactionHeights: (txs: IUtxo[]) => Promise<Result<string>>;
 		};
