@@ -20,7 +20,8 @@
  * reorg. The formatter cases cover issues #934 and #941: an entry the server
  * answered with an error reaches the formatter too, and must be skipped
  * there. Then issue #945: a lost transaction the server serves again is
- * shown as held again. The cases after them cover issue #871: a node
+ * shown as held again, and issue #964: only by a lookup that went out after
+ * it was lost. The cases after them cover issue #871: a node
  * without a txindex answers a transaction in no block and not in its mempool
  * in words of its own. And issue #935: for a transaction only seen in the
  * mempool, that answer is final once it outlasts two new blocks.
@@ -527,6 +528,32 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 					lookupReply(...txHashes.map((h) => answer(h, served())))
 				);
 
+		/**
+		 * Serves every lookup as the node holds the transaction, and loses it
+		 * while a refresh's lookup of its address history, whose entries carry a
+		 * height, is in flight: a check beside the refresh, such as the one a new
+		 * header runs, clears it from that newer answer. The refresh's lookup is
+		 * then answered as the node held it before. Returns the node, which a
+		 * test may set serving again.
+		 */
+		const loseDuringLookup = (): { served: boolean } => {
+			const node = { served: true };
+			let lost = false;
+			sinon
+				.stub(wallet.electrum, 'getTransactions')
+				.callsFake(async ({ txHashes }: { txHashes: ITxHash[] }) => {
+					if (!lost && txHashes.some((h) => 'height' in h)) {
+						lost = true;
+						node.served = false;
+						await wallet.checkUnconfirmedTransactions();
+						// Answered before the node lost it.
+						return lookupReply(...txHashes.map((h) => answer(h, true)));
+					}
+					return lookupReply(...txHashes.map((h) => answer(h, node.served)));
+				});
+			return node;
+		};
+
 		/** Messages announcing a transaction or its confirmation since `from`. */
 		const announced = (from: number): typeof messages =>
 			messages
@@ -623,22 +650,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			// Still in the mempool when the refresh starts.
 			wallet.data.transactions[TXID] = mempoolRecord();
 			wallet.data.unconfirmedTransactions[TXID] = mempoolRecord();
-			let gone = false;
-			sinon
-				.stub(wallet.electrum, 'getTransactions')
-				.callsFake(async ({ txHashes }: { txHashes: ITxHash[] }) => {
-					// The refresh's lookup of its address history, whose entries
-					// carry a height. The node loses the transaction while it is in
-					// flight, and a check beside the refresh, such as the one a new
-					// header runs, clears it from that newer answer.
-					if (!gone && txHashes.some((h) => 'height' in h)) {
-						gone = true;
-						await wallet.checkUnconfirmedTransactions();
-						// Answered before the node lost it.
-						return lookupReply(...txHashes.map((h) => answer(h, true)));
-					}
-					return lookupReply(...txHashes.map((h) => answer(h, !gone)));
-				});
+			loseDuringLookup();
 
 			const res = await wallet.updateTransactions({});
 			expect(res.isOk(), 'the refresh ran').to.equal(true);
@@ -745,6 +757,145 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			expect(res.isOk(), 'the refresh ran').to.equal(true);
 			expect(wallet.transactions[TXID].exists, 'lost again').to.equal(false);
 			expect(savedTransactions()[TXID].exists).to.equal(false);
+		});
+
+		/**
+		 * Issue #964: an answer older than the clearing was kept from reading the
+		 * record back only at the same height. It still watched the ghost again,
+		 * so the next check reported the same loss a second time, and one at
+		 * another height still rewrote the record: -1 for a transaction with
+		 * unconfirmed parents, or a block the chain has since lost.
+		 */
+		describe('a clearing newer than the lookup, on every branch (issue #964)', function () {
+			/** Observes the record at this height, as a refresh would have. */
+			const observe = (height: 0 | -1 = 0): void => {
+				wallet.data.transactions[TXID] = mempoolRecord(height);
+				wallet.data.unconfirmedTransactions[TXID] = mempoolRecord(height);
+			};
+
+			/** The address history lists the transaction at this height. */
+			const listedAt = (height: number): void => {
+				(wallet.electrum.getAddressHistory as sinon.SinonStub).resolves(
+					ok([{ ...historyEntry, height }])
+				);
+			};
+
+			/** Still lost: cleared at height 0, and not watched again. */
+			const expectLost = (): void => {
+				expect(
+					wallet.transactions[TXID].exists,
+					'the newer answer stands'
+				).to.equal(false);
+				expect(wallet.transactions[TXID].height).to.equal(0);
+				expect(savedTransactions()[TXID].exists).to.equal(false);
+				expect(savedTransactions()[TXID].height).to.equal(0);
+				expect(
+					wallet.getUnconfirmedTransactions()[TXID],
+					'and it is not watched again'
+				).to.equal(undefined);
+			};
+
+			it('does not watch it again', async function () {
+				observe();
+				loseDuringLookup();
+
+				const res = await wallet.updateTransactions({});
+				expect(res.isOk(), 'the refresh ran').to.equal(true);
+				expectLost();
+
+				// Nothing observes it, so the next check has nothing to report.
+				await wallet.checkUnconfirmedTransactions();
+				expect(
+					messages.filter((m) => m.key === 'rbf'),
+					'the removal is reported once'
+				).to.have.length(1);
+			});
+
+			it('does not rewrite it from an answer at -1', async function () {
+				// With unconfirmed parents the history lists it at -1, not 0.
+				observe(-1);
+				listedAt(-1);
+				loseDuringLookup();
+
+				const res = await wallet.updateTransactions({});
+				expect(res.isOk(), 'the refresh ran').to.equal(true);
+				expectLost();
+			});
+
+			it('does not rewrite it from an answer in a block', async function () {
+				// Mined as the lookup went out, then reorged out and lost.
+				observe();
+				listedAt(REORGED_HEIGHT);
+				loseDuringLookup();
+
+				const res = await wallet.updateTransactions({});
+				expect(res.isOk(), 'the refresh ran').to.equal(true);
+				expectLost();
+				expect(
+					announced(0),
+					'nor announce a confirmation the chain lost'
+				).to.have.length(0);
+			});
+
+			it('stands when it lands while the history lookup is in flight', async function () {
+				// The height and address come from the history, so the answer is
+				// only as new as that lookup, even when the transaction itself is
+				// fetched and served after the clearing.
+				observe();
+				let lost = false;
+				sinon
+					.stub(wallet.electrum, 'getTransactions')
+					.callsFake(async ({ txHashes }: { txHashes: ITxHash[] }) =>
+						lookupReply(
+							...txHashes.map((h) => answer(h, !lost || 'height' in h))
+						)
+					);
+				(wallet.electrum.getAddressHistory as sinon.SinonStub).callsFake(
+					async () => {
+						if (!lost) {
+							lost = true;
+							await wallet.checkUnconfirmedTransactions();
+						}
+						return ok([historyEntry]);
+					}
+				);
+
+				const res = await wallet.updateTransactions({});
+				expect(res.isOk(), 'the refresh ran').to.equal(true);
+				expectLost();
+			});
+
+			it('keeps the cleared record when replacing the stored ones', async function () {
+				observe();
+				loseDuringLookup();
+
+				const res = await wallet.updateTransactions({
+					replaceStoredTransactions: true
+				});
+				expect(res.isOk(), 'the refresh ran').to.equal(true);
+				expectLost();
+			});
+
+			it('still reads it back once a later lookup finds it', async function () {
+				observe();
+				const node = loseDuringLookup();
+				await wallet.updateTransactions({});
+				expect(wallet.transactions[TXID].exists, 'lost').to.equal(false);
+
+				// Rebroadcast: this refresh's lookup goes out after the clearing.
+				node.served = true;
+				const res = await wallet.updateTransactions({});
+				expect(res.isOk(), 'the refresh ran').to.equal(true);
+
+				expect(wallet.transactions[TXID].exists, 'pending again').to.equal(
+					true
+				);
+				expect(savedTransactions()[TXID].exists).to.equal(true);
+				expect(
+					wallet.getUnconfirmedTransactions()[TXID]?.height,
+					'and observed again'
+				).to.equal(0);
+			});
 		});
 	});
 
