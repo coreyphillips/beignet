@@ -66,6 +66,15 @@ import {
 const DISCONNECTED_ERROR = 'Electrum instance is disconnected.';
 
 /**
+ * The constructor and connectToElectrum both accept one server or a list of
+ * them; every consumer wants the list.
+ */
+function toServerList(servers?: TServer | TServer[]): TServer[] {
+	if (!servers) return [];
+	return Array.isArray(servers) ? servers : [servers];
+}
+
+/**
  * A well formed script hash used only to ask a server whether it is still
  * answering. It addresses nothing; the balance in the reply is discarded. The
  * same value rn-electrum-client uses for its own post-connect probe.
@@ -669,13 +678,12 @@ export class Electrum {
 		servers?: TServer | TServer[];
 		disableRegtestCheck?: boolean;
 	}): Promise<Result<TConnectToElectrumRes>> {
-		let customPeers = servers
-			? Array.isArray(servers)
-				? servers
-				: [servers]
-			: [];
-		// @ts-ignore
-		customPeers = customPeers.length ? customPeers : this?.servers ?? [];
+		// The instance's own servers may be a single object too (#980), so the
+		// fallback is normalized the same way as the argument.
+		const givenPeers = toServerList(servers);
+		const customPeers = givenPeers.length
+			? givenPeers
+			: toServerList(this.servers);
 		const electrumNetwork = getElectrumNetwork(network);
 		if (
 			!disableRegtestCheck &&
