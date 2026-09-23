@@ -49,7 +49,9 @@ import {
 	storedTipSequence,
 	JOURNAL_META_KEYS,
 	META_REPLICATED_THROUGH,
-	META_REPLICATED_THROUGH_HASH
+	META_REPLICATED_THROUGH_HASH,
+	REPLICATION_META_KEYS,
+	ROTATION_META_KEYS
 } from '../../src/lightning/recovery';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { withStorageTransaction } from '../../src/lightning/storage/transaction';
@@ -2521,6 +2523,138 @@ describe('Recovery phase 2: round-16 complete invariants', () => {
 		expect(result.committed, 'a non-JSON lease refused').to.equal(false);
 		expect(String(result.error?.message)).to.match(/illegitimate value/);
 		storage.close();
+	});
+
+	// A guardian-set rotation can run before the first frame (issue #862):
+	// its intent survives an abort by design (wire 5.9), and the switch
+	// records the generation, the set and the retirement owed to the
+	// outgoing set. The keys come from the modules that write them, which
+	// pins the journal's own copies of those names against drift.
+	const ROTATION_PRE_FRAME: Array<[string, string]> = [
+		[
+			ROTATION_META_KEYS.pending,
+			JSON.stringify({ version: 1, generation: '2', entries: [] })
+		],
+		[
+			ROTATION_META_KEYS.retirePending,
+			JSON.stringify({ version: 1, request: '00', entries: [] })
+		],
+		[REPLICATION_META_KEYS.generation, '2'],
+		[REPLICATION_META_KEYS.generation, '17'],
+		[
+			REPLICATION_META_KEYS.guardianSet,
+			JSON.stringify([{ guardianId: 'aa'.repeat(32), url: 'http://g' }])
+		]
+	];
+
+	it('admits guardian-rotation metadata ahead of the first frame (issue #862)', () => {
+		for (const [key, value] of ROTATION_PRE_FRAME) {
+			const storage = openStorage();
+			storage.setRecoveryMeta!(key, value);
+			const result = commitPreimage(makeJournaledManager(storage).manager, 90);
+			expect(
+				result.committed,
+				`${key}=${value}: ${result.error?.message}`
+			).to.equal(true);
+			storage.close();
+		}
+		// All of them at once: the state a genesis switch leaves before the
+		// retirement is accepted.
+		const storage = openStorage();
+		for (const [key, value] of ROTATION_PRE_FRAME) {
+			storage.setRecoveryMeta!(key, value);
+		}
+		const all = commitPreimage(makeJournaledManager(storage).manager, 91);
+		expect(all.committed, String(all.error?.message)).to.equal(true);
+		storage.close();
+	});
+
+	it('refuses guardian-rotation metadata ahead of the first frame in an illegitimate shape', () => {
+		const shapes: Array<[string, string]> = [
+			[ROTATION_META_KEYS.pending, 'not json'],
+			[ROTATION_META_KEYS.pending, JSON.stringify({ version: 2 })],
+			[ROTATION_META_KEYS.pending, '[]'],
+			[ROTATION_META_KEYS.retirePending, '7'],
+			[ROTATION_META_KEYS.retirePending, '{}'],
+			[REPLICATION_META_KEYS.generation, '0'],
+			[REPLICATION_META_KEYS.generation, '1'],
+			[REPLICATION_META_KEYS.generation, '02'],
+			[REPLICATION_META_KEYS.generation, 'abc'],
+			[REPLICATION_META_KEYS.generation, ''],
+			[REPLICATION_META_KEYS.guardianSet, '{}'],
+			[REPLICATION_META_KEYS.guardianSet, '[]'],
+			[REPLICATION_META_KEYS.guardianSet, '[1]'],
+			[REPLICATION_META_KEYS.guardianSet, '[null]'],
+			[REPLICATION_META_KEYS.guardianSet, JSON.stringify([{ url: 'x' }])],
+			[REPLICATION_META_KEYS.guardianSet, JSON.stringify([{ guardianId: 7 }])]
+		];
+		for (const [key, value] of shapes) {
+			const storage = openStorage();
+			storage.setRecoveryMeta!(key, value);
+			const result = commitPreimage(makeJournaledManager(storage).manager, 92);
+			expect(result.committed, `${key}=${value} refused`).to.equal(false);
+			expect(String(result.error?.message)).to.match(/illegitimate value/);
+			storage.close();
+		}
+	});
+
+	it('still reads a replication watermark over an empty store as residue', () => {
+		// Nothing receipted is ABSENCE: a watermark, main or a rotation's
+		// prefixed copy, can only exist because frames did.
+		const residue: Array<[string, string]> = [
+			[REPLICATION_META_KEYS.replicatedThrough, '0'],
+			[REPLICATION_META_KEYS.replicatedThroughHash, 'aa'.repeat(32)],
+			[`rotation:2:${REPLICATION_META_KEYS.replicatedThrough}`, '1'],
+			[
+				`rotation:2:${REPLICATION_META_KEYS.replicatedThroughHash}`,
+				'aa'.repeat(32)
+			]
+		];
+		for (const [key, value] of residue) {
+			const storage = openStorage();
+			storage.setRecoveryMeta!(key, value);
+			const result = commitPreimage(makeJournaledManager(storage).manager, 93);
+			expect(result.committed, `${key} refused`).to.equal(false);
+			expect(String(result.error?.message)).to.match(/survives/);
+			storage.close();
+		}
+	});
+
+	it('refuses a rotated journal whose frames and tip were deleted', () => {
+		// The torn shapes the rotation keys must not open: a journal that
+		// rotated with frames, then lost the frames and the tip record while
+		// other bookkeeping survived. The verifier catches a surviving base
+		// snapshot record; with that gone too, the residue scan still finds
+		// the watermark and the snapshot bookkeeping beside the rotation keys.
+		const torn = (dropBase: boolean): string => {
+			const storage = openStorage();
+			const { manager } = makeJournaledManager(storage);
+			expect(commitPreimage(manager, 94).committed).to.equal(true);
+			expect(commitPreimage(manager, 95).committed).to.equal(true);
+			const frame2 = storage.loadRecoveryFrames!(1)[0];
+			storage.setRecoveryMeta!(REPLICATION_META_KEYS.replicatedThrough, '2');
+			storage.setRecoveryMeta!(
+				REPLICATION_META_KEYS.replicatedThroughHash,
+				frame2.frameHash.toString('hex')
+			);
+			for (const [key, value] of ROTATION_PRE_FRAME) {
+				if (key !== ROTATION_META_KEYS.pending) {
+					storage.setRecoveryMeta!(key, value);
+				}
+			}
+			expect(commitPreimage(manager, 96).committed).to.equal(true);
+			sql(storage).prepare('DELETE FROM recovery_frames').run();
+			storage.deleteRecoveryMeta!(JOURNAL_META_KEYS.tipSequence);
+			storage.deleteRecoveryMeta!(JOURNAL_META_KEYS.tipHash);
+			if (dropBase) storage.deleteRecoveryMeta!(JOURNAL_META_KEYS.lastSnapshot);
+			const result = commitPreimage(makeJournaledManager(storage).manager, 97);
+			expect(result.committed, 'the torn store refused').to.equal(false);
+			expect(storage.loadRecoveryFrames!()).to.have.length(0);
+			storage.close();
+			return String(result.error?.message);
+		};
+		expect(torn(false)).to.match(/fails verification|survives/);
+		expect(torn(true)).to.match(/survives/);
 	});
 });
 

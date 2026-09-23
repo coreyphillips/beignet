@@ -136,6 +136,19 @@ export const META_REPLICATED_THROUGH = 'guardian_replicated_through';
  * the retained frame store (see resolveWatermarkAnchor).
  */
 export const META_REPLICATED_THROUGH_HASH = 'guardian_replicated_through_hash';
+/** The guardian-set generation (wire 5.9); absent reads as 1. */
+const META_GUARDIAN_GENERATION = 'guardian_generation_v1';
+/**
+ * The rest of a guardian-set rotation's metadata (wire 5.9), named here
+ * only so the empty-store check below can admit it: the modules that write
+ * these keys (guardian-rotation.ts, guardian-replication.ts) import this
+ * one, so the names are repeated rather than imported, and the phase 2
+ * tests pin each copy to its writer's constant. Not exported: the recovery
+ * barrel already exports the writers' names.
+ */
+const META_ROTATION_PENDING = 'guardian_rotation_pending_v1';
+const META_RETIRE_PENDING = 'guardian_retire_pending_v1';
+const META_GUARDIAN_SET_ENTRIES = 'guardian_set_v1';
 
 /**
  * The frame hash a watermark at `sequence` must have been receipted at, from
@@ -198,9 +211,14 @@ const JOURNAL_META_RESIDUE_KEYS = [
  * lease acquisition and namespace registration run ahead of the first
  * commit, and the node's startup repair marker is written before restore,
  * but only as the bare 'owed' sentinel (a numeric receipt target implies
- * frames existed, so it can never precede frame 1). Everything else
- * present over an EMPTY frame store, and every allowed key holding a
- * value outside its legitimate shape, is residue of destroyed history.
+ * frames existed, so it can never precede frame 1). A guardian-set
+ * rotation can run before the first frame too (issue #862): its intent,
+ * and after the switch the generation, the configured set and the
+ * retirement owed to the outgoing set. Everything else present over an
+ * EMPTY frame store, and every allowed key holding a value outside its
+ * legitimate shape, is residue of destroyed history. That includes every
+ * replication watermark, main or a rotation's prefixed copy: nothing
+ * receipted is ABSENCE, so a watermark exists only because frames did.
  * The scan refuses BY PRESENCE: an explicitly stored empty string is
  * presence, not absence.
  */
@@ -208,6 +226,38 @@ const isJsonObject = (value: string): boolean => {
 	try {
 		const parsed: unknown = JSON.parse(value);
 		return parsed !== null && typeof parsed === 'object';
+	} catch {
+		return false;
+	}
+};
+/** A persisted rotation record: exactly what its loader accepts (version 1). */
+const isVersionOneRecord = (value: string): boolean => {
+	try {
+		const parsed: unknown = JSON.parse(value);
+		return (
+			parsed !== null &&
+			typeof parsed === 'object' &&
+			!Array.isArray(parsed) &&
+			(parsed as { version?: unknown }).version === 1
+		);
+	} catch {
+		return false;
+	}
+};
+/** A configured guardian set: a non-empty list of entries naming a guardian. */
+const isGuardianSetEntries = (value: string): boolean => {
+	try {
+		const parsed: unknown = JSON.parse(value);
+		return (
+			Array.isArray(parsed) &&
+			parsed.length > 0 &&
+			parsed.every(
+				(entry: unknown) =>
+					entry !== null &&
+					typeof entry === 'object' &&
+					typeof (entry as { guardianId?: unknown }).guardianId === 'string'
+			)
+		);
 	} catch {
 		return false;
 	}
@@ -223,7 +273,18 @@ const EMPTY_STORE_ALLOWED_META: ReadonlyMap<
 	['writer_lease_v1', isJsonObject],
 	['restore_pending_acquisition_v1', isJsonObject],
 	['guardian_pending_registration_v1', isJsonObject],
-	['startup_repair_tail', (value: string): boolean => value === 'owed']
+	['startup_repair_tail', (value: string): boolean => value === 'owed'],
+	// A rotation's intent survives an abort by design, so a restart resumes
+	// it (wire 5.9); the switch records the rest, and the boot follow loop
+	// records the generation and the set a rotation moved to. A generation
+	// is only ever written as g+1, so 1 is never a stored value.
+	[META_ROTATION_PENDING, isVersionOneRecord],
+	[META_RETIRE_PENDING, isVersionOneRecord],
+	[
+		META_GUARDIAN_GENERATION,
+		(value: string): boolean => /^(?:[2-9]|[1-9]\d+)$/.test(value)
+	],
+	[META_GUARDIAN_SET_ENTRIES, isGuardianSetEntries]
 ]);
 
 /**
@@ -240,7 +301,7 @@ export const JOURNAL_META_KEYS = {
 	durabilityFloor: META_DURABILITY_FLOOR,
 	backfillLost: META_BACKFILL_LOST,
 	/** The guardian-set generation (wire 5.9); absent reads as 1. */
-	generation: 'guardian_generation_v1'
+	generation: META_GUARDIAN_GENERATION
 } as const;
 
 /** Deltas between full-state snapshot frames. */

@@ -13,10 +13,13 @@
  *   3. BACKFILL: replicate the retained journal to the incoming set, under
  *      its own bookkeeping keys, until a quorum holds the tip; the outgoing
  *      set keeps receiving frames meanwhile, so the live barrier never
- *      waits on a set that is not ready;
+ *      waits on a set that is not ready. A journal with no frames yet has
+ *      nothing to backfill, and both sets must first prove the namespace
+ *      holds nothing either (issue #862);
  *   4. SWITCH in one transaction: generation, configured set, and the
- *      watermark become the incoming set's; the caller re-points the
- *      barrier, the gate and the capsule locators at the incoming set;
+ *      watermark become the incoming set's (an empty journal has no
+ *      watermark to move); the caller re-points the barrier, the gate and
+ *      the capsule locators at the incoming set;
  *   5. RETIRE the outgoing set with ROTATE_SET, retried until at least one
  *      member accepts (a restore device that only knows the outgoing set
  *      finds the rotation there).
@@ -32,17 +35,19 @@ import {
 	rotateTranscriptHash,
 	signTranscript
 } from './guardian-wire';
-import { JOURNAL_META_KEYS } from './journal';
+import { JOURNAL_META_KEYS, storedTipSequence } from './journal';
 import {
 	GuardianReplicator,
 	IGuardianReplicationEvent,
 	REPLICATION_META_KEYS
 } from './guardian-replication';
 import {
+	GuardianBindingError,
 	GuardianClient,
 	IBoundGuardianClient,
 	IGuardianSetContext,
-	boundFanOut
+	boundFanOut,
+	verifyGuardianBindings
 } from './guardian-client';
 import { GuardianStatus, IGuardianRotateSetRequest } from './guardian';
 import { IWriterLeaseKeys } from './writer-lease';
@@ -97,7 +102,13 @@ export class RotationRefusedError extends Error {
 			| 'no-quorum'
 			| 'not-catching-up'
 			| 'same-set'
-			| 'malformed',
+			| 'malformed'
+			/**
+			 * This journal has no frames but a guardian set holds records in
+			 * the namespace: the journal was lost, not unused. Restore, never
+			 * rotate (issue #862).
+			 */
+			| 'journal-behind',
 		message: string
 	) {
 		super(message);
@@ -346,8 +357,15 @@ export class GuardianRotation {
 			);
 		}
 
-		// Step 4: the switch, and the retirement owed to the outgoing set.
+		// A journal with no frames had nothing to backfill, and locally it
+		// looks exactly like one whose frames were lost. Only the guardians
+		// can tell the two apart, so the switch waits on both sets proving
+		// the namespace holds nothing (issue #862).
 		const prefix = this.prefix(generation);
+		const genesis = this.journalAtGenesis(prefix);
+		if (genesis) await this.proveNamespaceEmpty(incoming);
+
+		// Step 4: the switch, and the retirement owed to the outgoing set.
 		const retire = this.retireRequest(generation);
 		const retirePending: IRetirePending = {
 			version: 1,
@@ -355,23 +373,46 @@ export class GuardianRotation {
 			entries: this.config.outgoing.guardians.map(entryOf)
 		};
 		storage.transaction(() => {
-			const mark = storage.getRecoveryMeta!(
-				prefix + REPLICATION_META_KEYS.replicatedThrough
-			);
-			const markHash = storage.getRecoveryMeta!(
-				prefix + REPLICATION_META_KEYS.replicatedThroughHash
-			);
-			if (mark == null || markHash == null) {
-				throw new RotationRefusedError(
-					'not-catching-up',
-					'the incoming watermark vanished before the switch'
+			// Re-tested inside the transaction: a first frame committed while
+			// the sets were being asked ends the genesis case, and the switch
+			// then needs the watermark like any other.
+			if (!(genesis && this.journalAtGenesis(prefix))) {
+				// The mark is copied only if it is the TRUSTED one (bound to a
+				// frame this store holds) and covers the tip; a torn or
+				// unanchored copy never becomes the main watermark.
+				const mark = storage.getRecoveryMeta!(
+					prefix + REPLICATION_META_KEYS.replicatedThrough
+				);
+				const markHash = storage.getRecoveryMeta!(
+					prefix + REPLICATION_META_KEYS.replicatedThroughHash
+				);
+				const localTip = storedTipSequence(storage);
+				const trusted = incoming.replicatedThrough();
+				if (
+					mark == null ||
+					markHash == null ||
+					!/^\d+$/.test(mark) ||
+					BigInt(mark) !== trusted ||
+					localTip == null ||
+					trusted < localTip
+				) {
+					const found = mark ?? 'none';
+					const tip = localTip ?? 'unverifiable';
+					throw new RotationRefusedError(
+						'not-catching-up',
+						`the incoming watermark (${found}) does not cover this journal's tip ${tip}; the rotation stays pending, and a retry backfills again`
+					);
+				}
+				storage.setRecoveryMeta!(REPLICATION_META_KEYS.replicatedThrough, mark);
+				storage.setRecoveryMeta!(
+					REPLICATION_META_KEYS.replicatedThroughHash,
+					markHash
 				);
 			}
-			storage.setRecoveryMeta!(REPLICATION_META_KEYS.replicatedThrough, mark);
-			storage.setRecoveryMeta!(
-				REPLICATION_META_KEYS.replicatedThroughHash,
-				markHash
-			);
+			// At genesis nothing was receipted and nothing is owed: the zero
+			// watermark is ABSENCE (raiseWatermark cannot bind below 1, and a
+			// watermark row over an empty frame store is residue), so none is
+			// written.
 			storage.deleteRecoveryMeta?.(
 				prefix + REPLICATION_META_KEYS.replicatedThrough
 			);
@@ -480,6 +521,129 @@ export class GuardianRotation {
 			JOURNAL_META_KEYS.tipSequence
 		);
 		return raw != null ? BigInt(raw) : 0n;
+	}
+
+	/**
+	 * This journal has never written a frame: no tip record, no watermark
+	 * (main, or the incoming set's), and no frame row. Any one of them
+	 * surviving means frames existed, and that store is not at genesis
+	 * whatever its tip reads.
+	 */
+	private journalAtGenesis(prefix: string): boolean {
+		const storage = this.config.storage;
+		const keys = [
+			JOURNAL_META_KEYS.tipSequence,
+			JOURNAL_META_KEYS.tipHash,
+			REPLICATION_META_KEYS.replicatedThrough,
+			REPLICATION_META_KEYS.replicatedThroughHash,
+			prefix + REPLICATION_META_KEYS.replicatedThrough,
+			prefix + REPLICATION_META_KEYS.replicatedThroughHash
+		];
+		if (keys.some((key) => storage.getRecoveryMeta!(key) != null)) {
+			return false;
+		}
+		return storedTipSequence(storage) === 0n;
+	}
+
+	/**
+	 * Prove, from both sets, that the namespace holds nothing before an
+	 * empty journal switches (issue #862). A store that lost its frames but
+	 * kept its lease looks exactly like an unused one, and switching it
+	 * would retire the outgoing set that holds the real history. Each set
+	 * must confirm this lease with enough members to meet every write
+	 * quorum (n - required + 1), and no signed head may be past genesis
+	 * unless it is a frame this journal wrote while the sets were asked.
+	 */
+	private async proveNamespaceEmpty(
+		incoming: GuardianReplicator
+	): Promise<void> {
+		const storage = this.config.storage;
+		const outgoingNeeded =
+			this.config.outgoing.bound.length - this.config.required + 1;
+		// A member whose endpoint no longer proves it is the guardian it was
+		// bound to counts for nothing, like an unreachable one, and the rest
+		// must meet the count on their own. Refusing the whole set on it
+		// would block the rotation away from that very member.
+		const proven: IBoundGuardianClient[] = [];
+		for (const entry of this.config.outgoing.bound) {
+			try {
+				await verifyGuardianBindings([entry], this.config.outgoing.context);
+				proven.push(entry);
+			} catch (error) {
+				if (!(error instanceof GuardianBindingError)) throw error;
+			}
+		}
+		if (proven.length < Math.max(outgoingNeeded, this.config.required)) {
+			throw new RotationRefusedError(
+				'no-quorum',
+				`only ${proven.length} of the outgoing set prove they are the configured guardians; ${outgoingNeeded} must confirm the namespace is empty`
+			);
+		}
+		const outgoing = new GuardianReplicator({
+			storage,
+			guardians: proven,
+			context: this.config.outgoing.context,
+			required: this.config.required,
+			recoveryRoot: this.config.recoveryRoot,
+			clock: this.clock,
+			onEvent: this.config.onReplicationEvent,
+			allowUnencryptedSecrets: this.config.allowUnencryptedSecrets
+		});
+		const sets: Array<[string, GuardianReplicator, number]> = [
+			['outgoing', outgoing, outgoingNeeded],
+			[
+				'incoming',
+				incoming,
+				this.config.incoming.bound.length - this.config.required + 1
+			]
+		];
+		for (const [name, replicator, needed] of sets) {
+			const proof = await replicator.confirmOwnership(this.config.lease);
+			if (proof.superseded || proof.rotated) {
+				throw new RotationRefusedError(
+					'no-quorum',
+					`the ${name} set reports a newer writer or a rotation of this namespace; refusing to rotate`
+				);
+			}
+			const past = proof.states.filter((state) => state.logHead.sequence > 0n);
+			if (past.length > 0) {
+				// Read after the answer: a first frame committed (and
+				// replicated) while the set was asked is this journal's own,
+				// and a retry carries it over. Any head this journal cannot
+				// show with the same hash is history it lost.
+				const ours = new Map(
+					(storage.loadRecoveryFrames?.(0) ?? []).map((row) => [
+						BigInt(row.sequence),
+						row.frameHash
+					])
+				);
+				const held = past.reduce(
+					(max, state) =>
+						state.logHead.sequence > max ? state.logHead.sequence : max,
+					0n
+				);
+				const lost = past.some(
+					(state) =>
+						!ours.get(state.logHead.sequence)?.equals(state.logHead.frameHash)
+				);
+				if (lost) {
+					throw new RotationRefusedError(
+						'journal-behind',
+						`the ${name} set holds this namespace through ${held} but this journal does not hold those records; restore instead of rotating`
+					);
+				}
+				throw new RotationRefusedError(
+					'not-catching-up',
+					`this journal wrote its first frame while the ${name} set was asked; the rotation stays pending, and a retry carries the frame over`
+				);
+			}
+			if (proof.confirming < needed) {
+				throw new RotationRefusedError(
+					'no-quorum',
+					`only ${proof.confirming} of the ${name} set confirmed the namespace is empty; ${needed} are needed to rule out records this journal lost`
+				);
+			}
+		}
 	}
 }
 

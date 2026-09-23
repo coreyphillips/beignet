@@ -5111,7 +5111,9 @@ export class BeignetNode extends EventEmitter {
 				'no-quorum': 'ROTATION_NO_QUORUM',
 				'not-catching-up': 'ROTATION_NOT_CATCHING_UP',
 				'same-set': 'INVALID_PARAMS',
-				malformed: 'INVALID_PARAMS'
+				malformed: 'INVALID_PARAMS',
+				// A lost journal: a retry never heals it, a restore does.
+				'journal-behind': 'ROTATION_UNAVAILABLE'
 			};
 			return new BeignetError(code[error.reason], error.message);
 		}

@@ -693,6 +693,14 @@ restarts with the outgoing set still configured and the intent persisted,
 and resumes from step 2 (registration is idempotent); a crash after step
 4 restarts on the incoming set and resumes step 5.
 
+A journal with no frames has nothing to backfill at step 3 and no
+watermark to move at step 4 (nothing receipted is the absence of one).
+Locally it is indistinguishable from a journal whose frames were lost, so
+before that switch the writer reads GET_HEAD from both sets and proceeds
+only when each confirms its lease with n - required + 1 members and no
+signed head is past genesis; a set holding records the journal lacks
+refuses the rotation (restore instead), and the intent stays persisted.
+
 One-member replacement is this operation with two members carried over.
 A carried-over guardian serves the outgoing namespace (retired) and the
 incoming one side by side, under their two set ids; they never share a
