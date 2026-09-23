@@ -13,11 +13,21 @@
 import { expect } from 'chai';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
+import { AddressInfo } from 'net';
 import sinon from 'sinon';
 import { BeignetNode } from '../../src/cli/beignet-node';
+import { startDaemon, IStartedDaemon } from '../../src/cli/daemon';
 import { QueuedPayment } from '../../src/cli/types';
+import { Channel } from '../../src/lightning/channel/channel';
+import { createOpenerState } from '../../src/lightning/channel/channel-state';
+import {
+	ChannelState,
+	DEFAULT_CHANNEL_CONFIG
+} from '../../src/lightning/channel/types';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import {
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
@@ -25,6 +35,7 @@ import {
 } from '../../src/lightning/invoice/types';
 import {
 	IOutgoingPaymentResolution,
+	IPaymentInfo,
 	PaymentDirection,
 	PaymentStatus
 } from '../../src/lightning/node/types';
@@ -93,6 +104,46 @@ const resolution = (
 
 const settle = (ms = 20): Promise<void> =>
 	new Promise((resolve) => setTimeout(resolve, ms));
+
+const ROUTE_TOKEN = 'queue-restart-token';
+
+/** One authenticated request to the daemon, JSON in and out. */
+const postJson = (
+	port: number,
+	urlPath: string,
+	body: Record<string, unknown> | undefined,
+	method = 'POST'
+): Promise<{ status: number; body: Record<string, unknown> }> =>
+	new Promise((resolve, reject) => {
+		const payload = body ? JSON.stringify(body) : undefined;
+		const headers: Record<string, string | number> = {
+			Authorization: `Bearer ${ROUTE_TOKEN}`
+		};
+		if (payload) {
+			headers['Content-Type'] = 'application/json';
+			headers['Content-Length'] = Buffer.byteLength(payload);
+		}
+		const req = http.request(
+			{ hostname: '127.0.0.1', port, path: urlPath, method, headers },
+			(res) => {
+				const chunks: Buffer[] = [];
+				res.on('data', (chunk: Buffer) => chunks.push(chunk));
+				res.on('end', () => {
+					try {
+						resolve({
+							status: res.statusCode!,
+							body: JSON.parse(Buffer.concat(chunks).toString())
+						});
+					} catch (err) {
+						reject(err);
+					}
+				});
+			}
+		);
+		req.on('error', reject);
+		if (payload) req.write(payload);
+		req.end();
+	});
 
 /** Replaces payInvoiceSafe with a recorder that completes every payment. */
 const stubPayInvoiceSafe = (node: BeignetNode): string[] => {
@@ -200,6 +251,97 @@ describe('BeignetNode.resolveInterruptedPayment (issue #967)', function () {
 		expect(await node.resolveInterruptedPayment(bolt11)).to.deep.equal({
 			status: 'unpaid'
 		});
+	});
+
+	/** A durable record for the hash, as storage would return it. */
+	const durableRecord = (
+		paymentHash: Buffer,
+		direction: PaymentDirection,
+		status: PaymentStatus,
+		preimage?: Buffer
+	): IPaymentInfo => ({
+		paymentHash,
+		...(preimage ? { preimage } : {}),
+		amountMsat: 1_000_000n,
+		status,
+		direction,
+		createdAt: Date.now() - 1_000
+	});
+
+	it('is completed when the in-memory view has nothing but the durable OUTGOING record is COMPLETED or holds the preimage', async () => {
+		for (const [status, withPreimage] of [
+			[PaymentStatus.COMPLETED, false],
+			[PaymentStatus.FAILED, true]
+		] as Array<[PaymentStatus, boolean]>) {
+			const { bolt11, paymentHash, preimage } = invoiceFrom(
+				`durable ${status}`
+			);
+			sinon
+				.stub(node.getNode(), 'awaitPaymentResolution')
+				.resolves(resolution(paymentHash, null));
+			sinon
+				.stub(node.getStorage(), 'loadPayment')
+				.returns(
+					durableRecord(
+						paymentHash,
+						PaymentDirection.OUTGOING,
+						status,
+						withPreimage ? preimage : undefined
+					)
+				);
+			expect(await node.resolveInterruptedPayment(bolt11)).to.deep.equal({
+				status: 'completed',
+				paymentHash: paymentHash.toString('hex')
+			});
+			sinon.restore();
+		}
+	});
+
+	it('is unpaid when the durable record is not an OUTGOING payment that was made', async () => {
+		const { bolt11, paymentHash, preimage } = invoiceFrom('durable other');
+		sinon
+			.stub(node.getNode(), 'awaitPaymentResolution')
+			.resolves(resolution(paymentHash, null));
+		const load = sinon.stub(node.getStorage(), 'loadPayment');
+		// This node's own invoice for the hash: its preimage is not a payment.
+		load.returns(
+			durableRecord(
+				paymentHash,
+				PaymentDirection.INCOMING,
+				PaymentStatus.COMPLETED,
+				preimage
+			)
+		);
+		expect(await node.resolveInterruptedPayment(bolt11)).to.deep.equal({
+			status: 'unpaid'
+		});
+		load.returns(
+			durableRecord(
+				paymentHash,
+				PaymentDirection.OUTGOING,
+				PaymentStatus.FAILED
+			)
+		);
+		expect(await node.resolveInterruptedPayment(bolt11)).to.deep.equal({
+			status: 'unpaid'
+		});
+	});
+
+	it('throws when the durable record cannot be read, so the entry waits', async () => {
+		const { bolt11, paymentHash } = invoiceFrom('durable unreadable');
+		sinon
+			.stub(node.getNode(), 'awaitPaymentResolution')
+			.resolves(resolution(paymentHash, null));
+		sinon
+			.stub(node.getStorage(), 'loadPayment')
+			.throws(new Error('The database connection is not open'));
+		let refused: unknown;
+		try {
+			await node.resolveInterruptedPayment(bolt11);
+		} catch (err: unknown) {
+			refused = err;
+		}
+		expect((refused as Error | undefined)?.message).to.contain('not open');
 	});
 
 	it('waits while the payment is unresolved', async () => {
@@ -367,7 +509,8 @@ describe('A payment in flight at a restart is not paid again (issue #967)', func
 		node: BeignetNode,
 		paymentHash: Buffer,
 		status: PaymentStatus,
-		preimage?: Buffer
+		preimage?: Buffer,
+		completedAgoMs = 0
 	): void => {
 		const storage = node.getStorage();
 		const hashHex = paymentHash.toString('hex');
@@ -377,8 +520,8 @@ describe('A payment in flight at a restart is not paid again (issue #967)', func
 			amountMsat: 1_000_000n,
 			status,
 			direction: PaymentDirection.OUTGOING,
-			createdAt: Date.now() - 1_000,
-			completedAt: Date.now()
+			createdAt: Date.now() - completedAgoMs - 1_000,
+			completedAt: Date.now() - completedAgoMs
 		});
 		if (preimage) storage.savePreimage(hashHex, preimage);
 	};
@@ -466,4 +609,256 @@ describe('A payment in flight at a restart is not paid again (issue #967)', func
 			await second.destroy();
 		}
 	});
+
+	// Review round 1: the in-memory record and preimage are pruned 24 hours
+	// after completion, on a 60 s tick that can run before the queue starts.
+	// The resolver then saw no record and no preimage and answered 'unpaid',
+	// while the record stayed COMPLETED on disk.
+	it('a completed payment whose in-memory record was pruned is still recorded completed, and never sent again', async () => {
+		const paid = invoiceFrom('paid 25 hours before the restart');
+		await seedRun((first) => {
+			recordOutgoing(
+				first,
+				paid.paymentHash,
+				PaymentStatus.COMPLETED,
+				paid.preimage,
+				25 * 60 * 60 * 1000
+			);
+			first.getStorage().saveQueueEntry({
+				id: 'q-1-pruned',
+				bolt11: paid.bolt11,
+				priority: 5,
+				status: 'dispatching',
+				createdAt: Date.now() - 25 * 60 * 60 * 1000
+			});
+		});
+
+		const second = await bootNode(tmpDir);
+		try {
+			const hashHex = paid.paymentHash.toString('hex');
+			// The cleanup tick, before the queue exists.
+			const pruned = second.getNode().pruneCompletedPayments();
+			expect(pruned).to.be.greaterThan(0);
+			expect(
+				second.getNode().getOutgoingHtlcs(paid.paymentHash).preimage
+			).to.equal(undefined);
+			expect(second.getStorage().loadPayment(hashHex)?.status).to.equal(
+				'COMPLETED'
+			);
+
+			const payCalls = stubPayInvoiceSafe(second);
+			second.listQueue();
+			const restored = await queueEntryOnceFinal(second, 'q-1-pruned');
+			expect(restored.status).to.equal('completed');
+			expect(payCalls).to.deep.equal([]);
+		} finally {
+			await second.destroy();
+		}
+	});
+});
+
+describe('Restored queue entries wait for a channel that can carry an HTLC (issue #967)', function () {
+	this.timeout(60_000);
+
+	let tmpDir: string;
+	let node: BeignetNode;
+
+	beforeEach(async () => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-queue-usable-'));
+		node = await bootNode(tmpDir);
+	});
+
+	afterEach(async () => {
+		await node?.destroy();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	/** A restored channel waiting on its peer's channel_reestablish. */
+	const injectReestablishingChannel = (): Channel => {
+		const seed = crypto.randomBytes(32);
+		const basepoint = (i: number): Buffer =>
+			getPublicKey(
+				crypto
+					.createHash('sha256')
+					.update(seed)
+					.update(Buffer.from([i]))
+					.digest()
+			);
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: {
+				fundingPubkey: basepoint(0),
+				revocationBasepoint: basepoint(1),
+				paymentBasepoint: basepoint(2),
+				delayedPaymentBasepoint: basepoint(3),
+				htlcBasepoint: basepoint(4),
+				firstPerCommitmentPoint: Buffer.alloc(33)
+			},
+			localPerCommitmentSeed: seed
+		});
+		state.channelId = crypto.randomBytes(32);
+		state.state = ChannelState.AWAITING_REESTABLISH;
+		state.fundingTxid = crypto.randomBytes(32);
+		state.localBalanceMsat = 900_000_000n;
+		state.remoteBalanceMsat = 100_000_000n;
+		const channel = new Channel(state);
+		const manager = node.getNode().getChannelManager() as unknown as {
+			channels: Map<string, Channel>;
+			channelPeers: Map<string, string>;
+		};
+		manager.channels.set(state.channelId.toString('hex'), channel);
+		manager.channelPeers.set(
+			state.channelId.toString('hex'),
+			'02'.padEnd(66, 'ab')
+		);
+		return channel;
+	};
+
+	// Review round 1: node:ready fires once the peers' init handshakes are
+	// done, before channel_reestablish. Started then, the queue sent a
+	// payment with no amount straight into "no route" (recorded failed), and
+	// held one with an amount back on canSend with nothing to look again.
+	it('neither restored row is dispatched or failed before the channel is usable, and both dispatch once it is, with no enqueue', async () => {
+		const channel = injectReestablishingChannel();
+		const noAmount = invoiceFrom('restored, no amount');
+		const withAmount = invoiceFrom('restored, with an amount');
+		const storage = node.getStorage();
+		storage.saveQueueEntry({
+			id: 'q-1-no-amount',
+			bolt11: noAmount.bolt11,
+			priority: 5,
+			status: 'queued',
+			createdAt: Date.now() - 1_000
+		});
+		storage.saveQueueEntry({
+			id: 'q-2-with-amount',
+			bolt11: withAmount.bolt11,
+			priority: 5,
+			status: 'queued',
+			amountSats: 1_000,
+			createdAt: Date.now() - 1_000
+		});
+		const payCalls = stubPayInvoiceSafe(node);
+		// The node is ready (its peers answered init) but the channel is not.
+		await node.getNode().waitForReady(1_000);
+
+		node.listQueue();
+		await settle(200);
+		expect(payCalls).to.deep.equal([]);
+		expect(
+			node
+				.listQueue()
+				.map((e) => e.status)
+				.sort()
+		).to.deep.equal(['queued', 'queued']);
+
+		// The peer's channel_reestablish lands and the channel is NORMAL.
+		(channel as unknown as { _state: { state: ChannelState } })._state.state =
+			ChannelState.NORMAL;
+		expect(channel.acceptsNewHtlcs()).to.equal(true);
+		node
+			.getNode()
+			.getChannelManager()
+			.emit('channel:reestablished', channel.getChannelId());
+
+		expect((await queueEntryOnceFinal(node, 'q-1-no-amount')).status).to.equal(
+			'completed'
+		);
+		expect(
+			(await queueEntryOnceFinal(node, 'q-2-with-amount')).status
+		).to.equal('completed');
+		expect([...payCalls].sort()).to.deep.equal(
+			[noAmount.bolt11, withAmount.bolt11].sort()
+		);
+	});
+
+	it('an entry held back by canSend after the start dispatches when a channel becomes usable, with no enqueue', async () => {
+		const payCalls = stubPayInvoiceSafe(node);
+		// No channel yet: the queue starts at once.
+		node.listQueue();
+		await settle();
+		const invoice = invoiceFrom('waits for capacity');
+		const entry = node.enqueuePayment(invoice.bolt11, 5, { amountSats: 1_000 });
+		await settle();
+		expect(payCalls).to.deep.equal([]);
+		expect(node.listQueue().find((e) => e.id === entry.id)?.status).to.equal(
+			'queued'
+		);
+
+		const channel = injectReestablishingChannel();
+		(channel as unknown as { _state: { state: ChannelState } })._state.state =
+			ChannelState.NORMAL;
+		node
+			.getNode()
+			.getChannelManager()
+			.emit('channel:reestablished', channel.getChannelId());
+
+		expect((await queueEntryOnceFinal(node, entry.id)).status).to.equal(
+			'completed'
+		);
+		expect(payCalls).to.deep.equal([invoice.bolt11]);
+	});
+
+	it('a wait for a usable channel does not outlive shutdown', async () => {
+		injectReestablishingChannel();
+		let runs = 0;
+		const before = node.listenerCount('channel:usable');
+		node.whenReadyToPay(() => runs++);
+		await settle();
+		expect(node.listenerCount('channel:usable')).to.equal(before + 1);
+		await node.destroy();
+		expect(node.listenerCount('channel:usable')).to.equal(0);
+		expect(runs).to.equal(0);
+	});
+});
+
+describe('POST /queue/add refuses an amount the queue could never check (issue #967)', function () {
+	this.timeout(60_000);
+
+	let tmpDir: string;
+	let daemon: IStartedDaemon;
+	let port: number;
+
+	before(async () => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-queue-route-'));
+		daemon = await startDaemon({
+			mnemonic: MNEMONIC,
+			network: 'regtest',
+			dataDir: tmpDir,
+			logLevel: 'silent',
+			rapidGossipSync: false,
+			autoGossipSync: false,
+			...OFFLINE_ELECTRUM,
+			daemonPort: 0,
+			apiToken: ROUTE_TOKEN
+		});
+		port = (daemon.server.address() as AddressInfo).port;
+	});
+
+	after(async () => {
+		await daemon?.stop();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	for (const [label, extra] of [
+		['a fractional amountSats', { amountSats: 1.5 }],
+		['a string amountSats', { amountSats: '1000' }],
+		['a negative maxFeeSats', { maxFeeSats: -1 }]
+	] as Array<[string, Record<string, unknown>]>) {
+		it(`answers 400 INVALID_PARAMS for ${label}, and queues nothing`, async () => {
+			const res = await postJson(port, '/queue/add', {
+				bolt11: invoiceFrom(label).bolt11,
+				...extra
+			});
+			expect(res.status).to.equal(400);
+			expect((res.body as { error?: { code?: string } }).error?.code).to.equal(
+				'INVALID_PARAMS'
+			);
+			const listed = await postJson(port, '/queue', undefined, 'GET');
+			expect(listed.body.result).to.deep.equal([]);
+		});
+	}
 });

@@ -5,7 +5,19 @@
  */
 
 import { EventEmitter } from 'events';
+import { BeignetError, BeignetErrorCode } from './errors';
 import { QueuedPayment } from './types';
+
+/** Absent, or a whole number of satoshis, zero or greater. */
+function requireOptionalSats(value: unknown, field: string): void {
+	if (value === undefined) return;
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be a whole number of satoshis, zero or greater`
+		);
+	}
+}
 
 /**
  * How a payment the queue was dispatching when the process stopped ended, as
@@ -195,9 +207,23 @@ export class PaymentQueue extends EventEmitter {
 			metadata?: Record<string, string>;
 		}
 	): QueuedPayment {
-		if (!bolt11) throw new Error('bolt11 is required');
-		if (priority < 1 || priority > 10)
-			throw new Error('priority must be between 1 and 10');
+		if (!bolt11) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'bolt11 is required'
+			);
+		}
+		if (!(priority >= 1 && priority <= 10)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'priority must be between 1 and 10'
+			);
+		}
+		// A persisted amount the capacity check refuses would be refused again
+		// at every start, so it is refused here, before it is stored (issue
+		// #967).
+		requireOptionalSats(opts?.amountSats, 'amountSats');
+		requireOptionalSats(opts?.maxFeeSats, 'maxFeeSats');
 
 		const entry: QueuedPayment = {
 			id: `q-${++this.idCounter}-${Date.now()}`,
@@ -329,6 +355,17 @@ export class PaymentQueue extends EventEmitter {
 	}
 
 	/**
+	 * Look at the queue again because capacity may have appeared, such as a
+	 * channel that can carry HTLCs again after a restart (issue #967). An
+	 * entry held back by canSend otherwise waits for the next enqueue() or
+	 * finished dispatch. Does nothing before start() or after stop().
+	 */
+	poke(): void {
+		if (!this.started || this.stopped) return;
+		this.processQueue();
+	}
+
+	/**
 	 * Stop dispatching, for shutdown. Payments already dispatching still
 	 * record how they ended; queued ones, including any enqueued after this,
 	 * stay 'queued' in storage. The next start restores them, and they
@@ -421,37 +458,70 @@ export class PaymentQueue extends EventEmitter {
 		if (this.processing || this.stopped) return;
 		this.processing = true;
 
-		// Process all eligible entries
-		while (this.activeCount < this.maxConcurrent) {
-			const next = this.queue.find((e) => e.status === 'queued');
-			if (!next) break;
+		// Reset however the pass ends: a throw that left it set would stop
+		// every later pass, and so the queue, for good (issue #967).
+		try {
+			// Process all eligible entries
+			while (this.activeCount < this.maxConcurrent) {
+				const next = this.queue.find((e) => e.status === 'queued');
+				if (!next) break;
 
-			// Check capacity
-			const amountToCheck = next.amountSats ?? 0;
-			if (amountToCheck > 0) {
-				const check = this.canSend(amountToCheck);
-				if (!check.canSend) break; // No capacity, stop processing
-			}
-
-			next.status = 'dispatching';
-			this.activeCount++;
-			this.emit('queue:dispatched', { id: next.id, bolt11: next.bolt11 });
-
-			if (this.storage) {
-				try {
-					this.storage.updateQueueEntryStatus(next.id, 'dispatching');
-				} catch {
-					/* best-effort */
+				// Check capacity
+				const amountToCheck = next.amountSats ?? 0;
+				if (amountToCheck > 0) {
+					let check: ReturnType<CanSendFn>;
+					try {
+						check = this.canSend(amountToCheck);
+					} catch (err: unknown) {
+						// An amount the check refuses (a row stored before
+						// enqueue() validated it) is refused on every pass: fail
+						// the entry rather than hold the rest behind it.
+						this.failUndispatchable(next, err);
+						continue;
+					}
+					if (!check.canSend) break; // No capacity, stop processing
 				}
+
+				next.status = 'dispatching';
+				this.activeCount++;
+				this.emit('queue:dispatched', { id: next.id, bolt11: next.bolt11 });
+
+				if (this.storage) {
+					try {
+						this.storage.updateQueueEntryStatus(next.id, 'dispatching');
+					} catch {
+						/* best-effort */
+					}
+				}
+
+				// Fire and forget -- will call back when done
+				this.dispatchPayment(next).catch(() => {
+					// Error already handled in dispatchPayment
+				});
 			}
-
-			// Fire and forget -- will call back when done
-			this.dispatchPayment(next).catch(() => {
-				// Error already handled in dispatchPayment
-			});
+		} finally {
+			this.processing = false;
 		}
+	}
 
-		this.processing = false;
+	/** Record a queued entry that can never be dispatched as failed. */
+	private failUndispatchable(entry: QueuedPayment, err: unknown): void {
+		entry.status = 'failed';
+		entry.error = err instanceof Error ? err.message : String(err);
+		entry.completedAt = Date.now();
+		if (this.storage) {
+			try {
+				this.storage.updateQueueEntryStatus(
+					entry.id,
+					entry.status,
+					entry.error,
+					entry.completedAt
+				);
+			} catch {
+				/* best-effort */
+			}
+		}
+		this.emit('queue:failed', { id: entry.id, error: entry.error });
 	}
 
 	private async dispatchPayment(entry: QueuedPayment): Promise<void> {

@@ -270,10 +270,10 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `enqueuePayment(bolt11, priority?, opts?)` | `QueuedPayment` | Add payment to priority queue (1-10, lower = higher priority). `opts: { amountSats?, maxFeeSats?, metadata? }` |
 | `listQueue()` | `QueuedPayment[]` | List all queue entries |
 | `cancelQueuedPayment(id)` | `boolean` | Cancel a queued payment by ID |
-| `resolveInterruptedPayment(bolt11)` | `Promise<InterruptedPaymentOutcome>` | How a payment the queue was dispatching when the process stopped ended, from the node's record: `{ status: 'completed', paymentHash }` or `{ status: 'unpaid' }`, once every HTLC offered for it is resolved. The queue's resolver for such an entry |
-| `whenReadyToPay(run)` | `void` | Calls `run` once the node can pay (after a pending guardian restore, once the node is ready); never after shutdown |
+| `resolveInterruptedPayment(bolt11)` | `Promise<InterruptedPaymentOutcome>` | How a payment the queue was dispatching when the process stopped ended, from the node's record (in memory, then on disk): `{ status: 'completed', paymentHash }` or `{ status: 'unpaid' }`, once every HTLC offered for it is resolved. The queue's resolver for such an entry |
+| `whenReadyToPay(run)` | `void` | Calls `run` once the node can pay: after a pending guardian restore, once the node is ready, and once some channel can carry an HTLC (or there is no channel); never after shutdown |
 
-Entries survive a restart. The queue dispatches the restored ones once the node is ready, without waiting for another enqueue. An entry that was `dispatching` when the process stopped is never sent again blindly: a payment that was made is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again (issue #967). A `PaymentQueue` built without a `resolveInterrupted` option records such an entry `failed` instead.
+Entries survive a restart. The queue dispatches the restored ones once some channel can carry an HTLC after the start, and looks again on every `channel:usable`, without waiting for another enqueue. An entry left `dispatching` by a restart is checked against the node's record for its invoice before anything sends it again: a payment that was made is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again (issue #967). A `PaymentQueue` built without a `resolveInterrupted` option records such an entry `failed` instead. The check covers only entries a restart interrupted: a dispatch that reaches the queue's own payment timeout (60 s by default) is recorded `failed` although its HTLC may still be in flight, so look up the payment before paying that invoice again. `amountSats` and `maxFeeSats` must be whole numbers of satoshis, zero or greater; `enqueuePayment` (and `POST /queue/add`) refuses anything else with `INVALID_PARAMS`.
 
 #### Liquidity & Channel Intelligence
 
@@ -1089,6 +1089,7 @@ interface BeignetNodeEvents {
   'hold:cancelled': (data: HoldInvoiceEvent & { reason: 'api' | 'expiry-scan' }) => void;
   'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
   'channel:ready': (data: { channelId: string }) => void;
+  'channel:usable': (data: { channelId: string }) => void;  // can take a new HTLC again (lock or reconnect); not relayed over SSE
   'channel:pending-close': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
   'channel:force-closing': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
   'channel:closed': (data: { channelId: string }) => void;

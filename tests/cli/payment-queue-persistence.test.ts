@@ -647,6 +647,136 @@ describe('Payment Queue Persistence', () => {
 				process.removeListener('unhandledRejection', onUnhandled);
 			}
 		});
+
+		/** BeignetNode.canSend's own guard: a whole number of sats or a throw. */
+		const strictCanSend = (
+			amountSats: number
+		): { canSend: boolean; availableSats: number } => {
+			if (!Number.isSafeInteger(amountSats) || amountSats < 0) {
+				throw new Error(
+					'amountSats must be a whole number of satoshis, zero or greater'
+				);
+			}
+			return { canSend: true, availableSats: 100_000 };
+		};
+
+		// Review round 1: a canSend that throws left processQueue's
+		// `processing` flag set, and every later pass returned at once. The
+		// row stayed queued, so every start hit it again.
+		it('a restored row whose amountSats the capacity check refuses is failed at start, and the queue keeps dispatching', async () => {
+			storage.saveQueueEntry({
+				id: 'q-1-bad',
+				bolt11: 'lnbc_bad_amount',
+				priority: 1,
+				status: 'queued',
+				amountSats: 1.5,
+				createdAt: Date.now()
+			});
+			seed('q-2-next', 'lnbc_next', 'queued', 5);
+			const { calls, pay } = recordingPay();
+			const queue = new PaymentQueue(pay, strictCanSend, undefined, storage);
+			const failed: Array<{ id: string; error: string }> = [];
+			queue.on('queue:failed', (e) => failed.push(e));
+
+			expect(() => queue.start()).to.not.throw();
+			await settle();
+			const row = rowOf('q-1-bad');
+			expect(row?.status).to.equal('failed');
+			expect(row?.error).to.contain('whole number of satoshis');
+			expect(row?.completedAt).to.be.a('number');
+			expect(failed.map((e) => e.id)).to.deep.equal(['q-1-bad']);
+			// The rest of the queue is not held behind it.
+			expect(calls).to.deep.equal(['lnbc_next']);
+
+			const later = queue.enqueue('lnbc_later', 5);
+			await settle();
+			expect(calls).to.deep.equal(['lnbc_next', 'lnbc_later']);
+			expect(statusOf(later.id)).to.equal('completed');
+		});
+
+		it('enqueue() refuses an amountSats or maxFeeSats that is not a whole number of satoshis, and stores nothing', () => {
+			const queue = new PaymentQueue(
+				noopPay,
+				noopCanSend,
+				{ maxConcurrent: 0 },
+				storage
+			);
+			const bad: Array<Record<string, unknown>> = [
+				{ amountSats: 1.5 },
+				{ amountSats: '1000' },
+				{ amountSats: -1 },
+				{ amountSats: Number.NaN },
+				{ amountSats: null },
+				{ maxFeeSats: 0.5 },
+				{ maxFeeSats: -2 }
+			];
+			for (const opts of bad) {
+				let refused: unknown;
+				try {
+					queue.enqueue('lnbc_bad', 5, opts as { amountSats?: number });
+				} catch (err: unknown) {
+					refused = err;
+				}
+				expect(
+					(refused as { code?: string } | undefined)?.code,
+					JSON.stringify(opts)
+				).to.equal('INVALID_PARAMS');
+			}
+			expect(storage.loadAllQueueEntries()).to.deep.equal([]);
+			expect(queue.list()).to.deep.equal([]);
+			// Absent and whole amounts are still taken.
+			queue.enqueue('lnbc_good', 5, { amountSats: 0, maxFeeSats: 10 });
+			queue.enqueue('lnbc_plain', 5);
+			expect(queue.list()).to.have.length(2);
+		});
+
+		it('poke() dispatches an entry canSend held back once capacity appears, only between start() and stop()', async () => {
+			const seedWithAmount = (id: string, bolt11: string): void =>
+				storage.saveQueueEntry({
+					id,
+					bolt11,
+					priority: 5,
+					status: 'queued',
+					amountSats: 1_000,
+					createdAt: Date.now()
+				});
+			seedWithAmount('q-1-a', 'lnbc_needs_capacity');
+			let capacity = false;
+			const canSend = (): { canSend: boolean; availableSats: number } => ({
+				canSend: capacity,
+				availableSats: capacity ? 10_000 : 0
+			});
+			const { calls, pay } = recordingPay();
+			const queue = new PaymentQueue(pay, canSend, undefined, storage);
+			capacity = true;
+			queue.poke();
+			await settle();
+			expect(calls, 'not before start()').to.deep.equal([]);
+
+			capacity = false;
+			queue.start();
+			await settle();
+			expect(calls).to.deep.equal([]);
+			expect(statusOf('q-1-a')).to.equal('queued');
+
+			capacity = true;
+			queue.poke();
+			await settle();
+			expect(calls).to.deep.equal(['lnbc_needs_capacity']);
+			expect(statusOf('q-1-a')).to.equal('completed');
+
+			// A stopped queue leaves it for the next start.
+			seedWithAmount('q-2-b', 'lnbc_after_stop');
+			capacity = false;
+			const stopped = new PaymentQueue(pay, canSend, undefined, storage);
+			stopped.start();
+			stopped.stop();
+			capacity = true;
+			stopped.poke();
+			await settle();
+			expect(calls).to.deep.equal(['lnbc_needs_capacity']);
+			expect(statusOf('q-2-b')).to.equal('queued');
+		});
 	});
 
 	it('metadata JSON round-trips', () => {

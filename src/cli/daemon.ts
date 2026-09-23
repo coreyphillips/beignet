@@ -3390,8 +3390,11 @@ async function bootDaemon(
 			// the next enqueue (issue #967). Started only now that the boot
 			// can no longer fail: a failed boot destroys the node without
 			// stopping the queue. stop() halts the queue first, so a start
-			// that comes after it does nothing.
+			// that comes after it does nothing. A payment held back by canSend
+			// is looked at again whenever a channel can carry HTLCs again,
+			// not only on the next enqueue.
 			node.whenReadyToPay(() => paymentQueue.start());
+			node.on('channel:usable', () => paymentQueue.poke());
 			resolve({ server, node, stop });
 		});
 	});

@@ -161,6 +161,7 @@ import {
 	SpliceRefusalCode,
 	IHoldCancelledEvent,
 	IHoldInvoiceStateEvent,
+	PaymentDirection,
 	PaymentStatus
 } from '../lightning/node/types';
 import {
@@ -2688,6 +2689,43 @@ export class BeignetNode extends EventEmitter {
 			this.refreshStaticChannelBackup();
 			this.emit('channel:ready', { channelId });
 		});
+		// A channel that can take a new HTLC again (issue #967): it reached
+		// NORMAL on channel_ready, or finished reestablishing on a reconnect.
+		// node:ready fires once the peers' init handshakes are done, before
+		// any reestablish, so the payment queues wait for this instead.
+		const usableNode = this.node;
+		const announceUsable = (channelId: Buffer): void => {
+			// Out of the channel manager's dispatch turn: a payment the event
+			// releases must not be sent from inside the message handler that
+			// is still finishing the reestablish.
+			setImmediate(() => {
+				if (this.destroyed || this.node !== usableNode) return;
+				try {
+					const channel = usableNode.getChannelManager().getChannel(channelId);
+					if (!channel?.acceptsNewHtlcs()) return;
+					this.emit('channel:usable', {
+						channelId: channelId.toString('hex')
+					});
+				} catch (err: unknown) {
+					try {
+						this.log('warn', 'A channel:usable listener failed', {
+							error: err instanceof Error ? err.message : String(err)
+						});
+					} catch {
+						// A throwing log listener must not crash the process
+						// from a timer callback either.
+					}
+				}
+			});
+		};
+		this.node.on('channel:ready', (data: { channelId: Buffer }) =>
+			announceUsable(data.channelId)
+		);
+		this.node
+			.getChannelManager()
+			.on('channel:reestablished', (channelId: Buffer) =>
+				announceUsable(channelId)
+			);
 		this.node.on('channel:closed', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel closed', { channelId });
@@ -11892,10 +11930,14 @@ export class BeignetNode extends EventEmitter {
 	 * when the preimage is known or the record says COMPLETED; 'unpaid'
 	 * otherwise, since the PENDING record is committed before any HTLC is
 	 * offered and the HTLC view covers offered HTLCs even without a record:
-	 * resolved with no preimage means nothing was paid. Throws while there is
-	 * no node to ask (restore pending, a capsule restore rebuilding it, a
-	 * restart required, destroyed); the queue then leaves the entry for the
-	 * next start.
+	 * resolved with no preimage means nothing was paid. The in-memory record
+	 * and preimage are pruned 24 hours after completion (and oldest first past
+	 * the size cap), and the cleanup tick can run before this does, so the
+	 * durable record is read before answering 'unpaid': pruning leaves it on
+	 * disk. Throws while there is no node to ask (restore pending, a capsule
+	 * restore rebuilding it, a restart required, destroyed) or the durable
+	 * record cannot be read; the queue then leaves the entry for the next
+	 * start.
 	 */
 	async resolveInterruptedPayment(
 		bolt11: string
@@ -11927,18 +11969,44 @@ export class BeignetNode extends EventEmitter {
 		} catch {
 			return { status: 'unpaid' };
 		}
+		const hashHex = paymentHash.toString('hex');
 		const view = await this.node.awaitPaymentResolution(paymentHash);
 		if (view.preimage || view.status === PaymentStatus.COMPLETED) {
-			return { status: 'completed', paymentHash: paymentHash.toString('hex') };
+			return { status: 'completed', paymentHash: hashHex };
+		}
+		// Only an OUTGOING record counts: the preimage store alone also holds
+		// this node's own invoices' preimages. A read that throws propagates,
+		// so the entry waits rather than being sent on a guess.
+		const durable = this.storage.loadPayment(hashHex);
+		if (
+			durable?.direction === PaymentDirection.OUTGOING &&
+			(durable.status === PaymentStatus.COMPLETED ||
+				durable.preimage !== undefined)
+		) {
+			return { status: 'completed', paymentHash: hashHex };
 		}
 		return { status: 'unpaid' };
 	}
 
 	/**
+	 * True when a new HTLC can go out now: some channel accepts one, or there
+	 * is no channel at all, where waiting would never end and a payment fails
+	 * on its own terms (issue #967).
+	 */
+	private canCarryHtlc(): boolean {
+		const channels = this.node.getChannelManager().listChannels();
+		return channels.length === 0 || channels.some((ch) => ch.acceptsNewHtlcs());
+	}
+
+	/**
 	 * Run `run` once this node can pay: after a pending guardian restore has
-	 * built the node, and once the node is ready. Never while a capsule
-	 * restore rebuilds the node or a restart is required, and never after
-	 * shutdown. The payment queues start here (issue #967).
+	 * built the node, once the node is ready, and once some channel can carry
+	 * an HTLC. node:ready alone comes after the peers' init handshakes and
+	 * before any channel_reestablish, when every restored channel still
+	 * refuses new HTLCs: a payment sent then fails for want of a route, and
+	 * one held back by canSend waits for the next enqueue. Never while a
+	 * capsule restore rebuilds the node or a restart is required, and never
+	 * after shutdown. The payment queues start here (issue #967).
 	 */
 	whenReadyToPay(run: () => void): void {
 		if (this.destroyed) return;
@@ -11948,19 +12016,36 @@ export class BeignetNode extends EventEmitter {
 			return;
 		}
 		if (this._resuming || this._restartRequired) return;
+		const node = this.node;
+		// Bound to the node it was asked about: a capsule restore that
+		// rebuilds the node retires the wait.
+		const live = (): boolean =>
+			!this.destroyed &&
+			!this._resuming &&
+			!this._restartRequired &&
+			this.node === node;
 		let ready: Promise<void>;
 		try {
-			ready = this.node.waitForReady(BeignetNode.MAX_TIMER_MS);
+			ready = node.waitForReady(BeignetNode.MAX_TIMER_MS);
 		} catch {
 			return;
 		}
 		ready
 			.then(
 				() => {
-					if (this.destroyed || this._resuming || this._restartRequired) {
+					if (!live()) return;
+					if (this.canCarryHtlc()) {
+						run();
 						return;
 					}
-					run();
+					// Shutdown removes every listener, so this cannot outlive
+					// the node; a retired wait removes itself on the next event.
+					const onUsable = (): void => {
+						if (live() && !this.canCarryHtlc()) return;
+						this.removeListener('channel:usable', onUsable);
+						if (live()) run();
+					};
+					this.on('channel:usable', onUsable);
 				},
 				() => {
 					// Destroyed (a shutdown, or a capsule restore rebuilding the
@@ -11993,10 +12078,15 @@ export class BeignetNode extends EventEmitter {
 			// First built after shutdown began, while the database stays open
 			// for the wallet: the rows it restored must not dispatch against
 			// the stopped node and persist 'failed' (issue #958). Otherwise
-			// they dispatch once the node can pay, not on the next enqueue()
-			// (issue #967).
-			if (this.destroyed) this.paymentQueue.stop();
-			else this.whenReadyToPay(() => this.paymentQueue?.start());
+			// they dispatch once the node can pay, not on the next enqueue(),
+			// and one held back by canSend is looked at again whenever a
+			// channel can carry HTLCs again (issue #967).
+			if (this.destroyed) {
+				this.paymentQueue.stop();
+			} else {
+				this.whenReadyToPay(() => this.paymentQueue?.start());
+				this.on('channel:usable', () => this.paymentQueue?.poke());
+			}
 		}
 		return this.paymentQueue;
 	}
