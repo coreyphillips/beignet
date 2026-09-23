@@ -598,7 +598,9 @@ console.log('Limit:', info.limitSats, 'Spent:', info.spentSats, 'Remaining:', in
 // Resets at midnight UTC (info.resetsAt)
 
 // payInvoice and sendKeysend will throw SPENDING_LIMIT_EXCEEDED if the limit is hit.
-// Spend is recorded AFTER payment settles — failed payments do not count against the limit.
+// Spend is recorded when a payment settles, once, even when the settle lands after
+// payInvoice's timeout or after a restart; failed payments do not count against the limit.
+// The ledger is persisted: a restart within the UTC day resumes the day's total.
 // Concurrent payments are guarded by a pending counter to prevent overshoot.
 ```
 

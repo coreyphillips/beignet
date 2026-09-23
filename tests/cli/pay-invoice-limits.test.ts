@@ -45,7 +45,6 @@ type StubbedEngine = {
 type Internals = {
 	node: StubbedEngine;
 	_pendingSpendSats: number;
-	_blockingPaymentHashes: Map<string, number>;
 };
 
 const internals = (node: BeignetNode): Internals =>
@@ -179,7 +178,6 @@ describe('payInvoice admission on a fixed-amount invoice (#528)', function () {
 
 		expect(calls).to.have.length(0);
 		expect(internals(node)._pendingSpendSats).to.equal(0);
-		expect(internals(node)._blockingPaymentHashes.size).to.equal(0);
 	});
 
 	it('refuses a fixed invoice the daily budget can no longer cover', async () => {
@@ -243,7 +241,6 @@ describe('payInvoice admission on a fixed-amount invoice (#528)', function () {
 			'Invoice has no amount'
 		);
 		expect(internals(node)._pendingSpendSats).to.equal(0);
-		expect(internals(node)._blockingPaymentHashes.size).to.equal(0);
 	});
 
 	it('reports the refusal through payInvoiceSafe rather than paying', async () => {

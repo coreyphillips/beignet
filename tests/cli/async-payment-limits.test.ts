@@ -47,7 +47,6 @@ type Internals = {
 	_pendingSpendSats: number;
 	_dailySpendResetTime: number;
 	_asyncSpendClaims: Map<string, AsyncSpendClaim[]>;
-	_blockingPaymentHashes: Map<string, number>;
 };
 
 const internals = (node: BeignetNode): Internals =>
@@ -453,9 +452,9 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		settle(node, paymentHash, 3_000, 'FAILED');
 		expect(claimedSats(node, paymentHash)).to.equal(3_000);
 
-		// payInvoice owns the hash's accounting while it runs: the forwarding
-		// handler in create() and its own listener otherwise both record the
-		// one settlement.
+		// The forwarding handler in create() charges the one settlement, to the
+		// oldest claim still holding budget; payInvoice's own listener records
+		// nothing (issue #977).
 		const retried = node.payInvoice(bolt11, 5_000);
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		await retried;
@@ -467,7 +466,6 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		// back budget 3 000 sats could still leave on.
 		expect(claimedSats(node, paymentHash)).to.equal(3_000);
 		expect(internals(node)._pendingSpendSats).to.equal(3_000);
-		expect(internals(node)._blockingPaymentHashes.size).to.equal(0);
 	});
 
 	it('holds the budget of every attempt a blocking retry could not report', async () => {
