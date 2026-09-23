@@ -210,8 +210,9 @@ export class Wallet {
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
 	// its deadline walked away from, must not undo the teardown.
 	private _stopped = false;
-	// Raised by stop() before it waits for the refresh in flight. A wallet
-	// shutting down owes no further scan, and one would only hold stop() up.
+	// Raised by stop() before it waits for the refresh in flight and the
+	// queued writes. A wallet shutting down owes no further scan, and one
+	// would only hold stop() up.
 	private _stopping = false;
 	// BIP32 account index as a path segment string ('0' by default).
 	private readonly _account: string;
@@ -728,21 +729,37 @@ export class Wallet {
 	}
 
 	/**
-	 * Stops the wallet permanently, waiting up to refreshTimeout for active refreshes.
+	 * Stops the wallet permanently, waiting up to refreshTimeout for active
+	 * refreshes and for the storage writes already queued at the call.
 	 * @param {Object} [options]
-	 * @param {number} [options.refreshTimeout] How long to wait for an in-flight refresh, in ms.
+	 * @param {number} [options.refreshTimeout] How long to wait for an in-flight refresh and queued writes, in ms.
 	 * @returns {Promise<Result<string>>}
 	 */
 	public async stop({
 		refreshTimeout = STOP_REFRESH_WAIT_MS
 	}: { refreshTimeout?: number } = {}): Promise<Result<string>> {
 		let abandonedRefresh = false;
+		let abandonedWrites: string[] = [];
+		// One deadline for both waits below: the writes get what the refresh
+		// left of it, never a second deadline of their own.
+		const deadline = Date.now() + refreshTimeout;
+		// Writes callers issued before the shutdown. Clearing _setData drops a
+		// write still waiting its turn, so they get their chance first.
+		const queuedWrites = Object.entries(this.savingOperations);
 		this._stopping = true;
 		try {
 			try {
 				// if we are refreshing, we need to wait for it to finish
 				if (this.isRefreshing) {
 					abandonedRefresh = !(await this._waitForRefresh(refreshTimeout));
+				}
+				// Only with a write queued: with nothing to wait for, the teardown
+				// below runs in the same tick as the call, as it always has.
+				if (queuedWrites.length) {
+					abandonedWrites = await this._waitForWrites(
+						queuedWrites,
+						deadline - Date.now()
+					);
 				}
 			} finally {
 				// However the wait above ended, the teardown runs: a shutdown that
@@ -758,8 +775,15 @@ export class Wallet {
 				// disconnect from Electrum
 				await this.electrum.disconnect();
 			}
-			if (abandonedRefresh) {
-				const message = `Wallet stopped, abandoning a refresh that did not finish within ${refreshTimeout}ms.`;
+			const abandoned: string[] = [];
+			if (abandonedRefresh) abandoned.push('a refresh');
+			if (abandonedWrites.length) {
+				abandoned.push(`writes to ${abandonedWrites.join(', ')}`);
+			}
+			if (abandoned.length) {
+				const message = `Wallet stopped, abandoning ${abandoned.join(
+					' and '
+				)} that did not finish within ${refreshTimeout}ms.`;
 				this.logger.warn(message);
 				return ok(message);
 			}
@@ -767,6 +791,42 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * Waits for the given queued writes, for at most `timeout` ms. Resolves
+	 * the keys whose writes were still pending when the deadline came.
+	 *
+	 * Never rejects (saveWalletData's queue does not), and never cancels: a
+	 * write the adapter is already making may still land after stop(), while
+	 * those queued behind it are dropped by the cleared _setData.
+	 * @private
+	 */
+	private async _waitForWrites(
+		writes: [string, Promise<Result<string>>][],
+		timeout: number
+	): Promise<string[]> {
+		if (!writes.length) return [];
+		const pending = new Set(writes.map(([key]) => key));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, Math.max(0, timeout));
+		});
+		try {
+			await Promise.race([
+				Promise.all(
+					writes.map(([key, write]) =>
+						write.then(() => {
+							pending.delete(key);
+						})
+					)
+				),
+				deadline
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+		return [...pending];
 	}
 
 	/**
@@ -898,7 +958,12 @@ export class Wallet {
 		force?: boolean;
 		onStart?: () => void;
 	} = {}): Promise<Result<IWalletData>> {
-		if (this._stopped) return err('Wallet stopped.');
+		// A stopping wallet starts no new body: one started while stop() waits
+		// on queued writes would only be abandoned mid-step by the teardown. A
+		// call made while a refresh is in flight still queues behind it, which
+		// is how stop() waits for one.
+		if (this._stopped || (this._stopping && !this.isRefreshing))
+			return err('Wallet stopped.');
 		if (onStart) this._refreshStartCallbacks.push(onStart);
 		if (this.isRefreshing && !force) {
 			this._refreshOwed = true;
@@ -3091,6 +3156,11 @@ export class Wallet {
 		return clone.toBase58();
 	}
 
+	// The newest write queued for each key. Each write waits for the one
+	// queued before it, so this one settles only after all of them, and it
+	// never rejects.
+	private savingOperations: Record<string, Promise<Result<string>>> = {};
+
 	/**
 	 * Saves the wallet data object to storage if able.
 	 *
@@ -3101,50 +3171,77 @@ export class Wallet {
 	 *
 	 * A wallet configured without a setData is not a failure: it never had
 	 * persistence to lose.
+	 *
+	 * Writes to one key reach storage one at a time, in the order they were
+	 * issued, so an adapter that completes writes out of order still ends up
+	 * holding the last value written. Never rejects: an adapter that throws,
+	 * before or after returning its promise, answers Err, and so does a write
+	 * stop() dropped while it waited its turn (#946).
 	 * @private
 	 * @async
 	 * @param {TWalletDataKeys} key
 	 * @param {IWalletData[K]} data
 	 * @returns {Promise<Result<string>>}
 	 */
-	private savingOperations: Record<string, Promise<Result<string>>> = {};
 	public async saveWalletData<K extends keyof IWalletData>(
 		key: TWalletDataKeys,
 		data: IWalletData[K]
 	): Promise<Result<string>> {
 		if (!this._setData) return ok('No setData method has been provided');
-
-		// Check if there's an ongoing save operation for the same key
-		if (key in this.savingOperations) {
-			// Wait for the ongoing operation to complete
-			await this.savingOperations[key];
-		}
-
+		// Fixed now, not when the write's turn comes: switchNetwork moves the
+		// wallet to another network while a write may still be waiting, and
+		// that write carries the old network's data.
 		const walletDataKey = this.getWalletDataKey(key);
-		// Create a new save operation
-		this.savingOperations[key] = this._setData(walletDataKey, data)
-			.then((res) => {
-				// Adapters written in JS may resolve something that is not a
-				// Result at all; only an explicit Err counts as a failure.
-				if (typeof res?.isErr === 'function' && res.isErr()) {
-					return err<string>(
-						`Error saving wallet data for ${walletDataKey}: ${res.error.message}`
-					);
-				}
-				return ok(`${walletDataKey} data saved successfully`);
-			})
-			.catch((error) => {
-				return err<string>(
-					`Error saving wallet data for ${walletDataKey}: ${error}`
-				);
-			})
-			.finally(() => {
-				// Remove the operation once it's completed
-				delete this.savingOperations[key];
-			});
+		// With nothing queued for the key the write is issued in this same
+		// tick, so a stop() that follows the call cannot get in ahead of it.
+		const operation =
+			key in this.savingOperations
+				? this.savingOperations[key].then(() =>
+						this.writeWalletData(walletDataKey, data)
+				  )
+				: this.writeWalletData(walletDataKey, data);
+		this.savingOperations[key] = operation;
+		const saved = await operation;
+		// A newer write that queued behind this one owns the entry now.
+		if (this.savingOperations[key] === operation) {
+			delete this.savingOperations[key];
+		}
+		return saved;
+	}
 
-		// Wait for the save operation to complete
-		return await this.savingOperations[key];
+	/**
+	 * Hands one write to the storage adapter, for saveWalletData once the
+	 * write's turn has come. Never rejects.
+	 * @private
+	 * @param {string} walletDataKey The storage key, fixed when the write was issued.
+	 * @param {IWalletData[K]} data
+	 * @returns {Promise<Result<string>>}
+	 */
+	private async writeWalletData<K extends keyof IWalletData>(
+		walletDataKey: string,
+		data: IWalletData[K]
+	): Promise<Result<string>> {
+		try {
+			// stop() clears the adapter on purpose, so that work it walked away
+			// from cannot write after it. A write still waiting its turn then
+			// was accepted and never made, and its caller has to hear that.
+			if (!this._setData) {
+				return err(
+					`Wallet stopped before the queued write of ${walletDataKey} could run; it was not saved.`
+				);
+			}
+			const res = await this._setData(walletDataKey, data);
+			// Adapters written in JS may resolve something that is not a
+			// Result at all; only an explicit Err counts as a failure.
+			if (typeof res?.isErr === 'function' && res.isErr()) {
+				return err(
+					`Error saving wallet data for ${walletDataKey}: ${res.error.message}`
+				);
+			}
+			return ok(`${walletDataKey} data saved successfully`);
+		} catch (error) {
+			return err(`Error saving wallet data for ${walletDataKey}: ${error}`);
+		}
 	}
 
 	//TODO: Implement this as a way to better update and save state so we can consolidate this.data[key] updates.

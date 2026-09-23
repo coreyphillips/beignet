@@ -622,6 +622,42 @@ describe('UTXO state persistence (#812)', function () {
 		expect(persistErrors()).to.have.length(1);
 	});
 
+	// Issue #946: stop() turns storage off under a write still waiting its
+	// turn, and that write used to reject with a TypeError, failing the
+	// broadcast of a transaction that was already on the network.
+	it('reports both broadcasts when stop() drops a UTXO write queued behind a held one', async () => {
+		// Spend 1's set write reaches storage and waits there.
+		const releaseFirstWrite = holdNext('utxos');
+		const first = wallet.broadcastTransaction(txSpending([utxoA]));
+		await waitFor(() => wallet.getBalance() === 40000);
+
+		// Spend 2 is broadcast, and its set write queues behind spend 1's.
+		const second = wallet.broadcastTransaction(txSpending([utxoB]));
+		await waitFor(() => wallet.getBalance() === 0);
+
+		// The held write does not land inside the deadline, so stop() turns
+		// storage off with spend 2's write still queued.
+		const stopped = await wallet.stop({ refreshTimeout: 50 });
+		expect(stopped.isOk(), 'the wallet stopped').to.equal(true);
+		releaseFirstWrite();
+
+		const [firstRes, secondRes] = await Promise.allSettled([first, second]);
+		for (const [what, res] of [
+			['spend 1', firstRes],
+			['spend 2', secondRes]
+		] as const) {
+			expect(res.status, `${what} did not reject`).to.equal('fulfilled');
+			if (res.status !== 'fulfilled') continue;
+			expect(res.value.isOk(), `${what} reported its broadcast`).to.equal(true);
+			if (res.value.isOk()) expect(res.value.value).to.equal(BROADCAST_TXID);
+		}
+		// Spend 1's set landed. Spend 2's was dropped, and that was logged.
+		expect(outpoints(storedUtxos())).to.deep.equal(outpoints([utxoB]));
+		expect(persistErrors()).to.have.length(1);
+		expect(persistErrors()[0]).to.include(UTXOS_KEY);
+		expect(wallet.listUtxos()).to.have.length(0);
+	});
+
 	it('logs a refused write when clearing the set, and leaves the stored pair agreeing', async () => {
 		fail.keys = ['utxos'];
 		await wallet.clearUtxos();
