@@ -308,6 +308,14 @@ describe('Transaction CoinSelect Test', function (): void {
 		await refreshOrSkip(this, wallet);
 	});
 
+	after(async function () {
+		// A skipped before leaves either nothing or the first suite's wallet
+		// here. stop() is safe on both and, unlike electrum.disconnect(), never
+		// throws and keeps a refresh abandoned by refreshOrSkip from
+		// reconnecting (issue #947).
+		await wallet?.stop({ refreshTimeout: 5000 });
+	});
+
 	const transaction = new Transaction({ wallet });
 
 	it('Should select smallest UTXOs first when using small preference', () => {

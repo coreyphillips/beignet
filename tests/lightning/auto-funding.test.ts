@@ -13,6 +13,7 @@ import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { createFundingScript } from '../../src/lightning/script/funding';
+import { neverSettles, settle } from './helpers/settle';
 
 bitcoin.initEccLib(ecc);
 
@@ -130,7 +131,7 @@ function buildMockFundingTx(
 
 describe('Auto-Funding Integration', function () {
 	describe('full auto-funding flow', function () {
-		it('should auto-build and broadcast funding tx after accept_channel', function (done) {
+		it('should auto-build and broadcast funding tx after accept_channel', async function () {
 			let buildCalled = false;
 			let broadcastCalled = false;
 			let capturedAddress = '';
@@ -163,12 +164,13 @@ describe('Auto-Funding Integration', function () {
 
 			connectNodes(alice, bob);
 
-			const fundingSatoshis = 500_000n;
-			alice.openChannel(bob.getNodeId(), fundingSatoshis);
+			try {
+				const fundingSatoshis = 500_000n;
+				alice.openChannel(bob.getNodeId(), fundingSatoshis);
 
-			// The auto-funding flow is async — wait a tick for the promise chain
-			setTimeout(() => {
-				expect(buildCalled).to.be.true;
+				// The auto-funding flow is async. Wait on the provider call itself,
+				// not a fixed window a loaded machine can overrun (issue #947).
+				await settle(() => buildCalled);
 				expect(capturedAmount).to.equal(fundingSatoshis);
 				// The address should be a valid regtest P2WSH address
 				expect(capturedAddress).to.match(/^bcrt1/);
@@ -176,23 +178,20 @@ describe('Auto-Funding Integration', function () {
 				// After buildFundingTransaction resolves, funding_created is sent,
 				// bob responds with funding_signed, and then broadcast is called
 				// via the watch:funding listener
-				setTimeout(() => {
-					expect(broadcastCalled).to.be.true;
+				await settle(() => broadcastCalled);
 
-					// Both nodes should have the channel
-					const aliceChannels = alice.listChannels();
-					const bobChannels = bob.listChannels();
-					expect(aliceChannels.length).to.equal(1);
-					expect(bobChannels.length).to.equal(1);
-
-					alice.destroy();
-					bob.destroy();
-					done();
-				}, 50);
-			}, 50);
+				// Both nodes should have the channel
+				const aliceChannels = alice.listChannels();
+				const bobChannels = bob.listChannels();
+				expect(aliceChannels.length).to.equal(1);
+				expect(bobChannels.length).to.equal(1);
+			} finally {
+				alice.destroy();
+				bob.destroy();
+			}
 		});
 
-		it('should use correct P2WSH funding address from both pubkeys', function (done) {
+		it('should use correct P2WSH funding address from both pubkeys', async function () {
 			let capturedAddress = '';
 			const aliceConfig = makeNodeConfig(10);
 			const bobConfig = makeNodeConfig(20);
@@ -212,9 +211,10 @@ describe('Auto-Funding Integration', function () {
 			bob.on('node:error', () => {});
 			connectNodes(alice, bob);
 
-			alice.openChannel(bob.getNodeId(), 100_000n);
+			try {
+				alice.openChannel(bob.getNodeId(), 100_000n);
+				await settle(() => capturedAddress !== '');
 
-			setTimeout(() => {
 				// Verify the address matches what createFundingScript would produce
 				const { address } = createFundingScript(
 					aliceConfig.channelBasepoints.fundingPubkey,
@@ -222,11 +222,10 @@ describe('Auto-Funding Integration', function () {
 					bitcoin.networks.regtest
 				);
 				expect(capturedAddress).to.equal(address);
-
+			} finally {
 				alice.destroy();
 				bob.destroy();
-				done();
-			}, 50);
+			}
 		});
 	});
 
@@ -254,7 +253,7 @@ describe('Auto-Funding Integration', function () {
 	});
 
 	describe('error handling', function () {
-		it('should emit AUTO_FUNDING_FAILED when wallet has insufficient funds', function (done) {
+		it('should emit AUTO_FUNDING_FAILED when wallet has insufficient funds', async function () {
 			const mockProvider: IFundingProvider = {
 				buildFundingTransaction: async () => {
 					throw new Error('Insufficient funds');
@@ -273,22 +272,23 @@ describe('Auto-Funding Integration', function () {
 				errors.push(err);
 			});
 
-			alice.openChannel(bob.getNodeId(), 100_000n);
+			try {
+				alice.openChannel(bob.getNodeId(), 100_000n);
+				await settle(() =>
+					errors.some((e) => e.code === 'AUTO_FUNDING_FAILED')
+				);
 
-			setTimeout(() => {
 				const fundingError = errors.find(
 					(e) => e.code === 'AUTO_FUNDING_FAILED'
 				);
-				expect(fundingError).to.exist;
 				expect(fundingError!.message).to.include('Insufficient funds');
-
+			} finally {
 				alice.destroy();
 				bob.destroy();
-				done();
-			}, 50);
+			}
 		});
 
-		it('should emit FUNDING_BROADCAST_FAILED when broadcast fails', function (done) {
+		it('should emit FUNDING_BROADCAST_FAILED when broadcast fails', async function () {
 			const mockProvider: IFundingProvider = {
 				buildFundingTransaction: async (address, amountSats) => {
 					return buildMockFundingTx(address, Number(amountSats));
@@ -309,19 +309,20 @@ describe('Auto-Funding Integration', function () {
 				errors.push(err);
 			});
 
-			alice.openChannel(bob.getNodeId(), 100_000n);
+			try {
+				alice.openChannel(bob.getNodeId(), 100_000n);
+				await settle(() =>
+					errors.some((e) => e.code === 'FUNDING_BROADCAST_FAILED')
+				);
 
-			setTimeout(() => {
 				const broadcastError = errors.find(
 					(e) => e.code === 'FUNDING_BROADCAST_FAILED'
 				);
-				expect(broadcastError).to.exist;
 				expect(broadcastError!.message).to.include('Connection refused');
-
+			} finally {
 				alice.destroy();
 				bob.destroy();
-				done();
-			}, 100);
+			}
 		});
 	});
 
@@ -387,7 +388,7 @@ describe('Auto-Funding Integration', function () {
 			return { provider, calls };
 		}
 
-		it('threads max and the pinned rate through accept_channel to funding', function (done) {
+		it('threads max and the pinned rate through accept_channel to funding', async function () {
 			const { provider, calls } = capturingProvider();
 			const alice = new LightningNode(makeNodeConfig(41, provider));
 			const bob = new LightningNode(makeNodeConfig(42));
@@ -395,20 +396,26 @@ describe('Auto-Funding Integration', function () {
 			bob.on('node:error', () => {});
 			connectNodesAsync(alice, bob);
 
-			alice.openChannel(bob.getNodeId(), 99_500n, undefined, 2, true);
+			try {
+				alice.openChannel(bob.getNodeId(), 99_500n, undefined, 2, true);
+				await settle(() => calls.length >= 1);
+				// A duplicate build would land after the first, so hold a window for
+				// it. Like the fixed window this replaces, it also gives the queued
+				// funding_created and funding_signed time to land before the nodes
+				// are destroyed (issue #947).
+				await neverSettles(() => calls.length > 1, 80);
 
-			setTimeout(() => {
 				expect(calls.length, 'funding built once').to.equal(1);
 				expect(calls[0].max, 'max threaded to provider').to.be.true;
 				expect(calls[0].rate, 'pinned rate threaded').to.equal(2);
 				expect(calls[0].amount).to.equal(99_500n);
+			} finally {
 				alice.destroy();
 				bob.destroy();
-				done();
-			}, 80);
+			}
 		});
 
-		it('does not leak the max flag to a later non-max open', function (done) {
+		it('does not leak the max flag to a later non-max open', async function () {
 			// Sequential opens: a max open funds and consumes its flag, then a later
 			// open to a different peer must not inherit it (the temporary-id entry is
 			// per-channel and cleared after use).
@@ -420,25 +427,32 @@ describe('Auto-Funding Integration', function () {
 			connectNodesAsync(alice, bob);
 			connectNodesAsync(alice, carol);
 
-			alice.openChannel(bob.getNodeId(), 99_500n, undefined, 2, true);
-			setTimeout(() => {
+			try {
+				alice.openChannel(bob.getNodeId(), 99_500n, undefined, 2, true);
+				// handleAutoFunding deletes the temporary-id flag before it calls the
+				// provider, so a recorded call means the max flag is already spent.
+				await settle(() => calls.length >= 1);
+				// The window a duplicate build would need. It also gives the first
+				// handshake time to drain, so the opens run one after the other as
+				// they did under the old fixed window (issue #947).
+				await neverSettles(() => calls.length > 1, 80);
 				expect(calls.length, 'max open funded').to.equal(1);
 				expect(calls[0].max, 'max open swept').to.be.true;
 
 				// A later, non-max open to a different peer.
 				alice.openChannel(carol.getNodeId(), 40_000n, undefined, 2);
-				setTimeout(() => {
-					expect(calls.length, 'both opens funded').to.equal(2);
-					expect(calls[1].amount).to.equal(40_000n);
-					expect(calls[1].max, 'plain open did not inherit max').to.not.equal(
-						true
-					);
-					alice.destroy();
-					bob.destroy();
-					carol.destroy();
-					done();
-				}, 80);
-			}, 80);
+				await settle(() => calls.length >= 2);
+				await neverSettles(() => calls.length > 2, 80);
+				expect(calls.length, 'both opens funded').to.equal(2);
+				expect(calls[1].amount).to.equal(40_000n);
+				expect(calls[1].max, 'plain open did not inherit max').to.not.equal(
+					true
+				);
+			} finally {
+				alice.destroy();
+				bob.destroy();
+				carol.destroy();
+			}
 		});
 
 		it('rejects a max open without a pinned satsPerVbyte', function () {
