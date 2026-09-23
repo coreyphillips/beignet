@@ -360,7 +360,7 @@ curl "http://localhost:2112/channel/health?channelId=abc123..." \
 
 ### Timeout behavior
 
-At its timeout `payInvoice()` fails the payment only when no HTLC is out for it. With one still in flight the record stays `PENDING` until that HTLC resolves (it can still settle after the timeout fires), and the `PAYMENT_TIMEOUT` message says so; `payInvoiceSafe()` then returns that `PENDING` record (issue #976). Check `getPayment(hash)` before retrying: a `PENDING` payment is still being paid, and the engine refuses a second payment to it in any case.
+At its timeout `payInvoice()` fails the payment only when no HTLC is out for it. With one still in flight the record stays `PENDING` until that HTLC resolves (it can still settle after the timeout fires), no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so, and `payInvoiceSafe()` then returns that `PENDING` record (issue #976). Check `getPayment(hash)` before retrying: a `PENDING` payment is still being paid, and the engine refuses a second payment to it in any case.
 
 ### Duplicate payment protection
 
@@ -371,7 +371,7 @@ Retrying the same invoice while the payment is still `PENDING`, while any HTLC i
 | Method | Blocks? | Throws on failure? | Best for |
 |--------|---------|-------------------|----------|
 | `payInvoice()` | Yes | Yes | Simple scripts |
-| `payInvoiceSafe()` | Yes | No (returns `FAILED`) | Agent loops |
+| `payInvoiceSafe()` | Yes | No (returns `FAILED`, or the `PENDING` record after a timeout with an HTLC still out) | Agent loops |
 | `sendPaymentAsync()` | No | Only at submission (drain, limits, decode, no route) | Fire-and-forget |
 | `payInvoiceWithRetry()` | Yes | No | Production agents |
 

@@ -15506,7 +15506,13 @@ export class LightningNode extends EventEmitter {
 				createdAt: Date.now(),
 				completedAt: Date.now()
 			};
-			this.payments.set(invoice.paymentHash.toString('hex'), payment);
+			const expiredHashHex = invoice.paymentHash.toString('hex');
+			this.payments.set(expiredHashHex, payment);
+			// A retry that lands here (the invoice expired between attempts)
+			// is over: its context would otherwise linger until prune, and
+			// the record went unpersisted (issue #976).
+			this.paymentRetryContexts.delete(expiredHashHex);
+			this.persistPayment(invoice.paymentHash);
 			this.emit('payment:failed', payment);
 			return payment;
 		}
@@ -21682,6 +21688,7 @@ export class LightningNode extends EventEmitter {
 	): void {
 		if (outputType !== OutputType.OFFERED_HTLC) return;
 		if (!channelId || !paymentHash) return;
+		const hashHex = paymentHash.toString('hex');
 		// Our own outgoing payment's HTLC resolved on chain (issue #737): the
 		// resolution watcher learns it here whether the preimage was found or
 		// the timeout path won.
@@ -21689,9 +21696,18 @@ export class LightningNode extends EventEmitter {
 			htlcId !== undefined &&
 			this.htlcPaymentMap.get(
 				`${channelId.toString('hex')}:offered-${htlcId}`
-			) === paymentHash.toString('hex')
+			) === hashHex
 		) {
 			this.emitHtlcResolved(paymentHash, channelId, htlcId, 'onchain-resolved');
+			// With no preimage the timeout path won for this HTLC (a preimage
+			// resolution is handleOnChainPreimageLearned's). Nothing else
+			// fails a PENDING record whose channel left NORMAL: the expiry
+			// backstop skips such channels and the stuck-payment sweep counts
+			// the kept entry as active. So the payment is failed here, unless
+			// another HTLC of it is still out (issue #976).
+			if (!this.preimages.has(hashHex)) {
+				this.failPaymentUnlessInFlight(paymentHash, 'HTLC timed out on chain');
+			}
 		}
 		// A known preimage means the downstream DID settle; the fulfill path
 		// (handleOnChainPreimageLearned / handleHtlcFulfilled) owns the inbound leg.
@@ -27423,15 +27439,28 @@ export class LightningNode extends EventEmitter {
 	 * to retract an update_add_htlc, so a record failed at a timeout while
 	 * its HTLC was still out lied until the HTLC resolved, and a payee who
 	 * settled after the clock turned that FAILED back into COMPLETED. While
-	 * hasHtlcInFlight the record is left PENDING, nothing is emitted, and
-	 * false is returned; otherwise this is failPayment, and true is
-	 * returned. The ghost case (a PENDING record with no HTLC out, a send
+	 * hasHtlcInFlight the record is left PENDING with its retries frozen (the
+	 * HTLCs out get their outcome; no further route is tried), nothing is
+	 * emitted, and false is returned; otherwise this is failPayment, and
+	 * true is returned. The ghost case (a PENDING record with no HTLC out, a send
 	 * that never dispatched or whose HTLCs all resolved without a verdict)
 	 * still fails here; scanStuckPayments sweeps such a record after ten
 	 * minutes in any case.
 	 */
 	failPaymentUnlessInFlight(paymentHash: Buffer, reason?: string): boolean {
-		if (this.hasHtlcInFlight(paymentHash)) return false;
+		if (this.hasHtlcInFlight(paymentHash)) {
+			// The caller has given up on this payment: the HTLCs already out
+			// get their outcome, but no further route is tried. A retry the
+			// peer's later update_fail_htlc would dispatch runs outside every
+			// admission the caller made (drain, spending limits, a queue
+			// slot) with nothing charging its settlement, so the retry budget
+			// is frozen at what was used; the context itself stays for the
+			// expiry scanner. A later fail then lands on the give-up path:
+			// record FAILED, payment:failed.
+			const ctx = this.paymentRetryContexts.get(paymentHash.toString('hex'));
+			if (ctx) ctx.maxRetries = ctx.retryCount;
+			return false;
+		}
 		this.failPayment(paymentHash, reason);
 		return true;
 	}
@@ -28000,7 +28029,7 @@ export class LightningNode extends EventEmitter {
 					new Error(
 						failed
 							? `Payment timed out after ${timeoutMs}ms`
-							: `Payment timed out after ${timeoutMs}ms; an HTLC is still in flight and the payment stays PENDING until it resolves`
+							: `Payment timed out after ${timeoutMs}ms; an HTLC is still in flight and the payment stays PENDING until it resolves; no further route is tried after the timeout`
 					)
 				);
 			}, timeoutMs);

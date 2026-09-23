@@ -592,7 +592,7 @@ describe('PaymentQueue keeps a dispatch whose payment is still out (issue #976)'
 		const row = rowOf(entry.id);
 		expect(row?.status).to.equal('failed');
 		expect(row?.error).to.equal(IN_FLIGHT_PAYMENT_ERROR);
-		expect(IN_FLIGHT_PAYMENT_ERROR).to.contain('may still be in flight');
+		expect(IN_FLIGHT_PAYMENT_ERROR).to.contain('still pending');
 		expect(IN_FLIGHT_PAYMENT_ERROR).to.contain('outcome unknown');
 		expect(events.failed).to.deep.equal([
 			{ id: entry.id, error: IN_FLIGHT_PAYMENT_ERROR }
@@ -644,5 +644,108 @@ describe('PaymentQueue keeps a dispatch whose payment is still out (issue #976)'
 		expect(events.completed).to.deep.equal([
 			{ id: 'q-1-restored', paymentHash: 'hash-lnbc_restored' }
 		]);
+	});
+
+	it('resettle() asks again about an entry whose resolver refused, and records the answer', async () => {
+		const { calls, pay } = payer();
+		const resolver = heldResolver();
+		const queue = new PaymentQueue(
+			pay,
+			canSend,
+			{ resolveInterrupted: resolver.resolve },
+			storage
+		);
+		const events = recordEvents(queue);
+		const entry = queue.enqueue('lnbc_refused_once');
+		await settle();
+		resolver.refuse(0);
+		await settle();
+		expect(listed(queue, entry.id)).to.equal('dispatching');
+
+		// Before the fix nothing asked again in this process.
+		queue.resettle();
+		await settle();
+		expect(resolver.asked).to.deep.equal([
+			'lnbc_refused_once',
+			'lnbc_refused_once'
+		]);
+		resolver.answer(1, { status: 'unpaid' });
+		await settle();
+		expect(listed(queue, entry.id)).to.equal('failed');
+		expect(rowOf(entry.id)?.error).to.equal(TIMED_OUT_PAYMENT_ERROR);
+		expect(events.failed).to.deep.equal([
+			{ id: entry.id, error: TIMED_OUT_PAYMENT_ERROR }
+		]);
+		expect(calls).to.deep.equal(['lnbc_refused_once']);
+
+		// Settled: a further resettle() asks nothing.
+		queue.resettle();
+		await settle();
+		expect(resolver.asked).to.have.length(2);
+	});
+
+	it('start() asks again about an entry refused before it, and resettle() does nothing after stop()', async () => {
+		const { pay } = payer();
+		const resolver = heldResolver();
+		const queue = new PaymentQueue(
+			pay,
+			canSend,
+			{ resolveInterrupted: resolver.resolve },
+			storage
+		);
+		// Enqueued before start(): it dispatches at once, and the resolver
+		// has no node to ask yet.
+		const entry = queue.enqueue('lnbc_before_start');
+		await settle();
+		resolver.refuse(0);
+		await settle();
+		expect(listed(queue, entry.id)).to.equal('dispatching');
+
+		queue.start();
+		await settle();
+		expect(resolver.asked).to.deep.equal([
+			'lnbc_before_start',
+			'lnbc_before_start'
+		]);
+		resolver.refuse(1);
+		await settle();
+
+		queue.stop();
+		queue.resettle();
+		await settle();
+		expect(resolver.asked).to.have.length(2);
+		expect(listed(queue, entry.id)).to.equal('dispatching');
+		expect(rowOf(entry.id)?.status).to.equal('dispatching');
+	});
+
+	it('a queue:dispatched listener that throws does not leave a still-out entry with nobody to settle it', async () => {
+		const { pay } = payer({ lnbc_next: 'COMPLETED' });
+		const resolver = heldResolver();
+		const queue = new PaymentQueue(
+			pay,
+			canSend,
+			{ maxConcurrent: 1, resolveInterrupted: resolver.resolve },
+			storage
+		);
+		queue.on('queue:dispatched', (e: { bolt11: string }) => {
+			if (e.bolt11 === 'lnbc_next') throw new Error('listener threw');
+		});
+		const events = recordEvents(queue);
+		const first = queue.enqueue('lnbc_still_out');
+		queue.enqueue('lnbc_next');
+		await settle();
+
+		// The throw came out of the pass that released the first entry's
+		// slot. Before the fix that skipped the ask, and the entry stayed
+		// 'dispatching' with nothing to settle it.
+		expect(resolver.asked).to.deep.equal(['lnbc_still_out']);
+		expect(listed(queue, first.id)).to.equal('dispatching');
+		resolver.answer(0, { status: 'completed', paymentHash: 'cc'.repeat(32) });
+		await settle();
+		expect(listed(queue, first.id)).to.equal('completed');
+		expect(events.completed).to.deep.include({
+			id: first.id,
+			paymentHash: 'cc'.repeat(32)
+		});
 	});
 });

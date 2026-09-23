@@ -164,7 +164,7 @@ const rejectionOf = async (
 };
 
 const IN_FLIGHT_SUFFIX =
-	'an HTLC is still in flight and the payment stays PENDING until it resolves';
+	'an HTLC is still in flight and the payment stays PENDING until it resolves; no further route is tried after the timeout';
 
 describe('Issue #976: a payment timeout leaves a record with an HTLC in flight PENDING', function () {
 	this.timeout(30_000);

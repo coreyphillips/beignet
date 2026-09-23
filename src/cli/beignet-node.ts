@@ -4599,6 +4599,10 @@ export class BeignetNode extends EventEmitter {
 			if (this.paymentQueue) {
 				this.whenReadyToPay(() => {
 					this.paymentQueue?.start();
+					// An entry whose outcome the torn-down node could not
+					// answer is asked about again on the rebuilt one (issue
+					// #976).
+					this.paymentQueue?.resettle();
 					this.paymentQueue?.poke();
 				});
 			}
@@ -9600,8 +9604,12 @@ export class BeignetNode extends EventEmitter {
 	 * offered can settle after the clock, so such a record stays PENDING
 	 * until it resolves rather than reading FAILED in between, and the
 	 * message says so, because a caller that reads a timeout as a failure
-	 * and pays again is refused (#975) but must not be told it failed. A
-	 * ghost record, with no HTLC out, is failed as before.
+	 * and pays again is refused (#975) but must not be told it failed. No
+	 * further route is tried for it: the engine freezes its retries, so a
+	 * later update_fail_htlc ends it (FAILED, payment:failed) rather than
+	 * dispatching a retry outside this call's admission and accounting; an
+	 * HTLC whose on-chain timeout resolves ends it the same way. A ghost
+	 * record, with no HTLC out, is failed as before.
 	 */
 	private _paymentTimeout(
 		paymentHash: Buffer,
@@ -9613,7 +9621,7 @@ export class BeignetNode extends EventEmitter {
 			'PAYMENT_TIMEOUT',
 			failed
 				? `${what} timed out after ${timeoutMs}ms`
-				: `${what} timed out after ${timeoutMs}ms; an HTLC is still in flight and the payment stays PENDING until it resolves`
+				: `${what} timed out after ${timeoutMs}ms; an HTLC is still in flight and the payment stays PENDING until it resolves; no further route is tried after the timeout`
 		);
 	}
 
