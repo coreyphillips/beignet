@@ -3324,29 +3324,51 @@ export class Wallet {
 		reorgDetected = false
 	): Promise<Result<string>> {
 		try {
+			// What the check below looks up. An entry a refresh adds while it
+			// waits is in none of its results.
+			const observed = new Set(Object.keys(this.getUnconfirmedTransactions()));
 			const processRes = await this.processUnconfirmedTransactions();
 			if (processRes.isErr()) {
 				return err(processRes.error.message);
 			}
 
 			const { unconfirmedTxs, outdatedTxs, ghostTxs } = processRes.value;
+			// Each repair below returns early on a write that did not land, so Ok
+			// means all of it is durable. An Err also leaves a reorg that
+			// Electrum's header path found still owed, so it is reconciled again
+			// on every header until storage recovers (issue #870).
 			if (outdatedTxs.length > 0 || reorgDetected) {
 				this.sendMessage('reorg', outdatedTxs);
 				//We need to update the height of the transactions that were reorg'd out.
-				await this.updateTransactionHeights(outdatedTxs);
+				const updated = await this.updateTransactionHeights(outdatedTxs);
+				// Return before anything else is written. The main record is
+				// already cleared in memory, so the copy under observation, still
+				// at the lost block, is what asks for this repair again on the next
+				// check, and every ghost of this round stays observed with it. A
+				// refresh that finds the transaction in its address history again
+				// rewrites that copy at zero, which ends that retry. The record in
+				// memory is right either way and lands with the next write of the
+				// transactions map, and a restart before then reads the lost block
+				// from the stored record itself (issue #870).
+				if (updated.isErr()) return err(updated.error.message);
 			}
 			if (ghostTxs.length > 0) {
 				this.sendMessage('rbf', ghostTxs);
 				//We need to update the ghost transactions in the store & activity-list and rescan the addresses to get the correct balance.
-				await this.updateGhostTransactions({
-					txIds: ghostTxs
+				const updated = await this.updateGhostTransactions({
+					txIds: ghostTxs,
+					unconfirmedTxs,
+					observed
 				});
+				if (updated.isErr()) return err(updated.error.message);
 			} else {
 				this._data.unconfirmedTransactions = unconfirmedTxs;
-				await this.saveWalletData(
+				const saved = await this.saveWalletData(
 					'unconfirmedTransactions',
 					this._data.unconfirmedTransactions
 				);
+				// Already in memory, so the next check writes it again.
+				if (saved.isErr()) return err(saved.error.message);
 			}
 			return ok('Successfully updated unconfirmed transactions.');
 		} catch (e) {
@@ -3412,7 +3434,13 @@ export class Wallet {
 					// confirmationsToBlockHeight, which answers the current TIP for
 					// zero confirmations: that is above every stored height, so the
 					// comparison never fired and the reorg went unseen (issue #863).
-					const oldHeight = oldUnconfirmedTxs[txData.data.tx_hash]?.height ?? 0;
+					// The main record counts as well: a repair whose write was lost
+					// leaves the lost block there, while after a restart the copy
+					// observed here may already read zero (issue #870).
+					const oldHeight = Math.max(
+						oldUnconfirmedTxs[txData.data.tx_hash]?.height ?? 0,
+						this.data.transactions[txData.data.tx_hash]?.height ?? 0
+					);
 					if (oldHeight > 0) {
 						//Transaction was reorg'd back to zero confirmations. Add it to the outdatedTxs array.
 						outdatedTxs.push(txData.data);
@@ -3504,16 +3532,22 @@ export class Wallet {
 	 * @private
 	 * @async
 	 * @param {string[]} txIds
+	 * @param {IFormattedTransactions} unconfirmedTxs What the check that found
+	 * them leaves under observation, these already left out.
+	 * @param {Set<string>} observed Every transaction that check looked up.
 	 * @returns {Promise<Result<string>>}
 	 */
 	private async updateGhostTransactions({
-		txIds
+		txIds,
+		unconfirmedTxs,
+		observed
 	}: {
 		txIds: string[];
+		unconfirmedTxs: IFormattedTransactions;
+		observed: Set<string>;
 	}): Promise<Result<string>> {
 		try {
 			const transactions = this.data.transactions;
-			const unconfirmedTransactions = this.data.unconfirmedTransactions;
 			txIds.forEach((txId) => {
 				if (txId in transactions) {
 					transactions[txId]['exists'] = false;
@@ -3525,22 +3559,44 @@ export class Wallet {
 					delete transactions[txId].blockhash;
 					delete transactions[txId].confirmTimestamp;
 				}
-				if (txId in unconfirmedTransactions) {
-					delete unconfirmedTransactions[txId];
-				}
 			});
 			this._data.transactions = transactions;
-			await this.saveWalletData('transactions', transactions);
-			this._data.unconfirmedTransactions = unconfirmedTransactions;
-			await this.saveWalletData(
+			const saved = await this.saveWalletData('transactions', transactions);
+			// Dropping the unconfirmed copy is what stops this transaction being
+			// looked up again, so it may only happen once the repaired record is
+			// durable. Otherwise a failed write leaves it stored as confirmed at a
+			// lost block, and unwatched. The rescan waits for it too: its forced
+			// refresh runs this check again, and a ghost still observed would
+			// come straight back here (issue #870).
+			if (saved.isErr()) return err(saved.error.message);
+
+			// The check's own map rather than the old one less these ghosts: a
+			// transaction the same round found back in the mempool is observed at
+			// zero from now on, where its old copy would report the same reorg
+			// again on the next check. An entry a refresh added while the check
+			// waited is not in that map, and is kept: a record found already in
+			// a block is not fetched again, so this entry is all that would
+			// notice a later reorg of it.
+			const next: IFormattedTransactions = { ...unconfirmedTxs };
+			for (const [txid, transaction] of Object.entries(
+				this.data.unconfirmedTransactions
+			)) {
+				if (!observed.has(txid)) next[txid] = transaction;
+			}
+			this._data.unconfirmedTransactions = next;
+			const savedUnconfirmed = await this.saveWalletData(
 				'unconfirmedTransactions',
-				unconfirmedTransactions
+				next
 			);
 
 			//Rescan the addresses to get the correct balance.
 			await this.rescanAddresses({
 				shouldClearAddresses: false // No need to clear addresses since we are only updating the balance.
 			});
+			// Reported only after the rescan. Memory no longer observes these
+			// ghosts, so nothing in this session would rescan for them again,
+			// and a copy still on disk only repeats this repair after a restart.
+			if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error.message);
 			return ok('Successfully deleted transactions.');
 		} catch (e) {
 			return err(e);
@@ -3658,9 +3714,11 @@ export class Wallet {
 	 * @private
 	 * @async
 	 * @param {IUtxo[]} txs
-	 * @returns {Promise<string>}
+	 * @returns {Promise<Result<string>>}
 	 */
-	private async updateTransactionHeights(txs: IUtxo[]): Promise<string> {
+	private async updateTransactionHeights(
+		txs: IUtxo[]
+	): Promise<Result<string>> {
 		let needsSave = false;
 		const transactions = this.data.transactions;
 		txs.forEach((tx) => {
@@ -3677,9 +3735,10 @@ export class Wallet {
 			}
 		});
 		if (needsSave) {
-			await this.saveWalletData('transactions', transactions);
+			const saved = await this.saveWalletData('transactions', transactions);
+			if (saved.isErr()) return err(saved.error.message);
 		}
-		return 'Successfully updated reorg transactions.';
+		return ok('Successfully updated reorg transactions.');
 	}
 
 	/**
