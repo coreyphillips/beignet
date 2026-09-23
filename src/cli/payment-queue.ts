@@ -2,6 +2,10 @@
  * PaymentQueue: Priority queue for AI agent payment processing.
  * Capacity-aware dispatch, concurrency control, never crashes.
  * Supports optional persistent storage for crash recovery.
+ *
+ * The capacity check uses an entry's amountSats or, when that is absent, the
+ * amount the owner decodes from its invoice through the invoiceAmountSats
+ * option (issue #981). The queue itself never decodes an invoice.
  */
 
 import { EventEmitter } from 'events';
@@ -56,6 +60,18 @@ export interface PaymentQueueOptions {
 	 * cannot tell whether it was paid, and sending it again could pay twice.
 	 */
 	resolveInterrupted?: (bolt11: string) => Promise<InterruptedPaymentOutcome>;
+	/**
+	 * The amount, in whole satoshis, of the invoice an entry carries, for the
+	 * capacity check of an entry enqueued without amountSats (issue #981).
+	 * The owner decodes the invoice; the queue itself never does. Asked once
+	 * per entry. A throw, or anything but a whole number of satoshis, counts
+	 * as no amount: the entry then dispatches with no capacity check, as it
+	 * did without this option, and an invoice that does not decode fails in
+	 * payInvoiceSafe as before. Without this option such an entry is
+	 * dispatched into "no route" and recorded 'failed' where one with
+	 * amountSats would have waited for capacity.
+	 */
+	invoiceAmountSats?: (bolt11: string) => number | undefined;
 }
 
 /** Recorded on a restored in-flight entry when no resolver can settle it. */
@@ -120,6 +136,12 @@ export class PaymentQueue extends EventEmitter {
 	private idCounter = 0;
 	private storage: IPaymentQueueStorage | null;
 	private resolveInterrupted?: PaymentQueueOptions['resolveInterrupted'];
+	private invoiceAmountSats?: PaymentQueueOptions['invoiceAmountSats'];
+	/**
+	 * What invoiceAmountSats answered for each entry, undefined included, so
+	 * an invoice is decoded once rather than on every pass (issue #981).
+	 */
+	private invoiceAmounts = new WeakMap<QueuedPayment, number | undefined>();
 	/**
 	 * Restored entries that were 'dispatching' when the process stopped. They
 	 * stay 'dispatching' until start() settles each against the node's record
@@ -146,6 +168,7 @@ export class PaymentQueue extends EventEmitter {
 		this.maxConcurrent = options?.maxConcurrent ?? 3;
 		this.paymentTimeoutMs = options?.paymentTimeoutMs ?? 60_000;
 		this.resolveInterrupted = options?.resolveInterrupted;
+		this.invoiceAmountSats = options?.invoiceAmountSats;
 		this.storage = storage ?? null;
 
 		// Restore persisted queue entries. Nothing dispatches here: start()
@@ -492,12 +515,16 @@ export class PaymentQueue extends EventEmitter {
 				);
 				if (!next) break;
 
-				// Check capacity
-				const amountToCheck = next.amountSats ?? 0;
+				// Check capacity for the entry's amountSats or, when that is
+				// absent, the amount its invoice carries (issue #981). Zero,
+				// an amountless invoice or one the owner cannot decode, skips
+				// the check, and the dispatch fails on its own if it must.
+				const amountToCheck = next.amountSats ?? this.invoiceAmount(next) ?? 0;
 				if (!isWholeSats(amountToCheck)) {
-					// A row stored before enqueue() validated amounts: the check
-					// refuses it on every pass, so fail it rather than hold the
-					// rest behind it.
+					// A row stored before enqueue() validated amounts (only
+					// amountSats can be anything else here): the check refuses
+					// it on every pass, so fail it rather than hold the rest
+					// behind it.
 					this.failUndispatchable(
 						next,
 						new Error(`amountSats ${SATS_MESSAGE}`)
@@ -556,6 +583,27 @@ export class PaymentQueue extends EventEmitter {
 			}
 		}
 		this.emit('queue:failed', { id: entry.id, error: entry.error });
+	}
+
+	/**
+	 * The amount the invoice of an entry without amountSats carries, from the
+	 * owner's invoiceAmountSats (issue #981). Asked once per entry, whatever
+	 * it answers: the invoice does not change, and the check runs on every
+	 * pass. Undefined without the option, when it throws, or when it answers
+	 * anything but a whole number of satoshis.
+	 */
+	private invoiceAmount(entry: QueuedPayment): number | undefined {
+		if (!this.invoiceAmountSats) return undefined;
+		if (this.invoiceAmounts.has(entry)) return this.invoiceAmounts.get(entry);
+		let amount: number | undefined;
+		try {
+			const decoded = this.invoiceAmountSats(entry.bolt11);
+			amount = isWholeSats(decoded) ? decoded : undefined;
+		} catch {
+			amount = undefined;
+		}
+		this.invoiceAmounts.set(entry, amount);
+		return amount;
 	}
 
 	private async dispatchPayment(entry: QueuedPayment): Promise<void> {
