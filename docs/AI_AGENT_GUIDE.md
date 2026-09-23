@@ -279,7 +279,7 @@ if (result.status === 'COMPLETED') {
 ```
 
 ### Payment queuing
-For batch payments with concurrency control. The queue is **persistent**: queued payments survive daemon restarts and crashes, and dispatch once a channel can carry them after the next start. A payment that was mid-dispatch at the restart is checked against the node's own record for its invoice before anything sends it again: one that was paid is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again. That check covers only payments a restart interrupted. A dispatch that reaches the queue's own payment timeout (60 s by default) is recorded `failed` even though its HTLC may still be in flight, so look up the payment (`GET /payment?paymentHash=<hash>`) before paying that invoice again.
+For batch payments with concurrency control. The queue is **persistent**: queued payments survive daemon restarts and crashes, and dispatch once a channel can carry them after the next start. A payment that was mid-dispatch at the restart is checked against the node's own record for its invoice before anything sends it again: one that was paid is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again. A dispatch whose HTLC is still out when the queue's own payment timeout fires (60 s by default) is not recorded `failed` either: it stays `dispatching` and is recorded from the node's outcome, `completed` when the payment settles and `failed` once every HTLC resolved with nothing paid (issue #976). A `failed` entry is a verdict; a `dispatching` one is still being paid, so do not enqueue its invoice again.
 
 ```typescript
 const queue = node.enqueuePayment(bolt11, 1); // priority 1 (highest)
@@ -360,7 +360,7 @@ curl "http://localhost:2112/channel/health?channelId=abc123..." \
 
 ### Timeout behavior
 
-`payInvoice()` calls `failPayment()` internally on timeout, but the HTLC may still settle after the timeout fires. Always check `getPayment(hash)` before retrying to avoid duplicate payments.
+At its timeout `payInvoice()` fails the payment only when no HTLC is out for it. With one still in flight the record stays `PENDING` until that HTLC resolves (it can still settle after the timeout fires), and the `PAYMENT_TIMEOUT` message says so; `payInvoiceSafe()` then returns that `PENDING` record (issue #976). Check `getPayment(hash)` before retrying: a `PENDING` payment is still being paid, and the engine refuses a second payment to it in any case.
 
 ### Duplicate payment protection
 

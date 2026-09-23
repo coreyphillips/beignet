@@ -6,6 +6,15 @@
  * The capacity check uses an entry's amountSats or, when that is absent, the
  * amount the owner decodes from its invoice through the invoiceAmountSats
  * option (issue #981). The queue itself never decodes an invoice.
+ *
+ * An entry is recorded 'failed' only on a verdict. A dispatch whose payment
+ * is still out when the queue's own payment timeout fires (payInvoiceSafe
+ * answers with the PENDING record: its HTLC can still settle) is not one:
+ * the entry stays 'dispatching', its slot is released, and the
+ * resolveInterrupted resolver records how the node's payment ended, exactly
+ * as for an entry a restart interrupted (issue #976). Without a resolver
+ * such an entry is recorded 'failed' with its outcome unknown, as a restored
+ * in-flight entry is, never as a failure to send again.
  */
 
 import { EventEmitter } from 'events';
@@ -36,11 +45,13 @@ function optionalSats(value: unknown, field: string): number | undefined {
 }
 
 /**
- * How a payment the queue was dispatching when the process stopped ended, as
- * the node's own record for its invoice tells it (issue #967). 'completed':
+ * How a payment the queue was dispatching ended, as the node's own record
+ * for its invoice tells it: one the process stopped during (issue #967), or
+ * one still out at the queue's payment timeout (issue #976). 'completed':
  * the payment was made (its preimage is known), so it must never be sent
  * again. 'unpaid': every HTLC it offered is resolved and none paid, so
- * nothing was paid and it may be sent again.
+ * nothing was paid; a restored entry may then be sent again, and a timed-out
+ * dispatch is recorded failed.
  */
 export type InterruptedPaymentOutcome =
 	| { status: 'completed'; paymentHash: string }
@@ -52,12 +63,14 @@ export interface PaymentQueueOptions {
 	paymentTimeoutMs?: number;
 	/**
 	 * Settles a restored entry that was 'dispatching' when the process
-	 * stopped, before anything sends it again (issue #967). It resolves once
-	 * the payment's outcome is final, which can take until its HTLCs expire.
-	 * A rejection (or a throw) means the outcome is unknown right now, and the
-	 * entry stays 'dispatching' for the next start to ask again. Without a
-	 * resolver such an entry is recorded 'failed' at restore: the queue
-	 * cannot tell whether it was paid, and sending it again could pay twice.
+	 * stopped, before anything sends it again (issue #967), and a dispatch
+	 * whose payment was still out when paymentTimeoutMs fired (issue #976).
+	 * It resolves once the payment's outcome is final, which can take until
+	 * its HTLCs expire. A rejection (or a throw) means the outcome is unknown
+	 * right now, and the entry stays 'dispatching' for the next start to ask
+	 * again. Without a resolver such an entry is recorded 'failed', outcome
+	 * unknown: the queue cannot tell whether it was paid, and sending it
+	 * again could pay twice.
 	 */
 	resolveInterrupted?: (bolt11: string) => Promise<InterruptedPaymentOutcome>;
 	/**
@@ -78,6 +91,21 @@ export interface PaymentQueueOptions {
 export const INTERRUPTED_PAYMENT_ERROR =
 	'Interrupted by a restart while dispatching; outcome unknown. Check the ' +
 	'payment for this invoice before paying it again.';
+
+/**
+ * Recorded on a dispatch whose payment was still out at the queue's payment
+ * timeout when no resolver can settle it (issue #976).
+ */
+export const IN_FLIGHT_PAYMENT_ERROR =
+	'Dispatch timed out while its HTLC may still be in flight; outcome ' +
+	'unknown. Check the payment for this invoice before paying it again.';
+
+/**
+ * Recorded on a dispatch whose payment was still out at the queue's payment
+ * timeout once the resolver found that nothing was paid (issue #976).
+ */
+export const TIMED_OUT_PAYMENT_ERROR =
+	'Payment failed after the dispatch timed out';
 
 export interface IPaymentQueueStorage {
 	saveQueueEntry(entry: {
@@ -395,7 +423,7 @@ export class PaymentQueue extends EventEmitter {
 		this.started = true;
 		const interrupted = this.queue.filter((e) => this.interrupted.has(e.id));
 		this.interrupted.clear();
-		for (const entry of interrupted) this.reconcileInterrupted(entry);
+		for (const entry of interrupted) this.reconcileInterrupted(entry, 'queue');
 		this.processQueue();
 	}
 
@@ -416,21 +444,27 @@ export class PaymentQueue extends EventEmitter {
 	 * stay 'queued' in storage. The next start restores them, and they
 	 * dispatch on its start(). Without this, a dispatch against the stopped
 	 * node fails at once and persists 'failed', now that the database stays
-	 * open while the wallet stops (issue #958). A restored in-flight entry
-	 * the resolver has not settled yet stays 'dispatching', for the next
-	 * start to settle (issue #967).
+	 * open while the wallet stops (issue #958). An in-flight entry the
+	 * resolver has not settled yet, restored (issue #967) or timed out with
+	 * its HTLC still out (issue #976), stays 'dispatching', for the next
+	 * start to settle.
 	 */
 	stop(): void {
 		this.stopped = true;
 	}
 
 	/**
-	 * Settle one restored entry that was 'dispatching' when the process
-	 * stopped (issue #967). An outcome that arrives after stop() is still
-	 * recorded, as dispatchPayment records one; an 'unpaid' entry is then
-	 * left 'queued' for the next start.
+	 * Settle one 'dispatching' entry through the resolver: a restored one
+	 * the process stopped during (issue #967, onUnpaid 'queue'), or one
+	 * whose payment was still out at the queue's payment timeout (issue
+	 * #976, onUnpaid 'fail'). An outcome that arrives after stop() is still
+	 * recorded, as dispatchPayment records one; a restored 'unpaid' entry is
+	 * then left 'queued' for the next start.
 	 */
-	private reconcileInterrupted(entry: QueuedPayment): void {
+	private reconcileInterrupted(
+		entry: QueuedPayment,
+		onUnpaid: 'queue' | 'fail'
+	): void {
 		const resolve = this.resolveInterrupted;
 		if (!resolve) return;
 		let outcome: Promise<InterruptedPaymentOutcome>;
@@ -442,21 +476,22 @@ export class PaymentQueue extends EventEmitter {
 		}
 		outcome
 			.then(
-				(result) => this.recordInterruptedOutcome(entry, result),
+				(result) => this.recordInterruptedOutcome(entry, result, onUnpaid),
 				() => {
 					// Unknown right now: it stays 'dispatching' for the next start.
 				}
 			)
 			.catch(() => {
-				// A 'queue:completed' listener threw. The outcome is already
-				// recorded, and the throw must not become an unhandled
-				// rejection.
+				// A 'queue:completed' or 'queue:failed' listener threw. The
+				// outcome is already recorded, and the throw must not become
+				// an unhandled rejection.
 			});
 	}
 
 	private recordInterruptedOutcome(
 		entry: QueuedPayment,
-		result: InterruptedPaymentOutcome | undefined
+		result: InterruptedPaymentOutcome | undefined,
+		onUnpaid: 'queue' | 'fail'
 	): void {
 		if (entry.status !== 'dispatching') return;
 		if (
@@ -486,6 +521,14 @@ export class PaymentQueue extends EventEmitter {
 		// Anything but a clear 'unpaid' is treated as unknown, never as leave
 		// to send the payment again.
 		if (result?.status !== 'unpaid') return;
+		if (onUnpaid === 'fail') {
+			// The dispatch had its turn and every HTLC it offered resolved
+			// with none paid: that is its verdict. Not queued again: an entry
+			// sent again on every timeout could loop for as long as the route
+			// keeps failing late (issue #976).
+			this.recordFailed(entry, new Error(TIMED_OUT_PAYMENT_ERROR));
+			return;
+		}
 		// Every HTLC it offered resolved and none paid, so nothing was paid:
 		// it takes its turn again like any queued payment.
 		entry.status = 'queued';
@@ -525,10 +568,7 @@ export class PaymentQueue extends EventEmitter {
 					// amountSats can be anything else here): the check refuses
 					// it on every pass, so fail it rather than hold the rest
 					// behind it.
-					this.failUndispatchable(
-						next,
-						new Error(`amountSats ${SATS_MESSAGE}`)
-					);
+					this.recordFailed(next, new Error(`amountSats ${SATS_MESSAGE}`));
 					continue;
 				}
 				if (amountToCheck > 0) {
@@ -565,8 +605,12 @@ export class PaymentQueue extends EventEmitter {
 		}
 	}
 
-	/** Record a queued entry that can never be dispatched as failed. */
-	private failUndispatchable(entry: QueuedPayment, err: unknown): void {
+	/**
+	 * Record an entry as failed with the given error, persist it and emit
+	 * queue:failed: a queued entry that can never be dispatched, or one the
+	 * resolver found paid nothing after its dispatch timed out (issue #976).
+	 */
+	private recordFailed(entry: QueuedPayment, err: unknown): void {
 		entry.status = 'failed';
 		entry.error = err instanceof Error ? err.message : String(err);
 		entry.completedAt = Date.now();
@@ -607,6 +651,9 @@ export class PaymentQueue extends EventEmitter {
 	}
 
 	private async dispatchPayment(entry: QueuedPayment): Promise<void> {
+		// Set when the payer answered PENDING and a resolver will settle the
+		// entry: it stays 'dispatching' past the slot release below.
+		let stillOut = false;
 		try {
 			const result = await this.payInvoiceSafe(
 				entry.bolt11,
@@ -615,16 +662,34 @@ export class PaymentQueue extends EventEmitter {
 				entry.amountSats,
 				entry.metadata
 			);
-			entry.completedAt = Date.now();
 			if (result.status === 'COMPLETED') {
 				entry.status = 'completed';
+				entry.completedAt = Date.now();
 				this.emit('queue:completed', {
 					id: entry.id,
 					paymentHash: result.paymentHash
 				});
+			} else if (result.status === 'PENDING') {
+				// The node still has the payment out: the queue's own attempt
+				// timed out with an HTLC still offered, or the hash was already
+				// in flight and payInvoiceSafe answered with that record. The
+				// HTLC can settle after this, so 'failed' would be a verdict
+				// the queue does not have, and one an agent acts on by paying
+				// again (issue #976). With a resolver the entry stays
+				// 'dispatching' and the node's outcome records it; without
+				// one it is failed as unknown, like a restored in-flight row.
+				if (this.resolveInterrupted) {
+					stillOut = true;
+				} else {
+					entry.status = 'failed';
+					entry.error = IN_FLIGHT_PAYMENT_ERROR;
+					entry.completedAt = Date.now();
+					this.emit('queue:failed', { id: entry.id, error: entry.error });
+				}
 			} else {
 				entry.status = 'failed';
 				entry.error = `Payment status: ${result.status}`;
+				entry.completedAt = Date.now();
 				this.emit('queue:failed', { id: entry.id, error: entry.error });
 			}
 		} catch (err: unknown) {
@@ -633,7 +698,8 @@ export class PaymentQueue extends EventEmitter {
 			entry.completedAt = Date.now();
 			this.emit('queue:failed', { id: entry.id, error: entry.error });
 		} finally {
-			// Update storage with final status
+			// The status this dispatch ended with, 'dispatching' included: an
+			// entry still out is persisted as such for a restart to settle.
 			if (this.storage) {
 				try {
 					this.storage.updateQueueEntryStatus(
@@ -646,9 +712,13 @@ export class PaymentQueue extends EventEmitter {
 					/* best-effort */
 				}
 			}
+			// The slot goes once, here, whatever the outcome: an entry still
+			// out holds none while the resolver waits (a stuck HTLC can last
+			// until its expiry, and canSend already counts what it holds).
 			this.activeCount--;
 			// Process more items
 			this.processQueue();
 		}
+		if (stillOut) this.reconcileInterrupted(entry, 'fail');
 	}
 }

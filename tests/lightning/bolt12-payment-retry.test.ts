@@ -450,7 +450,7 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 		bob.destroy();
 	});
 
-	it('fails a pending BOLT 12 payment once its invoice expires', () => {
+	it('fails a pending BOLT 12 payment once its invoice expires, unless its HTLC is still out', () => {
 		const { alice, bob } = setupPair(954, 955);
 		const invoice = issueBolt12Invoice(bob, 954, 50_000n);
 		// Issued two hours ago with a one-hour expiry.
@@ -459,22 +459,32 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 		// Bob parks the HTLC so the payment stays PENDING past its expiry.
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		(bob as any).handleFinalHopHtlc = (): void => {};
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
 
 		alice.payBolt12Invoice(invoice);
 		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
 			PaymentStatus.PENDING
 		);
 
-		// The expiry scanner previously only understood BOLT 11 invoice
-		// strings, so a BOLT 12 context was silently skipped here forever.
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		(alice as any).scanExpiredPendingPayments();
+		// The HTLC bob holds can still settle whatever the invoice says, so
+		// the scanner leaves the payment PENDING, context and all (issue #976).
+		a.scanExpiredPendingPayments();
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(a.paymentRetryContexts.size).to.equal(1);
+
+		// With nothing out for the hash, the BOLT 12 expiry fails it. The
+		// scanner previously only understood BOLT 11 invoice strings, so a
+		// BOLT 12 context was silently skipped here forever.
+		a.hasHtlcInFlight = (): boolean => false;
+		a.scanExpiredPendingPayments();
 
 		const payment = alice.getPayment(invoice.paymentHash)!;
 		expect(payment.status).to.equal(PaymentStatus.FAILED);
 		expect(payment.failureReason ?? '').to.contain('expired');
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		expect((alice as any).paymentRetryContexts.size).to.equal(0);
+		expect(a.paymentRetryContexts.size).to.equal(0);
 
 		alice.destroy();
 		bob.destroy();
