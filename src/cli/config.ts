@@ -446,6 +446,16 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 		tlsKey: cliFlags.tlsKey || process.env.BEIGNET_TLS_KEY || file.tlsKey,
 		torProxy:
 			cliFlags.torProxy || process.env.BEIGNET_TOR_PROXY || file.torProxy,
+		// Exact 'true'/'false' only (the autoReconnect rule): a typo leaves the
+		// switch unset, which is "proxy everything", the private direction.
+		torProxyOnionOnly:
+			cliFlags.torProxyOnionOnly ??
+			(process.env.BEIGNET_TOR_PROXY_ONION_ONLY === 'true'
+				? true
+				: process.env.BEIGNET_TOR_PROXY_ONION_ONLY === 'false'
+				? false
+				: undefined) ??
+			file.torProxyOnionOnly,
 		announceAddresses:
 			cliFlags.announceAddresses ||
 			(process.env.BEIGNET_ANNOUNCE_ADDRESSES

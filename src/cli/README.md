@@ -1874,6 +1874,8 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_CONNECT_TIMEOUT_MS` | Timeout for `connectPeer()` in milliseconds (default: 15000) |
 | `BEIGNET_TLS_CERT` | Path to TLS certificate for HTTPS daemon |
 | `BEIGNET_TLS_KEY` | Path to TLS private key for HTTPS daemon |
+| `BEIGNET_TOR_PROXY` | SOCKS5 proxy as `host:port` for outbound Lightning peer and watchtower connections (e.g. Tor at `127.0.0.1:9050`); `.onion` peers need one. Unset, `.onion` peers fall back to `127.0.0.1:9050` and everything else is dialed directly |
+| `BEIGNET_TOR_PROXY_ONION_ONLY` | `true` to use `BEIGNET_TOR_PROXY` for `.onion` hosts only and dial public clearnet hosts directly (hybrid mode, LND's `tor.skip-proxy-for-clearnet-targets`); exact `true`/`false`, anything else is ignored. Needs `BEIGNET_TOR_PROXY`, or startup is refused |
 | `BEIGNET_HTLC_EVENTS` | `true` to relay per-HTLC events over SSE + webhooks |
 | `BEIGNET_EAGER_GOSSIP_VERIFY` | `true` to verify foreign gossip signatures at intake instead of lazily at serve time (default: lazy; exact `true`/`false`, anything else is ignored) |
 | `BEIGNET_LOG_LEVEL` | Daemon stderr log level: `debug`, `info`, `warn`, `error`, `silent` (default: silent) |
@@ -1917,6 +1919,27 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_SWAP_SUBMARINE_REFUND_DELTA_BLOCKS` | Blocks from a submarine create to its refund height (default 288, bounds 144 to 432); an invoice whose final CLTV plus a 72 block route budget cannot fit under the refund height minus the margins is refused as `CLTV_UNFITTABLE` |
 | `BEIGNET_DF_RELAY` | Relay direct-funding frames for OTHER nodes (`true`/`false`, default off). Paying and being paid needs nothing switched on; this is work done for strangers, metered but not free |
 | `BEIGNET_DF_MIN_AMOUNT` | Smallest direct-funding offer this node serves, a whole number of satoshis. Clamps up to the 5000 sat protocol floor; a partly numeric value refuses startup |
+
+### Tor proxy
+
+`BEIGNET_TOR_PROXY` (`--tor-proxy`, config key `torProxy`) sets the SOCKS5
+proxy for outbound peer and watchtower connections. On its own it proxies every
+public host, which hides the node's clearnet address from its peers at the cost
+of Tor's latency on every dial. `BEIGNET_TOR_PROXY_ONION_ONLY=true`
+(`--tor-proxy-onion-only`, config key `torProxyOnionOnly`) keeps the proxy for
+`.onion` hosts only, so a node can reach onion peers through a Tor that lives
+elsewhere (a separate container, say) while dialing clearnet peers directly.
+It needs `BEIGNET_TOR_PROXY`: set alone it has nothing to act on and startup is
+refused. Private and loopback hosts are dialed directly in every case, because
+Tor refuses them.
+
+| Destination | proxy alone | proxy plus onion-only |
+|---|---|---|
+| `.onion` | proxy | proxy |
+| private or loopback | direct | direct |
+| public clearnet | proxy | direct |
+
+Guardian sessions over bolt8 already dial only onion hosts through the proxy.
 
 ### Priority Order
 

@@ -898,6 +898,17 @@ async function bootDaemon(
 			'guardianServe must be a boolean (BEIGNET_GUARDIAN_SERVE is exactly true or false)'
 		);
 	}
+	// Tor hybrid mode (issue #963): an exact boolean; the "needs torProxy"
+	// pairing is refused by BeignetNode itself so library callers get it too.
+	if (
+		opts.torProxyOnionOnly !== undefined &&
+		typeof opts.torProxyOnionOnly !== 'boolean'
+	) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'torProxyOnionOnly must be a boolean (BEIGNET_TOR_PROXY_ONION_ONLY is exactly true or false)'
+		);
+	}
 	// FFOR roles (issue #729): exact booleans, and the issuer needs the
 	// witness it is co-hosted with (spec section 9.7.1).
 	for (const [name, v] of [

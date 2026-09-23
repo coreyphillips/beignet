@@ -448,6 +448,7 @@ async function handleStart(): Promise<void> {
 	if (tlsKeyFlag) cliFlags.tlsKey = tlsKeyFlag;
 	const torProxyFlag = parseFlag('--tor-proxy');
 	if (torProxyFlag) cliFlags.torProxy = torProxyFlag;
+	if (hasFlag('--tor-proxy-onion-only')) cliFlags.torProxyOnionOnly = true;
 	const announceAddrFlag = parseFlag('--announce-addr');
 	if (announceAddrFlag)
 		cliFlags.announceAddresses = announceAddrFlag
@@ -3056,6 +3057,9 @@ Start flags:
   --tls-key <path>                       TLS private key file (requires --tls-cert)
   --tor-proxy <host:port>                SOCKS5 proxy for outbound Lightning peer
                                          connections (e.g. Tor at 127.0.0.1:9050)
+  --tor-proxy-onion-only                 Use --tor-proxy for .onion peers only and
+                                         dial public clearnet peers directly
+                                         (hybrid mode; needs --tor-proxy)
   --announce-addr <addr[,addr...]>       Addresses to advertise in node_announcement
                                          (IPv4, [ipv6]:port, .onion v3, or hostname;
                                          port defaults to 9735)
