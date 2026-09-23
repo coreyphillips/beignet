@@ -205,6 +205,16 @@ export class Wallet {
 	// so without this an older query landing last would undo a newer one.
 	private _scanSeq = 0;
 	private _appliedScanSeq = 0;
+	// This wallet's tip at the first check a node without a txindex answered
+	// "no such mempool transaction" for a record the rule of issue #871 kept,
+	// by txid, or the highest tip it held if that was higher. A miss that
+	// outlasts two new blocks is final (issue #935). Memory only: a restart
+	// counts again from its own first miss, which only waits longer.
+	private readonly _noTxindexMisses: Map<string, number> = new Map();
+	// The highest tip updateHeader has replaced. A failover to a server
+	// further behind lowers the tip, and that server may announce new blocks
+	// while it catches up to the one a transaction was mined in (issue #935).
+	private _replacedTipHeight = 0;
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
@@ -772,6 +782,8 @@ export class Wallet {
 				this.disableMessages = true;
 				// disable saving to storage
 				this._setData = undefined;
+				// Nothing checks again here, and a new wallet counts afresh.
+				this._noTxindexMisses.clear();
 				// disconnect from Electrum
 				await this.electrum.disconnect();
 			}
@@ -3527,6 +3539,10 @@ export class Wallet {
 		try {
 			//Retrieve all unconfirmed transactions (tx less than 6 confirmations in this case) from the store
 			const oldUnconfirmedTxs = this.getUnconfirmedTransactions();
+			// A miss counted for a transaction no longer observed is over.
+			for (const txid of this._noTxindexMisses.keys()) {
+				if (!(txid in oldUnconfirmedTxs)) this._noTxindexMisses.delete(txid);
+			}
 
 			//Use electrum to check if the transaction was removed/bumped from the mempool or if it still exists.
 			const tx_hashes: ITxHash[] = Object.values(oldUnconfirmedTxs).map(
@@ -3534,6 +3550,9 @@ export class Wallet {
 					return { tx_hash: transaction.txid };
 				}
 			);
+			// A header that lands while the lookup is in flight is newer than the
+			// answer, so the rule of issue #935 below judges by this one.
+			const tipBeforeLookup = this.data.header?.height ?? 0;
 			const txs = await this.electrum.getTransactions({
 				txHashes: tx_hashes
 			});
@@ -3578,6 +3597,42 @@ export class Wallet {
 					return;
 				}
 
+				if (this.electrum.transactionMissingWithoutTxindex(txData)) {
+					// For a record only ever seen in the mempool, which the rule above
+					// keeps, the same miss is final once it outlasts two new blocks.
+					// electrs indexes a block before it announces the block's header,
+					// so once this wallet's tip has moved on, a transaction mined in
+					// the meantime is found through electrs' index. The second block
+					// covers a failover to a server a block behind, as above. So what
+					// is still missing then was replaced or evicted from the mempool
+					// (issue #935).
+					//
+					// Counted from no lower than the highest tip this wallet has
+					// held, though: a failover to a server further behind lowers the
+					// tip, and that server announces new blocks while it catches up to
+					// the one the transaction may be in. Nor from lower than a block
+					// the record was seen in, which leaves such a record to the rule
+					// above. Nothing is counted before the wallet knows a tip, and the
+					// count stays until the transaction is answered for or leaves
+					// observation.
+					const firstMiss = this._noTxindexMisses.get(txData.data.tx_hash);
+					if (firstMiss === undefined) {
+						if (tipHeight > 0) {
+							this._noTxindexMisses.set(
+								txData.data.tx_hash,
+								Math.max(tipHeight, this._replacedTipHeight)
+							);
+						}
+					} else if (
+						Math.min(tipBeforeLookup, tipHeight) -
+							Math.max(firstMiss, oldHeight) >=
+						2
+					) {
+						ghostTxs.push(txData.data.tx_hash);
+						return;
+					}
+				}
+
 				if (!txData.result) {
 					// An entry error that is not a "no such transaction" (a busy or
 					// overloaded server, say) says nothing about where the transaction
@@ -3587,6 +3642,8 @@ export class Wallet {
 						oldUnconfirmedTxs[txData.data.tx_hash];
 					return;
 				}
+				// Answered for, so whatever miss was counted is over.
+				this._noTxindexMisses.delete(txData.data.tx_hash);
 
 				if (!txData.result.confirmations) {
 					// No confirmations is no block, which this wallet stores as height
@@ -3676,6 +3733,10 @@ export class Wallet {
 	 * @returns {Promise<void>}
 	 */
 	public async updateHeader(headerData: IHeader): Promise<void> {
+		this._replacedTipHeight = Math.max(
+			this._replacedTipHeight,
+			this._data.header?.height ?? 0
+		);
 		this._data.header = headerData;
 		await this.saveWalletData('header', headerData);
 	}
@@ -3708,8 +3769,9 @@ export class Wallet {
 					// such transaction" rather than with no confirmations: by a server
 					// with a txindex always, and by electrs on a node without one for
 					// a record seen in a block two or more under the tip (issue
-					// #871). So this is where that reorg lands, and the block it was
-					// found in is gone with it (issue #863).
+					// #871), or once the miss outlasts two new blocks (issue #935).
+					// So this is where that reorg lands, and the block it was found
+					// in is gone with it (issue #863).
 					transactions[txId].height = 0;
 					delete transactions[txId].blockhash;
 					delete transactions[txId].confirmTimestamp;
@@ -3739,6 +3801,11 @@ export class Wallet {
 				if (!observed.has(txid)) next[txid] = transaction;
 			}
 			this._data.unconfirmedTransactions = next;
+			// Their counted misses end here, with their observation, and not when
+			// the check found them: a ghost whose write failed above is still
+			// observed, and the next check clears it at once rather than counting
+			// two more blocks (issue #935).
+			for (const txId of txIds) this._noTxindexMisses.delete(txId);
 			const savedUnconfirmed = await this.saveWalletData(
 				'unconfirmedTransactions',
 				next
@@ -5408,6 +5475,8 @@ export class Wallet {
 		if (txid in unconfirmed) {
 			delete unconfirmed[txid];
 		}
+		// No longer observed, so a count of its misses is over (issue #935).
+		this._noTxindexMisses.delete(txid);
 		await this.saveWalletData('transactions', transactions);
 		await this.saveWalletData('unconfirmedTransactions', unconfirmed);
 	}
