@@ -6287,15 +6287,20 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Public networking entry points refuse loudly while the gate is closed,
 	 * rather than parking: a fenced gate never opens, and a parked promise
-	 * on a fenced node would hang its caller forever.
+	 * on a fenced node would hang its caller forever. The refusal carries
+	 * code STARTUP_QUARANTINE so a caller can tell it from a transport
+	 * failure without matching the message (issue #933).
 	 */
 	private assertPeerContactPermitted(operation: string): void {
 		if (this.recoveryPermitsPeerTraffic()) return;
 		this.recoveryGate?.reportBlocked(
 			`refused ${operation} while ${this.getRecoveryGateState()}`
 		);
-		throw new Error(
-			`Startup quarantine: ${operation} is refused until writer ownership is confirmed (gate is ${this.getRecoveryGateState()})`
+		throw Object.assign(
+			new Error(
+				`Startup quarantine: ${operation} is refused until writer ownership is confirmed (gate is ${this.getRecoveryGateState()})`
+			),
+			{ code: 'STARTUP_QUARANTINE' }
 		);
 	}
 

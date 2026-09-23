@@ -178,6 +178,7 @@ import {
 } from './errors';
 import { PaymentQueue } from './payment-queue';
 import {
+	ListenerProblem,
 	NodeInfo,
 	PeerInfo,
 	ChannelInfo,
@@ -1466,6 +1467,21 @@ interface IRecencyHold {
 	reestablishSecretMissing?: true;
 }
 
+/** The inbound listeners a node can be asked to bind. */
+type ListenerKind = 'tcp' | 'websocket';
+
+const LISTENER_HELD_MESSAGE =
+	'held by the startup quarantine until writer ownership is confirmed ' +
+	'and any startup repair is receipted; it binds then';
+
+const LISTENER_FENCED_MESSAGE =
+	'this node is fenced: another device owns its recovery namespace, so ' +
+	'the listener stays down';
+
+function listenerLabel(kind: ListenerKind): string {
+	return kind === 'tcp' ? 'Lightning listener' : 'WebSocket listener';
+}
+
 export class BeignetNode extends EventEmitter {
 	private fforReceiveService?: FforReceiveService;
 	private offlineReceive?: OfflineReceive;
@@ -1706,8 +1722,19 @@ export class BeignetNode extends EventEmitter {
 	private electrumServerCount = 1;
 	private _failoverInProgress = false;
 	private _backupPromise?: Promise<void>;
+	/** The TCP listener's port, set only once the bind succeeded. */
 	private _listenPort?: number;
 	private _websocketPort?: number;
+	/** Why a configured listener is not bound (issues #861 and #933). */
+	private _listenError?: ListenerProblem;
+	private _websocketListenError?: ListenerProblem;
+	/** One bind attempt in flight per listener kind. */
+	private _listenBinds: Partial<Record<ListenerKind, Promise<void>>> = {};
+	/**
+	 * Bumped whenever the node's listener state is reset (a rebuild tears
+	 * the node down), so an attempt that outlived its node records nothing.
+	 */
+	private _listenEpoch = 0;
 	private _connectTimeoutMs = 15_000;
 	private _dailySpendLimitSats?: number;
 	// _dailySpentSats is the combined LN + onchain total; the two source
@@ -3007,6 +3034,9 @@ export class BeignetNode extends EventEmitter {
 		// Forward node:ready event
 		this.node.on('node:ready', () => {
 			this.log('info', 'Node ready');
+			// node:ready waits for a startup repair's receipt, which can land
+			// after the gate confirmed: a listener held by it binds now.
+			this.bindHeldListeners();
 			this.emit('node:ready');
 		});
 
@@ -3187,22 +3217,17 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 
-		// 10. Start listening if port specified
+		// 10. Start listening if port specified. Non-fatal: a refused bind is
+		// recorded, and a guardian mode's startup quarantine holds the bind
+		// until writer ownership is confirmed (bindHeldListeners). The reset
+		// comes first because an in-process rebuild runs this again on a
+		// fresh node.
+		this.resetListenerState();
 		if (opts.listenPort) {
-			try {
-				await this.node.listen(opts.listenPort);
-				this._listenPort = opts.listenPort;
-			} catch {
-				// Non-fatal
-			}
+			await this.bindListener('tcp', opts.listenPort);
 		}
 		if (opts.websocketPort) {
-			try {
-				await this.node.listenWebSocket(opts.websocketPort);
-				this._websocketPort = opts.websocketPort;
-			} catch {
-				// Non-fatal
-			}
+			await this.bindListener('websocket', opts.websocketPort);
 		}
 
 		// 11. Connect timeout + Daily spending limit
@@ -3634,6 +3659,9 @@ export class BeignetNode extends EventEmitter {
 					});
 					this.startRecoveryLeaseCheck();
 					this.resumeRotationWork();
+					// The quarantine refused the step-10 bind; nothing else
+					// binds it once the gate opens (issue #933).
+					this.bindHeldListeners();
 					return;
 				}
 				if (outcome.state === 'fenced') {
@@ -3669,6 +3697,9 @@ export class BeignetNode extends EventEmitter {
 	 */
 	private relayRecoveryFenced(supersededBy: GuardianState | undefined): void {
 		this.stopRecoveryLeaseCheck();
+		// A held listener never binds on a fenced node: say so rather than
+		// report it held forever.
+		this.fenceHeldListeners();
 		if (this._recoveryFenceRelayed) return;
 		this._recoveryFenceRelayed = true;
 		this.emit('recovery:fenced', {
@@ -4777,6 +4808,9 @@ export class BeignetNode extends EventEmitter {
 			this._fallbackRecoveryTimer = undefined;
 		}
 		this.paymentQueue?.removeAllListeners();
+		// The node's listeners close with it; a bind still in flight on it
+		// records nothing.
+		this.resetListenerState();
 		this.node.destroy();
 		void (this.wallet as Wallet | undefined)?.stop().catch(() => {
 			/* best effort */
@@ -12445,6 +12479,164 @@ export class BeignetNode extends EventEmitter {
 		source: 'scb' | 'capsule';
 	} | null {
 		return this._peerRetrievedScb;
+	}
+
+	// ─────────────── Inbound listeners ───────────────
+
+	/**
+	 * Forget every listener fact about the previous node: an in-process
+	 * rebuild (capsule restore resume, guardian restore) runs step 10 again
+	 * on a fresh node, and a stale `_listenPort` would still hand out a URI
+	 * nobody answers.
+	 */
+	private resetListenerState(): void {
+		this._listenEpoch++;
+		this._listenPort = undefined;
+		this._websocketPort = undefined;
+		this._listenError = undefined;
+		this._websocketListenError = undefined;
+		this._listenBinds = {};
+	}
+
+	/**
+	 * Bind one configured listener, recording why when it does not bind.
+	 * Concurrent callers share the attempt in flight: a second bind of the
+	 * same port would fail on this node's own socket.
+	 */
+	private bindListener(kind: ListenerKind, port: number): Promise<void> {
+		const inFlight = this._listenBinds[kind];
+		if (inFlight) return inFlight;
+		const attempt: Promise<void> = this.attemptListen(kind, port).finally(
+			() => {
+				if (this._listenBinds[kind] === attempt) {
+					delete this._listenBinds[kind];
+				}
+			}
+		);
+		this._listenBinds[kind] = attempt;
+		return attempt;
+	}
+
+	private async attemptListen(kind: ListenerKind, port: number): Promise<void> {
+		const node = this.node;
+		const epoch = this._listenEpoch;
+		// The node can be torn down or replaced while the bind is in flight;
+		// the outcome then belongs to nobody.
+		const stale = (): boolean =>
+			this.destroyed || this.node !== node || this._listenEpoch !== epoch;
+		try {
+			if (kind === 'tcp') await node.listen(port);
+			else await node.listenWebSocket(port);
+		} catch (err) {
+			if (stale()) return;
+			const problem = this.classifyListenFailure(node, port, err);
+			const held = this.listenerProblem(kind)?.state === 'held';
+			this.setListenerProblem(kind, problem);
+			if (problem.state === 'held' && !held) {
+				this.log(
+					'info',
+					`${listenerLabel(kind)} on port ${port} is held until ` +
+						'writer ownership is confirmed'
+				);
+			}
+			return;
+		}
+		if (stale()) return;
+		const wasHeld = this.listenerProblem(kind)?.state === 'held';
+		if (kind === 'tcp') this._listenPort = port;
+		else this._websocketPort = port;
+		this.setListenerProblem(kind, undefined);
+		if (wasHeld) {
+			this.log('info', `${listenerLabel(kind)} bound on port ${port}`);
+		}
+	}
+
+	/**
+	 * An OS error code is a failed bind. The startup quarantine's refusal
+	 * (code STARTUP_QUARANTINE) is a hold that lifts once writer ownership
+	 * is confirmed, unless the node is fenced, when it never lifts.
+	 */
+	private classifyListenFailure(
+		node: LightningNode,
+		port: number,
+		err: unknown
+	): ListenerProblem {
+		const message = err instanceof Error ? err.message : String(err);
+		const rawCode =
+			err !== null && typeof err === 'object' && 'code' in err
+				? (err as { code: unknown }).code
+				: undefined;
+		const code = typeof rawCode === 'string' ? rawCode : undefined;
+		const errno = code !== 'STARTUP_QUARANTINE' ? code : undefined;
+		if (errno === undefined && this.nodeFenced(node)) {
+			return { port, state: 'fenced', message: LISTENER_FENCED_MESSAGE };
+		}
+		if (code === 'STARTUP_QUARANTINE') {
+			return { port, state: 'held', message: LISTENER_HELD_MESSAGE };
+		}
+		return { port, state: 'failed', message, ...(errno ? { errno } : {}) };
+	}
+
+	private nodeFenced(node: LightningNode): boolean {
+		try {
+			return (
+				node.getRecoveryGateState() === 'fenced' ||
+				node.getRecoveryStatus().fenced
+			);
+		} catch {
+			// A status read that throws must not turn a bind outcome into a
+			// boot failure; the fence relay still records it.
+			return false;
+		}
+	}
+
+	private listenerProblem(kind: ListenerKind): ListenerProblem | undefined {
+		return kind === 'tcp' ? this._listenError : this._websocketListenError;
+	}
+
+	private setListenerProblem(
+		kind: ListenerKind,
+		problem: ListenerProblem | undefined
+	): void {
+		if (kind === 'tcp') this._listenError = problem;
+		else this._websocketListenError = problem;
+	}
+
+	/**
+	 * Retry every listener the startup quarantine held. Runs when the gate
+	 * confirms and on node:ready (which waits for a startup repair's
+	 * receipt); an attempt made while the quarantine still holds records
+	 * the hold again, and a fenced node never binds. Never throws: it runs
+	 * inside event relays.
+	 */
+	private bindHeldListeners(): void {
+		if (this.destroyed || !this.node) return;
+		const held: Array<[ListenerKind, number]> = [];
+		for (const kind of ['tcp', 'websocket'] as const) {
+			const problem = this.listenerProblem(kind);
+			if (problem?.state === 'held') held.push([kind, problem.port]);
+		}
+		if (held.length === 0) return;
+		if (this.nodeFenced(this.node)) {
+			this.fenceHeldListeners();
+			return;
+		}
+		for (const [kind, port] of held) {
+			void this.bindListener(kind, port).catch(() => undefined);
+		}
+	}
+
+	/** A held listener on a fenced node stays down: record it as fenced. */
+	private fenceHeldListeners(): void {
+		for (const kind of ['tcp', 'websocket'] as const) {
+			const problem = this.listenerProblem(kind);
+			if (problem?.state !== 'held') continue;
+			this.setListenerProblem(kind, {
+				port: problem.port,
+				state: 'fenced',
+				message: LISTENER_FENCED_MESSAGE
+			});
+		}
 	}
 
 	// ─────────────── Node URI ───────────────

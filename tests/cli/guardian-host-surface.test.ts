@@ -256,6 +256,10 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 		expect(before.serving).to.equal(true);
 		expect(before.guardianId).to.match(/^[0-9a-f]{64}$/);
 		expect(before.sets).to.have.length(0);
+		// Guardians are dialled at the host's Lightning address: it is bound.
+		const hostInfo = (await request(portOf(a.daemon), 'GET', '/info')).body
+			.result as { listening: boolean };
+		expect(hostInfo.listening).to.equal(true);
 
 		// One host resolves the others' URIs (and its own) to entries.
 		const entries: string[] = [];
@@ -305,13 +309,17 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 		);
 		expect(junk.status).to.equal(400);
 
-		// The wallet pins the three and boots in quorum mode over bolt8.
+		// The wallet pins the three and boots in quorum mode over bolt8. It
+		// hosts no guardian but asks for a listener, which the startup
+		// quarantine refuses until its writer lease is confirmed (#933).
 		walletDir = tmpDir('wallet');
 		pinned = entries;
+		const walletListen = await freePort();
 		wallet = await startDaemon({
 			...OFFLINE,
 			mnemonic: MNEMONICS[3],
 			dataDir: walletDir,
+			listenPort: walletListen,
 			recoveryMode: 'quorum',
 			recoveryGuardians: entries,
 			recoveryLeaseCheckIntervalMs: 200
@@ -338,6 +346,21 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 				'confirmed'
 			);
 		});
+		// Ownership confirmed, so the refused listener binds now.
+		await waitFor(
+			async () =>
+				(
+					(await request(walletPort, 'GET', '/info')).body.result as {
+						listening: boolean;
+					}
+				).listening === true,
+			15_000
+		);
+		const walletUri = await request(walletPort, 'GET', '/node/uri');
+		expect(walletUri.status, JSON.stringify(walletUri.body)).to.equal(200);
+		expect((walletUri.body.result as { uri: string }).uri).to.match(
+			new RegExp(`:${walletListen}$`)
+		);
 
 		// A journaled commit goes durable on the quorum over the sessions.
 		const durableBefore = BigInt(
@@ -589,6 +612,10 @@ describe('Guardian host surface: the guardian-only lane', () => {
 			};
 			expect(view.state).to.equal('running');
 			expect(view.node?.gate).to.equal('quarantined');
+			// The lane admits the host's bind during quarantine.
+			const laneInfo = (await request(portOf(a), 'GET', '/info')).body
+				.result as { listening: boolean };
+			expect(laneInfo.listening).to.equal(true);
 
 			// The lane: a stranger's guardian session gets INFO answered.
 			const transport = bolt8GuardianTransport();
