@@ -2181,11 +2181,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'ROTATION_IN_PROGRESS or ROTATION_UNAVAILABLE (not a guardian mode, gate not confirmed, fenced, no lease)'
+								'ROTATION_IN_PROGRESS or ROTATION_UNAVAILABLE (not a guardian mode, gate not confirmed, fenced, no lease, or a wallet with no journal entries whose guardians hold records in the namespace: its journal was lost, so restore instead of rotating)'
 						},
 						'503': {
 							description:
-								'ROTATION_NO_QUORUM or ROTATION_NOT_CATCHING_UP: the incoming set did not register or did not reach the tip; retry'
+								'ROTATION_NO_QUORUM or ROTATION_NOT_CATCHING_UP: the incoming set did not register or did not reach the tip, or, on a wallet with no journal entries, too few members of either set confirmed the namespace is empty; retry'
 						}
 					}
 				}

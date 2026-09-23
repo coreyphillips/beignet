@@ -17,6 +17,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
+import * as bip39 from 'bip39';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
 import { BeignetError } from '../../src/cli/errors';
 import {
@@ -27,12 +28,15 @@ import {
 	GuardianStatus,
 	computeGuardianSetId,
 	deriveRecoveryRoot,
-	encryptRecoveryCapsule
+	encryptRecoveryCapsule,
+	ROTATION_META_KEYS
 } from '../../src/lightning/recovery';
 import {
 	LnCoinType,
 	deriveLightningKeysFromMnemonic
 } from '../../src/lightning/keys/wallet-keys';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { deriveStorageKey } from '../../src/lightning/storage/encryption';
 
 const MNEMONICS = [
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
@@ -899,5 +903,209 @@ describe('Guardian rotation surface: a wallet moves to a new set with the channe
 				(s.node as { fenced: boolean } | null)?.fenced === true
 			);
 		});
+	});
+});
+
+describe('Guardian rotation surface: a wallet that has journaled nothing yet (issue #862)', () => {
+	/** Wallets of their own, so each test registers a namespace of its own. */
+	const UNUSED_WALLETS = [
+		'scheme spot photo card baby mountain device kick cradle pact join borrow',
+		'ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic'
+	];
+	const hosts: Array<IHost | null> = [];
+	const wallets: Array<{ daemon: IStartedDaemon | null; dir: string }> = [];
+	let oldEntries: string[] = [];
+	let newEntries: string[] = [];
+
+	const status = async (port: number): Promise<Record<string, unknown>> =>
+		(await request(port, 'GET', '/recovery/status')).body.result as Record<
+			string,
+			unknown
+		>;
+	const durable = async (port: number): Promise<bigint> =>
+		BigInt(
+			((await status(port)).node as { lastDurableSequence: string })
+				.lastDurableSequence
+		);
+	const confirmed = async (port: number): Promise<boolean> =>
+		((await status(port)).node as { gate: string } | null)?.gate ===
+		'confirmed';
+	const idsOf = (entries: string[]): string[] =>
+		entries.map((e) => e.slice(0, 64)).sort();
+
+	const startWallet = async (
+		mnemonic: string,
+		dir: string
+	): Promise<IStartedDaemon> =>
+		startDaemon({
+			...OFFLINE,
+			mnemonic,
+			dataDir: dir,
+			recoveryMode: 'quorum',
+			recoveryGuardians: oldEntries,
+			recoveryLeaseCheckIntervalMs: 200
+		});
+
+	before(async function (): Promise<void> {
+		this.timeout(120_000);
+		hosts.push(
+			await startHost(0),
+			await startHost(1),
+			await startHost(2),
+			await startHost(3)
+		);
+		const [a, b, c, d] = hosts as IHost[];
+		const resolve = async (uri: string): Promise<string> => {
+			const r = await request(
+				portOf(a.daemon),
+				'POST',
+				'/recovery/resolve-guardian',
+				{ uri }
+			);
+			expect(r.status, JSON.stringify(r.body)).to.equal(200);
+			return (r.body.result as { entry: string }).entry;
+		};
+		const [entryA, entryB, entryC, entryD] = [
+			await resolve(a.uri),
+			await resolve(b.uri),
+			await resolve(c.uri),
+			await resolve(d.uri)
+		];
+		oldEntries = [entryA, entryB, entryC];
+		newEntries = [entryB, entryC, entryD];
+	});
+
+	after(async function (): Promise<void> {
+		this.timeout(60_000);
+		for (const wallet of wallets.splice(0)) {
+			try {
+				await wallet.daemon?.stop();
+			} catch {
+				// Already stopped.
+			}
+			fs.rmSync(wallet.dir, { recursive: true, force: true });
+		}
+		await stopAll(hosts.splice(0));
+	});
+
+	it('rotates a wallet with no journal entries, then journals its first entry on the new set', async function (): Promise<void> {
+		this.timeout(240_000);
+		const wallet = {
+			daemon: null as IStartedDaemon | null,
+			dir: tmpDir('unused-rotate')
+		};
+		wallets.push(wallet);
+		wallet.daemon = await startWallet(UNUSED_WALLETS[0], wallet.dir);
+		const port = portOf(wallet.daemon);
+		await waitFor(() => confirmed(port));
+		// The literal report: nothing durable yet, and the rotation right away.
+		expect(await durable(port)).to.equal(0n);
+
+		const rotated = await request(port, 'POST', '/recovery/rotate-guardians', {
+			guardians: newEntries,
+			confirm: true
+		});
+		expect(rotated.status, JSON.stringify(rotated.body)).to.equal(200);
+		const result = rotated.body.result as {
+			generation: string;
+			retired: number;
+		};
+		expect(result.generation).to.equal('2');
+		expect(result.retired).to.be.greaterThan(0);
+
+		const after = await status(port);
+		expect(after.generation).to.equal('2');
+		const rotation = after.rotation as {
+			inProgress: boolean;
+			pending: boolean;
+			retirePending: boolean;
+		};
+		expect(rotation.pending).to.equal(false);
+		expect(rotation.inProgress).to.equal(false);
+		expect(rotation.retirePending).to.equal(false);
+		expect(
+			idsOf(
+				(after.guardians as Array<{ guardianId: string }>).map(
+					(g) => g.guardianId
+				)
+			)
+		).to.deep.equal(idsOf(newEntries));
+
+		// And the first durable write lands, on the new set.
+		const invoice = await request(port, 'POST', '/invoice/create', {
+			amountSats: 1000,
+			description: 'first entry after rotating'
+		});
+		expect(invoice.body.ok, JSON.stringify(invoice.body)).to.equal(true);
+		await waitFor(async () => (await durable(port)) >= 1n);
+	});
+
+	it('an intent left on a frame-less wallet by 0.21.x no longer blocks it, and the rotation resumes on restart', async function (): Promise<void> {
+		this.timeout(240_000);
+		const mnemonic = UNUSED_WALLETS[1];
+		const wallet = {
+			daemon: null as IStartedDaemon | null,
+			dir: tmpDir('unused-resume')
+		};
+		wallets.push(wallet);
+		wallet.daemon = await startWallet(mnemonic, wallet.dir);
+		await waitFor(() => confirmed(portOf(wallet.daemon!)));
+		expect(await durable(portOf(wallet.daemon))).to.equal(0n);
+		await wallet.daemon.stop();
+		wallet.daemon = null;
+
+		// What a refused rotation on 0.21.x left behind: the intent over a
+		// store with no frames.
+		const storage = new SqliteStorage(
+			path.join(wallet.dir, 'regtest.db'),
+			undefined,
+			{ encryptionKey: deriveStorageKey(bip39.mnemonicToSeedSync(mnemonic)) }
+		);
+		storage.open();
+		try {
+			expect(storage.loadRecoveryFrames!()).to.have.length(0);
+			storage.setRecoveryMeta!(
+				ROTATION_META_KEYS.pending,
+				JSON.stringify({
+					version: 1,
+					generation: '2',
+					entries: newEntries.map((e) => ({
+						guardianId: e.slice(0, 64),
+						url: e.slice(65)
+					}))
+				})
+			);
+		} finally {
+			storage.close();
+		}
+
+		wallet.daemon = await startWallet(mnemonic, wallet.dir);
+		const port = portOf(wallet.daemon);
+		// The gate confirms on the outgoing set and the rotation resumes by
+		// itself: no request names the new set.
+		await waitFor(async () => {
+			const s = await status(port);
+			const rotation = s.rotation as {
+				pending: boolean;
+				retirePending: boolean;
+			};
+			return (
+				s.generation === '2' && !rotation.pending && !rotation.retirePending
+			);
+		}, 60_000);
+		expect(
+			idsOf(
+				((await status(port)).guardians as Array<{ guardianId: string }>).map(
+					(g) => g.guardianId
+				)
+			)
+		).to.deep.equal(idsOf(newEntries));
+
+		const invoice = await request(port, 'POST', '/invoice/create', {
+			amountSats: 1000,
+			description: 'first entry after the resumed rotation'
+		});
+		expect(invoice.body.ok, JSON.stringify(invoice.body)).to.equal(true);
+		await waitFor(async () => (await durable(port)) >= 1n);
 	});
 });

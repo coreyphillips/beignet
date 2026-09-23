@@ -430,6 +430,16 @@ a capsule or in a guardian's answer. A rotation interrupted by a crash resumes
 once the gate confirms; a retirement the outgoing set has not accepted yet is
 retried in the background.
 
+A wallet that has journaled nothing yet (`lastDurableSequence` `"0"`) rotates
+too, for example to swap a member before first use (issue #862). With no
+journal on disk an unused wallet and a wallet that lost its journal look the
+same, so the switch waits until both sets confirm the namespace holds nothing,
+with at least two members of each answering. If a set holds records this
+journal does not, the rotation is refused with `ROTATION_UNAVAILABLE` (409)
+and the outgoing set is left untouched: restore instead of rotating. If too
+few members answer, it is refused with `ROTATION_NO_QUORUM`. A pending or
+refused rotation never blocks the wallet's first durable write.
+
 #### Guardian recovery (Recovery Protocol)
 
 The Recovery Protocol (docs/RECOVERY-PROTOCOL.md) is configured entirely
