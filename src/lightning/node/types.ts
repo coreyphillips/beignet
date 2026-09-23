@@ -18,6 +18,7 @@ import { ILogger } from '../../logger';
 import { IPerChannelKeys } from '../channel/channel-manager';
 import { SignerFactory } from '../keys/signer';
 import { WebSocketConstructor } from '../transport/websocket';
+import { Socks5ProxyScope } from '../transport/peer-manager';
 import { GuardianStartupGate } from '../recovery/startup-gate';
 import { DurabilityBarrier } from '../recovery/durability-barrier';
 import { IGuardianHostConfig } from '../recovery/guardian-host';
@@ -546,6 +547,16 @@ export interface INodeConfig {
 	announcedAddresses?: INodeAddress[];
 	/** SOCKS5 proxy for outbound peer connections (e.g. Tor on 127.0.0.1:9050) */
 	socks5Proxy?: { host: string; port: number };
+	/**
+	 * Which destinations ride socks5Proxy (default 'all'). 'all' sends every
+	 * public host through it; 'onion' sends only .onion hosts through it and
+	 * dials public clearnet directly (LND's tor.skip-proxy-for-clearnet-targets,
+	 * "hybrid mode"). Private and loopback hosts are always dialed directly.
+	 * Applies to peer dials and watchtower connections alike; it has no effect
+	 * without socks5Proxy, since .onion then falls back to 127.0.0.1:9050 and
+	 * everything else is direct already.
+	 */
+	socks5ProxyScope?: Socks5ProxyScope;
 	/**
 	 * WebSocket constructor for outbound WS peer connections. Defaults to the
 	 * in-repo RFC-cased Node client under Node (CLN's ws listener rejects the

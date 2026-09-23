@@ -728,6 +728,11 @@ export interface BeignetConfig {
 	tlsKey?: string;
 	/** SOCKS5 proxy as "host:port" for outbound Lightning peer connections (e.g. Tor). */
 	torProxy?: string;
+	/** Use torProxy for `.onion` peers only and dial public clearnet peers
+	 *  directly (LND's `tor.skip-proxy-for-clearnet-targets`, "hybrid mode").
+	 *  Private and loopback hosts are always dialed directly. Needs torProxy.
+	 *  Env: BEIGNET_TOR_PROXY_ONION_ONLY (exactly `true`/`false`). */
+	torProxyOnionOnly?: boolean;
 	/** Addresses to advertise in node_announcement, as "host[:port]" strings
 	 *  (IPv4, "[ipv6]:port", Tor v3 ".onion", or DNS hostname). */
 	announceAddresses?: string[];

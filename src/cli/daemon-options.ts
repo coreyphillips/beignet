@@ -41,6 +41,7 @@ export function daemonOptions(
 		tlsCert: config.tlsCert,
 		tlsKey: config.tlsKey,
 		torProxy: config.torProxy,
+		torProxyOnionOnly: config.torProxyOnionOnly,
 		announceAddresses: config.announceAddresses,
 		watchtowers: config.watchtowers,
 		htlcEvents: config.htlcEvents,

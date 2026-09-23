@@ -137,7 +137,10 @@ import {
 	isOnionV3Hostname,
 	parseBolt8GuardianUrl
 } from '../lightning/recovery';
-import { socks5SocketFactory } from '../lightning/transport/peer-manager';
+import {
+	Socks5ProxyScope,
+	socks5SocketFactory
+} from '../lightning/transport/peer-manager';
 import { parsePeerUri } from '../lightning/transport/peer-uri';
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import {
@@ -460,6 +463,15 @@ export interface BeignetNodeOptions {
 	 * an onion address. Needs a running Tor daemon/Tor Browser on that port.
 	 */
 	torProxy?: string;
+	/**
+	 * Use torProxy for `.onion` peers only and dial public clearnet peers
+	 * directly (LND's `tor.skip-proxy-for-clearnet-targets`, "hybrid mode").
+	 * Without it every public peer rides the proxy. Private and loopback hosts
+	 * are dialed directly either way. Needs torProxy: startup is refused when
+	 * this is set without one, since it only chooses which hosts use the
+	 * configured proxy. Applies to peer dials and watchtower connections.
+	 */
+	torProxyOnionOnly?: boolean;
 	/**
 	 * Addresses to advertise in our node_announcement so remote peers can
 	 * discover and dial us, as "host[:port]" strings (port defaults to 9735).
@@ -2012,6 +2024,15 @@ export class BeignetNode extends EventEmitter {
 				throw new BeignetError('INVALID_PARAMS', `jitReceive: ${refusal}`);
 			}
 		}
+		// Refused before the lock, storage or Electrum are touched (issue
+		// #963): the switch only narrows which hosts use the proxy, so with no
+		// proxy configured it is a misconfiguration and not a no-op.
+		if (opts.torProxyOnionOnly && !opts.torProxy) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'torProxyOnionOnly needs torProxy: it only chooses which hosts use the configured proxy'
+			);
+		}
 		const networkName = this.networkName;
 
 		// 2. Acquire the single-instance lock before touching storage. Two
@@ -2330,11 +2351,17 @@ export class BeignetNode extends EventEmitter {
 			if (!proxyHost || !Number.isFinite(port)) {
 				throw new BeignetError(
 					'INVALID_PARAMS',
-					`Invalid torProxy "${opts.torProxy}" — expected "host:port"`
+					`Invalid torProxy "${opts.torProxy}": expected "host:port"`
 				);
 			}
 			socks5Proxy = { host: proxyHost, port };
 		}
+		// Hybrid mode (issue #963): the proxy serves .onion peers only and
+		// public clearnet peers are dialed directly. Private and loopback
+		// hosts are direct under either scope.
+		const socks5ProxyScope: Socks5ProxyScope = opts.torProxyOnionOnly
+			? 'onion'
+			: 'all';
 
 		// Parse addresses to advertise in our node_announcement (BOLT 7).
 		let announcedAddresses: INodeAddress[] | undefined;
@@ -2577,6 +2604,7 @@ export class BeignetNode extends EventEmitter {
 			logger: this.logger,
 			sweepDestinationScript,
 			socks5Proxy,
+			socks5ProxyScope,
 			...(opts.guardianServe
 				? {
 						guardianHost: {

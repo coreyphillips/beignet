@@ -74,7 +74,8 @@ import {
 	PeerManager,
 	IPeerDialOptions,
 	IPeerInfo,
-	PeerDialCancelledError
+	PeerDialCancelledError,
+	Socks5ProxyScope
 } from '../transport/peer-manager';
 import { IPeerTransportOptions } from '../transport/duplex-transport';
 import { parseWebSocketUrl } from '../transport/websocket';
@@ -1317,6 +1318,9 @@ export class LightningNode extends EventEmitter {
 	private largeChannels: boolean;
 	// SOCKS5 proxy config, kept for connect-by-node-id Tor address gating
 	private socks5Proxy: { host: string; port: number } | null;
+	// Which hosts ride socks5Proxy: 'all' or 'onion' (issue #963). Threaded to
+	// the peer manager and the watchtower client, which share one table.
+	private socks5ProxyScope: Socks5ProxyScope;
 	/**
 	 * The reference guardian this node serves to OTHER nodes over bolt8
 	 * sessions (wire 2.7, issue #699), or null. Unrelated to this node's own
@@ -1562,6 +1566,7 @@ export class LightningNode extends EventEmitter {
 		this.paymentBasepointSecret = config.paymentBasepointSecret;
 		this.feeEstimator = config.feeEstimator || null;
 		this.socks5Proxy = config.socks5Proxy ?? null;
+		this.socks5ProxyScope = config.socks5ProxyScope ?? 'all';
 		this.initWatchtowerClient(config.watchtowers ?? []);
 		this.logger = config.logger ?? noopLogger;
 		if (durabilityRefusal) {
@@ -2108,6 +2113,7 @@ export class LightningNode extends EventEmitter {
 				autoReconnect: this.autoReconnect,
 				maxReconnectDelay: config.maxReconnectDelay,
 				socks5Proxy: config.socks5Proxy,
+				socks5ProxyScope: this.socks5ProxyScope,
 				webSocketImpl: config.webSocketImpl
 			});
 			this.channelManager.attachToPeerManager(this.peerManager);
@@ -7919,7 +7925,8 @@ export class LightningNode extends EventEmitter {
 			network: btcNetwork,
 			towers,
 			store,
-			socks5Proxy: this.socks5Proxy ?? undefined
+			socks5Proxy: this.socks5Proxy ?? undefined,
+			socks5ProxyScope: this.socks5ProxyScope
 		});
 		this.watchtowerClient.on('log', (entry: Record<string, unknown>) => {
 			const event = String(entry.event ?? 'log');
@@ -26161,6 +26168,7 @@ export class LightningNode extends EventEmitter {
 			feeEstimator?: IFeeEstimator;
 			logger?: ILogger;
 			socks5Proxy?: { host: string; port: number };
+			socks5ProxyScope?: Socks5ProxyScope;
 			webSocketImpl?: import('../transport/websocket').WebSocketConstructor;
 			preferAnchors?: boolean;
 			largeChannels?: boolean;
@@ -26257,6 +26265,7 @@ export class LightningNode extends EventEmitter {
 			feeEstimator: options?.feeEstimator,
 			logger: options?.logger,
 			socks5Proxy: options?.socks5Proxy,
+			socks5ProxyScope: options?.socks5ProxyScope,
 			webSocketImpl: options?.webSocketImpl,
 			preferAnchors: options?.preferAnchors,
 			largeChannels: options?.largeChannels,

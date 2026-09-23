@@ -3,8 +3,11 @@ import crypto from 'crypto';
 import net from 'net';
 import { Peer } from '../../src/lightning/transport/peer';
 import {
+	DEFAULT_TOR_PROXY,
 	PeerManager,
-	isPrivateOrLoopbackHost
+	Socks5ProxyScope,
+	isPrivateOrLoopbackHost,
+	selectOutboundProxy
 } from '../../src/lightning/transport/peer-manager';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
@@ -151,6 +154,181 @@ describe('SOCKS5 Proxy Support', function () {
 			]) {
 				expect(isPrivateOrLoopbackHost(h), h).to.be.false;
 			}
+		});
+	});
+
+	describe('selectOutboundProxy', function () {
+		// The one table every dial path (peer manager, watchtower) reads from
+		// (issue #963): onion always rides a proxy (the configured one, else
+		// Tor's default), private/loopback is always direct, and public
+		// clearnet rides the configured proxy only under scope 'all'.
+		const proxy = { host: '10.21.21.11', port: 9050 };
+		const cases: Array<{
+			host: string;
+			scope: Socks5ProxyScope;
+			proxy: { host: string; port: number } | undefined;
+			expected: { host: string; port: number } | undefined;
+		}> = [
+			// .onion
+			{ host: 'abc123.onion', scope: 'all', proxy, expected: proxy },
+			{ host: 'abc123.onion', scope: 'onion', proxy, expected: proxy },
+			{
+				host: 'abc123.onion',
+				scope: 'all',
+				proxy: undefined,
+				expected: DEFAULT_TOR_PROXY
+			},
+			{
+				host: 'ABC123.ONION',
+				scope: 'onion',
+				proxy: undefined,
+				expected: DEFAULT_TOR_PROXY
+			},
+			// private / loopback
+			{ host: '127.0.0.1', scope: 'all', proxy, expected: undefined },
+			{ host: '192.168.4.20', scope: 'onion', proxy, expected: undefined },
+			{
+				host: 'localhost',
+				scope: 'all',
+				proxy: undefined,
+				expected: undefined
+			},
+			{ host: '[::1]', scope: 'onion', proxy: undefined, expected: undefined },
+			// public clearnet
+			{ host: '203.0.113.1', scope: 'all', proxy, expected: proxy },
+			{ host: '203.0.113.1', scope: 'onion', proxy, expected: undefined },
+			{ host: 'ln.acinq.co', scope: 'all', proxy, expected: proxy },
+			{ host: 'ln.acinq.co', scope: 'onion', proxy, expected: undefined },
+			{
+				host: '203.0.113.1',
+				scope: 'all',
+				proxy: undefined,
+				expected: undefined
+			},
+			{
+				host: 'ln.acinq.co',
+				scope: 'onion',
+				proxy: undefined,
+				expected: undefined
+			}
+		];
+
+		for (const c of cases) {
+			it(`${c.host} with proxy ${c.proxy ? 'set' : 'unset'} under scope ${
+				c.scope
+			} -> ${
+				c.expected ? `${c.expected.host}:${c.expected.port}` : 'direct'
+			}`, function () {
+				expect(selectOutboundProxy(c.host, c.proxy, c.scope)).to.deep.equal(
+					c.expected
+				);
+			});
+		}
+
+		it('defaults the scope to all, which is the pre-#963 behaviour', function () {
+			expect(selectOutboundProxy('203.0.113.1', proxy)).to.deep.equal(proxy);
+			expect(selectOutboundProxy('abc.onion', undefined)).to.deep.equal(
+				DEFAULT_TOR_PROXY
+			);
+		});
+	});
+
+	describe('PeerManager with socks5ProxyScope onion', function () {
+		// Hybrid mode (issue #963): the proxy is for .onion peers only. Same
+		// flag-server pattern as the scope 'all' cases below: a TCP server that
+		// records any contact stands in for the proxy.
+		let proxy: net.Server;
+		let proxyPort = 0;
+		let proxyContacted = false;
+
+		beforeEach(async function () {
+			proxyContacted = false;
+			proxy = net.createServer((s) => {
+				proxyContacted = true;
+				s.destroy();
+			});
+			await new Promise<void>((resolve) =>
+				proxy.listen(0, '127.0.0.1', resolve)
+			);
+			proxyPort = (proxy.address() as net.AddressInfo).port;
+		});
+
+		afterEach(async function () {
+			await new Promise<void>((resolve) => proxy.close(() => resolve()));
+		});
+
+		const manager = (): PeerManager =>
+			new PeerManager({
+				localPrivateKey: crypto.randomBytes(32),
+				socks5Proxy: { host: '127.0.0.1', port: proxyPort },
+				socks5ProxyScope: 'onion',
+				socks5TimeoutMs: 500
+			});
+
+		it('Should dial public clearnet peers directly, never touching the proxy', async function () {
+			this.timeout(5000);
+			const pm = manager();
+			// 203.0.113.1 is TEST-NET-3 (RFC 5737), never routed: the direct
+			// dial either fails at once or sits in SYN until the 200 ms dial
+			// bound. Either way the proxy must see nothing, which is what
+			// distinguishes this from the scope 'all' case that proxies it.
+			const dial = pm
+				.connectPeer(
+					getPublicKey(crypto.randomBytes(32)).toString('hex'),
+					'203.0.113.1',
+					9735,
+					undefined,
+					{ timeoutMs: 200, reconnect: false }
+				)
+				.catch(() => undefined);
+			await new Promise((r) => setTimeout(r, 300));
+
+			expect(proxyContacted, 'proxy should not be contacted for a public host')
+				.to.be.false;
+
+			pm.destroy();
+			await Promise.race([dial, new Promise((r) => setTimeout(r, 1000))]);
+		});
+
+		it('Should still route .onion peers through the proxy', async function () {
+			this.timeout(5000);
+			const pm = manager();
+			try {
+				await pm.connectPeer(
+					getPublicKey(crypto.randomBytes(32)).toString('hex'),
+					'abc123.onion',
+					9735
+				);
+			} catch {
+				// The flag server speaks no SOCKS, so negotiation fails; the
+				// point is that the dial was aimed at the proxy at all.
+			}
+
+			expect(proxyContacted, 'proxy should be contacted for an onion host').to
+				.be.true;
+
+			pm.destroy();
+		});
+
+		it('Should still dial private peers directly', async function () {
+			this.timeout(5000);
+			const pm = manager();
+			try {
+				// Port 1 is closed, so a direct dial fails fast with ECONNREFUSED.
+				await pm.connectPeer(
+					getPublicKey(crypto.randomBytes(32)).toString('hex'),
+					'127.0.0.1',
+					1
+				);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include('ECONNREFUSED');
+			}
+
+			expect(proxyContacted, 'proxy should not be contacted for a private host')
+				.to.be.false;
+
+			pm.destroy();
 		});
 	});
 

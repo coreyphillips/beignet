@@ -48,7 +48,12 @@ const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000; // 1 second
 // drops (a "flapping" peer — e.g. a closing channel, or an unstable Tor circuit)
 // resets the backoff every cycle and reconnects in a tight 1s loop forever.
 const STABLE_CONNECTION_MS = 60_000;
-const DEFAULT_TOR_PROXY = { host: '127.0.0.1', port: 9050 };
+/**
+ * Where `.onion` dials go when no SOCKS5 proxy is configured: Tor's default
+ * SOCKS port on the local host. Shared with the watchtower client so both
+ * dial paths agree on the fallback.
+ */
+export const DEFAULT_TOR_PROXY = { host: '127.0.0.1', port: 9050 };
 // Cap on gossip-announced reconnect candidates kept per peer. Announcements
 // are peer-controlled input; without a cap a peer could make every reconnect
 // round crawl through a long list of dead addresses.
@@ -96,6 +101,49 @@ export function isPrivateOrLoopbackHost(host: string): boolean {
 }
 
 /**
+ * Which destinations a configured SOCKS5 proxy is used for (issue #963).
+ *
+ * - `'all'`: every public host rides the proxy (privacy: the node's clearnet
+ *   address is never revealed to a public peer). Today's behaviour and the
+ *   default.
+ * - `'onion'`: only `.onion` hosts ride the proxy; public clearnet hosts are
+ *   dialed directly. What LND calls `tor.skip-proxy-for-clearnet-targets`
+ *   ("hybrid mode"): Tor is reachable, at a non-default address if need be,
+ *   without paying its latency on every clearnet peer.
+ *
+ * Private and loopback hosts are dialed directly under either scope, because
+ * Tor refuses them (see isPrivateOrLoopbackHost).
+ */
+export type Socks5ProxyScope = 'all' | 'onion';
+
+/**
+ * The proxy an outbound dial to `host` goes through, or undefined for a direct
+ * dial. One table for every place that picks a proxy (peer dials, watchtower
+ * connections), so the two cannot drift:
+ *
+ *   destination        | proxy unset      | proxy, scope 'all' | proxy, scope 'onion'
+ *   .onion             | DEFAULT_TOR_PROXY | proxy              | proxy
+ *   private / loopback | direct           | direct             | direct
+ *   public clearnet    | direct           | proxy              | direct
+ *
+ * `.onion` always needs a proxy because the name resolves nowhere else, so an
+ * unset proxy falls back to Tor's default local SOCKS port rather than
+ * failing on DNS. Private and loopback hosts never ride the proxy: Tor rejects
+ * them, so proxying a LAN or localhost peer would only ever fail.
+ */
+export function selectOutboundProxy(
+	host: string,
+	proxy: { host: string; port: number } | undefined,
+	scope: Socks5ProxyScope = 'all'
+): { host: string; port: number } | undefined {
+	if (host.trim().toLowerCase().endsWith('.onion')) {
+		return proxy ?? DEFAULT_TOR_PROXY;
+	}
+	if (isPrivateOrLoopbackHost(host)) return undefined;
+	return scope === 'onion' ? undefined : proxy;
+}
+
+/**
  * A socket factory that dials through a SOCKS5 proxy (Tor), shared by the
  * peer manager and by guardian sessions to onion hosts (recovery
  * guardian-bolt8.ts). Tor circuit establishment can hang for minutes;
@@ -128,9 +176,15 @@ export interface IPeerManagerOptions {
 	autoReconnect?: boolean;
 	/** Max reconnect delay in ms (default 5 min) */
 	maxReconnectDelay?: number;
-	/** SOCKS5 proxy for ALL outbound connections (e.g. Tor on 127.0.0.1:9050).
-	 *  When not set, .onion addresses auto-route through 127.0.0.1:9050. */
+	/** SOCKS5 proxy for outbound connections (e.g. Tor on 127.0.0.1:9050).
+	 *  Which hosts use it is decided by socks5ProxyScope; private and
+	 *  loopback hosts never do. When not set, .onion addresses auto-route
+	 *  through 127.0.0.1:9050 and everything else is dialed directly. */
 	socks5Proxy?: { host: string; port: number };
+	/** Which destinations ride socks5Proxy (default 'all'): 'all' proxies
+	 *  every public host, 'onion' proxies .onion hosts only and dials public
+	 *  clearnet directly. See selectOutboundProxy for the full table. */
+	socks5ProxyScope?: Socks5ProxyScope;
 	/** SOCKS5 connect/negotiation timeout in ms (default 20000). Lower it when a
 	 *  fast failure is preferable to waiting out a stalled/filtered proxy. */
 	socks5TimeoutMs?: number;
@@ -268,6 +322,7 @@ export class PeerManager extends EventEmitter {
 	private server: net.Server | null = null;
 	private wsServer: WebSocketServer | null = null;
 	private socks5Proxy?: { host: string; port: number };
+	private socks5ProxyScope: Socks5ProxyScope;
 	private socks5TimeoutMs: number;
 	private maxInboundPeers: number;
 	private maxLanePeers: number;
@@ -296,6 +351,7 @@ export class PeerManager extends EventEmitter {
 		this.maxReconnectDelay =
 			options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
 		this.socks5Proxy = options.socks5Proxy;
+		this.socks5ProxyScope = options.socks5ProxyScope ?? 'all';
 		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
 		this.maxLanePeers = options.maxLanePeers ?? 32;
@@ -460,16 +516,18 @@ export class PeerManager extends EventEmitter {
 			createSocket = (): Promise<IDuplexTransport> =>
 				connectWebSocket(url, { webSocketImpl });
 		} else {
-			// Route selection for the outbound socket:
-			//   .onion           → always via Tor (explicit proxy, else the default)
-			//   private/loopback → always direct; Tor rejects these, so proxying a
-			//                      LAN or localhost peer would only ever fail
-			//   public clearnet  → via the configured proxy (privacy), else direct
-			const proxy = host.endsWith('.onion')
-				? this.socks5Proxy ?? DEFAULT_TOR_PROXY
-				: isPrivateOrLoopbackHost(host)
-				? undefined
-				: this.socks5Proxy;
+			// Route selection for the outbound socket (selectOutboundProxy):
+			//   .onion           -> always via Tor (explicit proxy, else the default)
+			//   private/loopback -> always direct; Tor rejects these, so proxying a
+			//                       LAN or localhost peer would only ever fail
+			//   public clearnet  -> via the configured proxy under scope 'all'
+			//                       (privacy), direct under scope 'onion' or
+			//                       when no proxy is set
+			const proxy = selectOutboundProxy(
+				host,
+				this.socks5Proxy,
+				this.socks5ProxyScope
+			);
 			createSocket = proxy
 				? this.buildSocks5Factory(proxy, timeoutMs)
 				: undefined;

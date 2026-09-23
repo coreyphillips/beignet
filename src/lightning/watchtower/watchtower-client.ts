@@ -42,6 +42,7 @@ import {
 	IJusticeContext
 } from './justice';
 import { TowerConnection, parseTowerUri } from './tower-connection';
+import { Socks5ProxyScope } from '../transport/peer-manager';
 import {
 	ITowerAddress,
 	ITowerTransport,
@@ -84,6 +85,9 @@ export interface IWatchtowerClientOptions {
 	store?: IWatchtowerStore;
 	transportFactory?: TowerTransportFactory;
 	socks5Proxy?: { host: string; port: number };
+	/** Which tower hosts ride socks5Proxy (default 'all'; 'onion' dials
+	 *  public clearnet towers directly). See selectOutboundProxy. */
+	socks5ProxyScope?: Socks5ProxyScope;
 	maxUpdates?: number;
 	sweepFeeRateSatPerKw?: bigint;
 	connectTimeoutMs?: number;
@@ -131,6 +135,7 @@ export class WatchtowerClient extends EventEmitter {
 	private readonly store?: IWatchtowerStore;
 	private readonly transportFactory: TowerTransportFactory;
 	private readonly socks5Proxy?: { host: string; port: number };
+	private readonly socks5ProxyScope: Socks5ProxyScope;
 	private readonly maxUpdates: number;
 	private readonly sweepFeeRate: bigint;
 	private readonly connectTimeoutMs: number;
@@ -143,6 +148,7 @@ export class WatchtowerClient extends EventEmitter {
 		this.chainHash = opts.chainHash;
 		this.store = opts.store;
 		this.socks5Proxy = opts.socks5Proxy;
+		this.socks5ProxyScope = opts.socks5ProxyScope ?? 'all';
 		this.maxUpdates = opts.maxUpdates ?? DEFAULT_MAX_UPDATES;
 		this.sweepFeeRate =
 			opts.sweepFeeRateSatPerKw ?? DEFAULT_SWEEP_FEE_RATE_SAT_PER_KW;
@@ -154,7 +160,8 @@ export class WatchtowerClient extends EventEmitter {
 					localPrivateKey: transportKey ?? this.localPrivateKey,
 					address: addr,
 					connectTimeoutMs: this.connectTimeoutMs,
-					socks5Proxy: this.socks5Proxy
+					socks5Proxy: this.socks5Proxy,
+					socks5ProxyScope: this.socks5ProxyScope
 				}));
 
 		for (const uri of opts.towers ?? []) {
