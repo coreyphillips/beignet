@@ -259,14 +259,28 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 			release = held.release;
 			const { key, labels, write } = held;
 
-			// Payments are in flight and one more waits its turn.
+			// Payments are in flight and one more waits its turn. Each dispatch
+			// settles on timeOut(), with the FAILED result payInvoiceSafe gives
+			// when payInvoice's payment timer fires.
 			const payCalls: string[] = [];
-			const failPays: Array<(e: Error) => void> = [];
+			const timeOuts: Array<() => void> = [];
 			(
 				node as unknown as { payInvoiceSafe: (b: string) => Promise<unknown> }
 			).payInvoiceSafe = (bolt11: string): Promise<unknown> => {
 				payCalls.push(bolt11);
-				return new Promise((_resolve, reject) => failPays.push(reject));
+				return new Promise((resolve) =>
+					timeOuts.push(() =>
+						resolve({
+							paymentHash: 'unknown',
+							amountSats: 0,
+							status: 'FAILED',
+							direction: 'OUTGOING',
+							failureDescription:
+								'[PAYMENT_TIMEOUT] Payment timed out after 60000ms',
+							createdAt: Date.now()
+						})
+					)
+				);
 			};
 			const queuedNow = (): QueuedPayment[] =>
 				node.listQueue().filter((e) => e.status === 'queued');
@@ -293,9 +307,11 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 					await new Promise((resolve) => setTimeout(resolve, 10));
 				}
 			}
-			// The stopped node fails what it had in flight. The queue records
-			// that, and hands the waiting payment to nobody.
-			for (const fail of failPays) fail(new Error('node destroyed'));
+			// The destroyed node has dropped its payment listeners, so a
+			// dispatch in flight settles only when its payment timer fires.
+			// Those timers fire now, while the wallet stops. The queue records
+			// the outcome, and hands the waiting payment to nobody.
+			for (const timeOut of timeOuts) timeOut();
 			await new Promise((resolve) => setTimeout(resolve, 20));
 			expect(payCalls).to.have.length(inFlight.length);
 			release();
@@ -331,6 +347,9 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 				const statusOf = (id: string): string | undefined =>
 					reopened.loadAllQueueEntries().find((row) => row.id === id)?.status;
 				expect(statusOf(waiting.id)).to.equal('queued');
+				// A dispatch that settles before the close records its outcome.
+				// Only one still pending at the close stays 'dispatching', for a
+				// retry after the restart.
 				for (const id of inFlight) expect(statusOf(id)).to.equal('failed');
 			} finally {
 				reopened.close();
@@ -357,6 +376,105 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 		this.timeout(45_000);
 		// destroy() reaches wallet.stop() before its first await.
 		await heldWalletWriteLandsBeforeClose((node) => node.destroy(), true);
+	});
+
+	// The tail runs in a finally. When the node's own shutdown throws before
+	// its storage close, the node's view is still fenced while the wallet
+	// stops, the wallet's write still lands, the database still closes and
+	// the lock is still released. Without the finally, a throw there left the
+	// database open and the instance lock held.
+	const nodeShutdownThrows = async (
+		method: 'gracefulShutdown' | 'destroy'
+	): Promise<void> => {
+		const { BeignetNode } = await import('../../src/cli/beignet-node');
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-test-'));
+		const node = await BeignetNode.create({
+			network: 'regtest',
+			dataDir: tmpDir,
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
+		});
+		const lightning = node.getNode() as unknown as {
+			storage: SqliteStorage;
+			gracefulShutdown: (timeoutMs?: number) => Promise<void>;
+			destroy: () => void;
+		};
+		let release: () => void = () => {};
+		let done: Promise<void> | undefined;
+		try {
+			await node.waitForInitialSync();
+			const lockPath = path.join(tmpDir, 'regtest.lock');
+			expect(fs.existsSync(lockPath)).to.equal(true);
+			const nodeStorage = lightning.storage;
+			const database = node.getStorage() as unknown as {
+				db: { open: boolean };
+			};
+			const thrown = new Error('issue958: node teardown threw');
+			if (method === 'gracefulShutdown') {
+				lightning.gracefulShutdown = (): Promise<void> =>
+					Promise.reject(thrown);
+			} else {
+				lightning.destroy = (): void => {
+					throw thrown;
+				};
+			}
+			const held = holdWalletWrite(node);
+			release = held.release;
+
+			done =
+				method === 'gracefulShutdown'
+					? node.gracefulShutdown(1_000)
+					: node.destroy();
+			const deadline = Date.now() + 10_000;
+			while (!held.stopping()) {
+				if (Date.now() > deadline) {
+					throw new Error('wallet.stop() never started');
+				}
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			// The node never reached its own close, and its view is fenced all
+			// the same. The database itself is still open, for the wallet.
+			expect(() =>
+				nodeStorage.saveMetadata('issue958_teardown_threw', '1')
+			).to.throw(TypeError, 'The database connection is not open');
+			expect(database.db.open).to.equal(true);
+
+			release();
+			let rejected: unknown;
+			await done.catch((e: unknown) => {
+				rejected = e;
+			});
+			expect(rejected).to.equal(thrown);
+			const saved = await held.write;
+			expect(saved.isOk(), saved.isErr() ? saved.error.message : '').to.equal(
+				true
+			);
+			expect(database.db.open).to.equal(false);
+			expect(fs.existsSync(lockPath)).to.equal(false);
+		} finally {
+			release();
+			await done?.catch(() => {});
+			// The stub skipped the node's real teardown. Run it, so no timer or
+			// socket outlives the test.
+			delete (lightning as unknown as Record<string, unknown>)[method];
+			try {
+				lightning.destroy();
+			} catch {
+				// cleanup only
+			}
+			await node.destroy();
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		}
+	};
+
+	it('gracefulShutdown still fences the node, stops the wallet, closes the database and releases the lock when the node shutdown throws (issue #958)', async function () {
+		this.timeout(45_000);
+		await nodeShutdownThrows('gracefulShutdown');
+	});
+
+	it('destroy still fences the node, stops the wallet, closes the database and releases the lock when the node teardown throws (issue #958)', async function () {
+		this.timeout(45_000);
+		await nodeShutdownThrows('destroy');
 	});
 
 	// What the reviewer of the first fix found: the node's subsystems keep

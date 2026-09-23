@@ -1523,6 +1523,12 @@ export class BeignetNode extends EventEmitter {
 	private wallet!: Wallet;
 	private node!: LightningNode;
 	private storage!: SqliteStorage;
+	/**
+	 * The fenced view of the database the current node was built on (issue
+	 * #958). Kept so shutdown can fence it even when the node's own teardown
+	 * throws before its close.
+	 */
+	private _nodeStorageView?: SqliteStorage;
 	/** Wallet-owned output script that force-close sweeps pay into. */
 	private sweepDestinationScript?: Buffer;
 	/** Background timer retrying wallet sweep-address resolution (see scheduleSweepAddressRefresh). */
@@ -2329,15 +2335,16 @@ export class BeignetNode extends EventEmitter {
 			});
 		}
 
+		// A fenced view, not the database itself: the node's destroy() closes
+		// it, and the database stays open for the wallet, which stops after
+		// the node and still writes (issue #958). Every path that builds a
+		// node comes through here, so each gets a fresh view of the database
+		// it runs on.
+		this._nodeStorageView = nodeStorageView(this.storage);
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
 			network: lnNetwork,
-			// A fenced view, not the database itself: the node's destroy()
-			// closes it, and the database stays open for the wallet, which
-			// stops after the node and still writes (issue #958). Every path
-			// that builds a node comes through here, so each gets a fresh view
-			// of the database it runs on.
-			storage: nodeStorageView(this.storage),
+			storage: this._nodeStorageView,
 			// Issue #906: fence fresh indices during active auto-apply or a
 			// rebuild, and while the node's block height is zero.
 			newChannelsRefused: (): string | null => this.newChannelRefusal(),
@@ -12589,6 +12596,11 @@ export class BeignetNode extends EventEmitter {
 	 * webhook subscribers.
 	 */
 	private async stopWalletAndCloseStorage(): Promise<void> {
+		// The node's destroy() fences its view in its own close. A teardown
+		// step that throws before that close would leave every reference the
+		// node's subsystems hold writable while the wallet stops, so fence it
+		// here too. The close is idempotent (issue #958).
+		this._nodeStorageView?.close();
 		this.removeAllListeners();
 		try {
 			await (this.wallet as Wallet | undefined)?.stop();
