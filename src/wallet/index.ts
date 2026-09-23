@@ -2529,9 +2529,10 @@ export class Wallet {
 	 * @param {number} addressIndex
 	 * @param {number} changeAddressIndex
 	 * @param {EAddressType[]} [addressTypesToCheck]
-	 * @returns {Promise<Result<IGetUtxosResponse>>} The scan's answer, which
-	 * memory now holds. A write of it that storage refuses is logged, not
-	 * returned: the scan itself succeeded.
+	 * @returns {Promise<Result<IGetUtxosResponse>>} The pair the scan applied
+	 * to memory, or, when a newer scan already landed, memory's pair as it
+	 * stands, applied and written by that scan instead. A write that storage
+	 * refuses is logged, not returned: the scan itself succeeded.
 	 */
 	public async getUtxos({
 		scanningStrategy = EScanningStrategy.gapLimit,
@@ -2681,12 +2682,13 @@ export class Wallet {
 	 * Writes the UTXO set, then the balance, as one pair read from memory at
 	 * the call. They are separate storage keys and cannot be written
 	 * atomically, so the balance is written only once the set has landed. A
-	 * refused set write then leaves both keys as they were, still a matching
-	 * pair, instead of the old set beside the new balance (#812). A refused
-	 * balance write leaves the new set beside the old balance. Either way this
-	 * is display consistency, not selection safety: coin selection reads the
-	 * set, never the balance. Memory keeps the new state regardless, and the
-	 * next applied scan writes both again.
+	 * refused set write then leaves both keys as they were, instead of the old
+	 * set beside the new balance (#812). A refused balance write leaves the
+	 * new set beside the old balance, and so does a stop() between the two
+	 * writes: it drops the balance write without a log, as it drops every
+	 * write after it. Either way this is display consistency, not selection
+	 * safety: coin selection reads the set, never the balance. Memory keeps
+	 * the new state regardless, and the next applied scan writes both again.
 	 * @returns {Promise<Result<string>>} Err naming the refused write, which
 	 * has already been logged.
 	 */
@@ -2700,7 +2702,8 @@ export class Wallet {
 			? set
 			: await this.saveWalletData('balance', balance);
 		if (saved.isErr()) {
-			const message = `Failed to persist the UTXO set: ${saved.error.message}`;
+			const refused = set.isErr() ? 'UTXO set' : "UTXO set's balance";
+			const message = `Failed to persist the ${refused}: ${saved.error.message}`;
 			this.logger.error(message);
 			return err(message);
 		}

@@ -2645,11 +2645,11 @@ export class Electrum {
 		// coins this transaction spends, and the UTXO set is only ever replaced
 		// by a whole scan, which arrives on a notification at best and never on
 		// a timer: until one lands, every caller of listUtxos can still select a
-		// coin that is already gone. What removeSpentUtxos returns never fails
-		// the broadcast: the transaction is out and its txid is the answer. A
-		// write of the new set that storage refuses is logged by the wallet, and
-		// the scan this spend triggers through the wallet's own scripthash
-		// subscription writes it again.
+		// coin that is already gone. The Result removeSpentUtxos returns is not
+		// checked: the transaction is out and its txid is the answer. A write of
+		// the new set that storage refuses is logged by the wallet, and the scan
+		// this spend triggers through the wallet's own scripthash subscription
+		// writes it again.
 		await this._wallet.removeSpentUtxos(rawTx);
 		return ok(broadcastResponse.data);
 	}

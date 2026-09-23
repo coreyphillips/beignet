@@ -556,6 +556,8 @@ describe('UTXO state persistence (#812)', function () {
 		}
 	});
 
+	// Guard: passes without the #812 fix too. It pins that the next applied
+	// scan writes both keys again after a refusal.
 	it('lets the next scan write the pair storage refused', async () => {
 		fail.keys = ['utxos'];
 		const res = await wallet.broadcastTransaction(txSpending([utxoA]));
@@ -591,6 +593,7 @@ describe('UTXO state persistence (#812)', function () {
 		expect(outpoints(storedUtxos())).to.deep.equal(outpoints([utxoB]));
 		expect(storedBalance()).to.equal(100000);
 		expect(persistErrors()).to.have.length(1);
+		expect(persistErrors()[0]).to.include("UTXO set's balance");
 	});
 
 	it('does not pair a stored set with the balance of a scan that landed while it was written', async () => {
