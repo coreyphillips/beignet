@@ -760,7 +760,9 @@ mode (`async-remote`, `quorum`) the startup quarantine refuses the bind
 until writer ownership is confirmed and any startup repair is receipted:
 `listenError.state` is `'held'` meanwhile, no `LISTEN_FAILED` is raised,
 and the listener binds on its own once the gate opens (`'fenced'` if the
-node is fenced instead, when it stays down). A guardian host's TCP bind is
+node is fenced instead, when it stays down). A fence also closes a
+listener that was bound, which then reads `'fenced'` and gives no
+`GET /node/uri`. A guardian host's TCP bind is
 admitted during quarantine by the guardian-only lane. A failure at startup
 is raised before the daemon's SSE stream and webhooks are wired, so read it
 from `GET /info`.

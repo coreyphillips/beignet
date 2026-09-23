@@ -33,6 +33,7 @@ import {
 	LnCoinType,
 	deriveLightningKeysFromMnemonic
 } from '../../src/lightning/keys/wallet-keys';
+import { LightningNode } from '../../src/lightning/node/lightning-node';
 
 const MNEMONICS = [
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
@@ -308,6 +309,7 @@ describe('Guardian host surface: a listen port another process holds (issue #861
 		const dir = tmpDir('squatted-throw');
 		const { port, squatter } = await squat();
 		let daemon: IStartedDaemon | null = null;
+		let thrown = 0;
 		try {
 			daemon = await startDaemon({
 				...OFFLINE,
@@ -315,9 +317,13 @@ describe('Guardian host surface: a listen port another process holds (issue #861
 				dataDir: dir,
 				listenPort: port,
 				onError: (e: IErrorEvent) => {
-					if (e.code === 'LISTEN_FAILED') throw new Error('observer failed');
+					if (e.code !== 'LISTEN_FAILED') return;
+					thrown++;
+					throw new Error('observer failed');
 				}
 			});
+			// The observer did run, and threw, during the boot.
+			expect(thrown).to.equal(1);
 			const info = (await request(portOf(daemon), 'GET', '/info')).body
 				.result as IListenerInfo;
 			expect(info.listening).to.equal(false);
@@ -336,6 +342,8 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 	let wallet: IStartedDaemon | null = null;
 	let walletDir: string | null = null;
 	let pinned: string[] = [];
+	let walletListen = 0;
+	const walletErrors: IErrorEvent[] = [];
 	let restored: IStartedDaemon | null = null;
 	let restoredDir: string | null = null;
 
@@ -442,8 +450,7 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 		// quarantine refuses until its writer lease is confirmed (#933).
 		walletDir = tmpDir('wallet');
 		pinned = entries;
-		const walletListen = await freePort();
-		const walletErrors: IErrorEvent[] = [];
+		walletListen = await freePort();
 		wallet = await startDaemon({
 			...OFFLINE,
 			mnemonic: MNEMONICS[3],
@@ -649,6 +656,27 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 				fencedOnA.length > 0
 			);
 		}, 60_000);
+		// The fence closed the old device's bound listener: it reads fenced,
+		// and no URI is handed out for the port nobody answers now.
+		await waitFor(
+			async () =>
+				(
+					(await request(walletPort, 'GET', '/info')).body
+						.result as IListenerInfo
+				).listenError?.state === 'fenced'
+		);
+		const fencedInfo = (await request(walletPort, 'GET', '/info')).body
+			.result as IListenerInfo;
+		expect(fencedInfo.listening).to.equal(false);
+		expect(fencedInfo.listenPort).to.equal(walletListen);
+		expect(fencedInfo.listenError?.port).to.equal(walletListen);
+		expect(fencedInfo.listenError?.errno).to.equal(undefined);
+		expect((await request(walletPort, 'GET', '/node/uri')).status).to.equal(
+			404
+		);
+		expect(
+			walletErrors.filter((e) => e.code === 'LISTEN_FAILED')
+		).to.have.length(0);
 
 		// Every host now holds the takeover: the set is still one set, with
 		// one namespace, at epoch 2.
@@ -826,6 +854,114 @@ describe('Guardian host surface: the guardian-only lane', () => {
 		} finally {
 			await a.stop();
 			fs.rmSync(dirA, { recursive: true, force: true });
+		}
+	});
+});
+
+describe('Guardian host surface: a listener held past the gate confirming (issue #933)', () => {
+	const hosts: Array<IHost | null> = [];
+	const listen = LightningNode.prototype.listen;
+
+	after(async function (): Promise<void> {
+		this.timeout(60_000);
+		LightningNode.prototype.listen = listen;
+		await stopAll(hosts.splice(0));
+	});
+
+	it('binds on node:ready when a startup repair still holds it after confirmation', async function (): Promise<void> {
+		this.timeout(180_000);
+		const b = await startHost(1);
+		const c = await startHost(2);
+		hosts.push(b, c);
+		const resolve = async (uri: string): Promise<string> => {
+			const resolved = await request(
+				portOf(b.daemon),
+				'POST',
+				'/recovery/resolve-guardian',
+				{ uri }
+			);
+			expect(resolved.status, JSON.stringify(resolved.body)).to.equal(200);
+			return (resolved.body.result as { entry: string }).entry;
+		};
+		const entries = [
+			await resolve(b.uri),
+			await resolve(c.uri),
+			`79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798@bolt8://${
+				b.uri.split('@')[0]
+			}@127.0.0.1:1`
+		];
+
+		// A startup repair owed at boot keeps refusing the bind (the same
+		// STARTUP_QUARANTINE refusal) after the gate confirms, until its
+		// receipt; the receipt then drives node:ready. Stand in for it on
+		// this wallet's port only.
+		const walletListen = await freePort();
+		let repairPending = true;
+		LightningNode.prototype.listen = async function (
+			this: LightningNode,
+			port: number,
+			host?: string
+		): Promise<void> {
+			if (port === walletListen && repairPending) {
+				throw Object.assign(
+					new Error(
+						'Startup quarantine: listen is refused until writer ownership is confirmed'
+					),
+					{ code: 'STARTUP_QUARANTINE' }
+				);
+			}
+			return listen.call(this, port, host);
+		};
+		const dir = tmpDir('repair-held');
+		const errors: IErrorEvent[] = [];
+		let wallet: IStartedDaemon | null = null;
+		try {
+			wallet = await startDaemon({
+				...OFFLINE,
+				mnemonic: MNEMONICS[3],
+				dataDir: dir,
+				listenPort: walletListen,
+				recoveryMode: 'quorum',
+				recoveryGuardians: entries,
+				onError: (e: IErrorEvent) => errors.push(e)
+			});
+			const walletPort = portOf(wallet);
+			await waitFor(async () => {
+				const s = await request(walletPort, 'GET', '/recovery/status');
+				return (
+					(s.body.result as { node: { gate: string } | null }).node?.gate ===
+					'confirmed'
+				);
+			});
+			// Confirmed, but the repair still holds the listener.
+			const heldInfo = (await request(walletPort, 'GET', '/info')).body
+				.result as IListenerInfo;
+			expect(heldInfo.listening).to.equal(false);
+			expect(heldInfo.listenError?.state).to.equal('held');
+
+			repairPending = false;
+			wallet.node.getNode().emit('node:ready');
+			await waitFor(
+				async () =>
+					(
+						(await request(walletPort, 'GET', '/info')).body
+							.result as IListenerInfo
+					).listening === true,
+				15_000
+			);
+			const boundInfo = (await request(walletPort, 'GET', '/info')).body
+				.result as IListenerInfo;
+			expect(boundInfo.listenPort).to.equal(walletListen);
+			expect(boundInfo.listenError).to.equal(undefined);
+			const uri = await request(walletPort, 'GET', '/node/uri');
+			expect(uri.status, JSON.stringify(uri.body)).to.equal(200);
+			expect(errors.filter((e) => e.code === 'LISTEN_FAILED')).to.have.length(
+				0
+			);
+		} finally {
+			LightningNode.prototype.listen = listen;
+			if (wallet) await wallet.stop();
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 });

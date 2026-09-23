@@ -3671,7 +3671,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				ListenerProblem: {
 					type: 'object',
 					description:
-						'Why a configured inbound listener is not bound; absent while it is. failed: the OS refused the bind (the port is taken or not permitted; errno names it), nothing retries it, and node:error LISTEN_FAILED was raised; restart once the port is free. held: a guardian recovery mode (async-remote, quorum) holds the bind under its startup quarantine until writer ownership is confirmed and any startup repair is receipted, and it binds then. fenced: another device owns this recovery namespace, so the listener stays down',
+						'Why a configured inbound listener is not bound; absent while it is. failed: the OS refused the bind (the port is taken or not permitted; errno names it), nothing retries it, and node:error LISTEN_FAILED was raised; restart once the port is free. held: a guardian recovery mode (async-remote, quorum) holds the bind under its startup quarantine until writer ownership is confirmed and any startup repair is receipted, and it binds then. fenced: another device owns this recovery namespace, so the listener stays down (the fence also closes one that was bound)',
 					properties: {
 						port: { type: 'integer', description: 'The port asked for' },
 						state: { type: 'string', enum: ['failed', 'held', 'fenced'] },

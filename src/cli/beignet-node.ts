@@ -3700,9 +3700,9 @@ export class BeignetNode extends EventEmitter {
 	 */
 	private relayRecoveryFenced(supersededBy: GuardianState | undefined): void {
 		this.stopRecoveryLeaseCheck();
-		// A held listener never binds on a fenced node: say so rather than
-		// report it held forever.
-		this.fenceHeldListeners();
+		// The fence closed every listener and a held one never binds: say so
+		// rather than report one bound or held forever.
+		this.fenceListeners();
 		if (this._recoveryFenceRelayed) return;
 		this._recoveryFenceRelayed = true;
 		this.emit('recovery:fenced', {
@@ -12564,6 +12564,15 @@ export class BeignetNode extends EventEmitter {
 			return;
 		}
 		if (stale()) return;
+		if (this.nodeFenced(node)) {
+			// A fence that landed as the bind resolved has closed it again.
+			this.setListenerProblem(kind, {
+				port,
+				state: 'fenced',
+				message: LISTENER_FENCED_MESSAGE
+			});
+			return;
+		}
 		const wasHeld = this.listenerProblem(kind)?.state === 'held';
 		if (kind === 'tcp') this._listenPort = port;
 		else this._websocketPort = port;
@@ -12669,7 +12678,7 @@ export class BeignetNode extends EventEmitter {
 		}
 		if (held.length === 0) return;
 		if (this.nodeFenced(this.node)) {
-			this.fenceHeldListeners();
+			this.fenceListeners();
 			return;
 		}
 		for (const [kind, port] of held) {
@@ -12677,13 +12686,23 @@ export class BeignetNode extends EventEmitter {
 		}
 	}
 
-	/** A held listener on a fenced node stays down: record it as fenced. */
-	private fenceHeldListeners(): void {
+	/**
+	 * A fenced node's listeners stay down: the hard freeze closed any bound
+	 * one before the fence was relayed, and a held one never binds. Record
+	 * both as fenced, and forget the bound port so no URI is handed out for
+	 * a socket nobody answers. A failed bind keeps its OS error.
+	 */
+	private fenceListeners(): void {
 		for (const kind of ['tcp', 'websocket'] as const) {
 			const problem = this.listenerProblem(kind);
-			if (problem?.state !== 'held') continue;
+			const bound = kind === 'tcp' ? this._listenPort : this._websocketPort;
+			const port =
+				bound ?? (problem?.state === 'held' ? problem.port : undefined);
+			if (port === undefined) continue;
+			if (kind === 'tcp') this._listenPort = undefined;
+			else this._websocketPort = undefined;
 			this.setListenerProblem(kind, {
-				port: problem.port,
+				port,
 				state: 'fenced',
 				message: LISTENER_FENCED_MESSAGE
 			});

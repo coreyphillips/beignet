@@ -70,7 +70,7 @@ export interface NodeInfo {
  * mode's startup quarantine refuses the bind until writer ownership is
  * confirmed and any startup repair is receipted, and it binds then.
  * `fenced`: another device owns this node's recovery namespace, so the
- * listener stays down.
+ * listener stays down (the fence also closes one that was bound).
  */
 export interface ListenerProblem {
 	/** The port that was asked for. */
