@@ -399,4 +399,50 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			'nothing rejected unhandled'
 		).to.deep.equal([]);
 	});
+
+	it('reads the rbf signal of each transaction on its own (issue #941)', async function () {
+		// The flag was shared by the whole batch, so every transaction formatted
+		// after one that signals replaceability was stored as rbf too. Coinbase
+		// style inputs keep this offline: they need no previous output lookup.
+		const withSequence = (
+			txid: string,
+			sequence: number
+		): ITransaction<IUtxo> => {
+			const answer = txAnswer(2) as unknown as {
+				param: string;
+				data: { tx_hash: string };
+				result: { hash: string; txid: string; vin: unknown[] };
+			};
+			return {
+				...answer,
+				param: txid,
+				data: { tx_hash: txid },
+				result: {
+					...answer.result,
+					hash: txid,
+					txid,
+					vin: [{ coinbase: '00', sequence }]
+				}
+			} as unknown as ITransaction<IUtxo>;
+		};
+		const SIGNALS = 'ee'.repeat(32);
+		const FINAL = 'ff'.repeat(32);
+
+		const res = await wallet.formatTransactions({
+			transactions: [
+				withSequence(SIGNALS, 0xfffffffd),
+				withSequence(FINAL, 0xffffffff)
+			]
+		});
+		expect(res.isOk(), 'the batch was formatted').to.equal(true);
+		if (res.isOk()) {
+			expect(res.value[SIGNALS].rbf, 'the signalling transaction').to.equal(
+				true
+			);
+			expect(
+				res.value[FINAL].rbf,
+				'a final transaction formatted after it'
+			).to.equal(false);
+		}
+	});
 });
