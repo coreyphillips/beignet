@@ -3103,6 +3103,16 @@ describe('Phase 4: Chain Watcher', () => {
 	});
 
 	describe('LightningNode integration', () => {
+		// The first require of lightning-node transpiles its whole import graph
+		// under ts-node: 3 to 11 s measured at a load average of 11 to 25, and
+		// past the 20 s suite timeout under heavier load, unless an earlier file
+		// in the same mocha worker already loaded it. Paid once here on its own
+		// budget rather than inside whichever test runs first (issue #947).
+		before(function (): void {
+			this.timeout(120_000);
+			require('../../src/lightning/node/lightning-node');
+		});
+
 		it('should accept chainBackend in INodeConfig', () => {
 			const {
 				LightningNode

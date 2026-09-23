@@ -130,7 +130,10 @@ describe('CLI direct funding with trailing local flags', function () {
 		expect(parsed.error?.code).to.equal('AMOUNT_REQUIRED');
 	});
 
-	it('sends a receipt recovery with no amount when only the flag follows the request', async () => {
+	it('sends a receipt recovery with no amount when only the flag follows the request', async function () {
+		// Two CLI children in one cell, each a full ts-node load of the CLI, so
+		// twice the per-child budget (issue #947).
+		this.timeout(240_000);
 		// Issue #767 review: --recover-receipt is a boolean flag, so with the
 		// optional amount omitted it became pos[3], went out as amountSats: null,
 		// and the daemon refused INVALID_PARAMS before any recovery ran. The

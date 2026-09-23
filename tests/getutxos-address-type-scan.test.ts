@@ -72,8 +72,12 @@ describe('getUtxos address-type scan', function () {
 		}
 	});
 
-	afterEach(function () {
+	afterEach(async function () {
 		sinon.restore();
+		// An Electrum instance polls its connection every 10 s until stopped,
+		// and this file shares its CI process with suites that stub or depend on
+		// rn-electrum-client's module-global state (issue #947).
+		await wallet?.stop({ refreshTimeout: 1000 });
 	});
 
 	it('still scans later address types when an earlier one has no addresses', async function () {
