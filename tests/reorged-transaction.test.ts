@@ -15,8 +15,10 @@
  * calls the check makes are stubbed, so this asserts on what the wallet does
  * with each answer a server can give for a reorg'd out transaction.
  *
- * The last case covers issue #872: a batched lookup that fails is not an
- * answer either, and dropping it stopped the monitoring that finds a reorg.
+ * The batched lookup case covers issue #872: a batched lookup that fails is
+ * not an answer either, and dropping it stopped the monitoring that finds a
+ * reorg. The last case covers issue #934: an entry the server answered with an
+ * error reaches the formatter too, and must be skipped there.
  */
 
 import { expect } from 'chai';
@@ -119,6 +121,33 @@ const txAnswer = (
 					weight: 561
 			  }
 	}) as unknown as ITransaction<IUtxo>;
+
+/**
+ * Run fn while observing unhandled promise rejections. Existing listeners
+ * (mocha's) are detached for the duration so the probe sees every event, then
+ * restored. A tick after fn lets a rejection it left behind surface.
+ */
+async function captureUnhandledRejections(
+	fn: () => Promise<void>
+): Promise<unknown[]> {
+	const prior = process.listeners('unhandledRejection');
+	process.removeAllListeners('unhandledRejection');
+	const seen: unknown[] = [];
+	const probe = (reason: unknown): void => {
+		seen.push(reason);
+	};
+	process.on('unhandledRejection', probe);
+	try {
+		await fn();
+		await new Promise((resolve) => setImmediate(resolve));
+	} finally {
+		process.removeListener('unhandledRejection', probe);
+		for (const listener of prior) {
+			process.on('unhandledRejection', listener);
+		}
+	}
+	return seen;
+}
 
 describe('a transaction the chain no longer holds (issue #863)', function () {
 	this.timeout(60000);
@@ -336,5 +365,38 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			messages.filter((m) => m.key === 'reorg' || m.key === 'rbf'),
 			'a failed batch is not a reorg'
 		).to.have.length(0);
+	});
+
+	it('skips an entry the server answered with an error when formatting (issue #934)', async function () {
+		// A history refresh hands every lookup answer to the formatter, and a
+		// server may answer one entry of a batch with an error and no result.
+		// Reading that entry's txid threw inside an unawaited async callback: an
+		// unhandled rejection, which terminates the process on Node >= 15.
+		const FAILED_TXID = 'cd'.repeat(32);
+		const failed = {
+			id: 1,
+			jsonrpc: '2.0',
+			param: FAILED_TXID,
+			data: { tx_hash: FAILED_TXID },
+			error: { code: 2, message: 'server overloaded' }
+		} as unknown as ITransaction<IUtxo>;
+
+		const rejections = await captureUnhandledRejections(async () => {
+			const res = await wallet.formatTransactions({
+				transactions: [failed, txAnswer(2)]
+			});
+			expect(res.isOk(), 'the batch was formatted').to.equal(true);
+			if (res.isOk()) {
+				expect(
+					Object.keys(res.value),
+					'the answered entry is formatted, the failed one skipped'
+				).to.deep.equal([TXID]);
+				expect(res.value[TXID].txid).to.equal(TXID);
+			}
+		});
+		expect(
+			rejections.map((reason) => String(reason)),
+			'nothing rejected unhandled'
+		).to.deep.equal([]);
 	});
 });

@@ -3827,8 +3827,10 @@ export class Wallet {
 		);
 
 		const formattedTransactions: IFormattedTransactions = {};
-		transactions.map(async ({ data, result }) => {
-			if (!result.txid) {
+		transactions.forEach(({ data, result }) => {
+			// An entry the server answered with an error carries no result
+			// (issue #934). Skip it and format the rest of the batch.
+			if (!result?.txid) {
 				return;
 			}
 
