@@ -320,10 +320,11 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		).to.contain('No route found');
 	});
 
-	it('owns the hash it is paying, so the async ledger cannot charge the same settlement', async () => {
+	it('charges the one settlement of a hash an async attempt also claims, and releases the rest', async () => {
 		// A payee that issued one preimage under a BOLT 11 invoice and again
 		// under the offer's invoice. The async attempt's claim and payOffer's
-		// own listener would otherwise both charge the single settlement.
+		// own claim are both on the hash; the handler in create() charges one
+		// settlement (issue #977).
 		const paymentHash = crypto.randomBytes(32);
 		internals(node).node.sendPayment = (): unknown => ({ status: 'PENDING' });
 		node.sendPaymentAsync(
@@ -350,10 +351,10 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		settle(node, payee.paymentHash, 3_000, 'COMPLETED');
 		await paid;
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
-		// The async attempt's HTLC is still out there and the engine reports
-		// nothing further for a hash it has marked completed, so its claim goes
-		// on holding budget rather than being handed back on this settlement.
-		expect(pending()).to.equal(3_000);
+		// The engine reports nothing further for a hash it has marked
+		// completed and refuses a re-send of it (#975), so nothing can ever
+		// charge the async attempt: its reservation goes with the settlement.
+		expect(pending()).to.equal(0);
 	});
 
 	it('rounds a sub-satoshi invoice up instead of letting it skip the limits', async () => {

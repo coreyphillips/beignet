@@ -213,7 +213,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `payInvoiceSafe(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `Promise<PaymentInfo>` | Like `payInvoice` but **never throws**: catches all errors and resolves with the hash's existing record when there is one (after a timeout with an HTLC still out, the `PENDING` record, which no further route is tried for and which is failed when that HTLC fails or its on-chain timeout resolves; for a duplicate refusal, the record the engine refused from) and otherwise with `status: 'FAILED'`. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
 | `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `{ paymentHash, status: 'PENDING' \| 'FAILED' }` | Fire-and-forget pay. Returns immediately, `FAILED` when the engine refused the submission outright (an expired invoice, an HTLC the channel would not take). Poll `getPayment()` for settlement. Drain mode and the spending limits are applied at submission, so it can throw `SERVICE_DRAINING` or `SPENDING_LIMIT_EXCEEDED`; the limits use the invoice's own amount whenever it carries one, since that is what gets paid. |
 | `payInvoiceWithRetry(bolt11, opts?)` | `Promise<RetryPaymentResult>` | Pay with exponential backoff retry. `opts: { maxRetries? (3), backoffMs? (2000), maxFeeSats?, amountSats?, metadata?, cltvLimit? }`. Emits `payment:retry` events. |
-| `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until it settles or its claim expires (24h). |
+| `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until that HTLC settles or fails back, or the 24h window ends; `getDailySpendInfo().pendingSats` shows what is held. |
 | `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. |
 | `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment |
 | `setPaymentMetadata(paymentHash, metadata)` | `void` | Attach key-value metadata to an existing payment |
@@ -705,13 +705,17 @@ comes back with it. A Lightning payment is charged when it settles, once,
 whichever path sent it (`payInvoice`, `sendKeysend`, `payOffer`,
 `sendPaymentAsync`), including a settle that lands after `payInvoice` gave up
 waiting or after a restart. Before this the counters were per-process, so
-every restart started the day at zero. Failed payments are not charged; a
-payment cancelled while its HTLC is out keeps holding its amount until it
-settles or its claim expires (24h).
+every restart started the day at zero. Failed payments are not charged, and
+a payment that fails with nothing left in flight gives its budget back at
+once. A payment cancelled while its HTLC is out keeps its budget held until
+that HTLC settles or fails back, or the 24h window ends: the HTLC cannot be
+retracted, and releasing the budget on the cancel would let it be spent
+twice. `getDailySpendInfo().pendingSats` is what in-flight payments hold,
+and `remainingSats` subtracts it, so it is what the next payment can pass.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getDailySpendInfo()` | `DailySpendInfo` | Current combined limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt }` plus the legacy `spentSats` field (equals `totalSats`) for back-compat |
+| `getDailySpendInfo()` | `DailySpendInfo` | Current combined limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, pendingSats, resetsAt }` plus the legacy `spentSats` field (equals `totalSats`) for back-compat |
 
 #### Drain Mode
 
@@ -961,7 +965,8 @@ interface ChannelHealth {
 interface DailySpendInfo {
   limitSats: number | null; // null if no limit configured
   spentSats: number;        // sats spent today (persisted; survives a restart within the UTC day)
-  remainingSats: number;    // sats remaining (Infinity if no limit)
+  remainingSats: number;    // sats the next payment can pass: limit minus spent minus pending (Infinity if no limit)
+  pendingSats: number;      // sats held by payments still in flight
   resetsAt: number;         // unix ms — next midnight UTC
 }
 
@@ -1413,7 +1418,7 @@ beignet fees
 
 beignet spend-limit
 # Combined LN + on-chain budget with breakdown (spentSats == totalSats, kept for back-compat):
-# {"ok":true,"result":{"limitSats":100000,"spentSats":2500,"remainingSats":97500,"resetsAt":...,"totalSats":2500,"lightningSats":1500,"onchainSats":1000}}
+# {"ok":true,"result":{"limitSats":100000,"spentSats":2500,"remainingSats":97500,"pendingSats":0,"resetsAt":...,"totalSats":2500,"lightningSats":1500,"onchainSats":1000}}
 
 beignet logs --category payment --limit 20
 # {"ok":true,"result":[{"category":"payment","action":"sent","timestamp":...,"data":{...}}]}
@@ -2140,7 +2145,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/queue/cancel` | `{ id }` | Cancel queued payment |
 | POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. |
 | POST | `/keysend/safe` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Keysend that never errors — resolves with `status: 'FAILED'` instead. |
-| GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat). Persisted: the figures survive a restart within the UTC day, and a payment that settles after a timeout or a restart is still counted once |
+| GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, pendingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat; `pendingSats` is what in-flight payments hold and `remainingSats` subtracts it). Persisted: the figures survive a restart within the UTC day, and a payment that settles after a timeout or a restart is still counted once |
 | GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |
 | POST | `/auth/keys/revoke` | `{ name }` | Disable a named API key immediately (admin scope; persisted, survives restarts) |
 | POST | `/auth/keys/rotate` | `{ name }` | Mint a new random secret for a named key; returned once, old secret dies immediately (admin scope; persisted) |

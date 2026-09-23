@@ -35,6 +35,7 @@ const MNEMONIC =
 
 type StubbedEngine = {
 	sendPayment: (...args: unknown[]) => unknown;
+	hasHtlcInFlight: (paymentHash: Buffer) => boolean;
 	emit: (event: string, info: unknown) => boolean;
 	createInvoice: (options: { amountMsat?: bigint; description?: string }) => {
 		bolt11: string;
@@ -67,6 +68,16 @@ const ageClaimsPastExpiry = (node: BeignetNode): void => {
 	for (const claims of internals(node)._asyncSpendClaims.values()) {
 		for (const claim of claims) claim.expiresAt = Date.now() - 1;
 	}
+};
+
+/**
+ * What the engine answers about the HTLCs behind a hash. A failure report
+ * with an HTLC still out (cancelPayment, the engine sweeps) keeps the claim
+ * reserved; the give-up report, sent once the last HTLC failed back, releases
+ * it (issue #977). Without a channel the real predicate answers false.
+ */
+const holdHtlcsInFlight = (node: BeignetNode, inFlight: boolean): void => {
+	internals(node).node.hasHtlcInFlight = (): boolean => inFlight;
 };
 
 /**
@@ -224,18 +235,39 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		expect(internals(node)._pendingSpendSats).to.equal(0);
 	});
 
-	it('keeps a failed payment claimed, because its HTLC can still settle', () => {
+	it('keeps a failed payment claimed while its HTLC can still settle', () => {
 		stubSendPayment(node);
 		const { paymentHash } = node.sendPaymentAsync(
 			node.createInvoice(3_000, 'fails').bolt11
 		);
 
+		// A failure report is not a retraction: cancelPayment() marks a
+		// payment FAILED with its HTLC still out there.
+		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
-		// A failure report is not a retraction: cancelPayment() and both engine
-		// sweeps mark a payment FAILED with its HTLC still out there.
 		expect(internals(node)._pendingSpendSats).to.equal(3_000);
 		expect(claimedSats(node, paymentHash)).to.equal(3_000);
 		expect(node.getDailySpendInfo().spentSats).to.equal(0);
+		expect(node.getDailySpendInfo().pendingSats).to.equal(3_000);
+	});
+
+	it("releases a failed payment's reservation once nothing is out for it", () => {
+		stubSendPayment(node);
+		const { paymentHash } = node.sendPaymentAsync(
+			node.createInvoice(3_000, 'gave up').bolt11
+		);
+		expect(internals(node)._pendingSpendSats).to.equal(3_000);
+
+		// The give-up report, once the last HTLC failed back: nothing can
+		// settle under the claim any more, so its budget comes back (issue
+		// #977). The record stays.
+		holdHtlcsInFlight(node, false);
+		settle(node, paymentHash, 3_000, 'FAILED');
+		expect(internals(node)._pendingSpendSats).to.equal(0);
+		expect(claimedSats(node, paymentHash)).to.equal(0);
+		expect(claimRecords(node, paymentHash)).to.equal(1);
+		expect(node.getDailySpendInfo().spentSats).to.equal(0);
+		expect(node.getDailySpendInfo().pendingSats).to.equal(0);
 	});
 
 	it('holds the daily budget a failed payment can still spend', () => {
@@ -243,6 +275,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		const cancelled = node.sendPaymentAsync(
 			node.createInvoice(5_000, 'cancelled').bolt11
 		);
+		holdHtlcsInFlight(node, true);
 		settle(node, cancelled.paymentHash, 5_000, 'FAILED');
 
 		const second = node.sendPaymentAsync(
@@ -266,6 +299,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		const { paymentHash } = node.sendPaymentAsync(
 			node.createInvoice(5_000, 'expires').bolt11
 		);
+		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 5_000, 'FAILED');
 		expect(internals(node)._pendingSpendSats).to.equal(5_000);
 
@@ -359,8 +393,10 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 
 		// What cancelPayment() does: the engine marks the payment failed, but
 		// its HTLC is still live and the preimage can still arrive.
+		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
 		expect(node.getDailySpendInfo().spentSats).to.equal(0);
+		expect(internals(node)._pendingSpendSats).to.equal(3_000);
 
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
@@ -371,10 +407,11 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		expect(internals(node)._pendingSpendSats).to.equal(0);
 	});
 
-	it('claims each dispatched attempt of a hash, and charges each settlement', () => {
+	it('claims each dispatched attempt of a hash, and one settlement releases the rest', () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'retried');
 		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
 
 		// Two HTLCs can be out there for one hash, and either can settle, so
@@ -383,10 +420,17 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		expect(claimedSats(node, paymentHash)).to.equal(6_000);
 		expect(internals(node)._pendingSpendSats).to.equal(6_000);
 
+		// The engine reports one settlement per hash and refuses a re-send of
+		// a paid hash (#975), so nothing can ever charge the other attempt:
+		// its reservation goes with this settlement (issue #977).
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
-		expect(claimedSats(node, paymentHash)).to.equal(3_000);
+		expect(claimedSats(node, paymentHash)).to.equal(0);
+		expect(internals(node)._pendingSpendSats).to.equal(0);
+		expect(claimRecords(node, paymentHash)).to.equal(1);
 
+		// A further report, which the engine never sends, still charges the
+		// record it left: one claim per report.
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		expect(node.getDailySpendInfo().spentSats).to.equal(6_000);
 		expect(internals(node)._pendingSpendSats).to.equal(0);
@@ -399,6 +443,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'refused retry');
 		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
 
 		// The retry dispatched nothing, so only its own claim goes: taking the
@@ -445,10 +490,11 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		expect(calls).to.have.length(0);
 	});
 
-	it('records a payInvoice retry once and leaves the async attempt claimed', async () => {
+	it("records a payInvoice retry once and releases the async attempt's reservation with it", async () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'blocking retry');
 		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
 		expect(claimedSats(node, paymentHash)).to.equal(3_000);
 
@@ -456,42 +502,49 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		// oldest claim still holding budget; payInvoice's own listener records
 		// nothing (issue #977).
 		const retried = node.payInvoice(bolt11, 5_000);
+		expect(internals(node)._pendingSpendSats).to.equal(6_000);
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		await retried;
 
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
-		// The async attempt's HTLC is still out there, and the engine reports
-		// nothing more for a hash it has marked completed, so nobody will ever
-		// tell us it settled. Discarding its claim on the retry's success handed
-		// back budget 3 000 sats could still leave on.
-		expect(claimedSats(node, paymentHash)).to.equal(3_000);
-		expect(internals(node)._pendingSpendSats).to.equal(3_000);
+		// The engine reports nothing more for a hash it has marked completed
+		// and refuses a re-send of it (#975), so nobody will ever charge the
+		// async attempt: its reservation goes with the settlement, its record
+		// stays for the boot reconciliation.
+		expect(claimedSats(node, paymentHash)).to.equal(0);
+		expect(internals(node)._pendingSpendSats).to.equal(0);
+		expect(claimRecords(node, paymentHash)).to.equal(1);
 	});
 
-	it('holds the budget of every attempt a blocking retry could not report', async () => {
+	it("releases every attempt's reservation when the blocking retry settles", async () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'retried twice');
 		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
 		node.sendPaymentAsync(bolt11);
 		settle(node, paymentHash, 3_000, 'FAILED');
 
 		const retried = node.payInvoice(bolt11, 5_000);
+		expect(internals(node)._pendingSpendSats).to.equal(9_000);
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		await retried;
 
-		// Three attempts dispatched and one reported: 6 000 sats can still go.
+		// Three attempts dispatched, one reported, and the hash cannot be
+		// paid again: the day carries the one settlement and nothing is held.
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
-		expect(internals(node)._pendingSpendSats).to.equal(6_000);
-		expect(() =>
-			node.sendPaymentAsync(node.createInvoice(2_000, 'on top').bolt11)
-		).to.throw('Daily spend limit exceeded');
+		expect(internals(node)._pendingSpendSats).to.equal(0);
+		expect(
+			node.sendPaymentAsync(node.createInvoice(2_000, 'on top').bolt11).status
+		).to.equal('PENDING');
+		expect(internals(node)._pendingSpendSats).to.equal(2_000);
 	});
 
-	it('keeps the async claim when the payInvoice retry does not settle', async () => {
+	it('keeps every claim of a hash while an HTLC is still out, whichever attempt failed', async () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'failed blocking retry');
 		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
 
 		const retried = node.payInvoice(bolt11, 5_000);
@@ -503,11 +556,13 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 			rejected = true;
 		}
 		expect(rejected).to.equal(true);
-		expect(claimedSats(node, paymentHash)).to.equal(3_000);
-		expect(internals(node)._pendingSpendSats).to.equal(3_000);
+		// In flight is judged per hash: while any HTLC of it is out, every
+		// claim on it stays whole, the failed retry's included.
+		expect(claimedSats(node, paymentHash)).to.equal(6_000);
+		expect(internals(node)._pendingSpendSats).to.equal(6_000);
 
-		// The hash is the async ledger's again, so the forwarding handler in
-		// create() charges the settlement the blocking call never saw.
+		// The forwarding handler in create() charges the settlement the
+		// blocking call never saw, and releases the rest.
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
 		expect(internals(node)._pendingSpendSats).to.equal(0);

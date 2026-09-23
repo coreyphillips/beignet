@@ -115,6 +115,14 @@ const storedLedger = (node: BeignetNode): PersistedDailySpendState | null => {
 	return raw === null ? null : (JSON.parse(raw) as PersistedDailySpendState);
 };
 
+/** Reserved sats the persisted row holds for a hash. */
+const storedReservedSats = (node: BeignetNode, hashHex: string): number =>
+	Object.entries(storedLedger(node)?.claims ?? {})
+		.filter(([hash]) => hash === hashHex)
+		.flatMap(([, list]) => list)
+		.filter((claim) => claim.reserved)
+		.reduce((total, claim) => total + claim.sats, 0);
+
 /** An invoice from somebody else, which is what a payment path is given. */
 const invoiceFrom = (
 	amountSats: number,
@@ -457,6 +465,75 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			repeatSettle(node, invoice.paymentHash);
 			expect(spent(node)).to.equal(1_000);
 		});
+
+		it('releases the reservation when the engine gives up after the timeout, charging nothing', async () => {
+			const invoice = invoiceFrom(1_000, 'gave up after the timeout');
+			stubSendPayment(node);
+			engineOf(node).hasHtlcInFlight = (hash): boolean =>
+				hash.equals(invoice.paymentHash);
+			expect(await rejectionOf(node.payInvoice(invoice.bolt11, 50))).to.equal(
+				'PAYMENT_TIMEOUT'
+			);
+			const held = node.getDailySpendInfo();
+			expect(held.pendingSats).to.equal(1_000);
+			expect(held.remainingSats).to.equal(LIMIT_SATS - 1_000);
+
+			// The last HTLC failed back and the engine gave up. Its report
+			// reaches only the handler in create(), the blocking listener
+			// being gone, and nothing is in flight for the hash any more.
+			engineOf(node).hasHtlcInFlight = (): boolean => false;
+			fail(node, invoice.paymentHash);
+			expect(node.getPayment(invoice.hashHex)?.status).to.equal('FAILED');
+			expect(pending(node)).to.equal(0);
+			expect(spent(node)).to.equal(0);
+			const released = node.getDailySpendInfo();
+			expect(released.pendingSats).to.equal(0);
+			expect(released.remainingSats).to.equal(LIMIT_SATS);
+			// The record stays in the row, unreserved.
+			expect(Object.keys(storedLedger(node)?.claims ?? {})).to.include(
+				invoice.hashHex
+			);
+			expect(storedReservedSats(node, invoice.hashHex)).to.equal(0);
+
+			// sendPaymentAsync, which never had a listener, releases the same
+			// way.
+			const async = invoiceFrom(2_000, 'async gave up');
+			expect(node.sendPaymentAsync(async.bolt11).status).to.equal('PENDING');
+			expect(pending(node)).to.equal(2_000);
+			fail(node, async.paymentHash);
+			expect(pending(node)).to.equal(0);
+			expect(spent(node)).to.equal(0);
+		});
+
+		it('releases a claim restored at boot when the engine gives up after the restart', async () => {
+			const invoice = invoiceFrom(1_000, 'gave up after the restart');
+			stubSendPayment(node);
+			engineOf(node).hasHtlcInFlight = (hash): boolean =>
+				hash.equals(invoice.paymentHash);
+			expect(await rejectionOf(node.payInvoice(invoice.bolt11, 50))).to.equal(
+				'PAYMENT_TIMEOUT'
+			);
+			persistRecord(node, invoice.paymentHash, PaymentStatus.PENDING);
+
+			await restart();
+			expect(pending(node)).to.equal(1_000);
+			expect(node.getDailySpendInfo().remainingSats).to.equal(
+				LIMIT_SATS - 1_000
+			);
+
+			// The give-up report after the restart: the real predicate finds
+			// nothing out for the hash.
+			fail(node, invoice.paymentHash);
+			expect(pending(node)).to.equal(0);
+			expect(spent(node)).to.equal(0);
+			expect(node.getDailySpendInfo().remainingSats).to.equal(LIMIT_SATS);
+			expect(storedReservedSats(node, invoice.hashHex)).to.equal(0);
+
+			// The release is in the ledger: the next boot holds nothing.
+			await restart();
+			expect(pending(node)).to.equal(0);
+			expect(node.getDailySpendInfo().remainingSats).to.equal(LIMIT_SATS);
+		});
 	});
 
 	describe('boot reconciliation of the stored claims', () => {
@@ -497,28 +574,32 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			const invoice = invoiceFrom(1_000, 'retried');
 			stubSendPayment(node);
 			expect(node.sendPaymentAsync(invoice.bolt11).status).to.equal('PENDING');
+			// The first attempt fails with its HTLC still out, so its claim
+			// stays; the retry claims beside it.
+			engineOf(node).hasHtlcInFlight = (): boolean => true;
 			fail(node, invoice.paymentHash);
-			// The retry claims beside the first attempt, whose HTLC may still
-			// be out there.
 			expect(node.sendPaymentAsync(invoice.bolt11).status).to.equal('PENDING');
 			expect(pending(node)).to.equal(2_000);
 
+			// One settlement per hash, and no re-send of a paid hash (#975):
+			// the other attempt's reservation goes with the charge, its record
+			// staying marked as belonging to a charged settlement.
 			settle(node, invoice.paymentHash);
 			expect(spent(node)).to.equal(1_000);
-			expect(pending(node)).to.equal(1_000);
+			expect(pending(node)).to.equal(0);
+			expect(claimedSats(node, invoice.hashHex)).to.equal(0);
 			persistRecord(node, invoice.paymentHash, PaymentStatus.COMPLETED);
 
-			// The remaining claim is marked as belonging to a settlement that
-			// was charged, so the boot sees a completed hash with nothing
-			// left to charge and restores the claim as a hold only.
+			// The boot sees a completed hash with nothing left to charge and
+			// restores the record without a reservation.
 			await restart();
 			expect(spent(node)).to.equal(1_000);
-			expect(pending(node)).to.equal(1_000);
-			expect(claimedSats(node, invoice.hashHex)).to.equal(1_000);
+			expect(pending(node)).to.equal(0);
+			expect(claimedSats(node, invoice.hashHex)).to.equal(0);
 
 			await restart();
 			expect(spent(node)).to.equal(1_000);
-			expect(pending(node)).to.equal(1_000);
+			expect(pending(node)).to.equal(0);
 		});
 	});
 
