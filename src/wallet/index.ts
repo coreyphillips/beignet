@@ -3473,7 +3473,7 @@ export class Wallet {
 	): Promise<Result<string>> {
 		try {
 			// What the check below looks up. An entry a refresh adds while it
-			// waits is in none of its results.
+			// waits is in none of its results, and both branches below keep it.
 			const observed = new Set(Object.keys(this.getUnconfirmedTransactions()));
 			const processRes = await this.processUnconfirmedTransactions();
 			if (processRes.isErr()) {
@@ -3510,7 +3510,12 @@ export class Wallet {
 				});
 				if (updated.isErr()) return err(updated.error.message);
 			} else {
-				this._data.unconfirmedTransactions = unconfirmedTxs;
+				// As on the ghost path, an entry a refresh added while this check
+				// waited is kept (issue #944).
+				this._data.unconfirmedTransactions = this.keepAddedMeanwhile(
+					unconfirmedTxs,
+					observed
+				);
 				const saved = await this.saveWalletData(
 					'unconfirmedTransactions',
 					this._data.unconfirmedTransactions
@@ -3742,6 +3747,32 @@ export class Wallet {
 	}
 
 	/**
+	 * What a check leaves under observation: the map it built, plus every entry
+	 * a refresh added while it waited. Such an entry is not among what the
+	 * check looked up, so it is in none of its results, and a record found
+	 * already in a block is not fetched again: this entry is all that would
+	 * notice a later reorg of it (issue #944). An entry the check did look up
+	 * keeps the check's copy, so one it dropped stays dropped. Read after the
+	 * check's last await, so an entry added during any of them is kept.
+	 * @private
+	 * @param {IFormattedTransactions} unconfirmedTxs The check's own map.
+	 * @param {Set<string>} observed Every transaction that check looked up.
+	 * @returns {IFormattedTransactions}
+	 */
+	private keepAddedMeanwhile(
+		unconfirmedTxs: IFormattedTransactions,
+		observed: Set<string>
+	): IFormattedTransactions {
+		const next: IFormattedTransactions = { ...unconfirmedTxs };
+		for (const [txid, transaction] of Object.entries(
+			this.getUnconfirmedTransactions()
+		)) {
+			if (!observed.has(txid)) next[txid] = transaction;
+		}
+		return next;
+	}
+
+	/**
 	 * Removes transactions from the store and activity list.
 	 * @private
 	 * @async
@@ -3790,16 +3821,8 @@ export class Wallet {
 			// The check's own map rather than the old one less these ghosts: a
 			// transaction the same round found back in the mempool is observed at
 			// zero from now on, where its old copy would report the same reorg
-			// again on the next check. An entry a refresh added while the check
-			// waited is not in that map, and is kept: a record found already in
-			// a block is not fetched again, so this entry is all that would
-			// notice a later reorg of it.
-			const next: IFormattedTransactions = { ...unconfirmedTxs };
-			for (const [txid, transaction] of Object.entries(
-				this.data.unconfirmedTransactions
-			)) {
-				if (!observed.has(txid)) next[txid] = transaction;
-			}
+			// again on the next check.
+			const next = this.keepAddedMeanwhile(unconfirmedTxs, observed);
 			this._data.unconfirmedTransactions = next;
 			// Their counted misses end here, with their observation, and not when
 			// the check found them: a ghost whose write failed above is still

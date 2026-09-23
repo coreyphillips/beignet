@@ -1310,6 +1310,79 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 		).to.equal(TIP);
 	});
 
+	it('keeps a transaction a refresh adds while a check without ghosts runs (issue #944)', async function () {
+		// The same race on the branch that finds no ghost: the check drops what
+		// it found buried, and must not drop what it never looked up.
+		sinon
+			.stub(wallet.electrum, 'getTransactions')
+			.callsFake(async ({ txHashes }: { txHashes: ITxHash[] }) => {
+				await (
+					wallet as unknown as TWalletInternals
+				).addUnconfirmedTransactions({
+					transactions: { [OTHER_TXID]: confirmedRecord(TIP, OTHER_TXID) }
+				});
+				return ok<IGetTransactions>({
+					error: false,
+					id: 0,
+					method: 'getTransactions',
+					network: 'bitcoinRegtest',
+					data: txHashes.map((h) => txAnswer(6, undefined, h.tx_hash))
+				});
+			});
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the check ran').to.equal(true);
+
+		expect(
+			wallet.getUnconfirmedTransactions()[TXID],
+			'the buried transaction leaves observation'
+		).to.equal(undefined);
+		expect(stored('unconfirmedTransactions')[TXID]).to.equal(undefined);
+		expect(
+			wallet.getUnconfirmedTransactions()[OTHER_TXID]?.height,
+			'the new transaction is still observed'
+		).to.equal(TIP);
+		expect(
+			stored('unconfirmedTransactions')[OTHER_TXID]?.height,
+			'after a restart too'
+		).to.equal(TIP);
+	});
+
+	it('keeps a transaction a refresh adds while the header path repairs a reorg (issue #944)', async function () {
+		// Added during the repair's own write, the last await before the map
+		// is replaced, so what is kept must be read after it.
+		type TRepairInternals = TWalletInternals & {
+			updateTransactionHeights: (txs: IUtxo[]) => Promise<Result<string>>;
+		};
+		const internals = wallet as unknown as TRepairInternals;
+		const repair = internals.updateTransactionHeights.bind(wallet);
+		sinon
+			.stub(internals, 'updateTransactionHeights')
+			.callsFake(async (txs: IUtxo[]) => {
+				const res = await repair(txs);
+				await internals.addUnconfirmedTransactions({
+					transactions: { [OTHER_TXID]: confirmedRecord(TIP, OTHER_TXID) }
+				});
+				return res;
+			});
+		answerWith(txAnswer(0));
+
+		const res = await wallet.checkUnconfirmedTransactions(true);
+		expect(res.isOk(), 'the check ran').to.equal(true);
+
+		expect(sent('reorg'), 'the reorg is reported once').to.have.length(1);
+		expect(stored('transactions')[TXID].height).to.equal(0);
+		expect(stored('unconfirmedTransactions')[TXID].height).to.equal(0);
+		expect(
+			wallet.getUnconfirmedTransactions()[OTHER_TXID]?.height,
+			'the new transaction is still observed'
+		).to.equal(TIP);
+		expect(
+			stored('unconfirmedTransactions')[OTHER_TXID]?.height,
+			'after a restart too'
+		).to.equal(TIP);
+	});
+
 	it('repairs a ghost transaction on the next check after a restart', async function () {
 		answerWith(noSuchTransaction());
 		stubRescan();
