@@ -136,22 +136,25 @@ describe('Auto-Funding Integration', function () {
 			let broadcastCalled = false;
 			let capturedAddress = '';
 			let capturedAmount = 0n;
+			let builtHex = '';
+			let broadcastHex = '';
 
 			const mockProvider: IFundingProvider = {
 				buildFundingTransaction: async (address, amountSats) => {
 					buildCalled = true;
 					capturedAddress = address;
 					capturedAmount = amountSats;
-					return buildMockFundingTx(address, Number(amountSats));
+					const built = buildMockFundingTx(address, Number(amountSats));
+					builtHex = built.txHex;
+					return built;
 				},
 				broadcastTransaction: async (txHex) => {
+					// Only record here: a failed expect in this callback becomes a
+					// node:error the listener below absorbs, so the checks live in
+					// the test body.
+					broadcastHex = txHex;
 					broadcastCalled = true;
-					expect(txHex).to.be.a('string');
-					expect(txHex.length).to.be.greaterThan(0);
-					// Verify it's valid hex
-					const tx = bitcoin.Transaction.fromHex(txHex);
-					expect(tx.outs.length).to.be.greaterThan(0);
-					return tx.getId();
+					return bitcoin.Transaction.fromHex(txHex).getId();
 				}
 			};
 
@@ -179,6 +182,8 @@ describe('Auto-Funding Integration', function () {
 				// bob responds with funding_signed, and then broadcast is called
 				// via the watch:funding listener
 				await settle(() => broadcastCalled);
+				// The node broadcasts the transaction the provider built.
+				expect(broadcastHex).to.equal(builtHex);
 
 				// Both nodes should have the channel
 				const aliceChannels = alice.listChannels();

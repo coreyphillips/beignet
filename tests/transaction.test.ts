@@ -48,7 +48,10 @@ describe('Transaction Test', function () {
 	});
 
 	after(async function () {
-		await wallet?.electrum?.disconnect();
+		// stop() rather than electrum.disconnect(): it never throws, and it
+		// keeps a refresh abandoned by refreshOrSkip from reconnecting after
+		// the suite is done (issue #947).
+		await wallet?.stop({ refreshTimeout: 5000 });
 	});
 
 	it('Should successfully create a wallet.', (): void => {
@@ -309,10 +312,9 @@ describe('Transaction CoinSelect Test', function (): void {
 	});
 
 	after(async function () {
-		// A skipped before leaves either nothing or the first suite's wallet
-		// here. stop() is safe on both and, unlike electrum.disconnect(), never
-		// throws and keeps a refresh abandoned by refreshOrSkip from
-		// reconnecting (issue #947).
+		// A skipped before leaves nothing, the first suite's already-stopped
+		// wallet, or this suite's own wallet with a refresh still running
+		// (refreshOrSkip). stop() is safe on all three (issue #947).
 		await wallet?.stop({ refreshTimeout: 5000 });
 	});
 
