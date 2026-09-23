@@ -277,3 +277,111 @@ describe('PaymentQueue', () => {
 		expect(pq.list()[0].status).to.equal('queued');
 	});
 });
+
+// Issue #981: the capacity check read the amount from amountSats alone. That
+// field is usually absent, the amount being in the invoice, so such an entry
+// was dispatched with no check at all and failed with "no route" where one
+// with amountSats waited. The owner now supplies the invoice's amount.
+describe('PaymentQueue checks capacity for an entry whose amount is only in its invoice (issue #981)', () => {
+	const settle = (ms = 20): Promise<void> =>
+		new Promise((resolve) => setTimeout(resolve, ms));
+
+	/** A started queue that records what it pays, decodes and checks. */
+	const build = (
+		invoiceAmountSats: (bolt11: string) => number | undefined
+	): {
+		pq: PaymentQueue;
+		payCalls: string[];
+		decodeCalls: string[];
+		canSendCalls: number[];
+		capacity: { canSend: boolean };
+	} => {
+		const payCalls: string[] = [];
+		const decodeCalls: string[] = [];
+		const canSendCalls: number[] = [];
+		const capacity = { canSend: false };
+		const pq = new PaymentQueue(
+			async (
+				bolt11: string
+			): Promise<{ status: string; paymentHash: string }> => {
+				payCalls.push(bolt11);
+				return { status: 'COMPLETED', paymentHash: 'paid' };
+			},
+			(amount: number): { canSend: boolean; availableSats: number } => {
+				canSendCalls.push(amount);
+				return { canSend: capacity.canSend, availableSats: 4_000 };
+			},
+			{
+				invoiceAmountSats: (bolt11: string): number | undefined => {
+					decodeCalls.push(bolt11);
+					return invoiceAmountSats(bolt11);
+				}
+			}
+		);
+		// Built by hand: poke() does nothing until start() has run.
+		pq.start();
+		return { pq, payCalls, decodeCalls, canSendCalls, capacity };
+	};
+
+	it('an invoice-amount entry waits while canSend refuses that amount, then dispatches once on poke()', async () => {
+		const { pq, payCalls, canSendCalls, capacity } = build(() => 5_000);
+		const entry = pq.enqueue('lnbc50u-invoice');
+		await settle();
+		expect(canSendCalls).to.deep.equal([5_000]);
+		expect(payCalls).to.deep.equal([]);
+		expect(pq.activePayments).to.equal(0);
+		expect(pq.list().find((e) => e.id === entry.id)?.status).to.equal('queued');
+
+		capacity.canSend = true;
+		pq.poke();
+		await settle();
+		expect(payCalls).to.deep.equal(['lnbc50u-invoice']);
+		expect(pq.list().find((e) => e.id === entry.id)?.status).to.equal(
+			'completed'
+		);
+	});
+
+	it('an entry enqueued with amountSats never consults the callback', async () => {
+		const { pq, payCalls, decodeCalls, canSendCalls } = build(() => 5_000);
+		pq.enqueue('lnbc-with-amount', 5, { amountSats: 3_000 });
+		pq.poke();
+		await settle();
+		expect(decodeCalls).to.deep.equal([]);
+		expect(canSendCalls).to.deep.equal([3_000, 3_000]);
+		expect(payCalls).to.deep.equal([]);
+	});
+
+	it('dispatches unchecked, as before, when the callback throws', async () => {
+		const { pq, payCalls, canSendCalls } = build(() => {
+			throw new Error('Invalid invoice');
+		});
+		pq.enqueue('not-an-invoice');
+		await settle();
+		expect(canSendCalls).to.deep.equal([]);
+		expect(payCalls).to.deep.equal(['not-an-invoice']);
+	});
+
+	it('dispatches unchecked, as before, when the callback answers no amount or anything but whole sats', async () => {
+		for (const answer of [undefined, 0, 1.5, -1, NaN, Infinity]) {
+			const { pq, payCalls, canSendCalls } = build(() => answer);
+			pq.enqueue(`lnbc-answer-${String(answer)}`);
+			await settle();
+			expect(canSendCalls, `answer ${String(answer)}`).to.deep.equal([]);
+			expect(payCalls, `answer ${String(answer)}`).to.deep.equal([
+				`lnbc-answer-${String(answer)}`
+			]);
+		}
+	});
+
+	it('consults the callback once per entry across repeated pokes', async () => {
+		const { pq, payCalls, decodeCalls, canSendCalls } = build(() => 5_000);
+		pq.enqueue('lnbc50u-invoice');
+		pq.poke();
+		pq.poke();
+		pq.poke();
+		await settle();
+		expect(decodeCalls).to.deep.equal(['lnbc50u-invoice']);
+		expect(canSendCalls).to.deep.equal([5_000, 5_000, 5_000, 5_000]);
+		expect(payCalls).to.deep.equal([]);
+	});
+});

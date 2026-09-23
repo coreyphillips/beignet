@@ -186,6 +186,57 @@ const queueEntryOnceFinal = async (
 	}
 };
 
+/**
+ * A restored channel of 1 000 000 sats with 900 000 on our side, by default
+ * waiting on its peer's channel_reestablish. NORMAL, it can carry the 1 000
+ * sat payments of this suite.
+ */
+const injectChannel = (
+	node: BeignetNode,
+	initial: ChannelState = ChannelState.AWAITING_REESTABLISH
+): Channel => {
+	const seed = crypto.randomBytes(32);
+	const basepoint = (i: number): Buffer =>
+		getPublicKey(
+			crypto
+				.createHash('sha256')
+				.update(seed)
+				.update(Buffer.from([i]))
+				.digest()
+		);
+	const state = createOpenerState({
+		temporaryChannelId: crypto.randomBytes(32),
+		fundingSatoshis: 1_000_000n,
+		pushMsat: 0n,
+		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+		localBasepoints: {
+			fundingPubkey: basepoint(0),
+			revocationBasepoint: basepoint(1),
+			paymentBasepoint: basepoint(2),
+			delayedPaymentBasepoint: basepoint(3),
+			htlcBasepoint: basepoint(4),
+			firstPerCommitmentPoint: Buffer.alloc(33)
+		},
+		localPerCommitmentSeed: seed
+	});
+	state.channelId = crypto.randomBytes(32);
+	state.state = initial;
+	state.fundingTxid = crypto.randomBytes(32);
+	state.localBalanceMsat = 900_000_000n;
+	state.remoteBalanceMsat = 100_000_000n;
+	const channel = new Channel(state);
+	const manager = node.getNode().getChannelManager() as unknown as {
+		channels: Map<string, Channel>;
+		channelPeers: Map<string, string>;
+	};
+	manager.channels.set(state.channelId.toString('hex'), channel);
+	manager.channelPeers.set(
+		state.channelId.toString('hex'),
+		'02'.padEnd(66, 'ab')
+	);
+	return channel;
+};
+
 describe('BeignetNode.resolveInterruptedPayment (issue #967)', function () {
 	this.timeout(30_000);
 
@@ -546,6 +597,9 @@ describe('A payment in flight at a restart is not paid again (issue #967)', func
 
 		const second = await bootNode(tmpDir);
 		try {
+			// A channel that can carry the unrelated payment: with none, it
+			// waits for capacity like any entry with an amount (issue #981).
+			injectChannel(second, ChannelState.NORMAL);
 			const payCalls = stubPayInvoiceSafe(second);
 			expect(second.listQueue().map((e) => e.id)).to.include('q-1-967');
 			// Before the fix this dispatched the restored row again: the
@@ -592,6 +646,9 @@ describe('A payment in flight at a restart is not paid again (issue #967)', func
 
 		const second = await bootNode(tmpDir);
 		try {
+			// A channel that can carry both payments: with none, they wait
+			// for capacity like any entry with an amount (issue #981).
+			injectChannel(second, ChannelState.NORMAL);
 			const payCalls = stubPayInvoiceSafe(second);
 			// Only builds the queue: nothing is enqueued in this run.
 			second.listQueue();
@@ -676,48 +733,7 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 	/** A restored channel, by default waiting on its peer's channel_reestablish. */
 	const injectReestablishingChannel = (
 		initial: ChannelState = ChannelState.AWAITING_REESTABLISH
-	): Channel => {
-		const seed = crypto.randomBytes(32);
-		const basepoint = (i: number): Buffer =>
-			getPublicKey(
-				crypto
-					.createHash('sha256')
-					.update(seed)
-					.update(Buffer.from([i]))
-					.digest()
-			);
-		const state = createOpenerState({
-			temporaryChannelId: crypto.randomBytes(32),
-			fundingSatoshis: 1_000_000n,
-			pushMsat: 0n,
-			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
-			localBasepoints: {
-				fundingPubkey: basepoint(0),
-				revocationBasepoint: basepoint(1),
-				paymentBasepoint: basepoint(2),
-				delayedPaymentBasepoint: basepoint(3),
-				htlcBasepoint: basepoint(4),
-				firstPerCommitmentPoint: Buffer.alloc(33)
-			},
-			localPerCommitmentSeed: seed
-		});
-		state.channelId = crypto.randomBytes(32);
-		state.state = initial;
-		state.fundingTxid = crypto.randomBytes(32);
-		state.localBalanceMsat = 900_000_000n;
-		state.remoteBalanceMsat = 100_000_000n;
-		const channel = new Channel(state);
-		const manager = node.getNode().getChannelManager() as unknown as {
-			channels: Map<string, Channel>;
-			channelPeers: Map<string, string>;
-		};
-		manager.channels.set(state.channelId.toString('hex'), channel);
-		manager.channelPeers.set(
-			state.channelId.toString('hex'),
-			'02'.padEnd(66, 'ab')
-		);
-		return channel;
-	};
+	): Channel => injectChannel(node, initial);
 
 	// Review round 1: node:ready fires once the peers' init handshakes are
 	// done, before channel_reestablish. Started then, the queue sent a
@@ -797,6 +813,42 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 			.getNode()
 			.getChannelManager()
 			.emit('channel:reestablished', channel.getChannelId());
+
+		expect((await queueEntryOnceFinal(node, entry.id)).status).to.equal(
+			'completed'
+		);
+		expect(payCalls).to.deep.equal([invoice.bolt11]);
+	});
+
+	// Issue #981: the queue read the amount from amountSats alone, so an
+	// entry whose amount was only in its invoice was dispatched with no
+	// capacity check and failed with "no route" where one with amountSats
+	// waited. BeignetNode now hands the queue the invoice's amount.
+	it('an entry whose amount is only in its invoice waits for capacity for that amount, and dispatches once the channel can carry it (issue #981)', async () => {
+		const payCalls = stubPayInvoiceSafe(node);
+		const channel = injectReestablishingChannel(ChannelState.NORMAL);
+		const state = (
+			channel as unknown as { _state: { localBalanceMsat: bigint } }
+		)._state;
+		// The channel can carry an HTLC, but not one of 100 000 sats.
+		state.localBalanceMsat = 50_000_000n;
+		node.listQueue();
+		await node.getNode().waitForReady(1_000);
+		await settle();
+
+		const invoice = invoiceFrom('amount only in the invoice', 100_000);
+		const entry = node.enqueuePayment(invoice.bolt11);
+		await settle();
+		expect(payCalls).to.deep.equal([]);
+		expect(node.listQueue().find((e) => e.id === entry.id)?.status).to.equal(
+			'queued'
+		);
+
+		// The channel's balance grows (an inbound payment settled, say).
+		state.localBalanceMsat = 900_000_000n;
+		node.emit('channel:usable', {
+			channelId: channel.getChannelId().toString('hex')
+		});
 
 		expect((await queueEntryOnceFinal(node, entry.id)).status).to.equal(
 			'completed'
@@ -922,8 +974,9 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 		seedQueued('q-1-last-close', invoice.bolt11);
 		const payCalls = stubPayInvoiceSafe(node);
 
-		node.listQueue();
+		const start = sinon.spy(node.getPaymentQueue(), 'start');
 		await settle(200);
+		expect(start.callCount).to.equal(0);
 		expect(payCalls).to.deep.equal([]);
 
 		setState(channel, ChannelState.FORCE_CLOSED);
@@ -931,13 +984,17 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 			channelId: channel.getChannelId(),
 			initiator: 'remote'
 		});
+		await settle(200);
 
-		// No live channel is left, so the queue starts and the payment fails
-		// (here: the stub completes it) on its own terms.
-		expect((await queueEntryOnceFinal(node, 'q-1-last-close')).status).to.equal(
-			'completed'
-		);
-		expect(payCalls).to.deep.equal([invoice.bolt11]);
+		// No live channel is left, so the queue starts rather than wait for
+		// one for good. The restored row, whose amount is in its invoice,
+		// then waits for capacity like any entry with an amount, instead of
+		// being sent into "no route" unchecked (issue #981).
+		expect(start.callCount).to.equal(1);
+		expect(payCalls).to.deep.equal([]);
+		expect(
+			node.listQueue().find((e) => e.id === 'q-1-last-close')?.status
+		).to.equal('queued');
 	});
 
 	// Review round 2 (P3).

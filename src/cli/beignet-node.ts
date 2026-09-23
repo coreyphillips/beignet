@@ -12227,9 +12227,18 @@ export class BeignetNode extends EventEmitter {
 					(this.node as LightningNode | undefined)
 						? this.canSend(amount)
 						: { canSend: false, availableSats: 0 },
-				// A restored entry that was in flight is settled against the
-				// node's record before anything sends it again (issue #967).
-				{ resolveInterrupted: (b) => this.resolveInterruptedPayment(b) },
+				{
+					// A restored entry that was in flight is settled against
+					// the node's record before anything sends it again (issue
+					// #967).
+					resolveInterrupted: (b) => this.resolveInterruptedPayment(b),
+					// The capacity check for an entry whose amount is only in
+					// its invoice uses that amount, rounded up to whole sats
+					// as payInvoice admits it (issue #981). A string that does
+					// not decode throws, which the queue takes as no amount.
+					invoiceAmountSats: (b) =>
+						paymentSpendSats(decodeInvoiceInput(b).amountMsat)
+				},
 				this.liveQueueStorage()
 			);
 			// First built after shutdown began, while the database stays open
