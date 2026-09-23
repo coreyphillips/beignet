@@ -364,7 +364,7 @@ curl "http://localhost:2112/channel/health?channelId=abc123..." \
 
 ### Duplicate payment protection
 
-Retrying the same invoice while the payment is still `PENDING` will throw `DUPLICATE_PAYMENT`. The correct pattern: check the payment status first, use `waitForPayment()` if still pending.
+Retrying the same invoice while the payment is still `PENDING`, while any HTLC it sent is still out (a payment that timed out at the wall clock is not over until its HTLC resolves), or after it completed will throw `DUPLICATE_PAYMENT`; a paid invoice is never paid twice. `payInvoiceSafe()` returns the existing record instead of throwing. A failed attempt can be sent again. The correct pattern: check the payment status first, use `waitForPayment()` if still pending.
 
 ### Method comparison
 

@@ -15436,15 +15436,10 @@ export class LightningNode extends EventEmitter {
 	): IPaymentInfo {
 		const invoice = decodeInvoice(invoiceStr);
 
-		// Payment deduplication: reject duplicate in-flight payments (Fix 1.4)
+		// Payment deduplication (Fix 1.4, widened by issue #975): a hash whose
+		// payment completed, or that still has an HTLC out, is not paid again.
+		this.assertHashUnpaid(invoice.paymentHash);
 		const dedupHashHex = invoice.paymentHash.toString('hex');
-		const existingPayment = this.payments.get(dedupHashHex);
-		if (existingPayment && existingPayment.status === PaymentStatus.PENDING) {
-			throw new LightningPaymentError(
-				LightningErrorCode.DUPLICATE_PAYMENT,
-				'Payment already in flight for this invoice'
-			);
-		}
 
 		// Absolute outgoing expiry ceiling (issue #737). A retry re-enters here
 		// without the argument; the ceiling it was first sent under rides the
@@ -26816,17 +26811,11 @@ export class LightningNode extends EventEmitter {
 			throw new Error('BOLT 12 invoice missing required fields');
 		}
 
-		// Payment deduplication, as in sendPayment: a second dispatch for a
-		// hash still in flight would fight the first attempt's retry context
-		// and in-flight record.
-		const dedupHashHex = invoice.paymentHash.toString('hex');
-		const existingPayment = this.payments.get(dedupHashHex);
-		if (existingPayment && existingPayment.status === PaymentStatus.PENDING) {
-			throw new LightningPaymentError(
-				LightningErrorCode.DUPLICATE_PAYMENT,
-				'Payment already in flight for this invoice'
-			);
-		}
+		// Payment deduplication, as in sendPayment: a hash whose payment
+		// completed, or that still has an HTLC out, is not paid again (issue
+		// #975), and a second dispatch for a hash still in flight would fight
+		// the first attempt's retry context and in-flight record.
+		this.assertHashUnpaid(invoice.paymentHash);
 
 		const destination = invoice.nodeId;
 		const amountMsat = invoice.amount;
@@ -27384,6 +27373,66 @@ export class LightningNode extends EventEmitter {
 			status: payment.status,
 			failureCode: payment.failureCode
 		});
+	}
+
+	/**
+	 * Refuse to send for a hash this node must not pay again (issue #975).
+	 * Judged from what the HTLCs did, not from the record's status alone: a
+	 * COMPLETED or FAILED record used to pass the dedup check, so paying the
+	 * same invoice twice paid twice, and a record FAILED by a wall clock
+	 * (failPayment on a timeout) while its HTLC was still offered got a
+	 * second HTLC beside the first, which could still settle.
+	 *
+	 * Refused, in this order, all as DUPLICATE_PAYMENT:
+	 * - completed: the HTLC view knows the preimage or the OUTGOING record is
+	 *   COMPLETED. The view reports a preimage only for a hash this node
+	 *   offered an HTLC for or holds an OUTGOING record for, so the preimage
+	 *   of this node's own invoice does not read as a payment made;
+	 * - in flight: some offered HTLC for the hash is not terminal ('offered',
+	 *   or 'onchain-pending' on a channel that went to chain), or the
+	 *   in-memory record is PENDING (a record exists before any HTLC does).
+	 *   A 'failed' HTLC does NOT count as in flight, terminal or not: the
+	 *   retry path re-enters the senders right after the peer's
+	 *   update_fail_htlc, before the removal round completes, and a peer
+	 *   that failed an HTLC cannot fulfil it, so refusing there would refuse
+	 *   every retry;
+	 * - completed, from the durable row: the in-memory record and preimage
+	 *   are pruned 24 hours after completion (and oldest first past the size
+	 *   cap), while storage keeps the row. One synchronous read per send;
+	 *   only an OUTGOING row that is COMPLETED or carries a preimage counts,
+	 *   as for the payment queue's resolver (#967).
+	 */
+	private assertHashUnpaid(paymentHash: Buffer): void {
+		const hashHex = paymentHash.toString('hex');
+		const completed = (): LightningPaymentError =>
+			new LightningPaymentError(
+				LightningErrorCode.DUPLICATE_PAYMENT,
+				'Payment already completed for this invoice'
+			);
+		const view = this.getOutgoingHtlcs(paymentHash);
+		if (view.preimage || view.status === PaymentStatus.COMPLETED) {
+			throw completed();
+		}
+		const existingPayment = this.payments.get(hashHex);
+		if (
+			view.htlcs.some(
+				(h) => h.state === 'offered' || h.state === 'onchain-pending'
+			) ||
+			existingPayment?.status === PaymentStatus.PENDING
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.DUPLICATE_PAYMENT,
+				'Payment already in flight for this invoice'
+			);
+		}
+		const durable = this.storage?.loadPayment(hashHex);
+		if (
+			durable?.direction === PaymentDirection.OUTGOING &&
+			(durable.status === PaymentStatus.COMPLETED ||
+				durable.preimage !== undefined)
+		) {
+			throw completed();
+		}
 	}
 
 	/**

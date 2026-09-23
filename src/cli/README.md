@@ -1186,7 +1186,7 @@ not repeat a 4xx unchanged.
 | `INVALID_INVOICE` | Payments | 400 | BOLT 11 string failed to parse |
 | `INVALID_OFFER` | Payments | 400 | BOLT 12 offer string failed to parse |
 | `INSUFFICIENT_BALANCE` | Payments | 409 | Not enough balance to send, or to fund the requested open |
-| `DUPLICATE_PAYMENT` | Payments | 409 | Payment with this hash already pending |
+| `DUPLICATE_PAYMENT` | Payments | 409 | Payment with this hash already completed, or still has an HTLC out; `payInvoiceSafe` returns the existing record instead |
 | `SPENDING_LIMIT_EXCEEDED` | Payments | 403 | Daily spending limit exceeded (permanent) |
 | `CHANNEL_NOT_FOUND` | Channels | 404 | Channel ID does not exist |
 | `CHANNEL_NOT_READY` | Channels | 409 | Channel is not in NORMAL state |
@@ -1246,7 +1246,7 @@ try {
   if (err instanceof LightningPaymentError) {
     switch (err.code) {
       case LightningErrorCode.NO_ROUTE:         // No path to destination
-      case LightningErrorCode.DUPLICATE_PAYMENT: // Payment hash already in-flight
+      case LightningErrorCode.DUPLICATE_PAYMENT: // Payment hash already paid or in-flight
       case LightningErrorCode.NO_CHANNEL_TO_HOP: // No channel to first hop peer
       case LightningErrorCode.FEE_EXCEEDS_MAX:   // Route fee exceeds maxFeeMsat
       case LightningErrorCode.MISSING_AMOUNT:     // Amount-less invoice with no amount

@@ -6,8 +6,22 @@
  */
 
 import { expect } from 'chai';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { BeignetNode } from '../../src/cli/beignet-node';
 import { BeignetError, BeignetErrorCode } from '../../src/cli/errors';
 import { PaymentInfo } from '../../src/cli/types';
+import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import {
+	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+	Network
+} from '../../src/lightning/invoice/types';
+import {
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 
 /**
  * Since BeignetNode.create() requires real Electrum/wallet, we test the
@@ -164,9 +178,106 @@ describe('payInvoiceSafe — Never Throws', () => {
 
 	// ─── Verify BeignetNode.payInvoiceSafe method exists ───
 
-	it('BeignetNode.prototype.payInvoiceSafe exists', async function () {
-		this.timeout(10_000);
-		const { BeignetNode } = await import('../../src/cli/beignet-node');
+	it('BeignetNode.prototype.payInvoiceSafe exists', () => {
 		expect(typeof BeignetNode.prototype.payInvoiceSafe).to.equal('function');
+	});
+});
+
+// Same rationale as tests/cli/payment-queue-restart.test.ts: a refused
+// loopback connect returns instantly, where the regtest default is a public
+// host.
+const OFFLINE_ELECTRUM = {
+	electrumHost: '127.0.0.1',
+	electrumPort: 65529,
+	electrumTls: false
+};
+
+const MNEMONIC =
+	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+/** An invoice from somebody else, for a preimage the test knows. */
+const invoiceFrom = (
+	description: string
+): { bolt11: string; paymentHash: Buffer; preimage: Buffer } => {
+	const preimage = crypto.randomBytes(32);
+	const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+	return {
+		bolt11: encodeInvoice({
+			network: Network.REGTEST,
+			amountMsat: 1_000_000n,
+			timestamp: Math.floor(Date.now() / 1000),
+			paymentHash,
+			paymentSecret: crypto.randomBytes(32),
+			description,
+			expiry: 3600,
+			minFinalCltvExpiry: DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+			privateKey: crypto
+				.createHash('sha256')
+				.update(Buffer.from(`payee-${description}`))
+				.digest()
+		}),
+		paymentHash,
+		preimage
+	};
+};
+
+/**
+ * Issue #975: the engine refuses to pay a hash whose durable OUTGOING row
+ * says it was paid, and the in-memory record is pruned 24 hours after
+ * completion while that row stays. payInvoiceSafe used to answer such a
+ * refusal with a synthetic FAILED record, since it read memory only.
+ */
+describe('payInvoiceSafe answers a pruned paid hash with its durable record (issue #975)', function () {
+	this.timeout(30_000);
+
+	let tmpDir: string;
+	let node: BeignetNode;
+
+	before(async () => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-safe-durable-'));
+		node = await BeignetNode.create({
+			mnemonic: MNEMONIC,
+			network: 'regtest',
+			dataDir: tmpDir,
+			logLevel: 'silent',
+			rapidGossipSync: false,
+			autoGossipSync: false,
+			...OFFLINE_ELECTRUM
+		});
+	});
+
+	after(async () => {
+		await node?.destroy();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	it('returns the COMPLETED record, preimage included, when only storage holds it', async () => {
+		const { bolt11, paymentHash, preimage } = invoiceFrom('pruned paid');
+		const hashHex = paymentHash.toString('hex');
+		node.getStorage().savePayment(hashHex, {
+			paymentHash,
+			preimage,
+			amountMsat: 1_000_000n,
+			status: PaymentStatus.COMPLETED,
+			direction: PaymentDirection.OUTGOING,
+			createdAt: Date.now() - 2_000,
+			completedAt: Date.now() - 1_000
+		});
+		expect(node.getPayment(hashHex), 'memory holds nothing').to.equal(null);
+
+		const result = await node.payInvoiceSafe(bolt11, 2_000);
+		expect(result.paymentHash).to.equal(hashHex);
+		expect(result.status).to.equal('COMPLETED');
+		expect(result.direction).to.equal('OUTGOING');
+		expect(result.preimage).to.equal(preimage.toString('hex'));
+		expect(result.failureDescription).to.equal(undefined);
+	});
+
+	it('still returns a synthetic FAILED record for a hash nothing knows', async () => {
+		const { bolt11, paymentHash } = invoiceFrom('unknown');
+		const result = await node.payInvoiceSafe(bolt11, 2_000);
+		expect(result.paymentHash).to.equal(paymentHash.toString('hex'));
+		expect(result.status).to.equal('FAILED');
+		expect(result.failureDescription ?? '').to.match(/^\[[A-Z_]+\]/);
 	});
 });

@@ -9575,9 +9575,11 @@ export class BeignetNode extends EventEmitter {
 		// records, counting one payment twice.
 		//
 		// The claims a fire-and-forget attempt on this hash already holds stay
-		// where they are, reservations and all. This attempt adds an HTLC to
-		// the ones already out there rather than replacing them, and the engine
-		// reports at most one of them settling (it emits nothing further for a
+		// where they are, reservations and all. The engine refuses this
+		// attempt while any HTLC of that one is still out or once it paid
+		// (#975); when it does dispatch, its HTLC is a new one beside the
+		// resolved ones rather than a replacement, and the engine reports at
+		// most one settlement for the hash (it emits nothing further for a
 		// hash it has marked completed), so the rest have to go on holding
 		// budget on their own account.
 		this._acquireBlockingPayment(paymentHashHex);
@@ -9749,10 +9751,22 @@ export class BeignetNode extends EventEmitter {
 				/* bolt11 is malformed — use defaults */
 			}
 
-			// Return persisted record if available
+			// Return persisted record if available. The in-memory record is
+			// pruned 24 hours after completion (oldest first past the size cap)
+			// while the durable row stays, and the engine refuses to pay a hash
+			// whose row says it was paid (#975), so a refused re-send of a
+			// pruned paid invoice answers with its COMPLETED record rather than
+			// a synthetic failure. A row that cannot be read (the database is
+			// closed) is no record: this method never throws.
 			if (hashHex !== 'unknown') {
 				const existing = this.getPayment(hashHex);
 				if (existing) return existing;
+				try {
+					const durable = this.storage.loadPayment(hashHex);
+					if (durable) return this.toPaymentInfo(durable);
+				} catch {
+					/* fall through to the synthetic record */
+				}
 			}
 
 			const message = err instanceof Error ? err.message : String(err);
@@ -11990,11 +12004,11 @@ export class BeignetNode extends EventEmitter {
 	 * How a payment the payment queue was dispatching when the process last
 	 * stopped ended, from this node's own record for its invoice (issue
 	 * #967). The queue's resolver for such an entry: it must know this before
-	 * sending the invoice again, since sendPayment refuses a second payment
-	 * to a hash only while the first is PENDING. A COMPLETED one would be
-	 * paid again with a new HTLC, and a PENDING one would come back from
-	 * payInvoiceSafe as that record and be marked failed although it may
-	 * still complete.
+	 * sending the invoice again. The engine refuses to pay a hash that was
+	 * paid or still has an HTLC out (#975), so a re-send can no longer pay
+	 * twice, but it would come back from payInvoiceSafe as the old record,
+	 * a PENDING one marked failed although it may still complete; this
+	 * resolver waits for the outcome instead.
 	 *
 	 * Resolves once every HTLC the node offered for the hash is terminal,
 	 * which for one stuck at a peer can take until its expiry. 'completed'
