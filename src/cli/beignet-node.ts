@@ -1030,10 +1030,11 @@ export interface AsyncSpendClaim {
 /**
  * How long a dispatched async payment keeps HOLDING daily budget. The hold has
  * to outlive the payment's own FAILED report: BOLT 2 has no way to retract an
- * update_add_htlc, so cancelPayment(), the engine's stuck-payment sweep and its
- * expired-invoice sweep all mark a payment failed while its HTLC is still live,
- * and the engine deliberately completes such a payment when the preimage turns
- * up. One full daily window is where the hold ends, because by then the budget
+ * update_add_htlc, so cancelPayment() marks a payment failed while its HTLC is
+ * still live (the payment timeouts and the expired-invoice sweep leave such a
+ * payment PENDING since #976), and the engine deliberately completes such a
+ * payment when the preimage turns up. One full daily window is where the hold
+ * ends, because by then the budget
  * the payment was admitted against has itself rolled over.
  *
  * This is emphatically not a claim that the HTLC is dead by then — routing
@@ -4598,6 +4599,10 @@ export class BeignetNode extends EventEmitter {
 			if (this.paymentQueue) {
 				this.whenReadyToPay(() => {
 					this.paymentQueue?.start();
+					// An entry whose outcome the torn-down node could not
+					// answer is asked about again on the rebuilt one (issue
+					// #976).
+					this.paymentQueue?.resettle();
 					this.paymentQueue?.poke();
 				});
 			}
@@ -9592,6 +9597,41 @@ export class BeignetNode extends EventEmitter {
 		return height + cltvLimit;
 	}
 
+	/**
+	 * The PAYMENT_TIMEOUT a blocking payment rejects with once its wait is
+	 * over, after failing the record only when nothing is out for it (issue
+	 * #976). BOLT 2 has no way to retract an update_add_htlc: an HTLC still
+	 * offered can settle after the clock, so such a record stays PENDING
+	 * until it resolves rather than reading FAILED in between, and the
+	 * message says so, because a caller that reads a timeout as a failure
+	 * and pays again is refused (#975) but must not be told it failed. No
+	 * further route is tried for it: the engine freezes its retries, so a
+	 * later update_fail_htlc ends it (FAILED, payment:failed) rather than
+	 * dispatching a retry outside this call's admission and accounting; an
+	 * HTLC whose on-chain timeout resolves ends it the same way. A ghost
+	 * record, with no HTLC out, is failed as before.
+	 */
+	private _paymentTimeout(
+		paymentHash: Buffer,
+		what: 'Payment' | 'Keysend',
+		timeoutMs: number
+	): BeignetError {
+		const failed = this.node.failPaymentUnlessInFlight(paymentHash);
+		return new BeignetError(
+			'PAYMENT_TIMEOUT',
+			failed
+				? `${what} timed out after ${timeoutMs}ms`
+				: `${what} timed out after ${timeoutMs}ms; an HTLC is still in flight and the payment stays PENDING until it resolves; no further route is tried after the timeout`
+		);
+	}
+
+	/**
+	 * Pay a BOLT 11 invoice and wait for its outcome, at most timeoutMs. At
+	 * the timeout the payment is failed only when no HTLC is out for it; with
+	 * one still in flight the record stays PENDING until that HTLC resolves,
+	 * and the PAYMENT_TIMEOUT says so (issue #976). A hash that was paid or
+	 * still has an HTLC out is refused as DUPLICATE_PAYMENT (#975).
+	 */
 	async payInvoice(
 		bolt11: string,
 		timeoutMs = 60_000,
@@ -9684,14 +9724,9 @@ export class BeignetNode extends EventEmitter {
 			const timer = setTimeout(() => {
 				cleanup();
 				releaseReservation();
-				// Clean up the ghost payment to free channel capacity
-				this.node.failPayment(decoded.paymentHash);
-				reject(
-					new BeignetError(
-						'PAYMENT_TIMEOUT',
-						`Payment timed out after ${timeoutMs}ms`
-					)
-				);
+				// A ghost payment is failed to free its capacity; one with an
+				// HTLC still out stays PENDING (issue #976).
+				reject(this._paymentTimeout(decoded.paymentHash, 'Payment', timeoutMs));
 			}, timeoutMs);
 
 			const cleanup = (): void => {
@@ -9784,6 +9819,14 @@ export class BeignetNode extends EventEmitter {
 		});
 	}
 
+	/**
+	 * payInvoice that never throws. A refused or failed payment comes back
+	 * as the hash's existing record when there is one: after a timeout with
+	 * an HTLC still out, the PENDING record, which stays PENDING until the
+	 * HTLC resolves (issue #976); for a duplicate refusal, the record the
+	 * engine refused from, the durable row included (#975). Otherwise a
+	 * synthetic FAILED record whose failureDescription carries the code.
+	 */
 	async payInvoiceSafe(
 		bolt11: string,
 		timeoutMs = 60_000,
@@ -10110,13 +10153,7 @@ export class BeignetNode extends EventEmitter {
 			const timer = setTimeout(() => {
 				cleanup();
 				releaseReservation();
-				this.node.failPayment(result.paymentHash);
-				reject(
-					new BeignetError(
-						'PAYMENT_TIMEOUT',
-						`Keysend timed out after ${timeoutMs}ms`
-					)
-				);
+				reject(this._paymentTimeout(result.paymentHash, 'Keysend', timeoutMs));
 			}, timeoutMs);
 
 			const cleanup = (): void => {
@@ -11102,12 +11139,8 @@ export class BeignetNode extends EventEmitter {
 			const timer = setTimeout(() => {
 				cleanup();
 				releaseReservation();
-				this.node.failPayment(bolt12Invoice.paymentHash);
 				reject(
-					new BeignetError(
-						'PAYMENT_TIMEOUT',
-						`Payment timed out after ${timeoutMs}ms`
-					)
+					this._paymentTimeout(bolt12Invoice.paymentHash, 'Payment', timeoutMs)
 				);
 			}, timeoutMs);
 
@@ -12085,14 +12118,15 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Payment Queue ───────────────
 
 	/**
-	 * How a payment the payment queue was dispatching when the process last
-	 * stopped ended, from this node's own record for its invoice (issue
-	 * #967). The queue's resolver for such an entry: it must know this before
-	 * sending the invoice again. The engine refuses to pay a hash that was
-	 * paid or still has an HTLC out (#975), so a re-send can no longer pay
-	 * twice, but it would come back from payInvoiceSafe as the old record,
-	 * a PENDING one marked failed although it may still complete; this
-	 * resolver waits for the outcome instead.
+	 * How a payment the payment queue was dispatching ended, from this
+	 * node's own record for its invoice: one the process stopped during
+	 * (issue #967), or one whose HTLC was still out when the queue's own
+	 * payment timeout fired (issue #976). The queue's resolver for such an
+	 * entry: it must know this before sending the invoice again or recording
+	 * a verdict. The engine refuses to pay a hash that was paid or still has
+	 * an HTLC out (#975), so a re-send can no longer pay twice, but it would
+	 * come back from payInvoiceSafe as the old record, PENDING while its
+	 * HTLC is out; this resolver waits for the outcome instead.
 	 *
 	 * Resolves once every HTLC the node offered for the hash is terminal,
 	 * which for one stuck at a peer can take until its expiry. 'completed'
