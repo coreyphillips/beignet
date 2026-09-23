@@ -3316,10 +3316,11 @@ export class Wallet {
 		// Records the ghost path cleared before this lookup went out, with their
 		// clearing counts. Only these may be read as back below, and only if the
 		// count has not moved: a clearing that lands while the lookup is in
-		// flight, from a check beside this refresh, rests on a newer answer than
-		// this one and must stand. That holds for a record cleared again after a
-		// concurrent refresh found it back, whose flag alone looks unchanged
-		// (issue #945).
+		// flight, from a check beside this refresh, may rest on a newer answer
+		// than this one, so it stands, and the next refresh reads the record
+		// again if the transaction really is back. That holds for a record
+		// cleared again after a concurrent refresh found it back, whose flag
+		// alone looks unchanged (issue #945).
 		const clearedBeforeLookup = new Map(
 			filteredTxHashes
 				.filter((tx) => this.data.transactions[tx.tx_hash]?.exists === false)
@@ -3854,6 +3855,16 @@ export class Wallet {
 			// zero from now on, where its old copy would report the same reorg
 			// again on the next check.
 			const next = this.keepAddedMeanwhile(unconfirmedTxs, observed);
+			// A refresh that ran during the write above may have been served one
+			// of these ghosts, read it as back and watched it again. Its record no
+			// longer reads cleared, and dropping its entry would leave it held and
+			// unwatched, so a later loss would never show. The next check judges
+			// it again instead (issue #945).
+			for (const txId of txIds) {
+				const live = this.data.unconfirmedTransactions[txId];
+				const record = this.data.transactions[txId];
+				if (live && record && record.exists !== false) next[txId] = live;
+			}
 			this._data.unconfirmedTransactions = next;
 			// Their counted misses end here, with their observation, and not when
 			// the check found them: a ghost whose write failed above is still

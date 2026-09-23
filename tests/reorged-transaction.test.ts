@@ -697,6 +697,55 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				'each removal is reported once'
 			).to.have.length(2);
 		});
+
+		it('keeps watching one a refresh finds back during its removal', async function () {
+			wallet.data.transactions[TXID] = mempoolRecord();
+			wallet.data.unconfirmedTransactions[TXID] = mempoolRecord();
+			let served = false;
+			serveWhile(() => served);
+			const save = wallet.saveWalletData.bind(wallet);
+			let refreshed = false;
+			const saveBesideRefresh = async (
+				key: keyof IWalletData,
+				data: IWalletData[keyof IWalletData]
+			): Promise<Result<string>> => {
+				const saving = save(key, data);
+				// The check's write of the cleared record. While it is in flight, a
+				// refresh reaches a server that serves the transaction, such as
+				// after a failover, and finds it back.
+				if (
+					key === 'transactions' &&
+					!refreshed &&
+					wallet.transactions[TXID].exists === false
+				) {
+					refreshed = true;
+					served = true;
+					await wallet.updateTransactions({});
+					expect(wallet.transactions[TXID].exists, 'back').to.equal(true);
+				}
+				return saving;
+			};
+			sinon.stub(wallet, 'saveWalletData').callsFake(saveBesideRefresh);
+
+			await wallet.checkUnconfirmedTransactions();
+			expect(wallet.transactions[TXID].exists, 'held').to.equal(true);
+			expect(
+				wallet.getUnconfirmedTransactions()[TXID],
+				'so still observed'
+			).to.not.equal(undefined);
+			expect(savedUnconfirmed()[TXID], 'as a restart reads it').to.not.equal(
+				undefined
+			);
+
+			// Lost again and gone from the history: only the observation can
+			// notice, and a held record nothing watches would stay pending.
+			served = false;
+			(wallet.electrum.getAddressHistory as sinon.SinonStub).resolves(ok([]));
+			const res = await wallet.updateTransactions({});
+			expect(res.isOk(), 'the refresh ran').to.equal(true);
+			expect(wallet.transactions[TXID].exists, 'lost again').to.equal(false);
+			expect(savedTransactions()[TXID].exists).to.equal(false);
+		});
 	});
 
 	/**
