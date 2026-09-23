@@ -3380,7 +3380,7 @@ export class Wallet {
 	 * This method processes all transactions with less than 6 confirmations and returns the following:
 	 * 1. Transactions that still have less than 6 confirmations and can be considered unconfirmed. (unconfirmedTxs)
 	 * 2. Transactions that have fewer confirmations than before due to a reorg. (outdatedTxs)
-	 * 3. Transactions that have been removed from the mempool. (ghostTxs)
+	 * 3. Transactions the server no longer has in the mempool or the chain. (ghostTxs)
 	 * @private
 	 * @async
 	 * @returns {Promise<Result<TProcessUnconfirmedTransactions>>}
@@ -3409,10 +3409,34 @@ export class Wallet {
 			const outdatedTxs: IUtxo[] = []; //Transactions that have been pushed back into the mempool due to a reorg. We need to update the height.
 			const ghostTxs: string[] = []; //Transactions that have been removed from the mempool and are no longer in the blockchain.
 			const answered = new Set<string>();
+			const tipHeight = this.data.header?.height ?? 0;
 			txs.value.data.forEach((txData: ITransaction<IUtxo>) => {
 				answered.add(txData.data.tx_hash);
+				// The block this wallet last saw the transaction in, zero for none.
+				// The main record counts as well: a repair whose write was lost
+				// leaves the lost block there, while after a restart the copy
+				// observed here may already read zero (issue #870).
+				const oldHeight = Math.max(
+					oldUnconfirmedTxs[txData.data.tx_hash]?.height ?? 0,
+					this.data.transactions[txData.data.tx_hash]?.height ?? 0
+				);
 				// Check if the transaction has been removed from the mempool/still exists.
-				if (!this.electrum.transactionExists(txData)) {
+				if (
+					!this.electrum.transactionExists(txData) ||
+					// A node without a txindex searches only its mempool, and electrs
+					// finds a confirmed transaction only in blocks it has indexed.
+					// So that miss says nothing about a transaction never seen in a
+					// block: one mined into a block electrs has not indexed yet gets
+					// it too. And it counts only two blocks under the tip, since a
+					// failover commonly lands on a server a block behind, and a
+					// height written from a confirmation count runs a block low
+					// (confirmationsToBlockHeight). A record nearer the tip keeps its
+					// entry below and is asked about again on the next refresh
+					// (issue #871).
+					(oldHeight > 0 &&
+						oldHeight < tipHeight - 1 &&
+						this.electrum.transactionMissingWithoutTxindex(txData))
+				) {
 					//Transaction may have been removed/bumped from the mempool or potentially reorg'd out.
 					ghostTxs.push(txData.data.tx_hash);
 					return;
@@ -3434,13 +3458,6 @@ export class Wallet {
 					// confirmationsToBlockHeight, which answers the current TIP for
 					// zero confirmations: that is above every stored height, so the
 					// comparison never fired and the reorg went unseen (issue #863).
-					// The main record counts as well: a repair whose write was lost
-					// leaves the lost block there, while after a restart the copy
-					// observed here may already read zero (issue #870).
-					const oldHeight = Math.max(
-						oldUnconfirmedTxs[txData.data.tx_hash]?.height ?? 0,
-						this.data.transactions[txData.data.tx_hash]?.height ?? 0
-					);
 					if (oldHeight > 0) {
 						//Transaction was reorg'd back to zero confirmations. Add it to the outdatedTxs array.
 						outdatedTxs.push(txData.data);
@@ -3551,10 +3568,12 @@ export class Wallet {
 			txIds.forEach((txId) => {
 				if (txId in transactions) {
 					transactions[txId]['exists'] = false;
-					// A server without a txindex answers "no such transaction" for a
-					// reorg'd out transaction instead of one with no confirmations, so
-					// this is where that reorg lands. The block it was found in is
-					// gone with it (issue #863).
+					// A reorg'd out transaction no mempool took back is answered "no
+					// such transaction" rather than with no confirmations: by a server
+					// with a txindex always, and by electrs on a node without one for
+					// a record seen in a block two or more under the tip (issue
+					// #871). So this is where that reorg lands, and the block it was
+					// found in is gone with it (issue #863).
 					transactions[txId].height = 0;
 					delete transactions[txId].blockhash;
 					delete transactions[txId].confirmTimestamp;

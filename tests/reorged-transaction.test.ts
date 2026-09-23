@@ -17,8 +17,11 @@
  *
  * The batched lookup case covers issue #872: a batched lookup that fails is
  * not an answer either, and dropping it stopped the monitoring that finds a
- * reorg. The last case covers issue #934: an entry the server answered with an
- * error reaches the formatter too, and must be skipped there.
+ * reorg. The formatter cases cover issues #934 and #941: an entry the server
+ * answered with an error reaches the formatter too, and must be skipped
+ * there. The cases after them cover issue #871: a node without a txindex
+ * answers a transaction in no block and not in its mempool in words of its
+ * own.
  */
 
 import { expect } from 'chai';
@@ -73,6 +76,20 @@ const BLOCK_HASH =
 	'0f2b1a4c6e8d0f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a';
 const REORGED_HEIGHT = 190;
 const TIP = 191;
+
+// Bitcoin Core's answers for a transaction it cannot find, which electrs
+// relays unchanged with code 2. Every one ends in the same hint.
+const WALLET_HINT = ' Use gettransaction for wallet transactions.';
+/** With a txindex: in no block and not in the mempool. */
+const TXINDEX_MISS = `No such mempool or blockchain transaction.${WALLET_HINT}`;
+/** Without a txindex: not in the mempool, the only place such a node looks. */
+const NO_TXINDEX_MISS = `No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries.${WALLET_HINT}`;
+/** The same from Core before 0.17. */
+const OLD_NO_TXINDEX_MISS = `No such mempool transaction. Use -txindex to enable blockchain transaction queries.${WALLET_HINT}`;
+/** With a txindex still being built: says nothing about the chain. */
+const STILL_INDEXING = `No such mempool transaction. Blockchain transactions are still in the process of being indexed.${WALLET_HINT}`;
+/** The no-txindex answer inside the daemon error an ElectrumX or Fulcrum returns. */
+const WRAPPED_NO_TXINDEX_MISS = `daemon error: DaemonError({'code': -5, 'message': '${NO_TXINDEX_MISS}'})`;
 
 /** The wallet's stored record of the receive, as it looked when confirmed. */
 const confirmedRecord = (
@@ -196,8 +213,11 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		wallet.data.unconfirmedTransactions[TXID] = confirmedRecord(REORGED_HEIGHT);
 	});
 
-	afterEach(function () {
+	afterEach(async function () {
 		sinon.restore();
+		// Every Electrum instance polls its connection until stopped, and a
+		// wallet left running keeps calling the shared client other suites stub.
+		await wallet?.stop();
 	});
 
 	/** The stored transactions as they were last written to storage. */
@@ -262,15 +282,10 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		expect(persisted[TXID].blockhash).to.equal(undefined);
 	});
 
-	it('clears the height when a server without a txindex loses the transaction', async function () {
-		// No txindex: a reorg'd out transaction is not "unconfirmed", it is
-		// unknown, and the ghost path handles it instead.
-		answerWith(
-			txAnswer(undefined, {
-				code: 2,
-				message: 'No such mempool or blockchain transaction'
-			})
-		);
+	it('clears the height when a server with a txindex loses the transaction', async function () {
+		// A reorg'd out transaction no mempool took back is not "unconfirmed",
+		// it is unknown, and the ghost path handles it instead.
+		answerWith(txAnswer(undefined, { code: 2, message: TXINDEX_MISS }));
 		// The rescan the ghost path fires needs a server; the record is the subject.
 		sinon.stub(wallet, 'rescanAddresses').resolves(ok(wallet.data));
 
@@ -453,6 +468,190 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			).to.equal(false);
 		}
 	});
+
+	/**
+	 * Issue #871: a node without a txindex searches only its mempool, and its
+	 * "no such transaction" was not read as a miss at all, so a transaction
+	 * reorged out of the chain and out of every mempool stayed confirmed.
+	 * electrs finds a confirmed transaction in its own index first, but only in
+	 * blocks it has indexed, so the answer is a miss only for a record already
+	 * seen in a block safely below the tip.
+	 */
+	describe('a node without a txindex (issue #871)', function () {
+		const tipAt = (height: number): void => {
+			wallet.data.header = { height, hash: '', hex: '' };
+		};
+
+		const miss = (message: string): ITransaction<IUtxo> =>
+			txAnswer(undefined, { code: 2, message });
+
+		const stubRescan = (): sinon.SinonStub =>
+			sinon.stub(wallet, 'rescanAddresses').resolves(ok(wallet.data));
+
+		/** The record is where it was, still observed, and nothing was sent. */
+		const expectKept = (
+			rescan: sinon.SinonStub,
+			height = REORGED_HEIGHT
+		): void => {
+			const stored = wallet.transactions[TXID];
+			expect(stored.exists, 'still held').to.equal(true);
+			expect(stored.height, 'at the height it was found at').to.equal(height);
+			expect(
+				wallet.getUnconfirmedTransactions()[TXID]?.height,
+				'and still observed, so the next refresh asks again'
+			).to.equal(height);
+			expect(
+				messages.filter((m) => m.key === 'reorg' || m.key === 'rbf'),
+				'nothing was reported'
+			).to.have.length(0);
+			expect(rescan.callCount, 'and nothing rescanned').to.equal(0);
+		};
+
+		beforeEach(function () {
+			// Two blocks past the record: even a server a block behind has it.
+			tipAt(REORGED_HEIGHT + 2);
+		});
+
+		it('clears the height when the node has it in neither a block nor its mempool', async function () {
+			answerWith(miss(NO_TXINDEX_MISS));
+			const rescan = stubRescan();
+
+			const res = await wallet.checkUnconfirmedTransactions();
+			expect(res.isOk(), 'the check ran').to.equal(true);
+
+			const stored = wallet.transactions[TXID];
+			expect(stored.exists, 'the chain does not have it').to.equal(false);
+			expect(
+				stored.height,
+				'so neither does the height it was found at'
+			).to.equal(0);
+			expect(stored.blockhash).to.equal(undefined);
+			expect(stored.confirmTimestamp).to.equal(undefined);
+			expect(
+				wallet.getUnconfirmedTransactions()[TXID],
+				'and it is no longer observed'
+			).to.equal(undefined);
+			expect(savedTransactions()[TXID].exists).to.equal(false);
+			expect(savedTransactions()[TXID].height).to.equal(0);
+			expect(savedUnconfirmed()[TXID]).to.equal(undefined);
+
+			const rbf = messages.filter((m) => m.key === 'rbf');
+			expect(rbf, 'the removal is reported once').to.have.length(1);
+			expect(rbf[0].data).to.deep.equal([TXID]);
+			expect(messages.filter((m) => m.key === 'reorg')).to.have.length(0);
+			expect(rescan.callCount, 'and the balance rescanned').to.equal(1);
+		});
+
+		it('clears a record a lost write left confirmed (issue #870)', async function () {
+			// The main record still names the block while the observed copy
+			// already reads zero. The main record is evidence of that block too.
+			wallet.data.unconfirmedTransactions[TXID] = confirmedRecord(0);
+			answerWith(miss(NO_TXINDEX_MISS));
+			stubRescan();
+
+			await wallet.checkUnconfirmedTransactions();
+
+			expect(wallet.transactions[TXID].exists).to.equal(false);
+			expect(wallet.transactions[TXID].height).to.equal(0);
+			expect(savedTransactions()[TXID].height).to.equal(0);
+		});
+
+		it('waits for the tip to pass a block a lagging server may not hold yet', async function () {
+			// A failover commonly lands on a server a block behind, whose
+			// electrs has not indexed the newest block while its node has
+			// already taken the transaction out of its mempool. Heights written
+			// from a confirmation count also run a block low. So a record at the
+			// tip or one block under it is asked about again, not cleared.
+			answerWith(miss(NO_TXINDEX_MISS));
+			const rescan = stubRescan();
+
+			for (const tip of [REORGED_HEIGHT, REORGED_HEIGHT + 1]) {
+				tipAt(tip);
+				const res = await wallet.checkUnconfirmedTransactions();
+				expect(res.isOk(), `the check ran at tip ${tip}`).to.equal(true);
+				expectKept(rescan);
+			}
+
+			tipAt(REORGED_HEIGHT + 2);
+			await wallet.checkUnconfirmedTransactions();
+			expect(
+				wallet.transactions[TXID].exists,
+				'once the tip has moved on, the miss is final'
+			).to.equal(false);
+			expect(wallet.transactions[TXID].height).to.equal(0);
+			expect(rescan.callCount).to.equal(1);
+		});
+
+		it('keeps a transaction never seen in a block', async function () {
+			// The same answer is what a transaction mined into a block electrs
+			// has not indexed yet gets, so for one this wallet has only seen in
+			// the mempool (height 0, or -1 with unconfirmed parents) it says
+			// nothing about the chain.
+			answerWith(miss(NO_TXINDEX_MISS));
+			const rescan = stubRescan();
+
+			for (const height of [0, -1]) {
+				wallet.data.transactions[TXID] = confirmedRecord(height);
+				wallet.data.unconfirmedTransactions[TXID] = confirmedRecord(height);
+				await wallet.checkUnconfirmedTransactions();
+				expectKept(rescan, height);
+			}
+		});
+
+		it('does not read a txindex still being built as a miss', async function () {
+			answerWith(miss(STILL_INDEXING));
+			const rescan = stubRescan();
+
+			await wallet.checkUnconfirmedTransactions();
+
+			expectKept(rescan);
+			expect(wallet.transactions[TXID].blockhash).to.equal(BLOCK_HASH);
+		});
+
+		it('does not read a wrapped daemon error as a miss', async function () {
+			// A server that wraps daemon errors needs a txindex. Pointed at a
+			// node without one, it would report every confirmed transaction as
+			// missing, so only the unwrapped answer counts.
+			answerWith(miss(WRAPPED_NO_TXINDEX_MISS));
+			const rescan = stubRescan();
+
+			await wallet.checkUnconfirmedTransactions();
+
+			expectKept(rescan);
+		});
+
+		it('does not read the miss before the wallet knows a tip', async function () {
+			tipAt(0);
+			answerWith(miss(NO_TXINDEX_MISS));
+			const rescan = stubRescan();
+
+			await wallet.checkUnconfirmedTransactions();
+
+			expectKept(rescan);
+		});
+
+		it('tells that answer apart from every other', function () {
+			const table: Array<[string, ITransaction<IUtxo>, boolean]> = [
+				['the no-txindex miss', miss(NO_TXINDEX_MISS), true],
+				[
+					'the no-txindex miss before Core 0.17',
+					miss(OLD_NO_TXINDEX_MISS),
+					true
+				],
+				['the txindex miss', miss(TXINDEX_MISS), false],
+				['a txindex still being built', miss(STILL_INDEXING), false],
+				['a wrapped daemon error', miss(WRAPPED_NO_TXINDEX_MISS), false],
+				['a busy server', miss('server overloaded'), false],
+				['an answer with no error', txAnswer(2), false]
+			];
+			for (const [what, answer, expected] of table) {
+				expect(
+					wallet.electrum.transactionMissingWithoutTxindex(answer),
+					what
+				).to.equal(expected);
+			}
+		});
+	});
 });
 
 /**
@@ -588,15 +787,7 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 		messages.filter((m) => m.key === key);
 
 	const noSuchTransaction = (txid = TXID): ITransaction<IUtxo> =>
-		txAnswer(
-			undefined,
-			{
-				code: 2,
-				message:
-					'No such mempool or blockchain transaction. Use gettransaction for wallet transactions.'
-			},
-			txid
-		);
+		txAnswer(undefined, { code: 2, message: TXINDEX_MISS }, txid);
 
 	beforeEach(async function () {
 		store.clear();

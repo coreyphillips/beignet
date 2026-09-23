@@ -330,6 +330,31 @@ describe('ElectrumBackend — Call Timeouts', () => {
 			expect(err.message).to.include('No hex data');
 		});
 
+		// Issue #871: electrs asks a node without a txindex this way about a
+		// transaction in no block it has indexed yet, so this answer is also
+		// what its index lagging a block behind looks like. The wallet reads it
+		// as a miss only for a record seen confirmed well below the tip; here it
+		// has not said no.
+		it('is unavailable when a node without a txindex has no mempool copy', async () => {
+			const err = await failure(() =>
+				Promise.resolve({
+					isErr: () => false,
+					value: {
+						data: [
+							{
+								error: {
+									code: 2,
+									message:
+										'No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.'
+								}
+							}
+						]
+					}
+				})
+			);
+			expect(err).to.be.instanceOf(ChainBackendUnavailableError);
+		});
+
 		it('is unavailable when the server answered with some other error', async () => {
 			const err = await failure(() =>
 				Promise.resolve({
