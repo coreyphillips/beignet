@@ -495,11 +495,16 @@ export class Wallet {
 	}
 
 	static async create(params: IWallet): Promise<Result<Wallet>> {
+		// Outside the try, so the catch can reach a wallet the constructor built.
+		let wallet: Wallet | undefined;
 		try {
-			const wallet = new Wallet(params);
+			wallet = new Wallet(params);
 			if (wallet._disableMessagesOnCreate) wallet.disableMessages = true;
 			const res = await wallet.setWalletData();
-			if (res.isErr()) return err(res.error.message);
+			if (res.isErr()) {
+				await wallet._abandonFailedCreate();
+				return err(res.error.message);
+			}
 			void wallet.updateFeeEstimates(true);
 			// A host that owns the startup refresh (and must hold its ONE
 			// promise, e.g. BeignetNode.waitForInitialSync) opts out here so
@@ -507,7 +512,33 @@ export class Wallet {
 			if (!wallet._disableRefreshOnCreate) void wallet.refreshWallet({});
 			return ok(wallet);
 		} catch (e) {
+			if (wallet) await wallet._abandonFailedCreate();
 			return err(e);
+		}
+	}
+
+	/**
+	 * Silences and stops a wallet Wallet.create is about to report as failed
+	 * (issue #966). The constructor has already started the Electrum
+	 * connection poll, and the caller never receives this instance, so nothing
+	 * else could ever stop it: it would go on connecting, calling onMessage
+	 * for a wallet the caller was told does not exist, and keeping the process
+	 * alive.
+	 *
+	 * Never throws. A teardown that fails is logged, so the caller still gets
+	 * the error that failed the create rather than this one.
+	 * @private
+	 * @returns {Promise<void>}
+	 */
+	private async _abandonFailedCreate(): Promise<void> {
+		this.disableMessages = true;
+		try {
+			await this.electrum.abandon();
+		} catch (e) {
+			this.logger.warn(
+				'Unable to stop the Electrum connection of a wallet that failed to create.',
+				e
+			);
 		}
 	}
 
