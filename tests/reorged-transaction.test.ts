@@ -17,8 +17,11 @@
  *
  * The batched lookup case covers issue #872: a batched lookup that fails is
  * not an answer either, and dropping it stopped the monitoring that finds a
- * reorg. The last case covers issue #934: an entry the server answered with an
- * error reaches the formatter too, and must be skipped there.
+ * reorg. The formatter cases cover issues #934 and #941: an entry the server
+ * answered with an error reaches the formatter too, and must be skipped
+ * there. The cases after them cover issue #871: a node without a txindex
+ * answers a transaction in no block and not in its mempool in words of its
+ * own.
  */
 
 import { expect } from 'chai';
@@ -37,13 +40,17 @@ import {
 	EAvailableNetworks,
 	EPaymentType,
 	EProtocol,
+	err,
 	IFormattedTransaction,
 	IGetTransactions,
 	ITransaction,
+	ITxHash,
 	IUtxo,
 	IWalletData,
 	ok,
+	Result,
 	TMessageDataMap,
+	TStorage,
 	Wallet
 } from '../src';
 
@@ -70,8 +77,25 @@ const BLOCK_HASH =
 const REORGED_HEIGHT = 190;
 const TIP = 191;
 
+// Bitcoin Core's answers for a transaction it cannot find, which electrs
+// relays unchanged with code 2. Every one ends in the same hint.
+const WALLET_HINT = ' Use gettransaction for wallet transactions.';
+/** With a txindex: in no block and not in the mempool. */
+const TXINDEX_MISS = `No such mempool or blockchain transaction.${WALLET_HINT}`;
+/** Without a txindex: not in the mempool, the only place such a node looks. */
+const NO_TXINDEX_MISS = `No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries.${WALLET_HINT}`;
+/** The same from Core before 0.17. */
+const OLD_NO_TXINDEX_MISS = `No such mempool transaction. Use -txindex to enable blockchain transaction queries.${WALLET_HINT}`;
+/** With a txindex still being built: says nothing about the chain. */
+const STILL_INDEXING = `No such mempool transaction. Blockchain transactions are still in the process of being indexed.${WALLET_HINT}`;
+/** The no-txindex answer inside the daemon error an ElectrumX or Fulcrum returns. */
+const WRAPPED_NO_TXINDEX_MISS = `daemon error: DaemonError({'code': -5, 'message': '${NO_TXINDEX_MISS}'})`;
+
 /** The wallet's stored record of the receive, as it looked when confirmed. */
-const confirmedRecord = (height: number): IFormattedTransaction => ({
+const confirmedRecord = (
+	height: number,
+	txid = TXID
+): IFormattedTransaction => ({
 	address: 'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080',
 	blockhash: BLOCK_HASH,
 	height,
@@ -84,7 +108,7 @@ const confirmedRecord = (height: number): IFormattedTransaction => ({
 	satsPerByte: 1,
 	type: EPaymentType.received,
 	value: 0.25,
-	txid: TXID,
+	txid,
 	messages: [],
 	vin: [],
 	timestamp: 1_700_000_000_000,
@@ -96,24 +120,25 @@ const confirmedRecord = (height: number): IFormattedTransaction => ({
 /** What the server answers for the transaction, echoing the request payload. */
 const txAnswer = (
 	confirmations?: number,
-	error?: { code: number; message: string }
+	error?: { code: number; message: string },
+	txid = TXID
 ): ITransaction<IUtxo> =>
 	({
 		id: 0,
 		jsonrpc: '2.0',
-		param: TXID,
-		data: { tx_hash: TXID },
+		param: txid,
+		data: { tx_hash: txid },
 		...(error ? { error } : {}),
 		result: error
 			? undefined
 			: {
 					...(confirmations !== undefined ? { confirmations } : {}),
 					...(confirmations ? { blockhash: BLOCK_HASH } : {}),
-					hash: TXID,
+					hash: txid,
 					hex: '00',
 					locktime: 0,
 					size: 141,
-					txid: TXID,
+					txid,
 					version: 2,
 					vin: [],
 					vout: [],
@@ -188,8 +213,11 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		wallet.data.unconfirmedTransactions[TXID] = confirmedRecord(REORGED_HEIGHT);
 	});
 
-	afterEach(function () {
+	afterEach(async function () {
 		sinon.restore();
+		// Every Electrum instance polls its connection until stopped, and a
+		// wallet left running keeps calling the shared client other suites stub.
+		await wallet?.stop();
 	});
 
 	/** The stored transactions as they were last written to storage. */
@@ -254,15 +282,10 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		expect(persisted[TXID].blockhash).to.equal(undefined);
 	});
 
-	it('clears the height when a server without a txindex loses the transaction', async function () {
-		// No txindex: a reorg'd out transaction is not "unconfirmed", it is
-		// unknown, and the ghost path handles it instead.
-		answerWith(
-			txAnswer(undefined, {
-				code: 2,
-				message: 'No such mempool or blockchain transaction'
-			})
-		);
+	it('clears the height when a server with a txindex loses the transaction', async function () {
+		// A reorg'd out transaction no mempool took back is not "unconfirmed",
+		// it is unknown, and the ghost path handles it instead.
+		answerWith(txAnswer(undefined, { code: 2, message: TXINDEX_MISS }));
 		// The rescan the ghost path fires needs a server; the record is the subject.
 		sinon.stub(wallet, 'rescanAddresses').resolves(ok(wallet.data));
 
@@ -444,5 +467,652 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				'a final transaction formatted after it'
 			).to.equal(false);
 		}
+	});
+
+	/**
+	 * Issue #871: a node without a txindex searches only its mempool, and its
+	 * "no such transaction" was not read as a miss at all, so a transaction
+	 * reorged out of the chain and out of every mempool stayed confirmed.
+	 * electrs finds a confirmed transaction in its own index first, but only in
+	 * blocks it has indexed, so the answer is a miss only for a record already
+	 * seen in a block safely below the tip.
+	 */
+	describe('a node without a txindex (issue #871)', function () {
+		const tipAt = (height: number): void => {
+			wallet.data.header = { height, hash: '', hex: '' };
+		};
+
+		const miss = (message: string): ITransaction<IUtxo> =>
+			txAnswer(undefined, { code: 2, message });
+
+		const stubRescan = (): sinon.SinonStub =>
+			sinon.stub(wallet, 'rescanAddresses').resolves(ok(wallet.data));
+
+		/** The record is where it was, still observed, and nothing was sent. */
+		const expectKept = (
+			rescan: sinon.SinonStub,
+			height = REORGED_HEIGHT
+		): void => {
+			const stored = wallet.transactions[TXID];
+			expect(stored.exists, 'still held').to.equal(true);
+			expect(stored.height, 'at the height it was found at').to.equal(height);
+			expect(
+				wallet.getUnconfirmedTransactions()[TXID]?.height,
+				'and still observed, so the next refresh asks again'
+			).to.equal(height);
+			expect(
+				messages.filter((m) => m.key === 'reorg' || m.key === 'rbf'),
+				'nothing was reported'
+			).to.have.length(0);
+			expect(rescan.callCount, 'and nothing rescanned').to.equal(0);
+		};
+
+		beforeEach(function () {
+			// Two blocks past the record: even a server a block behind has it.
+			tipAt(REORGED_HEIGHT + 2);
+		});
+
+		it('clears the height when the node has it in neither a block nor its mempool', async function () {
+			answerWith(miss(NO_TXINDEX_MISS));
+			const rescan = stubRescan();
+
+			const res = await wallet.checkUnconfirmedTransactions();
+			expect(res.isOk(), 'the check ran').to.equal(true);
+
+			const stored = wallet.transactions[TXID];
+			expect(stored.exists, 'the chain does not have it').to.equal(false);
+			expect(
+				stored.height,
+				'so neither does the height it was found at'
+			).to.equal(0);
+			expect(stored.blockhash).to.equal(undefined);
+			expect(stored.confirmTimestamp).to.equal(undefined);
+			expect(
+				wallet.getUnconfirmedTransactions()[TXID],
+				'and it is no longer observed'
+			).to.equal(undefined);
+			expect(savedTransactions()[TXID].exists).to.equal(false);
+			expect(savedTransactions()[TXID].height).to.equal(0);
+			expect(savedUnconfirmed()[TXID]).to.equal(undefined);
+
+			const rbf = messages.filter((m) => m.key === 'rbf');
+			expect(rbf, 'the removal is reported once').to.have.length(1);
+			expect(rbf[0].data).to.deep.equal([TXID]);
+			expect(messages.filter((m) => m.key === 'reorg')).to.have.length(0);
+			expect(rescan.callCount, 'and the balance rescanned').to.equal(1);
+		});
+
+		it('clears a record a lost write left confirmed (issue #870)', async function () {
+			// The main record still names the block while the observed copy
+			// already reads zero. The main record is evidence of that block too.
+			wallet.data.unconfirmedTransactions[TXID] = confirmedRecord(0);
+			answerWith(miss(NO_TXINDEX_MISS));
+			stubRescan();
+
+			await wallet.checkUnconfirmedTransactions();
+
+			expect(wallet.transactions[TXID].exists).to.equal(false);
+			expect(wallet.transactions[TXID].height).to.equal(0);
+			expect(savedTransactions()[TXID].height).to.equal(0);
+		});
+
+		it('waits for the tip to pass a block a lagging server may not hold yet', async function () {
+			// A failover commonly lands on a server a block behind, whose
+			// electrs has not indexed the newest block while its node has
+			// already taken the transaction out of its mempool. Heights written
+			// from a confirmation count also run a block low. So a record at the
+			// tip or one block under it is asked about again, not cleared.
+			answerWith(miss(NO_TXINDEX_MISS));
+			const rescan = stubRescan();
+
+			for (const tip of [REORGED_HEIGHT, REORGED_HEIGHT + 1]) {
+				tipAt(tip);
+				const res = await wallet.checkUnconfirmedTransactions();
+				expect(res.isOk(), `the check ran at tip ${tip}`).to.equal(true);
+				expectKept(rescan);
+			}
+
+			tipAt(REORGED_HEIGHT + 2);
+			await wallet.checkUnconfirmedTransactions();
+			expect(
+				wallet.transactions[TXID].exists,
+				'once the tip has moved on, the miss is final'
+			).to.equal(false);
+			expect(wallet.transactions[TXID].height).to.equal(0);
+			expect(rescan.callCount).to.equal(1);
+		});
+
+		it('keeps a transaction never seen in a block', async function () {
+			// The same answer is what a transaction mined into a block electrs
+			// has not indexed yet gets, so for one this wallet has only seen in
+			// the mempool (height 0, or -1 with unconfirmed parents) it says
+			// nothing about the chain.
+			answerWith(miss(NO_TXINDEX_MISS));
+			const rescan = stubRescan();
+
+			for (const height of [0, -1]) {
+				wallet.data.transactions[TXID] = confirmedRecord(height);
+				wallet.data.unconfirmedTransactions[TXID] = confirmedRecord(height);
+				await wallet.checkUnconfirmedTransactions();
+				expectKept(rescan, height);
+			}
+		});
+
+		it('does not read a txindex still being built as a miss', async function () {
+			answerWith(miss(STILL_INDEXING));
+			const rescan = stubRescan();
+
+			await wallet.checkUnconfirmedTransactions();
+
+			expectKept(rescan);
+			expect(wallet.transactions[TXID].blockhash).to.equal(BLOCK_HASH);
+		});
+
+		it('does not read a wrapped daemon error as a miss', async function () {
+			// A server that wraps daemon errors needs a txindex. Pointed at a
+			// node without one, it would report every confirmed transaction as
+			// missing, so only the unwrapped answer counts.
+			answerWith(miss(WRAPPED_NO_TXINDEX_MISS));
+			const rescan = stubRescan();
+
+			await wallet.checkUnconfirmedTransactions();
+
+			expectKept(rescan);
+		});
+
+		it('does not read the miss before the wallet knows a tip', async function () {
+			tipAt(0);
+			answerWith(miss(NO_TXINDEX_MISS));
+			const rescan = stubRescan();
+
+			await wallet.checkUnconfirmedTransactions();
+
+			expectKept(rescan);
+		});
+
+		it('tells that answer apart from every other', function () {
+			const table: Array<[string, ITransaction<IUtxo>, boolean]> = [
+				['the no-txindex miss', miss(NO_TXINDEX_MISS), true],
+				[
+					'the no-txindex miss before Core 0.17',
+					miss(OLD_NO_TXINDEX_MISS),
+					true
+				],
+				['the txindex miss', miss(TXINDEX_MISS), false],
+				['a txindex still being built', miss(STILL_INDEXING), false],
+				['a wrapped daemon error', miss(WRAPPED_NO_TXINDEX_MISS), false],
+				['a busy server', miss('server overloaded'), false],
+				['an answer with no error', txAnswer(2), false]
+			];
+			for (const [what, answer, expected] of table) {
+				expect(
+					wallet.electrum.transactionMissingWithoutTxindex(answer),
+					what
+				).to.equal(expected);
+			}
+		});
+	});
+});
+
+/**
+ * Regression: a reorg repair that failed to reach storage must be tried again
+ * (issue #870).
+ *
+ * The write of the repaired transaction was not checked, while the unconfirmed
+ * copy that drives the next check was advanced to zero or deleted. So a single
+ * failed write left a transaction stored as confirmed at a block the chain no
+ * longer has, with nothing under observation to notice it, permanently.
+ *
+ * Fully OFFLINE, as above, over storage that hands back copies, as a real
+ * one does, and can refuse either transaction map. Every record starts out in
+ * storage and reaches the wallet through a restart, so what a restart reads
+ * back is exactly what each case asserts on.
+ */
+describe('a reorg repair that storage refuses (issue #870)', function () {
+	this.timeout(60000);
+
+	const OTHER_TXID =
+		'bbb870ee62fa1d2b5c8b2f4b2b6c4d8e1f3a5c7e9b1d3f5a7c9e1b3d5f7a9c1e';
+
+	/** The private step through which a refresh observes what it found. */
+	type TWalletInternals = {
+		addUnconfirmedTransactions: (args: {
+			transactions: Record<string, IFormattedTransaction>;
+		}) => Promise<Result<string>>;
+	};
+
+	let wallet: Wallet;
+	let messages: Array<{ key: keyof TMessageDataMap; data: unknown }>;
+	/** What a restart would read back. */
+	const store = new Map<string, unknown>();
+	/** Refuses the main record, `transactions`. */
+	const failMainWrite = { on: false };
+	/** Refuses the copy under observation, `unconfirmedTransactions`. */
+	const failMonitorWrite = { on: false };
+
+	const copy = <T>(value: T): T =>
+		value === undefined ? value : JSON.parse(JSON.stringify(value));
+
+	const storage: TStorage = {
+		getData: async <K extends keyof IWalletData>(
+			key: string
+		): Promise<Result<IWalletData[K]>> =>
+			ok(copy(store.get(key)) as IWalletData[K]),
+		setData: async <K extends keyof IWalletData>(
+			key: string,
+			value: IWalletData[K]
+		): Promise<Result<boolean>> => {
+			// Keys end in the wallet data key, and neither suffix ends the other.
+			if (failMainWrite.on && key.endsWith('-transactions')) {
+				return err('storage is down');
+			}
+			if (failMonitorWrite.on && key.endsWith('-unconfirmedTransactions')) {
+				return err('storage is down');
+			}
+			store.set(key, copy(value));
+			return ok(true);
+		}
+	};
+
+	/** A wallet over whatever storage currently holds. */
+	const openWallet = async (): Promise<Wallet> => {
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			name: 'reorgrepair',
+			network: EAvailableNetworks.regtest,
+			addressType: EAddressType.p2wpkh,
+			electrumOptions,
+			disableRefreshOnCreate: true,
+			onMessage: (key, data): void => {
+				messages.push({ key, data });
+			},
+			storage
+		});
+		if (res.isErr()) throw res.error;
+		res.value.data.header = { height: TIP, hash: '', hex: '' };
+		return res.value;
+	};
+
+	/** Closes the wallet and opens a new one over the same storage. */
+	const restart = async (): Promise<void> => {
+		sinon.restore();
+		await wallet.stop();
+		wallet = await openWallet();
+	};
+
+	/** Puts both transaction maps in storage and restarts onto them. */
+	const seed = async (
+		transactions: Record<string, IFormattedTransaction>,
+		unconfirmed: Record<string, IFormattedTransaction>
+	): Promise<void> => {
+		store.set(wallet.getWalletDataKey('transactions'), copy(transactions));
+		store.set(
+			wallet.getWalletDataKey('unconfirmedTransactions'),
+			copy(unconfirmed)
+		);
+		await restart();
+	};
+
+	// Answers only for the hashes actually asked about, since what is still
+	// under observation is the whole subject here.
+	const answerWith = (...answers: ITransaction<IUtxo>[]): void => {
+		sinon
+			.stub(wallet.electrum, 'getTransactions')
+			.callsFake(async ({ txHashes }: { txHashes: ITxHash[] }) =>
+				ok<IGetTransactions>({
+					error: false,
+					id: 0,
+					method: 'getTransactions',
+					network: 'bitcoinRegtest',
+					data: answers.filter((answer) =>
+						txHashes.some((h) => h.tx_hash === answer.data.tx_hash)
+					)
+				})
+			);
+	};
+
+	/** The rescan the ghost path fires needs a server; it is counted instead. */
+	const stubRescan = (): sinon.SinonStub =>
+		sinon.stub(wallet, 'rescanAddresses').resolves(ok(wallet.data));
+
+	const stored = (
+		key: 'transactions' | 'unconfirmedTransactions'
+	): Record<string, IFormattedTransaction> =>
+		store.get(wallet.getWalletDataKey(key)) as Record<
+			string,
+			IFormattedTransaction
+		>;
+
+	const sent = (key: keyof TMessageDataMap): unknown[] =>
+		messages.filter((m) => m.key === key);
+
+	const noSuchTransaction = (txid = TXID): ITransaction<IUtxo> =>
+		txAnswer(undefined, { code: 2, message: TXINDEX_MISS }, txid);
+
+	beforeEach(async function () {
+		store.clear();
+		messages = [];
+		failMainWrite.on = false;
+		failMonitorWrite.on = false;
+		wallet = await openWallet();
+		await seed(
+			{ [TXID]: confirmedRecord(REORGED_HEIGHT) },
+			{ [TXID]: confirmedRecord(REORGED_HEIGHT) }
+		);
+	});
+
+	afterEach(async function () {
+		sinon.restore();
+		await wallet?.stop();
+	});
+
+	it('reports a failed write and keeps the transaction under observation', async function () {
+		answerWith(txAnswer(0));
+		failMainWrite.on = true;
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isErr(), 'the check reports the write it lost').to.equal(true);
+
+		expect(
+			stored('transactions')[TXID].height,
+			'the stored record was not repaired'
+		).to.equal(REORGED_HEIGHT);
+		expect(
+			stored('unconfirmedTransactions')[TXID].height,
+			'so the copy that asks again still holds the height a reorg undid'
+		).to.equal(REORGED_HEIGHT);
+	});
+
+	it('repairs the record on the next check in the same session', async function () {
+		answerWith(txAnswer(0));
+		failMainWrite.on = true;
+		await wallet.checkUnconfirmedTransactions();
+		expect(
+			wallet.getUnconfirmedTransactions()[TXID].height,
+			'the copy the next check reads the reorg from was not advanced'
+		).to.equal(REORGED_HEIGHT);
+
+		failMainWrite.on = false;
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the repair was tried again').to.equal(true);
+
+		expect(stored('transactions')[TXID].height).to.equal(0);
+		expect(stored('transactions')[TXID].blockhash).to.equal(undefined);
+		expect(stored('unconfirmedTransactions')[TXID].height).to.equal(0);
+	});
+
+	it('repairs a record a refresh left behind a failed write, after a restart', async function () {
+		// The refresh goes on past the failed check and finds the transaction
+		// in its address history at zero, which rewrites the copy under
+		// observation at zero as well. So the stored record is the only place
+		// the lost block is left.
+		const record: IFormattedTransaction = {
+			...confirmedRecord(0),
+			blockhash: undefined,
+			confirmTimestamp: undefined
+		};
+		answerWith(txAnswer(0));
+		sinon
+			.stub(wallet.electrum, 'getAddressHistory')
+			.resolves(ok([{ tx_hash: TXID, height: 0 } as never]));
+		sinon.stub(wallet, 'formatTransactions').resolves(ok({ [TXID]: record }));
+		const added = sinon.spy(
+			wallet as unknown as TWalletInternals,
+			'addUnconfirmedTransactions'
+		);
+		failMainWrite.on = true;
+
+		await wallet.updateTransactions({});
+		expect(added.callCount, 'the refresh observed its history').to.equal(1);
+		await added.firstCall.returnValue;
+		expect(
+			stored('transactions')[TXID].height,
+			'the repair did not reach storage'
+		).to.equal(REORGED_HEIGHT);
+
+		failMainWrite.on = false;
+		await restart();
+		answerWith(txAnswer(0));
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the check ran').to.equal(true);
+
+		expect(stored('transactions')[TXID].height).to.equal(0);
+		expect(stored('transactions')[TXID].blockhash).to.equal(undefined);
+	});
+
+	it('repairs the record on the next check after a restart', async function () {
+		answerWith(txAnswer(0));
+		failMainWrite.on = true;
+		await wallet.checkUnconfirmedTransactions();
+
+		failMainWrite.on = false;
+		await restart();
+		expect(
+			wallet.transactions[TXID].height,
+			'the restart reads the transaction back as confirmed'
+		).to.equal(REORGED_HEIGHT);
+
+		answerWith(txAnswer(0));
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the repair was tried again').to.equal(true);
+
+		expect(stored('transactions')[TXID].height).to.equal(0);
+		expect(stored('transactions')[TXID].blockhash).to.equal(undefined);
+		expect(stored('unconfirmedTransactions')[TXID].height).to.equal(0);
+	});
+
+	it('keeps watching a ghost transaction whose write failed', async function () {
+		answerWith(noSuchTransaction());
+		const rescan = stubRescan();
+		failMainWrite.on = true;
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isErr(), 'the check reports the write it lost').to.equal(true);
+
+		expect(
+			stored('transactions')[TXID].height,
+			'the stored record was not repaired'
+		).to.equal(REORGED_HEIGHT);
+		expect(stored('transactions')[TXID].exists).to.equal(true);
+		expect(
+			stored('unconfirmedTransactions')[TXID]?.height,
+			'so it is still looked up on the next check'
+		).to.equal(REORGED_HEIGHT);
+		expect(
+			rescan.callCount,
+			'and no rescan runs while it is still observed, since its refresh would repeat this check'
+		).to.equal(0);
+	});
+
+	it('repairs a ghost transaction on the next check in the same session', async function () {
+		answerWith(noSuchTransaction());
+		const rescan = stubRescan();
+		failMainWrite.on = true;
+		await wallet.checkUnconfirmedTransactions();
+		expect(
+			wallet.getUnconfirmedTransactions()[TXID]?.height,
+			'the ghost is still observed'
+		).to.equal(REORGED_HEIGHT);
+
+		failMainWrite.on = false;
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the repair was tried again').to.equal(true);
+
+		expect(stored('transactions')[TXID].exists).to.equal(false);
+		expect(stored('transactions')[TXID].height).to.equal(0);
+		expect(stored('unconfirmedTransactions')[TXID]).to.equal(undefined);
+		expect(rescan.callCount, 'the balance is rescanned once').to.equal(1);
+	});
+
+	it('keeps a transaction a refresh adds while a ghost round runs', async function () {
+		// A refresh running beside the check finds a transaction already in a
+		// block while the lookup is in flight. A confirmed record is not
+		// fetched again, so this entry is all that would notice a later reorg.
+		stubRescan();
+		sinon
+			.stub(wallet.electrum, 'getTransactions')
+			.callsFake(async ({ txHashes }: { txHashes: ITxHash[] }) => {
+				await (
+					wallet as unknown as TWalletInternals
+				).addUnconfirmedTransactions({
+					transactions: { [OTHER_TXID]: confirmedRecord(TIP, OTHER_TXID) }
+				});
+				return ok<IGetTransactions>({
+					error: false,
+					id: 0,
+					method: 'getTransactions',
+					network: 'bitcoinRegtest',
+					data: txHashes.map((h) => noSuchTransaction(h.tx_hash))
+				});
+			});
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the check ran').to.equal(true);
+
+		expect(stored('transactions')[TXID].exists).to.equal(false);
+		expect(stored('unconfirmedTransactions')[TXID]).to.equal(undefined);
+		expect(
+			wallet.getUnconfirmedTransactions()[OTHER_TXID]?.height,
+			'the new transaction is still observed'
+		).to.equal(TIP);
+		expect(
+			stored('unconfirmedTransactions')[OTHER_TXID]?.height,
+			'after a restart too'
+		).to.equal(TIP);
+	});
+
+	it('repairs a ghost transaction on the next check after a restart', async function () {
+		answerWith(noSuchTransaction());
+		stubRescan();
+		failMainWrite.on = true;
+		await wallet.checkUnconfirmedTransactions();
+
+		failMainWrite.on = false;
+		await restart();
+		answerWith(noSuchTransaction());
+		const rescan = stubRescan();
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the repair was tried again').to.equal(true);
+
+		expect(stored('transactions')[TXID].exists).to.equal(false);
+		expect(stored('transactions')[TXID].height).to.equal(0);
+		expect(
+			stored('unconfirmedTransactions')[TXID],
+			'and only now is it dropped from observation'
+		).to.equal(undefined);
+		expect(rescan.callCount, 'the balance is rescanned').to.equal(1);
+	});
+
+	it('reports a failed write of the copy under observation', async function () {
+		answerWith(txAnswer(0));
+		failMonitorWrite.on = true;
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isErr(), 'Ok means every write the check made landed').to.equal(
+			true
+		);
+		expect(
+			stored('transactions')[TXID].height,
+			'the repair itself is durable'
+		).to.equal(0);
+
+		failMonitorWrite.on = false;
+		const retry = await wallet.checkUnconfirmedTransactions();
+		expect(retry.isOk(), 'the next check writes it again').to.equal(true);
+		expect(stored('unconfirmedTransactions')[TXID].height).to.equal(0);
+		expect(
+			sent('reorg'),
+			'without reporting the reorg a second time'
+		).to.have.length(1);
+	});
+
+	it('still rescans a ghost when only the write of its observed copy fails', async function () {
+		answerWith(noSuchTransaction());
+		const rescan = stubRescan();
+		failMonitorWrite.on = true;
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isErr(), 'the lost write is reported').to.equal(true);
+		expect(
+			stored('transactions')[TXID].exists,
+			'the repair itself is durable'
+		).to.equal(false);
+		expect(stored('transactions')[TXID].height).to.equal(0);
+		expect(
+			rescan.callCount,
+			'and the balance is still rescanned, since nothing in this session asks again'
+		).to.equal(1);
+	});
+
+	it('repairs a record a lost write already left confirmed', async function () {
+		// What the unchecked write left behind: the main record still at the
+		// lost block, and the copy under observation already at zero.
+		await seed(
+			{ [TXID]: confirmedRecord(REORGED_HEIGHT) },
+			{ [TXID]: confirmedRecord(0) }
+		);
+		answerWith(txAnswer(0));
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the check ran').to.equal(true);
+
+		expect(
+			stored('transactions')[TXID].height,
+			'the main record is evidence of the lost block too'
+		).to.equal(0);
+		expect(stored('transactions')[TXID].blockhash).to.equal(undefined);
+		expect(sent('reorg'), 'the reorg is reported once').to.have.length(1);
+	});
+
+	it('leaves such a record alone while the chain still holds it', async function () {
+		await seed(
+			{ [TXID]: confirmedRecord(REORGED_HEIGHT) },
+			{ [TXID]: confirmedRecord(0) }
+		);
+		answerWith(txAnswer(2));
+
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the check ran').to.equal(true);
+
+		expect(
+			stored('transactions')[TXID].height,
+			'still confirmed where it was'
+		).to.equal(REORGED_HEIGHT);
+		expect(stored('transactions')[TXID].blockhash).to.equal(BLOCK_HASH);
+		expect(sent('reorg'), 'nothing was undone').to.have.length(0);
+	});
+
+	it('reports a reorg once when the same round also loses a transaction', async function () {
+		// One transaction is back in the mempool, the other is gone. A round
+		// with a ghost in it used to keep the old copy of the first, still at
+		// the lost block, so the next check reported the same reorg again.
+		await seed(
+			{
+				[TXID]: confirmedRecord(REORGED_HEIGHT),
+				[OTHER_TXID]: confirmedRecord(REORGED_HEIGHT, OTHER_TXID)
+			},
+			{
+				[TXID]: confirmedRecord(REORGED_HEIGHT),
+				[OTHER_TXID]: confirmedRecord(REORGED_HEIGHT, OTHER_TXID)
+			}
+		);
+		answerWith(txAnswer(0), noSuchTransaction(OTHER_TXID));
+		stubRescan();
+
+		const first = await wallet.checkUnconfirmedTransactions();
+		const second = await wallet.checkUnconfirmedTransactions();
+		expect(first.isOk(), 'the first check ran').to.equal(true);
+		expect(second.isOk(), 'the second check ran').to.equal(true);
+
+		expect(sent('reorg'), 'the reorg is reported once').to.have.length(1);
+		expect(sent('rbf'), 'and so is the removal').to.have.length(1);
+		expect(
+			stored('unconfirmedTransactions')[TXID]?.height,
+			'the transaction back in the mempool is observed at zero'
+		).to.equal(0);
+		expect(stored('unconfirmedTransactions')[OTHER_TXID]).to.equal(undefined);
+		expect(stored('transactions')[TXID].height).to.equal(0);
+		expect(stored('transactions')[OTHER_TXID].exists).to.equal(false);
 	});
 });

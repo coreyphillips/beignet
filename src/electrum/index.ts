@@ -73,6 +73,19 @@ const DISCONNECTED_ERROR = 'Electrum instance is disconnected.';
 const LIVENESS_SCRIPT_HASH =
 	'77ca78f9a84b48041ad71f7cc6ff6c33460c25f0cb99f558f9813ed9e63727dd';
 
+/**
+ * Bitcoin Core's "not found" from a node without a txindex, in the current
+ * wording ("... Use -txindex or provide a block hash ...") and the one before
+ * 0.17 ("... Use -txindex to enable ..."), as electrs relays it: unchanged, at
+ * the start of the message (issue #871). Anchored on purpose. The loose prefix
+ * would also match Core's "Blockchain transactions are still in the process
+ * of being indexed", which a node with a txindex gives for every confirmed
+ * transaction until its index is built. And a server that wraps the daemon
+ * error in its own text requires a txindex, so pointed at a node without one
+ * it reports every confirmed transaction as missing.
+ */
+const NO_TXINDEX_MISS = /^No such mempool transaction\. Use -txindex/;
+
 type TScriptHashSubscription = {
 	callbacks: Set<(data: TSubscribedReceive) => void>;
 	/** Address index of a UTXO tracked beyond the gap limit; that index is
@@ -1744,6 +1757,30 @@ export class Electrum {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Whether the server relays a node without a txindex saying it has no such
+	 * transaction (issue #871). Such a node searches only its mempool. electrs,
+	 * which needs no txindex, first looks the transaction up in its own index
+	 * and hands the node the block it finds there, so from electrs this answer
+	 * means: in no block electrs has indexed, and not in the mempool.
+	 *
+	 * transactionExists does not read this as a miss, and must not. electrs
+	 * indexes a block after the node has already taken the block's
+	 * transactions out of its mempool, so a transaction mined a moment ago
+	 * gets the same answer until electrs catches up. It is final only for a
+	 * record this wallet already saw in a block safely below the tip, which is
+	 * for the caller to judge; the Lightning chain backend cannot, and keeps
+	 * reading it as no answer.
+	 * @param {ITransaction<IUtxo>} txData
+	 * @returns {boolean}
+	 */
+	public transactionMissingWithoutTxindex(
+		txData: ITransaction<IUtxo>
+	): boolean {
+		const message = txData?.error?.message;
+		return typeof message === 'string' && NO_TXINDEX_MISS.test(message);
 	}
 
 	/**
