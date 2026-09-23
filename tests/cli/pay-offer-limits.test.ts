@@ -46,7 +46,6 @@ type StubbedEngine = {
 type Internals = {
 	node: StubbedEngine;
 	_pendingSpendSats: number;
-	_blockingPaymentHashes: Map<string, number>;
 };
 
 const internals = (node: BeignetNode): Internals =>
@@ -216,7 +215,6 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		).to.contain('Payment amount 5001 sats exceeds per-payment limit');
 		expect(payee.dispatched).to.have.length(0);
 		expect(pending()).to.equal(0);
-		expect(internals(node)._blockingPaymentHashes.size).to.equal(0);
 	});
 
 	it('limits the invoice the payee returned, not the amount the caller asked for', async () => {
@@ -271,7 +269,6 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		expect(pending()).to.equal(0);
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
 		expect(node.getDailySpendInfo().lightningSats).to.equal(3_000);
-		expect(internals(node)._blockingPaymentHashes.size).to.equal(0);
 
 		// A repeated terminal event must not count the payment twice.
 		settle(node, payee.paymentHash, 3_000, 'COMPLETED');
@@ -288,7 +285,6 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		expect(await refusalOf(paid)).to.contain('Payment failed');
 		expect(pending()).to.equal(0);
 		expect(node.getDailySpendInfo().spentSats).to.equal(0);
-		expect(internals(node)._blockingPaymentHashes.size).to.equal(0);
 	});
 
 	it('releases the reservation when the payment times out', async () => {
@@ -304,7 +300,6 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		// the process, and refuse real payments once the counter passed the limit.
 		expect(pending()).to.equal(0);
 		expect(node.getDailySpendInfo().spentSats).to.equal(0);
-		expect(internals(node)._blockingPaymentHashes.size).to.equal(0);
 	});
 
 	it('releases the reservation when the engine refuses the dispatch', async () => {
@@ -317,7 +312,6 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		).to.contain('No route found');
 		expect(payee.dispatched).to.have.length(1);
 		expect(pending()).to.equal(0);
-		expect(internals(node)._blockingPaymentHashes.size).to.equal(0);
 
 		// The budget is intact: a payment that never started holds no capacity,
 		// so the retry is refused by the engine again rather than by the limit.
@@ -326,10 +320,11 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		).to.contain('No route found');
 	});
 
-	it('owns the hash it is paying, so the async ledger cannot charge the same settlement', async () => {
+	it('charges the one settlement of a hash an async attempt also claims, and releases the rest', async () => {
 		// A payee that issued one preimage under a BOLT 11 invoice and again
 		// under the offer's invoice. The async attempt's claim and payOffer's
-		// own listener would otherwise both charge the single settlement.
+		// own claim are both on the hash; the handler in create() charges one
+		// settlement (issue #977).
 		const paymentHash = crypto.randomBytes(32);
 		internals(node).node.sendPayment = (): unknown => ({ status: 'PENDING' });
 		node.sendPaymentAsync(
@@ -356,11 +351,10 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		settle(node, payee.paymentHash, 3_000, 'COMPLETED');
 		await paid;
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
-		// The async attempt's HTLC is still out there and the engine reports
-		// nothing further for a hash it has marked completed, so its claim goes
-		// on holding budget rather than being handed back on this settlement.
-		expect(pending()).to.equal(3_000);
-		expect(internals(node)._blockingPaymentHashes.size).to.equal(0);
+		// The engine reports nothing further for a hash it has marked
+		// completed and refuses a re-send of it (#975), so nothing can ever
+		// charge the async attempt: its reservation goes with the settlement.
+		expect(pending()).to.equal(0);
 	});
 
 	it('rounds a sub-satoshi invoice up instead of letting it skip the limits', async () => {
