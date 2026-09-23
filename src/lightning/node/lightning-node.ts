@@ -371,6 +371,7 @@ import {
 	computeScriptHash
 } from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
+import { isDuplicateBroadcastRejection } from '../chain/broadcast-rejection';
 import {
 	satPerVbyteToSatPerKw,
 	MIN_FEERATE_PER_KW,
@@ -7161,25 +7162,50 @@ export class LightningNode extends EventEmitter {
 			})
 			.catch((err) => {
 				const message = (err as Error)?.message ?? String(err);
-				// A tx that is already mined cannot be re-sent; that is success,
-				// and funding:confirmed will retire the entry.
-				if (
-					/already in block ?chain|already known|txn-already/i.test(message)
-				) {
+				// The network already has it, mined or in the mempool: that is
+				// success. The entry stays on purpose until funding:confirmed
+				// retires it at depth, so the per-block resend runs on and hears
+				// this same answer, quietly (issue #921).
+				if (isDuplicateBroadcastRejection(message)) {
 					entry.broadcastSucceeded = true;
 					this.resumeSkippedCloseAfterBroadcast(txidHex);
 					return;
 				}
+				// Named in display order, the form explorers and bitcoind take.
+				// The channel is named in the text only. ILightningError.channelId
+				// stays unset: a consumer matches an attributed error to the open
+				// it watches by the TEMPORARY id, so the permanent id there would
+				// detach this failure from its open.
+				const displayTxid = Buffer.from(txidHex, 'hex')
+					.reverse()
+					.toString('hex');
+				const channelIdHex =
+					this.fundingChannelIdFor(txidHex)?.toString('hex') ?? null;
 				this.emitStructuredLog('chain', 'funding_broadcast_failed', {
-					txid: txidHex,
+					channelId: channelIdHex,
+					txid: displayTxid,
 					error: message
 				});
+				const of = channelIdHex ? ` of channel ${channelIdHex}` : '';
 				this.emit('node:error', {
 					code: 'FUNDING_BROADCAST_FAILED',
-					message: `${message} (funding tx ${txidHex} retained; will retry)`,
+					message: `${message} (funding tx ${displayTxid}${of} retained; will retry)`,
 					timestamp: Date.now()
 				} as ILightningError);
 			});
+	}
+
+	/**
+	 * The id of the channel a retained funding tx (internal byte order hex)
+	 * belongs to, or null when no channel holds it any more.
+	 */
+	private fundingChannelIdFor(txidHex: string): Buffer | null {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
+			return state.channelId ?? state.temporaryChannelId;
+		}
+		return null;
 	}
 
 	/**
@@ -8732,6 +8758,19 @@ export class LightningNode extends EventEmitter {
 					});
 				})
 				.catch((err) => {
+					const message = (err as Error)?.message ?? String(err);
+					// The backend already holds this exact transaction (on
+					// Core 28+ that answer means it is CONFIRMED, so the alarm
+					// came from a lagging index). That is the accepted arm
+					// above, not a rejection (issue #921).
+					if (isDuplicateBroadcastRejection(message)) {
+						this.emitStructuredLog('chain', 'funding_rebroadcast', {
+							channelId: channelId.toString('hex'),
+							txid,
+							duplicate: true
+						});
+						return;
+					}
 					// A rejection is NOT evidence that the channel is
 					// fiction. bad-txns-inputs-missingorspent covers an
 					// unconfirmed parent this backend has not seen, a
@@ -8743,7 +8782,7 @@ export class LightningNode extends EventEmitter {
 					this.emitStructuredLog('chain', 'funding_rebroadcast_rejected', {
 						channelId: channelId.toString('hex'),
 						txid,
-						error: (err as Error)?.message ?? String(err)
+						error: message
 					});
 					// Absence was NOT answered: we tried to send and the network
 					// would not take it. Nothing here says the transaction is
@@ -11955,10 +11994,10 @@ export class LightningNode extends EventEmitter {
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			// Only the KNOWN duplicate-transaction rejections count as success
-			// (same allowlist as broadcastPendingFundingTx). A broad match is
+			// (the allowlist in isDuplicateBroadcastRejection). A broad match is
 			// dangerous: "Input already spent by conflicting transaction" also
 			// says "already" but means this tx can never be in the network.
-			ok = /already in block ?chain|already known|txn-already/i.test(msg);
+			ok = isDuplicateBroadcastRejection(msg);
 		}
 		this._lastCloseBroadcast.set(idHex, { txid, ok });
 		return ok;

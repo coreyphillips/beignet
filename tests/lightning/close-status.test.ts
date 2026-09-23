@@ -386,6 +386,26 @@ describe('Issue #214: manual close rebroadcast', function () {
 		fx.destroy();
 	});
 
+	it("treats Core 28+ 'outputs already in utxo set' as success (issue #921)", async () => {
+		// Core 28 renamed the already-mined answer. It is returned only while
+		// an output of this txid is unspent, so the close is confirmed.
+		const fx = setup(333);
+		fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice));
+		(fx.alice as any)._chainBackend = {
+			broadcastTransaction: async (): Promise<string> => {
+				throw new Error(
+					'Failed to broadcast transaction: Transaction outputs already in utxo set'
+				);
+			}
+		};
+
+		const result = await fx.alice.rebroadcastClose(fx.channelId);
+		expect(result.ok).to.equal(true);
+		expect(result.broadcastOk).to.equal(true);
+		expect(closeStatusOf(fx.alice, fx.channelId).broadcast).to.equal(true);
+		fx.destroy();
+	});
+
 	it('reports a failed broadcast honestly', async () => {
 		const fx = setup(341);
 		fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice));
