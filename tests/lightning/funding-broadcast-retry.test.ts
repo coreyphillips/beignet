@@ -19,7 +19,8 @@ import { LightningNode } from '../../src/lightning/node/lightning-node';
 import {
 	INodeConfig,
 	IFundingProvider,
-	ILightningError
+	ILightningError,
+	IStructuredLog
 } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
@@ -233,6 +234,56 @@ describe('Funding broadcast retry', function () {
 		// Success does NOT retire the entry: it lives until the funding
 		// confirms, so a later mempool eviction can be rebroadcast.
 		expect(pendingMap(alice).has(fundingTxidHex)).to.equal(true);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a failed broadcast names the funding in display order and its channel (issue #921)', async function () {
+		// The retained map is keyed by the internal byte order, which no
+		// explorer or bitcoind RPC accepts, and the line named no channel.
+		let fundingTxidHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				return built;
+			},
+			broadcastTransaction: async () => {
+				throw new Error('electrum hiccup');
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(71, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(72));
+		const errors: ILightningError[] = [];
+		const logs: IStructuredLog[] = [];
+		alice.on('node:error', (e: ILightningError) => errors.push(e));
+		alice.on('log', (l: IStructuredLog) => logs.push(l));
+		bob.on('node:error', () => {});
+		connectNodes(alice, bob);
+
+		const channel = alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+
+		const displayTxid = Buffer.from(fundingTxidHex, 'hex')
+			.reverse()
+			.toString('hex');
+		const channelIdHex = channel.getChannelId()!.toString('hex');
+		const failure = errors.find((e) => e.code === 'FUNDING_BROADCAST_FAILED');
+		expect(failure, 'the failure is surfaced').to.not.equal(undefined);
+		expect(failure!.message).to.include(displayTxid);
+		expect(failure!.message).to.not.include(fundingTxidHex);
+		expect(failure!.message).to.include(channelIdHex);
+		// Named in the text only: a consumer matches an attributed error to
+		// the open it watches by the temporary id, and this channel already
+		// has its permanent one.
+		expect(failure!.channelId).to.equal(undefined);
+		const logged = logs.find((l) => l.action === 'funding_broadcast_failed');
+		expect(logged, 'the failure is logged').to.not.equal(undefined);
+		expect(logged!.data.txid).to.equal(displayTxid);
+		expect(logged!.data.channelId).to.equal(channelIdHex);
 
 		alice.destroy();
 		bob.destroy();
@@ -610,6 +661,64 @@ describe('Funding broadcast retry', function () {
 		alice.destroy();
 		bob.destroy();
 	});
+
+	it("a rebroadcast answered 'already in utxo set' is not a rejection (issue #921)", async function () {
+		// funding:missing can come from an index that lags the chain. Core 28+
+		// answers a rebroadcast of a CONFIRMED transaction with this wording,
+		// so the backend has just said it holds the funding: that is the
+		// accepted arm, and it raises no quarantine.
+		let fundingTxidHex = '';
+		let answer: string | null = null;
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				return built;
+			},
+			broadcastTransaction: async (txHex) => {
+				if (answer !== null) throw new Error(answer);
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(73, {
+				fundingProvider: provider,
+				chainBackend: new ControlledBackend()
+			})
+		);
+		const bob = new LightningNode(makeNodeConfig(74));
+		const logs: IStructuredLog[] = [];
+		alice.on('log', (l: IStructuredLog) => logs.push(l));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectNodes(alice, bob);
+
+		const channel = alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		const channelId = channel.getChannelId()!;
+
+		answer = 'Broadcast failed: Transaction outputs already in utxo set';
+		const displayTxid = Buffer.from(fundingTxidHex, 'hex')
+			.reverse()
+			.toString('hex');
+		alice.getChainWatcher()!.emit('funding:missing', channelId, displayTxid);
+		await tick();
+
+		const actions = logs.map((l) => l.action);
+		expect(actions).to.not.include('funding_rebroadcast_rejected');
+		expect(actions).to.not.include('funding_missing_quarantined');
+		const rebroadcast = logs.find((l) => l.action === 'funding_rebroadcast');
+		expect(rebroadcast, 'logged as a rebroadcast').to.not.equal(undefined);
+		expect(rebroadcast!.data.duplicate).to.equal(true);
+		expect(
+			alice.getChannelManager().getChannel(channelId)!.isFundingUnaccounted(),
+			'not quarantined'
+		).to.equal(false);
+		expect(pendingMap(alice).has(fundingTxidHex)).to.equal(true);
+
+		alice.destroy();
+		bob.destroy();
+	});
 });
 
 describe('Funding broadcast authorization (BOLT 2 ordering)', function () {
@@ -819,6 +928,76 @@ describe('Funding broadcast authorization (BOLT 2 ordering)', function () {
 		await tick();
 		expect(broadcasts.length).to.equal(postRetire);
 		expect(released).to.have.length(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a funding the backend reports already mined resumes the skipped close and raises no error (issue #921)', async function () {
+		// Core 28+ answers a rebroadcast of a CONFIRMED transaction with
+		// "Transaction outputs already in utxo set". When that is the first
+		// answer the entry sees after a failure, it is the evidence the issue
+		// #413 gate waits for: the close the dead channel skipped resumes at
+		// once, and nothing reports a broadcast failure.
+		const broadcasts: string[] = [];
+		let fundingTxidHex = '';
+		let answer = 'backend down';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				return built;
+			},
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				throw new Error(answer);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(75, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(76));
+		const events: string[] = [];
+		alice.on('node:error', (e: ILightningError) => events.push(e.code));
+		bob.on('node:error', () => {});
+		connectNodes(alice, bob);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		expect(broadcasts).to.have.length(1);
+		expect(events).to.include('FUNDING_BROADCAST_FAILED');
+
+		const channelId = alice
+			.getChannelManager()
+			.listChannels()[0]
+			.getChannelId()!;
+		alice.handlePeerMessage(
+			bob.getNodeId(),
+			17, // ERROR
+			encodeErrorMessage({ channelId, data: Buffer.from('nope') })
+		);
+		await tick();
+		expect(events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+
+		// The funding confirmed meanwhile, and the next resend hears so.
+		answer = 'Broadcast failed: Transaction outputs already in utxo set';
+		const before = events.length;
+		alice.handleNewBlock(501);
+		await tick();
+		expect(broadcasts).to.have.length(2);
+		const after = events.slice(before);
+		expect(after).to.not.include('FUNDING_BROADCAST_FAILED');
+		expect(after).to.include('CHANNEL_FAILED_FORCE_CLOSED');
+		const entry = pendingMap(alice).get(fundingTxidHex) as unknown as {
+			broadcastSucceeded?: boolean;
+		};
+		expect(entry, 'held until depth').to.not.equal(undefined);
+		expect(entry.broadcastSucceeded).to.equal(true);
+
+		// Depth retires it as usual.
+		alice.handleFundingConfirmed(channelId);
+		await tick();
+		expect(pendingMap(alice).size).to.equal(0);
 
 		alice.destroy();
 		bob.destroy();
