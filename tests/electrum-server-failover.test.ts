@@ -2617,6 +2617,13 @@ describe('Electrum lifecycle and disconnect races', () => {
 	it('records nothing for a connect that finishes after disconnect() (#979)', async () => {
 		await electrum.connectToElectrum({ servers: serverA });
 		await flush();
+		// A host of this test's own: the server module's connectedServers map
+		// is process wide, and another test file run in the same mocha
+		// process (electrum-rotation never disconnects its instances) can
+		// still hold serverB, which would make the sibling below accept the
+		// peer for a reason that has nothing to do with this instance.
+		const serverC: TServer = { ...serverB, host: 'c.example.com' };
+		reachableHosts.add(serverC.host);
 		// The connect is inside electrum.start() when the wallet stops, and
 		// disconnect() does not wait for it.
 		const dial = createGate();
@@ -2640,7 +2647,7 @@ describe('Electrum lifecycle and disconnect races', () => {
 			}
 		);
 
-		const connecting = electrum.connectToElectrum({ servers: serverB });
+		const connecting = electrum.connectToElectrum({ servers: serverC });
 		try {
 			await flush();
 			expect(dials, 'the candidate is parked in the dial').to.equal(1);
@@ -2665,8 +2672,8 @@ describe('Electrum lifecycle and disconnect races', () => {
 		// as a stray dial and redial its own server rather than accept a peer
 		// only a stopped instance vouches for.
 		const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
-		other.servers = [serverB];
-		client.peer = { host: serverB.host, port: serverB.ssl, protocol: 'ssl' };
+		other.servers = [serverC];
+		client.peer = { host: serverC.host, port: serverC.ssl, protocol: 'ssl' };
 		connectionEvents.length = 0;
 
 		await pollConnection(other);
@@ -2675,7 +2682,7 @@ describe('Electrum lifecycle and disconnect races', () => {
 		expect(
 			connectionEvents.filter((event) => event.startsWith('connect:')),
 			'the stopped instance must no longer vouch for the peer'
-		).to.deep.equal([`connect:${serverB.host}`]);
+		).to.deep.equal([`connect:${serverC.host}`]);
 	});
 
 	it('lets a sibling discharge the debt a failed restore left (#499)', async () => {
