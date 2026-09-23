@@ -21,7 +21,8 @@
  * answered with an error reaches the formatter too, and must be skipped
  * there. The cases after them cover issue #871: a node without a txindex
  * answers a transaction in no block and not in its mempool in words of its
- * own.
+ * own. And issue #935: for a transaction only seen in the mempool, that
+ * answer is final once it outlasts two new blocks.
  */
 
 import { expect } from 'chai';
@@ -117,6 +118,16 @@ const confirmedRecord = (
 	vsize: 141
 });
 
+/**
+ * The record of a transaction only ever seen in the mempool: height 0, or -1
+ * with unconfirmed parents, and no block.
+ */
+const mempoolRecord = (height: 0 | -1 = 0): IFormattedTransaction => ({
+	...confirmedRecord(height),
+	blockhash: undefined,
+	confirmTimestamp: undefined
+});
+
 /** What the server answers for the transaction, echoing the request payload. */
 const txAnswer = (
 	confirmations?: number,
@@ -182,9 +193,8 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 	let saved: Record<string, unknown>;
 	let messages: Array<{ key: keyof TMessageDataMap; data: unknown }>;
 
-	beforeEach(async function () {
-		saved = {};
-		messages = [];
+	/** A wallet writing to `saved` and reporting to `messages`. */
+	const openWallet = async (): Promise<Wallet> => {
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			network: EAvailableNetworks.regtest,
@@ -206,7 +216,13 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			}
 		});
 		if (res.isErr()) throw res.error;
-		wallet = res.value;
+		return res.value;
+	};
+
+	beforeEach(async function () {
+		saved = {};
+		messages = [];
+		wallet = await openWallet();
 
 		wallet.data.header = { height: TIP, hash: '', hex: '' };
 		wallet.data.transactions[TXID] = confirmedRecord(REORGED_HEIGHT);
@@ -234,16 +250,18 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			IFormattedTransaction
 		>;
 
+	/** The lookup's reply carrying one answer. */
+	const lookupReply = (tx: ITransaction<IUtxo>): Result<IGetTransactions> =>
+		ok<IGetTransactions>({
+			error: false,
+			id: 0,
+			method: 'getTransactions',
+			network: 'bitcoinRegtest',
+			data: [tx]
+		});
+
 	const answerWith = (tx: ITransaction<IUtxo>): sinon.SinonStub =>
-		sinon.stub(wallet.electrum, 'getTransactions').resolves(
-			ok<IGetTransactions>({
-				error: false,
-				id: 0,
-				method: 'getTransactions',
-				network: 'bitcoinRegtest',
-				data: [tx]
-			})
-		);
+		sinon.stub(wallet.electrum, 'getTransactions').resolves(lookupReply(tx));
 
 	it('clears the height when the server reports no confirmations', async function () {
 		answerWith(txAnswer(0));
@@ -651,6 +669,170 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				).to.equal(expected);
 			}
 		});
+
+		/**
+		 * Issue #935: for a record the rule above keeps, above all one only ever
+		 * seen in the mempool, the same answer is final once it outlasts two new
+		 * blocks. electrs indexes a block before it announces the block's header,
+		 * so by then a transaction mined in the meantime is found through its
+		 * index, and one still missing was replaced or evicted.
+		 */
+		describe('a miss that outlasts new blocks (issue #935)', function () {
+			/** The tip this wallet holds at the first check that misses. */
+			const FIRST_MISS = TIP;
+
+			/** Checks once at each tip in turn. */
+			const checkAt = async (...tips: number[]): Promise<void> => {
+				for (const tip of tips) {
+					tipAt(tip);
+					const res = await wallet.checkUnconfirmedTransactions();
+					expect(res.isOk(), `the check ran at tip ${tip}`).to.equal(true);
+				}
+			};
+
+			/** Observes the record at this height, as a refresh would have. */
+			const observe = (record: IFormattedTransaction): void => {
+				wallet.data.transactions[TXID] = { ...record };
+				wallet.data.unconfirmedTransactions[TXID] = { ...record };
+			};
+
+			/** The record is gone, reported and rescanned once, and unobserved. */
+			const expectCleared = (rescan: sinon.SinonStub): void => {
+				const stored = wallet.transactions[TXID];
+				expect(stored.exists, 'the server does not have it').to.equal(false);
+				expect(stored.height).to.equal(0);
+				expect(
+					wallet.getUnconfirmedTransactions()[TXID],
+					'and it is no longer observed'
+				).to.equal(undefined);
+				expect(savedTransactions()[TXID].exists).to.equal(false);
+				expect(savedUnconfirmed()[TXID]).to.equal(undefined);
+
+				const rbf = messages.filter((m) => m.key === 'rbf');
+				expect(rbf, 'the removal is reported once').to.have.length(1);
+				expect(rbf[0].data).to.deep.equal([TXID]);
+				expect(messages.filter((m) => m.key === 'reorg')).to.have.length(0);
+				expect(rescan.callCount, 'and the balance rescanned once').to.equal(1);
+			};
+
+			/** The count the wallet keeps, which stop() drops. */
+			const misses = (w: Wallet): Map<string, number> =>
+				(w as unknown as { _noTxindexMisses: Map<string, number> })
+					._noTxindexMisses;
+
+			beforeEach(function () {
+				observe(mempoolRecord(0));
+			});
+
+			for (const height of [0, -1] as const) {
+				it(`clears a record at height ${height} once the miss outlasts two new blocks`, async function () {
+					// Replaced or evicted: out of the mempool, and in no block.
+					observe(mempoolRecord(height));
+					answerWith(miss(NO_TXINDEX_MISS));
+					const rescan = stubRescan();
+
+					await checkAt(FIRST_MISS);
+					expectKept(rescan, height);
+					// A block on: it may be in that one, which a server a block
+					// behind has not indexed.
+					await checkAt(FIRST_MISS + 1);
+					expectKept(rescan, height);
+
+					await checkAt(FIRST_MISS + 2);
+					expectCleared(rescan);
+				});
+			}
+
+			it('starts counting again when the transaction is found in between', async function () {
+				const lookup = answerWith(miss(NO_TXINDEX_MISS));
+				const rescan = stubRescan();
+
+				await checkAt(FIRST_MISS);
+				lookup.resolves(lookupReply(txAnswer(0)));
+				await checkAt(FIRST_MISS + 1);
+				expectKept(rescan, 0);
+
+				// Missed again: counted from here, not from the first miss.
+				lookup.resolves(lookupReply(miss(NO_TXINDEX_MISS)));
+				await checkAt(FIRST_MISS + 2, FIRST_MISS + 3);
+				expectKept(rescan, 0);
+
+				await checkAt(FIRST_MISS + 4);
+				expectCleared(rescan);
+			});
+
+			it('never clears it while the tip stands still', async function () {
+				answerWith(miss(NO_TXINDEX_MISS));
+				const rescan = stubRescan();
+
+				await checkAt(...new Array<number>(10).fill(FIRST_MISS));
+
+				expectKept(rescan, 0);
+			});
+
+			it('counts nothing before the wallet knows a tip', async function () {
+				answerWith(miss(NO_TXINDEX_MISS));
+				const rescan = stubRescan();
+
+				await checkAt(0, 0);
+				expectKept(rescan, 0);
+
+				// A miss counted at tip zero would be final at any tip from two on.
+				await checkAt(FIRST_MISS, FIRST_MISS + 1);
+				expectKept(rescan, 0);
+
+				await checkAt(FIRST_MISS + 2);
+				expectCleared(rescan);
+			});
+
+			it('clears a record within a block of the tip, which the rule above keeps', async function () {
+				// Its block is one past the header this wallet holds, as a history
+				// read just before a header notification lands can report. Two
+				// blocks on it is still within a block of the tip, where the rule
+				// of #871 never reads the miss as final.
+				observe(confirmedRecord(FIRST_MISS + 1));
+				answerWith(miss(NO_TXINDEX_MISS));
+				const rescan = stubRescan();
+
+				await checkAt(FIRST_MISS, FIRST_MISS + 1);
+				expectKept(rescan, FIRST_MISS + 1);
+
+				await checkAt(FIRST_MISS + 2);
+				expectCleared(rescan);
+			});
+
+			it('starts counting again after a restart', async function () {
+				answerWith(miss(NO_TXINDEX_MISS));
+				stubRescan();
+				await checkAt(FIRST_MISS, FIRST_MISS + 1);
+				expect(misses(wallet).size, 'the miss is counted').to.equal(1);
+
+				sinon.restore();
+				await wallet.stop();
+				expect(misses(wallet).size, 'stop() drops the count').to.equal(0);
+
+				// The count is memory only, so a restart waits longer, never less.
+				wallet = await openWallet();
+				observe(mempoolRecord(0));
+				answerWith(miss(NO_TXINDEX_MISS));
+				const rescan = stubRescan();
+
+				await checkAt(FIRST_MISS + 2, FIRST_MISS + 3);
+				expectKept(rescan, 0);
+
+				await checkAt(FIRST_MISS + 4);
+				expectCleared(rescan);
+			});
+
+			it('still clears it at once when a server with a txindex misses it', async function () {
+				answerWith(miss(TXINDEX_MISS));
+				const rescan = stubRescan();
+
+				await checkAt(FIRST_MISS);
+
+				expectCleared(rescan);
+			});
+		});
 	});
 });
 
@@ -940,6 +1122,38 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 
 		expect(stored('transactions')[TXID].exists).to.equal(false);
 		expect(stored('transactions')[TXID].height).to.equal(0);
+		expect(stored('unconfirmedTransactions')[TXID]).to.equal(undefined);
+		expect(rescan.callCount, 'the balance is rescanned once').to.equal(1);
+	});
+
+	it('repairs a mempool transaction a node without a txindex lost on the next check (issue #935)', async function () {
+		// The miss has outlasted two blocks, so the count is spent. It may only
+		// go once the repair lands: counted again from here, the retry would
+		// wait two more blocks.
+		await seed({ [TXID]: mempoolRecord() }, { [TXID]: mempoolRecord() });
+		const tipAt = (height: number): void => {
+			wallet.data.header = { height, hash: '', hex: '' };
+		};
+		answerWith(txAnswer(undefined, { code: 2, message: NO_TXINDEX_MISS }));
+		const rescan = stubRescan();
+		await wallet.checkUnconfirmedTransactions();
+
+		tipAt(TIP + 2);
+		failMainWrite.on = true;
+		const failed = await wallet.checkUnconfirmedTransactions();
+		expect(failed.isErr(), 'the check reports the write it lost').to.equal(
+			true
+		);
+		expect(
+			wallet.getUnconfirmedTransactions()[TXID]?.height,
+			'the lost transaction is still observed'
+		).to.equal(0);
+
+		failMainWrite.on = false;
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the repair was tried again').to.equal(true);
+
+		expect(stored('transactions')[TXID].exists).to.equal(false);
 		expect(stored('unconfirmedTransactions')[TXID]).to.equal(undefined);
 		expect(rescan.callCount, 'the balance is rescanned once').to.equal(1);
 	});

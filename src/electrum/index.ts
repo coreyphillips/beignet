@@ -1770,9 +1770,10 @@ export class Electrum {
 	 * indexes a block after the node has already taken the block's
 	 * transactions out of its mempool, so a transaction mined a moment ago
 	 * gets the same answer until electrs catches up. It is final only for a
-	 * record this wallet already saw in a block safely below the tip, which is
-	 * for the caller to judge; the Lightning chain backend cannot, and keeps
-	 * reading it as no answer.
+	 * record this wallet already saw in a block safely below the tip, or once
+	 * the same answer outlasts two new blocks (issue #935), which is for the
+	 * caller to judge; the Lightning chain backend cannot, and keeps reading it
+	 * as no answer.
 	 * @param {ITransaction<IUtxo>} txData
 	 * @returns {boolean}
 	 */
