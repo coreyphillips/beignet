@@ -15761,15 +15761,18 @@ export class LightningNode extends EventEmitter {
 		// an OUTGOING PENDING record counts as in flight here: a circular
 		// rebalance sends to its own fresh invoice, whose record is INCOMING
 		// PENDING. A part of an MPP set (total_msat above what the final hop
-		// receives) joins the parts already out for the hash, so nothing
-		// counts as in flight for it; a paid hash refuses a part all the same.
+		// receives) joins the parts already out for the hash, so no offered
+		// HTLC or PENDING record counts as in flight for it, until the parts
+		// already out reach total_msat (issue #990); a paid hash refuses a
+		// part all the same.
 		const finalAmountMsat =
 			route.hops[route.hops.length - 1].amountToForwardMsat;
 		this.assertHashUnpaid(
 			paymentHash,
 			totalMsat !== undefined && totalMsat > finalAmountMsat
 				? 'mpp-part'
-				: 'outgoing-pending'
+				: 'outgoing-pending',
+			totalMsat
 		);
 
 		// BOLT 4 self-introduction (issue #550): a blinded path can name US as
@@ -27483,9 +27486,22 @@ export class LightningNode extends EventEmitter {
 	private static viewHasHtlcInFlight(
 		view: IOutgoingPaymentResolution
 	): boolean {
-		return view.htlcs.some(
-			(h) => h.state === 'offered' || h.state === 'onchain-pending'
-		);
+		return view.htlcs.some(LightningNode.htlcViewInFlight);
+	}
+
+	/**
+	 * The sum of the amounts of the HTLCs in the view that can still settle
+	 * (issue #990): first-hop amounts, fee inclusive, as the channels carry
+	 * them. What an MPP part through sendPaymentToRoute is bounded by.
+	 */
+	private static viewAmountInFlight(view: IOutgoingPaymentResolution): bigint {
+		return view.htlcs
+			.filter(LightningNode.htlcViewInFlight)
+			.reduce((sum, h) => sum + h.amountMsat, 0n);
+	}
+
+	private static htlcViewInFlight(h: IOutgoingHtlcView): boolean {
+		return h.state === 'offered' || h.state === 'onchain-pending';
 	}
 
 	/**
@@ -27533,13 +27549,28 @@ export class LightningNode extends EventEmitter {
 	 * - 'outgoing-pending': an outstanding HTLC, or an OUTGOING PENDING
 	 *   record. A single-part sendPaymentToRoute, which a circular rebalance
 	 *   calls with its own fresh invoice;
-	 * - 'mpp-part': nothing. A part of an MPP set sent through
-	 *   sendPaymentToRoute joins the sibling parts already out for the hash,
-	 *   which is what an HTLC set is (BOLT 4).
+	 * - 'mpp-part': the parts already out, once they reach the set's total
+	 *   (issue #990). A part of an MPP set sent through sendPaymentToRoute
+	 *   joins the sibling parts already out for the hash, which is what an
+	 *   HTLC set is (BOLT 4), so an offered HTLC or a PENDING record does
+	 *   not refuse it on its own. It is refused once the amounts of the
+	 *   non-terminal HTLCs out for the hash ('offered' or 'onchain-pending')
+	 *   already reach `totalMsat`, the set's total_msat: the payee fulfils
+	 *   every part once it holds total_msat, so a part beyond that (a third
+	 *   part added to a two-part set, or a re-send that mistook totalMsat
+	 *   for the route total) overpays. The view carries first-hop amounts,
+	 *   fee inclusive, so the bound is conservative: it can only refuse a
+	 *   legitimate last part when the fees already paid on the earlier
+	 *   parts reach that part's amount. No caller in src/ reaches this arm
+	 *   (each passes totalMsat equal to the final hop's amount); a library
+	 *   caller does.
+	 *
+	 * `totalMsat` is read for 'mpp-part' only.
 	 */
 	private assertHashUnpaid(
 		paymentHash: Buffer,
-		inFlight: 'any-pending' | 'outgoing-pending' | 'mpp-part'
+		inFlight: 'any-pending' | 'outgoing-pending' | 'mpp-part',
+		totalMsat?: bigint
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const completed = (): LightningPaymentError =>
@@ -27566,6 +27597,16 @@ export class LightningNode extends EventEmitter {
 			throw new LightningPaymentError(
 				LightningErrorCode.DUPLICATE_PAYMENT,
 				'Payment already in flight for this invoice'
+			);
+		}
+		if (
+			inFlight === 'mpp-part' &&
+			totalMsat !== undefined &&
+			LightningNode.viewAmountInFlight(view) >= totalMsat
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.DUPLICATE_PAYMENT,
+				'Payment already in flight for this invoice: the MPP parts out already reach its total'
 			);
 		}
 		if (!this.storage) return;
